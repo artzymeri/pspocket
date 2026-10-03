@@ -400,6 +400,28 @@ atomic against SPU code using GETLLAR/PUTLLC on it. Two departures from RPCS3, b
 tasks that wait on a flag needs the native taskset policy; until it exists that case stops with a fatal log instead of
 being skipped.
 
+## D-041 · 2026-10-03 · SPURS task creation: assumed LS pattern semantics, our own task attribute layout
+
+Run 012. GTA V creates SPU tasks with `cellSpursTaskGetLoadableSegmentPattern`, `...GetReadOnlyAreaPattern`,
+`...GenerateLsPattern`, `...GetContextSaveAreaSize`, `_cellSpursTaskAttributeInitialize` and
+`cellSpursCreateTask[WithAttribute]`. RPCS3 implements only `cellSpursCreateTask`; the rest are stubs, so their
+semantics are taken from what RPCS3's taskset code does with their results:
+
+- An LS pattern has one bit per 2 KB block of local store, block 0 the top bit; the six blocks below 0x3000 belong to
+  SPURS and may not be set (RPCS3 `_spurs::create_task`).
+- The loadable-segment pattern is every block a PT_LOAD segment touches. The read-only pattern is only the blocks that
+  read-only segments cover completely: when a task resumes, its read-only segments are reloaded from the ELF and the
+  pattern's blocks are restored from the context (RPCS3 `spursTasksetLoadElf`), so a block shared with writable data
+  has to be treated as writable.
+- `GenerateLsPattern(start, size)` wants 2 KB alignment and a range inside 0x3000..0x40000.
+- The context save area is 1 KB of execution context plus 2 KB per pattern block, the inverse of RPCS3's
+  `(size - 0x400) >> 11`.
+
+Every one of these logs "[native, assumed semantics]" so a boot log shows what the game asked for. They are checked
+against libsre once the firmware reference is set up (D-037). `CellSpursTaskAttribute` is opaque (256 bytes), so
+pspocket stores its own fields there. A created task is marked pending-ready and its taskset's workload is signalled,
+but nothing runs it until the native taskset policy exists (stage 3b).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

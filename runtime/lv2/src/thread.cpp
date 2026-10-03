@@ -221,6 +221,7 @@ void thread_finish(PpuThread& t, u64 status)
         return;
     }
     bool reap = false;
+    Waiter* joiner = nullptr;
     {
         std::lock_guard jl(s.join_mutex);
         if (t.finished) return;
@@ -229,9 +230,10 @@ void thread_finish(PpuThread& t, u64 status)
         switch (t.join) {
         case JoinState::Joinable: t.join = JoinState::Zombie; break;
         case JoinState::Joining:
-            // The joiner waits on this lock (the cancel side of its park checks t.joiner under it).
+            // Claim the joiner (the cancel side of its park sees t.joiner cleared and waits for the wake), but wake
+            // it only once the stack is released and the ID is gone, so a join that returned leaves nothing behind.
             t.join = JoinState::Exited;
-            if (t.joiner) wake(*t.joiner, CELL_OK);
+            joiner = t.joiner;
             t.joiner = nullptr;
             reap = true;
             break;
@@ -250,7 +252,11 @@ void thread_finish(PpuThread& t, u64 status)
         t.stack_addr = 0;
     }
     PS_LOG_DEBUG(kChan, "thread {:#x} exited with {:#x}", t.id, status);
-    if (reap) s.threads.remove(PpuThread::kIdBase, t.id);
+    if (reap) s.threads.remove(PpuThread::kIdBase, t.id); // a joiner holds a reference, so *t outlives this
+    if (joiner) {
+        std::lock_guard jl(s.join_mutex);
+        wake(*joiner, CELL_OK);
+    }
 }
 
 void _sys_ppu_thread_exit(PpuThread& t, u64 errorcode)

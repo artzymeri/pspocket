@@ -681,3 +681,105 @@ TEST_CASE("cellSpurs event flags: lv2 queue attach, PPU set and wait, detach; SP
     CHECK(a.call("cellSpursBarrierInitialize", kTs, kBarrier, 129) == kTaskInval);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 }
+
+// A synthetic SPU task ELF (32-bit big-endian, EM_SPU): text 0x3000..0x4900 (read-only), data 0x4900..0x5000
+// (writable), and a NOTE segment the patterns ignore.
+static void write_task_elf(u8* base, u32 elf, u32 text_vaddr = 0x3000)
+{
+    std::memset(base + elf, 0, 0x100);
+    ps_write32(base, elf, 0x7F454C46);
+    base[elf + 4] = 1; // ELFCLASS32
+    base[elf + 5] = 2; // big-endian
+    ps_write16(base, elf + 0x12, 23); // EM_SPU
+    ps_write32(base, elf + 0x1C, 0x34);
+    ps_write16(base, elf + 0x2A, 0x20);
+    ps_write16(base, elf + 0x2C, 3);
+    const u32 segs[3][4] = {{1, text_vaddr, 0x1900, 5}, {1, 0x4900, 0x700, 6}, {4, 0, 0x40, 4}}; // type vaddr memsz flags
+    for (u32 i = 0; i < 3; i++) {
+        const u32 ph = elf + 0x34 + 0x20 * i;
+        ps_write32(base, ph, segs[i][0]);
+        ps_write32(base, ph + 0x08, segs[i][1]);
+        ps_write32(base, ph + 0x10, segs[i][2]);
+        ps_write32(base, ph + 0x14, segs[i][2]);
+        ps_write32(base, ph + 0x18, segs[i][3]);
+    }
+}
+
+TEST_CASE("cellSpurs tasks: LS patterns from the task ELF, context size, create (plain and with an attribute)",
+    "[hle][spurs]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u32 kSpursAttr = kData + 0x1000, kSpurs = kData + 0x2000, kTsAttr = kData + 0x4000, kPrio = kData + 0x4400;
+    constexpr u32 kTs = kData + 0x6000, kElf = kData + 0x8000, kPattern = kData + 0x8200, kRo = kData + 0x8210,
+                  kSize = kData + 0x8220, kId = kData + 0x8230, kArgs = kData + 0x8240, kTaskAttr = kData + 0x8300,
+                  kContext = kData + 0x9000;
+    constexpr u64 kTaskInval = 0xFFFFFFFF80410902ull, kTaskAlign = 0xFFFFFFFF80410910ull,
+                  kTaskNoexec = 0xFFFFFFFF80410907ull, kTaskFault = 0xFFFFFFFF8041090Dull,
+                  kTaskAgain = 0xFFFFFFFF80410901ull;
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 5, 200, 2016, 0) == 0);
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
+    std::memset(base + kPrio, 1, 8);
+    REQUIRE(a.call("_cellSpursTasksetAttributeInitialize", kTsAttr, 1, 0x330000, 0, kPrio, 4) == 0);
+    REQUIRE(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs, kTsAttr) == 0);
+    write_task_elf(base, kElf);
+
+    // One bit per 2 KB block, block 0 the top bit: blocks 6..9 are LS 0x3000..0x5000.
+    REQUIRE(a.call("cellSpursTaskGetLoadableSegmentPattern", kPattern, kElf) == 0);
+    CHECK(ps_read32(base, kPattern) == 0x03C00000u);
+    CHECK(ps_read32(base, kPattern + 4) == 0);
+    CHECK(ps_read64(base, kPattern + 8) == 0);
+    REQUIRE(a.call("cellSpursTaskGetReadOnlyAreaPattern", kRo, kElf) == 0);
+    CHECK(ps_read32(base, kRo) == 0x03800000u); // block 9 holds writable data too, so it is not read-only
+    REQUIRE(a.call("cellSpursTaskGenerateLsPattern", kRo, 0x3F000, 0x1000) == 0);
+    CHECK(ps_read64(base, kRo) == 0);
+    CHECK(ps_read64(base, kRo + 8) == 3); // blocks 126, 127
+    CHECK(a.call("cellSpursTaskGenerateLsPattern", kRo, 0x2800, 0x800) == kTaskInval); // SPURS' own area
+    CHECK(a.call("cellSpursTaskGenerateLsPattern", kRo, 0x3100, 0x800) == kTaskAlign);
+    REQUIRE(a.call("cellSpursTaskGetContextSaveAreaSize", kSize, kPattern) == 0);
+    CHECK(ps_read32(base, kSize) == 0x400 + 4 * 0x800);
+    ps_write32(base, kRo, 0x80000000u);
+    CHECK(a.call("cellSpursTaskGetContextSaveAreaSize", kSize, kRo) == kTaskInval);
+    CHECK(a.call("cellSpursTaskGetLoadableSegmentPattern", kPattern, kElf + 8) == kTaskAlign);
+    write_task_elf(base, kElf + 0x100, 0x1000); // text below CELL_SPURS_TASK_TOP
+    CHECK(a.call("cellSpursTaskGetLoadableSegmentPattern", kRo, kElf + 0x100) == kTaskFault);
+    base[kElf + 0x100] = 0;
+    CHECK(a.call("cellSpursTaskGetLoadableSegmentPattern", kRo, kElf + 0x100) == kTaskNoexec);
+
+    // cellSpursCreateTask: the lowest free ID, TaskInfo filled, pending-ready, the workload signalled.
+    for (u32 i = 0; i < 16; i++) base[kArgs + i] = static_cast<u8>(0xA0 + i);
+    REQUIRE(a.call("cellSpursCreateTask", kTs, kId, kElf, kContext, 0x2400, kPattern, kArgs) == 0);
+    CHECK(ps_read32(base, kId) == 0);
+    CHECK(ps_read32(base, kTs + 0x30) == 0x80000000u); // enabled
+    CHECK(ps_read32(base, kTs + 0x20) == 0x80000000u); // pending_ready
+    CHECK(std::memcmp(base + kTs + 0x80, base + kArgs, 16) == 0);
+    CHECK(ps_read64(base, kTs + 0x90) == kElf);
+    CHECK(ps_read64(base, kTs + 0x98) == (u64{kContext} | 4)); // context | allocated LS blocks
+    CHECK(ps_read32(base, kTs + 0xA0) == 0x03C00000u);
+    CHECK(ps_read16(base, kSpurs + 0x70) == 0x8000);  // wklSignal1: workload 0
+    CHECK(ps_read8(base, kSpurs + 0xD64) == 1);       // handlerDirty
+
+    REQUIRE(a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, 0) == 0); // no context, no argument
+    CHECK(ps_read32(base, kId) == 1);
+    CHECK(ps_read64(base, kTs + 0x80 + 0x30 + 0x18) == 0);
+    CHECK(ps_read32(base, kTs + 0x20) == 0xC0000000u);
+    CHECK(a.call("cellSpursCreateTask", kTs, kId, kElf, kContext, 0x200, 0, 0) == kTaskInval);       // context too small
+    CHECK(a.call("cellSpursCreateTask", kTs, kId, kElf, kContext, 0x1C00, kPattern, 0) == kTaskInval); // 3 blocks < 4
+    CHECK(a.call("cellSpursCreateTask", kTs, kId, kElf, kContext + 0x40, 0x2400, 0, 0) == kTaskAlign);
+
+    // The attribute route (Bink's): the same task through _cellSpursTaskAttributeInitialize.
+    REQUIRE(a.call("_cellSpursTaskAttributeInitialize", kTaskAttr, 1, 0x330000, kElf, kContext, 0x2400, kPattern, kArgs) == 0);
+    REQUIRE(a.call("cellSpursCreateTaskWithAttribute", kTs, kId, kTaskAttr) == 0);
+    CHECK(ps_read32(base, kId) == 2);
+    CHECK(ps_read64(base, kTs + 0x80 + 2 * 0x30 + 0x10) == kElf);
+    CHECK(ps_read32(base, kTs + 0x80 + 2 * 0x30 + 0x20) == 0x03C00000u);
+    CHECK(a.call("_cellSpursTaskAttributeInitialize", kTaskAttr + 8, 1, 0x330000, kElf, 0, 0, 0, 0) == kTaskAlign);
+    ps_write32(base, kTaskAttr, 2);
+    CHECK(a.call("cellSpursCreateTaskWithAttribute", kTs, kId, kTaskAttr) == kTaskInval);
+
+    // All 128 IDs taken.
+    for (u32 w = 0; w < 4; w++) ps_write32(base, kTs + 0x30 + 4 * w, 0xFFFFFFFFu);
+    CHECK(a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, 0) == kTaskAgain);
+    REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+}
