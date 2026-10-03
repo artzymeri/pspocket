@@ -200,4 +200,20 @@ Result sys_fs_fsync(PpuThread& t, u32 fd);
 Result sys_fs_truncate(PpuThread& t, u32 path, u64 size);
 Result sys_fs_ftruncate(PpuThread& t, u32 fd, u64 size);
 
+// ---- virtual memory (sys_vm.cpp)
+Result sys_vm_memory_map(PpuThread& t, u64 vsize, u64 psize, u32 cid, u64 flag, u64 policy, u32 addr_out);
+Result sys_vm_memory_map_different(PpuThread& t, u64 vsize, u64 psize, u32 cid, u64 flag, u64 policy, u32 addr_out);
+Result sys_vm_unmap(PpuThread& t, u32 addr);
+Result sys_vm_append_memory(PpuThread& t, u32 addr, u64 size);
+Result sys_vm_return_memory(PpuThread& t, u32 addr, u64 size);
+Result sys_vm_lock(PpuThread& t, u32 addr, u32 size);
+Result sys_vm_unlock(PpuThread& t, u32 addr, u32 size);
+Result sys_vm_touch(PpuThread& t, u32 addr, u32 size);
+Result sys_vm_flush(PpuThread& t, u32 addr, u32 size);
+Result sys_vm_invalidate(PpuThread& t, u32 addr, u32 size);
+Result sys_vm_store(PpuThread& t, u32 addr, u32 size);
+Result sys_vm_sync(PpuThread& t, u32 addr, u32 size);
+Result sys_vm_test(PpuThread& t, u32 addr, u32 size, u32 result);
+Result sys_vm_get_statistics(PpuThread& t, u32 addr, u32 stat);
+
 } // namespace pspocket::lv2

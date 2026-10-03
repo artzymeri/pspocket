@@ -369,6 +369,14 @@ runs libsre's policy-module code even in HLE mode. Architecture and stages: docs
 initialize, finalize) does not create the SPU thread group, handler threads, lv2 semaphores or the guest lwmutex/lwcond
 that libsre's kernel uses; those CellSpurs fields stay 0.
 
+## D-038 · 2026-10-03 · sys_vm without paging (as RPCS3)
+
+Run 006. `sys_vm_memory_map` reserves a 256 MB-aligned area, commits the whole virtual size at once and charges only
+the physical size to the memory container; nothing is paged, so lock/unlock/touch/flush/invalidate/store/sync only
+validate their range, `sys_vm_test` reports every page on memory and the statistics show no paging. 256 MB of virtual
+memory per process. Host memory is committed lazily by the OS, so an untouched virtual range costs nothing on iOS. If
+a game's working set ever outgrows the phone, real paging (decommit on `sys_vm_store`/`invalidate`) is the lever.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

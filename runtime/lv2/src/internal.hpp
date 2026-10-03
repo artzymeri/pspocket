@@ -137,6 +137,7 @@ void register_lw_syscalls(SyscallTable& table);
 void register_time_syscalls(SyscallTable& table);
 void register_memory_syscalls(SyscallTable& table);
 void register_fs_syscalls(SyscallTable& table);
+void register_vm_syscalls(SyscallTable& table);
 
 // ---------------------------------------------------------------------------------------------------- helpers
 
@@ -211,10 +212,28 @@ public:
     u64 handle = 0;             // host memory object (created on first map), guarded by the memory manager's mutex
 };
 
+// sys_vm block (RPCS3 sys_vm.h sys_vm_t): IDs 1..16 in their own table, one block per 256 MB area.
+class VmBlock final : public Object {
+public:
+    static constexpr u32 kIdBase = 0x1;
+    u32 id_base() const override { return kIdBase; }
+    VmBlock(u32 addr, u32 size, u32 psize, std::shared_ptr<MemoryContainer> ct)
+        : addr(addr), size(size), psize(psize), container(std::move(ct))
+    {
+    }
+    const u32 addr;
+    const u32 size;  // virtual size
+    u32 psize;       // physical size charged to the container; guarded by the memory manager's mutex
+    const std::shared_ptr<MemoryContainer> container; // null: the default container
+};
+inline constexpr IdSpec kVmIds{1, 16, 0, 0, false};
+inline constexpr u32 SYS_MEMORY_CONTAINER_ID_INVALID = 0xFFFFFFFF;
+inline constexpr u64 SYS_MEMORY_PAGE_SIZE_64K = 0x200;
+
 // 256 MB areas between the main executable and RSX memory (RPCS3 vm.cpp _find_map, sys_memory.cpp,
 // sys_mmapper.cpp): user memory (64 KB / 1 MB pages) and sys_mmapper address ranges.
 struct Area {
-    enum class Kind { User64k, User1m, Mmapper };
+    enum class Kind { User64k, User1m, Mmapper, Vm };
     Kind kind;
     u32 addr;
     u64 size;
@@ -239,6 +258,7 @@ public:
     };
     std::map<u32, UserAlloc> user_allocs;
     RangeSet stacks; // PPU thread stacks, PS_MEM_STACK_BASE..+SIZE
+    u32 vm_total = 0; // virtual size of all sys_vm blocks
     bool fixed_area_mapped = false;
 
     // With `mutex` held.
@@ -356,6 +376,7 @@ struct Kernel::Impl {
     IdTable threads{kPpuThreadIds};
     IdTable containers{kMemContainerIds};
     IdTable fds{kFsIds};
+    IdTable vms{kVmIds};
 
     std::mutex ipc_mutex;
     std::map<std::pair<u32, u64>, std::weak_ptr<Object>> ipc; // (type, key) -> object

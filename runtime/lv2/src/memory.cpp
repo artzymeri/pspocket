@@ -32,7 +32,6 @@ namespace pspocket::lv2 {
 namespace {
 
 constexpr u64 k256M = 0x10000000;
-constexpr u64 SYS_MEMORY_PAGE_SIZE_64K = 0x200;
 constexpr u64 SYS_MEMORY_PAGE_SIZE_1M = 0x400;
 constexpr u64 SYS_MEMORY_GRANULARITY_MASK = 0xF00;
 constexpr u64 SYS_MMAPPER_NO_SHM_KEY = 0xFFFF000000000000ull;

@@ -233,3 +233,58 @@ TEST_CASE("lv2 mmapper: IPC keys", "[lv2][mmapper]")
     REQUIRE(c.call(kMmAllocateShm, key, 0x100000, create_any, out) == CELL_OK);
     REQUIRE(c.call(kMmFreeShm, f.r32(out)) == CELL_OK);
 }
+
+TEST_CASE("lv2 sys_vm: map the whole virtual size, charge the physical size, paging calls validate ranges", "[lv2][vm]")
+{
+    // GTA V's first sys_vm call (docs/runs/006): 32 MB virtual, 0x1260000 physical, default container, 64 KB pages.
+    constexpr u32 kVmMap = 300, kVmUnmap = 301, kVmAppend = 302, kVmReturn = 303, kVmLock = 304, kVmTouch = 306,
+                  kVmStore = 309, kVmTest = 311, kVmStats = 312;
+    constexpr u64 kPolicy = 1;
+    const Result kInval = err(CELL_EINVAL), kBusy = err(CELL_EBUSY);
+    Fixture f;
+    Caller c(*f.kernel);
+    const UserSize before = user_size(f, c);
+    const u32 out = f.alloc(8);
+
+    CHECK(c.call(kVmMap, 0x2000000, 0x1260000, 0xFFFFFFFF, k64K, 2, out) == kInval);  // policy
+    CHECK(c.call(kVmMap, 0x1000000, 0x1260000, 0xFFFFFFFF, k64K, kPolicy, out) == kInval); // vsize not 32 MB-aligned
+    CHECK(c.call(kVmMap, 0x2000000, 0x80000, 0xFFFFFFFF, k64K, kPolicy, out) == kInval);  // psize below 1 MB
+    REQUIRE(c.call(kVmMap, 0x2000000, 0x1260000, 0xFFFFFFFF, k64K, kPolicy, out) == CELL_OK);
+    const u32 vm = f.r32(out);
+    CHECK(vm % 0x10000000 == 0);
+    CHECK(vm >= 0x10000000);
+    CHECK(f.mem.is_committed(vm));
+    CHECK(f.mem.is_committed(vm + 0x1FFFFFF)); // the whole virtual size, not just the physical part
+    CHECK_FALSE(f.mem.is_committed(vm + 0x2000000));
+    f.w32(vm + 0x1FFFFFC, 0x12345678);
+    CHECK(f.r32(vm + 0x1FFFFFC) == 0x12345678);
+    CHECK(user_size(f, c).available == before.available - 0x1260000);
+
+    CHECK(c.call(kVmLock, vm, 0x1000) == CELL_OK);
+    CHECK(c.call(kVmTouch, vm + 0x1FFF000, 0x1000) == CELL_OK);
+    CHECK(c.call(kVmStore, vm + 0x1FFF000, 0x2000) == kInval); // past the end
+    CHECK(c.call(kVmLock, vm, 0) == kInval);
+    const u32 state = f.alloc(8);
+    REQUIRE(c.call(kVmTest, vm, 0x10000, state) == CELL_OK);
+    CHECK(f.r64(state) == 2); // SYS_VM_STATE_ON_MEMORY
+
+    REQUIRE(c.call(kVmAppend, vm, 0x100000) == CELL_OK);
+    CHECK(c.call(kVmAppend, vm, 0x10000) == kInval); // 1 MB granularity
+    CHECK(c.call(kVmReturn, vm, 0x1300000) == kBusy); // would leave less than 1 MB
+    REQUIRE(c.call(kVmReturn, vm, 0x200000) == CELL_OK);
+    const u32 stats = f.alloc(0x30);
+    REQUIRE(c.call(kVmStats, vm, stats) == CELL_OK);
+    CHECK(f.r32(stats + 0x20) == 0x1260000 + 0x100000 - 0x200000);
+    CHECK(user_size(f, c).available == before.available - 0x1160000);
+
+    // At most 256 MB of virtual memory per process.
+    const u32 out2 = f.alloc(4);
+    for (int i = 0; i < 7; i++) REQUIRE(c.call(kVmMap, 0x2000000, 0x100000, 0xFFFFFFFF, k64K, kPolicy, out2) == CELL_OK);
+    CHECK(c.call(kVmMap, 0x2000000, 0x100000, 0xFFFFFFFF, k64K, kPolicy, out2) == kBusy);
+
+    CHECK(c.call(kVmUnmap, vm + 0x1000) == kInval);
+    REQUIRE(c.call(kVmUnmap, vm) == CELL_OK);
+    CHECK_FALSE(f.mem.is_committed(vm));
+    CHECK(c.call(kVmUnmap, vm) == kInval);
+    CHECK(c.call(kVmMap, 0x2000000, 0x100000, 0xFFFFFFFF, k64K, kPolicy, out2) == CELL_OK); // room again
+}
