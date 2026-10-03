@@ -1,15 +1,19 @@
 // cellSpurs, native (D-037): the SPURS API on the host. Guest-visible structures keep RPCS3's layouts
 // (rpcs3/Emu/Cell/Modules/cellSpurs.h); API semantics follow RPCS3 cellSpurs.cpp where it implements them.
 //
-// Stage 1 (this file so far): attributes, initialize and finalize. Initialize fills the CellSpurs fields RPCS3's
+// Stage 1: attributes, initialize and finalize. Stage 3a: workload registration and tasksets (PPU side; tasks do not
+// run until the native taskset policy exists). Initialize fills the CellSpurs fields RPCS3's
 // _spurs::initialize sets that games and SPU code can observe, and registers a host instance. What a native SPURS
 // does not create, because nothing of Sony's SPURS kernel runs: the SPU thread group and its threads (spuTG, spus[]),
 // the PPU handler and event helper threads (ppu0, ppu1), the per-workload lv2 semaphores (wklF1[].sem, semPrv), the
 // guest lwmutex/lwcond at 0xDB0/0xDC8 and the kernel's event queue and port. Those fields stay 0 (ppu0/ppu1 keep
 // RPCS3's 0xFFFFFFFF "no thread"). Workloads, tasksets, tasks, job chains and SPU execution come next.
 
+#include <algorithm>
+#include <bit>
 #include <cstring>
 #include <map>
+#include <string>
 #include <mutex>
 
 #include "guest.hpp"
@@ -34,6 +38,17 @@ enum : u32 {
     CELL_SPURS_CORE_ERROR_ALIGN = 0x80410710,
     CELL_SPURS_CORE_ERROR_NULL_POINTER = 0x80410711,
 };
+enum : u32 {
+    CELL_SPURS_POLICY_MODULE_ERROR_AGAIN = 0x80410801,
+    CELL_SPURS_POLICY_MODULE_ERROR_INVAL = 0x80410802,
+    CELL_SPURS_POLICY_MODULE_ERROR_STAT = 0x8041080F,
+    CELL_SPURS_POLICY_MODULE_ERROR_ALIGN = 0x80410810,
+    CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER = 0x80410811,
+    CELL_SPURS_TASK_ERROR_INVAL = 0x80410902,
+    CELL_SPURS_TASK_ERROR_STAT = 0x8041090F,
+    CELL_SPURS_TASK_ERROR_ALIGN = 0x80410910,
+    CELL_SPURS_TASK_ERROR_NULL_POINTER = 0x80410911,
+};
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
 constexpr u32 CELL_SPURS_MAX_SPU = 8;
@@ -44,6 +59,12 @@ constexpr u32 CELL_SPURS_ALIGN = 128;
 constexpr u32 CELL_SPURS_KERNEL1_ENTRY_ADDR = 0x818;
 constexpr u32 CELL_SPURS_KERNEL2_ENTRY_ADDR = 0x848;
 constexpr u32 SPURS_IMG_ADDR_SYS_SRV_WORKLOAD = 0x100;
+constexpr u32 SPURS_IMG_ADDR_TASKSET_PM = 0x200; // marker for the taskset policy module (RPCS3), handled natively
+constexpr u32 kTasksetPmSize = 0x1E40;
+constexpr u32 CELL_SPURS_MAX_WORKLOAD = 16;
+constexpr u32 CELL_SPURS_TASKSET_ATTRIBUTE_REVISION = 1;
+constexpr u32 kTasksetSize = 6400; // CellSpursTaskset (CellSpursTaskset2 is larger; not supported yet)
+constexpr u8 SPURS_WKL_STATE_PREPARING = 1, SPURS_WKL_STATE_RUNNABLE = 2;
 
 // SpursAttrFlags
 constexpr u32 SAF_EXIT_IF_NO_WORK = 0x00000001;
@@ -73,13 +94,40 @@ constexpr u32 wklFlag = 0x60, flags1 = 0x74, nSpus = 0x76, wklFlagReceiver = 0x7
               handlerExiting = 0xD66, spuImg = 0xD70, flags = 0xD80, spuPriority = 0xD84, ppuPriority = 0xD88,
               prefix = 0xD8C, prefixSize = 0xD9B, revision = 0xDA0, sdkVersion = 0xDA4;
 }
+// Workload tables of CellSpurs (SPURS1: wid 0..15).
+namespace wkl_off {
+constexpr u32 readyCount1 = 0x00, idleSpuCountOrReadyCount2 = 0x10, currentContention = 0x20,
+              pendingContention = 0x30, minContention = 0x40, maxContention = 0x50, signal1 = 0x70,
+              sysSrvMessage = 0x72, state1 = 0x80, status1 = 0x90, event1 = 0xA0, enabled = 0xB0, mskB = 0xB4,
+              sysSrvMsgUpdateWorkload = 0xBD, f1 = 0x100, f1_stride = 0x80, info1 = 0xB00, info_stride = 0x20,
+              h1 = 0xE00, h_stride = 0x10, exception = 0xD6C;
+// WorkloadInfo: addr (u64), arg (u64), size (u32), uniqueId (u8), priority[8] at 0x18.
+constexpr u32 info_addr = 0x00, info_arg = 0x08, info_size = 0x10, info_unique = 0x14, info_priority = 0x18;
+} // namespace wkl_off
+
+// CellSpursTasksetAttribute (512 bytes) and CellSpursTaskset (6400 bytes, 128-aligned).
+namespace tsattr_off {
+constexpr u32 revision = 0x00, sdk_version = 0x04, args = 0x08, priority = 0x10, max_contention = 0x18, name = 0x1C,
+              taskset_size = 0x20, enable_clear_ls = 0x24, size = 0x200;
+}
+namespace ts_off {
+constexpr u32 spurs = 0x60, args = 0x68, enable_clear_ls = 0x70, wkl_flag_wait_task = 0x72, wid = 0x74,
+              size = 0x1890;
+}
+
 // sys_spu_image {type, entry_point, segs, nsegs} and CellSpurs::WorkloadInfo {addr (u64), arg, size, uniqueId, ...}.
 constexpr u32 SYS_SPU_IMAGE_TYPE_USER = 0;
 
 // Host side of every initialized SPURS instance, keyed by the guest CellSpurs address.
+struct Workload {
+    enum class Kind { Taskset, Custom } kind = Kind::Custom;
+    u32 arg = 0; // the taskset (Taskset) or the policy module's argument
+};
+
 struct Instance {
     u32 nspus = 0;
     bool second = false;
+    std::map<u32, Workload> workloads; // by workload ID
 };
 
 struct SpursHost {
@@ -177,7 +225,7 @@ s32 initialize(PPUContext& ctx, u32 spurs, u32 revision, u32 sdk_version, s32 ns
         SpursHost& h = host();
         std::lock_guard lock(h.mutex);
         if (h.instances.contains(spurs)) return error(CELL_SPURS_CORE_ERROR_STAT);
-        h.instances[spurs] = Instance{static_cast<u32>(nspus), second};
+        h.instances[spurs] = Instance{static_cast<u32>(nspus), second, {}};
     }
 
     u8* base = guest_base(ctx);
@@ -247,6 +295,170 @@ s32 cellSpursFinalize(PPUContext& ctx, u32 spurs)
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------------------------- workloads
+
+// RPCS3 _spurs::add_workload (SPURS1 workloads 0..15): claims the first free workload ID, fills its tables in the guest
+// CellSpurs, gives it the unique ID of an existing workload with the same policy module (or the lowest free one) and
+// makes it runnable. The native scheduler finds the workload through the host instance.
+s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, const u8 (&priority)[8], u32 min_contention,
+    u32 max_contention, u32 name_class, u32 name_instance, Workload::Kind kind)
+{
+    if (!spurs || !pm) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN || pm % 16) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    u64 prio_bits = 0;
+    for (u32 i = 0; i < 8; i++) prio_bits = (prio_bits << 8) | priority[i];
+    if (min_contention == 0 || (prio_bits & 0xF0F0F0F0F0F0F0F0ull)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+
+    SpursHost& h = host();
+    std::lock_guard lock(h.mutex);
+    const auto it = h.instances.find(spurs);
+    if (it == h.instances.end()) {
+        PS_LOG_ERROR(kChan, "add_workload: SPURS {:#010x} is not initialized", spurs);
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    }
+    Instance& inst = it->second;
+    if (inst.second) {
+        PS_LOG_ERROR(kChan, "add_workload: SPURS2 (32 workloads) is not implemented");
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    }
+
+    const u32 enabled = ps_read32(base, spurs + wkl_off::enabled);
+    const u32 wid = static_cast<u32>(std::countl_one(enabled));
+    wid_out = wid;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return error(CELL_SPURS_POLICY_MODULE_ERROR_AGAIN);
+    ps_write32(base, spurs + wkl_off::enabled, enabled | (0x80000000u >> wid));
+    // RPCS3 ensure()s a free workload slot has no SPUs on it or switching to it.
+    if ((ps_read8(base, spurs + wkl_off::currentContention + wid) & 0xF) ||
+        (ps_read8(base, spurs + wkl_off::pendingContention + wid) & 0xF)) {
+        PS_FATAL(kChan, "add_workload: free workload {} of SPURS {:#010x} still has contention", wid, spurs);
+    }
+
+    ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_PREPARING);
+    ps_write8(base, spurs + wkl_off::status1 + wid, 0);
+    ps_write8(base, spurs + wkl_off::event1 + wid, 0);
+    const u32 info = spurs + wkl_off::info1 + wid * wkl_off::info_stride;
+    ps_write64(base, info + wkl_off::info_addr, pm);
+    ps_write64(base, info + wkl_off::info_arg, data);
+    ps_write32(base, info + wkl_off::info_size, size);
+    for (u32 i = 0; i < 8; i++) ps_write8(base, info + wkl_off::info_priority + i, priority[i]);
+    const u32 names = spurs + wkl_off::h1 + wid * wkl_off::h_stride;
+    ps_write64(base, names, name_class);
+    ps_write64(base, names + 8, name_instance);
+    const u32 f = spurs + wkl_off::f1 + wid * wkl_off::f1_stride;
+    std::memset(base + f, 0, 0x20);                 // keeps the semaphore at 0x20
+    std::memset(base + f + 0x28, 0, 0x58);
+    ps_write8(base, spurs + wkl_off::idleSpuCountOrReadyCount2 + wid, 0);
+    ps_write8(base, spurs + wkl_off::minContention + wid, static_cast<u8>(std::min<u32>(min_contention, 8)));
+    ps_write8(base, spurs + wkl_off::readyCount1 + wid, 0);
+    const u8 maxc = ps_read8(base, spurs + wkl_off::maxContention + wid);
+    ps_write8(base, spurs + wkl_off::maxContention + wid, static_cast<u8>((maxc & 0xF0) | std::min<u32>(max_contention, 8)));
+    ps_write16(base, spurs + wkl_off::signal1, static_cast<u16>(ps_read16(base, spurs + wkl_off::signal1) & ~(0x8000u >> wid)));
+    if (ps_read8(base, spurs + spurs_off::wklFlagReceiver) == wid) ps_write8(base, spurs + spurs_off::wklFlagReceiver, 0xFF);
+
+    // Unique ID: shared with an enabled workload using the same policy module, else the lowest unused one.
+    const u32 mask = ps_read32(base, spurs + wkl_off::mskB) & ~(0x80000000u >> wid);
+    u32 unique = 0, used = 0;
+    for (u32 i = 0, m = 0x80000000u; i < 32; i++, m >>= 1) {
+        if (!(mask & m) || i >= CELL_SPURS_MAX_WORKLOAD) continue;
+        const u32 other = spurs + wkl_off::info1 + i * wkl_off::info_stride;
+        if (ps_read64(base, other + wkl_off::info_addr) == pm) {
+            unique = ps_read8(base, other + wkl_off::info_unique);
+            break;
+        }
+        used |= 0x80000000u >> ps_read8(base, other + wkl_off::info_unique);
+        unique = static_cast<u32>(std::countl_one(used));
+    }
+    ps_write8(base, info + wkl_off::info_unique, static_cast<u8>(unique));
+    ps_write32(base, spurs + wkl_off::mskB, mask | (0x80000000u >> wid));
+    ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_RUNNABLE);
+    ps_write8(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, 0xFF);
+    ps_write8(base, spurs + wkl_off::sysSrvMessage, 0xFF);
+
+    inst.workloads[wid] = Workload{kind, static_cast<u32>(data)};
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- tasksets
+
+// RPCS3 _cellSpursTasksetAttributeInitialize.
+s32 _cellSpursTasksetAttributeInitialize(PPUContext& ctx, u32 attr, u32 revision, u32 sdk_version, u64 args, u32 priority,
+    u32 max_contention)
+{
+    if (!attr) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    for (u32 i = 0; i < 8; i++)
+        if (ps_read8(base, priority + i) > 0xF) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    u8 prio[8];
+    std::memcpy(prio, base + priority, 8);
+    std::memset(base + attr, 0, tsattr_off::size);
+    ps_write32(base, attr + tsattr_off::revision, revision);
+    ps_write32(base, attr + tsattr_off::sdk_version, sdk_version);
+    ps_write64(base, attr + tsattr_off::args, args);
+    std::memcpy(base + attr + tsattr_off::priority, prio, 8);
+    ps_write32(base, attr + tsattr_off::taskset_size, kTasksetSize);
+    ps_write32(base, attr + tsattr_off::max_contention, max_contention);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellSpursTasksetAttributeSetName: stores the guest pointer.
+s32 cellSpursTasksetAttributeSetName(PPUContext& ctx, u32 attr, u32 name)
+{
+    if (!attr || !name) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    ps_write32(guest_base(ctx), attr + tsattr_off::name, name);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 _spurs::create_taskset: clears the taskset, links it to the SPURS instance and adds it as a workload whose
+// policy module is the taskset marker, with minimum contention 8 and the attribute's priorities and maximum.
+s32 create_taskset(u8* base, u32 spurs, u32 taskset, u64 args, const u8 (&priority)[8], u32 max_contention, u32 name,
+    u32 size, s32 enable_clear_ls)
+{
+    if (!spurs || !taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN || taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (size != kTasksetSize) {
+        PS_LOG_ERROR(kChan, "create_taskset: taskset size {:#x} (CellSpursTaskset2) is not implemented", size);
+        return error(CELL_SPURS_TASK_ERROR_INVAL);
+    }
+    std::memset(base + taskset, 0, size);
+    ps_write64(base, taskset + ts_off::spurs, spurs);
+    ps_write64(base, taskset + ts_off::args, args);
+    ps_write8(base, taskset + ts_off::enable_clear_ls, enable_clear_ls > 0 ? 1 : 0);
+    ps_write32(base, taskset + ts_off::size, size);
+
+    u32 wid = 0;
+    if (const s32 r = add_workload(base, spurs, wid, SPURS_IMG_ADDR_TASKSET_PM, kTasksetPmSize, taskset, priority, 8,
+            max_contention, 0, name, Workload::Kind::Taskset);
+        r != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "create_taskset({:#x}): adding the workload failed ({:#x})", taskset, static_cast<u32>(r));
+        return r;
+    }
+    ps_write8(base, taskset + ts_off::wkl_flag_wait_task, 0x80);
+    ps_write32(base, taskset + ts_off::wid, wid);
+    std::string label;
+    if (name) label = reinterpret_cast<const char*>(base + name);
+    PS_LOG_INFO(kChan, "taskset {:#010x} \"{}\" is workload {} of SPURS {:#010x} (max contention {})", taskset, label, wid,
+        spurs, max_contention);
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursCreateTasksetWithAttribute(PPUContext& ctx, u32 spurs, u32 taskset, u32 attr)
+{
+    if (!attr) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, attr + tsattr_off::revision) != CELL_SPURS_TASKSET_ATTRIBUTE_REVISION) {
+        return error(CELL_SPURS_TASK_ERROR_INVAL);
+    }
+    u8 prio[8];
+    std::memcpy(prio, base + attr + tsattr_off::priority, 8);
+    return create_taskset(base, spurs, taskset, ps_read64(base, attr + tsattr_off::args), prio,
+        ps_read32(base, attr + tsattr_off::max_contention), ps_read32(base, attr + tsattr_off::name),
+        ps_read32(base, attr + tsattr_off::taskset_size), static_cast<s32>(ps_read32(base, attr + tsattr_off::enable_clear_ls)));
+}
+
 } // namespace
 
 void register_cellSpurs(Registry& r)
@@ -257,6 +469,9 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xA839A4D9, cellSpursAttributeSetSpuThreadGroupType),
         PS_HLE_FUNC(0xAA6269A8, cellSpursInitializeWithAttribute),
         PS_HLE_FUNC(0xCA4C4600, cellSpursFinalize),
+        PS_HLE_FUNC(0x16394A4E, _cellSpursTasksetAttributeInitialize),
+        PS_HLE_FUNC(0x652B70E2, cellSpursTasksetAttributeSetName),
+        PS_HLE_FUNC(0xC10931CB, cellSpursCreateTasksetWithAttribute),
     });
 }
 

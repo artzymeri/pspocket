@@ -51,6 +51,42 @@ s32 sys_ppu_thread_get_id(PPUContext& ctx, u32 thread_id)
     return lv2::CELL_OK;
 }
 
+constexpr u64 SYS_PPU_THREAD_CREATE_INTERRUPT = 0x2;
+
+// RPCS3 sys_ppu_thread_.cpp sys_ppu_thread_create: a TLS block for the new thread, then the kernel's
+// _sys_ppu_thread_create with {entry descriptor, r13} and sys_ppu_thread_start. Deviation: the TLS block is released
+// when the kernel refuses the thread (RPCS3 keeps it; games retry thread creation in a loop when it fails).
+s32 sys_ppu_thread_create(PPUContext& ctx, u32 thread_id, u32 entry, u64 arg, s32 prio, u32 stacksize, u64 flags,
+    u32 threadname)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    HleProcess* p = HleProcess::current();
+    const u32 tls = p ? p->alloc_tls() : 0;
+    if (!tls) return lv2::err(lv2::CELL_ENOMEM);
+    StackVar param(ctx, base, 8); // ppu_thread_param_t {entry, tls}
+    ps_write32(base, param.addr(), entry);
+    ps_write32(base, param.addr() + 4, tls + kTlsR13Offset);
+    if (const s32 r = lv2::_sys_ppu_thread_create(t, thread_id, param.addr(), arg, 0, prio, stacksize, flags, threadname);
+        r != lv2::CELL_OK) {
+        p->free_tls(tls);
+        return r;
+    }
+    if (flags & SYS_PPU_THREAD_CREATE_INTERRUPT) return lv2::CELL_OK;
+    return lv2::sys_ppu_thread_start(t, static_cast<u32>(ps_read64(base, thread_id)));
+}
+
+// RPCS3 sys_ppu_thread_.cpp sys_ppu_thread_exit: atexit handlers, the TLS block, then the syscall. Deviation: no atexit
+// list (sys_ppu_thread_register_atexit is not implemented, so nothing can be registered).
+void sys_ppu_thread_exit(PPUContext& ctx, u64 val)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (HleProcess* p = HleProcess::current(); p && ctx.gpr[13] >= kTlsR13Offset) {
+        p->free_tls(static_cast<u32>(ctx.gpr[13]) - kTlsR13Offset);
+    }
+    lv2::_sys_ppu_thread_exit(t, val); // does not return
+}
+
 // RPCS3 sysPrxForUser.cpp sys_process_exit. Deviation: RPCS3 first locks the "_lv2ppu" exit mutex that its
 // sys_initialize_tls creates; atexit handlers are a TODO there too.
 void sys_process_exit(PPUContext& ctx, s32 status)
@@ -272,6 +308,8 @@ void register_sysPrxForUser(Registry& r)
     r.add("sysPrxForUser", {
         PS_HLE_FUNC(0x744680A2, sys_initialize_tls),
         PS_HLE_FUNC(0x350D454E, sys_ppu_thread_get_id),
+        PS_HLE_FUNC(0x24A1EA07, sys_ppu_thread_create),
+        PS_HLE_FUNC(0xAFF080A4, sys_ppu_thread_exit),
         PS_HLE_FUNC(0xE6F2C1E7, sys_process_exit),
         PS_HLE_FUNC(0xA2C7BA64, sys_prx_exitspawn_with_level),
         PS_HLE_FUNC(0x8461E528, sys_time_get_system_time),

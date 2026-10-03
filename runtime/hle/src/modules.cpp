@@ -6,12 +6,14 @@ namespace pspocket::hle {
 
 void register_cellSpurs(Registry& r);
 void register_cellSysmodule(Registry& r);
+void register_sceNp(Registry& r);
 void register_sysPrxForUser(Registry& r);
 
 void register_all_modules(Registry& r)
 {
     register_cellSpurs(r);
     register_cellSysmodule(r);
+    register_sceNp(r);
     register_sysPrxForUser(r);
 }
 

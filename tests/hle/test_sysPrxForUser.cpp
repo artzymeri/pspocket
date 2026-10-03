@@ -16,6 +16,7 @@
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/ppu/runtime.h"
 
 using namespace pspocket;
@@ -326,4 +327,94 @@ TEST_CASE("cellSpurs stage 1: attributes, native initialize, finalize", "[hle][s
     REQUIRE(a.call("cellSpursAttributeSetSpuThreadGroupType", kAttrAddr, 0x18) == 0); // ... fine without the scheduler
     CHECK(a.call("cellSpursInitializeWithAttribute", kSpurs, kAttrAddr) == 0);
     CHECK(a.call("cellSpursFinalize", kSpurs) == 0);
+}
+
+TEST_CASE("sys_ppu_thread_create: TLS, start, entry argument, exit; failed creation returns the TLS slot", "[hle][thread]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
+
+    // TLS template: 0x20-byte image of 0x5A bytes, 0x40 bytes per thread.
+    constexpr u32 kImage = kData + 0x4000;
+    std::memset(base + kImage, 0x5A, 0x20);
+    a.ctx.gpr[13] = 0;
+    REQUIRE(a.call("sys_initialize_tls", 1, kImage, 0x20, 0x40) == a.ctx.gpr[3]);
+    const u32 first_slot = static_cast<u32>(a.ctx.gpr[13]) - hle::kTlsR13Offset;
+
+    // Guest thread: std r13, 0(r3); li r3, 0x55; li r11, 41 (_sys_ppu_thread_exit); sc.
+    constexpr u32 kCode = kData + 0x3000, kOpd = kData + 0x3100, kOut = kData + 0x3200, kId = kData + 0x3300;
+    constexpr u32 kJoined = kData + 0x3400, kName = kData + 0x3500;
+    const u32 code[] = {0xF9A30000, 0x38600055, 0x39600029, 0x44000002};
+    for (u32 i = 0; i < 4; i++) ps_write32(base, kCode + 4 * i, code[i]);
+    ps_write32(base, kOpd, kCode);
+    ps_write32(base, kOpd + 4, 0);
+    std::memcpy(base + kName, "worker", 7);
+
+    // Failures (priority out of range) must not leak TLS slots.
+    for (int i = 0; i < 50; i++) CHECK(a.call("sys_ppu_thread_create", kId, kOpd, kOut, 4000, 0x4000, 1, kName) == r3_of(lv2::CELL_EINVAL));
+
+    REQUIRE(a.call("sys_ppu_thread_create", kId, kOpd, kOut, 1000, 0x4000, 1 /* joinable */, kName) == 0);
+    const u32 id = static_cast<u32>(ps_read64(base, kId));
+    CHECK(id >= 0x01000000);
+    REQUIRE(lv2::sys_ppu_thread_join(*a.t, id, kJoined) == lv2::CELL_OK);
+    CHECK(ps_read64(base, kJoined) == 0x55);
+    const u64 r13 = ps_read64(base, kOut);
+    CHECK(r13 == u64{first_slot} + 0x40 + 0x30 + hle::kTlsR13Offset); // the slot after the caller's, not a leaked one
+    CHECK(ps_read8(base, static_cast<u32>(r13) - 0x7000) == 0x5A);     // the image was copied
+}
+
+TEST_CASE("sceNpManagerGetStatus before NP initialization", "[hle][np]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    CHECK(a.call("sceNpManagerGetStatus", kData) == 0xFFFFFFFF8002AA01ull); // SCE_NP_ERROR_NOT_INITIALIZED
+}
+
+TEST_CASE("cellSpurs tasksets: attributes, creation registers a taskset workload", "[hle][spurs]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u32 kSpursAttr = kData + 0x1000, kSpurs = kData + 0x2000, kTsAttr = kData + 0x4000, kPrio = kData + 0x4400;
+    constexpr u32 kName = kData + 0x4500, kTs0 = kData + 0x6000, kTs1 = kData + 0x8000;
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 5, 200, 2016, 0) == 0);
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
+
+    const u8 prio[8] = {1, 1, 1, 1, 1, 0, 0, 0};
+    std::memcpy(base + kPrio, prio, 8);
+    std::memcpy(base + kName, "physics", 8);
+    REQUIRE(a.call("_cellSpursTasksetAttributeInitialize", kTsAttr, 1, 0x330000, 0x1234, kPrio, 5) == 0);
+    CHECK(ps_read32(base, kTsAttr + 0x20) == 6400); // taskset_size
+    CHECK(ps_read32(base, kTsAttr + 0x18) == 5);    // max_contention
+    REQUIRE(a.call("cellSpursTasksetAttributeSetName", kTsAttr, kName) == 0);
+    CHECK(ps_read32(base, kTsAttr + 0x1C) == kName);
+
+    REQUIRE(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs0, kTsAttr) == 0);
+    CHECK(ps_read64(base, kTs0 + 0x60) == kSpurs);
+    CHECK(ps_read64(base, kTs0 + 0x68) == 0x1234);
+    CHECK(ps_read32(base, kTs0 + 0x74) == 0); // wid
+    CHECK(ps_read8(base, kTs0 + 0x72) == 0x80);
+    CHECK(ps_read32(base, kTs0 + 0x1890) == 6400);
+    CHECK(ps_read32(base, kSpurs + 0xB0) == (0xFFFFu | 0x80000000u)); // wklEnabled: workload 0 claimed
+    CHECK(ps_read32(base, kSpurs + 0xB4) == 0x80000000u);             // wklMskB
+    CHECK(ps_read8(base, kSpurs + 0x80) == 2);                         // wklState1[0] = RUNNABLE
+    CHECK(ps_read64(base, kSpurs + 0xB00) == 0x200);                   // wklInfo1[0].addr: taskset policy marker
+    CHECK(ps_read64(base, kSpurs + 0xB08) == kTs0);                    // .arg: the taskset
+    CHECK(ps_read32(base, kSpurs + 0xB10) == 0x1E40);
+    CHECK(ps_read8(base, kSpurs + 0xB18) == 1);                        // priority[0]
+    CHECK(ps_read8(base, kSpurs + 0x40) == 8);                         // min contention
+    CHECK(ps_read8(base, kSpurs + 0x50) == 5);                         // max contention
+    CHECK(ps_read64(base, kSpurs + 0xE08) == kName);                   // nameInstance
+
+    REQUIRE(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs1, kTsAttr) == 0);
+    CHECK(ps_read32(base, kTs1 + 0x74) == 1);
+    CHECK(ps_read8(base, kSpurs + 0xB20 + 0x14) == ps_read8(base, kSpurs + 0xB00 + 0x14)); // same policy, same unique ID
+
+    ps_write32(base, kTsAttr, 2); // revision
+    CHECK(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs1, kTsAttr) == 0xFFFFFFFF80410902ull);
+    base[kPrio] = 0x10;
+    CHECK(a.call("_cellSpursTasksetAttributeInitialize", kTsAttr, 1, 0x330000, 0, kPrio, 5) == 0xFFFFFFFF80410902ull);
+    REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 }

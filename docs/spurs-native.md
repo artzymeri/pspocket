@@ -34,7 +34,8 @@ and hands the cores back to the PPU threads and the renderer otherwise.
 ## Stages
 
 1. Attributes, initialize, finalize (done).
-2. Workload registry and the scheduler (AddWorkload, ReadyCountStore, WakeUp, workload flag), custom workloads.
-3. Tasksets and tasks (GTA V's physics tasks, Bink, inflate).
+2. Workload registry (done for SPURS1: the guest tables as RPCS3 fills them) and the scheduler (ReadyCountStore,
+   WakeUp, workload flag), custom workloads.
+3. Tasksets (PPU side done) and tasks (GTA V's physics tasks, Bink, inflate).
 4. Event flags, semaphores, barriers, lv2 event queue attachment.
 5. Job chains and SPURS queues (need libsre as the reference).

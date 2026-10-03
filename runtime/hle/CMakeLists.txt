@@ -4,6 +4,7 @@ add_library(pspocket_hle STATIC
     src/cellSysmodule.cpp
     src/modules.cpp
     src/process.cpp
+    src/sceNp.cpp
     src/sysPrxForUser.cpp)
 target_include_directories(pspocket_hle PUBLIC include)
 target_link_libraries(pspocket_hle PUBLIC pspocket::core pspocket::ppu pspocket::lv2)
