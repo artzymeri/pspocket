@@ -10,7 +10,7 @@
 // is committed at host-page granularity (16 KB, D-010); every user allocation is a multiple of 64 KB.
 //
 // Deviations:
-// - Each PPU stack gets a 16 KB (one host page) uncommitted guard below it, not RPCS3's 4 KB guards.
+// - Each PPU stack gets a 16 KB uncommitted guard below it (stack_granule), not RPCS3's 4 KB guards.
 // - sys_mmapper_change_address_access_right, page-fault notification and the _ext allocators are not implemented.
 // - sys_memory_get_page_attribute reports SYS_MEMORY_ACCESS_RIGHT_ANY for everything but stacks (as RPCS3).
 
@@ -43,6 +43,11 @@ constexpr u64 SYS_MEMORY_PROT_READ_WRITE = 0x40000;
 u64 align_up(u64 v, u64 a) { return (v + a - 1) & ~(a - 1); }
 
 u64 host_page() { return GuestMemory::host_page_size(); }
+
+// Guest stack layout unit: stack sizes and the guard below each stack are multiples of 16 KB on every host (the
+// Apple page size, D-010), so guest-visible stack addresses don't depend on the host. Hosts with larger pages
+// round up to their page.
+u64 stack_granule() { return std::max<u64>(host_page(), 0x4000); }
 
 // ---- host shared memory objects
 
@@ -239,7 +244,7 @@ u32 MemoryManager::allocate_user(u64 size, u32 page_size)
 
 u32 MemoryManager::allocate_stack(u32 size, u32& committed)
 {
-    const u64 page = host_page();
+    const u64 page = stack_granule();
     const u64 commit = align_up(size, page);
     const u32 start = stacks.alloc(commit + page, page); // guard page below the stack
     if (!start) return 0;
@@ -255,7 +260,7 @@ u32 MemoryManager::allocate_stack(u32 size, u32& committed)
 void MemoryManager::free_stack(u32 addr, u32 committed)
 {
     kernel.memory().decommit(addr, committed);
-    stacks.free(static_cast<u32>(addr - host_page()));
+    stacks.free(static_cast<u32>(addr - stack_granule()));
 }
 
 bool MemoryManager::map_shared(SharedMemory& mem, u32 addr)

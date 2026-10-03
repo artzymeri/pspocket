@@ -43,6 +43,8 @@ ctest --test-dir build/host --output-on-failure
 ```
 
 - Clang only (D-026). On Linux, prefix the configure step with `CC=clang CXX=clang++`.
+- AArch64-only paths (lifted VMX, SPU FP) on an x86 Linux host: cross-build and test under qemu with
+  `-DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-aarch64-qemu.cmake` into `build/arm64` (D-027).
 
 - Host tools land in `build/host/`: `tools/ps3inspect/ps3inspect`, `recomp/ppu/ppu-lift`,
   `runtime/platform/macos/pspocket-selftest`.

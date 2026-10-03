@@ -27,8 +27,11 @@ target_link_libraries(make_synthetic_ps3_binaries PRIVATE pspocket_test_syntheti
 pspocket_set_warnings(make_synthetic_ps3_binaries)
 
 if(TARGET ps3inspect)
+    # Cross builds run both tools through the emulator; '|' stands in for ';' so the list survives add_test.
+    string(REPLACE ";" "|" ps3inspect_emulator "${CMAKE_CROSSCOMPILING_EMULATOR}")
     add_test(NAME ps3inspect_end_to_end
         COMMAND ${CMAKE_COMMAND}
+            -DEMULATOR=${ps3inspect_emulator}
             -DGENERATOR=$<TARGET_FILE:make_synthetic_ps3_binaries>
             -DPS3INSPECT=$<TARGET_FILE:ps3inspect>
             -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/ps3inspect_e2e

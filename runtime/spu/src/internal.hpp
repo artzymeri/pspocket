@@ -78,8 +78,9 @@ struct HostFpScope {
     HostFpScope& operator=(const HostFpScope&) = delete;
 
 private:
-    u64 saved_ = 0;
-    bool restore_ = false;
+    // Used on AArch64 only (the FPCR switch); other hosts keep the host FP environment throughout.
+    [[maybe_unused]] u64 saved_ = 0;
+    [[maybe_unused]] bool restore_ = false;
 };
 
 } // namespace pspocket::spu::detail

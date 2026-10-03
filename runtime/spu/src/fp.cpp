@@ -9,6 +9,9 @@
 #include <cfenv>
 #include <cmath>
 #endif
+#if defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 #include "pspocket/core/types.hpp"
 
@@ -109,22 +112,40 @@ int ps_spu_fpenv_active(void)
 
 #else
 
-// Other hosts: rounding mode only (flush-to-zero and default-NaN behaviour is the host's). Toolchain builds don't
-// execute SPU code in production; tests on such hosts are best effort.
+// Other hosts: the rounding mode, plus flush-to-zero on x86-64 (MXCSR FTZ flushes denormal results, DAZ treats
+// denormal operands as zero: the two halves of AArch64 FPCR.FZ). Default-NaN behaviour stays the host's. Toolchain
+// builds don't execute SPU code in production; tests on such hosts are best effort, and the AArch64 paths are tested
+// under qemu (cmake/toolchains/linux-aarch64-qemu.cmake).
+namespace {
+#if defined(__x86_64__)
+constexpr u32 kMxcsrFtzDaz = 0x8040;
+u32 flush_bits() { return _mm_getcsr() & kMxcsrFtzDaz; }
+void set_flush_bits(u32 bits) { _mm_setcsr((_mm_getcsr() & ~kMxcsrFtzDaz) | bits); }
+#else
+constexpr u32 kMxcsrFtzDaz = 0;
+u32 flush_bits() { return 0; }
+void set_flush_bits(u32) {}
+#endif
+} // namespace
+
 uint64_t ps_spu_fpenv_enter(void)
 {
     const int old = std::fegetround();
-    if (old == FE_TOWARDZERO) return 0;
+    const u32 old_flush = flush_bits();
+    if (old == FE_TOWARDZERO && old_flush == kMxcsrFtzDaz) return 0;
     std::fesetround(FE_TOWARDZERO);
-    return (1ull << 63) | static_cast<u32>(old);
+    set_flush_bits(kMxcsrFtzDaz);
+    return (1ull << 63) | (u64{old_flush} << 32) | static_cast<u32>(old);
 }
 
 void ps_spu_fpenv_leave(uint64_t token)
 {
-    if (token >> 63) std::fesetround(static_cast<int>(token & 0xFFFFFFFFu));
+    if (!(token >> 63)) return;
+    std::fesetround(static_cast<int>(token & 0xFFFFFFFFu));
+    set_flush_bits(static_cast<u32>(token >> 32) & kMxcsrFtzDaz);
 }
 
-int ps_spu_fpenv_active(void) { return std::fegetround() == FE_TOWARDZERO; }
+int ps_spu_fpenv_active(void) { return std::fegetround() == FE_TOWARDZERO && flush_bits() == kMxcsrFtzDaz; }
 
 #pragma STDC FENV_ACCESS ON
 

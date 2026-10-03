@@ -227,6 +227,18 @@ probe's helper is unused elsewhere, and 128-bit integers go through `s128`/`u128
 `#pragma clang fp contract(off)` for bit-exact FP (GCC would silently fuse multiply-adds), and GCC 13's
 `-Wnull-dereference` fires inside libstdc++. Apple Clang remains the reference compiler.
 
+## D-027 · 2026-10-03 · AArch64 tests run under qemu on x86 Linux; host-independent stack layout
+
+The lifted VMX helpers (`pspocket/ppu/vmx.h`) are NEON and the SPU FP environment is AArch64 FPCR (D-003), so an
+x86 host can't run those paths natively. `cmake/toolchains/linux-aarch64-qemu.cmake` cross-builds the tree with
+Clang for aarch64-linux-gnu and runs the build-time generators and ctest through qemu-user; the whole suite passes
+there, VMX fuzzing included. x86 builds stay supported for everything else: the PPU fuzz test lowers its form-count
+floor when the cases were generated with `--no-vmx`, and the SPU FP environment adds MXCSR FTZ/DAZ to the rounding
+mode on x86-64 (default-NaN behaviour remains the host's; best effort).
+
+lv2 thread stacks are laid out in 16 KB units on every host (size rounded up and a 16 KB guard below), not in host
+pages: guest-visible stack addresses must not differ between a 4 KB-page host and the phone.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

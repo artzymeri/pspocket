@@ -62,6 +62,22 @@ struct ThreadFixture {
     }
 };
 
+// Stack size of the calling thread (pthread_get_stacksize_np is Apple-only).
+usize current_stack_size()
+{
+#if defined(__APPLE__)
+    return pthread_get_stacksize_np(pthread_self());
+#else
+    pthread_attr_t attr;
+    usize size = 0;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        pthread_attr_getstacksize(&attr, &size);
+        pthread_attr_destroy(&attr);
+    }
+    return size;
+#endif
+}
+
 } // namespace
 
 TEST_CASE("lv2 threads: create, start and join run the entry with lv2's initial registers", "[lv2][thread]")
@@ -71,7 +87,7 @@ TEST_CASE("lv2 threads: create, start and join run the entry with lv2's initial 
     usize host_stack = 0;
     t.entries.add(0x10000, [&](PPUContext& ctx) {
         seen = ctx;
-        host_stack = pthread_get_stacksize_np(pthread_self());
+        host_stack = current_stack_size();
         syscall(ctx, kThreadExit, ctx.gpr[3] + 1);
     });
     u32 id = 0;

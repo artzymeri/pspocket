@@ -220,7 +220,8 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
 
     // Every branch/stwcx./trap form goes both ways; every OE form overflows sometimes; every saturating VMX form
     // saturates sometimes and not always; every VMX compare record form sees CR6 "all true" both ways.
-    CHECK(outcomes.size() > 80);
+    // Without lifted VMX (--no-vmx hosts) the saturating and compare-record VMX forms are not there to count.
+    CHECK(outcomes.size() > (ps_fuzz_has_vmx ? 80u : 40u));
     for (const auto& [form, oc] : outcomes) {
         const Op op = static_cast<Op>(form.first);
         INFO("form " << form_name(op, form.second) << ": " << oc.yes << " yes / " << oc.no << " no");

@@ -1,5 +1,6 @@
 # ps3inspect end-to-end test (run by CTest with cmake -P).
 #   -DGENERATOR=<make_synthetic_ps3_binaries> -DPS3INSPECT=<ps3inspect> -DWORK_DIR=<scratch dir>
+#   [-DEMULATOR=<cross-build emulator, '|'-separated>]
 # Writes synthetic binaries, runs ps3inspect on them and checks exit codes and key JSON fields.
 
 cmake_minimum_required(VERSION 3.24)
@@ -10,10 +11,12 @@ foreach(var GENERATOR PS3INSPECT WORK_DIR)
     endif()
 endforeach()
 
+string(REPLACE "|" ";" emulator "${EMULATOR}")
+
 file(REMOVE_RECURSE "${WORK_DIR}")
 file(MAKE_DIRECTORY "${WORK_DIR}")
 
-execute_process(COMMAND "${GENERATOR}" "${WORK_DIR}" RESULT_VARIABLE rc)
+execute_process(COMMAND ${emulator} "${GENERATOR}" "${WORK_DIR}" RESULT_VARIABLE rc)
 if(NOT rc EQUAL 0)
     message(FATAL_ERROR "generator failed (${rc})")
 endif()
@@ -22,7 +25,7 @@ set(failures 0)
 
 # run(<expected exit code> <stdout var> <stderr var> args...)
 function(run expected out_var err_var)
-    execute_process(COMMAND "${PS3INSPECT}" ${ARGN}
+    execute_process(COMMAND ${emulator} "${PS3INSPECT}" ${ARGN}
         WORKING_DIRECTORY "${WORK_DIR}"
         RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
     if(NOT rc EQUAL expected)
