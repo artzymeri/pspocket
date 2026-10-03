@@ -33,8 +33,23 @@ endif()
 
 # Every component directory owns its own CMakeLists.txt. Directories that don't exist yet are skipped,
 # so components can land independently.
+#
+# PSPOCKET_ONLY limits the build to the listed component directories (and their tests/<name> suites), e.g.
+#   -DPSPOCKET_ONLY="runtime/core;runtime/spu;tests/core;tests/spu"
+# so work in progress elsewhere in the tree can't break a focused build. Empty = everything.
+set(PSPOCKET_ONLY "" CACHE STRING "Semicolon-separated component directories to build (empty = all)")
+
+function(pspocket_component_enabled dir out)
+    if(PSPOCKET_ONLY STREQUAL "" OR "${dir}" IN_LIST PSPOCKET_ONLY OR "${dir}" STREQUAL "third_party")
+        set(${out} TRUE PARENT_SCOPE)
+    else()
+        set(${out} FALSE PARENT_SCOPE)
+    endif()
+endfunction()
+
 function(pspocket_add_component dir)
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt)
+    pspocket_component_enabled(${dir} enabled)
+    if(enabled AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt)
         add_subdirectory(${dir})
     endif()
 endfunction()
