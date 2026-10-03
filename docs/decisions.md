@@ -364,6 +364,10 @@ structures (CellSpurs, attributes, tasksets, event flags, ...) keep RPCS3's layo
 their SPU code read them. Reference: RPCS3 cellSpurs.cpp / cellSpursSpu.cpp where they implement a feature. Where they
 don't (job chains: `spursJobChainEntry` is empty; SPURS queues: UNIMPLEMENTED), the reference is Sony's libsre from the
 user's firmware file, read on the Mac to learn the behaviour and used as a test oracle, never shipped or committed.
+RPCS3's SPU side is a reference for structures only: its native task and kernel entry points are commented out and it
+runs libsre's policy-module code even in HLE mode. Architecture and stages: docs/spurs-native.md. Stage 1 (attributes,
+initialize, finalize) does not create the SPU thread group, handler threads, lv2 semaphores or the guest lwmutex/lwcond
+that libsre's kernel uses; those CellSpurs fields stay 0.
 
 ## Open decisions (plan section 14)
 

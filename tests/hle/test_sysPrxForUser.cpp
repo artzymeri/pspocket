@@ -257,3 +257,73 @@ TEST_CASE("cellSysmodule: load counts, dependencies, default and virtual modules
     CHECK(a.call("cellSysmoduleIsLoaded", 0xF000) == kUnknown);
     CHECK(a.call("cellSysmoduleFinalize") == 0);
 }
+
+TEST_CASE("cellSpurs stage 1: attributes, native initialize, finalize", "[hle][spurs]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u32 kAttrAddr = kData + 0x1000, kSpurs = kData + 0x2000, kPrefix = kData + 0x1800;
+    constexpr u64 kInval = 0xFFFFFFFF80410702ull, kAlign = 0xFFFFFFFF80410710ull, kStat = 0xFFFFFFFF8041070Full,
+                  kNull = 0xFFFFFFFF80410711ull, kLv2Inval = 0xFFFFFFFF80010002ull;
+
+    std::memset(base + kAttrAddr, 0xCC, 0x200);
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kAttrAddr, 2, 0x330000, 5, 250, 1000, 1) == 0);
+    CHECK(ps_read32(base, kAttrAddr + 0x0) == 2);
+    CHECK(ps_read32(base, kAttrAddr + 0x4) == 0x330000);
+    CHECK(ps_read32(base, kAttrAddr + 0x8) == 5);
+    CHECK(ps_read32(base, kAttrAddr + 0xC) == 250);
+    CHECK(ps_read32(base, kAttrAddr + 0x10) == 1000);
+    CHECK(ps_read8(base, kAttrAddr + 0x14) == 1);
+    CHECK(ps_read32(base, kAttrAddr + 0x28) == 0); // flags cleared with the rest
+    CHECK(ps_read8(base, kAttrAddr + 0x1FF) == 0);
+    CHECK(a.call("_cellSpursAttributeInitialize", kAttrAddr + 4, 2, 0, 5, 250, 1000, 0) == kAlign);
+    CHECK(a.call("_cellSpursAttributeInitialize", 0, 2, 0, 5, 250, 1000, 0) == kNull);
+
+    std::memcpy(base + kPrefix, "gta5spurs", 9);
+    REQUIRE(a.call("cellSpursAttributeSetNamePrefix", kAttrAddr, kPrefix, 9) == 0);
+    CHECK(std::memcmp(base + kAttrAddr + 0x15, "gta5spurs", 9) == 0);
+    CHECK(ps_read32(base, kAttrAddr + 0x24) == 9);
+    CHECK(a.call("cellSpursAttributeSetNamePrefix", kAttrAddr, kPrefix, 16) == kInval);
+
+    REQUIRE(a.call("cellSpursAttributeSetSpuThreadGroupType", kAttrAddr, 0x18) == 0); // exclusive non-context
+    CHECK(ps_read32(base, kAttrAddr + 0x28) == 0x20000000u);
+    REQUIRE(a.call("cellSpursAttributeSetSpuThreadGroupType", kAttrAddr, 0) == 0);
+    CHECK(ps_read32(base, kAttrAddr + 0x28) == 0);
+    CHECK(a.call("cellSpursAttributeSetSpuThreadGroupType", kAttrAddr, 2) == kInval);
+
+    std::memset(base + kSpurs, 0xAB, 0x1100);
+    CHECK(a.call("cellSpursInitializeWithAttribute", kSpurs + 0x40, kAttrAddr) == kAlign);
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kAttrAddr) == 0);
+    CHECK(ps_read32(base, kSpurs + 0xDA0) == 2);        // revision
+    CHECK(ps_read32(base, kSpurs + 0xDA4) == 0x330000); // sdkVersion
+    CHECK(ps_read8(base, kSpurs + 0x76) == 5);          // nSpus
+    CHECK(ps_read32(base, kSpurs + 0xD84) == 250);      // spuPriority
+    CHECK(ps_read32(base, kSpurs + 0xD88) == 1000);     // ppuPriority
+    CHECK(ps_read32(base, kSpurs + 0xD80) == 1);        // flags: SAF_EXIT_IF_NO_WORK from exitIfNoWork
+    CHECK(ps_read8(base, kSpurs + 0x74) == 0x80);       // flags1: SF1_EXIT_IF_NO_WORK
+    CHECK(ps_read32(base, kSpurs + 0xB0) == 0xFFFF);    // wklEnabled
+    CHECK(ps_read32(base, kSpurs + 0x60) == 0xFFFFFFFFu); // wklFlag.flag
+    CHECK(ps_read8(base, kSpurs + 0x77) == 0xFF);       // wklFlagReceiver
+    CHECK(ps_read64(base, kSpurs + 0xD20) == 0xFFFFFFFFull); // ppu0
+    CHECK(ps_read8(base, kSpurs + 0xC7) == 0xFF);       // sysSrvPreemptWklId[7]
+    CHECK(ps_read64(base, kSpurs + 0xD00) == 0x100);    // wklInfoSysSrv.addr
+    CHECK(ps_read32(base, kSpurs + 0xD74) == 0x818);    // spuImg.entry_point
+    CHECK(ps_read8(base, kSpurs + 0xD9B) == 9);         // prefixSize
+    CHECK(std::memcmp(base + kSpurs + 0xD8C, "gta5spurs", 9) == 0);
+    CHECK(ps_read8(base, kSpurs + 0x200) == 0);         // the rest of the 4 KB is cleared
+    CHECK(ps_read8(base, kSpurs + 0x1000) == 0xAB);     // and nothing past it (SPURS1)
+    CHECK(a.call("cellSpursInitializeWithAttribute", kSpurs, kAttrAddr) == kStat); // already initialized
+
+    REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+    CHECK(a.call("cellSpursFinalize", kSpurs) == kStat);
+
+    ps_write32(base, kAttrAddr + 0x8, 7); // 7 SPUs: the SPU thread group would refuse it
+    CHECK(a.call("cellSpursInitializeWithAttribute", kSpurs, kAttrAddr) == kLv2Inval);
+    ps_write32(base, kAttrAddr + 0x8, 6);
+    ps_write32(base, kAttrAddr + 0xC, 8); // priority below 16 ...
+    CHECK(a.call("cellSpursInitializeWithAttribute", kSpurs, kAttrAddr) == kLv2Inval);
+    REQUIRE(a.call("cellSpursAttributeSetSpuThreadGroupType", kAttrAddr, 0x18) == 0); // ... fine without the scheduler
+    CHECK(a.call("cellSpursInitializeWithAttribute", kSpurs, kAttrAddr) == 0);
+    CHECK(a.call("cellSpursFinalize", kSpurs) == 0);
+}
