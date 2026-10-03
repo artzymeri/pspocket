@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Blocks commits that would add game data, firmware or keys (CLAUDE.md rule 1).
+# Enabled per clone with: git config core.hooksPath .githooks
+#
+# Checks every staged file (added or modified) by content, not just by name, so `git add -f` can't sneak in a
+# PS3 executable, package or disc image under another name.
+
+set -euo pipefail
+
+fail=0
+report() {
+    echo "pre-commit: refusing $1: $2" >&2
+    fail=1
+}
+
+# Name patterns (mirrors .gitignore, in case of `git add -f`).
+name_re='\.(iso|elf|self|sprx|prx|sfo|pkg|pup|rap|edat|sdat)$|(^|/)EBOOT\.BIN$|(^|/)keys/|(^|/)PS3_GAME/|(^|/)dev_(hdd0|flash)/'
+
+while IFS= read -r -d '' path; do
+    if [[ "$path" =~ $name_re ]] || [[ "$(tr '[:upper:]' '[:lower:]' <<<"$path")" =~ $name_re ]]; then
+        report "$path" "file name matches a game-data pattern"
+        continue
+    fi
+
+    # Read the staged blob, not the working-tree file.
+    head_hex=$(git cat-file -p ":$path" 2>/dev/null | head -c 20 | xxd -p | tr -d '\n')
+    case "$head_hex" in
+        7f454c46*)
+            # ELF: block big-endian PowerPC (EM_PPC64 = 21 / EM_PPC = 20) and SPU (EM_SPU = 23) images.
+            # e_ident[EI_DATA] is byte 5; e_machine is bytes 18-19.
+            data=${head_hex:10:2}
+            machine=${head_hex:36:4}
+            if [[ "$data" == "02" && ( "$machine" == "0015" || "$machine" == "0014" || "$machine" == "0017" ) ]]; then
+                report "$path" "PS3 ELF image (PPU/SPU executable or PRX)"
+            fi
+            ;;
+        53434500*) report "$path" "SCE container (SELF/SPRX/SDAT)" ;;
+        7f504b47*) report "$path" "PS3 package (PKG)" ;;
+        00505346*) report "$path" "PARAM.SFO" ;;
+        4e504400*) report "$path" "NPD/EDAT data" ;;
+    esac
+
+    # ISO 9660 volume descriptor ("CD001" at offset 0x8001).
+    size=$(git cat-file -s ":$path" 2>/dev/null || echo 0)
+    if (( size > 0x8006 )); then
+        if [[ "$(git cat-file -p ":$path" | head -c $((0x8006)) | tail -c 5)" == "CD001" ]]; then
+            report "$path" "ISO 9660 disc image"
+        fi
+    fi
+
+    # Large binaries deserve a second look (generated code and dumps both tend to be big).
+    if (( size > 8 * 1024 * 1024 )); then
+        report "$path" "larger than 8 MB; game data or generated code? (commit with --no-verify only if you're sure)"
+    fi
+done < <(git diff --cached --name-only --diff-filter=AM -z)
+
+# Key-like material: long hex runs in staged text additions.
+if git diff --cached --diff-filter=AM -U0 | grep -E '^\+' | grep -v -E '^\+\+\+' |
+    grep -q -i -E '(erk|riv|klic|rap|aes|key)[a-z_]*\s*[:=\[{(].{0,8}[0-9a-f]{32,}'; then
+    report "staged text" "looks like a cryptographic key next to a key-ish name"
+fi
+
+if (( fail )); then
+    echo "pre-commit: see CLAUDE.md rule 1. Nothing derived from game data, firmware or keys goes into git." >&2
+    exit 1
+fi

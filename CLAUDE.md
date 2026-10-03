@@ -28,6 +28,12 @@ First title: GTA IV (BLES00229, update 1.08). The plan is `docs/plan.md`; decisi
     reference file in a comment whenever semantics come from it. Where hardware manuals and RPCS3 disagree with real
     games, real games win.
 
+## Setup (once per clone)
+
+```sh
+git config core.hooksPath .githooks   # pre-commit refuses PS3 executables, PKGs, SFOs, disc images, key-like text
+```
+
 ## Build and test
 
 ```sh
