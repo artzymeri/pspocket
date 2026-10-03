@@ -40,7 +40,7 @@ endif()
 set(PSPOCKET_ONLY "" CACHE STRING "Semicolon-separated component directories to build (empty = all)")
 
 function(pspocket_component_enabled dir out)
-    if(PSPOCKET_ONLY STREQUAL "" OR "${dir}" IN_LIST PSPOCKET_ONLY OR "${dir}" STREQUAL "third_party")
+    if(PSPOCKET_ONLY STREQUAL "" OR "${dir}" IN_LIST PSPOCKET_ONLY OR "${dir}" STREQUAL "third_party" OR "${dir}" STREQUAL "tests")
         set(${out} TRUE PARENT_SCOPE)
     else()
         set(${out} FALSE PARENT_SCOPE)
