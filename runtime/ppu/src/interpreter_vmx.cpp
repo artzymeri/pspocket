@@ -23,7 +23,6 @@ namespace pspocket::ppu {
 namespace {
 
 using V = ps_v128;
-using u128 = unsigned __int128;
 
 inline float fl(u32 bits) { return std::bit_cast<float>(bits); }
 inline u32 bits(float f) { return std::bit_cast<u32>(f); }

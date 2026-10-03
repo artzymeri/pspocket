@@ -239,6 +239,56 @@ mode on x86-64 (default-NaN behaviour remains the host's; best effort).
 lv2 thread stacks are laid out in 16 KB units on every host (size rounded up and a 16 KB guard below), not in host
 pages: guest-visible stack addresses must not differ between a 4 KB-page host and the phone.
 
+## D-028 · 2026-10-03 · PPU VMX: RPCS3 accuracy model, NEON lifted code, scalar oracle
+
+Recorded after the fact for the agent work merged in 8e99d87; full detail in `pspocket/ppu/vmx.h`.
+All VMX instructions execute in the interpreter (`runtime/ppu/src/interpreter_vmx.cpp`, scalar, per element) and
+lift to NEON (`vmx.h`, one static inline function per instruction, `uint32x4_t` locals in D-004 order); the
+differential fuzz compares them bit for bit, NaN payloads included. Semantics are RPCS3's with its accuracy options
+on: VSCR[NJ] flushes denormals (inputs and the results RPCS3 flushes), NaN results are the first NaN operand
+(vA, vB order, quieted) else 0x7fc00000, VSCR[SAT] is sticky (a vector accumulator in lifted code). vrefp,
+vrsqrtefp, vexptefp and vlogefp are correctly rounded (host libm), not the hardware estimates. mfvscr/mtvscr use
+guest word 3 as the architecture does (RPCS3's interpreter uses word 0). Lifted VMX is AArch64-only (D-003); x86
+hosts fuzz it under qemu (D-027).
+
+## D-029 · 2026-10-03 · SPU: interpreter, lifter, channels and MFC; FP model in the host FP environment
+
+Detail in `pspocket/spu/fp.h`, `context.h`, `runtime.h` and `recomp/spu/.../lifter.hpp`. SPU code runs with the
+host FPCR set to FZ + round-toward-zero + DN, entered once per SPU thread, so single-precision arithmetic is native.
+Two single-precision models, per context: APPROXIMATE (default; RPCS3's default xfloat: IEEE single in that
+environment, with RPCS3's fm/fma/fs fixups) and ACCURATE (extended range in double precision). Double precision
+rounds to nearest inside one FPCR window per instruction. frest/frsqest/fi are RPCS3's tables, bit-exact. Lifted
+programs are keyed by a hash of their LS code range, entered at any block start, and fall back to the interpreter
+(logging the address) for unknown targets. Channels, mailboxes, signals, events, the decrementer and MFC DMA/list
+commands live in the runtime; contexts without a host thread stop with PS_SPU_STOP_BLOCKED instead of blocking.
+
+## D-030 · 2026-10-03 · One reservation system for PPU and SPU: seqlocked 128-byte line versions
+
+Detail in `runtime/core/src/reservation.cpp` (contract: `pspocket/core/reservation.h`). 32768 version slots, one per
+128-byte host cache line, hashed from the guest line index. A slot is a seqlock and a stripe lock at once;
+conditional stores compare the whole line against the snapshot and write changed 8-byte words with CAS, so plain
+stores (which take no lock) are never lost. Waits with timeouts use parked mutex/condvar buckets counted per slot,
+so an uncontended store costs one extra load.
+
+## D-031 · 2026-10-03 · lv2: host threads, no scheduler emulation, VFS over host directories
+
+Detail in `pspocket/lv2/kernel.hpp` and the source headers in `runtime/lv2/src/`. Every PPU thread is a host thread
+(8 MB stack, D-015) running lifted code with interpreter fallback; blocking syscalls block it; priorities only order
+SYS_SYNC_PRIORITY wait queues and choose host QoS. Thread exit unwinds through lifted code with a C++ exception, so
+lifted code must keep unwind tables. Memory follows RPCS3's area layout (256 MB user areas, stacks in
+0xD0000000..0xE0000000, D-027 for their granularity). sys_fs maps mount points to host directories with normalised
+paths (no escape from a mount), no NPDRM, case-sensitive like iOS. Not yet: interrupt-thread establishment,
+sys_mmapper access-right changes and page-fault notification.
+
+## D-032 · 2026-10-03 · RSX: portable front end, Metal backend, write tracking by protection or hash
+
+Detail in `pspocket/rsx/rsx.hpp`, `shader/ir.hpp`, `write_tracker.hpp`. The FIFO parser, method table, register
+state, shader microcode decoding (VP/FP to an IR, then MSL) and texture layouts are portable C++ tested on any host;
+the Metal backend (`runtime/rsx/metal/`, Objective-C++ with ARC) builds on Apple platforms only. Semaphores, labels
+and reports are written in command order. Written guest memory behind GPU copies is detected either by page
+protection (the plan's design; 3.7 µs per fault on the A19 Pro) or, until the platform fault handler is installed,
+by content hashes.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

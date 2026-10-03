@@ -12,10 +12,10 @@ user's own disc dump. No JIT, no interpreter on the hot path. First title: GTA V
 | Phase | Gate | State |
 |---|---|---|
 | 0 · Inventory and go/no-go | Inventory report, go/no-go | GTA V inventory done, **go** ([docs/phase0-gta5.md](docs/phase0-gta5.md)); runtime trace (job chains) still to do |
-| 1 · Toolchain foundation | Samples recompile and match the interpreter; GTA IV ELF lifts | Loader, NID database, manifest done; PPU interpreter and lifter in progress |
-| 2 · Runtime core on macOS | Test suite passes; EBOOT boots to its first unimplemented call | Guest memory, logging, timebase done; lv2 kernel and shared reservations in progress (D-018) |
-| 3 · SPU | Stress runs, every inventoried SPU program lifts | SPU interpreter, MFC and lifter in progress (D-018) |
-| 4 · RSX to Metal | Menu renders on macOS and iOS | RSX FIFO and Metal backend in progress (D-018); iOS test host proven on device ([runs](docs/runs/README.md)) |
+| 1 · Toolchain foundation | Samples recompile and match the interpreter; GTA V ELF lifts | Loader, NID database, manifest; PPU interpreter and lifter including VMX (D-028), differential fuzz green. Re-lifting the GTA V ELF with VMX: to do on the Mac |
+| 2 · Runtime core on macOS | Test suite passes; EBOOT boots to its first unimplemented call | Guest memory, timebase, shared reservations (D-030), lv2 kernel: threads, sync, events, memory, time, fs (D-031). Next: firmware-module (HLE) layer and the boot host |
+| 3 · SPU | Stress runs, every inventoried SPU program lifts | SPU interpreter, channels, MFC and lifter (D-029); SPURS not started (needs the firmware file, D-024) |
+| 4 · RSX to Metal | Menu renders on macOS and iOS | FIFO, methods, state, shader decode to MSL, textures, write tracking, Metal backend (D-032); iOS test host proven on device ([runs](docs/runs/README.md)) |
 | 5–7 · Bring-up, performance, app | | Not started |
 
 ## Build
@@ -26,6 +26,9 @@ ninja -C build/host
 ctest --test-dir build/host --output-on-failure
 ./build/host/runtime/platform/macos/pspocket-selftest
 ```
+
+Clang only (D-026). On Linux: `CC=clang CXX=clang++ cmake ...`; the AArch64-only paths are tested under qemu with
+`-DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-aarch64-qemu.cmake` (D-027).
 
 iOS test host on a connected iPhone: `scripts/ios.sh all` (see [app/ios/README.md](app/ios/README.md)).
 
