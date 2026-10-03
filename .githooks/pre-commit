@@ -23,7 +23,8 @@ while IFS= read -r -d '' path; do
     fi
 
     # Read the staged blob, not the working-tree file.
-    head_hex=$(git cat-file -p ":$path" 2>/dev/null | head -c 20 | xxd -p | tr -d '\n')
+    # od is POSIX (xxd is missing on minimal Linux images, and an empty hex string would let everything through).
+    head_hex=$(git cat-file -p ":$path" 2>/dev/null | head -c 20 | od -An -v -tx1 | tr -d ' \n')
     case "$head_hex" in
         7f454c46*)
             # ELF: block big-endian PowerPC (EM_PPC64 = 21 / EM_PPC = 20) and SPU (EM_SPU = 23) images.
