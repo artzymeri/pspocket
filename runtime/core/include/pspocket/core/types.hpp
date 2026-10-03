@@ -16,5 +16,8 @@ using s64 = std::int64_t;
 using f32 = float;
 using f64 = double;
 using usize = std::size_t;
+// 128-bit integers are a GCC/Clang extension; __extension__ keeps -Wpedantic quiet on both.
+__extension__ using s128 = __int128;
+__extension__ using u128 = unsigned __int128;
 
 } // namespace pspocket

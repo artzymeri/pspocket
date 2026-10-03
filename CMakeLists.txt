@@ -15,6 +15,13 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Clang only (Apple Clang on macOS/iOS, LLVM Clang on Linux): the FP-contraction pragmas, the warning set and the
+# lifted code's extensions are Clang's. GCC is rejected here rather than half-working (D-026).
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "pspocket builds with Clang only (found ${CMAKE_CXX_COMPILER_ID}). "
+        "On Linux: CC=clang CXX=clang++ cmake ...")
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()

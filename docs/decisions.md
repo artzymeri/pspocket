@@ -218,6 +218,15 @@ The user owns a GTA V dump and no GTA IV dump, the inventory says go, and the us
 the user approved using Sony's official PS3UPDAT.PUP; it is placed by the user (this session's tooling may not
 fetch it) under `inventory/firmware/`, outside git.
 
+## D-026 · 2026-10-03 · Clang only; the tree builds and tests on Linux
+
+Cloud sessions run on Linux, so the host build (toolchain, runtime, tests) must work there too, not only on the Mac.
+The tree now builds and passes ctest on Linux with LLVM Clang: `sys/sysctl.h` is included on Apple only, the QoS
+probe's helper is unused elsewhere, and 128-bit integers go through `s128`/`u128` in `pspocket/core/types.hpp`
+(`__extension__`, so `-Wpedantic` stays quiet). GCC is rejected at configure time: the interpreter relies on
+`#pragma clang fp contract(off)` for bit-exact FP (GCC would silently fuse multiply-adds), and GCC 13's
+`-Wnull-dereference` fires inside libstdc++. Apple Clang remains the reference compiler.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

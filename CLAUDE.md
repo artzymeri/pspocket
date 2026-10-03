@@ -42,6 +42,8 @@ ninja -C build/host
 ctest --test-dir build/host --output-on-failure
 ```
 
+- Clang only (D-026). On Linux, prefix the configure step with `CC=clang CXX=clang++`.
+
 - Host tools land in `build/host/`: `tools/ps3inspect/ps3inspect`, `recomp/ppu/ppu-lift`,
   `runtime/platform/macos/pspocket-selftest`.
 - Phase 0 inventory: `ps3inspect --json inventory/gta4/eboot.json EBOOT.elf` (`inventory/` is gitignored; see

@@ -7,7 +7,6 @@
 #include <pthread.h>
 #include <string>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
 #include <sys/utsname.h>
 #include <thread>
 #include <unistd.h>
@@ -15,6 +14,7 @@
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#include <sys/sysctl.h>
 #include <pthread/qos.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
@@ -337,7 +337,7 @@ u64 integer_workload()
     return x;
 }
 
-void* qos_thread(void* arg)
+[[maybe_unused]] void* qos_thread(void* arg) // unused off Apple: the probe skips there
 {
     auto* run = static_cast<QosRun*>(arg);
     const auto start = Clock::now();
