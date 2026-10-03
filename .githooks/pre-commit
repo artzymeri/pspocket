@@ -5,7 +5,7 @@
 # Checks every staged file (added or modified) by content, not just by name, so `git add -f` can't sneak in a
 # PS3 executable, package or disc image under another name.
 
-set -euo pipefail
+set -eu  # no pipefail: `git cat-file | head` closes the pipe early by design
 
 fail=0
 report() {
