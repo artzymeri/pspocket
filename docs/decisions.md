@@ -289,6 +289,33 @@ and reports are written in command order. Written guest memory behind GPU copies
 protection (the plan's design; 3.7 µs per fault on the A19 Pro) or, until the platform fault handler is installed,
 by content hashes.
 
+## D-033 · 2026-10-03 · HLE linkage and the process loader; pspocket-boot for Phase 2 bring-up
+
+`runtime/hle` holds the firmware modules implemented on the host and the per-process linkage; `runtime/loader` turns
+a decrypted ELF into a running lv2 process; `pspocket-boot` runs it under the interpreter on any host.
+- **Imports** link the way RPCS3 links HLE functions (PPUModule.cpp): one 8-byte entry per function in a main-area
+  block, `{func = entry + 4, toc = 0}`, the zero TOC word doubling as the stub instruction. The stub address is
+  registered in the PPU dispatch table with a trampoline that identifies the import from `ctx->cia`, so lifted code
+  and the interpreter reach HLE through the ordinary indirect-call path, with no special instruction. Executing the
+  stub word directly is an illegal instruction (fails loudly). Unimplemented functions log
+  `UNIMPLEMENTED module::function (NID)` with the caller and r3..r6 and return CELL_ENOSYS, or abort with
+  `--stop-at-first`; imported variables are logged and left unpatched. Reference tables (attribute 0x2000) are
+  patched with RPCS3's ppu_patch_refs types 1/4/6/57.
+- **Registration** is explicit (`register_<module>()` listed in `runtime/hle/src/modules.cpp`), not static
+  initialisers, which a static-library link drops. NIDs are written in the source and checked against `nid_of(name)`
+  by the tests, so the runtime does not need the toolchain's SHA-1 and NID database.
+- **Process start** follows RPCS3 ppu_load_exec with liblv2 in HLE mode (no firmware needed): segments at p_vaddr in
+  the main area (256 MB, or 512 MB for SDK < 2.0), main thread with sys_process_param's priority and decoded stack
+  size, detached; `sysPrxForUser::sys_initialize_tls` runs on the main thread before the entry (TLS blocks of
+  0x30 + p_memsz in a 256 KB main-area region, r13 = block + 0x7030); argv/envp as u64 pointer arrays at the stack
+  top; entry registers r3..r12 as RPCS3 sets them.
+- **Allocation in the main area** (`hle::MainMemory`, RPCS3 vm::alloc in vm::main) is first fit at 64 KB alignment
+  in whole host pages, after the loader reserves the executable's segments.
+- Not yet: PRX loading (the game's own modules, LLE firmware libraries), write protection of read-only segments,
+  charging the segments to the default memory container. The loader uses recomp/common's ELF and module parsers;
+  the iOS app will need them on device too (the EBOOT comes from the user's disc), to be wired in when the app boots
+  a game.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

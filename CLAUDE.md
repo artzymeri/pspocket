@@ -55,6 +55,8 @@ ctest --test-dir build/host --output-on-failure
   Longer differential fuzzing: `PSPOCKET_FUZZ_SEED=<n> PSPOCKET_FUZZ_ITERS=<k> build/host/tests/ppu/test_ppu_fuzz`.
   Never build lifted code with `-ffast-math`/`-Ofast`.
 - Disc images: `ps3disc <image.iso> <out-dir>` (host) or the app's `-extract-iso` mode pulls out the executables only.
+- Boot an executable under the interpreter (Phase 2 bring-up, D-033): `pspocket-boot EBOOT.elf [--bdvd DIR]
+  [--hdd0 DIR] [--timeout S] [--stop-at-first]`; it prints every unimplemented syscall and firmware function it hit.
 - iOS test host: `scripts/ios.sh build|install|run` (XcodeGen project in `app/ios/project.yml`, team M7XJA39ZV6).
 - Use your own build directory (`build/<name>`) when several builds run at once.
 
@@ -67,7 +69,9 @@ recomp/ppu/              PPU analyzer, lifter, C code generation
 recomp/spu/              SPU extractor, analyzer, lifter (Phase 3)
 runtime/core/            guest memory, big-endian accessors, logging, timebase
 runtime/ppu/             PPU context, decoder, interpreter (oracle + fallback), dispatch table
-runtime/lv2/ hle/ spu/ rsx/   later phases
+runtime/lv2/ spu/ rsx/   lv2 kernel, SPU runtime, RSX front end and Metal backend
+runtime/hle/             firmware modules on the host (HLE), import linkage, main-area allocator, TLS
+runtime/loader/          ELF executable -> lv2 process; pspocket-boot
 runtime/selftest/        device self-test probes with a C API (used by the iOS app and macOS CLI)
 runtime/platform/macos/  macOS dev host (pspocket-selftest CLI)
 runtime/platform/ios/    iOS host glue

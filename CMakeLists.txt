@@ -81,6 +81,9 @@ pspocket_add_component(recomp/ppu)
 pspocket_add_component(recomp/spu)
 pspocket_add_component(tools/ps3inspect)
 
+# Process loader and boot host (need both the runtime and recomp/common)
+pspocket_add_component(runtime/loader)
+
 if(PSPOCKET_BUILD_TESTS)
     enable_testing()
     pspocket_add_component(tests)
