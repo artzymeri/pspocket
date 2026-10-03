@@ -342,12 +342,26 @@ is generated from RPCS3's MODULE_INFOS. Internal IDs (0xF000+) return CELL_SYSMO
 until a game uses one. Module state lives in `HleProcess::state<T>()` (RPCS3's g_fxo), so tests and future
 restarts get a fresh copy per process.
 
+## D-036 · 2026-10-03 · Goal: any PS3 game, one Mac-side build per game; GTA V stays the driving title
+
+The user widened the goal from one title to any PS3 disc image. What that means under iOS's rules:
+- **Still static recompilation, one build per game.** iOS gives apps no JIT, so a game's PPU and SPU code is lifted
+  and compiled on the Mac (disc image in, signed app out). The interpreter remains the fallback for code the build
+  missed, ~12× slower (run 003), too slow to be the main path. A phone-only "drop an ISO in" flow isn't possible.
+- **The runtime is shared by every game**: lv2, HLE modules, SPU, RSX→Metal. Rule 6 already keeps it title-free; HLE
+  and syscall coverage grows with each game's boot log, as RPCS3's did (rule 4 applies per title).
+- **GTA V stays the first and driving title**; its gaps are worked first. Other titles follow once it boots.
+- Consequence for SPURS (amends D-024): a native SPURS has to cover every SPURS feature any game uses, and RPCS3 has
+  no reference for two of them (job chains: `spursJobChainEntry` is a stub; SPURS queues: UNIMPLEMENTED). See the
+  open question below.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
 - [x] Game version → D-025: GTA V BLES01807 (GTA IV in D-002 stays as a draft).
 - [x] Toolchain → D-012 (write our own).
-- [~] SPURS → D-024: LLE proposed (needs the user's firmware file); HLE fallback.
+- [~] SPURS → D-024, D-036: the user wants a native SPURS; for "any game" Sony's libsre (LLE) is the compatibility
+  baseline it is built and tested against. Firmware file needed either way.
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
 - [ ] Input: controller required, or a polished touch overlay as well.
 - [ ] ISO handling: extract assets, or read directly from the ISO.

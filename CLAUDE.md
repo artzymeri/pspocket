@@ -1,7 +1,8 @@
 # pspocket — working rules
 
-A per-game static recompiler that turns a PS3 game's PPU and SPU code into a native, signed iOS app.
-First title: GTA IV (BLES00229, update 1.08). The plan is `docs/plan.md`; decisions are `docs/decisions.md`.
+A static recompiler that turns PS3 games' PPU and SPU code into native, signed iOS apps: one Mac-side build per game
+(disc image in, app out), the runtime shared by all of them (D-036). First and driving title: GTA V (BLES01807,
+D-025). The plan is `docs/plan.md`; decisions are `docs/decisions.md`.
 
 ## Rules (plan section 12)
 
