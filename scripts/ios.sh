@@ -295,7 +295,8 @@ cmd_run() {
         require_unlocked "$dev"
         say "launch $BUNDLE_ID ${args[*]+"${args[*]}"} (console; Ctrl-C to stop)"
         set +e +o pipefail
-        xcrun devicectl device process launch --device "$dev" --console --terminate-existing "$BUNDLE_ID" \
+        # `--` keeps devicectl from parsing the app's arguments: it would read -autorun as bundled short flags.
+        xcrun devicectl device process launch --device "$dev" --console --terminate-existing -- "$BUNDLE_ID" \
             ${args[@]+"${args[@]}"} 2>&1 | tee "$log"
         status=${PIPESTATUS[0]}
         set -e -o pipefail
