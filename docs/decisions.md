@@ -31,7 +31,15 @@ host byte `j` = guest byte `15 - j`. So guest element `i` of an `N`-element vect
 in host byte order, and element-wise arithmetic maps straight to NEON. Loads and stores (`lvx`, `stvx`, `lqd`, `stqd`)
 are a 16-byte aligned access plus one byte reverse (`ps_ld128_rev` / `ps_st128_rev` in `runtime/core/include/pspocket/core/be.h`).
 Byte-indexed operations (`vperm`, `lvsl`, `lvsr`, `vsldoi`, SPU `shufb`, the SPU preferred slot) must translate guest
-byte index `b` to host byte `15 - b`. Same convention as XenonRecomp and RPCS3's `v128`.
+byte index `b` to host byte `15 - b`. Same convention as XenonRecomp and RPCS3's `v128` (confirmed by the Phase 0
+evaluation, `docs/phase0-recomp-evaluation.md` §3).
+
+Element-position operations need the same translation: merges, packs and unpacks; even/odd multiplies (a guest even
+element is a host odd lane); sums across lanes and splat-by-index; `lvewx`/`stvewx`, `lvlx`/`lvrx`/`stvlx`/`stvrx`;
+`mfvscr`/`mtvscr` (VSCR is guest word 3 = host lane 0); SPU `gb*`, `fsm*`, the `cbd` family and every preferred-slot
+scalar (host lane 3 for words). Whole-register byte shifts map to native shifts (the reversed register is the guest's
+128-bit value as a little-endian integer). `vperm`/`shufb` should become `vqtbl2q_u8({vB, vA}, vbicq_u8(0x1F, vC))`
+(RPCS3's PANDN trick), to be verified by the fuzz tests.
 
 ## D-005 · 2026-10-03 · std::format instead of fmt
 
@@ -56,11 +64,12 @@ times, no game) lands now, because the riskiest platform assumptions can only be
 the memory entitlements, reserving 4 GB of guest address space, fault-based write tracking, and the real speed of
 interpreted versus lifted PPU code on the A19 Pro. Each later phase adds its probes.
 
-## D-009 · 2026-10-03 · Lifted function signature
+## D-009 · 2026-10-03 · Lifted function signature (amended by D-013)
 
-`void f_XXXXXXXX(PPUContext* restrict ctx, uint8_t* restrict base)` where `XXXXXXXX` is the guest entry address in
-hex. The guest base is an argument (as in XenonRecomp) so it stays in a register through call chains instead of being
-reloaded from the context. Context registers are loaded into locals at entry and spilled around calls and syscalls.
+`void f_XXXXXXXX(PPUContext* restrict ctx, uint8_t* base)` where `XXXXXXXX` is the guest entry address in hex. The
+guest base is an argument (as in XenonRecomp) so it stays in a register through call chains instead of being reloaded
+from the context. Context registers are loaded into locals at entry and spilled around calls and syscalls.
+XenonRecomp-style ABI-trusting register modes may be added later as manifest-controlled options, once the oracle passes.
 
 ## D-010 · 2026-10-03 · Host page granularity
 
@@ -73,11 +82,31 @@ game actually depends on them.
 iPhone 17 Pro Max (A19 Pro, iOS 26), team M7XJA39ZV6 (paid, already proven with the two memory entitlements in
 `ps3-ios-engine`). Bundle IDs live under `com.artzymeri.pspocket`.
 
+## D-012 · 2026-10-03 · Toolchain: our own lifter; ps3recomp is not reused
+
+From the Phase 0 evaluation (`docs/phase0-recomp-evaluation.md`). ps3recomp (MIT) fails silently where our rules
+demand loud failures (unknown instructions become no-ops, unresolved imports return CELL_OK), has no interpreter
+oracle, uses a vector layout that contradicts D-004 with open lane bugs, runs no game on macOS and has no iOS support.
+It also ships decrypted Sony firmware and keys, so nothing is copied from it; at most its pitfall list and synthetic
+jump-table cases are used as test ideas, re-checked against RPCS3. XenonRecomp (MIT) is the design reference for the
+emitter, VMX handling, config/hook/override mechanisms, but it encodes Xenon assumptions (32-bit compares, 32-byte
+`dcbz`, no-op fences, unscaled `mftb`) that do not hold on the Cell. RPCS3 stays the authority for semantics.
+
+## D-013 · 2026-10-03 · Guest accessors are volatile; `base` is not restrict-qualified
+
+Guest code polls memory that other host threads write (SPU completion flags, cellSync, RSX labels, the FIFO get
+pointer). `ps_readN`/`ps_writeN` in `be.h` are therefore volatile accesses through byte-aligned types: the compiler
+cannot hoist, merge or drop them, unaligned guest addresses stay well-defined, and on ARM64 each is still one
+`LDR`/`STR` (+ `REV`) with `base + uxtw(addr)` folded into the addressing mode. `restrict` is dropped from `base` in
+the lifted signature, because HLE code and other threads legitimately touch guest memory during a lifted call. Lifted
+prologues assume `base` is 64 KB-aligned. Host-pointer accessors (`ps_ldN`/`ps_stN`) stay plain. Cost on the M4:
+scalar big-endian loads 12 GB/s (the earlier 50–60 GB/s came from auto-vectorization lifted code can't use anyway).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
-- [x] Game version → D-002.
-- [ ] Toolchain: reuse PS3Recomp (sp00nznet/ps3recomp) or write our own. Decided by the Phase 0 evaluation.
+- [~] Game version → D-002 (tentative: no dump yet).
+- [x] Toolchain → D-012 (write our own).
 - [ ] SPURS: HLE or LLE. Decided by the Phase 0 inventory.
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
 - [ ] Input: controller required, or a polished touch overlay as well.
