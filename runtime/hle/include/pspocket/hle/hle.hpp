@@ -54,7 +54,7 @@ private:
 // Every module in src/modules.cpp, built on first use.
 const Registry& registry();
 
-// ---- typed binding: R fn(PPUContext&, A...) with A in {bool, u16, u32, s32, u64, s64}, R in {void, s32, u32, u64};
+// ---- typed binding: R fn(PPUContext&, A...) with A in {bool, u8, u16, u32, s32, u64, s64}, R in {void, s32, u32, u64};
 // up to 16 arguments (the ninth and later on the caller's stack) ----
 
 namespace detail {
@@ -67,6 +67,7 @@ T reg_arg(u64 v)
     else if constexpr (std::is_same_v<T, u32>) return static_cast<u32>(v); // low word, as RPCS3 ppu_gpr_cast
     else if constexpr (std::is_same_v<T, s32>) return static_cast<s32>(static_cast<u32>(v));
     else if constexpr (std::is_same_v<T, u16>) return static_cast<u16>(v);
+    else if constexpr (std::is_same_v<T, u8>) return static_cast<u8>(v);
     else if constexpr (std::is_same_v<T, bool>) return (v & 0xFF) != 0; // b8: the low byte
     else static_assert(sizeof(T) == 0, "unsupported HLE argument type");
 }

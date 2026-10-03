@@ -4,9 +4,11 @@
 // guest words.
 
 #include <atomic>
+#include <cstring>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
+#include "pspocket/core/reservation.h"
 #include "pspocket/core/types.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/ppu/context.h"
@@ -84,6 +86,24 @@ inline void atomic_add_be64(u8* base, u32 addr, u64 delta)
     u64 old = __atomic_load_n(p, __ATOMIC_RELAXED);
     while (!__atomic_compare_exchange_n(p, &old, ps_bswap64(ps_bswap64(old) + delta), true, __ATOMIC_SEQ_CST,
         __ATOMIC_RELAXED)) {
+    }
+}
+
+// An atomic update of the 128-byte guest line at `line` (RPCS3 vm::reservation_op), made through the shared
+// reservation system so it is atomic against PPU lwarx/stwcx. and SPU GETLLAR/PUTLLC on the same line. `fn(u8* copy)`
+// gets a copy of the line (guest byte order: use ps_read*/ps_write* with offsets from 0) and returns true to store it,
+// false to leave the line as it is. It runs again whenever another writer got in first, so it must compute only from
+// the copy. Returns what the last `fn` returned.
+template <typename Fn>
+bool reservation_op(u8* base, u32 line, Fn&& fn)
+{
+    alignas(16) u8 snapshot[PS_RES_LINE_SIZE];
+    alignas(16) u8 copy[PS_RES_LINE_SIZE];
+    for (;;) {
+        const u64 version = ps_res_acquire(base, line, snapshot);
+        std::memcpy(copy, snapshot, sizeof copy);
+        if (!fn(copy)) return false;
+        if (ps_res_store_line(base, line, version, snapshot, copy)) return true;
     }
 }
 

@@ -387,6 +387,19 @@ than a guess. To be checked against libsre once the firmware file is available (
 event flag initialize and workload shutdown follow RPCS3; natively no SPU runs a workload yet, so a shutdown makes it
 removable at once and the completion hook (unused by GTA V so far) is logged, not called.
 
+## D-040 · 2026-10-03 · SPURS SPU ports live in the native instance; event flags follow RPCS3 with two fixes
+
+Run 011. On the PS3, attaching an lv2 event queue to SPURS (`cellSpursAttachLv2EventQueue`, and the queue an event
+flag gets in `cellSpursEventFlagAttachLv2EventQueue`) connects it to an SPU port on every thread of SPURS' SPU thread
+group. A native SPURS has no thread group, so each SPURS instance keeps its own port → queue map, with lv2's rules: a
+given port 0..0x3F (0..0xF from SDK 1.8), or the lowest free one of 0x10..0x3F, and a port whose queue was destroyed
+is free again. The native scheduler will send SPU-side events (an SPU task setting an event flag, a SPURS queue push)
+through this map. Event flag set and wait run as one reservation operation on the flag's 128-byte line, so they stay
+atomic against SPU code using GETLLAR/PUTLLC on it. Two departures from RPCS3, both bugs there: a blocked
+`cellSpursEventFlagWait` returns the bits that woke it, and detaching a queue also disconnects its port. Waking SPU
+tasks that wait on a flag needs the native taskset policy; until it exists that case stops with a fatal log instead of
+being skipped.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

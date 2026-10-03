@@ -15,3 +15,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [008](008-gta5-boot-6-mac.md) | 2026-10-03 | 246075a | M4 Mac, pspocket-boot | Threads run; Bink tasksets; sheap, network and SPU setup requested |
 | [009](009-gta5-boot-7-mac.md) | 2026-10-03 | d749522 | M4 Mac, pspocket-boot | SPU and network setup done; next gap `cellNetCtlInit`; Bink waits on native SPU tasks |
 | [010](010-gta5-boot-8-mac.md) | 2026-10-03 | 0d93ebb | M4 Mac, pspocket-boot | Network up; first job chain attribute (14 arguments) |
+| [011](011-gta5-boot-9-mac.md) | 2026-10-03 | 4f47fde | M4 Mac, pspocket-boot | Seven job chains and the `dependency_spu` taskset created; next gap `cellSpursEventFlagAttachLv2EventQueue` |

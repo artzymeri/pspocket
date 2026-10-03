@@ -30,6 +30,7 @@
 
 namespace pspocket::lv2 {
 
+class EventQueue;
 class Kernel;
 
 // Thrown to unwind a PPU thread's host stack: sys_ppu_thread_exit, process exit and kernel shutdown. It passes
@@ -168,6 +169,8 @@ public:
     Result create_thread(const ThreadParams& params, u32& id_out);
     Result start_thread(u32 id);
     std::shared_ptr<PpuThread> thread(u32 id) const;
+    // A live event queue by ID, or null (HLE modules that connect queues on the guest's behalf: SPURS ports).
+    std::shared_ptr<EventQueue> event_queue(u32 id) const;
 
     // Gives the calling host thread an lv2 thread identity bound to `ctx` (ctx.runtime is set), so it can make
     // syscalls: tests, HLE helper threads. No guest stack is allocated. Undo with detach_thread().

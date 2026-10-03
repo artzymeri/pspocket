@@ -567,3 +567,117 @@ TEST_CASE("cellSpurs job chains: 14-argument attribute (stack arguments), creati
     CHECK(a.call("sys_net_show_ifconfig") == 0);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 }
+
+TEST_CASE("cellSpurs event flags: lv2 queue attach, PPU set and wait, detach; SPURS queue ports; barriers",
+    "[hle][spurs]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u32 kSpursAttr = kData + 0x1000, kSpurs = kData + 0x2000, kTsAttr = kData + 0x4000, kPrio = kData + 0x4400;
+    constexpr u32 kTs = kData + 0x6000, kFlag = kData + 0x8000, kFlag2 = kData + 0x8080, kFlag3 = kData + 0x8100;
+    constexpr u32 kMask = kData + 0x8200, kMaskB = kData + 0x8210, kQueueOut = kData + 0x8220,
+                  kQueueAttr = kData + 0x8230, kPort = kData + 0x8240, kBarrier = kData + 0x8280;
+    constexpr u64 kTaskStat = 0xFFFFFFFF8041090Full, kTaskPerm = 0xFFFFFFFF80410909ull,
+                  kTaskBusy = 0xFFFFFFFF8041090Aull, kTaskInval = 0xFFFFFFFF80410902ull,
+                  kCoreBusy = 0xFFFFFFFF8041070Aull, kCorePerm = 0xFFFFFFFF80410709ull,
+                  kCoreSrch = 0xFFFFFFFF80410705ull, kCoreInval = 0xFFFFFFFF80410702ull;
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 5, 200, 2016, 0) == 0);
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
+    std::memset(base + kPrio, 1, 8);
+    REQUIRE(a.call("_cellSpursTasksetAttributeInitialize", kTsAttr, 1, 0x330000, 0, kPrio, 1) == 0);
+    REQUIRE(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs, kTsAttr) == 0);
+
+    // GTA V's sequence (run 011): an event flag on a taskset, then its lv2 event queue.
+    REQUIRE(a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag, 0 /* auto */, 3 /* ANY2ANY */) == 0);
+    REQUIRE(a.call("cellSpursEventFlagAttachLv2EventQueue", kFlag) == 0);
+    CHECK(ps_read8(base, kFlag + 0x0C) == 0x10); // spuPort: the first dynamic port
+    const u32 queue = ps_read32(base, kFlag + 0x7C);
+    CHECK(f.kernel->event_queue(queue) != nullptr);
+    CHECK(ps_read32(base, kFlag + 0x78) != 0);   // eventPortId: ANY2ANY flags get a local port
+    CHECK(ps_read64(base, kSpurs + 0xDA8) == 0); // spuPortBits: SPURS' own queues don't show
+    CHECK(a.call("cellSpursEventFlagAttachLv2EventQueue", kFlag) == kTaskStat); // already attached
+
+    REQUIRE(a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag2, 1, 1 /* SPU2PPU */) == 0);
+    REQUIRE(a.call("cellSpursEventFlagAttachLv2EventQueue", kFlag2) == 0);
+    CHECK(ps_read8(base, kFlag2 + 0x0C) == 0x11);
+    CHECK(ps_read32(base, kFlag2 + 0x78) == 0); // no local port
+    REQUIRE(a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag3, 1, 2 /* PPU2SPU */) == 0);
+    CHECK(a.call("cellSpursEventFlagAttachLv2EventQueue", kFlag3) == kTaskPerm);
+    CHECK(a.call("cellSpursEventFlagWait", kFlag3, kMask, 0) == kTaskPerm);
+
+    // Bits already set: no blocking; AUTO clears the bits the waiter consumed.
+    REQUIRE(a.call("cellSpursEventFlagSet", kFlag, 0x0003) == 0);
+    CHECK(ps_read16(base, kFlag) == 0x0003);
+    ps_write16(base, kMask, 0x0001);
+    REQUIRE(a.call("cellSpursEventFlagWait", kFlag, kMask, 0 /* OR */) == 0);
+    CHECK(ps_read16(base, kMask) == 0x0001);
+    CHECK(ps_read16(base, kFlag) == 0x0002);
+    CHECK(a.call("cellSpursEventFlagWait", kFlag, kMask, 2) == kTaskInval); // mode
+
+    // A PPU thread blocks (AND 0x000C) until both bits are set, then gets them.
+    std::atomic<u64> b_rc{~0ull};
+    std::atomic<u32> b_mask{0};
+    ps_write16(base, kMaskB, 0x000C);
+    std::thread tb([&] {
+        GuestThread b(f, 1, "b");
+        b_rc = b.call("cellSpursEventFlagWait", kFlag, kMaskB, 1 /* AND */);
+        b_mask = ps_read16(base, kMaskB);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (ps_read16(base, kFlag + 0x04) == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(ps_read16(base, kFlag + 0x04) == 0x000C); // ppuWaitMask
+    CHECK(ps_read8(base, kFlag + 0x06) == 0xF1);       // wait slot 15 (no SPU task holds one), mode AND
+    CHECK(a.call("cellSpursEventFlagWait", kFlag, kMask, 0) == kTaskBusy); // one PPU waiter at a time
+    REQUIRE(a.call("cellSpursEventFlagSet", kFlag, 0x0004) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(b_rc.load() == ~0ull); // still waiting for 0x0008
+    CHECK(a.call("cellSpursEventFlagDetachLv2EventQueue", kFlag) == kTaskBusy);
+    REQUIRE(a.call("cellSpursEventFlagSet", kFlag, 0x0008) == 0);
+    tb.join();
+    CHECK(b_rc.load() == 0);
+    CHECK(b_mask.load() == 0x000C);
+    CHECK(ps_read16(base, kFlag) == 0x0002);     // 0x000C consumed (AUTO)
+    CHECK(ps_read16(base, kFlag + 0x04) == 0);   // no waiter
+    CHECK(ps_read8(base, kFlag + 0x07) == 0);    // ppuPendingRecv
+
+    // Detach destroys the queue and frees the port for the next attach.
+    REQUIRE(a.call("cellSpursEventFlagDetachLv2EventQueue", kFlag) == 0);
+    CHECK(ps_read8(base, kFlag + 0x0C) == 0xFF);
+    CHECK(f.kernel->event_queue(queue) == nullptr);
+    CHECK(a.call("cellSpursEventFlagDetachLv2EventQueue", kFlag) == kTaskStat);
+    CHECK(a.call("cellSpursEventFlagWait", kFlag, kMask, 0) == kTaskStat); // blocking needs the queue
+    REQUIRE(a.call("cellSpursEventFlagAttachLv2EventQueue", kFlag) == 0);
+    CHECK(ps_read8(base, kFlag + 0x0C) == 0x10);
+
+    // cellSpursAttachLv2EventQueue: the game's own queue on a dynamic or given SPU port (spuPortBits records both).
+    ps_write32(base, kQueueAttr, 2);     // SYS_SYNC_PRIORITY
+    ps_write32(base, kQueueAttr + 4, 1); // SYS_PPU_QUEUE
+    REQUIRE(lv2::sys_event_queue_create(*a.t, kQueueOut, kQueueAttr, 0, 8) == 0);
+    const u32 game_queue = ps_read32(base, kQueueOut);
+    REQUIRE(a.call("cellSpursAttachLv2EventQueue", kSpurs, game_queue, kPort, 1) == 0);
+    CHECK(ps_read8(base, kPort) == 0x12);
+    base[kPort] = 5;
+    REQUIRE(a.call("cellSpursAttachLv2EventQueue", kSpurs, game_queue, kPort, 0) == 0);
+    CHECK(ps_read8(base, kPort) == 5);
+    CHECK(ps_read64(base, kSpurs + 0xDA8) == ((1ull << 0x12) | (1ull << 5)));
+    CHECK(a.call("cellSpursAttachLv2EventQueue", kSpurs, game_queue, kPort, 0) == kCoreBusy); // port 5 taken
+    base[kPort] = 0x20;
+    CHECK(a.call("cellSpursAttachLv2EventQueue", kSpurs, game_queue, kPort, 0) == kCorePerm); // > 0xF from SDK 1.8
+    base[kPort] = 6;
+    CHECK(a.call("cellSpursAttachLv2EventQueue", kSpurs, 0x12345678, kPort, 0) == r3_of(lv2::CELL_ESRCH));
+    REQUIRE(a.call("cellSpursDetachLv2EventQueue", kSpurs, 5) == 0);
+    CHECK(ps_read64(base, kSpurs + 0xDA8) == (1ull << 0x12));
+    CHECK(a.call("cellSpursDetachLv2EventQueue", kSpurs, 5) == kCoreSrch);
+    CHECK(a.call("cellSpursDetachLv2EventQueue", kSpurs, 0x40) == kCoreInval);
+    base[kPort] = 5;
+    CHECK(a.call("cellSpursAttachLv2EventQueue", kSpurs, game_queue, kPort, 0) == 0); // free again after detach
+
+    REQUIRE(a.call("cellSpursBarrierInitialize", kTs, kBarrier, 6) == 0);
+    CHECK(ps_read32(base, kBarrier + 0x04) == 6);
+    CHECK(ps_read32(base, kBarrier + 0x34) == kTs);
+    CHECK(a.call("cellSpursBarrierInitialize", kTs, kBarrier, 0) == kTaskInval);
+    CHECK(a.call("cellSpursBarrierInitialize", kTs, kBarrier, 129) == kTaskInval);
+    REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+}

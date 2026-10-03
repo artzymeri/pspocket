@@ -482,6 +482,14 @@ void Kernel::vfs_unmount(std::string_view point) { impl_->vfs.unmount(point); }
 
 std::shared_ptr<PpuThread> Kernel::thread(u32 id) const { return impl_->threads.get<PpuThread>(id); }
 
+std::shared_ptr<EventQueue> Kernel::event_queue(u32 id) const
+{
+    auto q = impl_->objects.get<EventQueue>(id);
+    if (!q) return nullptr;
+    std::lock_guard lk(q->lock);
+    return q->dead ? nullptr : q;
+}
+
 bool Kernel::exited() const
 {
     std::lock_guard lock(impl_->exit_mutex);

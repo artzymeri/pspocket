@@ -2,7 +2,8 @@
 // (rpcs3/Emu/Cell/Modules/cellSpurs.h); API semantics follow RPCS3 cellSpurs.cpp where it implements them.
 //
 // Stage 1: attributes, initialize and finalize. Stage 3a: workload registration and tasksets (PPU side; tasks do not
-// run until the native taskset policy exists). Initialize fills the CellSpurs fields RPCS3's
+// run until the native taskset policy exists). Stage 4 (PPU side): event flags, lv2 event queue ports (D-040),
+// barrier initialize. Initialize fills the CellSpurs fields RPCS3's
 // _spurs::initialize sets that games and SPU code can observe, and registers a host instance. What a native SPURS
 // does not create, because nothing of Sony's SPURS kernel runs: the SPU thread group and its threads (spuTG, spus[]),
 // the PPU handler and event helper threads (ppu0, ppu1), the per-workload lv2 semaphores (wklF1[].sem, semPrv), the
@@ -21,6 +22,8 @@
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/lv2/sync.hpp"
+#include "pspocket/lv2/syscalls.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -44,7 +47,10 @@ enum : u32 {
     CELL_SPURS_POLICY_MODULE_ERROR_STAT = 0x8041080F,
     CELL_SPURS_POLICY_MODULE_ERROR_ALIGN = 0x80410810,
     CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER = 0x80410811,
+    CELL_SPURS_TASK_ERROR_AGAIN = 0x80410901,
     CELL_SPURS_TASK_ERROR_INVAL = 0x80410902,
+    CELL_SPURS_TASK_ERROR_PERM = 0x80410909,
+    CELL_SPURS_TASK_ERROR_BUSY = 0x8041090A,
     CELL_SPURS_TASK_ERROR_STAT = 0x8041090F,
     CELL_SPURS_TASK_ERROR_ALIGN = 0x80410910,
     CELL_SPURS_TASK_ERROR_NULL_POINTER = 0x80410911,
@@ -80,6 +86,10 @@ constexpr u32 CELL_SPURS_MAX_WORKLOAD2 = 32;
 constexpr u32 CELL_SPURS_EVENT_FLAG_LAST = 3;       // ANY2ANY
 constexpr u32 CELL_SPURS_EVENT_FLAG_CLEAR_LAST = 1; // MANUAL
 constexpr u8 CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT = 0xFF;
+constexpr u8 CELL_SPURS_EVENT_FLAG_SPU2PPU = 1, CELL_SPURS_EVENT_FLAG_ANY2ANY = 3;
+constexpr u32 CELL_SPURS_EVENT_FLAG_OR = 0, CELL_SPURS_EVENT_FLAG_AND = 1;
+constexpr u8 CELL_SPURS_EVENT_FLAG_CLEAR_AUTO = 0;
+constexpr u32 CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS = 16;
 
 // SpursAttrFlags
 constexpr u32 SAF_EXIT_IF_NO_WORK = 0x00000001;
@@ -143,6 +153,10 @@ struct Instance {
     u32 nspus = 0;
     bool second = false;
     std::map<u32, Workload> workloads; // by workload ID
+    // SPU port -> lv2 event queue ID. On the PS3, lv2 connects these on every thread of SPURS' SPU thread group
+    // (sys_spu_thread_group_connect_event_all_threads); a native SPURS has no group, so the instance keeps them, and
+    // SPU code run by the native scheduler sends its events through them.
+    std::map<u8, u32> spu_ports;
 };
 
 struct SpursHost {
@@ -240,7 +254,7 @@ s32 initialize(PPUContext& ctx, u32 spurs, u32 revision, u32 sdk_version, s32 ns
         SpursHost& h = host();
         std::lock_guard lock(h.mutex);
         if (h.instances.contains(spurs)) return error(CELL_SPURS_CORE_ERROR_STAT);
-        h.instances[spurs] = Instance{static_cast<u32>(nspus), second, {}};
+        h.instances[spurs] = Instance{static_cast<u32>(nspus), second, {}, {}};
     }
 
     u8* base = guest_base(ctx);
@@ -525,12 +539,104 @@ s32 cellSpursShutdownTaskset(PPUContext& ctx, u32 taskset)
     return r;
 }
 
+// ------------------------------------------------------------------------------------------------- lv2 event queues
+
+constexpr u32 kSpursSpuPortBits = 0xDA8; // CellSpurs::spuPortBits (u64): ports taken by cellSpursAttachLv2EventQueue
+
+// Sets (or clears) bit `port` of CellSpurs::spuPortBits; returns whether it was set before.
+bool update_spu_port_bit(u8* base, u32 spurs, u8 port, bool set)
+{
+    const u64 bit = u64{1} << port;
+    for (;;) {
+        const u64 old = ps_read64(base, spurs + kSpursSpuPortBits);
+        if (atomic_cas_be64(base, spurs + kSpursSpuPortBits, old, set ? old | bit : old & ~bit)) return old & bit;
+    }
+}
+
+// RPCS3 _spurs::attach_lv2_eq. lv2 would connect `queue` to one SPU port of every thread in SPURS' SPU thread group
+// (sys_spu_thread_group_connect_event_all_threads): a given port (0..0x3F; 0..0xF from SDK 1.8) or, dynamic, the
+// lowest free one of 0x10..0x3F. Natively the SPURS instance records the connection. A port whose queue has been
+// destroyed is free again (RPCS3 lv2_obj::check). `spurs_created`: a queue SPURS makes for itself (event flags,
+// queues), which spuPortBits does not show.
+s32 attach_lv2_eq(PPUContext& ctx, u32 spurs, u32 queue, u8& port, bool dynamic, bool spurs_created)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    u32 first = 0x10, last = 0x3F;
+    if (!dynamic) {
+        if (port > 0x3F) return error(CELL_SPURS_CORE_ERROR_INVAL);
+        if (t.kernel.config().sdk_version >= 0x180000 && port > 0xF) return error(CELL_SPURS_CORE_ERROR_PERM);
+        first = last = port;
+    }
+    if (!t.kernel.event_queue(queue)) return lv2::err(lv2::CELL_ESRCH);
+
+    SpursHost& h = host();
+    std::lock_guard lock(h.mutex);
+    const auto it = h.instances.find(spurs);
+    if (it == h.instances.end()) return lv2::err(lv2::CELL_ESRCH); // no SPU thread group: not initialized
+    auto& ports = it->second.spu_ports;
+    u32 p = first;
+    for (; p <= last; p++) {
+        const auto c = ports.find(static_cast<u8>(p));
+        if (c == ports.end() || !t.kernel.event_queue(c->second)) break;
+    }
+    if (p > last) return error(CELL_SPURS_CORE_ERROR_BUSY); // lv2 CELL_EISCONN
+    port = static_cast<u8>(p);
+    ports[port] = queue;
+    if (!spurs_created) update_spu_port_bit(base, spurs, port, true);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 _spurs::detach_lv2_eq. Deviation: the port's connection is removed as well (RPCS3 leaves the SPU threads'
+// port connected, so a detached port can't be attached again until its queue is destroyed).
+s32 detach_lv2_eq(u8* base, u32 spurs, u8 port, bool spurs_created, u32 sdk_version)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (!spurs_created && ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    if (port > 0x3F) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    if (!spurs_created && !update_spu_port_bit(base, spurs, port, false) && sdk_version >= 0x180000) {
+        return error(CELL_SPURS_CORE_ERROR_SRCH);
+    }
+    SpursHost& h = host();
+    std::lock_guard lock(h.mutex);
+    if (const auto it = h.instances.find(spurs); it != h.instances.end()) it->second.spu_ports.erase(port);
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursAttachLv2EventQueue(PPUContext& ctx, u32 spurs, u32 queue, u32 port_addr, s32 dynamic)
+{
+    if (!spurs || !port_addr) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    u8* base = guest_base(ctx);
+    u8 port = dynamic ? 0 : ps_read8(base, port_addr);
+    const s32 rc = attach_lv2_eq(ctx, spurs, queue, port, dynamic != 0, false);
+    if (rc == lv2::CELL_OK) {
+        ps_write8(base, port_addr, port);
+        PS_LOG_INFO(kChan, "cellSpursAttachLv2EventQueue: queue {:#x} on SPU port {:#x} of SPURS {:#x}", queue, port,
+            spurs);
+    }
+    return rc;
+}
+
+s32 cellSpursDetachLv2EventQueue(PPUContext& ctx, u32 spurs, u8 port)
+{
+    return detach_lv2_eq(guest_base(ctx), spurs, port, false, thread_of(ctx).kernel.config().sdk_version);
+}
+
 // ------------------------------------------------------------------------------------------------- event flags
 
 // CellSpursEventFlag (128 bytes, 128-aligned): ctrl (8 bytes), spuTaskUsedWaitSlots, spuTaskWaitMode, spuPort, isIwl,
 // direction, clearMode, ..., addr (u64) at 0x70.
+// ctrl: events (u16), spuTaskPendingRecv (u16), ppuWaitMask (u16), ppuWaitSlotAndMode (u8: slot << 4 | mode),
+// ppuPendingRecv (u8). Wait slot i is bit 15 - i of spuTaskUsedWaitSlots, spuTaskPendingRecv and spuTaskWaitMode.
 namespace ef_off {
-constexpr u32 spuPort = 0x0C, isIwl = 0x0D, direction = 0x0E, clearMode = 0x0F, addr = 0x70, size = 0x80;
+constexpr u32 events = 0x00, spuTaskPendingRecv = 0x02, ppuWaitMask = 0x04, ppuWaitSlotAndMode = 0x06,
+              ppuPendingRecv = 0x07, spuTaskUsedWaitSlots = 0x08, spuTaskWaitMode = 0x0A, spuPort = 0x0C,
+              isIwl = 0x0D, direction = 0x0E, clearMode = 0x0F, spuTaskWaitMask = 0x10,
+              pendingRecvTaskEvents = 0x30, addr = 0x70, eventPortId = 0x78, eventQueueId = 0x7C, size = 0x80;
 }
 
 // RPCS3 _cellSpursEventFlagInitialize.
@@ -553,6 +659,289 @@ s32 _cellSpursEventFlagInitialize(PPUContext& ctx, u32 spurs, u32 taskset, u32 e
         ps_write8(base, event_flag + ef_off::isIwl, 1);
         ps_write64(base, event_flag + ef_off::addr, spurs);
     }
+    return lv2::CELL_OK;
+}
+
+// The CellSpurs an event flag belongs to: its `addr` when made for SPURS itself (isIwl), else the taskset's.
+u32 event_flag_spurs(u8* base, u32 event_flag)
+{
+    const u32 addr = static_cast<u32>(ps_read64(base, event_flag + ef_off::addr));
+    if (ps_read8(base, event_flag + ef_off::isIwl) == 1) return addr;
+    return static_cast<u32>(ps_read64(base, addr + ts_off::spurs));
+}
+
+bool event_flag_to_ppu(u8 direction)
+{
+    return direction == CELL_SPURS_EVENT_FLAG_SPU2PPU || direction == CELL_SPURS_EVENT_FLAG_ANY2ANY;
+}
+
+// An lv2 error from a step of an event flag operation as a SPURS task error (RPCS3: SPURS codes pass unchanged).
+s32 task_error(s32 rc)
+{
+    const u32 u = static_cast<u32>(rc);
+    return (u & 0x0FFF0000) == 0x00410000 ? rc : error(0x80410900 | (u & 0xFF));
+}
+
+// RPCS3 cellSpursEventFlagAttachLv2EventQueue and _spurs::create_lv2_eq: a one-event PPU queue ("_spuEvF") the PPU
+// waiter blocks on, connected to a dynamic SPU port that SPU tasks setting the flag send to; for an ANY2ANY flag also
+// a local event port to it, through which cellSpursEventFlagSet on the PPU wakes the waiter. A misaligned flag gives
+// TASK_ERROR_AGAIN, as in RPCS3. Deviation: a failed port attach is returned (RPCS3's create_lv2_eq destroys the
+// queue and returns CELL_OK).
+s32 cellSpursEventFlagAttachLv2EventQueue(PPUContext& ctx, u32 event_flag)
+{
+    if (!event_flag) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (event_flag % 128) return error(CELL_SPURS_TASK_ERROR_AGAIN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u8 direction = ps_read8(base, event_flag + ef_off::direction);
+    if (!event_flag_to_ppu(direction)) return error(CELL_SPURS_TASK_ERROR_PERM);
+    if (ps_read8(base, event_flag + ef_off::spuPort) != CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT) {
+        return error(CELL_SPURS_TASK_ERROR_STAT);
+    }
+    const u32 spurs = event_flag_spurs(base, event_flag);
+
+    StackVar vars(ctx, base, 24); // queue ID, port ID, sys_event_queue_attribute_t {protocol, type, name[8]}
+    const u32 queue_out = vars.addr(), port_out = vars.addr() + 4, attr = vars.addr() + 8;
+    ps_write32(base, attr, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, attr + 4, lv2::SYS_PPU_QUEUE);
+    std::memcpy(base + attr + 8, "_spuEvF", 8);
+    if (const s32 rc = lv2::sys_event_queue_create(t, queue_out, attr, 0, 1); rc != lv2::CELL_OK) {
+        return task_error(rc);
+    }
+    const u32 queue = ps_read32(base, queue_out);
+    u8 port = 0;
+    if (const s32 rc = attach_lv2_eq(ctx, spurs, queue, port, true, true); rc != lv2::CELL_OK) {
+        lv2::sys_event_queue_destroy(t, queue, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+        return task_error(rc);
+    }
+    if (direction == CELL_SPURS_EVENT_FLAG_ANY2ANY) {
+        s32 rc = lv2::sys_event_port_create(t, port_out, lv2::SYS_EVENT_PORT_LOCAL, 0);
+        if (rc == lv2::CELL_OK) {
+            const u32 eport = ps_read32(base, port_out);
+            rc = lv2::sys_event_port_connect_local(t, eport, queue);
+            if (rc == lv2::CELL_OK) {
+                ps_write32(base, event_flag + ef_off::eventPortId, eport);
+            } else {
+                lv2::sys_event_port_destroy(t, eport);
+            }
+        }
+        if (rc != lv2::CELL_OK) {
+            if (detach_lv2_eq(base, spurs, port, true, t.kernel.config().sdk_version) == lv2::CELL_OK) {
+                lv2::sys_event_queue_destroy(t, queue, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+            }
+            return task_error(rc);
+        }
+    }
+    ps_write32(base, event_flag + ef_off::eventQueueId, queue);
+    ps_write8(base, event_flag + ef_off::spuPort, port);
+    PS_LOG_INFO(kChan, "cellSpursEventFlagAttachLv2EventQueue: event flag {:#x} -> queue {:#x}, SPU port {:#x}",
+        event_flag, queue, port);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellSpursEventFlagDetachLv2EventQueue.
+s32 cellSpursEventFlagDetachLv2EventQueue(PPUContext& ctx, u32 event_flag)
+{
+    if (!event_flag) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (event_flag % 128) return error(CELL_SPURS_TASK_ERROR_AGAIN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u8 direction = ps_read8(base, event_flag + ef_off::direction);
+    if (!event_flag_to_ppu(direction)) return error(CELL_SPURS_TASK_ERROR_PERM);
+    const u8 port = ps_read8(base, event_flag + ef_off::spuPort);
+    if (port == CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT) return error(CELL_SPURS_TASK_ERROR_STAT);
+    if (ps_read16(base, event_flag + ef_off::ppuWaitMask) || ps_read8(base, event_flag + ef_off::ppuPendingRecv)) {
+        return error(CELL_SPURS_TASK_ERROR_BUSY);
+    }
+    ps_write8(base, event_flag + ef_off::spuPort, CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT);
+    const u32 spurs = event_flag_spurs(base, event_flag);
+    if (direction == CELL_SPURS_EVENT_FLAG_ANY2ANY) {
+        const u32 eport = ps_read32(base, event_flag + ef_off::eventPortId);
+        lv2::sys_event_port_disconnect(t, eport);
+        lv2::sys_event_port_destroy(t, eport);
+    }
+    if (detach_lv2_eq(base, spurs, port, true, t.kernel.config().sdk_version) == lv2::CELL_OK) {
+        lv2::sys_event_queue_destroy(t, ps_read32(base, event_flag + ef_off::eventQueueId),
+            lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellSpursEventFlagSet, as one reservation operation on the flag's 128-byte line (SPU tasks update it with
+// GETLLAR/PUTLLC). Wakes the waiting PPU thread of an ANY2ANY flag through its event port. Waking SPU tasks waiting on
+// the flag needs the native taskset policy (D-037 stage 3b); until then that is fatal, never silently skipped.
+s32 cellSpursEventFlagSet(PPUContext& ctx, u32 event_flag, u16 bits)
+{
+    if (!event_flag) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (event_flag % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!event_flag_to_ppu(ps_read8(base, event_flag + ef_off::direction))) return error(CELL_SPURS_TASK_ERROR_PERM);
+
+    bool send = false;
+    u8 ppu_slot = 0;
+    u16 ppu_events = 0, pending_recv = 0;
+    reservation_op(base, event_flag, [&](u8* ef) {
+        send = false;
+        ppu_slot = 0;
+        ppu_events = 0;
+        pending_recv = 0;
+        const u16 events = ps_read16(ef, ef_off::events) | bits;
+        u16 to_clear = 0;
+        const u16 ppu_mask = ps_read16(ef, ef_off::ppuWaitMask);
+        const u8 slot_mode = ps_read8(ef, ef_off::ppuWaitSlotAndMode);
+        if (ps_read8(ef, ef_off::direction) == CELL_SPURS_EVENT_FLAG_ANY2ANY && ppu_mask) {
+            const u16 relevant = events & ppu_mask;
+            if ((ppu_mask & ~relevant) == 0 || ((slot_mode & 0x0F) == CELL_SPURS_EVENT_FLAG_OR && relevant)) {
+                ps_write8(ef, ef_off::ppuPendingRecv, 1);
+                ps_write16(ef, ef_off::ppuWaitMask, 0);
+                ppu_events = relevant;
+                to_clear = relevant;
+                ppu_slot = slot_mode >> 4;
+                send = true;
+            }
+        }
+        const u16 task_pending = ps_read16(ef, ef_off::spuTaskPendingRecv);
+        const u16 wait_mode = ps_read16(ef, ef_off::spuTaskWaitMode);
+        const u16 waiting = ps_read16(ef, ef_off::spuTaskUsedWaitSlots) & ~task_pending;
+        for (u32 slot = 0; slot < CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS; slot++) {
+            const u16 bit = static_cast<u16>(0x8000 >> slot);
+            if (!(waiting & bit)) continue;
+            const u16 mask = ps_read16(ef, ef_off::spuTaskWaitMask + 2 * slot);
+            const u16 relevant = events & mask;
+            if ((mask & ~relevant) == 0 || (!(wait_mode & bit) && relevant)) { // wait mode bit clear: OR
+                to_clear |= relevant;
+                pending_recv |= bit;
+            }
+        }
+        const bool auto_clear = ps_read8(ef, ef_off::clearMode) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO;
+        ps_write16(ef, ef_off::events, auto_clear ? events & ~to_clear : events);
+        ps_write16(ef, ef_off::spuTaskPendingRecv, task_pending | pending_recv);
+        return true;
+    });
+    if (pending_recv) {
+        PS_FATAL(kChan, "cellSpursEventFlagSet({:#x}, {:#06x}) releases SPU tasks (wait slots {:#06x}): waking SPU "
+            "tasks needs the native taskset policy", event_flag, bits, pending_recv);
+    }
+    if (send) {
+        ps_write16(base, event_flag + ef_off::pendingRecvTaskEvents + 2 * ppu_slot, ppu_events);
+        if (const s32 rc = lv2::sys_event_port_send(t, ps_read32(base, event_flag + ef_off::eventPortId), 0, 0, 0);
+            rc != lv2::CELL_OK) {
+            PS_LOG_ERROR(kChan, "cellSpursEventFlagSet({:#x}): waking the PPU waiter failed: {:#x}", event_flag,
+                static_cast<u32>(rc));
+            return task_error(rc);
+        }
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3 _spurs::event_flag_wait (cellSpursEventFlagWait and cellSpursEventFlagTryWait). The PPU thread records its
+// mask and mode in the flag and blocks on the flag's lv2 queue until a setter (PPU, or SPU through the SPU port)
+// meets its condition. Fix: a thread that blocked returns the bits that woke it (RPCS3 then overwrites the mask
+// with an uninitialized value).
+s32 event_flag_wait(PPUContext& ctx, u32 event_flag, u32 mask_addr, u32 mode, bool block)
+{
+    if (!event_flag || !mask_addr) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (event_flag % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (mode > CELL_SPURS_EVENT_FLAG_AND) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u8 direction = ps_read8(base, event_flag + ef_off::direction);
+    if (!event_flag_to_ppu(direction)) return error(CELL_SPURS_TASK_ERROR_PERM);
+    if (block && ps_read8(base, event_flag + ef_off::spuPort) == CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT) {
+        return error(CELL_SPURS_TASK_ERROR_STAT);
+    }
+    if (ps_read16(base, event_flag + ef_off::ppuWaitMask) || ps_read8(base, event_flag + ef_off::ppuPendingRecv)) {
+        return error(CELL_SPURS_TASK_ERROR_BUSY);
+    }
+    const u16 mask = ps_read16(base, mask_addr);
+    s32 rc = lv2::CELL_OK;
+    bool recv = false;
+    u16 received = 0;
+    reservation_op(base, event_flag, [&](u8* ef) {
+        rc = lv2::CELL_OK;
+        recv = false;
+        received = 0;
+        const u16 events = ps_read16(ef, ef_off::events);
+        const u16 relevant = events & mask;
+        const u16 used = ps_read16(ef, ef_off::spuTaskUsedWaitSlots);
+        if (direction == CELL_SPURS_EVENT_FLAG_ANY2ANY) {
+            // The mask must not conflict with an SPU task still waiting: OR never conflicts with OR, OR and AND
+            // conflict when the masks overlap, AND and AND when they differ.
+            u16 waiting = used & ~ps_read16(ef, ef_off::spuTaskPendingRecv);
+            if (mode == CELL_SPURS_EVENT_FLAG_OR) waiting &= ps_read16(ef, ef_off::spuTaskWaitMode);
+            for (u32 slot = 0; slot < CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS; slot++) {
+                if (!(waiting & (0x8000 >> slot))) continue;
+                const u16 other = ps_read16(ef, ef_off::spuTaskWaitMask + 2 * slot);
+                if ((other & mask) && other != mask) {
+                    rc = error(CELL_SPURS_TASK_ERROR_AGAIN);
+                    return false;
+                }
+            }
+        }
+        if ((mask & ~relevant) == 0 || (mode == CELL_SPURS_EVENT_FLAG_OR && relevant)) {
+            if (ps_read8(ef, ef_off::clearMode) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
+                ps_write16(ef, ef_off::events, events & ~relevant);
+            }
+            received = relevant;
+            return true;
+        }
+        if (!block) {
+            rc = error(CELL_SPURS_TASK_ERROR_BUSY);
+            return false;
+        }
+        u8 slot_mode = 0;
+        if (direction == CELL_SPURS_EVENT_FLAG_ANY2ANY) {
+            const u32 free_slot = static_cast<u32>(std::countr_one(used)); // lowest clear bit
+            if (free_slot >= CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS) {
+                rc = error(CELL_SPURS_TASK_ERROR_BUSY);
+                return false;
+            }
+            slot_mode = static_cast<u8>((CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS - 1 - free_slot) << 4);
+        }
+        ps_write8(ef, ef_off::ppuWaitSlotAndMode, static_cast<u8>(slot_mode | mode));
+        ps_write16(ef, ef_off::ppuWaitMask, mask);
+        recv = true;
+        return true;
+    });
+    if (rc != lv2::CELL_OK) return rc;
+    if (recv) {
+        const u32 queue = ps_read32(base, event_flag + ef_off::eventQueueId);
+        if (const s32 r = lv2::sys_event_queue_receive(t, queue, 0, 0); r != lv2::CELL_OK) {
+            PS_LOG_ERROR(kChan, "cellSpursEventFlagWait({:#x}): receive on queue {:#x} failed: {:#x}", event_flag, queue,
+                static_cast<u32>(r));
+            return task_error(r);
+        }
+        const u32 slot = direction == CELL_SPURS_EVENT_FLAG_ANY2ANY
+            ? ps_read8(base, event_flag + ef_off::ppuWaitSlotAndMode) >> 4 : 0;
+        received = ps_read16(base, event_flag + ef_off::pendingRecvTaskEvents + 2 * slot);
+        reservation_op(base, event_flag, [](u8* ef) {
+            ps_write8(ef, ef_off::ppuPendingRecv, 0);
+            return true;
+        });
+    }
+    ps_write16(base, mask_addr, received);
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursEventFlagWait(PPUContext& ctx, u32 event_flag, u32 mask, u32 mode)
+{
+    return event_flag_wait(ctx, event_flag, mask, mode, true);
+}
+
+// ------------------------------------------------------------------------------------------------- barriers
+
+// RPCS3 cellSpursBarrierInitialize. CellSpursBarrier (128 bytes, 128-aligned): zero, remained (u32), taskset at 0x34.
+s32 cellSpursBarrierInitialize(PPUContext& ctx, u32 taskset, u32 barrier, u32 total)
+{
+    if (!taskset || !barrier) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128 || barrier % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (!total || total > 128) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, taskset + ts_off::wid) >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    std::memset(base + barrier, 0, 128);
+    ps_write32(base, barrier + 0x04, total);
+    ps_write32(base, barrier + 0x34, taskset);
     return lv2::CELL_OK;
 }
 
@@ -731,6 +1120,13 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xC10931CB, cellSpursCreateTasksetWithAttribute),
         PS_HLE_FUNC(0xA789E631, cellSpursShutdownTaskset),
         PS_HLE_FUNC(0x5EF96465, _cellSpursEventFlagInitialize),
+        PS_HLE_FUNC(0x87630976, cellSpursEventFlagAttachLv2EventQueue),
+        PS_HLE_FUNC(0x22AAB31D, cellSpursEventFlagDetachLv2EventQueue),
+        PS_HLE_FUNC(0xF5507729, cellSpursEventFlagSet),
+        PS_HLE_FUNC(0x373523D4, cellSpursEventFlagWait),
+        PS_HLE_FUNC(0xB9BC6207, cellSpursAttachLv2EventQueue),
+        PS_HLE_FUNC(0x4E66D483, cellSpursDetachLv2EventQueue),
+        PS_HLE_FUNC(0x7FDF4FEF, cellSpursBarrierInitialize),
         PS_HLE_FUNC(0x3548F483, _cellSpursJobChainAttributeInitialize),
         PS_HLE_FUNC(0x9FEF70C2, cellSpursJobChainAttributeSetName),
         PS_HLE_FUNC(0xBB68D76E, cellSpursJobChainAttributeSetHaltOnError),

@@ -37,6 +37,7 @@ and hands the cores back to the PPU threads and the renderer otherwise.
 2. Workload registry (done for SPURS1: the guest tables as RPCS3 fills them) and the scheduler (ReadyCountStore,
    WakeUp, workload flag), custom workloads.
 3. Tasksets (PPU side done) and tasks (GTA V's physics tasks, Bink, inflate).
-4. Event flags, semaphores, barriers, lv2 event queue attachment.
+4. Event flags (PPU side done: attach, set, wait, detach; SPU-side waits come with the taskset policy), lv2 event
+   queue attachment (done: SPU ports in the native instance, D-040), barriers (initialize done), semaphores.
 5. Job chains (attributes and creation done, workload marker 0x300; running jobs needs libsre as the reference) and
    SPURS queues.
