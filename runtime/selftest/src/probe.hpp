@@ -88,6 +88,8 @@ void probe_mem_bandwidth(ProbeContext&);
 void probe_mem_fault_tracking(ProbeContext&);
 void probe_timebase(ProbeContext&);
 void probe_threads_qos(ProbeContext&);
+void probe_ppu_interp(ProbeContext&); // probes_ppu.cpp
+void probe_ppu_lifted(ProbeContext&);
 
 // True when a debugger is attached (intentional faults would stop in LLDB).
 bool debugger_attached();

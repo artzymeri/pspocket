@@ -177,6 +177,29 @@ SELF with no NPDRM header: no RAP needed). GTA V ships no separate PRX modules. 
 EBOOT once RPCS3 has decrypted it; whether the first title becomes GTA V instead of GTA IV (D-002) is decided from
 that inventory. GTA V is the heavier game (more SPU work, larger engine), so the go/no-go matters more, not less.
 
+## D-023 · 2026-10-03 · PPU interpreter and lifter conventions
+
+- **Registers in lifted code:** CR is `uint8_t cr[32]` (one byte per bit) and XER is separate so/ov/ca/bc bytes, both
+  in the context and in locals; FPRs are doubles. A lifted function loads every register it references at entry,
+  spills the ones it wrote before calls and returns, and reloads after calls; nothing relies on the ABI.
+- **FPSCR:** the architected 32-bit register. Writes follow the architecture (FEX/VX recomputed, `mtfsb1` on an
+  exception bit sets FX, `mcrfs` clears what it copies); `fcmpu`/`fcmpo` set FPCC; arithmetic sets no FPRF or
+  exception bits and rounds to nearest (as RPCS3 by default); only `fctiw`/`fctid` honour RN. Rc=1 FP forms set
+  CR1 = FX FEX VX OX as the architecture says (RPCS3 differs). The interpreter warns once if a guest sets RN ≠ 0.
+- **Deviations from RPCS3, on purpose:** D-form with rA = 0 uses a literal 0; `fctiw` honours RN; the FPSCR
+  instructions are complete. `stfs` rounds like RPCS3 (hardware truncates).
+- **Dispatch:** one 8-byte slot per 4-byte code address over the registered range; empty slots point at a miss stub,
+  so an indirect call is a bounds check plus one load. Miss policy: abort without NDEBUG, interpret with NDEBUG
+  (configurable). One range of up to 256 MB today; PRX modules will need more ranges.
+- **Interop contract:** a lifted function behaves as "run from the entry until `blr`", then execution continues at
+  LR. An interpreter fallback stops when cia equals the entry LR and r1 equals the entry SP.
+- **Jump tables:** a `switch` on the computed CTR value whose `default` traps (`ps_ppu_jump_table_miss`).
+- **Fuzzing:** whole-context comparison, bitwise, except that FP-arithmetic forms accept any NaN for any NaN.
+- **Names:** lifted functions are `<prefix>f_XXXXXXXX` (upper-case hex) with a per-image `<name>_register()`.
+- **Build flags:** lifted code is never compiled with `-ffast-math`/`-Ofast`; `lifted.h` disables FP contraction.
+- **Open:** VMX is decoded but not executed; reservations still use a single-thread model in the context
+  (`ps_ppu_lwarx`/`stwcx` in runtime/ppu/src/runtime.cpp) until they move onto `reservation.h`.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

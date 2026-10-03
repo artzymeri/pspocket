@@ -24,6 +24,8 @@ public:
     static constexpr u64 kGuestSize = 0x1'0000'0000ull;
     // A stray 128-bit access at 0xFFFFFFF0+ or a lifted base+offset overrun lands here and faults.
     static constexpr u64 kGuardSize = 0x10'0000ull;
+    // base() is aligned to this; lifted prologues tell the compiler so (D-013, PS_PPU_BASE_ALIGN).
+    static constexpr u64 kBaseAlign = 0x1'0000ull;
 
     GuestMemory() = default;
     ~GuestMemory();

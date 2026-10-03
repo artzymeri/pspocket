@@ -47,6 +47,10 @@ ctest --test-dir build/host --output-on-failure
 - Phase 0 inventory: `ps3inspect --json inventory/gta4/eboot.json EBOOT.elf` (`inventory/` is gitignored; see
   `docs/phase0.md`). NID/syscall names: `recomp/common/scripts/harvest_nids.py <rpcs3-dir> [--check]` (D-019).
 - Focused builds while other work is in progress: `-DPSPOCKET_ONLY="runtime/core;recomp/common;tests/common"`.
+- PPU lifter: `ppu-lift --image f.bin --base 0x10000 --seed 0x10200 --out DIR [--tu N] [--strict]` (D-023).
+  Longer differential fuzzing: `PSPOCKET_FUZZ_SEED=<n> PSPOCKET_FUZZ_ITERS=<k> build/host/tests/ppu/test_ppu_fuzz`.
+  Never build lifted code with `-ffast-math`/`-Ofast`.
+- Disc images: `ps3disc <image.iso> <out-dir>` (host) or the app's `-extract-iso` mode pulls out the executables only.
 - iOS test host: `scripts/ios.sh build|install|run` (XcodeGen project in `app/ios/project.yml`, team M7XJA39ZV6).
 - Use your own build directory (`build/<name>`) when several builds run at once.
 

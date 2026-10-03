@@ -33,13 +33,20 @@ bool GuestMemory::reserve()
 
     page_size_ = host_page_size();
     const u64 total = kGuestSize + kGuardSize;
-    void* p = mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    // Over-reserve by the alignment, then hand back the slack on both sides so base() is kBaseAlign-aligned.
+    const u64 padded = total + kBaseAlign;
+    void* p = mmap(nullptr, padded, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) {
         PS_LOG_ERROR(kChan, "reserving {} GB of guest address space failed: {} (on iOS this needs the "
                             "extended-virtual-addressing entitlement)", total >> 30, std::strerror(errno));
         return false;
     }
-    base_ = static_cast<u8*>(p);
+    const auto raw = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t aligned = (raw + kBaseAlign - 1) & ~static_cast<uintptr_t>(kBaseAlign - 1);
+    if (aligned > raw) munmap(p, aligned - raw);
+    if (const uintptr_t tail = raw + padded - (aligned + total); tail > 0)
+        munmap(reinterpret_cast<void*>(aligned + total), tail);
+    base_ = reinterpret_cast<u8*>(aligned);
     committed_.assign((kGuestSize / page_size_ + 63) / 64, 0);
     committed_pages_ = 0;
     PS_LOG_DEBUG(kChan, "guest memory reserved at {} ({} KB host pages)", static_cast<void*>(base_), page_size_ >> 10);

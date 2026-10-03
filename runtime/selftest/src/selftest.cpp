@@ -27,6 +27,8 @@ std::span<const Probe> all_probes()
         Probe{"mem.fault_tracking", "Write tracking by page protection: fault, mark dirty, resume", probe_mem_fault_tracking},
         Probe{"timebase", "Guest timebase runs at 79.8 MHz", probe_timebase},
         Probe{"threads.qos", "Single-thread speed per QoS class (performance vs efficiency cores)", probe_threads_qos},
+        Probe{"ppu.interp", "PPU interpreter: checksum + recursive fib benchmark, MIPS", probe_ppu_interp},
+        Probe{"ppu.lifted", "Lifted PPU code: same benchmark, speedup over the interpreter", probe_ppu_lifted},
     };
     return probes;
 }

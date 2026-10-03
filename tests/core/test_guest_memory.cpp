@@ -10,6 +10,7 @@ TEST_CASE("guest memory reserves 4 GB and commits on demand")
     GuestMemory mem;
     REQUIRE(mem.reserve());
     REQUIRE(mem.base() != nullptr);
+    CHECK(reinterpret_cast<uintptr_t>(mem.base()) % GuestMemory::kBaseAlign == 0); // lifted code assumes it
     CHECK(mem.committed_bytes() == 0);
     CHECK_FALSE(mem.is_committed(PS_MEM_MAIN_BASE));
 
