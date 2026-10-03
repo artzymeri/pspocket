@@ -2,8 +2,8 @@
 // RPCS3 has no implementation (every function is UNIMPLEMENTED and returns CELL_OK) and only the error codes come from
 // it (rpcs3/Emu/Cell/Modules/cellSheap.cpp). Native SPURS (D-037), assumed semantics until libsre can be checked:
 //
-// - cellSheapInitialize(ea, size, rdmaTag, wdmaTag): a heap over [ea, ea + size), ea 128-byte aligned. The heap is kept
-//   on the host; nothing is written into the guest range.
+// - cellSheapInitialize(ea, size, dmaTag): a heap over [ea, ea + size), ea 128-byte aligned. Three arguments: GTA V
+//   passes a non-tag value in r6 (run 009). The heap is kept on the host; nothing is written into the guest range.
 // - cellSheapAllocate / cellSheapFree: not implemented yet. GTA V imports them but has not called them in a boot log;
 //   their exact signatures (return value or out pointer) are taken from the first call that does (CLAUDE.md rule 4).
 
@@ -37,10 +37,10 @@ struct SheapState {
     std::map<u32, Heap> heaps; // by guest address
 };
 
-s32 cellSheapInitialize(PPUContext&, u32 ea, u32 size, u32 rdma_tag, u32 wdma_tag)
+s32 cellSheapInitialize(PPUContext&, u32 ea, u32 size, u32 dma_tag)
 {
-    PS_LOG_INFO(kChan, "cellSheapInitialize(ea {:#x}, size {:#x}, rdmaTag {}, wdmaTag {}) [native, assumed semantics]",
-        ea, size, rdma_tag, wdma_tag);
+    PS_LOG_INFO(kChan, "cellSheapInitialize(ea {:#x}, size {:#x}, dmaTag {}) [native, assumed semantics]", ea, size,
+        dma_tag);
     if (!ea || !size) return error(CELL_SHEAP_ERROR_INVAL);
     if (ea % 128 || size % 128) return error(CELL_SHEAP_ERROR_ALIGN);
     SheapState& s = HleProcess::current()->state<SheapState>();

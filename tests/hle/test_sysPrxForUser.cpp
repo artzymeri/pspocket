@@ -482,3 +482,22 @@ TEST_CASE("cellSpurs event flags and taskset shutdown; sys_net, sys_spu_initiali
     ps_ppu_syscall(&a.ctx, base);
     CHECK(a.ctx.gpr[3] == 0xFFFFFFFF80010002ull);
 }
+
+TEST_CASE("cellNetCtl: init once, disconnected, handlers accepted", "[hle][net]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    constexpr u64 kNotInit = 0xFFFFFFFF80130101ull, kNotTerm = 0xFFFFFFFF80130102ull, kBadAddr = 0xFFFFFFFF80130107ull;
+    CHECK(a.call("cellNetCtlGetState", kData) == kNotInit);
+    REQUIRE(a.call("cellNetCtlInit") == 0);
+    CHECK(a.call("cellNetCtlInit") == kNotTerm);
+    ps_write32(f.base(), kData, 0xFFFFFFFF);
+    REQUIRE(a.call("cellNetCtlGetState", kData) == 0);
+    CHECK(ps_read32(f.base(), kData) == 0); // CELL_NET_CTL_STATE_Disconnected
+    CHECK(a.call("cellNetCtlGetState", 0) == kBadAddr);
+    CHECK(a.call("cellNetCtlAddHandler", 0x10000, 0, kData + 8) == 0);
+    CHECK(a.call("cellNetCtlDelHandler", 0) == 0);
+    CHECK(a.call("cellNetCtlDelHandler", 4) == 0xFFFFFFFF80130105ull);
+    a.call("cellNetCtlTerm");
+    CHECK(a.call("cellNetCtlInit") == 0);
+}
