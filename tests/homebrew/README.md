@@ -1,0 +1,4 @@
+# tests/homebrew
+
+Reserved for the homebrew suites (see docs/plan.md section 10). Tests use synthetic inputs or homebrew built from
+source, never game data.
