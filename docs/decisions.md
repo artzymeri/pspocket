@@ -316,6 +316,22 @@ a decrypted ELF into a running lv2 process; `pspocket-boot` runs it under the in
   the iOS app will need them on device too (the EBOOT comes from the user's disc), to be wired in when the app boots
   a game.
 
+## D-034 · 2026-10-03 · Bring-up loop: boot log → HLE functions; guest faults reported, not fatal-silent
+
+GTA V's first boot (docs/runs/004) set the loop for Phase 2: run `pspocket-boot`, implement what the log names, run
+again. Decisions from the first round:
+- **sysPrxForUser lwmutex** is RPCS3's user-space protocol (sys_lwmutex_.cpp without its `hle_lwmutex` option):
+  atomics on the guest's big-endian owner/waiter word, the kernel sleep queue (`_sys_lwmutex_*`, already in lv2) only
+  on contention, the `reserved` owner value handing the lock to the woken waiter. The whole set (create, destroy, lock,
+  trylock, unlock) lands together because a created lwmutex is only used through it. HLE functions get guest
+  scratch variables on the caller's stack (RPCS3 vm::var: r1 moves below them for their lifetime).
+- **null_func syscalls**: lv2 binds a syscall that RPCS3 answers with `null_func` (CELL_OK, logged) only when a game
+  is seen calling it, with RPCS3's table comment as its description (`SyscallTable::bind_null`). First: 988.
+- **Guest faults** in `pspocket-boot` print the guest address, the PPU thread and its cia/lr/r1/r2/r3 and exit with
+  128 + signal (a debugger still stops at the fault first). The runtime-wide handler (write tracking, release
+  fallback) is the RSX write tracker's job later; this one is for bring-up.
+- Unimplemented HLE calls are logged like unimplemented syscalls: the first 8 calls, then every 1024th.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

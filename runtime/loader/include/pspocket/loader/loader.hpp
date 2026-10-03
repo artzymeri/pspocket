@@ -90,7 +90,14 @@ struct LoadReport {
     u32 variables_unresolved = 0;
 };
 
-// Maps the segments, links the imports and creates and starts the main thread.
+// Maps the segments and links the imports. No guest code runs.
+lv2::Result load(const Executable& exe, lv2::Kernel& kernel, hle::HleProcess& hle, LoadReport* report = nullptr);
+
+// Creates and starts the main thread of a loaded executable.
+lv2::Result start_main_thread(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, BootState& state,
+    const BootOptions& options, u32& main_thread_id);
+
+// load() then start_main_thread().
 lv2::Result boot(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, hle::HleProcess& hle, BootState& state,
     const BootOptions& options, u32& main_thread_id, LoadReport* report = nullptr);
 

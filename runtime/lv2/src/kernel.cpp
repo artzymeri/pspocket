@@ -3,6 +3,8 @@
 // Emu/Cell/lv2/lv2.cpp (syscall table, null_func/uns_func), Emu/Cell/ErrorCodes.h.
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
 
 #include "internal.hpp"
@@ -352,6 +354,33 @@ void SyscallTable::bind(u32 number, const char* name, SyscallFn fn)
     entries_[number].fn = fn;
 }
 
+namespace {
+
+std::array<const char*, kSyscallCount> g_null_what{};
+std::array<std::atomic<bool>, kSyscallCount> g_null_logged{};
+
+void null_syscall(PpuThread& t, PPUContext& ctx)
+{
+    const u32 number = static_cast<u32>(ctx.gpr[11]);
+    if (!g_null_logged[number].exchange(true)) {
+        PS_LOG_WARN(kChan, "syscall {} ({}) is not implemented; returns CELL_OK as RPCS3's null_func does (first call "
+                           "at {:#010x}, r3={:#x} r4={:#x}, thread {:#x})",
+            number, g_null_what[number], ctx.cia, ctx.gpr[3], ctx.gpr[4], t.id);
+    }
+    ctx.gpr[3] = 0;
+}
+
+} // namespace
+
+void SyscallTable::bind_null(u32 number, const char* what)
+{
+    if (number >= kSyscallCount) PS_FATAL(kChan, "syscall {} ({}) out of range", number, what);
+    if (entries_[number].fn) PS_FATAL(kChan, "syscall {} is already bound", number);
+    g_null_what[number] = what;
+    entries_[number].fn = null_syscall;
+    if (!entries_[number].name) entries_[number].name = what;
+}
+
 PpuThread* current_thread() { return g_current_thread; }
 void set_current_thread(PpuThread* t) { g_current_thread = t; }
 
@@ -382,6 +411,8 @@ Kernel::Impl::Impl(Kernel& k)
     register_time_syscalls(table);
     register_memory_syscalls(table);
     register_fs_syscalls(table);
+    // null_func syscalls (RPCS3 lv2.cpp) that games are seen calling.
+    table.bind_null(988, "sys_dbg_..._ppu_exception_handler"); // GTA V's CRT registers a debug exception handler
 }
 
 Kernel::Impl::~Impl() = default;

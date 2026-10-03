@@ -32,7 +32,7 @@ void stub_trampoline(PPUContext* ctx, uint8_t* base)
     HleProcess* p = HleProcess::current();
     LinkedFunction* f = p ? p->linked_at(ctx->cia) : nullptr;
     if (!f) PS_FATAL(kChan, "HLE stub call at {:#010x} with no linked function (LR {:#010x})", ctx->cia, ctx->lr);
-    f->calls.fetch_add(1, std::memory_order_relaxed);
+    const u64 n = f->calls.fetch_add(1, std::memory_order_relaxed) + 1;
     if (f->impl) {
         PS_LOG_TRACE(kChan, "{}::{} (LR {:#010x})", f->module, f->name, ctx->lr);
         f->impl->fn(*ctx, base);
@@ -44,8 +44,11 @@ void stub_trampoline(PPUContext* ctx, uint8_t* base)
         PS_FATAL(kChan, "UNIMPLEMENTED {}::{} ({:#010x}) called from {:#010x}, r3..r6 = {:#x} {:#x} {:#x} {:#x}",
             f->module, name, f->nid, static_cast<u32>(ctx->lr) - 4, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6]);
     }
-    PS_LOG_ERROR(kChan, "UNIMPLEMENTED {}::{} ({:#010x}) called from {:#010x}, r3..r6 = {:#x} {:#x} {:#x} {:#x}",
-        f->module, name, f->nid, static_cast<u32>(ctx->lr) - 4, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6]);
+    if (n <= 8 || n % 1024 == 0) { // as lv2's unimplemented syscalls: a polled function must not flood the log
+        PS_LOG_ERROR(kChan, "UNIMPLEMENTED {}::{} ({:#010x}) called from {:#010x}, r3..r6 = {:#x} {:#x} {:#x} {:#x} "
+                            "(call #{})",
+            f->module, name, f->nid, static_cast<u32>(ctx->lr) - 4, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6], n);
+    }
     ctx->gpr[3] = lv2::to_r3(lv2::err(lv2::CELL_ENOSYS));
 }
 

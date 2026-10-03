@@ -199,9 +199,9 @@ void prepare_kernel_config(lv2::Config& cfg, BootState& state)
     cfg.executor_user = &state;
 }
 
-lv2::Result boot(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, hle::HleProcess& hle, BootState& state,
-    const BootOptions& options, u32& main_thread_id, LoadReport* report)
+lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess& hle, LoadReport* report)
 {
+    const Executable* exe = &exe_ref;
     using lv2::err;
     LoadReport rep;
     GuestMemory& mem = kernel.memory();
@@ -265,6 +265,16 @@ lv2::Result boot(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, hle
     }
     PS_LOG_INFO(kChan, "{} segments, {} imported functions ({} implemented), {} unresolved variables", rep.segments,
         rep.functions_linked, rep.functions_implemented, rep.variables_unresolved);
+    if (report) *report = rep;
+    return lv2::CELL_OK;
+}
+
+lv2::Result start_main_thread(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, BootState& state,
+    const BootOptions& options, u32& main_thread_id)
+{
+    using lv2::err;
+    GuestMemory& mem = kernel.memory();
+    u8* base = mem.base();
 
     // Main thread (RPCS3 ppu_load_exec "Initialize main thread").
     const u32 opd = exe->entry_descriptor();
@@ -286,8 +296,14 @@ lv2::Result boot(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, hle
     if (const lv2::Result r = kernel.create_thread(p, id); r != lv2::CELL_OK) return r;
     state.main_thread_id = id;
     main_thread_id = id;
-    if (report) *report = rep;
     return kernel.start_thread(id);
+}
+
+lv2::Result boot(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, hle::HleProcess& hle, BootState& state,
+    const BootOptions& options, u32& main_thread_id, LoadReport* report)
+{
+    if (const lv2::Result r = load(*exe, kernel, hle, report); r != lv2::CELL_OK) return r;
+    return start_main_thread(std::move(exe), kernel, state, options, main_thread_id);
 }
 
 } // namespace pspocket::loader

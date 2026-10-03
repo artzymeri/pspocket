@@ -56,7 +56,8 @@ ctest --test-dir build/host --output-on-failure
   Never build lifted code with `-ffast-math`/`-Ofast`.
 - Disc images: `ps3disc <image.iso> <out-dir>` (host) or the app's `-extract-iso` mode pulls out the executables only.
 - Boot an executable under the interpreter (Phase 2 bring-up, D-033): `pspocket-boot EBOOT.elf [--bdvd DIR]
-  [--hdd0 DIR] [--timeout S] [--stop-at-first]`; it prints every unimplemented syscall and firmware function it hit.
+  [--hdd0 DIR] [--timeout S] [--stop-at-first] [--imports]`; it prints every unimplemented syscall and firmware
+  function it hit (`--imports` lists the imports and their state without running). Runs go in `docs/runs/`.
 - iOS test host: `scripts/ios.sh build|install|run` (XcodeGen project in `app/ios/project.yml`, team M7XJA39ZV6).
 - Use your own build directory (`build/<name>`) when several builds run at once.
 

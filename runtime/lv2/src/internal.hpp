@@ -116,6 +116,9 @@ void syscall_thunk(PpuThread& t, PPUContext& ctx)
 class SyscallTable {
 public:
     SyscallTable();
+    // Binds a syscall RPCS3 answers with null_func (lv2.cpp): it logs the first call and returns CELL_OK. Only for
+    // numbers a game is seen calling; `what` describes the syscall (RPCS3's table comment) for the log.
+    void bind_null(u32 number, const char* what);
     // Binds `fn` to `number`; `name` must match the generated name table (catches a wrong number at startup).
     void bind(u32 number, const char* name, SyscallFn fn);
     const SyscallEntry& operator[](u32 number) const { return entries_[number]; }

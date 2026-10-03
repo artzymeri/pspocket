@@ -3,18 +3,25 @@
 // This is the Phase 2 bring-up tool (plan section 10): the log names every gap the game hits, in order.
 //
 //   pspocket-boot <EBOOT.elf> [--bdvd DIR] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS] [--stop-at-first]
-//                 [--log trace|debug|info|warn|error]
+//                 [--log trace|debug|info|warn|error] [--imports]
+//
+// --imports lists every imported function by module (implemented ones marked) and exits without running.
+// A host fault inside guest memory (an access to an unmapped guest address) is reported with the guest address and
+// the faulting PPU thread's instruction address before the process dies (CLAUDE.md rule 5).
 //
 // The executable must be a decrypted ELF (RPCS3's --decrypt writes one). Game files stay outside the repository.
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <unistd.h>
 
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
@@ -32,8 +39,68 @@ int usage()
 {
     std::fprintf(stderr,
         "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]\n"
-        "                     [--stop-at-first] [--log trace|debug|info|warn|error]\n");
+        "                     [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]\n");
     return 64;
+}
+
+u8* g_guest_base = nullptr;
+
+// SIGSEGV/SIGBUS: name the guest address and the PPU thread's position, then exit with 128 + signal (a debugger
+// attached to the process stops at the fault before this handler runs).
+void on_fault(int sig, siginfo_t* info, void*)
+{
+    const auto addr = reinterpret_cast<uintptr_t>(info->si_addr);
+    const auto base = reinterpret_cast<uintptr_t>(g_guest_base);
+    const lv2::PpuThread* t = lv2::current_thread();
+    const PPUContext* c = t ? t->ctx : nullptr;
+    char buf[384];
+    int n;
+    if (base && addr >= base && addr < base + GuestMemory::kGuestSize + GuestMemory::kGuardSize) {
+        n = std::snprintf(buf, sizeof buf,
+            "\n[fatal] boot: %s: guest access to 0x%08llx (not mapped, or protected) by PPU thread 0x%x at cia 0x%08x "
+            "(lr 0x%llx, r1 0x%llx, r2 0x%llx, r3 0x%llx). cia is exact for interpreted code.\n",
+            sig == SIGBUS ? "SIGBUS" : "SIGSEGV", static_cast<unsigned long long>(addr - base), t ? t->id : 0,
+            c ? c->cia : 0, c ? static_cast<unsigned long long>(c->lr) : 0ull,
+            c ? static_cast<unsigned long long>(c->gpr[1]) : 0ull, c ? static_cast<unsigned long long>(c->gpr[2]) : 0ull,
+            c ? static_cast<unsigned long long>(c->gpr[3]) : 0ull);
+    } else {
+        n = std::snprintf(buf, sizeof buf, "\n[fatal] boot: %s at host address %p (outside guest memory); PPU thread 0x%x "
+                                           "at cia 0x%08x\n",
+            sig == SIGBUS ? "SIGBUS" : "SIGSEGV", info->si_addr, t ? t->id : 0, c ? c->cia : 0);
+    }
+    if (n > 0) (void)!write(STDERR_FILENO, buf, static_cast<size_t>(std::min<int>(n, sizeof buf - 1)));
+    _exit(128 + sig);
+}
+
+void install_fault_reporter(u8* guest_base)
+{
+    g_guest_base = guest_base;
+    struct sigaction sa{};
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+}
+
+void print_imports(const hle::HleProcess& hle)
+{
+    const auto linked = hle.linked();
+    std::vector<std::string> modules;
+    for (const auto* f : linked)
+        if (std::find(modules.begin(), modules.end(), f->module) == modules.end()) modules.push_back(f->module);
+    usize implemented = 0;
+    for (const auto& m : modules) {
+        usize count = 0, done = 0;
+        for (const auto* f : linked)
+            if (f->module == m) count++, done += f->impl != nullptr;
+        std::printf("%s: %zu imported, %zu implemented\n", m.c_str(), count, done);
+        for (const auto* f : linked)
+            if (f->module == m)
+                std::printf("  %c %s (0x%08X)\n", f->impl ? '*' : ' ', f->name.empty() ? "?" : f->name.c_str(), f->nid);
+        implemented += done;
+    }
+    std::printf("total: %zu imported functions, %zu implemented (*)\n", linked.size(), implemented);
 }
 
 bool read_file(const char* path, std::vector<u8>& out)
@@ -53,6 +120,7 @@ int main(int argc, char** argv)
     std::string bdvd, hdd0, app_home;
     double timeout_s = 30;
     bool stop_at_first = false;
+    bool list_imports = false;
     for (int i = 1; i < argc; i++) {
         const std::string_view a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -61,6 +129,7 @@ int main(int argc, char** argv)
         else if (a == "--app-home") { const char* v = value(); if (!v) return usage(); app_home = v; }
         else if (a == "--timeout") { const char* v = value(); if (!v) return usage(); timeout_s = std::atof(v); }
         else if (a == "--stop-at-first") stop_at_first = true;
+        else if (a == "--imports") list_imports = true;
         else if (a == "--log") {
             const char* v = value();
             if (!v) return usage();
@@ -90,6 +159,7 @@ int main(int argc, char** argv)
 
     GuestMemory memory;
     if (!memory.reserve()) return 71;
+    install_fault_reporter(memory.base());
 
     // No lifted code is linked into this host: every guest function runs in the interpreter.
     ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
@@ -115,8 +185,16 @@ int main(int argc, char** argv)
 
     u32 main_id = 0;
     loader::LoadReport report;
-    if (const lv2::Result r = loader::boot(*exe, kernel, hle, state, {}, main_id, &report); r != lv2::CELL_OK) {
-        std::fprintf(stderr, "pspocket-boot: boot failed: %s\n", lv2::error_name(r));
+    if (const lv2::Result r = loader::load(**exe, kernel, hle, &report); r != lv2::CELL_OK) {
+        std::fprintf(stderr, "pspocket-boot: load failed: %s\n", lv2::error_name(r));
+        return 70;
+    }
+    if (list_imports) {
+        print_imports(hle);
+        return 0;
+    }
+    if (const lv2::Result r = loader::start_main_thread(*exe, kernel, state, {}, main_id); r != lv2::CELL_OK) {
+        std::fprintf(stderr, "pspocket-boot: cannot start the main thread: %s\n", lv2::error_name(r));
         return 70;
     }
 
