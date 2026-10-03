@@ -11,11 +11,11 @@ user's own disc dump. No JIT, no interpreter on the hot path. First title: GTA I
 
 | Phase | Gate | State |
 |---|---|---|
-| 0 · Inventory and go/no-go | Inventory report, go/no-go | Tools built; blocked until there is a dump of a copy you own ([docs/phase0.md](docs/phase0.md)) |
-| 1 · Toolchain foundation | Samples recompile and match the interpreter; GTA IV ELF lifts | In progress |
-| 2 · Runtime core on macOS | Test suite passes; EBOOT boots to its first unimplemented call | Guest memory, logging, timebase done |
-| 3 · SPU | Stress runs, every inventoried SPU program lifts | Not started |
-| 4 · RSX to Metal | Menu renders on macOS and iOS | Not started (iOS test host exists early, D-008) |
+| 0 · Inventory and go/no-go | Inventory report, go/no-go | `ps3inspect` built; PS3Recomp evaluated (D-012); the inventory waits for a dump of a copy you own ([docs/phase0.md](docs/phase0.md)) |
+| 1 · Toolchain foundation | Samples recompile and match the interpreter; GTA IV ELF lifts | Loader, NID database, manifest done; PPU interpreter and lifter in progress |
+| 2 · Runtime core on macOS | Test suite passes; EBOOT boots to its first unimplemented call | Guest memory, logging, timebase done; lv2 kernel and shared reservations in progress (D-018) |
+| 3 · SPU | Stress runs, every inventoried SPU program lifts | SPU interpreter, MFC and lifter in progress (D-018) |
+| 4 · RSX to Metal | Menu renders on macOS and iOS | RSX FIFO and Metal backend in progress (D-018); iOS test host proven on device ([runs](docs/runs/README.md)) |
 | 5–7 · Bring-up, performance, app | | Not started |
 
 ## Build

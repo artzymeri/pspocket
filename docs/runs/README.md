@@ -6,3 +6,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | Run | Date | Build | Device | Result |
 |---|---|---|---|---|
 | [001](001-first-device-selftest.md) | 2026-10-03 | e557a8a | iPhone 17 Pro Max, iOS 26.6.1 | Self-test 6/6 pass; MetalFX 1152×640 at 30 Hz, 0 dropped |
+| [002](002-thermal-10min.md) | 2026-10-03 | e557a8a | iPhone 17 Pro Max, iOS 26.6.1 | 10 min max GPU load: nominal thermals, GPU time flat, 0/18,241 dropped |
