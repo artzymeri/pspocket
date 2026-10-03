@@ -1,0 +1,5 @@
+if(APPLE)
+    add_executable(pspocket-selftest selftest_main.cpp)
+    target_link_libraries(pspocket-selftest PRIVATE pspocket::selftest)
+    pspocket_set_warnings(pspocket-selftest)
+endif()

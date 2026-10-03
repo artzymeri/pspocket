@@ -1,0 +1,65 @@
+# --- Game data, firmware and keys: NEVER commit (CLAUDE.md rule 1) ---
+*.iso
+*.ISO
+*.elf
+*.ELF
+*.self
+*.SELF
+*.sprx
+*.SPRX
+*.prx
+*.PRX
+*.sfo
+*.SFO
+*.pkg
+*.PKG
+*.PUP
+*.pup
+*.rap
+*.RAP
+*.edat
+*.EDAT
+*.sdat
+*.SDAT
+EBOOT.BIN
+eboot.bin
+keys/
+PS3_GAME/
+USRDIR/
+dev_hdd0/
+dev_flash/
+dumps/
+# Phase 0 inventories are derived from game binaries; keep them out of git
+inventory/
+*.inventory.json
+
+# --- Build output ---
+build/
+build-*/
+out/
+cmake-build-*/
+compile_commands.json
+.cache/
+
+# Generated code goes to build/generated/<title>/ and is never committed
+generated/
+
+# --- Xcode ---
+app/ios/*.xcodeproj/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.ipa
+*.dSYM/
+*.dSYM.zip
+
+# --- Editors / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Logs / traces ---
+*.log
+*.trace
