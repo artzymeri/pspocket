@@ -25,6 +25,7 @@ using rt::Op;
 
 std::string G(u32 n) { return std::format("r{}", n); }
 std::string F(u32 n) { return std::format("f{}", n); }
+std::string VR(u32 n) { return std::format("v{}", n); }
 std::string CR(u32 bit)
 {
     static constexpr const char* kBits[4] = {"lt", "gt", "eq", "so"};
@@ -45,7 +46,9 @@ constexpr SprLocal kSprLocals[] = {
     {rt::SPR_XER_BC, "xer_bc", "uint8_t"},
     {rt::SPR_FPSCR, "fpscr", "uint32_t"},
     {rt::SPR_VRSAVE, "vrsave", "uint32_t"},
+    {rt::SPR_VSCR_NJ, "vscr_nj", "uint8_t"},
 };
+// VSCR[SAT] is not in the table: lifted code accumulates it in a vector (pspocket/ppu/vmx.h).
 
 std::string hex64(u64 v) { return std::format("0x{:x}ull", v); }
 std::string hex32(u32 v) { return std::format("0x{:x}u", v); }
@@ -74,7 +77,7 @@ u64 mask64(u32 mb, u32 me)
 // ------------------------------------------------------------------------------------------ generator state
 
 struct RegSet {
-    u32 gpr = 0, fpr = 0, cr = 0, spr = 0;
+    u32 gpr = 0, fpr = 0, vr = 0, cr = 0, spr = 0;
 };
 
 struct Gen {
@@ -95,10 +98,12 @@ void add_use(Gen& g, const rt::RegUse& u)
 {
     g.ref.gpr |= u.gpr_read | u.gpr_write;
     g.ref.fpr |= u.fpr_read | u.fpr_write;
+    g.ref.vr |= u.vr_read | u.vr_write;
     g.ref.cr |= u.cr_read | u.cr_write;
     g.ref.spr |= u.spr_read | u.spr_write;
     g.wr.gpr |= u.gpr_write;
     g.wr.fpr |= u.fpr_write;
+    g.wr.vr |= u.vr_write;
     g.wr.cr |= u.cr_write;
     g.wr.spr |= u.spr_write;
 }
@@ -115,6 +120,10 @@ void build_spill_reload(Gen& g)
         if (g.ref.fpr >> n & 1) r += std::format("f{0} = ctx->fpr[{0}]; ", n);
     }
     for (u32 n = 0; n < 32; n++) {
+        if (g.wr.vr >> n & 1) s += std::format("ps_vmx_set(ctx, {0}, v{0}); ", n);
+        if (g.ref.vr >> n & 1) r += std::format("v{0} = ps_vmx_get(ctx, {0}); ", n);
+    }
+    for (u32 n = 0; n < 32; n++) {
         if (g.wr.cr >> n & 1) s += std::format("ctx->cr[{}] = {}; ", n, CR(n));
         if (g.ref.cr >> n & 1) r += std::format("{} = ctx->cr[{}]; ", CR(n), n);
     }
@@ -122,6 +131,8 @@ void build_spill_reload(Gen& g)
         if (g.wr.spr & sp.bit) s += std::format("ctx->{0} = {0}; ", sp.name);
         if (g.ref.spr & sp.bit) r += std::format("{0} = ctx->{0}; ", sp.name);
     }
+    if (g.wr.spr & rt::SPR_VSCR_SAT) s += "ctx->vscr_sat = ps_vmx_sat_bit(vsat); ";
+    if (g.ref.spr & rt::SPR_VSCR_SAT) r += "vsat = ps_vmx_sat_load(ctx->vscr_sat); ";
     g.spill = s;
     g.reload = r;
 }
@@ -146,10 +157,15 @@ std::string declarations(const Gen& g)
     group("double", std::move(d));
     d.clear();
     for (u32 n = 0; n < 32; n++)
+        if (g.ref.vr >> n & 1) d.push_back(std::format("v{0} = ps_vmx_get(ctx, {0})", n));
+    group("uint32x4_t", std::move(d));
+    d.clear();
+    for (u32 n = 0; n < 32; n++)
         if (g.ref.cr >> n & 1) d.push_back(std::format("{} = ctx->cr[{}]", CR(n), n));
     group("uint8_t", std::move(d));
     for (const SprLocal& sp : kSprLocals)
         if (g.ref.spr & sp.bit) o += std::format("    {0} {1} = ctx->{1};\n", sp.type, sp.name);
+    if (g.ref.spr & rt::SPR_VSCR_SAT) o += "    uint32x4_t vsat = ps_vmx_sat_load(ctx->vscr_sat);\n";
     return o;
 }
 
@@ -732,6 +748,88 @@ bool emit_semantics(const Inst& in, std::string& o)
     }
 }
 
+// ------------------------------------------------------------------------------------------ VMX
+
+// VMX instructions: one call into pspocket/ppu/vmx.h each (NEON). VSCR[SAT] accumulates in `vsat`, VSCR[NJ] is the
+// `vscr_nj` local. Returns false when the op is not VMX.
+bool emit_vmx(const Inst& in, std::string& o)
+{
+    if (!(in.flags() & rt::OPF_VMX)) return false;
+    const u32 d = in.rt(), a = in.ra(), b = in.rb(), c = in.rc_reg();
+    const std::string VD = VR(d), VA = VR(a), VB = VR(b), VC = VR(c);
+    auto line = [&](const std::string& s) { o += "    " + s + "\n"; };
+    const std::string fn = std::format("ps_vmx_{}", in.info().mnemonic);
+    // Trailing arguments: the SAT accumulator or the NJ bit.
+    const std::string extra = rt::vmx_sets_sat(in.op) ? ", &vsat" : rt::vmx_uses_nj(in.op) ? ", vscr_nj" : "";
+
+    switch (in.info().fmt) {
+    case rt::Fmt::X_VLOAD: {
+        const std::string ea = ea_x(in);
+        switch (in.op) {
+        case Op::LVSL: line(std::format("{} = ps_vmx_lvsl({});", VD, ea)); break;
+        case Op::LVSR: line(std::format("{} = ps_vmx_lvsr({});", VD, ea)); break;
+        case Op::LVLX: case Op::LVLXL: line(std::format("{} = ps_vmx_lvlx(base, {});", VD, ea)); break;
+        case Op::LVRX: case Op::LVRXL: line(std::format("{} = ps_vmx_lvrx(base, {});", VD, ea)); break;
+        default: line(std::format("{} = ps_vmx_lvx(base, {});", VD, ea)); break; // lvx lvxl lvebx lvehx lvewx
+        }
+        return true;
+    }
+    case rt::Fmt::X_VSTORE: {
+        const std::string ea = ea_x(in);
+        const char* f = "ps_vmx_stvx"; // stvx stvxl
+        switch (in.op) {
+        case Op::STVEBX: f = "ps_vmx_stvebx"; break;
+        case Op::STVEHX: f = "ps_vmx_stvehx"; break;
+        case Op::STVEWX: f = "ps_vmx_stvewx"; break;
+        case Op::STVLX: case Op::STVLXL: f = "ps_vmx_stvlx"; break;
+        case Op::STVRX: case Op::STVRXL: f = "ps_vmx_stvrx"; break;
+        default: break;
+        }
+        line(std::format("{}(base, {}, {});", f, ea, VD));
+        return true;
+    }
+    case rt::Fmt::VX_VD: line(std::format("{} = ps_vmx_mfvscr(vsat, vscr_nj);", VD)); return true;
+    case rt::Fmt::VX_VB:
+        line(std::format("{{ const uint32_t w = vgetq_lane_u32({}, 0); vsat = ps_vmx_sat_load((uint8_t)(w & 1)); "
+                         "vscr_nj = (uint8_t)((w >> 16) & 1); }}",
+            VB));
+        return true;
+    case rt::Fmt::VX_VD_SIMM: line(std::format("{} = {}({});", VD, fn, in.vsimm())); return true;
+    case rt::Fmt::VX_VD_VB_UIMM:
+        switch (in.op) {
+        case Op::VSPLTB: line(std::format("{} = PS_VMX_VSPLTB({}, {});", VD, VB, in.vuimm() & 15)); break;
+        case Op::VSPLTH: line(std::format("{} = PS_VMX_VSPLTH({}, {});", VD, VB, in.vuimm() & 7)); break;
+        case Op::VSPLTW: line(std::format("{} = PS_VMX_VSPLTW({}, {});", VD, VB, in.vuimm() & 3)); break;
+        default: line(std::format("{} = {}({}, {}u{});", VD, fn, VB, in.vuimm(), extra)); break; // vcf*, vct*
+        }
+        return true;
+    case rt::Fmt::VX_VD_VB:
+        line(std::format("{} = {}({}{});", VD, fn, VB, extra));
+        return true;
+    case rt::Fmt::VX_VD_VA_VB:
+        line(std::format("{} = {}({}, {}{});", VD, fn, VA, VB, extra));
+        return true;
+    case rt::Fmt::VXR_VD_VA_VB:
+        line(std::format("{} = {}({}, {});", VD, fn, VA, VB));
+        if (in.vrc()) {
+            line(std::format("cr6_lt = {}; cr6_gt = 0; cr6_eq = ps_vmx_all_zero({}); cr6_so = 0;",
+                in.op == Op::VCMPBFP ? std::string("0") : std::format("ps_vmx_all_ones({})", VD), VD));
+        }
+        return true;
+    case rt::Fmt::VA_VD_VA_VB_VC:
+        line(std::format("{} = {}({}, {}, {}{});", VD, fn, VA, VB, VC, extra));
+        return true;
+    case rt::Fmt::VA_VSLDOI:
+        if (in.vsh() == 0) {
+            if (d != a) line(std::format("{} = {};", VD, VA));
+        } else {
+            line(std::format("{} = PS_VMX_VSLDOI({}, {}, {});", VD, VA, VB, in.vsh()));
+        }
+        return true;
+    default: return false;
+    }
+}
+
 // ------------------------------------------------------------------------------------------ control flow
 
 std::string sym(const Gen& g, u32 addr) { return function_symbol(g.opt ? g.opt->prefix : std::string{}, addr); }
@@ -895,7 +993,8 @@ void emit_instruction(Gen& g, u32 pc, const Inst& in, std::string& o)
             in.op == Op::LSWX ? "ps_ppu_lswx" : "ps_ppu_stswx", in.rt(), g.reload);
         return;
     }
-    if (!emit_semantics(in, o)) throw std::logic_error(std::format("lifter: no semantics for {}", in.info().mnemonic));
+    if (!emit_vmx(in, o) && !emit_semantics(in, o))
+        throw std::logic_error(std::format("lifter: no semantics for {}", in.info().mnemonic));
 }
 
 bool falls_through(const Inst& in)

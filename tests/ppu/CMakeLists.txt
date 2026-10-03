@@ -16,6 +16,12 @@ target_include_directories(ppu-fuzz-gen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ppu-fuzz-gen PRIVATE pspocket::recomp_ppu)
 pspocket_set_warnings(ppu-fuzz-gen)
 
+# Lifted VMX code is NEON (D-003): other hosts fuzz the integer/FP forms only.
+set(fuzz_vmx_flag)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
+    set(fuzz_vmx_flag --no-vmx)
+endif()
+
 set(fuzz_dir ${CMAKE_CURRENT_BINARY_DIR}/fuzz)
 set(fuzz_sources ${fuzz_dir}/fuzz_cases.c)
 math(EXPR fuzz_last "${PSPOCKET_PPU_FUZZ_TUS} - 1")
@@ -25,7 +31,7 @@ endforeach()
 add_custom_command(
     OUTPUT ${fuzz_sources}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${fuzz_dir}
-    COMMAND ppu-fuzz-gen --out ${fuzz_dir} --cases ${PSPOCKET_PPU_FUZZ_CASES} --tus ${PSPOCKET_PPU_FUZZ_TUS}
+    COMMAND ppu-fuzz-gen --out ${fuzz_dir} --cases ${PSPOCKET_PPU_FUZZ_CASES} --tus ${PSPOCKET_PPU_FUZZ_TUS} ${fuzz_vmx_flag}
     DEPENDS ppu-fuzz-gen
     COMMENT "Generating the PPU differential fuzz cases"
     VERBATIM)

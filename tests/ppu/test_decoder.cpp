@@ -125,15 +125,25 @@ TEST_CASE("disassembly uses the standard and extended mnemonics")
     CHECK(disassemble(as::mfocrf(3, 0x02), 0) == "mfocrf r3,cr6");
 }
 
-TEST_CASE("support classification: VMX and exotic forms are recognised but unsupported")
+TEST_CASE("support classification: every VMX instruction is supported, exotic forms are not")
 {
     const Inst vor = decode(as::encode(Op::VOR, as::Fields{.d = 0, .a = 1, .b = 2}));
     CHECK(vor.op == Op::VOR);
-    CHECK_FALSE(is_supported(vor));
-    CHECK(unsupported_reason(vor).find("VMX") != std::string_view::npos);
-    CHECK_FALSE(is_supported(decode(as::encode(Op::LVX, as::Fields{.d = 1, .a = 3, .b = 4}))));
-    CHECK_FALSE(is_supported(decode(as::encode(Op::VPERM, as::Fields{.d = 1, .a = 2, .b = 3, .c = 4}))));
-    CHECK_FALSE(is_supported(decode(as::encode(Op::VCMPEQUW, as::Fields{.d = 1, .a = 2, .b = 3, .rc = true}))));
+    CHECK(is_supported(vor));
+    CHECK(is_supported(decode(as::encode(Op::LVX, as::Fields{.d = 1, .a = 3, .b = 4}))));
+    CHECK(is_supported(decode(as::encode(Op::VPERM, as::Fields{.d = 1, .a = 2, .b = 3, .c = 4}))));
+    CHECK(is_supported(decode(as::encode(Op::VCMPEQUW, as::Fields{.d = 1, .a = 2, .b = 3, .rc = true}))));
+    u32 vmx = 0;
+    for (const OpInfo& info : all_ops()) {
+        if (!(info.flags & OPF_VMX)) continue;
+        vmx++;
+        as::Fields f{.d = 1, .a = 2, .b = 3, .c = 4};
+        INFO(info.mnemonic);
+        const Inst in = decode(as::encode(info.op, f));
+        CHECK(in.op == info.op);
+        CHECK(is_supported(in));
+    }
+    CHECK(vmx == 164);
     CHECK_FALSE(is_supported(decode(as::encode(Op::ECIWX, as::Fields{.d = 1, .a = 2, .b = 3}))));
     CHECK_FALSE(is_supported(decode(0x44000022))); // sc 1 (hypervisor)
     CHECK_FALSE(is_supported(decode(as::mfspr(3, 287)))); // PVR
@@ -154,8 +164,10 @@ TEST_CASE("forms: variants and names")
     CHECK(form_name(Op::BCCTR, kVarLk) == "bcctrl");
     CHECK(op_variants(Op::LWZ).size() == 1);
     const auto forms = supported_forms();
-    CHECK(forms.size() > 300);
-    for (const Form& f : forms) CHECK((op_info(f.op).flags & (OPF_VMX | OPF_NOSUPPORT)) == 0);
+    CHECK(forms.size() == 345 + 164 + 13); // integer/FP/system forms, VMX ops, vcmp* record forms
+    for (const Form& f : forms) CHECK((op_info(f.op).flags & OPF_NOSUPPORT) == 0);
+    CHECK(op_variants(Op::VCMPGTFP).size() == 2);
+    CHECK(form_name(Op::VCMPGTFP, kVarRc) == "vcmpgtfp.");
 }
 
 TEST_CASE("register usage")
@@ -193,4 +205,36 @@ TEST_CASE("register usage")
     u = reg_use(decode(as::lswi(30, 3, 9))); // 9 bytes: r30, r31, r0
     CHECK(u.gpr_write == ((1u << 30) | (1u << 31) | 1u));
     CHECK(lswi_reg_mask(0, 0) == 0xFFu);
+}
+
+TEST_CASE("register usage: VMX")
+{
+    RegUse u = reg_use(decode(as::encode(Op::VMADDFP, as::Fields{.d = 1, .a = 2, .b = 3, .c = 4})));
+    CHECK(u.vr_read == 0b11100u);
+    CHECK(u.vr_write == 0b10u);
+    CHECK(u.spr_read == SPR_VSCR_NJ);
+    CHECK(u.spr_write == 0);
+    u = reg_use(decode(as::encode(Op::VADDSHS, as::Fields{.d = 5, .a = 6, .b = 7})));
+    CHECK(u.vr_read == ((1u << 6) | (1u << 7)));
+    CHECK(u.spr_read == SPR_VSCR_SAT);
+    CHECK(u.spr_write == SPR_VSCR_SAT);
+    u = reg_use(decode(as::encode(Op::VCMPEQUW, as::Fields{.d = 1, .a = 2, .b = 3, .rc = true})));
+    CHECK(u.cr_write == 0x0F000000u); // CR6
+    u = reg_use(decode(as::encode(Op::VCMPEQUW, as::Fields{.d = 1, .a = 2, .b = 3})));
+    CHECK(u.cr_write == 0);
+    u = reg_use(decode(as::encode(Op::LVX, as::Fields{.d = 9, .a = 0, .b = 4}))); // (rA|0)
+    CHECK(u.gpr_read == (1u << 4));
+    CHECK(u.vr_write == (1u << 9));
+    CHECK(u.mem_read);
+    u = reg_use(decode(as::encode(Op::LVSL, as::Fields{.d = 9, .a = 3, .b = 4})));
+    CHECK_FALSE(u.mem_read);
+    u = reg_use(decode(as::encode(Op::STVX, as::Fields{.d = 9, .a = 3, .b = 4})));
+    CHECK(u.vr_read == (1u << 9));
+    CHECK(u.vr_write == 0);
+    CHECK(u.mem_write);
+    u = reg_use(decode(as::encode(Op::MFVSCR, as::Fields{.d = 2})));
+    CHECK(u.spr_read == (SPR_VSCR_SAT | SPR_VSCR_NJ));
+    u = reg_use(decode(as::encode(Op::MTVSCR, as::Fields{.b = 2})));
+    CHECK(u.spr_write == (SPR_VSCR_SAT | SPR_VSCR_NJ));
+    CHECK(u.vr_read == (1u << 2));
 }

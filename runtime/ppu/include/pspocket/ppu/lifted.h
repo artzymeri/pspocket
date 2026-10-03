@@ -3,7 +3,8 @@
  *
  * Generated functions have the D-009 signature (amended by D-013: base is not restrict-qualified)
  *     void f_XXXXXXXX(PPUContext* restrict ctx, uint8_t* base)
- * keep guest registers in locals (loaded at entry, spilled around calls, syscalls and fallbacks, and at return),
+ * keep guest registers in locals (loaded at entry, spilled around calls, syscalls and fallbacks, and at return;
+ * vector registers are uint32x4_t NEON locals in the D-004 lane order),
  * access guest memory only through the volatile ps_read and ps_write functions of pspocket/core/be.h, and call
  * the runtime through pspocket/ppu/runtime.h. Helpers here are small static inline functions; clang folds them
  * into straight-line code.
@@ -18,6 +19,12 @@
 #include "pspocket/ppu/context.h"
 #include "pspocket/ppu/fpu.h"
 #include "pspocket/ppu/runtime.h"
+
+/* VMX helpers (NEON). Lifted code is compiled for AArch64 only (D-003); other hosts can build the toolchain and
+ * the integer/FP subset of the tests, not lifted VMX code. */
+#if defined(__aarch64__)
+#include "pspocket/ppu/vmx.h"
+#endif
 
 /* Generated headers are also included from C++ (tests, the self-test probes), which has no `restrict`. */
 #ifdef __cplusplus

@@ -5,6 +5,7 @@ add_library(pspocket_ppu STATIC
     src/decoder.cpp
     src/disasm.cpp
     src/interpreter.cpp
+    src/interpreter_vmx.cpp
     src/runtime.cpp)
 target_include_directories(pspocket_ppu PUBLIC include)
 target_link_libraries(pspocket_ppu PUBLIC pspocket::core)

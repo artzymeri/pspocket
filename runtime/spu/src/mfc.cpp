@@ -1,0 +1,371 @@
+// SPU MFC: DMA (GET/PUT and their barrier/fence/result forms, lists with stall-and-notify), sndsig, sdcrz, the
+// atomic commands (GETLLAR/PUTLLC/PUTLLUC/PUTQLLUC through the shared reservation system) and thread-group MMIO.
+//
+// Every transfer executes synchronously when it is issued (plan section 6), so tag groups complete immediately.
+// The only commands that ever wait in the queue are lists stalled on a stall-and-notify element and commands
+// ordered behind them by a fence, a barrier form or a barrier command. Semantics follow RPCS3
+// rpcs3/Emu/Cell/SPUThread.cpp (process_mfc_cmd, do_dma_transfer, do_list_transfer, do_putllc, do_putlluc,
+// do_dma_check); the alignment rules are the CBEA's (RPCS3 does not check them):
+//   size 1, 2, 4 or 8: EA aligned to the size and LS/EA low 4 bits equal; size 16*n (n <= 1024): LS and EA
+//   16-byte aligned; lists: list size a multiple of 8 and <= 16 KB, list address 8-byte aligned.
+//
+// Called without the context lock: DMA may reach another SPU of the group (its LS or signal registers), which takes
+// that context's lock. The lock is only taken here to change events.
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+
+#include "internal.hpp"
+#include "pspocket/core/be.h"
+#include "pspocket/core/log.hpp"
+#include "pspocket/core/reservation.h"
+#include "pspocket/spu/runtime.h"
+
+using namespace pspocket;
+using namespace pspocket::spu::detail;
+
+namespace {
+
+bool is_transfer(u32 cmd)
+{
+    switch (cmd) {
+    case PS_MFC_PUT: case PS_MFC_PUTB: case PS_MFC_PUTF:
+    case PS_MFC_PUTR: case PS_MFC_PUTRB: case PS_MFC_PUTRF:
+    case PS_MFC_GET: case PS_MFC_GETB: case PS_MFC_GETF:
+    case PS_MFC_SDCRZ:
+    case PS_MFC_SNDSIG: case PS_MFC_SNDSIGB: case PS_MFC_SNDSIGF: return true;
+    default: return false;
+    }
+}
+
+bool is_list(u32 cmd)
+{
+    switch (cmd) {
+    case PS_MFC_PUTL: case PS_MFC_PUTLB: case PS_MFC_PUTLF:
+    case PS_MFC_PUTRL: case PS_MFC_PUTRLB: case PS_MFC_PUTRLF:
+    case PS_MFC_GETL: case PS_MFC_GETLB: case PS_MFC_GETLF: return true;
+    default: return false;
+    }
+}
+
+bool is_barrier_command(u32 cmd) { return cmd == PS_MFC_BARRIER || cmd == PS_MFC_EIEIO || cmd == PS_MFC_SYNC; }
+bool is_get(u32 cmd) { return (cmd & 0xF0) == 0x40; }
+
+bool dma_aligned(u32 lsa, u32 eal, u32 size)
+{
+    if (size == 0) return true;
+    if (size < 16)
+        return (size == 1 || size == 2 || size == 4 || size == 8) && (eal & (size - 1)) == 0 && (lsa & 0xF) == (eal & 0xF);
+    return (size & 0xF) == 0 && (lsa & 0xF) == 0 && (eal & 0xF) == 0;
+}
+
+// Copies between the LS (wrapping at 256 KB) and a host buffer.
+void ls_copy(u8* ls, u32 lsa, u8* other, u32 size, bool to_ls)
+{
+    u32 done = 0;
+    while (done < size) {
+        const u32 at = (lsa + done) & PS_SPU_LS_MASK;
+        const u32 chunk = std::min(size - done, PS_SPU_LS_SIZE - at);
+        // memmove: a group-MMIO transfer may target this SPU's own LS
+        if (to_ls)
+            std::memmove(ls + at, other + done, chunk);
+        else
+            std::memmove(other + done, ls + at, chunk);
+        done += chunk;
+    }
+}
+
+int group_mmio(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
+{
+    if (eal < PS_SPU_THREAD_BASE)
+        return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, eal, "DMA to raw SPU MMIO (not supported)");
+    const u32 index = (eal - PS_SPU_THREAD_BASE) / PS_SPU_THREAD_OFFSET;
+    const u32 offset = (eal - PS_SPU_THREAD_BASE) % PS_SPU_THREAD_OFFSET;
+    SPUContext* target = (ctx->group && index < ctx->group->count) ? ctx->group->members[index] : nullptr;
+    if (!target) return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, eal, "DMA to a missing SPU thread of the group");
+    const bool get = is_get(cmd);
+    if (offset + size <= PS_SPU_LS_SIZE) {
+        // Local store of a group member (RPCS3 do_dma_transfer, "SPU Thread Group MMIO").
+        if (cmd == PS_MFC_SDCRZ) {
+            std::memset(target->ls + offset, 0, size);
+        } else {
+            ls_copy(ctx->ls, lsa, target->ls + offset, size, get);
+        }
+        return 0;
+    }
+    if (!get && size == 4 && (offset == PS_SPU_THREAD_SNR1 || offset == PS_SPU_THREAD_SNR2)) {
+        const u32 value = cmd == PS_MFC_SDCRZ ? 0 : ps_ld32(ctx->ls + (lsa & PS_SPU_LS_MASK & ~3u));
+        ps_spu_write_signal(target, offset == PS_SPU_THREAD_SNR1 ? 1 : 2, value);
+        return 0;
+    }
+    return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, eal, "DMA to an invalid SPU thread MMIO offset");
+}
+
+int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
+{
+    if (size == 0) return 0;
+    if (eal >= PS_SPU_RAW_BASE) return group_mmio(ctx, pc, cmd, lsa, eal, size);
+    u8* mem = ctx->membase + eal;
+    if (cmd == PS_MFC_SDCRZ) {
+        std::memset(mem, 0, size);
+    } else {
+        ls_copy(ctx->ls, lsa, mem, size, is_get(cmd));
+    }
+    if (!is_get(cmd)) ps_res_notify_write(eal, size); // PUTs break reservations on the lines they touch
+    return 0;
+}
+
+void mark_stalled(SPUContext* ctx, u32 tag)
+{
+    ps_spu_channels& ch = ctx->ch;
+    const u32 bit = 1u << tag;
+    ch.stall_mask |= bit;
+    ChannelLock lock(ctx);
+    if (!ch.stall_stat_count) set_events(ctx, PS_SPU_EVENT_SN);
+    ch.stall_stat |= bit;
+    ch.stall_stat_count = 1;
+}
+
+// Runs list elements of c until the list ends (0), a stall-and-notify element stalls it (2) or an exception (1).
+int run_list(SPUContext* ctx, u32 pc, ps_spu_mfc_cmd& c)
+{
+    const u32 base_cmd = c.cmd & ~u32{PS_MFC_LIST_MASK | PS_MFC_BARRIER_MASK | PS_MFC_FENCE_MASK};
+    while (c.size >= 8) {
+        const u32 at = c.eal & 0x3FFF8u;
+        const u32 w0 = ps_ld32(ctx->ls + at);
+        const u32 ea = ps_ld32(ctx->ls + at + 4);
+        const bool stall = (w0 >> 31) & 1;
+        const u32 size = w0 & 0x7FFFu;
+        const u32 lsa = (c.lsa & 0x3FFF0u) | (ea & 0xFu);
+        if (size > PS_MFC_MAX_SIZE)
+            return raise_exception(ctx, pc, PS_SPU_EXC_DMA_COMMAND, c.cmd, "DMA list element larger than 16 KB");
+        if (!dma_aligned(lsa, ea, size))
+            return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ALIGNMENT, c.cmd, "misaligned DMA list element");
+        if (transfer(ctx, pc, base_cmd, lsa, ea, size)) return 1;
+        c.lsa = ((c.lsa & 0x3FFF0u) + ((size + 15) & ~15u)) & PS_SPU_LS_MASK;
+        c.eal = (c.eal + 8) & PS_SPU_LS_MASK;
+        c.size -= 8;
+        // RPCS3 do_list_transfer: the element with the stall bit is transferred, then the list stalls (unless it
+        // was the last element).
+        if (stall && c.size >= 8) {
+            c.stalled = 1;
+            mark_stalled(ctx, c.tag);
+            return 2;
+        }
+    }
+    c.size = 0;
+    return 0;
+}
+
+bool blocked(const ps_spu_mfc_cmd& c, u32 fence, u32 barrier)
+{
+    const u32 bit = 1u << c.tag;
+    if (barrier & bit) return true;
+    return (c.cmd & (PS_MFC_BARRIER_MASK | PS_MFC_FENCE_MASK)) && (fence & bit);
+}
+
+void add_masks(const ps_spu_mfc_cmd& c, u32& fence, u32& barrier)
+{
+    const u32 bit = 1u << c.tag;
+    fence |= bit;
+    if (is_barrier_command(c.cmd))
+        barrier = ~0u;
+    else if (c.cmd & PS_MFC_BARRIER_MASK)
+        barrier |= bit;
+}
+
+int enqueue(SPUContext* ctx, u32 pc, const ps_spu_mfc_cmd& c)
+{
+    ps_spu_channels& ch = ctx->ch;
+    if (ch.queue_size >= 16)
+        return raise_exception(ctx, pc, PS_SPU_EXC_DEADLOCK, PS_MFC_Cmd, "MFC queue full of stalled commands");
+    ch.queue[ch.queue_size++] = c;
+    add_masks(c, ch.queue_fence, ch.queue_barrier);
+    return 0;
+}
+
+int putlluc(SPUContext* ctx, u32 pc, u32 eal, u32 lsa)
+{
+    const u32 addr = eal & ~127u;
+    if (addr >= PS_SPU_RAW_BASE) return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, eal, "PUTLLUC outside main memory");
+    ps_spu_channels& ch = ctx->ch;
+    if (ch.res_valid && ch.res_addr == addr) {
+        // RPCS3 do_putlluc: storing over our own reservation consumes it; LR only if it was already lost.
+        ChannelLock lock(ctx);
+        if (reservation_lost(ctx)) set_events(ctx, PS_SPU_EVENT_LR);
+        ch.res_valid = 0;
+    }
+    ps_res_store_line_unconditional(ctx->membase, addr, ctx->ls + (lsa & 0x3FF80u));
+    return 0;
+}
+
+int execute_queued(SPUContext* ctx, u32 pc, ps_spu_mfc_cmd& c)
+{
+    if (is_list(c.cmd)) return run_list(ctx, pc, c);
+    if (c.cmd == PS_MFC_PUTQLLUC) return putlluc(ctx, pc, c.eal, c.lsa);
+    if (is_barrier_command(c.cmd)) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return 0;
+    }
+    return transfer(ctx, pc, c.cmd, c.lsa, c.eal, c.size);
+}
+
+// Runs every queued command that is no longer blocked, in order.
+int process_queue(SPUContext* ctx, u32 pc)
+{
+    ps_spu_channels& ch = ctx->ch;
+    ps_spu_mfc_cmd kept[16];
+    u32 count = 0, fence = 0, barrier = 0;
+    for (u32 i = 0; i < ch.queue_size; i++) {
+        ps_spu_mfc_cmd c = ch.queue[i];
+        const bool waits = c.stalled || (is_barrier_command(c.cmd) ? count != 0 : blocked(c, fence, barrier));
+        if (!waits) {
+            const int r = execute_queued(ctx, pc, c);
+            if (r == 1) return 1;
+            if (r == 0) continue; // done
+        }
+        kept[count++] = c;
+        add_masks(c, fence, barrier);
+    }
+    ch.queue_size = count;
+    std::copy(kept, kept + count, ch.queue);
+    ch.queue_fence = fence;
+    ch.queue_barrier = barrier;
+    return 0;
+}
+
+} // namespace
+
+namespace pspocket::spu::detail {
+
+void mfc_update_tag_status(SPUContext* ctx)
+{
+    ps_spu_channels& ch = ctx->ch;
+    if (!ch.tag_update) return;
+    const u32 completed = mfc_completed(ctx);
+    if ((ch.tag_update == PS_MFC_TAG_UPDATE_ANY && completed) ||
+        (ch.tag_update == PS_MFC_TAG_UPDATE_ALL && completed == ch.tag_mask)) {
+        ch.tag_stat = completed;
+        ch.tag_stat_count = 1;
+        ch.tag_update = 0;
+    }
+}
+
+int mfc_stall_ack(SPUContext* ctx, u32 pc, u32 tag)
+{
+    ps_spu_channels& ch = ctx->ch;
+    const u32 bit = 1u << tag;
+    if (!(ch.stall_mask & bit)) return 0;
+    ch.stall_mask &= ~bit;
+    for (u32 i = 0; i < ch.queue_size; i++)
+        if (ch.queue[i].tag == tag) ch.queue[i].stalled = 0;
+    const int r = process_queue(ctx, pc);
+    mfc_update_tag_status(ctx);
+    return r;
+}
+
+int mfc_command(SPUContext* ctx, u32 pc, u32 cmd)
+{
+    ps_spu_channels& ch = ctx->ch;
+    ps_spu_mfc_cmd c{};
+    c.lsa = ch.mfc_lsa;
+    c.eal = ch.mfc_eal;
+    c.eah = ch.mfc_eah;
+    c.size = ch.mfc_size;
+    c.tag = static_cast<u8>(ch.mfc_tag & 0x1F);
+    c.cmd = static_cast<u8>(cmd);
+
+    int result = 0;
+    switch (cmd) {
+    case PS_MFC_SDCRT:
+    case PS_MFC_SDCRTST:
+    case PS_MFC_SDCRS:
+    case PS_MFC_SDCRF: return 0; // cache hints: no caches to manage
+
+    case PS_MFC_GETLLAR: {
+        const u32 addr = c.eal & ~127u;
+        if (addr >= PS_SPU_RAW_BASE) return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, c.eal, "GETLLAR outside main memory");
+        if (ch.res_valid) {
+            // Replacing a reservation that was lost raises LR first (RPCS3 process_mfc_cmd, GETLLAR).
+            ChannelLock lock(ctx);
+            if (reservation_lost(ctx)) set_events(ctx, PS_SPU_EVENT_LR);
+        }
+        alignas(16) u8 line[128];
+        const u64 version = ps_res_acquire(ctx->membase, addr, line);
+        std::memcpy(ctx->ls + (c.lsa & 0x3FF80u), line, 128);
+        std::memcpy(ch.res_data, line, 128);
+        ch.res_addr = addr;
+        ch.res_version = version;
+        ch.res_valid = 1;
+        ch.atomic_stat = PS_MFC_GETLLAR_SUCCESS;
+        ch.atomic_stat_count = 1;
+        return 0;
+    }
+    case PS_MFC_PUTLLC: {
+        const u32 addr = c.eal & ~127u;
+        if (addr >= PS_SPU_RAW_BASE) return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, c.eal, "PUTLLC outside main memory");
+        const bool ok = ch.res_valid && ch.res_addr == addr &&
+            ps_res_store_line(ctx->membase, addr, ch.res_version, ch.res_data, ctx->ls + (c.lsa & 0x3FF80u));
+        if (!ok && ch.res_valid) {
+            // RPCS3 do_putllc: a failed PUTLLC on the reserved line means it was lost; another line is checked.
+            ChannelLock lock(ctx);
+            if (ch.res_addr == addr || reservation_lost(ctx)) set_events(ctx, PS_SPU_EVENT_LR);
+        }
+        ch.res_valid = 0;
+        ch.atomic_stat = ok ? PS_MFC_PUTLLC_SUCCESS : PS_MFC_PUTLLC_FAILURE;
+        ch.atomic_stat_count = 1;
+        return 0;
+    }
+    case PS_MFC_PUTLLUC:
+        if (putlluc(ctx, pc, c.eal, c.lsa)) return 1;
+        ch.atomic_stat = PS_MFC_PUTLLUC_SUCCESS;
+        ch.atomic_stat_count = 1;
+        return 0;
+    case PS_MFC_PUTQLLUC:
+        result = blocked(c, ch.queue_fence, ch.queue_barrier) ? enqueue(ctx, pc, c) : putlluc(ctx, pc, c.eal, c.lsa);
+        break;
+    case PS_MFC_BARRIER:
+    case PS_MFC_EIEIO:
+    case PS_MFC_SYNC:
+        if (ch.queue_size == 0)
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        else
+            result = enqueue(ctx, pc, c);
+        break;
+    default:
+        if (is_transfer(cmd)) {
+            if ((cmd & 0xF0) == 0xA0 && c.size != 4)
+                return raise_exception(ctx, pc, PS_SPU_EXC_DMA_COMMAND, cmd, "sndsig with a size other than 4");
+            if (c.size > PS_MFC_MAX_SIZE)
+                return raise_exception(ctx, pc, PS_SPU_EXC_DMA_COMMAND, cmd, "DMA larger than 16 KB");
+            if (!dma_aligned(c.lsa & PS_SPU_LS_MASK, c.eal, c.size))
+                return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ALIGNMENT, cmd, "misaligned DMA");
+            if (blocked(c, ch.queue_fence, ch.queue_barrier))
+                result = enqueue(ctx, pc, c);
+            else
+                result = transfer(ctx, pc, cmd, c.lsa, c.eal, c.size);
+        } else if (is_list(cmd)) {
+            if (c.size > PS_MFC_MAX_SIZE)
+                return raise_exception(ctx, pc, PS_SPU_EXC_DMA_COMMAND, cmd, "DMA list larger than 16 KB");
+            if ((c.size & 7) || (c.eal & 7))
+                return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ALIGNMENT, cmd, "misaligned DMA list");
+            c.eal &= PS_SPU_LS_MASK;
+            if (blocked(c, ch.queue_fence, ch.queue_barrier)) {
+                result = enqueue(ctx, pc, c);
+            } else {
+                const int r = run_list(ctx, pc, c);
+                if (r == 1) return 1;
+                if (r == 2) result = enqueue(ctx, pc, c);
+            }
+        } else {
+            return raise_exception(ctx, pc, PS_SPU_EXC_DMA_COMMAND, cmd, "invalid MFC command");
+        }
+        break;
+    }
+    if (result) return result;
+    mfc_update_tag_status(ctx);
+    return 0;
+}
+
+} // namespace pspocket::spu::detail

@@ -1,0 +1,360 @@
+// FIFO parser tests: method headers, increment/non-increment, NOPs, old/new jumps, calls and returns (with nesting),
+// jump-to-self, split packets, errors and recovery, semaphores, labels, the reference register, and the RSX thread.
+// Command buffers are synthetic, built with CommandBuilder.
+
+#include <catch_amalgamated.hpp>
+
+#include <chrono>
+#include <thread>
+
+#include "rsx_test_util.hpp"
+
+using namespace pspocket;
+using namespace pspocket::rsx;
+using namespace pspocket::rsx::test;
+using Kind = RecordingBackend::Kind;
+
+TEST_CASE("methods write registers and get follows put")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.method(m::NV4097_SET_BLEND_ENABLE, 1);
+    b.method(m::NV4097_SET_DEPTH_FUNC, {0x203, 1, 0}); // DEPTH_FUNC, DEPTH_MASK, DEPTH_TEST_ENABLE
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+
+    CHECK(f.state().reg(m::NV4097_SET_BLEND_ENABLE) == 1);
+    CHECK(f.state().reg(m::NV4097_SET_DEPTH_FUNC) == 0x203);
+    CHECK(f.state().reg(m::NV4097_SET_DEPTH_MASK) == 1);
+    CHECK(f.state().reg(m::NV4097_SET_DEPTH_TEST_ENABLE) == 0);
+    CHECK(f.rsx->get() == b.offset());
+    CHECK(f.get_register() == b.offset()); // the guest-visible get register
+    CHECK(f.failures.empty());
+}
+
+TEST_CASE("non-incrementing methods send every argument to the same register")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.method_ni(m::NV4097_SET_ALPHA_REF, {1, 2, 3});
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(f.state().reg(m::NV4097_SET_ALPHA_REF) == 3);
+    CHECK(f.state().reg(m::NV4097_SET_ALPHA_REF + 1) == 0); // the next register (BLEND_ENABLE) is untouched
+
+    // Non-incrementing clears: three CLEAR_SURFACE calls
+    auto c = f.at(b.offset());
+    c.method_ni(m::NV4097_CLEAR_SURFACE, {0x10, 0x20, 0x40});
+    REQUIRE(f.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{0x10, 0x20, 0x40});
+}
+
+TEST_CASE("NOP headers are skipped")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.nop().nop();
+    b.method(m::NV4097_CLEAR_SURFACE, 0xf3);
+    b.nop();
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{0xf3});
+    CHECK(f.rsx->get() == b.offset());
+}
+
+TEST_CASE("old and new jumps redirect the FIFO")
+{
+    Fixture f;
+    // 0x000: CLEAR(1), old JUMP 0x100
+    // 0x100: CLEAR(2), new JUMP 0x200
+    // 0x200: CLEAR(3)
+    auto a = f.at(0);
+    a.method(m::NV4097_CLEAR_SURFACE, 1).jump(0x100);
+    auto b = f.at(0x100);
+    b.method(m::NV4097_CLEAR_SURFACE, 2).jump_new(0x200);
+    auto c = f.at(0x200);
+    c.method(m::NV4097_CLEAR_SURFACE, 3);
+    // A command that must not run: right after the first jump.
+    f.at(a.offset()).method(m::NV4097_CLEAR_SURFACE, 0xdead);
+    REQUIRE(f.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{1, 2, 3});
+    CHECK(f.rsx->get() == c.offset());
+}
+
+TEST_CASE("call and return")
+{
+    Fixture f;
+    // main: CLEAR(1) CALL sub CLEAR(3);  sub at 0x400: CLEAR(2) RETURN
+    auto sub = f.at(0x400);
+    sub.method(m::NV4097_CLEAR_SURFACE, 2).ret();
+    auto main = f.at(0);
+    main.method(m::NV4097_CLEAR_SURFACE, 1).call(0x400).method(m::NV4097_CLEAR_SURFACE, 3);
+    REQUIRE(f.submit(main) == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{1, 2, 3});
+    CHECK(f.rsx->call_depth() == 0);
+    CHECK(f.failures.empty());
+}
+
+TEST_CASE("the same subroutine can be called repeatedly")
+{
+    Fixture f;
+    auto sub = f.at(0x800);
+    sub.method(m::NV4097_CLEAR_SURFACE, 7).ret();
+    auto main = f.at(0);
+    main.call(0x800).call(0x800).call(0x800);
+    REQUIRE(f.submit(main) == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{7, 7, 7});
+}
+
+TEST_CASE("nested calls use the return stack when it is deep enough")
+{
+    Config cfg = test_config();
+    cfg.call_stack_depth = 4;
+    Fixture f(cfg);
+    // main: CALL s1, CLEAR(4)   s1: CLEAR(1) CALL s2 CLEAR(3) RET   s2: CALL s3 RET   s3: CLEAR(2) RET
+    f.at(0x300).method(m::NV4097_CLEAR_SURFACE, 2).ret();
+    f.at(0x200).call(0x300).ret();
+    f.at(0x100).method(m::NV4097_CLEAR_SURFACE, 1).call(0x200).method(m::NV4097_CLEAR_SURFACE, 3).ret();
+    auto main = f.at(0);
+    main.call(0x100).method(m::NV4097_CLEAR_SURFACE, 4);
+    REQUIRE(f.submit(main) == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{1, 2, 3, 4});
+    CHECK(f.failures.empty());
+}
+
+TEST_CASE("a nested call beyond the hardware depth is a FIFO error and the FIFO recovers")
+{
+    Fixture f; // depth 1, like the NV40 PFIFO
+    f.at(0x200).method(m::NV4097_CLEAR_SURFACE, 2).ret();
+    f.at(0x100).call(0x200).ret();
+    auto main = f.at(0);
+    main.call(0x100).method(m::NV4097_CLEAR_SURFACE, 9);
+    REQUIRE(f.submit(main) == Rsx::RunStatus::Error);
+    REQUIRE(f.failures.size() == 1);
+    CHECK(f.failures[0].kind == FailKind::FifoError);
+    CHECK(f.failures[0].message.find("nested") != std::string::npos);
+    // Recovery skips to put: nothing else ran, and the next submission works.
+    CHECK(f.backend.clears().empty());
+    CHECK(f.rsx->get() == main.offset());
+    auto next = f.at(main.offset());
+    next.method(m::NV4097_CLEAR_SURFACE, 5);
+    REQUIRE(f.submit(next) == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{5});
+}
+
+TEST_CASE("RETURN without CALL and malformed words are FIFO errors")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.ret();
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Error);
+    REQUIRE(f.failures.size() == 1);
+    CHECK(f.failures[0].message.find("RETURN") != std::string::npos);
+
+    auto c = f.at(b.offset());
+    c.word(0x80000000); // bit 31: not a method, not a jump
+    REQUIRE(f.submit(c) == Rsx::RunStatus::Error);
+    REQUIRE(f.failures.size() == 2);
+    CHECK(f.failures[1].kind == FailKind::FifoError);
+    CHECK(f.failures[1].message.find("malformed") != std::string::npos);
+}
+
+TEST_CASE("an unmapped FIFO address is a FIFO error")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.jump(0x01000000); // IO offset 16 MB: not mapped
+    f.set_put(0x01000010);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Error);
+    REQUIRE(f.failures.size() == 1);
+    CHECK(f.failures[0].message.find("not mapped") != std::string::npos);
+}
+
+TEST_CASE("unhandled methods are reported with name and number")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.method(0x1234 >> 2, 0x55);                   // inside NV4097 space, no such method
+    b.method(m::NV4097_SET_COLOR_MASK, 0x01010101); // known, keeps going
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    REQUIRE(f.failures.size() == 1);
+    CHECK(f.failures[0].kind == FailKind::UnhandledMethod);
+    CHECK(f.failures[0].method == (0x1234u >> 2));
+    CHECK(f.failures[0].message.find("0x1234") != std::string::npos);
+    CHECK(f.failures[0].message.find("0x00000055") != std::string::npos);
+    CHECK(f.state().reg(m::NV4097_SET_COLOR_MASK) == 0x01010101);
+}
+
+TEST_CASE("a packet split by put resumes when put moves")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.method(m::NV4097_CLEAR_SURFACE + 0, {0x10}); // whole packet
+    const u32 split_start = b.offset();
+    b.method_ni(m::NV4097_CLEAR_SURFACE, {0x11, 0x12, 0x13, 0x14});
+    // put stops after the header and two arguments
+    f.set_put(split_start + 4 + 8);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{0x10, 0x11, 0x12});
+    CHECK(f.rsx->get() == split_start + 12);
+    f.set_put(b.offset());
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{0x10, 0x11, 0x12, 0x13, 0x14});
+}
+
+TEST_CASE("jump to self parks the FIFO until the word is patched")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.method(m::NV4097_CLEAR_SURFACE, 1);
+    const u32 park = b.offset();
+    b.jump(park); // jump to self
+    b.method(m::NV4097_CLEAR_SURFACE, 2);
+    f.set_put(b.offset());
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Blocked);
+    CHECK(f.rsx->get() == park);
+    CHECK(f.backend.clears() == std::vector<u32>{1});
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Blocked); // still parked
+
+    // The guest replaces the jump with a NOP.
+    f.write32(Fixture::kCmdEa + park, 0);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{1, 2});
+}
+
+TEST_CASE("set_fifo_pointers resets the parser and writes the control registers")
+{
+    Fixture f;
+    auto b = f.at(0x1000);
+    b.method(m::NV4097_CLEAR_SURFACE, 3);
+    f.rsx->set_fifo_pointers(0x1000, b.offset());
+    CHECK(f.read32(f.layout().put_addr()) == b.offset());
+    CHECK(f.read32(f.layout().get_addr()) == 0x1000);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{3});
+    CHECK(f.rsx->fifo_location() == FifoLocation::Io);
+}
+
+TEST_CASE("a FIFO whose first get is not IO mapped lives in local memory")
+{
+    // GTA IV's libgcm puts its push buffer in local memory (RPCS3 RSXFIFO.cpp g_fifo_location).
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(PS_MEM_RSX_LOCAL_BASE, 0x100000));
+    Config cfg = test_config();
+    REQUIRE(initialize_context_memory(mem, cfg.layout));
+    RecordingBackend backend;
+    Rsx rsx(mem, backend, cfg);
+    CommandBuilder b(mem.base(), PS_MEM_RSX_LOCAL_BASE + 0x8000, 0x8000);
+    b.method(m::NV4097_CLEAR_SURFACE, 0x80);
+    rsx.set_fifo_pointers(0x8000, b.offset());
+    CHECK(rsx.fifo_location() == FifoLocation::Local);
+    REQUIRE(rsx.run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(backend.clears() == std::vector<u32>{0x80});
+}
+
+TEST_CASE("NV406E semaphore acquire blocks until the label matches")
+{
+    Fixture f;
+    const u32 label = f.layout().label_addr(64);
+    f.write32(label, 0);
+    auto b = f.at(0);
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 64 * 0x10);
+    const u32 acquire_at = b.offset();
+    b.method(m::NV406E_SEMAPHORE_ACQUIRE, 0x1234);
+    b.method(m::NV4097_CLEAR_SURFACE, 0x10);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Blocked);
+    CHECK(f.rsx->get() == acquire_at + 4); // parked on the acquire's argument
+    CHECK(f.backend.clears().empty());
+
+    f.write32(label, 0x1233);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Blocked);
+    f.write32(label, 0x1234);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{0x10});
+}
+
+TEST_CASE("semaphore releases and the reference register are written in command order")
+{
+    Fixture f;
+    auto b = f.at(0);
+    // NV406E release at label 65
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 65 * 0x10);
+    b.method(m::NV406E_SEMAPHORE_RELEASE, 0xCAFE0001);
+    // NV4097 texture-read release at label 66, back-end release at label 67 (bytes 0 and 2 exchanged)
+    b.method(m::NV4097_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV4097_SET_SEMAPHORE_OFFSET, 66 * 0x10);
+    b.method(m::NV4097_TEXTURE_READ_SEMAPHORE_RELEASE, 0x11223344);
+    b.method(m::NV4097_SET_SEMAPHORE_OFFSET, 67 * 0x10);
+    b.method(m::NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE, 0x11223344);
+    b.method(m::NV406E_SET_REFERENCE, 0x77);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(f.read32(f.layout().label_addr(65)) == 0xCAFE0001);
+    CHECK(f.read32(f.layout().label_addr(66)) == 0x11223344);
+    CHECK(f.read32(f.layout().label_addr(67)) == 0x11443322);
+    CHECK(f.read32(f.layout().ref_addr()) == 0x77);
+    CHECK(f.failures.empty());
+}
+
+TEST_CASE("an unaligned NV4097 semaphore offset is a FIFO error")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.method(m::NV4097_SET_SEMAPHORE_OFFSET, 0x14);
+    b.method(m::NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE, 1);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle); // error recovery skipped to put
+    REQUIRE(f.failures.size() == 1);
+    CHECK(f.failures[0].kind == FailKind::FifoError);
+}
+
+TEST_CASE("the RSX thread consumes the FIFO and sleeps on semaphores")
+{
+    Fixture f;
+    const u32 label = f.layout().label_addr(70);
+    f.write32(label, 0);
+    f.rsx->start();
+    REQUIRE(f.rsx->running());
+
+    auto b = f.at(0);
+    b.method(m::NV4097_CLEAR_SURFACE, 1);
+    f.set_put(b.offset());
+    f.rsx->notify();
+    REQUIRE(f.rsx->wait_idle(2'000'000'000ull));
+    CHECK(f.backend.clears() == std::vector<u32>{1});
+
+    // Wait on a label another thread releases.
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 70 * 0x10);
+    b.method(m::NV406E_SEMAPHORE_ACQUIRE, 5);
+    b.method(m::NV4097_CLEAR_SURFACE, 2);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 71 * 0x10);
+    b.method(m::NV406E_SEMAPHORE_RELEASE, 6);
+    f.set_put(b.offset());
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(f.backend.clears().size() == 1); // still blocked
+    CHECK_FALSE(f.rsx->wait_idle(1'000'000ull));
+
+    std::thread releaser([&] { f.write32(label, 5); });
+    releaser.join();
+    // Poll the label the RSX releases, as a PPU thread would.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (f.read32(f.layout().label_addr(71)) != 6 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    CHECK(f.read32(f.layout().label_addr(71)) == 6);
+    REQUIRE(f.rsx->wait_idle(2'000'000'000ull));
+    f.rsx->stop();
+    CHECK(f.backend.clears() == std::vector<u32>{1, 2});
+    CHECK_FALSE(f.rsx->running());
+}
+
+TEST_CASE("set_fifo_pointers from another thread is taken by the running RSX thread")
+{
+    Fixture f;
+    f.rsx->start();
+    auto b = f.at(0x2000);
+    b.method(m::NV4097_CLEAR_SURFACE, 9);
+    f.rsx->set_fifo_pointers(0x2000, b.offset());
+    REQUIRE(f.rsx->wait_idle(2'000'000'000ull));
+    f.rsx->stop();
+    CHECK(f.backend.clears() == std::vector<u32>{9});
+}

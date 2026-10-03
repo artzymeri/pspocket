@@ -1,12 +1,16 @@
 // ppu-fuzz-gen: writes the differential fuzz cases for every instruction form the interpreter supports.
 //
-//   ppu-fuzz-gen --out DIR --cases K --tus N
+//   ppu-fuzz-gen --out DIR --cases K --tus N [--no-vmx]
+//
+// --no-vmx leaves out the VMX forms (their lifted code needs AArch64 NEON, D-003).
 //
 // For each form (op + Rc/OE/LK/AA variant) it draws K random valid encodings, lifts each into a step function with
 // the real lifter (lift_step_function: same code generation as ppu-lift) and records overrides that keep effective
 // addresses inside the test window and provoke edge cases. Output: DIR/fuzz_lifted_<i>.c (the functions) and
 // DIR/fuzz_cases.c (the table, see fuzz_case.h). The generator seed is fixed, so the output is stable.
 
+#include <array>
+#include <bit>
 #include <cstdio>
 #include <format>
 #include <string>
@@ -267,6 +271,17 @@ public:
             f.u4 = rng_.below(16);
             break;
         case Fmt::X_MTFSB: f.d = rng_.below(32); break;
+        case Fmt::VX_VD_VA_VB:
+        case Fmt::VX_VD_VB:
+        case Fmt::VX_VD_VB_UIMM:
+        case Fmt::VX_VD_SIMM:
+        case Fmt::VA_VD_VA_VB_VC:
+        case Fmt::VA_VSLDOI:
+        case Fmt::VXR_VD_VA_VB:
+        case Fmt::VX_VD:
+        case Fmt::VX_VB:
+        case Fmt::X_VLOAD:
+        case Fmt::X_VSTORE: vmx_case(op, info, f); break;
         default:
             std::fprintf(stderr, "ppu-fuzz-gen: no generator for %s\n", info.mnemonic);
             std::exit(1);
@@ -431,6 +446,174 @@ private:
         }
     }
 
+    // ---- VMX ----------------------------------------------------------------------------------------------
+
+    // Element type of a VMX operand (k = 0 vA, 1 vB, 2 vC): drives which special values its lanes get.
+    enum class Lane : u8 { Any, F32, I8, I16, I32 };
+
+    static Lane lane_class(Op op, u32 k)
+    {
+        switch (op) {
+        case Op::VADDFP: case Op::VSUBFP: case Op::VMADDFP: case Op::VNMSUBFP: case Op::VMAXFP: case Op::VMINFP:
+        case Op::VREFP: case Op::VRSQRTEFP: case Op::VEXPTEFP: case Op::VLOGEFP: case Op::VRFIM: case Op::VRFIN:
+        case Op::VRFIP: case Op::VRFIZ: case Op::VCMPEQFP: case Op::VCMPGEFP: case Op::VCMPGTFP: case Op::VCMPBFP:
+        case Op::VCTSXS: case Op::VCTUXS: return Lane::F32;
+        case Op::VSUM4UBS: case Op::VSUM4SBS: case Op::VMSUMUBM: case Op::VMSUMMBM: return k == 0 || (k == 1 && op != Op::VSUM4UBS && op != Op::VSUM4SBS) ? Lane::I8 : Lane::I32;
+        case Op::VSUM4SHS: case Op::VMSUMUHM: case Op::VMSUMUHS: case Op::VMSUMSHM: case Op::VMSUMSHS:
+            return k == 0 || (k == 1 && op != Op::VSUM4SHS) ? Lane::I16 : Lane::I32;
+        case Op::VADDUBM: case Op::VADDUBS: case Op::VADDSBS: case Op::VSUBUBM: case Op::VSUBUBS: case Op::VSUBSBS:
+        case Op::VMAXUB: case Op::VMAXSB: case Op::VMINUB: case Op::VMINSB: case Op::VAVGUB: case Op::VAVGSB:
+        case Op::VCMPEQUB: case Op::VCMPGTUB: case Op::VCMPGTSB: case Op::VMULEUB: case Op::VMULOUB: case Op::VMULESB:
+        case Op::VMULOSB: case Op::VUPKHSB: case Op::VUPKLSB: case Op::VSLB: case Op::VSRB: case Op::VSRAB:
+        case Op::VRLB: return Lane::I8;
+        case Op::VADDUHM: case Op::VADDUHS: case Op::VADDSHS: case Op::VSUBUHM: case Op::VSUBUHS: case Op::VSUBSHS:
+        case Op::VMAXUH: case Op::VMAXSH: case Op::VMINUH: case Op::VMINSH: case Op::VAVGUH: case Op::VAVGSH:
+        case Op::VCMPEQUH: case Op::VCMPGTUH: case Op::VCMPGTSH: case Op::VMULEUH: case Op::VMULOUH: case Op::VMULESH:
+        case Op::VMULOSH: case Op::VMHADDSHS: case Op::VMHRADDSHS: case Op::VMLADDUHM: case Op::VPKUHUM:
+        case Op::VPKUHUS: case Op::VPKSHSS: case Op::VPKSHUS: case Op::VUPKHSH: case Op::VUPKLSH: case Op::VUPKHPX:
+        case Op::VUPKLPX: case Op::VSLH: case Op::VSRH: case Op::VSRAH: case Op::VRLH: return Lane::I16;
+        case Op::VADDUWM: case Op::VADDUWS: case Op::VADDSWS: case Op::VSUBUWM: case Op::VSUBUWS: case Op::VSUBSWS:
+        case Op::VADDCUW: case Op::VSUBCUW: case Op::VMAXUW: case Op::VMAXSW: case Op::VMINUW: case Op::VMINSW:
+        case Op::VAVGUW: case Op::VAVGSW: case Op::VCMPEQUW: case Op::VCMPGTUW: case Op::VCMPGTSW: case Op::VPKUWUM:
+        case Op::VPKUWUS: case Op::VPKSWSS: case Op::VPKSWUS: case Op::VPKPX: case Op::VSUMSWS: case Op::VSUM2SWS:
+        case Op::VSLW: case Op::VSRW: case Op::VSRAW: case Op::VRLW: case Op::VCFSX: case Op::VCFUX: return Lane::I32;
+        default: return Lane::Any;
+        }
+    }
+
+    // Case profiles: random bits, special values per lane type, "tame" (small; vA above vB, so saturating forms
+    // stay in range and compares come out all-true or all-false), or vB equal to vA.
+    enum class Profile : u8 { Random, Special, Tame, Equal };
+
+    u32 special_f32(u32 uimm)
+    {
+        static constexpr u32 kBits[] = {0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3f000000, 0xbf000000,
+            0x3fc00000, 0xbfc00000, 0x40200000, 0xc0200000, 0x40600000, 0x3effffff, 0x3f7fffff, 0x00800000,
+            0x80800000, 0x00000001, 0x007fffff, 0x80000001, 0x80400000, 0x7f7fffff, 0xff7fffff, 0x7f800000,
+            0xff800000, 0x7fc00000, 0xffc00000, 0x7fc12345, 0xffd00001, 0x7f800001, 0x7fa00000, 0xff800123,
+            0x4b000000, 0x4b7fffff, 0x3a83126f, 0x501502f9, 0x42c90000, 0xc2c90000};
+        if (rng_.chance(30)) { // around the vctsxs/vctuxs thresholds 2^31 / 2^32 (scaled by 2^-uimm) and 0
+            const s32 e = static_cast<s32>(rng_.chance(50) ? 31 : 32) - static_cast<s32>(uimm & 31);
+            u32 v = static_cast<u32>(127 + e) << 23;
+            v += static_cast<u32>(static_cast<s32>(rng_.below(5)) - 2);
+            if (rng_.chance(40)) v |= 0x80000000u;
+            return v;
+        }
+        if (rng_.chance(25)) { // small numbers with fractions: rounding and arithmetic that stays finite
+            const float x = (static_cast<float>(rng_.below(2001)) - 1000.0f) / static_cast<float>(1u << rng_.below(6));
+            return std::bit_cast<u32>(x);
+        }
+        return kBits[rng_.below(std::size(kBits))];
+    }
+
+    u64 special_int(u32 width)
+    {
+        static constexpr u64 k8[] = {0, 1, 2, 0x7f, 0x80, 0x81, 0xff, 0xfe, 0x40, 0xc0, 0x10};
+        static constexpr u64 k16[] = {0, 1, 0x7fff, 0x8000, 0x8001, 0xffff, 0x00ff, 0x0100, 0xff80, 0x007f, 0x0080,
+            0xff7f, 0x4000, 0xc000, 0xfffe};
+        static constexpr u64 k32[] = {0, 1, 0x7fffffff, 0x80000000, 0x80000001, 0xffffffff, 0xffff, 0x10000, 0x7fff,
+            0x8000, 0xffff8000, 0xffff7fff, 0x40000000, 0xc0000000, 0xfffffffe, 0x3fffffff};
+        if (rng_.chance(25)) return rng_.next();
+        switch (width) {
+        case 1: return k8[rng_.below(std::size(k8))];
+        case 2: return k16[rng_.below(std::size(k16))];
+        default: return k32[rng_.below(std::size(k32))];
+        }
+    }
+
+    // One operand value (host order, 16 bytes) for lane class cls.
+    std::array<u8, 16> vmx_value(Lane cls, Profile p, bool high, u32 uimm)
+    {
+        std::array<u8, 16> v{};
+        const u32 width = cls == Lane::I8 ? 1 : cls == Lane::I16 ? 2 : 4;
+        for (u32 off = 0; off < 16; off += width) {
+            u64 x;
+            if (p == Profile::Random || cls == Lane::Any) {
+                x = rng_.next();
+            } else if (p == Profile::Tame) {
+                const u32 k = (high ? 32 : 0) + rng_.below(32);
+                x = cls == Lane::F32 ? std::bit_cast<u32>(static_cast<float>(k) / 64.0f) : k; // [0, 1) for FP
+            } else {
+                x = cls == Lane::F32 ? special_f32(uimm) : special_int(width);
+            }
+            for (u32 b = 0; b < width; b++) v[off + b] = static_cast<u8>(x >> (8 * b));
+        }
+        return v;
+    }
+
+    void vr(u32 r, const std::array<u8, 16>& v)
+    {
+        u64 lo = 0, hi = 0;
+        for (u32 b = 0; b < 8; b++) {
+            lo |= u64{v[b]} << (8 * b);
+            hi |= u64{v[8 + b]} << (8 * b);
+        }
+        add(PS_FZ_VR_LO, r, lo);
+        add(PS_FZ_VR_HI, r, hi);
+    }
+
+    void vmx_case(Op op, const OpInfo& info, as::Fields& f)
+    {
+        f.d = reg();
+        f.a = reg();
+        f.b = reg();
+        f.c = reg();
+        // VSCR: SAT clear most of the time (so the cases show whether an instruction sets it), NJ either way.
+        add(PS_FZ_VSCR, 0, (rng_.chance(20) ? 1u : 0u) | (rng_.below(2) << 16));
+
+        u32 uimm = 0;
+        switch (info.fmt) {
+        case Fmt::X_VLOAD:
+        case Fmt::X_VSTORE: (void)ea_ra0_rb(f, 16, 1); return; // the whole aligned line is inside the window
+        case Fmt::VX_VD: return;
+        case Fmt::VX_VB: { // mtvscr: random word with SAT and NJ either way
+            std::array<u8, 16> v{};
+            for (auto& x : v) x = static_cast<u8>(rng_.next());
+            vr(f.b, v);
+            return;
+        }
+        case Fmt::VX_VD_SIMM: f.a = rng_.below(32); return;
+        case Fmt::VA_VSLDOI: f.sh = rng_.below(16); break;
+        case Fmt::VX_VD_VB_UIMM:
+            switch (op) {
+            case Op::VSPLTB: f.a = rng_.below(16); break;
+            case Op::VSPLTH: f.a = rng_.below(8); break;
+            case Op::VSPLTW: f.a = rng_.below(4); break;
+            default: f.a = rng_.below(32); break; // vcfux vcfsx vctuxs vctsxs: scale 2^+-uimm
+            }
+            uimm = f.a;
+            break;
+        default: break;
+        }
+
+        const u32 pick = rng_.below(100);
+        const Profile p = pick < 15 ? Profile::Equal : pick < 45 ? Profile::Tame : pick < 75 ? Profile::Special : Profile::Random;
+        const bool bounds = op == Op::VCMPBFP; // in bounds when |vA| <= vB: tame vA below vB
+        auto operand = [&](u32 k, bool high) {
+            return vmx_value(lane_class(op, k), p == Profile::Equal ? Profile::Tame : p, bounds ? !high : high, uimm);
+        };
+        switch (info.fmt) {
+        case Fmt::VX_VD_VA_VB:
+        case Fmt::VXR_VD_VA_VB:
+        case Fmt::VA_VSLDOI: {
+            const auto va = operand(0, true);
+            vr(f.a, va);
+            if (f.b != f.a) vr(f.b, p == Profile::Equal ? va : operand(1, false));
+            break;
+        }
+        case Fmt::VX_VD_VB:
+        case Fmt::VX_VD_VB_UIMM: vr(f.b, operand(1, false)); break;
+        case Fmt::VA_VD_VA_VB_VC: {
+            const auto va = operand(0, true);
+            vr(f.a, va);
+            if (f.b != f.a) vr(f.b, p == Profile::Equal ? va : operand(1, false));
+            if (f.c != f.a && f.c != f.b) vr(f.c, operand(2, false));
+            break;
+        }
+        default: break;
+        }
+    }
+
     Rng rng_;
     std::vector<ps_fuzz_override>* ov_ = nullptr;
 };
@@ -458,11 +641,17 @@ int main(int argc, char** argv)
 {
     std::string out;
     u32 per_form = 256, tus = 32;
-    for (int i = 1; i + 1 < argc; i += 2) {
+    bool vmx = true;
+    for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
-        if (arg == "--out") out = argv[i + 1];
-        else if (arg == "--cases") per_form = static_cast<u32>(std::stoul(argv[i + 1]));
-        else if (arg == "--tus") tus = static_cast<u32>(std::stoul(argv[i + 1]));
+        if (arg == "--no-vmx") {
+            vmx = false;
+            continue;
+        }
+        if (i + 1 >= argc) break;
+        if (arg == "--out") out = argv[++i];
+        else if (arg == "--cases") per_form = static_cast<u32>(std::stoul(argv[++i]));
+        else if (arg == "--tus") tus = static_cast<u32>(std::stoul(argv[++i]));
     }
     if (out.empty() || tus == 0) {
         std::fprintf(stderr, "usage: ppu-fuzz-gen --out DIR --cases K --tus N\n");
@@ -471,8 +660,12 @@ int main(int argc, char** argv)
 
     Generator gen(0x5EEDF00Dull);
     std::vector<GenCase> cases;
-    for (const Form& form : supported_forms())
+    usize forms = 0;
+    for (const Form& form : supported_forms()) {
+        if (!vmx && (op_info(form.op).flags & OPF_VMX)) continue;
+        forms++;
         for (u32 i = 0; i < per_form; i++) cases.push_back(gen.make(form.op, form.variant));
+    }
 
     std::vector<std::string> units(tus, "/* Generated by ppu-fuzz-gen (tests/ppu). Do not edit. */\n#include \"pspocket/ppu/lifted.h\"\n\n");
     std::string table = "/* Generated by ppu-fuzz-gen (tests/ppu). Do not edit. */\n#include \"fuzz_case.h\"\n\n";
@@ -489,7 +682,9 @@ int main(int argc, char** argv)
         override_index += static_cast<u32>(c.overrides.size());
     }
     table += protos;
-    table += std::format("\nconst uint32_t ps_fuzz_cases_per_form = {}u;\nconst uint32_t ps_fuzz_case_count = {}u;\n\n", per_form, cases.size());
+    table += std::format("\nconst uint32_t ps_fuzz_cases_per_form = {}u;\nconst uint32_t ps_fuzz_case_count = {}u;\n"
+                         "const uint32_t ps_fuzz_has_vmx = {}u;\n\n",
+        per_form, cases.size(), vmx ? 1 : 0);
     table += "const ps_fuzz_override ps_fuzz_overrides[] = {\n" + overrides + "    {0, 0, 0},\n};\n\n";
     table += "const ps_fuzz_case ps_fuzz_cases[] = {\n" + rows + "};\n";
 
@@ -502,7 +697,6 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "ppu-fuzz-gen: cannot write to %s\n", out.c_str());
         return 1;
     }
-    std::printf("ppu-fuzz-gen: %zu forms x %u cases = %zu lifted functions in %u units\n", supported_forms().size(),
-        per_form, cases.size(), tus);
+    std::printf("ppu-fuzz-gen: %zu forms x %u cases = %zu lifted functions in %u units\n", forms, per_form, cases.size(), tus);
     return 0;
 }

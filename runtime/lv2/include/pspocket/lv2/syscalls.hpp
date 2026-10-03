@@ -1,0 +1,203 @@
+#pragma once
+
+// The implemented lv2 syscalls as typed C++ functions, with RPCS3's argument order (rpcs3/Emu/Cell/lv2/*.h).
+// The dispatcher decodes r3..r10 into these parameters (u32 arguments take the low word, as RPCS3's
+// ppu_gpr_cast); HLE modules call them directly. Guest pointers are plain u32 guest addresses. A Result return is
+// written to r3 sign-extended; u64 returns are written as is.
+//
+// _sys_ppu_thread_exit and the process exits do not return: they unwind the thread with ThreadExit.
+
+#include "pspocket/core/types.hpp"
+#include "pspocket/lv2/errors.hpp"
+
+namespace pspocket::lv2 {
+
+class PpuThread;
+
+// ---- process, tty (sys_process.cpp, sys_tty.cpp)
+s32 sys_process_getpid(PpuThread& t);
+void sys_process_exit3(PpuThread& t, s32 status);
+Result sys_process_get_number_of_object(PpuThread& t, u32 object, u32 nump);
+s32 sys_process_getppid(PpuThread& t);
+void _sys_process_exit(PpuThread& t, s32 status, u32 arg2, u32 arg3);
+Result sys_process_get_sdk_version(PpuThread& t, u32 pid, u32 version);
+void _sys_process_exit2(PpuThread& t, s32 status, u32 arg, u32 arg_size, u32 arg4);
+Result _sys_process_get_paramsfo(PpuThread& t, u32 buffer);
+Result sys_tty_read(PpuThread& t, s32 ch, u32 buf, u32 len, u32 preadlen);
+Result sys_tty_write(PpuThread& t, s32 ch, u32 buf, u32 len, u32 pwritelen);
+
+// ---- PPU threads (sys_ppu_thread.cpp)
+void _sys_ppu_thread_exit(PpuThread& t, u64 errorcode);
+s32 sys_ppu_thread_yield(PpuThread& t);
+Result sys_ppu_thread_join(PpuThread& t, u32 thread_id, u32 vptr);
+Result sys_ppu_thread_detach(PpuThread& t, u32 thread_id);
+Result sys_ppu_thread_get_join_state(PpuThread& t, u32 isjoinable);
+Result sys_ppu_thread_set_priority(PpuThread& t, u32 thread_id, s32 prio);
+Result sys_ppu_thread_get_priority(PpuThread& t, u32 thread_id, u32 priop);
+Result sys_ppu_thread_get_stack_information(PpuThread& t, u32 sp);
+Result sys_ppu_thread_stop(PpuThread& t, u32 thread_id);
+Result sys_ppu_thread_restart(PpuThread& t);
+Result _sys_ppu_thread_create(PpuThread& t, u32 thread_id, u32 param, u64 arg, u64 unk, s32 prio, u64 stacksize,
+    u64 flags, u32 threadname);
+Result sys_ppu_thread_start(PpuThread& t, u32 thread_id);
+Result sys_ppu_thread_rename(PpuThread& t, u32 thread_id, u32 name);
+// sysPrxForUser's sys_ppu_thread_get_id has no syscall; HLE uses this.
+u32 sys_ppu_thread_get_id(PpuThread& t);
+
+// ---- timers and time (sys_timer.cpp, sys_time.cpp)
+Result sys_timer_create(PpuThread& t, u32 timer_id);
+Result sys_timer_destroy(PpuThread& t, u32 timer_id);
+Result sys_timer_get_information(PpuThread& t, u32 timer_id, u32 info);
+Result _sys_timer_start(PpuThread& t, u32 timer_id, u64 base_time, u64 period);
+Result sys_timer_stop(PpuThread& t, u32 timer_id);
+Result sys_timer_connect_event_queue(PpuThread& t, u32 timer_id, u32 queue_id, u64 name, u64 data1, u64 data2);
+Result sys_timer_disconnect_event_queue(PpuThread& t, u32 timer_id);
+Result sys_timer_usleep(PpuThread& t, u64 sleep_time);
+Result sys_timer_sleep(PpuThread& t, u32 sleep_time);
+Result sys_time_set_timezone(PpuThread& t, s32 timezone, s32 summertime);
+Result sys_time_get_timezone(PpuThread& t, u32 timezone, u32 summertime);
+Result sys_time_get_current_time(PpuThread& t, u32 sec, u32 nsec);
+Result sys_time_set_current_time(PpuThread& t, s64 sec, s64 nsec);
+u64 sys_time_get_timebase_frequency(PpuThread& t);
+u64 sys_time_get_system_time(PpuThread& t);
+
+// Guest system time: microseconds since the timebase origin (ps_timebase_now at 79.8 MHz), the clock timers and
+// sys_time_get_system_time use.
+u64 guest_system_time_us();
+
+// ---- event flags (sys_event_flag.cpp)
+Result sys_event_flag_create(PpuThread& t, u32 id, u32 attr, u64 init);
+Result sys_event_flag_destroy(PpuThread& t, u32 id);
+Result sys_event_flag_wait(PpuThread& t, u32 id, u64 bitptn, u32 mode, u32 result, u64 timeout);
+Result sys_event_flag_trywait(PpuThread& t, u32 id, u64 bitptn, u32 mode, u32 result);
+Result sys_event_flag_set(PpuThread& t, u32 id, u64 bitptn);
+Result sys_event_flag_clear(PpuThread& t, u32 id, u64 bitptn);
+Result sys_event_flag_cancel(PpuThread& t, u32 id, u32 num);
+Result sys_event_flag_get(PpuThread& t, u32 id, u32 flags);
+
+// ---- semaphores (sys_semaphore.cpp)
+Result sys_semaphore_create(PpuThread& t, u32 sem_id, u32 attr, s32 initial_val, s32 max_val);
+Result sys_semaphore_destroy(PpuThread& t, u32 sem_id);
+Result sys_semaphore_wait(PpuThread& t, u32 sem_id, u64 timeout);
+Result sys_semaphore_trywait(PpuThread& t, u32 sem_id);
+Result sys_semaphore_post(PpuThread& t, u32 sem_id, s32 count);
+Result sys_semaphore_get_value(PpuThread& t, u32 sem_id, u32 count);
+
+// ---- lightweight mutex / condition, kernel side (sys_lwmutex.cpp, sys_lwcond.cpp)
+Result _sys_lwmutex_create(PpuThread& t, u32 lwmutex_id, u32 protocol, u32 control, s32 has_name, u64 name);
+Result _sys_lwmutex_destroy(PpuThread& t, u32 lwmutex_id);
+Result _sys_lwmutex_lock(PpuThread& t, u32 lwmutex_id, u64 timeout);
+Result _sys_lwmutex_unlock(PpuThread& t, u32 lwmutex_id);
+Result _sys_lwmutex_trylock(PpuThread& t, u32 lwmutex_id);
+Result _sys_lwmutex_unlock2(PpuThread& t, u32 lwmutex_id);
+Result _sys_lwcond_create(PpuThread& t, u32 lwcond_id, u32 lwmutex_id, u32 control, u64 name);
+Result _sys_lwcond_destroy(PpuThread& t, u32 lwcond_id);
+Result _sys_lwcond_queue_wait(PpuThread& t, u32 lwcond_id, u32 lwmutex_id, u64 timeout);
+Result _sys_lwcond_signal(PpuThread& t, u32 lwcond_id, u32 lwmutex_id, u64 ppu_thread_id, u32 mode);
+Result _sys_lwcond_signal_all(PpuThread& t, u32 lwcond_id, u32 lwmutex_id, u32 mode);
+
+// ---- mutex, condition variable, rwlock (sys_mutex.cpp, sys_cond.cpp, sys_rwlock.cpp)
+Result sys_mutex_create(PpuThread& t, u32 mutex_id, u32 attr);
+Result sys_mutex_destroy(PpuThread& t, u32 mutex_id);
+Result sys_mutex_lock(PpuThread& t, u32 mutex_id, u64 timeout);
+Result sys_mutex_trylock(PpuThread& t, u32 mutex_id);
+Result sys_mutex_unlock(PpuThread& t, u32 mutex_id);
+Result sys_cond_create(PpuThread& t, u32 cond_id, u32 mutex_id, u32 attr);
+Result sys_cond_destroy(PpuThread& t, u32 cond_id);
+Result sys_cond_wait(PpuThread& t, u32 cond_id, u64 timeout);
+Result sys_cond_signal(PpuThread& t, u32 cond_id);
+Result sys_cond_signal_all(PpuThread& t, u32 cond_id);
+Result sys_cond_signal_to(PpuThread& t, u32 cond_id, u32 thread_id);
+Result sys_rwlock_create(PpuThread& t, u32 rw_lock_id, u32 attr);
+Result sys_rwlock_destroy(PpuThread& t, u32 rw_lock_id);
+Result sys_rwlock_rlock(PpuThread& t, u32 rw_lock_id, u64 timeout);
+Result sys_rwlock_tryrlock(PpuThread& t, u32 rw_lock_id);
+Result sys_rwlock_runlock(PpuThread& t, u32 rw_lock_id);
+Result sys_rwlock_wlock(PpuThread& t, u32 rw_lock_id, u64 timeout);
+Result sys_rwlock_trywlock(PpuThread& t, u32 rw_lock_id);
+Result sys_rwlock_wunlock(PpuThread& t, u32 rw_lock_id);
+Result _sys_rwlock_trywlock(PpuThread& t, u32 rw_lock_id);
+
+// ---- event queues and ports (sys_event.cpp)
+Result sys_event_queue_create(PpuThread& t, u32 equeue_id, u32 attr, u64 event_queue_key, s32 size);
+Result sys_event_queue_destroy(PpuThread& t, u32 equeue_id, s32 mode);
+Result sys_event_queue_receive(PpuThread& t, u32 equeue_id, u32 dummy_event, u64 timeout);
+Result sys_event_queue_tryreceive(PpuThread& t, u32 equeue_id, u32 event_array, s32 size, u32 number);
+Result sys_event_queue_drain(PpuThread& t, u32 equeue_id);
+Result sys_event_port_create(PpuThread& t, u32 eport_id, s32 port_type, u64 name);
+Result sys_event_port_destroy(PpuThread& t, u32 eport_id);
+Result sys_event_port_connect_local(PpuThread& t, u32 eport_id, u32 equeue_id);
+Result sys_event_port_disconnect(PpuThread& t, u32 eport_id);
+Result sys_event_port_send(PpuThread& t, u32 eport_id, u64 data1, u64 data2, u64 data3);
+Result sys_event_port_connect_ipc(PpuThread& t, u32 eport_id, u64 ipc_key);
+
+// ---- memory (sys_memory.cpp, sys_mmapper.cpp)
+Result sys_memory_container_create(PpuThread& t, u32 cid, u64 size);
+Result sys_memory_container_destroy(PpuThread& t, u32 cid);
+Result sys_memory_container_get_size(PpuThread& t, u32 mem_info, u32 cid);
+Result sys_memory_allocate(PpuThread& t, u64 size, u64 flags, u32 alloc_addr);
+Result sys_memory_free(PpuThread& t, u32 start_addr);
+Result sys_memory_allocate_from_container(PpuThread& t, u64 size, u32 cid, u64 flags, u32 alloc_addr);
+Result sys_memory_get_page_attribute(PpuThread& t, u32 addr, u32 attr);
+Result sys_memory_get_user_memory_size(PpuThread& t, u32 mem_info);
+Result sys_mmapper_allocate_fixed_address(PpuThread& t);
+Result sys_mmapper_free_shared_memory(PpuThread& t, u32 mem_id);
+Result sys_mmapper_allocate_address(PpuThread& t, u64 size, u64 flags, u64 alignment, u32 alloc_addr);
+Result sys_mmapper_free_address(PpuThread& t, u32 addr);
+Result sys_mmapper_allocate_shared_memory(PpuThread& t, u64 ipc_key, u64 size, u64 flags, u32 mem_id);
+Result sys_mmapper_map_shared_memory(PpuThread& t, u32 addr, u32 mem_id, u64 flags);
+Result sys_mmapper_unmap_shared_memory(PpuThread& t, u32 addr, u32 mem_id);
+Result sys_mmapper_search_and_map(PpuThread& t, u32 start_addr, u32 mem_id, u64 flags, u32 alloc_addr);
+Result sys_mmapper_allocate_shared_memory_from_container(PpuThread& t, u64 ipc_key, u64 size, u32 cid, u64 flags,
+    u32 mem_id);
+
+// ---- filesystem (sys_fs.cpp)
+enum : s32 {
+    CELL_FS_O_RDONLY = 000000,
+    CELL_FS_O_WRONLY = 000001,
+    CELL_FS_O_RDWR = 000002,
+    CELL_FS_O_ACCMODE = 000003,
+    CELL_FS_O_CREAT = 000100,
+    CELL_FS_O_EXCL = 000200,
+    CELL_FS_O_TRUNC = 001000,
+    CELL_FS_O_APPEND = 002000,
+    CELL_FS_O_MSELF = 010000,
+    CELL_FS_O_UNK = 01000000,
+};
+enum : s32 {
+    CELL_FS_SEEK_SET = 0,
+    CELL_FS_SEEK_CUR = 1,
+    CELL_FS_SEEK_END = 2,
+};
+enum : s32 {
+    CELL_FS_S_IFDIR = 0040000,
+    CELL_FS_S_IFREG = 0100000,
+};
+enum : u8 {
+    CELL_FS_TYPE_UNKNOWN = 0,
+    CELL_FS_TYPE_DIRECTORY = 1,
+    CELL_FS_TYPE_REGULAR = 2,
+};
+inline constexpr u32 kCellFsStatSize = 52;    // CellFsStat (4-byte aligned 64-bit fields)
+inline constexpr u32 kCellFsDirentSize = 258; // CellFsDirent
+
+Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg, u64 size);
+Result sys_fs_read(PpuThread& t, u32 fd, u32 buf, u64 nbytes, u32 nread);
+Result sys_fs_write(PpuThread& t, u32 fd, u32 buf, u64 nbytes, u32 nwrite);
+Result sys_fs_close(PpuThread& t, u32 fd);
+Result sys_fs_opendir(PpuThread& t, u32 path, u32 fd);
+Result sys_fs_readdir(PpuThread& t, u32 fd, u32 dir, u32 nread);
+Result sys_fs_closedir(PpuThread& t, u32 fd);
+Result sys_fs_stat(PpuThread& t, u32 path, u32 sb);
+Result sys_fs_fstat(PpuThread& t, u32 fd, u32 sb);
+Result sys_fs_mkdir(PpuThread& t, u32 path, s32 mode);
+Result sys_fs_rename(PpuThread& t, u32 from, u32 to);
+Result sys_fs_rmdir(PpuThread& t, u32 path);
+Result sys_fs_unlink(PpuThread& t, u32 path);
+Result sys_fs_lseek(PpuThread& t, u32 fd, s64 offset, s32 whence, u32 pos);
+Result sys_fs_fdatasync(PpuThread& t, u32 fd);
+Result sys_fs_fsync(PpuThread& t, u32 fd);
+Result sys_fs_truncate(PpuThread& t, u32 path, u64 size);
+Result sys_fs_ftruncate(PpuThread& t, u32 fd, u64 size);
+
+} // namespace pspocket::lv2

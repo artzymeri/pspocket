@@ -1,6 +1,7 @@
 add_library(pspocket_core STATIC
     src/guest_memory.cpp
     src/log.cpp
+    src/reservation.cpp
     src/timebase.cpp)
 target_include_directories(pspocket_core PUBLIC include)
 pspocket_set_warnings(pspocket_core)

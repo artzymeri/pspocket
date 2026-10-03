@@ -1,7 +1,7 @@
 #pragma once
 
 // PPU instruction decoder: 32-bit instruction word -> Op + field accessors. Covers the whole Cell PPE instruction
-// set including VMX (which this milestone decodes and disassembles but does not execute or lift).
+// set including VMX.
 
 #include <span>
 #include <string>
@@ -102,7 +102,7 @@ inline constexpr u32 OPF_INDEXED = 1u << 8;   // EA = (rA|0) + rB
 inline constexpr u32 OPF_MULTI = 1u << 9;     // lmw stmw lswi lswx stswi stswx
 inline constexpr u32 OPF_FP = 1u << 10;
 inline constexpr u32 OPF_FPARITH = 1u << 11;  // FP arithmetic: NaN payload propagation is host-defined (as RPCS3)
-inline constexpr u32 OPF_VMX = 1u << 12;      // decoded and disassembled; not executed this milestone
+inline constexpr u32 OPF_VMX = 1u << 12;      // VMX (AltiVec): vector registers, VSCR
 inline constexpr u32 OPF_NOSUPPORT = 1u << 13; // decoded; not supported (eciwx, ecowx)
 inline constexpr u32 OPF_TRAP = 1u << 14;
 inline constexpr u32 OPF_HINT = 1u << 15;     // cache / stream hint: architecturally a no-op here
@@ -195,8 +195,8 @@ struct Inst {
 
 Inst decode(u32 raw);
 
-// True when this milestone executes and lifts the instruction (interpreter and lifter agree on this list).
-// VMX, eciwx/ecowx, sc with LEV != 0, unknown SPRs and invalid mfocrf masks are not supported.
+// True when the interpreter executes and the lifter lifts the instruction (they agree on this list).
+// eciwx/ecowx, sc with LEV != 0, unknown SPRs and invalid mfocrf masks are not supported.
 bool is_supported(const Inst& inst);
 // Why is_supported() is false (empty when supported).
 std::string_view unsupported_reason(const Inst& inst);
@@ -233,11 +233,14 @@ inline constexpr u32 SPR_XER_CA = 1u << 4;
 inline constexpr u32 SPR_XER_BC = 1u << 5;
 inline constexpr u32 SPR_FPSCR = 1u << 6;
 inline constexpr u32 SPR_VRSAVE = 1u << 7;
-inline constexpr u32 SPR_ALL = 0xFF;
+inline constexpr u32 SPR_VSCR_SAT = 1u << 8; // VSCR[SAT] (sticky: saturating instructions read and write it)
+inline constexpr u32 SPR_VSCR_NJ = 1u << 9;  // VSCR[NJ] (read by the VMX FP instructions that flush denormals)
+inline constexpr u32 SPR_ALL = 0x3FF;
 
 struct RegUse {
     u32 gpr_read = 0, gpr_write = 0; // bit n = rn
     u32 fpr_read = 0, fpr_write = 0;
+    u32 vr_read = 0, vr_write = 0;
     u32 cr_read = 0, cr_write = 0;   // bit n = CR bit n (IBM numbering: bit 0 = cr0.lt)
     u32 spr_read = 0, spr_write = 0; // SPR_* bits
     bool mem_read = false, mem_write = false;
@@ -248,6 +251,8 @@ struct RegUse {
         gpr_write |= o.gpr_write;
         fpr_read |= o.fpr_read;
         fpr_write |= o.fpr_write;
+        vr_read |= o.vr_read;
+        vr_write |= o.vr_write;
         cr_read |= o.cr_read;
         cr_write |= o.cr_write;
         spr_read |= o.spr_read;
@@ -264,5 +269,9 @@ RegUse reg_use(const Inst& inst);
 
 // Registers lswi/stswi touch: rT .. rT + ceil(NB/4) - 1, wrapping at 32 (NB = 0 means 32 bytes).
 u32 lswi_reg_mask(u32 rt, u32 nb);
+
+// VMX instructions that may set VSCR[SAT], and those whose result depends on VSCR[NJ] (pspocket/ppu/vmx.h).
+bool vmx_sets_sat(Op op);
+bool vmx_uses_nj(Op op);
 
 } // namespace pspocket::ppu

@@ -1,0 +1,922 @@
+// GPU tests on the Mac's Metal device (skipped without one): texture decode (Morton unswizzle, 16-bit and float
+// formats, DXT in compute and as BC) against the CPU reference decoders, byte-swapped vertex and index pulling,
+// MSL compilation of translated programs, and end-to-end draws from synthetic RSX command buffers (clear, triangle,
+// culling, texturing, render-to-texture, readback through NV0039, flip and present).
+
+#include <catch_amalgamated.hpp>
+
+#import <Metal/Metal.h>
+
+#include <cmath>
+#include <cstring>
+#include <random>
+
+#include "pspocket/core/log.hpp"
+#include "pspocket/rsx/metal/metal_backend.hpp"
+#include "pspocket/rsx/shader/msl.hpp"
+#include "pspocket/rsx/texture.hpp"
+#include "rsx_test_util.hpp"
+#include "shader_asm.hpp"
+
+using namespace pspocket;
+using namespace pspocket::rsx;
+using namespace pspocket::rsx::test;
+using pspocket::rsx::metal::MetalBackend;
+using pspocket::rsx::metal::MetalBackendConfig;
+
+namespace {
+
+bool have_metal()
+{
+    static const bool ok = MTLCreateSystemDefaultDevice() != nil;
+    return ok;
+}
+
+#define REQUIRE_METAL()                                                                                                 \
+    do {                                                                                                                \
+        if (!have_metal()) SKIP("no Metal device");                                                                     \
+    } while (0)
+
+// Guest memory plus a Metal backend, without the FIFO (texture decode tests).
+struct GpuFixture {
+    GuestMemory mem;
+    std::unique_ptr<WriteTracker> tracker;
+    std::unique_ptr<MetalBackend> backend;
+    static constexpr u32 kTexEa = PS_MEM_RSX_LOCAL_BASE + 0x200000;
+
+    GpuFixture()
+    {
+        PS_CHECK(mem.reserve());
+        PS_CHECK(mem.commit(PS_MEM_RSX_LOCAL_BASE, 0x01000000));
+        tracker = std::make_unique<WriteTracker>(mem);
+        backend = std::make_unique<MetalBackend>(mem, *tracker);
+    }
+};
+
+std::array<int, 4> to_u8(const std::array<float, 4>& v)
+{
+    std::array<int, 4> r{};
+    for (u32 i = 0; i < 4; i++) r[i] = static_cast<int>(std::lround(std::clamp(v[i], 0.f, 1.f) * 255.f));
+    return r;
+}
+
+// Decodes level `level` of face `face` on the GPU and the CPU; returns the largest per-channel difference
+// (in 8-bit steps for unorm formats, exact float otherwise).
+double compare_decode(GpuFixture& g, const TextureInfo& t, u32 face, u32 level, bool force_compute, bool unorm)
+{
+    std::string why;
+    const auto layout = compute_texture_layout(t, &why);
+    REQUIRE(layout.has_value());
+    const TextureLevel& l = layout->levels[face * layout->mips + level];
+    std::vector<std::array<float, 4>> cpu, gpu;
+    REQUIRE(decode_level_cpu(*layout, l, g.mem.host(GpuFixture::kTexEa), cpu));
+    REQUIRE(g.backend->debug_decode_texture(t, GpuFixture::kTexEa, face, level, force_compute, gpu, &why));
+    REQUIRE(gpu.size() == cpu.size());
+    double worst = 0;
+    for (usize i = 0; i < cpu.size(); i++) {
+        if (unorm) {
+            const auto a = to_u8(cpu[i]), b = to_u8(gpu[i]);
+            for (u32 c = 0; c < 4; c++) worst = std::max(worst, static_cast<double>(std::abs(a[c] - b[c])));
+        } else {
+            for (u32 c = 0; c < 4; c++) worst = std::max(worst, std::abs(static_cast<double>(cpu[i][c]) - gpu[i][c]));
+        }
+    }
+    return worst;
+}
+
+TextureInfo tex_info(u32 format, u16 w, u16 h, u32 mips, u32 pitch = 0, bool cube = false)
+{
+    TextureInfo t;
+    t.format = format;
+    t.width = w;
+    t.height = h;
+    t.mipmaps = mips;
+    t.pitch = pitch;
+    t.dimension = 2;
+    t.cubemap = cube;
+    t.border_type = true;
+    t.location = 0;
+    return t;
+}
+
+void fill_random(GuestMemory& mem, u32 ea, u32 size, u32 seed)
+{
+    std::mt19937 rng(seed);
+    for (u32 i = 0; i < size; i++) ps_write8(mem.base(), ea + i, static_cast<u8>(rng()));
+}
+
+} // namespace
+
+TEST_CASE("metal: device, kernels and output ring")
+{
+    REQUIRE_METAL();
+    GpuFixture g;
+    REQUIRE(g.backend->valid());
+    CHECK(g.backend->device() != nullptr);
+}
+
+TEST_CASE("metal: Morton unswizzle and byte swap match the CPU reference")
+{
+    REQUIRE_METAL();
+    GpuFixture g;
+    fill_random(g.mem, GpuFixture::kTexEa, 0x40000, 1);
+
+    // ARGB8, swizzled, full mip chain of a non-square texture
+    const TextureInfo argb = tex_info(tex::A8R8G8B8, 64, 32, 7);
+    for (u32 level = 0; level < 7; level++) CHECK(compare_decode(g, argb, 0, level, false, true) == 0);
+    // ARGB8 linear with a padded pitch
+    CHECK(compare_decode(g, tex_info(tex::A8R8G8B8 | tex::kLinearFlag, 48, 20, 1, 256), 0, 0, false, true) == 0);
+    // 16-bit and 8-bit formats, swizzled
+    for (u32 f : {tex::R5G6B5, tex::A1R5G5B5, tex::A4R4G4B4, tex::R5G5B5A1, tex::D1R5G5B5, tex::R6G5B5, tex::B8,
+             tex::D8R8G8B8}) {
+        INFO("format " << f);
+        CHECK(compare_decode(g, tex_info(f, 32, 16, 2), 0, 0, false, true) == 0);
+        CHECK(compare_decode(g, tex_info(f, 32, 16, 2), 0, 1, false, true) == 0);
+    }
+    // Cube map: face 3, level 1
+    CHECK(compare_decode(g, tex_info(tex::A8R8G8B8, 16, 16, 2, 0, true), 3, 1, false, true) == 0);
+    // Border texels (linear, 1 texel around the image)
+    TextureInfo bordered = tex_info(tex::A8R8G8B8 | tex::kLinearFlag, 8, 8, 1, 64);
+    bordered.border_type = false;
+    CHECK(compare_decode(g, bordered, 0, 0, false, true) == 0);
+}
+
+TEST_CASE("metal: float texture formats decode exactly")
+{
+    REQUIRE_METAL();
+    GpuFixture g;
+    // Finite random floats/halves (random bits would include NaNs, which never compare equal).
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1000.f, 1000.f);
+    for (u32 i = 0; i < 0x8000; i += 4) ps_writef32(g.mem.base(), GpuFixture::kTexEa + i, dist(rng));
+    CHECK(compare_decode(g, tex_info(tex::X32_FLOAT, 16, 16, 1), 0, 0, false, false) == 0);
+    CHECK(compare_decode(g, tex_info(tex::W32_Z32_Y32_X32_FLOAT, 8, 8, 1), 0, 0, false, false) == 0);
+    for (u32 i = 0; i < 0x8000; i += 2) {
+        const u16 h = static_cast<u16>((rng() & 0x8000) | ((rng() % 30 + 1) << 10) | (rng() & 0x3ff));
+        ps_write16(g.mem.base(), GpuFixture::kTexEa + i, h);
+    }
+    CHECK(compare_decode(g, tex_info(tex::W16_Z16_Y16_X16_FLOAT, 16, 8, 1), 0, 0, false, false) == 0);
+}
+
+TEST_CASE("metal: DXT1/3/5 decode in compute matches the CPU reference, BC upload agrees")
+{
+    REQUIRE_METAL();
+    GpuFixture g;
+    fill_random(g.mem, GpuFixture::kTexEa, 0x20000, 3);
+    for (u32 f : {tex::COMPRESSED_DXT1, tex::COMPRESSED_DXT23, tex::COMPRESSED_DXT45}) {
+        INFO("format " << f);
+        const TextureInfo t = tex_info(f, 64, 32, 4);
+        for (u32 level = 0; level < 4; level++) CHECK(compare_decode(g, t, 0, level, true, true) == 0);
+        if (g.backend->supports_bc()) {
+            // The hardware BC decoder rounds its interpolations differently: allow a few steps.
+            for (u32 level = 0; level < 4; level++) CHECK(compare_decode(g, t, 0, level, false, true) <= 4);
+        }
+    }
+}
+
+// ---- vertex pulling --------------------------------------------------------------------------------------------
+
+namespace {
+
+id<MTLRenderPipelineState> fetch_pipeline(id<MTLDevice> device)
+{
+    const std::string src = shader::msl_prologue() + R"MSL(
+vertex void rsx_test_fetch(uint vid [[vertex_id]], device const uchar* vb [[buffer(0)]],
+                           constant rsx_vs_params& p [[buffer(1)]], device const uchar* ib [[buffer(3)]],
+                           device float4* out [[buffer(4)]])
+{
+    const uint vi = rsx_vertex_index(vid, p, ib);
+    for (uint a = 0; a < 8; a++) out[vid * 8 + a] = rsx_fetch(p.attribs[a], vi, vb);
+}
+)MSL";
+    NSError* error = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()] options:nil error:&error];
+    REQUIRE(lib != nil);
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [lib newFunctionWithName:@"rsx_test_fetch"];
+    d.rasterizationEnabled = NO;
+    id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:d error:&error];
+    REQUIRE(p != nil);
+    return p;
+}
+
+std::vector<std::array<float, 4>> run_fetch(id<MTLDevice> device, const std::vector<u8>& vb, const std::vector<u8>& ib,
+    const shader::MslVsParams& params, u32 count)
+{
+    id<MTLRenderPipelineState> pso = fetch_pipeline(device);
+    id<MTLBuffer> vbuf = [device newBufferWithBytes:vb.data() length:vb.size() options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ibuf = [device newBufferWithBytes:ib.data() length:std::max<usize>(ib.size(), 16) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [device newBufferWithLength:count * 8 * 16 options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> q = [device newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.renderTargetWidth = 1;
+    rp.renderTargetHeight = 1;
+    rp.defaultRasterSampleCount = 1;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:pso];
+    [enc setVertexBuffer:vbuf offset:0 atIndex:0];
+    [enc setVertexBytes:&params length:sizeof(params) atIndex:1];
+    [enc setVertexBuffer:ibuf offset:0 atIndex:3];
+    [enc setVertexBuffer:out offset:0 atIndex:4];
+    [enc drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:count];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    REQUIRE(cb.status == MTLCommandBufferStatusCompleted);
+    std::vector<std::array<float, 4>> r(count * 8);
+    std::memcpy(r.data(), out.contents, r.size() * 16);
+    return r;
+}
+
+void put16(std::vector<u8>& b, usize at, u16 v) { ps_st16(b.data() + at, v); }
+void put32(std::vector<u8>& b, usize at, u32 v) { ps_st32(b.data() + at, v); }
+u16 to_half(float f)
+{
+    // Exact for the values used here (small integers and halves)
+    u32 u;
+    std::memcpy(&u, &f, 4);
+    const u32 sign = (u >> 16) & 0x8000;
+    const int exp = static_cast<int>((u >> 23) & 0xff) - 127 + 15;
+    const u32 mant = (u >> 13) & 0x3ff;
+    if ((u & 0x7fffffff) == 0) return static_cast<u16>(sign);
+    return static_cast<u16>(sign | (static_cast<u32>(exp) << 10) | mant);
+}
+
+} // namespace
+
+TEST_CASE("metal: vertex pulling decodes big-endian attributes of every type")
+{
+    REQUIRE_METAL();
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    // Four vertices. Layout: a0 F x3 @0 stride 12; a1 S1 x4 @48 stride 8; a2 SF x2 @80 stride 4; a3 UB x4 @96;
+    // a4 S32K x2 @112; a5 CMP @128; a6 UB256 x4 @144 (strides 4); a7 register value.
+    std::vector<u8> vb(160, 0);
+    const s16 s1v[4][4] = {{32767, -32768, 0, 100}, {-1, 1, 16384, -16384}, {7, 8, 9, 10}, {-7, -8, -9, -10}};
+    for (u32 v = 0; v < 4; v++) {
+        for (u32 c = 0; c < 3; c++) {
+            u32 bits;
+            const float f = static_cast<float>(v * 10 + c) + 0.5f;
+            std::memcpy(&bits, &f, 4);
+            put32(vb, v * 12 + c * 4, bits);
+        }
+        for (u32 c = 0; c < 4; c++) put16(vb, 48 + v * 8 + c * 2, static_cast<u16>(s1v[v][c]));
+        put16(vb, 80 + v * 4, to_half(static_cast<float>(v) + 0.5f));
+        put16(vb, 82 + v * 4, to_half(-2.f * static_cast<float>(v)));
+        for (u32 c = 0; c < 4; c++) vb[96 + v * 4 + c] = static_cast<u8>(v * 60 + c);
+        put16(vb, 112 + v * 4, static_cast<u16>(-1000 + static_cast<int>(v)));
+        put16(vb, 114 + v * 4, static_cast<u16>(1000 + v));
+        // CMP: x = 1023 (max), y = -1024 (min), z = 255
+        put32(vb, 128 + v * 4, (1023u) | (0x400u << 11) | (255u << 22));
+        for (u32 c = 0; c < 4; c++) vb[144 + v * 4 + c] = static_cast<u8>(200 + v + c);
+    }
+    shader::MslVsParams p{};
+    auto attr = [&](u32 i, u32 offset, u32 stride, VertexType type, u32 size) {
+        p.attribs[i] = {offset, stride, static_cast<u32>(type), size, 0, shader::kAttribSwap, 0, 0, {0, 0, 0, 1}};
+    };
+    attr(0, 0, 12, VertexType::F, 3);
+    attr(1, 48, 8, VertexType::S1, 4);
+    attr(2, 80, 4, VertexType::SF, 2);
+    attr(3, 96, 4, VertexType::UB, 4);
+    attr(4, 112, 4, VertexType::S32K, 2);
+    attr(5, 128, 4, VertexType::CMP, 1);
+    attr(6, 144, 4, VertexType::UB256, 4);
+    p.attribs[7] = {0, 0, 0, 0, 0, shader::kAttribRegister, 0, 0, {9.f, 8.f, 7.f, 6.f}};
+
+    // Indexed: big-endian u16 indices {3, 0, 2} with base index 0 -> vertices 3, 0, 2
+    std::vector<u8> ib(8, 0);
+    put16(ib, 0, 3);
+    put16(ib, 2, 0);
+    put16(ib, 4, 2);
+    p.index_mode = shader::kIndexU16BE;
+    const auto out = run_fetch(device, vb, ib, p, 3);
+    const u32 order[3] = {3, 0, 2};
+    for (u32 k = 0; k < 3; k++) {
+        const u32 v = order[k];
+        const auto* a = &out[k * 8];
+        INFO("vertex " << v);
+        CHECK(a[0] == std::array<float, 4>{v * 10 + 0.5f, v * 10 + 1.5f, v * 10 + 2.5f, 1.f});
+        for (u32 c = 0; c < 4; c++) CHECK(a[1][c] == Catch::Approx((s1v[v][c] + 0.5) / 32767.5).epsilon(1e-6));
+        CHECK(a[2][0] == v + 0.5f);
+        CHECK(a[2][1] == -2.f * v);
+        CHECK(a[2][2] == 0.f);
+        CHECK(a[2][3] == 1.f);
+        for (u32 c = 0; c < 4; c++) CHECK(a[3][c] == Catch::Approx((v * 60 + c) / 255.0));
+        CHECK(a[4][0] == -1000.f + v);
+        CHECK(a[4][1] == 1000.f + v);
+        CHECK(a[5][0] == Catch::Approx(1023.0 * 32 / 32767.0));
+        CHECK(a[5][1] == Catch::Approx(-1024.0 * 32 / 32767.0));
+        CHECK(a[5][2] == Catch::Approx(255.0 * 64 / 32767.0));
+        CHECK(a[5][3] == 1.f);
+        for (u32 c = 0; c < 4; c++) CHECK(a[6][c] == static_cast<float>(200 + v + c));
+        CHECK(a[7] == std::array<float, 4>{9.f, 8.f, 7.f, 6.f});
+    }
+
+    // Big-endian u32 indices with a base index, and an instanced attribute (frequency 2, divide) plus a modulo one.
+    std::vector<u8> ib32(16, 0);
+    put32(ib32, 0, 0);
+    put32(ib32, 4, 1);
+    put32(ib32, 8, 2);
+    shader::MslVsParams q = p;
+    q.index_mode = shader::kIndexU32BE;
+    q.base_index = 1; // vertices 1, 2, 3
+    q.attribs[3].divisor = 2; // element = vertex / 2
+    q.attribs[6].divisor = 2; // element = vertex % 2
+    q.attribs[6].flags |= shader::kAttribModulo;
+    const auto out2 = run_fetch(device, vb, ib32, q, 3);
+    for (u32 k = 0; k < 3; k++) {
+        const u32 v = k + 1;
+        CHECK(out2[k * 8 + 0][0] == v * 10 + 0.5f);
+        CHECK(out2[k * 8 + 3][0] == Catch::Approx(((v / 2) * 60) / 255.0));
+        CHECK(out2[k * 8 + 6][0] == static_cast<float>(200 + (v % 2)));
+    }
+}
+
+// ---- MSL compilation of translated programs ---------------------------------------------------------------------
+
+TEST_CASE("metal: translated vertex and fragment programs compile")
+{
+    REQUIRE_METAL();
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    auto compile = [&](const shader::TranslateResult& r) {
+        REQUIRE(r.ok);
+        NSError* error = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:r.shader.source.c_str()]
+                                                  options:nil
+                                                    error:&error];
+        if (!lib) FAIL(error.localizedDescription.UTF8String << "\n" << r.shader.source);
+        CHECK([lib newFunctionWithName:[NSString stringWithUTF8String:r.shader.entry.c_str()]] != nil);
+    };
+
+    // Every supported VP opcode in one program.
+    std::vector<VpInst> vp;
+    for (u32 op : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u, 14u, 15u, 16u, 17u, 18u, 19u, 20u, 21u, 22u}) {
+        VpInst in;
+        in.vec_op = op;
+        in.src[0] = vp_in();
+        in.src[1] = vp_const("yzwx");
+        in.src[2] = vp_temp(1);
+        in.input = op % 16;
+        in.constant = op;
+        in.vec_result = false;
+        in.vec_temp = 1 + op % 4;
+        in.vec_mask = 0xf;
+        vp.push_back(in);
+    }
+    for (u32 op : {1u, 2u, 3u, 4u, 13u, 14u, 15u, 16u}) {
+        VpInst in;
+        in.sca_op = op;
+        in.src[2] = vp_temp(2, "wwww");
+        in.vec_result = false;
+        in.out = op % 16;
+        in.sca_mask = mask("x");
+        in.saturate = op == 2;
+        vp.push_back(in);
+    }
+    VpInst pos;
+    pos.vec_op = 1;
+    pos.src[0] = vp_temp(1);
+    pos.out = 0;
+    pos.vec_mask = 0xf;
+    pos.end = true;
+    vp.push_back(pos);
+    const auto words = assemble_vp(vp);
+    const auto decoded = shader::decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
+    REQUIRE(decoded.has_value());
+    compile(shader::translate_vertex_program(*decoded));
+    shader::VpOptions points;
+    points.point_size = true;
+    compile(shader::translate_vertex_program(*decoded, points));
+
+    // Every supported FP opcode.
+    std::vector<FpInst> fp;
+    for (u32 op : {0x01u, 0x02u, 0x03u, 0x04u, 0x38u, 0x05u, 0x06u, 0x08u, 0x09u, 0x3Au, 0x1Au, 0x1Bu, 0x1Cu, 0x1Du,
+             0x23u, 0x22u, 0x10u, 0x11u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu, 0x20u, 0x21u, 0x1Fu, 0x39u, 0x15u,
+             0x16u, 0x17u, 0x18u, 0x2Fu, 0x31u}) {
+        FpInst in;
+        in.op = op;
+        in.dst = op % 3;
+        in.fp16 = (op & 1) != 0;
+        in.input = 1 + op % 13;
+        in.tex = op % 4;
+        in.src[0] = fp_in("xyzw");
+        in.src[1] = fp_const("wzyx");
+        in.src[2] = fp_r(1);
+        in.constant = std::array<float, 4>{1.f, 2.f, 3.f, 4.f};
+        in.saturate = op == 0x02;
+        in.scale = op == 0x03 ? 1 : 0;
+        in.prec = op == 0x04 ? 2 : 0;
+        fp.push_back(in);
+    }
+    FpInst kil;
+    kil.op = 0x12;
+    fp.push_back(kil);
+    FpInst out;
+    out.op = 0x01;
+    out.dst = 0;
+    out.src[0] = fp_r(1);
+    out.end = true;
+    fp.push_back(out);
+    const auto bytes = assemble_fp(fp);
+    const auto fdecoded = shader::decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
+    REQUIRE(fdecoded.has_value());
+    shader::FpOptions fo;
+    fo.shader_control = 0x40 | 0xe; // 32-bit exports and depth export
+    fo.mrt_count = 4;
+    fo.texture_kind[1] = shader::TextureKind::Cube;
+    fo.texture_kind[2] = shader::TextureKind::Tex1D;
+    fo.texcoord_2d_mask = 0x3;
+    fo.alpha_test = true;
+    fo.output_swizzle[1] = {2, 1, 4, 4};
+    // TXP/TXL/TXB on the cube unit are rejected; keep unit 1 2D for the compile check.
+    fo.texture_kind[1] = shader::TextureKind::Tex2D;
+    compile(shader::translate_fragment_program(*fdecoded, fo));
+    fo.flat_colors = true;
+    fo.shader_control = 0;
+    fo.mrt_count = 1;
+    compile(shader::translate_fragment_program(*fdecoded, fo));
+}
+
+// ---- end to end -------------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr u32 kSurfaceOffset = 0x100000; // local memory
+constexpr u32 kSurfaceB = 0x140000;
+constexpr u32 kVertexOffset = 0x010000;
+constexpr u32 kColorOffset = 0x011000;
+constexpr u32 kUvOffset = 0x012000;
+constexpr u32 kFpOffset = 0x020000;
+constexpr u32 kFp2Offset = 0x021000;
+constexpr u32 kTexOffset = 0x030000;
+constexpr u32 kW = 64, kH = 64;
+
+struct E2E {
+    GuestMemory mem;
+    std::unique_ptr<WriteTracker> tracker;
+    std::unique_ptr<MetalBackend> backend;
+    std::unique_ptr<Rsx> rsx;
+    Config config = test_config();
+    std::vector<Failure> failures;
+    std::vector<metal::PresentFrame> presents;
+    std::vector<std::vector<u8>> present_pixels; // BGRA8 of each presented frame
+    static constexpr u32 kCmdEa = 0x00200000;
+    static constexpr u32 kReadbackEa = 0x00400000; // main memory, IO 0x00100000
+
+    E2E()
+    {
+        PS_CHECK(mem.reserve());
+        PS_CHECK(mem.commit(kCmdEa, 0x100000));
+        PS_CHECK(mem.commit(kReadbackEa, 0x100000));
+        PS_CHECK(mem.commit(PS_MEM_RSX_LOCAL_BASE, 0x01000000));
+        PS_CHECK(initialize_context_memory(mem, config.layout));
+        tracker = std::make_unique<WriteTracker>(mem);
+        MetalBackendConfig mc;
+        mc.output_width = 128;
+        mc.output_height = 128;
+        mc.present = [this](const metal::PresentFrame& f) {
+            presents.push_back(f);
+            // Read the output back once the frame's command buffer completes.
+            id<MTLTexture> t = (__bridge id<MTLTexture>)f.texture;
+            id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)f.command_buffer;
+            id<MTLDevice> dev = t.device;
+            id<MTLBuffer> buf = [dev newBufferWithLength:t.width * t.height * 4 options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(t.width, t.height, 1) toBuffer:buf destinationOffset:0
+           destinationBytesPerRow:t.width * 4 destinationBytesPerImage:t.width * t.height * 4];
+            [blit endEncoding];
+            const usize index = present_pixels.size();
+            present_pixels.emplace_back();
+            auto* store = &present_pixels;
+            const usize bytes = t.width * t.height * 4;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+                (*store)[index].assign(static_cast<const u8*>(buf.contents), static_cast<const u8*>(buf.contents) + bytes);
+            }];
+        };
+        backend = std::make_unique<MetalBackend>(mem, *tracker, mc);
+        rsx = std::make_unique<Rsx>(mem, *backend, config);
+        rsx->on_failure = [this](const Failure& f) { failures.push_back(f); };
+        PS_CHECK(rsx->io_map().map(0, kCmdEa, 0x100000));
+        PS_CHECK(rsx->io_map().map(0x100000, kReadbackEa, 0x100000));
+        rsx->set_fifo_pointers(0, 0);
+    }
+
+    CommandBuilder at(u32 offset) { return CommandBuilder(mem.base(), kCmdEa + offset, offset); }
+    Rsx::RunStatus submit(const CommandBuilder& b)
+    {
+        ps_write32(mem.base(), config.layout.put_addr(), b.offset());
+        return rsx->run_until_idle();
+    }
+    u32 local32(u32 offset) const { return ps_read32(mem.base(), PS_MEM_RSX_LOCAL_BASE + offset); }
+    void put_local32(u32 offset, u32 v) { ps_write32(mem.base(), PS_MEM_RSX_LOCAL_BASE + offset, v); }
+    void put_local_f(u32 offset, float v) { ps_writef32(mem.base(), PS_MEM_RSX_LOCAL_BASE + offset, v); }
+    void put_local_bytes(u32 offset, const std::vector<u8>& bytes)
+    {
+        std::memcpy(mem.host(PS_MEM_RSX_LOCAL_BASE + offset), bytes.data(), bytes.size());
+    }
+};
+
+// Surface A8R8G8B8 kW x kH at `offset`, no depth, viewport and scissor covering it (libgcm-style y flip).
+void setup_surface(CommandBuilder& b, u32 offset)
+{
+    b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (1u << 8));
+    b.method(m::NV4097_SET_CONTEXT_DMA_COLOR_A, loc::kDmaFrameBuffer);
+    b.method(m::NV4097_SET_SURFACE_COLOR_AOFFSET, offset);
+    b.method(m::NV4097_SET_SURFACE_PITCH_A, kW * 4);
+    b.method(m::NV4097_SET_SURFACE_COLOR_TARGET, static_cast<u32>(SurfaceTarget::A));
+    b.method(m::NV4097_SET_SURFACE_CLIP_HORIZONTAL, {kW << 16, kH << 16});
+    b.method(m::NV4097_SET_VIEWPORT_HORIZONTAL, {kW << 16, kH << 16});
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {kW << 16, kH << 16});
+    const float hw = kW / 2.f, hh = kH / 2.f;
+    b.method(m::NV4097_SET_VIEWPORT_OFFSET, {f2u(hw), f2u(hh), f2u(0.5f), f2u(0.f)});
+    b.method(m::NV4097_SET_VIEWPORT_SCALE, {f2u(hw), f2u(-hh), f2u(0.5f), f2u(0.f)});
+}
+
+// VP: o[0] = v[0]; o[1] = v[3]; o[7] = v[8]
+void upload_vertex_program(CommandBuilder& b)
+{
+    VpInst p0;
+    p0.vec_op = 1;
+    p0.src[0] = vp_in();
+    p0.input = 0;
+    p0.out = 0;
+    p0.vec_mask = 0xf;
+    VpInst p1 = p0;
+    p1.input = 3;
+    p1.out = 1;
+    VpInst p2 = p0;
+    p2.input = 8;
+    p2.out = 7;
+    p2.end = true;
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({p0, p1, p2}));
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+    b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, (1u << 0) | (1u << 3) | (1u << 8));
+}
+
+void set_fragment_program(CommandBuilder& b, u32 offset, u32 control)
+{
+    b.method(m::NV4097_SET_SHADER_PROGRAM, offset | (loc::kLocal + 1));
+    b.method(m::NV4097_SET_SHADER_CONTROL, control);
+}
+
+// Triangle (-1,-1) (1,-1) (0,1) in clip space, colour per vertex as UB4 (r, g, b, a bytes), uv as F x2.
+void write_triangle(E2E& e, std::array<u32, 3> colors, bool flip_winding = false)
+{
+    const float xy[3][2] = {{-1.f, -1.f}, {1.f, -1.f}, {0.f, 1.f}};
+    const float uv[3][2] = {{0.f, 1.f}, {1.f, 1.f}, {0.5f, 0.f}};
+    for (u32 v = 0; v < 3; v++) {
+        const u32 src = flip_winding ? (v == 0 ? 1 : v == 1 ? 0 : 2) : v;
+        e.put_local_f(kVertexOffset + v * 16 + 0, xy[src][0]);
+        e.put_local_f(kVertexOffset + v * 16 + 4, xy[src][1]);
+        e.put_local_f(kVertexOffset + v * 16 + 8, 0.5f);
+        e.put_local_f(kVertexOffset + v * 16 + 12, 1.f);
+        e.put_local32(kColorOffset + v * 4, colors[src]); // bytes r g b a (big-endian word 0xRRGGBBAA)
+        e.put_local_f(kUvOffset + v * 8 + 0, uv[src][0]);
+        e.put_local_f(kUvOffset + v * 8 + 4, uv[src][1]);
+    }
+}
+
+void bind_vertex_arrays(CommandBuilder& b)
+{
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0, static_cast<u32>(VertexType::F) | (4u << 4) | (16u << 8));
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0, kVertexOffset);
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3, static_cast<u32>(VertexType::UB) | (4u << 4) | (4u << 8));
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3, kColorOffset);
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 8, static_cast<u32>(VertexType::F) | (2u << 4) | (8u << 8));
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 8, kUvOffset);
+}
+
+void draw_triangle(CommandBuilder& b)
+{
+    b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Triangles));
+    b.method(m::NV4097_DRAW_ARRAYS, (2u << 24) | 0);
+    b.method(m::NV4097_SET_BEGIN_END, 0);
+}
+
+// MOV R0, f[COL0] (32-bit export) or MOV H0, f[COL0] (16-bit export)
+std::vector<u8> fp_color(bool fp16)
+{
+    FpInst mov;
+    mov.op = 0x01;
+    mov.dst = 0;
+    mov.fp16 = fp16;
+    mov.input = 1;
+    mov.src[0] = fp_in();
+    mov.end = true;
+    return assemble_fp({mov});
+}
+
+// R0 = TEX0(f[TEX0])
+std::vector<u8> fp_texture()
+{
+    FpInst tex;
+    tex.op = 0x17;
+    tex.dst = 0;
+    tex.input = 4;
+    tex.tex = 0;
+    tex.src[0] = fp_in();
+    tex.end = true;
+    return assemble_fp({tex});
+}
+
+// Pixel (x, y) of the surface read back as guest A8R8G8B8 bytes (a, r, g, b) after a flush.
+std::array<u8, 4> guest_pixel(E2E& e, u32 surface_offset, u32 x, u32 y)
+{
+    const u8* p = e.mem.host(PS_MEM_RSX_LOCAL_BASE + surface_offset + y * kW * 4 + x * 4);
+    return {p[0], p[1], p[2], p[3]};
+}
+
+} // namespace
+
+TEST_CASE("metal e2e: clear, upload programs, draw a triangle, read back through NV0039")
+{
+    REQUIRE_METAL();
+    E2E e;
+    REQUIRE(e.backend->valid());
+    const auto fp = fp_color(false);
+    e.put_local_bytes(kFpOffset, fp);
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red, opaque
+
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ff); // ARGB: opaque blue
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40); // 32-bit exports: R0
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    // Label release after the draw: the guest would wait for it
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 64 * 0x10);
+    b.method(m::NV406E_SEMAPHORE_RELEASE, 1);
+    // Copy the surface to main memory with NV0039: the RSX reads surface memory -> GPU readback first
+    b.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaFrameBuffer, loc::kDmaHostBuffer});
+    b.method(m::NV0039_OFFSET_IN, {kSurfaceOffset, 0x100000, kW * 4, kW * 4, kW * 4, kH, 0x101});
+    b.method(m::NV0039_BUFFER_NOTIFY, 0);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(ps_read32(e.mem.base(), e.config.layout.label_addr(64)) == 1);
+
+    const auto& st = e.backend->stats();
+    CHECK(st.draws == 1);
+    CHECK(st.draws_skipped == 0);
+    CHECK(st.readbacks == 1);
+    CHECK(st.load_action_clears == 1); // the clear became the pass's load action
+    // Inside the triangle: red (A R G B bytes); outside: the blue clear colour
+    const u8* main = e.mem.host(E2E::kReadbackEa);
+    auto main_pixel = [&](u32 x, u32 y) {
+        const u8* p = main + y * kW * 4 + x * 4;
+        return std::array<u8, 4>{p[0], p[1], p[2], p[3]};
+    };
+    CHECK(main_pixel(32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
+    CHECK(main_pixel(32, 10) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // near the apex (top)
+    CHECK(main_pixel(2, 2) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
+    CHECK(main_pixel(60, 5) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
+    // The surface memory itself was written back too.
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
+
+    std::vector<u8> rgba;
+    u32 w = 0, h = 0;
+    REQUIRE(e.backend->debug_read_surface(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, rgba, w, h));
+    CHECK(w == kW);
+    CHECK(h == kH);
+    CHECK(rgba[(48 * kW + 32) * 4 + 0] == 255);
+    CHECK(rgba[(48 * kW + 32) * 4 + 2] == 0);
+}
+
+TEST_CASE("metal e2e: 16-bit exports, vertex colour interpolation and partial clears")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(true));
+    write_triangle(e, {0xff0000ff, 0x00ff00ff, 0x0000ffff}); // r, g, b corners
+
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff202020);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0); // 16-bit exports: H0
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    // Partial clear after the draw: a scissored quad (not a load action)
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(8u << 16) | 0, (8u << 16) | 0});
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffffffff);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+
+    // Near each corner the colour is dominated by that vertex
+    const auto bl = guest_pixel(e, kSurfaceOffset, 3, 62);
+    CHECK(bl[1] > 200);
+    CHECK(bl[2] < 40);
+    const auto br = guest_pixel(e, kSurfaceOffset, 60, 62);
+    CHECK(br[2] > 200);
+    CHECK(br[1] < 40);
+    const auto top = guest_pixel(e, kSurfaceOffset, 32, 3);
+    CHECK(top[3] > 200);
+    // Centre: a mix
+    const auto mid = guest_pixel(e, kSurfaceOffset, 32, 40);
+    CHECK(mid[1] > 40);
+    CHECK(mid[2] > 40);
+    CHECK(mid[3] > 20);
+    // The scissored clear hit only the 8x8 corner
+    CHECK(guest_pixel(e, kSurfaceOffset, 4, 4) == std::array<u8, 4>{0xff, 0xff, 0xff, 0xff});
+    CHECK(guest_pixel(e, kSurfaceOffset, 12, 4) == std::array<u8, 4>{0xff, 0x20, 0x20, 0x20});
+}
+
+TEST_CASE("metal e2e: back-face culling follows the RSX winding")
+{
+    REQUIRE_METAL();
+    auto run = [](u32 front_face, bool flip) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}, flip);
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_CULL_FACE_ENABLE, 1);
+        b.method(m::NV4097_SET_CULL_FACE, static_cast<u32>(CullFace::Back));
+        b.method(m::NV4097_SET_FRONT_FACE, front_face);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 40)[1] == 0xff; // red drawn?
+    };
+    // The triangle (-1,-1) (1,-1) (0,1) is counter-clockwise on screen (y down, row 0 at the top).
+    CHECK(run(static_cast<u32>(FrontFace::CCW), false));       // front-facing: drawn
+    CHECK_FALSE(run(static_cast<u32>(FrontFace::CW), false));  // back-facing: culled
+    CHECK_FALSE(run(static_cast<u32>(FrontFace::CCW), true));  // reversed vertex order: culled
+    CHECK(run(static_cast<u32>(FrontFace::CW), true));
+}
+
+TEST_CASE("metal e2e: textured draw with a swizzled texture and a channel remap")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_texture());
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    // 8x8 swizzled ARGB8 texture: left half green, right half blue (opaque); A R G B bytes per texel.
+    for (u32 y = 0; y < 8; y++) {
+        for (u32 x = 0; x < 8; x++) {
+            const u32 argb = x < 4 ? 0xff00ff00 : 0xff0000ff;
+            e.put_local32(kTexOffset + morton_index(x, y, 3, 3) * 4, argb);
+        }
+    }
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    // Texture unit 0: offset, format (local, 2D, A8R8G8B8 swizzled, 1 mip, border colour), wrap clamp, enabled,
+    // remap that swaps R and B, nearest filtering, 8x8.
+    b.method(m::NV4097_SET_TEXTURE_OFFSET, {
+        kTexOffset,
+        (loc::kLocal + 1) | (1u << 3) | (2u << 4) | (tex::A8R8G8B8 << 8) | (1u << 16),
+        3u | (3u << 8) | (3u << 16),
+        (1u << 31),
+        0xaa6c, // R <- B, B <- R
+        (1u << 16) | (1u << 24),
+        (8u << 16) | 8,
+        0,
+    });
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(e.backend->stats().textures_decoded == 1);
+    // uv.x = 0 at the bottom-left corner -> left half of the texture (green): stays green after the R/B swap.
+    CHECK(guest_pixel(e, kSurfaceOffset, 8, 60) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});
+    // Right side: texture blue, shown red after the remap.
+    CHECK(guest_pixel(e, kSurfaceOffset, 56, 60) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
+
+    // Second frame, unchanged texture memory: a cache hit, no new decode.
+    auto c = e.at(b.offset());
+    draw_triangle(c);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.backend->stats().textures_decoded == 1);
+    CHECK(e.backend->stats().texture_cache_hits >= 1);
+    // The CPU rewrites the texture (hash-mode write tracking): the next draw decodes again.
+    for (u32 i = 0; i < 64; i++) e.put_local32(kTexOffset + i * 4, 0xffff0000);
+    auto d = e.at(c.offset());
+    draw_triangle(d);
+    REQUIRE(e.submit(d) == Rsx::RunStatus::Idle);
+    CHECK(e.backend->stats().textures_decoded == 2);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 56, 60) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // red, remapped to blue
+}
+
+TEST_CASE("metal e2e: render to a surface, then sample it as a texture")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0x00ff00ff, 0x00ff00ff, 0x00ff00ff}); // green
+
+    auto b = e.at(0);
+    // Pass 1: green triangle into surface B
+    setup_surface(b, kSurfaceB);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    // Pass 2: surface A, sampling surface B (linear A8R8G8B8 texture at the same address) with the same triangle
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    b.method(m::NV4097_SET_TEXTURE_OFFSET, {
+        kSurfaceB,
+        (loc::kLocal + 1) | (1u << 3) | (2u << 4) | ((tex::A8R8G8B8 | tex::kLinearFlag) << 8) | (1u << 16),
+        3u | (3u << 8) | (3u << 16),
+        (1u << 31),
+        tex::kRemapIdentity,
+        (1u << 16) | (1u << 24),
+        (kW << 16) | kH,
+        0,
+    });
+    b.method(m::NV4097_SET_TEXTURE_CONTROL3, kW * 4);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_samples == 1);
+    CHECK(e.backend->stats().textures_decoded == 0); // the render target was bound, not decoded from memory
+    CHECK(e.backend->stats().render_passes == 2);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    // uv maps the triangle onto itself: inside it reads B's green, near the bottom corners B's black clear.
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});
+}
+
+TEST_CASE("metal e2e: flip presents the display buffer scaled to the output size")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    e.rsx->set_display_buffer(0, {kSurfaceOffset, kW * 4, kW, kH});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ff);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    b.method(m::GCM_FLIP_COMMAND, 0);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    e.backend->sync();
+    REQUIRE(e.presents.size() == 1);
+    CHECK(e.presents[0].width == 128);
+    CHECK(e.presents[0].height == 128);
+    CHECK(e.presents[0].flip_index == 1);
+    REQUIRE(e.present_pixels.size() == 1);
+    const auto& px = e.present_pixels[0];
+    REQUIRE(px.size() == 128 * 128 * 4);
+    auto bgra = [&](u32 x, u32 y) { return std::array<u8, 4>{px[(y * 128 + x) * 4 + 0], px[(y * 128 + x) * 4 + 1], px[(y * 128 + x) * 4 + 2], px[(y * 128 + x) * 4 + 3]}; };
+    CHECK(bgra(64, 96) == std::array<u8, 4>{0x00, 0x00, 0xff, 0xff}); // red in BGRA
+    CHECK(bgra(4, 4) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});   // blue
+    CHECK(e.backend->stats().flips == 1);
+    CHECK(e.rsx->flip_count() == 1);
+}
+
+TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")
+{
+    REQUIRE_METAL();
+    E2E e;
+    FpInst bad;
+    bad.op = 0x13; // PK4: not translated yet
+    bad.dst = 0;
+    bad.input = 1;
+    bad.src[0] = fp_in();
+    bad.end = true;
+    e.put_local_bytes(kFpOffset, assemble_fp({bad}));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(e.backend->stats().draws == 0);
+    CHECK(e.backend->stats().draws_skipped == 1);
+    REQUIRE_FALSE(e.failures.empty());
+    CHECK(e.failures[0].kind == FailKind::Unsupported);
+    CHECK(e.failures[0].message.find("PK4") != std::string::npos);
+}

@@ -184,7 +184,7 @@ TEST_CASE("lifter output: files, symbols, registration, switch for jump tables, 
 
 TEST_CASE("unsupported instructions are listed and lifted as interpreter fallbacks")
 {
-    const CodeImage img = words_image({as::encode(rt::Op::VOR, as::Fields{.d = 0, .a = 1, .b = 2}), as::addi(3, 3, 1), as::blr()});
+    const CodeImage img = words_image({as::encode(rt::Op::ECIWX, as::Fields{.d = 3, .a = 0, .b = 4}), as::addi(3, 3, 1), as::blr()});
     const Seed seeds[] = {{kBase, {}, "f"}};
     const Program p = analyze(img, seeds);
     REQUIRE(p.unsupported.size() == 1);

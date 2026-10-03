@@ -32,6 +32,9 @@ enum ps_fuzz_override_kind {
     PS_FZ_RES_OTHER_ADDR,  /* as MATCH, for another address */
     PS_FZ_RES_NONE,        /* no reservation */
     PS_FZ_XER_CA,          /* xer_ca = value */
+    PS_FZ_VR_LO,           /* vr[index].u64[0] = value (host lanes 0-1 = guest words 3-2) */
+    PS_FZ_VR_HI,           /* vr[index].u64[1] = value */
+    PS_FZ_VSCR,            /* vscr_sat = value & 1, vscr_nj = (value >> 16) & 1 */
 };
 
 typedef struct ps_fuzz_override {
@@ -56,6 +59,7 @@ extern const ps_fuzz_case ps_fuzz_cases[];
 extern const uint32_t ps_fuzz_case_count;
 extern const ps_fuzz_override ps_fuzz_overrides[];
 extern const uint32_t ps_fuzz_cases_per_form;
+extern const uint32_t ps_fuzz_has_vmx; /* 0 when generated with --no-vmx (hosts without AArch64 NEON) */
 
 #ifdef __cplusplus
 }

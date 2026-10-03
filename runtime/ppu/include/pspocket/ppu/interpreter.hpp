@@ -2,7 +2,7 @@
 
 // PPU interpreter: the test oracle for the lifter and the runtime fallback for code that was not lifted.
 // Semantics follow RPCS3's interpreter (rpcs3/Emu/Cell/PPUInterpreter.cpp); deviations are documented where they
-// occur (FPSCR model: pspocket/ppu/fpu.h; reservations: pspocket/ppu/runtime.h).
+// occur (FPSCR model: pspocket/ppu/fpu.h; VMX model: pspocket/ppu/vmx.h; reservations: pspocket/ppu/runtime.h).
 
 #include <vector>
 
@@ -18,6 +18,8 @@ namespace pspocket::ppu {
 void step(PPUContext& ctx, u8* base);
 // Executes an already decoded instruction; ctx.cia must be its address.
 void execute(PPUContext& ctx, u8* base, const Inst& inst);
+// The VMX part of execute() (interpreter_vmx.cpp): registers, VSCR and memory, never cia.
+void execute_vmx(PPUContext& ctx, u8* base, const Inst& inst);
 
 struct RunOptions {
     u64 max_steps = ~0ull;       // stop after this many instructions

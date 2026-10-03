@@ -5,6 +5,7 @@
 // - D-form loads/stores with rA = 0 use the literal 0 as the architecture says (RPCS3's "op.ra || 1" uses r0).
 // - Update forms always use rA (RPCS3 mixes "rA" and "rA|0" for the invalid rA = 0 form).
 // - FPSCR, Rc=1 FP record forms, fctiw rounding mode: see pspocket/ppu/fpu.h.
+// - VMX: interpreter_vmx.cpp, model in pspocket/ppu/vmx.h.
 // - Reservations: single-thread model, pspocket/ppu/runtime.h.
 
 #include "pspocket/ppu/interpreter.hpp"
@@ -830,7 +831,12 @@ void execute(PPUContext& ctx, u8* base, const Inst& in)
         break;
     }
 
-    default: fatal_unsupported(ctx, in);
+    default:
+        if ((in.flags() & OPF_VMX) && is_supported(in)) {
+            execute_vmx(ctx, base, in);
+            break;
+        }
+        fatal_unsupported(ctx, in);
     }
 
     ctx.cia = next;
@@ -875,7 +881,7 @@ std::vector<Form> supported_forms()
 {
     std::vector<Form> forms;
     for (const OpInfo& info : all_ops()) {
-        if (info.flags & (OPF_VMX | OPF_NOSUPPORT)) continue;
+        if (info.flags & OPF_NOSUPPORT) continue;
         for (u32 v : op_variants(info.op)) forms.push_back({info.op, v});
     }
     return forms;

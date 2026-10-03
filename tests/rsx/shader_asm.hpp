@@ -1,0 +1,170 @@
+#pragma once
+
+// A tiny RSX shader microcode assembler for synthetic test programs. Encodings mirror the decoders
+// (runtime/rsx/src/shader/vp.cpp, fp.cpp), which follow RPCS3's RSXVertexProgram.h / RSXFragmentProgram.h.
+
+#include <array>
+#include <cstring>
+#include <optional>
+#include <string_view>
+#include <vector>
+
+#include "pspocket/core/be.h"
+#include "pspocket/core/types.hpp"
+
+namespace pspocket::rsx::test {
+
+inline std::array<u8, 4> swz(std::string_view s)
+{
+    std::array<u8, 4> r{0, 1, 2, 3};
+    for (usize i = 0; i < 4; i++) {
+        const char ch = s[i < s.size() ? i : s.size() - 1];
+        r[i] = static_cast<u8>(ch == 'x' ? 0 : ch == 'y' ? 1 : ch == 'z' ? 2 : 3);
+    }
+    return r;
+}
+
+inline u8 mask(std::string_view s)
+{
+    u8 m = 0;
+    for (char ch : s) m |= static_cast<u8>(1u << (ch == 'x' ? 0 : ch == 'y' ? 1 : ch == 'z' ? 2 : 3));
+    return m;
+}
+
+// ---- vertex programs ----
+
+struct VpSrc {
+    u32 type = 1; // 1 temp, 2 input, 3 constant
+    u32 temp = 0;
+    std::array<u8, 4> sw{0, 1, 2, 3};
+    bool neg = false;
+    bool abs = false;
+};
+
+inline VpSrc vp_temp(u32 r, std::string_view s = "xyzw") { return {1, r, swz(s)}; }
+inline VpSrc vp_in(std::string_view s = "xyzw") { return {2, 0, swz(s)}; }
+inline VpSrc vp_const(std::string_view s = "xyzw") { return {3, 0, swz(s)}; }
+
+struct VpInst {
+    u32 vec_op = 0, sca_op = 0;
+    VpSrc src[3] = {vp_in(), vp_in(), vp_in()};
+    u32 input = 0;
+    u32 constant = 0;
+    bool vec_result = true; // the vector op writes o[out]
+    u32 out = 0x1f;
+    u32 vec_temp = 0x3f, sca_temp = 0x3f;
+    u8 vec_mask = 0, sca_mask = 0;
+    bool saturate = false;
+    u32 cond = 7;
+    bool end = false;
+};
+
+inline u32 vp_src_bits(const VpSrc& s)
+{
+    return s.type | (s.temp << 2) | (u32{s.sw[3]} << 8) | (u32{s.sw[2]} << 10) | (u32{s.sw[1]} << 12) |
+        (u32{s.sw[0]} << 14) | (u32{s.neg} << 16);
+}
+
+inline std::array<u32, 4> encode_vp(const VpInst& in)
+{
+    const u32 s0 = vp_src_bits(in.src[0]), s1 = vp_src_bits(in.src[1]), s2 = vp_src_bits(in.src[2]);
+    const u32 d0 = (3u << 2) | (2u << 4) | (1u << 6) | (0u << 8) | (in.cond << 10) | (in.vec_temp << 15) |
+        (u32{in.src[0].abs} << 21) | (u32{in.src[1].abs} << 22) | (u32{in.src[2].abs} << 23) |
+        (u32{in.saturate} << 26) | (u32{in.vec_result} << 30);
+    const u32 d1 = ((s0 >> 9) & 0xff) | (in.input << 8) | (in.constant << 12) | (in.vec_op << 22) | (in.sca_op << 27);
+    const u32 d2 = ((s2 >> 11) & 0x3f) | (s1 << 6) | ((s0 & 0x1ff) << 23);
+    auto m = [](u8 v, u32 base) {
+        return (u32{(v >> 3) & 1u} << base) | (u32{(v >> 2) & 1u} << (base + 1)) | (u32{(v >> 1) & 1u} << (base + 2)) |
+            (u32{v & 1u} << (base + 3));
+    };
+    const u32 d3 = u32{in.end} | (in.out << 2) | (in.sca_temp << 7) | m(in.vec_mask, 13) | m(in.sca_mask, 17) |
+        ((s2 & 0x7ff) << 21);
+    return {d0, d1, d2, d3};
+}
+
+inline std::vector<u32> assemble_vp(const std::vector<VpInst>& prog)
+{
+    std::vector<u32> words;
+    for (const VpInst& in : prog) {
+        const auto w = encode_vp(in);
+        words.insert(words.end(), w.begin(), w.end());
+    }
+    return words;
+}
+
+// ---- fragment programs ----
+
+struct FpSrc {
+    u32 type = 0; // 0 temp, 1 input, 2 constant
+    u32 index = 0;
+    bool fp16 = false;
+    std::array<u8, 4> sw{0, 1, 2, 3};
+    bool neg = false;
+    bool abs = false;
+};
+
+inline FpSrc fp_r(u32 r, std::string_view s = "xyzw") { return {0, r, false, swz(s)}; }
+inline FpSrc fp_h(u32 r, std::string_view s = "xyzw") { return {0, r, true, swz(s)}; }
+inline FpSrc fp_in(std::string_view s = "xyzw") { return {1, 0, false, swz(s)}; }
+inline FpSrc fp_const(std::string_view s = "xyzw") { return {2, 0, false, swz(s)}; }
+
+struct FpInst {
+    u32 op = 0;
+    u32 dst = 0;
+    bool fp16 = false;
+    u8 mask = 0xf;
+    bool saturate = false;
+    u32 input = 0;
+    u32 tex = 0;
+    FpSrc src[3] = {fp_r(0), fp_r(0), fp_r(0)};
+    std::optional<std::array<float, 4>> constant;
+    bool no_dest = false;
+    u32 prec = 0;
+    u32 scale = 0;
+    bool exec_lt = true, exec_eq = true, exec_gt = true;
+    bool end = false;
+};
+
+inline u32 fp_src_bits(const FpSrc& s)
+{
+    return s.type | (s.index << 2) | (u32{s.fp16} << 8) | (u32{s.sw[0]} << 9) | (u32{s.sw[1]} << 11) |
+        (u32{s.sw[2]} << 13) | (u32{s.sw[3]} << 15) | (u32{s.neg} << 17);
+}
+
+// Appends the instruction (and its constant) to `bytes` in guest memory order: each word big-endian with its
+// 16-bit halves exchanged.
+inline void encode_fp(const FpInst& in, std::vector<u8>& bytes)
+{
+    const u32 dst = u32{in.end} | (in.dst << 1) | (u32{in.fp16} << 7) | (u32{in.mask} << 9) | (in.input << 13) |
+        (in.tex << 17) | (in.prec << 22) | ((in.op & 0x3f) << 24) | (u32{in.no_dest} << 30) | (u32{in.saturate} << 31);
+    const u32 s0 = fp_src_bits(in.src[0]) | (u32{in.exec_lt} << 18) | (u32{in.exec_eq} << 19) | (u32{in.exec_gt} << 20) |
+        (0u << 21) | (1u << 23) | (2u << 25) | (3u << 27) | (u32{in.src[0].abs} << 29);
+    const u32 s1 = fp_src_bits(in.src[1]) | (u32{in.src[1].abs} << 18) | (in.scale << 28) | (((in.op >> 6) & 1) << 31);
+    const u32 s2 = fp_src_bits(in.src[2]) | (u32{in.src[2].abs} << 18);
+    auto put = [&](u32 w) {
+        const u32 be = (w << 16) | (w >> 16);
+        u8 b[4];
+        ps_st32(b, be);
+        bytes.insert(bytes.end(), b, b + 4);
+    };
+    put(dst);
+    put(s0);
+    put(s1);
+    put(s2);
+    if (in.constant) {
+        for (float f : *in.constant) {
+            u32 u;
+            std::memcpy(&u, &f, 4);
+            put(u);
+        }
+    }
+}
+
+inline std::vector<u8> assemble_fp(const std::vector<FpInst>& prog)
+{
+    std::vector<u8> bytes;
+    for (const FpInst& in : prog) encode_fp(in, bytes);
+    return bytes;
+}
+
+} // namespace pspocket::rsx::test

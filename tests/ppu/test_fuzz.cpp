@@ -74,6 +74,12 @@ void apply_overrides(PPUContext& ctx, u8* base, const ps_fuzz_case& c)
         }
         case PS_FZ_RES_NONE: ctx.reserve_valid = 0; break;
         case PS_FZ_XER_CA: ctx.xer_ca = static_cast<u8>(o.value); break;
+        case PS_FZ_VR_LO: ctx.vr[o.index].u64[0] = o.value; break;
+        case PS_FZ_VR_HI: ctx.vr[o.index].u64[1] = o.value; break;
+        case PS_FZ_VSCR:
+            ctx.vscr_sat = static_cast<u8>(o.value & 1);
+            ctx.vscr_nj = static_cast<u8>((o.value >> 16) & 1);
+            break;
         default: FAIL("unknown override kind");
         }
     }
@@ -101,8 +107,9 @@ TEST_CASE("every instruction form the interpreter supports has at least 200 fuzz
     std::map<std::pair<u32, u32>, u32> counts;
     for (u32 i = 0; i < ps_fuzz_case_count; i++) counts[{ps_fuzz_cases[i].op, ps_fuzz_cases[i].variant}]++;
 
-    const std::vector<Form> forms = supported_forms();
-    CHECK(forms.size() > 300);
+    std::vector<Form> forms = supported_forms();
+    CHECK(forms.size() > 500);
+    if (!ps_fuzz_has_vmx) std::erase_if(forms, [](const Form& f) { return (op_info(f.op).flags & OPF_VMX) != 0; });
     CHECK(ps_fuzz_cases_per_form >= 200);
     for (const Form& f : forms) {
         INFO("form " << form_name(f.op, f.variant));
@@ -131,7 +138,12 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
         u32 yes = 0, no = 0;
     };
     std::map<std::pair<u32, u32>, Outcomes> outcomes;
-    auto outcome_of = [](Op op, const PPUContext& before, const PPUContext& after, u32 pc, u64 traps) -> int {
+    auto outcome_of = [](Op op, u32 variant, const PPUContext& before, const PPUContext& after, u32 pc, u64 traps) -> int {
+        if (op_info(op).flags & OPF_VMX) {
+            if (vmx_sets_sat(op)) return before.vscr_sat == 0 ? after.vscr_sat : -1; // SAT produced
+            if (variant & kVarRc) return after.cr[op == Op::VCMPBFP ? 26 : 24];     // CR6: all in bounds / all true
+            return -1;
+        }
         switch (op) {
         case Op::BC:
         case Op::BCLR:
@@ -169,7 +181,7 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
             step(interp, base);
             if (it == 0) {
                 const bool oe_form = (c.variant & kVarOe) != 0;
-                const int o = outcome_of(static_cast<Op>(c.op), before, interp, c.pc, g_traps);
+                const int o = outcome_of(static_cast<Op>(c.op), c.variant, before, interp, c.pc, g_traps);
                 if (o >= 0 && (oe_form || !(op_info(static_cast<Op>(c.op)).flags & OPF_OE))) {
                     Outcomes& oc = outcomes[{c.op, c.variant}];
                     (o ? oc.yes : oc.no)++;
@@ -183,6 +195,8 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
             mem.read_bytes(PS_FUZZ_WINDOW_BASE, after_lifted.data(), after_lifted.size());
             executed++;
 
+            // Scalar FP arithmetic accepts any NaN for any NaN (host NaN propagation, as RPCS3). VMX compares bitwise,
+            // NaN payloads included: both sides produce the architected NaN (pspocket/ppu/vmx.h).
             const bool relaxed = (op_info(static_cast<Op>(c.op)).flags & OPF_FPARITH) != 0;
             std::string diff = test::diff_contexts(interp, lifted, relaxed);
             for (u32 b = 0; b < PS_FUZZ_WINDOW_SIZE; b++) {
@@ -204,8 +218,9 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
     CHECK(failures == 0);
     CHECK(executed == u64{ps_fuzz_case_count} * iterations);
 
-    // Every branch/stwcx./trap form goes both ways; every OE form overflows sometimes.
-    CHECK(outcomes.size() > 40);
+    // Every branch/stwcx./trap form goes both ways; every OE form overflows sometimes; every saturating VMX form
+    // saturates sometimes and not always; every VMX compare record form sees CR6 "all true" both ways.
+    CHECK(outcomes.size() > 80);
     for (const auto& [form, oc] : outcomes) {
         const Op op = static_cast<Op>(form.first);
         INFO("form " << form_name(op, form.second) << ": " << oc.yes << " yes / " << oc.no << " no");

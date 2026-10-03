@@ -1,0 +1,177 @@
+// SPU analyzer: functions, block starts, call targets and jump tables (pspocket/recomp/spu/analyzer.hpp).
+
+#include "pspocket/recomp/spu/analyzer.hpp"
+
+#include <algorithm>
+#include <deque>
+#include <format>
+
+#include "pspocket/spu/disasm.hpp"
+
+namespace pspocket::recomp::spu {
+
+using namespace ::pspocket::spu;
+
+namespace {
+
+class Analyzer {
+public:
+    Analyzer(const LsImage& image, const AnalyzerOptions& options, Program& program)
+        : image_(image), options_(options), program_(program)
+    {
+    }
+
+    void run()
+    {
+        std::deque<u32> pending(image_.entries.begin(), image_.entries.end());
+        std::map<u32, Function> functions;
+        while (!pending.empty()) {
+            const u32 entry = pending.front();
+            pending.pop_front();
+            if (functions.contains(entry) || !image_.in_code(entry)) continue;
+            Function f = function(entry, pending);
+            functions.emplace(entry, std::move(f));
+        }
+        for (auto& [entry, f] : functions) {
+            program_.entries.insert(entry);
+            program_.functions.push_back(std::move(f));
+        }
+        std::sort(program_.unsupported.begin(), program_.unsupported.end(),
+            [](const Diagnostic& a, const Diagnostic& b) { return a.addr < b.addr; });
+        program_.unsupported.erase(std::unique(program_.unsupported.begin(), program_.unsupported.end(),
+                                       [](const Diagnostic& a, const Diagnostic& b) { return a.addr == b.addr; }),
+            program_.unsupported.end());
+    }
+
+private:
+    bool valid_code(u32 addr) const { return image_.in_code(addr) && is_supported(decode(image_.word(addr))); }
+
+    Function function(u32 entry, std::deque<u32>& pending)
+    {
+        Function f;
+        f.entry = entry;
+        f.labels.insert(entry);
+        std::set<u32> visited;
+        std::deque<u32> work{entry};
+        std::vector<u32> constants;
+        bool indirect = false;
+        std::set<u32> tables_scanned;
+
+        for (;;) {
+            while (!work.empty()) {
+                u32 a = work.front();
+                work.pop_front();
+                trace(f, a, visited, work, constants, indirect, pending);
+            }
+            // Jump tables: bi through a register with a table of code addresses whose base an ila formed.
+            bool grew = false;
+            if (indirect) {
+                for (u32 base : constants) {
+                    if (!tables_scanned.insert(base).second) continue;
+                    for (usize k = 0; k < options_.max_jump_table; k++) {
+                        const u32 at = base + static_cast<u32>(k) * 4;
+                        if (at + 4 > image_.ls.size()) break;
+                        const u32 target = image_.word(at);
+                        if (!valid_code(target)) break;
+                        f.labels.insert(target);
+                        if (!visited.contains(target)) {
+                            work.push_back(target);
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            if (!grew) break;
+        }
+
+        if (options_.constant_entries)
+            for (u32 c : constants)
+                if (valid_code(c)) pending.push_back(c);
+
+        f.insns.assign(visited.begin(), visited.end());
+        // Labels must be lifted instructions.
+        for (auto it = f.labels.begin(); it != f.labels.end();) it = visited.contains(*it) ? std::next(it) : f.labels.erase(it);
+        return f;
+    }
+
+    void trace(Function& f, u32 a, std::set<u32>& visited, std::deque<u32>& work, std::vector<u32>& constants,
+        bool& indirect, std::deque<u32>& pending)
+    {
+        for (;;) {
+            if (!image_.in_code(a)) return; // leaves the code range: the lifter exits to the run loop
+            if (!visited.insert(a).second) return;
+            const u32 word = image_.word(a);
+            const Inst inst = decode(word);
+            if (!is_supported(inst)) {
+                visited.erase(a);
+                program_.unsupported.push_back(Diagnostic{a, word,
+                    std::format("{} ({})", disassemble(word, a), unsupported_reason(inst))});
+                return;
+            }
+            const RegUse use = reg_use(inst);
+            f.used |= use.read;
+            f.used |= use.write;
+            f.written |= use.write;
+            const u32 fl = inst.flags();
+            const u32 next = a + 4;
+            // Instructions that may stop and be resumed (blocking channels, halts, exceptions) restart in place.
+            if (use.runtime) f.labels.insert(a);
+
+            switch (inst.op) {
+            case Op::STOP:
+            case Op::STOPD: f.labels.insert(next); break;
+            case Op::ILA: constants.push_back(inst.i18()); break;
+            case Op::IL:
+                if (inst.si16() >= 0) constants.push_back(static_cast<u32>(inst.si16()));
+                break;
+            default: break;
+            }
+
+            if (fl & OPF_BRANCH) {
+                if (inst.info().fmt == Fmt::RI16_BR) {
+                    const u32 target = branch_target(inst, a);
+                    if (fl & OPF_CALL) {
+                        f.calls.insert(target);
+                        pending.push_back(target);
+                        f.labels.insert(next);
+                    } else {
+                        f.labels.insert(target);
+                        work.push_back(target);
+                        if (!(fl & OPF_COND)) return; // br / bra
+                    }
+                } else {
+                    // indirect: bi, bisl, biz, binz, bihz, bihnz, iret, bisled
+                    if (inst.op == Op::BI || inst.op == Op::IRET) {
+                        if (inst.op == Op::BI && inst.ra() != 0) indirect = true;
+                        return;
+                    }
+                    indirect = indirect || inst.op != Op::BISL;
+                    f.labels.insert(next);
+                }
+            }
+            a = next;
+        }
+    }
+
+    const LsImage& image_;
+    const AnalyzerOptions& options_;
+    Program& program_;
+};
+
+} // namespace
+
+const Function* Program::find(u32 entry) const
+{
+    const auto it = std::lower_bound(functions.begin(), functions.end(), entry,
+        [](const Function& f, u32 e) { return f.entry < e; });
+    return it != functions.end() && it->entry == entry ? &*it : nullptr;
+}
+
+Program analyze(const LsImage& image, const AnalyzerOptions& options)
+{
+    Program program;
+    Analyzer(image, options, program).run();
+    return program;
+}
+
+} // namespace pspocket::recomp::spu

@@ -172,7 +172,6 @@ std::string_view unsupported_reason(const Inst& inst)
 {
     const OpInfo& info = inst.info();
     if (inst.op == Op::UNKNOWN) return "illegal or unknown instruction";
-    if (info.flags & OPF_VMX) return "VMX is not implemented in this milestone";
     if (info.flags & OPF_NOSUPPORT) return "external control (eciwx/ecowx) is not supported";
     switch (inst.op) {
     case Op::SC:
@@ -226,6 +225,28 @@ std::span<const u32> op_variants(Op op)
     const auto i = static_cast<usize>(op);
     if (i >= kOpCount) return {};
     return std::span<const u32>(kVariants.values[i].data(), kVariants.count[i]);
+}
+
+bool vmx_sets_sat(Op op)
+{
+    switch (op) {
+    case Op::VADDUBS: case Op::VADDUHS: case Op::VADDUWS: case Op::VADDSBS: case Op::VADDSHS: case Op::VADDSWS:
+    case Op::VSUBUBS: case Op::VSUBUHS: case Op::VSUBUWS: case Op::VSUBSBS: case Op::VSUBSHS: case Op::VSUBSWS:
+    case Op::VMHADDSHS: case Op::VMHRADDSHS: case Op::VMSUMUHS: case Op::VMSUMSHS:
+    case Op::VPKUHUS: case Op::VPKUWUS: case Op::VPKSHSS: case Op::VPKSHUS: case Op::VPKSWSS: case Op::VPKSWUS:
+    case Op::VSUMSWS: case Op::VSUM2SWS: case Op::VSUM4SBS: case Op::VSUM4SHS: case Op::VSUM4UBS:
+    case Op::VCTSXS: case Op::VCTUXS: return true;
+    default: return false;
+    }
+}
+
+bool vmx_uses_nj(Op op)
+{
+    switch (op) {
+    case Op::VADDFP: case Op::VSUBFP: case Op::VMADDFP: case Op::VNMSUBFP: case Op::VMAXFP: case Op::VMINFP:
+    case Op::VREFP: case Op::VRSQRTEFP: case Op::VRFIM: case Op::VRFIN: case Op::VRFIP: case Op::VRFIZ: return true;
+    default: return false;
+    }
 }
 
 u32 lswi_reg_mask(u32 rt, u32 nb)
@@ -533,8 +554,52 @@ RegUse reg_use(const Inst& inst)
         u.spr_read |= SPR_FPSCR;
         u.spr_write |= SPR_FPSCR;
         break;
+    // ---- VMX (vD = rt, vA = ra, vB = rb, vC = rc_reg; loads/stores use rA/rB as GPRs)
+    case Fmt::VX_VD_VA_VB:
+    case Fmt::VA_VSLDOI:
+        u.vr_read |= g(ra) | g(rb);
+        u.vr_write |= g(rt);
+        break;
+    case Fmt::VXR_VD_VA_VB:
+        u.vr_read |= g(ra) | g(rb);
+        u.vr_write |= g(rt);
+        if (inst.vrc()) u.cr_write |= field(6);
+        break;
+    case Fmt::VX_VD_VB:
+    case Fmt::VX_VD_VB_UIMM:
+        u.vr_read |= g(rb);
+        u.vr_write |= g(rt);
+        break;
+    case Fmt::VX_VD_SIMM: u.vr_write |= g(rt); break;
+    case Fmt::VA_VD_VA_VB_VC:
+        u.vr_read |= g(ra) | g(rb) | g(inst.rc_reg());
+        u.vr_write |= g(rt);
+        break;
+    case Fmt::VX_VD:
+        u.vr_write |= g(rt);
+        u.spr_read |= SPR_VSCR_SAT | SPR_VSCR_NJ;
+        break;
+    case Fmt::VX_VB:
+        u.vr_read |= g(rb);
+        u.spr_write |= SPR_VSCR_SAT | SPR_VSCR_NJ;
+        break;
+    case Fmt::X_VLOAD:
+        u.gpr_read |= (ra != 0 ? g(ra) : 0) | g(rb);
+        u.vr_write |= g(rt);
+        u.mem_read = inst.op != Op::LVSL && inst.op != Op::LVSR;
+        break;
+    case Fmt::X_VSTORE:
+        u.gpr_read |= (ra != 0 ? g(ra) : 0) | g(rb);
+        u.vr_read |= g(rt);
+        u.mem_write = true;
+        break;
     default: break;
     }
+    if (vmx_sets_sat(inst.op)) {
+        u.spr_read |= SPR_VSCR_SAT;
+        u.spr_write |= SPR_VSCR_SAT;
+    }
+    if (vmx_uses_nj(inst.op)) u.spr_read |= SPR_VSCR_NJ;
     return u;
 }
 
