@@ -102,6 +102,36 @@ the lifted signature, because HLE code and other threads legitimately touch gues
 prologues assume `base` is 64 KB-aligned. Host-pointer accessors (`ps_ldN`/`ps_stN`) stay plain. Cost on the M4:
 scalar big-endian loads 12 GB/s (the earlier 50–60 GB/s came from auto-vectorization lifted code can't use anyway).
 
+## D-014 · 2026-10-03 · iOS build and run flow
+
+`scripts/ios.sh` is the entry point (`gen`, `build [--sim]`, `install`, `run`, `report`, `all`). It builds the host
+CMake tree first, so build-time generated sources exist, then runs XcodeGen and `xcodebuild`. A runtime component joins
+the iOS build when its `CMakeLists.txt` exists (as `pspocket_add_component` does on the host); every `.c`/`.cpp` in its
+`src/` and in `<host build>/generated/selftest/` is compiled, so host-only code never goes in a runtime `src/`. The
+runtime library is force-loaded into the app so self-registering code isn't dropped. Release everywhere, including the
+Xcode scheme, because the probes' numbers only mean something optimised. Device signing uses automatic provisioning
+(`-allowProvisioningUpdates`), which needs Xcode signed in to team M7XJA39ZV6.
+
+## D-015 · 2026-10-03 · Self-test threading on iOS
+
+Probes run on a dedicated thread with an 8 MB stack at userInitiated QoS, matching the macOS CLI's main thread. GCD
+threads have 512 KB, and lifted code nests host calls as deep as the guest nests guest calls. The same applies later to
+PPU threads: their host stacks must be sized for guest call depth.
+
+## D-016 · 2026-10-03 · Output preview and frame pacing
+
+The test host renders a 1152×640 bgra8 target, upscales it with MetalFX spatial (perceptual) to an aspect-fit texture,
+and composites it letterboxed; a CADisplayLink at 30/30/30 drives frames, presented with
+`present(atTime: link.targetTimestamp)`, and frame intervals come from `presentedTime`. MetalFX falls back to a
+bilinear blit where unavailable (the simulator), labelled on screen. This is the shape the RSX backend's output stage
+will take (plan section 7).
+
+## D-017 · 2026-10-03 · iOS logging
+
+`pspocket::log` goes to os_log with subsystem `com.artzymeri.pspocket` and the log channel as category; Info/Warn map to
+default, Error to error, Fatal to fault. The test host also mirrors lines to stdout (visible through
+`devicectl ... --console`) and into the self-test report.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
