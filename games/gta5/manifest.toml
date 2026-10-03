@@ -1,0 +1,88 @@
+# Game manifest: Grand Theft Auto V, BLES01807 (EU), disc version 01.03, app 01.00 (docs/decisions.md D-022, D-025).
+#
+# Read by recomp/common (pspocket::recomp::load_manifest). TOML subset; unknown keys are errors.
+# Data only: hashes, addresses, bytes, names. No game code or data (CLAUDE.md rule 1).
+# Phase 0 inventory of these files: docs/phase0-gta5.md.
+
+title_id = "BLES01807"          # PARAM.SFO TITLE_ID
+title = "Grand Theft Auto V"
+app_version = "01.00"           # PARAM.SFO APP_VER of the disc EBOOT (no update applied yet)
+
+# SHA-256 of the decrypted disc image the app accepts. Not computed yet: the 18.74 GB image lives on the phone; the
+# app computes it on first launch (plan section 9) and the value goes here.
+iso_sha256 = ""
+
+# ---------------------------------------------------------------------------------------------------------------
+# Input files, relative to the dump root (dev_bdvd = disc). Hashes from the image on the user's phone, 2026-10-03.
+
+[[files]]                        # disc identity
+path = "dev_bdvd/PS3_DISC.SFB"
+sha256 = "fa3f99811c1274a2ef382dd8ada078166e6f6fbfa2fd3fea58b799133ab34dc2"
+
+[[files]]                        # TITLE_ID BLES01807, VERSION 01.03, APP_VER 01.00, PS3_SYSTEM_VER 04.4600
+path = "dev_bdvd/PS3_GAME/PARAM.SFO"
+sha256 = "a5e83e5162fb60d4d39ab59d5a7b1312579e4ef1c6db50908bbcf41c3981fe49"
+
+[[files]]                        # disc EBOOT, encrypted SELF (APP, key revision 0x1c, no NPDRM header)
+path = "dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN"
+sha256 = "dbe129873ea26e8e9066e1a32e026aa58beb09e0eeca90b9370169a50b42bb16"
+
+[[files]]                        # the same EBOOT decrypted by RPCS3 v0.0.43-20193: the toolchain's input
+path = "dev_bdvd/PS3_GAME/USRDIR/EBOOT.elf"
+sha256 = "8cad8baa51fa6e1a5772dfd5c514199ef738ed300c73ef894eb36b339bbc0959"
+
+# ---------------------------------------------------------------------------------------------------------------
+# Function overrides and patches: none yet.
+#
+# [[overrides]]
+# addr = 0x00012345
+# name = "gta5_override_example"
+#
+# [[patches]]
+# addr = 0x00012345
+# bytes = "60000000"
+# why = "explain the patch"
+
+# ---------------------------------------------------------------------------------------------------------------
+# SPU programs embedded in EBOOT.elf (SHA-1 of each ELF image, as ps3inspect prints). All SPURS tasks. Programs
+# loaded at runtime (SPURS jobs, overlays) are added from the runtime traces.
+
+[[spu_programs]]                 # zlib inflate service; candidate for a native replacement (plan section 6)
+sha1 = "eb8c1b962f3589391d89125771db455dc0cfb616"
+name = "inflateServer_task"
+action = "lift"
+
+[[spu_programs]]
+sha1 = "9f2d03e91a5cd4b9e7cfd3b6a6819f176f70cc45"
+name = "dependency_spu_task"
+action = "lift"
+
+[[spu_programs]]                 # physics
+sha1 = "bf07d3773525f5379c781da0bf1e516aa53770c2"
+name = "collision_task"
+action = "lift"
+
+[[spu_programs]]                 # physics
+sha1 = "f18908088af9a423d281b24f7fc2ba7be56673c7"
+name = "forcesolver_task"
+action = "lift"
+
+[[spu_programs]]                 # physics
+sha1 = "292a1087845084dd5ec7d0611fc1ace9d529f8e3"
+name = "forcesolverpush_task"
+action = "lift"
+
+[[spu_programs]]                 # physics
+sha1 = "aaf749e9877fd74a3184e3dfc95ee043212589b4"
+name = "updatecolliders_task"
+action = "lift"
+
+[[spu_programs]]                 # physics
+sha1 = "27796540b6111f2a2534248b19266471492d5841"
+name = "updatecontacts_task"
+action = "lift"
+
+[[spu_programs]]                 # Bink video decoding
+sha1 = "bbd058e343a100390bb1ba8043ec0b113b952b12"
+name = "binkspu_task"
+action = "lift"

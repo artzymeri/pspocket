@@ -200,12 +200,28 @@ that inventory. GTA V is the heavier game (more SPU work, larger engine), so the
 - **Open:** VMX is decoded but not executed; reservations still use a single-thread model in the context
   (`ps_ppu_lwarx`/`stwcx` in runtime/ppu/src/runtime.cpp) until they move onto `reservation.h`.
 
+## D-024 · 2026-10-03 · Phase 0 result for GTA V: go, SPURS by LLE (proposed)
+
+From `docs/phase0-gta5.md`: 85,342 functions / 6.09 M PPU instructions, every scalar instruction already supported,
+448 k VMX instructions over 98 mnemonics (in progress), 362 firmware imports all named (184 are online/PSN/trophy
+non-goals, stubbed as "offline"), 8 embedded SPURS tasks (494 KB), and job chains that only a runtime trace will
+reveal. **Go**, with SPU throughput on the phone as the decisive risk and a checkpoint at the first lifted physics task.
+**SPURS: LLE proposed** — recompile Sony's libsre (PPU + SPU) from the user's own firmware file like game code,
+because GTA V uses tasksets and job chains (RPCS3 relies on LLE for these); HLE stays the fallback. Pending the
+user's firmware file. Raw inventory outputs stay in `inventory/`; the aggregate report goes to docs (amends D-021).
+The analyzer recognised no jump tables in this EBOOT (SNC rather than GCC patterns, to investigate).
+
+## D-025 · 2026-10-03 · First title: GTA V (BLES01807), pending the user's confirmation
+
+The user owns a GTA V dump and no GTA IV dump, and the inventory says go. `games/gta5/manifest.toml` is the active
+manifest; `games/gta4/` stays as a draft. Revert to GTA IV only if the user gets that dump and prefers it.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
-- [~] Game version → D-002 (GTA IV, tentative) / D-022 (Phase 0 runs on GTA V, the dump on hand).
+- [~] Game version → D-025: GTA V BLES01807 (pending the user's confirmation; GTA IV in D-002 as a draft).
 - [x] Toolchain → D-012 (write our own).
-- [ ] SPURS: HLE or LLE. Decided by the Phase 0 inventory.
+- [~] SPURS → D-024: LLE proposed (needs the user's firmware file); HLE fallback.
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
 - [ ] Input: controller required, or a polished touch overlay as well.
 - [ ] ISO handling: extract assets, or read directly from the ISO.

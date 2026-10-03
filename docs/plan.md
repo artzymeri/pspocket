@@ -345,7 +345,8 @@ previous gate passes.
 
 ### Phase 0: Inventory and go/no-go (2–4 weeks)
 
-- [ ] User decrypts EBOOT.BIN and the game's PRX files with RPCS3's binary decryption utility.
+- [x] User decrypts EBOOT.BIN and the game's PRX files with RPCS3's binary decryption utility. (GTA V EBOOT,
+  decrypted with RPCS3 `--decrypt`, D-022; GTA V has no PRX files.)
 - [x] Build `tools/ps3inspect`: ELF and PRX headers and segments; imports grouped by module with NIDs resolved to
   names; exports; embedded SPU images with counts, sizes and hashes; strings that identify middleware.
 - [ ] Trace a 30-minute desktop session in RPCS3, including driving: SPU programs loaded (with hashes), syscalls used,
