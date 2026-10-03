@@ -73,7 +73,10 @@ struct GuestThread {
             if (x.name == name) fn = &x;
         REQUIRE(fn != nullptr);
         const u64 v[] = {0, static_cast<u64>(args)...}; // leading 0: no zero-length array for calls without arguments
-        for (usize i = 0; i < sizeof...(A); i++) ctx.gpr[3 + i] = v[i + 1];
+        for (usize i = 0; i < sizeof...(A); i++) {
+            if (i < 8) ctx.gpr[3 + i] = v[i + 1];
+            else ps_write64(f.base(), static_cast<u32>(ctx.gpr[1]) + 0x70 + 8 * static_cast<u32>(i - 8), v[i + 1]);
+        }
         const u64 sp = ctx.gpr[1];
         fn->fn(ctx, f.base());
         CHECK(ctx.gpr[1] == sp); // stack variables released
@@ -500,4 +503,67 @@ TEST_CASE("cellNetCtl: init once, disconnected, handlers accepted", "[hle][net]"
     CHECK(a.call("cellNetCtlDelHandler", 4) == 0xFFFFFFFF80130105ull);
     a.call("cellNetCtlTerm");
     CHECK(a.call("cellNetCtlInit") == 0);
+}
+
+TEST_CASE("cellSpurs job chains: 14-argument attribute (stack arguments), creation registers a job chain workload", "[hle][spurs]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u32 kSpursAttr = kData + 0x1000, kSpurs = kData + 0x2000, kJcAttr = kData + 0x4000, kPrio = kData + 0x4400;
+    constexpr u32 kEntry = kData + 0x4800, kName = kData + 0x4900, kJc = kData + 0x6000;
+    constexpr u64 kJobInval = 0xFFFFFFFF80410A02ull;
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 5, 200, 2016, 0) == 0);
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
+    const u8 prio[8] = {2, 2, 2, 2, 2, 0, 0, 0};
+    std::memcpy(base + kPrio, prio, 8);
+    std::memcpy(base + kName, "physics", 8);
+
+    // jm 3, SDK 3.30, attr, entry, 128-byte jobs, 4 grabbed, priorities, contention 5, then on the stack: autoSpuCount 1,
+    // tags 20/21, fixed memory 1, max job descriptor 0x200, initial SPU count 3.
+    REQUIRE(a.call("_cellSpursJobChainAttributeInitialize", 3, 0x330000, kJcAttr, kEntry, 0x80, 4, kPrio, 5, 1, 20, 21, 1,
+                0x200, 3) == 0);
+    CHECK(ps_read32(base, kJcAttr + 0x00) == 3);
+    CHECK(ps_read32(base, kJcAttr + 0x08) == kEntry);
+    CHECK(ps_read16(base, kJcAttr + 0x0C) == 0x80);
+    CHECK(ps_read16(base, kJcAttr + 0x0E) == 4);
+    CHECK(ps_read8(base, kJcAttr + 0x10) == 2);
+    CHECK(ps_read32(base, kJcAttr + 0x18) == 5);
+    CHECK(ps_read8(base, kJcAttr + 0x1C) == 1);     // autoSpuCount (stack argument 9)
+    CHECK(ps_read32(base, kJcAttr + 0x20) == 20);   // tag1
+    CHECK(ps_read32(base, kJcAttr + 0x24) == 21);   // tag2
+    CHECK(ps_read8(base, kJcAttr + 0x28) == 1);     // isFixedMemAlloc
+    CHECK(ps_read32(base, kJcAttr + 0x2C) == 0x200); // maxSizeJobDescriptor
+    CHECK(ps_read32(base, kJcAttr + 0x30) == 3);    // initSpuCount (stack argument 14)
+    REQUIRE(a.call("cellSpursJobChainAttributeSetName", kJcAttr, kName) == 0);
+    REQUIRE(a.call("cellSpursJobChainAttributeSetHaltOnError", kJcAttr) == 0);
+    CHECK(ps_read32(base, kJcAttr + 0x34) == 1);
+
+    REQUIRE(a.call("cellSpursCreateJobChainWithAttribute", kSpurs, kJc, kJcAttr) == 0);
+    CHECK(ps_read64(base, kJc + 0x00) == kEntry);  // pc
+    CHECK(ps_read64(base, kJc + 0x78) == kSpurs);
+    CHECK(ps_read32(base, kJc + 0x74) == 0);       // workloadId
+    CHECK(ps_read16(base, kJc + 0x70) == 4);       // maxGrabbedJob
+    CHECK(ps_read8(base, kJc + 0x2A) == 20);
+    CHECK(ps_read8(base, kJc + 0x2B) == 21);
+    CHECK(ps_read8(base, kJc + 0x2C) == (0x80 | (2 << 4))); // fixed memory, (0x200 - 0x100) / 128
+    CHECK(ps_read8(base, kJc + 0x2D) == 3);        // jmVer from the attribute
+    CHECK(ps_read8(base, kJc + 0x28) == 3);        // initSpuCount
+    CHECK(ps_read32(base, kJc + 0x90) == 0x330000);
+    CHECK(ps_read64(base, kSpurs + 0xB00) == 0x300); // the native job chain marker
+    CHECK(ps_read64(base, kSpurs + 0xB08) == kJc);
+    CHECK(ps_read8(base, kSpurs + 0x40) == 1);       // min contention 1
+    CHECK(ps_read8(base, kSpurs + 0x50) == 5);
+
+    // Validation (RPCS3 check_job_chain_attribute).
+    CHECK(a.call("_cellSpursJobChainAttributeInitialize", 3, 0x330000, kJcAttr, kEntry, 0x80, 0, kPrio, 5, 0, 0, 0, 0,
+              0x200, 0) == kJobInval); // no grabbed jobs
+    CHECK(a.call("_cellSpursJobChainAttributeInitialize", 3, 0x330000, kJcAttr, kEntry, 0x80, 4, kPrio, 5, 0, 31, 0, 0,
+              0x200, 0) == kJobInval); // tag 31 after SDK 1.90
+    CHECK(a.call("_cellSpursJobChainAttributeInitialize", 3, 0x330000, kJcAttr, kEntry, 0x80, 4, kPrio, 5, 0, 0, 0, 0,
+              0x80, 0) == kJobInval); // max job descriptor too small
+    ps_write32(base, kJcAttr, 1); // jm revision 1 can't be created with an attribute
+    CHECK(a.call("cellSpursCreateJobChainWithAttribute", kSpurs, kJc + 0x200, kJcAttr) == kJobInval);
+    CHECK(a.call("sys_net_show_ifconfig") == 0);
+    REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 }

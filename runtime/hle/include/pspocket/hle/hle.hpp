@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "pspocket/core/be.h"
 #include "pspocket/core/types.hpp"
 #include "pspocket/ppu/context.h"
 
@@ -53,7 +54,8 @@ private:
 // Every module in src/modules.cpp, built on first use.
 const Registry& registry();
 
-// ---- typed binding: R fn(PPUContext&, A...) with A in {u16, u32, s32, u64, s64}, R in {void, s32, u32, u64} ----
+// ---- typed binding: R fn(PPUContext&, A...) with A in {bool, u16, u32, s32, u64, s64}, R in {void, s32, u32, u64};
+// up to 16 arguments (the ninth and later on the caller's stack) ----
 
 namespace detail {
 
@@ -65,30 +67,40 @@ T reg_arg(u64 v)
     else if constexpr (std::is_same_v<T, u32>) return static_cast<u32>(v); // low word, as RPCS3 ppu_gpr_cast
     else if constexpr (std::is_same_v<T, s32>) return static_cast<s32>(static_cast<u32>(v));
     else if constexpr (std::is_same_v<T, u16>) return static_cast<u16>(v);
+    else if constexpr (std::is_same_v<T, bool>) return (v & 0xFF) != 0; // b8: the low byte
     else static_assert(sizeof(T) == 0, "unsupported HLE argument type");
 }
 
-template <class R, class... A, usize... I>
-void invoke(R (*fn)(PPUContext&, A...), PPUContext& ctx, std::index_sequence<I...>)
+// Argument I: r3..r10 for the first eight, then the caller's parameter save area at r1 + 0x70 + 8 * (I - 8) (the
+// PPC64 ELF ABI; RPCS3 ppu_func_detail reads the same slots).
+template <class T, usize I>
+T arg(PPUContext& ctx, u8* base)
 {
-    static_assert(sizeof...(A) <= 8, "HLE functions take at most 8 register arguments (r3..r10)");
+    if constexpr (I < 8) return reg_arg<T>(ctx.gpr[3 + I]);
+    else return reg_arg<T>(ps_read64(base, static_cast<u32>(ctx.gpr[1]) + 0x70 + 8 * static_cast<u32>(I - 8)));
+}
+
+template <class R, class... A, usize... I>
+void invoke(R (*fn)(PPUContext&, A...), PPUContext& ctx, u8* base, std::index_sequence<I...>)
+{
+    static_assert(sizeof...(A) <= 16, "HLE functions take at most 16 arguments");
     if constexpr (std::is_void_v<R>) {
-        fn(ctx, reg_arg<A>(ctx.gpr[3 + I])...);
+        fn(ctx, arg<A, I>(ctx, base)...);
     } else if constexpr (std::is_same_v<R, s32>) {
         // error_code results are sign-extended into r3 (RPCS3 ppu_func_detail::bind_result).
-        ctx.gpr[3] = static_cast<u64>(static_cast<s64>(fn(ctx, reg_arg<A>(ctx.gpr[3 + I])...)));
+        ctx.gpr[3] = static_cast<u64>(static_cast<s64>(fn(ctx, arg<A, I>(ctx, base)...)));
     } else if constexpr (std::is_same_v<R, u32> || std::is_same_v<R, u64>) {
-        ctx.gpr[3] = fn(ctx, reg_arg<A>(ctx.gpr[3 + I])...);
+        ctx.gpr[3] = fn(ctx, arg<A, I>(ctx, base)...);
     } else {
         static_assert(sizeof(R) == 0, "unsupported HLE return type");
     }
 }
 
 template <auto Fn>
-void thunk(PPUContext& ctx, u8*)
+void thunk(PPUContext& ctx, u8* base)
 {
     [&]<class R, class... A>(R (*fn)(PPUContext&, A...)) {
-        invoke(fn, ctx, std::index_sequence_for<A...>{});
+        invoke(fn, ctx, base, std::index_sequence_for<A...>{});
     }(Fn);
 }
 

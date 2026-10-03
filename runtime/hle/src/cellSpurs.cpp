@@ -48,6 +48,11 @@ enum : u32 {
     CELL_SPURS_TASK_ERROR_STAT = 0x8041090F,
     CELL_SPURS_TASK_ERROR_ALIGN = 0x80410910,
     CELL_SPURS_TASK_ERROR_NULL_POINTER = 0x80410911,
+    CELL_SPURS_JOB_ERROR_AGAIN = 0x80410A01,
+    CELL_SPURS_JOB_ERROR_INVAL = 0x80410A02,
+    CELL_SPURS_JOB_ERROR_STAT = 0x80410A0F,
+    CELL_SPURS_JOB_ERROR_ALIGN = 0x80410A10,
+    CELL_SPURS_JOB_ERROR_NULL_POINTER = 0x80410A11,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -61,6 +66,11 @@ constexpr u32 CELL_SPURS_KERNEL2_ENTRY_ADDR = 0x848;
 constexpr u32 SPURS_IMG_ADDR_SYS_SRV_WORKLOAD = 0x100;
 constexpr u32 SPURS_IMG_ADDR_TASKSET_PM = 0x200; // marker for the taskset policy module (RPCS3), handled natively
 constexpr u32 kTasksetPmSize = 0x1E40;
+// Job chains: RPCS3 registers them with no policy module (vm::null, a TODO), so they never run there. The native
+// scheduler needs to recognize them, so they get a marker of their own next to RPCS3's 0x100 and 0x200.
+constexpr u32 SPURS_IMG_ADDR_JOB_CHAIN_PM = 0x300;
+constexpr u32 CELL_SPURS_JOB_REVISION_0 = 0, CELL_SPURS_JOB_REVISION_1 = 1, CELL_SPURS_JOB_REVISION_2 = 2,
+              CELL_SPURS_JOB_REVISION_3 = 3;
 constexpr u32 CELL_SPURS_MAX_WORKLOAD = 16;
 constexpr u32 CELL_SPURS_TASKSET_ATTRIBUTE_REVISION = 1;
 constexpr u32 kTasksetSize = 6400; // CellSpursTaskset (CellSpursTaskset2 is larger; not supported yet)
@@ -125,7 +135,7 @@ constexpr u32 SYS_SPU_IMAGE_TYPE_USER = 0;
 
 // Host side of every initialized SPURS instance, keyed by the guest CellSpurs address.
 struct Workload {
-    enum class Kind { Taskset, Custom } kind = Kind::Custom;
+    enum class Kind { Taskset, JobChain, Custom } kind = Kind::Custom;
     u32 arg = 0; // the taskset (Taskset) or the policy module's argument
 };
 
@@ -546,6 +556,166 @@ s32 _cellSpursEventFlagInitialize(PPUContext& ctx, u32 spurs, u32 taskset, u32 e
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------------------------- job chains
+
+// CellSpursJobChainAttribute (8-aligned) and CellSpursJobChain (0x100 bytes, 128-aligned).
+namespace jcattr_off {
+constexpr u32 jmVer = 0x00, sdkVer = 0x04, jobChainEntry = 0x08, sizeJobDescriptor = 0x0C, maxGrabbedJob = 0x0E,
+              priorities = 0x10, maxContention = 0x18, autoSpuCount = 0x1C, tag1 = 0x20, tag2 = 0x24,
+              isFixedMemAlloc = 0x28, maxSizeJobDescriptor = 0x2C, initSpuCount = 0x30, haltOnError = 0x34,
+              name = 0x38, jobMemoryCheck = 0x3C;
+}
+namespace jc_off {
+constexpr u32 pc = 0x00, isHalted = 0x23, initSpuCount = 0x28, tag1 = 0x2A, tag2 = 0x2B, val2C = 0x2C, jmVer = 0x2D,
+              val2F = 0x2F, maxGrabbedJob = 0x70, workloadId = 0x74, spurs = 0x78, error = 0x80, cause = 0x88,
+              sdkVer = 0x90, jobMemoryCheck = 0x94;
+}
+
+// RPCS3 _spurs::check_job_chain_attribute.
+s32 check_job_chain_attribute(u32 sdk_ver, u32 entry, u16 size_job, u16 max_grabbed, u64 priorities, bool auto_spu_count,
+    u32 tag1, u32 tag2, u32 max_size_job, u32 init_spu_count)
+{
+    if (!entry) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (entry % 8) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (!max_grabbed || max_grabbed > 0x10) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    const u32 max_tag = sdk_ver < 0x19000 ? 31 : 30; // tag 31 is refused from SDK 1.90 on
+    if (tag1 > max_tag || tag2 > max_tag) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (priorities & 0xF0F0F0F0F0F0F0F0ull) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (size_job % 0x80 && size_job != 64) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (auto_spu_count && init_spu_count > 0xFF) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (max_size_job <= 0xFF || max_size_job > 0x400 || max_size_job % 0x80) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    return lv2::CELL_OK;
+}
+
+u64 read_priorities(u8* base, u32 addr)
+{
+    u64 v = 0;
+    for (u32 i = 0; i < 8; i++) v = (v << 8) | ps_read8(base, addr + i);
+    return v;
+}
+
+// RPCS3 _cellSpursJobChainAttributeInitialize (14 arguments; the last six come from the caller's stack).
+s32 _cellSpursJobChainAttributeInitialize(PPUContext& ctx, u32 jm_revision, u32 sdk_revision, u32 attr, u32 entry,
+    u16 size_job, u16 max_grabbed, u32 priority_table, u32 max_contention, bool auto_spu_count, u32 tag1, u32 tag2,
+    bool fixed_mem_alloc, u32 max_size_job, u32 init_spu_count)
+{
+    PS_LOG_INFO(kChan, "_cellSpursJobChainAttributeInitialize(jm {}, sdk {:#x}, attr {:#x}, entry {:#x}, sizeJob {:#x}, "
+                       "maxGrabbed {}, maxContention {}, autoSpuCount {}, tags {}/{}, fixedMem {}, maxSizeJob {:#x}, "
+                       "initSpuCount {})",
+        jm_revision, sdk_revision, attr, entry, size_job, max_grabbed, max_contention, auto_spu_count, tag1, tag2,
+        fixed_mem_alloc, max_size_job, init_spu_count);
+    if (!attr) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    const u64 prio = read_priorities(base, priority_table);
+    if (const s32 r = check_job_chain_attribute(sdk_revision, entry, size_job, max_grabbed, prio, auto_spu_count, tag1,
+            tag2, max_size_job, init_spu_count);
+        r != lv2::CELL_OK) {
+        return r;
+    }
+    ps_write32(base, attr + jcattr_off::jmVer, jm_revision);
+    ps_write32(base, attr + jcattr_off::sdkVer, sdk_revision);
+    ps_write32(base, attr + jcattr_off::jobChainEntry, entry);
+    ps_write16(base, attr + jcattr_off::sizeJobDescriptor, size_job);
+    ps_write16(base, attr + jcattr_off::maxGrabbedJob, max_grabbed);
+    ps_write64(base, attr + jcattr_off::priorities, prio);
+    ps_write32(base, attr + jcattr_off::maxContention, max_contention);
+    ps_write8(base, attr + jcattr_off::autoSpuCount, auto_spu_count);
+    ps_write32(base, attr + jcattr_off::tag1, tag1);
+    ps_write32(base, attr + jcattr_off::tag2, tag2);
+    ps_write8(base, attr + jcattr_off::isFixedMemAlloc, fixed_mem_alloc);
+    ps_write32(base, attr + jcattr_off::maxSizeJobDescriptor, max_size_job);
+    ps_write32(base, attr + jcattr_off::initSpuCount, init_spu_count);
+    ps_write32(base, attr + jcattr_off::haltOnError, 0);
+    ps_write32(base, attr + jcattr_off::name, 0);
+    ps_write8(base, attr + jcattr_off::jobMemoryCheck, 0);
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursJobChainAttributeSetName(PPUContext& ctx, u32 attr, u32 name)
+{
+    if (!attr || !name) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    ps_write32(guest_base(ctx), attr + jcattr_off::name, name);
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursJobChainAttributeSetHaltOnError(PPUContext& ctx, u32 attr)
+{
+    if (!attr) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    ps_write32(guest_base(ctx), attr + jcattr_off::haltOnError, 1);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellSpursCreateJobChainWithAttribute + _spurs::create_job_chain, with the native job chain marker as the
+// policy module. Deviations: no "JobChain" class name (RPCS3 points it at a temporary guest string), and RPCS3's
+// one-title firmware quirk (val2F) is not reproduced (no title checks in the runtime, rule 6).
+s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_chain, u32 attr)
+{
+    if (!attr) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    const u32 entry = ps_read32(base, attr + jcattr_off::jobChainEntry);
+    const u16 size_job = ps_read16(base, attr + jcattr_off::sizeJobDescriptor);
+    const u16 max_grabbed = ps_read16(base, attr + jcattr_off::maxGrabbedJob);
+    const u64 prio = ps_read64(base, attr + jcattr_off::priorities);
+    const u32 max_contention = ps_read32(base, attr + jcattr_off::maxContention);
+    const bool auto_spu_count = ps_read8(base, attr + jcattr_off::autoSpuCount) != 0;
+    const u32 tag1 = ps_read32(base, attr + jcattr_off::tag1), tag2 = ps_read32(base, attr + jcattr_off::tag2);
+    const bool fixed_mem = ps_read8(base, attr + jcattr_off::isFixedMemAlloc) != 0;
+    const u32 max_size_job = ps_read32(base, attr + jcattr_off::maxSizeJobDescriptor);
+    const u32 init_spu_count = ps_read32(base, attr + jcattr_off::initSpuCount);
+    if (const s32 r = check_job_chain_attribute(ps_read32(base, attr + jcattr_off::sdkVer), entry, size_job, max_grabbed,
+            prio, auto_spu_count, tag1, tag2, max_size_job, init_spu_count);
+        r != lv2::CELL_OK) {
+        return r;
+    }
+    if (!job_chain || !spurs) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (job_chain % 128 || spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    std::memset(base + job_chain, 0, 0x110);
+    const u32 jm_ver = ps_read32(base, attr + jcattr_off::jmVer);
+    if (jm_ver != CELL_SPURS_JOB_REVISION_2 && jm_ver != CELL_SPURS_JOB_REVISION_3) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    ps_write8(base, job_chain + jc_off::val2C,
+        static_cast<u8>((fixed_mem ? 0x80 : 0) | ((((max_size_job - 0x100) / 128) & 7) << 4)));
+
+    // _spurs::create_job_chain
+    const u32 sdk = HleProcess::current()->kernel().config().sdk_version;
+    ps_write64(base, job_chain + jc_off::spurs, spurs);
+    ps_write8(base, job_chain + jc_off::jmVer, sdk > 0x14FFFF ? CELL_SPURS_JOB_REVISION_1 : CELL_SPURS_JOB_REVISION_0);
+    ps_write8(base, job_chain + jc_off::val2F, 0);
+    ps_write8(base, job_chain + jc_off::tag1, static_cast<u8>(tag1));
+    ps_write8(base, job_chain + jc_off::tag2, static_cast<u8>(tag2));
+    ps_write8(base, job_chain + jc_off::isHalted, 0);
+    ps_write16(base, job_chain + jc_off::maxGrabbedJob, max_grabbed);
+    ps_write64(base, job_chain + jc_off::pc, entry);
+    u8 priority[8];
+    for (u32 i = 0; i < 8; i++) priority[i] = static_cast<u8>(prio >> (56 - 8 * i));
+    u32 wid = 0;
+    if (s32 r = add_workload(base, spurs, wid, SPURS_IMG_ADDR_JOB_CHAIN_PM, 0, job_chain, priority, 1, max_contention, 0,
+            ps_read32(base, attr + jcattr_off::name), Workload::Kind::JobChain);
+        r != lv2::CELL_OK) {
+        if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_AGAIN)) r = error(CELL_SPURS_JOB_ERROR_AGAIN);
+        else if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL)) r = error(CELL_SPURS_JOB_ERROR_INVAL);
+        else if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) r = error(CELL_SPURS_JOB_ERROR_STAT);
+        return r;
+    }
+    ps_write64(base, job_chain + jc_off::cause, 0);
+    ps_write32(base, job_chain + jc_off::error, 0);
+    ps_write32(base, job_chain + jc_off::workloadId, wid);
+    // back in cellSpursCreateJobChainWithAttribute
+    ps_write8(base, job_chain + jc_off::initSpuCount, static_cast<u8>(init_spu_count));
+    ps_write8(base, job_chain + jc_off::jmVer, static_cast<u8>(jm_ver));
+    ps_write32(base, job_chain + jc_off::sdkVer, ps_read32(base, attr + jcattr_off::sdkVer));
+    ps_write8(base, job_chain + jc_off::jobMemoryCheck, static_cast<u8>(ps_read8(base, attr + jcattr_off::jobMemoryCheck) << 1));
+    std::string label;
+    if (const u32 name = ps_read32(base, attr + jcattr_off::name)) label = reinterpret_cast<const char*>(base + name);
+    PS_LOG_INFO(kChan, "job chain {:#010x} \"{}\" is workload {} of SPURS {:#010x} (entry {:#x}, max contention {}); "
+                       "jobs do not run until the native job chain policy exists (needs libsre as the reference)",
+        job_chain, label, wid, spurs, entry, max_contention);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_cellSpurs(Registry& r)
@@ -561,6 +731,10 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xC10931CB, cellSpursCreateTasksetWithAttribute),
         PS_HLE_FUNC(0xA789E631, cellSpursShutdownTaskset),
         PS_HLE_FUNC(0x5EF96465, _cellSpursEventFlagInitialize),
+        PS_HLE_FUNC(0x3548F483, _cellSpursJobChainAttributeInitialize),
+        PS_HLE_FUNC(0x9FEF70C2, cellSpursJobChainAttributeSetName),
+        PS_HLE_FUNC(0xBB68D76E, cellSpursJobChainAttributeSetHaltOnError),
+        PS_HLE_FUNC(0x303C19CD, cellSpursCreateJobChainWithAttribute),
     });
 }
 

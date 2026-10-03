@@ -17,12 +17,20 @@ s32 sys_net_initialize_network_ex(PPUContext&, u32 param)
     return lv2::CELL_OK;
 }
 
+// RPCS3: UNIMPLEMENTED, returns CELL_OK. A debug printout of the network interfaces.
+s32 sys_net_show_ifconfig(PPUContext&)
+{
+    PS_LOG_DEBUG(kChan, "sys_net_show_ifconfig(): no interfaces");
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_sys_net(Registry& r)
 {
     r.add("sys_net", {
         PS_HLE_FUNC(0x139A9E9B, sys_net_initialize_network_ex),
+        PS_HLE_FUNC(0xB48636C4, sys_net_show_ifconfig),
     });
 }
 

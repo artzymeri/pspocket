@@ -38,4 +38,5 @@ and hands the cores back to the PPU threads and the renderer otherwise.
    WakeUp, workload flag), custom workloads.
 3. Tasksets (PPU side done) and tasks (GTA V's physics tasks, Bink, inflate).
 4. Event flags, semaphores, barriers, lv2 event queue attachment.
-5. Job chains and SPURS queues (need libsre as the reference).
+5. Job chains (attributes and creation done, workload marker 0x300; running jobs needs libsre as the reference) and
+   SPURS queues.
