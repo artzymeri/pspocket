@@ -399,9 +399,9 @@ TEST_CASE("256-bit add/sub carry chains (addc/adde/addze, subfc/subfe)")
         c.gpr[4] = kData + 32;
         c.gpr[5] = kData + 64;
         Run r = both(env().sym("add256"), c, data);
-        unsigned __int128 carry = 0;
+        u128 carry = 0;
         for (int i = 0; i < 4; i++) {
-            const unsigned __int128 s = static_cast<unsigned __int128>(x[i]) + y[i] + carry;
+            const u128 s = static_cast<u128>(x[i]) + y[i] + carry;
             CHECK(get64(r.data, static_cast<usize>(i) * 8) == static_cast<u64>(s));
             carry = s >> 64;
         }

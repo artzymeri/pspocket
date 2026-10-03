@@ -246,7 +246,7 @@ void execute(PPUContext& ctx, u8* base, const Inst& in)
     }
     case Op::MULLD: { // MULLD: OV when the high doubleword is not the sign extension of the low one
         const s64 a = static_cast<s64>(gpr[ra]), b = static_cast<s64>(gpr[rb]);
-        const __int128 p = static_cast<__int128>(a) * b;
+        const s128 p = static_cast<s128>(a) * b;
         const u64 lo = static_cast<u64>(p);
         gpr[rt] = lo;
         if (in.oe()) set_ov(ctx, static_cast<s64>(p >> 64) != (static_cast<s64>(lo) >> 63));
@@ -266,13 +266,13 @@ void execute(PPUContext& ctx, u8* base, const Inst& in)
         break;
     }
     case Op::MULHD: {
-        const __int128 p = static_cast<__int128>(static_cast<s64>(gpr[ra])) * static_cast<s64>(gpr[rb]);
+        const s128 p = static_cast<s128>(static_cast<s64>(gpr[ra])) * static_cast<s64>(gpr[rb]);
         gpr[rt] = static_cast<u64>(p >> 64);
         if (in.rc()) record(ctx, gpr[rt]);
         break;
     }
     case Op::MULHDU: {
-        const unsigned __int128 p = static_cast<unsigned __int128>(gpr[ra]) * gpr[rb];
+        const u128 p = static_cast<u128>(gpr[ra]) * gpr[rb];
         gpr[rt] = static_cast<u64>(p >> 64);
         if (in.rc()) record(ctx, gpr[rt]);
         break;

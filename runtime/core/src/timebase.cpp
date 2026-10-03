@@ -2,9 +2,13 @@
 
 #include <chrono>
 
+#include "pspocket/core/types.hpp"
+
 #if defined(__APPLE__)
 #include <mach/mach_time.h>
 #endif
+
+using pspocket::u128;
 
 namespace {
 
@@ -19,12 +23,12 @@ struct HostClock {
     }
     uint64_t ns() const
     {
-        const unsigned __int128 t = mach_absolute_time();
+        const u128 t = mach_absolute_time();
         return static_cast<uint64_t>(t * info.numer / info.denom);
     }
     uint64_t elapsed_ns() const
     {
-        const unsigned __int128 t = mach_absolute_time() - start;
+        const u128 t = mach_absolute_time() - start;
         return static_cast<uint64_t>(t * info.numer / info.denom);
     }
 };
@@ -54,7 +58,7 @@ const HostClock& host_clock()
 
 extern "C" uint64_t ps_timebase_now(void)
 {
-    const unsigned __int128 ns = host_clock().elapsed_ns();
+    const u128 ns = host_clock().elapsed_ns();
     return static_cast<uint64_t>(ns * PS_TIMEBASE_HZ / 1'000'000'000ull);
 }
 
