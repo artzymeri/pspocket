@@ -11,7 +11,7 @@ user's own disc dump. No JIT, no interpreter on the hot path. First title: GTA I
 
 | Phase | Gate | State |
 |---|---|---|
-| 0 · Inventory and go/no-go | Inventory report, go/no-go | Tools built; waiting on a decrypted EBOOT ([docs/phase0.md](docs/phase0.md)) |
+| 0 · Inventory and go/no-go | Inventory report, go/no-go | Tools built; blocked until there is a dump of a copy you own ([docs/phase0.md](docs/phase0.md)) |
 | 1 · Toolchain foundation | Samples recompile and match the interpreter; GTA IV ELF lifts | In progress |
 | 2 · Runtime core on macOS | Test suite passes; EBOOT boots to its first unimplemented call | Guest memory, logging, timebase done |
 | 3 · SPU | Stress runs, every inventoried SPU program lifts | Not started |

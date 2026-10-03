@@ -10,11 +10,14 @@ The plan's recommendation. The repo is private, so GPLv2 costs nothing, and it a
 Consequences: `LICENSE` is GPLv2. Code taken or adapted from RPCS3 keeps a comment naming the source file.
 Revisit only if the project ever needs a permissive licence (it would then need a clean-room rewrite of those parts).
 
-## D-002 · 2026-10-03 · Game version: GTA IV BLES00229 (EU) with update 1.08
+## D-002 · 2026-10-03 · Game version: GTA IV BLES00229 (EU) with update 1.08 (tentative)
 
-That is the copy already in use in the `ps3-ios-engine` project (disc BLES00229 plus
-`EP1017-BLES00229_00-GTAIVUPDATEV0108-A0108-V0100-PE.pkg`). The recompiled EBOOT is the one from update 1.08, which
-replaces the disc's. The manifest (`games/gta4/manifest.toml`) records the hashes once Phase 0 has the decrypted files.
+Tentative target, chosen because the `ps3-ios-engine` project worked with BLES00229 and the 1.08 update package
+(`EP1017-BLES00229_00-GTAIVUPDATEV0108-A0108-V0100-PE.pkg`) is on the Mac. **The user has no GTA IV dump at the
+moment**, so Phase 0's inventory and every GTA IV-specific step wait until there is a dump of a copy the user owns;
+confirm region and version against that disc then. The recompiled EBOOT would be the one from update 1.08, which
+replaces the disc's. Until then the toolchain and runtime are exercised with synthetic programs and homebrew, which
+is what Phases 1–4 do first anyway. The manifest (`games/gta4/manifest.toml`) records hashes once the files exist.
 
 ## D-003 · 2026-10-03 · Host and languages
 
