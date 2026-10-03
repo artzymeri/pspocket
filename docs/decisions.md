@@ -355,13 +355,23 @@ The user widened the goal from one title to any PS3 disc image. What that means 
   no reference for two of them (job chains: `spursJobChainEntry` is a stub; SPURS queues: UNIMPLEMENTED). See the
   open question below.
 
+## D-037 · 2026-10-03 · SPURS is native: our own C++ implementation, no Sony code in the app
+
+The user chose a native SPURS (supersedes the LLE proposal of D-024 and the baseline idea in D-036). cellSpurs is an
+HLE module like the others: the PPU API on the host, and a host scheduler that runs each workload's SPU code (task
+ELFs, job binaries; lifted like any SPU program) on SPU contexts, without Sony's SPU-side SPURS kernel. Guest-visible
+structures (CellSpurs, attributes, tasksets, event flags, ...) keep RPCS3's layouts (cellSpurs.h), because games and
+their SPU code read them. Reference: RPCS3 cellSpurs.cpp / cellSpursSpu.cpp where they implement a feature. Where they
+don't (job chains: `spursJobChainEntry` is empty; SPURS queues: UNIMPLEMENTED), the reference is Sony's libsre from the
+user's firmware file, read on the Mac to learn the behaviour and used as a test oracle, never shipped or committed.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
 - [x] Game version → D-025: GTA V BLES01807 (GTA IV in D-002 stays as a draft).
 - [x] Toolchain → D-012 (write our own).
-- [~] SPURS → D-024, D-036: the user wants a native SPURS; for "any game" Sony's libsre (LLE) is the compatibility
-  baseline it is built and tested against. Firmware file needed either way.
+- [x] SPURS → D-037: native (HLE module + host scheduler). libsre from the user's firmware is a reference only, for job
+  chains and queues.
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
 - [ ] Input: controller required, or a polished touch overlay as well.
 - [ ] ISO handling: extract assets, or read directly from the ISO.
