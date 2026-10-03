@@ -141,6 +141,33 @@ backend. Rule 4 still holds for everything title-specific: firmware modules beyo
 SPU program replacements, patches, and the GTA IV bring-up wait for the inventory. Phase gates remain the measure of
 done; they are no longer the order in which work starts.
 
+## D-019 · 2026-10-03 · NID and syscall names come from RPCS3, by script
+
+`recomp/common/scripts/harvest_nids.py <rpcs3-dir>` regenerates `recomp/common/data/nids.txt` (6,625 names in 148
+modules) and `data/syscalls.txt` (634 syscalls) from RPCS3's registration macros and syscall table. They are API
+names, so they are committed and embedded into `pspocket::recomp_common` at build time; more names files can be loaded
+at runtime (`ps3inspect --names`). Rerun after RPCS3 updates; `--check` detects drift. The runtime gets its own
+committed syscall-name table generated from the same file (it can't depend on recomp/).
+
+## D-020 · 2026-10-03 · Toolchain parsers never abort on bad input
+
+ELF, SELF, PRX, TOML and manifest parsing use bounds-checked reads and return errors as values; `PS_CHECK` is only for
+programming mistakes. Robustness tests (truncations, 60k random mutations) run under ASan and UBSan. SELF handling reads
+the plaintext headers only and reports the licence type; it never decrypts. A PRX is viewed statically with each
+segment at its `p_vaddr` and relocations applied the way RPCS3's `ppu_load_prx` does.
+
+## D-021 · 2026-10-03 · Manifest format, SPU program identity, Phase 0 outputs
+
+- `games/<title>/manifest.toml` is a strict TOML subset: unknown keys are errors, every patch needs a `why`,
+  overlapping patches are rejected, hashes are optional in drafts and required for builds, paths are relative to a
+  dump laid out like the PS3 filesystem (`dev_bdvd/`, `dev_hdd0/`).
+- SPU programs are keyed by the SHA-1 of their ELF image bytes. RPCS3's `SPU-`/`PPU-` hashes are printed alongside so
+  results can be matched against RPCS3 logs. The key for code loaded at runtime (overlays, SPURS jobs) is decided in
+  Phase 3.
+- Phase 0 outputs (`ps3inspect --json`, traces) live in `inventory/<title>/`, which is gitignored; only the decisions
+  and the re-estimate go into docs. `ps3inspect` exits 0 (ok), 1 (usage or I/O error), 2 (bad input), 3 (encrypted
+  SELF).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

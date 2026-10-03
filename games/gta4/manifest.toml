@@ -1,0 +1,67 @@
+# Game manifest: Grand Theft Auto IV, BLES00229 (EU), update 1.08 (docs/decisions.md D-002, tentative).
+#
+# Read by recomp/common (pspocket::recomp::load_manifest). The format is a TOML subset: tables, arrays of tables,
+# strings, integers (0x hex allowed), booleans, arrays of scalars and comments. Unknown keys are errors.
+#
+# This file holds data only: hashes, addresses, bytes, names. No game code or data, and nothing that can be used
+# to obtain them (CLAUDE.md rule 1). The hashes stay empty until Phase 0 has a dump of a copy the user owns
+# (docs/phase0.md); a build checks them with ManifestOptions::require_hashes.
+
+title_id = "BLES00229"          # 4 letters + 5 digits, from PARAM.SFO TITLE_ID
+title = "Grand Theft Auto IV"
+app_version = "01.08"           # PARAM.SFO APP_VER of the update whose EBOOT is recompiled
+
+# SHA-256 of the decrypted disc image (ISO) the iOS app accepts (plan section 9, "First launch"). 64 hex digits.
+iso_sha256 = ""
+
+# ---------------------------------------------------------------------------------------------------------------
+# Input files, by path relative to the dump root laid out like the PS3 file system (dev_bdvd = disc,
+# dev_hdd0 = installed update). sha256 = SHA-256 of the file (ps3inspect prints it). Add every *.sprx / *.self
+# that USRDIR turns out to contain, both the encrypted file and the .prx/.elf RPCS3 decrypts it to.
+
+[[files]]                        # disc EBOOT (encrypted SELF): identifies the disc version
+path = "dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN"
+sha256 = ""
+
+[[files]]                        # disc PARAM.SFO
+path = "dev_bdvd/PS3_GAME/PARAM.SFO"
+sha256 = ""
+
+[[files]]                        # update 1.08 EBOOT (encrypted SELF), as installed by RPCS3
+path = "dev_hdd0/game/BLES00229/USRDIR/EBOOT.BIN"
+sha256 = ""
+
+[[files]]                        # the same EBOOT decrypted by RPCS3: the input of the PPU and SPU toolchain
+path = "dev_hdd0/game/BLES00229/USRDIR/EBOOT.elf"
+sha256 = ""
+
+[[files]]                        # update PARAM.SFO (APP_VER 01.08)
+path = "dev_hdd0/game/BLES00229/PARAM.SFO"
+sha256 = ""
+
+# ---------------------------------------------------------------------------------------------------------------
+# Function overrides: guest functions replaced by a host implementation with this C name (CLAUDE.md rule 6).
+# addr = guest entry address (4-byte aligned), name = a C identifier implemented in games/gta4/.
+#
+# [[overrides]]
+# addr = 0x00012345
+# name = "gta4_override_example"
+
+# ---------------------------------------------------------------------------------------------------------------
+# Patches: bytes written over the decrypted EBOOT image at a guest address before lifting. `why` is required:
+# say what the original code does and why it must change (e.g. a render-target readback, plan section 7).
+#
+# [[patches]]
+# addr = 0x00012345
+# bytes = "60000000"               # hex, spaces allowed: one PowerPC nop
+# why = "explain the patch"
+
+# ---------------------------------------------------------------------------------------------------------------
+# SPU programs, keyed by the SHA-1 ps3inspect prints for each embedded image (and the runtime traces log for
+# programs loaded at runtime). action: "lift" (recompile), "replace" (native implementation in runtime/spu/replace/,
+# plan section 6) or "interpret" (SPU interpreter fallback).
+#
+# [[spu_programs]]
+# sha1 = "0000000000000000000000000000000000000000"
+# name = "example_job"
+# action = "lift"

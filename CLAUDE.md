@@ -44,6 +44,9 @@ ctest --test-dir build/host --output-on-failure
 
 - Host tools land in `build/host/`: `tools/ps3inspect/ps3inspect`, `recomp/ppu/ppu-lift`,
   `runtime/platform/macos/pspocket-selftest`.
+- Phase 0 inventory: `ps3inspect --json inventory/gta4/eboot.json EBOOT.elf` (`inventory/` is gitignored; see
+  `docs/phase0.md`). NID/syscall names: `recomp/common/scripts/harvest_nids.py <rpcs3-dir> [--check]` (D-019).
+- Focused builds while other work is in progress: `-DPSPOCKET_ONLY="runtime/core;recomp/common;tests/common"`.
 - iOS test host: `scripts/ios.sh build|install|run` (XcodeGen project in `app/ios/project.yml`, team M7XJA39ZV6).
 - Use your own build directory (`build/<name>`) when several builds run at once.
 

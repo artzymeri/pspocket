@@ -346,11 +346,12 @@ previous gate passes.
 ### Phase 0: Inventory and go/no-go (2–4 weeks)
 
 - [ ] User decrypts EBOOT.BIN and the game's PRX files with RPCS3's binary decryption utility.
-- [ ] Build `tools/ps3inspect`: ELF and PRX headers and segments; imports grouped by module with NIDs resolved to
+- [x] Build `tools/ps3inspect`: ELF and PRX headers and segments; imports grouped by module with NIDs resolved to
   names; exports; embedded SPU images with counts, sizes and hashes; strings that identify middleware.
 - [ ] Trace a 30-minute desktop session in RPCS3, including driving: SPU programs loaded (with hashes), syscalls used,
   render-target readbacks, shader count. This may need a locally patched RPCS3 build with extra logging.
-- [ ] Evaluate PS3Recomp: licence, maturity, output quality on the GTA IV ELF.
+- [x] Evaluate PS3Recomp: licence, maturity, output quality on the GTA IV ELF. (Done by static reading, see
+  `docs/phase0-recomp-evaluation.md`; the GTA IV run waits for a dump.)
 
 **Exit:** an inventory report with function count, imported NIDs per module, and SPU programs split into Sony
 middleware versus custom. Go/no-go decision and a re-estimate.
