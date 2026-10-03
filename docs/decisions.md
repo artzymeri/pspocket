@@ -168,10 +168,19 @@ segment at its `p_vaddr` and relocations applied the way RPCS3's `ppu_load_prx` 
   and the re-estimate go into docs. `ps3inspect` exits 0 (ok), 1 (usage or I/O error), 2 (bad input), 3 (encrypted
   SELF).
 
+## D-022 · 2026-10-03 · Phase 0 runs on GTA V (BLES01807), the dump on hand
+
+The user's dump is GTA V, not GTA IV: BLES01807 (EU), disc version 01.03, app 01.00, 18.74 GB, decrypted at disc
+level (its region table still marks 18.47 GB encrypted; the EBOOT reads as a SELF, so the content isn't). It lives on
+the phone in the app's Documents; `-extract-iso` copied out PS3_DISC.SFB, PARAM.SFO and EBOOT.BIN (14.6 MB, a disc
+SELF with no NPDRM header: no RAP needed). GTA V ships no separate PRX modules. The Phase 0 inventory runs on this
+EBOOT once RPCS3 has decrypted it; whether the first title becomes GTA V instead of GTA IV (D-002) is decided from
+that inventory. GTA V is the heavier game (more SPU work, larger engine), so the go/no-go matters more, not less.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
-- [~] Game version → D-002 (tentative: no dump yet).
+- [~] Game version → D-002 (GTA IV, tentative) / D-022 (Phase 0 runs on GTA V, the dump on hand).
 - [x] Toolchain → D-012 (write our own).
 - [ ] SPURS: HLE or LLE. Decided by the Phase 0 inventory.
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
