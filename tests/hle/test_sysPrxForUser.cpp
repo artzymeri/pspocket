@@ -1,5 +1,6 @@
-// sysPrxForUser HLE functions on real lv2 threads: lwmutex (RPCS3 sys_lwmutex_.cpp semantics, including contention
-// through the kernel's sleep queue), sys_ppu_thread_get_id, and lv2's null_func syscall 988.
+// HLE functions on real lv2 threads: sysPrxForUser lwmutex (RPCS3 sys_lwmutex_.cpp semantics, including contention
+// through the kernel's sleep queue), sys_ppu_thread_get_id and sys_time_get_system_time, cellSysmodule's load
+// bookkeeping, and lv2's null_func syscall 988.
 
 #include <catch_amalgamated.hpp>
 
@@ -68,10 +69,10 @@ struct GuestThread {
     {
         const hle::Function* fn = nullptr;
         for (const hle::Function& x : hle::registry().functions())
-            if (x.module == "sysPrxForUser" && x.name == name) fn = &x;
+            if (x.name == name) fn = &x;
         REQUIRE(fn != nullptr);
-        const u64 v[] = {static_cast<u64>(args)...};
-        for (usize i = 0; i < sizeof...(A); i++) ctx.gpr[3 + i] = v[i];
+        const u64 v[] = {0, static_cast<u64>(args)...}; // leading 0: no zero-length array for calls without arguments
+        for (usize i = 0; i < sizeof...(A); i++) ctx.gpr[3 + i] = v[i + 1];
         const u64 sp = ctx.gpr[1];
         fn->fn(ctx, f.base());
         CHECK(ctx.gpr[1] == sp); // stack variables released
@@ -201,4 +202,58 @@ TEST_CASE("syscall 988 (debug PPU exception handler) returns CELL_OK like RPCS3'
     ps_ppu_syscall(&a.ctx, f.base());
     CHECK(a.ctx.gpr[3] == 0);
     CHECK(f.kernel->unimplemented_count() == 0);
+}
+
+TEST_CASE("sys_time_get_system_time: microseconds, increasing", "[hle]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    const u64 t0 = a.call("sys_time_get_system_time");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const u64 t1 = a.call("sys_time_get_system_time");
+    CHECK(t1 > t0);
+    CHECK(t1 - t0 >= 2000);
+}
+
+TEST_CASE("cellSysmodule: load counts, dependencies, default and virtual modules", "[hle][sysmodule]")
+{
+    Fixture f; // SDK 0x00360001 by default: the six external default modules are loaded
+    GuestThread a(f, 0, "a");
+    constexpr u64 kUnloaded = 0xFFFFFFFF80012003ull, kUnknown = 0xFFFFFFFF80012002ull;
+    constexpr u32 kNet = 0x00, kHttps = 0x04, kRtc = 0x09, kFs = 0x0E, kNetctl = 0x14, kSysutil = 0x15;
+
+    CHECK(a.call("cellSysmoduleInitialize") == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kSysutil) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kFs) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kNet) == kUnloaded);
+
+    // NET depends on NETCTL; both load, both unload.
+    REQUIRE(a.call("cellSysmoduleLoadModule", kNet) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kNet) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kNetctl) == 0);
+    REQUIRE(a.call("cellSysmoduleUnloadModule", kNet) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kNet) == kUnloaded);
+    CHECK(a.call("cellSysmoduleIsLoaded", kNetctl) == kUnloaded);
+
+    // Reference counted.
+    REQUIRE(a.call("cellSysmoduleLoadModule", kRtc) == 0);
+    REQUIRE(a.call("cellSysmoduleLoadModule", kRtc) == 0);
+    REQUIRE(a.call("cellSysmoduleUnloadModule", kRtc) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kRtc) == 0);
+    REQUIRE(a.call("cellSysmoduleUnloadModule", kRtc) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kRtc) == kUnloaded);
+
+    // A default module loaded only by lv2 stays loaded.
+    REQUIRE(a.call("cellSysmoduleUnloadModule", kSysutil) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kSysutil) == 0);
+
+    // HTTPS has no image of its own: loaded when its last dependency (HTTP) is.
+    CHECK(a.call("cellSysmoduleIsLoaded", kHttps) == kUnloaded);
+    REQUIRE(a.call("cellSysmoduleLoadModule", kHttps) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kHttps) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kNet) == 0); // SSL -> NET
+
+    CHECK(a.call("cellSysmoduleLoadModule", 0x58) == kUnknown);
+    CHECK(a.call("cellSysmoduleIsLoaded", 0xF000) == kUnknown);
+    CHECK(a.call("cellSysmoduleFinalize") == 0);
 }

@@ -59,6 +59,9 @@ void sys_process_exit(PPUContext& ctx, s32 status)
     lv2::_sys_process_exit(thread_of(ctx), status, 0, 0); // does not return
 }
 
+// RPCS3 sysPrxForUser.cpp: the library's copy of the syscall.
+u64 sys_time_get_system_time(PPUContext& ctx) { return lv2::sys_time_get_system_time(thread_of(ctx)); }
+
 // RPCS3 sys_prx_.cpp: a TODO that returns CELL_OK.
 s32 sys_prx_exitspawn_with_level(PPUContext&)
 {
@@ -271,6 +274,7 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0x350D454E, sys_ppu_thread_get_id),
         PS_HLE_FUNC(0xE6F2C1E7, sys_process_exit),
         PS_HLE_FUNC(0xA2C7BA64, sys_prx_exitspawn_with_level),
+        PS_HLE_FUNC(0x8461E528, sys_time_get_system_time),
         PS_HLE_FUNC(0x2F85C0EF, sys_lwmutex_create),
         PS_HLE_FUNC(0xC3476D0C, sys_lwmutex_destroy),
         PS_HLE_FUNC(0x1573DC3F, sys_lwmutex_lock),

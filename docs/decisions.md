@@ -332,6 +332,16 @@ again. Decisions from the first round:
   fallback) is the RSX write tracker's job later; this one is for bring-up.
 - Unimplemented HLE calls are logged like unimplemented syscalls: the first 8 calls, then every 1024th.
 
+## D-035 · 2026-10-03 · cellSysmodule is bookkeeping; HLE modules keep per-process state
+
+Run 005. Every imported firmware function is linked to HLE (or the UNIMPLEMENTED stub) at load time, so
+`cellSysmoduleLoadModule` does not load anything: it keeps RPCS3's per-module load counts, loads dependencies first
+and unloads them last, refuses 0x58, and counts lv2's default modules (SYSUTIL, GCM_SYS, AUDIO, IO, SPURS, and FS from
+SDK 3.3) as loaded from the start, exactly as RPCS3's cellSysmodule.cpp does minus its sys_prx calls. The module table
+is generated from RPCS3's MODULE_INFOS. Internal IDs (0xF000+) return CELL_SYSMODULE_ERROR_UNKNOWN with an error log
+until a game uses one. Module state lives in `HleProcess::state<T>()` (RPCS3's g_fxo), so tests and future
+restarts get a fresh copy per process.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

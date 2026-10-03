@@ -8,6 +8,9 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <typeindex>
+#include <unordered_map>
 #include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
@@ -97,6 +100,20 @@ public:
     // Used by the stub trampoline.
     void on_unimplemented() { unimplemented_calls_.fetch_add(1, std::memory_order_relaxed); }
 
+    // Per-process state of an HLE module (RPCS3 g_fxo): created on first use (from this process when T has a
+    // constructor taking HleProcess&), destroyed with the process. T does its own locking.
+    template <class T>
+    T& state()
+    {
+        std::lock_guard lock(state_mutex_);
+        std::shared_ptr<void>& slot = states_[std::type_index(typeid(T))];
+        if (!slot) {
+            if constexpr (std::is_constructible_v<T, HleProcess&>) slot = std::make_shared<T>(*this);
+            else slot = std::make_shared<T>();
+        }
+        return *static_cast<T*>(slot.get());
+    }
+
 private:
     struct Chunk {
         u32 base = 0;
@@ -118,6 +135,9 @@ private:
     u32 tls_area_ = 0;  // start of the first slot's system area
     u32 tls_slot_ = 0;  // bytes per thread: mem_size + 0x30
     std::vector<bool> tls_used_;
+
+    std::mutex state_mutex_;
+    std::unordered_map<std::type_index, std::shared_ptr<void>> states_;
 };
 
 // The stub layout (RPCS3 PPUModule.cpp ppu_initialize_modules): 8 bytes per function, word 0 = descriptor + 4,
