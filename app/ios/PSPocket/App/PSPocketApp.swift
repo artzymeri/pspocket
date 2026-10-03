@@ -11,6 +11,7 @@ struct PSPocketApp: App {
         // Line-buffered stdout, so `devicectl device process launch --console` (and `simctl launch --console-pty`)
         // show each self-test line as it happens.
         setvbuf(stdout, nil, _IOLBF, 0)
+        DiscExtraction.runIfRequested()
     }
 
     var body: some Scene {
@@ -57,6 +58,10 @@ enum LaunchOptions {
     static let initialTab = value("-tab", env: "PSPOCKET_TAB")
     /// Metal load passes at launch (0...64): `-passes N` or PSPOCKET_PASSES=N.
     static let initialPasses = value("-passes", env: "PSPOCKET_PASSES").flatMap { Int($0) }
+    /// Extract the executables from the disc image in Documents, then exit (DiscExtraction). `-extract-iso`.
+    static let extractISO = flag("-extract-iso", env: "PSPOCKET_EXTRACT_ISO")
+    /// Which image in Documents to use with `-extract-iso` (default: the first .iso by name). `-iso NAME`.
+    static let isoName = value("-iso", env: "PSPOCKET_ISO")
 
     private static func flag(_ argument: String, env: String) -> Bool {
         ProcessInfo.processInfo.arguments.contains(argument) || ProcessInfo.processInfo.environment[env] == "1"

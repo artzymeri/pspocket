@@ -56,6 +56,10 @@ targets:
         name: selftest
         group: Runtime
         includes: *compiled
+      - path: ../../runtime/disc/src
+        name: disc
+        group: Runtime
+        includes: *compiled
       - path: ../../runtime/platform/ios/src
         name: platform-ios
         group: Runtime
@@ -81,6 +85,7 @@ targets:
           - $(PSPOCKET_ROOT)/runtime/selftest/include
           - $(PSPOCKET_ROOT)/runtime/selftest/src
           - $(PSPOCKET_ROOT)/runtime/platform/ios/include
+          - $(PSPOCKET_ROOT)/runtime/disc/include
           - $(PSPOCKET_HOST_BUILD_DIR)/generated/selftest
           - $(PSPOCKET_HOST_BUILD_DIR)/generated
         GCC_PREPROCESSOR_DEFINITIONS:
@@ -145,6 +150,7 @@ targets:
         HEADER_SEARCH_PATHS:
           - $(PSPOCKET_ROOT)/runtime/selftest/include
           - $(PSPOCKET_ROOT)/runtime/platform/ios/include
+          - $(PSPOCKET_ROOT)/runtime/disc/include
         # Load every object of the runtime, so code that registers itself (static initialisers, tables in
         # generated code) is never dropped by the static linker.
         OTHER_LDFLAGS: [$(inherited), -force_load, $(BUILT_PRODUCTS_DIR)/libPSPocketRuntime.a]

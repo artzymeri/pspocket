@@ -64,6 +64,7 @@ pspocket_add_component(runtime/spu)
 pspocket_add_component(runtime/lv2)
 pspocket_add_component(runtime/hle)
 pspocket_add_component(runtime/rsx)
+pspocket_add_component(runtime/disc)
 pspocket_add_component(runtime/selftest)
 pspocket_add_component(runtime/platform/macos)
 
