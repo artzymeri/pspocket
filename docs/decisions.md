@@ -211,15 +211,17 @@ because GTA V uses tasksets and job chains (RPCS3 relies on LLE for these); HLE 
 user's firmware file. Raw inventory outputs stay in `inventory/`; the aggregate report goes to docs (amends D-021).
 The analyzer recognised no jump tables in this EBOOT (SNC rather than GCC patterns, to investigate).
 
-## D-025 · 2026-10-03 · First title: GTA V (BLES01807), pending the user's confirmation
+## D-025 · 2026-10-03 · First title: GTA V (BLES01807), confirmed by the user
 
-The user owns a GTA V dump and no GTA IV dump, and the inventory says go. `games/gta5/manifest.toml` is the active
-manifest; `games/gta4/` stays as a draft. Revert to GTA IV only if the user gets that dump and prefers it.
+The user owns a GTA V dump and no GTA IV dump, the inventory says go, and the user confirmed the switch.
+`games/gta5/manifest.toml` is the active manifest; `games/gta4/` stays as a draft. Firmware for SPURS LLE (D-024):
+the user approved using Sony's official PS3UPDAT.PUP; it is placed by the user (this session's tooling may not
+fetch it) under `inventory/firmware/`, outside git.
 
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
-- [~] Game version → D-025: GTA V BLES01807 (pending the user's confirmation; GTA IV in D-002 as a draft).
+- [x] Game version → D-025: GTA V BLES01807 (GTA IV in D-002 stays as a draft).
 - [x] Toolchain → D-012 (write our own).
 - [~] SPURS → D-024: LLE proposed (needs the user's firmware file); HLE fallback.
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
