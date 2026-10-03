@@ -64,7 +64,12 @@ constexpr u32 kTasksetPmSize = 0x1E40;
 constexpr u32 CELL_SPURS_MAX_WORKLOAD = 16;
 constexpr u32 CELL_SPURS_TASKSET_ATTRIBUTE_REVISION = 1;
 constexpr u32 kTasksetSize = 6400; // CellSpursTaskset (CellSpursTaskset2 is larger; not supported yet)
-constexpr u8 SPURS_WKL_STATE_PREPARING = 1, SPURS_WKL_STATE_RUNNABLE = 2;
+constexpr u8 SPURS_WKL_STATE_PREPARING = 1, SPURS_WKL_STATE_RUNNABLE = 2, SPURS_WKL_STATE_SHUTTING_DOWN = 3,
+             SPURS_WKL_STATE_REMOVABLE = 4;
+constexpr u32 CELL_SPURS_MAX_WORKLOAD2 = 32;
+constexpr u32 CELL_SPURS_EVENT_FLAG_LAST = 3;       // ANY2ANY
+constexpr u32 CELL_SPURS_EVENT_FLAG_CLEAR_LAST = 1; // MANUAL
+constexpr u8 CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT = 0xFF;
 
 // SpursAttrFlags
 constexpr u32 SAF_EXIT_IF_NO_WORK = 0x00000001;
@@ -459,6 +464,88 @@ s32 cellSpursCreateTasksetWithAttribute(PPUContext& ctx, u32 spurs, u32 taskset,
         ps_read32(base, attr + tsattr_off::taskset_size), static_cast<s32>(ps_read32(base, attr + tsattr_off::enable_clear_ls)));
 }
 
+// RPCS3 cellSpursShutdownWorkload. Natively no SPU runs a workload yet (status 0), so a shutdown makes it removable
+// at once. The shutdown-completion notification RPCS3 sends to the SPURS event port (when a hook is registered) has
+// no handler thread to go to natively; it is logged instead.
+s32 shutdown_workload(u8* base, u32 spurs, u32 wid)
+{
+    if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    const bool second = (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0;
+    if (wid >= (second ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
+        PS_LOG_ERROR(kChan, "shutdown_workload: SPURS2 workload {} is not implemented", wid);
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    }
+    SpursHost& h = host();
+    std::lock_guard lock(h.mutex);
+    const u8 state = ps_read8(base, spurs + wkl_off::state1 + wid);
+    if (state <= SPURS_WKL_STATE_PREPARING) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    if (state == SPURS_WKL_STATE_SHUTTING_DOWN || state == SPURS_WKL_STATE_REMOVABLE) return lv2::CELL_OK;
+    const u8 status = ps_read8(base, spurs + wkl_off::status1 + wid);
+    if (status) {
+        ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_SHUTTING_DOWN);
+        ps_write8(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, 0xFF);
+        ps_write8(base, spurs + wkl_off::sysSrvMessage, 0xFF);
+        return lv2::CELL_OK;
+    }
+    ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_REMOVABLE);
+    const u8 event = ps_read8(base, spurs + wkl_off::event1 + wid);
+    ps_write8(base, spurs + wkl_off::event1 + wid, static_cast<u8>(event | 1));
+    if ((event & 0x12) && !(event & 1)) {
+        PS_LOG_WARN(kChan, "workload {} of SPURS {:#010x} shut down: its completion hook is not called (not implemented)",
+            wid, spurs);
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellSpursShutdownTaskset.
+s32 cellSpursShutdownTaskset(PPUContext& ctx, u32 taskset)
+{
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    const u32 wid = ps_read32(base, taskset + ts_off::wid);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
+    s32 r = shutdown_workload(base, spurs, wid);
+    if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) r = error(CELL_SPURS_TASK_ERROR_STAT);
+    PS_LOG_INFO(kChan, "cellSpursShutdownTaskset({:#010x}): workload {} -> {:#x}", taskset, wid, static_cast<u32>(r));
+    return r;
+}
+
+// ------------------------------------------------------------------------------------------------- event flags
+
+// CellSpursEventFlag (128 bytes, 128-aligned): ctrl (8 bytes), spuTaskUsedWaitSlots, spuTaskWaitMode, spuPort, isIwl,
+// direction, clearMode, ..., addr (u64) at 0x70.
+namespace ef_off {
+constexpr u32 spuPort = 0x0C, isIwl = 0x0D, direction = 0x0E, clearMode = 0x0F, addr = 0x70, size = 0x80;
+}
+
+// RPCS3 _cellSpursEventFlagInitialize.
+s32 _cellSpursEventFlagInitialize(PPUContext& ctx, u32 spurs, u32 taskset, u32 event_flag, u32 clear_mode, u32 direction)
+{
+    if ((!taskset && !spurs) || !event_flag) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN || taskset % 128 || event_flag % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (taskset && ps_read32(base, taskset + ts_off::wid) >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    if (direction > CELL_SPURS_EVENT_FLAG_LAST || clear_mode > CELL_SPURS_EVENT_FLAG_CLEAR_LAST) {
+        return error(CELL_SPURS_TASK_ERROR_INVAL);
+    }
+    std::memset(base + event_flag, 0, ef_off::size);
+    ps_write8(base, event_flag + ef_off::direction, static_cast<u8>(direction));
+    ps_write8(base, event_flag + ef_off::clearMode, static_cast<u8>(clear_mode));
+    ps_write8(base, event_flag + ef_off::spuPort, CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT);
+    if (taskset) {
+        ps_write64(base, event_flag + ef_off::addr, taskset);
+    } else {
+        ps_write8(base, event_flag + ef_off::isIwl, 1);
+        ps_write64(base, event_flag + ef_off::addr, spurs);
+    }
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_cellSpurs(Registry& r)
@@ -472,6 +559,8 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0x16394A4E, _cellSpursTasksetAttributeInitialize),
         PS_HLE_FUNC(0x652B70E2, cellSpursTasksetAttributeSetName),
         PS_HLE_FUNC(0xC10931CB, cellSpursCreateTasksetWithAttribute),
+        PS_HLE_FUNC(0xA789E631, cellSpursShutdownTaskset),
+        PS_HLE_FUNC(0x5EF96465, _cellSpursEventFlagInitialize),
     });
 }
 

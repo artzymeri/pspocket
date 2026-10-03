@@ -418,3 +418,67 @@ TEST_CASE("cellSpurs tasksets: attributes, creation registers a taskset workload
     CHECK(a.call("_cellSpursTasksetAttributeInitialize", kTsAttr, 1, 0x330000, 0, kPrio, 5) == 0xFFFFFFFF80410902ull);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 }
+
+TEST_CASE("cellSpurs event flags and taskset shutdown; sys_net, sys_spu_initialize, cellSheap", "[hle][spurs]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u32 kSpursAttr = kData + 0x1000, kSpurs = kData + 0x2000, kTsAttr = kData + 0x4000, kPrio = kData + 0x4400;
+    constexpr u32 kTs = kData + 0x6000, kFlag = kData + 0x8000, kHeap = kData + 0x10000;
+    constexpr u64 kTaskInval = 0xFFFFFFFF80410902ull, kTaskAlign = 0xFFFFFFFF80410910ull,
+                  kTaskNull = 0xFFFFFFFF80410911ull, kTaskStat = 0xFFFFFFFF8041090Full;
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 5, 200, 2016, 0) == 0);
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
+    std::memset(base + kPrio, 1, 8);
+    REQUIRE(a.call("_cellSpursTasksetAttributeInitialize", kTsAttr, 1, 0x330000, 0, kPrio, 1) == 0);
+
+    // A taskset that was never created (workload 0 not prepared) can't be shut down.
+    std::memset(base + kTs, 0, 0x80);
+    ps_write64(base, kTs + 0x60, kSpurs);
+    CHECK(a.call("cellSpursShutdownTaskset", kTs) == kTaskStat);
+    REQUIRE(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs, kTsAttr) == 0);
+
+    // Bink's sequence (run 008): an event flag on the taskset, then shut the taskset down.
+    std::memset(base + kFlag, 0xEE, 0x80);
+    REQUIRE(a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag, 1 /* manual */, 2 /* PPU2SPU */) == 0);
+    CHECK(ps_read8(base, kFlag + 0x00) == 0);    // events cleared
+    CHECK(ps_read8(base, kFlag + 0x0C) == 0xFF); // spuPort: none
+    CHECK(ps_read8(base, kFlag + 0x0D) == 0);    // isIwl
+    CHECK(ps_read8(base, kFlag + 0x0E) == 2);    // direction
+    CHECK(ps_read8(base, kFlag + 0x0F) == 1);    // clearMode
+    CHECK(ps_read64(base, kFlag + 0x70) == kTs); // addr: the taskset
+    CHECK(ps_read8(base, kFlag + 0x7F) == 0);
+    REQUIRE(a.call("_cellSpursEventFlagInitialize", kSpurs, 0, kFlag, 0, 3) == 0);
+    CHECK(ps_read8(base, kFlag + 0x0D) == 1);    // isIwl: attached to the SPURS instance
+    CHECK(ps_read64(base, kFlag + 0x70) == kSpurs);
+    CHECK(a.call("_cellSpursEventFlagInitialize", 0, 0, kFlag, 0, 0) == kTaskNull);
+    CHECK(a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag + 0x40, 0, 0) == kTaskAlign);
+    CHECK(a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag, 2, 0) == kTaskInval);
+    CHECK(a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag, 0, 4) == kTaskInval);
+
+    REQUIRE(a.call("cellSpursShutdownTaskset", kTs) == 0);
+    CHECK(ps_read8(base, kSpurs + 0x80) == 4); // wklState1[0]: REMOVABLE (no SPU was running it)
+    CHECK(ps_read8(base, kSpurs + 0xA0) == 1); // wklEvent1[0]: shutdown bit
+    CHECK(a.call("cellSpursShutdownTaskset", kTs) == 0); // already removable
+    REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+
+    CHECK(a.call("sys_net_initialize_network_ex", kData) == 0);
+    a.call("_sys_process_atexitspawn", 0x10000);
+    a.call("_sys_process_at_Exitspawn", 0x10008);
+
+    CHECK(a.call("cellSheapInitialize", kHeap, 0x80000, 0, 0) == 0);
+    CHECK(a.call("cellSheapInitialize", kHeap + 0x40, 0x80000, 0, 0) == 0xFFFFFFFF80410310ull); // ALIGN
+    CHECK(a.call("cellSheapInitialize", 0, 0x80000, 0, 0) == 0xFFFFFFFF80410302ull);           // INVAL
+
+    a.ctx.gpr[11] = 169; // sys_spu_initialize(6, 0) as GTA V calls it, then an invalid raw SPU count
+    a.ctx.gpr[3] = 6;
+    a.ctx.gpr[4] = 0;
+    ps_ppu_syscall(&a.ctx, base);
+    CHECK(a.ctx.gpr[3] == 0);
+    a.ctx.gpr[11] = 169;
+    a.ctx.gpr[3] = 6;
+    a.ctx.gpr[4] = 6;
+    ps_ppu_syscall(&a.ctx, base);
+    CHECK(a.ctx.gpr[3] == 0xFFFFFFFF80010002ull);
+}

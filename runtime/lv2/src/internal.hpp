@@ -138,6 +138,7 @@ void register_time_syscalls(SyscallTable& table);
 void register_memory_syscalls(SyscallTable& table);
 void register_fs_syscalls(SyscallTable& table);
 void register_vm_syscalls(SyscallTable& table);
+void register_spu_syscalls(SyscallTable& table);
 
 // ---------------------------------------------------------------------------------------------------- helpers
 
@@ -377,6 +378,13 @@ struct Kernel::Impl {
     IdTable containers{kMemContainerIds};
     IdTable fds{kFsIds};
     IdTable vms{kVmIds};
+
+    // sys_spu_initialize's split of the six SPUs (RPCS3 spu_limits_t).
+    struct {
+        std::mutex mutex;
+        u32 max_raw = 0;
+        u32 max_spu = 6;
+    } spu_limits;
 
     std::mutex ipc_mutex;
     std::map<std::pair<u32, u64>, std::weak_ptr<Object>> ipc; // (type, key) -> object

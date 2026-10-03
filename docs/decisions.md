@@ -377,6 +377,16 @@ validate their range, `sys_vm_test` reports every page on memory and the statist
 memory per process. Host memory is committed lazily by the OS, so an untouched virtual range costs nothing on iOS. If
 a game's working set ever outgrows the phone, real paging (decommit on `sys_vm_store`/`invalidate`) is the lever.
 
+## D-039 · 2026-10-03 · cellSheap is native with assumed semantics; only functions a log shows
+
+Run 008. Sony's shared heap (cellSheap) lives in libsre and RPCS3 has no implementation (UNIMPLEMENTED stubs that
+return CELL_OK), so there is no reference for its behaviour or its guest-memory layout. `cellSheapInitialize` keeps
+the heap on the host and writes nothing into the guest range; `cellSheapAllocate` / `cellSheapFree` are left
+unimplemented until a boot log shows them called, so their exact signatures come from the game's own calls rather
+than a guess. To be checked against libsre once the firmware file is available (D-037). Also from run 008: SPURS
+event flag initialize and workload shutdown follow RPCS3; natively no SPU runs a workload yet, so a shutdown makes it
+removable at once and the completion hook (unused by GTA V so far) is logged, not called.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

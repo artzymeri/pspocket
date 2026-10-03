@@ -4,6 +4,8 @@
 // Implemented: what GTA V's first boot log called (docs/runs/004), plus the rest of the lwmutex set that a created
 // lwmutex is used through. Everything else stays unimplemented until a log shows the game calls it (CLAUDE.md rule 4).
 
+#include <atomic>
+
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
@@ -85,6 +87,27 @@ void sys_ppu_thread_exit(PPUContext& ctx, u64 val)
         p->free_tls(static_cast<u32>(ctx.gpr[13]) - kTlsR13Offset);
     }
     lv2::_sys_ppu_thread_exit(t, val); // does not return
+}
+
+// RPCS3 sysPrxForUser.cpp _sys_process_atexitspawn / _sys_process_at_Exitspawn: remember the first function given.
+// They would run around an exitspawn (launching another executable), which pspocket does not do (D-031).
+struct ExitspawnState {
+    std::atomic<u32> atexitspawn{0};
+    std::atomic<u32> at_exitspawn{0};
+};
+
+void _sys_process_atexitspawn(PPUContext&, u32 func)
+{
+    u32 none = 0;
+    HleProcess::current()->state<ExitspawnState>().atexitspawn.compare_exchange_strong(none, func);
+    PS_LOG_DEBUG(kChan, "_sys_process_atexitspawn({:#x})", func);
+}
+
+void _sys_process_at_Exitspawn(PPUContext&, u32 func)
+{
+    u32 none = 0;
+    HleProcess::current()->state<ExitspawnState>().at_exitspawn.compare_exchange_strong(none, func);
+    PS_LOG_DEBUG(kChan, "_sys_process_at_Exitspawn({:#x})", func);
 }
 
 // RPCS3 sysPrxForUser.cpp sys_process_exit. Deviation: RPCS3 first locks the "_lv2ppu" exit mutex that its
@@ -311,6 +334,8 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0x24A1EA07, sys_ppu_thread_create),
         PS_HLE_FUNC(0xAFF080A4, sys_ppu_thread_exit),
         PS_HLE_FUNC(0xE6F2C1E7, sys_process_exit),
+        PS_HLE_FUNC(0x2C847572, _sys_process_atexitspawn),
+        PS_HLE_FUNC(0x96328741, _sys_process_at_Exitspawn),
         PS_HLE_FUNC(0xA2C7BA64, sys_prx_exitspawn_with_level),
         PS_HLE_FUNC(0x8461E528, sys_time_get_system_time),
         PS_HLE_FUNC(0x2F85C0EF, sys_lwmutex_create),

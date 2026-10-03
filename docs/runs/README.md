@@ -12,3 +12,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [005](005-gta5-boot-2-mac.md) | 2026-10-03 | 442ac11 | M4 Mac, pspocket-boot | Past the CRT; next gaps `sys_time_get_system_time`, `cellSysmodule` |
 | [006](006-gta5-boot-4-mac.md) | 2026-10-03 | 8cf53e3 | M4 Mac, pspocket-boot | Two SPURS instances up natively; next gap `sys_vm_memory_map` |
 | [007](007-gta5-boot-5-mac.md) | 2026-10-03 | db14915 | M4 Mac, pspocket-boot | 60 s of game code without a crash; tasksets, thread creation and PSN status requested |
+| [008](008-gta5-boot-6-mac.md) | 2026-10-03 | 246075a | M4 Mac, pspocket-boot | Threads run; Bink tasksets; sheap, network and SPU setup requested |

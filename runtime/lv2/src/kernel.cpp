@@ -412,6 +412,7 @@ Kernel::Impl::Impl(Kernel& k)
     register_memory_syscalls(table);
     register_fs_syscalls(table);
     register_vm_syscalls(table);
+    register_spu_syscalls(table);
     // null_func syscalls (RPCS3 lv2.cpp) that games are seen calling.
     table.bind_null(988, "sys_dbg_..._ppu_exception_handler"); // GTA V's CRT registers a debug exception handler
 }

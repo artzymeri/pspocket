@@ -216,4 +216,7 @@ Result sys_vm_sync(PpuThread& t, u32 addr, u32 size);
 Result sys_vm_test(PpuThread& t, u32 addr, u32 size, u32 result);
 Result sys_vm_get_statistics(PpuThread& t, u32 addr, u32 stat);
 
+// ---- SPU (sys_spu.cpp)
+Result sys_spu_initialize(PpuThread& t, u32 max_usable_spu, u32 max_raw_spu);
+
 } // namespace pspocket::lv2
