@@ -7,7 +7,7 @@ function(pspocket_add_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-foreach(sub core common ppu spu rsx homebrew)
+foreach(sub core common ppu spu lv2 hle rsx homebrew)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${sub}/CMakeLists.txt)
         add_subdirectory(${sub})
     endif()

@@ -132,6 +132,15 @@ will take (plan section 7).
 default, Error to error, Fatal to fault. The test host also mirrors lines to stdout (visible through
 `devicectl ... --console`) and into the self-test report.
 
+## D-018 · 2026-10-03 · Build the game-independent engine before the Phase 0 inventory
+
+The user asked for the whole engine to be built now rather than waiting for a GTA IV dump. Work that every PS3 title
+needs proceeds ahead of the Phase 0 gate: PPU VMX, the SPU interpreter and lifter, the shared reservation system,
+the core lv2 kernel (threads, synchronization, memory, time, filesystem, events), and the RSX command parser and Metal
+backend. Rule 4 still holds for everything title-specific: firmware modules beyond what homebrew and every game use,
+SPU program replacements, patches, and the GTA IV bring-up wait for the inventory. Phase gates remain the measure of
+done; they are no longer the order in which work starts.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
