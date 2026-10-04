@@ -14,3 +14,14 @@ copying it every 5 s (`xcrun devicectl device copy from`).
 
 The phone keeps the Mac's pace on this stretch (interpreters on both): calibration to the semaphore gap in about
 1.5 minutes. No crash, no failed draws in the log.
+
+**Frame rate** (a later boot of the same build, with the frame rate logged every 5 s): 6 to 9 fps during the opening
+animation (a Bink video decoded on SPUs), then 29.7 to 29.9 fps on the loading screens, the game's own 30 fps cap.
+
+**Where the phone's time goes** (Instruments Time Profiler, 10 s during the opening animation, recorded from the Mac
+with `xcrun xctrace record --attach PSPocket`): all six cores are busy. The six SPURS workers take about 88% of the CPU
+(each a full core); the PPU threads about 10%; the RSX about 1%. On four of the workers, 30 to 50% of the time is the
+kernel's workload selection and another 25 to 35% policy overhead: polling, not game work (GTA V's own policy module
+looking for work, D-064). The PPU interpreter spends about a quarter of its time decoding instructions. Two fixes for
+when the game is playable and frame rates can be measured in the game itself: let idle SPU workers sleep instead of
+spinning, and run translated code (PPU and SPU lifting) instead of the interpreters.
