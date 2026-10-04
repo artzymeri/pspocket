@@ -40,6 +40,7 @@ struct Fixture {
 
     explicit Fixture(hle::ProcessConfig config = {})
     {
+        config.spurs_workers = false; // these tests check the SPURS PPU API alone (test_spurs_run.cpp runs tasks)
         REQUIRE(mem.reserve());
         kernel = std::make_unique<lv2::Kernel>(mem);
         kernel->install();
@@ -312,7 +313,7 @@ TEST_CASE("cellSpurs stage 1: attributes, native initialize, finalize", "[hle][s
     CHECK(ps_read32(base, kSpurs + 0xD80) == 1);        // flags: SAF_EXIT_IF_NO_WORK from exitIfNoWork
     CHECK(ps_read8(base, kSpurs + 0x74) == 0x80);       // flags1: SF1_EXIT_IF_NO_WORK
     CHECK(ps_read32(base, kSpurs + 0xB0) == 0xFFFF);    // wklEnabled
-    CHECK(ps_read32(base, kSpurs + 0x60) == 0xFFFFFFFFu); // wklFlag.flag
+    CHECK(ps_read32(base, kSpurs + 0x6C) == 0xFFFFFFFFu); // wklFlag.flag (CellSpursWorkloadFlag at 0x60, flag at +0xC)
     CHECK(ps_read8(base, kSpurs + 0x77) == 0xFF);       // wklFlagReceiver
     CHECK(ps_read64(base, kSpurs + 0xD20) == 0xFFFFFFFFull); // ppu0
     CHECK(ps_read8(base, kSpurs + 0xC7) == 0xFF);       // sysSrvPreemptWklId[7]

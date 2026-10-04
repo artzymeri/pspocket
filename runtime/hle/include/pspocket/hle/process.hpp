@@ -65,6 +65,9 @@ struct ProcessConfig {
     // Abort on the first call to an unimplemented function instead of logging and returning CELL_ENOSYS.
     bool abort_on_unimplemented = false;
     GameInfo game;
+    // Start the native SPURS scheduler's workers with each SPURS instance (they run the SPU tasks). Tests of the PPU
+    // API alone turn them off.
+    bool spurs_workers = true;
 };
 
 class HleProcess {

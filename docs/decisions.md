@@ -590,6 +590,58 @@ it stays at rest. A connected controller is the right default for an app that al
 
 This settles how input reaches the game, not the open question of whether a hardware controller is required.
 
+## D-050 · 2026-10-04 · Native SPURS runs SPU tasks: host workers and a taskset policy that follows libsre
+
+Runs 020 and 021 (D-037 stage 3b). Each SPURS instance gets one host worker per SPU (`spurs_scheduler.cpp`). A worker
+is a pthread with an SPU context and 256 KB of local store.
+- **Selection.** A worker picks a workload by the SPURS kernel's rules (RPCS3 `spursKernel1SelectWorkload`), using the
+  guest CellSpurs line 0 (ready counts, signals, the workload flag, contention). It updates that line through the
+  reservation system.
+- **Idle.** An idle worker sleeps in `ps_res_wait_change` on that line: any ready count, signal or flag change from PPU
+  HLE, SPU code (PUTLLC) or another worker wakes it, which is what the SPURS kernel's idle loop waits on too.
+- **Not reproduced.** The system service never runs: its message is acknowledged, and workload state is read directly.
+  Pending contention is not tracked, and SPURS2 has no scheduler yet.
+
+**The taskset policy** (`spurs_taskset.cpp`) follows libsre's taskset policy module, read from the firmware, field by
+field. RPCS3's `cellSpursSpu.cpp` is an unwired draft that differs in several places (sparse context blocks, LS cleared
+at every start, exit-handler sizes, the receive-flag syscall).
+- What task code sees is libsre's: the kernel context at LS 0x100 and the taskset context at 0x2700, the task image
+  with libsre's ELF-loader checks, and the registers at entry.
+- The syscall entry at 0xA70 is a `stop` the worker takes: 0 exit, 1 yield, 2 wait for a signal, 3 poll, 4 receive the
+  workload flag.
+- The task bits change on the guest taskset line with libsre's state machine, and ready counts are updated after every
+  request.
+- A task that yields or waits is saved to its own context save area exactly as libsre saves it: 0x380 bytes, then the
+  pattern's blocks, packed. It resumes on any worker with $3 = 0.
+
+**Waking tasks from the PPU.** `cellSpursEventFlagSet` writes each released task's events and sends it a signal
+(`_cellSpursSendSignal`), replacing D-040's deliberate fatal stop.
+
+**Events to the PPU.** SPU code's interrupt-mailbox events (`sys_spu_thread_throw_event` / `send_event`) reach lv2
+event queues through the instance's SPU port map (D-040).
+
+**SPU runtime hooks.** Contexts can have their own stop and interrupt-mailbox handlers (`SPUContext::hooks`), so SPURS
+workers don't take over the process-wide ones, which lv2's SPU threads will need.
+
+**Tests and a bug found.** The tests run hand-assembled SPU tasks that exit, wait and resume, get woken by an event
+flag, throw events, and yield to each other. They found a lost-update bug in the ready-count update: the running total
+was changed inside a retried reservation update, so a retry after another writer's store dropped the increment. A
+regression test forces those retries.
+
+## D-051 · 2026-10-04 · Custom workloads: a game's own policy module runs on a worker
+
+Run 021. GTA V adds a workload with its own SPU policy module (`cellSpursAddWorkload`: 0x11B0 bytes, priority 12 on
+SPUs 0-3, contention 5). Since it is game code, the worker runs it rather than imitating it.
+- **Loading and entry.** The image is loaded at LS 0xA00, and reloaded only when another module was there, as libsre's
+  kernel does. It is entered with the kernel's registers: $0 = 0x804, $1 = 0x3FFB0, $3 = 0x100, $4 = its argument,
+  $5 = the poll status.
+- **Kernel entry points.** The kernel's entry points it can reach are `stop`s the worker answers: select (0x290, via
+  `[0x1E4]`), its return (0x804) and exit (0x808, via `[0x1E0]`).
+- **Work arrives** through `cellSpursReadyCountStore` and the workload flag (`_cellSpursWorkloadFlagReceiver`,
+  `cellSpursGetWorkloadFlag`), both checked against libsre.
+- **Offset fix.** The workload flag word is at CellSpurs 0x6C, inside the 16-byte CellSpursWorkloadFlag at 0x60; it
+  was read at 0x60 before.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
