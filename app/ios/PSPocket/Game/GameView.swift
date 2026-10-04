@@ -59,8 +59,8 @@ struct GameView: View {
     }
 }
 
-/// The running game, full screen: its frames scaled to fit, the on-screen buttons over them while no controller is
-/// connected, and (tap with two fingers) a small status and log overlay.
+/// The running game, full screen: its frames scaled to fit, the frame rate in a corner, the on-screen buttons over them
+/// while no controller is connected, and (double tap) a small status and log overlay.
 struct GameScreen: View {
     @Environment(GameModel.self) private var game
     @State private var showInfo = false
@@ -75,6 +75,14 @@ struct GameScreen: View {
                     .padding(.horizontal, 28)
                     .padding(.vertical, 14)
             }
+            Text(String(format: "%.0f fps", game.fps))
+                .font(.caption2.monospacedDigit().bold())
+                .foregroundStyle(.white.opacity(0.75))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(.black.opacity(0.4), in: Capsule())
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .padding(8)
             if showInfo {
                 info
             }
@@ -86,7 +94,7 @@ struct GameScreen: View {
 
     private var info: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(String(format: "%.0f s · %llu frames · %@", game.seconds, game.flips,
+            Text(String(format: "%.0f s · %llu frames · %.1f fps · %@", game.seconds, game.flips, game.fps,
                         game.controllerName ?? "on-screen buttons"))
                 .font(.caption.bold())
             Text(game.logTail.split(separator: "\n").suffix(8).joined(separator: "\n"))

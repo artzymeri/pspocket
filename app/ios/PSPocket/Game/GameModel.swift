@@ -22,6 +22,8 @@ final class GameModel {
     private(set) var running = false
     private(set) var flips: UInt64 = 0
     private(set) var seconds = 0.0
+    /// Frames the game presented per second, over the last refresh (half a second).
+    private(set) var fps = 0.0
     private(set) var logTail = ""
     /// The connected game controller's name, or nil (the on-screen buttons show then).
     private(set) var controllerName: String?
@@ -144,12 +146,16 @@ final class GameModel {
         OrientationLock.landscape()
         sendPad()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refresh() }
+        refresh()
     }
 
     private func refresh() {
         var stats = ps_game_stats()
         ps_game_get_stats(&stats)
         running = stats.running != 0
+        if stats.seconds > seconds {
+            fps = Double(stats.flips - min(flips, stats.flips)) / (stats.seconds - seconds)
+        }
         flips = stats.flips
         seconds = stats.seconds
         var tail = [CChar](repeating: 0, count: 6000)

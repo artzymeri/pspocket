@@ -58,7 +58,12 @@ struct Session {
     std::atomic<bool> running{false};
     std::atomic<u64> flips{0};
     CAMetalLayer* layer = nil;
+    // The frame rate line in the log (written from the present callback, on the RSX thread only).
+    std::chrono::steady_clock::time_point rate_since;
+    u64 rate_flips = 0;
 };
+
+constexpr auto kRateInterval = std::chrono::seconds(5);
 
 Session* g_session = nullptr; // one game per process, never destroyed
 
@@ -183,7 +188,15 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         rsx::metal::MetalBackendConfig mc;
         mc.device = (__bridge void*)device;
         mc.present = [raw](const rsx::metal::PresentFrame& f) {
-            raw->flips.fetch_add(1, std::memory_order_relaxed);
+            const u64 flips = raw->flips.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - raw->rate_since >= kRateInterval) {
+                const double dt = std::chrono::duration<double>(now - raw->rate_since).count();
+                PS_LOG_INFO(kChan, "{:.1f} fps ({} frames in {:.1f} s; {} since the boot)",
+                    static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips, dt, flips);
+                raw->rate_since = now;
+                raw->rate_flips = flips;
+            }
             CAMetalLayer* layer = raw->layer;
             if (!layer) return;
             id<MTLTexture> src = (__bridge id<MTLTexture>)f.texture;
@@ -237,6 +250,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     install_fault_handler();
     u32 main_id = 0;
     s->start = std::chrono::steady_clock::now();
+    s->rate_since = s->start;
     s->running = true;
     g_session = s.release();
     if (const lv2::Result r = loader::start_main_thread(g_session->exe, *g_session->kernel, g_session->state, {},
