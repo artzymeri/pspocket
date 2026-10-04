@@ -51,7 +51,8 @@
 // - Timing: RPCS3 without buffering schedules period k at start + k * 5333 us and runs late periods back to back.
 //   Here the fixed clock is exact (256 / 48000 s). A thread more than 100 ms late skips the missed periods instead of
 //   running them in a burst, as the GCM vblank thread does. Buffering mode leaves out RPCS3's alignment of a restart
-//   to the global 5.33 ms clock and its time stretching (off by default).
+//   to the global 5.33 ms clock, and replaces its time stretching (off by default) with the ps3-ios-engine port's
+//   follow-the-game tempo when the sink has a stretcher (D-075).
 // - Output: RPCS3 mixes every period into its ring buffer, and buffering depends on its backend. Here the mix
 //   (RPCS3's mix<STEREO, ...>) runs only while a host sink is attached, and buffering only while the sink has a
 //   buffer query (pspocket/hle/audio.hpp).
@@ -241,9 +242,10 @@ struct AudioState {
     u32 add_data_calls = 0; // since the last sound line (buffering mode)
     u32 doubled = 0;        // blocks played with more than one cellAudioAddData in them, since the last sound line
 
-    std::mutex sink_mutex; // held while the sink or its query runs
+    std::mutex sink_mutex; // held while the sink, its query or its stretcher runs
     AudioSink sink;
     AudioBufferQuery query;
+    AudioStretch stretch;
     std::atomic<bool> has_sink{false};
     std::atomic<bool> buffered{false}; // a sink with a query: buffering mode
 };
@@ -382,12 +384,15 @@ struct Buffering {
     u64 last_period_end = 0; // host clock, us
     f32 average_us = 0.0f;   // what the host held after the periods, rolling average
     u64 desired_us = audio_buffering::desired_buffer_us(0);
+    audio_buffering::Stretch stretch; // D-075
     // The sound line, every 5 s: periods by kind, those that waited for the game and the longest wait, and the range
     // the host's buffer stayed in.
     u64 log_since = 0;
     u32 mixed = 0, audible = 0, silent = 0, skipped = 0, late = 0;
     u64 wait_start = 0, longest_wait = 0;
     u32 low = ~0u, high = 0;
+    u32 stretched = 0;     // periods played through the stretcher
+    f32 slowest = 1.0f;    // the lowest tempo
 };
 
 u64 host_us()
@@ -403,6 +408,20 @@ AudioBufferLevel buffer_level(AudioState& s)
 {
     std::lock_guard lock(s.sink_mutex);
     return s.query ? s.query() : AudioBufferLevel{};
+}
+
+// How long what the host holds lasts at the speaker: longer while it plays stretched.
+u64 speaker_us(u32 frames, const audio_buffering::Stretch& st)
+{
+    const u64 us = playtime_us(frames);
+    return st.on ? static_cast<u64>(static_cast<f32>(us) / st.tempo) : us;
+}
+
+// Hands the stretcher its setting (nothing without a stretcher).
+void apply_stretch(AudioState& s, const audio_buffering::Stretch& st)
+{
+    std::lock_guard lock(s.sink_mutex);
+    if (s.stretch) s.stretch(st.on, st.tempo);
 }
 
 // Waits `us`; false when the run was told to stop meanwhile.
@@ -449,10 +468,18 @@ bool buffered_turn(AudioState& s, Runner& r, Buffering& b, MixBlock& mix, std::v
             std::lock_guard lock(s.sink_mutex);
             for (u32 i = 0; s.sink && i < ab::restart_blocks(b.desired_us); i++) s.sink(mix.data(), kAudioBlockFrames);
         }
+        b.stretch = {};
+        apply_stretch(s, b.stretch);
         b.average_us = static_cast<f32>(playtime_us(buffer_level(s).queued));
         b.last_period_end = now;
         b.log_since = now;
         return true;
+    }
+    // Time stretching (D-075): the tempo follows the game's pace, trimmed toward the target fill.
+    u64 enqueued_us = speaker_us(level.queued, b.stretch);
+    if (b.stretch.update(static_cast<f32>(enqueued_us) / ab::adjusted_target_us(b.average_us, b.desired_us), now)) {
+        apply_stretch(s, b.stretch);
+        enqueued_us = speaker_us(level.queued, b.stretch);
     }
     ab::TagCount tags;
     {
@@ -460,8 +487,7 @@ bool buffered_turn(AudioState& s, Runner& r, Buffering& b, MixBlock& mix, std::v
         if (s.runner.get() != &r) return false;
         tags = count_tags(s);
     }
-    const ab::Decision d =
-        ab::decide(now - b.last_period_end, playtime_us(level.queued), b.average_us, b.desired_us, tags);
+    const ab::Decision d = ab::decide(now - b.last_period_end, enqueued_us, b.average_us, b.desired_us, tags);
     Output out = Output::Mix;
     switch (d.step) {
     case ab::Step::WaitForGame:
@@ -474,9 +500,10 @@ bool buffered_turn(AudioState& s, Runner& r, Buffering& b, MixBlock& mix, std::v
     case ab::Step::Mix: out = Output::Mix; break;
     }
     if (!run_period(s, r, mix, notify, out, true)) return false;
+    b.stretch.period(now - b.last_period_end, b.wait_start != 0, out != Output::None);
     b.last_period_end = now;
     level = buffer_level(s);
-    b.average_us = ab::kPeriodAverageAlpha * static_cast<f32>(playtime_us(level.queued)) +
+    b.average_us = ab::kPeriodAverageAlpha * static_cast<f32>(speaker_us(level.queued, b.stretch)) +
                    (1.0f - ab::kPeriodAverageAlpha) * b.average_us;
 
     b.mixed += out == Output::Mix;
@@ -490,6 +517,10 @@ bool buffered_turn(AudioState& s, Runner& r, Buffering& b, MixBlock& mix, std::v
     }
     b.low = std::min(b.low, level.queued);
     b.high = std::max(b.high, level.queued);
+    if (b.stretch.on) {
+        b.stretched++;
+        b.slowest = std::min(b.slowest, b.stretch.tempo);
+    }
     if (now - b.log_since >= kSoundLogIntervalUs) {
         u32 added = 0, doubled = 0;
         {
@@ -500,16 +531,18 @@ bool buffered_turn(AudioState& s, Runner& r, Buffering& b, MixBlock& mix, std::v
         PS_LOG_INFO(kChan, "sound: {} periods in {:.1f} s ({} mixed, {} of them not silent; {} silent; {} skipped: "
                            "the game was too late); {} waited for the game, the longest {:.1f} ms; {} "
                            "cellAudioAddData, {} blocks with two or more; the host held {:.0f} to {:.0f} ms (target "
-                           "{} ms)",
+                           "{} ms); the game's pace {:.2f}, {} periods stretched, the slowest at {:.2f}",
             b.mixed + b.silent + b.skipped, static_cast<double>(now - b.log_since) / 1e6, b.mixed, b.audible,
             b.silent, b.skipped, b.late, static_cast<double>(b.longest_wait) / 1e3, added, doubled,
             static_cast<double>(playtime_us(b.low)) / 1e3, static_cast<double>(playtime_us(b.high)) / 1e3,
-            b.desired_us / 1000);
+            b.desired_us / 1000, b.stretch.pace, b.stretched, b.slowest);
         b.log_since = now;
         b.mixed = b.audible = b.silent = b.skipped = b.late = 0;
         b.longest_wait = 0;
         b.low = ~0u;
         b.high = 0;
+        b.stretched = 0;
+        b.slowest = 1.0f;
     }
     return true;
 }
@@ -956,15 +989,17 @@ s32 cellAudioAddData(PPUContext& ctx, u32 port_num, u32 src, u32 samples)
 
 } // namespace
 
-void set_audio_sink(HleProcess& process, AudioSink sink, AudioBufferQuery query)
+void set_audio_sink(HleProcess& process, AudioSink sink, AudioBufferQuery query, AudioStretch stretch)
 {
     AudioState& s = process.state<AudioState>();
     if (!sink) query = {};
+    if (!query) stretch = {};
     std::lock_guard lock(s.sink_mutex);
     s.has_sink.store(static_cast<bool>(sink), std::memory_order_release);
     s.buffered.store(static_cast<bool>(query), std::memory_order_release);
     s.sink = std::move(sink);
     s.query = std::move(query);
+    s.stretch = std::move(stretch);
 }
 
 void register_cellAudio(Registry& r)

@@ -37,6 +37,7 @@
 // (CLAUDE.md rule 4). Where libsre would touch a bad pointer, initialize refuses the call with TASK_ERROR_FAULT and a
 // log of the call site (D-042).
 
+#include <atomic>
 #include <cstring>
 #include <format>
 #include <string_view>
@@ -105,12 +106,15 @@ s32 _cellSpursSemaphoreInitialize(PPUContext& ctx, u32 spurs, u32 taskset, u32 s
     ps_write64(base, semaphore + sem_off::spurs, spurs);
     __atomic_thread_fence(__ATOMIC_RELEASE); // libsre's lwsync
     ps_res_notify_write(semaphore, CELL_SPURS_SEMAPHORE_SIZE);
-    if (spurs) {
-        PS_LOG_INFO(kChan, "SPURS semaphore {:#010x} of SPURS {:#x} (taskset {:#x}): {} units", semaphore, spurs,
-            taskset, total);
-    } else {
-        PS_LOG_INFO(kChan, "SPURS semaphore {:#010x} of taskset {:#x} (workload {}): {} units", semaphore, taskset,
-            ps_read32(base, taskset + ts_off::wid), total);
+    static std::atomic<u64> made{0}; // the first 8 and every 1024th: GTA V makes hundreds a second in its missions
+    if (const u64 n = ++made; n <= 8 || n % 1024 == 0) {
+        if (spurs) {
+            PS_LOG_INFO(kChan, "SPURS semaphore {:#010x} of SPURS {:#x} (taskset {:#x}): {} units (semaphore {})",
+                semaphore, spurs, taskset, total, n);
+        } else {
+            PS_LOG_INFO(kChan, "SPURS semaphore {:#010x} of taskset {:#x} (workload {}): {} units (semaphore {})",
+                semaphore, taskset, ps_read32(base, taskset + ts_off::wid), total, n);
+        }
     }
     return lv2::CELL_OK;
 }

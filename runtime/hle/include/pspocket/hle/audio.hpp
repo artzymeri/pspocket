@@ -10,7 +10,8 @@
 // - A sink with a buffer query (what the host holds between cellAudio and the device): RPCS3's buffering mode. The
 //   periods keep the host's buffer at its target (34 ms, or more for a device that takes more at once), and each one
 //   waits briefly for the game to finish writing its blocks, so a game that runs a little late still plays whole
-//   blocks.
+//   blocks. With a stretcher too, a game that delivers its audio slower than real time is played slower, at its pace,
+//   instead of with gaps (D-075).
 // - No sink, or one without a query (a capture): RPCS3 without buffering, a fixed clock of exactly 256 / 48000 s.
 //   Without a sink nothing is mixed.
 
@@ -40,9 +41,14 @@ struct AudioBufferLevel {
 // Called on cellAudio's thread, often (up to every half millisecond while it waits for the game): it must be quick.
 using AudioBufferQuery = std::function<AudioBufferLevel()>;
 
+// The host's time stretcher, used with a query (D-075). On: play what the host holds at `tempo` times real time (0.25
+// to 1), keeping the pitch; `queued` then lasts 1 / tempo times longer. Off: play it unprocessed. Called on
+// cellAudio's thread when the setting changes, and with off when buffering mode starts.
+using AudioStretch = std::function<void(bool on, f32 tempo)>;
+
 // Attaches the host's audio output to the process's cellAudio, replacing the previous one; an empty sink detaches it
-// (and its query). Thread-safe. Once it returns, the previous sink and query are no longer called. A sink or query
-// must not call it.
-void set_audio_sink(HleProcess& process, AudioSink sink, AudioBufferQuery query = {});
+// (and its query and stretcher). Thread-safe. Once it returns, the previous sink, query and stretcher are no longer
+// called. None of them may call it.
+void set_audio_sink(HleProcess& process, AudioSink sink, AudioBufferQuery query = {}, AudioStretch stretch = {});
 
 } // namespace pspocket::hle

@@ -17,6 +17,7 @@
 // Not implemented (GTA V's tasks don't use them; each stops with a fatal log): CellSpursTaskset2 tasks and exit
 // callbacks (exit-code containers), which run more of libsre's SPU code; elf bit 1 (a debugger break) is logged.
 
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <format>
@@ -275,8 +276,13 @@ void Policy::start_task(u32 id, u64 elf)
     ps_write32(ls_, ls::ctx_exit_code, 0);
     ps_write32(ls_, ls::ctx_flags, flags & 5);
 
-    PS_LOG_INFO(kTaskChan, "SPURS {:#x} SPU {}: task {} of taskset {:#x} (workload {}) starts: ELF {:#x}, entry 0x{:05x}",
-        w_.sched.spurs, w_.spu_num, id, taskset_, wid_, static_cast<u32>(elf & ~7ull), entry);
+    // The first 8 and every 1024th: in its first mission GTA V starts thousands of tasks a second.
+    static std::atomic<u64> starts{0};
+    if (const u64 n = ++starts; n <= 8 || n % 1024 == 0) {
+        PS_LOG_INFO(kTaskChan, "SPURS {:#x} SPU {}: task {} of taskset {:#x} (workload {}) starts: ELF {:#x}, entry "
+                               "0x{:05x} (task start {})",
+            w_.sched.spurs, w_.spu_num, id, taskset_, wid_, static_cast<u32>(elf & ~7ull), entry, n);
+    }
     SPUContext& c = w_.ctx;
     for (auto& r : c.gpr) r = ps_spu_v128{};
     c.gpr[0] = word0(entry);

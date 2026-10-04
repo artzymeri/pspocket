@@ -1069,6 +1069,32 @@ in), and the iOS FPS line counts the speaker's underruns. What this can't fix: a
 audio runs slower than real time for long stretches lets the speaker run dry (gaps, not buzz); RPCS3's answer is time
 stretching, not done yet.
 
+## D-075 · 2026-10-04 · Time stretching while the game is behind: the ps3-ios-engine port's follow-the-game tempo
+
+D-074 plays the game's blocks whole, but GTA V delivers its audio slower than real time on the loading screens (55 to
+75% on the Mac, 20% in the heaviest stretch), so the speaker kept running dry: about 500 underruns in 100 s. RPCS3
+answers that with time stretching (an option, off by default): SoundTouch slows the output while its buffer is low,
+moving the tempo halfway to the buffer's fill in steps of 0.1, which swings between the game's pace and real time. The
+ps3-ios-engine port replaced that rule with one that follows the game, tuned on the iPhone, and that is what runs here
+(`audio_buffering.hpp`, `Stretch`):
+- The game's pace is measured from the periods, averaged over 0.7 s: a period that waited for the game counts at
+  nominal / actual length, one that didn't at least 1 (a period stretched to 1.2 because the buffer is full isn't
+  slowness), a skipped one at 0; periods of half a second or more are pauses and don't count.
+- Stretching starts below a pace of 0.95 (or with the buffer under 30% full while the game isn't ahead) and stops once
+  the pace has stayed at 0.98 or more with the buffer at least 60% full for 2 s: every switch splices the audio once.
+- While on, the tempo is the pace trimmed toward the target fill (30% per 100% of fill error), 1 from 0.98 up, never
+  below 0.25 (slower than that, the speaker runs dry instead); changes under 0.02 aren't passed on.
+- cellAudio counts what the host holds at the speaker's tempo (it lasts 1 / tempo longer), for the period length too.
+
+The stretcher is the host's: a sink may come with an `hle::AudioStretch` (on or off, and the tempo).
+`platform::AudioOutput` puts an AVAudioUnitTimePitch between its source node and the mixer, bypassed while off, so the
+audio is untouched while the game keeps up. Run 045 (`boot-047.log`, 120 s on the Mac): the pace went from 1.07 at the
+opening to 0.7 on the loading screens and 0.2 at the heaviest, the tempo followed it down to the floor, and the speaker
+ran dry 69 times instead of about 500.
+
+Also: SPURS task creation, task starts and semaphore setups are logged the first 8 times and every 1024th. In the first
+mission GTA V starts thousands of tasks a second, and run 044's mission log grew by 80,000 lines in a few minutes.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

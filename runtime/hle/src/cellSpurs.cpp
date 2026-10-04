@@ -13,6 +13,7 @@
 // RPCS3's 0xFFFFFFFF "no thread"). Workloads, tasksets, tasks, job chains and SPU execution come next.
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <format>
@@ -906,8 +907,12 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
             "here and aborts the process", what, spurs, id, taskset, static_cast<u32>(woken));
     }
     ps_write32(base, task_id_out, id);
-    PS_LOG_INFO(kChan, "task {} of taskset {:#010x} (workload {}): ELF {:#x}, context {:#x} ({:#x} bytes, {} LS blocks); "
-        "ready", id, taskset, wid, s.elf, s.context, s.context_size, saved_blocks);
+    static std::atomic<u64> created{0}; // the first 8 and every 1024th, as the task starts (spurs_taskset.cpp)
+    if (const u64 n = ++created; n <= 8 || n % 1024 == 0) {
+        PS_LOG_INFO(kChan, "task {} of taskset {:#010x} (workload {}): ELF {:#x}, context {:#x} ({:#x} bytes, {} LS "
+                           "blocks); ready (task {} created)",
+            id, taskset, wid, s.elf, s.context, s.context_size, saved_blocks, n);
+    }
     return lv2::CELL_OK;
 }
 

@@ -173,16 +173,22 @@ inline u64 desired_buffer_us(u32 device_frames)
 // cfg.desired_full_buffers: the silent blocks a (re)start queues.
 inline u32 restart_blocks(u64 desired_us) { return static_cast<u32>(desired_us / kPeriodUs) + 3; }
 
+// What the host's buffer is compared with (RPCS3 desired_duration_adjusted): the target plus half a period. RPCS3
+// divides the average of what the host held (us) by cfg.audio_buffer_length, a stereo block's sample count (512): only
+// a host buffer that has stayed all but empty raises the target, by up to 4 times.
+inline f32 adjusted_target_us(f32 average_us, u64 desired_us)
+{
+    const f32 average_ratio = average_us / static_cast<f32>(2 * kBlockSamples);
+    f32 desired = static_cast<f32>(desired_us) + static_cast<f32>(kPeriodUs) / 2.0f;
+    if (average_ratio < 1.0f) desired /= std::max(average_ratio, 0.25f);
+    return desired;
+}
+
 // The period length: shorter while the host holds less than the target (down to half a period, quadratically), longer
 // while it holds more (up to 1.2 periods). `average_us`: the rolling average of what the host held after each period.
 inline u64 dynamic_period_us(u64 enqueued_us, f32 average_us, u64 desired_us)
 {
-    // RPCS3 divides the average (us) by cfg.audio_buffer_length, a stereo block's sample count (512): only a host
-    // buffer that has stayed all but empty raises the target, by up to 4 times.
-    const f32 average_ratio = average_us / static_cast<f32>(2 * kBlockSamples);
-    f32 desired = static_cast<f32>(desired_us) + static_cast<f32>(kPeriodUs) / 2.0f;
-    if (average_ratio < 1.0f) desired /= std::max(average_ratio, 0.25f);
-    const f32 rate = static_cast<f32>(enqueued_us) / desired; // 1: exactly the target
+    const f32 rate = static_cast<f32>(enqueued_us) / adjusted_target_us(average_us, desired_us); // 1: the target
     if (rate >= 1.0f) {
         return kMaxPeriodUs - static_cast<u64>(static_cast<f32>(kMaxPeriodUs - kPeriodUs) * (1.0f / rate));
     }
@@ -226,5 +232,79 @@ inline Decision decide(u64 since_us, u64 enqueued_us, f32 average_us, u64 desire
     if (!waited_long_enough && tags.in_progress > 0) return {Step::WaitForWrites, kWaitForWritesUs};
     return {Step::Mix};
 }
+
+// ---- time stretching (D-075)
+//
+// While the game delivers its audio slower than real time, the speaker plays it slower (keeping the pitch) instead of
+// running dry: the ps3-ios-engine port's follow-the-game tempo (its cellAudio.cpp, g_cellaudio_follow_game), which
+// replaced RPCS3's own rule there (a tempo that moves halfway to the buffer's fill in steps of 0.1 swings between the
+// game's pace and real time). The game's pace is measured from the periods, the tempo follows it, trimmed toward the
+// target fill, and stretching switches on only once the game falls behind and off once it has kept pace for 2 s, since
+// every switch splices the audio once.
+
+inline constexpr f32 kPaceTimeConstantUs = 700'000.0f; // the pace's average (Citra's 0.7 s)
+inline constexpr u64 kPaceMaxPeriodUs = 500'000;       // a longer period is a pause or a restart, not the game's pace
+inline constexpr f32 kFillTimeConstantUs = 500'000.0f; // the switch looks at a 0.5 s average of the fill
+inline constexpr f32 kMinTempo = 0.25f;                // slower than this, the speaker runs dry instead
+inline constexpr f32 kFillTrim = 0.3f;                 // 30% faster or slower per 100% of fill error
+inline constexpr f32 kTempoStep = 0.02f;               // smaller changes are inaudible (and re-plan the stretcher)
+inline constexpr f32 kStretchStartPace = 0.95f;        // start below this pace,
+inline constexpr f32 kStretchStartFill = 0.3f;         // or with the fill below this while the game isn't ahead
+inline constexpr f32 kStretchStartFillPace = 0.99f;
+inline constexpr f32 kStretchStopPace = 0.98f;         // stop once the pace and the fill stay above these
+inline constexpr f32 kStretchStopFill = 0.6f;
+inline constexpr u64 kStretchCalmUs = 2'000'000;       // for this long
+
+struct Stretch {
+    f32 pace = 1.0f; // the game's delivery rate as a share of real time
+    f32 fill = 1.0f; // the host's buffer vs the adjusted target, 0.5 s average
+    u64 fill_at = 0; // when `fill` was last updated (us; 0: never)
+    bool on = false; // playing through the stretcher
+    u64 calm_since = 0;
+    f32 tempo = 1.0f; // the stretcher's tempo while on
+
+    // After each period, `dt_us` after the previous one: whether it waited for the game, and whether it played
+    // anything. A period that waited lasted as long as the game took to deliver: its pace is nominal / actual. One
+    // that didn't wait was on time: at least 1, whatever length the buffer management chose (1.2 periods when the
+    // buffer is full must not read as slowness). A skipped period delivered nothing.
+    void period(u64 dt_us, bool waited, bool played)
+    {
+        if (!dt_us || dt_us >= kPaceMaxPeriodUs) return;
+        const f32 pace_now = static_cast<f32>(kPeriodUs) / static_cast<f32>(dt_us);
+        const f32 rate = !played ? 0.0f : waited ? std::min(pace_now, 1.0f) : std::clamp(pace_now, 1.0f, 2.0f);
+        pace += (1.0f - std::exp(-static_cast<f32>(dt_us) / kPaceTimeConstantUs)) * (rate - pace);
+    }
+
+    // Each turn, at `now_us`, with the host holding `fill_now` of the adjusted target. Returns true when the speaker's
+    // setting changed (`on`, or `tempo` while on).
+    bool update(f32 fill_now, u64 now_us)
+    {
+        const u64 dt = fill_at ? std::min<u64>(now_us - fill_at, 500'000) : 500'000;
+        fill += (1.0f - std::exp(-static_cast<f32>(dt) / kFillTimeConstantUs)) * (fill_now - fill);
+        fill_at = now_us;
+        const bool was_on = on;
+        if (!on) {
+            if (pace < kStretchStartPace || (fill < kStretchStartFill && pace < kStretchStartFillPace)) {
+                on = true;
+                calm_since = 0;
+            }
+        } else if (pace >= kStretchStopPace && fill >= kStretchStopFill) {
+            if (!calm_since) calm_since = now_us;
+            else if (now_us - calm_since >= kStretchCalmUs) on = false;
+        } else {
+            calm_since = 0;
+        }
+        if (!on) {
+            tempo = 1.0f;
+            return was_on;
+        }
+        // The pace the game delivers at, trimmed toward the target fill; near 1, exactly 1.
+        const f32 wanted = std::clamp(pace * (1.0f + kFillTrim * (fill_now - 1.0f)), kMinTempo, 1.0f);
+        const f32 target = wanted >= 0.98f ? 1.0f : wanted;
+        if (was_on && std::abs(target - tempo) < kTempoStep && !(target == 1.0f && tempo != 1.0f)) return false;
+        tempo = target;
+        return true;
+    }
+};
 
 } // namespace pspocket::hle::audio_buffering

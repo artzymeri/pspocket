@@ -493,7 +493,8 @@ int main(int argc, char** argv)
         platform::AudioOutput* out = audio_output.get();
         hle::set_audio_sink(
             hle, [out](const f32* samples, u32 frames) { out->push(samples, frames); },
-            [out] { return hle::AudioBufferLevel{out->queued(), out->device_frames()}; });
+            [out] { return hle::AudioBufferLevel{out->queued(), out->device_frames()}; },
+            [out](bool on, f32 tempo) { out->set_stretch(on, tempo); });
     }
     struct DetachAudio {
         hle::HleProcess& hle;

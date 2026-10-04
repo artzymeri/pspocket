@@ -253,7 +253,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
 
     // Sound: the playback category (it plays with the ring/silent switch on) and a speaker that takes a cellAudio
     // period at a time (iOS's default, about 20 ms per callback, would swing the 34 ms buffer by more than half), then
-    // cellAudio's mix to the speaker, paced by what it holds (D-074).
+    // cellAudio's mix to the speaker, paced by what it holds (D-074) and stretched while the game is behind (D-075).
     NSError* audio_error = nil;
     AVAudioSession* session = [AVAudioSession sharedInstance];
     if (![session setCategory:AVAudioSessionCategoryPlayback error:&audio_error] ||
@@ -269,7 +269,8 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         platform::AudioOutput* out = s->audio.get();
         hle::set_audio_sink(
             *s->hle, [out](const f32* samples, u32 frames) { out->push(samples, frames); },
-            [out] { return hle::AudioBufferLevel{out->queued(), out->device_frames()}; });
+            [out] { return hle::AudioBufferLevel{out->queued(), out->device_frames()}; },
+            [out](bool on, f32 tempo) { out->set_stretch(on, tempo); });
     }
 
     loader::LoadReport report;

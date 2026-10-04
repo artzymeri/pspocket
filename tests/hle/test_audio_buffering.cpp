@@ -1,7 +1,8 @@
 // cellAudio's buffering mode, the decisions (runtime/hle/src/audio_buffering.hpp, D-074), against RPCS3's
 // count_port_buffer_tags and the buffering branch of cell_audio_thread::operator(): where the tags go, what a block
-// looks like after the game wrote all, part or none of it, which ports the game feeds, the period length, and each
-// turn's choice (with D-074's per-port waits instead of RPCS3's count of untouched ports).
+// looks like after the game wrote all, part or none of it, which ports the game feeds, the period length, each turn's
+// choice (with D-074's per-port waits instead of RPCS3's count of untouched ports), and the time stretcher's tempo
+// (D-075, the ps3-ios-engine port's follow-the-game rule).
 
 #include <catch_amalgamated.hpp>
 
@@ -230,4 +231,81 @@ TEST_CASE("audio buffering: each turn waits for the period, then for the game, t
     CHECK(turn(3 * kPeriodUs, half).step == Step::WaitForGame);
     CHECK(turn(4 * kPeriodUs + 1, half).step == Step::Mix);
     CHECK(turn(4 * kPeriodUs + 1, counted({Block::Untouched, Block::InProgress}, 2)).step == Step::Mix);
+}
+
+TEST_CASE("audio buffering: the game's pace, from how its periods went", "[hle][audio]")
+{
+    // On time, whatever length the buffer management chose: real time.
+    Stretch st;
+    for (u32 i = 0; i < 400; i++) st.period(6 * kPeriodUs / 5, false, true);
+    CHECK(st.pace == Catch::Approx(1.0f));
+    // A game that takes two periods for each block: the pace goes to one half over about 0.7 s.
+    for (u32 i = 0; i < 66; i++) st.period(2 * kPeriodUs, true, true); // 0.7 s
+    CHECK(st.pace == Catch::Approx(0.5f + 0.5f * std::exp(-1.0f)).margin(0.01));
+    for (u32 i = 0; i < 400; i++) st.period(2 * kPeriodUs, true, true);
+    CHECK(st.pace == Catch::Approx(0.5f).margin(0.001));
+    // Skipped periods delivered nothing; a period of half a second or more is a pause and doesn't count.
+    const f32 before = st.pace;
+    st.period(500'000, true, true);
+    CHECK(st.pace == before);
+    for (u32 i = 0; i < 400; i++) st.period(2 * kPeriodUs, true, false);
+    CHECK(st.pace < 0.01f);
+}
+
+TEST_CASE("audio buffering: stretching starts behind the game, follows its pace and stops once it keeps up",
+    "[hle][audio]")
+{
+    Stretch st;
+    u64 now = 1'000'000;
+    const auto turn = [&](f32 fill) {
+        now += kPeriodUs;
+        return st.update(fill, now);
+    };
+
+    // The game keeps pace with the buffer at its target: no stretching.
+    CHECK_FALSE(turn(1.0f));
+    CHECK_FALSE(st.on);
+
+    // The pace drops to 0.6: on, at the pace (the fill on target).
+    st.pace = 0.6f;
+    CHECK(turn(1.0f));
+    CHECK(st.on);
+    CHECK(st.tempo == Catch::Approx(0.6f));
+    // Trimmed toward the target: 30% slower per 100% of missing fill, never below 0.25.
+    CHECK(turn(0.5f));
+    CHECK(st.tempo == Catch::Approx(0.6f * 0.85f));
+    st.pace = 0.2f;
+    CHECK(turn(1.0f));
+    CHECK(st.tempo == Catch::Approx(0.25f));
+    // Changes under 0.02 aren't passed on.
+    st.pace = 0.6f;
+    CHECK(turn(1.0f));
+    st.pace = 0.61f;
+    CHECK_FALSE(turn(1.0f));
+    CHECK(st.tempo == Catch::Approx(0.6f));
+
+    // Back to real time: the tempo goes to 1 at once (0.98 and up are 1), and stretching stops after 2 s of it with
+    // the buffer at least 60% full.
+    st.pace = 0.99f;
+    CHECK(turn(1.0f));
+    CHECK(st.tempo == 1.0f);
+    CHECK(st.on);
+    u32 turns = 0;
+    while (st.on && turns < 1000) {
+        turn(1.0f);
+        turns++;
+    }
+    CHECK_FALSE(st.on);
+    CHECK(static_cast<double>(turns) * kPeriodUs >= 2'000'000.0);
+    CHECK(static_cast<double>(turns) * kPeriodUs < 2'100'000.0);
+
+    // A buffer running low while the game isn't ahead also starts it; one ahead of real time doesn't.
+    Stretch low;
+    low.pace = 0.985f;
+    low.fill = 0.2f;
+    CHECK(low.update(0.2f, 2'000'000));
+    CHECK(low.on);
+    Stretch ahead;
+    ahead.fill = 0.2f;
+    CHECK_FALSE(ahead.update(0.2f, 2'000'000));
 }

@@ -1,6 +1,7 @@
 // AudioOutput (pspocket/platform/audio_output.hpp): an AVAudioEngine whose source node pulls from an AudioRing that
-// cellAudio's thread fills. 48 kHz stereo float, non-interleaved on the engine side; the main mixer converts to the
-// device's format. Objective-C++ with ARC.
+// cellAudio's thread fills, through a time-pitch unit that is bypassed unless cellAudio stretches (D-075). 48 kHz
+// stereo float, non-interleaved on the engine side; the main mixer converts to the device's format. Objective-C++ with
+// ARC.
 
 #import <AVFoundation/AVFoundation.h>
 
@@ -23,6 +24,7 @@ struct AudioOutput::Impl {
     AudioRing ring{kRingFrames, kPrebufferFrames};
     AVAudioEngine* engine = nil;
     AVAudioSourceNode* source = nil;
+    AVAudioUnitTimePitch* pitch = nil; // cellAudio's stretcher
     bool valid = false;
 };
 
@@ -39,8 +41,12 @@ AudioOutput::AudioOutput() : impl_(std::make_unique<Impl>())
             *silence = impl->ring.pull(left, right, frames) == 0;
             return noErr;
         }];
+    impl->pitch = [AVAudioUnitTimePitch new];
+    impl->pitch.bypass = YES;
     [impl->engine attachNode:impl->source];
-    [impl->engine connect:impl->source to:impl->engine.mainMixerNode format:format];
+    [impl->engine attachNode:impl->pitch];
+    [impl->engine connect:impl->source to:impl->pitch format:format];
+    [impl->engine connect:impl->pitch to:impl->engine.mainMixerNode format:format];
     NSError* error = nil;
     if (![impl->engine startAndReturnError:&error]) {
         PS_LOG_ERROR(kChan, "the audio engine didn't start: {}",
@@ -67,6 +73,13 @@ void AudioOutput::push(const f32* samples, u32 frames)
 u32 AudioOutput::queued() const { return impl_->ring.queued(); }
 
 u32 AudioOutput::device_frames() const { return impl_->ring.largest_pull(); }
+
+void AudioOutput::set_stretch(bool on, f32 tempo)
+{
+    if (!impl_->valid) return;
+    impl_->pitch.rate = on ? tempo : 1.0f;
+    impl_->pitch.bypass = on ? NO : YES;
+}
 
 AudioOutput::Stats AudioOutput::stats() const
 {

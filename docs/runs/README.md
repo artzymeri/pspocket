@@ -48,3 +48,5 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [041](041-gta5-boot-39-mac.md) | 2026-10-04 | e935dfa | M4 Mac, pspocket-boot --press | Past calibration with a scripted Cross: "Loading Story Mode"; waits on SPURS semaphores |
 | [042](042-gta5-first-iphone-run.md) | 2026-10-04 | 0770578+ | iPhone 17 Pro Max, iOS 26.6.1 | GTA V on the phone: ISO picked in Files, calibration with an on-screen Cross, profile saved, "Loading Story Mode" to the semaphore gap |
 | [043](043-gta5-sound-mac.md) | 2026-10-04 | 7ea8393+ | M4 Mac, pspocket-boot --audio | Sound blocks played whole (D-074); GTA V's audio runs at 55 to 65% of real time on the loading screens, 20% at its heaviest |
+| [044](044-gta5-first-mission-mac.md) | 2026-10-04 | c503afa | M4 Mac, pspocket-boot --frames --press | **The first mission starts** (the prologue's objective and radar); the 3D world is black: vertex condition codes, DIVSQ, vertex TXL, X16 textures |
+| [045](045-gta5-time-stretch-mac.md) | 2026-10-04 | c503afa+ | M4 Mac, pspocket-boot --audio | Time stretching follows the game's pace (0.2 to 1.07); 69 speaker underruns in 120 s instead of about 500 |

@@ -1,8 +1,9 @@
 #pragma once
 
 // Sound out of cellAudio on Apple platforms (macOS and iOS): the stereo mix cellAudio hands its sink every period
-// (pspocket/hle/audio.hpp: 256 frames at 48 kHz) goes through an AudioRing to an AVAudioEngine source node on the
-// default output. Objective-C++ inside (src/audio_output.mm); this header is plain C++.
+// (pspocket/hle/audio.hpp: 256 frames at 48 kHz) goes through an AudioRing to an AVAudioEngine source node, then a
+// time-pitch unit (bypassed unless cellAudio stretches, D-075), to the default output. Objective-C++ inside
+// (src/audio_output.mm); this header is plain C++.
 
 #include <memory>
 
@@ -28,6 +29,10 @@ public:
     // device has taken at once (0 before it played).
     u32 queued() const;
     u32 device_frames() const;
+
+    // For cellAudio's stretcher (hle::AudioStretch): on, the ring plays at `tempo` times real time with its pitch kept
+    // (AVAudioUnitTimePitch); off, unprocessed. Any thread.
+    void set_stretch(bool on, f32 tempo);
 
     struct Stats {
         u64 played = 0;    // frames the device took from the ring
