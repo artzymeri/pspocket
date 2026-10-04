@@ -420,6 +420,17 @@ s32 cellSpursTasksetAttributeSetName(PPUContext& ctx, u32 attr, u32 name)
     return lv2::CELL_OK;
 }
 
+// cellSpursTasksetAttributeSetTasksetSize as libsre (fw 4.92) and RPCS3: a CellSpursTaskset (6400 bytes) or a
+// CellSpursTaskset2 (10496), else INVAL.
+s32 cellSpursTasksetAttributeSetTasksetSize(PPUContext& ctx, u32 attr, u32 size)
+{
+    if (!attr) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (size != kTasksetSize && size != kTaskset2Size) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    ps_write32(guest_base(ctx), attr + tsattr_off::taskset_size, size);
+    return lv2::CELL_OK;
+}
+
 // RPCS3 _spurs::create_taskset: clears the taskset, links it to the SPURS instance and adds it as a workload whose
 // policy module is the taskset marker, with minimum contention 8 and the attribute's priorities and maximum.
 s32 create_taskset(u8* base, u32 spurs, u32 taskset, u64 args, const u8 (&priority)[8], u32 max_contention, u32 name,
@@ -427,8 +438,9 @@ s32 create_taskset(u8* base, u32 spurs, u32 taskset, u64 args, const u8 (&priori
 {
     if (!spurs || !taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
     if (spurs % CELL_SPURS_ALIGN || taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
-    if (size != kTasksetSize) {
-        PS_LOG_ERROR(kChan, "create_taskset: taskset size {:#x} (CellSpursTaskset2) is not implemented", size);
+    if (size != kTasksetSize && size != kTaskset2Size) {
+        PS_LOG_ERROR(kChan, "create_taskset: taskset size {:#x} is neither a CellSpursTaskset's nor a CellSpursTaskset2's",
+            size);
         return error(CELL_SPURS_TASK_ERROR_INVAL);
     }
     std::memset(base + taskset, 0, size);
@@ -463,9 +475,17 @@ s32 cellSpursCreateTasksetWithAttribute(PPUContext& ctx, u32 spurs, u32 taskset,
     }
     u8 prio[8];
     std::memcpy(prio, base + attr + tsattr_off::priority, 8);
-    return create_taskset(base, spurs, taskset, ps_read64(base, attr + tsattr_off::args), prio,
-        ps_read32(base, attr + tsattr_off::max_contention), ps_read32(base, attr + tsattr_off::name),
-        ps_read32(base, attr + tsattr_off::taskset_size), static_cast<s32>(ps_read32(base, attr + tsattr_off::enable_clear_ls)));
+    const u32 size = ps_read32(base, attr + tsattr_off::taskset_size);
+    const s32 r = create_taskset(base, spurs, taskset, ps_read64(base, attr + tsattr_off::args), prio,
+        ps_read32(base, attr + tsattr_off::max_contention), ps_read32(base, attr + tsattr_off::name), size,
+        static_cast<s32>(ps_read32(base, attr + tsattr_off::enable_clear_ls)));
+    // libsre (fw 4.92): a CellSpursTaskset2 also gets the default exit code container handler's descriptor at 0x1900
+    // (EA | size in 128-byte units; the handler's marker here).
+    if (r == lv2::CELL_OK && size > 0x28FF) {
+        ps_write64(base, taskset + 0x1900,
+            SPURS_IMG_ADDR_TASK_EXIT_CODE_HANDLER | ((kTaskExitCodeHandlerSize + 127) >> 7));
+    }
+    return r;
 }
 
 // cellSpursShutdownWorkload, checked against libsre (fw 4.92), which RPCS3 follows: NULL, ALIGN, INVAL for a
@@ -556,7 +576,7 @@ constexpr u32 CELL_SPURS_TASK_EXECUTION_CONTEXT_SIZE = 1024;
 constexpr u32 CELL_SPURS_TASK_ATTRIBUTE_REVISION = 1;
 constexpr u32 kLsBlock = 0x800;            // one bit of an LS pattern
 constexpr u32 kTaskMaxSavedBlocks = 0x7A;  // a context save area larger than 0x3D400 bytes adds no blocks
-constexpr u32 kTaskset2MinSize = 0x2900;   // CellSpursTaskset2 (libsre: taskset size > 0x28FF)
+constexpr u32 kTaskset2MinSize = kTaskset2Size; // CellSpursTaskset2 (libsre: taskset size > 0x28FF)
 
 // CellSpursTaskLsPattern: 128 bits, one per 2 KB block of local store, most significant bit first (the top bit of the
 // first big-endian word is LS 0..0x7FF). The six blocks below CELL_SPURS_TASK_TOP are SPURS' own: task creation and
@@ -1116,6 +1136,13 @@ bool event_flag_to_ppu(u8 direction)
     return direction == CELL_SPURS_EVENT_FLAG_SPU2PPU || direction == CELL_SPURS_EVENT_FLAG_ANY2ANY;
 }
 
+// A flag the PPU sets: PPU2SPU or ANY2ANY (libsre's cellSpursEventFlagSet, fw 4.92; RPCS3 checks SPU2PPU here, the
+// direction a PPU wait needs, which refuses GTA V's PPU-to-SPU flags with PERM).
+bool event_flag_from_ppu(u8 direction)
+{
+    return direction == CELL_SPURS_EVENT_FLAG_PPU2SPU || direction == CELL_SPURS_EVENT_FLAG_ANY2ANY;
+}
+
 // An lv2 error from a step of an event flag operation as a SPURS task error (RPCS3: SPURS codes pass unchanged).
 s32 task_error(s32 rc)
 {
@@ -1217,7 +1244,7 @@ s32 cellSpursEventFlagSet(PPUContext& ctx, u32 event_flag, u16 bits)
     if (event_flag % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    if (!event_flag_to_ppu(ps_read8(base, event_flag + ef_off::direction))) return error(CELL_SPURS_TASK_ERROR_PERM);
+    if (!event_flag_from_ppu(ps_read8(base, event_flag + ef_off::direction))) return error(CELL_SPURS_TASK_ERROR_PERM);
 
     bool send = false;
     u8 ppu_slot = 0;
@@ -1594,6 +1621,7 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0x16394A4E, _cellSpursTasksetAttributeInitialize),
         PS_HLE_FUNC(0x652B70E2, cellSpursTasksetAttributeSetName),
         PS_HLE_FUNC(0xC10931CB, cellSpursCreateTasksetWithAttribute),
+        PS_HLE_FUNC(0x8F122EF8, cellSpursTasksetAttributeSetTasksetSize),
         PS_HLE_FUNC(0xA789E631, cellSpursShutdownTaskset),
         PS_HLE_FUNC(0x69726AA2, cellSpursAddWorkload),
         PS_HLE_FUNC(0xF843818D, cellSpursReadyCountStore),

@@ -233,14 +233,18 @@ TEST_CASE("SPURS workers: a task waits for a signal in its context save area and
     CHECK(hle::spurs::send_signal(b, kTs, id) == static_cast<s32>(0x80410905u)); // gone: SRCH
 }
 
+// PPU2SPU is how GTA V's DVD streamer hands work to its zlib task (regression: the PPU's set was refused with PERM,
+// as RPCS3 checks the direction a PPU wait needs, and the streamer waited for the task's answer forever).
 TEST_CASE("SPURS workers: cellSpursEventFlagSet from the PPU wakes a waiting task", "[hle][spurs][spurs-run]")
 {
+    const u32 direction = GENERATE(3u /* ANY2ANY */, 2u /* PPU2SPU */);
+    CAPTURE(direction);
     SpursFixture s;
     u8* b = s.base;
     write_task_elf(b, kElf, waiting_task());
     ps_write32(b, kArg, kOut);
     s.set_pattern_top_block();
-    REQUIRE(s.a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag, 0 /* auto clear */, 3 /* ANY2ANY */) == 0);
+    REQUIRE(s.a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag, 0 /* auto clear */, direction) == 0);
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, kCtx, 0xC00, kPattern, kArg) == 0);
     const u32 id = ps_read32(b, kId);
     REQUIRE(wait_for([&] { return s.task_bit(0x50, id) && !s.task_bit(0x00, id); }));

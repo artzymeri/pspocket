@@ -84,18 +84,22 @@ constexpr u32 kTasksetPmSize = 0x1E40;
 // Job chains: RPCS3 registers them with no policy module (vm::null, a TODO), so they never run there. The native
 // scheduler needs to recognize them, so they get a marker of their own next to RPCS3's 0x100 and 0x200.
 constexpr u32 SPURS_IMG_ADDR_JOB_CHAIN_PM = 0x300;
+// libsre's exit handler for tasks with an exit code container, whose descriptor (EA | size in 128-byte units) a
+// CellSpursTaskset2 keeps at 0x1900: a marker here too (no task of a supported game has such a container).
+constexpr u32 SPURS_IMG_ADDR_TASK_EXIT_CODE_HANDLER = 0x400, kTaskExitCodeHandlerSize = 0x710;
 constexpr u32 CELL_SPURS_JOB_REVISION_0 = 0, CELL_SPURS_JOB_REVISION_1 = 1, CELL_SPURS_JOB_REVISION_2 = 2,
               CELL_SPURS_JOB_REVISION_3 = 3;
 constexpr u32 CELL_SPURS_MAX_WORKLOAD = 16;
 constexpr u32 CELL_SPURS_TASKSET_ATTRIBUTE_REVISION = 1;
-constexpr u32 kTasksetSize = 6400; // CellSpursTaskset (CellSpursTaskset2 is larger; not supported yet)
+constexpr u32 kTasksetSize = 6400;   // CellSpursTaskset
+constexpr u32 kTaskset2Size = 10496; // CellSpursTaskset2
 constexpr u8 SPURS_WKL_STATE_PREPARING = 1, SPURS_WKL_STATE_RUNNABLE = 2, SPURS_WKL_STATE_SHUTTING_DOWN = 3,
              SPURS_WKL_STATE_REMOVABLE = 4;
 constexpr u32 CELL_SPURS_MAX_WORKLOAD2 = 32;
 constexpr u32 CELL_SPURS_EVENT_FLAG_LAST = 3;       // ANY2ANY
 constexpr u32 CELL_SPURS_EVENT_FLAG_CLEAR_LAST = 1; // MANUAL
 constexpr u8 CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT = 0xFF;
-constexpr u8 CELL_SPURS_EVENT_FLAG_SPU2PPU = 1, CELL_SPURS_EVENT_FLAG_ANY2ANY = 3;
+constexpr u8 CELL_SPURS_EVENT_FLAG_SPU2PPU = 1, CELL_SPURS_EVENT_FLAG_PPU2SPU = 2, CELL_SPURS_EVENT_FLAG_ANY2ANY = 3;
 constexpr u32 CELL_SPURS_EVENT_FLAG_OR = 0, CELL_SPURS_EVENT_FLAG_AND = 1;
 constexpr u8 CELL_SPURS_EVENT_FLAG_CLEAR_AUTO = 0;
 constexpr u32 CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS = 16;

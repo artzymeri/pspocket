@@ -745,6 +745,18 @@ platforms; `--frames DIR [--frame-every N]` (which implies Metal) saves every Nt
 - **Tests.** The Metal backend's end-to-end tests (`tests/rsx/test_metal.mm`) were in the tree but in no build; they
   now run in the host build on Apple platforms (`test_rsx_metal`), with a capture test.
 
+## D-058 · 2026-10-04 · cellSpursEventFlagSet takes PPU2SPU flags; CellSpursTaskset2 through the attribute's size
+
+Two cellSpurs PPU-side fixes from runs 029 and 030, both checked against libsre (fw 4.92, D-046):
+- **Event flag set direction.** libsre's cellSpursEventFlagSet accepts PPU2SPU and ANY2ANY flags. RPCS3 (and pspocket
+  until now) check SPU2PPU and ANY2ANY, the directions a PPU *wait* needs, and refuse a PPU2SPU flag with PERM. GTA V's
+  DVD streamer hands work to its zlib task through a PPU2SPU flag, ignored the PERM, and waited for the answer forever:
+  nothing loaded and the screen stayed black. With libsre's check the game loads and draws its logo screen.
+- **Taskset2.** `cellSpursTasksetAttributeSetTasksetSize` takes 6400 (CellSpursTaskset) or 10496 (CellSpursTaskset2),
+  as libsre and RPCS3. A taskset created with the larger size gets, as in libsre, the descriptor of the exit code
+  container handler at 0x1900: a marker (0x400) here, since that handler is Sony SPU code and no task of GTA V has an
+  exit code container (the taskset policy stops loudly if one does).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

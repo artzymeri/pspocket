@@ -421,6 +421,22 @@ TEST_CASE("cellSpurs tasksets: attributes, creation registers a taskset workload
     CHECK(ps_read32(base, kTs1 + 0x74) == 1);
     CHECK(ps_read8(base, kSpurs + 0xB20 + 0x14) == ps_read8(base, kSpurs + 0xB00 + 0x14)); // same policy, same unique ID
 
+    // A CellSpursTaskset2 through the attribute's size (as GTA V makes one): libsre also stores the exit code
+    // container handler's descriptor at 0x1900 (its marker, 0x710 bytes = 15 units).
+    constexpr u32 kTs2 = kData + 0xA000;
+    CHECK(a.call("cellSpursTasksetAttributeSetTasksetSize", 0, 10496) == 0xFFFFFFFF80410911ull);
+    CHECK(a.call("cellSpursTasksetAttributeSetTasksetSize", kTsAttr + 4, 10496) == 0xFFFFFFFF80410910ull);
+    CHECK(a.call("cellSpursTasksetAttributeSetTasksetSize", kTsAttr, 0x2000) == 0xFFFFFFFF80410902ull);
+    REQUIRE(a.call("cellSpursTasksetAttributeSetTasksetSize", kTsAttr, 10496) == 0);
+    CHECK(ps_read32(base, kTsAttr + 0x20) == 10496);
+    std::memset(base + kTs2, 0xEE, 10496);
+    REQUIRE(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs2, kTsAttr) == 0);
+    CHECK(ps_read32(base, kTs2 + 0x1890) == 10496);
+    CHECK(ps_read64(base, kTs2 + 0x1900) == (0x400 | 15));
+    CHECK(ps_read64(base, kTs2 + 0x1980) == 0); // task_exit_code: cleared with the rest
+    CHECK(ps_read32(base, kTs2 + 10496 - 4) == 0);
+    CHECK(ps_read32(base, kTs2 + 0x74) == 2);
+
     ps_write32(base, kTsAttr, 2); // revision
     CHECK(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs1, kTsAttr) == 0xFFFFFFFF80410902ull);
     base[kPrio] = 0x10;
@@ -639,6 +655,10 @@ TEST_CASE("cellSpurs event flags: lv2 queue attach, PPU set and wait, detach; SP
     REQUIRE(a.call("_cellSpursEventFlagInitialize", 0, kTs, kFlag3, 1, 2 /* PPU2SPU */) == 0);
     CHECK(a.call("cellSpursEventFlagAttachLv2EventQueue", kFlag3) == kTaskPerm);
     CHECK(a.call("cellSpursEventFlagWait", kFlag3, kMask, 0) == kTaskPerm);
+    // libsre's cellSpursEventFlagSet takes PPU2SPU and ANY2ANY flags (RPCS3 checks SPU2PPU, as for a wait).
+    CHECK(a.call("cellSpursEventFlagSet", kFlag2, 0x0001) == kTaskPerm);
+    REQUIRE(a.call("cellSpursEventFlagSet", kFlag3, 0x0001) == 0);
+    CHECK(ps_read16(base, kFlag3) == 0x0001);
 
     // Bits already set: no blocking; AUTO clears the bits the waiter consumed.
     REQUIRE(a.call("cellSpursEventFlagSet", kFlag, 0x0003) == 0);
