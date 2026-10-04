@@ -1287,7 +1287,19 @@ TEST_CASE("cellGame: disc boot check and permit, game data created then found; s
     CHECK(a.call("sceNp2Init", 0x20000, kPool) == 0xFFFFFFFF8002AA02ull);
     REQUIRE(a.call("sceNpManagerGetStatus", kStatus) == 0);
     CHECK(static_cast<s32>(ps_read32(base, kStatus)) == -1); // offline
+    // The manager callback is kept (never called offline): a null one is refused.
+    CHECK(a.call("sceNpManagerRegisterCallback", 0, kStatus) == 0xFFFFFFFF8002AA03ull);
+    CHECK(a.call("sceNpManagerRegisterCallback", kParam, kStatus) == 0);
+    CHECK(a.call("sceNpManagerUnregisterCallback") == 0);
+    // One basic event handler (never called offline either).
+    CHECK(a.call("sceNpBasicUnregisterHandler") == 0xFFFFFFFF8002A66Dull); // not registered
+    CHECK(a.call("sceNpBasicRegisterContextSensitiveHandler", kName, 0, 0) == 0xFFFFFFFF8002A665ull);
+    CHECK(a.call("sceNpBasicRegisterContextSensitiveHandler", kName, kParam, 0) == 0);
+    CHECK(a.call("sceNpBasicRegisterContextSensitiveHandler", kName, kParam, 0) == 0xFFFFFFFF8002A66Bull);
+    CHECK(a.call("sceNpBasicUnregisterHandler") == 0);
     REQUIRE(a.call("sceNp2Term") == 0);
+    CHECK(a.call("sceNpManagerRegisterCallback", kParam, kStatus) == 0xFFFFFFFF8002AA01ull); // not initialized
+    CHECK(a.call("sceNpManagerUnregisterCallback") == 0xFFFFFFFF8002AA01ull);
     CHECK(a.call("sceNp2Term") == 0xFFFFFFFF8002AA01ull);
     fsys::remove_all(root);
 }
