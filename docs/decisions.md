@@ -832,6 +832,32 @@ argument checks with the PS3's error numbers.
 Left out until a game imports them: the list and fixed variants with dialogs (funcList), the User* variants, import
 and export, and the auto-save indicator.
 
+## D-063 · 2026-10-04 · SPURS queues as libsre: one shared line, marked indices, the PPU woken through a SPURS port
+
+Run 030 stopped at `_cellSpursQueueInitialize` (the game asserts when it fails). RPCS3 has no SPURS queues (stubs, and
+a six-argument initialize), so the four functions GTA V imports follow libsre (fw 4.92, read as the reference, D-046)
+and the SPU-side queue library its tasks link statically, in `runtime/hle/src/cellSpursQueue.cpp`.
+- **Layout.** CellSpursQueue is one 128-byte line: pop and push indices counting modulo 2 × depth (so full and empty
+  differ), entry size, depth, the entries' address, the SPU port of the attached lv2 queue, the direction, FIFO lists
+  of waiting SPU tasks (task IDs and workload IDs, at most 15), the taskset, CellSpurs and the lv2 queue ID.
+- **Protocol.** A push or pop is two atomic updates of the line with the copy between them. The first stores `~index`,
+  a claim that gives another PPU caller BUSY and makes an SPU task wait; the second stores index + 1. Waiting SPU tasks
+  join the list and wait for a signal (taskset syscall 2, wait object `queue | 4`); whoever frees an entry signals the
+  oldest. The PPU keeps its index marked for its whole blocking call and waits on a one-event lv2 queue ("_spuQue",
+  FIFO) on a dynamic SPU port; an SPU push into an empty queue whose pop index is marked throws
+  `sys_spu_thread_throw_event(port, 0, 0)`.
+- **Native.** The SPU side is task code the native taskset policy already runs (GETLLAR/PUTLLC, DMA, syscall 2, its
+  own signalling, the interrupt-mailbox event); its event reaches the PPU through the instance's port map (D-040,
+  D-050). A synthetic SPU task test checks that each side wakes the other.
+- **Shared helpers.** `attach_lv2_eq` and `detach_lv2_eq` are now `spurs::` functions (libsre also uses one helper for
+  event flags and queues).
+- **Deviations.** Unreadable pointers give TASK_ERROR_FAULT before an entry is claimed (D-042); libsre's asserts stop
+  with a fatal log (D-047); a failed lookup of a waiter's workload returns FATAL where libsre signals an undefined
+  taskset.
+
+Left out until a game imports them: PushBody (the PPU's side of PPU2SPU queues), Clear, Size, Depth, the getters and
+the LF queues; their semantics are summarised in the file header.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

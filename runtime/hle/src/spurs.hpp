@@ -229,6 +229,17 @@ constexpr u32 events = 0x00, spuTaskPendingRecv = 0x02, ppuWaitMask = 0x04, ppuW
               pendingRecvTaskEvents = 0x30, waitingTaskId = 0x50, waitingTaskWklId = 0x60, addr = 0x70, eventPortId = 0x78, eventQueueId = 0x7C, size = 0x80;
 }
 
+// ------------------------------------------------------------------------------------------------- SPU ports
+// (cellSpurs.cpp; shared with cellSpursQueue.cpp)
+
+// Connects lv2 event queue `queue` to an SPU port of the SPURS instance (RPCS3 _spurs::attach_lv2_eq; libsre's
+// helper at 0xAF2C): `port` itself, or with `dynamic` the lowest free one of 0x10..0x3F, written to `port`.
+// `spurs_created`: a queue SPURS makes for itself (event flags, SPURS queues), which CellSpurs::spuPortBits does not
+// show. CELL_OK, a CELL_SPURS_CORE_ERROR_* or an lv2 error.
+s32 attach_lv2_eq(PPUContext& ctx, u32 spurs, u32 queue, u8& port, bool dynamic, bool spurs_created);
+// Disconnects SPU port `port` (RPCS3 _spurs::detach_lv2_eq; libsre's helper at 0xB0E0).
+s32 detach_lv2_eq(u8* base, u32 spurs, u8 port, bool spurs_created, u32 sdk_version);
+
 // ------------------------------------------------------------------------------------------------- native scheduler
 
 // Starts the scheduler of an initialized instance: `inst.nspus` host workers that run its workloads (the SPURS

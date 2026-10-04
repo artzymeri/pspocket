@@ -1020,6 +1020,11 @@ bool update_spu_port_bit(u8* base, u32 spurs, u8 port, bool set)
     }
 }
 
+} // namespace
+
+// attach_lv2_eq and detach_lv2_eq are shared with cellSpursQueue.cpp (declared in spurs.hpp).
+namespace spurs {
+
 // RPCS3 _spurs::attach_lv2_eq. lv2 would connect `queue` to one SPU port of every thread in SPURS' SPU thread group
 // (sys_spu_thread_group_connect_event_all_threads): a given port (0..0x3F; 0..0xF from SDK 1.8) or, dynamic, the
 // lowest free one of 0x10..0x3F. Natively the SPURS instance records the connection. A port whose queue has been
@@ -1073,6 +1078,10 @@ s32 detach_lv2_eq(u8* base, u32 spurs, u8 port, bool spurs_created, u32 sdk_vers
     if (const auto it = h.instances.find(spurs); it != h.instances.end()) it->second.spu_ports.erase(port);
     return lv2::CELL_OK;
 }
+
+} // namespace spurs
+
+namespace {
 
 s32 cellSpursAttachLv2EventQueue(PPUContext& ctx, u32 spurs, u32 queue, u32 port_addr, s32 dynamic)
 {

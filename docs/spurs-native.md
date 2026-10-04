@@ -42,6 +42,7 @@ and hands the cores back to the PPU threads and the renderer otherwise.
 4. Event flags (done: PPU side, and SPU-side waits through the taskset policy), lv2 event queue attachment (done: SPU
    ports in the native instance, D-040), barriers (initialize done), semaphores.
 5. Job chains (done, D-054, D-055: libsre's layout and job chain policy, every command, jobs run one at a time;
-   GTA V's EDGE/GFX, GraphicsMain and Secondary chains run) and SPURS queues (not yet).
+   GTA V's EDGE/GFX, GraphicsMain and Secondary chains run) and SPURS queues (done, D-063: the PPU side GTA V
+   imports, as libsre; the SPU side is task code the taskset policy runs).
 6. Custom workloads (done, D-051): `cellSpursAddWorkload` with the game's own SPU policy module (GTA V adds one,
    0x11B0 bytes), entered as the SPURS kernel does, with the kernel's select and exit entry points as traps.
