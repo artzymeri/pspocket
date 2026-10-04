@@ -139,7 +139,8 @@ TEST_CASE("Linked stubs: descriptor layout, implemented and unimplemented calls"
 TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import and its exit", "[hle][loader]")
 {
     const auto x = test::build_ppu_exec();
-    const u32 stub7 = x.first_stub_code + 7 * 0x20; // sys_io::cellPadInit (no HLE implementation)
+    // synthLib's import 0xDEADBEEF: a NID no HLE module will ever implement.
+    const u32 stub12 = x.first_stub_code + 12 * 0x20;
     const u32 kOut = 0x21000;                      // bss of the data segment
 
     std::vector<u32> code;
@@ -160,7 +161,7 @@ TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import
     code.push_back(as::std_(5, 96, 31));
     for (int call = 0; call < 2; call++) {
         code.push_back(as::li(3, 5));
-        code.push_back(as::b_rel(static_cast<s32>(stub7 - at()), true)); // bl cellPadInit stub
+        code.push_back(as::b_rel(static_cast<s32>(stub12 - at()), true)); // bl synthLib 0xDEADBEEF stub
         code.push_back(as::ld(2, 40, 1));                                  // restore the TOC the stub saved
         code.push_back(as::std_(3, 88, 31));
     }
@@ -176,9 +177,10 @@ TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import
     loader::LoadReport report;
     REQUIRE(loader::boot(*exe, *p.kernel, *p.hle, p.state, {}, main_id, &report) == lv2::CELL_OK);
     CHECK(report.functions_linked == 14);
-    CHECK(report.functions_implemented == 7); // sysPrxForUser::sys_lwmutex_lock, sys_ppu_thread_exit, sys_process_exit,
+    CHECK(report.functions_implemented == 8); // sysPrxForUser::sys_lwmutex_lock, sys_ppu_thread_exit, sys_process_exit,
                                               // sys_fs::cellFsOpen, cellGcmSys::_cellGcmInitBody and
-                                              // cellGcmGetConfiguration, cellSysutil::cellSysutilRegisterCallback
+                                              // cellGcmGetConfiguration, cellSysutil::cellSysutilRegisterCallback,
+                                              // sys_io::cellPadInit
     CHECK(report.variables_unresolved == 1);
 
     REQUIRE(p.kernel->wait_for_exit(std::chrono::seconds(10)));
@@ -202,11 +204,11 @@ TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import
     CHECK(out(12) == 0);                   // argv[1] = NULL
 
     // The import slot points at a linked stub, which counted both calls.
-    const u32 descriptor = ps_read32(base, x.first_stub_slot + 7 * 4);
+    const u32 descriptor = ps_read32(base, x.first_stub_slot + 12 * 4);
     const hle::LinkedFunction* f = p.hle->linked_at(descriptor + 4);
     REQUIRE(f != nullptr);
-    CHECK(f->module == "sys_io");
-    CHECK(f->name == "cellPadInit");
+    CHECK(f->module == "synthLib");
+    CHECK(f->nid == 0xDEADBEEF);
     CHECK(f->calls.load() == 2);
     CHECK(p.hle->unimplemented_calls() == 2);
     // HLE allocations stay clear of the executable's pages (text 0x10000+0x4000, data 0x20000+0x2000).

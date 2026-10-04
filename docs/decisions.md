@@ -574,6 +574,22 @@ cellSysutilAvconfExt ones. Not implemented yet: dialogs, the on-screen keyboard,
   which is `inventory/<game>/hdd1` with `scripts/boot.sh`. RPCS3's relay and clear rules apply, with its in-use
   marker, which pspocket writes in every case, not only for a new cache.
 
+## D-049 · 2026-10-04 · Input: one virtual controller the host feeds; no keyboard
+
+Runs 018 and 019. `sys_io` (the 14 cellPad and cellKb functions GTA V imports, following RPCS3) reports one
+controller, always connected, on port 0. It looks like RPCS3's DualShock 3: standard type, press-sensitive buttons,
+motion sensors, high-precision sticks, rumble. The host sets its state with `hle::set_pad_input`
+(`pspocket/hle/input.hpp`). The iOS app will drive it from a touch overlay or an MFi/DualSense controller. On the Mac
+it stays at rest. A connected controller is the right default for an app that always shows a virtual one; games stop at
+"connect a controller" otherwise.
+- `cellPadGetData` reports changes the way RPCS3 does: the first read, any change, and every 10 ms with sensors on.
+  Rumble is accepted and ignored for now.
+- RPCS3's sys_config event thread is not reproduced: the controller counts as connected, assignment change included,
+  from `cellPadInit`.
+- No keyboard is connected, as with RPCS3's default null keyboard handler.
+
+This settles how input reaches the game, not the open question of whether a hardware controller is required.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

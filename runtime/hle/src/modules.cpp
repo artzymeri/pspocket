@@ -14,6 +14,7 @@ void register_cellSysutil(Registry& r);
 void register_sceNp(Registry& r);
 void register_sysPrxForUser(Registry& r);
 void register_sys_fs(Registry& r);
+void register_sys_io(Registry& r);
 void register_sys_net(Registry& r);
 
 void register_all_modules(Registry& r)
@@ -28,6 +29,7 @@ void register_all_modules(Registry& r)
     register_sceNp(r);
     register_sysPrxForUser(r);
     register_sys_fs(r);
+    register_sys_io(r);
     register_sys_net(r);
 }
 

@@ -13,6 +13,7 @@ add_library(pspocket_hle STATIC
     src/sceNp.cpp
     src/sysPrxForUser.cpp
     src/sys_fs.cpp
+    src/sys_io.cpp
     src/sys_net.cpp)
 target_include_directories(pspocket_hle PUBLIC include)
 target_link_libraries(pspocket_hle PUBLIC pspocket::core pspocket::ppu pspocket::lv2 pspocket::rsx)

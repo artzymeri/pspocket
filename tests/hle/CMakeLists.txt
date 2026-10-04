@@ -1,7 +1,7 @@
 # HLE linkage, sysPrxForUser and the process loader: registry checks, stub calls, lwmutex on real lv2 threads, a
 # synthetic executable booted end to end, and pspocket-boot's fault report.
 pspocket_add_test(test_hle
-    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_gcm.cpp test_sysutil.cpp
+    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_gcm.cpp test_sys_io.cpp test_sysutil.cpp
     LIBS pspocket::loader pspocket_test_synthetic pspocket::recomp_ppu)
 # HLE modules' internal headers (sysutil.hpp: the event queue other modules use).
 target_include_directories(test_hle PRIVATE ${PROJECT_SOURCE_DIR}/runtime/hle/src)
