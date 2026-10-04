@@ -1095,6 +1095,63 @@ ran dry 69 times instead of about 500.
 Also: SPURS task creation, task starts and semaphore setups are logged the first 8 times and every 1024th. In the first
 mission GTA V starts thousands of tasks a second, and run 044's mission log grew by 80,000 lines in a few minutes.
 
+## D-076 · 2026-10-04 · The game's SPU programs run lifted: collected on the Mac, lifted per image and LS address
+
+The iPhone's intro ran at 8 to 12 fps after D-073, and a Time Profiler capture during loading put 76% of the CPU in
+the SPU interpreter (`execute` 55%, its per-instruction support check 11.5%), with SPURS selection down to 3%: what is
+left is the game's SPU work itself (Bink video, the audio mixer, physics, decompression). The SPU lifter (D-029) and
+the runtime's program registry existed, but nothing collected GTA V's programs or attached them, and the SPU
+differential fuzz test was never in the build. Now:
+- The SPU fuzz test builds and runs (`test_spu_fuzz`, 256 cases per instruction, CLAUDE.md rule 3); it passes.
+- SPURS attaches the lifted program for every image it loads into a worker's local store: a task's first executable
+  segment (at start and at resume), a job's binary, a game's own policy module (`runtime/hle/src/spu_programs.cpp`).
+  An image is known by the hash of its code in guest memory, not of the worker's copy (a job keeps its data inside its
+  binary, so the copy changes as it runs), and by its LS address: lifted code is specific to it, and
+  position-independent job binaries land on different pages, so one binary can make several programs.
+- An image without a lifted program is logged once and interpreted, in every build. CLAUDE.md rule 5 asks dev builds
+  to abort on an unknown SPU hash; that waits until the collection is complete. Code a program reaches outside its
+  lifted range (the SPURS syscall stubs, code it loads itself) is interpreted too (`PS_SPU_MISS_INTERPRET`).
+- A DMA GET over the attached program's code drops it for the rest of the run: an overlay or other code loaded there
+  would leave the lifted code stale.
+- `pspocket-boot --spu-dump DIR` saves each image without a lifted program (the code, and its kind, guest address, LS
+  address, size and entry); `scripts/lift-spu.sh DIR OUT [LOG...]` lifts them all (seeds from earlier runs' "no
+  lifted code at" lines) and writes `game_spu.c`, whose `pspocket_game_spu_register()` registers them;
+  `-DPSPOCKET_GAME_SPU=OUT` builds them into pspocket-boot. Images and lifted code come from the user's game and stay
+  in the gitignored `inventory/` (CLAUDE.md rule 1), like the decrypted executable.
+
+## D-077 · 2026-10-04 · Memory ordering between the SPUs, the PPU and the RSX on ARM
+
+Run 048 (the first mission on the Mac with the null backend) ended on "malformed FIFO command 0x80000000", run 049 on
+"invalid primitive 80" and then a malformed command: the RSX read stale command words. The Cell orders these hand-offs
+itself; the host must make them hold on ARM, where, unlike x86, plain stores can become visible to another core out
+of order and plain loads can be satisfied out of order:
+- The RSX reads put, the word at get (a command, or a jump the guest just patched to release the RSX) and the
+  semaphore it waits on with acquire loads: what it reads next is at least as new.
+- Every MFC PUT is preceded by a release fence. GTA V's graphics jobs write RSX commands from SPUs, then the jump or
+  flag that hands them over; the MFC performs a queue's transfers in order, and with plain copies a later PUT could be
+  seen before an earlier one. Barrier commands (`barrier`, `eieio`, `sync`) were already full fences, and PPU `sync`
+  too.
+A FIFO error stays fatal in dev builds (CLAUDE.md rule 5): if one comes back it is another bug. A stress test appends
+commands over malformed placeholder words while the RSX thread consumes them; it can only fail when the ordering is
+broken, and it didn't reproduce the race without the fix in 30 runs either, so the fix rests on the memory model.
+
+## D-078 · 2026-10-04 · The first mission's shaders and textures, as RPCS3
+
+Run 044 reached the prologue with the 3D world black: its shaders and render targets use features the Metal
+translation refused, and a refused program skips the draw. Added, each following RPCS3 (upstream 431b169):
+- Vertex program condition codes (VertexProgramDecompiler SetDST, GetDST, AddCodeCond, GetRawCond): CC0 and CC1 start
+  at 0; an op whose result goes to neither an output nor a temp writes it to CC{sel} when the instruction updates
+  condition codes (or, as RPCS3's "Far Cry 2" rule, when the other op writes the output); a conditional instruction
+  writes only the components whose condition holds (`select`). 25 of the mission's programs needed it.
+- Fragment DIVSQ (`_builtin_divsq`: a / sqrt(|b|), a zero numerator staying zero), PK16 and UP16 (RPCS3 packs two
+  unorm16), RET (the program ends: the body runs in `do { } while (false)` and RET breaks out to the outputs), and TXL
+  and TXB on cube maps.
+- X16 and Y16_X16 textures (29 of the mission's textures), decoded on the GPU into R16Unorm and RG16Unorm with RPCS3's
+  component mappings (X16 {R, 1, R, 1}, Y16_X16 {G, R, G, R} in A, R, G, B order).
+Left for later, each logged once: vertex texture fetch (vertex TXL), floating-point and 16-bit render targets sampled
+as textures and read back, multisampling (one sample), occlusion queries (65535) and conditional rendering (always
+drawn).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

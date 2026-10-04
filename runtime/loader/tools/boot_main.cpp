@@ -6,6 +6,7 @@
 //                 [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]
 //                 [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]
 //                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]... [--audio]
+//                 [--spu-dump DIR]
 //   pspocket-boot --probe-disc IMAGE.iso
 //
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
@@ -14,6 +15,9 @@
 // codec, sys/external/flashMP3.pic), taken from the user's own firmware and kept out of the repository (D-067).
 // --imports lists every imported function by module (implemented ones marked) and exits without running.
 // --audio plays the game's sound (cellAudio's mix) on the Mac's default output, through AVAudioEngine.
+// --spu-dump DIR saves every SPU program SPURS loads that has no lifted program into DIR, for scripts/lift-spu.sh
+// (D-076; game data: keep it in inventory/). A build configured with -DPSPOCKET_GAME_SPU=OUT runs the programs lifted
+// into OUT natively; the rest are interpreted, and the run ends with how many loads were which.
 // --press presses a button of the virtual controller during the run (repeatable; pspocket/hle/pad_script.hpp):
 // cross@60 holds Cross from 60 s for 0.25 s, cross@60+10 again every 10 s, start@30:1.5 holds Start for 1.5 s.
 // A host fault inside guest memory (an access to an unmapped guest address) is reported with the guest address and
@@ -52,6 +56,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/hle/audio.hpp"
+#include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/pad_script.hpp"
 #include "pspocket/hle/process.hpp"
@@ -83,10 +88,14 @@ int usage()
         "                     [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]\n"
         "                     [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]\n"
         "                     [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]...\n"
-        "                     [--audio]\n"
+        "                     [--audio] [--spu-dump DIR]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
+
+#if defined(PSPOCKET_HAVE_GAME_SPU)
+extern "C" void pspocket_game_spu_register(void); // the game's lifted SPU programs (scripts/lift-spu.sh, D-076)
+#endif
 
 u8* g_guest_base = nullptr;
 GuestMemory* g_memory = nullptr;
@@ -327,6 +336,7 @@ int main(int argc, char** argv)
     u32 frame_every = 60;
     std::vector<hle::PadPress> presses;
     bool audio = false;
+    std::string spu_dump;
     for (int i = 1; i < argc; i++) {
         const std::string_view a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -367,6 +377,7 @@ int main(int argc, char** argv)
             presses.push_back(*press);
         }
         else if (a == "--audio") audio = true;
+        else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
         else if (a == "--log") {
@@ -486,6 +497,13 @@ int main(int argc, char** argv)
         ~ForgetHle() { g_hle = nullptr; } // before `hle` is destroyed
     } forget_hle;
     hle.install();
+    // The game's SPU programs (D-076): the lifted ones run natively; the others, and code a program reaches outside
+    // its lifted range (the SPURS syscall stubs, overlays), are interpreted, in every build, until they are collected.
+    ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
+#if defined(PSPOCKET_HAVE_GAME_SPU)
+    pspocket_game_spu_register();
+#endif
+    if (!spu_dump.empty()) hle::set_spu_dump_dir(spu_dump);
 #if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
     std::unique_ptr<platform::AudioOutput> audio_output;
     if (audio) {
@@ -579,6 +597,10 @@ int main(int argc, char** argv)
             static_cast<unsigned long long>(st.overruns));
     }
 #endif
+    const hle::SpuProgramStats spu = hle::spu_program_stats();
+    std::printf("SPU program loads: %llu lifted, %llu interpreted (%llu images without a lifted program)\n",
+        static_cast<unsigned long long>(spu.attached), static_cast<unsigned long long>(spu.unknown),
+        static_cast<unsigned long long>(spu.images));
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());
     for (const auto* f : missing)

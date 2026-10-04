@@ -102,6 +102,18 @@ int group_mmio(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, eal, "DMA to an invalid SPU thread MMIO offset");
 }
 
+// A GET over the attached lifted program's code (an overlay, or other code loaded where it was) leaves the lifted
+// code stale: the rest of the run interprets (D-076). The lifted program is attached again when SPURS loads it next.
+void drop_overwritten_program(SPUContext* ctx, u32 lsa, u32 size)
+{
+    const ps_spu_program* p = ctx->program;
+    const u32 at = lsa & PS_SPU_LS_MASK;
+    if (at >= p->code_start + p->code_size || at + size <= p->code_start) return;
+    PS_LOG_DEBUG("spu", "SPU {}: a DMA writes LS 0x{:05x}+{:#x} over lifted program {}: interpreting it", ctx->id, at,
+        size, p->name);
+    ps_spu_attach_program(ctx, nullptr);
+}
+
 int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
 {
     if (size == 0) return 0;
@@ -111,6 +123,7 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
         std::memset(mem, 0, size);
     } else {
         ls_copy(ctx->ls, lsa, mem, size, is_get(cmd));
+        if (is_get(cmd) && ctx->program) drop_overwritten_program(ctx, lsa, size);
     }
     if (!is_get(cmd)) ps_res_notify_write(eal, size); // PUTs break reservations on the lines they touch
     return 0;

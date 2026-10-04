@@ -40,6 +40,7 @@
 #include "pspocket/core/reservation.h"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/spu/runtime.h"
+#include "spu_programs.hpp"
 #include "spurs_native.hpp"
 
 namespace pspocket::hle::spurs {
@@ -947,6 +948,7 @@ bool JobChainPolicy::run_job(const Job& job)
     ctx.gpr[126].u32[3] = binary;
     ps_spu_wrch(&ctx, ls::jc_return, PS_MFC_WrTagMask, 1u << tag);
     ctx.pc = binary;
+    attach_program(ctx, base_, {ImageKind::Job, binary_ea, binary, size_binary, binary}); // D-076
 
     for (;;) {
         const u32 reason = ps_spu_run(&ctx);

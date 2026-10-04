@@ -17,6 +17,7 @@
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/runtime.h"
+#include "spu_programs.hpp"
 #include "spurs_native.hpp"
 
 namespace pspocket::hle::spurs {
@@ -67,6 +68,7 @@ void run_custom(Worker& w, u32 wid, u32 poll_status)
     c.gpr[4].u64[1] = arg;
     c.gpr[5] = word0(poll_status);
     c.pc = ls::pm_entry;
+    attach_program(c, base, {ImageKind::PolicyModule, pm, ls::pm_entry, size & ~3u, ls::pm_entry}); // D-076
 
     for (;;) {
         const u32 reason = ps_spu_run(&c);

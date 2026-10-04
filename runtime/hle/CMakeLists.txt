@@ -19,6 +19,7 @@ add_library(pspocket_hle STATIC
     src/psf.cpp
     src/sceNp.cpp
     src/sceNpTrophy.cpp
+    src/spu_programs.cpp
     src/spurs_custom.cpp
     src/spurs_jobchain.cpp
     src/spurs_scheduler.cpp

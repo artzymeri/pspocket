@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-/* Every lifted function: void spu_<hash8>_<entry>(SPUContext* ctx, uint8_t* ls). It may be entered at any of its
+/* Every lifted function: void spu_<hash>_<start>_<entry>(SPUContext* ctx, uint8_t* ls). It may be entered at any of its
  * block starts (it switches on ctx->pc), runs until control leaves it, and returns with ctx->pc = the next guest
  * instruction (and ctx->stop_reason set if execution must stop). */
 typedef void (*ps_spu_fn)(SPUContext* ctx, uint8_t* ls);

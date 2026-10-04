@@ -25,6 +25,7 @@
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/runtime.h"
+#include "spu_programs.hpp"
 #include "spurs_native.hpp"
 
 namespace pspocket::hle::spurs {
@@ -87,6 +88,7 @@ private:
     void start_task(u32 id, u64 elf);
     void resume_task(u32 id, u64 elf);
     void load_elf(u32 id, u32 elf, bool skip_writable, u32* entry, u32* lowest);
+    void attach_code(u32 elf); // the lifted program for the task's code (D-076)
     Next syscall();
     s32 save_context();
     Next incident(); // after a task left the SPU: next task, or exit to the kernel
@@ -258,6 +260,23 @@ void Policy::load_elf(u32 id, u32 elf, bool skip_writable, u32* entry, u32* lowe
     if (lowest) *lowest = low;
 }
 
+// The task's code is its ELF's first executable PT_LOAD segment (load_elf checked the headers): attach the lifted
+// program for it, if the game's build has one (D-076).
+void Policy::attach_code(u32 elf)
+{
+    u8* e = guest(elf);
+    const u32 phoff = ps_read32(e, 0x1C), phentsize = ps_read16(e, 0x2A), phnum = ps_read16(e, 0x2C);
+    for (u32 i = 0; i < phnum; i++) {
+        u8* ph = e + phoff + i * phentsize;
+        if (ps_read32(ph, 0x0C) >= ls::size) break;
+        if (ps_read32(ph, 0x00) != 1 || !(ps_read32(ph, 0x18) & 1)) continue; // PT_LOAD with PF_X
+        attach_program(w_.ctx, base_, {ImageKind::Task, elf + ps_read32(ph, 0x04), ps_read32(ph, 0x08),
+                                          ps_read32(ph, 0x10) & ~3u, ps_read32(e, 0x18)});
+        return;
+    }
+    ps_spu_attach_program(&w_.ctx, nullptr);
+}
+
 // A task starts (libsre: its image loaded, the execution context initialized, then the registers). Local store is not
 // cleared (RPCS3 clears 0x3000..0x40000 here): only each segment's bss is zeroed.
 void Policy::start_task(u32 id, u64 elf)
@@ -269,6 +288,7 @@ void Policy::start_task(u32 id, u64 elf)
     u32 entry = 0, lowest = 0;
     ps_write32(ls_, ls::ctx_guid, ls::task_top);
     load_elf(id, static_cast<u32>(elf & ~7ull), false, &entry, &lowest);
+    attach_code(static_cast<u32>(elf & ~7ull));
     store_qw(ls_, ls::ctx_lr, word0(entry));
     ps_write32(ls_, ls::ctx_guid, lowest);
     ps_write32(ls_, ls::ctx_mgmt, ls::ts);
@@ -303,6 +323,7 @@ void Policy::resume_task(u32 id, u64 elf)
     const u128 pattern = read128(ls_, ls::ts_ti_pattern);
     constexpr u128 kAllBlocks = (u128{0x03FFFFFFFFFFFFFFull} << 64) | 0xFFFFFFFFFFFFFFFFull;
     if (pattern != kAllBlocks) load_elf(id, static_cast<u32>(elf & ~7ull), true, nullptr, nullptr);
+    attach_code(static_cast<u32>(elf & ~7ull));
     const u32 save = static_cast<u32>(ps_read64(ls_, ls::ts_ti_context) & ~0x7Full);
     if (!save) fatal("a waiting task has no context save area");
     std::memcpy(ls_ + ls::ctx_area, guest(save), ls::ctx_area_size);

@@ -2,7 +2,7 @@
 
 // SPU lifter: analysed functions -> C11 translation units.
 //
-// One C function per SPU function, void spu_<hash8>_<entry>(SPUContext* ctx, uint8_t* ls), entered at any of its
+// One C function per SPU function, void spu_<hash>_<start>_<entry>(SPUContext* ctx, uint8_t* ls), entered at any of its
 // block starts (a switch on ctx->pc). Registers it uses live in ps_spu_vec locals; local branches are gotos (loop
 // back edges poll ctx->attention); direct calls into lifted functions are C calls that continue only when the
 // callee returned to the expected address (anything else returns to the run loop); indirect branches switch over
@@ -51,8 +51,10 @@ struct LiftResult {
 
 LiftResult lift(const LsImage& image, const Program& program, const LiftOptions& options);
 
-// "spu_<hash8>_<entry>": hash8 = top 32 bits of the program key, entry = 5 hex digits.
-std::string function_symbol(u64 hash, u32 entry);
+// "spu_<hash>_<code start>_<entry>": the program key (16 hex digits), its LS code start and the entry (5 hex digits
+// each). The code start keeps apart the programs one position-independent binary makes at different LS addresses
+// (D-076), whose functions would otherwise share names.
+std::string function_symbol(u64 hash, u32 code_start, u32 entry);
 
 // Step mode, for the differential fuzz test: one instruction as a function with the same code generation as
 // lift(), except that control transfers store their target in ctx->pc and return (calls don't call), and every
