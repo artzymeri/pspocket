@@ -656,6 +656,13 @@ int main(int argc, char** argv)
             static_cast<unsigned long long>(sites[i].steps), static_cast<unsigned long long>(sites[i].entries), sites[i].pc,
             sites[i].program ? sites[i].program->name : "no program");
     }
+    for (u32 mb = 0; mb < (PS_MEM_RSX_LOCAL_SIZE >> 20); mb++) {
+        const u64 got = ps_spu_video_dma(mb, 0), put = ps_spu_video_dma(mb, 1);
+        if (got || put) {
+            std::printf("SPU DMA in RSX local memory %#010x: %llu bytes read, %llu written\n", PS_MEM_RSX_LOCAL_BASE + (mb << 20),
+                static_cast<unsigned long long>(got), static_cast<unsigned long long>(put));
+        }
+    }
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());
     for (const auto* f : missing)

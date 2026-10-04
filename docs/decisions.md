@@ -1340,6 +1340,31 @@ UPB, and their draws were skipped. RPCS3's FragmentProgramDecompiler is the refe
 - Tests: the translation of an IFE with an else part and a LOOP with BRK and RET; Metal compiles a program with every
   new op.
 
+## D-090 · 2026-10-04 · Any ISO, by automatic ahead-of-time translation (not an emulator)
+
+The user's goal, in their words: the app runs "ANY ps3 iso", without making one game after another native by hand;
+and pspocket is "an ahead of time translation ... not an emulator". Both hold together with D-036:
+- Any game goes through the same automatic pipeline on the Mac: disc image in, the game's PPU and SPU code translated
+  ahead of time to native code and compiled into a signed app, the runtime shared by all. No per-game manual work: the
+  pipeline is one command (still to be written as such; its parts exist). iOS does not let an app create native code
+  after signing, so the translation cannot run on the phone itself.
+- The runtime reads disc images directly and has no title checks (CLAUDE.md rule 6): lv2, the HLE modules, SPURS and
+  the RSX to Metal translator serve every game.
+- The interpreters are the oracle and the safety net, not the path: code the translation has not found yet (code a
+  game only reaches at run time) is interpreted, logged, and translated by the next build automatically (the seeds of
+  D-081 and D-087). Their speed matters only for that (a decode cache for the PPU interpreter, D-091, is cheap).
+- Next for speed: the PPU, still interpreted for GTA V (about two cores in run 060's mission), translated ahead of time
+  like the SPUs.
+- Fixes are judged by whether they help every game; GTA V remains the game they are measured with.
+
+## D-091 · 2026-10-04 · A decode cache in the PPU interpreter
+
+decode()'s switch on the primary opcode was a quarter of the PPU threads' time in run 060 (an indirect branch the host
+mispredicts on nearly every instruction). The interpreter now keeps one 64-bit word per address (by pc bits 2-17): the
+instruction word, its op and whether it branches. The op is a function of the word alone, so an entry is used exactly
+when its word matches memory; code loaded or patched since simply misses. Shared by the PPU threads, read and written
+relaxed (a race is a miss). Test: code patched at an address after it ran runs as patched.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

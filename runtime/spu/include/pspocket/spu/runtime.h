@@ -113,6 +113,8 @@ typedef struct ps_spu_interp_site {
     uint64_t entries;
 } ps_spu_interp_site;
 uint32_t ps_spu_interp_sites(ps_spu_interp_site* out, uint32_t n);
+/* Bytes SPU DMAs read (put = 0) or wrote (put = 1) in MB `mb` of RSX local memory so far. Diagnostics. */
+uint64_t ps_spu_video_dma(uint32_t mb, int put);
 
 /* ---------------------------------------------------------------------------------------------------------------
  * Run loop.

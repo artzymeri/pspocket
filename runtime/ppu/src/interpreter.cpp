@@ -844,6 +844,35 @@ void execute(PPUContext& ctx, u8* base, const Inst& in)
 
 void step(PPUContext& ctx, u8* base) { execute(ctx, base, decode(ps_read32(base, ctx.cia))); }
 
+namespace {
+
+// Decoded instructions by address (D-091): decode()'s switch on the primary opcode is an indirect branch the host
+// mispredicts on nearly every instruction (run 060: a quarter of the PPU threads' time). An entry holds the
+// instruction word, its op and whether it branches; the op is a function of the word alone, so an entry is valid
+// exactly when its word is the one in memory now (code loaded or patched since just misses). Shared by every PPU
+// thread: one relaxed 64-bit word per entry, so a racing update is only a miss.
+constexpr u32 kDecodeCacheBits = 16;
+std::atomic<u64> g_decode_cache[1u << kDecodeCacheBits];
+
+inline Inst decode_cached(u32 pc, u32 raw, bool& branch)
+{
+    std::atomic<u64>& slot = g_decode_cache[(pc >> 2) & ((1u << kDecodeCacheBits) - 1)];
+    const u64 v = slot.load(std::memory_order_relaxed);
+    if (static_cast<u32>(v >> 32) == raw && (v & 0x10000u)) { // bit 16: filled
+        branch = (v >> 17) & 1;
+        Inst inst;
+        inst.raw = raw;
+        inst.op = static_cast<Op>(v & 0xFFFFu);
+        return inst;
+    }
+    const Inst inst = decode(raw);
+    branch = (inst.flags() & OPF_BRANCH) != 0;
+    slot.store((u64{raw} << 32) | (u64{branch} << 17) | 0x10000u | static_cast<u16>(inst.op), std::memory_order_relaxed);
+    return inst;
+}
+
+} // namespace
+
 RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
 {
     RunResult res;
@@ -859,13 +888,14 @@ RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
             res.reason = StopReason::StepLimit;
             return res;
         }
-        const Inst inst = decode(ps_read32(base, ctx.cia));
+        bool branch = false;
+        const Inst inst = decode_cached(ctx.cia, ps_read32(base, ctx.cia), branch);
         execute(ctx, base, inst);
         res.steps++;
 
         // Interop: a branch that lands on a lifted function runs it. Lifted code returns like the guest's blr, so
         // execution continues at LR afterwards (also correct for tail calls and local branches to an entry).
-        if (opt.call_lifted && (inst.flags() & OPF_BRANCH)) {
+        if (opt.call_lifted && branch) {
             while (!at_stop()) {
                 const ps_ppu_fn fn = ps_ppu_dispatch_find(ctx.cia);
                 if (!fn) break;

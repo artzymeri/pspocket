@@ -476,3 +476,31 @@ TEST_CASE("mftb / mftbu / mfspr TBL read the timebase source")
     m.exec(as::mftb(3));
     CHECK(m.ctx.gpr[3] >= t0);
 }
+
+TEST_CASE("run: code patched after it ran runs as patched (the decode cache checks the word, D-091)")
+{
+    Machine m;
+    constexpr u32 kSentinel = 0x00030000;
+    auto run_code = [&] {
+        m.ctx.lr = kSentinel;
+        m.ctx.gpr[1] = 0x00028000;
+        m.ctx.cia = Machine::kCode;
+        RunOptions opt;
+        opt.stop_at_return = true;
+        opt.stop_lr = kSentinel;
+        opt.stop_sp = m.ctx.gpr[1];
+        opt.max_steps = 100;
+        REQUIRE(run(m.ctx, m.base(), opt).reason == StopReason::Returned);
+        return m.ctx.gpr[3];
+    };
+    m.w32(Machine::kCode, 0x38600001);     // li r3, 1
+    m.w32(Machine::kCode + 4, 0x4E800020); // blr
+    CHECK(run_code() == 1);
+    CHECK(run_code() == 1);                // from the cache
+    m.w32(Machine::kCode, 0x38600002);     // li r3, 2
+    CHECK(run_code() == 2);
+    m.w32(Machine::kCode, 0x7C631A14);     // add r3, r3, r3: another op at the same address
+    m.ctx.gpr[3] = 21;
+    m.ctx.lr = kSentinel;
+    CHECK(run_code() == 42);
+}
