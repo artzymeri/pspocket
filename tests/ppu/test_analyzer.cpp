@@ -157,6 +157,90 @@ TEST_CASE("analyzer: GCC switch patterns become bounded jump tables")
     CHECK(t3.targets.size() == 4);
 }
 
+TEST_CASE("analyzer: the SNC switch pattern becomes a bounded jump table")
+{
+    const Function& snc = fn("sw_snc");
+    REQUIRE(snc.jump_tables.size() == 1);
+    const JumpTable& t = snc.jump_tables.begin()->second;
+    CHECK(t.relative);
+    CHECK(t.bounded);
+    CHECK(t.table == programs().symbol("sw_snc.table"));
+    REQUIRE(t.targets.size() == 4);
+    for (u32 i = 0; i < 4; i++) CHECK(t.targets[i] == programs().symbol("sw_snc." + std::to_string(i)));
+    CHECK_FALSE(snc.needs_entry_state);
+}
+
+TEST_CASE("analyzer: a table whose base the prologue sets, indexed by a loaded byte")
+{
+    const Function& vm = fn("vm");
+    REQUIRE(vm.jump_tables.size() == 3); // every dispatch site but the one across a call
+    for (const auto& [bctr, t] : vm.jump_tables) {
+        CHECK_FALSE(t.relative);
+        CHECK_FALSE(t.bounded); // read until the zero after the five entries
+        CHECK(t.table == programs().symbol("vm.table"));
+        REQUIRE(t.targets.size() == 5);
+        for (u32 i = 0; i < 5; i++) CHECK(t.targets[i] == programs().symbol("vm." + std::to_string(i)));
+    }
+    CHECK(vm.labels.contains(programs().symbol("vm_exit"))); // its register restore is vm's own code
+}
+
+namespace {
+
+// An SNC-style switch on (r3 - 37) & 0xFF with four relative entries, and one way to break its bounds check.
+enum class SncFlaw { None, NarrowCompare, ClobberedField, IndexChanged };
+
+CodeImage snc_switch(SncFlaw flaw)
+{
+    using L = as::Assembler::Label;
+    as::Assembler a(kBase);
+    const L table = a.new_label(), def = a.new_label();
+    L cases[4];
+    for (L& l : cases) l = a.new_label();
+    a.emit(as::addi(9, 3, -37));
+    a.emit(as::clrlwi(0, 9, flaw == SncFlaw::NarrowCompare ? 28 : 24)); // the compare sees 4 index bits, not 8
+    a.emit(as::cmplwi(7, 0, 3));
+    a.emit(flaw == SncFlaw::ClobberedField ? as::cmpwi(7, 5, 0) : as::nop());
+    a.emit(flaw == SncFlaw::IndexChanged ? as::addi(9, 9, 1) : as::nop());
+    a.bgt(7, def);
+    a.load_address(11, table);
+    a.emit(as::rlwinm(9, 9, 2, 22, 29));
+    a.emit(as::lwzx(0, 9, 11));
+    a.emit(as::extsw(0, 0));
+    a.emit(as::add(0, 0, 11));
+    a.emit(as::mtctr(0));
+    a.emit(as::bctr());
+    a.bind(def);
+    a.emit(as::li(3, -1));
+    a.emit(as::blr());
+    for (u32 i = 0; i < 4; i++) {
+        a.bind(cases[i]);
+        a.emit(as::li(3, static_cast<s32>(i)));
+        a.emit(as::blr());
+    }
+    a.bind(table);
+    for (const L& l : cases) a.label_offset_word(l, table);
+    a.word(0x7FFFFFF0); // not a code offset: ends a scan of the table
+    return CodeImage(kBase, a.finish());
+}
+
+} // namespace
+
+TEST_CASE("analyzer: a bounds check that does not cover the whole index leaves the table unbounded")
+{
+    const Seed seeds[] = {{kBase, {}, "f"}};
+    for (const SncFlaw flaw : {SncFlaw::None, SncFlaw::NarrowCompare, SncFlaw::ClobberedField, SncFlaw::IndexChanged}) {
+        INFO("flaw " << static_cast<int>(flaw));
+        const CodeImage img = snc_switch(flaw);
+        const Program p = analyze(img, seeds);
+        REQUIRE(p.functions.size() == 1);
+        REQUIRE(p.functions[0].jump_tables.size() == 1);
+        const JumpTable& t = p.functions[0].jump_tables.begin()->second;
+        CHECK(t.relative);
+        CHECK(t.bounded == (flaw == SncFlaw::None));
+        CHECK(t.targets.size() >= 4);
+    }
+}
+
 TEST_CASE("lifter output: files, symbols, registration, switch for jump tables, no fallbacks")
 {
     LiftOptions opt;
@@ -178,7 +262,17 @@ TEST_CASE("lifter output: files, symbols, registration, switch for jump tables, 
     CHECK(code.find("ps_ppu_dispatch_register_table(t_entries") != std::string::npos);
     CHECK(code.find("goto L_") != std::string::npos);
     CHECK(r.stats.fallbacks == 0);
-    CHECK(r.stats.jump_tables == 3);
+    CHECK(r.stats.jump_tables == 7);
+    // One dispatch switch per function, shared by its table sites (vm has three).
+    auto count = [&](std::string_view needle) {
+        usize n = 0;
+        for (usize at = code.find(needle); at != std::string::npos; at = code.find(needle, at + 1)) n++;
+        return n;
+    };
+    CHECK(count("D_tables: switch") == 5);
+    CHECK(count("goto D_tables;") == 7);
+    CHECK(count("D_known: switch") == 1);
+    CHECK(r.stats.entry_not_first == 1); // entry_above
     CHECK(r.stats.functions == analysis().functions.size());
 }
 

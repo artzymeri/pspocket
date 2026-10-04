@@ -143,10 +143,10 @@ int main(int argc, char** argv)
 
     const LiftStats& s = lifted.stats;
     if (!quiet) {
-        std::printf("ppu-lift: %zu functions, %zu instructions, %zu jump tables, %zu indirect jumps, %zu fallbacks, "
-                    "%zu illegal -> %s (%zu files)\n",
-            s.functions, s.instructions, s.jump_tables, s.indirect_jumps, s.fallbacks, s.illegal, out_dir.c_str(),
-            lifted.files.size());
+        std::printf("ppu-lift: %zu functions (%zu entered above their lowest address), %zu instructions, %zu jump "
+                    "tables, %zu indirect jumps, %zu fallbacks, %zu illegal -> %s (%zu files)\n",
+            s.functions, s.entry_not_first, s.instructions, s.jump_tables, s.indirect_jumps, s.fallbacks, s.illegal,
+            out_dir.c_str(), lifted.files.size());
         for (const Diagnostic& d : program.warnings)
             std::printf("warning: %08x: %s\n", d.addr, d.message.c_str());
     }

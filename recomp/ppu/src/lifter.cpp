@@ -8,6 +8,7 @@
 #include <bit>
 #include <filesystem>
 #include <format>
+#include <set>
 #include <fstream>
 #include <sstream>
 
@@ -85,6 +86,8 @@ struct Gen {
     RegSet wr;  // spilled before calls and at exits
     bool step = false;
     bool uses_entry_state = false;
+    bool uses_table_dispatch = false; // a recognised jump table: "goto D_tables"
+    bool uses_known_dispatch = false; // an unrecognised bctr in a function with tables: "goto D_known"
     const CodeImage* image = nullptr;
     const Program* program = nullptr;
     const Function* fn = nullptr;
@@ -919,20 +922,24 @@ void emit_control(Gen& g, u32 pc, const Inst& in, std::string& o)
             return;
         }
         g.uses_entry_state = true;
+        // Every jump table of a function dispatches through one switch at its end (emit_function): a threaded
+        // interpreter's 124 dispatch sites, each a switch of its own, kept clang busy for over 20 minutes.
         if (const auto jt = g.fn->jump_tables.find(pc); jt != g.fn->jump_tables.end() && cond.empty()) {
-            std::vector<u32> targets = jt->second.targets;
-            std::sort(targets.begin(), targets.end());
-            targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-            std::string s = std::format("switch ((uint32_t)ctr & ~3u) {{ /* jump table at {:#010x}, {} entries */\n", jt->second.table,
-                jt->second.targets.size());
-            for (u32 t : targets) s += std::format("    case {}: goto L_{:08X};\n", hex32(t), t);
-            s += std::format("    default: {}ps_ppu_jump_table_miss(ctx, base, {}, (uint32_t)ctr & ~3u, entry_lr, entry_sp); return;\n    }}",
-                g.spill, hex32(pc));
-            line(s);
+            line(std::format("jt_site = {}; goto D_tables; /* jump table at {:#010x}, {} entries */", hex32(pc),
+                jt->second.table, jt->second.targets.size()));
+            g.uses_table_dispatch = true;
             if (g.stats) g.stats->jump_tables++;
             return;
         }
         if (g.stats) g.stats->indirect_jumps++;
+        // An unrecognised jump in a function with jump tables (a bytecode interpreter's dispatch across a call, whose
+        // table register the matcher does not follow): the targets those tables proved are this function's code, so a
+        // jump to one of them stays here. Anything else goes through the dispatch table as before.
+        if (cond.empty() && !g.fn->jump_tables.empty()) {
+            line("goto D_known; /* not a recognised table: the function's table targets, then the dispatch table */");
+            g.uses_known_dispatch = true;
+            return;
+        }
         line(guarded(cond, std::format("{}ps_ppu_jump_indirect(ctx, base, (uint32_t)ctr & ~3u, entry_lr, entry_sp); return;", g.spill)));
         return;
     }
@@ -1036,10 +1043,17 @@ std::string emit_function(const CodeImage& image, const Program& prog, const Fun
     build_spill_reload(g);
 
     std::string body;
+    // The entry need not be the lowest instruction: a function can branch back into code below it (SNC's wrappers
+    // that set up an argument and then "b" to a shared body above which they sit). Start at the entry.
+    const bool entry_first = fn.insns.empty() || fn.insns.front() == fn.entry;
+    if (!entry_first) {
+        body += std::format("    goto L_{:08X};\n", fn.entry);
+        stats.entry_not_first++;
+    }
     for (usize i = 0; i < fn.insns.size(); i++) {
         const u32 pc = fn.insns[i];
         const Inst& in = insts[i];
-        if (fn.labels.contains(pc)) body += std::format("L_{:08X}: ;\n", pc);
+        if (fn.labels.contains(pc) || (pc == fn.entry && !entry_first)) body += std::format("L_{:08X}: ;\n", pc);
         if (opt.comments) body += comment(pc, in);
         emit_instruction(g, pc, in, body);
         stats.instructions++;
@@ -1056,10 +1070,25 @@ std::string emit_function(const CodeImage& image, const Program& prog, const Fun
         }
     }
 
+    // The dispatch blocks of the jump tables: one switch over every target of every table of the function.
+    if (g.uses_table_dispatch || g.uses_known_dispatch) {
+        std::set<u32> targets;
+        for (const auto& [at, table] : fn.jump_tables) targets.insert(table.targets.begin(), table.targets.end());
+        std::string cases;
+        for (u32 t : targets) cases += std::format("    case {}: goto L_{:08X};\n", hex32(t), t);
+        if (g.uses_table_dispatch)
+            body += std::format("D_tables: switch ((uint32_t)ctr & ~3u) {{\n{}    default: {}ps_ppu_jump_table_miss(ctx, base, "
+                                "jt_site, (uint32_t)ctr & ~3u, entry_lr, entry_sp); return;\n    }}\n", cases, g.spill);
+        if (g.uses_known_dispatch)
+            body += std::format("D_known: switch ((uint32_t)ctr & ~3u) {{\n{}    default: {}ps_ppu_jump_indirect(ctx, base, "
+                                "(uint32_t)ctr & ~3u, entry_lr, entry_sp); return;\n    }}\n", cases, g.spill);
+    }
+
     std::string o = std::format("{}\n{{\n", signature(function_symbol(opt.prefix, fn.entry)));
     o += "    base = (uint8_t*)__builtin_assume_aligned(base, PS_PPU_BASE_ALIGN);\n";
     o += declarations(g);
     if (g.uses_entry_state) o += "    const uint64_t entry_lr = ctx->lr, entry_sp = ctx->gpr[1];\n";
+    if (g.uses_table_dispatch) o += "    uint32_t jt_site = 0;\n";
     o += body;
     o += "}\n\n";
     stats.functions++;
@@ -1106,7 +1135,10 @@ LiftResult lift(const CodeImage& image, const Program& program, const LiftOption
         h += std::format("#ifndef {0}_H\n#define {0}_H\n\n#include \"pspocket/ppu/lifted.h\"\n\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n\n", name);
         for (const Function& f : program.functions) h += signature(function_symbol(options.prefix, f.entry)) + ";\n";
         h += std::format("\n/* Registers / unregisters every function above in the dispatch table (ps_ppu_dispatch_*). */\n"
-                         "void {0}_register(void);\nvoid {0}_unregister(void);\nextern const uint32_t {0}_function_count;\n\n"
+                         "void {0}_register(void);\nvoid {0}_unregister(void);\nextern const uint32_t {0}_function_count;\n"
+                         "/* (address, word) pairs of the image the functions were translated from, at a sample of their entries:\n"
+                         "   a host checks them before registering the functions for an executable. */\n"
+                         "extern const uint32_t {0}_image_words[];\nextern const uint32_t {0}_image_word_count;\n\n"
                          "#ifdef __cplusplus\n}}\n#endif\n\n#endif\n",
             name);
         result.files.push_back({name + ".h", std::move(h)});
@@ -1139,6 +1171,18 @@ LiftResult lift(const CodeImage& image, const Program& program, const LiftOption
         r += std::format("#include \"{}.h\"\n\n", name);
         const usize n = program.functions.size();
         r += std::format("const uint32_t {}_function_count = {}u;\n\n", name, n);
+        // Up to 64 entries, evenly spread, with the words found there.
+        std::vector<std::pair<u32, u32>> words;
+        const usize samples = std::min<usize>(n, 64);
+        for (usize i = 0; i < samples; i++) {
+            const u32 at = program.functions[i * n / samples].entry;
+            if (const auto w = image.read32(at)) words.emplace_back(at, *w);
+        }
+        r += std::format("const uint32_t {}_image_word_count = {}u;\nconst uint32_t {}_image_words[] = {{\n", name,
+            words.size(), name);
+        for (const auto& [at, w] : words) r += std::format("    {}, {:#010x}u,\n", hex32(at), w);
+        if (words.empty()) r += "    0u, 0u,\n";
+        r += "};\n\n";
         if (n) {
             r += std::format("static const ps_ppu_dispatch_entry {}_entries[{}] = {{\n", name, n);
             for (const Function& f : program.functions) r += std::format("    {{{}, {}}},\n", hex32(f.entry), function_symbol(options.prefix, f.entry));

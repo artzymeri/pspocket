@@ -2,7 +2,7 @@
 
 // PPU static analysis: function discovery (seeds + bl targets, to a fixpoint), per-function control flow
 // (local branch targets, fall-through, conditional branches), tail calls, function extent, and bctr jump-table
-// recognition for the PPC64 GCC switch pattern. Anything not recognised stays an indirect jump through the
+// recognition for the PPC64 GCC and SNC switch patterns. Anything not recognised stays an indirect jump through the
 // dispatch table at runtime.
 
 #include <map>
@@ -20,7 +20,7 @@ namespace pspocket::recomp::ppu {
 struct JumpTable {
     u32 bctr = 0;          // address of the bctr
     u32 table = 0;         // address of the first entry
-    bool relative = false; // entries are signed offsets from the table address (lwax/lwzx + add)
+    bool relative = false; // entries are signed offsets from the table address (lwax, or lwzx + extsw; then add)
     bool bounded = false;  // entry count from the cmplwi/bgt bounds check (else: scanned until an invalid entry)
     std::vector<u32> targets; // one per entry, in table order
 };

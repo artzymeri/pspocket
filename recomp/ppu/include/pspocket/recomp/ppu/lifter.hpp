@@ -37,6 +37,7 @@ struct LiftStats {
     usize jump_tables = 0;
     usize indirect_jumps = 0; // bctr without a recognised table
     usize illegal = 0;
+    usize entry_not_first = 0; // functions whose entry is above code they branch back into
 };
 
 struct LiftResult {

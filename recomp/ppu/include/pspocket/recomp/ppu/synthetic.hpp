@@ -34,6 +34,12 @@ struct Program {
 //   bubble_sort(a, n)         int32, nested loops, cmpw/ble
 //   sw_rel(x)                 jump table: cmplwi/bgt, lis/addi @ha/@l, slwi, lwax, add, mtctr, bctr (relative)
 //   sw_toc(x)                 jump table: table address loaded from the TOC (ld rX, off(r2)), rldic scaling
+//   sw_snc(x)                 jump table, SNC style: clrlwi/cmplwi on a byte index, lwz of the table from the TOC,
+//                             rlwinm mask-and-scale, lwzx + extsw + add (relative entries)
+//   entry_above(x)            sets r7 and branches back into a body below its entry (x + 5)
+//   vm(code)                  bytecode interpreter: table base set once in the prologue, byte opcodes, four
+//                             dispatch sites (0 return, 1 +1, 2 *2, 3 +10, 4 add_one across a call); it branches to
+//                             vm_exit (not seeded) to restore its registers and return
 //   sw_abs(x)                 jump table: lis/ori, lwzx, absolute entries
 //   add_one(x), times_three(x)      function-pointer targets (seeded, never bl'd)
 //   secret_fn(x)              function-pointer target deliberately NOT seeded (dispatch miss -> interpreter)

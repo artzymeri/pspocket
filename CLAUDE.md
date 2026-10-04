@@ -54,6 +54,8 @@ ctest --test-dir build/host --output-on-failure
   `docs/phase0.md`). NID/syscall names: `recomp/common/scripts/harvest_nids.py <rpcs3-dir> [--check]` (D-019).
 - Focused builds while other work is in progress: `-DPSPOCKET_ONLY="runtime/core;recomp/common;tests/common"`.
 - PPU lifter: `ppu-lift --image f.bin --base 0x10000 --seed 0x10200 --out DIR [--tu N] [--strict]` (D-023).
+  `ppu-dis --image f.bin --base 0x10000 ADDR [COUNT]` disassembles; a fault in translated code prints host frames for
+  `atos -o pspocket-boot -s SLIDE ADDR...` (D-094).
   Longer differential fuzzing: `PSPOCKET_FUZZ_SEED=<n> PSPOCKET_FUZZ_ITERS=<k> build/host/tests/ppu/test_ppu_fuzz`.
   Never build lifted code with `-ffast-math`/`-Ofast`.
 - Disc images: `ps3disc <image.iso> <out-dir>` (host) or the app's `-extract-iso` mode pulls out the executables only.

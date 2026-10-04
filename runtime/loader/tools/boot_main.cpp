@@ -54,6 +54,10 @@
 
 #include <pthread.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <sys/ucontext.h>
+#endif
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/guest_memory.hpp"
@@ -102,7 +106,11 @@ int usage()
 extern "C" void pspocket_game_spu_register(void); // the game's lifted SPU programs (scripts/lift-spu.sh, D-076)
 #endif
 #if defined(PSPOCKET_HAVE_GAME_PPU)
-extern "C" void game_ppu_register(void); // the game's PPU code translated ahead of time (ppu-lift, D-092)
+extern "C" {
+void game_ppu_register(void); // the game's PPU code translated ahead of time (ppu-lift, D-092)
+extern const uint32_t game_ppu_image_words[];  // (address, word) pairs of the image it was translated from
+extern const uint32_t game_ppu_image_word_count;
+}
 #endif
 
 u8* g_guest_base = nullptr;
@@ -218,7 +226,37 @@ void report_call_site(const PPUContext& c)
 
 // SIGSEGV/SIGBUS: name the guest address and the PPU thread's position, then exit with 128 + signal (a debugger
 // attached to the process stops at the fault before this handler runs).
-void on_fault(int sig, siginfo_t* info, void*)
+// The host code that faulted and its callers, for translated code (cia is stale there): the program counter, the link
+// register and the frame-pointer chain, with the image slide for "atos -o pspocket-boot -s SLIDE ADDR...".
+void report_host_frames(void* uctx)
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    const auto* uc = static_cast<const ucontext_t*>(uctx);
+    if (!uc || !uc->uc_mcontext) return;
+    const auto& ss = uc->uc_mcontext->__ss;
+    char buf[160];
+    int n = std::snprintf(buf, sizeof buf, "  host frames (slide 0x%llx): 0x%llx 0x%llx",
+        static_cast<unsigned long long>(_dyld_get_image_vmaddr_slide(0)), static_cast<unsigned long long>(ss.__pc),
+        static_cast<unsigned long long>(ss.__lr));
+    write_err(buf, std::min<int>(n, sizeof buf - 1));
+    const auto lo = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(pthread_self())) -
+        pthread_get_stacksize_np(pthread_self());
+    const auto hi = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(pthread_self()));
+    uintptr_t fp = ss.__fp;
+    for (int i = 0; i < 48 && fp >= lo && fp + 16 <= hi && (fp & 15) == 0; i++) {
+        const auto* frame = reinterpret_cast<const uintptr_t*>(fp);
+        n = std::snprintf(buf, sizeof buf, " 0x%llx", static_cast<unsigned long long>(frame[1]));
+        write_err(buf, std::min<int>(n, sizeof buf - 1));
+        if (frame[0] <= fp) break;
+        fp = frame[0];
+    }
+    write_err("\n", 1);
+#else
+    (void)uctx;
+#endif
+}
+
+void on_fault(int sig, siginfo_t* info, void* uctx)
 {
     const auto addr = reinterpret_cast<uintptr_t>(info->si_addr);
     const auto base = reinterpret_cast<uintptr_t>(g_guest_base);
@@ -241,6 +279,7 @@ void on_fault(int sig, siginfo_t* info, void*)
             sig == SIGBUS ? "SIGBUS" : "SIGSEGV", info->si_addr, t ? t->id : 0, c ? c->cia : 0);
     }
     write_err(buf, std::min<int>(n, sizeof buf - 1));
+    report_host_frames(uctx);
     if (c) report_call_site(*c);
     if (!t) {
         // Not a PPU thread: name the host thread (SPURS workers, the RSX, cellAudio...) and the SPU code it runs.
@@ -531,9 +570,6 @@ int main(int argc, char** argv)
     pspocket_game_spu_register();
     hle::enable_spu_modules();
 #endif
-#if defined(PSPOCKET_HAVE_GAME_PPU)
-    game_ppu_register(); // branches into it from the interpreter run it (D-092)
-#endif
     if (!spu_dump.empty()) {
         hle::set_spu_dump_dir(spu_dump);
         hle::enable_spu_modules();
@@ -569,6 +605,45 @@ int main(int argc, char** argv)
         print_imports(hle);
         return 0;
     }
+#if defined(PSPOCKET_HAVE_GAME_PPU)
+    // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only: its words at
+    // a sample of the functions' entries must be in memory (another executable, the test programs among them, has other
+    // code at those addresses: D-098).
+    bool same_image = true;
+    for (u32 i = 0; i < game_ppu_image_word_count && same_image; i++) {
+        const u32 addr = game_ppu_image_words[2 * i], word = game_ppu_image_words[2 * i + 1];
+        same_image = memory.is_committed(addr) && ps_read32(memory.base(), addr) == word;
+    }
+    if (same_image) {
+        game_ppu_register(); // branches into it from the interpreter run it
+    } else {
+        PS_LOG_WARN("boot", "the built-in translated PPU code is for another executable: interpreting this one");
+    }
+    // PSPOCKET_PPU_ONLY=LO-HI[,LO-HI...] keeps the translated functions in those ranges only, the rest interpreted:
+    // bisecting a translation fault down to the function.
+    if (const char* only = std::getenv("PSPOCKET_PPU_ONLY"); only && same_image) {
+        std::vector<std::pair<u64, u64>> ranges;
+        for (const char* p = only;;) {
+            char* end = nullptr;
+            const u64 lo = std::strtoull(p, &end, 0);
+            if (end == p) break;
+            u64 hi = lo + 4;
+            if (*end == '-') hi = std::strtoull(end + 1, &end, 0);
+            ranges.emplace_back(lo, hi);
+            if (*end != ',') break;
+            p = end + 1;
+        }
+        u64 kept = 0;
+        for (u32 i = 0; i < ps_ppu_dispatch.count; i++) {
+            const u32 addr = ps_ppu_dispatch.base + i * 4;
+            if (ps_ppu_dispatch.slots[i] == ps_ppu_dispatch_miss_stub) continue;
+            const bool keep = std::any_of(ranges.begin(), ranges.end(), [&](auto r) { return addr >= r.first && addr < r.second; });
+            if (!keep) ps_ppu_dispatch_unregister(addr);
+            else kept++;
+        }
+        PS_LOG_INFO("boot", "PSPOCKET_PPU_ONLY={}: {} translated functions kept", only, kept);
+    }
+#endif
     if (const lv2::Result r = loader::start_main_thread(*exe, kernel, state, {}, main_id); r != lv2::CELL_OK) {
         std::fprintf(stderr, "pspocket-boot: cannot start the main thread: %s\n", lv2::error_name(r));
         return 70;

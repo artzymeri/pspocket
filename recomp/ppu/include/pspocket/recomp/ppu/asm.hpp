@@ -510,6 +510,14 @@ public:
         fixups_.push_back({Fix::Lo16, l, {}, static_cast<u32>(words_.size())});
         words_.push_back(as::addi(rt, rt, 0));
     }
+    // lis rt, label@ha ; addic rt, rt, label@l (SNC's form).
+    void load_address_hac(u32 rt, Label l)
+    {
+        fixups_.push_back({Fix::Ha16, l, {}, static_cast<u32>(words_.size())});
+        words_.push_back(as::lis(rt, 0));
+        fixups_.push_back({Fix::Lo16, l, {}, static_cast<u32>(words_.size())});
+        words_.push_back(as::addic(rt, rt, 0));
+    }
     // 64-bit big-endian data word holding a label's address (TOC entries).
     void label_dword(Label l)
     {

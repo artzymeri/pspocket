@@ -288,6 +288,113 @@ Program build_test_programs(u32 base)
         a.emit(blr());
     }
 
+    // ---- sw_snc(x): the SNC switch: the index masked to a byte by both the bounds check (clrlwi; cmplwi) and the
+    // scaling (rlwinm r9, r9, 2, 22, 29), the table address loaded from the TOC as a word, the entries sign-extended
+    // by extsw after lwzx, and unrelated instructions between the compare and its branch.
+    B.func("sw_snc");
+    {
+        const Label def = a.new_label();
+        a.emit(addi(9, 3, -37));
+        a.emit(clrlwi(0, 9, 24));
+        a.emit(cmplwi(7, 0, 3));
+        a.emit(mr(7, 3));
+        a.emit(li(8, 0));
+        a.bgt(7, def);
+        a.emit(lwz(11, 24, 2));
+        a.emit(rlwinm(9, 9, 2, 22, 29));
+        a.emit(lwzx(0, 9, 11));
+        a.emit(extsw(0, 0));
+        a.emit(add(0, 0, 11));
+        a.emit(mtctr(0));
+        a.emit(bctr());
+        a.bind(def);
+        a.emit(li(3, -1));
+        a.emit(blr());
+        a.bind(B.L("sw_snc.0"));
+        a.emit(li(3, 70));
+        a.emit(blr());
+        a.bind(B.L("sw_snc.1"));
+        a.emit(addi(3, 7, 1));
+        a.emit(blr());
+        a.bind(B.L("sw_snc.2"));
+        a.emit(li(3, 72));
+        a.emit(blr());
+        a.bind(B.L("sw_snc.3"));
+        a.emit(li(3, 73));
+        a.emit(blr());
+    }
+
+    // ---- entry_above(x): x + 5, by setting r7 and branching back into a body below the entry (not a function of its
+    // own: never called, never seeded), like SNC's wrappers around a shared body.
+    B.func("entry_above.body", false);
+    a.emit(add(3, 3, 7));
+    a.emit(blr());
+    B.func("entry_above");
+    a.emit(li(7, 5));
+    a.b(B.L("entry_above.body"));
+
+    // ---- vm(code): a bytecode interpreter in SNC's shape. The dispatch table's address is set once in the prologue (lis
+    // and addic into r19, which only the exit helper restores), a call sits between it and the first dispatch (the
+    // matcher's backward slice stops there), and the opcode is a loaded byte with no bounds check. Opcodes: 0 return
+    // acc, 1 acc += 1, 2 acc *= 2, 3 acc += 10, 4 acc = add_one(acc). Handlers 1, 3 and 4 dispatch again themselves (4
+    // across a call); 2 branches back.
+    B.func("vm");
+    {
+        const Label dispatch = a.new_label();
+        auto dispatch_here = [&] {
+            a.emit(lbz(5, 0, 31));
+            a.emit(addi(31, 31, 1));
+            a.emit(slwi(5, 5, 2));
+            a.emit(lwzx(5, 19, 5));
+            a.emit(mtctr(5));
+            a.emit(bctr());
+        };
+        prologue(a, 112);
+        a.emit(std_(19, 64, 1));
+        a.emit(std_(30, 72, 1));
+        a.emit(std_(31, 80, 1));
+        a.emit(std_(26, 88, 1));
+        a.load_address_hac(19, B.L("vm.table"));
+        a.emit(mr(31, 3));
+        a.emit(li(3, -1));
+        a.bl(B.L("add_one"));
+        a.emit(mr(30, 3)); // acc = 0
+        a.bind(dispatch);
+        dispatch_here();
+        a.bind(B.L("vm.0"));
+        a.emit(mr(3, 30));
+        a.b(B.L("vm_exit"));
+        a.bind(B.L("vm.1"));
+        a.emit(addi(30, 30, 1));
+        dispatch_here();
+        a.bind(B.L("vm.2"));
+        a.emit(add(30, 30, 30));
+        a.b(dispatch);
+        a.bind(B.L("vm.3"));
+        a.emit(addi(30, 30, 10));
+        dispatch_here();
+        // 4: acc = add_one(acc), the next handler's address loaded before the call into r26 (which the call keeps):
+        // the matcher's slice stops at the call, so this dispatch is not a recognised table.
+        a.bind(B.L("vm.4"));
+        a.emit(lbz(5, 0, 31));
+        a.emit(addi(31, 31, 1));
+        a.emit(slwi(5, 5, 2));
+        a.emit(lwzx(26, 19, 5));
+        a.emit(mr(3, 30));
+        a.bl(B.L("add_one"));
+        a.emit(mr(30, 3));
+        a.emit(mtctr(26));
+        a.emit(bctr());
+    }
+    // Restores vm's registers and returns from it, reached by a branch (SNC's restgpr helpers): part of vm, so vm writes
+    // r19 there too, on its way out.
+    B.func("vm_exit", false);
+    a.emit(ld(19, 64, 1));
+    a.emit(ld(30, 72, 1));
+    a.emit(ld(31, 80, 1));
+    a.emit(ld(26, 88, 1));
+    epilogue(a, 112);
+
     // ---- sw_abs(x): lis/ori table address, absolute entries
     B.func("sw_abs");
     {
@@ -564,12 +671,21 @@ Program build_test_programs(u32 base)
     B.data("sw_toc.table");
     for (int i = 0; i < 5; i++) a.label_offset_word(B.L("sw_toc." + std::to_string(i)), B.L("sw_toc.table"));
     a.align(16);
+    a.align(16);
+    B.data("vm.table");
+    for (int i = 0; i < 5; i++) a.label_word(B.L("vm." + std::to_string(i)));
+    a.word(0); // not code: the end of the table
+    a.align(16);
+    B.data("sw_snc.table"); // in the data area, like SNC's .rodata
+    for (int i = 0; i < 4; i++) a.label_offset_word(B.L("sw_snc." + std::to_string(i)), B.L("sw_snc.table"));
+    a.align(16);
     B.data("toc");
     a.word(0);
     a.word(0);
     a.word(0);
     a.word(0);
     a.label_dword(B.L("sw_toc.table")); // toc + 16
+    a.label_word(B.L("sw_snc.table"));  // toc + 24
 
     const u32 toc = a.address(B.L("toc"));
     return B.finish(toc);

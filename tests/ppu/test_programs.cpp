@@ -264,6 +264,20 @@ TEST_CASE("switches through recognised jump tables")
         c.gpr[3] = x;
         CHECK(both(env().sym("sw_toc"), c).ctx.gpr[3] == sw_toc(x));
     }
+    auto sw_snc = [](u64 x) -> u64 {
+        switch (static_cast<u8>(x - 37)) {
+        case 0: return 70;
+        case 1: return x + 1;
+        case 2: return 72;
+        case 3: return 73;
+        default: return ~0ull;
+        }
+    };
+    for (u64 x : {37ull, 38ull, 39ull, 40ull, 41ull, 36ull, 0ull, 37ull + 256, 38ull + 0x100000000ull, 0xFFFFFFFFull}) {
+        PPUContext c = start_context(650 + x);
+        c.gpr[3] = x;
+        CHECK(both(env().sym("sw_snc"), c).ctx.gpr[3] == sw_snc(x));
+    }
     auto sw_abs = [](u64 x) -> u64 {
         switch (static_cast<u32>(x)) {
         case 0: return 1000;
@@ -277,6 +291,41 @@ TEST_CASE("switches through recognised jump tables")
         PPUContext c = start_context(700 + x);
         c.gpr[3] = x;
         CHECK(both(env().sym("sw_abs"), c).ctx.gpr[3] == sw_abs(x));
+    }
+}
+
+TEST_CASE("a function entered above the code it branches back into starts at its entry")
+{
+    // Regression: the lifter emitted the instructions in address order and started at the lowest one, skipping the
+    // entry's own instructions (GTA V's mbrtowc-style wrappers read a garbage pointer).
+    for (u64 x : {0ull, 1ull, 1000ull}) {
+        PPUContext c = start_context(660 + x);
+        c.gpr[3] = x;
+        c.gpr[7] = 1234;
+        CHECK(both(env().sym("entry_above"), c).ctx.gpr[3] == x + 5);
+    }
+}
+
+TEST_CASE("a bytecode interpreter dispatches through a table set up in its prologue")
+{
+    // GTA V's script VM: the table's address is in r19 from the prologue, the opcode a byte. Lifted, every dispatch is
+    // a switch (run 066: the VM fell back to the interpreter at its first dispatch).
+    // Opcode 4 dispatches across a call: not a recognised table, but its targets are the other tables' (no fallback).
+    const std::vector<std::vector<u8>> programs = {{0}, {1, 1, 2, 3, 2, 0}, {3, 3, 2, 1, 1, 2, 0}, {4, 1, 4, 2, 4, 3, 4, 0}};
+    for (usize i = 0; i < programs.size(); i++) {
+        std::vector<u8> data(256, 0);
+        std::copy(programs[i].begin(), programs[i].end(), data.begin());
+        u64 acc = 0;
+        for (u8 op : programs[i]) {
+            if (op == 1 || op == 4) acc += 1;
+            if (op == 2) acc *= 2;
+            if (op == 3) acc += 10;
+        }
+        PPUContext c = start_context(670 + i);
+        c.gpr[3] = kData;
+        const u64 misses = ps_ppu_dispatch_miss_count();
+        CHECK(both(env().sym("vm"), c, data).ctx.gpr[3] == acc);
+        CHECK(ps_ppu_dispatch_miss_count() == misses);
     }
 }
 

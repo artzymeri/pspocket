@@ -169,7 +169,19 @@ extern "C" void ps_ppu_jump_miss(PPUContext* ctx, uint8_t* base, uint32_t target
     if (should_log_miss(n))
         PS_LOG_WARN(kChan, "indirect jump to {:#010x} has no lifted function: interpreting until return to {:#x}",
             target, stop_lr);
+    // PSPOCKET_PPU_TRACE_MISSES=N: the registers around the first N fallbacks (debugging translated code).
+    static const u64 trace = [] {
+        const char* v = std::getenv("PSPOCKET_PPU_TRACE_MISSES");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    auto dump = [&](const char* when) {
+        std::string s;
+        for (u32 r = 0; r < 32; r++) s += std::format(" r{}={:#x}", r, ctx->gpr[r]);
+        PS_LOG_INFO(kChan, "fallback #{} {}: cia {:#x} lr {:#x} ctr {:#x}{}", n, when, ctx->cia, ctx->lr, ctx->ctr, s);
+    };
+    if (n <= trace) dump("before");
     ps_ppu_interp_until(ctx, base, target, stop_lr, stop_sp);
+    if (n <= trace) dump("after");
 }
 
 extern "C" void ps_ppu_jump_table_miss(PPUContext* ctx, uint8_t* base, uint32_t pc, uint32_t target, uint64_t stop_lr,
