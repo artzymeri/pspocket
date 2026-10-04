@@ -28,7 +28,7 @@ struct rsx_decode_params {
 // TexelDecode values (runtime/rsx/include/pspocket/rsx/texture.hpp)
 constant uint kARGB8 = 1, kDRGB8 = 2, kR5G6B5 = 3, kA1R5G5B5 = 4, kD1R5G5B5 = 5, kA4R4G4B4 = 6, kR5G5B5A1 = 7,
               kR6G5B5 = 8, kB8 = 9, kX32F = 10, kW16F = 11, kW32F = 12, kY16X16F = 13, kX16 = 14, kY16X16 = 15,
-              kDXT1 = 16, kDXT23 = 17, kDXT45 = 18;
+              kDXT1 = 16, kDXT23 = 17, kDXT45 = 18, kD16 = 19;
 
 static uint morton(uint x, uint y, uint lw, uint lh)
 {
@@ -101,7 +101,7 @@ kernel void rsx_decode_texture(device const uchar* src [[buffer(0)]], constant r
 {
     if (gid.x >= p.width || gid.y >= p.height) return;
     float4 c = float4(0.0);
-    if (p.format >= kDXT1) {
+    if (p.format >= kDXT1 && p.format <= kDXT45) {
         c = decode_dxt(src, p, gid);
     } else {
         const uint ex = gid.x + p.border, ey = gid.y + p.border;
@@ -123,7 +123,8 @@ kernel void rsx_decode_texture(device const uchar* src [[buffer(0)]], constant r
         case kW32F: c = float4(as_type<float>(ld32be(src, o)), as_type<float>(ld32be(src, o + 4)),
                                as_type<float>(ld32be(src, o + 8)), as_type<float>(ld32be(src, o + 12))); break;
         case kY16X16F: c = float4(float(as_type<half>(ushort(ld16be(src, o)))), float(as_type<half>(ushort(ld16be(src, o + 2)))), 0.0, 1.0); break;
-        case kX16: c = float4(float(ld16be(src, o)) / 65535.0, 0.0, 0.0, 1.0); break;
+        case kX16:
+        case kD16: c = float4(float(ld16be(src, o)) / 65535.0, 0.0, 0.0, 1.0); break;
         case kY16X16: c = float4(float(ld16be(src, o)) / 65535.0, float(ld16be(src, o + 2)) / 65535.0, 0.0, 1.0); break;
         default: break;
         }
@@ -156,6 +157,25 @@ kernel void rsx_depth_to_texture(depth2d<float, access::read> depth [[texture(0)
     default: c = float4(z); break;
     }
     dst.write(c, gid);
+}
+
+// A colour target read as a texture of another format whose texels are its pixels: the texture sees the target's bytes
+// as the RSX lays them out (A8R8G8B8 as a r g b, A8B8G8R8 as a b g r in memory) and decodes them as its own format
+// (p.x: kY16X16, two big-endian halfwords). p.y: the target is A8B8G8R8 (else A8R8G8B8); p.z: its alpha byte is the
+// pixel's (0), zero (1) or one (2), for the X8 formats.
+kernel void rsx_color_to_texture(texture2d<float, access::read> src [[texture(0)]],
+                                 texture2d<float, access::write> dst [[texture(1)]],
+                                 constant uint4& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    const float4 c = src.read(gid);
+    const uint r = uint(rint(saturate(c.r) * 255.0)), g = uint(rint(saturate(c.g) * 255.0)),
+               b = uint(rint(saturate(c.b) * 255.0));
+    const uint a = p.z == 1u ? 0u : p.z == 2u ? 255u : uint(rint(saturate(c.a) * 255.0));
+    const uint word = p.y != 0u ? (a << 24) | (b << 16) | (g << 8) | r : (a << 24) | (r << 16) | (g << 8) | b;
+    float4 o = float4(0.0, 0.0, 0.0, 1.0);
+    if (p.x == kY16X16) o = float4(float(word >> 16) / 65535.0, float(word & 0xffffu) / 65535.0, 0.0, 1.0);
+    dst.write(o, gid);
 }
 
 // Reads a texture back as float4 per texel (nearest sampling at texel centres: works for every format, BCn included).

@@ -428,7 +428,7 @@ void Rsx::m_nv0039_buffer_notify(u32 reg, u32)
         return;
     }
 
-    backend_.flush_memory(*src, read_length);
+    backend_.flush_memory(*src, read_length, "an NV0039 buffer copy");
     u8* const mem = base();
     if (in_format == 1 && out_format == 1) {
         if (static_cast<u32>(in_pitch) == line_length && static_cast<u32>(out_pitch) == line_length) {
@@ -583,7 +583,7 @@ void Rsx::m_nv3089_image_in(u32 reg, u32 value)
         return;
     }
 
-    backend_.flush_memory(*src, read_length);
+    backend_.flush_memory(*src, read_length, "an NV3089 image copy");
     u8* const mem = base();
     std::vector<u8> tmp(static_cast<size_t>(cols) * in_bpp * rows);
     for (u32 y = 0; y < rows; y++) std::memcpy(tmp.data() + static_cast<size_t>(y) * cols * in_bpp, mem + *src + y * in_pitch, cols * in_bpp);

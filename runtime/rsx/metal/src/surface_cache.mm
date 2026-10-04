@@ -209,6 +209,46 @@ Surface::Conversion* MetalBackend::Impl::depth_as_texture(Surface& d, u32 mode)
     return &conv;
 }
 
+// A colour target read as a texture of another format whose texels are its pixels (D-098): GTA V's first mission reads
+// a 640x360 A8B8G8R8 target as Y16_X16 every frame. Converted on the GPU from the target's bytes, as RPCS3 does, instead
+// of a write-back and a decode from memory (run 066: a GPU sync each time).
+Surface::Conversion* MetalBackend::Impl::color_as_texture(Surface& s, u32 mode)
+{
+    const auto f = static_cast<SurfaceColorFormat>(s.gcm_format);
+    const bool argb = f == SurfaceColorFormat::A8R8G8B8 || f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 ||
+                      f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8;
+    const bool abgr = f == SurfaceColorFormat::A8B8G8R8 || f == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8 ||
+                      f == SurfaceColorFormat::X8B8G8R8_O8B8G8R8;
+    if (s.depth || s.swizzled || (!argb && !abgr) || mode != static_cast<u32>(TexelDecode::Y16X16)) return nullptr;
+    Surface::Conversion& conv = s.conversions[mode];
+    __strong id<MTLTexture>& tex = conv.texture;
+    if (tex && conv.generation == s.generation) return &conv;
+    if (!tex) {
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Unorm
+                                                                                         width:s.width
+                                                                                        height:s.height
+                                                                                     mipmapped:NO];
+        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+        desc.storageMode = MTLStorageModePrivate;
+        tex = [device newTextureWithDescriptor:desc];
+        if (!tex) return nullptr;
+    }
+    const bool x_zero = f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 || f == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8;
+    const bool x_one = f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8 || f == SurfaceColorFormat::X8B8G8R8_O8B8G8R8;
+    end_pass();
+    id<MTLComputeCommandEncoder> enc = [render_buffer() computeCommandEncoder];
+    [enc setComputePipelineState:color_pipeline];
+    [enc setTexture:s.texture atIndex:0];
+    [enc setTexture:tex atIndex:1];
+    const u32 params[4] = {mode, abgr ? 1u : 0u, x_zero ? 1u : x_one ? 2u : 0u, 0};
+    [enc setBytes:params length:sizeof(params) atIndex:0];
+    [enc dispatchThreads:MTLSizeMake(s.width, s.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [enc endEncoding];
+    conv.generation = s.generation;
+    stats.color_conversions++;
+    return &conv;
+}
+
 void MetalBackend::Impl::upload_surface_from_guest(Surface& s)
 {
     // The CPU (or the RSX's own copies) wrote the surface's memory after the GPU copy was made: reload it.
@@ -302,7 +342,7 @@ bool MetalBackend::Impl::read_back(Surface& s, std::vector<u8>& raw, bool stenci
 
 // A depth buffer to guest memory as the RSX lays it out: Z24S8 as big-endian words, depth in the high 24 bits and
 // stencil in the low 8 (RPCS3 surface_store); Z16 as big-endian halfwords.
-bool MetalBackend::Impl::write_back_depth(Surface& s)
+bool MetalBackend::Impl::write_back_depth(Surface& s, const char* why)
 {
     const bool z16 = s.pixel_format == MTLPixelFormatDepth16Unorm;
     if (s.swizzled || (!z16 && s.pixel_format != MTLPixelFormatDepth32Float_Stencil8)) {
@@ -314,8 +354,8 @@ bool MetalBackend::Impl::write_back_depth(Surface& s)
     std::vector<u8> depth, stencil;
     if (!read_back(s, depth) || (!z16 && !read_back(s, stencil, true))) return false;
     stats.readbacks++;
-    PS_LOG_WARN(kChan, "expensive GPU readback: depth buffer {:#010x} {}x{} (#{})", s.address, s.width, s.height,
-        stats.readbacks);
+    PS_LOG_WARN(kChan, "expensive GPU readback: depth buffer {:#010x} {}x{} for {} (#{})", s.address, s.width, s.height,
+        why, stats.readbacks);
     u8* const guest = mem.base();
     for (u32 y = 0; y < s.height; y++) {
         u8* row = guest + s.address + y * s.pitch;
@@ -338,11 +378,11 @@ bool MetalBackend::Impl::write_back_depth(Surface& s)
     return true;
 }
 
-bool MetalBackend::Impl::write_back(Surface& s)
+bool MetalBackend::Impl::write_back(Surface& s, const char* why)
 {
     // GPU -> guest memory in the surface's format (RPCS3 surface_store "flush"). A full pipeline sync on a
     // tile-based GPU: plan section 7 wants every occurrence logged and patched out.
-    if (s.depth) return write_back_depth(s);
+    if (s.depth) return write_back_depth(s, why);
     const auto f = static_cast<SurfaceColorFormat>(s.gcm_format);
     const bool argb = !s.depth && (f == SurfaceColorFormat::A8R8G8B8 || f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 ||
                                       f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8);
@@ -364,7 +404,8 @@ bool MetalBackend::Impl::write_back(Surface& s)
     std::vector<u8> raw;
     if (!read_back(s, raw)) return false;
     stats.readbacks++;
-    PS_LOG_WARN(kChan, "expensive GPU readback: surface {:#010x} {}x{} (#{})", s.address, s.width, s.height, stats.readbacks);
+    PS_LOG_WARN(kChan, "expensive GPU readback: surface {:#010x} {}x{} for {} (#{})", s.address, s.width, s.height, why,
+        stats.readbacks);
 
     if (b8) {
         // One byte per pixel, as the Metal copy holds it (the shader's blue: surface_output_swizzle).

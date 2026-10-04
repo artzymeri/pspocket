@@ -19,7 +19,7 @@ public:
     void flip(const FlipRequest& request, const RsxState& state) override;
     void sync() override {}
     void invalidate_memory(u32, u32) override {}
-    bool flush_memory(u32, u32) override { return false; }
+    bool flush_memory(u32, u32, const char* = "") override { return false; }
 
     u64 draws() const { return draws_.load(std::memory_order_relaxed); }
     u64 clears() const { return clears_.load(std::memory_order_relaxed); }

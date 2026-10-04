@@ -79,8 +79,8 @@ struct Surface {
     u64 last_used = 0;
     std::unordered_map<u32, id<MTLTexture>> views; // swizzled views for sampling, by encoded channel sources
     u64 generation = 0; // render passes that wrote it
-    // A depth buffer read as a texture (D-088): its conversion per decode mode, the generation it was made from, and
-    // its swizzled views.
+    // A depth buffer (D-088) or colour target (D-098) read as a texture of another format: its conversion per decode
+    // mode, the generation it was made from, and its swizzled views.
     struct Conversion {
         id<MTLTexture> texture = nil;
         u64 generation = 0;
@@ -151,6 +151,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> decode_pipeline = nil;
     id<MTLComputePipelineState> read_pipeline = nil;
     id<MTLComputePipelineState> depth_pipeline = nil; // rsx_depth_to_texture
+    id<MTLComputePipelineState> color_pipeline = nil; // rsx_color_to_texture
     id<MTLTexture> dummy_stencil = nil;              // for Z16 buffers, which have none
     id<MTLRenderPipelineState> blit_pipeline = nil;
     id<MTLSamplerState> nearest_sampler = nil;
@@ -239,14 +240,15 @@ struct MetalBackend::Impl {
         MTLPixelFormat pf);
     void evict_overlapping(u32 address, u32 size, const Surface* keep);
     bool read_back(Surface& s, std::vector<u8>& raw, bool stencil = false); // raw texture bytes, tightly packed
-    bool write_back(Surface& s);                      // to guest memory, in the surface's format
-    bool write_back_depth(Surface& s);
+    bool write_back(Surface& s, const char* why);     // to guest memory, in the surface's format
+    bool write_back_depth(Surface& s, const char* why);
     void upload_surface_from_guest(Surface& s);
     void remove_surface(Surface* s);
     id<MTLTexture> copy_texture(id<MTLTexture> src);
     // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the
     // buffer was drawn to since; nil when it cannot be.
     Surface::Conversion* depth_as_texture(Surface& d, u32 mode);
+    Surface::Conversion* color_as_texture(Surface& s, u32 mode);
     id<MTLRenderPipelineState> blit_pipeline_for(MTLPixelFormat format);
     id<MTLTexture> sample_view(id<MTLTexture> tex, std::unordered_map<u32, id<MTLTexture>>& views,
         const std::array<u8, 4>& src); // src: texture_channel_sources, adjusted for what the texture holds

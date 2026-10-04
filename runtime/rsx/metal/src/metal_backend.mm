@@ -14,7 +14,8 @@
 namespace pspocket::rsx::metal {
 
 static_assert(static_cast<u32>(TexelDecode::ARGB8) == 1 && static_cast<u32>(TexelDecode::X16) == 14 &&
-                  static_cast<u32>(TexelDecode::Y16X16) == 15 && static_cast<u32>(TexelDecode::DXT45) == 18,
+                  static_cast<u32>(TexelDecode::Y16X16) == 15 && static_cast<u32>(TexelDecode::DXT45) == 18 &&
+                  static_cast<u32>(TexelDecode::D16) == 19,
     "TexelDecode values are mirrored in kernels.hpp");
 
 // ---- transient allocator ------------------------------------------------------------------------------------------
@@ -91,12 +92,14 @@ bool MetalBackend::Impl::init()
                                                           error:&error];
     depth_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_depth_to_texture"]
                                                            error:&error];
+    color_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_color_to_texture"]
+                                                           error:&error];
     MTLRenderPipelineDescriptor* blit = [MTLRenderPipelineDescriptor new];
     blit.vertexFunction = [kernels newFunctionWithName:@"rsx_fullscreen_vs"];
     blit.fragmentFunction = [kernels newFunctionWithName:@"rsx_blit_fs"];
     blit.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     blit_pipeline = [device newRenderPipelineStateWithDescriptor:blit error:&error];
-    if (!decode_pipeline || !read_pipeline || !depth_pipeline || !blit_pipeline) {
+    if (!decode_pipeline || !read_pipeline || !depth_pipeline || !color_pipeline || !blit_pipeline) {
         PS_LOG_ERROR(kChan, "backend pipelines failed: {}", error ? error.localizedDescription.UTF8String : "?");
         return false;
     }
@@ -1132,7 +1135,7 @@ void MetalBackend::invalidate_memory(u32 addr, u32 size)
     }
 }
 
-bool MetalBackend::flush_memory(u32 addr, u32 size)
+bool MetalBackend::flush_memory(u32 addr, u32 size, const char* why)
 {
     if (!impl_->device) return false;
     bool any = false;
@@ -1152,7 +1155,7 @@ bool MetalBackend::flush_memory(u32 addr, u32 size)
         }
         for (auto& s : impl_->surfaces) {
             if (!s->gpu_newer || s->cpu_newer) continue;
-            if (u64{s->address} < end && addr < u64{s->address} + s->bytes()) any |= impl_->write_back(*s);
+            if (u64{s->address} < end && addr < u64{s->address} + s->bytes()) any |= impl_->write_back(*s, why);
         }
     }
     return any;

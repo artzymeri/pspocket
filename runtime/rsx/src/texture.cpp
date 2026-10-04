@@ -28,7 +28,7 @@ constexpr TextureFormatInfo kFormats[] = {
     {tex::R6G5B5, "R6G5B5", 2, 1, TexelDecode::R6G5B5, DecodedFormat::RGBA8},
     {tex::DEPTH24_D8, "DEPTH24_D8", 4, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::DEPTH24_D8_FLOAT, "DEPTH24_D8_FLOAT", 4, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
-    {tex::DEPTH16, "DEPTH16", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
+    {tex::DEPTH16, "DEPTH16", 2, 1, TexelDecode::D16, DecodedFormat::R16},
     {tex::DEPTH16_FLOAT, "DEPTH16_FLOAT", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::X16, "X16", 2, 1, TexelDecode::X16, DecodedFormat::R16},
     {tex::Y16_X16, "Y16_X16", 4, 1, TexelDecode::Y16X16, DecodedFormat::RG16},
@@ -206,6 +206,7 @@ std::array<u8, 4> texture_channel_sources(const TextureFormatInfo& fmt, u32 rema
     bool float_format = false;
     switch (fmt.decode) {
     case TexelDecode::X32F:
+    case TexelDecode::D16: // RPCS3 VKFormats.cpp get_component_mapping: the depth formats read R in every channel
         base = {0, 0, 0, 0};
         float_format = true;
         break;
@@ -353,7 +354,8 @@ bool decode_level_cpu(const TextureLayout& layout, const TextureLevel& level, co
                 break;
             case TexelDecode::W32Z32Y32X32F: o = {ps_ldf32(p), ps_ldf32(p + 4), ps_ldf32(p + 8), ps_ldf32(p + 12)}; break;
             case TexelDecode::Y16X16F: o = {half_to_float(ps_ld16(p)), half_to_float(ps_ld16(p + 2)), 0.f, 1.f}; break;
-            case TexelDecode::X16: o = {ps_ld16(p) / 65535.f, 0.f, 0.f, 1.f}; break;
+            case TexelDecode::X16:
+            case TexelDecode::D16: o = {ps_ld16(p) / 65535.f, 0.f, 0.f, 1.f}; break;
             case TexelDecode::Y16X16: o = {ps_ld16(p) / 65535.f, ps_ld16(p + 2) / 65535.f, 0.f, 1.f}; break;
             default: return false;
             }

@@ -84,6 +84,7 @@ struct BackendStats {
     u64 surface_samples = 0; // texture binds served by a render target
     u64 readbacks = 0;       // GPU-to-CPU surface readbacks (expensive)
     u64 depth_conversions = 0; // depth buffers converted on the GPU for a texture that reads them (D-088)
+    u64 color_conversions = 0; // colour targets converted on the GPU for a texture of another format (D-098)
     u64 flips = 0;
     u64 command_buffers = 0;
 };
@@ -107,7 +108,7 @@ public:
     void flip(const FlipRequest& request, const RsxState& state) override;
     void sync() override;
     void invalidate_memory(u32 addr, u32 size) override;
-    bool flush_memory(u32 addr, u32 size) override;
+    bool flush_memory(u32 addr, u32 size, const char* why = "a memory read") override;
 
     const BackendStats& stats() const;
 

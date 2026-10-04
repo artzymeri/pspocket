@@ -159,6 +159,8 @@ TEST_CASE("CPU decoders: 16-bit formats are big-endian with RPCS3's bit expansio
     CHECK(decode_one(tex::A4R4G4B4, 0x8f04) == std::array<int, 4>{255, 0, 68, 136});
     CHECK(decode_one(tex::R5G5B5A1, 0xf801) == std::array<int, 4>{255, 0, 0, 255});
     CHECK(decode_one(tex::R6G5B5, 0xfc00) == std::array<int, 4>{255, 0, 0, 255});
+    CHECK(decode_one(tex::DEPTH16, 0xffff) == std::array<int, 4>{255, 0, 0, 255}); // the depth in red, unorm
+    CHECK(decode_one(tex::DEPTH16, 0x8080) == std::array<int, 4>{128, 0, 0, 255});
 }
 
 TEST_CASE("CPU decoders: DXT1, DXT3 and DXT5 blocks")
@@ -221,6 +223,10 @@ TEST_CASE("remap decoding and channel sources")
     CHECK(texture_channel_sources(x16, tex::kRemapIdentity) == std::array<u8, 4>{kChannelOne, 0, kChannelOne, 0});
     const TextureFormatInfo& y16x16 = *texture_format_info(tex::Y16_X16);
     CHECK(texture_channel_sources(y16x16, tex::kRemapIdentity) == std::array<u8, 4>{0, 1, 0, 1});
+    // The depth formats read their value in every channel, like X32_FLOAT.
+    const TextureFormatInfo& d16 = *texture_format_info(tex::DEPTH16);
+    CHECK(d16.decode == TexelDecode::D16);
+    CHECK(texture_channel_sources(d16, tex::kRemapIdentity) == std::array<u8, 4>{0, 0, 0, 0});
 }
 
 TEST_CASE("half floats")

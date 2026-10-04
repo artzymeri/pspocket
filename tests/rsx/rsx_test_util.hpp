@@ -41,7 +41,7 @@ struct RecordingBackend : Backend {
     }
     void sync() override { events.push_back({Kind::Sync}); }
     void invalidate_memory(u32 addr, u32 size) override { events.push_back({Kind::Invalidate, addr, size, {}, {}}); }
-    bool flush_memory(u32 addr, u32 size) override
+    bool flush_memory(u32 addr, u32 size, const char* = "") override
     {
         events.push_back({Kind::Flush, addr, size, {}, {}});
         return false;

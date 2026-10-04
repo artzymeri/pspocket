@@ -162,6 +162,9 @@ TEST_CASE("metal: float texture formats decode exactly")
     CHECK(compare_decode(g, tex_info(tex::X16, 32, 16, 2), 0, 0, false, false) < 1e-7);
     CHECK(compare_decode(g, tex_info(tex::X16, 32, 16, 2), 0, 1, false, false) < 1e-7);
     CHECK(compare_decode(g, tex_info(tex::Y16_X16, 16, 16, 1), 0, 0, false, false) < 1e-7);
+    // DEPTH16 in memory (GTA V's shadow maps outside a depth buffer the cache knows): the depth as 16-bit unorm.
+    CHECK(compare_decode(g, tex_info(tex::DEPTH16, 32, 16, 2), 0, 0, false, false) < 1e-7);
+    CHECK(compare_decode(g, tex_info(tex::DEPTH16, 32, 16, 2), 0, 1, false, false) < 1e-7);
 }
 
 TEST_CASE("metal: DXT1/3/5 decode in compute matches the CPU reference, BC upload agrees")
@@ -1170,6 +1173,36 @@ TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red 
     CHECK(e.backend->stats().textures_decoded == 0);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
+}
+
+TEST_CASE("metal e2e: an A8B8G8R8 target read as a Y16_X16 texture converts on the GPU, without a readback (D-098)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+
+    auto b = e.at(0);
+    // Pass 1: A 0x80, R 0x40, G 0x20, B 0x10 into an A8B8G8R8 target: its bytes are 80 10 20 40
+    setup_surface_as(b, kSurfaceB, SurfaceColorFormat::A8B8G8R8, kW * 4);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x80402010);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    // Pass 2: those bytes as Y16_X16 are 0x8010 and 0x2040, read (A, R, G, B) = (G, R, G, R) as RPCS3 maps them
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kSurfaceB, tex::Y16_X16, kW * 4);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().readbacks == 0); // run 066: a write-back and a decode from memory every frame
+    CHECK(e.backend->stats().color_conversions == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x20, 0x80, 0x20, 0x80});
 }
 
 TEST_CASE("metal e2e: a B8 target read as a B8 texture gives its byte in every channel")

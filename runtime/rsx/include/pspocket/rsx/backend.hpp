@@ -56,7 +56,7 @@ public:
     // The RSX front end is about to read guest memory [addr, addr + size) with the CPU: data that lives only on the
     // GPU (render targets) must be written back first. Returns true if something was written back (an expensive
     // GPU-to-CPU readback; backends log it).
-    virtual bool flush_memory(u32 addr, u32 size) = 0;
+    virtual bool flush_memory(u32 addr, u32 size, const char* why = "a memory read") = 0;
 };
 
 } // namespace pspocket::rsx

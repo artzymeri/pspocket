@@ -244,6 +244,16 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
                 c = c == 3 ? kChannelOne : 0; // a B8 target is an R8 texture; B8 reads its byte in every channel
             }
         }
+        // A texture whose texels are the target's pixels, in a format the GPU converts to (D-098).
+        if (!compatible && fmt->decode == TexelDecode::Y16X16 && surface_color_bpp(s->gcm_format) == 4 &&
+            t.width == s->width && t.height == s->height && (t.format & tex::kLinearFlag) && t.pitch == s->pitch &&
+            !draw_targets.contains(s)) {
+            if (Surface::Conversion* conv = color_as_texture(*s, static_cast<u32>(fmt->decode))) {
+                stats.surface_samples++;
+                bind_source = "target, converted";
+                return sample_view(conv->texture, conv->views, texture_channel_sources(*fmt, t.remap));
+            }
+        }
         if (!compatible) {
             bind_source = "memory, target written back";
             // Another format over the target's bits (the first mission reads an A8B8G8R8 target as Y16_X16): the
@@ -255,7 +265,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
                     "written back and decoded from memory", t.base_format(), t.width, t.height, s->width, s->height,
                     s->gcm_format, s->address);
             }
-            if (s->gpu_newer) write_back(*s);
+            if (s->gpu_newer) write_back(*s, "a texture of another format");
             s = nullptr;
         }
     }
@@ -309,7 +319,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
                     "written back and decoded from memory", t.base_format(), t.width, t.height, d->width, d->height,
                     d->gcm_format, d->address);
             }
-            if (write_back(*d)) bind_source = "memory, depth written back";
+            if (write_back(*d, "a texture")) bind_source = "memory, depth written back";
         }
     }
 
