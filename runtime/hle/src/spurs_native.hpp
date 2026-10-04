@@ -100,6 +100,8 @@ public:
     // workload.
     std::array<u8, 16> loc_contention{};
     u32 current_wid = kIdleWid;
+    // A game's own policy module is reloaded whenever another policy ran in between: logged once per worker.
+    bool custom_load_logged = false;
 
     struct Selection {
         u32 wid = kIdleWid;

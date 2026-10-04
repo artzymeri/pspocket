@@ -92,6 +92,9 @@ uint32_t ps_spu_run(SPUContext* ctx);
 /* Interpreter only, at most max_steps instructions (0 = no limit); PS_SPU_STOP_LIMIT when the limit is hit. */
 uint32_t ps_spu_interpret(SPUContext* ctx, uint64_t max_steps);
 
+/* The context running on this host thread (inside ps_spu_run or ps_spu_interpret), or NULL: for fault reports. */
+SPUContext* ps_spu_current(void);
+
 /* ---------------------------------------------------------------------------------------------------------------
  * Hooks for the lv2 layer (process-wide; set before SPU threads run). They run with the host's default FP
  * environment.

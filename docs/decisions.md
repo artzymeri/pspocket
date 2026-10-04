@@ -907,6 +907,26 @@ by value only, so two threads could both succeed, and a pop could succeed over a
   code lost more than half of 80,000 increments and handed one slot to two threads. The differential fuzz harness now
   takes real reservations on each side (the store on one side moves the line's version on for the other).
 
+## D-067 · 2026-10-04 · /dev_flash is the user's own firmware; SPU faults name their thread, code and memory
+
+Runs 034-038 ended in an SPU DMA from address 0 in GTA V's audio mixer job. The job was loading its MP3 decoder from a
+96 KB buffer that was all zeros: the game's statically linked MultiStream library fills it from
+`/dev_flash/sys/external/flashMP3.pic` (Sony's MP3 codec, SPU code), and pspocket had no /dev_flash, so the load failed
+quietly ("cellMSMP3Decoder: Error loading MP3 codec") and the mixer later ran the empty buffer.
+- **/dev_flash.** As in RPCS3, system files a game reads itself come from the user's own firmware: plan section 8
+  allows LLE of firmware code with the user's file, kept out of the repository. The local firmware script
+  (`inventory/firmware/tools/fw_unself.py --raw flashMP3.pic`) copies such files as they are into
+  `inventory/firmware/dev_flash`; `pspocket-boot --flash DIR` mounts it read-only and boot.sh passes it when it exists.
+  Only what a run shows the game opening is taken (CLAUDE.md rule 4): so far flashMP3.pic. SPURS stays native
+  (D-037); a native MP3 module could replace this one later. The iOS app will need the same file from the user's
+  firmware, as it needs the user's disc.
+- **Fault reports** from code that isn't a PPU thread now name the host thread (`SPURS 10016000 SPU 0`) and, for SPU
+  code, its pc and instruction, the MFC parameters and the registers' preferred words (`ps_spu_current`).
+  `--dump-on-fault FILE` writes the guest memory below the RSX's (and the faulting SPU's local store) for offline
+  reading; it is game data and stays in inventory/. Job chain fatal logs dump the job's descriptor.
+- Reloads of a game's own SPURS policy module are logged once per SPU, then at debug level (thousands per run now
+  that priorities are right, D-064).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

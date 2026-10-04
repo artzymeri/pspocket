@@ -47,8 +47,14 @@ void run_custom(Worker& w, u32 wid, u32 poll_status)
     if (ps_read64(w.ls, ls::k_wkl_addr) != pm) {
         std::memcpy(w.ls + ls::pm_entry, base + pm, size);
         ps_write64(w.ls, ls::k_wkl_addr, pm);
-        PS_LOG_INFO(kCustomChan, "SPURS {:#x} SPU {}: workload {}'s own policy module ({:#x} bytes at {:#x}, argument {:#x}) "
-            "loaded and started", w.sched.spurs, w.spu_num, wid, size, pm, arg);
+        if (!w.custom_load_logged) {
+            PS_LOG_INFO(kCustomChan, "SPURS {:#x} SPU {}: workload {}'s own policy module ({:#x} bytes at {:#x}, argument "
+                "{:#x}) loaded and started (reloads are logged at debug level)", w.sched.spurs, w.spu_num, wid, size, pm, arg);
+            w.custom_load_logged = true;
+        } else {
+            PS_LOG_DEBUG(kCustomChan, "SPURS {:#x} SPU {}: workload {}'s own policy module reloaded", w.sched.spurs, w.spu_num,
+                wid);
+        }
     }
     ps_write32(w.ls, ls::k_wkl_unique, ps_read8(base, info + wkl_off::info_unique));
     ps_write16(w.ls, ls::k_module_id, 0);

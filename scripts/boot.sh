@@ -9,7 +9,7 @@
 # The disc image, read in place: $PSPOCKET_ISO, else a PS3 game .iso in the game's inventory folder
 # (inventory/<game>/), on the Desktop or in Downloads, else the one the app holds on the connected iPhone, copied once
 # to inventory/<game>/disc.iso (scripts/ios.sh pull-iso). The game's /dev_hdd0 (game data, saves) is
-# inventory/<game>/hdd0.
+# inventory/<game>/hdd0. /dev_flash is inventory/firmware/dev_flash when it exists (the user's own firmware, D-067).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -67,6 +67,12 @@ if [ -n "$ISO" ]; then
     DISC=(--bdvd "$ISO")
 fi
 mkdir -p "$GAME_DIR/hdd0/game"
+# /dev_flash: the system files a game reads itself, from the user's own firmware (D-067), when they have been taken
+# out of it: inventory/firmware/tools/fw_unself.py --raw flashMP3.pic writes inventory/firmware/dev_flash.
+FLASH=()
+if [ -d inventory/firmware/dev_flash ]; then
+    FLASH=(--flash inventory/firmware/dev_flash)
+fi
 
 n=1
 while [ -e "$(printf 'inventory/boot-%03d.log' "$n")" ]; do n=$((n + 1)); done
@@ -74,7 +80,8 @@ LOG="$(printf 'inventory/boot-%03d.log' "$n")"
 
 echo "boot.sh: $ELF -> $LOG"
 status=0
-"$BOOT" "$ELF" --timeout 60 --hdd0 "$GAME_DIR/hdd0" ${DISC[@]+"${DISC[@]}"} "$@" > "$LOG" 2>&1 || status=$?
+"$BOOT" "$ELF" --timeout 60 --hdd0 "$GAME_DIR/hdd0" ${DISC[@]+"${DISC[@]}"} ${FLASH[@]+"${FLASH[@]}"} "$@" > "$LOG" 2>&1 ||
+    status=$?
 # The gaps and the end of the run; with the thread report (D-053) when there is one, which is longer than a screen.
 if grep -q '^==== thread report' "$LOG"; then
     grep -E 'UNIMPLEMENTED|\[fatal\]' "$LOG" | tail -10 || true

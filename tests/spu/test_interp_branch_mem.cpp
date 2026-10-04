@@ -217,6 +217,36 @@ TEST_CASE("no-ops and special registers")
     CHECK(hex(m.r(3)) == "00000000 00000000 00000000 00000000");
 }
 
+namespace {
+SPUContext* g_seen_current = nullptr;
+int note_current(SPUContext*, uint32_t code)
+{
+    g_seen_current = ps_spu_current();
+    return code == 0x10; // continue after the first stop, stop at the second
+}
+} // namespace
+
+// ps_spu_current names the context a host thread is running (pspocket-boot's fault report reads it): set inside
+// ps_spu_run, through the stop hooks it calls, and cleared when the run returns.
+TEST_CASE("run loop: ps_spu_current is the running context, and null outside a run")
+{
+    as::Assembler a(0x100);
+    a.emit(as::stop(0x10));
+    a.emit(as::stop(0x20));
+    Machine m;
+    m.load(0x100, a.finish());
+    const ps_spu_hooks hooks{note_current, nullptr};
+    m.ctx.hooks = &hooks;
+    m.ctx.pc = 0x100;
+    CHECK(ps_spu_current() == nullptr);
+    g_seen_current = nullptr;
+    CHECK(ps_spu_run(&m.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(m.ctx.stop_code == 0x20u);
+    CHECK(g_seen_current == &m.ctx);
+    CHECK(ps_spu_current() == nullptr);
+    m.ctx.hooks = nullptr;
+}
+
 TEST_CASE("run loop: a loop with a call, executed by ps_spu_interpret")
 {
     // sum = 0; for (i = 10; i != 0; i--) sum += double(i); stop 0x1234

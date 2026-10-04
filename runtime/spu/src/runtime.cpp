@@ -20,6 +20,16 @@ using namespace pspocket::spu;
 
 namespace {
 
+// The context ps_spu_run / ps_spu_interpret is running on this thread (ps_spu_current); nested runs restore the outer.
+thread_local SPUContext* t_current = nullptr;
+struct CurrentContext {
+    explicit CurrentContext(SPUContext* ctx) : previous(t_current) { t_current = ctx; }
+    ~CurrentContext() { t_current = previous; }
+    CurrentContext(const CurrentContext&) = delete;
+    CurrentContext& operator=(const CurrentContext&) = delete;
+    SPUContext* previous;
+};
+
 static_assert(std::endian::native == std::endian::little, "ps_spu_hash64 reads words in little-endian order");
 
 std::mutex g_registry_mutex;
@@ -160,8 +170,11 @@ void ps_spu_set_miss_policy(ps_spu_miss_policy policy) { g_miss_policy.store(pol
 ps_spu_miss_policy ps_spu_get_miss_policy(void) { return g_miss_policy.load(); }
 uint64_t ps_spu_miss_count(void) { return g_miss_count.load(); }
 
+SPUContext* ps_spu_current(void) { return t_current; }
+
 uint32_t ps_spu_run(SPUContext* ctx)
 {
+    const CurrentContext current(ctx);
     const u64 fp = ps_spu_fpenv_enter();
     ctx->stop_reason = PS_SPU_STOP_NONE;
     ctx->exception = PS_SPU_EXC_NONE;
@@ -185,6 +198,7 @@ uint32_t ps_spu_run(SPUContext* ctx)
 
 uint32_t ps_spu_interpret(SPUContext* ctx, uint64_t max_steps)
 {
+    const CurrentContext current(ctx);
     const u64 fp = ps_spu_fpenv_enter();
     ctx->stop_reason = PS_SPU_STOP_NONE;
     ctx->exception = PS_SPU_EXC_NONE;

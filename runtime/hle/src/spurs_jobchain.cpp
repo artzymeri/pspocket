@@ -218,6 +218,7 @@ private:
     u8 tags_[2]{};
     u32 sdk_ = 0;
     u32 jobs_run_ = 0;
+    u32 job_ea_ = 0; // the descriptor of the job being loaded or run, for fatal logs
     Heap heap_;
     std::array<CacheEntry, kCacheEntries> cache_{};
     u64 stamp_ = 0;
@@ -226,8 +227,16 @@ private:
 
 [[noreturn]] void JobChainPolicy::fatal(std::string_view what) const
 {
-    PS_FATAL(kJobChan, "SPURS {:#x} SPU {}, job chain {:#x} (workload {}): {} (pc {:#x})", w_.sched.spurs, w_.spu_num, jc_,
-        wid_, what, ps_read64(base_, jc_ + jc_off::pc));
+    // The descriptor of the job at hand as the PPU wrote it (header, DMA list and cache list), when there is one.
+    std::string job;
+    const u32 size = ps_read16(base_, jc_ + jc_off::sizeJobDescriptor);
+    if (job_ea_ && size <= 0x800 && w_.sched.kernel.memory().is_committed(job_ea_) &&
+        w_.sched.kernel.memory().is_committed(job_ea_ + size - 1)) {
+        job = std::format("; descriptor {:#x}:", job_ea_);
+        for (u32 off = 0; off < size; off += 4) job += std::format("{}{:08x}", off % 16 ? " " : "  ", ps_read32(base_, job_ea_ + off));
+    }
+    PS_FATAL(kJobChan, "SPURS {:#x} SPU {}, job chain {:#x} (workload {}): {} (pc {:#x}){}", w_.sched.spurs, w_.spu_num,
+        jc_, wid_, what, ps_read64(base_, jc_ + jc_off::pc), job);
 }
 
 void JobChainPolicy::init()
@@ -757,6 +766,7 @@ bool JobChainPolicy::run_job(const Job& job)
         fail(CELL_SPURS_JOB_ERROR_JOB_ALIGNMENT, job.ea);
         return false;
     }
+    job_ea_ = job.ea;
     const u32 desc = desc_base_ + (jobs_run_ % kRing) * max_size_;
     const u32 tag = tags_[jobs_run_ % 2]; // jobs alternate between the chain's two tags
     jobs_run_++;

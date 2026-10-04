@@ -2,13 +2,16 @@
 // exits, a timeout passes or (with --stop-at-first) it reaches the first unimplemented syscall or firmware function.
 // This is the Phase 2 bring-up tool (plan section 10): the log names every gap the game hits, in order.
 //
-//   pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]
-//                 [--report-every SECONDS] [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]
-//                 [--gpu null|metal] [--frames DIR] [--frame-every N]
+//   pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]
+//                 [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]
+//                 [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]
+//                 [--frame-every N] [--dump-on-fault FILE]
 //   pspocket-boot --probe-disc IMAGE.iso
 //
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
 // /app_home from PS3_GAME/USRDIR unless --app-home says otherwise).
+// --flash mounts DIR read-only as /dev_flash: the system files a game reads itself (GTA V's MultiStream loads its MP3
+// codec, sys/external/flashMP3.pic), taken from the user's own firmware and kept out of the repository (D-067).
 // --imports lists every imported function by module (implemented ones marked) and exits without running.
 // A host fault inside guest memory (an access to an unmapped guest address) is reported with the guest address and
 // the faulting PPU thread's instruction address before the process dies (CLAUDE.md rule 5).
@@ -17,6 +20,10 @@
 // --gpu metal draws the game's frames with the Metal backend (Apple platforms; the default null backend runs the
 // commands and draws nothing). --frames DIR (which implies Metal) saves every Nth presented frame (--frame-every,
 // 60 by default) as DIR/frame-NNNNNN.png: what the game shows, at the backend's output size.
+// --dump-on-fault FILE writes the guest's committed memory below the RSX's local memory to FILE when a guest fault
+// ends the run, for offline analysis (game data: keep it in inventory/). The file is a sequence of blocks: a
+// big-endian u32 guest address, a u32 byte count, then the bytes. A fault in SPU code also writes that SPU's local
+// store (256 KB) to FILE.ls.
 //
 // The executable must be a decrypted ELF (RPCS3's --decrypt writes one). Game files stay outside the repository.
 
@@ -33,6 +40,7 @@
 #include <string_view>
 #include <vector>
 
+#include <pthread.h>
 #include <unistd.h>
 
 #include "pspocket/core/be.h"
@@ -51,6 +59,8 @@
 #endif
 #include "pspocket/ppu/disasm.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/spu/disasm.hpp"
+#include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
 
@@ -59,9 +69,10 @@ namespace {
 int usage()
 {
     std::fprintf(stderr,
-        "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]\n"
-        "                     [--report-every SECONDS] [--stop-at-first] [--log trace|debug|info|warn|error]\n"
-        "                     [--imports] [--gpu null|metal] [--frames DIR] [--frame-every N]\n"
+        "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]\n"
+        "                     [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]\n"
+        "                     [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]\n"
+        "                     [--frame-every N] [--dump-on-fault FILE]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -71,10 +82,54 @@ GuestMemory* g_memory = nullptr;
 hle::HleProcess* g_hle = nullptr;
 std::atomic<lv2::Kernel*> g_kernel{nullptr};
 volatile sig_atomic_t g_fault_signal = 0;
+std::string g_dump_path; // --dump-on-fault
 
 void write_err(const char* text, int n)
 {
     if (n > 0) (void)!write(STDERR_FILENO, text, static_cast<size_t>(n));
+}
+
+// Writes the committed guest memory below the RSX's local memory to g_dump_path (--dump-on-fault): blocks of a
+// big-endian address and byte count, then the bytes. Best effort, from the fault handler.
+void dump_guest_memory()
+{
+    if (g_dump_path.empty() || !g_memory) return;
+    std::FILE* f = std::fopen(g_dump_path.c_str(), "wb");
+    if (!f) return;
+    // Runs of committed 4 KB pages, each written as one block.
+    u64 total = 0;
+    u64 addr = 0;
+    while (addr < PS_MEM_RSX_LOCAL_BASE) {
+        if (!g_memory->is_committed(static_cast<u32>(addr))) {
+            addr += PS_GUEST_PAGE_SIZE;
+            continue;
+        }
+        u64 end = addr + PS_GUEST_PAGE_SIZE;
+        while (end < PS_MEM_RSX_LOCAL_BASE && g_memory->is_committed(static_cast<u32>(end))) end += PS_GUEST_PAGE_SIZE;
+        const u32 a = static_cast<u32>(addr), size = static_cast<u32>(end - addr);
+        const u8 header[8] = {static_cast<u8>(a >> 24), static_cast<u8>(a >> 16), static_cast<u8>(a >> 8),
+            static_cast<u8>(a), static_cast<u8>(size >> 24), static_cast<u8>(size >> 16), static_cast<u8>(size >> 8),
+            static_cast<u8>(size)};
+        std::fwrite(header, 1, sizeof header, f);
+        std::fwrite(g_guest_base + a, 1, size, f);
+        total += size;
+        addr = end;
+    }
+    std::fclose(f);
+    char buf[256];
+    int n = std::snprintf(buf, sizeof buf, "  guest memory (%llu MB) written to %s\n",
+        static_cast<unsigned long long>(total >> 20), g_dump_path.c_str());
+    write_err(buf, std::min<int>(n, sizeof buf - 1));
+    // The faulting SPU's local store, when the fault is in SPU code.
+    if (const SPUContext* spu = ps_spu_current()) {
+        const std::string ls_path = g_dump_path + ".ls";
+        if (std::FILE* l = std::fopen(ls_path.c_str(), "wb")) {
+            std::fwrite(spu->ls, 1, 0x40000, l);
+            std::fclose(l);
+            n = std::snprintf(buf, sizeof buf, "  the SPU's local store written to %s\n", ls_path.c_str());
+            write_err(buf, std::min<int>(n, sizeof buf - 1));
+        }
+    }
 }
 
 // The thread report (lv2/report.hpp), with the HLE function behind each import stub named.
@@ -159,6 +214,29 @@ void on_fault(int sig, siginfo_t* info, void*)
     }
     write_err(buf, std::min<int>(n, sizeof buf - 1));
     if (c) report_call_site(*c);
+    if (!t) {
+        // Not a PPU thread: name the host thread (SPURS workers, the RSX, cellAudio...) and the SPU code it runs.
+        char name[64] = "?";
+        pthread_getname_np(pthread_self(), name, sizeof name);
+        n = std::snprintf(buf, sizeof buf, "  on host thread \"%s\"\n", name);
+        write_err(buf, std::min<int>(n, sizeof buf - 1));
+        if (const SPUContext* spu = ps_spu_current()) {
+            const u32 pc = spu->pc & 0x3FFFC;
+            const std::string insn = spu::disassemble(ps_read32(spu->ls, pc), pc);
+            n = std::snprintf(buf, sizeof buf, "  SPU code at 0x%05x: %s; MFC parameters: LSA 0x%05x, EA 0x%08x%08x, "
+                                               "size 0x%x, tag %u\n",
+                pc, insn.c_str(), spu->ch.mfc_lsa, spu->ch.mfc_eah, spu->ch.mfc_eal, spu->ch.mfc_size, spu->ch.mfc_tag);
+            write_err(buf, std::min<int>(n, sizeof buf - 1));
+            // The registers' preferred words ($0 is the link register, $1 the stack pointer).
+            for (u32 row = 0; row < 32; row += 8) {
+                n = std::snprintf(buf, sizeof buf, "  $%u..$%u = %08x %08x %08x %08x %08x %08x %08x %08x\n", row, row + 7,
+                    spu->gpr[row].u32[3], spu->gpr[row + 1].u32[3], spu->gpr[row + 2].u32[3], spu->gpr[row + 3].u32[3],
+                    spu->gpr[row + 4].u32[3], spu->gpr[row + 5].u32[3], spu->gpr[row + 6].u32[3], spu->gpr[row + 7].u32[3]);
+                write_err(buf, std::min<int>(n, sizeof buf - 1));
+            }
+        }
+    }
+    if (guest) dump_guest_memory();
     // What every thread was doing. Best effort, like the call site: it locks and allocates, so a watchdog ends the
     // process if the faulting thread held a lock the report needs.
     if (lv2::Kernel* kernel = g_kernel.load(); guest && kernel) {
@@ -229,7 +307,7 @@ int main(int argc, char** argv)
     }
     if (argc < 2) return usage();
     const char* elf_path = nullptr;
-    std::string bdvd, hdd0, app_home;
+    std::string bdvd, hdd0, flash, app_home;
     double timeout_s = 30;
     double report_every_s = 0; // 0: only at the end
     bool stop_at_first = false;
@@ -241,6 +319,7 @@ int main(int argc, char** argv)
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
         if (a == "--bdvd") { const char* v = value(); if (!v) return usage(); bdvd = v; }
         else if (a == "--hdd0") { const char* v = value(); if (!v) return usage(); hdd0 = v; }
+        else if (a == "--flash") { const char* v = value(); if (!v) return usage(); flash = v; }
         else if (a == "--app-home") { const char* v = value(); if (!v) return usage(); app_home = v; }
         else if (a == "--timeout") { const char* v = value(); if (!v) return usage(); timeout_s = std::atof(v); }
         else if (a == "--report-every") {
@@ -262,6 +341,7 @@ int main(int argc, char** argv)
             if (!v || std::atoi(v) <= 0) return usage();
             frame_every = static_cast<u32>(std::atoi(v));
         }
+        else if (a == "--dump-on-fault") { const char* v = value(); if (!v) return usage(); g_dump_path = v; }
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
         else if (a == "--log") {
@@ -369,6 +449,7 @@ int main(int argc, char** argv)
         if (read_file((bdvd + "/PS3_GAME/PARAM.SFO").c_str(), sfo)) game.param_sfo = std::move(sfo);
     }
     if (!hdd0.empty() && !kernel.vfs_mount("/dev_hdd0", hdd0, false)) return 66;
+    if (!flash.empty() && !kernel.vfs_mount("/dev_flash", flash, true)) return 66;
     if (!app_home.empty() && !kernel.vfs_mount("/app_home", app_home, false)) return 66;
 
     hle::ProcessConfig process_config;
