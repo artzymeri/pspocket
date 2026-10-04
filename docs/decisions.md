@@ -789,6 +789,25 @@ quirks: a "+hhmm" time zone reads as hh * 60 + hhmm % 60 minutes, a day below '0
 report: both now read the host clock through `lv2::host_current_time` and `host_time_zone`. Pointers are checked
 against mapped guest memory, as RPCS3 does with sys_memory_get_page_attribute.
 
+## D-061 · 2026-10-04 · Voice, trophies, network control, background music: offline as RPCS3
+
+The small gaps of runs 029 and 030. Each function makes RPCS3's checks in RPCS3's order and takes its path with no
+network, no PSN and no voice devices.
+- **cellVoice** (14 functions): the game's ports kept as data with RPCS3's IDs (a creation counter mod 0xA0 in the
+  low byte) and its input/output topology checks; the device reads as detached, reads return nothing, writes go
+  nowhere.
+- **cellNetCtl** stays disconnected: GetInfo answers only the Ethernet address (FF:FF:FF:FF:FF:FF, as RPCS3 before it
+  finds one), NAT info is RPCS3's fixed type 2 with STUN OK, the network start dialog reports LOADED and FINISHED
+  500 ms after the load and is canceled at unload. The two events go out from the first `cellSysutilCheckCallback`
+  500 ms after the load, rather than from a helper thread as in RPCS3, so no host thread outlives the process.
+- **sceNpTrophy:** init, term, contexts and handles with RPCS3's IDs and communication-signature checks. Installing
+  TROPHY.TRP from the disc (RegisterContext) and the calls that read or write the installed set wait for a log to show
+  them.
+- **Background music:** RPCS3's state, starting disabled with the player stopped. `sys_net_free_thread_context`
+  returns CELL_OK.
+- Where RPCS3 would fault on an unchecked guest pointer, the call site is logged and the call refused with the
+  module's address error (D-042).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

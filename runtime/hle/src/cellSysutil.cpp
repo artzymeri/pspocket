@@ -1,10 +1,10 @@
-// cellSysutil, cellSysutilAvconfExt: system utility callbacks, system parameters, the system cache (/dev_hdd1) and
-// video and audio output state. Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellSysutil.cpp/.h, cellVideoOut.cpp/.h,
-// cellAudioOut.cpp/.h, cellSysCache.cpp, cellAvconfExt.cpp, with RPCS3's default configuration (Emu/system_config.h,
-// rsx::avconf in Emu/RSX/Utils/rsx_utils.h).
+// cellSysutil, cellSysutilAvconfExt: system utility callbacks, system parameters, the system cache (/dev_hdd1),
+// video and audio output state, and background music playback. Reference: RPCS3 rpcs3/Emu/Cell/Modules/
+// cellSysutil.cpp/.h, cellVideoOut.cpp/.h, cellAudioOut.cpp/.h, cellSysCache.cpp, cellAvconfExt.cpp, with RPCS3's
+// default configuration (Emu/system_config.h, rsx::avconf in Emu/RSX/Utils/rsx_utils.h).
 //
-// Implemented: what GTA V imports from these modules except the dialog, on-screen keyboard, save data and BGM
-// functions, which nothing has called yet (CLAUDE.md rule 4).
+// Implemented: what GTA V imports from these modules except the dialog, on-screen keyboard and save data functions,
+// which nothing has called yet (CLAUDE.md rule 4).
 //
 // The console reported is RPCS3's default one, which also suits a fixed iPhone target: one HDMI display at 720p
 // (1280x720 progressive, 16:9: the PS3 mode closest to a phone screen, and the resolution most games render at), RGB,
@@ -60,6 +60,7 @@ constexpr std::string_view kChan = "cellSysutil";
 constexpr std::string_view kAvconfChan = "cellAvconfExt";
 
 enum : u32 {
+    CELL_SYSUTIL_BGMPLAYBACK_ERROR_PARAM = 0x8002b101,
     CELL_SYSUTIL_ERROR_VALUE = 0x8002b102,
     CELL_SYSUTIL_ERROR_SIZE = 0x8002b103,
     CELL_SYSUTIL_ERROR_BUSY = 0x8002b105,
@@ -85,6 +86,7 @@ std::string result_name(s32 r)
 {
     switch (static_cast<u32>(r)) {
     case 0: return "CELL_OK";
+    case CELL_SYSUTIL_BGMPLAYBACK_ERROR_PARAM: return "CELL_SYSUTIL_BGMPLAYBACK_ERROR_PARAM";
     case CELL_SYSUTIL_ERROR_VALUE: return "CELL_SYSUTIL_ERROR_VALUE";
     case CELL_SYSUTIL_ERROR_SIZE: return "CELL_SYSUTIL_ERROR_SIZE";
     case CELL_SYSUTIL_ERROR_BUSY: return "CELL_SYSUTIL_ERROR_BUSY";
@@ -133,6 +135,9 @@ enum class Fn : u8 {
     AudioOutGetSoundAvailability,
     VideoOutSetGamma,
     AudioOutGetAvailableDeviceInfo,
+    EnableBgmPlayback,
+    DisableBgmPlayback,
+    GetBgmPlaybackStatus,
     Count,
 };
 
@@ -244,6 +249,9 @@ std::string_view event_name(u64 status)
     case CELL_SYSUTIL_SYSTEM_MENU_CLOSE: return "SYSTEM_MENU_CLOSE";
     case CELL_SYSUTIL_BGMPLAYBACK_PLAY: return "BGMPLAYBACK_PLAY";
     case CELL_SYSUTIL_BGMPLAYBACK_STOP: return "BGMPLAYBACK_STOP";
+    case 0x0801: return "NET_CTL_NETSTART_LOADED"; // sent by cellNetCtl
+    case 0x0802: return "NET_CTL_NETSTART_FINISHED";
+    case 0x0803: return "NET_CTL_NETSTART_UNLOADED";
     }
     return "?";
 }
@@ -957,6 +965,70 @@ s32 cellAudioOutGetAvailableDeviceInfo(PPUContext&, u32 count, u32 info)
     return call.ok(0, "0 devices");
 }
 
+// ------------------------------------------------------------------------ background music (cellSysutil.cpp)
+
+// CellSysutilBgmPlaybackStatus (32 bytes): u8 playerState, enableState; char contentId[16]; u8 currentFadeRatio;
+// char reserved[13].
+constexpr u32 kBgmStatusSize = 32;
+constexpr u8 CELL_SYSUTIL_BGMPLAYBACK_STATUS_PLAY = 0, CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP = 1;
+constexpr u8 CELL_SYSUTIL_BGMPLAYBACK_STATUS_ENABLE = 0, CELL_SYSUTIL_BGMPLAYBACK_STATUS_DISABLE = 1;
+
+// RPCS3 bgm_manager: whether the user's own music (the system's background music player) may play over the game. There
+// is no such player (nor in RPCS3), so it stays stopped, with no content and a fade ratio of 0. Playback starts out
+// disabled, as in RPCS3. Enabling and disabling only change that state: RPCS3's fade between the system's music and
+// the game's is a TODO, and no BGMPLAYBACK event is sent.
+struct BgmState {
+    std::mutex mutex;
+    u8 enable_state = CELL_SYSUTIL_BGMPLAYBACK_STATUS_DISABLE;
+    u8 player_state = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
+};
+
+s32 set_bgm_enable_state(Fn fn, std::string_view name, u8 enable_state)
+{
+    const Call call(fn, kInfoCalls, kChan, "{}()", name);
+    BgmState& b = state<BgmState>();
+    std::lock_guard lock(b.mutex);
+    b.enable_state = enable_state;
+    return call(lv2::CELL_OK);
+}
+
+s32 cellSysutilEnableBgmPlayback(PPUContext&)
+{
+    return set_bgm_enable_state(Fn::EnableBgmPlayback, "cellSysutilEnableBgmPlayback",
+        CELL_SYSUTIL_BGMPLAYBACK_STATUS_ENABLE);
+}
+
+s32 cellSysutilDisableBgmPlayback(PPUContext&)
+{
+    return set_bgm_enable_state(Fn::DisableBgmPlayback, "cellSysutilDisableBgmPlayback",
+        CELL_SYSUTIL_BGMPLAYBACK_STATUS_DISABLE);
+}
+
+// The whole status is written (RPCS3 copies its bgm_manager::status): the two states, then zeros. Deviation: a pointer
+// that is not guest memory is refused with CELL_SYSUTIL_BGMPLAYBACK_ERROR_PARAM and the call site logged (D-042;
+// RPCS3 faults).
+s32 cellSysutilGetBgmPlaybackStatus(PPUContext& ctx, u32 status)
+{
+    const Call call(Fn::GetBgmPlaybackStatus, kPolledInfoCalls, kChan, "cellSysutilGetBgmPlaybackStatus({:#x})",
+        status);
+    if (!status) return call(error(CELL_SYSUTIL_BGMPLAYBACK_ERROR_PARAM));
+    if (!guest_readable(thread_of(ctx), status, kBgmStatusSize)) {
+        log_call_site(ctx, guest_base(ctx),
+            std::format("cellSysutilGetBgmPlaybackStatus: {:#x} is not guest memory", status));
+        return call(error(CELL_SYSUTIL_BGMPLAYBACK_ERROR_PARAM));
+    }
+    BgmState& b = state<BgmState>();
+    std::lock_guard lock(b.mutex);
+    u8* base = guest_base(ctx);
+    std::memset(base + status, 0, kBgmStatusSize);
+    ps_write8(base, status + 0, b.player_state);
+    ps_write8(base, status + 1, b.enable_state);
+    const bool playing = b.player_state == CELL_SYSUTIL_BGMPLAYBACK_STATUS_PLAY;
+    const bool enabled = b.enable_state == CELL_SYSUTIL_BGMPLAYBACK_STATUS_ENABLE;
+    return call.ok(lv2::CELL_OK, "player {}, playback {}", playing ? "playing" : "stopped",
+        enabled ? "enabled" : "disabled");
+}
+
 } // namespace
 
 s32 sysutil_send_event(u64 status, u64 param)
@@ -1023,6 +1095,9 @@ void register_cellSysutil(Registry& r)
         PS_HLE_FUNC(0x4692AB35, cellAudioOutConfigure),
         PS_HLE_FUNC(0xED5D96AF, cellAudioOutGetConfiguration),
         PS_HLE_FUNC(0xC01B4E7C, cellAudioOutGetSoundAvailability),
+        PS_HLE_FUNC(0x220894E3, cellSysutilEnableBgmPlayback),
+        PS_HLE_FUNC(0xCFDD8E87, cellSysutilDisableBgmPlayback),
+        PS_HLE_FUNC(0xA11552F6, cellSysutilGetBgmPlaybackStatus),
     });
     r.add("cellSysutilAvconfExt", {
         PS_HLE_FUNC(0xC7020F62, cellVideoOutSetGamma),

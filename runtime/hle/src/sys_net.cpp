@@ -24,6 +24,15 @@ s32 sys_net_show_ifconfig(PPUContext&)
     return lv2::CELL_OK;
 }
 
+// sys_net_free_thread_context(u64 tid, s32 flags). RPCS3: a TODO that returns CELL_OK. libnet frees the context it
+// keeps for a thread that used it (its errno and resolver state); there is none here.
+s32 sys_net_free_thread_context(PPUContext&, u64 tid, s32 flags)
+{
+    PS_LOG_DEBUG(kChan, "sys_net_free_thread_context(tid {:#x}, flags {}): no thread context; CELL_OK (as RPCS3)", tid,
+        flags);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_sys_net(Registry& r)
@@ -31,6 +40,7 @@ void register_sys_net(Registry& r)
     r.add("sys_net", {
         PS_HLE_FUNC(0x139A9E9B, sys_net_initialize_network_ex),
         PS_HLE_FUNC(0xB48636C4, sys_net_show_ifconfig),
+        PS_HLE_FUNC(0xFDB8F926, sys_net_free_thread_context),
     });
 }
 

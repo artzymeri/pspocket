@@ -9,10 +9,12 @@ add_library(pspocket_hle STATIC
     src/cellSpurs.cpp
     src/cellSysmodule.cpp
     src/cellSysutil.cpp
+    src/cellVoice.cpp
     src/modules.cpp
     src/process.cpp
     src/psf.cpp
     src/sceNp.cpp
+    src/sceNpTrophy.cpp
     src/spurs_custom.cpp
     src/spurs_jobchain.cpp
     src/spurs_scheduler.cpp
