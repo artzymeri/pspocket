@@ -1487,6 +1487,22 @@ over its block).
   seeds are not kept, and a later lift without them would have lost that code.
 - Test: a module copied in, then 300 pieces of data, then run: lifted (fails with the old table).
 
+## D-100 · 2026-10-05 · Shadow-map lookups compare depth; atlas tiles are separate surfaces
+
+- A depth-format texture (DEPTH16, DEPTH24_D8 and their float forms) with a compare function other than never and
+  always, and no alpha kill, is a shadow lookup (RPCS3 RSXThread.cpp shadow_textures): TEX and TXP return the
+  comparison of the coordinate's z (TXP: z / w) against the depth, in every channel, instead of the depth. The
+  translator has a Shadow2D texture kind; `rsx_shadow` compares the texel at uv, or with linear filtering the 2x2
+  texels around it and blends them bilinearly (percentage-closer filtering, as RPCS3's comparison samplers do); the
+  compare function and filtering come in the unit's tex_scale.zw, so they do not multiply the shaders. The reference
+  saturates at 1 for the integer depth formats (RPCS3 _texcoord_xform_shadow).
+- Run 070's frame trace showed GTA V's shadow cascades as 128x128 Z16 tiles of one depth atlas (zeta offsets 0x100
+  apart, pitch 0x400): each tile's surface replaced the one before, since their bytes interleave, and the cascades were
+  read from stale memory. Surfaces that share a pitch now overlap only where their pixel rectangles do (rows that wrap
+  past the pitch still compare bytes). Run 071: every DEPTH16 texture of the traced frame is a converted depth buffer.
+- Tests: a shadow lookup with nearest and linear filtering, end to end (the blended values at the edge); the translation;
+  two depth tiles of one atlas cleared to different depths and read as textures (fails with the byte overlap).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

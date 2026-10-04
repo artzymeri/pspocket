@@ -75,7 +75,9 @@ static_assert(sizeof(MslVsParams) == 80 + 16 * 48);
 
 struct alignas(16) MslFsParams {
     float wpos[4] = {1.f, 0.f, 0.f, 0.f}; // WPOS: y' = y * wpos[0] + wpos[1]; x', y' += wpos[2]
-    float tex_scale[16][4] = {};          // xy: coordinate multipliers (1/size for unnormalised textures)
+    float tex_scale[16][4] = {};          // xy: coordinate multipliers (1/size for unnormalised textures); for
+                                          // Shadow2D, z: the compare function, w: 1 linear filtering + 2 clamp
+                                          // the reference to 1 (integer depth)
     u32 alpha_func = 0x207;               // CompareFunc, only read when FpOptions::alpha_test
     float alpha_ref = 0.f;
     u32 pad0 = 0, pad1 = 0;
@@ -86,7 +88,9 @@ struct VpOptions {
     bool point_size = false; // emit [[point_size]] (point primitives)
 };
 
-enum class TextureKind : u8 { Tex2D = 0, Cube = 1, Tex1D = 2 };
+// Shadow2D: a depth texture sampled with a depth comparison (RPCS3 shadow_textures: a depth format and a compare
+// function other than never and always); the lookup returns the comparison's result in every channel.
+enum class TextureKind : u8 { Tex2D = 0, Cube = 1, Tex1D = 2, Shadow2D = 3 };
 
 struct FpOptions {
     u32 shader_control = 0; // NV4097_SET_SHADER_CONTROL (0x40: 32-bit exports, 0xe: depth export)

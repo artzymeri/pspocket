@@ -1315,6 +1315,100 @@ TEST_CASE("metal e2e: a Z16 depth buffer reads as X16 (its value) and as DEPTH16
     }
 }
 
+TEST_CASE("metal e2e: a DEPTH16 texture with a compare function returns the depth comparison (shadow maps)")
+{
+    REQUIRE_METAL();
+    // A 32x64 depth texture over the 64x64 target: depth 0.25 in its left half, 0.75 in its right; the reference (the
+    // texture coordinate's z) is 0.5. LEQUAL passes where 0.5 <= depth (RPCS3 shadow_textures and TEX2D_SHADOW): the
+    // right half white, the left half black; with linear filtering the 2x2 comparisons around the edge blend.
+    for (const bool linear : {false, true}) {
+        INFO(std::format("{} filtering", linear ? "linear" : "nearest"));
+        E2E e;
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        // Texture coordinates with z = 0.5: four floats per vertex
+        const float uv[3][2] = {{0.f, 1.f}, {1.f, 1.f}, {0.5f, 0.f}};
+        constexpr u32 kUv4Offset = 0x1A0000, kDepthTex = 0x1B0000, kTexW = kW / 2;
+        for (u32 v = 0; v < 3; v++) {
+            e.put_local_f(kUv4Offset + v * 16 + 0, uv[v][0]);
+            e.put_local_f(kUv4Offset + v * 16 + 4, uv[v][1]);
+            e.put_local_f(kUv4Offset + v * 16 + 8, 0.5f);
+            e.put_local_f(kUv4Offset + v * 16 + 12, 1.f);
+        }
+        for (u32 y = 0; y < kH; y++)
+            for (u32 x = 0; x < kTexW; x++) ps_st16(e.mem.host(PS_MEM_RSX_LOCAL_BASE + kDepthTex + (y * kTexW + x) * 2),
+                x < kTexW / 2 ? 0x4000 : 0xC000);
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x80808080);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 8, static_cast<u32>(VertexType::F) | (4u << 4) | (16u << 8));
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 8, kUv4Offset);
+        bind_linear_texture(b, kDepthTex, tex::DEPTH16, kTexW * 2);
+        b.method(m::NV4097_SET_TEXTURE_IMAGE_RECT, (kTexW << 16) | kH);
+        b.method(m::NV4097_SET_TEXTURE_ADDRESS, 3u | (3u << 8) | (3u << 16) | (3u << 28)); // clamp, zfunc LEQUAL
+        b.method(m::NV4097_SET_TEXTURE_FILTER, linear ? (2u << 16) | (2u << 24) : (1u << 16) | (1u << 24));
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        CHECK(guest_pixel(e, kSurfaceOffset, 20, 48) == std::array<u8, 4>{0x00, 0x00, 0x00, 0x00});
+        CHECK(guest_pixel(e, kSurfaceOffset, 44, 48) == std::array<u8, 4>{0xff, 0xff, 0xff, 0xff});
+        // Pixels 31 and 32 sample texel coordinates 15.25 and 15.75: between texels 15 (fails) and 16 (passes).
+        const int left = guest_pixel(e, kSurfaceOffset, 31, 48)[1], right = guest_pixel(e, kSurfaceOffset, 32, 48)[1];
+        if (linear) {
+            CHECK(std::abs(left - 64) <= 4);   // a quarter of texel 16
+            CHECK(std::abs(right - 191) <= 4); // three quarters
+        } else {
+            CHECK(left == 0x00);
+            CHECK(right == 0xff);
+        }
+    }
+}
+
+TEST_CASE("metal e2e: depth tiles side by side in one atlas stay apart, each read as its own texture")
+{
+    // GTA V's shadow cascades: 128x128 Z16 tiles of one atlas, zeta offsets 0x100 apart with a 0x400 pitch. Their bytes
+    // interleave row by row, but their pixels do not: each tile must survive the next one (run 070).
+    REQUIRE_METAL();
+    constexpr u32 kAtlas = 0x1C0000, kAtlasPitch = kW * 2 * 2; // two kW-wide Z16 tiles per row
+    for (const u32 tile : {0u, 1u}) {
+        INFO(std::format("tile {}", tile));
+        E2E e;
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        auto b = e.at(0);
+        for (const u32 t : {0u, 1u}) {
+            setup_surface(b, kSurfaceB);
+            b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (1u << 5) | (1u << 8));
+            b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+            b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kAtlas + t * kW * 2);
+            b.method(m::NV4097_SET_SURFACE_PITCH_Z, kAtlasPitch);
+            b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, t == 0 ? 0x4000 : 0xC000); // 0.25, then 0.75
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth);
+        }
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        bind_linear_texture(b, kAtlas + tile * kW * 2, tex::DEPTH16, kAtlasPitch);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().depth_conversions == 1); // the tile's depth buffer, not stale memory
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const u8 v = tile == 0 ? 0x40 : 0xbf;
+        CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{v, v, v, v});
+    }
+}
+
 TEST_CASE("metal e2e: a vertex program samples a vertex texture (TXL, D-093)")
 {
     REQUIRE_METAL();

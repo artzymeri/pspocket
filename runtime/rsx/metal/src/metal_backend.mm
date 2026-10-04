@@ -13,6 +13,16 @@
 
 namespace pspocket::rsx::metal {
 
+// RPCS3 RSXThread.cpp (shadow_textures): a depth format sampled with a compare function other than never and always,
+// and no alpha kill, returns the depth comparison instead of the depth.
+static bool is_shadow_texture(const TextureInfo& t)
+{
+    const u32 bf = t.base_format();
+    const bool depth = bf == tex::DEPTH16 || bf == tex::DEPTH24_D8 || bf == tex::DEPTH16_FLOAT || bf == tex::DEPTH24_D8_FLOAT;
+    const u32 func = t.zfunc & 7;
+    return depth && func != 0 && func != 7 && !t.alpha_kill;
+}
+
 static_assert(static_cast<u32>(TexelDecode::ARGB8) == 1 && static_cast<u32>(TexelDecode::X16) == 14 &&
                   static_cast<u32>(TexelDecode::Y16X16) == 15 && static_cast<u32>(TexelDecode::DXT45) == 18 &&
                   static_cast<u32>(TexelDecode::D16) == 19,
@@ -619,6 +629,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         fo.texture_kind[t] = ti.cubemap && ti.dimension == 2 ? shader::TextureKind::Cube
             : ti.dimension == 1                               ? shader::TextureKind::Tex1D
                                                               : shader::TextureKind::Tex2D;
+        if (fo.texture_kind[t] == shader::TextureKind::Tex2D && is_shadow_texture(ti)) fo.texture_kind[t] = shader::TextureKind::Shadow2D;
         if (t < 10 && (state.texcoord_control(t) & 1)) fo.texcoord_2d_mask |= 1u << t;
     }
     const RasterInfo raster = state.raster();
@@ -664,6 +675,12 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (ti.is_unnormalized() && ti.width && ti.height) {
             fs.tex_scale[t][0] = 1.f / ti.width;
             fs.tex_scale[t][1] = 1.f / ti.height;
+        }
+        if (fo.texture_kind[t] == shader::TextureKind::Shadow2D) {
+            const u32 bf = ti.base_format();
+            fs.tex_scale[t][2] = static_cast<float>(ti.zfunc & 7);
+            fs.tex_scale[t][3] = static_cast<float>((ti.mag_filter != static_cast<u32>(tex::MagFilter::Nearest) ? 1u : 0u) |
+                                                    (bf == tex::DEPTH16 || bf == tex::DEPTH24_D8 ? 2u : 0u));
         }
         bool ok = true;
         id<MTLTexture> tex = ti.enabled ? bind_texture(ti, t, ok) : nil;

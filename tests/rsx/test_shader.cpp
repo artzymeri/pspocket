@@ -401,6 +401,15 @@ TEST_CASE("fragment program MSL for the supported subset")
     const TranslateResult h = translate_fragment_program(*fp, half);
     REQUIRE(h.ok);
     CHECK(h.shader.source.find("out.c0 = r0;") != std::string::npos);
+
+    // A shadow map on unit 0: the depth comparison against the coordinate's z, in every channel.
+    FpOptions shadow = opt;
+    shadow.texture_kind[0] = TextureKind::Shadow2D;
+    const TranslateResult sh = translate_fragment_program(*fp, shadow);
+    REQUIRE(sh.ok);
+    CHECK(sh.shader.source.find("rsx_shadow(t0, s0, (in.tc0).xy * fp.tex_scale[0].xy, (in.tc0).z, fp.tex_scale[0])") !=
+          std::string::npos);
+    CHECK(sh.shader.source.find("texture2d<float> t0 [[texture(0)]]") != std::string::npos);
 }
 
 // Condition codes as RPCS3 (FragmentProgramDecompiler SetDst, AddCodeCond, AddFlowOp, GetRawCond): GTA V's frontend

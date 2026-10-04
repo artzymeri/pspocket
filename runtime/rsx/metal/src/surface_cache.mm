@@ -68,13 +68,28 @@ void MetalBackend::Impl::remove_surface(Surface* s)
     std::erase_if(surfaces, [s](const std::unique_ptr<Surface>& p) { return p.get() == s; });
 }
 
-void MetalBackend::Impl::evict_overlapping(u32 address, u32 size, const Surface* keep)
+// Two surfaces overlap where their pixels do. Surfaces that share a pitch can interleave in memory row by row without
+// touching: GTA V renders its shadow cascades into 128x128 tiles of one depth atlas (zeta offsets 0x100 apart, pitch
+// 0x400), and each tile replaced the one before (run 070: the cascades were read from stale memory). Otherwise, and
+// for rows that wrap past the pitch, where their bytes do.
+bool surfaces_overlap(u32 a, u32 a_pitch, u32 a_row, u32 a_rows, u32 b, u32 b_pitch, u32 b_row, u32 b_rows)
 {
-    const u64 end = u64{address} + size;
+    if (a_pitch && a_pitch == b_pitch) {
+        const u32 base = std::min(a, b);
+        const u32 ax = (a - base) % a_pitch, ay = (a - base) / a_pitch, bx = (b - base) % b_pitch, by = (b - base) / b_pitch;
+        if (ax + a_row <= a_pitch && bx + b_row <= b_pitch)
+            return ay < by + b_rows && by < ay + a_rows && ax < bx + b_row && bx < ax + a_row;
+    }
+    return u64{a} < u64{b} + u64{b_pitch} * b_rows && u64{b} < u64{a} + u64{a_pitch} * a_rows;
+}
+
+void MetalBackend::Impl::evict_overlapping(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep)
+{
     std::vector<Surface*> victims;
     for (const auto& s : surfaces) {
         if (s.get() == keep) continue;
-        if (u64{s->address} < end && address < u64{s->address} + s->bytes()) victims.push_back(s.get());
+        const u32 s_row = s->width * surface_bytes_per_pixel(s->gcm_format, s->depth);
+        if (surfaces_overlap(address, pitch, row_bytes, rows, s->address, s->pitch, s_row, s->height)) victims.push_back(s.get());
     }
     for (Surface* s : victims) {
         if (draw_targets.contains(s)) continue; // another attachment of the same draw (MRT): not a redefinition
@@ -119,8 +134,8 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
             return s.get();
         }
     }
-    const u32 size = (pitch ? pitch : width * surface_color_bpp(format)) * height;
-    evict_overlapping(address, size, nullptr);
+    const u32 row = width * surface_color_bpp(format);
+    evict_overlapping(address, pitch ? pitch : row, row, height, nullptr);
     return make_surface(address, pitch, width, height, format, false, swizzled, color_surface_format(format));
 }
 
@@ -134,8 +149,8 @@ Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width
             return s.get();
         }
     }
-    const u32 size = (pitch ? pitch : width * surface_bytes_per_pixel(format, true)) * height;
-    evict_overlapping(address, size, nullptr);
+    const u32 row = width * surface_bytes_per_pixel(format, true);
+    evict_overlapping(address, pitch ? pitch : row, row, height, nullptr);
     return make_surface(address, pitch, width, height, format, true, false, depth_surface_format(format));
 }
 

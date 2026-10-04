@@ -238,7 +238,7 @@ struct MetalBackend::Impl {
     Surface* find_surface(u32 address, bool depth) const;
     Surface* make_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool depth, bool swizzled,
         MTLPixelFormat pf);
-    void evict_overlapping(u32 address, u32 size, const Surface* keep);
+    void evict_overlapping(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep);
     bool read_back(Surface& s, std::vector<u8>& raw, bool stencil = false); // raw texture bytes, tightly packed
     bool write_back(Surface& s, const char* why);     // to guest memory, in the surface's format
     bool write_back_depth(Surface& s, const char* why);
@@ -274,6 +274,8 @@ struct MetalBackend::Impl {
 MTLPixelFormat color_surface_format(u32 gcm_format);
 MTLPixelFormat depth_surface_format(u32 gcm_format);
 u32 surface_bytes_per_pixel(u32 gcm_format, bool depth);
+// Whether two pitch-linear surfaces (address, pitch, bytes per row, rows) share pixels (surface_cache.mm).
+bool surfaces_overlap(u32 a, u32 a_pitch, u32 a_row, u32 a_rows, u32 b, u32 b_pitch, u32 b_row, u32 b_rows);
 // Which shader output channels land in the surface's channels (B8, G8B8 remaps).
 std::array<u8, 4> surface_output_swizzle(u32 gcm_format);
 

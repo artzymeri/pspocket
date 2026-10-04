@@ -29,7 +29,7 @@ struct rsx_vs_params {
 
 struct rsx_fs_params {
     float4 wpos;
-    float4 tex_scale[16];
+    float4 tex_scale[16]; // Shadow2D: z compare function, w flags (1 linear, 2 clamp the reference to 1)
     uint alpha_func; float alpha_ref; uint pad0; uint pad1;
 };
 
@@ -110,6 +110,21 @@ static bool rsx_compare(uint func, float a, float b)
     case 6u: return a >= b;
     default: return true;
     }
+}
+
+// A depth comparison lookup (shadow maps): the reference against the texel at uv, or with linear filtering against the
+// 2x2 texels around it, filtered bilinearly (percentage-closer filtering, as a comparison sampler does). p: the unit's
+// tex_scale (z compare function, w flags). RPCS3 TEX2D_SHADOW: texture(sampler2DShadow, vec3(uv, ref)).xxxx.
+static float4 rsx_shadow(texture2d<float> t, sampler s, float2 uv, float ref, float4 p)
+{
+    const uint func = uint(p.z), flags = uint(p.w);
+    if ((flags & 2u) != 0u) ref = min(ref, 1.0); // integer depth: the reference saturates as the buffer's values do
+    if ((flags & 1u) == 0u) return float4(rsx_compare(func, ref, t.sample(s, uv).x) ? 1.0 : 0.0);
+    const float4 d = t.gather(s, uv); // x (i0, j1), y (i1, j1), z (i1, j0), w (i0, j0)
+    const float4 c = float4(rsx_compare(func, ref, d.x) ? 1.0 : 0.0, rsx_compare(func, ref, d.y) ? 1.0 : 0.0,
+                            rsx_compare(func, ref, d.z) ? 1.0 : 0.0, rsx_compare(func, ref, d.w) ? 1.0 : 0.0);
+    const float2 f = fract(uv * float2(t.get_width(), t.get_height()) - 0.5);
+    return float4(mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y));
 }
 )MSL";
 
@@ -724,7 +739,12 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
             const u32 t = in.tex;
             c.textures |= 1u << t;
             const TextureKind kind = opt.texture_kind[t];
-            if (kind == TextureKind::Cube) {
+            if (kind == TextureKind::Shadow2D) {
+                // The reference is the coordinate's z (TXP: z / w); LOD and bias do not apply to the comparison.
+                const std::string uv = op == FpOp::TXP ? std::format("(({}).xy / ({}).w)", s0, s0) : std::format("({}).xy", s0);
+                const std::string ref = op == FpOp::TXP ? std::format("(({}).z / ({}).w)", s0, s0) : std::format("({}).z", s0);
+                e = std::format("rsx_shadow(t{}, s{}, {} * fp.tex_scale[{}].xy, {}, fp.tex_scale[{}])", t, t, uv, t, ref, t);
+            } else if (kind == TextureKind::Cube) {
                 switch (op) {
                 case FpOp::TEX: e = std::format("t{}.sample(s{}, ({}).xyz)", t, t, s0); break;
                 case FpOp::TXL: e = std::format("t{}.sample(s{}, ({}).xyz, level(({}).w))", t, t, s0, s0); break;
