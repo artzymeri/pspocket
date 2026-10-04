@@ -1,5 +1,6 @@
 # Firmware modules on the host (HLE) and the per-process import linkage. Portable C++; the iOS app compiles src/ too.
 add_library(pspocket_hle STATIC
+    src/cellAudio.cpp
     src/cellGame.cpp
     src/cellGcmSys.cpp
     src/cellNetCtl.cpp

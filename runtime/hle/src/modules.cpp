@@ -4,6 +4,7 @@
 
 namespace pspocket::hle {
 
+void register_cellAudio(Registry& r);
 void register_cellGame(Registry& r);
 void register_cellGcmSys(Registry& r);
 void register_cellNetCtl(Registry& r);
@@ -19,6 +20,7 @@ void register_sys_net(Registry& r);
 
 void register_all_modules(Registry& r)
 {
+    register_cellAudio(r);
     register_cellGame(r);
     register_cellGcmSys(r);
     register_cellNetCtl(r);

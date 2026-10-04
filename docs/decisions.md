@@ -642,6 +642,23 @@ SPUs 0-3, contention 5). Since it is game code, the worker runs it rather than i
 - **Offset fix.** The workload flag word is at CellSpurs 0x6C, inside the 16-byte CellSpursWorkloadFlag at 0x60; it
   was read at 0x60 before.
 
+## D-052 · 2026-10-04 · cellAudio: RPCS3's ports and periods on a host thread; output through a host sink
+
+Run 021. The 11 cellAudio functions GTA V imports follow upstream RPCS3:
+- 8 ports (4 for SDK ≤ 3.5) from RPCS3's free-list stacks, with its checks and error codes;
+- notify queues on keys from 0x80004D494F323221, with one CELL_AUDIO_EVENT_MIX event per period.
+
+How pspocket does it:
+- **Memory.** The read indices (big-endian u64 in a 64 KB area, 16 bytes per server index) and the port buffers are
+  main-area allocations. RPCS3 maps lv2 shared memory instead.
+- **Thread.** The audio thread is a host thread that runs no guest code, from `cellAudioInit` to `cellAudioQuit`; it
+  also stops when the process exits. Every 256/48000 s it clears the block just played, advances the read index and
+  notifies the queues. When it falls more than 100 ms behind, it skips the missed periods rather than bursting.
+- **Output.** There is no output backend yet. `hle::set_audio_sink` (`pspocket/hle/audio.hpp`) gets RPCS3's stereo mix
+  each period, and the iOS app will attach CoreAudio there.
+- **Gap.** lv2 can't look a queue up by its IPC key yet, so only queues made by `cellAudioCreateNotifyEventQueue` can
+  be registered. GTA V uses that one.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
