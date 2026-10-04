@@ -2,7 +2,8 @@
 
 A static recompiler that turns PS3 games' PPU and SPU code into native, signed iOS apps: one Mac-side build per game
 (disc image in, app out), the runtime shared by all of them (D-036). First and driving title: GTA V (BLES01807,
-D-025). The plan is `docs/plan.md`; decisions are `docs/decisions.md`.
+D-025). The plan is `docs/plan.md`; decisions are `docs/decisions.md`; where things stand and what comes next is
+`docs/status.md` (read it first in a new session).
 
 ## Rules (plan section 12)
 
