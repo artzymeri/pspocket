@@ -529,6 +529,8 @@ std::shared_ptr<EventQueue> Kernel::event_queue(u32 id) const
     return q->dead ? nullptr : q;
 }
 
+std::shared_ptr<EventFlag> Kernel::event_flag(u32 id) const { return impl_->objects.get<EventFlag>(id); }
+
 bool Kernel::exited() const
 {
     std::lock_guard lock(impl_->exit_mutex);
