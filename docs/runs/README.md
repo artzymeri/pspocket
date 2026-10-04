@@ -50,3 +50,8 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [043](043-gta5-sound-mac.md) | 2026-10-04 | 7ea8393+ | M4 Mac, pspocket-boot --audio | Sound blocks played whole (D-074); GTA V's audio runs at 55 to 65% of real time on the loading screens, 20% at its heaviest |
 | [044](044-gta5-first-mission-mac.md) | 2026-10-04 | c503afa | M4 Mac, pspocket-boot --frames --press | **The first mission starts** (the prologue's objective and radar); the 3D world is black: vertex condition codes, DIVSQ, vertex TXL, X16 textures |
 | [045](045-gta5-time-stretch-mac.md) | 2026-10-04 | c503afa+ | M4 Mac, pspocket-boot --audio | Time stretching follows the game's pace (0.2 to 1.07); 69 speaker underruns in 120 s instead of about 500 |
+| [048](048-gta5-fifo-desync-mac.md) | 2026-10-04 | 574baa0+ | M4 Mac, pspocket-boot --spu-dump | The first mission ends on "malformed FIFO command": ARM memory ordering (D-077). From here on a note carries its log's number |
+| [049](049-gta5-lifted-spu-mac.md) | 2026-10-04 | 574baa0+ | M4 Mac, pspocket-boot --audio | 102 lifted SPU programs run (D-076); a task that loads modules itself; a second desync |
+| [050](050-gta5-profile-mac.md) | 2026-10-04 | a532a5f | M4 Mac, pspocket-boot --frames, Time Profiler | 15 minutes without a desync; the world draws in pink; hashing takes a fifth of the SPU workers (D-079) |
+| [051](051-gta5-fps-mac.md) | 2026-10-04 | a532a5f+ | M4 Mac, pspocket-boot --gpu metal | Frame rates: intro 11 to 13, loading 30, "Loading Story Mode" 8 to 10, the mission 4; the SPU interpreter 38% |
+| [052](052-gta5-module-dump-mac.md) | 2026-10-04 | 02e8498 | M4 Mac, pspocket-boot --spu-dump | 82 modules at thousands of addresses: 32,570 dumps; relocatable lifting (D-081) |
