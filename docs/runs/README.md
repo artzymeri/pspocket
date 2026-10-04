@@ -35,3 +35,13 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [028](028-gta5-boot-26-mac.md) | 2026-10-04 | 437b72e+ | M4 Mac, pspocket-boot | sceNpLookupInit; the main thread waits on a semaphore from second 4 |
 | [029](029-gta5-boot-27-mac.md) | 2026-10-04 | c68e12c+ | M4 Mac, pspocket-boot --frames | First picture: the Rockstar logo screen through the Metal backend, after the event flag direction fix |
 | [030](030-gta5-boot-28-mac.md) | 2026-10-04 | c68e12c+ | M4 Mac, pspocket-boot --frames | A CellSpursTaskset2; then `_cellSpursQueueInitialize` (SPURS queues) |
+| [031](031-gta5-boot-29-mac.md) | 2026-10-04 | 68706ad | M4 Mac, pspocket-boot --frames | SPURS queues work; the opening animation; the audio engine starves (priorities upside down) |
+| [032](032-gta5-boot-30-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | The audio engine runs (D-064); the mixer faults on a job descriptor |
+| [033](033-gta5-boot-31-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | Two PPU threads took one job slot: `stwcx.` was not atomic |
+| [034](034-gta5-boot-32-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | Atomic reservations (D-066); a fault outside the PPU threads |
+| [035](035-gta5-boot-33-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | The fault is the audio mixer's SPU job (a DMA from address 0) |
+| [036](036-gta5-boot-34-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | The job loads a code module from a header of zeros |
+| [037](037-gta5-boot-35-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | The module's 96 KB buffer was never filled |
+| [038](038-gta5-boot-36-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | The MP3 codec comes from /dev_flash, which was missing |
+| [039](039-gta5-boot-37-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | No crash for 120 s with /dev_flash (D-067); a grey screen, 110,146 draws skipped |
+| [040](040-gta5-boot-38-mac.md) | 2026-10-04 | c6b357d+ | M4 Mac, pspocket-boot --frames | Condition codes (D-068): no failed draws; the legal and Display Calibration screens |
