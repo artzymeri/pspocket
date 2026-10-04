@@ -38,6 +38,10 @@ struct Function {
     std::string_view name;
     u32 nid = 0;
     HleFn fn = nullptr;
+    // A function the module hands to the game by address rather than exporting it (RPCS3 FIND_FUNC, e.g.
+    // cellGcmCallback in the GCM context). The loader links every internal function of each module the game imports,
+    // before guest threads run; HLE code finds its descriptor with HleProcess::descriptor_of.
+    bool internal = false;
 };
 
 class Registry {
@@ -108,6 +112,8 @@ void thunk(PPUContext& ctx, u8* base)
 } // namespace detail
 
 // Registry::add(module, {PS_HLE_FUNC(0x744680A2, sys_initialize_tls), ...})
-#define PS_HLE_FUNC(nid, fn) ::pspocket::hle::Function{{}, #fn, nid, &::pspocket::hle::detail::thunk<&fn>}
+#define PS_HLE_FUNC(nid, fn) ::pspocket::hle::Function{{}, #fn, nid, &::pspocket::hle::detail::thunk<&fn>, false}
+// An internal function (Function::internal), with the NID its name hashes to.
+#define PS_HLE_INTERNAL(nid, fn) ::pspocket::hle::Function{{}, #fn, nid, &::pspocket::hle::detail::thunk<&fn>, true}
 
 } // namespace pspocket::hle

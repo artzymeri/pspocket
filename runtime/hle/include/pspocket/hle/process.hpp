@@ -87,6 +87,12 @@ public:
     // entries); 0 when the main area is full.
     u32 link_function(std::string_view module, u32 nid, std::string_view name);
 
+    // Links every internal function (Function::internal) of the modules in `modules` (the game's imports). Same rule
+    // as link_function: before guest threads run. Returns false when the main area is full.
+    bool link_internal_functions(const std::vector<std::string>& modules);
+    // The descriptor of an already linked function, or 0. Safe while guest threads run.
+    u32 descriptor_of(std::string_view module, u32 nid) const;
+
     // The linked function whose stub is at code address `cia` (descriptor + 4), or nullptr.
     LinkedFunction* linked_at(u32 cia);
     std::vector<const LinkedFunction*> linked() const;

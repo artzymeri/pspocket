@@ -473,6 +473,33 @@ Run 014.
   since there is no UI yet.
 - **sceNp2Init.** It brings NP up with no user signed in, so the status reads offline.
 
+## D-045 · 2026-10-04 · The RSX lives in lv2; cellGcmSys is HLE on top of it, as in RPCS3
+
+Runs 015 and 016. GTA V's `_cellGcmInitBody` is the first graphics call, so the RSX front end (D-032) gets wired to a
+game for the first time:
+
+- **lv2 owns the RSX** (`runtime/lv2/src/rsx.cpp`, RPCS3 `sys_rsx.cpp`). `sys_rsx_memory_allocate` commits local memory
+  at 0xC0000000. `sys_rsx_device_map` reserves the rsx_context area through the same first-free-256 MB allocator as
+  user memory, as RPCS3's `vm::reserve_map` does (GTA V: 0x40000000). `sys_rsx_context_allocate` fills DMA control,
+  driver info and reports as RPCS3 does, then creates and starts `rsx::Rsx`. The kernel config's `rsx_backend`
+  factory supplies the backend; without one, the new `rsx::NullBackend` runs every command and draws nothing, which is
+  what `pspocket-boot` uses on the Mac. Unhandled RSX methods abort (rule 5) unless `rsx_log_failures` is set.
+- **These are C++ entry points for HLE, not bound syscalls.** No game has called syscalls 666-677 directly (rule 4).
+- **cellGcmSys** (`runtime/hle/src/cellGcmSys.cpp`): the 20 functions GTA V imports, following RPCS3. The
+  CellGcmContextData sits at the start of the device area, and the offset tables, display info, tiles and Z-cull
+  arrays sit in the main area, all where RPCS3 puts them. Display buffers, tiles and Z-cull go through
+  `sys_rsx_context_attribute` (0x104, 0x300, 0x301) the way the firmware's libgcm does. RPCS3's HLE writes them into
+  its renderer directly instead.
+- **Internal HLE functions.** `cellGcmCallback`, which the game reaches through the context when a 32 KB segment is
+  full, has to have a guest address without being an import. A registry flag (`PS_HLE_INTERNAL`) makes the loader
+  link such functions for every imported module before guest threads start, because the dispatch table can't grow
+  later. HLE looks them up with `HleProcess::descriptor_of`.
+- **HLE can call the guest** (`call_guest` in `guest.hpp`). It gives the callee a fresh frame below r1, because the ABI
+  lets a callee write its caller's LR, TOC and parameter save slots, and a `StackVar` sits at r1.
+- **Vblank.** `_gcm_intr_thread` is an lv2 PPU thread whose entry is an internal HLE function. Every 1/59.94 s it counts
+  a vblank in the driver info (package 0xFED, RPCS3's vblank hack) and calls the game's vblank handler with head 1.
+  Flip and user handlers come when a game imports their setters.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

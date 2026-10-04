@@ -211,6 +211,24 @@ u32 HleProcess::link_function(std::string_view module, u32 nid, std::string_view
     return descriptor;
 }
 
+bool HleProcess::link_internal_functions(const std::vector<std::string>& modules)
+{
+    for (const Function& f : registry().functions()) {
+        if (!f.internal) continue;
+        if (std::find(modules.begin(), modules.end(), f.module) == modules.end()) continue;
+        if (!link_function(f.module, f.nid, f.name)) return false;
+    }
+    return true;
+}
+
+u32 HleProcess::descriptor_of(std::string_view module, u32 nid) const
+{
+    std::lock_guard lock(link_mutex_);
+    for (const auto& f : linked_)
+        if (f && f->nid == nid && f->module == module) return f->descriptor;
+    return 0;
+}
+
 LinkedFunction* HleProcess::linked_at(u32 cia)
 {
     // Read without the lock: linking happens before guest threads run (the dispatch table has the same rule).

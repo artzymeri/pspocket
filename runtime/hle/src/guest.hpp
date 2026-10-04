@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <initializer_list>
 #include <string_view>
 
 #include "pspocket/core/be.h"
@@ -49,6 +50,37 @@ private:
     const u64 saved_sp_;
     u32 addr_ = 0;
 };
+
+// Calls the guest function whose descriptor (OPD: entry, TOC) is at `opd` on the calling thread, with up to eight
+// arguments in r3..r10, and returns r3: what RPCS3 does with ppu_execute and its callback calls (cellGcmCallback
+// through the context, cellSysutilCheckCallback, interrupt handlers). The callee gets a fresh 0x80-byte frame below r1
+// with a back chain, because the PPC64 ABI lets it write its caller's LR, TOC and parameter save slots
+// (r1 + 16/40/48..) and a StackVar sits right at r1. The caller's r1, r2 and LR are restored afterwards; the callee
+// keeps r13..r31 as the ABI requires. Runs through the kernel's executor (lifted code, or the interpreter fallback).
+inline u64 call_guest(PPUContext& ctx, u32 opd, std::initializer_list<u64> args)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u64 saved_r1 = ctx.gpr[1], saved_r2 = ctx.gpr[2], saved_lr = ctx.lr;
+    const u32 saved_cia = ctx.cia;
+    const u32 entry = ps_read32(base, opd);
+    ctx.gpr[2] = ps_read32(base, opd + 4);
+    u32 r = 3;
+    for (const u64 a : args) {
+        if (r > 10) PS_FATAL("hle", "call_guest: more than eight arguments");
+        ctx.gpr[r++] = a;
+    }
+    ctx.gpr[1] = (saved_r1 - 0x80) & ~u64{15};
+    ps_write64(base, static_cast<u32>(ctx.gpr[1]), saved_r1);
+    ctx.lr = lv2::kThreadReturnAddress; // returning lands here; the interpreter fallback stops at it
+    t.kernel.config().executor(t.kernel.config().executor_user, ctx, base, entry);
+    const u64 result = ctx.gpr[3];
+    ctx.gpr[1] = saved_r1;
+    ctx.gpr[2] = saved_r2;
+    ctx.lr = saved_lr;
+    ctx.cia = saved_cia;
+    return result;
+}
 
 // Whether [addr, addr + size) is committed guest memory, for sizes up to one host page: a pointer argument checked
 // before an HLE function reads it, so a wrong guess about a firmware signature gives a logged error, not a host crash.

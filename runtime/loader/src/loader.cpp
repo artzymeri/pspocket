@@ -263,6 +263,10 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
         }
         for (const auto& p : lib.problems) PS_LOG_WARN(kChan, "import library {}: {}", lib.name, p);
     }
+    // Functions the imported modules hand to the game by address (cellGcmCallback), linked while no guest thread runs.
+    std::vector<std::string> modules;
+    for (const auto& lib : exe->module().imports) modules.push_back(lib.name);
+    if (!hle.link_internal_functions(modules)) return err(lv2::CELL_ENOMEM);
     PS_LOG_INFO(kChan, "{} segments, {} imported functions ({} implemented), {} unresolved variables", rep.segments,
         rep.functions_linked, rep.functions_implemented, rep.variables_unresolved);
     if (report) *report = rep;

@@ -1,7 +1,7 @@
 # HLE linkage, sysPrxForUser and the process loader: registry checks, stub calls, lwmutex on real lv2 threads, a
 # synthetic executable booted end to end, and pspocket-boot's fault report.
 pspocket_add_test(test_hle
-    SOURCES test_hle.cpp test_sysPrxForUser.cpp
+    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_gcm.cpp
     LIBS pspocket::loader pspocket_test_synthetic pspocket::recomp_ppu)
 
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
