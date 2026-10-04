@@ -869,6 +869,28 @@ selection weighs those (RPCS3 spursSysServiceUpdateWorkload). The worker now con
 the kernel context at LS 0x1A0 holds the converted bytes, as policy and task code see them on the PS3. Workload
 creation logs show the priorities. A regression test runs two tasksets on one SPU: priority 2 goes before 12.
 
+## D-065 · 2026-10-04 · Trophies as RPCS3: the disc's TROPHY.TRP installed into the user's trophy directory
+
+GTA V creates its trophy context ("NPWR03885_00"), asks for the disk space it needs and registers it. The five
+functions it calls next (GetRequiredDiskSpace, RegisterContext, GetGameInfo, GetTrophyInfo, UnlockTrophy) follow
+RPCS3's sceNpTrophy.cpp, with RPCS3's context and handle checks in its order.
+- **The pack.** `TROPDIR/<set>/TROPHY.TRP` is read through lv2's file system, so it is read in place from the disc
+  image (an HDD game's own TROPDIR, or the disc's when the PARAM.SFO category is GD), and checked as RPCS3's TRPLoader
+  does, SHA-1 included (`trophy_files.cpp`; `pspocket_hle` now links recomp_common for the hash).
+- **Installation** into `/dev_hdd0/home/00000001/trophy/<set>`: `TROP_01.SFM` (English, cellSysutil's language), else
+  `TROP.SFM`, becomes `TROPCONF.SFM`; the other language files are left out; the icons are copied. The files go to a
+  temporary directory that then replaces the set's. `TROPUSR.DAT` keeps the user's progress across installations, in
+  RPCS3's layout, with its platinum rule. No TROPTRNS.DAT, as RPCS3.
+- **Registration** calls the game's status callback once directly, then sends RPCS3's SETUP, PROGRESS, FINALIZE and
+  COMPLETE steps through `cellSysutilCheckCallback` one at a time; the caller blocks for at least 2 s, plus up to 50 ms
+  for each step no check has taken (RPCS3's timing: about 7 s when the registering thread is the one that checks).
+- **Details and unlocks** work on the installed set: game info, trophy info (hidden trophies refused until unlocked),
+  unlocks with RTC ticks and platinum completion.
+- **Deviations.** Pointers are checked before use (D-042); a TROPUSR.DAT that can't be created gives ILLEGAL_UPDATE
+  where RPCS3 aborts; without an error dialog, SHOW_ERROR_EXIT asks the game to exit at once (what RPCS3 does when its
+  dialog can't open). No trophy pop-ups, trophy list or RPCN sync. The XML reader is a small one that matches what
+  RPCS3 gets from pugixml.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
