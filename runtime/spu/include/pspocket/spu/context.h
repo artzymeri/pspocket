@@ -244,6 +244,7 @@ typedef struct ps_spu_channels {
 struct ps_spu_host;    /* runtime-private (pspocket/spu/runtime.h) */
 struct ps_spu_group;   /* thread group, for group MMIO (runtime.h) */
 struct ps_spu_program; /* lifted program attached to this context (runtime.h) */
+struct ps_spu_hooks;   /* per-context stop and interrupt-mailbox handlers (runtime.h) */
 
 typedef struct SPUContext {
     ps_spu_v128 gpr[128];
@@ -275,6 +276,9 @@ typedef struct SPUContext {
     struct ps_spu_group* group;
     struct ps_spu_host* host; /* NULL: single-thread use (tests); blocking channel accesses stop instead */
     void* runtime;            /* owned by the lv2 layer; never touched by the SPU runtime */
+    /* Handlers for this context only, consulted before the process-wide ones (runtime.h): an owner other than lv2's
+     * SPU threads (the native SPURS workers) handles its own stop codes and interrupt-mailbox writes. NULL: none. */
+    const struct ps_spu_hooks* hooks;
 } SPUContext;
 
 /* Layout is part of the ABI between the runtime and generated code. */

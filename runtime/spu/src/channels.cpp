@@ -449,7 +449,8 @@ int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
         notify(ctx);
         return 0;
     case PS_SPU_WrOutIntrMbox: {
-        if (const ps_spu_intr_mbox_handler handler = g_intr_handler.load()) {
+        const ps_spu_intr_mbox_handler own = ctx->hooks ? ctx->hooks->intr_mbox : nullptr;
+        if (const ps_spu_intr_mbox_handler handler = own ? own : g_intr_handler.load()) {
             lock.unlock();
             HostFpScope fp;
             if (handler(ctx, value)) return requested_stop(ctx, pc);
@@ -470,7 +471,8 @@ int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
 
 int ps_spu_stop(SPUContext* ctx, uint32_t pc, uint32_t code)
 {
-    if (const ps_spu_stop_handler handler = g_stop_handler.load()) {
+    const ps_spu_stop_handler own = ctx->hooks ? ctx->hooks->stop : nullptr;
+    if (const ps_spu_stop_handler handler = own ? own : g_stop_handler.load()) {
         HostFpScope fp;
         if (handler(ctx, code)) return 0;
     }

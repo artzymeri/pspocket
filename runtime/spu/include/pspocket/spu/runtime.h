@@ -108,6 +108,14 @@ void ps_spu_set_stop_handler(ps_spu_stop_handler handler);
 typedef int (*ps_spu_intr_mbox_handler)(SPUContext* ctx, uint32_t value);
 void ps_spu_set_intr_mbox_handler(ps_spu_intr_mbox_handler handler);
 
+/* Per-context handlers (SPUContext::hooks): when a context has them, its stop codes and interrupt-mailbox writes go
+ * to these instead of the process-wide handlers above, with the same return conventions. A NULL member falls back to
+ * the process-wide handler. */
+typedef struct ps_spu_hooks {
+    ps_spu_stop_handler stop;
+    ps_spu_intr_mbox_handler intr_mbox;
+} ps_spu_hooks;
+
 /* Decrementer and event timing. NULL restores ps_timebase_now (pspocket/core/timebase.h); tests install a clock. */
 typedef uint64_t (*ps_spu_timebase_source)(void);
 void ps_spu_set_timebase_source(ps_spu_timebase_source source);

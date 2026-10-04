@@ -175,6 +175,34 @@ TEST_CASE("stop, stopd, halts, illegal instructions")
     CHECK_FALSE(m.exec(as::bi(4, true, true), 0x400));
 }
 
+namespace {
+u32 g_global_stops = 0, g_own_stops = 0;
+int count_global_stop(SPUContext*, u32) { return ++g_global_stops, 1; } // handled: continue
+int count_own_stop(SPUContext*, u32 code) { return ++g_own_stops, code == 0x111; } // 0x111 continues, others stop
+} // namespace
+
+TEST_CASE("per-context hooks take a context's stop codes before the process-wide handler")
+{
+    g_global_stops = g_own_stops = 0;
+    ps_spu_set_stop_handler(count_global_stop);
+    Machine m;
+    CHECK(m.exec(as::stop(0x2102), 0x200)); // no hooks: the process-wide handler continues it
+    CHECK(g_global_stops == 1);
+    const ps_spu_hooks hooks{count_own_stop, nullptr};
+    m.ctx.hooks = &hooks;
+    CHECK(m.exec(as::stop(0x111), 0x200)); // the context's handler continues it
+    CHECK_FALSE(m.exec(as::stop(0x222), 0x200)); // ... or stops it
+    CHECK(m.ctx.stop_reason == PS_SPU_STOP_SIGNAL);
+    CHECK(m.ctx.stop_code == 0x222u);
+    CHECK(g_own_stops == 2);
+    CHECK(g_global_stops == 1); // never consulted for this context
+    const ps_spu_hooks no_stop{nullptr, nullptr};
+    m.ctx.hooks = &no_stop;
+    CHECK(m.exec(as::stop(0x2102), 0x200)); // a NULL member falls back to the process-wide handler
+    CHECK(g_global_stops == 2);
+    ps_spu_set_stop_handler(nullptr);
+}
+
 TEST_CASE("no-ops and special registers")
 {
     Machine m;
