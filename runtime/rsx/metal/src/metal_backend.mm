@@ -988,6 +988,18 @@ bool MetalBackend::flush_memory(u32 addr, u32 size)
     bool any = false;
     @autoreleasepool {
         const u64 end = u64{addr} + size;
+        // A target of the open pass with only a clear so far (a load action) is not yet newer on the GPU: end the
+        // pass so the clear runs before the target is written back.
+        Impl& m = *impl_;
+        if (m.pass_open) {
+            bool overlaps = false;
+            const auto check = [&](const Surface* s) {
+                overlaps |= s && u64{s->address} < end && addr < u64{s->address} + s->bytes();
+            };
+            for (u32 i = 0; i < m.pass.color_count; i++) check(m.pass.color[i]);
+            check(m.pass.depth);
+            if (overlaps) m.end_pass();
+        }
         for (auto& s : impl_->surfaces) {
             if (!s->gpu_newer || s->cpu_newer) continue;
             if (u64{s->address} < end && addr < u64{s->address} + s->bytes()) any |= impl_->write_back(*s);

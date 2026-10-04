@@ -265,7 +265,13 @@ bool MetalBackend::Impl::write_back(Surface& s)
                                       f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8);
     const bool abgr = !s.depth && (f == SurfaceColorFormat::A8B8G8R8 || f == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8 ||
                                       f == SurfaceColorFormat::X8B8G8R8_O8B8G8R8);
-    if (s.swizzled || (!argb && !abgr)) {
+    // Floating-point targets: each component big-endian, red first in memory (as W16_Z16_Y16_X16_FLOAT,
+    // W32_Z32_Y32_X32_FLOAT and X32_FLOAT textures read them).
+    const u32 float_bytes = s.depth ? 0
+                          : f == SurfaceColorFormat::F_W16Z16Y16X16 ? 2
+                          : (f == SurfaceColorFormat::F_W32Z32Y32X32 || f == SurfaceColorFormat::F_X32) ? 4
+                                                                                                         : 0;
+    if (s.swizzled || (!argb && !abgr && !float_bytes)) {
         unsupported(std::format("GPU readback of surface format {}{} is not implemented", s.gcm_format,
             s.depth ? " (depth)" : s.swizzled ? " (swizzled)" : ""));
         return false;
@@ -275,6 +281,29 @@ bool MetalBackend::Impl::write_back(Surface& s)
     if (!read_back(s, raw)) return false;
     stats.readbacks++;
     PS_LOG_WARN(kChan, "expensive GPU readback: surface {:#010x} {}x{} (#{})", s.address, s.width, s.height, stats.readbacks);
+
+    if (float_bytes) {
+        // The Metal copy holds the same components little-endian: swap each one into place, row by row.
+        const u32 components = f == SurfaceColorFormat::F_X32 ? 1 : 4;
+        const usize row = static_cast<usize>(s.width) * components * float_bytes;
+        u8* const guest_base = mem.base();
+        for (u32 y = 0; y < s.height; y++) {
+            const u8* src = &raw[y * row];
+            u8* dst = guest_base + s.address + y * s.pitch;
+            if (float_bytes == 2) {
+                for (usize i = 0; i < row; i += 2) ps_st16(dst + i, static_cast<u16>(src[i] | (src[i + 1] << 8)));
+            } else {
+                for (usize i = 0; i < row; i += 4) {
+                    u32 v;
+                    std::memcpy(&v, src + i, 4);
+                    ps_st32(dst + i, v);
+                }
+            }
+        }
+        tracker.notify_write(s.address, s.bytes());
+        s.gpu_newer = false;
+        return true;
+    }
 
     const bool x_zero = f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 || f == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8;
     const bool x_one = f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8 || f == SurfaceColorFormat::X8B8G8R8_O8B8G8R8;

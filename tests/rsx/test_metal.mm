@@ -791,6 +791,32 @@ TEST_CASE("metal e2e: clear, upload programs, draw a triangle, read back through
     CHECK(rgba[(48 * kW + 32) * 4 + 2] == 0);
 }
 
+TEST_CASE("metal e2e: a float16 target reads back big-endian, red first (D-080)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    REQUIRE(e.backend->valid());
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::F_W16Z16Y16X16) | (2u << 5) | (1u << 8));
+    b.method(m::NV4097_SET_SURFACE_PITCH_A, kW * 8);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ff); // ARGB: opaque blue
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    // The RSX copies the target to main memory (NV0039): the GPU copy is written back first.
+    b.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaFrameBuffer, loc::kDmaHostBuffer});
+    b.method(m::NV0039_OFFSET_IN, {kSurfaceOffset, 0x100000, kW * 8, kW * 8, kW * 8, kH, 0x101});
+    b.method(m::NV0039_BUFFER_NOTIFY, 0);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().readbacks == 1);
+    const u8* p = e.mem.host(E2E::kReadbackEa) + (10 * kW + 20) * 8;
+    CHECK(ps_ld16(p + 0) == 0x0000); // R
+    CHECK(ps_ld16(p + 2) == 0x0000); // G
+    CHECK(ps_ld16(p + 4) == 0x3C00); // B = 1.0
+    CHECK(ps_ld16(p + 6) == 0x3C00); // A = 1.0
+}
+
 TEST_CASE("metal e2e: 16-bit exports, vertex colour interpolation and partial clears")
 {
     REQUIRE_METAL();

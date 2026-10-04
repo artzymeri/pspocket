@@ -222,14 +222,26 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     }
     const TextureFormatInfo* fmt = texture_format_info(t.base_format());
 
-    // A render target at this address: sample the GPU copy (plan section 7: "bind the Metal texture directly").
-    if (Surface* s = find_surface(*ea, false); s && !s->cpu_newer && fmt) {
-        const bool compatible = (fmt->decode == TexelDecode::ARGB8 || fmt->decode == TexelDecode::DRGB8) &&
-            surface_color_bpp(s->gcm_format) == 4;
+    // A render target at this address: sample the GPU copy (plan section 7: "bind the Metal texture directly") when
+    // the texture reads it in its own format.
+    Surface* s = find_surface(*ea, false);
+    if (s && !s->cpu_newer && fmt) {
+        const auto sf = static_cast<SurfaceColorFormat>(s->gcm_format);
+        const bool compatible =
+            ((fmt->decode == TexelDecode::ARGB8 || fmt->decode == TexelDecode::DRGB8) &&
+                surface_color_bpp(s->gcm_format) == 4) ||
+            (fmt->decode == TexelDecode::W16Z16Y16X16F && sf == SurfaceColorFormat::F_W16Z16Y16X16) ||
+            (fmt->decode == TexelDecode::W32Z32Y32X32F && sf == SurfaceColorFormat::F_W32Z32Y32X32) ||
+            (fmt->decode == TexelDecode::X32F && sf == SurfaceColorFormat::F_X32);
         if (!compatible) {
-            unsupported(std::format("texture format {} sampled from a surface of format {} is not converted",
-                fmt->name, s->gcm_format));
+            // Another format over the target's bits (the first mission reads an A8B8G8R8 target as Y16_X16): the
+            // target goes to guest memory, and the texture is decoded from there below (D-080; RPCS3 converts on the
+            // GPU). An expensive readback, logged with the others.
+            if (s->gpu_newer) write_back(*s);
+            s = nullptr;
         }
+    }
+    if (s && !s->cpu_newer && fmt) {
         stats.surface_samples++;
         id<MTLTexture> tex = s->texture;
         if (draw_targets.contains(s)) {

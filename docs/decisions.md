@@ -1176,6 +1176,21 @@ runs' pace. Two causes, from a Time Profiler capture on the Mac (run 050):
   of other modules).
 pspocket-boot logs the frame rate every 5 s, like the iOS app.
 
+## D-080 · 2026-10-04 · Floating-point render targets read back; other formats over a target decode from memory
+
+Run 050's first mission drew its world in pink and red. Its log named the gaps around the game's floating-point
+render targets: "GPU readback of surface format 11 is not implemented" (the RSX copying a float16 target, with NV0039
+or as texture memory, read stale guest memory) and textures sampling a target in another format than its own (an
+A8B8G8R8 target read as Y16_X16).
+- Write-back covers F_W16Z16Y16X16, F_W32Z32Y32X32 and F_X32: each component big-endian, red first, as the
+  W16_Z16_Y16_X16_FLOAT, W32_Z32_Y32_X32_FLOAT and X32_FLOAT textures read them.
+- A texture over a render target samples the GPU copy only when it reads it in its own format (8-bit ARGB textures
+  over 32-bit 8-bit targets, as before, and the three float formats over their targets). Otherwise the target is
+  written back and the texture decoded from guest memory: exact, but an expensive readback (logged). RPCS3 converts
+  such reinterpretations on the GPU; that waits until the readbacks show up in a profile.
+- A flush of memory under a target of the open render pass ends the pass first: a target cleared but not drawn to
+  holds the clear only as the pass's load action, so the write-back read the memory from before the clear.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
