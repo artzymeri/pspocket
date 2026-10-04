@@ -273,9 +273,35 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         return sample_view(tex, s->views, src);
     }
     if (!s && fmt) {
-        // A depth buffer read as a colour texture (the lighting pass reads Z24S8 as A8R8G8B8 to rebuild positions):
-        // its bits go to guest memory, in the RSX's layout, and the texture decodes them (RPCS3 converts them on the
-        // GPU). An expensive readback, logged with the others.
+        // A depth buffer read as a texture (GTA V's lighting reads Z24S8 as A8R8G8B8 to rebuild positions, and its
+        // shadow maps as DEPTH16 and X16): converted on the GPU into what the texture's format makes of the buffer's
+        // bits (D-088, as RPCS3 does), when the sizes and formats line up.
+        if (Surface* d = find_surface(*ea, true); d && !d->cpu_newer && d->initialized) {
+            const u32 bf = t.base_format();
+            const bool z16 = d->pixel_format == MTLPixelFormatDepth16Unorm;
+            u32 mode = ~0u;
+            if (bf == tex::DEPTH24_D8 || bf == tex::DEPTH24_D8_FLOAT || bf == tex::DEPTH16 || bf == tex::DEPTH16_FLOAT) {
+                mode = kDepthValueMode;
+            } else if (!z16 && (fmt->decode == TexelDecode::ARGB8 || fmt->decode == TexelDecode::DRGB8 ||
+                                   fmt->decode == TexelDecode::Y16X16)) {
+                mode = static_cast<u32>(fmt->decode);
+            } else if (z16 && fmt->decode == TexelDecode::X16) {
+                mode = static_cast<u32>(fmt->decode);
+            }
+            if (mode != ~0u && t.width == d->width && t.height == d->height) {
+                if (Surface::Conversion* conv = depth_as_texture(*d, mode)) {
+                    bind_source = "depth buffer, converted";
+                    std::array<u8, 4> csrc = texture_channel_sources(*fmt, t.remap);
+                    if (mode == kDepthValueMode) {
+                        // The depth formats: the depth in every channel, as X32_FLOAT reads its value.
+                        for (u8& c : csrc) c = c < 4 ? 0 : c;
+                    }
+                    return sample_view(conv->texture, conv->views, csrc);
+                }
+            }
+        }
+        // Otherwise its bits go to guest memory, in the RSX's layout, and the texture decodes them: an expensive
+        // readback, logged with the others.
         if (Surface* d = find_surface(*ea, true); d && !d->cpu_newer && d->gpu_newer) {
             if (reinterpretations.insert((u64{0x100 | d->gcm_format} << 32) | (u64{t.base_format()} << 16) |
                                          (d->width & 0xFFFF)).second) {

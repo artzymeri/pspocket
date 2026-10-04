@@ -61,6 +61,9 @@ private:
 
 // ---- surfaces -----------------------------------------------------------------------------------------------------
 
+// rsx_depth_to_texture's mode for the depth texture formats: the depth itself (kernels.hpp kDepthValue).
+inline constexpr u32 kDepthValueMode = 100;
+
 struct Surface {
     u32 address = 0;   // guest EA
     u32 pitch = 0;
@@ -75,6 +78,15 @@ struct Surface {
     bool cpu_newer = false;    // guest memory was written by the CPU after the GPU copy was made
     u64 last_used = 0;
     std::unordered_map<u32, id<MTLTexture>> views; // swizzled views for sampling, by encoded channel sources
+    u64 generation = 0; // render passes that wrote it
+    // A depth buffer read as a texture (D-088): its conversion per decode mode, the generation it was made from, and
+    // its swizzled views.
+    struct Conversion {
+        id<MTLTexture> texture = nil;
+        u64 generation = 0;
+        std::unordered_map<u32, id<MTLTexture>> views;
+    };
+    std::unordered_map<u32, Conversion> conversions;
     u32 bytes() const { return pitch * height; }
 };
 
@@ -138,6 +150,8 @@ struct MetalBackend::Impl {
     id<MTLLibrary> kernels = nil;
     id<MTLComputePipelineState> decode_pipeline = nil;
     id<MTLComputePipelineState> read_pipeline = nil;
+    id<MTLComputePipelineState> depth_pipeline = nil; // rsx_depth_to_texture
+    id<MTLTexture> dummy_stencil = nil;              // for Z16 buffers, which have none
     id<MTLRenderPipelineState> blit_pipeline = nil;
     id<MTLSamplerState> nearest_sampler = nil;
     id<MTLSamplerState> linear_sampler = nil;
@@ -203,7 +217,9 @@ struct MetalBackend::Impl {
     void unsupported(std::string message);
 
     // Render passes
-    bool select_targets(const RsxState& state, PassTargets& out, bool for_clear);
+    // clear_mask: for a clear, its mask (only a clear that touches depth or stencil looks at the depth buffer);
+    // ~0u for a draw.
+    bool select_targets(const RsxState& state, PassTargets& out, u32 clear_mask);
     void open_pass(const PassTargets& targets);
     id<MTLRenderCommandEncoder> start_encoder();
     void end_pass();
@@ -228,6 +244,9 @@ struct MetalBackend::Impl {
     void upload_surface_from_guest(Surface& s);
     void remove_surface(Surface* s);
     id<MTLTexture> copy_texture(id<MTLTexture> src);
+    // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the
+    // buffer was drawn to since; nil when it cannot be.
+    Surface::Conversion* depth_as_texture(Surface& d, u32 mode);
     id<MTLRenderPipelineState> blit_pipeline_for(MTLPixelFormat format);
     id<MTLTexture> sample_view(id<MTLTexture> tex, std::unordered_map<u32, id<MTLTexture>>& views,
         const std::array<u8, 4>& src); // src: texture_channel_sources, adjusted for what the texture holds

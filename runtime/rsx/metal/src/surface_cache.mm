@@ -170,6 +170,45 @@ id<MTLTexture> MetalBackend::Impl::copy_texture(id<MTLTexture> src)
     return dst;
 }
 
+Surface::Conversion* MetalBackend::Impl::depth_as_texture(Surface& d, u32 mode)
+{
+    const bool z16 = d.pixel_format == MTLPixelFormatDepth16Unorm;
+    if (!d.depth || d.swizzled || (!z16 && d.pixel_format != MTLPixelFormatDepth32Float_Stencil8)) return nullptr;
+    Surface::Conversion& conv = d.conversions[mode];
+    __strong id<MTLTexture>& tex = conv.texture;
+    if (tex && conv.generation == d.generation) return &conv;
+    if (!tex) {
+        // The texture's own decoded formats (rsx_decode_texture): RGBA8 for 8-bit channels, 16-bit unorm for X16 and
+        // Y16_X16, the depth as a float for the depth formats.
+        const MTLPixelFormat pf = mode == static_cast<u32>(TexelDecode::X16)      ? MTLPixelFormatR16Unorm
+                                : mode == static_cast<u32>(TexelDecode::Y16X16)   ? MTLPixelFormatRG16Unorm
+                                : mode == kDepthValueMode                         ? MTLPixelFormatR32Float
+                                                                                  : MTLPixelFormatRGBA8Unorm;
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                                                         width:d.width
+                                                                                        height:d.height
+                                                                                     mipmapped:NO];
+        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+        desc.storageMode = MTLStorageModePrivate;
+        tex = [device newTextureWithDescriptor:desc];
+        if (!tex) return nullptr;
+    }
+    id<MTLTexture> stencil = z16 ? dummy_stencil : [d.texture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+    end_pass();
+    id<MTLComputeCommandEncoder> enc = [render_buffer() computeCommandEncoder];
+    [enc setComputePipelineState:depth_pipeline];
+    [enc setTexture:d.texture atIndex:0];
+    [enc setTexture:stencil atIndex:1];
+    [enc setTexture:tex atIndex:2];
+    const u32 params[4] = {mode, z16 ? 1u : 0u, 0, 0};
+    [enc setBytes:params length:sizeof(params) atIndex:0];
+    [enc dispatchThreads:MTLSizeMake(d.width, d.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [enc endEncoding];
+    conv.generation = d.generation;
+    stats.depth_conversions++;
+    return &conv;
+}
+
 void MetalBackend::Impl::upload_surface_from_guest(Surface& s)
 {
     // The CPU (or the RSX's own copies) wrote the surface's memory after the GPU copy was made: reload it.

@@ -89,12 +89,14 @@ bool MetalBackend::Impl::init()
                                                             error:&error];
     read_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_read_texture"]
                                                           error:&error];
+    depth_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_depth_to_texture"]
+                                                           error:&error];
     MTLRenderPipelineDescriptor* blit = [MTLRenderPipelineDescriptor new];
     blit.vertexFunction = [kernels newFunctionWithName:@"rsx_fullscreen_vs"];
     blit.fragmentFunction = [kernels newFunctionWithName:@"rsx_blit_fs"];
     blit.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     blit_pipeline = [device newRenderPipelineStateWithDescriptor:blit error:&error];
-    if (!decode_pipeline || !read_pipeline || !blit_pipeline) {
+    if (!decode_pipeline || !read_pipeline || !depth_pipeline || !blit_pipeline) {
         PS_LOG_ERROR(kChan, "backend pipelines failed: {}", error ? error.localizedDescription.UTF8String : "?");
         return false;
     }
@@ -118,6 +120,11 @@ bool MetalBackend::Impl::init()
     dummy_texture = [device newTextureWithDescriptor:dd];
     const u32 zero = 0;
     [dummy_texture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&zero bytesPerRow:4];
+    MTLTextureDescriptor* sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint
+                                                                                  width:1
+                                                                                 height:1
+                                                                              mipmapped:NO];
+    dummy_stencil = [device newTextureWithDescriptor:sd];
     MTLTextureDescriptor* cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                      size:1
                                                                                 mipmapped:NO];
@@ -205,8 +212,9 @@ void MetalBackend::Impl::submit(bool wait)
 
 // ---- render passes ----------------------------------------------------------------------------------------------
 
-bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out, bool for_clear)
+bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out, u32 clear_mask)
 {
+    const bool for_clear = clear_mask != ~0u;
     // RPCS3 RSXThread.cpp get_framebuffer_layout: size from the surface clip, colour buffers for the active
     // targets, the depth buffer only when the draw (or clear) uses it, misconfigured pitches dropped.
     const SurfaceInfo si = state.surface();
@@ -221,7 +229,9 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
     const DepthStencilInfo ds = state.depth_stencil();
     bool depth_used = false;
     if (for_clear) {
-        depth_used = true; // the caller drops the depth target when the clear mask does not touch it
+        // Only a clear of depth or stencil: a colour clear must not set up (and so replace) whatever depth buffer the
+        // stale zeta registers describe.
+        depth_used = (clear_mask & clear::kDepthStencil) != 0;
     } else {
         depth_used = ds.depth_test || (si.depth_format == 2 && ds.stencil_test) ||
             (ds.depth_bounds_test && (ds.depth_bounds_min > 0.f || ds.depth_bounds_max < 1.f));
@@ -315,11 +325,13 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
             pass.color[i]->initialized = true;
             pass.color[i]->gpu_newer = true;
             pass.color[i]->last_used = tick;
+            pass.color[i]->generation++;
         }
         if (pass.depth) {
             pass.depth->initialized = true;
             pass.depth->gpu_newer = true;
             pass.depth->last_used = tick;
+            pass.depth->generation++;
         }
     }
     return encoder;
@@ -422,7 +434,7 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
     stats.clears++;
 
     PassTargets t;
-    if (!select_targets(state, t, true)) return;
+    if (!select_targets(state, t, mask)) return;
     if (!(mask & clear::kColor)) t.color_count = 0;
     if (!(mask & clear::kDepthStencil)) t.depth = nullptr;
     // Keep the open pass if it already has these surfaces (clearing mid-pass), else switch.
@@ -582,7 +594,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 
     // ---- targets and programs ----
     PassTargets targets;
-    if (!select_targets(state, targets, false)) return skip("");
+    if (!select_targets(state, targets, ~0u)) return skip("");
     const bool points = d.primitive == Primitive::Points;
     const CompiledProgram* vp = vertex_program_for(state, points);
     if (!vp) return skip("");

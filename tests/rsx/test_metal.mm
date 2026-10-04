@@ -1185,9 +1185,52 @@ TEST_CASE("metal e2e: a Z24S8 depth buffer read as an A8R8G8B8 texture gives its
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
     for (const auto& f : e.failures) INFO(f.message);
     CHECK(e.failures.empty());
-    CHECK(e.backend->stats().readbacks == 1);
+    CHECK(e.backend->stats().readbacks == 0); // converted on the GPU (D-088)
+    CHECK(e.backend->stats().depth_conversions == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x12, 0x34, 0x56, 0x78});
+}
+
+TEST_CASE("metal e2e: a Z16 depth buffer reads as X16 (its value) and as DEPTH16 (the depth in every channel)")
+{
+    REQUIRE_METAL();
+    for (const u32 format : {tex::X16, tex::DEPTH16}) {
+        INFO(std::format("texture format {:#x}", format));
+        E2E e;
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        constexpr u32 kDepth = 0x180000;
+        auto b = e.at(0);
+        // Pass 1: a Z16 depth buffer cleared to 0x6000 (0.375: 96 in 8 bits, away from a rounding edge)
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (1u << 5) | (1u << 8));
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kDepth);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 2);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x6000);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth);
+        // Pass 2: read it
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        bind_linear_texture(b, kDepth, format, kW * 2);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().readbacks == 0);
+        CHECK(e.backend->stats().depth_conversions == 1);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const auto p = guest_pixel(e, kSurfaceOffset, 32, 48);
+        if (format == tex::X16) {
+            CHECK(p == std::array<u8, 4>{0x60, 0xff, 0x60, 0xff}); // X16 in A R G B: value, 1, value, 1 (RPCS3)
+        } else {
+            CHECK(p == std::array<u8, 4>{0x60, 0x60, 0x60, 0x60}); // the depth in every channel
+        }
+    }
 }
 
 TEST_CASE("metal e2e: flip presents the display buffer scaled to the output size")

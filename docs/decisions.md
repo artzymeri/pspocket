@@ -1296,6 +1296,34 @@ refused. RPCS3's VertexProgramDecompiler is the reference.
   constants).
 - Tests: the translation of ARL, a relative constant, BRI, CAL and RET; Metal compiles a program with all of them.
 
+## D-087 · 2026-10-04 · The worker's stops run as lifted stand-ins; misses re-seed the lift
+
+Run 058 (D-085 in place) interpreted where the lift had not reached: one job binary was 36% lifted, its other code
+reached through function pointers. Its misses, logged in its own terms (D-081), seeded the next lift (86% of it). And
+GTA V's own policy module left through the kernel's exit at 0x808 2.1 million times a second; every time, the run loop
+missed (taking the miss log's lock), interpreted one `stop` and handed back.
+- The HLE's resolver gives the worker's planted stops (select 0x290, return 0x804, exit 0x808, the job return 0x2570)
+  a lifted stand-in each: a 4-byte program whose entry takes the same stop, used only while local store holds that
+  stop there. A wider one would have held the policy module's code too (the run loop would not have gone back to it).
+- Run 059: the most interpreted address 70 million instructions in 300 s (run 057: 16.6 billion).
+- Test: a policy module leaves through 0x808 without a miss, and comes back to its own lifted code.
+
+## D-088 · 2026-10-04 · Depth buffers read as textures convert on the GPU
+
+D-083's write-back of a depth buffer for a texture that reads it cost a full GPU stall and a CPU copy each time; GTA V
+reads its main depth buffer and its shadow maps every frame (65,433 readbacks in run 058, the first mission down from 9
+to 6.6 fps).
+- `rsx_depth_to_texture` (compute) reads the depth buffer (and its stencil, through an X32_Stencil8 view) and writes
+  what the texture's format makes of the RSX's bits: Z24S8 as big-endian words (depth high, stencil low) read as
+  A8R8G8B8, D8R8G8B8 or Y16_X16; Z16 read as X16; and the depth formats (DEPTH24_D8, DEPTH16 and their float forms)
+  the depth itself, in every channel. It runs in the frame's command buffer, after the passes that drew the buffer;
+  the result is kept per format and redone only when the buffer was drawn to since (a generation count per surface).
+- Other combinations, and sizes that differ from the buffer's, still go through the write-back.
+- A colour-only clear no longer sets up the depth buffer the stale zeta registers describe: creating it replaced the
+  real depth buffer at that address.
+- Not yet: depth comparison (shadow tests) for the depth formats; they read the depth.
+- Tests: Z24S8 as A8R8G8B8 and Z16 as X16 and DEPTH16, end to end with no readback.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -131,6 +131,33 @@ kernel void rsx_decode_texture(device const uchar* src [[buffer(0)]], constant r
     dst.write(c, gid);
 }
 
+// A depth buffer read as a texture, on the GPU (D-088): the texture sees the depth buffer's bits as the RSX lays them
+// out, Z24S8 as big-endian words (depth in bits 31-8, stencil in 7-0) and Z16 as big-endian halfwords, and decodes them
+// as its own format (p.x: kARGB8, kDRGB8, kX16, kY16X16 as rsx_decode_texture does; kDepthValue: the depth itself, for
+// the depth texture formats). p.y: the buffer is Z16.
+constant uint kDepthValue = 100;
+kernel void rsx_depth_to_texture(depth2d<float, access::read> depth [[texture(0)]],
+                                 texture2d<uint, access::read> stencil [[texture(1)]],
+                                 texture2d<float, access::write> dst [[texture(2)]],
+                                 constant uint4& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    const float z = depth.read(gid);
+    const bool z16 = p.y != 0u;
+    const uint d = z16 ? uint(rint(saturate(z) * 65535.0)) : uint(rint(saturate(z) * 16777215.0));
+    const uint word = z16 ? (d << 16) : ((d << 8) | (stencil.read(gid).r & 0xffu));
+    const uint b0 = word >> 24, b1 = (word >> 16) & 0xffu, b2 = (word >> 8) & 0xffu, b3 = word & 0xffu;
+    float4 c;
+    switch (p.x) {
+    case kARGB8: c = rgba8(b1, b2, b3, b0); break;
+    case kDRGB8: c = rgba8(b1, b2, b3, 255u); break;
+    case kX16: c = float4(float(word >> 16) / 65535.0, 0.0, 0.0, 1.0); break;
+    case kY16X16: c = float4(float(word >> 16) / 65535.0, float(word & 0xffffu) / 65535.0, 0.0, 1.0); break;
+    default: c = float4(z); break;
+    }
+    dst.write(c, gid);
+}
+
 // Reads a texture back as float4 per texel (nearest sampling at texel centres: works for every format, BCn included).
 kernel void rsx_read_texture(texture2d<float> src [[texture(0)]], sampler s [[sampler(0)]],
                              device float4* out [[buffer(0)]], constant uint4& size [[buffer(1)]],
