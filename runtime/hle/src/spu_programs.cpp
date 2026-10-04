@@ -17,8 +17,10 @@
 #include <utility>
 #include <vector>
 
+#include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/runtime.h"
+#include "spurs_native.hpp"
 
 namespace pspocket::hle::spurs {
 namespace {
@@ -205,11 +207,57 @@ void log_modified(const u8* ls, const u8* guest, u32 size, u32 ls_start, u32 ea_
         "copy, +{:#x} to +{:#x}; interpreted", ls_start, size, ea_start, words, first, last);
 }
 
+// ---- the worker's stops (D-087)
+//
+// The SPURS kernel's entry points and the job return are `stop`s the worker plants in local store (spurs_native.hpp).
+// Policy modules and jobs reach them from lifted code all the time (run 058: GTA V's own policy module left through
+// 0x808 2.1 million times a second), and each time the run loop missed, logged under a lock and interpreted one
+// instruction. A lifted stand-in takes the stop instead, while local store still holds it there.
+void stop_select(SPUContext* ctx, uint8_t*) { ps_spu_stop(ctx, kKernelSelect, kKernelSelectStop); }
+void stop_return(SPUContext* ctx, uint8_t*) { ps_spu_stop(ctx, kKernelReturn, kKernelExitStop); }
+void stop_exit(SPUContext* ctx, uint8_t*) { ps_spu_stop(ctx, kKernelExit, kKernelExitStop); }
+void stop_job_return(SPUContext* ctx, uint8_t*) { ps_spu_stop(ctx, ls::jc_return, kJobReturnStop); }
+
+// One 4-byte program per stop: a wider one would also hold the policy module's code (from 0xA00), and the run loop
+// would not go back to the module's own program from it.
+const ps_spu_entry kSelectEntry[] = {{kKernelSelect, &stop_select}};
+const ps_spu_entry kReturnEntry[] = {{kKernelReturn, &stop_return}};
+const ps_spu_entry kExitEntry[] = {{kKernelExit, &stop_exit}};
+const ps_spu_entry kJobReturnEntry[] = {{ls::jc_return, &stop_job_return}};
+std::array<ps_spu_program, 4> g_stubs{{
+    {"spurs_stop_select", 0x5350555253000001ull, kKernelSelect, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kSelectEntry, nullptr,
+        nullptr},
+    {"spurs_stop_return", 0x5350555253000002ull, kKernelReturn, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kReturnEntry, nullptr,
+        nullptr},
+    {"spurs_stop_exit", 0x5350555253000003ull, kKernelExit, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kExitEntry, nullptr,
+        nullptr},
+    {"spurs_stop_job_return", 0x5350555253000004ull, ls::jc_return, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kJobReturnEntry,
+        nullptr, nullptr},
+}};
+
+const ps_spu_program* worker_stop(const SPUContext* ctx, u32 pc)
+{
+    u32 stop = 0;
+    const ps_spu_program* program = nullptr;
+    switch (pc) {
+    case kKernelSelect: stop = kKernelSelectStop, program = &g_stubs[0]; break;
+    case kKernelReturn: stop = kKernelExitStop, program = &g_stubs[1]; break;
+    case kKernelExit: stop = kKernelExitStop, program = &g_stubs[2]; break;
+    case ls::jc_return: stop = kJobReturnStop, program = &g_stubs[3]; break;
+    default: return nullptr;
+    }
+    return ps_read32(ctx->ls, pc) == stop ? program : nullptr; // `stop` encodes its signal in its low 14 bits
+}
+
 // The resolver: the lifted program of the module holding pc, and where it sits (its lifted programs are relocatable).
 const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start)
 {
-    Modules& m = modules_for(ctx);
     pc &= PS_SPU_LS_MASK & ~3u;
+    if (const ps_spu_program* stub = worker_stop(ctx, pc)) {
+        *code_start = stub->code_start;
+        return stub;
+    }
+    Modules& m = modules_for(ctx);
     const u32 at = m.block_run[pc >> kBlockShift];
     if (!at) return nullptr;
     Run& r = m.runs[at - 1];
@@ -341,6 +389,7 @@ void set_spu_dump_dir(std::string dir)
 
 void enable_spu_modules()
 {
+    for (ps_spu_program& stub : spurs::g_stubs) ps_spu_register_program(&stub); // the worker's stops (D-087)
     ps_spu_set_get_observer(&spurs::observe_get);
     ps_spu_set_resolver(&spurs::resolve);
 }

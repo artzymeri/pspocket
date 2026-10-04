@@ -421,3 +421,49 @@ TEST_CASE("SPU programs: a task's modules stay known across its context switch t
     ps_spu_set_get_observer(nullptr);
     ps_spu_unregister_program(&program);
 }
+
+namespace {
+
+void jump_to_kernel_exit(SPUContext* ctx, uint8_t*) { ctx->pc = 0x808; }
+
+} // namespace
+
+TEST_CASE("SPU programs: the worker's stops in local store run as lifted stand-ins, not misses (D-087)", "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    hle::enable_spu_modules();
+    Spu spu(mem.base());
+    ps_write32(spu.ls.get(), 0x808, 0x808); // `stop 0x808`, as the worker plants it
+    const ps_spu_entry entries[] = {{0xA00, &jump_to_kernel_exit}};
+    ps_spu_program pm{"spu_pm", 3, 0xA00, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_register_program(&pm);
+    const ps_spu_miss_policy policy = ps_spu_get_miss_policy();
+    ps_spu_set_miss_policy(PS_SPU_MISS_ABORT); // a miss would end the test
+    const u64 misses = ps_spu_miss_count();
+
+    ps_spu_attach_program(&spu.ctx, &pm);
+    spu.ctx.pc = 0xA00;
+    REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(spu.ctx.stop_code == 0x808);
+    CHECK(ps_spu_miss_count() == misses);
+    CHECK(spu.ctx.home == &pm);
+    // Back to the module's own code, lifted: its entry runs again and stops at the exit again.
+    spu.ctx.pc = 0xA00;
+    REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(spu.ctx.stop_code == 0x808);
+    CHECK(ps_spu_miss_count() == misses);
+
+    // Something else at that address: no stand-in (the stop is checked in local store).
+    ps_write32(spu.ls.get(), 0x808, 0x00000123); // `stop 0x123`
+    ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
+    spu.ctx.pc = 0xA00;
+    REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(spu.ctx.stop_code == 0x123);
+    CHECK(ps_spu_miss_count() == misses + 1);
+
+    ps_spu_set_miss_policy(policy);
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&pm);
+}
