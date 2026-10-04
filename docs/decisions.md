@@ -927,6 +927,17 @@ quietly ("cellMSMP3Decoder: Error loading MP3 codec") and the mixer later ran th
 - Reloads of a game's own SPURS policy module are logged once per SPU, then at debug level (thousands per run now
   that priorities are right, D-064).
 
+## D-068 · 2026-10-04 · Fragment program condition codes, as RPCS3
+
+Runs 031 and 039 showed a grey screen: every draw of GTA V's frontend shaders failed on `MOVR RC0, ...`, a condition
+code update (110,146 skipped draws in run 039). The MSL translator now follows RPCS3's FragmentProgramDecompiler
+(SetDst, AddCodeCond, AddFlowOp, GetRawCond): condition registers RC0 and RC1 start at 0; a conditional instruction
+compares RC{cond_reg}, through its condition swizzle, with 0 (>=, <=, !=, >, < or == from its three condition bits)
+and writes only the destination components whose test holds (`select`); a conditional KIL discards when any component
+holds; set_cond copies what an instruction wrote to RC{cond_mod_reg}, or without a destination its result (scale only,
+no clamp) when any component's test holds. Run 040: no failed draws; the legal screen and the Display Calibration
+screen draw as on the PS3.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

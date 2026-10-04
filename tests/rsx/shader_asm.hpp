@@ -122,6 +122,10 @@ struct FpInst {
     u32 prec = 0;
     u32 scale = 0;
     bool exec_lt = true, exec_eq = true, exec_gt = true;
+    std::array<u8, 4> cond_sw{0, 1, 2, 3}; // condition swizzle
+    u32 cond_reg = 0;                       // RC tested by a conditional instruction
+    u32 cond_mod_reg = 0;                   // RC written by set_cond
+    bool set_cond = false;
     bool end = false;
 };
 
@@ -135,10 +139,12 @@ inline u32 fp_src_bits(const FpSrc& s)
 // 16-bit halves exchanged.
 inline void encode_fp(const FpInst& in, std::vector<u8>& bytes)
 {
-    const u32 dst = u32{in.end} | (in.dst << 1) | (u32{in.fp16} << 7) | (u32{in.mask} << 9) | (in.input << 13) |
-        (in.tex << 17) | (in.prec << 22) | ((in.op & 0x3f) << 24) | (u32{in.no_dest} << 30) | (u32{in.saturate} << 31);
+    const u32 dst = u32{in.end} | (in.dst << 1) | (u32{in.fp16} << 7) | (u32{in.set_cond} << 8) | (u32{in.mask} << 9) |
+        (in.input << 13) | (in.tex << 17) | (in.prec << 22) | ((in.op & 0x3f) << 24) | (u32{in.no_dest} << 30) |
+        (u32{in.saturate} << 31);
     const u32 s0 = fp_src_bits(in.src[0]) | (u32{in.exec_lt} << 18) | (u32{in.exec_eq} << 19) | (u32{in.exec_gt} << 20) |
-        (0u << 21) | (1u << 23) | (2u << 25) | (3u << 27) | (u32{in.src[0].abs} << 29);
+        (u32{in.cond_sw[0]} << 21) | (u32{in.cond_sw[1]} << 23) | (u32{in.cond_sw[2]} << 25) | (u32{in.cond_sw[3]} << 27) |
+        (u32{in.src[0].abs} << 29) | (in.cond_mod_reg << 30) | (in.cond_reg << 31);
     const u32 s1 = fp_src_bits(in.src[1]) | (u32{in.src[1].abs} << 18) | (in.scale << 28) | (((in.op >> 6) & 1) << 31);
     const u32 s2 = fp_src_bits(in.src[2]) | (u32{in.src[2].abs} << 18);
     auto put = [&](u32 w) {

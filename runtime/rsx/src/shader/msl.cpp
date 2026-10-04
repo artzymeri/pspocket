@@ -422,6 +422,19 @@ std::string fp_compare(const char* op, const std::string& a, const std::string& 
 
 } // namespace
 
+// The condition of a conditional instruction (RPCS3 FragmentProgramDecompiler GetRawCond): condition register
+// RC{cond_reg} through the condition swizzle, compared with 0 per component, as a bool4 expression.
+std::string fp_condition(const FpInstruction& in)
+{
+    const char* op = (in.exec_gt && in.exec_eq) ? ">="
+                   : (in.exec_lt && in.exec_eq) ? "<="
+                   : (in.exec_gt && in.exec_lt) ? "!="
+                   : in.exec_gt                 ? ">"
+                   : in.exec_lt                 ? "<"
+                                                : "==";
+    return std::format("(cc{}{} {} float4(0.0))", in.cond_reg, in.cond_swizzle.str(), op);
+}
+
 TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOptions& opt)
 {
     TranslateResult result;
@@ -441,13 +454,17 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         const FpOp op = static_cast<FpOp>(in.op);
         if (op == FpOp::NOP || op == FpOp::FENCT || op == FpOp::FENCB) continue;
         if (in.never()) continue; // conditional execution that never executes
-        if (!in.always()) return fail("conditional execution");
-        if (in.set_cond) return fail("condition code update");
         if (in.use_index_reg) return fail("indexed input (loop counter)");
+        // Condition codes (RPCS3 SetDst, AddCodeCond, AddFlowOp): RC0 and RC1 start at 0. A conditional instruction
+        // writes only the destination components whose condition holds; one with set_cond also copies what it wrote
+        // to RC{cond_mod_reg}, or without a destination its result when any component's condition holds.
+        const bool conditional = !in.always();
+        const std::string cond = conditional ? fp_condition(in) : std::string();
 
         body += std::format("    {{ // {:04x}: {}\n", in.offset, disassemble(in));
         if (op == FpOp::KIL) {
-            body += "        discard_fragment();\n    }\n";
+            body += conditional ? std::format("        if (any({})) discard_fragment();\n    }}\n", cond)
+                                : std::string("        discard_fragment();\n    }\n");
             continue;
         }
 
@@ -517,26 +534,37 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         default: return fail(std::format("opcode {}", fp_op_name(in.op)));
         }
 
-        // Result modifiers (SetDst): scale, then saturate or the destination precision.
+        // Result modifiers (SetDst): scale, then (with a destination) saturate or the destination precision.
         static constexpr const char* kScale[] = {"", " * 2.0", " * 4.0", " * 8.0", "", " / 2.0", " / 4.0", " / 8.0"};
         if (in.scale & 7) e = std::format("(({}){})", e, kScale[in.scale & 7]);
-        if (in.saturate) {
+        if (!in.no_dest && in.saturate) {
             e = clamp_precision(e, 4);
-        } else if (in.prec && !exempt_prec && !(in.prec == 1 && !in.dst_fp16)) {
+        } else if (!in.no_dest && in.prec && !exempt_prec && !(in.prec == 1 && !in.dst_fp16)) {
             e = clamp_precision(e, in.prec);
         }
         body += std::format("        const float4 res = {};\n", e);
+        const std::string m = mask_suffix(in.mask);
         if (!in.no_dest && in.mask) {
-            const std::string m = mask_suffix(in.mask);
+            std::string reg;
             if (in.dst_fp16) {
                 c.h_regs.insert(in.dst);
                 c.h_written.insert(in.dst);
-                body += std::format("        h{}{} = res{};\n", in.dst, m, m);
+                reg = std::format("h{}", in.dst);
             } else {
                 c.r_regs.insert(in.dst);
                 c.r_written.insert(in.dst);
-                body += std::format("        r{}{} = res{};\n", in.dst, m, m);
+                reg = std::format("r{}", in.dst);
             }
+            if (conditional) {
+                body += std::format("        {}{} = select({}{}, res{}, {}{});\n", reg, m, reg, m, m, cond, m);
+            } else {
+                body += std::format("        {}{} = res{};\n", reg, m, m);
+            }
+            if (in.set_cond) body += std::format("        cc{}{} = {}{};\n", in.cond_mod_reg, m, reg, m);
+        } else if (in.no_dest && in.set_cond && in.mask) {
+            if (conditional) body += std::format("        if (any({})) ", cond);
+            else body += "        ";
+            body += std::format("cc{}{} = res{};\n", in.cond_mod_reg, m, m);
         }
         body += "    }\n";
     }
@@ -591,6 +619,8 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     src += "    const float in_w = 1.0 / in.position.w;\n";
     src += "    const float4 ssa = float4(front ? 1.0 : -1.0);\n";
     src += "    (void)wpos; (void)in_w; (void)ssa; (void)fc;\n";
+    src += "    float4 cc0 = float4(0.0), cc1 = float4(0.0); // condition registers RC0, RC1\n";
+    src += "    (void)cc0; (void)cc1;\n";
     for (u32 r : c.r_regs) src += std::format("    float4 r{} = float4(0.0);\n", r);
     for (u32 h : c.h_regs) src += std::format("    float4 h{} = float4(0.0);\n", h);
     src += body;

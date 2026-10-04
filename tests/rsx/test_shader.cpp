@@ -4,6 +4,8 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <format>
+
 #include "pspocket/rsx/shader/ir.hpp"
 #include "pspocket/rsx/shader/msl.hpp"
 #include "rsx_test_util.hpp"
@@ -277,6 +279,90 @@ TEST_CASE("fragment program MSL for the supported subset")
     CHECK(h.shader.source.find("out.c0 = r0;") != std::string::npos);
 }
 
+// Condition codes as RPCS3 (FragmentProgramDecompiler SetDst, AddCodeCond, AddFlowOp, GetRawCond): GTA V's frontend
+// shaders set RC0 from a constant and test it (run 039: every draw with them was skipped before).
+TEST_CASE("fragment program condition codes: set, conditional writes and a conditional KIL")
+{
+    // MOVR RC0, {-1, 0, 1, 2}  (no destination: the result goes to RC0)
+    FpInst set;
+    set.op = static_cast<u32>(FpOp::MOV);
+    set.no_dest = true;
+    set.set_cond = true;
+    set.src[0] = fp_const();
+    set.constant = std::array<float, 4>{-1.f, 0.f, 1.f, 2.f};
+    // MOVR R0.xy (GT RC0.zwxx), f[COL0]  (a conditional write of two components)
+    FpInst mov;
+    mov.op = static_cast<u32>(FpOp::MOV);
+    mov.dst = 0;
+    mov.mask = mask("xy");
+    mov.input = 1;
+    mov.src[0] = fp_in();
+    mov.exec_lt = mov.exec_eq = false;
+    mov.cond_sw = swz("zwxx");
+    // ADDR R1, R0, R0 and RC1 = R1  (set_cond with a destination, writing RC1)
+    FpInst add;
+    add.op = static_cast<u32>(FpOp::ADD);
+    add.dst = 1;
+    add.src[0] = fp_r(0);
+    add.src[1] = fp_r(0);
+    add.set_cond = true;
+    add.cond_mod_reg = 1;
+    // KIL (LT RC1.x)
+    FpInst kil;
+    kil.op = static_cast<u32>(FpOp::KIL);
+    kil.exec_eq = kil.exec_gt = false;
+    kil.cond_reg = 1;
+    kil.cond_sw = swz("xxxx");
+    FpInst out;
+    out.op = static_cast<u32>(FpOp::MOV);
+    out.src[0] = fp_r(0);
+    out.end = true;
+    const auto bytes = assemble_fp({set, mov, add, kil, out});
+    const auto fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
+    REQUIRE(fp.has_value());
+    CHECK(disassemble(fp->instructions[0]) == "MOVR RC0, {-1, 0, 1, 2};");
+    FpOptions opt;
+    opt.shader_control = 0x40;
+    const TranslateResult r = translate_fragment_program(*fp, opt);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    const std::string& s = r.shader.source;
+    INFO(s);
+    CHECK(s.find("float4 cc0 = float4(0.0), cc1 = float4(0.0);") != std::string::npos);
+    CHECK(s.find("cc0 = res;") != std::string::npos);
+    CHECK(s.find("r0.xy = select(r0.xy, res.xy, (cc0.zwxx > float4(0.0)).xy);") != std::string::npos);
+    CHECK(s.find("r1 = res;\n        cc1 = r1;") != std::string::npos);
+    CHECK(s.find("if (any((cc1.xxxx < float4(0.0)))) discard_fragment();") != std::string::npos);
+
+    // Every comparison the condition bits can ask for.
+    struct Row {
+        bool lt, eq, gt;
+        const char* op;
+    };
+    for (const Row& row : {Row{false, true, true, ">="}, Row{true, true, false, "<="}, Row{true, false, true, "!="},
+             Row{false, false, true, ">"}, Row{true, false, false, "<"}, Row{false, true, false, "=="}}) {
+        FpInst k = kil;
+        k.exec_lt = row.lt;
+        k.exec_eq = row.eq;
+        k.exec_gt = row.gt;
+        const auto b = assemble_fp({set, k, out});
+        const auto f = decode_fragment_program(b.data(), static_cast<u32>(b.size()));
+        REQUIRE(f.has_value());
+        const TranslateResult t = translate_fragment_program(*f, opt);
+        REQUIRE(t.ok);
+        CHECK(t.shader.source.find(std::format("(cc1.xxxx {} float4(0.0))", row.op)) != std::string::npos);
+    }
+    // A condition no component can meet: the instruction is left out.
+    FpInst never = mov;
+    never.exec_gt = false;
+    const auto nb = assemble_fp({set, never, out});
+    const auto nf = decode_fragment_program(nb.data(), static_cast<u32>(nb.size()));
+    REQUIRE(nf.has_value());
+    const TranslateResult n = translate_fragment_program(*nf, opt);
+    REQUIRE(n.ok);
+    CHECK(n.shader.source.find("select(") == std::string::npos);
+}
+
 TEST_CASE("unsupported fragment program features are named")
 {
     auto prog = sample_fp();
@@ -288,15 +374,6 @@ TEST_CASE("unsupported fragment program features are named")
     CHECK_FALSE(r.ok);
     CHECK(r.error.find("opcode PK4") != std::string::npos);
     CHECK(r.error.find("0x0020") != std::string::npos);
-
-    prog = sample_fp();
-    prog[0].exec_gt = false; // conditional on CC0
-    bytes = assemble_fp(prog);
-    fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
-    REQUIRE(fp.has_value());
-    r = translate_fragment_program(*fp);
-    CHECK_FALSE(r.ok);
-    CHECK(r.error.find("conditional execution") != std::string::npos);
 
     prog = sample_fp();
     prog[1].op = static_cast<u32>(FpOp::IFE);

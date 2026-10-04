@@ -436,6 +436,42 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
     fo.shader_control = 0;
     fo.mrt_count = 1;
     compile(shader::translate_fragment_program(*fdecoded, fo));
+
+    // Condition codes: RC0 set without a destination, a conditional masked write, RC1 set with one, a conditional KIL.
+    FpInst set;
+    set.op = 0x01;
+    set.no_dest = true;
+    set.set_cond = true;
+    set.src[0] = fp_const();
+    set.constant = std::array<float, 4>{-1.f, 0.f, 1.f, 2.f};
+    FpInst cmov;
+    cmov.op = 0x01;
+    cmov.mask = mask("xy");
+    cmov.input = 1;
+    cmov.src[0] = fp_in();
+    cmov.exec_lt = cmov.exec_eq = false;
+    cmov.cond_sw = swz("zwxx");
+    FpInst cadd;
+    cadd.op = 0x03;
+    cadd.dst = 1;
+    cadd.fp16 = true;
+    cadd.src[0] = fp_r(0);
+    cadd.src[1] = fp_r(0);
+    cadd.set_cond = true;
+    cadd.cond_mod_reg = 1;
+    cadd.exec_gt = false;
+    FpInst ckil;
+    ckil.op = 0x12;
+    ckil.exec_eq = ckil.exec_gt = false;
+    ckil.cond_reg = 1;
+    FpInst cout_;
+    cout_.op = 0x01;
+    cout_.src[0] = fp_r(0);
+    cout_.end = true;
+    const auto cbytes = assemble_fp({set, cmov, cadd, ckil, cout_});
+    const auto cdecoded = shader::decode_fragment_program(cbytes.data(), static_cast<u32>(cbytes.size()));
+    REQUIRE(cdecoded.has_value());
+    compile(shader::translate_fragment_program(*cdecoded));
 }
 
 // ---- end to end -------------------------------------------------------------------------------------------------
