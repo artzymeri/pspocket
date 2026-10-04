@@ -1,5 +1,7 @@
 // cellSpurs, native (D-037): the SPURS API on the host. Guest-visible structures keep RPCS3's layouts
-// (rpcs3/Emu/Cell/Modules/cellSpurs.h); API semantics follow RPCS3 cellSpurs.cpp where it implements them.
+// (rpcs3/Emu/Cell/Modules/cellSpurs.h); API semantics follow RPCS3 cellSpurs.cpp where it implements them. Sony's
+// libsre (fw 4.92, read on the Mac, never copied) is the authority where RPCS3 stubs a function (D-042): task creation,
+// the task attribute, the LS pattern helpers and taskset shutdown are checked against it ("as libsre").
 //
 // Stage 1: attributes, initialize and finalize. Stage 3a: workload registration and tasksets (PPU side; tasks do not
 // run until the native taskset policy exists). Stage 4 (PPU side): event flags, lv2 event queue ports (D-040),
@@ -17,7 +19,6 @@
 #include <map>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
@@ -61,6 +62,7 @@ enum : u32 {
     CELL_SPURS_TASK_ERROR_NULL_POINTER = 0x80410911,
     CELL_SPURS_JOB_ERROR_AGAIN = 0x80410A01,
     CELL_SPURS_JOB_ERROR_INVAL = 0x80410A02,
+    CELL_SPURS_JOB_ERROR_PERM = 0x80410A09,
     CELL_SPURS_JOB_ERROR_STAT = 0x80410A0F,
     CELL_SPURS_JOB_ERROR_ALIGN = 0x80410A10,
     CELL_SPURS_JOB_ERROR_NULL_POINTER = 0x80410A11,
@@ -129,6 +131,7 @@ namespace wkl_off {
 constexpr u32 readyCount1 = 0x00, idleSpuCountOrReadyCount2 = 0x10, currentContention = 0x20,
               pendingContention = 0x30, minContention = 0x40, maxContention = 0x50, signal1 = 0x70,
               sysSrvMessage = 0x72, state1 = 0x80, status1 = 0x90, event1 = 0xA0, enabled = 0xB0, mskB = 0xB4,
+              status2 = 0xE0,
               sysSrvMsgUpdateWorkload = 0xBD, f1 = 0x100, f1_stride = 0x80, info1 = 0xB00, info_stride = 0x20,
               h1 = 0xE00, h_stride = 0x10, exception = 0xD6C;
 // WorkloadInfo: addr (u64), arg (u64), size (u32), uniqueId (u8), priority[8] at 0x18.
@@ -499,15 +502,18 @@ s32 cellSpursCreateTasksetWithAttribute(PPUContext& ctx, u32 spurs, u32 taskset,
         ps_read32(base, attr + tsattr_off::taskset_size), static_cast<s32>(ps_read32(base, attr + tsattr_off::enable_clear_ls)));
 }
 
-// RPCS3 cellSpursShutdownWorkload. Natively no SPU runs a workload yet (status 0), so a shutdown makes it removable
-// at once. The shutdown-completion notification RPCS3 sends to the SPURS event port (when a hook is registered) has
-// no handler thread to go to natively; it is logged instead.
+// cellSpursShutdownWorkload, checked against libsre (fw 4.92), which RPCS3 follows: NULL, ALIGN, INVAL for a
+// workload ID past the instance's 16 (32 for SPURS2), SRCH for a workload that is not registered (its wklEnabled bit
+// clear), STAT for an instance in exception state or a workload not yet runnable. Natively no SPU runs a workload yet
+// (status 0), so a shutdown makes it removable at once. The shutdown-completion notification libsre and RPCS3 send to
+// the SPURS event port (when a hook is registered) has no handler thread to go to natively; it is logged instead.
 s32 shutdown_workload(u8* base, u32 spurs, u32 wid)
 {
     if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
     if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
     const bool second = (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0;
     if (wid >= (second ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!(ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid))) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
     if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
     if (wid >= CELL_SPURS_MAX_WORKLOAD) {
         PS_LOG_ERROR(kChan, "shutdown_workload: SPURS2 workload {} is not implemented", wid);
@@ -518,8 +524,8 @@ s32 shutdown_workload(u8* base, u32 spurs, u32 wid)
     const u8 state = ps_read8(base, spurs + wkl_off::state1 + wid);
     if (state <= SPURS_WKL_STATE_PREPARING) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
     if (state == SPURS_WKL_STATE_SHUTTING_DOWN || state == SPURS_WKL_STATE_REMOVABLE) return lv2::CELL_OK;
-    const u8 status = ps_read8(base, spurs + wkl_off::status1 + wid);
-    if (status) {
+    // libsre also reads wklStatus2[wid] for workloads 0..15 (RPCS3 reads only wklStatus1).
+    if (ps_read8(base, spurs + wkl_off::status1 + wid) || ps_read8(base, spurs + wkl_off::status2 + wid)) {
         ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_SHUTTING_DOWN);
         ps_write8(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, 0xFF);
         ps_write8(base, spurs + wkl_off::sysSrvMessage, 0xFF);
@@ -535,33 +541,58 @@ s32 shutdown_workload(u8* base, u32 spurs, u32 wid)
     return lv2::CELL_OK;
 }
 
-// RPCS3 cellSpursShutdownTaskset.
+// cellSpursShutdownTaskset as libsre (fw 4.92): NULL, ALIGN, INVAL for a workload ID past 31 in the taskset, then
+// cellSpursShutdownWorkload on the SPURS instance and workload the taskset names. Its POLICY_MODULE_ERROR_STAT becomes
+// TASK_ERROR_STAT; other results pass unchanged, so a taskset that was never created (zeroed: no SPURS) gets
+// POLICY_MODULE_ERROR_NULL_POINTER, and workload 16..31 of a SPURS1 instance POLICY_MODULE_ERROR_INVAL. libsre
+// asserts (and aborts the process) when the shutdown returns ALIGN or SRCH: a misaligned SPURS pointer, or a workload
+// that is not registered.
 s32 cellSpursShutdownTaskset(PPUContext& ctx, u32 taskset)
 {
     if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
     if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
-    u8* base = guest_base(ctx);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, taskset, 128)) {
+        log_call_site(ctx, base, std::format("cellSpursShutdownTaskset: taskset {:#x} is not readable guest memory; "
+            "refused with CELL_SPURS_TASK_ERROR_FAULT", taskset));
+        return error(CELL_SPURS_TASK_ERROR_FAULT);
+    }
     const u32 wid = ps_read32(base, taskset + ts_off::wid);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
     const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
     s32 r = shutdown_workload(base, spurs, wid);
+    PS_LOG_INFO(kChan, "cellSpursShutdownTaskset({:#010x}): workload {} of SPURS {:#x} -> {:#x}", taskset, wid, spurs,
+        static_cast<u32>(r));
+    if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN) || r == error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH)) {
+        log_call_site(ctx, base, "cellSpursShutdownTaskset");
+        PS_FATAL(kChan, "cellSpursShutdownTaskset({:#x}): shutting down workload {} of SPURS {:#x} returned {:#x}; libsre "
+            "(fw 4.92) asserts here and aborts the process", taskset, wid, spurs, static_cast<u32>(r));
+    }
     if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) r = error(CELL_SPURS_TASK_ERROR_STAT);
-    PS_LOG_INFO(kChan, "cellSpursShutdownTaskset({:#010x}): workload {} -> {:#x}", taskset, wid, static_cast<u32>(r));
     return r;
 }
 
 // ------------------------------------------------------------------------------------------------- tasks
+//
+// Task creation and the LS pattern helpers follow Sony's libsre (fw 4.92, read on the Mac as the reference; D-037,
+// D-042): RPCS3 implements only cellSpursCreateTask and stubs the rest. Signatures, checks and their order, error codes
+// and what is written to guest memory are libsre's. libsre checks pointers only against NULL; where it would read a
+// bad pointer, pspocket checks first and refuses the call with TASK_ERROR_FAULT and a log of the call site (D-042).
+// Where libsre asserts (it prints the failed condition and aborts the process), pspocket stops with a fatal log.
 
 constexpr u32 CELL_SPURS_MAX_TASK = 128;
 constexpr u32 CELL_SPURS_TASK_TOP = 0x3000;     // task code and data start here; LS below belongs to SPURS
 constexpr u32 CELL_SPURS_TASK_BOTTOM = 0x40000; // end of local store
 constexpr u32 CELL_SPURS_TASK_EXECUTION_CONTEXT_SIZE = 1024;
 constexpr u32 CELL_SPURS_TASK_ATTRIBUTE_REVISION = 1;
-constexpr u32 kLsBlock = 0x800; // one bit of an LS pattern
+constexpr u32 kLsBlock = 0x800;            // one bit of an LS pattern
+constexpr u32 kTaskMaxSavedBlocks = 0x7A;  // a context save area larger than 0x3D400 bytes adds no blocks
+constexpr u32 kTaskset2MinSize = 0x2900;   // CellSpursTaskset2 (libsre: taskset size > 0x28FF)
 
 // CellSpursTaskLsPattern: 128 bits, one per 2 KB block of local store, most significant bit first (the top bit of the
-// first big-endian word is LS 0..0x7FF). The six blocks below CELL_SPURS_TASK_TOP are SPURS' own (RPCS3
-// _spurs::create_task refuses patterns that touch them).
+// first big-endian word is LS 0..0x7FF). The six blocks below CELL_SPURS_TASK_TOP are SPURS' own: task creation and
+// cellSpursTaskGetContextSaveAreaSize refuse patterns that touch them (libsre checks the top 6 bits of word 0).
 constexpr u128 kLsPatternReserved = u128{0xFC000000} << 96;
 
 u128 read_ls_pattern(u8* base, u32 addr)
@@ -593,61 +624,128 @@ u32 ls_block_count(u128 v)
     return static_cast<u32>(std::popcount(static_cast<u64>(v >> 64)) + std::popcount(static_cast<u64>(v)));
 }
 
-// The PT_LOAD segments of a task's SPU ELF in guest memory (32-bit, big-endian, EM_SPU), or an error: NOEXEC for a
-// bad header, FAULT for a segment outside the task area (RPCS3 cellSpursSpu.cpp spursTasksetLoadElf).
-struct SpuSegment {
-    u32 vaddr = 0, memsz = 0;
-    bool writable = false;
-};
-
-s32 task_elf_segments(u8* base, u32 elf, std::vector<SpuSegment>& out)
+// The process SDK version as libsre reads it (sys_process_get_sdk_version); a process without one counts as 0x492000.
+u32 process_sdk_version(lv2::PpuThread& t)
 {
-    constexpr u16 EM_SPU = 23;
-    constexpr u32 PT_LOAD = 1, PF_W = 2;
-    if (ps_read32(base, elf) != 0x7F454C46 || ps_read8(base, elf + 4) != 1 || ps_read8(base, elf + 5) != 2 ||
-        ps_read16(base, elf + 0x12) != EM_SPU) {
+    const u32 v = t.kernel.config().sdk_version;
+    return v == 0xFFFFFFFF ? 0x492000 : v;
+}
+
+// OK when [addr, addr + size) is readable guest memory, else TASK_ERROR_FAULT and a log of the call site.
+s32 task_readable(PPUContext& ctx, std::string_view what, std::string_view name, u32 addr, u32 size)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (guest_readable(t, addr, size)) return lv2::CELL_OK;
+    log_call_site(ctx, t.kernel.base(), std::format("{}: the {} ({:#x}, {} bytes) is not readable guest memory; refused "
+        "with CELL_SPURS_TASK_ERROR_FAULT", what, name, addr, size));
+    return error(CELL_SPURS_TASK_ERROR_FAULT);
+}
+
+// A task's SPU ELF (Elf32, big-endian) as libsre reads it.
+namespace elf_off {
+constexpr u32 e_machine = 0x12, e_entry = 0x18, e_phoff = 0x1C, e_phentsize = 0x2A, e_phnum = 0x2C, ehdr_size = 0x34;
+constexpr u32 p_type = 0x00, p_vaddr = 0x08, p_paddr = 0x0C, p_filesz = 0x10, p_memsz = 0x14, p_flags = 0x18;
+}
+constexpr u32 kElfMagic = 0x7F454C46;
+constexpr u64 kSpuElfIdent = 0x7F454C4601020100; // magic, ELFCLASS32, ELFDATA2MSB, EV_CURRENT, ELFOSABI_NONE
+constexpr u16 EM_SPU = 23;
+constexpr u32 PT_LOAD = 1, PF_W = 2;
+
+// libsre's ELF check at task creation (and in _cellSpursTaskAttributeInitialize): the first 8 bytes of e_ident, EM_SPU,
+// an entry point at or above CELL_SPURS_TASK_TOP and every PT_LOAD segment's address at or above it; NOEXEC otherwise.
+s32 check_task_elf(PPUContext& ctx, std::string_view what, u32 elf)
+{
+    if (const s32 rc = task_readable(ctx, what, "task ELF header", elf, elf_off::ehdr_size); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    if (ps_read64(base, elf) != kSpuElfIdent || ps_read16(base, elf + elf_off::e_machine) != EM_SPU ||
+        ps_read32(base, elf + elf_off::e_entry) < CELL_SPURS_TASK_TOP) {
         return error(CELL_SPURS_TASK_ERROR_NOEXEC);
     }
-    const u32 phoff = ps_read32(base, elf + 0x1C);
-    const u16 phentsize = ps_read16(base, elf + 0x2A), phnum = ps_read16(base, elf + 0x2C);
-    if (phentsize < 0x20 || phnum > 64) return error(CELL_SPURS_TASK_ERROR_NOEXEC);
-    out.clear();
+    const u32 phoff = ps_read32(base, elf + elf_off::e_phoff), phentsize = ps_read16(base, elf + elf_off::e_phentsize),
+              phnum = ps_read16(base, elf + elf_off::e_phnum);
     for (u32 i = 0; i < phnum; i++) {
         const u32 ph = elf + phoff + i * phentsize;
-        if (ps_read32(base, ph) != PT_LOAD) continue;
-        const u32 vaddr = ps_read32(base, ph + 0x08), memsz = ps_read32(base, ph + 0x14);
-        if (!memsz) continue;
-        if (vaddr < CELL_SPURS_TASK_TOP || u64{vaddr} + memsz > CELL_SPURS_TASK_BOTTOM) {
-            return error(CELL_SPURS_TASK_ERROR_FAULT);
+        if (const s32 rc = task_readable(ctx, what, "task ELF program header", ph, elf_off::p_vaddr + 4); rc != lv2::CELL_OK) {
+            return rc;
         }
-        out.push_back({vaddr, memsz, (ps_read32(base, ph + 0x18) & PF_W) != 0});
+        if (ps_read32(base, ph + elf_off::p_type) == PT_LOAD && ps_read32(base, ph + elf_off::p_vaddr) < CELL_SPURS_TASK_TOP) {
+            return error(CELL_SPURS_TASK_ERROR_NOEXEC);
+        }
     }
     return lv2::CELL_OK;
 }
 
-// The LS pattern helpers: RPCS3 leaves them unimplemented, so these semantics are assumed from what the taskset
-// policy does with a pattern (D-041; to be checked against libsre). A paused task's context keeps the LS blocks of
-// its pattern; on resume the policy reloads the read-only segments from the ELF and restores the saved blocks.
+// The pattern of LS range [start, start + size), as libsre's cellSpursTaskGenerateLsPattern computes it: both 2 KB
+// aligned (ALIGN), the end at most 0x40000 (INVAL; libsre adds in 32 bits and does not check the start against
+// CELL_SPURS_TASK_TOP). A range of more than 128 blocks (only an end that wraps past 2^32 gets that far) is a libsre
+// assertion.
+s32 ls_range_pattern(u32 start, u32 size, u128& out)
+{
+    if (start % kLsBlock || size % kLsBlock) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (start + size > CELL_SPURS_TASK_BOTTOM) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    const u32 first = start / kLsBlock, count = size / kLsBlock;
+    if (first > 128 || first + count > 128) {
+        PS_FATAL(kChan, "LS pattern of {:#x} + {:#x}: more than 128 blocks; libsre (fw 4.92) asserts here and aborts the "
+            "process", start, size);
+    }
+    out = ls_blocks(first, first + count);
+    return lv2::CELL_OK;
+}
+
+// cellSpursTaskGetLoadableSegmentPattern and ...GetReadOnlyAreaPattern(pattern, elf), as libsre. Checks: elf NULL,
+// then the ELF's magic (4 bytes only), EM_SPU and an entry point in the task area (NOEXEC), then pattern NULL. The
+// pattern is cleared, then each program header in turn: any whose vaddr + memsz (32 bits) passes 0x40000 ends the call
+// with INVAL (the blocks found so far stay in the pattern). PT_LOAD segments with a paddr below 0x40000 add:
+// - loadable: every block the segment's memory image touches (vaddr rounded down to vaddr + memsz rounded up);
+// - read-only (segments without PF_W): the blocks their file image covers completely (vaddr rounded up to vaddr +
+//   filesz rounded down). A read-only segment that covers no block completely but ends in a later block than it
+//   starts in makes libsre assert (its 32-bit range wraps).
+// Nothing checks segments against CELL_SPURS_TASK_TOP here, so a segment below it sets reserved blocks.
 s32 task_pattern_from_elf(PPUContext& ctx, u32 pattern, u32 elf, bool read_only, const char* what)
 {
-    if (!pattern || !elf) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (elf % 16) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (!elf) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (const s32 rc = task_readable(ctx, what, "task ELF header", elf, elf_off::ehdr_size); rc != lv2::CELL_OK) return rc;
     u8* base = guest_base(ctx);
-    std::vector<SpuSegment> segments;
-    if (const s32 rc = task_elf_segments(base, elf, segments); rc != lv2::CELL_OK) return rc;
-    u128 v = 0;
-    for (const SpuSegment& seg : segments) {
-        if (!read_only) {
-            // Every block a loadable segment touches.
-            v |= ls_blocks(seg.vaddr / kLsBlock, (seg.vaddr + seg.memsz + kLsBlock - 1) / kLsBlock);
-        } else if (!seg.writable) {
-            // Only blocks a read-only segment covers completely: a block shared with writable data must be saved.
-            v |= ls_blocks((seg.vaddr + kLsBlock - 1) / kLsBlock, (seg.vaddr + seg.memsz) / kLsBlock);
-        }
+    if (ps_read32(base, elf) != kElfMagic || ps_read16(base, elf + elf_off::e_machine) != EM_SPU ||
+        ps_read32(base, elf + elf_off::e_entry) < CELL_SPURS_TASK_TOP) {
+        return error(CELL_SPURS_TASK_ERROR_NOEXEC);
     }
+    if (!pattern) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (const s32 rc = task_readable(ctx, what, "LS pattern", pattern, 16); rc != lv2::CELL_OK) return rc;
+    const u32 phoff = ps_read32(base, elf + elf_off::e_phoff), phentsize = ps_read16(base, elf + elf_off::e_phentsize),
+              phnum = ps_read16(base, elf + elf_off::e_phnum);
+    u128 v = 0;
     write_ls_pattern(base, pattern, v);
-    PS_LOG_INFO(kChan, "{}(ELF {:#x}): {} LS blocks, {} [native, assumed semantics]", what, elf, ls_block_count(v),
-        hex128(v));
+    for (u32 i = 0; i < phnum; i++) {
+        const u32 ph = elf + phoff + i * phentsize;
+        if (const s32 rc = task_readable(ctx, what, "task ELF program header", ph, elf_off::p_flags + 4); rc != lv2::CELL_OK) {
+            return rc;
+        }
+        const u32 vaddr = ps_read32(base, ph + elf_off::p_vaddr), memsz = ps_read32(base, ph + elf_off::p_memsz);
+        if (vaddr + memsz > CELL_SPURS_TASK_BOTTOM) {
+            PS_LOG_WARN(kChan, "{}(ELF {:#x}): program header {} ends at {:#x}, past local store: CELL_SPURS_TASK_ERROR_INVAL",
+                what, elf, i, vaddr + memsz);
+            return error(CELL_SPURS_TASK_ERROR_INVAL);
+        }
+        if (ps_read32(base, ph + elf_off::p_type) != PT_LOAD || ps_read32(base, ph + elf_off::p_paddr) >= CELL_SPURS_TASK_BOTTOM) {
+            continue;
+        }
+        u32 start = 0, size = 0;
+        if (!read_only) {
+            start = vaddr & ~(kLsBlock - 1);
+            size = (((vaddr + kLsBlock - 1 + memsz) & ~(kLsBlock - 1)) - start) & ~(kLsBlock - 1);
+        } else {
+            if (ps_read32(base, ph + elf_off::p_flags) & PF_W) continue;
+            start = (vaddr + kLsBlock - 1) & ~(kLsBlock - 1);
+            const u32 end = (vaddr + ps_read32(base, ph + elf_off::p_filesz)) & ~(kLsBlock - 1);
+            size = (end - start) & ~(kLsBlock - 1);
+        }
+        u128 seg = 0;
+        if (const s32 rc = ls_range_pattern(start, size, seg); rc != lv2::CELL_OK) return rc;
+        v |= seg;
+        write_ls_pattern(base, pattern, v);
+    }
+    PS_LOG_INFO(kChan, "{}(ELF {:#x}): {} LS blocks, {} (as libsre)", what, elf, ls_block_count(v), hex128(v));
     return lv2::CELL_OK;
 }
 
@@ -661,78 +759,63 @@ s32 cellSpursTaskGetReadOnlyAreaPattern(PPUContext& ctx, u32 pattern, u32 elf)
     return task_pattern_from_elf(ctx, pattern, elf, true, "cellSpursTaskGetReadOnlyAreaPattern");
 }
 
-// The blocks of [start, start + size), which must lie in the task area (D-041).
+// cellSpursTaskGenerateLsPattern(pattern, start, size), as libsre: NULL, then ls_range_pattern's checks.
 s32 cellSpursTaskGenerateLsPattern(PPUContext& ctx, u32 pattern, u32 start, u32 size)
 {
     if (!pattern) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (start % kLsBlock || size % kLsBlock) return error(CELL_SPURS_TASK_ERROR_ALIGN);
-    if (start < CELL_SPURS_TASK_TOP || u64{start} + size > CELL_SPURS_TASK_BOTTOM) {
-        return error(CELL_SPURS_TASK_ERROR_INVAL);
+    u128 v = 0;
+    if (const s32 rc = ls_range_pattern(start, size, v); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = task_readable(ctx, "cellSpursTaskGenerateLsPattern", "LS pattern", pattern, 16); rc != lv2::CELL_OK) {
+        return rc;
     }
-    const u128 v = ls_blocks(start / kLsBlock, (start + size) / kLsBlock);
     write_ls_pattern(guest_base(ctx), pattern, v);
-    PS_LOG_INFO(kChan, "cellSpursTaskGenerateLsPattern({:#x}, {:#x}): {} [native, assumed semantics]", start, size,
-        hex128(v));
+    PS_LOG_INFO(kChan, "cellSpursTaskGenerateLsPattern({:#x}, {:#x}): {} (as libsre)", start, size, hex128(v));
     return lv2::CELL_OK;
 }
 
-// The execution context (1 KB) plus 2 KB per block of the pattern: the size RPCS3 _spurs::create_task expects
-// (allocated blocks = (size - 0x400) >> 11).
+// cellSpursTaskGetContextSaveAreaSize(size, pattern), as libsre: 1 KB of execution context plus 2 KB per block of the
+// pattern (the inverse of task creation's (size - 0x400) >> 11); INVAL for a pattern with reserved blocks. libsre
+// checks neither pointer.
 s32 cellSpursTaskGetContextSaveAreaSize(PPUContext& ctx, u32 size_out, u32 pattern)
 {
-    if (!size_out || !pattern) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    constexpr std::string_view what = "cellSpursTaskGetContextSaveAreaSize";
+    if (const s32 rc = task_readable(ctx, what, "LS pattern", pattern, 16); rc != lv2::CELL_OK) return rc;
     u8* base = guest_base(ctx);
     const u128 v = read_ls_pattern(base, pattern);
     if (v & kLsPatternReserved) return error(CELL_SPURS_TASK_ERROR_INVAL);
     const u32 size = CELL_SPURS_TASK_EXECUTION_CONTEXT_SIZE + ls_block_count(v) * kLsBlock;
+    if (const s32 rc = task_readable(ctx, what, "size", size_out, 4); rc != lv2::CELL_OK) return rc;
     ps_write32(base, size_out, size);
-    PS_LOG_INFO(kChan, "cellSpursTaskGetContextSaveAreaSize({}): {:#x} [native, assumed semantics]", hex128(v), size);
+    PS_LOG_INFO(kChan, "cellSpursTaskGetContextSaveAreaSize({}): {:#x} (as libsre)", hex128(v), size);
     return lv2::CELL_OK;
 }
 
-// A task to create: what cellSpursCreateTask takes, or a task attribute holds.
-struct TaskParams {
-    u32 elf = 0, context = 0, context_size = 0;
-    bool has_pattern = false;
-    u128 pattern = 0;
-    u128 args = 0;
+// A task to create: what cellSpursCreateTask takes, or what a task attribute holds. `pattern` (CellSpursTaskLsPattern)
+// and `args` (CellSpursTaskArgument, 16 bytes) are guest pointers, 0 for none.
+struct TaskSpec {
+    u32 elf = 0, context = 0, context_size = 0, pattern = 0, args = 0;
 };
 
-// The checks of RPCS3 _spurs::create_task on ELF, context and pattern; `alloc_blocks` gets the LS blocks the context
-// save area has room for.
-s32 check_task(u32 sdk_version, const TaskParams& p, u32& alloc_blocks)
-{
-    if (!p.elf) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (p.elf % 16) return error(CELL_SPURS_TASK_ERROR_ALIGN);
-    if (p.context % (sdk_version < 0x27FFFF ? 16 : 128)) return error(CELL_SPURS_TASK_ERROR_ALIGN);
-    alloc_blocks = 0;
-    if (p.context) {
-        if (p.context_size < CELL_SPURS_TASK_EXECUTION_CONTEXT_SIZE) return error(CELL_SPURS_TASK_ERROR_INVAL);
-        alloc_blocks = p.context_size > 0x3D400 ? 0x7A : (p.context_size - 0x400) >> 11;
-        if (p.has_pattern && (ls_block_count(p.pattern) > alloc_blocks || (p.pattern & kLsPatternReserved))) {
-            return error(CELL_SPURS_TASK_ERROR_INVAL);
-        }
-    }
-    return lv2::CELL_OK;
-}
-
-// Reads a task's LS pattern and argument (CellSpursTaskArgument: 16 bytes, read like a pattern). The pattern says
-// which LS blocks the context keeps, so it is read only with a context: without one a caller may leave anything
-// there (run 013: GTA V passed a value that is no guest address). A pointer that must be read but isn't readable is
-// refused with TASK_ERROR_FAULT and a log of the call site.
-s32 read_task_params(PPUContext& ctx, const char* what, u32 elf, u32 context, u32 size, u32 pattern, u32 args,
-    TaskParams& p)
+// libsre's task checks, in its order; _cellSpursTaskAttributeInitialize runs the same ones as task creation. ELF
+// NULL; ELF 16-byte and context 16-byte aligned (128-byte from SDK 0x280000, the process' SDK version); a context of
+// at least 1 KB; the ELF (check_task_elf); with a context and a pattern, a pattern of at most as many blocks as the
+// context has room for and none reserved (INVAL). The pattern only describes what the context keeps, so without a
+// context it is not read (run 013: GTA V passed a value that is no guest address there). `saved_blocks` gets the LS
+// blocks the context save area has room for (0 without a context).
+s32 check_task(PPUContext& ctx, std::string_view what, const TaskSpec& s, u32& saved_blocks)
 {
     lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    p = TaskParams{elf, context, size, context && pattern, 0, 0};
-    if ((p.has_pattern && !guest_readable(t, pattern, 16)) || (args && !guest_readable(t, args, 16))) {
-        log_call_site(ctx, base, std::format("{}: the LS pattern ({:#x}) or argument ({:#x}) pointer is not readable guest "
-            "memory; refused with CELL_SPURS_TASK_ERROR_FAULT", what, pattern, args));
-        return error(CELL_SPURS_TASK_ERROR_FAULT);
-    }
-    if (p.has_pattern) p.pattern = read_ls_pattern(base, pattern);
-    if (args) p.args = read_ls_pattern(base, args);
+    if (!s.elf) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (s.elf % 16 || s.context % (process_sdk_version(t) > 0x27FFFF ? 128 : 16)) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (s.context && s.context_size < CELL_SPURS_TASK_EXECUTION_CONTEXT_SIZE) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    if (const s32 rc = check_task_elf(ctx, what, s.elf); rc != lv2::CELL_OK) return rc;
+    saved_blocks = 0;
+    if (!s.context) return lv2::CELL_OK;
+    saved_blocks = s.context_size > 0x3D400 ? kTaskMaxSavedBlocks : (s.context_size - 0x400) >> 11;
+    if (!s.pattern) return lv2::CELL_OK;
+    if (const s32 rc = task_readable(ctx, what, "LS pattern", s.pattern, 16); rc != lv2::CELL_OK) return rc;
+    const u128 v = read_ls_pattern(t.kernel.base(), s.pattern);
+    if (ls_block_count(v) > saved_blocks || (v & kLsPatternReserved)) return error(CELL_SPURS_TASK_ERROR_INVAL);
     return lv2::CELL_OK;
 }
 
@@ -754,8 +837,8 @@ s32 send_workload_signal(u8* base, u32 spurs, u32 wid)
     return lv2::CELL_OK;
 }
 
-// RPCS3 cellSpursWakeUp: marks the SPURS handler dirty. On the PS3 that wakes SPURS' PPU handler thread, which
-// restarts SPUs that went idle; natively the scheduler will be woken here (stage 3b).
+// cellSpursWakeUp (RPCS3; libsre's checks are the same): marks the SPURS handler dirty. On the PS3 that wakes SPURS'
+// PPU handler thread, which restarts SPUs that went idle; natively the scheduler will be woken here (stage 3b).
 s32 cellSpursWakeUp(PPUContext& ctx, u32 spurs)
 {
     if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
@@ -766,17 +849,28 @@ s32 cellSpursWakeUp(PPUContext& ctx, u32 spurs)
     return lv2::CELL_OK;
 }
 
-// RPCS3 _spurs::create_task and _spurs::task_start: claims the lowest free task ID in the taskset's `enabled` bits,
-// fills its TaskInfo, marks it pending-ready and signals the taskset's workload. Deviation: an absent LS pattern is
-// stored as zero (RPCS3 leaves the slot's previous pattern).
-s32 create_task(PPUContext& ctx, u32 taskset, u32 task_id_out, const TaskParams& p)
+// libsre's task creation and task start, shared by cellSpursCreateTask and cellSpursCreateTaskWithAttribute once they
+// have checked their own arguments (task ID pointer, taskset): check_task, the lowest free task ID in the taskset's
+// `enabled` bits (AGAIN when all 128 are taken), its TaskInfo (argument, ELF, context | saved blocks, LS pattern; the
+// argument is zero without one, the pattern without a context or a pattern), then the start: the task's pending-ready
+// bit, cellSpursSendWorkloadSignal (its result ignored, as libsre) and cellSpursWakeUp, whose STAT becomes
+// TASK_ERROR_STAT (libsre asserts on any other error). The ID is written only when all of that succeeded.
+s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id_out, const TaskSpec& s)
 {
-    if (!taskset || !task_id_out) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    u32 alloc_blocks = 0;
-    if (const s32 rc = check_task(t.kernel.config().sdk_version, p, alloc_blocks); rc != lv2::CELL_OK) return rc;
+    u32 saved_blocks = 0;
+    if (const s32 rc = check_task(ctx, what, s, saved_blocks); rc != lv2::CELL_OK) return rc;
+    // libsre reads the argument after claiming the ID; checking it first keeps a refused call from using one up.
+    if (s.args) {
+        if (const s32 rc = task_readable(ctx, what, "task argument", s.args, 16); rc != lv2::CELL_OK) return rc;
+    }
+    if (const s32 rc = task_readable(ctx, what, "taskset", taskset, ts_off::task_info + CELL_SPURS_MAX_TASK *
+            ts_off::task_info_stride);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
 
     u32 id = CELL_SPURS_MAX_TASK;
     reservation_op(base, taskset, [&id](u8* line) {
@@ -794,13 +888,12 @@ s32 create_task(PPUContext& ctx, u32 taskset, u32 task_id_out, const TaskParams&
     if (id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_AGAIN);
 
     const u32 info = taskset + ts_off::task_info + id * ts_off::task_info_stride;
-    write_ls_pattern(base, info + ts_off::ti_args, p.args);
-    ps_write64(base, info + ts_off::ti_elf, p.elf);
-    ps_write64(base, info + ts_off::ti_context, u64{p.context} | alloc_blocks);
-    write_ls_pattern(base, info + ts_off::ti_ls_pattern, p.has_pattern ? p.pattern : 0);
-    ps_write32(base, task_id_out, id);
+    ps_write64(base, info + ts_off::ti_elf, s.elf);
+    ps_write64(base, info + ts_off::ti_context, u64{s.context | saved_blocks});
+    write_ls_pattern(base, info + ts_off::ti_args, s.args ? read_ls_pattern(base, s.args) : 0);
+    write_ls_pattern(base, info + ts_off::ti_ls_pattern, s.context && s.pattern ? read_ls_pattern(base, s.pattern) : 0);
 
-    // task_start
+    // Task start.
     reservation_op(base, taskset, [id](u8* line) {
         const u32 w = ts_off::pending_ready + 4 * (id / 32);
         ps_write32(line, w, ps_read32(line, w) | (0x80000000u >> (id % 32)));
@@ -809,78 +902,120 @@ s32 create_task(PPUContext& ctx, u32 taskset, u32 task_id_out, const TaskParams&
     const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
     const u32 wid = ps_read32(base, taskset + ts_off::wid);
     send_workload_signal(base, spurs, wid);
-    cellSpursWakeUp(ctx, spurs);
+    const s32 woken = cellSpursWakeUp(ctx, spurs);
+    if (woken == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) return error(CELL_SPURS_TASK_ERROR_STAT);
+    if (woken != lv2::CELL_OK) {
+        PS_FATAL(kChan, "{}: cellSpursWakeUp({:#x}) for task {} of taskset {:#x} returned {:#x}; libsre (fw 4.92) asserts "
+            "here and aborts the process", what, spurs, id, taskset, static_cast<u32>(woken));
+    }
+    ps_write32(base, task_id_out, id);
     PS_LOG_INFO(kChan, "task {} of taskset {:#010x} (workload {}): ELF {:#x}, context {:#x} ({:#x} bytes, {} LS blocks); "
-        "ready, but SPU tasks do not run until the native taskset policy exists", id, taskset, wid, p.elf, p.context,
-        p.context_size, alloc_blocks);
+        "ready, but SPU tasks do not run until the native taskset policy exists", id, taskset, wid, s.elf, s.context,
+        s.context_size, saved_blocks);
     return lv2::CELL_OK;
 }
 
+// cellSpursCreateTask(taskset, id, elf, context, size, lsPattern, argument), as libsre: id and taskset NULL, taskset
+// 128-byte aligned, then create_task.
 s32 cellSpursCreateTask(PPUContext& ctx, u32 taskset, u32 task_id, u32 elf, u32 context, u32 size, u32 ls_pattern,
     u32 argument)
 {
-    TaskParams p;
-    if (const s32 rc = read_task_params(ctx, "cellSpursCreateTask", elf, context, size, ls_pattern, argument, p);
-        rc != lv2::CELL_OK) {
-        return rc;
-    }
-    return create_task(ctx, taskset, task_id, p);
+    if (!task_id || !taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    return create_task(ctx, "cellSpursCreateTask", taskset, task_id, TaskSpec{elf, context, size, ls_pattern, argument});
 }
 
-// CellSpursTaskAttribute is opaque (256 bytes, 16-aligned) and RPCS3 does not implement it; pspocket's layout
-// (D-041): revision, SDK version, ELF, context, context size, pattern given (u32 each), the LS pattern at 0x20 and the
-// task argument at 0x30.
+// CellSpursTaskAttribute (256 bytes, opaque in the SDK; libsre wants it 8-byte aligned) in libsre's layout:
+// revision, SDK version, ELF (u64), context (u64), context size, the LS pattern (16 bytes) at 0x20, the task argument
+// (16 bytes) at 0x30 and the exit code container (u64; cellSpursTaskAttributeSetExitCodeContainer, which wants
+// revision 1 and a 128-byte aligned container) at 0x40. The rest is zero.
 namespace taskattr_off {
-constexpr u32 revision = 0x00, sdk_version = 0x04, elf = 0x08, context = 0x0C, context_size = 0x10,
-              has_pattern = 0x14, ls_pattern = 0x20, args = 0x30, size = 0x100;
+constexpr u32 revision = 0x00, sdk_version = 0x04, elf = 0x08, context = 0x10, context_size = 0x18, ls_pattern = 0x20,
+              args = 0x30, exit_code_container = 0x40, size = 0x100;
+}
+// CellSpursTaskSaveConfig {eaContext, sizeContext, lsPattern (pointer)}: how _cellSpursTaskAttributeInitialize gets a
+// context.
+namespace savecfg_off {
+constexpr u32 context = 0x0, context_size = 0x4, ls_pattern = 0x8, size = 0xC;
 }
 
-s32 _cellSpursTaskAttributeInitialize(PPUContext& ctx, u32 attr, u32 revision, u32 sdk_version, u32 elf, u32 context,
-    u32 size, u32 ls_pattern, u32 argument)
+// _cellSpursTaskAttributeInitialize(attr, revision, sdkVersion, elf, saveConfig, argument), as libsre (six arguments;
+// run 013's log shows GTA V's Bink passing a stack CellSpursTaskSaveConfig in r7 and no argument in r8). Checks: attr
+// NULL, a saveConfig whose context is NULL (NULL_POINTER), attr 8-byte aligned, then check_task. The revision and SDK
+// version are stored, not checked. The attribute is cleared; the context fields are set only with a saveConfig, the
+// pattern only when it has one, the argument only when given.
+s32 _cellSpursTaskAttributeInitialize(PPUContext& ctx, u32 attr, u32 revision, u32 sdk_version, u32 elf, u32 save_config,
+    u32 argument)
 {
-    PS_LOG_INFO(kChan, "_cellSpursTaskAttributeInitialize(attr {:#x}, revision {}, sdk {:#x}, ELF {:#x}, context {:#x}, "
-        "size {:#x}, LS pattern {:#x}, argument {:#x})", attr, revision, sdk_version, elf, context, size, ls_pattern,
-        argument);
+    constexpr std::string_view what = "_cellSpursTaskAttributeInitialize";
+    PS_LOG_INFO(kChan, "_cellSpursTaskAttributeInitialize(attr {:#x}, revision {}, sdk {:#x}, ELF {:#x}, saveConfig {:#x}, "
+        "argument {:#x})", attr, revision, sdk_version, elf, save_config, argument);
     if (!attr) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (attr % 16) return error(CELL_SPURS_TASK_ERROR_ALIGN);
-    lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    TaskParams p;
-    if (const s32 rc = read_task_params(ctx, "_cellSpursTaskAttributeInitialize", elf, context, size, ls_pattern,
-            argument, p);
-        rc != lv2::CELL_OK) {
-        return rc;
+    u8* base = guest_base(ctx);
+    TaskSpec s{elf, 0, 0, 0, argument};
+    if (save_config) {
+        if (const s32 rc = task_readable(ctx, what, "save config", save_config, savecfg_off::size); rc != lv2::CELL_OK) {
+            return rc;
+        }
+        s.context = ps_read32(base, save_config + savecfg_off::context);
+        s.context_size = ps_read32(base, save_config + savecfg_off::context_size);
+        s.pattern = ps_read32(base, save_config + savecfg_off::ls_pattern);
+        PS_LOG_INFO(kChan, "  saveConfig: context {:#x}, size {:#x}, LS pattern {:#x}", s.context, s.context_size, s.pattern);
+        if (!s.context) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
     }
-    u32 alloc_blocks = 0;
-    if (const s32 rc = check_task(t.kernel.config().sdk_version, p, alloc_blocks); rc != lv2::CELL_OK) return rc;
+    if (attr % 8) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    u32 saved_blocks = 0;
+    if (const s32 rc = check_task(ctx, what, s, saved_blocks); rc != lv2::CELL_OK) return rc;
+    if (argument) {
+        if (const s32 rc = task_readable(ctx, what, "task argument", argument, 16); rc != lv2::CELL_OK) return rc;
+    }
+    if (const s32 rc = task_readable(ctx, what, "attribute", attr, taskattr_off::size); rc != lv2::CELL_OK) return rc;
+
     std::memset(base + attr, 0, taskattr_off::size);
     ps_write32(base, attr + taskattr_off::revision, revision);
     ps_write32(base, attr + taskattr_off::sdk_version, sdk_version);
-    ps_write32(base, attr + taskattr_off::elf, elf);
-    ps_write32(base, attr + taskattr_off::context, context);
-    ps_write32(base, attr + taskattr_off::context_size, size);
-    ps_write32(base, attr + taskattr_off::has_pattern, p.has_pattern ? 1 : 0);
-    write_ls_pattern(base, attr + taskattr_off::ls_pattern, p.pattern);
-    write_ls_pattern(base, attr + taskattr_off::args, p.args);
+    ps_write64(base, attr + taskattr_off::elf, elf);
+    if (save_config) {
+        ps_write64(base, attr + taskattr_off::context, s.context);
+        ps_write32(base, attr + taskattr_off::context_size, s.context_size);
+        if (s.pattern) write_ls_pattern(base, attr + taskattr_off::ls_pattern, read_ls_pattern(base, s.pattern));
+    }
+    if (argument) write_ls_pattern(base, attr + taskattr_off::args, read_ls_pattern(base, argument));
     return lv2::CELL_OK;
 }
 
+// cellSpursCreateTaskWithAttribute(taskset, id, attr), as libsre: id and taskset NULL, taskset 128-byte aligned, attr
+// NULL, attr 8-byte aligned, revision 1 (INVAL). An exit code container needs a CellSpursTaskset2 (PERM for a
+// CellSpursTaskset; a misaligned one is a libsre assertion). Then create_task with the attribute's ELF, context and
+// size (the low words of the u64 fields, as libsre) and its pattern and argument, which always exist (zero when unset).
 s32 cellSpursCreateTaskWithAttribute(PPUContext& ctx, u32 taskset, u32 task_id, u32 attr)
 {
+    constexpr std::string_view what = "cellSpursCreateTaskWithAttribute";
+    if (!task_id || !taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
     if (!attr) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (attr % 16) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (attr % 8) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = task_readable(ctx, what, "attribute", attr, taskattr_off::exit_code_container + 8); rc != lv2::CELL_OK) {
+        return rc;
+    }
     u8* base = guest_base(ctx);
     if (ps_read32(base, attr + taskattr_off::revision) != CELL_SPURS_TASK_ATTRIBUTE_REVISION) {
         return error(CELL_SPURS_TASK_ERROR_INVAL);
     }
-    TaskParams p;
-    p.elf = ps_read32(base, attr + taskattr_off::elf);
-    p.context = ps_read32(base, attr + taskattr_off::context);
-    p.context_size = ps_read32(base, attr + taskattr_off::context_size);
-    p.has_pattern = ps_read32(base, attr + taskattr_off::has_pattern) != 0;
-    p.pattern = read_ls_pattern(base, attr + taskattr_off::ls_pattern);
-    p.args = read_ls_pattern(base, attr + taskattr_off::args);
-    return create_task(ctx, taskset, task_id, p);
+    if (const u64 container = ps_read64(base, attr + taskattr_off::exit_code_container)) {
+        if (container % 128) {
+            PS_FATAL(kChan, "{}: exit code container {:#x} is not 128-byte aligned; libsre (fw 4.92) asserts here and "
+                "aborts the process", what, container);
+        }
+        if (const s32 rc = task_readable(ctx, what, "taskset", taskset, ts_off::size + 4); rc != lv2::CELL_OK) return rc;
+        if (ps_read32(base, taskset + ts_off::size) < kTaskset2MinSize) return error(CELL_SPURS_TASK_ERROR_PERM);
+        PS_LOG_ERROR(kChan, "{}: exit code container {:#x} on a CellSpursTaskset2 is not implemented", what, container);
+        return error(CELL_SPURS_TASK_ERROR_STAT);
+    }
+    const TaskSpec s{static_cast<u32>(ps_read64(base, attr + taskattr_off::elf)),
+        static_cast<u32>(ps_read64(base, attr + taskattr_off::context)), ps_read32(base, attr + taskattr_off::context_size),
+        attr + taskattr_off::ls_pattern, attr + taskattr_off::args};
+    return create_task(ctx, what, taskset, task_id, s);
 }
 
 // ------------------------------------------------------------------------------------------------- lv2 event queues
@@ -1449,6 +1584,33 @@ s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_cha
     return lv2::CELL_OK;
 }
 
+// cellSpursRunJobChain(jobChain), as libsre (fw 4.92): NULL, 128-byte ALIGN, a workload ID past 31 (INVAL), a job
+// chain of revision 0 or 1 (PERM); then cellSpursSendWorkloadSignal on its workload (result ignored) and
+// cellSpursWakeUp, whose STAT becomes JOB_ERROR_STAT. Any other wake-up result gives CELL_OK (RPCS3 passes it through).
+// Natively the signal is recorded in the guest CellSpurs, but no SPU runs jobs until the native job chain policy
+// exists (D-037 stage 5).
+s32 cellSpursRunJobChain(PPUContext& ctx, u32 job_chain)
+{
+    if (!job_chain) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (job_chain % 128) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, job_chain, 128)) {
+        log_call_site(ctx, base, std::format("cellSpursRunJobChain: job chain {:#x} is not readable guest memory; refused "
+            "with CELL_SPURS_JOB_ERROR_INVAL", job_chain));
+        return error(CELL_SPURS_JOB_ERROR_INVAL);
+    }
+    const u32 wid = ps_read32(base, job_chain + jc_off::workloadId);
+    const u32 spurs = static_cast<u32>(ps_read64(base, job_chain + jc_off::spurs));
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (ps_read8(base, job_chain + jc_off::jmVer) <= CELL_SPURS_JOB_REVISION_1) return error(CELL_SPURS_JOB_ERROR_PERM);
+    send_workload_signal(base, spurs, wid);
+    const s32 woken = cellSpursWakeUp(ctx, spurs);
+    PS_LOG_INFO(kChan, "cellSpursRunJobChain({:#010x}): workload {} of SPURS {:#x} signalled; no SPU runs its jobs until "
+        "the native job chain policy exists", job_chain, wid, spurs);
+    return woken == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT) ? error(CELL_SPURS_JOB_ERROR_STAT) : lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_cellSpurs(Registry& r)
@@ -1483,6 +1645,7 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0x9FEF70C2, cellSpursJobChainAttributeSetName),
         PS_HLE_FUNC(0xBB68D76E, cellSpursJobChainAttributeSetHaltOnError),
         PS_HLE_FUNC(0x303C19CD, cellSpursCreateJobChainWithAttribute),
+        PS_HLE_FUNC(0xF31731BB, cellSpursRunJobChain),
     });
 }
 

@@ -500,6 +500,60 @@ game for the first time:
   a vblank in the driver info (package 0xFED, RPCS3's vblank hack) and calls the game's vblank handler with head 1.
   Flip and user handlers come when a game imports their setters.
 
+## D-046 · 2026-10-04 · The firmware reference is decrypted on the Mac by a local script, never committed
+
+D-037 and D-042 need Sony's libsre as the reference for SPURS. RPCS3 isn't installed on the Mac, but its source is
+(`../ps3-ios-engine/external/rpcs3`). A small script follows RPCS3's own code: the PUP reader (`Loader/PUP.cpp`, entry
+0x300 is update_files.tar), the firmware installer (`main_window.cpp`: each `dev_flash_*` package is an SCE container
+whose third section is a tar), and `SELFDecrypter` for the SPRX. It reads the keys from RPCS3's `key_vault` source at
+run time. Script and outputs stay in `inventory/firmware/` (gitignored): the script in `tools/fw_unself.py`, the ELFs
+in `elf/`. From firmware 4.92 we have `libsre.prx.elf` (cellSync, cellSheap, cellSpurs, cellDaisy, ...) with its two
+embedded SPU kernels carved out, and `libspurs_jq.prx.elf`. libsre also carries the SPU policy modules as raw code
+blocks, the taskset module at LS 0xA00. Reading it uses scratch disassemblers built on the repo's PPU and SPU
+disassemblers. Nothing from the firmware, and no disassembly of it, goes into the repository. Code comments describe
+the behaviour they follow ("as libsre").
+
+## D-047 · 2026-10-04 · SPURS tasks, taskset shutdown and cellSheap follow libsre (fw 4.92)
+
+Run 015 (D-046 made the check possible). Changes from D-039, D-041 and D-042:
+
+- **`_cellSpursTaskAttributeInitialize(attr, revision, sdk, elf, saveConfig, argument)`** takes six arguments. The
+  fifth is a `CellSpursTaskSaveConfig {u32 context; u32 contextSize; u32 lsPattern*}`. This explains run 013: Bink
+  passed a stack save config and no argument, and garbage sat in r9/r10. The attribute now uses libsre's layout, which
+  replaces D-041's own:
+
+  | Offset | Field |
+  |---|---|
+  | 0x08 | ELF (u64) |
+  | 0x10 | context (u64) |
+  | 0x18 | size |
+  | 0x20 | pattern |
+  | 0x30 | argument |
+  | 0x40 | exit code container |
+
+  The attribute only needs to be 8-byte aligned.
+- **Task creation** follows libsre's check order and now checks the ELF. Its ident must be `7F 45 4C 46 01 02 01 00`,
+  with EM_SPU, and the entry and every PT_LOAD address must be at least 0x3000, else NOEXEC. Contexts need 128-byte
+  alignment for process SDK 0x280000 and up. A wake-up STAT becomes TASK STAT.
+- **LS pattern helpers.** The D-041 semantics are confirmed: one bit per 2 KB block, six reserved, and a save area of
+  1 KB + 2 KB per block. Corrections:
+  - Only PT_LOAD segments with paddr below 0x40000 count.
+  - Any program header past 0x40000 is INVAL.
+  - The read-only pattern comes from `p_filesz`, not `p_memsz`.
+  - `GenerateLsPattern` has no lower bound at 0x3000.
+  - `GetContextSaveAreaSize` checks no pointers.
+
+  GTA V's patterns are unchanged.
+- **Taskset shutdown.** `cellSpursShutdownTaskset` refuses only workload IDs above 31 and passes the workload
+  shutdown's result through (STAT becomes TASK STAT). `cellSpursShutdownWorkload` gains SRCH for unregistered
+  workloads.
+- **cellSheap** (supersedes D-039) is libsre's buddy allocator in guest memory: a 128-byte header, a bitmap with 2 bits
+  per tree node, and 128-byte blocks. Allocate returns 0 on failure. Free merges buddies. A double free is a libsre
+  assertion.
+- **libsre's assertions.** Where libsre asserts (it prints the condition and aborts the process), pspocket stops with a
+  fatal log naming it. Where libsre would read a bad pointer, pspocket refuses the call with a logged error, as in
+  D-042.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
