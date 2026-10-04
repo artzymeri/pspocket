@@ -5,8 +5,10 @@
 
 #include <atomic>
 #include <cstring>
+#include <string_view>
 
 #include "pspocket/core/be.h"
+#include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/reservation.h"
 #include "pspocket/core/types.hpp"
@@ -44,6 +46,19 @@ private:
     const u64 saved_sp_;
     u32 addr_ = 0;
 };
+
+// Whether [addr, addr + size) is committed guest memory, for sizes up to one host page: a pointer argument checked
+// before an HLE function reads it, so a wrong guess about a firmware signature gives a logged error, not a host crash.
+inline bool guest_readable(lv2::PpuThread& t, u32 addr, u32 size)
+{
+    if (!size) return true;
+    if (u64{addr} + size > GuestMemory::kGuestSize) return false;
+    return t.kernel.memory().is_committed(addr) && t.kernel.memory().is_committed(addr + size - 1);
+}
+
+// Logs (as errors) why an HLE call is refused, the argument registers r3..r10 and the caller's last instructions
+// before the call, so a log shows what the game put in each register (implemented in process.cpp).
+void log_call_site(PPUContext& ctx, u8* base, std::string_view why);
 
 // Atomics on naturally aligned big-endian guest words (the host is little-endian; values are swapped at the edges).
 inline u32* host_u32(u8* base, u32 addr) { return reinterpret_cast<u32*>(base + addr); }

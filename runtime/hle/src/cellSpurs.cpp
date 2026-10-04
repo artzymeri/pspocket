@@ -717,12 +717,24 @@ s32 check_task(u32 sdk_version, const TaskParams& p, u32& alloc_blocks)
     return lv2::CELL_OK;
 }
 
-TaskParams read_task_params(u8* base, u32 elf, u32 context, u32 size, u32 pattern, u32 args)
+// Reads a task's LS pattern and argument (CellSpursTaskArgument: 16 bytes, read like a pattern). The pattern says
+// which LS blocks the context keeps, so it is read only with a context: without one a caller may leave anything
+// there (run 013: GTA V passed a value that is no guest address). A pointer that must be read but isn't readable is
+// refused with TASK_ERROR_FAULT and a log of the call site.
+s32 read_task_params(PPUContext& ctx, const char* what, u32 elf, u32 context, u32 size, u32 pattern, u32 args,
+    TaskParams& p)
 {
-    TaskParams p{elf, context, size, pattern != 0, 0, 0};
-    if (pattern) p.pattern = read_ls_pattern(base, pattern);
-    if (args) p.args = read_ls_pattern(base, args); // CellSpursTaskArgument: 16 bytes, read the same way
-    return p;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    p = TaskParams{elf, context, size, context && pattern, 0, 0};
+    if ((p.has_pattern && !guest_readable(t, pattern, 16)) || (args && !guest_readable(t, args, 16))) {
+        log_call_site(ctx, base, std::format("{}: the LS pattern ({:#x}) or argument ({:#x}) pointer is not readable guest "
+            "memory; refused with CELL_SPURS_TASK_ERROR_FAULT", what, pattern, args));
+        return error(CELL_SPURS_TASK_ERROR_FAULT);
+    }
+    if (p.has_pattern) p.pattern = read_ls_pattern(base, pattern);
+    if (args) p.args = read_ls_pattern(base, args);
+    return lv2::CELL_OK;
 }
 
 // RPCS3 cellSpursSendWorkloadSignal (SPURS1 workloads): sets the workload's bit in wklSignal1.
@@ -808,7 +820,12 @@ s32 create_task(PPUContext& ctx, u32 taskset, u32 task_id_out, const TaskParams&
 s32 cellSpursCreateTask(PPUContext& ctx, u32 taskset, u32 task_id, u32 elf, u32 context, u32 size, u32 ls_pattern,
     u32 argument)
 {
-    return create_task(ctx, taskset, task_id, read_task_params(guest_base(ctx), elf, context, size, ls_pattern, argument));
+    TaskParams p;
+    if (const s32 rc = read_task_params(ctx, "cellSpursCreateTask", elf, context, size, ls_pattern, argument, p);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    return create_task(ctx, taskset, task_id, p);
 }
 
 // CellSpursTaskAttribute is opaque (256 bytes, 16-aligned) and RPCS3 does not implement it; pspocket's layout
@@ -822,11 +839,19 @@ constexpr u32 revision = 0x00, sdk_version = 0x04, elf = 0x08, context = 0x0C, c
 s32 _cellSpursTaskAttributeInitialize(PPUContext& ctx, u32 attr, u32 revision, u32 sdk_version, u32 elf, u32 context,
     u32 size, u32 ls_pattern, u32 argument)
 {
+    PS_LOG_INFO(kChan, "_cellSpursTaskAttributeInitialize(attr {:#x}, revision {}, sdk {:#x}, ELF {:#x}, context {:#x}, "
+        "size {:#x}, LS pattern {:#x}, argument {:#x})", attr, revision, sdk_version, elf, context, size, ls_pattern,
+        argument);
     if (!attr) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
     if (attr % 16) return error(CELL_SPURS_TASK_ERROR_ALIGN);
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    const TaskParams p = read_task_params(base, elf, context, size, ls_pattern, argument);
+    TaskParams p;
+    if (const s32 rc = read_task_params(ctx, "_cellSpursTaskAttributeInitialize", elf, context, size, ls_pattern,
+            argument, p);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
     u32 alloc_blocks = 0;
     if (const s32 rc = check_task(t.kernel.config().sdk_version, p, alloc_blocks); rc != lv2::CELL_OK) return rc;
     std::memset(base + attr, 0, taskattr_off::size);

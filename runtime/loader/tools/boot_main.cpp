@@ -23,12 +23,14 @@
 
 #include <unistd.h>
 
+#include "pspocket/core/be.h"
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/ppu/disasm.hpp"
 #include "pspocket/ppu/runtime.h"
 
 using namespace pspocket;
@@ -44,6 +46,45 @@ int usage()
 }
 
 u8* g_guest_base = nullptr;
+GuestMemory* g_memory = nullptr;
+hle::HleProcess* g_hle = nullptr;
+
+void write_err(const char* text, int n)
+{
+    if (n > 0) (void)!write(STDERR_FILENO, text, static_cast<size_t>(n));
+}
+
+// After the fault line: the argument registers, the firmware function running (when the PPU is in an HLE stub) and
+// the caller's last instructions before LR, so a crash in an HLE function shows what the game passed in each
+// register. Best effort: it formats with the heap, which is fine for a fault in guest memory (the case reported).
+void report_call_site(const PPUContext& c)
+{
+    char buf[256];
+    int n = std::snprintf(buf, sizeof buf, "  r4..r10 = 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n",
+        static_cast<unsigned long long>(c.gpr[4]), static_cast<unsigned long long>(c.gpr[5]),
+        static_cast<unsigned long long>(c.gpr[6]), static_cast<unsigned long long>(c.gpr[7]),
+        static_cast<unsigned long long>(c.gpr[8]), static_cast<unsigned long long>(c.gpr[9]),
+        static_cast<unsigned long long>(c.gpr[10]));
+    write_err(buf, std::min<int>(n, sizeof buf - 1));
+    if (g_hle) {
+        if (const hle::LinkedFunction* f = g_hle->linked_at(c.cia)) {
+            n = std::snprintf(buf, sizeof buf, "  in firmware function %s::%s (0x%08X), called from 0x%08x:\n",
+                f->module.c_str(), f->name.empty() ? "?" : f->name.c_str(), f->nid, static_cast<u32>(c.lr) - 4);
+            write_err(buf, std::min<int>(n, sizeof buf - 1));
+        }
+    }
+    constexpr u32 kInstructions = 16;
+    const u32 ret = static_cast<u32>(c.lr);
+    if (!g_memory || ret < 4 * kInstructions || !g_memory->is_committed(ret - 4 * kInstructions) ||
+        !g_memory->is_committed(ret - 4)) {
+        return;
+    }
+    for (u32 pc = ret - 4 * kInstructions; pc < ret; pc += 4) {
+        const std::string text = ppu::disassemble(ps_read32(g_guest_base, pc), pc);
+        n = std::snprintf(buf, sizeof buf, "    0x%08x: %s\n", pc, text.c_str());
+        write_err(buf, std::min<int>(n, sizeof buf - 1));
+    }
+}
 
 // SIGSEGV/SIGBUS: name the guest address and the PPU thread's position, then exit with 128 + signal (a debugger
 // attached to the process stops at the fault before this handler runs).
@@ -68,13 +109,15 @@ void on_fault(int sig, siginfo_t* info, void*)
                                            "at cia 0x%08x\n",
             sig == SIGBUS ? "SIGBUS" : "SIGSEGV", info->si_addr, t ? t->id : 0, c ? c->cia : 0);
     }
-    if (n > 0) (void)!write(STDERR_FILENO, buf, static_cast<size_t>(std::min<int>(n, sizeof buf - 1)));
+    write_err(buf, std::min<int>(n, sizeof buf - 1));
+    if (c) report_call_site(*c);
     _exit(128 + sig);
 }
 
-void install_fault_reporter(u8* guest_base)
+void install_fault_reporter(GuestMemory& memory)
 {
-    g_guest_base = guest_base;
+    g_guest_base = memory.base();
+    g_memory = &memory;
     struct sigaction sa{};
     sa.sa_sigaction = on_fault;
     sa.sa_flags = SA_SIGINFO;
@@ -159,7 +202,7 @@ int main(int argc, char** argv)
 
     GuestMemory memory;
     if (!memory.reserve()) return 71;
-    install_fault_reporter(memory.base());
+    install_fault_reporter(memory);
 
     // No lifted code is linked into this host: every guest function runs in the interpreter.
     ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
@@ -181,6 +224,10 @@ int main(int argc, char** argv)
     if (!app_home.empty() && !kernel.vfs_mount("/app_home", app_home, false)) return 66;
 
     hle::HleProcess hle(kernel, PS_MEM_MAIN_BASE, cfg.main_area_end, {stop_at_first});
+    g_hle = &hle;
+    struct ForgetHle {
+        ~ForgetHle() { g_hle = nullptr; } // before `hle` is destroyed
+    } forget_hle;
     hle.install();
 
     u32 main_id = 0;

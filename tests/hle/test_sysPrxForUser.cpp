@@ -778,6 +778,24 @@ TEST_CASE("cellSpurs tasks: LS patterns from the task ELF, context size, create 
     ps_write32(base, kTaskAttr, 2);
     CHECK(a.call("cellSpursCreateTaskWithAttribute", kTs, kId, kTaskAttr) == kTaskInval);
 
+    // Run 013 (regression): GTA V's first _cellSpursTaskAttributeInitialize passed a register value that is no
+    // guest address (0x40), which crashed the boot. The LS pattern is only read with a context; an unreadable pointer
+    // that has to be read is refused with TASK_ERROR_FAULT and a log of the call site, never a host crash.
+    constexpr u64 kTaskFaultErr = 0xFFFFFFFF8041090Dull;
+    constexpr u32 kCaller = kData + 0xA000;
+    for (u32 i = 0; i < 16; i++) ps_write32(base, kCaller + 4 * i, 0x60000000); // nop: the caller's code before LR
+    ps_write32(base, kCaller + 0x38, 0x39200040); // li r9,0x40
+    ps_write32(base, kCaller + 0x3C, 0x48000001); // bl
+    a.ctx.lr = kCaller + 0x40;
+    REQUIRE(a.call("_cellSpursTaskAttributeInitialize", kTaskAttr, 1, 0x330000, kElf, 0, 0, 0x40, kArgs) == 0);
+    CHECK(a.call("_cellSpursTaskAttributeInitialize", kTaskAttr, 1, 0x330000, kElf, kContext, 0x2400, 0x40, kArgs) ==
+        kTaskFaultErr);
+    CHECK(a.call("_cellSpursTaskAttributeInitialize", kTaskAttr, 1, 0x330000, kElf, 0, 0, 0, 0x40) == kTaskFaultErr);
+    REQUIRE(a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0x40, kArgs) == 0); // pattern ignored: no context
+    CHECK(ps_read32(base, kId) == 3);
+    CHECK(ps_read64(base, kTs + 0x80 + 3 * 0x30 + 0x20) == 0);
+    CHECK(a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, 0x40) == kTaskFaultErr);
+
     // All 128 IDs taken.
     for (u32 w = 0; w < 4; w++) ps_write32(base, kTs + 0x30 + 4 * w, 0xFFFFFFFFu);
     CHECK(a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, 0) == kTaskAgain);

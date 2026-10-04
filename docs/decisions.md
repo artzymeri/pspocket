@@ -422,6 +422,23 @@ against libsre once the firmware reference is set up (D-037). `CellSpursTaskAttr
 pspocket stores its own fields there. A created task is marked pending-ready and its taskset's workload is signalled,
 but nothing runs it until the native taskset policy exists (stage 3b).
 
+## D-042 · 2026-10-04 · RPCS3 runs Sony's libsre by default; HLE functions check the pointers they read
+
+Run 013. RPCS3 does not use its own cellSpurs code for games by default: `g_prx_list` in
+`rpcs3/Emu/Cell/lv2/sys_prx.cpp` marks `libsre.sprx` as not HLE, so libsysmodule loads the firmware's libsre and its
+PPU code runs as it is. RPCS3's cellSpurs.cpp is therefore a partial, rarely exercised reference (it is how so many of
+its task functions can be stubs). Consequences:
+
+- libsre is the authority for the PPU side of SPURS as well, not only for job chains and queues (D-037). What was taken
+  from RPCS3's HLE (initialize, workloads, tasksets, event flags, job chain attributes, D-040, D-041) gets checked
+  against it once the firmware reference is set up.
+- An HLE function checks a guest pointer before it reads it (`guest_readable`). A wrong guess about a firmware
+  signature then gives a logged error, not a host crash: the run goes on and the log shows what the game passed.
+- Those errors, unimplemented calls and `pspocket-boot`'s crash report show r3..r10, and the crash report and
+  `log_call_site` disassemble the caller's last 16 instructions, so one run shows what the game put in each register.
+- From run 013: a task's LS pattern is read only when the task has a context. The pattern only describes what the
+  context keeps, and GTA V's first `_cellSpursTaskAttributeInitialize` passed 0x40 in one of those two registers.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

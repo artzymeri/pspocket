@@ -6,11 +6,15 @@
 
 #include <algorithm>
 #include <cstring>
+#include <format>
+#include <string>
 
+#include "guest.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/ppu/disasm.hpp"
 #include "pspocket/ppu/runtime.h"
 
 namespace pspocket::hle {
@@ -24,6 +28,14 @@ constexpr std::string_view kChan = "hle";
 std::atomic<HleProcess*> g_current{nullptr};
 
 constexpr u64 align_up(u64 v, u64 a) { return (v + a - 1) & ~(a - 1); }
+
+// "0x1 0x2 ..." for r3..r10, the argument registers of a call.
+std::string arg_registers(const PPUContext& ctx)
+{
+    std::string out;
+    for (int i = 3; i <= 10; i++) out += std::format("{}{:#x}", i == 3 ? "" : " ", ctx.gpr[i]);
+    return out;
+}
 
 // Every stub entry's code address is registered with this function. ps_ppu_call_indirect / ps_ppu_jump_indirect and
 // the interpreter's call_lifted path set ctx->cia to the target before calling it, which identifies the import.
@@ -41,18 +53,29 @@ void stub_trampoline(PPUContext* ctx, uint8_t* base)
     p->on_unimplemented();
     const std::string_view name = f->name.empty() ? std::string_view("?") : std::string_view(f->name);
     if (p->config().abort_on_unimplemented) {
-        PS_FATAL(kChan, "UNIMPLEMENTED {}::{} ({:#010x}) called from {:#010x}, r3..r6 = {:#x} {:#x} {:#x} {:#x}",
-            f->module, name, f->nid, static_cast<u32>(ctx->lr) - 4, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6]);
+        PS_FATAL(kChan, "UNIMPLEMENTED {}::{} ({:#010x}) called from {:#010x}, r3..r10 = {}", f->module, name, f->nid,
+            static_cast<u32>(ctx->lr) - 4, arg_registers(*ctx));
     }
     if (n <= 8 || n % 1024 == 0) { // as lv2's unimplemented syscalls: a polled function must not flood the log
-        PS_LOG_ERROR(kChan, "UNIMPLEMENTED {}::{} ({:#010x}) called from {:#010x}, r3..r6 = {:#x} {:#x} {:#x} {:#x} "
-                            "(call #{})",
-            f->module, name, f->nid, static_cast<u32>(ctx->lr) - 4, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6], n);
+        PS_LOG_ERROR(kChan, "UNIMPLEMENTED {}::{} ({:#010x}) called from {:#010x}, r3..r10 = {} (call #{})", f->module,
+            name, f->nid, static_cast<u32>(ctx->lr) - 4, arg_registers(*ctx), n);
     }
     ctx->gpr[3] = lv2::to_r3(lv2::err(lv2::CELL_ENOSYS));
 }
 
 } // namespace
+
+void log_call_site(PPUContext& ctx, u8* base, std::string_view why)
+{
+    constexpr u32 kInstructions = 16;
+    const u32 ret = static_cast<u32>(ctx.lr);
+    PS_LOG_ERROR(kChan, "{} (called from {:#010x}); r3..r10 = {}", why, ret - 4, arg_registers(ctx));
+    lv2::PpuThread* t = static_cast<lv2::PpuThread*>(ctx.runtime);
+    if (!t || ret < 4 * kInstructions || !guest_readable(*t, ret - 4 * kInstructions, 4 * kInstructions)) return;
+    for (u32 pc = ret - 4 * kInstructions; pc < ret; pc += 4) {
+        PS_LOG_ERROR(kChan, "  {:#010x}: {}", pc, ppu::disassemble(ps_read32(base, pc), pc));
+    }
+}
 
 // ------------------------------------------------------------------------------------------------- registry
 
