@@ -13,3 +13,10 @@
 | End | The 300 s timeout, no crash. The main thread has waited 167 s in `cellSpursQueuePopBody` for the Physics tasks, which wait on the semaphore that was never set up |
 
 Next: SPURS semaphores (RPCS3 has none: libsre is the reference).
+
+**Where the time goes while loading** (macOS `sample`, 10 s at 90 s into a run of the same build): of about 36 host
+threads, SPU code being interpreted takes about 1.75 cores, the native SPURS scheduler about 1.4 cores (mostly GTA V's
+own policy module on SPUs 0-3 looking for work: the module's code, its reloads and the kernel's selection on
+CellSpurs line 0), and the PPU interpreter only about 0.3 cores. The SPU interpreter runs a loop of typical job code
+at about 180 MIPS on the M4 (`test_spu "[.bench]"`). So SPU speed (lifting SPU programs, D-029) matters more than PPU
+speed for loading; making the per-instruction support check inline gave no measurable gain and was left out.
