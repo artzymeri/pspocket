@@ -24,6 +24,11 @@ public:
     // One period from cellAudio's sink: `frames` interleaved stereo float frames. Never blocks.
     void push(const f32* samples, u32 frames);
 
+    // For cellAudio's buffer query (pspocket/hle/audio.hpp): the frames waiting for the device, and the most frames the
+    // device has taken at once (0 before it played).
+    u32 queued() const;
+    u32 device_frames() const;
+
     struct Stats {
         u64 played = 0;    // frames the device took from the ring
         u64 underruns = 0; // callbacks the ring couldn't fill (silence played)

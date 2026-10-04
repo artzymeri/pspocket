@@ -490,7 +490,10 @@ int main(int argc, char** argv)
     std::unique_ptr<platform::AudioOutput> audio_output;
     if (audio) {
         audio_output = std::make_unique<platform::AudioOutput>();
-        hle::set_audio_sink(hle, [out = audio_output.get()](const f32* samples, u32 frames) { out->push(samples, frames); });
+        platform::AudioOutput* out = audio_output.get();
+        hle::set_audio_sink(
+            hle, [out](const f32* samples, u32 frames) { out->push(samples, frames); },
+            [out] { return hle::AudioBufferLevel{out->queued(), out->device_frames()}; });
     }
     struct DetachAudio {
         hle::HleProcess& hle;

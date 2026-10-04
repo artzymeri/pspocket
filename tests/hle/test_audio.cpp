@@ -3,6 +3,7 @@
 
 #include "hle_test_util.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <mutex>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/lv2/sync.hpp"
@@ -458,6 +460,136 @@ TEST_CASE("cellAudio: the host sink gets the stereo mix of the started ports eve
     const u32 calls = snapshot()[0];
     std::this_thread::sleep_for(20ms);
     CHECK(snapshot()[0] == calls);
+    REQUIRE(g.call("cellAudioQuit") == 0);
+}
+
+namespace {
+
+// A speaker behind a sink with a buffer query, like platform::AudioOutput's: it plays 48 kHz in real time from what was
+// pushed, from the first push on, and keeps every block.
+struct FakeSpeaker {
+    using Clock = std::chrono::steady_clock;
+    std::mutex mutex;
+    std::vector<std::array<f32, 2 * hle::kAudioBlockFrames>> blocks;
+    u64 pushed = 0, played = 0; // frames
+    u64 most_queued = 0;
+    Clock::time_point last{};
+
+    // What real time has played since the last call. With mutex held.
+    void play()
+    {
+        if (!pushed) return;
+        const u64 frames =
+            static_cast<u64>(std::chrono::duration<double>(Clock::now() - last).count() * hle::kAudioSampleRate);
+        last += std::chrono::nanoseconds(frames * 1'000'000'000ull / hle::kAudioSampleRate);
+        played = std::min(pushed, played + frames);
+    }
+
+    void attach(hle::HleProcess& p)
+    {
+        hle::set_audio_sink(
+            p,
+            [this](const f32* samples, u32 frames) {
+                std::lock_guard lock(mutex);
+                if (!pushed) last = Clock::now();
+                play();
+                auto& block = blocks.emplace_back();
+                std::copy(samples, samples + 2 * std::min(frames, hle::kAudioBlockFrames), block.begin());
+                pushed += frames;
+                most_queued = std::max(most_queued, pushed - played);
+            },
+            [this] {
+                std::lock_guard lock(mutex);
+                play();
+                return hle::AudioBufferLevel{static_cast<u32>(pushed - played), hle::kAudioBlockFrames};
+            });
+    }
+
+    size_t count()
+    {
+        std::lock_guard lock(mutex);
+        return blocks.size();
+    }
+};
+
+} // namespace
+
+TEST_CASE("cellAudio: a sink with a buffer query gets RPCS3's buffering mode", "[hle][audio]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "audio");
+    u8* b = f.base();
+    FakeSpeaker speaker;
+    speaker.attach(*f.hle);
+
+    // The thread starts by queueing the target's worth of silence (34 ms, 9 blocks), then keeps the speaker near it.
+    REQUIRE(g.call("cellAudioInit") == 0);
+    std::this_thread::sleep_for(20ms);
+    CHECK(speaker.count() >= 9);
+
+    // Two ports of 4 blocks. Once each block has been played, it holds RPCS3's tags (-0.0f), the 8-channel port's
+    // marks too, and zeros elsewhere. The game has never written these ports, so the thread doesn't wait for them: it
+    // plays silence.
+    const u32 p2 = open_ok(g, 2, 4), p8 = open_ok(g, 8, 4);
+    const PortConfig c2 = port_config(g, p2), c8 = port_config(g, p8);
+    REQUIRE(g.call("cellAudioPortStart", p2) == 0);
+    REQUIRE(g.call("cellAudioPortStart", p8) == 0);
+    std::this_thread::sleep_for(100ms);
+    REQUIRE(g.call("cellAudioPortStop", p2) == 0);
+    REQUIRE(g.call("cellAudioPortStop", p8) == 0);
+    const auto check_tagged = [&](const PortConfig& c, u32 channels) {
+        const u32 floats = channels * 256;
+        u32 tags = 0, zeros = 0;
+        for (u32 block = 0; block < 4; block++) {
+            for (u32 i = 0; i < floats; i++) {
+                bool tag = false;
+                for (u32 nr = 0; nr < 6; nr++) {
+                    tag |= i == (channels == 2 ? 1 + 102 * nr : 2 + 409 * nr);
+                    tag |= channels == 8 && i == nr * 51 * 8 + 1;
+                }
+                const u32 bits = ps_read32(b, c.addr + 4 * (block * floats + i));
+                if (tag) tags += bits == 0x80000000;
+                else zeros += bits == 0;
+            }
+        }
+        const u32 per_block = channels == 2 ? 6 : 12;
+        CHECK(tags == 4 * per_block);
+        CHECK(zeros == 4 * (floats - per_block));
+    };
+    check_tagged(c2, 2);
+    check_tagged(c8, 8);
+
+    // A block the game adds at the read index is played whole, once: left and right 0.25 (an untouched block of the
+    // 8-channel port adds nothing).
+    REQUIRE(g.call("cellAudioPortStart", p2) == 0);
+    REQUIRE(g.call("cellAudioPortStart", p8) == 0);
+    for (u32 i = 0; i < 512; i++) ps_writef32(b, kSrc + 4 * i, 0.25f);
+    const size_t before = speaker.count();
+    g.ctx.fpr[1] = 1.0;
+    REQUIRE(g.call("cellAudioAddData", p2, kSrc, 256) == 0);
+    std::this_thread::sleep_for(60ms);
+    {
+        std::lock_guard lock(speaker.mutex);
+        u32 whole = 0, other = 0;
+        for (size_t i = before; i < speaker.blocks.size(); i++) {
+            const auto& block = speaker.blocks[i];
+            const bool silent = std::all_of(block.begin(), block.end(), [](f32 v) { return v == 0.0f; });
+            const bool game = std::all_of(block.begin(), block.end(), [](f32 v) { return v == 0.25f; });
+            whole += game;
+            other += !silent && !game;
+        }
+        CHECK(whole == 1);
+        CHECK(other == 0);
+        // The periods keep the speaker's buffer at the target: it never held more than the starting silence and a
+        // block (a period above the target lasts at least as long as the speaker takes to play a block).
+        CHECK(speaker.most_queued <= 10 * 256);
+    }
+
+    // Detached: no more blocks once set_audio_sink returns (the thread goes back to the fixed clock).
+    hle::set_audio_sink(*f.hle, {});
+    const size_t detached = speaker.count();
+    std::this_thread::sleep_for(20ms);
+    CHECK(speaker.count() == detached);
     REQUIRE(g.call("cellAudioQuit") == 0);
 }
 

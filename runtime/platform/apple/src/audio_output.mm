@@ -64,6 +64,10 @@ void AudioOutput::push(const f32* samples, u32 frames)
     if (impl_->valid) impl_->ring.push(samples, frames);
 }
 
+u32 AudioOutput::queued() const { return impl_->ring.queued(); }
+
+u32 AudioOutput::device_frames() const { return impl_->ring.largest_pull(); }
+
 AudioOutput::Stats AudioOutput::stats() const
 {
     return {impl_->ring.played(), impl_->ring.underruns(), impl_->ring.overruns()};

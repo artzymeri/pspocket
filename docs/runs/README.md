@@ -47,3 +47,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [040](040-gta5-boot-38-mac.md) | 2026-10-04 | c6b357d+ | M4 Mac, pspocket-boot --frames | Condition codes (D-068): no failed draws; the legal and Display Calibration screens |
 | [041](041-gta5-boot-39-mac.md) | 2026-10-04 | e935dfa | M4 Mac, pspocket-boot --press | Past calibration with a scripted Cross: "Loading Story Mode"; waits on SPURS semaphores |
 | [042](042-gta5-first-iphone-run.md) | 2026-10-04 | 0770578+ | iPhone 17 Pro Max, iOS 26.6.1 | GTA V on the phone: ISO picked in Files, calibration with an on-screen Cross, profile saved, "Loading Story Mode" to the semaphore gap |
+| [043](043-gta5-sound-mac.md) | 2026-10-04 | 7ea8393+ | M4 Mac, pspocket-boot --audio | Sound blocks played whole (D-074); GTA V's audio runs at 55 to 65% of real time on the loading screens, 20% at its heaviest |

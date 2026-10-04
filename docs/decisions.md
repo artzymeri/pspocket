@@ -1026,6 +1026,49 @@ the reservation system (HLE updates, PPU stwcx., SPU PUTLLC and DMA, cellSpursWa
 plain store to line 0 is seen at the idle wait's 100 ms timeout. A regression test checks that the line stays
 untouched while nothing happens.
 
+## D-074 · 2026-10-04 · cellAudio follows the speaker and waits for the game: RPCS3's buffering mode, per-port waits
+
+The sound on the iPhone buzzed ("like bad radio") on the loading screen. cellAudio played a period every 5.33 ms by the
+clock (RPCS3 without buffering, which is what RPCS3's null renderer does) and never looked at whether the game had
+written the block. GTA V adds each block with `cellAudioAddData`, which adds to the block at the read index, once per
+`CELL_AUDIO_EVENT_MIX`. A game thread that answers an event a little late finds the read index already moved on: the
+block it was meant for plays silent, its data lands on the next block, and if it then answers the next event at once,
+on top of the same block. Silent and doubled blocks alternating at up to 94 Hz are the buzz.
+
+With a sink that can say how much it holds, cellAudio now runs RPCS3's buffering mode with its default settings (a
+34 ms buffer, no time stretching; the decisions in `runtime/hle/src/audio_buffering.hpp`, the loop in cellAudio.cpp):
+- Each played block gets RPCS3's tags: -0.0f on six floats spread over the block (and, on 8-channel ports, marks on
+  the front right channel for games that fill only the front channels). Before mixing, the thread looks at the next
+  block's tags: written, being written (a tag moved since the last look), or untouched.
+- The period's length keeps the host's buffer at its target: 34 ms, or the device's callback plus two blocks when that
+  is more, half a period to 1.2 periods depending on how full the buffer is. A restart queues the target's worth of
+  silence first.
+- A block being written gets 0.5 ms more; an untouched one is waited for, 1 ms at a time. A period whose blocks stay
+  untouched too long goes on without them (all untouched: skipped, nothing played).
+
+Which untouched ports to wait for differs from RPCS3. RPCS3 counts the untouched ports it has given up on
+(`untouched_expected`, held for 340 ms after each match) and waits only while more are untouched. The first Mac run
+with it (run 043, `boot-042.log`) found the count stuck: GTA V opens a second port, starts it, never writes it and
+closes it 20 s in, and from then on the count stayed at one, so the main port's late blocks played silent without
+waiting, half the periods in a row: the buzz again. RPCS3's recompiled PPU answers in time, so its count rarely
+matters; here the game's audio thread answers late often. Now each port says whether the game feeds it (a tag moved
+in the last 340 ms; a port's tag state starts fresh at `cellAudioPortStart`), and the loop waits for every untouched
+port that is fed, for RPCS3's 2 periods (4 when other ports are ready). A port the game never wrote, or stopped
+writing, is never waited for. Three 100 s Mac runs with waits of 0, 2 and 8 periods gave the same game audio (about
+9,500 `cellAudioAddData` blocks, 64% of real time in the loading stretches and 20% in the heaviest), and none of them
+a doubled block (two `cellAudioAddData` in one played block); the wait only decides how often a period goes on without
+the game. So the limits stay RPCS3's.
+
+Without a query (no sink, a capture in the tests, `pspocket-boot` without `--audio`) the fixed clock stays, without
+tags. The sink's query (`hle::AudioBufferQuery`) returns the frames queued and the device's callback length, which
+`AudioRing` now records as the largest pull. On iOS the app asks for a 5.33 ms IO buffer (one period; iOS's default of
+about 20 ms would swing the 34 ms buffer by more than half) and logs what it got. cellAudio logs a sound line every
+5 s in buffering mode (periods mixed, how many of them not silent, silent and skipped; how many waited for the game and
+the longest wait; the `cellAudioAddData` calls and the blocks that got two or more; the range the host's buffer stayed
+in), and the iOS FPS line counts the speaker's underruns. What this can't fix: a game whose
+audio runs slower than real time for long stretches lets the speaker run dry (gaps, not buzz); RPCS3's answer is time
+stretching, not done yet.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

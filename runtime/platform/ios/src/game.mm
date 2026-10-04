@@ -65,6 +65,7 @@ struct Session {
     // The frame rate line in the log (written from the present callback, on the RSX thread only).
     std::chrono::steady_clock::time_point rate_since;
     u64 rate_flips = 0;
+    u64 rate_underruns = 0; // the speaker's, at the last line
 };
 
 constexpr auto kRateInterval = std::chrono::seconds(5);
@@ -196,8 +197,11 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
             const auto now = std::chrono::steady_clock::now();
             if (now - raw->rate_since >= kRateInterval) {
                 const double dt = std::chrono::duration<double>(now - raw->rate_since).count();
-                PS_LOG_INFO(kChan, "{:.1f} fps ({} frames in {:.1f} s; {} since the boot)",
-                    static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips, dt, flips);
+                const u64 underruns = raw->audio ? raw->audio->stats().underruns : 0;
+                PS_LOG_INFO(kChan, "{:.1f} fps ({} frames in {:.1f} s; {} since the boot); the speaker ran dry {} times",
+                    static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips, dt, flips,
+                    underruns - raw->rate_underruns);
+                raw->rate_underruns = underruns;
                 raw->rate_since = now;
                 raw->rate_flips = flips;
             }
@@ -247,17 +251,25 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         std::move(process_config));
     s->hle->install();
 
-    // Sound: the playback category (it plays with the ring/silent switch on), then cellAudio's mix to the speaker.
+    // Sound: the playback category (it plays with the ring/silent switch on) and a speaker that takes a cellAudio
+    // period at a time (iOS's default, about 20 ms per callback, would swing the 34 ms buffer by more than half), then
+    // cellAudio's mix to the speaker, paced by what it holds (D-074).
     NSError* audio_error = nil;
     AVAudioSession* session = [AVAudioSession sharedInstance];
     if (![session setCategory:AVAudioSessionCategoryPlayback error:&audio_error] ||
+        ![session setPreferredIOBufferDuration:static_cast<double>(hle::kAudioBlockFrames) / hle::kAudioSampleRate
+                                         error:&audio_error] ||
         ![session setActive:YES error:&audio_error]) {
         PS_LOG_WARN(kChan, "audio session: {}", audio_error ? audio_error.localizedDescription.UTF8String : "?");
     }
+    PS_LOG_INFO(kChan, "audio session: {} Hz, {:.1f} ms per callback", session.sampleRate,
+        session.IOBufferDuration * 1000.0);
     s->audio = std::make_unique<platform::AudioOutput>();
     if (s->audio->valid()) {
-        hle::set_audio_sink(*s->hle,
-            [out = s->audio.get()](const f32* samples, u32 frames) { out->push(samples, frames); });
+        platform::AudioOutput* out = s->audio.get();
+        hle::set_audio_sink(
+            *s->hle, [out](const f32* samples, u32 frames) { out->push(samples, frames); },
+            [out] { return hle::AudioBufferLevel{out->queued(), out->device_frames()}; });
     }
 
     loader::LoadReport report;

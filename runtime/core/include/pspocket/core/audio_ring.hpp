@@ -48,6 +48,7 @@ public:
     // Returns the frames that came from the ring.
     u32 pull(f32* left, f32* right, u32 frames)
     {
+        if (frames > largest_pull_.load(std::memory_order_relaxed)) largest_pull_.store(frames, std::memory_order_relaxed);
         const u64 read = read_.load(std::memory_order_relaxed);
         const u64 queued = write_.load(std::memory_order_acquire) - read;
         if (!playing_) {
@@ -78,6 +79,8 @@ public:
     u64 underruns() const { return underruns_.load(std::memory_order_relaxed); }
     u64 overruns() const { return overruns_.load(std::memory_order_relaxed); }
     u64 played() const { return played_.load(std::memory_order_relaxed); }
+    // The most frames one pull has asked for: the device's callback length (0 before the first pull).
+    u32 largest_pull() const { return largest_pull_.load(std::memory_order_relaxed); }
     u32 queued() const
     {
         return static_cast<u32>(write_.load(std::memory_order_acquire) - read_.load(std::memory_order_acquire));
@@ -90,6 +93,7 @@ private:
     std::atomic<u64> write_{0}, read_{0};
     bool playing_ = false; // consumer only
     std::atomic<u64> underruns_{0}, overruns_{0}, played_{0};
+    std::atomic<u32> largest_pull_{0};
 };
 
 } // namespace pspocket

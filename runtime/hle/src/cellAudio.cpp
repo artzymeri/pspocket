@@ -16,9 +16,20 @@
 //     allocation is the size rounded up to 64 KB (at least 64 KB), 64 KB aligned, like RPCS3's shared memory.
 //   CellAudioPortParam {be u64 nChannel, nBlock, attr; be f32 level}.
 //   CellAudioPortConfig {be u32 readIndexAddr, status; be u64 nChannel, nBlock; be u32 portSize, portAddr}.
-// Besides clearing played blocks, the thread writes only the read indices. RPCS3 keeps each port's block counter and
-// timestamp on the host (for cellAudioGetPortBlockTag and cellAudioGetPortTimestamp, not imported yet). It writes
-// -0.0f tags into the blocks only in its buffering mode, which needs an audio backend; its null renderer turns it off.
+// Besides clearing played blocks, the thread writes only the read indices, and in buffering mode RPCS3's -0.0f tags into
+// each block it clears (below). RPCS3 keeps each port's block counter and timestamp on the host (for
+// cellAudioGetPortBlockTag and cellAudioGetPortTimestamp, not imported yet).
+//
+// Timing (D-074, pspocket/hle/audio.hpp). With a host sink that can say how much it holds (the speaker on the Mac and
+// the iPhone), the thread runs RPCS3's buffering mode with its default settings (audio_buffering.hpp): each period
+// lasts as long as keeps the host's buffer at its target (half to 1.2 periods), and before mixing it looks at the tags
+// of the blocks it is about to play. A block whose tags the game hasn't overwritten yet is waited for, 1 ms at a time,
+// if the game feeds that port (a tag moved in the last 340 ms), up to 2 periods after the previous one (4 when other
+// ports are ready); a block the game is writing (a tag moved since the last look) gets 0.5 ms more. A game that runs late therefore plays whole
+// blocks, one per period, instead of a silent block followed by a doubled one: cellAudioAddData adds to the block at
+// the read index, so a late call lands on the next block. A game that leaves every block untouched for too long skips
+// a period (nothing played). Without such a sink (pspocket-boot without --audio, the tests) the thread runs RPCS3
+// without buffering: a fixed clock, and no tags.
 //
 // The audio thread is a host thread owned by the module, like RPCS3's cell_audio_thread. It is not an lv2 PPU thread
 // like the GCM interrupt thread, because it runs no guest code. It touches only guest memory (under the module's
@@ -38,10 +49,12 @@
 //   cellAudioQuit. Here it runs from cellAudioInit to cellAudioQuit. Registered queues stay registered (RPCS3: "handled
 //   independently") and get events again after the next cellAudioInit.
 // - Timing: RPCS3 without buffering schedules period k at start + k * 5333 us and runs late periods back to back.
-//   Here the schedule is exact (256 / 48000 s). A thread more than 100 ms late skips the missed periods instead of
-//   running them in a burst, as the GCM vblank thread does.
-// - Output: there is no audio backend. RPCS3 mixes every period into its ring buffer. Here the mix (RPCS3's
-//   mix<STEREO, ...>) runs only while a host sink is attached (pspocket/hle/audio.hpp).
+//   Here the fixed clock is exact (256 / 48000 s). A thread more than 100 ms late skips the missed periods instead of
+//   running them in a burst, as the GCM vblank thread does. Buffering mode leaves out RPCS3's alignment of a restart
+//   to the global 5.33 ms clock and its time stretching (off by default).
+// - Output: RPCS3 mixes every period into its ring buffer, and buffering depends on its backend. Here the mix
+//   (RPCS3's mix<STEREO, ...>) runs only while a host sink is attached, and buffering only while the sink has a
+//   buffer query (pspocket/hle/audio.hpp).
 // - Queues by key: RPCS3 finds any event queue by its IPC key (lv2_event_queue::find). lv2's public interface finds
 //   queues by ID only, so cellAudioSetNotifyEventQueue finds the queues cellAudioCreateNotifyEventQueue made. A keyed
 //   queue the game created itself gives CELL_AUDIO_ERROR_TRANS_EVENT and an error log, until lv2 can look up a key.
@@ -72,6 +85,7 @@
 #include <sys/qos.h>
 #endif
 
+#include "audio_buffering.hpp"
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/audio.hpp"
@@ -170,6 +184,8 @@ struct Port {
     u64 active_counter = 0; // periods played
     u64 timestamp = 0;      // guest system time (us) of the port's last period
     f32 level = 1.0f;
+    audio_buffering::PortTags tags; // buffering mode: what the game has written of the next block (fresh at open)
+    u32 adds = 0;                   // cellAudioAddData calls into the block at the read index (the sound line)
 
     u32 block_bytes() const { return std::max(num_channels, 1u) * CELL_AUDIO_BLOCK_SAMPLES * 4; }
     u32 block_addr(u64 block) const { return addr + static_cast<u32>(block) * block_bytes(); }
@@ -222,10 +238,14 @@ struct AudioState {
     std::array<bool, AUDIO_PORT_COUNT> config_logged{};
     bool add_data_logged = false;
     u32 polled_errors = 0;
+    u32 add_data_calls = 0; // since the last sound line (buffering mode)
+    u32 doubled = 0;        // blocks played with more than one cellAudioAddData in them, since the last sound line
 
-    std::mutex sink_mutex; // held while the sink runs
+    std::mutex sink_mutex; // held while the sink or its query runs
     AudioSink sink;
+    AudioBufferQuery query;
     std::atomic<bool> has_sink{false};
+    std::atomic<bool> buffered{false}; // a sink with a query: buffering mode
 };
 
 AudioState& audio() { return HleProcess::current()->state<AudioState>(); }
@@ -296,14 +316,18 @@ void mix_ports(AudioState& s, MixBlock& out)
     }
 }
 
-// RPCS3 cell_audio_thread::advance without buffering (so no tags): clear the block each started port just played,
+// RPCS3 cell_audio_thread::advance: clear the block each started port just played (in buffering mode, tag it too),
 // move the port to its next block and publish its read index, then pick the queues due for an event. With s.mutex
 // held; the events go out once it is released, as in RPCS3.
-void advance(AudioState& s, u64 now, std::vector<Notify>& notify)
+void advance(AudioState& s, u64 now, std::vector<Notify>& notify, bool tag)
 {
     for (Port& port : s.ports) {
         if (port.state != PortState::Started) continue;
-        std::memset(s.base + port.block_addr(port.cur_pos), 0, port.block_bytes());
+        const u32 block = port.block_addr(port.cur_pos);
+        std::memset(s.base + block, 0, port.block_bytes());
+        if (tag && port.num_channels) audio_buffering::tag_block(s.base, block, port.num_channels, port.tags);
+        s.doubled += port.adds > 1;
+        port.adds = 0;
         port.global_counter = s.counter;
         port.active_counter++;
         port.timestamp = now;
@@ -323,18 +347,21 @@ void advance(AudioState& s, u64 now, std::vector<Notify>& notify)
     }
 }
 
-// One period of the run `r` (RPCS3 cell_audio_thread::operator() without buffering: mix, enqueue, advance). Returns
-// false when `r` is no longer the module's run (cellAudioQuit ran meanwhile).
-bool run_period(AudioState& s, Runner& r, MixBlock& mix, std::vector<Notify>& notify)
+// What a period hands the sink: the mix, a silent block, or nothing.
+enum class Output : u8 { None, Mix, Silence };
+
+// One period of the run `r` (RPCS3 cell_audio_thread::operator(): mix, enqueue, advance). Returns false when `r` is no
+// longer the module's run (cellAudioQuit ran meanwhile).
+bool run_period(AudioState& s, Runner& r, MixBlock& mix, std::vector<Notify>& notify, Output out, bool tag)
 {
-    const bool mixing = s.has_sink.load(std::memory_order_acquire);
     {
         std::lock_guard lock(s.mutex);
         if (s.runner.get() != &r) return false;
-        if (mixing) mix_ports(s, mix);
-        advance(s, lv2::guest_system_time_us(), notify);
+        if (out == Output::Mix) mix_ports(s, mix);
+        advance(s, lv2::guest_system_time_us(), notify, tag);
     }
-    if (mixing) {
+    if (out != Output::None) {
+        if (out == Output::Silence) mix.fill(0.0f);
         std::lock_guard lock(s.sink_mutex);
         if (s.sink) s.sink(mix.data(), kAudioBlockFrames);
     }
@@ -344,7 +371,151 @@ bool run_period(AudioState& s, Runner& r, MixBlock& mix, std::vector<Notify>& no
     return true;
 }
 
-// The thread's body: sleeps until each period's deadline, then plays the period.
+// ---- buffering mode (D-074; the decisions are in audio_buffering.hpp)
+
+constexpr u64 kSoundLogIntervalUs = 5'000'000;
+
+// The buffering loop's state: RPCS3 cell_audio_thread's m_audio_should_restart, m_last_period_end and
+// m_average_playtime, plus what the sound line in the log counts.
+struct Buffering {
+    bool restart = true;
+    u64 last_period_end = 0; // host clock, us
+    f32 average_us = 0.0f;   // what the host held after the periods, rolling average
+    u64 desired_us = audio_buffering::desired_buffer_us(0);
+    // The sound line, every 5 s: periods by kind, those that waited for the game and the longest wait, and the range
+    // the host's buffer stayed in.
+    u64 log_since = 0;
+    u32 mixed = 0, audible = 0, silent = 0, skipped = 0, late = 0;
+    u64 wait_start = 0, longest_wait = 0;
+    u32 low = ~0u, high = 0;
+};
+
+u64 host_us()
+{
+    using namespace std::chrono;
+    return static_cast<u64>(duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+u64 playtime_us(u32 frames) { return u64{frames} * 1'000'000 / kAudioSampleRate; }
+
+// The sink's buffer level ({} once detached), under the sink's lock like the sink itself.
+AudioBufferLevel buffer_level(AudioState& s)
+{
+    std::lock_guard lock(s.sink_mutex);
+    return s.query ? s.query() : AudioBufferLevel{};
+}
+
+// Waits `us`; false when the run was told to stop meanwhile.
+bool pause(Runner& r, u64 us)
+{
+    std::unique_lock lock(r.mutex);
+    return !r.cv.wait_for(lock, std::chrono::microseconds(us), [&] { return r.stop; });
+}
+
+// RPCS3 count_port_buffer_tags over the started ports, at the block each plays next. With s.mutex held.
+audio_buffering::TagCount count_tags(AudioState& s)
+{
+    audio_buffering::TagCount c;
+    for (Port& port : s.ports) {
+        if (port.state != PortState::Started) continue;
+        c.active++;
+        if (!port.num_channels) continue;
+        const audio_buffering::Block block =
+            audio_buffering::classify_block(s.base, port.block_addr(port.cur_pos), port.num_channels, port.tags);
+        audio_buffering::count(c, block, port.tags.fed);
+        if (port.tags.front_only && !port.tags.front_only_reported) {
+            port.tags.front_only_reported = true;
+            PS_LOG_INFO(kChan, "port {} carries front channel audio only ({} channels): its marks, not its tags, tell "
+                               "whether the game wrote a block (as RPCS3)",
+                port.number, port.num_channels);
+        }
+    }
+    return c;
+}
+
+// One turn of RPCS3's loop in buffering mode: wait (for the period's end, or for the game), or play a period. False
+// when the thread must end.
+bool buffered_turn(AudioState& s, Runner& r, Buffering& b, MixBlock& mix, std::vector<Notify>& notify)
+{
+    namespace ab = audio_buffering;
+    const u64 now = host_us();
+    AudioBufferLevel level = buffer_level(s);
+    b.desired_us = ab::desired_buffer_us(level.device_frames); // the device's callback length is known once it played
+    if (b.restart) {
+        // RPCS3's restart: the host's buffer starts with the target's worth of silence.
+        b.restart = false;
+        mix.fill(0.0f);
+        {
+            std::lock_guard lock(s.sink_mutex);
+            for (u32 i = 0; s.sink && i < ab::restart_blocks(b.desired_us); i++) s.sink(mix.data(), kAudioBlockFrames);
+        }
+        b.average_us = static_cast<f32>(playtime_us(buffer_level(s).queued));
+        b.last_period_end = now;
+        b.log_since = now;
+        return true;
+    }
+    ab::TagCount tags;
+    {
+        std::lock_guard lock(s.mutex);
+        if (s.runner.get() != &r) return false;
+        tags = count_tags(s);
+    }
+    const ab::Decision d =
+        ab::decide(now - b.last_period_end, playtime_us(level.queued), b.average_us, b.desired_us, tags);
+    Output out = Output::Mix;
+    switch (d.step) {
+    case ab::Step::WaitForGame:
+    case ab::Step::WaitForWrites:
+        if (!b.wait_start) b.wait_start = now;
+        return pause(r, d.wait_us);
+    case ab::Step::Wait: return pause(r, d.wait_us);
+    case ab::Step::Silence: out = Output::Silence; break;
+    case ab::Step::Skip: out = Output::None; break;
+    case ab::Step::Mix: out = Output::Mix; break;
+    }
+    if (!run_period(s, r, mix, notify, out, true)) return false;
+    b.last_period_end = now;
+    level = buffer_level(s);
+    b.average_us = ab::kPeriodAverageAlpha * static_cast<f32>(playtime_us(level.queued)) +
+                   (1.0f - ab::kPeriodAverageAlpha) * b.average_us;
+
+    b.mixed += out == Output::Mix;
+    b.audible += out == Output::Mix && std::any_of(mix.begin(), mix.end(), [](f32 v) { return v != 0.0f; });
+    b.silent += out == Output::Silence;
+    b.skipped += out == Output::None;
+    if (b.wait_start) {
+        b.late++;
+        b.longest_wait = std::max(b.longest_wait, now - b.wait_start);
+        b.wait_start = 0;
+    }
+    b.low = std::min(b.low, level.queued);
+    b.high = std::max(b.high, level.queued);
+    if (now - b.log_since >= kSoundLogIntervalUs) {
+        u32 added = 0, doubled = 0;
+        {
+            std::lock_guard lock(s.mutex);
+            added = std::exchange(s.add_data_calls, 0);
+            doubled = std::exchange(s.doubled, 0);
+        }
+        PS_LOG_INFO(kChan, "sound: {} periods in {:.1f} s ({} mixed, {} of them not silent; {} silent; {} skipped: "
+                           "the game was too late); {} waited for the game, the longest {:.1f} ms; {} "
+                           "cellAudioAddData, {} blocks with two or more; the host held {:.0f} to {:.0f} ms (target "
+                           "{} ms)",
+            b.mixed + b.silent + b.skipped, static_cast<double>(now - b.log_since) / 1e6, b.mixed, b.audible,
+            b.silent, b.skipped, b.late, static_cast<double>(b.longest_wait) / 1e3, added, doubled,
+            static_cast<double>(playtime_us(b.low)) / 1e3, static_cast<double>(playtime_us(b.high)) / 1e3,
+            b.desired_us / 1000);
+        b.log_since = now;
+        b.mixed = b.audible = b.silent = b.skipped = b.late = 0;
+        b.longest_wait = 0;
+        b.low = ~0u;
+        b.high = 0;
+    }
+    return true;
+}
+
+// The thread's body: buffering mode while the sink has a buffer query, otherwise a fixed clock that sleeps until each
+// period's deadline.
 void audio_thread(AudioState& s, Runner& r)
 {
 #if defined(__APPLE__)
@@ -354,22 +525,38 @@ void audio_thread(AudioState& s, Runner& r)
     using Clock = std::chrono::steady_clock;
     MixBlock mix{};
     std::vector<Notify> notify;
+    Buffering buffering;
+    bool buffered = false;
     auto start = Clock::now();
-    for (u64 n = 0;; n++) {
+    u64 n = 0; // fixed clock: the next period since `start`
+    for (;;) {
+        if (s.kernel.exited()) {
+            PS_LOG_INFO(kChan, "the process exited: the audio thread stops");
+            return;
+        }
+        if (const bool now_buffered = s.buffered.load(std::memory_order_acquire); now_buffered != buffered) {
+            buffered = now_buffered; // a sink with a query came or went: start over in the other mode
+            buffering = Buffering{};
+            start = Clock::now();
+            n = 0;
+        }
+        if (buffered) {
+            if (!buffered_turn(s, r, buffering, mix, notify)) return;
+            continue;
+        }
         const auto deadline = start + period_offset(n);
         {
             std::unique_lock lock(r.mutex);
             if (r.cv.wait_until(lock, deadline, [&] { return r.stop; })) return;
         }
-        if (s.kernel.exited()) {
-            PS_LOG_INFO(kChan, "the process exited: the audio thread stops");
-            return;
-        }
+        if (s.kernel.exited() || s.buffered.load(std::memory_order_acquire)) continue; // the top of the loop sees to it
         if (const auto now = Clock::now(); now - deadline > kMaxLateness) {
             start = now; // far behind (a debugger, a stalled host): skip the missed periods rather than burst
             n = 0;
         }
-        if (!run_period(s, r, mix, notify)) return;
+        const Output out = s.has_sink.load(std::memory_order_acquire) ? Output::Mix : Output::None;
+        if (!run_period(s, r, mix, notify, out, false)) return;
+        n++;
     }
 }
 
@@ -418,6 +605,7 @@ Port* open_port(AudioState& s)
     Port& port = s.ports[s.free_ports[i]];
     port.server_index = s.free_indices[i];
     port.state = PortState::Opened;
+    port.tags = {};
     s.config_logged[port.number] = false;
     return &port;
 }
@@ -602,6 +790,7 @@ s32 cellAudioPortStart(PPUContext&, u32 port_num)
     case PortState::Opened: break;
     }
     std::memset(s.base + port.addr, 0, port.size); // RPCS3: the whole ring starts silent
+    port.tags = {}; // and not fed until the game writes it (D-074)
     port.state = PortState::Started;
     PS_LOG_INFO(kChan, "cellAudioPortStart({}): playing from block {}", port_num, port.cur_pos);
     return lv2::CELL_OK;
@@ -738,7 +927,7 @@ s32 cellAudioAddData(PPUContext& ctx, u32 port_num, u32 src, u32 samples)
         return fail_polled(s, error(CELL_AUDIO_ERROR_PARAM), "cellAudioAddData({}, src {:#x}, samples {})", port_num,
             src, samples);
     }
-    const Port& port = s.ports[port_num];
+    Port& port = s.ports[port_num];
     if (!port.num_channels) return lv2::CELL_OK; // RPCS3: nothing to add to (a port never opened, or without channels)
     if (!port.mapped) {
         return fail_polled(s, error(CELL_AUDIO_ERROR_PORT_NOT_OPEN),
@@ -755,6 +944,8 @@ s32 cellAudioAddData(PPUContext& ctx, u32 port_num, u32 src, u32 samples)
     for (u32 i = 0; i < count; i++) {
         ps_writef32(s.base, dst + 4 * i, ps_readf32(s.base, dst + 4 * i) + ps_readf32(s.base, src + 4 * i) * volume);
     }
+    s.add_data_calls++;
+    port.adds++;
     if (!s.add_data_logged) {
         s.add_data_logged = true;
         PS_LOG_INFO(kChan, "first cellAudioAddData({}, src {:#x}, samples {}, volume {}): into block {}", port_num, src,
@@ -765,12 +956,15 @@ s32 cellAudioAddData(PPUContext& ctx, u32 port_num, u32 src, u32 samples)
 
 } // namespace
 
-void set_audio_sink(HleProcess& process, AudioSink sink)
+void set_audio_sink(HleProcess& process, AudioSink sink, AudioBufferQuery query)
 {
     AudioState& s = process.state<AudioState>();
+    if (!sink) query = {};
     std::lock_guard lock(s.sink_mutex);
     s.has_sink.store(static_cast<bool>(sink), std::memory_order_release);
+    s.buffered.store(static_cast<bool>(query), std::memory_order_release);
     s.sink = std::move(sink);
+    s.query = std::move(query);
 }
 
 void register_cellAudio(Registry& r)

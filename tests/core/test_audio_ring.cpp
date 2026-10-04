@@ -1,6 +1,6 @@
 // The audio ring between cellAudio's thread and the host's audio callback: prebuffering, order, underruns (silence,
-// then prebuffering again), overruns (a push that doesn't fit is dropped whole), wrap-around, and one producer and one
-// consumer on two threads.
+// then prebuffering again), overruns (a push that doesn't fit is dropped whole), wrap-around, the largest pull, and one
+// producer and one consumer on two threads.
 
 #include <catch_amalgamated.hpp>
 
@@ -69,6 +69,7 @@ TEST_CASE("audio ring: prebuffering, order, underruns and overruns", "[core][aud
     CHECK(ring.pull(l, r, 4) == 4);
     CHECK(l[0] == 65.0f);
     CHECK(ring.underruns() == 1);
+    CHECK(ring.largest_pull() == 30); // the device's callback length, for cellAudio's target (D-074)
 
     // Capacity rounds up to a power of two.
     AudioRing odd(100, 0);
