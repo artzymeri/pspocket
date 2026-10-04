@@ -119,6 +119,10 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     if (size == 0) return 0;
     if (eal >= PS_SPU_RAW_BASE) return group_mmio(ctx, pc, cmd, lsa, eal, size);
     u8* mem = ctx->membase + eal;
+    // The MFC performs a queue's transfers in order, and a fenced PUT or a later command's flag must not be seen by
+    // another processor before the data PUT before it: on ARM, plain stores can become visible out of order, so
+    // every PUT is a release (D-077: GTA V's graphics jobs write RSX commands, then the jump that releases them).
+    if (!is_get(cmd)) std::atomic_thread_fence(std::memory_order_release);
     if (cmd == PS_MFC_SDCRZ) {
         std::memset(mem, 0, size);
     } else {

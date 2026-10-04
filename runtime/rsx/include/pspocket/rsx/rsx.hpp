@@ -197,6 +197,12 @@ private:
 
     // Guest memory helpers
     u32 read32(u32 ea) const { return ps_read32(mem_.base(), ea); }
+    // A FIFO word: an acquire load, so the words read after a jump the guest just patched are at least as new as the
+    // jump (D-077).
+    u32 read32_acquire(u32 ea) const
+    {
+        return ps_bswap32(__atomic_load_n(reinterpret_cast<const u32*>(mem_.base() + ea), __ATOMIC_ACQUIRE));
+    }
     void write32(u32 ea, u32 v) { ps_write32(mem_.base(), ea, v); }
     void write_label(u32 ea, u32 value);
 

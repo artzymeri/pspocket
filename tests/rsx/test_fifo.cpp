@@ -4,8 +4,10 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #include "rsx_test_util.hpp"
 
@@ -411,4 +413,34 @@ TEST_CASE("status() reports where the FIFO is and what it is blocked on")
     CHECK(s.block == Rsx::BlockReason::None);
     CHECK(s.get == s.put);
     CHECK(f.backend.clears() == std::vector<u32>{1});
+}
+
+TEST_CASE("the running RSX never sees words older than the put that covers them (D-077)")
+{
+    // A writer appends commands while the RSX thread consumes them, as the PPU does. Each stretch is first filled with
+    // malformed words, then overwritten with the real commands, then published with put after a release fence. With
+    // put read with acquire ordering the RSX only ever sees the real commands; when the read of a command is
+    // satisfied before the read of put (ARM allows it for plain loads) it can see a malformed word. Probabilistic: it
+    // can only fail when that ordering is broken.
+    Fixture f;
+    f.rsx->start();
+    constexpr u32 kLaps = 20000, kStride = 32; // 4 methods with one argument each
+    for (u32 lap = 0; lap < kLaps; lap++) {
+        const u32 pos = lap * kStride;
+        auto poison = f.at(pos);
+        for (u32 w = 0; w < kStride / 4; w++) poison.word(0x80000000);
+        auto b = f.at(pos);
+        for (u32 k = 0; k < 4; k++) b.method(m::NV4097_CLEAR_SURFACE, lap);
+        std::atomic_thread_fence(std::memory_order_release);
+        f.set_put(b.offset());
+        f.rsx->notify();
+    }
+    REQUIRE(f.rsx->wait_idle(10'000'000'000ull));
+    f.rsx->stop();
+    CHECK(f.failures.empty());
+    const std::vector<u32> clears = f.backend.clears();
+    REQUIRE(clears.size() == 4 * kLaps);
+    bool ordered = true;
+    for (u32 i = 0; i < clears.size(); i++) ordered = ordered && clears[i] == i / 4;
+    CHECK(ordered);
 }

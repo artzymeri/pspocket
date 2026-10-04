@@ -273,7 +273,15 @@ std::optional<u32> Rsx::fifo_address(u32 offset) const
     return io_map_.io_to_ea(offset);
 }
 
-u32 Rsx::read_put() const { return ps_read32(mem_.base(), config_.layout.put_addr()) & ~3u; }
+// The guest writes its commands, then (after a sync) put. Put is read with acquire ordering, so the FIFO words read
+// after it are at least as new: on ARM a plain load lets those later loads be satisfied first and see words the
+// guest has already replaced (run 048 on the Mac: "malformed FIFO command 0x80000000", D-077).
+u32 Rsx::read_put() const
+{
+    const u32 raw = __atomic_load_n(reinterpret_cast<const u32*>(mem_.base() + config_.layout.put_addr()),
+        __ATOMIC_ACQUIRE);
+    return ps_bswap32(raw) & ~3u;
+}
 
 void Rsx::publish_get() { ps_write32(mem_.base(), config_.layout.get_addr(), get_.load(std::memory_order_relaxed)); }
 
@@ -364,7 +372,7 @@ Rsx::RunStatus Rsx::step(u64 max_words)
             fifo_error(std::format("FIFO offset {:#010x} is not mapped (put {:#010x})", get, put));
             return RunStatus::Error;
         }
-        const u32 word = read32(*ea);
+        const u32 word = read32_acquire(*ea);
 
         if (packet_remaining_ > 0) {
             // Method argument
@@ -467,7 +475,7 @@ bool Rsx::semaphore_acquire_satisfied(u32 value)
             std::format("NV406E_SEMAPHORE_ACQUIRE: bad semaphore offset {:#x} (dma {:#x})", offset, dma));
         return true;
     }
-    return read32(*ea) == value;
+    return read32_acquire(*ea) == value; // what the releaser wrote before the value is visible after it (D-077)
 }
 
 // ---- thread -----------------------------------------------------------------------------------------------------
@@ -479,7 +487,7 @@ bool Rsx::blocked_condition_cleared()
     case BlockReason::Semaphore: return semaphore_acquire_satisfied(block_value_);
     case BlockReason::JumpToSelf: {
         const auto ea = fifo_address(get_.load(std::memory_order_relaxed));
-        return !ea || read32(*ea) != block_value_;
+        return !ea || read32_acquire(*ea) != block_value_;
     }
     case BlockReason::None: break;
     }
