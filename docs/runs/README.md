@@ -45,3 +45,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [038](038-gta5-boot-36-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | The MP3 codec comes from /dev_flash, which was missing |
 | [039](039-gta5-boot-37-mac.md) | 2026-10-04 | 68706ad+ | M4 Mac, pspocket-boot --frames | No crash for 120 s with /dev_flash (D-067); a grey screen, 110,146 draws skipped |
 | [040](040-gta5-boot-38-mac.md) | 2026-10-04 | c6b357d+ | M4 Mac, pspocket-boot --frames | Condition codes (D-068): no failed draws; the legal and Display Calibration screens |
+| [041](041-gta5-boot-39-mac.md) | 2026-10-04 | e935dfa | M4 Mac, pspocket-boot --press | Past calibration with a scripted Cross: "Loading Story Mode"; waits on SPURS semaphores |

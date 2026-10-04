@@ -30,7 +30,7 @@ PS3 game. SPURS (the PS3's SPU job system) is our own native C++ implementation,
 | RSX | Portable front end (FIFO methods, state, textures, shader translation to MSL with condition codes, D-068) and Metal backend (D-032). Driven by GTA V since run 016; its frames are saved as PNG (D-057): the logo, the legal screen and the Display Calibration screen draw as on the PS3 |
 | iOS app | XcodeGen test host with device self-tests. On an iPhone 17 Pro Max, MetalFX 30 Hz runs steady and lifted PPU code runs 12× faster than the interpreter (runs 001–003). `-extract-iso` mode. The GTA V disc image (18.7 GB, decrypted at disc level) is in the app's Documents |
 
-## GTA V bring-up so far (docs/runs 004–040)
+## GTA V bring-up so far (docs/runs 004–041)
 
 The EBOOT boots under the interpreter on the M4 Mac. It gets through:
 - the CRT, TLS, lwmutexes, cellSysmodule;
@@ -57,15 +57,17 @@ The EBOOT boots under the interpreter on the M4 Mac. It gets through:
   threads could take one lock-free slot (D-066), the MP3 codec comes from /dev_flash (the user's firmware, D-067), and
   fragment programs need condition codes (D-068);
 - **runs 039 and 040 end at their timeout without a crash**: the opening animation, the legal screen and the **Display
-  Calibration** screen, which waits for the X button.
+  Calibration** screen, which waits for the X button;
+- run 041 presses X on a schedule (`--press cross@45+10`, D-069): past calibration to **"Loading Story Mode"**, with the
+  trophy set registered (D-065).
 
 ## Right now
 
-The game shows its Display Calibration screen and waits for a button press (run 040, 150 s, no crash, no failed
-draws). Nothing presses buttons yet: `pspocket-boot` needs a way to script the virtual controller (press X at a given
-time) so runs can go on into the game's menus and loading. The two trophy calls in run 040's log are implemented now
-(D-065); the next run will register the trophy set.
-See the frames with `scripts/boot.sh --frames inventory/gta5/frames --frame-every 30`.
+The game shows its "Loading Story Mode" screens (run 041, 300 s, no crash, no failed draws) and stops loading: its
+Physics SPU tasks wait on a SPURS semaphore that `_cellSpursSemaphoreInitialize` (unimplemented) never set up, and the
+main thread waits for them in `cellSpursQueuePopBody`. SPURS semaphores are next, with libsre as the reference (RPCS3
+has none). Runs need `--press cross@45+10` to get past the Display Calibration screen; boot.sh passes it through:
+`scripts/boot.sh --timeout 300 --frames inventory/gta5/frames --frame-every 60 --press cross@45+10`.
 
 ## Next steps, in order
 
@@ -73,7 +75,7 @@ See the frames with `scripts/boot.sh --frames inventory/gta5/frames --frame-ever
    1. Run `scripts/boot.sh`.
    2. Read the whole log, `inventory/boot-NNN.log`.
    3. Implement what it shows, following RPCS3 and citing it, with a test for each.
-   4. Write a `docs/runs/0NN` entry (next is 041) and record decisions as D-069 onwards.
+   4. Write a `docs/runs/0NN` entry (next is 042) and record decisions as D-070 onwards.
    5. Commit, push, repeat.
 
    A run that doesn't crash ends at its timeout with the thread report: every guest thread, what it waits on and its
