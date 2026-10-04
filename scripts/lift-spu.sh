@@ -10,6 +10,10 @@
 # one directory per program and game_spu.c, whose pspocket_game_spu_register() registers them all. DUMP and OUT hold
 # code derived from the game: keep them in the gitignored inventory/ or build/ (CLAUDE.md rule 1).
 #
+# Job binaries and modules are position independent: they are lifted relocatable (spu-lift --relocatable, D-081), once
+# per hash. Copies of one saved at several LS addresses (older dumps) become one program, lifted at the first copy's
+# base, with the seeds of every copy moved there.
+#
 # Works with macOS's bash 3.2.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -21,38 +25,71 @@ DUMP="$1"; OUT="$2"; shift 2
 [ -d "$DUMP" ] || { echo "error: no dump directory $DUMP" >&2; exit 1; }
 mkdir -p "$OUT"
 
-# Seeds from the logs: "no lifted code at 0xADDR in program NAME".
-SEEDS="$(mktemp)"
-trap 'rm -f "$SEEDS"' EXIT
-if [ $# -gt 0 ]; then
-    sed -n 's/.*no lifted code at \(0x[0-9a-fA-F]*\) in program \(spu_[0-9a-f]*_[0-9a-f]*\).*/\2 \1/p' "$@" \
-        | sort -u > "$SEEDS" || true
-fi
-
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 value() { sed -n "s/^$1 //p" "$2"; }
 
-count=0; failed=0
-REG="$OUT/game_spu.c.tmp"
+# The images: name kind base size entry, one per line.
+for meta in "$DUMP"/spu_*.txt; do
+    [ -e "$meta" ] || continue
+    name="$(basename "$meta" .txt)"
+    [ -f "$DUMP/$name.bin" ] || { echo "warning: $name has no $name.bin, skipped" >&2; continue; }
+    echo "$name $(value kind "$meta") $(value base "$meta") $(value size "$meta") $(value entry "$meta" | head -1)"
+done | sort > "$TMP/images"
+
+# Seeds, "name address": from the logs ("no lifted code at 0xADDR in program NAME") and the images' "seed" lines.
 {
-    echo "/* The game's lifted SPU programs (scripts/lift-spu.sh, D-076). Generated: do not edit or commit. */"
-    echo
-} > "$REG"
+    if [ $# -gt 0 ]; then
+        sed -n 's/.*no lifted code at \(0x[0-9a-fA-F]*\) in program \(spu_[0-9a-f]*_[0-9a-f]*\).*/\2 \1/p' "$@" || true
+    fi
+    for meta in "$DUMP"/spu_*.txt; do
+        [ -e "$meta" ] || continue
+        name="$(basename "$meta" .txt)"
+        value seed "$meta" | sed "s/^/$name /"
+    done
+} > "$TMP/raw-seeds"
+
+# Relocatable images (jobs, modules) are lifted once per hash, at the first copy's base: "name canonical" for each,
+# and the seeds of the other copies moved by the difference of the bases.
+awk '
+    function hex(s,   v, i) { s = tolower(s); sub(/^0x/, "", s); v = 0
+        for (i = 1; i <= length(s); i++) v = v * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+        return v }
+    FNR == NR {
+        base[$1] = hex($3)
+        if ($2 == "job" || $2 == "module") {
+            h = substr($1, 1, 20)
+            if (!(h in first)) first[h] = $1
+            canon[$1] = first[h]
+            print $1, first[h] > "'"$TMP/canon"'"
+        }
+        next
+    }
+    {
+        name = $1; at = hex($2)
+        if (name in canon && canon[name] != name) {
+            at = (at - base[name] + base[canon[name]]) % 262144
+            if (at < 0) at += 262144
+            name = canon[name]
+        }
+        printf "%s 0x%x\n", name, at
+    }
+' "$TMP/images" "$TMP/raw-seeds" | sort -u > "$TMP/seeds"
+touch "$TMP/canon"
+
+count=0; failed=0; merged=0
 DECLS=""; CALLS=""
-for bin in "$DUMP"/spu_*.bin; do
-    [ -e "$bin" ] || continue
-    name="$(basename "$bin" .bin)"
-    meta="$DUMP/$name.txt"
-    [ -f "$meta" ] || { echo "warning: $name has no $name.txt, skipped" >&2; continue; }
-    base="$(value base "$meta")"; entry="$(value entry "$meta" | head -1)"; size="$(value size "$meta")"
-    args=(--image "$bin" --base "$base" --entry "$entry" --name "$name" --out "$OUT/$name" --quiet)
+while read -r name kind base size entry; do
+    canonical="$(awk -v n="$name" '$1 == n { print $2 }' "$TMP/canon")"
+    if [ -n "$canonical" ] && [ "$canonical" != "$name" ]; then merged=$((merged + 1)); continue; fi
+    args=(--image "$DUMP/$name.bin" --base "$base" --entry "$entry" --name "$name" --out "$OUT/$name" --quiet)
+    case "$kind" in job|module) args+=(--relocatable) ;; esac
     # Seeds inside the image's code only: execution also leaves lifted code for code outside it (the SPURS syscall
     # stubs, modules a program loads), which spu-lift refuses as seeds.
-    add_seed() { if [ $(($1)) -ge $((base)) ] && [ $(($1)) -lt $((base + size)) ]; then args+=(--seed "$1"); fi; }
     while read -r prog seed; do
-        [ "$prog" = "$name" ] && add_seed "$seed"
-    done < "$SEEDS"
-    # Seeds the run saved with the image (modules, D-079: addresses execution entered it at).
-    for seed in $(value seed "$meta" | sort -u); do add_seed "$seed"; done
+        [ "$prog" = "$name" ] || continue
+        if [ $((seed)) -ge $((base)) ] && [ $((seed)) -lt $((base + size)) ]; then args+=(--seed "$seed"); fi
+    done < "$TMP/seeds"
     if "$LIFT" "${args[@]}" > "$OUT/$name.log" 2>&1; then
         DECLS="${DECLS}void ${name}_register(void);"$'\n'
         CALLS="${CALLS}    ${name}_register();"$'\n'
@@ -62,14 +99,24 @@ for bin in "$DUMP"/spu_*.bin; do
         rm -rf "${OUT:?}/$name"
         failed=$((failed + 1))
     fi
+done < "$TMP/images"
+
+# Programs of earlier lifts that are no longer lifted (merged copies) must not be built.
+for dir in "$OUT"/spu_*/; do
+    [ -d "$dir" ] || continue
+    name="$(basename "$dir")"
+    case "$CALLS" in *" ${name}_register();"*) ;; *) rm -rf "${OUT:?}/$name" "$OUT/$name.log" ;; esac
 done
+
 {
+    echo "/* The game's lifted SPU programs (scripts/lift-spu.sh, D-076). Generated: do not edit or commit. */"
+    echo
     printf '%s\n' "$DECLS"
     echo "void pspocket_game_spu_register(void);"
     echo "void pspocket_game_spu_register(void)"
     echo "{"
     printf '%s' "$CALLS"
     echo "}"
-} >> "$REG"
-mv "$REG" "$OUT/game_spu.c"
-echo "lifted $count SPU programs into $OUT ($failed failed); seeds: $(wc -l < "$SEEDS" | tr -d ' ')"
+} > "$OUT/game_spu.c.tmp"
+mv "$OUT/game_spu.c.tmp" "$OUT/game_spu.c"
+echo "lifted $count SPU programs into $OUT ($failed failed, $merged copies merged); seeds: $(wc -l < "$TMP/seeds" | tr -d ' ')"

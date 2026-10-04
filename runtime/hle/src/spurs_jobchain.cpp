@@ -958,7 +958,7 @@ bool JobChainPolicy::run_job(const Job& job)
         cached->program = identify_program(base_, image);
         cached->identified = true;
     }
-    ps_spu_attach_program(&ctx, cached ? cached->program : identify_program(base_, image));
+    ps_spu_attach_program_at(&ctx, cached ? cached->program : identify_program(base_, image), binary); // relocatable (D-081)
 
     for (;;) {
         const u32 reason = ps_spu_run(&ctx);
@@ -969,7 +969,7 @@ bool JobChainPolicy::run_job(const Job& job)
             ctx.exception, ctx.pc));
     }
     // A DMA over the binary's code dropped its lifted program: the cached copy is interpreted from now on.
-    if (cached && !ctx.program) cached->program = nullptr;
+    if (cached && !ctx.home) cached->program = nullptr;
     // The job's own DMA (its output) completed with it: the MFC is synchronous.
     release_buffers();
     return true;

@@ -1191,6 +1191,38 @@ A8B8G8R8 target read as Y16_X16).
 - A flush of memory under a target of the open render pass ends the pass first: a target cleared but not drawn to
   holds the clear only as the pass's load action, so the write-back read the memory from before the clear.
 
+## D-081 · 2026-10-04 · Relocatable lifted SPU programs: one translation per job binary or module, run at any address
+
+Run 052 (the first mission, with the modules of D-079 collected) dumped 32,570 images in a few minutes: GTA V's
+dependency tasks load 82 distinct modules, each at thousands of LS addresses, and a lifted program was keyed by its
+LS address (D-076). Job binaries are the same: 132 dumps were 36 programs. Code that SPURS or a program loads at
+varying addresses is position independent, so it is now lifted once and runs wherever it sits.
+- `spu-lift --relocatable`: the lifted code reads `ctx->reloc` (the distance from where it was lifted to where it
+  runs) once per function, and every LS address it derives from its own adds it: the pc it stores, links, relative
+  branch and load targets (lqr, stqr), the pc it passes to the runtime (stops, channels, halts), call returns and the
+  dispatch switch. Absolute branches (bra, brasl) reach the same address wherever the code sits: they leave to the run
+  loop, and the analyzer does not follow them or treat ila/il constants as entries. This is exact for any code, not
+  only position-independent code: it runs as the interpreter would at that address.
+- `ps_spu_program.relocatable`: found by hash and size alone; `ps_spu_attach_program_at` and the resolver say where
+  the code sits. Function symbols of a relocatable lift carry an "r" before the code start.
+- The context keeps a home program (the one SPURS attached) beside the current one. The resolver makes a module
+  current; when execution comes back to the home program's code (the module returned), home is current again, so a
+  task or job runs lifted after every module call instead of interpreting to its end. A GET over either drops it.
+- The resolver returns a module's program even without an entry at pc: the miss is reported in the program's own
+  terms ("no lifted code at ... in program ..."), so the logs seed the next lift as they do for other programs.
+- SPURS dumps a relocatable image once per hash, where it was first seen, and module seeds are moved into that copy's
+  terms; `scripts/lift-spu.sh` lifts jobs and modules with `--relocatable`, once per hash (older per-address copies
+  merge into the first, with their seeds moved).
+- Seeds (`spu-lift --seed`, `LsImage::seeds`) inside a function the entries reach become labels of it, entered through
+  its dispatch switch; only the others start functions. Each seed used to start a function that copied all the code
+  it reached: one 22 KB job, with the seeds of its 29 copies merged, lifted to 35 MB of C (367,473 instructions for
+  5,536) and did not compile in 11 minutes; now 4 times its size at most, all 36 programs 53 MB.
+- Tests: a quarter of the differential fuzz cases run relocated, at another address of the code window (and so do
+  their relative loads); a synthetic program with calls, a loop, a call through a computed address, relative loads and
+  stores, a stop, an absolute call out of it and a jump through a register runs lifted fixed and relocatable at six
+  placements (one across the end of local store) against the interpreter; HLE tests for relocatable jobs, the module
+  dumps and the return to the home program.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

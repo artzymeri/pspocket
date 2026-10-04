@@ -3,8 +3,10 @@
 // The game's SPU programs as SPURS loads them into a worker's local store (D-076). Each load attaches the lifted
 // program for that image when the game's build has one, so the run loop executes native code instead of the
 // interpreter. An image is known by the hash of its code as it sits in guest memory, not of the worker's copy (a job
-// keeps its data inside its binary, and the copy changes as it runs), and by where it sits in local store: lifted
-// code is specific to its LS address, and position-independent job binaries land on different pages.
+// keeps its data inside its binary, and the copy changes as it runs). Tasks and policy modules are also known by where
+// they sit in local store, the address their code was lifted for; job binaries and the modules programs load
+// themselves are position independent and land anywhere, so their lifted programs are relocatable (D-081): one
+// program per hash, run wherever the image sits.
 //
 // With a dump directory (pspocket/hle/spu_programs.hpp, pspocket-boot --spu-dump DIR), each image that has no lifted
 // program is saved once, for scripts/lift-spu.sh.

@@ -1,6 +1,7 @@
 // SPU programs as SPURS loads them (runtime/hle/src/spu_programs.cpp, D-076): the lifted program a load attaches, the
-// dump of the images that have none, and a DMA over an attached program's code dropping it. Synthetic: the "code" is
-// a byte pattern and the lifted program a hand-made descriptor.
+// dump of the images that have none, a DMA over an attached program's code dropping it, the modules programs load
+// themselves (D-079) and relocatable programs (D-081). Synthetic: the "code" is a byte pattern and the lifted program a
+// hand-made descriptor.
 
 #include <catch_amalgamated.hpp>
 
@@ -62,7 +63,7 @@ TEST_CASE("SPU programs: a load attaches the lifted program with the image's key
     for (u32 i = 0; i < kSize; i++) base[kGuest + i] = static_cast<u8>(i * 7 + 3);
 
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
-    ps_spu_program program{"spu_test", ps_spu_hash64(base + kGuest, kSize), kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 1,
+    ps_spu_program program{"spu_test", ps_spu_hash64(base + kGuest, kSize), kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1,
         entries, nullptr};
     ps_spu_register_program(&program);
     Spu spu(base);
@@ -72,8 +73,8 @@ TEST_CASE("SPU programs: a load attaches the lifted program with the image's key
     CHECK(spu.ctx.program == &program);
     CHECK(ps_spu_lookup(&spu.ctx, kLs) == &lifted_entry);
 
-    // The same code at another LS address is another program (lifted code is specific to its address)...
-    hle::spurs::attach_program(spu.ctx, base, {ImageKind::Job, kGuest, kLs + 0x400, kSize, kLs + 0x400});
+    // The same code at another LS address is another program (fixed lifted code is specific to its address)...
+    hle::spurs::attach_program(spu.ctx, base, {ImageKind::Task, kGuest, kLs + 0x400, kSize, kLs + 0x400});
     CHECK(spu.ctx.program == nullptr);
     // ...and other code at the same address too. The key is the guest copy's, whatever the LS copy holds.
     base[kGuest + 0x40] ^= 1;
@@ -88,6 +89,37 @@ TEST_CASE("SPU programs: a load attaches the lifted program with the image's key
     CHECK(after.attached - before.attached == 2);
     CHECK(after.unknown - before.unknown == 2);
     CHECK(after.images - before.images == 2);
+    ps_spu_unregister_program(&program);
+}
+
+TEST_CASE("SPU programs: a relocatable program attaches wherever its image sits (D-081)", "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    for (u32 i = 0; i < kSize; i++) base[kGuest + i] = static_cast<u8>(i * 13 + 1);
+
+    const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
+    ps_spu_program program{"spu_test_reloc", ps_spu_hash64(base + kGuest, kSize), kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE,
+        1, 1, entries, nullptr};
+    ps_spu_register_program(&program);
+    Spu spu(base);
+
+    for (const u32 at : {kLs, kLs + 0x400, kLs - 0x1000, 0x3FF00u}) {
+        INFO(std::format("job at LS {:#x}", at));
+        hle::spurs::attach_program(spu.ctx, base, {ImageKind::Job, kGuest, at, kSize, at});
+        REQUIRE(spu.ctx.program == &program);
+        CHECK(spu.ctx.home == &program);
+        CHECK(spu.ctx.reloc == ((at - kLs) & PS_SPU_LS_MASK));
+        CHECK(ps_spu_lookup(&spu.ctx, at) == &lifted_entry);
+        CHECK(ps_spu_lookup(&spu.ctx, at + 4) == nullptr);
+        if (at != kLs) CHECK(ps_spu_lookup(&spu.ctx, kLs) == nullptr);
+    }
+    // The program decides, not the kind of image: a relocatable program runs wherever any image with its code sits.
+    hle::spurs::attach_program(spu.ctx, base, {ImageKind::Task, kGuest, kLs + 0x400, kSize, kLs + 0x400});
+    CHECK(spu.ctx.program == &program);
+    CHECK(spu.ctx.reloc == 0x400);
     ps_spu_unregister_program(&program);
 }
 
@@ -106,6 +138,8 @@ TEST_CASE("SPU programs: images without a lifted program are saved once, with wh
 
     hle::spurs::attach_program(spu.ctx, base, {ImageKind::Job, kGuest, 0x4C00, kSize, 0x4C00});
     hle::spurs::attach_program(spu.ctx, base, {ImageKind::Job, kGuest, 0x4C00, kSize, 0x4C00});
+    // A job binary is position independent: the same one elsewhere is the same image (D-081).
+    hle::spurs::attach_program(spu.ctx, base, {ImageKind::Job, kGuest, 0x9000, kSize, 0x9000});
     hle::set_spu_dump_dir({});
 
     std::vector<std::filesystem::path> files;
@@ -127,7 +161,7 @@ TEST_CASE("SPU programs: a DMA over the attached program's code drops it", "[hle
     REQUIRE(mem.commit(kGuest, 0x10000));
     u8* base = mem.base();
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
-    ps_spu_program program{"spu_test", 1, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 1, entries, nullptr};
+    ps_spu_program program{"spu_test", 1, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr};
     ps_spu_register_program(&program);
     Spu spu(base);
     ps_spu_attach_program(&spu.ctx, &program);
@@ -146,6 +180,7 @@ TEST_CASE("SPU programs: a DMA over the attached program's code drops it", "[hle
     CHECK(spu.ctx.program == &program);
     get(kLs + 0x80, 0x10); // over it: the lifted code would be stale
     CHECK(spu.ctx.program == nullptr);
+    CHECK(spu.ctx.home == nullptr);
     ps_spu_unregister_program(&program);
 }
 
@@ -167,7 +202,7 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i); // nops with distinct bits
     const ps_spu_entry entries[] = {{kModule, &module_entry}};
     ps_spu_program program{"spu_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 1, entries, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr};
     ps_spu_register_program(&program);
     hle::enable_spu_modules();
     Spu spu(base);
@@ -204,4 +239,117 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     ps_spu_set_resolver(nullptr);
     ps_spu_set_get_observer(nullptr);
     ps_spu_unregister_program(&program);
+}
+
+namespace {
+
+constexpr u32 kHome = 0x1000;  // a task's code, lifted where it runs
+constexpr u32 kLifted = 0x8000; // where the module was lifted
+constexpr u32 kLoaded = 0xA400; // where the task copies it
+u32 g_home_runs = 0;
+
+// The task's code: branches to the module, which returns to kHome + 4.
+void home_entry(SPUContext* ctx, uint8_t*)
+{
+    g_home_runs++;
+    ctx->pc = kLoaded;
+}
+void home_return(SPUContext* ctx, uint8_t*) { ps_spu_stop(ctx, ctx->pc, 0x43); }
+// The module's code (relocatable): records where it runs, then returns to its caller.
+u32 g_module_reloc = ~0u;
+void reloc_module_entry(SPUContext* ctx, uint8_t*)
+{
+    g_module_reloc = ctx->reloc;
+    ctx->pc = kHome + 4;
+}
+
+} // namespace
+
+TEST_CASE("SPU programs: a relocatable module runs where it was copied, then its caller's code runs lifted again (D-081)",
+    "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModuleSize = 0x400;
+    for (u32 i = 0; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i); // nops with distinct bits
+    const ps_spu_entry module_entries[] = {{kLifted, &reloc_module_entry}};
+    ps_spu_program module{"spu_module_reloc", ps_spu_hash64(base + kGuest, kModuleSize), kLifted, kModuleSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, module_entries, nullptr};
+    const ps_spu_entry home_entries[] = {{kHome, &home_entry}, {kHome + 4, &home_return}};
+    ps_spu_program home{"spu_home", 2, kHome, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 2, home_entries, nullptr};
+    ps_spu_register_program(&module);
+    ps_spu_register_program(&home);
+    hle::enable_spu_modules();
+    Spu spu(base);
+
+    // The task copies the module in (one GET), then calls it.
+    ps_spu_attach_program(&spu.ctx, &home);
+    REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_LSA, kLoaded) == 0);
+    REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAH, 0) == 0);
+    REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAL, kGuest) == 0);
+    REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Size, kModuleSize) == 0);
+    REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_TagID, 3) == 0);
+    REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+    CHECK(spu.ctx.home == &home); // the GET was not over the task's code
+    spu.ctx.pc = kHome;
+    g_home_runs = 0;
+    const u64 misses = ps_spu_miss_count();
+    REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(spu.ctx.stop_code == 0x43); // the task's lifted code took the return
+    CHECK(g_home_runs == 1);
+    CHECK(g_module_reloc == kLoaded - kLifted);
+    CHECK(spu.ctx.program == &home);
+    CHECK(spu.ctx.reloc == 0);
+    CHECK(ps_spu_miss_count() == misses);
+
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&module);
+    ps_spu_unregister_program(&home);
+}
+
+TEST_CASE("SPU programs: a relocatable module is saved once, its seeds where the saved copy has them (D-081)", "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModuleSize = 0x400, kFirst = 0x6000, kSecond = 0x9800;
+    ps_write32(base, kGuest, 0x00000007);        // stop 0x7 at its start...
+    ps_write32(base, kGuest + 0x10, 0x00000008); // ...and stop 0x8 at +0x10
+    for (u32 i = 0x20; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("pspocket-spu-modules-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    hle::set_spu_dump_dir(dir.string());
+    hle::enable_spu_modules();
+    Spu spu(base);
+    const auto load_and_run = [&](u32 at, u32 entry) {
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_LSA, at) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAH, 0) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAL, kGuest) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Size, kModuleSize) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_TagID, 4) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+        spu.ctx.pc = at + entry;
+        REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+        return spu.ctx.stop_code;
+    };
+    CHECK(load_and_run(kFirst, 0) == 0x7);
+    CHECK(load_and_run(kSecond, 0x10) == 0x8); // entered elsewhere, at another address
+    hle::set_spu_dump_dir({});
+
+    std::vector<std::filesystem::path> files;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) files.push_back(e.path());
+    REQUIRE(files.size() == 2);
+    const std::string name = std::format("spu_{:016x}_{:05x}", ps_spu_hash64(base + kGuest, kModuleSize), kFirst);
+    const std::vector<u8> meta = read_file(dir / (name + ".txt"));
+    CHECK(std::string(meta.begin(), meta.end()) ==
+          std::format("kind module\nguest {:#x}\nbase {:#x}\nsize {:#x}\nentry {:#x}\nseed {:#x}\nseed {:#x}\n", kGuest,
+              kFirst, kModuleSize, kFirst, kFirst, kFirst + 0x10));
+    std::filesystem::remove_all(dir);
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
 }

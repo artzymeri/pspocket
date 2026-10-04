@@ -29,6 +29,9 @@ struct LiftOptions {
     u32 tu_count = 1;
     bool comments = true;
     u8 xfloat = 0; // PS_SPU_XFLOAT_APPROXIMATE or PS_SPU_XFLOAT_ACCURATE (pspocket/spu/fp.h)
+    // Position independent (D-081): runs ctx->reloc bytes past the image's base. Every address the code derives from
+    // its own (pcs, links, relative branch and load targets) adds it; absolute branches leave to the run loop.
+    bool relocatable = false;
 };
 
 struct OutputFile {
@@ -52,14 +55,15 @@ struct LiftResult {
 LiftResult lift(const LsImage& image, const Program& program, const LiftOptions& options);
 
 // "spu_<hash>_<code start>_<entry>": the program key (16 hex digits), its LS code start and the entry (5 hex digits
-// each). The code start keeps apart the programs one position-independent binary makes at different LS addresses
-// (D-076), whose functions would otherwise share names.
-std::string function_symbol(u64 hash, u32 code_start, u32 entry);
+// each), with an "r" before the code start for a relocatable program. The code start keeps apart the programs one
+// binary makes at different LS addresses (D-076), the "r" a relocatable lift from a fixed one of the same image.
+std::string function_symbol(u64 hash, u32 code_start, u32 entry, bool relocatable = false);
 
 // Step mode, for the differential fuzz test: one instruction as a function with the same code generation as
 // lift(), except that control transfers store their target in ctx->pc and return (calls don't call), and every
-// other instruction stores pc + 4. The instruction must be supported.
-std::string lift_step_function(std::string_view symbol, u32 insn, u32 pc, u8 xfloat);
+// other instruction stores pc + 4. The instruction must be supported. Relocatable: lifted at pc, it behaves as the
+// instruction at pc + ctx->reloc.
+std::string lift_step_function(std::string_view symbol, u32 insn, u32 pc, u8 xfloat, bool relocatable = false);
 
 // Writes files into dir (created if needed); rewrites a file only when its content changed.
 bool write_files(const std::string& dir, const std::vector<OutputFile>& files, std::string& error);

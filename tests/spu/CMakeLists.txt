@@ -17,7 +17,8 @@ target_link_libraries(spu-fuzz-gen PRIVATE pspocket::recomp_spu)
 pspocket_set_warnings(spu-fuzz-gen)
 
 set(fuzz_dir ${CMAKE_CURRENT_BINARY_DIR}/fuzz)
-set(fuzz_sources ${fuzz_dir}/fuzz_cases.c)
+set(fuzz_sources ${fuzz_dir}/fuzz_cases.c ${fuzz_dir}/fuzz_program.c ${fuzz_dir}/ps_spu_fzp_0.c ${fuzz_dir}/ps_spu_fzp_reg.c
+    ${fuzz_dir}/ps_spu_fzq_0.c ${fuzz_dir}/ps_spu_fzq_reg.c)
 math(EXPR fuzz_last "${PSPOCKET_SPU_FUZZ_TUS} - 1")
 foreach(i RANGE ${fuzz_last})
     list(APPEND fuzz_sources ${fuzz_dir}/fuzz_lifted_${i}.c)

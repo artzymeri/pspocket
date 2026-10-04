@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "pspocket/spu/context.h"
+#include "pspocket/spu/runtime.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,7 +47,8 @@ typedef struct ps_spu_fuzz_case {
     uint8_t xfloat; /* PS_SPU_XFLOAT_* the step function was lifted for */
     uint8_t override_count;
     uint32_t insn;
-    uint32_t pc;
+    uint32_t pc;             /* where it was lifted */
+    uint32_t reloc;          /* relocatable (D-081): runs at pc + reloc with ctx->reloc = reloc; else 0 */
     uint32_t first_override; /* index into ps_spu_fuzz_overrides */
     ps_spu_fuzz_fn fn;
 } ps_spu_fuzz_case;
@@ -55,6 +57,18 @@ extern const ps_spu_fuzz_case ps_spu_fuzz_cases[];
 extern const uint32_t ps_spu_fuzz_case_count;
 extern const ps_spu_fuzz_override ps_spu_fuzz_overrides[];
 extern const uint32_t ps_spu_fuzz_cases_per_op;
+
+/* The program-level case (D-081): a synthetic program (big-endian bytes, lifted at PROGRAM_BASE) lifted whole,
+ * relocatable (ps_spu_fzp) and fixed (ps_spu_fzq); its absolute call goes to a stub (bi $lr) at PROGRAM_STUB. */
+#define PS_SPU_FUZZ_PROGRAM_BASE 0x1000u
+#define PS_SPU_FUZZ_PROGRAM_STUB 0x100u
+extern const uint8_t ps_spu_fuzz_program[];
+extern const uint32_t ps_spu_fuzz_program_size;
+extern const uint32_t ps_spu_fuzz_program_entry;
+extern ps_spu_program ps_spu_fzp_program;
+extern ps_spu_program ps_spu_fzq_program;
+void ps_spu_fzp_register(void);
+void ps_spu_fzq_register(void);
 
 #ifdef __cplusplus
 }

@@ -211,6 +211,15 @@ TEST_CASE("every supported instruction has at least 200 fuzz cases per floating-
     }
     // ... and nothing else: every case belongs to a supported op and model.
     CHECK(counts.size() == expected_keys);
+
+    // A quarter of them run relocated (D-081), away from where they were lifted.
+    std::map<u32, u32> relocated;
+    for (u32 i = 0; i < ps_spu_fuzz_case_count; i++)
+        if (ps_spu_fuzz_cases[i].reloc) relocated[ps_spu_fuzz_cases[i].op]++;
+    for (const Op op : ops) {
+        INFO("op " << op_info(op).mnemonic);
+        CHECK(relocated[static_cast<u32>(op)] >= 40);
+    }
 }
 
 TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
@@ -244,14 +253,16 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
             ps_spu_context_init(&start, ls_a.data(), mem.base());
             random_context(start, rng);
             start.xfloat = c.xfloat;
-            start.pc = c.pc;
+            const u32 pc = (c.pc + c.reloc) & PS_SPU_LS_MASK; // where it runs
+            start.pc = pc;
+            start.reloc = c.reloc;
 
             // interpreter
             if (memory) mem.write_bytes(PS_SPU_FUZZ_GUEST_BASE, guest_init.data(), kGuestCommit);
             SPUContext interp = start;
             apply_overrides(interp, c);
-            const u32 saved_word = ps_ld32(ls_a.data() + c.pc);
-            ps_st32(ls_a.data() + c.pc, c.insn);
+            const u32 saved_word = ps_ld32(ls_a.data() + pc);
+            ps_st32(ls_a.data() + pc, c.insn);
             step(interp);
             if (memory) mem.read_bytes(PS_SPU_FUZZ_GUEST_BASE, after_interp.data(), kGuestCommit);
 
@@ -260,7 +271,7 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
             SPUContext lifted = start;
             lifted.ls = ls_b.data();
             apply_overrides(lifted, c);
-            ps_st32(ls_b.data() + c.pc, c.insn);
+            ps_st32(ls_b.data() + pc, c.insn);
             c.fn(&lifted, ls_b.data());
             executed++;
 
@@ -283,13 +294,13 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
                 std::memcpy(ls_a.data(), ls_init.data(), PS_SPU_LS_SIZE);
                 std::memcpy(ls_b.data(), ls_init.data(), PS_SPU_LS_SIZE);
             } else {
-                ps_st32(ls_a.data() + c.pc, saved_word);
-                ps_st32(ls_b.data() + c.pc, saved_word);
+                ps_st32(ls_a.data() + pc, saved_word);
+                ps_st32(ls_b.data() + pc, saved_word);
             }
             if (!diff.empty() && ++failures <= 25) {
-                UNSCOPED_INFO(std::format("case {} ({}{}) {:08x} '{}' at {:#07x}, seed {:#x} iteration {}:{}", i,
-                    op_info(static_cast<Op>(c.op)).mnemonic, c.xfloat ? ", accurate" : "", c.insn,
-                    disassemble(c.insn, c.pc), c.pc, seed, it, diff));
+                UNSCOPED_INFO(std::format("case {} ({}{}) {:08x} '{}' at {:#07x} (lifted at {:#07x}), seed {:#x} iteration {}:{}",
+                    i, op_info(static_cast<Op>(c.op)).mnemonic, c.xfloat ? ", accurate" : "", c.insn,
+                    disassemble(c.insn, pc), pc, c.pc, seed, it, diff));
                 CHECK(diff.empty());
             }
         }
@@ -297,4 +308,73 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
     INFO(failures << " mismatches in " << executed << " executions");
     CHECK(failures == 0);
     CHECK(executed == u64{ps_spu_fuzz_case_count} * iterations);
+}
+
+TEST_CASE("program-level fuzz: a lifted program agrees with the interpreter wherever it runs (D-081)")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    ps_spu_fzp_register();
+    ps_spu_fzq_register();
+    HookGuard hooks;
+    // Its absolute call leaves the program for the stub: a miss, interpreted (CLAUDE.md rule 5 aborts dev builds).
+    const ps_spu_miss_policy policy = ps_spu_get_miss_policy();
+    ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
+
+    struct Placement {
+        const ps_spu_program* program;
+        u32 reloc;
+    };
+    const Placement placements[] = {
+        {&ps_spu_fzq_program, 0},       // fixed, where it was lifted
+        {&ps_spu_fzp_program, 0},       // relocatable, where it was lifted
+        {&ps_spu_fzp_program, 0x2340},  // higher
+        {&ps_spu_fzp_program, 0x3F800}, // lower (0x800 below)
+        {&ps_spu_fzp_program, 0x1234},  // not quadword aligned: its relative loads read other quadwords
+        {&ps_spu_fzp_program, 0x3EFE0}, // across the end of local store
+    };
+    LocalStore ls_interp, ls_lifted;
+    for (const auto& [program, reloc] : placements) {
+        INFO(std::format("{} at reloc {:#x}", program->name, reloc));
+        const u32 at = (PS_SPU_FUZZ_PROGRAM_BASE + reloc) & PS_SPU_LS_MASK;
+        Rng fill(0x51DE);
+        for (u32 i = 0; i < PS_SPU_LS_SIZE; i += 8) ps_st64(ls_interp.data() + i, fill.next());
+        for (u32 i = 0; i < ps_spu_fuzz_program_size; i++)
+            ls_interp.data()[(at + i) & PS_SPU_LS_MASK] = ps_spu_fuzz_program[i];
+        ps_st32(ls_interp.data() + PS_SPU_FUZZ_PROGRAM_STUB, 0x35000000u); // bi $lr
+        std::memcpy(ls_lifted.data(), ls_interp.data(), PS_SPU_LS_SIZE);
+
+        SPUContext interp{}, lifted{};
+        ps_spu_context_init(&interp, ls_interp.data(), mem.base());
+        ps_spu_context_init(&lifted, ls_lifted.data(), mem.base());
+        interp.pc = lifted.pc = (ps_spu_fuzz_program_entry + reloc) & PS_SPU_LS_MASK;
+        ps_spu_attach_program_at(&lifted, program, at);
+        const u64 misses = ps_spu_miss_count();
+
+        for (const u32 code : {0x10u, 0x11u}) { // runs to the first stop, then resumes after it
+            REQUIRE(ps_spu_interpret(&interp, 0) == PS_SPU_STOP_SIGNAL);
+            REQUIRE(ps_spu_run(&lifted) == PS_SPU_STOP_SIGNAL);
+            CHECK(interp.stop_code == code);
+            CHECK(lifted.stop_code == code);
+            SPUContext compared = lifted;
+            compared.ls = interp.ls;
+            compared.program = interp.program;
+            compared.home = interp.home;
+            compared.reloc = interp.reloc;
+            compared.home_reloc = interp.home_reloc;
+            CHECK(diff_contexts(interp, compared).empty());
+            CHECK(std::memcmp(ls_interp.data(), ls_lifted.data(), PS_SPU_LS_SIZE) == 0);
+        }
+        CHECK(gw(lifted.gpr[4], 0) == 20); // 5 + 4 + 3 + 2 + 1, and func1 five times
+        CHECK(gw(lifted.gpr[9], 0) == 0x77);
+        CHECK(gw(lifted.gpr[8], 0) == 2);
+        CHECK(gw(lifted.gpr[7], 0) == 0); // jumped over
+        // Lifted code ran throughout: the one miss is the stub, outside the program.
+        CHECK(lifted.program == program);
+        CHECK(ps_spu_miss_count() - misses == 1);
+    }
+
+    ps_spu_set_miss_policy(policy);
+    ps_spu_unregister_program(&ps_spu_fzp_program);
+    ps_spu_unregister_program(&ps_spu_fzq_program);
 }

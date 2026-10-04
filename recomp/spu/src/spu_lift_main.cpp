@@ -3,8 +3,10 @@
 //   spu-lift --elf prog.elf --out DIR [options]
 //   spu-lift --image code.bin --base 0x0 --entry 0x0 [--entry ...] --out DIR [options]
 //   options: [--seed ADDR]... [--name NAME] [--tu N] [--xfloat approximate|accurate] [--no-comments]
-//            [--no-constant-entries] [--strict] [--quiet]
+//            [--no-constant-entries] [--relocatable] [--strict] [--quiet]
 //
+// --relocatable lifts position independent code (job binaries, the modules programs load: D-081) to run at any LS
+// address: the base is only where the image is analysed.
 // Prints a summary (functions, instructions, labels, the program key) and every unsupported instruction reached by
 // control flow (left to the interpreter at runtime). --strict turns those into a failing exit code.
 
@@ -30,7 +32,7 @@ void usage()
     std::fprintf(stderr,
         "usage: spu-lift (--elf FILE | --image FILE --base ADDR --entry ADDR [--entry ADDR]...) --out DIR\n"
         "                [--seed ADDR]... [--name NAME] [--tu N] [--xfloat approximate|accurate] [--no-comments]\n"
-        "                [--no-constant-entries] [--strict] [--quiet]\n");
+        "                [--no-constant-entries] [--relocatable] [--strict] [--quiet]\n");
 }
 
 bool read_file(const std::string& path, std::vector<u8>& out)
@@ -106,6 +108,11 @@ int main(int argc, char** argv)
             }
         } else if (arg == "--no-comments") options.comments = false;
         else if (arg == "--no-constant-entries") analyzer.constant_entries = false;
+        else if (arg == "--relocatable") {
+            // Position independent code (D-081): ila/il constants are not its code addresses either.
+            options.relocatable = analyzer.relocatable = true;
+            analyzer.constant_entries = false;
+        }
         else if (arg == "--strict") strict = true;
         else if (arg == "--quiet") quiet = true;
         else if (arg == "--help" || arg == "-h") {
@@ -138,7 +145,7 @@ int main(int argc, char** argv)
             std::fprintf(stderr, "spu-lift: seed 0x%05x is outside the code range\n", s);
             return 2;
         }
-        image->entries.push_back(s);
+        image->seeds.push_back(s);
     }
 
     const Program program = analyze(*image, analyzer);

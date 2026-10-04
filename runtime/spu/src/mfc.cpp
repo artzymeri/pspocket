@@ -102,16 +102,34 @@ int group_mmio(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, eal, "DMA to an invalid SPU thread MMIO offset");
 }
 
-// A GET over the attached lifted program's code (an overlay, or other code loaded where it was) leaves the lifted
-// code stale: the rest of the run interprets (D-076). The lifted program is attached again when SPURS loads it next.
-void drop_overwritten_program(SPUContext* ctx, u32 lsa, u32 size)
+// Whether a GET of size bytes at LS address at writes over program p's code where it runs (reloc past where it was
+// lifted).
+bool overwrites(const ps_spu_program* p, u32 reloc, u32 at, u32 size)
 {
-    const ps_spu_program* p = ctx->program;
+    const u32 start = (p->code_start + reloc) & PS_SPU_LS_MASK;
+    return ((at - start) & PS_SPU_LS_MASK) < p->code_size || ((start - at) & PS_SPU_LS_MASK) < size;
+}
+
+// A GET over lifted code (an overlay, or other code loaded where it was) leaves it stale: the rest of the run
+// interprets it (D-076). Both the current program and the host's (home, D-081) are checked; SPURS attaches its program
+// again when it loads it next.
+void drop_overwritten_programs(SPUContext* ctx, u32 lsa, u32 size)
+{
     const u32 at = lsa & PS_SPU_LS_MASK;
-    if (at >= p->code_start + p->code_size || at + size <= p->code_start) return;
-    PS_LOG_DEBUG("spu", "SPU {}: a DMA writes LS 0x{:05x}+{:#x} over lifted program {}: interpreting it", ctx->id, at,
-        size, p->name);
-    ps_spu_attach_program(ctx, nullptr);
+    const ps_spu_program* dropped = nullptr;
+    if (const ps_spu_program* p = ctx->program; p && overwrites(p, ctx->reloc, at, size)) {
+        PS_LOG_DEBUG("spu", "SPU {}: a DMA writes LS 0x{:05x}+{:#x} over lifted program {}: interpreting it", ctx->id, at,
+            size, p->name);
+        dropped = p;
+        set_current(ctx, nullptr, 0);
+    }
+    if (const ps_spu_program* h = ctx->home; h && overwrites(h, ctx->home_reloc, at, size)) {
+        if (h != dropped)
+            PS_LOG_DEBUG("spu", "SPU {}: a DMA writes LS 0x{:05x}+{:#x} over lifted program {}: interpreting it", ctx->id,
+                at, size, h->name);
+        ctx->home = nullptr;
+        ctx->home_reloc = 0;
+    }
 }
 
 int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
@@ -128,7 +146,7 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     } else {
         ls_copy(ctx->ls, lsa, mem, size, is_get(cmd));
         if (is_get(cmd)) {
-            if (ctx->program) drop_overwritten_program(ctx, lsa, size);
+            if (ctx->program || ctx->home) drop_overwritten_programs(ctx, lsa, size);
             observe_get(ctx, lsa, eal, size); // code a program loads itself (D-079)
         }
     }

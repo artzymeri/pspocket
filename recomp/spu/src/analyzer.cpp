@@ -25,12 +25,35 @@ public:
     {
         std::deque<u32> pending(image_.entries.begin(), image_.entries.end());
         std::map<u32, Function> functions;
-        while (!pending.empty()) {
-            const u32 entry = pending.front();
-            pending.pop_front();
-            if (functions.contains(entry) || !image_.in_code(entry)) continue;
-            Function f = function(entry, pending);
-            functions.emplace(entry, std::move(f));
+        const auto drain = [&] {
+            while (!pending.empty()) {
+                const u32 entry = pending.front();
+                pending.pop_front();
+                if (functions.contains(entry) || !image_.in_code(entry)) continue;
+                Function f = function(entry, pending);
+                functions.emplace(entry, std::move(f));
+            }
+        };
+        drain();
+        // Seeds: a seed inside a function's code is entered through its dispatch switch, as a label. Started as a
+        // function of its own it would copy everything it reaches (one job of GTA V with seeds from its runs: 66 times
+        // its size). Only seeds no function holds yet start functions, in address order.
+        std::vector<u32> seeds = image_.seeds;
+        std::sort(seeds.begin(), seeds.end());
+        for (u32 seed : seeds) {
+            if (!image_.in_code(seed) || functions.contains(seed)) continue;
+            Function* holder = nullptr;
+            for (auto& [entry, f] : functions)
+                if (std::binary_search(f.insns.begin(), f.insns.end(), seed)) {
+                    holder = &f;
+                    break;
+                }
+            if (holder) {
+                holder->labels.insert(seed);
+                continue;
+            }
+            pending.push_back(seed);
+            drain();
         }
         for (auto& [entry, f] : functions) {
             program_.entries.insert(entry);
@@ -128,7 +151,10 @@ private:
             }
 
             if (fl & OPF_BRANCH) {
-                if (inst.info().fmt == Fmt::RI16_BR) {
+                if (inst.info().fmt == Fmt::RI16_BR && (fl & OPF_ABS) && options_.relocatable) {
+                    if (fl & OPF_CALL) f.labels.insert(next); // brasl: returns here through the run loop
+                    else return;                               // bra
+                } else if (inst.info().fmt == Fmt::RI16_BR) {
                     const u32 target = branch_target(inst, a);
                     if (fl & OPF_CALL) {
                         f.calls.insert(target);

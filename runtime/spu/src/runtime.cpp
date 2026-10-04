@@ -54,27 +54,50 @@ void report_miss(const SPUContext* ctx, u32 pc)
 {
     g_miss_count.fetch_add(1, std::memory_order_relaxed);
     const ps_spu_program* p = ctx->program;
+    // The address in the program's own terms (where it was lifted): scripts/lift-spu.sh takes it as a seed.
+    const u32 at = (pc - ctx->reloc) & 0x3FFFFu;
     if (g_miss_policy.load(std::memory_order_relaxed) == PS_SPU_MISS_ABORT)
-        PS_FATAL("spu", "SPU {}: no lifted code at 0x{:05x} in program {} ({:016x})", ctx->id, pc, p->name, p->hash);
-    const u64 key = (p->hash << 18) ^ pc;
+        PS_FATAL("spu", "SPU {}: no lifted code at 0x{:05x} in program {} ({:016x}, LS 0x{:05x})", ctx->id, at, p->name,
+            p->hash, pc);
+    const u64 key = (p->hash << 18) ^ at;
     std::lock_guard lock(g_miss_mutex);
     if (g_logged_misses.insert(key).second)
-        PS_LOG_WARN("spu", "SPU {}: no lifted code at 0x{:05x} in program {} ({:016x}): interpreting", ctx->id, pc,
-            p->name, p->hash);
+        PS_LOG_WARN("spu", "SPU {}: no lifted code at 0x{:05x} in program {} ({:016x}, LS 0x{:05x}): interpreting", ctx->id,
+            at, p->name, p->hash, pc);
 }
 
 } // namespace
 
 namespace pspocket::spu::detail {
 
+bool holds(const ps_spu_program* p, u32 reloc, u32 pc) { return ((pc - reloc - p->code_start) & 0x3FFFFu) < p->code_size; }
+
+u32 reloc_for(const ps_spu_program* p, u32 code_start)
+{
+    return p && p->relocatable ? (code_start - p->code_start) & 0x3FFFFu : 0;
+}
+
+void set_current(SPUContext* ctx, const ps_spu_program* p, u32 reloc)
+{
+    ctx->program = p;
+    ctx->reloc = reloc;
+    if (p) ctx->xfloat = p->xfloat;
+}
+
 bool resolve_program(SPUContext* ctx, u32 pc)
 {
+    if (const ps_spu_program* p = ctx->program; p && holds(p, ctx->reloc, pc)) return false; // its own code
+    // Back in the code of the program the host attached, from a module's.
+    if (const ps_spu_program* h = ctx->home; h && holds(h, ctx->home_reloc, pc)) {
+        set_current(ctx, h, ctx->home_reloc);
+        return ps_spu_lookup(ctx, pc) != nullptr;
+    }
     const ps_spu_resolver resolver = g_resolver.load(std::memory_order_relaxed);
     if (!resolver) return false;
-    if (const ps_spu_program* p = ctx->program; p && pc - p->code_start < p->code_size) return false; // its own code
-    const ps_spu_program* other = resolver(ctx, pc);
-    if (!other || other == ctx->program) return false;
-    ps_spu_attach_program(ctx, other);
+    u32 code_start = 0;
+    const ps_spu_program* other = resolver(ctx, pc, &code_start);
+    if (!other) return false;
+    set_current(ctx, other, reloc_for(other, code_start));
     return ps_spu_lookup(ctx, pc) != nullptr;
 }
 
@@ -166,7 +189,7 @@ const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, ui
 {
     std::lock_guard lock(g_registry_mutex);
     for (const ps_spu_program* p : g_programs)
-        if (p->hash == hash && p->code_start == code_start && p->code_size == code_size) return p;
+        if (p->hash == hash && p->code_size == code_size && (p->relocatable || p->code_start == code_start)) return p;
     return nullptr;
 }
 
@@ -188,8 +211,15 @@ const ps_spu_program* ps_spu_identify(SPUContext* ctx, uint32_t code_start, uint
 
 void ps_spu_attach_program(SPUContext* ctx, const ps_spu_program* program)
 {
-    ctx->program = program;
-    if (program) ctx->xfloat = program->xfloat;
+    ps_spu_attach_program_at(ctx, program, program ? program->code_start : 0);
+}
+
+void ps_spu_attach_program_at(SPUContext* ctx, const ps_spu_program* program, uint32_t code_start)
+{
+    const u32 reloc = detail::reloc_for(program, code_start);
+    detail::set_current(ctx, program, reloc);
+    ctx->home = program;
+    ctx->home_reloc = reloc;
 }
 
 void ps_spu_set_miss_policy(ps_spu_miss_policy policy) { g_miss_policy.store(policy); }
@@ -215,7 +245,7 @@ uint32_t ps_spu_run(SPUContext* ctx)
             if (detail::resolve_program(ctx, ctx->pc)) continue; // another program has lifted code here (D-079)
             if (ctx->program) report_miss(ctx, ctx->pc);
             RunOptions options;
-            options.stop_at_lifted = ctx->program != nullptr || g_resolver.load(std::memory_order_relaxed);
+            options.stop_at_lifted = ctx->program || ctx->home || g_resolver.load(std::memory_order_relaxed);
             run(*ctx, options);
         }
         if (ctx->stop_reason != PS_SPU_STOP_NONE) break;

@@ -66,9 +66,15 @@ inline u32 mfc_completed(const SPUContext* ctx) { return ctx->ch.tag_mask & ~ctx
 
 // Takes a pending interrupt (interrupts enabled and an enabled event pending): SRR0 = pc, pc = handler.
 void check_interrupt(SPUContext* ctx);
-// The resolver (ps_spu_set_resolver) for pc outside the attached program's range: attaches and returns true when another
-// program has lifted code there.
+// For pc outside the current program's code: makes the home program (back from a module) or the one the resolver
+// (ps_spu_set_resolver) names current, and returns true when it has lifted code at pc (runtime.cpp).
 bool resolve_program(SPUContext* ctx, u32 pc);
+// Whether program p, running reloc bytes past where it was lifted, holds pc.
+bool holds(const ps_spu_program* p, u32 reloc, u32 pc);
+// The reloc of program p with its code at code_start (0 unless relocatable).
+u32 reloc_for(const ps_spu_program* p, u32 code_start);
+// Makes p (at reloc) the current program; home stays.
+void set_current(SPUContext* ctx, const ps_spu_program* p, u32 reloc);
 // The GET observer (ps_spu_set_get_observer).
 void observe_get(SPUContext* ctx, u32 lsa, u32 eal, u32 size);
 

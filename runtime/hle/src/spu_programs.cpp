@@ -12,6 +12,7 @@
 #include <fstream>
 #include <mutex>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -34,10 +35,15 @@ const char* kind_name(ImageKind k)
     return "?";
 }
 
+// Job binaries and the modules programs load are position independent: their lifted programs run at any LS address
+// (D-081), so they are known by hash alone.
+bool relocatable(ImageKind k) { return k == ImageKind::Job || k == ImageKind::Module; }
+
 struct Registry {
     std::mutex mutex;
     std::string dump_dir;
-    std::unordered_set<u64> seen; // images without a lifted program, by key (hash ^ LS address)
+    std::unordered_set<u64> seen;           // images without a lifted program: hash ^ LS address, or hash (relocatable)
+    std::unordered_map<u64, u32> dump_base; // relocatable images saved by this run: hash -> the LS address they name
 };
 
 Registry& registry()
@@ -72,19 +78,23 @@ void dump(const std::string& dir, u8* base, const SpuImage& image, u64 hash)
         image.ls_start, image.size, image.entry);
 }
 
-// Another entry of a module: a seed for its next lift (scripts/lift-spu.sh reads "seed" lines). Once per thread and
-// address, then appended under the registry's lock.
+// Another entry of a module (at pc, its code at ls_start): a seed for its next lift (scripts/lift-spu.sh reads "seed"
+// lines), where the saved image has it. Once per thread and offset, then appended under the registry's lock.
 thread_local std::unordered_set<u64> t_seeds;
 
 void dump_seed(u64 hash, u32 ls_start, u32 pc)
 {
-    if (!g_dumping.load(std::memory_order_relaxed) || !t_seeds.insert(((hash ^ ls_start) << 18) ^ pc).second) return;
+    const u32 offset = (pc - ls_start) & PS_SPU_LS_MASK;
+    if (!g_dumping.load(std::memory_order_relaxed) || !t_seeds.insert((hash << 18) ^ offset).second) return;
     Registry& r = registry();
     std::lock_guard lock(r.mutex);
-    if (r.dump_dir.empty()) return;
-    std::ofstream meta(std::filesystem::path(r.dump_dir) / (image_name(hash, ls_start) + ".txt"), std::ios::app);
-    meta << std::format("seed {:#x}\n", pc);
+    const auto it = r.dump_base.find(hash);
+    if (r.dump_dir.empty() || it == r.dump_base.end()) return;
+    std::ofstream meta(std::filesystem::path(r.dump_dir) / (image_name(hash, it->second) + ".txt"), std::ios::app);
+    meta << std::format("seed {:#x}\n", (it->second + offset) & PS_SPU_LS_MASK);
 }
+
+const ps_spu_program* identify_hashed(u64 hash, u8* base, const SpuImage& image);
 
 // ---- modules (D-079)
 //
@@ -157,7 +167,8 @@ void observe_get(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size)
     for (u32 b = lsa >> kBlockShift; b <= (end - 1) >> kBlockShift; b++) m.block_run[b] = static_cast<u8>(index + 1);
 }
 
-const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc)
+// The resolver: the lifted program of the module holding pc, and where it sits (its lifted programs are relocatable).
+const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start)
 {
     Modules& m = modules_for(ctx);
     pc &= PS_SPU_LS_MASK & ~3u;
@@ -175,20 +186,19 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc)
             return nullptr;
         }
         r.hash = ps_spu_hash64(base + r.ea_start, size);
-        r.program = identify_program(base, {ImageKind::Module, r.ea_start, r.ls_start, size, pc});
+        r.program = identify_hashed(r.hash, base, {ImageKind::Module, r.ea_start, r.ls_start, size, pc});
         if (r.program) g_modules.fetch_add(1, std::memory_order_relaxed);
     }
-    if (const ps_spu_program* p = r.program; p && pc - p->code_start < p->code_size && p->table[(pc - p->code_start) >> 2])
-        return p;
+    if (r.program) {
+        *code_start = r.ls_start;
+        return r.program;
+    }
     if (r.hash) dump_seed(r.hash, r.ls_start, pc);
     return nullptr;
 }
 
-} // namespace
-
-const ps_spu_program* identify_program(u8* base, const SpuImage& image)
+const ps_spu_program* identify_hashed(u64 hash, u8* base, const SpuImage& image)
 {
-    const u64 hash = ps_spu_hash64(base + image.guest, image.size);
     const ps_spu_program* program = ps_spu_find_program(hash, image.ls_start, image.size);
     if (program) {
         g_attached.fetch_add(1, std::memory_order_relaxed);
@@ -197,19 +207,31 @@ const ps_spu_program* identify_program(u8* base, const SpuImage& image)
     g_unknown.fetch_add(1, std::memory_order_relaxed);
     Registry& r = registry();
     std::lock_guard lock(r.mutex);
-    if (!r.seen.insert(hash ^ image.ls_start).second) return nullptr;
+    const bool anywhere = relocatable(image.kind);
+    if (!r.seen.insert(anywhere ? hash : hash ^ image.ls_start).second) return nullptr;
     g_images.fetch_add(1, std::memory_order_relaxed);
     // CLAUDE.md rule 5 asks dev builds to abort on an unknown SPU hash. Until the game's programs are collected
     // (D-076), every build logs it once and interprets.
     PS_LOG_INFO(kChan, "SPU {} {} (guest {:#x}, LS 0x{:05x}+{:#x}, entry 0x{:05x}) has no lifted program: interpreted",
         kind_name(image.kind), image_name(hash, image.ls_start), image.guest, image.ls_start, image.size, image.entry);
-    if (!r.dump_dir.empty()) dump(r.dump_dir, base, image, hash);
+    if (!r.dump_dir.empty()) {
+        dump(r.dump_dir, base, image, hash);
+        // A relocatable image is saved once, where it was first seen: its seeds are kept in those terms.
+        if (anywhere) r.dump_base.emplace(hash, image.ls_start);
+    }
     return nullptr;
+}
+
+} // namespace
+
+const ps_spu_program* identify_program(u8* base, const SpuImage& image)
+{
+    return identify_hashed(ps_spu_hash64(base + image.guest, image.size), base, image);
 }
 
 void attach_program(SPUContext& ctx, u8* base, const SpuImage& image)
 {
-    ps_spu_attach_program(&ctx, identify_program(base, image));
+    ps_spu_attach_program_at(&ctx, identify_program(base, image), image.ls_start);
 }
 
 } // namespace pspocket::hle::spurs

@@ -41,6 +41,9 @@ typedef struct ps_spu_program {
     uint32_t code_start; /* LS range the program was lifted from */
     uint32_t code_size;
     uint8_t xfloat;      /* single-precision model the code was lifted for (PS_SPU_XFLOAT_*) */
+    /* Position independent (D-081): the code computes every address it derives from its own from ctx->reloc, so it
+     * runs at any LS address; found by hash and size only. Job binaries and the modules programs load are. */
+    uint8_t relocatable;
     uint32_t entry_count;
     const ps_spu_entry* entries; /* ascending addr */
     ps_spu_fn* table;    /* dense lookup over the code range, built by ps_spu_register_program */
@@ -53,21 +56,28 @@ uint64_t ps_spu_hash64(const uint8_t* data, size_t size);
 /* Registration happens at startup, before SPU threads run. The program must stay alive. */
 void ps_spu_register_program(ps_spu_program* program);
 void ps_spu_unregister_program(ps_spu_program* program);
+/* The registered program with this key: hash, code start and size; a relocatable program matches any code start. */
 const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, uint32_t code_size);
 
 /* Selects the lifted program for the LS image now in ctx->ls: hashes [code_start, code_start + size) and attaches
  * the registered program with that key. Returns it, or NULL (logs the hash: CLAUDE.md rule 5; the interpreter
  * runs the program). */
 const ps_spu_program* ps_spu_identify(SPUContext* ctx, uint32_t code_start, uint32_t code_size);
-/* Attaches a program directly (also sets ctx->xfloat to its model). NULL detaches. */
+/* Attaches a program directly (also sets ctx->xfloat to its model) as the context's home and current program. NULL
+ * detaches. */
 void ps_spu_attach_program(SPUContext* ctx, const ps_spu_program* program);
+/* Attaches a program whose code sits at LS address code_start: a relocatable one anywhere, another only where it
+ * was lifted. NULL detaches. */
+void ps_spu_attach_program_at(SPUContext* ctx, const ps_spu_program* program, uint32_t code_start);
 
-/* Code a program loads itself (D-079). The host may name another lifted program for an address the attached one
- * has no lifted code for: a module the program copied into local store. The run loop asks on a miss, the interpreter
- * on a taken branch out of the attached program's range; the resolver returns a program with lifted code at pc, or
- * NULL. Called on the SPU's thread. The observer sees every GET into local store as it completes (lsa, effective
- * address, size), on the SPU's thread. Set both before SPU threads run; NULL clears. */
-typedef const ps_spu_program* (*ps_spu_resolver)(SPUContext* ctx, uint32_t pc);
+/* Code a program loads itself (D-079). The host may name another lifted program for an address the current one has
+ * no code at: a module the program copied into local store. The run loop asks on a miss, the interpreter on a taken
+ * branch out of the current program's code; the resolver returns the program lifted from the code at pc (it may still
+ * lack an entry there: a miss to report) and where that code sits (*code_start: a relocatable program runs there), or
+ * NULL. The run loop makes it current; when execution comes back to the home program's code, home is current again.
+ * Called on the SPU's thread. The observer sees every GET into local store as it completes (lsa, effective address,
+ * size), on the SPU's thread. Set both before SPU threads run; NULL clears. */
+typedef const ps_spu_program* (*ps_spu_resolver)(SPUContext* ctx, uint32_t pc, uint32_t* code_start);
 void ps_spu_set_resolver(ps_spu_resolver resolver);
 typedef void (*ps_spu_get_observer)(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size);
 void ps_spu_set_get_observer(ps_spu_get_observer observer);
@@ -76,7 +86,7 @@ static inline ps_spu_fn ps_spu_lookup(const SPUContext* ctx, uint32_t pc)
 {
     const ps_spu_program* p = ctx->program;
     if (!p) return NULL;
-    const uint32_t off = pc - p->code_start;
+    const uint32_t off = (pc - ctx->reloc - p->code_start) & 0x3FFFFu;
     return off < p->code_size ? p->table[off >> 2] : NULL;
 }
 

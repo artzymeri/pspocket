@@ -20,6 +20,9 @@ struct LsImage {
     u32 code_start = 0;
     u32 code_end = 0; // exclusive
     std::vector<u32> entries;
+    // Addresses execution entered from outside lifted code (spu-lift --seed: misses of earlier runs, module entries).
+    // One inside a function the entries reach becomes a label of it; only the others start functions (analyzer.hpp).
+    std::vector<u32> seeds;
     std::string name;
 
     u32 code_size() const { return code_end - code_start; }

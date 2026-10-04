@@ -73,7 +73,7 @@ void run_custom(Worker& w, u32 wid, u32 poll_status)
 
     for (;;) {
         const u32 reason = ps_spu_run(&c);
-        if (!c.program) w.custom_program = nullptr; // a DMA over the module's code dropped it: interpreted from now on
+        if (!c.home) w.custom_program = nullptr; // a DMA over the module's code dropped it: interpreted from now on
         if (reason == PS_SPU_STOP_REQUESTED) return;
         if (reason == PS_SPU_STOP_SIGNAL && c.stop_code == kKernelExitStop) return; // 0x804 or [0x1E0]
         if (reason == PS_SPU_STOP_SIGNAL && c.stop_code == kKernelSelectStop) {

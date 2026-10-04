@@ -279,6 +279,14 @@ typedef struct SPUContext {
     /* Handlers for this context only, consulted before the process-wide ones (runtime.h): an owner other than lv2's
      * SPU threads (the native SPURS workers) handles its own stop codes and interrupt-mailbox writes. NULL: none. */
     const struct ps_spu_hooks* hooks;
+    /* Where the attached program runs: its code_start + reloc (LS addresses, wrapping at 256 KB). Non-zero only for a
+     * relocatable program (runtime.h) loaded away from where it was lifted (D-081). */
+    uint32_t reloc;
+    /* The program the host attached and its reloc. program and reloc follow execution into the modules a program
+     * loads itself (D-079); the run loop comes back to home when execution returns to its code. A DMA over the code
+     * of either drops it. */
+    const struct ps_spu_program* home;
+    uint32_t home_reloc;
 } SPUContext;
 
 /* Layout is part of the ABI between the runtime and generated code. */

@@ -5,7 +5,9 @@
 // For each supported op it draws K random valid encodings (K per floating-point model for the ops whose result
 // depends on it), lifts each into a step function with the real lifter (lift_step_function: the same code
 // generation as spu-lift) and records overrides that steer operands to their edges (shift counts, conditions, DMA
-// parameters in the guest window, reservations). Output: DIR/fuzz_lifted_<i>.c and DIR/fuzz_cases.c. The generator
+// parameters in the guest window, reservations). Every fourth case is lifted relocatable (D-081) and runs at another
+// address of the code window. A small synthetic program is also lifted whole (lift(), relocatable and fixed) for the
+// program-level test: DIR/ps_spu_fzp*.c, DIR/ps_spu_fzq*.c and its image in DIR/fuzz_program.c. Output: DIR/fuzz_lifted_<i>.c and DIR/fuzz_cases.c. The generator
 // seed is fixed, so the output is stable.
 
 #include <bit>
@@ -15,7 +17,9 @@
 #include <vector>
 
 #include "fuzz_case.h"
+#include "pspocket/recomp/spu/analyzer.hpp"
 #include "pspocket/recomp/spu/asm.hpp"
+#include "pspocket/recomp/spu/image.hpp"
 #include "pspocket/recomp/spu/lifter.hpp"
 #include "pspocket/spu/decoder.hpp"
 #include "pspocket/spu/interpreter.hpp"
@@ -32,7 +36,8 @@ struct GenCase {
     Op op;
     u8 xfloat;
     u32 insn;
-    u32 pc;
+    u32 pc;    // where it is lifted
+    u32 reloc; // relocatable cases (D-081) run reloc bytes past pc; 0 for the others
     std::vector<ps_spu_fuzz_override> overrides;
 };
 
@@ -56,12 +61,16 @@ class Generator {
 public:
     explicit Generator(u64 seed) : rng_(seed) {}
 
-    GenCase make(Op op, u8 xfloat)
+    GenCase make(Op op, u8 xfloat, bool relocated)
     {
-        GenCase c{op, xfloat, 0, 0, {}};
+        GenCase c{op, xfloat, 0, 0, 0, {}};
         ov_ = &c.overrides;
         const OpInfo& info = op_info(op);
         c.pc = PS_SPU_FUZZ_CODE_BASE + rng_.below(PS_SPU_FUZZ_CODE_SIZE / 4) * 4;
+        if (relocated) { // runs elsewhere in the code window, before or after where it was lifted
+            const u32 run_at = PS_SPU_FUZZ_CODE_BASE + rng_.below(PS_SPU_FUZZ_CODE_SIZE / 4) * 4;
+            c.reloc = (run_at - c.pc) & PS_SPU_LS_MASK;
+        }
 
         as::Fields f;
         f.rt = reg();
@@ -273,6 +282,82 @@ private:
     std::vector<ps_spu_fuzz_override>* ov_ = nullptr;
 };
 
+// ---- the program-level case (D-081)
+//
+// Direct calls, a loop, a call through an address computed from a link (position-independent code takes its own
+// address that way), relative loads and stores, a stop the run loop resumes after, an absolute call out of the
+// program (to a stub test_spu_fuzz puts at PS_SPU_FUZZ_PROGRAM_STUB) and a jump through a register, so lifted code
+// runs through every address it derives from its own: pcs, links, the dispatch switch, call returns.
+struct SyntheticProgram {
+    std::vector<u8> bytes; // at PS_SPU_FUZZ_PROGRAM_BASE
+    u32 entry = 0;
+    std::vector<u32> seeds; // reached only through registers: entries of the next lift, as spu-lift --seed
+};
+
+SyntheticProgram synthetic_program()
+{
+    as::Assembler m(PS_SPU_FUZZ_PROGRAM_BASE);
+    const auto data = m.here();
+    for (u32 i = 0; i < 4; i++) m.word(0x11111111u * (i + 1));
+    const auto data2 = m.here();
+    for (u32 i = 0; i < 4; i++) m.word(0);
+    const auto func1 = m.here(); // r4 += 1
+    m.emit(as::ai(4, 4, 1));
+    m.emit(as::ret());
+    const auto get_pc = m.here(); // returns its caller's return address in $lr: the caller's own position
+    m.emit(as::ret());
+    const u32 func2 = m.pc(); // called through a register only
+    m.emit(as::il(9, 0x77));
+    m.emit(as::ret());
+
+    const u32 entry = m.pc();
+    m.emit(as::il(3, 5));
+    m.emit(as::il(4, 0));
+    const auto loop = m.here();
+    m.emit(as::a(4, 4, 3));
+    m.brsl(0, func1);
+    m.emit(as::ai(3, 3, -1));
+    m.brnz(3, loop);
+    m.brsl(0, get_pc);
+    const u32 link1 = m.pc();
+    m.emit(as::ai(11, 0, static_cast<s32>(func2 - link1)));
+    m.emit(as::bisl(0, 11));
+    m.lqr(5, data);
+    m.stqr(4, data2);
+    m.emit(as::stop(0x10));
+    m.emit(as::a(6, 4, 5));
+    m.emit(as::brasl(0, PS_SPU_FUZZ_PROGRAM_STUB));
+    const u32 link2 = m.pc();
+    const u32 target = link2 + 12; // past the next two instructions
+    m.emit(as::ai(12, 0, static_cast<s32>(target - link2)));
+    m.emit(as::bi(12));
+    m.emit(as::il(7, 1)); // jumped over
+    if (m.pc() != target) {
+        std::fprintf(stderr, "spu-fuzz-gen: synthetic program layout\n");
+        std::exit(1);
+    }
+    m.emit(as::il(8, 2));
+    m.emit(as::stop(0x11));
+    return {m.finish(), entry, {func2, target}};
+}
+
+bool lift_program(const SyntheticProgram& sp, const std::string& name, bool relocatable, const std::string& out)
+{
+    auto image = recomp::spu::load_raw_image(sp.bytes, PS_SPU_FUZZ_PROGRAM_BASE, {sp.entry}, name);
+    if (!image) return false;
+    image->seeds = sp.seeds;
+    recomp::spu::AnalyzerOptions analyzer;
+    analyzer.relocatable = relocatable;
+    analyzer.constant_entries = !relocatable;
+    const recomp::spu::Program program = recomp::spu::analyze(*image, analyzer);
+    if (!program.unsupported.empty()) return false;
+    recomp::spu::LiftOptions options;
+    options.name = name;
+    options.relocatable = relocatable;
+    std::string error;
+    return recomp::spu::write_files(out, recomp::spu::lift(*image, program, options).files, error);
+}
+
 bool write_text(const std::string& path, const std::string& content)
 {
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -312,7 +397,7 @@ int main(int argc, char** argv)
     for (const Op op : supported_ops()) {
         const bool both_models = op_info(op).flags & OPF_XFLOAT;
         for (u8 model = 0; model < (both_models ? 2 : 1); model++)
-            for (u32 i = 0; i < per_op; i++) cases.push_back(gen.make(op, model));
+            for (u32 i = 0; i < per_op; i++) cases.push_back(gen.make(op, model, i % 4 == 3));
     }
 
     std::vector<std::string> units(tus, "/* Generated by spu-fuzz-gen (tests/spu). Do not edit. */\n#include \"pspocket/spu/lifted.h\"\n\n");
@@ -322,12 +407,12 @@ int main(int argc, char** argv)
     for (usize i = 0; i < cases.size(); i++) {
         const GenCase& c = cases[i];
         const std::string name = std::format("ps_spu_fz_{:06}", i);
-        units[i % tus] += recomp::spu::lift_step_function(name, c.insn, c.pc, c.xfloat) + "\n";
+        units[i % tus] += recomp::spu::lift_step_function(name, c.insn, c.pc, c.xfloat, c.reloc != 0) + "\n";
         protos += std::format("void {}(SPUContext* ctx, uint8_t* ls);\n", name);
         for (const auto& o : c.overrides)
             overrides += std::format("    {{{}, {}, {{0}}, 0x{:x}ull, 0x{:x}ull}},\n", o.kind, o.index, o.value, o.value2);
-        rows += std::format("    {{{}, {}, {}, 0x{:08x}u, 0x{:05x}u, {}u, {}}},\n", static_cast<u32>(c.op), c.xfloat,
-            c.overrides.size(), c.insn, c.pc, override_index, name);
+        rows += std::format("    {{{}, {}, {}, 0x{:08x}u, 0x{:05x}u, 0x{:05x}u, {}u, {}}},\n", static_cast<u32>(c.op), c.xfloat,
+            c.overrides.size(), c.insn, c.pc, c.reloc, override_index, name);
         override_index += static_cast<u32>(c.overrides.size());
     }
     table += protos;
@@ -345,6 +430,24 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "spu-fuzz-gen: cannot write to %s\n", out.c_str());
         return 1;
     }
+
+    const SyntheticProgram sp = synthetic_program();
+    if (!lift_program(sp, "ps_spu_fzp", true, out) || !lift_program(sp, "ps_spu_fzq", false, out)) {
+        std::fprintf(stderr, "spu-fuzz-gen: cannot lift the synthetic program into %s\n", out.c_str());
+        return 1;
+    }
+    std::string bytes;
+    for (usize i = 0; i < sp.bytes.size(); i++) bytes += std::format("{}0x{:02x},", i % 16 ? " " : "\n    ", sp.bytes[i]);
+    const std::string program = std::format(
+        "/* Generated by spu-fuzz-gen (tests/spu). Do not edit. */\n#include \"fuzz_case.h\"\n\n"
+        "const uint8_t ps_spu_fuzz_program[] = {{{}\n}};\nconst uint32_t ps_spu_fuzz_program_size = {}u;\n"
+        "const uint32_t ps_spu_fuzz_program_entry = 0x{:05x}u;\n",
+        bytes, sp.bytes.size(), sp.entry);
+    if (!write_text(out + "/fuzz_program.c", program)) {
+        std::fprintf(stderr, "spu-fuzz-gen: cannot write to %s\n", out.c_str());
+        return 1;
+    }
+
     std::printf("spu-fuzz-gen: %zu ops, %zu cases (%u per op and floating-point model) in %u units\n", supported_ops().size(),
         cases.size(), per_op, tus);
     return 0;

@@ -25,8 +25,13 @@ std::string hex32(u32 v) { return std::format("0x{:X}u", v); }
 
 // How control leaves an instruction. Full mode jumps to labels of the current function and calls lifted functions;
 // step mode (fuzz) always stores the target in ctx->pc and returns.
+//
+// Relocatable code (D-081) runs ctx->reloc bytes past where it was lifted: every LS address it derives from its own
+// (the pc it stores, links, relative branch and load targets, the pc it passes to the runtime) adds the local rel,
+// and absolute targets (bra, brasl) are the same wherever it sits, so they leave to the run loop.
 class Flow {
 public:
+    explicit Flow(bool relocatable) : relocatable_(relocatable) {}
     virtual ~Flow() = default;
     // A constant target; backward = loop back edge (polls ctx->attention).
     virtual std::string jump(u32 target, u32 from) const = 0;
@@ -36,7 +41,34 @@ public:
     virtual std::string call(u32 target, u32 ret) const = 0;
     // Indirect call, ctx->pc already set to the target.
     virtual std::string call_dynamic(u32 ret) const = 0;
+
+    // bra and brasl.
+    std::string jump_absolute(u32 target, u32 from) const { return relocatable_ ? leave_absolute(target) : jump(target, from); }
+    std::string call_absolute(u32 target, u32 ret) const { return relocatable_ ? leave_absolute(target) : call(target, ret); }
+
+    // An LS address the code derives from its own address (a pc, a link): as is, or relocated.
+    std::string pc(u32 addr) const
+    {
+        return relocatable_ ? std::format("((0x{:05X}u + rel) & 0x3FFFCu)", addr) : std::format("0x{:05X}u", addr);
+    }
+    // The address of a relative load or store (psl_lq and psl_stq align it).
+    std::string ls_addr(u32 addr) const
+    {
+        return relocatable_ ? std::format("0x{:05X}u + rel", addr & PS_SPU_LS_MASK) : std::format("0x{:05X}u", addr & 0x3FFF0u);
+    }
+    bool relocatable() const { return relocatable_; }
+
+protected:
+    std::string leave(u32 target) const { return std::format("    ctx->pc = {};\n    goto exit_spill;\n", pc(target)); }
+
+private:
+    static std::string leave_absolute(u32 target) { return std::format("    ctx->pc = 0x{:05X}u;\n    goto exit_spill;\n", target); }
+
+    bool relocatable_;
 };
+
+// The unaligned target of lqr/stqr at a (ls_target aligns it; a relocated address is aligned after adding rel).
+u32 relative_ls_target(const Inst& inst, u32 a) { return (a + (inst.i16() << 2)) & PS_SPU_LS_MASK; }
 
 // Lowers one instruction at address a. Returns true when the instruction can fall through to a + 4.
 bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat, bool spill_around_stop)
@@ -78,20 +110,20 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     case Op::STOPD: {
         const u32 code = inst.op == Op::STOP ? inst.stop_signal() : 0x3FFF;
         if (spill_around_stop) {
-            o += std::format("    PSL_SPILL();\n    if (ps_spu_stop(ctx, 0x{:05X}u, 0x{:X}u)) goto exit_now;\n    PSL_RELOAD();\n", a, code);
+            o += std::format("    PSL_SPILL();\n    if (ps_spu_stop(ctx, {}, 0x{:X}u)) goto exit_now;\n    PSL_RELOAD();\n", flow.pc(a), code);
         } else {
-            o += std::format("    if (ps_spu_stop(ctx, 0x{:05X}u, 0x{:X}u)) goto exit_spill;\n", a, code);
+            o += std::format("    if (ps_spu_stop(ctx, {}, 0x{:X}u)) goto exit_spill;\n", flow.pc(a), code);
         }
         return true;
     }
     case Op::MFSPR: set("psl_splat32(0u)"); return true;
     case Op::RDCH:
     case Op::RCHCNT:
-        o += std::format("    {{\n        uint32_t v;\n        if ({}(ctx, 0x{:05X}u, {}u, &v)) goto exit_spill;\n        {} = psl_pref(v);\n    }}\n",
-            inst.op == Op::RDCH ? "ps_spu_rdch" : "ps_spu_rchcnt", a, inst.channel(), R(rt));
+        o += std::format("    {{\n        uint32_t v;\n        if ({}(ctx, {}, {}u, &v)) goto exit_spill;\n        {} = psl_pref(v);\n    }}\n",
+            inst.op == Op::RDCH ? "ps_spu_rdch" : "ps_spu_rchcnt", flow.pc(a), inst.channel(), R(rt));
         return true;
     case Op::WRCH:
-        o += std::format("    if (ps_spu_wrch(ctx, 0x{:05X}u, {}u, {})) goto exit_spill;\n", a, inst.channel(), P(rt));
+        o += std::format("    if (ps_spu_wrch(ctx, {}, {}u, {})) goto exit_spill;\n", flow.pc(a), inst.channel(), P(rt));
         return true;
 
     // ---- halts ----
@@ -110,23 +142,23 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
         case Op::HGTI: cond = std::format("(int32_t){} > {}", P(ra), inst.si10()); break;
         default: cond = std::format("{} > {}", P(ra), hex32(si10)); break;
         }
-        o += std::format("    if ({}) {{\n        ps_spu_halt(ctx, 0x{:05X}u);\n        goto exit_spill;\n    }}\n", cond, a);
+        o += std::format("    if ({}) {{\n        ps_spu_halt(ctx, {});\n        goto exit_spill;\n    }}\n", cond, flow.pc(a));
         return true;
     }
 
     // ---- loads and stores ----
     case Op::LQD: set(std::format("psl_lq(ls, {} + {})", P(ra), hex32(si10 * 16))); return true;
     case Op::LQX: set(std::format("psl_lq(ls, {} + {})", P(ra), P(rb))); return true;
-    case Op::LQA:
-    case Op::LQR: set(std::format("psl_lq(ls, 0x{:05X}u)", ls_target(inst, a))); return true;
+    case Op::LQA: set(std::format("psl_lq(ls, 0x{:05X}u)", ls_target(inst, a))); return true;
+    case Op::LQR: set(std::format("psl_lq(ls, {})", flow.ls_addr(relative_ls_target(inst, a)))); return true;
     case Op::STQD: o += std::format("    psl_stq(ls, {} + {}, {});\n", P(ra), hex32(si10 * 16), R(rt)); return true;
     case Op::STQX: o += std::format("    psl_stq(ls, {} + {}, {});\n", P(ra), P(rb), R(rt)); return true;
-    case Op::STQA:
-    case Op::STQR: o += std::format("    psl_stq(ls, 0x{:05X}u, {});\n", ls_target(inst, a), R(rt)); return true;
+    case Op::STQA: o += std::format("    psl_stq(ls, 0x{:05X}u, {});\n", ls_target(inst, a), R(rt)); return true;
+    case Op::STQR: o += std::format("    psl_stq(ls, {}, {});\n", flow.ls_addr(relative_ls_target(inst, a)), R(rt)); return true;
 
     // ---- branches ----
-    case Op::BR:
-    case Op::BRA: o += flow.jump(branch_target(inst, a), a); return false;
+    case Op::BR: o += flow.jump(branch_target(inst, a), a); return false;
+    case Op::BRA: o += flow.jump_absolute(branch_target(inst, a), a); return false;
     case Op::BRZ:
     case Op::BRNZ:
     case Op::BRHZ:
@@ -141,9 +173,12 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
         return true;
     }
     case Op::BRSL:
-    case Op::BRASL:
-        set(std::format("psl_pref(0x{:05X}u)", ret));
+        set(std::format("psl_pref({})", flow.pc(ret)));
         o += flow.call(branch_target(inst, a), ret);
+        return false;
+    case Op::BRASL:
+        set(std::format("psl_pref({})", flow.pc(ret)));
+        o += flow.call_absolute(branch_target(inst, a), ret);
         return false;
     case Op::BI:
         o += std::format("    ctx->pc = {} & 0x3FFFCu;\n", P(ra));
@@ -157,13 +192,13 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
         return false;
     case Op::BISL:
         o += std::format("    ctx->pc = {} & 0x3FFFCu;\n", P(ra)); // target read before the link is written
-        set(std::format("psl_pref(0x{:05X}u)", ret));
+        set(std::format("psl_pref({})", flow.pc(ret)));
         o += interrupts();
         o += flow.call_dynamic(ret);
         return false;
     case Op::BISLED:
         o += std::format("    {{\n        const uint32_t target = {} & 0x3FFFCu;\n", P(ra));
-        o += std::format("        {} = psl_pref(0x{:05X}u);\n", R(rt), ret);
+        o += std::format("        {} = psl_pref({});\n", R(rt), flow.pc(ret));
         o += "        if (ps_spu_events_pending(ctx)) {\n            ctx->pc = target;\n";
         o += interrupts();
         o += flow.jump_dynamic();
@@ -374,7 +409,7 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     case Op::COUNT: break;
     }
     // Not supported: raise the exception the interpreter would raise.
-    o += std::format("    ps_spu_illegal(ctx, 0x{:05X}u, 0x{:08X}u);\n    goto exit_spill;\n", a, inst.raw);
+    o += std::format("    ps_spu_illegal(ctx, {}, 0x{:08X}u);\n    goto exit_spill;\n", flow.pc(a), inst.raw);
     return false;
 }
 
@@ -405,9 +440,10 @@ std::string reg_decls(const RegSet& used)
 
 class StepFlow final : public Flow {
 public:
-    std::string jump(u32 target, u32) const override { return std::format("    ctx->pc = 0x{:05X}u;\n    goto exit_spill;\n", target); }
+    using Flow::Flow;
+    std::string jump(u32 target, u32) const override { return leave(target); }
     std::string jump_dynamic() const override { return "    goto exit_spill;\n"; }
-    std::string call(u32 target, u32) const override { return std::format("    ctx->pc = 0x{:05X}u;\n    goto exit_spill;\n", target); }
+    std::string call(u32 target, u32) const override { return leave(target); }
     std::string call_dynamic(u32) const override { return "    goto exit_spill;\n"; }
 };
 
@@ -415,23 +451,26 @@ public:
 
 class FunctionFlow final : public Flow {
 public:
-    FunctionFlow(const Function& f, const std::map<u32, std::string>& symbols) : f_(f), symbols_(symbols) {}
+    FunctionFlow(const Function& f, const std::map<u32, std::string>& symbols, bool relocatable)
+        : Flow(relocatable), f_(f), symbols_(symbols)
+    {
+    }
 
     std::string jump(u32 target, u32 from) const override
     {
-        if (!f_.labels.contains(target)) return std::format("    ctx->pc = 0x{:05X}u;\n    goto exit_spill;\n", target);
+        if (!f_.labels.contains(target)) return leave(target);
         if (target <= from)
-            return std::format("    if (__atomic_load_n(&ctx->attention, __ATOMIC_RELAXED)) {{\n        ctx->pc = 0x{:05X}u;\n"
+            return std::format("    if (__atomic_load_n(&ctx->attention, __ATOMIC_RELAXED)) {{\n        ctx->pc = {};\n"
                                "        goto exit_spill;\n    }}\n    goto L_{:05X};\n",
-                target, target);
+                pc(target), target);
         return std::format("    goto L_{:05X};\n", target);
     }
     std::string jump_dynamic() const override { return "    goto dispatch;\n"; }
     std::string call(u32 target, u32 ret) const override
     {
         const auto it = symbols_.find(target);
-        if (it == symbols_.end()) return std::format("    ctx->pc = 0x{:05X}u;\n    goto exit_spill;\n", target);
-        return std::format("    PSL_SPILL();\n    ctx->pc = 0x{:05X}u;\n    {}(ctx, ls);\n{}", target, it->second, after_call(ret));
+        if (it == symbols_.end()) return leave(target);
+        return std::format("    PSL_SPILL();\n    ctx->pc = {};\n    {}(ctx, ls);\n{}", pc(target), it->second, after_call(ret));
     }
     std::string call_dynamic(u32 ret) const override
     {
@@ -444,7 +483,7 @@ private:
     std::string after_call(u32 ret) const
     {
         // Continue only if the callee returned to us; otherwise ctx is current and the run loop takes over.
-        std::string s = std::format("    if (ctx->pc != 0x{:05X}u || ctx->stop_reason) goto exit_now;\n    PSL_RELOAD();\n", ret);
+        std::string s = std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n    PSL_RELOAD();\n", pc(ret));
         s += f_.labels.contains(ret) ? std::format("    goto L_{:05X};\n", ret) : std::format("    goto exit_spill;\n");
         return s;
     }
@@ -460,8 +499,9 @@ std::string lift_function(const LsImage& image, const Function& f, const std::st
     o += reg_macros(f.used, f.written);
     o += std::format("void {}(SPUContext* ctx, uint8_t* ls)\n{{\n", symbol);
     o += reg_decls(f.used);
+    if (options.relocatable) o += "    const uint32_t rel = ctx->reloc;\n";
     o += "    PSL_RELOAD();\n    goto dispatch;\n";
-    const FunctionFlow flow(f, symbols);
+    const FunctionFlow flow(f, symbols, options.relocatable);
     for (usize i = 0; i < f.insns.size(); i++) {
         const u32 a = f.insns[i];
         const u32 word = image.word(a);
@@ -470,10 +510,11 @@ std::string lift_function(const LsImage& image, const Function& f, const std::st
         const bool falls = lower(o, decode(word), a, flow, options.xfloat, true);
         if (falls) {
             const bool next_emitted = i + 1 < f.insns.size() && f.insns[i + 1] == a + 4;
-            if (!next_emitted) o += std::format("    ctx->pc = 0x{:05X}u;\n    goto exit_spill;\n", (a + 4) & PS_SPU_PC_MASK);
+            if (!next_emitted) o += std::format("    ctx->pc = {};\n    goto exit_spill;\n", flow.pc((a + 4) & PS_SPU_PC_MASK));
         }
     }
-    o += "exit_spill:\n    PSL_SPILL();\nexit_now:\n    return;\ndispatch:\n    switch (ctx->pc) {\n";
+    o += "exit_spill:\n    PSL_SPILL();\nexit_now:\n    return;\ndispatch:\n";
+    o += options.relocatable ? "    switch ((ctx->pc - rel) & 0x3FFFFu) {\n" : "    switch (ctx->pc) {\n";
     for (u32 l : f.labels) o += std::format("    case 0x{:05X}u: goto L_{:05X};\n", l, l);
     o += "    default: goto exit_spill;\n    }\n}\n#undef PSL_SPILL\n#undef PSL_RELOAD\n\n";
     return o;
@@ -497,12 +538,12 @@ bool write_text(const std::string& path, const std::string& content)
 
 } // namespace
 
-std::string function_symbol(u64 hash, u32 code_start, u32 entry)
+std::string function_symbol(u64 hash, u32 code_start, u32 entry, bool relocatable)
 {
-    return std::format("spu_{:016x}_{:05x}_{:05x}", hash, code_start, entry);
+    return std::format("spu_{:016x}_{}{:05x}_{:05x}", hash, relocatable ? "r" : "", code_start, entry);
 }
 
-std::string lift_step_function(std::string_view symbol, u32 insn, u32 pc, u8 xfloat)
+std::string lift_step_function(std::string_view symbol, u32 insn, u32 pc, u8 xfloat, bool relocatable)
 {
     const Inst inst = decode(insn);
     const RegUse use = reg_use(inst);
@@ -511,9 +552,10 @@ std::string lift_step_function(std::string_view symbol, u32 insn, u32 pc, u8 xfl
     std::string o = reg_macros(used, use.write);
     o += std::format("void {}(SPUContext* ctx, uint8_t* ls)\n{{\n", symbol);
     o += reg_decls(used);
+    if (relocatable) o += "    const uint32_t rel = ctx->reloc;\n    (void)rel;\n";
     o += "    PSL_RELOAD();\n";
-    const StepFlow flow;
-    if (lower(o, inst, pc, flow, xfloat, true)) o += std::format("    ctx->pc = 0x{:05X}u;\n", (pc + 4) & PS_SPU_PC_MASK);
+    const StepFlow flow(relocatable);
+    if (lower(o, inst, pc, flow, xfloat, true)) o += std::format("    ctx->pc = {};\n", flow.pc((pc + 4) & PS_SPU_PC_MASK));
     o += "exit_spill:\n    PSL_SPILL();\nexit_now:\n    return;\n}\n#undef PSL_SPILL\n#undef PSL_RELOAD\n";
     return o;
 }
@@ -525,7 +567,8 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
     const u32 tus = std::max<u32>(1, options.tu_count);
 
     std::map<u32, std::string> symbols;
-    for (const Function& f : program.functions) symbols[f.entry] = function_symbol(result.hash, image.code_start, f.entry);
+    for (const Function& f : program.functions)
+        symbols[f.entry] = function_symbol(result.hash, image.code_start, f.entry, options.relocatable);
 
     // Header
     std::string h = std::format("/* Generated by spu-lift ({}). Do not edit. */\n#ifndef {}_H\n#define {}_H\n", image.name,
@@ -561,9 +604,9 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
     for (const auto& [addr, sym] : entries) r += std::format("    {{0x{:05X}u, {}}},\n", addr, sym);
     if (entries.empty()) r += "    {0u, 0},\n";
     r += "};\n\n";
-    r += std::format("ps_spu_program {}_program = {{\"{}\", 0x{:016X}ull, 0x{:05X}u, 0x{:X}u, {}, {}u, {}_entries, 0}};\n\n",
+    r += std::format("ps_spu_program {}_program = {{\"{}\", 0x{:016X}ull, 0x{:05X}u, 0x{:X}u, {}, {}, {}u, {}_entries, 0}};\n\n",
         options.name, image.name.empty() ? options.name : image.name, result.hash, image.code_start, image.code_size(),
-        options.xfloat, entries.size(), options.name);
+        options.xfloat, options.relocatable ? 1 : 0, entries.size(), options.name);
     r += std::format("void {}_register(void) {{ ps_spu_register_program(&{}_program); }}\n", options.name, options.name);
     result.files.push_back({options.name + "_reg.c", r});
 

@@ -3,7 +3,8 @@
 // SPU static analysis: function discovery (entries, brsl/brasl targets and code addresses formed by ila/il, to a
 // fixpoint), per-function control flow (local branch targets, fall-through, resume points), and jump tables reached
 // through bi (tables of code addresses next to an ila of their base). Every block start becomes a label: the run
-// loop can resume lifted code there (return addresses, loop heads, instructions that may stop and restart).
+// loop can resume lifted code there (return addresses, loop heads, instructions that may stop and restart). Seeds
+// (LsImage::seeds) inside a function's code become labels of it; the others start functions.
 
 #include <map>
 #include <set>
@@ -35,6 +36,9 @@ struct Diagnostic {
 struct AnalyzerOptions {
     bool constant_entries = true; // treat ila/il immediates that point at code as function entries
     usize max_jump_table = 256;
+    // Position independent code (D-081): absolute branch targets (bra, brasl) are not the image's code wherever it
+    // sits, so they are not followed.
+    bool relocatable = false;
 };
 
 struct Program {
