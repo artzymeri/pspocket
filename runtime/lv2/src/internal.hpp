@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,8 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/rsx/backend.hpp"
+#include "pspocket/rsx/rsx.hpp"
 
 namespace pspocket::lv2 {
 
@@ -234,7 +237,7 @@ inline constexpr u64 SYS_MEMORY_PAGE_SIZE_64K = 0x200;
 // 256 MB areas between the main executable and RSX memory (RPCS3 vm.cpp _find_map, sys_memory.cpp,
 // sys_mmapper.cpp): user memory (64 KB / 1 MB pages) and sys_mmapper address ranges.
 struct Area {
-    enum class Kind { User64k, User1m, Mmapper, Vm };
+    enum class Kind { User64k, User1m, Mmapper, Vm, RsxContext };
     Kind kind;
     u32 addr;
     u64 size;
@@ -283,6 +286,42 @@ public:
 
     Kernel& kernel;
     u32 main_area_end;
+};
+
+// ---------------------------------------------------------------------------------------------------- RSX
+
+// lv2's RSX state (rsx.cpp, RPCS3 sys_rsx.cpp and the rsx::thread fields it sets): local memory, the context regions,
+// tiles and Z-cull regions, and the RSX front end, created by sys_rsx_context_allocate.
+struct RsxDevice {
+    ~RsxDevice();
+    void stop(); // stops the RSX thread (process exit, shutdown)
+
+    std::mutex mutex; // guards everything below except `flips` and the listener
+    u32 local_size = 0;    // sys_rsx_memory_allocate (0: no local memory yet)
+    u32 area = 0;          // the rsx_context 256 MB area
+    u32 device_addr = 0;   // sys_rsx_device_map
+    u32 dma_control = 0;   // sys_rsx_context_allocate (0: no context)
+    u32 driver_info = 0;
+    u32 reports = 0;
+    u32 main_mem_size = 0; // IO address space
+    bool vsync = false;    // display sync (cellGcmSetFlipMode)
+    struct Tile {
+        u32 location = 0, offset = 0, size = 0, pitch = 0, comp = 0, base = 0;
+        bool bound = false;
+    };
+    struct Zcull {
+        u32 width = 0, height = 0, cull_start = 0, offset = 0;
+        bool bound = false;
+    };
+    std::array<Tile, 15> tiles{};
+    std::array<Zcull, 8> zculls{};
+
+    std::atomic<u64> flips{0};
+    std::mutex listener_mutex;
+    std::function<void(u32)> on_flip; // Kernel::set_rsx_flip_listener
+
+    std::unique_ptr<rsx::Backend> backend;
+    std::unique_ptr<rsx::Rsx> rsx; // after `backend`, so it is destroyed first
 };
 
 // ---------------------------------------------------------------------------------------------------- filesystem
@@ -405,6 +444,7 @@ struct Kernel::Impl {
 
     MemoryManager memory;
     Vfs vfs;
+    RsxDevice rsx;
     TimerService timers;
     std::mutex tty_mutex;
 

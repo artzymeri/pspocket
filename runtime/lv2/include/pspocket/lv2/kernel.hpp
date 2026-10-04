@@ -31,6 +31,11 @@
 #include "pspocket/lv2/object.hpp"
 #include "pspocket/ppu/context.h"
 
+namespace pspocket::rsx {
+class Backend;
+class Rsx;
+} // namespace pspocket::rsx
+
 namespace pspocket::lv2 {
 
 class EventQueue;
@@ -151,6 +156,11 @@ struct Config {
     void* executor_user = nullptr;
     // Called once when the guest exits the process (sys_process_exit*), from the exiting thread.
     std::function<void(s32 status)> on_process_exit;
+    // The GPU backend sys_rsx_context_allocate gives the RSX front end. Unset, or returning null: rsx::NullBackend
+    // (the commands run, nothing is drawn).
+    std::function<std::unique_ptr<rsx::Backend>()> rsx_backend;
+    // Unhandled RSX methods and FIFO errors are logged instead of aborting (tests, release builds; CLAUDE.md rule 5).
+    bool rsx_log_failures = false;
 };
 
 // RPCS3 PPUModule.cpp: default container size by SDK version.
@@ -226,6 +236,11 @@ public:
 
     // Number of syscalls dispatched to the unimplemented handler since start (for tests and reports).
     u64 unimplemented_count() const;
+
+    // The RSX front end, once sys_rsx_context_allocate created it; null before.
+    rsx::Rsx* rsx();
+    // Called on the RSX thread after each flip (HLE cellGcmSys: the game's flip handler). Replaces the previous one.
+    void set_rsx_flip_listener(std::function<void(u32 buffer_id)> fn);
 
     struct Impl;
     Impl& impl() { return *impl_; }

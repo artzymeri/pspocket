@@ -530,6 +530,7 @@ bool Kernel::shutdown(std::chrono::milliseconds timeout)
     impl_->exiting = true;
     impl_->abort_all_waits();
     impl_->timers.stop();
+    impl_->rsx.stop();
     HostThreads& host = *impl_->host_threads;
     std::unique_lock lock(host.mutex);
     const bool done = host.cv.wait_for(lock, timeout, [&] { return host.live == 0; });
@@ -538,6 +539,18 @@ bool Kernel::shutdown(std::chrono::milliseconds timeout)
 }
 
 u64 Kernel::unimplemented_count() const { return impl_->unimplemented.load(); }
+
+rsx::Rsx* Kernel::rsx()
+{
+    std::lock_guard lock(impl_->rsx.mutex);
+    return impl_->rsx.rsx.get();
+}
+
+void Kernel::set_rsx_flip_listener(std::function<void(u32 buffer_id)> fn)
+{
+    std::lock_guard lock(impl_->rsx.listener_mutex);
+    impl_->rsx.on_flip = std::move(fn);
+}
 
 void Kernel::syscall(PPUContext& ctx)
 {

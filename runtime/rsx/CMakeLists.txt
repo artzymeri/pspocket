@@ -5,6 +5,7 @@ add_library(pspocket_rsx STATIC
     src/io_map.cpp
     src/method_names.cpp
     src/methods.cpp
+    src/null_backend.cpp
     src/rsx.cpp
     src/shader/fp.cpp
     src/shader/msl.cpp
