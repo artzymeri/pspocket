@@ -7,7 +7,8 @@
 // Idle workers wait for any change to CellSpurs line 0 (ps_res_wait_change): that is what the SPURS kernel's idle loop
 // waits on (GETLLAR line 0 and the lock-line-lost event), and every way work arrives changes it through the
 // reservation system: ready counts and workload signals from the PPU side (HLE reservation_op), from SPU task code
-// (PUTLLC) and from the policy itself. cellSpursWakeUp notifies explicitly.
+// (PUTLLC) and from the policy itself. cellSpursWakeUp notifies explicitly. A selection that takes nothing stores
+// nothing, so an idle worker's own look at the line doesn't end its wait.
 //
 // Deviations from the SPURS kernel: the system service workload never runs (its jobs, activating workloads and
 // processing their state changes, are read from the guest state directly, and its message bit is just acknowledged);
@@ -315,9 +316,15 @@ Worker::Selection Worker::select(bool poll)
             ps_write16(line, wkl_off::signal1, static_cast<u16>(signal & ~(0x8000u >> sel.wid)));
             if (sel.wid == flag_receiver) ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
             contention[sel.wid]++;
+            changed = true;
         }
-        for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) ps_write8(line, wkl_off::currentContention + i, contention[i]);
-        return true;
+        for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+            changed |= ps_read8(line, wkl_off::currentContention + i) != contention[i];
+            ps_write8(line, wkl_off::currentContention + i, contention[i]);
+        }
+        // An SPU that stays idle and changes nothing stores nothing: every store bumps the line's version, which would
+        // end its own wait for a change at once (regression: idle workers spun at full speed instead of sleeping).
+        return changed;
     });
     if (poll) return sel;
 

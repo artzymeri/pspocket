@@ -476,6 +476,34 @@ TEST_CASE("SPURS workers: ready counts stay right while other writers race for C
     REQUIRE(wait_for([&] { return ps_read8(b, kSpurs + 0x00) == 0; })); // ready count back to 0
 }
 
+// Regression (found with the SPURS semaphores, D-073): an idle worker's own selection stored CellSpurs line 0 even when
+// it took nothing. Every store moves the line's version on, which ended the worker's wait for a change at once, so
+// idle workers spun at full speed (four of them used 7.8 s of CPU in 2 s). Now the line stays as it is while nothing
+// happens, and work still wakes the worker.
+TEST_CASE("SPURS workers: an idle worker sleeps and leaves CellSpurs line 0 alone", "[hle][spurs][spurs-run]")
+{
+    SpursFixture s; // the taskset has no tasks: nothing to do
+    u8* b = s.base;
+    // The worker acknowledges the system service message that creating the taskset left (bit 0 of CellSpurs 0x72) the
+    // next time it looks at the line, when its idle wait times out at the latest. After that nothing changes.
+    REQUIRE(wait_for([&] { return !(ps_read8(b, kSpurs + 0x72) & 1); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const u64 version = ps_res_version(kSpurs);
+    std::this_thread::sleep_for(std::chrono::milliseconds(350)); // the idle wait's 100 ms timeout passes three times
+    CHECK(ps_res_version(kSpurs) == version);
+
+    Program p; // writes its 16-byte argument to the EA in the argument's first word, then exits
+    p.emit(as::il(10, kBuf));
+    p.emit(as::stqd(3, 0, 10));
+    p.dma16(PS_MFC_PUT, 10, 3);
+    p.syscall(0);
+    write_task_elf(b, kElf, p);
+    ps_write32(b, kArg, kOut);
+    ps_write32(b, kArg + 4, 0x5EE);
+    REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 4) == 0x5EE; }));
+}
+
 TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entry points", "[hle][spurs][spurs-run]")
 {
     constexpr u32 kPm = kData + 0x14000, kWid = kData + 0x8600, kFlagPtr = kData + 0x8610;

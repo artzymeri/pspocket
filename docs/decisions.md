@@ -947,6 +947,34 @@ report full pressure. The schedule (`pspocket/hle/pad_script.hpp`) is checked ev
 ("controller at 45.00 s: cross"); boot.sh passes the option through. Times are wall-clock seconds since the game
 started, so a schedule only holds for one build's speed: it is a bring-up tool, not a replay system.
 
+## D-070 · 2026-10-04 · SPURS semaphores as libsre: a unit given back goes to the oldest waiter
+
+Run 041 stopped loading at `_cellSpursSemaphoreInitialize`: GTA V gives its "Physics" taskset a semaphore of 4 units,
+the call failed, and the Physics tasks waited in P on a semaphore with no units while the main thread waited for them
+in `cellSpursQueuePopBody`. RPCS3 has only commented stubs, so `runtime/hle/src/cellSpursSemaphore.cpp` follows libsre
+(fw 4.92, read as the reference, D-046: `_cellSpursSemaphoreInitialize` 0x17F04) and the SPU-side semaphore library
+the Physics tasks link statically.
+- **Initialize** (spurs, taskset, semaphore, total): cellSpursSemaphoreInitialize passes spurs 0, the IWL form taskset
+  0. With spurs: semaphore NULL, then spurs and semaphore alignment (128); the taskset is only stored. Without:
+  taskset or semaphore NULL, their alignment, then a workload ID above 31 (INVAL). The total is stored unchecked.
+- **Layout.** One 128-byte line: the count at 0x00; the waiting tasks' IDs from 0x10 (their number first, oldest first,
+  15 at most) and their workload IDs from 0x20; CellSpurs at 0x30 for a semaphore of the whole instance (else 0); the
+  taskset at 0x38 (0 for the whole instance); the rest zero.
+- **Protocol.** Only SPU tasks take and give units (libsre has no PPU P or V). P takes one when the count is above 0;
+  otherwise it joins the lists (AGAIN at 15) and waits for a signal (syscall 2, wait object `semaphore | 1`). V, when
+  tasks wait and the count isn't negative, hands its unit to the oldest: the waiter leaves the lists, the count stays,
+  and V signals it from SPU code (its signalled bit and, if it waits already, its workload's wklSignal bit); otherwise
+  V adds 1 to the count. The woken task doesn't look at the count again. Its taskset is the semaphore's, or for the
+  whole instance its workload's (WorkloadInfo.arg).
+- **Native.** All of that is task code the native taskset policy already runs; nothing was missing. Synthetic SPU tasks
+  check it on four SPUs: more tasks than units with both kinds of semaphore, a signal that arrives before the waiter's
+  syscall 2, and a waiter whose taskset has nothing else to run, brought back only by the workload signal a task of
+  another taskset sets.
+- **Deviations.** Unreadable pointers give TASK_ERROR_FAULT (D-042). The line's reservations are broken explicitly, as
+  the PPU's stores break them on the PS3.
+
+Left out until a game imports it: cellSpursSemaphoreGetTasksetAddress.
+
 ## D-071 · 2026-10-04 · The iOS app boots a game: the disc image picked in Files, the executable from the Mac
 
 The user asked to try GTA V on the iPhone. The app's new Game tab (now the first tab) does what pspocket-boot does on
@@ -985,6 +1013,18 @@ plays silence instead of crackling; a period that doesn't fit is dropped (an ove
 `pspocket-boot --audio` plays on the Mac and prints the played time, underruns and overruns: a 75 s GTA V run played
 72.3 s with one underrun and no overruns. The iOS app sets the playback audio session category (sound with the silent
 switch on) and attaches the same output when it boots a game.
+
+## D-073 · 2026-10-04 · Idle SPURS workers sleep: a selection that takes nothing stores nothing
+
+Found while writing the SPURS semaphores (D-070), and the first item of run 042's notes: an idle worker's own look at
+CellSpurs line 0 stored the line even when it took nothing. Every store moves the line's version on, so the worker's
+wait for a change (D-050) ended at once and idle workers spun at full speed: on the iPhone, six emulated SPUs took a
+full core each. `Worker::select` now stores the line only when it changed something (a workload taken, a signal or
+the workload flag consumed, contention moved, the system service message acknowledged). Four idle workers: 7.8 s of CPU
+in 2 s before, none after; the SPURS tests under parallel load: 172 s of CPU before, 39 s after. Work arriving through
+the reservation system (HLE updates, PPU stwcx., SPU PUTLLC and DMA, cellSpursWakeUp) still wakes a worker at once; a
+plain store to line 0 is seen at the idle wait's 100 ms timeout. A regression test checks that the line stays
+untouched while nothing happens.
 
 ## Open decisions (plan section 14)
 

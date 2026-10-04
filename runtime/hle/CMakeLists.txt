@@ -9,6 +9,7 @@ add_library(pspocket_hle STATIC
     src/cellSheap.cpp
     src/cellSpurs.cpp
     src/cellSpursQueue.cpp
+    src/cellSpursSemaphore.cpp
     src/cellSysmodule.cpp
     src/cellSysutil.cpp
     src/cellVoice.cpp
