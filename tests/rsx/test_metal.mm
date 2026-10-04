@@ -596,6 +596,55 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
     cube.texture_kind[0] = shader::TextureKind::Cube;
     cube.texture_kind[1] = shader::TextureKind::Cube;
     compile(shader::translate_fragment_program(*tdecoded, cube));
+
+    // Flow control and the pack/unpack ops (D-089): IFE with an else part, a LOOP with BRK and RET inside.
+    {
+        FpInst setcc;
+        setcc.op = 0x01; // MOV R1, f[COL0], setting RC0
+        setcc.dst = 1;
+        setcc.input = 1;
+        setcc.src[0] = fp_in();
+        setcc.set_cond = true;
+        FpInst ife;
+        ife.op = 0x42;
+        ife.exec_lt = false, ife.exec_eq = false;
+        fp_if(ife, 0x40, 0x60);
+        FpInst a;
+        a.op = 0x01;
+        a.src[0] = fp_const();
+        a.constant = std::array<float, 4>{1.f, 0.f, 0.f, 1.f};
+        FpInst b = a;
+        b.constant = std::array<float, 4>{0.f, 1.f, 0.f, 1.f};
+        FpInst loop;
+        loop.op = 0x43;
+        fp_loop(loop, 0, 4, 1, 0x100);
+        std::vector<FpInst> prog{setcc, ife, a, b, loop};
+        for (u32 op : {0x27u, 0x28u, 0x13u, 0x14u, 0x24u, 0x25u}) { // PKB UPB PK4 UP4 PK2 UP2 at 0x70..0xC0
+            FpInst p;
+            p.op = op;
+            p.dst = 2;
+            p.src[0] = fp_r(1);
+            prog.push_back(p);
+        }
+        FpInst brk; // 0xD0
+        brk.op = 0x40;
+        brk.exec_eq = false, brk.exec_gt = false;
+        prog.push_back(brk);
+        FpInst fret; // 0xE0
+        fret.op = 0x45;
+        fret.exec_lt = false, fret.exec_gt = false;
+        prog.push_back(fret);
+        prog.push_back(FpInst{}); // 0xF0: NOP
+        FpInst fout; // 0x100: MOV R0, R2 END
+        fout.op = 0x01;
+        fout.src[0] = fp_r(2);
+        fout.end = true;
+        prog.push_back(fout);
+        const auto fbytes = assemble_fp(prog);
+        const auto ffd = shader::decode_fragment_program(fbytes.data(), static_cast<u32>(fbytes.size()));
+        REQUIRE(ffd.has_value());
+        compile(shader::translate_fragment_program(*ffd));
+    }
 }
 
 // ---- end to end -------------------------------------------------------------------------------------------------
@@ -1300,7 +1349,7 @@ TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")
     REQUIRE_METAL();
     E2E e;
     FpInst bad;
-    bad.op = 0x13; // PK4: not translated yet
+    bad.op = 0x2B; // BEM: not translated yet
     bad.dst = 0;
     bad.input = 1;
     bad.src[0] = fp_in();
@@ -1318,5 +1367,5 @@ TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")
     CHECK(e.backend->stats().draws_skipped == 1);
     REQUIRE_FALSE(e.failures.empty());
     CHECK(e.failures[0].kind == FailKind::Unsupported);
-    CHECK(e.failures[0].message.find("PK4") != std::string::npos);
+    CHECK(e.failures[0].message.find("BEM") != std::string::npos);
 }

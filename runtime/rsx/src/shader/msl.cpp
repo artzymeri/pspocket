@@ -454,7 +454,9 @@ bool fp_supported(u32 op)
     case FpOp::FLR: case FpOp::SLT: case FpOp::SGE: case FpOp::SLE: case FpOp::SGT: case FpOp::SNE:
     case FpOp::SEQ: case FpOp::STR: case FpOp::SFL: case FpOp::LRP: case FpOp::NRM: case FpOp::DDX:
     case FpOp::DDY: case FpOp::KIL: case FpOp::TEX: case FpOp::TXP: case FpOp::TXL: case FpOp::TXB:
-    case FpOp::FENCT: case FpOp::FENCB: case FpOp::DIVSQ: case FpOp::PK16: case FpOp::UP16: case FpOp::RET: return true;
+    case FpOp::FENCT: case FpOp::FENCB: case FpOp::DIVSQ: case FpOp::PK16: case FpOp::UP16: case FpOp::RET:
+    case FpOp::PKB: case FpOp::UPB: case FpOp::PK4: case FpOp::UP4: case FpOp::PK2: case FpOp::UP2: case FpOp::IFE:
+    case FpOp::LOOP: case FpOp::REP: case FpOp::BRK: return true;
     default: return false;
     }
 }
@@ -556,6 +558,35 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     std::string body;
     u32 const_slot = 0;
 
+    // Flow control (RPCS3 FragmentProgramDecompiler Decompile, IFE/LOOP/REP/BRK/RET): blocks close at their end
+    // offsets (and IFE switches to its else part at its else offset), byte offsets from the start of the program.
+    // The body runs inside do { } while (false); RET sets fp_ret and breaks, and every loop that ends passes it on.
+    struct Block {
+        u32 end;
+        bool loop;
+    };
+    std::vector<Block> blocks;
+    std::vector<u32> elses;
+    u32 loops = 0;
+    bool uses_ret_flag = false;
+    auto close_blocks = [&](u32 offset) {
+        for (auto it = blocks.end(); it != blocks.begin();) {
+            --it;
+            if (it->end != offset) continue;
+            body += it->loop ? "    }\n    if (fp_ret) break;\n" : "    }\n";
+            if (it->loop) loops--;
+            it = blocks.erase(it);
+        }
+        for (auto it = elses.begin(); it != elses.end();) {
+            if (*it == offset) {
+                body += "    } else {\n";
+                it = elses.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+
     for (const FpInstruction& in : fp.instructions) {
         auto fail = [&](std::string what) {
             result.error = std::format("unsupported fragment program {} at offset {:#06x} ({})", what, in.offset, disassemble(in));
@@ -563,10 +594,39 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         };
         c.constant_index = const_slot;
         if (in.has_constant) const_slot++;
+        close_blocks(in.offset);
 
         if (!fp_supported(in.op)) return fail(std::format("opcode {}", fp_op_name(in.op)));
         const FpOp op = static_cast<FpOp>(in.op);
         if (op == FpOp::NOP || op == FpOp::FENCT || op == FpOp::FENCB) continue;
+        if (op == FpOp::IFE || op == FpOp::LOOP || op == FpOp::REP) {
+            const u32 else_offset = (in.words[2] & 0x7fffffffu) << 2, end_offset = (in.words[3] & 0x7fffffffu) << 2;
+            const std::string cond = in.always() ? std::string("true") : in.never() ? std::string("false")
+                                                                                    : std::format("any({})", fp_condition(in));
+            body += std::format("    // {:04x}: {}\n", in.offset, disassemble(in));
+            if (op == FpOp::IFE) {
+                body += std::format("    if ({}) {{\n", cond);
+                if (else_offset != end_offset) elses.push_back(else_offset);
+                blocks.push_back({end_offset, false});
+            } else if (in.never()) {
+                // RPCS3: a loop that never runs is commented out, its body left in line.
+                body += "    // (never: the body runs once, in line)\n";
+            } else {
+                // SRC1: end counter bits 2-9, initial value bits 10-17, increment bits 19-26.
+                const u32 s1w = in.words[2];
+                const u32 end = (s1w >> 2) & 0xff, init = (s1w >> 10) & 0xff, inc = (s1w >> 19) & 0xff;
+                body += std::format("    if ({}) for (int i{} = {}; i{} < {}; i{} += {}) {{\n", cond, loops, init, loops, end,
+                    loops, std::max<u32>(inc, 1));
+                loops++;
+                blocks.push_back({end_offset, true});
+            }
+            continue;
+        }
+        if (op == FpOp::BRK) {
+            body += std::format("    // {:04x}: {}\n", in.offset, disassemble(in));
+            if (!in.never()) body += in.always() ? "    break;\n" : std::format("    if (any({})) break;\n", fp_condition(in));
+            continue;
+        }
         if (in.never()) continue; // conditional execution that never executes
         if (in.use_index_reg) return fail("indexed input (loop counter)");
         // Condition codes (RPCS3 SetDst, AddCodeCond, AddFlowOp): RC0 and RC1 start at 0. A conditional instruction
@@ -583,8 +643,10 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         }
         if (op == FpOp::RET) {
             // RPCS3 AddFlowOp("return"): the program ends here and its outputs are what the registers hold. The body
-            // runs inside do { } while (false), and the subset has no loops, so break reaches the outputs.
-            body += conditional ? std::format("        if (any({})) break;\n    }}\n", cond) : std::string("        break;\n    }\n");
+            // runs inside do { } while (false); inside loops fp_ret carries the return out of each.
+            uses_ret_flag = true;
+            body += conditional ? std::format("        if (any({})) {{ fp_ret = true; break; }}\n    }}\n", cond)
+                                : std::string("        fp_ret = true;\n        break;\n    }\n");
             continue;
         }
 
@@ -611,6 +673,13 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         // RPCS3 packs and unpacks PK16/UP16 as two unorm16 (packUnorm2x16).
         case FpOp::PK16: e = std::format("float4(as_type<float>(pack_float_to_unorm2x16(({}).xy)))", s0); break;
         case FpOp::UP16: e = std::format("unpack_unorm2x16_to_float(as_type<uint>(({}).x)).xyxy", s0); break;
+        // RPCS3: PKB/UPB packUnorm4x8 and unpackUnorm4x8, PK4/UP4 the snorm forms, PK2/UP2 packHalf2x16.
+        case FpOp::PKB: e = std::format("float4(as_type<float>(pack_float_to_unorm4x8({})))", s0); break;
+        case FpOp::UPB: e = std::format("unpack_unorm4x8_to_float(as_type<uint>(({}).x))", s0); break;
+        case FpOp::PK4: e = std::format("float4(as_type<float>(pack_float_to_snorm4x8({})))", s0); break;
+        case FpOp::UP4: e = std::format("unpack_snorm4x8_to_float(as_type<uint>(({}).x))", s0); break;
+        case FpOp::PK2: e = std::format("float4(as_type<float>(half2(({}).xy)))", s0); break;
+        case FpOp::UP2: e = std::format("float2(as_type<half2>(as_type<uint>(({}).x))).xyxy", s0); break;
         case FpOp::RCP: e = std::format("float4(1.0 / ({}).x)", s0); break;
         case FpOp::RSQ: e = std::format("float4(1.0 / sqrt(abs(({}).x)))", s0); break; // RSQ ignores the sign (GTA4)
         case FpOp::EX2: e = std::format("float4(exp2(({}).x))", s0); break;
@@ -699,6 +768,12 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         }
         body += "    }\n";
     }
+    // Blocks a malformed program leaves open: closed, so the shader still compiles.
+    while (!blocks.empty()) {
+        body += blocks.back().loop ? "    }\n    if (fp_ret) break;\n" : "    }\n";
+        blocks.pop_back();
+    }
+    if (uses_ret_flag || body.find("fp_ret") != std::string::npos) body = "    bool fp_ret = false; (void)fp_ret;\n" + body;
 
     // Outputs: R0/R2/R3/R4 with 32-bit exports, H0/H4/H6/H8 otherwise; depth from R1.z
     // (FragmentProgramDecompiler.cpp get_fragment_program_output_set). H and R are kept as separate files; when the

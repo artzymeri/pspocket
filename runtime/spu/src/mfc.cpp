@@ -19,6 +19,7 @@
 #include "internal.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
+#include "pspocket/core/memory_map.h"
 #include "pspocket/core/reservation.h"
 #include "pspocket/spu/runtime.h"
 
@@ -147,10 +148,21 @@ void drop_overwritten_programs(SPUContext* ctx, u32 lsa, u32 size)
     }
 }
 
+// SPU DMAs to and from RSX local memory: the GPU's copies of render targets and textures there are not told (a
+// diagnostic for now: the first few are logged).
+void note_video_dma(const SPUContext* ctx, u32 cmd, u32 lsa, u32 eal, u32 size)
+{
+    static std::atomic<u32> logged{0};
+    if (logged.load(std::memory_order_relaxed) >= 16 || logged.fetch_add(1, std::memory_order_relaxed) >= 16) return;
+    PS_LOG_INFO("spu", "SPU {}: {} {:#x} bytes {} RSX local memory {:#010x} (LS 0x{:05x}); the RSX's copies are not told",
+        ctx->id, is_get(cmd) ? "GET" : "PUT", size, is_get(cmd) ? "from" : "to", eal, lsa);
+}
+
 int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
 {
     if (size == 0) return 0;
     if (eal >= PS_SPU_RAW_BASE) return group_mmio(ctx, pc, cmd, lsa, eal, size);
+    if (eal - PS_MEM_RSX_LOCAL_BASE < PS_MEM_RSX_LOCAL_SIZE) note_video_dma(ctx, cmd, lsa, eal, size);
     u8* mem = ctx->membase + eal;
     // The MFC performs a queue's transfers in order, and a fenced PUT or a later command's flag must not be seen by
     // another processor before the data PUT before it: on ARM, plain stores can become visible out of order, so

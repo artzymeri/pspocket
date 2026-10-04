@@ -1323,6 +1323,22 @@ to 6.6 fps).
   real depth buffer at that address.
 - Not yet: depth comparison (shadow tests) for the depth formats; they read the depth.
 - Tests: Z24S8 as A8R8G8B8 and Z16 as X16 and DEPTH16, end to end with no readback.
+- Run 060: the first mission at 22 to 25 fps on the Mac (run 059: 6 to 7).
+
+## D-089 · 2026-10-04 · Fragment programs: IFE, LOOP, REP, BRK and the byte and half packs
+
+Run 060 traced a mission frame whose HDR lighting target stayed black: three of its fragment programs use IFE and two
+UPB, and their draws were skipped. RPCS3's FragmentProgramDecompiler is the reference.
+- IFE opens `if (any(cond)) {` and closes at its end offset, switching to `} else {` at its else offset (both in SRC1
+  and SRC2, words of the program, constants included). LOOP and REP open `if (cond) for (int iN = init; iN < end;
+  iN += increment) {` (SRC1's counters); one whose condition never holds leaves its body in line, as RPCS3 does. BRK
+  breaks the innermost loop when any component of its condition holds.
+- RET sets a flag and breaks; every loop passes the flag on as it ends, so the program still reaches its outputs (the
+  body runs inside do { } while (false); Metal has no goto).
+- PKB/UPB (unorm 4x8), PK4/UP4 (snorm 4x8), PK2/UP2 (half 2x16).
+- Still refused, by name: CAL, the loop counter as an input index, BEM, the gamma packs.
+- Tests: the translation of an IFE with an else part and a LOOP with BRK and RET; Metal compiles a program with every
+  new op.
 
 ## Open decisions (plan section 14)
 

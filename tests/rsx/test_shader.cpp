@@ -511,31 +511,89 @@ TEST_CASE("fragment program DIVSQ, PK16, UP16 and RET")
     CHECK(s.find("pack_float_to_unorm2x16(") != std::string::npos);
     CHECK(s.find("unpack_unorm2x16_to_float(as_type<uint>(") != std::string::npos);
     CHECK(s.find("do {") != std::string::npos);
-    CHECK(s.find("if (any((cc0 > float4(0.0)))) break;") != std::string::npos);
+    CHECK(s.find("if (any((cc0 > float4(0.0)))) { fp_ret = true; break; }") != std::string::npos);
     CHECK(s.find("} while (false);") < s.find("out.c0 = "));
 }
 
 TEST_CASE("unsupported fragment program features are named")
 {
     auto prog = sample_fp();
-    prog[1].op = static_cast<u32>(FpOp::PK4);
+    prog[1].op = static_cast<u32>(FpOp::BEM);
     auto bytes = assemble_fp(prog);
     auto fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
     REQUIRE(fp.has_value());
     TranslateResult r = translate_fragment_program(*fp);
     CHECK_FALSE(r.ok);
-    CHECK(r.error.find("opcode PK4") != std::string::npos);
+    CHECK(r.error.find("opcode BEM") != std::string::npos);
     CHECK(r.error.find("0x0020") != std::string::npos);
 
     prog = sample_fp();
-    prog[1].op = static_cast<u32>(FpOp::IFE);
+    prog[1].op = static_cast<u32>(FpOp::CAL);
     bytes = assemble_fp(prog);
     fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
     REQUIRE(fp.has_value());
     CHECK(fp->has_branches);
     r = translate_fragment_program(*fp);
     CHECK_FALSE(r.ok);
-    CHECK(r.error.find("IFE") != std::string::npos);
+    CHECK(r.error.find("CAL") != std::string::npos);
+}
+
+TEST_CASE("fragment programs: IFE with else, LOOP with BRK and RET, and byte packing translate (RPCS3 semantics)")
+{
+    // 0x00: MOV R1, f[COL0] (sets RC0)    0x10: IFE (RC0 > 0) else 0x40, end 0x60
+    // 0x20: MOV R0, {1, 0, 0, 1}           0x40: MOV R0, {0, 1, 0, 1}  (each with its 16-byte constant)
+    // 0x60: LOOP i = 0..3, end 0xA0         0x70: UPB R2, R1    0x80: BRK (RC0.y < 0)    0x90: RET (RC0 == 0)
+    // 0xA0: MOV R0, R2 END
+    FpInst setcc;
+    setcc.op = static_cast<u32>(FpOp::MOV);
+    setcc.dst = 1;
+    setcc.input = 1;
+    setcc.src[0] = fp_in();
+    setcc.set_cond = true;
+    FpInst ife;
+    ife.op = static_cast<u32>(FpOp::IFE);
+    ife.exec_lt = false, ife.exec_eq = false, ife.exec_gt = true;
+    fp_if(ife, 0x40, 0x60);
+    FpInst then_mov;
+    then_mov.op = static_cast<u32>(FpOp::MOV);
+    then_mov.src[0] = fp_const();
+    then_mov.constant = std::array<float, 4>{1.f, 0.f, 0.f, 1.f};
+    FpInst else_mov = then_mov; // at 0x40
+    else_mov.constant = std::array<float, 4>{0.f, 1.f, 0.f, 1.f};
+    FpInst loop; // at 0x60: for (i = 0; i < 4; i++) up to 0xA0
+    loop.op = static_cast<u32>(FpOp::LOOP);
+    fp_loop(loop, 0, 4, 1, 0xA0);
+    FpInst upb; // 0x70: UPB R2, R1
+    upb.op = static_cast<u32>(FpOp::UPB);
+    upb.dst = 2;
+    upb.src[0] = fp_r(1);
+    FpInst brk; // 0x80: BRK (RC0.y < 0)
+    brk.op = static_cast<u32>(FpOp::BRK);
+    brk.exec_lt = true, brk.exec_eq = false, brk.exec_gt = false;
+    brk.cond_sw = {1, 1, 1, 1};
+    FpInst ret; // 0x90: RET (EQ)
+    ret.op = static_cast<u32>(FpOp::RET);
+    ret.exec_lt = false, ret.exec_eq = true, ret.exec_gt = false;
+    FpInst last; // 0xA0: MOV R0, R2 END
+    last.op = static_cast<u32>(FpOp::MOV);
+    last.src[0] = fp_r(2);
+    last.end = true;
+    const auto bytes = assemble_fp({setcc, ife, then_mov, else_mov, loop, upb, brk, ret, last});
+    const auto fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
+    REQUIRE(fp.has_value());
+    const TranslateResult r = translate_fragment_program(*fp);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    const std::string& s = r.shader.source;
+    INFO(s);
+    CHECK(s.find("if (any((cc0 > float4(0.0)))) {") != std::string::npos);
+    CHECK(s.find("} else {") != std::string::npos);
+    CHECK(s.find("if (true) for (int i0 = 0; i0 < 4; i0 += 1) {") != std::string::npos);
+    CHECK(s.find("unpack_unorm4x8_to_float(as_type<uint>((r1).x))") != std::string::npos);
+    CHECK(s.find("if (any((cc0.yyyy < float4(0.0)))) break;") != std::string::npos);
+    CHECK(s.find("{ fp_ret = true; break; }") != std::string::npos);
+    CHECK(s.find("if (fp_ret) break;") != std::string::npos);
+    CHECK(s.find("bool fp_ret = false;") != std::string::npos);
 }
 
 TEST_CASE("fragment program opcode names cover the ISA")

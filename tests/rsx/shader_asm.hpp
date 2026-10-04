@@ -143,7 +143,23 @@ struct FpInst {
     u32 cond_mod_reg = 0;                   // RC written by set_cond
     bool set_cond = false;
     bool end = false;
+    // Flow control (IFE, LOOP, REP): SRC1 bits 0-30 (IFE: else offset; LOOP/REP: counters) and SRC2 bits 0-30 (the
+    // end offset), in place of sources 1 and 2.
+    std::optional<u32> flow_src1, flow_src2;
 };
+
+// IFE's operands: else and end at these byte offsets of the program.
+inline void fp_if(FpInst& in, u32 else_offset, u32 end_offset)
+{
+    in.flow_src1 = else_offset >> 2;
+    in.flow_src2 = end_offset >> 2;
+}
+// LOOP/REP's operands: for (i = init; i < end; i += inc) up to the end offset.
+inline void fp_loop(FpInst& in, u32 init, u32 end, u32 inc, u32 end_offset)
+{
+    in.flow_src1 = (end << 2) | (init << 10) | (inc << 19);
+    in.flow_src2 = end_offset >> 2;
+}
 
 inline u32 fp_src_bits(const FpSrc& s)
 {
@@ -161,8 +177,10 @@ inline void encode_fp(const FpInst& in, std::vector<u8>& bytes)
     const u32 s0 = fp_src_bits(in.src[0]) | (u32{in.exec_lt} << 18) | (u32{in.exec_eq} << 19) | (u32{in.exec_gt} << 20) |
         (u32{in.cond_sw[0]} << 21) | (u32{in.cond_sw[1]} << 23) | (u32{in.cond_sw[2]} << 25) | (u32{in.cond_sw[3]} << 27) |
         (u32{in.src[0].abs} << 29) | (in.cond_mod_reg << 30) | (in.cond_reg << 31);
-    const u32 s1 = fp_src_bits(in.src[1]) | (u32{in.src[1].abs} << 18) | (in.scale << 28) | (((in.op >> 6) & 1) << 31);
-    const u32 s2 = fp_src_bits(in.src[2]) | (u32{in.src[2].abs} << 18);
+    const u32 s1 = (in.flow_src1 ? (*in.flow_src1 & 0x7fffffffu)
+                                 : (fp_src_bits(in.src[1]) | (u32{in.src[1].abs} << 18) | (in.scale << 28))) |
+        (((in.op >> 6) & 1) << 31);
+    const u32 s2 = in.flow_src2 ? (*in.flow_src2 & 0x7fffffffu) : (fp_src_bits(in.src[2]) | (u32{in.src[2].abs} << 18));
     auto put = [&](u32 w) {
         const u32 be = (w << 16) | (w >> 16);
         u8 b[4];
