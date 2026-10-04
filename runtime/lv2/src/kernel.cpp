@@ -478,7 +478,19 @@ bool Kernel::vfs_mount(std::string_view point, std::string_view host_dir, bool r
     return impl_->vfs.mount(point, host_dir, read_only);
 }
 
+bool Kernel::vfs_mount_image(std::string_view point, std::shared_ptr<const VfsImage> image, std::string_view subdir)
+{
+    return impl_->vfs.mount_image(point, std::move(image), subdir);
+}
+
 void Kernel::vfs_unmount(std::string_view point) { impl_->vfs.unmount(point); }
+
+std::string Kernel::vfs_host_path(std::string_view vpath) const
+{
+    const Vfs::Resolved r = impl_->vfs.resolve(vpath);
+    if (!r.mount || r.mount->image) return {};
+    return r.host;
+}
 
 std::shared_ptr<PpuThread> Kernel::thread(u32 id) const { return impl_->threads.get<PpuThread>(id); }
 

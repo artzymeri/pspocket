@@ -18,3 +18,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [011](011-gta5-boot-9-mac.md) | 2026-10-03 | 4f47fde | M4 Mac, pspocket-boot | Seven job chains and the `dependency_spu` taskset created; next gap `cellSpursEventFlagAttachLv2EventQueue` |
 | [012](012-gta5-boot-10-mac.md) | 2026-10-03 | 1c8ec8f | M4 Mac, pspocket-boot | Event flag attached to its lv2 queue; next gap `cellSpursTaskGetLoadableSegmentPattern` (task creation) |
 | [013](013-gta5-boot-11-mac.md) | 2026-10-04 | f8c82a4 | M4 Mac, pspocket-boot | Crash in `_cellSpursTaskAttributeInitialize` (a register holding 0x40 read as a pointer); crash reports now show the call site |
+| [014](014-gta5-boot-12-mac.md) | 2026-10-04 | a45e338 | M4 Mac, pspocket-boot | Bink fixed; 4 dependency tasks created; first file access needs the disc |

@@ -25,6 +25,9 @@ inline lv2::PpuThread& thread_of(PPUContext& ctx)
     return *t;
 }
 
+// The guest memory base of the calling thread's process.
+inline u8* guest_base(PPUContext& ctx) { return thread_of(ctx).kernel.base(); }
+
 // A guest variable on the calling thread's stack (RPCS3 vm::var): r1 moves below it for the variable's lifetime, so
 // guest code called meanwhile can't overwrite it. 16-byte aligned, zeroed.
 class StackVar {

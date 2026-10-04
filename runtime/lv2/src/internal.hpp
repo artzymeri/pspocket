@@ -289,7 +289,9 @@ public:
 
 struct Mount {
     std::string point;     // "/dev_hdd0"
-    std::string host;      // host directory, no trailing slash
+    std::string host;      // host directory, no trailing slash (empty for an image mount)
+    std::shared_ptr<const VfsImage> image; // set: the mount reads this image (always read-only)
+    std::string image_root; // the image directory the mount point shows ("" = the image root)
     bool read_only = false;
     u32 block_size = 4096;
     bool no_uid_gid = false;
@@ -298,13 +300,15 @@ struct Mount {
 class Vfs {
 public:
     bool mount(std::string_view point, std::string_view host_dir, bool read_only);
+    bool mount_image(std::string_view point, std::shared_ptr<const VfsImage> image, std::string_view subdir);
     void unmount(std::string_view point);
 
     struct Resolved {
         const Mount* mount = nullptr; // null: not mounted (or the root "/")
         std::shared_ptr<const Mount> mount_ref; // keeps `mount` alive across a concurrent unmount
         bool root = false;            // the path is "/" itself
-        std::string host;             // host path
+        std::string host;             // host path (empty for an image mount)
+        std::string image_path;       // image mounts: the path inside the image ("" = the image root)
         std::string vpath;            // normalized guest path
         bool trailing_dot = false;    // ended with "/." or "/.."
     };

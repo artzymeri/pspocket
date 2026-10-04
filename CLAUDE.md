@@ -56,8 +56,9 @@ ctest --test-dir build/host --output-on-failure
   Longer differential fuzzing: `PSPOCKET_FUZZ_SEED=<n> PSPOCKET_FUZZ_ITERS=<k> build/host/tests/ppu/test_ppu_fuzz`.
   Never build lifted code with `-ffast-math`/`-Ofast`.
 - Disc images: `ps3disc <image.iso> <out-dir>` (host) or the app's `-extract-iso` mode pulls out the executables only.
-- One bring-up round on the Mac: `scripts/boot.sh` (pull, build, run the decrypted EBOOT, print the gaps).
-- Boot an executable under the interpreter (Phase 2 bring-up, D-033): `pspocket-boot EBOOT.elf [--bdvd DIR]
+- One bring-up round on the Mac: `scripts/boot.sh` (pull, build, run the decrypted EBOOT with the disc image read in
+  place, print the gaps). It finds the game's .iso (or copies it once from the iPhone app: `scripts/ios.sh pull-iso`).
+- Boot an executable under the interpreter (Phase 2 bring-up, D-033): `pspocket-boot EBOOT.elf [--bdvd DIR|IMAGE.iso]
   [--hdd0 DIR] [--timeout S] [--stop-at-first] [--imports]`; it prints every unimplemented syscall and firmware
   function it hit (`--imports` lists the imports and their state without running). Runs go in `docs/runs/`.
 - iOS test host: `scripts/ios.sh build|install|run` (XcodeGen project in `app/ios/project.yml`, team M7XJA39ZV6).

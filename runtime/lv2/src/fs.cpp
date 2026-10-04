@@ -5,6 +5,8 @@
 // Mount points (configured by the host with Kernel::vfs_mount): /dev_bdvd (read-only), /dev_hdd0, /dev_hdd1,
 // /app_home, /host_root (dev only), plus anything else the host mounts. Paths are normalized before mapping ("."
 // and ".." resolved, ".." of the root is the root), so a guest path can't name a host file outside its mount.
+// A mount can instead show a read-only image (Kernel::vfs_mount_image: the game's disc image read in place); every
+// syscall then reads the image, with the same results a read-only host directory gives.
 //
 // Deviations:
 // - No NPDRM: opening an encrypted SDATA/EDATA file (sys_fs_open with the 8-byte type argument and an "NPD\0"
@@ -16,10 +18,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <optional>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -49,7 +53,11 @@ public:
     {
         if (host_fd >= 0) ::close(host_fd);
     }
-    int host_fd = -1; // guarded by lock
+    // Guarded by lock. A file is open while it has a host descriptor or (on an image mount) an image file.
+    int host_fd = -1;
+    std::shared_ptr<const VfsImage::File> image_file;
+    u64 pos = 0; // image files: the file position (host files use the descriptor's)
+    bool is_open() const { return host_fd >= 0 || image_file; }
     s32 flags = 0;
     s32 mode = 0;
 };
@@ -168,6 +176,21 @@ void write_host_stat(const Guest& g, u32 sb, const Mount& m, const struct stat& 
     write_stat(g, sb, mode, id, id, st.st_atime, st.st_mtime, st.st_ctime, size, m.block_size);
 }
 
+void write_image_stat(const Guest& g, u32 sb, const Mount& m, const VfsImage::Stat& st, bool dir_size_is_block)
+{
+    s32 mode = st.dir ? (CELL_FS_S_IFDIR | 0777) : (CELL_FS_S_IFREG | 0666);
+    if (m.read_only) mode &= ~0222;
+    const s32 id = m.no_uid_gid ? -1 : 0;
+    const u64 size = st.dir && dir_size_is_block ? m.block_size : st.size;
+    write_stat(g, sb, mode, id, id, 0, 0, 0, size, m.block_size); // an image has no host times
+}
+
+bool image_is_dir(const Vfs::Resolved& res)
+{
+    const auto st = res.mount->image->stat(res.image_path);
+    return st && st->dir;
+}
+
 std::shared_ptr<FsFile> get_file(Kernel& k, u32 fd)
 {
     return std::dynamic_pointer_cast<FsFile>(k.impl().fds.find(FsObject::kIdBase, fd));
@@ -188,6 +211,140 @@ bool host_exists(const std::string& path)
 {
     struct stat st {};
     return ::stat(path.c_str(), &st) == 0;
+}
+
+// Reads up to `nbytes` into guest `buf` (already validated) at `at`, or at the file position (advancing it) when `at`
+// is empty. Host I/O and image reads go through a bounce buffer. `total` gets the bytes read; the file's lock is held.
+Result read_locked(Kernel::Impl& s, FsFile& file, u32 buf, u64 nbytes, std::optional<u64> at, u64& total)
+{
+    std::vector<u8> bounce(static_cast<usize>(std::min<u64>(nbytes, kBounce)));
+    total = 0;
+    if (file.image_file) {
+        const u64 file_size = file.image_file->size();
+        u64 pos = at ? *at : file.pos;
+        while (total < nbytes && pos < file_size) {
+            const usize want = static_cast<usize>(std::min<u64>({nbytes - total, bounce.size(), file_size - pos}));
+            if (!file.image_file->read(pos, bounce.data(), want)) {
+                PS_LOG_ERROR(kFs, "read {}: reading the disc image failed at {:#x}", file.vpath, pos);
+                return err(CELL_EIO);
+            }
+            std::memcpy(s.guest.ptr(buf + static_cast<u32>(total)), bounce.data(), want);
+            total += want;
+            pos += want;
+        }
+        if (!at) file.pos = pos;
+        return CELL_OK;
+    }
+    while (total < nbytes) {
+        const usize want = static_cast<usize>(std::min<u64>(nbytes - total, bounce.size()));
+        const ssize_t n = at ? ::pread(file.host_fd, bounce.data(), want, static_cast<off_t>(*at + total))
+                             : ::read(file.host_fd, bounce.data(), want);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return map_errno(errno, "read", file.vpath);
+        }
+        if (n == 0) break;
+        std::memcpy(s.guest.ptr(buf + static_cast<u32>(total)), bounce.data(), static_cast<usize>(n));
+        total += static_cast<u64>(n);
+    }
+    return CELL_OK;
+}
+
+// Writes `nbytes` from guest `buf` (already validated) at `at`, or at the file position (the end with O_APPEND)
+// when `at` is empty. Host files only: image mounts are read-only. The file's lock is held.
+Result write_locked(Kernel::Impl& s, FsFile& file, u32 buf, u64 nbytes, std::optional<u64> at, u64& total)
+{
+    std::vector<u8> bounce(static_cast<usize>(std::min<u64>(nbytes, kBounce)));
+    total = 0;
+    if (!at && (file.flags & CELL_FS_O_APPEND)) ::lseek(file.host_fd, 0, SEEK_END);
+    while (total < nbytes) {
+        const usize chunk = static_cast<usize>(std::min<u64>(nbytes - total, bounce.size()));
+        std::memcpy(bounce.data(), s.guest.ptr(buf + static_cast<u32>(total)), chunk);
+        usize done = 0;
+        while (done < chunk) {
+            const ssize_t n = at ? ::pwrite(file.host_fd, bounce.data() + done, chunk - done,
+                                       static_cast<off_t>(*at + total + done))
+                                 : ::write(file.host_fd, bounce.data() + done, chunk - done);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                total += done;
+                return map_errno(errno, "write", file.vpath);
+            }
+            done += static_cast<usize>(n);
+        }
+        total += chunk;
+    }
+    return CELL_OK;
+}
+
+// ". " and ".." first, as on the PS3, then the entries sorted by name (RPCS3 sys_fs_opendir); then the descriptor.
+Result finish_opendir(Kernel::Impl& s, std::shared_ptr<FsDir> dir, u32 fd)
+{
+    std::sort(dir->entries.begin(), dir->entries.end(), [](const FsDir::Entry& a, const FsDir::Entry& b) { return a.name < b.name; });
+    dir->entries.insert(dir->entries.begin(), {{".", true}, {"..", true}});
+    dir->refs = 1;
+    const u32 id = s.fds.insert(FsObject::kIdBase, dir);
+    if (!id) return err(CELL_EMFILE);
+    dir->id = id;
+    s.guest.w32(fd, id);
+    return CELL_OK;
+}
+
+// Gives an opened file its descriptor (lowest free, 3..254) and writes it to the guest.
+Result install_file(Kernel::Impl& s, std::shared_ptr<FsFile> file, u32 fd)
+{
+    file->refs = 1;
+    const u32 id = s.fds.insert(FsObject::kIdBase, file);
+    if (!id) {
+        PS_LOG_ERROR(kFs, "sys_fs_open({}): out of file descriptors", file->vpath);
+        return err(CELL_EMFILE);
+    }
+    file->id = id;
+    s.guest.w32(fd, id);
+    PS_LOG_DEBUG(kFs, "sys_fs_open({}, {:#o}) -> fd {}", file->vpath, file->flags, id);
+    return CELL_OK;
+}
+
+// RPCS3 verify_mself: magic "MSF\0", format version 1, 0x40-byte entries.
+bool is_mself(const u8 (&header)[0x40])
+{
+    return ps_ld32(header) == 0x4D534600u && ps_ld32(header + 4) == 1 && ps_ld32(header + 20) == 0x40;
+}
+
+// sys_fs_open on an image mount. The mount is read-only, so this follows the host path's read-only rules: creating,
+// truncating or opening for writing is CELL_EPERM, a missing file CELL_ENOENT.
+Result open_image_file(Kernel::Impl& s, const Vfs::Resolved& res, const std::optional<VfsImage::Stat>& st, s32 flags,
+    s32 mode, u32 arg, u64 size, u32 fd)
+{
+    if (!st) return err((flags & CELL_FS_O_CREAT) ? CELL_EPERM : CELL_ENOENT);
+    if ((flags & CELL_FS_O_ACCMODE) != CELL_FS_O_RDONLY || (flags & CELL_FS_O_TRUNC)) return err(CELL_EPERM);
+    auto image_file = res.mount->image->open(res.image_path);
+    if (!image_file) {
+        PS_LOG_ERROR(kFs, "sys_fs_open({}): the image lists the file but can't open it", res.vpath);
+        return err(CELL_EIO);
+    }
+    if (flags & CELL_FS_O_MSELF) {
+        u8 header[0x40]{};
+        if (image_file->size() < sizeof(header) || !image_file->read(0, header, sizeof(header)) || !is_mself(header)) {
+            return err(CELL_ENOTMSELF);
+        }
+    }
+    if (size == 8 && s.guest.valid(arg, 8)) {
+        const u64 type = s.guest.r64(arg);
+        u8 magic[4]{};
+        if ((type == 0x18000000010ull || type == 2) && image_file->size() >= 4 && image_file->read(0, magic, 4) &&
+            std::memcmp(magic, "NPD\0", 4) == 0) {
+            PS_LOG_ERROR(kFs, "sys_fs_open({}): encrypted {} is not supported", res.vpath, type == 2 ? "EDATA" : "SDATA");
+            return err(CELL_EFSSPECIFIC);
+        }
+    }
+    auto file = std::make_shared<FsFile>();
+    file->vpath = res.vpath;
+    file->mount = res.mount_ref;
+    file->image_file = std::move(image_file);
+    file->flags = flags;
+    file->mode = mode;
+    return install_file(s, std::move(file), fd);
 }
 
 } // namespace
@@ -213,6 +370,32 @@ bool Vfs::mount(std::string_view point, std::string_view host_dir, bool read_onl
     mount_properties(*m);
     if (point == "/dev_bdvd" && !read_only) PS_LOG_WARN(kFs, "/dev_bdvd mounted writable");
     PS_LOG_INFO(kFs, "mounted {} -> {}{}", m->point, m->host, read_only ? " (read-only)" : "");
+    std::lock_guard lock(mutex_);
+    mounts_[m->point] = std::move(m);
+    return true;
+}
+
+bool Vfs::mount_image(std::string_view point, std::shared_ptr<const VfsImage> image, std::string_view subdir)
+{
+    if (point.size() < 2 || point[0] != '/' || point.find('/', 1) != std::string_view::npos || !image) {
+        PS_LOG_ERROR(kFs, "mount point '{}' must be a single top-level name like /dev_bdvd, with an image", point);
+        return false;
+    }
+    std::string root(subdir);
+    while (!root.empty() && root.front() == '/') root.erase(0, 1);
+    while (!root.empty() && root.back() == '/') root.pop_back();
+    if (const auto st = image->stat(root); !st || !st->dir) {
+        PS_LOG_ERROR(kFs, "mount {}: '{}' is not a directory of the image", point, root);
+        return false;
+    }
+    auto m = std::make_shared<Mount>();
+    m->point = std::string(point);
+    m->image = std::move(image);
+    m->image_root = std::move(root);
+    m->read_only = true;
+    mount_properties(*m);
+    PS_LOG_INFO(kFs, "mounted {} -> disc image{}{} (read-only)", m->point, m->image_root.empty() ? "" : " /",
+        m->image_root);
     std::lock_guard lock(mutex_);
     mounts_[m->point] = std::move(m);
     return true;
@@ -271,6 +454,14 @@ Vfs::Resolved Vfs::resolve(std::string_view vpath) const
     }
     r.mount_ref = m;
     r.mount = m.get();
+    if (m->image) {
+        r.image_path = m->image_root;
+        for (usize k = 1; k < parts.size(); k++) {
+            if (!r.image_path.empty()) r.image_path += '/';
+            r.image_path += parts[k];
+        }
+        return r;
+    }
     r.host = m->host;
     for (usize k = 1; k < parts.size(); k++) {
         r.host += '/';
@@ -293,7 +484,9 @@ Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg,
     if (!res.mount) return err(CELL_ENOTMOUNTED);
     const Mount& m = *res.mount;
 
-    if (host_is_dir(res.host)) return err(CELL_EISDIR);
+    std::optional<VfsImage::Stat> image_stat;
+    if (m.image) image_stat = m.image->stat(res.image_path);
+    if (m.image ? image_stat && image_stat->dir : host_is_dir(res.host)) return err(CELL_EISDIR);
     const s32 access = flags & CELL_FS_O_ACCMODE;
     if (access == CELL_FS_O_ACCMODE ||
         (flags & ~(CELL_FS_O_UNK | CELL_FS_O_ACCMODE | CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND |
@@ -302,6 +495,8 @@ Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg,
         PS_LOG_ERROR(kFs, "sys_fs_open({}): invalid or unsupported flags {:#o}", p.vpath, flags);
         return err(CELL_EINVAL);
     }
+
+    if (m.image) return open_image_file(s, res, image_stat, flags, mode, arg, size, fd);
 
     const bool writable_fs = !m.read_only && has_write_rights(k, res.vpath);
     if (m.read_only && access != CELL_FS_O_RDONLY && host_exists(res.host)) return err(CELL_EPERM);
@@ -327,10 +522,9 @@ Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg,
     if ((flags & CELL_FS_O_TRUNC) && !writable_fs) return close_fail(err(m.read_only ? CELL_EPERM : CELL_EACCES));
 
     if (flags & CELL_FS_O_MSELF) {
-        // RPCS3 verify_mself: magic "MSF\0", format version 1, 0x40-byte entries.
         u8 header[0x40]{};
         const bool ok = ::pread(host_fd, header, sizeof(header), 0) == static_cast<ssize_t>(sizeof(header)) &&
-            ps_ld32(header) == 0x4D534600u && ps_ld32(header + 4) == 1 && ps_ld32(header + 20) == 0x40;
+            is_mself(header);
         if (!ok) return close_fail(err(CELL_ENOTMSELF));
     }
     if (size == 8 && s.guest.valid(arg, 8)) {
@@ -350,16 +544,7 @@ Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg,
     file->host_fd = host_fd;
     file->flags = flags;
     file->mode = mode;
-    file->refs = 1;
-    const u32 id = s.fds.insert(FsObject::kIdBase, file);
-    if (!id) {
-        PS_LOG_ERROR(kFs, "sys_fs_open({}): out of file descriptors", p.vpath);
-        return err(CELL_EMFILE); // the FsFile destructor closes host_fd
-    }
-    file->id = id;
-    s.guest.w32(fd, id);
-    PS_LOG_DEBUG(kFs, "sys_fs_open({}, {:#o}) -> fd {}", p.vpath, flags, id);
-    return CELL_OK;
+    return install_file(s, std::move(file), fd); // on failure the FsFile destructor closes host_fd
 }
 
 Result sys_fs_read(PpuThread& t, u32 fd, u32 buf, u64 nbytes, u32 nread)
@@ -383,26 +568,15 @@ Result sys_fs_read(PpuThread& t, u32 fd, u32 buf, u64 nbytes, u32 nread)
         s.guest.w64(nread, 0);
         return err(CELL_EFAULT);
     }
-    std::vector<u8> bounce(static_cast<usize>(std::min<u64>(nbytes, kBounce)));
     u64 total = 0;
+    Result r = CELL_OK;
     {
         std::lock_guard lock(file->lock);
-        if (file->host_fd < 0) return err(CELL_EBADF);
-        while (total < nbytes) {
-            const usize want = static_cast<usize>(std::min<u64>(nbytes - total, bounce.size()));
-            const ssize_t n = ::read(file->host_fd, bounce.data(), want);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                s.guest.w64(nread, total);
-                return map_errno(errno, "sys_fs_read", file->vpath);
-            }
-            if (n == 0) break;
-            std::memcpy(s.guest.ptr(buf + static_cast<u32>(total)), bounce.data(), static_cast<usize>(n));
-            total += static_cast<u64>(n);
-        }
+        if (!file->is_open()) return err(CELL_EBADF);
+        r = read_locked(s, *file, buf, nbytes, std::nullopt, total);
     }
     s.guest.w64(nread, total);
-    return CELL_OK;
+    return r;
 }
 
 Result sys_fs_write(PpuThread& t, u32 fd, u32 buf, u64 nbytes, u32 nwrite)
@@ -430,30 +604,15 @@ Result sys_fs_write(PpuThread& t, u32 fd, u32 buf, u64 nbytes, u32 nwrite)
         s.guest.w64(nwrite, 0);
         return err(CELL_EFAULT);
     }
-    std::vector<u8> bounce(static_cast<usize>(std::min<u64>(nbytes, kBounce)));
     u64 total = 0;
+    Result r = CELL_OK;
     {
         std::lock_guard lock(file->lock);
         if (file->host_fd < 0) return err(CELL_EBADF);
-        if (file->flags & CELL_FS_O_APPEND) ::lseek(file->host_fd, 0, SEEK_END);
-        while (total < nbytes) {
-            const usize chunk = static_cast<usize>(std::min<u64>(nbytes - total, bounce.size()));
-            std::memcpy(bounce.data(), s.guest.ptr(buf + static_cast<u32>(total)), chunk);
-            usize done = 0;
-            while (done < chunk) {
-                const ssize_t n = ::write(file->host_fd, bounce.data() + done, chunk - done);
-                if (n < 0) {
-                    if (errno == EINTR) continue;
-                    s.guest.w64(nwrite, total + done);
-                    return map_errno(errno, "sys_fs_write", file->vpath);
-                }
-                done += static_cast<usize>(n);
-            }
-            total += chunk;
-        }
+        r = write_locked(s, *file, buf, nbytes, std::nullopt, total);
     }
     s.guest.w64(nwrite, total);
-    return CELL_OK;
+    return r;
 }
 
 Result sys_fs_close(PpuThread& t, u32 fd)
@@ -463,10 +622,14 @@ Result sys_fs_close(PpuThread& t, u32 fd)
     if (!file) return err(CELL_EBADF);
     {
         std::lock_guard lock(file->lock);
-        if (file->host_fd < 0) return err(CELL_EBADF);
-        if (file->flags & CELL_FS_O_ACCMODE) ::fsync(file->host_fd); // RPCS3 syncs written files on close
-        ::close(file->host_fd);
-        file->host_fd = -1;
+        if (!file->is_open()) return err(CELL_EBADF);
+        if (file->image_file) {
+            file->image_file.reset();
+        } else {
+            if (file->flags & CELL_FS_O_ACCMODE) ::fsync(file->host_fd); // RPCS3 syncs written files on close
+            ::close(file->host_fd);
+            file->host_fd = -1;
+        }
     }
     s.fds.remove(FsObject::kIdBase, fd);
     PS_LOG_DEBUG(kFs, "sys_fs_close(fd {})", fd);
@@ -488,6 +651,15 @@ Result sys_fs_opendir(PpuThread& t, u32 path, u32 fd)
     } else {
         if (!res.mount) return err(CELL_ENOTMOUNTED);
         dir->mount = res.mount_ref;
+        if (res.mount->image) {
+            const auto st = res.mount->image->stat(res.image_path);
+            if (!st) return err(CELL_ENOENT);
+            if (!st->dir) return err(CELL_ENOTDIR);
+            const auto list = res.mount->image->list(res.image_path);
+            if (!list) return err(CELL_EIO);
+            for (const auto& [name, entry] : *list) dir->entries.push_back({name, entry.dir});
+            return finish_opendir(s, std::move(dir), fd);
+        }
         struct stat st {};
         if (::stat(res.host.c_str(), &st) != 0) return map_errno(errno, "sys_fs_opendir", p.vpath);
         if (!S_ISDIR(st.st_mode)) return err(CELL_ENOTDIR);
@@ -502,15 +674,7 @@ Result sys_fs_opendir(PpuThread& t, u32 path, u32 fd)
         }
         ::closedir(d);
     }
-    // ". " and ".." first, as on the PS3, then the entries sorted by name (RPCS3 sys_fs_opendir).
-    std::sort(dir->entries.begin(), dir->entries.end(), [](const FsDir::Entry& a, const FsDir::Entry& b) { return a.name < b.name; });
-    dir->entries.insert(dir->entries.begin(), {{".", true}, {"..", true}});
-    dir->refs = 1;
-    const u32 id = s.fds.insert(FsObject::kIdBase, dir);
-    if (!id) return err(CELL_EMFILE);
-    dir->id = id;
-    s.guest.w32(fd, id);
-    return CELL_OK;
+    return finish_opendir(s, std::move(dir), fd);
 }
 
 Result sys_fs_readdir(PpuThread& t, u32 fd, u32 dir, u32 nread)
@@ -561,6 +725,13 @@ Result sys_fs_stat(PpuThread& t, u32 path, u32 sb)
         return CELL_OK;
     }
     if (!res.mount) return err(CELL_ENOTMOUNTED);
+    if (res.mount->image) {
+        const auto st = res.mount->image->stat(res.image_path);
+        if (!st) return err(CELL_ENOENT);
+        if (res.trailing_dot && !st->dir) return err(CELL_ENOTDIR);
+        write_image_stat(s.guest, sb, *res.mount, *st, true);
+        return CELL_OK;
+    }
     struct stat st {};
     if (::stat(res.host.c_str(), &st) != 0) return map_errno(errno, "sys_fs_stat", p.vpath);
     if (res.trailing_dot && !S_ISDIR(st.st_mode)) return err(CELL_ENOTDIR);
@@ -577,7 +748,11 @@ Result sys_fs_fstat(PpuThread& t, u32 fd, u32 sb)
     struct stat st {};
     {
         std::lock_guard lock(file->lock);
-        if (file->host_fd < 0) return err(CELL_EBADF);
+        if (!file->is_open()) return err(CELL_EBADF);
+        if (file->image_file) {
+            write_image_stat(s.guest, sb, *file->mount, {false, file->image_file->size()}, false);
+            return CELL_OK;
+        }
         if (::fstat(file->host_fd, &st) != 0) return map_errno(errno, "sys_fs_fstat", file->vpath);
     }
     write_host_stat(s.guest, sb, *file->mount, st, false);
@@ -646,7 +821,7 @@ Result sys_fs_unlink(PpuThread& t, u32 path)
     const Vfs::Resolved res = s.vfs.resolve(p.vpath);
     if (res.root) return err(CELL_EISDIR);
     if (!res.mount) return err(CELL_ENOTMOUNTED);
-    if (host_is_dir(res.host)) return err(CELL_EISDIR);
+    if (res.mount->image ? image_is_dir(res) : host_is_dir(res.host)) return err(CELL_EISDIR);
     if (res.mount->read_only) return err(CELL_EROFS);
     if (::unlink(res.host.c_str()) != 0) return map_errno(errno, "sys_fs_unlink", p.vpath);
     return CELL_OK;
@@ -662,7 +837,17 @@ Result sys_fs_lseek(PpuThread& t, u32 fd, s64 offset, s32 whence, u32 pos)
     off_t result = 0;
     {
         std::lock_guard lock(file->lock);
-        if (file->host_fd < 0) return err(CELL_EBADF);
+        if (!file->is_open()) return err(CELL_EBADF);
+        if (file->image_file) {
+            const s64 from = whence == CELL_FS_SEEK_SET ? 0
+                : whence == CELL_FS_SEEK_CUR        ? static_cast<s64>(file->pos)
+                                                    : static_cast<s64>(file->image_file->size());
+            s64 to = 0;
+            if (__builtin_add_overflow(from, offset, &to) || to < 0) return err(CELL_EINVAL);
+            file->pos = static_cast<u64>(to);
+            s.guest.w64(pos, file->pos);
+            return CELL_OK;
+        }
         const int host_whence = whence == CELL_FS_SEEK_SET ? SEEK_SET : whence == CELL_FS_SEEK_CUR ? SEEK_CUR : SEEK_END;
         result = ::lseek(file->host_fd, static_cast<off_t>(offset), host_whence);
     }
@@ -709,6 +894,93 @@ Result sys_fs_ftruncate(PpuThread& t, u32 fd, u64 size)
     return CELL_OK;
 }
 
+// RPCS3 sys_fs_chmod: lv2 checks the path and changes nothing (the PS3 file systems keep no permissions games see).
+Result sys_fs_chmod(PpuThread& t, u32 path, s32)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const PathArg p = read_path(s.guest, path);
+    if (p.error) return p.error;
+    const Vfs::Resolved res = s.vfs.resolve(p.vpath);
+    if (res.root || !res.mount) return err(CELL_ENOTMOUNTED);
+    if (res.mount->read_only) return err(CELL_EROFS);
+    struct stat st {};
+    if (::stat(res.host.c_str(), &st) != 0) return map_errno(errno, "sys_fs_chmod", p.vpath);
+    return CELL_OK;
+}
+
+// RPCS3 sys_fs_utime. CellFsUtimbuf: actime, modtime (s64 each, 4-byte aligned).
+Result sys_fs_utime(PpuThread& t, u32 path, u32 timep)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const PathArg p = read_path(s.guest, path);
+    if (p.error) return p.error;
+    if (!s.guest.valid(timep, 16)) return err(CELL_EFAULT);
+    const Vfs::Resolved res = s.vfs.resolve(p.vpath);
+    if (res.root) return err(CELL_EISDIR);
+    if (!res.mount) return err(CELL_ENOTMOUNTED);
+    if (res.mount->read_only) return err(CELL_EROFS);
+    struct timeval times[2] {};
+    times[0].tv_sec = static_cast<time_t>(static_cast<s64>(s.guest.r64(timep)));
+    times[1].tv_sec = static_cast<time_t>(static_cast<s64>(s.guest.r64(timep + 8)));
+    if (::utimes(res.host.c_str(), times) != 0) return map_errno(errno, "sys_fs_utime", p.vpath);
+    return CELL_OK;
+}
+
+// RPCS3 sys_fs_fcntl, for the operations cellFs reaches it with:
+// - 0x8000000A / 0x8000000B (cellFsReadWithOffset / cellFsWriteWithOffset): read or write at an offset without
+//   moving the file position. lv2_file_op_rw (0x38 bytes): vtable, op, 2 x u32, fd, buf, offset (u64), size (u64),
+//   out_code (s32) at 0x28, out_size (u64) at 0x30.
+// - 0xE0000017 (cellFsAllocateFileAreaWithoutZeroFill): sets a file's size. lv2_file_e0000017 (0x28 bytes): size,
+//   0x10, 0x20, -, path, size (u64) at 0x18, out_code at 0x20.
+// Deviation: any other operation logs an error and returns CELL_EINVAL (RPCS3 logs and returns CELL_OK), so nothing
+// silently succeeds (CLAUDE.md rule 4).
+Result sys_fs_fcntl(PpuThread& t, u32 fd, u32 op, u32 arg, u32 size)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    switch (op) {
+    case 0x8000000A:
+    case 0x8000000B: {
+        const bool write = op == 0x8000000B;
+        if (size < 0x38) return err(CELL_EINVAL);
+        if (!s.guest.valid(arg, 0x38)) return err(CELL_EFAULT);
+        const auto file = get_file(t.kernel, fd);
+        if (!file) return err(CELL_EBADF);
+        if (!write && (file->flags & CELL_FS_O_WRONLY)) return err(CELL_EBADF);
+        if (write && (!(file->flags & CELL_FS_O_ACCMODE) || (file->flags & CELL_FS_O_APPEND))) return err(CELL_EBADF);
+        if (write && file->mount->read_only) return err(CELL_EROFS);
+        const u32 buf = s.guest.r32(arg + 0x14);
+        const u64 offset = s.guest.r64(arg + 0x18);
+        const u64 nbytes = s.guest.r64(arg + 0x20);
+        if (nbytes && !s.guest.valid(buf, nbytes)) return err(CELL_EFAULT);
+        u64 done = 0;
+        Result r = CELL_OK;
+        {
+            std::lock_guard lock(file->lock);
+            if (!file->is_open()) return err(CELL_EBADF);
+            if (nbytes) {
+                r = write ? write_locked(s, *file, buf, nbytes, offset, done)
+                          : read_locked(s, *file, buf, nbytes, offset, done);
+            }
+        }
+        s.guest.w64(arg + 0x30, done);
+        s.guest.w32(arg + 0x28, static_cast<u32>(r));
+        return CELL_OK;
+    }
+    case 0xE0000017: {
+        if (!s.guest.valid(arg, 0x28)) return err(CELL_EFAULT);
+        if (size < s.guest.r32(arg) || s.guest.r32(arg + 4) != 0x10 || s.guest.r32(arg + 8) != 0x20) {
+            return err(CELL_EINVAL);
+        }
+        const Result r = sys_fs_truncate(t, s.guest.r32(arg + 0x10), s.guest.r64(arg + 0x18));
+        s.guest.w32(arg + 0x20, static_cast<u32>(r));
+        return CELL_OK;
+    }
+    default:
+        PS_LOG_ERROR(kFs, "sys_fs_fcntl(fd {}, op {:#x}, size {:#x}): operation not implemented", fd, op, size);
+        return err(CELL_EINVAL);
+    }
+}
+
 void register_fs_syscalls(SyscallTable& table)
 {
     PS_LV2_BIND(table, 801, sys_fs_open);
@@ -724,11 +996,14 @@ void register_fs_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 812, sys_fs_rename);
     PS_LV2_BIND(table, 813, sys_fs_rmdir);
     PS_LV2_BIND(table, 814, sys_fs_unlink);
+    PS_LV2_BIND(table, 815, sys_fs_utime);
+    PS_LV2_BIND(table, 817, sys_fs_fcntl);
     PS_LV2_BIND(table, 818, sys_fs_lseek);
     PS_LV2_BIND(table, 819, sys_fs_fdatasync);
     PS_LV2_BIND(table, 820, sys_fs_fsync);
     PS_LV2_BIND(table, 831, sys_fs_truncate);
     PS_LV2_BIND(table, 832, sys_fs_ftruncate);
+    PS_LV2_BIND(table, 834, sys_fs_chmod);
 }
 
 } // namespace pspocket::lv2

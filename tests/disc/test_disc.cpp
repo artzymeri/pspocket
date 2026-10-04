@@ -11,7 +11,10 @@
 #include <vector>
 
 #include "pspocket/disc/disc.h"
+#include "pspocket/core/guest_memory.hpp"
 #include "pspocket/disc/iso9660.hpp"
+#include "pspocket/loader/disc.hpp"
+#include "pspocket/lv2/kernel.hpp"
 
 using namespace pspocket;
 using namespace pspocket::disc;
@@ -386,3 +389,63 @@ TEST_CASE("Reads an image made by hdiutil")
     fs::remove_all(dir);
 }
 #endif
+
+TEST_CASE("The disc image as a VFS image: lookups ignore case, reads cross extents, encrypted images are refused")
+{
+    Ps3Disc disc(false);
+    const fs::path dir = temp_dir("vfsimage");
+    write_file(dir / "game.iso", disc.iso.image);
+
+    pspocket::loader::DiscInfo info;
+    std::string error;
+    const auto image = pspocket::loader::open_disc_image((dir / "game.iso").string(), &info, &error);
+    INFO(error);
+    REQUIRE(image);
+    CHECK(info.title_id == "BLES01807");
+    CHECK(info.volume_id == "PS3VOLUME");
+    CHECK(info.param_sfo == disc.sfo);
+
+    const auto root = image->stat("");
+    REQUIRE(root);
+    CHECK(root->dir);
+    const auto eboot = image->stat("ps3_game/usrdir/eboot.bin"); // the disc says EBOOT.BIN
+    REQUIRE(eboot);
+    CHECK_FALSE(eboot->dir);
+    CHECK(eboot->size == disc.eboot.size());
+    CHECK_FALSE(image->stat("PS3_GAME/USRDIR/NOPE.BIN"));
+
+    const auto listing = image->list("PS3_GAME/USRDIR");
+    REQUIRE(listing);
+    std::vector<std::string> names;
+    for (const auto& [name, st] : *listing) names.push_back(name + (st.dir ? "/" : ""));
+    CHECK(names == std::vector<std::string>{"BIG.DAT", "DATA.RPF", "EBOOT.BIN", "LIB/"});
+    CHECK_FALSE(image->list("PS3_GAME/PARAM.SFO"));
+
+    // BIG.DAT is two extents: a read across the boundary at 4096 comes from both.
+    const auto big = image->open("PS3_GAME/USRDIR/BIG.DAT");
+    REQUIRE(big);
+    std::vector<u8> whole = disc.big_a;
+    whole.insert(whole.end(), disc.big_b.begin(), disc.big_b.end());
+    CHECK(big->size() == whole.size());
+    std::vector<u8> part(300);
+    REQUIRE(big->read(4000, part.data(), part.size()));
+    CHECK(std::equal(part.begin(), part.end(), whole.begin() + 4000));
+    CHECK_FALSE(big->read(whole.size() - 10, part.data(), 20)); // past the end
+    CHECK_FALSE(image->open("PS3_GAME/USRDIR/LIB"));            // a directory
+    CHECK_FALSE(image->open("PS3_GAME/USRDIR/NOPE.BIN"));
+
+    // Mounted in a kernel: /dev_bdvd from the root, /app_home from PS3_GAME/USRDIR.
+    GuestMemory memory;
+    REQUIRE(memory.reserve());
+    pspocket::lv2::Kernel kernel(memory);
+    REQUIRE(pspocket::loader::mount_disc_image(kernel, (dir / "game.iso").string(), nullptr, &error));
+
+    Ps3Disc encrypted(true);
+    write_file(dir / "encrypted.iso", encrypted.iso.image);
+    CHECK_FALSE(pspocket::loader::open_disc_image((dir / "encrypted.iso").string(), nullptr, &error));
+    CHECK(error.find("encrypted at disc level") != std::string::npos);
+    write_file(dir / "junk.iso", pattern(64 * kSectorSize, 9));
+    CHECK_FALSE(pspocket::loader::open_disc_image((dir / "junk.iso").string(), nullptr, &error));
+    CHECK_FALSE(pspocket::loader::open_disc_image((dir / "missing.iso").string(), nullptr, &error));
+    fs::remove_all(dir);
+}

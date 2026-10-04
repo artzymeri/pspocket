@@ -2,8 +2,10 @@
 
 #include <unistd.h>
 
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 #include "lv2_test_util.hpp"
@@ -90,6 +92,57 @@ Stat read_stat(Fixture& f, u32 sb)
     return {static_cast<s32>(f.r32(sb)), static_cast<s32>(f.r32(sb + 4)), static_cast<s32>(f.r32(sb + 8)),
         f.r64(sb + 36), f.r64(sb + 44)};
 }
+
+// A read-only image in memory: file paths and contents; directories are the files' parents.
+class MemImage final : public VfsImage {
+public:
+    std::map<std::string, std::string> files;
+
+    class MemFile final : public File {
+    public:
+        explicit MemFile(std::string bytes) : bytes_(std::move(bytes)) {}
+        u64 size() const override { return bytes_.size(); }
+        bool read(u64 offset, void* dst, usize size) const override
+        {
+            if (offset > bytes_.size() || size > bytes_.size() - offset) return false;
+            std::memcpy(dst, bytes_.data() + offset, size);
+            return true;
+        }
+
+    private:
+        std::string bytes_;
+    };
+
+    std::optional<Stat> stat(std::string_view path) const override
+    {
+        if (const auto it = files.find(std::string(path)); it != files.end()) return Stat{false, it->second.size()};
+        if (path.empty()) return Stat{true, 0};
+        const std::string prefix = std::string(path) + "/";
+        for (const auto& [p, bytes] : files)
+            if (p.starts_with(prefix)) return Stat{true, 0};
+        return std::nullopt;
+    }
+    std::optional<std::vector<std::pair<std::string, Stat>>> list(std::string_view path) const override
+    {
+        const auto st = stat(path);
+        if (!st || !st->dir) return std::nullopt;
+        const std::string prefix = path.empty() ? "" : std::string(path) + "/";
+        std::map<std::string, Stat> children;
+        for (const auto& [p, bytes] : files) {
+            if (!p.starts_with(prefix)) continue;
+            const std::string rest = p.substr(prefix.size());
+            const auto slash = rest.find('/');
+            if (slash == std::string::npos) children[rest] = Stat{false, bytes.size()};
+            else children[rest.substr(0, slash)] = Stat{true, 0};
+        }
+        return std::vector<std::pair<std::string, Stat>>(children.begin(), children.end());
+    }
+    std::shared_ptr<const File> open(std::string_view path) const override
+    {
+        const auto it = files.find(std::string(path));
+        return it == files.end() ? nullptr : std::make_shared<MemFile>(it->second);
+    }
+};
 
 } // namespace
 
@@ -305,4 +358,93 @@ TEST_CASE("lv2 fs: rename, truncate and path normalization", "[lv2][fs]")
     CHECK(t.stat("/dev_hdd0/game/TEST00000/uno/.", sb) == rc(CELL_ENOTDIR));
     CHECK(t.stat("/dev_hdd0/game/.", sb) == CELL_OK);
     CHECK(t.stat("relative", sb) == rc(CELL_ENOENT));
+}
+
+TEST_CASE("lv2 fs: a disc image mounted read-only as /dev_bdvd and /app_home", "[lv2][fs]")
+{
+    FsFixture t;
+    auto image = std::make_shared<MemImage>();
+    std::string big(5000, '\0');
+    for (usize i = 0; i < big.size(); i++) big[i] = static_cast<char>('a' + i % 26);
+    image->files["PS3_GAME/PARAM.SFO"] = "sfo";
+    image->files["PS3_GAME/USRDIR/EBOOT.BIN"] = "SCE\0eboot";
+    image->files["PS3_GAME/USRDIR/data/big.bin"] = big;
+    REQUIRE(t.f.kernel->vfs_mount_image("/dev_bdvd", image));
+    REQUIRE(t.f.kernel->vfs_mount_image("/app_home", image, "PS3_GAME/USRDIR"));
+    CHECK_FALSE(t.f.kernel->vfs_mount_image("/dev_usb000", image, "PS3_GAME/PARAM.SFO")); // not a directory
+
+    // Reads, seeks and the file position, through both mount points.
+    const u32 fd = t.open_ok("/dev_bdvd/PS3_GAME/USRDIR/data/big.bin", CELL_FS_O_RDONLY);
+    std::string s;
+    REQUIRE(t.read(fd, 10, s) == CELL_OK);
+    CHECK(s == big.substr(0, 10));
+    const u32 pos = t.f.alloc(8);
+    REQUIRE(t.c.call(kFsLseek, fd, 4000, CELL_FS_SEEK_SET, pos) == CELL_OK);
+    REQUIRE(t.read(fd, 2000, s) == CELL_OK);
+    CHECK(s == big.substr(4000)); // 1000 bytes: the rest of the file
+    REQUIRE(t.read(fd, 100, s) == CELL_OK);
+    CHECK(s.empty()); // at the end
+    REQUIRE(t.c.call(kFsLseek, fd, -10, CELL_FS_SEEK_END, pos) == CELL_OK);
+    CHECK(t.f.r64(pos) == 4990);
+    CHECK(t.c.call(kFsLseek, fd, -5000, CELL_FS_SEEK_CUR, pos) == rc(CELL_EINVAL));
+    REQUIRE(t.read(fd, 100, s) == CELL_OK);
+    CHECK(s == big.substr(4990));
+    const u32 sb = t.f.alloc(kCellFsStatSize);
+    REQUIRE(t.c.call(kFsFstat, fd, sb) == CELL_OK);
+    Stat st = read_stat(t.f, sb);
+    CHECK(st.mode == (CELL_FS_S_IFREG | 0444));
+    CHECK(st.size == 5000);
+    CHECK(st.blksize == 2048);
+    u64 n = 0;
+    CHECK(t.write(fd, "x", n) == rc(CELL_EBADF));
+    REQUIRE(t.c.call(kFsClose, fd) == CELL_OK);
+    CHECK(t.c.call(kFsClose, fd) == rc(CELL_EBADF));
+    const u32 app = t.open_ok("/app_home/data/big.bin", CELL_FS_O_RDONLY);
+    REQUIRE(t.read(app, 3, s) == CELL_OK);
+    CHECK(s == "abc");
+    REQUIRE(t.c.call(kFsClose, app) == CELL_OK);
+
+    // Read-only, as /dev_bdvd always is.
+    u32 bad = 0;
+    CHECK(t.open("/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN", CELL_FS_O_RDWR, bad) == rc(CELL_EPERM));
+    CHECK(t.open("/dev_bdvd/PS3_GAME/new.bin", CELL_FS_O_CREAT | CELL_FS_O_WRONLY, bad) == rc(CELL_EPERM));
+    CHECK(t.open("/dev_bdvd/PS3_GAME/none.bin", CELL_FS_O_RDONLY, bad) == rc(CELL_ENOENT));
+    CHECK(t.open("/dev_bdvd/PS3_GAME/USRDIR", CELL_FS_O_RDONLY, bad) == rc(CELL_EISDIR));
+    CHECK(t.open("/dev_bdvd/PS3_GAME/PARAM.SFO", CELL_FS_O_RDONLY | CELL_FS_O_MSELF, bad) == rc(CELL_ENOTMSELF));
+    CHECK(t.c.call(kFsMkdir, t.f.cstr("/dev_bdvd/dir"), 0777) == rc(CELL_EROFS));
+    CHECK(t.c.call(kFsUnlink, t.f.cstr("/dev_bdvd/PS3_GAME/PARAM.SFO")) == rc(CELL_EROFS));
+    CHECK(t.c.call(kFsUnlink, t.f.cstr("/dev_bdvd/PS3_GAME/USRDIR")) == rc(CELL_EISDIR));
+    CHECK(t.c.call(kFsRename, t.f.cstr("/dev_bdvd/PS3_GAME/PARAM.SFO"), t.f.cstr("/dev_bdvd/x")) == rc(CELL_EROFS));
+    CHECK(t.c.call(kFsTruncate, t.f.cstr("/dev_bdvd/PS3_GAME/PARAM.SFO"), 0) == rc(CELL_EROFS));
+
+    // stat: directories report the device's block size as their size.
+    REQUIRE(t.stat("/dev_bdvd/PS3_GAME", sb) == CELL_OK);
+    st = read_stat(t.f, sb);
+    CHECK(st.mode == (CELL_FS_S_IFDIR | 0555));
+    CHECK(st.size == 2048);
+    CHECK(st.uid == -1);
+    REQUIRE(t.stat("/dev_bdvd/PS3_GAME/../PS3_GAME/PARAM.SFO", sb) == CELL_OK);
+    CHECK(read_stat(t.f, sb).size == 3);
+    CHECK(t.stat("/dev_bdvd/PS3_GAME/PARAM.SFO/.", sb) == rc(CELL_ENOTDIR));
+    CHECK(t.stat("/dev_bdvd/nope", sb) == rc(CELL_ENOENT));
+
+    // Directory listings: "." and "..", then the entries by name.
+    const u32 out = t.f.alloc(4);
+    REQUIRE(t.c.call(kFsOpendir, t.f.cstr("/dev_bdvd/PS3_GAME/USRDIR"), out) == CELL_OK);
+    const u32 dfd = t.f.r32(out);
+    const u32 dirent = t.f.alloc(kCellFsDirentSize);
+    const u32 nread = t.f.alloc(8);
+    std::vector<std::pair<std::string, u8>> listed;
+    for (;;) {
+        REQUIRE(t.c.call(kFsReaddir, dfd, dirent, nread) == CELL_OK);
+        if (t.f.r64(nread) == 0) break;
+        listed.emplace_back(std::string(reinterpret_cast<const char*>(t.f.base() + dirent + 2), t.f.base()[dirent + 1]),
+            t.f.base()[dirent]);
+    }
+    const std::vector<std::pair<std::string, u8>> expected = {{".", CELL_FS_TYPE_DIRECTORY},
+        {"..", CELL_FS_TYPE_DIRECTORY}, {"EBOOT.BIN", CELL_FS_TYPE_REGULAR}, {"data", CELL_FS_TYPE_DIRECTORY}};
+    CHECK(listed == expected);
+    REQUIRE(t.c.call(kFsClosedir, dfd) == CELL_OK);
+    CHECK(t.c.call(kFsOpendir, t.f.cstr("/dev_bdvd/PS3_GAME/PARAM.SFO"), out) == rc(CELL_ENOTDIR));
+    CHECK(t.c.call(kFsOpendir, t.f.cstr("/dev_bdvd/missing"), out) == rc(CELL_ENOENT));
 }

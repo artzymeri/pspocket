@@ -52,9 +52,19 @@ struct LinkedFunction {
     std::atomic<u64> calls{0};
 };
 
+// The running game, for cellGame: how it was started and its PARAM.SFO. A disc game has it in
+// /dev_bdvd/PS3_GAME, an HDD game in /dev_hdd0/game/<title_id>.
+struct GameInfo {
+    enum class Boot : u8 { Disc, Hdd };
+    Boot boot = Boot::Disc;
+    std::string title_id;      // "BLES01807"; empty if unknown
+    std::vector<u8> param_sfo; // PARAM.SFO as on the disc; empty if unknown
+};
+
 struct ProcessConfig {
     // Abort on the first call to an unimplemented function instead of logging and returning CELL_ENOSYS.
     bool abort_on_unimplemented = false;
+    GameInfo game;
 };
 
 class HleProcess {

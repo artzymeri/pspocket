@@ -439,6 +439,40 @@ its task functions can be stubs). Consequences:
 - From run 013: a task's LS pattern is read only when the task has a context. The pattern only describes what the
   context keeps, and GTA V's first `_cellSpursTaskAttributeInitialize` passed 0x40 in one of those two registers.
 
+## D-043 · 2026-10-04 · The game reads its disc image in place; boot.sh finds it or copies it from the iPhone
+
+Run 014. GTA V's first file access (`cellFsStat` and `cellFsOpen` on `/dev_bdvd/...`) needs the disc. That settles
+the open question of whether to extract the disc or read the ISO: **read it in place**. lv2 gets a read-only
+`VfsImage` interface, and the loader puts runtime/disc's ISO 9660 reader behind it. `/dev_bdvd` mounts the image root
+and `/app_home` mounts `PS3_GAME/USRDIR`, where RPCS3 puts `/app_home` for a game started from the drive. Every sys_fs
+syscall reads image mounts with the results a read-only host directory gives. Lookups ignore case, as the reader does
+on PS3 discs, and files over 4 GB read across their extents. Nothing is extracted, so the 18.7 GB GTA V image costs no
+extra space, and the iOS app can use the same path on the copy it already holds.
+
+On the Mac, `scripts/boot.sh` takes the first image that reads as a PS3 game disc (`pspocket-boot --probe-disc`),
+searching in this order:
+1. `$PSPOCKET_ISO`;
+2. `inventory/<game>/`;
+3. the Desktop and Downloads.
+
+If none of those has one, it copies the image the app holds on the connected iPhone into `inventory/<game>/disc.iso`
+once (`scripts/ios.sh pull-iso`, through devicectl). That image, like everything in `inventory/`, never goes into git.
+The game's `/dev_hdd0` is `inventory/<game>/hdd0`, for game data and saves.
+
+## D-044 · 2026-10-04 · cellFs over lv2, cellGame as RPCS3 without the delays, sceNp2Init offline
+
+Run 014.
+
+- **cellFs.** The 20 `cellFs` functions GTA V imports forward to lv2 as RPCS3's `cellFs.cpp` does. Read and write at
+  an offset go through `sys_fs_fcntl` 0x8000000A/B with RPCS3's argument block, and allocate-area goes through
+  0xE0000017. lv2 gains `sys_fs_fcntl`, `sys_fs_chmod` and `sys_fs_utime`. Deviation: an fcntl operation lv2 doesn't
+  implement logs and returns `CELL_EINVAL`, where RPCS3 returns `CELL_OK` (rule 4).
+- **cellGame.** It follows RPCS3's `content_permission`: a check opens a session and ContentPermit ends it. Game data
+  is created in a temporary directory and moved into place with a PARAM.SFO written by a PSF writer that follows
+  RPCS3's `save_object`. RPCS3's sleeps, which imitate the PS3's slow calls, are left out. The error dialog only logs,
+  since there is no UI yet.
+- **sceNp2Init.** It brings NP up with no user signed in, so the status reads offline.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
@@ -448,4 +482,4 @@ its task functions can be stubs). Consequences:
   chains and queues.
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
 - [ ] Input: controller required, or a polished touch overlay as well.
-- [ ] ISO handling: extract assets, or read directly from the ISO.
+- [x] ISO handling → D-043 (read directly from the ISO).

@@ -19,8 +19,11 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/types.hpp"
@@ -32,6 +35,31 @@ namespace pspocket::lv2 {
 
 class EventQueue;
 class Kernel;
+
+// A read-only file system image mounted in the VFS: a disc image read in place (plan section 9, "read straight from
+// the ISO"). The host adapts its reader to this interface (the loader does it for ISO 9660 images); lv2 only reads.
+// Paths are relative to the image root, '/'-separated, without a leading slash ("" is the root). Lookups may ignore
+// case (a PS3 disc's names), and every member may be called from several threads at once.
+class VfsImage {
+public:
+    struct Stat {
+        bool dir = false;
+        u64 size = 0;
+    };
+    class File {
+    public:
+        virtual ~File() = default;
+        virtual u64 size() const = 0;
+        // Reads exactly `size` bytes at `offset` (within the file); false on an I/O error.
+        virtual bool read(u64 offset, void* dst, usize size) const = 0;
+    };
+    virtual ~VfsImage() = default;
+    virtual std::optional<Stat> stat(std::string_view path) const = 0;
+    // The entries of a directory (without "." and ".."), or nullopt if `path` isn't one.
+    virtual std::optional<std::vector<std::pair<std::string, Stat>>> list(std::string_view path) const = 0;
+    // A regular file, or null if `path` doesn't name one.
+    virtual std::shared_ptr<const File> open(std::string_view path) const = 0;
+};
 
 // Thrown to unwind a PPU thread's host stack: sys_ppu_thread_exit, process exit and kernel shutdown. It passes
 // through lifted C code, which therefore must keep unwind tables (the clang default on Darwin; never build lifted
@@ -163,7 +191,13 @@ public:
     // Filesystem mapping (plan section 8): `point` is "/dev_bdvd", "/dev_hdd0", "/dev_hdd1", "/app_home" or
     // "/host_root" (dev only); `host_dir` is an existing host directory.
     bool vfs_mount(std::string_view point, std::string_view host_dir, bool read_only);
+    // Mounts a read-only image at `point`, from the image's directory `subdir` ("" = its root; e.g. /dev_bdvd from
+    // the root of a disc image, /app_home from its PS3_GAME/USRDIR).
+    bool vfs_mount_image(std::string_view point, std::shared_ptr<const VfsImage> image, std::string_view subdir = {});
     void vfs_unmount(std::string_view point);
+    // The host path a guest path maps to on a host-directory mount, for HLE modules that manage files for the game
+    // (cellGame creating game data). Empty for the root, an image mount or a path outside every mount.
+    std::string vfs_host_path(std::string_view vpath) const;
 
     // PPU threads. create_thread allocates the guest stack and an ID and leaves the thread stopped.
     Result create_thread(const ThreadParams& params, u32& id_out);

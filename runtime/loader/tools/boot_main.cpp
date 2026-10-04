@@ -2,9 +2,12 @@
 // exits, a timeout passes or (with --stop-at-first) it reaches the first unimplemented syscall or firmware function.
 // This is the Phase 2 bring-up tool (plan section 10): the log names every gap the game hits, in order.
 //
-//   pspocket-boot <EBOOT.elf> [--bdvd DIR] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS] [--stop-at-first]
-//                 [--log trace|debug|info|warn|error] [--imports]
+//   pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]
+//                 [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]
+//   pspocket-boot --probe-disc IMAGE.iso
 //
+// --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
+// /app_home from PS3_GAME/USRDIR unless --app-home says otherwise).
 // --imports lists every imported function by module (implemented ones marked) and exits without running.
 // A host fault inside guest memory (an access to an unmapped guest address) is reported with the guest address and
 // the faulting PPU thread's instruction address before the process dies (CLAUDE.md rule 5).
@@ -16,6 +19,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
@@ -28,6 +32,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/hle/process.hpp"
+#include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/ppu/disasm.hpp"
@@ -40,8 +45,9 @@ namespace {
 int usage()
 {
     std::fprintf(stderr,
-        "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]\n"
-        "                     [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]\n");
+        "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]\n"
+        "                     [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]\n"
+        "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
 
@@ -158,6 +164,17 @@ bool read_file(const char* path, std::vector<u8>& out)
 
 int main(int argc, char** argv)
 {
+    // --probe-disc IMAGE: is it a readable PS3 game disc? Prints its title ID (exit 0) or why not (exit 1).
+    if (argc == 3 && std::string_view(argv[1]) == "--probe-disc") {
+        loader::DiscInfo disc;
+        std::string error;
+        if (!loader::open_disc_image(argv[2], &disc, &error)) {
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 1;
+        }
+        std::printf("%s %s\n", disc.title_id.c_str(), disc.title.c_str());
+        return 0;
+    }
     if (argc < 2) return usage();
     const char* elf_path = nullptr;
     std::string bdvd, hdd0, app_home;
@@ -219,11 +236,26 @@ int main(int argc, char** argv)
 
     lv2::Kernel kernel(memory, cfg);
     kernel.install();
-    if (!bdvd.empty() && !kernel.vfs_mount("/dev_bdvd", bdvd, true)) return 66;
+    hle::GameInfo game;
+    if (!bdvd.empty() && std::filesystem::is_regular_file(bdvd)) {
+        // A disc image: read in place; /dev_bdvd and /app_home come from it.
+        loader::DiscInfo disc;
+        std::string error;
+        if (!loader::mount_disc_image(kernel, bdvd, &disc, &error)) {
+            std::fprintf(stderr, "pspocket-boot: %s\n", error.c_str());
+            return 66;
+        }
+        game.title_id = disc.title_id;
+        game.param_sfo = std::move(disc.param_sfo);
+    } else if (!bdvd.empty()) {
+        if (!kernel.vfs_mount("/dev_bdvd", bdvd, true)) return 66;
+        std::vector<u8> sfo;
+        if (read_file((bdvd + "/PS3_GAME/PARAM.SFO").c_str(), sfo)) game.param_sfo = std::move(sfo);
+    }
     if (!hdd0.empty() && !kernel.vfs_mount("/dev_hdd0", hdd0, false)) return 66;
     if (!app_home.empty() && !kernel.vfs_mount("/app_home", app_home, false)) return 66;
 
-    hle::HleProcess hle(kernel, PS_MEM_MAIN_BASE, cfg.main_area_end, {stop_at_first});
+    hle::HleProcess hle(kernel, PS_MEM_MAIN_BASE, cfg.main_area_end, {stop_at_first, std::move(game)});
     g_hle = &hle;
     struct ForgetHle {
         ~ForgetHle() { g_hle = nullptr; } // before `hle` is destroyed

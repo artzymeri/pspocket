@@ -7,8 +7,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <thread>
+#include <tuple>
+
+#include <unistd.h>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/guest_memory.hpp"
@@ -33,12 +38,12 @@ struct Fixture {
     std::unique_ptr<lv2::Kernel> kernel;
     std::unique_ptr<hle::HleProcess> hle;
 
-    Fixture()
+    explicit Fixture(hle::ProcessConfig config = {})
     {
         REQUIRE(mem.reserve());
         kernel = std::make_unique<lv2::Kernel>(mem);
         kernel->install();
-        hle = std::make_unique<hle::HleProcess>(*kernel, 0x10000, 0x10000000);
+        hle = std::make_unique<hle::HleProcess>(*kernel, 0x10000, 0x10000000, std::move(config));
         hle->install();
         REQUIRE(hle->main_memory().reserve(kData, 0x200000));
         REQUIRE(mem.commit(kData, 0x200000));
@@ -800,4 +805,225 @@ TEST_CASE("cellSpurs tasks: LS patterns from the task ELF, context size, create 
     for (u32 w = 0; w < 4; w++) ps_write32(base, kTs + 0x30 + 4 * w, 0xFFFFFFFFu);
     CHECK(a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, 0) == kTaskAgain);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+}
+
+TEST_CASE("sys_fs (cellFs): open, write, read, offsets, seek, stat, directories, allocate", "[hle][fs]")
+{
+    namespace fsys = std::filesystem;
+    const fsys::path root = fsys::temp_directory_path() / ("pspocket-hle-fs-" + std::to_string(::getpid()));
+    fsys::remove_all(root);
+    fsys::create_directories(root / "game" / "TEST00000");
+    Fixture f;
+    u8* base = f.base();
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", root.string(), false));
+    GuestThread a(f, 0, "a");
+    constexpr u32 kPath = kData + 0x1000, kFd = kData + 0x1100, kBuf = kData + 0x2000, kCount = kData + 0x1108,
+                  kPos = kData + 0x1110, kStat = kData + 0x1200, kDir = kData + 0x3000, kPath2 = kData + 0x1400;
+    constexpr s32 O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0100;
+    const auto put = [&](u32 addr, std::string_view s) {
+        std::memcpy(base + addr, s.data(), s.size());
+        base[addr + s.size()] = 0;
+    };
+
+    put(kPath, "/dev_hdd0/game/TEST00000/save.bin");
+    REQUIRE(a.call("cellFsOpen", kPath, O_RDWR | O_CREAT, kFd, 0, 0) == 0);
+    const u32 fd = ps_read32(base, kFd);
+    CHECK(fd == 3);
+    put(kBuf, "hello, cellFs");
+    REQUIRE(a.call("cellFsWrite", fd, kBuf, 13, kCount) == 0);
+    CHECK(ps_read64(base, kCount) == 13);
+    REQUIRE(a.call("cellFsWrite", fd, kBuf, 2, 0) == 0); // no count pointer: a stack variable takes it
+
+    // Read at an offset without moving the position (sys_fs_fcntl 0x8000000A).
+    std::memset(base + kBuf, 0, 32);
+    REQUIRE(a.call("cellFsReadWithOffset", fd, 7, kBuf, 6, kCount) == 0);
+    CHECK(std::string(reinterpret_cast<const char*>(base + kBuf), 6) == "cellFs");
+    CHECK(ps_read64(base, kCount) == 6);
+    REQUIRE(a.call("cellFsLseek", fd, 0, 1 /* CUR */, kPos) == 0);
+    CHECK(ps_read64(base, kPos) == 15); // unchanged by the offset read
+    put(kBuf, "HELLO");
+    REQUIRE(a.call("cellFsWriteWithOffset", fd, 0, kBuf, 5, kCount) == 0);
+    CHECK(ps_read64(base, kCount) == 5);
+    REQUIRE(a.call("cellFsLseek", fd, 0, 0 /* SET */, kPos) == 0);
+    std::memset(base + kBuf, 0, 32);
+    REQUIRE(a.call("cellFsRead", fd, kBuf, 100, kCount) == 0);
+    CHECK(ps_read64(base, kCount) == 15);
+    CHECK(std::string(reinterpret_cast<const char*>(base + kBuf), 15) == "HELLO, cellFshe");
+    CHECK(a.call("cellFsLseek", fd, 0, 0, 0) == r3_of(lv2::CELL_EFAULT));
+    REQUIRE(a.call("cellFsFsync", fd) == 0);
+    REQUIRE(a.call("cellFsClose", fd) == 0);
+    CHECK(a.call("cellFsClose", fd) == r3_of(lv2::CELL_EBADF));
+    CHECK(a.call("cellFsReadWithOffset", 300, 0, kBuf, 4, kCount) == r3_of(lv2::CELL_EBADF));
+    CHECK(ps_read64(base, kCount) == 0);
+
+    // stat, allocate (sets the size), utime, chmod.
+    REQUIRE(a.call("cellFsStat", kPath, kStat) == 0);
+    CHECK(ps_read64(base, kStat + 36) == 15);
+    REQUIRE(a.call("cellFsAllocateFileAreaWithoutZeroFill", kPath, 0x1000) == 0);
+    REQUIRE(a.call("cellFsStat", kPath, kStat) == 0);
+    CHECK(ps_read64(base, kStat + 36) == 0x1000);
+    ps_write64(base, kBuf, 1000000);
+    ps_write64(base, kBuf + 8, 2000000);
+    REQUIRE(a.call("cellFsUtime", kPath, kBuf) == 0);
+    CHECK(fsys::last_write_time(root / "game" / "TEST00000" / "save.bin").time_since_epoch().count() != 0);
+    REQUIRE(a.call("cellFsChmod", kPath, 0666) == 0);
+    CHECK(a.call("cellFsStat", kPath, 0) == r3_of(lv2::CELL_EFAULT));
+    put(kPath2, "/dev_hdd0/game/TEST00000/none.bin");
+    CHECK(a.call("cellFsStat", kPath2, kStat) == r3_of(lv2::CELL_ENOENT));
+    CHECK(a.call("cellFsOpen", kPath2, O_RDONLY, kFd, 0, 0) == r3_of(lv2::CELL_ENOENT));
+    CHECK(a.call("cellFsOpen", kPath2, O_WRONLY, 0, 0, 0) == r3_of(lv2::CELL_EFAULT));
+
+    // Directories, rename, unlink.
+    put(kPath2, "/dev_hdd0/game/TEST00000/dir");
+    REQUIRE(a.call("cellFsMkdir", kPath2, 0777) == 0);
+    REQUIRE(a.call("cellFsOpendir", kPath2, kFd) == 0);
+    const u32 dfd = ps_read32(base, kFd);
+    REQUIRE(a.call("cellFsReaddir", dfd, kDir, kCount) == 0);
+    CHECK(base[kDir + 2] == '.');
+    CHECK(a.call("cellFsReaddir", dfd, 0, kCount) == r3_of(lv2::CELL_EFAULT));
+    REQUIRE(a.call("cellFsClosedir", dfd) == 0);
+    REQUIRE(a.call("cellFsRmdir", kPath2) == 0);
+    put(kPath2, "/dev_hdd0/game/TEST00000/moved.bin");
+    REQUIRE(a.call("cellFsRename", kPath, kPath2) == 0);
+    CHECK(fsys::exists(root / "game" / "TEST00000" / "moved.bin"));
+    REQUIRE(a.call("cellFsOpen", kPath2, O_RDWR, kFd, 0, 0) == 0);
+    REQUIRE(a.call("cellFsFtruncate", ps_read32(base, kFd), 3) == 0);
+    REQUIRE(a.call("cellFsClose", ps_read32(base, kFd)) == 0);
+    CHECK(fsys::file_size(root / "game" / "TEST00000" / "moved.bin") == 3);
+    REQUIRE(a.call("cellFsUnlink", kPath2) == 0);
+    CHECK_FALSE(fsys::exists(root / "game" / "TEST00000" / "moved.bin"));
+    fsys::remove_all(root);
+}
+
+// A PARAM.SFO with string entries (key, value, max size), written the way the PS3 lays it out.
+static std::vector<u8> make_param_sfo(const std::vector<std::tuple<std::string, std::string, u32>>& entries)
+{
+    std::vector<u8> keys, data, index;
+    const auto put32 = [](std::vector<u8>& v, u32 x) {
+        for (int i = 0; i < 4; i++) v.push_back(static_cast<u8>(x >> (8 * i)));
+    };
+    for (const auto& [key, value, max] : entries) { // keys must be sorted
+        index.push_back(static_cast<u8>(keys.size()));
+        index.push_back(static_cast<u8>(keys.size() >> 8));
+        index.push_back(0x04);
+        index.push_back(0x02);
+        put32(index, static_cast<u32>(value.size() + 1));
+        put32(index, max);
+        put32(index, static_cast<u32>(data.size()));
+        keys.insert(keys.end(), key.begin(), key.end());
+        keys.push_back(0);
+        const usize at = data.size();
+        data.insert(data.end(), value.begin(), value.end());
+        data.resize(at + max, 0);
+    }
+    while (keys.size() % 4) keys.push_back(0);
+    std::vector<u8> out;
+    put32(out, 0x46535000);
+    put32(out, 0x101);
+    put32(out, static_cast<u32>(20 + index.size()));
+    put32(out, static_cast<u32>(20 + index.size() + keys.size()));
+    put32(out, static_cast<u32>(entries.size()));
+    out.insert(out.end(), index.begin(), index.end());
+    out.insert(out.end(), keys.begin(), keys.end());
+    out.insert(out.end(), data.begin(), data.end());
+    return out;
+}
+
+TEST_CASE("cellGame: disc boot check and permit, game data created then found; sceNp2Init", "[hle][game]")
+{
+    namespace fsys = std::filesystem;
+    const fsys::path root = fsys::temp_directory_path() / ("pspocket-hle-game-" + std::to_string(::getpid()));
+    fsys::remove_all(root);
+    fsys::create_directories(root / "game");
+    hle::ProcessConfig config;
+    config.game.title_id = "BLES01807";
+    config.game.param_sfo = make_param_sfo({{"APP_VER", "01.00", 8}, {"CATEGORY", "DG", 4},
+        {"TITLE", "Test Game", 128}, {"TITLE_ID", "BLES01807", 16}, {"VERSION", "01.00", 8}});
+    Fixture f(config);
+    u8* base = f.base();
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", root.string(), false));
+    GuestThread a(f, 0, "a");
+    constexpr u32 kType = kData + 0x100, kAttributes = kData + 0x104, kSize = kData + 0x110, kDirName = kData + 0x120,
+                  kContent = kData + 0x200, kUsrdir = kData + 0x300, kBuf = kData + 0x400, kInit = kData + 0x500,
+                  kName = kData + 0x600;
+    constexpr u64 kBusy = 0xFFFFFFFF8002CB23ull, kFailure = 0xFFFFFFFF8002CB22ull, kParam = 0xFFFFFFFF8002CB07ull,
+                  kNotSupported = 0xFFFFFFFF8002CB21ull, kExist = 0xFFFFFFFF8002CB26ull, kBroken = 0xFFFFFFFF8002CB05ull,
+                  kInvalidId = 0xFFFFFFFF8002CB25ull;
+    const auto str = [&](u32 addr) { return std::string(reinterpret_cast<const char*>(base + addr)); };
+    const auto put = [&](u32 addr, std::string_view v) {
+        std::memcpy(base + addr, v.data(), v.size());
+        base[addr + v.size()] = 0;
+    };
+
+    // The disc game: boot check, then its content directories.
+    REQUIRE(a.call("cellGameBootCheck", kType, kAttributes, kSize, kDirName) == 0);
+    CHECK(ps_read32(base, kType) == 1); // CELL_GAME_GAMETYPE_DISC
+    CHECK(ps_read32(base, kAttributes) == 0);
+    CHECK(static_cast<s32>(ps_read32(base, kSize + 4)) == -1); // size not calculated
+    CHECK(ps_read32(base, kSize + 8) == 4);
+    CHECK(a.call("cellGameBootCheck", kType, kAttributes, kSize, kDirName) == kBusy);
+    REQUIRE(a.call("cellGameGetParamString", 100, kBuf, 16) == 0); // TITLE_ID
+    CHECK(str(kBuf) == "BLES01807");
+    CHECK(a.call("cellGameGetParamString", 101, kBuf, 16) == kNotSupported); // VERSION: game data only
+    CHECK(a.call("cellGameGetParamString", 999, kBuf, 16) == kInvalidId);
+    REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+    CHECK(str(kContent) == "/dev_bdvd/PS3_GAME");
+    CHECK(str(kUsrdir) == "/dev_bdvd/PS3_GAME/USRDIR");
+    CHECK(a.call("cellGameContentPermit", kContent, kUsrdir) == kFailure); // the session is closed
+    CHECK(a.call("cellGameGetParamString", 100, kBuf, 16) == kFailure);
+    REQUIRE(a.call("cellGameDataCheck", 1, 0, kSize) == 0); // DISC: the disc's PARAM.SFO (category DG)
+    REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+
+    // Game data that doesn't exist yet: RET_NONE, then create it.
+    put(kName, "BLES01807DATA");
+    REQUIRE(a.call("cellGameDataCheck", 3, kName, kSize) == 2); // CELL_GAME_RET_NONE
+    CHECK(ps_read32(base, kSize + 4) == 0);
+    std::memset(base + kInit, 0, 0x100);
+    put(kInit, "Test Data");
+    put(kInit + 128, "BLES01807");
+    put(kInit + 140, "01.00");
+    REQUIRE(a.call("cellGameCreateGameData", kInit, kContent, kUsrdir) == 0);
+    CHECK(str(kContent).starts_with("/dev_hdd0/game/_GDATA_"));
+    CHECK(str(kUsrdir) == str(kContent) + "/USRDIR");
+    REQUIRE(a.call("cellGameGetParamString", 0, kBuf, 128) == 0); // TITLE
+    CHECK(str(kBuf) == "Test Data");
+    REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+    CHECK(str(kContent) == "/dev_hdd0/game/BLES01807DATA");
+    CHECK(str(kUsrdir) == "/dev_hdd0/game/BLES01807DATA/USRDIR");
+    CHECK(fsys::is_directory(root / "game" / "BLES01807DATA" / "USRDIR"));
+    CHECK(fsys::exists(root / "game" / "BLES01807DATA" / "PARAM.SFO"));
+
+    // Found next time, with the PARAM.SFO written above.
+    REQUIRE(a.call("cellGameDataCheck", 3, kName, kSize) == 0);
+    CHECK(static_cast<s32>(ps_read32(base, kSize + 4)) == -1);
+    REQUIRE(a.call("cellGameGetParamString", 100, kBuf, 16) == 0);
+    CHECK(str(kBuf) == "BLES01807");
+    REQUIRE(a.call("cellGameGetParamString", 101, kBuf, 3) == 0); // truncated to the buffer
+    CHECK(str(kBuf) == "01");
+    CHECK(a.call("cellGameCreateGameData", kInit, kContent, kUsrdir) == kExist);
+    REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+    CHECK(str(kContent) == "/dev_hdd0/game/BLES01807DATA");
+
+    // A corrupt PARAM.SFO is BROKEN, and the session stays closed.
+    fsys::create_directories(root / "game" / "BROKEN");
+    std::ofstream(root / "game" / "BROKEN" / "PARAM.SFO") << "not a psf";
+    put(kName, "BROKEN");
+    CHECK(a.call("cellGameDataCheck", 3, kName, kSize) == kBroken);
+    CHECK(a.call("cellGameDataCheck", 4, kName, kSize) == kParam);
+    CHECK(a.call("cellGameDataCheck", 3, 0, kSize) == kParam);
+    CHECK(a.call("cellGameContentErrorDialog", 0, 0, kName) == 0);
+    CHECK(a.call("cellGameContentErrorDialog", 5, 0, 0) == kParam);
+
+    // sceNp2Init brings NP up (offline).
+    constexpr u32 kPool = kData + 0x40000, kStatus = kData + 0x700;
+    CHECK(a.call("sceNpManagerGetStatus", kStatus) == 0xFFFFFFFF8002AA01ull); // not initialized
+    CHECK(a.call("sceNp2Init", 0x1000, kPool) == 0xFFFFFFFF8002AA0Full);      // pool below 128 KB
+    CHECK(a.call("sceNp2Init", 0x20000, 0) == 0xFFFFFFFF8002AA03ull);
+    REQUIRE(a.call("sceNp2Init", 0x20000, kPool) == 0);
+    CHECK(a.call("sceNp2Init", 0x20000, kPool) == 0xFFFFFFFF8002AA02ull);
+    REQUIRE(a.call("sceNpManagerGetStatus", kStatus) == 0);
+    CHECK(static_cast<s32>(ps_read32(base, kStatus)) == -1); // offline
+    REQUIRE(a.call("sceNp2Term") == 0);
+    CHECK(a.call("sceNp2Term") == 0xFFFFFFFF8002AA01ull);
+    fsys::remove_all(root);
 }

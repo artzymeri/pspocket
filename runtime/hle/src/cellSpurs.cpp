@@ -183,7 +183,6 @@ SpursHost& host()
     return p->state<SpursHost>();
 }
 
-u8* guest_base(PPUContext& ctx) { return thread_of(ctx).kernel.base(); }
 
 // ------------------------------------------------------------------------------------------------- attributes
 

@@ -33,6 +33,8 @@ Commands:
                              --autorun runs every probe at launch, --exit quits once the report is written.
                              ARGS go to the app, e.g. -- -tab metal -passes 32 (Metal load, stats every 5 s).
   report                     Copy Documents/$REPORT from the app's data container to <ios build>/ and print it.
+  pull-iso [--to DIR]        Copy the disc image the app holds (the largest .iso in its Documents: Files > On My
+                             iPhone > PSPocket) to DIR/disc.iso (default inventory/). Phone connected and unlocked.
   all                        build + install + run --autorun --exit + report.
 
 Options:
@@ -61,9 +63,11 @@ DEVICE="${PSPOCKET_DEVICE:-}"
 AUTORUN=0
 EXIT_AFTER=0
 APP_ARGS=()
+PULL_DIR="$ROOT/inventory"
 while [ $# -gt 0 ]; do
     case "$1" in
         --) shift; APP_ARGS=("$@"); break ;;
+        --to) [ $# -ge 2 ] || die "--to needs a directory"; PULL_DIR="$(abspath "$2")"; shift ;;
         --sim) SIM=1 ;;
         --debug) CONFIG=Debug; CONFIG_SET=1 ;;
         --device) [ $# -ge 2 ] || die "--device needs an identifier"; DEVICE="$2"; shift ;;
@@ -331,12 +335,62 @@ cmd_report() {
     say "report: $out"
 }
 
+# The game's disc image from the app's Documents, for Mac runs (scripts/boot.sh calls this when the Mac has none).
+cmd_pull_iso() {
+    local dev json pick name size dest free_kb
+    dev="$(device_id)"
+    require_unlocked "$dev"
+    mkdir -p "$IOS_BUILD" "$PULL_DIR"
+    json="$IOS_BUILD/documents.json"
+    rm -f "$json"
+    xcrun devicectl device info files --device "$dev" --domain-type appDataContainer \
+        --domain-identifier "$BUNDLE_ID" --subdirectory Documents --quiet --json-output "$json" >/dev/null 2>&1 \
+        || xcrun devicectl device info files --device "$dev" --domain-type appDataContainer \
+            --domain-identifier "$BUNDLE_ID" --recurse --quiet --json-output "$json" >/dev/null 2>&1 \
+        || die "could not list the app's files on the iPhone: is PSPocket installed? (scripts/ios.sh all)"
+    # The listing's layout isn't documented: take every object that names a .iso, with its size when it has one.
+    pick="$("$PYTHON" - "$json" <<'PY'
+import json, sys
+found = []
+def walk(o):
+    if isinstance(o, dict):
+        name = next((v for k, v in o.items() if isinstance(v, str) and k.lower() in ("name", "relativepath", "path")
+                     and v.lower().endswith(".iso")), None)
+        if name:
+            size = next((v for k, v in o.items() if k.lower() in ("size", "filesize") and isinstance(v, int)), 0)
+            found.append((size, name.rsplit("/", 1)[-1]))
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+walk(json.load(open(sys.argv[1])))
+if found:
+    size, name = max(found)
+    print("%d\t%s" % (size, name))
+PY
+)"
+    [ -n "$pick" ] || die "no .iso in the app's Documents on the iPhone (Files > On My iPhone > PSPocket)"
+    size="${pick%%$'\t'*}"
+    name="${pick#*$'\t'}"
+    dest="$PULL_DIR/disc.iso"
+    free_kb="$(df -Pk "$PULL_DIR" | awk 'NR == 2 { print $4 }')"
+    if [ "$size" -gt 0 ] && [ $((free_kb / 1024)) -lt $((size / 1048576 + 1024)) ]; then
+        die "not enough space on this Mac for $name: it needs $((size / 1073741824 + 1)) GB free in $PULL_DIR"
+    fi
+    say "copying \"$name\" ($((size / 1048576)) MB) from the iPhone to $dest; only the first time, a few minutes"
+    xcrun devicectl device copy from --device "$dev" --domain-type appDataContainer \
+        --domain-identifier "$BUNDLE_ID" --source "Documents/$name" --destination "$dest.part" >&2 \
+        || { rm -f "$dest.part"; die "copying the disc image failed (keep the iPhone connected and unlocked)"; }
+    mv "$dest.part" "$dest"
+    say "disc image: $dest"
+}
+
 case "$COMMAND" in
     gen) cmd_gen ;;
     build) cmd_build ;;
     install) cmd_install ;;
     run) cmd_run; exit "$RUN_STATUS" ;;
     report) cmd_report ;;
+    pull-iso) cmd_pull_iso ;;
     all)
         cmd_build >/dev/null
         cmd_install

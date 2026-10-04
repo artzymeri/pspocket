@@ -2,10 +2,12 @@
 // "offline" the way RPCS3 does when the user is not signed in, so single-player never waits on PSN.
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/sceNp.cpp/.h.
 //
-// sceNpInit is not imported by GTA V; sceNp2Init (sceNp2, not implemented yet) initializes NP there. Until a module
-// sets NpState::initialized, the manager functions return SCE_NP_ERROR_NOT_INITIALIZED, as RPCS3 does before init.
+// sceNpInit is not imported by GTA V; sceNp2Init (module sceNp2, registered here because it shares this state)
+// initializes NP there. Until then the manager functions return SCE_NP_ERROR_NOT_INITIALIZED, as RPCS3 does before
+// init; afterwards they report a user who is signed out (offline).
 
 #include <atomic>
+#include <mutex>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
@@ -20,12 +22,17 @@ constexpr std::string_view kChan = "sceNp";
 
 enum : u32 {
     SCE_NP_ERROR_NOT_INITIALIZED = 0x8002AA01,
+    SCE_NP_ERROR_ALREADY_INITIALIZED = 0x8002AA02,
     SCE_NP_ERROR_INVALID_ARGUMENT = 0x8002AA03,
+    SCE_NP_ERROR_INSUFFICIENT_BUFFER = 0x8002AA0F,
 };
 constexpr s32 SCE_NP_MANAGER_STATUS_OFFLINE = -1;
+constexpr u32 SCE_NP_MIN_POOL_SIZE = 128 * 1024;
 
 struct NpState {
-    std::atomic<bool> initialized{false};
+    std::mutex mutex;                     // init and term
+    std::atomic<bool> initialized{false}; // sceNpInit's state
+    bool np2_initialized = false;         // sceNp2Init's, guarded by mutex
 };
 
 NpState& np()
@@ -46,12 +53,51 @@ s32 sceNpManagerGetStatus(PPUContext& ctx, u32 status)
     return lv2::CELL_OK;
 }
 
+// RPCS3 sceNpInit, with NpState::mutex held. The pool would hold NP's working memory; nothing uses it offline.
+u32 np_init_locked(NpState& s, u32 poolsize, u32 poolptr)
+{
+    if (s.initialized) return SCE_NP_ERROR_ALREADY_INITIALIZED;
+    if (poolsize == 0 || !poolptr) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (poolsize < SCE_NP_MIN_POOL_SIZE) return SCE_NP_ERROR_INSUFFICIENT_BUFFER;
+    s.initialized = true;
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNp2Init: sceNpInit (already initialized is fine), then NP2's own flag.
+s32 sceNp2Init(PPUContext&, u32 poolsize, u32 poolptr)
+{
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    if (s.np2_initialized) return static_cast<s32>(SCE_NP_ERROR_ALREADY_INITIALIZED);
+    if (const u32 r = np_init_locked(s, poolsize, poolptr); r != lv2::CELL_OK && r != SCE_NP_ERROR_ALREADY_INITIALIZED) {
+        return static_cast<s32>(r);
+    }
+    s.np2_initialized = true;
+    PS_LOG_INFO(kChan, "sceNp2Init(pool {:#x} bytes at {:#x}): NP up, no user signed in (offline)", poolsize, poolptr);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNp2Term: matching 2 (never started here) and NP are terminated.
+s32 sceNp2Term(PPUContext&)
+{
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    if (!s.np2_initialized) return static_cast<s32>(SCE_NP_ERROR_NOT_INITIALIZED);
+    s.initialized = false;
+    s.np2_initialized = false;
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_sceNp(Registry& r)
 {
     r.add("sceNp", {
         PS_HLE_FUNC(0xA7BFF757, sceNpManagerGetStatus),
+    });
+    r.add("sceNp2", {
+        PS_HLE_FUNC(0x41251F74, sceNp2Init),
+        PS_HLE_FUNC(0xAADB7C12, sceNp2Term),
     });
 }
 

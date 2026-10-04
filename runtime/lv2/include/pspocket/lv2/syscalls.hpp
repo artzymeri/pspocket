@@ -199,6 +199,9 @@ Result sys_fs_fdatasync(PpuThread& t, u32 fd);
 Result sys_fs_fsync(PpuThread& t, u32 fd);
 Result sys_fs_truncate(PpuThread& t, u32 path, u64 size);
 Result sys_fs_ftruncate(PpuThread& t, u32 fd, u64 size);
+Result sys_fs_chmod(PpuThread& t, u32 path, s32 mode);
+Result sys_fs_utime(PpuThread& t, u32 path, u32 timep);
+Result sys_fs_fcntl(PpuThread& t, u32 fd, u32 op, u32 arg, u32 size);
 
 // ---- virtual memory (sys_vm.cpp)
 Result sys_vm_memory_map(PpuThread& t, u64 vsize, u64 psize, u32 cid, u64 flag, u64 policy, u32 addr_out);
