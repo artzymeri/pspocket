@@ -61,6 +61,9 @@ struct VpInst {
     u32 cond_reg = 0;         // CC0 or CC1
     std::array<u8, 4> cond_sw{0, 1, 2, 3};
     bool end = false;
+    bool constant_relative = false;  // D3.index_const: c[constant + A.addr_swizzle]
+    u32 addr_reg = 0, addr_swizzle = 0; // D0.addr_reg_sel_1, D0.addr_swz
+    int branch_target = -1;          // BRI/CAL target (shares its bits with src2)
 };
 
 inline u32 vp_src_bits(const VpSrc& s)
@@ -82,9 +85,17 @@ inline std::array<u32, 4> encode_vp(const VpInst& in)
         return (u32{(v >> 3) & 1u} << base) | (u32{(v >> 2) & 1u} << (base + 1)) | (u32{(v >> 1) & 1u} << (base + 2)) |
             (u32{v & 1u} << (base + 3));
     };
-    const u32 d3 = u32{in.end} | (in.out << 2) | (in.sca_temp << 7) | m(in.vec_mask, 13) | m(in.sca_mask, 17) |
-        ((s2 & 0x7ff) << 21);
-    return {d0, d1, d2, d3};
+    u32 d3 = u32{in.end} | (u32{in.constant_relative} << 1) | (in.out << 2) | (in.sca_temp << 7) | m(in.vec_mask, 13) |
+        m(in.sca_mask, 17) | ((s2 & 0x7ff) << 21);
+    u32 d0x = d0 | (in.addr_swizzle & 3) | ((in.addr_reg & 1) << 24);
+    u32 d2x = d2;
+    if (in.branch_target >= 0) {
+        const u32 t = static_cast<u32>(in.branch_target);
+        d0x = (d0x & ~(1u << 23)) | (((t >> 9) & 1) << 23);
+        d2x = (d2x & ~0x3fu) | ((t >> 3) & 0x3f);
+        d3 = (d3 & ~(7u << 29)) | ((t & 7) << 29);
+    }
+    return {d0x, d1, d2x, d3};
 }
 
 inline std::vector<u32> assemble_vp(const std::vector<VpInst>& prog)

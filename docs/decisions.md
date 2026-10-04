@@ -1268,6 +1268,34 @@ three of its inputs wrongly, so the HDR target stayed black and the frame showed
   inventory/*/spu-lifted with a game_spu.c), and the app registers them and the module resolver as pspocket-boot
   does. The lifted code comes from the user's own game and stays out of the repository (CLAUDE.md rule 1).
 
+## D-085 · 2026-10-04 · A DMA invalidates a lifted SPU program only when it writes its instructions
+
+Run 057's interpreter counts (D-084) showed where the SPUs' time went: 16.6 billion instructions interpreted from job
+entries (LS 0x4C00) with no program attached, and 12 billion more at another job address, in 300 s. A job binary's
+range is its code, data and bss, and jobs copy their buffers into their own data: D-076 dropped a program at any GET
+into its range, and the job chain then marked the cached binary interpreted for good, so every job after its first run
+was interpreted.
+- `ps_spu_program.code_words`: one bit per word of the range, set for the words lifted as instructions; spu-lift
+  writes it. A GET drops the program (and the home program, D-081) only when it writes one of those words. NULL keeps
+  the old rule (the whole range), for hand-made descriptors.
+- Test: a program keeps its lifted code through a GET into its data and loses it to a GET over its instructions.
+
+## D-086 · 2026-10-04 · Vertex programs: the address register, relative constants and flow control
+
+On the phone (run 059, the first mission) the people did not appear: every skinned draw was skipped, its vertex
+program using ARL (the address register) and relative constants (bone matrices at c[A0.x + n]), which the translator
+refused. RPCS3's VertexProgramDecompiler is the reference.
+- ARL: a{addr_reg} = int4(floor(src0)). A relative constant reads vc[clamp(n + a{addr_reg}.{swizzle}, 0, 467)] (RPCS3
+  reads past the 468 constants unchecked).
+- Flow control: the body is a switch on the instruction to run next inside a bounded loop (Metal has no goto), with a
+  case at every branch target and return point (at every instruction when BRA jumps to the address register). BRI and
+  BRA branch when any component of their condition holds (GetCond); CAL and CLI push the return point on an 8-deep
+  stack, RET pops it or ends the program. The decoder reads on past the main END to the subroutines branches reach.
+- LIT (lit_legacy), EXP and LOG.
+- Still refused, by name: TXL in vertex programs (vertex texture fetch), BRB and CLB (branches on the boolean
+  constants).
+- Tests: the translation of ARL, a relative constant, BRI, CAL and RET; Metal compiles a program with all of them.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

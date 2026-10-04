@@ -198,24 +198,80 @@ TEST_CASE("vertex program condition codes: an update to CC1 and conditional writ
 TEST_CASE("unsupported vertex program features are named")
 {
     std::vector<VpInst> prog = sample_vp();
-    prog[1].vec_op = static_cast<u32>(VpVecOp::ARL);
+    prog[1].vec_op = static_cast<u32>(VpVecOp::TXL);
     auto words = assemble_vp(prog);
     auto vp = decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
     REQUIRE(vp.has_value());
     TranslateResult r = translate_vertex_program(*vp);
     CHECK_FALSE(r.ok);
-    CHECK(r.error.find("opcode ARL") != std::string::npos);
+    CHECK(r.error.find("opcode TXL") != std::string::npos);
     CHECK(r.error.find("instruction 1") != std::string::npos);
 
     prog = sample_vp();
-    prog[3].sca_op = static_cast<u32>(VpScaOp::BRA);
+    prog[3].sca_op = static_cast<u32>(VpScaOp::BRB);
     words = assemble_vp(prog);
     vp = decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
     REQUIRE(vp.has_value());
     CHECK(vp->has_branches);
     r = translate_vertex_program(*vp);
     CHECK_FALSE(r.ok);
-    CHECK(r.error.find("BRA") != std::string::npos);
+    CHECK(r.error.find("BRB") != std::string::npos);
+}
+
+TEST_CASE("vertex programs: ARL and relative constants, branches, calls and returns translate (RPCS3 semantics)")
+{
+    // 0: ARL A0.y, c[3]          1: MOV o[1], c[A0.y + 5]      2: BRI L4 (always)
+    // 3: MOV o[1], c[0] (skipped) 4: CAL L6                     5: MOV o[0], v[0] END
+    // 6: MOV o[7], c[1]           7: RET
+    VpInst arl;
+    arl.vec_op = static_cast<u32>(VpVecOp::ARL);
+    arl.src[0] = vp_const();
+    arl.constant = 3;
+    arl.addr_reg = 0;
+    arl.vec_mask = 0x2;
+    VpInst rel;
+    rel.vec_op = static_cast<u32>(VpVecOp::MOV);
+    rel.src[0] = vp_const();
+    rel.constant = 5;
+    rel.constant_relative = true;
+    rel.addr_swizzle = 1;
+    rel.out = 1;
+    rel.vec_mask = 0xf;
+    VpInst bri;
+    bri.sca_op = static_cast<u32>(VpScaOp::BRI);
+    bri.branch_target = 4;
+    VpInst skipped = rel;
+    skipped.constant_relative = false;
+    skipped.constant = 0;
+    VpInst cal;
+    cal.sca_op = static_cast<u32>(VpScaOp::CAL);
+    cal.branch_target = 6;
+    VpInst pos;
+    pos.vec_op = static_cast<u32>(VpVecOp::MOV);
+    pos.out = 0;
+    pos.vec_mask = 0xf;
+    pos.end = true;
+    VpInst sub = skipped;
+    sub.constant = 1;
+    sub.out = 7;
+    VpInst ret;
+    ret.sca_op = static_cast<u32>(VpScaOp::RET);
+    ret.end = true;
+    const auto words = assemble_vp({arl, rel, bri, skipped, cal, pos, sub, ret});
+    const auto vp = decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
+    REQUIRE(vp.has_value());
+    CHECK(vp->instructions.size() == 8); // the subroutine after the main END is decoded too
+    const TranslateResult r = translate_vertex_program(*vp);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    const std::string& s = r.shader.source;
+    INFO(s);
+    CHECK(s.find("a0 = int4(floor(vc[3]));") != std::string::npos);
+    CHECK(s.find("vc[clamp(5 + a0.y, 0, 467)]") != std::string::npos);
+    CHECK(s.find("switch (jump)") != std::string::npos);
+    CHECK(s.find("if (true) { jump = 4; continue; }") != std::string::npos);
+    CHECK(s.find("calls[depth++] = 5; jump = 6; continue;") != std::string::npos);
+    CHECK(s.find("jump = depth > 0 ? calls[--depth] : -1; continue;") != std::string::npos);
 }
 
 namespace {

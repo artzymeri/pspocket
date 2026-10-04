@@ -2,6 +2,7 @@
 // Bit layouts: RPCS3 rpcs3/Emu/RSX/Program/RSXVertexProgram.h (D0, D1, D2, D3, SRC). Operand roles and destination
 // rules: VertexProgramDecompiler.cpp (GetSRC, GetDST, SetDST, Decompile).
 
+#include <algorithm>
 #include <format>
 
 #include "pspocket/rsx/shader/ir.hpp"
@@ -137,6 +138,7 @@ std::optional<VertexProgram> decode_vertex_program(const u32* memory, u32 instru
     VertexProgram vp;
     vp.start = start;
     u64 h = 0x76657274ull; // "vert"
+    u32 furthest = start; // the last instruction a branch or call reaches: subroutines can follow the main END
     for (u32 slot = start; slot < instruction_count; slot++) {
         VpInstruction in = decode_vp_instruction(memory + slot * 4, slot);
         for (const VpSource& s : in.src) {
@@ -144,19 +146,19 @@ std::optional<VertexProgram> decode_vertex_program(const u32* memory, u32 instru
         }
         if (in.writes_output()) vp.output_mask = static_cast<u16>(vp.output_mask | (1u << in.out));
         switch (static_cast<VpScaOp>(in.sca_op)) {
-        case VpScaOp::BRA:
         case VpScaOp::BRI:
         case VpScaOp::CAL:
         case VpScaOp::CLI:
-        case VpScaOp::RET:
         case VpScaOp::BRB:
-        case VpScaOp::CLB: vp.has_branches = true; break;
+        case VpScaOp::CLB: furthest = std::max(furthest, in.branch_target); [[fallthrough]];
+        case VpScaOp::BRA:
+        case VpScaOp::RET: vp.has_branches = true; break;
         default: break;
         }
         h = hash_words(in.words.data(), 4, h);
         const bool end = in.end;
         vp.instructions.push_back(in);
-        if (end) {
+        if (end && slot >= furthest) {
             vp.hash = h ^ vp.instructions.size();
             return vp;
         }

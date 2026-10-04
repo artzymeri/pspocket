@@ -417,6 +417,70 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
     const auto decoded = shader::decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
     REQUIRE(decoded.has_value());
     compile(shader::translate_vertex_program(*decoded));
+
+    // ARL, relative constants, LIT/EXP/LOG and every branch kind (characters skin through c[A0.x + n]).
+    {
+        std::vector<VpInst> flow;
+        VpInst arl;
+        arl.vec_op = 0x0d; // ARL A0, v[0]
+        arl.src[0] = vp_in();
+        arl.vec_mask = 0xf;
+        flow.push_back(arl);
+        VpInst rel;
+        rel.vec_op = 1; // MOV R1, c[A0.z + 10]
+        rel.src[0] = vp_const();
+        rel.constant = 10;
+        rel.constant_relative = true;
+        rel.addr_swizzle = 2;
+        rel.vec_result = false;
+        rel.vec_temp = 1;
+        rel.vec_mask = 0xf;
+        flow.push_back(rel);
+        for (u32 op : {5u, 6u, 7u}) { // EXP, LOG, LIT
+            VpInst in;
+            in.sca_op = op;
+            in.src[2] = vp_temp(1);
+            in.vec_result = false;
+            in.sca_temp = 2;
+            in.sca_mask = 0xf;
+            flow.push_back(in);
+        }
+        VpInst bri; // 5: BRI L7 if CC0.x > 0
+        bri.sca_op = 9;
+        bri.cond = 4;
+        bri.cond_test = true;
+        bri.branch_target = 7;
+        flow.push_back(bri);
+        VpInst cal; // 6: CAL L9
+        cal.sca_op = 10;
+        cal.branch_target = 9;
+        flow.push_back(cal);
+        VpInst out; // 7: MOV o[0], R1 END
+        out.vec_op = 1;
+        out.src[0] = vp_temp(1);
+        out.out = 0;
+        out.vec_mask = 0xf;
+        out.end = true;
+        flow.push_back(out);
+        VpInst bra; // 8: BRA (to A0.x) -- unreachable, still compiled
+        bra.sca_op = 8;
+        flow.push_back(bra);
+        VpInst sub; // 9: MOV o[7], c[A1.x + 0] ; RET END
+        sub.vec_op = 1;
+        sub.src[0] = vp_const();
+        sub.constant_relative = true;
+        sub.addr_reg = 1;
+        sub.out = 7;
+        sub.vec_mask = 0xf;
+        sub.sca_op = 12;
+        sub.end = true;
+        flow.push_back(sub);
+        const auto fw = assemble_vp(flow);
+        const auto fd = shader::decode_vertex_program(fw.data(), static_cast<u32>(fw.size() / 4), 0);
+        REQUIRE(fd.has_value());
+        CHECK(fd->instructions.size() == 10);
+        compile(shader::translate_vertex_program(*fd));
+    }
     shader::VpOptions points;
     points.point_size = true;
     compile(shader::translate_vertex_program(*decoded, points));

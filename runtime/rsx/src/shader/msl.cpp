@@ -142,7 +142,7 @@ bool vp_vec_supported(u32 op)
     case VpVecOp::DP3: case VpVecOp::DPH: case VpVecOp::DP4: case VpVecOp::DST: case VpVecOp::MIN:
     case VpVecOp::MAX: case VpVecOp::SLT: case VpVecOp::SGE: case VpVecOp::SEQ: case VpVecOp::SNE:
     case VpVecOp::SGT: case VpVecOp::SLE: case VpVecOp::SFL: case VpVecOp::STR: case VpVecOp::FRC:
-    case VpVecOp::FLR: case VpVecOp::SSG: return true;
+    case VpVecOp::FLR: case VpVecOp::SSG: case VpVecOp::ARL: return true;
     default: return false;
     }
 }
@@ -151,10 +151,23 @@ bool vp_sca_supported(u32 op)
 {
     switch (static_cast<VpScaOp>(op)) {
     case VpScaOp::NOP: case VpScaOp::MOV: case VpScaOp::RCP: case VpScaOp::RCC: case VpScaOp::RSQ:
-    case VpScaOp::EX2: case VpScaOp::LG2: case VpScaOp::SIN: case VpScaOp::COS: return true;
+    case VpScaOp::EX2: case VpScaOp::LG2: case VpScaOp::SIN: case VpScaOp::COS: case VpScaOp::LIT:
+    case VpScaOp::EXP: case VpScaOp::LOG: case VpScaOp::BRA: case VpScaOp::BRI: case VpScaOp::CAL:
+    case VpScaOp::CLI: case VpScaOp::RET: return true;
     default: return false;
     }
 }
+
+bool vp_is_branch(u32 sca_op)
+{
+    switch (static_cast<VpScaOp>(sca_op)) {
+    case VpScaOp::BRA: case VpScaOp::BRI: case VpScaOp::CAL: case VpScaOp::CLI: case VpScaOp::RET: return true;
+    default: return false;
+    }
+}
+
+// The address register an instruction reads, with its component (RPCS3 VertexProgramDecompiler AddAddrReg).
+std::string vp_address(const VpInstruction& in) { return std::format("a{}.{}", in.addr_reg, kXyzw[in.addr_swizzle & 3]); }
 
 std::string vp_source(const VpInstruction& in, u32 n, std::set<u32>& temps)
 {
@@ -166,7 +179,11 @@ std::string vp_source(const VpInstruction& in, u32 n, std::set<u32>& temps)
         r = std::format("r{}", s.temp);
         break;
     case VpRegType::Input: r = std::format("v{}", in.input); break;
-    case VpRegType::Constant: r = std::format("vc[{}]", in.constant); break;
+    case VpRegType::Constant:
+        // c[n + A.x] (D3.index_const), clamped to the 468 constants (RPCS3 _fetch_constant reads past them unchecked).
+        r = in.constant_relative ? std::format("vc[clamp({} + {}, 0, 467)]", in.constant, vp_address(in))
+                                 : std::format("vc[{}]", in.constant);
+        break;
     default: r = "float4(0.0)"; break;
     }
     r += swizzle_suffix(s.swizzle);
@@ -188,6 +205,14 @@ std::string vp_condition(const VpInstruction& in)
     return std::format("(cc{}{} {} float4(0.0))", in.cond_reg, in.cond_swizzle.str(), kCompare[in.cond & 7]);
 }
 
+// A branch's condition (RPCS3 VertexProgramDecompiler GetCond): never, always, or any component of the comparison.
+std::string vp_branch_condition(const VpInstruction& in)
+{
+    if (in.cond == 0) return "false";
+    if (in.cond == 7) return "true";
+    return std::format("any{}", vp_condition(in));
+}
+
 } // namespace
 
 const std::string& msl_prologue()
@@ -201,6 +226,18 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
     TranslateResult result;
     std::set<u32> temps;
     std::string body;
+    // Branch targets and return points start cases of the flow-control switch; BRA jumps to computed instructions,
+    // so with it every instruction does.
+    std::set<u32> labels;
+    bool flow = false, flow_all = false, uses_address = false;
+    for (const VpInstruction& in : vp.instructions) {
+        if (!vp_is_branch(in.sca_op)) continue;
+        flow = true;
+        if (static_cast<VpScaOp>(in.sca_op) == VpScaOp::BRA) flow_all = true;
+        labels.insert(in.branch_target);
+        labels.insert(in.slot + 1);
+    }
+    if (flow) labels.insert(vp.instructions.empty() ? 0 : vp.instructions.front().slot);
 
     for (const VpInstruction& in : vp.instructions) {
         auto fail = [&](std::string what) {
@@ -215,11 +252,17 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
         }
         if (!vp_vec_supported(in.vec_op)) return fail(std::format("opcode {}", vp_vec_op_name(in.vec_op)));
         if (!vp_sca_supported(in.sca_op)) return fail(std::format("opcode {}", vp_sca_op_name(in.sca_op)));
-        if (in.constant_relative) return fail("relative constant addressing (A0)");
 
+        // Flow control (RPCS3 VertexProgramDecompiler Decompile): the body is a switch inside a loop, a case per
+        // instruction a branch can reach; a branch sets the case to run next and continues the loop.
+        if (flow && (labels.contains(in.slot) || flow_all)) body += std::format("    case {}:\n", in.slot);
+        const bool branch = vp_is_branch(in.sca_op);
         const bool vec = in.vec_op != 0;
-        const bool sca = in.sca_op != 0;
-        if ((!vec && !sca) || in.cond == 0) continue; // NOP, or never written (SetDST: cond == 0)
+        const bool sca = in.sca_op != 0 && !branch;
+        if ((!vec && !sca && !branch) || (in.cond == 0 && !branch)) {
+            if (in.end && flow) body += "    jump = -1; continue;\n";
+            continue; // NOP, or never written (SetDST: cond == 0)
+        }
         // Condition codes (RPCS3 VertexProgramDecompiler SetDST, GetDST, AddCodeCond, GetRawCond): CC0 and CC1 start
         // at 0. An op whose result goes to neither an output nor a temp writes it to CC{cond_reg}: when the
         // instruction updates condition codes, or (RPCS3, "Far Cry 2") when the other op writes the output. A
@@ -228,7 +271,11 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
         const std::string cond = conditional ? vp_condition(in) : std::string();
 
         body += std::format("    {{ // {}: {}\n", in.slot, disassemble(in));
-        if (vec) {
+        if (vec && static_cast<VpVecOp>(in.vec_op) == VpVecOp::ARL) {
+            // ARL: the address register gets floor(src0) (RPCS3: "$awm = $ifloor($0)").
+            uses_address = true;
+            body += std::format("        a{} = int4(floor({}));\n", in.addr_reg, vp_source(in, 0, temps));
+        } else if (vec) {
             const std::string s0 = vp_source(in, 0, temps), s1 = vp_source(in, 1, temps), s2 = vp_source(in, 2, temps);
             std::string e;
             switch (static_cast<VpVecOp>(in.vec_op)) {
@@ -259,9 +306,16 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
             if (in.saturate) body += "        vec = clamp(vec, 0.0, 1.0);\n";
         }
         if (sca) {
-            const std::string s = "(" + vp_source(in, 2, temps) + ").x"; // scalar ops read src2 (RPCS3 "$s")
+            const std::string v = vp_source(in, 2, temps);
+            const std::string s = "(" + v + ").x"; // scalar ops read src2 (RPCS3 "$s")
             std::string e;
             switch (static_cast<VpScaOp>(in.sca_op)) {
+            // LIT (RPCS3 lit_legacy): x and y clamped at 0; z = x > 0 ? y ^ w : 0.
+            case VpScaOp::LIT:
+                e = std::format("1.0, max(({0}).x, 0.0), ({0}).x > 0.0 ? exp(({0}).w * log(max(({0}).y, 1e-10))) : 0.0, 1.0", v);
+                break;
+            case VpScaOp::EXP: e = std::format("exp({})", s); break;
+            case VpScaOp::LOG: e = std::format("log({})", s); break;
             case VpScaOp::MOV: e = s; break;
             case VpScaOp::RCP: e = std::format("1.0 / {}", s); break;
             case VpScaOp::RCC: e = std::format("clamp(1.0 / {}, 5.42101e-20, 1.884467e19)", s); break;
@@ -299,9 +353,38 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
                 assign(cc, value, m);
             }
         };
-        if (vec) write("vec", in.vec_mask, in.vec_result, in.vec_temp);
+        if (vec && static_cast<VpVecOp>(in.vec_op) != VpVecOp::ARL) write("vec", in.vec_mask, in.vec_result, in.vec_temp);
         if (sca) write("sca", in.sca_mask, !in.vec_result, in.sca_temp);
+        if (branch) {
+            // After the vector op's write (both ops issue together; the branch takes effect after them).
+            const std::string c = vp_branch_condition(in);
+            switch (static_cast<VpScaOp>(in.sca_op)) {
+            case VpScaOp::BRA: // to the address register's instruction
+                uses_address = true;
+                body += std::format("        if ({}) {{ jump = {}; continue; }}\n", c, vp_address(in));
+                break;
+            case VpScaOp::BRI:
+                body += std::format("        if ({}) {{ jump = {}; continue; }}\n", c, in.branch_target);
+                break;
+            case VpScaOp::CAL:
+            case VpScaOp::CLI:
+                body += std::format("        if ({}) {{ if (depth < 8) calls[depth++] = {}; jump = {}; continue; }}\n", c,
+                    in.slot + 1, in.branch_target);
+                break;
+            case VpScaOp::RET: // to the caller, or the end of the program outside a call
+                body += std::format("        if ({}) {{ jump = depth > 0 ? calls[--depth] : -1; continue; }}\n", c);
+                break;
+            default: break;
+            }
+        }
         body += "    }\n";
+        if (in.end && flow) body += "    jump = -1; continue;\n";
+    }
+    if (flow) {
+        body = "    int jump = " + std::to_string(vp.instructions.empty() ? 0 : vp.instructions.front().slot) +
+               ", depth = 0;\n    int calls[8];\n    (void)depth; (void)calls;\n"
+               "    for (uint guard = 0u; guard < 65536u; guard++) {\n    switch (jump) {\n" + body +
+               "    default: break;\n    }\n    break;\n    }\n";
     }
 
     std::string src = msl_prologue();
@@ -329,6 +412,8 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
     for (u32 t : temps) src += std::format("    float4 r{} = float4(0.0);\n", t);
     src += "    float4 cc0 = float4(0.0), cc1 = float4(0.0); // condition registers CC0, CC1\n";
     src += "    (void)cc0; (void)cc1;\n";
+    if (uses_address || [&] { for (const auto& in : vp.instructions) if (in.constant_relative) return true; return false; }())
+        src += "    int4 a0 = int4(0), a1 = int4(0); // address registers A0, A1\n    (void)a0; (void)a1;\n";
     for (u32 i = 0; i < 16; i++) src += std::format("    float4 o{} = float4(0.0, 0.0, 0.0, 1.0);\n", i);
     src += body;
     // Outputs: o0 position, o1/o2 front colours, o3/o4 back colours, o5.x fog, o6.x point size (o6 also TEX9),
