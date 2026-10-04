@@ -11,6 +11,8 @@
 // With a dump directory (pspocket/hle/spu_programs.hpp, pspocket-boot --spu-dump DIR), each image that has no lifted
 // program is saved once, for scripts/lift-spu.sh.
 
+#include <functional>
+
 #include "pspocket/core/types.hpp"
 #include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/spu/context.h"
@@ -36,5 +38,13 @@ const ps_spu_program* identify_program(u8* base, const SpuImage& image);
 
 // identify_program, then attaches the result to the context.
 void attach_program(SPUContext& ctx, u8* base, const SpuImage& image);
+
+// The modules a program loaded (D-079) across a task's context switch (D-082). Restoring local store from a save area
+// does not go through the MFC, so the runs the tracker knew when the context was saved (those `keep` accepts: inside
+// the saved blocks) are kept with the save area and given back when the context is restored, on whichever worker.
+// forget_module_runs clears what the tracker knew about the context's local store (another task's image replaced it).
+void save_module_runs(const SPUContext& ctx, u32 save_area, const std::function<bool(u32 ls_start, u32 ls_end)>& keep);
+void restore_module_runs(SPUContext& ctx, u32 save_area);
+void forget_module_runs(SPUContext& ctx);
 
 } // namespace pspocket::hle::spurs

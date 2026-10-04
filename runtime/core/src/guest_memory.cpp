@@ -73,17 +73,19 @@ bool GuestMemory::page_range(u32 addr, u64 size, u64& first_page, u64& page_coun
     return true;
 }
 
+// Under the mutex (one writer); each word is stored atomically for is_committed, which reads without it.
 void GuestMemory::mark(u64 first_page, u64 page_count, bool committed)
 {
     for (u64 page = first_page; page < first_page + page_count; page++) {
         u64& word = committed_[page / 64];
         const u64 bit = u64{1} << (page % 64);
-        const bool was = (word & bit) != 0;
+        const u64 old = __atomic_load_n(&word, __ATOMIC_RELAXED);
+        const bool was = (old & bit) != 0;
         if (committed && !was) {
-            word |= bit;
+            __atomic_store_n(&word, old | bit, __ATOMIC_RELEASE);
             committed_pages_++;
         } else if (!committed && was) {
-            word &= ~bit;
+            __atomic_store_n(&word, old & ~bit, __ATOMIC_RELEASE);
             committed_pages_--;
         }
     }
@@ -129,12 +131,14 @@ bool GuestMemory::protect(u32 addr, u64 size, Prot prot)
     return true;
 }
 
+// Without the mutex: SPU DMAs, SPURS and the RSX ask this thousands of times a second from every thread (run 056: the
+// mutex was 14% of the SPURS workers' time). The bitmap exists from reserve() to release(), which run while no other
+// thread uses guest memory; commit and decommit store its words atomically.
 bool GuestMemory::is_committed(u32 addr) const
 {
-    std::lock_guard lock(mutex_);
     if (!base_) return false;
     const u64 page = u64{addr} / page_size_;
-    return (committed_[page / 64] >> (page % 64)) & 1;
+    return (__atomic_load_n(&committed_[page / 64], __ATOMIC_ACQUIRE) >> (page % 64)) & 1;
 }
 
 u64 GuestMemory::committed_bytes() const

@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/runtime.h"
@@ -52,7 +53,7 @@ Registry& registry()
     return r;
 }
 
-std::atomic<u64> g_attached{0}, g_unknown{0}, g_images{0}, g_modules{0};
+std::atomic<u64> g_attached{0}, g_unknown{0}, g_images{0}, g_modules{0}, g_modified{0};
 std::atomic<bool> g_dumping{false};
 
 // The file name of an image: its program key, as spu-lift names the program (see scripts/lift-spu.sh).
@@ -106,7 +107,7 @@ const ps_spu_program* identify_hashed(u64 hash, u8* base, const SpuImage& image)
 // copy (patched after loading) is not attached: its lifted code could be stale. Per SPU thread, so no lock.
 
 constexpr u32 kBlockShift = 10; // a run is found through the 1 KB blocks of local store it covers
-constexpr u32 kRuns = 64;
+constexpr u32 kRuns = 128;      // block_run holds index + 1 in a byte
 
 struct Run {
     u32 ls_start = 0, ls_end = 0; // [ls_start, ls_end) of local store
@@ -138,6 +139,24 @@ Modules& modules_for(const SPUContext* ctx)
     return m;
 }
 
+// The slot for a new run: a free one, else the oldest that never ran (data: most GETs are), else the oldest. A module
+// that ran stays known while it is in local store, however much data its program copies around it (run 054: with
+// the oldest run always replaced, the dependency tasks' data pushed their modules out, and 4,970 of their addresses
+// were interpreted).
+u32 take_slot(Modules& m)
+{
+    for (u32 k = 0; k < kRuns; k++) {
+        const u32 i = (m.next + k) % kRuns;
+        if (const Run& r = m.runs[i]; r.ls_end == r.ls_start || !r.resolved) {
+            m.next = (i + 1) % kRuns;
+            return i;
+        }
+    }
+    const u32 i = m.next;
+    m.next = (m.next + 1) % kRuns;
+    return i;
+}
+
 void observe_get(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size)
 {
     if (!size) return;
@@ -159,12 +178,31 @@ void observe_get(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size)
         r.hash = 0;
         r.program = nullptr;
     } else {
-        index = m.next;
-        m.next = (m.next + 1) % kRuns;
+        index = take_slot(m);
         m.runs[index] = Run{lsa, end, eal};
     }
     m.last = index;
     for (u32 b = lsa >> kBlockShift; b <= (end - 1) >> kBlockShift; b++) m.block_run[b] = static_cast<u8>(index + 1);
+}
+
+// A module whose local store copy is not its guest copy any more: logged once per guest address, with where the copies
+// part (what the program changes in it before it runs).
+void log_modified(const u8* ls, const u8* guest, u32 size, u32 ls_start, u32 ea_start)
+{
+    static std::mutex mutex;
+    static std::unordered_set<u32> logged;
+    {
+        std::lock_guard lock(mutex);
+        if (!logged.insert(ea_start).second) return;
+    }
+    u32 first = 0, last = 0, words = 0;
+    for (u32 i = 0; i + 4 <= size; i += 4)
+        if (std::memcmp(ls + i, guest + i, 4) != 0) {
+            if (!words++) first = i;
+            last = i;
+        }
+    PS_LOG_INFO(kChan, "SPU module at LS 0x{:05x}+{:#x} (guest {:#x}) changed before it ran: {} words differ from its guest "
+        "copy, +{:#x} to +{:#x}; interpreted", ls_start, size, ea_start, words, first, last);
 }
 
 // The resolver: the lifted program of the module holding pc, and where it sits (its lifted programs are relocatable).
@@ -181,8 +219,8 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
         r.resolved = true;
         u8* base = ctx->membase;
         if (std::memcmp(ctx->ls + r.ls_start, base + r.ea_start, size) != 0) {
-            PS_LOG_DEBUG(kChan, "SPU module at LS 0x{:05x}+{:#x} (guest {:#x}) differs from its guest copy: interpreted",
-                r.ls_start, size, r.ea_start);
+            g_modified.fetch_add(1, std::memory_order_relaxed);
+            log_modified(ctx->ls + r.ls_start, base + r.ea_start, size, r.ls_start, r.ea_start);
             return nullptr;
         }
         r.hash = ps_spu_hash64(base + r.ea_start, size);
@@ -222,7 +260,62 @@ const ps_spu_program* identify_hashed(u64 hash, u8* base, const SpuImage& image)
     return nullptr;
 }
 
+struct SavedRun {
+    u32 ls_start, ls_end, ea_start;
+};
+
+struct SavedRuns {
+    std::mutex mutex;
+    std::unordered_map<u32, std::vector<SavedRun>> by_area; // save area -> the runs inside its blocks
+};
+
+SavedRuns& saved_runs()
+{
+    static SavedRuns s;
+    return s;
+}
+
 } // namespace
+
+void save_module_runs(const SPUContext& ctx, u32 save_area, const std::function<bool(u32, u32)>& keep)
+{
+    Modules& m = modules_for(&ctx);
+    std::vector<SavedRun> runs;
+    for (const Run& r : m.runs)
+        if (r.ls_end > r.ls_start && keep(r.ls_start, r.ls_end)) runs.push_back({r.ls_start, r.ls_end, r.ea_start});
+    SavedRuns& s = saved_runs();
+    std::lock_guard lock(s.mutex);
+    if (runs.empty()) s.by_area.erase(save_area);
+    else s.by_area[save_area] = std::move(runs);
+}
+
+void restore_module_runs(SPUContext& ctx, u32 save_area)
+{
+    std::vector<SavedRun> runs;
+    {
+        SavedRuns& s = saved_runs();
+        std::lock_guard lock(s.mutex);
+        const auto it = s.by_area.find(save_area);
+        if (it == s.by_area.end()) return;
+        runs = it->second;
+    }
+    Modules& m = modules_for(&ctx);
+    for (const SavedRun& saved : runs) {
+        // Identified again when execution reaches it: its guest copy is checked against local store as after a GET.
+        const u32 index = take_slot(m);
+        m.runs[index] = Run{saved.ls_start, saved.ls_end, saved.ea_start};
+        for (u32 b = saved.ls_start >> kBlockShift; b <= (saved.ls_end - 1) >> kBlockShift; b++)
+            m.block_run[b] = static_cast<u8>(index + 1);
+    }
+    m.last = kRuns;
+}
+
+void forget_module_runs(SPUContext& ctx)
+{
+    Modules& m = modules_for(&ctx);
+    m = Modules{};
+    m.ctx = &ctx;
+}
 
 const ps_spu_program* identify_program(u8* base, const SpuImage& image)
 {
@@ -255,7 +348,8 @@ void enable_spu_modules()
 SpuProgramStats spu_program_stats()
 {
     return {spurs::g_attached.load(std::memory_order_relaxed), spurs::g_unknown.load(std::memory_order_relaxed),
-        spurs::g_images.load(std::memory_order_relaxed), spurs::g_modules.load(std::memory_order_relaxed)};
+        spurs::g_images.load(std::memory_order_relaxed), spurs::g_modules.load(std::memory_order_relaxed),
+        spurs::g_modified.load(std::memory_order_relaxed)};
 }
 
 } // namespace pspocket::hle

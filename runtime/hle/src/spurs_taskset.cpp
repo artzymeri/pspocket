@@ -287,6 +287,7 @@ void Policy::start_task(u32 id, u64 elf)
     if (flags & 2) PS_LOG_WARN(kTaskChan, "task {} of taskset {:#x} asks for a debugger break at dispatch; ignored", id, taskset_);
     u32 entry = 0, lowest = 0;
     ps_write32(ls_, ls::ctx_guid, ls::task_top);
+    forget_module_runs(w_.ctx); // a new image: the modules another task loaded are gone
     load_elf(id, static_cast<u32>(elf & ~7ull), false, &entry, &lowest);
     attach_code(static_cast<u32>(elf & ~7ull));
     store_qw(ls_, ls::ctx_lr, word0(entry));
@@ -331,6 +332,9 @@ void Policy::resume_task(u32 id, u64 elf)
     for (u32 b = 6; b < 128; b++) {
         if (pattern & task_bit(b)) std::memcpy(ls_ + b * kBlock, guest(save + 0x400 + kBlock * k++), kBlock);
     }
+    // The modules the task had loaded come back with its blocks (D-082).
+    forget_module_runs(w_.ctx);
+    restore_module_runs(w_.ctx, save);
     SPUContext& c = w_.ctx;
     const ps_spu_v128 fpscr = load_qw(ls_, ls::ctx_fpscr);
     ps_spu_fscrwr(&c, &fpscr);
@@ -396,6 +400,12 @@ s32 Policy::save_context()
         if (pattern & task_bit(b)) std::memcpy(guest(save + 0x400 + kBlock * k++), ls_ + b * kBlock, kBlock);
     }
     ps_res_notify_write(save, 0x400 + kBlock * k);
+    // The modules it loaded go with the blocks that hold them (D-082): restoring them is not a DMA the tracker sees.
+    save_module_runs(w_.ctx, save, [&pattern](u32 ls_start, u32 ls_end) {
+        for (u32 b = ls_start / kBlock; b <= (ls_end - 1) / kBlock; b++)
+            if (b < 6 || !(pattern & task_bit(b))) return false;
+        return true;
+    });
     return lv2::CELL_OK;
 }
 

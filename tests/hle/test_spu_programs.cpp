@@ -228,6 +228,13 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     CHECK(spu.ctx.program == &program);
     CHECK(hle::spu_program_stats().modules - before.modules == 1);
 
+    // Data the program copies in afterwards, more pieces than the run table holds, leaves the module known: it ran
+    // (regression, run 054: the oldest run was replaced, and modules that were still in local store were interpreted).
+    for (u32 i = 0; i < 300; i++) get(0x20000 + i * 0x20, kGuest + 0x1000 + i * 0x40, 0x10);
+    ps_spu_attach_program(&spu.ctx, nullptr); // back in the program's own code: the module is found again
+    CHECK(run_at_module() == 0x42);
+    CHECK(spu.ctx.program == &program);
+
     // Copied again, then patched in local store before it runs: its lifted code could be stale, so it is interpreted.
     ps_spu_attach_program(&spu.ctx, nullptr);
     get(kModule, kGuest, 0x400);
@@ -352,4 +359,51 @@ TEST_CASE("SPU programs: a relocatable module is saved once, its seeds where the
     std::filesystem::remove_all(dir);
     ps_spu_set_resolver(nullptr);
     ps_spu_set_get_observer(nullptr);
+}
+
+TEST_CASE("SPU programs: a task's modules stay known across its context switch to another SPU (D-082)", "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModule = 0x8000, kModuleSize = 0x800, kSaveArea = 0x40000;
+    ps_write32(base, kGuest, 0x00000007); // interpreted, the module stops with 0x7; lifted, with 0x42
+    for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
+    const ps_spu_entry entries[] = {{kModule, &module_entry}};
+    ps_spu_program program{"spu_module_switch", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr};
+    ps_spu_register_program(&program);
+    hle::enable_spu_modules();
+    const auto run_at_module = [](Spu& spu) {
+        spu.ctx.pc = kModule;
+        REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+        return spu.ctx.stop_code;
+    };
+
+    Spu first(base);
+    REQUIRE(ps_spu_wrch(&first.ctx, 0, PS_MFC_LSA, kModule) == 0);
+    REQUIRE(ps_spu_wrch(&first.ctx, 0, PS_MFC_EAH, 0) == 0);
+    REQUIRE(ps_spu_wrch(&first.ctx, 0, PS_MFC_EAL, kGuest) == 0);
+    REQUIRE(ps_spu_wrch(&first.ctx, 0, PS_MFC_Size, kModuleSize) == 0);
+    REQUIRE(ps_spu_wrch(&first.ctx, 0, PS_MFC_TagID, 5) == 0);
+    REQUIRE(ps_spu_wrch(&first.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+    CHECK(run_at_module(first) == 0x42);
+    // The task yields: its context (local store included) is saved, the module runs with it.
+    hle::spurs::save_module_runs(first.ctx, kSaveArea, [](u32, u32) { return true; });
+
+    // It resumes on another SPU: local store comes back by copy, not by DMA.
+    Spu second(base);
+    std::memcpy(second.ls.get() + kModule, first.ls.get() + kModule, kModuleSize);
+    CHECK(run_at_module(second) == 0x7); // without the saved runs: unknown code, interpreted
+    std::memcpy(second.ls.get() + kModule, first.ls.get() + kModule, kModuleSize);
+    hle::spurs::forget_module_runs(second.ctx);
+    hle::spurs::restore_module_runs(second.ctx, kSaveArea);
+    ps_spu_attach_program(&second.ctx, nullptr);
+    CHECK(run_at_module(second) == 0x42);
+    CHECK(second.ctx.program == &program);
+
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&program);
 }
