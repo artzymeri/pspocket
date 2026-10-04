@@ -66,6 +66,11 @@ inline u32 mfc_completed(const SPUContext* ctx) { return ctx->ch.tag_mask & ~ctx
 
 // Takes a pending interrupt (interrupts enabled and an enabled event pending): SRR0 = pc, pc = handler.
 void check_interrupt(SPUContext* ctx);
+// The resolver (ps_spu_set_resolver) for pc outside the attached program's range: attaches and returns true when another
+// program has lifted code there.
+bool resolve_program(SPUContext* ctx, u32 pc);
+// The GET observer (ps_spu_set_get_observer).
+void observe_get(SPUContext* ctx, u32 lsa, u32 eal, u32 size);
 
 // Run-state bookkeeping for ps_spu_status.
 void set_status(SPUContext* ctx, u32 status);

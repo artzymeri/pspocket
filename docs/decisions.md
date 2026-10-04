@@ -1152,6 +1152,30 @@ Left for later, each logged once: vertex texture fetch (vertex TXL), floating-po
 as textures and read back, multisampling (one sample), occlusion queries (65535) and conditional rendering (always
 drawn).
 
+## D-079 · 2026-10-04 · SPU modules programs load themselves; identifying images once per load
+
+Run 049 (lifted tasks, jobs and policy module) ran the 102 lifted programs without a crash, but at the interpreted
+runs' pace. Two causes, from a Time Profiler capture on the Mac (run 050):
+- Hashing every load took a fifth of the workers' time: GTA V's own policy module is entered every time its workload
+  is selected, and jobs and tasks start thousands of times a second. An image is now identified when it is copied into
+  local store and the answer kept while the copy stays: the worker keeps its policy module's program until the module
+  is reloaded, the job chain's LS cache keeps each binary's, and tasks (copied at every start) are hashed then. A DMA
+  over a program's code forgets it there too. (A sampled fingerprint cache was tried first and dropped: a test showed
+  it can miss a change in the middle of the code.) The SPU's floating-point mode is entered once per worker thread
+  instead of on every run (about 3.5% more).
+- Most of the remaining interpreted time is code the programs load themselves: GTA V's four "dependency_spu" tasks
+  copy in the jobs they run as code modules (6,105 of run 049's 6,982 "no lifted code" addresses were in one such task,
+  outside its own 14 KB of code). The SPU runtime now has two hooks: an observer of every GET into local store, and a
+  resolver the run loop asks when execution reaches an address the attached program has no lifted code for (the
+  interpreter asks on taken branches out of the attached program's range). The HLE keeps each SPU's GETs as runs of
+  contiguous copies (a module comes in several 16 KB GETs), finds the run holding the address, and identifies it like
+  any image: the hash of its guest copy and its LS address. A module whose local store copy differs from its guest copy
+  when execution first reaches it (patched after loading) is interpreted, since its lifted code could be stale. With
+  `--spu-dump`, modules are saved too, with the addresses execution entered them at as "seed" lines for the next lift;
+  `scripts/lift-spu.sh` keeps only seeds inside each image (spu-lift refuses the others: the SPURS syscall stubs, code
+  of other modules).
+pspocket-boot logs the frame rate every 5 s, like the iOS app.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

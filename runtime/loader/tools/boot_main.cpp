@@ -74,6 +74,7 @@
 #endif
 #include "pspocket/ppu/disasm.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/rsx/rsx.hpp"
 #include "pspocket/spu/disasm.hpp"
 #include "pspocket/spu/runtime.h"
 
@@ -502,8 +503,12 @@ int main(int argc, char** argv)
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
 #if defined(PSPOCKET_HAVE_GAME_SPU)
     pspocket_game_spu_register();
+    hle::enable_spu_modules();
 #endif
-    if (!spu_dump.empty()) hle::set_spu_dump_dir(spu_dump);
+    if (!spu_dump.empty()) {
+        hle::set_spu_dump_dir(spu_dump);
+        hle::enable_spu_modules();
+    }
 #if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
     std::unique_ptr<platform::AudioOutput> audio_output;
     if (audio) {
@@ -547,11 +552,16 @@ int main(int argc, char** argv)
     };
     const auto deadline = start + seconds(timeout_s);
     auto next_report = start + seconds(report_every_s);
+    // The frame rate, every 5 s once the RSX runs (as the iOS app's log line).
+    constexpr double kRateEvery = 5.0;
+    auto next_rate = start + seconds(kRateEvery);
+    auto rate_since = start;
+    u64 rate_flips = 0;
     bool done = false;
     // Scripted presses (--press): which buttons are down is checked every 20 ms while any press is scheduled.
     std::string pad_text;
     for (;;) {
-        auto until = report_every_s > 0 ? std::min(deadline, next_report) : deadline;
+        auto until = std::min(next_rate, report_every_s > 0 ? std::min(deadline, next_report) : deadline);
         if (!presses.empty()) until = std::min(until, Clock::now() + std::chrono::milliseconds(20));
         done = kernel.wait_for_exit(std::chrono::ceil<std::chrono::milliseconds>(std::max(until - Clock::now(),
             Clock::duration::zero())));
@@ -567,6 +577,19 @@ int main(int argc, char** argv)
                 PS_LOG_INFO("boot", "controller at {:.2f} s: {}", t, text.empty() ? "released" : text);
                 pad_text = text;
             }
+        }
+        if (now >= next_rate) {
+            if (rsx::Rsx* r = kernel.rsx()) {
+                const u64 flips = r->status().flips;
+                const double dt = std::chrono::duration<double>(now - rate_since).count();
+                if (flips != rate_flips) {
+                    PS_LOG_INFO("boot", "{:.1f} fps ({} frames in {:.1f} s; {} since the boot)",
+                        static_cast<double>(flips - rate_flips) / dt, flips - rate_flips, dt, flips);
+                }
+                rate_flips = flips;
+            }
+            rate_since = now;
+            next_rate = now + seconds(kRateEvery);
         }
         if (report_every_s > 0 && now >= next_report) {
             const double elapsed = std::chrono::duration<double>(now - start).count();
@@ -598,9 +621,10 @@ int main(int argc, char** argv)
     }
 #endif
     const hle::SpuProgramStats spu = hle::spu_program_stats();
-    std::printf("SPU program loads: %llu lifted, %llu interpreted (%llu images without a lifted program)\n",
+    std::printf("SPU program loads: %llu lifted, %llu interpreted (%llu images without a lifted program); %llu modules "
+                "lifted\n",
         static_cast<unsigned long long>(spu.attached), static_cast<unsigned long long>(spu.unknown),
-        static_cast<unsigned long long>(spu.images));
+        static_cast<unsigned long long>(spu.images), static_cast<unsigned long long>(spu.modules));
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());
     for (const auto* f : missing)

@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "internal.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/disasm.hpp"
@@ -970,7 +971,7 @@ RunResult run(SPUContext& ctx, const RunOptions& options)
         if (ctx.pc != pc + 4) {
             // Taken branch (or an interrupt): the run loop may resume lifted code here, or must stop.
             if (__atomic_load_n(&ctx.attention, __ATOMIC_RELAXED)) break;
-            if (options.stop_at_lifted && ps_spu_lookup(&ctx, ctx.pc)) {
+            if (options.stop_at_lifted && (ps_spu_lookup(&ctx, ctx.pc) || detail::resolve_program(&ctx, ctx.pc))) {
                 result.reached_lifted = true;
                 break;
             }

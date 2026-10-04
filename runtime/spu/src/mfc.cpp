@@ -127,7 +127,10 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
         std::memset(mem, 0, size);
     } else {
         ls_copy(ctx->ls, lsa, mem, size, is_get(cmd));
-        if (is_get(cmd) && ctx->program) drop_overwritten_program(ctx, lsa, size);
+        if (is_get(cmd)) {
+            if (ctx->program) drop_overwritten_program(ctx, lsa, size);
+            observe_get(ctx, lsa, eal, size); // code a program loads itself (D-079)
+        }
     }
     if (!is_get(cmd)) ps_res_notify_write(eal, size); // PUTs break reservations on the lines they touch
     return 0;

@@ -14,10 +14,16 @@ namespace pspocket::hle {
 // them in the gitignored inventory/ (CLAUDE.md rule 1).
 void set_spu_dump_dir(std::string dir);
 
+// Code SPU programs load themselves (D-079): watches every SPU's GETs into local store and, when execution reaches an
+// address no attached program has lifted code for, attaches the lifted program of the module copied there. Call once,
+// before SPU threads run, when lifted programs are built in or images are being saved.
+void enable_spu_modules();
+
 struct SpuProgramStats {
     u64 attached = 0; // loads that found a lifted program
     u64 unknown = 0;  // loads that didn't (the interpreter ran them)
     u64 images = 0;   // distinct images without one, seen so far
+    u64 modules = 0;  // modules (code a program loaded itself) that found a lifted program
 };
 SpuProgramStats spu_program_stats();
 

@@ -15,7 +15,7 @@
 
 namespace pspocket::hle::spurs {
 
-enum class ImageKind : u8 { Task, Job, PolicyModule };
+enum class ImageKind : u8 { Task, Job, PolicyModule, Module }; // Module: code a program loaded itself (D-079)
 
 struct SpuImage {
     ImageKind kind = ImageKind::Task;
@@ -25,8 +25,14 @@ struct SpuImage {
     u32 entry = 0;    // where it is entered (LS)
 };
 
-// Attaches the lifted program for `image` to the context (or none: the interpreter runs it). The image must be in
-// guest memory at `base + guest`.
+// The lifted program for an image just copied into local store (nullptr: the interpreter runs it), from the hash of its
+// guest copy at `base + guest`. An image without one is logged (and with a dump directory saved) the first time.
+// Hashing costs about what copying the image does several times over: callers identify an image when they load it
+// and keep the answer while the image stays in local store (run 050: hashing every entry of GTA V's own policy
+// module and every job took a fifth of the workers' time).
+const ps_spu_program* identify_program(u8* base, const SpuImage& image);
+
+// identify_program, then attaches the result to the context.
 void attach_program(SPUContext& ctx, u8* base, const SpuImage& image);
 
 } // namespace pspocket::hle::spurs

@@ -28,6 +28,7 @@
 #include "pspocket/core/reservation.h"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/sync.hpp"
+#include "pspocket/spu/fp.h"
 #include "pspocket/spu/runtime.h"
 #include "spurs_native.hpp"
 
@@ -205,6 +206,10 @@ void Worker::body()
 #elif defined(__linux__)
     pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
 #endif
+    // The SPU's floating-point mode (pspocket/spu/fp.h) for the worker's whole life: every ps_spu_run would otherwise
+    // set the host's FP control register and restore it, thousands of times a second (run 050: about 3.5% of the
+    // workers' time). The scheduler and policies around the SPU code do no floating point.
+    const u64 fp_env = ps_spu_fpenv_enter();
     while (!sched.stopping.load(std::memory_order_acquire)) {
         // The version is read before selecting, so a change made while selecting ends the wait at once.
         const u64 version = ps_res_version(sched.spurs);
@@ -216,6 +221,7 @@ void Worker::body()
         run_workload(sel);
     }
     release();
+    ps_spu_fpenv_leave(fp_env);
 }
 
 // Gives this SPU's contention back (the worker stops).

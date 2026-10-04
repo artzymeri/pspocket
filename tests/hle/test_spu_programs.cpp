@@ -148,3 +148,60 @@ TEST_CASE("SPU programs: a DMA over the attached program's code drops it", "[hle
     CHECK(spu.ctx.program == nullptr);
     ps_spu_unregister_program(&program);
 }
+
+namespace {
+
+void module_entry(SPUContext* ctx, uint8_t*) { ps_spu_stop(ctx, ctx->pc, 0x42); }
+
+} // namespace
+
+TEST_CASE("SPU programs: code a program copies in itself runs lifted when execution reaches it (D-079)", "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModule = 0x8000, kModuleSize = 0x800;
+    // The module's code as the interpreter would run it: `stop 0x7` at its entry.
+    ps_write32(base, kGuest, 0x00000007);
+    for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i); // nops with distinct bits
+    const ps_spu_entry entries[] = {{kModule, &module_entry}};
+    ps_spu_program program{"spu_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 1, entries, nullptr};
+    ps_spu_register_program(&program);
+    hle::enable_spu_modules();
+    Spu spu(base);
+    const auto get = [&](u32 lsa, u32 eal, u32 size) {
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_LSA, lsa) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAH, 0) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAL, eal) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Size, size) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_TagID, 2) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+    };
+    const auto run_at_module = [&] {
+        spu.ctx.pc = kModule;
+        REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+        return spu.ctx.stop_code;
+    };
+    const hle::SpuProgramStats before = hle::spu_program_stats();
+
+    // Copied in two pieces, as one module: its lifted program runs.
+    get(kModule, kGuest, 0x400);
+    get(kModule + 0x400, kGuest + 0x400, 0x400);
+    CHECK(run_at_module() == 0x42);
+    CHECK(spu.ctx.program == &program);
+    CHECK(hle::spu_program_stats().modules - before.modules == 1);
+
+    // Copied again, then patched in local store before it runs: its lifted code could be stale, so it is interpreted.
+    ps_spu_attach_program(&spu.ctx, nullptr);
+    get(kModule, kGuest, 0x400);
+    get(kModule + 0x400, kGuest + 0x400, 0x400);
+    ps_write32(spu.ls.get(), kModule + 0x100, 0x40200000);
+    CHECK(run_at_module() == 0x7);
+    CHECK(spu.ctx.program == nullptr);
+
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&program);
+}

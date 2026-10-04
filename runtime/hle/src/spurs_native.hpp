@@ -102,6 +102,7 @@ public:
     u32 current_wid = kIdleWid;
     // A game's own policy module is reloaded whenever another policy ran in between: logged once per worker.
     bool custom_load_logged = false;
+    const ps_spu_program* custom_program = nullptr; // the lifted program of the policy module in LS (D-076)
 
     struct Selection {
         u32 wid = kIdleWid;

@@ -48,6 +48,7 @@ void run_custom(Worker& w, u32 wid, u32 poll_status)
     if (ps_read64(w.ls, ls::k_wkl_addr) != pm) {
         std::memcpy(w.ls + ls::pm_entry, base + pm, size);
         ps_write64(w.ls, ls::k_wkl_addr, pm);
+        w.custom_program = identify_program(base, {ImageKind::PolicyModule, pm, ls::pm_entry, size & ~3u, ls::pm_entry});
         if (!w.custom_load_logged) {
             PS_LOG_INFO(kCustomChan, "SPURS {:#x} SPU {}: workload {}'s own policy module ({:#x} bytes at {:#x}, argument "
                 "{:#x}) loaded and started (reloads are logged at debug level)", w.sched.spurs, w.spu_num, wid, size, pm, arg);
@@ -68,10 +69,11 @@ void run_custom(Worker& w, u32 wid, u32 poll_status)
     c.gpr[4].u64[1] = arg;
     c.gpr[5] = word0(poll_status);
     c.pc = ls::pm_entry;
-    attach_program(c, base, {ImageKind::PolicyModule, pm, ls::pm_entry, size & ~3u, ls::pm_entry}); // D-076
+    ps_spu_attach_program(&c, w.custom_program); // identified when loaded (D-076)
 
     for (;;) {
         const u32 reason = ps_spu_run(&c);
+        if (!c.program) w.custom_program = nullptr; // a DMA over the module's code dropped it: interpreted from now on
         if (reason == PS_SPU_STOP_REQUESTED) return;
         if (reason == PS_SPU_STOP_SIGNAL && c.stop_code == kKernelExitStop) return; // 0x804 or [0x1E0]
         if (reason == PS_SPU_STOP_SIGNAL && c.stop_code == kKernelSelectStop) {

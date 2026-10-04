@@ -41,6 +41,8 @@ std::atomic<ps_spu_miss_policy> g_miss_policy{PS_SPU_MISS_INTERPRET};
 std::atomic<ps_spu_miss_policy> g_miss_policy{PS_SPU_MISS_ABORT};
 #endif
 std::atomic<u64> g_miss_count{0};
+std::atomic<ps_spu_resolver> g_resolver{nullptr};
+std::atomic<ps_spu_get_observer> g_get_observer{nullptr};
 std::mutex g_miss_mutex;
 std::unordered_set<u64> g_logged_misses;
 
@@ -60,6 +62,30 @@ void report_miss(const SPUContext* ctx, u32 pc)
         PS_LOG_WARN("spu", "SPU {}: no lifted code at 0x{:05x} in program {} ({:016x}): interpreting", ctx->id, pc,
             p->name, p->hash);
 }
+
+} // namespace
+
+namespace pspocket::spu::detail {
+
+bool resolve_program(SPUContext* ctx, u32 pc)
+{
+    const ps_spu_resolver resolver = g_resolver.load(std::memory_order_relaxed);
+    if (!resolver) return false;
+    if (const ps_spu_program* p = ctx->program; p && pc - p->code_start < p->code_size) return false; // its own code
+    const ps_spu_program* other = resolver(ctx, pc);
+    if (!other || other == ctx->program) return false;
+    ps_spu_attach_program(ctx, other);
+    return ps_spu_lookup(ctx, pc) != nullptr;
+}
+
+void observe_get(SPUContext* ctx, u32 lsa, u32 eal, u32 size)
+{
+    if (const ps_spu_get_observer observer = g_get_observer.load(std::memory_order_relaxed)) observer(ctx, lsa, eal, size);
+}
+
+} // namespace pspocket::spu::detail
+
+namespace {
 
 // Returns true when the run loop must stop.
 bool handle_attention(SPUContext* ctx)
@@ -167,6 +193,8 @@ void ps_spu_attach_program(SPUContext* ctx, const ps_spu_program* program)
 }
 
 void ps_spu_set_miss_policy(ps_spu_miss_policy policy) { g_miss_policy.store(policy); }
+void ps_spu_set_resolver(ps_spu_resolver resolver) { g_resolver.store(resolver, std::memory_order_release); }
+void ps_spu_set_get_observer(ps_spu_get_observer observer) { g_get_observer.store(observer, std::memory_order_release); }
 ps_spu_miss_policy ps_spu_get_miss_policy(void) { return g_miss_policy.load(); }
 uint64_t ps_spu_miss_count(void) { return g_miss_count.load(); }
 
@@ -184,9 +212,10 @@ uint32_t ps_spu_run(SPUContext* ctx)
         if (const ps_spu_fn fn = ps_spu_lookup(ctx, ctx->pc)) {
             fn(ctx, ctx->ls);
         } else {
+            if (detail::resolve_program(ctx, ctx->pc)) continue; // another program has lifted code here (D-079)
             if (ctx->program) report_miss(ctx, ctx->pc);
             RunOptions options;
-            options.stop_at_lifted = ctx->program != nullptr;
+            options.stop_at_lifted = ctx->program != nullptr || g_resolver.load(std::memory_order_relaxed);
             run(*ctx, options);
         }
         if (ctx->stop_reason != PS_SPU_STOP_NONE) break;

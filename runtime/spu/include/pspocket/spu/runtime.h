@@ -62,6 +62,16 @@ const ps_spu_program* ps_spu_identify(SPUContext* ctx, uint32_t code_start, uint
 /* Attaches a program directly (also sets ctx->xfloat to its model). NULL detaches. */
 void ps_spu_attach_program(SPUContext* ctx, const ps_spu_program* program);
 
+/* Code a program loads itself (D-079). The host may name another lifted program for an address the attached one
+ * has no lifted code for: a module the program copied into local store. The run loop asks on a miss, the interpreter
+ * on a taken branch out of the attached program's range; the resolver returns a program with lifted code at pc, or
+ * NULL. Called on the SPU's thread. The observer sees every GET into local store as it completes (lsa, effective
+ * address, size), on the SPU's thread. Set both before SPU threads run; NULL clears. */
+typedef const ps_spu_program* (*ps_spu_resolver)(SPUContext* ctx, uint32_t pc);
+void ps_spu_set_resolver(ps_spu_resolver resolver);
+typedef void (*ps_spu_get_observer)(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size);
+void ps_spu_set_get_observer(ps_spu_get_observer observer);
+
 static inline ps_spu_fn ps_spu_lookup(const SPUContext* ctx, uint32_t pc)
 {
     const ps_spu_program* p = ctx->program;

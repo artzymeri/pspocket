@@ -152,6 +152,9 @@ struct CacheEntry {
     u32 pages = 0;
     u32 refs = 0; // jobs using it
     u64 used = 0; // LRU stamp
+    // A binary's lifted program, identified when the binary was loaded (D-076).
+    bool identified = false;
+    const ps_spu_program* program = nullptr;
 };
 
 class JobChainPolicy {
@@ -948,7 +951,14 @@ bool JobChainPolicy::run_job(const Job& job)
     ctx.gpr[126].u32[3] = binary;
     ps_spu_wrch(&ctx, ls::jc_return, PS_MFC_WrTagMask, 1u << tag);
     ctx.pc = binary;
-    attach_program(ctx, base_, {ImageKind::Job, binary_ea, binary, size_binary, binary}); // D-076
+    // The binary's lifted program (D-076): identified when the binary came into the LS cache, kept while it stays.
+    const SpuImage image{ImageKind::Job, binary_ea, binary, size_binary, binary};
+    CacheEntry* cached = binary_entry >= 0 ? &cache_[static_cast<u32>(binary_entry)] : nullptr;
+    if (cached && !cached->identified) {
+        cached->program = identify_program(base_, image);
+        cached->identified = true;
+    }
+    ps_spu_attach_program(&ctx, cached ? cached->program : identify_program(base_, image));
 
     for (;;) {
         const u32 reason = ps_spu_run(&ctx);
@@ -958,6 +968,8 @@ bool JobChainPolicy::run_job(const Job& job)
             job.ea, binary_ea, binary, reason, ctx.stop_code, ctx.stop_code == 0x3FFF ? ", stopd: an assertion" : "",
             ctx.exception, ctx.pc));
     }
+    // A DMA over the binary's code dropped its lifted program: the cached copy is interpreted from now on.
+    if (cached && !ctx.program) cached->program = nullptr;
     // The job's own DMA (its output) completed with it: the MFC is synchronous.
     release_buffers();
     return true;
