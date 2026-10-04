@@ -5,6 +5,7 @@ add_library(pspocket_hle STATIC
     src/cellGcmSys.cpp
     src/cellNetCtl.cpp
     src/cellRtc.cpp
+    src/cellSaveData.cpp
     src/cellSheap.cpp
     src/cellSpurs.cpp
     src/cellSysmodule.cpp

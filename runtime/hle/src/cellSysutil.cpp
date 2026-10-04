@@ -3,8 +3,8 @@
 // cellSysutil.cpp/.h, cellVideoOut.cpp/.h, cellAudioOut.cpp/.h, cellSysCache.cpp, cellAvconfExt.cpp, with RPCS3's
 // default configuration (Emu/system_config.h, rsx::avconf in Emu/RSX/Utils/rsx_utils.h).
 //
-// Implemented: what GTA V imports from these modules except the dialog, on-screen keyboard and save data functions,
-// which nothing has called yet (CLAUDE.md rule 4).
+// Implemented: what GTA V imports from these modules except the dialog and on-screen keyboard functions (save data:
+// cellSaveData.cpp), which nothing has called yet (CLAUDE.md rule 4).
 //
 // The console reported is RPCS3's default one, which also suits a fixed iPhone target: one HDMI display at 720p
 // (1280x720 progressive, 16:9: the PS3 mode closest to a phone screen, and the resolution most games render at), RGB,

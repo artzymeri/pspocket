@@ -808,6 +808,30 @@ network, no PSN and no voice devices.
 - Where RPCS3 would fault on an unchecked guest pointer, the call site is logged and the call refused with the
   module's address error (D-042).
 
+## D-062 · 2026-10-04 · Save data on host directories in RPCS3's layout; no dialogs yet
+
+GTA V calls cellSaveDataAutoLoad2 during startup. The six save data functions it imports (cellSysutil's
+cellSaveDataAutoLoad2, AutoSave2, ListAutoLoad, Delete2 and FixedDelete, and cellSaveData's cellSaveDataGetListItem)
+follow RPCS3's cellSaveData.cpp in `runtime/hle/src/cellSaveData.cpp`, through one `savedata_op` that makes RPCS3's
+argument checks with the PS3's error numbers.
+- **Layout:** RPCS3's, so saves move between RPCS3 and pspocket unchanged: `/dev_hdd0/home/00000001/savedata/<dir>/`
+  (`inventory/<game>/hdd0` with boot.sh) with PARAM.SFO (category SD, title, subtitle, detail, list parameter, and
+  RPCS3's `*<file>` secure-file flags and RPCS3_BLIST file order) and the game's files.
+- **Callbacks** run on the calling thread through call_guest (D-045), their structures in one guest block in the main
+  area: funcFixed picks a listed save, funcStat sees it and may set PARAM.SFO, funcFile reads, writes or deletes one
+  file per call until OK_LAST. A changed save is written whole to `.working_<dir>` and swapped in through
+  `.backup_<dir>`, so an interrupted save leaves the old or the new one.
+- **No dialogs yet:** the auto and list-auto variants need none; cellSaveDataDelete2 returns CELL_CANCEL and
+  cellSaveDataFixedDelete without OPTION_NOCONFIRM returns CELL_SAVEDATA_ERROR_INTERNAL, RPCS3's results with no
+  dialog. Errors the PS3 would show in a dialog are logged.
+- **Differences from RPCS3:** its PS3-imitating sleeps are left out (as D-044) except the 100/500 ms after the last
+  funcFile that games rely on; the savedata directory is made by the first call, not at boot; host failures, a fixed
+  delete of an unlisted save, a null funcDone and pointers outside memory return errors where RPCS3 throws or faults;
+  saves are listed in name order.
+
+Left out until a game imports them: the list and fixed variants with dialogs (funcList), the User* variants, import
+and export, and the auto-save indicator.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
