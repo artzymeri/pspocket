@@ -1,8 +1,10 @@
 # HLE linkage, sysPrxForUser and the process loader: registry checks, stub calls, lwmutex on real lv2 threads, a
 # synthetic executable booted end to end, and pspocket-boot's fault report.
 pspocket_add_test(test_hle
-    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_gcm.cpp
+    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_gcm.cpp test_sysutil.cpp
     LIBS pspocket::loader pspocket_test_synthetic pspocket::recomp_ppu)
+# HLE modules' internal headers (sysutil.hpp: the event queue other modules use).
+target_include_directories(test_hle PRIVATE ${PROJECT_SOURCE_DIR}/runtime/hle/src)
 
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.

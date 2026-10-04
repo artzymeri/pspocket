@@ -554,6 +554,26 @@ Run 015 (D-046 made the check possible). Changes from D-039, D-041 and D-042:
   fatal log naming it. Where libsre would read a bad pointer, pspocket refuses the call with a logged error, as in
   D-042.
 
+## D-048 · 2026-10-04 · cellSysutil reports RPCS3's default console; the system cache lives next to hdd0
+
+Runs 015 to 017. GTA V calls these functions right before and after GCM init. Implemented now: the 16 cellSysutil
+functions it imports (callbacks, system parameters, system cache, video and audio output state) and the two
+cellSysutilAvconfExt ones. Not implemented yet: dialogs, the on-screen keyboard, save data and BGM.
+
+- **The console reported** is RPCS3's default configuration, which suits a fixed iPhone target:
+  - display: one HDMI display, 1280x720 progressive at 59.94 Hz, 16:9, RGB;
+  - sound: stereo LPCM at 48 kHz;
+  - settings: English, enter on cross, parental control off, no PSN account (D-024);
+  - two values differ from RPCS3: the nickname "PSPocket", and the user name, which comes from the host's
+    `/dev_hdd0/home/00000001/localusername` when that file exists, else "User".
+- **System events** go through the callbacks the game registers. `sysutil.hpp` queues events for other HLE code, and
+  `cellSysutilCheckCallback` calls the callbacks on the game's thread through `call_guest` (D-045). Nothing sends an
+  event yet: there is no system menu.
+- **The system cache** follows RPCS3: `/dev_hdd1` is mounted on `caches/<TITLE_ID>_<cacheId>` under the hdd1 root.
+  That root is the host's `/dev_hdd1` mount if there is one, else `hdd1` next to the host directory of `/dev_hdd0`,
+  which is `inventory/<game>/hdd1` with `scripts/boot.sh`. RPCS3's relay and clear rules apply, with its in-use
+  marker, which pspocket writes in every case, not only for a new cache.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -6,6 +6,7 @@ add_library(pspocket_hle STATIC
     src/cellSheap.cpp
     src/cellSpurs.cpp
     src/cellSysmodule.cpp
+    src/cellSysutil.cpp
     src/modules.cpp
     src/process.cpp
     src/psf.cpp
