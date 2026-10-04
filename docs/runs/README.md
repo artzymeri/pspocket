@@ -57,3 +57,18 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [052](052-gta5-module-dump-mac.md) | 2026-10-04 | 02e8498 | M4 Mac, pspocket-boot --spu-dump | 82 modules at thousands of addresses: 32,570 dumps; relocatable lifting (D-081) |
 | [053](053-gta5-relocatable-jobs-mac.md) | 2026-10-04 | 750963c | M4 Mac, pspocket-boot --gpu metal --spu-dump | Relocatable jobs (D-081): the intro at 20 to 28 fps (was 11 to 13); 44 modules saved once each |
 | [054](054-gta5-lifted-modules-mac.md) | 2026-10-04 | 750963c+ | M4 Mac, pspocket-boot --frames --spu-dump | Every SPU program lifted: the intro at 30 fps, **the first mission at 9 to 10 fps** (was 4); the world still pink |
+| [055](055-gta5-module-count-mac.md) | 2026-10-04 | 750963c+ | M4 Mac, pspocket-boot --spu-dump | No module changed in local store (D-082's cause is the tracker); a FIFO desync after 195 s of the mission |
+| [056](056-gta5-first-frame-trace-mac.md) | 2026-10-04 | 750963c+ | M4 Mac, pspocket-boot --trace-frame, Time Profiler | The first frame trace: the lighting pass reads three inputs wrongly (D-083); the commit check's mutex at 14% |
+| [057](057-gta5-spu-interp-sites-mac.md) | 2026-10-04 | 37f47f9+ | M4 Mac, pspocket-boot --trace-frame | 16.6 billion SPU instructions interpreted at job entries: jobs lost their lifted code to data GETs (D-085) |
+| [058](058-gta5-depth-readbacks-mac.md) | 2026-10-04 | 37f47f9+ | M4 Mac, pspocket-boot --frames | Jobs lifted again; the policy module's stops (D-087); 65,433 depth readbacks, the mission at 6.6 fps |
+| [059](059-gta5-stops-lifted-mac.md) | 2026-10-04 | db6b7ad+ | M4 Mac, pspocket-boot --frames | The most interpreted SPU address down to 70 million instructions; the mission at 6 to 7 fps |
+| [060](060-gta5-gpu-depth-mac.md) | 2026-10-04 | 66b8b7a | M4 Mac, pspocket-boot --trace-frame | Depth converted on the GPU (D-088): **the first mission at 22 to 25 fps**; IFE and UPB draws skipped |
+| [061](061-gta5-fragment-flow-mac.md) | 2026-10-04 | 61be402 | M4 Mac, pspocket-boot --trace-frame | Fragment program flow control (D-089): the mission at 22 to 24 fps |
+| [062](062-gta5-decode-cache-mac.md) | 2026-10-04 | 61be402+ | M4 Mac, pspocket-boot --gpu metal | The PPU decode cache (D-091): the mission at 26 to 28 fps |
+| [063](063-gta5-skipped-post-mac.md) | 2026-10-04 | 93dd06e+ | M4 Mac, pspocket-boot --trace-frame | Five post-processing draws skipped for vertex texture fetch (D-093) |
+| [064](064-gta5-lit-mission-mac.md) | 2026-10-04 | 9cd1f31 | M4 Mac, pspocket-boot --trace-frame | **The first mission lit correctly**, no skipped draws, 26 to 28 fps |
+| [065](065-gta5-ppu-aot-fault-mac.md) | 2026-10-04 | 9cd1f31+ | M4 Mac, pspocket-boot, the PPU code translated | The game's PPU code translated ahead of time (D-092) faults within seconds: wrappers entered above their body (D-094) |
+| [066](066-gta5-ppu-translated-mac.md) | 2026-10-05 | 9cd1f31+ | M4 Mac, pspocket-boot, the PPU code translated | **The game's PPU code translated: the first mission at 28 to 30 fps** (the cap); an SPU task's modules and the script VM interpreted |
+| [067](067-gta5-vm-tables-mac.md) | 2026-10-05 | 9cd1f31+ | M4 Mac, pspocket-boot, the PPU code translated | Modules in shared blocks found, the script VM's tables, DEPTH16 from memory (D-095 to D-097) |
+| [068](068-gta5-color-conversion-mac.md) | 2026-10-05 | 9cd1f31+ | M4 Mac, pspocket-boot --spu-dump | Y16_X16 over colour targets converted on the GPU: one readback a frame left (D-098) |
+| [069](069-gta5-module-tracker-mac.md) | 2026-10-05 | 9cd1f31+ | M4 Mac, pspocket-boot --spu-dump | The dependency tasks' modules all run lifted (D-099) |

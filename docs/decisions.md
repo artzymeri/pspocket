@@ -1387,6 +1387,106 @@ albedo instead of the lit image.
   VERTEX_TEXTURE_FETCH2D: textureLod($t, $0.xy, 0)); the four units are bound as vertex textures and samplers.
 - Tests: the translation, and a draw whose vertex colour comes from a vertex texture, end to end.
 
+## D-094 · 2026-10-05 · Translated functions start at their entry; SNC switches; locating faults in translated code
+
+Run 065 (GTA V with its PPU code translated, D-092) faulted on a small guest address within seconds, not always at the
+same point.
+- The cause: the lifter emitted a function's instructions in address order and started at the lowest one. SNC emits
+  wrappers that set up an argument and then branch back into a shared body below them (here an mbrtowc-like function:
+  `addis r7, r13, 0; addi r7, r7, -28212; b body`); the translated wrapper started in the body with r7 unset. A
+  function whose entry is not its lowest instruction now begins with a goto to its entry. 9 of GTA V's 85,370
+  functions have that shape. Test: such a function, translated and interpreted, gives the same result.
+- SNC's switch shape is recognised: the bounds check compares a masked copy of the index (`clrlwi r0, r9, 24; cmplwi
+  cr7, r0, 83`), the scaling masks too (`rlwinm r9, r9, 2, 22, 29` is (r9 & 0xFF) * 4), the table address is a word
+  loaded from the TOC, and the entries are sign-extended with extsw after lwzx. The bounds check is accepted only when
+  it is the instruction that sets the branch's CR field, sees every index bit the scaling uses, and the index does not
+  change between them. GTA V: 9 tables recognised (none before); the game has few bctr switches.
+- Finding the function: a fault now prints the host program counter and frame-pointer chain with the image slide, so
+  `atos -o pspocket-boot -s SLIDE ADDR...` names the translated functions (game_ppu_f_<address>) on the stack. The guest
+  cia is stale in translated code. PSPOCKET_PPU_ONLY=LO-HI[,LO-HI] keeps only those translated functions, for
+  bisecting; the fault here was intermittent, which misled a bisection, so the host frames are the tool to reach for.
+- ppu-dis disassembles a raw image (`ppu-dis --image FILE --base ADDR ADDR [COUNT]`); PSPOCKET_PPU_TRACE_MISSES=N
+  prints the registers around the first N interpreter fallbacks of translated code.
+
+## D-095 · 2026-10-05 · Modules found in a shared 1 KB block; the task syscall stop lifted
+
+Run 066 (GTA V with its PPU code translated) interpreted 201 million SPU instructions at LS 0x071f0 in one dependency
+task (spu_5d53598703d84caa) and 7,596 other addresses of the modules it loads, while the task's syscalls missed at
+0xA70 every time.
+- The module tracker finds the run holding pc through the 1 KB block it is in, one run per block. The task copies a
+  module to 0x71f0 (0x110 bytes) and then its data to 0x7310, in the same block: the data's run took the block and the
+  module could not be found. When the block's run does not hold pc, the resolver now looks through all the runs.
+  Test: a module at 0x71f0 with data copied to 0x7310 runs lifted (fails without the fix).
+- The taskset's syscall entry (0xA70, a `stop` the worker catches) gets a lifted stand-in like the kernel's stops
+  (D-087): each syscall was a miss, a log lookup under a lock and one interpreted instruction. Test: a task's syscall
+  stops without a miss.
+- PSPOCKET_SPU_TRACE_RUNS=N prints, for the first N addresses the resolver finds no run for, the tracker's last
+  events over that block (GETs, runs they cleared, forgets, restores): how the shared block showed.
+
+## D-096 · 2026-10-05 · Jump tables whose base the prologue sets; dispatch across a call
+
+GTA V's script VM (0x91bf00) is a threaded bytecode interpreter: every handler ends in its own dispatch, `lbz r3,
+1(r3); slwi r3, r3, 2; lwzx r3, r19, r3; mtctr r3; bctr`, with r19 set once in the prologue (`lis r19, 434; addic r19,
+r19, -21596`). Only the first dispatch was within the matcher's backward slice; at the second the translated VM fell
+back to the interpreter until it returned, so scripts ran interpreted.
+- The prefix's constants: the non-volatile registers (r14 to r31) the entry's straight-line code sets to a constant
+  (lis, addis, addi, addic, ori, oris, mr, word and doubleword loads from the image; calls keep them) and nothing else
+  in the function writes, except on the way out (writes that run straight into a return without a branch or call:
+  SNC's functions branch to shared helpers that restore the saved registers, which become part of the function). The
+  matcher uses that value where its slice finds no definition, after the prefix's last write of the register. The
+  function is explored again with those constants until they hold for all the code it then reaches.
+- `addic` evaluates like addi (SNC builds addresses with it), and an index loaded as a byte (or masked by andi. or
+  clrlwi) caps a table without a bounds check at the values it can take: the VM's 256, of which 226 entries are code.
+- A bctr still unrecognised in a function with jump tables switches over the targets those tables proved before
+  falling back: three VM dispatches load the next handler's address before a call and jump after it.
+- A function's table sites share one dispatch switch at its end (`jt_site = pc; goto D_tables;`, and `goto D_known;`
+  for the unrecognised ones): with a switch of its own at each of the VM's 124 sites, clang worked on that one unit for
+  over 20 minutes; shared, 1.7 s.
+- GTA V: 133 jump tables (10 before), the VM's 124 dispatch sites among them.
+- Tests: a synthetic VM with its table base set in the prologue and restored by a helper it branches to, a call
+  between the prologue and the first dispatch, byte opcodes and a dispatch across a call, run translated against the
+  interpreter with no fallback; the analyzer finds its three tables (each fails without its part of the change).
+
+## D-097 · 2026-10-05 · DEPTH16 textures decoded from memory
+
+Run 066 logged 35 DEPTH16 textures the backend could not decode (GTA V's shadow maps, read where the surface cache
+has no depth buffer for them), and the RSX counted 532,716 failures in 200 s, most of them these. DEPTH16 now decodes
+from memory as 16-bit unorm (TexelDecode::D16, R16Unorm) and reads the depth in every channel, as RPCS3's component
+mapping does for the depth formats and as D-088's conversion does for a depth buffer. The float and 24-bit depth
+formats stay unsupported until a game reads them from memory. Tests: the CPU and GPU decoders agree, and the channel
+mapping.
+
+## D-098 · 2026-10-05 · Colour targets read as Y16_X16 convert on the GPU; translated code only for its executable
+
+- Run 066 wrote two 640x360 A8B8G8R8 targets back to guest memory 4,440 times each (every frame), because a pass of
+  the first mission reads them as Y16_X16 textures: a GPU sync and a CPU decode each time. `rsx_color_to_texture`
+  (compute) now makes the texture from the target's bytes on the GPU, as RPCS3 converts, when the texture's texels
+  are the target's pixels (a 4-byte target, same size and pitch, linear) and the draw does not also render to it; kept
+  per generation of the target like D-088's depth conversions. Run 068: none of those readbacks. Test: an A8B8G8R8
+  target read as Y16_X16, end to end, with no readback (fails without the conversion).
+- A readback's log line names what asked for it: a texture of another format, an NV0039 buffer copy or an NV3089
+  image copy. What remains in run 068 is one 80x45 target the game copies out with NV0039 every frame.
+- The game's translated PPU code built into pspocket-boot (D-092) is registered only when the executable is the one it
+  was translated from: ppu-lift writes the words found at 64 of the functions' entries (`N_image_words`), and the host
+  checks them in guest memory after the load. The boot tests' synthetic executables, at the same addresses, ran GTA
+  V's functions and faulted.
+
+## D-099 · 2026-10-05 · The module tracker keeps every run until a GET overwrites it; SPU seeds accumulate
+
+Run 068 still interpreted 3.9 million SPU instructions of the dependency tasks' modules: a task copies a module in,
+then hundreds of small pieces of data, and only then runs the module. With 128 runs per SPU, replaced oldest first
+among those that had not run yet, the module's run was gone (PSPOCKET_SPU_TRACE_RUNS showed its GET as the last event
+over its block).
+- A run now lives until a GET overwrites part of it (4,096 per SPU, more than local store holds in practice). Each
+  1 KB block of local store lists the runs that touch it (up to 32; a block of smaller pieces drops its oldest), so a
+  GET only looks at the runs it may overwrite and the resolver only at the runs in pc's block: the old table scanned
+  all 128 runs on every GET. Forgetting walks the blocks, not the 4,096 slots, as tasks start thousands of times a
+  second.
+- Run 069: none of the dependency tasks' code interpreted; four addresses of one job binary left (function pointers).
+- scripts/lift-spu.sh keeps the entry points of the programs an earlier lift made as seeds: the logs that gave the
+  seeds are not kept, and a later lift without them would have lost that code.
+- Test: a module copied in, then 300 pieces of data, then run: lifted (fails with the old table).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

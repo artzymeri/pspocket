@@ -1,14 +1,15 @@
 # Where pspocket stands
 
-2026-10-04, after the round 15 commits (runs 022 to 030). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md`
-(D-033 onwards matter most now) and the latest `docs/runs/` entries. Keep this file current when the picture changes.
+2026-10-05, after run 069 (D-099). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
+onwards matter most now) and the latest `docs/runs/` entries. Keep this file current when the picture changes.
 
 ## The project
 
 A static recompiler that turns PS3 games into native, signed iOS apps: the game's PPU and SPU code is translated to
 ARM64 ahead of time and its graphics go to Metal. It is not an emulator. One Mac-side build per game (disc image in,
 app out); the runtime is shared by all games (D-036). GTA V (BLES01807) is the driving title (D-025); the goal is any
-PS3 game. SPURS (the PS3's SPU job system) is our own native C++ implementation, with no Sony code in the app (D-037).
+PS3 game through the same automatic pipeline (D-090). SPURS (the PS3's SPU job system) is our own native C++
+implementation, with no Sony code in the app (D-037).
 
 ## Working with the user
 
@@ -23,84 +24,68 @@ PS3 game. SPURS (the PS3's SPU job system) is our own native C++ implementation,
 
 | Area | State |
 |---|---|
-| Toolchain | `ps3inspect` (inventory), ELF/SELF/PRX loader, NID database from RPCS3 (D-019), PPU interpreter and lifter with differential fuzzing (D-023, D-028), SPU interpreter, runtime and lifter (D-029), one PPU/SPU reservation system (D-030), ISO 9660 disc reader |
-| lv2 kernel | Host threads, sync objects, memory, `sys_vm`, event queues and ports, timers, filesystem (host directories and disc images read in place, D-043), `sys_fs_fcntl`/chmod/utime, SPU init (D-031), the RSX device (`sys_rsx`: local memory, context, IO map, display buffers, tiles; D-045), a report of what every thread waits on (D-053) |
-| HLE modules | sysPrxForUser, cellSysmodule, cellSpurs (native, checked against libsre: initialize, workloads, tasksets, tasks, event flags, lv2 queue ports, barriers, job chains, SPURS queues; D-047, D-054, D-063; host SPU workers run SPU tasks, job chains and a game's own policy module with libsre's priorities, D-050, D-051, D-055, D-064), cellAudio (a host thread, ports, notify queues, D-052; sound out through AVAudioEngine on the Mac with `--audio` and in the iOS app, D-072), cellSheap (libsre's allocator), cellGcmSys (20, with the vblank interrupt thread; D-045), cellSysutil and AvconfExt (D-048), sys_io (virtual controller, no keyboard; D-049), sceNp/sceNp2 (offline, D-059), sceNpTrophy (trophy packs installed as RPCS3, D-065), cellSaveData (D-062), cellRtc (D-060), cellVoice, cellNetCtl, sys_net, sys_fs (20 cellFs functions), cellGame (6). 244 of GTA V's 364 imports; the rest are online, keyboard dialogs and shutdown |
-| Loader | `pspocket-boot` runs a decrypted EBOOT under the interpreter on the Mac. Crash reports show r3..r10 and the caller's code (D-042), or for SPU code the host thread, pc, MFC parameters and registers (D-067). `--bdvd IMAGE.iso`, `--probe-disc`, `--flash DIR` (/dev_flash from the user's firmware, D-067), `--frames DIR`, `--dump-on-fault FILE` |
-| RSX | Portable front end (FIFO methods, state, textures, shader translation to MSL with condition codes, D-068) and Metal backend (D-032). Driven by GTA V since run 016; its frames are saved as PNG (D-057): the logo, the legal screen and the Display Calibration screen draw as on the PS3 |
-| iOS app | **Boots the game** (D-071): the Game tab picks the disc image in Files and boots it; full screen in landscape; a paired DualShock 4/DualSense drives the virtual controller, else on-screen buttons. The decrypted EBOOT and the /dev_flash files come from the Mac (`scripts/ios.sh push-game`). Also device self-tests: MetalFX 30 Hz steady, lifted PPU code 12× faster than the interpreter (runs 001–003) |
+| Toolchain | `ps3inspect` (inventory), ELF/SELF/PRX loader, NID database from RPCS3 (D-019), ISO 9660 disc reader. PPU: interpreter (the oracle, with a decode cache, D-091), analyzer and lifter with differential fuzzing (D-023, D-028), whole-game translation built into the host (D-092 to D-096, D-098), `ppu-dis`. SPU: interpreter, runtime and lifter (D-029), relocatable programs (D-081), `scripts/lift-spu.sh` (D-076, D-099). One PPU/SPU reservation system (D-030, D-066) |
+| lv2 kernel | Host threads, sync objects, memory, `sys_vm`, event queues and ports, timers, filesystem (host directories and disc images read in place, D-043), SPU threads (D-031), the RSX device (`sys_rsx`, D-045), a report of what every thread waits on (D-053) |
+| HLE modules | sysPrxForUser, cellSysmodule, cellSpurs (native, checked against libsre: workloads, tasksets, tasks, job chains, SPURS queues and semaphores, a game's own policy module; the modules programs load themselves, D-079, D-082, D-099), cellAudio (D-052, D-072 to D-075), cellGcmSys, cellSysutil, sys_io (D-049), sceNp/sceNp2 (offline), sceNpTrophy, cellSaveData, cellRtc, cellVoice, cellNetCtl, sys_net, sys_fs, cellGame. 248 of GTA V's 362 imports; the rest are online, keyboard dialogs and shutdown |
+| Loader | `pspocket-boot` runs a decrypted EBOOT on the Mac with the game's translated code built in (`-DPSPOCKET_GAME_PPU`, `-DPSPOCKET_GAME_SPU`; used only for the executable it was translated from, D-098). Crash reports show the guest registers and code, the host frames of translated code (D-094) and every thread. `--bdvd IMAGE.iso`, `--flash DIR`, `--frames DIR`, `--trace-frame N`, `--press`, `--spu-dump DIR`, `--rsx-recover` |
+| RSX | Portable front end (FIFO methods, state, textures, vertex and fragment programs to MSL with flow control, D-068, D-086, D-089, D-093) and Metal backend (D-032): surfaces and textures over them, GPU conversions of depth buffers and colour targets read as other formats (D-083, D-088, D-097, D-098), frame trace (D-084) |
+| iOS app | Boots the game from the ISO in Files (D-071); full screen; DualShock 4/DualSense or on-screen buttons; runs the lifted SPU programs and recovers from FIFO errors (D-084). Not yet: the translated PPU code |
 
-## GTA V bring-up so far (docs/runs 004–042)
+## GTA V so far (docs/runs 004–069)
 
-The EBOOT boots under the interpreter on the M4 Mac. It gets through:
-- the CRT, TLS, lwmutexes, cellSysmodule;
-- two SPURS instances ("Primary" with 5 SPUs, "Secondary" with 1);
-- `sys_vm`, threads, networking (offline);
-- SPURS setup: 7 job chains (DefaultShort, DefaultLong, ShapeTests, AudioEngine, GraphicsMain, GraphicsOther,
-  Secondary), the "dependency_spu" taskset with 4 tasks and an event flag, and Bink's "RAD Game Tools Task" tasksets;
-- `sceNp2Init`, cellGame;
-- its archives, read in place from the disc image (copied once from the iPhone, `inventory/gta5/disc.iso`);
-- graphics setup: GCM, 720p video output, two display buffers, tiled render targets, the vblank handler;
-- the system cache, controller and keyboard setup, the EDGE/GFX job chain;
-- its first frame: it kicks the GraphicsMain job chain, then waits. Run 019 is the first run without a crash (60 s);
-- its SPU tasks (dependency tasks, zlib inflate, Bink) and its own SPU policy module, on native SPURS workers (runs
-  020, 021);
-- cellAudio: two ports and the 5.33 ms audio period. Run 021 calls no unimplemented function (153 of 362 imports);
-- its job chains (runs 022 to 026): the Secondary chain (its audio mixer, whose jobs use 232 of the 234 LS pages),
-  GraphicsMain and EDGE/GFX;
-- frames: from run 026 the RSX works through about 2 million command words a minute and flips about 30 times a second;
-- loading its data (run 029, after the event flag direction fix, D-058) and **the first picture: the Rockstar logo
-  screen**, drawn by the Metal backend and saved as PNG (`pspocket-boot --frames DIR`, D-057);
-- PSN set up offline (D-059), a CellSpursTaskset2;
-- save data, the clock, voice, trophies, background music (D-060 to D-062, D-065), SPURS queues (D-063);
-- four fixes found in runs 031 to 038: SPURS priorities were upside down (D-064), PPU `stwcx.` was not atomic so two
-  threads could take one lock-free slot (D-066), the MP3 codec comes from /dev_flash (the user's firmware, D-067), and
-  fragment programs need condition codes (D-068);
-- **runs 039 and 040 end at their timeout without a crash**: the opening animation, the legal screen and the **Display
-  Calibration** screen, which waits for the X button;
-- run 041 presses X on a schedule (`--press cross@45+10`, D-069): past calibration to **"Loading Story Mode"**, with the
-  trophy set registered (D-065);
-- **run 042: the same on the iPhone** (D-071), at the Mac's pace: the ISO picked in Files, calibration confirmed with
-  an on-screen Cross, the profile saved, "Loading Story Mode".
+- Boots from the disc image read in place, through the logos, the Display Calibration screen (a scripted Cross,
+  `--press`), "Loading Story Mode" and **into the first mission (the prologue's bank), lit and complete**.
+- **Translated ahead of time**: all 85,376 PPU functions of the executable (`ppu-lift`, D-092 to D-096, 133 jump tables
+  including the script VM's) and all 88 SPU programs and modules SPURS and the tasks load (`scripts/lift-spu.sh`, D-076,
+  D-081, D-085, D-087, D-099). The interpreters only run what the translation has not reached yet, and log it as a seed
+  for the next lift.
+- Speed on the M4 Mac (run 069): the opening and loading screens and the first mission at 28 to 30 fps, the game's
+  cap; "Loading Story Mode" about 20. On the iPhone (before the PPU translation): about 6 fps, pink, no people
+  (fixed since on the Mac: D-086, D-088, D-093).
+- Graphics (D-078 to D-098): deferred lighting, post-processing, skinned characters, shadow maps; depth buffers and
+  colour targets read as other formats convert on the GPU. One 80x45 target is still read back each frame (an NV0039
+  copy the game asks for).
+- Sound through AVAudioEngine, time-stretched to the game's pace (D-072 to D-075).
 
 ## Right now
 
-The game shows its "Loading Story Mode" screens (run 041, 300 s, no crash, no failed draws) and stops loading: its
-Physics SPU tasks wait on a SPURS semaphore that `_cellSpursSemaphoreInitialize` (unimplemented) never set up, and the
-main thread waits for them in `cellSpursQueuePopBody`. SPURS semaphores are next, with libsre as the reference (RPCS3
-has none). The same happens on the iPhone (run 042): to try a build there, `scripts/ios.sh build`, `scripts/ios.sh
-install`, once `scripts/ios.sh push-game`, then the Game tab. Runs need `--press cross@45+10` to get past the Display Calibration screen; boot.sh passes it through:
-`scripts/boot.sh --timeout 300 --frames inventory/gta5/frames --frame-every 60 --press cross@45+10`.
+The Mac build with the game's PPU and SPU code translated runs the first mission at the 30 fps cap with no
+interpreted SPU code left but four function-pointer targets of one job binary (re-lifted after run 069). What is
+missing, roughly in order:
 
-## Next steps, in order
+1. **The iPhone build with the translated PPU code** (823 MB of C, 512 units; the Mac links it in about 3 minutes):
+   `scripts/ios.sh` builds the SPU programs in already; the PPU code next, then a playtest (the user runs it).
+2. **One command per game** (D-090): disc image in, app out: extract and decrypt the executable, lift its PPU code,
+   run once with `--spu-dump` to collect the SPU programs, lift them, build and sign. The parts exist as separate
+   commands (below).
+3. **RSX gaps** the first mission logs: occlusion queries (report 65535), conditional rendering (draws
+   unconditionally), MSAA (one sample), a 3D texture, depth comparison for shadow maps, fragment CAL/BEM, vertex
+   BRB/CLB.
+4. The per-frame 80x45 readback (make it asynchronous), the FIFO desync seen once in run 055 (the app recovers),
+   sound pace on the phone.
 
-1. **The boot loop.**
-   1. Run `scripts/boot.sh`.
-   2. Read the whole log, `inventory/boot-NNN.log`.
-   3. Implement what it shows, following RPCS3 and citing it, with a test for each.
-   4. Write a `docs/runs/0NN` entry (next is 042) and record decisions as D-070 onwards.
-   5. Commit, push, repeat.
+## Building and running GTA V on the Mac
 
-   A run that doesn't crash ends at its timeout with the thread report: every guest thread, what it waits on and its
-   backtrace, and the RSX's state (D-053; `pspocket-boot --report-every S` prints it during the run too). A fault in
-   SPU code can be read offline with `--dump-on-fault inventory/dumps/NAME.bin` (guest memory and the SPU's local
-   store). Next: scripted controller input, then whatever the menus and loading need.
-2. **Graphics.** The Metal backend draws the logo, legal and calibration screens. As the game gets further, its
-   frames need more of the RSX: render targets, tiled surfaces, shaders, textures. Look at the saved frames every round.
-3. **The libsre reference from the firmware** (D-046): decrypted in `inventory/firmware/elf/` (libsre, libspurs_jq,
-   the two SPU kernels); `inventory/firmware/tools/fw_unself.py` remakes it from the PUP and RPCS3's source. libsre
-   also holds the SPU modules as raw code: the system service workload (libsre 0x21480), the taskset policy module
-   (0x23680, loaded at LS 0xA00, syscall entry 0xA70), two task exit handlers (0x25500, 0x25B80) and the two job chain
-   policy modules (0x26300, 0x2A180). Use it for the SPU-side contract; the job chain policy (D-055) and SPURS queues
-   (D-063) are done. It is a reference only: never committed, never shipped, and no disassembly of it goes into the
-   repository. Separately, /dev_flash files a game loads itself come from the user's firmware (D-067):
-   `fw_unself.py --raw NAME` copies them into `inventory/firmware/dev_flash`; so far only flashMP3.pic.
-4. **Later:**
-   - RSX → Metal up to the first frame;
-   - sound out of cellAudio (a host sink: Core Audio) and input from a real controller;
-   - lift the whole EBOOT (`ppu-lift`, 6.1 M instructions, already lifts in 10 s) instead of interpreting;
-   - SPU lifting;
-   - the iOS app booting the game from the ISO in its Documents.
+```sh
+# the PPU code (rule 1: everything under inventory/ stays out of git)
+build/host/recomp/ppu/ppu-lift --image inventory/gta5/ppu/eboot.bin --base 0x10000 --seed 0x109e4:0x1adf8a8 \
+    --opd 0x1a709a8:0x66f00 --toc 0x1adf8a8 --out inventory/gta5/ppu-lifted --tu 512 --name game_ppu \
+    --prefix game_ppu_ --no-comments
+# the SPU programs a run saved with --spu-dump, plus the misses its log lists
+scripts/lift-spu.sh inventory/gta5/spu inventory/gta5/spu-lifted inventory/boot-NNN.log
+cmake -S . -B build/host -G Ninja -DPSPOCKET_WERROR=ON -DPSPOCKET_GAME_PPU=$PWD/inventory/gta5/ppu-lifted \
+    -DPSPOCKET_GAME_SPU=$PWD/inventory/gta5/spu-lifted
+ninja -C build/host pspocket-boot
+build/host/runtime/loader/pspocket-boot inventory/gta5/decrypt/EBOOT.elf --timeout 200 --rsx-recover \
+    --frames inventory/gta5/frames-NNN --frame-every 1500 --hdd0 inventory/gta5/hdd0 --bdvd inventory/gta5/disc.iso \
+    --flash inventory/firmware/dev_flash --spu-dump inventory/gta5/spu \
+    --press cross@45 --press cross@55 --press cross@65 --press cross@75 --press cross@90 > inventory/boot-NNN.log 2>&1
+```
+
+Debugging translated code: a fault prints host frames for `atos -o pspocket-boot -s SLIDE ADDR...` (D-094);
+`PSPOCKET_PPU_ONLY=LO-HI` keeps only some translated PPU functions; `PSPOCKET_SPU_TRACE_RUNS=N` shows why the module
+tracker missed code; `--trace-frame N` logs every draw of a frame (D-084). Keep one build directory and delete old
+frame dumps: the disk has about 10 GB free.
 
 ## Checked against libsre
 
