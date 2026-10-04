@@ -6,7 +6,8 @@
 # DUMP holds spu_<hash>_<lsaddr>.bin (the code, from the user's game) and .txt (kind, guest address, LS base, size,
 # entry, and for modules "seed" lines: addresses execution entered them at). Every image is lifted at its LS base with
 # its entry and seeds; the logs of earlier runs with lifted programs add the addresses where execution left lifted code
-# ("no lifted code at ...") as seeds too, so the next lift covers them. OUT gets
+# ("no lifted code at ...") as seeds too, so the next lift covers them, and the entry points of the programs already in
+# OUT stay seeds (the seeds accumulate). OUT gets
 # one directory per program and game_spu.c, whose pspocket_game_spu_register() registers them all. DUMP and OUT hold
 # code derived from the game: keep them in the gitignored inventory/ or build/ (CLAUDE.md rule 1).
 #
@@ -46,6 +47,13 @@ done | sort > "$TMP/images"
         [ -e "$meta" ] || continue
         name="$(basename "$meta" .txt)"
         value seed "$meta" | sed "s/^/$name /"
+    done
+    # The entry points of the programs an earlier lift made: a seed stays once found, though the logs that gave it
+    # are not kept.
+    for reg in "$OUT"/spu_*/spu_*_reg.c; do
+        [ -e "$reg" ] || continue
+        name="$(basename "$(dirname "$reg")")"
+        sed -n 's/^    {\(0x[0-9A-Fa-f]*\)u, .*/\1/p' "$reg" | sed "s/^/$name /"
     done
 } > "$TMP/raw-seeds"
 

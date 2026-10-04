@@ -262,6 +262,53 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     ps_spu_unregister_program(&program);
 }
 
+TEST_CASE("SPU programs: a module shares its 1 KB block with data, and outlasts hundreds of data copies", "[hle][spu]")
+{
+    // Regression, run 066: GTA V's dependency tasks copy a small module to LS 0x71f0 and their data to 0x7310, in the
+    // same 1 KB block; the data's run took the block, and the module was interpreted every time it ran.
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModule = 0x71F0, kModuleSize = 0x110;
+    ps_write32(base, kGuest, 0x00000007); // `stop 0x7` at its entry, for the interpreter
+    for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
+    const ps_spu_entry entries[] = {{kModule, &module_entry}};
+    ps_spu_program program{"spu_small_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_register_program(&program);
+    hle::enable_spu_modules();
+    Spu spu(base);
+    const auto get = [&](u32 lsa, u32 eal, u32 size) {
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_LSA, lsa) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAH, 0) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAL, eal) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Size, size) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_TagID, 2) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+    };
+    get(kModule, kGuest, kModuleSize);
+    get(0x7310, kGuest + 0x2000, 0x2FB0);
+    spu.ctx.pc = kModule;
+    REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(spu.ctx.stop_code == 0x42);
+    CHECK(spu.ctx.program == &program);
+
+    // Loaded again, then more pieces of data than the old table held before it first runs (regression, run 068: the
+    // module, the oldest run that had not run yet, was replaced).
+    ps_spu_attach_program(&spu.ctx, nullptr);
+    get(kModule, kGuest, kModuleSize);
+    for (u32 i = 0; i < 300; i++) get(0x20000 + i * 0x20, kGuest + 0x6000 + i * 0x20, 0x10);
+    spu.ctx.pc = kModule;
+    REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(spu.ctx.stop_code == 0x42);
+    CHECK(spu.ctx.program == &program);
+
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&program);
+}
+
 namespace {
 
 constexpr u32 kHome = 0x1000;  // a task's code, lifted where it runs
@@ -425,6 +472,7 @@ TEST_CASE("SPU programs: a task's modules stay known across its context switch t
 namespace {
 
 void jump_to_kernel_exit(SPUContext* ctx, uint8_t*) { ctx->pc = 0x808; }
+void call_task_syscall(SPUContext* ctx, uint8_t*) { ctx->pc = 0xA70; }
 
 } // namespace
 
@@ -466,4 +514,32 @@ TEST_CASE("SPU programs: the worker's stops in local store run as lifted stand-i
     ps_spu_set_resolver(nullptr);
     ps_spu_set_get_observer(nullptr);
     ps_spu_unregister_program(&pm);
+}
+
+TEST_CASE("SPU programs: a task's syscall entry runs as a lifted stand-in, not a miss", "[hle][spu]")
+{
+    // Run 066: every task syscall (the stop at 0xA70) missed, logged under the miss lock and interpreted one stop.
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    hle::enable_spu_modules();
+    Spu spu(mem.base());
+    ps_write32(spu.ls.get(), 0xA70, 0xA70); // `stop 0xA70`, as the taskset's policy plants it
+    const ps_spu_entry entries[] = {{0x3000, &call_task_syscall}};
+    ps_spu_program task{"spu_task", 5, 0x3000, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_register_program(&task);
+    const ps_spu_miss_policy policy = ps_spu_get_miss_policy();
+    ps_spu_set_miss_policy(PS_SPU_MISS_ABORT);
+    const u64 misses = ps_spu_miss_count();
+
+    ps_spu_attach_program(&spu.ctx, &task);
+    spu.ctx.pc = 0x3000;
+    REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(spu.ctx.stop_code == 0xA70);
+    CHECK(spu.ctx.pc == 0xA74);
+    CHECK(ps_spu_miss_count() == misses);
+
+    ps_spu_set_miss_policy(policy);
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&task);
 }
