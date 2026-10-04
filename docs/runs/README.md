@@ -55,3 +55,5 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [050](050-gta5-profile-mac.md) | 2026-10-04 | a532a5f | M4 Mac, pspocket-boot --frames, Time Profiler | 15 minutes without a desync; the world draws in pink; hashing takes a fifth of the SPU workers (D-079) |
 | [051](051-gta5-fps-mac.md) | 2026-10-04 | a532a5f+ | M4 Mac, pspocket-boot --gpu metal | Frame rates: intro 11 to 13, loading 30, "Loading Story Mode" 8 to 10, the mission 4; the SPU interpreter 38% |
 | [052](052-gta5-module-dump-mac.md) | 2026-10-04 | 02e8498 | M4 Mac, pspocket-boot --spu-dump | 82 modules at thousands of addresses: 32,570 dumps; relocatable lifting (D-081) |
+| [053](053-gta5-relocatable-jobs-mac.md) | 2026-10-04 | 750963c | M4 Mac, pspocket-boot --gpu metal --spu-dump | Relocatable jobs (D-081): the intro at 20 to 28 fps (was 11 to 13); 44 modules saved once each |
+| [054](054-gta5-lifted-modules-mac.md) | 2026-10-04 | 750963c+ | M4 Mac, pspocket-boot --frames --spu-dump | Every SPU program lifted: the intro at 30 fps, **the first mission at 9 to 10 fps** (was 4); the world still pink |
