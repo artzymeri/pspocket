@@ -357,7 +357,9 @@ def walk(o):
         name = next((v for k, v in o.items() if isinstance(v, str) and k.lower() in ("name", "relativepath", "path")
                      and v.lower().endswith(".iso")), None)
         if name:
-            size = next((v for k, v in o.items() if k.lower() in ("size", "filesize") and isinstance(v, int)), 0)
+            # devicectl keeps the size in "metadata": {"metadata": {"size": N, ...}, "name": ..., "relativePath": ...}
+            fields = dict(o, **o["metadata"]) if isinstance(o.get("metadata"), dict) else o
+            size = next((v for k, v in fields.items() if k.lower() in ("size", "filesize") and isinstance(v, int)), 0)
             found.append((size, name.rsplit("/", 1)[-1]))
         for v in o.values(): walk(v)
     elif isinstance(o, list):
