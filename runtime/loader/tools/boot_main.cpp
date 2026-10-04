@@ -5,7 +5,7 @@
 //   pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]
 //                 [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]
 //                 [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]
-//                 [--frame-every N] [--dump-on-fault FILE]
+//                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]...
 //   pspocket-boot --probe-disc IMAGE.iso
 //
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
@@ -13,6 +13,8 @@
 // --flash mounts DIR read-only as /dev_flash: the system files a game reads itself (GTA V's MultiStream loads its MP3
 // codec, sys/external/flashMP3.pic), taken from the user's own firmware and kept out of the repository (D-067).
 // --imports lists every imported function by module (implemented ones marked) and exits without running.
+// --press presses a button of the virtual controller during the run (repeatable; pspocket/hle/pad_script.hpp):
+// cross@60 holds Cross from 60 s for 0.25 s, cross@60+10 again every 10 s, start@30:1.5 holds Start for 1.5 s.
 // A host fault inside guest memory (an access to an unmapped guest address) is reported with the guest address and
 // the faulting PPU thread's instruction address before the process dies (CLAUDE.md rule 5).
 // A run that ends at its timeout, or on such a fault, prints the thread report (lv2/report.hpp): every PPU thread's
@@ -33,6 +35,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -47,6 +50,8 @@
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/hle/input.hpp"
+#include "pspocket/hle/pad_script.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/loader.hpp"
@@ -72,7 +77,7 @@ int usage()
         "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]\n"
         "                     [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]\n"
         "                     [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]\n"
-        "                     [--frame-every N] [--dump-on-fault FILE]\n"
+        "                     [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -314,6 +319,7 @@ int main(int argc, char** argv)
     bool list_imports = false;
     std::string gpu = "null", frames_dir;
     u32 frame_every = 60;
+    std::vector<hle::PadPress> presses;
     for (int i = 1; i < argc; i++) {
         const std::string_view a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -342,6 +348,17 @@ int main(int argc, char** argv)
             frame_every = static_cast<u32>(std::atoi(v));
         }
         else if (a == "--dump-on-fault") { const char* v = value(); if (!v) return usage(); g_dump_path = v; }
+        else if (a == "--press") {
+            const char* v = value();
+            if (!v) return usage();
+            std::string error;
+            const auto press = hle::parse_pad_press(v, &error);
+            if (!press) {
+                std::fprintf(stderr, "pspocket-boot: %s\n", error.c_str());
+                return 64;
+            }
+            presses.push_back(*press);
+        }
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
         else if (a == "--log") {
@@ -485,12 +502,26 @@ int main(int argc, char** argv)
     const auto deadline = start + seconds(timeout_s);
     auto next_report = start + seconds(report_every_s);
     bool done = false;
+    // Scripted presses (--press): which buttons are down is checked every 20 ms while any press is scheduled.
+    std::string pad_text;
     for (;;) {
-        const auto until = report_every_s > 0 ? std::min(deadline, next_report) : deadline;
+        auto until = report_every_s > 0 ? std::min(deadline, next_report) : deadline;
+        if (!presses.empty()) until = std::min(until, Clock::now() + std::chrono::milliseconds(20));
         done = kernel.wait_for_exit(std::chrono::ceil<std::chrono::milliseconds>(std::max(until - Clock::now(),
             Clock::duration::zero())));
         const auto now = Clock::now();
         if (done || now >= deadline) break;
+        if (!presses.empty()) {
+            const double t = std::chrono::duration<double>(now - start).count();
+            std::string text; // the buttons down, which decide the controller's state
+            for (const hle::PadPress& p : presses)
+                if (p.down_at(t) && text.find(p.button) == std::string::npos) text += (text.empty() ? "" : "+") + p.button;
+            if (text != pad_text) {
+                hle::set_pad_input(hle, hle::pad_state_at(presses, t));
+                PS_LOG_INFO("boot", "controller at {:.2f} s: {}", t, text.empty() ? "released" : text);
+                pad_text = text;
+            }
+        }
         if (report_every_s > 0 && now >= next_report) {
             const double elapsed = std::chrono::duration<double>(now - start).count();
             print_thread_report(kernel, std::format("after {:.1f} s", elapsed));

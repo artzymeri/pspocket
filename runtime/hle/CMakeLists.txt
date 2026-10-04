@@ -13,6 +13,7 @@ add_library(pspocket_hle STATIC
     src/cellSysutil.cpp
     src/cellVoice.cpp
     src/modules.cpp
+    src/pad_script.cpp
     src/process.cpp
     src/psf.cpp
     src/sceNp.cpp

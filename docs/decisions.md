@@ -938,6 +938,15 @@ holds; set_cond copies what an instruction wrote to RC{cond_mod_reg}, or without
 no clamp) when any component's test holds. Run 040: no failed draws; the legal screen and the Display Calibration
 screen draw as on the PS3.
 
+## D-069 · 2026-10-04 · Scripted controller presses for runs on the Mac
+
+Run 040 stops at GTA V's Display Calibration screen, which waits for Cross. `pspocket-boot --press
+BUTTON@START[+EVERY][:HOLD]` (repeatable) drives the virtual controller (D-049) on a schedule: `cross@45+10` holds
+Cross for 0.25 s at 45 s and every 10 s after; `start@30:1.5` holds Start for 1.5 s. The press-sensitive buttons also
+report full pressure. The schedule (`pspocket/hle/pad_script.hpp`) is checked every 20 ms and each change is logged
+("controller at 45.00 s: cross"); boot.sh passes the option through. Times are wall-clock seconds since the game
+started, so a schedule only holds for one build's speed: it is a bring-up tool, not a replay system.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
