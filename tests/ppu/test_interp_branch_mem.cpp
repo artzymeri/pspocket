@@ -3,6 +3,9 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <thread>
+#include <vector>
+
 #include "ppu_test_util.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/ppu/asm.hpp"
@@ -251,7 +254,7 @@ TEST_CASE("string loads/stores: lswi/stswi/lswx/stswx (partial last register, wr
     CHECK(m.ctx.gpr[11] == 77);
 }
 
-TEST_CASE("lwarx/stwcx. and ldarx/stdcx.: single-thread reservation model")
+TEST_CASE("lwarx/stwcx. and ldarx/stdcx. on the shared reservation system: one thread")
 {
     Machine m;
     const u32 d = Machine::kData;
@@ -293,6 +296,109 @@ TEST_CASE("lwarx/stwcx. and ldarx/stdcx.: single-thread reservation model")
     m.exec(as::lwarx(5, 4, 8));
     m.exec(as::stdcx_(6, 4, 8));
     CHECK(m.crf(0) == SO);
+    m.ctx.xer_so = 0;
+    m.ctx.gpr[6] = 999;
+    // The reservation covers the 128-byte line: a store that changes another word of it loses the reservation, one
+    // to the next line doesn't, and neither does a store that leaves the line's bytes as they were.
+    m.exec(as::lwarx(5, 4, 3));
+    m.w32(d + 0x7C, 0xABCD);
+    m.exec(as::stwcx_(6, 4, 3));
+    CHECK(m.crf(0) == 0);
+    m.exec(as::lwarx(5, 4, 3));
+    m.w32(d + 0x80, 0xABCD);
+    m.w32(d + 0x7C, 0xABCD);
+    m.exec(as::stwcx_(6, 4, 3));
+    CHECK(m.crf(0) == EQ);
+    CHECK(m.r32(d) == 999);
+    // A conditional store by another context to the line (here another word of it) does: its version moved on.
+    PPUContext other{};
+    ps_ppu_context_init(&other);
+    m.exec(as::lwarx(5, 4, 3));
+    CHECK(ps_ppu_lwarx(&other, m.base(), d + 0x40) == 0);
+    CHECK(ps_ppu_stwcx(&other, m.base(), d + 0x40, 0) == 1); // writes the value it read: the bytes stay the same
+    m.exec(as::stwcx_(6, 4, 3));
+    CHECK(m.crf(0) == 0);
+}
+
+// Regression (run 033): stwcx. compared the reserved word and stored it as two separate steps, and only by value, so
+// two PPU threads could both take the head of a lock-free stack (GTA V's audio job slots, a byte array of next
+// indices with the head word updated by lwarx/stwcx.) and run two jobs in one descriptor. Four interpreter threads
+// pop a slot, mark it owned (checking nobody else owns it), release it and push it back, and count increments on a
+// shared word, through lwarx/stwcx.
+TEST_CASE("lwarx/stwcx.: four threads share a lock-free stack and a counter without losing updates")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    constexpr u32 kCode = 0x00010000, kHead = 0x00020000, kNext = 0x00020100, kOwner = 0x00020200, kCount = 0x00020400;
+    constexpr u32 kFail = 0x00020480, kSlots = 8, kThreads = 4, kRounds = 20000;
+    REQUIRE(mem.commit(kCode, 0x20000));
+    u8* base = mem.base();
+
+    as::Assembler a(kCode);
+    using L = as::Assembler::Label;
+    // r3 = &head, r7 = next[], r10 = owner[], r11 = this thread's ID, r12 = &count, r13 = &fail, r4 = rounds left
+    const L pop = a.here(), push = a.new_label(), inc = a.new_label(), done = a.new_label(), fail = a.new_label();
+    a.emit(as::lwarx(5, 0, 3));
+    a.emit(as::cmplwi(0, 5, 0xFF)); // empty: try again
+    a.beq(0, pop);
+    a.emit(as::lbzx(6, 7, 5));
+    a.emit(as::stwcx_(6, 0, 3));
+    a.bne(0, pop);
+    a.emit(as::slwi(8, 5, 2));
+    a.emit(as::lwzx(9, 10, 8));
+    a.emit(as::cmpwi(0, 9, 0));
+    a.bne(0, fail);
+    a.emit(as::stwx(11, 10, 8)); // owned
+    a.emit(as::li(9, 0));
+    a.emit(as::stwx(9, 10, 8)); // released
+    a.bind(push);
+    a.emit(as::lwarx(6, 0, 3));
+    a.emit(as::stbx(6, 7, 5)); // next[slot] = head, between lwarx and stwcx. (another line)
+    a.emit(as::stwcx_(5, 0, 3));
+    a.bne(0, push);
+    a.bind(inc);
+    a.emit(as::lwarx(6, 0, 12));
+    a.emit(as::addi(6, 6, 1));
+    a.emit(as::stwcx_(6, 0, 12));
+    a.bne(0, inc);
+    a.emit(as::addi(4, 4, -1));
+    a.emit(as::cmpwi(0, 4, 0));
+    a.bne(0, pop);
+    a.b(done);
+    a.bind(fail);
+    a.emit(as::stw(11, 0, 13));
+    a.bind(done);
+    a.emit(as::b_rel(0)); // parked here
+    const std::vector<u8> code = a.finish();
+    mem.write_bytes(kCode, code.data(), code.size());
+    const u32 end = a.address(done);
+
+    // Slots 0..7 on the stack: head 0, next[i] = i + 1, the last 0xFF.
+    ps_write32(base, kHead, 0);
+    for (u32 i = 0; i < kSlots; i++) ps_write8(base, kNext + i, static_cast<u8>(i + 1 < kSlots ? i + 1 : 0xFF));
+    std::vector<std::thread> threads;
+    for (u32 t = 0; t < kThreads; t++) {
+        threads.emplace_back([&, t] {
+            PPUContext ctx;
+            ps_ppu_context_init(&ctx);
+            ctx.gpr[3] = kHead;
+            ctx.gpr[4] = kRounds;
+            ctx.gpr[7] = kNext;
+            ctx.gpr[10] = kOwner;
+            ctx.gpr[11] = t + 1;
+            ctx.gpr[12] = kCount;
+            ctx.gpr[13] = kFail;
+            ctx.cia = kCode;
+            while (ctx.cia != end) step(ctx, base);
+        });
+    }
+    for (std::thread& th : threads) th.join();
+    CHECK(ps_read32(base, kFail) == 0); // no slot was owned twice
+    CHECK(ps_read32(base, kCount) == kThreads * kRounds);
+    // All eight slots are back on the stack.
+    u32 seen = 0, slot = ps_read32(base, kHead);
+    for (u32 n = 0; slot != 0xFF && n <= kSlots; n++, slot = ps_read8(base, kNext + slot)) seen |= 1u << slot;
+    CHECK(seen == 0xFFu);
 }
 
 TEST_CASE("dcbz clears the whole 128-byte line")

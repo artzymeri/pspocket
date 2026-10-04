@@ -51,7 +51,30 @@ u64 env_u64(const char* name, u64 fallback)
     return v ? std::strtoull(v, nullptr, 0) : fallback;
 }
 
-void apply_overrides(PPUContext& ctx, u8* base, const ps_fuzz_case& c)
+// The reservation a stwcx./stdcx. case starts with, taken through lwarx/ldarx on the shared reservation system just
+// before the side runs (a successful store on the other side has moved the line's version on since): matching, stale
+// (the snapshot differs from memory in the reserved word), at another address, or none.
+void apply_reservation(PPUContext& ctx, u8* base, const ps_fuzz_case& c)
+{
+    for (u32 k = 0; k < c.override_count; k++) {
+        const ps_fuzz_override& o = ps_fuzz_overrides[c.first_override + k];
+        switch (o.kind) {
+        case PS_FZ_RES_MATCH:
+        case PS_FZ_RES_STALE_VALUE:
+        case PS_FZ_RES_OTHER_ADDR: {
+            const u32 addr = static_cast<u32>(o.value) ^ (o.kind == PS_FZ_RES_OTHER_ADDR ? 0x10 : 0);
+            if (o.index == 8) ps_ppu_ldarx(&ctx, base, addr);
+            else ps_ppu_lwarx(&ctx, base, addr);
+            if (o.kind == PS_FZ_RES_STALE_VALUE) ctx.reserve_line[(addr & 127) + o.index - 1] ^= 1;
+            break;
+        }
+        case PS_FZ_RES_NONE: ctx.reserve_valid = 0; break;
+        default: break;
+        }
+    }
+}
+
+void apply_overrides(PPUContext& ctx, const ps_fuzz_case& c)
 {
     for (u32 k = 0; k < c.override_count; k++) {
         const ps_fuzz_override& o = ps_fuzz_overrides[c.first_override + k];
@@ -62,17 +85,8 @@ void apply_overrides(PPUContext& ctx, u8* base, const ps_fuzz_case& c)
         case PS_FZ_XER_BC: ctx.xer_bc = static_cast<u8>(o.value); break;
         case PS_FZ_RES_MATCH:
         case PS_FZ_RES_STALE_VALUE:
-        case PS_FZ_RES_OTHER_ADDR: {
-            const u32 addr = static_cast<u32>(o.value);
-            ctx.reserve_valid = 1;
-            ctx.reserve_size = o.index;
-            ctx.reserve_addr = addr;
-            ctx.reserve_value = o.index == 8 ? ps_read64(base, addr) : ps_read32(base, addr);
-            if (o.kind == PS_FZ_RES_STALE_VALUE) ctx.reserve_value ^= 1;
-            if (o.kind == PS_FZ_RES_OTHER_ADDR) ctx.reserve_addr ^= 0x10;
-            break;
-        }
-        case PS_FZ_RES_NONE: ctx.reserve_valid = 0; break;
+        case PS_FZ_RES_OTHER_ADDR:
+        case PS_FZ_RES_NONE: break; // apply_reservation, per side
         case PS_FZ_XER_CA: ctx.xer_ca = static_cast<u8>(o.value); break;
         case PS_FZ_VR_LO: ctx.vr[o.index].u64[0] = o.value; break;
         case PS_FZ_VR_HI: ctx.vr[o.index].u64[1] = o.value; break;
@@ -169,10 +183,11 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
             PPUContext interp;
             test::random_context(interp, rng);
             for (u32 off = 0; off < PS_FUZZ_WINDOW_SIZE; off += 8) ps_write64(base, PS_FUZZ_WINDOW_BASE + off, rng.next());
-            apply_overrides(interp, base, c);
+            apply_overrides(interp, c);
             g_timebase = rng.next();
             mem.read_bytes(PS_FUZZ_WINDOW_BASE, initial.data(), initial.size());
             PPUContext lifted = interp;
+            apply_reservation(interp, base, c);
 
             ps_write32(base, c.pc, c.insn);
             interp.cia = c.pc;
@@ -190,6 +205,7 @@ TEST_CASE("differential fuzz: interpreter and lifted code agree on every case")
             mem.read_bytes(PS_FUZZ_WINDOW_BASE, after_interp.data(), after_interp.size());
 
             mem.write_bytes(PS_FUZZ_WINDOW_BASE, initial.data(), initial.size());
+            apply_reservation(lifted, base, c);
             lifted.cia = c.pc;
             c.fn(&lifted, base);
             mem.read_bytes(PS_FUZZ_WINDOW_BASE, after_lifted.data(), after_lifted.size());

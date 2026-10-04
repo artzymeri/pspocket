@@ -134,13 +134,12 @@ void ps_ppu_set_timebase_source(ps_ppu_timebase_source source);
 uint64_t ps_ppu_timebase(void);
 
 /*
- * Reservations: lwarx/ldarx/stwcx./stdcx.
- *
- * PHASE 3 HOOK. This milestone implements the single-thread model in the PPUContext: lwarx/ldarx record
- * (address, size, loaded value); stwcx./stdcx. succeed when a reservation of the same size exists for the same
- * address and memory still holds the loaded value (RPCS3 also compares data, PPUThread.cpp ppu_store_reservation),
- * and always clear the reservation. Phase 3 replaces these four functions with the shared 128-byte-line
- * reservation table (plan section 6) used by the SPU GETLLAR/PUTLLC path; callers do not change.
+ * Reservations: lwarx/ldarx/stwcx./stdcx., on the shared 128-byte-line reservation system that SPU GETLLAR/PUTLLC
+ * and HLE sync-object updates use too (pspocket/core/reservation.h, D-030). lwarx/ldarx record the address, size and
+ * loaded value with a snapshot of the line and its version; stwcx./stdcx. succeed, atomically, when a reservation of
+ * the same size exists for the same aligned address and the line is unchanged since the snapshot (no conditional
+ * store or notified write in between, its bytes equal: RPCS3 also compares data, PPUThread.cpp
+ * ppu_store_reservation), and always clear the reservation.
  */
 uint32_t ps_ppu_lwarx(PPUContext* ctx, uint8_t* base, uint32_t ea);
 uint64_t ps_ppu_ldarx(PPUContext* ctx, uint8_t* base, uint32_t ea);

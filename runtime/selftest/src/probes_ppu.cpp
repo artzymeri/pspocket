@@ -121,9 +121,11 @@ InterpResult run_interpreter(Bench& bench)
 
 bool same_context(const PPUContext& a, const PPUContext& b)
 {
-    // Everything but cia (lifted code does not maintain it) must match bit for bit.
+    // Everything but cia (lifted code does not maintain it) and the reservation's line version (the second run's
+    // lwarx sees the versions the first run's stwcx. moved on) must match bit for bit.
     PPUContext x = a, y = b;
     x.cia = y.cia = 0;
+    x.reserve_version = y.reserve_version = 0;
     return std::memcmp(&x, &y, sizeof(PPUContext)) == 0;
 }
 

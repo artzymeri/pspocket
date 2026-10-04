@@ -116,6 +116,8 @@ inline void random_context(PPUContext& ctx, Rng& rng)
     ctx.reserve_size = rng.chance(50) ? 4 : 8;
     ctx.reserve_addr = static_cast<u32>(rng.below(0x800)) & ~3u;
     ctx.reserve_value = rng.next();
+    ctx.reserve_version = rng.next() | 1; // odd: a version no line has between stores, so a stray stwcx. fails
+    for (u8& b : ctx.reserve_line) b = static_cast<u8>(rng.next());
 }
 
 inline bool is_nan_bits(u64 b) { return (b & 0x7FF0000000000000ull) == 0x7FF0000000000000ull && (b & 0x000FFFFFFFFFFFFFull); }
@@ -151,6 +153,10 @@ inline std::string diff_contexts(const PPUContext& a, const PPUContext& b, bool 
         a.reserve_value != b.reserve_value)
         d += std::format(" reservation: {}/{:#x}/{}/{:#x} vs {}/{:#x}/{}/{:#x};", a.reserve_valid, a.reserve_addr,
             a.reserve_size, a.reserve_value, b.reserve_valid, b.reserve_addr, b.reserve_size, b.reserve_value);
+    // A live reservation also holds the line's version and bytes (a consumed one keeps what its side last saw).
+    if (a.reserve_valid && b.reserve_valid &&
+        (a.reserve_version != b.reserve_version || std::memcmp(a.reserve_line, b.reserve_line, 128) != 0))
+        d += std::format(" reservation line: version {:#x} vs {:#x};", a.reserve_version, b.reserve_version);
     return d;
 }
 

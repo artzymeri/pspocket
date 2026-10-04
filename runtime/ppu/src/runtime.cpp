@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <vector>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
+#include "pspocket/core/reservation.h"
 #include "pspocket/core/timebase.h"
 #include "pspocket/ppu/disasm.hpp"
 #include "pspocket/ppu/interpreter.hpp"
@@ -232,44 +234,60 @@ extern "C" uint64_t ps_ppu_timebase(void)
 }
 
 // ---------------------------------------------------------------------------------------------- reservations
-// PHASE 3 HOOK: single-thread model, see runtime.h.
+// On the shared reservation system (pspocket/core/reservation.h, D-030), so PPU threads, SPU GETLLAR/PUTLLC and HLE
+// updates of guest sync objects see one another. lwarx/ldarx snapshot the 128-byte line and its version into the
+// context; stwcx./stdcx. store through ps_res_store_conditional, which writes only while no conditional store or
+// notified write changed the line since and its bytes still equal the snapshot, atomically with respect to every
+// other conditional store. As RPCS3 (PPUThread.cpp ppu_store_reservation): the address must be the reserved one and
+// aligned, and the reservation is consumed either way. An unaligned lwarx (an alignment interrupt on the PPE) loads
+// the value without a snapshot; the conditional store after it fails on its alignment.
 
-extern "C" uint32_t ps_ppu_lwarx(PPUContext* ctx, uint8_t* base, uint32_t ea)
+namespace {
+
+template <typename T>
+T reserve(PPUContext* ctx, uint8_t* base, uint32_t ea)
 {
-    const u32 value = ps_read32(base, ea);
     ctx->reserve_addr = ea;
     ctx->reserve_valid = 1;
-    ctx->reserve_size = 4;
+    ctx->reserve_size = sizeof(T);
+    T value;
+    if (ea % sizeof(T) == 0) {
+        ctx->reserve_version = ps_res_acquire(base, ea, ctx->reserve_line);
+        T be;
+        std::memcpy(&be, ctx->reserve_line + (ea & (PS_RES_LINE_SIZE - 1)), sizeof(T));
+        if constexpr (sizeof(T) == 8) value = __builtin_bswap64(be);
+        else value = __builtin_bswap32(be);
+    } else {
+        ctx->reserve_version = 0;
+        if constexpr (sizeof(T) == 8) value = ps_read64(base, ea);
+        else value = ps_read32(base, ea);
+    }
     ctx->reserve_value = value;
     return value;
 }
 
-extern "C" uint64_t ps_ppu_ldarx(PPUContext* ctx, uint8_t* base, uint32_t ea)
+int store_conditional(PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t size, uint64_t value)
 {
-    const u64 value = ps_read64(base, ea);
-    ctx->reserve_addr = ea;
-    ctx->reserve_valid = 1;
-    ctx->reserve_size = 8;
-    ctx->reserve_value = value;
-    return value;
+    const bool ok = ctx->reserve_valid && ctx->reserve_size == size && ctx->reserve_addr == ea && ea % size == 0 &&
+        ps_res_store_conditional(base, ea, size, value, ctx->reserve_version, ctx->reserve_line);
+    ctx->reserve_valid = 0;
+    return ok ? 1 : 0;
 }
+
+} // namespace
+
+extern "C" uint32_t ps_ppu_lwarx(PPUContext* ctx, uint8_t* base, uint32_t ea) { return reserve<uint32_t>(ctx, base, ea); }
+
+extern "C" uint64_t ps_ppu_ldarx(PPUContext* ctx, uint8_t* base, uint32_t ea) { return reserve<uint64_t>(ctx, base, ea); }
 
 extern "C" int ps_ppu_stwcx(PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t value)
 {
-    const bool ok = ctx->reserve_valid && ctx->reserve_size == 4 && ctx->reserve_addr == ea && (ea & 3) == 0 &&
-        ps_read32(base, ea) == static_cast<u32>(ctx->reserve_value);
-    ctx->reserve_valid = 0;
-    if (ok) ps_write32(base, ea, value);
-    return ok ? 1 : 0;
+    return store_conditional(ctx, base, ea, 4, value);
 }
 
 extern "C" int ps_ppu_stdcx(PPUContext* ctx, uint8_t* base, uint32_t ea, uint64_t value)
 {
-    const bool ok = ctx->reserve_valid && ctx->reserve_size == 8 && ctx->reserve_addr == ea && (ea & 7) == 0 &&
-        ps_read64(base, ea) == ctx->reserve_value;
-    ctx->reserve_valid = 0;
-    if (ok) ps_write64(base, ea, value);
-    return ok ? 1 : 0;
+    return store_conditional(ctx, base, ea, 8, value);
 }
 
 // ---------------------------------------------------------------------------------------------- string ops

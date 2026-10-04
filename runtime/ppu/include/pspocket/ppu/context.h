@@ -16,8 +16,8 @@
  *   byte in lifted code.
  * - FPSCR is the architected 32-bit register (IBM bit 0 = bit 31 here). What is modelled is documented in
  *   pspocket/ppu/fpu.h.
- * - The reservation (lwarx/ldarx, stwcx./stdcx.) is the single-thread model of this milestone; see
- *   ps_ppu_reserve_* in pspocket/ppu/runtime.h for the Phase 3 hook (shared 128-byte line table).
+ * - The reservation (lwarx/ldarx, stwcx./stdcx.) lives on the shared 128-byte-line reservation system
+ *   (pspocket/core/reservation.h, D-030): the context keeps the line's version and bytes as lwarx/ldarx saw them.
  */
 #ifndef PSPOCKET_PPU_CONTEXT_H
 #define PSPOCKET_PPU_CONTEXT_H
@@ -71,9 +71,9 @@ typedef struct PPUContext {
     uint32_t cia; /* current instruction address: kept by the interpreter, set by lifted code at runtime calls */
 
     /*
-     * Reservation, single-thread model (lwarx/ldarx set it, stwcx./stdcx. consume it).
-     * Phase 3 replaces the check with the shared 128-byte line table (plan section 6); these fields then hold this
-     * thread's reservation address and the line version or data it observed.
+     * Reservation (lwarx/ldarx set it, stwcx./stdcx. consume it): the reserved address and size and the value
+     * loaded. The line's version and bytes at that moment (reserve_version, reserve_line) are what the conditional
+     * store checks on the shared reservation system (pspocket/ppu/runtime.h).
      */
     uint32_t reserve_addr;
     uint8_t reserve_valid;
@@ -82,6 +82,10 @@ typedef struct PPUContext {
     uint64_t reserve_value;
 
     void* runtime; /* owned by the thread runtime (lv2 thread object, Phase 2); never touched by lifted code */
+
+    uint64_t reserve_version;
+    uint8_t pad2[8];
+    uint8_t reserve_line[128]; /* the reserved 128-byte line, guest byte order */
 } PPUContext;
 
 /* Layout is part of the ABI between the runtime and generated code. */
@@ -101,7 +105,9 @@ PS_PPU_STATIC_ASSERT(offsetof(PPUContext, reserve_addr) == 0x444, "PPUContext la
 PS_PPU_STATIC_ASSERT(offsetof(PPUContext, reserve_valid) == 0x448, "PPUContext layout");
 PS_PPU_STATIC_ASSERT(offsetof(PPUContext, reserve_value) == 0x450, "PPUContext layout");
 PS_PPU_STATIC_ASSERT(offsetof(PPUContext, runtime) == 0x458, "PPUContext layout");
-PS_PPU_STATIC_ASSERT(sizeof(PPUContext) == 0x460, "PPUContext layout");
+PS_PPU_STATIC_ASSERT(offsetof(PPUContext, reserve_version) == 0x460, "PPUContext layout");
+PS_PPU_STATIC_ASSERT(offsetof(PPUContext, reserve_line) == 0x470, "PPUContext layout");
+PS_PPU_STATIC_ASSERT(sizeof(PPUContext) == 0x4F0, "PPUContext layout");
 PS_PPU_STATIC_ASSERT(sizeof(ps_v128) == 16, "ps_v128 is 128 bits");
 PS_PPU_STATIC_ASSERT(sizeof(double) == 8, "FPRs are IEEE doubles");
 

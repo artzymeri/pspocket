@@ -891,6 +891,22 @@ RPCS3's sceNpTrophy.cpp, with RPCS3's context and handle checks in its order.
   dialog can't open). No trophy pop-ups, trophy list or RPCN sync. The XML reader is a small one that matches what
   RPCS3 gets from pugixml.
 
+## D-066 · 2026-10-04 · PPU lwarx/stwcx. go through the shared reservation system
+
+Run 033: two GTA V audio threads took the same job slot from a lock-free stack (a byte array of next indices, the
+head word updated with lwarx/stwcx.) and ran two jobs in one descriptor. The PPU's reservations were still the
+single-thread placeholder D-023 left open: stwcx. compared the reserved word and then stored it as two separate steps,
+by value only, so two threads could both succeed, and a pop could succeed over a pop-pop-push of the same head (ABA).
+- **Now** lwarx/ldarx take a snapshot of the 128-byte line and its version from the shared reservation system (D-030)
+  into the PPU context (`reserve_line`, `reserve_version`; the context grows to 0x4F0 bytes), and stwcx./stdcx. store
+  through `ps_res_store_conditional`: atomically, only while no conditional store, SPU PUTLLC or notified write changed
+  the line and its bytes still equal the snapshot. PPU threads, SPU atomics and HLE updates of guest sync objects
+  (`reservation_op`) now see one another. As RPCS3: the address must be the reserved one and aligned; the reservation
+  is consumed either way.
+- **Tests.** A regression test runs four interpreter threads through a lock-free stack and a shared counter; the old
+  code lost more than half of 80,000 increments and handed one slot to two threads. The differential fuzz harness now
+  takes real reservations on each side (the store on one side moves the line's version on for the other).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
