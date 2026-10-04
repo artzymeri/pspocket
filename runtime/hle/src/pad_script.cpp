@@ -3,8 +3,10 @@
 #include "pspocket/hle/pad_script.hpp"
 
 #include <array>
-#include <charconv>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <format>
 
 namespace pspocket::hle {
@@ -35,11 +37,17 @@ constexpr std::array<ButtonInfo, 16> kButtons{{
     {"l2", 0, 0x01, 10},
 }};
 
+// A non-negative decimal number, the whole of `s`. strtod rather than std::from_chars: the iOS app targets iOS 17,
+// whose libc++ has no floating-point from_chars.
 std::optional<double> number(std::string_view s)
 {
-    double v = 0;
-    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    if (ec != std::errc() || end != s.data() + s.size() || !(v >= 0) || !std::isfinite(v)) return std::nullopt;
+    if (s.empty() || s.size() > 31 || !(std::isdigit(static_cast<unsigned char>(s[0])) || s[0] == '.')) return std::nullopt;
+    char text[32];
+    std::memcpy(text, s.data(), s.size());
+    text[s.size()] = 0;
+    char* end = nullptr;
+    const double v = std::strtod(text, &end);
+    if (end != text + s.size() || !(v >= 0) || !std::isfinite(v)) return std::nullopt;
     return v;
 }
 

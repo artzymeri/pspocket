@@ -1,11 +1,21 @@
 import SwiftUI
 import UIKit
 
+/// Lets the running game lock the app to landscape (OrientationLock).
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?)
+        -> UIInterfaceOrientationMask {
+        OrientationLock.mask
+    }
+}
+
 @main
 struct PSPocketApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var selfTest = SelfTestModel()
     @State private var metal = MetalLoadModel()
     @State private var device = DeviceStatus()
+    @State private var game = GameModel()
 
     init() {
         // Line-buffered stdout, so `devicectl device process launch --console` (and `simctl launch --console-pty`)
@@ -20,6 +30,7 @@ struct PSPocketApp: App {
                 .environment(selfTest)
                 .environment(metal)
                 .environment(device)
+                .environment(game)
                 .onAppear {
                     // A test host: long thermal runs and headless autoruns must not be cut short by auto-lock.
                     UIApplication.shared.isIdleTimerDisabled = true
@@ -29,13 +40,26 @@ struct PSPocketApp: App {
 }
 
 struct RootView: View {
-    enum Tab: Hashable { case selfTest, metal }
+    enum Tab: Hashable { case game, selfTest, metal }
 
     @Environment(SelfTestModel.self) private var selfTest
-    @State private var tab: Tab = LaunchOptions.initialTab == "metal" ? .metal : .selfTest
+    @Environment(GameModel.self) private var game
+    @State private var tab: Tab = LaunchOptions.initialTab == "metal" ? .metal
+        : LaunchOptions.initialTab == "selftest" || LaunchOptions.autorun ? .selfTest : .game
 
     var body: some View {
+        if game.running {
+            GameScreen() // full screen, landscape
+        } else {
+            tabs
+        }
+    }
+
+    private var tabs: some View {
         TabView(selection: $tab) {
+            GameView()
+                .tabItem { Label("Game", systemImage: "gamecontroller") }
+                .tag(Tab.game)
             SelfTestView()
                 .tabItem { Label("Self-test", systemImage: "checklist") }
                 .tag(Tab.selfTest)
@@ -54,7 +78,8 @@ enum LaunchOptions {
     static let exitAfterAutorun = flag("-autorun-exit", env: "PSPOCKET_AUTORUN_EXIT")
     /// Run every probe at launch. `-autorun` or PSPOCKET_AUTORUN=1.
     static let autorun = exitAfterAutorun || flag("-autorun", env: "PSPOCKET_AUTORUN")
-    /// Tab shown at launch: `-tab metal` or PSPOCKET_TAB=metal starts the Metal load right away.
+    /// Tab shown at launch (the game by default): `-tab metal` or PSPOCKET_TAB=metal starts the Metal load right
+    /// away, `-tab selftest` shows the probes.
     static let initialTab = value("-tab", env: "PSPOCKET_TAB")
     /// Metal load passes at launch (0...64): `-passes N` or PSPOCKET_PASSES=N.
     static let initialPasses = value("-passes", env: "PSPOCKET_PASSES").flatMap { Int($0) }

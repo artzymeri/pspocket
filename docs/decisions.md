@@ -947,6 +947,33 @@ report full pressure. The schedule (`pspocket/hle/pad_script.hpp`) is checked ev
 ("controller at 45.00 s: cross"); boot.sh passes the option through. Times are wall-clock seconds since the game
 started, so a schedule only holds for one build's speed: it is a bring-up tool, not a replay system.
 
+## D-071 · 2026-10-04 · The iOS app boots a game: the disc image picked in Files, the executable from the Mac
+
+The user asked to try GTA V on the iPhone. The app's new Game tab (now the first tab) does what pspocket-boot does on
+the Mac, through `pspocket/platform/game.h` (`runtime/platform/ios/src/game.mm`, Objective-C++).
+- **Disc image.** Picked in Files (`fileImporter`), read in place (no copy of 20 GB), kept open through its
+  security-scoped URL and remembered with a bookmark; probed for its title ID and title.
+- **Executable.** The disc's EBOOT.BIN is an encrypted SELF, and the keys to decrypt it never go into the repository
+  or the app. `scripts/ios.sh push-game` copies the ELF decrypted on the Mac to `Documents/game/<TITLE_ID>/EBOOT.elf`,
+  with the /dev_flash files the game loads itself (D-067; not the reference-only .sprx). Both stay on the user's
+  devices.
+- **Runtime.** The app's runtime library now compiles the same components as pspocket-boot: lv2, the HLE modules,
+  the SPU runtime, the RSX front end and Metal backend, the loader, and recomp/common with the host build's embedded
+  NID tables. PPU and SPU code run on the interpreters (no lifted code yet).
+- **Frames.** The Metal backend's output texture (1152x640, D-016) is copied into a CAMetalLayer from its present
+  callback at each flip; Core Animation scales it to fit. Once the game runs, the app shows it full screen and locks
+  to landscape (status bar and home indicator hidden). No MetalFX or frame pacing yet.
+- **Input.** A game controller paired with the phone (DualShock 4, DualSense, Xbox, MFi) drives the virtual
+  controller through GameController (D-049): A/B/X/Y as cross, circle, square, triangle; Menu (Options) is Start;
+  Options (Share, Create) and the touchpad click are Select; both sticks; L2/R2 and the D-pad with pressure. Without
+  one, on-screen buttons lie over the game, each down while touched; they hide while a controller is connected.
+- **Log.** `Documents/game.log`, written from scratch at each boot; a double tap shows its last lines over the game.
+  A guest fault adds one line to it, then gets the system's crash report.
+- One game per process; quitting the app stops it.
+
+Run 042 is the first device run: the same screens and the same stopping point as the Mac, at the Mac's pace. The
+`--press` parser now uses strtod: iOS 17's libc++ has no floating-point `std::from_chars`.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

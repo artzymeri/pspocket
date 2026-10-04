@@ -60,6 +60,42 @@ targets:
         name: disc
         group: Runtime
         includes: *compiled
+      # What runs a game (the Game tab, pspocket/platform/game.h): the same components as pspocket-boot on the Mac.
+      - path: ../../runtime/spu/src
+        name: spu
+        group: Runtime
+        includes: *compiled
+        compilerFlags: [-ffp-contract=off, -fno-fast-math]
+      - path: ../../runtime/lv2/src
+        name: lv2
+        group: Runtime
+        includes: *compiled
+      - path: ../../runtime/hle/src
+        name: hle
+        group: Runtime
+        includes: *compiled
+      - path: ../../runtime/rsx/src
+        name: rsx
+        group: Runtime
+        includes: *compiled
+      - path: ../../runtime/rsx/metal/src
+        name: rsx-metal
+        group: Runtime
+        includes: *compiled
+      - path: ../../runtime/loader/src
+        name: loader
+        group: Runtime
+        includes: *compiled
+      - path: ../../recomp/common/src
+        name: recomp-common
+        group: Runtime
+        includes: *compiled
+      # recomp/common's NID and syscall tables, embedded by the host build.
+      - path: ${PSPOCKET_HOST_BUILD_DIR}/recomp/common/generated
+        name: generated-recomp-common
+        group: Generated
+        optional: true
+        includes: *compiled
       - path: ../../runtime/platform/ios/src
         name: platform-ios
         group: Runtime
@@ -77,6 +113,8 @@ targets:
       base:
         PRODUCT_NAME: PSPocketRuntime
         SKIP_INSTALL: YES
+        # The Metal backend and the game session are Objective-C++ with ARC (as -fobjc-arc in CMake).
+        CLANG_ENABLE_OBJC_ARC: YES
         # Resolve includes like the CMake build does: no header maps, explicit search paths only.
         USE_HEADERMAP: NO
         HEADER_SEARCH_PATHS:
@@ -86,6 +124,14 @@ targets:
           - $(PSPOCKET_ROOT)/runtime/selftest/src
           - $(PSPOCKET_ROOT)/runtime/platform/ios/include
           - $(PSPOCKET_ROOT)/runtime/disc/include
+          - $(PSPOCKET_ROOT)/runtime/spu/include
+          - $(PSPOCKET_ROOT)/runtime/lv2/include
+          - $(PSPOCKET_ROOT)/runtime/lv2/src
+          - $(PSPOCKET_ROOT)/runtime/hle/include
+          - $(PSPOCKET_ROOT)/runtime/rsx/include
+          - $(PSPOCKET_ROOT)/runtime/rsx/metal/include
+          - $(PSPOCKET_ROOT)/runtime/loader/include
+          - $(PSPOCKET_ROOT)/recomp/common/include
           - $(PSPOCKET_HOST_BUILD_DIR)/generated/selftest
           - $(PSPOCKET_HOST_BUILD_DIR)/generated
         GCC_PREPROCESSOR_DEFINITIONS:
@@ -125,7 +171,7 @@ targets:
           GCC_OPTIMIZATION_LEVEL: "2"
           OTHER_CFLAGS: [$(inherited), -DNDEBUG]
 
-  # SwiftUI test host: self-test probes and a Metal output/pacing preview.
+  # SwiftUI app: the game (pick its disc image in Files, boot it), self-test probes and a Metal output/pacing preview.
   PSPocket:
     type: application
     platform: iOS

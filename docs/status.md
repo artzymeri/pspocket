@@ -28,9 +28,9 @@ PS3 game. SPURS (the PS3's SPU job system) is our own native C++ implementation,
 | HLE modules | sysPrxForUser, cellSysmodule, cellSpurs (native, checked against libsre: initialize, workloads, tasksets, tasks, event flags, lv2 queue ports, barriers, job chains, SPURS queues; D-047, D-054, D-063; host SPU workers run SPU tasks, job chains and a game's own policy module with libsre's priorities, D-050, D-051, D-055, D-064), cellAudio (a host thread, ports, notify queues, no sound out yet; D-052), cellSheap (libsre's allocator), cellGcmSys (20, with the vblank interrupt thread; D-045), cellSysutil and AvconfExt (D-048), sys_io (virtual controller, no keyboard; D-049), sceNp/sceNp2 (offline, D-059), sceNpTrophy (trophy packs installed as RPCS3, D-065), cellSaveData (D-062), cellRtc (D-060), cellVoice, cellNetCtl, sys_net, sys_fs (20 cellFs functions), cellGame (6). 244 of GTA V's 364 imports; the rest are online, keyboard dialogs and shutdown |
 | Loader | `pspocket-boot` runs a decrypted EBOOT under the interpreter on the Mac. Crash reports show r3..r10 and the caller's code (D-042), or for SPU code the host thread, pc, MFC parameters and registers (D-067). `--bdvd IMAGE.iso`, `--probe-disc`, `--flash DIR` (/dev_flash from the user's firmware, D-067), `--frames DIR`, `--dump-on-fault FILE` |
 | RSX | Portable front end (FIFO methods, state, textures, shader translation to MSL with condition codes, D-068) and Metal backend (D-032). Driven by GTA V since run 016; its frames are saved as PNG (D-057): the logo, the legal screen and the Display Calibration screen draw as on the PS3 |
-| iOS app | XcodeGen test host with device self-tests. On an iPhone 17 Pro Max, MetalFX 30 Hz runs steady and lifted PPU code runs 12× faster than the interpreter (runs 001–003). `-extract-iso` mode. The GTA V disc image (18.7 GB, decrypted at disc level) is in the app's Documents |
+| iOS app | **Boots the game** (D-071): the Game tab picks the disc image in Files and boots it; full screen in landscape; a paired DualShock 4/DualSense drives the virtual controller, else on-screen buttons. The decrypted EBOOT and the /dev_flash files come from the Mac (`scripts/ios.sh push-game`). Also device self-tests: MetalFX 30 Hz steady, lifted PPU code 12× faster than the interpreter (runs 001–003) |
 
-## GTA V bring-up so far (docs/runs 004–041)
+## GTA V bring-up so far (docs/runs 004–042)
 
 The EBOOT boots under the interpreter on the M4 Mac. It gets through:
 - the CRT, TLS, lwmutexes, cellSysmodule;
@@ -59,14 +59,17 @@ The EBOOT boots under the interpreter on the M4 Mac. It gets through:
 - **runs 039 and 040 end at their timeout without a crash**: the opening animation, the legal screen and the **Display
   Calibration** screen, which waits for the X button;
 - run 041 presses X on a schedule (`--press cross@45+10`, D-069): past calibration to **"Loading Story Mode"**, with the
-  trophy set registered (D-065).
+  trophy set registered (D-065);
+- **run 042: the same on the iPhone** (D-071), at the Mac's pace: the ISO picked in Files, calibration confirmed with
+  an on-screen Cross, the profile saved, "Loading Story Mode".
 
 ## Right now
 
 The game shows its "Loading Story Mode" screens (run 041, 300 s, no crash, no failed draws) and stops loading: its
 Physics SPU tasks wait on a SPURS semaphore that `_cellSpursSemaphoreInitialize` (unimplemented) never set up, and the
 main thread waits for them in `cellSpursQueuePopBody`. SPURS semaphores are next, with libsre as the reference (RPCS3
-has none). Runs need `--press cross@45+10` to get past the Display Calibration screen; boot.sh passes it through:
+has none). The same happens on the iPhone (run 042): to try a build there, `scripts/ios.sh build`, `scripts/ios.sh
+install`, once `scripts/ios.sh push-game`, then the Game tab. Runs need `--press cross@45+10` to get past the Display Calibration screen; boot.sh passes it through:
 `scripts/boot.sh --timeout 300 --frames inventory/gta5/frames --frame-every 60 --press cross@45+10`.
 
 ## Next steps, in order

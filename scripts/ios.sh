@@ -35,6 +35,12 @@ Commands:
   report                     Copy Documents/$REPORT from the app's data container to <ios build>/ and print it.
   pull-iso [--to DIR]        Copy the disc image the app holds (the largest .iso in its Documents: Files > On My
                              iPhone > PSPocket) to DIR/disc.iso (default inventory/). Phone connected and unlocked.
+  push-game [--elf FILE] [--title ID] [--flash DIR]
+                             Copy what the Game tab needs besides the disc image (which you pick in Files) to the
+                             app's Documents: the game's decrypted executable as game/<TITLE_ID>/EBOOT.elf (default
+                             inventory/*/decrypt/EBOOT.elf; the title ID from the disc image next to it) and the
+                             /dev_flash files the game loads itself (default inventory/firmware/dev_flash, without the
+                             reference-only .sprx). Phone connected and unlocked. They stay on your devices.
   all                        build + install + run --autorun --exit + report.
 
 Options:
@@ -64,10 +70,16 @@ AUTORUN=0
 EXIT_AFTER=0
 APP_ARGS=()
 PULL_DIR="$ROOT/inventory"
+GAME_ELF=""
+GAME_TITLE=""
+GAME_FLASH="$ROOT/inventory/firmware/dev_flash"
 while [ $# -gt 0 ]; do
     case "$1" in
         --) shift; APP_ARGS=("$@"); break ;;
         --to) [ $# -ge 2 ] || die "--to needs a directory"; PULL_DIR="$(abspath "$2")"; shift ;;
+        --elf) [ $# -ge 2 ] || die "--elf needs a file"; GAME_ELF="$(abspath "$2")"; shift ;;
+        --title) [ $# -ge 2 ] || die "--title needs a title ID"; GAME_TITLE="$2"; shift ;;
+        --flash) [ $# -ge 2 ] || die "--flash needs a directory"; GAME_FLASH="$(abspath "$2")"; shift ;;
         --sim) SIM=1 ;;
         --debug) CONFIG=Debug; CONFIG_SET=1 ;;
         --device) [ $# -ge 2 ] || die "--device needs an identifier"; DEVICE="$2"; shift ;;
@@ -386,6 +398,41 @@ PY
     say "disc image: $dest"
 }
 
+# The Game tab's files besides the disc image: the decrypted executable and the user's /dev_flash files.
+cmd_push_game() {
+    local dev elf title iso boot f rel
+    if [ -n "$GAME_ELF" ]; then elf="$GAME_ELF"
+    else elf="$(find "$ROOT/inventory" -name EBOOT.elf -path '*/decrypt/*' 2>/dev/null | head -1)"
+    fi
+    [ -n "$elf" ] && [ -f "$elf" ] || die "no decrypted EBOOT.elf (inventory/<game>/decrypt/EBOOT.elf, or --elf FILE)"
+    title="$GAME_TITLE"
+    if [ -z "$title" ]; then
+        # The disc image next to the executable's game folder names the title (pspocket-boot --probe-disc).
+        iso="$(find "$(dirname "$(dirname "$elf")")" -maxdepth 2 -type f -iname '*.iso' 2>/dev/null | head -1)"
+        boot="$HOST_BUILD/runtime/loader/pspocket-boot"
+        if [ -n "$iso" ] && [ -x "$boot" ]; then title="$("$boot" --probe-disc "$iso" 2>/dev/null | awk '{ print $1 }')"; fi
+    fi
+    dev="$(device_id)"
+    require_unlocked "$dev"
+    local dest="Documents/game/EBOOT.elf"
+    if [ -n "$title" ]; then dest="Documents/game/$title/EBOOT.elf"; fi
+    say "copying $elf to $dest on the iPhone"
+    xcrun devicectl device copy to --device "$dev" --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+        --source "$elf" --destination "$dest" >&2 || die "copying the executable failed: is PSPocket installed?"
+    if [ -d "$GAME_FLASH" ]; then
+        find "$GAME_FLASH" -type f ! -name '*.sprx' | while IFS= read -r f; do
+            rel="${f#"$GAME_FLASH"/}"
+            say "copying dev_flash/$rel"
+            xcrun devicectl device copy to --device "$dev" --domain-type appDataContainer \
+                --domain-identifier "$BUNDLE_ID" --source "$f" --destination "Documents/dev_flash/$rel" >&2 \
+                || die "copying dev_flash/$rel failed"
+        done
+    else
+        warn "no $GAME_FLASH: the game's MP3 codec will be missing (inventory/firmware/tools/fw_unself.py --raw flashMP3.pic)"
+    fi
+    say "done: in PSPocket's Game tab, choose the game's .iso and press Boot"
+}
+
 case "$COMMAND" in
     gen) cmd_gen ;;
     build) cmd_build ;;
@@ -393,6 +440,7 @@ case "$COMMAND" in
     run) cmd_run; exit "$RUN_STATUS" ;;
     report) cmd_report ;;
     pull-iso) cmd_pull_iso ;;
+    push-game) cmd_push_game ;;
     all)
         cmd_build >/dev/null
         cmd_install
