@@ -47,6 +47,10 @@ typedef struct ps_spu_program {
     uint32_t entry_count;
     const ps_spu_entry* entries; /* ascending addr */
     ps_spu_fn* table;    /* dense lookup over the code range, built by ps_spu_register_program */
+    /* The words the program lifted as instructions: bit i of word i / 32 for the word at code_start + 4 * i (NULL: all
+     * of them). A DMA over the range invalidates the program only when it writes one of these (D-085): a binary's own
+     * data and bss share its range, and jobs copy their buffers there. */
+    const uint32_t* code_words;
 } ps_spu_program;
 
 /* Program key: 64-bit hash of the code bytes (multiply-xorshift over 8-byte words, then the tail). The same function

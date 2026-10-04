@@ -604,9 +604,20 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
     for (const auto& [addr, sym] : entries) r += std::format("    {{0x{:05X}u, {}}},\n", addr, sym);
     if (entries.empty()) r += "    {0u, 0},\n";
     r += "};\n\n";
-    r += std::format("ps_spu_program {}_program = {{\"{}\", 0x{:016X}ull, 0x{:05X}u, 0x{:X}u, {}, {}, {}u, {}_entries, 0}};\n\n",
+    // The lifted instruction words, a bit each: a DMA over anything else in the range leaves the program valid.
+    std::vector<u32> bits((image.code_size() / 4 + 31) / 32, 0);
+    for (const Function& f : program.functions)
+        for (u32 a : f.insns) {
+            const u32 w = (a - image.code_start) / 4;
+            bits[w / 32] |= 1u << (w % 32);
+        }
+    r += std::format("static const uint32_t {}_code[] = {{", options.name);
+    for (usize i = 0; i < bits.size(); i++) r += std::format("{}0x{:08X}u,", i % 8 ? " " : "\n    ", bits[i]);
+    if (bits.empty()) r += "0u";
+    r += "\n};\n\n";
+    r += std::format("ps_spu_program {}_program = {{\"{}\", 0x{:016X}ull, 0x{:05X}u, 0x{:X}u, {}, {}, {}u, {}_entries, 0, {}_code}};\n\n",
         options.name, image.name.empty() ? options.name : image.name, result.hash, image.code_start, image.code_size(),
-        options.xfloat, options.relocatable ? 1 : 0, entries.size(), options.name);
+        options.xfloat, options.relocatable ? 1 : 0, entries.size(), options.name, options.name);
     r += std::format("void {}_register(void) {{ ps_spu_register_program(&{}_program); }}\n", options.name, options.name);
     result.files.push_back({options.name + "_reg.c", r});
 

@@ -64,7 +64,7 @@ TEST_CASE("SPU programs: a load attaches the lifted program with the image's key
 
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
     ps_spu_program program{"spu_test", ps_spu_hash64(base + kGuest, kSize), kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1,
-        entries, nullptr};
+        entries, nullptr, nullptr};
     ps_spu_register_program(&program);
     Spu spu(base);
     const hle::SpuProgramStats before = hle::spu_program_stats();
@@ -102,7 +102,7 @@ TEST_CASE("SPU programs: a relocatable program attaches wherever its image sits 
 
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
     ps_spu_program program{"spu_test_reloc", ps_spu_hash64(base + kGuest, kSize), kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE,
-        1, 1, entries, nullptr};
+        1, 1, entries, nullptr, nullptr};
     ps_spu_register_program(&program);
     Spu spu(base);
 
@@ -161,7 +161,7 @@ TEST_CASE("SPU programs: a DMA over the attached program's code drops it", "[hle
     REQUIRE(mem.commit(kGuest, 0x10000));
     u8* base = mem.base();
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
-    ps_spu_program program{"spu_test", 1, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr};
+    ps_spu_program program{"spu_test", 1, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
     ps_spu_register_program(&program);
     Spu spu(base);
     ps_spu_attach_program(&spu.ctx, &program);
@@ -181,6 +181,20 @@ TEST_CASE("SPU programs: a DMA over the attached program's code drops it", "[hle
     get(kLs + 0x80, 0x10); // over it: the lifted code would be stale
     CHECK(spu.ctx.program == nullptr);
     CHECK(spu.ctx.home == nullptr);
+
+    // A program that says which words are its instructions keeps them through DMAs into the rest of its range: a job
+    // copies its buffers into its own data and bss (regression, run 057: every job ran interpreted after its first
+    // run). Instructions in the first 0x100 bytes, data after.
+    uint32_t code_words[kSize / 4 / 32] = {};
+    for (u32 w = 0; w < 0x100 / 4; w++) code_words[w / 32] |= 1u << (w % 32);
+    ps_spu_program partial{"spu_test_data", 2, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, code_words};
+    ps_spu_register_program(&partial);
+    ps_spu_attach_program(&spu.ctx, &partial);
+    get(kLs + 0x100, 0x100); // its data: stays
+    CHECK(spu.ctx.program == &partial);
+    get(kLs + 0xF0, 0x10); // the last instruction words
+    CHECK(spu.ctx.program == nullptr);
+    ps_spu_unregister_program(&partial);
     ps_spu_unregister_program(&program);
 }
 
@@ -202,7 +216,7 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i); // nops with distinct bits
     const ps_spu_entry entries[] = {{kModule, &module_entry}};
     ps_spu_program program{"spu_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
     ps_spu_register_program(&program);
     hle::enable_spu_modules();
     Spu spu(base);
@@ -283,9 +297,9 @@ TEST_CASE("SPU programs: a relocatable module runs where it was copied, then its
     for (u32 i = 0; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i); // nops with distinct bits
     const ps_spu_entry module_entries[] = {{kLifted, &reloc_module_entry}};
     ps_spu_program module{"spu_module_reloc", ps_spu_hash64(base + kGuest, kModuleSize), kLifted, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, module_entries, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, module_entries, nullptr, nullptr};
     const ps_spu_entry home_entries[] = {{kHome, &home_entry}, {kHome + 4, &home_return}};
-    ps_spu_program home{"spu_home", 2, kHome, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 2, home_entries, nullptr};
+    ps_spu_program home{"spu_home", 2, kHome, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 2, home_entries, nullptr, nullptr};
     ps_spu_register_program(&module);
     ps_spu_register_program(&home);
     hle::enable_spu_modules();
@@ -372,7 +386,7 @@ TEST_CASE("SPU programs: a task's modules stay known across its context switch t
     for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
     const ps_spu_entry entries[] = {{kModule, &module_entry}};
     ps_spu_program program{"spu_module_switch", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr, nullptr};
     ps_spu_register_program(&program);
     hle::enable_spu_modules();
     const auto run_at_module = [](Spu& spu) {

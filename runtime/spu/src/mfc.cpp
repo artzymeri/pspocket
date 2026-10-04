@@ -107,7 +107,22 @@ int group_mmio(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
 bool overwrites(const ps_spu_program* p, u32 reloc, u32 at, u32 size)
 {
     const u32 start = (p->code_start + reloc) & PS_SPU_LS_MASK;
-    return ((at - start) & PS_SPU_LS_MASK) < p->code_size || ((start - at) & PS_SPU_LS_MASK) < size;
+    const u32 into = (at - start) & PS_SPU_LS_MASK; // where the copy starts, from the program's start
+    u32 first, end;                                 // the overlap, in bytes from the program's start
+    if (into < p->code_size) {
+        first = into;
+        end = std::min<u32>(p->code_size, into + size);
+    } else if (((start - at) & PS_SPU_LS_MASK) < size) {
+        first = 0;
+        end = std::min<u32>(p->code_size, size - ((start - at) & PS_SPU_LS_MASK));
+    } else {
+        return false;
+    }
+    if (!p->code_words) return true;
+    // Only its lifted instructions matter (D-085): data and bss share the range.
+    for (u32 w = first >> 2; w < (end + 3) >> 2; w++)
+        if ((p->code_words[w >> 5] >> (w & 31)) & 1) return true;
+    return false;
 }
 
 // A GET over lifted code (an overlay, or other code loaded where it was) leaves it stale: the rest of the run
