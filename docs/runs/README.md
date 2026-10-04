@@ -26,3 +26,12 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [019](019-gta5-boot-17-mac.md) | 2026-10-04 | ad558c6+ | M4 Mac, pspocket-boot | 60 s without a crash: input, tiles, first frame's job chain kicks; the game waits on SPU work |
 | [020](020-gta5-boot-18-mac.md) | 2026-10-04 | 5cabf48+ | M4 Mac, pspocket-boot | SPU tasks run natively on SPURS workers; job chains and the custom workload don't yet |
 | [021](021-gta5-boot-19-mac.md) | 2026-10-04 | 5cabf48+ | M4 Mac, pspocket-boot | GTA V's own SPU module runs, audio starts, no unimplemented calls; the game waits on its job chains |
+| [022](022-gta5-boot-20-mac.md) | 2026-10-04 | 437b72e+ | M4 Mac, pspocket-boot | The job chains run; a job sets an lv2 event flag bit from SPU code (unhandled) |
+| [023](023-gta5-boot-21-mac.md) | 2026-10-04 | 437b72e+ | M4 Mac, pspocket-boot | The Secondary chain (GTA V's audio mixer) runs 55 commands, then MEMORY_SIZE |
+| [024](024-gta5-boot-22-mac.md) | 2026-10-04 | 437b72e+ | M4 Mac, pspocket-boot | MEMORY_SIZE again; first cellAudioAddData |
+| [025](025-gta5-boot-23-mac.md) | 2026-10-04 | 437b72e+ | M4 Mac, pspocket-boot | 395 commands; a job fits only when its pages are packed |
+| [026](026-gta5-boot-24-mac.md) | 2026-10-04 | 437b72e+ | M4 Mac, pspocket-boot | 60 s, no crash: 2 M RSX words and 1,721 flips (a loading screen, nothing shown yet) |
+| [027](027-gta5-boot-25-mac.md) | 2026-10-04 | 437b72e+ | M4 Mac, pspocket-boot | PSN manager callback kept; basic handler next |
+| [028](028-gta5-boot-26-mac.md) | 2026-10-04 | 437b72e+ | M4 Mac, pspocket-boot | sceNpLookupInit; the main thread waits on a semaphore from second 4 |
+| [029](029-gta5-boot-27-mac.md) | 2026-10-04 | c68e12c+ | M4 Mac, pspocket-boot --frames | First picture: the Rockstar logo screen through the Metal backend, after the event flag direction fix |
+| [030](030-gta5-boot-28-mac.md) | 2026-10-04 | c68e12c+ | M4 Mac, pspocket-boot --frames | A CellSpursTaskset2; then `_cellSpursQueueInitialize` (SPURS queues) |
