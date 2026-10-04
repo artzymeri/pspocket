@@ -32,6 +32,7 @@
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/process.hpp"
+#include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/lv2/kernel.hpp"
@@ -43,6 +44,10 @@
 #include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
+
+#if PSPOCKET_HAVE_GAME_SPU
+extern "C" void pspocket_game_spu_register(void); // the game's lifted SPU programs (scripts/lift-spu.sh, D-076)
+#endif
 
 namespace {
 
@@ -168,6 +173,13 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     s->memory = std::make_unique<GuestMemory>();
     if (!s->memory->reserve()) return fail(error, error_size, "cannot reserve the 4 GB guest address space");
     ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET); // no lifted code in the app yet: the interpreter runs the game
+    // SPU code without a lifted program, or outside it, is interpreted (D-076). The game's lifted SPU programs, when
+    // the build has them (scripts/ios.sh), run its SPURS tasks, jobs and the modules they load (D-079, D-081).
+    ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
+#if PSPOCKET_HAVE_GAME_SPU
+    pspocket_game_spu_register();
+    hle::enable_spu_modules();
+#endif
 
     lv2::Config cfg = s->exe->kernel_config();
     Session* raw = s.get();
@@ -176,6 +188,9 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         raw->running = false;
     };
     loader::prepare_kernel_config(cfg, s->state);
+    // A FIFO the RSX cannot read (a desync) is logged and skipped to put, as RPCS3 recovers (CLAUDE.md rule 5: the
+    // app falls back and logs; pspocket-boot on the Mac stops there).
+    cfg.rsx_log_failures = true;
 
     // The frames: the Metal backend renders into its output texture (1152x640, D-016), copied into the layer.
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();

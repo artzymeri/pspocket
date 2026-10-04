@@ -50,6 +50,8 @@ Options:
 
 Environment:
   PSPOCKET_HOST_BUILD   host CMake build directory, relative to the repo or absolute (default build/host)
+  PSPOCKET_GAME_SPU     the game's lifted SPU programs (scripts/lift-spu.sh output) to build in (default: the
+                        inventory/*/spu-lifted that holds a game_spu.c, if any)
   PSPOCKET_IOS_BUILD    Xcode output directory: DerivedData, logs, last-run.log, the report (default build/ios)
 EOF
 }
@@ -219,9 +221,24 @@ cmd_gen() {
         if [ -d "$ppu_src" ]; then say "runtime/ppu/src: not compiled until runtime/ppu/CMakeLists.txt exists"; fi
         ppu_src="$ROOT/runtime/ppu/not-in-the-host-build-yet"
     fi
+    # The game's lifted SPU programs (scripts/lift-spu.sh, D-076): $PSPOCKET_GAME_SPU, else an inventory/*/spu-lifted
+    # that holds a game_spu.c. Without them the interpreter runs the SPUs.
+    local game_spu="${PSPOCKET_GAME_SPU:-}" have_game_spu=1
+    if [ -z "$game_spu" ]; then
+        for d in "$ROOT"/inventory/*/spu-lifted; do
+            if [ -f "$d/game_spu.c" ]; then game_spu="$d"; fi
+        done
+    fi
+    if [ -n "$game_spu" ] && [ -f "$game_spu/game_spu.c" ]; then
+        say "lifted SPU programs: $game_spu ($(find "$game_spu" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') programs)"
+    else
+        say "no lifted SPU programs (scripts/lift-spu.sh): the SPUs are interpreted"
+        game_spu="$ROOT/inventory/no-lifted-spu-programs"
+        have_game_spu=0
+    fi
     say "xcodegen: $PROJECT"
-    PSPOCKET_HOST_BUILD_DIR="$HOST_BUILD" PSPOCKET_PPU_SRC="$ppu_src" \
-        "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
+    PSPOCKET_HOST_BUILD_DIR="$HOST_BUILD" PSPOCKET_PPU_SRC="$ppu_src" PSPOCKET_GAME_SPU_SRC="$game_spu" \
+        PSPOCKET_HAVE_GAME_SPU="$have_game_spu" "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
 }
 
 cmd_build() {
