@@ -430,8 +430,15 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
     REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
 
     // The module, entered at 0xA00 with $3 = 0x100, $4 = the argument (preferred doubleword), $5 = the poll status.
+    // It runs again and again while it has work, so it records one run only: when the record's first word (the poll
+    // status, never 0) is still 0. The test clears the record to have the next run recorded.
     Program p;
     p.emit(as::rotqbyi(80, 4, 4));    // the output EA: the argument's low word into the preferred slot
+    p.emit(as::il(73, kBuf + 0x10));
+    p.dma16(PS_MFC_GET, 73, 80);
+    p.emit(as::lqd(74, 0, 73));
+    const usize skip = p.code.size();
+    p.emit(0);                         // brnz $74: recorded already
     p.put(5, 80, 0);                   // the poll status it was entered with
     p.emit(as::lqa(6, 0x1E0));
     p.emit(as::rotqbyi(6, 6, 4));      // [0x1E4]: the kernel's select-workload entry
@@ -440,6 +447,7 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
     p.put(3, 80, 16);                  // {selected workload, poll status}
     p.emit(as::lqa(7, 0x1D0));
     p.put(7, 80, 32);                  // wklCurrentAddr, uniqueId, wklCurrentId
+    p.code[skip] = as::brnz(74, static_cast<s32>(p.code.size() - skip) * 4);
     p.emit(as::lqa(2, 0x1E0));         // [0x1E0]: exit to the kernel
     p.emit(as::bisl(0, 2));
     for (usize i = 0; i < p.code.size(); i++) ps_write32(b, kPm + 4 * static_cast<u32>(i), p.code[i]);
@@ -449,7 +457,8 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
                 1) == 0);
     const u32 wid = ps_read32(b, kWid);
 
-    // Work arrives as a ready count: the module runs (again and again while the count stays).
+    // Work arrives as a ready count: the module runs (again and again while the count stays; the first run records).
+    std::memset(b + kOut, 0, 48);
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 1) == 0);
     REQUIRE(wait_for([&] { return ps_read64(b, kOut + 32) == kPm; })); // the module's last output
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 0) == 0);
@@ -461,7 +470,7 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
     CHECK(a.call("cellSpursReadyCountStore", kSpurs, wid + 1, 1) == 0xFFFFFFFF80410805ull); // not registered: SRCH
 
     // Work arrives as the workload flag: the receiver runs with poll status 4 and the flag is consumed.
-    std::this_thread::sleep_for(std::chrono::milliseconds(20)); // let the last ready-count run finish
+    REQUIRE(wait_for([&] { return ps_read8(b, kSpurs + 0x20 + wid) == 0; })); // the last ready-count run is over
     REQUIRE(a.call("_cellSpursWorkloadFlagReceiver", kSpurs, wid, 1) == 0);
     CHECK(a.call("_cellSpursWorkloadFlagReceiver", kSpurs, wid, 1) == 0xFFFFFFFF8041080Aull); // already set: BUSY
     CHECK(a.call("_cellSpursWorkloadFlagReceiver", kSpurs, wid + 1, 1) == 0xFFFFFFFF80410805ull); // not registered
