@@ -470,9 +470,11 @@ s32 cellSpursCreateTasksetWithAttribute(PPUContext& ctx, u32 spurs, u32 taskset,
 
 // cellSpursShutdownWorkload, checked against libsre (fw 4.92), which RPCS3 follows: NULL, ALIGN, INVAL for a
 // workload ID past the instance's 16 (32 for SPURS2), SRCH for a workload that is not registered (its wklEnabled bit
-// clear), STAT for an instance in exception state or a workload not yet runnable. Natively no SPU runs a workload yet
-// (status 0), so a shutdown makes it removable at once. The shutdown-completion notification libsre and RPCS3 send to
-// the SPURS event port (when a hook is registered) has no handler thread to go to natively; it is logged instead.
+// clear), STAT for an instance in exception state or a workload not yet runnable. The native scheduler does not keep
+// wklStatus (which SPUs run a workload; status 0), so a shutdown makes the workload removable at once: a worker that is
+// running it leaves at its next poll, since the selection only takes runnable workloads. The shutdown-completion
+// notification libsre and RPCS3 send to the SPURS event port (when a hook is registered) has no handler thread to go
+// to natively; it is logged instead.
 s32 shutdown_workload(u8* base, u32 spurs, u32 wid)
 {
     if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
@@ -1403,19 +1405,6 @@ s32 cellSpursBarrierInitialize(PPUContext& ctx, u32 taskset, u32 barrier, u32 to
 
 // ------------------------------------------------------------------------------------------------- job chains
 
-// CellSpursJobChainAttribute (8-aligned) and CellSpursJobChain (0x100 bytes, 128-aligned).
-namespace jcattr_off {
-constexpr u32 jmVer = 0x00, sdkVer = 0x04, jobChainEntry = 0x08, sizeJobDescriptor = 0x0C, maxGrabbedJob = 0x0E,
-              priorities = 0x10, maxContention = 0x18, autoSpuCount = 0x1C, tag1 = 0x20, tag2 = 0x24,
-              isFixedMemAlloc = 0x28, maxSizeJobDescriptor = 0x2C, initSpuCount = 0x30, haltOnError = 0x34,
-              name = 0x38, jobMemoryCheck = 0x3C;
-}
-namespace jc_off {
-constexpr u32 pc = 0x00, isHalted = 0x23, initSpuCount = 0x28, tag1 = 0x2A, tag2 = 0x2B, val2C = 0x2C, jmVer = 0x2D,
-              val2F = 0x2F, maxGrabbedJob = 0x70, workloadId = 0x74, spurs = 0x78, error = 0x80, cause = 0x88,
-              sdkVer = 0x90, jobMemoryCheck = 0x94;
-}
-
 // RPCS3 _spurs::check_job_chain_attribute.
 s32 check_job_chain_attribute(u32 sdk_ver, u32 entry, u16 size_job, u16 max_grabbed, u64 priorities, bool auto_spu_count,
     u32 tag1, u32 tag2, u32 max_size_job, u32 init_spu_count)
@@ -1493,9 +1482,10 @@ s32 cellSpursJobChainAttributeSetHaltOnError(PPUContext& ctx, u32 attr)
     return lv2::CELL_OK;
 }
 
-// RPCS3 cellSpursCreateJobChainWithAttribute + _spurs::create_job_chain, with the native job chain marker as the
-// policy module. Deviations: no "JobChain" class name (RPCS3 points it at a temporary guest string), and RPCS3's
-// one-title firmware quirk (val2F) is not reproduced (no title checks in the runtime, rule 6).
+// cellSpursCreateJobChainWithAttribute + create_job_chain as libsre (fw 4.92, D-054; RPCS3 has the same steps but
+// swaps sizeJobDescriptor and maxGrabbedJob and leaves out autoReadyCount and haltOnError), with the native job chain
+// marker as the policy module. Deviations: no "JobChain" class name, and libsre's one-title firmware quirk (val2F) is
+// not reproduced (no title checks in the runtime, rule 6).
 s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_chain, u32 attr)
 {
     if (!attr) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
@@ -1521,8 +1511,10 @@ s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_cha
     std::memset(base + job_chain, 0, 0x110);
     const u32 jm_ver = ps_read32(base, attr + jcattr_off::jmVer);
     if (jm_ver != CELL_SPURS_JOB_REVISION_2 && jm_ver != CELL_SPURS_JOB_REVISION_3) return error(CELL_SPURS_JOB_ERROR_INVAL);
-    ps_write8(base, job_chain + jc_off::val2C,
-        static_cast<u8>((fixed_mem ? 0x80 : 0) | ((((max_size_job - 0x100) / 128) & 7) << 4)));
+    const bool halt_on_error = ps_read32(base, attr + jcattr_off::haltOnError) != 0;
+    ps_write8(base, job_chain + jc_off::flags,
+        static_cast<u8>((fixed_mem ? jc_off::flagFixedMem : 0) | ((((max_size_job - 0x100) / 128) & 7) << 4) |
+                        (halt_on_error ? jc_off::flagHaltOnError : 0)));
 
     // _spurs::create_job_chain
     const u32 sdk = HleProcess::current()->kernel().config().sdk_version;
@@ -1532,7 +1524,9 @@ s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_cha
     ps_write8(base, job_chain + jc_off::tag1, static_cast<u8>(tag1));
     ps_write8(base, job_chain + jc_off::tag2, static_cast<u8>(tag2));
     ps_write8(base, job_chain + jc_off::isHalted, 0);
+    ps_write16(base, job_chain + jc_off::sizeJobDescriptor, size_job);
     ps_write16(base, job_chain + jc_off::maxGrabbedJob, max_grabbed);
+    ps_write8(base, job_chain + jc_off::autoReadyCount, auto_spu_count ? 1 : 0);
     ps_write64(base, job_chain + jc_off::pc, entry);
     u8 priority[8];
     for (u32 i = 0; i < 8; i++) priority[i] = static_cast<u8>(prio >> (56 - 8 * i));
@@ -1555,17 +1549,17 @@ s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_cha
     ps_write8(base, job_chain + jc_off::jobMemoryCheck, static_cast<u8>(ps_read8(base, attr + jcattr_off::jobMemoryCheck) << 1));
     std::string label;
     if (const u32 name = ps_read32(base, attr + jcattr_off::name)) label = reinterpret_cast<const char*>(base + name);
-    PS_LOG_INFO(kChan, "job chain {:#010x} \"{}\" is workload {} of SPURS {:#010x} (entry {:#x}, max contention {}); "
-                       "jobs do not run until the native job chain policy exists (needs libsre as the reference)",
-        job_chain, label, wid, spurs, entry, max_contention);
+    PS_LOG_INFO(kChan, "job chain {:#010x} \"{}\" is workload {} of SPURS {:#010x} (entry {:#x}, descriptors {:#x} bytes, "
+                       "max grab {}, max contention {}, {} ready count{})",
+        job_chain, label, wid, spurs, entry, size_job, max_grabbed, max_contention, auto_spu_count ? "auto" : "fixed",
+        halt_on_error ? ", halts on error" : "");
     return lv2::CELL_OK;
 }
 
 // cellSpursRunJobChain(jobChain), as libsre (fw 4.92): NULL, 128-byte ALIGN, a workload ID past 31 (INVAL), a job
 // chain of revision 0 or 1 (PERM); then cellSpursSendWorkloadSignal on its workload (result ignored) and
 // cellSpursWakeUp, whose STAT becomes JOB_ERROR_STAT. Any other wake-up result gives CELL_OK (RPCS3 passes it through).
-// Natively the signal is recorded in the guest CellSpurs, but no SPU runs jobs until the native job chain policy
-// exists (D-037 stage 5).
+// A worker then picks the chain up and runs it with the native job chain policy (spurs_jobchain.cpp).
 s32 cellSpursRunJobChain(PPUContext& ctx, u32 job_chain)
 {
     if (!job_chain) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
@@ -1583,8 +1577,7 @@ s32 cellSpursRunJobChain(PPUContext& ctx, u32 job_chain)
     if (ps_read8(base, job_chain + jc_off::jmVer) <= CELL_SPURS_JOB_REVISION_1) return error(CELL_SPURS_JOB_ERROR_PERM);
     send_workload_signal(base, spurs, wid);
     const s32 woken = cellSpursWakeUp(ctx, spurs);
-    PS_LOG_INFO(kChan, "cellSpursRunJobChain({:#010x}): workload {} of SPURS {:#x} signalled; no SPU runs its jobs until "
-        "the native job chain policy exists", job_chain, wid, spurs);
+    PS_LOG_DEBUG(kChan, "cellSpursRunJobChain({:#010x}): workload {} of SPURS {:#x} signalled", job_chain, wid, spurs);
     return woken == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT) ? error(CELL_SPURS_JOB_ERROR_STAT) : lv2::CELL_OK;
 }
 

@@ -1,7 +1,8 @@
 #pragma once
 
 // The native SPURS scheduler's workers (D-037 stage 3b): shared by spurs_scheduler.cpp (workers, workload selection,
-// SPU-side events) and spurs_taskset.cpp (the taskset policy). Internal to runtime/hle.
+// SPU-side events) and the policies: spurs_taskset.cpp (tasksets), spurs_jobchain.cpp (job chains) and
+// spurs_custom.cpp (a game's own policy module). Internal to runtime/hle.
 //
 // A worker stands for one SPU of a SPURS instance: a host thread with an SPU context and 256 KB of local store. Its
 // local store below 0x3000 holds what Sony's SPURS kernel and taskset policy module keep there, as far as task code
@@ -56,6 +57,13 @@ constexpr u32 ctx_lr = 0x2C80, ctx_sp = 0x2C90, ctx_r80 = 0x2CA0, ctx_fpscr = 0x
               ctx_exit_arg = 0x2FC8, ctx_exit_code = 0x2FD0, ctx_flags = 0x2FD4, ctx_wait_object = 0x2FD8;
 constexpr u32 ctx_area_size = 0x380;
 constexpr u32 task_top = 0x3000;
+// Job chains (libsre's job chain policy module, D-055): a job returns to 0x2570 (after the module's call), its context
+// (CellSpursJobContext2) is at 0x4940, and binaries and buffers are 1 KB pages from 0x4C00 up to the 4 descriptor
+// buffers, which end at 0x3F800 (the module's stack is above).
+constexpr u32 jc_return = 0x2570;
+constexpr u32 jc_context = 0x4940;
+constexpr u32 jc_heap = 0x4C00;
+constexpr u32 jc_descriptors_end = 0x3F800;
 constexpr u32 size = 0x40000;
 } // namespace ls
 
@@ -63,6 +71,8 @@ constexpr u32 size = 0x40000;
 // policy's syscall entry, and the SPURS kernel's entry points a game's own policy module may reach (spurs_custom.cpp):
 // select workload (0x290, [0x1E4]), the return from a module (0x804) and the exit to the kernel (0x808, [0x1E0]).
 constexpr u32 kSyscallStop = ls::pm_syscall;
+// The return address of a job (job chains).
+constexpr u32 kJobReturnStop = ls::jc_return;
 constexpr u32 kKernelSelect = 0x290, kKernelReturn = 0x804, kKernelExit = 0x808;
 constexpr u32 kKernelSelectStop = kKernelSelect, kKernelExitStop = kKernelExit;
 // "Idle": the SPURS kernel's ID for the system service workload, which a native worker never runs.
@@ -128,8 +138,8 @@ public:
     const u32 spurs;
     Instance& inst;
     std::atomic<bool> stopping{false};
-    // Workloads whose policy is not implemented natively (job chains, custom policy modules): left out of the
-    // selection after the first time a worker picked one, which is logged.
+    // Workloads the native scheduler does not know (not registered through the HLE API): left out of the selection
+    // after the first time a worker picked one, which is logged.
     std::atomic<u32> unsupported{0};
 
 private:
@@ -141,6 +151,9 @@ private:
 void run_taskset(Worker& w, u32 wid, u32 taskset, u32 poll_status);
 // A game's own policy module (cellSpursAddWorkload; spurs_custom.cpp): runs it on `w` until it returns to the kernel.
 void run_custom(Worker& w, u32 wid, u32 poll_status);
+// The native job chain policy module (spurs_jobchain.cpp): runs the chain's jobs on `w` until the chain has no work for
+// this SPU or another workload should run.
+void run_jobchain(Worker& w, u32 wid, u32 job_chain);
 
 // Kernel helpers the policy uses.
 // Adds `n` to the workload's ready count in CellSpurs line 0 (clamped to 0..255; a decrement that would go below 0 waits,

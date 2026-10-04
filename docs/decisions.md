@@ -672,6 +672,65 @@ stopped making progress. Since then, `pspocket-boot` prints a thread and wait re
 - **How.** lv2 waiters record what they wait on, and each PPU thread records its current syscall. This costs a few
   atomic stores on the slow (blocking) path only (`runtime/lv2/report.hpp`).
 
+## D-054 · 2026-10-04 · CellSpursJobChain follows libsre's layout, not RPCS3's
+
+Job chains are created as libsre creates them (fw 4.92, read as the reference, D-046). RPCS3's `cellSpurs.h` and
+`_spurs::create_job_chain` differ from libsre in four places, and a job chain policy that follows libsre depends on all
+of them:
+- **0x70 / 0x72.** 0x70 is sizeJobDescriptor (u16) and 0x72 maxGrabbedJob (u16). RPCS3 writes maxGrabbedJob at 0x70
+  and nothing at 0x72, so a libsre-style policy would grab no commands and never advance.
+- **0x24 autoReadyCount.** Create writes the attribute's autoSpuCount there; it selects the ready count policy.
+- **haltOnError.** The attribute keeps the name at 0x34 and haltOnError at 0x38 (RPCS3 swaps them), and create ORs
+  haltOnError into the chain's flags byte (0x2C, bit 2).
+- **The job error codes** the policy raises (0x80410A0B..0x80410A1F) are RPCS3's names with libsre's meaning.
+
+## D-055 · 2026-10-04 · Native job chain policy: libsre's contract, jobs run one at a time
+
+Runs 022 to 028 (D-037 stage 5). `spurs_jobchain.cpp` runs a job chain on the native workers the way libsre's job
+chain policy module (the one cellSpursCreateJobChainWithAttribute registers) does, without running it. RPCS3 has no
+job chain policy (its `spursJobChainEntry` is empty).
+- **What a job sees** is libsre's contract. Its binary sits at a 1 KB page from LS 0x4C00 and is entered at its first
+  byte with $3 = its context (CellSpursJobContext2 at 0x4940: input, cache, output and scratch buffers, buffer counts,
+  DMA tag, descriptor EA), $4 = the LS copy of its descriptor, $126 = the binary's LS address (job code is position
+  independent) and $sp 0x30 below the top of its scratch + stack, with libsre's terminating frame. A job runs to
+  completion and puts its own output. LS 0x80..0x17F stay free for job code and the kernel context stays valid.
+- **The guest protocol** is libsre's, so several workers and the PPU agree on the chain. A visit takes the chain's lock
+  byte (0x29) through the reservation system, edits a copy of line 0, executes the commands at pc as guest memory has
+  them then (the PPU rewrites END and JTS in place) and releases the lock, merging back only the urgent command slots,
+  isHalted and maxGrabbedJob. Every command libsre knows is implemented: JOB, NOP, RESET_PC, SYNC, LWSYNC and their
+  label forms, SET_LABEL, NEXT, CALL/RET (three deep), FLUSH, JOBLIST, GUARD, ABORT, END, JTS and urgent commands.
+- **Ready count.** After every visit: busy SPUs + 1 with autoReadyCount, the requested count without it, 0 at END or a
+  blocked guard, 1 at a blocked SYNC.
+- **Memory.** Buffers are libsre's 1 KB pages, best fit, from 0x4C00 up to the four descriptor buffers. Binaries and
+  cache elements stay in LS between jobs while the policy stays on the SPU (libsre's LS cache, eight entries, LRU), so
+  a binary's data keeps its values from one job to the next. The previous job's scratch + stack is kept only for a job
+  of the same size, and freed before the next job's buffers otherwise.
+- **Errors** follow libsre's error path: isHalted, the workload shut down (unless the chain halts on errors), the error
+  and cause at jc+0x80/0x88. With haltOnError (GTA V's chains) libsre halts the SPU, so it is fatal here.
+
+Deviations, all because jobs run one at a time on a worker:
+- A job's descriptor, binary and input are loaded when it starts, not while the previous job runs.
+- An SPU that leaves the chain after running jobs makes one more visit without taking jobs, so its busy bit does not
+  hold up a SYNC on another SPU.
+- When a job's buffers don't fit as the pages are laid out (GTA V's Secondary chain has jobs that need 232 of the 234
+  pages), the job is laid out again in an emptied heap (cached binaries and the kept scratch + stack dropped). libsre
+  makes room by rolling back what it fetched ahead.
+- A visit that changes nothing (a JTS waiting for the PPU) is followed by a short sleep instead of libsre's spin.
+
+Not implemented (fatal when a chain asks for them): the memory check (jobType bit 1, jobMemoryCheck), trace packets,
+the exception event handler.
+
+## D-056 · 2026-10-04 · Polls consume the current workload's signal; SPU code sets event flag bits
+
+Two scheduler changes found by GTA V's job chains (runs 022 and 023):
+- **Polls.** When a worker's poll keeps the workload it runs, the poll consumes that workload's signal and the workload
+  flag, as SPURS kernel 1 does (libsre select: not a poll, or the selection is the current workload; RPCS3
+  `spursKernel1SelectWorkload`). Before, only a dispatch consumed them, so a chain kicked again while it ran kept its
+  SPU after its END forever.
+- **Event flag bits.** SPU code's interrupt-mailbox codes 128 (`sys_event_flag_set_bit`, answers in the inbound
+  mailbox) and 192 (`..._impatient`, no answer) set bit `value & 0xFFFFFF` of the lv2 event flag whose ID is in the
+  outbound mailbox (RPCS3 SPUThread.cpp `set_ch_value`). GTA V's Secondary chain wakes its audio mix thread this way.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

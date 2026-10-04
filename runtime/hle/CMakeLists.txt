@@ -13,6 +13,7 @@ add_library(pspocket_hle STATIC
     src/psf.cpp
     src/sceNp.cpp
     src/spurs_custom.cpp
+    src/spurs_jobchain.cpp
     src/spurs_scheduler.cpp
     src/spurs_taskset.cpp
     src/sysPrxForUser.cpp

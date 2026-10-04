@@ -48,16 +48,49 @@ constexpr u64 SYS_SPU_THREAD_EVENT_USER_KEY = 0xFFFFFFFF53505501ull;
 // which the worker reports).
 int worker_stop(SPUContext*, uint32_t) { return 0; }
 
+// sys_event_flag_set_bit (code 128, answers in the inbound mailbox) and sys_event_flag_set_bit_impatient (192, does
+// not): bit `value & 0xFFFFFF` of the lv2 event flag whose ID is in the outbound mailbox (RPCS3 SPUThread.cpp
+// set_ch_value, SPU_WrOutIntrMbox).
+int event_flag_set_bit(Worker& w, SPUContext* ctx, u32 value)
+{
+    const u32 code = value >> 24, bit = value & 0xFFFFFF;
+    if (!ctx->ch.out_mbox_count) {
+        PS_FATAL(kSchedChan, "SPURS {:#x} SPU {}: sys_event_flag_set_bit{}(bit {}) with an empty outbound mailbox at "
+            "0x{:05x}", w.sched.spurs, w.spu_num, code == 192 ? "_impatient" : "", bit, ctx->pc);
+    }
+    const u32 id = ctx->ch.out_mbox;
+    ctx->ch.out_mbox_count = 0;
+    if (bit > 63) {
+        PS_FATAL(kSchedChan, "SPURS {:#x} SPU {}: sys_event_flag_set_bit{}(event flag {:#x}, bit {}) at 0x{:05x}: no such "
+            "bit", w.sched.spurs, w.spu_num, code == 192 ? "_impatient" : "", id, bit, ctx->pc);
+    }
+    lv2::Result r = lv2::err(lv2::CELL_ESRCH);
+    if (const auto flag = w.sched.kernel.event_flag(id)) {
+        flag->set(u64{1} << bit);
+        r = lv2::CELL_OK;
+    }
+    PS_LOG_DEBUG(kSchedChan, "SPURS {:#x} SPU {}: sys_event_flag_set_bit{}(event flag {:#x}, bit {}) -> {}", w.sched.spurs,
+        w.spu_num, code == 192 ? "_impatient" : "", id, bit, lv2::error_name(r));
+    if (r != lv2::CELL_OK) {
+        PS_LOG_WARN(kSchedChan, "SPURS {:#x} SPU {}: event flag {:#x} bit {} not set: {}", w.sched.spurs, w.spu_num, id, bit,
+            lv2::error_name(r));
+    }
+    if (code == 128) ps_spu_write_in_mbox(ctx, static_cast<u32>(r));
+    return 0;
+}
+
 // sys_spu_thread_send_event / throw_event from SPU code (codes 0..127 in the interrupt mailbox, the data word in the
 // outbound mailbox), through the instance's SPU port map (D-040), as RPCS3 SPUThread.cpp set_ch_value
-// (SPU_WrOutIntrMbox). send_event (0..63) also answers in the inbound mailbox; throw_event (64..127) does not.
+// (SPU_WrOutIntrMbox). send_event (0..63) also answers in the inbound mailbox; throw_event (64..127) does not. Codes
+// 128 and 192 set event flag bits.
 int worker_intr_mbox(SPUContext* ctx, uint32_t value)
 {
     Worker& w = *static_cast<Worker*>(ctx->runtime);
     const u32 code = value >> 24;
+    if (code == 128 || code == 192) return event_flag_set_bit(w, ctx, value);
     if (code >= 128) {
         PS_FATAL(kSchedChan, "SPURS {:#x} SPU {}: interrupt mailbox code {:#x} (value {:#010x}) at 0x{:05x} is not "
-            "implemented (sys_event_flag_set_bit?)", w.sched.spurs, w.spu_num, code, value, ctx->pc);
+            "implemented", w.sched.spurs, w.spu_num, code, value, ctx->pc);
     }
     const u8 port = static_cast<u8>(code & 63);
     if (!ctx->ch.out_mbox_count) {
@@ -263,7 +296,18 @@ Worker::Selection Worker::select(bool poll)
                                   (wkl_flag ? CELL_SPURS_MODULE_POLL_STATUS_FLAG : 0);
             }
         }
-        if (poll) return changed;
+        if (poll) {
+            // A poll that keeps the current workload consumes its signal and the workload flag, as a dispatch does
+            // (libsre kernel 1 select: !isPoll || selected == current; RPCS3 spursKernel1SelectWorkload). A chain or
+            // taskset signalled again while it runs is then picked up by this poll, not left signalled forever.
+            if (sel.wid != current_wid || sel.wid >= CELL_SPURS_MAX_WORKLOAD) return changed;
+            const u16 bit = static_cast<u16>(0x8000u >> sel.wid);
+            const bool take_flag = sel.wid == flag_receiver && flag != 0xFFFFFFFF;
+            if (!(signal & bit) && !take_flag) return changed;
+            ps_write16(line, wkl_off::signal1, static_cast<u16>(signal & ~bit));
+            if (take_flag) ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
+            return true;
+        }
         if (sel.wid < CELL_SPURS_MAX_WORKLOAD) {
             ps_write16(line, wkl_off::signal1, static_cast<u16>(signal & ~(0x8000u >> sel.wid)));
             if (sel.wid == flag_receiver) ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
@@ -311,13 +355,20 @@ void Worker::run_workload(const Selection& sel)
         run_custom(*this, sel.wid, sel.poll_status);
         return;
     }
-    // Not run natively yet: logged once, then left out of the selection (CLAUDE.md rule 5: loud, not silent).
+    if (known && wkl.kind == Workload::Kind::JobChain) {
+        // The job chain module's image replaces whatever policy module was in local store.
+        ps_write64(ls, ls::k_wkl_addr, ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_addr));
+        ps_write32(ls, ls::k_wkl_unique, ps_read8(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_unique));
+        run_jobchain(*this, sel.wid, wkl.arg);
+        return;
+    }
+    // A workload the HLE API did not register: logged once, then left out of the selection (CLAUDE.md rule 5: loud,
+    // not silent).
     const u32 bit = 1u << sel.wid;
     if (!(sched.unsupported.fetch_or(bit) & bit)) {
         const u64 pm = ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_addr);
-        PS_LOG_ERROR(kSchedChan, "SPURS {:#x}: workload {} ({}, policy module {:#x}, argument {:#x}) has work, but its "
-            "policy is not implemented natively; it does not run", sched.spurs, sel.wid,
-            !known ? "unknown" : wkl.kind == Workload::Kind::JobChain ? "job chain" : "custom policy module", pm,
+        PS_LOG_ERROR(kSchedChan, "SPURS {:#x}: workload {} (policy module {:#x}, argument {:#x}) has work, but the native "
+            "scheduler does not know it; it does not run", sched.spurs, sel.wid, pm,
             ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_arg));
     }
 }

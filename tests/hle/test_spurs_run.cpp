@@ -1,6 +1,7 @@
 // The native SPURS scheduler running synthetic SPU tasks (built in code with the SPU assembler: no game data):
 // a task that exits, one that waits for a signal and resumes from its context save area, a PPU event flag set waking
-// a waiting task, an SPU-to-PPU event through a SPURS port, and two tasks yielding to each other on one SPU.
+// a waiting task, an SPU-to-PPU event through a SPURS port, event flag bits set from SPU code, and two tasks yielding
+// to each other on one SPU.
 
 #include "hle_test_util.hpp"
 
@@ -284,6 +285,48 @@ TEST_CASE("SPURS workers: an SPU task throws an event to the PPU through a SPURS
     CHECK(ev.source == 0xFFFFFFFF53505501ull); // SYS_SPU_THREAD_EVENT_USER_KEY
     CHECK(ev.data2 == ((u64{5} << 32) | 0x123));
     CHECK(ev.data3 == 0x777);
+}
+
+TEST_CASE("SPURS workers: SPU code sets lv2 event flag bits through its interrupt mailbox", "[hle][spurs][spurs-run]")
+{
+    SpursFixture s;
+    u8* b = s.base;
+    std::memset(b + kQueueAttr, 0, 32);      // sys_event_flag_attribute_t
+    ps_write32(b, kQueueAttr + 0, 2);        // SYS_SYNC_PRIORITY
+    ps_write32(b, kQueueAttr + 4, 0x200);    // SYS_SYNC_NOT_PROCESS_SHARED
+    ps_write32(b, kQueueAttr + 20, 0x20000); // SYS_SYNC_WAITER_MULTIPLE
+    REQUIRE(lv2::sys_event_flag_create(*s.a.t, kQueueId, kQueueAttr, 0) == lv2::CELL_OK);
+    const u32 flag = ps_read32(b, kQueueId);
+
+    // sys_event_flag_set_bit_impatient(flag, 5) (code 192, no answer), sys_event_flag_set_bit(flag, 40) (code 128)
+    // and set_bit on a flag that doesn't exist, whose answers the task stores at its argument's EA.
+    Program p;
+    p.emit(as::ila(1, 0x3FFD0));
+    p.emit(as::ori(81, 3, 0)); // the output EA (argument word 0)
+    p.load32(20, flag);
+    p.emit(as::wrch(PS_SPU_WrOutMbox, 20));
+    p.load32(21, (192u << 24) | 5);
+    p.emit(as::wrch(PS_SPU_WrOutIntrMbox, 21));
+    p.emit(as::wrch(PS_SPU_WrOutMbox, 20));
+    p.load32(21, (128u << 24) | 40);
+    p.emit(as::wrch(PS_SPU_WrOutIntrMbox, 21));
+    p.emit(as::rdch(22, PS_SPU_RdInMbox));
+    p.put(22, 81, 0);
+    p.load32(20, flag + 0x100);
+    p.emit(as::wrch(PS_SPU_WrOutMbox, 20));
+    p.emit(as::wrch(PS_SPU_WrOutIntrMbox, 21));
+    p.emit(as::rdch(22, PS_SPU_RdInMbox));
+    p.put(22, 81, 16);
+    p.syscall(0);
+    write_task_elf(b, kElf, p);
+    ps_write32(b, kArg, kOut);
+    ps_write32(b, kOut + 16, 0xFFFFFFFF);
+    REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
+
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 16) != 0xFFFFFFFF; }));
+    CHECK(s.f.kernel->event_flag(flag)->get() == ((u64{1} << 40) | (u64{1} << 5)));
+    CHECK(ps_read32(b, kOut) == 0);                                                // CELL_OK
+    CHECK(ps_read32(b, kOut + 16) == static_cast<u32>(lv2::err(lv2::CELL_ESRCH))); // no such flag
 }
 
 TEST_CASE("SPURS workers: two tasks yield to each other on one SPU", "[hle][spurs][spurs-run]")

@@ -556,16 +556,19 @@ TEST_CASE("cellSpurs job chains: 14-argument attribute (stack arguments), creati
     CHECK(ps_read32(base, kJcAttr + 0x30) == 3);    // initSpuCount (stack argument 14)
     REQUIRE(a.call("cellSpursJobChainAttributeSetName", kJcAttr, kName) == 0);
     REQUIRE(a.call("cellSpursJobChainAttributeSetHaltOnError", kJcAttr) == 0);
-    CHECK(ps_read32(base, kJcAttr + 0x34) == 1);
+    CHECK(ps_read32(base, kJcAttr + 0x34) == kName); // libsre: name at 0x34, haltOnError at 0x38 (RPCS3 swaps them)
+    CHECK(ps_read32(base, kJcAttr + 0x38) == 1);
 
     REQUIRE(a.call("cellSpursCreateJobChainWithAttribute", kSpurs, kJc, kJcAttr) == 0);
     CHECK(ps_read64(base, kJc + 0x00) == kEntry);  // pc
     CHECK(ps_read64(base, kJc + 0x78) == kSpurs);
     CHECK(ps_read32(base, kJc + 0x74) == 0);       // workloadId
-    CHECK(ps_read16(base, kJc + 0x70) == 4);       // maxGrabbedJob
+    CHECK(ps_read16(base, kJc + 0x70) == 0x80);    // sizeJobDescriptor (libsre; RPCS3 puts maxGrabbedJob here)
+    CHECK(ps_read16(base, kJc + 0x72) == 4);       // maxGrabbedJob
+    CHECK(ps_read8(base, kJc + 0x24) == 1);        // autoReadyCount
     CHECK(ps_read8(base, kJc + 0x2A) == 20);
     CHECK(ps_read8(base, kJc + 0x2B) == 21);
-    CHECK(ps_read8(base, kJc + 0x2C) == (0x80 | (2 << 4))); // fixed memory, (0x200 - 0x100) / 128
+    CHECK(ps_read8(base, kJc + 0x2C) == (0x80 | (2 << 4) | 0x04)); // fixed memory, (0x200 - 0x100) / 128, haltOnError
     CHECK(ps_read8(base, kJc + 0x2D) == 3);        // jmVer from the attribute
     CHECK(ps_read8(base, kJc + 0x28) == 3);        // initSpuCount
     CHECK(ps_read32(base, kJc + 0x90) == 0x330000);

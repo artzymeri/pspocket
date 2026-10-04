@@ -1,8 +1,8 @@
 #pragma once
 
 // Native SPURS internals shared by cellSpurs.cpp (the PPU API) and the native scheduler and policies
-// (spurs_scheduler.cpp, spurs_taskset.cpp): error codes, guest structure offsets (RPCS3 cellSpurs.h layouts, checked
-// against libsre where noted, D-047) and the host side of each SPURS instance.
+// (spurs_scheduler.cpp, spurs_taskset.cpp, spurs_jobchain.cpp, spurs_custom.cpp): error codes, guest structure offsets
+// (RPCS3 cellSpurs.h layouts, checked against libsre where noted, D-047) and the host side of each SPURS instance.
 
 #include <map>
 #include <memory>
@@ -54,9 +54,20 @@ enum : u32 {
     CELL_SPURS_JOB_ERROR_AGAIN = 0x80410A01,
     CELL_SPURS_JOB_ERROR_INVAL = 0x80410A02,
     CELL_SPURS_JOB_ERROR_PERM = 0x80410A09,
+    CELL_SPURS_JOB_ERROR_JOB_DESCRIPTOR = 0x80410A0B,
+    CELL_SPURS_JOB_ERROR_JOB_DESCRIPTOR_SIZE = 0x80410A0C,
     CELL_SPURS_JOB_ERROR_STAT = 0x80410A0F,
     CELL_SPURS_JOB_ERROR_ALIGN = 0x80410A10,
     CELL_SPURS_JOB_ERROR_NULL_POINTER = 0x80410A11,
+    CELL_SPURS_JOB_ERROR_MEMORY_SIZE = 0x80410A17,
+    CELL_SPURS_JOB_ERROR_UNKNOWN_COMMAND = 0x80410A18,
+    CELL_SPURS_JOB_ERROR_JOBLIST_ALIGNMENT = 0x80410A19,
+    CELL_SPURS_JOB_ERROR_JOB_ALIGNMENT = 0x80410A1A,
+    CELL_SPURS_JOB_ERROR_CALL_OVERFLOW = 0x80410A1B,
+    CELL_SPURS_JOB_ERROR_ABORT = 0x80410A1C,
+    CELL_SPURS_JOB_ERROR_DMALIST_ELEMENT = 0x80410A1D,
+    CELL_SPURS_JOB_ERROR_NUM_CACHE = 0x80410A1E,
+    CELL_SPURS_JOB_ERROR_INVALID_BINARY = 0x80410A1F,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -147,6 +158,30 @@ constexpr u32 spurs = 0x60, args = 0x68, enable_clear_ls = 0x70, wkl_flag_wait_t
               size = 0x1890;
 }
 
+// CellSpursJobChainAttribute (8-aligned) and CellSpursJobChain (128-aligned; create clears 0x110 bytes), as libsre
+// lays them out (fw 4.92, D-054). RPCS3's cellSpurs.h swaps the attribute's name and haltOnError, puts maxGrabbedJob
+// where sizeJobDescriptor is and has no autoReadyCount.
+namespace jcattr_off {
+constexpr u32 jmVer = 0x00, sdkVer = 0x04, jobChainEntry = 0x08, sizeJobDescriptor = 0x0C, maxGrabbedJob = 0x0E,
+              priorities = 0x10, maxContention = 0x18, autoSpuCount = 0x1C, tag1 = 0x20, tag2 = 0x24,
+              isFixedMemAlloc = 0x28, maxSizeJobDescriptor = 0x2C, initSpuCount = 0x30, name = 0x34,
+              haltOnError = 0x38, jobMemoryCheck = 0x3C;
+}
+namespace jc_off {
+// 0x08: the call stack (3 u64, [2] the top); 0x20: an urgent call or job list is active; 0x21: FLUSH requests, 0x22:
+// SPUs that stop taking jobs until their next poll, 0x25: SPUs with jobs in flight, 0x26/0x27: label request and
+// pending masks (a bit per SPU); 0x28: the requested SPU count without autoReadyCount; 0x29: the lock of line 0;
+// 0x2E: the ready count last stored; 0x30: four urgent command slots; 0x50/0x60: the active job lists (main stream,
+// urgent).
+constexpr u32 pc = 0x00, linkRegister = 0x08, urgentList = 0x20, flush = 0x21, lowered = 0x22, isHalted = 0x23,
+              autoReadyCount = 0x24, busy = 0x25, labelRequest = 0x26, labelPending = 0x27, initSpuCount = 0x28,
+              lock = 0x29, tag1 = 0x2A, tag2 = 0x2B, flags = 0x2C, jmVer = 0x2D, readyCount = 0x2E, val2F = 0x2F,
+              urgentCmds = 0x30, jobLists = 0x50, sizeJobDescriptor = 0x70, maxGrabbedJob = 0x72, workloadId = 0x74,
+              spurs = 0x78, error = 0x80, cause = 0x88, sdkVer = 0x90, jobMemoryCheck = 0x94;
+// flags (0x2C): isFixedMemAlloc, (maxSizeJobDescriptor - 0x100) / 0x80, waiting on a guard, haltOnError.
+constexpr u8 flagFixedMem = 0x80, flagMaxSizeMask = 0x70, flagGuardWait = 0x08, flagHaltOnError = 0x04;
+} // namespace jc_off
+
 // sys_spu_image {type, entry_point, segs, nsegs} and CellSpurs::WorkloadInfo {addr (u64), arg, size, uniqueId, ...}.
 constexpr u32 SYS_SPU_IMAGE_TYPE_USER = 0;
 
@@ -193,9 +228,9 @@ constexpr u32 events = 0x00, spuTaskPendingRecv = 0x02, ppuWaitMask = 0x04, ppuW
 // ------------------------------------------------------------------------------------------------- native scheduler
 
 // Starts the scheduler of an initialized instance: `inst.nspus` host workers that run its workloads (the SPURS
-// kernel's selection rules, then the workload's policy: the native taskset policy; job chains and custom policy
-// modules are not run yet). Workers sleep while nothing is ready and wake on any change to CellSpurs line 0, as the
-// SPURS kernel's idle loop does. Called with the host mutex held.
+// kernel's selection rules, then the workload's policy: the native taskset and job chain policies, or the game's own
+// policy module). Workers sleep while nothing is ready and wake on any change to CellSpurs line 0, as the SPURS
+// kernel's idle loop does. Called with the host mutex held.
 void start_scheduler(SpursHost& host, lv2::Kernel& kernel, u32 spurs, Instance& inst);
 // Stops and joins the workers (cellSpursFinalize; the process end does it through the Scheduler's destructor). Not
 // called with the host mutex held: the workers take it.
