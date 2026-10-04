@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <random>
 
 #include "pspocket/core/log.hpp"
@@ -78,7 +79,7 @@ double compare_decode(GpuFixture& g, const TextureInfo& t, u32 face, u32 level, 
             const auto a = to_u8(cpu[i]), b = to_u8(gpu[i]);
             for (u32 c = 0; c < 4; c++) worst = std::max(worst, static_cast<double>(std::abs(a[c] - b[c])));
         } else {
-            for (u32 c = 0; c < 4; c++) worst = std::max(worst, std::abs(static_cast<double>(cpu[i][c]) - gpu[i][c]));
+            for (u32 c = 0; c < 4; c++) worst = std::max(worst, std::abs(static_cast<double>(cpu[i][c]) - static_cast<double>(gpu[i][c])));
         }
     }
     return worst;
@@ -460,10 +461,12 @@ struct E2E {
     std::vector<Failure> failures;
     std::vector<metal::PresentFrame> presents;
     std::vector<std::vector<u8>> present_pixels; // BGRA8 of each presented frame
+    std::mutex capture_mutex;
+    std::vector<std::pair<u64, std::vector<u8>>> captures; // (flip index, BGRA8) from the capture hook
     static constexpr u32 kCmdEa = 0x00200000;
     static constexpr u32 kReadbackEa = 0x00400000; // main memory, IO 0x00100000
 
-    E2E()
+    explicit E2E(u32 capture_every = 0)
     {
         PS_CHECK(mem.reserve());
         PS_CHECK(mem.commit(kCmdEa, 0x100000));
@@ -493,6 +496,11 @@ struct E2E {
             [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
                 (*store)[index].assign(static_cast<const u8*>(buf.contents), static_cast<const u8*>(buf.contents) + bytes);
             }];
+        };
+        mc.capture_every = capture_every;
+        mc.capture = [this](const u8* bgra, u32 w, u32 h, u64 flip) {
+            std::lock_guard lock(capture_mutex);
+            captures.emplace_back(flip, std::vector<u8>(bgra, bgra + usize{w} * h * 4));
         };
         backend = std::make_unique<MetalBackend>(mem, *tracker, mc);
         rsx = std::make_unique<Rsx>(mem, *backend, config);
@@ -893,6 +901,36 @@ TEST_CASE("metal e2e: flip presents the display buffer scaled to the output size
     CHECK(bgra(4, 4) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});   // blue
     CHECK(e.backend->stats().flips == 1);
     CHECK(e.rsx->flip_count() == 1);
+}
+
+TEST_CASE("metal e2e: every Nth flip is also copied to the CPU (capture)")
+{
+    REQUIRE_METAL();
+    E2E e(2);
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    e.rsx->set_display_buffer(0, {kSurfaceOffset, kW * 4, kW, kH});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    for (u32 color : {0xff00ff00u, 0xff0000ffu}) { // green, then blue
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, color);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        draw_triangle(b);
+        b.method(m::GCM_FLIP_COMMAND, 0);
+    }
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    e.backend->sync();
+    std::lock_guard lock(e.capture_mutex);
+    REQUIRE(e.captures.size() == 1); // flip 2 only
+    CHECK(e.captures[0].first == 2);
+    REQUIRE(e.present_pixels.size() == 2);
+    CHECK(e.captures[0].second == e.present_pixels[1]);
+    const auto& px = e.captures[0].second;
+    CHECK(std::array<u8, 4>{px[(4 * 128 + 4) * 4], px[(4 * 128 + 4) * 4 + 1], px[(4 * 128 + 4) * 4 + 2], 0xff} ==
+          std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the blue clear, in BGRA
 }
 
 TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")

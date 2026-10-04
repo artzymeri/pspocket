@@ -873,6 +873,27 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
     [enc endEncoding];
+    if (config.capture && config.capture_every && request.flip_index % config.capture_every == 0) {
+        // Copy the output to a shared buffer and hand it over once the GPU has finished the frame.
+        const u32 w = config.output_width, h = config.output_height;
+        id<MTLBuffer> readback = [device newBufferWithLength:NSUInteger{w} * h * 4 options:MTLResourceStorageModeShared];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromTexture:output
+                     sourceSlice:0
+                     sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0)
+                      sourceSize:MTLSizeMake(w, h, 1)
+                        toBuffer:readback
+               destinationOffset:0
+          destinationBytesPerRow:NSUInteger{w} * 4
+        destinationBytesPerImage:NSUInteger{w} * h * 4];
+        [blit endEncoding];
+        CaptureCallback capture = config.capture;
+        const u64 index = request.flip_index;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+            capture(static_cast<const u8*>(readback.contents), w, h, index);
+        }];
+    }
     frame_event_value++;
     [cb encodeSignalEvent:frame_event value:frame_event_value];
 

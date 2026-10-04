@@ -14,7 +14,7 @@
 //  - Render passes: one per surface configuration, loading only initialised attachments; full-surface clears at
 //    the start of a pass become load-action clears; every attachment is stored (render targets stay on the GPU).
 //  - Flip: the display buffer is scaled into an output texture (1152x640 by default, D-016) and handed to the
-//    host's present callback; the host does MetalFX and pacing.
+//    host's present callback; the host does MetalFX and pacing. Chosen flips are also copied to the CPU (capture).
 
 #include <array>
 #include <functional>
@@ -46,6 +46,9 @@ struct PresentFrame {
 };
 
 using PresentCallback = std::function<void(const PresentFrame&)>;
+// A presented image on the CPU: BGRA8 bytes, rows top to bottom (width * 4 bytes each), and the flip it came from.
+// Called on a Metal completion thread once the GPU has finished the frame; the bytes are only valid during the call.
+using CaptureCallback = std::function<void(const u8* bgra, u32 width, u32 height, u64 flip_index)>;
 
 struct MetalBackendConfig {
     void* device = nullptr;      // id<MTLDevice>; nullptr = MTLCreateSystemDefaultDevice()
@@ -54,6 +57,10 @@ struct MetalBackendConfig {
     PresentCallback present;
     bool use_bc_textures = true; // DXT -> BC1-3 directly when supported; false forces the compute decoder
     u32 frames_in_flight = 3;
+    // Every capture_every-th flip (0: none) is also copied to the CPU and handed to `capture` (debug output: frame
+    // dumps on the Mac).
+    CaptureCallback capture;
+    u32 capture_every = 0;
 };
 
 struct BackendStats {

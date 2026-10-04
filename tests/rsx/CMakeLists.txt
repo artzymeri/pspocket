@@ -5,3 +5,14 @@ pspocket_add_test(test_rsx
     SOURCES test_fifo.cpp test_state.cpp test_methods.cpp test_shader.cpp test_texture.cpp test_write_tracker.cpp
     LIBS pspocket::rsx)
 target_include_directories(test_rsx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Metal backend end to end (Objective-C++ with ARC; Apple platforms with a Metal device, else the cases skip).
+if(TARGET pspocket::rsx_metal)
+    enable_language(OBJCXX)
+    pspocket_add_test(test_rsx_metal
+        SOURCES test_metal.mm
+        LIBS pspocket::rsx_metal)
+    target_include_directories(test_rsx_metal PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(test_rsx_metal PRIVATE -fobjc-arc)
+    set_target_properties(test_rsx_metal PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON OBJCXX_EXTENSIONS OFF)
+endif()
