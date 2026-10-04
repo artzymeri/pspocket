@@ -141,6 +141,60 @@ TEST_CASE("vertex program MSL for the supported subset")
     CHECK(r.shader.input_mask == ((1u << 0) | (1u << 3) | (1u << 8)));
 }
 
+TEST_CASE("vertex program condition codes: an update to CC1 and conditional writes")
+{
+    // SLT CC1.xy, v[0], c[0]: neither an output nor a temp, so the result goes to CC1 (RPCS3 GetDST).
+    VpInst set;
+    set.vec_op = static_cast<u32>(VpVecOp::SLT);
+    set.src[0] = vp_in();
+    set.src[1] = vp_const();
+    set.vec_result = false;
+    set.vec_mask = mask("xy");
+    set.cond_update = true;
+    set.cond_reg = 1;
+    // MOV o[0] (GT CC1.yyyy), v[0]: a conditional write of the whole output.
+    VpInst mov;
+    mov.vec_op = static_cast<u32>(VpVecOp::MOV);
+    mov.src[0] = vp_in();
+    mov.out = 0;
+    mov.vec_mask = 0xf;
+    mov.cond_test = true;
+    mov.cond = 4; // gt
+    mov.cond_reg = 1;
+    mov.cond_sw = {1, 1, 1, 1};
+    // MOV R2.xz (LE CC1), v[0]: masked; and RCP o[7].x with cond 0 (never) is dropped.
+    VpInst le;
+    le.vec_op = static_cast<u32>(VpVecOp::MOV);
+    le.src[0] = vp_in();
+    le.vec_result = false;
+    le.vec_temp = 2;
+    le.vec_mask = mask("xz");
+    le.cond_test = true;
+    le.cond = 3; // lt | eq
+    le.cond_reg = 1;
+    VpInst never;
+    never.sca_op = static_cast<u32>(VpScaOp::RCP);
+    never.vec_result = false;
+    never.out = 7;
+    never.sca_mask = mask("x");
+    never.cond_test = true;
+    never.cond = 0;
+    never.end = true;
+    const auto words = assemble_vp({set, mov, le, never});
+    const auto vp = decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
+    REQUIRE(vp.has_value());
+    const TranslateResult r = translate_vertex_program(*vp);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    const std::string& s = r.shader.source;
+    INFO(s);
+    CHECK(s.find("float4 cc0 = float4(0.0), cc1 = float4(0.0);") != std::string::npos);
+    CHECK(s.find("cc1.xy = vec.xy;") != std::string::npos);
+    CHECK(s.find("o0 = select(o0, vec, (cc1.yyyy > float4(0.0)));") != std::string::npos);
+    CHECK(s.find("r2.xz = select(r2.xz, vec.xz, (cc1 <= float4(0.0)).xz);") != std::string::npos);
+    CHECK(s.find("o7.x =") == std::string::npos);
+}
+
 TEST_CASE("unsupported vertex program features are named")
 {
     std::vector<VpInst> prog = sample_vp();
@@ -361,6 +415,48 @@ TEST_CASE("fragment program condition codes: set, conditional writes and a condi
     const TranslateResult n = translate_fragment_program(*nf, opt);
     REQUIRE(n.ok);
     CHECK(n.shader.source.find("select(") == std::string::npos);
+}
+
+TEST_CASE("fragment program DIVSQ, PK16, UP16 and RET")
+{
+    // R1 = DIVSQ(f[COL0], c), R2 = PK16(R1), R3 = UP16(R2), RET (GT RC0), R0 = R3
+    FpInst divsq;
+    divsq.op = static_cast<u32>(FpOp::DIVSQ);
+    divsq.dst = 1;
+    divsq.input = 1;
+    divsq.src[0] = fp_in();
+    divsq.src[1] = fp_const();
+    divsq.constant = std::array<float, 4>{4.f, 0.f, 0.f, 0.f};
+    FpInst pk;
+    pk.op = static_cast<u32>(FpOp::PK16);
+    pk.dst = 2;
+    pk.src[0] = fp_r(1);
+    FpInst up;
+    up.op = static_cast<u32>(FpOp::UP16);
+    up.dst = 3;
+    up.src[0] = fp_r(2);
+    FpInst ret;
+    ret.op = static_cast<u32>(FpOp::RET);
+    ret.exec_lt = ret.exec_eq = false;
+    FpInst out;
+    out.op = static_cast<u32>(FpOp::MOV);
+    out.src[0] = fp_r(3);
+    out.end = true;
+    const auto bytes = assemble_fp({divsq, pk, up, ret, out});
+    const auto fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
+    REQUIRE(fp.has_value());
+    const TranslateResult r = translate_fragment_program(*fp);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    const std::string& s = r.shader.source;
+    INFO(s);
+    CHECK(s.find("rsx_divsq(") != std::string::npos);
+    CHECK(s.find("select(a, a / sqrt(abs(b)), abs(a) > 0.0)") != std::string::npos); // a zero numerator stays zero
+    CHECK(s.find("pack_float_to_unorm2x16(") != std::string::npos);
+    CHECK(s.find("unpack_unorm2x16_to_float(as_type<uint>(") != std::string::npos);
+    CHECK(s.find("do {") != std::string::npos);
+    CHECK(s.find("if (any((cc0 > float4(0.0)))) break;") != std::string::npos);
+    CHECK(s.find("} while (false);") < s.find("out.c0 = "));
 }
 
 TEST_CASE("unsupported fragment program features are named")

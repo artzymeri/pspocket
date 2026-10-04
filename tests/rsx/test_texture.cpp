@@ -216,6 +216,11 @@ TEST_CASE("remap decoding and channel sources")
     // X32_FLOAT replicates its single channel and ignores remap sources
     const TextureFormatInfo& x32 = *texture_format_info(tex::X32_FLOAT);
     CHECK(texture_channel_sources(x32, 0xaa1b) == std::array<u8, 4>{0, 0, 0, 0});
+    // RPCS3's base mappings (A, R, G, B): X16 {R, 1, R, 1}, Y16_X16 {G, R, G, R}; Metal order is r, g, b, a.
+    const TextureFormatInfo& x16 = *texture_format_info(tex::X16);
+    CHECK(texture_channel_sources(x16, tex::kRemapIdentity) == std::array<u8, 4>{kChannelOne, 0, kChannelOne, 0});
+    const TextureFormatInfo& y16x16 = *texture_format_info(tex::Y16_X16);
+    CHECK(texture_channel_sources(y16x16, tex::kRemapIdentity) == std::array<u8, 4>{0, 1, 0, 1});
 }
 
 TEST_CASE("half floats")

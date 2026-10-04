@@ -157,6 +157,11 @@ TEST_CASE("metal: float texture formats decode exactly")
         ps_write16(g.mem.base(), GpuFixture::kTexEa + i, h);
     }
     CHECK(compare_decode(g, tex_info(tex::W16_Z16_Y16_X16_FLOAT, 16, 8, 1), 0, 0, false, false) == 0);
+    // 16-bit unsigned normalized: exact through R16Unorm and RG16Unorm.
+    for (u32 i = 0; i < 0x8000; i += 2) ps_write16(g.mem.base(), GpuFixture::kTexEa + i, static_cast<u16>(rng()));
+    CHECK(compare_decode(g, tex_info(tex::X16, 32, 16, 2), 0, 0, false, false) < 1e-7);
+    CHECK(compare_decode(g, tex_info(tex::X16, 32, 16, 2), 0, 1, false, false) < 1e-7);
+    CHECK(compare_decode(g, tex_info(tex::Y16_X16, 16, 16, 1), 0, 0, false, false) < 1e-7);
 }
 
 TEST_CASE("metal: DXT1/3/5 decode in compute matches the CPU reference, BC upload agrees")
@@ -374,6 +379,33 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
         in.saturate = op == 2;
         vp.push_back(in);
     }
+    // Condition codes: an update to CC0, then conditional writes of an output and a temp.
+    VpInst cc_set;
+    cc_set.vec_op = 11; // SLT
+    cc_set.src[0] = vp_in();
+    cc_set.src[1] = vp_const();
+    cc_set.vec_result = false;
+    cc_set.vec_mask = 0xf;
+    cc_set.cond_update = true;
+    vp.push_back(cc_set);
+    VpInst cond_out;
+    cond_out.vec_op = 1; // MOV
+    cond_out.src[0] = vp_in();
+    cond_out.out = 1;
+    cond_out.vec_mask = mask("xy");
+    cond_out.cond_test = true;
+    cond_out.cond = 5; // ne
+    cond_out.cond_sw = {3, 2, 1, 0};
+    vp.push_back(cond_out);
+    VpInst cond_temp;
+    cond_temp.sca_op = 2; // RCP
+    cond_temp.src[2] = vp_in();
+    cond_temp.vec_result = true;
+    cond_temp.sca_temp = 3;
+    cond_temp.sca_mask = mask("w");
+    cond_temp.cond_test = true;
+    cond_temp.cond = 6; // ge
+    vp.push_back(cond_temp);
     VpInst pos;
     pos.vec_op = 1;
     pos.src[0] = vp_temp(1);
@@ -393,7 +425,7 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
     std::vector<FpInst> fp;
     for (u32 op : {0x01u, 0x02u, 0x03u, 0x04u, 0x38u, 0x05u, 0x06u, 0x08u, 0x09u, 0x3Au, 0x1Au, 0x1Bu, 0x1Cu, 0x1Du,
              0x23u, 0x22u, 0x10u, 0x11u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu, 0x20u, 0x21u, 0x1Fu, 0x39u, 0x15u,
-             0x16u, 0x17u, 0x18u, 0x2Fu, 0x31u}) {
+             0x16u, 0x17u, 0x18u, 0x2Fu, 0x31u, 0x3Bu, 0x29u, 0x2Au}) {
         FpInst in;
         in.op = op;
         in.dst = op % 3;
@@ -472,6 +504,34 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
     const auto cdecoded = shader::decode_fragment_program(cbytes.data(), static_cast<u32>(cbytes.size()));
     REQUIRE(cdecoded.has_value());
     compile(shader::translate_fragment_program(*cdecoded));
+
+    // TXL and TXB on cube maps, and a conditional RET before the last write.
+    FpInst txl;
+    txl.op = 0x2F;
+    txl.dst = 0;
+    txl.input = 4;
+    txl.tex = 0;
+    txl.src[0] = fp_in();
+    FpInst txb;
+    txb.op = 0x31;
+    txb.dst = 2;
+    txb.input = 5;
+    txb.tex = 1;
+    txb.src[0] = fp_in();
+    FpInst ret;
+    ret.op = 0x45;
+    ret.exec_lt = ret.exec_eq = false;
+    FpInst last;
+    last.op = 0x01;
+    last.src[0] = fp_r(2);
+    last.end = true;
+    const auto tbytes = assemble_fp({txl, txb, ret, last});
+    const auto tdecoded = shader::decode_fragment_program(tbytes.data(), static_cast<u32>(tbytes.size()));
+    REQUIRE(tdecoded.has_value());
+    shader::FpOptions cube;
+    cube.texture_kind[0] = shader::TextureKind::Cube;
+    cube.texture_kind[1] = shader::TextureKind::Cube;
+    compile(shader::translate_fragment_program(*tdecoded, cube));
 }
 
 // ---- end to end -------------------------------------------------------------------------------------------------

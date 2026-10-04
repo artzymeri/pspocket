@@ -30,8 +30,8 @@ constexpr TextureFormatInfo kFormats[] = {
     {tex::DEPTH24_D8_FLOAT, "DEPTH24_D8_FLOAT", 4, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::DEPTH16, "DEPTH16", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::DEPTH16_FLOAT, "DEPTH16_FLOAT", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
-    {tex::X16, "X16", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
-    {tex::Y16_X16, "Y16_X16", 4, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
+    {tex::X16, "X16", 2, 1, TexelDecode::X16, DecodedFormat::R16},
+    {tex::Y16_X16, "Y16_X16", 4, 1, TexelDecode::Y16X16, DecodedFormat::RG16},
     {tex::R5G5B5A1, "R5G5B5A1", 2, 1, TexelDecode::R5G5B5A1, DecodedFormat::RGBA8},
     {tex::COMPRESSED_HILO8, "COMPRESSED_HILO8", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::COMPRESSED_HILO_S8, "COMPRESSED_HILO_S8", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
@@ -212,6 +212,9 @@ std::array<u8, 4> texture_channel_sources(const TextureFormatInfo& fmt, u32 rema
     case TexelDecode::W16Z16Y16X16F:
     case TexelDecode::W32Z32Y32X32F:
     case TexelDecode::Y16X16F: float_format = true; break;
+    // RPCS3 VKFormats.cpp get_component_mapping (A, R, G, B): X16 {R, 1, R, 1}, Y16_X16 {G, R, G, R}.
+    case TexelDecode::X16: base = {0, kChannelOne, 0, kChannelOne}; break;
+    case TexelDecode::Y16X16: base = {1, 0, 1, 0}; break;
     default: break;
     }
     TextureRemap r = decode_remap(remap);
@@ -350,6 +353,8 @@ bool decode_level_cpu(const TextureLayout& layout, const TextureLevel& level, co
                 break;
             case TexelDecode::W32Z32Y32X32F: o = {ps_ldf32(p), ps_ldf32(p + 4), ps_ldf32(p + 8), ps_ldf32(p + 12)}; break;
             case TexelDecode::Y16X16F: o = {half_to_float(ps_ld16(p)), half_to_float(ps_ld16(p + 2)), 0.f, 1.f}; break;
+            case TexelDecode::X16: o = {ps_ld16(p) / 65535.f, 0.f, 0.f, 1.f}; break;
+            case TexelDecode::Y16X16: o = {ps_ld16(p) / 65535.f, ps_ld16(p + 2) / 65535.f, 0.f, 1.f}; break;
             default: return false;
             }
         }

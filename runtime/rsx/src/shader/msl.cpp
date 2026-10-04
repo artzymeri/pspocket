@@ -180,6 +180,14 @@ std::string vp_compare(const char* op, const std::string& a, const std::string& 
     return std::format("select(float4(0.0), float4(1.0), {} {} {})", a, op, b);
 }
 
+// The condition of a conditional vertex program instruction (RPCS3 VertexProgramDecompiler GetRawCond): CC{cond_reg}
+// through the condition swizzle, compared with 0 per component (cond: lt 1, eq 2, gt 4), as a bool4 expression.
+std::string vp_condition(const VpInstruction& in)
+{
+    static constexpr const char* kCompare[8] = {"<", "<", "==", "<=", ">", "!=", ">=", "<"}; // 0: RPCS3's "error" row
+    return std::format("(cc{}{} {} float4(0.0))", in.cond_reg, in.cond_swizzle.str(), kCompare[in.cond & 7]);
+}
+
 } // namespace
 
 const std::string& msl_prologue()
@@ -208,12 +216,16 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
         if (!vp_vec_supported(in.vec_op)) return fail(std::format("opcode {}", vp_vec_op_name(in.vec_op)));
         if (!vp_sca_supported(in.sca_op)) return fail(std::format("opcode {}", vp_sca_op_name(in.sca_op)));
         if (in.constant_relative) return fail("relative constant addressing (A0)");
-        if (in.cond_update) return fail("condition code update");
-        if (in.cond_test && in.cond != 0 && in.cond != 7) return fail("conditional write");
 
         const bool vec = in.vec_op != 0;
         const bool sca = in.sca_op != 0;
         if ((!vec && !sca) || in.cond == 0) continue; // NOP, or never written (SetDST: cond == 0)
+        // Condition codes (RPCS3 VertexProgramDecompiler SetDST, GetDST, AddCodeCond, GetRawCond): CC0 and CC1 start
+        // at 0. An op whose result goes to neither an output nor a temp writes it to CC{cond_reg}: when the
+        // instruction updates condition codes, or (RPCS3, "Far Cry 2") when the other op writes the output. A
+        // conditional instruction writes only the components whose condition holds.
+        const bool conditional = in.cond_test && in.cond != 7;
+        const std::string cond = conditional ? vp_condition(in) : std::string();
 
         body += std::format("    {{ // {}: {}\n", in.slot, disassemble(in));
         if (vec) {
@@ -264,13 +276,27 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
             if (in.saturate) body += "        sca = clamp(sca, 0.0, 1.0);\n";
         }
         // Both ops read their sources before either writes (dual issue).
-        auto write = [&](const char* value, u8 mask, bool to_output, u8 temp) {
+        auto assign = [&](const std::string& reg, const char* value, const std::string& m) {
+            if (conditional) {
+                body += std::format("        {}{} = select({}{}, {}{}, {}{});\n", reg, m, reg, m, value, m, cond, m);
+            } else {
+                body += std::format("        {}{} = {}{};\n", reg, m, value, m);
+            }
+        };
+        auto write = [&](const char* value, u8 mask, bool is_result, u8 temp) {
             if (mask == 0) return;
             const std::string m = mask_suffix(mask);
-            if (to_output && in.out != 0x1f) body += std::format("        o{}{} = {}{};\n", in.out, m, value, m);
-            if (temp != 0x3f) {
-                temps.insert(temp);
-                body += std::format("        r{}{} = {}{};\n", temp, m, value, m);
+            const std::string cc = std::format("cc{}", in.cond_reg);
+            if (in.out != 0x1f || temp != 0x3f) {
+                if (is_result && in.out != 0x1f) assign(std::format("o{}", in.out), value, m);
+                if (temp != 0x3f) {
+                    temps.insert(temp);
+                    assign(std::format("r{}", temp), value, m);
+                } else if (!is_result) {
+                    assign(cc, value, m);
+                }
+            } else if (in.cond_update) {
+                assign(cc, value, m);
             }
         };
         if (vec) write("vec", in.vec_mask, in.vec_result, in.vec_temp);
@@ -301,6 +327,8 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
         }
     }
     for (u32 t : temps) src += std::format("    float4 r{} = float4(0.0);\n", t);
+    src += "    float4 cc0 = float4(0.0), cc1 = float4(0.0); // condition registers CC0, CC1\n";
+    src += "    (void)cc0; (void)cc1;\n";
     for (u32 i = 0; i < 16; i++) src += std::format("    float4 o{} = float4(0.0, 0.0, 0.0, 1.0);\n", i);
     src += body;
     // Outputs: o0 position, o1/o2 front colours, o3/o4 back colours, o5.x fog, o6.x point size (o6 also TEX9),
@@ -341,7 +369,7 @@ bool fp_supported(u32 op)
     case FpOp::FLR: case FpOp::SLT: case FpOp::SGE: case FpOp::SLE: case FpOp::SGT: case FpOp::SNE:
     case FpOp::SEQ: case FpOp::STR: case FpOp::SFL: case FpOp::LRP: case FpOp::NRM: case FpOp::DDX:
     case FpOp::DDY: case FpOp::KIL: case FpOp::TEX: case FpOp::TXP: case FpOp::TXL: case FpOp::TXB:
-    case FpOp::FENCT: case FpOp::FENCB: return true;
+    case FpOp::FENCT: case FpOp::FENCB: case FpOp::DIVSQ: case FpOp::PK16: case FpOp::UP16: case FpOp::RET: return true;
     default: return false;
     }
 }
@@ -439,6 +467,7 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
 {
     TranslateResult result;
     FpContext c{fp, opt, {}, {}, {}, {}, 0, 0, 0};
+    bool uses_divsq = false;
     std::string body;
     u32 const_slot = 0;
 
@@ -467,6 +496,12 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                                 : std::string("        discard_fragment();\n    }\n");
             continue;
         }
+        if (op == FpOp::RET) {
+            // RPCS3 AddFlowOp("return"): the program ends here and its outputs are what the registers hold. The body
+            // runs inside do { } while (false), and the subset has no loops, so break reaches the outputs.
+            body += conditional ? std::format("        if (any({})) break;\n    }}\n", cond) : std::string("        break;\n    }\n");
+            continue;
+        }
 
         const std::string s0 = fp_source(c, in, 0);
         auto s1 = [&] { return fp_source(c, in, 1); };
@@ -484,6 +519,13 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         case FpOp::MIN: e = std::format("min({}, {})", s0, s1()); exempt_prec = true; break;
         case FpOp::MAX: e = std::format("max({}, {})", s0, s1()); exempt_prec = true; break;
         case FpOp::DIV: e = std::format("({}) / ({}).x", s0, s1()); break;
+        case FpOp::DIVSQ: // RPCS3 _builtin_divsq
+            e = std::format("rsx_divsq({}, ({}).x)", s0, s1());
+            uses_divsq = true;
+            break;
+        // RPCS3 packs and unpacks PK16/UP16 as two unorm16 (packUnorm2x16).
+        case FpOp::PK16: e = std::format("float4(as_type<float>(pack_float_to_unorm2x16(({}).xy)))", s0); break;
+        case FpOp::UP16: e = std::format("unpack_unorm2x16_to_float(as_type<uint>(({}).x)).xyxy", s0); break;
         case FpOp::RCP: e = std::format("float4(1.0 / ({}).x)", s0); break;
         case FpOp::RSQ: e = std::format("float4(1.0 / sqrt(abs(({}).x)))", s0); break; // RSQ ignores the sign (GTA4)
         case FpOp::EX2: e = std::format("float4(exp2(({}).x))", s0); break;
@@ -515,8 +557,12 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
             c.textures |= 1u << t;
             const TextureKind kind = opt.texture_kind[t];
             if (kind == TextureKind::Cube) {
-                if (op != FpOp::TEX) return fail(std::format("{} on a cube map", fp_op_name(in.op)));
-                e = std::format("t{}.sample(s{}, ({}).xyz)", t, t, s0);
+                switch (op) {
+                case FpOp::TEX: e = std::format("t{}.sample(s{}, ({}).xyz)", t, t, s0); break;
+                case FpOp::TXL: e = std::format("t{}.sample(s{}, ({}).xyz, level(({}).w))", t, t, s0, s0); break;
+                case FpOp::TXB: e = std::format("t{}.sample(s{}, ({}).xyz, bias(({}).w))", t, t, s0, s0); break;
+                default: return fail(std::format("{} on a cube map", fp_op_name(in.op)));
+                }
             } else {
                 std::string coord = std::format("({}).xy", s0);
                 if (op == FpOp::TXP) coord = std::format("(({}).xy / ({}).w)", s0, s0);
@@ -601,7 +647,13 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     if (depth_export) src += "    float depth [[depth(any)]];\n";
     if (mrt == 0 && !depth_export) src += "    float4 c0 [[color(0)]];\n";
     src += "};\n\n";
-    src += "static float4 rsx_nrm(float4 v) { const float l = length(v.xyz); return (l > 0.0 ? float4(v.xyz / l, 0.0) : v).xyzz; }\n\n";
+    src += "static float4 rsx_nrm(float4 v) { const float l = length(v.xyz); return (l > 0.0 ? float4(v.xyz / l, 0.0) : v).xyzz; }\n";
+    if (uses_divsq) {
+        // RPCS3 _builtin_divsq (properties.has_divsq): a / sqrt(|b|), except that a zero numerator stays zero even
+        // when b is zero.
+        src += "static float4 rsx_divsq(float4 a, float b) { return select(a, a / sqrt(abs(b)), abs(a) > 0.0); }\n";
+    }
+    src += "\n";
 
     result.shader.entry = std::format("rsx_fp_{:016x}", fp.hash);
     std::string params = std::format("rsx_fs_in in [[stage_in]], constant float4* fc [[buffer({})]], "
@@ -623,7 +675,9 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     src += "    (void)cc0; (void)cc1;\n";
     for (u32 r : c.r_regs) src += std::format("    float4 r{} = float4(0.0);\n", r);
     for (u32 h : c.h_regs) src += std::format("    float4 h{} = float4(0.0);\n", h);
+    src += "    do {\n";
     src += body;
+    src += "    } while (false);\n";
     src += "    rsx_fs_out out;\n";
     static constexpr const char* kChan[6] = {"x", "y", "z", "w", "0.0", "1.0"};
     for (u32 i = 0; i < mrt; i++) {

@@ -57,6 +57,8 @@ MTLPixelFormat decoded_pixel_format(DecodedFormat f, bool bc)
     case DecodedFormat::BC1: return bc ? MTLPixelFormatBC1_RGBA : MTLPixelFormatRGBA8Unorm;
     case DecodedFormat::BC2: return bc ? MTLPixelFormatBC2_RGBA : MTLPixelFormatRGBA8Unorm;
     case DecodedFormat::BC3: return bc ? MTLPixelFormatBC3_RGBA : MTLPixelFormatRGBA8Unorm;
+    case DecodedFormat::R16: return MTLPixelFormatR16Unorm;
+    case DecodedFormat::RG16: return MTLPixelFormatRG16Unorm;
     }
     return MTLPixelFormatRGBA8Unorm;
 }

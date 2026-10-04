@@ -56,6 +56,10 @@ struct VpInst {
     u8 vec_mask = 0, sca_mask = 0;
     bool saturate = false;
     u32 cond = 7;
+    bool cond_test = false;   // D0.cond_test_enable: a conditional write
+    bool cond_update = false; // D0.cond_update_enable_0
+    u32 cond_reg = 0;         // CC0 or CC1
+    std::array<u8, 4> cond_sw{0, 1, 2, 3};
     bool end = false;
 };
 
@@ -68,9 +72,10 @@ inline u32 vp_src_bits(const VpSrc& s)
 inline std::array<u32, 4> encode_vp(const VpInst& in)
 {
     const u32 s0 = vp_src_bits(in.src[0]), s1 = vp_src_bits(in.src[1]), s2 = vp_src_bits(in.src[2]);
-    const u32 d0 = (3u << 2) | (2u << 4) | (1u << 6) | (0u << 8) | (in.cond << 10) | (in.vec_temp << 15) |
-        (u32{in.src[0].abs} << 21) | (u32{in.src[1].abs} << 22) | (u32{in.src[2].abs} << 23) |
-        (u32{in.saturate} << 26) | (u32{in.vec_result} << 30);
+    const u32 d0 = (u32{in.cond_sw[3]} << 2) | (u32{in.cond_sw[2]} << 4) | (u32{in.cond_sw[1]} << 6) |
+        (u32{in.cond_sw[0]} << 8) | (in.cond << 10) | (u32{in.cond_test} << 13) | (u32{in.cond_update} << 14) |
+        (in.vec_temp << 15) | (u32{in.src[0].abs} << 21) | (u32{in.src[1].abs} << 22) | (u32{in.src[2].abs} << 23) |
+        (in.cond_reg << 25) | (u32{in.saturate} << 26) | (u32{in.vec_result} << 30);
     const u32 d1 = ((s0 >> 9) & 0xff) | (in.input << 8) | (in.constant << 12) | (in.vec_op << 22) | (in.sca_op << 27);
     const u32 d2 = ((s2 >> 11) & 0x3f) | (s1 << 6) | ((s0 & 0x1ff) << 23);
     auto m = [](u8 v, u32 base) {

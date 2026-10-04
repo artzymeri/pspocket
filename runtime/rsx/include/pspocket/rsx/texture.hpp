@@ -40,13 +40,15 @@ enum class TexelDecode : u8 {
     W16Z16Y16X16F, // 4 x BE f16, first in memory = red
     W32Z32Y32X32F, // 4 x BE f32, first in memory = red
     Y16X16F,   // 2 x BE f16
+    X16,       // BE u16, unsigned normalized -> red
+    Y16X16,    // 2 x BE u16, unsigned normalized -> red, green (first in memory = red)
     DXT1,
     DXT23,
     DXT45,
 };
 
 // Decoded storage the GPU texture uses (the backend maps it to a Metal pixel format).
-enum class DecodedFormat : u8 { RGBA8, R32F, RG16F, RGBA16F, RGBA32F, BC1, BC2, BC3 };
+enum class DecodedFormat : u8 { RGBA8, R32F, RG16F, RGBA16F, RGBA32F, BC1, BC2, BC3, R16, RG16 };
 
 struct TextureFormatInfo {
     u32 gcm_format = 0;       // base format (LN/UN masked off)

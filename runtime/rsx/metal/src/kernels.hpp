@@ -27,8 +27,8 @@ struct rsx_decode_params {
 
 // TexelDecode values (runtime/rsx/include/pspocket/rsx/texture.hpp)
 constant uint kARGB8 = 1, kDRGB8 = 2, kR5G6B5 = 3, kA1R5G5B5 = 4, kD1R5G5B5 = 5, kA4R4G4B4 = 6, kR5G5B5A1 = 7,
-              kR6G5B5 = 8, kB8 = 9, kX32F = 10, kW16F = 11, kW32F = 12, kY16X16F = 13, kDXT1 = 14, kDXT23 = 15,
-              kDXT45 = 16;
+              kR6G5B5 = 8, kB8 = 9, kX32F = 10, kW16F = 11, kW32F = 12, kY16X16F = 13, kX16 = 14, kY16X16 = 15,
+              kDXT1 = 16, kDXT23 = 17, kDXT45 = 18;
 
 static uint morton(uint x, uint y, uint lw, uint lh)
 {
@@ -123,6 +123,8 @@ kernel void rsx_decode_texture(device const uchar* src [[buffer(0)]], constant r
         case kW32F: c = float4(as_type<float>(ld32be(src, o)), as_type<float>(ld32be(src, o + 4)),
                                as_type<float>(ld32be(src, o + 8)), as_type<float>(ld32be(src, o + 12))); break;
         case kY16X16F: c = float4(float(as_type<half>(ushort(ld16be(src, o)))), float(as_type<half>(ushort(ld16be(src, o + 2)))), 0.0, 1.0); break;
+        case kX16: c = float4(float(ld16be(src, o)) / 65535.0, 0.0, 0.0, 1.0); break;
+        case kY16X16: c = float4(float(ld16be(src, o)) / 65535.0, float(ld16be(src, o + 2)) / 65535.0, 0.0, 1.0); break;
         default: break;
         }
     }

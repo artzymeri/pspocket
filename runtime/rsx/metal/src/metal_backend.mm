@@ -13,7 +13,8 @@
 
 namespace pspocket::rsx::metal {
 
-static_assert(static_cast<u32>(TexelDecode::ARGB8) == 1 && static_cast<u32>(TexelDecode::DXT45) == 16,
+static_assert(static_cast<u32>(TexelDecode::ARGB8) == 1 && static_cast<u32>(TexelDecode::X16) == 14 &&
+                  static_cast<u32>(TexelDecode::Y16X16) == 15 && static_cast<u32>(TexelDecode::DXT45) == 18,
     "TexelDecode values are mirrored in kernels.hpp");
 
 // ---- transient allocator ------------------------------------------------------------------------------------------
