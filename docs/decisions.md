@@ -731,6 +731,20 @@ Two scheduler changes found by GTA V's job chains (runs 022 and 023):
   mailbox) and 192 (`..._impatient`, no answer) set bit `value & 0xFFFFFF` of the lv2 event flag whose ID is in the
   outbound mailbox (RPCS3 SPUThread.cpp `set_ch_value`). GTA V's Secondary chain wakes its audio mix thread this way.
 
+## D-057 · 2026-10-04 · The Mac shows the game's frames as PNG files through the Metal backend
+
+Run 029. `pspocket-boot --gpu metal` gives the RSX the Metal backend (D-032) instead of the null backend, on Apple
+platforms; `--frames DIR [--frame-every N]` (which implies Metal) saves every Nth presented frame as
+`DIR/frame-NNNNNN.png` (60 by default). That is the first picture: GTA V's Rockstar logo screen.
+- **Capture.** The Metal backend's flip copies the output texture (1152x640, BGRA8) to a shared buffer in the frame's
+  own command buffer and hands it to a callback once the GPU has finished it (`MetalBackendConfig::capture`).
+- **PNG.** `pspocket/core/png.hpp` writes 8-bit RGB PNGs with stored (uncompressed) deflate blocks: no library, any
+  viewer reads them. Frames stay in `inventory/` like every other game output.
+- **Why files.** pspocket-boot is a command-line tool: a window needs an app run loop. The files are enough to see
+  what the game draws while the boot loop goes on; the iOS app presents through the same backend.
+- **Tests.** The Metal backend's end-to-end tests (`tests/rsx/test_metal.mm`) were in the tree but in no build; they
+  now run in the host build on Apple platforms (`test_rsx_metal`), with a capture test.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -4,6 +4,7 @@
 //
 //   pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]
 //                 [--report-every SECONDS] [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]
+//                 [--gpu null|metal] [--frames DIR] [--frame-every N]
 //   pspocket-boot --probe-disc IMAGE.iso
 //
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
@@ -13,6 +14,9 @@
 // the faulting PPU thread's instruction address before the process dies (CLAUDE.md rule 5).
 // A run that ends at its timeout, or on such a fault, prints the thread report (lv2/report.hpp): every PPU thread's
 // state, what it waits on and its guest backtrace, and the RSX's FIFO. --report-every prints it while the game runs.
+// --gpu metal draws the game's frames with the Metal backend (Apple platforms; the default null backend runs the
+// commands and draws nothing). --frames DIR (which implies Metal) saves every Nth presented frame (--frame-every,
+// 60 by default) as DIR/frame-NNNNNN.png: what the game shows, at the backend's output size.
 //
 // The executable must be a decrypted ELF (RPCS3's --decrypt writes one). Game files stay outside the repository.
 
@@ -40,6 +44,11 @@
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/report.hpp"
+#include "pspocket/core/png.hpp"
+#if defined(PSPOCKET_HAVE_METAL)
+#include "pspocket/rsx/metal/metal_backend.hpp"
+#include "pspocket/rsx/write_tracker.hpp"
+#endif
 #include "pspocket/ppu/disasm.hpp"
 #include "pspocket/ppu/runtime.h"
 
@@ -52,7 +61,7 @@ int usage()
     std::fprintf(stderr,
         "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]\n"
         "                     [--report-every SECONDS] [--stop-at-first] [--log trace|debug|info|warn|error]\n"
-        "                     [--imports]\n"
+        "                     [--imports] [--gpu null|metal] [--frames DIR] [--frame-every N]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -225,6 +234,8 @@ int main(int argc, char** argv)
     double report_every_s = 0; // 0: only at the end
     bool stop_at_first = false;
     bool list_imports = false;
+    std::string gpu = "null", frames_dir;
+    u32 frame_every = 60;
     for (int i = 1; i < argc; i++) {
         const std::string_view a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -236,6 +247,20 @@ int main(int argc, char** argv)
             const char* v = value();
             if (!v || std::atof(v) <= 0) return usage();
             report_every_s = std::atof(v);
+        }
+        else if (a == "--gpu") {
+            const char* v = value();
+            if (!v || (std::string_view(v) != "null" && std::string_view(v) != "metal")) return usage();
+            gpu = v;
+        } else if (a == "--frames") {
+            const char* v = value();
+            if (!v) return usage();
+            frames_dir = v;
+            gpu = "metal";
+        } else if (a == "--frame-every") {
+            const char* v = value();
+            if (!v || std::atoi(v) <= 0) return usage();
+            frame_every = static_cast<u32>(std::atoi(v));
         }
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
@@ -282,6 +307,44 @@ int main(int argc, char** argv)
     };
     loader::BootState state;
     loader::prepare_kernel_config(cfg, state);
+
+    // The GPU backend sys_rsx gives the RSX (the null backend unless --gpu metal). The write tracker outlives the
+    // kernel, which owns the backend.
+    std::atomic<u32> frames_written{0};
+#if defined(PSPOCKET_HAVE_METAL)
+    std::unique_ptr<rsx::WriteTracker> tracker;
+    if (gpu == "metal") {
+        if (!frames_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(frames_dir, ec);
+            if (ec) {
+                std::fprintf(stderr, "pspocket-boot: cannot create %s: %s\n", frames_dir.c_str(), ec.message().c_str());
+                return 73;
+            }
+        }
+        tracker = std::make_unique<rsx::WriteTracker>(memory);
+        cfg.rsx_backend = [&]() -> std::unique_ptr<rsx::Backend> {
+            rsx::metal::MetalBackendConfig mc;
+            if (!frames_dir.empty()) {
+                mc.capture_every = frame_every;
+                mc.capture = [&](const u8* bgra, u32 w, u32 h, u64 flip) {
+                    const std::string path = std::format("{}/frame-{:06}.png", frames_dir, flip);
+                    if (write_png_rgb(path, bgra, w, h, w * 4, true) && frames_written.fetch_add(1) == 0) {
+                        PS_LOG_INFO("boot", "first frame saved: {}", path);
+                    }
+                };
+            }
+            auto backend = std::make_unique<rsx::metal::MetalBackend>(memory, *tracker, std::move(mc));
+            if (!backend->valid()) return nullptr; // no Metal device: the null backend
+            return backend;
+        };
+    }
+#else
+    if (gpu == "metal") {
+        std::fprintf(stderr, "pspocket-boot: this build has no Metal backend (--gpu metal, --frames)\n");
+        return 64;
+    }
+#endif
 
     lv2::Kernel kernel(memory, cfg);
     kernel.install();
@@ -367,6 +430,7 @@ int main(int argc, char** argv)
     if (done) std::printf("exit status: %d\n", kernel.exit_status());
     std::printf("imports: %u functions (%u implemented), %u unresolved variables\n", report.functions_linked,
         report.functions_implemented, report.variables_unresolved);
+    if (!frames_dir.empty()) std::printf("frames saved: %u in %s\n", frames_written.load(), frames_dir.c_str());
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());
     for (const auto* f : missing)
