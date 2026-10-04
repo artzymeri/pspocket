@@ -993,6 +993,139 @@ TEST_CASE("metal e2e: render to a surface, then sample it as a texture")
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});
 }
 
+namespace {
+
+// Surface A at offset in another colour format (pitch in bytes), optionally with a Z24S8 depth buffer.
+void setup_surface_as(CommandBuilder& b, u32 offset, SurfaceColorFormat format, u32 pitch, u32 depth_offset = 0)
+{
+    setup_surface(b, offset);
+    b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(format) | (2u << 5) | (1u << 8));
+    b.method(m::NV4097_SET_SURFACE_PITCH_A, pitch);
+    if (depth_offset) {
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, depth_offset);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 4);
+    }
+}
+
+// Texture unit 0: a linear texture of the given format at a local memory offset, kW x kH, identity remap.
+void bind_linear_texture(CommandBuilder& b, u32 offset, u32 format, u32 pitch)
+{
+    b.method(m::NV4097_SET_TEXTURE_OFFSET, {
+        offset,
+        (loc::kLocal + 1) | (1u << 3) | (2u << 4) | ((format | tex::kLinearFlag) << 8) | (1u << 16),
+        3u | (3u << 8) | (3u << 16),
+        (1u << 31),
+        tex::kRemapIdentity,
+        (1u << 16) | (1u << 24),
+        (kW << 16) | kH,
+        0,
+    });
+    b.method(m::NV4097_SET_TEXTURE_CONTROL3, pitch);
+}
+
+} // namespace
+
+TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+
+    auto b = e.at(0);
+    // Pass 1: red into an A8B8G8R8 target: its bytes are A B G R, so 0xff 0x00 0x00 0xff
+    setup_surface_as(b, kSurfaceB, SurfaceColorFormat::A8B8G8R8, kW * 4);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    // Pass 2: those bytes read as A8R8G8B8 are blue
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_linear_texture(b, kSurfaceB, tex::A8R8G8B8, kW * 4);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_samples == 1);
+    CHECK(e.backend->stats().textures_decoded == 0);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
+}
+
+TEST_CASE("metal e2e: a B8 target read as a B8 texture gives its byte in every channel")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0x10208040, 0x10208040, 0x10208040}); // r 0x10, g 0x20, b 0x80
+
+    auto b = e.at(0);
+    // Pass 1: a B8 target keeps the shader's blue
+    setup_surface_as(b, kSurfaceB, SurfaceColorFormat::B8, kW);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    // Pass 2: read as a B8 texture
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_linear_texture(b, kSurfaceB, tex::B8, kW);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_samples == 1);
+    CHECK(e.backend->stats().textures_decoded == 0);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x80, 0x80, 0x80});
+    // And a B8 target writes back as its bytes.
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH));
+    CHECK(*e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceB + 48 * kW + 32) == 0x80);
+}
+
+TEST_CASE("metal e2e: a Z24S8 depth buffer read as an A8R8G8B8 texture gives its bytes (depth high, stencil low)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    constexpr u32 kDepth = 0x180000;
+
+    auto b = e.at(0);
+    // Pass 1: depth 0x123456, stencil 0x78
+    setup_surface_as(b, kSurfaceB, SurfaceColorFormat::A8R8G8B8, kW * 4, kDepth);
+    b.method(m::NV4097_SET_STENCIL_MASK, 0xff);
+    b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x12345678);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth | clear::kStencil);
+    // Pass 2: the depth buffer as a texture (the lighting pass of GTA V's first mission rebuilds positions this way)
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kDepth, tex::A8R8G8B8, kW * 4);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().readbacks == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x12, 0x34, 0x56, 0x78});
+}
+
 TEST_CASE("metal e2e: flip presents the display buffer scaled to the output size")
 {
     REQUIRE_METAL();

@@ -1223,6 +1223,51 @@ varying addresses is position independent, so it is now lifted once and runs whe
   placements (one across the end of local store) against the interpreter; HLE tests for relocatable jobs, the module
   dumps and the return to the home program.
 
+## D-082 · 2026-10-04 · Modules stay known across data copies and task switches; a lock-free commit check
+
+Run 054 still interpreted 4,970 addresses of the modules GTA V's dependency tasks load, none of them modules changed
+in local store (run 055's count: 0). Two ways the tracker of D-079 lost a module that was still there:
+- Its table of GET runs replaced the oldest run, whatever it was: the tasks' data copies pushed their modules out.
+  A new run now takes a free slot, else the oldest run that never ran code, else the oldest (128 slots).
+- A task that yields saves its local store to its context save area and resumes from it, on any worker, by a copy the
+  MFC never sees. The runs inside the saved blocks are now kept with the save area and given back when the task
+  resumes; a task start forgets the runs of the image it replaced. Restored runs are verified again (guest copy
+  against local store) the first time execution reaches them.
+- `GuestMemory::is_committed` took the memory's mutex on every call, and SPU DMAs, SPURS and the RSX call it thousands
+  of times a second from every thread: run 056's profile had the mutex at 14% of the SPURS workers' time. It now reads
+  the commit bitmap with acquire loads; commit and decommit store its words atomically under the mutex.
+- Tests: a module survives 300 data GETs; a task's module runs lifted after its context moves to another SPU (both
+  fail without the fix).
+
+## D-083 · 2026-10-04 · Textures over render targets read the target's bytes as the texture's format
+
+Run 056 traced one frame of the first mission (`--trace-frame`, D-084): a deferred renderer whose lighting pass read
+three of its inputs wrongly, so the HDR target stayed black and the frame showed the albedo, in the wrong colours.
+- An A8R8G8B8 texture over an A8B8G8R8 target sees its bytes in the other order: red and blue trade places, as when
+  the texture is decoded from the target's memory. The G-buffer is A8B8G8R8 and is read as A8R8G8B8.
+- A B8 texture over a B8 target samples the target (its byte in every channel), and B8 targets write back.
+- A depth buffer read as a colour texture (the lighting pass reads Z24S8 as A8R8G8B8 to rebuild positions) is written
+  back to guest memory in the RSX's layout, depth in the high 24 bits and stencil in the low 8 (Z16 as halfwords),
+  and the texture decodes it from there: exact, but an expensive readback each frame (RPCS3 converts on the GPU; next
+  once a profile shows it).
+- Tests: each of the three, end to end through the Metal backend.
+
+## D-084 · 2026-10-04 · Debugging aids; the app recovers from FIFO errors; the app runs the lifted SPU programs
+
+- `pspocket-boot --trace-frame N` (with `--frames`): every clear and draw of frame N is logged on channel rsx.trace
+  (targets, fragment program, textures and whether each came from a target, from memory or from a written-back
+  target, blending), and every colour target it used is saved as a PNG at its flip.
+- A malformed FIFO command is reported with put, the words around get and the last eight jumps, calls and returns.
+  Run 055 ended on one after 195 s of the first mission (`malformed FIFO command 0xb28b0bcf`); runs 050 to 054 had
+  none in 15, 7, 7 and 10 minutes. The cause is not known yet.
+- The app logs a FIFO error and skips to put, as RPCS3 recovers (CLAUDE.md rule 5: release builds fall back and log);
+  `pspocket-boot --rsx-recover` does the same, and without it the Mac tool still stops there.
+- The run loop counts interpreted SPU instructions by the program current when the interpreter took over and the
+  address, and pspocket-boot prints the twelve largest at the end (`ps_spu_interp_sites`).
+- `scripts/ios.sh` builds the game's lifted SPU programs into the app when it finds them ($PSPOCKET_GAME_SPU, else an
+  inventory/*/spu-lifted with a game_spu.c), and the app registers them and the module resolver as pspocket-boot
+  does. The lifted code comes from the user's own game and stays out of the repository (CLAUDE.md rule 1).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

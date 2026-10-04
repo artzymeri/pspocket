@@ -6,7 +6,7 @@
 //                 [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]
 //                 [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]
 //                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]... [--audio]
-//                 [--spu-dump DIR]
+//                 [--spu-dump DIR] [--trace-frame N] [--rsx-recover]
 //   pspocket-boot --probe-disc IMAGE.iso
 //
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
@@ -26,7 +26,11 @@
 // state, what it waits on and its guest backtrace, and the RSX's FIFO. --report-every prints it while the game runs.
 // --gpu metal draws the game's frames with the Metal backend (Apple platforms; the default null backend runs the
 // commands and draws nothing). --frames DIR (which implies Metal) saves every Nth presented frame (--frame-every,
-// 60 by default) as DIR/frame-NNNNNN.png: what the game shows, at the backend's output size.
+// 60 by default) as DIR/frame-NNNNNN.png: what the game shows, at the backend's output size. --trace-frame N (with
+// --frames) logs every clear and draw of frame N (channel rsx.trace: targets, programs, textures, blending) and saves
+// each colour target it used as DIR/trace-N/<address>-fmt<format>-<width>x<height>.png at its flip. --rsx-recover
+// logs a FIFO error (with the words around it and the last jumps) and skips to put, as the app does, instead of
+// stopping the run.
 // --dump-on-fault FILE writes the guest's committed memory below the RSX's local memory to FILE when a guest fault
 // ends the run, for offline analysis (game data: keep it in inventory/). The file is a sequence of blocks: a
 // big-endian u32 guest address, a u32 byte count, then the bytes. A fault in SPU code also writes that SPU's local
@@ -89,7 +93,7 @@ int usage()
         "                     [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]\n"
         "                     [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]\n"
         "                     [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]...\n"
-        "                     [--audio] [--spu-dump DIR]\n"
+        "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -335,6 +339,8 @@ int main(int argc, char** argv)
     bool list_imports = false;
     std::string gpu = "null", frames_dir;
     u32 frame_every = 60;
+    u64 trace_frame = 0;
+    bool rsx_recover = false;
     std::vector<hle::PadPress> presses;
     bool audio = false;
     std::string spu_dump;
@@ -364,6 +370,12 @@ int main(int argc, char** argv)
             const char* v = value();
             if (!v || std::atoi(v) <= 0) return usage();
             frame_every = static_cast<u32>(std::atoi(v));
+        } else if (a == "--rsx-recover") {
+            rsx_recover = true;
+        } else if (a == "--trace-frame") {
+            const char* v = value();
+            if (!v || std::atoll(v) <= 0) return usage();
+            trace_frame = static_cast<u64>(std::atoll(v));
         }
         else if (a == "--dump-on-fault") { const char* v = value(); if (!v) return usage(); g_dump_path = v; }
         else if (a == "--press") {
@@ -424,6 +436,7 @@ int main(int argc, char** argv)
     };
     loader::BootState state;
     loader::prepare_kernel_config(cfg, state);
+    cfg.rsx_log_failures = rsx_recover;
 
     // The GPU backend sys_rsx gives the RSX (the null backend unless --gpu metal). The write tracker outlives the
     // kernel, which owns the backend.
@@ -450,6 +463,15 @@ int main(int argc, char** argv)
                         PS_LOG_INFO("boot", "first frame saved: {}", path);
                     }
                 };
+                if (trace_frame) {
+                    mc.trace_frame = trace_frame;
+                    mc.trace_surface = [&frames_dir, trace_frame](const std::string& name, const u8* bgra, u32 w, u32 h) {
+                        const std::string dir = std::format("{}/trace-{}", frames_dir, trace_frame);
+                        std::error_code ec;
+                        std::filesystem::create_directories(dir, ec);
+                        write_png_rgb(dir + "/" + name + ".png", bgra, w, h, w * 4, true);
+                    };
+                }
             }
             auto backend = std::make_unique<rsx::metal::MetalBackend>(memory, *tracker, std::move(mc));
             if (!backend->valid()) return nullptr; // no Metal device: the null backend
@@ -622,9 +644,18 @@ int main(int argc, char** argv)
 #endif
     const hle::SpuProgramStats spu = hle::spu_program_stats();
     std::printf("SPU program loads: %llu lifted, %llu interpreted (%llu images without a lifted program); %llu modules "
-                "lifted\n",
+                "lifted, %llu changed before they ran\n",
         static_cast<unsigned long long>(spu.attached), static_cast<unsigned long long>(spu.unknown),
-        static_cast<unsigned long long>(spu.images), static_cast<unsigned long long>(spu.modules));
+        static_cast<unsigned long long>(spu.images), static_cast<unsigned long long>(spu.modules),
+        static_cast<unsigned long long>(spu.modified));
+    // Where SPU code was interpreted most (the program current when the interpreter took over, and where).
+    ps_spu_interp_site sites[12];
+    const u32 nsites = ps_spu_interp_sites(sites, 12);
+    for (u32 i = 0; i < nsites; i++) {
+        std::printf("SPU interpreted: %llu instructions from %llu entries at LS 0x%05x in %s\n",
+            static_cast<unsigned long long>(sites[i].steps), static_cast<unsigned long long>(sites[i].entries), sites[i].pc,
+            sites[i].program ? sites[i].program->name : "no program");
+    }
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());
     for (const auto* f : missing)

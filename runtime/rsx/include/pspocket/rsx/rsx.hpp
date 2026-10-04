@@ -21,6 +21,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
@@ -260,6 +261,15 @@ private:
     u32 packet_remaining_ = 0;
     u32 packet_header_ = 0;
     std::vector<u32> return_stack_;
+    // The last FIFO jumps, calls and returns (from, to), for the report of a FIFO error.
+    std::array<std::pair<u32, u32>, 8> flow_history_{};
+    u32 flow_next_ = 0;
+    void note_flow(u32 from, u32 to)
+    {
+        flow_history_[flow_next_] = {from, to};
+        flow_next_ = (flow_next_ + 1) % static_cast<u32>(flow_history_.size());
+    }
+    std::string fifo_context(u32 get, u32 put) const;
     // Written by the thread driving the FIFO; atomic so status() can read them. The value is stored first.
     std::atomic<BlockReason> block_reason_{BlockReason::None};
     std::atomic<u32> block_value_{0}; // semaphore value, or the jump word

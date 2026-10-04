@@ -100,6 +100,16 @@ void ps_spu_set_miss_policy(ps_spu_miss_policy policy);
 ps_spu_miss_policy ps_spu_get_miss_policy(void);
 uint64_t ps_spu_miss_count(void);
 
+/* Where the run loop interprets: instructions interpreted, by the program current when the interpreter took over (NULL:
+ * none) and the address it took over at, for the n largest (the table holds the first 4096 keys). Diagnostics. */
+typedef struct ps_spu_interp_site {
+    const ps_spu_program* program;
+    uint32_t pc;
+    uint64_t steps;
+    uint64_t entries;
+} ps_spu_interp_site;
+uint32_t ps_spu_interp_sites(ps_spu_interp_site* out, uint32_t n);
+
 /* ---------------------------------------------------------------------------------------------------------------
  * Run loop.
  * ------------------------------------------------------------------------------------------------------------- */

@@ -332,6 +332,22 @@ void Rsx::fail(FailKind kind, u32 method, std::string message)
     PS_LOG_ERROR(kChan, "{}", message);
 }
 
+// What a FIFO error report needs to tell a desync from bad commands: put, the words around get and the last jumps.
+std::string Rsx::fifo_context(u32 get, u32 put) const
+{
+    std::string s = std::format(" (put {:#010x}; words from {:#010x}:", put, get - 16);
+    for (u32 o = get - 16; o != get + 20; o += 4) {
+        const auto ea = fifo_address(o);
+        s += ea ? std::format(" {:08x}", read32(*ea)) : " --------";
+    }
+    s += "; last jumps:";
+    for (u32 k = 0; k < flow_history_.size(); k++) {
+        const auto& [from, to] = flow_history_[(flow_next_ + k) % flow_history_.size()];
+        if (from || to) s += std::format(" {:#x}->{:#x}", from, to);
+    }
+    return s + ")";
+}
+
 void Rsx::fifo_error(std::string message)
 {
     fail(FailKind::FifoError, 0, std::move(message));
@@ -398,6 +414,7 @@ Rsx::RunStatus Rsx::step(u64 max_words)
                     block_reason_ = BlockReason::JumpToSelf;
                     return RunStatus::Blocked;
                 }
+                note_flow(get, target);
                 get_.store(target, std::memory_order_release);
                 publish_get();
                 continue;
@@ -409,6 +426,7 @@ Rsx::RunStatus Rsx::step(u64 max_words)
                     return RunStatus::Error;
                 }
                 return_stack_.push_back(get + 4);
+                note_flow(get, word & cmd::kCallOffsetMask);
                 get_.store(word & cmd::kCallOffsetMask, std::memory_order_release);
                 publish_get();
                 continue;
@@ -418,12 +436,13 @@ Rsx::RunStatus Rsx::step(u64 max_words)
                     fifo_error(std::format("FIFO RETURN at {:#010x} without a CALL", get));
                     return RunStatus::Error;
                 }
+                note_flow(get, return_stack_.back());
                 get_.store(return_stack_.back(), std::memory_order_release);
                 return_stack_.pop_back();
                 publish_get();
                 continue;
             }
-            fifo_error(std::format("malformed FIFO command {:#010x} at {:#010x}", word, get));
+            fifo_error(std::format("malformed FIFO command {:#010x} at {:#010x}{}", word, get, fifo_context(get, put)));
             return RunStatus::Error;
         }
 

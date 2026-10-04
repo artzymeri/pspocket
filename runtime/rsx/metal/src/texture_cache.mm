@@ -193,9 +193,8 @@ CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, 
 }
 
 id<MTLTexture> MetalBackend::Impl::sample_view(id<MTLTexture> tex, std::unordered_map<u32, id<MTLTexture>>& views,
-    const TextureFormatInfo& fmt, u32 remap)
+    const std::array<u8, 4>& src)
 {
-    const std::array<u8, 4> src = texture_channel_sources(fmt, remap);
     if (src == std::array<u8, 4>{0, 1, 2, 3}) return tex;
     const u32 key = src[0] | (src[1] << 4) | (src[2] << 8) | (src[3] << 12);
     if (auto it = views.find(key); it != views.end()) return it->second;
@@ -221,36 +220,71 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         return nil;
     }
     const TextureFormatInfo* fmt = texture_format_info(t.base_format());
+    bind_source = "memory";
 
     // A render target at this address: sample the GPU copy (plan section 7: "bind the Metal texture directly") when
     // the texture reads it in its own format.
     Surface* s = find_surface(*ea, false);
+    std::array<u8, 4> src = fmt ? texture_channel_sources(*fmt, t.remap) : std::array<u8, 4>{0, 1, 2, 3};
     if (s && !s->cpu_newer && fmt) {
         const auto sf = static_cast<SurfaceColorFormat>(s->gcm_format);
-        const bool compatible =
-            ((fmt->decode == TexelDecode::ARGB8 || fmt->decode == TexelDecode::DRGB8) &&
-                surface_color_bpp(s->gcm_format) == 4) ||
+        const bool abgr = sf == SurfaceColorFormat::A8B8G8R8 || sf == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8 ||
+                          sf == SurfaceColorFormat::X8B8G8R8_O8B8G8R8;
+        const bool argb_texture = fmt->decode == TexelDecode::ARGB8 || fmt->decode == TexelDecode::DRGB8;
+        const bool compatible = (argb_texture && surface_color_bpp(s->gcm_format) == 4) ||
+            (fmt->decode == TexelDecode::B8 && sf == SurfaceColorFormat::B8) ||
             (fmt->decode == TexelDecode::W16Z16Y16X16F && sf == SurfaceColorFormat::F_W16Z16Y16X16) ||
             (fmt->decode == TexelDecode::W32Z32Y32X32F && sf == SurfaceColorFormat::F_W32Z32Y32X32) ||
             (fmt->decode == TexelDecode::X32F && sf == SurfaceColorFormat::F_X32);
+        // What the bytes are to the texture, from what the Metal copy holds (its channels are the target's).
+        for (u8& c : src) {
+            if (argb_texture && abgr && (c == 0 || c == 2)) {
+                c = static_cast<u8>(2 - c); // an A8R8G8B8 texture over A8B8G8R8 bytes: red and blue trade places
+            } else if (fmt->decode == TexelDecode::B8 && c < 4) {
+                c = c == 3 ? kChannelOne : 0; // a B8 target is an R8 texture; B8 reads its byte in every channel
+            }
+        }
         if (!compatible) {
+            bind_source = "memory, target written back";
             // Another format over the target's bits (the first mission reads an A8B8G8R8 target as Y16_X16): the
             // target goes to guest memory, and the texture is decoded from there below (D-080; RPCS3 converts on the
-            // GPU). An expensive readback, logged with the others.
+            // GPU). An expensive readback, logged with the others, and each pair of formats once.
+            if (reinterpretations.insert((u64{s->gcm_format} << 32) | (u64{t.base_format()} << 16) | (s->width & 0xFFFF))
+                    .second) {
+                PS_LOG_INFO(kChan, "texture format {:#04x} ({}x{}) over a {}x{} render target of format {} at {:#010x}: "
+                    "written back and decoded from memory", t.base_format(), t.width, t.height, s->width, s->height,
+                    s->gcm_format, s->address);
+            }
             if (s->gpu_newer) write_back(*s);
             s = nullptr;
         }
     }
     if (s && !s->cpu_newer && fmt) {
         stats.surface_samples++;
+        bind_source = "target";
         id<MTLTexture> tex = s->texture;
         if (draw_targets.contains(s)) {
             // Reading a surface the draw also renders to: sample a copy taken before the draw.
+            bind_source = "target copy";
             tex = copy_texture(s->texture);
             std::unordered_map<u32, id<MTLTexture>> tmp;
-            return sample_view(tex, tmp, *fmt, t.remap);
+            return sample_view(tex, tmp, src);
         }
-        return sample_view(tex, s->views, *fmt, t.remap);
+        return sample_view(tex, s->views, src);
+    }
+    if (!s && fmt) {
+        // A depth buffer read as a colour texture (the lighting pass reads Z24S8 as A8R8G8B8 to rebuild positions):
+        // its bits go to guest memory, in the RSX's layout, and the texture decodes them (RPCS3 converts them on the
+        // GPU). An expensive readback, logged with the others.
+        if (Surface* d = find_surface(*ea, true); d && !d->cpu_newer && d->gpu_newer) {
+            if (reinterpretations.insert((u64{0x100 | d->gcm_format} << 32) | (u64{t.base_format()} << 16) |
+                                         (d->width & 0xFFFF)).second) {
+                PS_LOG_INFO(kChan, "texture format {:#04x} ({}x{}) over a {}x{} depth buffer of format {} at {:#010x}: "
+                    "written back and decoded from memory", t.base_format(), t.width, t.height, d->width, d->height,
+                    d->gcm_format, d->address);
+            }
+            if (write_back(*d)) bind_source = "memory, depth written back";
+        }
     }
 
     const u64 key = texture_key(t, *ea, false);
@@ -274,7 +308,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         }
     }
     entry->last_used = tick;
-    return sample_view(entry->texture, entry->views, *entry->layout.format, t.remap);
+    return sample_view(entry->texture, entry->views, texture_channel_sources(*entry->layout.format, t.remap));
 }
 
 id<MTLSamplerState> MetalBackend::Impl::sampler_for(const TextureInfo& t)

@@ -348,6 +348,70 @@ void MetalBackend::Impl::end_pass()
 
 // ---- clears -----------------------------------------------------------------------------------------------------
 
+std::string MetalBackend::Impl::describe_targets(const PassTargets& t)
+{
+    std::string d;
+    for (u32 i = 0; i < t.color_count; i++) {
+        const Surface* c = t.color[i];
+        d += std::format(" {}{:#010x} fmt {} {}x{}", i ? ", " : "", c->address, c->gcm_format, c->width, c->height);
+    }
+    if (t.depth) d += std::format("{} depth {:#010x} fmt {}", t.color_count ? ";" : "", t.depth->address, t.depth->gcm_format);
+    return d.empty() ? " nothing" : d;
+}
+
+void MetalBackend::Impl::trace_targets_of(const PassTargets& t)
+{
+    for (u32 i = 0; i < t.color_count; i++) {
+        const u32 a = t.color[i]->address;
+        if (std::find(trace_targets.begin(), trace_targets.end(), a) == trace_targets.end()) trace_targets.push_back(a);
+    }
+}
+
+void MetalBackend::Impl::trace_dump()
+{
+    // Every colour target the frame used, as it is now, converted to 8-bit BGRA.
+    for (const u32 address : trace_targets) {
+        Surface* s = find_surface(address, false);
+        if (!s || !s->texture || !config.trace_surface) continue;
+        std::vector<u8> raw;
+        if (!read_back(*s, raw)) continue;
+        std::vector<u8> out(static_cast<usize>(s->width) * s->height * 4);
+        const auto unit = [](float v) { return static_cast<u8>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); };
+        for (usize i = 0, n = static_cast<usize>(s->width) * s->height; i < n; i++) {
+            u8* o = &out[i * 4];
+            switch (s->pixel_format) {
+            case MTLPixelFormatBGRA8Unorm: std::memcpy(o, &raw[i * 4], 4); break;
+            case MTLPixelFormatRGBA8Unorm: o[0] = raw[i * 4 + 2], o[1] = raw[i * 4 + 1], o[2] = raw[i * 4], o[3] = raw[i * 4 + 3]; break;
+            case MTLPixelFormatR8Unorm: o[0] = o[1] = o[2] = raw[i], o[3] = 255; break;
+            case MTLPixelFormatRG8Unorm: o[0] = 0, o[1] = raw[i * 2 + 1], o[2] = raw[i * 2], o[3] = 255; break;
+            case MTLPixelFormatR32Float: {
+                float v;
+                std::memcpy(&v, &raw[i * 4], 4);
+                o[0] = o[1] = o[2] = unit(v), o[3] = 255;
+                break;
+            }
+            case MTLPixelFormatRGBA16Float: {
+                __fp16 h[4];
+                std::memcpy(h, &raw[i * 8], 8);
+                o[0] = unit(static_cast<float>(h[2])), o[1] = unit(static_cast<float>(h[1]));
+                o[2] = unit(static_cast<float>(h[0])), o[3] = unit(static_cast<float>(h[3]));
+                break;
+            }
+            case MTLPixelFormatRGBA32Float: {
+                float f[4];
+                std::memcpy(f, &raw[i * 16], 16);
+                o[0] = unit(f[2]), o[1] = unit(f[1]), o[2] = unit(f[0]), o[3] = unit(f[3]);
+                break;
+            }
+            default: break;
+            }
+        }
+        config.trace_surface(std::format("{:08x}-fmt{}-{}x{}", s->address, s->gcm_format, s->width, s->height), out.data(),
+            s->width, s->height);
+    }
+    trace_targets.clear();
+}
+
 void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
 {
     // RPCS3 VKGSRender.cpp clear_surface: the region is the scissor clipped to the surface; stencil is not cleared
@@ -389,6 +453,11 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
     const double depth = z24 ? (zs >> 8) / 16777215.0 : (zs & 0xffff) / 65535.0;
     const u32 stencil = zs & 0xff;
     const u32 channels = (mask >> 4) & 0xf; // R G B A
+    if (tracing) {
+        trace_targets_of(t);
+        PS_LOG_INFO("rsx.trace", "#{} clear {:#x} ->{}: colour {:#010x}, depth/stencil {:#010x}, region {},{} to {},{}",
+            ++trace_count, mask, describe_targets(t), argb, zs, x0, y0, x1, y1);
+    }
     const bool clear_depth = (mask & clear::kDepth) && pass.depth;
     const bool clear_stencil = (mask & clear::kStencil) && pass.depth && z24;
 
@@ -559,6 +628,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 
     // ---- textures: resolved before the pass opens (copying a bound render target may end a pass) ----
     std::array<id<MTLTexture>, kFragmentTextureCount> bound{};
+    std::string trace_tex;
     shader::MslFsParams fs{};
     for (u32 t = 0; t < kFragmentTextureCount; t++) {
         fs.tex_scale[t][0] = fs.tex_scale[t][1] = 1.f;
@@ -570,6 +640,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         }
         bool ok = true;
         id<MTLTexture> tex = ti.enabled ? bind_texture(ti, t, ok) : nil;
+        if (tracing) {
+            trace_tex += std::format(" t{} {:#010x} fmt {:#04x} {}x{}{} ({})", t,
+                rsx->translate(ti.offset, ti.location).value_or(0), ti.base_format(), ti.width, ti.height,
+                ti.enabled ? "" : " disabled", ti.enabled ? bind_source : "-");
+        }
         if (tex && tex.textureType == MTLTextureTypeCube && fo.texture_kind[t] == shader::TextureKind::Cube) {
             bound[t] = tex;
         } else if (tex && tex.textureType == MTLTextureType2D && fo.texture_kind[t] != shader::TextureKind::Cube) {
@@ -577,6 +652,22 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         } else {
             bound[t] = fo.texture_kind[t] == shader::TextureKind::Cube ? dummy_cube : dummy_texture;
         }
+    }
+
+    if (tracing) {
+        trace_targets_of(targets);
+        const BlendInfo b = state.blend();
+        const ColorMaskInfo cm = state.color_mask();
+        u32 vertices = 0;
+        for (const DrawRange& r : d.ranges) vertices += r.count;
+        std::string blend = "off";
+        if (b.enable || b.enable_mrt) {
+            blend = std::format("eq {:#x}/{:#x} src {:#x}/{:#x} dst {:#x}/{:#x} mrt {:#x}", b.equation_rgb, b.equation_a,
+                b.sfactor_rgb, b.sfactor_a, b.dfactor_rgb, b.dfactor_a, b.enable_mrt);
+        }
+        PS_LOG_INFO("rsx.trace", "#{} draw prim {} x{} ->{}; fp {:#010x}; mask {:x}{:x}{:x}{:x}; blend {};{}", ++trace_count,
+            static_cast<u32>(d.primitive), vertices, describe_targets(targets), fp_ea, cm.mask[0], cm.mask[1], cm.mask[2],
+            cm.mask[3], blend, trace_tex);
     }
 
     // ---- vertex parameters: viewport transform into Metal NDC for this surface
@@ -833,6 +924,13 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     tick++;
     end_pass();
     stats.flips++;
+    if (tracing && request.flip_index >= config.trace_frame) {
+        PS_LOG_INFO("rsx.trace", "frame {} ends: flip {} shows {:#010x}; {} clears and draws, {} colour targets",
+            config.trace_frame, request.flip_index,
+            request.buffer ? PS_MEM_RSX_LOCAL_BASE + request.buffer->offset : 0u, trace_count, trace_targets.size());
+        trace_dump();
+        tracing = false;
+    }
     id<MTLTexture> source = nil;
     if (request.buffer) {
         const u32 ea = PS_MEM_RSX_LOCAL_BASE + request.buffer->offset;
@@ -897,6 +995,12 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     }
     frame_event_value++;
     [cb encodeSignalEvent:frame_event value:frame_event_value];
+    if (config.trace_frame && request.flip_index + 1 == config.trace_frame) {
+        tracing = true;
+        trace_count = 0;
+        trace_targets.clear();
+        PS_LOG_INFO("rsx.trace", "frame {} begins", config.trace_frame);
+    }
 
     if (config.present) {
         PresentFrame frame;

@@ -49,6 +49,8 @@ using PresentCallback = std::function<void(const PresentFrame&)>;
 // A presented image on the CPU: BGRA8 bytes, rows top to bottom (width * 4 bytes each), and the flip it came from.
 // Called on a Metal completion thread once the GPU has finished the frame; the bytes are only valid during the call.
 using CaptureCallback = std::function<void(const u8* bgra, u32 width, u32 height, u64 flip_index)>;
+// A render target at the end of a traced frame, as 8-bit BGRA: name says where it is and its format.
+using TraceSurfaceCallback = std::function<void(const std::string& name, const u8* bgra, u32 width, u32 height)>;
 
 struct MetalBackendConfig {
     void* device = nullptr;      // id<MTLDevice>; nullptr = MTLCreateSystemDefaultDevice()
@@ -61,6 +63,11 @@ struct MetalBackendConfig {
     // dumps on the Mac).
     CaptureCallback capture;
     u32 capture_every = 0;
+    // Debug trace of one frame (0: none), the draws between flips trace_frame - 1 and trace_frame: every clear and
+    // draw is logged (channel rsx.trace: targets, programs, textures and where they come from, blending), and at its
+    // flip every colour target it used goes to trace_surface (float formats clamped to [0, 1]).
+    u64 trace_frame = 0;
+    TraceSurfaceCallback trace_surface;
 };
 
 struct BackendStats {

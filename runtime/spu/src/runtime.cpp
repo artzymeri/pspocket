@@ -50,6 +50,32 @@ constexpr u64 kP1 = 0x9E3779B185EBCA87ull;
 constexpr u64 kP2 = 0xC2B2AE3D27D4EB4Full;
 constexpr u64 kP3 = 0x165667B19E3779F9ull;
 
+// ps_spu_interp_sites: an open-addressed table of (program, pc) keys, filled without locks.
+constexpr u32 kSites = 4096;
+struct Site {
+    std::atomic<const ps_spu_program*> program{nullptr};
+    std::atomic<u32> pc{~0u};
+    std::atomic<u64> steps{0}, entries{0};
+};
+Site g_sites[kSites];
+
+void count_interpreted(const ps_spu_program* program, u32 pc, u64 steps)
+{
+    u32 h = static_cast<u32>((reinterpret_cast<uintptr_t>(program) >> 4) * 0x9E3779B1u ^ pc * 0x85EBCA6Bu) % kSites;
+    for (u32 probe = 0; probe < 32; probe++, h = (h + 1) % kSites) {
+        Site& s = g_sites[h];
+        u32 expected = ~0u;
+        if (s.pc.load(std::memory_order_relaxed) == ~0u && s.pc.compare_exchange_strong(expected, pc)) {
+            s.program.store(program, std::memory_order_relaxed);
+        } else if (s.pc.load(std::memory_order_relaxed) != pc || s.program.load(std::memory_order_relaxed) != program) {
+            continue;
+        }
+        s.steps.fetch_add(steps, std::memory_order_relaxed);
+        s.entries.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+}
+
 void report_miss(const SPUContext* ctx, u32 pc)
 {
     g_miss_count.fetch_add(1, std::memory_order_relaxed);
@@ -228,6 +254,20 @@ void ps_spu_set_get_observer(ps_spu_get_observer observer) { g_get_observer.stor
 ps_spu_miss_policy ps_spu_get_miss_policy(void) { return g_miss_policy.load(); }
 uint64_t ps_spu_miss_count(void) { return g_miss_count.load(); }
 
+uint32_t ps_spu_interp_sites(ps_spu_interp_site* out, uint32_t n)
+{
+    std::vector<ps_spu_interp_site> all;
+    for (const Site& s : g_sites) {
+        if (s.pc.load(std::memory_order_relaxed) == ~0u) continue;
+        all.push_back({s.program.load(std::memory_order_relaxed), s.pc.load(std::memory_order_relaxed),
+            s.steps.load(std::memory_order_relaxed), s.entries.load(std::memory_order_relaxed)});
+    }
+    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.steps > b.steps; });
+    const u32 count = std::min<u32>(n, static_cast<u32>(all.size()));
+    std::copy_n(all.begin(), count, out);
+    return count;
+}
+
 SPUContext* ps_spu_current(void) { return t_current; }
 
 uint32_t ps_spu_run(SPUContext* ctx)
@@ -246,7 +286,9 @@ uint32_t ps_spu_run(SPUContext* ctx)
             if (ctx->program) report_miss(ctx, ctx->pc);
             RunOptions options;
             options.stop_at_lifted = ctx->program || ctx->home || g_resolver.load(std::memory_order_relaxed);
-            run(*ctx, options);
+            const ps_spu_program* program = ctx->program;
+            const u32 pc = ctx->pc;
+            count_interpreted(program, pc, run(*ctx, options).steps);
         }
         if (ctx->stop_reason != PS_SPU_STOP_NONE) break;
     }

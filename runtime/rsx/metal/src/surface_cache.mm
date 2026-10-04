@@ -5,6 +5,7 @@
 #include "metal_internal.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <format>
 
@@ -216,11 +217,15 @@ void MetalBackend::Impl::upload_surface_from_guest(Surface& s)
     s.gpu_newer = false;
 }
 
-bool MetalBackend::Impl::read_back(Surface& s, std::vector<u8>& raw)
+bool MetalBackend::Impl::read_back(Surface& s, std::vector<u8>& raw, bool stencil)
 {
     u32 bpp = 0;
     MTLBlitOption options = MTLBlitOptionNone;
-    switch (s.pixel_format) {
+    if (stencil) {
+        if (s.pixel_format != MTLPixelFormatDepth32Float_Stencil8) return false;
+        bpp = 1;
+        options = MTLBlitOptionStencilFromDepthStencil;
+    } else switch (s.pixel_format) {
     case MTLPixelFormatBGRA8Unorm:
     case MTLPixelFormatRGBA8Unorm:
     case MTLPixelFormatR32Float: bpp = 4; break;
@@ -256,10 +261,49 @@ bool MetalBackend::Impl::read_back(Surface& s, std::vector<u8>& raw)
     return true;
 }
 
+// A depth buffer to guest memory as the RSX lays it out: Z24S8 as big-endian words, depth in the high 24 bits and
+// stencil in the low 8 (RPCS3 surface_store); Z16 as big-endian halfwords.
+bool MetalBackend::Impl::write_back_depth(Surface& s)
+{
+    const bool z16 = s.pixel_format == MTLPixelFormatDepth16Unorm;
+    if (s.swizzled || (!z16 && s.pixel_format != MTLPixelFormatDepth32Float_Stencil8)) {
+        unsupported(std::format("GPU readback of depth format {}{} is not implemented", s.gcm_format,
+            s.swizzled ? " (swizzled)" : ""));
+        return false;
+    }
+    submit(true);
+    std::vector<u8> depth, stencil;
+    if (!read_back(s, depth) || (!z16 && !read_back(s, stencil, true))) return false;
+    stats.readbacks++;
+    PS_LOG_WARN(kChan, "expensive GPU readback: depth buffer {:#010x} {}x{} (#{})", s.address, s.width, s.height,
+        stats.readbacks);
+    u8* const guest = mem.base();
+    for (u32 y = 0; y < s.height; y++) {
+        u8* row = guest + s.address + y * s.pitch;
+        for (u32 x = 0; x < s.width; x++) {
+            const usize i = static_cast<usize>(y) * s.width + x;
+            if (z16) {
+                u16 v;
+                std::memcpy(&v, &depth[i * 2], 2);
+                ps_st16(row + x * 2, v);
+            } else {
+                float z;
+                std::memcpy(&z, &depth[i * 4], 4);
+                const u32 d24 = static_cast<u32>(std::lround(std::clamp(z, 0.f, 1.f) * 16777215.f));
+                ps_st32(row + x * 4, (d24 << 8) | stencil[i]);
+            }
+        }
+    }
+    tracker.notify_write(s.address, s.bytes());
+    s.gpu_newer = false;
+    return true;
+}
+
 bool MetalBackend::Impl::write_back(Surface& s)
 {
     // GPU -> guest memory in the surface's format (RPCS3 surface_store "flush"). A full pipeline sync on a
     // tile-based GPU: plan section 7 wants every occurrence logged and patched out.
+    if (s.depth) return write_back_depth(s);
     const auto f = static_cast<SurfaceColorFormat>(s.gcm_format);
     const bool argb = !s.depth && (f == SurfaceColorFormat::A8R8G8B8 || f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 ||
                                       f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8);
@@ -271,7 +315,8 @@ bool MetalBackend::Impl::write_back(Surface& s)
                           : f == SurfaceColorFormat::F_W16Z16Y16X16 ? 2
                           : (f == SurfaceColorFormat::F_W32Z32Y32X32 || f == SurfaceColorFormat::F_X32) ? 4
                                                                                                          : 0;
-    if (s.swizzled || (!argb && !abgr && !float_bytes)) {
+    const bool b8 = !s.depth && f == SurfaceColorFormat::B8;
+    if (s.swizzled || (!argb && !abgr && !float_bytes && !b8)) {
         unsupported(std::format("GPU readback of surface format {}{} is not implemented", s.gcm_format,
             s.depth ? " (depth)" : s.swizzled ? " (swizzled)" : ""));
         return false;
@@ -282,6 +327,13 @@ bool MetalBackend::Impl::write_back(Surface& s)
     stats.readbacks++;
     PS_LOG_WARN(kChan, "expensive GPU readback: surface {:#010x} {}x{} (#{})", s.address, s.width, s.height, stats.readbacks);
 
+    if (b8) {
+        // One byte per pixel, as the Metal copy holds it (the shader's blue: surface_output_swizzle).
+        for (u32 y = 0; y < s.height; y++) std::memcpy(mem.base() + s.address + y * s.pitch, &raw[y * s.width], s.width);
+        tracker.notify_write(s.address, s.bytes());
+        s.gpu_newer = false;
+        return true;
+    }
     if (float_bytes) {
         // The Metal copy holds the same components little-endian: swap each one into place, row by row.
         const u32 components = f == SurfaceColorFormat::F_X32 ? 1 : 4;

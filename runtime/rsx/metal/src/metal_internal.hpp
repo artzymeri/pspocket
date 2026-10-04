@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
@@ -126,6 +127,11 @@ struct MetalBackend::Impl {
     BackendStats stats{};
     std::string last_error;
     u64 tick = 0;
+    // The frame trace (MetalBackendConfig::trace_frame): on while its draws run; the colour targets they used.
+    bool tracing = false;
+    u32 trace_count = 0;
+    std::vector<u32> trace_targets;
+    const char* bind_source = ""; // how bind_texture served the last texture (for the trace)
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
@@ -176,6 +182,7 @@ struct MetalBackend::Impl {
     // Caches
     std::vector<std::unique_ptr<Surface>> surfaces;
     std::unordered_map<u64, std::unique_ptr<CachedTexture>> textures; // key: hash of decode inputs
+    std::unordered_set<u64> reinterpretations; // (target format, texture format, width) pairs logged once
     std::map<PipelineKey, id<MTLRenderPipelineState>> pipelines;
     std::unordered_map<std::string, CompiledProgram> programs; // by program hash and translation options
     std::unordered_map<u64, id<MTLDepthStencilState>> depth_states;
@@ -204,6 +211,9 @@ struct MetalBackend::Impl {
     void do_draw(const RsxState& state);
     void do_clear(u32 mask, const RsxState& state);
     void do_flip(const FlipRequest& request);
+    void trace_targets_of(const PassTargets& t);
+    static std::string describe_targets(const PassTargets& t);
+    void trace_dump();
 
     // ---- surfaces (surface_cache.mm) ----
     Surface* get_color_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool swizzled);
@@ -212,14 +222,15 @@ struct MetalBackend::Impl {
     Surface* make_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool depth, bool swizzled,
         MTLPixelFormat pf);
     void evict_overlapping(u32 address, u32 size, const Surface* keep);
-    bool read_back(Surface& s, std::vector<u8>& raw); // raw texture bytes, tightly packed
+    bool read_back(Surface& s, std::vector<u8>& raw, bool stencil = false); // raw texture bytes, tightly packed
     bool write_back(Surface& s);                      // to guest memory, in the surface's format
+    bool write_back_depth(Surface& s);
     void upload_surface_from_guest(Surface& s);
     void remove_surface(Surface* s);
     id<MTLTexture> copy_texture(id<MTLTexture> src);
     id<MTLRenderPipelineState> blit_pipeline_for(MTLPixelFormat format);
     id<MTLTexture> sample_view(id<MTLTexture> tex, std::unordered_map<u32, id<MTLTexture>>& views,
-        const TextureFormatInfo& fmt, u32 remap);
+        const std::array<u8, 4>& src); // src: texture_channel_sources, adjusted for what the texture holds
 
     // ---- textures (texture_cache.mm) ----
     id<MTLTexture> bind_texture(const TextureInfo& t, u32 unit, bool& ok);
