@@ -1,7 +1,7 @@
 // The native SPURS scheduler running synthetic SPU tasks (built in code with the SPU assembler: no game data):
 // a task that exits, one that waits for a signal and resumes from its context save area, a PPU event flag set waking
-// a waiting task, an SPU-to-PPU event through a SPURS port, event flag bits set from SPU code, and two tasks yielding
-// to each other on one SPU.
+// a waiting task, an SPU-to-PPU event through a SPURS port, event flag bits set from SPU code, two tasks yielding
+// to each other on one SPU, and two workloads taking one SPU in priority order.
 
 #include "hle_test_util.hpp"
 
@@ -33,6 +33,7 @@ constexpr u32 kId = kData + 0x8000, kArg = kData + 0x8100, kArg2 = kData + 0x818
 constexpr u32 kFlag = kData + 0x8400, kQueueAttr = kData + 0x8500, kQueueId = kData + 0x8520, kPort = kData + 0x8530;
 constexpr u32 kOut = kData + 0x9000, kOut2 = kData + 0x9100;
 constexpr u32 kCtx = kData + 0xA000, kCtx2 = kData + 0xB000; // 0xC00 bytes each: 1 KB + one block
+constexpr u32 kTs2 = kData + 0xC000, kTsAttr2 = kData + 0xE000, kCounter = kData + 0xE400; // a second taskset
 constexpr u32 kElf = kData + 0x10000;
 constexpr u32 kBuf = 0x3800; // the tasks' LS buffer for DMA
 
@@ -382,6 +383,57 @@ TEST_CASE("SPURS workers: two tasks yield to each other on one SPU", "[hle][spur
     CHECK(ps_read32(b, kOut + 16) == 0xA1); // task 0 saw task 1's marker
     CHECK(ps_read32(b, kOut2 + 16) == 0xA0);
     REQUIRE(wait_for([&] { return ps_read32(b, kTs + 0x30) == 0; })); // both destroyed
+}
+
+// Regression (run 031): the kernel weighed the game's priority values themselves, so a workload at 12 won over one at 2
+// (1 is the highest) and GTA V's AudioEngine job chain starved behind lower-priority workloads. libsre's system service
+// gives the kernel 16 - priority, 0 staying "not on this SPU".
+TEST_CASE("SPURS workers: of two ready workloads, the higher priority (the lower number) runs first",
+    "[hle][spurs][spurs-run]")
+{
+    SpursFixture s(0); // workload 0, off SPU 0 until both tasks exist
+    u8* b = s.base;
+    REQUIRE(s.a.call("_cellSpursTasksetAttributeInitialize", kTsAttr2, 1, 0x330000, 0x5678, kPrio, 1) == 0);
+    REQUIRE(s.a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs2, kTsAttr2) == 0);
+    REQUIRE(ps_read32(b, kTs2 + 0x74) == 1); // workload 1, also off SPU 0
+    // Records its turn (the counter at argument word 1, then increments it) and the priorities its kernel context
+    // holds. Neither task yields, so on one SPU the first runs to its exit before the second starts.
+    Program p;
+    p.emit(as::ila(1, 0x3FFD0));
+    p.emit(as::ori(81, 3, 0));     // output EA (argument word 0)
+    p.emit(as::rotqbyi(82, 3, 4)); // counter EA (argument word 1)
+    p.emit(as::il(71, kBuf));
+    p.dma16(PS_MFC_GET, 71, 82);
+    p.emit(as::lqd(84, 0, 71));
+    p.put(84, 81, 0);
+    p.emit(as::ai(85, 84, 1));
+    p.put(85, 82, 0);
+    p.emit(as::lqa(86, 0x1A0)); // the kernel context's priorities on this SPU, one byte per workload
+    p.put(86, 81, 16);
+    p.syscall(0);
+    write_task_elf(b, kElf, p);
+    std::memset(b + kCounter, 0, 16);
+    std::memset(b + kOut, 0xFF, 32);
+    std::memset(b + kOut2, 0xFF, 32);
+    ps_write32(b, kArg, kOut);
+    ps_write32(b, kArg + 4, kCounter);
+    ps_write32(b, kArg2, kOut2);
+    ps_write32(b, kArg2 + 4, kCounter);
+    REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
+    REQUIRE(s.a.call("cellSpursCreateTask", kTs2, kId + 4, kElf, 0, 0, 0, kArg2) == 0);
+    // Workload 1 gets priority 2 on SPU 0 (first, so a worker that wakes between the two stores picks it too), then
+    // workload 0 priority 12.
+    ps_write8(b, kSpurs + 0xB00 + 0x20 + 0x18, 2);
+    ps_write8(b, kSpurs + 0xB00 + 0x18, 12);
+    REQUIRE(s.a.call("cellSpursWakeUp", kSpurs) == 0);
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut) != 0xFFFFFFFF && ps_read32(b, kOut2) != 0xFFFFFFFF; }));
+    CHECK(ps_read32(b, kOut2) == 0); // workload 1 (priority 2) ran first
+    CHECK(ps_read32(b, kOut) == 1);
+    CHECK(ps_read8(b, kOut2 + 16 + 1) == 14); // 16 - 2
+    CHECK(ps_read8(b, kOut + 16) == 4);       // 16 - 12
+    CHECK(ps_read8(b, kOut + 16 + 1) == 14);
+    CHECK(ps_read8(b, kOut + 16 + 2) == 0); // no workload 2
+    REQUIRE(wait_for([&] { return ps_read32(b, kTs + 0x30) == 0 && ps_read32(b, kTs2 + 0x30) == 0; }));
 }
 
 // Regression (found while bringing up the scheduler): the ready-count update kept its running total in a variable the

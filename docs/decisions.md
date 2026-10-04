@@ -858,6 +858,17 @@ and the SPU-side queue library its tasks link statically, in `runtime/hle/src/ce
 Left out until a game imports them: PushBody (the PPU's side of PPU2SPU queues), Clear, Size, Depth, the getters and
 the LF queues; their semantics are summarised in the file header.
 
+## D-064 · 2026-10-04 · The SPURS kernel weighs 16 - priority, as libsre's system service gives it
+
+Run 031: GTA V's audio engine thread waited 64 s for a job of its "AudioEngine" job chain (priority 4 on SPUs 0-3) that
+never ran, and the audio mixer then crashed on a voice the engine had not set up. The native scheduler (D-050) weighed
+the workloads' priority bytes as CellSpurs holds them, where 1 is the highest and 15 the lowest, so GTA V's own policy
+module (priority 12) and the Bink tasksets won every SPU over the job chains. libsre's system service (fw 4.92, read
+as the reference) writes 16 - priority into each SPU's kernel context, 0 staying "not on this SPU", and the kernel's
+selection weighs those (RPCS3 spursSysServiceUpdateWorkload). The worker now converts as it reads the guest state, and
+the kernel context at LS 0x1A0 holds the converted bytes, as policy and task code see them on the PS3. Workload
+creation logs show the priorities. A regression test runs two tasksets on one SPU: priority 2 goes before 12.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

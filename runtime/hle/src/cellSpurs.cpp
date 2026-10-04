@@ -207,6 +207,14 @@ s32 cellSpursFinalize(PPUContext& ctx, u32 spurs)
 
 // ------------------------------------------------------------------------------------------------- workloads
 
+// A workload's priorities on SPUs 0..7 for logs ("1 1 1 1 1 0 0 0"; 1 is the highest, 0 not on that SPU).
+std::string priority_text(const u8 (&priority)[8])
+{
+    std::string out;
+    for (u32 i = 0; i < 8; i++) out += std::format("{}{}", i ? " " : "", priority[i]);
+    return out;
+}
+
 // RPCS3 _spurs::add_workload (SPURS1 workloads 0..15): claims the first free workload ID, fills its tables in the guest
 // CellSpurs, gives it the unique ID of an existing workload with the same policy module (or the lowest free one) and
 // makes it runnable. The native scheduler finds the workload through the host instance.
@@ -460,8 +468,8 @@ s32 create_taskset(u8* base, u32 spurs, u32 taskset, u64 args, const u8 (&priori
     ps_write32(base, taskset + ts_off::wid, wid);
     std::string label;
     if (name) label = reinterpret_cast<const char*>(base + name);
-    PS_LOG_INFO(kChan, "taskset {:#010x} \"{}\" is workload {} of SPURS {:#010x} (max contention {})", taskset, label, wid,
-        spurs, max_contention);
+    PS_LOG_INFO(kChan, "taskset {:#010x} \"{}\" is workload {} of SPURS {:#010x} (max contention {}, priorities {})", taskset,
+        label, wid, spurs, max_contention, priority_text(priority));
     return lv2::CELL_OK;
 }
 
@@ -1586,9 +1594,9 @@ s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_cha
     std::string label;
     if (const u32 name = ps_read32(base, attr + jcattr_off::name)) label = reinterpret_cast<const char*>(base + name);
     PS_LOG_INFO(kChan, "job chain {:#010x} \"{}\" is workload {} of SPURS {:#010x} (entry {:#x}, descriptors {:#x} bytes, "
-                       "max grab {}, max contention {}, {} ready count{})",
-        job_chain, label, wid, spurs, entry, size_job, max_grabbed, max_contention, auto_spu_count ? "auto" : "fixed",
-        halt_on_error ? ", halts on error" : "");
+                       "max grab {}, max contention {}, priorities {}, {} ready count{})",
+        job_chain, label, wid, spurs, entry, size_job, max_grabbed, max_contention, priority_text(priority),
+        auto_spu_count ? "auto" : "fixed", halt_on_error ? ", halts on error" : "");
     return lv2::CELL_OK;
 }
 

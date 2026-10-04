@@ -237,13 +237,16 @@ Worker::Selection Worker::select(bool poll)
     u8* base = sched.base;
     const u32 spurs = sched.spurs;
     // What the system service keeps in each SPU's kernel context, read from the guest state: which workloads are
-    // runnable, their priority on this SPU and unique IDs.
+    // runnable, their priority on this SPU and unique IDs. The game's priorities run from 1 (highest) to 15, 0 meaning
+    // "not on this SPU"; the kernel weighs 16 - priority (0 stays 0), as libsre's system service converts them (fw 4.92;
+    // RPCS3 spursSysServiceUpdateWorkload).
     std::array<u8, CELL_SPURS_MAX_WORKLOAD> priority{}, unique{};
     u16 runnable = 0;
     const u32 enabled = ps_read32(base, spurs + wkl_off::enabled);
     const u32 unsupported = sched.unsupported.load(std::memory_order_relaxed);
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
-        priority[i] = ps_read8(base, info_addr(spurs, i) + wkl_off::info_priority + spu_num);
+        const u8 p = ps_read8(base, info_addr(spurs, i) + wkl_off::info_priority + spu_num);
+        priority[i] = p ? static_cast<u8>(0x10 - p) : 0;
         unique[i] = ps_read8(base, info_addr(spurs, i) + wkl_off::info_unique);
         if ((enabled & (0x80000000u >> i)) && ps_read8(base, spurs + wkl_off::state1 + i) == SPURS_WKL_STATE_RUNNABLE &&
             !(unsupported & (1u << i))) {
