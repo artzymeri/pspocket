@@ -24,3 +24,5 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [017](017-gta5-boot-15-mac.md) | 2026-10-04 | ad558c6+ | M4 Mac, pspocket-boot | 720p video output configured, Bink tasks created (libsre signature); first job chain "EDGE/GFX"; next gap `cellSpursRunJobChain` |
 | [018](018-gta5-boot-16-mac.md) | 2026-10-04 | ad558c6+ | M4 Mac, pspocket-boot | Vblank handler called at 59.94 Hz; next gap `cellKbInit` |
 | [019](019-gta5-boot-17-mac.md) | 2026-10-04 | ad558c6+ | M4 Mac, pspocket-boot | 60 s without a crash: input, tiles, first frame's job chain kicks; the game waits on SPU work |
+| [020](020-gta5-boot-18-mac.md) | 2026-10-04 | 5cabf48+ | M4 Mac, pspocket-boot | SPU tasks run natively on SPURS workers; job chains and the custom workload don't yet |
+| [021](021-gta5-boot-19-mac.md) | 2026-10-04 | 5cabf48+ | M4 Mac, pspocket-boot | GTA V's own SPU module runs, audio starts, no unimplemented calls; the game waits on its job chains |

@@ -34,13 +34,15 @@ and hands the cores back to the PPU threads and the renderer otherwise.
 ## Stages
 
 1. Attributes, initialize, finalize (done).
-2. Workload registry (done for SPURS1: the guest tables as RPCS3 fills them) and the scheduler (ReadyCountStore,
-   WakeUp, workload flag), custom workloads.
-3. Tasksets (PPU side done) and tasks (creation done and checked against libsre, D-047; running them is stage 3b:
-   GTA V's dependency tasks, Bink, zlib inflate).
-4. Event flags (PPU side done: attach, set, wait, detach; SPU-side waits come with the taskset policy), lv2 event
-   queue attachment (done: SPU ports in the native instance, D-040), barriers (initialize done), semaphores.
-5. Job chains (attributes, creation and `cellSpursRunJobChain` done, workload marker 0x300; running jobs needs libsre
-   as the reference: GTA V has 8 chains, including EDGE/GFX and GraphicsMain, which its frame waits on) and SPURS
-   queues.
-6. Custom workloads: `cellSpursAddWorkload` with the game's own SPU policy module (GTA V adds one, 0x11B0 bytes).
+2. Workload registry (done for SPURS1: the guest tables as RPCS3 fills them) and the scheduler (done for SPURS1, D-050:
+   host workers, kernel 1 workload selection, ReadyCountStore, WakeUp, the workload flag). SPURS2 (32 workloads) has no
+   scheduler yet.
+3. Tasksets and tasks (done, D-047, D-050: creation checked against libsre; the native taskset policy runs task ELFs
+   with libsre's local-store layout and task syscalls: GTA V's dependency tasks, Bink, zlib inflate).
+4. Event flags (done: PPU side, and SPU-side waits through the taskset policy), lv2 event queue attachment (done: SPU
+   ports in the native instance, D-040), barriers (initialize done), semaphores.
+5. Job chains (attributes, creation and `cellSpursRunJobChain` done, workload marker 0x300; running jobs is next and
+   needs libsre as the reference: GTA V has 8 chains, including EDGE/GFX and GraphicsMain, which its frame waits on)
+   and SPURS queues.
+6. Custom workloads (done, D-051): `cellSpursAddWorkload` with the game's own SPU policy module (GTA V adds one,
+   0x11B0 bytes), entered as the SPURS kernel does, with the kernel's select and exit entry points as traps.
