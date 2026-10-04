@@ -74,6 +74,7 @@ pspocket_add_component(runtime/rsx)
 pspocket_add_component(runtime/disc)
 pspocket_add_component(runtime/selftest)
 pspocket_add_component(runtime/platform/macos)
+pspocket_add_component(runtime/platform/apple)
 
 # Offline toolchain
 pspocket_add_component(recomp/common)

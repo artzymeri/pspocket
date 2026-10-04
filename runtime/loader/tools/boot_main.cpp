@@ -5,7 +5,7 @@
 //   pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]
 //                 [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]
 //                 [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]
-//                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]...
+//                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]... [--audio]
 //   pspocket-boot --probe-disc IMAGE.iso
 //
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
@@ -13,6 +13,7 @@
 // --flash mounts DIR read-only as /dev_flash: the system files a game reads itself (GTA V's MultiStream loads its MP3
 // codec, sys/external/flashMP3.pic), taken from the user's own firmware and kept out of the repository (D-067).
 // --imports lists every imported function by module (implemented ones marked) and exits without running.
+// --audio plays the game's sound (cellAudio's mix) on the Mac's default output, through AVAudioEngine.
 // --press presses a button of the virtual controller during the run (repeatable; pspocket/hle/pad_script.hpp):
 // cross@60 holds Cross from 60 s for 0.25 s, cross@60+10 again every 10 s, start@30:1.5 holds Start for 1.5 s.
 // A host fault inside guest memory (an access to an unmapped guest address) is reported with the guest address and
@@ -50,6 +51,7 @@
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/pad_script.hpp"
 #include "pspocket/hle/process.hpp"
@@ -58,6 +60,9 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/report.hpp"
 #include "pspocket/core/png.hpp"
+#if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
+#include "pspocket/platform/audio_output.hpp"
+#endif
 #if defined(PSPOCKET_HAVE_METAL)
 #include "pspocket/rsx/metal/metal_backend.hpp"
 #include "pspocket/rsx/write_tracker.hpp"
@@ -78,6 +83,7 @@ int usage()
         "                     [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]\n"
         "                     [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]\n"
         "                     [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]...\n"
+        "                     [--audio]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -320,6 +326,7 @@ int main(int argc, char** argv)
     std::string gpu = "null", frames_dir;
     u32 frame_every = 60;
     std::vector<hle::PadPress> presses;
+    bool audio = false;
     for (int i = 1; i < argc; i++) {
         const std::string_view a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -359,6 +366,7 @@ int main(int argc, char** argv)
             }
             presses.push_back(*press);
         }
+        else if (a == "--audio") audio = true;
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
         else if (a == "--log") {
@@ -478,6 +486,22 @@ int main(int argc, char** argv)
         ~ForgetHle() { g_hle = nullptr; } // before `hle` is destroyed
     } forget_hle;
     hle.install();
+#if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
+    std::unique_ptr<platform::AudioOutput> audio_output;
+    if (audio) {
+        audio_output = std::make_unique<platform::AudioOutput>();
+        hle::set_audio_sink(hle, [out = audio_output.get()](const f32* samples, u32 frames) { out->push(samples, frames); });
+    }
+    struct DetachAudio {
+        hle::HleProcess& hle;
+        ~DetachAudio() { hle::set_audio_sink(hle, {}); } // before the output is destroyed
+    } detach_audio{hle};
+#else
+    if (audio) {
+        std::fprintf(stderr, "pspocket-boot: this build has no audio output (--audio)\n");
+        return 64;
+    }
+#endif
 
     u32 main_id = 0;
     loader::LoadReport report;
@@ -543,6 +567,14 @@ int main(int argc, char** argv)
     std::printf("imports: %u functions (%u implemented), %u unresolved variables\n", report.functions_linked,
         report.functions_implemented, report.variables_unresolved);
     if (!frames_dir.empty()) std::printf("frames saved: %u in %s\n", frames_written.load(), frames_dir.c_str());
+#if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
+    if (audio_output) {
+        const auto st = audio_output->stats();
+        std::printf("sound out: %.1f s played, %llu underruns, %llu overruns\n",
+            static_cast<double>(st.played) / hle::kAudioSampleRate, static_cast<unsigned long long>(st.underruns),
+            static_cast<unsigned long long>(st.overruns));
+    }
+#endif
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());
     for (const auto* f : missing)

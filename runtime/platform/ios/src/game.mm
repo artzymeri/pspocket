@@ -2,6 +2,7 @@
 // boot_main.cpp) with the Metal backend presenting into the app's CAMetalLayer, the log in a file and on screen, and
 // the virtual controller driven by the app's buttons. Objective-C++ with ARC.
 
+#import <AVFoundation/AVFoundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
@@ -28,11 +29,13 @@
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/platform/audio_output.hpp"
 #include "pspocket/platform/ios.h"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/rsx/metal/metal_backend.hpp"
@@ -53,6 +56,7 @@ struct Session {
     std::unique_ptr<rsx::WriteTracker> tracker;
     std::unique_ptr<lv2::Kernel> kernel;
     std::unique_ptr<hle::HleProcess> hle;
+    std::unique_ptr<platform::AudioOutput> audio; // the game's sound (cellAudio's mix) on the phone's output
     loader::BootState state;
     std::chrono::steady_clock::time_point start;
     std::atomic<bool> running{false};
@@ -242,6 +246,19 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     s->hle = std::make_unique<hle::HleProcess>(*s->kernel, PS_MEM_MAIN_BASE, cfg.main_area_end,
         std::move(process_config));
     s->hle->install();
+
+    // Sound: the playback category (it plays with the ring/silent switch on), then cellAudio's mix to the speaker.
+    NSError* audio_error = nil;
+    AVAudioSession* session = [AVAudioSession sharedInstance];
+    if (![session setCategory:AVAudioSessionCategoryPlayback error:&audio_error] ||
+        ![session setActive:YES error:&audio_error]) {
+        PS_LOG_WARN(kChan, "audio session: {}", audio_error ? audio_error.localizedDescription.UTF8String : "?");
+    }
+    s->audio = std::make_unique<platform::AudioOutput>();
+    if (s->audio->valid()) {
+        hle::set_audio_sink(*s->hle,
+            [out = s->audio.get()](const f32* samples, u32 frames) { out->push(samples, frames); });
+    }
 
     loader::LoadReport report;
     if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report); r != lv2::CELL_OK) {

@@ -974,6 +974,18 @@ the Mac, through `pspocket/platform/game.h` (`runtime/platform/ios/src/game.mm`,
 Run 042 is the first device run: the same screens and the same stopping point as the Mac, at the Mac's pace. The
 `--press` parser now uses strtod: iOS 17's libc++ has no floating-point `std::from_chars`.
 
+## D-072 · 2026-10-04 · Sound out through AVAudioEngine, on the Mac and the iPhone
+
+cellAudio already mixed every started port into one stereo block per period and handed it to a host sink (D-052);
+nothing played it. `runtime/platform/apple` (macOS and iOS) now does: an `AudioRing` (`pspocket/core/audio_ring.hpp`,
+lock-free, one producer and one consumer) takes the 256-frame periods from cellAudio's thread, and an AVAudioEngine
+source node pulls them on the device's render thread, 48 kHz stereo float (the main mixer converts to the device's
+format). Playback starts once 2048 frames (43 ms) are queued and waits for them again after running dry, so an underrun
+plays silence instead of crackling; a period that doesn't fit is dropped (an overrun). The ring holds 16384 frames.
+`pspocket-boot --audio` plays on the Mac and prints the played time, underruns and overruns: a 75 s GTA V run played
+72.3 s with one underrun and no overruns. The iOS app sets the playback audio session category (sound with the silent
+switch on) and attaches the same output when it boots a game.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
