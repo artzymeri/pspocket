@@ -244,18 +244,45 @@ bool wait_aborted(Waiter& w)
     return w.aborted;
 }
 
-std::chrono::steady_clock::time_point deadline_after_us(u64 timeout_us)
+std::chrono::steady_clock::time_point deadline_after_us(std::chrono::steady_clock::time_point now, u64 timeout_us)
 {
     constexpr u64 kMaxUs = 1'000'000'000'000'000ull; // ~31 years
-    return std::chrono::steady_clock::now() + std::chrono::microseconds(static_cast<s64>(std::min(timeout_us, kMaxUs)));
+    return now + std::chrono::microseconds(static_cast<s64>(std::min(timeout_us, kMaxUs)));
+}
+
+std::chrono::steady_clock::time_point deadline_after_us(u64 timeout_us)
+{
+    return deadline_after_us(std::chrono::steady_clock::now(), timeout_us);
 }
 
 bool sleep_us(Waiter& w, u64 us)
 {
-    const auto deadline = deadline_after_us(us);
+    const auto now = std::chrono::steady_clock::now();
+    const auto deadline = deadline_after_us(now, us);
+    w.begin_wait({WaitKind::Sleep, 0}, now, deadline);
     std::unique_lock lock(w.park_mutex);
     w.park_cv.wait_until(lock, deadline, [&] { return w.aborted; });
+    w.end_wait();
     return !w.aborted;
+}
+
+const char* wait_kind_name(WaitKind kind)
+{
+    switch (kind) {
+    case WaitKind::None: return "nothing";
+    case WaitKind::Mutex: return "mutex";
+    case WaitKind::Cond: return "cond";
+    case WaitKind::RwLockRead: return "rwlock (read)";
+    case WaitKind::RwLockWrite: return "rwlock (write)";
+    case WaitKind::Semaphore: return "semaphore";
+    case WaitKind::EventQueue: return "event queue";
+    case WaitKind::EventFlag: return "event flag";
+    case WaitKind::LwMutex: return "lwmutex";
+    case WaitKind::LwCond: return "lwcond";
+    case WaitKind::Join: return "thread join";
+    case WaitKind::Sleep: return "sleep";
+    }
+    return "?";
 }
 
 // ------------------------------------------------------------------------------------------------- Guest
@@ -564,6 +591,13 @@ void Kernel::syscall(PPUContext& ctx)
         if (entry.fn) {
             PS_LOG_TRACE(kChan, "{} ({}) r3={:#x} r4={:#x} r5={:#x} r6={:#x} [thread {:#x}]", entry.name, number,
                 ctx.gpr[3], ctx.gpr[4], ctx.gpr[5], ctx.gpr[6], t->id);
+            // For reports: the syscall this thread is in (cleared on return and when the thread unwinds). Release
+            // order publishes the registers as they were at the `sc`.
+            const struct InSyscall {
+                PpuThread& thread;
+                InSyscall(PpuThread& th, u32 n) : thread(th) { th.current_syscall.store(n, std::memory_order_release); }
+                ~InSyscall() { thread.current_syscall.store(kNoSyscall, std::memory_order_relaxed); }
+            } in_syscall(*t, static_cast<u32>(number));
             entry.fn(*t, ctx);
             PS_LOG_TRACE(kChan, "{} -> r3={:#x}", entry.name, ctx.gpr[3]);
             return;

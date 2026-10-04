@@ -40,7 +40,7 @@ Result LwMutex::lock_wait(Waiter& w, u64 timeout_us)
     if (dead) return err(CELL_ESRCH);
     prepare_wait(w);
     if (const s32 s = own_or_queue_locked(w)) return (s & 1) ? CELL_OK : err(CELL_EBUSY); // bit 31 only: unlock2
-    const WaitStatus ws = park(w, lk, timeout_us,
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::LwMutex, id},
         [&](bool) { return sleepers.remove(&w) ? CancelResult::Removed : CancelResult::Woken; });
     switch (ws) {
     case WaitStatus::Woken: return w.result; // CELL_OK, or CELL_EBUSY after _sys_lwmutex_unlock2
@@ -86,7 +86,7 @@ Result LwCond::queue_wait(Waiter& w, LwMutex& mutex, u64 timeout_us)
         mutex.release_locked(false);
     }
 
-    const WaitStatus ws = park(w, lk, timeout_us, [&](bool) {
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::LwCond, id}, [&](bool) {
         if (waiters.remove(&w)) return CancelResult::Removed;
         std::lock_guard mlk(mutex.lock);
         if (mutex.sleepers.remove(&w)) return CancelResult::Removed;

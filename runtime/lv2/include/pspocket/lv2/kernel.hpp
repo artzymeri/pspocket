@@ -92,6 +92,9 @@ enum class JoinState : u8 {
     Exited,   // exited and reaped (only a stale handle can see this)
 };
 
+// PpuThread::current_syscall outside a syscall.
+inline constexpr u32 kNoSyscall = ~0u;
+
 class PpuThread final : public Object {
 public:
     static constexpr u32 kIdBase = 0x01000000; // RPCS3 PPUThread.h ppu_thread::id_base
@@ -125,6 +128,10 @@ public:
     Waiter* joiner = nullptr;
     u64 exit_status = 0;
     bool finished = false;
+
+    // The syscall the thread is executing (set by Kernel::syscall), or kNoSyscall; for reports. HLE functions call
+    // lv2 directly, so a thread inside an HLE function is not in a syscall.
+    std::atomic<u32> current_syscall{kNoSyscall};
 
     s32 priority() const { return waiter.prio.load(std::memory_order_relaxed); }
 

@@ -139,6 +139,34 @@ public:
     u64 flip_count() const { return flips_.load(std::memory_order_relaxed); }
     u32 call_depth() const { return static_cast<u32>(return_stack_.size()); }
 
+    // Why the FIFO is stopped short of put.
+    enum class BlockReason : u8 {
+        None,
+        Semaphore,  // NV406E_SEMAPHORE_ACQUIRE: the semaphore does not hold the value yet
+        JumpToSelf, // a jump to its own address: the guest parks the RSX there and patches the word to release it
+    };
+    // A snapshot of the FIFO for reports (pspocket-boot's thread report), safe to take from any thread while the RSX
+    // thread runs. The semaphore registers are read without synchronisation; they are stable while it is blocked.
+    struct Status {
+        bool running = false; // the RSX thread exists
+        bool idle = false;    // the thread parked on an empty FIFO
+        FifoLocation fifo_location = FifoLocation::Auto;
+        u32 get = 0;          // FIFO offsets
+        u32 put = 0;
+        u64 words = 0;        // command words processed
+        u64 flips = 0;
+        u64 failures = 0;
+        BlockReason block = BlockReason::None;
+        u32 block_value = 0;  // Semaphore: the value it waits for; JumpToSelf: the jump word
+        // Semaphore: where the acquire looks (NV406E_SEMAPHORE_OFFSET in the NV406E_SET_CONTEXT_DMA_SEMAPHORE
+        // context), its guest address when it translates, and the value there now.
+        u32 semaphore_offset = 0;
+        u32 semaphore_context = 0;
+        std::optional<u32> semaphore_addr;
+        u32 semaphore_value = 0;
+    };
+    Status status() const;
+
     // Guest EA for (offset, location): location is 0/1 (CELL_GCM_LOCATION_LOCAL/MAIN) or a DMA context handle
     // (0xFEED0000 frame buffer, 0xFEED0001 host buffer, semaphore, report, device). nullopt when unmapped or out of
     // range. size > 0 also checks that the whole range is reachable. RPCS3 RSXThread.cpp rsx::get_address.
@@ -226,8 +254,9 @@ private:
     u32 packet_remaining_ = 0;
     u32 packet_header_ = 0;
     std::vector<u32> return_stack_;
-    enum class BlockReason : u8 { None, Semaphore, JumpToSelf } block_reason_ = BlockReason::None;
-    u32 block_value_ = 0; // semaphore value, or the jump word
+    // Written by the thread driving the FIFO; atomic so status() can read them. The value is stored first.
+    std::atomic<BlockReason> block_reason_{BlockReason::None};
+    std::atomic<u32> block_value_{0}; // semaphore value, or the jump word
     std::atomic<bool> fifo_reset_{false};
     std::atomic<u64> pending_get_put_{0};
 

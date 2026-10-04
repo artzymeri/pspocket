@@ -288,7 +288,7 @@ Result sys_ppu_thread_join(PpuThread& t, u32 thread_id, u32 vptr)
         target->join = JoinState::Joining;
         target->joiner = &t.waiter;
         prepare_wait(t.waiter);
-        const WaitStatus ws = park(t.waiter, jl, 0, [&](bool) {
+        const WaitStatus ws = park(t.waiter, jl, 0, {WaitKind::Join, thread_id}, [&](bool) {
             if (target->joiner == &t.waiter) {
                 target->joiner = nullptr;
                 target->join = JoinState::Joinable;

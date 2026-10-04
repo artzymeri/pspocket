@@ -358,3 +358,57 @@ TEST_CASE("set_fifo_pointers from another thread is taken by the running RSX thr
     f.rsx->stop();
     CHECK(f.backend.clears() == std::vector<u32>{9});
 }
+
+TEST_CASE("status() reports where the FIFO is and what it is blocked on")
+{
+    Fixture f;
+    Rsx::Status s = f.rsx->status();
+    CHECK_FALSE(s.running);
+    CHECK(s.block == Rsx::BlockReason::None);
+    CHECK(s.get == 0);
+    CHECK(s.put == 0);
+    CHECK(s.words == 0);
+
+    // A semaphore acquire: where it looks, what the semaphore holds and what the FIFO waits for.
+    const u32 label = f.layout().label_addr(64);
+    f.write32(label, 0x1233);
+    auto b = f.at(0);
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 64 * 0x10);
+    const u32 acquire_at = b.offset();
+    b.method(m::NV406E_SEMAPHORE_ACQUIRE, 0x1234);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Blocked);
+    s = f.rsx->status();
+    CHECK(s.block == Rsx::BlockReason::Semaphore);
+    CHECK(s.block_value == 0x1234);
+    CHECK(s.semaphore_context == loc::kDmaSemaphoreRW);
+    CHECK(s.semaphore_offset == 64 * 0x10);
+    REQUIRE(s.semaphore_addr);
+    CHECK(*s.semaphore_addr == label);
+    CHECK(s.semaphore_value == 0x1233);
+    CHECK(s.get == acquire_at + 4); // the acquire's argument
+    CHECK(s.put == b.offset());
+    CHECK(s.fifo_location == FifoLocation::Io);
+    CHECK(s.words == 5); // two methods with their arguments, and the acquire's header
+
+    // Released, the FIFO runs on to a jump to itself and parks there.
+    f.write32(label, 0x1234);
+    const u32 park = b.offset();
+    b.jump(park);
+    b.method(m::NV4097_CLEAR_SURFACE, 1);
+    f.set_put(b.offset());
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Blocked);
+    s = f.rsx->status();
+    CHECK(s.block == Rsx::BlockReason::JumpToSelf);
+    CHECK(s.get == park);
+    CHECK(s.block_value == f.read32(Fixture::kCmdEa + park));
+
+    // Once the guest patches the jump, the status no longer reports it, even before the FIFO runs again.
+    f.write32(Fixture::kCmdEa + park, 0);
+    CHECK(f.rsx->status().block == Rsx::BlockReason::None);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    s = f.rsx->status();
+    CHECK(s.block == Rsx::BlockReason::None);
+    CHECK(s.get == s.put);
+    CHECK(f.backend.clears() == std::vector<u32>{1});
+}

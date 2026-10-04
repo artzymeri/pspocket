@@ -75,6 +75,13 @@ LOG="$(printf 'inventory/boot-%03d.log' "$n")"
 echo "boot.sh: $ELF -> $LOG"
 status=0
 "$BOOT" "$ELF" --timeout 60 --hdd0 "$GAME_DIR/hdd0" ${DISC[@]+"${DISC[@]}"} "$@" > "$LOG" 2>&1 || status=$?
-tail -40 "$LOG"
+# The gaps and the end of the run; with the thread report (D-053) when there is one, which is longer than a screen.
+if grep -q '^==== thread report' "$LOG"; then
+    grep -E 'UNIMPLEMENTED|\[fatal\]' "$LOG" | tail -10 || true
+    sed -n '/^==== thread report/,/^==== end of thread report/p' "$LOG"
+    sed -n '/^==== end of thread report/,$p' "$LOG" | tail -n +2
+else
+    tail -40 "$LOG"
+fi
 echo
 echo "boot.sh: exit status $status; full log in $LOG"

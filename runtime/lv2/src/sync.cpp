@@ -44,7 +44,7 @@ Result Mutex::lock_wait(Waiter& w, u64 timeout_us)
     }
     prepare_wait(w);
     if (own_or_queue_locked(w)) return CELL_OK;
-    const WaitStatus ws = park(w, lk, timeout_us,
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::Mutex, id},
         [&](bool) { return waiters.remove(&w) ? CancelResult::Removed : CancelResult::Woken; });
     switch (ws) {
     case WaitStatus::Woken: return CELL_OK; // the unlocking thread made us the owner
@@ -101,7 +101,7 @@ Result Cond::wait(Waiter& w, u64 timeout_us)
     m.hand_off_locked();
 
     bool timed_out = false;
-    const WaitStatus ws = park(w, lk, timeout_us, [&](bool aborting) {
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::Cond, id}, [&](bool aborting) {
         if (waiters.remove(&w)) {
             // Still waiting on the condition: the timeout applies; then the mutex must be re-acquired.
             timed_out = true;
@@ -172,7 +172,7 @@ Result RwLock::rlock(Waiter& w, u64 timeout_us)
     }
     prepare_wait(w);
     read_waiters.push(&w);
-    const WaitStatus ws = park(w, lk, timeout_us,
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::RwLockRead, id},
         [&](bool) { return read_waiters.remove(&w) ? CancelResult::Removed : CancelResult::Woken; });
     switch (ws) {
     case WaitStatus::Woken: return CELL_OK; // the waker counted us as a reader
@@ -218,7 +218,7 @@ Result RwLock::wlock(Waiter& w, u64 timeout_us)
     }
     prepare_wait(w);
     write_waiters.push(&w);
-    const WaitStatus ws = park(w, lk, timeout_us, [&](bool) {
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::RwLockWrite, id}, [&](bool) {
         if (!write_waiters.remove(&w)) return CancelResult::Woken;
         // The last waiting writer left while readers hold the lock: the readers queued behind it may enter.
         if (write_waiters.empty() && !writer && !read_waiters.empty()) {
@@ -274,7 +274,7 @@ Result Semaphore::wait(Waiter& w, u64 timeout_us)
     if (value-- > 0) return CELL_OK;
     prepare_wait(w);
     waiters.push(&w);
-    const WaitStatus ws = park(w, lk, timeout_us, [&](bool) {
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::Semaphore, id}, [&](bool) {
         if (!waiters.remove(&w)) return CancelResult::Woken;
         value++;
         return CancelResult::Removed;

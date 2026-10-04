@@ -277,6 +277,35 @@ u32 Rsx::read_put() const { return ps_read32(mem_.base(), config_.layout.put_add
 
 void Rsx::publish_get() { ps_write32(mem_.base(), config_.layout.get_addr(), get_.load(std::memory_order_relaxed)); }
 
+Rsx::Status Rsx::status() const
+{
+    Status s;
+    s.running = thread_.joinable();
+    s.idle = idle_.load(std::memory_order_acquire);
+    s.fifo_location = fifo_location_.load(std::memory_order_acquire);
+    s.get = get_.load(std::memory_order_acquire);
+    s.put = read_put();
+    s.words = words_.load(std::memory_order_relaxed);
+    s.flips = flips_.load(std::memory_order_relaxed);
+    s.failures = failures_.load(std::memory_order_relaxed);
+    s.block = block_reason_.load(std::memory_order_acquire);
+    s.block_value = block_value_.load(std::memory_order_relaxed);
+    if (s.block == BlockReason::JumpToSelf) {
+        // The reason stays set after the guest patches the word, until the FIFO next runs dry: parked only while the
+        // word at get is still the jump.
+        const auto ea = fifo_address(s.get);
+        if (!ea || read32(*ea) != s.block_value) s.block = BlockReason::None;
+    }
+    if (s.block == BlockReason::Semaphore) {
+        // The FIFO thread writes these registers only while it runs commands, not while it waits on the acquire.
+        s.semaphore_offset = __atomic_load_n(&state_.regs[m::NV406E_SEMAPHORE_OFFSET], __ATOMIC_RELAXED);
+        s.semaphore_context = __atomic_load_n(&state_.regs[m::NV406E_SET_CONTEXT_DMA_SEMAPHORE], __ATOMIC_RELAXED);
+        s.semaphore_addr = translate(s.semaphore_offset, s.semaphore_context, 4);
+        if (s.semaphore_addr) s.semaphore_value = read32(*s.semaphore_addr);
+    }
+    return s;
+}
+
 // ---- failures ---------------------------------------------------------------------------------------------------
 
 void Rsx::fail(FailKind kind, u32 method, std::string message)
@@ -357,8 +386,8 @@ Rsx::RunStatus Rsx::step(u64 max_words)
                 const u32 target = word & (old_jump ? cmd::kOldJumpOffsetMask : cmd::kNewJumpOffsetMask);
                 if (target == get) {
                     // Jump to self: the guest parks the RSX here and patches the word to release it.
-                    block_reason_ = BlockReason::JumpToSelf;
                     block_value_ = word;
+                    block_reason_ = BlockReason::JumpToSelf;
                     return RunStatus::Blocked;
                 }
                 get_.store(target, std::memory_order_release);
@@ -408,8 +437,8 @@ Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
 {
     if (reg == m::NV406E_SEMAPHORE_ACQUIRE) {
         if (!semaphore_acquire_satisfied(value)) {
-            block_reason_ = BlockReason::Semaphore;
             block_value_ = value;
+            block_reason_ = BlockReason::Semaphore;
             return Dispatch::Blocked;
         }
         block_reason_ = BlockReason::None;
@@ -446,7 +475,7 @@ bool Rsx::semaphore_acquire_satisfied(u32 value)
 bool Rsx::blocked_condition_cleared()
 {
     if (fifo_reset_.load(std::memory_order_acquire) || stop_requested_.load(std::memory_order_acquire)) return true;
-    switch (block_reason_) {
+    switch (block_reason_.load()) {
     case BlockReason::Semaphore: return semaphore_acquire_satisfied(block_value_);
     case BlockReason::JumpToSelf: {
         const auto ea = fifo_address(get_.load(std::memory_order_relaxed));

@@ -51,7 +51,7 @@ Result EventQueue::receive(Waiter& w, u64 timeout_us, Event& out)
     }
     prepare_wait(w);
     waiters.push(&w);
-    const WaitStatus ws = park(w, lk, timeout_us,
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::EventQueue, id},
         [&](bool) { return waiters.remove(&w) ? CancelResult::Removed : CancelResult::Woken; });
     switch (ws) {
     case WaitStatus::Woken:
@@ -139,7 +139,7 @@ Result EventFlag::wait(Waiter& w, u64 bitptn, u32 mode, u64 timeout_us, u64& res
     prepare_wait(w);
     waiters.push(&w);
     u64 timeout_pattern = 0;
-    const WaitStatus ws = park(w, lk, timeout_us, [&](bool) {
+    const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::EventFlag, id}, [&](bool) {
         if (!waiters.remove(&w)) return CancelResult::Woken;
         timeout_pattern = pattern;
         return CancelResult::Removed;

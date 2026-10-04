@@ -24,3 +24,24 @@ if(TARGET pspocket-boot)
     set_tests_properties(pspocket_boot_fault PROPERTIES
         PASS_REGULAR_EXPRESSION "guest access to 0x80000000 .* at cia 0x00010204")
 endif()
+
+# pspocket-boot's thread report: a program that waits forever on an event queue must end its run at the timeout with
+# a report naming the thread, the syscall, the queue and its state, and the backtrace into the caller. (Its own
+# directory: the rule above writes every program into boot_programs/ too, and two rules must not write one file.)
+set(boot_report_programs ${CMAKE_CURRENT_BINARY_DIR}/boot_programs_report)
+add_custom_command(
+    OUTPUT ${boot_report_programs}/wait_queue.elf
+    COMMAND make_boot_programs ${boot_report_programs}
+    DEPENDS make_boot_programs
+    COMMENT "Writing the synthetic pspocket-boot thread report programs"
+    VERBATIM)
+add_custom_target(boot_report_programs ALL DEPENDS ${boot_report_programs}/wait_queue.elf)
+if(TARGET pspocket-boot)
+    add_test(NAME pspocket_boot_thread_report COMMAND pspocket-boot ${boot_report_programs}/wait_queue.elf --timeout 2)
+    # The thread's line, what it waits on, and its backtrace: the `sc`, then the return into _start.
+    string(CONCAT thread_report_block
+        "main_thread +prio +[0-9]+  blocked +in sys_event_queue_receive \\(syscall 130\\) for [^\n]*\n"
+        " +on event queue 0x8d[0-9a-f]+ \"bootwait\": 0 of 16 events queued, 1 waiter\n"
+        " +at 0x00010298 <- 0x00010210  \\(sp 0x")
+    set_tests_properties(pspocket_boot_thread_report PROPERTIES PASS_REGULAR_EXPRESSION "${thread_report_block}")
+endif()

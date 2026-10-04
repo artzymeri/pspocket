@@ -8,6 +8,7 @@ add_library(pspocket_lv2 STATIC
     src/lw.cpp
     src/memory.cpp
     src/process.cpp
+    src/report.cpp
     src/rsx.cpp
     src/spu.cpp
     src/sync.cpp

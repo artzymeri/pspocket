@@ -12,6 +12,7 @@
 // - Waiter: a thread's parking spot. Objects queue Waiter pointers in WaitQueues. A waker removes the waiter from
 //   the queue and calls wake() while holding the lock of that object, so a waiter that times out can tell, under
 //   the same lock, whether it is still queued (it removes itself and times out) or was already woken.
+//   While it waits, a Waiter also says what it waits on (WaitKind and object ID), for thread reports (report.hpp).
 
 #include <atomic>
 #include <chrono>
@@ -109,6 +110,28 @@ inline constexpr IdSpec kPpuThreadIds{1, 100, 12, 12, false};      // ppu_thread
 inline constexpr IdSpec kMemContainerIds{1, 16, 0, 0, false};      // lv2_memory_container, base 0x3F000000
 inline constexpr IdSpec kFsIds{1, 255 - 3, 0, 0, true};            // lv2_fs_object, base 3
 
+// What a waiter is blocked on (Waiter::waiting_on), for thread reports.
+enum class WaitKind : u8 {
+    None,
+    Mutex,
+    Cond,        // also once woken (signalled, timed out), while the waiter re-takes the condition variable's mutex
+    RwLockRead,
+    RwLockWrite,
+    Semaphore,
+    EventQueue,
+    EventFlag,
+    LwMutex,     // the kernel side of sys_lwmutex (its sleep queue)
+    LwCond,      // the kernel side of sys_lwcond, also once signalled onto its lwmutex's sleep queue
+    Join,        // sys_ppu_thread_join; the ID is the joined thread's
+    Sleep,       // sys_timer_usleep / sys_timer_sleep; no ID
+};
+const char* wait_kind_name(WaitKind kind);
+
+struct WaitOn {
+    WaitKind kind = WaitKind::None;
+    u32 id = 0; // the object's lv2 ID
+};
+
 struct Waiter {
     u32 id = 0;                // lv2 thread ID (the owner value locks record)
     std::atomic<s32> prio{0};  // lv2 priority: lower is more urgent
@@ -124,6 +147,39 @@ struct Waiter {
     u64 data[4]{};
     // What the waiter waits for (event flag: bit pattern and mode), written before it queues.
     u64 want[2]{};
+
+    // What the waiter is blocked on, for reports. park() and sleep_us() set it on the waiting thread for the length
+    // of the wait (before the object lock is released, with release order, so a reader that sees it also sees the
+    // thread's registers as they were at the call) and clear it on return. Any thread may read it.
+    void begin_wait(WaitOn on, std::chrono::steady_clock::time_point since, std::chrono::steady_clock::time_point until)
+    {
+        wait_since_.store(since.time_since_epoch().count(), std::memory_order_relaxed);
+        wait_until_.store(until.time_since_epoch().count(), std::memory_order_relaxed);
+        wait_on_.store(u64{static_cast<u8>(on.kind)} << 32 | on.id, std::memory_order_release);
+    }
+    void end_wait() { wait_on_.store(0, std::memory_order_relaxed); }
+    void clear_wait_deadline() { wait_until_.store(0, std::memory_order_relaxed); }
+    WaitOn waiting_on() const
+    {
+        const u64 v = wait_on_.load(std::memory_order_acquire);
+        return {static_cast<WaitKind>(v >> 32), static_cast<u32>(v)};
+    }
+    // When the current wait began and when it times out (time_point{} for no timeout).
+    std::chrono::steady_clock::time_point wait_since() const
+    {
+        using Clock = std::chrono::steady_clock;
+        return Clock::time_point(Clock::duration(wait_since_.load(std::memory_order_relaxed)));
+    }
+    std::chrono::steady_clock::time_point wait_until() const
+    {
+        using Clock = std::chrono::steady_clock;
+        return Clock::time_point(Clock::duration(wait_until_.load(std::memory_order_relaxed)));
+    }
+
+private:
+    std::atomic<u64> wait_on_{0}; // WaitKind << 32 | ID; 0 while not waiting
+    std::atomic<std::chrono::steady_clock::rep> wait_since_{0};
+    std::atomic<std::chrono::steady_clock::rep> wait_until_{0};
 };
 
 class WaitQueue {
@@ -165,14 +221,22 @@ enum class CancelResult {
 
 // Deadline for an lv2 timeout in microseconds (0 = none; huge values are clamped to ~30 years).
 std::chrono::steady_clock::time_point deadline_after_us(u64 timeout_us);
+std::chrono::steady_clock::time_point deadline_after_us(std::chrono::steady_clock::time_point now, u64 timeout_us);
 
 // Blocks a queued waiter. `lk` holds the object lock on entry and is released while waiting; it is not held on
-// return. On timeout or abort, `cancel(aborting)` runs with `lk` re-taken and says where the waiter is.
+// return. On timeout or abort, `cancel(aborting)` runs with `lk` re-taken and says where the waiter is. `on` names
+// the object for reports (Waiter::waiting_on) while the waiter is parked.
 template <class Cancel>
-WaitStatus park(Waiter& w, std::unique_lock<std::mutex>& lk, u64 timeout_us, Cancel&& cancel)
+WaitStatus park(Waiter& w, std::unique_lock<std::mutex>& lk, u64 timeout_us, WaitOn on, Cancel&& cancel)
 {
     bool timed = timeout_us != 0;
-    const auto deadline = deadline_after_us(timeout_us);
+    const auto now = std::chrono::steady_clock::now();
+    const auto deadline = deadline_after_us(now, timeout_us);
+    w.begin_wait(on, now, timed ? deadline : std::chrono::steady_clock::time_point{});
+    const struct EndWait {
+        Waiter& waiter;
+        ~EndWait() { waiter.end_wait(); }
+    } end_wait{w};
     lk.unlock();
     for (;;) {
         bool aborting = false;
@@ -197,7 +261,10 @@ WaitStatus park(Waiter& w, std::unique_lock<std::mutex>& lk, u64 timeout_us, Can
             w.park_cv.wait(pl, [&] { return w.signaled; });
             return WaitStatus::Woken;
         }
-        case CancelResult::Requeued: timed = false; break;
+        case CancelResult::Requeued:
+            timed = false;
+            w.clear_wait_deadline();
+            break;
         }
     }
 }

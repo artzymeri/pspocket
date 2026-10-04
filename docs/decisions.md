@@ -659,6 +659,19 @@ How pspocket does it:
 - **Gap.** lv2 can't look a queue up by its IPC key yet, so only queues made by `cellAudioCreateNotifyEventQueue` can
   be registered. GTA V uses that one.
 
+## D-053 · 2026-10-04 · Every run that doesn't crash ends with a report of what each thread waits on
+
+Run 020 was the first GTA V run to end at its timeout instead of a crash, and its log could not say why the game
+stopped making progress. Since then, `pspocket-boot` prints a thread and wait report:
+- **When.** At the timeout, after a guest fault (with a 5 s watchdog, in case the faulting thread holds a lock), and
+  every N seconds with `--report-every N`. `scripts/boot.sh` prints the report block from the log.
+- **What, per thread.** Its state; what it is parked on, with the object's useful state (queued events, wanted bits
+  against the pattern, owners, counts, the guest lwmutex owner word); and a guest backtrace from the PPC64 back chain,
+  where every frame is checked before it is read.
+- **What, for the RSX.** Its FIFO position and what it is blocked on (`Rsx::status()`).
+- **How.** lv2 waiters record what they wait on, and each PPU thread records its current syscall. This costs a few
+  atomic stores on the slow (blocking) path only (`runtime/lv2/report.hpp`).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

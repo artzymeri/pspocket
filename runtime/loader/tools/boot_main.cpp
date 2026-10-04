@@ -3,7 +3,7 @@
 // This is the Phase 2 bring-up tool (plan section 10): the log names every gap the game hits, in order.
 //
 //   pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]
-//                 [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]
+//                 [--report-every SECONDS] [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]
 //   pspocket-boot --probe-disc IMAGE.iso
 //
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
@@ -11,15 +11,19 @@
 // --imports lists every imported function by module (implemented ones marked) and exits without running.
 // A host fault inside guest memory (an access to an unmapped guest address) is reported with the guest address and
 // the faulting PPU thread's instruction address before the process dies (CLAUDE.md rule 5).
+// A run that ends at its timeout, or on such a fault, prints the thread report (lv2/report.hpp): every PPU thread's
+// state, what it waits on and its guest backtrace, and the RSX's FIFO. --report-every prints it while the game runs.
 //
 // The executable must be a decrypted ELF (RPCS3's --decrypt writes one). Game files stay outside the repository.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
 #include <string_view>
@@ -35,6 +39,7 @@
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/lv2/report.hpp"
 #include "pspocket/ppu/disasm.hpp"
 #include "pspocket/ppu/runtime.h"
 
@@ -46,7 +51,8 @@ int usage()
 {
     std::fprintf(stderr,
         "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--app-home DIR] [--timeout SECONDS]\n"
-        "                     [--stop-at-first] [--log trace|debug|info|warn|error] [--imports]\n"
+        "                     [--report-every SECONDS] [--stop-at-first] [--log trace|debug|info|warn|error]\n"
+        "                     [--imports]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -54,11 +60,37 @@ int usage()
 u8* g_guest_base = nullptr;
 GuestMemory* g_memory = nullptr;
 hle::HleProcess* g_hle = nullptr;
+std::atomic<lv2::Kernel*> g_kernel{nullptr};
+volatile sig_atomic_t g_fault_signal = 0;
 
 void write_err(const char* text, int n)
 {
     if (n > 0) (void)!write(STDERR_FILENO, text, static_cast<size_t>(n));
 }
+
+// The thread report (lv2/report.hpp), with the HLE function behind each import stub named.
+std::string thread_report(lv2::Kernel& kernel, std::string title)
+{
+    lv2::ReportOptions options;
+    options.title = std::move(title);
+    options.describe_address = [](u32 addr) -> std::string {
+        const hle::LinkedFunction* f = g_hle ? g_hle->linked_at(addr) : nullptr;
+        if (!f) return {};
+        return f->module + "::" + (f->name.empty() ? std::format("{:#010x}", f->nid) : f->name);
+    };
+    return lv2::format_report(kernel, options);
+}
+
+void print_thread_report(lv2::Kernel& kernel, std::string title)
+{
+    const std::string report = thread_report(kernel, std::move(title));
+    std::fwrite(report.data(), 1, report.size(), stdout);
+    std::fflush(stdout);
+}
+
+// The thread report after a guest fault takes locks the faulting thread might hold: if it has not finished within a
+// few seconds, end the process as the fault would have.
+void on_report_timeout(int) { _exit(128 + g_fault_signal); }
 
 // After the fault line: the argument registers, the firmware function running (when the PPU is in an HLE stub) and
 // the caller's last instructions before LR, so a crash in an HLE function shows what the game passed in each
@@ -102,7 +134,8 @@ void on_fault(int sig, siginfo_t* info, void*)
     const PPUContext* c = t ? t->ctx : nullptr;
     char buf[384];
     int n;
-    if (base && addr >= base && addr < base + GuestMemory::kGuestSize + GuestMemory::kGuardSize) {
+    const bool guest = base && addr >= base && addr < base + GuestMemory::kGuestSize + GuestMemory::kGuardSize;
+    if (guest) {
         n = std::snprintf(buf, sizeof buf,
             "\n[fatal] boot: %s: guest access to 0x%08llx (not mapped, or protected) by PPU thread 0x%x at cia 0x%08x "
             "(lr 0x%llx, r1 0x%llx, r2 0x%llx, r3 0x%llx). cia is exact for interpreted code.\n",
@@ -117,6 +150,16 @@ void on_fault(int sig, siginfo_t* info, void*)
     }
     write_err(buf, std::min<int>(n, sizeof buf - 1));
     if (c) report_call_site(*c);
+    // What every thread was doing. Best effort, like the call site: it locks and allocates, so a watchdog ends the
+    // process if the faulting thread held a lock the report needs.
+    if (lv2::Kernel* kernel = g_kernel.load(); guest && kernel) {
+        g_fault_signal = sig;
+        signal(SIGALRM, on_report_timeout);
+        alarm(5);
+        const std::string report =
+            thread_report(*kernel, std::format("guest fault in PPU thread {:#x}", t ? t->id : 0));
+        write_err(report.data(), static_cast<int>(report.size()));
+    }
     _exit(128 + sig);
 }
 
@@ -179,6 +222,7 @@ int main(int argc, char** argv)
     const char* elf_path = nullptr;
     std::string bdvd, hdd0, app_home;
     double timeout_s = 30;
+    double report_every_s = 0; // 0: only at the end
     bool stop_at_first = false;
     bool list_imports = false;
     for (int i = 1; i < argc; i++) {
@@ -188,6 +232,11 @@ int main(int argc, char** argv)
         else if (a == "--hdd0") { const char* v = value(); if (!v) return usage(); hdd0 = v; }
         else if (a == "--app-home") { const char* v = value(); if (!v) return usage(); app_home = v; }
         else if (a == "--timeout") { const char* v = value(); if (!v) return usage(); timeout_s = std::atof(v); }
+        else if (a == "--report-every") {
+            const char* v = value();
+            if (!v || std::atof(v) <= 0) return usage();
+            report_every_s = std::atof(v);
+        }
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
         else if (a == "--log") {
@@ -236,6 +285,10 @@ int main(int argc, char** argv)
 
     lv2::Kernel kernel(memory, cfg);
     kernel.install();
+    g_kernel = &kernel;
+    struct ForgetKernel {
+        ~ForgetKernel() { g_kernel = nullptr; } // before `kernel` is destroyed
+    } forget_kernel;
     hle::GameInfo game;
     if (!bdvd.empty() && std::filesystem::is_regular_file(bdvd)) {
         // A disc image: read in place; /dev_bdvd and /app_home come from it.
@@ -255,7 +308,10 @@ int main(int argc, char** argv)
     if (!hdd0.empty() && !kernel.vfs_mount("/dev_hdd0", hdd0, false)) return 66;
     if (!app_home.empty() && !kernel.vfs_mount("/app_home", app_home, false)) return 66;
 
-    hle::HleProcess hle(kernel, PS_MEM_MAIN_BASE, cfg.main_area_end, {stop_at_first, std::move(game)});
+    hle::ProcessConfig process_config;
+    process_config.abort_on_unimplemented = stop_at_first;
+    process_config.game = std::move(game);
+    hle::HleProcess hle(kernel, PS_MEM_MAIN_BASE, cfg.main_area_end, std::move(process_config));
     g_hle = &hle;
     struct ForgetHle {
         ~ForgetHle() { g_hle = nullptr; } // before `hle` is destroyed
@@ -277,9 +333,30 @@ int main(int argc, char** argv)
         return 70;
     }
 
-    const auto start = std::chrono::steady_clock::now();
-    const bool done = kernel.wait_for_exit(std::chrono::milliseconds(static_cast<s64>(timeout_s * 1000)));
-    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    const auto seconds = [](double s) {
+        return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(s));
+    };
+    const auto deadline = start + seconds(timeout_s);
+    auto next_report = start + seconds(report_every_s);
+    bool done = false;
+    for (;;) {
+        const auto until = report_every_s > 0 ? std::min(deadline, next_report) : deadline;
+        done = kernel.wait_for_exit(std::chrono::ceil<std::chrono::milliseconds>(std::max(until - Clock::now(),
+            Clock::duration::zero())));
+        const auto now = Clock::now();
+        if (done || now >= deadline) break;
+        if (report_every_s > 0 && now >= next_report) {
+            const double elapsed = std::chrono::duration<double>(now - start).count();
+            print_thread_report(kernel, std::format("after {:.1f} s", elapsed));
+            next_report += seconds(report_every_s);
+        }
+    }
+    const double secs = std::chrono::duration<double>(Clock::now() - start).count();
+
+    // At a timeout, what every thread waits for (the summary stays the last thing printed).
+    if (!done) print_thread_report(kernel, std::format("timeout after {:.1f} s", secs));
 
     // Summary: which gaps the run hit, most-called first.
     std::vector<const hle::LinkedFunction*> missing;
