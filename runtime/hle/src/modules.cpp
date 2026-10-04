@@ -8,6 +8,7 @@ void register_cellAudio(Registry& r);
 void register_cellGame(Registry& r);
 void register_cellGcmSys(Registry& r);
 void register_cellNetCtl(Registry& r);
+void register_cellRtc(Registry& r);
 void register_cellSheap(Registry& r);
 void register_cellSpurs(Registry& r);
 void register_cellSysmodule(Registry& r);
@@ -24,6 +25,7 @@ void register_all_modules(Registry& r)
     register_cellGame(r);
     register_cellGcmSys(r);
     register_cellNetCtl(r);
+    register_cellRtc(r);
     register_cellSheap(r);
     register_cellSpurs(r);
     register_cellSysmodule(r);

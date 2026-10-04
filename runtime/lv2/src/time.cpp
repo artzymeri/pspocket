@@ -263,15 +263,30 @@ Result sys_time_set_timezone(PpuThread& t, s32, s32)
     return t.kernel.config().root ? CELL_OK : err(CELL_ENOSYS); // RPCS3: root only, no effect
 }
 
+void host_time_zone(s32& timezone, s32& summertime)
+{
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    summertime = local.tm_isdst > 0 ? 60 : 0;
+    timezone = static_cast<s32>(local.tm_gmtoff / 60) - summertime; // minutes east of UTC
+}
+
+void host_current_time(s64& sec, s64& nsec)
+{
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    sec = ts.tv_sec;
+    nsec = ts.tv_nsec;
+}
+
 Result sys_time_get_timezone(PpuThread& t, u32 timezone, u32 summertime)
 {
     Guest& g = t.kernel.impl().guest;
     if (!g.valid(timezone, 4) || !g.valid(summertime, 4)) return err(CELL_EFAULT);
-    const std::time_t now = std::time(nullptr);
-    std::tm local{};
-    localtime_r(&now, &local);
-    const s32 dst = local.tm_isdst > 0 ? 60 : 0;
-    g.w32(timezone, static_cast<u32>(static_cast<s32>(local.tm_gmtoff / 60) - dst)); // minutes east of UTC
+    s32 tz = 0, dst = 0;
+    host_time_zone(tz, dst);
+    g.w32(timezone, static_cast<u32>(tz));
     g.w32(summertime, static_cast<u32>(dst));
     return CELL_OK;
 }
@@ -280,11 +295,11 @@ Result sys_time_get_current_time(PpuThread& t, u32 sec, u32 nsec)
 {
     Guest& g = t.kernel.impl().guest;
     if (!g.valid(sec, 8)) return err(CELL_EFAULT);
-    timespec ts{};
-    clock_gettime(CLOCK_REALTIME, &ts);
-    g.w64(sec, static_cast<u64>(ts.tv_sec));
+    s64 s = 0, ns = 0;
+    host_current_time(s, ns);
+    g.w64(sec, static_cast<u64>(s));
     if (!g.valid(nsec, 8)) return err(CELL_EFAULT);
-    g.w64(nsec, static_cast<u64>(ts.tv_nsec));
+    g.w64(nsec, static_cast<u64>(ns));
     return CELL_OK;
 }
 

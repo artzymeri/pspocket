@@ -780,6 +780,15 @@ Where pspocket differs from RPCS3: an invalid communication ID in sceNpLookupCre
 (RPCS3 aborts); a 33rd title context gets TOO_MANY_OBJECTS (RPCS3 returns 0, which reads as success); an unreadable
 presence pointer is refused (RPCS3 faults); presence data is not kept (nothing reads it offline).
 
+## D-060 · 2026-10-04 · cellRtc as RPCS3, quirks included; the clock is lv2's
+
+The seven cellRtc functions GTA V imports (current tick and local clock, tick and date conversions, Win32 file times,
+RFC 2822 formatting, the date parser) follow RPCS3's cellRtc.cpp, which follows libcellRtc closely, including its
+quirks: a "+hhmm" time zone reads as hh * 60 + hhmm % 60 minutes, a day below '0' in asctime dates passes, hours up to
+25 are accepted. The current time and time zone are what lv2's sys_time_get_current_time and sys_time_get_timezone
+report: both now read the host clock through `lv2::host_current_time` and `host_time_zone`. Pointers are checked
+against mapped guest memory, as RPCS3 does with sys_memory_get_page_attribute.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

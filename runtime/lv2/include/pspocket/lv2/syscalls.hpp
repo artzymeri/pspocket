@@ -64,6 +64,11 @@ u64 sys_time_get_system_time(PpuThread& t);
 // Guest system time: microseconds since the timebase origin (ps_timebase_now at 79.8 MHz), the clock timers and
 // sys_time_get_system_time use.
 u64 guest_system_time_us();
+// What sys_time_get_current_time and sys_time_get_timezone report, for HLE modules: the host's wall clock (seconds and
+// nanoseconds since 1970) and its time zone (minutes east of UTC without daylight saving time, and the daylight
+// saving offset in minutes).
+void host_current_time(s64& sec, s64& nsec);
+void host_time_zone(s32& timezone, s32& summertime);
 
 // ---- event flags (sys_event_flag.cpp)
 Result sys_event_flag_create(PpuThread& t, u32 id, u32 attr, u64 init);
