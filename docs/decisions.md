@@ -757,6 +757,29 @@ Two cellSpurs PPU-side fixes from runs 029 and 030, both checked against libsre 
   container handler at 0x1900: a marker (0x400) here, since that handler is Sony SPU code and no task of GTA V has an
   exit code container (the taskset policy stops loudly if one does).
 
+## D-059 · 2026-10-04 · PSN offline: 43 of GTA V's 51 sceNp functions, as RPCS3 without a signed-in user
+
+GTA V calls PSN functions one after another during startup (runs 026 to 028). Instead of one round per function, the
+sceNp functions it imports with a simple offline behaviour in RPCS3 are implemented together (D-024: PSN is a
+non-goal). Each makes RPCS3's checks in RPCS3's order, then takes RPCS3's path with PSN disabled: status offline, NP ID
+all zeros, no ticket, no basic event, no signaling connection, addresses 0.
+- **Lookup:** init and term, title contexts (IDs from 0x3001 as RPCS3's idm hands them out), transaction contexts
+  refused (INVALID_ONLINE_ID), the async requests refused, poll reports done.
+- **Manager:** NP ID, region, age, content rating, chat restriction and network time: SCE_NP_ERROR_OFFLINE; no ticket;
+  no entitlements; the callback kept, never called.
+- **Basic:** one event handler kept (never called); no events; presence accepted and dropped; no block list or
+  messages.
+- **Signaling:** contexts (IDs from 0x6001, at most 8), handlers kept, local net info with no addresses, no
+  connections. **Util:** sceNpUtilCmpNpId.
+
+Left out, until a log shows them: functions that open system dialogs, send messages, need RPCN or the network
+(sceNpSignalingActivateConnection), write player history with a later event, or check DRM files and keys
+(sceNpDrmIsAvailable).
+
+Where pspocket differs from RPCS3: an invalid communication ID in sceNpLookupCreateTitleCtx is logged and refused
+(RPCS3 aborts); a 33rd title context gets TOO_MANY_OBJECTS (RPCS3 returns 0, which reads as success); an unreadable
+presence pointer is refused (RPCS3 faults); presence data is not kept (nothing reads it offline).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
