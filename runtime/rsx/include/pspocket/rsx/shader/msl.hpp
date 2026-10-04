@@ -104,7 +104,7 @@ struct MslShader {
     std::string source;
     std::string entry;
     u32 input_mask = 0;     // VP: attributes fetched; FP: FpInput bits read
-    u32 texture_mask = 0;   // FP: texture units sampled
+    u32 texture_mask = 0;   // FP: texture units sampled; VP: vertex texture units sampled (TXL)
     u32 constant_count = 0; // FP: number of fc[] entries (FragmentProgram::constant_offsets.size())
 };
 

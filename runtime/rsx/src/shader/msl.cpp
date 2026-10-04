@@ -142,7 +142,7 @@ bool vp_vec_supported(u32 op)
     case VpVecOp::DP3: case VpVecOp::DPH: case VpVecOp::DP4: case VpVecOp::DST: case VpVecOp::MIN:
     case VpVecOp::MAX: case VpVecOp::SLT: case VpVecOp::SGE: case VpVecOp::SEQ: case VpVecOp::SNE:
     case VpVecOp::SGT: case VpVecOp::SLE: case VpVecOp::SFL: case VpVecOp::STR: case VpVecOp::FRC:
-    case VpVecOp::FLR: case VpVecOp::SSG: case VpVecOp::ARL: return true;
+    case VpVecOp::FLR: case VpVecOp::SSG: case VpVecOp::ARL: case VpVecOp::TXL: return true;
     default: return false;
     }
 }
@@ -300,6 +300,11 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
             case VpVecOp::FRC: e = std::format("fract({})", s0); break;
             case VpVecOp::FLR: e = std::format("floor({})", s0); break;
             case VpVecOp::SSG: e = std::format("sign({})", s0); break;
+            // Vertex texture fetch (RPCS3 VERTEX_TEXTURE_FETCH2D: textureLod($t, $0.xy, 0)).
+            case VpVecOp::TXL:
+                e = std::format("vtex{}.sample(vsmp{}, ({}).xy, level(0.0))", in.tex_num, in.tex_num, s0);
+                result.shader.texture_mask |= 1u << in.tex_num;
+                break;
             default: break;
             }
             body += std::format("        float4 vec = {};\n", e);
@@ -400,8 +405,17 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
     src += std::format(
         "vertex rsx_vs_out {}(uint vid [[vertex_id]], device const uchar* vb [[buffer({})]],\n"
         "    constant rsx_vs_params& p [[buffer({})]], constant float4* vc [[buffer({})]],\n"
-        "    device const uchar* ib [[buffer({})]])\n{{\n",
-        result.shader.entry, slot::kVsVertexData, slot::kVsParams, slot::kVsConstants, slot::kVsIndexData);
+        "    device const uchar* ib [[buffer({})]]{})\n{{\n",
+        result.shader.entry, slot::kVsVertexData, slot::kVsParams, slot::kVsConstants, slot::kVsIndexData,
+        [&] {
+            // Vertex textures (D-093): the four RSX vertex texture units, sampled 2D.
+            std::string t;
+            for (u32 i = 0; i < 4; i++) {
+                if (result.shader.texture_mask & (1u << i))
+                    t += std::format(",\n    texture2d<float> vtex{} [[texture({})]], sampler vsmp{} [[sampler({})]]", i, i, i, i);
+            }
+            return t;
+        }());
     src += "    const uint vi = rsx_vertex_index(vid, p, ib);\n";
     for (u32 i = 0; i < 16; i++) {
         if (vp.input_mask & (1u << i)) {

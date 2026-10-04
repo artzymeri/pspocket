@@ -587,16 +587,25 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 {
     tick++;
     const DrawClause& d = state.draw;
+    // A skipped draw names why in the frame trace too (D-084): a draw the trace does not show cannot be told apart from
+    // one the game never made.
+    const char* skip_reason = "";
     auto skip = [&](std::string why) {
         stats.draws_skipped++;
+        if (tracing) {
+            PS_LOG_INFO("rsx.trace", "#{} draw SKIPPED ({}{}) ->{}", ++trace_count, why.empty() ? skip_reason : why.c_str(),
+                why.empty() && !*skip_reason ? "?" : "", describe_targets(draw_targets));
+        }
         if (!why.empty()) unsupported(std::move(why));
     };
 
     // ---- targets and programs ----
     PassTargets targets;
+    skip_reason = "no render target";
     if (!select_targets(state, targets, ~0u)) return skip("");
     const bool points = d.primitive == Primitive::Points;
     const CompiledProgram* vp = vertex_program_for(state, points);
+    skip_reason = "vertex program";
     if (!vp) return skip("");
     shader::FpOptions fo;
     fo.shader_control = state.shader_program().control;
@@ -615,6 +624,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const shader::FragmentProgram* fprog = nullptr;
     u32 fp_ea = 0;
     const CompiledProgram* fp = fragment_program_for(state, fo, &fprog, fp_ea);
+    skip_reason = "fragment program";
     if (!fp) return skip("");
 
     // ---- scissor: RSX scissor and viewport rectangles within the surface (RPCS3 get_scissor, clip_viewport) ----
@@ -632,9 +642,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const u32 sx0 = std::max<u32>(sc.x, vpi.x), sy0 = std::max<u32>(sc.y, vpi.y);
     const u32 sx1 = std::min({u32{sc.x} + sc.width, u32{vpi.x} + vpi.width, surf_w});
     const u32 sy1 = std::min({u32{sc.y} + sc.height, u32{vpi.y} + vpi.height, surf_h});
+    skip_reason = "empty scissor or viewport";
     if (sx1 <= sx0 || sy1 <= sy0) return skip("");
     if (raster.cull_enable && static_cast<CullFace>(raster.cull_face) == CullFace::FrontAndBack &&
         d.primitive >= Primitive::Triangles) {
+        skip_reason = "front and back culled";
         return skip(""); // every polygon is culled
     }
 
@@ -663,6 +675,21 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             bound[t] = tex;
         } else {
             bound[t] = fo.texture_kind[t] == shader::TextureKind::Cube ? dummy_cube : dummy_texture;
+        }
+    }
+
+    // ---- vertex textures (VP TXL, D-093): resolved before the pass opens, like the fragment textures ----
+    std::array<id<MTLTexture>, 4> vbound{};
+    for (u32 t = 0; t < 4; t++) {
+        if (!(vp->shader.texture_mask & (1u << t))) continue;
+        const TextureInfo vt = state.vertex_texture(t);
+        bool ok = true;
+        id<MTLTexture> tex = vt.enabled ? bind_texture(vt, 16 + t, ok) : nil;
+        vbound[t] = tex && tex.textureType == MTLTextureType2D ? tex : dummy_texture;
+        if (tracing) {
+            trace_tex += std::format(" vt{} {:#010x} fmt {:#04x} {}x{}{} ({})", t,
+                rsx->translate(vt.offset, vt.location).value_or(0), vt.base_format(), vt.width, vt.height,
+                vt.enabled ? "" : " disabled", vt.enabled ? bind_source : "-");
         }
     }
 
@@ -803,6 +830,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 
     if (!vertex_data.buffer) {
         // Arrays (plain, indexed or by element): copy each attribute's referenced range of guest memory.
+        skip_reason = "no vertices";
         if (ranges.empty()) return skip("");
         if (max_vi - min_vi > 0x100000) return skip(std::format("vertex range {}..{} is too large", min_vi, max_vi));
         struct Copy {
@@ -867,6 +895,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // ---- encode ----
     open_pass(targets);
     id<MTLRenderPipelineState> pso = pipeline_for(*vp, *fp, state);
+    skip_reason = "pipeline state";
     if (!pso) return skip("");
     id<MTLRenderCommandEncoder> enc = start_encoder();
     [enc setRenderPipelineState:pso];
@@ -905,6 +934,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (!bound[t]) continue;
         [enc setFragmentTexture:bound[t] atIndex:t];
         [enc setFragmentSamplerState:sampler_for(state.fragment_texture(t)) atIndex:t];
+    }
+    for (u32 t = 0; t < 4; t++) {
+        if (!vbound[t]) continue;
+        [enc setVertexTexture:vbound[t] atIndex:t];
+        [enc setVertexSamplerState:sampler_for(state.vertex_texture(t)) atIndex:t];
     }
 
     MTLPrimitiveType ptype = MTLPrimitiveTypeTriangle;

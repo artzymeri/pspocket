@@ -37,3 +37,23 @@ if(PSPOCKET_GAME_SPU)
     target_link_libraries(pspocket-boot PRIVATE pspocket_game_spu)
     target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_GAME_SPU=1)
 endif()
+
+# The game's PPU code translated ahead of time (D-092): ppu-lift over the executable's loaded segments
+# (--name game_ppu --prefix game_ppu_), from the user's own game, outside the repository (CLAUDE.md rule 1);
+# -DPSPOCKET_GAME_PPU=DIR builds it into pspocket-boot, which registers it in the dispatch table. About 800 MB of C
+# for GTA V: built without debug information.
+set(PSPOCKET_GAME_PPU "" CACHE PATH "Lifted PPU code (ppu-lift output, --name game_ppu) to build into pspocket-boot")
+if(PSPOCKET_GAME_PPU)
+    file(GLOB pspocket_game_ppu_sources CONFIGURE_DEPENDS ${PSPOCKET_GAME_PPU}/*.c)
+    if(NOT pspocket_game_ppu_sources)
+        message(FATAL_ERROR "PSPOCKET_GAME_PPU=${PSPOCKET_GAME_PPU} holds no lifted code")
+    endif()
+    add_library(pspocket_game_ppu STATIC ${pspocket_game_ppu_sources})
+    target_link_libraries(pspocket_game_ppu PRIVATE pspocket::ppu)
+    target_include_directories(pspocket_game_ppu PRIVATE ${PSPOCKET_GAME_PPU})
+    target_compile_options(pspocket_game_ppu PRIVATE -g0)
+    pspocket_set_warnings(pspocket_game_ppu)
+    pspocket_set_generated_warnings(pspocket_game_ppu)
+    target_link_libraries(pspocket-boot PRIVATE pspocket_game_ppu)
+    target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_GAME_PPU=1)
+endif()

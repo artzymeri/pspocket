@@ -101,6 +101,9 @@ int usage()
 #if defined(PSPOCKET_HAVE_GAME_SPU)
 extern "C" void pspocket_game_spu_register(void); // the game's lifted SPU programs (scripts/lift-spu.sh, D-076)
 #endif
+#if defined(PSPOCKET_HAVE_GAME_PPU)
+extern "C" void game_ppu_register(void); // the game's PPU code translated ahead of time (ppu-lift, D-092)
+#endif
 
 u8* g_guest_base = nullptr;
 GuestMemory* g_memory = nullptr;
@@ -424,7 +427,8 @@ int main(int argc, char** argv)
     if (!memory.reserve()) return 71;
     install_fault_reporter(memory);
 
-    // No lifted code is linked into this host: every guest function runs in the interpreter.
+    // Guest code the build has no translation for (a build without -DPSPOCKET_GAME_PPU: all of it) runs in the
+    // interpreter, which enters translated functions where it reaches them (D-092).
     ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
 
     lv2::Config cfg = (*exe)->kernel_config();
@@ -526,6 +530,9 @@ int main(int argc, char** argv)
 #if defined(PSPOCKET_HAVE_GAME_SPU)
     pspocket_game_spu_register();
     hle::enable_spu_modules();
+#endif
+#if defined(PSPOCKET_HAVE_GAME_PPU)
+    game_ppu_register(); // branches into it from the interpreter run it (D-092)
 #endif
     if (!spu_dump.empty()) {
         hle::set_spu_dump_dir(spu_dump);

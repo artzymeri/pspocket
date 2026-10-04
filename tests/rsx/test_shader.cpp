@@ -198,14 +198,28 @@ TEST_CASE("vertex program condition codes: an update to CC1 and conditional writ
 TEST_CASE("unsupported vertex program features are named")
 {
     std::vector<VpInst> prog = sample_vp();
-    prog[1].vec_op = static_cast<u32>(VpVecOp::TXL);
+    prog[1].vec_op = 0x17; // no such vector op
     auto words = assemble_vp(prog);
     auto vp = decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
     REQUIRE(vp.has_value());
     TranslateResult r = translate_vertex_program(*vp);
     CHECK_FALSE(r.ok);
-    CHECK(r.error.find("opcode TXL") != std::string::npos);
+    CHECK(r.error.find("opcode VEC?") != std::string::npos);
     CHECK(r.error.find("instruction 1") != std::string::npos);
+
+    // TXL samples a vertex texture (D-093): tex_num is src1's register field.
+    prog = sample_vp();
+    prog[1].vec_op = static_cast<u32>(VpVecOp::TXL);
+    prog[1].src[1] = vp_temp(2);
+    words = assemble_vp(prog);
+    vp = decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
+    REQUIRE(vp.has_value());
+    r = translate_vertex_program(*vp);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    CHECK(r.shader.source.find("vtex2.sample(vsmp2, ") != std::string::npos);
+    CHECK(r.shader.source.find("texture2d<float> vtex2 [[texture(2)]], sampler vsmp2 [[sampler(2)]]") != std::string::npos);
+    CHECK(r.shader.texture_mask == 0x4);
 
     prog = sample_vp();
     prog[3].sca_op = static_cast<u32>(VpScaOp::BRB);

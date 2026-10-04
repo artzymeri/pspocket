@@ -1364,6 +1364,28 @@ mispredicts on nearly every instruction). The interpreter now keeps one 64-bit w
 instruction word, its op and whether it branches. The op is a function of the word alone, so an entry is used exactly
 when its word matches memory; code loaded or patched since simply misses. Shared by the PPU threads, read and written
 relaxed (a race is a miss). Test: code patched at an address after it ran runs as patched.
+Run 062: the first mission at 26 to 28 fps (run 061: 22 to 24).
+
+## D-092 · 2026-10-04 · The game's PPU code translated ahead of time, built in
+
+`ppu-lift` translates GTA V's whole executable (both loaded segments as one image from 0x10000, the entry and the 52,704
+.opd descriptors as seeds) in 6.3 s: 85,342 functions, 6,086,213 instructions, no fallbacks, 823 MB of C in 512 units
+(`--name game_ppu --prefix game_ppu_`, so the names say nothing about the game). One unit compiles in about 1.6 s.
+- `-DPSPOCKET_GAME_PPU=DIR` builds that output into pspocket-boot without debug information; pspocket-boot registers
+  it in the PPU dispatch table at start. The interpreter enters a translated function wherever a branch reaches one
+  (D-028's interop), and translated code falls back to the interpreter for what it cannot reach.
+- The HLE's import trampolines live in their own memory, so they and the game's functions never share an address.
+- Like the SPU programs, the output is derived from the user's game: it stays in inventory/ (CLAUDE.md rule 1).
+
+## D-093 · 2026-10-04 · Vertex texture fetch; skipped draws in the frame trace
+
+The frame trace now names skipped draws and why (D-084). Run 063's mission frame skipped five, all for their vertex
+programs: the post-processing chain (into the target the final composite shows, the HDR downsample, a bloom target and
+the 1x1 exposure value), whose vertex programs read the exposure through TXL. That is why the frame showed the G-buffer
+albedo instead of the lit image.
+- TXL in a vertex program samples vertex texture unit `tex_num` at level 0 with src0.xy (RPCS3
+  VERTEX_TEXTURE_FETCH2D: textureLod($t, $0.xy, 0)); the four units are bound as vertex textures and samplers.
+- Tests: the translation, and a draw whose vertex colour comes from a vertex texture, end to end.
 
 ## Open decisions (plan section 14)
 

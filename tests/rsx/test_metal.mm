@@ -1282,6 +1282,58 @@ TEST_CASE("metal e2e: a Z16 depth buffer reads as X16 (its value) and as DEPTH16
     }
 }
 
+TEST_CASE("metal e2e: a vertex program samples a vertex texture (TXL, D-093)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    // A 4x4 linear A8R8G8B8 texture, every texel 0xff 0x20 0x40 0x80 (A R G B).
+    for (u32 i = 0; i < 16; i++) e.put_local32(kTexOffset + i * 4, 0xff204080);
+
+    // VP: o[0] = v[0]; o[1] = TXL(v[8].xy, TEX0) -- the colour comes from the vertex texture
+    VpInst pos;
+    pos.vec_op = 1;
+    pos.src[0] = vp_in();
+    pos.input = 0;
+    pos.out = 0;
+    pos.vec_mask = 0xf;
+    VpInst txl;
+    txl.vec_op = 0x19;
+    txl.src[0] = vp_in();
+    txl.src[1] = vp_temp(0); // tex_num 0
+    txl.input = 8;
+    txl.out = 1;
+    txl.vec_mask = 0xf;
+    txl.end = true;
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({pos, txl}));
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+    b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, (1u << 0) | (1u << 8));
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    b.method(m::NV4097_SET_VERTEX_TEXTURE_OFFSET, {
+        kTexOffset,
+        (loc::kLocal + 1) | (2u << 4) | ((tex::A8R8G8B8 | tex::kLinearFlag) << 8) | (1u << 16),
+        3u | (3u << 8) | (3u << 16),
+        (1u << 31),
+        4u * 4,                  // CONTROL3: pitch
+        (1u << 16) | (1u << 24), // nearest
+        (4u << 16) | 4u,
+    });
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().draws == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x20, 0x40, 0x80});
+}
+
 TEST_CASE("metal e2e: flip presents the display buffer scaled to the output size")
 {
     REQUIRE_METAL();
