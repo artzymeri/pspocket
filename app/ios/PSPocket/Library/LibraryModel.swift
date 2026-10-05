@@ -2,6 +2,7 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import Foundation
 import Observation
+import os
 import UIKit
 
 /// One disc image in the library: an .iso in Documents/Games (Files > On My iPhone > PSPocket > Games), or one the
@@ -32,7 +33,9 @@ final class LibraryModel {
     /// A game being booted from the library: armed (Play pressed; cancellable until the boot starts) or started
     /// (the game's threads run; the overlay stays until its first frame).
     struct Boot: Equatable {
-        enum Phase { case armed, started }
+        /// armed: a moment to call it off; preparing: the game's code is being translated and compiled on this phone,
+        /// the first time it is played (D-154); started: the game's threads run.
+        enum Phase { case armed, preparing, started }
         let entryID: String
         var phase: Phase
     }
@@ -44,6 +47,11 @@ final class LibraryModel {
     private(set) var backdrops: [String: Backdrop] = [:] // the covers prepared for the animated background
     private(set) var decrypting: Set<String> = [] // title IDs
     private(set) var boot: Boot?
+    /// Preparing a game on this iPhone the first time it is played (D-154): the overlay shows its progress.
+    let preparer = Preparer()
+    /// Why a game runs without its library this session (it could not be prepared), by title ID.
+    private(set) var preparationNotes: [String: String] = [:]
+    @ObservationIgnored static let log = Logger(subsystem: "com.artzymeri.pspocket", category: "library")
     /// A boot that failed, for the library to show.
     private(set) var bootError: String?
 
@@ -108,6 +116,7 @@ final class LibraryModel {
     func meta(for entry: LibraryEntry) -> String {
         if let problem = entry.problem { return problem }
         if let id = entry.titleID, decrypting.contains(id) { return "Preparing the game's executable…" }
+        if let id = entry.titleID, let note = preparationNotes[id] { return note }
         guard let id = entry.titleID, let stats = store.stats[id], let last = stats.lastPlayed else {
             return "Not played yet"
         }
@@ -390,11 +399,16 @@ final class LibraryModel {
         }
     }
 
-    /// While armed: Cancel (or ○) returns to the library. Once the game's threads run, nothing tears them down yet.
+    /// While armed or preparing: Cancel (or ○) returns to the library (a preparation keeps what it compiled, and
+    /// goes on from there next time). Once the game's threads run, nothing tears them down yet.
     func cancel() {
-        guard let boot, boot.phase == .armed else { return }
+        guard let boot, boot.phase != .started else { return }
         armTimer?.invalidate()
         armTimer = nil
+        if boot.phase == .preparing {
+            preparer.cancel()
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
         self.boot = nil
     }
 
@@ -402,12 +416,48 @@ final class LibraryModel {
         guard let boot, boot.phase == .armed, armTimer == nil,
               let entry = entries.first(where: { $0.id == boot.entryID }), let titleID = entry.titleID else { return }
         if decrypting.contains(titleID) { return } // ensureExecutable comes back here when done
-        guard let elf = Self.executable(titleID: titleID), let game else {
+        guard let elf = Self.executable(titleID: titleID), game != nil else {
             self.boot = nil
             bootError = entry.problem ?? "The game's executable is missing"
             return
         }
-        if let message = game.boot(iso: entry.url, elf: elf) {
+        // Route B (D-154): the game runs from the library this iPhone made of it; the first time, it is made now.
+        let gameDir = Self.decryptedGames.appendingPathComponent(titleID)
+        let check = Preparer.check(gameDir: gameDir, executable: elf)
+        if check.ready {
+            startGame(entry: entry, titleID: titleID, elf: elf, library: gameDir.appendingPathComponent("game.dylib"))
+            return
+        }
+        Self.log.notice("pspocket: preparing \(titleID, privacy: .public): \(check.why, privacy: .public)")
+        let entryID = entry.id
+        if let message = preparer.start(executable: elf, titleID: titleID, gameDir: gameDir, finish: { [weak self] result in
+            guard let self else { return }
+            UIApplication.shared.isIdleTimerDisabled = false
+            guard self.boot?.entryID == entryID, self.boot?.phase == .preparing,
+                  let entry = self.entries.first(where: { $0.id == entryID }) else { return }
+            switch result {
+            case .success(let library):
+                self.startGame(entry: entry, titleID: titleID, elf: elf, library: library)
+            case .failure(let error):
+                // The game still starts, the way it did before route B: the translation built into the app when
+                // it is this game's, else the interpreters (slow).
+                Self.log.error("pspocket: preparing \(titleID, privacy: .public) failed: \(error.message, privacy: .public)")
+                self.preparationNotes[titleID] = "Preparing failed: \(error.message)"
+                self.startGame(entry: entry, titleID: titleID, elf: elf, library: nil)
+            }
+        }) {
+            Self.log.error("pspocket: cannot prepare \(titleID, privacy: .public): \(message, privacy: .public)")
+            preparationNotes[titleID] = "Not prepared: \(message)"
+            startGame(entry: entry, titleID: titleID, elf: elf, library: nil)
+            return
+        }
+        UIApplication.shared.isIdleTimerDisabled = true // the screen stays on while the phone prepares the game
+        self.boot?.phase = .preparing
+    }
+
+    private func startGame(entry: LibraryEntry, titleID: String, elf: URL, library: URL?) {
+        guard let game else { return }
+        if let message = game.boot(iso: entry.url, elf: elf, library: library) {
             self.boot = nil
             bootError = message
             return

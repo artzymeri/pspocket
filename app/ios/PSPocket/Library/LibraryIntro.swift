@@ -106,6 +106,10 @@ struct BootOverlay: View {
     let title: String
     let cancellable: Bool
     let pad: Bool
+    /// Set while this iPhone prepares the game, the first time it is played (D-154): a bar that fills, what it does
+    /// and the time left.
+    var preparation: Preparer.Snapshot? = nil
+    var timeLeft: String = ""
     let cancel: () -> Void
 
     var body: some View {
@@ -126,14 +130,36 @@ struct BootOverlay: View {
                     }
                 }
                 .frame(width: 150, height: 174)
-                IndeterminateBar()
-                    .frame(width: 240, height: 4)
-                Text("The game's code runs translated ahead of time: about a minute from Boot to the first screens.")
-                    .font(.system(size: 13))
-                    .tracking(-0.08)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(Color(red: 235 / 255, green: 235 / 255, blue: 245 / 255).opacity(0.72))
-                    .frame(maxWidth: 420)
+                if let preparation {
+                    Text("Preparing \(title) for this iPhone")
+                        .font(.system(size: 17, weight: .semibold))
+                        .tracking(-0.4)
+                    ProgressBar(fraction: preparation.fraction)
+                        .frame(width: 280, height: 4)
+                    HStack(spacing: 10) {
+                        Text(preparation.detail)
+                        Text("·")
+                        Text(timeLeft).monospacedDigit()
+                    }
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.85))
+                    Text("Once, the first time: the game's code is translated and compiled here. Keep pspocket open; "
+                         + "later launches start at once.")
+                        .font(.system(size: 13))
+                        .tracking(-0.08)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(Color(red: 235 / 255, green: 235 / 255, blue: 245 / 255).opacity(0.72))
+                        .frame(maxWidth: 420)
+                } else {
+                    IndeterminateBar()
+                        .frame(width: 240, height: 4)
+                    Text("The game's code runs translated ahead of time: about a minute from Boot to the first screens.")
+                        .font(.system(size: 13))
+                        .tracking(-0.08)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(Color(red: 235 / 255, green: 235 / 255, blue: 245 / 255).opacity(0.72))
+                        .frame(maxWidth: 420)
+                }
                 Button(action: cancel) {
                     HStack(spacing: 8) {
                         if pad { ButtonBadge(kind: .circle) }
@@ -153,6 +179,22 @@ struct BootOverlay: View {
         }
         .ignoresSafeArea()
         .statusBarHidden(true)
+    }
+}
+
+/// A bar that fills to `fraction`, easing to each new value.
+private struct ProgressBar: View {
+    let fraction: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            Capsule()
+                .fill(.white)
+                .frame(width: max(geo.size.height, geo.size.width * min(max(fraction, 0), 1)), height: geo.size.height)
+                .animation(.easeOut(duration: 0.5), value: fraction)
+        }
+        .background(Capsule().fill(.white.opacity(0.18)))
+        .clipShape(Capsule())
     }
 }
 

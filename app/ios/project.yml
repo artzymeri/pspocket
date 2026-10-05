@@ -81,6 +81,21 @@ targets:
         group: Generated
         optional: true
         includes: *compiled
+      # The PPU translator (recomp/ppu, D-092), which the phone runs when it prepares a game (D-154).
+      - path: ../../recomp/ppu/src
+        name: recomp-ppu
+        group: Runtime
+        includes: [analyzer.cpp, code_image.cpp, executable.cpp, lifter.cpp]
+        compilerFlags: ['-I$(PSPOCKET_ROOT)/recomp/ppu/include']
+      # Preparing a game (D-154): translate, compile, link, sign. scripts/ios.sh points PSPOCKET_PREPARE_SRC at
+      # runtime/prepare/src when the app carries the compiler.
+      - path: ${PSPOCKET_PREPARE_SRC}
+        name: prepare
+        group: Runtime
+        optional: true
+        includes: *compiled
+        compilerFlags: ['-I$(PSPOCKET_ROOT)/runtime/prepare/include', '-I$(PSPOCKET_ROOT)/runtime/codegen/include',
+                        '-I$(PSPOCKET_ROOT)/recomp/ppu/include', '-DPSPOCKET_VERSION=\"$(PSPOCKET_VERSION)\"']
       # The compiler on the device (route B, D-151): clang and lld in process. scripts/ios.sh points
       # PSPOCKET_CODEGEN_SRC at runtime/codegen/src when scripts/build-llvm-ios.sh has built LLVM for iOS.
       - path: ${PSPOCKET_CODEGEN_SRC}
@@ -134,6 +149,8 @@ targets:
         name: platform-ios
         group: Runtime
         includes: *compiled
+        # prepare.mm: preparing games on the phone (D-154) when the app carries the compiler.
+        compilerFlags: ['-DPSPOCKET_HAVE_CODEGEN=${PSPOCKET_HAVE_CODEGEN}', '-I$(PSPOCKET_ROOT)/runtime/prepare/include']
       - path: ../../runtime/platform/apple/src
         name: platform-apple
         group: Runtime

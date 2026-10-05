@@ -40,7 +40,9 @@ struct Fnv {
 
 std::string settings_text(const CompileOptions& o)
 {
-    std::string s = std::format("{}|{}|{}|{}", o.target, o.cpu, o.opt_level, o.resource_dir);
+    // The CPU as compiled for: "native" is this device's, and an object made for another chip is not this one's.
+    std::string s = std::format("{}|{}|{}|{}", o.target, o.cpu == "native" ? host_cpu() : o.cpu, o.opt_level,
+        o.resource_dir);
     for (const auto* list : {&o.system_dirs, &o.include_dirs, &o.defines, &o.extra_args})
         for (const std::string& v : *list) s += "|" + v;
     return s;

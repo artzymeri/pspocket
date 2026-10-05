@@ -73,7 +73,7 @@ Result prepare_game(const Options& options);
 
 // What a game library was made from and by (game_dir/manifest.json).
 struct Manifest {
-    std::string title_id, executable_sha256, made_by, compiler;
+    std::string title_id, executable_sha256, made_by, compiler, cpu;
     std::string abi_hash, translator_hash; // hex
     long long made_at = 0;                 // seconds since 1970
     double seconds = 0;
@@ -82,8 +82,9 @@ struct Manifest {
 };
 bool read_manifest(const std::string& game_dir, Manifest* out);
 
-// Whether game_dir holds a library this build can load for this executable: made for this runtime (ABI hash) from an
-// executable with this SHA-256. A different translator hash leaves it usable (`*why` says a newer translation exists).
+// Whether game_dir holds a library this build can load for this executable: made for this runtime (ABI hash), for
+// this CPU, from an executable with this SHA-256. A different translator hash leaves it usable (`*why` says a newer
+// translation exists).
 bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why);
 
 // The SHA-256 of a file, in hex ("" if it cannot be read).

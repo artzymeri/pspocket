@@ -70,8 +70,9 @@ struct RootView: View {
             if let boot = library.boot {
                 let entry = library.entries.first { $0.id == boot.entryID }
                 BootOverlay(cover: library.cover(for: entry), title: entry?.displayTitle ?? "",
-                            cancellable: boot.phase == .armed, pad: library.inputMode == .pad,
-                            cancel: { library.cancel() })
+                            cancellable: boot.phase != .started, pad: library.inputMode == .pad,
+                            preparation: boot.phase == .preparing ? library.preparer.snapshot : nil,
+                            timeLeft: library.preparer.timeLeft, cancel: { library.cancel() })
                     .transition(.opacity)
             }
         }

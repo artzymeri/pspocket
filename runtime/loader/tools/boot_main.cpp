@@ -885,12 +885,7 @@ int main(int argc, char** argv)
     // The game's SPU programs (D-076): the lifted ones run natively; the others, and code a program reaches outside
     // its lifted range (the SPURS syscall stubs, overlays), are interpreted, in every build, until they are collected.
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
-#if defined(PSPOCKET_HAVE_GAME_SPU)
-    if (game_library.empty()) { // a game library brings its own (registered after the executable is loaded)
-        pspocket_game_spu_register();
-        hle::enable_spu_modules();
-    }
-#endif
+
     if (!spu_dump.empty()) {
         hle::set_spu_dump_dir(spu_dump);
         hle::enable_spu_modules();
@@ -926,7 +921,8 @@ int main(int argc, char** argv)
         print_imports(hle);
         return 0;
     }
-    bool translated = false; // the game's PPU code runs translated (built in or from a library)
+    bool translated = false;  // the game's PPU code runs translated (built in or from a library)
+    bool library_spu = false; // the game library brought the SPU programs
     if (!game_library.empty()) {
         // The game's translated code from a game library (route B, D-152), checked against this runtime and this
         // executable before anything in it runs.
@@ -936,9 +932,18 @@ int main(int argc, char** argv)
             std::fprintf(stderr, "pspocket-boot: %s\n", error.c_str());
             return 70;
         }
-        if (loaded.library->spu_register) hle::enable_spu_modules();
+        library_spu = loaded.library->spu_register != nullptr;
+        if (library_spu) hle::enable_spu_modules();
         translated = loaded.library->ppu_function_count > 0;
     }
+#if defined(PSPOCKET_HAVE_GAME_SPU)
+    // The lifted SPU programs built into this program, unless the library brought its own (one made on the phone has
+    // none yet, D-154). They are found by their code's hash, so they never run for another game.
+    if (!library_spu) {
+        pspocket_game_spu_register();
+        hle::enable_spu_modules();
+    }
+#endif
 #if defined(PSPOCKET_HAVE_GAME_PPU)
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098):
     // branches into it from the interpreter run it. A game library replaces it.

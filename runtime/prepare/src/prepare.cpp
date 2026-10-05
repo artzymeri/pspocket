@@ -141,6 +141,7 @@ bool read_manifest(const std::string& game_dir, Manifest* out)
     m.executable_sha256 = json_field(json, "executable_sha256");
     m.made_by = json_field(json, "made_by");
     m.compiler = json_field(json, "compiler");
+    m.cpu = json_field(json, "cpu");
     m.abi_hash = json_field(json, "abi_hash");
     m.translator_hash = json_field(json, "translator_hash");
     m.made_at = std::atoll(json_field(json, "made_at").c_str());
@@ -167,6 +168,10 @@ bool library_is_current(const std::string& game_dir, const std::string& executab
     }
     if (m.abi_hash != std::format("{:016x}", ps_game_abi_hash)) {
         say("prepared by another version of pspocket: preparing it again");
+        return false;
+    }
+    if (!m.cpu.empty() && m.cpu != codegen::host_cpu()) {
+        say("prepared for another chip (" + m.cpu + "): preparing it again");
         return false;
     }
     if (m.executable_sha256 != executable_sha256) {
@@ -382,12 +387,14 @@ Result prepare_game(const Options& o)
     // 4. What it was made from and by.
     const std::string manifest = std::format(
         "{{\n  \"title_id\": {},\n  \"executable_sha256\": \"{}\",\n  \"abi_hash\": \"{:016x}\",\n"
-        "  \"translator_hash\": \"{:016x}\",\n  \"made_by\": {},\n  \"compiler\": {},\n  \"made_at\": {},\n"
+        "  \"translator_hash\": \"{:016x}\",\n  \"made_by\": {},\n  \"compiler\": {},\n  \"cpu\": {},\n"
+        "  \"made_at\": {},\n"
         "  \"seconds\": {:.1f},\n  \"translate_seconds\": {:.1f},\n  \"compile_seconds\": {:.1f},\n"
         "  \"link_seconds\": {:.1f},\n  \"files\": {},\n  \"rate_0\": {:.3f},\n  \"rate_1\": {:.3f},\n"
         "  \"rate_2\": {:.3f},\n  \"bytes\": {}\n}}\n",
         json_string(o.title_id), exe_sha, ps_game_abi_hash, ps_game_translator_hash,
         json_string(std::string("pspocket ") + PSPOCKET_VERSION), json_string(codegen::compiler_version()),
+        json_string(o.toolchain.cpu == "native" ? codegen::host_cpu() : o.toolchain.cpu),
         static_cast<long long>(std::time(nullptr)), r.seconds, r.translate_seconds, r.compile_seconds, r.link_seconds,
         jobs.size(), r.rates[0], r.rates[1], r.rates[2], bytes.size());
     if (!write_bytes(dir / "manifest.json", manifest.data(), manifest.size())) return fail("cannot write the manifest");

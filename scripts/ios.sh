@@ -308,11 +308,13 @@ cmd_gen() {
     # Route B's compiler on the phone (D-151): LLVM, clang and lld built for iOS by scripts/build-llvm-ios.sh, and
     # the folder the app compiles against (clang's headers, runtime/codegen/sysroot, the runtime's ABI headers).
     local llvm_ios="$ROOT/build/llvm-ios" llvm_src="" have_codegen=0 codegen_src="$ROOT/runtime/codegen/none"
+    local prepare_src="$ROOT/runtime/prepare/none"
     local codegen_bundle="$IOS_BUILD/no-codegen/codegen" llvm_ldflags=""
     if [ -f "$llvm_ios/lib/libclangFrontend.a" ] && [ -f "$llvm_ios/lib/liblldMachO.a" ]; then
         llvm_src="$(sed -n 's/^CMAKE_HOME_DIRECTORY:[A-Z]*=//p' "$llvm_ios/CMakeCache.txt")/.." # llvm-project
         have_codegen=1
         codegen_src="$ROOT/runtime/codegen/src"
+        prepare_src="$ROOT/runtime/prepare/src"
         codegen_bundle="$IOS_BUILD/codegen-bundle/codegen"
         rm -rf "$IOS_BUILD/codegen-bundle"
         mkdir -p "$codegen_bundle/clang/include" "$codegen_bundle/include/pspocket"
@@ -337,7 +339,8 @@ cmd_gen() {
         PSPOCKET_HAVE_GAME_SPU="$have_game_spu" PSPOCKET_GAME_PPU_SRC="$game_ppu" PSPOCKET_HAVE_GAME_PPU="$have_game_ppu" \
         PSPOCKET_GAME_SHADERS_SRC="$game_shaders" PSPOCKET_HAVE_CODEGEN="$have_codegen" PSPOCKET_CODEGEN_SRC="$codegen_src" \
         PSPOCKET_CODEGEN_BUNDLE_SRC="$codegen_bundle" PSPOCKET_LLVM_SRC_DIR="$llvm_src" PSPOCKET_LLVM_IOS_DIR="$llvm_ios" \
-        PSPOCKET_LLVM_LDFLAGS="$llvm_ldflags" "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
+        PSPOCKET_LLVM_LDFLAGS="$llvm_ldflags" PSPOCKET_PREPARE_SRC="$prepare_src" \
+        "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
 }
 
 # scripts/gate.sh (D-149): nothing reaches the phone that does worse on the Mac than what is there. Exit 2 (no game

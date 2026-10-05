@@ -15,7 +15,7 @@ namespace pspocket::codegen {
 
 struct CompileOptions {
     std::string target = "arm64-apple-ios17.0";
-    std::string cpu = "apple-a12";          // the oldest chip iOS 17 runs on
+    std::string cpu = "apple-a12";          // the oldest chip iOS 17 runs on; "native": this device's (host_cpu)
     std::string resource_dir;               // clang's resource directory (its include/ holds stdint.h, arm_neon.h)
     std::vector<std::string> system_dirs;   // -isystem: runtime/codegen/sysroot/include
     std::vector<std::string> include_dirs;  // -I: the runtime's ABI headers, the game's generated headers
@@ -26,6 +26,10 @@ struct CompileOptions {
 
 // The compiler's name and version ("LLVM 22.1.8"): part of what names a kept object.
 std::string compiler_version();
+
+// This device's CPU as the compiler names it ("apple-m4"; chips newer than LLVM knows are its newest): code compiled on
+// the phone is for the phone it runs on.
+std::string host_cpu();
 
 // LLVM's own options (what `clang -mllvm X` sets), for every compile after this call. They are process-wide: call it
 // before any compile starts, not while one runs.

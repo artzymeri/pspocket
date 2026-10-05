@@ -79,7 +79,7 @@ int main(int argc, char** argv)
         PSPOCKET_SOURCE_DIR "/runtime/core/include", PSPOCKET_SOURCE_DIR "/runtime/game/include"};
     o.toolchain.entry_source = PSPOCKET_GAME_LIBRARY_ENTRY_SOURCE;
     o.toolchain.target = "arm64-apple-macos13.0";
-    o.toolchain.cpu = "apple-m1";
+    o.toolchain.cpu = "native"; // this Mac's, as the phone compiles for itself
     o.toolchain.platform = "macos";
     o.toolchain.min_os = "13.0";
     // The last preparation here says how fast this Mac compiles each kind of file (its manifest's rates).

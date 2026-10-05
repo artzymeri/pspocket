@@ -24,6 +24,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/TargetParser/Host.h>
 #include <llvm/Support/thread.h>
 
 LLD_HAS_DRIVER(macho)
@@ -63,7 +64,8 @@ bool compile_here(const std::string& source, const std::string& object, const Co
     std::string* diagnostics)
 {
     // The driver's arguments, as `clang -c` takes them: the driver turns them into the compile's own (cc1) settings.
-    std::vector<std::string> args = {"clang", "-target", o.target, "-mcpu=" + o.cpu, "-c", source, "-o", object,
+    std::vector<std::string> args = {"clang", "-target", o.target, "-mcpu=" + (o.cpu == "native" ? host_cpu() : o.cpu),
+        "-c", source, "-o", object,
         "-O" + std::to_string(o.opt_level), "-std=gnu11", "-g0", "-w", "-ffp-contract=off", "-fno-fast-math",
         "-fno-stack-protector", "-fno-common", "-nostdlibinc"};
     if (!o.resource_dir.empty()) {
@@ -142,6 +144,8 @@ bool compile_c(const std::string& source, const std::string& object, const Compi
 }
 
 std::string compiler_version() { return "LLVM " LLVM_VERSION_STRING; }
+
+std::string host_cpu() { return llvm::sys::getHostCPUName().str(); }
 
 bool set_llvm_options(const std::vector<std::string>& options, std::string* diagnostics)
 {
