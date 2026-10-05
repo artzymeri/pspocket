@@ -76,3 +76,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [071](071-gta5-atlas-tiles-mac.md) | 2026-10-05 | ed07f03- | M4 Mac, pspocket-boot --trace-frame | Every shadow cascade from its depth buffer (D-100) |
 | [072](072-gta5-occlusion-mac.md) | 2026-10-05 | fd3a099+ | M4 Mac, pspocket-boot --frames | Occlusion queries counted on the GPU; 361,371 RSX failures left |
 | [073](073-gta5-rsx-complete-mac.md) | 2026-10-05 | fd3a099+ | M4 Mac, pspocket-boot --frames | **One RSX failure in the run**: 3D textures, conditional rendering (D-102) |
+| [074](074-gta5-spu-backoff-mac.md) | 2026-10-05 | beddc3e+ | M4 Mac, pspocket-boot, top | SPU workers back off empty policy-module polls: **2.6 cores instead of 4.8** at the same 30 fps (D-103) |

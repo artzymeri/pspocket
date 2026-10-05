@@ -167,7 +167,10 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     // The MFC performs a queue's transfers in order, and a fenced PUT or a later command's flag must not be seen by
     // another processor before the data PUT before it: on ARM, plain stores can become visible out of order, so
     // every PUT is a release (D-077: GTA V's graphics jobs write RSX commands, then the jump that releases them).
-    if (!is_get(cmd)) std::atomic_thread_fence(std::memory_order_release);
+    if (!is_get(cmd)) {
+        std::atomic_thread_fence(std::memory_order_release);
+        ctx->mem_writes++;
+    }
     if (cmd == PS_MFC_SDCRZ) {
         std::memset(mem, 0, size);
     } else {
@@ -262,6 +265,7 @@ int putlluc(SPUContext* ctx, u32 pc, u32 eal, u32 lsa)
         ch.res_valid = 0;
     }
     ps_res_store_line_unconditional(ctx->membase, addr, ctx->ls + (lsa & 0x3FF80u));
+    ctx->mem_writes++;
     return 0;
 }
 
@@ -378,6 +382,7 @@ int mfc_command(SPUContext* ctx, u32 pc, u32 cmd)
             if (ch.res_addr == addr || reservation_lost(ctx)) set_events(ctx, PS_SPU_EVENT_LR);
         }
         ch.res_valid = 0;
+        if (ok) ctx->mem_writes++;
         ch.atomic_stat = ok ? PS_MFC_PUTLLC_SUCCESS : PS_MFC_PUTLLC_FAILURE;
         ch.atomic_stat_count = 1;
         return 0;

@@ -114,10 +114,16 @@ public:
     // True when the policy running on this worker should give the SPU back to the kernel.
     bool poll_switch() { return select(true).wid != current_wid; }
 
+    // Where this worker's time went (D-103): running workloads, running a game's own policy module that changed nothing
+    // in main memory (a poll that found no work), and waiting for work.
+    u64 ns_work = 0, ns_idle_polls = 0, ns_wait = 0, idle_polls = 0;
+    u32 idle_streak = 0; // empty polls in a row
+    u64 backoff_ns = 0;  // the wait after the next one
+
 private:
     static void* entry(void* arg);
     void body();
-    void run_workload(const Selection& sel);
+    bool run_workload(const Selection& sel); // true: a game's own policy module ran
     void release();
 
     void* thread_ = nullptr; // pthread_t

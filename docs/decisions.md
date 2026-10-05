@@ -1545,6 +1545,19 @@ Run 072's RSX counted 360,000 failures in 170 s; run 073 counts one.
   zero report skipped and one under a nonzero report drawn; 3D layouts, the 3D Morton order and the CPU decoder; a
   swizzled 3D texture sampled end to end at two slices.
 
+## D-103 · 2026-10-05 · SPU workers back off a policy module that keeps finding no work
+
+At the 30 fps cap the Mac process used 4.8 cores, five threads at 85 to 88% each. Each SPURS worker now reports where
+its time went (`ps_spu`'s new per-context count of main-memory writes tells a run that changed nothing from work):
+four of GTA V's five Primary SPUs spent 30 to 43 s of a 140 s run in 120 to 190 million runs of the game's own
+policy module that found no work, two million a second each, and 0.1 s waiting. The PS3's SPUs spin like that; here
+each spin takes a core the PPU threads need, two of the iPhone's six.
+- After 64 empty polls in a row the worker sleeps 5 us, doubling up to 100 us (the longest new work then waits), until
+  a run writes memory again. Waiting for the line the module polls to change instead woke at once: the other SPUs take
+  jobs from the same queue (4 s of waits in 140 s, the polls hardly fewer).
+- Run 074 (same scene, 140 s): 2.6 cores instead of 4.8 at the same 30 fps; 3.9 million empty polls per SPU instead of
+  120 to 190 million, 1.2 to 1.4 s instead of 28 to 43 s.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

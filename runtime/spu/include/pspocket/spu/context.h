@@ -287,6 +287,9 @@ typedef struct SPUContext {
      * of either drops it. */
     const struct ps_spu_program* home;
     uint32_t home_reloc;
+    /* Main-memory writes the MFC made for this context (PUTs, successful PUTLLC, PUTLLUC): a host that runs SPU code
+     * in a loop tells polls that found nothing from work (D-103). */
+    uint64_t mem_writes;
 } SPUContext;
 
 /* Layout is part of the ABI between the runtime and generated code. */

@@ -41,6 +41,11 @@ namespace {
 
 constexpr std::string_view kSchedChan = "spurs";
 constexpr u64 kIdleWaitNs = 100'000'000; // re-check for a stop request this often while idle
+// A game's own policy module that keeps finding no work (D-103): after this many empty polls in a row, waits that grow
+// from the first to the last value.
+constexpr u32 kIdleStreak = 64;
+constexpr u64 kMinBackoffNs = 5'000;
+constexpr u64 kMaxBackoffNs = 100'000;
 constexpr usize kWorkerStack = 8u << 20;  // as SPU threads (D-015)
 constexpr u32 CELL_SPURS_MODULE_POLL_STATUS_READYCOUNT = 1, CELL_SPURS_MODULE_POLL_STATUS_SIGNAL = 2,
               CELL_SPURS_MODULE_POLL_STATUS_FLAG = 4;
@@ -210,17 +215,45 @@ void Worker::body()
     // set the host's FP control register and restore it, thousands of times a second (run 050: about 3.5% of the
     // workers' time). The scheduler and policies around the SPU code do no floating point.
     const u64 fp_env = ps_spu_fpenv_enter();
+    using Clock = std::chrono::steady_clock;
+    const auto ns = [](Clock::duration d) { return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count()); };
     while (!sched.stopping.load(std::memory_order_acquire)) {
         // The version is read before selecting, so a change made while selecting ends the wait at once.
         const u64 version = ps_res_version(sched.spurs);
         const Selection sel = select(false);
         if (sel.wid >= CELL_SPURS_MAX_WORKLOAD) {
+            const auto t0 = Clock::now();
             ps_res_wait_change(sched.spurs, version, kIdleWaitNs);
+            ns_wait += ns(Clock::now() - t0);
             continue;
         }
-        run_workload(sel);
+        const u64 writes = ctx.mem_writes;
+        const auto t0 = Clock::now();
+        const bool custom = run_workload(sel);
+        const u64 dt = ns(Clock::now() - t0);
+        if (custom && ctx.mem_writes == writes) {
+            ns_idle_polls += dt;
+            idle_polls++;
+            // GTA V's policy module polled two million times a second on each of four SPUs (run 074): the PS3's SPUs
+            // spin, but here each would take a core the PPU threads need. After a run of empty polls the worker sleeps,
+            // a little longer each time up to 100 us, the longest new work then waits. Waiting for the line the module
+            // polls to change woke it at once: the other SPUs take jobs from the same queue.
+            if (++idle_streak >= kIdleStreak) {
+                backoff_ns = backoff_ns ? std::min(backoff_ns * 2, kMaxBackoffNs) : kMinBackoffNs;
+                const auto w0 = Clock::now();
+                std::this_thread::sleep_for(std::chrono::nanoseconds(backoff_ns));
+                ns_wait += ns(Clock::now() - w0);
+            }
+        } else {
+            ns_work += dt;
+            idle_streak = 0;
+            backoff_ns = 0;
+        }
     }
     release();
+    PS_LOG_INFO(kSchedChan, "SPURS {:#x} SPU {}: {:.1f} s running workloads, {:.1f} s in {} runs of a policy module that "
+        "changed nothing, {:.1f} s waiting", sched.spurs, spu_num, ns_work / 1e9, ns_idle_polls / 1e9, idle_polls,
+        ns_wait / 1e9);
     ps_spu_fpenv_leave(fp_env);
 }
 
@@ -350,7 +383,7 @@ Worker::Selection Worker::select(bool poll)
     return sel;
 }
 
-void Worker::run_workload(const Selection& sel)
+bool Worker::run_workload(const Selection& sel)
 {
     Workload wkl;
     bool known = false;
@@ -365,18 +398,18 @@ void Worker::run_workload(const Selection& sel)
         ps_write64(ls, ls::k_wkl_addr, ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_addr));
         ps_write32(ls, ls::k_wkl_unique, ps_read8(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_unique));
         run_taskset(*this, sel.wid, wkl.arg, sel.poll_status);
-        return;
+        return false;
     }
     if (known && wkl.kind == Workload::Kind::Custom) {
         run_custom(*this, sel.wid, sel.poll_status);
-        return;
+        return true;
     }
     if (known && wkl.kind == Workload::Kind::JobChain) {
         // The job chain module's image replaces whatever policy module was in local store.
         ps_write64(ls, ls::k_wkl_addr, ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_addr));
         ps_write32(ls, ls::k_wkl_unique, ps_read8(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_unique));
         run_jobchain(*this, sel.wid, wkl.arg);
-        return;
+        return false;
     }
     // A workload the HLE API did not register: logged once, then left out of the selection (CLAUDE.md rule 5: loud,
     // not silent).
@@ -387,6 +420,7 @@ void Worker::run_workload(const Selection& sel)
             "scheduler does not know it; it does not run", sched.spurs, sel.wid, pm,
             ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_arg));
     }
+    return false;
 }
 
 // ------------------------------------------------------------------------------------------------- scheduler
