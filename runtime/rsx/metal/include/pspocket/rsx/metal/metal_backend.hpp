@@ -137,6 +137,7 @@ public:
     void set_zpass_counting(bool on) override;
     void clear_zpass() override;
     bool report_zpass(u32 value_addr) override;
+    bool report_pending(u32 value_addr) override;
 
     const BackendStats& stats() const;
     // Waits until the shader cache has made everything it holds (tests), then hands it to the backend.

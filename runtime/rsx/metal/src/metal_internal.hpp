@@ -325,6 +325,12 @@ struct MetalBackend::Impl {
     s32 pass_zpass_slot = -1;                // this pass's counter for that query, -1 until a draw counts
     s32 encoder_zpass_slot = -1;             // the counter the encoder counts into, -1 when it does not count
     std::vector<PendingReport> pending_reports;
+    // Reports registered and not written yet, by value address (D-115): the completion handlers count them down.
+    struct ReportsInFlight {
+        std::mutex mutex;
+        std::unordered_map<u32, u32> count;
+    };
+    std::shared_ptr<ReportsInFlight> reports_in_flight = std::make_shared<ReportsInFlight>();
     PassTargets pass{};
     PassTargets draw_targets{}; // targets of the draw being prepared (render-target feedback detection)
     bool pass_open = false;    // targets chosen (descriptor built)
@@ -353,6 +359,7 @@ struct MetalBackend::Impl {
     std::map<PipelineKey, id<MTLRenderPipelineState>> pipelines;
     std::unordered_map<std::string, CompiledProgram> programs; // by program hash and translation options
     std::unique_ptr<ShaderCache> shader_cache;                 // D-114; null: none configured
+    u64 texture_bytes() const; // what the cached textures take in guest memory (their decoded copies, about as much)
     void take_shader_cache();
     std::unordered_map<u64, id<MTLDepthStencilState>> depth_states;
     std::unordered_map<u64, id<MTLSamplerState>> samplers;

@@ -102,6 +102,13 @@ public:
         (void)value_addr;
         return false;
     }
+    // A ZPASS_PIXEL_CNT report whose count has not reached value_addr yet (the GPU has not finished its draws): what is
+    // there is an older count (D-115).
+    virtual bool report_pending(u32 value_addr)
+    {
+        (void)value_addr;
+        return false;
+    }
 };
 
 } // namespace pspocket::rsx

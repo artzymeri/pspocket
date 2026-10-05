@@ -399,8 +399,10 @@ void Rsx::m_wait_for_idle(u32, u32) { backend_.sync(); }
 void Rsx::m_set_render_enable(u32 reg, u32 value)
 {
     // RPCS3 nv4097.cpp set_render_mode: 1 = render unconditionally, 2 = render if the report at offset is nonzero.
-    // The report is read when the method runs: occlusion results arrive once the GPU has counted (D-102), so a query
-    // issued in the same frame decides from its previous result, a frame late (RPCS3 defers the evaluation instead).
+    // The report is read when the method runs: occlusion results arrive once the GPU has counted (D-102). A count the
+    // GPU has not delivered yet renders (D-115): what is there is an older count, and a draw it skipped left holes the
+    // later passes shaded black or red (the iPhone's slower GPU, characters' clothes). RPCS3 defers the evaluation to
+    // the GPU instead.
     const u32 mode = value >> 24;
     if (mode == 1) {
         render_enabled_ = true;
@@ -412,7 +414,7 @@ void Rsx::m_set_render_enable(u32 reg, u32 value)
             fifo_error(std::format("NV4097_SET_RENDER_ENABLE: bad report offset {:#x}", value & 0xffffff));
             return;
         }
-        render_enabled_ = read32(*ea + 8) != 0;
+        render_enabled_ = backend_.report_pending(*ea + 8) || read32(*ea + 8) != 0;
         return;
     }
     fail(FailKind::Unsupported, reg, std::format("NV4097_SET_RENDER_ENABLE: unknown render mode {}", mode));

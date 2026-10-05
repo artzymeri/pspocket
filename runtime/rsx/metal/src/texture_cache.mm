@@ -241,6 +241,13 @@ id<MTLTexture> MetalBackend::Impl::sample_view(id<MTLTexture> tex, std::unordere
     return v;
 }
 
+u64 MetalBackend::Impl::texture_bytes() const
+{
+    u64 n = 0;
+    for (const auto& [key, t] : textures) n += t->layout.total_size;
+    return n;
+}
+
 id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, bool& ok)
 {
     ok = true;

@@ -260,12 +260,16 @@ void MetalBackend::Impl::submit(bool wait)
         auto reports = std::make_shared<std::vector<PendingReport>>(std::move(pending_reports));
         pending_reports.clear();
         u8* const guest = mem.base();
+        auto in_flight = reports_in_flight;
         [render_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
             for (const PendingReport& r : *reports) {
                 u64 count = 0;
                 for (const VisibilitySlot& s : r.slots) count += static_cast<const u64*>(s.buffer.contents)[s.index];
                 const u32 value = static_cast<u32>(std::min<u64>(count, 0xFFFFFFFFull));
                 __atomic_store_n(reinterpret_cast<u32*>(guest + r.value_addr), ps_bswap32(value), __ATOMIC_RELEASE);
+                std::lock_guard lock(in_flight->mutex);
+                if (auto it = in_flight->count.find(r.value_addr); it != in_flight->count.end() && --it->second == 0)
+                    in_flight->count.erase(it);
             }
         }];
     }
@@ -1307,7 +1311,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         }
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
-                           "{:.0f} texture checks ({:.2f} MB hashed); {} programs and {} pipelines made ({:.1f} ms)",
+                           "{:.0f} texture checks ({:.2f} MB hashed); {} programs and {} pipelines made ({:.1f} ms); "
+                           "{} textures cached ({:.0f} MB in guest memory), {} surfaces",
             m.report_flips, static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n,
             static_cast<double>(m.stats.draws - m.report_draws) / n,
             static_cast<double>(m.stats.render_passes - m.report_passes) / n, ends,
@@ -1318,7 +1323,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             static_cast<double>(m.stats.texture_checks - m.report_texture_checks) / n,
             static_cast<double>(m.stats.texture_check_bytes - m.report_texture_bytes) / 1048576.0 / n,
             m.stats.programs_compiled - m.report_programs, m.stats.pipelines_created - m.report_pipelines,
-            static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns - m.report_compile_ns) / 1e6);
+            static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns - m.report_compile_ns) / 1e6,
+            m.textures.size(), static_cast<double>(m.texture_bytes()) / 1048576.0, m.surfaces.size());
         m.report_programs = m.stats.programs_compiled;
         m.report_pipelines = m.stats.pipelines_created;
         m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns;
@@ -1537,7 +1543,15 @@ bool MetalBackend::report_zpass(u32 value_addr)
     if (!impl_->device) return false;
     impl_->pending_reports.push_back({value_addr, impl_->zpass_slots});
     impl_->stats.occlusion_reports++;
+    std::lock_guard lock(impl_->reports_in_flight->mutex);
+    impl_->reports_in_flight->count[value_addr]++;
     return true;
+}
+
+bool MetalBackend::report_pending(u32 value_addr)
+{
+    std::lock_guard lock(impl_->reports_in_flight->mutex);
+    return impl_->reports_in_flight->count.contains(value_addr);
 }
 
 bool MetalBackend::flush_memory(u32 addr, u32 size, const char* why)
