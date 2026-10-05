@@ -26,14 +26,14 @@
 // A run that ends at its timeout, or on such a fault, prints the thread report (lv2/report.hpp): every PPU thread's
 // state, what it waits on and its guest backtrace, and the RSX's FIFO. --report-every prints it while the game runs.
 // --gpu metal draws the game's frames with the Metal backend (Apple platforms; the default null backend runs the
-// commands and draws nothing). --frames DIR (which implies Metal) saves every Nth presented frame (--frame-every,
-// 60 by default) as DIR/frame-NNNNNN.png: what the game shows, at the backend's output size. --trace-frame N (with
-// --frames) logs every clear and draw of frame N (channel rsx.trace: targets, programs, textures, blending) and saves
-// each colour target it used as DIR/trace-N/<address>-fmt<format>-<width>x<height>.png at its flip. --rsx-recover
-// logs a FIFO error (with the words around it and the last jumps) and skips to put, as the app does, instead of
-// stopping the run. --shader-cache DIR (with Metal) records every program and pipeline the backend makes in DIR and
-// makes the ones recorded there before ahead, on background threads, while the game loads (D-114; game data: keep it
-// in inventory/, scripts/ios.sh puts it in the app).
+// commands and draws nothing). --frames DIR (which implies Metal) saves every Nth presented frame (--frame-every, 60 by
+// default; --frame-from N: none before frame N) as DIR/frame-NNNNNN.png: what the game shows, at the backend's output
+// size. --trace-frame N (with --frames) logs every clear and draw of frame N (channel rsx.trace: targets, programs,
+// textures, blending) and saves each colour target it used as DIR/trace-N/<address>-fmt<format>-<width>x<height>.png at
+// its flip. --rsx-recover logs a FIFO error (with the words around it and the last jumps) and skips to put, as the app
+// does, instead of stopping the run. --shader-cache DIR (with Metal) records every program and pipeline the backend
+// makes in DIR and makes the ones recorded there before ahead, on background threads, while the game loads (D-114; game
+// data: keep it in inventory/, scripts/ios.sh puts it in the app).
 // --dump-on-fault FILE writes the guest's committed memory below the RSX's local memory to FILE when a guest fault
 // ends the run, for offline analysis (game data: keep it in inventory/). The file is a sequence of blocks: a
 // big-endian u32 guest address, a u32 byte count, then the bytes. A fault in SPU code also writes that SPU's local
@@ -44,15 +44,19 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <pthread.h>
@@ -99,7 +103,8 @@ int usage()
         "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]\n"
         "                     [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]\n"
         "                     [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]\n"
-        "                     [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]...\n"
+        "                     [--frame-every N] [--frame-from N] [--dump-on-fault FILE]\n"
+        "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
@@ -360,6 +365,67 @@ bool read_file(const char* path, std::vector<u8>& out)
     return true;
 }
 
+// Saves --frames on threads of its own: compressing a PNG takes about as long as a frame, and the capture callback
+// runs on the GPU's completion thread, where it would hold up the frames after it (and the game's pace with them).
+class FrameWriter {
+public:
+    explicit FrameWriter(u32 threads)
+    {
+        for (u32 i = 0; i < threads; i++) threads_.emplace_back([this] { run(); });
+    }
+    ~FrameWriter() { finish(); }
+    void push(std::string path, const u8* bgra, u32 w, u32 h)
+    {
+        std::vector<u8> pixels(bgra, bgra + static_cast<usize>(w) * h * 4);
+        {
+            std::lock_guard lock(mutex_);
+            if (done_) return;
+            queue_.push_back({std::move(path), std::move(pixels), w, h});
+        }
+        cv_.notify_one();
+    }
+    // Writes what is queued, then stops.
+    void finish()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            done_ = true;
+        }
+        cv_.notify_all();
+        for (std::thread& t : threads_) {
+            if (t.joinable()) t.join();
+        }
+    }
+    u32 written() const { return written_.load(); }
+
+private:
+    struct Job {
+        std::string path;
+        std::vector<u8> pixels;
+        u32 w, h;
+    };
+    void run()
+    {
+        std::unique_lock lock(mutex_);
+        while (true) {
+            cv_.wait(lock, [this] { return done_ || !queue_.empty(); });
+            if (queue_.empty()) return; // finished, and nothing left
+            Job j = std::move(queue_.front());
+            queue_.pop_front();
+            lock.unlock();
+            if (write_png_rgb(j.path, j.pixels.data(), j.w, j.h, j.w * 4, true) && written_.fetch_add(1) == 0)
+                PS_LOG_INFO("boot", "first frame saved: {}", j.path);
+            lock.lock();
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<Job> queue_;
+    bool done_ = false;
+    std::atomic<u32> written_{0};
+    std::vector<std::thread> threads_; // last: started once the rest exists
+};
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -385,6 +451,7 @@ int main(int argc, char** argv)
     std::string gpu = "null", frames_dir;
     std::string shader_cache; // --shader-cache (D-114)
     u32 frame_every = 60;
+    u64 frame_from = 0;
     u64 trace_frame = 0;
     bool rsx_recover = false;
     std::vector<hle::PadPress> presses;
@@ -416,6 +483,10 @@ int main(int argc, char** argv)
             const char* v = value();
             if (!v || std::atoi(v) <= 0) return usage();
             frame_every = static_cast<u32>(std::atoi(v));
+        } else if (a == "--frame-from") {
+            const char* v = value();
+            if (!v || std::atoll(v) < 0) return usage();
+            frame_from = static_cast<u64>(std::atoll(v));
         } else if (a == "--rsx-recover") {
             rsx_recover = true;
         } else if (a == "--shader-cache") {
@@ -491,7 +562,7 @@ int main(int argc, char** argv)
 
     // The GPU backend sys_rsx gives the RSX (the null backend unless --gpu metal). The write tracker outlives the
     // kernel, which owns the backend.
-    std::atomic<u32> frames_written{0};
+    FrameWriter frame_writer(frames_dir.empty() ? 0 : 3);
 #if defined(PSPOCKET_HAVE_METAL)
     std::unique_ptr<rsx::WriteTracker> tracker;
     if (gpu == "metal") {
@@ -510,10 +581,8 @@ int main(int argc, char** argv)
             if (!frames_dir.empty()) {
                 mc.capture_every = frame_every;
                 mc.capture = [&](const u8* bgra, u32 w, u32 h, u64 flip) {
-                    const std::string path = std::format("{}/frame-{:06}.png", frames_dir, flip);
-                    if (write_png_rgb(path, bgra, w, h, w * 4, true) && frames_written.fetch_add(1) == 0) {
-                        PS_LOG_INFO("boot", "first frame saved: {}", path);
-                    }
+                    if (flip < frame_from) return;
+                    frame_writer.push(std::format("{}/frame-{:06}.png", frames_dir, flip), bgra, w, h);
                 };
                 if (trace_frame) {
                     mc.trace_frame = trace_frame;
@@ -715,7 +784,10 @@ int main(int argc, char** argv)
     if (done) std::printf("exit status: %d\n", kernel.exit_status());
     std::printf("imports: %u functions (%u implemented), %u unresolved variables\n", report.functions_linked,
         report.functions_implemented, report.variables_unresolved);
-    if (!frames_dir.empty()) std::printf("frames saved: %u in %s\n", frames_written.load(), frames_dir.c_str());
+    if (!frames_dir.empty()) {
+        frame_writer.finish();
+        std::printf("frames saved: %u in %s\n", frame_writer.written(), frames_dir.c_str());
+    }
 #if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
     if (audio_output) {
         const auto st = audio_output->stats();
