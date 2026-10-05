@@ -64,7 +64,7 @@ Surface* MetalBackend::Impl::find_surface(u32 address, bool depth) const
 
 void MetalBackend::Impl::remove_surface(Surface* s)
 {
-    if (pass_open && pass.contains(s)) end_pass();
+    if (pass_open && pass.contains(s)) end_pass_for(kEndSurfaceGone);
     std::erase_if(surfaces, [s](const std::unique_ptr<Surface>& p) { return p.get() == s; });
 }
 
@@ -178,7 +178,7 @@ id<MTLTexture> MetalBackend::Impl::copy_texture(id<MTLTexture> src)
     d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     d.storageMode = MTLStorageModePrivate;
     id<MTLTexture> dst = [device newTextureWithDescriptor:d];
-    end_pass();
+    end_pass_for(kEndTargetCopy);
     id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
     [blit copyFromTexture:src toTexture:dst];
     [blit endEncoding];
@@ -191,7 +191,16 @@ Surface::Conversion* MetalBackend::Impl::depth_as_texture(Surface& d, u32 mode)
     if (!d.depth || d.swizzled || (!z16 && d.pixel_format != MTLPixelFormatDepth32Float_Stencil8)) return nullptr;
     Surface::Conversion& conv = d.conversions[mode];
     __strong id<MTLTexture>& tex = conv.texture;
-    if (tex && conv.generation == d.generation) return &conv;
+    // Up to date unless the depth changed, or the stencil for a format that sees its bits (Z24S8 read as A8R8G8B8,
+    // D8R8G8B8 or Y16_X16). The depth buffer of the pass that reads it (GTA V's lighting tests against it and marks
+    // light volumes in its stencil) is read as it was at the conversion: such feedback is undefined on the RSX, and
+    // converting again at every draw split the pass each time (D-105).
+    const bool reads_stencil = !z16 && mode != kDepthValueMode;
+    const bool feedback = draw_targets.depth == &d;
+    if (tex && conv.generation == d.generation &&
+        (!reads_stencil || feedback || conv.stencil_generation == d.stencil_generation)) {
+        return &conv;
+    }
     if (!tex) {
         // The texture's own decoded formats (rsx_decode_texture): RGBA8 for 8-bit channels, 16-bit unorm for X16 and
         // Y16_X16, the depth as a float for the depth formats.
@@ -209,7 +218,7 @@ Surface::Conversion* MetalBackend::Impl::depth_as_texture(Surface& d, u32 mode)
         if (!tex) return nullptr;
     }
     id<MTLTexture> stencil = z16 ? dummy_stencil : [d.texture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
-    end_pass();
+    end_pass_for(kEndDepthConversion);
     id<MTLComputeCommandEncoder> enc = [render_buffer() computeCommandEncoder];
     [enc setComputePipelineState:depth_pipeline];
     [enc setTexture:d.texture atIndex:0];
@@ -220,6 +229,7 @@ Surface::Conversion* MetalBackend::Impl::depth_as_texture(Surface& d, u32 mode)
     [enc dispatchThreads:MTLSizeMake(d.width, d.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
     [enc endEncoding];
     conv.generation = d.generation;
+    conv.stencil_generation = d.stencil_generation;
     stats.depth_conversions++;
     return &conv;
 }
@@ -250,7 +260,7 @@ Surface::Conversion* MetalBackend::Impl::color_as_texture(Surface& s, u32 mode)
     }
     const bool x_zero = f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 || f == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8;
     const bool x_one = f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8 || f == SurfaceColorFormat::X8B8G8R8_O8B8G8R8;
-    end_pass();
+    end_pass_for(kEndColorConversion);
     id<MTLComputeCommandEncoder> enc = [render_buffer() computeCommandEncoder];
     [enc setComputePipelineState:color_pipeline];
     [enc setTexture:s.texture atIndex:0];

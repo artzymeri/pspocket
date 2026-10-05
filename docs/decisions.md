@@ -1576,6 +1576,25 @@ wired: a host file read into a protected guest page fails rather than faults, so
 - Tests: a texture drawn twice in a batch decodes once, a CPU write before a new batch and an NV0039 copy inside a
   batch are both seen (the copy fails without the backend's own-write epoch); usleep(0) back to back sleeps after 16.
 
+## D-105 · 2026-10-05 · GPU time per frame; surfaces change when written; feedback depth reads convert once
+
+The Metal backend logs, every 300 flips, the GPU time per frame (GPUEndTime - GPUStartTime of the render buffers),
+the draws and render passes, and why the passes ended. Run 077, the first mission on the M4: 23.5 ms of GPU a frame
+(the iPhone's GPU is slower, and 33 ms is the whole frame), 1,041 draws in 113 passes, 30 of them ended by depth
+conversions: each conversion (compute, D-088) ends the render pass, and the next draw starts it again, loading and
+storing its targets.
+- A surface's generation counts the writes to it, not the passes it is attached to: draws that do not mask out a
+  colour target, depth writes (test and write enabled), clears. Stencil writes count apart (stencil_generation).
+- A depth conversion is current unless the depth changed, or the stencil for a format that sees its bits (Z24S8 read
+  as A8R8G8B8, D8R8G8B8 or Y16_X16). GTA V's lighting reads the depth buffer it tests against as A8R8G8B8 while
+  marking light volumes in its stencil: the depth buffer of the pass that reads it is read as it was at its
+  conversion (feedback is undefined on the RSX; RPCS3 reads the image as it is). Converting at every stencil write
+  split the pass at every draw.
+- Converting eagerly when the writing pass ended instead made it worse (27 ms: the depth buffer is written across
+  many passes).
+- Run 077: 17.8 ms of GPU a frame instead of 23.5, 101 passes, 16 ended by depth conversions. Same frames.
+- Test: three stencil-writing draws reading their own depth buffer convert it once (three times without the rule).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -215,7 +215,7 @@ id<MTLCommandBuffer> MetalBackend::Impl::upload_buffer()
 
 void MetalBackend::Impl::submit(bool wait)
 {
-    end_pass();
+    end_pass_for(kEndSubmit);
     // Uploads first: the render buffer samples what they decode (same queue, so in order).
     id<MTLCommandBuffer> last = nil;
     if (upload_cb) {
@@ -242,6 +242,11 @@ void MetalBackend::Impl::submit(bool wait)
     if (render_cb) {
         last = render_cb;
         transient.retire(render_cb);
+        auto gpu = gpu_ns;
+        [render_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            const double s = cb.GPUEndTime - cb.GPUStartTime;
+            if (s > 0) gpu->fetch_add(static_cast<u64>(s * 1e9), std::memory_order_relaxed);
+        }];
         [render_cb commit];
         render_cb = nil;
         visibility = nil;
@@ -332,7 +337,7 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
 void MetalBackend::Impl::open_pass(const PassTargets& t)
 {
     if (pass_open && pass == t) return;
-    end_pass();
+    end_pass_for(kEndTargets);
     pass = t;
     pass_open = true;
     pass_started = false;
@@ -380,17 +385,22 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
         encoder.label = @"rsx pass";
         pass_started = true;
         stats.render_passes++;
+        // A surface's generation counts the passes and draws that write it, not the passes it is attached to (D-105):
+        // GTA V's lighting pass samples the depth buffer it tests against without writing it, and every conversion
+        // of it ended the pass, which the next draw restarted, which made the depth buffer new again (30 passes a
+        // frame).
         for (u32 i = 0; i < pass.color_count; i++) {
             pass.color[i]->initialized = true;
             pass.color[i]->gpu_newer = true;
             pass.color[i]->last_used = tick;
-            pass.color[i]->generation++;
+            if (pass_desc.colorAttachments[i].loadAction == MTLLoadActionClear) pass.color[i]->generation++;
         }
         if (pass.depth) {
             pass.depth->initialized = true;
             pass.depth->gpu_newer = true;
             pass.depth->last_used = tick;
-            pass.depth->generation++;
+            if (pass_desc.depthAttachment.loadAction == MTLLoadActionClear) pass.depth->generation++;
+            if (pass_desc.stencilAttachment.loadAction == MTLLoadActionClear) pass.depth->stencil_generation++;
         }
     }
     return encoder;
@@ -399,6 +409,7 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
 void MetalBackend::Impl::end_pass()
 {
     if (!pass_open) return;
+    if (pass_started) pass_ends[pass_end_reason]++;
     if (!pass_started) {
         // A pass that only clears (load-action clears) must still run.
         bool clears = false;
@@ -561,6 +572,11 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
 
     // A partial clear: draw a quad with the clear values through the scissor.
     id<MTLRenderCommandEncoder> enc = start_encoder();
+    if (channels) {
+        for (u32 i = 0; i < pass.color_count; i++) pass.color[i]->generation++;
+    }
+    if (clear_depth && pass.depth) pass.depth->generation++;
+    if (clear_stencil && pass.depth) pass.depth->stencil_generation++;
     const u32 color_mask = channels ? channels : 0;
     id<MTLRenderPipelineState> pso = clear_pipeline_for(pass.color_count ? color_mask : 0, clear_depth, clear_stencil);
     if (!pso) return;
@@ -1044,6 +1060,17 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                  indexBufferOffset:ib.offset];
     }
     stats.draws++;
+    // What the draw wrote is new (D-105): colour targets it does not mask out, the depth buffer when it writes depth or
+    // stencil.
+    const ColorMaskInfo cm = state.color_mask();
+    for (u32 i = 0; i < targets.color_count; i++)
+        if (cm.mask[targets.rsx_index[i]] != 0) targets.color[i]->generation++;
+    if (targets.depth) {
+        const DepthStencilInfo& z = ds;
+        const bool stencil_writes = z.stencil_test && (z.front.write_mask || (z.two_sided_stencil && z.back.write_mask));
+        if (z.depth_test && z.depth_write) targets.depth->generation++;
+        if (stencil_writes) targets.depth->stencil_generation++;
+    }
 }
 
 // ---- flips --------------------------------------------------------------------------------------------------------
@@ -1051,7 +1078,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 void MetalBackend::Impl::do_flip(const FlipRequest& request)
 {
     tick++;
-    end_pass();
+    end_pass_for(kEndFlip);
     stats.flips++;
     if (tracing && request.flip_index >= config.trace_frame) {
         PS_LOG_INFO("rsx.trace", "frame {} ends: flip {} shows {:#010x}; {} clears and draws, {} colour targets",
@@ -1195,6 +1222,27 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
     @autoreleasepool {
         impl_->do_flip(request);
     }
+    Impl& m = *impl_;
+    if (++m.report_flips == Impl::kGpuReportFlips) {
+        const u64 gpu = m.gpu_ns->load(std::memory_order_relaxed);
+        const double n = static_cast<double>(m.report_flips);
+        static constexpr const char* kWhy[Impl::kEndCount] = {"targets", "target copy", "depth conversion",
+            "colour conversion", "submit", "flip", "surface gone", "flush", "other"};
+        std::string ends;
+        for (u32 i = 0; i < Impl::kEndCount; i++) {
+            const u64 d = m.pass_ends[i] - m.report_pass_ends[i];
+            if (d) ends += std::format("{}{} {:.1f}", ends.empty() ? "" : ", ", kWhy[i], static_cast<double>(d) / n);
+            m.report_pass_ends[i] = m.pass_ends[i];
+        }
+        PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {})",
+            m.report_flips, static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n,
+            static_cast<double>(m.stats.draws - m.report_draws) / n,
+            static_cast<double>(m.stats.render_passes - m.report_passes) / n, ends);
+        m.report_flips = 0;
+        m.report_gpu_ns = gpu;
+        m.report_draws = m.stats.draws;
+        m.report_passes = m.stats.render_passes;
+    }
 }
 
 void MetalBackend::sync()
@@ -1248,7 +1296,7 @@ bool MetalBackend::flush_memory(u32 addr, u32 size, const char* why)
             };
             for (u32 i = 0; i < m.pass.color_count; i++) check(m.pass.color[i]);
             check(m.pass.depth);
-            if (overlaps) m.end_pass();
+            if (overlaps) m.end_pass_for(Impl::kEndFlush);
         }
         for (auto& s : impl_->surfaces) {
             if (!s->gpu_newer || s->cpu_newer) continue;

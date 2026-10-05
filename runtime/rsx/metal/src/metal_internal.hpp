@@ -78,12 +78,14 @@ struct Surface {
     bool cpu_newer = false;    // guest memory was written by the CPU after the GPU copy was made
     u64 last_used = 0;
     std::unordered_map<u32, id<MTLTexture>> views; // swizzled views for sampling, by encoded channel sources
-    u64 generation = 0; // render passes that wrote it
+    u64 generation = 0;         // writes to it: colour, or depth for a depth buffer (D-105)
+    u64 stencil_generation = 0; // writes to a depth buffer's stencil
     // A depth buffer (D-088) or colour target (D-098) read as a texture of another format: its conversion per decode
     // mode, the generation it was made from, and its swizzled views.
     struct Conversion {
         id<MTLTexture> texture = nil;
         u64 generation = 0;
+        u64 stencil_generation = 0;
         std::unordered_map<u32, id<MTLTexture>> views;
     };
     std::unordered_map<u32, Conversion> conversions;
@@ -205,6 +207,23 @@ struct MetalBackend::Impl {
         std::vector<VisibilitySlot> slots;
     };
     static constexpr u32 kVisibilitySlots = 4096;
+
+    // GPU time of the render buffers (completion handlers add GPUEndTime - GPUStartTime), logged with the frame's draws
+    // and passes every kGpuReportFlips flips: what a slower GPU (the iPhone's) has to fit in a frame.
+    static constexpr u64 kGpuReportFlips = 300;
+    std::shared_ptr<std::atomic<u64>> gpu_ns = std::make_shared<std::atomic<u64>>(0);
+    // Why render passes ended (a started pass only), for the same report: the pass loads and stores its targets.
+    enum PassEnd : u8 { kEndTargets, kEndTargetCopy, kEndDepthConversion, kEndColorConversion, kEndSubmit, kEndFlip,
+                        kEndSurfaceGone, kEndFlush, kEndOther, kEndCount };
+    PassEnd pass_end_reason = kEndOther;
+    std::array<u64, kEndCount> pass_ends{}, report_pass_ends{};
+    void end_pass_for(PassEnd why)
+    {
+        pass_end_reason = why;
+        end_pass();
+        pass_end_reason = kEndOther;
+    }
+    u64 report_flips = 0, report_draws = 0, report_passes = 0, report_gpu_ns = 0;
     __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
     u32 visibility_next = 0;
     bool zpass_on = false;

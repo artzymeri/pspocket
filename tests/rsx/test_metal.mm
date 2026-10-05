@@ -1275,6 +1275,39 @@ TEST_CASE("metal e2e: a Z24S8 depth buffer read as an A8R8G8B8 texture gives its
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x12, 0x34, 0x56, 0x78});
 }
 
+TEST_CASE("metal e2e: draws that write the stencil of the depth buffer they read convert it once (D-105)")
+{
+    // GTA V's lighting marks light volumes in the stencil of the depth buffer it also reads as A8R8G8B8 to rebuild
+    // positions. Converting it again after every stencil write split the pass at every draw; the pass's own depth
+    // buffer is read as it was at the conversion (feedback, undefined on the RSX).
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    constexpr u32 kDepth = 0x180000;
+    auto b = e.at(0);
+    setup_surface_as(b, kSurfaceOffset, SurfaceColorFormat::A8R8G8B8, kW * 4, kDepth);
+    b.method(m::NV4097_SET_STENCIL_MASK, 0xff);
+    b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x12345678);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth | clear::kStencil);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kDepth, tex::A8R8G8B8, kW * 4);
+    // Stencil writes, no depth test: the depth stays 0x123456.
+    b.method(m::NV4097_SET_STENCIL_TEST_ENABLE, 1);
+    b.method(m::NV4097_SET_STENCIL_FUNC, static_cast<u32>(CompareFunc::Always));
+    b.method(m::NV4097_SET_STENCIL_FUNC_REF, 0x9a);
+    b.method(m::NV4097_SET_STENCIL_OP_ZPASS, static_cast<u32>(StencilOp::Replace));
+    for (int i = 0; i < 3; i++) draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().depth_conversions == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x12, 0x34, 0x56, 0x78});
+}
+
 TEST_CASE("metal e2e: a Z16 depth buffer reads as X16 (its value) and as DEPTH16 (the depth in every channel)")
 {
     REQUIRE_METAL();
