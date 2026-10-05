@@ -122,6 +122,22 @@ uint32_t ps_spu_interp_sites(ps_spu_interp_site* out, uint32_t n);
 /* Bytes SPU DMAs read (put = 0) or wrote (put = 1) in MB `mb` of RSX local memory so far. Diagnostics. */
 uint64_t ps_spu_video_dma(uint32_t mb, int put);
 
+/* The last DMA writes to guest memory (PUT and its forms, list elements, SDCRZ, PUTLLC, PUTLLUC) made on each host
+ * thread, in a ring per thread (D-138): when a structure turns out overwritten, ps_spu_dma_writes_over tells which SPU
+ * work wrote there. `tag` names the work the calling thread runs from now on (a SPURS worker: the job's descriptor and
+ * binary); 0: none. Diagnostics. */
+typedef struct ps_spu_dma_write {
+    uint32_t ea;
+    uint32_t size;
+    uint64_t tag;     /* the writing thread's tag then */
+    uint64_t time_ns; /* steady clock */
+    uint32_t pc;      /* the SPU's pc at the command */
+    uint32_t cmd;     /* the MFC command */
+} ps_spu_dma_write;
+void ps_spu_set_dma_tag(uint64_t tag);
+/* The recorded writes that overlap [ea, ea + size), newest first, at most n; returns how many. */
+uint32_t ps_spu_dma_writes_over(uint32_t ea, uint32_t size, ps_spu_dma_write* out, uint32_t n);
+
 /* ---------------------------------------------------------------------------------------------------------------
  * Run loop.
  * ------------------------------------------------------------------------------------------------------------- */

@@ -242,6 +242,8 @@ void Worker::body()
             sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst);
             continue;
         }
+        // The DMA log's tag for what the workload's policy writes (a job chain tags its jobs' writes, D-138).
+        ps_spu_set_dma_tag(0xFF00000000000000ull | (u64{sel.wid} << 48) | sched.spurs);
         const bool custom = run_workload(sel);
         sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst);
         const u64 dt = ns(Clock::now() - t0);

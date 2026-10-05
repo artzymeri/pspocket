@@ -13,8 +13,12 @@
 // that context's lock. The lock is only taken here to change events.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "internal.hpp"
 #include "pspocket/core/be.h"
@@ -158,6 +162,48 @@ void note_video_dma(u32 cmd, u32 eal, u32 size)
     (is_get(cmd) ? g_video_get : g_video_put)[mb].fetch_add(size, std::memory_order_relaxed);
 }
 
+// The DMA write log (ps_spu_dma_writes_over): a ring of the last writes per host thread, registered for the search and
+// dropped with its thread. A write costs a clock read and five stores.
+struct DmaWriteRing {
+    static constexpr u32 kSize = 2048;
+    std::array<ps_spu_dma_write, kSize> e{};
+    std::atomic<u32> next{0};
+    u64 tag = 0;
+};
+std::mutex g_rings_mutex;
+std::vector<DmaWriteRing*> g_rings;
+struct RingHolder {
+    DmaWriteRing* ring = nullptr;
+    ~RingHolder()
+    {
+        if (!ring) return;
+        std::lock_guard lock(g_rings_mutex);
+        std::erase(g_rings, ring);
+        delete ring;
+    }
+};
+thread_local RingHolder t_ring;
+
+DmaWriteRing& dma_ring()
+{
+    if (!t_ring.ring) {
+        t_ring.ring = new DmaWriteRing;
+        std::lock_guard lock(g_rings_mutex);
+        g_rings.push_back(t_ring.ring);
+    }
+    return *t_ring.ring;
+}
+
+void log_write(u32 cmd, u32 pc, u32 ea, u32 size)
+{
+    DmaWriteRing& r = dma_ring();
+    const u32 i = r.next.load(std::memory_order_relaxed);
+    const u64 now = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    r.e[i % DmaWriteRing::kSize] = ps_spu_dma_write{ea, size, r.tag, now, pc, cmd};
+    r.next.store(i + 1, std::memory_order_release);
+}
+
 int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
 {
     if (size == 0) return 0;
@@ -170,6 +216,7 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     if (!is_get(cmd)) {
         std::atomic_thread_fence(std::memory_order_release);
         ctx->mem_writes++;
+        log_write(cmd, pc, eal, size);
     }
     if (cmd == PS_MFC_SDCRZ) {
         std::memset(mem, 0, size);
@@ -279,6 +326,7 @@ int putlluc(SPUContext* ctx, u32 pc, u32 eal, u32 lsa)
     }
     ps_res_store_line_unconditional(ctx->membase, addr, ctx->ls + (lsa & 0x3FF80u));
     ctx->mem_writes++;
+    log_write(PS_MFC_PUTLLUC, pc, addr, 128);
     return 0;
 }
 
@@ -395,7 +443,10 @@ int mfc_command(SPUContext* ctx, u32 pc, u32 cmd)
             if (ch.res_addr == addr || reservation_lost(ctx)) set_events(ctx, PS_SPU_EVENT_LR);
         }
         ch.res_valid = 0;
-        if (ok) ctx->mem_writes++;
+        if (ok) {
+            ctx->mem_writes++;
+            log_write(PS_MFC_PUTLLC, pc, addr, 128);
+        }
         ch.atomic_stat = ok ? PS_MFC_PUTLLC_SUCCESS : PS_MFC_PUTLLC_FAILURE;
         ch.atomic_stat_count = 1;
         return 0;
@@ -457,4 +508,29 @@ extern "C" uint64_t ps_spu_video_dma(uint32_t mb, int put)
 {
     if (mb >= (PS_MEM_RSX_LOCAL_SIZE >> 20)) return 0;
     return (put ? g_video_put : g_video_get)[mb].load(std::memory_order_relaxed);
+}
+
+extern "C" void ps_spu_set_dma_tag(uint64_t tag) { dma_ring().tag = tag; }
+
+extern "C" uint32_t ps_spu_dma_writes_over(uint32_t ea, uint32_t size, ps_spu_dma_write* out, uint32_t n)
+{
+    // Read while the rings' threads write on: an entry being written may show torn, which a diagnostic accepts.
+    std::vector<ps_spu_dma_write> found;
+    {
+        std::lock_guard lock(g_rings_mutex);
+        for (const DmaWriteRing* r : g_rings) {
+            const u32 next = r->next.load(std::memory_order_acquire);
+            const u32 count = std::min<u32>(next, DmaWriteRing::kSize);
+            for (u32 k = 0; k < count; k++) {
+                const ps_spu_dma_write& w = r->e[(next - 1 - k) % DmaWriteRing::kSize];
+                if (u64{w.ea} < u64{ea} + size && ea < u64{w.ea} + w.size) found.push_back(w);
+            }
+        }
+    }
+    std::sort(found.begin(), found.end(), [](const ps_spu_dma_write& a, const ps_spu_dma_write& b) {
+        return a.time_ns > b.time_ns;
+    });
+    const u32 count = std::min<u32>(n, static_cast<u32>(found.size()));
+    std::copy_n(found.begin(), count, out);
+    return count;
 }

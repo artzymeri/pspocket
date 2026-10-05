@@ -206,6 +206,11 @@ private:
 
     void fail(u32 code, u64 cause);
     [[noreturn]] void fatal(std::string_view what) const;
+    // D-138: a descriptor found broken: what it held when read, what memory holds now, the SPU DMA writes over it and
+    // the commands around the chain's pc.
+    void report_descriptor(u64 cause) const;
+    // The DMA log's tag (ps_spu_set_dma_tag) while the module itself runs: the workload, the chain.
+    u64 policy_tag() const { return 0xFF00000000000000ull | (u64{wid_} << 48) | jc_; }
 
     Worker& w_;
     const u32 wid_;
@@ -227,6 +232,7 @@ private:
     u32 sdk_ = 0;
     u32 jobs_run_ = 0;
     u32 job_ea_ = 0; // the descriptor of the job being loaded or run, for fatal logs
+    u32 desc_ls_ = 0; // where in LS it was read
     Heap heap_;
     std::array<CacheEntry, kCacheEntries> cache_{};
     u64 stamp_ = 0;
@@ -245,6 +251,45 @@ private:
     }
     PS_FATAL(kJobChan, "SPURS {:#x} SPU {}, job chain {:#x} (workload {}): {} (pc {:#x}){}", w_.sched.spurs, w_.spu_num,
         jc_, wid_, what, ps_read64(base_, jc_ + jc_off::pc), job);
+}
+
+void JobChainPolicy::report_descriptor(u64 cause) const
+{
+    if (!job_ea_ || cause != job_ea_) return; // the error is not about the descriptor at hand
+    const auto words = [](u8* p, u32 at, u32 n) {
+        std::string s;
+        for (u32 off = 0; off < n; off += 4) s += std::format("{}{:08x}", off == 0 ? "" : off % 16 ? " " : "  ", ps_read32(p, at + off));
+        return s;
+    };
+    const u32 size = std::min<u32>(ps_read16(base_, jc_ + jc_off::sizeJobDescriptor), 0x800);
+    PS_LOG_ERROR(kJobChan, "  descriptor {:#x} as the SPU read it: {}", job_ea_, words(ls_, desc_ls_, 0x30));
+    PS_LOG_ERROR(kJobChan, "  descriptor {:#x} in memory now:      {}", job_ea_, words(base_, job_ea_, 0x30));
+    std::array<ps_spu_dma_write, 12> w{};
+    const u32 n = ps_spu_dma_writes_over(job_ea_, size, w.data(), static_cast<u32>(w.size()));
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    for (u32 i = 0; i < n; i++) {
+        const u64 tag = w[i].tag;
+        const std::string by = tag == 0 ? std::string("no SPURS work")
+            : (tag >> 56) == 0xFF ? std::format("the policy of workload {} (job chain or SPURS {:#x})", (tag >> 48) & 0xFF,
+                                        static_cast<u32>(tag))
+                                  : std::format("job {:#x} (binary {:#x})", static_cast<u32>(tag), static_cast<u32>(tag >> 32));
+        PS_LOG_ERROR(kJobChan, "  SPU DMA write over it: {:#x} bytes at {:#x} (MFC command {:#x}, SPU pc {:#x}) {:.3f} ms "
+            "ago, by {}", w[i].size, w[i].ea, w[i].cmd, w[i].pc, static_cast<double>(now - w[i].time_ns) / 1e6, by);
+    }
+    if (!n) {
+        PS_LOG_ERROR(kJobChan, "  no SPU DMA write over it among the last 2048 of each thread: the PPU or the RSX wrote "
+            "it, or the SPU read it before the game wrote it");
+    }
+    // The commands before and after the chain's pc (the JOB that named the descriptor is behind it).
+    const u64 pc = ps_read64(base_, jc_ + jc_off::pc);
+    std::string cmds;
+    for (s32 k = -6; k <= 3; k++) {
+        const u64 at = pc + static_cast<u64>(static_cast<s64>(k) * 8);
+        if (at >> 32 || !w_.sched.kernel.memory().is_committed(static_cast<u32>(at))) continue;
+        cmds += std::format("{}{:#x}: {:016x}", cmds.empty() ? "" : ", ", at, ps_read64(base_, static_cast<u32>(at)));
+    }
+    PS_LOG_ERROR(kJobChan, "  commands around pc {:#x}: {}", pc, cmds);
 }
 
 void JobChainPolicy::init()
@@ -663,6 +708,7 @@ void JobChainPolicy::fail(u32 code, u64 cause)
     PS_LOG_ERROR(kJobChan, "SPURS {:#x} SPU {}, job chain {:#x} (workload {}): CELL_SPURS_JOB_ERROR_{} ({:#x}), cause {:#x}; "
         "the chain halts{}", w_.sched.spurs, w_.spu_num, jc_, wid_, job_error_name(code), code, cause,
         first ? "" : " (another SPU reported first)");
+    report_descriptor(cause);
     if (halt) fatal("the chain halts on errors (haltOnError): libsre halts the SPU");
 }
 
@@ -777,6 +823,7 @@ bool JobChainPolicy::run_job(const Job& job)
     }
     job_ea_ = job.ea;
     const u32 desc = desc_base_ + (jobs_run_ % kRing) * max_size_;
+    desc_ls_ = desc;
     const u32 tag = tags_[jobs_run_ % 2]; // jobs alternate between the chain's two tags
     jobs_run_++;
     get(desc, job.ea, job.size, tags_[jobs_run_ % 2], "job descriptor");
@@ -965,14 +1012,17 @@ bool JobChainPolicy::run_job(const Job& job)
     }
     ps_spu_attach_program_at(&ctx, cached ? cached->program : identify_program(base_, image), binary); // relocatable (D-081)
 
+    ps_spu_set_dma_tag((u64{binary_ea} << 32) | job.ea); // the job's DMA writes carry it (D-138)
     for (;;) {
         const u32 reason = ps_spu_run(&ctx);
         if (reason == PS_SPU_STOP_SIGNAL && ctx.stop_code == kJobReturnStop) break;
+        ps_spu_set_dma_tag(policy_tag());
         if (reason == PS_SPU_STOP_REQUESTED) return false;
         fatal(std::format("job {:#x} (binary {:#x} at LS {:#x}) stopped (reason {}, code {:#x}{}, exception {}) at 0x{:05x}",
             job.ea, binary_ea, binary, reason, ctx.stop_code, ctx.stop_code == 0x3FFF ? ", stopd: an assertion" : "",
             ctx.exception, ctx.pc));
     }
+    ps_spu_set_dma_tag(policy_tag());
     // A DMA over the binary's code dropped its lifted program: the cached copy is interpreted from now on.
     if (cached && !ctx.home) cached->program = nullptr;
     // The job's own DMA (its output) completed with it: the MFC is synchronous.

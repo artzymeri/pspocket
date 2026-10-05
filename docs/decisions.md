@@ -2129,6 +2129,19 @@ the wait anyway.
   clear seen; a Z24S8 buffer read as R5G6B5 of another size likewise; a G8B8 target sampled and G8B8 memory decoded;
   G8B8 in the GPU against CPU decode comparison.
 
+## D-138 · 2026-10-05 · SPU writes to guest memory are logged per thread; a broken job descriptor names who wrote it
+
+The Mac's walk (D-137's first run) stopped on the EDGE/GFX job chain: CELL_SPURS_JOB_ERROR_INVALID_BINARY, the
+descriptor's first 16 bytes 201d2000 00000000 00000000 00000000 in memory where a descriptor's header belongs, the rest
+a descriptor. The iPhone's NUM_CACHE stop of D-131 had a descriptor full of what look like 16-bit vertex pairs. Both
+were blamed on D-127's lifter, which this run did not have: something writes over the chain's descriptors. Each host
+thread now keeps a ring of its last 2,048 SPU DMA writes to guest memory (PUT forms, list elements, SDCRZ, PUTLLC,
+PUTLLUC: address, size, MFC command, SPU pc, time, and a tag the SPURS worker sets: the job's descriptor and binary, or
+the workload's policy). A job chain that finds a descriptor broken logs what the SPU read, what memory holds now, the
+logged writes over it, newest first, and the commands around the chain's pc; no write found means the PPU or the RSX
+wrote it, or the SPU read it before the game wrote it. A write costs a clock read and five stores. The second run of the
+walk did not stop.
+
 ## D-139 · 2026-10-05 · The rest of GTA V's PSN imports: sceNp2, the store, Facebook, and the sceNp functions D-059 left
 
 The user asked for every unimplemented import to be done before the next phone build, so a call the game makes later
