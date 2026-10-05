@@ -19,6 +19,15 @@
 extern "C" {
 #endif
 
+/* Route B (D-152): code built into a game library reaches the functions marked PS_SPU_IMPORT through pointers the
+ * host fills in when it loads the library (pspocket/game/library.h): each name is then a hidden variable of the
+ * library holding the host's function. */
+#if defined(PSPOCKET_GAME_LIBRARY)
+#define PS_SPU_IMPORT(ret, name, params) extern ret(*name) params __attribute__((visibility("hidden")))
+#else
+#define PS_SPU_IMPORT(ret, name, params) ret name params
+#endif
+
 /* Every lifted function: void spu_<hash>_<start>_<entry>(SPUContext* ctx, uint8_t* ls). It may be entered at any of its
  * block starts (it switches on ctx->pc), runs until control leaves it, and returns with ctx->pc = the next guest
  * instruction (and ctx->stop_reason set if execution must stop). */
@@ -58,7 +67,7 @@ typedef struct ps_spu_program {
 uint64_t ps_spu_hash64(const uint8_t* data, size_t size);
 
 /* Registration happens at startup, before SPU threads run. The program must stay alive. */
-void ps_spu_register_program(ps_spu_program* program);
+PS_SPU_IMPORT(void, ps_spu_register_program, (ps_spu_program* program));
 void ps_spu_unregister_program(ps_spu_program* program);
 /* The registered program with this key: hash, code start and size; a relocatable program matches any code start. */
 const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, uint32_t code_size);
@@ -187,20 +196,20 @@ uint64_t ps_spu_timebase(void);
  * exception and pc are set, and the caller returns to the run loop (lifted code spills its registers first).
  * ------------------------------------------------------------------------------------------------------------- */
 
-int ps_spu_rdch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* value);
-int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value);
-int ps_spu_rchcnt(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* count);
+PS_SPU_IMPORT(int, ps_spu_rdch, (SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* value));
+PS_SPU_IMPORT(int, ps_spu_wrch, (SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value));
+PS_SPU_IMPORT(int, ps_spu_rchcnt, (SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* count));
 /* stop (signal type 0..0x3FFF) / stopd (0x3FFF) at pc. */
-int ps_spu_stop(SPUContext* ctx, uint32_t pc, uint32_t code);
+PS_SPU_IMPORT(int, ps_spu_stop, (SPUContext* ctx, uint32_t pc, uint32_t code));
 /* heq/hgt/hlgt whose condition holds (pc = the halt instruction). Always stops. */
-int ps_spu_halt(SPUContext* ctx, uint32_t pc);
+PS_SPU_IMPORT(int, ps_spu_halt, (SPUContext* ctx, uint32_t pc));
 /* Illegal or unsupported instruction at pc. Always stops (PS_SPU_EXC_ILLEGAL). */
-int ps_spu_illegal(SPUContext* ctx, uint32_t pc, uint32_t insn);
+PS_SPU_IMPORT(int, ps_spu_illegal, (SPUContext* ctx, uint32_t pc, uint32_t insn));
 /* bisled: non-zero when an enabled event is pending (the SPU_RdEventStat count). */
-int ps_spu_events_pending(SPUContext* ctx);
+PS_SPU_IMPORT(int, ps_spu_events_pending, (SPUContext* ctx));
 /* E/D bits of an indirect branch, applied after the branch updated ctx->pc. Non-zero when an interrupt must be
  * taken now (ctx->pc and srr0 are updated): the caller returns to the run loop. */
-int ps_spu_set_interrupts(SPUContext* ctx, int enable);
+PS_SPU_IMPORT(int, ps_spu_set_interrupts, (SPUContext* ctx, int enable));
 
 /* fscrwr: the architected FPSCR bits (RPCS3 SPU_FPSCR::Write). Host word i = guest word 3 - i. */
 static inline void ps_spu_fscrwr(SPUContext* ctx, const ps_spu_v128* value)

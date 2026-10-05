@@ -3,7 +3,8 @@
 
 add_library(pspocket_codesign STATIC
     src/macho.cpp
-    src/codesign.cpp)
+    src/codesign.cpp
+    src/load.cpp)
 if(APPLE)
     target_sources(pspocket_codesign PRIVATE src/identity_apple.cpp)
     target_link_libraries(pspocket_codesign PUBLIC "-framework Security" "-framework CoreFoundation")

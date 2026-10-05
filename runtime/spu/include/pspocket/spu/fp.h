@@ -104,11 +104,19 @@ static inline uint64_t ps_spu_u64f(double d)
     return u;
 }
 
-/* ---- tables: RPCS3 Emu/Cell/SPUThread.cpp (spu_frest_fraction_lut and friends) ---- */
+/* ---- tables: RPCS3 Emu/Cell/SPUThread.cpp (spu_frest_fraction_lut and friends); in a game library (D-152), the
+ * host's, through pointers it fills in at load ---- */
+#if defined(PSPOCKET_GAME_LIBRARY)
+extern const uint32_t* ps_spu_frest_fraction_lut __attribute__((visibility("hidden")));
+extern const uint32_t* ps_spu_frest_exponent_lut __attribute__((visibility("hidden")));
+extern const uint32_t* ps_spu_frsqest_fraction_lut __attribute__((visibility("hidden")));
+extern const uint32_t* ps_spu_frsqest_exponent_lut __attribute__((visibility("hidden")));
+#else
 extern const uint32_t ps_spu_frest_fraction_lut[32];
 extern const uint32_t ps_spu_frest_exponent_lut[256];
 extern const uint32_t ps_spu_frsqest_fraction_lut[64];
 extern const uint32_t ps_spu_frsqest_exponent_lut[256];
+#endif
 
 /* ---- extended-range single precision (ACCURATE model), RPCS3 SPULLVMRecompiler.cpp xfloat_to_double,
  * xfloat_in_double and double_to_xfloat ---- */

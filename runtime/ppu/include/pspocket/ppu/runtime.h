@@ -15,6 +15,17 @@
 extern "C" {
 #endif
 
+/*
+ * Route B (D-152): code built into a game library reaches the functions marked PS_PPU_IMPORT, and the dispatch table,
+ * through pointers the host fills in when it loads the library (pspocket/game/library.h). Each name is then a hidden
+ * variable of the library holding the host's function, so the generated code is the same either way.
+ */
+#if defined(PSPOCKET_GAME_LIBRARY)
+#define PS_PPU_IMPORT(ret, name, params) extern ret(*name) params __attribute__((visibility("hidden")))
+#else
+#define PS_PPU_IMPORT(ret, name, params) ret name params
+#endif
+
 /* Every lifted function: void f_XXXXXXXX(PPUContext* restrict ctx, uint8_t* base) (D-009, amended by D-013). */
 typedef void (*ps_ppu_fn)(PPUContext* ctx, uint8_t* base);
 
@@ -36,13 +47,18 @@ typedef struct ps_ppu_dispatch_table {
     uint32_t count;
 } ps_ppu_dispatch_table;
 
+#if defined(PSPOCKET_GAME_LIBRARY)
+extern ps_ppu_dispatch_table* ps_ppu_dispatch_ref __attribute__((visibility("hidden")));
+#define ps_ppu_dispatch (*ps_ppu_dispatch_ref)
+#else
 extern ps_ppu_dispatch_table ps_ppu_dispatch;
+#endif
 
 /*
  * The function in every empty slot. It reads the target from ctx->cia (ps_ppu_call_indirect stores it there) and
  * applies the miss policy below.
  */
-void ps_ppu_dispatch_miss_stub(PPUContext* ctx, uint8_t* base);
+PS_PPU_IMPORT(void, ps_ppu_dispatch_miss_stub, (PPUContext* ctx, uint8_t* base));
 
 static inline ps_ppu_fn ps_ppu_dispatch_slot(uint32_t addr)
 {
@@ -54,8 +70,8 @@ static inline ps_ppu_fn ps_ppu_dispatch_slot(uint32_t addr)
 ps_ppu_fn ps_ppu_dispatch_find(uint32_t addr);
 
 void ps_ppu_dispatch_register(uint32_t addr, ps_ppu_fn fn);
-void ps_ppu_dispatch_register_table(const ps_ppu_dispatch_entry* entries, size_t count);
-void ps_ppu_dispatch_unregister(uint32_t addr);
+PS_PPU_IMPORT(void, ps_ppu_dispatch_register_table, (const ps_ppu_dispatch_entry* entries, size_t count));
+PS_PPU_IMPORT(void, ps_ppu_dispatch_unregister, (uint32_t addr));
 void ps_ppu_dispatch_clear(void);
 size_t ps_ppu_dispatch_count(void);
 
@@ -81,7 +97,8 @@ static inline void ps_ppu_call_indirect(PPUContext* ctx, uint8_t* base, uint32_t
  * tail call. Otherwise the miss policy applies; the interpreter then runs until the enclosing lifted function would
  * have returned: cia == stop_lr and r1 == stop_sp (that function's entry LR and SP).
  */
-void ps_ppu_jump_miss(PPUContext* ctx, uint8_t* base, uint32_t target, uint64_t stop_lr, uint64_t stop_sp);
+PS_PPU_IMPORT(void, ps_ppu_jump_miss, (PPUContext* ctx, uint8_t* base, uint32_t target, uint64_t stop_lr,
+    uint64_t stop_sp));
 static inline void ps_ppu_jump_indirect(PPUContext* ctx, uint8_t* base, uint32_t target, uint64_t stop_lr,
     uint64_t stop_sp)
 {
@@ -99,19 +116,25 @@ static inline void ps_ppu_jump_indirect(PPUContext* ctx, uint8_t* base, uint32_t
  * patched. Logs pc and target and aborts in dev builds (never __builtin_unreachable); release builds continue
  * like ps_ppu_jump_indirect.
  */
-void ps_ppu_jump_table_miss(PPUContext* ctx, uint8_t* base, uint32_t pc, uint32_t target, uint64_t stop_lr,
-    uint64_t stop_sp);
+PS_PPU_IMPORT(void, ps_ppu_jump_table_miss, (PPUContext* ctx, uint8_t* base, uint32_t pc, uint32_t target,
+    uint64_t stop_lr, uint64_t stop_sp));
 
 /* ---------------------------------------------------------------------------------------------------------------
  * Interpreter fallbacks for lifted code (context fully spilled before the call, reloaded after).
  * ------------------------------------------------------------------------------------------------------------- */
 
 /* Executes the single (non-branch) instruction at pc. */
-void ps_ppu_interp_one(PPUContext* ctx, uint8_t* base, uint32_t pc);
+PS_PPU_IMPORT(void, ps_ppu_interp_one, (PPUContext* ctx, uint8_t* base, uint32_t pc));
 /* Runs from pc until cia == stop_lr and r1 == stop_sp (calls registered lifted functions on the way). */
-void ps_ppu_interp_until(PPUContext* ctx, uint8_t* base, uint32_t pc, uint64_t stop_lr, uint64_t stop_sp);
+PS_PPU_IMPORT(void, ps_ppu_interp_until, (PPUContext* ctx, uint8_t* base, uint32_t pc, uint64_t stop_lr,
+    uint64_t stop_sp));
 /* Illegal/unknown instruction reached: logs pc and the word, then aborts. */
+#if defined(PSPOCKET_GAME_LIBRARY)
+typedef void (*ps_ppu_illegal_fn)(PPUContext* ctx, uint8_t* base, uint32_t pc) __attribute__((noreturn));
+extern ps_ppu_illegal_fn ps_ppu_illegal __attribute__((visibility("hidden")));
+#else
 __attribute__((noreturn)) void ps_ppu_illegal(PPUContext* ctx, uint8_t* base, uint32_t pc);
+#endif
 
 /* ---------------------------------------------------------------------------------------------------------------
  * System hooks (process-wide; set before guest code runs).
@@ -125,13 +148,13 @@ typedef void (*ps_ppu_trap_handler)(PPUContext* ctx, uint8_t* base, uint32_t pc)
 /* NULL restores the defaults, which log (syscall number / trap address) and abort. */
 void ps_ppu_set_syscall_handler(ps_ppu_syscall_handler handler);
 void ps_ppu_set_trap_handler(ps_ppu_trap_handler handler);
-void ps_ppu_syscall(PPUContext* ctx, uint8_t* base);
-void ps_ppu_trap(PPUContext* ctx, uint8_t* base, uint32_t pc);
+PS_PPU_IMPORT(void, ps_ppu_syscall, (PPUContext* ctx, uint8_t* base));
+PS_PPU_IMPORT(void, ps_ppu_trap, (PPUContext* ctx, uint8_t* base, uint32_t pc));
 
 /* mftb / mfspr TBL,TBU. NULL restores ps_timebase_now (pspocket/core/timebase.h); tests install a fixed clock. */
 typedef uint64_t (*ps_ppu_timebase_source)(void);
 void ps_ppu_set_timebase_source(ps_ppu_timebase_source source);
-uint64_t ps_ppu_timebase(void);
+PS_PPU_IMPORT(uint64_t, ps_ppu_timebase, (void));
 
 /*
  * Reservations: lwarx/ldarx/stwcx./stdcx., on the shared 128-byte-line reservation system that SPU GETLLAR/PUTLLC
@@ -141,14 +164,14 @@ uint64_t ps_ppu_timebase(void);
  * store or notified write in between, its bytes equal: RPCS3 also compares data, PPUThread.cpp
  * ppu_store_reservation), and always clear the reservation.
  */
-uint32_t ps_ppu_lwarx(PPUContext* ctx, uint8_t* base, uint32_t ea);
-uint64_t ps_ppu_ldarx(PPUContext* ctx, uint8_t* base, uint32_t ea);
-int ps_ppu_stwcx(PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t value);
-int ps_ppu_stdcx(PPUContext* ctx, uint8_t* base, uint32_t ea, uint64_t value);
+PS_PPU_IMPORT(uint32_t, ps_ppu_lwarx, (PPUContext* ctx, uint8_t* base, uint32_t ea));
+PS_PPU_IMPORT(uint64_t, ps_ppu_ldarx, (PPUContext* ctx, uint8_t* base, uint32_t ea));
+PS_PPU_IMPORT(int, ps_ppu_stwcx, (PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t value));
+PS_PPU_IMPORT(int, ps_ppu_stdcx, (PPUContext* ctx, uint8_t* base, uint32_t ea, uint64_t value));
 
 /* lswx / stswx (byte count in ctx->xer_bc), on the spilled ctx->gpr. Semantics: RPCS3 PPUInterpreter.cpp LSWX. */
-void ps_ppu_lswx(PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t rt);
-void ps_ppu_stswx(PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t rs);
+PS_PPU_IMPORT(void, ps_ppu_lswx, (PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t rt));
+PS_PPU_IMPORT(void, ps_ppu_stswx, (PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t rs));
 
 #ifdef __cplusplus
 } /* extern "C" */
