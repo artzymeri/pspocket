@@ -2587,6 +2587,34 @@ sys/external then decrypt with pspocket's own SELF code (run 096). The app insta
 software into Application Support/pspocket-firmware/dev_flash, which games then mount. The second half, loading
 firmware modules (LLE) where pspocket has no HLE, is next.
 
+## D-157 · 2026-10-06 · Firmware modules run as they are where pspocket has nothing (LLE, route B stage 5)
+
+Any game may import a library pspocket never implemented; with the user's system software installed (D-156), the PS3's
+own module serves it instead of every call failing. runtime/loader/lle.cpp does what RPCS3's ppu_load_prx,
+ppu_load_exports and ppu_load_imports do (PPUModule.cpp): the module (a SELF in /dev_flash/sys/external) decrypted with
+pspocket's SELF code, its LOAD segments placed in main memory, its SCE_PPURELA relocations applied (types 1, 4, 5, 6,
+10, 11, 38, 44, 57; a bad entry is logged and skipped), its exports read (the management library's module_start and
+module_stop, every library's functions and variables), its own imports linked to the host's stubs or to other firmware
+modules, recursively. The game's import slots get the module's descriptors and its variable references the module's
+addresses; the main thread runs each module_start (dependencies first, r3 = r4 = 0) after sys_initialize_tls and
+before the entry, as ppu_load_exec does. Firmware code runs under the interpreter (the dispatch miss policy is
+already "interpret").
+
+The policy is per module file, not per function: a module goes LLE only when the host implements none of the libraries
+it exports. Mixing host and firmware functions of one library would split its state (SPURS, sysutil, the GCM context),
+and RPCS3 also chooses per library. So the libraries pspocket runs on the host (lv2, SPURS (D-037), the RSX, files,
+sysutil, network, NP) are never doubled, and a library a host function exists for keeps its gaps as logged errors
+(rule 4). `--lle LIBRARY` (pspocket-boot) forces one onto its module to test it; `--no-lle` turns modules off. The
+index of which file exports which library is built once per firmware (all 142 modules of 4.92 decrypt; 163 libraries;
+2.5 s on the M4) and kept in lle-index.txt beside /dev_flash. pspocket-boot uses modules whenever --flash is given,
+the app whenever the system software is installed.
+
+First real run (run 097): Assassin's Creed with `--lle cellSync`, which libsre.sprx exports beside cellSpurs: the
+firmware's cellSync replaces the main thread's 24-million-call spin on the missing cellSyncMutexTryLock, and the game
+goes on to its next gaps (sys_mmapper_allocate_memory). Its own libraries all have host functions, so by default it
+loads no module. Not yet: modules a game loads itself through sys_prx (syscalls 480-499), modules' imported variables,
+and translating firmware code with the game.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
