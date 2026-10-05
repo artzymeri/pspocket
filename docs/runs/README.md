@@ -83,3 +83,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [080](080-gta5-mission-mac.md) | 2026-10-05 | 3a3e3fb+ | M4 Mac, pspocket-boot, sticks | Walking, the phone and the charge in the first mission; **no SPU code interpreted** after five lift rounds (D-108) |
 | [081](081-gta5-profile-mac.md) | 2026-10-05 | a1f7223+ | M4 Mac, pspocket-boot, sample | CPU per thread in the mission (1.3 cores busy); SPU image identification **363 samples to 30** (D-109) |
 | [082](082-gta5-shader-cache-mac.md) | 2026-10-05 | 7ac7e8c+ | M4 Mac, pspocket-boot --shader-cache | Shaders made ahead while the game loads: **no compile stalls in play** instead of 13.6 s of them (D-114) |
+| [083](083-gta5-conditional-mac.md) | 2026-10-05 | eeda058+ | M4 Mac, pspocket-boot | Conditional rendering no longer decides by an older count: **0 wrong skips** (the black and red flashes on the iPhone, D-115) |

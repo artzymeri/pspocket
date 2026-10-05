@@ -1762,6 +1762,26 @@ slower.
 - Tests: a second backend on the same cache directory compiles nothing for a draw the first one compiled two programs
   and a pipeline for; the surface check reports a write behind the backend's back.
 
+## D-115 · 2026-10-05 · Conditional rendering draws while its query is still being counted
+
+On the iPhone, parts of characters (whole people, or some of their clothes) flashed black or red now and then.
+Conditional rendering (D-102) read the report a query writes when the method ran; occlusion counts arrive only when the
+GPU has finished the query's draws, so what it read was an older count. In GTA V every test comes in the frame of its
+query, before the frame's work is submitted: all 4,905 to 7,736 draws a run skipped were decided by some earlier
+frame's count. A part that had been hidden then was skipped while the passes around it (its depth among them) drew, and
+the lighting shaded the hole with what the G-buffer held: black or red. The phone's slower GPU makes the counts later
+still.
+- The backend now says which report values have a count on its way (`report_pending`: registered by report_zpass,
+  counted down by the completion handler that writes them). A test on one of those draws: an older count is no answer.
+  RPCS3 evaluates on the GPU instead (VK_EXT_conditional_rendering); Metal has no predicated draws.
+- Run 083: no draw skipped by conditional rendering in the first mission (all its tests found their counts pending),
+  GPU 8.7 ms a frame at 30 fps, same frames. Occlusion culling by conditional rendering is lost with it; a GPU-side test
+  (an indirect draw whose count a compute pass writes from the visibility buffer) would bring it back.
+- Also: the app target, not the runtime library, holds the shaders folder (D-114): a library's resources reach no
+  bundle, and build 126 went out without the Mac's recording.
+- Test: a draw under a report the GPU has not counted renders even though the memory holds zero; once counted, the same
+  test skips.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
