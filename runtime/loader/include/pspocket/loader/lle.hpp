@@ -12,6 +12,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -19,10 +20,7 @@
 #include <vector>
 
 #include "pspocket/core/types.hpp"
-
-namespace pspocket::hle {
-class HleProcess;
-}
+#include "pspocket/hle/process.hpp"
 
 namespace pspocket::loader {
 
@@ -56,15 +54,18 @@ public:
     bool chooses(std::string_view library) const;
     void force(std::string library) { forced_.push_back(std::move(library)); }
 
-    // Loads the module exporting `library` (once), with the modules its own imports need that the host lacks. Must be
-    // called before guest threads run. nullptr with the reason in *error.
+    // Loads the module exporting `library` (once), with the modules its own imports need that the host lacks. nullptr
+    // with the reason in *error. Before guest threads run, or under RuntimeModules' lock.
     const PrxModule* load(std::string_view library, hle::HleProcess& hle, std::string* error);
+    // The module in sys/external file `file` (once), as load(): for a game that loads one by its path (D-159).
+    const PrxModule* load_file(const std::string& file, hle::HleProcess& hle, std::string* error);
+    // Whether the host implements none of `file`'s libraries: the module can run as it is.
+    bool runs_whole(std::string_view file) const;
     const std::vector<std::unique_ptr<PrxModule>>& loaded() const { return loaded_; }
     // module_start descriptors in the order they run: a module after the modules it imports from.
     const std::vector<u32>& starts() const { return starts_; }
 
 private:
-    const PrxModule* load_file(const std::string& file, hle::HleProcess& hle, std::string* error);
 
     std::string dev_flash_;
     std::map<std::string, std::string, std::less<>> library_file_;               // library -> file
@@ -72,6 +73,51 @@ private:
     std::vector<std::string> forced_;
     std::vector<std::unique_ptr<PrxModule>> loaded_;
     std::vector<u32> starts_;
+};
+
+class Executable;
+
+// Modules the game loads while it runs (sys_prx_load_module, D-159; RPCS3 lv2/sys_prx.cpp prx_load_module and
+// _sys_prx_start_module): a module of the game's own, read through its file system (/dev_bdvd, /app_home, ...), a disc
+// game's SELF decrypted with the built-in keys, placed and linked as a firmware module is; a firmware module by its
+// /dev_flash path through `lle` when the host replaces none of it, else an empty module (the host's functions serve
+// its libraries, as RPCS3's "ignored" HLE modules). Starting one points the executable's imports of its libraries at
+// its exports. Install with HleProcess::set_module_loader before guest threads run.
+class RuntimeModules final : public hle::ModuleLoader {
+public:
+    RuntimeModules(hle::HleProcess& hle, std::shared_ptr<const Executable> exe, LleModules* lle);
+    ~RuntimeModules() override;
+
+    u32 load(std::string_view path, u32* id) override;
+    u32 start(u32 id, u32* entry) override;
+    void started(u32 id, s32 result) override;
+    u32 stop(u32 id, u32* entry) override;
+    void stopped(u32 id, s32 result) override;
+    u32 unload(u32 id) override;
+    u32 id_by_name(std::string_view name) override;
+
+    // The module behind `id` (null for an empty one or an unknown ID).
+    const PrxModule* module(u32 id);
+
+private:
+    enum class State { Loaded, Started, Stopped, Unloaded };
+    struct Entry {
+        u32 id = 0;
+        std::string path;
+        const PrxModule* module = nullptr; // the game's (owned) or a firmware module (lle's); null: empty
+        std::unique_ptr<PrxModule> owned;
+        State state = State::Loaded;
+    };
+    Entry* find(u32 id);
+    u32 link_function(std::string_view library, u32 nid, std::string_view who);
+    u32 link_variable(std::string_view library, u32 nid, std::string_view who);
+
+    hle::HleProcess& hle_;
+    std::shared_ptr<const Executable> exe_;
+    LleModules* lle_;
+    std::recursive_mutex mutex_;
+    std::vector<std::unique_ptr<Entry>> entries_;
+    u32 next_id_ = 0x23000001; // RPCS3's lv2_prx IDs start at 0x23000000
 };
 
 // Places a decrypted PRX (an ELF) in main memory and links it: segments, relocations (the SCE_PPURELA program

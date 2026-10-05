@@ -275,3 +275,57 @@ TEST_CASE("LLE: a game's import served by a firmware module, its module_start ru
     kernel.reset();
     fs::remove_all(root);
 }
+
+TEST_CASE("Run-time modules: a game's own PRX loaded by path, started (its exports reach the game's imports) and "
+          "found by name (D-159)", "[hle][lle][prx]")
+{
+    // The game ships libsynth.sprx in its directory and loads it with sys_prx_load_module while it runs.
+    const fs::path root = fresh_flash("pspocket-test-prx-runtime");
+    constexpr u32 kMarker = 0x21100; // the executable's bss: module_start writes it
+    const auto prx = test::build_ppu_prx();
+    std::vector<u8> module = prx_exporting(prx, "synthLib", 0xDEADBEEF);
+    mark_module_start(module, kMarker);
+    fs::create_directories(root / "usrdir");
+    write(root / "usrdir" / "libsynth.sprx", debug_self(module));
+
+    const auto x = test::build_ppu_exec();
+    auto exe = loader::Executable::parse(x.bytes);
+    REQUIRE(exe);
+    hle::test::Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/app_home", (root / "usrdir").string(), true));
+    REQUIRE(loader::load(**exe, *f.kernel, *f.hle) == lv2::CELL_OK);
+    loader::RuntimeModules modules(*f.hle, *exe, nullptr);
+    f.hle->set_module_loader(&modules);
+
+    u8* base = f.base();
+    const u32 slot = x.first_stub_slot + 12 * 4; // synthLib 0xDEADBEEF
+    const u32 host_stub = ps_read32(base, slot);
+    hle::test::GuestThread t(f, 0, "main");
+    const u32 path = hle::test::kData, missing = hle::test::kData + 0x100, name = hle::test::kData + 0x200,
+              result = hle::test::kData + 0x300;
+    const std::string p = "/app_home/libsynth.sprx", m = "/app_home/none.sprx", n = "synthetic_prx";
+    std::memcpy(base + path, p.c_str(), p.size() + 1);
+    std::memcpy(base + missing, m.c_str(), m.size() + 1);
+    std::memcpy(base + name, n.c_str(), n.size() + 1);
+
+    CHECK(t.call("sys_prx_load_module", missing, 0, 0) == hle::test::r3_of(lv2::CELL_ENOENT));
+    CHECK(t.call("sys_prx_load_module", path, 1, 0) == hle::test::r3_of(lv2::CELL_ENOSYS)); // a fixed address
+    const u64 id = t.call("sys_prx_load_module", path, 0, 0);
+    REQUIRE(static_cast<s32>(id) > 0);
+    CHECK(t.call("sys_prx_get_module_id_by_name", name, 0, 0) == id);
+    CHECK(ps_read32(base, slot) == host_stub); // not linked before it starts
+    CHECK(t.call("sys_prx_start_module", id, 0, 0, result, 0, 0) == lv2::CELL_OK);
+    CHECK(ps_read32(base, result) == 0);           // module_start's result: resident
+    CHECK(ps_read32(base, kMarker) == 0x77);       // module_start ran on the calling thread
+    const loader::PrxModule* loaded = modules.module(static_cast<u32>(id));
+    REQUIRE(loaded != nullptr);
+    CHECK(ps_read32(base, slot) == loaded->functions.at({"synthLib", 0xDEADBEEF})); // the game's import now goes to it
+    CHECK(t.call("sys_prx_start_module", id, 0, 0, result, 0, 0) == hle::test::r3_of_code(0x80011133)); // started
+    CHECK(t.call("sys_prx_unload_module", id, 0, 0) == hle::test::r3_of_code(0x80011138)); // stop it first
+    CHECK(t.call("sys_prx_stop_module", id, 0, 0, result, 0, 0) == lv2::CELL_OK);
+    CHECK(t.call("sys_prx_unload_module", id, 0, 0) == lv2::CELL_OK);
+    CHECK(t.call("sys_prx_get_module_id_by_name", name, 0, 0) == hle::test::r3_of_code(0x8001112E));
+    f.hle->set_module_loader(nullptr);
+    fs::remove_all(root);
+}
+

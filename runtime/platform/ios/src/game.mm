@@ -81,6 +81,7 @@ struct Session {
     std::unique_ptr<lv2::Kernel> kernel;
     std::unique_ptr<hle::HleProcess> hle;
     std::unique_ptr<loader::LleModules> lle; // the firmware modules it runs (D-157)
+    std::unique_ptr<loader::RuntimeModules> modules; // the modules it loads while it runs (D-159)
     std::unique_ptr<platform::AudioOutput> audio; // the game's sound (cellAudio's mix) on the phone's output
     loader::BootState state;
     std::chrono::steady_clock::time_point start;
@@ -441,6 +442,9 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         return fail(error, error_size, std::string("loading the executable failed: ") + lv2::error_name(r));
     }
     if (s->lle) s->state.module_starts = s->lle->starts();
+    // Modules the game loads while it runs (sys_prx_load_module, D-159).
+    s->modules = std::make_unique<loader::RuntimeModules>(*s->hle, s->exe, s->lle.get());
+    s->hle->set_module_loader(s->modules.get());
 #if PSPOCKET_HAVE_GAME_SPU
     // The lifted SPU programs built into the app (scripts/ios.sh), first: a program is found by its code's hash, the
     // first registered winning, so these (with the entries the Mac's runs collected, D-099) run where the library has

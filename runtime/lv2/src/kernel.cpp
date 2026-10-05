@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 
@@ -541,6 +542,26 @@ std::string Kernel::vfs_host_path(std::string_view vpath) const
     const Vfs::Resolved r = impl_->vfs.resolve(vpath);
     if (!r.mount || r.mount->image) return {};
     return r.host;
+}
+
+bool Kernel::vfs_read_file(std::string_view vpath, std::vector<u8>& out) const
+{
+    const Vfs::Resolved r = impl_->vfs.resolve(vpath);
+    if (!r.mount) return false;
+    if (r.mount->image) {
+        const auto file = r.mount->image->open(r.image_path);
+        if (!file) return false;
+        out.resize(static_cast<usize>(file->size()));
+        return file->read(0, out.data(), out.size());
+    }
+    std::FILE* f = std::fopen(r.host.c_str(), "rb");
+    if (!f) return false;
+    out.clear();
+    u8 buf[1 << 16];
+    for (usize n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;) out.insert(out.end(), buf, buf + n);
+    const bool ok = !std::ferror(f);
+    std::fclose(f);
+    return ok;
 }
 
 std::shared_ptr<PpuThread> Kernel::thread(u32 id) const { return impl_->threads.get<PpuThread>(id); }

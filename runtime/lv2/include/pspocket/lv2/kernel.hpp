@@ -222,6 +222,9 @@ public:
     // The host path a guest path maps to on a host-directory mount, for HLE modules that manage files for the game
     // (cellGame creating game data). Empty for the root, an image mount or a path outside every mount.
     std::string vfs_host_path(std::string_view vpath) const;
+    // A whole guest file read into `out` (a host-directory mount or an image), for the host's own use (the loader
+    // reading a PRX module the game loads, D-159). False when it is not a readable regular file.
+    bool vfs_read_file(std::string_view vpath, std::vector<u8>& out) const;
 
     // PPU threads. create_thread allocates the guest stack and an ID and leaves the thread stopped.
     Result create_thread(const ThreadParams& params, u32& id_out);

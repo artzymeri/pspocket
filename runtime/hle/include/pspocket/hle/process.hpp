@@ -61,6 +61,25 @@ struct GameInfo {
     std::vector<u8> param_sfo; // PARAM.SFO as on the disc; empty if unknown
 };
 
+// Modules the game loads while it runs (sys_prx_load_module and the rest, D-159): the loader's (runtime/loader
+// RuntimeModules), installed in the process before guest threads run. Each call returns CELL_OK or a CELL_PRX_ERROR /
+// CELL_E* code; the HLE functions in sys_prx.cpp run the start and stop functions on the calling thread.
+class ModuleLoader {
+public:
+    virtual ~ModuleLoader() = default;
+    // Places and links the module at guest path `path`; its ID in *id.
+    virtual u32 load(std::string_view path, u32* id) = 0;
+    // Its exports linked into the imports waiting for them; *entry its module_start descriptor (0: none).
+    virtual u32 start(u32 id, u32* entry) = 0;
+    // module_start returned `result` (SYS_PRX_RESIDENT 0: it stays; else it goes).
+    virtual void started(u32 id, s32 result) = 0;
+    virtual u32 stop(u32 id, u32* entry) = 0;
+    virtual void stopped(u32 id, s32 result) = 0;
+    virtual u32 unload(u32 id) = 0;
+    // By the name in its module info; 0 when none.
+    virtual u32 id_by_name(std::string_view name) = 0;
+};
+
 struct ProcessConfig {
     // Abort on the first call to an unimplemented function instead of logging and returning CELL_ENOSYS.
     bool abort_on_unimplemented = false;
@@ -86,8 +105,9 @@ public:
     const ProcessConfig& config() const { return config_; }
 
     // Returns the descriptor address to store in an import slot for (module, nid). The same pair always gets the same
-    // descriptor. `name` is only used for logs. Must be called before guest threads run (it registers dispatch
-    // entries); 0 when the main area is full.
+    // descriptor. `name` is only used for logs. 0 when the main area is full. While guest threads run (a module the
+    // game loads, D-159) it is safe for the first kPreparedChunks chunks of stubs: the tables linked_at reads without
+    // the lock never move before then.
     u32 link_function(std::string_view module, u32 nid, std::string_view name);
 
     // Links every internal function (Function::internal) of the modules in `modules` (the game's imports). Same rule
@@ -98,6 +118,9 @@ public:
 
     // The linked function whose stub is at code address `cia` (descriptor + 4), or nullptr.
     LinkedFunction* linked_at(u32 cia);
+    // Modules loaded at run time (D-159); null when nothing installed one.
+    void set_module_loader(ModuleLoader* loader) { module_loader_ = loader; }
+    ModuleLoader* module_loader() const { return module_loader_; }
     std::vector<const LinkedFunction*> linked() const;
     // Calls that reached a function without a host implementation.
     u64 unimplemented_calls() const { return unimplemented_calls_.load(std::memory_order_relaxed); }
@@ -146,6 +169,7 @@ private:
     mutable std::mutex link_mutex_;
     std::vector<Chunk> chunks_;
     std::vector<std::unique_ptr<LinkedFunction>> linked_; // index = chunk * kEntriesPerChunk + entry
+    ModuleLoader* module_loader_ = nullptr;
     std::atomic<u64> unimplemented_calls_{0};
 
     Tls tls_{};
@@ -165,6 +189,7 @@ private:
 inline constexpr u32 kStubEntrySize = 8;
 inline constexpr u32 kStubChunkSize = 0x10000;
 inline constexpr u32 kEntriesPerChunk = kStubChunkSize / kStubEntrySize;
+inline constexpr u32 kPreparedChunks = 8; // 65,536 linked functions before the stub tables may move
 
 // TLS layout (RPCS3 sys_ppu_thread_.cpp): each thread's block starts with a 0x30-byte system area, then the image;
 // r13 points 0x7000 bytes past the image start.

@@ -46,7 +46,8 @@ void stub_trampoline(PPUContext* ctx, uint8_t* base)
     if (!f) PS_FATAL(kChan, "HLE stub call at {:#010x} with no linked function (LR {:#010x})", ctx->cia, ctx->lr);
     const u64 n = f->calls.fetch_add(1, std::memory_order_relaxed) + 1;
     if (f->impl) {
-        PS_LOG_TRACE(kChan, "{}::{} (LR {:#010x})", f->module, f->name, ctx->lr);
+        PS_LOG_TRACE(kChan, "{}::{} (LR {:#010x}, r3 {:#x}, r4 {:#x}, r5 {:#x}) on thread {:#x}", f->module, f->name, ctx->lr,
+            ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], lv2::current_thread() ? lv2::current_thread()->id : 0);
         f->impl->fn(*ctx, base);
         return;
     }
@@ -159,6 +160,9 @@ void MainMemory::free(u32 addr)
 HleProcess::HleProcess(lv2::Kernel& kernel, u32 main_begin, u32 main_end, ProcessConfig config)
     : kernel_(kernel), config_(config), main_(kernel.memory(), main_begin, main_end)
 {
+    // Sized once, so linking while guest threads call stubs (D-159) never moves what linked_at reads.
+    chunks_.reserve(kPreparedChunks);
+    linked_.resize(usize{kPreparedChunks} * kEntriesPerChunk);
 }
 
 HleProcess::~HleProcess()
@@ -176,8 +180,12 @@ HleProcess* HleProcess::current() { return g_current.load(); }
 u32 HleProcess::link_function(std::string_view module, u32 nid, std::string_view name)
 {
     std::lock_guard lock(link_mutex_);
-    for (const auto& f : linked_)
-        if (f && f->nid == nid && f->module == module) return f->descriptor;
+    for (usize c = 0; c < chunks_.size(); c++) {
+        for (u32 e = 0; e < chunks_[c].used; e++) {
+            const auto& f = linked_[c * kEntriesPerChunk + e];
+            if (f && f->nid == nid && f->module == module) return f->descriptor;
+        }
+    }
 
     if (chunks_.empty() || chunks_.back().used == kEntriesPerChunk) {
         const u32 base = main_.alloc(kStubChunkSize, kStubChunkSize);
@@ -185,8 +193,11 @@ u32 HleProcess::link_function(std::string_view module, u32 nid, std::string_view
             PS_LOG_ERROR(kChan, "no main-area memory for HLE stubs ({}::{})", module, name);
             return 0;
         }
+        if (chunks_.size() == kPreparedChunks)
+            PS_LOG_WARN(kChan, "more than {} chunks of HLE stubs: linking from now on is unsafe while guest threads run",
+                kPreparedChunks);
         chunks_.push_back({base, 0});
-        linked_.resize(chunks_.size() * kEntriesPerChunk);
+        if (linked_.size() < chunks_.size() * kEntriesPerChunk) linked_.resize(chunks_.size() * kEntriesPerChunk);
     }
     Chunk& c = chunks_.back();
     const u32 index = static_cast<u32>(chunks_.size() - 1) * kEntriesPerChunk + c.used;
@@ -224,8 +235,12 @@ bool HleProcess::link_internal_functions(const std::vector<std::string>& modules
 u32 HleProcess::descriptor_of(std::string_view module, u32 nid) const
 {
     std::lock_guard lock(link_mutex_);
-    for (const auto& f : linked_)
-        if (f && f->nid == nid && f->module == module) return f->descriptor;
+    for (usize c = 0; c < chunks_.size(); c++) {
+        for (u32 e = 0; e < chunks_[c].used; e++) {
+            const auto& f = linked_[c * kEntriesPerChunk + e];
+            if (f && f->nid == nid && f->module == module) return f->descriptor;
+        }
+    }
     return 0;
 }
 

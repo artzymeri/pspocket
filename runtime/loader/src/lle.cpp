@@ -2,6 +2,7 @@
 // SCE_PPURELA relocations; ppu_load_exports; ppu_load_imports) and rpcs3/Emu/Cell/lv2/sys_prx.cpp.
 
 #include "pspocket/loader/lle.hpp"
+#include "pspocket/loader/loader.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -285,8 +286,14 @@ bool LleModules::chooses(std::string_view library) const
     const auto file = file_for(library);
     if (!file) return false;
     if (std::find(forced_.begin(), forced_.end(), library) != forced_.end()) return true;
-    const auto it = file_libraries_.find(*file);
-    return std::none_of(it->second.begin(), it->second.end(), [](const std::string& l) { return host_has(l); });
+    return runs_whole(*file);
+}
+
+bool LleModules::runs_whole(std::string_view file) const
+{
+    const auto it = file_libraries_.find(file);
+    return it != file_libraries_.end() &&
+        std::none_of(it->second.begin(), it->second.end(), [](const std::string& l) { return host_has(l); });
 }
 
 const PrxModule* LleModules::load(std::string_view library, hle::HleProcess& hle, std::string* error)
@@ -351,6 +358,212 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
         m->name, file, m->segments.size(), m->segments.empty() ? 0 : m->segments[0].first, m->relocations,
         m->relocation_errors, m->functions.size(), m->start);
     return m;
+}
+
+// ---- modules the game loads while it runs (D-159) ----------------------------------------------------------------
+
+namespace {
+
+constexpr u32 kPrxErrorAlreadyStarted = 0x80011133,
+              kPrxErrorNotStarted = 0x80011134, kPrxErrorUnsupportedType = 0x80011148,
+              kPrxErrorIllegalLibrary = 0x8001113D, kPrxErrorNotRemovable = 0x80011138;
+constexpr u32 kOk = 0, kNoEntry = 0x80010006, kNoSuchObject = 0x80010005; // CELL_ENOENT, CELL_ESRCH
+
+} // namespace
+
+RuntimeModules::RuntimeModules(hle::HleProcess& hle, std::shared_ptr<const Executable> exe, LleModules* lle)
+    : hle_(hle), exe_(std::move(exe)), lle_(lle)
+{
+}
+
+RuntimeModules::~RuntimeModules() = default;
+
+RuntimeModules::Entry* RuntimeModules::find(u32 id)
+{
+    for (const auto& e : entries_)
+        if (e->id == id && e->state != State::Unloaded) return e.get();
+    return nullptr;
+}
+
+const PrxModule* RuntimeModules::module(u32 id)
+{
+    std::lock_guard lock(mutex_);
+    const Entry* e = find(id);
+    return e ? e->module : nullptr;
+}
+
+// A module's import: from a module the game loaded before, else a firmware module the host does not replace, else the
+// host's stub.
+u32 RuntimeModules::link_function(std::string_view library, u32 nid, std::string_view who)
+{
+    for (const auto& e : entries_) {
+        if (!e->module || e->state == State::Unloaded) continue;
+        if (const auto it = e->module->functions.find({std::string(library), nid}); it != e->module->functions.end())
+            return it->second;
+    }
+    if (lle_ && lle_->chooses(library)) {
+        std::string why;
+        if (const PrxModule* m = lle_->load(library, hle_, &why)) {
+            if (const auto it = m->functions.find({std::string(library), nid}); it != m->functions.end()) return it->second;
+        } else {
+            PS_LOG_ERROR(kChan, "{} needs {}: {}", who, library, why);
+        }
+    }
+    return hle_.link_function(library, nid, {});
+}
+
+u32 RuntimeModules::link_variable(std::string_view library, u32 nid, std::string_view who)
+{
+    for (const auto& e : entries_) {
+        if (!e->module || e->state == State::Unloaded) continue;
+        if (const auto it = e->module->variables.find({std::string(library), nid}); it != e->module->variables.end())
+            return it->second;
+    }
+    if (lle_ && lle_->chooses(library)) {
+        std::string why;
+        if (const PrxModule* m = lle_->load(library, hle_, &why)) {
+            if (const auto it = m->variables.find({std::string(library), nid}); it != m->variables.end()) return it->second;
+        } else {
+            PS_LOG_ERROR(kChan, "{} needs {}: {}", who, library, why);
+        }
+    }
+    return 0;
+}
+
+u32 RuntimeModules::load(std::string_view path, u32* id)
+{
+    std::lock_guard lock(mutex_);
+    auto e = std::make_unique<Entry>();
+    e->path = std::string(path);
+    const std::string file = fs::path(e->path).filename().string();
+    constexpr std::string_view kFirmware = "/dev_flash/sys/external/";
+    if (path.starts_with(kFirmware)) {
+        // A firmware module by its path: as it is when the host replaces none of it, else empty (the host's functions
+        // serve its libraries).
+        if (lle_ && lle_->runs_whole(file)) {
+            std::string why;
+            e->module = lle_->load_file(file, hle_, &why);
+            if (!e->module) {
+                PS_LOG_ERROR(kChan, "{}: {}", path, why);
+                return kPrxErrorIllegalLibrary;
+            }
+        } else {
+            PS_LOG_INFO(kChan, "{}: the host serves its libraries (an empty module)", path);
+        }
+    } else {
+        std::vector<u8> bytes;
+        if (!hle_.kernel().vfs_read_file(path, bytes)) return kNoEntry;
+        std::vector<u8> elf;
+        if (bytes.size() >= 4 && bytes[0] == 0x7F && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F') {
+            elf = std::move(bytes);
+        } else {
+            auto decrypted = recomp::decrypt_self(bytes, recomp::builtin_self_keys());
+            if (!decrypted) {
+                // An NPDRM module needs the game's licence key (klicensee), which only a PSN game has.
+                PS_LOG_ERROR(kChan, "{}: cannot decrypt: {}", path, decrypted.error().message);
+                return kPrxErrorUnsupportedType;
+            }
+            elf = std::move(*decrypted);
+        }
+        e->owned = std::make_unique<PrxModule>();
+        e->owned->file = file;
+        std::string why;
+        const std::string who(path);
+        if (!load_prx(
+                elf, hle_, [&](std::string_view library, u32 nid) { return link_function(library, nid, who); },
+                e->owned.get(), &why,
+                [&](std::string_view library, u32 nid) { return link_variable(library, nid, who); })) {
+            PS_LOG_ERROR(kChan, "{}: {}", path, why);
+            return kPrxErrorIllegalLibrary;
+        }
+        e->module = e->owned.get();
+        PS_LOG_INFO(kChan, "{} ({}): {} segments at {:#x}, {} relocations ({} bad), {} functions exported", path,
+            e->module->name, e->module->segments.size(), e->module->segments.empty() ? 0 : e->module->segments[0].first,
+            e->module->relocations, e->module->relocation_errors, e->module->functions.size());
+    }
+    e->id = next_id_++;
+    *id = e->id;
+    entries_.push_back(std::move(e));
+    return kOk;
+}
+
+u32 RuntimeModules::start(u32 id, u32* entry)
+{
+    std::lock_guard lock(mutex_);
+    Entry* e = find(id);
+    if (!e) return kNoSuchObject;
+    if (e->state == State::Started) return kPrxErrorAlreadyStarted;
+    *entry = 0;
+    if (!e->module) return kOk;
+    // Its exports into the executable's imports of them (RPCS3 lv2_prx::load_exports): the slots held the host's
+    // stubs, which log the call and fail.
+    u32 functions = 0, variables = 0;
+    if (exe_) {
+        GuestMemory& mem = hle_.kernel().memory();
+        for (const auto& lib : exe_->module().imports) {
+            for (const auto& fn : lib.functions) {
+                const auto it = e->module->functions.find({lib.name, fn.nid});
+                if (it == e->module->functions.end()) continue;
+                ps_write32(mem.base(), fn.slot, it->second);
+                if (fn.refs) patch_refs(mem, *fn.refs, it->second, std::format("{}::{:#010x}", lib.name, fn.nid));
+                functions++;
+            }
+            for (const auto& var : lib.variables) {
+                const auto it = e->module->variables.find({lib.name, var.nid});
+                if (it == e->module->variables.end()) continue;
+                patch_refs(mem, var.ref_table, it->second, std::format("{}::{:#010x}", lib.name, var.nid));
+                variables++;
+            }
+        }
+    }
+    PS_LOG_INFO(kChan, "{} starts: {} of the game's imported functions and {} variables now go to it", e->path, functions,
+        variables);
+    *entry = e->module->start;
+    return kOk;
+}
+
+void RuntimeModules::started(u32 id, s32 result)
+{
+    std::lock_guard lock(mutex_);
+    Entry* e = find(id);
+    if (!e) return;
+    // SYS_PRX_RESIDENT (0) stays; otherwise the module goes (RPCS3 _sys_prx_start_module, cmd 2).
+    e->state = result == 0 ? State::Started : State::Unloaded;
+}
+
+u32 RuntimeModules::stop(u32 id, u32* entry)
+{
+    std::lock_guard lock(mutex_);
+    Entry* e = find(id);
+    if (!e) return kNoSuchObject;
+    if (e->state != State::Started) return kPrxErrorNotStarted;
+    *entry = e->module ? e->module->stop : 0;
+    return kOk;
+}
+
+void RuntimeModules::stopped(u32 id, s32 /*result*/)
+{
+    std::lock_guard lock(mutex_);
+    if (Entry* e = find(id)) e->state = State::Stopped;
+}
+
+u32 RuntimeModules::unload(u32 id)
+{
+    std::lock_guard lock(mutex_);
+    Entry* e = find(id);
+    if (!e) return kNoSuchObject;
+    if (e->state == State::Started) return kPrxErrorNotRemovable;
+    // Its memory stays: code of it may still sit in a caller's frames or in function pointers the game kept.
+    e->state = State::Unloaded;
+    return kOk;
+}
+
+u32 RuntimeModules::id_by_name(std::string_view name)
+{
+    std::lock_guard lock(mutex_);
+    for (const auto& e : entries_)
+        if (e->state != State::Unloaded && e->module && e->module->name == name) return e->id;
+    return 0;
 }
 
 bool load_prx(std::span<const u8> elf_bytes, hle::HleProcess& hle, const std::function<u32(std::string_view, u32)>& link,
