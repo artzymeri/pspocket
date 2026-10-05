@@ -13,6 +13,7 @@ add_library(pspocket_hle STATIC
     src/cellSpursQueue.cpp
     src/cellSpursSemaphore.cpp
     src/cellSsl.cpp
+    src/cellSync.cpp
     src/cellSysmodule.cpp
     src/cellSysutil.cpp
     src/cellVoice.cpp
