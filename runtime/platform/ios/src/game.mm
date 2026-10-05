@@ -37,6 +37,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/core/thread_report.hpp"
+#include "pspocket/game/host.hpp"
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/process.hpp"
@@ -257,9 +258,12 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     // SPU code without a lifted program, or outside it, is interpreted (D-076). The game's lifted SPU programs, when
     // the build has them (scripts/ios.sh), run its SPURS tasks, jobs and the modules they load (D-079, D-081).
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
+    const std::string game_library = options->game_library ? options->game_library : "";
 #if PSPOCKET_HAVE_GAME_SPU
-    pspocket_game_spu_register();
-    hle::enable_spu_modules();
+    if (game_library.empty()) { // a game library brings its own, registered once the executable is loaded
+        pspocket_game_spu_register();
+        hle::enable_spu_modules();
+    }
 #endif
 
     lv2::Config cfg = s->exe->kernel_config();
@@ -420,9 +424,20 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report); r != lv2::CELL_OK) {
         return fail(error, error_size, std::string("loading the executable failed: ") + lv2::error_name(r));
     }
+    if (!game_library.empty()) {
+        // The game's translated code from its game library (route B, D-152), checked against this runtime and this
+        // executable before anything in it runs.
+        game::LoadedLibrary loaded;
+        std::string why;
+        if (!game::load_library(game_library, *s->memory, &loaded, &why))
+            return fail(error, error_size, "the game library cannot run: " + why);
+        if (loaded.library->spu_register) hle::enable_spu_modules();
+        s->translated = loaded.library->ppu_function_count > 0;
+    }
 #if PSPOCKET_HAVE_GAME_PPU
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098).
-    if (loader::register_translated_ppu(*s->memory, game_ppu_image_words, game_ppu_image_word_count, &game_ppu_register)) {
+    if (game_library.empty() &&
+        loader::register_translated_ppu(*s->memory, game_ppu_image_words, game_ppu_image_word_count, &game_ppu_register)) {
         s->translated = true;
         PS_LOG_INFO(kChan, "the game's PPU code runs translated ahead of time");
     }

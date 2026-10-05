@@ -50,8 +50,9 @@ final class GameModel {
 
     // MARK: running
 
-    /// Boots the game from its disc image and decrypted executable; nil, or why it could not start.
-    func boot(iso: URL, elf: URL) -> String? {
+    /// Boots the game from its disc image and decrypted executable, with its translated code from `library` (a game
+    /// library this iPhone made, D-152) when there is one; nil, or why it could not start.
+    func boot(iso: URL, elf: URL, library: URL? = nil) -> String? {
         guard !running else { return "A game is already running" }
         let layer = screen.metalLayer
         let docs = Self.documents
@@ -63,10 +64,13 @@ final class GameModel {
                 docs.appendingPathComponent("hdd0").path.withCString { hdd0 in
                     flash.path.withCString { flashPath in
                         docs.appendingPathComponent("game.log").path.withCString { log in
-                            var options = ps_game_options(elf_path: elfPath, iso_path: isoPath, hdd0_dir: hdd0,
-                                flash_dir: hasFlash ? flashPath : nil, log_path: log,
-                                metal_layer: Unmanaged.passUnretained(layer).toOpaque())
-                            return ps_game_boot(&options, &error, error.count)
+                            (library?.path ?? "").withCString { libraryPath in
+                                var options = ps_game_options(elf_path: elfPath, iso_path: isoPath, hdd0_dir: hdd0,
+                                    flash_dir: hasFlash ? flashPath : nil, log_path: log,
+                                    metal_layer: Unmanaged.passUnretained(layer).toOpaque(),
+                                    game_library: library == nil ? nil : libraryPath)
+                                return ps_game_boot(&options, &error, error.count)
+                            }
                         }
                     }
                 }

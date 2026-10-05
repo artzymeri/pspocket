@@ -21,6 +21,8 @@ typedef struct ps_game_options {
     const char* flash_dir; /* /dev_flash, from the user's own firmware (D-067), or NULL */
     const char* log_path;  /* the run's log (written from scratch), or NULL */
     void* metal_layer;     /* the CAMetalLayer the frames go to (bridged), or NULL */
+    const char* game_library; /* the game's translated code as a game library (route B, D-152), or NULL: the
+                                 translation built into the app, if it is this game's, else the interpreters */
 } ps_game_options;
 
 /*
