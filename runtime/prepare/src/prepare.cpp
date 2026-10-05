@@ -224,9 +224,14 @@ Result prepare_game(const Options& o)
     if (!read_bytes(o.executable, exe)) return fail("cannot read the executable " + o.executable);
     const std::string exe_sha = hex(recomp::Sha256::hash(std::string_view(exe)));
     const double exe_mb = static_cast<double>(exe.size()) / 1e6;
-    // GTA V: 28.6 MB of executable, 8 s to translate on the M4, about 4,300 cost-seconds to compile (runs 093-094).
-    translate_estimate = 0.3 * exe_mb;
-    compile_estimate = 150 * exe_mb * o.prior_rates[0] / workers;
+    // GTA V: 28.6 MB of executable, 6 s to translate on the M4, about 2,400 cost-seconds of PPU code to compile, and
+    // 1,900 of SPU code from 84 MB of lifted C (runs 094-095). Refined once the files are known.
+    translate_estimate = 0.25 * exe_mb;
+    double spu_c_mb = 0;
+    if (!o.spu_dir.empty())
+        for (const auto& e : fs::recursive_directory_iterator(o.spu_dir, ec))
+            if (e.is_regular_file() && e.path().extension() == ".c") spu_c_mb += static_cast<double>(e.file_size()) / 1e6;
+    compile_estimate = (85 * exe_mb * o.prior_rates[0] + 23 * spu_c_mb * o.prior_rates[1]) / workers;
     auto left_after_translation = [&] { return compile_estimate + link_estimate + sign_estimate; };
     report(Progress::Phase::Translating, translate_estimate + left_after_translation(), 0, 0,
         "Translating the game's code");

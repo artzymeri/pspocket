@@ -127,3 +127,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **State:** -fno-slp-vectorize (PPU) and the allocator budget adopted (D-153: GTA V 8:21 to 6:47 on the M4, the
   gate the same); the time left within 15% throughout (run 094). Open: the SPU analyzer's copies, per-unit
   prototypes, PGO/LTO clang, LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.
+
+## Stability: the EDGE/GFX job chain's descriptors written over
+
+- **Seen:** CELL_SPURS_JOB_ERROR_NUM_CACHE or INVALID_BINARY on the EDGE/GFX chain now and then, the chain halts
+  (D-130, D-131 on the iPhone, D-138 and run 095 on the Mac): a descriptor slot holds vertex-like data. Run 095's log
+  names the writer: a job (binary 0x18fcc80) PUT 0x2000 bytes at 0x10394000, over the descriptor at 0x10395a00, 26 ms
+  before the chain read it. The walk passes when run again.
+- **Try:** which SPU program binary 0x18fcc80 is and where its output address comes from (its job descriptor's
+  output list, the interpreter against the lifted program for that job: spu-check with that image); whether lv2 or
+  the game's heap handed out the ring and the job's buffer overlapping (log both allocations).
+- **State:** open; it stands between GTA V and an hour without a stop (the Flawless bar).

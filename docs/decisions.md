@@ -2517,6 +2517,36 @@ first (rule 2).
 - Still to try, each against the gate: the SPU analyzer's copies of other functions' code, per-unit prototypes, clang
   built with PGO and LTO (docs/improve.md).
 
+## D-154 · 2026-10-05 · Preparing a game on the phone: the pipeline, the screen, what is checked (route B, stage 4)
+
+The phone makes a game's library itself, the first time the game is played: route B's promise (D-147), on top of
+signing (D-150), compiling (D-151), libraries (D-152) and the compile settings and time left (D-153).
+- **One pipeline for the Mac and the phone (runtime/prepare):** the executable's PPU functions translated
+  (`recomp::ppu::translate_executable`, which ppu-lift --elf now shares: byte-identical output for GTA V; units of
+  about 12,000 instructions), every file compiled (`codegen::build_library`), linked, signed (the user's identity on
+  the phone, ad hoc on the Mac), then a manifest: the executable's SHA-256, the ABI and translator hashes, the
+  compiler and the CPU it compiled for, the timings and the compile rate per kind of file. One progress and time left
+  over all the steps (GTA V: translating takes 6 s of the 7.5 minutes). The translated C (0.8 GB for GTA V) is deleted
+  once the library is made; the objects stay, so a stopped preparation goes on from where it was.
+- **When a game is prepared again:** no library; another ABI hash (another pspocket); another executable (an update);
+  another CPU (a backup restored to another phone: the phone compiles for its own chip, `-mcpu` from LLVM's host
+  detection, which takes chips newer than it knows, the A19 Pro included, as its newest, apple-m4). Another translator
+  hash leaves the library in use (a newer pspocket would translate the game differently; preparing it again is for
+  later).
+- **The screen:** Play on a game without a library shows "Preparing <game> for this iPhone": a bar that fills by time,
+  the step ("Compiling: 312 of 811 files"), and the time left, followed with a time constant of about six seconds and
+  said the way a person says it ("About 7 minutes left", "Less than a minute left"). The screen stays on. Cancel stops
+  at the next file and keeps what is compiled. The next game's time left starts from the speeds this phone measured
+  last time (`last-preparation/manifest.json`).
+- **When it cannot:** no signing identity on the phone yet, no compiler in the build, or a failure: the game starts
+  the way it did before route B (the translation built into the app if it is this game's, else the interpreters), and
+  the library shows why.
+- **SPU programs:** a library made on the phone has none yet; the app's built-in ones (found by their code's hash, so
+  never for another game) run with it. Next (stage 4c): the phone lifts the SPU programs too, from images found in
+  the executable (264 of GTA V's 265 are in EBOOT.elf as they are) and those the game loads at run time.
+- **On the Mac:** `pspocket-prepare --title ID --exe EBOOT.elf --game-dir DIR [--spu DIR]` runs the same pipeline;
+  GTA V prepared from its executable alone (and the Mac's lifted SPU programs) passes the gate (run 095).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
