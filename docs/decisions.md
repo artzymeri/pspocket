@@ -1797,6 +1797,20 @@ closing the app.
   (44 MB); same frames.
 - Test: a texture unused for a few flips (the limit set low) is freed, then decoded again when a draw uses it.
 
+## D-117 · 2026-10-05 · The phone records what the translation does not cover, for the Mac to pull
+
+The user plays further on the phone than the Mac's scripted runs reach, and SPU code the translation has not reached
+runs in the interpreter there, slowly. The app now keeps what it meets, the way pspocket-boot keeps it on the Mac:
+- SPU programs without a lifted program are saved, with their seeds (`hle::set_spu_dump_dir`), and every address lifted
+  code did not reach is appended to a miss log in the log's own words (`ps_spu_set_miss_log`, new), in
+  Library/Application Support/pspocket-coverage (kept by the system, not shown in Files). Shaders already went to
+  Library/Caches/pspocket-shaders (D-114).
+- `scripts/ios.sh pull-coverage` copies both from the phone (devicectl; `PSPOCKET_PULL_FROM` takes a container on this
+  Mac, a simulator's) into the game's inventory directory: new programs, new seed lines, the misses as a run log
+  (run-phone-<time>.log, which scripts/lift-spu.sh and translate-game.sh read), new shaders and pipelines. The next
+  lift and build cover what the phone met.
+- Tests: a miss reaches the miss log in the words lift-spu.sh matches; the merge, on a fake container.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

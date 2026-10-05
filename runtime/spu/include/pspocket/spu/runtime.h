@@ -106,6 +106,9 @@ typedef enum ps_spu_miss_policy { PS_SPU_MISS_ABORT = 0, PS_SPU_MISS_INTERPRET =
 void ps_spu_set_miss_policy(ps_spu_miss_policy policy);
 ps_spu_miss_policy ps_spu_get_miss_policy(void);
 uint64_t ps_spu_miss_count(void);
+/* Each address a miss is logged for is also appended to the file at `path` (NULL: none), in the log's own words, so
+ * scripts/lift-spu.sh can take the file as a log: the iOS app keeps one for the Mac to translate (D-117). */
+void ps_spu_set_miss_log(const char* path);
 
 /* Where the run loop interprets: instructions interpreted, by the program current when the interpreter took over (NULL:
  * none) and the address it took over at, for the n largest (the table holds the first 4096 keys). Diagnostics. */

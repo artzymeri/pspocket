@@ -506,6 +506,7 @@ namespace {
 
 void jump_to_kernel_exit(SPUContext* ctx, uint8_t*) { ctx->pc = 0x808; }
 void call_task_syscall(SPUContext* ctx, uint8_t*) { ctx->pc = 0xA70; }
+void jump_to_unlifted(SPUContext* ctx, uint8_t*) { ctx->pc = 0xA10; }
 
 } // namespace
 
@@ -575,4 +576,32 @@ TEST_CASE("SPU programs: a task's syscall entry runs as a lifted stand-in, not a
     ps_spu_set_resolver(nullptr);
     ps_spu_set_get_observer(nullptr);
     ps_spu_unregister_program(&task);
+}
+
+TEST_CASE("SPU programs: a miss is also written to the miss log, in the words scripts/lift-spu.sh reads (D-117)",
+    "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    Spu spu(mem.base());
+    ps_write32(spu.ls.get(), 0xA10, 0x00000123); // `stop 0x123`, no lifted code for it
+    const ps_spu_entry entries[] = {{0xA00, &jump_to_unlifted}};
+    ps_spu_program p{"spu_misslog", 7, 0xA00, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_register_program(&p);
+    const auto path = std::filesystem::temp_directory_path() / std::format("pspocket-misses-{}.log", getpid());
+    std::filesystem::remove(path);
+    const ps_spu_miss_policy policy = ps_spu_get_miss_policy();
+    ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
+    ps_spu_set_miss_log(path.c_str());
+    ps_spu_attach_program(&spu.ctx, &p);
+    spu.ctx.pc = 0xA00;
+    REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+    CHECK(spu.ctx.stop_code == 0x123);
+    ps_spu_set_miss_log(nullptr);
+    ps_spu_set_miss_policy(policy);
+    ps_spu_unregister_program(&p);
+    const std::vector<u8> text = read_file(path);
+    const std::string log(text.begin(), text.end());
+    CHECK(log.find("no lifted code at 0x00a10 in program spu_misslog") != std::string::npos);
+    std::filesystem::remove(path);
 }

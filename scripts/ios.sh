@@ -41,6 +41,10 @@ Commands:
                              inventory/*/decrypt/EBOOT.elf; the title ID from the disc image next to it) and the
                              /dev_flash files the game loads itself (default inventory/firmware/dev_flash, without the
                              reference-only .sprx). Phone connected and unlocked. They stay on your devices.
+  pull-coverage              Copy what the phone met that the translation does not cover (D-117) into the game's
+                             inventory directory: the SPU programs without lifted code, the addresses lifted code did not
+                             reach (a run log for scripts/lift-spu.sh) and the shaders it compiled. Phone connected and
+                             unlocked. Then translate and build again (scripts/lift-spu.sh, build or testflight).
   all                        build + install + run --autorun --exit + report.
   testflight [--upload-only] gen, then archive the Release build, export it signed for App Store Connect (team
                              M7XJA39ZV6) and upload it for TestFlight: the way onto an iPhone that is not connected to
@@ -604,6 +608,82 @@ PLIST
     fi
 }
 
+# The game's inventory directory: $PSPOCKET_GAME_DIR, else the one whose lifted SPU programs a build would use.
+game_inventory_dir() {
+    if [ -n "${PSPOCKET_GAME_DIR:-}" ]; then echo "$PSPOCKET_GAME_DIR"; return; fi
+    local found=""
+    for d in "$ROOT"/inventory/*/spu-lifted; do
+        if [ -f "$d/game_spu.c" ]; then found="$(dirname "$d")"; fi
+    done
+    [ -n "$found" ] || die "no inventory/*/spu-lifted: set PSPOCKET_GAME_DIR to the game's inventory directory"
+    echo "$found"
+}
+
+cmd_pull_coverage() {
+    local dev game tmp n_spu=0 n_seeds=0 n_shaders=0 n_pipes=0 stamp
+    game="$(game_inventory_dir)"
+    tmp="$(mktemp -d)"
+    if [ -n "${PSPOCKET_PULL_FROM:-}" ]; then
+        # An app data container on this Mac instead (a simulator's: xcrun simctl get_app_container ... data; tests).
+        say "pulling the coverage in $PSPOCKET_PULL_FROM into $game"
+        cp -R "$PSPOCKET_PULL_FROM/Library/Application Support/pspocket-coverage" "$tmp/coverage" \
+            || die "no Library/Application Support/pspocket-coverage in $PSPOCKET_PULL_FROM"
+        if [ -d "$PSPOCKET_PULL_FROM/Library/Caches/pspocket-shaders" ]; then
+            cp -R "$PSPOCKET_PULL_FROM/Library/Caches/pspocket-shaders" "$tmp/shaders"
+        fi
+    else
+        dev="$(device_id)"
+        say "pulling the phone's coverage into $game"
+        xcrun devicectl device copy from --device "$dev" --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+            --source "Library/Application Support/pspocket-coverage" --destination "$tmp/coverage" --quiet >&2 \
+            || die "nothing to pull: the app has run no game since it records coverage (D-117), or the phone is locked"
+        xcrun devicectl device copy from --device "$dev" --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+            --source "Library/Caches/pspocket-shaders" --destination "$tmp/shaders" --quiet >&2 \
+            || warn "no shader cache on the phone"
+    fi
+    # SPU programs: an image is the same wherever it was saved; its seed lines (where execution entered it) add up.
+    mkdir -p "$game/spu"
+    for f in "$tmp"/coverage/spu/spu_*; do
+        [ -e "$f" ] || continue
+        local name dest
+        name="$(basename "$f")"
+        dest="$game/spu/$name"
+        if [ ! -e "$dest" ]; then
+            cp "$f" "$dest"
+            case "$name" in *.bin) n_spu=$((n_spu + 1)) ;; esac
+        elif [ "${name##*.}" = txt ]; then
+            while IFS= read -r line; do
+                case "$line" in seed\ *) grep -qxF "$line" "$dest" || { printf '%s\n' "$line" >> "$dest"; n_seeds=$((n_seeds + 1)); } ;; esac
+            done < "$f"
+        fi
+    done
+    # The addresses lifted code did not reach: a run log, which scripts/lift-spu.sh and translate-game.sh read.
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    if [ -s "$tmp/coverage/spu-misses.log" ]; then
+        cp "$tmp/coverage/spu-misses.log" "$game/run-phone-$stamp.log"
+        n_seeds=$((n_seeds + $(grep -c 'no lifted code at' "$tmp/coverage/spu-misses.log" || true)))
+    fi
+    # Shaders: new programs, new pipeline lines.
+    if [ -d "$tmp/shaders/programs" ]; then
+        mkdir -p "$game/shaders/programs"
+        for f in "$tmp"/shaders/programs/*.txt; do
+            [ -e "$f" ] || continue
+            [ -e "$game/shaders/programs/$(basename "$f")" ] && continue
+            cp "$f" "$game/shaders/programs/"
+            n_shaders=$((n_shaders + 1))
+        done
+        if [ -f "$tmp/shaders/pipelines.txt" ]; then
+            touch "$game/shaders/pipelines.txt"
+            while IFS= read -r line; do
+                grep -qxF "$line" "$game/shaders/pipelines.txt" || { printf '%s\n' "$line" >> "$game/shaders/pipelines.txt"; n_pipes=$((n_pipes + 1)); }
+            done < "$tmp/shaders/pipelines.txt"
+        fi
+    fi
+    rm -rf "$tmp"
+    say "new: $n_spu SPU programs, $n_seeds entry points, $n_shaders shader programs, $n_pipes pipelines"
+    say "next: scripts/lift-spu.sh $game/spu $game/spu-lifted $game/run-*.log, then scripts/ios.sh build or testflight"
+}
+
 case "$COMMAND" in
     gen) cmd_gen ;;
     build) cmd_build ;;
@@ -613,6 +693,7 @@ case "$COMMAND" in
     pull-iso) cmd_pull_iso ;;
     push-game) cmd_push_game ;;
     testflight) cmd_testflight ;;
+    pull-coverage) cmd_pull_coverage ;;
     all)
         cmd_build >/dev/null
         cmd_install

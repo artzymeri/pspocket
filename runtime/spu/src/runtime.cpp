@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -46,6 +47,7 @@ std::atomic<ps_spu_resolver> g_resolver{nullptr};
 std::atomic<ps_spu_get_observer> g_get_observer{nullptr};
 std::mutex g_miss_mutex;
 std::unordered_set<u64> g_logged_misses;
+std::FILE* g_miss_log = nullptr; // ps_spu_set_miss_log (under g_miss_mutex)
 
 constexpr u64 kP1 = 0x9E3779B185EBCA87ull;
 constexpr u64 kP2 = 0xC2B2AE3D27D4EB4Full;
@@ -88,9 +90,15 @@ void report_miss(const SPUContext* ctx, u32 pc)
             p->hash, pc);
     const u64 key = (p->hash << 18) ^ at;
     std::lock_guard lock(g_miss_mutex);
-    if (g_logged_misses.insert(key).second)
+    if (g_logged_misses.insert(key).second) {
         PS_LOG_WARN("spu", "SPU {}: no lifted code at 0x{:05x} in program {} ({:016x}, LS 0x{:05x}): interpreting", ctx->id,
             at, p->name, p->hash, pc);
+        if (g_miss_log) {
+            std::fprintf(g_miss_log, "SPU %u: no lifted code at 0x%05x in program %s (%016llx, LS 0x%05x): interpreting\n",
+                static_cast<unsigned>(ctx->id), at, p->name, static_cast<unsigned long long>(p->hash), pc);
+            std::fflush(g_miss_log);
+        }
+    }
 }
 
 } // namespace
@@ -254,6 +262,13 @@ void ps_spu_attach_program_at(SPUContext* ctx, const ps_spu_program* program, ui
 }
 
 void ps_spu_set_miss_policy(ps_spu_miss_policy policy) { g_miss_policy.store(policy); }
+
+void ps_spu_set_miss_log(const char* path)
+{
+    std::lock_guard lock(g_miss_mutex);
+    if (g_miss_log) std::fclose(g_miss_log);
+    g_miss_log = path ? std::fopen(path, "a") : nullptr;
+}
 void ps_spu_set_resolver(ps_spu_resolver resolver) { g_resolver.store(resolver, std::memory_order_release); }
 void ps_spu_set_get_observer(ps_spu_get_observer observer) { g_get_observer.store(observer, std::memory_order_release); }
 ps_spu_miss_policy ps_spu_get_miss_policy(void) { return g_miss_policy.load(); }

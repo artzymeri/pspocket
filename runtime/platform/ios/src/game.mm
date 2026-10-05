@@ -185,6 +185,19 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     // SPU code without a lifted program, or outside it, is interpreted (D-076). The game's lifted SPU programs, when
     // the build has them (scripts/ios.sh), run its SPURS tasks, jobs and the modules they load (D-079, D-081).
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
+    // Coverage for the Mac (D-117): the SPU programs this phone meets without lifted code (saved as pspocket-boot
+    // --spu-dump saves them) and the addresses lifted code did not reach, kept for scripts/ios.sh pull-coverage, which
+    // hands them to the next translation. Application Support: the system does not purge it, Files does not show it.
+    if (NSString* support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)
+                                .firstObject) {
+        const std::string coverage = std::string(support.UTF8String) + "/pspocket-coverage";
+        std::error_code ec;
+        std::filesystem::create_directories(coverage + "/spu", ec);
+        if (!ec) {
+            hle::set_spu_dump_dir(coverage + "/spu");
+            ps_spu_set_miss_log((coverage + "/spu-misses.log").c_str());
+        }
+    }
 #if PSPOCKET_HAVE_GAME_SPU
     pspocket_game_spu_register();
     hle::enable_spu_modules();
