@@ -56,7 +56,11 @@ final class GameModel {
         guard !running else { return "A game is already running" }
         let layer = screen.metalLayer
         let docs = Self.documents
-        let flash = docs.appendingPathComponent("dev_flash")
+        // /dev_flash: the system software installed from PS3UPDAT.PUP on this iPhone (D-156), else a copy pushed
+        // from the Mac.
+        let installed = Firmware.devFlash
+        let flash = FileManager.default.fileExists(atPath: installed.appendingPathComponent("sys").path)
+            ? installed : docs.appendingPathComponent("dev_flash")
         let hasFlash = FileManager.default.fileExists(atPath: flash.path)
         var error = [CChar](repeating: 0, count: 1024)
         let status = iso.path.withCString { isoPath in
@@ -77,7 +81,7 @@ final class GameModel {
             }
         }
         if status != 0 { return String(cString: error) }
-        problem = hasFlash ? nil : "No dev_flash on this iPhone: the game's audio will fail (scripts/ios.sh push-game)"
+        problem = hasFlash ? nil : "No system software on this iPhone: install PS3UPDAT.PUP in Settings (the game's sound needs it)"
         running = true
         sendPad()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refresh() }

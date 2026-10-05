@@ -5,3 +5,4 @@
 #include "pspocket/platform/ios.h"
 #include "pspocket/platform/game.h"
 #include "pspocket/platform/prepare.h"
+#include "pspocket/platform/firmware.h"

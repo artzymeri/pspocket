@@ -195,11 +195,15 @@ extern "C" int ps_prepare_start(const char* executable, const char* title_id, co
     o.memory_mb = static_cast<double>(os_proc_available_memory()) / 1048576.0 * 0.5;
     NSString* bundle = [[NSBundle mainBundle] bundleIdentifier];
     o.identifier = bundle ? bundle.UTF8String : "com.artzymeri.pspocket.testhost"; // library validation wants the app's
-    // How fast this phone compiled last time, per kind of file (this game's manifest, else the last game's).
+    // How fast this phone compiled last time, per kind of file (the last game's preparation, else this game's last
+    // one), brought from the heat it was measured at to the heat now: a warm phone compiles slower (D-154).
+    o.thermal = static_cast<int>([[NSProcessInfo processInfo] thermalState]);
     pspocket::prepare::Manifest last;
-    if (pspocket::prepare::read_manifest(game_dir, &last) ||
-        pspocket::prepare::read_manifest((fs::path(game_dir).parent_path() / "last-preparation").string(), &last))
-        for (int k = 0; k < 3; k++) o.prior_rates[k] = last.rates[k];
+    if (pspocket::prepare::read_manifest((fs::path(game_dir).parent_path() / "last-preparation").string(), &last) ||
+        pspocket::prepare::read_manifest(game_dir, &last))
+        for (int k = 0; k < 3; k++)
+            o.prior_rates[k] = last.rates[k] / pspocket::prepare::thermal_slowdown(last.thermal) *
+                pspocket::prepare::thermal_slowdown(o.thermal);
     o.progress = set_status;
     o.cancel = &g_cancel;
     PS_LOG_INFO(kChan, "{}: preparing with {} workers, {:.0f} MB for compiles, rates {:.2f}/{:.2f}", title_id, o.workers,
