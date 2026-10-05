@@ -513,7 +513,7 @@ bool fp_supported(u32 op)
     case FpOp::RSQ: case FpOp::EX2: case FpOp::LG2: case FpOp::SIN: case FpOp::COS: case FpOp::FRC:
     case FpOp::FLR: case FpOp::SLT: case FpOp::SGE: case FpOp::SLE: case FpOp::SGT: case FpOp::SNE:
     case FpOp::SEQ: case FpOp::STR: case FpOp::SFL: case FpOp::LRP: case FpOp::NRM: case FpOp::DDX:
-    case FpOp::DDY: case FpOp::KIL: case FpOp::TEX: case FpOp::TXP: case FpOp::TXL: case FpOp::TXB:
+    case FpOp::DDY: case FpOp::KIL: case FpOp::TEX: case FpOp::TXP: case FpOp::TXL: case FpOp::TXB: case FpOp::TXD:
     case FpOp::FENCT: case FpOp::FENCB: case FpOp::DIVSQ: case FpOp::PK16: case FpOp::UP16: case FpOp::RET:
     case FpOp::PKB: case FpOp::UPB: case FpOp::PK4: case FpOp::UP4: case FpOp::PK2: case FpOp::UP2: case FpOp::IFE:
     case FpOp::LOOP: case FpOp::REP: case FpOp::BRK: return true;
@@ -766,14 +766,22 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         case FpOp::TEX:
         case FpOp::TXP:
         case FpOp::TXL:
-        case FpOp::TXB: {
+        case FpOp::TXB:
+        case FpOp::TXD: {
             const u32 t = in.tex;
             c.textures |= 1u << t;
             const TextureKind kind = opt.texture_kind[t];
+            // TXD: the coordinate's derivatives are the second and third sources (RPCS3 FragmentProgramDecompiler.cpp,
+            // FUNCTION_TEXTURE_SAMPLE*_GRAD: textureGrad(tex, coord, ddx, ddy)). RPCS3 scales only the coordinate of an
+            // unnormalised texture; the derivatives scale with it here, as the derivatives of the scaled coordinate.
+            const auto grad2 = [&](const std::string& scale) {
+                return std::format("gradient2d(({}).xy * {}, ({}).xy * {})", s1(), scale, s2(), scale);
+            };
             if (kind == TextureKind::Shadow2D || kind == TextureKind::DepthShadow2D) {
                 // The reference is the coordinate's z (TXP: z / w); LOD and bias do not apply to the comparison.
                 const std::string uv = op == FpOp::TXP ? std::format("(({}).xy / ({}).w)", s0, s0) : std::format("({}).xy", s0);
                 const std::string ref = op == FpOp::TXP ? std::format("(({}).z / ({}).w)", s0, s0) : std::format("({}).z", s0);
+                if (op == FpOp::TXD) return fail("TXD on a shadow map");
                 e = std::format("{}(t{}, s{}, {} * fp.tex_scale[{}].xy, {}, fp.tex_scale[{}])",
                     kind == TextureKind::Shadow2D ? "rsx_shadow" : "rsx_shadow_depth", t, t, uv, t, ref, t);
             } else if (kind == TextureKind::Depth2D) {
@@ -783,6 +791,9 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 switch (op) {
                 case FpOp::TXL: e = std::format("float4(t{}.sample(s{}, {}, level(({}).w)))", t, t, c2, s0); break;
                 case FpOp::TXB: e = std::format("float4(t{}.sample(s{}, {}, bias(({}).w)))", t, t, c2, s0); break;
+                case FpOp::TXD:
+                    e = std::format("float4(t{}.sample(s{}, {}, {}))", t, t, c2, grad2(std::format("fp.tex_scale[{}].xy", t)));
+                    break;
                 default: e = std::format("float4(t{}.sample(s{}, {}))", t, t, c2); break;
                 }
             } else if (kind == TextureKind::Tex3D) {
@@ -792,6 +803,10 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 switch (op) {
                 case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, c3, s0); break;
                 case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, c3, s0); break;
+                case FpOp::TXD:
+                    e = std::format("t{}.sample(s{}, {}, gradient3d(({}).xyz * float3(fp.tex_scale[{}].xy, 1.0), ({}).xyz * "
+                        "float3(fp.tex_scale[{}].xy, 1.0)))", t, t, c3, s1(), t, s2(), t);
+                    break;
                 default: e = std::format("t{}.sample(s{}, {})", t, t, c3); break;
                 }
             } else if (kind == TextureKind::Cube) {
@@ -799,6 +814,9 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 case FpOp::TEX: e = std::format("t{}.sample(s{}, ({}).xyz)", t, t, s0); break;
                 case FpOp::TXL: e = std::format("t{}.sample(s{}, ({}).xyz, level(({}).w))", t, t, s0, s0); break;
                 case FpOp::TXB: e = std::format("t{}.sample(s{}, ({}).xyz, bias(({}).w))", t, t, s0, s0); break;
+                case FpOp::TXD:
+                    e = std::format("t{}.sample(s{}, ({}).xyz, gradientcube(({}).xyz, ({}).xyz))", t, t, s0, s1(), s2());
+                    break;
                 default: return fail(std::format("{} on a cube map", fp_op_name(in.op)));
                 }
             } else {
@@ -809,6 +827,15 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 switch (op) {
                 case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, coord, s0); break;
                 case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, coord, s0); break;
+                case FpOp::TXD: {
+                    // A 1D texture is a row of a 2D one: its y derivatives are zero.
+                    const std::string scale = std::format("fp.tex_scale[{}].xy", t);
+                    e = kind == TextureKind::Tex1D
+                        ? std::format("t{}.sample(s{}, {}, gradient2d(float2(({}).x, 0.0) * {}, float2(({}).x, 0.0) * {}))",
+                              t, t, coord, s1(), scale, s2(), scale)
+                        : std::format("t{}.sample(s{}, {}, {})", t, t, coord, grad2(scale));
+                    break;
+                }
                 default: e = std::format("t{}.sample(s{}, {})", t, t, coord); break;
                 }
             }

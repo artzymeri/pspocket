@@ -2034,6 +2034,28 @@ the 128-bit rotates, cflts through double) until a check of the game's own trans
 interpreter finds what differs; the program-level test that D-127 extended stays. Also: the SPURS schedulers report
 every 5 s how much SPU time each workload took, by the game's names for them (AudioEngine, Physics, EDGE/GFX).
 
+## D-132 · 2026-10-05 · spu-check: the game's own translated SPU functions against the interpreter
+
+The fuzz tests check every instruction (step mode) and one synthetic program; D-127 passed them and still broke GTA
+V's EDGE jobs on the iPhone. spu-check (built with -DPSPOCKET_GAME_SPU, like pspocket-boot; nothing of the game in
+it) runs each entry of each translated program from random states: random local store around the image's code, the
+link register on a planted stop, the stack pointer in local store, random other registers, a fixed timebase. The
+interpreter runs it (at most --steps instructions), then the lifted program; registers, channels (but the shared
+reservation version), pc, the stop and local store must agree. Each run has main memory of its own whose pages
+commit as zeros when first touched (a fault handler) and are thrown away after the trial, so DMA does the same in
+both. Trials whose stores reached the code, or that the interpreter did not finish, are not compared.
+- The lift of D-126 (the lifter in use): no difference in 22 programs, 40 entries, 2 trials each.
+
+## D-133 · 2026-10-05 · The fragment program's TXD: a sample with the derivatives given
+
+GTA V's escape draws with a fragment program that has TXD (TXDR R1.x, R0.zwzz, R2.zwzz, R2, TEX6): the draws were
+skipped as unsupported. TXD samples with the coordinate's derivatives in its second and third sources (RPCS3
+FragmentProgramDecompiler.cpp: TEX2D_GRAD(coord.xy, ddx.xy, ddy.xy)): Metal's sample with gradient2d (gradient3d for
+3D textures, gradientcube for cube maps); a 1D texture's y derivatives are zero. An unnormalised texture's coordinate
+is scaled to Metal's [0, 1] and so are its derivatives (RPCS3 scales only the coordinate). On a shadow map it is
+still refused (no game seen doing it).
+- Test: the every-opcode fragment program, TXD added, compiles in Metal.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

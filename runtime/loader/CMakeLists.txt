@@ -36,6 +36,10 @@ if(PSPOCKET_GAME_SPU)
     pspocket_set_generated_warnings(pspocket_game_spu)
     target_link_libraries(pspocket-boot PRIVATE pspocket_game_spu)
     target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_GAME_SPU=1)
+    # spu-check DUMP: the game's translated SPU functions against the interpreter from random states (D-132).
+    add_executable(spu-check tools/spu_check.cpp)
+    target_link_libraries(spu-check PRIVATE pspocket_game_spu pspocket::spu pspocket::core)
+    pspocket_set_warnings(spu-check)
 endif()
 
 # The game's PPU code translated ahead of time (D-092): ppu-lift over the executable's loaded segments
