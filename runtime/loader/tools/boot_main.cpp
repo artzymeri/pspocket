@@ -81,6 +81,7 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/report.hpp"
 #include "pspocket/core/png.hpp"
+#include "pspocket/core/thread_report.hpp"
 #if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
 #include "pspocket/platform/audio_output.hpp"
 #endif
@@ -777,6 +778,7 @@ int main(int argc, char** argv)
                 if (flips != rate_flips) {
                     PS_LOG_INFO("boot", "{:.1f} fps ({} frames in {:.1f} s; {} since the boot)",
                         static_cast<double>(flips - rate_flips) / dt, flips - rate_flips, dt, flips);
+                    PS_LOG_INFO("boot", "threads: {}", thread_cpu_report(dt));
                 }
                 rate_flips = flips;
             }

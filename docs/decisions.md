@@ -2294,6 +2294,15 @@ with 9. An earlier memory report from iOS listed the app at 5.6 GB.
   allowed. The cache made all 13,067 pipelines in 30 s, where the boots with archives took 41 to 43 s: iOS keeps
   the pipelines it compiled for the app between launches itself. The user confirmed the flicker gone (D-144).
 
+## D-146 · 2026-10-05 · The status lines name the busiest host threads every 5 s
+
+In the phone session of 17:13 GTA V played at 12 to 22 fps with the GPU at 21 to 27 ms a frame (of the 50 ms a frame
+took) and the SPURS instances 66 to 90% busy: the cores were the limit, but the log could not say which threads held
+the frames back (docs/improve.md). thread_cpu_report (pspocket::core) lists, every 5 s, the CPU time the process used
+(as cores) and its busiest threads by name (the PPU threads, "SPU n", the RSX thread, cellAudio), from Mach's
+per-thread times (THREAD_EXTENDED_INFO); the iPhone app's and pspocket-boot's status lines log it. Elsewhere it is
+empty.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

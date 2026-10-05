@@ -35,6 +35,7 @@
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/core/thread_report.hpp"
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/process.hpp"
@@ -312,6 +313,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
                     static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips, dt, flips,
                     underruns - raw->rate_underruns, kThermal[std::min<usize>(thermal, 3)], footprint / 1e9,
                     static_cast<double>(os_proc_available_memory()) / 1e9);
+                PS_LOG_INFO(kChan, "threads: {}", thread_cpu_report(dt)); // which thread holds a slow stretch back
                 raw->rate_underruns = underruns;
                 raw->rate_since = now;
                 raw->rate_flips = flips;
