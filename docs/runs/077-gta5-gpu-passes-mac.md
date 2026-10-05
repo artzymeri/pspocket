@@ -10,7 +10,8 @@ the first mission.
 | Writes count, not attachments | 23.0 ms | 1,041 | 111 | 68 / 27 / 8 / 2 |
 | Eager conversions at pass end (dropped) | 27.2 ms | 1,041 | 111 | 71 / 24 / 8 / 2 |
 | Stencil apart, feedback reads once (D-105) | 17.8 ms | 1,041 | 101 | 69 / 16 / 8 / 2 |
+| Depth buffers sampled directly (D-106, run 078) | 12 to 17 ms | 1,041 | 87 | 69 / 2 / 8 / 2 |
 
 - 30 fps throughout; frame 3,000 as in run 071.
-- Next for the GPU: the 16 remaining conversion splits and 8 target copies (a depth or colour target read by a pass
-  that draws elsewhere could be sampled without converting, as RPCS3 samples the depth image directly).
+- Next for the GPU: the 8 target copies a frame (a colour target read by a draw that also renders to it) and the
+  69 passes the targets themselves need.

@@ -1595,6 +1595,18 @@ storing its targets.
 - Run 077: 17.8 ms of GPU a frame instead of 23.5, 101 passes, 16 ended by depth conversions. Same frames.
 - Test: three stencil-writing draws reading their own depth buffer convert it once (three times without the rule).
 
+## D-106 · 2026-10-05 · Depth buffers sampled directly by depth-format textures
+
+A DEPTH16, DEPTH24_D8 (or float) texture exactly over a depth buffer that the draw does not render to binds the depth
+buffer's own Metal texture as depth2d<float>, as RPCS3 samples the depth image: two texture kinds, Depth2D (the depth
+in every channel) and DepthShadow2D (D-100's comparison on the depth buffer, `rsx_shadow_depth`). No conversion
+compute, so no split render pass. Units whose buffer went away read a 1x1 Depth32Float. The draw's own depth buffer
+keeps the conversion snapshot (D-105); bit reinterpretations (A8R8G8B8 over Z24S8, X16 over Z16) keep converting.
+- Run 078: 87 render passes a frame instead of 101, depth conversions ending 2 of them instead of 16; GPU 12 to 17 ms
+  a frame instead of 17.8. Same frames.
+- Tests: a shadow lookup on a Z16 depth buffer with LEQUAL and GREATER, no conversion, no readback; the earlier depth
+  tests now count no conversion for DEPTH16.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -15,6 +15,22 @@
 
 namespace pspocket::rsx::metal {
 
+// A depth-format texture exactly over a depth buffer that the draw does not render to: its depth texture is sampled
+// directly (depth2d<float>), as RPCS3 samples the depth image, without a conversion that would end the render pass
+// (D-106). The draw's own depth buffer keeps the conversion's snapshot (D-105).
+Surface* MetalBackend::Impl::depth_sampled_directly(const TextureInfo& t)
+{
+    const u32 bf = t.base_format();
+    if (bf != tex::DEPTH16 && bf != tex::DEPTH24_D8 && bf != tex::DEPTH16_FLOAT && bf != tex::DEPTH24_D8_FLOAT) return nullptr;
+    if (t.dimension != 2 || t.cubemap) return nullptr;
+    const auto ea = rsx->translate(t.offset, t.location);
+    if (!ea) return nullptr;
+    Surface* d = find_surface(*ea, true);
+    if (!d || !d->initialized || d->cpu_newer || d->swizzled) return nullptr;
+    if (t.width != d->width || t.height != d->height || d == draw_targets.depth) return nullptr;
+    return d;
+}
+
 // RPCS3 RSXThread.cpp (shadow_textures): a depth format sampled with a compare function other than never and always,
 // and no alpha kill, returns the depth comparison instead of the depth.
 static bool is_shadow_texture(const TextureInfo& t)
@@ -149,6 +165,13 @@ bool MetalBackend::Impl::init()
     for (u32 face = 0; face < 6; face++) {
         [dummy_cube replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:face withBytes:&zero bytesPerRow:4 bytesPerImage:4];
     }
+    MTLTextureDescriptor* zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                  width:1
+                                                                                 height:1
+                                                                              mipmapped:NO];
+    zd.usage = MTLTextureUsageShaderRead;
+    zd.storageMode = MTLStorageModePrivate;
+    dummy_depth = [device newTextureWithDescriptor:zd]; // depth units without their buffer read 0
     MTLTextureDescriptor* vd = [MTLTextureDescriptor new];
     vd.textureType = MTLTextureType3D;
     vd.pixelFormat = MTLPixelFormatRGBA8Unorm;
@@ -686,6 +709,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     fo.shader_control = state.shader_program().control;
     fo.mrt_count = targets.color_count;
     for (u32 i = 0; i < targets.color_count; i++) fo.output_swizzle[i] = surface_output_swizzle(targets.color[i]->gcm_format);
+    std::array<Surface*, kFragmentTextureCount> depth_source{}; // depth buffers sampled directly (D-106)
     for (u32 t = 0; t < kFragmentTextureCount; t++) {
         const TextureInfo ti = state.fragment_texture(t);
         fo.texture_kind[t] = ti.cubemap && ti.dimension == 2 ? shader::TextureKind::Cube
@@ -693,6 +717,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             : ti.dimension == 3                               ? shader::TextureKind::Tex3D
                                                               : shader::TextureKind::Tex2D;
         if (fo.texture_kind[t] == shader::TextureKind::Tex2D && is_shadow_texture(ti)) fo.texture_kind[t] = shader::TextureKind::Shadow2D;
+        if ((fo.texture_kind[t] == shader::TextureKind::Tex2D || fo.texture_kind[t] == shader::TextureKind::Shadow2D) &&
+            ti.enabled) {
+            if (Surface* zs = depth_sampled_directly(ti)) {
+                depth_source[t] = zs;
+                fo.texture_kind[t] = fo.texture_kind[t] == shader::TextureKind::Shadow2D ? shader::TextureKind::DepthShadow2D
+                                                                                         : shader::TextureKind::Depth2D;
+            }
+        }
         if (t < 10 && (state.texcoord_control(t) & 1)) fo.texcoord_2d_mask |= 1u << t;
     }
     const RasterInfo raster = state.raster();
@@ -739,11 +771,21 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             fs.tex_scale[t][0] = 1.f / ti.width;
             fs.tex_scale[t][1] = 1.f / ti.height;
         }
-        if (fo.texture_kind[t] == shader::TextureKind::Shadow2D) {
+        if (fo.texture_kind[t] == shader::TextureKind::Shadow2D || fo.texture_kind[t] == shader::TextureKind::DepthShadow2D) {
             const u32 bf = ti.base_format();
             fs.tex_scale[t][2] = static_cast<float>(ti.zfunc & 7);
             fs.tex_scale[t][3] = static_cast<float>((ti.mag_filter != static_cast<u32>(tex::MagFilter::Nearest) ? 1u : 0u) |
                                                     (bf == tex::DEPTH16 || bf == tex::DEPTH24_D8 ? 2u : 0u));
+        }
+        if (Surface* zs = depth_source[t]) {
+            bound[t] = zs->texture;
+            zs->last_used = tick;
+            stats.surface_samples++;
+            if (tracing) {
+                trace_tex += std::format(" t{} {:#010x} fmt {:#04x} {}x{} (depth buffer, sampled)", t, zs->address,
+                    ti.base_format(), ti.width, ti.height);
+            }
+            continue;
         }
         bool ok = true;
         id<MTLTexture> tex = ti.enabled ? bind_texture(ti, t, ok) : nil;
@@ -756,10 +798,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         const MTLTextureType wanted = kind == shader::TextureKind::Cube ? MTLTextureTypeCube
                                     : kind == shader::TextureKind::Tex3D ? MTLTextureType3D
                                                                          : MTLTextureType2D;
-        if (tex && tex.textureType == wanted) {
+        const bool depth_kind = kind == shader::TextureKind::Depth2D || kind == shader::TextureKind::DepthShadow2D;
+        if (tex && tex.textureType == wanted && !depth_kind) {
             bound[t] = tex;
         } else {
-            bound[t] = wanted == MTLTextureTypeCube ? dummy_cube : wanted == MTLTextureType3D ? dummy_volume : dummy_texture;
+            bound[t] = depth_kind                         ? dummy_depth
+                     : wanted == MTLTextureTypeCube       ? dummy_cube
+                     : wanted == MTLTextureType3D         ? dummy_volume
+                                                          : dummy_texture;
         }
     }
 

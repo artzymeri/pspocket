@@ -126,6 +126,19 @@ static float4 rsx_shadow(texture2d<float> t, sampler s, float2 uv, float ref, fl
     const float2 f = fract(uv * float2(t.get_width(), t.get_height()) - 0.5);
     return float4(mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y));
 }
+
+// rsx_shadow on a depth buffer sampled directly (D-106).
+static float4 rsx_shadow_depth(depth2d<float> t, sampler s, float2 uv, float ref, float4 p)
+{
+    const uint func = uint(p.z), flags = uint(p.w);
+    if ((flags & 2u) != 0u) ref = min(ref, 1.0);
+    if ((flags & 1u) == 0u) return float4(rsx_compare(func, ref, t.sample(s, uv)) ? 1.0 : 0.0);
+    const float4 d = t.gather(s, uv);
+    const float4 c = float4(rsx_compare(func, ref, d.x) ? 1.0 : 0.0, rsx_compare(func, ref, d.y) ? 1.0 : 0.0,
+                            rsx_compare(func, ref, d.z) ? 1.0 : 0.0, rsx_compare(func, ref, d.w) ? 1.0 : 0.0);
+    const float2 f = fract(uv * float2(t.get_width(), t.get_height()) - 0.5);
+    return float4(mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y));
+}
 )MSL";
 
 constexpr const char* kXyzw = "xyzw";
@@ -739,11 +752,21 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
             const u32 t = in.tex;
             c.textures |= 1u << t;
             const TextureKind kind = opt.texture_kind[t];
-            if (kind == TextureKind::Shadow2D) {
+            if (kind == TextureKind::Shadow2D || kind == TextureKind::DepthShadow2D) {
                 // The reference is the coordinate's z (TXP: z / w); LOD and bias do not apply to the comparison.
                 const std::string uv = op == FpOp::TXP ? std::format("(({}).xy / ({}).w)", s0, s0) : std::format("({}).xy", s0);
                 const std::string ref = op == FpOp::TXP ? std::format("(({}).z / ({}).w)", s0, s0) : std::format("({}).z", s0);
-                e = std::format("rsx_shadow(t{}, s{}, {} * fp.tex_scale[{}].xy, {}, fp.tex_scale[{}])", t, t, uv, t, ref, t);
+                e = std::format("{}(t{}, s{}, {} * fp.tex_scale[{}].xy, {}, fp.tex_scale[{}])",
+                    kind == TextureKind::Shadow2D ? "rsx_shadow" : "rsx_shadow_depth", t, t, uv, t, ref, t);
+            } else if (kind == TextureKind::Depth2D) {
+                // The depth in every channel (RPCS3's depth formats: R in every channel).
+                const std::string uv = op == FpOp::TXP ? std::format("(({}).xy / ({}).w)", s0, s0) : std::format("({}).xy", s0);
+                const std::string c2 = std::format("({} * fp.tex_scale[{}].xy)", uv, t);
+                switch (op) {
+                case FpOp::TXL: e = std::format("float4(t{}.sample(s{}, {}, level(({}).w)))", t, t, c2, s0); break;
+                case FpOp::TXB: e = std::format("float4(t{}.sample(s{}, {}, bias(({}).w)))", t, t, c2, s0); break;
+                default: e = std::format("float4(t{}.sample(s{}, {}))", t, t, c2); break;
+                }
             } else if (kind == TextureKind::Tex3D) {
                 // 3D textures (D-102): coord.xyz (TXP: / w); unnormalised coordinates scale x and y.
                 const std::string coord = op == FpOp::TXP ? std::format("(({}).xyz / ({}).w)", s0, s0) : std::format("({}).xyz", s0);
@@ -864,9 +887,11 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         slot::kFsConstants, slot::kFsParams);
     for (u32 t = 0; t < 16; t++) {
         if (!(c.textures & (1u << t))) continue;
-        const char* type = opt.texture_kind[t] == TextureKind::Cube    ? "texturecube<float>"
-                         : opt.texture_kind[t] == TextureKind::Tex3D ? "texture3d<float>"
-                                                                     : "texture2d<float>";
+        const TextureKind k = opt.texture_kind[t];
+        const char* type = k == TextureKind::Cube                                            ? "texturecube<float>"
+                         : k == TextureKind::Tex3D                                           ? "texture3d<float>"
+                         : k == TextureKind::Depth2D || k == TextureKind::DepthShadow2D      ? "depth2d<float>"
+                                                                                             : "texture2d<float>";
         params += std::format(",\n    {} t{} [[texture({})]], sampler s{} [[sampler({})]]", type, t, t, t, t);
     }
     src += std::format("fragment rsx_fs_out {}({})\n{{\n", result.shader.entry, params);

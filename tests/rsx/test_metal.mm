@@ -1339,7 +1339,9 @@ TEST_CASE("metal e2e: a Z16 depth buffer reads as X16 (its value) and as DEPTH16
         for (const auto& f : e.failures) INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().readbacks == 0);
-        CHECK(e.backend->stats().depth_conversions == 1);
+        // X16 converts (D-088); DEPTH16 samples the depth buffer itself (D-106).
+        CHECK(e.backend->stats().depth_conversions == (format == tex::X16 ? 1u : 0u));
+        CHECK(e.backend->stats().surface_samples == (format == tex::X16 ? 0u : 1u));
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         const auto p = guest_pixel(e, kSurfaceOffset, 32, 48);
         if (format == tex::X16) {
@@ -1405,6 +1407,45 @@ TEST_CASE("metal e2e: a DEPTH16 texture with a compare function returns the dept
     }
 }
 
+TEST_CASE("metal e2e: a shadow lookup on a depth buffer compares against the buffer itself (D-106)")
+{
+    // The depth buffer (Z16, 0.375) sampled directly as DEPTH16 with a compare function; the reference is the texture
+    // coordinate's z, 0 here: LEQUAL passes (white), GREATER fails (black). No conversion, no readback.
+    REQUIRE_METAL();
+    for (const u32 zfunc : {3u, 4u}) {
+        INFO(std::format("zfunc {}", zfunc));
+        E2E e;
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        constexpr u32 kDepth = 0x180000;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (1u << 5) | (1u << 8));
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kDepth);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 2);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x6000);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x80808080);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        bind_linear_texture(b, kDepth, tex::DEPTH16, kW * 2);
+        b.method(m::NV4097_SET_TEXTURE_ADDRESS, 3u | (3u << 8) | (3u << 16) | (zfunc << 28));
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().depth_conversions == 0);
+        CHECK(e.backend->stats().readbacks == 0);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const u8 v = zfunc == 3 ? 0xff : 0x00;
+        CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{v, v, v, v});
+    }
+}
+
 TEST_CASE("metal e2e: depth tiles side by side in one atlas stay apart, each read as its own texture")
 {
     // GTA V's shadow cascades: 128x128 Z16 tiles of one atlas, zeta offsets 0x100 apart with a 0x400 pitch. Their bytes
@@ -1437,7 +1478,8 @@ TEST_CASE("metal e2e: depth tiles side by side in one atlas stay apart, each rea
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
         for (const auto& f : e.failures) INFO(f.message);
         CHECK(e.failures.empty());
-        CHECK(e.backend->stats().depth_conversions == 1); // the tile's depth buffer, not stale memory
+        CHECK(e.backend->stats().surface_samples == 1); // the tile's depth buffer, sampled (D-106), not stale memory
+        CHECK(e.backend->stats().readbacks == 0);
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         const u8 v = tile == 0 ? 0x40 : 0xbf;
         CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{v, v, v, v});

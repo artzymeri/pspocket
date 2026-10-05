@@ -164,6 +164,7 @@ struct MetalBackend::Impl {
     id<MTLTexture> dummy_texture = nil;
     id<MTLTexture> dummy_cube = nil;
     id<MTLTexture> dummy_volume = nil; // 3D
+    id<MTLTexture> dummy_depth = nil;  // Depth32Float, for depth2d units
     id<MTLSharedEvent> frame_event = nil;
     u64 frame_event_value = 0;
     bool bc_supported = false;
@@ -306,6 +307,7 @@ struct MetalBackend::Impl {
     // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the
     // buffer was drawn to since; nil when it cannot be.
     Surface::Conversion* depth_as_texture(Surface& d, u32 mode);
+    Surface* depth_sampled_directly(const TextureInfo& t);
     Surface::Conversion* color_as_texture(Surface& s, u32 mode);
     id<MTLRenderPipelineState> blit_pipeline_for(MTLPixelFormat format);
     id<MTLTexture> sample_view(id<MTLTexture> tex, std::unordered_map<u32, id<MTLTexture>>& views,
