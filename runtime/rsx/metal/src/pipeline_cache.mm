@@ -6,6 +6,8 @@
 
 #include "metal_internal.hpp"
 
+#include <chrono>
+
 #include <format>
 
 #include "pspocket/core/memory_map.h"
@@ -106,6 +108,9 @@ MTLColorWriteMask write_mask(u8 rsx, u32 gcm_format)
     }
 }
 
+
+} // namespace
+
 MTLCompileOptions* shader_compile_options()
 {
     MTLCompileOptions* o = [MTLCompileOptions new];
@@ -121,15 +126,16 @@ MTLCompileOptions* shader_compile_options()
     return o;
 }
 
-} // namespace
-
 std::optional<CompiledProgram> MetalBackend::Impl::compile(const shader::TranslateResult& tr, const char* what)
 {
     // One library per program: entry names only need to be unique within it.
     NSError* error = nil;
+    const auto t0 = std::chrono::steady_clock::now();
     id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:tr.shader.source.c_str()]
                                               options:shader_compile_options()
                                                 error:&error];
+    stats.compile_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     if (!lib) {
         // A translator bug, not a guest problem: log the source with the error.
         fail(std::format("MSL compilation of {} {} failed: {}", what, tr.shader.entry,
@@ -151,6 +157,7 @@ std::optional<CompiledProgram> MetalBackend::Impl::compile(const shader::Transla
 
 const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& state, bool points)
 {
+    take_shader_cache(); // programs and pipelines the shader cache made since (D-114)
     if ((state.dirty_bits & dirty::kVertexProgram) || !vertex_program) {
         state.dirty_bits &= ~dirty::kVertexProgram;
         std::string why;
@@ -184,7 +191,9 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     auto compiled = compile(tr, "vertex program");
     if (!compiled) return nullptr;
     compiled->ucode = std::move(ucode);
+    compiled->key = key;
     auto [it, inserted] = programs.insert_or_assign(key, std::move(*compiled));
+    if (shader_cache) shader_cache->record_program(it->second);
     if (!inserted) forget_program_lookups(); // the key's program changed under the lookups that hold it
     return vertex_compiled[points ? 1 : 0] = &it->second;
 }
@@ -211,6 +220,7 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
         return nullptr;
     }
 
+    take_shader_cache(); // D-114
     FragmentProgramEntry& entry = fragment_programs[*ea];
     // A deferred copy to the program (or its constants, read every draw) lands first (D-107). A program not seen yet:
     // its first instruction (a copy that writes a program writes its start).
@@ -270,7 +280,9 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     auto compiled = compile(tr, "fragment program");
     if (!compiled) return nullptr;
     compiled->ucode = std::move(ucode);
+    compiled->key = key;
     auto [it, inserted] = programs.insert_or_assign(key, std::move(*compiled));
+    if (shader_cache) shader_cache->record_program(it->second);
     if (!inserted) forget_program_lookups(); // the key's program changed under the lookups that hold it
     return remember(&it->second);
 }
@@ -281,71 +293,98 @@ void MetalBackend::Impl::forget_program_lookups()
     vertex_compiled = {};
 }
 
+PipelineKey pipeline_key(const PipelineParams& p, id<MTLFunction> vp, id<MTLFunction> fp)
+{
+    PipelineKey key;
+    key.vp = reinterpret_cast<uintptr_t>((__bridge void*)vp);
+    key.fp = reinterpret_cast<uintptr_t>((__bridge void*)fp);
+    for (u32 i = 0; i < p.color_count; i++) {
+        key.color_formats[i] = p.color_formats[i];
+        key.write_masks[i] = p.write_masks[i];
+        if (p.blend_on[i]) {
+            key.blend[i] = 1u | (p.sfactor_rgb << 1) | (p.dfactor_rgb << 17);
+            key.blend_ops[i] = p.equation_rgb | (p.equation_a << 16);
+            key.blend[i] ^= (p.sfactor_a * 0x9e3779b1u) ^ (p.dfactor_a * 0x85ebca77u);
+        }
+    }
+    key.depth_format = p.depth_format;
+    key.stencil_format = p.stencil_format;
+    return key;
+}
+
+MTLRenderPipelineDescriptor* pipeline_descriptor(const PipelineParams& p, id<MTLFunction> vp, id<MTLFunction> fp)
+{
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = vp;
+    d.fragmentFunction = fp;
+    for (u32 i = 0; i < p.color_count; i++) {
+        MTLRenderPipelineColorAttachmentDescriptor* a = d.colorAttachments[i];
+        a.pixelFormat = static_cast<MTLPixelFormat>(p.color_formats[i]);
+        a.writeMask = static_cast<MTLColorWriteMask>(p.write_masks[i]);
+        if (p.blend_on[i]) {
+            a.blendingEnabled = YES;
+            a.sourceRGBBlendFactor = blend_factor(p.sfactor_rgb);
+            a.destinationRGBBlendFactor = blend_factor(p.dfactor_rgb);
+            a.sourceAlphaBlendFactor = blend_factor(p.sfactor_a);
+            a.destinationAlphaBlendFactor = blend_factor(p.dfactor_a);
+            MTLBlendOperation op_rgb = MTLBlendOperationAdd, op_a = MTLBlendOperationAdd;
+            blend_operation(p.equation_rgb, op_rgb);
+            blend_operation(p.equation_a, op_a);
+            a.rgbBlendOperation = op_rgb;
+            a.alphaBlendOperation = op_a;
+        }
+    }
+    if (p.depth_format) d.depthAttachmentPixelFormat = static_cast<MTLPixelFormat>(p.depth_format);
+    if (p.stencil_format) d.stencilAttachmentPixelFormat = static_cast<MTLPixelFormat>(p.stencil_format);
+    return d;
+}
+
 id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgram& vp, const CompiledProgram& fp,
     const RsxState& state)
 {
     const BlendInfo blend = state.blend();
     const ColorMaskInfo masks = state.color_mask();
-    PipelineKey key;
-    key.vp = reinterpret_cast<uintptr_t>((__bridge void*)vp.function);
-    key.fp = reinterpret_cast<uintptr_t>((__bridge void*)fp.function);
+    PipelineParams p;
+    p.color_count = pass.color_count;
     for (u32 i = 0; i < pass.color_count; i++) {
         const Surface* s = pass.color[i];
         const u32 rsx_index = pass.rsx_index[i];
-        key.color_formats[i] = static_cast<u32>(s->pixel_format);
-        key.write_masks[i] = static_cast<u32>(write_mask(masks.mask[rsx_index], s->gcm_format));
-        if (blend.enabled_for(rsx_index)) {
-            key.blend[i] = 1u | (blend.sfactor_rgb << 1) | (blend.dfactor_rgb << 17);
-            key.blend_ops[i] = blend.equation_rgb | (blend.equation_a << 16);
-            key.blend[i] ^= (blend.sfactor_a * 0x9e3779b1u) ^ (blend.dfactor_a * 0x85ebca77u);
-        }
+        p.color_formats[i] = static_cast<u32>(s->pixel_format);
+        p.write_masks[i] = static_cast<u32>(write_mask(masks.mask[rsx_index], s->gcm_format));
+        p.blend_on[i] = blend.enabled_for(rsx_index) ? 1 : 0;
     }
+    p.sfactor_rgb = blend.sfactor_rgb, p.dfactor_rgb = blend.dfactor_rgb;
+    p.sfactor_a = blend.sfactor_a, p.dfactor_a = blend.dfactor_a;
+    p.equation_rgb = blend.equation_rgb, p.equation_a = blend.equation_a;
     if (pass.depth) {
-        key.depth_format = static_cast<u32>(pass.depth->pixel_format);
-        if (pass.depth->pixel_format == MTLPixelFormatDepth32Float_Stencil8) key.stencil_format = key.depth_format;
+        p.depth_format = static_cast<u32>(pass.depth->pixel_format);
+        if (pass.depth->pixel_format == MTLPixelFormatDepth32Float_Stencil8) p.stencil_format = p.depth_format;
     }
+    take_shader_cache(); // pipelines the shader cache made since (D-114)
+    const PipelineKey key = pipeline_key(p, vp.function, fp.function);
     if (auto it = pipelines.find(key); it != pipelines.end()) return it->second;
 
-    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = vp.function;
-    d.fragmentFunction = fp.function;
-    for (u32 i = 0; i < pass.color_count; i++) {
-        const u32 rsx_index = pass.rsx_index[i];
-        MTLRenderPipelineColorAttachmentDescriptor* a = d.colorAttachments[i];
-        a.pixelFormat = pass.color[i]->pixel_format;
-        a.writeMask = static_cast<MTLColorWriteMask>(key.write_masks[i]);
-        if (blend.enabled_for(rsx_index)) {
-            a.blendingEnabled = YES;
-            a.sourceRGBBlendFactor = blend_factor(blend.sfactor_rgb);
-            a.destinationRGBBlendFactor = blend_factor(blend.dfactor_rgb);
-            a.sourceAlphaBlendFactor = blend_factor(blend.sfactor_a);
-            a.destinationAlphaBlendFactor = blend_factor(blend.dfactor_a);
-            MTLBlendOperation op_rgb = MTLBlendOperationAdd, op_a = MTLBlendOperationAdd;
-            const bool rgb_ok = blend_operation(blend.equation_rgb, op_rgb);
-            const bool a_ok = blend_operation(blend.equation_a, op_a);
-            if (!rgb_ok || !a_ok) {
-                unsupported(std::format("blend equation {:#x}/{:#x} (signed) is not implemented", blend.equation_rgb,
-                    blend.equation_a));
-            }
-            a.rgbBlendOperation = op_rgb;
-            a.alphaBlendOperation = op_a;
-        }
+    bool blends = false;
+    for (u32 i = 0; i < p.color_count; i++) blends |= p.blend_on[i] != 0;
+    MTLBlendOperation op = MTLBlendOperationAdd;
+    if (blends && (!blend_operation(p.equation_rgb, op) || !blend_operation(p.equation_a, op))) {
+        unsupported(std::format("blend equation {:#x}/{:#x} (signed) is not implemented", blend.equation_rgb,
+            blend.equation_a));
     }
     if (blend.logic_op_enable) unsupported("logic ops are not implemented (Metal has none)");
-    if (pass.depth) {
-        d.depthAttachmentPixelFormat = pass.depth->pixel_format;
-        if (pass.depth->pixel_format == MTLPixelFormatDepth32Float_Stencil8) {
-            d.stencilAttachmentPixelFormat = pass.depth->pixel_format;
-        }
-    }
+    MTLRenderPipelineDescriptor* d = pipeline_descriptor(p, vp.function, fp.function);
     NSError* error = nil;
+    const auto t0 = std::chrono::steady_clock::now();
     id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:d error:&error];
+    stats.pipeline_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     if (!pso) {
         fail(std::format("render pipeline creation failed: {}", error ? error.localizedDescription.UTF8String : "?"));
         return nil;
     }
     stats.pipelines_created++;
     pipelines[key] = pso;
+    if (shader_cache) shader_cache->record_pipeline(vp.key, fp.key, p);
     return pso;
 }
 

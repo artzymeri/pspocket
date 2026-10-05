@@ -286,6 +286,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             !draw_targets.contains(s)) {
             if (Surface::Conversion* conv = color_as_texture(*s, static_cast<u32>(fmt->decode))) {
                 stats.surface_samples++;
+                check_guest(*s, t, unit);
                 bind_source = "target, converted";
                 return sample_view(conv->texture, conv->views, texture_channel_sources(*fmt, t.remap));
             }
@@ -307,6 +308,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     }
     if (s && !s->cpu_newer && fmt) {
         stats.surface_samples++;
+        check_guest(*s, t, unit);
         bind_source = "target";
         id<MTLTexture> tex = s->texture;
         if (draw_targets.contains(s)) {

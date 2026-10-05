@@ -9,6 +9,9 @@
 #import <Metal/Metal.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <map>
@@ -16,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -81,6 +85,7 @@ struct Surface {
     std::unordered_map<u32, id<MTLTexture>> views; // swizzled views for sampling, by encoded channel sources
     u64 generation = 0;         // writes to it: colour, or depth for a depth buffer (D-105)
     u64 stencil_generation = 0; // writes to a depth buffer's stencil
+    u64 guest_hash = 0;          // PSPOCKET_RSX_CHECK_SURFACES: its guest memory when it last matched or was made
     // A depth buffer (D-088) or colour target (D-098) read as a texture of another format: its conversion per decode
     // mode, the generation it was made from, and its swizzled views.
     struct Conversion {
@@ -114,7 +119,21 @@ struct CompiledProgram {
     id<MTLFunction> function = nil;
     shader::MslShader shader;
     std::vector<u32> ucode; // instruction words (FP: constants masked) for collision checks
+    std::string key;        // its key in MetalBackend::Impl::programs (the shader cache records it by it, D-114)
 };
+
+// What a render pipeline is made from besides its two programs: the attachments, their write masks and blending
+// (RSX blending is one function for every target, enabled per target). pipeline_for and the shader cache (D-114)
+// make the descriptor and the key from it alike.
+struct PipelineParams {
+    u32 color_count = 0;
+    std::array<u32, 4> color_formats{}; // MTLPixelFormat
+    std::array<u32, 4> write_masks{};   // MTLColorWriteMask
+    std::array<u32, 4> blend_on{};
+    u32 sfactor_rgb = 0, dfactor_rgb = 0, sfactor_a = 0, dfactor_a = 0, equation_rgb = 0, equation_a = 0;
+    u32 depth_format = 0, stencil_format = 0;
+};
+
 
 struct PipelineKey {
     u64 vp = 0, fp = 0;
@@ -125,6 +144,70 @@ struct PipelineKey {
     std::array<u32, 4> blend{}; // enable | factors | ops packed per target (see pipeline_cache.mm)
     std::array<u32, 4> blend_ops{};
     bool operator<(const PipelineKey& o) const;
+};
+
+MTLCompileOptions* shader_compile_options(); // pipeline_cache.mm: what every program compiles with
+PipelineKey pipeline_key(const PipelineParams& p, id<MTLFunction> vp, id<MTLFunction> fp);
+MTLRenderPipelineDescriptor* pipeline_descriptor(const PipelineParams& p, id<MTLFunction> vp, id<MTLFunction> fp);
+
+// The shader cache (shader_cache.mm, D-114): records what the backend compiles, and makes what was recorded before on
+// background threads; the RSX thread takes the results between draws (MetalBackend::Impl::take_shader_cache).
+class ShaderCache {
+public:
+    struct Record {
+        std::string key;
+        shader::MslShader shader;
+        std::vector<u32> ucode;
+    };
+    struct PipelineRecord {
+        std::string vp_key, fp_key;
+        PipelineParams params;
+    };
+    struct ReadyPipeline {
+        std::string vp_key, fp_key;
+        PipelineParams params;
+        __strong id<MTLFunction> vp = nil, fp = nil;
+        __strong id<MTLRenderPipelineState> pso = nil;
+    };
+    struct Ready {
+        std::vector<CompiledProgram> programs;
+        std::vector<ReadyPipeline> pipelines;
+    };
+
+    ShaderCache(id<MTLDevice> device, std::string dir, std::vector<std::string> seeds, u32 threads);
+    ~ShaderCache();
+    ShaderCache(const ShaderCache&) = delete;
+    ShaderCache& operator=(const ShaderCache&) = delete;
+
+    bool take(Ready& out); // what was made since the last call; false: nothing
+    void wait();           // until every record has been made (or failed)
+    void record_program(const CompiledProgram& p);
+    void record_pipeline(const std::string& vp_key, const std::string& fp_key, const PipelineParams& p);
+
+private:
+    void load_and_start(u32 threads);
+    void work();
+
+    __strong id<MTLDevice> device_ = nil;
+    std::string dir_;
+    std::vector<std::string> seeds_;
+    std::chrono::steady_clock::time_point started_;
+    std::thread loader_;
+    std::vector<std::thread> workers_;
+    std::atomic<bool> stop_{false}, ready_{false};
+    std::mutex mutex_;
+    std::condition_variable done_cv_, programs_done_cv_;
+    bool done_ = false;
+    std::vector<Record> records_;
+    std::vector<PipelineRecord> pipeline_records_;
+    std::unordered_set<std::string> recorded_programs_, recorded_pipelines_;
+    std::unordered_map<std::string, id<MTLFunction>> functions_;
+    std::vector<CompiledProgram> ready_programs_;
+    std::vector<ReadyPipeline> ready_pipelines_;
+    u64 made_programs_ = 0, made_pipelines_ = 0;
+    usize programs_finished_ = 0;
+    std::atomic<usize> next_program_{0}, next_pipeline_{0};
+    u32 workers_left_ = 0;
 };
 
 struct CompiledProgram;
@@ -234,6 +317,7 @@ struct MetalBackend::Impl {
     }
     u64 report_flips = 0, report_draws = 0, report_passes = 0, report_gpu_ns = 0, report_readback_ns = 0;
     u64 report_readbacks = 0, report_deferred = 0, report_conflicts = 0, report_texture_checks = 0, report_texture_bytes = 0;
+    u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0;
     __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
     u32 visibility_next = 0;
     bool zpass_on = false;
@@ -268,6 +352,8 @@ struct MetalBackend::Impl {
     std::unordered_set<u64> reinterpretations; // (target format, texture format, width) pairs logged once
     std::map<PipelineKey, id<MTLRenderPipelineState>> pipelines;
     std::unordered_map<std::string, CompiledProgram> programs; // by program hash and translation options
+    std::unique_ptr<ShaderCache> shader_cache;                 // D-114; null: none configured
+    void take_shader_cache();
     std::unordered_map<u64, id<MTLDepthStencilState>> depth_states;
     std::unordered_map<u64, id<MTLSamplerState>> samplers;
     std::unordered_map<u64, id<MTLRenderPipelineState>> clear_pipelines;
@@ -349,6 +435,12 @@ struct MetalBackend::Impl {
     void run_deferred(bool wait, usize count = ~usize{0});
     void end_pass_over(u32 addr, u32 size); // a target there with only a clear so far: its pass ends (it is newer then)
     void check_cpu_writes(Surface& s);      // a watched copy destination the CPU wrote since: guest memory is newer
+    // PSPOCKET_RSX_CHECK_SURFACES (a diagnostic): each surface keeps a hash of its guest memory from when it was made or
+    // last written back; a texture sampled from a surface whose memory changed since (a CPU or SPU write the backend
+    // was not told of) is logged.
+    bool check_surfaces = false;
+    void note_guest(Surface& s);
+    void check_guest(const Surface& s, const TextureInfo& t, u32 unit);
     void upload_surface_from_guest(Surface& s);
     void upload_surface_bytes(Surface& s); // the formats store_readback writes, but A8R8G8B8 (D-110)
     bool newer_in_guest(const PassTargets& t) const; // a target whose guest memory is newer: reloaded by open_pass

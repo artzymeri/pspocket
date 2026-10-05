@@ -31,7 +31,9 @@
 // --frames) logs every clear and draw of frame N (channel rsx.trace: targets, programs, textures, blending) and saves
 // each colour target it used as DIR/trace-N/<address>-fmt<format>-<width>x<height>.png at its flip. --rsx-recover
 // logs a FIFO error (with the words around it and the last jumps) and skips to put, as the app does, instead of
-// stopping the run.
+// stopping the run. --shader-cache DIR (with Metal) records every program and pipeline the backend makes in DIR and
+// makes the ones recorded there before ahead, on background threads, while the game loads (D-114; game data: keep it
+// in inventory/, scripts/ios.sh puts it in the app).
 // --dump-on-fault FILE writes the guest's committed memory below the RSX's local memory to FILE when a guest fault
 // ends the run, for offline analysis (game data: keep it in inventory/). The file is a sequence of blocks: a
 // big-endian u32 guest address, a u32 byte count, then the bytes. A fault in SPU code also writes that SPU's local
@@ -98,7 +100,7 @@ int usage()
         "                     [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]\n"
         "                     [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]\n"
         "                     [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]...\n"
-        "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover]\n"
+        "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -381,6 +383,7 @@ int main(int argc, char** argv)
     bool stop_at_first = false;
     bool list_imports = false;
     std::string gpu = "null", frames_dir;
+    std::string shader_cache; // --shader-cache (D-114)
     u32 frame_every = 60;
     u64 trace_frame = 0;
     bool rsx_recover = false;
@@ -415,6 +418,10 @@ int main(int argc, char** argv)
             frame_every = static_cast<u32>(std::atoi(v));
         } else if (a == "--rsx-recover") {
             rsx_recover = true;
+        } else if (a == "--shader-cache") {
+            const char* v = value();
+            if (!v) return usage();
+            shader_cache = v;
         } else if (a == "--trace-frame") {
             const char* v = value();
             if (!v || std::atoll(v) <= 0) return usage();
@@ -499,6 +506,7 @@ int main(int argc, char** argv)
         tracker = std::make_unique<rsx::WriteTracker>(memory);
         cfg.rsx_backend = [&]() -> std::unique_ptr<rsx::Backend> {
             rsx::metal::MetalBackendConfig mc;
+            mc.shader_cache = shader_cache;
             if (!frames_dir.empty()) {
                 mc.capture_every = frame_every;
                 mc.capture = [&](const u8* bgra, u32 w, u32 h, u64 flip) {

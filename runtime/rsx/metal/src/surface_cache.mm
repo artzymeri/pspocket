@@ -126,6 +126,7 @@ Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32
     s->texture = tex;
     s->last_used = impl.tick;
     impl.stats.surfaces_created++;
+    impl.note_guest(*s);
     impl.surfaces.push_back(std::move(s));
     return impl.surfaces.back().get();
 }
@@ -560,6 +561,11 @@ void MetalBackend::Impl::store_readback(const Readback& r)
     }
     own_write();
     tracker.notify_write(s.address, s.pitch * s.height);
+    if (check_surfaces) {
+        for (auto& c : surfaces) {
+            if (c->address == s.address && c->pitch == s.pitch && c->height == s.height) note_guest(*c);
+        }
+    }
     if (r.mirror) {
         for (auto& c : surfaces) {
             if (c->texture != r.mirror) continue;
@@ -570,6 +576,26 @@ void MetalBackend::Impl::store_readback(const Readback& r)
             }
             break;
         }
+    }
+}
+
+void MetalBackend::Impl::note_guest(Surface& s)
+{
+    if (!check_surfaces || !mem.is_committed(s.address) || !mem.is_committed(s.address + s.bytes() - 1)) return;
+    s.guest_hash = WriteTracker::content_hash(mem.host(s.address), s.bytes());
+}
+
+void MetalBackend::Impl::check_guest(const Surface& s, const TextureInfo& t, u32 unit)
+{
+    if (!check_surfaces || !mem.is_committed(s.address) || !mem.is_committed(s.address + s.bytes() - 1)) return;
+    if (WriteTracker::content_hash(mem.host(s.address), s.bytes()) == s.guest_hash) return;
+    stats.surface_guest_changes++;
+    static std::unordered_set<u64> seen;
+    const u64 key = (u64{s.address} << 16) ^ t.base_format() ^ (u64{s.width} << 48);
+    if (seen.size() < 64 && seen.insert(key).second) {
+        PS_LOG_WARN(kChan, "texture unit {} ({:#04x} {}x{}) samples the surface at {:#010x} ({}x{} fmt {}{}), whose guest "
+            "memory changed since it was made or written back: a write the backend was not told of", unit,
+            t.base_format(), t.width, t.height, s.address, s.width, s.height, s.gcm_format, s.depth ? " depth" : "");
     }
 }
 

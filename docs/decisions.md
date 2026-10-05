@@ -1735,6 +1735,33 @@ every draw. Not used by GTA V's first mission; engines branch on these bits betw
 - Test: one triangle per case, its colour from c[0] or c[1] by a BRB or a CLB on bit 2, taken and not, on a set and on
   a clear bit.
 
+## D-114 · 2026-10-05 · The shader cache: programs and pipelines recorded, then made ahead while the game loads
+
+On the iPhone the game "lags at first, then runs smooth" whenever something new happens: the RSX thread compiled each
+new program (newLibraryWithSource) and pipeline (newRenderPipelineStateWithDescriptor) at the draw that first needed
+it. Run 082 timed it: the first mission made 558 programs and 497 pipelines, 6.1 s of stalls when it started and
+2.3 s in the vault scene on an M4 Mac. The fps dips at its start (12 to 24) were compiles. A phone compiles several times
+slower.
+- **Recorded**: every program the backend compiles is a file in the cache directory, programs/<hash of its key>.txt,
+  holding its key, its translation's entry and masks, its ucode (the collision check) and its MSL source. Every
+  pipeline is a line of pipelines.txt: its two program keys and `PipelineParams`, everything else a pipeline is made from
+  (formats, write masks, blending), which `pipeline_for` now builds its key and descriptor from.
+- **Made ahead**: when the backend starts, two or three background threads (utility QoS) load what is recorded, in the
+  directory and in read-only seed directories, then make every program and every pipeline whose two programs they
+  made. The RSX thread takes what they made before each program and pipeline lookup. A program it compiled itself
+  meanwhile stays; a pipeline joins only with the functions it was made with. Anything new still compiles at its draw,
+  and is recorded.
+- **Where**: `pspocket-boot --shader-cache DIR`; `translate-game.sh` records into inventory/<TITLE_ID>/shaders (its runs
+  now use Metal). `scripts/ios.sh` puts that directory in the app as `shaders`, a seed; the app records into
+  Library/Caches/pspocket-shaders. So the phone's first session has the Mac's recording, and later ones their own too.
+- Run 082: with the cache, everything was made in 0.4 s while the game loaded (the system's Metal cache helps on the
+  Mac); the mission then compiled no program and a few pipelines (about 0.1 ms each), and ran at 28 to 30 fps throughout.
+- Also: compile time in the per-frame report; `PSPOCKET_RSX_CHECK_SURFACES`, a diagnostic for textures sampled from
+  surfaces whose guest memory changed under them (a write the backend was not told of). It found none in the mission:
+  the red and black flashes the iPhone shows are not that, at least there.
+- Tests: a second backend on the same cache directory compiles nothing for a draw the first one compiled two programs
+  and a pipeline for; the surface check reports a write behind the backend's back.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

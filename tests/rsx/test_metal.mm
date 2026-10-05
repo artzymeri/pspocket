@@ -10,11 +10,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <mutex>
 #include <random>
 #include <thread>
+#include <unistd.h>
 
 #include "pspocket/core/log.hpp"
 #include "pspocket/rsx/metal/metal_backend.hpp"
@@ -682,7 +684,7 @@ struct E2E {
     static constexpr u32 kCmdEa = 0x00200000;
     static constexpr u32 kReadbackEa = 0x00400000; // main memory, IO 0x00100000
 
-    explicit E2E(u32 capture_every = 0)
+    explicit E2E(u32 capture_every = 0, std::string shader_cache = {})
     {
         PS_CHECK(mem.reserve());
         PS_CHECK(mem.commit(kCmdEa, 0x100000));
@@ -714,6 +716,8 @@ struct E2E {
             }];
         };
         mc.capture_every = capture_every;
+        mc.shader_cache = std::move(shader_cache);
+        mc.shader_cache_threads = 2;
         mc.capture = [this](const u8* bgra, u32 w, u32 h, u64 flip) {
             std::lock_guard lock(capture_mutex);
             captures.emplace_back(flip, std::vector<u8>(bgra, bgra + usize{w} * h * 4));
@@ -1659,6 +1663,82 @@ TEST_CASE("metal e2e: vertex programs branch and call on NV4097_SET_TRANSFORM_BR
     CHECK(draw_with_branch_bits(true, true, 1u << 2) == green);  // CLB calls the subroutine, which returns
     CHECK(draw_with_branch_bits(true, true, 0) == red);
     CHECK(draw_with_branch_bits(true, false, 0) == green);
+}
+
+TEST_CASE("metal e2e: PSPOCKET_RSX_CHECK_SURFACES reports a surface sampled after its memory changed under it")
+{
+    REQUIRE_METAL();
+    setenv("PSPOCKET_RSX_CHECK_SURFACES", "1", 1);
+    E2E e;
+    unsetenv("PSPOCKET_RSX_CHECK_SURFACES");
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0x00ff00ff, 0x00ff00ff, 0x00ff00ff});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceB);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    // A write the backend is not told of (as a CPU store or an SPU DMA), then a texture over the surface.
+    e.put_local32(kSurfaceB + 100, 0x12345678u);
+    auto c = e.at(b.offset());
+    setup_surface(c, kSurfaceOffset);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    set_fragment_program(c, kFp2Offset, 0x40);
+    bind_linear_texture(c, kSurfaceB, tex::A8R8G8B8, kW * 4);
+    draw_triangle(c);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.backend->stats().surface_samples == 1);
+    CHECK(e.backend->stats().surface_guest_changes == 1);
+}
+
+TEST_CASE("metal e2e: the shader cache records what draws compile and makes it ahead for the next backend (D-114)")
+{
+    // The first mission compiled 533 programs and pipelines in its first minutes, 8.3 s of stalls on the Mac (run 082).
+    REQUIRE_METAL();
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / std::format("pspocket-shader-cache-{}", static_cast<long>(getpid()));
+    std::filesystem::remove_all(dir);
+    const auto draw = [](E2E& e) {
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
+    };
+    {
+        E2E e(0, dir.string());
+        e.backend->wait_for_shader_cache(); // nothing recorded yet
+        draw(e);
+        CHECK(e.backend->stats().programs_compiled == 2);
+        CHECK(e.backend->stats().pipelines_created == 1);
+        CHECK(e.backend->stats().programs_prewarmed == 0);
+    }
+    CHECK(std::distance(std::filesystem::directory_iterator(dir / "programs"), std::filesystem::directory_iterator{}) == 2);
+    {
+        E2E e(0, dir.string());
+        e.backend->wait_for_shader_cache();
+        draw(e);
+        CHECK(e.backend->stats().programs_compiled == 0); // made ahead, not at the draw
+        CHECK(e.backend->stats().pipelines_created == 0);
+        CHECK(e.backend->stats().programs_prewarmed == 2);
+        CHECK(e.backend->stats().pipelines_prewarmed == 1);
+    }
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")

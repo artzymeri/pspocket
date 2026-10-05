@@ -68,6 +68,12 @@ struct MetalBackendConfig {
     // flip every colour target it used goes to trace_surface (float formats clamped to [0, 1]).
     u64 trace_frame = 0;
     TraceSurfaceCallback trace_surface;
+    // The shader cache (D-114): programs and pipelines are recorded in shader_cache (a writable directory; empty: not
+    // recorded), and the ones recorded there and in shader_seeds (read-only, e.g. the app's copy of the Mac's) are made
+    // again on background threads when the backend starts (0 threads: chosen from the core count).
+    std::string shader_cache;
+    std::vector<std::string> shader_seeds;
+    u32 shader_cache_threads = 0;
 };
 
 struct BackendStats {
@@ -89,6 +95,11 @@ struct BackendStats {
     u64 gpu_copies = 0;         // NV0039 copies of render targets done on the GPU (D-107)
     u64 texture_checks = 0;     // cached textures checked against guest memory (a content hash, D-104)
     u64 surface_reloads = 0;    // surfaces loaded again from guest memory the CPU or the RSX wrote
+    u64 compile_ns = 0;         // the RSX thread's time in MSL compilation (newLibraryWithSource)
+    u64 programs_prewarmed = 0;  // programs the shader cache made ahead and a draw then found (D-114)
+    u64 pipelines_prewarmed = 0; // ... and pipelines
+    u64 pipeline_ns = 0;        // ... and in render pipeline creation
+    u64 surface_guest_changes = 0; // PSPOCKET_RSX_CHECK_SURFACES: samples of surfaces whose memory changed under them
     u64 texture_check_bytes = 0; // the bytes those checks hashed
     u64 depth_conversions = 0; // depth buffers converted on the GPU for a texture that reads them (D-088)
     u64 color_conversions = 0; // colour targets converted on the GPU for a texture of another format (D-098)
@@ -128,6 +139,8 @@ public:
     bool report_zpass(u32 value_addr) override;
 
     const BackendStats& stats() const;
+    // Waits until the shader cache has made everything it holds (tests), then hands it to the backend.
+    void wait_for_shader_cache();
 
     // Debug and test helpers ------------------------------------------------------------------------------------
     // Decodes texture `t` (its bytes at guest address `ea`) through the texture path and reads back (face, level)

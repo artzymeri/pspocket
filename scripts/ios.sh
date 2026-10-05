@@ -62,6 +62,8 @@ Environment:
                         inventory/*/spu-lifted that holds a game_spu.c, if any)
   PSPOCKET_GAME_PPU     the game's translated PPU code (ppu-lift output, --name game_ppu) to build in (default: the
                         inventory/*/ppu-lifted that holds a game_ppu_reg.c, if any)
+  PSPOCKET_GAME_SHADERS the shaders the Mac recorded for the game (pspocket-boot --shader-cache; a directory named
+                        shaders) to put in the app (default: the inventory/*/shaders that holds programs, if any)
   PSPOCKET_IOS_BUILD    Xcode output directory: DerivedData, logs, last-run.log, the report (default build/ios)
   PSPOCKET_ASC_KEY_ID, PSPOCKET_ASC_ISSUER_ID, PSPOCKET_ASC_KEY_PATH
                         testflight: an App Store Connect API key (the .p8 file, default
@@ -266,10 +268,24 @@ cmd_gen() {
         game_ppu="$ROOT/inventory/no-translated-ppu-code"
         have_game_ppu=0
     fi
+    # The shaders the Mac recorded for the game (pspocket-boot --shader-cache, D-114): $PSPOCKET_GAME_SHADERS, else an
+    # inventory/*/shaders with programs in it. The app makes them ahead while the game loads.
+    local game_shaders="${PSPOCKET_GAME_SHADERS:-}"
+    if [ -z "$game_shaders" ]; then
+        for d in "$ROOT"/inventory/*/shaders; do
+            if [ -d "$d/programs" ]; then game_shaders="$d"; fi
+        done
+    fi
+    if [ -n "$game_shaders" ] && [ -d "$game_shaders/programs" ]; then
+        say "recorded shaders: $game_shaders ($(find "$game_shaders/programs" -name '*.txt' | wc -l | tr -d ' ') programs)"
+    else
+        say "no recorded shaders (pspocket-boot --shader-cache): the app compiles them as the game meets them"
+        game_shaders="$ROOT/inventory/no-recorded-shaders/shaders"
+    fi
     say "xcodegen: $PROJECT"
     PSPOCKET_HOST_BUILD_DIR="$HOST_BUILD" PSPOCKET_PPU_SRC="$ppu_src" PSPOCKET_GAME_SPU_SRC="$game_spu" \
         PSPOCKET_HAVE_GAME_SPU="$have_game_spu" PSPOCKET_GAME_PPU_SRC="$game_ppu" PSPOCKET_HAVE_GAME_PPU="$have_game_ppu" \
-        "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
+        PSPOCKET_GAME_SHADERS_SRC="$game_shaders" "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
 }
 
 cmd_build() {

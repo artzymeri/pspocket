@@ -3,6 +3,8 @@
 
 #include "metal_internal.hpp"
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <cstring>
 #include <format>
@@ -191,6 +193,11 @@ bool MetalBackend::Impl::init()
         id<MTLTexture> t = [device newTextureWithDescriptor:od];
         t.label = @"rsx output";
         outputs.push_back(t);
+    }
+    check_surfaces = std::getenv("PSPOCKET_RSX_CHECK_SURFACES") != nullptr;
+    if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
+        shader_cache = std::make_unique<ShaderCache>(device, config.shader_cache, config.shader_seeds,
+            config.shader_cache_threads);
     }
     PS_LOG_INFO(kChan, "Metal backend on {} (BC textures: {}), output {}x{}", device.name.UTF8String,
         bc_supported ? "yes" : "no", config.output_width, config.output_height);
@@ -1300,7 +1307,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         }
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
-                           "{:.0f} texture checks ({:.2f} MB hashed)",
+                           "{:.0f} texture checks ({:.2f} MB hashed); {} programs and {} pipelines made ({:.1f} ms)",
             m.report_flips, static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n,
             static_cast<double>(m.stats.draws - m.report_draws) / n,
             static_cast<double>(m.stats.render_passes - m.report_passes) / n, ends,
@@ -1309,7 +1316,12 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             static_cast<double>(m.stats.deferred_conflicts - m.report_conflicts) / n,
             static_cast<double>(m.stats.readback_wait_ns - m.report_readback_ns) / 1e6 / n,
             static_cast<double>(m.stats.texture_checks - m.report_texture_checks) / n,
-            static_cast<double>(m.stats.texture_check_bytes - m.report_texture_bytes) / 1048576.0 / n);
+            static_cast<double>(m.stats.texture_check_bytes - m.report_texture_bytes) / 1048576.0 / n,
+            m.stats.programs_compiled - m.report_programs, m.stats.pipelines_created - m.report_pipelines,
+            static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns - m.report_compile_ns) / 1e6);
+        m.report_programs = m.stats.programs_compiled;
+        m.report_pipelines = m.stats.pipelines_created;
+        m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns;
         m.report_texture_checks = m.stats.texture_checks;
         m.report_texture_bytes = m.stats.texture_check_bytes;
         m.report_readback_ns = m.stats.readback_wait_ns;
@@ -1417,6 +1429,15 @@ bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u
         m.deferred.push_back(std::move(later));
     }
     return true;
+}
+
+void MetalBackend::wait_for_shader_cache()
+{
+    if (!impl_->shader_cache) return;
+    impl_->shader_cache->wait();
+    @autoreleasepool {
+        impl_->take_shader_cache();
+    }
 }
 
 bool MetalBackend::flush_memory_later(u32 addr, u32 size, u32 write_addr, u32 write_size, std::function<void()> then)

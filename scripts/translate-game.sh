@@ -12,7 +12,8 @@
 # 2. The PPU code: ppu-lift --elf, every function of the executable (D-092, D-101).
 # 3. pspocket-boot built with it, then one run of --seconds (default 300) with --spu-dump: the SPU programs SPURS and
 #    the game's tasks load are saved, with the addresses where execution left lifted code.
-# 4. The SPU programs: scripts/lift-spu.sh (D-076, D-099), and pspocket-boot rebuilt with them.
+# 4. The SPU programs: scripts/lift-spu.sh (D-076, D-099), and pspocket-boot rebuilt with them. The runs also record
+#    the game's shaders in inventory/<TITLE_ID>/shaders (--shader-cache, D-114), which the app makes while it loads.
 # 5. With --ios: scripts/ios.sh build with both (then scripts/ios.sh install and push-game with the phone connected).
 #
 # --rounds N repeats steps 3 and 4 up to N times (default 1), until a run leaves no SPU code interpreted: each run's
@@ -95,8 +96,9 @@ while :; do
     while [ -e "$GAME/run-$(printf %03d $n).log" ]; do n=$((n + 1)); done
     LOG="$GAME/run-$(printf %03d $n).log"
     say "round $round of $ROUNDS: running the game for $SECONDS_RUN s to collect its SPU programs: $LOG"
-    "$BUILD/runtime/loader/pspocket-boot" "$GAME/EBOOT.elf" --timeout "$SECONDS_RUN" --rsx-recover --bdvd "$ISO" \
-        --hdd0 "$GAME/hdd0" ${flash[@]+"${flash[@]}"} --spu-dump "$GAME/spu" ${PRESSES[@]+"${PRESSES[@]}"} > "$LOG" 2>&1 || true
+    "$BUILD/runtime/loader/pspocket-boot" "$GAME/EBOOT.elf" --timeout "$SECONDS_RUN" --gpu metal --rsx-recover --bdvd "$ISO" \
+        --hdd0 "$GAME/hdd0" ${flash[@]+"${flash[@]}"} --spu-dump "$GAME/spu" --shader-cache "$GAME/shaders" \
+        ${PRESSES[@]+"${PRESSES[@]}"} > "$LOG" 2>&1 || true
     grep -E "fps|SPU program loads|unimplemented (syscalls|functions) called" "$LOG" | tail -4 >&2 || true
     # What the translation did not cover: code the SPU interpreter ran, images without a lifted program.
     interpreted="$(grep -c '^SPU interpreted:' "$LOG" || true)"
