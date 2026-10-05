@@ -7,19 +7,20 @@
 // RPCS3's logic with its sys_prx_load_module / start / stop / unload calls removed.
 //
 // Deviations: internal module IDs (0xF000 and up) return CELL_SYSMODULE_ERROR_UNKNOWN with an error log until a game
-// is seen loading one; the debug/retail variants of libfs, libgcm_sys and liblv2dbg are one module each;
-// cellSysmoduleSetMemcontainer is not implemented.
+// is seen loading one; the debug/retail variants of libfs, libgcm_sys and liblv2dbg are one module each.
 
 #include <array>
 #include <initializer_list>
 #include <mutex>
 
 #include "guest.hpp"
+#include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/lv2/syscalls.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -30,8 +31,12 @@ enum : u32 {
     CELL_SYSMODULE_ERROR_DUPLICATED = 0x80012001,
     CELL_SYSMODULE_ERROR_UNKNOWN = 0x80012002,
     CELL_SYSMODULE_ERROR_UNLOADED = 0x80012003,
+    CELL_SYSMODULE_ERROR_INVALID_MEMCONTAINER = 0x80012004,
     CELL_SYSMODULE_ERROR_FATAL = 0x800120FF,
 };
+
+constexpr u32 kNoContainer = 0xFFFFFFFF; // SYS_MEMORY_CONTAINER_ID_INVALID
+constexpr u32 kContainerMinFree = 0x60000; // what a container needs free to take module loads (RPCS3)
 
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -149,6 +154,7 @@ constexpr u16 kDefaultModules[] = {0x15, 0x10, 0x11, 0x17, 0x0A, 0x0E};
 struct SysmoduleState {
     std::mutex mutex;
     std::array<s32, kExternalCount> loaded{};
+    u32 container = kNoContainer; // cellSysmoduleSetMemcontainer's: where later loads would put their PRX images
 
     explicit SysmoduleState(HleProcess& p)
     {
@@ -255,6 +261,27 @@ s32 cellSysmoduleIsLoaded(PPUContext&, u16 id)
     return loaded ? lv2::CELL_OK : error(CELL_SYSMODULE_ERROR_UNLOADED);
 }
 
+// cellSysmoduleSetMemcontainer(ct_id), as RPCS3: SYS_MEMORY_CONTAINER_ID_INVALID goes back to no container; any other
+// ID must be a memory container with 0x60000 bytes free (sys_memory_container_get_size), or the call fails with
+// INVALID_MEMCONTAINER and no container is used. The container would hold the PRX images of later loads; HLE modules
+// have none, so it is only remembered. GTA V calls it with a container it made, and asserts (tw 31,r1,r1) on an error
+// (phone run of 2026-10-05: unimplemented, the game stopped at 0xa3a16c).
+s32 cellSysmoduleSetMemcontainer(PPUContext& ctx, u32 ct_id)
+{
+    PS_LOG_INFO(kChan, "cellSysmoduleSetMemcontainer({:#x})", ct_id);
+    SysmoduleState& s = state();
+    bool usable = ct_id == kNoContainer;
+    if (!usable) {
+        u8* base = guest_base(ctx);
+        StackVar info(ctx, base, 8); // sys_memory_info_t {total_user_memory, available_user_memory}
+        usable = lv2::sys_memory_container_get_size(thread_of(ctx), info.addr(), ct_id) == lv2::CELL_OK &&
+            ps_read32(base, info.addr() + 4) >= kContainerMinFree;
+    }
+    std::lock_guard lock(s.mutex);
+    s.container = usable ? ct_id : kNoContainer;
+    return usable ? lv2::CELL_OK : error(CELL_SYSMODULE_ERROR_INVALID_MEMCONTAINER);
+}
+
 } // namespace
 
 void register_cellSysmodule(Registry& r)
@@ -265,6 +292,7 @@ void register_cellSysmodule(Registry& r)
         PS_HLE_FUNC(0x32267A31, cellSysmoduleLoadModule),
         PS_HLE_FUNC(0x112A5EE9, cellSysmoduleUnloadModule),
         PS_HLE_FUNC(0x5A59E258, cellSysmoduleIsLoaded),
+        PS_HLE_FUNC(0xA193143C, cellSysmoduleSetMemcontainer),
     });
 }
 

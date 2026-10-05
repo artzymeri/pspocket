@@ -268,6 +268,26 @@ TEST_CASE("cellSysmodule: load counts, dependencies, default and virtual modules
     CHECK(a.call("cellSysmoduleFinalize") == 0);
 }
 
+TEST_CASE("cellSysmoduleSetMemcontainer: a container with room, none, or an unusable one (RPCS3)", "[hle][sysmodule]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u64 kInvalidContainer = 0xFFFFFFFF80012004ull;
+    constexpr u64 kPageSize64K = 0x200; // SYS_MEMORY_PAGE_SIZE_64K
+    constexpr u32 kId = kData + 0x40, kAddr = kData + 0x48;
+
+    REQUIRE(lv2::sys_memory_container_create(*a.t, kId, 0x100000) == lv2::CELL_OK);
+    const u32 ct = ps_read32(base, kId);
+    CHECK(a.call("cellSysmoduleSetMemcontainer", ct) == 0); // GTA V's call: a container of its own, 1 MB free
+    CHECK(a.call("cellSysmoduleSetMemcontainer", 0xFFFFFFFFu) == 0); // back to none
+    CHECK(a.call("cellSysmoduleSetMemcontainer", ct + 1) == kInvalidContainer); // not a container
+    // 64 KB left: less than a module load needs.
+    REQUIRE(lv2::sys_memory_allocate_from_container(*a.t, 0xF0000, ct, kPageSize64K, kAddr) == lv2::CELL_OK);
+    CHECK(a.call("cellSysmoduleSetMemcontainer", ct) == kInvalidContainer);
+    CHECK(a.call("cellSysmoduleLoadModule", 0x09) == 0); // loads still work without a container
+}
+
 TEST_CASE("cellSpurs stage 1: attributes, native initialize, finalize", "[hle][spurs]")
 {
     Fixture f;

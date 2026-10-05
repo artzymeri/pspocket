@@ -1955,6 +1955,15 @@ with bit 35 (the JTS bit) ends the batch with pc unchanged, as a JTS does.
 - Test: a chain whose second command is a JOB's low word over a JTS waits on its SPU; once the high word is written
   the job runs (without the change it stops on the phone's MFC fault).
 
+## D-126 · 2026-10-05 · cellSysmoduleSetMemcontainer: a container is checked and remembered
+
+The iPhone stopped after 15 minutes of the first mission: GTA V called cellSysmoduleSetMemcontainer (unimplemented,
+an error) with a memory container it had made, then trapped on its own assertion (tw 31,r1,r1 at 0xa3a16c). Now it
+follows RPCS3: SYS_MEMORY_CONTAINER_ID_INVALID returns to no container; any other ID must be a memory container with
+0x60000 bytes free (sys_memory_container_get_size), or CELL_SYSMODULE_ERROR_INVALID_MEMCONTAINER. The container would
+hold the PRX images of later loads; HLE modules have none, so it is only remembered.
+- Test: a fresh 1 MB container, no container, a wrong ID, and a container with 64 KB left.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
