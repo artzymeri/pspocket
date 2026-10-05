@@ -42,6 +42,12 @@ Commands:
                              /dev_flash files the game loads itself (default inventory/firmware/dev_flash, without the
                              reference-only .sprx). Phone connected and unlocked. They stay on your devices.
   all                        build + install + run --autorun --exit + report.
+  testflight                 gen, then archive the Release build and upload it to App Store Connect (team
+                             M7XJA39ZV6, with the Apple ID Xcode is signed in with) for TestFlight: the way onto an
+                             iPhone that is not connected to this Mac or on its network. The build number is the
+                             commit count, so each upload is higher than the last. App Store Connect needs an app
+                             with the bundle ID first (created once, on the website). The upload holds the game's
+                             translated code: it stays private to the team (internal testers).
 
 Options:
   --device ID   devicectl device: identifier, UDID or name. Default: \$PSPOCKET_DEVICE, else the first connected iPhone.
@@ -469,6 +475,62 @@ cmd_push_game() {
     say "done: in PSPocket's Game tab, choose the game's .iso and press Boot"
 }
 
+cmd_testflight() {
+    cmd_gen
+    local hash version build_number archive log options status
+    hash="$(git_hash)"
+    version="$(project_version)"
+    build_number="$(git -C "$ROOT" rev-list --count HEAD)"
+    archive="$IOS_BUILD/PSPocket.xcarchive"
+    log="$IOS_BUILD/xcodebuild-archive.log"
+    mkdir -p "$IOS_BUILD"
+    rm -rf "$archive" "$IOS_BUILD/export"
+    say "xcodebuild archive, pspocket $version build $build_number ($hash); full log: $log"
+    set +e +o pipefail
+    xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -destination generic/platform=iOS \
+        -derivedDataPath "$DERIVED" -archivePath "$archive" -allowProvisioningUpdates \
+        PSPOCKET_GIT_HASH="$hash" PSPOCKET_VERSION="$version" CURRENT_PROJECT_VERSION="$build_number" archive 2>&1 \
+        | tee "$log" \
+        | grep --line-buffered -E '(^|: )(error|warning): |^\*\* ARCHIVE ' \
+        | awk '!seen[$0]++ { print; fflush() }' >&2
+    status=${PIPESTATUS[0]}
+    set -e -o pipefail
+    [ "$status" = 0 ] || die "xcodebuild archive failed (status $status); full log: $log"
+
+    # App Store Connect distribution, uploaded straight from the export (symbols stay here: the translated code makes
+    # them large, and crash logs are symbolicated with the archive's dSYM).
+    options="$IOS_BUILD/ExportOptions.plist"
+    cat > "$options" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key><string>app-store-connect</string>
+    <key>destination</key><string>upload</string>
+    <key>teamID</key><string>M7XJA39ZV6</string>
+    <key>signingStyle</key><string>automatic</string>
+    <key>uploadSymbols</key><false/>
+    <key>manageAppVersionAndBuildNumber</key><false/>
+</dict>
+</plist>
+PLIST
+    log="$IOS_BUILD/xcodebuild-export.log"
+    say "uploading to App Store Connect; full log: $log"
+    set +e +o pipefail
+    xcodebuild -exportArchive -archivePath "$archive" -exportOptionsPlist "$options" -exportPath "$IOS_BUILD/export" \
+        -allowProvisioningUpdates 2>&1 | tee "$log" | grep --line-buffered -E 'error|Upload|EXPORT' >&2
+    status=${PIPESTATUS[0]}
+    set -e -o pipefail
+    if [ "$status" != 0 ]; then
+        if grep -qi 'no suitable application records\|app record' "$log"; then
+            warn "App Store Connect has no app for $BUNDLE_ID yet: create it once at https://appstoreconnect.apple.com" \
+                 "(Apps > + > New App, bundle ID $BUNDLE_ID), then run scripts/ios.sh testflight again."
+        fi
+        die "upload failed (status $status); full log: $log"
+    fi
+    say "uploaded build $build_number: it shows in TestFlight once App Store Connect has processed it (minutes)"
+}
+
 case "$COMMAND" in
     gen) cmd_gen ;;
     build) cmd_build ;;
@@ -477,6 +539,7 @@ case "$COMMAND" in
     report) cmd_report ;;
     pull-iso) cmd_pull_iso ;;
     push-game) cmd_push_game ;;
+    testflight) cmd_testflight ;;
     all)
         cmd_build >/dev/null
         cmd_install
