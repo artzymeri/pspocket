@@ -3,6 +3,7 @@ add_library(pspocket_hle STATIC
     src/cellAudio.cpp
     src/cellGame.cpp
     src/cellGcmSys.cpp
+    src/cellHttp.cpp
     src/cellNetCtl.cpp
     src/cellOskDialog.cpp
     src/cellRtc.cpp
@@ -11,6 +12,7 @@ add_library(pspocket_hle STATIC
     src/cellSpurs.cpp
     src/cellSpursQueue.cpp
     src/cellSpursSemaphore.cpp
+    src/cellSsl.cpp
     src/cellSysmodule.cpp
     src/cellSysutil.cpp
     src/cellVoice.cpp

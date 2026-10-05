@@ -2179,6 +2179,28 @@ The other imports left: the keyboard dialog, cellMsgDialogAbort and sys_prx_regi
 - **sys_prx_register_library:** EFAULT for an entry outside guest memory, else CELL_OK with the library logged: no PRX
   module is ever loaded here to import its exports (GTA V ships none).
 
+## D-141 · 2026-10-05 · sys_net offline, with loopback between the game's own sockets; cellHttp and cellSsl
+
+The last of GTA V's 113 unimplemented imports: 23 sys_net functions, 6 cellHttp, 3 cellSsl. Online play is a non-goal
+(D-024): no traffic leaves the process. RPCS3's checks, errno values and structure layouts are kept (sys_net.cpp,
+lv2/sys_net.cpp, cellHttp.cpp, cellSsl.cpp).
+- Sockets are numbered as RPCS3's (24 to 1023, then the lowest free, then EMFILE); errors set the thread's errno where
+  RPCS3 puts it (r13 - 0x7030 + 0x2c) and return -1.
+- Only 0.0.0.0, 127.0.0.1 and multicast bind; any address outside 127/8 is EADDRNOTAVAIL (RPCS3's answer with its
+  network disconnected). Between the game's own sockets UDP and TCP work in memory, with BSD's EOF, EPIPE and buffer
+  limits; nobody listening is ECONNREFUSED.
+- A blocking recv, recvfrom or accept without a timeout waits as on a console without a link (its receive thread parks)
+  until data, a shutdown, a close from another thread (EINTR, as RPCS3), SO_RCVTIMEO (EWOULDBLOCK) or the process
+  end: an invented error could send such a thread into a loop that takes a core on the phone. The first wait on each
+  socket is logged, and it shows in the thread report.
+- gethostbyname answers dotted addresses and fails names with TRY_AGAIN; select counts sockets and never sets
+  exceptfds; socket info reports the real queued bytes (RPCS3 reports 0).
+- cellHttp and cellSsl: RPCS3's init and end state machines; cellSslCertificateLoader answers as RPCS3 with no
+  firmware certificates installed (size 0, or zeros).
+- Guesses where the PS3's own behaviour is not known: ephemeral ports from 49152, a backlog cap of 128, EOF (not a
+  reset) for a socket closed with unread data, ECONNREFUSED for a full backlog; sys_net_get_sockinfo_ex's fourth
+  argument taken as flags.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
