@@ -258,7 +258,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     // SPU code without a lifted program, or outside it, is interpreted (D-076). The game's lifted SPU programs, when
     // the build has them (scripts/ios.sh), run its SPURS tasks, jobs and the modules they load (D-079, D-081).
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
-    const std::string game_library = options->game_library ? options->game_library : "";
+    const std::string game_library = o->game_library ? o->game_library : "";
 #if PSPOCKET_HAVE_GAME_SPU
     if (game_library.empty()) { // a game library brings its own, registered once the executable is loaded
         pspocket_game_spu_register();
