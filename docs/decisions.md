@@ -2231,6 +2231,31 @@ games go, Self-test and Metal; `-tab selftest|metal` and `-autorun` open them at
   starts 1.2 s later, or when the executable is ready, and Cancel (○) works until then: a running game cannot be torn
   down yet, so Cancel goes once the game's threads run. The overlay stays over the game's screen until its first frame.
 
+## D-143 · 2026-10-05 · The shader cache makes pipelines first, in first-use order, on half the cores; the iPhone keeps their GPU code in binary archives
+
+On the iPhone the first minutes of play ran at 4 to 10 fps (run 087): the cache (D-114, D-118) compiled all of its
+~7,500 programs before the first of its ~11,600 pipelines, on two threads at utility QoS (iOS runs those on the
+efficiency cores), so no pipeline the game needed was ready when play began and the RSX thread compiled 821 itself in
+the first 300 frames. And every launch compiled everything again.
+- **Order:** pipelines as pipelines.txt lists them (the order the game first needed them), each with its two programs
+  compiled on demand, once (a worker that needs a program another is compiling waits for it); then the programs no
+  pipeline names.
+- **Threads:** half the cores, 2 to 4 (3 on the iPhone's 6), at user-initiated QoS while the game loads; each drops
+  to utility after 45 s, when the game is playing (three threads at user-initiated QoS left the iPhone's sound at
+  half speed).
+- **GPU binary archives (the iPhone app only, `shader_archives`):** each worker adds what it compiles to its own
+  MTLBinaryArchive and writes it to the cache directory (archive-<launch>-<worker>.bin, every 400 pipelines and at the
+  end); the next launch loads them all and makes its pipelines from them (MTLPipelineOptionFailOnBinaryArchiveMiss),
+  compiling only the misses, and the RSX thread's own pipelines look there too. An archive that does not load (an OS
+  update) is deleted. Pipelines that write no colour are left out: an archive holding one is not saved ("expecting
+  'fragment' stage in pipeline").
+- **Measured on the iPhone 17 Pro Max:** 10,000 of 11,634 pipelines ready when play began, 45 compiled on the RSX
+  thread in the first 300 frames (17 to 23 fps, run 087); the next boots were done in 43 and 41 s and held 30 fps
+  until play (run 088).
+- **Open:** the iPhone's archive saves still report "expecting 'fragment' stage" or "missing 'vertex' stage in
+  pipeline no. N" and keep only part of what was added: 3,623 of 11,756 pipelines came from the archives in the
+  second boot, 5,307 of 11,770 in the third. The Mac saves every kind of pipeline tried (run 088).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

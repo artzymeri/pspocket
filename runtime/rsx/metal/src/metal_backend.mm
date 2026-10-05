@@ -206,7 +206,7 @@ bool MetalBackend::Impl::init()
     if (std::getenv("PSPOCKET_RSX_WRITE_BACK_TARGETS")) config.overlay_targets = false; // D-137's comparison
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
         shader_cache = std::make_unique<ShaderCache>(device, config.shader_cache, config.shader_seeds,
-            config.shader_cache_threads);
+            config.shader_cache_threads, config.shader_archives);
     }
     PS_LOG_INFO(kChan, "Metal backend on {} (BC textures: {}), output {}x{}", device.name.UTF8String,
         bc_supported ? "yes" : "no", config.output_width, config.output_height);

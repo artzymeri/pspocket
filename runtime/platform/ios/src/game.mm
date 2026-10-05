@@ -279,14 +279,15 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         rsx::metal::MetalBackendConfig mc;
         mc.device = (__bridge void*)device;
         // The shader cache (D-114): what this phone compiled before for this game (D-118), and what the Mac recorded
-        // for the game the app was built for (in the app, scripts/ios.sh), made ahead on two background threads while
-        // the game loads.
+        // for the game the app was built for (in the app, scripts/ios.sh), made ahead on background threads while the
+        // game loads; the GPU code it compiles is kept in binary archives for the next launch (D-143).
         if (NSString* caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject) {
             mc.shader_cache = std::string(caches.UTF8String) + "/pspocket-shaders/" + raw->title_id;
         }
         NSString* seed = [[NSBundle mainBundle] pathForResource:@"shaders" ofType:nil];
         if (seed && raw->translated) mc.shader_seeds.push_back(seed.UTF8String);
-        mc.shader_cache_threads = 2;
+        mc.shader_cache_threads = 0; // half the cores (D-143)
+        mc.shader_archives = true;   // the compiled GPU code kept for the next launch (D-143)
         mc.present = [raw](const rsx::metal::PresentFrame& f) {
             const u64 flips = raw->flips.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto now = std::chrono::steady_clock::now();

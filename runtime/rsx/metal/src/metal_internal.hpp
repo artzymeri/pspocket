@@ -196,7 +196,7 @@ public:
         std::vector<ReadyPipeline> pipelines;
     };
 
-    ShaderCache(id<MTLDevice> device, std::string dir, std::vector<std::string> seeds, u32 threads);
+    ShaderCache(id<MTLDevice> device, std::string dir, std::vector<std::string> seeds, u32 threads, bool archives);
     ~ShaderCache();
     ShaderCache(const ShaderCache&) = delete;
     ShaderCache& operator=(const ShaderCache&) = delete;
@@ -205,31 +205,41 @@ public:
     void wait();           // until every record has been made (or failed)
     void record_program(const CompiledProgram& p);
     void record_pipeline(const std::string& vp_key, const std::string& fp_key, const PipelineParams& p);
+    // The GPU binaries earlier runs kept (D-143), for the RSX thread's own pipelines too; nil until loaded.
+    NSArray<id<MTLBinaryArchive>>* archives();
 
 private:
     void load_and_start(u32 threads);
-    void work();
+    void work(u32 worker);
+    id<MTLFunction> program(const std::string& key, MTLCompileOptions* options);
+    void load_archives();
+    void report_progress();
 
     __strong id<MTLDevice> device_ = nil;
     std::string dir_;
     std::vector<std::string> seeds_;
+    bool use_archives_ = false;
     std::chrono::steady_clock::time_point started_;
     std::thread loader_;
     std::vector<std::thread> workers_;
     std::atomic<bool> stop_{false}, ready_{false};
     std::mutex mutex_;
-    std::condition_variable done_cv_, programs_done_cv_;
+    std::condition_variable done_cv_;
     bool done_ = false;
     std::vector<Record> records_;
     std::vector<PipelineRecord> pipeline_records_;
     std::unordered_set<std::string> recorded_programs_, recorded_pipelines_;
     std::unordered_map<std::string, id<MTLFunction>> functions_;
+    std::unordered_map<std::string, usize> record_index_; // program key -> records_
+    std::unordered_set<std::string> compiling_;            // programs a worker is compiling now
+    std::condition_variable compiled_cv_;
     std::vector<CompiledProgram> ready_programs_;
     std::vector<ReadyPipeline> ready_pipelines_;
-    u64 made_programs_ = 0, made_pipelines_ = 0;
-    usize programs_finished_ = 0;
+    u64 made_programs_ = 0, made_pipelines_ = 0, archive_hits_ = 0, archived_ = 0;
     std::atomic<usize> next_program_{0}, next_pipeline_{0};
     u32 workers_left_ = 0;
+    __strong NSArray<id<MTLBinaryArchive>>* archives_ = nil; // read only once loaded
+    std::chrono::steady_clock::time_point last_report_;
 };
 
 struct CompiledProgram;

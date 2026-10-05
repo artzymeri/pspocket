@@ -6,6 +6,14 @@
 //
 // A program is a file programs/<hash>.txt: its key, its translation's entry and masks, its ucode (the collision
 // check) and its MSL source. A pipeline is a line of pipelines.txt: its two program keys and PipelineParams.
+//
+// D-143: the pipelines are made in the order they were first needed (pipelines.txt grows in that order), each with
+// its two programs, then the programs no pipeline names: the first ones a game needs are ready first, where all
+// 7,500 programs used to come before the first pipeline. Each worker keeps the GPU binaries it compiled in a Metal
+// binary archive in the writable directory (archive-<launch>-<worker>.bin); the next run loads them all and finds its
+// pipelines there instead of compiling them: the iPhone compiled them again at every launch, for longer than the game
+// takes to load (macOS keeps them in its own cache). An archive is only ever added to by the worker that made it;
+// the loaded ones are only read.
 
 #include "metal_internal.hpp"
 
@@ -94,15 +102,18 @@ std::string read_file(const std::filesystem::path& p)
 
 } // namespace
 
-ShaderCache::ShaderCache(id<MTLDevice> device, std::string dir, std::vector<std::string> seeds, u32 threads)
-    : device_(device), dir_(std::move(dir)), seeds_(std::move(seeds))
+ShaderCache::ShaderCache(id<MTLDevice> device, std::string dir, std::vector<std::string> seeds, u32 threads,
+    bool archives)
+    : device_(device), dir_(std::move(dir)), seeds_(std::move(seeds)), use_archives_(archives)
 {
     if (!dir_.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path(dir_) / "programs", ec);
         if (ec) PS_LOG_WARN(kChan, "shader cache: cannot create {}: {}", dir_, ec.message());
     }
-    if (threads == 0) threads = std::clamp<u32>(std::thread::hardware_concurrency() / 3, 1, 3);
+    // Half the cores (3 on an iPhone's 6, 4 on a Mac), at user-initiated QoS: at utility the iPhone ran them on its
+    // efficiency cores, and the game needs what they make within its first minute (D-143).
+    if (threads == 0) threads = std::clamp<u32>(std::thread::hardware_concurrency() / 2, 2, 4);
     started_ = std::chrono::steady_clock::now();
     loader_ = std::thread([this, threads] { load_and_start(threads); });
 }
@@ -114,15 +125,16 @@ ShaderCache::~ShaderCache()
     {
         std::lock_guard lock(mutex_); // a worker between its check and its wait still sees stop_ when woken
     }
-    programs_done_cv_.notify_all();
+    compiled_cv_.notify_all();
     for (std::thread& t : workers_) t.join();
 }
 
 void ShaderCache::load_and_start(u32 threads)
 {
 #if defined(__APPLE__)
-    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0); // background work while the game loads
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0); // while the game loads
 #endif
+    load_archives();
     // Seeds first, then the writable directory; a key seen once is enough.
     std::vector<std::string> dirs = seeds_;
     if (!dir_.empty()) dirs.push_back(dir_);
@@ -137,6 +149,7 @@ void ShaderCache::load_and_start(u32 threads)
             if (!keys.insert(r.key).second) continue;
             std::lock_guard lock(mutex_);
             recorded_programs_.insert(r.key);
+            record_index_[r.key] = records_.size();
             records_.push_back(std::move(r));
         }
         std::ifstream lines(std::filesystem::path(d) / "pipelines.txt");
@@ -159,78 +172,192 @@ void ShaderCache::load_and_start(u32 threads)
             done_cv_.notify_all();
             return;
         }
-        PS_LOG_INFO(kChan, "shader cache: making {} programs and {} pipelines ahead, on {} threads", records_.size(),
-            pipeline_records_.size(), threads);
+        PS_LOG_INFO(kChan, "shader cache: making {} programs and {} pipelines ahead, on {} threads ({} GPU binary "
+            "archives)", records_.size(), pipeline_records_.size(), threads, archives_.count);
+        last_report_ = std::chrono::steady_clock::now();
     }
     workers_left_ = threads;
-    for (u32 i = 0; i < threads; i++) workers_.emplace_back([this] { work(); });
+    for (u32 i = 0; i < threads; i++) workers_.emplace_back([this, i] { work(i); });
 }
 
-void ShaderCache::work()
+// The archives earlier runs kept. One that does not load (another device, an OS update) is deleted: its pipelines
+// are compiled again into a new one.
+void ShaderCache::load_archives()
 {
-#if defined(__APPLE__)
-    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-#endif
-    MTLCompileOptions* options = shader_compile_options();
-    // Programs.
-    for (usize i; (i = next_program_.fetch_add(1)) < records_.size();) {
-        if (stop_.load(std::memory_order_acquire)) break;
-        @autoreleasepool {
-            const Record& r = records_[i];
-            NSError* error = nil;
-            id<MTLLibrary> lib = [device_ newLibraryWithSource:[NSString stringWithUTF8String:r.shader.source.c_str()]
-                                                       options:options
-                                                         error:&error];
-            id<MTLFunction> fn = lib ? [lib newFunctionWithName:[NSString stringWithUTF8String:r.shader.entry.c_str()]] : nil;
-            std::lock_guard lock(mutex_);
-            if (fn) {
-                CompiledProgram p;
-                p.function = fn;
-                p.shader = r.shader;
-                p.ucode = r.ucode;
-                p.key = r.key;
-                functions_[r.key] = fn;
-                ready_programs_.push_back(std::move(p));
-                ready_.store(true, std::memory_order_release);
-                made_programs_++;
-            }
-            if (++programs_finished_ == records_.size()) programs_done_cv_.notify_all();
+    if (dir_.empty() || !use_archives_) return;
+    NSMutableArray<id<MTLBinaryArchive>>* loaded = [NSMutableArray array];
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir_, ec)) {
+        const std::string name = e.path().filename().string();
+        if (!e.is_regular_file() || !name.starts_with("archive-") || !name.ends_with(".bin")) continue;
+        MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+        d.url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:e.path().c_str()]];
+        NSError* error = nil;
+        id<MTLBinaryArchive> archive = [device_ newBinaryArchiveWithDescriptor:d error:&error];
+        if (archive) {
+            [loaded addObject:archive];
+        } else {
+            PS_LOG_WARN(kChan, "shader cache: archive {} does not load ({}); deleted", name,
+                error ? error.localizedDescription.UTF8String : "?");
+            std::filesystem::remove(e.path(), ec);
         }
     }
-    // Pipelines, once every program is made (a pipeline needs its two).
+    std::lock_guard lock(mutex_);
+    archives_ = loaded;
+}
+
+NSArray<id<MTLBinaryArchive>>* ShaderCache::archives()
+{
+    std::lock_guard lock(mutex_);
+    return archives_;
+}
+
+// A program's function, compiled once: a worker that needs one another worker is compiling waits for it.
+id<MTLFunction> ShaderCache::program(const std::string& key, MTLCompileOptions* options)
+{
+    usize index;
     {
         std::unique_lock lock(mutex_);
-        programs_done_cv_.wait(lock, [this] {
-            return programs_finished_ >= records_.size() || stop_.load(std::memory_order_acquire);
-        });
+        compiled_cv_.wait(lock, [&] { return !compiling_.contains(key) || stop_.load(std::memory_order_acquire); });
+        if (auto it = functions_.find(key); it != functions_.end()) return it->second;
+        const auto r = record_index_.find(key);
+        if (r == record_index_.end() || stop_.load(std::memory_order_acquire)) return nil;
+        index = r->second;
+        compiling_.insert(key);
     }
+    id<MTLFunction> fn = nil;
+    @autoreleasepool {
+        const Record& r = records_[index];
+        NSError* error = nil;
+        id<MTLLibrary> lib = [device_ newLibraryWithSource:[NSString stringWithUTF8String:r.shader.source.c_str()]
+                                                   options:options
+                                                     error:&error];
+        fn = lib ? [lib newFunctionWithName:[NSString stringWithUTF8String:r.shader.entry.c_str()]] : nil;
+    }
+    {
+        std::lock_guard lock(mutex_);
+        compiling_.erase(key);
+        functions_[key] = fn; // nil too: a program that does not compile is not tried again
+        if (fn) {
+            const Record& r = records_[index];
+            CompiledProgram p;
+            p.function = fn;
+            p.shader = r.shader;
+            p.ucode = r.ucode;
+            p.key = r.key;
+            ready_programs_.push_back(std::move(p));
+            ready_.store(true, std::memory_order_release);
+            made_programs_++;
+        }
+    }
+    compiled_cv_.notify_all();
+    return fn;
+}
+
+// Every 10 s while it runs: how far the cache is (the iPhone's log shows whether it was ready for the game).
+void ShaderCache::report_progress()
+{
+#if defined(__APPLE__)
+    // After 45 s the game is playing, not loading: what is left yields to it (on the iPhone the game's sound fell to
+    // half speed while three workers at user-initiated QoS compiled on; D-143).
+    thread_local bool lowered = false;
+    if (!lowered && std::chrono::steady_clock::now() - started_ > std::chrono::seconds(45)) {
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        lowered = true;
+    }
+#endif
+    std::lock_guard lock(mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report_ < std::chrono::seconds(10)) return;
+    last_report_ = now;
+    PS_LOG_INFO(kChan, "shader cache: {} of {} pipelines and {} of {} programs made ({} from the GPU binary archives) "
+        "in {:.0f} s", made_pipelines_, pipeline_records_.size(), made_programs_, records_.size(), archive_hits_,
+        std::chrono::duration<double>(now - started_).count());
+}
+
+void ShaderCache::work(u32 worker)
+{
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+    MTLCompileOptions* options = shader_compile_options();
+    NSArray<id<MTLBinaryArchive>>* loaded = archives();
+    // This worker's own archive, for the pipelines the loaded ones miss.
+    id<MTLBinaryArchive> mine = nil;
+    std::string mine_path;
+    u64 mine_added = 0, mine_saved = 0;
+    if (!dir_.empty() && use_archives_) {
+        mine_path = (std::filesystem::path(dir_) / std::format("archive-{:x}-{}.bin",
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count(), worker)).string();
+        mine = [device_ newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:nil];
+    }
+    const auto save = [&] {
+        if (!mine || mine_added == mine_saved) return;
+        NSError* error = nil;
+        if (![mine serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:mine_path.c_str()]] error:&error]) {
+            PS_LOG_WARN(kChan, "shader cache: cannot save {}: {}", mine_path,
+                error ? error.localizedDescription.UTF8String : "?");
+        }
+        mine_saved = mine_added;
+    };
+
+    // Pipelines first, in the order they were first needed, each with its two programs.
     for (usize i; (i = next_pipeline_.fetch_add(1)) < pipeline_records_.size();) {
         if (stop_.load(std::memory_order_acquire)) break;
+        const PipelineRecord& r = pipeline_records_[i];
+        id<MTLFunction> vp = program(r.vp_key, options);
+        id<MTLFunction> fp = program(r.fp_key, options);
+        if (!vp || !fp) continue;
         @autoreleasepool {
-            const PipelineRecord& r = pipeline_records_[i];
-            id<MTLFunction> vp = nil, fp = nil;
-            {
-                std::lock_guard lock(mutex_);
-                if (auto it = functions_.find(r.vp_key); it != functions_.end()) vp = it->second;
-                if (auto it = functions_.find(r.fp_key); it != functions_.end()) fp = it->second;
-            }
-            if (!vp || !fp) continue;
+            MTLRenderPipelineDescriptor* d = pipeline_descriptor(r.params, vp, fp);
             NSError* error = nil;
-            id<MTLRenderPipelineState> pso = [device_ newRenderPipelineStateWithDescriptor:pipeline_descriptor(r.params, vp, fp)
-                                                                                    error:&error];
+            id<MTLRenderPipelineState> pso = nil;
+            bool hit = false;
+            if (loaded.count) {
+                d.binaryArchives = loaded;
+                pso = [device_ newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                         reflection:nil error:&error];
+                hit = pso != nil;
+            }
+            // A pipeline that writes no colour (depth only: shadow maps) loses its fragment stage when compiled, and
+            // an archive holding one cannot be saved ("expecting 'fragment' stage in pipeline"; the iPhone, D-143):
+            // those are compiled each run instead.
+            bool writes_color = false;
+            for (u32 c = 0; c < r.params.color_count; c++) writes_color |= r.params.write_masks[c] != 0;
+            if (!pso && mine && writes_color) {
+                // Compiled into this worker's archive, then made from it.
+                if ([mine addRenderPipelineFunctionsWithDescriptor:d error:&error]) {
+                    mine_added++;
+                    d.binaryArchives = loaded.count ? [loaded arrayByAddingObject:mine] : @[ mine ];
+                }
+            }
+            if (!pso) pso = [device_ newRenderPipelineStateWithDescriptor:d error:&error];
             if (!pso) continue;
             std::lock_guard lock(mutex_);
             ready_pipelines_.push_back({r.vp_key, r.fp_key, r.params, vp, fp, pso});
             ready_.store(true, std::memory_order_release);
             made_pipelines_++;
+            if (hit) archive_hits_++;
         }
+        if (mine_added - mine_saved >= 400) save();
+        report_progress();
     }
+    // Then the programs no pipeline named.
+    for (usize i; (i = next_program_.fetch_add(1)) < records_.size();) {
+        if (stop_.load(std::memory_order_acquire)) break;
+        program(records_[i].key, options);
+        report_progress();
+    }
+    save();
     std::lock_guard lock(mutex_);
+    archived_ += mine_added;
     if (--workers_left_ == 0) {
         done_ = true;
-        PS_LOG_INFO(kChan, "shader cache: {} programs and {} pipelines made ahead in {:.1f} s", made_programs_,
-            made_pipelines_,
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count());
+        PS_LOG_INFO(kChan, "shader cache: {} programs and {} pipelines made ahead in {:.1f} s ({} from the GPU binary "
+            "archives, {} added to them)", made_programs_, made_pipelines_,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count(), archive_hits_,
+            archived_);
         done_cv_.notify_all();
     }
 }

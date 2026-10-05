@@ -373,6 +373,10 @@ id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgra
     }
     if (blend.logic_op_enable) unsupported("logic ops are not implemented (Metal has none)");
     MTLRenderPipelineDescriptor* d = pipeline_descriptor(p, vp.function, fp.function);
+    // The GPU binaries earlier runs kept (D-143): a pipeline the cache has not made yet may be there.
+    if (shader_cache) {
+        if (NSArray<id<MTLBinaryArchive>>* archives = shader_cache->archives(); archives.count) d.binaryArchives = archives;
+    }
     NSError* error = nil;
     const auto t0 = std::chrono::steady_clock::now();
     id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:d error:&error];

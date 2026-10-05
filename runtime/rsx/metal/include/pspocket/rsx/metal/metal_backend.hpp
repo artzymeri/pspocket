@@ -74,6 +74,9 @@ struct MetalBackendConfig {
     std::string shader_cache;
     std::vector<std::string> shader_seeds;
     u32 shader_cache_threads = 0;
+    // The GPU binaries the cache compiles kept in Metal binary archives in shader_cache, for the next run (D-143): the
+    // iPhone app's; macOS keeps them in its own cache, and the Mac's directory is the app's seed.
+    bool shader_archives = false;
     // Textures and surfaces unused for this many flips are freed (D-116; a minute at 30 fps).
     u32 evict_after_flips = 1800;
     // A texture of another format over a render target the GPU drew since guest memory last held it is decoded with
