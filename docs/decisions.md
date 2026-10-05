@@ -2278,6 +2278,22 @@ textures hashed instead (run 088).
   store faulting while unwatch() released the page; this one passes.
 - **Mac walk:** 2 jumps in 829 frames (camera cuts), 37 write faults per frame, 30 fps.
 
+## D-145 · 2026-10-05 · The iPhone keeps no shader archives for now; the app logs its memory every 5 s
+
+Two boots of GTA V on the iPhone vanished at 17:06 and 17:10, at the loading screens, without a crash report or a
+fatal line in the game's log: iOS stopped the app. Both had loaded the nine GPU binary archives three earlier boots
+had written (D-143, 114 MB). iOS sent the app memory warnings as the archives loaded, before the cache had compiled
+anything: none in the boot without archives (16:10), 1 with 3 archives, 2 with 6 (and 2 more when play began), 1 and 5
+with 9. An earlier memory report from iOS listed the app at 5.6 GB.
+- `shader_archives` is off in the app until the archives are understood (they also kept only part of what they were
+  given, D-143); the cache deletes the archives earlier runs left. The cache compiles everything again at each
+  launch, as before D-143, with D-143's order and threads.
+- The status line every 5 s adds the memory iOS counts against the app (phys_footprint) and what is left before iOS
+  stops it (os_proc_available_memory): a stop for memory is seen coming in the log.
+- **The next boot (17:13):** no memory warnings; 0.86 GB at the loading screens, 1.6 GB in play, with about 6.4 GB
+  allowed. The cache made all 13,067 pipelines in 30 s, where the boots with archives took 41 to 43 s: iOS keeps
+  the pipelines it compiled for the app between launches itself. The user confirmed the flicker gone (D-144).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -181,15 +181,19 @@ void ShaderCache::load_and_start(u32 threads)
 }
 
 // The archives earlier runs kept. One that does not load (another device, an OS update) is deleted: its pipelines
-// are compiled again into a new one.
+// are compiled again into a new one. Without archives, those of earlier runs are deleted (D-145).
 void ShaderCache::load_archives()
 {
-    if (dir_.empty() || !use_archives_) return;
+    if (dir_.empty()) return;
     NSMutableArray<id<MTLBinaryArchive>>* loaded = [NSMutableArray array];
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(dir_, ec)) {
         const std::string name = e.path().filename().string();
         if (!e.is_regular_file() || !name.starts_with("archive-") || !name.ends_with(".bin")) continue;
+        if (!use_archives_) {
+            std::filesystem::remove(e.path(), ec);
+            continue;
+        }
         MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
         d.url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:e.path().c_str()]];
         NSError* error = nil;

@@ -8,6 +8,8 @@
 
 #include "pspocket/platform/game.h"
 
+#include <mach/mach.h>
+#include <os/proc.h>
 #include <signal.h>
 
 #include <thread>
@@ -287,7 +289,9 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         NSString* seed = [[NSBundle mainBundle] pathForResource:@"shaders" ofType:nil];
         if (seed && raw->translated) mc.shader_seeds.push_back(seed.UTF8String);
         mc.shader_cache_threads = 0; // half the cores (D-143)
-        mc.shader_archives = true;   // the compiled GPU code kept for the next launch (D-143)
+        // The compiled GPU code kept for the next launch (D-143): off. With 3, 6 and then 9 archives loaded iOS sent
+        // memory warnings as they loaded, more each time, and stopped the app twice with 9 (D-145).
+        mc.shader_archives = false;
         mc.present = [raw](const rsx::metal::PresentFrame& f) {
             const u64 flips = raw->flips.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto now = std::chrono::steady_clock::now();
@@ -297,9 +301,17 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
                 // iOS's heat level: from "serious" the system slows the chips down.
                 static constexpr const char* kThermal[] = {"nominal", "fair", "serious", "critical"};
                 const auto thermal = static_cast<usize>([[NSProcessInfo processInfo] thermalState]);
+                // The memory iOS counts against the app, and what is left before it stops the app (it does so without
+                // a crash report: a game that vanished at 17:06 left only "Received memory warning" in the log).
+                task_vm_info_data_t vm{};
+                mach_msg_type_number_t vm_count = TASK_VM_INFO_COUNT;
+                const double footprint = task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm),
+                                             &vm_count) == KERN_SUCCESS ? static_cast<double>(vm.phys_footprint) : 0.0;
                 PS_LOG_INFO(kChan, "{:.1f} fps ({} frames in {:.1f} s; {} since the boot); the speaker ran dry {} times; "
-                                   "heat {}", static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips,
-                    dt, flips, underruns - raw->rate_underruns, kThermal[std::min<usize>(thermal, 3)]);
+                                   "heat {}; memory {:.2f} GB, {:.2f} GB left",
+                    static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips, dt, flips,
+                    underruns - raw->rate_underruns, kThermal[std::min<usize>(thermal, 3)], footprint / 1e9,
+                    static_cast<double>(os_proc_available_memory()) / 1e9);
                 raw->rate_underruns = underruns;
                 raw->rate_since = now;
                 raw->rate_flips = flips;
