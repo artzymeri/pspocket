@@ -34,6 +34,7 @@ static_assert(std::endian::native == std::endian::little, "ps_spu_hash64 reads w
 
 std::mutex g_registry_mutex;
 std::vector<ps_spu_program*> g_programs;
+std::atomic<u64> g_registry_generation{0};
 
 #ifdef NDEBUG
 std::atomic<ps_spu_miss_policy> g_miss_policy{PS_SPU_MISS_INTERPRET};
@@ -201,6 +202,7 @@ void ps_spu_register_program(ps_spu_program* program)
         }
     }
     if (std::find(g_programs.begin(), g_programs.end(), program) == g_programs.end()) g_programs.push_back(program);
+    g_registry_generation.fetch_add(1, std::memory_order_release);
 }
 
 void ps_spu_unregister_program(ps_spu_program* program)
@@ -209,7 +211,10 @@ void ps_spu_unregister_program(ps_spu_program* program)
     g_programs.erase(std::remove(g_programs.begin(), g_programs.end(), program), g_programs.end());
     delete[] program->table;
     program->table = nullptr;
+    g_registry_generation.fetch_add(1, std::memory_order_release);
 }
+
+uint64_t ps_spu_registry_generation(void) { return g_registry_generation.load(std::memory_order_acquire); }
 
 const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, uint32_t code_size)
 {

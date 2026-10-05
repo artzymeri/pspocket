@@ -363,6 +363,10 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     CachedTexture* entry = nullptr;
     const u64 epoch = check_epoch();
     if (auto it = textures.find(key); it != textures.end()) {
+        if (it->second->checked != epoch) {
+            stats.texture_checks++;
+            stats.texture_check_bytes += it->second->watch.size;
+        }
         if (it->second->checked != epoch && tracker.is_dirty(it->second->watch)) {
             tracker.unwatch(it->second->watch);
             textures.erase(it);

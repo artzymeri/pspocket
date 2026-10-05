@@ -162,13 +162,17 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
             return nullptr;
         }
         vertex_program = std::move(*vp);
+        vertex_compiled = {};
     }
     if (!vertex_program) return nullptr;
+    if (const CompiledProgram* c = vertex_compiled[points ? 1 : 0]) return c;
     const shader::VertexProgram& vp = *vertex_program;
     std::vector<u32> ucode;
     for (const auto& in : vp.instructions) ucode.insert(ucode.end(), in.words.begin(), in.words.end());
     const std::string key = std::format("vp:{:016x}:{}", vp.hash, points ? 1 : 0);
-    if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) return &it->second;
+    if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) {
+        return vertex_compiled[points ? 1 : 0] = &it->second;
+    }
 
     shader::VpOptions options;
     options.point_size = points;
@@ -181,8 +185,8 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     if (!compiled) return nullptr;
     compiled->ucode = std::move(ucode);
     auto [it, inserted] = programs.insert_or_assign(key, std::move(*compiled));
-    (void)inserted;
-    return &it->second;
+    if (!inserted) forget_program_lookups(); // the key's program changed under the lookups that hold it
+    return vertex_compiled[points ? 1 : 0] = &it->second;
 }
 
 const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& state, const shader::FpOptions& options,
@@ -212,8 +216,12 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     // its first instruction (a copy that writes a program writes its start).
     before_access(*ea, entry.program.ucode_length ? entry.program.ucode_length : 16, false);
     const u64 epoch = check_epoch();
-    const bool redecode = (state.dirty_bits & dirty::kFragmentProgram) || entry.program.instructions.empty() ||
-        (entry.checked != epoch && tracker.is_dirty(entry.watch));
+    // Decoded again when its bytes changed: checked once per epoch, and whenever the program is set again (a game that
+    // writes a new program over the old one between draws of one batch sets it again). GTA V sets one nearly every
+    // draw: decoding it each time, and looking its compile up again, was most of what the RSX thread spent on programs
+    // (D-109).
+    const bool redecode = entry.program.instructions.empty() ||
+        (((state.dirty_bits & dirty::kFragmentProgram) || entry.checked != epoch) && tracker.is_dirty(entry.watch));
     entry.checked = epoch;
     state.dirty_bits &= ~dirty::kFragmentProgram;
     if (redecode) {
@@ -228,10 +236,14 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
         entry.address = *ea;
         entry.program = std::move(*fp);
         entry.watch = tracker.watch(*ea, entry.program.ucode_length);
+        entry.compiled.clear();
     }
     const shader::FragmentProgram& fp = entry.program;
     *program_out = &fp;
     program_ea = *ea;
+    for (const auto& [o, c] : entry.compiled) {
+        if (o == options) return c;
+    }
 
     std::vector<u32> ucode;
     for (const auto& in : fp.instructions) ucode.insert(ucode.end(), in.words.begin(), in.words.end());
@@ -244,7 +256,11 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
         if (fp.texture_mask & (1u << t)) opt += std::format(".{}{}", t, static_cast<u32>(options.texture_kind[t]));
     }
     const std::string key = std::format("fp:{:016x}:{}", fp.hash, opt);
-    if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) return &it->second;
+    const auto remember = [&](const CompiledProgram* c) {
+        if (entry.compiled.size() < 8) entry.compiled.emplace_back(options, c);
+        return c;
+    };
+    if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) return remember(&it->second);
 
     const shader::TranslateResult tr = shader::translate_fragment_program(fp, options);
     if (!tr.ok) {
@@ -255,8 +271,14 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     if (!compiled) return nullptr;
     compiled->ucode = std::move(ucode);
     auto [it, inserted] = programs.insert_or_assign(key, std::move(*compiled));
-    (void)inserted;
-    return &it->second;
+    if (!inserted) forget_program_lookups(); // the key's program changed under the lookups that hold it
+    return remember(&it->second);
+}
+
+void MetalBackend::Impl::forget_program_lookups()
+{
+    for (auto& [ea, e] : fragment_programs) e.compiled.clear();
+    vertex_compiled = {};
 }
 
 id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgram& vp, const CompiledProgram& fp,

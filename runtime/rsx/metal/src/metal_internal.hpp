@@ -127,11 +127,16 @@ struct PipelineKey {
     bool operator<(const PipelineKey& o) const;
 };
 
+struct CompiledProgram;
+
 struct FragmentProgramEntry {
     u32 address = 0;
     shader::FragmentProgram program;
     WriteTracker::Watch watch{};
     u64 checked = ~0ull; // as CachedTexture::checked
+    // What the program compiled to with these options, until it is decoded again (D-109): the lookup by hash and
+    // ucode is not repeated every draw.
+    std::vector<std::pair<shader::FpOptions, const CompiledProgram*>> compiled;
 };
 
 // ---- the backend --------------------------------------------------------------------------------------------------
@@ -228,7 +233,7 @@ struct MetalBackend::Impl {
         pass_end_reason = kEndOther;
     }
     u64 report_flips = 0, report_draws = 0, report_passes = 0, report_gpu_ns = 0, report_readback_ns = 0;
-    u64 report_readbacks = 0, report_deferred = 0, report_conflicts = 0;
+    u64 report_readbacks = 0, report_deferred = 0, report_conflicts = 0, report_texture_checks = 0, report_texture_bytes = 0;
     __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
     u32 visibility_next = 0;
     bool zpass_on = false;
@@ -269,6 +274,8 @@ struct MetalBackend::Impl {
     std::unordered_map<u32, id<MTLRenderPipelineState>> blit_pipelines; // by destination MTLPixelFormat
     std::unordered_map<u32, FragmentProgramEntry> fragment_programs; // by guest EA
     std::optional<shader::VertexProgram> vertex_program;             // decoded at the last dirty VP
+    std::array<const CompiledProgram*, 2> vertex_compiled{};          // it compiled, without and with point size (D-109)
+    void forget_program_lookups();                                   // a program key now names another program
     std::vector<id<MTLTexture>> outputs;
     u32 next_output = 0;
 

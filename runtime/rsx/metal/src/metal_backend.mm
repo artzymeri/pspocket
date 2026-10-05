@@ -1287,14 +1287,19 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             m.report_pass_ends[i] = m.pass_ends[i];
         }
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
-                           "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them",
+                           "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
+                           "{:.0f} texture checks ({:.2f} MB hashed)",
             m.report_flips, static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n,
             static_cast<double>(m.stats.draws - m.report_draws) / n,
             static_cast<double>(m.stats.render_passes - m.report_passes) / n, ends,
             static_cast<double>(m.stats.readbacks - m.report_readbacks) / n,
             static_cast<double>(m.stats.deferred_readbacks - m.report_deferred) / n,
             static_cast<double>(m.stats.deferred_conflicts - m.report_conflicts) / n,
-            static_cast<double>(m.stats.readback_wait_ns - m.report_readback_ns) / 1e6 / n);
+            static_cast<double>(m.stats.readback_wait_ns - m.report_readback_ns) / 1e6 / n,
+            static_cast<double>(m.stats.texture_checks - m.report_texture_checks) / n,
+            static_cast<double>(m.stats.texture_check_bytes - m.report_texture_bytes) / 1048576.0 / n);
+        m.report_texture_checks = m.stats.texture_checks;
+        m.report_texture_bytes = m.stats.texture_check_bytes;
         m.report_readback_ns = m.stats.readback_wait_ns;
         m.report_readbacks = m.stats.readbacks;
         m.report_deferred = m.stats.deferred_readbacks;

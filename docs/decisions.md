@@ -1663,6 +1663,27 @@ GPU: 9.3 ms a frame (run 079).
 - Test: the D-104 yield test checks the thread's backoff state instead of a 2 ms bound, which a loaded machine
   overran.
 
+## D-109 · 2026-10-05 · SPU images and shader programs found again without hashing them again
+
+A profile of the first mission at 30 fps (run 081, `sample`, 10 s) showed 1.3 cores busy: the SPU workers about 95%
+of a core, the RSX thread 18%, the game's PPU threads under 10%.
+- **SPU images**: every job and module load hashed the whole image (`ps_spu_hash64`, one lane) and searched the
+  registry linearly under its lock: 363 samples. Each worker now keeps the images it identified (256, direct-mapped by
+  guest address, size and LS address) with a four-lane content hash, four times as fast; the same bytes at the same
+  place are the same program. Only lifted programs are kept, and only while the registry is unchanged
+  (`ps_spu_registry_generation`, bumped by every register and unregister). 30 samples.
+- **Shader programs**: the compile a fragment program maps to, per set of translation options, is kept with the
+  decoded program (and the vertex program's with it), instead of building its words and a string key every draw. A
+  fragment program set again is decoded again only when its bytes changed, checked by its watch (it was decoded on
+  every set). GTA V copies its fragment programs with their constants patched for most draws, so most still change;
+  what is left is under 1% of a core.
+- **Texture checks** are counted in the per-frame report: 560 to 780 a frame in the mission, 33 to 40 MB hashed, about
+  1 ms of the RSX thread. Write protection would make them free, but host code that writes guest memory through the
+  kernel (`read()` into a guest buffer) would get EFAULT instead of a fault the tracker can handle: not done.
+- Tests: an image loaded again is the program found before unless its bytes or the registry changed; draws reuse a
+  program's compile until the CPU rewrites it; a program the RSX rewrites between two draws of one batch and sets again
+  is decoded again.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

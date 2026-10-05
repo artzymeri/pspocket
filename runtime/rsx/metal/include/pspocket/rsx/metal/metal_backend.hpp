@@ -87,6 +87,8 @@ struct BackendStats {
     u64 deferred_readbacks = 0; // of the readbacks, those the RSX copied once the GPU had them, without waiting (D-107)
     u64 deferred_conflicts = 0; // RSX accesses that waited for a deferred copy that touches the same memory
     u64 gpu_copies = 0;         // NV0039 copies of render targets done on the GPU (D-107)
+    u64 texture_checks = 0;     // cached textures checked against guest memory (a content hash, D-104)
+    u64 texture_check_bytes = 0; // the bytes those checks hashed
     u64 depth_conversions = 0; // depth buffers converted on the GPU for a texture that reads them (D-088)
     u64 color_conversions = 0; // colour targets converted on the GPU for a texture of another format (D-098)
     u64 occlusion_reports = 0; // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) answered from the GPU's counters (D-102)

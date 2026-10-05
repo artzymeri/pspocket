@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -99,6 +100,60 @@ void dump_seed(u64 hash, u32 ls_start, u32 pc)
 }
 
 const ps_spu_program* identify_hashed(u64 hash, u8* base, const SpuImage& image);
+
+// ---- identifications again (D-109)
+//
+// Jobs and modules load from the same guest addresses thousands of times a second, and each load hashed its whole
+// image and searched the registry under its lock (3.6% of a core in run 080's profile). An image found before, at the
+// same guest address, size and local store address, with the same bytes by a hash four times as fast (four lanes, as
+// the RSX's texture checks), is the program found then. Only lifted programs are kept: an image without one goes the
+// whole way each time, as before. Per worker thread, so no lock.
+struct KnownImage {
+    u32 guest = 0, size = 0, ls_start = 0;
+    u64 check = 0, hash = 0;
+    u64 registry = 0; // ps_spu_registry_generation when it was found: a program unregistered since is not used
+    const ps_spu_program* program = nullptr;
+};
+constexpr u32 kKnownImages = 256;
+thread_local std::array<KnownImage, kKnownImages> t_known{};
+
+u64 content_check(const u8* data, usize size)
+{
+    constexpr u64 kPrime = 0x100000001b3ull;
+    u64 h0 = 0xcbf29ce484222325ull, h1 = 0x9e3779b97f4a7c15ull, h2 = 0xc2b2ae3d27d4eb4full, h3 = 0x165667b19e3779f9ull;
+    usize i = 0;
+    for (; i + 32 <= size; i += 32) {
+        u64 w[4];
+        std::memcpy(w, data + i, 32);
+        h0 = (h0 ^ w[0]) * kPrime;
+        h1 = (h1 ^ w[1]) * kPrime;
+        h2 = (h2 ^ w[2]) * kPrime;
+        h3 = (h3 ^ w[3]) * kPrime;
+    }
+    u64 h = h0 ^ std::rotl(h1, 17) ^ std::rotl(h2, 31) ^ std::rotl(h3, 47);
+    for (; i < size; i++) h = (h ^ data[i]) * kPrime;
+    return h ^ size;
+}
+
+// identify_hashed, by way of the images found before; *hash gets the image's program hash.
+const ps_spu_program* identify(u8* base, const SpuImage& image, u64* hash)
+{
+    const u8* bytes = base + image.guest;
+    const u64 check = content_check(bytes, image.size);
+    const u64 registry = ps_spu_registry_generation();
+    KnownImage& k = t_known[((image.guest >> 4) ^ (image.size >> 2) ^ image.ls_start) % kKnownImages];
+    if (k.program && k.registry == registry && k.guest == image.guest && k.size == image.size &&
+        k.ls_start == image.ls_start && k.check == check) {
+        g_attached.fetch_add(1, std::memory_order_relaxed);
+        if (hash) *hash = k.hash;
+        return k.program;
+    }
+    const u64 h = ps_spu_hash64(bytes, image.size);
+    const ps_spu_program* program = identify_hashed(h, base, image);
+    if (program) k = {image.guest, image.size, image.ls_start, check, h, registry, program};
+    if (hash) *hash = h;
+    return program;
+}
 
 // ---- modules (D-079)
 //
@@ -390,8 +445,7 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
             log_modified(ctx->ls + r.ls_start, base + r.ea_start, size, r.ls_start, r.ea_start);
             return nullptr;
         }
-        r.hash = ps_spu_hash64(base + r.ea_start, size);
-        r.program = identify_hashed(r.hash, base, {ImageKind::Module, r.ea_start, r.ls_start, size, pc});
+        r.program = identify(base, {ImageKind::Module, r.ea_start, r.ls_start, size, pc}, &r.hash);
         if (r.program) g_modules.fetch_add(1, std::memory_order_relaxed);
     }
     if (r.program) {
@@ -489,10 +543,7 @@ void forget_module_runs(SPUContext& ctx)
     reset(modules_for(&ctx));
 }
 
-const ps_spu_program* identify_program(u8* base, const SpuImage& image)
-{
-    return identify_hashed(ps_spu_hash64(base + image.guest, image.size), base, image);
-}
+const ps_spu_program* identify_program(u8* base, const SpuImage& image) { return identify(base, image, nullptr); }
 
 void attach_program(SPUContext& ctx, u8* base, const SpuImage& image)
 {

@@ -1338,6 +1338,74 @@ TEST_CASE("metal e2e: copies that touch nothing deferred run at once; a write ov
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the CPU's blue
 }
 
+TEST_CASE("metal e2e: draws reuse a fragment program's compile until the program is rewritten (D-109)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+    for (u32 i = 0; i < kW * kH; i++) e.put_local32(kTexOffset + i * 4, 0xff0000ffu); // blue texels
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kTexOffset, tex::A8R8G8B8, kW * 4);
+    draw_triangle(b);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(e.failures.empty());
+    const u64 compiled = e.backend->stats().programs_compiled;
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // red
+
+    // The CPU writes another program at the same address: the next batch decodes and compiles it.
+    e.put_local_bytes(kFpOffset, fp_texture());
+    auto c = e.at(b.offset());
+    draw_triangle(c);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().programs_compiled == compiled + 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the texture's blue
+}
+
+TEST_CASE("metal e2e: a fragment program rewritten between two draws of one batch, then set again, is decoded again (D-109)")
+{
+    // Setting the program again no longer decodes it again by itself, only when its bytes changed.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+    for (u32 i = 0; i < kW * kH; i++) e.put_local32(kTexOffset + i * 4, 0xff0000ffu); // blue texels
+    const std::vector<u8> textured = fp_texture();
+    REQUIRE(textured.size() % 4 == 0);
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kTexOffset, tex::A8R8G8B8, kW * 4);
+    draw_triangle(b);
+    // NV308A writes the textured program over it, word by word (Y32: the words as they are).
+    const u32 words = static_cast<u32>(textured.size() / 4);
+    b.method(m::NV3062_SET_CONTEXT_DMA_IMAGE_DESTIN, loc::kDmaFrameBuffer);
+    b.method(m::NV3062_SET_COLOR_FORMAT, {11, (0x1000u << 16) | 0x1000u, 0, kFpOffset});
+    b.method(m::NV308A_POINT, {0, words, words});
+    for (u32 i = 0; i < words; i++) b.method(m::NV308A_COLOR + i, ps_ld32(textured.data() + i * 4));
+    set_fragment_program(b, kFpOffset, 0x40);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the texture's blue
+}
+
 TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")
 {
     REQUIRE_METAL();

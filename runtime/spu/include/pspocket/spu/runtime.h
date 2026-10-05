@@ -62,6 +62,9 @@ void ps_spu_register_program(ps_spu_program* program);
 void ps_spu_unregister_program(ps_spu_program* program);
 /* The registered program with this key: hash, code start and size; a relocatable program matches any code start. */
 const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, uint32_t code_size);
+/* Changes whenever a program is registered or unregistered: what a caller remembered from ps_spu_find_program holds
+ * while it stays the same (D-109). */
+uint64_t ps_spu_registry_generation(void);
 
 /* Selects the lifted program for the LS image now in ctx->ls: hashes [code_start, code_start + size) and attaches
  * the registered program with that key. Returns it, or NULL (logs the hash: CLAUDE.md rule 5; the interpreter

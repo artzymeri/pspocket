@@ -92,6 +92,39 @@ TEST_CASE("SPU programs: a load attaches the lifted program with the image's key
     ps_spu_unregister_program(&program);
 }
 
+TEST_CASE("SPU programs: an image loaded again is the program found before, unless its bytes or the registry changed (D-109)",
+    "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    for (u32 i = 0; i < kSize; i++) base[kGuest + i] = static_cast<u8>(i * 11 + 5);
+    const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
+    ps_spu_program program{"spu_test_again", ps_spu_hash64(base + kGuest, kSize), kLs, kSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr, nullptr};
+    ps_spu_register_program(&program);
+    Spu spu(base);
+    const hle::spurs::SpuImage job{ImageKind::Job, kGuest, kLs, kSize, kLs};
+    const hle::SpuProgramStats before = hle::spu_program_stats();
+
+    for (int i = 0; i < 3; i++) CHECK(hle::spurs::identify_program(base, job) == &program);
+    base[kGuest + kSize - 1] ^= 0x80; // another job binary at the same address
+    CHECK(hle::spurs::identify_program(base, job) == nullptr);
+    base[kGuest + kSize - 1] ^= 0x80;
+    CHECK(hle::spurs::identify_program(base, job) == &program);
+    CHECK(hle::spu_program_stats().attached - before.attached == 4);
+
+    // Unregistered, it is not found again; another program with the key is.
+    ps_spu_unregister_program(&program);
+    CHECK(hle::spurs::identify_program(base, job) == nullptr);
+    ps_spu_program again = program;
+    again.name = "spu_test_again_2";
+    ps_spu_register_program(&again);
+    CHECK(hle::spurs::identify_program(base, job) == &again);
+    ps_spu_unregister_program(&again);
+}
+
 TEST_CASE("SPU programs: a relocatable program attaches wherever its image sits (D-081)", "[hle][spu]")
 {
     GuestMemory mem;

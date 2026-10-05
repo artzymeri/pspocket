@@ -104,6 +104,7 @@ struct FpOptions {
     u32 texcoord_2d_mask = 0; // NV4097_SET_TEX_COORD_CONTROL bit 0 per unit: z = 0, w = 1/w
     bool alpha_test = false;
     bool flat_colors = false;
+    bool operator==(const FpOptions&) const = default;
 };
 
 struct MslShader {
