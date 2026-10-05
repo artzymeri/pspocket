@@ -2201,6 +2201,36 @@ lv2/sys_net.cpp, cellHttp.cpp, cellSsl.cpp).
   reset) for a socket closed with unread data, ECONNREFUSED for a full backlog; sys_net_get_sockinfo_ex's fourth
   argument taken as flags.
 
+## D-142 · 2026-10-05 · The iPhone app opens on a game library in landscape; Self-test and Metal move behind Settings
+
+The app opened on three tabs: a Game tab with one disc image picked in Files, Self-test and Metal. It now opens on a
+full-screen landscape game library, the user's design ("PSPocket Game Library", 956x440 pt on an iPhone 17 Pro Max),
+locked to landscape (OrientationLock and Info.plist). Settings (the gear, or Menu on a controller) holds where the
+games go, Self-test and Metal; `-tab selftest|metal` and `-autorun` open them at launch, without the intro.
+- **The games:** every .iso in Documents/Games (Files > On My iPhone > PSPocket > Games, made at launch and watched,
+  so a copy appears by itself), and the ones added with Add Game from anywhere else, kept as security-scoped bookmarks
+  in Application Support. The single picked image of before joins once. Title ID and title from ps_game_probe_disc;
+  the executable decrypted on the phone as before (D-121), one disc at a time.
+- **Play time:** last played and seconds played per title ID in Application Support, from ps_game_get_stats while
+  the game runs; the library sorts by last played and shows "Last played today · 14 h 32 min" or "Not played yet".
+- **Covers:** GameTDB's coverM (350x408) fetched at run time into Caches, never into the repository (CLAUDE.md rule
+  1); before it arrives, or without a network, the disc's ICON0.PNG (ps_game_read_disc_file, new); else the title.
+- **Layout and motion as designed:** the focused cover 148x172 at 76 pt with the others at 0.75 to its right, bottoms
+  at 396 (curve .16,1,.3,1, 320 ms); title, play time and a white Play capsule above; the controller chip, Add and
+  Settings in Liquid Glass at the top right (a frosted fallback before iOS 26); the left, bottom and top scrims. The
+  background is the focused cover: 446x520 with a radial fade and a 12 s zoom, three blurred copies drifting in screen
+  blend, 160 rising motes and a sweep every 6 s, crossfading in 700 ms with a 1.18x, brighter start on a new focus.
+  The blurred copies are made once per cover with Core Image; the motion is a function of the clock at 60 Hz.
+- **Input:** a controller's d-pad or left stick moves the focus (again after 380 ms, then every 130 ms), A plays, B
+  cancels, X is Add Game, Menu is Settings; while it was the last input, button glyph hints and a focus ring show,
+  and a touch hides them. Touch: tap a cover to focus it, tap it again to play, swipe the row (110 pt a step).
+- **Intro** (3.3 s, skipped by a tap or a button): the app icon's mark in white from a blur, "PSPocket" tightening,
+  a blue bloom and a line; at 1.7 s the library builds in (background 1.18x to 1, covers from +560 pt 70 ms apart,
+  the title at 380 ms, the top bar at 700 ms).
+- **Booting:** Play shows the boot overlay (cover, an indeterminate bar, the minute-to-first-screens line); the boot
+  starts 1.2 s later, or when the executable is ready, and Cancel (○) works until then: a running game cannot be torn
+  down yet, so Cancel goes once the game's threads run. The overlay stays over the game's screen until its first frame.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

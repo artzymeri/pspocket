@@ -438,6 +438,29 @@ extern "C" int ps_game_probe_disc(const char* iso_path, char* title_id, size_t t
     return 0;
 }
 
+extern "C" int ps_game_read_disc_file(const char* iso_path, const char* path, void* buffer, size_t buffer_size,
+    size_t* size, char* error, size_t error_size)
+{
+    const auto fail = [&](const std::string& why) {
+        if (error && error_size) std::snprintf(error, error_size, "%s", why.c_str());
+        return 1;
+    };
+    if (size) *size = 0;
+    if (!iso_path || !path) return fail("no image or path");
+    std::string message;
+    const auto image = loader::open_disc_image(iso_path, nullptr, &message);
+    if (!image) return fail(message.empty() ? "no image" : message);
+    const auto file = image->open(path);
+    if (!file) return fail(std::string("no ") + path + " on the disc");
+    const u64 n = file->size();
+    if (size) *size = static_cast<size_t>(n);
+    if (buffer && buffer_size) {
+        const usize take = static_cast<usize>(std::min<u64>(n, buffer_size));
+        if (!file->read(0, buffer, take)) return fail(std::string("reading ") + path + " failed");
+    }
+    return 0;
+}
+
 extern "C" void ps_game_set_pad(const ps_game_pad* pad)
 {
     if (!g_session || !g_session->hle || !pad) return;

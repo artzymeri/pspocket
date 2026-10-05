@@ -1,65 +1,5 @@
 import SwiftUI
-import UniformTypeIdentifiers
 import UIKit
-
-/// The game tab: pick the game's disc image in Files and boot it. Once the game runs, RootView shows GameScreen
-/// full screen in landscape instead of the tabs.
-struct GameView: View {
-    @Environment(GameModel.self) private var game
-    @State private var picking = false
-
-    var body: some View {
-        VStack(spacing: 14) {
-            VStack(spacing: 4) {
-                Text(game.title ?? "No game chosen").font(.title2.bold())
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
-            }
-            GameLayerView(screen: game.screen)
-                .aspectRatio(1152.0 / 640.0, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-            if game.decrypting {
-                ProgressView("Decrypting the game's EBOOT.BIN…").font(.footnote)
-            } else if let problem = game.problem {
-                Text(problem).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
-            }
-            HStack(spacing: 12) {
-                Button {
-                    picking = true
-                } label: {
-                    Label("Choose ISO", systemImage: "folder")
-                }
-                .buttonStyle(.bordered)
-                Button {
-                    game.boot()
-                } label: {
-                    Label("Boot", systemImage: "play.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!game.canBoot)
-            }
-            Label(game.controllerName.map { "\($0) connected" } ?? "No controller: on-screen buttons",
-                  systemImage: game.controllerName == nil ? "hand.tap" : "gamecontroller.fill")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Text("The game's code runs translated ahead of time: about a minute from Boot to the first screens.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Spacer(minLength: 0)
-        }
-        .padding()
-        .fileImporter(isPresented: $picking, allowedContentTypes: Self.discTypes) { result in
-            if case .success(let url) = result { game.pickedISO(url) }
-        }
-    }
-
-    private static let discTypes: [UTType] = [UTType(filenameExtension: "iso"), .diskImage, .data].compactMap { $0 }
-
-    private var subtitle: String {
-        if let id = game.titleID { return "\(id) · \(game.isoName ?? "")" }
-        return game.isoName ?? "Choose the game's .iso in Files"
-    }
-}
 
 /// The running game, full screen: its frames scaled to fit, the frame rate in a corner, the on-screen buttons over them
 /// while no controller is connected, and (double tap) a small status and log overlay.
@@ -99,6 +39,9 @@ struct GameScreen: View {
             Text(String(format: "%.0f s · %llu frames · %.1f fps · %@", game.seconds, game.flips, game.fps,
                         game.controllerName ?? "on-screen buttons"))
                 .font(.caption.bold())
+            if let problem = game.problem {
+                Text(problem).font(.caption2).foregroundStyle(.orange)
+            }
             Text(game.logTail.split(separator: "\n").suffix(8).joined(separator: "\n"))
                 .font(.system(size: 9, design: .monospaced))
                 .lineLimit(8)

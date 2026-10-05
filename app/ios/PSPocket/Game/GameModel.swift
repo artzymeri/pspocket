@@ -4,26 +4,22 @@ import Observation
 import QuartzCore
 import UIKit
 
-/// The game tab's state: the disc image the user picked in Files (remembered across launches), the files the game
-/// needs in the app's Documents, the running game (pspocket/platform/game.h) and its controller: a connected game
-/// controller (DualShock 4, DualSense, ...) through GameController, else the on-screen buttons.
+/// The running game (pspocket/platform/game.h) and its controller: a connected game controller (DualShock 4,
+/// DualSense, ...) through GameController, else the on-screen buttons. The library (LibraryModel) picks the disc image
+/// and the executable; while no game runs, the controller drives the library instead (menuInput).
 ///
 /// Documents layout (Files > On My iPhone > PSPocket):
+///   Games/                     the user's disc images (LibraryModel)
 ///   game/<TITLE_ID>/EBOOT.elf  the game's executable pushed from the Mac (`scripts/ios.sh push-game`); one decrypted
-///                              here from the disc when it is picked (D-121) goes to Library/Application Support/
-///                              pspocket-games/<TITLE_ID>/EBOOT.elf
+///                              here from the disc (D-121) goes to Library/Application Support/pspocket-games/<TITLE_ID>/
 ///   dev_flash/                 system files the game loads itself, from the user's firmware (D-067)
 ///   hdd0/                      the game's /dev_hdd0: game data, saves, trophies
 ///   game.log                   the last run's log
 @Observable
 final class GameModel {
-    private(set) var isoName: String?
-    private(set) var titleID: String?
-    private(set) var title: String?
-    private(set) var problem: String?
-    /// The disc's EBOOT.BIN is being decrypted into game/<TITLE_ID>/EBOOT.elf (D-121).
-    private(set) var decrypting = false
     private(set) var running = false
+    /// A warning from the boot (no dev_flash), shown with the game's info.
+    private(set) var problem: String?
     private(set) var flips: UInt64 = 0
     private(set) var seconds = 0.0
     /// Frames the game presented per second, over the last refresh (half a second).
@@ -31,138 +27,43 @@ final class GameModel {
     private(set) var logTail = ""
     /// The connected game controller's name, or nil (the on-screen buttons show then).
     private(set) var controllerName: String?
+    /// While no game runs, the controller's state goes here (the library's menu input).
+    @ObservationIgnored var menuInput: ((GCExtendedGamepad) -> Void)?
+    /// Seconds of play since the last call, every half second while the game runs (the library's play time).
+    @ObservationIgnored var onPlayed: ((TimeInterval) -> Void)?
 
-    /// The view whose CAMetalLayer shows the game's frames. One instance for the whole run: SwiftUI moves it between
-    /// the setup screen and the full-screen game, and the game keeps presenting into its layer.
+    /// The view whose CAMetalLayer shows the game's frames: one instance for the whole run.
     @ObservationIgnored let screen = GameLayerUIView()
 
-    @ObservationIgnored private var isoURL: URL?
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var touch1: UInt16 = 0
     @ObservationIgnored private var touch2: UInt16 = 0
     @ObservationIgnored private var controllerPad = ps_game_pad.atRest
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
 
-    private static let bookmarkKey = "gameISOBookmark"
-
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
 
     init() {
         screen.backgroundColor = .black
-        restoreISO()
         watchControllers()
     }
 
-    // MARK: the disc image
-
-    /// A file the user picked in Files: keep access to it (it stays where it is: a disc image is 20 GB) and
-    /// remember it for the next launch.
-    func pickedISO(_ url: URL) {
-        guard url.startAccessingSecurityScopedResource() || FileManager.default.isReadableFile(atPath: url.path) else {
-            problem = "Can't open \(url.lastPathComponent)"
-            return
-        }
-        if let data = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
-            UserDefaults.standard.set(data, forKey: Self.bookmarkKey)
-        }
-        useISO(url)
-    }
-
-    private func restoreISO() {
-        guard let data = UserDefaults.standard.data(forKey: Self.bookmarkKey) else { return }
-        var stale = false
-        guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
-        else { return }
-        _ = url.startAccessingSecurityScopedResource()
-        if stale, let fresh = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
-            UserDefaults.standard.set(fresh, forKey: Self.bookmarkKey)
-        }
-        useISO(url)
-    }
-
-    private func useISO(_ url: URL) {
-        isoURL = url
-        isoName = url.lastPathComponent
-        titleID = nil
-        title = nil
-        problem = nil
-        let path = url.path
-        DispatchQueue.global(qos: .userInitiated).async {
-            var id = [CChar](repeating: 0, count: 32)
-            var name = [CChar](repeating: 0, count: 256)
-            var error = [CChar](repeating: 0, count: 512)
-            let status = ps_game_probe_disc(path, &id, id.count, &name, name.count, &error, error.count)
-            let result = (status, String(cString: id), String(cString: name), String(cString: error))
-            DispatchQueue.main.async {
-                guard self.isoURL == url else { return }
-                if result.0 == 0 {
-                    self.titleID = result.1
-                    self.title = result.2
-                    self.problem = nil
-                    if self.executableURL == nil { self.decryptExecutable(isoPath: path, titleID: result.1, for: url) }
-                } else {
-                    self.problem = "Not a PS3 game disc: \(result.3)"
-                }
-            }
-        }
-    }
-
-    /// Where executables decrypted on the phone go: a folder the app makes itself. Documents/game/ was made by the
-    /// Mac's copies (`scripts/ios.sh push-game`), and the app may not write in it ("Permission denied").
-    static var decryptedGames: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("pspocket-games")
-    }
-
-    /// The disc's executable decrypted on the phone, with the keys the app carries (D-121), into
-    /// Library/Application Support/pspocket-games/<TITLE_ID>/EBOOT.elf: then any disc picked here can boot.
-    private func decryptExecutable(isoPath: String, titleID: String, for url: URL) {
-        let folder = Self.decryptedGames.appendingPathComponent(titleID)
-        let elf = folder.appendingPathComponent("EBOOT.elf")
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        decrypting = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            var error = [CChar](repeating: 0, count: 512)
-            let status = ps_disc_decrypt_executable(isoPath, elf.path, &error, error.count)
-            let message = String(cString: error)
-            DispatchQueue.main.async {
-                self.decrypting = false
-                guard self.isoURL == url else { return }
-                self.problem = status == 0 ? nil : "Could not decrypt the game's EBOOT.BIN: \(message)"
-            }
-        }
-    }
-
-    /// The decrypted executable for the picked disc: Documents/game/<TITLE_ID>/EBOOT.elf (pushed from the Mac), else
-    /// the one decrypted here, else Documents/game/EBOOT.elf.
-    var executableURL: URL? {
-        let game = Self.documents.appendingPathComponent("game")
-        var candidates: [URL] = []
-        if let titleID {
-            candidates.append(game.appendingPathComponent(titleID).appendingPathComponent("EBOOT.elf"))
-            candidates.append(Self.decryptedGames.appendingPathComponent(titleID).appendingPathComponent("EBOOT.elf"))
-        }
-        candidates.append(game.appendingPathComponent("EBOOT.elf"))
-        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
-    }
-
-    var canBoot: Bool { !running && !decrypting && titleID != nil && executableURL != nil }
-
     // MARK: running
 
-    func boot() {
-        guard canBoot, let isoURL, let elf = executableURL else { return }
+    /// Boots the game from its disc image and decrypted executable; nil, or why it could not start.
+    func boot(iso: URL, elf: URL) -> String? {
+        guard !running else { return "A game is already running" }
         let layer = screen.metalLayer
         let docs = Self.documents
         let flash = docs.appendingPathComponent("dev_flash")
         let hasFlash = FileManager.default.fileExists(atPath: flash.path)
         var error = [CChar](repeating: 0, count: 1024)
-        let status = isoURL.path.withCString { iso in
+        let status = iso.path.withCString { isoPath in
             elf.path.withCString { elfPath in
                 docs.appendingPathComponent("hdd0").path.withCString { hdd0 in
                     flash.path.withCString { flashPath in
                         docs.appendingPathComponent("game.log").path.withCString { log in
-                            var options = ps_game_options(elf_path: elfPath, iso_path: iso, hdd0_dir: hdd0,
+                            var options = ps_game_options(elf_path: elfPath, iso_path: isoPath, hdd0_dir: hdd0,
                                 flash_dir: hasFlash ? flashPath : nil, log_path: log,
                                 metal_layer: Unmanaged.passUnretained(layer).toOpaque())
                             return ps_game_boot(&options, &error, error.count)
@@ -171,16 +72,13 @@ final class GameModel {
                 }
             }
         }
-        if status != 0 {
-            problem = String(cString: error)
-            return
-        }
+        if status != 0 { return String(cString: error) }
         problem = hasFlash ? nil : "No dev_flash on this iPhone: the game's audio will fail (scripts/ios.sh push-game)"
         running = true
-        OrientationLock.landscape()
         sendPad()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refresh() }
         refresh()
+        return nil
     }
 
     private func refresh() {
@@ -189,6 +87,7 @@ final class GameModel {
         running = stats.running != 0
         if stats.seconds > seconds {
             fps = Double(stats.flips - min(flips, stats.flips)) / (stats.seconds - seconds)
+            if running { onPlayed?(stats.seconds - seconds) }
         }
         flips = stats.flips
         seconds = stats.seconds
@@ -270,7 +169,7 @@ final class GameModel {
             gamepad.valueChangedHandler = { [weak self] gamepad, _ in self?.controllerMoved(gamepad) }
             controllerMoved(gamepad)
         }
-        sendPad()
+        if running { sendPad() }
     }
 
     /// A PlayStation layout through GameController: A cross, B circle, X square, Y triangle, Menu (Options) start,
@@ -300,7 +199,7 @@ final class GameModel {
             for (i, v) in levels.enumerated() { bytes[i] = v }
         }
         controllerPad = pad
-        sendPad()
+        if running { sendPad() } else { menuInput?(g) }
     }
 
     /// The controller's state and the on-screen buttons together.
@@ -356,9 +255,9 @@ final class GameLayerUIView: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 }
 
-/// Which orientations the app allows: everything until a game runs, then landscape only (AppDelegate).
+/// Which orientations the app allows: landscape, from the library on (AppDelegate; D-142).
 enum OrientationLock {
-    static var mask: UIInterfaceOrientationMask = .all
+    static var mask: UIInterfaceOrientationMask = .landscape
 
     static func landscape() {
         mask = .landscape

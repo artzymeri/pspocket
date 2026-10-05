@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// Lets the running game lock the app to landscape (OrientationLock).
+/// Keeps the app in landscape: the library and the game (OrientationLock).
 final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?)
         -> UIInterfaceOrientationMask {
@@ -16,6 +16,7 @@ struct PSPocketApp: App {
     @State private var metal = MetalLoadModel()
     @State private var device = DeviceStatus()
     @State private var game = GameModel()
+    @State private var library = LibraryModel()
 
     init() {
         // Line-buffered stdout, so `devicectl device process launch --console` (and `simctl launch --console-pty`)
@@ -31,43 +32,61 @@ struct PSPocketApp: App {
                 .environment(metal)
                 .environment(device)
                 .environment(game)
+                .environment(library)
                 .onAppear {
                     // A test host: long thermal runs and headless autoruns must not be cut short by auto-lock.
                     UIApplication.shared.isIdleTimerDisabled = true
+                    library.attach(game)
                 }
         }
     }
 }
 
+/// The game library in landscape (D-142); the running game full screen in its place; the boot overlay over both
+/// until the game's first frame. Self-test and Metal are behind Settings (`-tab selftest|metal` and `-autorun` open
+/// them at launch, without the intro).
 struct RootView: View {
-    enum Tab: Hashable { case game, selfTest, metal }
-
     @Environment(SelfTestModel.self) private var selfTest
     @Environment(GameModel.self) private var game
-    @State private var tab: Tab = LaunchOptions.initialTab == "metal" ? .metal
-        : LaunchOptions.initialTab == "selftest" || LaunchOptions.autorun ? .selfTest : .game
+    @Environment(LibraryModel.self) private var library
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var settingsPath: [SettingsView.Page] = RootView.launchPage.map { [$0] } ?? []
+    @State private var showSettings = RootView.launchPage != nil
 
-    var body: some View {
-        if game.running {
-            GameScreen() // full screen, landscape
-        } else {
-            tabs
-        }
+    private static var launchPage: SettingsView.Page? {
+        if LaunchOptions.initialTab == "metal" { return .metal }
+        if LaunchOptions.initialTab == "selftest" || LaunchOptions.autorun { return .selfTest }
+        return nil
     }
 
-    private var tabs: some View {
-        TabView(selection: $tab) {
-            GameView()
-                .tabItem { Label("Game", systemImage: "gamecontroller") }
-                .tag(Tab.game)
-            SelfTestView()
-                .tabItem { Label("Self-test", systemImage: "checklist") }
-                .tag(Tab.selfTest)
-            MetalTabView()
-                .tabItem { Label("Metal", systemImage: "cube.transparent") }
-                .tag(Tab.metal)
+    var body: some View {
+        ZStack {
+            if game.running {
+                GameScreen()
+            } else {
+                LibraryView(settingsPath: $settingsPath, showSettings: $showSettings,
+                            skipIntro: Self.launchPage != nil)
+            }
+            if let boot = library.boot {
+                let entry = library.entries.first { $0.id == boot.entryID }
+                BootOverlay(cover: library.cover(for: entry), title: entry?.displayTitle ?? "",
+                            cancellable: boot.phase == .armed, pad: library.inputMode == .pad,
+                            cancel: { library.cancel() })
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.36), value: library.boot != nil)
+        .sheet(isPresented: $showSettings) { SettingsView(path: $settingsPath) }
+        .onChange(of: game.flips) { if game.flips > 0 { library.gameShowedFrames() } }
+        .onChange(of: scenePhase) {
+            switch scenePhase {
+            case .active: library.scheduleRescan()
+            case .background: library.save()
+            default: break
+            }
         }
         .task { selfTest.startAutorunIfRequested() }
+        .onAppear { OrientationLock.landscape() }
     }
 }
 
@@ -78,8 +97,8 @@ enum LaunchOptions {
     static let exitAfterAutorun = flag("-autorun-exit", env: "PSPOCKET_AUTORUN_EXIT")
     /// Run every probe at launch. `-autorun` or PSPOCKET_AUTORUN=1.
     static let autorun = exitAfterAutorun || flag("-autorun", env: "PSPOCKET_AUTORUN")
-    /// Tab shown at launch (the game by default): `-tab metal` or PSPOCKET_TAB=metal starts the Metal load right
-    /// away, `-tab selftest` shows the probes.
+    /// A page shown at launch over the library (Settings): `-tab metal` or PSPOCKET_TAB=metal starts the Metal load
+    /// right away, `-tab selftest` shows the probes.
     static let initialTab = value("-tab", env: "PSPOCKET_TAB")
     /// Metal load passes at launch (0...64): `-passes N` or PSPOCKET_PASSES=N.
     static let initialPasses = value("-passes", env: "PSPOCKET_PASSES").flatMap { Int($0) }

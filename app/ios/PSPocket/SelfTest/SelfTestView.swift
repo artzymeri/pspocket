@@ -7,8 +7,7 @@ struct SelfTestView: View {
     @State private var copied = false
 
     var body: some View {
-        NavigationStack {
-            List {
+        List {
                 Section("Build and device") {
                     Text(model.buildInfo)
                         .font(.caption.monospaced())
@@ -82,8 +81,7 @@ struct SelfTestView: View {
                     }
                 }
             }
-            .navigationTitle("Self-test")
-        }
+        .navigationTitle("Self-test")
     }
 }
 

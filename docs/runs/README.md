@@ -87,3 +87,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [084](084-gta5-flashes-mac.md) | 2026-10-05 | 25d64ec+ | M4 Mac, pspocket-boot, every frame saved | Characters flashing red or black reproduced: **the red and the black fixed** (D-119, D-120, D-122) |
 | [085](085-gta5-cpu-iphone-mac.md) | 2026-10-05 | cb10984+ | iPhone and M4 Mac, Time Profiler | The iPhone uses 5.8 of 6 cores, 4.6 of them SPU code; translated SPU calls save less: **SPU code -14%** on the Mac (D-127) |
 | [086](086-gta5-readbacks-mac.md) | 2026-10-05 | 6a3aa8f | M4 Mac, pspocket-boot --gpu metal | Texture readbacks in the walk **42 to 0** (D-137); a job chain stopped on an overwritten descriptor, without D-127 (D-138) |
+| [087](087-gta5-library-iphone.md) | 2026-10-05 | d32ccea+ | iPhone 17 Pro Max, library build | Start-of-play shader stalls: the RSX compiled **821 pipelines to 45** at the start of play (D-143); colour flicker reported |

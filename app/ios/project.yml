@@ -199,7 +199,8 @@ targets:
           GCC_OPTIMIZATION_LEVEL: "2"
           OTHER_CFLAGS: [$(inherited), -DNDEBUG]
 
-  # SwiftUI app: the game (pick its disc image in Files, boot it), self-test probes and a Metal output/pacing preview.
+  # SwiftUI app: the game library (D-142: the disc images in Documents/Games or added from Files) and the running
+  # game, with the self-test probes and a Metal output/pacing preview behind Settings.
   PSPocket:
     type: application
     platform: iOS

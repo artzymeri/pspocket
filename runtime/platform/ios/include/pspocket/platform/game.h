@@ -33,6 +33,14 @@ int ps_game_boot(const ps_game_options* options, char* error, size_t error_size)
 int ps_game_probe_disc(const char* iso_path, char* title_id, size_t title_id_size, char* title, size_t title_size,
     char* error, size_t error_size);
 
+/*
+ * A file of the disc image, by its path on the disc ("PS3_GAME/ICON0.PNG"): its size goes to *size, and as much of it
+ * as fits into `buffer` (NULL with 0 to ask for the size only). Returns 0, or non-zero with `error` set (no image, no
+ * such file, a read error). The library's covers fall back to the disc's ICON0.PNG with it.
+ */
+int ps_game_read_disc_file(const char* iso_path, const char* path, void* buffer, size_t buffer_size, size_t* size,
+    char* error, size_t error_size);
+
 /* The virtual controller's state (port 0), as pspocket/hle/input.hpp's PadInput. */
 typedef struct ps_game_pad {
     /* CellPadData button[2]: 0x80 left, 0x40 down, 0x20 right, 0x10 up, 0x08 start, 0x04 R3, 0x02 L3, 0x01 select. */
