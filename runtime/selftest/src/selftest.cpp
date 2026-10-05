@@ -30,6 +30,9 @@ std::span<const Probe> all_probes()
         Probe{"ppu.interp", "PPU interpreter: checksum + recursive fib benchmark, MIPS", probe_ppu_interp},
         Probe{"ppu.lifted", "Lifted PPU code: same benchmark, speedup over the interpreter", probe_ppu_lifted},
         Probe{"codegen.dlopen", "Libraries made after the app was signed: signed, loaded and run (route B)", probe_codegen_dlopen},
+#if PSPOCKET_HAVE_CODEGEN
+        Probe{"codegen.compile", "C compiled, linked and signed on this device; translated code compiled (route B)", probe_codegen_compile},
+#endif
     };
     return probes;
 }

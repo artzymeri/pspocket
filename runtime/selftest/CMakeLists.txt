@@ -5,6 +5,11 @@ add_library(pspocket_selftest STATIC
     src/probes_codegen.cpp)
 target_include_directories(pspocket_selftest PUBLIC include PRIVATE src)
 target_link_libraries(pspocket_selftest PUBLIC pspocket::core PRIVATE pspocket::codesign)
+if(TARGET pspocket_codegen) # route B's compiler (D-151), with an LLVM build
+    target_link_libraries(pspocket_selftest PRIVATE pspocket::codegen)
+    target_compile_definitions(pspocket_selftest PRIVATE PSPOCKET_HAVE_CODEGEN=1
+        PSPOCKET_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+endif()
 target_compile_definitions(pspocket_selftest PRIVATE PSPOCKET_VERSION="${PROJECT_VERSION}")
 pspocket_set_warnings(pspocket_selftest)
 add_library(pspocket::selftest ALIAS pspocket_selftest)

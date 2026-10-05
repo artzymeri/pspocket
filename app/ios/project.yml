@@ -58,7 +58,9 @@ targets:
         includes: *compiled
         # The version stamp only where it is printed: as a target-wide define it changed every compile command with
         # each commit, so every build recompiled all of the game's translated code.
-        compilerFlags: ['-DPSPOCKET_VERSION=\"$(PSPOCKET_VERSION)\"', '-DPSPOCKET_GIT_HASH=\"$(PSPOCKET_GIT_HASH)\"']
+        compilerFlags: ['-DPSPOCKET_VERSION=\"$(PSPOCKET_VERSION)\"', '-DPSPOCKET_GIT_HASH=\"$(PSPOCKET_GIT_HASH)\"',
+                        '-DPSPOCKET_HAVE_CODEGEN=${PSPOCKET_HAVE_CODEGEN}',
+                        '-I$(PSPOCKET_ROOT)/runtime/codegen/include']
       - path: ../../runtime/disc/src
         name: disc
         group: Runtime
@@ -68,6 +70,19 @@ targets:
         name: codesign
         group: Runtime
         includes: *compiled
+      # The compiler on the device (route B, D-151): clang and lld in process. scripts/ios.sh points
+      # PSPOCKET_CODEGEN_SRC at runtime/codegen/src when scripts/build-llvm-ios.sh has built LLVM for iOS.
+      - path: ${PSPOCKET_CODEGEN_SRC}
+        name: codegen
+        group: Runtime
+        optional: true
+        includes: *compiled
+        # -fno-rtti as LLVM is built; -w: LLVM's headers are not ours to keep warning-free. Per file, like every
+        # setting here only some files need: a target-wide change recompiles all of the game's translated code.
+        compilerFlags: [-fno-rtti, -w, '-I$(PSPOCKET_ROOT)/runtime/codegen/include',
+                        '-I${PSPOCKET_LLVM_SRC_DIR}/llvm/include',
+                        '-I${PSPOCKET_LLVM_SRC_DIR}/clang/include', '-I${PSPOCKET_LLVM_SRC_DIR}/lld/include',
+                        '-I${PSPOCKET_LLVM_IOS_DIR}/include', '-I${PSPOCKET_LLVM_IOS_DIR}/tools/clang/include']
       # What runs a game (the Game tab, pspocket/platform/game.h): the same components as pspocket-boot on the Mac.
       - path: ../../runtime/spu/src
         name: spu
@@ -220,6 +235,13 @@ targets:
         buildPhase: resources
         group: Generated
         optional: true
+      # What the compiler on the device reads (D-151): clang's headers, runtime/codegen/sysroot, the runtime's ABI
+      # headers, as a folder named codegen in the app (scripts/ios.sh assembles it).
+      - path: ${PSPOCKET_CODEGEN_BUNDLE_SRC}
+        type: folder
+        buildPhase: resources
+        group: Generated
+        optional: true
     dependencies:
       - target: PSPocketRuntime
       - sdk: libc++.tbd
@@ -248,7 +270,9 @@ targets:
           - $(PSPOCKET_ROOT)/runtime/disc/include
         # Load every object of the runtime, so code that registers itself (static initialisers, tables in
         # generated code) is never dropped by the static linker.
-        OTHER_LDFLAGS: [$(inherited), -force_load, $(BUILT_PRODUCTS_DIR)/libPSPocketRuntime.a]
+        # The device's compiler (D-151): build/llvm-ios's static libraries, as one string Xcode splits at spaces.
+        OTHER_LDFLAGS: [$(inherited), -force_load, $(BUILT_PRODUCTS_DIR)/libPSPocketRuntime.a,
+                        '${PSPOCKET_LLVM_LDFLAGS}']
 
 schemes:
   PSPocket:

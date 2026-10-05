@@ -305,10 +305,36 @@ cmd_gen() {
         say "no recorded shaders (pspocket-boot --shader-cache): the app compiles them as the game meets them"
         game_shaders="$ROOT/inventory/no-recorded-shaders/shaders"
     fi
+    # Route B's compiler on the phone (D-151): LLVM, clang and lld built for iOS by scripts/build-llvm-ios.sh, and
+    # the folder the app compiles against (clang's headers, runtime/codegen/sysroot, the runtime's ABI headers).
+    local llvm_ios="$ROOT/build/llvm-ios" llvm_src="" have_codegen=0 codegen_src="$ROOT/runtime/codegen/none"
+    local codegen_bundle="$IOS_BUILD/no-codegen/codegen" llvm_ldflags=""
+    if [ -f "$llvm_ios/lib/libclangFrontend.a" ] && [ -f "$llvm_ios/lib/liblldMachO.a" ]; then
+        llvm_src="$(sed -n 's/^CMAKE_HOME_DIRECTORY:[A-Z]*=//p' "$llvm_ios/CMakeCache.txt")/.." # llvm-project
+        have_codegen=1
+        codegen_src="$ROOT/runtime/codegen/src"
+        codegen_bundle="$IOS_BUILD/codegen-bundle/codegen"
+        rm -rf "$IOS_BUILD/codegen-bundle"
+        mkdir -p "$codegen_bundle/clang/include" "$codegen_bundle/include/pspocket"
+        # Of clang's own headers (15 MB, every target's), the ones arm64 C needs: 2 MB.
+        local clang_inc
+        clang_inc="$(ls -d "$llvm_ios"/lib/clang/*/include | head -1)"
+        (cd "$clang_inc" && cp arm_neon.h arm_fp16.h arm_bf16.h arm_vector_types.h arm_acle.h std*.h __std*.h \
+            float.h limits.h iso646.h ptrauth.h "$codegen_bundle/clang/include/")
+        cp -R "$ROOT/runtime/codegen/sysroot" "$codegen_bundle/sysroot"
+        for d in ppu spu core; do cp -R "$ROOT/runtime/$d/include/pspocket/$d" "$codegen_bundle/include/pspocket/"; done
+        llvm_ldflags="$(ls "$llvm_ios"/lib/*.a | tr '\n' ' ')"
+        say "compiler on the device: $(ls "$llvm_ios"/lib/*.a | wc -l | tr -d ' ') LLVM libraries ($llvm_ios), headers in $codegen_bundle"
+    else
+        mkdir -p "$codegen_bundle"
+        say "no compiler on the device (scripts/build-llvm-ios.sh builds it)"
+    fi
     say "xcodegen: $PROJECT"
     PSPOCKET_HOST_BUILD_DIR="$HOST_BUILD" PSPOCKET_PPU_SRC="$ppu_src" PSPOCKET_GAME_SPU_SRC="$game_spu" \
         PSPOCKET_HAVE_GAME_SPU="$have_game_spu" PSPOCKET_GAME_PPU_SRC="$game_ppu" PSPOCKET_HAVE_GAME_PPU="$have_game_ppu" \
-        PSPOCKET_GAME_SHADERS_SRC="$game_shaders" "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
+        PSPOCKET_GAME_SHADERS_SRC="$game_shaders" PSPOCKET_HAVE_CODEGEN="$have_codegen" PSPOCKET_CODEGEN_SRC="$codegen_src" \
+        PSPOCKET_CODEGEN_BUNDLE_SRC="$codegen_bundle" PSPOCKET_LLVM_SRC_DIR="$llvm_src" PSPOCKET_LLVM_IOS_DIR="$llvm_ios" \
+        PSPOCKET_LLVM_LDFLAGS="$llvm_ldflags" "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
 }
 
 # scripts/gate.sh (D-149): nothing reaches the phone that does worse on the Mac than what is there. Exit 2 (no game
