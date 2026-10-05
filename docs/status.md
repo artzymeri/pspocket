@@ -2,6 +2,7 @@
 
 2026-10-05, after run 083 (D-115) and build 131 (D-117). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
 onwards matter most now) and the latest `docs/runs/` entries. Keep this file current when the picture changes.
+Where each part can improve, with the numbers behind it, is `docs/improve.md` (updated after every run).
 
 ## The project
 

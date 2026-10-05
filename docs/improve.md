@@ -1,0 +1,101 @@
+# Where to improve, part by part
+
+A living list (the user's ask, 2026-10-05: "keep notes where to improve every part"): for each part, what the runs
+show, what to try, and its state. Numbers come from the runs in docs/runs; an item that lands points to its D-number
+and is struck through. Rule 8 holds: an optimization starts from a measurement and ends with one from the same scene.
+
+Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA V, D-144 and D-145 installed;
+2 performance and 4 efficiency cores, a GPU budget of 33 ms a frame at 30 fps).
+
+## SPU and SPURS: the biggest cost in play
+
+- **Seen:** in the heavier stretches of play (17:17:30-50) the main SPURS instance (5 SPUs) was 70 to 85% busy: EDGE/GFX
+  7.6 to 9.4 s of SPU time per 5 s, dependency_spu 2.2 to 4.0 s, GraphicsMain 2.8 to 3.5 s, AudioEngine 1.3 to 2.2 s.
+  The second instance (1 SPU, "Secondary") was 85 to 90% busy. fps fell to 14-28 there; the GPU had room.
+- **Try:**
+  - Profile EDGE/GFX's translated code on the Mac (Instruments, run 085's method) and make its hottest loops faster in
+    the SPU lifter: shuffles and float work as NEON (D-127 cut SPU code by 14% this way).
+  - EDGE geometry (culling, skinning) is a Sony library many PS3 games ship: a native NEON implementation of its jobs,
+    recognised by hash, would serve every such game (goal: any ISO). Large; the payoff is the biggest cost in play.
+  - Six SPU threads, the PPU threads and the RSX thread share six cores, four of them efficiency cores: measure the
+    context switches and try fewer host threads for the 5-SPU instance (the native scheduler runs any workload on
+    any thread, D-037), with QoS that keeps the SPU threads on the performance cores.
+- **State:** open.
+
+## Audio
+
+- **Seen:** when the SPUs are saturated the sound runs at 0.52 to 0.80 of its pace (17:17:31-46: 15 to 95 periods of
+  5 s skipped because the game was late, 400+ waits for the game): AudioEngine is one SPURS workload among the others.
+  Earlier (run 087) the shader cache's threads did the same to it.
+- **Try:** the native scheduler picks AudioEngine first when it has work (a priority boost for the workload that
+  feeds cellAudio); a larger host buffer while the pace falls, so a late block stretches less.
+- **State:** open.
+
+## RSX and Metal: the GPU
+
+- **Seen:** 25 ms of GPU time per frame at 1,504 draws and 83 render passes (55 ended by a target change, 19 by a
+  target copy) in the heaviest stretch; 17 to 21 ms in most of play. The GPU is close to its budget too.
+- **Try:** fewer render passes (a target copy that does not need to end the pass; passes merged when the targets
+  repeat); on a tile GPU every pass end writes its targets to memory: load and store actions that skip what the next
+  pass does not read, memoryless depth where it is never sampled. Metal System Trace on the phone (needs the user)
+  to see where the 25 ms go.
+- **Multisampling:** surfaces with AA modes 3 and 5 render with one sample (logged): edges alias. Metal has
+  multisample textures; resolve where the game reads them.
+- **Blending:** ADD_SIGNED (0xf006) draws as ADD, as RPCS3 does (VKGSRender.cpp): only the log line says otherwise.
+- **State:** open.
+
+## Shaders
+
+- **Seen:** the cache makes all 13,067 pipelines in 30 s at launch (D-143's order, 3 threads; D-145). In play, a
+  pipeline the cache has never seen is compiled on the RSX thread: 11 to 12 at a time at 17:15:58 and 17:16:43 (0.9
+  to 1.2 s of compiling in 300 frames), 87 in boot 5 of run 088 (5.4 s).
+- **Try:**
+  - Bring the phone's pipelines.txt back into the app's seed (scripts/ios.sh can pull the Caches directory), so a new
+    install starts with what the phone has seen.
+  - Compile a new pipeline off the RSX thread and draw without it for the frames that takes (RPCS3's asynchronous
+    shader mode); needs a decision on what to show meanwhile.
+- **Archives:** off on the phone (D-145): iOS keeps compiled pipelines between launches itself, and the archives cost
+  gigabytes. After an iOS update its cache is empty and the first launch compiles everything (84 s and more, run 087).
+- **State:** open.
+
+## Write tracking (textures)
+
+- **Seen:** 37 to 56 write faults per frame, 0.02 MB hashed; no stale textures since D-144 (the user: flicker gone).
+- **Try:** nothing needed now. A guest page freed and committed again while watched keeps its tracker state (a
+  texture there could go stale): drop the watches of a page the guest frees.
+- **State:** fine.
+
+## Memory
+
+- **Seen:** 0.86 GB at the loading screens, 1.6 to 1.7 GB in play, of about 6.4 GB iOS allows (D-145's status line).
+- **Try:** nothing needed now; keep reading the status line in every session.
+- **State:** fine.
+
+## PPU
+
+- **Seen:** no per-thread measurement on the phone yet: the status lines show the SPUs, the GPU and the sound, not
+  how busy the PPU threads are.
+- **Try:** a status line every 5 s with each guest thread's CPU time (PPU threads, SPU threads, the RSX thread), so the
+  bottleneck in a stretch is read off the log instead of guessed.
+- **State:** open (measurement first).
+
+## Heat
+
+- **Seen:** nominal in this session's first five minutes; "fair" after a minute of play in run 088.
+- **Try:** keep the heat level in every session's notes; lower work (fewer threads, a frame cap) only if it reaches
+  "serious".
+- **State:** watch.
+
+## The iOS app (library)
+
+- **Seen:** the layout "in the first second" with the covers too high (run 087), not seen since; the layout log
+  records the size at launch and on every change.
+- **Try:** catch it in the log and fix it.
+- **State:** open.
+
+## Other games
+
+- **Seen:** L.A. Noire (BLES00933) boots and stops on about 77 unimplemented imports (cellSync mutexes, cellGcmSys flip
+  and system mode, cellSpurs workloads, sceNpInit, ...).
+- **Try:** implement them from its inventory, as for GTA V (D-139 to D-141).
+- **State:** open.
