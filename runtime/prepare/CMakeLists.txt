@@ -3,10 +3,10 @@
 if(NOT TARGET pspocket_codegen)
     return()
 endif()
-add_library(pspocket_prepare STATIC src/prepare.cpp)
+add_library(pspocket_prepare STATIC src/prepare.cpp src/spu.cpp)
 target_include_directories(pspocket_prepare PUBLIC include)
 target_link_libraries(pspocket_prepare PUBLIC pspocket::codesign
-    PRIVATE pspocket::codegen pspocket::game pspocket::recomp_ppu pspocket::recomp_common)
+    PRIVATE pspocket::codegen pspocket::game pspocket::recomp_ppu pspocket::recomp_spu pspocket::recomp_common)
 target_compile_definitions(pspocket_prepare PRIVATE PSPOCKET_VERSION="${PROJECT_VERSION}")
 pspocket_set_warnings(pspocket_prepare)
 add_library(pspocket::prepare ALIAS pspocket_prepare)

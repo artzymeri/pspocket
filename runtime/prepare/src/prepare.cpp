@@ -1,4 +1,5 @@
 #include "pspocket/prepare/prepare.hpp"
+#include "pspocket/prepare/spu.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -155,7 +156,8 @@ bool read_manifest(const std::string& game_dir, Manifest* out)
     return !m.abi_hash.empty();
 }
 
-bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why)
+bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why,
+    const std::string& spu_images_dir)
 {
     Manifest m;
     std::error_code ec;
@@ -177,6 +179,14 @@ bool library_is_current(const std::string& game_dir, const std::string& executab
     if (m.executable_sha256 != executable_sha256) {
         say("prepared from another executable (an update?): preparing it again");
         return false;
+    }
+    if (!spu_images_dir.empty()) { // SPU programs the game loaded that the library has not got yet
+        const auto made = fs::last_write_time(fs::path(game_dir) / "manifest.json", ec);
+        for (const auto& e : fs::directory_iterator(spu_images_dir, ec))
+            if (e.path().extension() == ".bin" && !ec && e.last_write_time(ec) > made) {
+                say("the game has met SPU programs to translate: updating it");
+                return false;
+            }
     }
     say(m.translator_hash == std::format("{:016x}", ps_game_translator_hash)
             ? "ready"
@@ -227,10 +237,13 @@ Result prepare_game(const Options& o)
     // GTA V: 28.6 MB of executable, 6 s to translate on the M4, about 2,400 cost-seconds of PPU code to compile, and
     // 1,900 of SPU code from 84 MB of lifted C (runs 094-095). Refined once the files are known.
     translate_estimate = 0.25 * exe_mb;
-    double spu_c_mb = 0;
+    double spu_c_mb = 0; // lifted SPU C: given, or about 0.33 MB per saved image (GTA V: 84 MB from 265 images)
     if (!o.spu_dir.empty())
         for (const auto& e : fs::recursive_directory_iterator(o.spu_dir, ec))
             if (e.is_regular_file() && e.path().extension() == ".c") spu_c_mb += static_cast<double>(e.file_size()) / 1e6;
+    if (o.spu_dir.empty() && !o.spu_images_dir.empty())
+        for (const auto& e : fs::directory_iterator(o.spu_images_dir, ec))
+            if (e.path().extension() == ".bin") spu_c_mb += 0.33;
     compile_estimate = (85 * exe_mb * o.prior_rates[0] + 23 * spu_c_mb * o.prior_rates[1]) / workers;
     auto left_after_translation = [&] { return compile_estimate + link_estimate + sign_estimate; };
     report(Progress::Phase::Translating, translate_estimate + left_after_translation(), 0, 0,
@@ -266,6 +279,27 @@ Result prepare_game(const Options& o)
     }
     if (cancelled()) return fail("cancelled");
 
+    // 1b. The SPU programs the game's runs saved, lifted (a fraction of a second each).
+    fs::path spu_dir = o.spu_dir;
+    if (spu_dir.empty() && !o.spu_images_dir.empty() && fs::exists(o.spu_images_dir, ec)) {
+        const auto t2 = Clock::now();
+        size_t images = 0;
+        for (const auto& e : fs::directory_iterator(o.spu_images_dir, ec))
+            if (e.path().extension() == ".bin") images++;
+        if (images > 0) {
+            report(Progress::Phase::Translating, 0.2 * static_cast<double>(images) + left_after_translation(), 0, 0,
+                std::format("Translating {} SPU programs", images));
+            spu_dir = dir / "spu";
+            SpuLiftReport spu;
+            std::string error;
+            if (!lift_spu_images(o.spu_images_dir, spu_dir.string(), o.spu_logs, &spu, &error))
+                return fail("the SPU programs: " + error);
+            r.spu_programs = spu.lifted;
+        }
+        r.spu_seconds = since(t2);
+    }
+    if (cancelled()) return fail("cancelled");
+
     // 2. Compile: the PPU units, the SPU programs, the library's entry.
     const codegen::TranslatedCodeSettings& settings = codegen::translated_code_settings();
     std::vector<std::string> ppu_args = settings.ppu_args, spu_args = settings.spu_args;
@@ -278,8 +312,8 @@ Result prepare_game(const Options& o)
         for (const auto& e : fs::directory_iterator(ppu, ec))
             if (e.path().extension() == ".c") jobs.push_back(job_for(e.path(), false, headers, ppu_args, spu_args));
     }
-    if (!o.spu_dir.empty()) {
-        for (const auto& d : fs::directory_iterator(o.spu_dir, ec)) {
+    if (!spu_dir.empty()) {
+        for (const auto& d : fs::directory_iterator(spu_dir, ec)) {
             if (d.is_regular_file() && d.path().extension() == ".c") {
                 jobs.push_back(job_for(d.path(), true, "", ppu_args, spu_args)); // game_spu.c
             } else if (d.is_directory()) {

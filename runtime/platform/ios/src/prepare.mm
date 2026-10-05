@@ -8,6 +8,7 @@
 #include <pthread.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -79,6 +80,17 @@ std::optional<pspocket::codesign::SigningKey> signing_key(std::string* error)
     return pspocket::codesign::key_from_p12(p12, password, chain, error);
 }
 
+// Where the app keeps what a game met that no translation had (game.mm, D-117/D-118): its SPU images and misses.
+std::string coverage_dir(const std::string& title_id)
+{
+    std::string id;
+    for (const char c : title_id)
+        if (std::isalnum(static_cast<unsigned char>(c))) id += c;
+    NSString* support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)
+                            .firstObject;
+    return support ? std::string(support.UTF8String) + "/pspocket-coverage/" + (id.empty() ? "unknown" : id) : "";
+}
+
 void set_status(const pspocket::prepare::Progress& p)
 {
     using Phase = pspocket::prepare::Progress::Phase;
@@ -112,7 +124,9 @@ extern "C" int ps_prepare_check(const char* game_dir, const char* executable, ch
     if (!game_dir || !executable) return 0;
     const std::string sha = pspocket::prepare::file_sha256(executable);
     std::string reason = "the executable cannot be read";
-    const bool ok = !sha.empty() && pspocket::prepare::library_is_current(game_dir, sha, &reason);
+    // The title is the game folder's name (Application Support/pspocket-games/<TITLE_ID>).
+    const std::string spu = coverage_dir(fs::path(game_dir).filename().string()) + "/spu";
+    const bool ok = !sha.empty() && pspocket::prepare::library_is_current(game_dir, sha, &reason, spu);
     copy_text(why, why_size, reason);
     return ok ? 1 : 0;
 #else
@@ -172,6 +186,10 @@ extern "C" int ps_prepare_start(const char* executable, const char* title_id, co
     o.toolchain.include_dirs = {codegen + "/include"};
     o.toolchain.entry_source = codegen + "/library/library_entry.c";
     o.toolchain.cpu = "native"; // compiled on this phone, for this phone
+    // The SPU programs the game met without a translation (saved while it ran), with the misses for more entries.
+    const std::string coverage = coverage_dir(title_id);
+    o.spu_images_dir = coverage + "/spu";
+    o.spu_logs = {coverage + "/spu-misses.log"};
     // Every core; compiles start while their predicted peaks fit in half of what iOS lets the app have now.
     o.workers = std::max(1u, std::thread::hardware_concurrency());
     o.memory_mb = static_cast<double>(os_proc_available_memory()) / 1048576.0 * 0.5;

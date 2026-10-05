@@ -2,7 +2,8 @@
 
 // Preparing a game (route B, stage 4, D-154): from the game's decrypted executable to its game library, on the phone
 // ("Preparing game…") and on the Mac (pspocket-prepare), with the same code. The steps:
-//   1. translate: every PPU function of the executable to C (recomp/ppu, as ppu-lift --elf)
+//   1. translate: every PPU function of the executable to C (recomp/ppu, as ppu-lift --elf), and the SPU programs runs
+//      saved (recomp/spu, as scripts/lift-spu.sh)
 //   2. compile: every file with the device's compiler, the slowest first, objects kept (codegen::build_library)
 //   3. link, then sign the library (the user's development identity on the phone, ad hoc on the Mac)
 //   4. a manifest beside it: what it was made from and by, so a later launch knows whether it is still current
@@ -43,6 +44,10 @@ struct Options {
     std::string game_dir;     // the game's folder: game.dylib, manifest.json, and the work (ppu/, objects/)
     std::string ppu_dir;      // translated PPU code to use instead of translating (Mac experiments), or empty
     std::string spu_dir;      // lifted SPU programs (scripts/lift-spu.sh's output) to include, or empty
+    // SPU images runs saved (pspocket-boot --spu-dump, the app while the game runs): lifted into game_dir/spu, which
+    // keeps their entries as seeds for the next time (D-155), and included. Used when spu_dir is empty.
+    std::string spu_images_dir;
+    std::vector<std::string> spu_logs; // runs' logs: where execution left lifted SPU code, more seeds
     Toolchain toolchain;
     unsigned workers = 0;     // 0: one per core
     double memory_mb = 0;     // compiles start while their predicted peaks fit; 0: no limit
@@ -64,7 +69,8 @@ struct Result {
     std::string error;
     std::string library;        // game_dir/game.dylib
     double seconds = 0;         // all of it
-    double translate_seconds = 0, compile_seconds = 0, link_seconds = 0, sign_seconds = 0;
+    double translate_seconds = 0, spu_seconds = 0, compile_seconds = 0, link_seconds = 0, sign_seconds = 0;
+    size_t spu_programs = 0;
     size_t files_compiled = 0, files_kept = 0;
     double rates[3] = {1.0, 1.0, 1.0}; // real compile seconds per predicted second here, per kind: the next priors
 };
@@ -85,7 +91,9 @@ bool read_manifest(const std::string& game_dir, Manifest* out);
 // Whether game_dir holds a library this build can load for this executable: made for this runtime (ABI hash), for
 // this CPU, from an executable with this SHA-256. A different translator hash leaves it usable (`*why` says a newer
 // translation exists).
-bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why);
+// With spu_images_dir, also whether the game saved SPU images since the library was made (programs to add to it).
+bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why,
+    const std::string& spu_images_dir = {});
 
 // The SHA-256 of a file, in hex ("" if it cannot be read).
 std::string file_sha256(const std::string& path);

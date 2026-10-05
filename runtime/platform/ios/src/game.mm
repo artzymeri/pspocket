@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
@@ -259,6 +260,10 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     // the build has them (scripts/ios.sh), run its SPURS tasks, jobs and the modules they load (D-079, D-081).
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
     const std::string game_library = o->game_library ? o->game_library : "";
+    bool spu_modules = false; // hle::enable_spu_modules registers the worker's stubs: once
+    auto enable_spu_modules = [&spu_modules] {
+        if (!std::exchange(spu_modules, true)) hle::enable_spu_modules();
+    };
 
     lv2::Config cfg = s->exe->kernel_config();
     Session* raw = s.get();
@@ -371,6 +376,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         if (!cov_ec) {
             hle::set_spu_dump_dir(coverage + "/spu");
             ps_spu_set_miss_log((coverage + "/spu-misses.log").c_str());
+            enable_spu_modules(); // the images SPURS loads are only seen with the module hooks in (as --spu-dump)
         }
     }
     std::error_code ec;
@@ -418,7 +424,13 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report); r != lv2::CELL_OK) {
         return fail(error, error_size, std::string("loading the executable failed: ") + lv2::error_name(r));
     }
-    bool library_spu = false; // the game library brought the SPU programs
+#if PSPOCKET_HAVE_GAME_SPU
+    // The lifted SPU programs built into the app (scripts/ios.sh), first: a program is found by its code's hash, the
+    // first registered winning, so these (with the entries the Mac's runs collected, D-099) run where the library has
+    // the same program, and the library's fill in the ones the app lacks (D-155). Never for another game: the hash.
+    pspocket_game_spu_register();
+    enable_spu_modules();
+#endif
     if (!game_library.empty()) {
         // The game's translated code from its game library (route B, D-152), checked against this runtime and this
         // executable before anything in it runs.
@@ -426,18 +438,9 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         std::string why;
         if (!game::load_library(game_library, *s->memory, &loaded, &why))
             return fail(error, error_size, "the game library cannot run: " + why);
-        library_spu = loaded.library->spu_register != nullptr;
-        if (library_spu) hle::enable_spu_modules();
+        if (loaded.library->spu_register) enable_spu_modules();
         s->translated = loaded.library->ppu_function_count > 0;
     }
-#if PSPOCKET_HAVE_GAME_SPU
-    // The lifted SPU programs built into the app (scripts/ios.sh), unless the library brought its own: a library the
-    // phone made has none yet (D-154). They are found by their code's hash, so they never run for another game.
-    if (!library_spu) {
-        pspocket_game_spu_register();
-        hle::enable_spu_modules();
-    }
-#endif
 #if PSPOCKET_HAVE_GAME_PPU
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098).
     if (game_library.empty() &&

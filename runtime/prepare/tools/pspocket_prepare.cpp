@@ -2,12 +2,14 @@
 // compiled with the device's compiler into a game library, linked and signed (ad hoc here), with a manifest. The gate
 // then runs what the phone will run (scripts/gate.sh game --library DIR/game.dylib).
 //
-//   pspocket-prepare --title ID --exe EBOOT.elf --game-dir DIR [--ppu DIR] [--spu DIR] [-j N] [--memory MB]
+//   pspocket-prepare --title ID --exe EBOOT.elf --game-dir DIR [--ppu DIR] [--spu DIR | --spu-images DIR
+//                    [--spu-log FILE]...] [-j N] [--memory MB]
 //                    [--ppu-arg ARG]... [--spu-arg ARG]... [--mllvm OPT]... [--keep-sources] [--events FILE.csv]
 //                    [--quiet]
 //
 // --ppu uses translated PPU code (ppu-lift's output) instead of translating; --spu adds lifted SPU programs
-// (scripts/lift-spu.sh's output). Objects stay in DIR/objects, so a second run compiles only what changed.
+// (scripts/lift-spu.sh's output); --spu-images lifts the SPU images runs saved (pspocket-boot --spu-dump) into
+// DIR/spu, as the phone does, with --spu-log runs' logs for more entry points. Objects stay in DIR/objects, so a second run compiles only what changed.
 // --events records every file's start and end (time, kind, predicted cost, seconds), to try other estimates of the
 // time left on a real build; at the end the tool says how right its time left was.
 
@@ -21,6 +23,7 @@
 #include <vector>
 
 #include "pspocket/prepare/prepare.hpp"
+#include "pspocket/prepare/spu.hpp"
 
 namespace fs = std::filesystem;
 using namespace pspocket;
@@ -29,7 +32,8 @@ namespace {
 
 int usage()
 {
-    std::fputs("usage: pspocket-prepare --title ID --exe EBOOT.elf --game-dir DIR [--ppu DIR] [--spu DIR] [-j N]\n"
+    std::fputs("usage: pspocket-prepare --title ID --exe EBOOT.elf --game-dir DIR [--ppu DIR] [--spu DIR |\n"
+               "                        --spu-images DIR [--spu-log FILE]...] [-j N]\n"
                "                        [--memory MB] [--ppu-arg ARG]... [--spu-arg ARG]... [--mllvm OPT]...\n"
                "                        [--keep-sources] [--events FILE.csv] [--quiet]\n",
         stderr);
@@ -49,19 +53,22 @@ int main(int argc, char** argv)
 {
     prepare::Options o;
     std::string events_path;
-    bool quiet = false;
+    bool quiet = false, lift_spu_only = false;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
         const char* v = nullptr;
         if (a == "--quiet") quiet = true;
         else if (a == "--keep-sources") o.keep_sources = true;
+        else if (a == "--lift-spu-only") lift_spu_only = true;
         else if (!(v = value())) return usage();
         else if (a == "--title") o.title_id = v;
         else if (a == "--exe") o.executable = v;
         else if (a == "--game-dir") o.game_dir = v;
         else if (a == "--ppu") o.ppu_dir = v;
         else if (a == "--spu") o.spu_dir = v;
+        else if (a == "--spu-images") o.spu_images_dir = v;
+        else if (a == "--spu-log") o.spu_logs.emplace_back(v);
         else if (a == "-j") o.workers = static_cast<unsigned>(std::max(1, std::atoi(v)));
         else if (a == "--memory") o.memory_mb = std::atof(v);
         else if (a == "--ppu-arg") o.extra_ppu_args.emplace_back(v);
@@ -69,6 +76,19 @@ int main(int argc, char** argv)
         else if (a == "--mllvm") o.llvm_options.emplace_back(v);
         else if (a == "--events") events_path = v;
         else return usage();
+    }
+    if (lift_spu_only) { // only the SPU step: --spu-images into --game-dir/spu (comparing with lift-spu.sh)
+        if (o.spu_images_dir.empty() || o.game_dir.empty()) return usage();
+        prepare::SpuLiftReport rep;
+        std::string error;
+        if (!prepare::lift_spu_images(o.spu_images_dir, (fs::path(o.game_dir) / "spu").string(), o.spu_logs, &rep,
+                &error)) {
+            std::fprintf(stderr, "pspocket-prepare: %s\n", error.c_str());
+            return 1;
+        }
+        std::printf("lifted %zu SPU programs (%zu failed, %zu copies merged); seeds: %zu\n", rep.lifted, rep.failed,
+            rep.merged, rep.seeds);
+        return 0;
     }
     if (o.title_id.empty() || o.executable.empty() || o.game_dir.empty()) return usage();
 

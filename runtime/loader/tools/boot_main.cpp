@@ -43,7 +43,9 @@
 // jumps and every warning and error by shape (numbers as #).
 // --game-library FILE runs the game's translated code from a game library (route B, D-152: pspocket-prepare makes one
 // as the phone does) instead of the translation built into this program: its PPU functions and SPU programs, for the
-// executable it was made from only; a library made for another runtime or executable stops the run.
+// executable it was made from only; a library made for another runtime or executable stops the run. With
+// --builtin-spu the SPU programs built into this program run too, registered first (the app's way, D-155); without it
+// the library runs alone.
 // --dump-on-fault FILE writes the guest's committed memory below the RSX's local memory to FILE when a guest fault
 // ends the run, for offline analysis (game data: keep it in inventory/). The file is a sequence of blocks: a
 // big-endian u32 guest address, a u32 byte count, then the bytes. A fault in SPU code also writes that SPU's local
@@ -70,6 +72,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <pthread.h>
@@ -124,6 +127,7 @@ int usage()
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
+        "                     [--builtin-spu]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -653,6 +657,7 @@ int main(int argc, char** argv)
     bool audio = false;
     std::string spu_dump;
     std::string game_library; // --game-library (D-152)
+    bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the app's way)
     bool frame_jumps = false;
     std::string summary_path;
     const auto add_press = [&](std::string_view spec) {
@@ -736,6 +741,7 @@ int main(int argc, char** argv)
         else if (a == "--audio") audio = true;
         else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
         else if (a == "--game-library") { const char* v = value(); if (!v) return usage(); game_library = v; }
+        else if (a == "--builtin-spu") builtin_spu = true;
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
         else if (a == "--log") {
@@ -921,8 +927,17 @@ int main(int argc, char** argv)
         print_imports(hle);
         return 0;
     }
-    bool translated = false;  // the game's PPU code runs translated (built in or from a library)
-    bool library_spu = false; // the game library brought the SPU programs
+    bool translated = false; // the game's PPU code runs translated (built in or from a library)
+    bool spu_modules = !spu_dump.empty(); // hle::enable_spu_modules ran (it registers the worker's stubs: once)
+#if defined(PSPOCKET_HAVE_GAME_SPU)
+    // The lifted SPU programs built into this program, first: a program is found by its code's hash, the first
+    // registered winning, so a library's fill in only the ones built in lacks (as the app does, D-155). Without
+    // --builtin-spu a game library runs alone, to test what it holds.
+    if (game_library.empty() || builtin_spu) {
+        pspocket_game_spu_register();
+        if (!std::exchange(spu_modules, true)) hle::enable_spu_modules();
+    }
+#endif
     if (!game_library.empty()) {
         // The game's translated code from a game library (route B, D-152), checked against this runtime and this
         // executable before anything in it runs.
@@ -932,18 +947,9 @@ int main(int argc, char** argv)
             std::fprintf(stderr, "pspocket-boot: %s\n", error.c_str());
             return 70;
         }
-        library_spu = loaded.library->spu_register != nullptr;
-        if (library_spu) hle::enable_spu_modules();
+        if (loaded.library->spu_register && !spu_modules) hle::enable_spu_modules();
         translated = loaded.library->ppu_function_count > 0;
     }
-#if defined(PSPOCKET_HAVE_GAME_SPU)
-    // The lifted SPU programs built into this program, unless the library brought its own (one made on the phone has
-    // none yet, D-154). They are found by their code's hash, so they never run for another game.
-    if (!library_spu) {
-        pspocket_game_spu_register();
-        hle::enable_spu_modules();
-    }
-#endif
 #if defined(PSPOCKET_HAVE_GAME_PPU)
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098):
     // branches into it from the interpreter run it. A game library replaces it.
