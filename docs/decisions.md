@@ -2413,6 +2413,52 @@ Developer Mode on; no for TestFlight (Apple re-signs the app, and no developer p
   = 42. Route B goes ahead; games are delivered to the phone by cable or Xcode installs (the development profile), where
   the app signs what it translates. TestFlight (1c) is checked next; the research expects it to fail.
 
+## D-151 · 2026-10-05 · Route B's code generator: LLVM's clang and lld inside the app, compiling the lifters' C
+
+Stage 2 of route B (D-147): how the phone turns a game's code into ARM64. Two candidates: compile the C the lifters
+already write, with LLVM inside the app, or a new emitter from the lifters' IR straight to ARM64 (about 650 instruction
+forms, each with its own differential fuzz test under rule 3). Measured (runs 091, 092), LLVM wins on every count that
+matters now: it reuses the lifters and their fuzz tests unchanged, its code is the code the Mac builds and the gate
+checks, and the phone compiles fast enough.
+- **runtime/codegen (new):** `compile_c` runs clang's front end and AArch64 back end in process (iOS starts no other
+  programs) and `link_dylib` runs lld's Mach-O linker; LLVM 22.1.8 (RPCS3's copy) as static libraries,
+  `scripts/build-llvm-ios.sh` (AArch64 only, no tools). The phone has no SDK: the code compiles against clang's own
+  headers (3.3 MB of them, bundled in the app's codegen folder), `runtime/codegen/sysroot` (our own string.h, math.h and
+  a libSystem.tbd naming the symbols translated code calls) and the runtime's ABI headers. Flags as the builds':
+  -O2 (-O1 is no faster and no smaller), `-ffp-contract=off -fno-fast-math`, no stack protector.
+- **In process, unlike clang:** each compile on its own thread with clang's 8 MB stack (iOS gives threads 512 KB);
+  `DisableFree` off (the driver's `-disable-free` leaked each compile's AST and module); freed pages returned to iOS
+  after each compile (`malloc_zone_pressure_relief`); the compile job taken from clang's driver as `clang -c -o` makes
+  it (`clang::createInvocation` adds `-fsyntax-only`, which drops `-o`); lld asked for the signature's room
+  (`-adhoc_codesign`: it reserves one unasked only for macOS), which runtime/codesign then fills (D-150). LLVM's own
+  options (`-mllvm`) through `set_llvm_options`, process-wide, before compiles start.
+- **On the iPhone 17 Pro Max:** C compiled, linked, signed and loaded by the app, all on the phone (50 ms for a small
+  program). GTA V's code compiles as fast per core as on the M4: a 1.8 MB PPU unit in 1.6 s, its slowest SPU programs in
+  35-38 s; six compiles at once give 2.35 MB of C a second; 155 s of full load left the phone nominal. LLVM adds 66 MB
+  to the app's code.
+- **GTA V, one of the biggest PS3 executables, is about 14 minutes today** (823 MB of PPU C and 86 MB of SPU C; all of
+  it takes 8 minutes on the M4's ten cores with `pspocket-cc`, the same compiler as a Mac command). Where it goes and
+  what cuts it, to be measured against the game's speed before any is adopted (rule 8; stage 3 builds the game as a
+  library with this compiler on the Mac, so the gate measures what the phone will run):
+  - LLVM's SLP vectorizer on functions of huge blocks: one PPU unit takes 35 s with it, 3.3 s without; typical units
+    17% less. Its code is no smaller with it.
+  - The greedy register allocator's region growing on SPU functions that keep 90 vector registers live across
+    thousands of blocks: a budget of 1,000 (`-grow-region-complexity-budget`, LLVM's default 10,000) makes the slowest
+    program 2.3 times faster to compile and its code 30% smaller.
+  - The SPU analyzer copies into each function the code of other functions it branches or falls into: block starts
+    repeat 1.1-3.7 times in the 12 biggest programs.
+  - Every PPU unit parses the game's whole prototype list (85,401 lines, 0.22 s): per-unit prototypes save 12%.
+- **Memory:** a PPU unit peaks at +200 MB, a big SPU program at +500-900 MB, ten at once at 5.6 GB on the Mac. The
+  phone's preparation schedules by predicted memory, not by core count (stage 4).
+- **The user's ask for stage 4:** "Preparing game…" shows a loader with progress and an ETA that is accurate. Progress
+  and ETA count predicted cost, not files (a few files take most of the time): each file's cost from its size and its
+  largest functions, fitted on the Mac's per-file timings, scaled by the phone's own measured speed and corrected live
+  as files finish, by simulating the remaining schedule over the workers.
+- **Licence:** LLVM is Apache-2.0 WITH LLVM-exception, whose exception lets it combine with GPLv2 code (D-001), as RPCS3
+  does.
+- **Not chosen now:** a direct ARM64 emitter (kept as the option if phone preparation times miss the budget after the
+  fixes above), and emitting LLVM IR from the lifters instead of C (skips the front end: a later speed-up).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

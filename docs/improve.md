@@ -103,3 +103,25 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   and system mode, cellSpurs workloads, sceNpInit, ...).
 - **Try:** implement them from its inventory, as for GTA V (D-139 to D-141).
 - **State:** open.
+
+## The gate (D-149)
+
+- **Seen:** one walk failed on the fps floor (a single 5 s window at 19.8 fps at flip 2,400 while the Mac's GPU was in
+  its slow state, no wait for the GPU, nothing on the walk's path changed) and passed when run again (run 091).
+- **Try:** a lone fps-floor failure is run again once automatically; two in a row fail the gate. Keep a walk per
+  Flawless game as games get there (docs/compatibility.md).
+- **State:** open.
+
+## Preparing a game on the phone (route B, D-151)
+
+- **Seen (run 092):** GTA V's code takes about 14 minutes to compile on the iPhone at today's settings (8 on the M4's
+  ten cores). Two files cost minutes each: an SPU program with 22 near-copies of one big function, a PPU unit whose
+  one function is a few huge blocks. Big SPU programs peak at 0.5-0.9 GB each.
+- **Try, each measured against the game's speed through the gate:** -fno-slp-vectorize for PPU code (that unit 35 s
+  to 3.3 s, others 17% less); `-grow-region-complexity-budget=1000` for SPU code (2.3x faster, 30% less code); the SPU
+  analyzer stops at other functions' entries instead of copying them (block starts repeat up to 3.7 times); per-unit
+  prototypes instead of the 5.7 MB shared header (12%); clang built with PGO and LTO (Apple's is 1.4x faster than
+  ours on the same file); LLVM IR from the lifters instead of C (no front end). A scheduler that starts compiles by
+  predicted memory and keeps the biggest files on the performance cores; an ETA from predicted cost per file,
+  corrected live (the user asked for an accurate one).
+- **State:** open (measured; nothing adopted yet).
