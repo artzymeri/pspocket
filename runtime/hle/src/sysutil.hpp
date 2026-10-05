@@ -42,8 +42,8 @@ enum class MsgDialogSource : u8 { CellMsgDialog, CellSaveData, CellGame, SceNp, 
 // One at a time: while one is open the result is CELL_SYSUTIL_ERROR_BUSY. The dialog begins drawing (DRAWING_BEGIN to
 // the game's callbacks; when a system dialog draws already, that event's CELL_SYSUTIL_ERROR_BUSY is the result and
 // nothing opens) and stays open until it is closed. `callback` (a CellMsgDialogCallback descriptor, or 0) and
-// `userdata` are for the user's answer. There is no dialog UI yet, so nothing answers: only cellMsgDialogAbort closes
-// a dialog.
+// `userdata` are for the user's answer. There is no dialog UI yet, so nothing answers a dialog opened here: only
+// cellMsgDialogAbort closes one. (cellMsgDialogOpen2's own dialogs are answered at once: cellSysutil.cpp.)
 s32 open_msg_dialog(MsgDialogSource source, u32 type, std::string_view message, u32 callback, u32 userdata);
 
 } // namespace pspocket::hle

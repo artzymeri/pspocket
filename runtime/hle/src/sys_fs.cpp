@@ -1,23 +1,35 @@
 // sys_fs (libfs): the cellFs file API over lv2's file system syscalls. Reference: RPCS3
-// rpcs3/Emu/Cell/Modules/cellFs.cpp, where most functions forward to the syscall; the read/write-with-offset and
+// rpcs3/Emu/Cell/Modules/cellFs.cpp/.h, where most functions forward to the syscall; the read/write-with-offset and
 // allocate-area functions go through sys_fs_fcntl with the same argument blocks.
 //
 // Opens and stats are logged with their path and result (info; failures as warnings), so a boot log shows which
 // files the game asks for.
+//
+// Asynchronous reads (cellFsAio*) follow RPCS3's fs_aio_thread, which its HLE never starts (it logs "use LLE", for
+// the firmware's libfs): the first cellFsAioInit creates the AIO thread, an lv2 PPU thread whose entry is an internal
+// HLE function. cellFsAioRead queues a request and returns its ID at once; the AIO thread reads at the request's
+// offset without moving the file position, then calls the game's callback with the result, on itself.
 
+#include <cstring>
+#include <deque>
 #include <format>
+#include <mutex>
 #include <string>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
+#include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/lv2/kernel.hpp"
+#include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 
 namespace pspocket::hle {
 namespace {
 
 constexpr std::string_view kChan = "sys_fs";
+constexpr std::string_view kModule = "sys_fs";
 constexpr s32 CELL_FS_O_CREAT = 0100;
 constexpr s32 CELL_FS_S_IRUSR = 0400, CELL_FS_S_IWUSR = 0200;
 
@@ -184,6 +196,307 @@ s32 cellFsAllocateFileAreaWithoutZeroFill(PPUContext& ctx, u32 path, u64 size)
     return static_cast<s32>(ps_read32(base, ctrl.addr() + 0x20));
 }
 
+// RPCS3 cellFsFstat: sys_fs_fstat as it is.
+s32 cellFsFstat(PPUContext& ctx, u32 fd, u32 sb) { return lv2::sys_fs_fstat(thread_of(ctx), fd, sb); }
+
+// cellFsStReadFinish(fd): RPCS3 checks only that fd is an open file (CELL_EBADF otherwise) and returns CELL_OK; its
+// stream reads are a TODO. None of the other cellFsSt* functions is implemented here either, so no stream ever runs
+// that this would end. (sys_fs_fstat tells an open file from a directory or a free descriptor.)
+s32 cellFsStReadFinish(PPUContext& ctx, u32 fd)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    StackVar sb(ctx, t.kernel.base(), lv2::kCellFsStatSize);
+    if (lv2::sys_fs_fstat(t, fd, sb.addr()) == error(lv2::CELL_EBADF)) {
+        PS_LOG_WARN(kChan, "cellFsStReadFinish(fd {}): not an open file: CELL_EBADF", fd);
+        return error(lv2::CELL_EBADF);
+    }
+    PS_LOG_INFO(kChan, "cellFsStReadFinish(fd {}): no stream read was started (as in RPCS3, which doesn't implement "
+                       "them): CELL_OK",
+        fd);
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- free space
+
+constexpr u64 kGiB = 1ull << 30;
+constexpr u32 kHdd0BlockSize = 4096; // RPCS3's lv2_fs_mount_point table: /dev_hdd0's block size
+constexpr u64 kSectorSize = 512;     // the same: the sector size of every device that can have free space
+constexpr u32 kMaxMountPointLength = 31; // CELL_FS_MAX_MP_LENGTH
+
+struct GuestPath {
+    std::string text;    // up to the NUL, 1025 bytes at most
+    bool faulted = false; // ran into memory that is not guest memory first
+};
+
+GuestPath read_path(lv2::PpuThread& t, u32 addr)
+{
+    GuestPath p;
+    for (u32 i = 0; i <= 1024; i++) {
+        if (!guest_readable(t, addr + i, 1)) {
+            p.faulted = true;
+            break;
+        }
+        const char c = static_cast<char>(ps_read8(t.kernel.base(), addr + i));
+        if (!c) break;
+        p.text += c;
+    }
+    return p;
+}
+
+// RPCS3 sys_fs_disk_free's free bytes for `vpath` (cellFsGetFreeSize's use of it, the paths not under /dev_hdd0): an
+// empty path, one not starting with exactly one '/', or a device that isn't mounted is CELL_EINVAL; "/", /app_home and
+// /host_root (RPCS3's strict_get_block_size devices) CELL_ENOTSUP; a path of more than 31 characters
+// CELL_ENAMETOOLONG. A read-only device has none free: /dev_bdvd and /dev_ps2disc (read-only mount points), /dev_flash
+// (RPCS3 mounts it read-only) and whatever the host mounted read-only (lv2's stat then reports no write permission).
+// /dev_hdd1 has 2 GB less a sector free, any other device 40 GB less a sector (RPCS3's sizes, see cellHddGameCheck).
+s32 disk_free(PPUContext& ctx, const std::string& vpath, u64& available)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    available = 0;
+    if (vpath.empty()) return error(lv2::CELL_EINVAL);
+    if (vpath == "/") return error(lv2::CELL_ENOTSUP);
+    if (vpath.size() > kMaxMountPointLength) return error(lv2::CELL_ENAMETOOLONG);
+    if (vpath.find_first_not_of('/') != 1) return error(lv2::CELL_EINVAL);
+    const std::string device = vpath.substr(0, vpath.find('/', 1));
+    StackVar v(ctx, base, 0x20 + lv2::kCellFsStatSize); // the device's path (StackVar clears: terminated), CellFsStat
+    std::memcpy(base + v.addr(), device.data(), device.size());
+    if (lv2::sys_fs_stat(t, v.addr(), v.addr() + 0x20) != lv2::CELL_OK) return error(lv2::CELL_EINVAL);
+    if (device == "/app_home" || device == "/host_root") return error(lv2::CELL_ENOTSUP);
+    const bool read_only = device == "/dev_bdvd" || device == "/dev_ps2disc" || device == "/dev_flash" ||
+        !(ps_read32(base, v.addr() + 0x20) & 0222);
+    if (!read_only) available = device == "/dev_hdd1" ? 2 * kGiB - kSectorSize : 40 * kGiB - kSectorSize;
+    return lv2::CELL_OK;
+}
+
+// cellFsGetFreeSize(path, u32* block_size, u64* block_count): RPCS3's. CELL_EFAULT for a null argument; both results
+// are zeroed first. A path starting "/dev_hdd0" gets RPCS3's sys_fs_fcntl 0xC0000002 answer, whether the path exists
+// or not: 40 GB less a byte in /dev_hdd0's 4 KB blocks. Any other path takes disk_free's free bytes (no free bytes:
+// CELL_ENOTDIR), then the path's block size (cellFsGetBlockSize: the path must exist, lv2's stat errors otherwise),
+// and the block count is the free bytes over it. Deviation (D-042): a path or result pointer outside guest memory is
+// CELL_EFAULT with the call site logged (RPCS3 faults).
+s32 cellFsGetFreeSize(PPUContext& ctx, u32 path, u32 block_size, u32 block_count)
+{
+    if (!path || !block_size || !block_count) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const GuestPath p = read_path(t, path);
+    // RPCS3 compares only the first 9 bytes with "/dev_hdd0".
+    const bool hdd0 = p.text.starts_with("/dev_hdd0");
+    if ((p.faulted && !hdd0) || !guest_readable(t, block_size, 4) || !guest_readable(t, block_count, 8)) {
+        log_call_site(ctx, base,
+            std::format("cellFsGetFreeSize(path {:#x}, block_size {:#x}, block_count {:#x}): not guest memory", path,
+                block_size, block_count));
+        return error(lv2::CELL_EFAULT);
+    }
+    ps_write32(base, block_size, 0);
+    ps_write64(base, block_count, 0);
+    if (hdd0) {
+        ps_write64(base, block_count, (40 * kGiB - 1) / kHdd0BlockSize);
+        ps_write32(base, block_size, kHdd0BlockSize);
+        PS_LOG_INFO(kChan, "cellFsGetFreeSize({}): {} blocks of {} bytes", p.text, ps_read64(base, block_count),
+            kHdd0BlockSize);
+        return lv2::CELL_OK;
+    }
+    u64 available = 0;
+    s32 r = disk_free(ctx, p.text, available);
+    // (RPCS3 turns sys_fs_disk_free's CELL_EPERM into CELL_EINVAL; that one never returns it.)
+    if (r == lv2::CELL_OK && !available) r = error(lv2::CELL_ENOTDIR);
+    if (r == lv2::CELL_OK) {
+        StackVar sb(ctx, base, lv2::kCellFsStatSize);
+        r = lv2::sys_fs_stat(t, path, sb.addr());
+        if (r == lv2::CELL_OK) {
+            const u64 block = ps_read64(base, sb.addr() + 44); // CellFsStat st_blksize: the device's block size
+            ps_write64(base, block_count, available / block);
+            ps_write32(base, block_size, static_cast<u32>(block));
+        }
+    }
+    if (r != lv2::CELL_OK) {
+        PS_LOG_WARN(kChan, "cellFsGetFreeSize({}) -> {} ({:#010x})", p.text, lv2::error_name(r), static_cast<u32>(r));
+        return r;
+    }
+    PS_LOG_INFO(kChan, "cellFsGetFreeSize({}): {} blocks of {} bytes", p.text, ps_read64(base, block_count),
+        ps_read32(base, block_size));
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------- asynchronous reads (AIO)
+
+constexpr u32 NID_aio_thread = 0xFFB98633; // nid_of("_pspocket_fs_aio_thread"): pspocket's own
+constexpr s32 kAioThreadPriority = 1000;
+constexpr u32 kAioThreadStack = 0x10000;
+
+// CellFsAio (40 bytes): be32 fd; be64 offset at 8; be32 buf at 16; be64 size at 24; be64 user_data at 32.
+namespace aio_off {
+constexpr u32 fd = 0, offset = 8, buf = 16, size = 24, kSize = 40;
+}
+
+struct AioRequest {
+    s32 xid = 0;
+    u32 aio = 0;  // the game's CellFsAio
+    u32 func = 0; // the descriptor of its callback(aio, error, xid, size)
+};
+
+// RPCS3 fs_aio_manager: the AIO thread, the requests waiting for it, and the last request ID (RPCS3 g_fs_aio_id).
+struct AioState {
+    std::mutex mutex;
+    u32 thread_id = 0; // 0 until the first cellFsAioInit
+    std::deque<AioRequest> requests;
+    lv2::WaitQueue idle; // the AIO thread, while it waits for a request
+    s32 last_id = 0;
+    u32 reads = 0; // requests so far, for the log
+};
+
+AioState& aio_state()
+{
+    HleProcess* p = HleProcess::current();
+    if (!p) PS_FATAL(kChan, "cellFsAio called without an HLE process");
+    return p->state<AioState>();
+}
+
+// The AIO thread's body (RPCS3 fs_aio_thread::non_task), its entry through an internal function's descriptor. It takes
+// the requests in order. Each reads aio->size bytes at aio->offset into aio->buf without moving the file position (as
+// cellFsReadWithOffset: sys_fs_fcntl 0x8000000A), then the game's func(aio, error, xid, size read) runs on this
+// thread. A descriptor that isn't a file open for reading gives CELL_EBADF and 0 bytes (RPCS3). Deviations: a buffer
+// outside guest memory gives CELL_EFAULT, and a host read error that error with the bytes read before it (RPCS3
+// faults, or aborts). Never returns: the thread unwinds when the process ends.
+void _pspocket_fs_aio_thread(PPUContext& ctx, u64)
+{
+    AioState& s = aio_state();
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    for (;;) {
+        AioRequest req;
+        {
+            std::unique_lock lk(s.mutex);
+            while (s.requests.empty()) {
+                lv2::prepare_wait(t.waiter);
+                s.idle.push(&t.waiter);
+                const lv2::WaitStatus status = lv2::park(t.waiter, lk, 0, {lv2::WaitKind::Sleep, 0}, [&](bool) {
+                    return s.idle.remove(&t.waiter) ? lv2::CancelResult::Removed : lv2::CancelResult::Woken;
+                });
+                if (status == lv2::WaitStatus::Aborted) throw lv2::ThreadExit{};
+                lk.lock();
+            }
+            req = s.requests.front();
+            s.requests.pop_front();
+        }
+        s32 result = error(lv2::CELL_EFAULT);
+        u64 done = 0;
+        if (guest_readable(t, req.aio, aio_off::kSize)) {
+            StackVar count(ctx, base, 8);
+            result = rw_with_offset(ctx, 0x8000000A, 0xFA8A0000, ps_read32(base, req.aio + aio_off::fd),
+                ps_read64(base, req.aio + aio_off::offset), ps_read32(base, req.aio + aio_off::buf),
+                ps_read64(base, req.aio + aio_off::size), count.addr());
+            done = ps_read64(base, count.addr());
+        } else {
+            PS_LOG_ERROR(kChan, "AIO request {}: its CellFsAio at {:#x} is no longer guest memory", req.xid, req.aio);
+        }
+        PS_LOG_DEBUG(kChan, "AIO request {} done: {}, {:#x} bytes; calling {:#x}", req.xid, lv2::error_name(result),
+            done, req.func);
+        call_guest(ctx, req.func, {req.aio, static_cast<u64>(static_cast<s64>(result)),
+                                      static_cast<u64>(static_cast<s64>(req.xid)), done}); // returns void
+    }
+}
+
+// Creates and starts the AIO thread: an ordinary priority, a 64 KB stack and a TLS block like any thread's (RPCS3,
+// whose HLE never creates it, gives no parameters). Called with the AIO state locked.
+s32 start_aio_thread(PPUContext& ctx, AioState& s)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    HleProcess& p = *HleProcess::current();
+    const u32 entry = p.descriptor_of(kModule, NID_aio_thread);
+    if (!entry) PS_FATAL(kChan, "the AIO thread function was not linked at load");
+    const u32 tls = p.alloc_tls();
+    if (!tls) return error(lv2::CELL_ENOMEM);
+    StackVar v(ctx, base, 0x30); // thread ID (u64), ppu_thread_param_t {entry, tls}, the name
+    ps_write32(base, v.addr() + 8, entry);
+    ps_write32(base, v.addr() + 12, tls + kTlsR13Offset);
+    std::memcpy(base + v.addr() + 0x10, "fs_aio_thread", 14);
+    if (const s32 r = lv2::_sys_ppu_thread_create(t, v.addr(), v.addr() + 8, 0, 0, kAioThreadPriority,
+            kAioThreadStack, 0, v.addr() + 0x10);
+        r != lv2::CELL_OK) {
+        p.free_tls(tls);
+        return r;
+    }
+    const u32 id = static_cast<u32>(ps_read64(base, v.addr()));
+    if (const s32 r = lv2::sys_ppu_thread_start(t, id); r != lv2::CELL_OK) return r;
+    s.thread_id = id;
+    return lv2::CELL_OK;
+}
+
+// cellFsAioInit(mount_point): the first call starts the AIO thread, which then serves every mount point (RPCS3's
+// fs_aio_manager holds one thread; its TODO is one per mount point). The mount point is not checked (RPCS3). CELL_OK,
+// or the error creating the thread gave.
+s32 cellFsAioInit(PPUContext& ctx, u32 mount_point)
+{
+    AioState& s = aio_state();
+    std::lock_guard lock(s.mutex);
+    if (s.thread_id) {
+        PS_LOG_INFO(kChan, "cellFsAioInit({}): the AIO thread {:#x} runs already", path_of(ctx, mount_point),
+            s.thread_id);
+        return lv2::CELL_OK;
+    }
+    if (const s32 r = start_aio_thread(ctx, s); r != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "cellFsAioInit({}): the AIO thread was not created: {}", path_of(ctx, mount_point),
+            lv2::error_name(r));
+        return r;
+    }
+    PS_LOG_INFO(kChan, "cellFsAioInit({}): AIO thread {:#x} started", path_of(ctx, mount_point), s.thread_id);
+    return lv2::CELL_OK;
+}
+
+// cellFsAioFinish(mount_point): CELL_OK (RPCS3). Its TODO, ending the mount point's AIO thread, isn't done there
+// either: the thread stays, and the requests queued before still complete.
+s32 cellFsAioFinish(PPUContext& ctx, u32 mount_point)
+{
+    PS_LOG_INFO(kChan, "cellFsAioFinish({})", path_of(ctx, mount_point));
+    return lv2::CELL_OK;
+}
+
+// cellFsAioRead(CellFsAio* aio, s32* id, func): RPCS3's. CELL_ENXIO until cellFsAioInit started the AIO thread;
+// otherwise the request gets the next ID (from 1), written to *id, and is queued for the AIO thread, and the call
+// returns at once: the callback brings the result. Deviation (D-042): a null aio, id or func, or one outside guest
+// memory, is CELL_EFAULT with the call site logged (RPCS3 faults, at once or on the AIO thread).
+s32 cellFsAioRead(PPUContext& ctx, u32 aio, u32 id, u32 func)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    AioState& s = aio_state();
+    std::lock_guard lock(s.mutex);
+    if (!s.thread_id) {
+        PS_LOG_WARN(kChan, "cellFsAioRead(aio {:#x}): cellFsAioInit has not started the AIO thread: CELL_ENXIO", aio);
+        return error(lv2::CELL_ENXIO);
+    }
+    if (!aio || !id || !func || !guest_readable(t, aio, aio_off::kSize) || !guest_readable(t, id, 4) ||
+        !guest_readable(t, func, 8)) {
+        log_call_site(ctx, guest_base(ctx),
+            std::format("cellFsAioRead(aio {:#x}, id {:#x}, func {:#x}): a null pointer, or one outside guest memory",
+                aio, id, func));
+        return error(lv2::CELL_EFAULT);
+    }
+    u8* base = t.kernel.base();
+    const s32 xid = s.last_id = static_cast<s32>(static_cast<u32>(s.last_id) + 1);
+    ps_write32(base, id, static_cast<u32>(xid));
+    s.requests.push_back({xid, aio, func});
+    for (lv2::Waiter* w : s.idle.take_all(lv2::SYS_SYNC_FIFO)) lv2::wake(*w, lv2::CELL_OK);
+    const log::Level level = s.reads++ < 8 ? log::Level::Info : log::Level::Debug;
+    if (level >= log::min_level()) {
+        log::print(level, kChan, "cellFsAioRead: request {}: fd {}, {:#x} bytes at {:#x} to {:#x}, callback {:#x}", xid,
+            ps_read32(base, aio + aio_off::fd), ps_read64(base, aio + aio_off::size),
+            ps_read64(base, aio + aio_off::offset), ps_read32(base, aio + aio_off::buf), func);
+    }
+    return lv2::CELL_OK;
+}
+
+// cellFsAioCancel(id): CELL_EINVAL, as in RPCS3: requests aren't cancelled, each one completes with its callback.
+// (RPCS3's TODO: a cancelled request's callback gets CELL_ECANCELED.)
+s32 cellFsAioCancel(PPUContext&, s32 id)
+{
+    PS_LOG_WARN(kChan, "cellFsAioCancel({}): requests are not cancelled (RPCS3): CELL_EINVAL", id);
+    return error(lv2::CELL_EINVAL);
+}
+
 } // namespace
 
 void register_sys_fs(Registry& r)
@@ -209,6 +522,14 @@ void register_sys_fs(Registry& r)
         PS_HLE_FUNC(0x0D5B4A14, cellFsReadWithOffset),
         PS_HLE_FUNC(0x8CB722D5, cellFsWriteWithOffset),
         PS_HLE_FUNC(0x7A0329A1, cellFsAllocateFileAreaWithoutZeroFill),
+        PS_HLE_FUNC(0xEF3EFA34, cellFsFstat),
+        PS_HLE_FUNC(0xAA3B4BCD, cellFsGetFreeSize),
+        PS_HLE_FUNC(0xD73938DF, cellFsStReadFinish),
+        PS_HLE_FUNC(0xDB869F20, cellFsAioInit),
+        PS_HLE_FUNC(0x9F951810, cellFsAioFinish),
+        PS_HLE_FUNC(0xC1C507E7, cellFsAioRead),
+        PS_HLE_FUNC(0x7F13FC8C, cellFsAioCancel),
+        PS_HLE_INTERNAL(NID_aio_thread, _pspocket_fs_aio_thread),
     });
 }
 

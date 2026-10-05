@@ -4,9 +4,9 @@
 // cellAvconfExt.cpp, cellMsgDialog.cpp/.h, with RPCS3's default configuration (Emu/system_config.h, rsx::avconf in
 // Emu/RSX/Utils/rsx_utils.h).
 //
-// Implemented: what GTA V imports from these modules (save data: cellSaveData.cpp; the on-screen keyboard:
-// cellOskDialog.cpp). Of the message dialog that is only cellMsgDialogAbort, which needs the dialog's bookkeeping
-// (MsgDialog): GTA V imports none of the functions that open one, and there is no dialog UI yet.
+// Implemented: what GTA V and Assassin's Creed import from these modules (save data: cellSaveData.cpp; the on-screen
+// keyboard: cellOskDialog.cpp; the game data checks: cellGame.cpp). Of the message dialog: cellMsgDialogOpen2 and
+// cellMsgDialogAbort. There is no dialog UI yet, so the user answers a dialog with buttons at once (show_msg_dialog).
 //
 // The console reported is RPCS3's default one, which also suits a fixed iPhone target: one HDMI display at 720p
 // (1280x720 progressive, 16:9: the PS3 mode closest to a phone screen, and the resolution most games render at), RGB,
@@ -81,6 +81,8 @@ enum : u32 {
     CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER = 0x8002b242,
     CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE = 0x8002b243,
     CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT = 0x8002b245,
+
+    CELL_MSGDIALOG_ERROR_PARAM = 0x8002b301,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -104,6 +106,7 @@ std::string result_name(s32 r)
     case CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER: return "CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER";
     case CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE: return "CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE";
     case CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT: return "CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT";
+    case CELL_MSGDIALOG_ERROR_PARAM: return "CELL_MSGDIALOG_ERROR_PARAM";
     }
     return r > 0 ? std::to_string(r) : std::format("{:#010x}", static_cast<u32>(r));
 }
@@ -137,9 +140,11 @@ enum class Fn : u8 {
     AudioOutGetSoundAvailability,
     VideoOutSetGamma,
     AudioOutGetAvailableDeviceInfo,
+    AudioOutSetCopyControl,
     EnableBgmPlayback,
     DisableBgmPlayback,
     GetBgmPlaybackStatus,
+    MsgDialogOpen2,
     MsgDialogAbort,
     Count,
 };
@@ -819,6 +824,7 @@ constexpr u8 CELL_AUDIO_OUT_CHNUM_2 = 2;
 constexpr u8 CELL_AUDIO_OUT_FS_48KHZ = 0x04;
 constexpr u32 CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH = 1;
 constexpr u32 CELL_AUDIO_OUT_DOWNMIXER_NONE = 0, CELL_AUDIO_OUT_DOWNMIXER_TYPE_B = 2;
+constexpr u32 CELL_AUDIO_OUT_COPY_CONTROL_COPY_FREE = 0, CELL_AUDIO_OUT_COPY_CONTROL_COPY_NEVER = 2;
 
 // CellAudioOutSoundMode: u8 type, channel, fs, reserved; be32 layout.
 struct SoundMode {
@@ -845,6 +851,7 @@ struct AudioOutState {
         u32 channels = CELL_AUDIO_OUT_CHNUM_2;
         u32 encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
         u32 downmixer = CELL_AUDIO_OUT_DOWNMIXER_NONE;
+        u32 copy_control = CELL_AUDIO_OUT_COPY_CONTROL_COPY_FREE;
         std::vector<SoundMode> sound_modes{kStereo};
         SoundMode sound_mode = kStereo;
     };
@@ -975,6 +982,23 @@ s32 cellAudioOutGetAvailableDeviceInfo(PPUContext&, u32 count, u32 info)
     return call.ok(0, "0 devices");
 }
 
+// The copy control the output reports to recording equipment: CELL_AUDIO_OUT_COPY_CONTROL_COPY_FREE, _COPY_ONCE or
+// _COPY_NEVER (anything above is ILLEGAL_PARAMETER, checked before the output). Only the primary output takes it: the
+// secondary one is UNSUPPORTED_AUDIO_OUT, any other ILLEGAL_PARAMETER (RPCS3). It is remembered, and nothing reads it,
+// as in RPCS3.
+s32 cellAudioOutSetCopyControl(PPUContext&, u32 audio_out, u32 control)
+{
+    const Call call(Fn::AudioOutSetCopyControl, kInfoCalls, kChan,
+        "cellAudioOutSetCopyControl(audioOut {}, control {})", audio_out, control);
+    if (control > CELL_AUDIO_OUT_COPY_CONTROL_COPY_NEVER) return call(error(CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER));
+    if (audio_out == CELL_AUDIO_OUT_SECONDARY) return call(error(CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT));
+    if (audio_out != CELL_AUDIO_OUT_PRIMARY) return call(error(CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER));
+    AudioOutState& a = state<AudioOutState>();
+    std::lock_guard lock(a.mutex);
+    a.out[audio_out].copy_control = control;
+    return call(lv2::CELL_OK);
+}
+
 // ------------------------------------------------------------------------ background music (cellSysutil.cpp)
 
 // CellSysutilBgmPlaybackStatus (32 bytes): u8 playerState, enableState; char contentId[16]; u8 currentFadeRatio;
@@ -1041,13 +1065,28 @@ s32 cellSysutilGetBgmPlaybackStatus(PPUContext& ctx, u32 status)
 
 // ------------------------------------------------------------------------------ message dialog (cellMsgDialog.cpp)
 
+constexpr u32 CELL_MSGDIALOG_STRING_SIZE = 512; // a message's bytes, its terminator included
+// The CELL_MSGDIALOG_TYPE_* fields (RPCS3 MsgDialogType): se_normal bit 0, se_mute_on bit 1, bg_invisible bit 2,
+// button_type bits 4-6, disable_cancel bit 7, default_cursor bits 8-9, progress_bar_count bits 12-13. Any other bit is
+// CELL_MSGDIALOG_ERROR_PARAM (RPCS3: type & -0x33f8).
+constexpr u32 kMsgDialogTypeBits = 0x33F7;
+constexpr u32 CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL = 1;
+constexpr u32 CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE = 0, CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO = 1,
+              CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK = 2; // button_type
+constexpr u32 CELL_MSGDIALOG_TYPE_DEFAULT_CURSOR_NO = 1; // default_cursor of a YES/NO dialog
+constexpr s32 CELL_MSGDIALOG_BUTTON_OK = 1, CELL_MSGDIALOG_BUTTON_YES = 1, CELL_MSGDIALOG_BUTTON_NO = 2;
+
+u32 button_type(u32 type) { return (type >> 4) & 7; }
+u32 default_cursor(u32 type) { return (type >> 8) & 3; }
+u32 progress_bar_count(u32 type) { return (type >> 12) & 3; }
+
 // RPCS3 msg_info, with its native overlay dialog (rsx::overlays::message_dialog, the default): at most one message
-// dialog is open. Only open_msg_dialog (sysutil.hpp) opens one, and nothing calls it in a game's run yet: the
-// functions that would (cellMsgDialogOpen2 and the others, the dialogs of cellSaveData and the other modules) are not
-// implemented, as GTA V imports none of them and there is no dialog UI to show one.
+// dialog is open. open_locked opens one: for cellMsgDialogOpen2, and for other modules through open_msg_dialog
+// (sysutil.hpp), which nothing in a game's run calls yet.
 struct MsgDialog {
     std::mutex mutex;
     bool open = false;
+    u64 generation = 0; // dialogs opened so far: an answer meant for one can't close the next
     MsgDialogSource source = MsgDialogSource::CellMsgDialog;
     u32 type = 0;     // CELL_MSGDIALOG_TYPE_* bits
     u32 callback = 0; // CellMsgDialogCallback(buttonType, userData) descriptor, for the user's answer; 0 = none
@@ -1064,6 +1103,152 @@ std::string_view source_name(MsgDialogSource source)
     case MsgDialogSource::SceNpTrophy: return "sceNpTrophy";
     }
     return "?";
+}
+
+// RPCS3 open_msg_dialog (not blocking, its overlay path), with the dialog's state locked: one dialog at a time
+// (CELL_SYSUTIL_ERROR_BUSY while one is open), then DRAWING_BEGIN to the game's callbacks (when a system dialog draws
+// already, that event's CELL_SYSUTIL_ERROR_BUSY is the result and nothing opens). The dialog then stays open until it
+// is answered (msg_dialog_answered) or aborted.
+s32 open_locked(MsgDialog& d, MsgDialogSource source, u32 type, std::string_view message, u32 callback, u32 userdata)
+{
+    if (d.open) {
+        PS_LOG_WARN(kChan, "message dialog from {} (type {:#x}, \"{}\"): another one is open: CELL_SYSUTIL_ERROR_BUSY",
+            source_name(source), type, message);
+        return error(CELL_SYSUTIL_ERROR_BUSY);
+    }
+    if (const s32 r = sysutil_send_event(CELL_SYSUTIL_DRAWING_BEGIN, 0); r < 0) {
+        PS_LOG_WARN(kChan, "message dialog from {} (type {:#x}, \"{}\"): a system dialog draws already: {}",
+            source_name(source), type, message, result_name(r));
+        return r;
+    }
+    d.open = true;
+    d.generation++;
+    d.source = source;
+    d.type = type;
+    d.callback = callback;
+    d.userdata = userdata;
+    return lv2::CELL_OK;
+}
+
+// The user answered the dialog of this generation by pressing `button` (RPCS3's on_close for it): the dialog closes,
+// DRAWING_END goes to the game's callbacks, and the dialog's callback(button, userData) is queued as well (RPCS3
+// sysutil_register_cb), so both reach the game at a cellSysutilCheckCallback, the end of the drawing first. The answer
+// is dropped when that dialog isn't open any more: the game aborted it meanwhile.
+void msg_dialog_answered(u64 generation, s32 button)
+{
+    MsgDialog& d = state<MsgDialog>();
+    std::lock_guard lock(d.mutex);
+    if (!d.open || d.generation != generation) {
+        PS_LOG_INFO(kChan, "message dialog: an answer for a dialog the game has aborted since: ignored");
+        return;
+    }
+    d.open = false;
+    sysutil_send_event(CELL_SYSUTIL_DRAWING_END, 0);
+    if (!d.callback) {
+        PS_LOG_INFO(kChan, "message dialog (type {:#x}) answered with button {}; it has no callback", d.type, button);
+        return;
+    }
+    sysutil_queue_call([callback = d.callback, userdata = d.userdata, button](PPUContext& ctx) -> s32 {
+        PS_LOG_INFO(kChan, "cellSysutilCheckCallback: message dialog callback {:#x}(button {}, userData {:#x})",
+            callback, button, userdata);
+        call_guest(ctx, callback, {static_cast<u64>(static_cast<s64>(button)), userdata}); // returns void
+        return lv2::CELL_OK;
+    });
+}
+
+// Shows a dialog cellMsgDialogOpen2 opened (RPCS3 MsgDialogBase::Create, or its overlay's show). There is no dialog
+// UI yet, so the user answers as soon as the dialog appears, with its default button: OK for an OK dialog, YES or NO
+// as the default cursor says for a YES/NO dialog. The first cellSysutilCheckCallback after the open delivers
+// DRAWING_BEGIN, then the answer closes the dialog, so DRAWING_END and the callback reach the game at the check after
+// that. A dialog without buttons (a progress or "please wait" dialog) has nothing to answer: it stays open until the
+// game ends it (cellMsgDialogAbort), as on a PS3. A dialog UI shows the dialog here instead, and calls
+// msg_dialog_answered() with the user's button. Called with the dialog's state locked.
+void show_msg_dialog(u64 generation, u32 type, std::string_view message)
+{
+    const u32 buttons = button_type(type);
+    if (buttons == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE) {
+        PS_LOG_WARN(kChan, "no dialog UI: the message dialog \"{}\" has no buttons and stays open until the game ends "
+                           "it",
+            message);
+        return;
+    }
+    const s32 button = buttons == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK ? CELL_MSGDIALOG_BUTTON_OK
+        : default_cursor(type) == CELL_MSGDIALOG_TYPE_DEFAULT_CURSOR_NO ? CELL_MSGDIALOG_BUTTON_NO
+                                                                         : CELL_MSGDIALOG_BUTTON_YES;
+    PS_LOG_WARN(kChan, "no dialog UI: the message dialog \"{}\" is answered {} at once", message,
+        buttons == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK ? "OK" : button == CELL_MSGDIALOG_BUTTON_NO ? "NO" : "YES");
+    sysutil_queue_call([generation, button](PPUContext&) -> s32 {
+        msg_dialog_answered(generation, button);
+        return lv2::CELL_OK;
+    });
+}
+
+// cellMsgDialogOpen2(type, msgString, callback, userData, extParam), with RPCS3's checks in its order: a message
+// shorter than 512 bytes, no type bit outside the fields, then the buttons: none (no default cursor, up to two
+// progress bars), YES/NO (default cursor YES or NO, no progress bar) or OK (no default cursor, no progress bar).
+// Anything else is CELL_MSGDIALOG_ERROR_PARAM. The dialog then opens as RPCS3's open_msg_dialog opens it, from
+// cellMsgDialog (CELL_SYSUTIL_ERROR_BUSY while another is open), and show_msg_dialog shows it. extParam is not used
+// (RPCS3). Deviation (D-042): a message or callback outside guest memory is refused with CELL_MSGDIALOG_ERROR_PARAM
+// and the call site logged (RPCS3 faults, the callback's only when it is called).
+s32 cellMsgDialogOpen2(PPUContext& ctx, u32 type, u32 msg_string, u32 callback, u32 user_data, u32 ext_param)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    // The message as RPCS3's strlen finds it: its terminator must come within 512 bytes.
+    std::string message;
+    bool terminated = false, faulted = false;
+    for (u32 i = 0; msg_string && i < CELL_MSGDIALOG_STRING_SIZE; i++) {
+        if (!guest_readable(t, msg_string + i, 1)) {
+            faulted = true;
+            break;
+        }
+        const char c = static_cast<char>(ps_read8(base, msg_string + i));
+        if (!c) {
+            terminated = true;
+            break;
+        }
+        message += c;
+    }
+    const Call call(Fn::MsgDialogOpen2, kInfoCalls, kChan,
+        "cellMsgDialogOpen2(type {:#x}, msgString {:#x} \"{}\", callback {:#x}, userData {:#x}, extParam {:#x})", type,
+        msg_string, message, callback, user_data, ext_param);
+    if (faulted) {
+        log_call_site(ctx, base, std::format("cellMsgDialogOpen2: msgString {:#x} runs into memory that is not guest "
+                                             "memory",
+                                     msg_string));
+        return call(error(CELL_MSGDIALOG_ERROR_PARAM));
+    }
+    if (!msg_string || !terminated || (type & ~kMsgDialogTypeBits)) return call(error(CELL_MSGDIALOG_ERROR_PARAM));
+    switch (button_type(type)) {
+    case CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE:
+        if (default_cursor(type) || progress_bar_count(type) > 2) return call(error(CELL_MSGDIALOG_ERROR_PARAM));
+        break;
+    case CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO:
+        if (default_cursor(type) > 1 || progress_bar_count(type)) return call(error(CELL_MSGDIALOG_ERROR_PARAM));
+        break;
+    case CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK:
+        if (default_cursor(type) || progress_bar_count(type)) return call(error(CELL_MSGDIALOG_ERROR_PARAM));
+        break;
+    default: return call(error(CELL_MSGDIALOG_ERROR_PARAM));
+    }
+    if (callback && !guest_readable(t, callback, 8)) {
+        log_call_site(ctx, base, std::format("cellMsgDialogOpen2: callback {:#x} is not guest memory", callback));
+        return call(error(CELL_MSGDIALOG_ERROR_PARAM));
+    }
+    // RPCS3 logs the message, an error dialog's as an error.
+    if (type & CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL) {
+        PS_LOG_WARN(kChan, "opening a message dialog: \"{}\"", message);
+    } else {
+        PS_LOG_ERROR(kChan, "opening an error message dialog: \"{}\"", message);
+    }
+    MsgDialog& d = state<MsgDialog>();
+    std::lock_guard lock(d.mutex);
+    if (const s32 r = open_locked(d, MsgDialogSource::CellMsgDialog, type, message, callback, user_data);
+        r != lv2::CELL_OK) {
+        return call(r);
+    }
+    show_msg_dialog(d.generation, type, message);
+    return call(lv2::CELL_OK);
 }
 
 // RPCS3 cellMsgDialogAbort (its overlay path): a dialog the game opened with cellMsgDialog's functions closes at once
@@ -1140,21 +1325,7 @@ s32 open_msg_dialog(MsgDialogSource source, u32 type, std::string_view message, 
     if (!p) PS_FATAL(kChan, "open_msg_dialog without an HLE process");
     MsgDialog& d = p->state<MsgDialog>();
     std::lock_guard lock(d.mutex);
-    if (d.open) {
-        PS_LOG_WARN(kChan, "message dialog from {} (type {:#x}, \"{}\"): another one is open: CELL_SYSUTIL_ERROR_BUSY",
-            source_name(source), type, message);
-        return error(CELL_SYSUTIL_ERROR_BUSY);
-    }
-    if (const s32 r = sysutil_send_event(CELL_SYSUTIL_DRAWING_BEGIN, 0); r < 0) {
-        PS_LOG_WARN(kChan, "message dialog from {} (type {:#x}, \"{}\"): a system dialog draws already: {}",
-            source_name(source), type, message, result_name(r));
-        return r;
-    }
-    d.open = true;
-    d.source = source;
-    d.type = type;
-    d.callback = callback;
-    d.userdata = userdata;
+    if (const s32 r = open_locked(d, source, type, message, callback, userdata); r != lv2::CELL_OK) return r;
     PS_LOG_WARN(kChan, "message dialog from {} (type {:#x}): \"{}\"; there is no dialog UI, so it stays open until "
                        "the game aborts it",
         source_name(source), type, message);
@@ -1183,6 +1354,8 @@ void register_cellSysutil(Registry& r)
         PS_HLE_FUNC(0x220894E3, cellSysutilEnableBgmPlayback),
         PS_HLE_FUNC(0xCFDD8E87, cellSysutilDisableBgmPlayback),
         PS_HLE_FUNC(0xA11552F6, cellSysutilGetBgmPlaybackStatus),
+        PS_HLE_FUNC(0xC96E89E9, cellAudioOutSetCopyControl),
+        PS_HLE_FUNC(0x7603D3DB, cellMsgDialogOpen2),
         PS_HLE_FUNC(0x62B0F803, cellMsgDialogAbort),
     });
     r.add("cellSysutilAvconfExt", {

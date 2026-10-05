@@ -7,9 +7,11 @@
 // as with RPCS3's default null keyboard handler. RPCS3's sys_config machinery (the event thread that delivers connect
 // events) is not reproduced: the controller is reported connected, with the assignment-changed flag, from cellPadInit.
 //
-// cellPadGetData reports changes only, as RPCS3 does: the first read after init, and any read where the controller's
-// state differs from the last one reported, returns data; otherwise CELL_PAD_LEN_NO_CHANGE. With sensors on, data comes
-// back at least every 10 ms. Rumble (cellPadSetActDirect) is accepted and ignored for now.
+// cellPadGetData reports changes only, as RPCS3 does: the first read after init or cellPadClearBuf, and any read where
+// the controller's state differs from the last one reported, returns data; otherwise CELL_PAD_LEN_NO_CHANGE. With
+// sensors on, data comes back at least every 10 ms. Rumble (cellPadSetActDirect) is accepted and ignored for now. The
+// old cellPadGetInfo reports the controller with the USB IDs RPCS3 gives a standard pad without its own: Sony's
+// PlayStation 3 controller (054C:0268).
 
 #include <array>
 #include <chrono>
@@ -57,7 +59,16 @@ constexpr s32 CELL_PAD_LEN_NO_CHANGE = 0, CELL_PAD_LEN_CHANGE_DEFAULT = 8, CELL_
 constexpr u32 kVirtualPadCapability = CELL_PAD_CAPABILITY_PS3_CONFORMITY | CELL_PAD_CAPABILITY_PRESS_MODE |
                                       CELL_PAD_CAPABILITY_SENSOR_MODE | CELL_PAD_CAPABILITY_HP_ANALOG_STICK |
                                       CELL_PAD_CAPABILITY_ACTUATOR;
+// RPCS3 Input/product_info.cpp: the first standard-class product, a pad's IDs when its handler gives none.
+constexpr u16 kVirtualPadVendorId = 0x054C, kVirtualPadProductId = 0x0268;
+constexpr u32 CELL_PAD_MAX_CAPABILITY_INFO = 32;
 
+// CellPadInfo (the layout before CellPadInfo2, 648 bytes): max_connect, now_connect, system_info (u32 each), then
+// u16 vendor_id[127], u16 product_id[127], u8 status[127].
+namespace info_off {
+constexpr u32 max_connect = 0x0, now_connect = 0x4, system_info = 0x8, vendor_id = 0xC, product_id = 0x10A,
+              status = 0x208, size = 0x288;
+}
 // CellPadInfo2: max_connect, now_connect, system_info, then port_status[7], port_setting[7], device_capability[7],
 // device_type[7] (u32 each).
 namespace info2_off {
@@ -158,6 +169,64 @@ s32 cellPadGetInfo2(PPUContext& ctx, u32 info)
         now_connect++;
     }
     ps_write32(base, info + info2_off::now_connect, now_connect);
+    return lv2::CELL_OK;
+}
+
+// cellPadGetInfo(CellPadInfo*), the old layout (RPCS3 cellPadGetInfo): max_connect as cellPadInit got it (not limited
+// to the 7 ports, as cellPadGetInfo2's is), system_info, and for each of the first max_connect ports (7 at most) its
+// status and, with a controller connected, its USB vendor and product IDs. A port's assignment-changed flag is cleared
+// before its status is written, so this function never reports it (and a cellPadGetInfo2 after it doesn't either).
+s32 cellPadGetInfo(PPUContext& ctx, u32 info)
+{
+    IoState& s = io();
+    std::lock_guard lock(s.mutex);
+    if (!s.pad_max_connect) return error(CELL_PAD_ERROR_UNINITIALIZED);
+    if (!info) return error(CELL_PAD_ERROR_INVALID_PARAMETER);
+    u8* base = guest_base(ctx);
+    std::memset(base + info, 0, info_off::size);
+    ps_write32(base, info + info_off::max_connect, s.pad_max_connect);
+    ps_write32(base, info + info_off::system_info, 0);
+    u32 now_connect = 0;
+    for (u32 i = 0; i < pad_ports(s); i++) {
+        s.reported_status[i] &= ~CELL_PAD_STATUS_ASSIGN_CHANGES;
+        ps_write8(base, info + info_off::status + i, static_cast<u8>(s.reported_status[i]));
+        if (!(s.reported_status[i] & CELL_PAD_STATUS_CONNECTED)) continue;
+        ps_write16(base, info + info_off::vendor_id + 2 * i, kVirtualPadVendorId);
+        ps_write16(base, info + info_off::product_id + 2 * i, kVirtualPadProductId);
+        now_connect++;
+    }
+    ps_write32(base, info + info_off::now_connect, now_connect);
+    return lv2::CELL_OK;
+}
+
+// cellPadGetCapabilityInfo(port, CellPadCapabilityInfo*): u32 info[32], zero but info[0], the controller's device
+// capability (RPCS3; what cellPadGetInfo2 reports as device_capability). Checks: initialized, a port below 127 and a
+// pointer (INVALID_PARAMETER), then a connected controller on a port below max_connect and 7 (NO_DEVICE).
+s32 cellPadGetCapabilityInfo(PPUContext& ctx, u32 port, u32 info)
+{
+    IoState& s = io();
+    std::lock_guard lock(s.mutex);
+    if (!s.pad_max_connect) return error(CELL_PAD_ERROR_UNINITIALIZED);
+    if (port >= CELL_MAX_PADS || !info) return error(CELL_PAD_ERROR_INVALID_PARAMETER);
+    if (!pad_connected(s, port)) return error(CELL_PAD_ERROR_NO_DEVICE);
+    u8* base = guest_base(ctx);
+    std::memset(base + info, 0, 4 * CELL_PAD_MAX_CAPABILITY_INFO);
+    ps_write32(base, info, kVirtualPadCapability);
+    return lv2::CELL_OK;
+}
+
+// cellPadClearBuf(port): RPCS3 clear_pad_buffer. The last state reported goes back to rest (no buttons, sticks
+// centred, the sensors' resting values) and the next cellPadGetData reports in full, changed or not. Checks as
+// cellPadGetCapabilityInfo's, without the pointer.
+s32 cellPadClearBuf(PPUContext&, u32 port)
+{
+    IoState& s = io();
+    std::lock_guard lock(s.mutex);
+    if (!s.pad_max_connect) return error(CELL_PAD_ERROR_UNINITIALIZED);
+    if (port >= CELL_MAX_PADS) return error(CELL_PAD_ERROR_INVALID_PARAMETER);
+    if (!pad_connected(s, port)) return error(CELL_PAD_ERROR_NO_DEVICE);
+    s.output = pad_buttons(PadInput{});
+    s.buffer_cleared = true;
     return lv2::CELL_OK;
 }
 
@@ -342,6 +411,9 @@ void register_sys_io(Registry& r)
         PS_HLE_FUNC(0x1CF98800, cellPadInit),
         PS_HLE_FUNC(0x4D9B75D5, cellPadEnd),
         PS_HLE_FUNC(0xA703A51D, cellPadGetInfo2),
+        PS_HLE_FUNC(0x3AAAD464, cellPadGetInfo),
+        PS_HLE_FUNC(0xDBF4C59C, cellPadGetCapabilityInfo),
+        PS_HLE_FUNC(0x0D5F2C14, cellPadClearBuf),
         PS_HLE_FUNC(0x8B72CDA1, cellPadGetData),
         PS_HLE_FUNC(0x578E3C98, cellPadSetPortSetting),
         PS_HLE_FUNC(0xF65544EE, cellPadSetActDirect),
