@@ -20,9 +20,17 @@ The firmware module: "cellSre_Library (libsre.sprx): 2 segments at 0x1200000, 14
 exported, module_start 0x0"; 3 of the game's 140 imports linked to it. By default the game loads no module: each of its
 10 import libraries has host functions (D-157's per-module rule), so its gaps are the host's to fill.
 
+## Firmware code running: the audio and video decoders
+
+`--lle-load cellAdec --lle-load cellDmux` (modules the game does not import, loaded at boot): 17 modules, 115 to 485
+relocations each, none bad; libadec links 17 imported variables (its codecs' tables; 9 more name codecs 4.92's
+sys/external does not hold); every module_start returns 0 under the interpreter before the game's entry.
+`pspocket-firmware --modules DIR` lists what each module exports and imports: 142 modules, 59 imported variables.
+
 ## Tests
 
 tests/hle/test_lle.cpp: a synthetic PRX placed and relocated (all nine relocation types, two bad entries skipped), its
 exports and imports; a /dev_flash of debug SELFs indexed, cached and chosen per module; a synthetic executable whose
 import library only the module has, booted end to end, the module's function answering and its module_start run
-before the entry. ctest: 19 of 19.
+before the entry; a module's variable exported and its import patched through the reference table; a module's
+imported variable taken from the other module that exports it. ctest: 19 of 19.

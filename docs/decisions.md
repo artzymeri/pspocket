@@ -2612,8 +2612,11 @@ the app whenever the system software is installed.
 First real run (run 097): Assassin's Creed with `--lle cellSync`, which libsre.sprx exports beside cellSpurs: the
 firmware's cellSync replaces the main thread's 24-million-call spin on the missing cellSyncMutexTryLock, and the game
 goes on to its next gaps (sys_mmapper_allocate_memory). Its own libraries all have host functions, so by default it
-loads no module. Not yet: modules a game loads itself through sys_prx (syscalls 480-499), modules' imported variables,
-and translating firmware code with the game.
+loads no module. A module's imported variables come from the module that exports them (its reference tables patched,
+as ppu_patch_refs; with attribute 0x2000 a function's reference table too): libadec links 17 of its codecs' variables,
+and the 17 modules of `--lle-load cellAdec --lle-load cellDmux` all ran their module_start to 0 under the interpreter
+(run 097). Not yet: modules a game loads itself through sys_prx (syscalls 480-499), and translating firmware code
+with the game.
 
 ## D-158 · 2026-10-06 · New shaders compile in the background: a frame waits for them 4 ms at most
 
