@@ -90,6 +90,7 @@ struct Surface {
     u64 generation = 0;         // writes to it: colour, or depth for a depth buffer (D-105)
     u64 stencil_generation = 0; // writes to a depth buffer's stencil
     u64 guest_hash = 0;          // PSPOCKET_RSX_CHECK_SURFACES: its guest memory when it last matched or was made
+    u64 serial = 0;              // unique among the backend's surfaces, never reused (D-137)
     // A depth buffer (D-088) or colour target (D-098) read as a texture of another format: its conversion per decode
     // mode, the generation it was made from, and its swizzled views.
     struct Conversion {
@@ -126,6 +127,12 @@ struct CachedTexture {
     u64 last_used = 0;
     u64 last_frame = 0;  // the flip it was last sampled in (D-116)
     u64 checked = ~0ull; // the check epoch (MetalBackend::Impl::check_epoch) it was last found clean in (D-104)
+    // The GPU-newer target laid over guest memory when it was decoded (D-137; serial 0: none): the texture is out of
+    // date once that target is drawn to again, or another one (or none) is newer than memory there.
+    struct Overlay {
+        u64 serial = 0, generation = 0, stencil_generation = 0;
+        bool operator==(const Overlay&) const = default;
+    } overlay;
 };
 
 // ---- pipelines ----------------------------------------------------------------------------------------------------
@@ -269,6 +276,9 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> depth_pipeline = nil; // rsx_depth_to_texture
     id<MTLComputePipelineState> color_pipeline = nil; // rsx_color_to_texture
     id<MTLComputePipelineState> decode3d_pipeline = nil; // rsx_decode_texture3d
+    // D-137: a target's pixels as guest bytes into a texture's staging copy of memory (rsx_*_to_memory).
+    id<MTLComputePipelineState> color_memory_pipeline = nil, float_memory_pipeline = nil, depth_memory_pipeline = nil;
+    u64 surface_serial = 0; // the last Surface::serial given
     id<MTLTexture> dummy_stencil = nil;              // for Z16 buffers, which have none
     id<MTLRenderPipelineState> blit_pipeline = nil;
     id<MTLSamplerState> nearest_sampler = nil;
@@ -332,8 +342,8 @@ struct MetalBackend::Impl {
     static constexpr u64 kGpuReportFlips = 300;
     std::shared_ptr<std::atomic<u64>> gpu_ns = std::make_shared<std::atomic<u64>>(0);
     // Why render passes ended (a started pass only), for the same report: the pass loads and stores its targets.
-    enum PassEnd : u8 { kEndTargets, kEndTargetCopy, kEndDepthConversion, kEndColorConversion, kEndSubmit, kEndFlip,
-                        kEndSurfaceGone, kEndFlush, kEndOther, kEndCount };
+    enum PassEnd : u8 { kEndTargets, kEndTargetCopy, kEndDepthConversion, kEndColorConversion, kEndTargetOverlay,
+                        kEndSubmit, kEndFlip, kEndSurfaceGone, kEndFlush, kEndOther, kEndCount };
     PassEnd pass_end_reason = kEndOther;
     std::array<u64, kEndCount> pass_ends{}, report_pass_ends{};
     void end_pass_for(PassEnd why)
@@ -345,6 +355,7 @@ struct MetalBackend::Impl {
     u64 report_flips = 0, report_draws = 0, report_passes = 0, report_gpu_ns = 0, report_readback_ns = 0;
     u64 report_readbacks = 0, report_deferred = 0, report_conflicts = 0, report_texture_checks = 0, report_texture_bytes = 0;
     u64 report_faults = 0; // the tracker's write faults at the last report (D-134)
+    u64 report_overlays = 0;
     u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0;
     __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
     u32 visibility_next = 0;
@@ -505,7 +516,13 @@ struct MetalBackend::Impl {
 
     // ---- textures (texture_cache.mm) ----
     id<MTLTexture> bind_texture(const TextureInfo& t, u32 unit, bool& ok);
-    CachedTexture* decode_texture(const TextureInfo& t, u32 ea, bool force_compute_dxt, std::string* error);
+    // `overlay`: a GPU-newer target over the texture's memory whose pixels go into the decode on the GPU (D-137).
+    CachedTexture* decode_texture(const TextureInfo& t, u32 ea, bool force_compute_dxt, std::string* error,
+        Surface* overlay = nullptr);
+    // D-137: whether a target's pixels can be laid over guest memory on the GPU (else it is written back), and the
+    // encoding of that into `staging` (a copy of `size` bytes of guest memory from `ea`), on the render buffer.
+    bool overlay_supported(const Surface& s);
+    void encode_overlay(Surface& s, const TransientAllocator::Allocation& staging, u32 ea, u32 size);
     id<MTLSamplerState> sampler_for(const TextureInfo& t);
     id<MTLTexture> view_2d(id<MTLTexture> tex, u32 face, u32 level);
     bool read_texture(id<MTLTexture> tex, u32 face, u32 level, u32 w, u32 h, std::vector<std::array<float, 4>>& out);

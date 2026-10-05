@@ -2103,6 +2103,32 @@ game may free the taskset after it.
   instance's exception state; a join waits for the job still running at the shutdown; a chain halted by an unknown
   command is joined and the join returns the error. The taskset's join gets the same checks.
 
+## D-137 · 2026-10-05 · A texture over a render target of another format: the target laid over memory on the GPU; G8B8
+
+On the iPhone the frame rate fell to 2 to 4 fps where GTA V reads its 640x360 F_W16Z16Y16X16 target as a 1280x720
+A8R8G8B8 texture: each time the target went to guest memory first (D-080), a readback the RSX thread waits for (270 in
+one session), with the phone's GPU a frame behind. The other common readback in the phone's logs (325 to 463 a
+session) was a 256x256 G8B8 target read as a G8B8 texture, a format the decoder did not have: the draw failed after
+the wait anyway.
+- A texture of another format over a target the GPU drew since memory last held it is now decoded from a copy of
+  guest memory over which a compute kernel first writes the target's pixels as store_readback lays them in memory
+  (rsx_*_to_memory: the 8-bit formats from their unorm channels, the float ones through an integer view so their
+  bits pass as they are, Z24S8 and Z16 depth buffers), on the render buffer after the passes that drew it. Guest
+  memory is not written. The cached texture keeps the target's serial (never reused) and generations, and is decoded
+  again when the target is drawn to again or another target, or none, is newer there.
+  MetalBackendConfig::overlay_targets (PSPOCKET_RSX_WRITE_BACK_TARGETS) returns to the write-back.
+- G8B8 textures decode as RPCS3 uploads them (the big-endian halfword into R8G8: red the B byte, green the G byte) and
+  read (A, R, G, B) = (G, B, G, B), RPCS3's mapping; a G8B8 texture over a G8B8 target samples the target, whose RG8
+  copy holds the same.
+- The tests found a target whose open pass had only a clear so far laid over before the clear ran: a load action runs
+  with its pass and counts in the generation then. bind_texture now runs such a pass before reading its target.
+- Measured (Mac, run 080's walk with --gpu metal): readbacks the RSX thread waited for, 42 in the walk (0.09 to 0.16 ms
+  a frame) before, 0 after; "G8B8 is not decoded yet" gone. The phone's numbers come with its next build.
+- Tests: a float16 target read as an A8R8G8B8 texture twice as wide and twice as tall (its lower half memory) gives
+  the same pixels laid over as written back, without a readback; laid over again after the target is cleared, the
+  clear seen; a Z24S8 buffer read as R5G6B5 of another size likewise; a G8B8 target sampled and G8B8 memory decoded;
+  G8B8 in the GPU against CPU decode comparison.
+
 ## D-139 · 2026-10-05 · The rest of GTA V's PSN imports: sceNp2, the store, Facebook, and the sceNp functions D-059 left
 
 The user asked for every unimplemented import to be done before the next phone build, so a call the game makes later

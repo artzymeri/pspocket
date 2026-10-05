@@ -30,7 +30,7 @@ struct rsx_decode_params {
 // TexelDecode values (runtime/rsx/include/pspocket/rsx/texture.hpp)
 constant uint kARGB8 = 1, kDRGB8 = 2, kR5G6B5 = 3, kA1R5G5B5 = 4, kD1R5G5B5 = 5, kA4R4G4B4 = 6, kR5G5B5A1 = 7,
               kR6G5B5 = 8, kB8 = 9, kX32F = 10, kW16F = 11, kW32F = 12, kY16X16F = 13, kX16 = 14, kY16X16 = 15,
-              kDXT1 = 16, kDXT23 = 17, kDXT45 = 18, kD16 = 19;
+              kDXT1 = 16, kDXT23 = 17, kDXT45 = 18, kD16 = 19, kG8B8 = 20;
 
 static uint morton(uint x, uint y, uint lw, uint lh)
 {
@@ -117,6 +117,7 @@ static float4 decode_texel(device const uchar* src, uint o, constant rsx_decode_
     switch (p.format) {
     case kARGB8: c = rgba8(src[o + 1], src[o + 2], src[o + 3], src[o]); break;
     case kDRGB8: c = rgba8(src[o + 1], src[o + 2], src[o + 3], 255u); break;
+    case kG8B8: c = rgba8(src[o + 1], src[o], 0u, 255u); break;
     case kR5G6B5: { const uint v = ld16be(src, o); c = rgba8(expand5(v >> 11), expand6((v >> 5) & 63u), expand5(v & 31u), 255u); break; }
     case kA1R5G5B5: { const uint v = ld16be(src, o); c = rgba8(expand5((v >> 10) & 31u), expand5((v >> 5) & 31u), expand5(v & 31u), (v >> 15) != 0u ? 255u : 0u); break; }
     case kD1R5G5B5: { const uint v = ld16be(src, o); c = rgba8(expand5((v >> 10) & 31u), expand5((v >> 5) & 31u), expand5(v & 31u), 255u); break; }
@@ -210,6 +211,106 @@ kernel void rsx_color_to_texture(texture2d<float, access::read> src [[texture(0)
     float4 o = float4(0.0, 0.0, 0.0, 1.0);
     if (p.x == kY16X16) o = float4(float(word >> 16) / 65535.0, float(word & 0xffffu) / 65535.0, 0.0, 1.0);
     dst.write(o, gid);
+}
+
+// A render target's pixels as the RSX lays them out in memory (store_readback's bytes, surface_cache.mm), written into
+// a buffer that holds a copy of the guest memory under a texture of another format, which then decodes it (D-137): the
+// target's newer pixels reach the texture on the GPU, without a write-back the RSX thread waits for. Mirrors
+// OverlayParams in texture_cache.mm.
+struct rsx_overlay_params {
+    uint mode;     // kOv*
+    uint width;    // the target's size in pixels
+    uint height;
+    uint pitch;    // its bytes per row in memory (linear targets)
+    int delta;     // its address minus the buffer's
+    uint size;     // the buffer's bytes
+    uint swizzled; // Morton order (power-of-two colour targets, D-111)
+    uint log2_w;
+    uint log2_h;
+    uint bpp;      // its bytes per pixel in memory
+    uint alpha;    // the X formats' top bits: the pixel's alpha (0), zero (1) or one (2)
+    uint pad;
+};
+constant uint kOvARGB8 = 0, kOvABGR8 = 1, kOvB8 = 2, kOvG8B8 = 3, kOvR5G6B5 = 4, kOvX1R5G5B5 = 5, kOvF16x4 = 6,
+              kOvF32x4 = 7, kOvF32 = 8, kOvZ24S8 = 9, kOvZ16 = 10;
+
+static void overlay_store(device uchar* dst, constant rsx_overlay_params& p, uint2 gid, thread const uchar* b)
+{
+    const uint element = p.swizzled != 0u ? morton(gid.x, gid.y, p.log2_w, p.log2_h) * p.bpp : gid.y * p.pitch + gid.x * p.bpp;
+    const int at = p.delta + int(element);
+    for (uint i = 0; i < p.bpp; i++) {
+        const int o = at + int(i);
+        if (o >= 0 && uint(o) < p.size) dst[o] = b[i];
+    }
+}
+
+static uint quantize(uint v, uint max) { return (v * max + 127u) / 255u; }
+
+// The 8-bit formats, from the target's unorm channels (exact: n / 255 rounds back to n).
+kernel void rsx_color_to_memory(texture2d<float, access::read> src [[texture(0)]], device uchar* dst [[buffer(0)]],
+                                constant rsx_overlay_params& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p.width || gid.y >= p.height) return;
+    const float4 c = src.read(gid);
+    const uint r = uint(rint(saturate(c.r) * 255.0)), g = uint(rint(saturate(c.g) * 255.0)),
+               bl = uint(rint(saturate(c.b) * 255.0));
+    const uint a = p.alpha == 1u ? 0u : p.alpha == 2u ? 255u : uint(rint(saturate(c.a) * 255.0));
+    uchar b[4] = {0, 0, 0, 0};
+    switch (p.mode) {
+    case kOvARGB8: b[0] = uchar(a); b[1] = uchar(r); b[2] = uchar(g); b[3] = uchar(bl); break;
+    case kOvABGR8: b[0] = uchar(a); b[1] = uchar(bl); b[2] = uchar(g); b[3] = uchar(r); break;
+    case kOvB8: b[0] = uchar(r); break;                   // the R8 copy holds the target's byte in red
+    case kOvG8B8: b[0] = uchar(g); b[1] = uchar(r); break; // the RG8 copy: blue in red, green in green (D-112)
+    case kOvR5G6B5: {
+        const uint v = (quantize(r, 31u) << 11) | (quantize(g, 63u) << 5) | quantize(bl, 31u);
+        b[0] = uchar(v >> 8); b[1] = uchar(v);
+        break;
+    }
+    case kOvX1R5G5B5: {
+        const uint v = (p.alpha == 2u ? 0x8000u : 0u) | (quantize(r, 31u) << 10) | (quantize(g, 31u) << 5) | quantize(bl, 31u);
+        b[0] = uchar(v >> 8); b[1] = uchar(v);
+        break;
+    }
+    default: break;
+    }
+    overlay_store(dst, p, gid, b);
+}
+
+// The float formats, from an integer view of the target (their bits as they are): each component big-endian, red first.
+kernel void rsx_float_to_memory(texture2d<uint, access::read> src [[texture(0)]], device uchar* dst [[buffer(0)]],
+                                constant rsx_overlay_params& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p.width || gid.y >= p.height) return;
+    const uint4 v = src.read(gid);
+    uchar b[16];
+    if (p.mode == kOvF16x4) {
+        for (uint i = 0; i < 4u; i++) { b[2u * i] = uchar(v[i] >> 8); b[2u * i + 1u] = uchar(v[i]); }
+    } else {
+        const uint n = p.mode == kOvF32x4 ? 4u : 1u;
+        for (uint i = 0; i < n; i++) {
+            b[4u * i] = uchar(v[i] >> 24); b[4u * i + 1u] = uchar(v[i] >> 16);
+            b[4u * i + 2u] = uchar(v[i] >> 8); b[4u * i + 3u] = uchar(v[i]);
+        }
+    }
+    overlay_store(dst, p, gid, b);
+}
+
+// A depth buffer: Z24S8 as big-endian words (depth in bits 31-8, stencil in 7-0), Z16 as big-endian halfwords.
+kernel void rsx_depth_to_memory(depth2d<float, access::read> depth [[texture(0)]],
+                                texture2d<uint, access::read> stencil [[texture(1)]], device uchar* dst [[buffer(0)]],
+                                constant rsx_overlay_params& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p.width || gid.y >= p.height) return;
+    const float z = depth.read(gid);
+    uchar b[4];
+    if (p.mode == kOvZ16) {
+        const uint d = uint(rint(saturate(z) * 65535.0));
+        b[0] = uchar(d >> 8); b[1] = uchar(d);
+    } else {
+        const uint w = (uint(rint(saturate(z) * 16777215.0)) << 8) | (stencil.read(gid).r & 0xffu);
+        b[0] = uchar(w >> 24); b[1] = uchar(w >> 16); b[2] = uchar(w >> 8); b[3] = uchar(w);
+    }
+    overlay_store(dst, p, gid, b);
 }
 
 // Reads a texture back as float4 per texel (nearest sampling at texel centres: works for every format, BCn included).

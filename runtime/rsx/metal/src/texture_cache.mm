@@ -6,6 +6,7 @@
 
 #include "metal_internal.hpp"
 
+#include <bit>
 #include <format>
 
 #include "pspocket/rsx/gcm.hpp"
@@ -30,6 +31,25 @@ struct DecodeParams {
     u32 slice_bytes;
     u32 pad;
 };
+
+// Mirrors rsx_overlay_params in kernels.hpp (D-137).
+struct OverlayParams {
+    u32 mode;
+    u32 width;
+    u32 height;
+    u32 pitch;
+    s32 delta;
+    u32 size;
+    u32 swizzled;
+    u32 log2_w;
+    u32 log2_h;
+    u32 bpp;
+    u32 alpha;
+    u32 pad;
+};
+// kOv* in kernels.hpp
+enum OverlayMode : u32 { kOvARGB8, kOvABGR8, kOvB8, kOvG8B8, kOvR5G6B5, kOvX1R5G5B5, kOvF16x4, kOvF32x4, kOvF32, kOvZ24S8,
+                         kOvZ16 };
 
 u64 mix(u64 h, u64 v)
 {
@@ -103,7 +123,69 @@ id<MTLTexture> MetalBackend::Impl::view_2d(id<MTLTexture> tex, u32 face, u32 lev
                                        slices:NSMakeRange(face, 1)];
 }
 
-CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, bool force_compute_dxt, std::string* error)
+// D-137: the formats store_readback writes, as long as the backend is not told to write targets back instead.
+bool MetalBackend::Impl::overlay_supported(const Surface& s) { return config.overlay_targets && readback_supported(s); }
+
+// The target's pixels into the staging copy of the guest memory a texture decodes, as store_readback would have put
+// them into guest memory (rsx_*_to_memory, kernels.hpp), on the render buffer after the passes that drew it (D-137).
+// The float formats are read through an integer view, so their bits arrive as they are.
+void MetalBackend::Impl::encode_overlay(Surface& s, const TransientAllocator::Allocation& staging, u32 ea, u32 size)
+{
+    OverlayParams p{};
+    p.width = s.width;
+    p.height = s.height;
+    p.pitch = s.pitch;
+    p.delta = static_cast<s32>(static_cast<s64>(s.address) - static_cast<s64>(ea));
+    p.size = size;
+    p.swizzled = s.swizzled ? 1 : 0;
+    p.log2_w = s.swizzled ? static_cast<u32>(std::countr_zero(s.width)) : 0;
+    p.log2_h = s.swizzled ? static_cast<u32>(std::countr_zero(s.height)) : 0;
+    id<MTLComputePipelineState> pipeline = color_memory_pipeline;
+    id<MTLTexture> src = s.texture, stencil = nil;
+    if (s.depth) {
+        const bool z16 = s.pixel_format == MTLPixelFormatDepth16Unorm;
+        p.mode = z16 ? kOvZ16 : kOvZ24S8;
+        p.bpp = z16 ? 2 : 4;
+        pipeline = depth_memory_pipeline;
+        stencil = z16 ? dummy_stencil : [s.texture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+    } else {
+        p.bpp = surface_color_bpp(s.gcm_format);
+        const auto bits = [&](MTLPixelFormat view) {
+            pipeline = float_memory_pipeline;
+            src = [s.texture newTextureViewWithPixelFormat:view];
+        };
+        switch (static_cast<SurfaceColorFormat>(s.gcm_format)) {
+        case SurfaceColorFormat::A8R8G8B8: p.mode = kOvARGB8; break;
+        case SurfaceColorFormat::X8R8G8B8_Z8R8G8B8: p.mode = kOvARGB8, p.alpha = 1; break;
+        case SurfaceColorFormat::X8R8G8B8_O8R8G8B8: p.mode = kOvARGB8, p.alpha = 2; break;
+        case SurfaceColorFormat::A8B8G8R8: p.mode = kOvABGR8; break;
+        case SurfaceColorFormat::X8B8G8R8_Z8B8G8R8: p.mode = kOvABGR8, p.alpha = 1; break;
+        case SurfaceColorFormat::X8B8G8R8_O8B8G8R8: p.mode = kOvABGR8, p.alpha = 2; break;
+        case SurfaceColorFormat::B8: p.mode = kOvB8; break;
+        case SurfaceColorFormat::G8B8: p.mode = kOvG8B8; break;
+        case SurfaceColorFormat::R5G6B5: p.mode = kOvR5G6B5; break;
+        case SurfaceColorFormat::X1R5G5B5_Z1R5G5B5: p.mode = kOvX1R5G5B5, p.alpha = 1; break;
+        case SurfaceColorFormat::X1R5G5B5_O1R5G5B5: p.mode = kOvX1R5G5B5, p.alpha = 2; break;
+        case SurfaceColorFormat::F_W16Z16Y16X16: p.mode = kOvF16x4, bits(MTLPixelFormatRGBA16Uint); break;
+        case SurfaceColorFormat::F_W32Z32Y32X32: p.mode = kOvF32x4, bits(MTLPixelFormatRGBA32Uint); break;
+        case SurfaceColorFormat::F_X32: p.mode = kOvF32, bits(MTLPixelFormatR32Uint); break;
+        default: PS_FATAL(kChan, "encode_overlay: surface format {} has no overlay (overlay_supported)", s.gcm_format);
+        }
+    }
+    end_pass_for(kEndTargetOverlay);
+    id<MTLComputeCommandEncoder> enc = [render_buffer() computeCommandEncoder];
+    [enc setComputePipelineState:pipeline];
+    [enc setTexture:src atIndex:0];
+    if (stencil) [enc setTexture:stencil atIndex:1];
+    [enc setBuffer:staging.buffer offset:staging.offset atIndex:0];
+    [enc setBytes:&p length:sizeof(p) atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(s.width, s.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [enc endEncoding];
+    stats.texture_overlays++;
+}
+
+CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, bool force_compute_dxt, std::string* error,
+    Surface* overlay)
 {
     std::string why;
     auto layout = compute_texture_layout(t, &why);
@@ -153,10 +235,16 @@ CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, 
     entry->watch = tracker.watch(ea, size);
     auto staging = transient.alloc(size, 256);
     std::memcpy(staging.data, mem.host(ea), size);
+    // A target the GPU drew since memory held it goes over the copy, and the decode follows on the render buffer (D-137).
+    if (overlay) {
+        encode_overlay(*overlay, staging, ea, size);
+        entry->overlay = {overlay->serial, overlay->generation, overlay->stencil_generation};
+    }
+    id<MTLCommandBuffer> cb = overlay ? render_buffer() : upload_buffer();
 
     if (layout->volume) {
         // A 3D texture (D-102): every slice of a level in one dispatch.
-        id<MTLComputeCommandEncoder> enc = [upload_buffer() computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:decode3d_pipeline];
         [enc setBuffer:staging.buffer offset:staging.offset atIndex:0];
         for (const TextureLevel& l : layout->levels) {
@@ -183,7 +271,7 @@ CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, 
         }
         [enc endEncoding];
     } else if (use_bc) {
-        id<MTLBlitCommandEncoder> blit = [upload_buffer() blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         for (const TextureLevel& l : layout->levels) {
             [blit copyFromBuffer:staging.buffer
                        sourceOffset:staging.offset + l.offset
@@ -197,7 +285,7 @@ CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, 
         }
         [blit endEncoding];
     } else {
-        id<MTLComputeCommandEncoder> enc = [upload_buffer() computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:decode_pipeline];
         [enc setBuffer:staging.buffer offset:staging.offset atIndex:0];
         for (const TextureLevel& l : layout->levels) {
@@ -300,6 +388,14 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     // A render target at this address: sample the GPU copy (plan section 7: "bind the Metal texture directly") when
     // the texture reads it in its own format.
     Surface* s = find_surface(*ea, false);
+    Surface* overlay = nullptr; // a GPU-newer target whose pixels the decode lays over guest memory (D-137)
+    // A target of the open pass with only a clear so far (a load action) is written, and its generation counted, when
+    // the pass runs: it runs now, so what reads the target below (a conversion, a corner, an overlay, a write-back)
+    // sees the clear (D-137's test found a texture laid over the target before its clear).
+    const auto run_pending_clear = [&](const Surface* target) {
+        if (target && pass_open && !pass_started && pass.contains(target)) end_pass_for(kEndFlush);
+    };
+    run_pending_clear(s);
     if (s) check_cpu_writes(*s);
     if (s) s->last_frame = stats.flips; // sampled: in use (D-116)
     if (s && !s->cpu_newer) sync_surface(*s); // what its children or its parent wrote (D-122)
@@ -311,6 +407,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         const bool argb_texture = fmt->decode == TexelDecode::ARGB8 || fmt->decode == TexelDecode::DRGB8;
         const bool compatible = (argb_texture && surface_color_bpp(s->gcm_format) == 4) ||
             (fmt->decode == TexelDecode::B8 && sf == SurfaceColorFormat::B8) ||
+            (fmt->decode == TexelDecode::G8B8 && sf == SurfaceColorFormat::G8B8) || // both: blue in red, green in green
             (fmt->decode == TexelDecode::W16Z16Y16X16F && sf == SurfaceColorFormat::F_W16Z16Y16X16) ||
             (fmt->decode == TexelDecode::W32Z32Y32X32F && sf == SurfaceColorFormat::F_W32Z32Y32X32) ||
             (fmt->decode == TexelDecode::X32F && sf == SurfaceColorFormat::F_X32);
@@ -334,17 +431,21 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             }
         }
         if (!compatible) {
-            bind_source = "memory, target written back";
-            // Another format over the target's bits (the first mission reads an A8B8G8R8 target as Y16_X16): the
-            // target goes to guest memory, and the texture is decoded from there below (D-080; RPCS3 converts on the
-            // GPU). An expensive readback, logged with the others, and each pair of formats once.
+            // Another format over the target's bits (GTA V reads a 640x360 F_W16Z16Y16X16 target as a 1280x720
+            // A8R8G8B8 texture): the texture is decoded from guest memory below, with the target's pixels laid over
+            // the copy of it on the GPU when the GPU drew it since (D-137, as RPCS3 converts on the GPU). Without that,
+            // the target goes to guest memory first (D-080): a readback the RSX thread waits for, logged with the
+            // others. Each pair of formats is logged once.
+            const bool lay = s->gpu_newer && overlay_supported(*s);
+            bind_source = lay ? "memory, target laid over" : "memory, target written back";
             if (reinterpretations.insert((u64{s->gcm_format} << 32) | (u64{t.base_format()} << 16) | (s->width & 0xFFFF))
                     .second) {
                 PS_LOG_INFO(kChan, "texture format {:#04x} ({}x{}) over a {}x{} render target of format {} at {:#010x}: "
-                    "written back and decoded from memory", t.base_format(), t.width, t.height, s->width, s->height,
-                    s->gcm_format, s->address);
+                    "decoded from memory{}", t.base_format(), t.width, t.height, s->width, s->height, s->gcm_format,
+                    s->address, lay ? ", the target laid over it on the GPU" : ", the target written back first");
             }
-            if (s->gpu_newer) write_back(*s, "a texture of another format");
+            if (lay) overlay = s;
+            else if (s->gpu_newer) write_back(*s, "a texture of another format");
             s = nullptr;
         }
     }
@@ -396,6 +497,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         return sample_view(tex, s->views, src);
     }
     if (!s && fmt) {
+        run_pending_clear(find_surface(*ea, true));
         // A depth buffer read as a texture (GTA V's lighting reads Z24S8 as A8R8G8B8 to rebuild positions, and its
         // shadow maps as DEPTH16 and X16): converted on the GPU into what the texture's format makes of the buffer's
         // bits (D-088, as RPCS3 does), when the sizes and formats line up.
@@ -423,25 +525,36 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
                 }
             }
         }
-        // Otherwise its bits go to guest memory, in the RSX's layout, and the texture decodes them: an expensive
-        // readback, logged with the others.
+        // Otherwise the texture decodes its bits in the RSX's layout from guest memory, the buffer laid over the copy
+        // on the GPU (D-137) or written back first (an expensive readback, logged with the others).
         if (Surface* d = find_surface(*ea, true); d && !d->cpu_newer && d->gpu_newer) {
+            const bool lay = overlay_supported(*d);
             if (reinterpretations.insert((u64{0x100 | d->gcm_format} << 32) | (u64{t.base_format()} << 16) |
                                          (d->width & 0xFFFF)).second) {
                 PS_LOG_INFO(kChan, "texture format {:#04x} ({}x{}) over a {}x{} depth buffer of format {} at {:#010x}: "
-                    "written back and decoded from memory", t.base_format(), t.width, t.height, d->width, d->height,
-                    d->gcm_format, d->address);
+                    "decoded from memory{}", t.base_format(), t.width, t.height, d->width, d->height, d->gcm_format,
+                    d->address, lay ? ", the buffer laid over it on the GPU" : ", the buffer written back first");
             }
-            if (write_back(*d, "a texture")) bind_source = "memory, depth written back";
+            if (lay) {
+                sync_surface(*d);
+                overlay = d;
+                bind_source = "memory, depth laid over";
+            } else if (write_back(*d, "a texture")) {
+                bind_source = "memory, depth written back";
+            }
         }
     }
 
     const u64 key = texture_key(t, *ea, false);
     CachedTexture* entry = nullptr;
     const u64 epoch = check_epoch();
+    const CachedTexture::Overlay want = overlay
+        ? CachedTexture::Overlay{overlay->serial, overlay->generation, overlay->stencil_generation}
+        : CachedTexture::Overlay{};
     if (auto it = textures.find(key); it != textures.end()) {
-        bool dirty = false;
-        if (it->second->checked != epoch) {
+        // Decoded over another target, or before this one was drawn to again, or over one guest memory now holds.
+        bool dirty = it->second->overlay != want;
+        if (!dirty && it->second->checked != epoch) {
             // Protection mode reads the bytes only when a page under the texture was written (D-134).
             bool hashed = false;
             dirty = tracker.check(it->second->watch, &hashed);
@@ -459,7 +572,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     }
     if (!entry) {
         std::string why;
-        entry = decode_texture(t, *ea, false, &why);
+        entry = decode_texture(t, *ea, false, &why, overlay);
         if (!entry) {
             unsupported(why);
             ok = false;

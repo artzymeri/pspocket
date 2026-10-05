@@ -135,7 +135,7 @@ TEST_CASE("metal: Morton unswizzle and byte swap match the CPU reference")
     CHECK(compare_decode(g, tex_info(tex::A8R8G8B8 | tex::kLinearFlag, 48, 20, 1, 256), 0, 0, false, true) == 0);
     // 16-bit and 8-bit formats, swizzled
     for (u32 f : {tex::R5G6B5, tex::A1R5G5B5, tex::A4R4G4B4, tex::R5G5B5A1, tex::D1R5G5B5, tex::R6G5B5, tex::B8,
-             tex::D8R8G8B8}) {
+             tex::D8R8G8B8, tex::G8B8}) {
         INFO("format " << f);
         CHECK(compare_decode(g, tex_info(f, 32, 16, 2), 0, 0, false, true) == 0);
         CHECK(compare_decode(g, tex_info(f, 32, 16, 2), 0, 1, false, true) == 0);
@@ -684,7 +684,8 @@ struct E2E {
     static constexpr u32 kCmdEa = 0x00200000;
     static constexpr u32 kReadbackEa = 0x00400000; // main memory, IO 0x00100000
 
-    explicit E2E(u32 capture_every = 0, std::string shader_cache = {}, u32 evict_after_flips = 1800)
+    explicit E2E(u32 capture_every = 0, std::string shader_cache = {}, u32 evict_after_flips = 1800,
+        bool overlay_targets = true)
     {
         PS_CHECK(mem.reserve());
         PS_CHECK(mem.commit(kCmdEa, 0x100000));
@@ -719,6 +720,7 @@ struct E2E {
         mc.shader_cache = std::move(shader_cache);
         mc.shader_cache_threads = 2;
         mc.evict_after_flips = evict_after_flips;
+        mc.overlay_targets = overlay_targets;
         mc.capture = [this](const u8* bgra, u32 w, u32 h, u64 flip) {
             std::lock_guard lock(capture_mutex);
             captures.emplace_back(flip, std::vector<u8>(bgra, bgra + usize{w} * h * 4));
@@ -1163,8 +1165,8 @@ void setup_surface_as(CommandBuilder& b, u32 offset, SurfaceColorFormat format, 
     }
 }
 
-// Texture unit 0: a linear texture of the given format at a local memory offset, kW x kH, identity remap.
-void bind_linear_texture(CommandBuilder& b, u32 offset, u32 format, u32 pitch)
+// Texture unit 0: a linear texture of the given format at a local memory offset, kW x kH unless given, identity remap.
+void bind_linear_texture(CommandBuilder& b, u32 offset, u32 format, u32 pitch, u32 w = kW, u32 h = kH)
 {
     b.method(m::NV4097_SET_TEXTURE_OFFSET, {
         offset,
@@ -1173,7 +1175,7 @@ void bind_linear_texture(CommandBuilder& b, u32 offset, u32 format, u32 pitch)
         (1u << 31),
         tex::kRemapIdentity,
         (1u << 16) | (1u << 24),
-        (kW << 16) | kH,
+        (w << 16) | h,
         0,
     });
     b.method(m::NV4097_SET_TEXTURE_CONTROL3, pitch);
@@ -2034,6 +2036,212 @@ TEST_CASE("metal e2e: an A8B8G8R8 target read as a Y16_X16 texture converts on t
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().readbacks == 0); // run 066: a write-back and a decode from memory every frame
     CHECK(e.backend->stats().color_conversions == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x20, 0x80, 0x20, 0x80});
+}
+
+namespace {
+
+// GTA V reads its 640x360 F_W16Z16Y16X16 target as a 1280x720 A8R8G8B8 texture. Here: a float16 target with a
+// gradient drawn into it, then a pass that samples it as an A8R8G8B8 texture twice as wide and twice as tall (its lower
+// half is the memory after the target, a pattern). Returns the second target's bytes; `readbacks`: the readbacks before
+// they were flushed (the flush is one); `end`: where the commands end.
+std::vector<u8> sample_f16_as_argb(E2E& e, u64& readbacks, u32* end = nullptr)
+{
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xff102030, 0x40ff8000, 0x2050ffff});
+    for (u32 i = 0; i < kW * 8 * kH; i++) {
+        ps_write8(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceB + kW * 8 * kH + i, static_cast<u8>(i * 7 + 3));
+    }
+    auto b = e.at(0);
+    setup_surface_as(b, kSurfaceB, SurfaceColorFormat::F_W16Z16Y16X16, kW * 8);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x80402010);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_linear_texture(b, kSurfaceB, tex::A8R8G8B8, kW * 8, 2 * kW, 2 * kH);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    if (end) *end = b.offset();
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    readbacks = e.backend->stats().readbacks;
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    const u8* p = e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset);
+    return {p, p + kW * kH * 4};
+}
+
+} // namespace
+
+TEST_CASE("metal e2e: a float16 target read as a wider A8R8G8B8 texture is laid over memory on the GPU, as a "
+          "write-back would give, without one (D-137)")
+{
+    REQUIRE_METAL();
+    E2E laid;
+    u64 readbacks = 0;
+    const std::vector<u8> on_gpu = sample_f16_as_argb(laid, readbacks);
+    CHECK(readbacks == 0);
+    CHECK(laid.backend->stats().texture_overlays == 1);
+    // The target's memory was not written: guest memory still has what was there before (zeros).
+    CHECK(ps_read32(laid.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceB + (40 * kW + 32) * 8) == 0);
+
+    E2E written(0, {}, 1800, false);
+    const std::vector<u8> from_memory = sample_f16_as_argb(written, readbacks);
+    CHECK(readbacks == 1);
+    CHECK(written.backend->stats().texture_overlays == 0);
+    CHECK(on_gpu == from_memory);
+
+    // Both halves were sampled: rows above the middle read the target's rows, the ones below the pattern after it.
+    usize from_target = 0, from_pattern = 0;
+    for (u32 y = 0; y < kH; y++) {
+        for (u32 x = 0; x < kW; x++) {
+            const u8* px = &on_gpu[(y * kW + x) * 4];
+            if (px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 0) continue; // outside the triangle
+            (y < kH / 2 ? from_target : from_pattern)++;
+        }
+    }
+    CHECK(from_target > 100);
+    CHECK(from_pattern > 100);
+}
+
+TEST_CASE("metal e2e: a texture laid over a target is decoded again after the target is drawn to again (D-137)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    u32 end = 0;
+    u64 readbacks = 0;
+    sample_f16_as_argb(e, readbacks, &end);
+    REQUIRE(e.backend->stats().texture_overlays == 1);
+    // The same texture again, the target untouched: the cached decode.
+    auto b = e.at(end);
+    bind_linear_texture(b, kSurfaceB, tex::A8R8G8B8, kW * 8, 2 * kW, 2 * kH);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(e.backend->stats().texture_overlays == 1);
+    // The target cleared again, then sampled: laid over again.
+    auto c = e.at(b.offset());
+    setup_surface_as(c, kSurfaceB, SurfaceColorFormat::F_W16Z16Y16X16, kW * 8);
+    c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    setup_surface(c, kSurfaceOffset);
+    bind_linear_texture(c, kSurfaceB, tex::A8R8G8B8, kW * 8, 2 * kW, 2 * kH);
+    draw_triangle(c);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().texture_overlays == 2);
+    CHECK(e.backend->stats().readbacks == 1); // the first flush
+    // Opaque green in float16 is 0000 3C00 0000 3C00 in memory (R G B A, big-endian): A8R8G8B8 texels 00 00 3C 00, each
+    // alpha 0x00, red 0x00, green 0x3C, blue 0x00. Row 20 samples the texture's row 41: the target's.
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 20) == std::array<u8, 4>{0x00, 0x00, 0x3C, 0x00});
+}
+
+TEST_CASE("metal e2e: a Z24S8 depth buffer read as a texture of another size is laid over memory on the GPU, as a "
+          "write-back would give (D-137)")
+{
+    REQUIRE_METAL();
+    constexpr u32 kDepth = 0x180000;
+    u64 readbacks = 0;
+    const auto run = [&](E2E& e) {
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        auto b = e.at(0);
+        setup_surface_as(b, kSurfaceB, SurfaceColorFormat::A8R8G8B8, kW * 4, kDepth);
+        b.method(m::NV4097_SET_STENCIL_MASK, 0xff);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x12345678);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth | clear::kStencil);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        // R5G6B5 texels, two per depth word: a format no GPU conversion of a depth buffer gives (D-088)
+        bind_linear_texture(b, kDepth, tex::R5G6B5, kW * 4, 2 * kW, kH);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        readbacks = e.backend->stats().readbacks;
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const u8* p = e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset);
+        return std::vector<u8>(p, p + kW * kH * 4);
+    };
+    E2E laid;
+    const std::vector<u8> on_gpu = run(laid);
+    CHECK(readbacks == 0);
+    CHECK(laid.backend->stats().texture_overlays == 1);
+    E2E written(0, {}, 1800, false);
+    const std::vector<u8> from_memory = run(written);
+    CHECK(readbacks == 1);
+    CHECK(on_gpu == from_memory);
+    // Texel 2n+1 of a row is the word's low half, 0x5678: R5G6B5 red 10, green 51, blue 24, expanded to 8 bits
+    // (RPCS3's expansion); the even texels hold 0x1234 (red 2, green 17, blue 20).
+    const auto px = guest_pixel(laid, kSurfaceOffset, 32, 48);
+    const bool low = px == std::array<u8, 4>{0xff, 0x52, 0xCE, 0xC5};
+    const bool high = px == std::array<u8, 4>{0xff, 0x10, 0x45, 0xA5};
+    CHECK((low || high));
+}
+
+TEST_CASE("metal e2e: a G8B8 target read as a G8B8 texture samples it, (A, R, G, B) = (G, B, G, B), and a G8B8 texture "
+          "in memory decodes the same")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0x10208040, 0x10208040, 0x10208040}); // r 0x10, g 0x20, b 0x80
+    auto b = e.at(0);
+    // Pass 1: a G8B8 target keeps the shader's green and blue
+    setup_surface_as(b, kSurfaceB, SurfaceColorFormat::G8B8, kW * 2);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    // Pass 2: read as a G8B8 texture
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_linear_texture(b, kSurfaceB, tex::G8B8, kW * 2);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_samples == 1);
+    CHECK(e.backend->stats().textures_decoded == 0);
+    CHECK(e.backend->stats().readbacks == 0);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x20, 0x80, 0x20, 0x80});
+    // The target in memory: green, then blue.
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 2));
+    const u8* t = e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceB + (48 * kW + 32) * 2);
+    CHECK(t[0] == 0x20);
+    CHECK(t[1] == 0x80);
+
+    // The same bytes as a texture in plain memory, decoded.
+    for (u32 i = 0; i < kW * kH; i++) {
+        ps_write8(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kTexOffset + 2 * i, 0x20);
+        ps_write8(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kTexOffset + 2 * i + 1, 0x80);
+    }
+    auto c = e.at(b.offset());
+    c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    bind_linear_texture(c, kTexOffset, tex::G8B8, kW * 2);
+    draw_triangle(c);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().textures_decoded == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x20, 0x80, 0x20, 0x80});
 }

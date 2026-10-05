@@ -206,6 +206,7 @@ Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32
     s->swizzled = swizzled;
     s->pixel_format = pf;
     s->texture = tex;
+    s->serial = ++impl.surface_serial;
     s->last_used = impl.tick;
     s->last_frame = impl.stats.flips;
     impl.stats.surfaces_created++;

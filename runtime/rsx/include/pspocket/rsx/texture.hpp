@@ -46,6 +46,7 @@ enum class TexelDecode : u8 {
     DXT23,
     DXT45,
     D16,       // BE u16, unsigned normalized depth -> red, read in every channel (DEPTH16 in memory)
+    G8B8,      // bytes G B -> red B, green G (RPCS3 uploads the big-endian u16 into R8G8), read (A, R, G, B) = (G, B, G, B)
 };
 
 // Decoded storage the GPU texture uses (the backend maps it to a Metal pixel format).

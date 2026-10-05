@@ -127,12 +127,19 @@ bool MetalBackend::Impl::init()
                                                            error:&error];
     decode3d_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_decode_texture3d"]
                                                               error:&error];
+    color_memory_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_color_to_memory"]
+                                                                  error:&error];
+    float_memory_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_float_to_memory"]
+                                                                  error:&error];
+    depth_memory_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_depth_to_memory"]
+                                                                  error:&error];
     MTLRenderPipelineDescriptor* blit = [MTLRenderPipelineDescriptor new];
     blit.vertexFunction = [kernels newFunctionWithName:@"rsx_fullscreen_vs"];
     blit.fragmentFunction = [kernels newFunctionWithName:@"rsx_blit_fs"];
     blit.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     blit_pipeline = [device newRenderPipelineStateWithDescriptor:blit error:&error];
-    if (!decode_pipeline || !read_pipeline || !depth_pipeline || !color_pipeline || !decode3d_pipeline || !blit_pipeline) {
+    if (!decode_pipeline || !read_pipeline || !depth_pipeline || !color_pipeline || !decode3d_pipeline || !blit_pipeline ||
+        !color_memory_pipeline || !float_memory_pipeline || !depth_memory_pipeline) {
         PS_LOG_ERROR(kChan, "backend pipelines failed: {}", error ? error.localizedDescription.UTF8String : "?");
         return false;
     }
@@ -196,6 +203,7 @@ bool MetalBackend::Impl::init()
         outputs.push_back(t);
     }
     check_surfaces = std::getenv("PSPOCKET_RSX_CHECK_SURFACES") != nullptr;
+    if (std::getenv("PSPOCKET_RSX_WRITE_BACK_TARGETS")) config.overlay_targets = false; // D-137's comparison
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
         shader_cache = std::make_unique<ShaderCache>(device, config.shader_cache, config.shader_seeds,
             config.shader_cache_threads);
@@ -1359,7 +1367,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         const u64 gpu = m.gpu_ns->load(std::memory_order_relaxed);
         const double n = static_cast<double>(m.report_flips);
         static constexpr const char* kWhy[Impl::kEndCount] = {"targets", "target copy", "depth conversion",
-            "colour conversion", "submit", "flip", "surface gone", "flush", "other"};
+            "colour conversion", "target overlay", "submit", "flip", "surface gone", "flush", "other"};
         std::string ends;
         for (u32 i = 0; i < Impl::kEndCount; i++) {
             const u64 d = m.pass_ends[i] - m.report_pass_ends[i];
@@ -1368,6 +1376,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         }
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
+                           "{:.2f} targets laid over memory on the GPU; "
                            "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {} programs and {} pipelines "
                            "made ({:.1f} ms); "
                            "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB)",
@@ -1378,6 +1387,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             static_cast<double>(m.stats.deferred_readbacks - m.report_deferred) / n,
             static_cast<double>(m.stats.deferred_conflicts - m.report_conflicts) / n,
             static_cast<double>(m.stats.readback_wait_ns - m.report_readback_ns) / 1e6 / n,
+            static_cast<double>(m.stats.texture_overlays - m.report_overlays) / n,
             static_cast<double>(m.stats.texture_checks - m.report_texture_checks) / n,
             static_cast<double>(m.stats.texture_check_bytes - m.report_texture_bytes) / 1048576.0 / n,
             static_cast<double>(m.tracker.faults_handled() - m.report_faults) / n,
@@ -1392,6 +1402,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_texture_bytes = m.stats.texture_check_bytes;
         m.report_faults = m.tracker.faults_handled();
         m.report_readback_ns = m.stats.readback_wait_ns;
+        m.report_overlays = m.stats.texture_overlays;
         m.report_readbacks = m.stats.readbacks;
         m.report_deferred = m.stats.deferred_readbacks;
         m.report_conflicts = m.stats.deferred_conflicts;

@@ -76,6 +76,10 @@ struct MetalBackendConfig {
     u32 shader_cache_threads = 0;
     // Textures and surfaces unused for this many flips are freed (D-116; a minute at 30 fps).
     u32 evict_after_flips = 1800;
+    // A texture of another format over a render target the GPU drew since guest memory last held it is decoded with
+    // the target's pixels laid over a copy of the memory on the GPU (D-137). False (or PSPOCKET_RSX_WRITE_BACK_TARGETS
+    // set): the target is written back first, a readback the RSX thread waits for, as before.
+    bool overlay_targets = true;
 };
 
 struct BackendStats {
@@ -111,6 +115,7 @@ struct BackendStats {
     u64 texture_check_bytes = 0; // the bytes those checks hashed
     u64 depth_conversions = 0; // depth buffers converted on the GPU for a texture that reads them (D-088)
     u64 color_conversions = 0; // colour targets converted on the GPU for a texture of another format (D-098)
+    u64 texture_overlays = 0;  // targets laid over guest memory on the GPU for a texture decoded from it (D-137)
     u64 occlusion_reports = 0; // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) answered from the GPU's counters (D-102)
     u64 flips = 0;
     u64 command_buffers = 0;

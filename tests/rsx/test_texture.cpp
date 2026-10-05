@@ -271,6 +271,18 @@ TEST_CASE("remap decoding and channel sources")
     CHECK(texture_channel_sources(x16, tex::kRemapIdentity) == std::array<u8, 4>{kChannelOne, 0, kChannelOne, 0});
     const TextureFormatInfo& y16x16 = *texture_format_info(tex::Y16_X16);
     CHECK(texture_channel_sources(y16x16, tex::kRemapIdentity) == std::array<u8, 4>{0, 1, 0, 1});
+    // G8B8 too (D-137): its bytes G B decode to red B, green G, read (A, R, G, B) = (G, B, G, B).
+    const TextureFormatInfo& g8b8 = *texture_format_info(tex::G8B8);
+    CHECK(g8b8.decode == TexelDecode::G8B8);
+    CHECK(texture_channel_sources(g8b8, tex::kRemapIdentity) == std::array<u8, 4>{0, 1, 0, 1});
+    const auto layout = compute_texture_layout(make_texture(tex::G8B8 | tex::kLinearFlag, 1, 1, 1, 2));
+    REQUIRE(layout.has_value());
+    const u8 texel[2] = {0x20, 0x80};
+    std::vector<std::array<float, 4>> out;
+    REQUIRE(decode_level_cpu(*layout, layout->levels[0], texel, out));
+    REQUIRE(out.size() == 1);
+    CHECK(static_cast<int>(out[0][0] * 255.f + 0.5f) == 0x80);
+    CHECK(static_cast<int>(out[0][1] * 255.f + 0.5f) == 0x20);
     // The depth formats read their value in every channel, like X32_FLOAT.
     const TextureFormatInfo& d16 = *texture_format_info(tex::DEPTH16);
     CHECK(d16.decode == TexelDecode::D16);

@@ -22,7 +22,7 @@ constexpr TextureFormatInfo kFormats[] = {
     {tex::COMPRESSED_DXT1, "DXT1", 8, 4, TexelDecode::DXT1, DecodedFormat::BC1},
     {tex::COMPRESSED_DXT23, "DXT23", 16, 4, TexelDecode::DXT23, DecodedFormat::BC2},
     {tex::COMPRESSED_DXT45, "DXT45", 16, 4, TexelDecode::DXT45, DecodedFormat::BC3},
-    {tex::G8B8, "G8B8", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
+    {tex::G8B8, "G8B8", 2, 1, TexelDecode::G8B8, DecodedFormat::RGBA8},
     {tex::COMPRESSED_B8R8_G8R8, "COMPRESSED_B8R8_G8R8", 4, 2, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::COMPRESSED_R8B8_R8G8, "COMPRESSED_R8B8_R8G8", 4, 2, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::R6G5B5, "R6G5B5", 2, 1, TexelDecode::R6G5B5, DecodedFormat::RGBA8},
@@ -221,9 +221,10 @@ std::array<u8, 4> texture_channel_sources(const TextureFormatInfo& fmt, u32 rema
     case TexelDecode::W16Z16Y16X16F:
     case TexelDecode::W32Z32Y32X32F:
     case TexelDecode::Y16X16F: float_format = true; break;
-    // RPCS3 VKFormats.cpp get_component_mapping (A, R, G, B): X16 {R, 1, R, 1}, Y16_X16 {G, R, G, R}.
+    // RPCS3 VKFormats.cpp get_component_mapping (A, R, G, B): X16 {R, 1, R, 1}, Y16_X16 and G8B8 {G, R, G, R}.
     case TexelDecode::X16: base = {0, kChannelOne, 0, kChannelOne}; break;
-    case TexelDecode::Y16X16: base = {1, 0, 1, 0}; break;
+    case TexelDecode::Y16X16:
+    case TexelDecode::G8B8: base = {1, 0, 1, 0}; break;
     default: break;
     }
     TextureRemap r = decode_remap(remap);
@@ -328,6 +329,7 @@ bool decode_level_cpu(const TextureLayout& layout, const TextureLevel& level, co
             switch (fmt.decode) {
             case TexelDecode::ARGB8: o = rgba8(p[1], p[2], p[3], p[0]); break;
             case TexelDecode::DRGB8: o = rgba8(p[1], p[2], p[3], 255); break;
+            case TexelDecode::G8B8: o = rgba8(p[1], p[0], 0, 255); break;
             case TexelDecode::R5G6B5: {
                 const u32 v = ps_ld16(p);
                 o = rgba8(expand5(v >> 11), expand6((v >> 5) & 63), expand5(v & 31), 255);
