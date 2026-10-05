@@ -50,19 +50,26 @@ struct CostEstimate {
 };
 CostEstimate estimate_cost(const std::string& source_text, FileKind kind);
 
-// The time left of a build, from the predicted costs and what the files done so far really took (D-152). A rate per
-// group of files (real seconds per predicted second: PPU and SPU predictions err differently, run 093) starts from a
-// prior and follows that group's files as they finish; the files left are laid out over the workers, slowest first,
-// as the builder runs them.
+// The time left of a build, from the predicted costs and what the files done so far really took (D-152, D-153). A
+// rate per kind of file (real seconds per predicted second: PPU and SPU predictions err differently, runs 093-095)
+// starts from that kind's prior and follows its files as they finish; the files left are laid out over the workers,
+// slowest first, as the builder runs them. A kind's rate does not lean on the others' (the big SPU programs, first to
+// finish and slower than predicted, made the PPU units look 20% slower than they were: run 095).
 class TimeLeft {
 public:
     static constexpr int kGroups = 3; // FileKind
-    // The prior weighs as much as `prior_weight` predicted seconds of files done (build_library: a quarter of the
-    // build, at most 1,000): the first files to finish are the ones that ran fast, so trusting them early said 40%
-    // too little a tenth of the way into GTA V's build (run 094).
+    // A prior weighs as much as `prior_weight` predicted seconds of files done (build_library: a quarter of the build,
+    // at most 1,000): the first files to finish are the ones that ran fast, so trusting them early said 40% too little
+    // a tenth of the way into GTA V's build (run 094).
     explicit TimeLeft(unsigned workers, double prior_rate = 1.0, double prior_weight = 1000.0)
-        : workers_(workers ? workers : 1), prior_rate_(prior_rate), prior_weight_(prior_weight)
+        : workers_(workers ? workers : 1), prior_weight_(prior_weight)
     {
+        for (double& r : prior_rate_) r = prior_rate;
+    }
+    TimeLeft(unsigned workers, const double (&prior_rates)[kGroups], double prior_weight)
+        : workers_(workers ? workers : 1), prior_weight_(prior_weight)
+    {
+        for (int g = 0; g < kGroups; g++) prior_rate_[g] = prior_rates[g];
     }
     void finished(int group, double predicted, double seconds); // a file compiled
     double rate(int group) const;                               // real seconds per predicted second
@@ -75,9 +82,8 @@ public:
 
 private:
     unsigned workers_;
-    double prior_rate_, prior_weight_;
+    double prior_rate_[kGroups] = {1.0, 1.0, 1.0}, prior_weight_;
     double predicted_done_[kGroups] = {}, seconds_done_[kGroups] = {};
-    double all_predicted_ = 0, all_seconds_ = 0;
 };
 
 struct BuildProgress {
@@ -100,7 +106,7 @@ struct BuildOptions {
     double memory_mb = 0;        // compiles start while their predicted peaks fit; 0: no limit
     std::string object_dir;      // objects, kept between builds
     std::string cache_key;       // what else makes an object (the ABI and compiler versions): part of its name
-    double prior_rate = 1.0;     // this machine's speed against the cost model's (TimeLeft)
+    double prior_rates[TimeLeft::kGroups] = {1.0, 1.0, 1.0}; // this machine's speed per FileKind (TimeLeft)
     std::function<void(const BuildProgress&)> progress; // called from the build's threads, one call at a time
     const std::atomic<bool>* cancel = nullptr;
 };
@@ -111,6 +117,7 @@ struct BuildResult {
     size_t compiled = 0, reused = 0; // files compiled now, objects kept from an earlier build
     double compile_seconds = 0, link_seconds = 0;
     double predicted = 0, compile_thread_seconds = 0;
+    double rates[TimeLeft::kGroups] = {1.0, 1.0, 1.0}; // real seconds per predicted second, per FileKind (1: none)
 };
 
 // Compiles the jobs (objects in options.object_dir) and links them, with `extra_objects`, into `output`.

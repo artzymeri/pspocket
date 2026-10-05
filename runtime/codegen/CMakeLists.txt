@@ -27,13 +27,4 @@ if(NOT IOS)
     add_executable(pspocket-cc tools/pspocket_cc.cpp)
     target_link_libraries(pspocket-cc PRIVATE pspocket::codegen)
     pspocket_set_warnings(pspocket-cc)
-    # And a game library from a game's translated C, as the phone makes it (D-152).
-    add_executable(pspocket-prepare tools/pspocket_prepare.cpp)
-    target_link_libraries(pspocket-prepare PRIVATE pspocket::codegen pspocket::codesign pspocket::game
-        pspocket::recomp_common)
-    # CMake repeats static libraries that other static libraries need; Apple's linker warns about the repeats.
-    target_link_options(pspocket-prepare PRIVATE -Wl,-no_warn_duplicate_libraries)
-    target_compile_definitions(pspocket-prepare PRIVATE PSPOCKET_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
-        PSPOCKET_VERSION="${PROJECT_VERSION}")
-    pspocket_set_warnings(pspocket-prepare)
 endif()

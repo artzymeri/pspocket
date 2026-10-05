@@ -1,0 +1,92 @@
+#pragma once
+
+// Preparing a game (route B, stage 4, D-154): from the game's decrypted executable to its game library, on the phone
+// ("Preparing game…") and on the Mac (pspocket-prepare), with the same code. The steps:
+//   1. translate: every PPU function of the executable to C (recomp/ppu, as ppu-lift --elf)
+//   2. compile: every file with the device's compiler, the slowest first, objects kept (codegen::build_library)
+//   3. link, then sign the library (the user's development identity on the phone, ad hoc on the Mac)
+//   4. a manifest beside it: what it was made from and by, so a later launch knows whether it is still current
+// Progress and the time left cover all of it.
+
+#include <atomic>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include "pspocket/codesign/codesign.hpp"
+
+namespace pspocket::prepare {
+
+// Where the device's compiler finds what it compiles against (the app's codegen folder, or the source tree and the
+// LLVM build on the Mac), and what it compiles for.
+struct Toolchain {
+    std::string resource_dir;              // clang's headers
+    std::string sysroot;                   // runtime/codegen/sysroot
+    std::vector<std::string> include_dirs; // the runtime's ABI headers (pspocket/ppu, spu, core, game)
+    std::string entry_source;              // runtime/game/library/library_entry.c
+    std::string target = "arm64-apple-ios17.0", cpu = "apple-a12", platform = "ios", min_os = "17.0";
+};
+
+struct Progress {
+    enum class Phase { Translating, Compiling, Linking, Signing, Done, Failed };
+    Phase phase = Phase::Translating;
+    double fraction = 0;      // of the whole preparation, by time: elapsed / (elapsed + time left)
+    double seconds = 0;       // since it started
+    double seconds_left = -1; // -1: not known yet
+    size_t files_done = 0, files_total = 0;
+    std::string detail;       // what it is doing, in a few words
+};
+
+struct Options {
+    std::string executable;   // the decrypted executable (ELF)
+    std::string title_id;     // "BLES01807"
+    std::string game_dir;     // the game's folder: game.dylib, manifest.json, and the work (ppu/, objects/)
+    std::string ppu_dir;      // translated PPU code to use instead of translating (Mac experiments), or empty
+    std::string spu_dir;      // lifted SPU programs (scripts/lift-spu.sh's output) to include, or empty
+    Toolchain toolchain;
+    unsigned workers = 0;     // 0: one per core
+    double memory_mb = 0;     // compiles start while their predicted peaks fit; 0: no limit
+    const codesign::SigningKey* key = nullptr; // nullptr: ad hoc
+    std::string identifier;   // the signature's identifier (the app's bundle ID on the phone)
+    // This device's speed against the cost model's, per kind of file (PPU code, SPU code, tables): the last
+    // preparation's (Result::rates, the manifest's).
+    double prior_rates[3] = {1.0, 1.0, 1.0};
+    bool keep_sources = false; // keep the translated C after a successful build (it is about 0.8 GB for GTA V)
+    std::vector<std::string> extra_ppu_args, extra_spu_args, llvm_options; // added to translated_code_settings()
+    std::function<void(const Progress&)> progress;
+    // Every file's start (seconds -1) and end, for recording a build (pspocket-prepare --events).
+    std::function<void(const std::string& file, int kind, double predicted, double seconds, double at)> on_file;
+    const std::atomic<bool>* cancel = nullptr;
+};
+
+struct Result {
+    bool ok = false;
+    std::string error;
+    std::string library;        // game_dir/game.dylib
+    double seconds = 0;         // all of it
+    double translate_seconds = 0, compile_seconds = 0, link_seconds = 0, sign_seconds = 0;
+    size_t files_compiled = 0, files_kept = 0;
+    double rates[3] = {1.0, 1.0, 1.0}; // real compile seconds per predicted second here, per kind: the next priors
+};
+
+Result prepare_game(const Options& options);
+
+// What a game library was made from and by (game_dir/manifest.json).
+struct Manifest {
+    std::string title_id, executable_sha256, made_by, compiler;
+    std::string abi_hash, translator_hash; // hex
+    long long made_at = 0;                 // seconds since 1970
+    double seconds = 0;
+    size_t files = 0;
+    double rates[3] = {1.0, 1.0, 1.0};
+};
+bool read_manifest(const std::string& game_dir, Manifest* out);
+
+// Whether game_dir holds a library this build can load for this executable: made for this runtime (ABI hash) from an
+// executable with this SHA-256. A different translator hash leaves it usable (`*why` says a newer translation exists).
+bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why);
+
+// The SHA-256 of a file, in hex ("" if it cannot be read).
+std::string file_sha256(const std::string& path);
+
+} // namespace pspocket::prepare

@@ -24,6 +24,7 @@
 #include "pspocket/recomp/ppu_module.hpp"
 #include "pspocket/recomp/ppu/analyzer.hpp"
 #include "pspocket/recomp/ppu/code_image.hpp"
+#include "pspocket/recomp/ppu/executable.hpp"
 #include "pspocket/recomp/ppu/lifter.hpp"
 
 using namespace pspocket;
@@ -134,37 +135,15 @@ int main(int argc, char** argv)
             std::fprintf(stderr, "ppu-lift: cannot read %s\n", elf_path.c_str());
             return 1;
         }
-        const auto elf = recomp::ElfFile::parse(bytes);
-        if (!elf || !elf->is_ppu()) {
-            std::fprintf(stderr, "ppu-lift: %s is not a PPU ELF%s\n", elf_path.c_str(),
-                elf ? "" : (": " + elf.error().message).c_str());
+        auto loaded = load_executable(bytes);
+        if (!loaded) {
+            std::fprintf(stderr, "ppu-lift: %s: %s\n", elf_path.c_str(), loaded.error().message.c_str());
             return 1;
         }
-        const auto guest = recomp::GuestImage::from_elf(*elf);
-        if (!guest) {
-            std::fprintf(stderr, "ppu-lift: %s: %s\n", elf_path.c_str(), guest.error().message.c_str());
-            return 1;
-        }
-        const auto module = recomp::analyze_ppu_module(*elf, *guest);
-        if (!module) {
-            std::fprintf(stderr, "ppu-lift: %s: %s\n", elf_path.c_str(), module.error().message.c_str());
-            return 1;
-        }
-        for (const auto& seg : guest->segments()) {
-            if (seg.memsz == 0) continue;
-            std::vector<u8> data = seg.data;
-            data.resize(static_cast<usize>(seg.memsz), 0); // bss reads as zero
-            image.add_segment(Segment{seg.vaddr, std::move(data), (seg.flags & 1u) != 0});
-        }
-        const recomp::OpdInfo& opd = module->opd;
-        if (opd.entry_func) seeds.push_back(Seed{*opd.entry_func, opd.toc, "entry"});
-        for (const recomp::OpdEntry& e : opd.entries)
-            if (image.is_code(e.func)) seeds.push_back(Seed{e.func, e.toc, {}});
-        if (!analyzer_options.toc) analyzer_options.toc = opd.toc;
-        if (!quiet)
-            std::printf("ppu-lift: %s: %zu segments, entry %#x, %zu function descriptors (%s), TOC %#x\n", elf_path.c_str(),
-                image.segments().size(), opd.entry_func.value_or(0), opd.entries.size(),
-                std::string(recomp::opd_source_name(opd.source)).c_str(), opd.toc.value_or(0));
+        image = std::move(loaded->image);
+        seeds.insert(seeds.end(), loaded->seeds.begin(), loaded->seeds.end());
+        if (!analyzer_options.toc) analyzer_options.toc = loaded->toc;
+        if (!quiet) std::printf("ppu-lift: %s: %s\n", elf_path.c_str(), loaded->summary.c_str());
     } else {
         std::vector<u8> bytes;
         if (!read_file(image_path, bytes)) {

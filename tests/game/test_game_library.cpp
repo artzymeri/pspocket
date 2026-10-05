@@ -205,17 +205,21 @@ TEST_CASE("game library: a second build keeps every object it can")
     fs::remove_all(dir);
 }
 
-TEST_CASE("time left: follows the files done, per group, and lays the rest out over the workers")
+TEST_CASE("time left: follows the files done, per kind, and lays the rest out over the workers")
 {
     using File = codegen::TimeLeft::File;
     codegen::TimeLeft left(2, 1.0, 10.0);
     CHECK(left.seconds_left({}, {{0, 4, 0}, {0, 4, 0}, {0, 2, 0}, {0, 2, 0}}) == Catch::Approx(6.0)); // 4+2 each
-    // PPU files take 1.5 times their prediction here: the PPU rate follows; the SPU rate leans on the overall one.
+    // PPU files take 1.5 times their prediction here: the PPU rate follows; the SPU rate keeps its own prior (run 095:
+    // leaning on the others made PPU units look 20% slower than they were).
     for (int i = 0; i < 20; i++) left.finished(0, 1.0, 1.5);
-    const double overall = (10.0 + 30.0) / (10.0 + 20.0);
-    CHECK(left.rate(0) == Catch::Approx((overall * 10.0 + 30.0) / (10.0 + 20.0)));
-    CHECK(left.rate(1) == Catch::Approx(overall));
-    // SPU files at twice their prediction, PPU at their prediction: each group keeps its own rate.
+    CHECK(left.rate(0) == Catch::Approx((10.0 + 30.0) / (10.0 + 20.0)));
+    CHECK(left.rate(1) == Catch::Approx(1.0));
+    // Priors per kind, from the last build on this machine.
+    codegen::TimeLeft primed(1, {0.9, 1.2, 0.5}, 100.0);
+    CHECK(primed.rate(0) == Catch::Approx(0.9));
+    CHECK(primed.rate(1) == Catch::Approx(1.2));
+    // SPU files at twice their prediction, PPU at their prediction: each kind keeps its own rate.
     codegen::TimeLeft mixed(1, 1.0, 1.0);
     for (int i = 0; i < 100; i++) {
         mixed.finished(1, 10.0, 20.0);

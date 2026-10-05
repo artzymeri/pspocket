@@ -3,9 +3,10 @@ add_library(pspocket_recomp_ppu STATIC
     src/code_image.cpp
     src/analyzer.cpp
     src/lifter.cpp
+    src/executable.cpp
     src/synthetic.cpp)
 target_include_directories(pspocket_recomp_ppu PUBLIC include)
-target_link_libraries(pspocket_recomp_ppu PUBLIC pspocket::ppu)
+target_link_libraries(pspocket_recomp_ppu PUBLIC pspocket::ppu pspocket::recomp_common)
 pspocket_set_warnings(pspocket_recomp_ppu)
 add_library(pspocket::recomp_ppu ALIAS pspocket_recomp_ppu)
 

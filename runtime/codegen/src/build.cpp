@@ -105,16 +105,12 @@ void TimeLeft::finished(int group, double predicted, double seconds)
     const int g = std::clamp(group, 0, kGroups - 1);
     predicted_done_[g] += predicted;
     seconds_done_[g] += seconds;
-    all_predicted_ += predicted;
-    all_seconds_ += seconds;
 }
 
 double TimeLeft::rate(int group) const
 {
-    // A group with few files done leans on the rate of all files so far, which leans on the prior.
     const int g = std::clamp(group, 0, kGroups - 1);
-    const double overall = (prior_rate_ * prior_weight_ + all_seconds_) / (prior_weight_ + all_predicted_);
-    return (overall * prior_weight_ + seconds_done_[g]) / (prior_weight_ + predicted_done_[g]);
+    return (prior_rate_[g] * prior_weight_ + seconds_done_[g]) / (prior_weight_ + predicted_done_[g]);
 }
 
 double TimeLeft::seconds_left(const std::vector<File>& running, std::vector<File> waiting) const
@@ -189,7 +185,8 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
     size_t next = 0, files_done = result.reused, running = 0;
     double memory_in_use = 0;
     std::vector<std::pair<size_t, Clock::time_point>> active; // (work index, start)
-    TimeLeft left(workers, options.prior_rate, std::min(1000.0, 0.25 * cost_total));
+    TimeLeft left(workers, options.prior_rates, std::min(1000.0, 0.25 * cost_total));
+    double kind_predicted[TimeLeft::kGroups] = {}, kind_seconds[TimeLeft::kGroups] = {};
     std::string first_error;
 
     // Under m. `i` is the file that started or finished (SIZE_MAX: none), `seconds` how long it took (-1: started).
@@ -265,6 +262,9 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
                 cost_done += work[i].job.cost;
                 result.compiled++;
                 left.finished(work[i].job.group, work[i].job.cost, seconds);
+                const int g = std::clamp(work[i].job.group, 0, TimeLeft::kGroups - 1);
+                kind_predicted[g] += work[i].job.cost;
+                kind_seconds[g] += seconds;
             } else if (first_error.empty()) {
                 first_error = std::format("{} did not compile:\n{}", work[i].job.source, diagnostics.substr(0, 4000));
             }
@@ -280,6 +280,8 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
     }
     result.compile_seconds = since(t0);
     result.predicted = cost_total;
+    for (int g = 0; g < TimeLeft::kGroups; g++)
+        if (kind_predicted[g] > 1.0) result.rates[g] = kind_seconds[g] / kind_predicted[g];
     if (!first_error.empty() || (options.cancel && options.cancel->load())) {
         result.error = first_error.empty() ? "cancelled" : first_error;
         std::lock_guard lock(m);
