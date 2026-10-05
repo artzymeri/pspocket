@@ -42,12 +42,14 @@ Commands:
                              /dev_flash files the game loads itself (default inventory/firmware/dev_flash, without the
                              reference-only .sprx). Phone connected and unlocked. They stay on your devices.
   all                        build + install + run --autorun --exit + report.
-  testflight                 gen, then archive the Release build and upload it to App Store Connect (team
-                             M7XJA39ZV6, with the Apple ID Xcode is signed in with) for TestFlight: the way onto an
-                             iPhone that is not connected to this Mac or on its network. The build number is the
-                             commit count, so each upload is higher than the last. App Store Connect needs an app
-                             with the bundle ID first (created once, on the website). The upload holds the game's
-                             translated code: it stays private to the team (internal testers).
+  testflight [--upload-only] gen, then archive the Release build, export it signed for App Store Connect (team
+                             M7XJA39ZV6) and upload it for TestFlight: the way onto an iPhone that is not connected to
+                             this Mac or on its network. The build number is the commit count, so each upload is
+                             higher than the last. App Store Connect needs an app with the bundle ID first (created
+                             once, on the website: its API cannot). The upload holds the game's translated code: it
+                             stays private to the team (internal testers). --upload-only exports and uploads the last
+                             archive. Signs in with an App Store Connect API key when \$PSPOCKET_ASC_KEY_ID is set,
+                             else with the Apple ID Xcode is signed in with.
 
 Options:
   --device ID   devicectl device: identifier, UDID or name. Default: \$PSPOCKET_DEVICE, else the first connected iPhone.
@@ -61,6 +63,9 @@ Environment:
   PSPOCKET_GAME_PPU     the game's translated PPU code (ppu-lift output, --name game_ppu) to build in (default: the
                         inventory/*/ppu-lifted that holds a game_ppu_reg.c, if any)
   PSPOCKET_IOS_BUILD    Xcode output directory: DerivedData, logs, last-run.log, the report (default build/ios)
+  PSPOCKET_ASC_KEY_ID, PSPOCKET_ASC_ISSUER_ID, PSPOCKET_ASC_KEY_PATH
+                        testflight: an App Store Connect API key (the .p8 file, default
+                        ~/.appstoreconnect/private_keys/AuthKey_<ID>.p8, where altool looks for it)
 EOF
 }
 
@@ -96,6 +101,7 @@ while [ $# -gt 0 ]; do
         --device=*) DEVICE="${1#--device=}" ;;
         --autorun) AUTORUN=1 ;;
         --exit) EXIT_AFTER=1 ;;
+        --upload-only) UPLOAD_ONLY=1 ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (scripts/ios.sh --help)" ;;
     esac
@@ -476,29 +482,54 @@ cmd_push_game() {
 }
 
 cmd_testflight() {
-    cmd_gen
-    local hash version build_number archive log options status
-    hash="$(git_hash)"
-    version="$(project_version)"
-    build_number="$(git -C "$ROOT" rev-list --count HEAD)"
+    local hash version build_number archive log options status ipa
+    local auth=()
+    if [ -n "${PSPOCKET_ASC_KEY_ID:-}" ]; then
+        [ -n "${PSPOCKET_ASC_ISSUER_ID:-}" ] || die "PSPOCKET_ASC_KEY_ID needs PSPOCKET_ASC_ISSUER_ID"
+        local key="${PSPOCKET_ASC_KEY_PATH:-$HOME/.appstoreconnect/private_keys/AuthKey_$PSPOCKET_ASC_KEY_ID.p8}"
+        [ -f "$key" ] || die "no API key at $key"
+        auth=(-authenticationKeyPath "$key" -authenticationKeyID "$PSPOCKET_ASC_KEY_ID"
+            -authenticationKeyIssuerID "$PSPOCKET_ASC_ISSUER_ID")
+    fi
     archive="$IOS_BUILD/PSPocket.xcarchive"
-    log="$IOS_BUILD/xcodebuild-archive.log"
-    mkdir -p "$IOS_BUILD"
-    rm -rf "$archive" "$IOS_BUILD/export"
-    say "xcodebuild archive, pspocket $version build $build_number ($hash); full log: $log"
-    set +e +o pipefail
-    xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -destination generic/platform=iOS \
-        -derivedDataPath "$DERIVED" -archivePath "$archive" -allowProvisioningUpdates \
-        PSPOCKET_GIT_HASH="$hash" PSPOCKET_VERSION="$version" CURRENT_PROJECT_VERSION="$build_number" archive 2>&1 \
-        | tee "$log" \
-        | grep --line-buffered -E '(^|: )(error|warning): |^\*\* ARCHIVE ' \
-        | awk '!seen[$0]++ { print; fflush() }' >&2
-    status=${PIPESTATUS[0]}
-    set -e -o pipefail
-    [ "$status" = 0 ] || die "xcodebuild archive failed (status $status); full log: $log"
+    if [ "${UPLOAD_ONLY:-0}" != 1 ]; then
+        cmd_gen
+        hash="$(git_hash)"
+        version="$(project_version)"
+        build_number="$(git -C "$ROOT" rev-list --count HEAD)"
+        log="$IOS_BUILD/xcodebuild-archive.log"
+        mkdir -p "$IOS_BUILD"
+        rm -rf "$archive"
+        say "xcodebuild archive, pspocket $version build $build_number ($hash); full log: $log"
+        set +e +o pipefail
+        xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -destination generic/platform=iOS \
+            -derivedDataPath "$DERIVED" -archivePath "$archive" -allowProvisioningUpdates \
+            PSPOCKET_GIT_HASH="$hash" PSPOCKET_VERSION="$version" CURRENT_PROJECT_VERSION="$build_number" archive 2>&1 \
+            | tee "$log" \
+            | grep --line-buffered -E '(^|: )(error|warning): |^\*\* ARCHIVE ' \
+            | awk '!seen[$0]++ { print; fflush() }' >&2
+        status=${PIPESTATUS[0]}
+        set -e -o pipefail
+        [ "$status" = 0 ] || die "xcodebuild archive failed (status $status); full log: $log"
+    fi
+    [ -d "$archive" ] || die "no archive at $archive (scripts/ios.sh testflight)"
 
-    # App Store Connect distribution, uploaded straight from the export (symbols stay here: the translated code makes
-    # them large, and crash logs are symbolicated with the archive's dSYM).
+    # Signed for App Store Connect into an .ipa here first (symbols stay here: the translated code makes them large,
+    # and crash logs are symbolicated with the archive's dSYM), then uploaded. With an API key: the Apple Distribution
+    # identity in this Mac's keychain and an App Store profile made through the API with the app's capabilities
+    # (scripts/asc.mjs; such keys have no cloud signing). Without one: automatic signing with Xcode's Apple ID.
+    local signing='<key>signingStyle</key><string>automatic</string>'
+    if [ ${#auth[@]} -gt 0 ]; then
+        local serial profile_name="PSPocket App Store"
+        serial="$(security find-certificate -c "Apple Distribution" -p 2>/dev/null | openssl x509 -noout -serial \
+            | sed 's/^serial=//')" || true
+        [ -n "$serial" ] || die "no Apple Distribution certificate in the keychain"
+        node "$ROOT/scripts/asc.mjs" profile "$BUNDLE_ID" "$profile_name" "$serial" \
+            EXTENDED_VIRTUAL_ADDRESSING INCREASED_MEMORY_LIMIT >&2 || die "no App Store profile (scripts/asc.mjs)"
+        signing="<key>signingStyle</key><string>manual</string>
+    <key>signingCertificate</key><string>Apple Distribution</string>
+    <key>provisioningProfiles</key><dict><key>$BUNDLE_ID</key><string>$profile_name</string></dict>"
+    fi
     options="$IOS_BUILD/ExportOptions.plist"
     cat > "$options" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -506,29 +537,55 @@ cmd_testflight() {
 <plist version="1.0">
 <dict>
     <key>method</key><string>app-store-connect</string>
-    <key>destination</key><string>upload</string>
+    <key>destination</key><string>export</string>
     <key>teamID</key><string>M7XJA39ZV6</string>
-    <key>signingStyle</key><string>automatic</string>
+    $signing
     <key>uploadSymbols</key><false/>
     <key>manageAppVersionAndBuildNumber</key><false/>
 </dict>
 </plist>
 PLIST
     log="$IOS_BUILD/xcodebuild-export.log"
-    say "uploading to App Store Connect; full log: $log"
+    rm -rf "$IOS_BUILD/export"
+    say "exporting for App Store Connect; full log: $log"
     set +e +o pipefail
-    xcodebuild -exportArchive -archivePath "$archive" -exportOptionsPlist "$options" -exportPath "$IOS_BUILD/export" \
-        -allowProvisioningUpdates 2>&1 | tee "$log" | grep --line-buffered -E 'error|Upload|EXPORT' >&2
+    if [ ${#auth[@]} -gt 0 ]; then
+        xcodebuild -exportArchive -archivePath "$archive" -exportOptionsPlist "$options" \
+            -exportPath "$IOS_BUILD/export" 2>&1 | tee "$log" | grep --line-buffered -E 'error|EXPORT' >&2
+    else
+        xcodebuild -exportArchive -archivePath "$archive" -exportOptionsPlist "$options" \
+            -exportPath "$IOS_BUILD/export" -allowProvisioningUpdates 2>&1 | tee "$log" \
+            | grep --line-buffered -E 'error|EXPORT' >&2
+    fi
     status=${PIPESTATUS[0]}
     set -e -o pipefail
-    if [ "$status" != 0 ]; then
-        if grep -qi 'no suitable application records\|app record' "$log"; then
+    [ "$status" = 0 ] || die "export failed (status $status); full log: $log"
+    ipa="$(find "$IOS_BUILD/export" -maxdepth 1 -name '*.ipa' | head -1)"
+    [ -n "$ipa" ] || die "the export made no .ipa; full log: $log"
+
+    log="$IOS_BUILD/upload.log"
+    say "uploading $(basename "$ipa") ($(du -h "$ipa" | cut -f1)); full log: $log"
+    set +e +o pipefail
+    if [ ${#auth[@]} -gt 0 ]; then
+        xcrun altool --upload-app -f "$ipa" -t ios --apiKey "$PSPOCKET_ASC_KEY_ID" --apiIssuer "$PSPOCKET_ASC_ISSUER_ID" \
+            2>&1 | tee "$log" >&2
+    else
+        xcrun altool --upload-app -f "$ipa" -t ios 2>&1 | tee "$log" >&2
+    fi
+    status=${PIPESTATUS[0]}
+    set -e -o pipefail
+    # altool can print an error and still exit 0.
+    if [ "$status" != 0 ] || grep -qiE '^ERROR|error:|Failed to upload' "$log"; then
+        if grep -qi 'no suitable application records\|cannot be found\|app record' "$log"; then
             warn "App Store Connect has no app for $BUNDLE_ID yet: create it once at https://appstoreconnect.apple.com" \
-                 "(Apps > + > New App, bundle ID $BUNDLE_ID), then run scripts/ios.sh testflight again."
+                 "(Apps > + > New App, bundle ID $BUNDLE_ID), then run scripts/ios.sh testflight --upload-only."
         fi
         die "upload failed (status $status); full log: $log"
     fi
-    say "uploaded build $build_number: it shows in TestFlight once App Store Connect has processed it (minutes)"
+    say "uploaded: it shows in TestFlight once App Store Connect has processed it (minutes)"
+    if [ ${#auth[@]} -gt 0 ]; then
+        node "$ROOT/scripts/asc.mjs" testers "$BUNDLE_ID" >&2 || warn "the TestFlight testers were not set up"
+    fi
 }
 
 case "$COMMAND" in
