@@ -281,14 +281,19 @@ void ps_spu_host_detach(SPUContext* ctx)
 
 int ps_spu_rdch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* value)
 {
-    ChannelLock lock(ctx);
     ps_spu_channels& ch = ctx->ch;
+    // State only this SPU's own thread writes (its channels, the run loop, the SPURS kernel running on it): read
+    // without the lock (D-128). GTA V's jobs read the decrementer millions of times a second.
     switch (channel) {
     case PS_SPU_RdSRR0: *value = ctx->srr0; return 0;
     case PS_SPU_RdEventMask: *value = ch.event_mask; return 0;
     case PS_MFC_RdTagMask: *value = ch.tag_mask; return 0;
     case PS_SPU_RdMachStat: *value = ctx->interrupts_enabled; return 0; // bit 0: interrupts enabled
     case PS_SPU_RdDec: *value = dec_now(ctx); return 0;
+    default: break;
+    }
+    ChannelLock lock(ctx);
+    switch (channel) {
     case PS_MFC_RdTagStat:
         if (!ch.tag_stat_count)
             return raise_exception(ctx, pc, PS_SPU_EXC_DEADLOCK, channel, "MFC_RdTagStat with no completion pending");
@@ -378,8 +383,8 @@ int ps_spu_rchcnt(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* coun
 
 int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
 {
-    ChannelLock lock(ctx);
     ps_spu_channels& ch = ctx->ch;
+    // A DMA's parameters are state only this SPU's thread reads (mfc_command): no lock for them (D-128), five per DMA.
     switch (channel) {
     case PS_SPU_WrSRR0: ctx->srr0 = value & PS_SPU_PC_MASK; return 0;
     case PS_MFC_LSA: ch.mfc_lsa = value; return 0;
@@ -387,9 +392,12 @@ int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
     case PS_MFC_EAL: ch.mfc_eal = value; return 0;
     case PS_MFC_Size: ch.mfc_size = std::min<u32>(value, 0xFFFF); return 0;
     case PS_MFC_TagID: ch.mfc_tag = value & 0x1F; return 0;
-    case PS_MFC_Cmd:
-        lock.unlock(); // DMA may take another context's lock (group MMIO); mfc.cpp locks for events itself
-        return mfc_command(ctx, pc, value & 0xFF);
+    case PS_MFC_Cmd: return mfc_command(ctx, pc, value & 0xFF); // DMA may take another context's lock (group MMIO);
+                                                                // mfc.cpp locks for events itself
+    default: break;
+    }
+    ChannelLock lock(ctx);
+    switch (channel) {
     case PS_MFC_WrTagMask:
         ch.tag_mask = value;
         mfc_update_tag_status(ctx);

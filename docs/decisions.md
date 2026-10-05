@@ -1990,6 +1990,16 @@ million lanes, no difference).
   written by the callee, written two calls deep, and kept across a call that leaves the program and comes back
   through the run loop (without the early-exit stores, or without the reload, it fails).
 
+## D-128 · 2026-10-05 · SPU channels of the SPU's own state without the lock; the timebase by one multiply
+
+The same iPhone recording: the SPU workers spent 1.2 s of 10 s in the channel lock's mutex, and 1.1 s reading the
+clock for SPU_RdDec: GTA V's jobs read the decrementer millions of times a second, and ps_timebase_now did two
+128-bit divisions each time. Channels whose state only the SPU's own thread writes (SRR0, the event and tag masks,
+the machine status, the decrementer, and a DMA's parameters: LSA, EAH, EAL, size, tag, the command) no longer take
+the lock (mfc_command already took its own where it needs one). The timebase is the host ticks times a 32.32
+fixed-point factor (79.8 MHz over the host's 24 MHz on Apple silicon): one multiply, drifting about a microsecond a
+day, monotonic.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
