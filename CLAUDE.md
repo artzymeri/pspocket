@@ -68,6 +68,9 @@ ctest --test-dir build/host --output-on-failure
   [--hdd0 DIR] [--timeout S] [--stop-at-first] [--imports]`; it prints every unimplemented syscall and firmware
   function it hit (`--imports` lists the imports and their state without running). Runs go in `docs/runs/`.
 - iOS test host: `scripts/ios.sh build|install|run` (XcodeGen project in `app/ios/project.yml`, team M7XJA39ZV6).
+  An iPhone that is neither connected nor on this Mac's network: `scripts/ios.sh testflight` archives and uploads to
+  App Store Connect for TestFlight (internal testers). It sends the app, with the game's translated code, to Apple:
+  only with the user's OK, each time.
 - Use your own build directory (`build/<name>`) when several builds run at once.
 
 ## Layout
