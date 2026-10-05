@@ -35,6 +35,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 
 - **Seen:** 25 ms of GPU time per frame at 1,504 draws and 83 render passes (55 ended by a target change, 19 by a
   target copy) in the heaviest stretch; 17 to 21 ms in most of play. The GPU is close to its budget too.
+- **Seen later in the session (17:19-17:23):** the work per frame follows the scene: 800 to 1,900 draws, 55 to 96
+  render passes, 400 to 1,130 texture checks. At 10 to 14 fps (17:22) the GPU took 26 ms of the 70 to 100 ms a frame
+  lasted: the CPU side was the limit there. A 10 s dip to 5 to 7 fps (17:23:02) had 96 render passes a frame, 61 of
+  them ended by target copies (12 to 23 elsewhere), and 33.6 ms of GPU time a frame.
 - **Try:** fewer render passes (a target copy that does not need to end the pass; passes merged when the targets
   repeat); on a tile GPU every pass end writes its targets to memory: load and store actions that skip what the next
   pass does not read, memoryless depth where it is never sampled. Metal System Trace on the phone (needs the user)
@@ -74,10 +78,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 ## PPU
 
 - **Seen:** no per-thread measurement on the phone yet: the status lines show the SPUs, the GPU and the sound, not
-  how busy the PPU threads are.
-- **Try:** a status line every 5 s with each guest thread's CPU time (PPU threads, SPU threads, the RSX thread), so the
-  bottleneck in a stretch is read off the log instead of guessed.
-- **State:** open (measurement first).
+  how busy the PPU threads are. In the 10 to 20 fps stretches neither the GPU nor the SPURS instances were full, so
+  a PPU thread or the RSX thread is the likely limit.
+- **Try:** read the busiest threads off the new status line (D-146) in the next session, then work on that thread.
+- **State:** measurement built (D-146), not yet on the phone.
 
 ## Heat
 
