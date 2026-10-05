@@ -4,13 +4,14 @@
 //
 //   pspocket-prepare --title ID --exe EBOOT.elf [--ppu DIR] [--spu DIR] --out game.dylib [--objects DIR]
 //                    [-j N] [--memory MB] [-O L] [-X ARG]... [--ppu-arg ARG]... [--spu-arg ARG]...
-//                    [--mllvm OPT]... [--quiet]
+//                    [--mllvm OPT]... [--events FILE.csv] [--quiet]
 //
 // --ppu is ppu-lift's output (--name game_ppu), --spu scripts/lift-spu.sh's; --exe the decrypted executable they were
 // translated from (its SHA-256 goes into the library). Objects are kept in --objects (default: beside the library),
 // so a second run compiles only what changed. -X passes an argument to clang for every file, --ppu-arg and --spu-arg
 // for PPU or SPU files only (-fno-slp-vectorize); --mllvm sets one of LLVM's options for all of them. Progress, the
-// time left and, at the end, how right the time left was.
+// time left and, at the end, how right the time left was. --events writes every file's start and end (time, group,
+// predicted cost, seconds) and the time left as said then, to try other estimates on a real build.
 
 #include <algorithm>
 #include <cstdio>
@@ -38,7 +39,7 @@ int usage()
 {
     std::fputs("usage: pspocket-prepare --title ID --exe EBOOT.elf [--ppu DIR] [--spu DIR] --out game.dylib\n"
                "                        [--objects DIR] [-j N] [--memory MB] [-O L] [-X ARG]... [--ppu-arg ARG]...\n"
-               "                        [--spu-arg ARG]... [--mllvm OPT]... [--quiet]\n",
+               "                        [--spu-arg ARG]... [--mllvm OPT]... [--events FILE.csv] [--quiet]\n",
         stderr);
     return 64;
 }
@@ -75,12 +76,17 @@ codegen::BuildJob job_for(const fs::path& source, bool spu, const std::string& h
 {
     std::string text;
     read_bytes(source, text);
-    const codegen::CostEstimate e = codegen::estimate_cost(text, spu);
+    const std::string name = source.filename().string();
+    const codegen::FileKind kind = name.ends_with("_reg.c") || name == "game_spu.c" ? codegen::FileKind::Table
+        : spu                                                                       ? codegen::FileKind::SpuCode
+                                                                                    : codegen::FileKind::PpuCode;
+    const codegen::CostEstimate e = codegen::estimate_cost(text, kind);
     codegen::BuildJob j;
     j.source = source.string();
     j.include_dirs = {source.parent_path().string()};
     if (!headers.empty()) j.defines = {headers};
     j.extra_args = spu ? g_spu_args : g_ppu_args;
+    j.group = static_cast<int>(kind);
     j.cost = e.seconds;
     j.memory_mb = e.memory_mb;
     return j;
@@ -96,7 +102,7 @@ std::string clock_text(double s)
 
 int main(int argc, char** argv)
 {
-    std::string title, exe, ppu, spu, out, objects;
+    std::string title, exe, ppu, spu, out, objects, events_path;
     unsigned jobs = 0;
     double memory_mb = 0;
     int opt = 2;
@@ -121,9 +127,15 @@ int main(int argc, char** argv)
         else if (a == "--ppu-arg") g_ppu_args.emplace_back(v);
         else if (a == "--spu-arg") g_spu_args.emplace_back(v);
         else if (a == "--mllvm") llvm_options.emplace_back(v);
+        else if (a == "--events") events_path = v;
         else return usage();
     }
     if (title.empty() || exe.empty() || out.empty() || (ppu.empty() && spu.empty())) return usage();
+    // The settings translated code compiles with (D-153), then what the command line adds.
+    const codegen::TranslatedCodeSettings& settings = codegen::translated_code_settings();
+    llvm_options.insert(llvm_options.begin(), settings.llvm_options.begin(), settings.llvm_options.end());
+    g_ppu_args.insert(g_ppu_args.begin(), settings.ppu_args.begin(), settings.ppu_args.end());
+    g_spu_args.insert(g_spu_args.begin(), settings.spu_args.begin(), settings.spu_args.end());
     if (objects.empty()) objects = (fs::path(out).parent_path() / (fs::path(out).stem().string() + "-objects")).string();
     if (std::string error; !llvm_options.empty() && !codegen::set_llvm_options(llvm_options, &error)) {
         std::fprintf(stderr, "pspocket-prepare: %s\n", error.c_str());
@@ -218,8 +230,16 @@ int main(int argc, char** argv)
     };
     std::vector<Sample> samples;
     double last_print = -10;
+    std::ofstream events;
+    if (!events_path.empty()) {
+        events.open(events_path);
+        events << "event,seconds,file,group,predicted,file_seconds,seconds_left\n";
+    }
     o.progress = [&](const codegen::BuildProgress& p) {
         const double fraction = p.cost_total > 0 ? p.cost_done / p.cost_total : 0;
+        if (events.is_open() && !p.file.empty() && p.phase == codegen::BuildProgress::Phase::Compiling)
+            events << std::format("{},{:.3f},{},{},{:.3f},{:.3f},{:.1f}\n", p.file_seconds < 0 ? "start" : "end", p.seconds,
+                fs::path(p.file).filename().string(), p.file_group, p.file_cost, p.file_seconds, p.seconds_left);
         if (p.phase == codegen::BuildProgress::Phase::Compiling && p.seconds_left >= 0)
             samples.push_back({p.seconds, p.seconds_left, fraction});
         const bool phase_line = p.phase != codegen::BuildProgress::Phase::Compiling;

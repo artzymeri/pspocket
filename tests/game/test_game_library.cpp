@@ -205,18 +205,28 @@ TEST_CASE("game library: a second build keeps every object it can")
     fs::remove_all(dir);
 }
 
-TEST_CASE("time left: follows the files done, and lays the rest out over the workers")
+TEST_CASE("time left: follows the files done, per group, and lays the rest out over the workers")
 {
-    // Files take 1.5 times their prediction on this machine: once some are done, the time left says so.
+    using File = codegen::TimeLeft::File;
     codegen::TimeLeft left(2, 1.0, 10.0);
-    CHECK(left.seconds_left({}, {4, 4, 2, 2}) == Catch::Approx(6.0)); // two workers: 4+2 each
-    for (int i = 0; i < 20; i++) left.finished(1.0, 1.5);
-    CHECK(left.rate() == Catch::Approx((10.0 + 30.0) / (10.0 + 20.0)));
-    left = codegen::TimeLeft(2, 1.0, 0.0);
-    left.finished(10, 15);
-    // One file running (predicted 10, 3 s in), four waiting: 15-3=12 on one worker, the waiting ones laid out.
-    const double t = left.seconds_left({{10.0, 3.0}}, {4, 4, 2});
-    CHECK(t == Catch::Approx(15.0)); // worker 1: 12 + 3 (the 2), worker 2: 6 + 6 = 12 -> 15
+    CHECK(left.seconds_left({}, {{0, 4, 0}, {0, 4, 0}, {0, 2, 0}, {0, 2, 0}}) == Catch::Approx(6.0)); // 4+2 each
+    // PPU files take 1.5 times their prediction here: the PPU rate follows; the SPU rate leans on the overall one.
+    for (int i = 0; i < 20; i++) left.finished(0, 1.0, 1.5);
+    const double overall = (10.0 + 30.0) / (10.0 + 20.0);
+    CHECK(left.rate(0) == Catch::Approx((overall * 10.0 + 30.0) / (10.0 + 20.0)));
+    CHECK(left.rate(1) == Catch::Approx(overall));
+    // SPU files at twice their prediction, PPU at their prediction: each group keeps its own rate.
+    codegen::TimeLeft mixed(1, 1.0, 1.0);
+    for (int i = 0; i < 100; i++) {
+        mixed.finished(1, 10.0, 20.0);
+        mixed.finished(0, 1.0, 1.0);
+    }
+    CHECK(mixed.rate(1) == Catch::Approx(2.0).epsilon(0.02));
+    CHECK(mixed.rate(0) == Catch::Approx(1.0).epsilon(0.02));
+    // One file running (predicted 10, 3 s in) and three waiting, at rate 1.5: 15-3=12 on one worker, the rest laid out.
+    codegen::TimeLeft one(2, 1.0, 0.0);
+    one.finished(0, 10, 15);
+    CHECK(one.seconds_left({File{0, 10.0, 3.0}}, {{0, 4, 0}, {0, 4, 0}, {0, 2, 0}}) == Catch::Approx(15.0));
     // A file far past its prediction is given a tenth of it more, not a negative time.
-    CHECK(left.seconds_left({{1.0, 50.0}}, {}) == Catch::Approx(0.15));
+    CHECK(one.seconds_left({File{0, 1.0, 50.0}}, {}) == Catch::Approx(0.15));
 }

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -47,7 +48,17 @@ std::string settings_text(const CompileOptions& o)
 
 } // namespace
 
-CostEstimate estimate_cost(const std::string& text, bool spu)
+const TranslatedCodeSettings& translated_code_settings()
+{
+    static const TranslatedCodeSettings settings = {
+        .llvm_options = {"-grow-region-complexity-budget=1000"},
+        .ppu_args = {"-fno-slp-vectorize"},
+        .spu_args = {},
+    };
+    return settings;
+}
+
+CostEstimate estimate_cost(const std::string& text, FileKind kind)
 {
     // Per function: its lines times its block starts (labels "L_xxxxx:" at the start of a line). Functions start with
     // "void " at the start of a line (every translated function is void f(ctx, base or ls)).
@@ -68,44 +79,56 @@ CostEstimate estimate_cost(const std::string& text, bool spu)
     }
     end_function();
     const double mb = static_cast<double>(text.size()) / 1e6;
-    // Least squares over GTA V's files compiled ten at a time on the M4 (run 092): SPU mean error 27% per file and 3%
-    // over the whole game; PPU 21% and 3% (the shape term does not help PPU code).
+    // Least squares over two builds of GTA V's files, ten at a time on the M4 with translated_code_settings(), each
+    // build's own speed taken out (run 094).
     CostEstimate e;
-    if (spu) {
-        e.seconds = 6.985 * mb + 8.822 * lines_times_labels / 1e6;
+    switch (kind) {
+    case FileKind::SpuCode:
+        e.seconds = 6.767 * mb + 9.180 * lines_times_labels / 1e6;
         e.memory_mb = 200 + 100 * mb;
-    } else {
-        e.seconds = 3.124 * mb;
+        break;
+    case FileKind::PpuCode:
+        e.seconds = 2.599 * mb + 1.385 * lines_times_labels / 1e6;
         e.memory_mb = 80 + 70 * mb;
+        break;
+    case FileKind::Table:
+        e.seconds = 0.852 * mb;
+        e.memory_mb = 50 + 20 * mb;
+        break;
     }
     e.seconds = std::max(e.seconds, 0.02);
     return e;
 }
 
-void TimeLeft::finished(double predicted, double seconds)
+void TimeLeft::finished(int group, double predicted, double seconds)
 {
-    predicted_done_ += predicted;
-    seconds_done_ += seconds;
+    const int g = std::clamp(group, 0, kGroups - 1);
+    predicted_done_[g] += predicted;
+    seconds_done_[g] += seconds;
+    all_predicted_ += predicted;
+    all_seconds_ += seconds;
 }
 
-double TimeLeft::rate() const
+double TimeLeft::rate(int group) const
 {
-    return (prior_rate_ * prior_weight_ + seconds_done_) / (prior_weight_ + predicted_done_);
+    // A group with few files done leans on the rate of all files so far, which leans on the prior.
+    const int g = std::clamp(group, 0, kGroups - 1);
+    const double overall = (prior_rate_ * prior_weight_ + all_seconds_) / (prior_weight_ + all_predicted_);
+    return (overall * prior_weight_ + seconds_done_[g]) / (prior_weight_ + predicted_done_[g]);
 }
 
-double TimeLeft::seconds_left(const std::vector<std::pair<double, double>>& running, std::vector<double> waiting) const
+double TimeLeft::seconds_left(const std::vector<File>& running, std::vector<File> waiting) const
 {
-    const double r = rate();
     std::vector<double> free(workers_, 0.0);
     for (size_t i = 0; i < running.size() && i < free.size(); i++) {
-        const auto [predicted, elapsed] = running[i];
+        const double expected = running[i].predicted * rate(running[i].group);
         // A file past its prediction is taken to need a tenth of it more, whatever it has run.
-        free[i] = std::max(predicted * r - elapsed, 0.1 * predicted * r);
+        free[i] = std::max(expected - running[i].elapsed, 0.1 * expected);
     }
-    std::sort(waiting.begin(), waiting.end(), std::greater<>());
-    for (const double c : waiting) {
+    std::sort(waiting.begin(), waiting.end(), [](const File& a, const File& b) { return a.predicted > b.predicted; });
+    for (const File& f : waiting) {
         auto earliest = std::min_element(free.begin(), free.end());
-        *earliest += c * r;
+        *earliest += f.predicted * rate(f.group);
     }
     return *std::max_element(free.begin(), free.end());
 }
@@ -166,10 +189,11 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
     size_t next = 0, files_done = result.reused, running = 0;
     double memory_in_use = 0;
     std::vector<std::pair<size_t, Clock::time_point>> active; // (work index, start)
-    TimeLeft left(workers, options.prior_rate);
+    TimeLeft left(workers, options.prior_rate, std::min(1000.0, 0.25 * cost_total));
     std::string first_error;
 
-    auto report = [&](BuildProgress::Phase phase, const std::string& file) { // under m
+    // Under m. `i` is the file that started or finished (SIZE_MAX: none), `seconds` how long it took (-1: started).
+    auto report = [&](BuildProgress::Phase phase, size_t i, double seconds, const std::string& file) {
         if (!options.progress) return;
         BuildProgress p;
         p.phase = phase;
@@ -179,11 +203,16 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
         p.cost_total = cost_total;
         p.seconds = since(t0);
         p.file = file;
+        if (i < work.size()) {
+            p.file_cost = work[i].job.cost;
+            p.file_group = work[i].job.group;
+            p.file_seconds = seconds;
+        }
         if (phase == BuildProgress::Phase::Compiling) {
-            std::vector<std::pair<double, double>> now;
-            for (const auto& [i, start] : active) now.emplace_back(work[i].job.cost, since(start));
-            std::vector<double> waiting;
-            for (size_t k = next; k < order.size(); k++) waiting.push_back(work[order[k]].job.cost);
+            std::vector<TimeLeft::File> now, waiting;
+            for (const auto& [a, start] : active) now.push_back({work[a].job.group, work[a].job.cost, since(start)});
+            for (size_t k = next; k < order.size(); k++)
+                waiting.push_back({work[order[k]].job.group, work[order[k]].job.cost, 0});
             p.seconds_left = left.seconds_left(now, std::move(waiting));
         }
         options.progress(p);
@@ -213,7 +242,7 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
             running++;
             memory_in_use += work[i].job.memory_mb;
             active.emplace_back(i, Clock::now());
-            report(BuildProgress::Phase::Compiling, work[i].job.source);
+            report(BuildProgress::Phase::Compiling, i, -1, work[i].job.source);
             lock.unlock();
 
             CompileOptions o = options.compile;
@@ -235,11 +264,11 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
                 files_done++;
                 cost_done += work[i].job.cost;
                 result.compiled++;
-                left.finished(work[i].job.cost, seconds);
+                left.finished(work[i].job.group, work[i].job.cost, seconds);
             } else if (first_error.empty()) {
                 first_error = std::format("{} did not compile:\n{}", work[i].job.source, diagnostics.substr(0, 4000));
             }
-            report(BuildProgress::Phase::Compiling, work[i].job.source);
+            report(BuildProgress::Phase::Compiling, i, seconds, work[i].job.source);
             cv.notify_all();
         }
     };
@@ -254,13 +283,13 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
     if (!first_error.empty() || (options.cancel && options.cancel->load())) {
         result.error = first_error.empty() ? "cancelled" : first_error;
         std::lock_guard lock(m);
-        report(BuildProgress::Phase::Failed, "");
+        report(BuildProgress::Phase::Failed, SIZE_MAX, -1, "");
         return result;
     }
 
     {
         std::lock_guard lock(m);
-        report(BuildProgress::Phase::Linking, output);
+        report(BuildProgress::Phase::Linking, SIZE_MAX, -1, output);
     }
     const auto l0 = Clock::now();
     std::vector<std::string> all = objects;
@@ -271,11 +300,11 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
     std::lock_guard lock(m);
     if (!linked) {
         result.error = std::format("the link failed:\n{}", diagnostics.substr(0, 4000));
-        report(BuildProgress::Phase::Failed, "");
+        report(BuildProgress::Phase::Failed, SIZE_MAX, -1, "");
         return result;
     }
     result.ok = true;
-    report(BuildProgress::Phase::Done, output);
+    report(BuildProgress::Phase::Done, SIZE_MAX, -1, output);
     return result;
 }
 
