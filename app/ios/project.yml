@@ -56,6 +56,9 @@ targets:
         name: selftest
         group: Runtime
         includes: *compiled
+        # The version stamp only where it is printed: as a target-wide define it changed every compile command with
+        # each commit, so every build recompiled all of the game's translated code.
+        compilerFlags: ['-DPSPOCKET_VERSION=\"$(PSPOCKET_VERSION)\"', '-DPSPOCKET_GIT_HASH=\"$(PSPOCKET_GIT_HASH)\"']
       - path: ../../runtime/disc/src
         name: disc
         group: Runtime
@@ -161,8 +164,6 @@ targets:
           - $(PSPOCKET_HOST_BUILD_DIR)/generated
         GCC_PREPROCESSOR_DEFINITIONS:
           - $(inherited)
-          - 'PSPOCKET_VERSION=\"$(PSPOCKET_VERSION)\"'
-          - 'PSPOCKET_GIT_HASH=\"$(PSPOCKET_GIT_HASH)\"'
           - PSPOCKET_HAVE_GAME_SPU=${PSPOCKET_HAVE_GAME_SPU}
           - PSPOCKET_HAVE_GAME_PPU=${PSPOCKET_HAVE_GAME_PPU}
         # cmake/PSPocketWarnings.cmake, without -Werror. Xcode's defaults that the host build doesn't use are off,
