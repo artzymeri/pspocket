@@ -1775,6 +1775,130 @@ TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red 
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
 }
 
+TEST_CASE("metal e2e: a clear writes its value into an A8B8G8R8 target's words as it is, channel mask too (D-119)")
+{
+    // GTA V clears its characters' damage target, A8B8G8R8, to 0x00ff0000 and reads it as A8R8G8B8: transparent red.
+    // Taken as red, green, blue, the clear made it transparent blue to that texture, and the characters red.
+    REQUIRE_METAL();
+    E2E e;
+    auto b = e.at(0);
+    setup_surface_as(b, kSurfaceB, SurfaceColorFormat::A8B8G8R8, kW * 4);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x11223344);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceB, 5, 7) == std::array<u8, 4>{0x11, 0x22, 0x33, 0x44});
+
+    // The mask's red is the value's red byte (the second): the target's blue.
+    auto c = e.at(b.offset());
+    c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x00ff0000);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kRed);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceB, 5, 7) == std::array<u8, 4>{0x00, 0xff, 0x00, 0x00});
+}
+
+// An A8R8G8B8 target at a local offset with its own clip and pitch; the scissor covers it (D-120).
+void setup_surface_sized(CommandBuilder& b, u32 offset, u32 width, u32 height, u32 pitch)
+{
+    setup_surface(b, offset);
+    b.method(m::NV4097_SET_SURFACE_PITCH_A, pitch);
+    b.method(m::NV4097_SET_SURFACE_CLIP_HORIZONTAL, {width << 16, height << 16});
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {width << 16, height << 16});
+}
+
+// Guest bytes (a, r, g, b) of pixel (x, y) of an A8R8G8B8 target with that pitch, after a flush.
+std::array<u8, 4> guest_pixel_pitch(E2E& e, u32 surface_offset, u32 pitch, u32 x, u32 y)
+{
+    const u8* p = e.mem.host(PS_MEM_RSX_LOCAL_BASE + surface_offset + y * pitch + x * 4);
+    return {p[0], p[1], p[2], p[3]};
+}
+
+TEST_CASE("metal e2e: a target narrower than the one at its address is its left part, and the rest stays (D-120)")
+{
+    // GTA V clears the right half of a 2560x512 target for its characters, then draws into the left half as a
+    // 1280x512 target with the same pitch. A new surface for the narrow one lost the cleared half: they turned black.
+    REQUIRE_METAL();
+    E2E e;
+    constexpr u32 kPitch = 2 * kW * 4;
+    auto b = e.at(0);
+    setup_surface_sized(b, kSurfaceB, 2 * kW, kH, kPitch);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff112233);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(kW << 16) | kW, kH << 16}); // the right half
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff445566);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    setup_surface_sized(b, kSurfaceB, kW, kH, kPitch);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff778899);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kPitch * kH));
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, 5, 7) == std::array<u8, 4>{0xff, 0x77, 0x88, 0x99});
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, kW + 5, 7) == std::array<u8, 4>{0xff, 0x44, 0x55, 0x66});
+    CHECK(e.backend->stats().surfaces_created == 1);
+}
+
+TEST_CASE("metal e2e: a target wider than the one at its address keeps what that one held (D-120)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    constexpr u32 kPitch = 2 * kW * 4;
+    auto b = e.at(0);
+    setup_surface_sized(b, kSurfaceB, kW, kH, kPitch);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff778899);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    setup_surface_sized(b, kSurfaceB, 2 * kW, kH, kPitch);
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(kW << 16) | kW, kH << 16});
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff445566);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surfaces_grown == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kPitch * kH));
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, 5, 7) == std::array<u8, 4>{0xff, 0x77, 0x88, 0x99});
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, kW + 5, 7) == std::array<u8, 4>{0xff, 0x44, 0x55, 0x66});
+}
+
+TEST_CASE("metal e2e: a texture smaller than the target at its address samples the target's top-left corner (D-120)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    constexpr u32 kPitch = 2 * kW * 4;
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    auto b = e.at(0);
+    // A target twice as wide: green on the left, red on the right
+    setup_surface_sized(b, kSurfaceB, 2 * kW, kH, kPitch);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(kW << 16) | kW, kH << 16});
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffff0000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    // Its left half read as a kW x kH texture with its pitch: green wherever the triangle samples it
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kSurfaceB, tex::A8R8G8B8, kPitch);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_corners == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 5, 60) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});  // u near 0
+    CHECK(guest_pixel(e, kSurfaceOffset, 58, 60) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // u near 1
+}
+
 TEST_CASE("metal e2e: an A8B8G8R8 target read as a Y16_X16 texture converts on the GPU, without a readback (D-098)")
 {
     REQUIRE_METAL();

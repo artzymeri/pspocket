@@ -367,7 +367,10 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
         }
     }
     draw_targets = out;
-    // All attachments of a pass share a size: surfaces were created at (width, height).
+    // The pass draws in (width, height), the top-left corner of its surfaces: they were made at that size, or are a
+    // larger target at the same place (D-120).
+    out.width = width;
+    out.height = height;
     return out.color_count > 0 || out.depth != nullptr;
 }
 
@@ -388,8 +391,9 @@ void MetalBackend::Impl::open_pass(const PassTargets& t)
     pass_open = true;
     pass_started = false;
     pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass_width = ~0u;
-    pass_height = ~0u;
+    pass_width = t.width ? t.width : ~0u;
+    pass_height = t.height ? t.height : ~0u;
+    pass_partial = false;
     for (u32 i = 0; i < t.color_count; i++) {
         Surface* s = t.color[i];
         if (s->cpu_newer) upload_surface_from_guest(*s);
@@ -402,6 +406,7 @@ void MetalBackend::Impl::open_pass(const PassTargets& t)
         a.storeAction = MTLStoreActionStore;
         pass_width = std::min(pass_width, s->width);
         pass_height = std::min(pass_height, s->height);
+        pass_partial |= s->width != t.width || s->height != t.height;
     }
     if (Surface* d = t.depth) {
         if (d->cpu_newer) upload_surface_from_guest(*d); // D-110
@@ -417,7 +422,10 @@ void MetalBackend::Impl::open_pass(const PassTargets& t)
         }
         pass_width = std::min(pass_width, d->width);
         pass_height = std::min(pass_height, d->height);
+        pass_partial |= d->width != t.width || d->height != t.height;
     }
+    pass_desc.renderTargetWidth = pass_width;
+    pass_desc.renderTargetHeight = pass_height;
 }
 
 id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
@@ -484,7 +492,8 @@ std::string MetalBackend::Impl::describe_targets(const PassTargets& t)
     std::string d;
     for (u32 i = 0; i < t.color_count; i++) {
         const Surface* c = t.color[i];
-        d += std::format(" {}{:#010x} fmt {} {}x{}", i ? ", " : "", c->address, c->gcm_format, c->width, c->height);
+        d += std::format(" {}{:#010x} fmt {} {}x{} pitch {:#x}", i ? ", " : "", c->address, c->gcm_format, c->width,
+            c->height, c->pitch);
     }
     if (t.depth) d += std::format("{} depth {:#010x} fmt {}", t.color_count ? ";" : "", t.depth->address, t.depth->gcm_format);
     return d.empty() ? " nothing" : d;
@@ -541,6 +550,22 @@ void MetalBackend::Impl::trace_dump()
             s->width, s->height);
     }
     trace_targets.clear();
+    // And every 2D texture it sampled, as the shader saw it: tex-<address>-fmt<format>-t<unit>-<width>x<height>.
+    for (const TracedTexture& x : trace_textures) {
+        if (!config.trace_surface) break;
+        const u32 w = static_cast<u32>(x.texture.width), h = static_cast<u32>(x.texture.height);
+        std::vector<std::array<float, 4>> texels;
+        if (!read_texture(x.texture, 0, 0, w, h, texels)) continue;
+        std::vector<u8> out(static_cast<usize>(w) * h * 4);
+        const auto unit = [](float v) { return static_cast<u8>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); };
+        for (usize i = 0; i < texels.size(); i++) {
+            out[i * 4 + 0] = unit(texels[i][2]), out[i * 4 + 1] = unit(texels[i][1]);
+            out[i * 4 + 2] = unit(texels[i][0]), out[i * 4 + 3] = unit(texels[i][3]);
+        }
+        config.trace_surface(std::format("tex-{:08x}-fmt{:x}-t{}-{}x{}", x.address, x.format, x.unit, w, h),
+            out.data(), w, h);
+    }
+    trace_textures.clear();
 }
 
 void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
@@ -576,24 +601,37 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
     if (x1 <= x0 || y1 <= y0) return;
     const bool full = x0 == 0 && y0 == 0 && x1 == pass_width && y1 == pass_height;
 
-    const u32 argb = state.color_clear_value();
+    // The clear writes its 32-bit value into each pixel as it is. A8B8G8R8 targets keep r g b a in their RGBA8Unorm
+    // copy, so the value's red byte is their blue: red and blue trade places, in the value and in the channel mask
+    // (RPCS3 VKGSRender.cpp clear_surface, get_abgr8_clear_color, get_abgr8_clearmask). Without it GTA V's characters
+    // turned red: their damage target is cleared to 0x00ff0000 (D-119).
+    const auto cf = static_cast<SurfaceColorFormat>(si.color_format);
+    const bool abgr = cf == SurfaceColorFormat::A8B8G8R8 || cf == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8 ||
+                      cf == SurfaceColorFormat::X8B8G8R8_O8B8G8R8;
+    const u32 register_argb = state.color_clear_value();
+    const u32 argb = abgr ? (register_argb & 0xff00ff00u) | ((register_argb >> 16) & 0xffu) | ((register_argb & 0xffu) << 16)
+                          : register_argb;
     const MTLClearColor color = MTLClearColorMake(((argb >> 16) & 0xff) / 255.0, ((argb >> 8) & 0xff) / 255.0,
         (argb & 0xff) / 255.0, (argb >> 24) / 255.0);
     const u32 zs = state.zstencil_clear_value();
     const bool z24 = si.depth_format == 2;
     const double depth = z24 ? (zs >> 8) / 16777215.0 : (zs & 0xffff) / 65535.0;
     const u32 stencil = zs & 0xff;
-    const u32 channels = (mask >> 4) & 0xf; // R G B A
+    const u32 register_channels = (mask >> 4) & 0xf; // R G B A
+    const u32 channels =
+        abgr ? (register_channels & 0xau) | ((register_channels & 1u) << 2) | ((register_channels >> 2) & 1u)
+             : register_channels;
     if (tracing) {
         trace_targets_of(t);
         PS_LOG_INFO("rsx.trace", "#{} clear {:#x} ->{}: colour {:#010x}, depth/stencil {:#010x}, region {},{} to {},{}",
-            ++trace_count, mask, describe_targets(t), argb, zs, x0, y0, x1, y1);
+            ++trace_count, mask, describe_targets(t), register_argb, zs, x0, y0, x1, y1);
     }
     const bool clear_depth = (mask & clear::kDepth) && pass.depth;
     const bool clear_stencil = (mask & clear::kStencil) && pass.depth && z24;
 
-    if (!pass_started && full) {
-        // At the start of a pass a full clear is free on a tile-based GPU: make it the load action.
+    if (!pass_started && full && !pass_partial) {
+        // At the start of a pass a full clear is free on a tile-based GPU: make it the load action. Not in a pass that
+        // draws in part of a larger target: the load action clears all of it (D-120).
         bool done_color = channels == 0xf || channels == 0;
         if (channels == 0xf) {
             for (u32 i = 0; i < pass.color_count; i++) {
@@ -828,6 +866,12 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         const bool depth_kind = kind == shader::TextureKind::Depth2D || kind == shader::TextureKind::DepthShadow2D;
         if (tex && tex.textureType == wanted && !depth_kind) {
             bound[t] = tex;
+            if (tracing && wanted == MTLTextureType2D && trace_textures.size() < 512) {
+                const u32 at = rsx->translate(ti.offset, ti.location).value_or(0);
+                const auto seen = std::find_if(trace_textures.begin(), trace_textures.end(),
+                    [&](const TracedTexture& x) { return x.address == at && x.format == ti.format; });
+                if (seen == trace_textures.end()) trace_textures.push_back({t, at, ti.format, tex});
+            }
         } else {
             bound[t] = depth_kind                         ? dummy_depth
                      : wanted == MTLTextureTypeCube       ? dummy_cube

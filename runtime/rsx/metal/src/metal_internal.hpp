@@ -96,6 +96,8 @@ struct Surface {
         std::unordered_map<u32, id<MTLTexture>> views;
     };
     std::unordered_map<u32, Conversion> conversions;
+    // Its top-left corner sampled as a smaller texture at its start (D-120), by width << 16 | height.
+    std::unordered_map<u32, Conversion> corners;
     // A copy's destination (D-107), once guest memory has the copy: a CPU write after that makes guest memory newer.
     WriteTracker::Watch watch{};
     u32 bytes() const { return pitch * height; }
@@ -240,6 +242,12 @@ struct MetalBackend::Impl {
     bool tracing = false;
     u32 trace_count = 0;
     std::vector<u32> trace_targets;
+    // The 2D textures the traced frame sampled, each once, as the shader sees them (its channel order).
+    struct TracedTexture {
+        u32 unit, address, format;
+        id<MTLTexture> texture;
+    };
+    std::vector<TracedTexture> trace_textures;
     const char* bind_source = ""; // how bind_texture served the last texture (for the trace)
 
     id<MTLDevice> device = nil;
@@ -274,9 +282,13 @@ struct MetalBackend::Impl {
         std::array<u32, 4> rsx_index{}; // RSX surface (A=0 .. D=3) behind each attachment: blend and mask bits
         u32 color_count = 0;
         Surface* depth = nullptr;
+        // The surface clip: what the pass draws in, the top-left corner of its surfaces, which can be larger (a target
+        // drawn narrower than the one at its address before it, D-120).
+        u32 width = 0, height = 0;
         bool operator==(const PassTargets& o) const
         {
-            return color == o.color && color_count == o.color_count && depth == o.depth;
+            return color == o.color && color_count == o.color_count && depth == o.depth && width == o.width &&
+                height == o.height;
         }
         bool contains(const Surface* s) const
         {
@@ -336,6 +348,7 @@ struct MetalBackend::Impl {
     PassTargets pass{};
     PassTargets draw_targets{}; // targets of the draw being prepared (render-target feedback detection)
     bool pass_open = false;    // targets chosen (descriptor built)
+    bool pass_partial = false; // the pass draws in part of an attachment: its load-action clear would clear the rest
     bool pass_started = false; // encoder created
     u32 pass_width = 0, pass_height = 0;
 
@@ -456,6 +469,7 @@ struct MetalBackend::Impl {
     void note_guest(Surface& s);
     void check_guest(const Surface& s, const TextureInfo& t, u32 unit);
     void upload_surface_from_guest(Surface& s);
+    void grow_surface(Surface& outer, Surface& inner); // D-120
     void upload_surface_bytes(Surface& s); // the formats store_readback writes, but A8R8G8B8 (D-110)
     bool newer_in_guest(const PassTargets& t) const; // a target whose guest memory is newer: reloaded by open_pass
     void remove_surface(Surface* s);

@@ -1836,6 +1836,45 @@ Neither log says which word the reader took wrong, so:
 - Tests: a stretch written after it was first read is read again; a stretch that stays wrong is read three times and
   then skipped to put; an acquire passed before the desync holds during the re-read and waits again past it.
 
+## D-119 · 2026-10-05 · A clear writes its value into A8B8G8R8 targets as it is (red and blue trade places)
+
+On the iPhone characters, or parts of their clothes, flashed fully red or black (run 084 reproduced it on the Mac:
+every frame of the bank walk saved, scanned for red and black bumps, then frame traces). The red: GTA V draws its
+characters with a damage target (A8B8G8R8, at 0xcf3f0000) that it clears every frame to 0x00ff0000 and samples as
+A8R8G8B8: transparent red, no damage. The clear value is A8R8G8B8, and the RSX writes it into the pixel's word as it
+is; an A8B8G8R8 target's RGBA8Unorm copy holds r g b a, so the value's red byte is its blue. The backend took the value
+as red, green, blue: to the texture it was transparent blue, and the clothes it touched came out red. Now red and blue
+trade places in the value and in the clear's channel mask for A8B8G8R8 and X8B8G8R8 targets (RPCS3 VKGSRender.cpp
+clear_surface, get_abgr8_clear_color, get_abgr8_clearmask). Draws need nothing: the shader's outputs land as r g b a.
+- The frame trace saves every 2D texture a traced frame samples as `trace-N/tex-<address>-fmt<format>-t<unit>-WxH.png`,
+  as the shader sees it, and prints each target's pitch. `pspocket-boot --frame-from N` saves frames from N on; frames
+  are written on threads of their own, so saving every frame keeps 30 fps.
+- Test: a clear of 0x11223344 reads back from an A8B8G8R8 target as those bytes, and a clear of only the red channel
+  writes the value's red byte.
+
+## D-120 · 2026-10-05 · A target narrower than the one at its address is its corner; a wider one keeps what it held
+
+The black flashes: GTA V clears the right half of that damage target as 2560x512, then draws into its left half as a
+1280x512 target with the same pitch, and samples it as 2560x512. A surface was found only by address, size, pitch and
+format, so the narrow one evicted the wide one and its cleared half was gone; the 2560-wide texture sampled the
+1280-wide surface stretched, and the characters came out black. Its 1280x720 depth buffer, used at 1280x512 by the
+same pass, was made anew each frame the same way.
+- A colour target at the start of a larger one with its pitch and format, or a depth buffer at the start of a larger
+  one, is that surface: the pass draws in its top-left corner, the surface clip (`PassTargets::width, height`, the
+  descriptor's render target size). Its load-action clear would clear the whole attachment, so such a pass clears
+  with a quad.
+- A larger colour target over a smaller one at its start takes guest memory, then the smaller one's pixels in its
+  corner (`grow_surface`), instead of starting empty.
+- A texture smaller than the target at its address, with its pitch, samples a copy of the target's top-left corner,
+  made again when the target changes (`Surface::corners`). A larger one (an MSAA target read at its sample layout)
+  still samples it stretched.
+- Tests: a narrow target keeps the wide one's other half; a wide one keeps the narrow one's pixels; a texture of half
+  the width samples only the left half.
+- Run 084: the robber who turned black then red keeps his green jacket and red and teal hat. Not yet: the security
+  guard in the hostage cutscene still turns black at the cut to his close-up. The 640x256 target GTA V clears at
+  0xcf670000 (pitch 0x2800) lies inside the 2560x512 one, 256 rows down, and evicts it, decals and all: the guard's
+  texture then decodes the stale memory under it. Targets inside other targets at any offset come next.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

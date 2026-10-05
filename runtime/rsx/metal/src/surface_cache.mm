@@ -143,9 +143,60 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
             return s.get();
         }
     }
+    // A target at the start of a larger one, with its pitch and format, is its top-left corner: the same memory, so
+    // the same texture, drawn in that corner (the pass is the surface clip). A larger one over a smaller one takes
+    // what the smaller one held. Made anew, the larger one lost what lay outside the smaller one: GTA V clears the
+    // right half of a 2560x512 target for its characters, then draws into its left half as a 1280x512 one, and they
+    // sampled the half that was never cleared (black, D-120).
+    Surface* inner = nullptr;
+    if (!swizzled) {
+        for (const auto& s : surfaces) {
+            if (s->address != address || s->depth || s->swizzled || s->gcm_format != format || s->pitch != pitch) continue;
+            if (s->width >= width && s->height >= height) {
+                s->last_used = tick;
+                s->last_frame = stats.flips;
+                check_cpu_writes(*s);
+                return s.get();
+            }
+            if (s->width <= width && s->height <= height) inner = s.get();
+        }
+    }
     const u32 row = width * surface_color_bpp(format);
-    evict_overlapping(address, pitch ? pitch : row, row, height, nullptr);
-    return make_surface(address, pitch, width, height, format, false, swizzled, color_surface_format(format));
+    evict_overlapping(address, pitch ? pitch : row, row, height, inner);
+    Surface* made = make_surface(address, pitch, width, height, format, false, swizzled, color_surface_format(format));
+    if (inner) {
+        if (made && inner->initialized) grow_surface(*made, *inner);
+        remove_surface(inner);
+    }
+    return made;
+}
+
+// A larger target over a smaller one at its start: guest memory under it, then the smaller one's pixels in its corner.
+void MetalBackend::Impl::grow_surface(Surface& outer, Surface& inner)
+{
+    if (readback_supported(outer)) {
+        outer.cpu_newer = true;
+        end_pass_for(kEndTargetCopy);
+        upload_surface_from_guest(outer); // what lies outside the smaller one, as guest memory holds it
+    }
+    if (!inner.cpu_newer) {
+        end_pass_for(kEndTargetCopy);
+        id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
+        [blit copyFromTexture:inner.texture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(inner.width, inner.height, 1)
+                    toTexture:outer.texture
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+    }
+    outer.initialized = true;
+    outer.gpu_newer = inner.gpu_newer || outer.gpu_newer;
+    outer.generation++;
+    stats.surfaces_grown++;
 }
 
 Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool depth_float)
@@ -154,6 +205,16 @@ Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width
     for (const auto& s : surfaces) {
         if (s->address == address && s->depth && s->gcm_format == format && s->width == width && s->height == height &&
             s->pitch == pitch) {
+            s->last_used = tick;
+            s->last_frame = stats.flips;
+            return s.get();
+        }
+    }
+    // A smaller clip over a depth buffer with its pitch: its top-left corner (D-120). GTA V's character pass uses its
+    // 1280x720 depth buffer at 1280x512, which made a new one each frame and lost what the frame had drawn.
+    for (const auto& s : surfaces) {
+        if (s->address == address && s->depth && s->gcm_format == format && s->pitch == pitch && s->width >= width &&
+            s->height >= height) {
             s->last_used = tick;
             s->last_frame = stats.flips;
             return s.get();

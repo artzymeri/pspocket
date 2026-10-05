@@ -352,6 +352,39 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         check_guest(*s, t, unit);
         bind_source = "target";
         id<MTLTexture> tex = s->texture;
+        // A smaller texture at its start, with its pitch: its top-left corner, copied once per change (D-120). A
+        // larger one (an MSAA target read at its sample layout) still samples it stretched.
+        if ((t.width < s->width || t.height < s->height) && t.width <= s->width && t.height <= s->height &&
+            (t.format & tex::kLinearFlag) && t.pitch == s->pitch && t.dimension == 2 && !t.cubemap && t.width &&
+            t.height) {
+            Surface::Conversion& c = s->corners[(t.width << 16) | t.height];
+            if (!c.texture || c.generation != s->generation) {
+                MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->pixel_format
+                                                                                             width:t.width
+                                                                                            height:t.height
+                                                                                         mipmapped:NO];
+                d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+                d.storageMode = MTLStorageModePrivate;
+                c.texture = [device newTextureWithDescriptor:d];
+                c.views.clear();
+                end_pass_for(kEndTargetCopy);
+                id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
+                [blit copyFromTexture:s->texture
+                          sourceSlice:0
+                          sourceLevel:0
+                         sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(t.width, t.height, 1)
+                            toTexture:c.texture
+                     destinationSlice:0
+                     destinationLevel:0
+                    destinationOrigin:MTLOriginMake(0, 0, 0)];
+                [blit endEncoding];
+                c.generation = s->generation;
+            }
+            stats.surface_corners++;
+            bind_source = "target corner";
+            return sample_view(c.texture, c.views, src);
+        }
         if (draw_targets.contains(s)) {
             // Reading a surface the draw also renders to: sample a copy taken before the draw.
             bind_source = "target copy";
