@@ -432,6 +432,29 @@ TEST_CASE("job chains: a JTS keeps the chain on its SPU until the PPU rewrites i
     CHECK(ps_read64(b, kJc + 0x00) == kCmds + 0x10);
 }
 
+TEST_CASE("job chains: a JTS half rewritten into a JOB still waits until its high word is written (D-125)",
+    "[hle][spurs][spurs-jobchain]")
+{
+    // The PPU writes the JOB's low word over the JTS first: in between the command is 0x00000008_<job EA>, which
+    // GTA V's escape caught, and which ran as a job at that 36-bit address (an MFC fault, the game stopped).
+    ChainFixture s;
+    u8* b = s.base;
+    write_desc(b, desc(0), {.out = out(0)});
+    write_desc(b, desc(1), {.out = out(1)});
+    s.cmd(kCmds + 0x00, desc(0));
+    s.cmd(kCmds + 0x08, (kJts & ~0xFFFFFFFFull) | desc(1)); // the low word written, the high word not yet
+    s.cmd(kCmds + 0x10, kEnd);
+    s.run();
+    REQUIRE(s.wait_done(0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(ps_read8(b, kSpurs + 0x20 + s.wid()) == 1); // still on the SPU, waiting
+    CHECK(ps_read64(b, kJc + 0x00) == kCmds + 0x08);
+    s.cmd(kCmds + 0x08, desc(1)); // the high word lands
+    REQUIRE(s.wait_done(1));
+    REQUIRE(s.wait_left());
+    CHECK(ps_read64(b, kJc + 0x00) == kCmds + 0x10);
+}
+
 TEST_CASE("job chains: an unknown command halts the chain, records the error and shuts the workload down",
     "[hle][spurs][spurs-jobchain]")
 {

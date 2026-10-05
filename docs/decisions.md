@@ -1944,6 +1944,17 @@ each PUT still orders PUTs among themselves). D-118's re-read stays as the net u
 also says iOS's heat level ("heat nominal / fair / serious / critical").
 - No test reproduces the race without the game: it lives in the order stores reach another core.
 
+## D-125 · 2026-10-05 · A job chain command with the JTS bit waits, whatever its low word
+
+The iPhone stopped in the first mission's escape on "job descriptor: 0x280 bytes at 0x8102db800 are not in guest
+memory": a job chain (workload 11) took 0x00000008_102db800 as a JOB at a 36-bit address. The descriptor at
+0x102db800 was whole; the high word was a JTS's (0x00000008_00000012, RPCS3's CELL_SPURS_JOB_OPCODE_JTS). The PPU
+rewrites a JTS into a JOB low word first, then the high word: between the two stores the command keeps the JTS bit,
+and libsre reads it as a jump to self until the high word lands. Only the whole JTS value waited here. Now any command
+with bit 35 (the JTS bit) ends the batch with pc unchanged, as a JTS does.
+- Test: a chain whose second command is a JOB's low word over a JTS waits on its SPU; once the high word is written
+  the job runs (without the change it stops on the phone's MFC fault).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

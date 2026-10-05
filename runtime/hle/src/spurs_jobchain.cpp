@@ -55,6 +55,10 @@ constexpr u32 kOpJob = 0, kOpResetPc = 1, kOpSync = 2, kOpNext = 3, kOpCall = 4,
 constexpr u32 kSyncLabelBit = 0x08, kSyncLightBit = 0x10;
 constexpr u32 kAbort = 0x07, kGuard = 0x0F, kSetLabel = 0x17, kRet = 0x77, kEnd = 0x7F;
 constexpr u64 kJts = 0x0000000800000012ull; // jump to self: wait here until the PPU rewrites the command
+// Any command with the JTS bit waits (D-125): the PPU rewrites a JTS with a JOB low word first, then the high word, so
+// a command caught between the two stores (0x00000008_<job EA> in GTA V's escape) reads as a JTS until it is whole.
+constexpr u64 kJtsBit = 0x0000000800000000ull;
+static_assert(kJts & kJtsBit);
 
 constexpr u32 kPage = 0x400;
 constexpr u32 kRing = 4;              // descriptor buffers
@@ -415,6 +419,7 @@ void JobChainPolicy::batch(const u64* cmds, u32 n, bool urgent, Grab& g, bool* l
 {
     for (u32 i = 0; i < n && !g.exit; i++) {
         const u64 cmd = cmds[i];
+        if (cmd & kJtsBit) return; // a JTS, or a command the PPU is still writing: the batch ends; pc stays
         if (cmd != 0 && (cmd & 7) == kOpJob) {
             if (!may_take_) return;
             g.jobs.push_back({cmd, ps_read16(line_, jc_off::sizeJobDescriptor)});
@@ -438,7 +443,7 @@ bool JobChainPolicy::command(u64 cmd, bool urgent, Grab& g, bool* list_loaded)
         return false;
     };
     const auto set_pc = [&](u64 to) { ps_write64(line_, jc_off::pc, to); };
-    if (cmd == kJts) return false; // the batch ends; pc stays
+    if (cmd & kJtsBit) return false; // a JTS (or one being written): the batch ends; pc stays
     switch (low & 7) {
     case kOpJob: // NOP
         advance(urgent);
