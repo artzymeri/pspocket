@@ -72,7 +72,10 @@ struct RootView: View {
                 BootOverlay(cover: library.cover(for: entry), title: entry?.displayTitle ?? "",
                             cancellable: boot.phase != .started, pad: library.inputMode == .pad,
                             preparation: boot.phase == .preparing ? library.preparer.snapshot : nil,
-                            timeLeft: library.preparer.timeLeft, cancel: { library.cancel() })
+                            timeLeft: library.preparer.timeLeft,
+                            starting: boot.phase == .started ? BootOverlay.Starting(seconds: game.seconds,
+                                                                                    logTail: game.logTail) : nil,
+                            cancel: { library.cancel() })
                     .transition(.opacity)
             }
         }

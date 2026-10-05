@@ -110,7 +110,25 @@ struct BootOverlay: View {
     /// and the time left.
     var preparation: Preparer.Snapshot? = nil
     var timeLeft: String = ""
+    /// Set once the game's threads run, until its first frame: how long it has been starting, and what it last asked
+    /// for that pspocket does not do yet (a game that never draws looked frozen: Assassin's Creed, run 096).
+    var starting: Starting? = nil
     let cancel: () -> Void
+
+    struct Starting {
+        let seconds: Double
+        let logTail: String
+
+        /// The last call the log names as not done ("UNIMPLEMENTED cellSync::cellSyncMutexTryLock (0x...)").
+        var missing: String? {
+            for line in logTail.split(separator: "\n").reversed() {
+                guard let range = line.range(of: "UNIMPLEMENTED ") else { continue }
+                let rest = line[range.upperBound...]
+                return String(rest.prefix { $0 != " " })
+            }
+            return nil
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -153,7 +171,13 @@ struct BootOverlay: View {
                 } else {
                     IndeterminateBar()
                         .frame(width: 240, height: 4)
-                    Text("The game's code runs translated ahead of time: about a minute from Boot to the first screens.")
+                    if let starting {
+                        Text("Starting · \(Self.clock(starting.seconds))")
+                            .font(.system(size: 13, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
+                    Text(note)
                         .font(.system(size: 13))
                         .tracking(-0.08)
                         .multilineTextAlignment(.center)
@@ -179,6 +203,22 @@ struct BootOverlay: View {
         }
         .ignoresSafeArea()
         .statusBarHidden(true)
+    }
+
+    private var note: String {
+        if let starting, starting.seconds >= 45 {
+            if let missing = starting.missing {
+                return "No picture yet. The game last asked for \(missing), which pspocket doesn't do yet; it may "
+                    + "not get further. Swipe pspocket away to quit."
+            }
+            return "No picture yet: some games take a few minutes to their first screen."
+        }
+        return "The game's code runs translated ahead of time: about a minute from Boot to the first screens."
+    }
+
+    private static func clock(_ seconds: Double) -> String {
+        let s = Int(seconds)
+        return String(format: "%d:%02d", s / 60, s % 60)
     }
 }
 
