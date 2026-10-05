@@ -508,6 +508,28 @@ s32 cellSpursCreateTasksetWithAttribute(PPUContext& ctx, u32 spurs, u32 taskset,
     return r;
 }
 
+s32 task_readable(PPUContext& ctx, std::string_view what, std::string_view name, u32 addr, u32 size);
+
+// cellSpursCreateTaskset(spurs, taskset, args, priority, maxContention): RPCS3 cellSpursCreateTaskset, and libsre's
+// (fw 4.92) passes the same: create_taskset for a CellSpursTaskset (6400 bytes) with no name and enable_clear_ls 0.
+// The priority table is read after create_taskset's pointer checks (NULL, ALIGN), which therefore come first here; an
+// unreadable table is refused with TASK_ERROR_FAULT and a log of the call site (D-042; RPCS3 and libsre read it
+// unchecked).
+s32 cellSpursCreateTaskset(PPUContext& ctx, u32 spurs, u32 taskset, u64 args, u32 priority, u32 max_contention)
+{
+    PS_LOG_INFO(kChan, "cellSpursCreateTaskset(spurs {:#x}, taskset {:#x}, args {:#x}, priority {:#x}, maxContention {})",
+        spurs, taskset, args, priority, max_contention);
+    if (!spurs || !taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN || taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = task_readable(ctx, "cellSpursCreateTaskset", "priority table", priority, 8); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    u8 prio[8];
+    std::memcpy(prio, base + priority, 8);
+    return create_taskset(base, spurs, taskset, args, prio, max_contention, 0, kTasksetSize, 0);
+}
+
 // cellSpursShutdownWorkload, checked against libsre (fw 4.92), which RPCS3 follows: NULL, ALIGN, INVAL for a
 // workload ID past the instance's 16 (32 for SPURS2), SRCH for a workload that is not registered (its wklEnabled bit
 // clear), STAT for an instance in exception state or a workload not yet runnable. The native scheduler does not keep
@@ -1000,6 +1022,35 @@ s32 cellSpursWakeUp(PPUContext& ctx, u32 spurs)
     __atomic_store_n(base + spurs + spurs_off::handlerDirty, u8{1}, __ATOMIC_SEQ_CST);
     wake_workers(spurs); // natively: the scheduler's idle workers
     return lv2::CELL_OK;
+}
+
+// _cellSpursSendSignal(taskset, taskId), as RPCS3 (cellSpurs.cpp) and libsre (fw 4.92): NULL, 128-byte ALIGN, a task
+// ID past 127 or a workload ID past 31 (INVAL; an unreadable taskset is refused with TASK_ERROR_FAULT and a log, D-042),
+// then the task's signalled bit in one reservation operation on the taskset's first line, SRCH with nothing changed
+// when the task is not enabled or its bits are inconsistent (signal_task). A task that was waiting for the signal gets
+// its workload signalled (cellSpursSendWorkloadSignal, its result ignored) and SPURS woken (cellSpursWakeUp: STAT
+// becomes TASK_ERROR_STAT, another error is returned as RPCS3 returns it; libsre asserts it is CELL_OK).
+s32 _cellSpursSendSignal(PPUContext& ctx, u32 taskset, u32 task_id)
+{
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (task_id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, taskset, 128)) {
+        log_call_site(ctx, base, std::format("_cellSpursSendSignal: taskset {:#x} is not readable guest memory; refused "
+            "with CELL_SPURS_TASK_ERROR_FAULT", taskset));
+        return error(CELL_SPURS_TASK_ERROR_FAULT);
+    }
+    const u32 wid = ps_read32(base, taskset + ts_off::wid);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    const int signal = signal_task(base, taskset, task_id);
+    if (signal < 0) return error(CELL_SPURS_TASK_ERROR_SRCH);
+    if (signal == 0) return lv2::CELL_OK;
+    const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
+    send_workload_signal(base, spurs, wid);
+    const s32 rc = cellSpursWakeUp(ctx, spurs);
+    return rc == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT) ? error(CELL_SPURS_TASK_ERROR_STAT) : rc;
 }
 
 // libsre's task creation and task start, shared by cellSpursCreateTask and cellSpursCreateTaskWithAttribute once they
@@ -1843,6 +1894,32 @@ s32 cellSpursJoinJobChain(PPUContext& ctx, u32 job_chain)
     return chain_error;
 }
 
+// cellSpursAddUrgentCommand(jobChain, command), as RPCS3 (cellSpurs.cpp) and libsre (fw 4.92): the checks of
+// job_chain_workload (NULL, 128-byte ALIGN, a workload ID past 31 is INVAL; an unreadable chain too, with a log), then
+// in one reservation operation on the chain's first line the command goes into the first of its four urgent command
+// slots that is 0; BUSY when all four are taken. libsre's ldarx/stdcx. walk over the slots ends in the same slot.
+// Nothing is signalled: the chain's next visit runs it (spurs_jobchain.cpp takes slot 0 and moves the others up).
+s32 cellSpursAddUrgentCommand(PPUContext& ctx, u32 job_chain, u64 command)
+{
+    u32 wid = 0, spurs = 0;
+    s32 rc;
+    if (!job_chain_workload(ctx, "cellSpursAddUrgentCommand", job_chain, wid, spurs, rc)) return rc;
+    reservation_op(guest_base(ctx), job_chain, [&](u8* line) {
+        for (u32 k = 0; k < 4; k++) {
+            if (ps_read64(line, jc_off::urgentCmds + 8 * k) == 0) {
+                ps_write64(line, jc_off::urgentCmds + 8 * k, command);
+                rc = lv2::CELL_OK;
+                return true;
+            }
+        }
+        rc = error(CELL_SPURS_JOB_ERROR_BUSY);
+        return false;
+    });
+    PS_LOG_DEBUG(kChan, "cellSpursAddUrgentCommand({:#010x}, {:#018x}): workload {} of SPURS {:#x} -> {:#x}", job_chain,
+        command, wid, spurs, static_cast<u32>(rc));
+    return rc;
+}
+
 } // namespace
 
 void register_cellSpurs(Registry& r)
@@ -1856,6 +1933,7 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0x16394A4E, _cellSpursTasksetAttributeInitialize),
         PS_HLE_FUNC(0x652B70E2, cellSpursTasksetAttributeSetName),
         PS_HLE_FUNC(0xC10931CB, cellSpursCreateTasksetWithAttribute),
+        PS_HLE_FUNC(0x52CC6C82, cellSpursCreateTaskset),
         PS_HLE_FUNC(0x8F122EF8, cellSpursTasksetAttributeSetTasksetSize),
         PS_HLE_FUNC(0xA789E631, cellSpursShutdownTaskset),
         PS_HLE_FUNC(0x9F72ADD3, cellSpursJoinTaskset),
@@ -1874,6 +1952,7 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xBEB600AC, cellSpursCreateTask),
         PS_HLE_FUNC(0x1D46FEDF, cellSpursCreateTaskWithAttribute),
         PS_HLE_FUNC(0x7E4EA023, cellSpursWakeUp),
+        PS_HLE_FUNC(0xE0A6DBE4, _cellSpursSendSignal),
         PS_HLE_FUNC(0x87630976, cellSpursEventFlagAttachLv2EventQueue),
         PS_HLE_FUNC(0x22AAB31D, cellSpursEventFlagDetachLv2EventQueue),
         PS_HLE_FUNC(0xF5507729, cellSpursEventFlagSet),
@@ -1886,6 +1965,7 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xBB68D76E, cellSpursJobChainAttributeSetHaltOnError),
         PS_HLE_FUNC(0x303C19CD, cellSpursCreateJobChainWithAttribute),
         PS_HLE_FUNC(0xF31731BB, cellSpursRunJobChain),
+        PS_HLE_FUNC(0x17001000, cellSpursAddUrgentCommand),
     });
 }
 

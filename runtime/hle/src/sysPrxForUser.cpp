@@ -1,13 +1,18 @@
 // sysPrxForUser: the liblv2 user-side library (thread and TLS setup, lightweight sync, process exit, ...).
-// References: RPCS3 rpcs3/Emu/Cell/Modules/sysPrxForUser.cpp, sys_ppu_thread_.cpp, sys_lwmutex_.cpp, sys_prx_.cpp.
+// References: RPCS3 rpcs3/Emu/Cell/Modules/sysPrxForUser.cpp, sys_ppu_thread_.cpp, sys_lwmutex_.cpp, sys_prx_.cpp,
+// sys_spinlock.cpp, sys_mmapper_.cpp, sys_spu_.cpp, sys_game_.cpp.
 //
 // Implemented: what GTA V's first boot log called (docs/runs/004), plus the rest of the lwmutex set that a created
-// lwmutex is used through, and sys_prx_register_library (a GTA V import). Everything else stays unimplemented until a
-// log shows the game calls it (CLAUDE.md rule 4).
+// lwmutex is used through, and sys_prx_register_library (a GTA V import); Assassin's Creed's imports: the spinlocks,
+// the sys_mmapper wrappers, sys_process_is_stack, sys_spu_image_close and sys_game_process_exitspawn. Everything else
+// stays unimplemented until a log shows the game calls it (CLAUDE.md rule 4).
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <format>
 #include <string>
+#include <vector>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
@@ -377,6 +382,268 @@ s32 sys_lwmutex_unlock(PPUContext& ctx, u32 lwmutex)
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------------------------- spinlocks
+// RPCS3 sys_spinlock.cpp: a spinlock is one big-endian guest word, 0 when free; lock and trylock exchange 0xabadcafe
+// into it and own the lock when the exchange found 0. Every store goes through the reservation system (one update of
+// the word's 128-byte line), so it is atomic against guest lwarx/stwcx. and SPU GETLLAR/PUTLLC on the word and wakes
+// what waits on the line.
+
+constexpr u32 kSpinlockTaken = 0xABADCAFE;
+
+// The lock word must be a naturally aligned word of guest memory (the PS3's lwarx needs the alignment; RPCS3 reads it
+// unchecked); otherwise the call is refused with a log of the call site (D-042).
+bool spinlock_word_ok(PPUContext& ctx, u32 lock, std::string_view what)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (lock % 4 == 0 && guest_readable(t, lock, 4)) return true;
+    log_call_site(ctx, t.kernel.base(),
+        std::format("{}({:#x}): not an aligned word of guest memory; refused", what, lock));
+    return false;
+}
+
+// Stores `value` into the lock word in one reservation update and returns what the word held (RPCS3's exchange).
+u32 spinlock_exchange(u8* base, u32 lock, u32 value)
+{
+    const u32 line = PS_RES_LINE_ADDR(lock), offset = lock - line;
+    u32 old = 0;
+    reservation_op(base, line, [&](u8* copy) {
+        old = ps_read32(copy, offset);
+        ps_write32(copy, offset, value);
+        return true;
+    });
+    return old;
+}
+
+// RPCS3: a word that is not 0 is cleared; a free lock is left alone.
+void sys_spinlock_initialize(PPUContext& ctx, u32 lock)
+{
+    if (!spinlock_word_ok(ctx, lock, "sys_spinlock_initialize")) return;
+    u8* base = guest_base(ctx);
+    if (atomic_load_be32(base, lock) != 0) spinlock_exchange(base, lock, 0);
+}
+
+// RPCS3 `while (*lock || lock->exchange(0xabadcafe))`: spins until the word reads 0 and the exchange found 0. The wait
+// is polite: short pauses first, as sys_lwmutex_lock's, then lv2's yield, which backs off to sleeps (D-104) and reports
+// the end of the process, where RPCS3's loop leaves on test_stopped(): the thread then unwinds.
+s32 sys_spinlock_lock(PPUContext& ctx, u32 lock)
+{
+    if (!spinlock_word_ok(ctx, lock, "sys_spinlock_lock")) return err(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    for (u32 round = 0;; round++) {
+        if (atomic_load_be32(base, lock) == 0 && spinlock_exchange(base, lock, kSpinlockTaken) == 0) {
+            return lv2::CELL_OK;
+        }
+        if (round < 10) {
+            busy_wait();
+        } else if (!lv2::yield_wait(t)) {
+            throw lv2::ThreadExit{};
+        }
+    }
+}
+
+// RPCS3: CELL_EBUSY (not an error for the guest) when the word is not 0 or the exchange found the lock taken.
+s32 sys_spinlock_trylock(PPUContext& ctx, u32 lock)
+{
+    if (!spinlock_word_ok(ctx, lock, "sys_spinlock_trylock")) return err(lv2::CELL_EFAULT);
+    u8* base = guest_base(ctx);
+    if (atomic_load_be32(base, lock) != 0 || spinlock_exchange(base, lock, kSpinlockTaken) != 0) {
+        return err(lv2::CELL_EBUSY);
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3: the word becomes 0, whoever holds the lock.
+void sys_spinlock_unlock(PPUContext& ctx, u32 lock)
+{
+    if (!spinlock_word_ok(ctx, lock, "sys_spinlock_unlock")) return;
+    spinlock_exchange(guest_base(ctx), lock, 0);
+}
+
+// ------------------------------------------------------------------------------------------------- sys_mmapper
+// RPCS3 sys_mmapper_.cpp: the library's wrappers of the lv2 shared memory syscalls (runtime/lv2/src/memory.cpp), with
+// no IPC key: memory only this process maps.
+
+constexpr u64 SYS_MMAPPER_NO_SHM_KEY = 0xFFFF000000000000ull;
+
+s32 sys_mmapper_allocate_memory(PPUContext& ctx, u32 size, u64 flags, u32 mem_id)
+{
+    PS_LOG_DEBUG(kChan, "sys_mmapper_allocate_memory(size {:#x}, flags {:#x}, mem_id {:#x})", size, flags, mem_id);
+    return lv2::sys_mmapper_allocate_shared_memory(thread_of(ctx), SYS_MMAPPER_NO_SHM_KEY, size, flags, mem_id);
+}
+
+s32 sys_mmapper_map_memory(PPUContext& ctx, u32 addr, u32 mem_id, u64 flags)
+{
+    PS_LOG_DEBUG(kChan, "sys_mmapper_map_memory(addr {:#x}, mem_id {:#x}, flags {:#x})", addr, mem_id, flags);
+    return lv2::sys_mmapper_map_shared_memory(thread_of(ctx), addr, mem_id, flags);
+}
+
+s32 sys_mmapper_unmap_memory(PPUContext& ctx, u32 addr, u32 mem_id)
+{
+    PS_LOG_DEBUG(kChan, "sys_mmapper_unmap_memory(addr {:#x}, mem_id {:#x})", addr, mem_id);
+    return lv2::sys_mmapper_unmap_shared_memory(thread_of(ctx), addr, mem_id);
+}
+
+s32 sys_mmapper_free_memory(PPUContext& ctx, u32 mem_id)
+{
+    PS_LOG_DEBUG(kChan, "sys_mmapper_free_memory(mem_id {:#x})", mem_id);
+    return lv2::sys_mmapper_free_shared_memory(thread_of(ctx), mem_id);
+}
+
+// ------------------------------------------------------------------------------------------------- process, SPU images
+
+// RPCS3 sysPrxForUser.cpp sys_process_is_stack: whether the address's top four bits are 0xD, the PPU stack area
+// (0xD0000000..0xE0000000 here as well, D-031).
+s32 sys_process_is_stack(PPUContext&, u32 addr) { return (addr >> 28) == 0xD ? 1 : 0; }
+
+// sys_spu_image {u32 type, u32 entry_point, u32 segs, s32 nsegs} (RPCS3 sys_spu.h).
+constexpr u32 SYS_SPU_IMAGE_TYPE_USER = 0, SYS_SPU_IMAGE_TYPE_KERNEL = 1;
+constexpr u32 kSyscallSpuImageClose = 158; // _sys_spu_image_close
+
+// Makes lv2 syscall `number` with r3 = `arg` as the guest's `sc` does (Kernel::syscall), for a library function that
+// ends in a syscall: one lv2 does not implement is logged there and returns CELL_ENOSYS (CLAUDE.md rule 4).
+s32 lv2_syscall(PPUContext& ctx, u32 number, u64 arg)
+{
+    const u64 saved_r11 = ctx.gpr[11];
+    ctx.gpr[11] = number;
+    ctx.gpr[3] = arg;
+    thread_of(ctx).kernel.syscall(ctx);
+    ctx.gpr[11] = saved_r11;
+    return static_cast<s32>(ctx.gpr[3]);
+}
+
+// RPCS3 sys_spu_.cpp sys_spu_image_close: a user image's segment table, which sys_spu_image_import allocates in the
+// main area, is freed there (a table that is no such allocation is logged by the allocator; RPCS3 ignores it); a
+// kernel image (its lv2 ID in entry_point) is closed by the syscall _sys_spu_image_close, which lv2 does not have yet
+// (nothing opens kernel images: sys_spu_image_open is not implemented either), so the dispatcher reports it and it
+// returns CELL_ENOSYS; any other type is CELL_EINVAL. An image that is not guest memory is refused with CELL_EFAULT
+// and a log of the call site (D-042; RPCS3 reads it unchecked).
+s32 sys_spu_image_close(PPUContext& ctx, u32 img)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, img, 16)) {
+        log_call_site(ctx, base, std::format("sys_spu_image_close({:#x}): the image is not readable guest memory; "
+            "refused with CELL_EFAULT", img));
+        return err(lv2::CELL_EFAULT);
+    }
+    const u32 type = ps_read32(base, img), segs = ps_read32(base, img + 8);
+    PS_LOG_INFO(kChan, "sys_spu_image_close({:#x}): type {}, entry point {:#x}, segments {:#x} ({})", img, type,
+        ps_read32(base, img + 4), segs, static_cast<s32>(ps_read32(base, img + 12)));
+    if (type == SYS_SPU_IMAGE_TYPE_USER) {
+        HleProcess::current()->main_memory().free(segs);
+        return lv2::CELL_OK;
+    }
+    if (type == SYS_SPU_IMAGE_TYPE_KERNEL) return lv2_syscall(ctx, kSyscallSpuImageClose, img);
+    return err(lv2::CELL_EINVAL);
+}
+
+// ------------------------------------------------------------------------------------------------- exitspawn
+
+// How much of the exitspawn strings is read: more strings or longer ones make the block pass 0x1000 bytes, which
+// leaves argv and envp out anyway; only a path longer than 4 KB is cut short.
+constexpr u32 kExitspawnMaxStrings = 0x200, kExitspawnMaxString = 0x1000;
+
+// A guest array of string pointers (RPCS3 vm::cpptr<char>) up to its NULL, as far as guest memory goes.
+std::vector<std::string> read_string_list(lv2::PpuThread& t, u32 list)
+{
+    std::vector<std::string> out;
+    for (u32 i = 0; list && i < kExitspawnMaxStrings && guest_readable(t, list + 4 * i, 4); i++) {
+        const u32 s = ps_read32(t.kernel.base(), list + 4 * i);
+        if (!s) break;
+        out.push_back(read_log_string(t, s, kExitspawnMaxString));
+    }
+    return out;
+}
+
+// The size of the path and string arrays in the parameter block (RPCS3 sys_game_.cpp get_exitspawn_size): each string
+// 16-byte rounded with its NUL plus its 8-byte pointer, 8 bytes for each array's terminating NULL, and 8 more when the
+// strings (the path counts as the first argument) are odd in number.
+u32 exitspawn_size(const std::string& path, const std::vector<std::string>& args, const std::vector<std::string>& env)
+{
+    const auto string_size = [](const std::string& s) { return ((static_cast<u32>(s.size()) + 0x10) & ~0xFu) + 8; };
+    u32 size = string_size(path) + 8 + 8;
+    for (const std::string& s : args) size += string_size(s);
+    for (const std::string& s : env) size += string_size(s);
+    if ((1 + args.size() + env.size()) % 2) size += 8;
+    return size;
+}
+
+std::string quoted_list(const std::vector<std::string>& v)
+{
+    std::string out;
+    for (const std::string& s : v) out += std::format("{}\"{}\"", out.empty() ? "" : ", ", s);
+    return out;
+}
+
+// RPCS3 sys_game_.cpp sys_game_process_exitspawn(path, argv, envp, data, data_size, prio, flags): the game ends itself
+// and asks lv2 to start the executable `path` with these arguments. As RPCS3's exitspawn, the parameter block of
+// _sys_process_exit2 goes in the main area: sys_exit2_param {0x85, 0x30, the size after it, prio, flags, the strings'
+// EA} (u64 each); then the path, argv and envp as arrays of u64 pointers that end in 0, and the strings, 16-byte
+// rounded (argv and envp are left out when the block would pass 0x1000 bytes); the game's data (up to 4 KB) in the
+// last 0x1000 bytes. The flags are (flags & 0xf0) with bit 63 set, for which neither the atexitspawn nor the
+// at_Exitspawn handler runs. Then _sys_process_exit2(0, block, size, 0x10000000), which in pspocket ends the process:
+// starting another executable is not implemented (D-031), so the request is logged as an error with its path and
+// arguments. Deviation: RPCS3 first locks the "_lv2ppu" exit mutex, which pspocket's sys_initialize_tls does not create
+// (as sys_process_exit).
+void sys_game_process_exitspawn(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,
+    u64 flags)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const std::string file = read_log_string(t, path, kExitspawnMaxString);
+    const std::vector<std::string> asked_args = read_string_list(t, argv), asked_env = read_string_list(t, envp);
+    std::vector<std::string> args = asked_args, env = asked_env;
+    u32 size = exitspawn_size(file, args, env);
+    if (size > 0x1000) {
+        args.clear();
+        env.clear();
+        size = exitspawn_size(file, args, env);
+    }
+    size += 0x30;
+    if (data_size > 0) size += 0x1030;
+    const u32 copied = std::min<u32>(data_size, 0x1000);
+    const bool data_ok = guest_readable(t, data, copied);
+    const u32 block = HleProcess::current()->main_memory().alloc(size);
+    PS_LOG_ERROR(kChan, "sys_game_process_exitspawn(path \"{}\", argv [{}], envp [{}], data {:#x} ({:#x} bytes{}), "
+                        "prio {}, flags {:#x}): starting another executable is not implemented (D-031); the process "
+                        "ends (parameter block {:#010x}, {:#x} bytes{})",
+        file, quoted_list(asked_args), quoted_list(asked_env), data, data_size, data_ok ? "" : ", not readable", prio,
+        flags, block, size, args.size() < asked_args.size() || env.size() < asked_env.size() ?
+            "; argv and envp left out, as RPCS3 does past 0x1000 bytes" : "");
+    if (!block) {
+        lv2::_sys_process_exit(t, err(lv2::CELL_ENOMEM), 0, 0); // RPCS3: no memory for the block; does not return
+        return;
+    }
+
+    // RPCS3 put_exitspawn: the pointers from block + 0x30 (path, argv, 0, envp, 0), then the strings.
+    const u32 argc = static_cast<u32>(1 + args.size()), envc = static_cast<u32>(env.size());
+    u32 slot = block + 0x30;
+    u32 str = slot + (argc + envc + (argc + envc) % 2) * 8 + 0x10;
+    const auto put = [&](const std::string& s) {
+        std::memcpy(base + str, s.data(), s.size());
+        ps_write8(base, str + static_cast<u32>(s.size()), 0);
+        ps_write64(base, slot, str);
+        slot += 8;
+        str += (static_cast<u32>(s.size()) + 0x10) & ~0xFu;
+    };
+    put(file);
+    for (const std::string& s : args) put(s);
+    ps_write64(base, slot, 0);
+    slot += 8;
+    for (const std::string& s : env) put(s);
+    ps_write64(base, slot, 0);
+    if (copied && data_ok) std::memcpy(base + block + size - 0x1000, base + data, copied);
+
+    ps_write64(base, block + 0x00, 0x85);
+    ps_write64(base, block + 0x08, 0x30);
+    ps_write64(base, block + 0x10, size - 0x30);
+    ps_write64(base, block + 0x18, static_cast<u64>(static_cast<s64>(prio)));
+    ps_write64(base, block + 0x20, (flags & 0xF0) | (u64{1} << 63));
+    ps_write64(base, block + 0x28, block + 0x30);
+    lv2::_sys_process_exit2(t, 0, block, size, 0x10000000); // does not return
+}
+
 } // namespace
 
 void register_sysPrxForUser(Registry& r)
@@ -397,6 +664,17 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0x1573DC3F, sys_lwmutex_lock),
         PS_HLE_FUNC(0xAEB78725, sys_lwmutex_trylock),
         PS_HLE_FUNC(0x1BC200F4, sys_lwmutex_unlock),
+        PS_HLE_FUNC(0x8C2BB498, sys_spinlock_initialize),
+        PS_HLE_FUNC(0xA285139D, sys_spinlock_lock),
+        PS_HLE_FUNC(0x722A0254, sys_spinlock_trylock),
+        PS_HLE_FUNC(0x5267CB35, sys_spinlock_unlock),
+        PS_HLE_FUNC(0xB257540B, sys_mmapper_allocate_memory),
+        PS_HLE_FUNC(0xDC578057, sys_mmapper_map_memory),
+        PS_HLE_FUNC(0x4643BA6E, sys_mmapper_unmap_memory),
+        PS_HLE_FUNC(0x409AD939, sys_mmapper_free_memory),
+        PS_HLE_FUNC(0x4F7172C9, sys_process_is_stack),
+        PS_HLE_FUNC(0xE0DA8EFD, sys_spu_image_close),
+        PS_HLE_FUNC(0xFC52A7A9, sys_game_process_exitspawn),
     });
 }
 

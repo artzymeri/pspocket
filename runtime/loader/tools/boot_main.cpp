@@ -662,7 +662,8 @@ int main(int argc, char** argv)
     bool audio = false;
     std::string spu_dump;
     std::string game_library; // --game-library (D-152)
-    bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the app's way)
+    [[maybe_unused]] bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the
+                                               // app's way); only a build with them uses it
     bool lle_on = true;                // --no-lle: no firmware modules even with --flash (D-157)
     std::vector<std::string> lle_force; // --lle LIBRARY: that library from its firmware module whatever the host has
     std::vector<std::string> lle_load;  // --lle-load LIBRARY: its module (and theirs) loaded and started at boot

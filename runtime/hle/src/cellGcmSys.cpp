@@ -14,14 +14,16 @@
 // The interrupt thread (_gcm_intr_thread, RPCS3 creates it in _cellGcmInitBody) is an lv2 PPU thread whose entry is
 // an internal HLE function: every 1/59.94 s it counts a vblank in the driver information (lv2 package 0xFED, as
 // RPCS3's vblank thread does) and calls the game's vblank handler with head 1. RPCS3 runs its handlers on that thread
-// too. Flip and user handlers: not imported by any game so far. Tile and Z-cull settings reach lv2, but the RSX front
-// end does not use them yet.
+// too. Flip and user handlers: not imported by any game so far. Tile, Z-cull and flip mode (vsync) settings reach lv2,
+// but the RSX front end does not use them yet.
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <format>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <thread>
 
 #include "guest.hpp"
@@ -50,7 +52,7 @@ enum : u32 {
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
-constexpr u32 CELL_GCM_LOCATION_MAIN = 1; // anything else is local memory (CELL_GCM_LOCATION_LOCAL = 0)
+constexpr u32 CELL_GCM_LOCATION_LOCAL = 0, CELL_GCM_LOCATION_MAIN = 1; // anything but MAIN is local memory
 constexpr u32 CELL_GCM_IOMAP_FLAG_STRICT_ORDERING = 1 << 1;
 constexpr u32 kContextId = 0x55555555;
 constexpr u32 kLocalSize = 0x0F900000; // 249 MB: RPCS3's fixed value (its TODO: by SDK version, gcmGetLocalMemorySize)
@@ -369,6 +371,27 @@ u64 cellGcmGetTimeStampLocation(PPUContext& ctx, u32 index, u32 location)
     return ps_read64(thread_of(ctx).kernel.base(), report_address(ctx, index, location));
 }
 
+// RPCS3 cellGcmGetTimeStamp, cellGcmGetReport and cellGcmGetReportDataAddress: the same report entries in local memory
+// only (an index past 2047 is logged and used anyway, as RPCS3).
+u64 cellGcmGetTimeStamp(PPUContext& ctx, u32 index)
+{
+    return ps_read64(thread_of(ctx).kernel.base(), report_address(ctx, index, CELL_GCM_LOCATION_LOCAL));
+}
+
+// The report's value for a report type of 1..5 (CELL_GCM_ZPASS_PIXEL_CNT .. CELL_GCM_ZCULL_STATS3), else -1; the type
+// selects nothing else (RPCS3).
+u32 cellGcmGetReport(PPUContext& ctx, u32 type, u32 index)
+{
+    const u32 report = report_address(ctx, index, CELL_GCM_LOCATION_LOCAL);
+    if (type < 1 || type > 5) return 0xFFFFFFFF;
+    return ps_read32(thread_of(ctx).kernel.base(), report + 8);
+}
+
+u32 cellGcmGetReportDataAddress(PPUContext& ctx, u32 index)
+{
+    return report_address(ctx, index, CELL_GCM_LOCATION_LOCAL);
+}
+
 // ------------------------------------------------------------------------------------------------- memory mapping
 
 s32 cellGcmAddressToOffset(PPUContext& ctx, u32 address, u32 offset)
@@ -464,6 +487,94 @@ void _cellGcmSetFlipCommandWithWaitLabel(PPUContext& ctx, u32 context, u32 id, u
     prepare_flip(base, context, id);
 }
 
+// The game's CellGcmContextData, checked before it is read (D-042; RPCS3 reads it unchecked).
+bool context_readable(PPUContext& ctx, u32 context, std::string_view what)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (guest_readable(t, context, 16)) return true;
+    log_call_site(ctx, t.kernel.base(),
+        std::format("{}: the context {:#x} is not readable guest memory", what, context));
+    return false;
+}
+
+// The space check of RPCS3's command functions (`ctxt->current + 2 >= ctxt->end`, in words): with fewer than three
+// words left before end, the context's callback makes room, called through its descriptor with a count of 8 (RPCS3's
+// "???"). For the default context that is cellGcmCallback (flush, then the next segment); a game's own context may
+// have its own. Returns the callback's result: 0 when there was room or it made some. A descriptor that is not guest
+// memory counts as a failed callback (CELL_GCM_ERROR_FAILURE) and is logged with the call site (D-042).
+s32 make_room(PPUContext& ctx, u8* base, u32 context)
+{
+    if (ps_read32(base, context + ctx_current) + 8 < ps_read32(base, context + ctx_end)) return lv2::CELL_OK;
+    const u32 callback = ps_read32(base, context + ctx_callback);
+    if (!guest_readable(thread_of(ctx), callback, 8)) {
+        log_call_site(ctx, base, std::format("the callback of GCM context {:#x} ({:#x}) is not guest memory", context,
+            callback));
+        return error(CELL_GCM_ERROR_FAILURE);
+    }
+    return static_cast<s32>(call_guest(ctx, callback, {context, 8}));
+}
+
+// RPCS3 cellGcmSetFlipMode: the renderer's requested vsync becomes mode == CELL_GCM_DISPLAY_VSYNC (2; 1 is HSYNC). The
+// firmware sets it through lv2's display sync attribute (0x101 with the mode in a4, as RPCS3's lv2 reads it), and so
+// does this, for head 1, the head the HLE GCM drives (lv2 ignores the head, as RPCS3's). Before cellGcmInit there is no
+// RSX context to take it: logged.
+void cellGcmSetFlipMode(PPUContext& ctx, u32 mode)
+{
+    PS_LOG_INFO(kChan, "cellGcmSetFlipMode({})", mode);
+    if (const s32 r = lv2::sys_rsx_context_attribute(thread_of(ctx), kContextId, 0x101, 1, mode, 0, 0);
+        r != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan,
+            "cellGcmSetFlipMode({}): lv2 refused the display sync setting ({}); called before cellGcmInit?", mode,
+            lv2::error_name(r));
+    }
+}
+
+// cellGcmSetFlip(context, id): RPCS3 cellGcmSetFlip over gcmSetPrepareFlip (the checked API): a buffer id past 7 is
+// CELL_GCM_ERROR_FAILURE; room for the command, where a callback that fails is logged and nothing is written (its
+// result, when negative, becomes CELL_GCM_ERROR_FAILURE, else CELL_OK); then GCM_FLIP_COMMAND with the id. For the
+// default context the put register then advances by the command's 8 bytes, so the RSX runs it: RPCS3 adds to put, it
+// does not set put from current.
+s32 cellGcmSetFlip(PPUContext& ctx, u32 context, u32 id)
+{
+    if (id > 7) return error(CELL_GCM_ERROR_FAILURE);
+    if (!context_readable(ctx, context, "cellGcmSetFlip")) return error(CELL_GCM_ERROR_FAILURE);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (const s32 res = make_room(ctx, base, context); res != 0) {
+        PS_LOG_ERROR(kChan, "cellGcmSetPrepareFlip: callback failed ({:#010x})", static_cast<u32>(res));
+        return res < 0 ? error(CELL_GCM_ERROR_FAILURE) : lv2::CELL_OK;
+    }
+    prepare_flip(base, context, id);
+    GcmState& g = gcm();
+    if (context == g.context_addr) {
+        for (u32 put = atomic_load_be32(base, g.control_addr);;) {
+            const u32 seen = atomic_cas_be32(base, g.control_addr, put, put + 8);
+            if (seen == put) break;
+            put = seen;
+        }
+        if (rsx::Rsx* rsx = t.kernel.rsx()) rsx->notify();
+    }
+    return lv2::CELL_OK;
+}
+
+// cellGcmSetWaitFlip(context): RPCS3: room for the command (a callback that fails is logged and nothing is written),
+// then NV406E_SEMAPHORE_OFFSET 0x10 and NV406E_SEMAPHORE_ACQUIRE 0: the RSX waits until label 1, which a flip clears
+// (rsx m_flip_command), is 0. The game flushes it (no put update).
+void cellGcmSetWaitFlip(PPUContext& ctx, u32 context)
+{
+    if (!context_readable(ctx, context, "cellGcmSetWaitFlip")) return;
+    u8* base = guest_base(ctx);
+    if (const s32 res = make_room(ctx, base, context); res != 0) {
+        PS_LOG_ERROR(kChan, "cellGcmSetWaitFlip(): callback failed ({:#010x})", static_cast<u32>(res));
+        return;
+    }
+    const u32 current = ps_read32(base, context + ctx_current);
+    ps_write32(base, current, rsx::cmd::method_header(rsx::m::NV406E_SEMAPHORE_OFFSET, 2));
+    ps_write32(base, current + 4, 0x10);
+    ps_write32(base, current + 8, 0);
+    ps_write32(base, context + ctx_current, current + 12);
+}
+
 // RPCS3: the handler takes effect once the RSX is initialized.
 void cellGcmSetVBlankHandler(PPUContext&, u32 handler)
 {
@@ -486,16 +597,17 @@ std::array<u32, 4> pack_tile(const GcmState::Tile& t)
         t.base | ((t.base + ((t.size - 1) / 0x10000)) << 13) | (t.comp << 26) | (1u << 30)};
 }
 
-s32 cellGcmSetTileInfo(PPUContext& ctx, u8 index, u8 location, u32 offset, u32 size, u32 pitch, u8 comp, u16 base_tag,
-    u8 bank)
+// RPCS3 cellGcmSetTileInfo, shared with cellGcmSetTile (whose checks RPCS3 copied from it): the checks, then the tile's
+// packed CellGcmTileInfo in the array cellGcmSys keeps for the game.
+s32 set_tile_info(PPUContext& ctx, std::string_view what, u8 index, u8 location, u32 offset, u32 size, u32 pitch,
+    u8 comp, u16 base_tag, u8 bank)
 {
-    PS_LOG_INFO(kChan, "cellGcmSetTileInfo(index {}, location {}, offset {:#x}, size {:#x}, pitch {:#x}, comp {}, "
-                       "base {}, bank {})",
-        index, location, offset, size, pitch, comp, base_tag, bank);
+    PS_LOG_INFO(kChan, "{}(index {}, location {}, offset {:#x}, size {:#x}, pitch {:#x}, comp {}, base {}, bank {})",
+        what, index, location, offset, size, pitch, comp, base_tag, bank);
     if (index >= kTilesCount || base_tag >= 2048 || bank >= 4) return error(CELL_GCM_ERROR_INVALID_VALUE);
     if ((offset & 0xffff) || (size & 0xffff) || (pitch & 0xff)) return error(CELL_GCM_ERROR_INVALID_ALIGNMENT);
     if (location >= 2 || (comp != 0 && (comp < 7 || comp > 12))) return error(CELL_GCM_ERROR_INVALID_ENUM);
-    if (comp) PS_LOG_ERROR(kChan, "cellGcmSetTileInfo: compression mode {} (as RPCS3: not emulated)", comp);
+    if (comp) PS_LOG_ERROR(kChan, "{}: compression mode {} (as RPCS3: not emulated)", what, comp);
     GcmState& g = gcm();
     GcmState::Tile& t = g.tile[index];
     t = {location, offset, size, pitch, comp, base_tag, bank};
@@ -503,6 +615,12 @@ s32 cellGcmSetTileInfo(PPUContext& ctx, u8 index, u8 location, u32 offset, u32 s
     u8* base = thread_of(ctx).kernel.base();
     for (u32 i = 0; i < 4; i++) ps_write32(base, g.tiles + 16 * index + 4 * i, packed[i]);
     return lv2::CELL_OK;
+}
+
+s32 cellGcmSetTileInfo(PPUContext& ctx, u8 index, u8 location, u32 offset, u32 size, u32 pitch, u8 comp, u16 base_tag,
+    u8 bank)
+{
+    return set_tile_info(ctx, "cellGcmSetTileInfo", index, location, offset, size, pitch, comp, base_tag, bank);
 }
 
 // Binding goes to lv2 with the packed words (RPCS3's HLE only sets the renderer's flag; lv2 decodes the same words).
@@ -517,6 +635,18 @@ s32 set_tile_binding(PPUContext& ctx, u8 index, bool bound)
 s32 cellGcmBindTile(PPUContext& ctx, u8 index) { return set_tile_binding(ctx, index, true); }
 
 s32 cellGcmUnbindTile(PPUContext& ctx, u8 index) { return set_tile_binding(ctx, index, false); }
+
+// RPCS3 cellGcmSetTile: cellGcmSetTileInfo, then the tile is bound when its pitch is not 0 and unbound otherwise
+// (through lv2, as cellGcmBindTile and cellGcmUnbindTile here).
+s32 cellGcmSetTile(PPUContext& ctx, u8 index, u8 location, u32 offset, u32 size, u32 pitch, u8 comp, u16 base_tag,
+    u8 bank)
+{
+    if (const s32 r = set_tile_info(ctx, "cellGcmSetTile", index, location, offset, size, pitch, comp, base_tag, bank);
+        r != lv2::CELL_OK) {
+        return r;
+    }
+    return set_tile_binding(ctx, index, pitch > 0);
+}
 
 // cellGcmSetZcull: twelve arguments (the last four on the stack). RPCS3 GcmZcullInfo::pack, then lv2 0x301.
 void cellGcmSetZcull(PPUContext& ctx, u8 index, u32 offset, u32 width, u32 height, u32 cull_start, u32 z_format,
@@ -565,14 +695,21 @@ void register_cellGcmSys(Registry& r)
         PS_HLE_FUNC(0x8572BCE2, cellGcmGetReportDataAddressLocation),
         PS_HLE_FUNC(0xA6B180AC, cellGcmGetReportDataLocation),
         PS_HLE_FUNC(0x2AD4951B, cellGcmGetTimeStampLocation),
+        PS_HLE_FUNC(0x5A41C10F, cellGcmGetTimeStamp),
+        PS_HLE_FUNC(0x99D397AC, cellGcmGetReport),
+        PS_HLE_FUNC(0x9A0159AF, cellGcmGetReportDataAddress),
         PS_HLE_FUNC(0x21AC3697, cellGcmAddressToOffset),
         PS_HLE_FUNC(0x2A6FBA9C, cellGcmIoOffsetToAddress),
         PS_HLE_FUNC(0x626E8518, cellGcmMapEaIoAddressWithFlags),
         PS_HLE_FUNC(0xA53D12AE, cellGcmSetDisplayBuffer),
         PS_HLE_FUNC(0x21397818, _cellGcmSetFlipCommand),
         PS_HLE_FUNC(0xD8F88E1A, _cellGcmSetFlipCommandWithWaitLabel),
+        PS_HLE_FUNC(0x4AE8D215, cellGcmSetFlipMode),
+        PS_HLE_FUNC(0xDC09357E, cellGcmSetFlip),
+        PS_HLE_FUNC(0x983FB9AA, cellGcmSetWaitFlip),
         PS_HLE_FUNC(0xA91B0402, cellGcmSetVBlankHandler),
         PS_HLE_FUNC(0xBD100DBC, cellGcmSetTileInfo),
+        PS_HLE_FUNC(0xD0B1D189, cellGcmSetTile),
         PS_HLE_FUNC(0x4524CCCD, cellGcmBindTile),
         PS_HLE_FUNC(0xD9B7653E, cellGcmUnbindTile),
         PS_HLE_FUNC(0xD34A420D, cellGcmSetZcull),

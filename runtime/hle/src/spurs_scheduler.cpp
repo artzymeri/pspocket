@@ -551,15 +551,10 @@ u32 workers_inside(const Scheduler& scheduler, u32 wid)
     return wid < CELL_SPURS_MAX_WORKLOAD ? scheduler.inside[wid].load(std::memory_order_seq_cst) : 0;
 }
 
-// _cellSpursSendSignal (RPCS3 cellSpurs.cpp; libsre's PPU side does the same on the 32-bit word): set the task's
-// signalled bit; if it was waiting and not yet signalled, signal its workload so a worker picks the taskset up.
-s32 send_signal(u8* base, u32 taskset, u32 task_id)
+// RPCS3 cellSpurs.cpp _cellSpursSendSignal's spurs_taskset_signal_op; libsre's PPU side does the same on the task's
+// 32-bit word.
+int signal_task(u8* base, u32 taskset, u32 task_id)
 {
-    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
-    if (task_id >= 128 || ps_read32(base, taskset + ts_off::wid) >= CELL_SPURS_MAX_WORKLOAD2) {
-        return error(CELL_SPURS_TASK_ERROR_INVAL);
-    }
     const u32 word = 4 * (task_id / 32), mask = 0x80000000u >> (task_id % 32);
     int signal = -1;
     reservation_op(base, taskset, [&](u8* line) {
@@ -575,6 +570,19 @@ s32 send_signal(u8* base, u32 taskset, u32 task_id)
         ps_write32(line, 0x40 + word, signalled | mask);
         return true;
     });
+    return signal;
+}
+
+// _cellSpursSendSignal (RPCS3 cellSpurs.cpp; libsre's PPU side does the same on the 32-bit word): set the task's
+// signalled bit; if it was waiting and not yet signalled, signal its workload so a worker picks the taskset up.
+s32 send_signal(u8* base, u32 taskset, u32 task_id)
+{
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (task_id >= 128 || ps_read32(base, taskset + ts_off::wid) >= CELL_SPURS_MAX_WORKLOAD2) {
+        return error(CELL_SPURS_TASK_ERROR_INVAL);
+    }
+    const int signal = signal_task(base, taskset, task_id);
     if (signal < 0) return error(CELL_SPURS_TASK_ERROR_SRCH);
     if (signal == 1) {
         const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));

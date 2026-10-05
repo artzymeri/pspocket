@@ -55,6 +55,7 @@ enum : u32 {
     CELL_SPURS_JOB_ERROR_AGAIN = 0x80410A01,
     CELL_SPURS_JOB_ERROR_INVAL = 0x80410A02,
     CELL_SPURS_JOB_ERROR_PERM = 0x80410A09,
+    CELL_SPURS_JOB_ERROR_BUSY = 0x80410A0A,
     CELL_SPURS_JOB_ERROR_JOB_DESCRIPTOR = 0x80410A0B,
     CELL_SPURS_JOB_ERROR_JOB_DESCRIPTOR_SIZE = 0x80410A0C,
     CELL_SPURS_JOB_ERROR_STAT = 0x80410A0F,
@@ -256,8 +257,14 @@ void stop_scheduler_of(Scheduler& scheduler);
 u32 workers_inside(const Scheduler& scheduler, u32 wid);
 
 // _cellSpursSendSignal (PPU side, as libsre and RPCS3): sets the task's signalled bit; when the task was waiting for
-// it, signals the taskset's workload so a worker resumes it. CELL_OK, or a CELL_SPURS_TASK_ERROR_*.
+// it, signals the taskset's workload so a worker resumes it. CELL_OK, or a CELL_SPURS_TASK_ERROR_*. For HLE callers
+// (event flags, SPURS queues); the exported _cellSpursSendSignal (cellSpurs.cpp) also wakes SPURS, as RPCS3's does.
 s32 send_signal(u8* base, u32 taskset, u32 task_id);
+// The taskset update of _cellSpursSendSignal (RPCS3 spurs_taskset_signal_op), one reservation operation on the
+// taskset's first line: sets the task's signalled bit. -1 when the task is not enabled or its bits are inconsistent
+// (running and waiting, ready and pending ready, a bit of a task that is not enabled), and nothing changed; 1 when it
+// was waiting for the signal and had none, so its workload needs one; 0 otherwise.
+int signal_task(u8* base, u32 taskset, u32 task_id);
 
 // Wakes the instance's idle workers (cellSpursWakeUp, and HLE writes to CellSpurs line 0 that don't go through the
 // reservation system).
