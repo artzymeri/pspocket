@@ -98,6 +98,14 @@ struct Surface {
     std::unordered_map<u32, Conversion> conversions;
     // Its top-left corner sampled as a smaller texture at its start (D-120), by width << 16 | height.
     std::unordered_map<u32, Conversion> corners;
+    // A colour target inside a larger one with its pitch and format, not at its start (D-122): its own texture, the
+    // larger one its parent. What one writes reaches the other on the GPU before the other is used: a child's pixels
+    // go into its place in the parent; after the parent is written, the child takes its place back from it.
+    Surface* parent = nullptr;
+    u32 parent_x = 0, parent_y = 0;
+    std::vector<Surface*> children;
+    bool newer_than_parent = false;
+    bool older_than_parent = false;
     // A copy's destination (D-107), once guest memory has the copy: a CPU write after that makes guest memory newer.
     WriteTracker::Watch watch{};
     u32 bytes() const { return pitch * height; }
@@ -421,7 +429,13 @@ struct MetalBackend::Impl {
     Surface* find_surface(u32 address, bool depth) const;
     Surface* make_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool depth, bool swizzled,
         MTLPixelFormat pf);
-    void evict_overlapping(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep);
+    void evict_overlapping(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep,
+        const Surface* keep_too = nullptr);
+    // D-122: the larger target a new one lies inside; the pixels between them before one is used; a write to one.
+    Surface* find_parent(u32 address, u32 pitch, u32 width, u32 height, u32 format) const;
+    void sync_surface(Surface& s);
+    void surface_written(Surface& s);
+    void copy_region(id<MTLTexture> src, u32 sx, u32 sy, id<MTLTexture> dst, u32 dx, u32 dy, u32 w, u32 h);
     bool read_back(Surface& s, std::vector<u8>& raw, bool stencil = false); // raw texture bytes, tightly packed
     bool write_back(Surface& s, const char* why);     // to guest memory, in the surface's format
     bool write_back_depth(Surface& s, const char* why);

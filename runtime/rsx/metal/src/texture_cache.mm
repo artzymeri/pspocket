@@ -302,6 +302,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     Surface* s = find_surface(*ea, false);
     if (s) check_cpu_writes(*s);
     if (s) s->last_frame = stats.flips; // sampled: in use (D-116)
+    if (s && !s->cpu_newer) sync_surface(*s); // what its children or its parent wrote (D-122)
     std::array<u8, 4> src = fmt ? texture_channel_sources(*fmt, t.remap) : std::array<u8, 4>{0, 1, 2, 3};
     if (s && !s->cpu_newer && fmt) {
         const auto sf = static_cast<SurfaceColorFormat>(s->gcm_format);

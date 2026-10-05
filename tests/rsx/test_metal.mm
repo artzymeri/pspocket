@@ -1899,6 +1899,65 @@ TEST_CASE("metal e2e: a texture smaller than the target at its address samples t
     CHECK(guest_pixel(e, kSurfaceOffset, 58, 60) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // u near 1
 }
 
+TEST_CASE("metal e2e: a target inside a larger one keeps it, and each sees what the other wrote (D-122)")
+{
+    // GTA V clears a 640x256 target 256 rows into its 2560x512 damage target, same pitch, and the first mission's
+    // guard samples the large one: a new surface for the small one evicted the large one, and he came out black.
+    REQUIRE_METAL();
+    E2E e;
+    constexpr u32 kPitch = 2 * kW * 4;
+    constexpr u32 kChild = kSurfaceB + (kH / 2) * kPitch; // half way down, at the left
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    auto b = e.at(0);
+    setup_surface_sized(b, kSurfaceB, 2 * kW, kH, kPitch);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff112233);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    setup_surface_sized(b, kChild, kW, kH / 2, kPitch);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff445566);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    // The large one read as a texture: the child's pixels where it lies (bottom left), the large one's beside it.
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kSurfaceB, tex::A8R8G8B8, kPitch);
+    b.method(m::NV4097_SET_TEXTURE_IMAGE_RECT, ((2 * kW) << 16) | kH);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_children == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 5, 60) == std::array<u8, 4>{0xff, 0x44, 0x55, 0x66});
+    CHECK(guest_pixel(e, kSurfaceOffset, 58, 60) == std::array<u8, 4>{0xff, 0x11, 0x22, 0x33});
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kPitch * kH));
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, 5, 5) == std::array<u8, 4>{0xff, 0x11, 0x22, 0x33});
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, 5, kH / 2 + 5) == std::array<u8, 4>{0xff, 0x44, 0x55, 0x66});
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, kW + 5, kH / 2 + 5) == std::array<u8, 4>{0xff, 0x11, 0x22, 0x33});
+
+    // The large one written over the child's left half; then the child drawn again (a corner of it): it takes its
+    // place back from the large one first.
+    auto c = e.at(b.offset());
+    setup_surface_sized(c, kSurfaceB, 2 * kW, kH, kPitch);
+    c.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(kW / 2) << 16, kH << 16}); // x 0 to kW/2, every row
+    c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff778899);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    setup_surface_sized(c, kChild, kW, kH / 2, kPitch);
+    c.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(2u << 16) | (kW - 2), (2u << 16)}); // its top-right 2x2
+    c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffaabbcc);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kPitch * kH));
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, 5, kH / 2 + 5) == std::array<u8, 4>{0xff, 0x77, 0x88, 0x99});
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, kW / 2 + 5, kH / 2 + 5) == std::array<u8, 4>{0xff, 0x44, 0x55, 0x66});
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, kW - 1, kH / 2) == std::array<u8, 4>{0xff, 0xaa, 0xbb, 0xcc});
+    CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, 5, 5) == std::array<u8, 4>{0xff, 0x77, 0x88, 0x99});
+}
+
 TEST_CASE("metal e2e: an A8B8G8R8 target read as a Y16_X16 texture converts on the GPU, without a readback (D-098)")
 {
     REQUIRE_METAL();

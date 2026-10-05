@@ -102,6 +102,8 @@ struct BackendStats {
     u64 surfaces_evicted = 0;    // surfaces freed after a minute unused, their memory holding what they did (D-116)
     u64 surfaces_grown = 0;      // larger targets made over smaller ones at their start, keeping their pixels (D-120)
     u64 surface_corners = 0;     // textures sampled as the top-left corner of a larger target (D-120)
+    u64 surface_children = 0;    // targets made inside a larger one, both kept (D-122)
+    u64 surface_region_copies = 0; // pixels moved between a target and the larger one it lies in (D-122)
     u64 programs_prewarmed = 0;  // programs the shader cache made ahead and a draw then found (D-114)
     u64 pipelines_prewarmed = 0; // ... and pipelines
     u64 pipeline_ns = 0;        // ... and in render pipeline creation

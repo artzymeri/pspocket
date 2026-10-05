@@ -69,6 +69,15 @@ Surface* MetalBackend::Impl::find_surface(u32 address, bool depth) const
 void MetalBackend::Impl::remove_surface(Surface* s)
 {
     if (pass_open && pass.contains(s)) end_pass_for(kEndSurfaceGone);
+    // A child leaves what it wrote in its parent; children of a parent that goes stand alone (D-122).
+    if (Surface* p = s->parent) {
+        if (s->newer_than_parent) copy_region(s->texture, 0, 0, p->texture, s->parent_x, s->parent_y, s->width, s->height);
+        std::erase(p->children, s);
+    }
+    for (Surface* c : s->children) {
+        c->parent = nullptr;
+        c->older_than_parent = c->newer_than_parent = false;
+    }
     tracker.unwatch(s->watch);
     std::erase_if(surfaces, [s](const std::unique_ptr<Surface>& p) { return p.get() == s; });
 }
@@ -88,11 +97,12 @@ bool surfaces_overlap(u32 a, u32 a_pitch, u32 a_row, u32 a_rows, u32 b, u32 b_pi
     return u64{a} < u64{b} + u64{b_pitch} * b_rows && u64{b} < u64{a} + u64{a_pitch} * a_rows;
 }
 
-void MetalBackend::Impl::evict_overlapping(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep)
+void MetalBackend::Impl::evict_overlapping(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep,
+    const Surface* keep_too)
 {
     std::vector<Surface*> victims;
     for (const auto& s : surfaces) {
-        if (s.get() == keep) continue;
+        if (s.get() == keep || s.get() == keep_too) continue;
         const u32 s_row = s->width * surface_bytes_per_pixel(s->gcm_format, s->depth);
         if (surfaces_overlap(address, pitch, row_bytes, rows, s->address, s->pitch, s_row, s->height)) victims.push_back(s.get());
     }
@@ -102,6 +112,78 @@ void MetalBackend::Impl::evict_overlapping(u32 address, u32 pitch, u32 row_bytes
             s->width, s->height, s->gcm_format, address);
         remove_surface(s);
     }
+}
+
+// ---- targets inside targets (D-122) -------------------------------------------------------------------------------
+
+// GTA V draws its characters' damage into a 2560x512 target, then clears a 640x256 one 256 rows into it with the same
+// pitch; the guard of the first mission samples the large one. A new surface for the small one evicted the large one,
+// and the guard came out black. The small one is now a child: it keeps its own texture (a pass with it has the
+// depth buffer at its own origin, which one texture with the large one could not) and the large one stays.
+Surface* MetalBackend::Impl::find_parent(u32 address, u32 pitch, u32 width, u32 height, u32 format) const
+{
+    const u32 bpp = surface_color_bpp(format);
+    if (bpp == 0 || pitch == 0) return nullptr;
+    Surface* best = nullptr;
+    for (const auto& p : surfaces) {
+        if (p->depth || p->swizzled || p->gcm_format != format || p->pitch != pitch || p->parent) continue;
+        if (address <= p->address || address - p->address >= p->bytes()) continue;
+        const u32 offset = address - p->address;
+        if ((offset % pitch) % bpp) continue;
+        const u32 x = (offset % pitch) / bpp, y = offset / pitch;
+        if (x + width > p->width || y + height > p->height) continue;
+        if (!best || p->last_used > best->last_used) best = p.get();
+    }
+    return best;
+}
+
+void MetalBackend::Impl::copy_region(id<MTLTexture> src, u32 sx, u32 sy, id<MTLTexture> dst, u32 dx, u32 dy, u32 w,
+    u32 h)
+{
+    end_pass_for(kEndTargetCopy);
+    id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
+    [blit copyFromTexture:src
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(sx, sy, 0)
+               sourceSize:MTLSizeMake(w, h, 1)
+                toTexture:dst
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(dx, dy, 0)];
+    [blit endEncoding];
+    stats.surface_region_copies++;
+}
+
+// Before s is drawn to, sampled or read back: what its children wrote goes into their places in it; a child whose
+// parent was written since takes its place back.
+void MetalBackend::Impl::sync_surface(Surface& s)
+{
+    for (Surface* c : s.children) {
+        if (!c->newer_than_parent) continue;
+        copy_region(c->texture, 0, 0, s.texture, c->parent_x, c->parent_y, c->width, c->height);
+        c->newer_than_parent = false;
+        s.initialized = true;
+        s.gpu_newer = true;
+        s.generation++;
+    }
+    if (Surface* p = s.parent; p && s.older_than_parent) {
+        sync_surface(*p); // its other children first
+        copy_region(p->texture, s.parent_x, s.parent_y, s.texture, 0, 0, s.width, s.height);
+        s.older_than_parent = false;
+        s.initialized = true;
+        s.gpu_newer = p->gpu_newer;
+        s.generation++;
+    }
+}
+
+void MetalBackend::Impl::surface_written(Surface& s)
+{
+    if (s.parent) {
+        s.newer_than_parent = true;
+        s.older_than_parent = false;
+    }
+    for (Surface* c : s.children) c->older_than_parent = true;
 }
 
 Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool depth,
@@ -140,6 +222,7 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
             s->last_used = tick;
             s->last_frame = stats.flips;
             check_cpu_writes(*s);
+            sync_surface(*s);
             return s.get();
         }
     }
@@ -156,17 +239,28 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
                 s->last_used = tick;
                 s->last_frame = stats.flips;
                 check_cpu_writes(*s);
+                sync_surface(*s);
                 return s.get();
             }
             if (s->width <= width && s->height <= height) inner = s.get();
         }
     }
+    Surface* parent = swizzled || inner ? nullptr : find_parent(address, pitch, width, height, format);
     const u32 row = width * surface_color_bpp(format);
-    evict_overlapping(address, pitch ? pitch : row, row, height, inner);
+    evict_overlapping(address, pitch ? pitch : row, row, height, inner, parent);
     Surface* made = make_surface(address, pitch, width, height, format, false, swizzled, color_surface_format(format));
     if (inner) {
         if (made && inner->initialized) grow_surface(*made, *inner);
         remove_surface(inner);
+    }
+    if (parent && made) {
+        made->parent = parent;
+        made->parent_x = ((address - parent->address) % pitch) / surface_color_bpp(format);
+        made->parent_y = (address - parent->address) / pitch;
+        parent->children.push_back(made);
+        made->older_than_parent = parent->initialized; // starts as its place in the parent holds
+        sync_surface(*made);
+        stats.surface_children++;
     }
     return made;
 }
@@ -196,6 +290,7 @@ void MetalBackend::Impl::grow_surface(Surface& outer, Surface& inner)
     outer.initialized = true;
     outer.gpu_newer = inner.gpu_newer || outer.gpu_newer;
     outer.generation++;
+    surface_written(outer);
     stats.surfaces_grown++;
 }
 
@@ -465,6 +560,7 @@ bool MetalBackend::Impl::readback_supported(const Surface& s)
 MetalBackend::Impl::Readback MetalBackend::Impl::encode_readback(Surface& s)
 {
     end_pass(); // a pass with only a load-action clear so far runs first
+    sync_surface(s); // what its children wrote, or its parent (D-122)
     Readback r;
     r.image = {s.address, s.pitch, s.width, s.height, s.gcm_format, s.depth, s.swizzled, s.pixel_format};
     u32 bpp = 4;

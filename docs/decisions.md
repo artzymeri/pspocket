@@ -1900,6 +1900,23 @@ is replaced.
   key, a wrong key, an empty table and a PSN executable are refused with the reason; FindSelfKey's choices; a debug
   SELF. A game without its translated code boots in the interpreters: slow, but it boots.
 
+## D-122 · 2026-10-05 · A target inside a larger one is its child: both kept, each sees what the other wrote
+
+The black security guard of run 084 (D-120's last open case): GTA V clears a 640x256 target 256 rows into its
+2560x512 damage target (0xcf670000 inside 0xcf3f0000, the same pitch 0x2800), and the guard's draws sample the large
+one. A new surface for the small one evicted the large one, decals and all; the guard's texture then decoded the
+stale memory under it. A target that lies inside a larger colour target with its pitch and format, not at its start
+(that is D-120's corner), is now its child (`Surface::parent`, `children`):
+- It keeps its own texture: a pass with it has its depth buffer at its own origin, which drawing into the parent's
+  texture at an offset could not give (Metal offsets every attachment together). The parent stays.
+- What one writes reaches the other on the GPU, before the other is used (`sync_surface`: drawn to, sampled, read
+  back, copied): a child's pixels go into its place in the parent; after the parent is written, the child takes its
+  place back (`surface_written`). A child that goes leaves its pixels in its parent; children of a parent that goes
+  stand alone.
+- Test: a child cleared inside a cleared parent: the parent sampled as a texture shows the child where it lies and
+  itself beside it, and reads back so; the parent written over part of the child, then the child drawn again: the
+  child had taken its place back first.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

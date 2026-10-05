@@ -12,8 +12,9 @@ solid red, for seconds.
 |---|---|---|
 | Before | black, then red (jacket, bag, hat) | black |
 | A8B8G8R8 clear (D-119) | black, then his own colours | black |
-| + target corners (D-120) | his own colours: green jacket, red and teal hat | black (next) |
+| + target corners (D-120) | his own colours: green jacket, red and teal hat | black |
+| + targets inside targets (D-122) | his own colours | his own: brown jacket, badge, the head wound (the damage target) |
 
 - The red: the damage target is cleared to 0x00ff0000 (transparent red) and was stored as transparent blue (D-119).
 - The black: the target was redefined narrower and wider within a frame and lost its contents (D-120).
-- Still black: the security guard at the cut to his close-up: a 640x256 target inside the 2560x512 one evicts it.
+- The guard's black at the cut to his close-up: a 640x256 target inside the 2560x512 one evicted it (D-122). 30 fps.

@@ -450,6 +450,7 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
             pass.color[i]->last_used = tick;
             pass.color[i]->last_frame = stats.flips;
             if (pass_desc.colorAttachments[i].loadAction == MTLLoadActionClear) pass.color[i]->generation++;
+            surface_written(*pass.color[i]); // D-122
         }
         if (pass.depth) {
             pass.depth->initialized = true;
@@ -1452,6 +1453,7 @@ bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u
         }
         if (!d) d = m.get_color_surface(dst, dst_pitch, w, h, s->gcm_format, false);
         if (!d) return false;
+        m.sync_surface(*s); // what the source's children wrote (D-122)
         m.tracker.unwatch(d->watch); // newer on the GPU again
         m.end_pass_for(Impl::kEndTargetCopy);
         id<MTLBlitCommandEncoder> blit = [m.render_buffer() blitCommandEncoder];
@@ -1471,6 +1473,7 @@ bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u
         d->generation++;
         d->last_used = m.tick;
         d->last_frame = m.stats.flips;
+        m.surface_written(*d);
         m.stats.gpu_copies++;
         // Guest memory gets the copy once the GPU has it, before what the RSX writes after it (a label the CPU waits
         // for to read it): a deferred readback that writes nothing else, so the GPU's own reads do not wait for it.
