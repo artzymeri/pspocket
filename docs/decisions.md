@@ -2547,6 +2547,46 @@ signing (D-150), compiling (D-151), libraries (D-152) and the compile settings a
 - **On the Mac:** `pspocket-prepare --title ID --exe EBOOT.elf --game-dir DIR [--spu DIR]` runs the same pipeline;
   GTA V prepared from its executable alone (and the Mac's lifted SPU programs) passes the gate (run 095).
 
+## D-155 · 2026-10-06 · The phone translates a game's SPU programs too, finding code only registers reach
+
+Stage 4c of route B. The Mac lifted GTA V's SPU programs with scripts/lift-spu.sh from the images its runs saved, and
+the seeds those runs accumulated (D-099): the phone has neither the script nor the runs.
+- **`lift_spu_images` (runtime/prepare/spu.cpp)** is lift-spu.sh in C++: the saved images (spu_<hash>_<ls>.bin and
+  .txt), seeds from their "seed" lines, from runs' miss logs and from every entry of an earlier lift in the same
+  folder, relocatable copies merged once per hash at the first copy's base, one directory per program and
+  game_spu.c. For GTA V's 265 images it writes byte for byte what the script writes (150 programs, in under a second).
+  The phone uses the images the app already saves while a game runs (pspocket-coverage/<title>/spu, D-117) and its
+  miss log; a game that met SPU programs since its library was made is updated (only those compile).
+- **Discovery (`AnalyzerOptions::discover`, on in the pipeline):** translated from the images alone, GTA V's programs
+  missed 379 entries the Mac runs had taught the script, and the walk ran at 12.8 fps. The misses were code reached only
+  through registers: after an unconditional branch (182, jump table cases), after calls in functions only pointers
+  reach (148), after returns and stops. The analyzer now also starts from every instruction after one that never falls
+  through, padding skipped, that nothing reached, and stops where it meets code already reached (entered there, a
+  label of the function holding it, rather than copied: 112 MB of C without that rule, 92 MB with it, the Mac-seeded set
+  86 MB). 353 of the 379 are found.
+- **Discovered code does not make a program stale:** a program is dropped when a DMA writes over one of its translated
+  instructions (D-085); discovery also translates data that decodes as code, which the jobs write, so whole jobs were
+  dropped and interpreted (12 fps). The lifter leaves discovered functions out of a program's code words. With that,
+  GTA V from SPU code translated from its images alone runs the gate walk at 29.8 fps (45 misses left, logged: the next
+  update adds them; run 096). The risk taken: real code only discovery found and an overlay overwrites would run stale.
+- **The app's built-in SPU programs first:** programs are found by hash, the first registered winning, so the app
+  registers the ones built into it before a library's (their entries come from the Mac's runs); a library fills in
+  what the app lacks. `pspocket-boot --builtin-spu` and `gate.sh --builtin-spu` do the same; without it a library
+  runs alone, to test what it holds.
+
+## D-156 · 2026-10-06 · /dev_flash from the user's PS3UPDAT.PUP, on the phone
+
+Stage 5's first half: no Mac for the system software either. recomp/common reads a PUP (RPCS3 Loader/PUP.h: the
+"SCEUF" header and file table; the entries' HMACs are not checked) and ustar archives (Loader/TAR.cpp), and decrypts an
+SCE package as RPCS3's SCEDecrypter does (unself.cpp: the metadata info opened with the package key, the sections
+with their own keys, zlib inflated). `install_firmware` takes the update archive (file 0x300), every dev_flash_*
+package in it, and writes each package's third section (a TAR) under /dev_flash, as RPCS3's firmware installer does.
+The package key (key_vault.h SCEPKG_ERK/RIV) comes into the build directory with the SELF keys (scripts/self-keys.py),
+never into the repository. On the M4: 4.92's 24 packages, 1,075 files, 186 MB in 1.4 s, and all 142 modules of
+sys/external then decrypt with pspocket's own SELF code (run 096). The app installs it from Settings › System
+software into Application Support/pspocket-firmware/dev_flash, which games then mount. The second half, loading
+firmware modules (LLE) where pspocket has no HLE, is next.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
