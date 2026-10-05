@@ -23,7 +23,7 @@ struct rsx_attrib {
 struct rsx_vs_params {
     float4 pos_x; float4 pos_y; float4 pos_z;
     uint index_mode; uint index_offset; uint base_index; uint first_vertex;
-    uint restart_enable; uint restart_index; uint pad0; uint pad1;
+    uint restart_enable; uint restart_index; uint branch_bits; uint pad1;
     rsx_attrib attribs[16];
 };
 
@@ -181,7 +181,7 @@ bool vp_sca_supported(u32 op)
     case VpScaOp::NOP: case VpScaOp::MOV: case VpScaOp::RCP: case VpScaOp::RCC: case VpScaOp::RSQ:
     case VpScaOp::EX2: case VpScaOp::LG2: case VpScaOp::SIN: case VpScaOp::COS: case VpScaOp::LIT:
     case VpScaOp::EXP: case VpScaOp::LOG: case VpScaOp::BRA: case VpScaOp::BRI: case VpScaOp::CAL:
-    case VpScaOp::CLI: case VpScaOp::RET: return true;
+    case VpScaOp::CLI: case VpScaOp::RET: case VpScaOp::BRB: case VpScaOp::CLB: return true;
     default: return false;
     }
 }
@@ -189,9 +189,19 @@ bool vp_sca_supported(u32 op)
 bool vp_is_branch(u32 sca_op)
 {
     switch (static_cast<VpScaOp>(sca_op)) {
-    case VpScaOp::BRA: case VpScaOp::BRI: case VpScaOp::CAL: case VpScaOp::CLI: case VpScaOp::RET: return true;
+    case VpScaOp::BRA: case VpScaOp::BRI: case VpScaOp::CAL: case VpScaOp::CLI: case VpScaOp::RET:
+    case VpScaOp::BRB: case VpScaOp::CLB: return true;
     default: return false;
     }
+}
+
+// BRB and CLB (RPCS3 VertexProgramDecompiler GetOptionalBranchCond, D-113): taken when bit D3.branch_index (23-27) of
+// NV4097_SET_TRANSFORM_BRANCH_BITS is set, or with D3.brb_cond_true (28) clear, when it is clear. The condition codes
+// play no part.
+std::string vp_boolean_condition(const VpInstruction& in)
+{
+    const u32 index = (in.words[3] >> 23) & 31, if_true = (in.words[3] >> 28) & 1;
+    return std::format("((p.branch_bits >> {}u) & 1u) {} 0u", index, if_true ? "!=" : "==");
 }
 
 // The address register an instruction reads, with its component (RPCS3 VertexProgramDecompiler AddAddrReg).
@@ -406,6 +416,14 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
                 break;
             case VpScaOp::RET: // to the caller, or the end of the program outside a call
                 body += std::format("        if ({}) {{ jump = depth > 0 ? calls[--depth] : -1; continue; }}\n", c);
+                break;
+            case VpScaOp::BRB:
+                body += std::format("        if ({}) {{ jump = {}; continue; }}\n", vp_boolean_condition(in),
+                    in.branch_target);
+                break;
+            case VpScaOp::CLB:
+                body += std::format("        if ({}) {{ if (depth < 8) calls[depth++] = {}; jump = {}; continue; }}\n",
+                    vp_boolean_condition(in), in.slot + 1, in.branch_target);
                 break;
             default: break;
             }

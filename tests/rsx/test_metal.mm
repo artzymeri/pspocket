@@ -1573,6 +1573,94 @@ TEST_CASE("metal e2e: a swizzled target goes to guest memory in Morton order and
     CHECK(pixel(60, 5) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
 }
 
+namespace {
+
+// One triangle with a vertex program whose colour comes from c[0] (red) or c[1] (green) by a BRB or CLB on bit 2 of
+// NV4097_SET_TRANSFORM_BRANCH_BITS; the pixel inside it, read back (A R G B bytes).
+std::array<u8, 4> draw_with_branch_bits(bool call, bool if_true, u32 bits)
+{
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    const auto mov = [](u32 out, VpSrc src, u32 constant = 0) {
+        VpInst in;
+        in.vec_op = 1;
+        in.src[0] = src;
+        in.constant = constant;
+        in.out = out;
+        in.vec_mask = 0xf;
+        return in;
+    };
+    std::vector<VpInst> prog;
+    if (!call) {
+        VpInst brb; // 0: BRB L3 on b2
+        brb.sca_op = 0x11;
+        brb.branch_target = 3;
+        brb.branch_index = 2;
+        brb.branch_if_true = if_true;
+        prog.push_back(brb);
+        prog.push_back(mov(1, vp_const(), 0)); // 1: MOV o[1], c[0]
+        VpInst bri; // 2: BRI L4
+        bri.sca_op = 0x09;
+        bri.branch_target = 4;
+        prog.push_back(bri);
+        prog.push_back(mov(1, vp_const(), 1)); // 3: MOV o[1], c[1]
+        VpInst pos = mov(0, vp_in());          // 4: MOV o[0], v[0] END
+        pos.end = true;
+        prog.push_back(pos);
+    } else {
+        prog.push_back(mov(1, vp_const(), 0)); // 0: MOV o[1], c[0]
+        VpInst clb; // 1: CLB L3 on b2
+        clb.sca_op = 0x12;
+        clb.branch_target = 3;
+        clb.branch_index = 2;
+        clb.branch_if_true = if_true;
+        prog.push_back(clb);
+        VpInst pos = mov(0, vp_in()); // 2: MOV o[0], v[0] END
+        pos.end = true;
+        prog.push_back(pos);
+        VpInst sub = mov(1, vp_const(), 1); // 3: MOV o[1], c[1] ; RET END (the last instruction holds the end bit)
+        sub.sca_op = 0x0c;
+        sub.end = true;
+        prog.push_back(sub);
+    }
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp(prog));
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+    b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT,
+        {f2u(1.f), f2u(0.f), f2u(0.f), f2u(1.f), f2u(0.f), f2u(1.f), f2u(0.f), f2u(1.f)});
+    b.method(m::NV4097_SET_TRANSFORM_BRANCH_BITS, bits);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().draws == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    return guest_pixel(e, kSurfaceOffset, 32, 48);
+}
+
+} // namespace
+
+TEST_CASE("metal e2e: vertex programs branch and call on NV4097_SET_TRANSFORM_BRANCH_BITS (BRB, CLB, D-113)")
+{
+    REQUIRE_METAL();
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00};
+    CHECK(draw_with_branch_bits(false, true, 1u << 2) == green); // BRB taken: bit 2 set
+    CHECK(draw_with_branch_bits(false, true, 1u << 1) == red);   // not taken: bit 2 clear
+    CHECK(draw_with_branch_bits(false, false, 0) == green);      // BRB on a clear bit, taken
+    CHECK(draw_with_branch_bits(true, true, 1u << 2) == green);  // CLB calls the subroutine, which returns
+    CHECK(draw_with_branch_bits(true, true, 0) == red);
+    CHECK(draw_with_branch_bits(true, false, 0) == green);
+}
+
 TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")
 {
     REQUIRE_METAL();

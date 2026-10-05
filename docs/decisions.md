@@ -1725,6 +1725,16 @@ ones: every 5- and 6-bit value survives the round trip exactly); X1R5G5B5's X bi
 as green then blue. None is used by GTA V's first mission; other games render to them.
 - Tests: the four formats round-trip through a CPU write and a reload, the X bit as its variant says.
 
+## D-113 · 2026-10-05 · Vertex programs branch and call on the transform branch bits (BRB, CLB)
+
+BRB and CLB were refused, so a vertex program with them skipped its draws. As RPCS3 (VertexProgramDecompiler
+GetOptionalBranchCond): they are taken when bit D3.branch_index (bits 23-27) of NV4097_SET_TRANSFORM_BRANCH_BITS is set,
+or, with D3.brb_cond_true (bit 28) clear, when it is clear; the condition codes play no part. BRB jumps, CLB calls (the
+call stack CAL uses). The register reaches the shader in the vertex parameters (the spare word after restart_index), set
+every draw. Not used by GTA V's first mission; engines branch on these bits between variants of one program.
+- Test: one triangle per case, its colour from c[0] or c[1] by a BRB or a CLB on bit 2, taken and not, on a set and on
+  a clear bit.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

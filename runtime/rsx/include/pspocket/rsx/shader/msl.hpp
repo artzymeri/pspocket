@@ -68,7 +68,8 @@ struct alignas(16) MslVsParams {
     u32 first_vertex = 0; // non-indexed draws
     u32 restart_enable = 0;
     u32 restart_index = 0;
-    u32 pad0 = 0, pad1 = 0;
+    u32 branch_bits = 0; // NV4097_SET_TRANSFORM_BRANCH_BITS: what BRB and CLB test (D-113)
+    u32 pad1 = 0;
     MslAttrib attribs[16];
 };
 static_assert(sizeof(MslVsParams) == 80 + 16 * 48);

@@ -64,6 +64,8 @@ struct VpInst {
     bool constant_relative = false;  // D3.index_const: c[constant + A.addr_swizzle]
     u32 addr_reg = 0, addr_swizzle = 0; // D0.addr_reg_sel_1, D0.addr_swz
     int branch_target = -1;          // BRI/CAL target (shares its bits with src2)
+    int branch_index = -1;           // BRB/CLB: the bit of NV4097_SET_TRANSFORM_BRANCH_BITS tested (D3 23-27)
+    bool branch_if_true = true;      // BRB/CLB: taken when that bit is set (D3 28), else when it is clear
 };
 
 inline u32 vp_src_bits(const VpSrc& s)
@@ -94,6 +96,9 @@ inline std::array<u32, 4> encode_vp(const VpInst& in)
         d0x = (d0x & ~(1u << 23)) | (((t >> 9) & 1) << 23);
         d2x = (d2x & ~0x3fu) | ((t >> 3) & 0x3f);
         d3 = (d3 & ~(7u << 29)) | ((t & 7) << 29);
+    }
+    if (in.branch_index >= 0) {
+        d3 = (d3 & ~(0x3fu << 23)) | ((static_cast<u32>(in.branch_index) & 31) << 23) | (u32{in.branch_if_true} << 28);
     }
     return {d0x, d1, d2x, d3};
 }

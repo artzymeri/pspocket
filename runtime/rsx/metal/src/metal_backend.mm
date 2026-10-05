@@ -865,6 +865,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     vs.pos_z[3] = vpi.offset[2];
     vs.base_index = state.vertex_data_base_index();
     vs.restart_enable = raster.restart_index_enable;
+    vs.branch_bits = state.transform_branch_bits(); // BRB and CLB (D-113)
     vs.restart_index = raster.restart_index;
     if (raster.restart_index_enable && d.command == DrawCommand::Indexed) unsupported("primitive restart is not implemented");
 
