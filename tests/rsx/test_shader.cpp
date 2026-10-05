@@ -221,15 +221,29 @@ TEST_CASE("unsupported vertex program features are named")
     CHECK(r.shader.source.find("texture2d<float> vtex2 [[texture(2)]], sampler vsmp2 [[sampler(2)]]") != std::string::npos);
     CHECK(r.shader.texture_mask == 0x4);
 
+    // Still refused, loudly: PSH (the stack ops).
+    prog = sample_vp();
+    prog[3].sca_op = static_cast<u32>(VpScaOp::PSH);
+    words = assemble_vp(prog);
+    vp = decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
+    REQUIRE(vp.has_value());
+    r = translate_vertex_program(*vp);
+    CHECK_FALSE(r.ok);
+    CHECK(r.error.find("PSH") != std::string::npos);
+
+    // BRB tests a bit of the transform branch bits (D-113; it was refused before).
     prog = sample_vp();
     prog[3].sca_op = static_cast<u32>(VpScaOp::BRB);
+    prog[3].branch_index = 5;
+    prog[3].branch_if_true = false;
     words = assemble_vp(prog);
     vp = decode_vertex_program(words.data(), static_cast<u32>(words.size() / 4), 0);
     REQUIRE(vp.has_value());
     CHECK(vp->has_branches);
     r = translate_vertex_program(*vp);
-    CHECK_FALSE(r.ok);
-    CHECK(r.error.find("BRB") != std::string::npos);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    CHECK(r.shader.source.find("((p.branch_bits >> 5u) & 1u) == 0u") != std::string::npos);
 }
 
 TEST_CASE("vertex programs: ARL and relative constants, branches, calls and returns translate (RPCS3 semantics)")
