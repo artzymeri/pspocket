@@ -80,6 +80,7 @@ TransientAllocator::Allocation TransientAllocator::alloc(u32 size, u32 align)
 
 void TransientAllocator::retire(id<MTLCommandBuffer> cb)
 {
+    generation_++;
     if (in_use_.empty()) return;
     auto chunks = std::make_shared<std::vector<id<MTLBuffer>>>(std::move(in_use_));
     in_use_.clear();
@@ -1082,8 +1083,15 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     }
     if (!index_data.buffer) index_data = vertex_data; // bound but unused
 
-    auto consts = transient.alloc(kTransformConstantCount * 16, 16);
-    std::memcpy(consts.data, state.transform_constants.data(), kTransformConstantCount * 16);
+    // The transform constants, uploaded again only after a write to one or a new command buffer (D-129): copying all
+    // 7.5 KB for every draw was the RSX thread's biggest copy on the iPhone (1,000 and more draws a frame).
+    if ((state.dirty_bits & dirty::kVertexConstants) || consts_generation != transient.generation()) {
+        consts_upload = transient.alloc(kTransformConstantCount * 16, 16);
+        std::memcpy(consts_upload.data, state.transform_constants.data(), kTransformConstantCount * 16);
+        consts_generation = transient.generation();
+        state.dirty_bits &= ~dirty::kVertexConstants;
+    }
+    const TransientAllocator::Allocation& consts = consts_upload;
 
     // Fragment constants: patched by games between draws, so read every draw.
     std::vector<std::array<float, 4>> fconst;

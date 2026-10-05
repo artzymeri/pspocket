@@ -53,9 +53,12 @@ public:
     Allocation alloc(u32 size, u32 align = 256);
     // Hands every chunk used since the last call to `cb`; they come back when it completes.
     void retire(id<MTLCommandBuffer> cb);
+    // Changes at each retire: an allocation made in this generation is still valid to bind.
+    u64 generation() const { return generation_; }
 
 private:
     static constexpr u32 kChunkSize = 4u << 20;
+    u64 generation_ = 0;
     id<MTLDevice> device_ = nil;
     id<MTLBuffer> current_ = nil;
     u32 offset_ = 0;
@@ -278,6 +281,8 @@ struct MetalBackend::Impl {
     u64 frame_event_value = 0;
     bool bc_supported = false;
     TransientAllocator transient;
+    TransientAllocator::Allocation consts_upload{}; // the transform constants as last uploaded (D-129)
+    u64 consts_generation = ~0ull;                   // the transient generation they were uploaded in
 
     // Command buffers: uploads (texture decode) go to their own buffer, committed before the render buffer.
     id<MTLCommandBuffer> upload_cb = nil;

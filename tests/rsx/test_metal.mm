@@ -1666,6 +1666,56 @@ TEST_CASE("metal e2e: vertex programs branch and call on NV4097_SET_TRANSFORM_BR
     CHECK(draw_with_branch_bits(true, false, 0) == green);
 }
 
+TEST_CASE("metal e2e: a transform constant written between two draws of one batch reaches the second (D-129)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    VpInst colour; // MOV o[1], c[0]
+    colour.vec_op = 1;
+    colour.src[0] = vp_const();
+    colour.out = 1;
+    colour.vec_mask = 0xf;
+    VpInst pos; // MOV o[0], v[0] END
+    pos.vec_op = 1;
+    pos.src[0] = vp_in();
+    pos.out = 0;
+    pos.vec_mask = 0xf;
+    pos.end = true;
+    auto b = e.at(0);
+    const auto draw_in = [&](u32 offset, std::array<float, 4> c0) {
+        setup_surface(b, offset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({colour, pos}));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(c0[0]), f2u(c0[1]), f2u(c0[2]), f2u(c0[3])});
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+    };
+    // One batch: red into the first surface, then green into the second, then (constants untouched) the third.
+    draw_in(kSurfaceOffset, {1.f, 0.f, 0.f, 1.f});
+    draw_in(kSurfaceOffset + 0x100000, {0.f, 1.f, 0.f, 1.f});
+    setup_surface(b, kSurfaceOffset + 0x200000);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().draws == 3);
+    for (u32 i = 0; i < 3; i++) REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + i * 0x100000, kW * kH * 4));
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00};
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == red);
+    CHECK(guest_pixel(e, kSurfaceOffset + 0x100000, 32, 48) == green);
+    CHECK(guest_pixel(e, kSurfaceOffset + 0x200000, 32, 48) == green);
+}
+
 TEST_CASE("metal e2e: PSPOCKET_RSX_CHECK_SURFACES reports a surface sampled after its memory changed under it")
 {
     REQUIRE_METAL();

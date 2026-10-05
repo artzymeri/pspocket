@@ -2000,6 +2000,15 @@ the lock (mfc_command already took its own where it needs one). The timebase is 
 fixed-point factor (79.8 MHz over the host's 24 MHz on Apple silicon): one multiply, drifting about a microsecond a
 day, monotonic.
 
+## D-129 · 2026-10-05 · The transform constants are uploaded again only after one changes
+
+The RSX thread's biggest copy on the iPhone (15% of its time) was the 7.5 KB of transform constants, copied into a
+new upload for every draw (1,000 and more a frame). The upload is now kept and bound again until a write to a
+constant (NV4097_SET_TRANSFORM_CONSTANT sets the dirty bit) or the next command buffer (the transient chunks retire
+with it).
+- Test: three draws in one batch, the constant changed between the first two and untouched before the third, each
+  renders its own colour.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
