@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-05, after run 083 (D-115). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
+2026-10-05, after run 083 (D-115) and build 131 (D-117). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
 onwards matter most now) and the latest `docs/runs/` entries. Keep this file current when the picture changes.
 
 ## The project
@@ -61,7 +61,12 @@ missing, roughly in order:
    what looks wrong. In TestFlight as PSPocketTEST since 2026-10-05 (`scripts/ios.sh testflight`, API key in the
    environment). The user's first report (build 116): 30 fps, but a stall the first time something happens (shader
    compiles: D-114) and characters flashing black or red (conditional rendering by stale counts: D-115). Build 125
-   added on-screen sticks; build 128 has both fixes and the Mac's recorded shaders.
+   added on-screen sticks; build 128 has both fixes and the Mac's recorded shaders. Build 131 frees textures and
+   surfaces unused for a minute (D-116) and records what the translation misses (D-117). The second report
+   (2026-10-05, build 128 or later): the black and red flashes on characters and clothes are still there, some
+   frame drops, and **the game crashes when switching to Trevor** (the prologue's first switch, past where the
+   Mac's scripted runs reach). Next: with the phone connected, stream the app's log while the user plays to the
+   switch, pull the crash report and the coverage, and catch a flash.
 2. **One command per game** (D-101): `scripts/translate-game.sh --iso GAME.iso --elf EBOOT.elf [--ios]` translates
    a game's PPU and SPU code and builds it in; the executable is decrypted with the user's own tools. Next: try it on
    a second game.
