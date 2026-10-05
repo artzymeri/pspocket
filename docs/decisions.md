@@ -1716,6 +1716,15 @@ Swizzled depth buffers are still refused, and logged.
 - Test: a red triangle rendered into a 64x64 swizzled target reads back at its Morton addresses; a texel the CPU
   writes there reloads, and the triangle stays.
 
+## D-112 · 2026-10-05 · 16-bit and G8B8 targets write back and reload
+
+R5G6B5 and X1R5G5B5 targets render into BGRA8 copies (8 bits a channel) and G8B8 into RG8 (blue in R, green in G,
+RPCS3 color_utils.hpp); their write-back and reload (D-110) refused them. Now R5G6B5 and X1R5G5B5 go to guest memory as
+big-endian 16-bit pixels, each channel rounded to 5 or 6 bits, and come back expanded (bits repeated into the low
+ones: every 5- and 6-bit value survives the round trip exactly); X1R5G5B5's X bit is one or zero by variant. G8B8 goes
+as green then blue. None is used by GTA V's first mission; other games render to them.
+- Tests: the four formats round-trip through a CPU write and a reload, the X bit as its variant says.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

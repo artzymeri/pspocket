@@ -1472,6 +1472,18 @@ TEST_CASE("metal e2e: a target the CPU wrote reloads from guest memory in every 
     SECTION("F_W32Z32Y32X32") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::F_W32Z32Y32X32) | color, 16, false, clear::kColor, floats, same); }
     SECTION("F_X32") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::F_X32) | color, 4, false, clear::kColor, floats, same); }
     SECTION("B8") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::B8) | color, 1, false, clear::kColor, bytes, same); }
+    SECTION("G8B8 (D-112)") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::G8B8) | color, 2, false, clear::kColor, bytes, same); }
+    SECTION("R5G6B5 (D-112)") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::R5G6B5) | color, 2, false, clear::kColor, bytes, same); }
+    SECTION("X1R5G5B5_O1R5G5B5: X reads back as one (D-112)")
+    {
+        reload_round_trip(static_cast<u32>(SurfaceColorFormat::X1R5G5B5_O1R5G5B5) | color, 2, false, clear::kColor, bytes,
+            [](u32 i, u8 v) { return i % 2 == 0 ? static_cast<u8>(v | 0x80) : v; });
+    }
+    SECTION("X1R5G5B5_Z1R5G5B5: X reads back as zero (D-112)")
+    {
+        reload_round_trip(static_cast<u32>(SurfaceColorFormat::X1R5G5B5_Z1R5G5B5) | color, 2, false, clear::kColor, bytes,
+            [](u32 i, u8 v) { return i % 2 == 0 ? static_cast<u8>(v & 0x7f) : v; });
+    }
     SECTION("Z24S8")
     {
         reload_round_trip(static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (1u << 8), 4, true,

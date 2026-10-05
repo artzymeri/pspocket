@@ -390,7 +390,8 @@ bool MetalBackend::Impl::readback_supported(const Surface& s)
     case SurfaceColorFormat::A8R8G8B8: case SurfaceColorFormat::X8R8G8B8_Z8R8G8B8: case SurfaceColorFormat::X8R8G8B8_O8R8G8B8:
     case SurfaceColorFormat::A8B8G8R8: case SurfaceColorFormat::X8B8G8R8_Z8B8G8R8: case SurfaceColorFormat::X8B8G8R8_O8B8G8R8:
     case SurfaceColorFormat::F_W16Z16Y16X16: case SurfaceColorFormat::F_W32Z32Y32X32: case SurfaceColorFormat::F_X32:
-    case SurfaceColorFormat::B8: return true;
+    case SurfaceColorFormat::B8: case SurfaceColorFormat::G8B8: case SurfaceColorFormat::R5G6B5:
+    case SurfaceColorFormat::X1R5G5B5_Z1R5G5B5: case SurfaceColorFormat::X1R5G5B5_O1R5G5B5: return true;
     default: return false;
     }
 }
@@ -481,9 +482,32 @@ void MetalBackend::Impl::store_readback(const Readback& r)
         const u32 float_bytes = f == SurfaceColorFormat::F_W16Z16Y16X16                                         ? 2
                               : (f == SurfaceColorFormat::F_W32Z32Y32X32 || f == SurfaceColorFormat::F_X32) ? 4
                                                                                                            : 0;
+        const bool r5g6b5 = f == SurfaceColorFormat::R5G6B5;
+        const bool x1r5g5b5 = f == SurfaceColorFormat::X1R5G5B5_Z1R5G5B5 || f == SurfaceColorFormat::X1R5G5B5_O1R5G5B5;
         if (f == SurfaceColorFormat::B8) {
             // One byte per pixel, as the Metal copy holds it (the shader's blue: surface_output_swizzle).
             for (u32 y = 0; y < s.height; y++) std::memcpy(out + y * out_pitch, &raw[y * s.width], s.width);
+        } else if (f == SurfaceColorFormat::G8B8) {
+            // The RG8 copy holds blue in R and green in G (surface_output_swizzle); memory holds G then B (D-112).
+            for (u32 y = 0; y < s.height; y++) {
+                for (u32 x = 0; x < s.width; x++) {
+                    const u8* p = &raw[(static_cast<usize>(y) * s.width + x) * 2];
+                    u8* dst = out + y * out_pitch + x * 2;
+                    dst[0] = p[1], dst[1] = p[0];
+                }
+            }
+        } else if (r5g6b5 || x1r5g5b5) {
+            // 16-bit big-endian, from the BGRA8 copy they render to, rounded to 5 and 6 bits (D-112).
+            const u16 x = f == SurfaceColorFormat::X1R5G5B5_O1R5G5B5 ? 0x8000 : 0;
+            const auto q = [](u32 v, u32 max) { return (v * max + 127) / 255; };
+            for (u32 y = 0; y < s.height; y++) {
+                for (u32 x2 = 0; x2 < s.width; x2++) {
+                    const u8* p = &raw[(static_cast<usize>(y) * s.width + x2) * 4]; // b g r a
+                    const u16 v = r5g6b5 ? static_cast<u16>((q(p[2], 31) << 11) | (q(p[1], 63) << 5) | q(p[0], 31))
+                                         : static_cast<u16>(x | (q(p[2], 31) << 10) | (q(p[1], 31) << 5) | q(p[0], 31));
+                    ps_st16(out + y * out_pitch + x2 * 2, v);
+                }
+            }
         } else if (float_bytes) {
             // The Metal copy holds the same components little-endian: swap each one into place, row by row.
             const u32 components = f == SurfaceColorFormat::F_X32 ? 1 : 4;
@@ -584,6 +608,7 @@ void MetalBackend::Impl::upload_surface_bytes(Surface& s)
     u32 bpp = 4;
     switch (s.pixel_format) {
     case MTLPixelFormatR8Unorm: bpp = 1; break;
+    case MTLPixelFormatRG8Unorm:
     case MTLPixelFormatDepth16Unorm: bpp = 2; break;
     case MTLPixelFormatRGBA16Float: bpp = 8; break;
     case MTLPixelFormatRGBA32Float: bpp = 16; break;
@@ -611,6 +636,25 @@ void MetalBackend::Impl::upload_surface_bytes(Surface& s)
             }
         } else if (f == SurfaceColorFormat::B8) {
             std::memcpy(dst, src, w);
+        } else if (f == SurfaceColorFormat::G8B8) {
+            for (u32 x = 0; x < w; x++) dst[x * 2] = src[x * 2 + 1], dst[x * 2 + 1] = src[x * 2]; // G B -> R(blue) G
+        } else if (f == SurfaceColorFormat::R5G6B5 || f == SurfaceColorFormat::X1R5G5B5_Z1R5G5B5 ||
+                   f == SurfaceColorFormat::X1R5G5B5_O1R5G5B5) {
+            // Expanded to the BGRA8 copy they render to (D-112).
+            const bool r5g6b5 = f == SurfaceColorFormat::R5G6B5;
+            const u8 alpha = f == SurfaceColorFormat::X1R5G5B5_Z1R5G5B5 ? 0 : 0xff;
+            const auto e5 = [](u32 v) { return static_cast<u8>((v << 3) | (v >> 2)); };
+            const auto e6 = [](u32 v) { return static_cast<u8>((v << 2) | (v >> 4)); };
+            for (u32 x = 0; x < w; x++) {
+                const u32 v = ps_ld16(src + x * 2);
+                u8* t = dst + x * 4;
+                if (r5g6b5) {
+                    t[0] = e5(v & 31), t[1] = e6((v >> 5) & 63), t[2] = e5(v >> 11);
+                } else {
+                    t[0] = e5(v & 31), t[1] = e5((v >> 5) & 31), t[2] = e5((v >> 10) & 31);
+                }
+                t[3] = alpha;
+            }
         } else if (f == SurfaceColorFormat::F_W16Z16Y16X16) {
             for (u32 i = 0; i < row; i += 2) {
                 const u16 v = ps_ld16(src + i);
