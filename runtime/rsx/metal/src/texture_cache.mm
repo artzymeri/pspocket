@@ -440,11 +440,15 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     CachedTexture* entry = nullptr;
     const u64 epoch = check_epoch();
     if (auto it = textures.find(key); it != textures.end()) {
+        bool dirty = false;
         if (it->second->checked != epoch) {
+            // Protection mode reads the bytes only when a page under the texture was written (D-134).
+            bool hashed = false;
+            dirty = tracker.check(it->second->watch, &hashed);
             stats.texture_checks++;
-            stats.texture_check_bytes += it->second->watch.size;
+            if (hashed) stats.texture_check_bytes += it->second->watch.size;
         }
-        if (it->second->checked != epoch && tracker.is_dirty(it->second->watch)) {
+        if (dirty) {
             tracker.unwatch(it->second->watch);
             textures.erase(it);
         } else {

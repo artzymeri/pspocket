@@ -344,6 +344,7 @@ struct MetalBackend::Impl {
     }
     u64 report_flips = 0, report_draws = 0, report_passes = 0, report_gpu_ns = 0, report_readback_ns = 0;
     u64 report_readbacks = 0, report_deferred = 0, report_conflicts = 0, report_texture_checks = 0, report_texture_bytes = 0;
+    u64 report_faults = 0; // the tracker's write faults at the last report (D-134)
     u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0;
     __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
     u32 visibility_next = 0;

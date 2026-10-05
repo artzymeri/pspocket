@@ -136,3 +136,49 @@ TEST_CASE("protection mode: a real guest store faults once, is resolved and comp
     tracker.uninstall();
     CHECK_FALSE(ps_rsx_handle_write_fault(mem.host(base)));
 }
+
+TEST_CASE("protection mode: check() reads nothing while untouched, keeps a watch a store beside it dirtied, and catches "
+          "a store into it (D-134)")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    const u32 page = static_cast<u32>(GuestMemory::host_page_size());
+    const u32 base = PS_MEM_RSX_LOCAL_BASE + 0x200000;
+    REQUIRE(mem.commit(base, 2 * page));
+    WriteTracker tracker(mem);
+    tracker.set_protection(true);
+    tracker.install();
+    struct sigaction sa {};
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_prev_segv);
+    sigaction(SIGBUS, &sa, &g_prev_bus);
+
+    auto w = tracker.watch(base + 0x100, 0x200); // a texture in the first page
+    bool hashed = true;
+    CHECK_FALSE(tracker.check(w, &hashed));
+    CHECK_FALSE(hashed); // nothing written: nothing read
+
+    // A store elsewhere in the page: a fault, then one read that finds the texture's bytes unchanged; the watch stays
+    // and its page is read-only again, so the next store faults too.
+    ps_write32(mem.base(), base + 0x800, 1);
+    CHECK(tracker.faults_handled() == 1);
+    CHECK_FALSE(tracker.check(w, &hashed));
+    CHECK(hashed);
+    CHECK_FALSE(tracker.check(w, &hashed));
+    CHECK_FALSE(hashed);
+    ps_write32(mem.base(), base + 0x900, 2);
+    CHECK(tracker.faults_handled() == 2);
+
+    // A store into the texture: dirty.
+    ps_write32(mem.base(), base + 0x180, 3);
+    CHECK(tracker.check(w, &hashed));
+    CHECK(hashed);
+
+    sigaction(SIGSEGV, &g_prev_segv, nullptr);
+    sigaction(SIGBUS, &g_prev_bus, nullptr);
+    CHECK(g_unexpected.load() == 0);
+    tracker.unwatch(w);
+    tracker.uninstall();
+}

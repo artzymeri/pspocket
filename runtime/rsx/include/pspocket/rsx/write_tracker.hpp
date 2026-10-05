@@ -53,6 +53,10 @@ public:
     Watch watch(u32 addr, u32 size);
     // True if the range may have changed since the watch was taken.
     bool is_dirty(const Watch& w) const;
+    // is_dirty for a watch the caller keeps (D-134). In protection mode nothing is read unless a page of the range
+    // was written; then the bytes decide: unchanged (a store elsewhere in the page), the watch is taken again (the
+    // pages protected again) and the range is clean. *hashed says whether the range was read.
+    bool check(Watch& w, bool* hashed = nullptr);
     // Drops a watch; pages no watch needs any more become writable again.
     void unwatch(Watch& w);
     // A write the tracker cannot observe through faults. Bumps generations (and wakes nothing: callers check).
@@ -72,6 +76,8 @@ public:
 
 private:
     u64 generation_sum(u64 first_page, u64 last_page) const;
+    // Makes the committed pages of [first, last] read-only that are not, in runs of one mprotect each.
+    void protect_pages(u64 first_page, u64 last_page);
 
     GuestMemory& mem_;
     usize page_size_;

@@ -1368,7 +1368,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         }
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
-                           "{:.0f} texture checks ({:.2f} MB hashed); {} programs and {} pipelines made ({:.1f} ms); "
+                           "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {} programs and {} pipelines "
+                           "made ({:.1f} ms); "
                            "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB)",
             m.report_flips, static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n,
             static_cast<double>(m.stats.draws - m.report_draws) / n,
@@ -1379,6 +1380,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             static_cast<double>(m.stats.readback_wait_ns - m.report_readback_ns) / 1e6 / n,
             static_cast<double>(m.stats.texture_checks - m.report_texture_checks) / n,
             static_cast<double>(m.stats.texture_check_bytes - m.report_texture_bytes) / 1048576.0 / n,
+            static_cast<double>(m.tracker.faults_handled() - m.report_faults) / n,
             m.stats.programs_compiled - m.report_programs, m.stats.pipelines_created - m.report_pipelines,
             static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns - m.report_compile_ns) / 1e6,
             m.textures.size(), static_cast<double>(m.texture_bytes()) / 1048576.0, m.surfaces.size(),
@@ -1388,6 +1390,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns;
         m.report_texture_checks = m.stats.texture_checks;
         m.report_texture_bytes = m.stats.texture_check_bytes;
+        m.report_faults = m.tracker.faults_handled();
         m.report_readback_ns = m.stats.readback_wait_ns;
         m.report_readbacks = m.stats.readbacks;
         m.report_deferred = m.stats.deferred_readbacks;

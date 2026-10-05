@@ -60,6 +60,7 @@
 #include <vector>
 
 #include <pthread.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -266,6 +267,10 @@ void report_host_frames(void* uctx)
 
 void on_fault(int sig, siginfo_t* info, void* uctx)
 {
+#if defined(PSPOCKET_HAVE_METAL)
+    // A store to a page the texture cache's write tracker made read-only (D-134): resolved, the store runs again.
+    if (ps_rsx_handle_write_fault(info->si_addr)) return;
+#endif
     const auto addr = reinterpret_cast<uintptr_t>(info->si_addr);
     const auto base = reinterpret_cast<uintptr_t>(g_guest_base);
     const lv2::PpuThread* t = lv2::current_thread();
@@ -323,6 +328,14 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
         write_err(report.data(), static_cast<int>(report.size()));
     }
     _exit(128 + sig);
+}
+
+bool debugger_attached()
+{
+    kinfo_proc info{};
+    size_t size = sizeof info;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    return sysctl(mib, 4, &info, &size, nullptr, 0) == 0 && (info.kp_proc.p_flag & P_TRACED) != 0;
 }
 
 void install_fault_reporter(GuestMemory& memory)
@@ -575,6 +588,12 @@ int main(int argc, char** argv)
             }
         }
         tracker = std::make_unique<rsx::WriteTracker>(memory);
+        // Textures are watched by page protection (D-134): on_fault resolves the tracker's faults. Not under a
+        // debugger, nor with PSPOCKET_RSX_HASH_TEXTURES set (the hashing of before).
+        if (!std::getenv("PSPOCKET_RSX_HASH_TEXTURES") && !debugger_attached()) {
+            tracker->install();
+            tracker->set_protection(true);
+        }
         cfg.rsx_backend = [&]() -> std::unique_ptr<rsx::Backend> {
             rsx::metal::MetalBackendConfig mc;
             mc.shader_cache = shader_cache;

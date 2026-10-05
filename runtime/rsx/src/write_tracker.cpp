@@ -96,19 +96,54 @@ WriteTracker::Watch WriteTracker::watch(u32 addr, u32 size)
     const u64 last = (u64{addr} + size - 1) >> page_shift_;
     w.generation = generation_sum(first, last);
     w.protected_mode = protection();
-    if (!w.protected_mode) {
-        w.content_hash = content_hash(mem_.host(addr), size);
-        return w;
-    }
-    for (u64 p = first; p <= last; p++) {
-        watchers_[p].fetch_add(1, std::memory_order_acq_rel);
-        const u32 page_addr = static_cast<u32>(p << page_shift_);
-        if (protected_[p].load(std::memory_order_acquire) != kProtected && mem_.is_committed(page_addr)) {
-            protected_[p].store(kProtected, std::memory_order_release);
-            mem_.protect(page_addr, page_size_, Prot::Read);
-        }
-    }
+    // The bytes as of the generation (protection mode keeps them too: check() tells a store to the range from one
+    // elsewhere in its pages).
+    w.content_hash = content_hash(mem_.host(addr), size);
+    if (!w.protected_mode) return w;
+    for (u64 p = first; p <= last; p++) watchers_[p].fetch_add(1, std::memory_order_acq_rel);
+    protect_pages(first, last);
     return w;
+}
+
+void WriteTracker::protect_pages(u64 first, u64 last)
+{
+    u64 run = 0, run_pages = 0; // the pending run of pages to make read-only
+    const auto flush = [&] {
+        if (run_pages) mem_.protect(static_cast<u32>(run << page_shift_), run_pages * page_size_, Prot::Read);
+        run_pages = 0;
+    };
+    for (u64 p = first; p <= last; p++) {
+        const u32 page_addr = static_cast<u32>(p << page_shift_);
+        if (protected_[p].load(std::memory_order_acquire) == kProtected || !mem_.is_committed(page_addr)) {
+            flush();
+            continue;
+        }
+        protected_[p].store(kProtected, std::memory_order_release);
+        if (!run_pages) run = p;
+        run_pages++;
+    }
+    flush();
+}
+
+bool WriteTracker::check(Watch& w, bool* hashed)
+{
+    if (hashed) *hashed = false;
+    if (!w.active) return true;
+    if (!w.protected_mode) {
+        if (hashed) *hashed = true;
+        return is_dirty(w);
+    }
+    const u64 first = w.addr >> page_shift_;
+    const u64 last = (u64{w.addr} + w.size - 1) >> page_shift_;
+    const u64 generation = generation_sum(first, last);
+    if (generation == w.generation) return false;
+    // A page was written since the watch (a fault, or notify_write). The generation is read before the pages are made
+    // read-only again: a store after that faults and dirties the next check; one before it is in the bytes compared.
+    protect_pages(first, last);
+    if (hashed) *hashed = true;
+    if (content_hash(mem_.host(w.addr), w.size) != w.content_hash) return true;
+    w.generation = generation;
+    return false;
 }
 
 bool WriteTracker::is_dirty(const Watch& w) const

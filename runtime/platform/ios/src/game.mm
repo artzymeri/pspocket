@@ -9,6 +9,9 @@
 #include "pspocket/platform/game.h"
 
 #include <signal.h>
+
+#include <thread>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -33,6 +36,7 @@
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/process.hpp"
+#include "pspocket/lv2/report.hpp"
 #include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/loader.hpp"
@@ -112,6 +116,8 @@ void on_log(void*, ps_ios_log_level level, const char* channel, const char* mess
 
 void on_fault(int sig, siginfo_t* info, void*)
 {
+    // A store to a page the texture cache's write tracker made read-only (D-134): resolved, the store runs again.
+    if (ps_rsx_handle_write_fault(info->si_addr)) return;
     char buf[320];
     const auto addr = reinterpret_cast<uintptr_t>(info->si_addr);
     const auto base = g_session && g_session->memory ? reinterpret_cast<uintptr_t>(g_session->memory->base()) : 0;
@@ -132,6 +138,57 @@ void on_fault(int sig, siginfo_t* info, void*)
         fsync(g_log_fd);
     }
     signal(sig, SIG_DFL); // returning re-runs the access, which now crashes with a system crash report
+}
+
+// A frozen game: frames came, then none for 10 s. What every PPU thread and the RSX's FIFO wait on goes to the log,
+// once per freeze (D-135): the phone froze with nothing logged, and gone before a debugger could attach.
+void watch_for_freezes(Session* s)
+{
+    std::thread([s] {
+        constexpr auto kQuiet = std::chrono::seconds(10);
+        u64 seen = 0;
+        auto since = std::chrono::steady_clock::now();
+        bool reported = false;
+        while (s->running.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            const u64 flips = s->flips.load(std::memory_order_relaxed);
+            const auto now = std::chrono::steady_clock::now();
+            if (flips != seen) {
+                seen = flips;
+                since = now;
+                reported = false;
+                continue;
+            }
+            if (!flips || reported || now - since < kQuiet) continue;
+            reported = true;
+            lv2::ReportOptions options;
+            options.title = std::format("no frame for {:.0f} s after frame {}",
+                std::chrono::duration<double>(now - since).count(), flips);
+            options.describe_address = [s](u32 addr) -> std::string {
+                const hle::LinkedFunction* f = s->hle ? s->hle->linked_at(addr) : nullptr;
+                if (!f) return {};
+                return f->module + "::" + (f->name.empty() ? std::format("{:#010x}", f->nid) : f->name);
+            };
+            const std::string report = lv2::format_report(*s->kernel, options);
+            // Line by line: the system log cuts long messages.
+            usize at = 0;
+            while (at < report.size()) {
+                const usize end = report.find('\n', at);
+                const usize n = (end == std::string::npos ? report.size() : end) - at;
+                if (n) PS_LOG_WARN(kChan, "freeze: {}", std::string_view(report).substr(at, n));
+                if (end == std::string::npos) break;
+                at = end + 1;
+            }
+        }
+    }).detach();
+}
+
+bool debugger_attached()
+{
+    kinfo_proc info{};
+    size_t size = sizeof info;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    return sysctl(mib, 4, &info, &size, nullptr, 0) == 0 && (info.kp_proc.p_flag & P_TRACED) != 0;
 }
 
 void install_fault_handler()
@@ -344,6 +401,12 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     }
 #endif
     install_fault_handler();
+    // Textures are watched by page protection from here on (D-134): the handler resolves the tracker's faults. Not
+    // under a debugger (it would stop at each one), nor with PSPOCKET_RSX_HASH_TEXTURES set (the hashing of before).
+    if (s->tracker && !std::getenv("PSPOCKET_RSX_HASH_TEXTURES") && !debugger_attached()) {
+        s->tracker->install();
+        s->tracker->set_protection(true);
+    }
     u32 main_id = 0;
     s->start = std::chrono::steady_clock::now();
     s->rate_since = s->start;
@@ -357,6 +420,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     }
     PS_LOG_INFO(kChan, "{} \"{}\" booted from {}: {} imported functions ({} implemented)", disc.title_id, disc.title,
         o->iso_path, report.functions_linked, report.functions_implemented);
+    watch_for_freezes(g_session);
     return 0;
 }
 

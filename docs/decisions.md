@@ -2056,6 +2056,30 @@ is scaled to Metal's [0, 1] and so are its derivatives (RPCS3 scales only the co
 still refused (no game seen doing it).
 - Test: the every-opcode fragment program, TXD added, compiles in Metal.
 
+## D-134 · 2026-10-05 · Textures are watched by page protection, and a store beside one keeps it
+
+The iPhone's RSX thread hashed 75 to 85 MB of texture memory a frame (about 1,100 checks), a fifth of its time and a
+steady draw on memory bandwidth, to find that nothing changed. WriteTracker's protection mode (plan section 4) was
+built and tested but never switched on: no fault handler called ps_rsx_handle_write_fault. Now the iPhone app's and
+pspocket-boot's fault handlers try it first, and both enable protection after installing themselves (not under a
+debugger, which would stop at every fault; PSPOCKET_RSX_HASH_TEXTURES keeps the hashing). A watch keeps its bytes'
+hash too, and the texture cache checks with WriteTracker::check: no page of the texture written, nothing is read; a
+page written, the bytes decide, and when they did not change (a store elsewhere in the page) the watch is taken again
+and its pages protected again instead of the texture being decoded anew. Pages are protected in runs, one mprotect
+each.
+- Measured (Mac, the walk of run 080 with --gpu metal): 520 to 610 texture checks a frame read 0.07 to 0.11 MB
+  instead of about 40 MB, with 36 to 43 write faults a frame; no other fault.
+- Test: check() reads nothing while untouched, keeps a watch a store beside it dirtied (one read, the page
+  protected again: the next store faults), and is dirty after a store into the range.
+
+## D-135 · 2026-10-05 · The iPhone app reports a freeze: what every thread waits on
+
+Build 149 froze on the iPhone two minutes into the mission: no more frames, the graphics, physics and dependency
+workloads at zero, the sound and the Secondary job chain still running, nothing in the log; the process was gone
+before a debugger could attach. The app now watches the flips from a thread of its own: when frames came and then
+none for 10 s, lv2's thread report (every PPU thread's state, what it waits on and its backtrace, then the RSX's FIFO
+and what it is blocked on) goes to the log line by line, once per freeze.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
