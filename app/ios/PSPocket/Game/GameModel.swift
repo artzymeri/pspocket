@@ -109,8 +109,9 @@ final class GameModel {
     /// The disc's executable decrypted on the phone, with the keys the app carries (D-121), into
     /// Documents/game/<TITLE_ID>/EBOOT.elf: then any disc picked here can boot.
     private func decryptExecutable(isoPath: String, titleID: String, for url: URL) {
-        let elf = Self.documents.appendingPathComponent("game").appendingPathComponent(titleID)
-            .appendingPathComponent("EBOOT.elf")
+        let folder = Self.documents.appendingPathComponent("game").appendingPathComponent(titleID)
+        let elf = folder.appendingPathComponent("EBOOT.elf")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         decrypting = true
         DispatchQueue.global(qos: .userInitiated).async {
             var error = [CChar](repeating: 0, count: 512)
