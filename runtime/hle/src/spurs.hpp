@@ -5,6 +5,7 @@
 // (RPCS3 cellSpurs.h layouts, checked against libsre where noted, D-047) and the host side of each SPURS instance.
 
 #include <map>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -193,6 +194,7 @@ constexpr u32 SYS_SPU_IMAGE_TYPE_USER = 0;
 struct Workload {
     enum class Kind { Taskset, JobChain, Custom } kind = Kind::Custom;
     u32 arg = 0; // the taskset (Taskset) or the policy module's argument
+    std::string name; // the game's name for it, if it gave one ("AudioEngine", "Physics")
 };
 
 class Scheduler; // spurs_scheduler.cpp

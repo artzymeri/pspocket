@@ -150,6 +150,12 @@ public:
     // Workloads the native scheduler does not know (not registered through the HLE API): left out of the selection
     // after the first time a worker picked one, which is logged.
     std::atomic<u32> unsupported{0};
+    // Where the workers' time went since the last report (D-131): each workload's runs, policy polls that found no
+    // work, waits. The first worker reports every 5 s.
+    std::array<std::atomic<u64>, CELL_SPURS_MAX_WORKLOAD> workload_ns{};
+    std::atomic<u64> idle_poll_ns{0}, wait_ns{0};
+    void report_time(u64 now_ns);
+    u64 last_report_ns = 0; // the reporting worker's
 
 private:
     std::vector<std::unique_ptr<Worker>> workers_;

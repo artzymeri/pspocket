@@ -294,7 +294,9 @@ s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, 
     ps_write8(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, 0xFF);
     ps_write8(base, spurs + wkl_off::sysSrvMessage, 0xFF);
 
-    inst.workloads[wid] = Workload{kind, static_cast<u32>(data)};
+    std::string label; // the class name's instance part, as the logs print it
+    if (name_instance) label.assign(reinterpret_cast<const char*>(base + name_instance), strnlen(reinterpret_cast<const char*>(base + name_instance), 31));
+    inst.workloads[wid] = Workload{kind, static_cast<u32>(data), std::move(label)};
     return lv2::CELL_OK;
 }
 

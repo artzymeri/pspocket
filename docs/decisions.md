@@ -2024,6 +2024,16 @@ acquire fence for the same reason: an SPU that GETs a flag and then the data it 
   snapshots are taken: none may hold the flag's value next to an older value of the data. Without the second read it
   fails at both ends on the M4 (the loads do reorder).
 
+## D-131 · 2026-10-05 · D-127's code withdrawn: the EDGE/GFX job chain stopped twice on the iPhone with it
+
+The first two iPhone sessions with D-127 stopped in the EDGE/GFX job chain, which never failed in the five sessions
+before it: a JOB whose descriptor slot held other data (CELL_SPURS_JOB_ERROR_NUM_CACHE, a minute in; D-130 fixes
+one way that can happen), then an EDGE job (spu_cfa0e0bb46e3326e) stopping on its own assertion (stopd at 0x5470, a
+state word of 1) seven minutes in, with D-130. The lifter and lifted.h go back to D-126's (full saves around calls,
+the 128-bit rotates, cflts through double) until a check of the game's own translated functions against the
+interpreter finds what differs; the program-level test that D-127 extended stays. Also: the SPURS schedulers report
+every 5 s how much SPU time each workload took, by the game's names for them (AudioEngine, Physics, EDGE/GFX).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -221,10 +221,13 @@ void Worker::body()
         // The version is read before selecting, so a change made while selecting ends the wait at once.
         const u64 version = ps_res_version(sched.spurs);
         const Selection sel = select(false);
+        if (spu_num == 0) sched.report_time(ns(Clock::now().time_since_epoch()));
         if (sel.wid >= CELL_SPURS_MAX_WORKLOAD) {
             const auto t0 = Clock::now();
             ps_res_wait_change(sched.spurs, version, kIdleWaitNs);
-            ns_wait += ns(Clock::now() - t0);
+            const u64 waited = ns(Clock::now() - t0);
+            ns_wait += waited;
+            sched.wait_ns.fetch_add(waited, std::memory_order_relaxed);
             continue;
         }
         const u64 writes = ctx.mem_writes;
@@ -232,6 +235,7 @@ void Worker::body()
         const bool custom = run_workload(sel);
         const u64 dt = ns(Clock::now() - t0);
         if (custom && ctx.mem_writes == writes) {
+            sched.idle_poll_ns.fetch_add(dt, std::memory_order_relaxed);
             ns_idle_polls += dt;
             idle_polls++;
             // GTA V's policy module polled two million times a second on each of four SPUs (run 074): the PS3's SPUs
@@ -242,9 +246,12 @@ void Worker::body()
                 backoff_ns = backoff_ns ? std::min(backoff_ns * 2, kMaxBackoffNs) : kMinBackoffNs;
                 const auto w0 = Clock::now();
                 std::this_thread::sleep_for(std::chrono::nanoseconds(backoff_ns));
-                ns_wait += ns(Clock::now() - w0);
+                const u64 slept = ns(Clock::now() - w0);
+                ns_wait += slept;
+                sched.wait_ns.fetch_add(slept, std::memory_order_relaxed);
             }
         } else {
+            sched.workload_ns[sel.wid].fetch_add(dt, std::memory_order_relaxed);
             ns_work += dt;
             idle_streak = 0;
             backoff_ns = 0;
@@ -255,6 +262,35 @@ void Worker::body()
         "changed nothing, {:.1f} s waiting", sched.spurs, spu_num, ns_work / 1e9, ns_idle_polls / 1e9, idle_polls,
         ns_wait / 1e9);
     ps_spu_fpenv_leave(fp_env);
+}
+
+// Every 5 s, from the first worker: the SPU time each workload took, by its name, and what was idle (D-131). The
+// iPhone's SPU workers are its biggest load; this says which of the game's systems the time went to.
+void Scheduler::report_time(u64 now_ns)
+{
+    constexpr u64 kPeriodNs = 5'000'000'000ull;
+    if (!last_report_ns) last_report_ns = now_ns;
+    if (now_ns - last_report_ns < kPeriodNs) return;
+    const double secs = static_cast<double>(now_ns - last_report_ns) / 1e9;
+    last_report_ns = now_ns;
+    std::array<std::pair<u64, u32>, CELL_SPURS_MAX_WORKLOAD> taken{};
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) taken[i] = {workload_ns[i].exchange(0, std::memory_order_relaxed), i};
+    std::sort(taken.begin(), taken.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string parts;
+    {
+        std::lock_guard lock(host_mutex);
+        for (const auto& [t, wid] : taken) {
+            if (t < 5'000'000) continue; // under 5 ms
+            const auto it = inst.workloads.find(wid);
+            const std::string name = it != inst.workloads.end() && !it->second.name.empty() ? it->second.name
+                                                                                           : std::format("workload {}", wid);
+            parts += std::format("{}{} {:.2f} s", parts.empty() ? "" : ", ", name, static_cast<double>(t) / 1e9);
+        }
+    }
+    PS_LOG_INFO(kSchedChan, "SPURS {:#x}, SPU time in {:.1f} s on {} SPUs: {}; empty policy polls {:.2f} s; waiting "
+        "for work {:.2f} s", spurs, secs, workers_.size(), parts.empty() ? "nothing" : parts,
+        static_cast<double>(idle_poll_ns.exchange(0, std::memory_order_relaxed)) / 1e9,
+        static_cast<double>(wait_ns.exchange(0, std::memory_order_relaxed)) / 1e9);
 }
 
 // Gives this SPU's contention back (the worker stops).
