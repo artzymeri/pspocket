@@ -1515,6 +1515,52 @@ TEST_CASE("metal e2e: an NV308A pixel written over a rendered target keeps what 
     CHECK(guest_pixel(e, kSurfaceOffset, 60, 5) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});  // the blue clear
 }
 
+TEST_CASE("metal e2e: a swizzled target goes to guest memory in Morton order and comes back from it (D-111)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+    const u32 log2 = 6; // kW = kH = 64
+    const auto at = [&](u32 x, u32 y) { return e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + morton_index(x, y, log2, log2) * 4); };
+    const auto pixel = [&](u32 x, u32 y) {
+        const u8* p = at(x, y);
+        return std::array<u8, 4>{p[0], p[1], p[2], p[3]};
+    };
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    // Swizzled (type 2), 2^6 x 2^6; the pitch register is ignored for it.
+    b.method(m::NV4097_SET_SURFACE_FORMAT,
+        static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (2u << 8) | (log2 << 16) | (log2 << 24));
+    b.method(m::NV4097_SET_SURFACE_PITCH_A, 64);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu); // blue
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(pixel(32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // the red triangle
+    CHECK(pixel(60, 5) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});  // the blue clear
+
+    // The CPU writes one texel; a pass over the target reloads it, Morton order and all.
+    ps_write32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + morton_index(10, 10, log2, log2) * 4, 0xff00ff00u);
+    e.backend->invalidate_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4);
+    auto c = e.at(b.offset());
+    c.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(1u << 16) | 63, (1u << 16) | 63});
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_reloads == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(pixel(10, 10) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // the CPU's green
+    CHECK(pixel(32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // still the triangle
+    CHECK(pixel(60, 5) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
+}
+
 TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")
 {
     REQUIRE_METAL();

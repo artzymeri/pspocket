@@ -7,9 +7,11 @@
 #include "metal_internal.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <vector>
 
 #include "pspocket/core/be.h"
 #include "pspocket/rsx/gcm.hpp"
@@ -380,7 +382,8 @@ bool MetalBackend::Impl::read_back(Surface& s, std::vector<u8>& raw, bool stenci
 
 bool MetalBackend::Impl::readback_supported(const Surface& s)
 {
-    if (s.swizzled) return false;
+    // Swizzled targets (Morton order, D-111): colour ones of power-of-two sizes, as RSX swizzled surfaces are.
+    if (s.swizzled && (s.depth || !std::has_single_bit(s.width) || !std::has_single_bit(s.height))) return false;
     if (s.depth) return s.pixel_format == MTLPixelFormatDepth16Unorm || s.pixel_format == MTLPixelFormatDepth32Float_Stencil8;
     const auto f = static_cast<SurfaceColorFormat>(s.gcm_format);
     switch (f) {
@@ -397,7 +400,7 @@ MetalBackend::Impl::Readback MetalBackend::Impl::encode_readback(Surface& s)
 {
     end_pass(); // a pass with only a load-action clear so far runs first
     Readback r;
-    r.image = {s.address, s.pitch, s.width, s.height, s.gcm_format, s.depth, s.pixel_format};
+    r.image = {s.address, s.pitch, s.width, s.height, s.gcm_format, s.depth, s.swizzled, s.pixel_format};
     u32 bpp = 4;
     MTLBlitOption options = MTLBlitOptionNone;
     switch (s.pixel_format) {
@@ -459,6 +462,17 @@ void MetalBackend::Impl::store_readback(const Readback& r)
             }
         }
     } else {
+        // Colour: a linear image at `out` (guest memory, or for a swizzled target a temporary scattered in Morton
+        // order below, D-111).
+        const u32 gbpp = surface_color_bpp(s.gcm_format);
+        std::vector<u8> linear;
+        u8* out = guest + s.address;
+        u32 out_pitch = s.pitch;
+        if (s.swizzled) {
+            linear.resize(static_cast<usize>(s.width) * gbpp * s.height);
+            out = linear.data();
+            out_pitch = s.width * gbpp;
+        }
         const auto f = static_cast<SurfaceColorFormat>(s.gcm_format);
         const bool argb = f == SurfaceColorFormat::A8R8G8B8 || f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 ||
                           f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8;
@@ -469,14 +483,14 @@ void MetalBackend::Impl::store_readback(const Readback& r)
                                                                                                            : 0;
         if (f == SurfaceColorFormat::B8) {
             // One byte per pixel, as the Metal copy holds it (the shader's blue: surface_output_swizzle).
-            for (u32 y = 0; y < s.height; y++) std::memcpy(guest + s.address + y * s.pitch, &raw[y * s.width], s.width);
+            for (u32 y = 0; y < s.height; y++) std::memcpy(out + y * out_pitch, &raw[y * s.width], s.width);
         } else if (float_bytes) {
             // The Metal copy holds the same components little-endian: swap each one into place, row by row.
             const u32 components = f == SurfaceColorFormat::F_X32 ? 1 : 4;
             const usize row = static_cast<usize>(s.width) * components * float_bytes;
             for (u32 y = 0; y < s.height; y++) {
                 const u8* src = &raw[y * row];
-                u8* dst = guest + s.address + y * s.pitch;
+                u8* dst = out + y * out_pitch;
                 if (float_bytes == 2) {
                     for (usize i = 0; i < row; i += 2) ps_st16(dst + i, static_cast<u16>(src[i] | (src[i + 1] << 8)));
                 } else {
@@ -503,7 +517,7 @@ void MetalBackend::Impl::store_readback(const Readback& r)
                     }
                     if (x_zero) a = 0;
                     if (x_one) a = 0xff;
-                    u8* dst = guest + s.address + y * s.pitch + x * 4;
+                    u8* dst = out + y * out_pitch + x * 4;
                     dst[0] = a;
                     if (argb) {
                         dst[1] = rr, dst[2] = g, dst[3] = b;
@@ -512,6 +526,12 @@ void MetalBackend::Impl::store_readback(const Readback& r)
                     }
                 }
             }
+        }
+        if (s.swizzled) {
+            const u32 lw = static_cast<u32>(std::countr_zero(s.width)), lh = static_cast<u32>(std::countr_zero(s.height));
+            for (u32 y = 0; y < s.height; y++)
+                for (u32 x = 0; x < s.width; x++)
+                    std::memcpy(guest + s.address + morton_index(x, y, lw, lh) * gbpp, out + y * out_pitch + x * gbpp, gbpp);
         }
     }
     own_write();
@@ -542,11 +562,24 @@ void MetalBackend::Impl::check_cpu_writes(Surface& s)
 void MetalBackend::Impl::upload_surface_bytes(Surface& s)
 {
     const u32 w = s.width, h = s.height;
-    if (!mem.is_committed(s.address) || !mem.is_committed(s.address + s.pitch * (h - 1) + w - 1)) {
+    if (!mem.is_committed(s.address) || !mem.is_committed(s.address + s.bytes() - 1)) {
         unsupported(std::format("surface at {:#010x} is not in committed guest memory: not reloaded", s.address));
         return;
     }
     const u8* guest = mem.base() + s.address;
+    u32 guest_pitch = s.pitch;
+    std::vector<u8> linear;
+    if (s.swizzled) {
+        // Morton order to a linear image first (D-111).
+        const u32 gbpp = surface_color_bpp(s.gcm_format);
+        const u32 lw = static_cast<u32>(std::countr_zero(w)), lh = static_cast<u32>(std::countr_zero(h));
+        linear.resize(static_cast<usize>(w) * gbpp * h);
+        for (u32 y = 0; y < h; y++)
+            for (u32 x = 0; x < w; x++)
+                std::memcpy(&linear[(static_cast<usize>(y) * w + x) * gbpp], guest + morton_index(x, y, lw, lh) * gbpp, gbpp);
+        guest = linear.data();
+        guest_pitch = w * gbpp;
+    }
     const bool z24s8 = s.pixel_format == MTLPixelFormatDepth32Float_Stencil8;
     u32 bpp = 4;
     switch (s.pixel_format) {
@@ -562,7 +595,7 @@ void MetalBackend::Impl::upload_surface_bytes(Surface& s)
     if (z24s8) stencil = transient.alloc(w * h, 256);
     const auto f = static_cast<SurfaceColorFormat>(s.gcm_format);
     for (u32 y = 0; y < h; y++) {
-        const u8* src = guest + y * s.pitch;
+        const u8* src = guest + y * guest_pitch;
         u8* dst = texels.data + static_cast<usize>(y) * row;
         if (s.depth) {
             for (u32 x = 0; x < w; x++) {
@@ -589,9 +622,10 @@ void MetalBackend::Impl::upload_surface_bytes(Surface& s)
                 std::memcpy(dst + i, &v, 4);
             }
         } else {
-            // A8B8G8R8 and its X8 forms: a b g r in memory, r g b a in the RGBA8Unorm copy.
-            const bool x_zero = f == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8;
-            const bool x_one = f == SurfaceColorFormat::X8B8G8R8_O8B8G8R8;
+            // A8B8G8R8: a b g r in memory, r g b a in the RGBA8Unorm copy; A8R8G8B8 (swizzled ones come here): a r g b,
+            // b g r a in the BGRA8Unorm copy. Either way the bytes reverse; the X8 forms' X reads as zero or one.
+            const bool x_zero = f == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8 || f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8;
+            const bool x_one = f == SurfaceColorFormat::X8B8G8R8_O8B8G8R8 || f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8;
             for (u32 x = 0; x < w; x++) {
                 const u8* p = src + x * 4;
                 u8* t = dst + x * 4;

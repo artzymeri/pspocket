@@ -1704,6 +1704,18 @@ generic:
 - Tests: every format round-trips through a CPU write and a reload, but the pixel a 1x1 clear covers; an NV308A pixel
   written over a rendered target keeps the triangle and the clear; the NV0039 front end flushes its destination.
 
+## D-111 · 2026-10-05 · Swizzled colour targets write back and reload in Morton order
+
+A swizzled render target (NV4097_SET_SURFACE_FORMAT type 2) keeps its texels in Morton order (`morton_index`, as
+swizzled textures). Its write-back and reload (D-110) refused it. Now a colour target of power-of-two size, as RSX
+swizzled surfaces are, goes through the same conversions as a linear one into a temporary linear image, then is
+scattered to (or gathered from) guest memory in Morton order. A swizzled target's pitch is its row of texels whatever
+the pitch register says (RPCS3 get_framebuffer_layout), so what it covers, and so what overlaps it, is its size.
+Swizzled depth buffers are still refused, and logged.
+- Run: the first mission as before, one failure (MSAA).
+- Test: a red triangle rendered into a 64x64 swizzled target reads back at its Morton addresses; a texel the CPU
+  writes there reloads, and the triangle stays.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

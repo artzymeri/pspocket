@@ -318,6 +318,7 @@ struct MetalBackend::Impl {
     struct SurfaceImage { // what a write-back needs of a surface (the surface itself may be gone by then)
         u32 address = 0, pitch = 0, width = 0, height = 0, gcm_format = 0;
         bool depth = false;
+        bool swizzled = false; // texels in Morton order (D-111)
         MTLPixelFormat pixel_format = MTLPixelFormatInvalid;
     };
     struct Readback {

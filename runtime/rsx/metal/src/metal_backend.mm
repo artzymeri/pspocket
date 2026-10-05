@@ -340,7 +340,8 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
             continue;
         }
         before_access(*ea, swizzled ? bpp * width * height : pitch * height, false); // a deferred copy there lands first
-        Surface* s = get_color_surface(*ea, pitch, width, height, si.color_format, swizzled);
+        // A swizzled target's pitch is its row of texels (RPCS3 get_framebuffer_layout): what it covers is its size.
+        Surface* s = get_color_surface(*ea, swizzled ? bpp * width : pitch, width, height, si.color_format, swizzled);
         if (!s) continue;
         out.rsx_index[out.color_count] = idx[i];
         out.color[out.color_count++] = s;
