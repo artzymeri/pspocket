@@ -2499,6 +2499,24 @@ first (rule 2).
   build compiles nothing; TimeLeft's arithmetic.
 - **Kept:** the built-in path (`PSPOCKET_GAME_PPU/SPU`) stays until the app prepares games itself (stage 4).
 
+## D-153 · 2026-10-05 · How translated code compiles, and how the time left is counted
+
+- **Settings (`codegen::translated_code_settings`), for the Mac and the phone alike:** PPU code without LLVM's SLP
+  vectorizer (`-fno-slp-vectorize`: one GTA V unit took 35 s with it and 3.3 s without, its code 44% smaller; the
+  others 17% faster), and the greedy register allocator with a region-growing budget of 1,000 instead of 10,000
+  (`-grow-region-complexity-budget`: the slowest SPU program compiles 2.3 times faster and its code is 30% smaller).
+  GTA V compiles in 6:47 instead of 8:21 on the M4 (19%) and runs the gate the same: 29.8 fps, the CPU over the walk
+  within the 12% the Mac varies between runs of one library (run 094). Measured, not assumed (rule 8): the gain at run
+  time first seen was that noise.
+- **The time left (`TimeLeft`, `estimate_cost`):** three kinds of file, each with its own rate (PPU code, SPU code, the
+  registration tables, which compile in no time and were predicted as code); costs refitted on two builds with each
+  build's own speed taken out; the prior rate weighs a quarter of the build's predicted cost, at most 1,000
+  cost-seconds, because the first files to finish are the ones that ran fast (trusting them made the estimate 40% low
+  a tenth of the way in). Replayed on both recorded builds, the time left is within 15% at every point, 5-8% on
+  average. `pspocket-prepare --events` records a build's files so the next change to the estimate is tried the same way.
+- Still to try, each against the gate: the SPU analyzer's copies of other functions' code, per-unit prototypes, clang
+  built with PGO and LTO (docs/improve.md).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

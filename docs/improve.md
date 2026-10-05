@@ -124,4 +124,6 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   ours on the same file); LLVM IR from the lifters instead of C (no front end). A scheduler that starts compiles by
   predicted memory and keeps the biggest files on the performance cores; an ETA from predicted cost per file,
   corrected live (the user asked for an accurate one).
-- **State:** open (measured; nothing adopted yet).
+- **State:** -fno-slp-vectorize (PPU) and the allocator budget adopted (D-153: GTA V 8:21 to 6:47 on the M4, the
+  gate the same); the time left within 15% throughout (run 094). Open: the SPU analyzer's copies, per-unit
+  prototypes, PGO/LTO clang, LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.
