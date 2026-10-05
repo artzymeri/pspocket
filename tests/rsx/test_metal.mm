@@ -685,7 +685,7 @@ struct E2E {
     static constexpr u32 kReadbackEa = 0x00400000; // main memory, IO 0x00100000
 
     explicit E2E(u32 capture_every = 0, std::string shader_cache = {}, u32 evict_after_flips = 1800,
-        bool overlay_targets = true)
+        bool overlay_targets = true, double async_wait_ms = -1)
     {
         PS_CHECK(mem.reserve());
         PS_CHECK(mem.commit(kCmdEa, 0x100000));
@@ -721,6 +721,8 @@ struct E2E {
         mc.shader_cache_threads = 2;
         mc.evict_after_flips = evict_after_flips;
         mc.overlay_targets = overlay_targets;
+        mc.async_shaders = async_wait_ms >= 0;
+        if (async_wait_ms >= 0) mc.compile_wait_ms = async_wait_ms;
         mc.capture = [this](const u8* bgra, u32 w, u32 h, u64 flip) {
             std::lock_guard lock(capture_mutex);
             captures.emplace_back(flip, std::vector<u8>(bgra, bgra + usize{w} * h * 4));
@@ -1792,6 +1794,55 @@ TEST_CASE("metal e2e: the shader cache records what draws compile and makes it a
         CHECK(e.backend->stats().pipelines_prewarmed == 1);
     }
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("metal e2e: with background compiles, a draw goes without its programs until they are made (D-158)")
+{
+    // A game the phone has never seen: nothing in the shader cache, and no frame may wait for the Metal compiler.
+    REQUIRE_METAL();
+    const auto draw = [](E2E& e, u32 offset) {
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        auto b = e.at(offset);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 48);
+    };
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, cleared{0, 0, 0, 0};
+    {
+        E2E e(0, {}, 1800, true, 0.0); // no wait at all
+        CHECK(draw(e, 0) == cleared);  // skipped: its vertex program is compiling
+        CHECK(e.backend->stats().draws_compiling == 1);
+        CHECK(e.backend->stats().draws == 0);
+        // Every program and pipeline it needs, one at a time: each later draw finds one more.
+        for (u32 i = 1; i <= 3 && e.backend->stats().draws == 0; i++) {
+            e.backend->wait_for_async_compiles();
+            draw(e, 0x1000 * i);
+        }
+        CHECK(e.backend->stats().draws == 1);
+        CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == red);
+        CHECK(e.backend->stats().async_programs == 2);
+        CHECK(e.backend->stats().async_pipelines == 1);
+        CHECK(e.backend->stats().compile_ns == 0); // nothing compiled on the RSX thread
+        CHECK(e.backend->stats().pipeline_ns == 0);
+    }
+    {
+        E2E e(0, {}, 1800, true, 10000.0); // a budget that covers the compiles: the draw waits and draws
+        CHECK(draw(e, 0) == red);
+        CHECK(e.backend->stats().draws_compiling == 0);
+        CHECK(e.backend->stats().draws == 1);
+        CHECK(e.backend->stats().async_programs == 2);
+        CHECK(e.backend->stats().compile_wait_ns > 0);
+    }
 }
 
 TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")

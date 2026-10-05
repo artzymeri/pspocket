@@ -248,6 +248,70 @@ private:
     std::chrono::steady_clock::time_point last_report_;
 };
 
+// Asynchronous compilation (async_compiler.mm, D-158): a program or pipeline a draw needs and the backend lacks is
+// compiled on background threads. The RSX thread waits for it only within a small budget per frame, then draws on
+// without it (the draw is skipped, as RPCS3's asynchronous shader mode does), and takes what finished between draws
+// (MetalBackend::Impl::take_async). For any game, the first time anything new shows, nothing waits for the Metal compiler
+// longer than the budget.
+class AsyncCompiler {
+public:
+    struct ProgramJob {
+        std::string key;
+        shader::MslShader shader;
+        std::vector<u32> ucode;
+        const char* what = "";
+    };
+    struct PipelineJob {
+        PipelineKey key;
+        __strong MTLRenderPipelineDescriptor* descriptor = nil;
+        std::string vp_key, fp_key;
+        PipelineParams params;
+    };
+    struct ReadyPipeline {
+        PipelineKey key;
+        __strong id<MTLRenderPipelineState> pso = nil;
+        std::string vp_key, fp_key;
+        PipelineParams params;
+        u64 ns = 0;
+    };
+    struct Ready {
+        std::vector<std::pair<CompiledProgram, u64>> programs; // with the time it took
+        std::vector<ReadyPipeline> pipelines;
+        std::vector<std::pair<std::string, std::string>> failed_programs; // key, error (with the source)
+        std::vector<std::pair<PipelineKey, std::string>> failed_pipelines;
+    };
+
+    AsyncCompiler(id<MTLDevice> device, u32 threads);
+    ~AsyncCompiler();
+    AsyncCompiler(const AsyncCompiler&) = delete;
+    AsyncCompiler& operator=(const AsyncCompiler&) = delete;
+
+    bool queued(const std::string& program_key);
+    bool queued(const PipelineKey& key);
+    void queue(ProgramJob job);
+    void queue(PipelineJob job);
+    // Until something more is ready to take, or `deadline`. True when something is.
+    bool wait_until(std::chrono::steady_clock::time_point deadline);
+    void wait_idle(); // until nothing is queued or compiling (tests)
+    bool take(Ready& out);
+
+private:
+    void work();
+
+    __strong id<MTLDevice> device_ = nil;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable work_cv_, ready_cv_;
+    bool stop_ = false;
+    u32 busy_ = 0;
+    std::deque<ProgramJob> programs_;
+    std::deque<PipelineJob> pipelines_;
+    std::unordered_set<std::string> program_keys_; // queued or compiling
+    std::map<PipelineKey, bool> pipeline_keys_;
+    Ready ready_;
+    std::atomic<bool> has_ready_{false};
+};
+
 struct CompiledProgram;
 
 struct FragmentProgramEntry {
@@ -376,7 +440,7 @@ struct MetalBackend::Impl {
     u64 report_readbacks = 0, report_deferred = 0, report_conflicts = 0, report_texture_checks = 0, report_texture_bytes = 0;
     u64 report_faults = 0; // the tracker's write faults at the last report (D-134)
     u64 report_overlays = 0;
-    u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0;
+    u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0, report_draws_compiling = 0;
     u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
     // At most config.frames_in_flight frames queued for the GPU (D-148): a flip waits for the oldest to complete. Each
     // frame queued holds what it allocated until then, and nothing else held the RSX thread back.
@@ -426,6 +490,14 @@ struct MetalBackend::Impl {
     std::map<PipelineKey, id<MTLRenderPipelineState>> pipelines;
     std::unordered_map<std::string, CompiledProgram> programs; // by program hash and translation options
     std::unique_ptr<ShaderCache> shader_cache;                 // D-114; null: none configured
+    std::unique_ptr<AsyncCompiler> async;                      // D-158; null: draws wait for their compiles
+    std::unordered_set<std::string> async_failed_programs;     // compiled in the background and failed: not tried again
+    std::map<PipelineKey, bool> async_failed_pipelines;
+    bool compile_pending = false;     // the last lookup's program or pipeline is compiling in the background
+    s64 compile_wait_left_ns = 0;     // what this frame may still wait for background compiles
+    void take_async();
+    // Waits (within the frame's budget) for `done` to hold, taking what finishes meanwhile.
+    bool wait_async(const std::function<bool()>& done);
     u64 texture_bytes() const; // what the cached textures take in guest memory (their decoded copies, about as much)
     u64 surface_bytes() const; // what the surfaces' GPU copies take
     // Textures unused for a minute of flips are freed (decoded again if used again), and surfaces unused as long whose

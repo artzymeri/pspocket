@@ -213,6 +213,10 @@ bool MetalBackend::Impl::init()
         shader_cache = std::make_unique<ShaderCache>(device, config.shader_cache, config.shader_seeds,
             config.shader_cache_threads, config.shader_archives);
     }
+    if (config.async_shaders) {
+        async = std::make_unique<AsyncCompiler>(device, config.async_threads);
+        compile_wait_left_ns = static_cast<s64>(config.compile_wait_ms * 1e6);
+    }
     PS_LOG_INFO(kChan, "Metal backend on {} (BC textures: {}), output {}x{}", device.name.UTF8String,
         bc_supported ? "yes" : "no", config.output_width, config.output_height);
     return true;
@@ -781,9 +785,13 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     skip_reason = "no render target";
     if (!select_targets(state, targets, ~0u)) return skip("");
     const bool points = d.primitive == Primitive::Points;
+    compile_pending = false;
     const CompiledProgram* vp = vertex_program_for(state, points);
-    skip_reason = "vertex program";
-    if (!vp) return skip("");
+    skip_reason = compile_pending ? "vertex program compiling" : "vertex program";
+    if (!vp) {
+        if (compile_pending) stats.draws_compiling++;
+        return skip("");
+    }
     shader::FpOptions fo;
     fo.shader_control = state.shader_program().control;
     fo.mrt_count = targets.color_count;
@@ -812,8 +820,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const shader::FragmentProgram* fprog = nullptr;
     u32 fp_ea = 0;
     const CompiledProgram* fp = fragment_program_for(state, fo, &fprog, fp_ea);
-    skip_reason = "fragment program";
-    if (!fp) return skip("");
+    skip_reason = compile_pending ? "fragment program compiling" : "fragment program";
+    if (!fp) {
+        if (compile_pending) stats.draws_compiling++;
+        return skip("");
+    }
 
     // ---- scissor: RSX scissor and viewport rectangles within the surface (RPCS3 get_scissor, clip_viewport) ----
     u32 surf_w = ~0u, surf_h = ~0u;
@@ -1122,8 +1133,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // ---- encode ----
     open_pass(targets);
     id<MTLRenderPipelineState> pso = pipeline_for(*vp, *fp, state);
-    skip_reason = "pipeline state";
-    if (!pso) return skip("");
+    skip_reason = compile_pending ? "pipeline state compiling" : "pipeline state";
+    if (!pso) {
+        if (compile_pending) stats.draws_compiling++;
+        return skip("");
+    }
     id<MTLRenderCommandEncoder> enc = start_encoder();
     // Occlusion counting (D-102): this pass's counter for the current query.
     if (zpass_on) {
@@ -1222,6 +1236,7 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     tick++;
     end_pass_for(kEndFlip);
     stats.flips++;
+    compile_wait_left_ns = static_cast<s64>(config.compile_wait_ms * 1e6); // each frame's budget (D-158)
     if (stats.flips % std::clamp<u64>(config.evict_after_flips / 2, 1, 150) == 0) evict_unused(config.evict_after_flips); // D-116
     if (trim_requested.exchange(false, std::memory_order_acq_rel)) trim();
     if (tracing && request.flip_index >= config.trace_frame) {
@@ -1440,7 +1455,9 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.gpu_wait_ms = per_frame(m.stats.gpu_wait_ns, m.report_gpu_wait_ns) / 1e6;
         w.programs_made = m.stats.programs_compiled - m.report_programs;
         w.pipelines_made = m.stats.pipelines_created - m.report_pipelines;
-        w.compile_ms = static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns - m.report_compile_ns) / 1e6;
+        w.compile_ms =
+            static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns + m.stats.compile_wait_ns - m.report_compile_ns) / 1e6;
+        w.draws_compiling = per_frame(m.stats.draws_compiling, m.report_draws_compiling);
         w.textures = m.textures.size();
         w.texture_mb = static_cast<double>(m.texture_bytes()) / 1048576.0;
         w.surfaces = m.surfaces.size();
@@ -1451,18 +1468,19 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
                            "{:.2f} targets laid over memory on the GPU; "
                            "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {} programs and {} pipelines "
-                           "made ({:.1f} ms); "
+                           "made ({:.1f} ms, {:.2f} draws waiting for one); "
                            "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB); "
                            "{:.2f} feedback copies, {:.2f} corner textures, {:.2f} surface reloads; {:.2f} ms waiting for "
                            "the GPU; GPU memory {:.0f} MB, {} deferred",
             w.flips, w.gpu_ms, w.draws, w.render_passes, ends, w.readbacks, w.deferred_readbacks, w.deferred_conflicts,
             w.readback_wait_ms, w.texture_overlays, w.texture_checks, w.texture_mb_hashed, w.write_faults,
-            w.programs_made, w.pipelines_made, w.compile_ms, w.textures, w.texture_mb, w.surfaces, w.surface_mb,
+            w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.textures, w.texture_mb, w.surfaces, w.surface_mb,
             w.feedback_copies, w.corner_textures, w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb, w.deferred_queue);
         if (m.config.on_window) m.config.on_window(w);
         m.report_programs = m.stats.programs_compiled;
         m.report_pipelines = m.stats.pipelines_created;
-        m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns;
+        m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns + m.stats.compile_wait_ns;
+        m.report_draws_compiling = m.stats.draws_compiling;
         m.report_texture_checks = m.stats.texture_checks;
         m.report_texture_bytes = m.stats.texture_check_bytes;
         m.report_faults = m.tracker.faults_handled();
@@ -1579,6 +1597,11 @@ bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u
         m.deferred.push_back(std::move(later));
     }
     return true;
+}
+
+void MetalBackend::wait_for_async_compiles()
+{
+    if (impl_->async) impl_->async->wait_idle();
 }
 
 void MetalBackend::wait_for_shader_cache()

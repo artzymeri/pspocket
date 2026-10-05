@@ -68,8 +68,9 @@ struct WindowStats {
     double texture_overlays = 0, texture_checks = 0, texture_mb_hashed = 0, write_faults = 0;
     double feedback_copies = 0, corner_textures = 0, surface_reloads = 0;
     double gpu_wait_ms = 0;        // the RSX thread's wait for the GPU at flips (frames in flight capped)
-    u64 programs_made = 0, pipelines_made = 0; // in the window, by the RSX thread
-    double compile_ms = 0;                      // in the window
+    u64 programs_made = 0, pipelines_made = 0; // in the window, by the RSX thread or for it in the background
+    double compile_ms = 0;                      // in the window: the RSX thread's compiling, or waiting for compiles
+    double draws_compiling = 0;                 // draws skipped while their compile ran in the background (D-158)
     u64 textures = 0, surfaces = 0;             // cached at its end
     double texture_mb = 0, surface_mb = 0;
     double gpu_allocated_mb = 0;                // MTLDevice.currentAllocatedSize at its end
@@ -102,6 +103,12 @@ struct MetalBackendConfig {
     // The GPU binaries the cache compiles kept in Metal binary archives in shader_cache, for the next run (D-143): the
     // iPhone app's; macOS keeps them in its own cache, and the Mac's directory is the app's seed.
     bool shader_archives = false;
+    // Programs and pipelines a draw needs and nothing has made are compiled on background threads (D-158): the RSX
+    // thread waits for them at most compile_wait_ms per frame, then skips the draws still waiting (RPCS3's
+    // asynchronous shader mode). Off: each draw waits for its compile, as before (the Mac's comparisons).
+    bool async_shaders = false;
+    double compile_wait_ms = 4.0;
+    u32 async_threads = 0; // 0: half the cores, 2 to 4
     // Textures and surfaces unused for this many flips are freed (D-116; a minute at 30 fps).
     u32 evict_after_flips = 1800;
     // A texture of another format over a render target the GPU drew since guest memory last held it is decoded with
@@ -118,6 +125,11 @@ struct MetalBackendConfig {
 struct BackendStats {
     u64 draws = 0;
     u64 draws_skipped = 0;
+    u64 draws_compiling = 0;  // of those, skipped while their program or pipeline compiled in the background (D-158)
+    u64 compile_wait_ns = 0;  // the RSX thread's waits for background compiles, within the frame's budget
+    u64 async_programs = 0;   // programs compiled in the background
+    u64 async_pipelines = 0;  // ... and pipelines
+    u64 async_compile_ns = 0; // the time those took on the background threads
     u64 clears = 0;
     u64 render_passes = 0;
     u64 load_action_clears = 0;
@@ -196,6 +208,7 @@ public:
     void trim_memory();
     // Waits until the shader cache has made everything it holds (tests), then hands it to the backend.
     void wait_for_shader_cache();
+    void wait_for_async_compiles(); // until the background compiles are done (tests; D-158)
 
     // Debug and test helpers ------------------------------------------------------------------------------------
     // Decodes texture `t` (its bytes at guest address `ea`) through the texture path and reads back (face, level)

@@ -158,6 +158,7 @@ std::optional<CompiledProgram> MetalBackend::Impl::compile(const shader::Transla
 const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& state, bool points)
 {
     take_shader_cache(); // programs and pipelines the shader cache made since (D-114)
+    take_async();        // ... and the background compiles (D-158)
     if ((state.dirty_bits & dirty::kVertexProgram) || !vertex_program) {
         state.dirty_bits &= ~dirty::kVertexProgram;
         std::string why;
@@ -183,6 +184,27 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
 
     shader::VpOptions options;
     options.point_size = points;
+    if (async) {
+        // Compiled in the background; this draw waits for it within the frame's budget, or goes without (D-158).
+        if (async_failed_programs.contains(key)) return nullptr;
+        if (!async->queued(key)) {
+            const shader::TranslateResult tr = shader::translate_vertex_program(vp, options);
+            if (!tr.ok) {
+                unsupported(tr.error);
+                return nullptr;
+            }
+            async->queue({key, tr.shader, ucode, "vertex program"});
+        }
+        const auto ready = [&] {
+            const auto it = programs.find(key);
+            return it != programs.end() && it->second.ucode == ucode;
+        };
+        if (!wait_async(ready)) {
+            compile_pending = true;
+            return nullptr;
+        }
+        return vertex_compiled[points ? 1 : 0] = &programs.find(key)->second;
+    }
     const shader::TranslateResult tr = shader::translate_vertex_program(vp, options);
     if (!tr.ok) {
         unsupported(tr.error);
@@ -221,6 +243,7 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     }
 
     take_shader_cache(); // D-114
+    take_async();        // D-158
     FragmentProgramEntry& entry = fragment_programs[*ea];
     // A deferred copy to the program (or its constants, read every draw) lands first (D-107). A program not seen yet:
     // its first instruction (a copy that writes a program writes its start).
@@ -272,6 +295,26 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     };
     if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) return remember(&it->second);
 
+    if (async) { // D-158, as for vertex programs
+        if (async_failed_programs.contains(key)) return nullptr;
+        if (!async->queued(key)) {
+            const shader::TranslateResult tr = shader::translate_fragment_program(fp, options);
+            if (!tr.ok) {
+                unsupported(tr.error);
+                return nullptr;
+            }
+            async->queue({key, tr.shader, ucode, "fragment program"});
+        }
+        const auto ready = [&] {
+            const auto it = programs.find(key);
+            return it != programs.end() && it->second.ucode == ucode;
+        };
+        if (!wait_async(ready)) {
+            compile_pending = true;
+            return nullptr;
+        }
+        return remember(&programs.find(key)->second);
+    }
     const shader::TranslateResult tr = shader::translate_fragment_program(fp, options);
     if (!tr.ok) {
         unsupported(tr.error);
@@ -361,8 +404,18 @@ id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgra
         if (pass.depth->pixel_format == MTLPixelFormatDepth32Float_Stencil8) p.stencil_format = p.depth_format;
     }
     take_shader_cache(); // pipelines the shader cache made since (D-114)
+    take_async();        // ... and the background compiles (D-158)
     const PipelineKey key = pipeline_key(p, vp.function, fp.function);
     if (auto it = pipelines.find(key); it != pipelines.end()) return it->second;
+    const auto made = [&] { return pipelines.contains(key); };
+    if (async && async->queued(key)) {
+        if (!wait_async(made)) {
+            compile_pending = true;
+            return nil;
+        }
+        return pipelines.at(key);
+    }
+    if (async && async_failed_pipelines.contains(key)) return nil;
 
     bool blends = false;
     for (u32 i = 0; i < p.color_count; i++) blends |= p.blend_on[i] != 0;
@@ -376,6 +429,14 @@ id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgra
     // The GPU binaries earlier runs kept (D-143): a pipeline the cache has not made yet may be there.
     if (shader_cache) {
         if (NSArray<id<MTLBinaryArchive>>* archives = shader_cache->archives(); archives.count) d.binaryArchives = archives;
+    }
+    if (async) {
+        async->queue({key, d, vp.key, fp.key, p});
+        if (!wait_async(made)) {
+            compile_pending = true;
+            return nil;
+        }
+        return pipelines.at(key);
     }
     NSError* error = nil;
     const auto t0 = std::chrono::steady_clock::now();

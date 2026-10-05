@@ -305,6 +305,10 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         // The compiled GPU code kept for the next launch (D-143): off. With 3, 6 and then 9 archives loaded iOS sent
         // memory warnings as they loaded, more each time, and stopped the app twice with 9 (D-145).
         mc.shader_archives = false;
+        // Anything new compiles in the background; a frame waits for it 4 ms at most, then draws without it (D-158):
+        // a game the phone has never seen plays from the start without stalls.
+        mc.async_shaders = true;
+        mc.compile_wait_ms = 4.0;
         mc.present = [raw](const rsx::metal::PresentFrame& f) {
             const u64 flips = raw->flips.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto now = std::chrono::steady_clock::now();

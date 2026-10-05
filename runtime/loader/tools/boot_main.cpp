@@ -128,7 +128,7 @@ int usage()
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
-        "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]...\n"
+        "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--async-shaders MS]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -607,11 +607,13 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
                          "\"pass_ends\": {{{}}}, \"readbacks\": {:.2f}, \"readback_wait_ms\": {:.2f}, "
                          "\"texture_checks\": {:.0f}, \"write_faults\": {:.1f}, \"feedback_copies\": {:.2f}, "
                          "\"corner_textures\": {:.2f}, \"surface_reloads\": {:.2f}, \"gpu_wait_ms\": {:.2f}, "
-                         "\"programs_made\": {}, \"pipelines_made\": {}, \"compile_ms\": {:.1f}, \"textures\": {}, "
+                         "\"programs_made\": {}, \"pipelines_made\": {}, \"compile_ms\": {:.1f}, "
+                         "\"draws_compiling\": {:.2f}, \"textures\": {}, "
                          "\"surfaces\": {}, \"gpu_allocated_mb\": {:.0f}, \"deferred_queue\": {}}}",
             i ? "," : "", w.last_flip, w.gpu_ms, w.draws, w.render_passes, ends, w.readbacks, w.readback_wait_ms,
             w.texture_checks, w.write_faults, w.feedback_copies, w.corner_textures, w.surface_reloads, w.gpu_wait_ms,
-            w.programs_made, w.pipelines_made, w.compile_ms, w.textures, w.surfaces, w.gpu_allocated_mb, w.deferred_queue);
+            w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.textures, w.surfaces, w.gpu_allocated_mb,
+            w.deferred_queue);
     }
 #endif
     j += "\n  ],\n  \"messages\": {";
@@ -650,6 +652,7 @@ int main(int argc, char** argv)
     bool list_imports = false;
     std::string gpu = "null", frames_dir;
     std::string shader_cache; // --shader-cache (D-114)
+    double compile_wait_ms = -1; // --async-shaders MS (D-158); -1: each draw waits for its compile
     u32 frame_every = 60;
     u64 frame_from = 0;
     u64 trace_frame = 0;
@@ -707,6 +710,11 @@ int main(int argc, char** argv)
             frame_from = static_cast<u64>(std::atoll(v));
         } else if (a == "--rsx-recover") {
             rsx_recover = true;
+        } else if (a == "--async-shaders") {
+            // Background compiles; a frame waits MS for them at most (the app's way, D-158).
+            const char* v = value();
+            if (!v || std::atof(v) < 0) return usage();
+            compile_wait_ms = std::atof(v);
         } else if (a == "--shader-cache") {
             const char* v = value();
             if (!v) return usage();
@@ -820,6 +828,8 @@ int main(int argc, char** argv)
         cfg.rsx_backend = [&]() -> std::unique_ptr<rsx::Backend> {
             rsx::metal::MetalBackendConfig mc;
             mc.shader_cache = shader_cache;
+            mc.async_shaders = compile_wait_ms >= 0; // D-158
+            if (compile_wait_ms >= 0) mc.compile_wait_ms = compile_wait_ms;
             if (!summary_path.empty()) {
                 mc.on_window = [](const rsx::metal::WindowStats& w) {
                     std::lock_guard lock(g_summary.mutex);

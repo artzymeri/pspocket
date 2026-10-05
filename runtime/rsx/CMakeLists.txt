@@ -27,6 +27,7 @@ if(APPLE)
         metal/src/pipeline_cache.mm
         metal/src/surface_cache.mm
         metal/src/shader_cache.mm
+        metal/src/async_compiler.mm
         metal/src/texture_cache.mm)
     target_include_directories(pspocket_rsx_metal PUBLIC metal/include)
     target_link_libraries(pspocket_rsx_metal PUBLIC pspocket::rsx "-framework Metal" "-framework Foundation")
