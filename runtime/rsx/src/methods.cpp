@@ -515,6 +515,7 @@ void Rsx::m_nv0039_buffer_notify(u32 reg, u32)
     }
     if (backend_.flush_memory_later(s_ea, read_length, d_ea, write_length, copy)) return;
     backend_.flush_memory(s_ea, read_length, "an NV0039 buffer copy");
+    backend_.flush_memory(d_ea, write_length, "an NV0039 copy over a render target"); // merged with it (D-110)
     copy();
 }
 
@@ -544,6 +545,7 @@ void Rsx::m_nv308a_color(u32 reg, u32 value)
             return;
         }
         backend_.before_access(*ea, 4, true);
+        backend_.flush_memory(*ea, 4, "an NV308A write over a render target"); // merged with what it renders (D-110)
         write32(*ea, value); // the argument is the pixel in PS3 (big-endian) order
         backend_.invalidate_memory(*ea, 4);
         break;
@@ -560,6 +562,7 @@ void Rsx::m_nv308a_color(u32 reg, u32 value)
         const u32 b = (value & 0xff) * 32 / 255;
         // Stored big-endian, like every 16-bit surface and texture format.
         backend_.before_access(*ea, 2, true);
+        backend_.flush_memory(*ea, 2, "an NV308A write over a render target");
         ps_write16(base(), *ea, static_cast<u16>((std::min(r, 31u) << 11) | (std::min(g, 63u) << 5) | std::min(b, 31u)));
         backend_.invalidate_memory(*ea, 2);
         break;
@@ -645,6 +648,7 @@ void Rsx::m_nv3089_image_in(u32 reg, u32 value)
 
     backend_.flush_memory(*src, read_length, "an NV3089 image copy");
     backend_.before_access(*dst, write_length, true);
+    backend_.flush_memory(*dst, write_length, "an NV3089 copy over a render target"); // merged with it (D-110)
     u8* const mem = base();
     std::vector<u8> tmp(static_cast<size_t>(cols) * in_bpp * rows);
     for (u32 y = 0; y < rows; y++) std::memcpy(tmp.data() + static_cast<size_t>(y) * cols * in_bpp, mem + *src + y * in_pitch, cols * in_bpp);

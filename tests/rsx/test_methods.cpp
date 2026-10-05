@@ -26,10 +26,13 @@ TEST_CASE("NV0039 copies a 2D block from main to local memory")
     for (u32 y = 0; y < 4; y++) {
         for (u32 x = 0; x < 8; x++) CHECK(ps_read8(f.base(), PS_MEM_RSX_LOCAL_BASE + 0x5000 + y * 8 + x) == y * 16 + x);
     }
-    // The source was flushed (a surface could live there) and the destination invalidated.
-    REQUIRE(f.backend.of(Kind::Flush).size() == 1);
+    // The source was flushed (a surface could live there), then the destination (a target there is written back
+    // before the copy lands over it, D-110), and the destination invalidated.
+    REQUIRE(f.backend.of(Kind::Flush).size() == 2);
     CHECK(f.backend.of(Kind::Flush)[0]->a == Fixture::kMainDataEa + 0x100);
     CHECK(f.backend.of(Kind::Flush)[0]->b == 16 * 3 + 8);
+    CHECK(f.backend.of(Kind::Flush)[1]->a == PS_MEM_RSX_LOCAL_BASE + 0x5000);
+    CHECK(f.backend.of(Kind::Flush)[1]->b == 32);
     REQUIRE(f.backend.of(Kind::Invalidate).size() == 1);
     CHECK(f.backend.of(Kind::Invalidate)[0]->a == PS_MEM_RSX_LOCAL_BASE + 0x5000);
     CHECK(f.backend.of(Kind::Invalidate)[0]->b == 32);

@@ -359,9 +359,18 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
     return out.color_count > 0 || out.depth != nullptr;
 }
 
+bool MetalBackend::Impl::newer_in_guest(const PassTargets& t) const
+{
+    bool newer = t.depth && t.depth->cpu_newer;
+    for (u32 i = 0; i < t.color_count; i++) newer |= t.color[i]->cpu_newer;
+    return newer;
+}
+
 void MetalBackend::Impl::open_pass(const PassTargets& t)
 {
-    if (pass_open && pass == t) return;
+    // The same targets: the pass goes on, unless guest memory under one of them is newer (the CPU or the RSX wrote it
+    // since): then it ends, and the new one reloads it (D-110).
+    if (pass_open && pass == t && !newer_in_guest(t)) return;
     end_pass_for(kEndTargets);
     pass = t;
     pass_open = true;
@@ -383,6 +392,7 @@ void MetalBackend::Impl::open_pass(const PassTargets& t)
         pass_height = std::min(pass_height, s->height);
     }
     if (Surface* d = t.depth) {
+        if (d->cpu_newer) upload_surface_from_guest(*d); // D-110
         pass_desc.depthAttachment.texture = d->texture;
         pass_desc.depthAttachment.loadAction = d->initialized ? MTLLoadActionLoad : MTLLoadActionClear;
         pass_desc.depthAttachment.clearDepth = 1.0;
@@ -539,7 +549,7 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
             subset &= i < pass.color_count && pass.color[i] == t.color[i];
         }
         if (t.depth && t.depth != pass.depth) subset = false;
-        if (!subset) open_pass(t);
+        if (!subset || newer_in_guest(t)) open_pass(t);
     } else {
         open_pass(t);
     }
@@ -1413,10 +1423,14 @@ bool MetalBackend::flush_memory_later(u32 addr, u32 size, u32 write_addr, u32 wr
     if (!m.device) return false;
     @autoreleasepool {
         m.end_pass_over(addr, size);
-        const u64 end = u64{addr} + size;
+        m.end_pass_over(write_addr, write_size);
+        const u64 end = u64{addr} + size, write_end = u64{write_addr} + write_size;
         std::vector<Surface*> newer;
         for (auto& s : m.surfaces) {
-            if (s->gpu_newer && !s->cpu_newer && u64{s->address} < end && addr < u64{s->address} + s->bytes())
+            if (!s->gpu_newer || s->cpu_newer) continue;
+            const u64 s_end = u64{s->address} + s->bytes();
+            // The source's targets, and the destination's: the copy lands over what they hold then (D-110).
+            if ((u64{s->address} < end && addr < s_end) || (u64{s->address} < write_end && write_addr < s_end))
                 newer.push_back(s.get());
         }
         // Nothing on the GPU: the copy runs now, unless a queued action touches what it reads or writes (then it queues

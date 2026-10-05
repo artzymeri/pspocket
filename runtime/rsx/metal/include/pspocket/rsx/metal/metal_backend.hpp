@@ -88,6 +88,7 @@ struct BackendStats {
     u64 deferred_conflicts = 0; // RSX accesses that waited for a deferred copy that touches the same memory
     u64 gpu_copies = 0;         // NV0039 copies of render targets done on the GPU (D-107)
     u64 texture_checks = 0;     // cached textures checked against guest memory (a content hash, D-104)
+    u64 surface_reloads = 0;    // surfaces loaded again from guest memory the CPU or the RSX wrote
     u64 texture_check_bytes = 0; // the bytes those checks hashed
     u64 depth_conversions = 0; // depth buffers converted on the GPU for a texture that reads them (D-088)
     u64 color_conversions = 0; // colour targets converted on the GPU for a texture of another format (D-098)

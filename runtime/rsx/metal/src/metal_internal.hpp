@@ -349,6 +349,8 @@ struct MetalBackend::Impl {
     void end_pass_over(u32 addr, u32 size); // a target there with only a clear so far: its pass ends (it is newer then)
     void check_cpu_writes(Surface& s);      // a watched copy destination the CPU wrote since: guest memory is newer
     void upload_surface_from_guest(Surface& s);
+    void upload_surface_bytes(Surface& s); // the formats store_readback writes, but A8R8G8B8 (D-110)
+    bool newer_in_guest(const PassTargets& t) const; // a target whose guest memory is newer: reloaded by open_pass
     void remove_surface(Surface* s);
     id<MTLTexture> copy_texture(id<MTLTexture> src);
     // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the

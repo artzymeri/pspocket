@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <format>
+#include <functional>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -1404,6 +1406,113 @@ TEST_CASE("metal e2e: a fragment program rewritten between two draws of one batc
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the texture's blue
+}
+
+namespace {
+
+// A target whose memory the CPU rewrote reloads from it when a pass opens over it (D-110): a 1x1 clear at (0, 0)
+// opens one, then the target goes back to guest memory. The bytes must come back as the CPU wrote them, but for the
+// cleared pixel. `pattern` gives byte i of the surface's memory (pitch kW * bpp); `expect` what reading it back gives.
+void reload_round_trip(u32 surface_format, u32 bpp, bool depth, u32 clear_mask, const std::function<u8(u32)>& pattern,
+    const std::function<u8(u32, u8)>& expect)
+{
+    E2E e;
+    const u32 pitch = kW * bpp;
+    const u32 target = depth ? kSurfaceB : kSurfaceOffset;
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_SURFACE_FORMAT, surface_format);
+    b.method(m::NV4097_SET_SURFACE_PITCH_A, depth ? kW * 4 : pitch);
+    if (depth) {
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kSurfaceB);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, pitch);
+    }
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff336699u);
+    b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xffffff00u);
+    b.method(m::NV4097_CLEAR_SURFACE, clear_mask); // the whole target: it exists on the GPU now
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+
+    u8* const guest = e.mem.host(PS_MEM_RSX_LOCAL_BASE + target);
+    for (u32 i = 0; i < pitch * kH; i++) guest[i] = pattern(i);
+    e.backend->invalidate_memory(PS_MEM_RSX_LOCAL_BASE + target, pitch * kH);
+    auto c = e.at(b.offset());
+    c.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(1u << 16) | 0, (1u << 16) | 0});
+    c.method(m::NV4097_CLEAR_SURFACE, clear_mask);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_reloads == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + target, pitch * kH));
+    u32 wrong = 0, first = ~0u;
+    for (u32 i = bpp; i < pitch * kH; i++) { // all but pixel (0, 0)
+        if (guest[i] != expect(i, pattern(i)) && wrong++ == 0) first = i;
+    }
+    INFO(std::format("first wrong byte {} of {}", first, pitch * kH));
+    CHECK(wrong == 0);
+}
+
+} // namespace
+
+TEST_CASE("metal e2e: a target the CPU wrote reloads from guest memory in every format that reads back (D-110)")
+{
+    REQUIRE_METAL();
+    const auto same = [](u32, u8 v) { return v; };
+    const auto bytes = [](u32 i) { return static_cast<u8>(i * 7 + 1); };
+    const auto halves = [](u32 i) { return static_cast<u8>(i % 2 == 0 ? 0x3c : i * 3); };            // 1.0 to 2.0
+    const auto floats = [](u32 i) { return static_cast<u8>(i % 4 == 0 ? 0x3f : i % 4 == 1 ? 0x80 : i); }; // 1.0 to 2.0
+    const u32 color = (2u << 5) | (1u << 8);
+    SECTION("A8B8G8R8") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::A8B8G8R8) | color, 4, false, clear::kColor, bytes, same); }
+    SECTION("X8B8G8R8_O8B8G8R8: X reads back as one")
+    {
+        reload_round_trip(static_cast<u32>(SurfaceColorFormat::X8B8G8R8_O8B8G8R8) | color, 4, false, clear::kColor, bytes,
+            [](u32 i, u8 v) { return i % 4 == 0 ? u8{0xff} : v; });
+    }
+    SECTION("F_W16Z16Y16X16") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::F_W16Z16Y16X16) | color, 8, false, clear::kColor, halves, same); }
+    SECTION("F_W32Z32Y32X32") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::F_W32Z32Y32X32) | color, 16, false, clear::kColor, floats, same); }
+    SECTION("F_X32") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::F_X32) | color, 4, false, clear::kColor, floats, same); }
+    SECTION("B8") { reload_round_trip(static_cast<u32>(SurfaceColorFormat::B8) | color, 1, false, clear::kColor, bytes, same); }
+    SECTION("Z24S8")
+    {
+        reload_round_trip(static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (1u << 8), 4, true,
+            clear::kDepthStencil, bytes, same);
+    }
+    SECTION("Z16")
+    {
+        reload_round_trip(static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (1u << 5) | (1u << 8), 2, true, clear::kDepth,
+            bytes, same);
+    }
+}
+
+TEST_CASE("metal e2e: an NV308A pixel written over a rendered target keeps what was rendered (D-110)")
+{
+    // The target goes to guest memory first, so the reload after the write has both.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu); // blue
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    b.method(m::NV3062_SET_CONTEXT_DMA_IMAGE_DESTIN, loc::kDmaFrameBuffer);
+    b.method(m::NV3062_SET_COLOR_FORMAT, {10, ((kW * 4) << 16) | (kW * 4), 0, kSurfaceOffset});
+    b.method(m::NV308A_POINT, {0, 1, 1});
+    b.method(m::NV308A_COLOR, 0xff00ff00u); // green at (0, 0)
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(1u << 16) | 63, (1u << 16) | 63});
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // (63, 63): a pass over the target again
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().surface_reloads == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 0, 0) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});   // the NV308A pixel
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // the red triangle
+    CHECK(guest_pixel(e, kSurfaceOffset, 60, 5) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});  // the blue clear
 }
 
 TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")

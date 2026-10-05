@@ -282,12 +282,17 @@ void MetalBackend::Impl::upload_surface_from_guest(Surface& s)
 {
     // The CPU (or the RSX's own copies) wrote the surface's memory after the GPU copy was made: reload it.
     s.cpu_newer = false;
+    stats.surface_reloads++;
     const auto f = static_cast<SurfaceColorFormat>(s.gcm_format);
-    const bool argb = f == SurfaceColorFormat::A8R8G8B8 || f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 ||
-        f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8;
-    if (s.depth || s.swizzled || !argb) {
-        unsupported(std::format("reloading a surface of format {}{} from guest memory is not implemented", s.gcm_format,
-            s.depth ? " (depth)" : s.swizzled ? " (swizzled)" : ""));
+    const bool argb = !s.depth && (f == SurfaceColorFormat::A8R8G8B8 || f == SurfaceColorFormat::X8R8G8B8_Z8R8G8B8 ||
+                                      f == SurfaceColorFormat::X8R8G8B8_O8R8G8B8);
+    if (!argb || s.swizzled) {
+        if (!readback_supported(s)) {
+            unsupported(std::format("reloading a surface of format {}{} from guest memory is not implemented",
+                s.gcm_format, s.depth ? " (depth)" : s.swizzled ? " (swizzled)" : ""));
+            return;
+        }
+        upload_surface_bytes(s);
         return;
     }
     TextureInfo t;
@@ -530,6 +535,94 @@ void MetalBackend::Impl::check_cpu_writes(Surface& s)
         tracker.unwatch(s.watch);
         s.cpu_newer = true;
     }
+}
+
+// Guest memory to the surface's texels, the inverse of store_readback (D-110): its bytes in the Metal format, through a
+// staging buffer and a blit (a Z24S8 buffer's depth and stencil apart).
+void MetalBackend::Impl::upload_surface_bytes(Surface& s)
+{
+    const u32 w = s.width, h = s.height;
+    if (!mem.is_committed(s.address) || !mem.is_committed(s.address + s.pitch * (h - 1) + w - 1)) {
+        unsupported(std::format("surface at {:#010x} is not in committed guest memory: not reloaded", s.address));
+        return;
+    }
+    const u8* guest = mem.base() + s.address;
+    const bool z24s8 = s.pixel_format == MTLPixelFormatDepth32Float_Stencil8;
+    u32 bpp = 4;
+    switch (s.pixel_format) {
+    case MTLPixelFormatR8Unorm: bpp = 1; break;
+    case MTLPixelFormatDepth16Unorm: bpp = 2; break;
+    case MTLPixelFormatRGBA16Float: bpp = 8; break;
+    case MTLPixelFormatRGBA32Float: bpp = 16; break;
+    default: break;
+    }
+    const u32 row = w * bpp;
+    TransientAllocator::Allocation texels = transient.alloc(row * h, 256);
+    TransientAllocator::Allocation stencil{};
+    if (z24s8) stencil = transient.alloc(w * h, 256);
+    const auto f = static_cast<SurfaceColorFormat>(s.gcm_format);
+    for (u32 y = 0; y < h; y++) {
+        const u8* src = guest + y * s.pitch;
+        u8* dst = texels.data + static_cast<usize>(y) * row;
+        if (s.depth) {
+            for (u32 x = 0; x < w; x++) {
+                if (!z24s8) {
+                    const u16 v = ps_ld16(src + x * 2);
+                    std::memcpy(dst + x * 2, &v, 2);
+                } else {
+                    const u32 v = ps_ld32(src + x * 4);
+                    const float z = static_cast<float>(v >> 8) / 16777215.f;
+                    std::memcpy(dst + x * 4, &z, 4);
+                    stencil.data[static_cast<usize>(y) * w + x] = static_cast<u8>(v);
+                }
+            }
+        } else if (f == SurfaceColorFormat::B8) {
+            std::memcpy(dst, src, w);
+        } else if (f == SurfaceColorFormat::F_W16Z16Y16X16) {
+            for (u32 i = 0; i < row; i += 2) {
+                const u16 v = ps_ld16(src + i);
+                std::memcpy(dst + i, &v, 2);
+            }
+        } else if (f == SurfaceColorFormat::F_W32Z32Y32X32 || f == SurfaceColorFormat::F_X32) {
+            for (u32 i = 0; i < row; i += 4) {
+                const u32 v = ps_ld32(src + i);
+                std::memcpy(dst + i, &v, 4);
+            }
+        } else {
+            // A8B8G8R8 and its X8 forms: a b g r in memory, r g b a in the RGBA8Unorm copy.
+            const bool x_zero = f == SurfaceColorFormat::X8B8G8R8_Z8B8G8R8;
+            const bool x_one = f == SurfaceColorFormat::X8B8G8R8_O8B8G8R8;
+            for (u32 x = 0; x < w; x++) {
+                const u8* p = src + x * 4;
+                u8* t = dst + x * 4;
+                t[0] = p[3], t[1] = p[2], t[2] = p[1];
+                t[3] = x_zero ? 0 : x_one ? 0xff : p[0];
+            }
+        }
+    }
+    // Called while a pass opens, before its encoder starts (as the A8R8G8B8 reload): no encoder is open.
+    PS_CHECK(encoder == nil);
+    id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
+    blit.label = @"rsx surface reload";
+    const auto copy = [&](const TransientAllocator::Allocation& a, u32 bytes_per_row, MTLBlitOption o) {
+        [blit copyFromBuffer:a.buffer
+                   sourceOffset:a.offset
+              sourceBytesPerRow:bytes_per_row
+            sourceBytesPerImage:static_cast<NSUInteger>(bytes_per_row) * h
+                     sourceSize:MTLSizeMake(w, h, 1)
+                      toTexture:s.texture
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)
+                        options:o];
+    };
+    copy(texels, row, z24s8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone);
+    if (z24s8) copy(stencil, w, MTLBlitOptionStencilFromDepthStencil);
+    [blit endEncoding];
+    s.initialized = true;
+    s.gpu_newer = false;
+    s.generation++;
+    if (s.depth) s.stencil_generation++;
 }
 
 bool MetalBackend::Impl::write_back_depth(Surface& s, const char* why) { return write_back(s, why); }

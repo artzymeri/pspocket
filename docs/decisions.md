@@ -1684,6 +1684,26 @@ of a core, the RSX thread 18%, the game's PPU threads under 10%.
   program's compile until the CPU rewrites it; a program the RSX rewrites between two draws of one batch and sets again
   is decoded again.
 
+## D-110 · 2026-10-05 · Render targets reload from guest memory in every format, and keep what was rendered
+
+When the RSX itself, or (through `invalidate_memory`) anything the runtime sees, writes guest memory under a render
+target, the target reloads from it before the GPU uses it again. Three gaps, none hit by GTA V's first mission, all
+generic:
+- **Formats**: the reload only took A8R8G8B8 colour targets (a texture decode and a draw); every other format was
+  refused, and depth buffers were never reloaded. Now every format the readback writes (A8B8G8R8 and its X forms,
+  W16Z16Y16X16 and W32Z32Y32X32 float, X32 float, B8, Z16, Z24S8) reloads by the inverse of `store_readback`: its bytes
+  in the Metal format, a staging buffer and a blit (Z24S8's depth and stencil apart). Depth buffers reload when a pass
+  opens over them.
+- **An open pass**: a target of the pass already open was never reloaded, because the pass went on (`open_pass` and
+  `do_clear` kept it). It now ends, and the next one reloads.
+- **What the GPU rendered**: an RSX write into part of a target (NV308A, the NV3089 destination, an NV0039
+  destination) reloaded the target from guest memory that never had the GPU's rendering, so it was lost. The targets
+  under the write go to guest memory first (`flush_memory`), so the reload has both. A deferred NV0039 copy reads back
+  its destination's targets with its source's, at the point in the GPU's order where the copy is.
+- Run: the first mission as before, 30 fps, one failure (MSAA), no new readbacks.
+- Tests: every format round-trips through a CPU write and a reload, but the pixel a 1x1 clear covers; an NV308A pixel
+  written over a rendered target keeps the triangle and the clear; the NV0039 front end flushes its destination.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
