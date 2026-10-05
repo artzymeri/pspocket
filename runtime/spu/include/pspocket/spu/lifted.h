@@ -348,6 +348,24 @@ PSL ps_spu_vec psl_from128(psl_u128 r)
     memcpy(&v, &r, 16);
     return v;
 }
+/* Byte counts in a register: one table lookup on AArch64 (D-127); the 128-bit integer shifts compile to about 30
+   instructions through general registers and a branch. Host byte k of the result is host byte k - n (left: shlqby,
+   rotqby) or k + n (right: rotqmby) of x; an index past 15 reads zero. */
+#if defined(__aarch64__)
+PSL uint8x16_t psl_iota8(void) { return (uint8x16_t){0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}; }
+PSL ps_spu_vec psl_shlqby(ps_spu_vec x, unsigned n)
+{
+    return (ps_spu_vec)vqtbl1q_u8((uint8x16_t)x, vsubq_u8(psl_iota8(), vdupq_n_u8((uint8_t)n))); /* n < 32 */
+}
+PSL ps_spu_vec psl_rotqmby(ps_spu_vec x, unsigned n)
+{
+    return (ps_spu_vec)vqtbl1q_u8((uint8x16_t)x, vaddq_u8(psl_iota8(), vdupq_n_u8((uint8_t)n))); /* n < 32 */
+}
+PSL ps_spu_vec psl_rotqby(ps_spu_vec x, unsigned n)
+{
+    return (ps_spu_vec)vqtbl1q_u8((uint8x16_t)x, vandq_u8(vsubq_u8(psl_iota8(), vdupq_n_u8((uint8_t)n)), vdupq_n_u8(15)));
+}
+#else
 PSL ps_spu_vec psl_shlqby(ps_spu_vec x, unsigned n) { return n < 16 ? psl_from128(psl_to128(x) << (8 * n)) : (ps_spu_vec){0, 0, 0, 0}; }
 PSL ps_spu_vec psl_rotqmby(ps_spu_vec x, unsigned n) { return n < 16 ? psl_from128(psl_to128(x) >> (8 * n)) : (ps_spu_vec){0, 0, 0, 0}; }
 PSL ps_spu_vec psl_rotqby(ps_spu_vec x, unsigned n)
@@ -356,6 +374,19 @@ PSL ps_spu_vec psl_rotqby(ps_spu_vec x, unsigned n)
     n &= 15;
     return n ? psl_from128((v << (8 * n)) | (v >> (128 - 8 * n))) : x;
 }
+#endif
+/* Immediate byte counts (the lifter's rotqbyi, shlqbyi, rotqmbyi with n a literal): a constant shuffle, one EXT or
+   TBL, where the 128-bit integer form moves the value through general registers and back (D-127). */
+#define PSL_BYI(k, n, form) ((form) == 0 ? (((k) + 16 - (n)) & 15) : (form) == 1 ? ((k) >= (n) ? (k) - (n) : 16) \
+                                              : ((k) + (n) < 16 ? (k) + (n) : 16))
+#define PSL_BYI_SHUFFLE(x, n, form)                                                                              \
+    ((ps_spu_vec)__builtin_shufflevector((psv_u8)(x), (psv_u8){0}, PSL_BYI(0, n, form), PSL_BYI(1, n, form),         \
+        PSL_BYI(2, n, form), PSL_BYI(3, n, form), PSL_BYI(4, n, form), PSL_BYI(5, n, form), PSL_BYI(6, n, form),       \
+        PSL_BYI(7, n, form), PSL_BYI(8, n, form), PSL_BYI(9, n, form), PSL_BYI(10, n, form), PSL_BYI(11, n, form),     \
+        PSL_BYI(12, n, form), PSL_BYI(13, n, form), PSL_BYI(14, n, form), PSL_BYI(15, n, form)))
+#define PSL_ROTQBYI(x, n) PSL_BYI_SHUFFLE(x, (n) & 15, 0)  /* rotqbyi: n & 15 */
+#define PSL_SHLQBYI(x, n) PSL_BYI_SHUFFLE(x, n, 1)         /* shlqbyi: n < 32, 16 and up give zero */
+#define PSL_ROTQMBYI(x, n) PSL_BYI_SHUFFLE(x, n, 2)        /* rotqmbyi: n < 32, 16 and up give zero */
 PSL ps_spu_vec psl_shlqbi(ps_spu_vec x, unsigned n) { return psl_from128(psl_to128(x) << (n & 7)); }
 PSL ps_spu_vec psl_rotqmbi(ps_spu_vec x, unsigned n) { return psl_from128(psl_to128(x) >> (n & 7)); }
 PSL ps_spu_vec psl_rotqbi(ps_spu_vec x, unsigned n)
@@ -497,6 +528,33 @@ PSL ps_spu_vec psl_cuflt(ps_spu_vec x, unsigned i8, int accurate)
     }
     return r;
 }
+#if defined(__aarch64__)
+/* cflts and cfltu, four lanes at once (D-127; the per-lane double form was 7% of the translated SPU code's time on the
+   iPhone). The scale 2^(173 - i8) is applied in single precision in at most two exact steps: a product that stays
+   normal is exact, one that overflows saturates the conversion either way (round toward zero overflows to FLT_MAX),
+   one that underflows truncates to 0 either way. FCVTZS/FCVTZU truncate and saturate. Exponent 0 (zero, denormals:
+   zero on the SPU) gives 0; exponent 255 (extended range on the SPU, infinity or NaN to the host) saturates by sign. */
+PSL psv_f32 psl_scale_pow2(psv_f32 f, int s) /* s in [-82, 173]: i8 in [0, 255] */
+{
+    if (s > 127) {
+        f = f * 0x1p127f;
+        s -= 127;
+    }
+    return f * ps_spu_f32((uint32_t)(127 + s) << 23);
+}
+PSL ps_spu_vec psl_cflts(ps_spu_vec x, unsigned i8)
+{
+    const ps_spu_vec r = (ps_spu_vec)vcvtq_s32_f32((float32x4_t)psl_scale_pow2((psv_f32)x, 173 - (int)i8));
+    const ps_spu_vec sat = (ps_spu_vec)((psv_s32)x >> 31) ^ 0x7FFFFFFFu; /* 0x7FFFFFFF, or 0x80000000 when negative */
+    return psl_bsel(psl_exp255(x), r, sat) & ~psl_zero_class(x);
+}
+PSL ps_spu_vec psl_cfltu(ps_spu_vec x, unsigned i8)
+{
+    const ps_spu_vec r = (ps_spu_vec)vcvtq_u32_f32((float32x4_t)psl_scale_pow2((psv_f32)x, 173 - (int)i8));
+    const ps_spu_vec sat = ~(ps_spu_vec)((psv_s32)x >> 31); /* 0xFFFFFFFF, or 0 when negative */
+    return psl_bsel(psl_exp255(x), r, sat) & ~psl_zero_class(x) & ~(ps_spu_vec)((psv_s32)x >> 31);
+}
+#else
 PSL ps_spu_vec psl_cflts(ps_spu_vec x, unsigned i8)
 {
     const double scale = psl_pow2(173 - (int)i8);
@@ -525,6 +583,7 @@ PSL ps_spu_vec psl_cfltu(ps_spu_vec x, unsigned i8)
     }
     return r;
 }
+#endif
 
 /* ---- double precision: one round-to-nearest FPCR window per instruction (fp.h) ---- */
 

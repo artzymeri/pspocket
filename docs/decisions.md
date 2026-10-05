@@ -1964,6 +1964,32 @@ follows RPCS3: SYS_MEMORY_CONTAINER_ID_INVALID returns to no container; any othe
 hold the PRX images of later loads; HLE modules have none, so it is only remembered.
 - Test: a fresh 1 MB container, no container, a wrong ID, and a container with 64 KB left.
 
+## D-127 · 2026-10-05 · Translated SPU calls save only what the callee can touch; byte rotates and cflts in NEON
+
+A 10 s Time Profiler recording of the iPhone in the first mission's escape (heat "serious", 9 to 17 fps): the process
+used 5.8 of the phone's 6 cores, 4.6 of them the six SPU workers, 79% of that in translated SPU code. A quarter of
+the translated code's time was the register saves and reloads around its own calls: each call stored every register
+the caller writes and reloaded every register it uses (up to 127 of each), though GTA V's jobs call small helpers
+from large functions. Now spu-lift works out, for each function and everything it calls, the registers it may read
+or write through ctx (its entry loads what it uses, its exits store what it writes); a call stores only what the
+caller wrote of the callee's set and reloads only what it uses of what the callee may write. A callee that does not
+come back to the call (it left for the run loop) has the caller store the rest of what it wrote before returning:
+each caller up the chain does the same, so ctx is whole again for the run loop. A stop (its handlers read and write
+any register) or a call through a register touches everything, as before.
+
+Two helpers were most of the rest: rotqby's 128-bit integer rotate moved the value through general registers (6
+instructions for an immediate count, about 30 and a branch for a register count) and is now one EXT or TBL for an
+immediate (shlqbyi, rotqbyi, rotqmbyi as constant shuffles) and a TBL for a register count; cflts and cfltu went
+through double precision lane by lane and are now FCVTZS/FCVTZU on the power-of-two-scaled lanes, with exponent 0
+giving 0 and exponent 255 saturating by sign (checked against the old form over every scale and edge values: 16.6
+million lanes, no difference).
+- Measured (run 085, the Mac's walk of run 080, 20 s at 30 fps): translated SPU code 14.8 s to 12.7 s (-14%), the
+  saves 2.20 s to 1.66 s, the reloads 2.74 s to 2.24 s; what is left of them is mostly each function's own entry
+  loads and exit stores.
+- Test: the program-level fuzz program keeps registers across a call that does not touch them, has them read and
+  written by the callee, written two calls deep, and kept across a call that leaves the program and comes back
+  through the run loop (without the early-exit stores, or without the reload, it fails).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -85,3 +85,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [082](082-gta5-shader-cache-mac.md) | 2026-10-05 | 7ac7e8c+ | M4 Mac, pspocket-boot --shader-cache | Shaders made ahead while the game loads: **no compile stalls in play** instead of 13.6 s of them (D-114) |
 | [083](083-gta5-conditional-mac.md) | 2026-10-05 | eeda058+ | M4 Mac, pspocket-boot | Conditional rendering no longer decides by an older count: **0 wrong skips** (the black and red flashes on the iPhone, D-115) |
 | [084](084-gta5-flashes-mac.md) | 2026-10-05 | 25d64ec+ | M4 Mac, pspocket-boot, every frame saved | Characters flashing red or black reproduced: **the red and the black fixed** (D-119, D-120, D-122) |
+| [085](085-gta5-cpu-iphone-mac.md) | 2026-10-05 | cb10984+ | iPhone and M4 Mac, Time Profiler | The iPhone uses 5.8 of 6 cores, 4.6 of them SPU code; translated SPU calls save less: **SPU code -14%** on the Mac (D-127) |

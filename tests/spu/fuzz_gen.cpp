@@ -287,7 +287,9 @@ private:
 // Direct calls, a loop, a call through an address computed from a link (position-independent code takes its own
 // address that way), relative loads and stores, a stop the run loop resumes after, an absolute call out of the
 // program (to a stub test_spu_fuzz puts at PS_SPU_FUZZ_PROGRAM_STUB) and a jump through a register, so lifted code
-// runs through every address it derives from its own: pcs, links, the dispatch switch, call returns.
+// runs through every address it derives from its own: pcs, links, the dispatch switch, call returns. Then the
+// registers around calls (D-127): kept across a call that doesn't touch them, read and written by the callee, written
+// two calls deep, and kept across a call that leaves the program and comes back through the run loop.
 struct SyntheticProgram {
     std::vector<u8> bytes; // at PS_SPU_FUZZ_PROGRAM_BASE
     u32 entry = 0;
@@ -309,6 +311,19 @@ SyntheticProgram synthetic_program()
     const u32 func2 = m.pc(); // called through a register only
     m.emit(as::il(9, 0x77));
     m.emit(as::ret());
+    const auto leaf2 = m.here(); // r22 = r21 + 1
+    m.emit(as::ai(22, 21, 1));
+    m.emit(as::ret());
+    const auto mid = m.here(); // calls func1 (r4 += 1), then r27 = 9; its link kept in r28
+    m.emit(as::ori(28, 0, 0));
+    m.brsl(0, func1);
+    m.emit(as::il(27, 9));
+    m.emit(as::bi(28));
+    const auto leaf_out = m.here(); // leaves the program for the stub and comes back, then r24 = 7
+    m.emit(as::ori(26, 0, 0));
+    m.emit(as::brasl(0, PS_SPU_FUZZ_PROGRAM_STUB));
+    m.emit(as::il(24, 7));
+    m.emit(as::bi(26));
 
     const u32 entry = m.pc();
     m.emit(as::il(3, 5));
@@ -337,6 +352,16 @@ SyntheticProgram synthetic_program()
         std::exit(1);
     }
     m.emit(as::il(8, 2));
+    m.emit(as::il(20, 0x7123)); // untouched by every call below
+    m.emit(as::il(21, 0x55));   // read by leaf2
+    m.brsl(0, leaf2);
+    m.emit(as::a(23, 20, 22));  // r22 written by leaf2
+    m.brsl(0, mid);
+    m.emit(as::a(25, 4, 27));   // r4 written two calls deep, r27 by mid
+    m.emit(as::il(29, 0x99));
+    m.brsl(0, leaf_out);        // r20, r23, r25 and r29 must reach ctx when it leaves
+    m.emit(as::a(30, 29, 24));
+    m.emit(as::a(31, 20, 23));
     m.emit(as::stop(0x11));
     return {m.finish(), entry, {func2, target}};
 }

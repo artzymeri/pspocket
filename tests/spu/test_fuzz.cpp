@@ -365,13 +365,18 @@ TEST_CASE("program-level fuzz: a lifted program agrees with the interpreter wher
             CHECK(diff_contexts(interp, compared).empty());
             CHECK(std::memcmp(ls_interp.data(), ls_lifted.data(), PS_SPU_LS_SIZE) == 0);
         }
-        CHECK(gw(lifted.gpr[4], 0) == 20); // 5 + 4 + 3 + 2 + 1, and func1 five times
+        CHECK(gw(lifted.gpr[4], 0) == 21); // 5 + 4 + 3 + 2 + 1, func1 five times, and once more through mid
         CHECK(gw(lifted.gpr[9], 0) == 0x77);
         CHECK(gw(lifted.gpr[8], 0) == 2);
         CHECK(gw(lifted.gpr[7], 0) == 0); // jumped over
-        // Lifted code ran throughout: the one miss is the stub, outside the program.
+        // The registers around calls (D-127).
+        CHECK(gw(lifted.gpr[23], 0) == 0x7123 + 0x56);
+        CHECK(gw(lifted.gpr[25], 0) == 21 + 9);
+        CHECK(gw(lifted.gpr[30], 0) == 0x99 + 7);
+        CHECK(gw(lifted.gpr[31], 0) == 0x7123 + 0x7123 + 0x56);
+        // Lifted code ran throughout: the misses are the stub, outside the program, called twice.
         CHECK(lifted.program == program);
-        CHECK(ps_spu_miss_count() - misses == 1);
+        CHECK(ps_spu_miss_count() - misses == 2);
     }
 
     ps_spu_set_miss_policy(policy);
