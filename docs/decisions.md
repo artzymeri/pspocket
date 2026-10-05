@@ -2615,6 +2615,31 @@ goes on to its next gaps (sys_mmapper_allocate_memory). Its own libraries all ha
 loads no module. Not yet: modules a game loads itself through sys_prx (syscalls 480-499), modules' imported variables,
 and translating firmware code with the game.
 
+## D-158 · 2026-10-06 · New shaders compile in the background: a frame waits for them 4 ms at most
+
+Rendering any game, not one: route B runs games the phone has never seen, and nothing records their shaders on a Mac
+first (the Mac's recording comes with the app for GTA V only, D-118). Until now each program and pipeline new to the
+backend compiled on the RSX thread at the draw that first needed it. GTA V with an empty shader cache on the M4 (run
+098): 562 programs and pipelines in one 300-frame stretch of the first walk, 9.3 s of stalls, 5 s windows at 6.8 and
+14.2 fps, 12.7 s of stalls in 128 s; the iPhone compiles several times slower.
+- `AsyncCompiler` (runtime/rsx/metal/src/async_compiler.mm): a program or pipeline a draw lacks is queued (a program
+  translated to MSL on the RSX thread, as before, compiled with newLibraryWithSource on a worker; a pipeline once its
+  two programs exist, its descriptor built on the RSX thread) on half the cores (2 to 4), at user-initiated QoS.
+  Pipelines go first: each is the last thing its draw waits for.
+- The RSX thread waits for what its draw queued while the frame's budget lasts (`compile_wait_ms`, 4 ms, renewed at
+  each flip), taking whatever finishes meanwhile; past it the draw is skipped ("compiling", counted per frame in the
+  report and the run summary), as RPCS3's asynchronous shader mode skips draws. What finishes joins the caches
+  between draws and is recorded in the shader cache, so the next launch makes it ahead (D-114).
+- A compile that fails is logged once and not tried again.
+- The app turns it on; pspocket-boot with `--async-shaders MS`. The gate keeps waiting compiles: its frames are
+  compared, and its shader cache has everything anyway.
+
+Measured (run 098, same walk, empty cache, a Mac busy with other builds): the slowest 5 s windows 25.0 and 27.2 fps
+(late in the walk, where little compiled) instead of 6.8 and 14.2; the RSX thread spent 0.5 s instead of 9.3 s in the
+burst. The price is draws left out while their shaders compile: 117 per frame on average over the burst's 300
+frames (287 with programs first and two threads). Tests: a draw with no budget goes without its programs and draws once they
+are made, with nothing compiled on the RSX thread; with a budget that covers the compiles it waits and draws.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

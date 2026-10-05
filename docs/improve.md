@@ -56,8 +56,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Try:**
   - Bring the phone's pipelines.txt back into the app's seed (scripts/ios.sh can pull the Caches directory), so a new
     install starts with what the phone has seen.
-  - Compile a new pipeline off the RSX thread and draw without it for the frames that takes (RPCS3's asynchronous
-    shader mode); needs a decision on what to show meanwhile.
+  - ~~Compile a new pipeline off the RSX thread and draw without it for the frames that takes~~: done (D-158,
+    run 098), 4 ms of waiting per frame at most, then the draw is skipped. Next: a shader interpreter (one MSL
+    program that runs RSX microcode, RPCS3's "async with shader interpreter") would draw those instead of leaving
+    them out; tune the 4 ms on the phone.
 - **Archives:** off on the phone (D-145): iOS keeps compiled pipelines between launches itself, and the archives cost
   gigabytes. After an iOS update its cache is empty and the first launch compiles everything (84 s and more, run 087).
 - **State:** open.
