@@ -58,9 +58,9 @@ missing, roughly in order:
 2. **One command per game** (D-101): `scripts/translate-game.sh --iso GAME.iso --elf EBOOT.elf [--ios]` translates
    a game's PPU and SPU code and builds it in; the executable is decrypted with the user's own tools. Next: try it on
    a second game.
-3. **RSX gaps** the first mission logs: occlusion queries (report 65535), conditional rendering (draws
-   unconditionally), MSAA (one sample), a 3D texture, depth comparison for shadow maps, fragment CAL/BEM, vertex
-   BRB/CLB.
+3. **RSX**: the first mission logs one failure (MSAA rendered with one sample, D-102); shadow lookups (D-100),
+   occlusion queries, conditional rendering and 3D textures (D-102) run. Still refused when a game uses them: fragment
+   CAL/BEM, vertex BRB/CLB, compressed 3D textures.
 4. The per-frame 80x45 readback (make it asynchronous), the FIFO desync seen once in run 055 (the app recovers),
    sound pace on the phone.
 

@@ -67,6 +67,7 @@ struct Rsx::HandlerTable {
         bind(m::NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE, &Rsx::m_back_end_write_semaphore_release);
         bind(m::NV4097_WAIT_FOR_IDLE, &Rsx::m_wait_for_idle);
         bind(m::NV4097_SET_RENDER_ENABLE, &Rsx::m_set_render_enable);
+        bind(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, &Rsx::m_zpass_pixel_count_enable);
         bind(m::NV4097_SET_INDEX_ARRAY_DMA, &Rsx::m_index_array_dma);
 
         // Dirty tracking (RPCS3 binds set_surface_dirty_bit, set_fragment_texture_dirty_bit, ... to these)
@@ -296,6 +297,7 @@ Rsx::Status Rsx::status() const
     s.words = words_.load(std::memory_order_relaxed);
     s.flips = flips_.load(std::memory_order_relaxed);
     s.failures = failures_.load(std::memory_order_relaxed);
+    s.conditional_skips = conditional_skips_.load(std::memory_order_relaxed);
     s.block = block_reason_.load(std::memory_order_acquire);
     s.block_value = block_value_.load(std::memory_order_relaxed);
     if (s.block == BlockReason::JumpToSelf) {

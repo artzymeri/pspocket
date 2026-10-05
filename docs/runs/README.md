@@ -72,3 +72,7 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [067](067-gta5-vm-tables-mac.md) | 2026-10-05 | 9cd1f31+ | M4 Mac, pspocket-boot, the PPU code translated | Modules in shared blocks found, the script VM's tables, DEPTH16 from memory (D-095 to D-097) |
 | [068](068-gta5-color-conversion-mac.md) | 2026-10-05 | 9cd1f31+ | M4 Mac, pspocket-boot --spu-dump | Y16_X16 over colour targets converted on the GPU: one readback a frame left (D-098) |
 | [069](069-gta5-module-tracker-mac.md) | 2026-10-05 | 9cd1f31+ | M4 Mac, pspocket-boot --spu-dump | The dependency tasks' modules all run lifted (D-099) |
+| [070](070-gta5-shadow-lookups-mac.md) | 2026-10-05 | ed07f03- | M4 Mac, pspocket-boot --trace-frame | Shadow lookups compare depth; the cascades are atlas tiles read from stale memory (D-100) |
+| [071](071-gta5-atlas-tiles-mac.md) | 2026-10-05 | ed07f03- | M4 Mac, pspocket-boot --trace-frame | Every shadow cascade from its depth buffer (D-100) |
+| [072](072-gta5-occlusion-mac.md) | 2026-10-05 | fd3a099+ | M4 Mac, pspocket-boot --frames | Occlusion queries counted on the GPU; 361,371 RSX failures left |
+| [073](073-gta5-rsx-complete-mac.md) | 2026-10-05 | fd3a099+ | M4 Mac, pspocket-boot --frames | **One RSX failure in the run**: 3D textures, conditional rendering (D-102) |

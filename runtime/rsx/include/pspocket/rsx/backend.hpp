@@ -57,6 +57,19 @@ public:
     // GPU (render targets) must be written back first. Returns true if something was written back (an expensive
     // GPU-to-CPU readback; backends log it).
     virtual bool flush_memory(u32 addr, u32 size, const char* why = "a memory read") = 0;
+
+    // Occlusion queries (D-102): NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE turns counting of the samples that pass the depth
+    // and stencil tests on and off, NV4097_CLEAR_REPORT_VALUE(ZPASS_PIXEL_CNT) restarts the count, and
+    // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) asks for the count since the last restart in the big-endian word at
+    // value_addr: the backend writes it once the GPU has it and returns true, or returns false when it does not count
+    // (the front end then writes Config::fake_zpass_count).
+    virtual void set_zpass_counting(bool on) { (void)on; }
+    virtual void clear_zpass() {}
+    virtual bool report_zpass(u32 value_addr)
+    {
+        (void)value_addr;
+        return false;
+    }
 };
 
 } // namespace pspocket::rsx

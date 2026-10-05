@@ -25,8 +25,10 @@ struct DecodeParams {
     u32 log2_w;
     u32 log2_h;
     u32 block_bytes;
-    u32 pad0;
-    u32 pad1;
+    u32 depth;
+    u32 log2_d;
+    u32 slice_bytes;
+    u32 pad;
 };
 
 u64 mix(u64 h, u64 v)
@@ -120,10 +122,11 @@ CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, 
     const bool use_bc = compressed && bc_supported && !force_compute_dxt && base.width % 4 == 0 && base.height % 4 == 0;
 
     MTLTextureDescriptor* d = [MTLTextureDescriptor new];
-    d.textureType = layout->cubemap ? MTLTextureTypeCube : MTLTextureType2D;
+    d.textureType = layout->cubemap ? MTLTextureTypeCube : layout->volume ? MTLTextureType3D : MTLTextureType2D;
     d.pixelFormat = decoded_pixel_format(fmt.decoded, use_bc);
     d.width = base.width;
     d.height = base.height;
+    d.depth = layout->volume ? base.depth : 1;
     d.mipmapLevelCount = layout->mips;
     d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView | (use_bc ? 0 : MTLTextureUsageShaderWrite);
     d.storageMode = MTLStorageModePrivate;
@@ -150,7 +153,35 @@ CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, 
     auto staging = transient.alloc(size, 256);
     std::memcpy(staging.data, mem.host(ea), size);
 
-    if (use_bc) {
+    if (layout->volume) {
+        // A 3D texture (D-102): every slice of a level in one dispatch.
+        id<MTLComputeCommandEncoder> enc = [upload_buffer() computeCommandEncoder];
+        [enc setComputePipelineState:decode3d_pipeline];
+        [enc setBuffer:staging.buffer offset:staging.offset atIndex:0];
+        for (const TextureLevel& l : layout->levels) {
+            DecodeParams p{};
+            p.format = static_cast<u32>(fmt.decode);
+            p.width = l.width;
+            p.height = l.height;
+            p.src_offset = l.offset;
+            p.pitch = l.pitch;
+            p.border = l.border;
+            p.morton = layout->swizzled;
+            p.log2_w = ceil_log2(l.swizzle_width);
+            p.log2_h = ceil_log2(l.swizzle_height);
+            p.block_bytes = fmt.block_bytes;
+            p.depth = l.depth;
+            p.log2_d = ceil_log2(l.swizzle_depth);
+            p.slice_bytes = l.slice_bytes();
+            [enc setBytes:&p length:sizeof(p) atIndex:1];
+            id<MTLTexture> level = layout->mips == 1 ? texture
+                : [texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:MTLTextureType3D
+                                                  levels:NSMakeRange(l.level, 1) slices:NSMakeRange(0, 1)];
+            [enc setTexture:level atIndex:0];
+            [enc dispatchThreads:MTLSizeMake(l.width, l.height, l.depth) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        }
+        [enc endEncoding];
+    } else if (use_bc) {
         id<MTLBlitCommandEncoder> blit = [upload_buffer() blitCommandEncoder];
         for (const TextureLevel& l : layout->levels) {
             [blit copyFromBuffer:staging.buffer

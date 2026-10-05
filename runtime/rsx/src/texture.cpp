@@ -119,8 +119,11 @@ std::optional<TextureLayout> compute_texture_layout(const TextureInfo& t, std::s
     const TextureFormatInfo* fmt = texture_format_info(t.base_format());
     if (!fmt) return fail(std::format("unknown texture format {:#x}", t.base_format()));
     if (fmt->decode == TexelDecode::Unsupported) return fail(std::format("texture format {} is not decoded yet", fmt->name));
-    if (t.dimension == 3) return fail("3D textures are not implemented yet");
-    if (t.dimension != 1 && t.dimension != 2) return fail(std::format("invalid texture dimension {}", t.dimension));
+    if (t.dimension == 3 && fmt->block_texels != 1) {
+        return fail(std::format("compressed 3D textures ({}x{}x{} {}) are not implemented yet", t.width, t.height,
+            t.depth, fmt->name));
+    }
+    if (t.dimension < 1 || t.dimension > 3) return fail(std::format("invalid texture dimension {}", t.dimension));
 
     u32 w = t.width;
     u32 h = t.dimension == 1 ? 1 : t.height;
@@ -130,6 +133,7 @@ std::optional<TextureLayout> compute_texture_layout(const TextureInfo& t, std::s
     layout.format = fmt;
     layout.swizzled = !t.is_linear();
     layout.cubemap = t.cubemap && t.dimension == 2;
+    layout.volume = t.dimension == 3;
     layout.faces = layout.cubemap ? 6 : 1;
     layout.mips = texture_mip_count(t, *fmt);
 
@@ -153,7 +157,7 @@ std::optional<TextureLayout> compute_texture_layout(const TextureInfo& t, std::s
 
     u32 offset = 0;
     for (u32 face = 0; face < layout.faces; face++) {
-        u32 mw = w, mh = h;
+        u32 mw = w, mh = h, md = layout.volume ? std::max<u32>(t.depth, 1) : 1;
         for (u32 level = 0; level < layout.mips; level++) {
             TextureLevel l;
             l.face = face;
@@ -176,11 +180,15 @@ std::optional<TextureLayout> compute_texture_layout(const TextureInfo& t, std::s
             }
             l.swizzle_width = l.pitch / fmt->block_bytes;
             l.swizzle_height = l.rows;
-            l.size = l.pitch * l.rows;
+            // RPCS3 get_subresources_layout_impl: a 3D level is its slices, pitch * rows bytes each.
+            l.depth = md;
+            l.swizzle_depth = layout.swizzled ? next_pow2(md) : md;
+            l.size = l.pitch * l.rows * md;
             offset += l.size;
             layout.levels.push_back(l);
             mw = std::max(mw / 2, 1u);
             mh = std::max(mh / 2, 1u);
+            md = std::max(md / 2, 1u);
         }
         if (layout.swizzled) offset = (offset + 127) & ~127u; // faces of swizzled textures are 128-byte aligned
     }
@@ -290,13 +298,16 @@ bool decode_level_cpu(const TextureLayout& layout, const TextureLevel& level, co
     std::vector<std::array<float, 4>>& out)
 {
     const TextureFormatInfo& fmt = *layout.format;
-    out.assign(static_cast<usize>(level.width) * level.height, {0.f, 0.f, 0.f, 0.f});
+    out.assign(static_cast<usize>(level.width) * level.height * level.depth, {0.f, 0.f, 0.f, 0.f});
     const bool morton = layout.swizzled && fmt.block_texels == 1;
     const u32 lw = ceil_log2(level.swizzle_width), lh = ceil_log2(level.swizzle_height);
+    const u32 ld = ceil_log2(level.swizzle_depth);
+    if (level.depth > 1 && fmt.block_texels != 1) return false;
 
+    for (u32 z = 0; z < level.depth; z++)
     for (u32 y = 0; y < level.height; y++) {
         for (u32 x = 0; x < level.width; x++) {
-            std::array<float, 4>& o = out[static_cast<usize>(y) * level.width + x];
+            std::array<float, 4>& o = out[(static_cast<usize>(z) * level.height + y) * level.width + x];
             if (fmt.block_texels == 4) {
                 const u8* block = src + level.offset + (y / 4) * level.pitch + (x / 4) * fmt.block_bytes;
                 std::array<std::array<u8, 4>, 16> texels{};
@@ -311,7 +322,8 @@ bool decode_level_cpu(const TextureLayout& layout, const TextureLevel& level, co
                 continue;
             }
             const u32 ex = x + level.border, ey = y + level.border;
-            const u32 element = morton ? morton_index(ex, ey, lw, lh) * fmt.block_bytes : ey * level.pitch + ex * fmt.block_bytes;
+            const u32 element = morton ? morton_index_3d(ex, ey, z, lw, lh, ld) * fmt.block_bytes
+                                       : z * level.slice_bytes() + ey * level.pitch + ex * fmt.block_bytes;
             const u8* p = src + level.offset + element;
             switch (fmt.decode) {
             case TexelDecode::ARGB8: o = rgba8(p[1], p[2], p[3], p[0]); break;

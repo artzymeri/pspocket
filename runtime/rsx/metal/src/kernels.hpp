@@ -21,8 +21,10 @@ struct rsx_decode_params {
     uint log2_w;      // Morton area, in elements
     uint log2_h;
     uint block_bytes;
-    uint pad0;
-    uint pad1;
+    uint depth;       // 3D textures: slices of the level
+    uint log2_d;      // 3D textures: Morton depth, in slices
+    uint slice_bytes; // 3D textures, linear: bytes per slice
+    uint pad;
 };
 
 // TexelDecode values (runtime/rsx/include/pspocket/rsx/texture.hpp)
@@ -37,6 +39,18 @@ static uint morton(uint x, uint y, uint lw, uint lh)
         if (lw != 0u) { offset |= (x & 1u) << shift++; x >>= 1; lw--; }
         if (lh != 0u) { offset |= (y & 1u) << shift++; y >>= 1; lh--; }
         if (lw == 0u && lh == 0u) break;
+    }
+    return offset;
+}
+
+static uint morton3(uint x, uint y, uint z, uint lw, uint lh, uint ld)
+{
+    uint offset = 0, shift = 0;
+    while ((x | y | z) != 0u) {
+        if (lw != 0u) { offset |= (x & 1u) << shift++; x >>= 1; lw--; }
+        if (lh != 0u) { offset |= (y & 1u) << shift++; y >>= 1; lh--; }
+        if (ld != 0u) { offset |= (z & 1u) << shift++; z >>= 1; ld--; }
+        if (lw == 0u && lh == 0u && ld == 0u) break;
     }
     return offset;
 }
@@ -96,6 +110,34 @@ static float4 decode_dxt(device const uchar* src, constant rsx_decode_params& p,
     return rgba8(c.r, c.g, c.b, c.a);
 }
 
+// One texel of an uncompressed format at byte o of src (TexelDecode p.format).
+static float4 decode_texel(device const uchar* src, uint o, constant rsx_decode_params& p)
+{
+    float4 c = float4(0.0);
+    switch (p.format) {
+    case kARGB8: c = rgba8(src[o + 1], src[o + 2], src[o + 3], src[o]); break;
+    case kDRGB8: c = rgba8(src[o + 1], src[o + 2], src[o + 3], 255u); break;
+    case kR5G6B5: { const uint v = ld16be(src, o); c = rgba8(expand5(v >> 11), expand6((v >> 5) & 63u), expand5(v & 31u), 255u); break; }
+    case kA1R5G5B5: { const uint v = ld16be(src, o); c = rgba8(expand5((v >> 10) & 31u), expand5((v >> 5) & 31u), expand5(v & 31u), (v >> 15) != 0u ? 255u : 0u); break; }
+    case kD1R5G5B5: { const uint v = ld16be(src, o); c = rgba8(expand5((v >> 10) & 31u), expand5((v >> 5) & 31u), expand5(v & 31u), 255u); break; }
+    case kA4R4G4B4: { const uint v = ld16be(src, o); c = rgba8(((v >> 8) & 15u) * 17u, ((v >> 4) & 15u) * 17u, (v & 15u) * 17u, (v >> 12) * 17u); break; }
+    case kR5G5B5A1: { const uint v = ld16be(src, o); c = rgba8(expand5(v >> 11), expand5((v >> 6) & 31u), expand5((v >> 1) & 31u), (v & 1u) != 0u ? 255u : 0u); break; }
+    case kR6G5B5: { const uint v = ld16be(src, o); c = rgba8(expand6(v >> 10), expand5((v >> 5) & 31u), expand5(v & 31u), 255u); break; }
+    case kB8: c = rgba8(src[o], src[o], src[o], 255u); break;
+    case kX32F: c = float4(as_type<float>(ld32be(src, o)), 0.0, 0.0, 1.0); break;
+    case kW16F: c = float4(float(as_type<half>(ushort(ld16be(src, o)))), float(as_type<half>(ushort(ld16be(src, o + 2)))),
+                           float(as_type<half>(ushort(ld16be(src, o + 4)))), float(as_type<half>(ushort(ld16be(src, o + 6))))); break;
+    case kW32F: c = float4(as_type<float>(ld32be(src, o)), as_type<float>(ld32be(src, o + 4)),
+                           as_type<float>(ld32be(src, o + 8)), as_type<float>(ld32be(src, o + 12))); break;
+    case kY16X16F: c = float4(float(as_type<half>(ushort(ld16be(src, o)))), float(as_type<half>(ushort(ld16be(src, o + 2)))), 0.0, 1.0); break;
+    case kX16:
+    case kD16: c = float4(float(ld16be(src, o)) / 65535.0, 0.0, 0.0, 1.0); break;
+    case kY16X16: c = float4(float(ld16be(src, o)) / 65535.0, float(ld16be(src, o + 2)) / 65535.0, 0.0, 1.0); break;
+    default: break;
+    }
+    return c;
+}
+
 kernel void rsx_decode_texture(device const uchar* src [[buffer(0)]], constant rsx_decode_params& p [[buffer(1)]],
                                texture2d<float, access::write> dst [[texture(0)]], uint2 gid [[thread_position_in_grid]])
 {
@@ -107,29 +149,21 @@ kernel void rsx_decode_texture(device const uchar* src [[buffer(0)]], constant r
         const uint ex = gid.x + p.border, ey = gid.y + p.border;
         const uint o = p.src_offset + (p.morton != 0u ? morton(ex, ey, p.log2_w, p.log2_h) * p.block_bytes
                                                        : ey * p.pitch + ex * p.block_bytes);
-        switch (p.format) {
-        case kARGB8: c = rgba8(src[o + 1], src[o + 2], src[o + 3], src[o]); break;
-        case kDRGB8: c = rgba8(src[o + 1], src[o + 2], src[o + 3], 255u); break;
-        case kR5G6B5: { const uint v = ld16be(src, o); c = rgba8(expand5(v >> 11), expand6((v >> 5) & 63u), expand5(v & 31u), 255u); break; }
-        case kA1R5G5B5: { const uint v = ld16be(src, o); c = rgba8(expand5((v >> 10) & 31u), expand5((v >> 5) & 31u), expand5(v & 31u), (v >> 15) != 0u ? 255u : 0u); break; }
-        case kD1R5G5B5: { const uint v = ld16be(src, o); c = rgba8(expand5((v >> 10) & 31u), expand5((v >> 5) & 31u), expand5(v & 31u), 255u); break; }
-        case kA4R4G4B4: { const uint v = ld16be(src, o); c = rgba8(((v >> 8) & 15u) * 17u, ((v >> 4) & 15u) * 17u, (v & 15u) * 17u, (v >> 12) * 17u); break; }
-        case kR5G5B5A1: { const uint v = ld16be(src, o); c = rgba8(expand5(v >> 11), expand5((v >> 6) & 31u), expand5((v >> 1) & 31u), (v & 1u) != 0u ? 255u : 0u); break; }
-        case kR6G5B5: { const uint v = ld16be(src, o); c = rgba8(expand6(v >> 10), expand5((v >> 5) & 31u), expand5(v & 31u), 255u); break; }
-        case kB8: c = rgba8(src[o], src[o], src[o], 255u); break;
-        case kX32F: c = float4(as_type<float>(ld32be(src, o)), 0.0, 0.0, 1.0); break;
-        case kW16F: c = float4(float(as_type<half>(ushort(ld16be(src, o)))), float(as_type<half>(ushort(ld16be(src, o + 2)))),
-                               float(as_type<half>(ushort(ld16be(src, o + 4)))), float(as_type<half>(ushort(ld16be(src, o + 6))))); break;
-        case kW32F: c = float4(as_type<float>(ld32be(src, o)), as_type<float>(ld32be(src, o + 4)),
-                               as_type<float>(ld32be(src, o + 8)), as_type<float>(ld32be(src, o + 12))); break;
-        case kY16X16F: c = float4(float(as_type<half>(ushort(ld16be(src, o)))), float(as_type<half>(ushort(ld16be(src, o + 2)))), 0.0, 1.0); break;
-        case kX16:
-        case kD16: c = float4(float(ld16be(src, o)) / 65535.0, 0.0, 0.0, 1.0); break;
-        case kY16X16: c = float4(float(ld16be(src, o)) / 65535.0, float(ld16be(src, o + 2)) / 65535.0, 0.0, 1.0); break;
-        default: break;
-        }
+        c = decode_texel(src, o, p);
     }
     dst.write(c, gid);
+}
+
+// A level of a 3D texture (uncompressed formats): its slices one after another, or swizzled in the Morton order with x,
+// y and z interleaved (RPCS3 convert_linear_swizzle_3d).
+kernel void rsx_decode_texture3d(device const uchar* src [[buffer(0)]], constant rsx_decode_params& p [[buffer(1)]],
+                                 texture3d<float, access::write> dst [[texture(0)]], uint3 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p.width || gid.y >= p.height || gid.z >= p.depth) return;
+    const uint ex = gid.x + p.border, ey = gid.y + p.border;
+    const uint o = p.src_offset + (p.morton != 0u ? morton3(ex, ey, gid.z, p.log2_w, p.log2_h, p.log2_d) * p.block_bytes
+                                                   : gid.z * p.slice_bytes + ey * p.pitch + ex * p.block_bytes);
+    dst.write(decode_texel(src, o, p), gid);
 }
 
 // A depth buffer read as a texture, on the GPU (D-088): the texture sees the depth buffer's bits as the RSX lays them

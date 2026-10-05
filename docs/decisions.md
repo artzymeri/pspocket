@@ -1521,6 +1521,30 @@ D-090's pipeline as commands a user runs once per game, with nothing found by ha
   inventory/*/ppu-lifted) and registers it after the load for its executable only (D-098), through
   loader::register_translated_ppu, as pspocket-boot does.
 
+## D-102 · 2026-10-05 · Occlusion queries, conditional rendering and 3D textures
+
+Run 072's RSX counted 360,000 failures in 170 s; run 073 counts one.
+- Occlusion queries: NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE turns counting on and off, CLEAR_REPORT_VALUE(ZPASS_PIXEL_CNT)
+  restarts it, GET_REPORT(ZPASS_PIXEL_CNT) asks for the samples that passed since (RPCS3 ZCULL_control). The Metal
+  backend gives each render buffer a visibility buffer of 64-bit counters and each query one counter per render pass it
+  draws in (Metal writes a pass's counters when the pass ends); a report sums its counters in a completion handler of
+  the render buffer that holds the last of them and stores the value word, without a GPU sync. The front end writes
+  the report's timestamp at once. Backends that do not count still answer Config::fake_zpass_count.
+- Conditional rendering (SET_RENDER_ENABLE mode 2) reads the report's value when the method runs and skips draws while
+  it is zero, until mode 1: a query issued in the same frame decides from its previous result, a frame late (RPCS3
+  defers the evaluation; Metal has no predication). The thread report counts the skipped draws.
+- 3D textures: a level is its slices one after another (linear), or swizzled with x, y and z bits interleaved over the
+  power-of-two volume (RPCS3 get_subresources_layout_impl, convert_linear_swizzle_3d, calculate_z_index), decoded on
+  the GPU by rsx_decode_texture3d (all slices in one dispatch, the texel decoding shared with the 2D kernel) into a
+  Metal 3D texture, sampled with coord.xyz (TXP: / w) through a Tex3D texture kind. GTA V samples a 64x64x32 R5G6B5
+  swizzled volume. Compressed 3D textures (VTC tiling) stay unsupported until a game uses them.
+- Multisampled surfaces still render with one sample: GTA V's one (AA mode 3, 128x128) is read by its resolve at the
+  sample layout, twice as wide, which samples the stretched target and gets the pixel itself. Reported once per
+  surface instead of at every draw.
+- Tests: an occlusion count equal to the pixels the triangle covered, a query without draws reporting 0, a draw under a
+  zero report skipped and one under a nonzero report drawn; 3D layouts, the 3D Morton order and the CPU decoder; a
+  swizzled 3D texture sampled end to end at two slices.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

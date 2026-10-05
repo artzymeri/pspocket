@@ -157,6 +157,7 @@ public:
         u64 words = 0;        // command words processed
         u64 flips = 0;
         u64 failures = 0;
+        u64 conditional_skips = 0; // draws conditional rendering skipped (D-102)
         BlockReason block = BlockReason::None;
         u32 block_value = 0;  // Semaphore: the value it waits for; JumpToSelf: the jump word
         // Semaphore: where the acquire looks (NV406E_SEMAPHORE_OFFSET in the NV406E_SET_CONTEXT_DMA_SEMAPHORE
@@ -227,6 +228,7 @@ private:
     void m_back_end_write_semaphore_release(u32, u32);
     void m_wait_for_idle(u32, u32);
     void m_set_render_enable(u32, u32);
+    void m_zpass_pixel_count_enable(u32, u32);
     void m_index_array_dma(u32, u32);
     void m_dirty_surface(u32, u32);
     void m_dirty_vertex_program(u32, u32);
@@ -295,6 +297,8 @@ private:
     std::atomic<u64> words_{0};
     std::atomic<u64> failures_{0};
     std::atomic<u64> flips_{0};
+    std::atomic<u64> conditional_skips_{0};
+    bool render_enabled_ = true; // NV4097_SET_RENDER_ENABLE: false while the report it names was zero (D-102)
     std::mutex fail_mutex_;
     std::unordered_set<std::string> reported_;
 };

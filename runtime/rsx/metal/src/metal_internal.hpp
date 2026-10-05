@@ -152,12 +152,14 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> read_pipeline = nil;
     id<MTLComputePipelineState> depth_pipeline = nil; // rsx_depth_to_texture
     id<MTLComputePipelineState> color_pipeline = nil; // rsx_color_to_texture
+    id<MTLComputePipelineState> decode3d_pipeline = nil; // rsx_decode_texture3d
     id<MTLTexture> dummy_stencil = nil;              // for Z16 buffers, which have none
     id<MTLRenderPipelineState> blit_pipeline = nil;
     id<MTLSamplerState> nearest_sampler = nil;
     id<MTLSamplerState> linear_sampler = nil;
     id<MTLTexture> dummy_texture = nil;
     id<MTLTexture> dummy_cube = nil;
+    id<MTLTexture> dummy_volume = nil; // 3D
     id<MTLSharedEvent> frame_event = nil;
     u64 frame_event_value = 0;
     bool bc_supported = false;
@@ -188,6 +190,26 @@ struct MetalBackend::Impl {
     };
     MTLRenderPassDescriptor* pass_desc = nil;
     id<MTLRenderCommandEncoder> encoder = nil;
+
+    // Occlusion queries (D-102): each render buffer has a visibility buffer of 64-bit counters; a query counts into one
+    // counter per render pass it draws in (Metal writes a pass's counters when the pass ends), and a report sums them
+    // once the render buffer that holds the last of them has completed.
+    struct VisibilitySlot {
+        __strong id<MTLBuffer> buffer;
+        u32 index = 0;
+    };
+    struct PendingReport {
+        u32 value_addr = 0;
+        std::vector<VisibilitySlot> slots;
+    };
+    static constexpr u32 kVisibilitySlots = 4096;
+    __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
+    u32 visibility_next = 0;
+    bool zpass_on = false;
+    std::vector<VisibilitySlot> zpass_slots; // the counters of the query since the last clear
+    s32 pass_zpass_slot = -1;                // this pass's counter for that query, -1 until a draw counts
+    s32 encoder_zpass_slot = -1;             // the counter the encoder counts into, -1 when it does not count
+    std::vector<PendingReport> pending_reports;
     PassTargets pass{};
     PassTargets draw_targets{}; // targets of the draw being prepared (render-target feedback detection)
     bool pass_open = false;    // targets chosen (descriptor built)

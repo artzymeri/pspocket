@@ -107,9 +107,57 @@ TEST_CASE("texture layouts: linear mips share the pitch, swizzled mips are packe
     CHECK(why.find("unknown") != std::string::npos);
     CHECK_FALSE(compute_texture_layout(make_texture(tex::COMPRESSED_HILO8, 4, 4), &why).has_value());
     CHECK(why.find("HILO8") != std::string::npos);
-    TextureInfo volume = make_texture(tex::A8R8G8B8, 4, 4);
+    TextureInfo volume = make_texture(tex::COMPRESSED_DXT1, 4, 4);
     volume.dimension = 3;
-    CHECK_FALSE(compute_texture_layout(volume, &why).has_value());
+    volume.depth = 4;
+    CHECK_FALSE(compute_texture_layout(volume, &why).has_value()); // compressed 3D textures (VTC tiling)
+    CHECK(why.find("compressed 3D") != std::string::npos);
+}
+
+TEST_CASE("3D textures: slices after one another, or swizzled with x, y and z interleaved")
+{
+    // GTA V's first mission samples a 64x64x32 R5G6B5 swizzled volume.
+    TextureInfo t = make_texture(tex::R5G6B5, 8, 4);
+    t.dimension = 3;
+    t.depth = 2;
+    const auto swizzled = compute_texture_layout(t);
+    REQUIRE(swizzled.has_value());
+    CHECK(swizzled->volume);
+    REQUIRE(swizzled->levels.size() == 1);
+    CHECK(swizzled->levels[0].depth == 2);
+    CHECK(swizzled->levels[0].size == 8 * 4 * 2 * 2);
+    // RPCS3 calculate_z_index: x0 y0 z0 x1 y1 x2 for an 8x4x2 volume.
+    CHECK(morton_index_3d(1, 0, 0, 3, 2, 1) == 1);
+    CHECK(morton_index_3d(0, 1, 0, 3, 2, 1) == 2);
+    CHECK(morton_index_3d(0, 0, 1, 3, 2, 1) == 4);
+    CHECK(morton_index_3d(2, 0, 0, 3, 2, 1) == 8);
+    CHECK(morton_index_3d(0, 2, 0, 3, 2, 1) == 16);
+    CHECK(morton_index_3d(4, 0, 0, 3, 2, 1) == 32);
+    CHECK(morton_index_3d(3, 1, 0, 2, 2, 0) == morton_index(3, 1, 2, 2)); // no depth bits: the 2D order
+
+    // Decoded: texel (x, y, z) holds the value it was written with, through the order above.
+    std::vector<u8> bytes(8 * 4 * 2 * 2);
+    for (u32 z = 0; z < 2; z++)
+        for (u32 y = 0; y < 4; y++)
+            for (u32 x = 0; x < 8; x++) ps_st16(&bytes[morton_index_3d(x, y, z, 3, 2, 1) * 2], static_cast<u16>((x << 11) | (y << 5) | z));
+    std::vector<std::array<float, 4>> out;
+    REQUIRE(decode_level_cpu(*swizzled, swizzled->levels[0], bytes.data(), out));
+    REQUIRE(out.size() == 64);
+    for (u32 z = 0; z < 2; z++)
+        for (u32 y = 0; y < 4; y++)
+            for (u32 x = 0; x < 8; x++) {
+                const auto& o = out[(z * 4 + y) * 8 + x];
+                CHECK(static_cast<int>(o[0] * 255.f + 0.5f) == ((x * 527 + 23) >> 6));
+                CHECK(static_cast<int>(o[2] * 255.f + 0.5f) == ((z * 527 + 23) >> 6));
+            }
+
+    // Linear: slices of pitch * height bytes.
+    t.format = tex::R5G6B5 | tex::kLinearFlag;
+    t.pitch = 32;
+    const auto linear = compute_texture_layout(t);
+    REQUIRE(linear.has_value());
+    CHECK(linear->levels[0].slice_bytes() == 32 * 4);
+    CHECK(linear->levels[0].size == 32 * 4 * 2);
 }
 
 TEST_CASE("CPU decoders: ARGB8 linear and swizzled agree")

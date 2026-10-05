@@ -90,7 +90,7 @@ struct VpOptions {
 
 // Shadow2D: a depth texture sampled with a depth comparison (RPCS3 shadow_textures: a depth format and a compare
 // function other than never and always); the lookup returns the comparison's result in every channel.
-enum class TextureKind : u8 { Tex2D = 0, Cube = 1, Tex1D = 2, Shadow2D = 3 };
+enum class TextureKind : u8 { Tex2D = 0, Cube = 1, Tex1D = 2, Shadow2D = 3, Tex3D = 4 };
 
 struct FpOptions {
     u32 shader_control = 0; // NV4097_SET_SHADER_CONTROL (0x40: 32-bit exports, 0xe: depth export)

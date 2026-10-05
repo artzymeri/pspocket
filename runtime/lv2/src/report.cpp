@@ -264,8 +264,9 @@ std::string rsx_text(Kernel& kernel)
     const char* where = st.fifo_location == rsx::FifoLocation::Local ? "local memory"
         : st.fifo_location == rsx::FifoLocation::Io                  ? "IO"
                                                                      : "IO, the default";
-    std::string out = std::format("RSX: FIFO get {:#010x}, put {:#010x} ({}), {} words processed, {}, {}{}\n", st.get,
-        st.put, where, st.words, count(st.flips, "flip"), count(st.failures, "failure"),
+    std::string out = std::format("RSX: FIFO get {:#010x}, put {:#010x} ({}), {} words processed, {}, {}, {} skipped "
+                                  "by conditional rendering{}\n", st.get, st.put, where, st.words, count(st.flips, "flip"),
+        count(st.failures, "failure"), count(st.conditional_skips, "draw"),
         st.running ? "" : "; the RSX thread is not running");
     switch (st.block) {
     case Block::Semaphore:

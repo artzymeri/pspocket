@@ -102,6 +102,10 @@ void Rsx::m_begin_end(u32 reg, u32 value)
 
     const u32 begin_prim = static_cast<u32>(state_.draw.primitive);
     if (begin_prim == 0 || begin_prim > 10 || state_.draw.empty()) return;
+    if (!render_enabled_) { // conditional rendering: the report said nothing passed
+        conditional_skips_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     backend_.draw(state_);
 }
 
@@ -282,12 +286,16 @@ void Rsx::m_get_report(u32 reg, u32 value)
         return;
     }
     u32 result = 0;
+    bool later = false; // the backend writes the value when the GPU has counted
     switch (type) {
     case reports::kZpassPixelCount:
-        fail(FailKind::Unsupported, reg,
-            std::format("NV4097_GET_REPORT: occlusion queries (ZPASS_PIXEL_CNT) are not implemented; reporting {}",
-                config_.fake_zpass_count));
-        result = config_.fake_zpass_count;
+        later = backend_.report_zpass(*ea + 8);
+        if (!later) {
+            fail(FailKind::Unsupported, reg,
+                std::format("NV4097_GET_REPORT: this backend does not count occlusion (ZPASS_PIXEL_CNT); reporting {}",
+                    config_.fake_zpass_count));
+            result = config_.fake_zpass_count;
+        }
         break;
     case reports::kZcullStats:
     case reports::kZcullStats1:
@@ -299,7 +307,7 @@ void Rsx::m_get_report(u32 reg, u32 value)
     }
     if (config_.sync_on_label) backend_.sync();
     ps_write64(base(), *ea, timestamp_ns());
-    write32(*ea + 8, result);
+    if (!later) write32(*ea + 8, result);
     write32(*ea + 12, 0);
 }
 
@@ -308,7 +316,10 @@ void Rsx::m_clear_report_value(u32 reg, u32 value)
     if (value != reports::kZpassPixelCount && value != reports::kZcullStats) {
         fail(FailKind::Unsupported, reg, std::format("NV4097_CLEAR_REPORT_VALUE: bad type {}", value));
     }
+    if (value == reports::kZpassPixelCount) backend_.clear_zpass();
 }
+
+void Rsx::m_zpass_pixel_count_enable(u32, u32 value) { backend_.set_zpass_counting(value != 0); }
 
 void Rsx::m_notify(u32, u32)
 {
@@ -366,10 +377,20 @@ void Rsx::m_wait_for_idle(u32, u32) { backend_.sync(); }
 void Rsx::m_set_render_enable(u32 reg, u32 value)
 {
     // RPCS3 nv4097.cpp set_render_mode: 1 = render unconditionally, 2 = render if the report at offset is nonzero.
+    // The report is read when the method runs: occlusion results arrive once the GPU has counted (D-102), so a query
+    // issued in the same frame decides from its previous result, a frame late (RPCS3 defers the evaluation instead).
     const u32 mode = value >> 24;
-    if (mode == 1) return;
+    if (mode == 1) {
+        render_enabled_ = true;
+        return;
+    }
     if (mode == 2) {
-        fail(FailKind::Unsupported, reg, "NV4097_SET_RENDER_ENABLE: conditional rendering is not implemented; drawing unconditionally");
+        const auto ea = translate(value & 0xffffff, state_.regs[m::NV4097_SET_CONTEXT_DMA_REPORT], 16);
+        if (!ea) {
+            fifo_error(std::format("NV4097_SET_RENDER_ENABLE: bad report offset {:#x}", value & 0xffffff));
+            return;
+        }
+        render_enabled_ = read32(*ea + 8) != 0;
         return;
     }
     fail(FailKind::Unsupported, reg, std::format("NV4097_SET_RENDER_ENABLE: unknown render mode {}", mode));

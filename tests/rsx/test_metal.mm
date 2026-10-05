@@ -7,10 +7,12 @@
 
 #import <Metal/Metal.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <random>
+#include <thread>
 
 #include "pspocket/core/log.hpp"
 #include "pspocket/rsx/metal/metal_backend.hpp"
@@ -1406,6 +1408,138 @@ TEST_CASE("metal e2e: depth tiles side by side in one atlas stay apart, each rea
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         const u8 v = tile == 0 ? 0x40 : 0xbf;
         CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{v, v, v, v});
+    }
+}
+
+namespace {
+
+// The value word of report `index` once the GPU has written it (occlusion reports arrive from a completion handler).
+u32 wait_report(E2E& e, u32 index, u32 previous)
+{
+    const u32 addr = e.config.layout.report_addr(index) + 8;
+    for (int i = 0; i < 1000; i++) {
+        const u32 v = __atomic_load_n(reinterpret_cast<const u32*>(e.mem.host(addr)), __ATOMIC_ACQUIRE);
+        if (ps_bswap32(v) != previous) return ps_bswap32(v);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return previous;
+}
+
+} // namespace
+
+TEST_CASE("metal e2e: occlusion queries count the samples that pass, and conditional rendering reads them (D-102)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    for (u32 i = 0; i < 2; i++) ps_write32(e.mem.base(), e.config.layout.report_addr(i) + 8, 0xDEADBEEF);
+
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    b.method(m::NV4097_SET_CONTEXT_DMA_REPORT, loc::kDmaReportLocal);
+    // Report 0: the triangle's samples; report 1: a query with no draw.
+    b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+    b.method(m::NV4097_CLEAR_REPORT_VALUE, reports::kZpassPixelCount);
+    draw_triangle(b);
+    b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x00);
+    b.method(m::NV4097_CLEAR_REPORT_VALUE, reports::kZpassPixelCount);
+    b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x10);
+    b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    e.backend->sync();
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().occlusion_reports == 2);
+    // The triangle's pixels, counted from the target.
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    u32 covered = 0;
+    for (u32 y = 0; y < kH; y++)
+        for (u32 x = 0; x < kW; x++) covered += guest_pixel(e, kSurfaceOffset, x, y) != std::array<u8, 4>{0, 0, 0, 0};
+    CHECK(covered > 1000);
+    CHECK(wait_report(e, 0, 0xDEADBEEF) == covered);
+    CHECK(wait_report(e, 1, 0xDEADBEEF) == 0);
+
+    // Conditional rendering: a draw under report 1 (zero) is skipped, one under report 0 runs.
+    auto c = e.at(b.offset());
+    setup_surface(c, kSurfaceB);
+    c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    c.method(m::NV4097_SET_RENDER_ENABLE, (2u << 24) | 0x10);
+    draw_triangle(c);
+    c.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.rsx->status().conditional_skips == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceB, 32, 48) == std::array<u8, 4>{0, 0, 0, 0});
+    auto d = e.at(c.offset());
+    setup_surface(d, kSurfaceB);
+    d.method(m::NV4097_SET_RENDER_ENABLE, (2u << 24) | 0x00);
+    draw_triangle(d);
+    d.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
+    REQUIRE(e.submit(d) == Rsx::RunStatus::Idle);
+    CHECK(e.rsx->status().conditional_skips == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceB, 32, 48) != std::array<u8, 4>{0, 0, 0, 0});
+}
+
+TEST_CASE("metal e2e: a swizzled 3D texture samples the slice its coordinate's z selects")
+{
+    // GTA V's first mission samples a 64x64x32 R5G6B5 swizzled volume. Here 4x4x4: red = 8x, green = 16y, blue = 8z.
+    REQUIRE_METAL();
+    for (const u32 slice : {1u, 3u}) {
+        INFO(std::format("slice {}", slice));
+        E2E e;
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        const float uv[3][2] = {{0.f, 1.f}, {1.f, 1.f}, {0.5f, 0.f}};
+        constexpr u32 kUv4Offset = 0x1A0000, kVolume = 0x1B0000;
+        for (u32 v = 0; v < 3; v++) {
+            e.put_local_f(kUv4Offset + v * 16 + 0, uv[v][0]);
+            e.put_local_f(kUv4Offset + v * 16 + 4, uv[v][1]);
+            e.put_local_f(kUv4Offset + v * 16 + 8, (slice + 0.5f) / 4.f);
+            e.put_local_f(kUv4Offset + v * 16 + 12, 1.f);
+        }
+        for (u32 z = 0; z < 4; z++)
+            for (u32 y = 0; y < 4; y++)
+                for (u32 x = 0; x < 4; x++) {
+                    u8* p = e.mem.host(PS_MEM_RSX_LOCAL_BASE + kVolume + morton_index_3d(x, y, z, 2, 2, 2) * 2);
+                    ps_st16(p, static_cast<u16>(((8 * x) << 11) | ((16 * y) << 5) | (8 * z)));
+                }
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 8, static_cast<u32>(VertexType::F) | (4u << 4) | (16u << 8));
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 8, kUv4Offset);
+        b.method(m::NV4097_SET_TEXTURE_OFFSET, {
+            kVolume,
+            (loc::kLocal + 1) | (1u << 3) | (3u << 4) | (tex::R5G6B5 << 8) | (1u << 16), // 3D, swizzled
+            3u | (3u << 8) | (3u << 16),
+            (1u << 31),
+            tex::kRemapIdentity,
+            (1u << 16) | (1u << 24), // nearest
+            (4u << 16) | 4u,
+            0,
+        });
+        b.method(m::NV4097_SET_TEXTURE_CONTROL3, 4u << 20); // depth 4
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        // Pixel (32, 48) samples texel (2, 3): red 16, green 48 (expanded as RPCS3 does), blue 8 * slice.
+        const auto expand5 = [](u32 v) { return static_cast<u8>((v * 527 + 23) >> 6); };
+        const auto expand6 = [](u32 v) { return static_cast<u8>((v * 259 + 33) >> 6); };
+        CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, expand5(16), expand6(48), expand5(8 * slice)});
     }
 }
 

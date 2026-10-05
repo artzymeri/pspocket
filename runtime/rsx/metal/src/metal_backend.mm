@@ -7,6 +7,8 @@
 #include <cstring>
 #include <format>
 
+#include <unordered_set>
+
 #include "kernels.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/rsx/gcm.hpp"
@@ -104,12 +106,14 @@ bool MetalBackend::Impl::init()
                                                            error:&error];
     color_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_color_to_texture"]
                                                            error:&error];
+    decode3d_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_decode_texture3d"]
+                                                              error:&error];
     MTLRenderPipelineDescriptor* blit = [MTLRenderPipelineDescriptor new];
     blit.vertexFunction = [kernels newFunctionWithName:@"rsx_fullscreen_vs"];
     blit.fragmentFunction = [kernels newFunctionWithName:@"rsx_blit_fs"];
     blit.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     blit_pipeline = [device newRenderPipelineStateWithDescriptor:blit error:&error];
-    if (!decode_pipeline || !read_pipeline || !depth_pipeline || !color_pipeline || !blit_pipeline) {
+    if (!decode_pipeline || !read_pipeline || !depth_pipeline || !color_pipeline || !decode3d_pipeline || !blit_pipeline) {
         PS_LOG_ERROR(kChan, "backend pipelines failed: {}", error ? error.localizedDescription.UTF8String : "?");
         return false;
     }
@@ -145,6 +149,13 @@ bool MetalBackend::Impl::init()
     for (u32 face = 0; face < 6; face++) {
         [dummy_cube replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:face withBytes:&zero bytesPerRow:4 bytesPerImage:4];
     }
+    MTLTextureDescriptor* vd = [MTLTextureDescriptor new];
+    vd.textureType = MTLTextureType3D;
+    vd.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    vd.width = vd.height = vd.depth = 1;
+    dummy_volume = [device newTextureWithDescriptor:vd];
+    [dummy_volume replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&zero bytesPerRow:4
+                  bytesPerImage:4];
 
     frame_event = [device newSharedEvent];
     for (u32 i = 0; i < std::max<u32>(config.frames_in_flight, 1); i++) {
@@ -183,6 +194,11 @@ id<MTLCommandBuffer> MetalBackend::Impl::render_buffer()
         render_cb = [queue commandBuffer];
         render_cb.label = @"rsx render";
         stats.command_buffers++;
+        // Its occlusion counters (D-102), zeroed: a pass only writes the counters it counted into.
+        visibility = [device newBufferWithLength:kVisibilitySlots * 8 options:MTLResourceStorageModeShared];
+        std::memset(visibility.contents, 0, kVisibilitySlots * 8);
+        visibility_next = 0;
+        pass_zpass_slot = -1;
     }
     return render_cb;
 }
@@ -208,11 +224,27 @@ void MetalBackend::Impl::submit(bool wait)
         [upload_cb commit];
         upload_cb = nil;
     }
+    // Occlusion reports (D-102): written when the render buffer that counted the last of their draws completes. The
+    // queue runs buffers in order, so the earlier buffers their other counters are in have completed too.
+    if (!pending_reports.empty()) {
+        auto reports = std::make_shared<std::vector<PendingReport>>(std::move(pending_reports));
+        pending_reports.clear();
+        u8* const guest = mem.base();
+        [render_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+            for (const PendingReport& r : *reports) {
+                u64 count = 0;
+                for (const VisibilitySlot& s : r.slots) count += static_cast<const u64*>(s.buffer.contents)[s.index];
+                const u32 value = static_cast<u32>(std::min<u64>(count, 0xFFFFFFFFull));
+                __atomic_store_n(reinterpret_cast<u32*>(guest + r.value_addr), ps_bswap32(value), __ATOMIC_RELEASE);
+            }
+        }];
+    }
     if (render_cb) {
         last = render_cb;
         transient.retire(render_cb);
         [render_cb commit];
         render_cb = nil;
+        visibility = nil;
     }
     if (last) last_committed = last;
     if (wait && last_committed) {
@@ -235,7 +267,17 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
     draw_targets = {};
     u32 width = si.clip_width, height = si.clip_height;
     if (width == 0 || height == 0) return false;
-    if (si.antialias != 0) unsupported(std::format("multisampled surfaces (AA mode {}) render with one sample", si.antialias));
+    if (si.antialias != 0) {
+        // Rendered with one sample at the clip size. A resolve that reads the target at its sample layout (twice as wide
+        // for AA mode 3, GTA V's 128x128 one) samples it stretched, and gets the pixel itself. Reported once per target,
+        // not on every draw (run 072: 360,000 failures in 170 s).
+        static std::unordered_set<u64> seen;
+        const u64 key = (u64{si.color[0].offset} << 8) | si.antialias;
+        if (seen.size() < 64 && seen.insert(key).second) {
+            unsupported(std::format("multisampled surface (AA mode {}) at colour offset {:#x}, {}x{}, renders with one "
+                                    "sample", si.antialias, si.color[0].offset, si.clip_width, si.clip_height));
+        }
+    }
     if (si.window_offset_x || si.window_offset_y) unsupported("NV4097_SET_WINDOW_OFFSET is ignored");
     const bool swizzled = si.type == 2;
 
@@ -330,7 +372,11 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
 {
     if (!pass_open) return nil;
     if (!pass_started) {
-        encoder = [render_buffer() renderCommandEncoderWithDescriptor:pass_desc];
+        id<MTLCommandBuffer> cb = render_buffer();
+        pass_desc.visibilityResultBuffer = visibility;
+        pass_zpass_slot = -1;
+        encoder_zpass_slot = -1;
+        encoder = [cb renderCommandEncoderWithDescriptor:pass_desc];
         encoder.label = @"rsx pass";
         pass_started = true;
         stats.render_passes++;
@@ -628,6 +674,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         const TextureInfo ti = state.fragment_texture(t);
         fo.texture_kind[t] = ti.cubemap && ti.dimension == 2 ? shader::TextureKind::Cube
             : ti.dimension == 1                               ? shader::TextureKind::Tex1D
+            : ti.dimension == 3                               ? shader::TextureKind::Tex3D
                                                               : shader::TextureKind::Tex2D;
         if (fo.texture_kind[t] == shader::TextureKind::Tex2D && is_shadow_texture(ti)) fo.texture_kind[t] = shader::TextureKind::Shadow2D;
         if (t < 10 && (state.texcoord_control(t) & 1)) fo.texcoord_2d_mask |= 1u << t;
@@ -689,12 +736,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                 rsx->translate(ti.offset, ti.location).value_or(0), ti.base_format(), ti.width, ti.height,
                 ti.enabled ? "" : " disabled", ti.enabled ? bind_source : "-");
         }
-        if (tex && tex.textureType == MTLTextureTypeCube && fo.texture_kind[t] == shader::TextureKind::Cube) {
-            bound[t] = tex;
-        } else if (tex && tex.textureType == MTLTextureType2D && fo.texture_kind[t] != shader::TextureKind::Cube) {
+        const shader::TextureKind kind = fo.texture_kind[t];
+        const MTLTextureType wanted = kind == shader::TextureKind::Cube ? MTLTextureTypeCube
+                                    : kind == shader::TextureKind::Tex3D ? MTLTextureType3D
+                                                                         : MTLTextureType2D;
+        if (tex && tex.textureType == wanted) {
             bound[t] = tex;
         } else {
-            bound[t] = fo.texture_kind[t] == shader::TextureKind::Cube ? dummy_cube : dummy_texture;
+            bound[t] = wanted == MTLTextureTypeCube ? dummy_cube : wanted == MTLTextureType3D ? dummy_volume : dummy_texture;
         }
     }
 
@@ -918,6 +967,20 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     skip_reason = "pipeline state";
     if (!pso) return skip("");
     id<MTLRenderCommandEncoder> enc = start_encoder();
+    // Occlusion counting (D-102): this pass's counter for the current query.
+    if (zpass_on) {
+        if (pass_zpass_slot < 0 && visibility_next < kVisibilitySlots) {
+            pass_zpass_slot = static_cast<s32>(visibility_next++);
+            zpass_slots.push_back({visibility, static_cast<u32>(pass_zpass_slot)});
+        }
+        if (pass_zpass_slot >= 0 && encoder_zpass_slot != pass_zpass_slot) {
+            [enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:static_cast<NSUInteger>(pass_zpass_slot) * 8];
+            encoder_zpass_slot = pass_zpass_slot;
+        }
+    } else if (encoder_zpass_slot >= 0) {
+        [enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+        encoder_zpass_slot = -1;
+    }
     [enc setRenderPipelineState:pso];
     [enc setDepthStencilState:depth_state_for(state)];
     const DepthStencilInfo ds = state.depth_stencil();
@@ -1150,6 +1213,22 @@ void MetalBackend::invalidate_memory(u32 addr, u32 size)
     for (auto& s : impl_->surfaces) {
         if (u64{s->address} < end && addr < u64{s->address} + s->bytes()) s->cpu_newer = true;
     }
+}
+
+void MetalBackend::set_zpass_counting(bool on) { impl_->zpass_on = on; }
+
+void MetalBackend::clear_zpass()
+{
+    impl_->zpass_slots.clear();
+    impl_->pass_zpass_slot = -1; // a new counter, even in the same pass
+}
+
+bool MetalBackend::report_zpass(u32 value_addr)
+{
+    if (!impl_->device) return false;
+    impl_->pending_reports.push_back({value_addr, impl_->zpass_slots});
+    impl_->stats.occlusion_reports++;
+    return true;
 }
 
 bool MetalBackend::flush_memory(u32 addr, u32 size, const char* why)

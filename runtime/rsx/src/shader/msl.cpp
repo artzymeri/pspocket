@@ -744,6 +744,15 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 const std::string uv = op == FpOp::TXP ? std::format("(({}).xy / ({}).w)", s0, s0) : std::format("({}).xy", s0);
                 const std::string ref = op == FpOp::TXP ? std::format("(({}).z / ({}).w)", s0, s0) : std::format("({}).z", s0);
                 e = std::format("rsx_shadow(t{}, s{}, {} * fp.tex_scale[{}].xy, {}, fp.tex_scale[{}])", t, t, uv, t, ref, t);
+            } else if (kind == TextureKind::Tex3D) {
+                // 3D textures (D-102): coord.xyz (TXP: / w); unnormalised coordinates scale x and y.
+                const std::string coord = op == FpOp::TXP ? std::format("(({}).xyz / ({}).w)", s0, s0) : std::format("({}).xyz", s0);
+                const std::string c3 = std::format("({} * float3(fp.tex_scale[{}].xy, 1.0))", coord, t);
+                switch (op) {
+                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, c3, s0); break;
+                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, c3, s0); break;
+                default: e = std::format("t{}.sample(s{}, {})", t, t, c3); break;
+                }
             } else if (kind == TextureKind::Cube) {
                 switch (op) {
                 case FpOp::TEX: e = std::format("t{}.sample(s{}, ({}).xyz)", t, t, s0); break;
@@ -855,7 +864,9 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         slot::kFsConstants, slot::kFsParams);
     for (u32 t = 0; t < 16; t++) {
         if (!(c.textures & (1u << t))) continue;
-        const char* type = opt.texture_kind[t] == TextureKind::Cube ? "texturecube<float>" : "texture2d<float>";
+        const char* type = opt.texture_kind[t] == TextureKind::Cube    ? "texturecube<float>"
+                         : opt.texture_kind[t] == TextureKind::Tex3D ? "texture3d<float>"
+                                                                     : "texture2d<float>";
         params += std::format(",\n    {} t{} [[texture({})]], sampler s{} [[sampler({})]]", type, t, t, t, t);
     }
     src += std::format("fragment rsx_fs_out {}({})\n{{\n", result.shader.entry, params);

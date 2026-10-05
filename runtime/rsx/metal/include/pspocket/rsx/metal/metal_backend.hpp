@@ -85,6 +85,7 @@ struct BackendStats {
     u64 readbacks = 0;       // GPU-to-CPU surface readbacks (expensive)
     u64 depth_conversions = 0; // depth buffers converted on the GPU for a texture that reads them (D-088)
     u64 color_conversions = 0; // colour targets converted on the GPU for a texture of another format (D-098)
+    u64 occlusion_reports = 0; // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) answered from the GPU's counters (D-102)
     u64 flips = 0;
     u64 command_buffers = 0;
 };
@@ -109,6 +110,9 @@ public:
     void sync() override;
     void invalidate_memory(u32 addr, u32 size) override;
     bool flush_memory(u32 addr, u32 size, const char* why = "a memory read") override;
+    void set_zpass_counting(bool on) override;
+    void clear_zpass() override;
+    bool report_zpass(u32 value_addr) override;
 
     const BackendStats& stats() const;
 

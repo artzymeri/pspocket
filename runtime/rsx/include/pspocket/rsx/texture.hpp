@@ -72,15 +72,21 @@ struct TextureLevel {
     u32 pitch = 0;               // bytes per row of blocks in memory
     u32 rows = 0;                // rows of blocks in memory (incl. border rows)
     u32 border = 0;              // border texels on each side (0, 1 or 4)
-    u32 size = 0;                // bytes occupied by the level
+    u32 size = 0;                // bytes occupied by the level (all its slices)
     // Swizzled images: the Morton-ordered power-of-two area, in blocks (incl. border).
     u32 swizzle_width = 0, swizzle_height = 0;
+    // 3D textures: the level's slices, one after another (linear), or in the Morton order with x, y and z
+    // interleaved over swizzle_depth (swizzled; RPCS3 convert_linear_swizzle_3d).
+    u32 depth = 1;
+    u32 swizzle_depth = 1;
+    u32 slice_bytes() const { return pitch * rows; }
 };
 
 struct TextureLayout {
     const TextureFormatInfo* format = nullptr;
     bool swizzled = false;
     bool cubemap = false;
+    bool volume = false; // a 3D texture
     u32 faces = 1;
     u32 mips = 1;
     u32 total_size = 0;
@@ -90,7 +96,7 @@ struct TextureLayout {
 // Mip levels the hardware samples: min(requested, full chain) (RSXTexture.cpp get_exact_mipmap_count).
 u32 texture_mip_count(const TextureInfo& t, const TextureFormatInfo& fmt);
 
-// Guest memory layout of a texture. Fails (nullopt + reason) for unknown formats, 3D textures and zero sizes.
+// Guest memory layout of a texture. Fails (nullopt + reason) for unknown formats, compressed 3D textures and zero sizes.
 std::optional<TextureLayout> compute_texture_layout(const TextureInfo& t, std::string* why = nullptr);
 
 // Morton (Z-order) index used by RSX swizzled textures and surfaces: x and y bits interleaved from bit 0 (x first)
@@ -111,6 +117,32 @@ constexpr u32 morton_index(u32 x, u32 y, u32 log2_w, u32 log2_h)
             log2_h--;
         }
         if (!log2_w && !log2_h) break;
+    }
+    return offset;
+}
+
+// The 3D form: x, y and z bits interleaved in that order while each has bits left (RPCS3 image_utils.hpp
+// calculate_z_index for 3D textures).
+constexpr u32 morton_index_3d(u32 x, u32 y, u32 z, u32 log2_w, u32 log2_h, u32 log2_d)
+{
+    u32 offset = 0, shift = 0;
+    while (x | y | z) {
+        if (log2_w) {
+            offset |= (x & 1) << shift++;
+            x >>= 1;
+            log2_w--;
+        }
+        if (log2_h) {
+            offset |= (y & 1) << shift++;
+            y >>= 1;
+            log2_h--;
+        }
+        if (log2_d) {
+            offset |= (z & 1) << shift++;
+            z >>= 1;
+            log2_d--;
+        }
+        if (!log2_w && !log2_h && !log2_d) break;
     }
     return offset;
 }
