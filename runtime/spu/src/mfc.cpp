@@ -185,6 +185,10 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     } else {
         ls_copy(ctx->ls, lsa, mem, size, is_get(cmd));
         if (is_get(cmd)) {
+            // The GET's loads are done before any later one (D-130): an SPU that GETs a flag, waits for it and then GETs
+            // the data the flag announces must not have read the data first (ARM reorders loads; the MFC's GET
+            // completed before the SPU looked).
+            std::atomic_thread_fence(std::memory_order_acquire);
             if (ctx->program || ctx->home) drop_overwritten_programs(ctx, lsa, size);
             observe_get(ctx, lsa, eal, size); // code a program loads itself (D-079)
         }

@@ -11,8 +11,10 @@
 //   failure releases with -1 (net 0: nothing was written, other reservations stay valid). ps_res_notify_write adds
 //   2, which keeps the parity, so the lock holder's release still lands on an even value and no bump is lost.
 // - Snapshots (ps_res_acquire) are seqlock reads: version (acquire), 16 relaxed 8-byte loads, acquire fence,
-//   version again. A store in progress (odd) or one that completed in between (changed) makes the reader retry,
-//   so a snapshot never contains half of a conditional store.
+//   version again and the 16 words again. A store in progress (odd) or one that completed in between (changed) makes
+//   the reader retry, so a snapshot never contains half of a conditional store; a second read of different bytes
+//   (plain stores landed during the first) retries too, so a snapshot never shows a plain store without the stores
+//   its writer ordered before it (D-130).
 // - Plain guest stores don't take the lock. Conditional stores therefore compare the whole line with the
 //   snapshot (catching plain stores that happened before) and then write each changed 8-byte word with a CAS. A
 //   CAS that fails means a plain store hit that word after the comparison: the bytes it changed are kept and ours
@@ -75,13 +77,6 @@ inline Bucket& bucket_of(u32 index) { return g_buckets[index & (kBuckets - 1)]; 
 inline u64* line_words(u8* base, u32 addr) { return reinterpret_cast<u64*>(base + PS_RES_LINE_ADDR(addr)); }
 
 inline u64 load_word(const u64* p) { return __atomic_load_n(p, __ATOMIC_RELAXED); }
-
-inline void copy_line_out(void* out, const u64* line)
-{
-    u64 tmp[kWords];
-    for (u32 i = 0; i < kWords; i++) tmp[i] = load_word(line + i);
-    std::memcpy(out, tmp, PS_RES_LINE_SIZE);
-}
 
 inline bool line_equals(const u64* line, const u64* expected)
 {
@@ -193,9 +188,18 @@ extern "C" uint64_t ps_res_acquire(uint8_t* base, uint32_t addr, void* out128)
     for (;;) {
         const u64 v1 = slot.version.load(std::memory_order_acquire);
         if (!(v1 & 1)) {
-            copy_line_out(out128, line);
+            u64 snap[kWords];
+            for (u32 i = 0; i < kWords; i++) snap[i] = load_word(line + i);
             std::atomic_thread_fence(std::memory_order_acquire);
-            if (slot.version.load(std::memory_order_relaxed) == v1) return v1;
+            // Plain stores don't move the version, and the 16 loads are not ordered among themselves: a line read while
+            // the PPU writes it (new commands, lwsync, then the word that publishes them) could hold the last store next
+            // to older values of the ones before it. A second read after the fence that finds the same bytes makes the
+            // snapshot one the writer's order allows: a store seen in the first read has the stores ordered before it
+            // visible to the second (D-130).
+            if (slot.version.load(std::memory_order_relaxed) == v1 && line_equals(line, snap)) {
+                std::memcpy(out128, snap, PS_RES_LINE_SIZE);
+                return v1;
+            }
         }
         backoff(spins);
     }

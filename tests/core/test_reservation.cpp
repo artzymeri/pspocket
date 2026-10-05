@@ -369,6 +369,46 @@ TEST_CASE("reservation: GETLLAR/PUTLLC line updates are atomic and never torn", 
     for (u32 i = 0; i < PS_RES_LINE_SIZE; i += 8) CHECK(ps_read64(base, line + i) == expected);
 }
 
+TEST_CASE("reservation: a line snapshot never shows a plain writer's last store without the ones before it (D-130)",
+    "[reservation][stress]")
+{
+    // The PPU appends job chain commands with plain stores: the new commands, a release fence, then the word that
+    // makes them visible. A snapshot (GETLLAR, the job chain's command fetch) read while it writes must not hold that
+    // word's new value next to older values of the words written before it, whichever end of the line it is at.
+    Arena a;
+    u8* base = a.base();
+    for (const bool flag_last : {true, false}) {
+        INFO((flag_last ? "the flag after the data" : "the flag before the data"));
+        const u32 line = kArena + (flag_last ? 0x6000 : 0x6080);
+        const u32 flag = flag_last ? 15 : 0;
+        std::atomic<bool> stop{false};
+        std::atomic<u64> torn{0}, snaps{0};
+        std::thread writer([&] {
+            u64* words = reinterpret_cast<u64*>(base + line);
+            for (u64 i = 1; !stop.load(std::memory_order_relaxed); i++) {
+                for (u32 w = 0; w < 16; w++)
+                    if (w != flag) __atomic_store_n(&words[w], i, __ATOMIC_RELAXED);
+                std::atomic_thread_fence(std::memory_order_release); // lwsync
+                __atomic_store_n(&words[flag], i, __ATOMIC_RELAXED);
+            }
+        });
+        alignas(16) u8 snap[PS_RES_LINE_SIZE];
+        const Deadline deadline(std::min(stress_seconds(), 0.5));
+        while (!deadline.passed()) {
+            ps_res_acquire(base, line, snap);
+            u64 w[16];
+            std::memcpy(w, snap, sizeof w);
+            for (u32 k = 0; k < 16; k++)
+                if (w[k] < w[flag]) torn++;
+            snaps++;
+        }
+        stop = true;
+        writer.join();
+        CHECK(snaps.load() > 0);
+        CHECK(torn.load() == 0);
+    }
+}
+
 TEST_CASE("reservation: lines that share a version slot only cause retries", "[reservation][stress]")
 {
     Arena a;

@@ -2009,6 +2009,21 @@ with it).
 - Test: three draws in one batch, the constant changed between the first two and untouched before the third, each
   renders its own colour.
 
+## D-130 · 2026-10-05 · A line snapshot reads the line twice: a plain writer's stores are seen in their order
+
+The iPhone stopped a minute into the first mission with the new build (D-127 to D-129): the EDGE/GFX job chain took
+a JOB whose descriptor at 0x102f5e00 held vertex-like data and failed with CELL_SPURS_JOB_ERROR_NUM_CACHE (the chain
+halts on errors). The PPU appends commands with plain stores: the new commands, lwsync, then the word over the
+jump-to-self that publishes them. The job chain reads its 16 commands with ps_res_acquire, whose seqlock catches
+conditional stores only; its 16 loads are not ordered among themselves, so it could take the new first command next
+to the previous lap's commands after it, a JOB of a descriptor slot since reused. The Cell's GETLLAR reads the line
+whole. Now ps_res_acquire reads the line again after its acquire fence and retries until both reads agree: a store
+the first read saw has every store its writer ordered before it visible to the second. Plain GETs end with an
+acquire fence for the same reason: an SPU that GETs a flag and then the data it announces reads them in that order.
+- Test: a writer fills a line (the data, a release fence, then the flag word, at either end of the line) while
+  snapshots are taken: none may hold the flag's value next to an older value of the data. Without the second read it
+  fails at both ends on the M4 (the loads do reorder).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
