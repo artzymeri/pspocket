@@ -9,8 +9,9 @@ import UIKit
 /// controller (DualShock 4, DualSense, ...) through GameController, else the on-screen buttons.
 ///
 /// Documents layout (Files > On My iPhone > PSPocket):
-///   game/<TITLE_ID>/EBOOT.elf  the game's executable, decrypted here from the disc's EBOOT.BIN when the disc is
-///                              picked (D-121), or pushed from the Mac (`scripts/ios.sh push-game`)
+///   game/<TITLE_ID>/EBOOT.elf  the game's executable pushed from the Mac (`scripts/ios.sh push-game`); one decrypted
+///                              here from the disc when it is picked (D-121) goes to Library/Application Support/
+///                              pspocket-games/<TITLE_ID>/EBOOT.elf
 ///   dev_flash/                 system files the game loads itself, from the user's firmware (D-067)
 ///   hdd0/                      the game's /dev_hdd0: game data, saves, trophies
 ///   game.log                   the last run's log
@@ -106,10 +107,17 @@ final class GameModel {
         }
     }
 
+    /// Where executables decrypted on the phone go: a folder the app makes itself. Documents/game/ was made by the
+    /// Mac's copies (`scripts/ios.sh push-game`), and the app may not write in it ("Permission denied").
+    static var decryptedGames: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("pspocket-games")
+    }
+
     /// The disc's executable decrypted on the phone, with the keys the app carries (D-121), into
-    /// Documents/game/<TITLE_ID>/EBOOT.elf: then any disc picked here can boot.
+    /// Library/Application Support/pspocket-games/<TITLE_ID>/EBOOT.elf: then any disc picked here can boot.
     private func decryptExecutable(isoPath: String, titleID: String, for url: URL) {
-        let folder = Self.documents.appendingPathComponent("game").appendingPathComponent(titleID)
+        let folder = Self.decryptedGames.appendingPathComponent(titleID)
         let elf = folder.appendingPathComponent("EBOOT.elf")
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         decrypting = true
@@ -125,11 +133,15 @@ final class GameModel {
         }
     }
 
-    /// The decrypted executable for the picked disc: Documents/game/<TITLE_ID>/EBOOT.elf, else Documents/game/EBOOT.elf.
+    /// The decrypted executable for the picked disc: Documents/game/<TITLE_ID>/EBOOT.elf (pushed from the Mac), else
+    /// the one decrypted here, else Documents/game/EBOOT.elf.
     var executableURL: URL? {
         let game = Self.documents.appendingPathComponent("game")
         var candidates: [URL] = []
-        if let titleID { candidates.append(game.appendingPathComponent(titleID).appendingPathComponent("EBOOT.elf")) }
+        if let titleID {
+            candidates.append(game.appendingPathComponent(titleID).appendingPathComponent("EBOOT.elf"))
+            candidates.append(Self.decryptedGames.appendingPathComponent(titleID).appendingPathComponent("EBOOT.elf"))
+        }
         candidates.append(game.appendingPathComponent("EBOOT.elf"))
         return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
     }
