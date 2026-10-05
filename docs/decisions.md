@@ -1891,7 +1891,9 @@ is replaced.
   the checkout beside this one) into `build/host/recomp/common/generated/self_keys.cpp`, which the host build and the
   iOS app compile. Without RPCS3's source the table is empty and decrypting says so. The script never prints a key.
 - `ps_disc_decrypt_executable` reads PS3_GAME/USRDIR/EBOOT.BIN from the disc image and writes the ELF (whole or not
-  at all). The app calls it when a disc is picked and Documents/game/<TITLE_ID>/EBOOT.elf is missing, showing
+  at all). Its folder is made from the deepest one that exists: on the phone `create_directories` did not make
+  game/BLES00158/ (iOS's sandbox does not let the app look above its container), and the first try said "cannot
+  write"; errors now carry the system's reason. The app calls it when a disc is picked and Documents/game/<TITLE_ID>/EBOOT.elf is missing, showing
   "Decrypting the game's EBOOT.BIN"; `ps3disc --decrypt IMAGE OUT.elf` on the Mac; `scripts/translate-game.sh` no
   longer needs `--elf`.
 - Check: GTA V's EBOOT.BIN decrypts in 0.4 s to an ELF byte for byte the one decrypted before (sha-256 8cad8baa...);
@@ -1916,6 +1918,17 @@ stale memory under it. A target that lies inside a larger colour target with its
 - Test: a child cleared inside a cleared parent: the parent sampled as a texture shows the child where it lies and
   itself beside it, and reads back so; the parent written over part of the child, then the child drawn again: the
   child had taken its place back first.
+
+## D-123 · 2026-10-05 · A FIFO reset stops the reader before its next word
+
+`sys_rsx_context_attribute(0x001)` sets get and put. The RSX applied it at the start of its next batch (up to 4096
+words), and in the meantime read on at the old get against the new put: past the old put's stretch, into stale
+words, which it executed until the batch ended (a stale label write is enough to hang the game). Now the reset is
+flagged first and put published after it with a release store, and the reader checks the flag after each read of
+put: a reader that sees the new put stops before reading a word at the old get. Each reset is logged ("FIFO set").
+In the Mac's first-mission walk GTA V does not reset the FIFO; whether it does at the iPhone's freeze (the switch to
+Trevor) the next phone log shows.
+- Test: the game moves the FIFO at the first clear of a stream of three: the other two never run.
 
 ## Open decisions (plan section 14)
 

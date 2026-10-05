@@ -198,11 +198,15 @@ void Rsx::set_fifo_pointers(u32 get, u32 put)
         PS_LOG_INFO(kChan, "FIFO set to unmapped IO offset {:#x}: the push buffer is in local memory", get);
     }
 
-    // Both registers are written at once, as RPCS3 does (RSXThread.cpp, new_get_put).
-    ps_write32(mem_.base(), config_.layout.put_addr(), put);
-    ps_write32(mem_.base(), config_.layout.get_addr(), get);
+    // Both registers are written at once, as RPCS3 does (RSXThread.cpp, new_get_put). The reset is flagged first and
+    // put published after it with release: a reader that sees the new put sees the flag, and stops before it reads a
+    // word at the old get against the new put (D-123: up to a batch of stale words past the old put otherwise).
+    PS_LOG_INFO(kChan, "FIFO set: get {:#x}, put {:#x} (it was at get {:#x}, put {:#x})", get, put,
+        get_.load(std::memory_order_relaxed), read_put());
     pending_get_put_.store((u64{put} << 32) | get, std::memory_order_release);
     fifo_reset_.store(true, std::memory_order_release);
+    ps_write32(mem_.base(), config_.layout.get_addr(), get);
+    __atomic_store_n(reinterpret_cast<u32*>(mem_.base() + config_.layout.put_addr()), ps_bswap32(put), __ATOMIC_RELEASE);
     if (thread_.joinable() && std::this_thread::get_id() != thread_.get_id()) {
         notify();
         // The caller (an lv2 syscall) returns once the RSX has taken the new pointers.
@@ -464,6 +468,8 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
     for (u64 n = 0; n < max_words; n++) {
         u32 get = get_.load(std::memory_order_relaxed);
         const u32 put = read_put();
+        // A reset since this batch began: its pointers first, at the next step (D-123).
+        if (fifo_reset_.load(std::memory_order_acquire)) return RunStatus::Budget;
         if (get == put) return RunStatus::Idle;
         if (put != epoch_put_) { // the CPU submitted more commands (and wrote what they read before that)
             epoch_put_ = put;

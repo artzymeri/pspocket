@@ -233,6 +233,25 @@ TEST_CASE("a re-read passes the semaphore acquires the reader passed before the 
     REQUIRE(f.submit(next) == Rsx::RunStatus::Blocked);
 }
 
+TEST_CASE("a FIFO reset in the middle of a batch takes effect before the next word (D-123)")
+{
+    // The game sets get and put (sys_rsx_context_attribute 0x001) while the RSX is in a batch: the words after the
+    // reset point, past the old put's stretch, were read against the new put until the batch ended.
+    Fixture f;
+    auto old_stream = f.at(0);
+    old_stream.method(m::NV4097_CLEAR_SURFACE, 1).method(m::NV4097_CLEAR_SURFACE, 2).method(m::NV4097_CLEAR_SURFACE, 3);
+    auto fresh = f.at(0x2000);
+    fresh.method(m::NV4097_CLEAR_SURFACE, 9);
+    f.backend.on_clear = [&](u32 mask) {
+        if (mask == 1) f.rsx->set_fifo_pointers(0x2000, fresh.offset()); // the game moves the FIFO at the first clear
+    };
+    f.set_put(old_stream.offset());
+    for (int i = 0; i < 4 && f.rsx->run_until_idle(64) != Rsx::RunStatus::Idle; i++) {}
+    CHECK(f.backend.clears() == std::vector<u32>{1, 9});
+    CHECK(f.rsx->get() == fresh.offset());
+    CHECK(f.failures.empty());
+}
+
 TEST_CASE("an unmapped FIFO address is a FIFO error")
 {
     Fixture f;

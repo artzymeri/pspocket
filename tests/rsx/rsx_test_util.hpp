@@ -4,6 +4,7 @@
 // RSX local memory, the RSX context regions, and a backend that records what the front end asks of it.
 // Everything is synthetic: command buffers are built in code with CommandBuilder.
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,7 +35,12 @@ struct RecordingBackend : Backend {
 
     void attach(Rsx& r) override { rsx = &r; }
     void draw(const RsxState& s) override { events.push_back({Kind::Draw, 0, 0, s.draw, {}}); }
-    void clear(u32 mask, const RsxState&) override { events.push_back({Kind::Clear, mask, 0, {}, {}}); }
+    void clear(u32 mask, const RsxState&) override
+    {
+        events.push_back({Kind::Clear, mask, 0, {}, {}});
+        if (on_clear) on_clear(mask);
+    }
+    std::function<void(u32 mask)> on_clear; // what a test does at a clear, in the middle of the FIFO
     void flip(const FlipRequest& r, const RsxState&) override
     {
         events.push_back({Kind::Flip, r.buffer_id, static_cast<u32>(r.flip_index), {}, r.buffer});
