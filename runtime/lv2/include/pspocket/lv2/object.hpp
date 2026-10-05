@@ -272,4 +272,11 @@ WaitStatus park(Waiter& w, std::unique_lock<std::mutex>& lk, u64 timeout_us, Wai
 // Sleeps for `us` microseconds unless the wait is aborted. Returns false when aborted.
 bool sleep_us(Waiter& w, u64 us);
 
+class PpuThread;
+// A yield (usleep(0), sys_ppu_thread_yield). The PS3 yields to threads of the same priority, or returns at once and
+// the loop around it spins; here a spinning thread takes a core the others need (GTA V's render thread waits with
+// usleep(0): a sixth of a core, run 075). After 16 yields less than 50 us apart it sleeps 20 us, doubling up to
+// 200 us, until it goes longer than that between two yields. False when the thread is to exit.
+bool yield_wait(PpuThread& t);
+
 } // namespace pspocket::lv2

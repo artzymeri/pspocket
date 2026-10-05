@@ -42,6 +42,22 @@ TEST_CASE("lv2 time: usleep", "[lv2][time]")
     CHECK(elapsed_ms(t0) < 1000);
 }
 
+TEST_CASE("lv2 time: usleep(0) back to back sleeps a little after a run of yields", "[lv2][time]")
+{
+    // D-104: GTA V's render thread waits with usleep(0) in a loop. The first 16 are yields; after that each sleeps
+    // 20 us, doubling up to 200 us: 40 in a row take at least 20 + 40 + 80 + 160 + 20 * 200 us.
+    Fixture f;
+    Caller c(*f.kernel);
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 40; i++) REQUIRE(c.call(kUsleep, 0) == CELL_OK);
+    CHECK(elapsed_ms(t0) >= 4);
+    // A pause longer than that between two of them: a plain yield again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 4; i++) REQUIRE(c.call(kUsleep, 0) == CELL_OK);
+    CHECK(elapsed_ms(t0) < 2);
+}
+
 TEST_CASE("lv2 timer: periodic and one-shot timers send to their event queue", "[lv2][timer]")
 {
     Fixture f;

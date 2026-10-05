@@ -384,6 +384,10 @@ Rsx::RunStatus Rsx::step(u64 max_words)
         u32 get = get_.load(std::memory_order_relaxed);
         const u32 put = read_put();
         if (get == put) return RunStatus::Idle;
+        if (put != epoch_put_) { // the CPU submitted more commands (and wrote what they read before that)
+            epoch_put_ = put;
+            data_epoch_.fetch_add(1, std::memory_order_release);
+        }
 
         const auto ea = fifo_address(get);
         if (!ea) {
@@ -471,6 +475,7 @@ Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
             return Dispatch::Blocked;
         }
         block_reason_ = BlockReason::None;
+        data_epoch_.fetch_add(1, std::memory_order_release); // what its releaser wrote is for the commands after it
     }
 
     state_.regs[reg] = value;

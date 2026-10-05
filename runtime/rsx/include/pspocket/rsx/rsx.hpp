@@ -167,6 +167,11 @@ public:
         std::optional<u32> semaphore_addr;
         u32 semaphore_value = 0;
     };
+    // Advances whenever memory the commands read may have changed under them: the CPU moved put (it writes what the
+    // commands it submits read before submitting them), a semaphore acquire passed (its releaser wrote before
+    // releasing). A backend may trust what it checked during one epoch until the next (D-104).
+    u64 data_epoch() const { return data_epoch_.load(std::memory_order_acquire); }
+
     Status status() const;
 
     // Guest EA for (offset, location): location is 0/1 (CELL_GCM_LOCATION_LOCAL/MAIN) or a DMA context handle
@@ -298,6 +303,8 @@ private:
     std::atomic<u64> failures_{0};
     std::atomic<u64> flips_{0};
     std::atomic<u64> conditional_skips_{0};
+    std::atomic<u64> data_epoch_{0};
+    u32 epoch_put_ = ~0u;
     bool render_enabled_ = true; // NV4097_SET_RENDER_ENABLE: false while the report it names was zero (D-102)
     std::mutex fail_mutex_;
     std::unordered_set<std::string> reported_;

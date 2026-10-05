@@ -268,9 +268,9 @@ void _sys_ppu_thread_exit(PpuThread& t, u64 errorcode)
 
 // ------------------------------------------------------------------------------------------------- syscalls
 
-s32 sys_ppu_thread_yield(PpuThread&)
+s32 sys_ppu_thread_yield(PpuThread& t)
 {
-    std::this_thread::yield();
+    if (!yield_wait(t)) throw ThreadExit{};
     return CELL_OK;
 }
 

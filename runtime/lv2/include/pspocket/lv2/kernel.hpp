@@ -134,6 +134,12 @@ public:
     // lv2 directly, so a thread inside an HLE function is not in a syscall.
     std::atomic<u32> current_syscall{kNoSyscall};
 
+    // Yields back to back (usleep(0), sys_ppu_thread_yield) are a wait loop: after a run of them the thread sleeps a
+    // little, longer each time (yield_wait, D-104). The owning host thread only.
+    u64 last_yield_ns = 0;
+    u32 yield_streak = 0;
+    u32 yield_backoff_us = 0;
+
     s32 priority() const { return waiter.prio.load(std::memory_order_relaxed); }
 
 private:

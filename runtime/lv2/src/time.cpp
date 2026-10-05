@@ -248,8 +248,8 @@ Result sys_timer_disconnect_event_queue(PpuThread& t, u32 timer_id)
 
 Result sys_timer_usleep(PpuThread& t, u64 sleep_time)
 {
-    if (sleep_time == 0) {
-        std::this_thread::yield(); // usleep(0): games use it as a yield (RPCS3)
+    if (sleep_time == 0) { // usleep(0): games use it as a yield (RPCS3)
+        if (!yield_wait(t)) throw ThreadExit{};
         return CELL_OK;
     }
     if (!sleep_us(t.waiter, sleep_time)) throw ThreadExit{};

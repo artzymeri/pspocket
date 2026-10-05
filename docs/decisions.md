@@ -1558,6 +1558,24 @@ each spin takes a core the PPU threads need, two of the iPhone's six.
 - Run 074 (same scene, 140 s): 2.6 cores instead of 4.8 at the same 30 fps; 3.9 million empty polls per SPU instead of
   120 to 190 million, 1.2 to 1.4 s instead of 28 to 43 s.
 
+## D-104 · 2026-10-05 · Texture checks once per batch of commands; a faster content hash; PPU yields back off
+
+Run 075 sampled the threads at the 30 fps cap: the RSX thread was busy 967 samples in 1,364, 447 of them in
+WriteTracker::is_dirty, which hashes a texture's whole memory at every bind (the tracker's page protection mode is not
+wired: a host file read into a protected guest page fails rather than faults, so it stays off).
+- The RSX counts a data epoch: it advances when put moves (the CPU writes what the commands it submits read before
+  submitting them) and when a semaphore acquire passes (its releaser wrote first). The Metal backend's check epoch
+  also advances with the writes it and the RSX make to guest memory (write-backs, NV0039/NV3089 copies). A texture or
+  fragment program found clean is trusted for the rest of its check epoch.
+- content_hash runs FNV-1a's step in four lanes over 32-byte blocks (one lane waits on each multiply).
+- RSX thread: 583 busy samples in 1,400, is_dirty 70 (run 076); the process 2.2 cores instead of 2.6 at the same
+  30 fps.
+- usleep(0) and sys_ppu_thread_yield yield, but 16 within 50 us of each other start sleeps of 20 us, doubling up to
+  200 us, until the thread goes longer than that between two: GTA V's render thread waits with usleep(0) in a loop
+  (72 samples of its 163 busy yielding; 7 after).
+- Tests: a texture drawn twice in a batch decodes once, a CPU write before a new batch and an NV0039 copy inside a
+  batch are both seen (the copy fails without the backend's own-write epoch); usleep(0) back to back sleeps after 16.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -1543,6 +1543,57 @@ TEST_CASE("metal e2e: a swizzled 3D texture samples the slice its coordinate's z
     }
 }
 
+TEST_CASE("metal e2e: a texture is checked once per batch of commands, and again after the CPU or the RSX wrote it")
+{
+    // D-104: a texture found clean is trusted until the CPU submits more commands, a semaphore acquire passes, or the
+    // RSX itself writes guest memory. Each of those must still show new texels.
+    REQUIRE_METAL();
+    constexpr u32 kTex = 0x1B0000, kSource = 0x1C0000;
+    const auto fill = [](E2E& e, u32 offset, u32 argb) {
+        for (u32 i = 0; i < kW * kH; i++) ps_write32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + offset + i * 4, argb);
+    };
+    E2E e;
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    fill(e, kTex, 0xff102030);
+    fill(e, kSource, 0xff405060);
+    const auto draw = [&](CommandBuilder& b) {
+        setup_surface(b, kSurfaceOffset);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        bind_linear_texture(b, kTex, tex::A8R8G8B8, kW * 4);
+        draw_triangle(b);
+    };
+    const auto pixel = [&] {
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 48);
+    };
+    // Two draws in one batch: one decode, then a cache hit.
+    auto b = e.at(0);
+    draw(b);
+    draw(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(pixel() == std::array<u8, 4>{0xff, 0x10, 0x20, 0x30});
+    CHECK(e.backend->stats().textures_decoded == 1);
+    // The CPU rewrites the texture, then submits: the next batch sees it.
+    fill(e, kTex, 0xff708090);
+    auto c = e.at(b.offset());
+    draw(c);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(pixel() == std::array<u8, 4>{0xff, 0x70, 0x80, 0x90});
+    // In one batch: a draw, an NV0039 copy over the texture, a draw: the second sees the copy.
+    auto d = e.at(c.offset());
+    draw(d);
+    d.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaFrameBuffer, loc::kDmaFrameBuffer});
+    d.method(m::NV0039_OFFSET_IN, {kSource, kTex, kW * 4, kW * 4, kW * 4, kH, 0x101});
+    d.method(m::NV0039_BUFFER_NOTIFY, 0);
+    draw(d);
+    REQUIRE(e.submit(d) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(pixel() == std::array<u8, 4>{0xff, 0x40, 0x50, 0x60});
+}
+
 TEST_CASE("metal e2e: a vertex program samples a vertex texture (TXL, D-093)")
 {
     REQUIRE_METAL();

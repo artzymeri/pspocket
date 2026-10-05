@@ -208,8 +208,10 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     }
 
     FragmentProgramEntry& entry = fragment_programs[*ea];
+    const u64 epoch = check_epoch();
     const bool redecode = (state.dirty_bits & dirty::kFragmentProgram) || entry.program.instructions.empty() ||
-        tracker.is_dirty(entry.watch);
+        (entry.checked != epoch && tracker.is_dirty(entry.watch));
+    entry.checked = epoch;
     state.dirty_bits &= ~dirty::kFragmentProgram;
     if (redecode) {
         std::string why;

@@ -50,15 +50,26 @@ void WriteTracker::uninstall()
 
 u64 WriteTracker::content_hash(const u8* data, usize size)
 {
-    // FNV-1a over 8-byte words, then the tail: fast enough for a fallback, no dependency.
-    u64 h = 0xcbf29ce484222325ull;
+    // FNV-1a's step over 8-byte words in four independent lanes of 32-byte blocks (one lane waits on each multiply:
+    // the hash was half the RSX thread's time in run 075, D-104), then the tail.
+    constexpr u64 kPrime = 0x100000001b3ull;
+    u64 h0 = 0xcbf29ce484222325ull, h1 = 0x9e3779b97f4a7c15ull, h2 = 0xc2b2ae3d27d4eb4full, h3 = 0x165667b19e3779f9ull;
     usize i = 0;
+    for (; i + 32 <= size; i += 32) {
+        u64 w[4];
+        std::memcpy(w, data + i, 32);
+        h0 = (h0 ^ w[0]) * kPrime;
+        h1 = (h1 ^ w[1]) * kPrime;
+        h2 = (h2 ^ w[2]) * kPrime;
+        h3 = (h3 ^ w[3]) * kPrime;
+    }
+    u64 h = h0 ^ std::rotl(h1, 17) ^ std::rotl(h2, 31) ^ std::rotl(h3, 47);
     for (; i + 8 <= size; i += 8) {
         u64 w;
         std::memcpy(&w, data + i, 8);
-        h = (h ^ w) * 0x100000001b3ull;
+        h = (h ^ w) * kPrime;
     }
-    for (; i < size; i++) h = (h ^ data[i]) * 0x100000001b3ull;
+    for (; i < size; i++) h = (h ^ data[i]) * kPrime;
     return h ^ size;
 }
 

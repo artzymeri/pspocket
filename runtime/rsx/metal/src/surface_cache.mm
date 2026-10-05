@@ -388,6 +388,7 @@ bool MetalBackend::Impl::write_back_depth(Surface& s, const char* why)
             }
         }
     }
+    own_write();
     tracker.notify_write(s.address, s.bytes());
     s.gpu_newer = false;
     return true;
@@ -425,6 +426,7 @@ bool MetalBackend::Impl::write_back(Surface& s, const char* why)
     if (b8) {
         // One byte per pixel, as the Metal copy holds it (the shader's blue: surface_output_swizzle).
         for (u32 y = 0; y < s.height; y++) std::memcpy(mem.base() + s.address + y * s.pitch, &raw[y * s.width], s.width);
+        own_write();
         tracker.notify_write(s.address, s.bytes());
         s.gpu_newer = false;
         return true;
@@ -447,6 +449,7 @@ bool MetalBackend::Impl::write_back(Surface& s, const char* why)
                 }
             }
         }
+        own_write();
         tracker.notify_write(s.address, s.bytes());
         s.gpu_newer = false;
         return true;
@@ -477,6 +480,7 @@ bool MetalBackend::Impl::write_back(Surface& s, const char* why)
             }
         }
     }
+    own_write();
     tracker.notify_write(s.address, s.bytes());
     s.gpu_newer = false;
     return true;

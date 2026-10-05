@@ -100,6 +100,7 @@ struct CachedTexture {
     WriteTracker::Watch watch{};
     std::unordered_map<u32, id<MTLTexture>> views; // by encoded channel sources
     u64 last_used = 0;
+    u64 checked = ~0ull; // the check epoch (MetalBackend::Impl::check_epoch) it was last found clean in (D-104)
 };
 
 // ---- pipelines ----------------------------------------------------------------------------------------------------
@@ -125,6 +126,7 @@ struct FragmentProgramEntry {
     u32 address = 0;
     shader::FragmentProgram program;
     WriteTracker::Watch watch{};
+    u64 checked = ~0ull; // as CachedTexture::checked
 };
 
 // ---- the backend --------------------------------------------------------------------------------------------------
@@ -215,6 +217,21 @@ struct MetalBackend::Impl {
     bool pass_open = false;    // targets chosen (descriptor built)
     bool pass_started = false; // encoder created
     u32 pass_width = 0, pass_height = 0;
+
+    // The texture and program caches check guest memory (a content hash) at most once per check epoch, which advances
+    // with the RSX's data epoch and with the writes the RSX and this backend make to guest memory themselves (D-104).
+    u64 check_counter = 1;
+    u64 seen_data_epoch = 0;
+    u64 check_epoch()
+    {
+        const u64 d = rsx ? rsx->data_epoch() : 0;
+        if (d != seen_data_epoch) {
+            seen_data_epoch = d;
+            check_counter++;
+        }
+        return check_counter;
+    }
+    void own_write() { check_counter++; }
 
     // Caches
     std::vector<std::unique_ptr<Surface>> surfaces;

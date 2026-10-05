@@ -77,3 +77,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [072](072-gta5-occlusion-mac.md) | 2026-10-05 | fd3a099+ | M4 Mac, pspocket-boot --frames | Occlusion queries counted on the GPU; 361,371 RSX failures left |
 | [073](073-gta5-rsx-complete-mac.md) | 2026-10-05 | fd3a099+ | M4 Mac, pspocket-boot --frames | **One RSX failure in the run**: 3D textures, conditional rendering (D-102) |
 | [074](074-gta5-spu-backoff-mac.md) | 2026-10-05 | beddc3e+ | M4 Mac, pspocket-boot, top | SPU workers back off empty policy-module polls: **2.6 cores instead of 4.8** at the same 30 fps (D-103) |
+| [075](075-gta5-rsx-thread-mac.md) | 2026-10-05 | 8666ca9+ | M4 Mac, pspocket-boot, sample | The RSX thread's texture hashing and the render thread's yields (D-104): 2.2 cores at 30 fps |

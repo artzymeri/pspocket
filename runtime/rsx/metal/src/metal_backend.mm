@@ -1209,6 +1209,7 @@ void MetalBackend::invalidate_memory(u32 addr, u32 size)
 {
     // The RSX's own CPU copies: textures over that memory re-upload, surfaces reload from guest memory before use.
     impl_->tracker.notify_write(addr, size);
+    impl_->own_write();
     const u64 end = u64{addr} + size;
     for (auto& s : impl_->surfaces) {
         if (u64{s->address} < end && addr < u64{s->address} + s->bytes()) s->cpu_newer = true;

@@ -356,12 +356,14 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
 
     const u64 key = texture_key(t, *ea, false);
     CachedTexture* entry = nullptr;
+    const u64 epoch = check_epoch();
     if (auto it = textures.find(key); it != textures.end()) {
-        if (tracker.is_dirty(it->second->watch)) {
+        if (it->second->checked != epoch && tracker.is_dirty(it->second->watch)) {
             tracker.unwatch(it->second->watch);
             textures.erase(it);
         } else {
             entry = it->second.get();
+            entry->checked = epoch;
             stats.texture_cache_hits++;
         }
     }
@@ -373,6 +375,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             ok = false;
             return nil;
         }
+        entry->checked = epoch;
     }
     entry->last_used = tick;
     return sample_view(entry->texture, entry->views, texture_channel_sources(*entry->layout.format, t.remap));
