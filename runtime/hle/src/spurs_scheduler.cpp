@@ -232,7 +232,18 @@ void Worker::body()
         }
         const u64 writes = ctx.mem_writes;
         const auto t0 = Clock::now();
+        // The selection read the workload's state before its update of the line: a shutdown and a join may have come
+        // in between, and the game may be freeing the workload. The worker counts itself inside, then reads the state
+        // again (both sequentially consistent, as the join's read of the state and then of the count): either it sees
+        // the shutdown and leaves, or the join sees it inside and waits (D-136).
+        sched.inside[sel.wid].fetch_add(1, std::memory_order_seq_cst);
+        if (__atomic_load_n(sched.base + sched.spurs + wkl_off::state1 + sel.wid, __ATOMIC_SEQ_CST) !=
+            SPURS_WKL_STATE_RUNNABLE) {
+            sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst);
+            continue;
+        }
         const bool custom = run_workload(sel);
+        sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst);
         const u64 dt = ns(Clock::now() - t0);
         if (custom && ctx.mem_writes == writes) {
             sched.idle_poll_ns.fetch_add(dt, std::memory_order_relaxed);
@@ -532,6 +543,11 @@ void start_scheduler(SpursHost& host, lv2::Kernel& kernel, u32 spurs, Instance& 
 void stop_scheduler_of(Scheduler& scheduler) { scheduler.stop(); }
 
 void wake_workers(u32 spurs) { ps_res_notify_write(spurs, PS_RES_LINE_SIZE); }
+
+u32 workers_inside(const Scheduler& scheduler, u32 wid)
+{
+    return wid < CELL_SPURS_MAX_WORKLOAD ? scheduler.inside[wid].load(std::memory_order_seq_cst) : 0;
+}
 
 // _cellSpursSendSignal (RPCS3 cellSpurs.cpp; libsre's PPU side does the same on the 32-bit word): set the task's
 // signalled bit; if it was waiting and not yet signalled, signal its workload so a worker picks the taskset up.

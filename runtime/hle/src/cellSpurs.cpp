@@ -15,11 +15,13 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <format>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "guest.hpp"
 #include "spurs.hpp"
@@ -247,11 +249,18 @@ s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, 
     wid_out = wid;
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return error(CELL_SPURS_POLICY_MODULE_ERROR_AGAIN);
     ps_write32(base, spurs + wkl_off::enabled, enabled | (0x80000000u >> wid));
-    // RPCS3 ensure()s a free workload slot has no SPUs on it or switching to it.
-    if ((ps_read8(base, spurs + wkl_off::currentContention + wid) & 0xF) ||
-        (ps_read8(base, spurs + wkl_off::pendingContention + wid) & 0xF)) {
-        PS_FATAL(kChan, "add_workload: free workload {} of SPURS {:#010x} still has contention", wid, spurs);
+    // RPCS3 ensure()s a free workload slot has no SPUs on it or switching to it. A native worker that selected the
+    // slot's previous workload just before its join removed it counts itself on the slot until its next selection,
+    // which comes at once, since the workload is gone (spurs_scheduler.cpp; D-136): that is waited for, up to a second.
+    const auto has_contention = [&] {
+        return (__atomic_load_n(base + spurs + wkl_off::currentContention + wid, __ATOMIC_SEQ_CST) & 0xF) ||
+               (ps_read8(base, spurs + wkl_off::pendingContention + wid) & 0xF);
+    };
+    for (const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+         has_contention() && std::chrono::steady_clock::now() < end;) {
+        std::this_thread::yield();
     }
+    if (has_contention()) PS_FATAL(kChan, "add_workload: free workload {} of SPURS {:#010x} still has contention", wid, spurs);
 
     ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_PREPARING);
     ps_write8(base, spurs + wkl_off::status1 + wid, 0);
@@ -525,12 +534,14 @@ s32 shutdown_workload(u8* base, u32 spurs, u32 wid)
     if (state == SPURS_WKL_STATE_SHUTTING_DOWN || state == SPURS_WKL_STATE_REMOVABLE) return lv2::CELL_OK;
     // libsre also reads wklStatus2[wid] for workloads 0..15 (RPCS3 reads only wklStatus1).
     if (ps_read8(base, spurs + wkl_off::status1 + wid) || ps_read8(base, spurs + wkl_off::status2 + wid)) {
-        ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_SHUTTING_DOWN);
+        __atomic_store_n(base + spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_SHUTTING_DOWN, __ATOMIC_SEQ_CST);
         ps_write8(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, 0xFF);
         ps_write8(base, spurs + wkl_off::sysSrvMessage, 0xFF);
         return lv2::CELL_OK;
     }
-    ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_REMOVABLE);
+    // Sequentially consistent: a worker that selected the workload before this reads the state again after counting
+    // itself inside (spurs_scheduler.cpp), and a join reads the state and then that count (D-136).
+    __atomic_store_n(base + spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_REMOVABLE, __ATOMIC_SEQ_CST);
     const u8 event = ps_read8(base, spurs + wkl_off::event1 + wid);
     ps_write8(base, spurs + wkl_off::event1 + wid, static_cast<u8>(event | 1));
     if ((event & 0x12) && !(event & 1)) {
@@ -568,6 +579,148 @@ s32 cellSpursShutdownTaskset(PPUContext& ctx, u32 taskset)
         PS_FATAL(kChan, "cellSpursShutdownTaskset({:#x}): shutting down workload {} of SPURS {:#x} returned {:#x}; libsre "
             "(fw 4.92) asserts here and aborts the process", taskset, wid, spurs, static_cast<u32>(r));
     }
+    if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) r = error(CELL_SPURS_TASK_ERROR_STAT);
+    return r;
+}
+
+// cellSpursWaitForWorkloadShutdown's checks and order, as RPCS3 (cellSpurs.cpp) and libsre: NULL, ALIGN, INVAL, SRCH,
+// STAT. RPCS3 then waits on the workload's semaphore, which the shutdown's completion posts; the native scheduler marks
+// a shut-down workload removable at once (shutdown_workload), and a worker still inside it leaves after its current
+// job or task: the wait is for both (D-136), so the game may free what the workload used once a join returns. A
+// workload an SPU shut down (a job chain's error) becomes removable here once its last worker left. The PPU
+// thread sleeps 100 us at a time, as the thread's other waits, so a stop request still ends it. Not a second waiter's
+// STAT (RPCS3's wklSyncInfo x28): the native wait keeps no slot to be taken.
+s32 wait_for_workload_shutdown(PPUContext& ctx, u32 spurs, u32 wid)
+{
+    u8* base = guest_base(ctx);
+    if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    const bool second = (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0;
+    if (wid >= (second ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!(ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid))) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
+        PS_LOG_ERROR(kChan, "wait_for_workload_shutdown: SPURS2 workload {} is not implemented", wid);
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    }
+    std::shared_ptr<Scheduler> scheduler;
+    {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.instances.find(spurs); it != h.instances.end()) scheduler = it->second.scheduler;
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* const state = base + spurs + wkl_off::state1 + wid;
+    for (;;) {
+        // Removable, no worker inside, and none still counted on it: a worker gives its contention back at its next
+        // selection, a moment after it leaves (so a workload added in the slot next finds none).
+        const u8 now = __atomic_load_n(state, __ATOMIC_SEQ_CST);
+        const bool left = (!scheduler || workers_inside(*scheduler, wid) == 0) &&
+                          !(__atomic_load_n(base + spurs + wkl_off::currentContention + wid, __ATOMIC_SEQ_CST) & 0x0F);
+        if (now == SPURS_WKL_STATE_REMOVABLE && left) break;
+        if (now == SPURS_WKL_STATE_SHUTTING_DOWN && left) {
+            // The system service's step when the last SPU leaves a workload that shuts down (RPCS3
+            // spursSysServiceUpdateWorkload and spursSysServiceUpdateShutdownCompletionEvents): removable, and the
+            // completion bit in its event byte. Natively the waiter takes it: a job chain that halts on an error shuts
+            // its workload down from the SPU (spurs_jobchain.cpp), and no system service runs. Checked again after this
+            // store, so a worker that counted itself inside meanwhile is seen.
+            u8 expected = SPURS_WKL_STATE_SHUTTING_DOWN;
+            if (__atomic_compare_exchange_n(state, &expected, SPURS_WKL_STATE_REMOVABLE, false, __ATOMIC_SEQ_CST,
+                    __ATOMIC_SEQ_CST)) {
+                const u8 event = __atomic_fetch_or(base + spurs + wkl_off::event1 + wid, u8{1}, __ATOMIC_SEQ_CST);
+                if ((event & 0x12) && !(event & 1)) {
+                    PS_LOG_WARN(kChan, "workload {} of SPURS {:#010x} shut down: its completion hook is not called (not "
+                        "implemented)", wid, spurs);
+                }
+            }
+            continue;
+        }
+        if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+        if (!lv2::sleep_us(t.waiter, 100)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT); // the thread is torn down
+    }
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    return lv2::CELL_OK;
+}
+
+// cellSpursRemoveWorkload, as RPCS3 (cellSpurs.cpp): NULL, ALIGN, INVAL, SRCH, STAT; BUSY while the workload shuts
+// down, STAT unless it is removable; the workload flag released if it receives it; then in one update of the state line
+// the state NON_EXISTENT and its enabled and mskB bits cleared. The native instance forgets the workload too.
+s32 remove_workload(PPUContext& ctx, u32 spurs, u32 wid)
+{
+    u8* base = guest_base(ctx);
+    if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    const bool second = (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2 || (wid >= CELL_SPURS_MAX_WORKLOAD && !second)) {
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    }
+    if (!(ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid))) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
+        PS_LOG_ERROR(kChan, "remove_workload: SPURS2 workload {} is not implemented", wid);
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    }
+    switch (ps_read8(base, spurs + wkl_off::state1 + wid)) {
+    case SPURS_WKL_STATE_SHUTTING_DOWN: return error(CELL_SPURS_POLICY_MODULE_ERROR_BUSY);
+    case SPURS_WKL_STATE_REMOVABLE: break;
+    default: return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    }
+    if (ps_read8(base, spurs + spurs_off::wklFlagReceiver) == wid) {
+        if (const s32 r = _cellSpursWorkloadFlagReceiver(ctx, spurs, wid, 0); r != lv2::CELL_OK) {
+            PS_FATAL(kChan, "remove_workload: releasing workload {}'s flag returned {:#x} (RPCS3 ensures it succeeds)", wid,
+                static_cast<u32>(r));
+        }
+    }
+    constexpr u32 kLine = wkl_off::state1; // state1, enabled and mskB share the line at 0x80
+    static_assert(wkl_off::enabled - kLine < 128 && wkl_off::mskB - kLine < 128);
+    s32 rc = lv2::CELL_OK;
+    reservation_op(base, spurs + kLine, [&](u8* line) {
+        u8& state = line[wid];
+        if (state == SPURS_WKL_STATE_SHUTTING_DOWN) {
+            rc = error(CELL_SPURS_POLICY_MODULE_ERROR_BUSY); // re-verified, as RPCS3 (libsre does not)
+            return false;
+        }
+        if (state != SPURS_WKL_STATE_REMOVABLE) {
+            rc = error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+            return false;
+        }
+        state = 0; // SPURS_WKL_STATE_NON_EXISTENT
+        const u32 bit = 0x80000000u >> wid;
+        ps_write32(line, wkl_off::enabled - kLine, ps_read32(line, wkl_off::enabled - kLine) & ~bit);
+        ps_write32(line, wkl_off::mskB - kLine, ps_read32(line, wkl_off::mskB - kLine) & ~bit);
+        rc = lv2::CELL_OK;
+        return true;
+    });
+    if (rc == lv2::CELL_OK) {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.instances.find(spurs); it != h.instances.end()) it->second.workloads.erase(wid);
+    }
+    return rc;
+}
+
+// cellSpursJoinTaskset(taskset). RPCS3 leaves it unimplemented (returns CELL_OK); the SDK makes it wait for the
+// taskset's shutdown and release its workload, after which the game may free the taskset (D-136). Its checks are
+// cellSpursShutdownTaskset's: NULL, ALIGN, a workload ID past 31 (INVAL); the wait's POLICY_MODULE_ERROR_STAT becomes
+// TASK_ERROR_STAT, as cellSpursShutdownTaskset converts it.
+s32 cellSpursJoinTaskset(PPUContext& ctx, u32 taskset)
+{
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, taskset, 128)) {
+        log_call_site(ctx, base, std::format("cellSpursJoinTaskset: taskset {:#x} is not readable guest memory; refused with "
+            "CELL_SPURS_TASK_ERROR_FAULT", taskset));
+        return error(CELL_SPURS_TASK_ERROR_FAULT);
+    }
+    const u32 wid = ps_read32(base, taskset + ts_off::wid);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
+    s32 r = wait_for_workload_shutdown(ctx, spurs, wid);
+    if (r == lv2::CELL_OK) r = remove_workload(ctx, spurs, wid);
+    PS_LOG_INFO(kChan, "cellSpursJoinTaskset({:#010x}): workload {} of SPURS {:#x} -> {:#x}", taskset, wid, spurs,
+        static_cast<u32>(r));
     if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) r = error(CELL_SPURS_TASK_ERROR_STAT);
     return r;
 }
@@ -1632,6 +1785,64 @@ s32 cellSpursRunJobChain(PPUContext& ctx, u32 job_chain)
     return woken == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT) ? error(CELL_SPURS_JOB_ERROR_STAT) : lv2::CELL_OK;
 }
 
+// The job chain's workload ID and SPURS after RPCS3's checks: NULL, 128-byte ALIGN, a workload ID past 31 (INVAL); an
+// unreadable chain is refused with INVAL and a log, as cellSpursRunJobChain does.
+bool job_chain_workload(PPUContext& ctx, std::string_view what, u32 job_chain, u32& wid, u32& spurs, s32& rc)
+{
+    rc = lv2::CELL_OK;
+    if (!job_chain) rc = error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    else if (job_chain % 128) rc = error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (rc != lv2::CELL_OK) return false;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, job_chain, 128)) {
+        log_call_site(ctx, base, std::format("{}: job chain {:#x} is not readable guest memory; refused with "
+            "CELL_SPURS_JOB_ERROR_INVAL", what, job_chain));
+        rc = error(CELL_SPURS_JOB_ERROR_INVAL);
+        return false;
+    }
+    wid = ps_read32(base, job_chain + jc_off::workloadId);
+    spurs = static_cast<u32>(ps_read64(base, job_chain + jc_off::spurs));
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2) {
+        rc = error(CELL_SPURS_JOB_ERROR_INVAL);
+        return false;
+    }
+    return true;
+}
+
+// cellSpursShutdownJobChain(jobChain), as RPCS3 (cellSpurs.cpp): the checks, then cellSpursShutdownWorkload on the
+// chain's workload; its POLICY_MODULE_ERROR_STAT becomes JOB_ERROR_STAT, other results pass as they are.
+s32 cellSpursShutdownJobChain(PPUContext& ctx, u32 job_chain)
+{
+    u32 wid = 0, spurs = 0;
+    s32 rc;
+    if (!job_chain_workload(ctx, "cellSpursShutdownJobChain", job_chain, wid, spurs, rc)) return rc;
+    rc = shutdown_workload(guest_base(ctx), spurs, wid);
+    PS_LOG_INFO(kChan, "cellSpursShutdownJobChain({:#010x}): workload {} of SPURS {:#x} -> {:#x}", job_chain, wid, spurs,
+        static_cast<u32>(rc));
+    return rc == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT) ? error(CELL_SPURS_JOB_ERROR_STAT) : rc;
+}
+
+// cellSpursJoinJobChain(jobChain), as RPCS3 (cellSpurs.cpp): the checks, cellSpursWaitForWorkloadShutdown (STAT becomes
+// JOB_ERROR_STAT) and cellSpursRemoveWorkload (its result as it is); then the chain's workload ID becomes 32 and the
+// chain's error word is the result. The native wait also waits for the workers to leave the chain (D-136).
+s32 cellSpursJoinJobChain(PPUContext& ctx, u32 job_chain)
+{
+    u32 wid = 0, spurs = 0;
+    s32 rc;
+    if (!job_chain_workload(ctx, "cellSpursJoinJobChain", job_chain, wid, spurs, rc)) return rc;
+    rc = wait_for_workload_shutdown(ctx, spurs, wid);
+    if (rc != lv2::CELL_OK) return rc == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT) ? error(CELL_SPURS_JOB_ERROR_STAT) : rc;
+    rc = remove_workload(ctx, spurs, wid);
+    if (rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    ps_write32(base, job_chain + jc_off::workloadId, CELL_SPURS_MAX_WORKLOAD2);
+    const s32 chain_error = static_cast<s32>(ps_read32(base, job_chain + jc_off::error));
+    PS_LOG_INFO(kChan, "cellSpursJoinJobChain({:#010x}): workload {} of SPURS {:#x} removed; the chain's error {:#x}",
+        job_chain, wid, spurs, static_cast<u32>(chain_error));
+    return chain_error;
+}
+
 } // namespace
 
 void register_cellSpurs(Registry& r)
@@ -1647,6 +1858,9 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xC10931CB, cellSpursCreateTasksetWithAttribute),
         PS_HLE_FUNC(0x8F122EF8, cellSpursTasksetAttributeSetTasksetSize),
         PS_HLE_FUNC(0xA789E631, cellSpursShutdownTaskset),
+        PS_HLE_FUNC(0x9F72ADD3, cellSpursJoinTaskset),
+        PS_HLE_FUNC(0x738E40E6, cellSpursShutdownJobChain),
+        PS_HLE_FUNC(0xA7C066DE, cellSpursJoinJobChain),
         PS_HLE_FUNC(0x69726AA2, cellSpursAddWorkload),
         PS_HLE_FUNC(0xF843818D, cellSpursReadyCountStore),
         PS_HLE_FUNC(0xC765B995, cellSpursGetWorkloadFlag),

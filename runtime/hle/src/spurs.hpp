@@ -252,6 +252,8 @@ void start_scheduler(SpursHost& host, lv2::Kernel& kernel, u32 spurs, Instance& 
 // Stops and joins the workers (cellSpursFinalize; the process end does it through the Scheduler's destructor). Not
 // called with the host mutex held: the workers take it.
 void stop_scheduler_of(Scheduler& scheduler);
+// The native workers running the workload now (D-136).
+u32 workers_inside(const Scheduler& scheduler, u32 wid);
 
 // _cellSpursSendSignal (PPU side, as libsre and RPCS3): sets the task's signalled bit; when the task was waiting for
 // it, signals the taskset's workload so a worker resumes it. CELL_OK, or a CELL_SPURS_TASK_ERROR_*.

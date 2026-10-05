@@ -518,7 +518,24 @@ TEST_CASE("cellSpurs event flags and taskset shutdown; sys_net, sys_spu_initiali
     CHECK(a.call("cellSpursShutdownTaskset", kOtherTs + 0x40) == kTaskAlign);
     ps_write32(base, kSpurs + 0xD6C, 1); // CellSpurs::exception
     CHECK(a.call("cellSpursShutdownTaskset", kTs) == kTaskStat);
+    CHECK(a.call("cellSpursJoinTaskset", kTs) == kTaskStat);
     ps_write32(base, kSpurs + 0xD6C, 0);
+
+    // cellSpursJoinTaskset (D-136): the shutdown's checks, then the workload is removed and its slot is free again.
+    CHECK(a.call("cellSpursJoinTaskset", 0) == kTaskNull);
+    CHECK(a.call("cellSpursJoinTaskset", kTs + 0x40) == kTaskAlign);
+    ps_write32(base, kOtherTs + 0x74, 32);
+    CHECK(a.call("cellSpursJoinTaskset", kOtherTs) == kTaskInval);
+    ps_write32(base, kOtherTs + 0x74, 16);
+    CHECK(a.call("cellSpursJoinTaskset", kOtherTs) == 0xFFFFFFFF80410802ull);
+    CHECK(a.call("cellSpursJoinTaskset", kTs) == 0);
+    CHECK(ps_read8(base, kSpurs + 0x80) == 0);                 // wklState1[0]: NON_EXISTENT
+    CHECK((ps_read32(base, kSpurs + 0xB0) & 0x80000000u) == 0); // wklEnabled
+    CHECK((ps_read32(base, kSpurs + 0xB4) & 0x80000000u) == 0); // wklMskB
+    CHECK(a.call("cellSpursJoinTaskset", kTs) == 0xFFFFFFFF80410805ull); // POLICY_MODULE_ERROR_SRCH: no workload 0
+    REQUIRE(a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTs, kTsAttr) == 0);
+    CHECK(ps_read32(base, kTs + 0x74) == 0); // the free slot again
+    CHECK(ps_read8(base, kSpurs + 0x80) == 2); // RUNNABLE
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 
     CHECK(a.call("sys_net_initialize_network_ex", kData) == 0);

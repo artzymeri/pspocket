@@ -488,3 +488,86 @@ TEST_CASE("job chains: a chain signalled again while it runs leaves its SPU afte
     REQUIRE(s.wait_done(0));
     CHECK(s.wait_left());
 }
+
+// cellSpursShutdownJobChain and cellSpursJoinJobChain (D-136, RPCS3's checks and order): a chain shut down and joined
+// gives its workload slot back, its workload ID becomes 32, and the join returns the chain's error word.
+TEST_CASE("job chains: shut down and joined, a chain gives its workload back; the join returns the chain's error",
+    "[hle][spurs][spurs-jobchain]")
+{
+    constexpr u64 kNull = 0xFFFFFFFF80410A11ull, kAlign = 0xFFFFFFFF80410A10ull, kInval = 0xFFFFFFFF80410A02ull,
+                  kStat = 0xFFFFFFFF80410A0Full;
+    ChainFixture s;
+    u8* b = s.base;
+    write_desc(b, desc(0), {.out = out(0)});
+    s.cmd(kCmds + 0x00, desc(0));
+    s.cmd(kCmds + 0x08, kEnd);
+    s.run();
+    REQUIRE(s.wait_done(0));
+    const u32 wid = s.wid();
+    REQUIRE(wid < 16);
+
+    CHECK(s.a.call("cellSpursShutdownJobChain", 0) == kNull);
+    CHECK(s.a.call("cellSpursShutdownJobChain", kJc + 0x40) == kAlign);
+    CHECK(s.a.call("cellSpursJoinJobChain", 0) == kNull);
+    CHECK(s.a.call("cellSpursJoinJobChain", kJc + 0x40) == kAlign);
+    ps_write32(b, kSpurs + 0xD6C, 1); // CellSpurs::exception: the workload's STAT becomes the chain's
+    CHECK(s.a.call("cellSpursShutdownJobChain", kJc) == kStat);
+    CHECK(s.a.call("cellSpursJoinJobChain", kJc) == kStat);
+    ps_write32(b, kSpurs + 0xD6C, 0);
+
+    REQUIRE(s.a.call("cellSpursShutdownJobChain", kJc) == 0);
+    CHECK(ps_read8(b, kSpurs + 0x80 + wid) == 4);           // SPURS_WKL_STATE_REMOVABLE
+    CHECK(s.a.call("cellSpursShutdownJobChain", kJc) == 0); // again: already removable
+    CHECK(s.a.call("cellSpursJoinJobChain", kJc) == 0);     // no error in the chain
+    CHECK(ps_read32(b, kJc + 0x74) == 32);
+    CHECK(ps_read8(b, kSpurs + 0x80 + wid) == 0); // NON_EXISTENT
+    CHECK((ps_read32(b, kSpurs + 0xB0) & (0x80000000u >> wid)) == 0);
+    CHECK((ps_read32(b, kSpurs + 0xB4) & (0x80000000u >> wid)) == 0);
+    CHECK(s.a.call("cellSpursJoinJobChain", kJc) == kInval); // workload 32: past the last one
+    CHECK(s.a.call("cellSpursShutdownJobChain", kJc) == kInval);
+
+    // The slot is free: the chain created again gets it and runs.
+    REQUIRE(s.a.call("cellSpursCreateJobChainWithAttribute", kSpurs, kJc, kJcAttr) == 0);
+    CHECK(s.wid() == wid);
+    ps_write32(b, out(0) + 0xC0, 0);
+    s.run();
+    CHECK(s.wait_done(0));
+}
+
+// A join waits for the SPU still running the chain's job when it was shut down: the game frees the chain after it.
+TEST_CASE("job chains: a join waits for the job running when its chain was shut down", "[hle][spurs][spurs-jobchain]")
+{
+    ChainFixture s;
+    u8* b = s.base;
+    write_desc(b, desc(0), {.out = out(0), .delay = 20'000'000, .started = kStarted});
+    s.cmd(kCmds + 0x00, desc(0));
+    s.cmd(kCmds + 0x08, kEnd);
+    s.run();
+    REQUIRE(wait_for([&] { return ps_read32(b, kStarted) == 0x4940; }));
+    const u32 wid = s.wid();
+    REQUIRE(s.a.call("cellSpursShutdownJobChain", kJc) == 0);
+    REQUIRE(!s.done(0)); // the job is still in its delay
+    CHECK(s.a.call("cellSpursJoinJobChain", kJc) == 0);
+    CHECK(s.done(0)); // it finished before the join returned
+    CHECK(ps_read8(b, kSpurs + 0x20 + wid) == 0); // and no SPU is counted on the slot
+}
+
+// A chain that stops on an error shuts its workload down from the SPU (SHUTTING_DOWN); the join finishes the shutdown
+// once the SPU left, as the system service would, and returns the error.
+TEST_CASE("job chains: a chain halted by an error is joined, and the join returns the error", "[hle][spurs][spurs-jobchain]")
+{
+    ChainFixture s(1, 1);
+    u8* b = s.base;
+    write_desc(b, desc(0), {.out = out(0)});
+    s.cmd(kCmds + 0x00, desc(0));
+    s.cmd(kCmds + 0x08, 0x1F); // no such command
+    s.cmd(kCmds + 0x10, kEnd);
+    s.run();
+    REQUIRE(s.wait_done(0));
+    REQUIRE(wait_for([&] { return ps_read8(b, kJc + 0x23) == 1; })); // isHalted
+    const u32 wid = s.wid();
+    CHECK(s.a.call("cellSpursJoinJobChain", kJc) == 0xFFFFFFFF80410A18ull); // CELL_SPURS_JOB_ERROR_UNKNOWN_COMMAND
+    CHECK(ps_read8(b, kSpurs + 0x80 + wid) == 0);
+    CHECK((ps_read8(b, kSpurs + 0xA0 + wid) & 1) == 1); // the shutdown's completion bit
+    CHECK(ps_read32(b, kJc + 0x74) == 32);
+}

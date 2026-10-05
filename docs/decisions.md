@@ -2080,6 +2080,29 @@ before a debugger could attach. The app now watches the flips from a thread of i
 none for 10 s, lv2's thread report (every PPU thread's state, what it waits on and its backtrace, then the RSX's FIFO
 and what it is blocked on) goes to the log line by line, once per freeze.
 
+## D-136 · 2026-10-05 · Job chains and tasksets are shut down and joined natively
+
+GTA V imports cellSpursShutdownJobChain, cellSpursJoinJobChain and cellSpursJoinTaskset, and a call would have
+stopped the game as unimplemented. They follow RPCS3 (cellSpurs.cpp): the shutdown is cellSpursShutdownWorkload on
+the chain's workload; a join waits for the workload's shutdown, removes the workload (state NON_EXISTENT, its enabled
+and mskB bits cleared, the workload flag released if it had it), sets the chain's workload ID to 32 and returns the
+chain's error word. RPCS3 leaves cellSpursJoinTaskset empty; here it waits and removes like the chain's join, so the
+game may free the taskset after it.
+- The native wait is for more than the state: no worker inside the workload (a count per workload in the scheduler)
+  and none still counted in its contention. The game frees the chain or taskset once a join returns, and a worker
+  could still be in its last job.
+- A worker selects from states read before its update of the contention line, so a shutdown and a join can come in
+  between. It now counts itself inside, then reads the state again, both sequentially consistent, as the join reads
+  the state and then the count: either the worker sees the shutdown and leaves, or the join sees the worker and
+  waits. A worker that picked a slot just before its join removed it gives the contention back at its next selection;
+  adding a workload waits for that (up to a second) instead of stopping on RPCS3's check.
+- A job chain that stops on an error shuts its workload down from the SPU (SHUTTING_DOWN), and no system service
+  makes it removable natively. The join does that step once the last worker left, with the completion bit in the
+  workload's event byte, as RPCS3's spursSysServiceUpdateWorkload does.
+- Tests: a chain shut down and joined frees its slot, which a new chain gets and runs; argument errors and the
+  instance's exception state; a join waits for the job still running at the shutdown; a chain halted by an unknown
+  command is joined and the join returns the error. The taskset's join gets the same checks.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
