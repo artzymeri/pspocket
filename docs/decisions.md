@@ -2643,6 +2643,58 @@ burst. The price is draws left out while their shaders compile: 117 per frame on
 frames (287 with programs first and two threads). Tests: a draw with no budget goes without its programs and draws once they
 are made, with nothing compiled on the RSX thread; with a budget that covers the compiles it waits and draws.
 
+## D-159 · 2026-10-06 · Modules a game loads while it runs (sys_prx)
+
+Many games keep part of their code in PRX modules on the disc and load them with sys_prx_load_module; route B's "any
+ISO" needs that. sysPrxForUser gets sys_prx_load_module, sys_prx_load_module_list, sys_prx_start_module,
+sys_prx_stop_module, sys_prx_unload_module and sys_prx_get_module_id_by_name, as RPCS3's wrappers (sys_prx_.cpp): the
+start and stop functions run on the calling thread (call_guest), args and argp passed, their result written to the
+caller's result and given back (SYS_PRX_RESIDENT keeps the module; anything else unloads it, as _sys_prx_start_module
+cmd 2). A recursive host mutex stands for liblv2's "_lv2prx" lwmutex. The placing and linking is the loader's,
+behind hle::ModuleLoader: RuntimeModules reads the file through the game's own file system (Kernel::vfs_read_file:
+the disc image, /app_home, /dev_hdd0), decrypts a disc game's SELF with the built-in keys (an NPDRM module needs the
+game's klicensee: refused, CELL_PRX_ERROR_UNSUPPORTED_PRX_TYPE), and places and links it as D-157 does a firmware
+module, its imports going to modules loaded before it, then firmware modules, then the host. Starting a module
+points the executable's import slots (and reference tables, and imported variables) of its libraries at its exports,
+as lv2_prx::load_exports; until then they hold the host's stubs. A path in /dev_flash/sys/external goes to the
+firmware module when the host replaces none of its libraries, else an empty module whose libraries the host serves
+(RPCS3's "ignored" modules). Unloading keeps the memory (code of it may still be on a stack). The HLE stub tables
+are sized for 65,536 functions up front, so linking while guest threads call stubs never moves what they read.
+Not yet: fixed-address loading (flags 1, CELL_ENOSYS), sys_prx_get_module_list/info, and translating a game's
+modules in the preparation (they run interpreted). Test: a game's module loaded from /app_home, its module_start run,
+the game's import repointed, the state errors (started twice, unloaded while started), name lookup.
+
+## D-160 · 2026-10-06 · Assassin's Creed's 40 missing functions, as RPCS3 has them, with what differs
+
+Three agents implemented the 40 imports Assassin's Creed (BLES00158) used and pspocket lacked, each from RPCS3 and,
+for SPURS and cellSync, checked against the firmware's libsre as a reference only (D-046); 21 test cases, every guest
+store that other processors may race through the reservation system. Where pspocket differs from RPCS3, and why:
+- **cellSyncMutex** Initialize/TryLock/Unlock: a ticket lock in one word; TryLock writes nothing when busy (a game
+  polling it must not break other code's reservations on the line), and every write is a reservation_op: a plain host
+  compare-and-swap, as RPCS3 uses, let a guest conditional store merge around it (two holders, caught by the test).
+- **cellMsgDialogOpen2**: answered at the first cellSysutilCheckCallback (OK, or YES/NO by the default cursor), as
+  the keyboard dialog (D-140); RPCS3 without its UI never answers. Dialogs without buttons stay until Abort.
+- **cellFsAio** Init/Read/Cancel/Finish: RPCS3's live code never starts the AIO thread ("use LLE"); pspocket runs its
+  unused fs_aio_thread design on a real lv2 thread (internal function, priority 1000, 64 KB stack): reads at the
+  request's offset without moving the file position, then the callback. Cancel stays CELL_EINVAL (a TODO in RPCS3).
+- **cellFsGetFreeSize**: RPCS3's three disk-free syscalls' rules done in sys_fs (40 GB less 256 KB on /dev_hdd0).
+- **cellHddGameCheck, cellGameDataCheckCreate2, cellDiscGameGetBootDiscInfo,
+  cellDiscGameRegisterDiscChangeCallback** (kept; the disc never changes), **cellAudioOutSetCopyControl**: RPCS3's
+  structures and checks; error dialogs logged, its sleeps skipped (D-044); a PARAM.SFO the host cannot write is
+  CELL_GAMEDATA_ERROR_ACCESS_ERROR where RPCS3 aborts.
+- **cellPad** ClearBuf, GetInfo (648-byte layout, max_connect not clamped, vendor/product 054C:0268),
+  GetCapabilityInfo.
+- **cellGcmSys** SetFlipMode (through lv2's display-sync attribute; before cellGcmInit only logged), GetTimeStamp,
+  GetReport, GetReportDataAddress, SetTile (lv2's refusal of an odd tile is returned), SetFlip (RPCS3's "put + 8"
+  kept exactly), SetWaitFlip.
+- **cellSpurs** CreateTaskset, _cellSpursSendSignal, AddUrgentCommand (four slots, then JOB_ERROR_BUSY).
+- **sysPrxForUser** spinlocks (0xABADCAFE, polite waiting through lv2's yield), the mmapper wrappers,
+  sys_process_is_stack, sys_spu_image_close (kernel images: syscall 158 is missing, CELL_ENOSYS),
+  sys_game_process_exitspawn (the parameter block built byte for byte; the next executable is not launched).
+- Pointers outside guest memory are refused with the call site logged (D-042), where RPCS3 would fault.
+
+With them the game boots on the Mac to its autosave notice and its disclaimer, at 60 fps (run 099).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
