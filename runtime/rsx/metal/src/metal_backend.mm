@@ -57,6 +57,7 @@ TransientAllocator::Allocation TransientAllocator::alloc(u32 size, u32 align)
         // Large uploads get a buffer of their own (still retired with the command buffer).
         id<MTLBuffer> b = [device_ newBufferWithLength:size options:MTLResourceStorageModeShared];
         in_use_.push_back(b);
+        bytes_in_use_ += size;
         return {b, 0, static_cast<u8*>(b.contents)};
     }
     u32 offset = (offset_ + align - 1) & ~(align - 1);
@@ -72,6 +73,7 @@ TransientAllocator::Allocation TransientAllocator::alloc(u32 size, u32 align)
         }
         if (!current_) current_ = [device_ newBufferWithLength:kChunkSize options:MTLResourceStorageModeShared];
         in_use_.push_back(current_);
+        bytes_in_use_ += kChunkSize;
         offset = 0;
     }
     offset_ = offset + size;
@@ -81,6 +83,7 @@ TransientAllocator::Allocation TransientAllocator::alloc(u32 size, u32 align)
 void TransientAllocator::retire(id<MTLCommandBuffer> cb)
 {
     generation_++;
+    bytes_in_use_ = 0;
     if (in_use_.empty()) return;
     auto chunks = std::make_shared<std::vector<id<MTLBuffer>>>(std::move(in_use_));
     in_use_.clear();
@@ -107,6 +110,8 @@ bool MetalBackend::Impl::init()
     }
     queue = [device newCommandQueue];
     queue.label = @"pspocket.rsx";
+    frames_in_flight_limit = std::max<u32>(config.frames_in_flight, 1);
+    frames_in_flight = dispatch_semaphore_create(frames_in_flight_limit);
     bc_supported = false;
     if (@available(macOS 11.0, iOS 16.4, *)) bc_supported = device.supportsBCTextureCompression;
     transient.init(device);
@@ -1217,7 +1222,8 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     tick++;
     end_pass_for(kEndFlip);
     stats.flips++;
-    if (stats.flips % std::clamp<u64>(config.evict_after_flips / 2, 1, 150) == 0) evict_unused(); // D-116
+    if (stats.flips % std::clamp<u64>(config.evict_after_flips / 2, 1, 150) == 0) evict_unused(config.evict_after_flips); // D-116
+    if (trim_requested.exchange(false, std::memory_order_acq_rel)) trim();
     if (tracing && request.flip_index >= config.trace_frame) {
         PS_LOG_INFO("rsx.trace", "frame {} ends: flip {} shows {:#010x}; {} clears and draws, {} colour targets",
             config.trace_frame, request.flip_index,
@@ -1309,7 +1315,32 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
         frame.flip_index = request.flip_index;
         config.present(frame);
     }
+    // The frame's last buffer gives its place back when the GPU has run it (completion handlers run on error too).
+    dispatch_semaphore_t slots = frames_in_flight;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer>) { dispatch_semaphore_signal(slots); }];
     submit(false);
+    // At most frames_in_flight frames queued (D-148): wait for the oldest before the RSX goes on to the next.
+    const auto t0 = std::chrono::steady_clock::now();
+    dispatch_semaphore_wait(frames_in_flight, DISPATCH_TIME_FOREVER);
+    stats.gpu_wait_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+
+// MetalBackend::trim_memory, at a flip (D-148): what can be made again goes, and readbacks the GPU has finished land.
+void MetalBackend::Impl::trim()
+{
+    const usize textures_before = textures.size(), surfaces_before = surfaces.size();
+    const u64 texture_mb = texture_bytes() >> 20, surface_mb = surface_bytes() >> 20;
+    evict_unused(60);
+    for (auto& s : surfaces) {
+        if (!draw_targets.contains(s.get()) && !(pass_open && pass.contains(s.get()))) s->feedback = {};
+    }
+    run_deferred(false);
+    stats.memory_trims++;
+    PS_LOG_WARN(kChan, "memory low: {} of {} textures ({} MB) and {} of {} surfaces ({} MB) freed, unused for 60 "
+        "flips; the GPU holds {} MB", textures_before - textures.size(), textures_before,
+        texture_mb - (texture_bytes() >> 20), surfaces_before - surfaces.size(), surfaces_before,
+        surface_mb - (surface_bytes() >> 20), static_cast<u64>(device.currentAllocatedSize) >> 20);
 }
 
 // ---- MetalBackend ---------------------------------------------------------------------------------------------------
@@ -1326,11 +1357,20 @@ MetalBackend::~MetalBackend()
 {
     @autoreleasepool {
         if (impl_->device) impl_->submit(true);
+        // Every queued frame's completion handler has given its place back before the semaphore goes (libdispatch
+        // aborts on one released below its starting count).
+        if (impl_->frames_in_flight) {
+            for (u32 i = 0; i < impl_->frames_in_flight_limit; i++)
+                dispatch_semaphore_wait(impl_->frames_in_flight, DISPATCH_TIME_FOREVER);
+            for (u32 i = 0; i < impl_->frames_in_flight_limit; i++) dispatch_semaphore_signal(impl_->frames_in_flight);
+        }
         for (auto& [key, t] : impl_->textures) impl_->tracker.unwatch(t->watch);
         for (auto& [ea, f] : impl_->fragment_programs) impl_->tracker.unwatch(f.watch);
         for (auto& s : impl_->surfaces) impl_->tracker.unwatch(s->watch);
     }
 }
+
+void MetalBackend::trim_memory() { impl_->trim_requested.store(true, std::memory_order_release); }
 
 bool MetalBackend::valid() const { return impl_->device != nil; }
 void* MetalBackend::device() const { return (__bridge void*)impl_->device; }
@@ -1345,6 +1385,12 @@ void MetalBackend::draw(const RsxState& state)
     if (!impl_->device) return;
     @autoreleasepool {
         impl_->do_draw(state);
+        // A frame's uploads stay allocated until the GPU has run its command buffer: past the budget it goes now, so
+        // the GPU starts on it and gives it back sooner (D-148).
+        if (impl_->transient.bytes_in_use() > impl_->config.transient_budget) {
+            impl_->submit(false);
+            impl_->stats.budget_submits++;
+        }
     }
 }
 
@@ -1364,37 +1410,56 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
     }
     Impl& m = *impl_;
     if (++m.report_flips == Impl::kGpuReportFlips) {
+        // The window's numbers (D-148): logged, and handed to config.on_window.
         const u64 gpu = m.gpu_ns->load(std::memory_order_relaxed);
         const double n = static_cast<double>(m.report_flips);
-        static constexpr const char* kWhy[Impl::kEndCount] = {"targets", "target copy", "depth conversion",
-            "colour conversion", "target overlay", "submit", "flip", "surface gone", "flush", "other"};
+        const auto per_frame = [n](u64 now, u64 before) { return static_cast<double>(now - before) / n; };
+        WindowStats w;
+        w.flips = static_cast<u32>(m.report_flips);
+        w.last_flip = m.stats.flips;
+        w.gpu_ms = static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n;
+        w.draws = per_frame(m.stats.draws, m.report_draws);
+        w.render_passes = per_frame(m.stats.render_passes, m.report_passes);
         std::string ends;
         for (u32 i = 0; i < Impl::kEndCount; i++) {
-            const u64 d = m.pass_ends[i] - m.report_pass_ends[i];
-            if (d) ends += std::format("{}{} {:.1f}", ends.empty() ? "" : ", ", kWhy[i], static_cast<double>(d) / n);
+            w.pass_ends[i] = per_frame(m.pass_ends[i], m.report_pass_ends[i]);
+            if (w.pass_ends[i] > 0) ends += std::format("{}{} {:.1f}", ends.empty() ? "" : ", ", kPassEndNames[i], w.pass_ends[i]);
             m.report_pass_ends[i] = m.pass_ends[i];
         }
+        w.readbacks = per_frame(m.stats.readbacks, m.report_readbacks);
+        w.deferred_readbacks = per_frame(m.stats.deferred_readbacks, m.report_deferred);
+        w.deferred_conflicts = per_frame(m.stats.deferred_conflicts, m.report_conflicts);
+        w.readback_wait_ms = per_frame(m.stats.readback_wait_ns, m.report_readback_ns) / 1e6;
+        w.texture_overlays = per_frame(m.stats.texture_overlays, m.report_overlays);
+        w.texture_checks = per_frame(m.stats.texture_checks, m.report_texture_checks);
+        w.texture_mb_hashed = per_frame(m.stats.texture_check_bytes, m.report_texture_bytes) / 1048576.0;
+        w.write_faults = per_frame(m.tracker.faults_handled(), m.report_faults);
+        w.feedback_copies = per_frame(m.stats.feedback_copies, m.report_feedback);
+        w.corner_textures = per_frame(m.stats.corner_textures, m.report_corners);
+        w.surface_reloads = per_frame(m.stats.surface_reloads, m.report_reloads);
+        w.gpu_wait_ms = per_frame(m.stats.gpu_wait_ns, m.report_gpu_wait_ns) / 1e6;
+        w.programs_made = m.stats.programs_compiled - m.report_programs;
+        w.pipelines_made = m.stats.pipelines_created - m.report_pipelines;
+        w.compile_ms = static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns - m.report_compile_ns) / 1e6;
+        w.textures = m.textures.size();
+        w.texture_mb = static_cast<double>(m.texture_bytes()) / 1048576.0;
+        w.surfaces = m.surfaces.size();
+        w.surface_mb = static_cast<double>(m.surface_bytes()) / 1048576.0;
+        w.gpu_allocated_mb = static_cast<double>(m.device.currentAllocatedSize) / 1048576.0;
+        w.deferred_queue = m.deferred.size();
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
                            "{:.2f} targets laid over memory on the GPU; "
                            "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {} programs and {} pipelines "
                            "made ({:.1f} ms); "
-                           "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB)",
-            m.report_flips, static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n,
-            static_cast<double>(m.stats.draws - m.report_draws) / n,
-            static_cast<double>(m.stats.render_passes - m.report_passes) / n, ends,
-            static_cast<double>(m.stats.readbacks - m.report_readbacks) / n,
-            static_cast<double>(m.stats.deferred_readbacks - m.report_deferred) / n,
-            static_cast<double>(m.stats.deferred_conflicts - m.report_conflicts) / n,
-            static_cast<double>(m.stats.readback_wait_ns - m.report_readback_ns) / 1e6 / n,
-            static_cast<double>(m.stats.texture_overlays - m.report_overlays) / n,
-            static_cast<double>(m.stats.texture_checks - m.report_texture_checks) / n,
-            static_cast<double>(m.stats.texture_check_bytes - m.report_texture_bytes) / 1048576.0 / n,
-            static_cast<double>(m.tracker.faults_handled() - m.report_faults) / n,
-            m.stats.programs_compiled - m.report_programs, m.stats.pipelines_created - m.report_pipelines,
-            static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns - m.report_compile_ns) / 1e6,
-            m.textures.size(), static_cast<double>(m.texture_bytes()) / 1048576.0, m.surfaces.size(),
-            static_cast<double>(m.surface_bytes()) / 1048576.0);
+                           "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB); "
+                           "{:.2f} feedback copies, {:.2f} corner textures, {:.2f} surface reloads; {:.2f} ms waiting for "
+                           "the GPU; GPU memory {:.0f} MB, {} deferred",
+            w.flips, w.gpu_ms, w.draws, w.render_passes, ends, w.readbacks, w.deferred_readbacks, w.deferred_conflicts,
+            w.readback_wait_ms, w.texture_overlays, w.texture_checks, w.texture_mb_hashed, w.write_faults,
+            w.programs_made, w.pipelines_made, w.compile_ms, w.textures, w.texture_mb, w.surfaces, w.surface_mb,
+            w.feedback_copies, w.corner_textures, w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb, w.deferred_queue);
+        if (m.config.on_window) m.config.on_window(w);
         m.report_programs = m.stats.programs_compiled;
         m.report_pipelines = m.stats.pipelines_created;
         m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns;
@@ -1406,6 +1471,10 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_readbacks = m.stats.readbacks;
         m.report_deferred = m.stats.deferred_readbacks;
         m.report_conflicts = m.stats.deferred_conflicts;
+        m.report_feedback = m.stats.feedback_copies;
+        m.report_corners = m.stats.corner_textures;
+        m.report_reloads = m.stats.surface_reloads;
+        m.report_gpu_wait_ns = m.stats.gpu_wait_ns;
         m.report_flips = 0;
         m.report_gpu_ns = gpu;
         m.report_draws = m.stats.draws;
@@ -1477,7 +1546,7 @@ bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u
         if (!d) return false;
         m.sync_surface(*s); // what the source's children wrote (D-122)
         m.tracker.unwatch(d->watch); // newer on the GPU again
-        m.end_pass_for(Impl::kEndTargetCopy);
+        m.end_pass_for(Impl::kEndGpuCopy);
         id<MTLBlitCommandEncoder> blit = [m.render_buffer() blitCommandEncoder];
         [blit copyFromTexture:s->texture
                   sourceSlice:0

@@ -52,6 +52,31 @@ using CaptureCallback = std::function<void(const u8* bgra, u32 width, u32 height
 // A render target at the end of a traced frame, as 8-bit BGRA: name says where it is and its format.
 using TraceSurfaceCallback = std::function<void(const std::string& name, const u8* bgra, u32 width, u32 height)>;
 
+// Why render passes end (a pass loads and stores its targets each time), in WindowStats::pass_ends' order (D-148).
+inline constexpr std::array<const char*, 14> kPassEndNames = {"targets", "gpu copy", "feedback copy", "corner copy",
+    "region copy", "grow", "depth conversion", "colour conversion", "target overlay", "submit", "flip", "surface gone",
+    "flush", "other"};
+
+// One report window of the backend (every 300 flips): what its log line says, as numbers, for tools that keep them
+// (pspocket-boot --summary, D-148). Per frame unless said otherwise.
+struct WindowStats {
+    u32 flips = 0;      // in the window
+    u64 last_flip = 0;  // the backend's flip count at its end
+    double gpu_ms = 0, draws = 0, render_passes = 0;
+    std::array<double, kPassEndNames.size()> pass_ends{};
+    double readbacks = 0, deferred_readbacks = 0, deferred_conflicts = 0, readback_wait_ms = 0;
+    double texture_overlays = 0, texture_checks = 0, texture_mb_hashed = 0, write_faults = 0;
+    double feedback_copies = 0, corner_textures = 0, surface_reloads = 0;
+    double gpu_wait_ms = 0;        // the RSX thread's wait for the GPU at flips (frames in flight capped)
+    u64 programs_made = 0, pipelines_made = 0; // in the window, by the RSX thread
+    double compile_ms = 0;                      // in the window
+    u64 textures = 0, surfaces = 0;             // cached at its end
+    double texture_mb = 0, surface_mb = 0;
+    double gpu_allocated_mb = 0;                // MTLDevice.currentAllocatedSize at its end
+    u64 deferred_queue = 0;                     // deferred actions waiting at its end
+};
+using WindowCallback = std::function<void(const WindowStats&)>;
+
 struct MetalBackendConfig {
     void* device = nullptr;      // id<MTLDevice>; nullptr = MTLCreateSystemDefaultDevice()
     u32 output_width = 1152;     // D-016: native render target, upscaled by the host with MetalFX
@@ -83,6 +108,11 @@ struct MetalBackendConfig {
     // the target's pixels laid over a copy of the memory on the GPU (D-137). False (or PSPOCKET_RSX_WRITE_BACK_TARGETS
     // set): the target is written back first, a readback the RSX thread waits for, as before.
     bool overlay_targets = true;
+    // Called on the RSX thread with each report window (D-148).
+    WindowCallback on_window;
+    // What the command buffer being recorded may hold in transient uploads before it is submitted early (D-148): what
+    // a frame holds stays allocated until the GPU has run it.
+    u64 transient_budget = 256ull << 20;
 };
 
 struct BackendStats {
@@ -120,6 +150,11 @@ struct BackendStats {
     u64 color_conversions = 0; // colour targets converted on the GPU for a texture of another format (D-098)
     u64 texture_overlays = 0;  // targets laid over guest memory on the GPU for a texture decoded from it (D-137)
     u64 occlusion_reports = 0; // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) answered from the GPU's counters (D-102)
+    u64 feedback_copies = 0;   // copies of a target a draw samples while drawing to it, made once per write (D-148)
+    u64 corner_textures = 0;   // corner textures allocated (D-120); later corners of the same size reuse them (D-148)
+    u64 gpu_wait_ns = 0;       // the RSX thread's wait at flips for the GPU to finish an older frame (D-148)
+    u64 budget_submits = 0;    // command buffers submitted early, past MetalBackendConfig::transient_budget (D-148)
+    u64 memory_trims = 0;      // trim_memory() requests served (D-148)
     u64 flips = 0;
     u64 command_buffers = 0;
 };
@@ -156,6 +191,9 @@ public:
     bool report_pending(u32 value_addr) override;
 
     const BackendStats& stats() const;
+    // Any thread: frees what can be made again (textures and surfaces unused for 60 flips, finished readbacks) at the
+    // next flip, on the RSX thread. The iOS app calls it when iOS says memory runs low (D-148).
+    void trim_memory();
     // Waits until the shader cache has made everything it holds (tests), then hands it to the backend.
     void wait_for_shader_cache();
 

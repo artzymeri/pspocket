@@ -344,9 +344,9 @@ u64 MetalBackend::Impl::surface_bytes() const
     return n;
 }
 
-void MetalBackend::Impl::evict_unused()
+void MetalBackend::Impl::evict_unused(u64 unused_flips)
 {
-    const u64 kUnusedFlips = config.evict_after_flips;
+    const u64 kUnusedFlips = unused_flips;
     const u64 now = stats.flips;
     for (auto it = textures.begin(); it != textures.end();) {
         if (now - it->second->last_frame > kUnusedFlips) {
@@ -461,6 +461,8 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             t.height) {
             Surface::Conversion& c = s->corners[(t.width << 16) | t.height];
             if (!c.texture || c.generation != s->generation) {
+                // A new texture at each change: copying into the one earlier draws read would make the GPU wait for
+                // them (D-148); the old one goes when the GPU is done with it.
                 MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->pixel_format
                                                                                              width:t.width
                                                                                             height:t.height
@@ -469,7 +471,8 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
                 d.storageMode = MTLStorageModePrivate;
                 c.texture = [device newTextureWithDescriptor:d];
                 c.views.clear();
-                end_pass_for(kEndTargetCopy);
+                stats.corner_textures++;
+                end_pass_for(kEndCornerCopy);
                 id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
                 [blit copyFromTexture:s->texture
                           sourceSlice:0
@@ -488,11 +491,9 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             return sample_view(c.texture, c.views, src);
         }
         if (draw_targets.contains(s)) {
-            // Reading a surface the draw also renders to: sample a copy taken before the draw.
+            // Reading a surface the draw also renders to: sample a copy taken before the draw (D-148).
             bind_source = "target copy";
-            tex = copy_texture(s->texture);
-            std::unordered_map<u32, id<MTLTexture>> tmp;
-            return sample_view(tex, tmp, src);
+            return sample_view(feedback_copy(*s), s->feedback.views, src);
         }
         return sample_view(tex, s->views, src);
     }

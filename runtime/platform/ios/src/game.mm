@@ -5,6 +5,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <UIKit/UIKit.h>
 
 #include "pspocket/platform/game.h"
 
@@ -90,6 +91,8 @@ struct Session {
     // translated PPU code is this game's: the shaders recorded on the Mac for it come with it.
     std::string title_id;
     bool translated = false;
+    // The game's Metal backend, once the RSX made it: asked to trim when memory runs low (D-148).
+    std::atomic<rsx::metal::MetalBackend*> backend{nullptr};
 };
 
 constexpr auto kRateInterval = std::chrono::seconds(5);
@@ -227,6 +230,10 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     if (!o || !o->elf_path || !o->iso_path || !o->hdd0_dir) return fail(error, error_size, "missing paths");
 
     if (o->log_path) {
+        // The last boot's log stays beside it (game-prev.log): a game iOS stopped is looked at after the next launch.
+        std::string previous = o->log_path;
+        if (previous.ends_with(".log")) previous.resize(previous.size() - 4);
+        std::rename(o->log_path, (previous + "-prev.log").c_str());
         std::lock_guard lock(g_log_mutex);
         g_log_fd = open(o->log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     }
@@ -314,6 +321,10 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
                     underruns - raw->rate_underruns, kThermal[std::min<usize>(thermal, 3)], footprint / 1e9,
                     static_cast<double>(os_proc_available_memory()) / 1e9);
                 PS_LOG_INFO(kChan, "threads: {}", thread_cpu_report(dt)); // which thread holds a slow stretch back
+                // Under 1.5 GB left before iOS stops the app: the backend frees what it can make again (D-148).
+                if (os_proc_available_memory() < (1536ull << 20)) {
+                    if (rsx::metal::MetalBackend* b = raw->backend.load(std::memory_order_acquire)) b->trim_memory();
+                }
                 raw->rate_underruns = underruns;
                 raw->rate_since = now;
                 raw->rate_flips = flips;
@@ -331,6 +342,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         };
         auto backend = std::make_unique<rsx::metal::MetalBackend>(*raw->memory, *raw->tracker, std::move(mc));
         if (!backend->valid()) return nullptr;
+        raw->backend.store(backend.get(), std::memory_order_release);
         return backend;
     };
 
@@ -427,6 +439,15 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     s->rate_since = s->start;
     s->running = true;
     g_session = s.release();
+    // iOS's memory warning: the backend frees what it can make again at its next flip (D-148; run 089: nine warnings
+    // in 2.4 s, then the app was stopped).
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                                                      object:nil
+                                                       queue:nil
+                                                  usingBlock:^(NSNotification*) {
+                                                      if (rsx::metal::MetalBackend* b = g_session->backend.load())
+                                                          b->trim_memory();
+                                                  }];
     if (const lv2::Result r = loader::start_main_thread(g_session->exe, *g_session->kernel, g_session->state, {},
             main_id);
         r != lv2::CELL_OK) {

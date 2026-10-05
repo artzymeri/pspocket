@@ -140,7 +140,7 @@ Surface* MetalBackend::Impl::find_parent(u32 address, u32 pitch, u32 width, u32 
 void MetalBackend::Impl::copy_region(id<MTLTexture> src, u32 sx, u32 sy, id<MTLTexture> dst, u32 dx, u32 dy, u32 w,
     u32 h)
 {
-    end_pass_for(kEndTargetCopy);
+    end_pass_for(kEndRegionCopy);
     id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
     [blit copyFromTexture:src
               sourceSlice:0
@@ -271,11 +271,11 @@ void MetalBackend::Impl::grow_surface(Surface& outer, Surface& inner)
 {
     if (readback_supported(outer)) {
         outer.cpu_newer = true;
-        end_pass_for(kEndTargetCopy);
+        end_pass_for(kEndGrow);
         upload_surface_from_guest(outer); // what lies outside the smaller one, as guest memory holds it
     }
     if (!inner.cpu_newer) {
-        end_pass_for(kEndTargetCopy);
+        end_pass_for(kEndGrow);
         id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
         [blit copyFromTexture:inner.texture
                   sourceSlice:0
@@ -336,20 +336,33 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blit_pipeline_for(MTLPixelFormat 
     return p;
 }
 
-id<MTLTexture> MetalBackend::Impl::copy_texture(id<MTLTexture> src)
+// A draw samples a target it also draws to: it reads a copy, taken before it (D-148). The copy is the surface's own,
+// made again only after a write to the surface (its generations), so draws that do not write the target they sample
+// (GTA V's, colour mask 0 there) share one copy and keep their pass. A new copy is a new texture: copying into the
+// one earlier draws read made the GPU wait for them each time (GPU time per frame 8.5 ms to 22 ms on the Mac walk);
+// the old one goes when the GPU is done with it, so a frame holds as many as it has writes between such draws.
+id<MTLTexture> MetalBackend::Impl::feedback_copy(Surface& s)
 {
-    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
-                                                                                 width:src.width
-                                                                                height:src.height
-                                                                             mipmapped:NO];
-    d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    d.storageMode = MTLStorageModePrivate;
-    id<MTLTexture> dst = [device newTextureWithDescriptor:d];
-    end_pass_for(kEndTargetCopy);
-    id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
-    [blit copyFromTexture:src toTexture:dst];
-    [blit endEncoding];
-    return dst;
+    Surface::Conversion& c = s.feedback;
+    const bool fresh = !c.texture || c.generation != s.generation || c.stencil_generation != s.stencil_generation;
+    if (fresh) {
+        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s.texture.pixelFormat
+                                                                                     width:s.texture.width
+                                                                                    height:s.texture.height
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        d.storageMode = MTLStorageModePrivate;
+        c.texture = [device newTextureWithDescriptor:d];
+        c.views.clear();
+        end_pass_for(kEndFeedbackCopy);
+        id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
+        [blit copyFromTexture:s.texture toTexture:c.texture];
+        [blit endEncoding];
+        c.generation = s.generation;
+        c.stencil_generation = s.stencil_generation;
+        stats.feedback_copies++;
+    }
+    return c.texture;
 }
 
 Surface::Conversion* MetalBackend::Impl::depth_as_texture(Surface& d, u32 mode)

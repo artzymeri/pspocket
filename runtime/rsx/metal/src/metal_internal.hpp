@@ -55,10 +55,13 @@ public:
     void retire(id<MTLCommandBuffer> cb);
     // Changes at each retire: an allocation made in this generation is still valid to bind.
     u64 generation() const { return generation_; }
+    // What the command buffer being recorded holds (chunks and buffers of its own) until it is retired (D-148).
+    u64 bytes_in_use() const { return bytes_in_use_; }
 
 private:
     static constexpr u32 kChunkSize = 4u << 20;
     u64 generation_ = 0;
+    u64 bytes_in_use_ = 0;
     id<MTLDevice> device_ = nil;
     id<MTLBuffer> current_ = nil;
     u32 offset_ = 0;
@@ -102,6 +105,9 @@ struct Surface {
     std::unordered_map<u32, Conversion> conversions;
     // Its top-left corner sampled as a smaller texture at its start (D-120), by width << 16 | height.
     std::unordered_map<u32, Conversion> corners;
+    // A copy for draws that sample it while they draw to it (D-148): made again only once it was written since. A copy
+    // per draw was up to ~200 whole targets a frame, held until the GPU ran the frame (4.7 GB on the iPhone, run 089).
+    Conversion feedback;
     // A colour target inside a larger one with its pitch and format, not at its start (D-122): its own texture, the
     // larger one its parent. What one writes reaches the other on the GPU before the other is used: a child's pixels
     // go into its place in the parent; after the parent is written, the child takes its place back from it.
@@ -351,9 +357,13 @@ struct MetalBackend::Impl {
     // and passes every kGpuReportFlips flips: what a slower GPU (the iPhone's) has to fit in a frame.
     static constexpr u64 kGpuReportFlips = 300;
     std::shared_ptr<std::atomic<u64>> gpu_ns = std::make_shared<std::atomic<u64>>(0);
-    // Why render passes ended (a started pass only), for the same report: the pass loads and stores its targets.
-    enum PassEnd : u8 { kEndTargets, kEndTargetCopy, kEndDepthConversion, kEndColorConversion, kEndTargetOverlay,
-                        kEndSubmit, kEndFlip, kEndSurfaceGone, kEndFlush, kEndOther, kEndCount };
+    // Why render passes ended (a started pass only), for the same report: the pass loads and stores its targets. The
+    // copies between targets are told apart (D-148): an NV0039 copy on the GPU, a target sampled while drawn to, a
+    // corner of a larger target, pixels between a target and its parent, a target grown over a smaller one.
+    enum PassEnd : u8 { kEndTargets, kEndGpuCopy, kEndFeedbackCopy, kEndCornerCopy, kEndRegionCopy, kEndGrow,
+                        kEndDepthConversion, kEndColorConversion, kEndTargetOverlay, kEndSubmit, kEndFlip, kEndSurfaceGone,
+                        kEndFlush, kEndOther, kEndCount };
+    static_assert(kEndCount == kPassEndNames.size(), "kPassEndNames names every PassEnd");
     PassEnd pass_end_reason = kEndOther;
     std::array<u64, kEndCount> pass_ends{}, report_pass_ends{};
     void end_pass_for(PassEnd why)
@@ -367,6 +377,13 @@ struct MetalBackend::Impl {
     u64 report_faults = 0; // the tracker's write faults at the last report (D-134)
     u64 report_overlays = 0;
     u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0;
+    u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
+    // At most config.frames_in_flight frames queued for the GPU (D-148): a flip waits for the oldest to complete. Each
+    // frame queued holds what it allocated until then, and nothing else held the RSX thread back.
+    dispatch_semaphore_t frames_in_flight = nil;
+    u32 frames_in_flight_limit = 0;
+    std::atomic<bool> trim_requested{false}; // MetalBackend::trim_memory
+    void trim();                             // serves it, at a flip
     __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
     u32 visibility_next = 0;
     bool zpass_on = false;
@@ -414,7 +431,7 @@ struct MetalBackend::Impl {
     // Textures unused for a minute of flips are freed (decoded again if used again), and surfaces unused as long whose
     // guest memory holds what they do (D-116): GTA V streams textures to new places all the time, and a phone has a few
     // GB, not a Mac's.
-    void evict_unused();
+    void evict_unused(u64 unused_flips);
     void take_shader_cache();
     std::unordered_map<u64, id<MTLDepthStencilState>> depth_states;
     std::unordered_map<u64, id<MTLSamplerState>> samplers;
@@ -514,7 +531,7 @@ struct MetalBackend::Impl {
     void upload_surface_bytes(Surface& s); // the formats store_readback writes, but A8R8G8B8 (D-110)
     bool newer_in_guest(const PassTargets& t) const; // a target whose guest memory is newer: reloaded by open_pass
     void remove_surface(Surface* s);
-    id<MTLTexture> copy_texture(id<MTLTexture> src);
+    id<MTLTexture> feedback_copy(Surface& s); // D-148
     // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the
     // buffer was drawn to since; nil when it cannot be.
     Surface::Conversion* depth_as_texture(Surface& d, u32 mode);

@@ -2333,6 +2333,30 @@ as StikDebug), which stays the fallback if B proves impossible.
 - Rule 1 holds: translated code, decrypted executables, firmware and logs stay on the phone or in inventory/. The
   development certificate's key is the user's own and goes to their phone only, never into the repository.
 
+## D-148 · 2026-10-05 · Feedback copies made once per write, frames in flight capped, GPU caches trimmed when iOS warns
+
+The iPhone stopped GTA V after ten minutes of play (run 089): memory went from 1.8 GB to 4.3 GB and back, then to
+4.7 GB, and iOS ended the app. A draw that samples a render target it also draws to got a new full-size copy of the
+target every time (3.7 to 14.7 MB), and every copy lived until the GPU had run the frame, with nothing limiting how
+many frames the RSX thread queued: about 200 copies a frame in the heavy stretches. GTA V's draws of this kind write
+nothing to the target they sample (colour mask 0 there).
+- **Feedback copies:** one per surface, made again only after a write to it (its generation; a draw changes it only
+  where its mask writes, metal_backend.mm:1204). A new copy is a new texture, as corner copies stay too: copying into
+  the one earlier draws read would make the GPU wait for them. GTA V's walk: 5 copies a frame where there were 9 to 16
+  target copies, render passes 84 a frame where there were 87, GPU memory flat at 220 to 230 MB.
+- **Frames in flight:** at most three (a semaphore the frame's last command buffer signals when it completes); a flip
+  waits for the oldest, and the wait is reported per frame (0 ms on the Mac walk: the GPU keeps up there).
+- **Transient budget:** past 256 MB of uploads in the command buffer being recorded, it is submitted early.
+- **iOS:** on a memory warning, or under 1.5 GB left before iOS stops the app, `MetalBackend::trim_memory()` frees, at
+  the next flip, textures and surfaces unused for 60 flips and the feedback copies, and lets finished readbacks land;
+  logged. The game's previous log stays as game-prev.log.
+- **Telemetry:** the per-frame line tells the five kinds of copies between targets apart (gpu copy, feedback copy,
+  corner copy, region copy, grow), and adds the feedback copies, corner textures and surface reloads per frame, the wait
+  for the GPU, `MTLDevice.currentAllocatedSize` and the deferred queue; the numbers also go to a callback
+  (`MetalBackendConfig::on_window`) for pspocket-boot's summary.
+- Tests: 50 draws that sample their own target with the mask off share one copy and one pass; a draw after a write to
+  the target samples the write (an old copy would show the clear).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
