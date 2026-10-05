@@ -45,6 +45,7 @@
 #include "pspocket/lv2/report.hpp"
 #include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/loader/disc.hpp"
+#include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/platform/audio_output.hpp"
@@ -79,6 +80,7 @@ struct Session {
     std::unique_ptr<rsx::WriteTracker> tracker;
     std::unique_ptr<lv2::Kernel> kernel;
     std::unique_ptr<hle::HleProcess> hle;
+    std::unique_ptr<loader::LleModules> lle; // the firmware modules it runs (D-157)
     std::unique_ptr<platform::AudioOutput> audio; // the game's sound (cellAudio's mix) on the phone's output
     loader::BootState state;
     std::chrono::steady_clock::time_point start;
@@ -420,10 +422,21 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
             [out](bool on, f32 tempo) { out->set_stretch(on, tempo); });
     }
 
+    // Firmware modules (D-157): with the system software installed, the import libraries pspocket has nothing of are
+    // served by the PS3's own modules. Indexed once (lle-index.txt beside /dev_flash).
+    if (o->flash_dir && std::filesystem::is_directory(o->flash_dir, ec)) {
+        s->lle = std::make_unique<loader::LleModules>(o->flash_dir);
+        std::string why;
+        if (!s->lle->index(&why)) {
+            PS_LOG_WARN(kChan, "no firmware modules: {}", why);
+            s->lle.reset();
+        }
+    }
     loader::LoadReport report;
-    if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report); r != lv2::CELL_OK) {
+    if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report, s->lle.get()); r != lv2::CELL_OK) {
         return fail(error, error_size, std::string("loading the executable failed: ") + lv2::error_name(r));
     }
+    if (s->lle) s->state.module_starts = s->lle->starts();
 #if PSPOCKET_HAVE_GAME_SPU
     // The lifted SPU programs built into the app (scripts/ios.sh), first: a program is found by its code's hash, the
     // first registered winning, so these (with the entries the Mac's runs collected, D-099) run where the library has

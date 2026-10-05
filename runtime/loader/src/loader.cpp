@@ -13,6 +13,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/hle/process.hpp"
+#include "pspocket/loader/lle.hpp"
 #include "pspocket/recomp/guest_image.hpp"
 #include "pspocket/recomp/nid.hpp"
 
@@ -111,6 +112,24 @@ void main_executor(void* user, PPUContext& ctx, u8* base, u32 entry)
         }
         ps_write64(base, slot, 0);
         ctx.gpr[1] -= alloc;
+
+        // The firmware modules' module_start (D-157), dependencies first, as RPCS3 ppu_load_exec: { set_args 2: 0, 0 },
+        // lle_call. Each returns to kThreadReturnAddress like a callback; r1, r2 and LR come back.
+        const u64 toc = ctx.gpr[2], lr = ctx.lr;
+        for (const u32 start : st.module_starts) {
+            const u64 sp = ctx.gpr[1];
+            ctx.gpr[1] = (sp - 0x80) & ~u64{15};
+            ps_write64(base, static_cast<u32>(ctx.gpr[1]), sp);
+            ctx.gpr[2] = ps_read32(base, start + 4);
+            ctx.gpr[3] = 0;
+            ctx.gpr[4] = 0;
+            ctx.lr = lv2::kThreadReturnAddress;
+            st.inner(st.inner_user, ctx, base, ps_read32(base, start));
+            PS_LOG_INFO(kChan, "module_start {:#010x} returned {:#x}", start, static_cast<u32>(ctx.gpr[3]));
+            ctx.gpr[1] = sp;
+        }
+        ctx.gpr[2] = toc;
+        ctx.lr = lr;
 
         // { set_args 8: argc, argv, envp, envc, thread id, TLS image, size, memory size }, r11 = e_entry,
         // r12 = malloc page size, entry_call.
@@ -214,7 +233,8 @@ bool register_translated_ppu(const GuestMemory& memory, const u32* image_words, 
     return true;
 }
 
-lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess& hle, LoadReport* report)
+lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess& hle, LoadReport* report,
+    LleModules* lle)
 {
     const Executable* exe = &exe_ref;
     using lv2::err;
@@ -261,10 +281,26 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
         rep.segments++;
     }
 
-    // Imports (RPCS3 ppu_load_imports): each stub table slot gets the linked descriptor.
+    // Imports (RPCS3 ppu_load_imports): each stub table slot gets the linked descriptor: the firmware module's export
+    // when the library goes LLE (D-157), else the host module's stub.
     for (const auto& lib : exe->module().imports) {
+        const PrxModule* module = nullptr;
+        if (lle && lle->chooses(lib.name)) {
+            std::string why;
+            module = lle->load(lib.name, hle, &why);
+            if (!module) PS_LOG_ERROR(kChan, "{} stays on the host: {}", lib.name, why);
+        }
         for (const auto& fn : lib.functions) {
-            const u32 descriptor = hle.link_function(lib.name, fn.nid, fn.resolved.name);
+            u32 descriptor = 0;
+            if (module) {
+                if (const auto it = module->functions.find({lib.name, fn.nid}); it != module->functions.end()) {
+                    descriptor = it->second;
+                    rep.functions_lle++;
+                } else {
+                    PS_LOG_ERROR(kChan, "{}::{} ({:#010x}) is not in {}", lib.name, fn.resolved.name, fn.nid, module->file);
+                }
+            }
+            if (!descriptor) descriptor = hle.link_function(lib.name, fn.nid, fn.resolved.name);
             if (!descriptor) return err(lv2::CELL_ENOMEM);
             ps_write32(base, fn.slot, descriptor);
             if (fn.refs) patch_refs(mem, *fn.refs, descriptor, std::format("{}::{}", lib.name, fn.resolved.name));
@@ -272,18 +308,26 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
             if (hle::registry().find(lib.name, fn.nid)) rep.functions_implemented++;
         }
         for (const auto& var : lib.variables) {
+            if (module) {
+                if (const auto it = module->variables.find({lib.name, var.nid}); it != module->variables.end()) {
+                    patch_refs(mem, var.ref_table, it->second, std::format("{}::{}", lib.name, var.resolved.name));
+                    continue;
+                }
+            }
             PS_LOG_ERROR(kChan, "UNIMPLEMENTED variable {}::{} ({:#010x}): {} references left unpatched", lib.name,
                 var.resolved.name.empty() ? "?" : var.resolved.name, var.nid, var.refs.size());
             rep.variables_unresolved++;
         }
         for (const auto& p : lib.problems) PS_LOG_WARN(kChan, "import library {}: {}", lib.name, p);
     }
+    if (lle) rep.lle_modules = static_cast<u32>(lle->loaded().size());
     // Functions the imported modules hand to the game by address (cellGcmCallback), linked while no guest thread runs.
     std::vector<std::string> modules;
     for (const auto& lib : exe->module().imports) modules.push_back(lib.name);
     if (!hle.link_internal_functions(modules)) return err(lv2::CELL_ENOMEM);
-    PS_LOG_INFO(kChan, "{} segments, {} imported functions ({} implemented), {} unresolved variables", rep.segments,
-        rep.functions_linked, rep.functions_implemented, rep.variables_unresolved);
+    PS_LOG_INFO(kChan, "{} segments, {} imported functions ({} implemented, {} by {} firmware modules), {} unresolved "
+                       "variables", rep.segments, rep.functions_linked, rep.functions_implemented, rep.functions_lle,
+        rep.lle_modules, rep.variables_unresolved);
     if (report) *report = rep;
     return lv2::CELL_OK;
 }

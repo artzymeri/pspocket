@@ -18,7 +18,7 @@
 // r11 = e_entry, r12 = malloc page size. argv and envp (arrays of u64 pointers) and their strings sit at the top of the
 // main thread's stack, r1 moved below them.
 //
-// Deviations: PRX modules (LLE firmware libraries, the game's own) are not loaded yet; segments are writable (RPCS3
+// Deviations: the game's own PRX modules are not loaded yet (firmware ones are: lle.hpp); segments are writable (RPCS3
 // write-protects read-only LOAD segments); the main thread's stack is taken from the default memory container but
 // the executable's segments are not (RPCS3 takes both).
 
@@ -78,6 +78,8 @@ struct BootState {
     // The executor every thread finally runs (default: lv2::default_executor).
     lv2::Executor inner = lv2::default_executor;
     void* inner_user = nullptr;
+    // Firmware modules' module_start descriptors (LleModules::starts()), run on the main thread before the entry.
+    std::vector<u32> module_starts;
 };
 
 // Wraps cfg.executor so the main thread runs sys_initialize_tls and receives its arguments before the entry.
@@ -87,11 +89,17 @@ struct LoadReport {
     u32 segments = 0;
     u32 functions_linked = 0;
     u32 functions_implemented = 0; // linked to an HLE implementation
+    u32 functions_lle = 0;         // linked to a firmware module's export
+    u32 lle_modules = 0;           // firmware modules loaded
     u32 variables_unresolved = 0;
 };
 
-// Maps the segments and links the imports. No guest code runs.
-lv2::Result load(const Executable& exe, lv2::Kernel& kernel, hle::HleProcess& hle, LoadReport* report = nullptr);
+class LleModules;
+
+// Maps the segments and links the imports. No guest code runs. With `lle` (indexed), the import libraries it chooses
+// go to their firmware modules, which load here (D-157); give lle->starts() to BootState::module_starts.
+lv2::Result load(const Executable& exe, lv2::Kernel& kernel, hle::HleProcess& hle, LoadReport* report = nullptr,
+    LleModules* lle = nullptr);
 
 // Creates and starts the main thread of a loaded executable.
 lv2::Result start_main_thread(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, BootState& state,

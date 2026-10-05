@@ -100,6 +100,7 @@
 #include "pspocket/core/png.hpp"
 #include "pspocket/core/thread_report.hpp"
 #include "pspocket/game/host.hpp"
+#include "pspocket/loader/lle.hpp"
 #if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
 #include "pspocket/platform/audio_output.hpp"
 #endif
@@ -127,7 +128,7 @@ int usage()
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
-        "                     [--builtin-spu]\n"
+        "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]...\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -658,6 +659,8 @@ int main(int argc, char** argv)
     std::string spu_dump;
     std::string game_library; // --game-library (D-152)
     bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the app's way)
+    bool lle_on = true;                // --no-lle: no firmware modules even with --flash (D-157)
+    std::vector<std::string> lle_force; // --lle LIBRARY: that library from its firmware module whatever the host has
     bool frame_jumps = false;
     std::string summary_path;
     const auto add_press = [&](std::string_view spec) {
@@ -676,6 +679,8 @@ int main(int argc, char** argv)
         if (a == "--bdvd") { const char* v = value(); if (!v) return usage(); bdvd = v; }
         else if (a == "--hdd0") { const char* v = value(); if (!v) return usage(); hdd0 = v; }
         else if (a == "--flash") { const char* v = value(); if (!v) return usage(); flash = v; }
+        else if (a == "--no-lle") lle_on = false;
+        else if (a == "--lle") { const char* v = value(); if (!v) return usage(); lle_force.emplace_back(v); }
         else if (a == "--app-home") { const char* v = value(); if (!v) return usage(); app_home = v; }
         else if (a == "--timeout") { const char* v = value(); if (!v) return usage(); timeout_s = std::atof(v); }
         else if (a == "--report-every") {
@@ -917,12 +922,26 @@ int main(int argc, char** argv)
     }
 #endif
 
+    // Firmware modules (D-157): with /dev_flash, the import libraries the host has nothing of are served by the PS3's
+    // own modules.
+    std::unique_ptr<loader::LleModules> lle;
+    if (!flash.empty() && lle_on) {
+        lle = std::make_unique<loader::LleModules>(flash);
+        std::string why;
+        if (lle->index(&why)) {
+            for (const std::string& l : lle_force) lle->force(l);
+        } else {
+            PS_LOG_WARN("boot", "no firmware modules: {}", why);
+            lle.reset();
+        }
+    }
     u32 main_id = 0;
     loader::LoadReport report;
-    if (const lv2::Result r = loader::load(**exe, kernel, hle, &report); r != lv2::CELL_OK) {
+    if (const lv2::Result r = loader::load(**exe, kernel, hle, &report, lle.get()); r != lv2::CELL_OK) {
         std::fprintf(stderr, "pspocket-boot: load failed: %s\n", lv2::error_name(r));
         return 70;
     }
+    if (lle) state.module_starts = lle->starts();
     if (list_imports) {
         print_imports(hle);
         return 0;
