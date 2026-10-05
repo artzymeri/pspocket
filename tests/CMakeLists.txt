@@ -7,7 +7,7 @@ function(pspocket_add_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-foreach(sub core common ppu spu lv2 hle rsx disc codesign homebrew)
+foreach(sub core common ppu spu lv2 hle rsx disc codesign codegen homebrew)
     pspocket_component_enabled(tests/${sub} enabled)
     if(enabled AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${sub}/CMakeLists.txt)
         add_subdirectory(${sub})
