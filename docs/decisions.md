@@ -1930,6 +1930,20 @@ In the Mac's first-mission walk GTA V does not reset the FIFO; whether it does a
 Trevor) the next phone log shows.
 - Test: the game moves the FIFO at the first clear of a stream of three: the other two never run.
 
+## D-124 · 2026-10-05 · An SPU PUT writes its first word last: the RSX resumes only on a whole block
+
+The iPhone's FIFO desyncs (several a minute in the first mission's escape; D-118's reports show them): the RSX parked
+on a jump-to-self, the word changed, and the words after it were the previous lap's: the first eight new, the rest
+stale, overwritten moments later. A probe of every SPU DMA into the command ring (100,000 in a Mac run of the
+mission) showed how GTA V fills it: its graphics jobs (two programs, three PUT sites) write each block of RSX
+commands, 16 bytes to 4.5 KB, with one PUT, whose first word lands over the jump-to-self the RSX waits on. A plain copy's
+stores reach another core in any order on ARM, and the SPU thread can be preempted inside it; on the Cell the block
+lands long before the RSX looks again. Every PUT longer than a word now copies all but its first word, then stores the
+first word with release: the RSX's acquire load of the parked word sees the whole block (D-077's release fence before
+each PUT still orders PUTs among themselves). D-118's re-read stays as the net under it. The app's frame-rate line now
+also says iOS's heat level ("heat nominal / fair / serious / critical").
+- No test reproduces the race without the game: it lives in the order stores reach another core.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

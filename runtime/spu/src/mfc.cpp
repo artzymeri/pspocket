@@ -173,6 +173,15 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     }
     if (cmd == PS_MFC_SDCRZ) {
         std::memset(mem, 0, size);
+    } else if (!is_get(cmd) && size > 4) {
+        // The first word last, as a release store (D-124). GTA V's graphics jobs write each block of RSX commands with
+        // one PUT, from 16 bytes to 4.5 KB, over the jump-to-self the RSX is parked on: the block's first word. A plain
+        // copy's stores can reach another core in any order, and the RSX, seeing that word change, read on into words
+        // not written yet (the iPhone's FIFO desyncs, several a minute in the first mission's escape).
+        ls_copy(ctx->ls, lsa + 4, mem + 4, size - 4, false);
+        u32 head; // its bytes as they are
+        std::memcpy(&head, ctx->ls + (lsa & PS_SPU_LS_MASK), 4);
+        __atomic_store_n(reinterpret_cast<u32*>(mem), head, __ATOMIC_RELEASE);
     } else {
         ls_copy(ctx->ls, lsa, mem, size, is_get(cmd));
         if (is_get(cmd)) {

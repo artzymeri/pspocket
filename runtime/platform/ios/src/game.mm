@@ -236,9 +236,12 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
             if (now - raw->rate_since >= kRateInterval) {
                 const double dt = std::chrono::duration<double>(now - raw->rate_since).count();
                 const u64 underruns = raw->audio ? raw->audio->stats().underruns : 0;
-                PS_LOG_INFO(kChan, "{:.1f} fps ({} frames in {:.1f} s; {} since the boot); the speaker ran dry {} times",
-                    static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips, dt, flips,
-                    underruns - raw->rate_underruns);
+                // iOS's heat level: from "serious" the system slows the chips down.
+                static constexpr const char* kThermal[] = {"nominal", "fair", "serious", "critical"};
+                const auto thermal = static_cast<usize>([[NSProcessInfo processInfo] thermalState]);
+                PS_LOG_INFO(kChan, "{:.1f} fps ({} frames in {:.1f} s; {} since the boot); the speaker ran dry {} times; "
+                                   "heat {}", static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips,
+                    dt, flips, underruns - raw->rate_underruns, kThermal[std::min<usize>(thermal, 3)]);
                 raw->rate_underruns = underruns;
                 raw->rate_since = now;
                 raw->rate_flips = flips;
