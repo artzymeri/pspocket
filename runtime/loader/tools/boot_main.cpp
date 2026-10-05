@@ -59,6 +59,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <dlfcn.h>
+#include <sys/mman.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -129,7 +131,7 @@ int usage()
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
-        "                     [--async-shaders MS]\n"
+        "                     [--async-shaders MS] [--watch ADDR]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -144,6 +146,10 @@ extern const uint32_t game_ppu_image_words[];  // (address, word) pairs of the i
 extern const uint32_t game_ppu_image_word_count;
 }
 #endif
+
+// The interpreter's last taken branch to address 0 on the calling thread (runtime/ppu interpreter.cpp; declared here, not
+// in runtime.h, whose text is part of the game library ABI hash).
+extern "C" uint32_t ps_ppu_zero_branch_from(void);
 
 u8* g_guest_base = nullptr;
 GuestMemory* g_memory = nullptr;
@@ -236,6 +242,18 @@ void report_call_site(const PPUContext& c)
         static_cast<unsigned long long>(c.gpr[8]), static_cast<unsigned long long>(c.gpr[9]),
         static_cast<unsigned long long>(c.gpr[10]));
     write_err(buf, std::min<int>(n, sizeof buf - 1));
+    // The rest, for interpreted code (exact there): r11..r31, CTR and CR.
+    for (u32 r = 11; r < 32; r += 7) {
+        n = std::snprintf(buf, sizeof buf, "  r%u..r%u = 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n", r,
+            std::min(r + 6, 31u), static_cast<unsigned long long>(c.gpr[r]), static_cast<unsigned long long>(c.gpr[r + 1]),
+            static_cast<unsigned long long>(c.gpr[r + 2]), static_cast<unsigned long long>(c.gpr[r + 3]),
+            static_cast<unsigned long long>(c.gpr[r + 4]), static_cast<unsigned long long>(c.gpr[r + 5]),
+            static_cast<unsigned long long>(r + 6 < 32 ? c.gpr[r + 6] : 0));
+        write_err(buf, std::min<int>(n, sizeof buf - 1));
+    }
+    n = std::snprintf(buf, sizeof buf, "  ctr 0x%llx; the interpreter's last branch to 0 was at 0x%08x\n",
+        static_cast<unsigned long long>(c.ctr), ps_ppu_zero_branch_from());
+    write_err(buf, std::min<int>(n, sizeof buf - 1));
     if (g_hle) {
         if (const hle::LinkedFunction* f = g_hle->linked_at(c.cia)) {
             n = std::snprintf(buf, sizeof buf, "  in firmware function %s::%s (0x%08X), called from 0x%08x:\n",
@@ -283,9 +301,119 @@ void report_host_frames(void* uctx)
         fp = frame[0];
     }
     write_err("\n", 1);
+    // Translated code in a game library (D-152): the library's base, for "atos -o game.dylib -l BASE ADDR", whose
+    // symbol names the guest function. Every image the frames are in, once.
+    uintptr_t seen[8] = {};
+    u32 seen_count = 0;
+    auto name_image = [&](uintptr_t pc) {
+        Dl_info info{};
+        if (!dladdr(reinterpret_cast<const void*>(pc), &info) || !info.dli_fname || !info.dli_fbase) return;
+        const auto image = reinterpret_cast<uintptr_t>(info.dli_fbase);
+        for (u32 i = 0; i < seen_count; i++)
+            if (seen[i] == image) return;
+        if (seen_count < 8) seen[seen_count++] = image;
+        n = std::snprintf(buf, sizeof buf, "  frames in %s, loaded at 0x%llx\n", info.dli_fname,
+            static_cast<unsigned long long>(image));
+        write_err(buf, std::min<int>(n, sizeof buf - 1));
+    };
+    name_image(ss.__pc);
+    fp = ss.__fp;
+    for (int i = 0; i < 48 && fp >= lo && fp + 16 <= hi && (fp & 15) == 0; i++) {
+        const auto* frame = reinterpret_cast<const uintptr_t*>(fp);
+        name_image(frame[1]);
+        if (frame[0] <= fp) break;
+        fp = frame[0];
+    }
 #else
     (void)uctx;
 #endif
+}
+
+// --watch ADDR: the host page holding the guest word is read-only; a store to the word is reported with its writer
+// (the PPU thread and its position, or the host thread and the SPU code it runs), then the page opens for the store
+// and closes again a moment later (watch_thread). Stores elsewhere in the page go through the same way, unreported.
+std::atomic<u32> g_watch_addr{0};
+std::atomic<bool> g_watch_open{false};
+uintptr_t g_watch_page = 0;
+usize g_watch_page_size = 0;
+std::atomic<u32> g_watch_hits{0};
+// The page's last writers (one per opening of the page), for when the word changes in a store that came while the page
+// was open: the store that opened it is likely the same writer (a memset across the word).
+struct WatchWriter {
+    u32 guest = 0, thread = 0, cia = 0;
+    u64 lr = 0, pc = 0;
+    char name[32] = {};
+};
+WatchWriter g_watch_ring[8];
+std::atomic<u32> g_watch_ring_next{0};
+
+bool handle_watch_fault(uintptr_t host, void* uctx)
+{
+    if (!g_watch_page || host < g_watch_page || host >= g_watch_page + g_watch_page_size) return false;
+    const u32 guest = static_cast<u32>(host - reinterpret_cast<uintptr_t>(g_guest_base));
+    {
+        const lv2::PpuThread* t = lv2::current_thread();
+        WatchWriter& w = g_watch_ring[g_watch_ring_next.fetch_add(1) % 8];
+        w.guest = guest;
+        w.thread = t ? t->id : 0;
+        w.cia = t && t->ctx ? t->ctx->cia : 0;
+        w.lr = t && t->ctx ? t->ctx->lr : 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+        w.pc = uctx ? static_cast<const ucontext_t*>(uctx)->uc_mcontext->__ss.__pc : 0;
+#endif
+        pthread_getname_np(pthread_self(), w.name, sizeof w.name);
+    }
+    const u32 watched = g_watch_addr.load(std::memory_order_relaxed);
+    if (guest >= watched && guest < watched + 8 && g_watch_hits.fetch_add(1) < 64) {
+        const lv2::PpuThread* t = lv2::current_thread();
+        const PPUContext* c = t ? t->ctx : nullptr;
+        char name[64] = "?";
+        pthread_getname_np(pthread_self(), name, sizeof name);
+        char buf[320];
+        int n = std::snprintf(buf, sizeof buf,
+            "[watch] store to 0x%08x (holding 0x%08x) by %s 0x%x \"%s\" at cia 0x%08x, lr 0x%llx\n", guest,
+            ps_read32(g_guest_base, guest & ~3u), t ? "PPU thread" : "host thread", t ? t->id : 0, name,
+            c ? c->cia : 0, c ? static_cast<unsigned long long>(c->lr) : 0ull);
+        write_err(buf, std::min<int>(n, sizeof buf - 1));
+        report_host_frames(uctx);
+        if (const SPUContext* spu = t ? nullptr : ps_spu_current()) {
+            n = std::snprintf(buf, sizeof buf, "  SPU code at 0x%05x; MFC: LSA 0x%05x, EA 0x%08x%08x, size 0x%x\n",
+                spu->pc & 0x3FFFC, spu->ch.mfc_lsa, spu->ch.mfc_eah, spu->ch.mfc_eal, spu->ch.mfc_size);
+            write_err(buf, std::min<int>(n, sizeof buf - 1));
+        }
+    }
+    mprotect(reinterpret_cast<void*>(g_watch_page), g_watch_page_size, PROT_READ | PROT_WRITE);
+    g_watch_open.store(true, std::memory_order_release);
+    return true;
+}
+
+void start_watch(u32 addr)
+{
+    g_watch_page_size = GuestMemory::host_page_size();
+    g_watch_page = (reinterpret_cast<uintptr_t>(g_guest_base) + addr) & ~(g_watch_page_size - 1);
+    g_watch_addr = addr;
+    mprotect(reinterpret_cast<void*>(g_watch_page), g_watch_page_size, PROT_READ);
+    std::fprintf(stderr, "[watch] 0x%08x holds 0x%08x\n", addr, ps_read32(g_guest_base, addr & ~3u));
+    std::thread([] {
+        u32 last = ps_read32(g_guest_base, g_watch_addr & ~3u);
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            if (g_watch_open.exchange(false, std::memory_order_acq_rel))
+                mprotect(reinterpret_cast<void*>(g_watch_page), g_watch_page_size, PROT_READ);
+            if (const u32 now = ps_read32(g_guest_base, g_watch_addr & ~3u); now != last) {
+                std::fprintf(stderr, "[watch] 0x%08x now holds 0x%08x (was 0x%08x); the page's last writers, newest first:\n",
+                    g_watch_addr.load(), now, last);
+                const u32 next = g_watch_ring_next.load();
+                for (u32 i = 1; i <= 8 && i <= next; i++) {
+                    const WatchWriter& w = g_watch_ring[(next - i) % 8];
+                    std::fprintf(stderr, "  store at 0x%08x by thread 0x%x \"%s\" (cia 0x%08x, lr 0x%llx, host pc 0x%llx)\n",
+                        w.guest, w.thread, w.name, w.cia, static_cast<unsigned long long>(w.lr),
+                        static_cast<unsigned long long>(w.pc));
+                }
+                last = now;
+            }
+        }
+    }).detach();
 }
 
 void on_fault(int sig, siginfo_t* info, void* uctx)
@@ -294,6 +422,7 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
     // A store to a page the texture cache's write tracker made read-only (D-134): resolved, the store runs again.
     if (ps_rsx_handle_write_fault(info->si_addr)) return;
 #endif
+    if (handle_watch_fault(reinterpret_cast<uintptr_t>(info->si_addr), uctx)) return;
     const auto addr = reinterpret_cast<uintptr_t>(info->si_addr);
     const auto base = reinterpret_cast<uintptr_t>(g_guest_base);
     const lv2::PpuThread* t = lv2::current_thread();
@@ -665,6 +794,8 @@ int main(int argc, char** argv)
     [[maybe_unused]] bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the
                                                // app's way); only a build with them uses it
     bool lle_on = true;                // --no-lle: no firmware modules even with --flash (D-157)
+    u32 watch = 0;                     // --watch ADDR[@SECONDS]: report the stores to that guest word
+    double watch_after = 0;
     std::vector<std::string> lle_force; // --lle LIBRARY: that library from its firmware module whatever the host has
     std::vector<std::string> lle_load;  // --lle-load LIBRARY: its module (and theirs) loaded and started at boot
     bool frame_jumps = false;
@@ -686,6 +817,14 @@ int main(int argc, char** argv)
         else if (a == "--hdd0") { const char* v = value(); if (!v) return usage(); hdd0 = v; }
         else if (a == "--flash") { const char* v = value(); if (!v) return usage(); flash = v; }
         else if (a == "--no-lle") lle_on = false;
+        else if (a == "--watch") {
+            // ADDR, or ADDR@SECONDS: from that time on (a thread's stack exists only once the thread does).
+            const char* v = value();
+            if (!v) return usage();
+            char* end = nullptr;
+            watch = static_cast<u32>(std::strtoul(v, &end, 0));
+            if (end && *end == '@') watch_after = std::atof(end + 1);
+        }
         else if (a == "--lle") { const char* v = value(); if (!v) return usage(); lle_force.emplace_back(v); }
         else if (a == "--lle-load") { const char* v = value(); if (!v) return usage(); lle_load.emplace_back(v); }
         else if (a == "--app-home") { const char* v = value(); if (!v) return usage(); app_home = v; }
@@ -968,6 +1107,13 @@ int main(int argc, char** argv)
             return 70;
         }
     }
+    // Modules the game loads while it runs (sys_prx_load_module, D-159).
+    loader::RuntimeModules runtime_modules(hle, *exe, lle.get());
+    hle.set_module_loader(&runtime_modules);
+    struct ForgetModules {
+        hle::HleProcess& hle;
+        ~ForgetModules() { hle.set_module_loader(nullptr); }
+    } forget_modules{hle};
     if (lle) {
         state.module_starts = lle->starts();
         for (const auto& m : lle->loaded())
@@ -1032,6 +1178,13 @@ int main(int argc, char** argv)
             else kept++;
         }
         PS_LOG_INFO("boot", "PSPOCKET_PPU_ONLY={}: {} translated functions kept", only, kept);
+    }
+    if (watch && watch_after <= 0) start_watch(watch);
+    if (watch && watch_after > 0) {
+        std::thread([watch, watch_after] {
+            std::this_thread::sleep_for(std::chrono::duration<double>(watch_after));
+            start_watch(watch);
+        }).detach();
     }
     if (const lv2::Result r = loader::start_main_thread(*exe, kernel, state, {}, main_id); r != lv2::CELL_OK) {
         std::fprintf(stderr, "pspocket-boot: cannot start the main thread: %s\n", lv2::error_name(r));

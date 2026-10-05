@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -204,8 +205,31 @@ void log_write(u32 cmd, u32 pc, u32 ea, u32 size)
     r.next.store(i + 1, std::memory_order_release);
 }
 
+// PSPOCKET_SPU_WATCH=LO-HI: every SPU write into guest [LO, HI) is logged with its command and SPU position (finding
+// what corrupts a PPU stack or a structure; dev only).
+struct SpuWatch {
+    u32 lo = 0, hi = 0;
+    SpuWatch()
+    {
+        if (const char* e = std::getenv("PSPOCKET_SPU_WATCH")) {
+            char* end = nullptr;
+            lo = static_cast<u32>(std::strtoul(e, &end, 0));
+            if (end && *end == '-') hi = static_cast<u32>(std::strtoul(end + 1, nullptr, 0));
+        }
+    }
+};
+const SpuWatch& spu_watch()
+{
+    static const SpuWatch w;
+    return w;
+}
+
 int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
 {
+    if (const SpuWatch& w = spu_watch(); w.hi && !is_get(cmd) && eal < w.hi && eal + size > w.lo) {
+        PS_LOG_WARN("spu", "SPU write into the watched range: cmd {:#x} at SPU pc {:#07x}, LSA {:#07x} -> EA {:#010x}, size {:#x}",
+            cmd, pc, lsa, eal, size);
+    }
     if (size == 0) return 0;
     if (eal >= PS_SPU_RAW_BASE) return group_mmio(ctx, pc, cmd, lsa, eal, size);
     if (eal - PS_MEM_RSX_LOCAL_BASE < PS_MEM_RSX_LOCAL_SIZE) note_video_dma(cmd, eal, size);

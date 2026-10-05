@@ -26,6 +26,10 @@
 namespace pspocket::ppu {
 namespace {
 
+// The last taken branch to address 0 on this thread (a return or an indirect jump to a null target, or a guest
+// thread's return to kThreadReturnAddress): fault reports name it (ps_ppu_zero_branch_from).
+thread_local u32 t_zero_branch_from = 0;
+
 constexpr std::string_view kChan = "ppu";
 
 inline u64 dup32(u32 x) { return x | (u64{x} << 32); }
@@ -511,12 +515,18 @@ void execute(PPUContext& ctx, u8* base, const Inst& in)
         const bool cond_ok = bo0 || ((cr[in.bi()] != 0) == bo1);
         const u32 target = in.op == Op::BC ? branch_target(in, pc) : static_cast<u32>(ctx.lr) & ~3u;
         if (in.lk()) ctx.lr = pc + 4;
-        if (ctr_ok && cond_ok) next = target;
+        if (ctr_ok && cond_ok) {
+            next = target;
+            if (!target) t_zero_branch_from = pc;
+        }
         break;
     }
     case Op::BCCTR: // BCCTR never decrements CTR (RPCS3)
         if (in.lk()) ctx.lr = pc + 4;
-        if ((in.bo() & 0x10) || (cr[in.bi()] != 0) == ((in.bo() & 0x08) != 0)) next = static_cast<u32>(ctx.ctr) & ~3u;
+        if ((in.bo() & 0x10) || (cr[in.bi()] != 0) == ((in.bo() & 0x08) != 0)) {
+            next = static_cast<u32>(ctx.ctr) & ~3u;
+            if (!next) t_zero_branch_from = pc;
+        }
         break;
 
     // ---------------------------------------------------------------- system
@@ -844,6 +854,8 @@ void execute(PPUContext& ctx, u8* base, const Inst& in)
 
 void step(PPUContext& ctx, u8* base) { execute(ctx, base, decode(ps_read32(base, ctx.cia))); }
 
+u32 t_zero_branch_from_value() { return t_zero_branch_from; }
+
 namespace {
 
 // Decoded instructions by address (D-091): decode()'s switch on the primary opcode is an indirect branch the host
@@ -918,3 +930,5 @@ std::vector<Form> supported_forms()
 }
 
 } // namespace pspocket::ppu
+
+extern "C" uint32_t ps_ppu_zero_branch_from(void) { return pspocket::ppu::t_zero_branch_from_value(); }

@@ -25,6 +25,7 @@
 #include <cerrno>
 #include <optional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -472,6 +473,27 @@ Vfs::Resolved Vfs::resolve(std::string_view vpath) const
 
 // ------------------------------------------------------------------------------------------------- syscalls
 
+// PSPOCKET_HIDE_FILES=PATH[,PATH...]: those guest paths do not exist for open and stat (dev only: does a game get past
+// a point without a file, a video it crashes in, say).
+static bool hidden(std::string_view vpath)
+{
+    static const std::vector<std::string> paths = [] {
+        std::vector<std::string> v;
+        if (const char* e = std::getenv("PSPOCKET_HIDE_FILES")) {
+            std::string all(e);
+            for (size_t at = 0; at <= all.size();) {
+                const size_t comma = all.find(',', at);
+                const std::string one = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                if (!one.empty()) v.push_back(one);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+        }
+        return v;
+    }();
+    return std::find(paths.begin(), paths.end(), vpath) != paths.end();
+}
+
 Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg, u64 size)
 {
     Kernel& k = t.kernel;
@@ -480,6 +502,7 @@ Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg,
     if (p.error) return p.error;
     if (!s.guest.valid(fd, 4)) return err(CELL_EFAULT);
     const Vfs::Resolved res = s.vfs.resolve(p.vpath);
+    if (hidden(res.vpath)) return err(CELL_ENOENT);
     if (res.root) return err(CELL_EISDIR);
     if (!res.mount) return err(CELL_ENOTMOUNTED);
     const Mount& m = *res.mount;
@@ -720,6 +743,7 @@ Result sys_fs_stat(PpuThread& t, u32 path, u32 sb)
     if (p.error) return p.error;
     if (!s.guest.valid(sb, kCellFsStatSize)) return err(CELL_EFAULT);
     const Vfs::Resolved res = s.vfs.resolve(p.vpath);
+    if (hidden(res.vpath)) return err(CELL_ENOENT);
     if (res.root) {
         write_stat(s.guest, sb, CELL_FS_S_IFDIR | 0711, -1, -1, -1, -1, -1, 258, 512); // RPCS3: the root ("/")
         return CELL_OK;
