@@ -74,6 +74,8 @@ struct MetalBackendConfig {
     std::string shader_cache;
     std::vector<std::string> shader_seeds;
     u32 shader_cache_threads = 0;
+    // Textures and surfaces unused for this many flips are freed (D-116; a minute at 30 fps).
+    u32 evict_after_flips = 1800;
 };
 
 struct BackendStats {
@@ -96,6 +98,8 @@ struct BackendStats {
     u64 texture_checks = 0;     // cached textures checked against guest memory (a content hash, D-104)
     u64 surface_reloads = 0;    // surfaces loaded again from guest memory the CPU or the RSX wrote
     u64 compile_ns = 0;         // the RSX thread's time in MSL compilation (newLibraryWithSource)
+    u64 textures_evicted = 0;    // cached textures freed after a minute unused (D-116)
+    u64 surfaces_evicted = 0;    // surfaces freed after a minute unused, their memory holding what they did (D-116)
     u64 programs_prewarmed = 0;  // programs the shader cache made ahead and a draw then found (D-114)
     u64 pipelines_prewarmed = 0; // ... and pipelines
     u64 pipeline_ns = 0;        // ... and in render pipeline creation

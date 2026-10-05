@@ -684,7 +684,7 @@ struct E2E {
     static constexpr u32 kCmdEa = 0x00200000;
     static constexpr u32 kReadbackEa = 0x00400000; // main memory, IO 0x00100000
 
-    explicit E2E(u32 capture_every = 0, std::string shader_cache = {})
+    explicit E2E(u32 capture_every = 0, std::string shader_cache = {}, u32 evict_after_flips = 1800)
     {
         PS_CHECK(mem.reserve());
         PS_CHECK(mem.commit(kCmdEa, 0x100000));
@@ -718,6 +718,7 @@ struct E2E {
         mc.capture_every = capture_every;
         mc.shader_cache = std::move(shader_cache);
         mc.shader_cache_threads = 2;
+        mc.evict_after_flips = evict_after_flips;
         mc.capture = [this](const u8* bgra, u32 w, u32 h, u64 flip) {
             std::lock_guard lock(capture_mutex);
             captures.emplace_back(flip, std::vector<u8>(bgra, bgra + usize{w} * h * 4));
@@ -2357,6 +2358,40 @@ TEST_CASE("metal e2e: a vertex program samples a vertex texture (TXL, D-093)")
     CHECK(e.backend->stats().draws == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x20, 0x40, 0x80});
+}
+
+TEST_CASE("metal e2e: a texture unused for a while is freed, and decoded again when used again (D-116)")
+{
+    REQUIRE_METAL();
+    E2E e(0, {}, 4);
+    e.put_local_bytes(kFpOffset, fp_texture());
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    for (u32 i = 0; i < kW * kH; i++) e.put_local32(kTexOffset + i * 4, 0xff0000ffu); // blue
+    e.rsx->set_display_buffer(0, {kSurfaceOffset, kW * 4, kW, kH});
+    const auto draw = [&](CommandBuilder& b) {
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        bind_linear_texture(b, kTexOffset, tex::A8R8G8B8, kW * 4);
+        draw_triangle(b);
+    };
+    auto b = e.at(0);
+    draw(b);
+    for (int i = 0; i < 10; i++) b.method(m::GCM_FLIP_COMMAND, 0); // ten flips without the texture after the first
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(e.backend->stats().textures_decoded == 1);
+    CHECK(e.backend->stats().textures_evicted == 1);
+    auto c = e.at(b.offset());
+    draw(c);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().textures_decoded == 2); // decoded again
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the texture's blue
 }
 
 TEST_CASE("metal e2e: flip presents the display buffer scaled to the output size")

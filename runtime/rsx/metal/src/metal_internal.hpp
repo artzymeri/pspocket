@@ -82,6 +82,7 @@ struct Surface {
     bool gpu_newer = false;    // rendered since guest memory was last written back
     bool cpu_newer = false;    // guest memory was written by the CPU after the GPU copy was made
     u64 last_used = 0;
+    u64 last_frame = 0;        // the flip it was last rendered to or sampled in (D-116: unused a minute, freed)
     std::unordered_map<u32, id<MTLTexture>> views; // swizzled views for sampling, by encoded channel sources
     u64 generation = 0;         // writes to it: colour, or depth for a depth buffer (D-105)
     u64 stencil_generation = 0; // writes to a depth buffer's stencil
@@ -110,6 +111,7 @@ struct CachedTexture {
     WriteTracker::Watch watch{};
     std::unordered_map<u32, id<MTLTexture>> views; // by encoded channel sources
     u64 last_used = 0;
+    u64 last_frame = 0;  // the flip it was last sampled in (D-116)
     u64 checked = ~0ull; // the check epoch (MetalBackend::Impl::check_epoch) it was last found clean in (D-104)
 };
 
@@ -360,6 +362,11 @@ struct MetalBackend::Impl {
     std::unordered_map<std::string, CompiledProgram> programs; // by program hash and translation options
     std::unique_ptr<ShaderCache> shader_cache;                 // D-114; null: none configured
     u64 texture_bytes() const; // what the cached textures take in guest memory (their decoded copies, about as much)
+    u64 surface_bytes() const; // what the surfaces' GPU copies take
+    // Textures unused for a minute of flips are freed (decoded again if used again), and surfaces unused as long whose
+    // guest memory holds what they do (D-116): GTA V streams textures to new places all the time, and a phone has a few
+    // GB, not a Mac's.
+    void evict_unused();
     void take_shader_cache();
     std::unordered_map<u64, id<MTLDepthStencilState>> depth_states;
     std::unordered_map<u64, id<MTLSamplerState>> samplers;

@@ -125,6 +125,7 @@ Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32
     s->pixel_format = pf;
     s->texture = tex;
     s->last_used = impl.tick;
+    s->last_frame = impl.stats.flips;
     impl.stats.surfaces_created++;
     impl.note_guest(*s);
     impl.surfaces.push_back(std::move(s));
@@ -137,6 +138,7 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
         if (s->address == address && !s->depth && s->gcm_format == format && s->width == width &&
             s->height == height && s->pitch == pitch && s->swizzled == swizzled) {
             s->last_used = tick;
+            s->last_frame = stats.flips;
             check_cpu_writes(*s);
             return s.get();
         }
@@ -153,6 +155,7 @@ Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width
         if (s->address == address && s->depth && s->gcm_format == format && s->width == width && s->height == height &&
             s->pitch == pitch) {
             s->last_used = tick;
+            s->last_frame = stats.flips;
             return s.get();
         }
     }

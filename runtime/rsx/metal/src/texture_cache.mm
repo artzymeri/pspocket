@@ -148,6 +148,7 @@ CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, 
     entry->layout = *layout;
     entry->texture = texture;
     entry->last_used = tick;
+    entry->last_frame = stats.flips;
     // Watch first, copy second: a store racing with the copy either lands in it or dirties the entry.
     entry->watch = tracker.watch(ea, size);
     auto staging = transient.alloc(size, 256);
@@ -248,6 +249,38 @@ u64 MetalBackend::Impl::texture_bytes() const
     return n;
 }
 
+u64 MetalBackend::Impl::surface_bytes() const
+{
+    u64 n = 0;
+    for (const auto& s : surfaces) n += u64{s->width} * s->height * surface_bytes_per_pixel(s->gcm_format, s->depth);
+    return n;
+}
+
+void MetalBackend::Impl::evict_unused()
+{
+    const u64 kUnusedFlips = config.evict_after_flips;
+    const u64 now = stats.flips;
+    for (auto it = textures.begin(); it != textures.end();) {
+        if (now - it->second->last_frame > kUnusedFlips) {
+            tracker.unwatch(it->second->watch);
+            it = textures.erase(it);
+            stats.textures_evicted++;
+        } else {
+            ++it;
+        }
+    }
+    std::vector<Surface*> stale;
+    for (const auto& s : surfaces) {
+        if (now - s->last_frame <= kUnusedFlips || s->gpu_newer || draw_targets.contains(s.get())) continue;
+        if (pass_open && pass.contains(s.get())) continue;
+        stale.push_back(s.get());
+    }
+    for (Surface* s : stale) {
+        remove_surface(s);
+        stats.surfaces_evicted++;
+    }
+}
+
 id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, bool& ok)
 {
     ok = true;
@@ -268,6 +301,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     // the texture reads it in its own format.
     Surface* s = find_surface(*ea, false);
     if (s) check_cpu_writes(*s);
+    if (s) s->last_frame = stats.flips; // sampled: in use (D-116)
     std::array<u8, 4> src = fmt ? texture_channel_sources(*fmt, t.remap) : std::array<u8, 4>{0, 1, 2, 3};
     if (s && !s->cpu_newer && fmt) {
         const auto sf = static_cast<SurfaceColorFormat>(s->gcm_format);
@@ -396,6 +430,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         entry->checked = epoch;
     }
     entry->last_used = tick;
+    entry->last_frame = stats.flips;
     return sample_view(entry->texture, entry->views, texture_channel_sources(*entry->layout.format, t.remap));
 }
 

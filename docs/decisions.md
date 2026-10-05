@@ -1782,6 +1782,21 @@ still.
 - Test: a draw under a report the GPU has not counted renders even though the memory holds zero; once counted, the same
   test skips.
 
+## D-116 · 2026-10-05 · Textures and surfaces unused for a minute are freed
+
+The texture cache only ever grew: an entry went away only when its own memory changed. GTA V streams textures to new
+places all the time, and in five minutes of the first mission the cache reached 856 textures, with 153 surfaces next
+to them. A Mac does not notice; a phone has a few GB for everything, and a long session would end with the system
+closing the app.
+- Every texture and surface remembers the flip it was last used in (a texture when bound, a surface when it is a
+  target or sampled). Every 150 flips the backend frees the textures unused for `evict_after_flips` flips (1,800 by
+  default: a minute at 30 fps; one used again is decoded again from memory), and the surfaces unused as long whose
+  guest memory holds what they do (not newer on the GPU, not a target of the open pass or the draw).
+- The per-frame report shows both caches' sizes.
+- Run: the cache now goes up and down with the scene (268 to 663 textures over five minutes), surfaces about 150
+  (44 MB); same frames.
+- Test: a texture unused for a few flips (the limit set low) is freed, then decoded again when a draw uses it.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

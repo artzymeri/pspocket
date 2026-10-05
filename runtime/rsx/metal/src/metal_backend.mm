@@ -440,12 +440,14 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
             pass.color[i]->initialized = true;
             pass.color[i]->gpu_newer = true;
             pass.color[i]->last_used = tick;
+            pass.color[i]->last_frame = stats.flips;
             if (pass_desc.colorAttachments[i].loadAction == MTLLoadActionClear) pass.color[i]->generation++;
         }
         if (pass.depth) {
             pass.depth->initialized = true;
             pass.depth->gpu_newer = true;
             pass.depth->last_used = tick;
+            pass.depth->last_frame = stats.flips;
             if (pass_desc.depthAttachment.loadAction == MTLLoadActionClear) pass.depth->generation++;
             if (pass_desc.stencilAttachment.loadAction == MTLLoadActionClear) pass.depth->stencil_generation++;
         }
@@ -804,6 +806,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (Surface* zs = depth_source[t]) {
             bound[t] = zs->texture;
             zs->last_used = tick;
+            zs->last_frame = stats.flips;
             stats.surface_samples++;
             if (tracing) {
                 trace_tex += std::format(" t{} {:#010x} fmt {:#04x} {}x{} (depth buffer, sampled)", t, zs->address,
@@ -1153,6 +1156,7 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     tick++;
     end_pass_for(kEndFlip);
     stats.flips++;
+    if (stats.flips % std::clamp<u64>(config.evict_after_flips / 2, 1, 150) == 0) evict_unused(); // D-116
     if (tracing && request.flip_index >= config.trace_frame) {
         PS_LOG_INFO("rsx.trace", "frame {} ends: flip {} shows {:#010x}; {} clears and draws, {} colour targets",
             config.trace_frame, request.flip_index,
@@ -1312,7 +1316,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
                            "{:.0f} texture checks ({:.2f} MB hashed); {} programs and {} pipelines made ({:.1f} ms); "
-                           "{} textures cached ({:.0f} MB in guest memory), {} surfaces",
+                           "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB)",
             m.report_flips, static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n,
             static_cast<double>(m.stats.draws - m.report_draws) / n,
             static_cast<double>(m.stats.render_passes - m.report_passes) / n, ends,
@@ -1324,7 +1328,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             static_cast<double>(m.stats.texture_check_bytes - m.report_texture_bytes) / 1048576.0 / n,
             m.stats.programs_compiled - m.report_programs, m.stats.pipelines_created - m.report_pipelines,
             static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns - m.report_compile_ns) / 1e6,
-            m.textures.size(), static_cast<double>(m.texture_bytes()) / 1048576.0, m.surfaces.size());
+            m.textures.size(), static_cast<double>(m.texture_bytes()) / 1048576.0, m.surfaces.size(),
+            static_cast<double>(m.surface_bytes()) / 1048576.0);
         m.report_programs = m.stats.programs_compiled;
         m.report_pipelines = m.stats.pipelines_created;
         m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns;
@@ -1421,6 +1426,7 @@ bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u
         d->cpu_newer = false;
         d->generation++;
         d->last_used = m.tick;
+        d->last_frame = m.stats.flips;
         m.stats.gpu_copies++;
         // Guest memory gets the copy once the GPU has it, before what the RSX writes after it (a label the CPU waits
         // for to read it): a deferred readback that writes nothing else, so the GPU's own reads do not wait for it.
