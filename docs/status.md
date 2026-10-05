@@ -58,7 +58,7 @@ missing, roughly in order:
 1. **A playtest on the iPhone with the translated PPU code**: `scripts/ios.sh` builds it in (D-101); the user
    installs it (`scripts/ios.sh install`, phone connected and unlocked, or `scripts/ios.sh testflight` and the
    TestFlight app when the phone is elsewhere: the user agreed to that on 2026-10-05) and reports the frame rate and
-   what looks wrong.
+   what looks wrong. Build 116 (80a9673, through D-110) is in TestFlight as PSPocketTEST since 2026-10-05.
 2. **One command per game** (D-101): `scripts/translate-game.sh --iso GAME.iso --elf EBOOT.elf [--ios]` translates
    a game's PPU and SPU code and builds it in; the executable is decrypted with the user's own tools. Next: try it on
    a second game.
