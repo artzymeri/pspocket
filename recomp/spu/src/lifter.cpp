@@ -604,10 +604,12 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
     for (const auto& [addr, sym] : entries) r += std::format("    {{0x{:05X}u, {}}},\n", addr, sym);
     if (entries.empty()) r += "    {0u, 0},\n";
     r += "};\n\n";
-    // The lifted instruction words, a bit each: a DMA over anything else in the range leaves the program valid.
+    // The lifted instruction words, a bit each: a DMA over anything else in the range leaves the program valid. Code
+    // only discovery found is left out: it may be data the program writes (GTA V's jobs: the whole job was dropped
+    // and interpreted, 12 fps, run 096).
     std::vector<u32> bits((image.code_size() / 4 + 31) / 32, 0);
     for (const Function& f : program.functions)
-        for (u32 a : f.insns) {
+        for (u32 a : f.discovered ? std::vector<u32>{} : f.insns) {
             const u32 w = (a - image.code_start) / 4;
             bits[w / 32] |= 1u << (w % 32);
         }

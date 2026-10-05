@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Writes the SELF key table the build carries (D-121) from RPCS3's Crypto/key_vault.cpp.
+"""Writes the SELF key table the build carries (D-121) from RPCS3's Crypto/key_vault.cpp, and the firmware update
+packages' key (D-156) from key_vault.h.
 
 usage: self-keys.py RPCS3_DIR OUT.cpp
 
@@ -58,15 +59,30 @@ def main() -> int:
             lines.append(f"{{{kind}, {m.group(2)}, {m.group(3)}, {m.group(4)}, {c_bytes(m.group(6), 32)}, "
                          f"{c_bytes(m.group(7), 16)}}},")
             count += 1
-    lines += ["};", "} // namespace", "",
-              "std::span<const SelfKey> builtin_self_keys() { return std::span<const SelfKey>(kKeys).subspan(1); }", "",
+    # The firmware update packages' key (key_vault.h SCEPKG_ERK, SCEPKG_RIV: constexpr byte arrays), for installing
+    # /dev_flash from PS3UPDAT.PUP (D-156).
+    package = ""
+    header = vault.with_suffix(".h") if vault else None
+    if header and header.is_file():
+        text_h = header.read_text(encoding="utf-8")
+        arrays = {}
+        for name in ("SCEPKG_ERK", "SCEPKG_RIV"):
+            m = re.search(name + r"\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}", text_h)
+            if m:
+                arrays[name] = bytes(int(b, 16) for b in re.findall(r"0x([0-9A-Fa-f]{2})", m.group(1)))
+        if len(arrays.get("SCEPKG_ERK", b"")) == 32 and len(arrays.get("SCEPKG_RIV", b"")) == 16:
+            package = f"{c_bytes(arrays['SCEPKG_ERK'].hex(), 32)}, {c_bytes(arrays['SCEPKG_RIV'].hex(), 16)}, true"
+    lines += ["};", f"constexpr PackageKey kPackageKey = {{{package}}};" if package else "constexpr PackageKey kPackageKey{};",
+              "} // namespace", "",
+              "std::span<const SelfKey> builtin_self_keys() { return std::span<const SelfKey>(kKeys).subspan(1); }",
+              "const PackageKey& builtin_package_key() { return kPackageKey; }", "",
               "} // namespace pspocket::recomp"]
     out.parent.mkdir(parents=True, exist_ok=True)
     text = "\n".join(lines) + "\n"
     if not out.exists() or out.read_text() != text:
         out.write_text(text)
     where = f"from {vault}" if vault else f"none: no Crypto/key_vault.cpp under {root}"
-    print(f"self-keys: {count} SELF keys {where}")
+    print(f"self-keys: {count} SELF keys and {'the' if package else 'no'} package key {where}")
     return 0
 
 

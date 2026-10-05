@@ -14,6 +14,7 @@ pspocket_add_test(test_recomp_common
         test_elf.cpp
         test_robustness.cpp
         test_self_decrypt.cpp
+        test_firmware.cpp
     LIBS pspocket_test_synthetic pspocket::recomp_common)
 find_package(ZLIB)
 if(ZLIB_FOUND)

@@ -53,7 +53,7 @@ int main(int argc, char** argv)
 {
     prepare::Options o;
     std::string events_path;
-    bool quiet = false, lift_spu_only = false;
+    bool quiet = false, lift_spu_only = false, discover_spu = false;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -61,6 +61,8 @@ int main(int argc, char** argv)
         if (a == "--quiet") quiet = true;
         else if (a == "--keep-sources") o.keep_sources = true;
         else if (a == "--lift-spu-only") lift_spu_only = true;
+        else if (a == "--discover-spu") discover_spu = true;
+        else if (a == "--no-discover-spu") o.discover_spu = false;
         else if (!(v = value())) return usage();
         else if (a == "--title") o.title_id = v;
         else if (a == "--exe") o.executable = v;
@@ -82,7 +84,7 @@ int main(int argc, char** argv)
         prepare::SpuLiftReport rep;
         std::string error;
         if (!prepare::lift_spu_images(o.spu_images_dir, (fs::path(o.game_dir) / "spu").string(), o.spu_logs, &rep,
-                &error)) {
+                &error, discover_spu)) {
             std::fprintf(stderr, "pspocket-prepare: %s\n", error.c_str());
             return 1;
         }

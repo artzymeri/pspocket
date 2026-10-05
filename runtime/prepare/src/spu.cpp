@@ -45,7 +45,7 @@ u32 parse(const std::string& text) { return static_cast<u32>(std::stoul(text, nu
 } // namespace
 
 bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, const std::vector<std::string>& logs,
-    SpuLiftReport* report, std::string* error)
+    SpuLiftReport* report, std::string* error, bool discover)
 {
     SpuLiftReport rep;
     std::error_code ec;
@@ -140,6 +140,7 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
             if (s >= img.base && s < img.base + img.size && image->in_code(s)) image->seeds.push_back(s);
         rep.seeds += image->seeds.size();
         recomp::spu::AnalyzerOptions analyzer;
+        analyzer.discover = discover;
         recomp::spu::LiftOptions lift;
         lift.name = name;
         if (img.kind == "job" || img.kind == "module") {

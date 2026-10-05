@@ -48,6 +48,7 @@ struct Options {
     // keeps their entries as seeds for the next time (D-155), and included. Used when spu_dir is empty.
     std::string spu_images_dir;
     std::vector<std::string> spu_logs; // runs' logs: where execution left lifted SPU code, more seeds
+    bool discover_spu = true;          // also lift SPU code only registers reach (recomp::spu discover, D-155)
     Toolchain toolchain;
     unsigned workers = 0;     // 0: one per core
     double memory_mb = 0;     // compiles start while their predicted peaks fit; 0: no limit
@@ -56,6 +57,7 @@ struct Options {
     // This device's speed against the cost model's, per kind of file (PPU code, SPU code, tables): the last
     // preparation's (Result::rates, the manifest's).
     double prior_rates[3] = {1.0, 1.0, 1.0};
+    int thermal = 0; // the device's heat when it starts (0 nominal .. 3 critical): kept in the manifest beside the rates
     bool keep_sources = false; // keep the translated C after a successful build (it is about 0.8 GB for GTA V)
     std::vector<std::string> extra_ppu_args, extra_spu_args, llvm_options; // added to translated_code_settings()
     std::function<void(const Progress&)> progress;
@@ -85,7 +87,13 @@ struct Manifest {
     double seconds = 0;
     size_t files = 0;
     double rates[3] = {1.0, 1.0, 1.0};
+    int thermal = 0; // the heat the rates were measured at
 };
+
+// How much slower a device compiles at a heat level than at nominal (D-154): iOS slows the chips as they heat. The
+// iPhone 17 Pro Max prepared Assassin's Creed at 0.86 of the cost model's speed, cool, and GTA V right after, warm
+// ("fair"), at 1.05: about 1.2 per level, refined as more preparations are recorded.
+double thermal_slowdown(int thermal);
 bool read_manifest(const std::string& game_dir, Manifest* out);
 
 // Whether game_dir holds a library this build can load for this executable: made for this runtime (ABI hash), for

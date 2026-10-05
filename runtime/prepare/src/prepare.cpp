@@ -152,8 +152,15 @@ bool read_manifest(const std::string& game_dir, Manifest* out)
         const std::string rate = json_field(json, std::format("rate_{}", k));
         if (!rate.empty() && std::atof(rate.c_str()) > 0.05) m.rates[k] = std::atof(rate.c_str());
     }
+    m.thermal = std::atoi(json_field(json, "thermal").c_str());
     if (out) *out = m;
     return !m.abi_hash.empty();
+}
+
+double thermal_slowdown(int thermal)
+{
+    static constexpr double kSlowdown[] = {1.0, 1.2, 1.5, 2.0};
+    return kSlowdown[std::clamp(thermal, 0, 3)];
 }
 
 bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why,
@@ -292,7 +299,7 @@ Result prepare_game(const Options& o)
             spu_dir = dir / "spu";
             SpuLiftReport spu;
             std::string error;
-            if (!lift_spu_images(o.spu_images_dir, spu_dir.string(), o.spu_logs, &spu, &error))
+            if (!lift_spu_images(o.spu_images_dir, spu_dir.string(), o.spu_logs, &spu, &error, o.discover_spu))
                 return fail("the SPU programs: " + error);
             r.spu_programs = spu.lifted;
         }
@@ -430,12 +437,12 @@ Result prepare_game(const Options& o)
         "  \"made_at\": {},\n"
         "  \"seconds\": {:.1f},\n  \"translate_seconds\": {:.1f},\n  \"compile_seconds\": {:.1f},\n"
         "  \"link_seconds\": {:.1f},\n  \"files\": {},\n  \"rate_0\": {:.3f},\n  \"rate_1\": {:.3f},\n"
-        "  \"rate_2\": {:.3f},\n  \"bytes\": {}\n}}\n",
+        "  \"rate_2\": {:.3f},\n  \"thermal\": {},\n  \"bytes\": {}\n}}\n",
         json_string(o.title_id), exe_sha, ps_game_abi_hash, ps_game_translator_hash,
         json_string(std::string("pspocket ") + PSPOCKET_VERSION), json_string(codegen::compiler_version()),
         json_string(o.toolchain.cpu == "native" ? codegen::host_cpu() : o.toolchain.cpu),
         static_cast<long long>(std::time(nullptr)), r.seconds, r.translate_seconds, r.compile_seconds, r.link_seconds,
-        jobs.size(), r.rates[0], r.rates[1], r.rates[2], bytes.size());
+        jobs.size(), r.rates[0], r.rates[1], r.rates[2], o.thermal, bytes.size());
     if (!write_bytes(dir / "manifest.json", manifest.data(), manifest.size())) return fail("cannot write the manifest");
     if (!o.keep_sources && o.ppu_dir.empty()) fs::remove_all(dir / "ppu", ec);
     PS_LOG_INFO(kChan, "{}: prepared in {:.0f} s (translate {:.1f}, compile {:.0f}, link {:.1f}, sign {:.1f}): {} files, "

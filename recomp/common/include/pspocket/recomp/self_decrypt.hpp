@@ -36,4 +36,17 @@ const SelfKey* find_self_key(std::span<const SelfKey> keys, u32 type, u32 revisi
 // (the build has no keys, or the file is damaged), a section that does not inflate.
 Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const SelfKey> keys);
 
+// The key of the firmware update packages (RPCS3 key_vault.h SCEPKG_ERK, SCEPKG_RIV), from the build like the SELF
+// keys; `present` is false in a build without them.
+struct PackageKey {
+    std::array<u8, 32> erk{};
+    std::array<u8, 16> riv{};
+    bool present = false;
+};
+const PackageKey& builtin_package_key();
+
+// The sections of an SCE package (a firmware update's dev_flash packages, D-156), as RPCS3's SCEDecrypter makes them
+// (LoadHeaders, LoadMetadata with the package key, DecryptData, MakeFile): each decrypted, and inflated when zlib.
+Result<std::vector<std::vector<u8>>> decrypt_sce_package(std::span<const u8> package, const PackageKey& key);
+
 } // namespace pspocket::recomp

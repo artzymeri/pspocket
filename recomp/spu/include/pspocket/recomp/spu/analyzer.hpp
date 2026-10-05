@@ -25,6 +25,9 @@ struct Function {
     std::set<u32> exits;         // instructions whose fall-through leaves the function (end of code)
     ::pspocket::spu::RegSet used;    // registers read or written
     ::pspocket::spu::RegSet written; // registers written
+    // Found only by AnalyzerOptions::discover: possibly data decoded as code, so a DMA over it does not make the
+    // program stale (the lifter leaves it out of the program's code words, D-155).
+    bool discovered = false;
 };
 
 struct Diagnostic {
@@ -39,6 +42,11 @@ struct AnalyzerOptions {
     // Position independent code (D-081): absolute branch targets (bra, brasl) are not the image's code wherever it
     // sits, so they are not followed.
     bool relocatable = false;
+    // Code reached only through registers (jump tables not recognised, function pointers: the common case in
+    // position independent jobs), found without a run's seeds (D-155): every instruction after one that never falls
+    // through (an unconditional branch, a return, a stop), padding skipped, that nothing reached yet is traced as a
+    // seed is. Data that decodes as code there is lifted and never run.
+    bool discover = false;
 };
 
 struct Program {

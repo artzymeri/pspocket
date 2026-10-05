@@ -209,4 +209,92 @@ Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const S
 #endif
 }
 
+Result<std::vector<std::vector<u8>>> decrypt_sce_package(std::span<const u8> package, const PackageKey& key)
+{
+    const ByteReader r(package);
+    if (!r.in_bounds(0, 0x20) || *r.be32(0) != 0x53434500u) return make_error("not an SCE package");
+    if (!key.present) return make_error("this build carries no package key (scripts/self-keys.py had no RPCS3 source)");
+#if !defined(__APPLE__)
+    return make_error("decrypting needs CommonCrypto (Apple platforms only)");
+#else
+    const u16 flags = *r.be16(0x08);
+    const u32 metadata_offset = *r.be32(0x0C);
+    const u64 header_size = *r.be64(0x10);
+    // Metadata info right after the SCE header at the metadata offset: AES-256-CBC with the package key, unless the
+    // package is a debug one (flag 0x8000: in the clear), as SCEDecrypter::LoadMetadata.
+    const u64 info_offset = u64{metadata_offset} + 0x20;
+    if (!r.in_bounds(info_offset, kMetadataInfoSize) || header_size < info_offset + kMetadataInfoSize ||
+        header_size > package.size()) {
+        return make_error("metadata outside the package");
+    }
+    std::array<u8, kMetadataInfoSize> meta_info{};
+    if ((flags & 0x8000) == 0x8000) {
+        std::memcpy(meta_info.data(), package.data() + info_offset, kMetadataInfoSize);
+    } else if (!aes256_cbc_decrypt(key.erk.data(), key.riv.data(), package.data() + info_offset, kMetadataInfoSize,
+                   meta_info.data())) {
+        return make_error("AES-256-CBC failed");
+    }
+    if (meta_info[0x10] != 0 || meta_info[0x30] != 0) return make_error("the package key does not open it (damaged?)");
+    const u64 meta_offset = info_offset + kMetadataInfoSize;
+    std::vector<u8> meta(static_cast<usize>(header_size - meta_offset));
+    if (!aes128_ctr(meta_info.data(), meta_info.data() + 0x20, package.data() + meta_offset, meta.size(), meta.data()))
+        return make_error("AES-128-CTR failed");
+    const ByteReader m(meta);
+    if (!m.in_bounds(0, kMetadataHeaderSize)) return make_error("metadata header truncated");
+    const u32 section_count = *m.be32(0x0C);
+    const u32 key_count = *m.be32(0x10);
+    const u64 keys_offset = kMetadataHeaderSize + u64{section_count} * kMetadataSectionSize;
+    if (!m.in_bounds(kMetadataHeaderSize, u64{section_count} * kMetadataSectionSize) ||
+        !m.in_bounds(keys_offset, u64{key_count} * 16)) {
+        return make_error("metadata of {} sections and {} keys runs past its header", section_count, key_count);
+    }
+    const u8* data_keys = meta.data() + keys_offset;
+    std::vector<std::vector<u8>> out;
+    for (u32 i = 0; i < section_count; i++) {
+        const u64 o = kMetadataHeaderSize + u64{i} * kMetadataSectionSize;
+        const u64 offset = *m.be64(o), size = *m.be64(o + 0x08);
+        const u32 encrypted = *m.be32(o + 0x20), key_index = *m.be32(o + 0x24), iv_index = *m.be32(o + 0x28);
+        const u32 compressed = *m.be32(o + 0x2C);
+        if (!r.in_bounds(offset, size)) return make_error("section {} outside the package", i);
+        std::vector<u8> plain(package.begin() + static_cast<std::ptrdiff_t>(offset),
+            package.begin() + static_cast<std::ptrdiff_t>(offset + size));
+        if (encrypted == 3) {
+            if (key_index >= key_count || iv_index >= key_count)
+                return make_error("section {} names key {} of {}", i, key_index, key_count);
+            if (!aes128_ctr(data_keys + 16 * key_index, data_keys + 16 * iv_index, plain.data(), plain.size(),
+                    plain.data())) {
+                return make_error("AES-128-CTR failed");
+            }
+        }
+        if (compressed == 2) {
+#if defined(PSPOCKET_SELF_ZLIB)
+            // The inflated size is not in the header: inflate in steps (RPCS3 unzip streams it).
+            std::vector<u8> inflated;
+            z_stream z{};
+            if (inflateInit(&z) != Z_OK) return make_error("zlib");
+            z.next_in = plain.data();
+            z.avail_in = static_cast<uInt>(plain.size());
+            int ret = Z_OK;
+            while (ret == Z_OK) {
+                inflated.resize(inflated.size() + std::max<usize>(plain.size() * 2, 1 << 16));
+                const usize had = z.total_out;
+                z.next_out = inflated.data() + had;
+                z.avail_out = static_cast<uInt>(inflated.size() - had);
+                ret = inflate(&z, Z_NO_FLUSH);
+            }
+            inflated.resize(z.total_out);
+            inflateEnd(&z);
+            if (ret != Z_STREAM_END) return make_error("section {} does not inflate", i);
+            out.push_back(std::move(inflated));
+#else
+            return make_error("section {} is compressed and this build has no zlib", i);
+#endif
+        } else {
+            out.push_back(std::move(plain));
+        }
+    }
+    return out;
+#endif
+}
+
 } // namespace pspocket::recomp

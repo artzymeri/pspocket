@@ -26,7 +26,8 @@ set(PSPOCKET_RPCS3_DIR "${PSPOCKET_RPCS3_DIR_DEFAULT}" CACHE PATH "RPCS3 source 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(self_keys_output ${CMAKE_CURRENT_BINARY_DIR}/generated/self_keys.cpp)
 set(self_keys_depends ${CMAKE_SOURCE_DIR}/scripts/self-keys.py)
-foreach(vault ${PSPOCKET_RPCS3_DIR}/rpcs3/Crypto/key_vault.cpp ${PSPOCKET_RPCS3_DIR}/Crypto/key_vault.cpp)
+foreach(vault ${PSPOCKET_RPCS3_DIR}/rpcs3/Crypto/key_vault.cpp ${PSPOCKET_RPCS3_DIR}/Crypto/key_vault.cpp
+        ${PSPOCKET_RPCS3_DIR}/rpcs3/Crypto/key_vault.h ${PSPOCKET_RPCS3_DIR}/Crypto/key_vault.h)
     if(PSPOCKET_RPCS3_DIR AND EXISTS ${vault})
         list(APPEND self_keys_depends ${vault})
     endif()
@@ -51,6 +52,7 @@ add_library(pspocket_recomp_common STATIC
     src/ppu_module.cpp
     src/sce.cpp
     src/self_decrypt.cpp
+    src/firmware.cpp
     src/spu_scan.cpp
     src/strings.cpp
     src/toml.cpp
@@ -63,3 +65,8 @@ if(ZLIB_FOUND)
 endif()
 pspocket_set_warnings(pspocket_recomp_common)
 add_library(pspocket::recomp_common ALIAS pspocket_recomp_common)
+
+# Host tool: /dev_flash from a PS3UPDAT.PUP, as the phone installs it (D-156).
+add_executable(pspocket-firmware tools/pspocket_firmware.cpp)
+target_link_libraries(pspocket-firmware PRIVATE pspocket::recomp_common)
+pspocket_set_warnings(pspocket-firmware)
