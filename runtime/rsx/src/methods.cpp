@@ -102,12 +102,14 @@ void Rsx::m_begin_end(u32, u32 value)
     if (prim != 0) {
         if (prim > static_cast<u32>(Primitive::Polygon)) {
             // As RPCS3: a warning, and the draw keeps the primitive it had (GTA V sends 36 once in a while in the first
-            // mission, run 080).
+            // mission, run 080). On the iPhone the argument was the next method's header (0x41710) shortly before
+            // the reader lost its place: a sign of a desync (D-118).
             static std::atomic<u32> warned{0};
             if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
                 PS_LOG_WARN(kChan, "NV4097_SET_BEGIN_END: invalid primitive {} (argument {:#x}): the last one is kept",
                     prim, value);
             }
+            desync_suspect_ = true;
             state_.draw.reset(state_.draw.primitive);
         } else {
             state_.draw.reset(static_cast<Primitive>(prim));

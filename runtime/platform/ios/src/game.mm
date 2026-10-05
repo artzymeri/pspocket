@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -78,6 +79,10 @@ struct Session {
     std::chrono::steady_clock::time_point rate_since;
     u64 rate_flips = 0;
     u64 rate_underruns = 0; // the speaker's, at the last line
+    // The disc's title ID, which keeps each game's shader cache and coverage apart (D-118), and whether the build's
+    // translated PPU code is this game's: the shaders recorded on the Mac for it come with it.
+    std::string title_id;
+    bool translated = false;
 };
 
 constexpr auto kRateInterval = std::chrono::seconds(5);
@@ -185,19 +190,6 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     // SPU code without a lifted program, or outside it, is interpreted (D-076). The game's lifted SPU programs, when
     // the build has them (scripts/ios.sh), run its SPURS tasks, jobs and the modules they load (D-079, D-081).
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
-    // Coverage for the Mac (D-117): the SPU programs this phone meets without lifted code (saved as pspocket-boot
-    // --spu-dump saves them) and the addresses lifted code did not reach, kept for scripts/ios.sh pull-coverage, which
-    // hands them to the next translation. Application Support: the system does not purge it, Files does not show it.
-    if (NSString* support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)
-                                .firstObject) {
-        const std::string coverage = std::string(support.UTF8String) + "/pspocket-coverage";
-        std::error_code ec;
-        std::filesystem::create_directories(coverage + "/spu", ec);
-        if (!ec) {
-            hle::set_spu_dump_dir(coverage + "/spu");
-            ps_spu_set_miss_log((coverage + "/spu-misses.log").c_str());
-        }
-    }
 #if PSPOCKET_HAVE_GAME_SPU
     pspocket_game_spu_register();
     hle::enable_spu_modules();
@@ -229,14 +221,14 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     cfg.rsx_backend = [raw, device]() -> std::unique_ptr<rsx::Backend> {
         rsx::metal::MetalBackendConfig mc;
         mc.device = (__bridge void*)device;
-        // The shader cache (D-114): what this phone compiled before, and what the Mac recorded for the game (in the
-        // app, scripts/ios.sh), made ahead on two background threads while the game loads.
+        // The shader cache (D-114): what this phone compiled before for this game (D-118), and what the Mac recorded
+        // for the game the app was built for (in the app, scripts/ios.sh), made ahead on two background threads while
+        // the game loads.
         if (NSString* caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject) {
-            mc.shader_cache = std::string(caches.UTF8String) + "/pspocket-shaders";
+            mc.shader_cache = std::string(caches.UTF8String) + "/pspocket-shaders/" + raw->title_id;
         }
-        if (NSString* seed = [[NSBundle mainBundle] pathForResource:@"shaders" ofType:nil]) {
-            mc.shader_seeds.push_back(seed.UTF8String);
-        }
+        NSString* seed = [[NSBundle mainBundle] pathForResource:@"shaders" ofType:nil];
+        if (seed && raw->translated) mc.shader_seeds.push_back(seed.UTF8String);
         mc.shader_cache_threads = 2;
         mc.present = [raw](const rsx::metal::PresentFrame& f) {
             const u64 flips = raw->flips.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -278,6 +270,24 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     }
     game.title_id = disc.title_id;
     game.param_sfo = std::move(disc.param_sfo);
+    for (const char c : disc.title_id) { // a path component: letters and digits only
+        if (std::isalnum(static_cast<unsigned char>(c))) s->title_id += c;
+    }
+    if (s->title_id.empty()) s->title_id = "unknown";
+    // Coverage for the Mac (D-117), per game (D-118): the SPU programs this phone meets without lifted code (saved as
+    // pspocket-boot --spu-dump saves them) and the addresses lifted code did not reach, kept for scripts/ios.sh
+    // pull-coverage, which hands them to the next translation. Application Support: the system does not purge it,
+    // Files does not show it.
+    if (NSString* support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)
+                                .firstObject) {
+        const std::string coverage = std::string(support.UTF8String) + "/pspocket-coverage/" + s->title_id;
+        std::error_code cov_ec;
+        std::filesystem::create_directories(coverage + "/spu", cov_ec);
+        if (!cov_ec) {
+            hle::set_spu_dump_dir(coverage + "/spu");
+            ps_spu_set_miss_log((coverage + "/spu-misses.log").c_str());
+        }
+    }
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(o->hdd0_dir) / "game", ec);
     if (!s->kernel->vfs_mount("/dev_hdd0", o->hdd0_dir, false)) {
@@ -325,8 +335,10 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     }
 #if PSPOCKET_HAVE_GAME_PPU
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098).
-    if (loader::register_translated_ppu(*s->memory, game_ppu_image_words, game_ppu_image_word_count, &game_ppu_register))
+    if (loader::register_translated_ppu(*s->memory, game_ppu_image_words, game_ppu_image_word_count, &game_ppu_register)) {
+        s->translated = true;
         PS_LOG_INFO(kChan, "the game's PPU code runs translated ahead of time");
+    }
 #endif
     install_fault_handler();
     u32 main_id = 0;

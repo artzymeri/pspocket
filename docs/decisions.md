@@ -1811,6 +1811,31 @@ runs in the interpreter there, slowly. The app now keeps what it meets, the way 
   lift and build cover what the phone met.
 - Tests: a miss reaches the miss log in the words lift-spu.sh matches; the merge, on a fake container.
 
+## D-118 · 2026-10-05 · A FIFO desync is reported in full and read again; the phone's records are per game
+
+The phone froze when the player switched to Trevor (the prologue's first switch, past the Mac's scripted runs). Its
+log: three `BEGIN_END` arguments that were the next method's header (0x41710: the reader one word out of step, then
+back), and a few minutes later, twelve words after a jump to a new 8 KB stretch of the command buffer, a header for
+method 0x0080 with 32 arguments that are good commands, then a malformed word. The recovery skipped to put, 480 KB on,
+past label writes the game waits for, so it hung. Run 049 and a Mac walk (invalid primitive 36) showed the same signs.
+Neither log says which word the reader took wrong, so:
+- The reader keeps the last 256 words it read. A desync (a malformed word, a method no class defines, an impossible
+  primitive) is reported with them, oldest first, each beside what memory holds now where that differs: a changed
+  word was read before the guest finished writing it; an unchanged run shows a misread of good commands. The words
+  after the point come too. A few reports per run.
+- A desync within 16384 words of a jump, call or return goes back to its target a millisecond later and reads the
+  stretch again, twice at most per target; then the old recovery. During the re-read the semaphore acquires the reader
+  passed before the desync point hold (their semaphores may have moved on, and waiting again would hang); past the
+  point, and after any jump, they wait again. Commands before the point run twice (state, the odd draw, label writes
+  of the same values), which is better than a hang. Dev runs without `--rsx-recover` still stop at the error.
+- The phone keeps its shader cache and coverage per game, in folders named by the disc's title ID, and uses the
+  shaders recorded on the Mac only for the game whose translated code the app holds: the user also boots other games
+  (Assassin's Creed) in the test app. `scripts/ios.sh pull-coverage` takes only the game's folders (its title ID from
+  `<game>/title-id` or the directory's name); the shared folder of builds up to 131 only with
+  `PSPOCKET_PULL_SHARED=1`.
+- Tests: a stretch written after it was first read is read again; a stretch that stays wrong is read three times and
+  then skipped to put; an acquire passed before the desync holds during the re-read and waits again past it.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

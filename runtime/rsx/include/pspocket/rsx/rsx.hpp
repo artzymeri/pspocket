@@ -280,8 +280,26 @@ private:
     {
         flow_history_[flow_next_] = {from, to};
         flow_next_ = (flow_next_ + 1) % static_cast<u32>(flow_history_.size());
+        words_since_flow_ = 0;
+        replay_end_ = 0;
+        if (to != reread_target_) reread_tries_ = 0;
     }
     std::string fifo_context(u32 get, u32 put) const;
+    // Desyncs (D-118). The last words read (offset, word) for the report; whether a method looked like the reader lost
+    // its place (an unknown method, an impossible primitive); and the re-read from the last jump target, call or
+    // return target after one: up to two tries per target, where the semaphore acquires it already passed (before
+    // replay_end_) hold.
+    std::array<std::pair<u32, u32>, 256> read_history_{};
+    u32 read_next_ = 0;
+    u64 words_since_flow_ = 0;
+    bool desync_suspect_ = false;
+    u32 reread_target_ = ~0u;
+    u32 reread_tries_ = 0;
+    u32 replay_end_ = 0;
+    u32 desync_reports_ = 0;
+    u64 last_desync_report_ = 0;
+    void report_desync(std::string_view why, u32 get);
+    bool reread_after_desync(u32 get);
     // Written by the thread driving the FIFO; atomic so status() can read them. The value is stored first.
     std::atomic<BlockReason> block_reason_{BlockReason::None};
     std::atomic<u32> block_value_{0}; // semaphore value, or the jump word

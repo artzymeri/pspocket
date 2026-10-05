@@ -158,6 +158,81 @@ TEST_CASE("RETURN without CALL and malformed words are FIFO errors")
     CHECK(f.failures[1].message.find("malformed") != std::string::npos);
 }
 
+TEST_CASE("a desync right after a jump is read again from the jump target (D-118)")
+{
+    // The reader jumps into a stretch it reads before the guest has finished writing it: an unknown method, then a
+    // malformed word. A millisecond later it reads the stretch again, written by then.
+    Fixture f;
+    auto main = f.at(0);
+    main.method(m::NV4097_CLEAR_SURFACE, 1).jump(0x1000);
+    auto stale = f.at(0x1000);
+    stale.word(0x00040080).word(0x12345678).word(0x80000000); // method 0x0080 does not exist; then not a command
+    CommandBuilder fresh = f.at(0x1000);
+    bool landed = false;
+    f.rsx->on_failure = [&](const Failure& x) {
+        f.failures.push_back(x);
+        if (landed) return;
+        landed = true; // the guest's words land
+        fresh.method(m::NV4097_CLEAR_SURFACE, 2).nop();
+    };
+    f.set_put(stale.offset());
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{1, 2}); // what came before the jump ran once
+    REQUIRE(f.failures.size() == 1);
+    CHECK(f.failures[0].kind == FailKind::UnhandledMethod);
+    CHECK(f.rsx->get() == stale.offset());
+}
+
+TEST_CASE("a desync that stays is read again twice, then skipped to put (D-118)")
+{
+    Fixture f;
+    auto main = f.at(0);
+    main.method(m::NV4097_CLEAR_SURFACE, 1).jump(0x1000);
+    auto bad = f.at(0x1000);
+    bad.word(0x00040080).word(0x12345678).word(0x80000000);
+    f.set_put(bad.offset());
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Error);
+    CHECK(f.backend.clears() == std::vector<u32>{1});
+    REQUIRE(f.failures.size() == 4); // the unknown method on each of the three reads, then the malformed word
+    CHECK(f.failures[2].kind == FailKind::UnhandledMethod);
+    CHECK(f.failures[3].kind == FailKind::FifoError);
+    CHECK(f.failures[3].message.find("malformed") != std::string::npos);
+    CHECK(f.rsx->get() == bad.offset());
+}
+
+TEST_CASE("a re-read passes the semaphore acquires the reader passed before the desync (D-118)")
+{
+    // The semaphore moves on while the reader goes the wrong way: waiting for the old value again would never end.
+    Fixture f;
+    const u32 label = f.layout().label_addr(64);
+    f.write32(label, 5);
+    auto main = f.at(0);
+    main.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW)
+        .method(m::NV406E_SEMAPHORE_OFFSET, 64 * 0x10)
+        .jump(0x1000);
+    auto stale = f.at(0x1000);
+    stale.method(m::NV406E_SEMAPHORE_ACQUIRE, 5);
+    CommandBuilder fresh = f.at(stale.offset());
+    stale.word(0x00040080).word(0x12345678);
+    bool landed = false;
+    f.rsx->on_failure = [&](const Failure& x) {
+        f.failures.push_back(x);
+        if (landed) return;
+        landed = true;
+        f.write32(label, 6);
+        fresh.method(m::NV4097_CLEAR_SURFACE, 7);
+    };
+    f.set_put(stale.offset());
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{7});
+    CHECK(f.failures.size() == 1);
+
+    // Past the point of the desync, acquires wait again.
+    auto next = f.at(stale.offset());
+    next.method(m::NV406E_SEMAPHORE_ACQUIRE, 5);
+    REQUIRE(f.submit(next) == Rsx::RunStatus::Blocked);
+}
+
 TEST_CASE("an unmapped FIFO address is a FIFO error")
 {
     Fixture f;

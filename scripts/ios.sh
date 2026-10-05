@@ -43,8 +43,10 @@ Commands:
                              reference-only .sprx). Phone connected and unlocked. They stay on your devices.
   pull-coverage              Copy what the phone met that the translation does not cover (D-117) into the game's
                              inventory directory: the SPU programs without lifted code, the addresses lifted code did not
-                             reach (a run log for scripts/lift-spu.sh) and the shaders it compiled. Phone connected and
-                             unlocked. Then translate and build again (scripts/lift-spu.sh, build or testflight).
+                             reach (a run log for scripts/lift-spu.sh) and the shaders it compiled, from that game's
+                             folders only (its title ID: <game>/title-id or the directory's name; D-118). Phone
+                             connected and unlocked. Then translate and build again (scripts/lift-spu.sh, build or
+                             testflight).
   all                        build + install + run --autorun --exit + report.
   testflight [--upload-only] gen, then archive the Release build, export it signed for App Store Connect (team
                              M7XJA39ZV6) and upload it for TestFlight: the way onto an iPhone that is not connected to
@@ -619,9 +621,20 @@ game_inventory_dir() {
     echo "$found"
 }
 
+# The game's title ID (BLES01807): $GAME/title-id, else the directory's name when it is one (translate-game.sh names
+# them so).
+game_title_id() {
+    local game="$1" name
+    if [ -s "$game/title-id" ]; then tr -d '[:space:]' < "$game/title-id"; return; fi
+    name="$(basename "$game")"
+    if [[ "$name" =~ ^[A-Z]{4}[0-9]{5}$ ]]; then echo "$name"; return; fi
+    die "which game is $game? Write its title ID (as BLES01807) into $game/title-id"
+}
+
 cmd_pull_coverage() {
-    local dev game tmp n_spu=0 n_seeds=0 n_shaders=0 n_pipes=0 stamp
+    local dev game title tmp n_spu=0 n_seeds=0 n_shaders=0 n_pipes=0 stamp
     game="$(game_inventory_dir)"
+    title="$(game_title_id "$game")"
     tmp="$(mktemp -d)"
     if [ -n "${PSPOCKET_PULL_FROM:-}" ]; then
         # An app data container on this Mac instead (a simulator's: xcrun simctl get_app_container ... data; tests).
@@ -641,6 +654,25 @@ cmd_pull_coverage() {
             --source "Library/Caches/pspocket-shaders" --destination "$tmp/shaders" --quiet >&2 \
             || warn "no shader cache on the phone"
     fi
+    # Each game keeps its own folders (D-118): only this game's are taken. Builds up to 131 kept one folder for every
+    # game the phone ran, which may hold another game's programs: taken only on request.
+    for kind in coverage shaders; do
+        if [ -d "$tmp/$kind/$title" ]; then
+            mv "$tmp/$kind" "$tmp/$kind-all"
+            mv "$tmp/$kind-all/$title" "$tmp/$kind"
+        elif [ -d "$tmp/$kind/spu" ] || [ -d "$tmp/$kind/programs" ]; then
+            if [ "${PSPOCKET_PULL_SHARED:-0}" = 1 ]; then
+                warn "$kind: the phone's folder from before D-118, shared by every game it ran (PSPOCKET_PULL_SHARED=1)"
+            else
+                warn "$kind: only the folder from before D-118 (build 131 or earlier), shared by every game the phone" \
+                     "ran: skipped (PSPOCKET_PULL_SHARED=1 takes it)"
+                rm -rf "$tmp/$kind"
+            fi
+        else
+            rm -rf "$tmp/$kind"
+        fi
+    done
+    say "game $title"
     # SPU programs: an image is the same wherever it was saved; its seed lines (where execution entered it) add up.
     mkdir -p "$game/spu"
     for f in "$tmp"/coverage/spu/spu_*; do

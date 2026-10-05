@@ -363,7 +363,73 @@ void Rsx::fifo_error(std::string message)
     packet_remaining_ = 0;
     return_stack_.clear();
     block_reason_ = BlockReason::None;
+    replay_end_ = 0;
     publish_get();
+}
+
+// The words the reader went through before it lost its place, oldest first, each with what the memory holds now
+// where that differs: a changed word was read before the guest finished writing it; an unchanged run shows the
+// commands as the reader took them (D-118). A few reports per run, one per desync.
+void Rsx::report_desync(std::string_view why, u32 get)
+{
+    const u64 now = words_.load(std::memory_order_relaxed);
+    if (desync_reports_ >= 8 || (desync_reports_ != 0 && now - last_desync_report_ < 4096)) return;
+    desync_reports_++;
+    last_desync_report_ = now;
+    std::string s = std::format("FIFO desync report {} at {:#010x} ({}), {} words after the last jump; the words read, "
+                                "oldest first (word!now where the memory differs now):", desync_reports_, get, why,
+        words_since_flow_);
+    const u32 size = static_cast<u32>(read_history_.size());
+    const u32 n = std::min(read_next_, size);
+    u32 next = ~0u, changed = 0;
+    for (u32 k = 0; k < n; k++) {
+        const auto& [at, word] = read_history_[(read_next_ - n + k) % size];
+        if (at != next) s += std::format("\n  {:#010x}:", at);
+        next = at + 4;
+        const auto ea = fifo_address(at);
+        const u32 current = ea ? read32(*ea) : word;
+        if (current == word) {
+            s += std::format(" {:08x}", word);
+        } else {
+            s += std::format(" {:08x}!{:08x}", word, current);
+            changed++;
+        }
+    }
+    s += std::format("\n  then from {:#010x}:", get + 4);
+    for (u32 o = get + 4; o != get + 68; o += 4) {
+        const auto ea = fifo_address(o);
+        s += ea ? std::format(" {:08x}", read32(*ea)) : " --------";
+    }
+    s += std::format("\n  {} of them changed since they were read", changed);
+    PS_LOG_ERROR(kChan, "{}", s);
+}
+
+// A desync soon after a jump, call or return is read again from its target a millisecond later: the words there may
+// have been read before the guest finished writing them. Two tries per target, then the caller gives up as before.
+// The semaphore acquires the reader already passed before the desync point hold during the re-read: their semaphores
+// may have moved on since (D-118).
+bool Rsx::reread_after_desync(u32 get)
+{
+    constexpr u64 kWindow = 16384; // words after the target
+    const auto& [from, to] = flow_history_[(flow_next_ + flow_history_.size() - 1) % flow_history_.size()];
+    if ((from == 0 && to == 0) || words_since_flow_ > kWindow) return false;
+    if (to != reread_target_) {
+        reread_target_ = to;
+        reread_tries_ = 0;
+    }
+    if (reread_tries_ >= 2) return false;
+    reread_tries_++;
+    PS_LOG_WARN(kChan, "FIFO desync at {:#010x}, {} words after the jump {:#x} -> {:#x}: reading again from {:#x} "
+                       "(try {})", get, words_since_flow_, from, to, to, reread_tries_);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    replay_end_ = std::max(replay_end_, get);
+    get_.store(to, std::memory_order_release);
+    packet_remaining_ = 0;
+    words_since_flow_ = 0;
+    desync_suspect_ = false;
+    block_reason_ = BlockReason::None;
+    publish_get();
+    return true;
 }
 
 // ---- FIFO -------------------------------------------------------------------------------------------------------
@@ -410,6 +476,9 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
             return RunStatus::Error;
         }
         const u32 word = read32_acquire(*ea);
+        read_history_[read_next_++ % read_history_.size()] = {get, word};
+        words_since_flow_++;
+        if (replay_end_ != 0 && get >= replay_end_) replay_end_ = 0; // past the point of the desync
 
         if (packet_remaining_ > 0) {
             // Method argument
@@ -419,6 +488,11 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
             packet_reg_ = (packet_reg_ + packet_inc_) & (m::kMethodCount - 1);
             packet_remaining_--;
             publish_get();
+            if (desync_suspect_) { // an unknown method or an impossible primitive (D-118)
+                desync_suspect_ = false;
+                report_desync("a method the reader cannot have meant", get);
+                reread_after_desync(get);
+            }
             continue;
         }
 
@@ -463,7 +537,14 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
                 publish_get();
                 continue;
             }
-            fifo_error(std::format("malformed FIFO command {:#010x} at {:#010x}{}", word, get, fifo_context(get, put)));
+            std::string message =
+                std::format("malformed FIFO command {:#010x} at {:#010x}{}", word, get, fifo_context(get, put));
+            report_desync("a malformed command", get);
+            if (config_.unhandled_policy != FailPolicy::Abort && reread_after_desync(get)) {
+                fail(FailKind::FifoError, 0, std::move(message));
+                continue;
+            }
+            fifo_error(std::move(message));
             return RunStatus::Error;
         }
 
@@ -484,7 +565,9 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
 Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
 {
     if (reg == m::NV406E_SEMAPHORE_ACQUIRE) {
-        if (!semaphore_acquire_satisfied(value)) {
+        // Passed already before a desync this re-read goes back over (D-118).
+        const bool replayed = replay_end_ != 0 && get_.load(std::memory_order_relaxed) < replay_end_;
+        if (!replayed && !semaphore_acquire_satisfied(value)) {
             block_value_ = value;
             block_reason_ = BlockReason::Semaphore;
             return Dispatch::Blocked;
@@ -498,6 +581,7 @@ Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
     if (const Handler handler = h.table[reg]) {
         (this->*handler)(reg, value);
     } else if (!h.known[reg]) {
+        desync_suspect_ = true;
         fail(FailKind::UnhandledMethod, reg,
             std::format("unhandled RSX method {} arg {:#010x} (FIFO {:#010x}, header {:#010x})", method_label(reg),
                 value, get_.load(std::memory_order_relaxed), packet_header_));
