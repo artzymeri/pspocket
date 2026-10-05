@@ -70,6 +70,17 @@ targets:
         name: codesign
         group: Runtime
         includes: *compiled
+      # Game libraries (route B, D-152): the runtime table a game library binds to, and loading one.
+      - path: ../../runtime/game/src
+        name: game
+        group: Runtime
+        includes: *compiled
+      # ... and the hashes that say which libraries fit this build (cmake/GameAbiHash.cmake, by the host build).
+      - path: ${PSPOCKET_HOST_BUILD_DIR}/generated/game
+        name: generated-game
+        group: Generated
+        optional: true
+        includes: *compiled
       # The compiler on the device (route B, D-151): clang and lld in process. scripts/ios.sh points
       # PSPOCKET_CODEGEN_SRC at runtime/codegen/src when scripts/build-llvm-ios.sh has built LLVM for iOS.
       - path: ${PSPOCKET_CODEGEN_SRC}
@@ -173,6 +184,7 @@ targets:
           - $(PSPOCKET_ROOT)/runtime/platform/apple/include
           - $(PSPOCKET_ROOT)/runtime/disc/include
           - $(PSPOCKET_ROOT)/runtime/codesign/include
+          - $(PSPOCKET_ROOT)/runtime/game/include
           - $(PSPOCKET_ROOT)/runtime/spu/include
           - $(PSPOCKET_ROOT)/runtime/lv2/include
           - $(PSPOCKET_ROOT)/runtime/lv2/src

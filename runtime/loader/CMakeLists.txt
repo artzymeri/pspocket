@@ -8,7 +8,7 @@ add_library(pspocket::loader ALIAS pspocket_loader)
 
 # Bring-up host: runs an executable under the interpreter until it exits or hits a gap.
 add_executable(pspocket-boot tools/boot_main.cpp)
-target_link_libraries(pspocket-boot PRIVATE pspocket::loader)
+target_link_libraries(pspocket-boot PRIVATE pspocket::loader pspocket::game)
 # --gpu metal / --frames: the game's frames through the Metal backend, saved as PNG (Apple platforms).
 if(TARGET pspocket::rsx_metal)
     target_link_libraries(pspocket-boot PRIVATE pspocket::rsx_metal)

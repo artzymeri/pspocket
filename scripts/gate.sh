@@ -8,17 +8,21 @@
 #                            two hours for GTA V's): for changes to the SPU translation, run before the gate
 #
 # Options: --accept-messages (game) adds the run's new warning and error shapes to the baseline instead of failing.
+# --library FILE (game) runs the walk with the game's code from a game library (pspocket-prepare, D-152), as the
+# phone runs it, instead of the translation built into pspocket-boot.
 # The runs stay in inventory/gate/ (game output: never committed, CLAUDE.md rule 1). Exit 0: passed; 1: failed;
 # 2: the game step cannot run here (no game inputs in inventory/).
 set -u
 cd "$(dirname "$0")/.."
-mode=all accept=""
-for a in "$@"; do
-  case $a in
-    quick|game|all|spu) mode=$a ;;
+mode=all accept="" library=()
+while (( $# )); do
+  case $1 in
+    quick|game|all|spu) mode=$1 ;;
     --accept-messages) accept=--accept-messages ;;
-    *) echo "usage: scripts/gate.sh [quick|game|all|spu] [--accept-messages]" >&2; exit 64 ;;
+    --library) shift; [[ -f ${1:-} ]] || { echo "gate: no game library ${1:-}" >&2; exit 64; }; library=(--game-library $1) ;;
+    *) echo "usage: scripts/gate.sh [quick|game|all|spu] [--accept-messages] [--library FILE]" >&2; exit 64 ;;
   esac
+  shift
 done
 build=${PSPOCKET_GATE_BUILD:-build/host}
 stamp=$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- . ':!docs' 2>/dev/null || echo +)
@@ -57,10 +61,10 @@ if [[ $mode == game || $mode == all ]]; then
   timeout_s=$(python3 -c "import json; print(json.load(open('$gate'))['timeout_s'])")
   frame_every=$(python3 -c "import json; print(json.load(open('$gate'))['frame_every'])")
   frame_from=$(python3 -c "import json; print(json.load(open('$gate'))['frame_from'])")
-  echo "==> gate game: GTA V prologue walk, ${timeout_s} s"
+  echo "==> gate game: GTA V prologue walk, ${timeout_s} s${library:+, code from ${library[2]}}"
   $build/runtime/loader/pspocket-boot $elf --gpu metal --timeout $timeout_s --hdd0 $hdd0 --bdvd $iso --flash $flash \
     --shader-cache $shaders --press-file games/gta5/walk-prologue.txt --frame-jumps --frame-every $frame_every \
-    --frame-from $frame_from --summary $out/summary.json > $out/run.log 2>&1
+    --frame-from $frame_from --summary $out/summary.json $library > $out/run.log 2>&1
   rc=$?
   echo "    pspocket-boot exit $rc ($out/run.log)"
   if [[ ! -f $out/summary.json ]]; then

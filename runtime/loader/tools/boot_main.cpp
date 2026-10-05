@@ -41,6 +41,9 @@
 // writes the run as JSON when it ends (scripts/gate.sh reads it, D-149): how it ended, fps per 5 s, the Metal
 // backend's report windows, the peak memory footprint, RSX failures, unimplemented calls, SPU code interpreted, frame
 // jumps and every warning and error by shape (numbers as #).
+// --game-library FILE runs the game's translated code from a game library (route B, D-152: pspocket-prepare makes one
+// as the phone does) instead of the translation built into this program: its PPU functions and SPU programs, for the
+// executable it was made from only; a library made for another runtime or executable stops the run.
 // --dump-on-fault FILE writes the guest's committed memory below the RSX's local memory to FILE when a guest fault
 // ends the run, for offline analysis (game data: keep it in inventory/). The file is a sequence of blocks: a
 // big-endian u32 guest address, a u32 byte count, then the bytes. A fault in SPU code also writes that SPU's local
@@ -93,6 +96,7 @@
 #include "pspocket/lv2/report.hpp"
 #include "pspocket/core/png.hpp"
 #include "pspocket/core/thread_report.hpp"
+#include "pspocket/game/host.hpp"
 #if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
 #include "pspocket/platform/audio_output.hpp"
 #endif
@@ -119,7 +123,7 @@ int usage()
         "                     [--frame-every N] [--frame-from N] [--dump-on-fault FILE]\n"
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
-        "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json]\n"
+        "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -648,6 +652,7 @@ int main(int argc, char** argv)
     std::vector<hle::PadPress> presses;
     bool audio = false;
     std::string spu_dump;
+    std::string game_library; // --game-library (D-152)
     bool frame_jumps = false;
     std::string summary_path;
     const auto add_press = [&](std::string_view spec) {
@@ -730,6 +735,7 @@ int main(int argc, char** argv)
         }
         else if (a == "--audio") audio = true;
         else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
+        else if (a == "--game-library") { const char* v = value(); if (!v) return usage(); game_library = v; }
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
         else if (a == "--log") {
@@ -880,8 +886,10 @@ int main(int argc, char** argv)
     // its lifted range (the SPURS syscall stubs, overlays), are interpreted, in every build, until they are collected.
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
 #if defined(PSPOCKET_HAVE_GAME_SPU)
-    pspocket_game_spu_register();
-    hle::enable_spu_modules();
+    if (game_library.empty()) { // a game library brings its own (registered after the executable is loaded)
+        pspocket_game_spu_register();
+        hle::enable_spu_modules();
+    }
 #endif
     if (!spu_dump.empty()) {
         hle::set_spu_dump_dir(spu_dump);
@@ -918,14 +926,29 @@ int main(int argc, char** argv)
         print_imports(hle);
         return 0;
     }
+    bool translated = false; // the game's PPU code runs translated (built in or from a library)
+    if (!game_library.empty()) {
+        // The game's translated code from a game library (route B, D-152), checked against this runtime and this
+        // executable before anything in it runs.
+        game::LoadedLibrary loaded;
+        std::string error;
+        if (!game::load_library(game_library, memory, &loaded, &error)) {
+            std::fprintf(stderr, "pspocket-boot: %s\n", error.c_str());
+            return 70;
+        }
+        if (loaded.library->spu_register) hle::enable_spu_modules();
+        translated = loaded.library->ppu_function_count > 0;
+    }
 #if defined(PSPOCKET_HAVE_GAME_PPU)
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098):
-    // branches into it from the interpreter run it.
-    const bool same_image =
-        loader::register_translated_ppu(memory, game_ppu_image_words, game_ppu_image_word_count, &game_ppu_register);
+    // branches into it from the interpreter run it. A game library replaces it.
+    if (game_library.empty())
+        translated = loader::register_translated_ppu(memory, game_ppu_image_words, game_ppu_image_word_count,
+            &game_ppu_register);
+#endif
     // PSPOCKET_PPU_ONLY=LO-HI[,LO-HI...] keeps the translated functions in those ranges only, the rest interpreted:
     // bisecting a translation fault down to the function.
-    if (const char* only = std::getenv("PSPOCKET_PPU_ONLY"); only && same_image) {
+    if (const char* only = std::getenv("PSPOCKET_PPU_ONLY"); only && translated) {
         std::vector<std::pair<u64, u64>> ranges;
         for (const char* p = only;;) {
             char* end = nullptr;
@@ -947,7 +970,6 @@ int main(int argc, char** argv)
         }
         PS_LOG_INFO("boot", "PSPOCKET_PPU_ONLY={}: {} translated functions kept", only, kept);
     }
-#endif
     if (const lv2::Result r = loader::start_main_thread(*exe, kernel, state, {}, main_id); r != lv2::CELL_OK) {
         std::fprintf(stderr, "pspocket-boot: cannot start the main thread: %s\n", lv2::error_name(r));
         return 70;

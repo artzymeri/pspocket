@@ -323,6 +323,9 @@ cmd_gen() {
             float.h limits.h iso646.h ptrauth.h "$codegen_bundle/clang/include/")
         cp -R "$ROOT/runtime/codegen/sysroot" "$codegen_bundle/sysroot"
         for d in ppu spu core; do cp -R "$ROOT/runtime/$d/include/pspocket/$d" "$codegen_bundle/include/pspocket/"; done
+        # A game library's ABI and the entry compiled into every one (D-152).
+        cp -R "$ROOT/runtime/game/include/pspocket/game" "$codegen_bundle/include/pspocket/"
+        mkdir -p "$codegen_bundle/library" && cp "$ROOT/runtime/game/library/library_entry.c" "$codegen_bundle/library/"
         llvm_ldflags="$(ls "$llvm_ios"/lib/*.a | tr '\n' ' ')"
         say "compiler on the device: $(ls "$llvm_ios"/lib/*.a | wc -l | tr -d ' ') LLVM libraries ($llvm_ios), headers in $codegen_bundle"
     else
