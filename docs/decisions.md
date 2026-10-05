@@ -2459,6 +2459,46 @@ checks, and the phone compiles fast enough.
 - **Not chosen now:** a direct ARM64 emitter (kept as the option if phone preparation times miss the budget after the
   fixes above), and emitting LLVM IR from the lifters instead of C (skips the front end: a later speed-up).
 
+## D-152 · 2026-10-05 · A game's translated code is a library the host loads (route B, stage 3)
+
+Route B (D-147) needs the translated code of a game to arrive after the app is built: a library the phone makes once
+per game (D-150 signs it, D-151 compiles it) and the app loads. Stage 3 makes that library and loads it, on the Mac
+first (rule 2).
+- **The interface (runtime/game, `pspocket/game/library.h`):** a game library exports one symbol,
+  `pspocket_game_library`. The host calls it with `ps_game_runtime`: pointers to the 18 PPU and 9 SPU runtime functions
+  translated code calls, the PPU dispatch table and the four SPU reciprocal tables (the whole list, from the lifters'
+  output and an `nm -u` of GTA V's code). The library returns `ps_game_library`: its register functions, its D-098
+  image samples, the title, what made it, and the decrypted executable's SHA-256. Inside the library the runtime's
+  names are hidden pointer variables (`PS_PPU_IMPORT` and `PS_SPU_IMPORT` in runtime.h, the tables in fp.h, under
+  `PSPOCKET_GAME_LIBRARY`), filled in by the library's entry (`library/library_entry.c`, compiled into every library):
+  the lifters' output does not change, and the host need not export anything, which a stripped iOS app could not.
+- **Compatibility:** the build hashes the ten headers translated code includes and library.h (`ps_game_abi_hash`)
+  and the lifters' sources (`ps_game_translator_hash`, cmake/GameAbiHash.cmake). A library carries both; the host
+  binds only one with its own layout version and ABI hash, and only for the executable now in memory (its sampled
+  words), else refuses with the reason and registers nothing; another translator hash is logged (a newer pspocket
+  would translate the game differently).
+- **Loading (`game::load_library`):** a fresh copy of the file (the kernel keeps a file's first signature), its
+  signature registered and library validation asked (`codesign::register_signature`, as in D-150), dlopen, bind,
+  checks, then its PPU functions and SPU programs registered. Never unloaded.
+- **Building (runtime/codegen `build_library`, the phone's and the Mac's):** every file compiled by the device's
+  compiler (D-151), the slowest first, as many at once as the cores and a memory budget allow; objects named by
+  everything that makes them and kept, so a stopped build resumes (the first GTA V build failed at 681 of 815 files
+  on a bug of ours and the next run compiled only the rest); then lld, and the library is signed. Progress and the
+  time left count each file's predicted cost (`estimate_cost`: size, and lines times block starts per function for
+  SPU code, fitted on run 092), corrected by the files done and laid out over the workers (`TimeLeft`): the user asked
+  for an accurate time left.
+- **pspocket-prepare** makes a game library on the Mac from ppu-lift's and lift-spu.sh's output, as the phone will;
+  **`pspocket-boot --game-library FILE`** runs from one instead of the built-in translation; **`scripts/gate.sh game
+  --library FILE`** walks the gate with it.
+- **GTA V (run 093):** 815 files, 8 min 21 s on the M4's ten cores, linked in 1.2 s, 145 MB. The gate walk from the
+  library passes with the built-in build's numbers: 29.8 fps median and 29.2 slowest, 2 frame jumps, 84 passes a
+  frame, 1.6 GB; CPU within 3% (11.97 against 11.68 CPU-seconds per 5 s, run-to-run noise is of that size).
+- **Test (tests/game):** recomp/ppu's synthetic benchmark, lifted at build time, made into a library with the
+  device's compiler, loaded through the runtime table and run through the dispatch table: the natively computed
+  result. A library made for another runtime, or for another executable, is refused and registers nothing; a second
+  build compiles nothing; TimeLeft's arithmetic.
+- **Kept:** the built-in path (`PSPOCKET_GAME_PPU/SPU`) stays until the app prepares games itself (stage 4).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
