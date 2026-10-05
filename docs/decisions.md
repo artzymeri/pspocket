@@ -2357,6 +2357,33 @@ nothing to the target they sample (colour mask 0 there).
 - Tests: 50 draws that sample their own target with the mask off share one copy and one pass; a draw after a write to
   the target samples the write (an old copy would show the clear).
 
+## D-149 · 2026-10-05 · The regression gate: nothing reaches the phone that does worse on the Mac
+
+The regressions that mattered got past the tests: the EDGE/GFX stops of D-127 (D-131), the flicker of D-134 (found by
+the user), the archive memory of D-143 (found by iOS). The user wants every change to move forward only.
+- **pspocket-boot:** `--press-file FILE` (presses as `--press` takes them, a walk per file), `--frame-jumps` (each
+  captured frame against the one before as 64x36 thumbnails, run 088's flicker measure, without writing frames) and
+  `--summary FILE.json` (how the run ended, fps per 5 s, the Metal backend's report windows, peak memory footprint,
+  RSX failures, unimplemented calls, SPU code interpreted, frame jumps, and every warning and error by shape with the
+  numbers taken out). The 5 s line on the Mac shows the memory footprint too.
+- **`scripts/gate.sh`:** `quick` builds and runs ctest; `game` runs GTA V's prologue walk (games/gta5/walk-prologue.txt,
+  128 s) and checks the summary against games/gta5/gate.json (`scripts/gate_check.py`): ends at its timeout, RSX
+  failures at most 1, no unimplemented calls, no SPU code interpreted, fps median 28 or more and no window under 24,
+  frame jumps at most 2, render passes per frame at most 90, write faults at most 60, at most 4 compiles in play,
+  feedback copies at most 8 a frame, no readback waits, GPU memory at most 400 MB, process memory at most 2.5 GB, and no
+  warning or error shape not seen before (the baseline list stays in inventory/gate/: the messages name the game's
+  files). `spu` runs spu-check over the game's SPU programs (two hours for GTA V's: before the gate, for changes to the
+  SPU translation). `scripts/ios.sh build` and `testflight` run the gate first (`--no-gate` skips it, said in the
+  commit); `ios.sh gen` stops when the host build fails.
+- **GPU time is not a gate check:** the Mac's GPU time per frame flips between about 8.5 and 22 to 25 ms from run to
+  run and within one (run 088's walks: a, b and d at 22 to 25, f from 8.5 to 22 halfway, g at 8.5), at 30 fps either
+  way; its ceiling is 30 ms and render passes per frame are the structural check.
+- **The phone:** `scripts/ios.sh session` summarises each app session in a device log (fps, sound pace and skipped
+  blocks, memory used and least left, memory warnings and trims, heat, the GPU windows, the busiest threads, faults);
+  `ios.sh pull-log` fetches the game's log and the one before.
+- The first gated runs: fps 29.2 to 30, 2 frame jumps (camera cuts), 84 passes a frame, GPU memory 231 MB, process
+  memory 1.6 GB.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

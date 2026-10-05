@@ -1,0 +1,24 @@
+{
+  "_about": "scripts/gate.sh's thresholds for GTA V's prologue walk (walk-prologue.txt) on the Mac, D-149. Values from walk g of run 088 and the first gated runs, with margins: runs are not frame-exact, and the Mac's GPU time per frame flips between about 8.5 and 22-25 ms from run to run (run 088's walks a-g), so GPU ms is a loose ceiling and render passes per frame the structural check. Lower a limit when a change makes things better, never raise it to let one through.",
+  "timeout_s": 128,
+  "frame_every": 2,
+  "frame_from": 2150,
+  "checks": {
+    "exit": "timeout",
+    "rsx_failures_max": 1,
+    "fps_skip_windows": 2,
+    "fps_median_min": 28,
+    "fps_floor": 24,
+    "frames_compared_min": 700,
+    "frame_jumps_max": 2,
+    "play_from_flip": 2150,
+    "gpu_ms_max": 30,
+    "render_passes_max": 90,
+    "write_faults_max": 60,
+    "compiled_in_play_max": 4,
+    "feedback_copies_max": 8,
+    "readback_wait_ms_max": 1.0,
+    "gpu_allocated_mb_max": 400,
+    "footprint_mb_max": 2500
+  }
+}

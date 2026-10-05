@@ -34,6 +34,13 @@
 // does, instead of stopping the run. --shader-cache DIR (with Metal) records every program and pipeline the backend
 // makes in DIR and makes the ones recorded there before ahead, on background threads, while the game loads (D-114; game
 // data: keep it in inventory/, scripts/ios.sh puts it in the app).
+// --press-file FILE reads presses from FILE, as --press takes them (whitespace or lines apart; # starts a comment): a
+// scripted walk (games/<title>/walk-*.txt). --frame-jumps compares each saved frame (every --frame-every, from
+// --frame-from) with the one before as 64x36 thumbnails and counts the jumps (mean difference over 25 of 255, big over
+// 60): the colour flicker of run 088 in a number, without writing a frame (--frames still saves them). --summary FILE
+// writes the run as JSON when it ends (scripts/gate.sh reads it, D-149): how it ended, fps per 5 s, the Metal
+// backend's report windows, the peak memory footprint, RSX failures, unimplemented calls, SPU code interpreted, frame
+// jumps and every warning and error by shape (numbers as #).
 // --dump-on-fault FILE writes the guest's committed memory below the RSX's local memory to FILE when a guest fault
 // ends the run, for offline analysis (game data: keep it in inventory/). The file is a sequence of blocks: a
 // big-endian u32 guest address, a u32 byte count, then the bytes. A fault in SPU code also writes that SPU's local
@@ -43,6 +50,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -53,7 +61,9 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -64,6 +74,7 @@
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
 #include <sys/ucontext.h>
 #endif
 
@@ -108,6 +119,7 @@ int usage()
         "                     [--frame-every N] [--frame-from N] [--dump-on-fault FILE]\n"
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
+        "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -379,6 +391,120 @@ bool read_file(const char* path, std::vector<u8>& out)
     return true;
 }
 
+// The memory the system counts against the process (the iOS app's status line has it too, D-145), in MB; 0 elsewhere.
+double footprint_mb()
+{
+#if defined(__APPLE__)
+    task_vm_info_data_t vm{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm), &count) == KERN_SUCCESS)
+        return static_cast<double>(vm.phys_footprint) / 1048576.0;
+#endif
+    return 0;
+}
+
+// A log message with its numbers taken out ("#" for each run starting with a digit, hex and decimals included):
+// warnings and errors of one kind count as one in the summary, whatever their addresses (D-149).
+std::string message_shape(std::string_view channel, std::string_view message)
+{
+    std::string out(channel);
+    out += ": ";
+    for (usize i = 0; i < message.size() && out.size() < 200;) {
+        const char c = message[i];
+        if (c >= '0' && c <= '9') {
+            while (i < message.size() && (std::isxdigit(static_cast<unsigned char>(message[i])) || message[i] == 'x' ||
+                                          message[i] == 'X' || message[i] == '.'))
+                i++;
+            out += '#';
+        } else {
+            out += c;
+            i++;
+        }
+    }
+    return out;
+}
+
+std::string json_string(std::string_view v)
+{
+    std::string out = "\"";
+    for (const char c : v) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            out += std::format("\\u{:04x}", static_cast<unsigned>(static_cast<unsigned char>(c)));
+        } else {
+            out += c;
+        }
+    }
+    return out + "\"";
+}
+
+// What --summary writes, gathered while the game runs (D-149).
+struct RunSummary {
+    std::mutex mutex;
+    std::vector<double> fps; // per 5 s window
+    double peak_footprint_mb = 0;
+    std::map<std::string, u64> messages; // warnings and errors by shape
+#if defined(PSPOCKET_HAVE_METAL)
+    std::vector<rsx::metal::WindowStats> windows;
+#endif
+    // --frame-jumps: each compared frame's 64x36 thumbnail against the one before.
+    u64 frames_compared = 0, jumps = 0, big_jumps = 0;
+    std::vector<std::pair<u64, double>> jump_at; // the first jumps: flip, mean difference
+    std::vector<int> previous;                   // the last thumbnail, B G R per pixel
+};
+RunSummary g_summary;
+
+// The log on stderr as the default sink writes it, the warnings and errors also counted by shape.
+void summary_sink(void*, log::Level level, std::string_view channel, std::string_view message)
+{
+    std::fprintf(stderr, "[%.*s] %.*s: %.*s\n", static_cast<int>(log::level_name(level).size()),
+        log::level_name(level).data(), static_cast<int>(channel.size()), channel.data(), static_cast<int>(message.size()),
+        message.data());
+    if (level < log::Level::Warn) return;
+    std::string shape = message_shape(channel, message);
+    std::lock_guard lock(g_summary.mutex);
+    g_summary.messages[std::move(shape)]++;
+}
+
+// A frame for --frame-jumps: its mean difference from the frame before, 64x36 box-filtered, over 25 a jump (run 088).
+void compare_frame(const u8* bgra, u32 w, u32 h, u64 flip)
+{
+    constexpr u32 kW = 64, kH = 36;
+    std::vector<int> thumb(kW * kH * 3);
+    for (u32 ty = 0; ty < kH; ty++) {
+        const u32 y0 = ty * h / kH, y1 = std::max(y0 + 1, (ty + 1) * h / kH);
+        for (u32 tx = 0; tx < kW; tx++) {
+            const u32 x0 = tx * w / kW, x1 = std::max(x0 + 1, (tx + 1) * w / kW);
+            u64 sum[3] = {};
+            for (u32 y = y0; y < y1; y++) {
+                const u8* row = bgra + (static_cast<usize>(y) * w + x0) * 4;
+                for (u32 x = x0; x < x1; x++, row += 4) {
+                    sum[0] += row[0];
+                    sum[1] += row[1];
+                    sum[2] += row[2];
+                }
+            }
+            const u64 n = u64{y1 - y0} * (x1 - x0);
+            for (u32 c = 0; c < 3; c++) thumb[(ty * kW + tx) * 3 + c] = static_cast<int>(sum[c] / n);
+        }
+    }
+    std::lock_guard lock(g_summary.mutex);
+    if (!g_summary.previous.empty()) {
+        u64 total = 0;
+        for (usize i = 0; i < thumb.size(); i++) total += static_cast<u64>(std::abs(thumb[i] - g_summary.previous[i]));
+        const double diff = static_cast<double>(total) / static_cast<double>(thumb.size());
+        g_summary.frames_compared++;
+        if (diff > 25) {
+            g_summary.jumps++;
+            if (diff > 60) g_summary.big_jumps++;
+            if (g_summary.jump_at.size() < 20) g_summary.jump_at.emplace_back(flip, diff);
+        }
+    }
+    g_summary.previous = std::move(thumb);
+}
+
 // Saves --frames on threads of its own: compressing a PNG takes about as long as a frame, and the capture callback
 // runs on the GPU's completion thread, where it would hold up the frames after it (and the game's pace with them).
 class FrameWriter {
@@ -440,6 +566,57 @@ private:
     std::vector<std::thread> threads_; // last: started once the rest exists
 };
 
+// --summary: the run as JSON (D-149), for scripts/gate.sh.
+bool write_summary(const std::string& path, bool exited, int status, double seconds, lv2::Kernel& kernel,
+    usize unimplemented_functions, const hle::SpuProgramStats& spu)
+{
+    std::lock_guard lock(g_summary.mutex);
+    std::string j = "{\n";
+    j += std::format("  \"exit\": {},\n  \"exit_status\": {},\n  \"seconds\": {:.1f},\n",
+        json_string(exited ? "exited" : "timeout"), status, seconds);
+    rsx::Rsx* r = kernel.rsx();
+    j += std::format("  \"flips\": {},\n  \"rsx_failures\": {},\n", r ? r->status().flips : 0, r ? r->failure_count() : 0);
+    j += "  \"fps\": [";
+    for (usize i = 0; i < g_summary.fps.size(); i++) j += std::format("{}{:.1f}", i ? ", " : "", g_summary.fps[i]);
+    j += std::format("],\n  \"footprint_peak_mb\": {:.0f},\n", g_summary.peak_footprint_mb);
+    j += std::format("  \"unimplemented_syscalls\": {},\n  \"unimplemented_functions\": {},\n",
+        kernel.unimplemented_count(), unimplemented_functions);
+    j += std::format("  \"spu_loads\": {{\"lifted\": {}, \"interpreted\": {}, \"images_without_lifted\": {}}},\n",
+        spu.attached, spu.unknown, spu.images);
+    j += std::format("  \"frame_jumps\": {{\"compared\": {}, \"jumps\": {}, \"big\": {}, \"at\": [",
+        g_summary.frames_compared, g_summary.jumps, g_summary.big_jumps);
+    for (usize i = 0; i < g_summary.jump_at.size(); i++)
+        j += std::format("{}[{}, {:.1f}]", i ? ", " : "", g_summary.jump_at[i].first, g_summary.jump_at[i].second);
+    j += "]},\n  \"gpu_windows\": [";
+#if defined(PSPOCKET_HAVE_METAL)
+    for (usize i = 0; i < g_summary.windows.size(); i++) {
+        const rsx::metal::WindowStats& w = g_summary.windows[i];
+        std::string ends;
+        for (usize k = 0; k < w.pass_ends.size(); k++)
+            ends += std::format("{}{}: {:.2f}", k ? ", " : "", json_string(rsx::metal::kPassEndNames[k]), w.pass_ends[k]);
+        j += std::format("{}\n    {{\"last_flip\": {}, \"gpu_ms\": {:.2f}, \"draws\": {:.0f}, \"render_passes\": {:.1f}, "
+                         "\"pass_ends\": {{{}}}, \"readbacks\": {:.2f}, \"readback_wait_ms\": {:.2f}, "
+                         "\"texture_checks\": {:.0f}, \"write_faults\": {:.1f}, \"feedback_copies\": {:.2f}, "
+                         "\"corner_textures\": {:.2f}, \"surface_reloads\": {:.2f}, \"gpu_wait_ms\": {:.2f}, "
+                         "\"programs_made\": {}, \"pipelines_made\": {}, \"compile_ms\": {:.1f}, \"textures\": {}, "
+                         "\"surfaces\": {}, \"gpu_allocated_mb\": {:.0f}, \"deferred_queue\": {}}}",
+            i ? "," : "", w.last_flip, w.gpu_ms, w.draws, w.render_passes, ends, w.readbacks, w.readback_wait_ms,
+            w.texture_checks, w.write_faults, w.feedback_copies, w.corner_textures, w.surface_reloads, w.gpu_wait_ms,
+            w.programs_made, w.pipelines_made, w.compile_ms, w.textures, w.surfaces, w.gpu_allocated_mb, w.deferred_queue);
+    }
+#endif
+    j += "\n  ],\n  \"messages\": {";
+    bool first = true;
+    for (const auto& [shape, count] : g_summary.messages) {
+        j += std::format("{}\n    {}: {}", first ? "" : ",", json_string(shape), count);
+        first = false;
+    }
+    j += "\n  }\n}\n";
+    std::ofstream out(path, std::ios::trunc);
+    out << j;
+    return static_cast<bool>(out);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -471,6 +648,18 @@ int main(int argc, char** argv)
     std::vector<hle::PadPress> presses;
     bool audio = false;
     std::string spu_dump;
+    bool frame_jumps = false;
+    std::string summary_path;
+    const auto add_press = [&](std::string_view spec) {
+        std::string error;
+        const auto press = hle::parse_pad_press(spec, &error);
+        if (!press) {
+            std::fprintf(stderr, "pspocket-boot: %s\n", error.c_str());
+            return false;
+        }
+        presses.push_back(*press);
+        return true;
+    };
     for (int i = 1; i < argc; i++) {
         const std::string_view a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -516,13 +705,28 @@ int main(int argc, char** argv)
         else if (a == "--press") {
             const char* v = value();
             if (!v) return usage();
-            std::string error;
-            const auto press = hle::parse_pad_press(v, &error);
-            if (!press) {
-                std::fprintf(stderr, "pspocket-boot: %s\n", error.c_str());
-                return 64;
+            if (!add_press(v)) return 64;
+        } else if (a == "--press-file") {
+            const char* v = value();
+            if (!v) return usage();
+            std::ifstream in(v);
+            if (!in) {
+                std::fprintf(stderr, "pspocket-boot: cannot read %s\n", v);
+                return 66;
             }
-            presses.push_back(*press);
+            for (std::string line; std::getline(in, line);) {
+                if (const auto hash = line.find('#'); hash != std::string::npos) line.resize(hash);
+                std::istringstream words(line);
+                for (std::string w; words >> w;)
+                    if (!add_press(w)) return 64;
+            }
+        } else if (a == "--frame-jumps") {
+            frame_jumps = true;
+            gpu = "metal";
+        } else if (a == "--summary") {
+            const char* v = value();
+            if (!v) return usage();
+            summary_path = v;
         }
         else if (a == "--audio") audio = true;
         else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
@@ -539,6 +743,7 @@ int main(int argc, char** argv)
         else return usage();
     }
     if (!elf_path) return usage();
+    if (!summary_path.empty()) log::set_sink(summary_sink, nullptr); // warnings and errors counted by shape
 
     std::vector<u8> bytes;
     if (!read_file(elf_path, bytes)) {
@@ -598,12 +803,22 @@ int main(int argc, char** argv)
         cfg.rsx_backend = [&]() -> std::unique_ptr<rsx::Backend> {
             rsx::metal::MetalBackendConfig mc;
             mc.shader_cache = shader_cache;
-            if (!frames_dir.empty()) {
+            if (!summary_path.empty()) {
+                mc.on_window = [](const rsx::metal::WindowStats& w) {
+                    std::lock_guard lock(g_summary.mutex);
+                    g_summary.windows.push_back(w);
+                };
+            }
+            if (!frames_dir.empty() || frame_jumps) {
                 mc.capture_every = frame_every;
                 mc.capture = [&](const u8* bgra, u32 w, u32 h, u64 flip) {
                     if (flip < frame_from) return;
-                    frame_writer.push(std::format("{}/frame-{:06}.png", frames_dir, flip), bgra, w, h);
+                    if (frame_jumps) compare_frame(bgra, w, h, flip);
+                    if (!frames_dir.empty())
+                        frame_writer.push(std::format("{}/frame-{:06}.png", frames_dir, flip), bgra, w, h);
                 };
+            }
+            if (!frames_dir.empty()) {
                 if (trace_frame) {
                     mc.trace_frame = trace_frame;
                     mc.trace_surface = [&frames_dir, trace_frame](const std::string& name, const u8* bgra, u32 w, u32 h) {
@@ -776,9 +991,14 @@ int main(int argc, char** argv)
                 const u64 flips = r->status().flips;
                 const double dt = std::chrono::duration<double>(now - rate_since).count();
                 if (flips != rate_flips) {
-                    PS_LOG_INFO("boot", "{:.1f} fps ({} frames in {:.1f} s; {} since the boot)",
-                        static_cast<double>(flips - rate_flips) / dt, flips - rate_flips, dt, flips);
+                    const double fps = static_cast<double>(flips - rate_flips) / dt;
+                    const double footprint = footprint_mb();
+                    PS_LOG_INFO("boot", "{:.1f} fps ({} frames in {:.1f} s; {} since the boot); memory {:.2f} GB", fps,
+                        flips - rate_flips, dt, flips, footprint / 1024);
                     PS_LOG_INFO("boot", "threads: {}", thread_cpu_report(dt));
+                    std::lock_guard lock(g_summary.mutex);
+                    g_summary.fps.push_back(fps);
+                    g_summary.peak_footprint_mb = std::max(g_summary.peak_footprint_mb, footprint);
                 }
                 rate_flips = flips;
             }
@@ -843,6 +1063,12 @@ int main(int argc, char** argv)
     for (const auto* f : missing)
         std::printf("  %8llu  %s::%s (0x%08X)\n", static_cast<unsigned long long>(f->calls.load()), f->module.c_str(),
             f->name.empty() ? "?" : f->name.c_str(), f->nid);
+    if (!summary_path.empty()) {
+        if (!write_summary(summary_path, done, done ? kernel.exit_status() : 0, secs, kernel, missing.size(), spu))
+            std::fprintf(stderr, "pspocket-boot: cannot write %s\n", summary_path.c_str());
+        else
+            std::printf("summary: %s\n", summary_path.c_str());
+    }
 
     if (!kernel.shutdown()) {
         std::fprintf(stderr, "pspocket-boot: guest threads still running at shutdown\n");

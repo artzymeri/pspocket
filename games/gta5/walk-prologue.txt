@@ -1,0 +1,5 @@
+# GTA V (BLES01807): the prologue walk of runs 086 and 088 (D-149). Through the start menus into the prologue, then
+# forward with a turn of the camera. Button presses only (pspocket/hle/pad_script.hpp), timed in seconds from the
+# boot: pspocket-boot --press-file reads it, and scripts/gate.sh runs it for 128 s.
+cross@45 cross@55 cross@65 cross@75 cross@90
+ls-up@100:6 ls-left@107:1.5 ls-up@109:8 rs-right@118:1 ls-up@120:10

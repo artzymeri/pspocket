@@ -48,6 +48,13 @@ Commands:
                              connected and unlocked. Then translate and build again (scripts/lift-spu.sh, build or
                              testflight).
   all                        build + install + run --autorun --exit + report.
+  gate                       scripts/gate.sh: the tests, then GTA V's walk on the Mac against games/gta5/gate.json
+                             (D-149). build and testflight run it first; --no-gate skips it (say why in the commit).
+  pull-log                   Copy the game's log and the one of the launch before (Documents/game.log, game-prev.log)
+                             to inventory/phone/logs/. Phone connected and unlocked.
+  session [FILE] [--since HH:MM]
+                             Summarise each app session in a device log (default: the newest
+                             inventory/phone/live/syslog-*.log): fps, sound, memory, heat, GPU, threads, faults.
   testflight [--upload-only] gen, then archive the Release build, export it signed for App Store Connect (team
                              M7XJA39ZV6) and upload it for TestFlight: the way onto an iPhone that is not connected to
                              this Mac or on its network. The build number is the commit count, so each upload is
@@ -61,6 +68,7 @@ Options:
   --device ID   devicectl device: identifier, UDID or name. Default: \$PSPOCKET_DEVICE, else the first connected iPhone.
   --sim         Use an iPhone simulator instead of the device (\$PSPOCKET_SIMULATOR: name or UDID).
   --debug       Debug configuration instead of Release (build, install, all).
+  --no-gate     build, testflight: skip scripts/gate.sh.
 
 Environment:
   PSPOCKET_HOST_BUILD   host CMake build directory, relative to the repo or absolute (default build/host)
@@ -110,6 +118,9 @@ while [ $# -gt 0 ]; do
         --autorun) AUTORUN=1 ;;
         --exit) EXIT_AFTER=1 ;;
         --upload-only) UPLOAD_ONLY=1 ;;
+        --no-gate) NO_GATE=1 ;;
+        --since) [ $# -ge 2 ] || die "--since needs HH:MM"; SINCE="$2"; shift ;;
+        *.log) SESSION_LOG="$(abspath "$1")" ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (scripts/ios.sh --help)" ;;
     esac
@@ -227,6 +238,7 @@ cmd_gen() {
         cmake --build "$HOST_BUILD" >&2 || host_ok=0
     fi
     if [ "$host_ok" = 0 ]; then
+        [ "${PSPOCKET_ALLOW_HOST_FAIL:-0}" = 1 ] || die "the host build failed (PSPOCKET_ALLOW_HOST_FAIL=1 goes on anyway)"
         warn "the host build failed; continuing with whatever generated sources exist" \
              "(Xcode compiles the runtime sources itself)"
     fi
@@ -294,7 +306,52 @@ cmd_gen() {
         PSPOCKET_GAME_SHADERS_SRC="$game_shaders" "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
 }
 
+# scripts/gate.sh (D-149): nothing reaches the phone that does worse on the Mac than what is there. Exit 2 (no game
+# inputs here) runs only the tests.
+cmd_gate() {
+    if [ "${NO_GATE:-0}" = 1 ]; then
+        warn "the gate is skipped (--no-gate)"
+        return 0
+    fi
+    local status=0
+    "$ROOT/scripts/gate.sh" quick || die "the gate failed: the tests (scripts/gate.sh quick)"
+    "$ROOT/scripts/gate.sh" game || status=$?
+    case "$status" in
+        0) ;;
+        2) warn "the game step of the gate cannot run here (no game inputs in inventory/)" ;;
+        *) die "the gate failed: the game walk (scripts/gate.sh game; the run is in inventory/gate/)" ;;
+    esac
+}
+
+cmd_pull_log() {
+    local id dir stamp f
+    id="$(device_id)"
+    require_unlocked "$id"
+    dir="$ROOT/inventory/phone/logs"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$dir"
+    for f in game.log game-prev.log; do
+        if xcrun devicectl device copy from --device "$id" --domain-type appDataContainer \
+            --domain-identifier "$BUNDLE_ID" --source "Documents/$f" --destination "$dir/$stamp-$f" >/dev/null 2>&1; then
+            say "$dir/$stamp-$f ($(wc -l <"$dir/$stamp-$f" | tr -d ' ') lines)"
+        else
+            warn "no Documents/$f on the phone"
+        fi
+    done
+}
+
+cmd_session() {
+    local log="${SESSION_LOG:-}"
+    if [ -z "$log" ]; then
+        log="$(ls -t "$ROOT"/inventory/phone/live/syslog-*.log 2>/dev/null | head -1)"
+        [ -n "$log" ] || die "no device log in inventory/phone/live/ (idevicesyslog -p PSPocket > ...)"
+    fi
+    say "sessions in $log"
+    "$PYTHON" "$ROOT/scripts/phone_session.py" "$log" ${SINCE:+--since "$SINCE"}
+}
+
 cmd_build() {
+    cmd_gate
     cmd_gen
     local hash version platform destination log status
     local extra=()
@@ -515,6 +572,7 @@ cmd_testflight() {
     fi
     archive="$IOS_BUILD/PSPocket.xcarchive"
     if [ "${UPLOAD_ONLY:-0}" != 1 ]; then
+        cmd_gate
         cmd_gen
         hash="$(git_hash)"
         version="$(project_version)"
@@ -726,6 +784,9 @@ case "$COMMAND" in
     push-game) cmd_push_game ;;
     testflight) cmd_testflight ;;
     pull-coverage) cmd_pull_coverage ;;
+    gate) cmd_gate ;;
+    pull-log) cmd_pull_log ;;
+    session) cmd_session ;;
     all)
         cmd_build >/dev/null
         cmd_install
