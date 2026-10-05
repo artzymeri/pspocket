@@ -1,10 +1,12 @@
 // cellSysutil, cellSysutilAvconfExt: system utility callbacks, system parameters, the system cache (/dev_hdd1),
-// video and audio output state, and background music playback. Reference: RPCS3 rpcs3/Emu/Cell/Modules/
-// cellSysutil.cpp/.h, cellVideoOut.cpp/.h, cellAudioOut.cpp/.h, cellSysCache.cpp, cellAvconfExt.cpp, with RPCS3's
-// default configuration (Emu/system_config.h, rsx::avconf in Emu/RSX/Utils/rsx_utils.h).
+// video and audio output state, background music playback, and the message dialog. Reference: RPCS3
+// rpcs3/Emu/Cell/Modules/cellSysutil.cpp/.h, cellVideoOut.cpp/.h, cellAudioOut.cpp/.h, cellSysCache.cpp,
+// cellAvconfExt.cpp, cellMsgDialog.cpp/.h, with RPCS3's default configuration (Emu/system_config.h, rsx::avconf in
+// Emu/RSX/Utils/rsx_utils.h).
 //
-// Implemented: what GTA V imports from these modules except the dialog and on-screen keyboard functions (save data:
-// cellSaveData.cpp), which nothing has called yet (CLAUDE.md rule 4).
+// Implemented: what GTA V imports from these modules (save data: cellSaveData.cpp; the on-screen keyboard:
+// cellOskDialog.cpp). Of the message dialog that is only cellMsgDialogAbort, which needs the dialog's bookkeeping
+// (MsgDialog): GTA V imports none of the functions that open one, and there is no dialog UI yet.
 //
 // The console reported is RPCS3's default one, which also suits a fixed iPhone target: one HDMI display at 720p
 // (1280x720 progressive, 16:9: the PS3 mode closest to a phone screen, and the resolution most games render at), RGB,
@@ -14,7 +16,7 @@
 // RPCS3: the system nickname is "PSPocket" (RPCS3 makes up "RPCS3-nnn"), and the user name comes from
 // /dev_hdd0/home/00000001/localusername if the host provides that file, else it is "User", which RPCS3 writes there.
 //
-// System events reach the game through the callbacks it registers: sysutil.hpp queues them (nothing sends one yet,
+// System events reach the game through the callbacks it registers: sysutil.hpp queues them (the dialogs send theirs;
 // there is no system menu) and cellSysutilCheckCallback calls them on the game's thread with call_guest.
 //
 // The system cache follows RPCS3: the cache is the directory caches/<TITLE_ID>_<cacheId> under the hdd1 root, and
@@ -138,6 +140,7 @@ enum class Fn : u8 {
     EnableBgmPlayback,
     DisableBgmPlayback,
     GetBgmPlaybackStatus,
+    MsgDialogAbort,
     Count,
 };
 
@@ -249,6 +252,13 @@ std::string_view event_name(u64 status)
     case CELL_SYSUTIL_SYSTEM_MENU_CLOSE: return "SYSTEM_MENU_CLOSE";
     case CELL_SYSUTIL_BGMPLAYBACK_PLAY: return "BGMPLAYBACK_PLAY";
     case CELL_SYSUTIL_BGMPLAYBACK_STOP: return "BGMPLAYBACK_STOP";
+    case 0x0502: return "OSKDIALOG_LOADED"; // sent by cellOskDialog.cpp
+    case 0x0503: return "OSKDIALOG_FINISHED";
+    case 0x0504: return "OSKDIALOG_UNLOADED";
+    case 0x0505: return "OSKDIALOG_INPUT_ENTERED";
+    case 0x0506: return "OSKDIALOG_INPUT_CANCELED";
+    case 0x0507: return "OSKDIALOG_INPUT_DEVICE_CHANGED";
+    case 0x0508: return "OSKDIALOG_DISPLAY_CHANGED";
     case 0x0801: return "NET_CTL_NETSTART_LOADED"; // sent by cellNetCtl
     case 0x0802: return "NET_CTL_NETSTART_FINISHED";
     case 0x0803: return "NET_CTL_NETSTART_UNLOADED";
@@ -1029,6 +1039,54 @@ s32 cellSysutilGetBgmPlaybackStatus(PPUContext& ctx, u32 status)
         enabled ? "enabled" : "disabled");
 }
 
+// ------------------------------------------------------------------------------ message dialog (cellMsgDialog.cpp)
+
+// RPCS3 msg_info, with its native overlay dialog (rsx::overlays::message_dialog, the default): at most one message
+// dialog is open. Only open_msg_dialog (sysutil.hpp) opens one, and nothing calls it in a game's run yet: the
+// functions that would (cellMsgDialogOpen2 and the others, the dialogs of cellSaveData and the other modules) are not
+// implemented, as GTA V imports none of them and there is no dialog UI to show one.
+struct MsgDialog {
+    std::mutex mutex;
+    bool open = false;
+    MsgDialogSource source = MsgDialogSource::CellMsgDialog;
+    u32 type = 0;     // CELL_MSGDIALOG_TYPE_* bits
+    u32 callback = 0; // CellMsgDialogCallback(buttonType, userData) descriptor, for the user's answer; 0 = none
+    u32 userdata = 0;
+};
+
+std::string_view source_name(MsgDialogSource source)
+{
+    switch (source) {
+    case MsgDialogSource::CellMsgDialog: return "cellMsgDialog";
+    case MsgDialogSource::CellSaveData: return "cellSaveData";
+    case MsgDialogSource::CellGame: return "cellGame";
+    case MsgDialogSource::SceNp: return "sceNp";
+    case MsgDialogSource::SceNpTrophy: return "sceNpTrophy";
+    }
+    return "?";
+}
+
+// RPCS3 cellMsgDialogAbort (its overlay path): a dialog the game opened with cellMsgDialog's functions closes at once
+// without calling its callback (RPCS3 closes the overlay without on_close), and the drawing its opening began ends
+// (DRAWING_END to the game's callbacks). Without one, or with a dialog another module opened (save data, trophies),
+// nothing happens and the result is still CELL_OK, not CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (RPCS3: tested on
+// hardware). RPCS3's CELL_SYSUTIL_ERROR_BUSY, for its other (Qt) dialog caught while it opens or closes, can't occur
+// here: the dialog opens and closes under one lock. (RPCS3 also drops a timed close cellMsgDialogClose asked for;
+// that function isn't implemented.)
+s32 cellMsgDialogAbort(PPUContext&)
+{
+    const Call call(Fn::MsgDialogAbort, kInfoCalls, kChan, "cellMsgDialogAbort()");
+    MsgDialog& d = state<MsgDialog>();
+    std::lock_guard lock(d.mutex);
+    if (!d.open) return call.ok(lv2::CELL_OK, "CELL_OK, no message dialog is open");
+    if (d.source != MsgDialogSource::CellMsgDialog) {
+        return call.ok(lv2::CELL_OK, "CELL_OK, the open dialog is {}'s and stays open", source_name(d.source));
+    }
+    d.open = false;
+    sysutil_send_event(CELL_SYSUTIL_DRAWING_END, 0);
+    return call.ok(lv2::CELL_OK, "CELL_OK, the message dialog (type {:#x}) closed without its callback", d.type);
+}
+
 } // namespace
 
 s32 sysutil_send_event(u64 status, u64 param)
@@ -1076,6 +1134,33 @@ void sysutil_queue_call(std::function<s32(PPUContext& ctx)> fn)
     cb.queue.push_back(std::move(fn));
 }
 
+s32 open_msg_dialog(MsgDialogSource source, u32 type, std::string_view message, u32 callback, u32 userdata)
+{
+    HleProcess* p = HleProcess::current();
+    if (!p) PS_FATAL(kChan, "open_msg_dialog without an HLE process");
+    MsgDialog& d = p->state<MsgDialog>();
+    std::lock_guard lock(d.mutex);
+    if (d.open) {
+        PS_LOG_WARN(kChan, "message dialog from {} (type {:#x}, \"{}\"): another one is open: CELL_SYSUTIL_ERROR_BUSY",
+            source_name(source), type, message);
+        return error(CELL_SYSUTIL_ERROR_BUSY);
+    }
+    if (const s32 r = sysutil_send_event(CELL_SYSUTIL_DRAWING_BEGIN, 0); r < 0) {
+        PS_LOG_WARN(kChan, "message dialog from {} (type {:#x}, \"{}\"): a system dialog draws already: {}",
+            source_name(source), type, message, result_name(r));
+        return r;
+    }
+    d.open = true;
+    d.source = source;
+    d.type = type;
+    d.callback = callback;
+    d.userdata = userdata;
+    PS_LOG_WARN(kChan, "message dialog from {} (type {:#x}): \"{}\"; there is no dialog UI, so it stays open until "
+                       "the game aborts it",
+        source_name(source), type, message);
+    return lv2::CELL_OK;
+}
+
 void register_cellSysutil(Registry& r)
 {
     r.add("cellSysutil", {
@@ -1098,6 +1183,7 @@ void register_cellSysutil(Registry& r)
         PS_HLE_FUNC(0x220894E3, cellSysutilEnableBgmPlayback),
         PS_HLE_FUNC(0xCFDD8E87, cellSysutilDisableBgmPlayback),
         PS_HLE_FUNC(0xA11552F6, cellSysutilGetBgmPlaybackStatus),
+        PS_HLE_FUNC(0x62B0F803, cellMsgDialogAbort),
     });
     r.add("cellSysutilAvconfExt", {
         PS_HLE_FUNC(0xC7020F62, cellVideoOutSetGamma),

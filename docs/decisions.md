@@ -774,7 +774,7 @@ all zeros, no ticket, no basic event, no signaling connection, addresses 0.
 
 Left out, until a log shows them: functions that open system dialogs, send messages, need RPCN or the network
 (sceNpSignalingActivateConnection), write player history with a later event, or check DRM files and keys
-(sceNpDrmIsAvailable).
+(sceNpDrmIsAvailable). (D-139 implements the rest of the imports.)
 
 Where pspocket differs from RPCS3: an invalid communication ID in sceNpLookupCreateTitleCtx is logged and refused
 (RPCS3 aborts); a 33rd title context gets TOO_MANY_OBJECTS (RPCS3 returns 0, which reads as success); an unreadable
@@ -2102,6 +2102,43 @@ game may free the taskset after it.
 - Tests: a chain shut down and joined frees its slot, which a new chain gets and runs; argument errors and the
   instance's exception state; a join waits for the job still running at the shutdown; a chain halted by an unknown
   command is joined and the join returns the error. The taskset's join gets the same checks.
+
+## D-139 · 2026-10-05 · The rest of GTA V's PSN imports: sceNp2, the store, Facebook, and the sceNp functions D-059 left
+
+The user asked for every unimplemented import to be done before the next phone build, so a call the game makes later
+does not stop it. As D-059, each function makes RPCS3's checks in RPCS3's order and then takes RPCS3's path with PSN
+offline; RPCS3 is cited per file. Pointers RPCS3 would fault on are logged with the call site and refused (D-042).
+- **sceNp2 (sceNp2.cpp, 25 functions):** sceNp2Init and sceNp2Term (moved from sceNp.cpp) start and stop NP through
+  RPCS3's sceNpInit and sceNpTerm (np.hpp). Matching 2: init and term; a context cannot be created offline
+  (NOT_NP_SIGN_IN), so every other call finds none (CONTEXT_NOT_FOUND, or INVALID_CONTEXT_ID for 0); the room and
+  lobby callbacks are kept and never called; GetEventData copies nothing.
+- **sceNp, the eight D-059 left:** SendMessage and SendMessageGui (RPCS3's validation, then NOT_CONNECTED; no dialog),
+  AddFriend (INVALID_ARGUMENT, as RPCS3's size check gives), RecvMessageCustom (CANCEL: the offline list is empty),
+  AddPlayersHistoryAsync (a request ID and the basic handler's event 18 at the next sysutil check), ProfileCallGui
+  (OFFLINE), SignalingActivateConnection (PEER_UNREACHABLE, logged: RPCS3 asks RPCN and faults offline), DrmIsAvailable
+  (lv2's file open; a plain file or a disc SELF is available, SDATs and key-locked EDATs are not entitled: no EDAT
+  decryption and no NP keys here).
+- **sceNpCommerce2 (30 functions):** init needs NP; one context (ID 0x5001) with its handler; CreateSessionStart
+  delivers CREATE_SESSION_DONE with error 0 at the next sysutil check, as RPCS3, which never reaches the store whether
+  signed in or not; results fail to initialize (INVALID_RESULT_DATA), category info is SERVER_MAINTENANCE (RPCS3's
+  guard against crashes); the dialogs neither open nor send events. A second context is CTX_MAX (RPCS3 writes ID 0
+  and returns CELL_OK).
+- **sceNpSns (6 functions, Facebook):** init and term, handles 1 to 5 in RPCS3's idm order, the long access token
+  NOT_SIGN_IN.
+- idm.hpp: RPCS3's ID manager order for HLE objects whose IDs the game sees.
+
+## D-140 · 2026-10-05 · The on-screen keyboard dialog cancels at once; cellMsgDialogAbort; sys_prx_register_library
+
+The other imports left: the keyboard dialog, cellMsgDialogAbort and sys_prx_register_library, as RPCS3
+(cellOskDialog.cpp, cellMsgDialog.cpp, sys_prx_.cpp).
+- **cellOskDialog (7 functions):** load, unload, abort and four settings, with RPCS3's checks, results and events.
+  There is no keyboard UI, so the dialog acts as if the user cancelled it as soon as it appeared: the first sysutil
+  check after the load delivers LOADED, the next FINISHED, and the unload reports CANCELED without touching the game's
+  buffer (RPCS3 copies text only for OK). A keyboard UI plugs in at show_keyboard() and keyboard_closed().
+- **cellMsgDialogAbort:** closes a dialog the game opened with cellMsgDialog's functions (open_msg_dialog in
+  cellSysutil.cpp, which nothing in GTA V's imports opens yet) and sends DRAWING_END; with none, CELL_OK.
+- **sys_prx_register_library:** EFAULT for an entry outside guest memory, else CELL_OK with the library logged: no PRX
+  module is ever loaded here to import its exports (GTA V ships none).
 
 ## Open decisions (plan section 14)
 

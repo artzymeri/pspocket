@@ -6,6 +6,7 @@
 // (sysutil_send_system_cmd, sysutil_register_cb).
 
 #include <functional>
+#include <string_view>
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/ppu/context.h"
@@ -32,5 +33,17 @@ s32 sysutil_send_event(u64 status, u64 param);
 // non-zero result ends that check early and is its return value; the functions queued after it wait for the next
 // check. Callable from any thread while an HLE process runs.
 void sysutil_queue_call(std::function<s32(PPUContext& ctx)> fn);
+
+// Who opened the message dialog (RPCS3 msg_dialog_source): cellMsgDialogAbort closes only the dialogs the game opened
+// with cellMsgDialog's own functions.
+enum class MsgDialogSource : u8 { CellMsgDialog, CellSaveData, CellGame, SceNp, SceNpTrophy };
+
+// Opens the message dialog (RPCS3 cellMsgDialog.cpp open_msg_dialog, not blocking; implemented in cellSysutil.cpp).
+// One at a time: while one is open the result is CELL_SYSUTIL_ERROR_BUSY. The dialog begins drawing (DRAWING_BEGIN to
+// the game's callbacks; when a system dialog draws already, that event's CELL_SYSUTIL_ERROR_BUSY is the result and
+// nothing opens) and stays open until it is closed. `callback` (a CellMsgDialogCallback descriptor, or 0) and
+// `userdata` are for the user's answer. There is no dialog UI yet, so nothing answers: only cellMsgDialogAbort closes
+// a dialog.
+s32 open_msg_dialog(MsgDialogSource source, u32 type, std::string_view message, u32 callback, u32 userdata);
 
 } // namespace pspocket::hle

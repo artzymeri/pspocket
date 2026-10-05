@@ -4,6 +4,7 @@ add_library(pspocket_hle STATIC
     src/cellGame.cpp
     src/cellGcmSys.cpp
     src/cellNetCtl.cpp
+    src/cellOskDialog.cpp
     src/cellRtc.cpp
     src/cellSaveData.cpp
     src/cellSheap.cpp
@@ -18,6 +19,9 @@ add_library(pspocket_hle STATIC
     src/process.cpp
     src/psf.cpp
     src/sceNp.cpp
+    src/sceNp2.cpp
+    src/sceNpCommerce2.cpp
+    src/sceNpSns.cpp
     src/sceNpTrophy.cpp
     src/spu_programs.cpp
     src/spurs_custom.cpp

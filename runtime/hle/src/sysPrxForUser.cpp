@@ -2,9 +2,12 @@
 // References: RPCS3 rpcs3/Emu/Cell/Modules/sysPrxForUser.cpp, sys_ppu_thread_.cpp, sys_lwmutex_.cpp, sys_prx_.cpp.
 //
 // Implemented: what GTA V's first boot log called (docs/runs/004), plus the rest of the lwmutex set that a created
-// lwmutex is used through. Everything else stays unimplemented until a log shows the game calls it (CLAUDE.md rule 4).
+// lwmutex is used through, and sys_prx_register_library (a GTA V import). Everything else stays unimplemented until a
+// log shows the game calls it (CLAUDE.md rule 4).
 
 #include <atomic>
+#include <format>
+#include <string>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
@@ -125,6 +128,56 @@ u64 sys_time_get_system_time(PPUContext& ctx) { return lv2::sys_time_get_system_
 s32 sys_prx_exitspawn_with_level(PPUContext&)
 {
     PS_LOG_WARN(kChan, "sys_prx_exitspawn_with_level(): not implemented, returns CELL_OK (as RPCS3)");
+    return lv2::CELL_OK;
+}
+
+// A library entry as an executable exports it (RPCS3 PPUModule.h ppu_prx_module_info; the syscall reads these 0x1c
+// bytes): u8 size, unk0; be16 version, attributes, num_func, num_var, num_tlsvar; u8 info_hash, info_tlshash, unk1[2];
+// be32 name, nids, addrs.
+constexpr u32 kLibEntrySize = 0x1C, kLibAttributes = 4, kLibNumFunc = 6, kLibNumVar = 8, kLibName = 16;
+
+struct PrxLogState {
+    std::atomic<bool> register_library_logged{false};
+};
+
+// A guest C string for a log: up to `max` characters, as far as guest memory goes.
+std::string read_log_string(lv2::PpuThread& t, u32 addr, u32 max)
+{
+    std::string s;
+    for (u32 i = 0; i < max && u64{addr} + i < GuestMemory::kGuestSize; i++) {
+        if (!guest_readable(t, addr + i, 1)) break;
+        const char c = static_cast<char>(ps_read8(t.kernel.base(), addr + i));
+        if (!c) break;
+        s += c;
+    }
+    return s;
+}
+
+// RPCS3 sys_prx_.cpp sys_prx_register_library: under the "_lv2prx" lwmutex, the syscall _sys_prx_register_library
+// (lv2/sys_prx.cpp), which returns CELL_EFAULT for a library entry that is not guest memory, and otherwise registers
+// the entry's exports (ppu_load_exports) for the modules loaded after it to import, and returns CELL_OK. No PRX module
+// is ever loaded here (the loader runs the executable alone, and GTA V ships none), so nothing could import the
+// library: the call is logged (at warning the first time in a process, then at debug) and returns CELL_OK. There is no
+// "_lv2prx" lwmutex to take either: sys_initialize_tls doesn't create it, as nothing else would use it.
+s32 sys_prx_register_library(PPUContext& ctx, u32 lib_entry)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_readable(t, lib_entry, 1)) {
+        PS_LOG_WARN(kChan, "sys_prx_register_library({:#x}): not guest memory: CELL_EFAULT", lib_entry);
+        return lv2::err(lv2::CELL_EFAULT);
+    }
+    std::string library;
+    if (guest_readable(t, lib_entry, kLibEntrySize)) {
+        u8* base = t.kernel.base();
+        library = std::format(" (\"{}\", attributes {:#x}, {} functions, {} variables)",
+            read_log_string(t, ps_read32(base, lib_entry + kLibName), 64), ps_read16(base, lib_entry + kLibAttributes),
+            ps_read16(base, lib_entry + kLibNumFunc), ps_read16(base, lib_entry + kLibNumVar));
+    }
+    const bool first = !HleProcess::current()->state<PrxLogState>().register_library_logged.exchange(true);
+    log::print(first ? log::Level::Warn : log::Level::Debug, kChan,
+        "sys_prx_register_library({:#x}){}: not registered, as no PRX module is loaded to import it; CELL_OK (RPCS3 "
+        "registers its exports)",
+        lib_entry, library);
     return lv2::CELL_OK;
 }
 
@@ -337,6 +390,7 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0x2C847572, _sys_process_atexitspawn),
         PS_HLE_FUNC(0x96328741, _sys_process_at_Exitspawn),
         PS_HLE_FUNC(0xA2C7BA64, sys_prx_exitspawn_with_level),
+        PS_HLE_FUNC(0x42B23552, sys_prx_register_library),
         PS_HLE_FUNC(0x8461E528, sys_time_get_system_time),
         PS_HLE_FUNC(0x2F85C0EF, sys_lwmutex_create),
         PS_HLE_FUNC(0xC3476D0C, sys_lwmutex_destroy),

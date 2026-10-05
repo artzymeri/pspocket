@@ -1,0 +1,27 @@
+#pragma once
+
+// NP's state for the other NP modules, kept by sceNp.cpp (implemented there; the user is never signed in: D-059).
+// sceNp2Init and sceNp2Term (sceNp2.cpp) start and stop NP through RPCS3's sceNpInit and sceNpTerm; modules on top of
+// NP (sceNpCommerce2) ask whether it is up. Reference: RPCS3 rpcs3/Emu/Cell/Modules/sceNp.cpp (sceNpInit, sceNpTerm)
+// and rpcs3/Emu/NP/np_handler.cpp (is_NP_init, init_NP, terminate_NP).
+
+#include "pspocket/core/types.hpp"
+
+namespace pspocket::hle {
+
+// Whether NP is initialized (RPCS3 np_handler::is_NP_init): from sceNp2Init until sceNp2Term. Needs a running HLE
+// process.
+bool np_initialized();
+
+// RPCS3 sceNpInit: CELL_OK, or SCE_NP_ERROR_ALREADY_INITIALIZED, SCE_NP_ERROR_INVALID_ARGUMENT (no pool) or
+// SCE_NP_ERROR_INSUFFICIENT_BUFFER (a pool under 128 KB). The pool would hold NP's working memory; nothing uses it
+// offline.
+u32 np_init(u32 poolsize, u32 poolptr);
+
+// RPCS3 sceNpTerm: CELL_OK, or SCE_NP_ERROR_NOT_INITIALIZED. Drops the manager callback, the basic handler and the
+// signaling contexts (np_handler::terminate_NP, idm::clear<signaling_ctx>); the lookup library and its title contexts
+// stay ("TODO: Other contexts"). terminate_NP also drops the matching 2 room callbacks, which sceNp2.cpp keeps: its
+// caller drops them when this succeeds.
+u32 np_term();
+
+} // namespace pspocket::hle

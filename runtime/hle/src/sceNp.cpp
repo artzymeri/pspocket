@@ -1,32 +1,41 @@
 // sceNp: PlayStation Network. A non-goal (docs/phase0-gta5.md, D-024): every function reports "not initialized" or
 // "offline" the way RPCS3 does when the user is not signed in, so single-player never waits on PSN.
-// Reference: RPCS3 rpcs3/Emu/Cell/Modules/sceNp.cpp/.h and sceNp2.cpp, with the NP state of
-// rpcs3/Emu/NP/np_handler.cpp, np_contexts.cpp, np_helpers.cpp and signaling_handler.cpp.
+// Reference: RPCS3 rpcs3/Emu/Cell/Modules/sceNp.cpp/.h, with the NP state of rpcs3/Emu/NP/np_handler.cpp,
+// np_contexts.cpp, np_helpers.cpp and signaling_handler.cpp, the message dialogs of
+// rpcs3/Emu/RSX/Overlays/Network/overlay_recvmessage_dialog.cpp, and the DRM check's rpcs3/Crypto/unedat.cpp,
+// unself.cpp and rpcs3/Emu/system_utils.cpp.
 //
-// sceNpInit is not imported by GTA V; sceNp2Init (module sceNp2, registered here because it shares this state)
-// initializes NP there. Until then the manager functions return SCE_NP_ERROR_NOT_INITIALIZED, as RPCS3 does before
-// init; afterwards they report a user who is signed out (offline), and the callbacks and handlers registered are kept
-// but never called.
+// sceNpInit is not imported by GTA V; sceNp2Init (module sceNp2, sceNp2.cpp) initializes NP through np_init (np.hpp).
+// Until then the manager functions return SCE_NP_ERROR_NOT_INITIALIZED, as RPCS3 does before init; afterwards they
+// report a user who is signed out (offline). The callbacks and handlers registered are kept; the basic handler gets
+// the one event RPCS3 sends offline too (sceNpBasicAddPlayersHistoryAsync's result), the others are never called.
 //
 // Offline is RPCS3's np_handler with PSN disabled and no network: get_psn_status() is SCE_NP_MANAGER_STATUS_OFFLINE,
-// the user's NP ID is all zeros, no ticket has been received, no basic event is queued, no signaling connection exists
-// and the local and public addresses are 0. Each function makes RPCS3's checks in RPCS3's order, then takes that path.
+// the user's NP ID is all zeros, no ticket has been received, no basic event is queued, no message can be sent or
+// received, no signaling connection exists and the local and public addresses are 0. Each function makes RPCS3's
+// checks in RPCS3's order, then takes that path.
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <format>
 #include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "guest.hpp"
+#include "np.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
+#include "sysutil.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -43,11 +52,14 @@ enum : u32 {
     SCE_NP_ERROR_INSUFFICIENT_BUFFER = 0x8002AA0F,
     SCE_NP_AUTH_EINVALID_ARGUMENT = 0x8002A015,
     SCE_NP_BASIC_ERROR_NOT_INITIALIZED = 0x8002A662,
+    SCE_NP_BASIC_ERROR_NOT_SUPPORTED = 0x8002A663,
     SCE_NP_BASIC_ERROR_INVALID_ARGUMENT = 0x8002A665,
     SCE_NP_BASIC_ERROR_NO_EVENT = 0x8002A66A,
     SCE_NP_BASIC_ERROR_EXCEEDS_MAX = 0x8002A66B,
     SCE_NP_BASIC_ERROR_NOT_REGISTERED = 0x8002A66D,
+    SCE_NP_BASIC_ERROR_CANCEL = 0x8002A671,
     SCE_NP_BASIC_ERROR_INVALID_DATA_ID = 0x8002A673,
+    SCE_NP_BASIC_ERROR_NOT_CONNECTED = 0x8002A678,
     SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED = 0x8002A101,
     SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED = 0x8002A102,
     SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT = 0x8002A104,
@@ -58,11 +70,19 @@ enum : u32 {
     SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED = 0x8002A801,
     SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND = 0x8002A805,
     SCE_NP_SIGNALING_ERROR_CONN_NOT_FOUND = 0x8002A80E,
+    SCE_NP_SIGNALING_ERROR_PEER_UNREACHABLE = 0x8002A80F,
     SCE_NP_SIGNALING_ERROR_CTX_MAX = 0x8002A812,
     SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT = 0x8002A815,
     SCE_NP_SIGNALING_ERROR_OWN_NP_ID = 0x8002A816,
     SCE_NP_UTIL_ERROR_INVALID_ARGUMENT = 0x8002AB01,
+    SCE_NP_UTIL_ERROR_INVALID_CHARACTER = 0x8002AB0B,
     SCE_NP_UTIL_ERROR_NOT_MATCH = 0x8002AB0F,
+    SCE_NP_PROFILE_ERROR_NOT_INITIALIZED = 0x8002AB41,
+    SCE_NP_PROFILE_ERROR_INVALID_ARGUMENT = 0x8002AB48,
+    SCE_NP_DRM_ERROR_INVALID_PARAM = 0x80029502,
+    SCE_NP_DRM_ERROR_NO_ENTITLEMENT = 0x80029513,
+    SCE_NP_DRM_ERROR_BAD_FORMAT = 0x80029515,
+    SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND = 0x80029521,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -76,6 +96,31 @@ constexpr u32 SCE_NP_BASIC_PRESENCE_OPTIONS_SET_DATA = 1, SCE_NP_BASIC_PRESENCE_
               SCE_NP_BASIC_PRESENCE_OPTIONS_ALL_OPTIONS = 3;
 constexpr u32 SCE_NP_BASIC_MESSAGE_INFO_TYPE_BOOTABLE_CUSTOM_DATA_MESSAGE = 7;
 constexpr u32 SCE_NP_BASIC_SELECTED_INVITATION_DATA = 1, SCE_NP_BASIC_SELECTED_MESSAGE_DATA = 2;
+// Messages (sceNpBasicSendMessage, sceNpBasicSendMessageGui, sceNpBasicAddFriend, sceNpBasicRecvMessageCustom).
+constexpr u32 SCE_NP_BASIC_MAX_MESSAGE_SIZE = 512, SCE_NP_BASIC_SEND_MESSAGE_MAX_RECIPIENTS = 12;
+constexpr u32 SCE_NP_BASIC_SUBJECT_CHARACTER_MAX = 18, SCE_NP_BASIC_BODY_CHARACTER_MAX = 512;
+constexpr u32 SCE_NP_BASIC_MAX_MESSAGE_ATTACHMENT_SIZE = 1048576, SCE_NP_BASIC_MAX_INVITATION_DATA_SIZE = 1024,
+              SCE_NP_BASIC_MAX_URL_ATTACHMENT_SIZE = 2048;
+// MULTI_RECEIPIENTS 1, BOOTABLE 2, ASSUME_SEND 4; ALL_FEATURES adds SCE_NP_BASIC_MESSAGE_FEATURES_EXP_MIN(0xffff).
+constexpr u32 SCE_NP_BASIC_MESSAGE_FEATURES_BOOTABLE = 2, SCE_NP_BASIC_MESSAGE_FEATURES_ASSUME_SEND = 4,
+              SCE_NP_BASIC_MESSAGE_FEATURES_ALL_FEATURES = 0xFFFF0007;
+constexpr u16 SCE_NP_BASIC_MESSAGE_MAIN_TYPE_DATA_ATTACHMENT = 0, SCE_NP_BASIC_MESSAGE_MAIN_TYPE_GENERAL = 1,
+              SCE_NP_BASIC_MESSAGE_MAIN_TYPE_ADD_FRIEND = 2, SCE_NP_BASIC_MESSAGE_MAIN_TYPE_INVITE = 3,
+              SCE_NP_BASIC_MESSAGE_MAIN_TYPE_CUSTOM_DATA = 4, SCE_NP_BASIC_MESSAGE_MAIN_TYPE_URL_ATTACHMENT = 5;
+// Every main type's sub types start at 0 (ACTION_USE, NONE, ACTION_ACCEPT_DENY); invitations also have ACTION_ACCEPT.
+constexpr u16 SCE_NP_BASIC_MESSAGE_INVITE_SUBTYPE_ACTION_ACCEPT = 1;
+constexpr u32 SCE_NP_BASIC_RECV_MESSAGE_OPTIONS_ALL_OPTIONS = 7; // PRESERVE, INCLUDE_BOOTABLE, ASSUME_LATEST
+// The history of players met (sceNpBasicAddPlayersHistoryAsync).
+constexpr u32 SCE_NP_BASIC_PLAYER_HISTORY_MAX_PLAYERS = 8, SCE_NP_BASIC_DESCRIPTION_CHARACTER_MAX = 341;
+constexpr s32 SCE_NP_BASIC_EVENT_ADD_PLAYERS_HISTORY_RESULT = 18;
+constexpr u32 kRequestIdMisc = 0x3333; // np_handler REQUEST_ID_HIGH::MISC: the high half of such a request's ID
+// NPDRM content (sceNpDrmIsAvailable), RPCS3 Crypto/unedat.h: an EDAT or SDAT file starts with NPD_HEADER (0x80 bytes:
+// magic, version, license, type, content_id[0x30], ...), then EDAT_HEADER (flags first).
+constexpr u32 kNpdHeaderSize = 0x80, kEdatHeaderSize = 0x10, kNpdLicense = 8, kNpdContentId = 0x10,
+              kNpdContentIdSize = 0x30;
+constexpr u32 SDAT_FLAG = 0x01000000;
+constexpr u32 kNpdLicenseFree = 3; // the klicensee alone opens it: no RAP licence needed
+constexpr u32 kDrmPathMax = 0x100; // RPCS3 reads at most this many characters of the path
 constexpr u32 SCE_NP_LOOKUP_MAX_CTX_NUM = 32;
 constexpr u32 SCE_NP_SIGNALING_CTX_MAX = 8;
 constexpr u32 SCE_NP_SIGNALING_CONN_STATUS_INACTIVE = 0;
@@ -143,11 +188,13 @@ struct SignalingCtx {
 
 struct NpState {
     std::mutex mutex;                     // everything below but `initialized`, which changes only with it held
-    std::atomic<bool> initialized{false}; // sceNpInit's state (RPCS3 is_NP_init)
-    bool np2_initialized = false;         // sceNp2Init's (is_NP2_init)
+    std::atomic<bool> initialized{false}; // sceNpInit's state (RPCS3 is_NP_init); sceNp2Init's is in sceNp2.cpp
     u32 manager_cb = 0, manager_cb_arg = 0;
     bool basic_handler_registered = false;
     u32 basic_handler = 0, basic_handler_arg = 0;
+    // The low half of the next request ID (np_handler match2_low_reqid_cnt: from 1, every kind of NP request takes
+    // one, never rewound).
+    u16 next_request = 1;
     // sceNpLookupInit's state (is_NP_Lookup_init) and the lookup title contexts (idm lookup_title_ctx, IDs 0x3001 on;
     // each keeps its communication ID). RPCS3's NP term leaves both ("TODO: Other contexts"). There is no table of
     // lookup transaction contexts: offline sceNpLookupCreateTransactionCtx never makes one.
@@ -459,6 +506,515 @@ s32 sceNpBasicRecvMessageAttachmentLoad(PPUContext&, u32 id, u32 buffer, u32 siz
     return error(SCE_NP_BASIC_ERROR_INVALID_DATA_ID);
 }
 
+// ------------------------------------------------------------------------------------------------- basic: messages
+
+// The first checks of the message functions: NP up, the basic handler registered.
+s32 basic_handler_check(NpState& s)
+{
+    if (!s.initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!basic_registered(s)) return error(SCE_NP_BASIC_ERROR_NOT_REGISTERED);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpBasicSendMessage (_sceNpBasicSendMessage without the rate limit): a message to one user, which RPCS3 sends
+// through RPCN. Offline it is refused once its arguments pass, with SCE_NP_BASIC_ERROR_NOT_CONNECTED (RPCS3 returns it
+// as not an error); the data isn't read. The recipient's NP ID is read unchecked by RPCS3: one that isn't guest memory
+// is refused here with a log.
+s32 sceNpBasicSendMessage(PPUContext& ctx, u32 to, u32 data, u32 size)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (to && !guest_readable(t, to, 1)) {
+        log_call_site(ctx, base, std::format("sceNpBasicSendMessage: the recipient {:#x} is not guest memory", to));
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    if (!to || !ps_read8(base, to) || !data || !size) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    if (size > SCE_NP_BASIC_MAX_MESSAGE_SIZE) return error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX);
+    PS_LOG_INFO(kChan, "sceNpBasicSendMessage(to \"{}\", {} bytes at {:#x}): offline, not sent",
+        guest_string(t, to, kOnlineIdLength), size, data);
+    return error(SCE_NP_BASIC_ERROR_NOT_CONNECTED);
+}
+
+// SceNpBasicMessageDetails (40 bytes): msgId (u64), mainType and subType (u16), msgFeatures, then npids (count
+// SceNpIds), count, subject and body (strings), data and its size.
+struct MessageDetails {
+    u64 msg_id = 0;
+    u16 main_type = 0, sub_type = 0;
+    u32 features = 0, npids = 0, count = 0, subject = 0, body = 0, data = 0, size = 0;
+};
+constexpr u32 kMessageDetailsSize = 40;
+
+MessageDetails read_message_details(u8* base, u32 addr)
+{
+    MessageDetails m;
+    m.msg_id = ps_read64(base, addr);
+    m.main_type = ps_read16(base, addr + 8);
+    m.sub_type = ps_read16(base, addr + 10);
+    m.features = ps_read32(base, addr + 12);
+    m.npids = ps_read32(base, addr + 16);
+    m.count = ps_read32(base, addr + 20);
+    m.subject = ps_read32(base, addr + 24);
+    m.body = ps_read32(base, addr + 28);
+    m.data = ps_read32(base, addr + 32);
+    m.size = ps_read32(base, addr + 36);
+    return m;
+}
+
+// RPCS3 check_text (libnp's FUN_000245e0 as RPCS3 decompiled it), for a message's subject and body: UTF-8 whose
+// characters RPCS3 checks by their lead byte (C2..DF, E0..EF and F0..F7 with one, two and three continuation bytes).
+// The result is the number of characters, or SCE_NP_UTIL_ERROR_INVALID_CHARACTER; nullopt when the text runs into
+// memory that isn't guest memory (RPCS3 faults). As RPCS3's conditions, a byte is read only while the ones before it
+// continue the character, so nothing past the terminator is read.
+std::optional<s32> check_text(lv2::PpuThread& t, u32 text)
+{
+    u8* base = t.kernel.base();
+    // Whether the byte at `addr` continues a character (10xxxxxx); nullopt if it isn't guest memory.
+    const auto continues = [&](u32 addr) -> std::optional<bool> {
+        if (!guest_readable(t, addr, 1)) return std::nullopt;
+        return (ps_read8(base, addr) & 0xC0) == 0x80;
+    };
+    s32 count = 0;
+    for (u32 p = text;; count++) {
+        if (!guest_readable(t, p, 1)) return std::nullopt;
+        const u8 c = ps_read8(base, p);
+        if (!c) return count;
+        if (c < 0x80) {
+            p++;
+            continue;
+        }
+        if ((c & 0xE0) == 0xC0 && c > 0xC1) {
+            const std::optional<bool> c1 = continues(p + 1);
+            if (!c1) return std::nullopt;
+            if (*c1) {
+                p += 2;
+                continue;
+            }
+        }
+        if ((c & 0xF0) == 0xE0) {
+            const std::optional<bool> c1 = continues(p + 1);
+            if (!c1) return std::nullopt;
+            const std::optional<bool> c2 = *c1 ? continues(p + 2) : std::optional<bool>(false);
+            if (!c2) return std::nullopt;
+            if (*c2) {
+                p += 3;
+                continue;
+            }
+        }
+        if ((c & 0xF8) != 0xF0) return error(SCE_NP_UTIL_ERROR_INVALID_CHARACTER);
+        for (u32 i = 1; i <= 3; i++) {
+            const std::optional<bool> ci = continues(p + i);
+            if (!ci) return std::nullopt;
+            if (!*ci) return error(SCE_NP_UTIL_ERROR_INVALID_CHARACTER);
+        }
+        p += 4;
+    }
+}
+
+// RPCS3 sceNpBasicSendMessageGui after its first checks (NP up, the basic handler registered, a message given): the
+// message's checks in RPCS3's order. Online RPCS3 then opens the send dialog and reports its result to the basic
+// handler; offline it stops before the dialog with SCE_NP_BASIC_ERROR_NOT_CONNECTED (returned as not an error), and
+// no event is sent. RPCS3 reads the recipients and the texts unchecked: ones that aren't guest memory are refused
+// here with a log.
+s32 send_message_offline(PPUContext& ctx, std::string_view name, const MessageDetails& m, u32 container_id)
+{
+    if (m.count > SCE_NP_BASIC_SEND_MESSAGE_MAX_RECIPIENTS || (m.features & ~SCE_NP_BASIC_MESSAGE_FEATURES_ALL_FEATURES) ||
+        m.main_type > SCE_NP_BASIC_MESSAGE_MAIN_TYPE_URL_ATTACHMENT || m.msg_id != 0) {
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    if (!(m.features & SCE_NP_BASIC_MESSAGE_FEATURES_BOOTABLE)) {
+        switch (m.main_type) {
+        case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_DATA_ATTACHMENT: // sub type ACTION_USE only
+        case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_CUSTOM_DATA:
+        case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_URL_ATTACHMENT:
+            if (m.sub_type != 0) return error(SCE_NP_BASIC_ERROR_NOT_SUPPORTED);
+            break;
+        case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_GENERAL: // sub type NONE only, and no data
+        case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_ADD_FRIEND:
+            if (m.sub_type != 0) return error(SCE_NP_BASIC_ERROR_NOT_SUPPORTED);
+            if (m.data) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+            break;
+        case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_INVITE:
+            if (m.sub_type > SCE_NP_BASIC_MESSAGE_INVITE_SUBTYPE_ACTION_ACCEPT) {
+                return error(SCE_NP_BASIC_ERROR_NOT_SUPPORTED);
+            }
+            break;
+        default: return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+        }
+    } else if (m.main_type == SCE_NP_BASIC_MESSAGE_MAIN_TYPE_INVITE) { // bootable: an accepted invitation
+        if (m.sub_type != SCE_NP_BASIC_MESSAGE_INVITE_SUBTYPE_ACTION_ACCEPT) {
+            return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+        }
+    } else if (m.main_type == SCE_NP_BASIC_MESSAGE_MAIN_TYPE_CUSTOM_DATA) { // or custom data to use
+        if (m.sub_type != 0) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    } else {
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    if (!m.data && m.main_type != SCE_NP_BASIC_MESSAGE_MAIN_TYPE_ADD_FRIEND) {
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    if (!m.size) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT); // sceNpBasicAddFriend's too: its size is 0
+    if (m.main_type == SCE_NP_BASIC_MESSAGE_MAIN_TYPE_ADD_FRIEND && m.count != 1) {
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (m.npids) {
+        if (!guest_readable(t, m.npids, m.count * kNpIdSize)) {
+            log_call_site(ctx, base, std::format("{}: the recipients ({} at {:#x}) are not guest memory", name,
+                m.count, m.npids));
+            return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+        }
+        for (u32 i = 0; i < m.count; i++) {
+            if (!ps_read8(base, m.npids + i * kNpIdSize)) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+        }
+    }
+    // A text's length in characters, or the error that ends the call.
+    const auto text_length = [&](u32 text, u32 max, std::string_view what) -> std::pair<u32, s32> {
+        const std::optional<s32> n = check_text(t, text);
+        if (!n) {
+            log_call_site(ctx, base, std::format("{}: the {} at {:#x} runs out of guest memory", name, what, text));
+            return {0, error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT)};
+        }
+        if (*n < 0) return {0, *n};
+        if (static_cast<u32>(*n) > max) return {0, error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX)};
+        return {static_cast<u32>(*n), lv2::CELL_OK};
+    };
+    u32 subject_length = 0, body_length = 0;
+    if (m.subject) {
+        if (m.main_type == SCE_NP_BASIC_MESSAGE_MAIN_TYPE_ADD_FRIEND) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+        const auto [n, r] = text_length(m.subject, SCE_NP_BASIC_SUBJECT_CHARACTER_MAX, "subject");
+        if (r != lv2::CELL_OK) return r;
+        subject_length = n;
+    }
+    if (m.body) {
+        const auto [n, r] = text_length(m.body, SCE_NP_BASIC_BODY_CHARACTER_MAX, "body");
+        if (r != lv2::CELL_OK) return r;
+        body_length = n;
+    }
+    switch (m.main_type) {
+    case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_DATA_ATTACHMENT:
+    case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_CUSTOM_DATA:
+        if (m.size > SCE_NP_BASIC_MAX_MESSAGE_ATTACHMENT_SIZE) return error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX);
+        break;
+    case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_INVITE:
+        if (m.size > SCE_NP_BASIC_MAX_INVITATION_DATA_SIZE) return error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX);
+        break;
+    case SCE_NP_BASIC_MESSAGE_MAIN_TYPE_URL_ATTACHMENT:
+        if (m.size > SCE_NP_BASIC_MAX_URL_ATTACHMENT_SIZE) return error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX);
+        break;
+    default: break;
+    }
+    if (m.features & SCE_NP_BASIC_MESSAGE_FEATURES_ASSUME_SEND) {
+        if (m.main_type > SCE_NP_BASIC_MESSAGE_MAIN_TYPE_CUSTOM_DATA || !m.count || !body_length ||
+            (m.main_type != SCE_NP_BASIC_MESSAGE_MAIN_TYPE_ADD_FRIEND && !subject_length)) {
+            return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+        }
+    }
+    PS_LOG_INFO(kChan, "{}(main type {}, sub type {}, features {:#x}, {} recipients, subject \"{}\", {} bytes of data, "
+                       "container {:#x}): offline, no dialog", name, m.main_type, m.sub_type, m.features, m.count,
+        m.subject ? guest_string(t, m.subject, 4 * SCE_NP_BASIC_SUBJECT_CHARACTER_MAX) : std::string(), m.size,
+        container_id);
+    return error(SCE_NP_BASIC_ERROR_NOT_CONNECTED);
+}
+
+s32 sceNpBasicSendMessageGui(PPUContext& ctx, u32 msg, u32 container_id)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    if (!msg) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_readable(t, msg, kMessageDetailsSize)) {
+        log_call_site(ctx, t.kernel.base(),
+            std::format("sceNpBasicSendMessageGui: the message {:#x} is not guest memory", msg));
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    return send_message_offline(ctx, "sceNpBasicSendMessageGui", read_message_details(t.kernel.base(), msg),
+        container_id);
+}
+
+// RPCS3 sceNpBasicAddFriend: a friend request (main type ADD_FRIEND to the one contact, with the body and no data)
+// through sceNpBasicSendMessageGui. Its checks want a data size, which a friend request doesn't have, so in RPCS3 it
+// ends there with SCE_NP_BASIC_ERROR_INVALID_ARGUMENT, before the offline check.
+s32 sceNpBasicAddFriend(PPUContext& ctx, u32 contact, u32 body, u32 container_id)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    MessageDetails m;
+    m.main_type = SCE_NP_BASIC_MESSAGE_MAIN_TYPE_ADD_FRIEND;
+    m.npids = contact;
+    m.count = 1;
+    m.body = body;
+    return send_message_offline(ctx, "sceNpBasicAddFriend", m, container_id);
+}
+
+// RPCS3 sceNpBasicRecvMessageCustom (recv_message_gui): opens the system's list of invitations or custom data
+// messages, waits for the user to pick one or cancel, and hands the pick to the basic handler. Offline the list is
+// empty (overlay_recvmessage_dialog: only "cancel" is offered), so the result is SCE_NP_BASIC_ERROR_CANCEL (returned
+// as not an error) and no event. No dialog is shown here: that cancel is the answer at once.
+s32 sceNpBasicRecvMessageCustom(PPUContext&, u16 main_type, u32 recv_options, u32 container_id)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    if (main_type != SCE_NP_BASIC_MESSAGE_MAIN_TYPE_INVITE && main_type != SCE_NP_BASIC_MESSAGE_MAIN_TYPE_CUSTOM_DATA) {
+        return error(SCE_NP_BASIC_ERROR_NOT_SUPPORTED);
+    }
+    if (recv_options & ~SCE_NP_BASIC_RECV_MESSAGE_OPTIONS_ALL_OPTIONS) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    PS_LOG_INFO(kChan, "sceNpBasicRecvMessageCustom(main type {}, options {:#x}, container {:#x}): offline there is no "
+                       "message to list; cancelled", main_type, recv_options, container_id);
+    return error(SCE_NP_BASIC_ERROR_CANCEL);
+}
+
+// ------------------------------------------------------------------------------------------------- basic: players
+
+// The length of the NUL-terminated guest string at `addr` if it is under `max`, else `max`; nullopt when it runs into
+// memory that isn't guest memory first.
+std::optional<u32> guest_strnlen(lv2::PpuThread& t, u32 addr, u32 max)
+{
+    for (u32 i = 0; i < max; i++) {
+        if (!guest_readable(t, addr + i, 1)) return std::nullopt;
+        if (!ps_read8(t.kernel.base(), addr + i)) return i;
+    }
+    return max;
+}
+
+// RPCS3 sceNpBasicAddPlayersHistoryAsync (np_handler::add_players_to_history), which works offline too: the players
+// go into the console's history of players met, and the result goes to the basic handler, if one is registered, as
+// SCE_NP_BASIC_EVENT_ADD_PLAYERS_HISTORY_RESULT with result 0 and the request ID this returns (np_handler::
+// send_basic_event: at the game's next cellSysutilCheckCallback). The request ID is REQUEST_ID_HIGH::MISC << 16 | the
+// next request number. The players aren't kept: RPCS3 writes them to its players_history.yml, which only
+// sceNpBasicGetPlayersHistoryEntryCount and sceNpBasicGetPlayersHistoryEntry read, and GTA V imports neither. RPCS3
+// reads the NP IDs and the description unchecked, and writes the request ID after the event is sent: memory that
+// isn't guest memory is refused here first, with a log.
+s32 sceNpBasicAddPlayersHistoryAsync(PPUContext& ctx, u32 npids, u32 count, u32 description, u32 req_id)
+{
+    NpState& s = np();
+    if (!s.initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!count) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    if (count > SCE_NP_BASIC_PLAYER_HISTORY_MAX_PLAYERS) return error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX);
+    if (!npids) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, npids, count * kNpIdSize)) {
+        log_call_site(ctx, base, std::format("sceNpBasicAddPlayersHistoryAsync: the NP IDs ({} at {:#x}) are not guest "
+                                             "memory", count, npids));
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    for (u32 i = 0; i < count; i++) {
+        if (!ps_read8(base, npids + i * kNpIdSize)) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    if (description) {
+        const std::optional<u32> length = guest_strnlen(t, description, SCE_NP_BASIC_DESCRIPTION_CHARACTER_MAX + 1);
+        if (!length) {
+            log_call_site(ctx, base, std::format("sceNpBasicAddPlayersHistoryAsync: the description at {:#x} runs out of "
+                                                 "guest memory", description));
+            return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+        }
+        if (*length > SCE_NP_BASIC_DESCRIPTION_CHARACTER_MAX) return error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX);
+    }
+    if (req_id && !guest_readable(t, req_id, 4)) {
+        log_call_site(ctx, base, std::format("sceNpBasicAddPlayersHistoryAsync: the request ID's address {:#x} is not "
+                                             "guest memory", req_id));
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    std::string players;
+    for (u32 i = 0; i < count; i++) {
+        players += std::format("{}\"{}\"", i ? ", " : "", guest_string(t, npids + i * kNpIdSize, kOnlineIdLength));
+    }
+    u32 request = 0, handler = 0, handler_arg = 0;
+    bool send_event = false;
+    {
+        std::lock_guard lock(s.mutex);
+        request = (kRequestIdMisc << 16) | s.next_request++;
+        send_event = s.basic_handler_registered;
+        handler = s.basic_handler;
+        handler_arg = s.basic_handler_arg;
+    }
+    if (send_event) {
+        sysutil_queue_call([=](PPUContext& cb_ctx) -> s32 {
+            // SceNpBasicEventHandler(event, retCode, reqId, arg); RPCS3 ignores its result.
+            call_guest(cb_ctx, handler, {SCE_NP_BASIC_EVENT_ADD_PLAYERS_HISTORY_RESULT, 0, request, handler_arg});
+            return lv2::CELL_OK;
+        });
+    }
+    if (req_id) ps_write32(base, req_id, request);
+    PS_LOG_INFO(kChan, "sceNpBasicAddPlayersHistoryAsync({}, description \"{}\"): request {:#x}, {}", players,
+        description ? guest_string(t, description, SCE_NP_BASIC_DESCRIPTION_CHARACTER_MAX) : std::string(), request,
+        send_event ? "its result goes to the basic handler" : "no basic handler for its result");
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- profile
+
+// RPCS3 sceNpProfileCallGui (a TODO): would show a user's profile and report to the handler when it closes. After its
+// checks it asks for the user's NP ID (sceNpManagerGetNpId on a stack variable), which offline answers
+// SCE_NP_ERROR_OFFLINE, and returns that. The handler isn't called; the NP ID isn't checked.
+s32 sceNpProfileCallGui(PPUContext&, u32 np_id, u32 handler, u32 user_arg, u64 options)
+{
+    if (!np().initialized) return error(SCE_NP_PROFILE_ERROR_NOT_INITIALIZED);
+    if (!handler) return error(SCE_NP_PROFILE_ERROR_INVALID_ARGUMENT);
+    PS_LOG_WARN(kChan, "sceNpProfileCallGui(npId {:#x}, handler {:#x}, arg {:#x}, options {:#x}): a TODO in RPCS3; "
+                       "offline the user's NP ID isn't available", np_id, handler, user_arg, options);
+    return error(SCE_NP_ERROR_OFFLINE);
+}
+
+// ------------------------------------------------------------------------------------------------- DRM
+
+// A guest file read through lv2's file system (a host directory or the disc image, as mounted): whether it opened,
+// sys_fs_open's result or else the reads' (CELL_OK, or the error that ended them), and up to the bytes asked for from
+// the file's start.
+struct GuestFile {
+    bool opened = false;
+    s32 result = lv2::CELL_OK;
+    std::vector<u8> bytes;
+};
+
+// Opens `vpath` read-only and reads up to `limit` bytes, with the syscalls' arguments on the caller's guest stack (as
+// sceNpTrophy reads its packs).
+GuestFile read_guest_file(PPUContext& ctx, std::string_view vpath, u64 limit)
+{
+    constexpr u32 kChunk = 0x1000;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 path_space = (static_cast<u32>(vpath.size()) + 16) & ~15u; // zeroed: the path ends there
+    const StackVar var(ctx, base, path_space + 16 + kChunk);
+    const u32 path = var.addr(), fd = path + path_space, nread = fd + 8, buf = nread + 8;
+    std::memcpy(base + path, vpath.data(), vpath.size());
+    GuestFile out;
+    out.result = lv2::sys_fs_open(t, path, 0 /* CELL_FS_O_RDONLY */, fd, 0, 0, 0);
+    if (out.result != lv2::CELL_OK) return out;
+    out.opened = true;
+    const u32 file = ps_read32(base, fd);
+    while (out.bytes.size() < limit) {
+        const u64 want = std::min<u64>(kChunk, limit - out.bytes.size());
+        out.result = lv2::sys_fs_read(t, file, buf, want, nread);
+        const u64 n = ps_read64(base, nread);
+        if (out.result != lv2::CELL_OK || !n) break;
+        out.bytes.insert(out.bytes.end(), base + buf, base + buf + n);
+    }
+    lv2::sys_fs_close(t, file);
+    return out;
+}
+
+// RPCS3 rpcs3::utils::get_rap_file_path's content ID check: 1 to 0x30 characters of A-Z, a-z, 0-9, '-' and '_'.
+bool valid_content_id(std::string_view id)
+{
+    return !id.empty() && id.size() <= kNpdContentIdSize && std::all_of(id.begin(), id.end(), [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+    });
+}
+
+// RPCS3 npDrmIsAvailable, from the file's first bytes on: whether the content at `path` can be used with the
+// klicensee given. A file that is neither a SELF ("SCE\0") nor an EDAT/SDAT ("NPD\0") is taken as unencrypted (disc
+// files): available. Where pspocket differs:
+// - RPCS3 then installs the content's key, which lets lv2 decrypt it when the game opens it. pspocket's file system
+//   reads no encrypted EDAT or SDAT and the loader no PSN executable (D-121), so content that would need a key is
+//   reported as RPCS3 reports content it can't verify: SCE_NP_DRM_ERROR_NO_ENTITLEMENT, with an error log.
+// - An EDAT's NPD hashes (its title hash, and for klicensee content the dev hash) are not checked: they need NP keys
+//   the build doesn't carry. A damaged or renamed EDAT RPCS3 refuses with NO_ENTITLEMENT gets the licence's answer.
+// - A SELF is checked by decrypting it with the build's SELF keys (recomp::decrypt_self, as the loader does), where
+//   RPCS3 opens its metadata with its key vault: a disc executable is available, a PSN one is not (above).
+// - RPCS3 searches every user's exdata for a RAP licence; pspocket has the one user, 00000001.
+s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile& head)
+{
+    const std::vector<u8>& b = head.bytes;
+    // The first four bytes are `magic` and its terminator ("SCE\0", "NPD\0").
+    const auto magic_is = [&](const char* magic) { return b.size() >= 4 && std::memcmp(b.data(), magic, 4) == 0; };
+    if (head.result != lv2::CELL_OK) {
+        PS_LOG_WARN(kChan, "sceNpDrmIsAvailable(\"{}\"): reading failed after {} bytes ({}); checked as read", path,
+            b.size(), lv2::error_name(head.result));
+    }
+    if (magic_is("SCE")) {
+        constexpr u64 kSelfMax = 256ull << 20; // far above any PS3 executable; a bigger file isn't read whole
+        const GuestFile whole = read_guest_file(ctx, path, kSelfMax + 1);
+        if (whole.result != lv2::CELL_OK || whole.bytes.size() > kSelfMax) {
+            PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that can't be read ({}, {} bytes): no entitlement",
+                path, lv2::error_name(whole.result), whole.bytes.size());
+            return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
+        }
+        const recomp::Result<std::vector<u8>> elf = recomp::decrypt_self(whole.bytes, recomp::builtin_self_keys());
+        if (!elf) {
+            PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that doesn't open ({}): no entitlement", path,
+                elf.error().message);
+            return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
+        }
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that opens with the build's keys: available", path);
+        return lv2::CELL_OK;
+    }
+    if (!magic_is("NPD")) {
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): not encrypted ({} bytes read): available", path, b.size());
+        return lv2::CELL_OK;
+    }
+    // RPCS3 read_npd_edat_header: the headers, zeros past the end of a short file.
+    std::array<u8, kNpdHeaderSize + kEdatHeaderSize> h{};
+    std::memcpy(h.data(), b.data(), std::min(b.size(), h.size()));
+    const u32 license = ps_read32(h.data(), kNpdLicense);
+    const u32 flags = ps_read32(h.data(), kNpdHeaderSize);
+    const std::string_view id_field(reinterpret_cast<const char*>(h.data() + kNpdContentId), kNpdContentIdSize);
+    const std::string content_id(id_field.substr(0, id_field.find('\0')));
+    if ((flags & SDAT_FLAG) == SDAT_FLAG) { // VerifyEDATHeaderWithKLicense: "SDATA file given to edat function"
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): an SDAT ({}), which RPCS3's EDAT check refuses: no entitlement",
+            path, content_id);
+        return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
+    }
+    if (license == kNpdLicenseFree) {
+        PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}) opened by the klicensee, which pspocket can't "
+                            "verify or decrypt: no entitlement", path, content_id);
+        return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
+    }
+    // A licence is needed: the user's RAP file for the content (none for a content ID RPCS3 finds invalid).
+    if (!valid_content_id(content_id)) {
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT (licence type {}) whose content ID \"{}\" isn't valid, "
+                           "so no licence: licence not found", path, license, content_id);
+        return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
+    }
+    const std::string rap = "/dev_hdd0/home/00000001/exdata/" + content_id + ".rap";
+    const GuestFile key = read_guest_file(ctx, rap, 16);
+    if (!key.opened) {
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}, licence type {}) without its licence {}: licence "
+                           "not found", path, content_id, license, rap);
+        return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
+    }
+    if (key.bytes.size() < 16) {
+        PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): the licence {} is too small ({} bytes): bad format", path, rap,
+            key.bytes.size());
+        return error(SCE_NP_DRM_ERROR_BAD_FORMAT);
+    }
+    PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}) with its licence {}, which pspocket can't decrypt: "
+                        "no entitlement", path, content_id, rap);
+    return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
+}
+
+// RPCS3 sceNpDrmIsAvailable (npDrmIsAvailable): whether the NPDRM content at drm_path can be used, given the game's
+// klicensee (16 bytes, optional). NP need not be up. The file is opened as RPCS3's lv2_file::open does (an error
+// there is the result: CELL_ENOENT for a missing file) and checked by its first bytes (drm_check_content); then the
+// thread sleeps 5 ms, as in RPCS3. The klicensee is a key: it is never logged. RPCS3 reads the klicensee and the path
+// (at most 0x100 characters) unchecked: ones that aren't guest memory are refused here with a log. RPCS3's key for
+// PSP remasters (category "PE") doesn't apply: pspocket runs PS3 games.
+s32 sceNpDrmIsAvailable(PPUContext& ctx, u32 k_licensee, u32 drm_path)
+{
+    if (!drm_path) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (k_licensee && !guest_readable(t, k_licensee, 16)) {
+        log_call_site(ctx, base, std::format("sceNpDrmIsAvailable: the klicensee {:#x} is not guest memory", k_licensee));
+        return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    }
+    const std::optional<u32> length = guest_strnlen(t, drm_path, kDrmPathMax);
+    if (!length) {
+        log_call_site(ctx, base, std::format("sceNpDrmIsAvailable: the path {:#x} runs out of guest memory", drm_path));
+        return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    }
+    const std::string path(reinterpret_cast<const char*>(base + drm_path), *length);
+    PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\", {}): checking", path, k_licensee ? "with a klicensee" : "no klicensee");
+    const GuestFile head = read_guest_file(ctx, path, kNpdHeaderSize + kEdatHeaderSize);
+    s32 result = head.result;
+    if (!head.opened) {
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): can't be opened: {}", path, lv2::error_name(result));
+    } else {
+        result = drm_check_content(ctx, path, head);
+    }
+    lv2::sys_timer_usleep(t, 5'000);
+    return result;
+}
+
 // ------------------------------------------------------------------------------------------------- lookup
 
 // RPCS3 sceNpLookupInit / sceNpLookupTerm: the lookup (community) library on top of NP. Term leaves the title
@@ -629,6 +1185,36 @@ s32 sceNpSignalingAddExtendedHandler(PPUContext&, u32 ctx_id, u32 handler, u32 a
     return lv2::CELL_OK;
 }
 
+// RPCS3 sceNpSignalingActivateConnection: starts a peer-to-peer connection to another user. After its checks (the
+// context, both pointers, not the user's own NP ID: offline, any NP ID with an empty online ID) RPCS3 makes the
+// connection pending and asks RPCN for the peer's address, which with PSN disabled aborts the emulator ("RPCN is
+// required to use PSN online features"). pspocket differs there: no connection is made and the call is refused with
+// SCE_NP_SIGNALING_ERROR_PEER_UNREACHABLE, the signaling library's error for a peer it can't reach, so the other
+// signaling functions keep finding no connection. RPCS3 reads the NP ID unchecked: one that isn't guest memory is
+// refused here with a log.
+s32 sceNpSignalingActivateConnection(PPUContext& ctx, u32 ctx_id, u32 np_id, u32 conn_id)
+{
+    NpState& s = np();
+    if (!s.initialized) return error(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.signaling_ctxs.find(ctx_id)) return error(SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND);
+    }
+    if (!np_id || !conn_id) return error(SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, np_id, 1)) {
+        log_call_site(ctx, base,
+            std::format("sceNpSignalingActivateConnection: the NP ID {:#x} is not guest memory", np_id));
+        return error(SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT);
+    }
+    if (!ps_read8(base, np_id)) return error(SCE_NP_SIGNALING_ERROR_OWN_NP_ID);
+    PS_LOG_ERROR(kChan, "sceNpSignalingActivateConnection(context {:#x}, peer \"{}\"): offline the peer can't be "
+                        "reached (RPCS3 needs RPCN here and aborts); no connection", ctx_id,
+        guest_string(t, np_id, kOnlineIdLength));
+    return error(SCE_NP_SIGNALING_ERROR_PEER_UNREACHABLE);
+}
+
 // RPCS3 sceNpSignalingGetLocalNetInfo: the console's local and public addresses (0 without a network) and RPCS3's
 // guesses: NAT type 2, UPnP invalid (RPCS3 enables it only with a network), NP port open. The struct's size picks its
 // layout: SceNpSignalingNetInfo (28 bytes, with the NP port) or the deprecated one without the port (24). The context
@@ -718,11 +1304,16 @@ s32 sceNpUtilCmpNpId(PPUContext& ctx, u32 id1, u32 id2)
     return lv2::CELL_OK;
 }
 
-// ------------------------------------------------------------------------------------------------- init and term
+} // namespace
 
-// RPCS3 sceNpInit, with NpState::mutex held. The pool would hold NP's working memory; nothing uses it offline.
-u32 np_init_locked(NpState& s, u32 poolsize, u32 poolptr)
+// ------------------------------------------------------------------------------------------------- NP's state (np.hpp)
+
+bool np_initialized() { return np().initialized; }
+
+u32 np_init(u32 poolsize, u32 poolptr)
 {
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
     if (s.initialized) return SCE_NP_ERROR_ALREADY_INITIALIZED;
     if (poolsize == 0 || !poolptr) return SCE_NP_ERROR_INVALID_ARGUMENT;
     if (poolsize < SCE_NP_MIN_POOL_SIZE) return SCE_NP_ERROR_INSUFFICIENT_BUFFER;
@@ -730,37 +1321,17 @@ u32 np_init_locked(NpState& s, u32 poolsize, u32 poolptr)
     return lv2::CELL_OK;
 }
 
-// RPCS3 sceNp2Init: sceNpInit (already initialized is fine), then NP2's own flag.
-s32 sceNp2Init(PPUContext&, u32 poolsize, u32 poolptr)
+u32 np_term()
 {
     NpState& s = np();
     std::lock_guard lock(s.mutex);
-    if (s.np2_initialized) return error(SCE_NP_ERROR_ALREADY_INITIALIZED);
-    if (const u32 r = np_init_locked(s, poolsize, poolptr); r != lv2::CELL_OK && r != SCE_NP_ERROR_ALREADY_INITIALIZED) {
-        return error(r);
-    }
-    s.np2_initialized = true;
-    PS_LOG_INFO(kChan, "sceNp2Init(pool {:#x} bytes at {:#x}): NP up, no user signed in (offline)", poolsize, poolptr);
-    return lv2::CELL_OK;
-}
-
-// RPCS3 sceNp2Term: matching 2 (never started here) and NP are terminated. NP term (RPCS3 sceNpTerm and
-// np_handler::terminate_NP) drops the manager callback, the basic handler and the signaling contexts; the lookup state
-// and its title contexts stay.
-s32 sceNp2Term(PPUContext&)
-{
-    NpState& s = np();
-    std::lock_guard lock(s.mutex);
-    if (!s.np2_initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    if (!s.initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     s.initialized = false;
-    s.np2_initialized = false;
     s.basic_handler_registered = false;
     s.manager_cb = s.manager_cb_arg = 0;
     s.signaling_ctxs.clear();
     return lv2::CELL_OK;
 }
-
-} // namespace
 
 void register_sceNp(Registry& r)
 {
@@ -788,6 +1359,13 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0xF2B3338A, sceNpBasicGetBlockListEntry),
         PS_HLE_FUNC(0xECD503DE, sceNpBasicGetMessageEntryCount),
         PS_HLE_FUNC(0x64A704CC, sceNpBasicRecvMessageAttachmentLoad),
+        PS_HLE_FUNC(0xEC0A1FBF, sceNpBasicSendMessage),
+        PS_HLE_FUNC(0x01FBBC9B, sceNpBasicSendMessageGui),
+        PS_HLE_FUNC(0x27C69EBA, sceNpBasicAddFriend),
+        PS_HLE_FUNC(0x806960AB, sceNpBasicRecvMessageCustom),
+        PS_HLE_FUNC(0xBCDBB2AB, sceNpBasicAddPlayersHistoryAsync),
+        PS_HLE_FUNC(0xCEEEBC7A, sceNpProfileCallGui),
+        PS_HLE_FUNC(0xAD218FAF, sceNpDrmIsAvailable),
         PS_HLE_FUNC(0x5F2D9257, sceNpLookupInit),
         PS_HLE_FUNC(0x8440537C, sceNpLookupTerm),
         PS_HLE_FUNC(0xCE81C7F0, sceNpLookupCreateTitleCtx),
@@ -801,6 +1379,7 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0x6356082E, sceNpSignalingCreateCtx),
         PS_HLE_FUNC(0xA8CF8451, sceNpSignalingDestroyCtx),
         PS_HLE_FUNC(0x50B86D94, sceNpSignalingAddExtendedHandler),
+        PS_HLE_FUNC(0x60897C38, sceNpSignalingActivateConnection),
         PS_HLE_FUNC(0x9AD7FBD1, sceNpSignalingGetLocalNetInfo),
         PS_HLE_FUNC(0xCA0A2D04, sceNpSignalingGetConnectionStatus),
         PS_HLE_FUNC(0x155DE760, sceNpSignalingGetConnectionInfo),
@@ -808,10 +1387,6 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0x34CE82A0, sceNpSignalingGetConnectionFromPeerAddress),
         PS_HLE_FUNC(0x95C7BBA3, sceNpSignalingTerminateConnection),
         PS_HLE_FUNC(0xD208F91D, sceNpUtilCmpNpId),
-    });
-    r.add("sceNp2", {
-        PS_HLE_FUNC(0x41251F74, sceNp2Init),
-        PS_HLE_FUNC(0xAADB7C12, sceNp2Term),
     });
 }
 

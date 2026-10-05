@@ -1,19 +1,25 @@
 // cellSysutil and cellSysutilAvconfExt (synthetic: no game data): system events delivered to a guest callback by
-// cellSysutilCheckCallback, system parameters, the system cache on host directories, video and audio output.
+// cellSysutilCheckCallback, system parameters, the system cache on host directories, video and audio output, the
+// on-screen keyboard and message dialogs; and sysPrxForUser's sys_prx_register_library.
 
 #include <catch_amalgamated.hpp>
 
 #include <unistd.h>
 
+#include <algorithm>
+#include <bit>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "sysutil.hpp" // runtime/hle/src (internal): the event queue other HLE modules use
 #include "hle_test_util.hpp"
+#include "pspocket/core/log.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/ppu/asm.hpp"
@@ -78,6 +84,150 @@ std::string guest_string(u8* base, u32 addr) { return std::string(reinterpret_ca
 
 // CellSysCacheParam {char cacheId[32]; char getCachePath[1055]; be32 reserved} for the cache tests.
 constexpr u32 kSysCacheParam = kData + 0x1000;
+
+constexpr u32 kUnmapped = 0x0FFF0000; // in the main area, never committed by these tests
+
+bool all_bytes(const u8* p, usize n, u8 value)
+{
+    for (usize i = 0; i < n; i++)
+        if (p[i] != value) return false;
+    return true;
+}
+
+// A guest sysutil callback that keeps every call, behind the descriptor kLogOpd: it appends the low words of its
+// (status, param, userdata) to a log at kLog + 16, 16 bytes an entry, and counts the entries at kLog.
+constexpr u32 kLogCode = kData + 0x20000, kLogOpd = kData + 0x20800, kLog = kData + 0x21000;
+
+void write_log_callback(u8* base)
+{
+    const std::vector<u32> code = {
+        as::lis(6, static_cast<s32>(kLog >> 16)),
+        as::ori(6, 6, kLog & 0xFFFF),
+        as::lwz(7, 0, 6),
+        as::slwi(8, 7, 4),
+        as::addi(8, 8, 16),
+        as::stwx(3, 6, 8),
+        as::addi(9, 8, 4),
+        as::stwx(4, 6, 9),
+        as::addi(9, 8, 8),
+        as::stwx(5, 6, 9),
+        as::addi(7, 7, 1),
+        as::stw(7, 0, 6),
+        as::blr(),
+    };
+    for (usize i = 0; i < code.size(); i++) ps_write32(base, kLogCode + 4 * static_cast<u32>(i), code[i]);
+    ps_write32(base, kLogOpd, kLogCode);
+    ps_write32(base, kLogOpd + 4, kToc);
+    std::memset(base + kLog, 0, 0x400);
+}
+
+struct Event {
+    u32 status = 0, param = 0, userdata = 0;
+    bool operator==(const Event&) const = default;
+};
+
+std::ostream& operator<<(std::ostream& os, const Event& e)
+{
+    return os << std::hex << "{status 0x" << e.status << ", param 0x" << e.param << ", userdata 0x" << e.userdata
+              << "}" << std::dec;
+}
+
+// The calls the log callback got, in order.
+std::vector<Event> events(u8* base)
+{
+    std::vector<Event> v;
+    for (u32 i = 0; i < ps_read32(base, kLog); i++) {
+        v.push_back({ps_read32(base, kLog + 16 + 16 * i), ps_read32(base, kLog + 20 + 16 * i),
+            ps_read32(base, kLog + 24 + 16 * i)});
+    }
+    return v;
+}
+
+// The log lines written while it lives (from the minimum level up).
+struct CapturedLog {
+    struct Line {
+        log::Level level;
+        std::string channel, message;
+    };
+    std::mutex mutex;
+    std::vector<Line> lines;
+
+    CapturedLog()
+    {
+        log::set_sink(
+            [](void* user, log::Level level, std::string_view channel, std::string_view message) {
+                auto* self = static_cast<CapturedLog*>(user);
+                std::lock_guard lock(self->mutex);
+                self->lines.push_back({level, std::string(channel), std::string(message)});
+            },
+            this);
+    }
+    ~CapturedLog() { log::set_sink(nullptr, nullptr); }
+    CapturedLog(const CapturedLog&) = delete;
+    CapturedLog& operator=(const CapturedLog&) = delete;
+
+    // The lines at `level` on `channel` that contain `text`.
+    usize count(log::Level level, std::string_view channel, std::string_view text)
+    {
+        std::lock_guard lock(mutex);
+        usize n = 0;
+        for (const Line& l : lines)
+            if (l.level == level && l.channel == channel && l.message.find(text) != std::string::npos) n++;
+        return n;
+    }
+};
+
+// cellOskDialog's guest structures: CellOskDialogParam at kOskParam, CellOskDialogInputFieldInfo at kOskField (its
+// message at kOskMessage, its initial text at kOskInit), CellOskDialogCallbackReturnParam at kOskOut and the result
+// buffer at kOskString.
+constexpr u32 kOskParam = kData + 0x30000, kOskField = kData + 0x30100, kOskMessage = kData + 0x30200,
+              kOskInit = kData + 0x30600, kOskOut = kData + 0x30A00, kOskString = kData + 0x30B00;
+const u64 kOskParamError = r3_of_code(0x8002b504); // CELL_OSKDIALOG_ERROR_PARAM
+const u64 kNotOpened = r3_of_code(0x8002b302);     // CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED
+const u64 kSysutilBusy = r3_of_code(0x8002b105);   // CELL_SYSUTIL_ERROR_BUSY
+constexpr u32 kOskLoaded = 0x0502, kOskFinished = 0x0503, kOskUnloaded = 0x0504; // CELL_SYSUTIL_OSKDIALOG_*
+
+void put_utf16(u8* base, u32 addr, std::u16string_view s)
+{
+    for (usize i = 0; i < s.size(); i++) ps_write16(base, addr + 2 * static_cast<u32>(i), s[i]);
+    ps_write16(base, addr + 2 * static_cast<u32>(s.size()), 0);
+}
+
+std::u16string get_utf16(u8* base, u32 addr, u32 max)
+{
+    std::u16string s;
+    for (u32 i = 0; i < max; i++) {
+        const char16_t c = ps_read16(base, addr + 2 * i);
+        if (!c) break;
+        s += c;
+    }
+    return s;
+}
+
+// A dialog asking for a "Name", "Niko" in its field, room for `limit` units.
+void write_osk_load_args(u8* base, u32 limit = 16)
+{
+    ps_write32(base, kOskParam + 0, 0x2);                        // allowOskPanelFlg: CELL_OSKDIALOG_PANELMODE_ENGLISH
+    ps_write32(base, kOskParam + 4, 0x2);                        // firstViewPanel
+    ps_write32(base, kOskParam + 8, std::bit_cast<u32>(0.5f));   // controlPoint
+    ps_write32(base, kOskParam + 12, std::bit_cast<u32>(0.25f)); //
+    ps_write32(base, kOskParam + 16, 0x1);                       // prohibitFlgs: CELL_OSKDIALOG_NO_SPACE
+    put_utf16(base, kOskMessage, u"Name");
+    put_utf16(base, kOskInit, u"Niko");
+    ps_write32(base, kOskField + 0, kOskMessage);
+    ps_write32(base, kOskField + 4, kOskInit);
+    ps_write32(base, kOskField + 8, limit);
+}
+
+// CellOskDialogCallbackReturnParam {result: 0xAAAAAAAA until written, numCharsResultString, pResultString}, and the
+// result buffer at kOskString filled with 0xAA.
+void write_osk_output(u8* base, s32 num_chars, u32 result_string = kOskString)
+{
+    ps_write32(base, kOskOut + 0, 0xAAAAAAAA);
+    ps_write32(base, kOskOut + 4, static_cast<u32>(num_chars));
+    ps_write32(base, kOskOut + 8, result_string);
+    std::memset(base + kOskString, 0xAA, 0x400);
+}
 
 } // namespace
 
@@ -560,4 +710,328 @@ TEST_CASE("cellAudioOut: stereo LPCM at 48 kHz, configuration", "[hle][sysutil]"
     CHECK(a.call("cellAudioOutGetAvailableDeviceInfo", 16, kInfo) == 0);
     CHECK(a.call("cellAudioOutGetAvailableDeviceInfo", 17, kInfo) == kAudioIllegal);
     CHECK(a.call("cellAudioOutGetAvailableDeviceInfo", 1, 0) == kAudioIllegal);
+}
+
+TEST_CASE("cellSysutil dialogs, sysPrxForUser: the functions GTA V imports, in their modules", "[hle][sysutil]")
+{
+    struct Expected {
+        std::string_view module, name;
+        u32 nid;
+    };
+    const Expected expected[] = {
+        {"cellSysutil", "cellOskDialogLoadAsync", 0x7FCFC915},
+        {"cellSysutil", "cellOskDialogUnloadAsync", 0x3D1E1931},
+        {"cellSysutil", "cellOskDialogAbort", 0xB6D84526},
+        {"cellSysutil", "cellOskDialogSetDeviceMask", 0xD3790A86},
+        {"cellSysutil", "cellOskDialogSetKeyLayoutOption", 0xB53C54FA},
+        {"cellSysutil", "cellOskDialogAddSupportLanguage", 0x7F21C918},
+        {"cellSysutil", "cellOskDialogSetLayoutMode", 0xF0EC3CCC},
+        {"cellSysutil", "cellMsgDialogAbort", 0x62B0F803},
+        {"sysPrxForUser", "sys_prx_register_library", 0x42B23552},
+    };
+    // (test_hle.cpp checks every registered NID against its name.)
+    for (const Expected& e : expected) {
+        INFO(e.module << "::" << e.name);
+        const hle::Function* fn = hle::registry().find(e.module, e.nid);
+        REQUIRE(fn != nullptr);
+        CHECK(fn->name == e.name);
+    }
+}
+
+TEST_CASE("cellOskDialog without a keyboard: LOADED, cancelled at the check after (FINISHED), unload, UNLOADED",
+    "[hle][sysutil][osk]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    write_log_callback(base);
+    REQUIRE(a.call("cellSysutilRegisterCallback", 0, kLogOpd, 0x05C0) == 0);
+    write_osk_load_args(base);
+    write_osk_output(base, 32);
+    const auto load = [&] { return a.call("cellOskDialogLoadAsync", 0, kOskParam, kOskField); };
+    const auto check = [&] { REQUIRE(a.call("cellSysutilCheckCallback") == 0); };
+    const Event loaded{kOskLoaded, 0, 0x05C0}, finished{kOskFinished, 0, 0x05C0}, unloaded{kOskUnloaded, 0, 0x05C0};
+
+    // Nothing is loaded yet.
+    CHECK(a.call("cellOskDialogAbort") == kNotOpened);
+    CHECK(a.call("cellOskDialogUnloadAsync", kOskOut) == kNotOpened);
+    CHECK(ps_read32(base, kOskOut) == 0xAAAAAAAA);
+
+    CapturedLog logs;
+    REQUIRE(load() == 0);
+    CHECK(logs.count(log::Level::Warn, "cellOskDialog", "no keyboard UI") == 1);
+    CHECK(load() == kSysutilBusy); // one dialog at a time
+    CHECK(events(base).empty());   // the game's callbacks run at its checks
+
+    // The first check delivers LOADED, then the missing keyboard cancels the dialog: FINISHED comes at the next one.
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded});
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded, finished});
+    check();
+    CHECK(events(base).size() == 2);
+    CHECK(load() == kSysutilBusy); // loaded until the unload
+
+    // The unload reports the cancel; as in RPCS3, a cancelled dialog's text isn't copied. UNLOADED follows.
+    REQUIRE(a.call("cellOskDialogUnloadAsync", kOskOut) == 0);
+    CHECK(ps_read32(base, kOskOut + 0) == 1); // CELL_OSKDIALOG_INPUT_FIELD_RESULT_CANCELED
+    CHECK(ps_read32(base, kOskOut + 4) == 32);
+    CHECK(ps_read32(base, kOskOut + 8) == kOskString);
+    CHECK(all_bytes(base + kOskString, 0x400, 0xAA));
+    CHECK(events(base).size() == 2);
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded, finished, unloaded});
+
+    // Gone: nothing to abort or unload, and the next dialog loads.
+    CHECK(a.call("cellOskDialogAbort") == kNotOpened);
+    CHECK(a.call("cellOskDialogUnloadAsync", kOskOut) == kNotOpened);
+    REQUIRE(load() == 0);
+    check();
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded, finished, unloaded, loaded, finished});
+    REQUIRE(a.call("cellOskDialogUnloadAsync", kOskOut) == 0);
+    CHECK(ps_read32(base, kOskOut) == 1);
+}
+
+TEST_CASE("cellOskDialog: the load's and the unload's argument checks", "[hle][sysutil][osk]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    const auto load = [&](u32 param, u32 field) { return a.call("cellOskDialogLoadAsync", 0, param, field); };
+    write_osk_load_args(base);
+
+    // RPCS3's checks: both pointers, the message and initial text pointers, limit_length up to 512.
+    CHECK(load(0, kOskField) == kOskParamError);
+    CHECK(load(kOskParam, 0) == kOskParamError);
+    ps_write32(base, kOskField + 0, 0);
+    CHECK(load(kOskParam, kOskField) == kOskParamError);
+    ps_write32(base, kOskField + 0, kOskMessage);
+    ps_write32(base, kOskField + 4, 0);
+    CHECK(load(kOskParam, kOskField) == kOskParamError);
+    ps_write32(base, kOskField + 4, kOskInit);
+    ps_write32(base, kOskField + 8, 513);
+    CHECK(load(kOskParam, kOskField) == kOskParamError);
+
+    // Not guest memory (RPCS3 faults): the structures, or strings that run into such memory before they end.
+    ps_write32(base, kOskField + 8, 16);
+    CHECK(load(kUnmapped, kOskField) == kOskParamError);
+    CHECK(load(kOskParam, kUnmapped) == kOskParamError);
+    ps_write32(base, kOskField + 0, kUnmapped);
+    CHECK(load(kOskParam, kOskField) == kOskParamError);
+    constexpr u32 kEnd = kData + 0x300000; // the end of the fixture's committed memory
+    REQUIRE_FALSE(f.mem.is_committed(kEnd));
+    ps_write16(base, kEnd - 4, u'A');
+    ps_write16(base, kEnd - 2, u'B');
+    ps_write32(base, kOskField + 0, kEnd - 4); // a message without a terminator
+    CHECK(load(kOskParam, kOskField) == kOskParamError);
+    ps_write32(base, kOskField + 0, kOskMessage);
+    ps_write32(base, kOskField + 4, kEnd - 4); // an initial text, read up to the limit (16 units)
+    CHECK(load(kOskParam, kOskField) == kOskParamError);
+    CHECK(a.call("cellOskDialogAbort") == kNotOpened); // none of these loaded a dialog
+    ps_write32(base, kOskField + 8, 2);                 // read only as far as the limit
+    REQUIRE(load(kOskParam, kOskField) == 0);
+
+    // The unload: the pointer, then numCharsResultString (not negative), then a loaded dialog.
+    CHECK(a.call("cellOskDialogUnloadAsync", 0) == kOskParamError);
+    CHECK(a.call("cellOskDialogUnloadAsync", kUnmapped) == kOskParamError);
+    write_osk_output(base, -1);
+    CHECK(a.call("cellOskDialogUnloadAsync", kOskOut) == kOskParamError);
+    CHECK(ps_read32(base, kOskOut) == 0xAAAAAAAA);
+    // No check ran yet, so the dialog is still open and its result so far is OK: its text is copied, and a result
+    // buffer that is not guest memory is refused, the dialog kept.
+    write_osk_output(base, 32, kUnmapped);
+    CHECK(a.call("cellOskDialogUnloadAsync", kOskOut) == kOskParamError);
+    CHECK(ps_read32(base, kOskOut) == 0xAAAAAAAA);
+    write_osk_output(base, 32);
+    REQUIRE(a.call("cellOskDialogUnloadAsync", kOskOut) == 0);
+    CHECK(ps_read32(base, kOskOut) == 0); // CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK
+    CHECK(get_utf16(base, kOskString, 64) == u"AB");
+    CHECK(all_bytes(base + kOskString + 6, 0x400 - 6, 0xAA));
+    CHECK(a.call("cellOskDialogUnloadAsync", kOskOut) == kNotOpened);
+
+    // limit_length 512 is allowed (511 units).
+    write_osk_load_args(base, 512);
+    REQUIRE(load(kOskParam, kOskField) == 0);
+    write_osk_output(base, 32);
+    REQUIRE(a.call("cellOskDialogUnloadAsync", kOskOut) == 0);
+    CHECK(get_utf16(base, kOskString, 64) == u"Niko");
+}
+
+TEST_CASE("cellOskDialog: abort; an unload before the keyboard answered copies the text (RPCS3)", "[hle][sysutil][osk]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    write_log_callback(base);
+    REQUIRE(a.call("cellSysutilRegisterCallback", 1, kLogOpd, 0xAB) == 0);
+    write_osk_load_args(base);
+    const auto load = [&] { return a.call("cellOskDialogLoadAsync", 0, kOskParam, kOskField); };
+    const auto unload = [&] { return a.call("cellOskDialogUnloadAsync", kOskOut); };
+    const auto check = [&] { REQUIRE(a.call("cellSysutilCheckCallback") == 0); };
+    const Event loaded{kOskLoaded, 0, 0xAB}, finished{kOskFinished, 0, 0xAB}, unloaded{kOskUnloaded, 0, 0xAB};
+
+    // An abort right after the load sends FINISHED, the result ABORT. The keyboard's cancel, which the load queued,
+    // then finds the dialog closed and does nothing.
+    REQUIRE(load() == 0);
+    REQUIRE(a.call("cellOskDialogAbort") == 0);
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded, finished});
+    check();
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded, finished});
+    // Every abort of a loaded dialog sends FINISHED (RPCS3), closed or not.
+    REQUIRE(a.call("cellOskDialogAbort") == 0);
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded, finished, finished});
+    write_osk_output(base, 32);
+    REQUIRE(unload() == 0);
+    CHECK(ps_read32(base, kOskOut) == 2);              // CELL_OSKDIALOG_INPUT_FIELD_RESULT_ABORT
+    CHECK(all_bytes(base + kOskString, 0x400, 0xAA)); // not copied
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded, finished, finished, unloaded});
+
+    // An unload while the dialog is still open: the result so far is OK, and RPCS3 copies the text (here the initial
+    // one): numCharsResultString units at most, then a terminator.
+    REQUIRE(load() == 0);
+    write_osk_output(base, 2);
+    REQUIRE(unload() == 0);
+    CHECK(ps_read32(base, kOskOut) == 0); // CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK
+    CHECK(get_utf16(base, kOskString, 64) == u"Ni");
+    CHECK(all_bytes(base + kOskString + 6, 0x400 - 6, 0xAA));
+    // Without a result buffer only the result is written; with numCharsResultString 0, only a terminator.
+    REQUIRE(load() == 0);
+    write_osk_output(base, 32, 0);
+    REQUIRE(unload() == 0);
+    CHECK(ps_read32(base, kOskOut) == 0);
+    CHECK(all_bytes(base + kOskString, 0x400, 0xAA));
+    REQUIRE(load() == 0);
+    write_osk_output(base, 0);
+    REQUIRE(unload() == 0);
+    CHECK(ps_read16(base, kOskString) == 0);
+    CHECK(all_bytes(base + kOskString + 2, 0x400 - 2, 0xAA));
+
+    // The keyboard's answers to those three dialogs come at the next check, find them unloaded, and leave alone the
+    // dialog loaded since: that one is cancelled by its own answer, its FINISHED delivered at the check after.
+    REQUIRE(load() == 0);
+    check();
+    CHECK(events(base) == std::vector<Event>{loaded, finished, finished, unloaded, loaded, unloaded, loaded, unloaded,
+                              loaded, unloaded, loaded});
+    check();
+    CHECK(events(base).back() == finished);
+    write_osk_output(base, 32);
+    REQUIRE(unload() == 0);
+    CHECK(ps_read32(base, kOskOut) == 1); // CELL_OSKDIALOG_INPUT_FIELD_RESULT_CANCELED
+}
+
+TEST_CASE("cellOskDialog settings: RPCS3's checks, with or without a dialog", "[hle][sysutil][osk]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    for (int loaded = 0; loaded < 2; loaded++) {
+        INFO("a dialog loaded: " << loaded);
+        if (loaded) {
+            write_osk_load_args(f.base());
+            REQUIRE(a.call("cellOskDialogLoadAsync", 0, kOskParam, kOskField) == 0);
+        }
+        // The device mask: up to CELL_OSKDIALOG_DEVICE_MASK_PAD.
+        CHECK(a.call("cellOskDialogSetDeviceMask", 0x100) == kOskParamError);
+        CHECK(a.call("cellOskDialogSetDeviceMask", 0xFFFFFFFFu) == kOskParamError);
+        CHECK(a.call("cellOskDialogSetDeviceMask", 0xFF) == 0);
+        CHECK(a.call("cellOskDialogSetDeviceMask", 0) == 0);
+        // The key layout option: the 10-key panel (1), the full keyboard (2), or both.
+        CHECK(a.call("cellOskDialogSetKeyLayoutOption", 0) == kOskParamError);
+        CHECK(a.call("cellOskDialogSetKeyLayoutOption", 4) == kOskParamError);
+        CHECK(a.call("cellOskDialogSetKeyLayoutOption", 0xFFFFFFFFu) == kOskParamError);
+        for (const u32 option : {1u, 2u, 3u}) CHECK(a.call("cellOskDialogSetKeyLayoutOption", option) == 0);
+        // The languages and the layout mode: anything (RPCS3 checks nothing).
+        CHECK(a.call("cellOskDialogAddSupportLanguage", 0) == 0);
+        CHECK(a.call("cellOskDialogAddSupportLanguage", 0xFFFFFFFFu) == 0);
+        CHECK(a.call("cellOskDialogSetLayoutMode", 0x2400) == 0); // centred
+        CHECK(a.call("cellOskDialogSetLayoutMode", 0xFFFFFFFFu) == 0);
+    }
+}
+
+TEST_CASE("cellMsgDialogAbort: closes the dialog cellMsgDialog opened, without its callback; CELL_OK without one",
+    "[hle][sysutil][msgdialog]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    write_log_callback(base);
+    REQUIRE(a.call("cellSysutilRegisterCallback", 0, kLogOpd, 0x5150) == 0);
+    const auto check = [&] { REQUIRE(a.call("cellSysutilCheckCallback") == 0); };
+    const Event begin{0x0121, 0, 0x5150}, end{0x0122, 0, 0x5150}; // DRAWING_BEGIN, DRAWING_END
+
+    // No dialog: CELL_OK all the same, not CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (RPCS3: tested on hardware).
+    CHECK(a.call("cellMsgDialogAbort") == 0);
+    check();
+    CHECK(events(base).empty());
+
+    // A dialog the game opened begins drawing. The abort closes it without its callback (here the log callback too:
+    // an answer would show in the log as a call with userdata 0xD1A1) and ends the drawing.
+    constexpr u32 kTypeOk = 0x21; // CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL | CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK
+    REQUIRE(hle::open_msg_dialog(hle::MsgDialogSource::CellMsgDialog, kTypeOk, "Saving.", kLogOpd, 0xD1A1) == 0);
+    CHECK(hle::open_msg_dialog(hle::MsgDialogSource::CellMsgDialog, kTypeOk, "Again.", kLogOpd, 0xD1A1) == kBusy);
+    check();
+    CHECK(events(base) == std::vector<Event>{begin});
+    CHECK(a.call("cellMsgDialogAbort") == 0);
+    check();
+    CHECK(events(base) == std::vector<Event>{begin, end});
+    CHECK(a.call("cellMsgDialogAbort") == 0); // closed: nothing more happens
+    check();
+    CHECK(events(base) == std::vector<Event>{begin, end});
+
+    // While a system dialog draws, none opens.
+    REQUIRE(hle::sysutil_send_event(hle::CELL_SYSUTIL_DRAWING_BEGIN, 0) == 1);
+    CHECK(hle::open_msg_dialog(hle::MsgDialogSource::CellMsgDialog, kTypeOk, "Saving.", kLogOpd, 0xD1A1) == kBusy);
+    REQUIRE(hle::sysutil_send_event(hle::CELL_SYSUTIL_DRAWING_END, 0) == 1);
+    CHECK(a.call("cellMsgDialogAbort") == 0);
+    CHECK(hle::sysutil_send_event(hle::CELL_SYSUTIL_DRAWING_END, 0) == -1); // nothing draws
+    check();
+    CHECK(events(base) == std::vector<Event>{begin, end, begin, end});
+
+    // A dialog another module opened stays open.
+    REQUIRE(hle::open_msg_dialog(hle::MsgDialogSource::CellSaveData, kTypeOk, "Overwrite?", 0, 0) == 0);
+    CHECK(a.call("cellMsgDialogAbort") == 0);
+    CHECK(hle::open_msg_dialog(hle::MsgDialogSource::CellMsgDialog, kTypeOk, "Saving.", kLogOpd, 0xD1A1) == kBusy);
+    check();
+    CHECK(events(base) == std::vector<Event>{begin, end, begin, end, begin});
+}
+
+TEST_CASE("sys_prx_register_library: CELL_EFAULT outside guest memory, else CELL_OK, logged once at warning",
+    "[hle][prx]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    // A library entry as an executable exports it (ppu_prx_module_info, 0x1c bytes): "testlib", one function.
+    constexpr u32 kEntry = kData + 0x40000, kName = kEntry + 0x40, kNids = kEntry + 0x60, kAddrs = kEntry + 0x70;
+    std::memset(base + kEntry, 0, 0x80);
+    base[kEntry + 0] = 0x1C;           // size
+    ps_write16(base, kEntry + 2, 1);   // version
+    ps_write16(base, kEntry + 4, 0x1); // attributes: a library
+    ps_write16(base, kEntry + 6, 1);   // num_func
+    ps_write32(base, kEntry + 16, kName);
+    ps_write32(base, kEntry + 20, kNids);
+    ps_write32(base, kEntry + 24, kAddrs);
+    std::memcpy(base + kName, "testlib", 8);
+    ps_write32(base, kNids, 0x12345678);
+    ps_write32(base, kAddrs, kData + 0x40100);
+    const std::vector<u8> before(base + kEntry, base + kEntry + 0x80);
+
+    CapturedLog logs;
+    CHECK(a.call("sys_prx_register_library", 0) == r3_of(lv2::CELL_EFAULT));
+    CHECK(a.call("sys_prx_register_library", kUnmapped) == r3_of(lv2::CELL_EFAULT));
+    CHECK(a.call("sys_prx_register_library", kEntry) == 0);
+    CHECK(a.call("sys_prx_register_library", kEntry) == 0);
+    CHECK(std::equal(before.begin(), before.end(), base + kEntry)); // nothing written
+    CHECK(logs.count(log::Level::Warn, "sysPrxForUser", "not registered") == 1);
+    CHECK(logs.count(log::Level::Warn, "sysPrxForUser", "(\"testlib\", attributes 0x1, 1 functions, 0 variables)") ==
+        1);
 }
