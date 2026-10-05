@@ -2384,6 +2384,35 @@ the user), the archive memory of D-143 (found by iOS). The user wants every chan
 - The first gated runs: fps 29.2 to 30, 2 frame jumps (camera cuts), 84 passes a frame, GPU memory 231 MB, process
   memory 1.6 GB.
 
+## D-150 · 2026-10-05 · Route B's go/no-go: GO for development installs. The app writes, signs and runs its own code
+
+Route B (D-147) stands or falls on one question: does iOS map code into the app that was signed after the app was
+installed? Research (LiveContainer's iOS 26 mode, Apple's TN3125/TN3126, XNU's checks) says: very likely yes for a
+development install, with the exact certificate the installed profile lists, the app's team ID in the signature and
+Developer Mode on; no for TestFlight (Apple re-signs the app, and no developer profile vouches for the certificate).
+- **runtime/codesign (new):** a Mach-O writer for a minimal arm64 library made from bytes (`answer_dylib`: one exported
+  function, `mov w0, #42; ret`, an export trie, `LC_BUILD_VERSION`, `LC_CODE_SIGNATURE`), and a signer for any 64-bit
+  Mach-O that has a signature load command: a CodeDirectory (version 0x20400, SHA-256 over 4 KB pages, the team ID, the
+  exec segment), the designated requirement codesign and zsign write for a development certificate, and a detached CMS
+  SignedData (content type data, the certificate chain, the CDHashes and CDHashes2 attributes) in our own DER, signed
+  with RSA PKCS#1 v1.5 SHA-256 through Security.framework. No OpenSSL (zsign's is GPL-incompatible); zsign, ChOma (MIT)
+  and Apple's tools were the reference, nothing copied from ldid or LiveContainer (AGPL).
+- **Checked on the Mac:** Apple's `codesign --verify` accepts the ad hoc signature and the library loads and returns 42;
+  with an identity, codesign reads the team, identifier, CodeDirectory hash and requirement back, and Security.framework's
+  CMS decoder verifies the signature over the CodeDirectory (tests/codesign). `pspocket-codesign` makes and signs
+  libraries on the Mac and exports the Apple Development identity for the phone (`scripts/ios.sh
+  push-signing-identity`: a .p12 under a random password, with its chain; the key is the user's own and never committed).
+- **The probe:** `codegen.dlopen` in the self-test loads every library in Library/Application Support/pspocket-codegen
+  the way LiveContainer does (a fresh copy, `F_ADDFILESIGS_RETURN` with the signature's place, `F_CHECK_LV`, dlopen,
+  dlsym, call) and, with the identity there, writes and signs a library itself and loads that. `scripts/codegen-probe.sh`
+  builds the variants (clang-built and ours, signed by codesign with the app's bundle ID or the default identifier),
+  copies them to the phone, runs the self-test and prints what iOS said.
+- **Result on the iPhone 17 Pro Max, iOS 26, development install (run 091): 4 of 4 libraries ran.** All three signed on
+  the Mac by codesign (both identifiers, and our own Mach-O) and the one the app wrote and signed itself on the phone
+  (team M7XJA39ZV6, the chain WWDR + Apple Root CA): signature registered, library validation passed, dlopen, ps_answer()
+  = 42. Route B goes ahead; games are delivered to the phone by cable or Xcode installs (the development profile), where
+  the app signs what it translates. TestFlight (1c) is checked next; the research expects it to fail.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

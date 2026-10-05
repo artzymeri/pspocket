@@ -63,6 +63,11 @@ targets:
         name: disc
         group: Runtime
         includes: *compiled
+      # Code signing on the device (route B, D-150): the Mach-O writer and signer the codegen.dlopen probe uses.
+      - path: ../../runtime/codesign/src
+        name: codesign
+        group: Runtime
+        includes: *compiled
       # What runs a game (the Game tab, pspocket/platform/game.h): the same components as pspocket-boot on the Mac.
       - path: ../../runtime/spu/src
         name: spu
@@ -152,6 +157,7 @@ targets:
           - $(PSPOCKET_ROOT)/runtime/platform/ios/include
           - $(PSPOCKET_ROOT)/runtime/platform/apple/include
           - $(PSPOCKET_ROOT)/runtime/disc/include
+          - $(PSPOCKET_ROOT)/runtime/codesign/include
           - $(PSPOCKET_ROOT)/runtime/spu/include
           - $(PSPOCKET_ROOT)/runtime/lv2/include
           - $(PSPOCKET_ROOT)/runtime/lv2/src
@@ -221,6 +227,8 @@ targets:
       - sdk: libz.tbd
       # The game's sound (runtime/platform/apple: AVAudioEngine; the audio session in game.mm).
       - sdk: AVFoundation.framework
+      # Signing on the device: the identity and its key (runtime/codesign, D-150).
+      - sdk: Security.framework
     settings:
       base:
         PRODUCT_NAME: PSPocket

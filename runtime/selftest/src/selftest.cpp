@@ -29,6 +29,7 @@ std::span<const Probe> all_probes()
         Probe{"threads.qos", "Single-thread speed per QoS class (performance vs efficiency cores)", probe_threads_qos},
         Probe{"ppu.interp", "PPU interpreter: checksum + recursive fib benchmark, MIPS", probe_ppu_interp},
         Probe{"ppu.lifted", "Lifted PPU code: same benchmark, speedup over the interpreter", probe_ppu_lifted},
+        Probe{"codegen.dlopen", "Libraries made after the app was signed: signed, loaded and run (route B)", probe_codegen_dlopen},
     };
     return probes;
 }

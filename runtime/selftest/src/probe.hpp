@@ -90,6 +90,7 @@ void probe_timebase(ProbeContext&);
 void probe_threads_qos(ProbeContext&);
 void probe_ppu_interp(ProbeContext&); // probes_ppu.cpp
 void probe_ppu_lifted(ProbeContext&);
+void probe_codegen_dlopen(ProbeContext&); // probes_codegen.cpp: route B's go/no-go (D-150)
 
 // True when a debugger is attached (intentional faults would stop in LLDB).
 bool debugger_attached();

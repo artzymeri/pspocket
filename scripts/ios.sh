@@ -52,6 +52,11 @@ Commands:
                              (D-149). build and testflight run it first; --no-gate skips it (say why in the commit).
   pull-log                   Copy the game's log and the one of the launch before (Documents/game.log, game-prev.log)
                              to inventory/phone/logs/. Phone connected and unlocked.
+  push-signing-identity      Export the Apple Development identity the app's profile names from the Mac's keychain
+                             (a .p12 under a random password, with its chain; macOS asks once) into inventory/signing
+                             and copy it to the app's Library/Application Support/pspocket-codegen, for libraries the
+                             app signs itself (route B, D-150). The key is the user's own: it goes to their phone only,
+                             never into the repository.
   session [FILE] [--since HH:MM]
                              Summarise each app session in a device log (default: the newest
                              inventory/phone/live/syslog-*.log): fps, sound, memory, heat, GPU, threads, faults.
@@ -338,6 +343,26 @@ cmd_pull_log() {
             warn "no Documents/$f on the phone"
         fi
     done
+}
+
+cmd_push_signing_identity() {
+    local id dir f
+    id="$(device_id)"
+    require_unlocked "$id"
+    dir="$ROOT/inventory/signing"
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    rm -f "$dir"/identity.p12 "$dir"/identity.pass "$dir"/chain-*.cer
+    say "exporting the Apple Development identity (macOS asks for the keychain password once)"
+    "$HOST_BUILD/runtime/codesign/pspocket-codesign" export-identity "Apple Development" "$dir" >&2 \
+        || die "the identity was not exported"
+    for f in "$dir"/identity.p12 "$dir"/identity.pass "$dir"/chain-*.cer; do
+        [ -f "$f" ] || continue
+        xcrun devicectl device copy to --device "$id" --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+            --source "$f" --destination "Library/Application Support/pspocket-codegen/$(basename "$f")" >/dev/null \
+            || die "could not copy $(basename "$f") to the phone"
+    done
+    say "the signing identity is on the phone (Library/Application Support/pspocket-codegen)"
 }
 
 cmd_session() {
@@ -787,6 +812,7 @@ case "$COMMAND" in
     gate) cmd_gate ;;
     pull-log) cmd_pull_log ;;
     session) cmd_session ;;
+    push-signing-identity) cmd_push_signing_identity ;;
     all)
         cmd_build >/dev/null
         cmd_install
