@@ -24,6 +24,9 @@ struct CompileOptions {
     int opt_level = 2;
 };
 
+// The compiler's name and version ("LLVM 22.1.8"): part of what names a kept object.
+std::string compiler_version();
+
 // LLVM's own options (what `clang -mllvm X` sets), for every compile after this call. They are process-wide: call it
 // before any compile starts, not while one runs.
 bool set_llvm_options(const std::vector<std::string>& options, std::string* diagnostics = nullptr);

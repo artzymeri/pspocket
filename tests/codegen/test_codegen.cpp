@@ -148,3 +148,25 @@ TEST_CASE("codegen: a library linked for iOS has room for its signature")
     CHECK(codesign::sign(bytes, {.identifier = "com.example.codegen"}, &error));
     fs::remove_all(dir);
 }
+
+// pspocket-prepare's first GTA V build: an empty define made "-D" take the next argument ("-fvisibility=hidden") as a
+// macro name, and the file failed. Empty defines and include directories are skipped.
+TEST_CASE("codegen: empty defines and include directories are skipped")
+{
+    const fs::path dir = temp_dir();
+    const fs::path source = dir / "plain.c", object = dir / "plain.o";
+    std::ofstream(source) << "int ps_plain(void) { return 7; }\n";
+    codegen::CompileOptions c;
+    c.target = "arm64-apple-macos13.0";
+    c.cpu = "apple-m1";
+    c.resource_dir = PSPOCKET_CODEGEN_RESOURCE_DIR;
+    c.system_dirs = {std::string(PSPOCKET_CODEGEN_SYSROOT) + "/include"};
+    c.defines = {""};
+    c.include_dirs = {""};
+    c.extra_args = {"-fvisibility=hidden"};
+    std::string diagnostics;
+    const bool compiled = codegen::compile_c(source.string(), object.string(), c, &diagnostics);
+    INFO(diagnostics);
+    CHECK(compiled);
+    fs::remove_all(dir);
+}

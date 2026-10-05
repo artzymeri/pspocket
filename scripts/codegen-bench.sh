@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 bundle=com.artzymeri.pspocket.testhost
 game=${PSPOCKET_BENCH_GAME:-inventory/gta5}
 out=inventory/codegen-bench
-rm -rf $out && mkdir -p $out/stage
+rm -rf $out/stage && mkdir -p $out/stage # only its own files: other runs keep theirs here
 # name, source file, header
 pick=(
   "1-ppu $game/ppu-lifted/game_ppu_100.c $game/ppu-lifted/game_ppu.h"

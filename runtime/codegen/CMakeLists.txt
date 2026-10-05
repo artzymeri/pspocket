@@ -9,7 +9,7 @@ find_package(LLVM REQUIRED CONFIG PATHS ${PSPOCKET_LLVM_DIR}/lib/cmake/llvm NO_D
 find_package(Clang REQUIRED CONFIG PATHS ${PSPOCKET_LLVM_DIR}/lib/cmake/clang NO_DEFAULT_PATH)
 find_package(LLD REQUIRED CONFIG PATHS ${PSPOCKET_LLVM_DIR}/lib/cmake/lld NO_DEFAULT_PATH)
 
-add_library(pspocket_codegen STATIC src/toolchain.cpp)
+add_library(pspocket_codegen STATIC src/toolchain.cpp src/build.cpp)
 target_include_directories(pspocket_codegen PUBLIC include)
 target_include_directories(pspocket_codegen SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS} ${LLD_INCLUDE_DIRS})
 target_compile_options(pspocket_codegen PRIVATE -fno-rtti) # as LLVM is built
@@ -27,4 +27,13 @@ if(NOT IOS)
     add_executable(pspocket-cc tools/pspocket_cc.cpp)
     target_link_libraries(pspocket-cc PRIVATE pspocket::codegen)
     pspocket_set_warnings(pspocket-cc)
+    # And a game library from a game's translated C, as the phone makes it (D-152).
+    add_executable(pspocket-prepare tools/pspocket_prepare.cpp)
+    target_link_libraries(pspocket-prepare PRIVATE pspocket::codegen pspocket::codesign pspocket::game
+        pspocket::recomp_common)
+    # CMake repeats static libraries that other static libraries need; Apple's linker warns about the repeats.
+    target_link_options(pspocket-prepare PRIVATE -Wl,-no_warn_duplicate_libraries)
+    target_compile_definitions(pspocket-prepare PRIVATE PSPOCKET_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+        PSPOCKET_VERSION="${PROJECT_VERSION}")
+    pspocket_set_warnings(pspocket-prepare)
 endif()

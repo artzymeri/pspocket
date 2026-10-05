@@ -19,6 +19,7 @@
 #include <clang/Frontend/CompilerInvocation.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <lld/Common/Driver.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
@@ -73,8 +74,11 @@ bool compile_here(const std::string& source, const std::string& object, const Co
         args.push_back("-isystem");
         args.push_back(d);
     }
-    for (const std::string& d : o.include_dirs) args.push_back("-I" + d);
-    for (const std::string& d : o.defines) args.push_back("-D" + d);
+    // Empty entries are skipped: "-D" alone would take the next argument as the macro.
+    for (const std::string& d : o.include_dirs)
+        if (!d.empty()) args.push_back("-I" + d);
+    for (const std::string& d : o.defines)
+        if (!d.empty()) args.push_back("-D" + d);
     args.insert(args.end(), o.extra_args.begin(), o.extra_args.end());
     const auto argv = pointers(args);
 
@@ -136,6 +140,8 @@ bool compile_c(const std::string& source, const std::string& object, const Compi
 #endif
     return ok;
 }
+
+std::string compiler_version() { return "LLVM " LLVM_VERSION_STRING; }
 
 bool set_llvm_options(const std::vector<std::string>& options, std::string* diagnostics)
 {
