@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-05, after run 080 (D-108). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
+2026-10-05, after run 083 (D-115). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
 onwards matter most now) and the latest `docs/runs/` entries. Keep this file current when the picture changes.
 
 ## The project
@@ -31,7 +31,7 @@ implementation, with no Sony code in the app (D-037).
 | RSX | Portable front end (FIFO methods, state, textures, vertex and fragment programs to MSL with flow control, D-068, D-086, D-089, D-093) and Metal backend (D-032): surfaces and textures over them, GPU conversions of depth buffers and colour targets read as other formats (D-083, D-088, D-097, D-098), frame trace (D-084) |
 | iOS app | Boots the game from the ISO in Files (D-071); full screen; DualShock 4/DualSense or on-screen buttons; runs the lifted SPU programs and recovers from FIFO errors (D-084). Not yet: the translated PPU code |
 
-## GTA V so far (docs/runs 004–080)
+## GTA V so far (docs/runs 004–083)
 
 - Boots from the disc image read in place, through the logos, the Display Calibration screen (a scripted Cross,
   `--press`), "Loading Story Mode" and **into the first mission (the prologue's bank), lit and complete**. With the
@@ -58,7 +58,10 @@ missing, roughly in order:
 1. **A playtest on the iPhone with the translated PPU code**: `scripts/ios.sh` builds it in (D-101); the user
    installs it (`scripts/ios.sh install`, phone connected and unlocked, or `scripts/ios.sh testflight` and the
    TestFlight app when the phone is elsewhere: the user agreed to that on 2026-10-05) and reports the frame rate and
-   what looks wrong. Build 116 (80a9673, through D-110) is in TestFlight as PSPocketTEST since 2026-10-05.
+   what looks wrong. In TestFlight as PSPocketTEST since 2026-10-05 (`scripts/ios.sh testflight`, API key in the
+   environment). The user's first report (build 116): 30 fps, but a stall the first time something happens (shader
+   compiles: D-114) and characters flashing black or red (conditional rendering by stale counts: D-115). Build 125
+   added on-screen sticks; build 128 has both fixes and the Mac's recorded shaders.
 2. **One command per game** (D-101): `scripts/translate-game.sh --iso GAME.iso --elf EBOOT.elf [--ios]` translates
    a game's PPU and SPU code and builds it in; the executable is decrypted with the user's own tools. Next: try it on
    a second game.
