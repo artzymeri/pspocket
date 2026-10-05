@@ -83,6 +83,10 @@ struct BackendStats {
     u64 surfaces_created = 0;
     u64 surface_samples = 0; // texture binds served by a render target
     u64 readbacks = 0;       // GPU-to-CPU surface readbacks (expensive)
+    u64 readback_wait_ns = 0; // the RSX thread's wait for the GPU before them
+    u64 deferred_readbacks = 0; // of the readbacks, those the RSX copied once the GPU had them, without waiting (D-107)
+    u64 deferred_conflicts = 0; // RSX accesses that waited for a deferred copy that touches the same memory
+    u64 gpu_copies = 0;         // NV0039 copies of render targets done on the GPU (D-107)
     u64 depth_conversions = 0; // depth buffers converted on the GPU for a texture that reads them (D-088)
     u64 color_conversions = 0; // colour targets converted on the GPU for a texture of another format (D-098)
     u64 occlusion_reports = 0; // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) answered from the GPU's counters (D-102)
@@ -110,6 +114,12 @@ public:
     void sync() override;
     void invalidate_memory(u32 addr, u32 size) override;
     bool flush_memory(u32 addr, u32 size, const char* why = "a memory read") override;
+    bool copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u32 line_length, u32 line_count) override;
+    bool flush_memory_later(u32 addr, u32 size, u32 write_addr, u32 write_size, std::function<void()> then) override;
+    void defer(u32 addr, u32 size, std::function<void()> action) override;
+    void before_access(u32 addr, u32 size, bool write) override;
+    bool deferring() const override;
+    void run_deferred(bool wait) override;
     void set_zpass_counting(bool on) override;
     void clear_zpass() override;
     bool report_zpass(u32 value_addr) override;

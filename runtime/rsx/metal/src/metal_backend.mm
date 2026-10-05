@@ -339,6 +339,7 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
             unsupported(std::format("colour surface {} at offset {:#x} is not mapped", idx[i], cb.offset));
             continue;
         }
+        before_access(*ea, swizzled ? bpp * width * height : pitch * height, false); // a deferred copy there lands first
         Surface* s = get_color_surface(*ea, pitch, width, height, si.color_format, swizzled);
         if (!s) continue;
         out.rsx_index[out.color_count] = idx[i];
@@ -349,6 +350,7 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
         const u32 dbpp = si.depth_format == 1 ? 2 : 4;
         if (swizzled || si.depth.pitch >= dbpp * width || si.depth.pitch > 64) {
             const auto ea = rsx->translate(si.depth.offset, si.depth.dma == loc::kDmaHostBuffer ? loc::kMain : loc::kLocal);
+            if (ea) before_access(*ea, swizzled ? dbpp * width * height : si.depth.pitch * height, false);
             if (ea) out.depth = get_depth_surface(*ea, si.depth.pitch, width, height, si.depth_format, si.depth_float);
         }
     }
@@ -889,6 +891,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             const u32 bytes = r.count * isize;
             const auto ea = rsx->translate(ia.offset + r.first * isize, ia.location, bytes);
             if (!ea || !guest_ok(*ea, bytes)) return skip(std::format("index array at {:#x} is not mapped", ia.offset));
+            before_access(*ea, bytes, false); // a deferred copy to it lands first (D-107)
             u8* dst = index_data.data + at;
             std::memcpy(dst, mem.host(*ea), bytes);
             for (u32 i = 0; i < r.count; i++) {
@@ -1001,6 +1004,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         }
         vertex_data = transient.alloc(std::max<u32>(total, 16), 16);
         for (const Copy& c : copies) {
+            before_access(c.ea, c.size, false);
             std::memcpy(vertex_data.data + vs.attribs[c.attr].offset, mem.host(c.ea), c.size);
             vs.attribs[c.attr].offset += vertex_data.offset;
         }
@@ -1136,6 +1140,7 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     id<MTLTexture> source = nil;
     if (request.buffer) {
         const u32 ea = PS_MEM_RSX_LOCAL_BASE + request.buffer->offset;
+        before_access(ea, request.buffer->pitch * request.buffer->height, false); // a deferred copy there lands first
         if (Surface* s = find_surface(ea, false); s && !s->cpu_newer) {
             source = s->texture;
         } else if (request.buffer->width && request.buffer->height) {
@@ -1235,6 +1240,7 @@ MetalBackend::~MetalBackend()
         if (impl_->device) impl_->submit(true);
         for (auto& [key, t] : impl_->textures) impl_->tracker.unwatch(t->watch);
         for (auto& [ea, f] : impl_->fragment_programs) impl_->tracker.unwatch(f.watch);
+        for (auto& s : impl_->surfaces) impl_->tracker.unwatch(s->watch);
     }
 }
 
@@ -1280,10 +1286,19 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             if (d) ends += std::format("{}{} {:.1f}", ends.empty() ? "" : ", ", kWhy[i], static_cast<double>(d) / n);
             m.report_pass_ends[i] = m.pass_ends[i];
         }
-        PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {})",
+        PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
+                           "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them",
             m.report_flips, static_cast<double>(gpu - m.report_gpu_ns) / 1e6 / n,
             static_cast<double>(m.stats.draws - m.report_draws) / n,
-            static_cast<double>(m.stats.render_passes - m.report_passes) / n, ends);
+            static_cast<double>(m.stats.render_passes - m.report_passes) / n, ends,
+            static_cast<double>(m.stats.readbacks - m.report_readbacks) / n,
+            static_cast<double>(m.stats.deferred_readbacks - m.report_deferred) / n,
+            static_cast<double>(m.stats.deferred_conflicts - m.report_conflicts) / n,
+            static_cast<double>(m.stats.readback_wait_ns - m.report_readback_ns) / 1e6 / n);
+        m.report_readback_ns = m.stats.readback_wait_ns;
+        m.report_readbacks = m.stats.readbacks;
+        m.report_deferred = m.stats.deferred_readbacks;
+        m.report_conflicts = m.stats.deferred_conflicts;
         m.report_flips = 0;
         m.report_gpu_ns = gpu;
         m.report_draws = m.stats.draws;
@@ -1296,6 +1311,163 @@ void MetalBackend::sync()
     if (!impl_->device) return;
     @autoreleasepool {
         impl_->submit(true);
+        impl_->run_deferred(true);
+    }
+}
+
+void MetalBackend::Impl::end_pass_over(u32 addr, u32 size)
+{
+    // A target of the open pass with only a clear so far (a load action) is not yet newer on the GPU: end the pass so
+    // the clear runs before the target is written back.
+    if (!pass_open) return;
+    const u64 end = u64{addr} + size;
+    bool overlaps = false;
+    const auto check = [&](const Surface* s) { overlaps |= s && u64{s->address} < end && addr < u64{s->address} + s->bytes(); };
+    for (u32 i = 0; i < pass.color_count; i++) check(pass.color[i]);
+    check(pass.depth);
+    if (overlaps) end_pass_for(kEndFlush);
+}
+
+bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u32 line_length, u32 line_count)
+{
+    Impl& m = *impl_;
+    if (!m.device || line_length == 0 || line_count == 0) return false;
+    @autoreleasepool {
+        const u32 src_size = src_pitch * (line_count - 1) + line_length;
+        const u32 dst_size = dst_pitch * (line_count - 1) + line_length;
+        if (u64{src} < u64{dst} + dst_size && dst < u64{src} + src_size) return false; // overlapping: in memory
+        // What is deferred and writes either range lands first (a read of the source, a write of the destination
+        // that must not be overwritten by an older copy).
+        m.before_access(src, src_size, false);
+        m.before_access(dst, dst_size, false);
+        m.end_pass_over(src, src_size);
+        // The source: rows of one colour target newer on the GPU, whole pixels.
+        Surface* s = nullptr;
+        for (auto& c : m.surfaces) {
+            if (c->depth || c->swizzled || c->pitch != src_pitch || src < c->address || src >= c->address + c->bytes()) continue;
+            if (!s || (c->gpu_newer && !c->cpu_newer)) s = c.get();
+        }
+        if (!s || !s->gpu_newer || s->cpu_newer) return false;
+        const u32 bpp = surface_color_bpp(s->gcm_format);
+        const u32 offset = src - s->address, x0_bytes = offset % s->pitch;
+        if (bpp == 0 || x0_bytes % bpp || line_length % bpp) return false;
+        const u32 x0 = x0_bytes / bpp, y0 = offset / s->pitch, w = line_length / bpp, h = line_count;
+        if (x0 + w > s->width || y0 + h > s->height || !m.readback_supported(*s)) return false;
+        // The destination: a target of the same format (the one from the last copy, or a new one). Targets there with
+        // newer contents than guest memory would lose them: those copies go through memory.
+        Surface* d = nullptr;
+        for (auto& c : m.surfaces) {
+            const u32 c_row = c->width * surface_bytes_per_pixel(c->gcm_format, c->depth);
+            if (!surfaces_overlap(dst, dst_pitch, line_length, line_count, c->address, c->pitch, c_row, c->height)) continue;
+            if (c->address == dst && !c->depth && !c->swizzled && c->gcm_format == s->gcm_format && c->width == w &&
+                c->height == h && c->pitch == dst_pitch) {
+                d = c.get();
+            } else if (c->gpu_newer && !c->cpu_newer) {
+                return false;
+            }
+        }
+        if (!d) d = m.get_color_surface(dst, dst_pitch, w, h, s->gcm_format, false);
+        if (!d) return false;
+        m.tracker.unwatch(d->watch); // newer on the GPU again
+        m.end_pass_for(Impl::kEndTargetCopy);
+        id<MTLBlitCommandEncoder> blit = [m.render_buffer() blitCommandEncoder];
+        [blit copyFromTexture:s->texture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(x0, y0, 0)
+                   sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:d->texture
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        d->initialized = true;
+        d->gpu_newer = true;
+        d->cpu_newer = false;
+        d->generation++;
+        d->last_used = m.tick;
+        m.stats.gpu_copies++;
+        // Guest memory gets the copy once the GPU has it, before what the RSX writes after it (a label the CPU waits
+        // for to read it): a deferred readback that writes nothing else, so the GPU's own reads do not wait for it.
+        Impl::Deferred later;
+        later.readbacks.push_back(m.encode_readback(*d));
+        later.readbacks.back().mirror = d->texture;
+        later.readbacks.back().generation = d->generation;
+        later.buffer = m.render_buffer();
+        m.submit(false);
+        m.stats.readbacks++;
+        m.stats.deferred_readbacks++;
+        m.deferred.push_back(std::move(later));
+    }
+    return true;
+}
+
+bool MetalBackend::flush_memory_later(u32 addr, u32 size, u32 write_addr, u32 write_size, std::function<void()> then)
+{
+    Impl& m = *impl_;
+    if (!m.device) return false;
+    @autoreleasepool {
+        m.end_pass_over(addr, size);
+        const u64 end = u64{addr} + size;
+        std::vector<Surface*> newer;
+        for (auto& s : m.surfaces) {
+            if (s->gpu_newer && !s->cpu_newer && u64{s->address} < end && addr < u64{s->address} + s->bytes())
+                newer.push_back(s.get());
+        }
+        // Nothing on the GPU: the copy runs now, unless a queued action touches what it reads or writes (then it queues
+        // behind it, and what reads its destination waits: before_access).
+        if (newer.empty() && !m.deferred_conflict(addr, size, false) && !m.deferred_conflict(write_addr, write_size, true))
+            return false;
+        Impl::Deferred d;
+        d.then = std::move(then);
+        d.read_addr = addr, d.read_size = size, d.write_addr = write_addr, d.write_size = write_size;
+        for (Surface* s : newer) {
+            if (!m.readback_supported(*s)) {
+                m.unsupported(std::format("GPU readback of surface format {}{} is not implemented", s->gcm_format,
+                    s->depth ? " (depth)" : s->swizzled ? " (swizzled)" : ""));
+                continue;
+            }
+            d.readbacks.push_back(m.encode_readback(*s));
+            m.stats.readbacks++;
+            m.stats.deferred_readbacks++;
+        }
+        if (!d.readbacks.empty()) {
+            // Committed now: it completes while the RSX goes on, and waiting for it never commits work half encoded.
+            d.buffer = m.render_buffer();
+            m.submit(false);
+        }
+        m.deferred.push_back(std::move(d));
+    }
+    return true;
+}
+
+void MetalBackend::defer(u32 addr, u32 size, std::function<void()> action)
+{
+    if (impl_->deferred.empty()) {
+        action();
+        return;
+    }
+    Impl::Deferred d;
+    d.then = std::move(action);
+    d.write_addr = addr, d.write_size = size;
+    impl_->deferred.push_back(std::move(d));
+}
+
+bool MetalBackend::deferring() const { return !impl_->deferred.empty(); }
+
+void MetalBackend::before_access(u32 addr, u32 size, bool write)
+{
+    if (impl_->deferred.empty()) return;
+    @autoreleasepool {
+        impl_->before_access(addr, size, write);
+    }
+}
+
+void MetalBackend::run_deferred(bool wait)
+{
+    if (impl_->deferred.empty()) return;
+    @autoreleasepool {
+        impl_->run_deferred(wait);
     }
 }
 
@@ -1331,19 +1503,9 @@ bool MetalBackend::flush_memory(u32 addr, u32 size, const char* why)
     if (!impl_->device) return false;
     bool any = false;
     @autoreleasepool {
+        impl_->before_access(addr, size, false); // a copy queued before this read lands first (D-107)
+        impl_->end_pass_over(addr, size);
         const u64 end = u64{addr} + size;
-        // A target of the open pass with only a clear so far (a load action) is not yet newer on the GPU: end the
-        // pass so the clear runs before the target is written back.
-        Impl& m = *impl_;
-        if (m.pass_open) {
-            bool overlaps = false;
-            const auto check = [&](const Surface* s) {
-                overlaps |= s && u64{s->address} < end && addr < u64{s->address} + s->bytes();
-            };
-            for (u32 i = 0; i < m.pass.color_count; i++) check(m.pass.color[i]);
-            check(m.pass.depth);
-            if (overlaps) m.end_pass_for(Impl::kEndFlush);
-        }
         for (auto& s : impl_->surfaces) {
             if (!s->gpu_newer || s->cpu_newer) continue;
             if (u64{s->address} < end && addr < u64{s->address} + s->bytes()) any |= impl_->write_back(*s, why);

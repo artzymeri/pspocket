@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -195,6 +196,7 @@ private:
 
     // FIFO
     RunStatus step(u64 max_words);
+    RunStatus step_commands(u64 max_words);
     Dispatch dispatch(u32 reg, u32 value);
     void fifo_error(std::string message);
     void publish_get();
@@ -211,6 +213,9 @@ private:
         return ps_bswap32(__atomic_load_n(reinterpret_cast<const u32*>(mem_.base() + ea), __ATOMIC_ACQUIRE));
     }
     void write32(u32 ea, u32 v) { ps_write32(mem_.base(), ea, v); }
+    // The RSX's own label writes queued behind a deferred readback (D-107), oldest first: its semaphore acquires see
+    // them at once, as its pipeline would (the CPU sees them land in order).
+    std::deque<std::pair<u32, u32>> queued_labels_;
     void write_label(u32 ea, u32 value);
 
     // Methods (methods.cpp)

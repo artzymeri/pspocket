@@ -208,6 +208,9 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     }
 
     FragmentProgramEntry& entry = fragment_programs[*ea];
+    // A deferred copy to the program (or its constants, read every draw) lands first (D-107). A program not seen yet:
+    // its first instruction (a copy that writes a program writes its start).
+    before_access(*ea, entry.program.ucode_length ? entry.program.ucode_length : 16, false);
     const u64 epoch = check_epoch();
     const bool redecode = (state.dirty_bits & dirty::kFragmentProgram) || entry.program.instructions.empty() ||
         (entry.checked != epoch && tracker.is_dirty(entry.watch));

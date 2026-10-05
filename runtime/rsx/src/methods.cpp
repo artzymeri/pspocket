@@ -53,7 +53,16 @@ float decode_s16(VertexType type, u16 raw)
 void Rsx::write_label(u32 ea, u32 value)
 {
     if (config_.sync_on_label) backend_.sync();
-    write32(ea, value);
+    if (!backend_.deferring()) {
+        write32(ea, value);
+        return;
+    }
+    // After a deferred readback before it (D-107).
+    queued_labels_.emplace_back(ea, value);
+    backend_.defer(ea, 4, [this, ea, value] {
+        write32(ea, value);
+        queued_labels_.pop_front();
+    });
 }
 
 void Rsx::m_set_reference(u32, u32 value)
@@ -61,7 +70,7 @@ void Rsx::m_set_reference(u32, u32 value)
     // RPCS3 nv406e.cpp set_reference: get is written together with ref.
     if (config_.sync_on_label) backend_.sync();
     publish_get();
-    write32(config_.layout.ref_addr(), value);
+    backend_.defer(config_.layout.ref_addr(), 4, [this, value] { write32(config_.layout.ref_addr(), value); });
 }
 
 void Rsx::m_semaphore_release(u32 reg, u32 value)
@@ -306,9 +315,11 @@ void Rsx::m_get_report(u32 reg, u32 value)
         break;
     }
     if (config_.sync_on_label) backend_.sync();
-    ps_write64(base(), *ea, timestamp_ns());
-    if (!later) write32(*ea + 8, result);
-    write32(*ea + 12, 0);
+    backend_.defer(*ea, 16, [this, e = *ea, later, result] {
+        ps_write64(base(), e, timestamp_ns());
+        if (!later) write32(e + 8, result);
+        write32(e + 12, 0);
+    });
 }
 
 void Rsx::m_clear_report_value(u32 reg, u32 value)
@@ -336,8 +347,10 @@ void Rsx::m_notify(u32, u32)
         return;
     }
     if (config_.sync_on_label) backend_.sync();
-    ps_write64(base(), *ea, timestamp_ns());
-    ps_write64(base(), *ea + 8, 0);
+    backend_.defer(*ea, 16, [this, e = *ea] {
+        ps_write64(base(), e, timestamp_ns());
+        ps_write64(base(), e + 8, 0);
+    });
 }
 
 void Rsx::m_texture_read_semaphore_release(u32, u32 value)
@@ -449,36 +462,51 @@ void Rsx::m_nv0039_buffer_notify(u32 reg, u32)
         return;
     }
 
-    backend_.flush_memory(*src, read_length, "an NV0039 buffer copy");
-    u8* const mem = base();
-    if (in_format == 1 && out_format == 1) {
-        if (static_cast<u32>(in_pitch) == line_length && static_cast<u32>(out_pitch) == line_length) {
-            std::memmove(mem + *dst, mem + *src, read_length);
+    const u32 s_ea = *src, d_ea = *dst;
+    const auto copy = [this, s_ea, d_ea, read_length, write_length, line_length, line_count, in_pitch, out_pitch,
+                          in_format, out_format] {
+        u8* const mem = base();
+        if (in_format == 1 && out_format == 1) {
+            if (static_cast<u32>(in_pitch) == line_length && static_cast<u32>(out_pitch) == line_length) {
+                std::memmove(mem + d_ea, mem + s_ea, read_length);
+            } else {
+                // Overlapping 2D ranges go through a temporary, as RPCS3 does.
+                std::vector<u8> tmp(static_cast<size_t>(line_length) * line_count);
+                for (u32 y = 0; y < line_count; y++) {
+                    std::memcpy(tmp.data() + static_cast<size_t>(y) * line_length, mem + s_ea + y * static_cast<u32>(in_pitch),
+                        line_length);
+                }
+                for (u32 y = 0; y < line_count; y++) {
+                    std::memcpy(mem + d_ea + y * static_cast<u32>(out_pitch), tmp.data() + static_cast<size_t>(y) * line_length,
+                        line_length);
+                }
+            }
         } else {
-            // Overlapping 2D ranges go through a temporary, as RPCS3 does.
+            // Strided byte gather: only the first byte of each column is read and written.
             std::vector<u8> tmp(static_cast<size_t>(line_length) * line_count);
             for (u32 y = 0; y < line_count; y++) {
-                std::memcpy(tmp.data() + static_cast<size_t>(y) * line_length, mem + *src + y * static_cast<u32>(in_pitch), line_length);
+                for (u32 x = 0; x < line_length; x++) {
+                    tmp[static_cast<size_t>(y) * line_length + x] = mem[s_ea + y * static_cast<u32>(in_pitch) + x * in_format];
+                }
             }
             for (u32 y = 0; y < line_count; y++) {
-                std::memcpy(mem + *dst + y * static_cast<u32>(out_pitch), tmp.data() + static_cast<size_t>(y) * line_length, line_length);
+                for (u32 x = 0; x < line_length; x++) {
+                    mem[d_ea + y * static_cast<u32>(out_pitch) + x * out_format] = tmp[static_cast<size_t>(y) * line_length + x];
+                }
             }
         }
-    } else {
-        // Strided byte gather: only the first byte of each column is read and written.
-        std::vector<u8> tmp(static_cast<size_t>(line_length) * line_count);
-        for (u32 y = 0; y < line_count; y++) {
-            for (u32 x = 0; x < line_length; x++) {
-                tmp[static_cast<size_t>(y) * line_length + x] = mem[*src + y * static_cast<u32>(in_pitch) + x * in_format];
-            }
-        }
-        for (u32 y = 0; y < line_count; y++) {
-            for (u32 x = 0; x < line_length; x++) {
-                mem[*dst + y * static_cast<u32>(out_pitch) + x * out_format] = tmp[static_cast<size_t>(y) * line_length + x];
-            }
-        }
+        backend_.invalidate_memory(d_ea, write_length);
+    };
+    // A render target newer on the GPU: copied there (GTA V copies an 80x45 corner of a target into a texture every
+    // frame; waiting for the GPU to read it back cost the RSX thread 9 ms a frame, run 079), or else copied once the
+    // GPU has it, without waiting (D-107).
+    if (in_format == 1 && out_format == 1 && in_pitch > 0 && out_pitch > 0 &&
+        backend_.copy_on_gpu(s_ea, static_cast<u32>(in_pitch), d_ea, static_cast<u32>(out_pitch), line_length, line_count)) {
+        return;
     }
-    backend_.invalidate_memory(*dst, write_length);
+    if (backend_.flush_memory_later(s_ea, read_length, d_ea, write_length, copy)) return;
+    backend_.flush_memory(s_ea, read_length, "an NV0039 buffer copy");
+    copy();
 }
 
 // ---- NV308A image from CPU --------------------------------------------------------------------------------------
@@ -506,6 +534,7 @@ void Rsx::m_nv308a_color(u32 reg, u32 value)
             fifo_error(std::format("NV308A_COLOR: unmapped destination {:#x}", dst_offset));
             return;
         }
+        backend_.before_access(*ea, 4, true);
         write32(*ea, value); // the argument is the pixel in PS3 (big-endian) order
         backend_.invalidate_memory(*ea, 4);
         break;
@@ -521,6 +550,7 @@ void Rsx::m_nv308a_color(u32 reg, u32 value)
         const u32 g = ((value >> 8) & 0xff) * 64 / 255;
         const u32 b = (value & 0xff) * 32 / 255;
         // Stored big-endian, like every 16-bit surface and texture format.
+        backend_.before_access(*ea, 2, true);
         ps_write16(base(), *ea, static_cast<u16>((std::min(r, 31u) << 11) | (std::min(g, 63u) << 5) | std::min(b, 31u)));
         backend_.invalidate_memory(*ea, 2);
         break;
@@ -605,6 +635,7 @@ void Rsx::m_nv3089_image_in(u32 reg, u32 value)
     }
 
     backend_.flush_memory(*src, read_length, "an NV3089 image copy");
+    backend_.before_access(*dst, write_length, true);
     u8* const mem = base();
     std::vector<u8> tmp(static_cast<size_t>(cols) * in_bpp * rows);
     for (u32 y = 0; y < rows; y++) std::memcpy(tmp.data() + static_cast<size_t>(y) * cols * in_bpp, mem + *src + y * in_pitch, cols * in_bpp);

@@ -852,6 +852,37 @@ std::array<u8, 4> guest_pixel(E2E& e, u32 surface_offset, u32 x, u32 y)
 
 } // namespace
 
+TEST_CASE("metal e2e: an NV0039 copy of a render target is deferred, and the label after it lands after it (D-107)")
+{
+    // GTA V copies an 80x45 target out every frame; waiting for the GPU there cost the RSX thread 9 ms a frame. The
+    // copy now lands once the GPU has the target, and what the RSX writes after it (a semaphore here) waits for it.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ff); // blue
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    b.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaFrameBuffer, loc::kDmaHostBuffer});
+    b.method(m::NV0039_OFFSET_IN, {kSurfaceOffset, 0x100000, kW * 4, kW * 4, kW * 4, kH, 0x101});
+    b.method(m::NV0039_BUFFER_NOTIFY, 0);
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 65 * 0x10);
+    b.method(m::NV406E_SEMAPHORE_RELEASE, 7);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle); // an idle FIFO runs what was deferred
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().deferred_readbacks == 1);
+    CHECK(ps_read32(e.mem.base(), e.config.layout.label_addr(65)) == 7);
+    const u8* p = e.mem.host(E2E::kReadbackEa + 48 * kW * 4 + 32 * 4);
+    CHECK(std::array<u8, 4>{p[0], p[1], p[2], p[3]} == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
+}
+
 TEST_CASE("metal e2e: clear, upload programs, draw a triangle, read back through NV0039")
 {
     REQUIRE_METAL();
@@ -897,8 +928,7 @@ TEST_CASE("metal e2e: clear, upload programs, draw a triangle, read back through
     CHECK(main_pixel(32, 10) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // near the apex (top)
     CHECK(main_pixel(2, 2) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
     CHECK(main_pixel(60, 5) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
-    // The surface memory itself was written back too.
-    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
+    CHECK(st.gpu_copies == 1); // copied on the GPU, then read back (D-107): the surface's own memory is not written
 
     std::vector<u8> rgba;
     u32 w = 0, h = 0;
@@ -1143,6 +1173,170 @@ void bind_linear_texture(CommandBuilder& b, u32 offset, u32 format, u32 pitch)
 }
 
 } // namespace
+
+namespace {
+
+// Surface B: black, with a green triangle; then NV0039 copies `line_length` bytes of each of its rows to kTexOffset
+// (local), and surface A samples kTexOffset as a linear A8R8G8B8 texture with the same triangle. Returns where the
+// commands end.
+u32 copy_target_then_sample(E2E& e, u32 line_length)
+{
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0x00ff00ff, 0x00ff00ff, 0x00ff00ff}); // green
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceB);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    b.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaFrameBuffer, loc::kDmaFrameBuffer});
+    b.method(m::NV0039_OFFSET_IN, {kSurfaceB, kTexOffset, kW * 4, kW * 4, line_length, kH, 0x101});
+    b.method(m::NV0039_BUFFER_NOTIFY, 0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_linear_texture(b, kTexOffset, tex::A8R8G8B8, kW * 4);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    return b.offset();
+}
+
+} // namespace
+
+TEST_CASE("metal e2e: an NV0039 copy of a render target into a texture is done on the GPU, and its draw waits for nothing (D-107)")
+{
+    // GTA V copies an 80x45 corner of a float target into a texture every frame and samples it: reading the target
+    // back for that cost the RSX thread 9 ms a frame (run 079).
+    REQUIRE_METAL();
+    E2E e;
+    const u32 end = copy_target_then_sample(e, kW * 4);
+    const auto& st = e.backend->stats();
+    CHECK(st.gpu_copies == 1);
+    CHECK(st.deferred_conflicts == 0);
+    CHECK(st.surface_samples == 1); // the copy's destination was sampled on the GPU
+    CHECK(st.textures_decoded == 0);
+    // Guest memory got the copy too, once the GPU had it.
+    CHECK(ps_read32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kTexOffset + 48 * kW * 4 + 32 * 4) == 0xff00ff00);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // B's green
+
+    // The CPU writes the destination after that: the texture over it reads guest memory, not the GPU's copy.
+    for (u32 i = 0; i < kW * kH; i++) e.put_local32(kTexOffset + i * 4, 0xff0000ff); // blue
+    auto c = e.at(end);
+    c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    draw_triangle(c);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.backend->stats().textures_decoded == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the CPU's blue
+}
+
+TEST_CASE("metal e2e: the RSX's own semaphore release queued behind a readback satisfies its acquire at once (D-107)")
+{
+    // GTA V releases a semaphore after its per-frame copy and acquires it itself: waiting for the GPU there cost 9 ms
+    // a frame. Its pipeline sees its own release at once; the CPU sees it land after the copy.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0x00ff00ff, 0x00ff00ff, 0x00ff00ff});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceB);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    b.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaFrameBuffer, loc::kDmaFrameBuffer});
+    b.method(m::NV0039_OFFSET_IN, {kSurfaceB, kTexOffset, kW * 4, kW * 4, kW * 4, kH, 0x101});
+    b.method(m::NV0039_BUFFER_NOTIFY, 0);
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 66 * 0x10);
+    b.method(m::NV406E_SEMAPHORE_RELEASE, 5);
+    b.method(m::NV406E_SEMAPHORE_ACQUIRE, 5);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle); // not blocked on the acquire
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().gpu_copies == 1);
+    CHECK(e.backend->stats().deferred_conflicts == 0);
+    CHECK(e.backend->stats().draws == 2);
+    CHECK(ps_read32(e.mem.base(), e.config.layout.label_addr(66)) == 5);
+}
+
+TEST_CASE("metal e2e: a draw that samples the destination of a deferred NV0039 copy waits for the copy (D-107)")
+{
+    // A copy the GPU cannot do (rows of 254 bytes: not whole pixels) is deferred until the GPU has the target; a
+    // texture over its destination is read after it lands, not before.
+    REQUIRE_METAL();
+    E2E e;
+    copy_target_then_sample(e, kW * 4 - 2);
+    const auto& st = e.backend->stats();
+    CHECK(st.gpu_copies == 0);
+    CHECK(st.deferred_readbacks == 1);
+    CHECK(st.deferred_conflicts == 1); // the texture bind waited for the copy
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // B's green
+}
+
+TEST_CASE("metal e2e: copies that touch nothing deferred run at once; a write over a deferred copy lands after it (D-107)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0x00ff00ff, 0x00ff00ff, 0x00ff00ff}); // green
+    // CPU data in main memory (IO 0x180000): blue pixels.
+    constexpr u32 kCpuData = E2E::kReadbackEa + 0x80000;
+    for (u32 i = 0; i < kW * kH; i++) ps_write32(e.mem.base(), kCpuData + i * 4, 0xff0000ff);
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceB);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    // Surface B to main memory: deferred.
+    b.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaFrameBuffer, loc::kDmaHostBuffer});
+    b.method(m::NV0039_OFFSET_IN, {kSurfaceB, 0x100000, kW * 4, kW * 4, kW * 4, kH, 0x101});
+    b.method(m::NV0039_BUFFER_NOTIFY, 0);
+    // The CPU data to kTexOffset: touches nothing deferred, so it runs now, and the draw that samples it does not wait.
+    b.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaHostBuffer, loc::kDmaFrameBuffer});
+    b.method(m::NV0039_OFFSET_IN, {0x180000, kTexOffset, kW * 4, kW * 4, kW * 4, kH, 0x101});
+    b.method(m::NV0039_BUFFER_NOTIFY, 0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_linear_texture(b, kTexOffset, tex::A8R8G8B8, kW * 4);
+    draw_triangle(b);
+    // NV308A over the first copy's destination: the copy lands first, the pixel after it.
+    b.method(m::NV3062_SET_CONTEXT_DMA_IMAGE_DESTIN, loc::kDmaHostBuffer);
+    b.method(m::NV3062_SET_COLOR_FORMAT, {10, ((kW * 4) << 16) | (kW * 4), 0, 0x100000});
+    b.method(m::NV308A_POINT, {0, 1, 1});
+    b.method(m::NV308A_COLOR, 0x11223344);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().deferred_readbacks == 1);
+    CHECK(e.backend->stats().deferred_conflicts == 1); // only the NV308A write waited
+    CHECK(ps_read32(e.mem.base(), E2E::kReadbackEa) == 0x11223344);
+    const u8* p = e.mem.host(E2E::kReadbackEa + 48 * kW * 4 + 32 * 4);
+    CHECK(std::array<u8, 4>{p[0], p[1], p[2], p[3]} == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // B's green
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the CPU's blue
+}
 
 TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")
 {

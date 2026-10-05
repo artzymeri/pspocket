@@ -1607,6 +1607,43 @@ keeps the conversion snapshot (D-105); bit reinterpretations (A8R8G8B8 over Z24S
 - Tests: a shadow lookup on a Z16 depth buffer with LEQUAL and GREATER, no conversion, no readback; the earlier depth
   tests now count no conversion for DEPTH16.
 
+## D-107 · 2026-10-05 · NV0039 copies of render targets on the GPU; readbacks that do not stop the RSX
+
+Every frame of the first mission, GTA V copies an 80x45 corner of a float target (320 wide) into a packed texture in
+local memory with NV0039, then samples it. The copy read the whole target back first and the RSX thread waited for the
+GPU: 9.3 ms a frame (run 079).
+- **On the GPU** (`copy_on_gpu`): a byte copy whose source rows are whole pixels of one colour target newer on the GPU,
+  at the target's own pitch, is a blit into a target of the same format at the destination, reused frame to frame.
+  Textures over the destination sample it directly. Depth or swizzled targets, overlapping ranges, and destinations
+  over other targets with GPU-only contents go through memory as before.
+- **Guest memory still gets it** (the CPU may read it after a label): the destination is blitted into a staging buffer
+  in a command buffer committed at once, and written to guest memory once that completes. The RSX polls for that at
+  every FIFO step and while it waits, so it does not wait itself. The destination is then no longer newer on the GPU,
+  and its memory is watched: a CPU write afterwards makes the texture read guest memory again.
+- Copies the GPU path declines that still read targets newer on the GPU are deferred the same way: the readback first,
+  then the copy itself (`flush_memory_later`).
+- **Order**: what the RSX writes to guest memory after a deferred item (labels, semaphores, the reference, reports,
+  notifies) queues behind it (`defer`). The CPU sees them land after the copy, as it sees the RSX's pipeline reach them.
+  The RSX's own semaphore acquires see its queued releases at once, as its pipeline would: GTA V releases one after the
+  copy and acquires it itself.
+- **Hazards**: every RSX access to guest memory outside the queue checks the queued items (`before_access`). Reads
+  (textures, vertex and index arrays, fragment programs and their constants, render targets, the displayed buffer) are
+  checked against what the queued items write. Writes (NV308A, the NV3089 destination, synchronous write-backs) are also
+  checked against what they read and write back. A conflict runs the queue up to the last conflicting item, waiting for
+  the GPU; it is counted, and the first 16 are logged. A copy that touches nothing queued runs at once.
+- Run 079: one readback a frame (the copy's), no access waited, **0.00 ms waiting instead of 9.3**; GPU 16 to 17 ms;
+  30 fps; same frames. A first version deferred the copy without the hazard checks and also showed 0 ms, but its
+  texture was sampled before the copy had landed. The checks caught that (1.75 waits a frame), which led to the GPU copy.
+- Tests:
+  - A GPU copy is sampled without waiting, and a CPU write afterwards is read from memory.
+  - A copy the GPU path declines (254-byte rows) is waited for by the texture over it.
+  - A label lands after a deferred copy.
+  - A copy that touches nothing queued runs at once, and an NV308A write over a deferred destination lands after it.
+  - The RSX's own release satisfies its acquire at once.
+- Not covered: CPU writes to render targets (as opposed to copy destinations) are still not seen. Commands that an RSX
+  copy writes into the FIFO are not ordered against deferred copies. Conditional rendering reads report values as they
+  are (D-102).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -252,10 +252,15 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     }
     const TextureFormatInfo* fmt = texture_format_info(t.base_format());
     bind_source = "memory";
+    if (!deferred.empty()) {
+        // A deferred copy to this texture lands first (D-107).
+        if (const auto layout = compute_texture_layout(t)) before_access(*ea, layout->total_size, false);
+    }
 
     // A render target at this address: sample the GPU copy (plan section 7: "bind the Metal texture directly") when
     // the texture reads it in its own format.
     Surface* s = find_surface(*ea, false);
+    if (s) check_cpu_writes(*s);
     std::array<u8, 4> src = fmt ? texture_channel_sources(*fmt, t.remap) : std::array<u8, 4>{0, 1, 2, 3};
     if (s && !s->cpu_newer && fmt) {
         const auto sf = static_cast<SurfaceColorFormat>(s->gcm_format);

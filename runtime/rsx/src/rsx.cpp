@@ -147,7 +147,11 @@ Rsx::Rsx(GuestMemory& mem, Backend& backend, Config config)
     backend_.attach(*this);
 }
 
-Rsx::~Rsx() { stop(); }
+Rsx::~Rsx()
+{
+    stop();
+    backend_.run_deferred(true); // what is queued writes guest memory through this object (D-107)
+}
 
 void Rsx::start()
 {
@@ -162,6 +166,7 @@ void Rsx::stop()
     stop_requested_.store(true, std::memory_order_release);
     notify();
     thread_.join();
+    backend_.run_deferred(true); // the CPU may look at what the RSX wrote last (D-107)
 }
 
 void Rsx::notify()
@@ -366,10 +371,20 @@ void Rsx::fifo_error(std::string message)
 Rsx::RunStatus Rsx::run_until_idle(u64 max_words)
 {
     PS_CHECK(!thread_.joinable());
-    return step(max_words);
+    const RunStatus status = step(max_words);
+    if (status != RunStatus::Budget) backend_.run_deferred(true); // what the caller may look at next (D-107)
+    return status;
 }
 
 Rsx::RunStatus Rsx::step(u64 max_words)
+{
+    // Deferred readbacks and what follows them (D-107): what the GPU has finished runs first. The thread keeps running
+    // them while it waits for commands (wait_for_work), without waiting for the GPU.
+    backend_.run_deferred(false);
+    return step_commands(max_words);
+}
+
+Rsx::RunStatus Rsx::step_commands(u64 max_words)
 {
     if (fifo_reset_.load(std::memory_order_acquire)) {
         const u64 gp = pending_get_put_.load(std::memory_order_acquire);
@@ -501,6 +516,10 @@ bool Rsx::semaphore_acquire_satisfied(u32 value)
             std::format("NV406E_SEMAPHORE_ACQUIRE: bad semaphore offset {:#x} (dma {:#x})", offset, dma));
         return true;
     }
+    // The RSX's own release still queued behind a deferred readback (D-107): the newest one is what its pipeline sees.
+    for (auto it = queued_labels_.rbegin(); it != queued_labels_.rend(); ++it) {
+        if (it->first == *ea) return it->second == value;
+    }
     return read32_acquire(*ea) == value; // what the releaser wrote before the value is visible after it (D-077)
 }
 
@@ -527,6 +546,7 @@ void Rsx::wait_for_work(RunStatus why)
     auto backoff = std::chrono::microseconds(config_.min_wait_us);
     const auto max_backoff = std::chrono::microseconds(config_.max_wait_us);
     while (!blocked_condition_cleared()) {
+        backend_.run_deferred(false); // a label the CPU waits for may be behind a deferred readback (D-107)
         std::unique_lock lock(wake_mutex_);
         wake_cv_.wait_for(lock, backoff, [this] { return wake_pending_; });
         wake_pending_ = false;

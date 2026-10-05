@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-05, after run 069 (D-099). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
+2026-10-05, after run 079 (D-107). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
 onwards matter most now) and the latest `docs/runs/` entries. Keep this file current when the picture changes.
 
 ## The project
@@ -31,7 +31,7 @@ implementation, with no Sony code in the app (D-037).
 | RSX | Portable front end (FIFO methods, state, textures, vertex and fragment programs to MSL with flow control, D-068, D-086, D-089, D-093) and Metal backend (D-032): surfaces and textures over them, GPU conversions of depth buffers and colour targets read as other formats (D-083, D-088, D-097, D-098), frame trace (D-084) |
 | iOS app | Boots the game from the ISO in Files (D-071); full screen; DualShock 4/DualSense or on-screen buttons; runs the lifted SPU programs and recovers from FIFO errors (D-084). Not yet: the translated PPU code |
 
-## GTA V so far (docs/runs 004–069)
+## GTA V so far (docs/runs 004–079)
 
 - Boots from the disc image read in place, through the logos, the Display Calibration screen (a scripted Cross,
   `--press`), "Loading Story Mode" and **into the first mission (the prologue's bank), lit and complete**.
@@ -43,8 +43,8 @@ implementation, with no Sony code in the app (D-037).
   cap; "Loading Story Mode" about 20. On the iPhone (before the PPU translation): about 6 fps, pink, no people
   (fixed since on the Mac: D-086, D-088, D-093).
 - Graphics (D-078 to D-098): deferred lighting, post-processing, skinned characters, shadow maps; depth buffers and
-  colour targets read as other formats convert on the GPU. One 80x45 target is still read back each frame (an NV0039
-  copy the game asks for).
+  colour targets read as other formats convert on the GPU. The 80x45 corner the game copies out of a target each frame
+  is copied on the GPU, and guest memory gets it without the RSX waiting (D-107). GPU time 16 to 17 ms a frame.
 - Sound through AVAudioEngine, time-stretched to the game's pace (D-072 to D-075).
 
 ## Right now
@@ -61,8 +61,8 @@ missing, roughly in order:
 3. **RSX**: the first mission logs one failure (MSAA rendered with one sample, D-102); shadow lookups (D-100),
    occlusion queries, conditional rendering and 3D textures (D-102) run. Still refused when a game uses them: fragment
    CAL/BEM, vertex BRB/CLB, compressed 3D textures.
-4. The per-frame 80x45 readback (make it asynchronous), the FIFO desync seen once in run 055 (the app recovers),
-   sound pace on the phone.
+4. The FIFO desync seen once in run 055 (the app recovers), sound pace on the phone, and GPU time: 8 target copies
+   and 69 target changes a frame (run 077).
 
 ## Building and running GTA V on the Mac
 

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -89,6 +90,8 @@ struct Surface {
         std::unordered_map<u32, id<MTLTexture>> views;
     };
     std::unordered_map<u32, Conversion> conversions;
+    // A copy's destination (D-107), once guest memory has the copy: a CPU write after that makes guest memory newer.
+    WriteTracker::Watch watch{};
     u32 bytes() const { return pitch * height; }
 };
 
@@ -224,7 +227,8 @@ struct MetalBackend::Impl {
         end_pass();
         pass_end_reason = kEndOther;
     }
-    u64 report_flips = 0, report_draws = 0, report_passes = 0, report_gpu_ns = 0;
+    u64 report_flips = 0, report_draws = 0, report_passes = 0, report_gpu_ns = 0, report_readback_ns = 0;
+    u64 report_readbacks = 0, report_deferred = 0, report_conflicts = 0;
     __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
     u32 visibility_next = 0;
     bool zpass_on = false;
@@ -301,6 +305,42 @@ struct MetalBackend::Impl {
     bool read_back(Surface& s, std::vector<u8>& raw, bool stencil = false); // raw texture bytes, tightly packed
     bool write_back(Surface& s, const char* why);     // to guest memory, in the surface's format
     bool write_back_depth(Surface& s, const char* why);
+
+    // Deferred readbacks (D-107): a surface's texels blitted into staging buffers in a render buffer committed at once,
+    // written to guest memory once it has completed, then an action of the RSX's; later actions queue behind them.
+    struct SurfaceImage { // what a write-back needs of a surface (the surface itself may be gone by then)
+        u32 address = 0, pitch = 0, width = 0, height = 0, gcm_format = 0;
+        bool depth = false;
+        MTLPixelFormat pixel_format = MTLPixelFormatInvalid;
+    };
+    struct Readback {
+        SurfaceImage image;
+        __strong id<MTLBuffer> data = nil;    // the texels, rows packed
+        __strong id<MTLBuffer> stencil = nil; // Z24S8: the stencil, rows packed
+        // A GPU copy's destination (copy_on_gpu): unless written again since (generation), it is no longer newer than
+        // guest memory once this lands, and its memory is watched for the CPU's writes.
+        __strong id<MTLTexture> mirror = nil;
+        u64 generation = 0;
+    };
+    struct Deferred {
+        std::vector<Readback> readbacks;
+        __strong id<MTLCommandBuffer> buffer = nil; // the committed buffer with the blits; nil: nothing to wait for
+        std::function<void()> then;
+        u32 read_addr = 0, read_size = 0;   // what `then` reads (an NV0039 source)
+        u32 write_addr = 0, write_size = 0; // what `then` writes
+    };
+    std::deque<Deferred> deferred;
+    bool readback_supported(const Surface& s);
+    Readback encode_readback(Surface& s);
+    void store_readback(const Readback& r);
+    // The RSX reads [addr, addr + size) (or samples or renders to a surface there), or with `write` writes it: the
+    // queued actions up to the last one that touches it run first, waiting for the GPU. A read conflicts with what
+    // they write; a write also with what they read and with the surfaces they write back.
+    usize deferred_conflict(u32 addr, u32 size, bool write) const; // how many queued actions must run first
+    void before_access(u32 addr, u32 size, bool write);
+    void run_deferred(bool wait, usize count = ~usize{0});
+    void end_pass_over(u32 addr, u32 size); // a target there with only a clear so far: its pass ends (it is newer then)
+    void check_cpu_writes(Surface& s);      // a watched copy destination the CPU wrote since: guest memory is newer
     void upload_surface_from_guest(Surface& s);
     void remove_surface(Surface* s);
     id<MTLTexture> copy_texture(id<MTLTexture> src);
