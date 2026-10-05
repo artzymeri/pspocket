@@ -4,26 +4,33 @@ Oct 3, 2026 · @Frrinci
 
 ## 1. Goal and scope
 
-Build a per-game static recompiler that turns a PS3 game's code into a native, signed iOS app, starting with GTA IV.
-Target: a locked 30 fps at native 1152×640, upscaled with MetalFX, on A18 Pro-class iPhones and M-series iPads.
+**The goal since 2026-10-05 (D-147, route B):** the user picks any PS3 game's disc image on the iPhone and plays it,
+with no Mac and no app rebuild per game. Install pspocket once; pick the PS3 firmware file (PS3UPDAT.PUP, the user's
+own download from Sony) once; pick a game. The first time, the phone translates that game's PPU and SPU code to ARM64
+ahead of time ("Preparing game…", a few minutes), signs it with the user's development certificate and saves it as a
+library the app loads; later launches start at once. Each game is measured against a "Flawless" bar
+(docs/compatibility.md). Target: the game's own frame rate (30 or 60 fps) at native 1152×640, upscaled with MetalFX,
+on A18 Pro-class iPhones and M-series iPads.
 
-The method in one line: game code is translated to C on a Mac ahead of time and compiled into the app. At runtime the
-app only reads assets from the user's own ISO.
+The method in one line: game code is translated ahead of time, once per game, on the phone itself (the same lifters
+the Mac uses, D-092 and D-076), compiled to a signed library and loaded at run time; the interpreters are the oracle
+and the fallback. Until 2026-10-05 the translation ran on a Mac and was compiled into the app (D-036, D-090): that
+path stays as the developer's test tool, and GTA V's Mac-translated build keeps working throughout.
 
 ### Goals
 
-- PPU and SPU code recompiled ahead of time to ARM64. No JIT, and no interpreter on the hot path.
-- A runtime that reimplements the PS3 kernel (lv2), the firmware modules the game imports, SPU execution, and RSX to
-  Metal rendering.
-- One iOS app per game: pick ISO, verify hash, extract assets, play.
-- A shared toolchain and runtime, so a second game costs a fraction of the first.
+- PPU and SPU code recompiled ahead of time to ARM64, on the phone, once per game. No interpreter on the hot path;
+  code found only at run time is interpreted, recorded (D-117) and translated in the background for the next launch.
+- A runtime that reimplements the PS3 kernel (lv2), the firmware modules games import (HLE), SPU execution, and RSX to
+  Metal rendering; the real firmware modules from the user's PUP (LLE) for what the HLE does not cover.
+- One app for every game: pick the ISO, prepare, play.
+- A shared toolchain and runtime with no title checks, so each new game costs a fraction of the first.
 
 ### Non-goals
 
-- A generic PS3 emulator or a "load any ISO" app.
-- On-device recompilation or JIT. iOS code signing forbids running native code that wasn't signed at build time.
 - Online play, trophies, PSN features.
-- Distributing game code, assets or keys in any form.
+- Distributing game code, firmware, assets or keys in any form.
+- JIT while playing: only if route B proves impossible (route A, a debugger-attach JIT enabler; D-147).
 
 ### Honest framing
 
@@ -41,8 +48,10 @@ These are fixed by the platform and the law. Every design choice below follows f
 
 ### iOS platform
 
-- **No JIT.** All CPU code must be compiled into the signed app. Code the build didn't capture can only run in a slow
-  interpreter fallback.
+- **No JIT.** Code may only run once it is signed. Route B (D-147): the app compiles a game's code ahead of play into
+  a library, signs it on the phone with the user's development certificate (the technique LiveContainer uses) and
+  loads it with dlopen; whether iOS allows this for a development install, and for TestFlight, is stage 1's go/no-go
+  test. Code no library covers runs in the interpreters until the next preparation.
 - **GPU code is the exception.** Compiling Metal shaders at runtime is allowed, so shader translation can happen on
   device, backed by a precompiled cache.
 - **Memory.** The runtime reserves a 4 GB guest address space. That needs the

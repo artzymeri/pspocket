@@ -2303,6 +2303,36 @@ the frames back (docs/improve.md). thread_cpu_report (pspocket::core) lists, eve
 per-thread times (THREAD_EXTENDED_INFO); the iPhone app's and pspocket-boot's status lines log it. Elsewhere it is
 empty.
 
+## D-147 · 2026-10-05 · Route B: the iPhone translates any game itself, once per game; supersedes D-036 and D-090
+
+The user's goal is any PS3 disc image picked on the iPhone, played with no Mac and no rebuild per game. Until now the
+design was one Mac-side build per game (D-036, D-090: the lifters write C, Xcode compiles it into the app). After
+Assassin's Creed (BLES00158) failed on the phone while GTA V (BLES01807) runs, the user rejected that as the answer for
+"any ISO" (2026-10-05) and chose route B over route A (JIT while playing, through a debugger-attach JIT enabler such
+as StikDebug), which stays the fallback if B proves impossible.
+- **The flow:** install pspocket once; pick PS3UPDAT.PUP (the user's own download from Sony) once; pick a game. The
+  first time, "Preparing game…": the phone decrypts the EBOOT (D-121), runs the lifters, compiles their output to
+  ARM64, links it into a library, signs it with the user's development certificate and saves it; then the game boots
+  with that library loaded (dlopen). Later launches load the saved library. Code met only at run time (SPU programs,
+  mostly) runs in the interpreters, is recorded (D-117) and translated in the background for the next launch.
+- **What stays (most of the code):** the runtime (rsx, lv2, spu, ppu with the interpreters as oracle and fallback,
+  hle, native SPURS of D-037), recomp/common, the lifters and their analysis, the app. The Mac path (`ppu-lift`,
+  `scripts/translate-game.sh`, `PSPOCKET_GAME_PPU/SPU`) stays as the developer's tool, and GTA V's Mac-translated build
+  keeps working throughout.
+- **What is new:** the translation as a per-game file loaded at run time; code generation on the phone; signing on the
+  phone; firmware from the PUP with the real firmware modules (LLE) for what the HLE does not implement; the coverage
+  loop on the phone.
+- **Stages,** each ending with tests, a commit, a decision and a run note: 1 a go/no-go test (a tiny ARM64 library the
+  app writes, signs and loads, for a development install and for TestFlight; if both fail, stop and take route A);
+  2 code generation chosen by measurement (embedded LLVM compiling the lifters' C, or a direct ARM64 emitter); 3 the
+  translation as a library, on the Mac first; 4 the on-phone pipeline; 5 firmware and PRX loading; 6 acceptance
+  (Assassin's Creed to its title screen and GTA V to the prologue's bank, both prepared on the phone).
+- **The bar:** each game is rated against "Flawless" (its own frame rate for a full session, PS3-accurate graphics,
+  sound in time, saves that persist, an hour with no crash) in docs/compatibility.md: Flawless, Playable, Boots or
+  Broken; GTA V and every Flawless game are re-checked after each change (the gate, D-149).
+- Rule 1 holds: translated code, decrypted executables, firmware and logs stay on the phone or in inventory/. The
+  development certificate's key is the user's own and goes to their phone only, never into the repository.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
