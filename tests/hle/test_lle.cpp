@@ -119,6 +119,35 @@ TEST_CASE("LLE: a PRX placed in main memory, relocated, its exports read and its
     CHECK(ps_read32(base, slot0 + 4) == asked.at({"sysPrxForUser", recomp::nid_of("_sys_printf")}));
 }
 
+TEST_CASE("LLE: a module's variables: exported, and imported through their reference tables", "[hle][lle]")
+{
+    hle::test::Fixture f;
+    test::PrxOptions o;
+    o.variables = true;
+    const auto x = test::build_ppu_prx(o);
+    loader::PrxModule m;
+    std::string error;
+    std::map<std::pair<std::string, u32>, int> asked;
+    REQUIRE(loader::load_prx(
+        x.bytes, *f.hle, [](std::string_view, u32) { return 0x00ABC000u; }, &m, &error,
+        [&](std::string_view library, u32 nid) {
+            asked[{std::string(library), nid}]++;
+            return 0x00DEF000u;
+        }));
+    INFO(error);
+    REQUIRE(m.segments.size() == 2);
+    const u32 seg1 = m.segments[1].first;
+    u8* base = f.base();
+    const auto var = m.variables.find({"synthPrxLib", test::kPrxVariableNid});
+    REQUIRE(var != m.variables.end());
+    CHECK(var->second == seg1 + 0x60);
+    CHECK(ps_read32(base, var->second) == test::kPrxVariableValue);
+    CHECK(asked.size() == 1);
+    CHECK(asked.count({"synthVarLib", test::kPrxVariableNid}) == 1);
+    CHECK(m.variables_linked == 1);
+    CHECK(ps_read32(base, seg1 + 0xC0) == 0x00DEF000u); // the reference got the variable's address
+}
+
 TEST_CASE("LLE: the firmware's modules indexed; a library goes LLE only when the host has nothing of its module",
     "[hle][lle]")
 {
@@ -148,6 +177,34 @@ TEST_CASE("LLE: the firmware's modules indexed; a library goes LLE only when the
     std::string error;
     CHECK_FALSE(none.index(&error));
     CHECK_FALSE(error.empty());
+    fs::remove_all(root);
+}
+
+TEST_CASE("LLE: a module's imported variable comes from the module that exports it, loaded for it", "[hle][lle]")
+{
+    const fs::path root = fresh_flash("pspocket-test-lle-variables");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    test::PrxOptions o;
+    o.variables = true;
+    const auto x = test::build_ppu_prx(o);
+    // libvar exports synthVarLib (its variable too); libsynth exports synthLib and imports synthVarLib's variable.
+    write(external / "libvar.sprx", debug_self(prx_exporting(x, "synthVarLib", 0x11111111)));
+    write(external / "libsynth.sprx", debug_self(prx_exporting(x, "synthLib", 0xDEADBEEF)));
+    hle::test::Fixture f;
+    loader::LleModules lle((root / "dev_flash").string());
+    REQUIRE(lle.index());
+    std::string error;
+    const loader::PrxModule* synth = lle.load("synthLib", *f.hle, &error);
+    INFO(error);
+    REQUIRE(synth != nullptr);
+    REQUIRE(lle.loaded().size() == 2);
+    const loader::PrxModule* var = lle.loaded()[1].get();
+    CHECK(var->file == "libvar.sprx");
+    const auto exported = var->variables.find({"synthVarLib", test::kPrxVariableNid});
+    REQUIRE(exported != var->variables.end());
+    CHECK(synth->variables_linked == 1);
+    CHECK(ps_read32(f.base(), synth->segments[1].first + 0xC0) == exported->second);
+    CHECK(ps_read32(f.base(), exported->second) == test::kPrxVariableValue);
     fs::remove_all(root);
 }
 

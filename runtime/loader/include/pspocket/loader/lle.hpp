@@ -36,6 +36,7 @@ struct PrxModule {
     u32 start = 0, stop = 0;                              // module_start, module_stop descriptors (0: none)
     u32 relocations = 0;                                  // applied
     u32 relocation_errors = 0;                            // out of their segments, or of a type RPCS3 lacks too
+    u32 variables_linked = 0;                             // its imported variables found in other modules
 };
 
 class LleModules {
@@ -75,8 +76,10 @@ private:
 
 // Places a decrypted PRX (an ELF) in main memory and links it: segments, relocations (the SCE_PPURELA program
 // header's entries, RPCS3's types 1, 4, 5, 6, 10, 11, 38, 44, 57), exports, and its imports through `link` (library,
-// NID -> descriptor; 0 leaves the slot as it is, with an error logged).
+// NID -> descriptor; 0 leaves the slot as it is, with an error logged) and `link_variable` (library, NID -> the
+// variable's address, whose references are then patched; none: variables stay unlinked, logged).
 bool load_prx(std::span<const u8> elf, hle::HleProcess& hle,
-    const std::function<u32(std::string_view library, u32 nid)>& link, PrxModule* out, std::string* error);
+    const std::function<u32(std::string_view library, u32 nid)>& link, PrxModule* out, std::string* error,
+    const std::function<u32(std::string_view library, u32 nid)>& link_variable = {});
 
 } // namespace pspocket::loader

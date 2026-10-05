@@ -617,7 +617,7 @@ SyntheticPpuExec build_ppu_exec(const PpuExecOptions& options)
 
 // ---- PPU PRX ----
 
-SyntheticPrx build_ppu_prx()
+SyntheticPrx build_ppu_prx(const PrxOptions& options)
 {
     // LOAD0 (R-X): file 0x100, vaddr 0, 0x700 bytes. LOAD1 (RW-): file 0x800, vaddr 0x1000, filesz 0x200, memsz 0x300.
     // Every pointer is left 0 in the file and filled by PT_SCE_PPURELA relocations, so the parse only succeeds
@@ -653,6 +653,12 @@ SyntheticPrx build_ppu_prx()
     b.put32(s0(0x308), nid_of("synthPrxFunc"));
     b.put32(s0(0x310), nid_of("sys_lwmutex_lock"));
     b.put32(s0(0x314), nid_of("_sys_printf"));
+    if (options.variables) {
+        b.put32(s0(0x30C), kPrxVariableNid); // synthPrxLib's variable, after its function
+        b.put32(s0(0x318), kPrxVariableNid); // synthVarLib's, imported
+        b.put_str(s0(0x220), "synthVarLib");
+        b.put32(kSeg1Off + 0x60, kPrxVariableValue);
+    }
 
     LibEntry mgmt;
     mgmt.attributes = 0x8000;
@@ -661,11 +667,18 @@ SyntheticPrx build_ppu_prx()
     LibEntry lib;
     lib.attributes = 0x0001;
     lib.num_func = 1;
+    lib.num_var = options.variables ? 1 : 0;
     lib_entry(b, s0(0x42C), lib);
     LibEntry stub;
     stub.attributes = 0x0009;
     stub.num_func = 2;
     lib_entry(b, s0(0x480), stub);
+    if (options.variables) {
+        LibEntry vstub;
+        vstub.attributes = 0x0009;
+        vstub.num_var = 1;
+        lib_entry(b, s0(0x4AC), vstub);
+    }
 
     // Module info (RPCS3 ppu_prx_library_info) at seg0 + 0x600.
     b.put16(s0(0x600), 0x0000);
@@ -694,7 +707,7 @@ SyntheticPrx build_ppu_prx()
     rel(0, 0x624, 0, 1, 0x400);  // exports start/end
     rel(0, 0x628, 0, 1, 0x458);
     rel(0, 0x62C, 0, 1, 0x480);  // imports start/end
-    rel(0, 0x630, 0, 1, 0x4AC);
+    rel(0, 0x630, 0, 1, options.variables ? 0x4D8 : 0x4AC);
     rel(0, 0x414, 0, 1, 0x300);  // libent[0]: NIDs, addresses
     rel(0, 0x418, 1, 1, 0x040);
     rel(0, 0x43C, 0, 1, 0x200);  // libent[1]: name, NIDs, addresses
@@ -712,6 +725,15 @@ SyntheticPrx build_ppu_prx()
     rel(1, 0x48, 1, 1, 0x10);
     rel(1, 0x80, 0, 1, 0x100); // stub table -> stub code
     rel(1, 0x84, 0, 1, 0x120);
+    if (options.variables) {
+        rel(1, 0x4C, 1, 1, 0x60);   // synthPrxLib's variable address
+        rel(0, 0x4BC, 0, 1, 0x220); // libstub[1]: name, variable NIDs, variable reference tables
+        rel(0, 0x4C8, 0, 1, 0x318);
+        rel(0, 0x4CC, 0, 1, 0x31C);
+        rel(0, 0x31C, 1, 1, 0xA0);  // its reference table: {ADDR32 at segment 1 + 0xC0, addend 0}, then the end
+        b.put32(kSeg1Off + 0xA0, 1);
+        rel(1, 0xA4, 1, 1, 0xC0);
+    }
     rel(0, 0x102, 1, 6, 0x80); // lis r12, slot@ha
     rel(0, 0x106, 1, 4, 0x80); // lwz r12, slot@l(r12)
     rel(0, 0x6F0, 0xFF, 1, 0x12345678); // absolute ADDR32
@@ -736,7 +758,7 @@ SyntheticPrx build_ppu_prx()
     x.exports_start = 0x400;
     x.exports_end = 0x458;
     x.imports_start = 0x480;
-    x.imports_end = 0x4AC;
+    x.imports_end = options.variables ? 0x4D8 : 0x4AC;
     x.module_start_descriptor = kSeg1Vaddr;
     x.module_start_code = 0x0;
     x.prx_func_code = 0x80;

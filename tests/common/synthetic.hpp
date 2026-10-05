@@ -113,7 +113,15 @@ struct SyntheticPrx {
     u32 out_of_range_relocations = 0;
 };
 
-SyntheticPrx build_ppu_prx();
+struct PrxOptions {
+    // synthPrxLib also exports a variable (kPrxVariableNid at segment 1 + 0x60, holding kPrxVariableValue), and the
+    // module imports that NID from library "synthVarLib" through a reference table that patches segment 1 + 0xC0.
+    bool variables = false;
+};
+inline constexpr u32 kPrxVariableNid = 0x5EED0001;
+inline constexpr u32 kPrxVariableValue = 0xC0FFEE01;
+
+SyntheticPrx build_ppu_prx(const PrxOptions& options = {});
 
 // ---- SELF wrapper ----
 

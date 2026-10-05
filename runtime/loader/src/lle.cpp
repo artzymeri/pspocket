@@ -18,6 +18,7 @@
 #include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/ppu_module.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
+#include "refs.hpp"
 
 namespace pspocket::loader {
 namespace {
@@ -27,6 +28,8 @@ constexpr std::string_view kChan = "lle";
 
 constexpr u32 kSceRelocations = 0x700000A4; // PT_SCE_PPURELA
 constexpr u32 kLibraryEntrySize = 0x2C;     // sizeof(ppu_prx_module_info), when an entry's size byte is 0
+
+using Linker = std::function<u32(std::string_view library, u32 nid)>;
 
 bool read_file(const fs::path& p, std::vector<u8>& out)
 {
@@ -178,23 +181,42 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
     return true;
 }
 
-// Imports (ppu_load_imports: the same entries, with nids and addrs the functions' NIDs and stub slots): each slot
-// gets the linked descriptor.
-void link_imports(std::pair<u32, u32> imports, hle::HleProcess& hle, const PrxModule& module,
-    const std::function<u32(std::string_view, u32)>& link)
+// Imports (ppu_load_imports: the same entries, nids and addrs the functions' NIDs and stub slots, vnids and vstubs the
+// variables' NIDs and reference tables): each slot gets the linked descriptor; with attribute 0x2000 a function's own
+// reference table follows its NIDs; each variable's references get its address.
+void link_imports(std::pair<u32, u32> imports, hle::HleProcess& hle, PrxModule& module, const Linker& link,
+    const Linker& link_variable)
 {
-    u8* base = hle.kernel().base();
+    GuestMemory& mem = hle.kernel().memory();
+    u8* base = mem.base();
     for (u32 at = imports.first; at < imports.second;) {
         const u8 size = ps_read8(base, at);
+        const u16 attributes = ps_read16(base, at + 4);
         const u16 num_func = ps_read16(base, at + 6), num_var = ps_read16(base, at + 8);
         const std::string library = guest_string(base, ps_read32(base, at + 0x10));
         const u32 nids = ps_read32(base, at + 0x14), slots = ps_read32(base, at + 0x18);
+        const u32 vnids = ps_read32(base, at + 0x1C), vstubs = ps_read32(base, at + 0x20);
         for (u32 i = 0; i < num_func; i++) {
             const u32 nid = ps_read32(base, nids + 4 * i);
-            if (const u32 descriptor = link(library, nid)) ps_write32(base, slots + 4 * i, descriptor);
-            else PS_LOG_ERROR(kChan, "{}: its import {}::{:#010x} is not linked", module.name, library, nid);
+            const u32 descriptor = link(library, nid);
+            if (!descriptor) {
+                PS_LOG_ERROR(kChan, "{}: its import {}::{:#010x} is not linked", module.name, library, nid);
+                continue;
+            }
+            ps_write32(base, slots + 4 * i, descriptor);
+            if (attributes & 0x2000)
+                if (const u32 refs = ps_read32(base, nids + 4 * (num_func + i)))
+                    patch_refs(mem, refs, descriptor, std::format("{}: {}::{:#010x}", module.name, library, nid));
         }
-        if (num_var) PS_LOG_ERROR(kChan, "{}: {} imported variables of {} are not linked", module.name, num_var, library);
+        for (u32 i = 0; i < num_var; i++) {
+            const u32 nid = ps_read32(base, vnids + 4 * i), refs = ps_read32(base, vstubs + 4 * i);
+            if (const u32 addr = link_variable ? link_variable(library, nid) : 0) {
+                patch_refs(mem, refs, addr, std::format("{}: variable {}::{:#010x}", module.name, library, nid));
+                module.variables_linked++;
+            } else {
+                PS_LOG_ERROR(kChan, "{}: its imported variable {}::{:#010x} is not linked", module.name, library, nid);
+            }
+        }
         at += size ? size : kLibraryEntrySize;
     }
 }
@@ -302,19 +324,28 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
     // Known before its imports are linked, so modules that import from each other find each other.
     PrxModule* m = module.get();
     loaded_.push_back(std::move(module));
-    link_imports(imports, hle, *m, [&](std::string_view library, u32 nid) -> u32 {
-        if (chooses(library)) {
-            std::string dep_error;
-            if (const PrxModule* dep = load(library, hle, &dep_error)) {
-                const auto it = dep->functions.find({std::string(library), nid});
-                if (it != dep->functions.end()) return it->second;
-                PS_LOG_ERROR(kChan, "{} imports {}::{:#010x}, which {} does not export", m->name, library, nid, dep->file);
-            } else {
-                PS_LOG_ERROR(kChan, "{} needs {}: {}", m->name, library, dep_error);
-            }
+    // From a firmware module the host does not replace (loaded now if need be), else the host's stub; variables only
+    // from firmware modules (the host exports none).
+    const auto from_module = [&](std::string_view library, u32 nid, bool variable) -> u32 {
+        if (!chooses(library)) return 0;
+        std::string dep_error;
+        const PrxModule* dep = load(library, hle, &dep_error);
+        if (!dep) {
+            PS_LOG_ERROR(kChan, "{} needs {}: {}", m->name, library, dep_error);
+            return 0;
         }
-        return hle.link_function(library, nid, {});
-    });
+        const auto& exports = variable ? dep->variables : dep->functions;
+        const auto it = exports.find({std::string(library), nid});
+        if (it != exports.end()) return it->second;
+        PS_LOG_ERROR(kChan, "{} imports {}::{:#010x}, which {} does not export", m->name, library, nid, dep->file);
+        return 0;
+    };
+    link_imports(imports, hle, *m,
+        [&](std::string_view library, u32 nid) -> u32 {
+            if (const u32 d = from_module(library, nid, false)) return d;
+            return hle.link_function(library, nid, {});
+        },
+        [&](std::string_view library, u32 nid) { return from_module(library, nid, true); });
     if (m->start) starts_.push_back(m->start);
     PS_LOG_INFO(kChan, "{} ({}): {} segments at {:#x}, {} relocations ({} bad), {} functions exported, module_start {:#x}",
         m->name, file, m->segments.size(), m->segments.empty() ? 0 : m->segments[0].first, m->relocations,
@@ -323,7 +354,7 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
 }
 
 bool load_prx(std::span<const u8> elf_bytes, hle::HleProcess& hle, const std::function<u32(std::string_view, u32)>& link,
-    PrxModule* out, std::string* error)
+    PrxModule* out, std::string* error, const std::function<u32(std::string_view, u32)>& link_variable)
 {
     auto elf = recomp::ElfFile::parse(elf_bytes);
     if (!elf) {
@@ -336,7 +367,7 @@ bool load_prx(std::span<const u8> elf_bytes, hle::HleProcess& hle, const std::fu
         if (error) *error = why;
         return false;
     }
-    link_imports(imports, hle, *out, link);
+    link_imports(imports, hle, *out, link, link_variable);
     return true;
 }
 

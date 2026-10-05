@@ -128,7 +128,8 @@ int usage()
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
-        "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--async-shaders MS]\n"
+        "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
+        "                     [--async-shaders MS]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n");
     return 64;
 }
@@ -664,6 +665,7 @@ int main(int argc, char** argv)
     bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the app's way)
     bool lle_on = true;                // --no-lle: no firmware modules even with --flash (D-157)
     std::vector<std::string> lle_force; // --lle LIBRARY: that library from its firmware module whatever the host has
+    std::vector<std::string> lle_load;  // --lle-load LIBRARY: its module (and theirs) loaded and started at boot
     bool frame_jumps = false;
     std::string summary_path;
     const auto add_press = [&](std::string_view spec) {
@@ -684,6 +686,7 @@ int main(int argc, char** argv)
         else if (a == "--flash") { const char* v = value(); if (!v) return usage(); flash = v; }
         else if (a == "--no-lle") lle_on = false;
         else if (a == "--lle") { const char* v = value(); if (!v) return usage(); lle_force.emplace_back(v); }
+        else if (a == "--lle-load") { const char* v = value(); if (!v) return usage(); lle_load.emplace_back(v); }
         else if (a == "--app-home") { const char* v = value(); if (!v) return usage(); app_home = v; }
         else if (a == "--timeout") { const char* v = value(); if (!v) return usage(); timeout_s = std::atof(v); }
         else if (a == "--report-every") {
@@ -951,7 +954,26 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "pspocket-boot: load failed: %s\n", lv2::error_name(r));
         return 70;
     }
-    if (lle) state.module_starts = lle->starts();
+    // Modules the game does not import, loaded anyway (testing the firmware's code under pspocket, D-157).
+    for (const std::string& library : lle_load) {
+        std::string why;
+        if (!lle) {
+            std::fprintf(stderr, "pspocket-boot: --lle-load needs --flash with firmware modules\n");
+            return 64;
+        }
+        const loader::PrxModule* m = lle->load(library, hle, &why);
+        if (!m) {
+            std::fprintf(stderr, "pspocket-boot: --lle-load %s: %s\n", library.c_str(), why.c_str());
+            return 70;
+        }
+    }
+    if (lle) {
+        state.module_starts = lle->starts();
+        for (const auto& m : lle->loaded())
+            PS_LOG_INFO("boot", "firmware module {} ({}): {} functions, {} variables exported, {} imported variables "
+                                "linked, {} relocations ({} bad)", m->name, m->file, m->functions.size(),
+                m->variables.size(), m->variables_linked, m->relocations, m->relocation_errors);
+    }
     if (list_imports) {
         print_imports(hle);
         return 0;

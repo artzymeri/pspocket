@@ -14,6 +14,7 @@
 #include "pspocket/core/memory_map.h"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/loader/lle.hpp"
+#include "refs.hpp"
 #include "pspocket/recomp/guest_image.hpp"
 #include "pspocket/recomp/nid.hpp"
 
@@ -24,6 +25,8 @@ constexpr std::string_view kChan = "loader";
 
 constexpr u64 align_up(u64 v, u64 a) { return (v + a - 1) & ~(a - 1); }
 constexpr u64 align_down(u64 v, u64 a) { return v & ~(a - 1); }
+
+} // namespace
 
 // RPCS3 ppu_patch_refs: a reference table of {type, addr, addend} entries ending with type 0.
 void patch_refs(GuestMemory& mem, u32 table, u32 value, std::string_view what)
@@ -55,6 +58,8 @@ void patch_refs(GuestMemory& mem, u32 table, u32 value, std::string_view what)
         }
     }
 }
+
+namespace {
 
 // Writes `text` (NUL-terminated) at addr, returns the next 16-byte aligned address (RPCS3 aligns each string to 16).
 u32 put_string(u8* base, u32 addr, const std::string& text)
