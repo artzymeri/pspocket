@@ -19,7 +19,8 @@
 // (D-076; game data: keep it in inventory/). A build configured with -DPSPOCKET_GAME_SPU=OUT runs the programs lifted
 // into OUT natively; the rest are interpreted, and the run ends with how many loads were which.
 // --press presses a button of the virtual controller during the run (repeatable; pspocket/hle/pad_script.hpp):
-// cross@60 holds Cross from 60 s for 0.25 s, cross@60+10 again every 10 s, start@30:1.5 holds Start for 1.5 s.
+// cross@60 holds Cross from 60 s for 0.25 s, cross@60+10 again every 10 s, start@30:1.5 holds Start for 1.5 s,
+// ls-up@100:5 pushes the left stick up (forward) for 5 s (ls-/rs- up, down, left, right).
 // A host fault inside guest memory (an access to an unmapped guest address) is reported with the guest address and
 // the faulting PPU thread's instruction address before the process dies (CLAUDE.md rule 5).
 // A run that ends at its timeout, or on such a fault, prints the thread report (lv2/report.hpp): every PPU thread's

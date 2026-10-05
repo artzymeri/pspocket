@@ -80,3 +80,4 @@ the raw text the test host writes (`scripts/ios.sh report`). No game data appear
 | [075](075-gta5-rsx-thread-mac.md) | 2026-10-05 | 8666ca9+ | M4 Mac, pspocket-boot, sample | The RSX thread's texture hashing and the render thread's yields (D-104): 2.2 cores at 30 fps |
 | [077](077-gta5-gpu-passes-mac.md) | 2026-10-05 | 4f08184+ | M4 Mac, pspocket-boot | GPU time per frame and pass endings: **17.8 ms instead of 23.5** (D-105) |
 | [079](079-gta5-readbacks-mac.md) | 2026-10-05 | 3b537de+ | M4 Mac, pspocket-boot | The per-frame NV0039 copy on the GPU: **the RSX thread waits 0 ms instead of 9.3** (D-107) |
+| [080](080-gta5-mission-mac.md) | 2026-10-05 | 3a3e3fb+ | M4 Mac, pspocket-boot, sticks | Walking, the phone and the charge in the first mission; **no SPU code interpreted** after five lift rounds (D-108) |

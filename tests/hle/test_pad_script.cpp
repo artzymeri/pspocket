@@ -64,3 +64,21 @@ TEST_CASE("pad script: the controller state is every press that is down", "[hle]
     CHECK(later.digital2 == 0x02); // R2
     CHECK(later.pressure[11] == 255);
 }
+
+TEST_CASE("pad script: stick directions push one axis all the way while they are down")
+{
+    std::vector<PadPress> presses;
+    for (const char* text : {"ls-up@1:2", "rs-right@1.5", "cross@1"}) presses.push_back(*parse_pad_press(text));
+    const PadInput rest = pad_state_at(presses, 0.5);
+    CHECK(rest.left_y == 128);
+    CHECK(rest.right_x == 128);
+    const PadInput walking = pad_state_at(presses, 1.6);
+    CHECK(walking.left_y == 0);   // up
+    CHECK(walking.left_x == 128); // the other axis stays at rest
+    CHECK(walking.right_x == 255);
+    CHECK(walking.digital1 == 0);
+    CHECK(walking.digital2 == 0); // cross was let go at 1.25 s
+    const PadInput later = pad_state_at(presses, 3.5);
+    CHECK(later.left_y == 128);
+    CHECK_FALSE(parse_pad_press("ls-forward@1").has_value());
+}

@@ -16,9 +16,11 @@ struct ButtonInfo {
     std::string_view name;
     u16 digital1, digital2;
     int pressure; // PadInput::pressure: right, left, up, down, triangle, circle, cross, square, L1, R1, L2, R2
+    int axis = -1; // a stick direction (PadPress::axis)
+    u8 axis_value = 128;
 };
 
-constexpr std::array<ButtonInfo, 16> kButtons{{
+constexpr std::array<ButtonInfo, 24> kButtons{{
     {"left", 0x80, 0, 1},
     {"down", 0x40, 0, 3},
     {"right", 0x20, 0, 0},
@@ -35,6 +37,14 @@ constexpr std::array<ButtonInfo, 16> kButtons{{
     {"l1", 0, 0x04, 8},
     {"r2", 0, 0x02, 11},
     {"l2", 0, 0x01, 10},
+    {"rs-left", 0, 0, -1, 0, 0},
+    {"rs-right", 0, 0, -1, 0, 255},
+    {"rs-up", 0, 0, -1, 1, 0},
+    {"rs-down", 0, 0, -1, 1, 255},
+    {"ls-left", 0, 0, -1, 2, 0},
+    {"ls-right", 0, 0, -1, 2, 255},
+    {"ls-up", 0, 0, -1, 3, 0},
+    {"ls-down", 0, 0, -1, 3, 255},
 }};
 
 // A non-negative decimal number, the whole of `s`. strtod rather than std::from_chars: the iOS app targets iOS 17,
@@ -78,6 +88,8 @@ std::optional<PadPress> parse_pad_press(std::string_view text, std::string* erro
     p.digital1 = info->digital1;
     p.digital2 = info->digital2;
     p.pressure = info->pressure;
+    p.axis = info->axis;
+    p.axis_value = info->axis_value;
 
     std::string_view rest = text.substr(at + 1);
     if (const usize colon = rest.find(':'); colon != std::string_view::npos) {
@@ -107,6 +119,10 @@ PadInput pad_state_at(const std::vector<PadPress>& presses, double t)
         in.digital1 = static_cast<u16>(in.digital1 | p.digital1);
         in.digital2 = static_cast<u16>(in.digital2 | p.digital2);
         if (p.pressure >= 0) in.pressure[p.pressure] = 255;
+        if (p.axis >= 0) {
+            u8* const axes[4] = {&in.right_x, &in.right_y, &in.left_x, &in.left_y};
+            *axes[p.axis] = p.axis_value;
+        }
     }
     return in;
 }

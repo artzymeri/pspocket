@@ -343,6 +343,27 @@ TEST_CASE("immediate vertex attributes decode every SET_VERTEX_DATA format")
     CHECK(f.backend.events.empty()); // no draw outside BEGIN/END
 }
 
+TEST_CASE("an invalid BEGIN_END primitive keeps the last one, as in RPCS3, and is not a failure")
+{
+    // GTA V sends primitive 36 now and then in its first mission (run 080).
+    Fixture f;
+    auto b = f.at(0);
+    b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::TriangleStrip));
+    b.method(m::NV4097_DRAW_ARRAYS, (3u << 24) | 0);
+    b.method(m::NV4097_SET_BEGIN_END, 0);
+    b.method(m::NV4097_SET_BEGIN_END, 36);
+    b.method(m::NV4097_DRAW_ARRAYS, (2u << 24) | 8);
+    b.method(m::NV4097_SET_BEGIN_END, 0);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(f.failures.empty());
+    const auto draws = f.backend.of(Kind::Draw);
+    REQUIRE(draws.size() == 2);
+    CHECK(draws[1]->draw.primitive == Primitive::TriangleStrip);
+    REQUIRE(draws[1]->draw.ranges.size() == 1); // only its own vertices
+    CHECK(draws[1]->draw.ranges[0].first == 8);
+    CHECK(draws[1]->draw.ranges[0].count == 3);
+}
+
 TEST_CASE("draw clauses: arrays, indexed, inline arrays, array elements and immediate mode")
 {
     Fixture f;

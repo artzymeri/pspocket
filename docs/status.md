@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-05, after run 079 (D-107). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
+2026-10-05, after run 080 (D-108). Read this first in a new session, then `CLAUDE.md`, `docs/decisions.md` (D-076
 onwards matter most now) and the latest `docs/runs/` entries. Keep this file current when the picture changes.
 
 ## The project
@@ -31,10 +31,12 @@ implementation, with no Sony code in the app (D-037).
 | RSX | Portable front end (FIFO methods, state, textures, vertex and fragment programs to MSL with flow control, D-068, D-086, D-089, D-093) and Metal backend (D-032): surfaces and textures over them, GPU conversions of depth buffers and colour targets read as other formats (D-083, D-088, D-097, D-098), frame trace (D-084) |
 | iOS app | Boots the game from the ISO in Files (D-071); full screen; DualShock 4/DualSense or on-screen buttons; runs the lifted SPU programs and recovers from FIFO errors (D-084). Not yet: the translated PPU code |
 
-## GTA V so far (docs/runs 004–079)
+## GTA V so far (docs/runs 004–080)
 
 - Boots from the disc image read in place, through the logos, the Display Calibration screen (a scripted Cross,
-  `--press`), "Loading Story Mode" and **into the first mission (the prologue's bank), lit and complete**.
+  `--press`), "Loading Story Mode" and **into the first mission (the prologue's bank), lit and complete**. With the
+  sticks scripted too (D-108), Michael walks through the bank, sets off the charge with the phone and reaches the vault
+  corridor at 30 fps, with no SPU code interpreted (run 080).
 - **Translated ahead of time**: all 85,376 PPU functions of the executable (`ppu-lift`, D-092 to D-096, 133 jump tables
   including the script VM's) and all 88 SPU programs and modules SPURS and the tasks load (`scripts/lift-spu.sh`, D-076,
   D-081, D-085, D-087, D-099). The interpreters only run what the translation has not reached yet, and log it as a seed

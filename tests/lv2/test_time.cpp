@@ -51,11 +51,12 @@ TEST_CASE("lv2 time: usleep(0) back to back sleeps a little after a run of yield
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 40; i++) REQUIRE(c.call(kUsleep, 0) == CELL_OK);
     CHECK(elapsed_ms(t0) >= 4);
-    // A pause longer than that between two of them: a plain yield again.
+    // A pause longer than that between two of them: a plain yield again (the thread's state, not a time: a loaded
+    // machine can take milliseconds over a yield).
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < 4; i++) REQUIRE(c.call(kUsleep, 0) == CELL_OK);
-    CHECK(elapsed_ms(t0) < 2);
+    REQUIRE(c.call(kUsleep, 0) == CELL_OK);
+    CHECK(c.thread->yield_streak == 0);
+    CHECK(c.thread->yield_backoff_us == 0);
 }
 
 TEST_CASE("lv2 timer: periodic and one-shot timers send to their event queue", "[lv2][timer]")

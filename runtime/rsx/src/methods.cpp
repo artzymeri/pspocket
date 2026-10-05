@@ -2,6 +2,7 @@
 // nv308a.cpp, nv3089.cpp and rsx_methods.cpp (flip, user command, driver flip/queue); each handler names its source.
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <format>
 #include <vector>
@@ -94,15 +95,23 @@ void Rsx::m_semaphore_release(u32 reg, u32 value)
 
 // ---- NV4097 draws -----------------------------------------------------------------------------------------------
 
-void Rsx::m_begin_end(u32 reg, u32 value)
+void Rsx::m_begin_end(u32, u32 value)
 {
     // RPCS3 nv4097.cpp set_begin_end (upper bits ignored)
     const u32 prim = value & 0xff;
     if (prim != 0) {
         if (prim > static_cast<u32>(Primitive::Polygon)) {
-            fail(FailKind::Unsupported, reg, std::format("NV4097_SET_BEGIN_END: invalid primitive {}", prim));
+            // As RPCS3: a warning, and the draw keeps the primitive it had (GTA V sends 36 once in a while in the first
+            // mission, run 080).
+            static std::atomic<u32> warned{0};
+            if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
+                PS_LOG_WARN(kChan, "NV4097_SET_BEGIN_END: invalid primitive {} (argument {:#x}): the last one is kept",
+                    prim, value);
+            }
+            state_.draw.reset(state_.draw.primitive);
+        } else {
+            state_.draw.reset(static_cast<Primitive>(prim));
         }
-        state_.draw.reset(prim <= 10 ? static_cast<Primitive>(prim) : Primitive::Points);
         state_.in_begin_end = true;
         return;
     }

@@ -1644,6 +1644,25 @@ GPU: 9.3 ms a frame (run 079).
   copy writes into the FIFO are not ordered against deferred copies. Conditional rendering reads report values as they
   are (D-102).
 
+## D-108 · 2026-10-05 · Playing further on the Mac: stick input, the SPU code the mission reaches, invalid primitives
+
+- **Sticks for `--press`**: the pseudo-buttons ls-up, ls-down, ls-left, ls-right and rs-up ... rs-right push one stick
+  axis all the way while they are held (`pad_script`). A scripted run now walks Michael through the bank, brings up the
+  phone (up), calls (Cross), sets off the charge, and reaches the alarm-lit vault corridor (run 080).
+- **SPU coverage by runs, as designed** (D-076, D-099): each run's misses and the images it saves (`--spu-dump`) go into
+  the next `scripts/lift-spu.sh`. Five rounds took the session from 586 million interpreted SPU instructions (and 4.3
+  billion in the round where the charge brought 27 new images) to none.
+- **Tried and dropped**: treating `ila` offsets in position-independent SPU code as function entries (the offset of a
+  callback, then an add of where the job was loaded). It found real callbacks, but some candidates were data. Lifted as
+  code, they marked data words as lifted instructions; a job's DMA into its own buffers then counted as overwriting
+  lifted code (D-085), dropped the job's program, and the binary was interpreted for the rest of the run: 54.6 billion
+  instructions, 10 fps. Entry points come only from the code's own branches and calls, absolute constants, and what
+  runs actually entered. The lift was redone from every log, without them.
+- **NV4097_SET_BEGIN_END with an invalid primitive** (GTA V sends 36 now and then in the mission): a warning, and the
+  draw keeps the primitive it had, as RPCS3 (`set_begin_end`); not a failure. It drew points before.
+- Test: the D-104 yield test checks the thread's backoff state instead of a 2 ms bound, which a loaded machine
+  overran.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
