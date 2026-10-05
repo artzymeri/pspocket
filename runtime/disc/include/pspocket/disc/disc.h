@@ -4,6 +4,8 @@
 #ifndef PSPOCKET_DISC_H
 #define PSPOCKET_DISC_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -23,6 +25,13 @@ typedef void (*ps_disc_callback)(void* user, const char* line);
  * Returns 0 on success, 1 if the image can't be read as a PS3 disc, 2 if it is disc-encrypted, 3 on I/O errors.
  */
 int ps_disc_extract_executables(const char* image_path, const char* out_dir, ps_disc_callback callback, void* user);
+
+/*
+ * Decrypts the disc's executable (PS3_GAME/USRDIR/EBOOT.BIN, a SELF) into the ELF it carries at elf_path (its folder is
+ * made), with the keys the build carries (D-121): on the phone, so any disc picked there can boot. Returns 0 on
+ * success; otherwise 1 and the reason in error.
+ */
+int ps_disc_decrypt_executable(const char* image_path, const char* elf_path, char* error, size_t error_size);
 
 #ifdef __cplusplus
 }

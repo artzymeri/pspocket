@@ -17,7 +17,9 @@ struct GameView: View {
             GameLayerView(screen: game.screen)
                 .aspectRatio(1152.0 / 640.0, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
-            if let problem = game.problem {
+            if game.decrypting {
+                ProgressView("Decrypting the game's EBOOT.BIN…").font(.footnote)
+            } else if let problem = game.problem {
                 Text(problem).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
             }
             HStack(spacing: 12) {

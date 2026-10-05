@@ -16,6 +16,29 @@ foreach(name IN LISTS PSPOCKET_RECOMP_EMBEDDED_DATA)
     list(APPEND embedded_sources ${output})
 endforeach()
 
+# The SELF keys the build carries (D-121), read from RPCS3's key_vault.cpp into the build directory only: keys never go
+# into the repository (CLAUDE.md rule 1). Without an RPCS3 source tree the table is empty and decrypt_self says so.
+set(PSPOCKET_RPCS3_DIR_DEFAULT "")
+if(EXISTS ${CMAKE_SOURCE_DIR}/../ps3-ios-engine/external/rpcs3/rpcs3/Crypto/key_vault.cpp)
+    get_filename_component(PSPOCKET_RPCS3_DIR_DEFAULT ${CMAKE_SOURCE_DIR}/../ps3-ios-engine/external/rpcs3 ABSOLUTE)
+endif()
+set(PSPOCKET_RPCS3_DIR "${PSPOCKET_RPCS3_DIR_DEFAULT}" CACHE PATH "RPCS3 source tree for the SELF keys (D-121)")
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(self_keys_output ${CMAKE_CURRENT_BINARY_DIR}/generated/self_keys.cpp)
+set(self_keys_depends ${CMAKE_SOURCE_DIR}/scripts/self-keys.py)
+foreach(vault ${PSPOCKET_RPCS3_DIR}/rpcs3/Crypto/key_vault.cpp ${PSPOCKET_RPCS3_DIR}/Crypto/key_vault.cpp)
+    if(PSPOCKET_RPCS3_DIR AND EXISTS ${vault})
+        list(APPEND self_keys_depends ${vault})
+    endif()
+endforeach()
+add_custom_command(
+    OUTPUT ${self_keys_output}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/self-keys.py "${PSPOCKET_RPCS3_DIR}" ${self_keys_output}
+    DEPENDS ${self_keys_depends}
+    COMMENT "SELF keys (scripts/self-keys.py)"
+    VERBATIM)
+find_package(ZLIB)
+
 add_library(pspocket_recomp_common STATIC
     src/bytes.cpp
     src/elf.cpp
@@ -27,11 +50,16 @@ add_library(pspocket_recomp_common STATIC
     src/nid.cpp
     src/ppu_module.cpp
     src/sce.cpp
+    src/self_decrypt.cpp
     src/spu_scan.cpp
     src/strings.cpp
     src/toml.cpp
-    ${embedded_sources})
+    ${embedded_sources}
+    ${self_keys_output})
 target_include_directories(pspocket_recomp_common PUBLIC include PRIVATE src)
 target_link_libraries(pspocket_recomp_common PUBLIC pspocket::core)
+if(ZLIB_FOUND)
+    target_link_libraries(pspocket_recomp_common PUBLIC ZLIB::ZLIB) # SELF segments are zlib (self_decrypt.cpp)
+endif()
 pspocket_set_warnings(pspocket_recomp_common)
 add_library(pspocket::recomp_common ALIAS pspocket_recomp_common)

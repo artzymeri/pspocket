@@ -216,6 +216,8 @@ targets:
     dependencies:
       - target: PSPocketRuntime
       - sdk: libc++.tbd
+      # zlib: SELF segments (recomp/common/src/self_decrypt.cpp, D-121).
+      - sdk: libz.tbd
       # The game's sound (runtime/platform/apple: AVAudioEngine; the audio session in game.mm).
       - sdk: AVFoundation.framework
     settings:

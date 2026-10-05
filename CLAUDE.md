@@ -53,15 +53,17 @@ ctest --test-dir build/host --output-on-failure
 - Phase 0 inventory: `ps3inspect --json inventory/gta4/eboot.json EBOOT.elf` (`inventory/` is gitignored; see
   `docs/phase0.md`). NID/syscall names: `recomp/common/scripts/harvest_nids.py <rpcs3-dir> [--check]` (D-019).
 - Focused builds while other work is in progress: `-DPSPOCKET_ONLY="runtime/core;recomp/common;tests/common"`.
-- One command per game: `scripts/translate-game.sh --iso GAME.iso --elf EBOOT.elf [--ios]` translates its PPU and
-  SPU code into inventory/<TITLE_ID>/ and builds it in (D-101).
+- One command per game: `scripts/translate-game.sh --iso GAME.iso [--ios]` decrypts the disc's EBOOT.BIN (D-121),
+  translates its PPU and SPU code into inventory/<TITLE_ID>/ and builds it in (D-101).
 - PPU lifter: `ppu-lift --elf EBOOT.elf --out DIR` (a whole executable, D-101) or
   `ppu-lift --image f.bin --base 0x10000 --seed 0x10200 --out DIR [--tu N] [--strict]` (D-023).
   `ppu-dis --image f.bin --base 0x10000 ADDR [COUNT]` disassembles; a fault in translated code prints host frames for
   `atos -o pspocket-boot -s SLIDE ADDR...` (D-094).
   Longer differential fuzzing: `PSPOCKET_FUZZ_SEED=<n> PSPOCKET_FUZZ_ITERS=<k> build/host/tests/ppu/test_ppu_fuzz`.
   Never build lifted code with `-ffast-math`/`-Ofast`.
-- Disc images: `ps3disc <image.iso> <out-dir>` (host) or the app's `-extract-iso` mode pulls out the executables only.
+- Disc images: `ps3disc <image.iso> <out-dir>` (host) or the app's `-extract-iso` mode pulls out the executables only;
+  `ps3disc --decrypt <image.iso> <out.elf>` decrypts EBOOT.BIN, as the app does on the phone (D-121). The keys come
+  from RPCS3's source at build time (`scripts/self-keys.py`, `-DPSPOCKET_RPCS3_DIR`) into the build directory only.
 - One bring-up round on the Mac: `scripts/boot.sh` (pull, build, run the decrypted EBOOT with the disc image read in
   place, print the gaps). It finds the game's .iso (or copies it once from the iPhone app: `scripts/ios.sh pull-iso`).
 - Boot an executable under the interpreter (Phase 2 bring-up, D-033): `pspocket-boot EBOOT.elf [--bdvd DIR|IMAGE.iso]

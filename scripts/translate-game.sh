@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# One command per game (D-090, D-101): the disc image and its decrypted executable in, the game's PPU and SPU code
-# translated ahead of time and built into pspocket-boot (and with --ios into the iOS app) out.
+# One command per game (D-090, D-101): the disc image in, the game's PPU and SPU code translated ahead of time and
+# built into pspocket-boot (and with --ios into the iOS app) out.
 #
-#   scripts/translate-game.sh --iso GAME.iso --elf EBOOT.elf [--seconds S] [--press BUTTON@S]... [--rounds N] [--ios]
+#   scripts/translate-game.sh --iso GAME.iso [--elf EBOOT.elf] [--seconds S] [--press BUTTON@S]... [--rounds N] [--ios]
 #
-# --elf is the disc's PS3_GAME/USRDIR/EBOOT.BIN decrypted to an ELF with the user's own tools (for example RPCS3's
-# "Decrypt PS3 Binaries"): the keys never enter this repository or the app (CLAUDE.md rule 1).
+# The disc's PS3_GAME/USRDIR/EBOOT.BIN is decrypted with the keys the build carries (ps3disc --decrypt, D-121; read
+# from RPCS3's source at build time, never committed: CLAUDE.md rule 1). --elf takes an executable decrypted elsewhere
+# instead.
 #
 # 1. The title ID from the disc image names inventory/<TITLE_ID>/, where everything derived from the game stays
 #    (gitignored): the executable, the translated code, the SPU programs a run saved, the logs and /dev_hdd0.
@@ -14,7 +15,8 @@
 #    the game's tasks load are saved, with the addresses where execution left lifted code.
 # 4. The SPU programs: scripts/lift-spu.sh (D-076, D-099), and pspocket-boot rebuilt with them. The runs also record
 #    the game's shaders in inventory/<TITLE_ID>/shaders (--shader-cache, D-114), which the app makes while it loads.
-# 5. With --ios: scripts/ios.sh build with both (then scripts/ios.sh install and push-game with the phone connected).
+# 5. With --ios: scripts/ios.sh build with both (then scripts/ios.sh install with the phone connected; the app
+#    decrypts the disc's executable itself, D-121).
 #
 # --rounds N repeats steps 3 and 4 up to N times (default 1), until a run leaves no SPU code interpreted: each run's
 # misses and saved programs seed the next lift (GTA V's first mission took five rounds, run 080). Run the script again
@@ -48,19 +50,21 @@ while [ $# -gt 0 ]; do
         *) die "unknown option $1 (see --help)" ;;
     esac
 done
-[ -n "$ISO" ] && [ -n "$ELF" ] || usage
+[ -n "$ISO" ] || usage
 case "$ROUNDS" in ''|*[!0-9]*|0) die "--rounds takes a positive number" ;; esac
 [ -f "$ISO" ] || die "no disc image $ISO"
-[ -f "$ELF" ] || die "no executable $ELF"
-if [ "$(head -c 3 "$ELF")" = "SCE" ]; then
-    die "$ELF is still an encrypted SELF: decrypt it to an ELF first (the keys stay outside this repository)"
+if [ -n "$ELF" ]; then
+    [ -f "$ELF" ] || die "no executable $ELF"
+    if [ "$(head -c 3 "$ELF")" = "SCE" ]; then
+        die "$ELF is still an encrypted SELF: leave out --elf and the disc's EBOOT.BIN is decrypted here (D-121)"
+    fi
 fi
 
 # The host tools: pspocket-boot reads the disc image, ppu-lift and spu-lift translate.
 if [ ! -f "$BUILD/CMakeCache.txt" ]; then
     cmake -S "$ROOT" -B "$BUILD" -G Ninja -DPSPOCKET_WERROR=ON --log-level=WARNING >&2
 fi
-ninja -C "$BUILD" pspocket-boot ppu-lift spu-lift >&2
+ninja -C "$BUILD" pspocket-boot ppu-lift spu-lift ps3disc >&2
 
 # 1. The title.
 probe="$("$BUILD/runtime/loader/pspocket-boot" --probe-disc "$ISO" 2>/dev/null | tail -1)" ||
@@ -70,6 +74,12 @@ TITLE="${probe%% *}"
 GAME="$ROOT/inventory/$TITLE"
 mkdir -p "$GAME/hdd0"
 say "$probe: $GAME"
+if [ -z "$ELF" ]; then
+    # The executable, decrypted from the disc with the keys the build carries (D-121).
+    ELF="$GAME/decrypt/EBOOT.elf"
+    "$BUILD/runtime/disc/ps3disc" --decrypt "$ISO" "$ELF" >/dev/null || die "could not decrypt $ISO's EBOOT.BIN"
+    say "decrypted the disc's EBOOT.BIN: $ELF"
+fi
 if [ ! -f "$GAME/EBOOT.elf" ] || ! cmp -s "$ELF" "$GAME/EBOOT.elf"; then cp "$ELF" "$GAME/EBOOT.elf"; fi
 
 # 2. The PPU code.

@@ -1,8 +1,9 @@
 add_library(pspocket_disc STATIC
     src/iso9660.cpp
-    src/extract.cpp)
+    src/extract.cpp
+    src/decrypt.cpp)
 target_include_directories(pspocket_disc PUBLIC include)
-target_link_libraries(pspocket_disc PUBLIC pspocket::core)
+target_link_libraries(pspocket_disc PUBLIC pspocket::core PRIVATE pspocket::recomp_common)
 pspocket_set_warnings(pspocket_disc)
 add_library(pspocket::disc ALIAS pspocket_disc)
 

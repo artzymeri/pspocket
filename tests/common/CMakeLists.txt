@@ -13,7 +13,12 @@ pspocket_add_test(test_recomp_common
         test_toml_manifest.cpp
         test_elf.cpp
         test_robustness.cpp
+        test_self_decrypt.cpp
     LIBS pspocket_test_synthetic pspocket::recomp_common)
+find_package(ZLIB)
+if(ZLIB_FOUND)
+    target_link_libraries(test_recomp_common PRIVATE ZLIB::ZLIB) # the SELF test compresses its segments
+endif()
 target_compile_definitions(test_recomp_common PRIVATE PSPOCKET_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 if(PSPOCKET_SANITIZE)
     # Make UBSan findings fail the test instead of only printing them.

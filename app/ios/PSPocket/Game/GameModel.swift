@@ -9,7 +9,8 @@ import UIKit
 /// controller (DualShock 4, DualSense, ...) through GameController, else the on-screen buttons.
 ///
 /// Documents layout (Files > On My iPhone > PSPocket):
-///   game/<TITLE_ID>/EBOOT.elf  the game's executable, decrypted on the Mac (`scripts/ios.sh push-game`)
+///   game/<TITLE_ID>/EBOOT.elf  the game's executable, decrypted here from the disc's EBOOT.BIN when the disc is
+///                              picked (D-121), or pushed from the Mac (`scripts/ios.sh push-game`)
 ///   dev_flash/                 system files the game loads itself, from the user's firmware (D-067)
 ///   hdd0/                      the game's /dev_hdd0: game data, saves, trophies
 ///   game.log                   the last run's log
@@ -19,6 +20,8 @@ final class GameModel {
     private(set) var titleID: String?
     private(set) var title: String?
     private(set) var problem: String?
+    /// The disc's EBOOT.BIN is being decrypted into game/<TITLE_ID>/EBOOT.elf (D-121).
+    private(set) var decrypting = false
     private(set) var running = false
     private(set) var flips: UInt64 = 0
     private(set) var seconds = 0.0
@@ -94,11 +97,29 @@ final class GameModel {
                 if result.0 == 0 {
                     self.titleID = result.1
                     self.title = result.2
-                    self.problem = self.executableURL == nil
-                        ? "The decrypted EBOOT for \(result.1) isn't on this iPhone yet (scripts/ios.sh push-game)" : nil
+                    self.problem = nil
+                    if self.executableURL == nil { self.decryptExecutable(isoPath: path, titleID: result.1, for: url) }
                 } else {
                     self.problem = "Not a PS3 game disc: \(result.3)"
                 }
+            }
+        }
+    }
+
+    /// The disc's executable decrypted on the phone, with the keys the app carries (D-121), into
+    /// Documents/game/<TITLE_ID>/EBOOT.elf: then any disc picked here can boot.
+    private func decryptExecutable(isoPath: String, titleID: String, for url: URL) {
+        let elf = Self.documents.appendingPathComponent("game").appendingPathComponent(titleID)
+            .appendingPathComponent("EBOOT.elf")
+        decrypting = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            var error = [CChar](repeating: 0, count: 512)
+            let status = ps_disc_decrypt_executable(isoPath, elf.path, &error, error.count)
+            let message = String(cString: error)
+            DispatchQueue.main.async {
+                self.decrypting = false
+                guard self.isoURL == url else { return }
+                self.problem = status == 0 ? nil : "Could not decrypt the game's EBOOT.BIN: \(message)"
             }
         }
     }
@@ -112,7 +133,7 @@ final class GameModel {
         return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
-    var canBoot: Bool { !running && titleID != nil && executableURL != nil }
+    var canBoot: Bool { !running && !decrypting && titleID != nil && executableURL != nil }
 
     // MARK: running
 

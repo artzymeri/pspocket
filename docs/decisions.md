@@ -1875,6 +1875,31 @@ same pass, was made anew each frame the same way.
   0xcf670000 (pitch 0x2800) lies inside the 2560x512 one, 256 rows down, and evicts it, decals and all: the guard's
   texture then decodes the stale memory under it. Targets inside other targets at any offset come next.
 
+## D-121 · 2026-10-05 · The phone decrypts a disc's executable itself; so does the Mac's factory
+
+The user picked Assassin's Creed (BLES00158) on the phone and the app said its decrypted EBOOT was not there: until
+now an executable was decrypted on the Mac (RPCS3, or the firmware script of D-046) and pushed with `scripts/ios.sh
+push-game`. The user wants any disc picked on the phone to boot ("the decryption should run inside the iPhone"), so
+the keys now travel in the app, never in the repository (CLAUDE.md rule 1), and D-071's "keys never go into the app"
+is replaced.
+- `recomp::decrypt_self` (recomp/common/src/self_decrypt.cpp) follows RPCS3's SELFDecrypter (Crypto/unself.cpp):
+  the metadata info opens with the AES-256-CBC key of the executable's type and key revision (KeyVault::FindSelfKey),
+  the metadata with the AES-128-CTR key and counter inside it, each segment with its own; zlib segments inflate; the
+  ELF is laid out from the SELF's plain copies of its headers. CommonCrypto (Apple platforms) and the system zlib.
+  Debug SELFs give their plain ELF; PSN executables (an NPDRM control header) need their licence and are refused.
+- The keys: `scripts/self-keys.py` reads RPCS3's Crypto/key_vault.cpp at build time (`PSPOCKET_RPCS3_DIR`, by default
+  the checkout beside this one) into `build/host/recomp/common/generated/self_keys.cpp`, which the host build and the
+  iOS app compile. Without RPCS3's source the table is empty and decrypting says so. The script never prints a key.
+- `ps_disc_decrypt_executable` reads PS3_GAME/USRDIR/EBOOT.BIN from the disc image and writes the ELF (whole or not
+  at all). The app calls it when a disc is picked and Documents/game/<TITLE_ID>/EBOOT.elf is missing, showing
+  "Decrypting the game's EBOOT.BIN"; `ps3disc --decrypt IMAGE OUT.elf` on the Mac; `scripts/translate-game.sh` no
+  longer needs `--elf`.
+- Check: GTA V's EBOOT.BIN decrypts in 0.4 s to an ELF byte for byte the one decrypted before (sha-256 8cad8baa...);
+  Assassin's Creed's to a 20.7 MB PPU executable.
+- Tests: a synthetic executable compressed and encrypted with made-up keys as a retail SELF is comes back out; a missing
+  key, a wrong key, an empty table and a PSN executable are refused with the reason; FindSelfKey's choices; a debug
+  SELF. A game without its translated code boots in the interpreters: slow, but it boots.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
