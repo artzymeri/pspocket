@@ -1,9 +1,12 @@
-// ppu-lift: lifts PPU code from a raw image into C translation units.
+// ppu-lift: lifts PPU code from an executable, or a raw image, into C translation units.
 //
+//   ppu-lift --elf EBOOT.elf [--seed ADDR[:TOC]]... --out DIR [--tu N] [--name NAME] [--prefix PREFIX] ...
 //   ppu-lift --image f.bin --base 0x10000 --seed 0x10200 [--seed ADDR[:TOC]]... [--seeds-file F] [--toc ADDR]
 //            [--opd ADDR:SIZE] --out DIR [--tu N] [--name NAME] [--prefix PREFIX] [--no-comments] [--strict] [--quiet]
 //
-// --opd adds every function descriptor of an .opd area inside the image (address, TOC) as a seed.
+// --elf takes a decrypted PPU executable: its LOAD segments (code where PF_X), the entry and every function descriptor
+// of its .opd (each with its TOC) as seeds, and the entry's TOC for the rest (D-101). --opd adds every function
+// descriptor of an .opd area inside a raw image (address, TOC) as a seed.
 //
 // Prints a summary and lists every unsupported instruction (lifted as an interpreter fallback) and every illegal
 // word reached by control flow. --strict turns those into a failing exit code.
@@ -16,6 +19,9 @@
 #include <vector>
 
 #include "pspocket/ppu/disasm.hpp"
+#include "pspocket/recomp/elf.hpp"
+#include "pspocket/recomp/guest_image.hpp"
+#include "pspocket/recomp/ppu_module.hpp"
 #include "pspocket/recomp/ppu/analyzer.hpp"
 #include "pspocket/recomp/ppu/code_image.hpp"
 #include "pspocket/recomp/ppu/lifter.hpp"
@@ -28,9 +34,9 @@ namespace {
 void usage()
 {
     std::fprintf(stderr,
-        "usage: ppu-lift --image FILE --base ADDR --seed ADDR[:TOC] [--seed ...] [--seeds-file FILE] [--toc ADDR]\n"
-        "                [--opd ADDR:SIZE] --out DIR [--tu N] [--name NAME] [--prefix PREFIX] [--no-comments]\n"
-        "                [--strict] [--quiet]\n");
+        "usage: ppu-lift --elf FILE | --image FILE --base ADDR [--seed ADDR[:TOC] ...] [--seeds-file FILE]\n"
+        "                [--toc ADDR] [--opd ADDR:SIZE] --out DIR [--tu N] [--name NAME] [--prefix PREFIX]\n"
+        "                [--no-comments] [--strict] [--quiet]\n");
 }
 
 bool read_file(const std::string& path, std::vector<u8>& out)
@@ -45,7 +51,7 @@ bool read_file(const std::string& path, std::vector<u8>& out)
 
 int main(int argc, char** argv)
 {
-    std::string image_path, out_dir;
+    std::string image_path, elf_path, out_dir;
     std::optional<u32> base;
     std::vector<Seed> seeds;
     std::vector<std::pair<u32, u32>> opd_areas;
@@ -71,6 +77,7 @@ int main(int argc, char** argv)
             return seed->addr;
         };
         if (arg == "--image") image_path = value();
+        else if (arg == "--elf") elf_path = value();
         else if (arg == "--base") base = address(value());
         else if (arg == "--seed") {
             const std::string text = value();
@@ -113,17 +120,59 @@ int main(int argc, char** argv)
             return 2;
         }
     }
-    if (image_path.empty() || !base || out_dir.empty() || (seeds.empty() && opd_areas.empty())) {
+    const bool from_elf = !elf_path.empty();
+    if (out_dir.empty() || (from_elf ? !image_path.empty() || base : image_path.empty() || !base) ||
+        (!from_elf && seeds.empty() && opd_areas.empty())) {
         usage();
         return 2;
     }
 
-    std::vector<u8> bytes;
-    if (!read_file(image_path, bytes)) {
-        std::fprintf(stderr, "ppu-lift: cannot read %s\n", image_path.c_str());
-        return 1;
+    CodeImage image;
+    if (from_elf) {
+        std::vector<u8> bytes;
+        if (!read_file(elf_path, bytes)) {
+            std::fprintf(stderr, "ppu-lift: cannot read %s\n", elf_path.c_str());
+            return 1;
+        }
+        const auto elf = recomp::ElfFile::parse(bytes);
+        if (!elf || !elf->is_ppu()) {
+            std::fprintf(stderr, "ppu-lift: %s is not a PPU ELF%s\n", elf_path.c_str(),
+                elf ? "" : (": " + elf.error().message).c_str());
+            return 1;
+        }
+        const auto guest = recomp::GuestImage::from_elf(*elf);
+        if (!guest) {
+            std::fprintf(stderr, "ppu-lift: %s: %s\n", elf_path.c_str(), guest.error().message.c_str());
+            return 1;
+        }
+        const auto module = recomp::analyze_ppu_module(*elf, *guest);
+        if (!module) {
+            std::fprintf(stderr, "ppu-lift: %s: %s\n", elf_path.c_str(), module.error().message.c_str());
+            return 1;
+        }
+        for (const auto& seg : guest->segments()) {
+            if (seg.memsz == 0) continue;
+            std::vector<u8> data = seg.data;
+            data.resize(static_cast<usize>(seg.memsz), 0); // bss reads as zero
+            image.add_segment(Segment{seg.vaddr, std::move(data), (seg.flags & 1u) != 0});
+        }
+        const recomp::OpdInfo& opd = module->opd;
+        if (opd.entry_func) seeds.push_back(Seed{*opd.entry_func, opd.toc, "entry"});
+        for (const recomp::OpdEntry& e : opd.entries)
+            if (image.is_code(e.func)) seeds.push_back(Seed{e.func, e.toc, {}});
+        if (!analyzer_options.toc) analyzer_options.toc = opd.toc;
+        if (!quiet)
+            std::printf("ppu-lift: %s: %zu segments, entry %#x, %zu function descriptors (%s), TOC %#x\n", elf_path.c_str(),
+                image.segments().size(), opd.entry_func.value_or(0), opd.entries.size(),
+                std::string(recomp::opd_source_name(opd.source)).c_str(), opd.toc.value_or(0));
+    } else {
+        std::vector<u8> bytes;
+        if (!read_file(image_path, bytes)) {
+            std::fprintf(stderr, "ppu-lift: cannot read %s\n", image_path.c_str());
+            return 1;
+        }
+        image = CodeImage(*base, std::move(bytes));
     }
-    const CodeImage image(*base, std::move(bytes));
     for (const auto& [addr, size] : opd_areas) {
         const std::vector<Seed> more = seeds_from_opd(image, addr, size);
         seeds.insert(seeds.end(), more.begin(), more.end());

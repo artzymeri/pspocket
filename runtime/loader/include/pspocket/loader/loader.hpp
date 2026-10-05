@@ -97,6 +97,12 @@ lv2::Result load(const Executable& exe, lv2::Kernel& kernel, hle::HleProcess& hl
 lv2::Result start_main_thread(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, BootState& state,
     const BootOptions& options, u32& main_thread_id);
 
+// The game's PPU code translated ahead of time (ppu-lift, D-092), built into the host, is for the executable it was
+// translated from only: its (address, word) samples (ppu-lift's N_image_words) must be in guest memory after load()
+// (D-098). Then register_fn (N_register) puts the functions in the dispatch table and this returns true.
+bool register_translated_ppu(const GuestMemory& memory, const u32* image_words, u32 image_word_count,
+    void (*register_fn)());
+
 // load() then start_main_thread().
 lv2::Result boot(std::shared_ptr<const Executable> exe, lv2::Kernel& kernel, hle::HleProcess& hle, BootState& state,
     const BootOptions& options, u32& main_thread_id, LoadReport* report = nullptr);

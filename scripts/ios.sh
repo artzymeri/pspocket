@@ -52,6 +52,8 @@ Environment:
   PSPOCKET_HOST_BUILD   host CMake build directory, relative to the repo or absolute (default build/host)
   PSPOCKET_GAME_SPU     the game's lifted SPU programs (scripts/lift-spu.sh output) to build in (default: the
                         inventory/*/spu-lifted that holds a game_spu.c, if any)
+  PSPOCKET_GAME_PPU     the game's translated PPU code (ppu-lift output, --name game_ppu) to build in (default: the
+                        inventory/*/ppu-lifted that holds a game_ppu_reg.c, if any)
   PSPOCKET_IOS_BUILD    Xcode output directory: DerivedData, logs, last-run.log, the report (default build/ios)
 EOF
 }
@@ -236,9 +238,26 @@ cmd_gen() {
         game_spu="$ROOT/inventory/no-lifted-spu-programs"
         have_game_spu=0
     fi
+    # The game's PPU code translated ahead of time (ppu-lift, D-092): $PSPOCKET_GAME_PPU, else an
+    # inventory/*/ppu-lifted that holds a game_ppu_reg.c. The app uses it only for the executable it was translated
+    # from (D-098); without it the interpreter runs the game's PPU code.
+    local game_ppu="${PSPOCKET_GAME_PPU:-}" have_game_ppu=1
+    if [ -z "$game_ppu" ]; then
+        for d in "$ROOT"/inventory/*/ppu-lifted; do
+            if [ -f "$d/game_ppu_reg.c" ]; then game_ppu="$d"; fi
+        done
+    fi
+    if [ -n "$game_ppu" ] && [ -f "$game_ppu/game_ppu_reg.c" ]; then
+        say "translated PPU code: $game_ppu ($(find "$game_ppu" -maxdepth 1 -name 'game_ppu_*.c' | wc -l | tr -d ' ') units)"
+    else
+        say "no translated PPU code (ppu-lift): the PPU is interpreted"
+        game_ppu="$ROOT/inventory/no-translated-ppu-code"
+        have_game_ppu=0
+    fi
     say "xcodegen: $PROJECT"
     PSPOCKET_HOST_BUILD_DIR="$HOST_BUILD" PSPOCKET_PPU_SRC="$ppu_src" PSPOCKET_GAME_SPU_SRC="$game_spu" \
-        PSPOCKET_HAVE_GAME_SPU="$have_game_spu" "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
+        PSPOCKET_HAVE_GAME_SPU="$have_game_spu" PSPOCKET_GAME_PPU_SRC="$game_ppu" PSPOCKET_HAVE_GAME_PPU="$have_game_ppu" \
+        "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
 }
 
 cmd_build() {

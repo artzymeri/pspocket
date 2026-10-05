@@ -53,11 +53,11 @@ The Mac build with the game's PPU and SPU code translated runs the first mission
 interpreted SPU code left but four function-pointer targets of one job binary (re-lifted after run 069). What is
 missing, roughly in order:
 
-1. **The iPhone build with the translated PPU code** (823 MB of C, 512 units; the Mac links it in about 3 minutes):
-   `scripts/ios.sh` builds the SPU programs in already; the PPU code next, then a playtest (the user runs it).
-2. **One command per game** (D-090): disc image in, app out: extract and decrypt the executable, lift its PPU code,
-   run once with `--spu-dump` to collect the SPU programs, lift them, build and sign. The parts exist as separate
-   commands (below).
+1. **A playtest on the iPhone with the translated PPU code**: `scripts/ios.sh` builds it in (D-101); the user
+   installs it (`scripts/ios.sh install`, phone connected and unlocked) and reports the frame rate and what looks wrong.
+2. **One command per game** (D-101): `scripts/translate-game.sh --iso GAME.iso --elf EBOOT.elf [--ios]` translates
+   a game's PPU and SPU code and builds it in; the executable is decrypted with the user's own tools. Next: try it on
+   a second game.
 3. **RSX gaps** the first mission logs: occlusion queries (report 65535), conditional rendering (draws
    unconditionally), MSAA (one sample), a 3D texture, depth comparison for shadow maps, fragment CAL/BEM, vertex
    BRB/CLB.
@@ -66,11 +66,12 @@ missing, roughly in order:
 
 ## Building and running GTA V on the Mac
 
+For any game, `scripts/translate-game.sh` does all of it (D-101). By hand, for GTA V:
+
 ```sh
 # the PPU code (rule 1: everything under inventory/ stays out of git)
-build/host/recomp/ppu/ppu-lift --image inventory/gta5/ppu/eboot.bin --base 0x10000 --seed 0x109e4:0x1adf8a8 \
-    --opd 0x1a709a8:0x66f00 --toc 0x1adf8a8 --out inventory/gta5/ppu-lifted --tu 512 --name game_ppu \
-    --prefix game_ppu_ --no-comments
+build/host/recomp/ppu/ppu-lift --elf inventory/gta5/decrypt/EBOOT.elf --out inventory/gta5/ppu-lifted --tu 512 \
+    --name game_ppu --prefix game_ppu_ --no-comments
 # the SPU programs a run saved with --spu-dump, plus the misses its log lists
 scripts/lift-spu.sh inventory/gta5/spu inventory/gta5/spu-lifted inventory/boot-NNN.log
 cmake -S . -B build/host -G Ninja -DPSPOCKET_WERROR=ON -DPSPOCKET_GAME_PPU=$PWD/inventory/gta5/ppu-lifted \

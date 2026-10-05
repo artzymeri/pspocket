@@ -11,7 +11,7 @@ add_library(pspocket::recomp_ppu ALIAS pspocket_recomp_ppu)
 
 # ppu-lift: raw image + seeds -> C translation units.
 add_executable(ppu-lift src/ppu_lift_main.cpp)
-target_link_libraries(ppu-lift PRIVATE pspocket::recomp_ppu)
+target_link_libraries(ppu-lift PRIVATE pspocket::recomp_ppu pspocket::recomp_common)
 pspocket_set_warnings(ppu-lift)
 
 # ppu-dis: disassembles a raw image's code (debugging translated games).

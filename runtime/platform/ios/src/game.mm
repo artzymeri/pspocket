@@ -45,6 +45,13 @@
 
 using namespace pspocket;
 
+#if PSPOCKET_HAVE_GAME_PPU
+extern "C" {
+void game_ppu_register(void); // the game's PPU code translated ahead of time (ppu-lift, D-092)
+extern const uint32_t game_ppu_image_words[];
+extern const uint32_t game_ppu_image_word_count;
+}
+#endif
 #if PSPOCKET_HAVE_GAME_SPU
 extern "C" void pspocket_game_spu_register(void); // the game's lifted SPU programs (scripts/lift-spu.sh, D-076)
 #endif
@@ -172,7 +179,9 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     s->exe = *exe;
     s->memory = std::make_unique<GuestMemory>();
     if (!s->memory->reserve()) return fail(error, error_size, "cannot reserve the 4 GB guest address space");
-    ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET); // no lifted code in the app yet: the interpreter runs the game
+    // PPU code the translation has not reached (or all of it, in a build without the game's translated code) is
+    // interpreted.
+    ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
     // SPU code without a lifted program, or outside it, is interpreted (D-076). The game's lifted SPU programs, when
     // the build has them (scripts/ios.sh), run its SPURS tasks, jobs and the modules they load (D-079, D-081).
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
@@ -292,6 +301,11 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report); r != lv2::CELL_OK) {
         return fail(error, error_size, std::string("loading the executable failed: ") + lv2::error_name(r));
     }
+#if PSPOCKET_HAVE_GAME_PPU
+    // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098).
+    if (loader::register_translated_ppu(*s->memory, game_ppu_image_words, game_ppu_image_word_count, &game_ppu_register))
+        PS_LOG_INFO(kChan, "the game's PPU code runs translated ahead of time");
+#endif
     install_fault_handler();
     u32 main_id = 0;
     s->start = std::chrono::steady_clock::now();

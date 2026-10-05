@@ -606,19 +606,10 @@ int main(int argc, char** argv)
         return 0;
     }
 #if defined(PSPOCKET_HAVE_GAME_PPU)
-    // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only: its words at
-    // a sample of the functions' entries must be in memory (another executable, the test programs among them, has other
-    // code at those addresses: D-098).
-    bool same_image = true;
-    for (u32 i = 0; i < game_ppu_image_word_count && same_image; i++) {
-        const u32 addr = game_ppu_image_words[2 * i], word = game_ppu_image_words[2 * i + 1];
-        same_image = memory.is_committed(addr) && ps_read32(memory.base(), addr) == word;
-    }
-    if (same_image) {
-        game_ppu_register(); // branches into it from the interpreter run it
-    } else {
-        PS_LOG_WARN("boot", "the built-in translated PPU code is for another executable: interpreting this one");
-    }
+    // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098):
+    // branches into it from the interpreter run it.
+    const bool same_image =
+        loader::register_translated_ppu(memory, game_ppu_image_words, game_ppu_image_word_count, &game_ppu_register);
     // PSPOCKET_PPU_ONLY=LO-HI[,LO-HI...] keeps the translated functions in those ranges only, the rest interpreted:
     // bisecting a translation fault down to the function.
     if (const char* only = std::getenv("PSPOCKET_PPU_ONLY"); only && same_image) {

@@ -1503,6 +1503,24 @@ over its block).
 - Tests: a shadow lookup with nearest and linear filtering, end to end (the blended values at the edge); the translation;
   two depth tiles of one atlas cleared to different depths and read as textures (fails with the byte overlap).
 
+## D-101 · 2026-10-05 · One command per game: ppu-lift reads the executable; scripts/translate-game.sh
+
+D-090's pipeline as commands a user runs once per game, with nothing found by hand:
+- `ppu-lift --elf EBOOT.elf` takes the decrypted executable: its LOAD segments (code only where PF_X, bss as zeros),
+  the entry and every function descriptor of its .opd as seeds with their TOCs (recomp/common's analyze_ppu_module
+  finds the .opd by section or probe, as ps3inspect does), and the entry's TOC for the rest. For GTA V the output is
+  byte for byte the lift made from the hand-made raw image, its .opd range and TOC (D-092).
+- `scripts/translate-game.sh --iso GAME.iso --elf EBOOT.elf [--seconds S] [--press ...] [--ios]`: the title ID from
+  the disc names inventory/<TITLE_ID>/ (gitignored); ppu-lift --elf; pspocket-boot built with the PPU code; one run
+  with --spu-dump to collect the SPU programs; scripts/lift-spu.sh; pspocket-boot rebuilt with both; with --ios the
+  app too. Running it again covers more of the game (the SPU seeds accumulate, D-099), and what is not translated yet
+  runs in the interpreters meanwhile.
+- Decrypting EBOOT.BIN stays with the user's own tools (the keys never enter the repository or the app); the script
+  refuses a SELF.
+- The iOS app builds the translated PPU code in when scripts/ios.sh finds it ($PSPOCKET_GAME_PPU, else an
+  inventory/*/ppu-lifted) and registers it after the load for its executable only (D-098), through
+  loader::register_translated_ppu, as pspocket-boot does.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

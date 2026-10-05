@@ -199,6 +199,21 @@ void prepare_kernel_config(lv2::Config& cfg, BootState& state)
     cfg.executor_user = &state;
 }
 
+bool register_translated_ppu(const GuestMemory& memory, const u32* image_words, u32 image_word_count,
+    void (*register_fn)())
+{
+    for (u32 i = 0; i < image_word_count; i++) {
+        const u32 addr = image_words[2 * i], word = image_words[2 * i + 1];
+        if (!memory.is_committed(addr) || ps_read32(memory.base(), addr) != word) {
+            PS_LOG_WARN(kChan, "the built-in translated PPU code is for another executable (the word at {:#010x} differs): "
+                               "interpreting this one", addr);
+            return false;
+        }
+    }
+    register_fn();
+    return true;
+}
+
 lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess& hle, LoadReport* report)
 {
     const Executable* exe = &exe_ref;
