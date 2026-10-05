@@ -2256,6 +2256,28 @@ the first 300 frames. And every launch compiled everything again.
   pipeline no. N" and keep only part of what was added: 3,623 of 11,756 pipelines came from the archives in the
   second boot, 5,307 of 11,770 in the third. The Mac saves every kind of pipeline tried (run 088).
 
+## D-144 · 2026-10-05 · Write tracking: a page's protection changes only in states the other threads wait out
+
+GTA V's screen flickered with other textures' colours on the iPhone and the Mac from D-134 on (13:38; "the game ran
+good this morning"). The Mac walk counted 215 to 322 jumps in its frames with page protection, 2 (camera cuts) with
+textures hashed instead (run 088).
+- **The race:** a fault marked its page resolved and then made it writable with an mprotect; check() could make the
+  page read-only again in between, and the fault's mprotect landed after: the page stayed writable while the tracker
+  took it for protected, and every later store into it went unseen until something else dirtied the texture. GTA V's
+  threads store beside its textures all the time (16 KB pages), so this happened many times a minute.
+- **The fix:** each page has a state: unprotected (never protected), protecting, protected, resolving, resolved,
+  releasing, released. Every mprotect happens in one of the three transitional states, entered by compare-and-swap
+  and left by the thread that entered it; whoever meets one waits for it to end (an mprotect, microseconds). So the
+  state always says what the page's protection is, and a fault handled late (its store faulted while the page was
+  protected) sees what happened since: protected again, it is resolved again (harmless); released, the store is
+  retried, up to 1,024 times per release so that a fault that is not ours still reaches the crash handler; a page
+  freed since is never retried. One thread (the RSX thread) watches, checks and unwatches; any thread may fault.
+- **Test:** three threads store beside a watched range while the main thread checks it, stores into it, checks
+  again, unwatches it and watches it again, 50,000 times: every store into it must be seen and every fault handled.
+  The D-134 code crashes it (SIGBUS) 3 times in 3; the first fix (the resolving state alone) still crashed it, a
+  store faulting while unwatch() released the page; this one passes.
+- **Mac walk:** 2 jumps in 829 frames (camera cuts), 37 write faults per frame, 30 fps.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

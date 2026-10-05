@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <cstring>
+#include <thread>
 #include <sys/mman.h>
 
 #include "pspocket/core/log.hpp"
@@ -20,12 +21,12 @@ WriteTracker::WriteTracker(GuestMemory& mem)
       page_count_(GuestMemory::kGuestSize / GuestMemory::host_page_size()),
       generation_(new std::atomic<u32>[page_count_]),
       watchers_(new std::atomic<u16>[page_count_]),
-      protected_(new std::atomic<u8>[page_count_])
+      state_(new std::atomic<u16>[page_count_])
 {
     for (u64 i = 0; i < page_count_; i++) {
         generation_[i].store(0, std::memory_order_relaxed);
         watchers_[i].store(0, std::memory_order_relaxed);
-        protected_[i].store(0, std::memory_order_relaxed);
+        state_[i].store(kUnprotected, std::memory_order_relaxed);
     }
 }
 
@@ -34,7 +35,7 @@ WriteTracker::~WriteTracker()
     uninstall();
     // Leave no page read-only behind us.
     for (u64 p = 0; p < page_count_; p++) {
-        if (protected_[p].load(std::memory_order_relaxed) == kProtected) {
+        if ((state_[p].load(std::memory_order_relaxed) & kStateMask) == kProtected) {
             mem_.protect(static_cast<u32>(p << page_shift_), page_size_, Prot::ReadWrite);
         }
     }
@@ -107,18 +108,26 @@ WriteTracker::Watch WriteTracker::watch(u32 addr, u32 size)
 
 void WriteTracker::protect_pages(u64 first, u64 last)
 {
-    u64 run = 0, run_pages = 0; // the pending run of pages to make read-only
+    u64 run = 0, run_pages = 0; // the pending run of pages to make read-only (all protecting)
     const auto flush = [&] {
-        if (run_pages) mem_.protect(static_cast<u32>(run << page_shift_), run_pages * page_size_, Prot::Read);
+        if (!run_pages) return;
+        mem_.protect(static_cast<u32>(run << page_shift_), run_pages * page_size_, Prot::Read);
+        for (u64 p = run; p < run + run_pages; p++) state_[p].store(kProtected, std::memory_order_release);
         run_pages = 0;
     };
     for (u64 p = first; p <= last; p++) {
-        const u32 page_addr = static_cast<u32>(p << page_shift_);
-        if (protected_[p].load(std::memory_order_acquire) == kProtected || !mem_.is_committed(page_addr)) {
+        // Any state but protected is ours to protect, once a fault making it writable has finished (its mprotect
+        // must not land after this one).
+        bool take = mem_.is_committed(static_cast<u32>(p << page_shift_));
+        while (take) {
+            u16 state = settled_state(p);
+            if ((state & kStateMask) == kProtected) take = false;
+            else if (state_[p].compare_exchange_weak(state, kProtecting, std::memory_order_acq_rel)) break;
+        }
+        if (!take) {
             flush();
             continue;
         }
-        protected_[p].store(kProtected, std::memory_order_release);
         if (!run_pages) run = p;
         run_pages++;
     }
@@ -168,11 +177,33 @@ void WriteTracker::unwatch(Watch& w)
     const u64 first = w.addr >> page_shift_;
     const u64 last = (u64{w.addr} + w.size - 1) >> page_shift_;
     for (u64 p = first; p <= last; p++) {
-        if (watchers_[p].fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            if (protected_[p].exchange(kUnprotected, std::memory_order_acq_rel) == kProtected) {
-                mem_.protect(static_cast<u32>(p << page_shift_), page_size_, Prot::ReadWrite);
+        if (watchers_[p].fetch_sub(1, std::memory_order_acq_rel) != 1) continue;
+        // The last watch on the page: writable again (resolved: it is already).
+        for (;;) {
+            u16 state = settled_state(p);
+            const u16 s = state & kStateMask;
+            if (s != kProtected && s != kResolved) break; // never protected (not committed then), or released
+            if (!state_[p].compare_exchange_weak(state, s == kProtected ? kReleasing : kReleased,
+                    std::memory_order_acq_rel)) {
+                continue;
             }
+            if (s == kProtected) {
+                mem_.protect(static_cast<u32>(p << page_shift_), page_size_, Prot::ReadWrite);
+                state_[p].store(kReleased, std::memory_order_release);
+            }
+            break;
         }
+    }
+}
+
+u16 WriteTracker::settled_state(u64 p) const
+{
+    u16 state = state_[p].load(std::memory_order_acquire);
+    for (u32 spins = 0;; spins++) {
+        const u16 s = state & kStateMask;
+        if (s != kProtecting && s != kResolving && s != kReleasing) return state;
+        if (spins > 64) std::this_thread::yield();
+        state = state_[p].load(std::memory_order_acquire);
     }
 }
 
@@ -190,17 +221,35 @@ bool WriteTracker::handle_fault(const void* host_addr)
     const auto b = reinterpret_cast<uintptr_t>(mem_.base());
     if (a < b || a - b >= GuestMemory::kGuestSize) return false;
     const u64 page = (a - b) >> page_shift_;
-    u8 expected = kProtected;
-    if (!protected_[page].compare_exchange_strong(expected, kResolved, std::memory_order_acq_rel)) {
-        // kResolved: another thread's fault on this page won the race; retrying the store is right (it faults again
-        // until the winner's mprotect lands). kUnprotected: not a page we protected: not ours.
-        return expected == kResolved;
+    // Writable already (resolved, released) means the store runs again: not for a page freed since (no access to it
+    // can succeed; it goes on to the crash handler).
+    const bool committed = mem_.is_committed(static_cast<u32>(page << page_shift_));
+    for (;;) {
+        u16 state = settled_state(page); // waits out a change in flight: its mprotect decides whether the store faults
+        switch (state & kStateMask) {
+        case kProtected:
+            if (!state_[page].compare_exchange_weak(state, kResolving, std::memory_order_acq_rel)) continue;
+            // Generation first, so a reader that sees the page writable also sees it dirty.
+            generation_[page].fetch_add(1, std::memory_order_acq_rel);
+            faults_.fetch_add(1, std::memory_order_relaxed);
+            ::mprotect(mem_.base() + (page << page_shift_), page_size_, PROT_READ | PROT_WRITE);
+            state_[page].store(kResolved, std::memory_order_release);
+            return true;
+        case kResolved:
+            return committed; // another thread's fault made it writable
+        case kReleased:
+            // The store faulted while the page was protected; unwatch() has made it writable since. Counted: a fault
+            // that is not ours would come back every time.
+            if (!committed || state >= kMaxStale * kStaleOne) return false;
+            if (!state_[page].compare_exchange_weak(state, static_cast<u16>(state + kStaleOne),
+                    std::memory_order_acq_rel)) {
+                continue;
+            }
+            return true;
+        default:
+            return false; // never protected: not ours
+        }
     }
-    // Generation first, so a reader that sees the page writable also sees it dirty.
-    generation_[page].fetch_add(1, std::memory_order_acq_rel);
-    faults_.fetch_add(1, std::memory_order_relaxed);
-    ::mprotect(mem_.base() + (page << page_shift_), page_size_, PROT_READ | PROT_WRITE);
-    return true;
 }
 
 } // namespace pspocket::rsx

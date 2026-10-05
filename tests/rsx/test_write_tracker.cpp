@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <csignal>
+#include <thread>
+#include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/memory_map.h"
@@ -75,6 +77,20 @@ TEST_CASE("protection mode: the fault hook marks pages dirty and makes them writ
     // Unwatched pages are writable: a plain store must not fault.
     mem.write<u32>(base + page + 16, 1);
     mem.write<u32>(base + 3 * page, 1);
+
+    // A store that faulted while page 1 was protected, handled after the unwatch made it writable: retried, not a
+    // crash (D-144). A fault that keeps coming back there is not ours after all.
+    CHECK(tracker.handle_fault(mem.host(base + page + 16)));
+    u32 retries = 1;
+    while (retries < 100000 && tracker.handle_fault(mem.host(base + page + 16))) retries++;
+    CHECK(retries < 100000);
+    // Watched and released again: retried again.
+    auto w3 = tracker.watch(base + page + 16, 4);
+    tracker.unwatch(w3);
+    CHECK(tracker.handle_fault(mem.host(base + page + 16)));
+    // Freed since: never retried (no access to it can succeed).
+    REQUIRE(mem.decommit(base + page, page));
+    CHECK_FALSE(tracker.handle_fault(mem.host(base + page + 16)));
 }
 
 namespace {
@@ -178,6 +194,55 @@ TEST_CASE("protection mode: check() reads nothing while untouched, keeps a watch
 
     sigaction(SIGSEGV, &g_prev_segv, nullptr);
     sigaction(SIGBUS, &g_prev_bus, nullptr);
+    CHECK(g_unexpected.load() == 0);
+    tracker.unwatch(w);
+    tracker.uninstall();
+}
+
+// Regression (D-144): a fault on a page (another thread storing beside a texture) made it writable again with an
+// mprotect that could land after check() had made the page read-only again: the page stayed writable while the
+// tracker took it for protected, and later stores into the texture went unseen (GTA V drew stale textures, the screen
+// flickering with other textures' colours). Other threads store beside the texture all the time; every store into it
+// must be seen by the next check().
+TEST_CASE("protection mode: a store into a watched range is always seen while other threads fault on its page (D-144)")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    const u32 page = static_cast<u32>(GuestMemory::host_page_size());
+    const u32 base = PS_MEM_RSX_LOCAL_BASE + 0x300000;
+    REQUIRE(mem.commit(base, page));
+    WriteTracker tracker(mem);
+    tracker.set_protection(true);
+    tracker.install();
+    struct sigaction sa {};
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_prev_segv);
+    sigaction(SIGBUS, &sa, &g_prev_bus);
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> noise;
+    for (u32 k = 0; k < 3; k++) {
+        noise.emplace_back([&, k] {
+            u32 v = 0;
+            while (!stop.load(std::memory_order_relaxed)) ps_write32(mem.base(), base + 0x800 + 64 * k, ++v);
+        });
+    }
+    auto w = tracker.watch(base + 0x100, 0x100);
+    u32 missed = 0;
+    for (u32 i = 1; i <= 50000; i++) {
+        tracker.check(w);                                  // may make the page read-only again
+        ps_write32(mem.base(), base + 0x180, 0x5A000000 + i); // a new value in the range: must be seen
+        if (!tracker.check(w)) missed++;
+        tracker.unwatch(w); // as the texture cache does with a dirty texture: decoded again, watched again
+        w = tracker.watch(base + 0x100, 0x100);
+    }
+    stop = true;
+    for (auto& t : noise) t.join();
+    sigaction(SIGSEGV, &g_prev_segv, nullptr);
+    sigaction(SIGBUS, &g_prev_bus, nullptr);
+    CHECK(missed == 0);
     CHECK(g_unexpected.load() == 0);
     tracker.unwatch(w);
     tracker.uninstall();

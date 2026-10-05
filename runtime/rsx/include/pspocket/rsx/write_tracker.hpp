@@ -50,6 +50,7 @@ public:
     // Starts watching [addr, addr + size). In protection mode the pages are made read-only (only committed pages;
     // a page is protected once however many watches cover it). The snapshot is taken before protecting, so a store
     // racing with watch() is either visible to the caller's subsequent read or makes the watch dirty.
+    // watch(), check(), is_dirty() and unwatch() are called from one thread (the RSX thread); any thread may fault.
     Watch watch(u32 addr, u32 size);
     // True if the range may have changed since the watch was taken.
     bool is_dirty(const Watch& w) const;
@@ -85,10 +86,29 @@ private:
     u64 page_count_;
     std::unique_ptr<std::atomic<u32>[]> generation_;
     std::unique_ptr<std::atomic<u16>[]> watchers_;
-    // Per-page protection state: kUnprotected (never, or no watch left), kProtected (read-only, watched),
-    // kResolved (a fault made it writable again; the next watch() protects it again).
-    static constexpr u8 kUnprotected = 0, kProtected = 1, kResolved = 2;
-    std::unique_ptr<std::atomic<u8>[]> protected_;
+    // Per-page protection state (D-144): the low bits are one of
+    //   kUnprotected  never protected by this tracker: a fault there is not ours;
+    //   kProtecting   protect_pages() is making it read-only;
+    //   kProtected    read-only, watched;
+    //   kResolving    a fault is making it writable;
+    //   kResolved     writable after a fault, still watched (the next watch() or check() protects it again);
+    //   kReleasing    unwatch() is making it writable;
+    //   kReleased     writable, no watch left.
+    // Every mprotect happens in one of the transitional states (protecting, resolving, releasing), entered by
+    // compare-and-swap and left by the thread that entered it; whoever meets one waits for it to end. So the state
+    // always says what the page's protection is. Before, a fault's mprotect to writable could land after check() had
+    // made the page read-only again: the page stayed writable while the tracker took it for read-only, and every later
+    // store went unseen (GTA V drew stale textures, flickering, on the iPhone and the Mac); and a page could be left
+    // read-only while the tracker took it for writable (a store there crashed).
+    // A fault is handled after its store faulted: by then the page may be protected again (resolved again, harmless)
+    // or released. Released, the store is retried (the page is writable); the bits above the state count those
+    // retries, and past kMaxStale a fault that is not ours (an unaligned atomic) goes on to the crash handler.
+    static constexpr u16 kUnprotected = 0, kProtecting = 1, kProtected = 2, kResolving = 3, kResolved = 4,
+                         kReleasing = 5, kReleased = 6;
+    static constexpr u16 kStateMask = 7, kStaleOne = 8, kMaxStale = 1024;
+    // Waits while another thread changes page `p`'s protection; returns the state then (with its count).
+    u16 settled_state(u64 p) const;
+    std::unique_ptr<std::atomic<u16>[]> state_;
     std::atomic<bool> protection_{false};
     std::atomic<u64> faults_{0};
 };
