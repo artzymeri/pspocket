@@ -39,7 +39,7 @@ struct GameView: View {
                   systemImage: game.controllerName == nil ? "hand.tap" : "gamecontroller.fill")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Text("The game runs on the interpreter for now: expect a slow start, about a minute to the first screens.")
+            Text("The game's code runs translated ahead of time: about a minute from Boot to the first screens.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -109,8 +109,9 @@ struct GameScreen: View {
     }
 }
 
-/// On-screen buttons laid over the game in landscape: shoulders at the top corners, the D-pad bottom left, the face
-/// buttons bottom right, Select and Start in the middle. Each button is down while touched.
+/// On-screen buttons laid over the game in landscape: shoulders at the top corners, the D-pad on the left with the
+/// left stick under it, the face buttons on the right with the right stick under them, Select, Start, L3 and R3 in the
+/// middle. Each button is down while touched; a stick follows the thumb and springs back when let go.
 private struct TouchPad: View {
     let game: GameModel
 
@@ -125,15 +126,27 @@ private struct TouchPad: View {
             }
             Spacer()
             HStack(alignment: .bottom) {
-                diamond(top: (.up, "▲"), left: (.left, "◀"), right: (.right, "▶"), bottom: (.down, "▼"))
+                VStack(spacing: 10) {
+                    diamond(top: (.up, "▲"), left: (.left, "◀"), right: (.right, "▶"), bottom: (.down, "▼"))
+                    VirtualStick(game: game, stick: .left)
+                }
                 Spacer()
-                HStack(spacing: 18) {
-                    PadButton(game: game, button: .select, label: "SELECT", shape: .capsule)
-                    PadButton(game: game, button: .start, label: "START", shape: .capsule)
+                VStack(spacing: 12) {
+                    HStack(spacing: 18) {
+                        PadButton(game: game, button: .l3, label: "L3", shape: .capsule)
+                        PadButton(game: game, button: .r3, label: "R3", shape: .capsule)
+                    }
+                    HStack(spacing: 18) {
+                        PadButton(game: game, button: .select, label: "SELECT", shape: .capsule)
+                        PadButton(game: game, button: .start, label: "START", shape: .capsule)
+                    }
                 }
                 .padding(.bottom, 6)
                 Spacer()
-                diamond(top: (.triangle, "△"), left: (.square, "□"), right: (.circle, "○"), bottom: (.cross, "✕"))
+                VStack(spacing: 10) {
+                    diamond(top: (.triangle, "△"), left: (.square, "□"), right: (.circle, "○"), bottom: (.cross, "✕"))
+                    VirtualStick(game: game, stick: .right)
+                }
             }
         }
     }
@@ -148,6 +161,46 @@ private struct TouchPad: View {
             }
             PadButton(game: game, button: bottom.0, label: bottom.1)
         }
+    }
+}
+
+/// An analog stick: a base the thumb drags a knob across. Its deflection from the base's centre, clamped to the base,
+/// is the stick's position (y grows downwards, as on the PS3); letting go recentres it.
+private struct VirtualStick: View {
+    let game: GameModel
+    let stick: GameModel.Stick
+    @State private var knob: CGSize = .zero
+    private let radius: CGFloat = 46
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.white.opacity(0.12))
+                .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1.5))
+                .frame(width: radius * 2, height: radius * 2)
+            Circle()
+                .fill(Color.white.opacity(knob == .zero ? 0.3 : 0.5))
+                .frame(width: 42, height: 42)
+                .offset(knob)
+        }
+        .frame(width: radius * 2 + 24, height: radius * 2 + 24)
+        .contentShape(Circle())
+        .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .local)
+            .onChanged { value in
+                let center = radius + 12
+                var dx = value.location.x - center, dy = value.location.y - center
+                let length = (dx * dx + dy * dy).squareRoot()
+                if length > radius {
+                    dx *= radius / length
+                    dy *= radius / length
+                }
+                knob = CGSize(width: dx, height: dy)
+                game.setStick(stick, x: Float(dx / radius), y: Float(dy / radius))
+            }
+            .onEnded { _ in
+                knob = .zero
+                game.setStick(stick, x: 0, y: 0)
+            })
     }
 }
 

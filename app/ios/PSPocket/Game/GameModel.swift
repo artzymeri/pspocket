@@ -167,7 +167,7 @@ final class GameModel {
 
     /// The on-screen buttons, used when no game controller is connected.
     enum Button: CaseIterable {
-        case up, down, left, right, cross, circle, square, triangle, start, select, l1, r1, l2, r2
+        case up, down, left, right, cross, circle, square, triangle, start, select, l1, r1, l2, r2, l3, r3
 
         /// (button[2] bit, button[3] bit) of CellPadData.
         var bits: (UInt16, UInt16) {
@@ -177,6 +177,8 @@ final class GameModel {
             case .right: (0x20, 0)
             case .up: (0x10, 0)
             case .start: (0x08, 0)
+            case .r3: (0x04, 0)
+            case .l3: (0x02, 0)
             case .select: (0x01, 0)
             case .square: (0, 0x80)
             case .cross: (0, 0x40)
@@ -188,6 +190,19 @@ final class GameModel {
             case .l2: (0, 0x01)
             }
         }
+    }
+
+    /// The on-screen analog sticks: -1...1 on each axis, y growing downwards as on the PS3; (0, 0) at rest.
+    enum Stick { case left, right }
+    private var touchLeft: (x: Float, y: Float) = (0, 0)
+    private var touchRight: (x: Float, y: Float) = (0, 0)
+
+    func setStick(_ stick: Stick, x: Float, y: Float) {
+        switch stick {
+        case .left: touchLeft = (x, y)
+        case .right: touchRight = (x, y)
+        }
+        sendPad()
     }
 
     func set(_ button: Button, down: Bool) {
@@ -260,6 +275,16 @@ final class GameModel {
         var pad = controllerPad
         pad.digital1 |= touch1
         pad.digital2 |= touch2
+        // An on-screen stick that is held moves its axes (a controller's sticks otherwise).
+        func axis(_ v: Float) -> UInt8 { UInt8(max(0, min(255, (v + 1) * 127.5))) }
+        if touchLeft.x != 0 || touchLeft.y != 0 {
+            pad.left_x = axis(touchLeft.x)
+            pad.left_y = axis(touchLeft.y)
+        }
+        if touchRight.x != 0 || touchRight.y != 0 {
+            pad.right_x = axis(touchRight.x)
+            pad.right_y = axis(touchRight.y)
+        }
         // Full pressure for on-screen presses of the press-sensitive buttons (same order as ps_game_pad.pressure).
         let touched: [(Bool, Int)] = [(touch1 & 0x20 != 0, 0), (touch1 & 0x80 != 0, 1), (touch1 & 0x10 != 0, 2),
             (touch1 & 0x40 != 0, 3), (touch2 & 0x10 != 0, 4), (touch2 & 0x20 != 0, 5), (touch2 & 0x40 != 0, 6),
