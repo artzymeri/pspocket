@@ -126,8 +126,13 @@ decoder, on FFmpeg (D-195, D-196, run 103): Sony's libvdec now runs in the test 
 and SPURS task exit callbacks, now pspocket's), and pspocket's matches it: Sony's sizes for every codec and level,
 pictures one access unit late as Sony's, items and H.264 information in Sony's places read from the stream, frame
 buffers in Sony's layout, pictures exact (RGB within one step). VC-1, DivX 3.11 and MVC are not decoded yet.
+cellAdec, the audio decoder (D-197, run 104): pspocket's own front end and LPCM decoder, the same as Sony's libadec to
+the byte (221 answers and callbacks, 22 PCM outputs, every LPCM packing); every other codec goes to Sony's codec
+module through pspocket's front end (the loader now links what a pspocket library takes from the firmware's modules),
+also the same as through Sony's libadec.
 
-Next: cellAdec and ATRAC on FFmpeg (D-181), then the image decoders, each measured against Sony's the same way; then
+Next: pspocket's own codec cores on FFmpeg in place of Sony's, ATRAC3plus first (D-181), then the image decoders, each
+measured against Sony's the same way; then
 docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
 with games nobody has analysed (each run's log names what is still missing).
 

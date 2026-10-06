@@ -4344,6 +4344,45 @@ MPEG-4 part 2 (DivX) with FFmpeg as RPCS3's does, and shows the game what Sony's
 Tests: tests/hle/test_vdec.cpp (pspocket's decoder over synthetic H.264; the comparison with Sony's when the firmware
 is there; two hidden probes that dump Sony's output for working out the formats).
 
+## D-197 · 2026-10-06 · cellAdec is pspocket's own front end with its own LPCM core; Sony's codec cores behind it
+
+Step 3 of the plan (D-179) for audio. A PS3's libadec is two layers: a front end the game calls (the context in the
+game's memory, the PCM queues, the callbacks) and a core per codec (LPCM inside libadec; ATRAC3plus, MP3, AC-3, AAC,
+MPEG audio, ... each in its own firmware module, called through the operation table it exports). pspocket now has
+its own front end and LPCM core, as RPCS3 has them (runtime/hle/src/cellAdec.cpp, adec_lpcm.cpp):
+
+- **The front end** keeps Sony's context, frames and bitstream information blocks where Sony's are (the handle is the
+  memory aligned to 128 bytes; items at +0x558, 0x68 apart; information after the frames; the core's memory after
+  that, aligned), the two output queues, the PTS correction for access units without a PTS, and every check.
+  adecVerUpper is Sony's 0x492000 (RPCS3 has 0x491000).
+- **The LPCM core** (PAMF, Blu-ray and DVD packings) is RPCS3's port of libadec's: its context in the game's memory,
+  its command queue of four, the conversion to big-endian floats and the channel reordering, quirks kept (the DVD
+  20-bit path's missing shift). libadec runs it as a SPURS task; pspocket on a PPU thread ("HLE LPCM decoder").
+- **Every other codec goes to Sony's core module, through its operation table**, as Sony's libadec and RPCS3's
+  cellAdec call it. The cores run as the system library runs Sony's modules (translated, D-178; their SPU programs
+  on pspocket's SPURS). pspocket's own cores on FFmpeg replace them one codec at a time, each measured against Sony's
+  (ATRAC3plus first: it is the one games use most).
+- **The host's own imports (the loader).** A host library can import from the firmware's modules as the firmware's own
+  module of that library would (Registry::add_imports). cellAdec imports what libadec imports: each core's operation
+  table and its _SceAdecCorrectPtsValue_* function. The loader chooses those modules with the game's imports
+  (LleModules::decide, extend for a game's PRX) and links each export into HleProcess::link_import; the front end
+  reads them with HleProcess::imported. DTS, DTS-HD core, WMA Pro and WMA Lossless are in no retail firmware: a game
+  asking for one gets CELL_ADEC_ERROR_FATAL and a log line (Sony's libadec calls through an empty table and crashes).
+- **call_guest** passes arguments past eight in the caller's parameter save area (a core's open takes ten).
+- Pointers RPCS3 dereferences without a check are checked (D-042); a PCM handle out of range is FATAL.
+
+Measured against Sony's libadec (rule 8, run 104, the user's 4.92 firmware):
+
+- LPCM, the three packings: 221 answers, items, information blocks and callbacks and 22 PCM outputs (104,608 bytes)
+  the same, to the byte. That covers the sizes, the refusals, a full command queue (BUSY), a reserved Blu-ray layout
+  and a refused DVD layout (FATAL), the PTS correction, mono, 3/0, 3/2, 3/4+LFE, 16, 20 and 24 bits.
+- A firmware core through pspocket's front end (MPEG-1 layer I, frames built in the test): 43 lines and 4 PCM outputs
+  the same as through Sony's libadec, the PTS correction through the core's own function included.
+
+Tests: tests/hle/test_adec.cpp (pspocket's LPCM alone; both comparisons when the firmware is there),
+tests/hle/test_lle.cpp (the host's imports chosen and linked), tests/hle/test_hle.cpp (call_guest with eleven
+arguments).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

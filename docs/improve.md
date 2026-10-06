@@ -142,7 +142,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   structure are inferred from two streams (try a stream with picture order count type 0, cropping, no VUI); VC-1,
   DivX 3.11 and MVC need FFmpeg decoders (vc1, msmpeg4v3: LGPL) and a comparison; MPEG-2 needs a synthetic writer to be
   compared. Speed on a real movie: FFmpeg on one thread, then VideoToolbox for H.264.
-- **State:** open; cellAdec next.
+- **cellAdec (D-197):** the LPCM decoder runs on a PPU thread of its own per decoder (libadec uses a SPURS task); its
+  conversion is scalar (RPCS3's is SIMD: measure on a real Blu-ray LPCM stream before changing). Every other codec is
+  still Sony's core (translated, SPU code on pspocket's SPURS): ATRAC3plus, MP3, AC-3 and AAC next on FFmpeg, each
+  compared with Sony's core. No synthetic writer for those yet: ATRAC3plus has no encoder anywhere, so its comparison
+  needs a game's stream (a local run, nothing committed); MP2, AC-3 and AAC could use FFmpeg's encoders in a test-only
+  build. Layer I frames are written in the test.
+- **State:** open; codec cores next.
 
 ## The gate (D-149)
 
