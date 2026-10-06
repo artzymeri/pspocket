@@ -14,8 +14,12 @@
 // SPU task code (GETLLAR/PUTLLC) and PPU code (lwarx/stwcx, HLE) see consistent states. After every request the
 // workload's ready count in CellSpurs line 0 is updated, as libsre does.
 //
-// Not implemented (GTA V's tasks don't use them; each stops with a fatal log): CellSpursTaskset2 tasks and exit
-// callbacks (exit-code containers), which run more of libsre's SPU code; elf bit 1 (a debugger break) is logged.
+// A task whose ELF word has bit 0 (and not bit 2) has an exit callback (D-195): its descriptor (code EA | size in
+// 128-byte units) and argument come from the CellSpursTaskset2's table at 0x1980 when it starts, and when it exits
+// the callback's code is loaded at 0x10000 and run with the taskset, task ID, exit code and argument (RPCS3
+// cellSpursSpu.cpp spursTasksetOnTaskExit, a draft of libsre's; Sony's libvdec chains its H.264 decoder's tasks so).
+// Not implemented (each stops with a fatal log): CellSpursTaskset2 tasks and libsre's own exit code handler, which
+// run more of libsre's SPU code; elf bit 1 (a debugger break) is logged.
 
 #include <atomic>
 #include <bit>
@@ -94,6 +98,8 @@ private:
     Next incident(); // after a task left the SPU: next task, or exit to the kernel
     void return_to_task(u32 result);
     [[noreturn]] void fatal(std::string_view what);
+    void run_exit_callback(u32 exit_code);
+    void store_exit_code(u32 container, u32 exit_code);
 
     u32 task_id() const { return ps_read32(ls_, ls::ts_task_id); }
     u8* guest(u32 ea) const { return base_ + ea; }
@@ -294,7 +300,6 @@ void Policy::start_task(u32 id, u64 elf)
 {
     const u32 flags = static_cast<u32>(elf & 7);
     if (flags & 4) fatal("a CellSpursTaskset2 task is not implemented");
-    if ((flags & 5) == 1) fatal("a task with an exit code container is not implemented");
     if (flags & 2) PS_LOG_WARN(kTaskChan, "task {} of taskset {:#x} asks for a debugger break at dispatch; ignored", id, taskset_);
     u32 entry = 0, lowest = 0;
     ps_write32(ls_, ls::ctx_guid, ls::task_top);
@@ -307,6 +312,14 @@ void Policy::start_task(u32 id, u64 elf)
     ps_write64(ls_, ls::ctx_exit_cb, 0);
     ps_write32(ls_, ls::ctx_exit_code, 0);
     ps_write32(ls_, ls::ctx_flags, flags & 5);
+    if ((flags & 5) == 1) { // the exit callback: descriptor and argument from the CellSpursTaskset2's table
+        if (ps_read32(base_, taskset_ + ts_off::size) <= 0x28FF)
+            fatal(std::format("task {} has an exit callback (ELF word {:#x}) in a taskset that is not a CellSpursTaskset2",
+                id, elf));
+        std::memcpy(ls_ + ls::ctx_exit_cb, guest(taskset_ + kTaskExitCallbacks + 16 * id), 16);
+        PS_LOG_DEBUG(kTaskChan, "task {} of taskset {:#x}: exit callback {:#x}, argument {:#x}", id, taskset_,
+            ps_read64(ls_, ls::ctx_exit_cb), ps_read64(ls_, ls::ctx_exit_arg));
+    }
 
     // The first 8 and every 1024th: in its first mission GTA V starts thousands of tasks a second.
     static std::atomic<u64> starts{0};
@@ -420,6 +433,82 @@ s32 Policy::save_context()
     return lv2::CELL_OK;
 }
 
+// An exiting task's callback (RPCS3 spursTasksetOnTaskExit): its code (EA | size in 128-byte units, as libsre's PPU
+// side encodes the descriptors it writes) loaded at 0x10000 and called with $3 the taskset, $4 the task ID, $5 the
+// exit code and $6 the argument; it returns to a `stop` of its own. libsre's own handlers are markers here (spurs.hpp):
+// those are not implemented.
+void Policy::run_exit_callback(u32 exit_code)
+{
+    const u32 desc = static_cast<u32>(ps_read64(ls_, ls::ctx_exit_cb));
+    const u32 ea = desc & ~0x7Fu, size = (desc & 0x7F) * 128;
+    if (ea == SPURS_IMG_ADDR_TASK_EXIT_CODE_HANDLER) {
+        store_exit_code(static_cast<u32>(ps_read64(ls_, ls::ctx_exit_arg)), exit_code);
+        return;
+    }
+    if (ea == SPURS_IMG_ADDR_TASK2_HANDLER)
+        fatal(std::format("task {}: libsre's CellSpursTaskset2 task handler ({:#x}) is not implemented", task_id(), desc));
+    if (!size || ls::exit_callback + size > ls::size) fatal(std::format("task {}: exit callback {:#x}", task_id(), desc));
+    std::memcpy(ls_ + ls::exit_callback, guest(ea), size);
+    attach_program(w_.ctx, base_, {ImageKind::Task, ea, ls::exit_callback, size, ls::exit_callback});
+    SPUContext& c = w_.ctx;
+    c.gpr[0] = word0(ls::exit_callback_return);
+    c.gpr[3] = ps_spu_v128{};
+    c.gpr[3].u64[1] = taskset_;
+    c.gpr[4] = word0(task_id());
+    c.gpr[5] = word0(exit_code);
+    c.gpr[6] = ps_spu_v128{};
+    c.gpr[6].u64[1] = ps_read64(ls_, ls::ctx_exit_arg);
+    c.pc = ls::exit_callback;
+    ps_write32(ls_, ls::exit_callback_return, kExitCallbackStop);
+    PS_LOG_DEBUG(kTaskChan, "task {} of taskset {:#x}: exit callback {:#x} ({:#x} bytes), exit code {:#x}", task_id(),
+        taskset_, ea, size, exit_code);
+    const u32 reason = ps_spu_run(&c);
+    if (reason == PS_SPU_STOP_REQUESTED) return;
+    if (reason != PS_SPU_STOP_SIGNAL || c.stop_code != kExitCallbackStop || c.pc != ls::exit_callback_return + 4)
+        fatal(std::format("task {}: its exit callback {:#x} stopped (reason {}, code {:#x}) instead of returning", task_id(),
+            ea, reason, c.stop_code));
+}
+
+// libsre's exit code handler (the SPU code its CellSpursTaskset2 keeps at 0x1900, D-195), natively: the exit code goes
+// into the task's exit code container, one 128-byte line: the status word at +0x20 (bit 0 initialized, bit 2 an exit
+// code stored, bit 16 a PPU thread waits, bit 17 an SPU task waits), the exit code at +0x28, a waiting task's taskset
+// (u64) at +0x30 and its ID (a byte) at +0x38. A NULL or misaligned container, or one not initialized, is left alone (libsre's
+// handler returns an error nobody reads). Then the task that waits is signalled; a waiting PPU thread (an event flag
+// at +0x40) is not implemented.
+void Policy::store_exit_code(u32 container, u32 exit_code)
+{
+    if (!container || (container & 0x7F)) {
+        PS_LOG_ERROR(kTaskChan, "task {} of taskset {:#x}: exit code container {:#x} is NULL or misaligned", task_id(),
+            taskset_, container);
+        return;
+    }
+    u32 old = 0;
+    bool stored = false;
+    reservation_op(base_, container, [&](u8* line) {
+        old = ps_read32(line, 0x20);
+        stored = old & 1;
+        if (!stored) return false;
+        ps_write32(line, 0x20, old | 4);
+        ps_write32(line, 0x28, exit_code);
+        return true;
+    });
+    if (!stored) {
+        PS_LOG_ERROR(kTaskChan, "task {} of taskset {:#x}: exit code container {:#x} is not initialized", task_id(), taskset_,
+            container);
+        return;
+    }
+    PS_LOG_DEBUG(kTaskChan, "task {} of taskset {:#x}: exit code {:#x} into container {:#x} (status {:#x})", task_id(),
+        taskset_, exit_code, container, old);
+    if (old & (1u << 17)) {
+        const u64 waiter_taskset = ps_read64(base_, container + 0x30);
+        const u32 waiter = base_[container + 0x38];
+        if (const s32 rc = send_signal(base_, static_cast<u32>(waiter_taskset), waiter); rc != lv2::CELL_OK)
+            PS_LOG_ERROR(kTaskChan, "exit code container {:#x}: signalling task {} of taskset {:#x}: {:#x}", container,
+                waiter, waiter_taskset, static_cast<u32>(rc));
+    }
+    if (old & (1u << 16)) fatal(std::format("exit code container {:#x}: a PPU thread waiting on it is not implemented", container));
+}
+
 // A task gave up the SPU (exit, yield, wait): its GUID in local store is cleared (the saved copy keeps it), then the
 // next task runs unless another workload should have the SPU.
 Next Policy::incident()
@@ -443,7 +532,7 @@ Next Policy::syscall()
         const u32 flags = ps_read32(ls_, ls::ctx_flags);
         if (flags == 4) fatal("a CellSpursTaskset2 task exits through libsre's exit handler (not implemented)");
         request(Request::Destroy);
-        if (static_cast<u32>(ps_read64(ls_, ls::ctx_exit_cb))) fatal("a task exit callback is not implemented");
+        if (static_cast<u32>(ps_read64(ls_, ls::ctx_exit_cb))) run_exit_callback(ps_read32(ls_, ls::ctx_exit_code));
         PS_LOG_DEBUG(kTaskChan, "SPURS {:#x}: task {} of taskset {:#x} exited ({:#x})", w_.sched.spurs, task_id(), taskset_,
             ps_read32(ls_, ls::ctx_exit_code));
         return incident();

@@ -57,6 +57,8 @@ constexpr u32 ctx_lr = 0x2C80, ctx_sp = 0x2C90, ctx_r80 = 0x2CA0, ctx_fpscr = 0x
               ctx_exit_arg = 0x2FC8, ctx_exit_code = 0x2FD0, ctx_flags = 0x2FD4, ctx_wait_object = 0x2FD8;
 constexpr u32 ctx_area_size = 0x380;
 constexpr u32 task_top = 0x3000;
+constexpr u32 exit_callback = 0x10000;       // where an exiting task's callback is loaded (RPCS3)
+constexpr u32 exit_callback_return = 0xA80;  // its return: a `stop` in the taskset policy module's unused space
 // Job chains (libsre's job chain policy module, D-055): a job returns to 0x2570 (after the module's call), its context
 // (CellSpursJobContext2) is at 0x4940, and binaries and buffers are 1 KB pages from 0x4C00 up to the 4 descriptor
 // buffers, which end at 0x3F800 (the module's stack is above).
@@ -73,6 +75,10 @@ constexpr u32 size = 0x40000;
 // 0x808, [0x1E0]). SPURS2's kernel 2 (libsre's second SPU kernel, entry 0x848) calls a module from 0x834, so a module
 // returns to 0x838, which is also its exit ([0x1E0]; RPCS3 CELL_SPURS_KERNEL2_EXIT_ADDR).
 constexpr u32 kSyscallStop = ls::pm_syscall;
+// The return of a task's exit callback (spurs_taskset.cpp).
+constexpr u32 kExitCallbackStop = ls::exit_callback_return;
+// CellSpursTaskset2's per-task exit callbacks (16 bytes each: descriptor, argument; RPCS3 task_exit_code[128]).
+constexpr u32 kTaskExitCallbacks = 0x1980;
 // The return address of a job (job chains).
 constexpr u32 kJobReturnStop = ls::jc_return;
 constexpr u32 kKernelSelect = 0x290, kKernelReturn = 0x804, kKernelExit = 0x808, kKernel2Exit = 0x838;

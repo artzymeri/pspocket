@@ -774,3 +774,116 @@ TEST_CASE("SPURS workers: a task runs the translated program of the segment hold
     CHECK(g_entry_segment_runs.load() == 1);
     ps_spu_unregister_program(&program);
 }
+
+// ------------------------------------------------------------------------------------------------- exit callbacks
+
+namespace {
+
+constexpr u32 kTs2Attr = kData + 0x2C000, kTs2B = kData + 0x30000; // a CellSpursTaskset2 (10496 bytes)
+constexpr u32 kCallback = kData + 0x34000;                          // an exit callback's code (128-aligned)
+constexpr u32 kContainer = kData + 0x35000;                         // an exit code container (128-aligned)
+constexpr u32 kOut3 = kData + 0x36000;
+
+// A CellSpursTaskset2 that no SPU selects until `run` gives it priority 1 on SPU 0, so its tasks can be prepared first.
+struct Taskset2Fixture : SpursFixture {
+    u32 wid = 0;
+    Taskset2Fixture() : SpursFixture(0)
+    {
+        REQUIRE(a.call("_cellSpursTasksetAttribute2Initialize", kTs2Attr, 1) == 0);
+        std::memset(base + kTs2Attr + 0x10, 0, 8); // priorities: on no SPU yet
+        REQUIRE(a.call("cellSpursCreateTaskset2", kSpurs, kTs2B, kTs2Attr) == 0);
+        wid = ps_read32(base, kTs2B + 0x74);
+    }
+    void run()
+    {
+        REQUIRE(a.call("cellSpursSetPriority", kSpurs, wid, 0, 1) == 0);
+        REQUIRE(a.call("cellSpursWakeUp", kSpurs) == 0);
+    }
+    // Marks task `id` as having an exit callback (ELF bit 0) with `descriptor` (EA | size in 128-byte units) and
+    // `argument`, as Sony's libvdec's tasks and libsre's cellSpursCreateTaskWithAttribute leave it.
+    void set_exit_callback(u32 id, u64 descriptor, u64 argument)
+    {
+        const u32 info = kTs2B + 0x80 + 0x30 * id;
+        ps_write64(base, info + 0x10, ps_read64(base, info + 0x10) | 1);
+        ps_write64(base, kTs2B + 0x1980 + 16 * id, descriptor);
+        ps_write64(base, kTs2B + 0x1988 + 16 * id, argument);
+    }
+};
+
+// A task that writes 1 to the EA in its argument, then exits with `code` (cellSpursTaskExit puts it at 0x2FD0).
+Program exiting_task(u32 code)
+{
+    Program p;
+    p.emit(as::ila(1, 0x3FFD0));
+    p.emit(as::ori(81, 3, 0));
+    p.emit(as::il(21, 1));
+    p.put(21, 81, 0);
+    p.load32(20, code);
+    p.emit(as::ila(22, 0x2FD0));
+    p.emit(as::stqd(20, 0, 22));
+    p.syscall(0);
+    return p;
+}
+
+} // namespace
+
+TEST_CASE("SPURS workers: an exiting task's exit callback runs with the taskset, task ID, exit code and argument (D-195)",
+    "[hle][spurs][spurs-run]")
+{
+    Taskset2Fixture s;
+    u8* b = s.base;
+    write_task_elf(b, kElf, exiting_task(0x55));
+    ps_write32(b, kArg, kOut3);
+    // The callback (loaded at 0x10000): $5 (exit code) to the EA in $6 (the argument, a doubleword: its low word is
+    // bytes 4..7, as libsre's handler reads it), $4 (task ID) after it, then $3 (the taskset), and returns.
+    Program cb;
+    cb.emit(as::rotqbyi(81, 6, 4));
+    cb.put(5, 81, 0x40);
+    cb.put(4, 81, 0x50);
+    cb.put(3, 81, 0x60);
+    cb.emit(as::bi(0));
+    std::memset(b + kCallback, 0, 0x400);
+    for (usize i = 0; i < cb.code.size(); i++) ps_write32(b, kCallback + 4 * static_cast<u32>(i), cb.code[i]);
+    const u32 units = static_cast<u32>((cb.code.size() * 4 + 127) / 128);
+
+    REQUIRE(s.a.call("cellSpursCreateTask", kTs2B, kId, kElf, 0, 0, 0, kArg) == 0);
+    const u32 id = ps_read32(b, kId);
+    s.set_exit_callback(id, kCallback | units, kOut3);
+    s.run();
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut3 + 0x40) != 0; }));
+    CHECK(ps_read32(b, kOut3) == 1);              // the task ran
+    CHECK(ps_read32(b, kOut3 + 0x40) == 0x55);    // its exit code
+    CHECK(ps_read32(b, kOut3 + 0x50) == id);      // its ID
+    CHECK(ps_read64(b, kOut3 + 0x60) == kTs2B);   // the taskset (the preferred doubleword)
+    REQUIRE(wait_for([&] { return ps_read32(b, kTs2B + 0x30) == 0; })); // destroyed
+}
+
+TEST_CASE("SPURS workers: libsre's exit code handler stores the code in the container and signals the waiting task "
+          "(D-195)",
+    "[hle][spurs][spurs-run]")
+{
+    Taskset2Fixture s;
+    u8* b = s.base;
+    // Task 0 waits for a signal (and then reports, as waiting_task does); task 1 exits with 0x77 into the container,
+    // whose status says it is initialized (bit 0) and that task 0 of this taskset waits (bit 17).
+    write_task_elf(b, kElf, waiting_task());
+    write_task_elf(b, kElf + 0x1000, exiting_task(0x77));
+    s.set_pattern_top_block();
+    ps_write32(b, kArg, kOut);
+    ps_write32(b, kArg2, kOut2);
+    REQUIRE(s.a.call("cellSpursCreateTask", kTs2B, kId, kElf, kCtx, 0xC00, kPattern, kArg) == 0);
+    REQUIRE(s.a.call("cellSpursCreateTask", kTs2B, kId + 4, kElf + 0x1000, 0, 0, 0, kArg2) == 0);
+    const u32 waiter = ps_read32(b, kId), exiter = ps_read32(b, kId + 4);
+    std::memset(b + kContainer, 0, 0x80);
+    ps_write32(b, kContainer + 0x20, 1u | (1u << 17));
+    ps_write64(b, kContainer + 0x30, kTs2B);
+    ps_write8(b, kContainer + 0x38, static_cast<u8>(waiter));
+    s.set_exit_callback(exiter, ps_read64(b, kTs2B + 0x1900), kContainer); // libsre's handler (its descriptor at 0x1900)
+    s.run();
+
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut2) == 1; }));
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 32) == 0x80808080; })); // the waiter was signalled and resumed
+    CHECK(ps_read32(b, kContainer + 0x20) == (1u | 4u | (1u << 17)));        // an exit code stored
+    CHECK(ps_read32(b, kContainer + 0x28) == 0x77);
+    REQUIRE(wait_for([&] { return ps_read32(b, kTs2B + 0x30) == 0; }));       // both destroyed
+}
