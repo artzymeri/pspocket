@@ -239,6 +239,9 @@ public:
     // A whole guest file read into `out` (a host-directory mount or an image), for the host's own use (the loader
     // reading a PRX module the game loads, D-159). False when it is not a readable regular file.
     bool vfs_read_file(std::string_view vpath, std::vector<u8>& out) const;
+    // The bytes of every file under a guest directory (a host-directory mount or an image), each rounded up to
+    // `rounding` (RPCS3 fs::get_dir_size, for cellGame's sizes). Nullopt when the path isn't a readable directory.
+    std::optional<u64> vfs_tree_size(std::string_view vpath, u64 rounding = 1) const;
     // Opens an NPD-encrypted file (D-165): sys_fs_open's 8-byte type argument asks for SDATA (0x18000000010) or
     // EDATA (2) and the file starts "NPD\0". Returns the plain file read through `encrypted`, or null with `error`
     // set; sys_fs_open then fails with CELL_EFSSPECIFIC, as RPCS3's does. Unset (the default), every such file fails.

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <thread>
 
 #include "internal.hpp"
@@ -591,6 +592,41 @@ bool Kernel::vfs_read_file(std::string_view vpath, std::vector<u8>& out) const
     const bool ok = !std::ferror(f);
     std::fclose(f);
     return ok;
+}
+
+std::optional<u64> Kernel::vfs_tree_size(std::string_view vpath, u64 rounding) const
+{
+    const auto align = [rounding](u64 size) { return rounding > 1 ? (size + rounding - 1) / rounding * rounding : size; };
+    const Vfs::Resolved r = impl_->vfs.resolve(vpath);
+    if (!r.mount) return std::nullopt;
+    if (r.mount->image) {
+        const VfsImage& image = *r.mount->image;
+        const auto walk = [&](const auto& self, const std::string& path) -> std::optional<u64> {
+            const auto entries = image.list(path);
+            if (!entries) return std::nullopt;
+            u64 total = 0;
+            for (const auto& [name, st] : *entries) {
+                if (!st.dir) {
+                    total += align(st.size);
+                } else if (const auto sub = self(self, path.empty() ? name : path + "/" + name)) {
+                    total += *sub;
+                } else {
+                    return std::nullopt;
+                }
+            }
+            return total;
+        };
+        return walk(walk, std::string(r.image_path));
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(r.host, ec)) return std::nullopt;
+    u64 total = 0;
+    for (auto it = std::filesystem::recursive_directory_iterator(r.host, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_regular_file(ec)) total += align(it->file_size(ec));
+    }
+    if (ec) return std::nullopt;
+    return total;
 }
 
 std::shared_ptr<PpuThread> Kernel::thread(u32 id) const { return impl_->threads.get<PpuThread>(id); }

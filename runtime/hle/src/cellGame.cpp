@@ -12,8 +12,15 @@
 // process here) and act on its answer; cellDiscGameGetBootDiscInfo reads the disc's PARAM.SFO; the disc change
 // callbacks are kept for a disc change the hosts can't make yet. The error dialog errDialog asks for is logged, as if
 // the user closed it at once (D-044).
+//
+// Every function RPCS3 registers is here (D-183): the param ints and strings, sizes (Kernel::vfs_tree_size, which
+// sizes a disc image too), the patch check, deleting game data, themes (to /dev_hdd0/theme, named by their SHA-256),
+// and cellSysutil's HddGameCheck2, CheckCreate, sizes, system versions, exit dialogs and the disc change callbacks.
 
 #include <algorithm>
+#include <vector>
+#include <span>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -27,11 +34,13 @@
 
 #include "guest.hpp"
 #include "psf.hpp"
+#include "sysutil.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/hash.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -39,7 +48,9 @@ namespace {
 constexpr std::string_view kChan = "cellGame";
 
 enum : u32 {
+    CELL_GAME_RET_CANCEL = 1,
     CELL_GAME_RET_NONE = 2,
+    CELL_GAME_ERROR_NOTFOUND = 0x8002CB04,
     CELL_GAME_ERROR_BROKEN = 0x8002CB05,
     CELL_GAME_ERROR_PARAM = 0x8002CB07,
     CELL_GAME_ERROR_ACCESS_ERROR = 0x8002CB09,
@@ -48,6 +59,9 @@ enum : u32 {
     CELL_GAME_ERROR_BUSY = 0x8002CB23,
     CELL_GAME_ERROR_INVALID_ID = 0x8002CB25,
     CELL_GAME_ERROR_EXIST = 0x8002CB26,
+    CELL_GAME_ERROR_NOTPATCH = 0x8002CB27,
+    CELL_GAME_ERROR_INVALID_THEME_FILE = 0x8002CB28,
+    CELL_GAME_ERROR_NOSPACE = 0x8002CB20,
 };
 constexpr u32 CELL_GAME_GAMETYPE_DISC = 1, CELL_GAME_GAMETYPE_HDD = 2, CELL_GAME_GAMETYPE_GAMEDATA = 3;
 constexpr s32 CELL_GAME_SIZEKB_NOTCALC = -1;
@@ -316,11 +330,14 @@ s32 cellGameCreateGameData(PPUContext& ctx, u32 init, u32 tmp_content_info_path,
     return lv2::CELL_OK;
 }
 
-// RPCS3 get_param_string_key: the PARAM.SFO key of an ID, and whether game data (or the disc / HDD game) may read it.
+// RPCS3 get_param_string_key: the PARAM.SFO key of an ID, its size, whether game data (or the disc / HDD game) may
+// read it, and whether game data may write it (cellGameSetParamString).
 struct StringKey {
     std::string_view name;
     bool game_data = false;
     bool other = false;
+    bool set = false;
+    u32 max_size = 0;
 };
 
 StringKey param_string_key(s32 id)
@@ -328,12 +345,12 @@ StringKey param_string_key(s32 id)
     static constexpr std::string_view kTitles[] = {"TITLE_00", "TITLE_01", "TITLE_02", "TITLE_03", "TITLE_04",
         "TITLE_05", "TITLE_06", "TITLE_07", "TITLE_08", "TITLE_09", "TITLE_10", "TITLE_11", "TITLE_12", "TITLE_13",
         "TITLE_14", "TITLE_15", "TITLE_16", "TITLE_17", "TITLE_18", "TITLE_19"};
-    if (id == 0 || id == 1) return {"TITLE", true, true};             // TITLE, TITLE_DEFAULT
-    if (id >= 2 && id <= 21) return {kTitles[id - 2], true, false};   // the localized titles
-    if (id == 100) return {"TITLE_ID", true, true};
-    if (id == 101) return {"VERSION", true, false};
-    if (id == 105) return {"PS3_SYSTEM_VER", false, false};
-    if (id == 106) return {"APP_VER", true, true};
+    if (id == 0 || id == 1) return {"TITLE", true, true, true, CELL_GAME_SYSP_TITLE_SIZE}; // TITLE, TITLE_DEFAULT
+    if (id >= 2 && id <= 21) return {kTitles[id - 2], true, false, true, CELL_GAME_SYSP_TITLE_SIZE}; // localized
+    if (id == 100) return {"TITLE_ID", true, true, false, CELL_GAME_SYSP_TITLEID_SIZE};
+    if (id == 101) return {"VERSION", true, false, false, CELL_GAME_SYSP_VERSION_SIZE};
+    if (id == 105) return {"PS3_SYSTEM_VER", false, false, false, 8};
+    if (id == 106) return {"APP_VER", true, true, false, 6};
     return {};
 }
 
@@ -350,6 +367,225 @@ s32 cellGameGetParamString(PPUContext& ctx, s32 id, u32 buf, u32 bufsize)
     const std::string value = psf::get_string(perm.sfo, key.name);
     if (value.empty() && !perm.sfo.contains(key.name)) PS_LOG_WARN(kChan, "cellGameGetParamString: {} not found", key.name);
     put_string(guest_base(ctx), buf, bufsize, value);
+    return lv2::CELL_OK;
+}
+
+s32 check_name_string(std::string_view s, s32 minlen, s32 maxlen, u32 sdk); // below
+
+// RPCS3 cellGameSetParamString: game data the check may create (can_create) takes the strings game data may set;
+// they go into its PARAM.SFO at cellGameContentPermit.
+s32 cellGameSetParamString(PPUContext& ctx, s32 id, u32 buf)
+{
+    if (!buf) return error(CELL_GAME_ERROR_PARAM);
+    Permission& perm = permission();
+    std::lock_guard lock(perm.mutex);
+    if (!perm.open || perm.mode == Permission::Mode::NotSet) return error(CELL_GAME_ERROR_FAILURE);
+    const StringKey key = param_string_key(id);
+    if (key.name.empty()) return error(CELL_GAME_ERROR_INVALID_ID);
+    const bool game_data_mode = perm.mode == Permission::Mode::GameData || perm.mode == Permission::Mode::Patch;
+    if (!perm.can_create || !game_data_mode || !key.set) return error(CELL_GAME_ERROR_NOTSUPPORTED);
+    const std::string value = get_string(thread_of(ctx), buf, key.max_size);
+    perm.sfo[std::string(key.name)] = psf::string(key.max_size, value.substr(0, key.max_size - 1));
+    PS_LOG_INFO(kChan, "cellGameSetParamString: {} = \"{}\"", key.name, value);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellGameGetParamInt: PARENTAL_LEVEL (102), RESOLUTION (103) or SOUND_FORMAT (104) of the checked PARAM.SFO,
+// 0 when it has none.
+s32 cellGameGetParamInt(PPUContext& ctx, s32 id, u32 value)
+{
+    if (!value) return error(CELL_GAME_ERROR_PARAM);
+    Permission& perm = permission();
+    std::lock_guard lock(perm.mutex);
+    if (!perm.open) return error(CELL_GAME_ERROR_FAILURE);
+    std::string_view key;
+    switch (id) {
+    case 102: key = "PARENTAL_LEVEL"; break;
+    case 103: key = "RESOLUTION"; break;
+    case 104: key = "SOUND_FORMAT"; break;
+    default: return error(CELL_GAME_ERROR_INVALID_ID);
+    }
+    const auto it = perm.sfo.find(std::string(key));
+    const u32 v = it != perm.sfo.end() && it->second.format == psf::Format::Integer ? it->second.integer : 0;
+    if (it == perm.sfo.end()) PS_LOG_WARN(kChan, "cellGameGetParamInt: {} not found", key);
+    ps_write32(guest_base(ctx), value, v);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellGameGetSizeKB: the checked directory's size in KB, each file rounded up to 1 KB (0 while it doesn't
+// exist yet); the directory cellGameCreateGameData made while it is the temporary one.
+s32 cellGameGetSizeKB(PPUContext& ctx, u32 size)
+{
+    if (!size) return error(CELL_GAME_ERROR_PARAM);
+    lv2::PpuThread& t = thread_of(ctx);
+    ps_write32(t.kernel.base(), size, 0);
+    Permission& perm = permission();
+    std::lock_guard lock(perm.mutex);
+    if (!perm.open) return error(CELL_GAME_ERROR_FAILURE);
+    std::optional<u64> bytes;
+    std::string where;
+    if (!perm.temp.empty()) {
+        where = perm.temp;
+        std::error_code ec;
+        u64 total = 0;
+        for (auto it = std::filesystem::recursive_directory_iterator(perm.temp, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (it->is_regular_file(ec)) total += (it->file_size(ec) + 1023) / 1024 * 1024;
+        }
+        if (!ec) bytes = total;
+    } else {
+        // RPCS3 sizes /dev_hdd0/game/<dir>, the whole of /dev_hdd0/game for the disc (whose dir is empty).
+        where = "/dev_hdd0/game/" + perm.dir;
+        bytes = t.kernel.vfs_tree_size(where, 1024);
+    }
+    if (!bytes) {
+        PS_LOG_INFO(kChan, "cellGameGetSizeKB: {} doesn't exist: 0 KB", where);
+        return lv2::CELL_OK;
+    }
+    ps_write32(t.kernel.base(), size, static_cast<u32>(*bytes / 1024));
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellGamePatchCheck: only a game booted from a patch (category GD) has one; the session then reads its
+// PARAM.SFO. The booted game's category comes from its PARAM.SFO.
+s32 cellGamePatchCheck(PPUContext& ctx, u32 size, u32 reserved)
+{
+    (void)reserved;
+    const GameInfo& g = game();
+    psf::Registry sfo;
+    if (auto parsed = psf::parse(g.param_sfo)) sfo = std::move(*parsed);
+    if (psf::get_string(sfo, "CATEGORY") != "GD") return error(CELL_GAME_ERROR_NOTPATCH);
+    Permission& perm = permission();
+    std::lock_guard lock(perm.mutex);
+    if (perm.open) return error(CELL_GAME_ERROR_BUSY);
+    write_size(guest_base(ctx), size, CELL_GAME_SIZEKB_NOTCALC, 0);
+    perm.open = true;
+    perm.mode = Permission::Mode::Patch;
+    perm.dir = g.title_id;
+    perm.sfo = std::move(sfo);
+    perm.exists = true;
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellGameDeleteGameData: game data (category GD) under /dev_hdd0/game goes; not while the open session may
+// create it, nor what isn't game data.
+s32 cellGameDeleteGameData(PPUContext& ctx, u32 dir_name)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    const std::string name = dir_name ? get_string(t, dir_name, CELL_GAME_DIRNAME_SIZE + 1) : std::string();
+    if (!dir_name || check_name_string(name, 1, CELL_GAME_DIRNAME_SIZE, t.kernel.config().sdk_version) != 0)
+        return error(CELL_GAME_ERROR_PARAM);
+    Permission& perm = permission();
+    std::lock_guard lock(perm.mutex);
+    if (perm.open && perm.dir == name && perm.can_create) return error(CELL_GAME_ERROR_NOTSUPPORTED);
+    const std::string dir = "/dev_hdd0/game/" + name;
+    psf::Registry sfo;
+    const SfoLoad load = load_sfo(t.kernel.vfs_host_path(dir + "/PARAM.SFO"), sfo);
+    if (load != SfoLoad::Missing && psf::get_string(sfo, "CATEGORY") != "GD") return error(CELL_GAME_ERROR_NOTSUPPORTED);
+    if (sfo.empty()) return error(CELL_GAME_ERROR_NOTFOUND);
+    if (const std::string id = psf::get_string(sfo, "TITLE_ID"); !id.empty() && id != game().title_id)
+        PS_LOG_WARN(kChan, "cellGameDeleteGameData({}): its title ID {} is not this game's", name, id);
+    std::error_code ec;
+    std::filesystem::remove_all(t.kernel.vfs_host_path(dir), ec);
+    if (ec) {
+        PS_LOG_ERROR(kChan, "cellGameDeleteGameData: cannot remove {} ({})", dir, ec.message());
+        return error(CELL_GAME_ERROR_ACCESS_ERROR);
+    }
+    PS_LOG_INFO(kChan, "cellGameDeleteGameData: {} removed", dir);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 writes nothing to these paths and answers CELL_OK (the PS3's update and web content paths).
+s32 cellGameGetDiscContentInfoUpdatePath(PPUContext&, u32 update_path)
+{
+    if (!update_path) return error(CELL_GAME_ERROR_PARAM);
+    PS_LOG_WARN(kChan, "cellGameGetDiscContentInfoUpdatePath({:#x}): nothing written (RPCS3)", update_path);
+    return lv2::CELL_OK;
+}
+
+s32 cellGameGetLocalWebContentPath(PPUContext&, u32 content_path)
+{
+    if (!content_path) return error(CELL_GAME_ERROR_PARAM);
+    PS_LOG_WARN(kChan, "cellGameGetLocalWebContentPath({:#x}): nothing written (RPCS3)", content_path);
+    return lv2::CELL_OK;
+}
+
+// A theme (.p3t, "P3TF") installed as RPCS3 installs it: /dev_hdd0/theme/<title ID>_<SHA-256 of the file>.p3t, kept
+// if it is there already. Applying it (option 1) does nothing, as in RPCS3.
+std::string theme_path(std::span<const u8> bytes)
+{
+    const recomp::Sha256Digest digest = recomp::Sha256::hash(bytes);
+    std::string hex;
+    for (const u8 b : digest) hex += std::format("{:02x}", b);
+    return std::format("/dev_hdd0/theme/{}_{}.p3t", game().title_id, hex);
+}
+
+bool is_theme(std::span<const u8> bytes) { return bytes.size() >= 4 && std::memcmp(bytes.data(), "P3TF", 4) == 0; }
+
+s32 cellGameThemeInstall(PPUContext& ctx, u32 usrdir_path, u32 file_name, u32 option)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    const GuestString usrdir = read_cstr(t, usrdir_path, CELL_GAME_PATH_MAX);
+    if (!usrdir_path || !file_name || !usrdir.terminated || option > 1) return error(CELL_GAME_ERROR_PARAM);
+    const std::string src = usrdir.text + "/" + get_string(t, file_name, 0x100);
+    std::vector<u8> bytes;
+    if (!t.kernel.vfs_read_file(src, bytes)) return error(CELL_GAME_ERROR_NOTFOUND);
+    std::string lower = src;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (!lower.ends_with(".p3t") || !is_theme(bytes)) return error(CELL_GAME_ERROR_INVALID_THEME_FILE);
+    const std::string dst = theme_path(bytes), host = t.kernel.vfs_host_path(dst);
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(host, ec)) {
+        PS_LOG_INFO(kChan, "cellGameThemeInstall: {} is installed already", dst);
+        return lv2::CELL_OK;
+    }
+    std::filesystem::create_directories(std::filesystem::path(host).parent_path(), ec);
+    std::ofstream out(host, std::ios::binary);
+    if (host.empty() || !out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+        PS_LOG_ERROR(kChan, "cellGameThemeInstall: cannot write {}", dst);
+        return error(CELL_GAME_ERROR_ACCESS_ERROR);
+    }
+    PS_LOG_INFO(kChan, "cellGameThemeInstall: {} installed as {}", src, dst);
+    return lv2::CELL_OK;
+}
+
+// From a buffer: whole, or (with func and a buffer smaller than the file) piece by piece, func(fileOffset, readSize,
+// buf) after each piece; CELL_GAME_RET_CANCEL from it stops the install. The name hashes what is in the buffer
+// first, as RPCS3's (its whole file only when it fits).
+s32 cellGameThemeInstallFromBuffer(PPUContext& ctx, u32 file_size, u32 buf_size, u32 buf, u32 func, u32 option)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!buf || !file_size || (file_size > buf_size && !func) || buf_size < 4096 || option > 1)
+        return error(CELL_GAME_ERROR_PARAM);
+    const u32 first = std::min(file_size, buf_size);
+    if (!guest_readable(t, buf, first)) {
+        log_call_site(ctx, t.kernel.base(), "cellGameThemeInstallFromBuffer: buf is not guest memory");
+        return error(CELL_GAME_ERROR_PARAM);
+    }
+    const std::span<const u8> head(t.kernel.base() + buf, first);
+    const std::string dst = theme_path(head), host = t.kernel.vfs_host_path(dst);
+    std::error_code ec;
+    if (std::filesystem::exists(host, ec)) {
+        PS_LOG_INFO(kChan, "cellGameThemeInstallFromBuffer: {} is installed already", dst);
+        return lv2::CELL_OK;
+    }
+    if (!is_theme(head)) return error(CELL_GAME_ERROR_INVALID_THEME_FILE);
+    std::filesystem::create_directories(std::filesystem::path(host).parent_path(), ec);
+    std::ofstream out(host, std::ios::binary);
+    if (host.empty() || !out) return error(CELL_GAME_ERROR_ACCESS_ERROR);
+    if (!func || buf_size >= file_size) {
+        if (!out.write(reinterpret_cast<const char*>(t.kernel.base() + buf), file_size)) return error(CELL_GAME_ERROR_NOSPACE);
+        return lv2::CELL_OK;
+    }
+    for (u32 offset = 0; offset < file_size;) {
+        const u32 piece = std::min(buf_size, file_size - offset);
+        if (!out.write(reinterpret_cast<const char*>(t.kernel.base() + buf), piece)) return error(CELL_GAME_ERROR_NOSPACE);
+        offset += piece;
+        if (static_cast<s32>(call_guest(ctx, func, {offset, piece, buf})) == static_cast<s32>(CELL_GAME_RET_CANCEL)) {
+            PS_LOG_INFO(kChan, "cellGameThemeInstallFromBuffer: cancelled by the game at {} bytes", offset);
+            return static_cast<s32>(CELL_GAME_RET_CANCEL);
+        }
+    }
     return lv2::CELL_OK;
 }
 
@@ -383,6 +619,7 @@ enum : u32 {
     CELL_HDDGAME_ERROR_CBRESULT = 0x8002BA01,
     CELL_HDDGAME_ERROR_INTERNAL = 0x8002BA03,
     CELL_HDDGAME_ERROR_PARAM = 0x8002BA04,
+    CELL_HDDGAME_ERROR_FAILURE = 0x8002BA07,
     CELL_DISCGAME_ERROR_NOT_DISCBOOT = 0x8002BD02,
     CELL_DISCGAME_ERROR_PARAM = 0x8002BD03,
 };
@@ -721,6 +958,12 @@ s32 cellHddGameCheck(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog,
 // CELL_OK. An error result is CELL_GAMEDATA_ERROR_CBRESULT (funcstat_failed). Deviations: a setParam outside guest
 // memory is CELL_GAMEDATA_ERROR_PARAM (RPCS3 faults); a PARAM.SFO the host can't write is
 // CELL_GAMEDATA_ERROR_ACCESS_ERROR (RPCS3 aborts). RPCS3's delays are left out (D-044).
+// The game data directory cellGameDataCheckCreate2 checked last (RPCS3 game_data_check), for cellGameDataGetSizeKB.
+struct GameDataDir {
+    std::mutex mutex;
+    std::string dir;
+};
+
 s32 cellGameDataCheckCreate2(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog, u32 func_stat, u32 container)
 {
     lv2::PpuThread& t = thread_of(ctx);
@@ -732,6 +975,11 @@ s32 cellGameDataCheckCreate2(PPUContext& ctx, u32 version, u32 dir_name, u32 err
         check_args(ctx, call, version, dir_name, func_stat, "CELL_GAMEDATA_ERROR_PARAM");
     if (!name) return error(CELL_GAMEDATA_ERROR_PARAM);
     const std::string dir = "/dev_hdd0/game/" + *name, usrdir = dir + "/USRDIR";
+    {
+        GameDataDir& g = HleProcess::current()->state<GameDataDir>();
+        std::lock_guard lock(g.mutex);
+        g.dir = dir;
+    }
     psf::Registry sfo;
     const bool new_data = load_checked_sfo(t.kernel.vfs_host_path(dir + "/PARAM.SFO"), sfo) == SfoLoad::Missing;
     const std::string cat = psf::get_string(sfo, "CATEGORY");
@@ -891,6 +1139,113 @@ s32 cellDiscGameRegisterDiscChangeCallback(PPUContext& ctx, u32 func_eject, u32 
     return lv2::CELL_OK;
 }
 
+// cellGameRegisterDiscChangeCallback: the same manager, under cellGame's name (RPCS3).
+s32 cellGameRegisterDiscChangeCallback(PPUContext& ctx, u32 func_eject, u32 func_insert)
+{
+    return cellDiscGameRegisterDiscChangeCallback(ctx, func_eject, func_insert);
+}
+
+// RPCS3 unregister_callbacks: both callbacks go; CELL_OK.
+s32 cellDiscGameUnregisterDiscChangeCallback(PPUContext&)
+{
+    DiscChange& d = HleProcess::current()->state<DiscChange>();
+    std::lock_guard lock(d.mutex);
+    d.eject = 0;
+    d.insert = 0;
+    PS_LOG_INFO(kChan, "cellDiscGameUnregisterDiscChangeCallback()");
+    return lv2::CELL_OK;
+}
+
+s32 cellGameUnregisterDiscChangeCallback(PPUContext& ctx) { return cellDiscGameUnregisterDiscChangeCallback(ctx); }
+
+// RPCS3: cellHddGameCheck2 is cellHddGameCheck, cellGameDataCheckCreate is cellGameDataCheckCreate2 (the PS3's older
+// one also computes the size).
+s32 cellHddGameCheck2(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog, u32 func_stat, u32 container)
+{
+    return cellHddGameCheck(ctx, version, dir_name, err_dialog, func_stat, container);
+}
+
+s32 cellGameDataCheckCreate(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog, u32 func_stat, u32 container)
+{
+    return cellGameDataCheckCreate2(ctx, version, dir_name, err_dialog, func_stat, container);
+}
+
+// The directory the game booted from: the disc's PS3_GAME, or an HDD game's /dev_hdd0/game/<title ID>.
+std::string boot_dir()
+{
+    const GameInfo& g = game();
+    return g.boot == GameInfo::Boot::Disc ? "/dev_bdvd/PS3_GAME" : "/dev_hdd0/game/" + g.title_id;
+}
+
+// RPCS3 cellHddGameGetSizeKB: the booted directory's size in KB, each file rounded up to 1 KB.
+s32 cellHddGameGetSizeKB(PPUContext& ctx, u32 size)
+{
+    if (!size) return error(CELL_HDDGAME_ERROR_PARAM);
+    lv2::PpuThread& t = thread_of(ctx);
+    const std::optional<u64> bytes = t.kernel.vfs_tree_size(boot_dir(), 1024);
+    if (!bytes) {
+        PS_LOG_ERROR(kChan, "cellHddGameGetSizeKB: cannot size {}", boot_dir());
+        return error(CELL_HDDGAME_ERROR_FAILURE);
+    }
+    ps_write32(t.kernel.base(), size, static_cast<u32>(*bytes / 1024));
+    return lv2::CELL_OK;
+}
+
+// RPCS3 cellGameDataGetSizeKB: the directory the last cellGameDataCheckCreate checked (the booted one before any),
+// 0 while it doesn't exist.
+s32 cellGameDataGetSizeKB(PPUContext& ctx, u32 size)
+{
+    if (!size) return error(CELL_GAMEDATA_ERROR_PARAM);
+    lv2::PpuThread& t = thread_of(ctx);
+    std::string dir;
+    {
+        GameDataDir& g = HleProcess::current()->state<GameDataDir>();
+        std::lock_guard lock(g.mutex);
+        dir = g.dir.empty() ? boot_dir() : g.dir;
+    }
+    const std::optional<u64> bytes = t.kernel.vfs_tree_size(dir, 1024);
+    ps_write32(t.kernel.base(), size, bytes ? static_cast<u32>(*bytes / 1024) : 0);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 check_system_ver: a version like "04.8300", seven characters.
+bool system_ver_ok(lv2::PpuThread& t, u32 addr)
+{
+    const GuestString v = read_cstr(t, addr, 8);
+    const auto digit = [&](usize i) { return v.text[i] >= '0' && v.text[i] <= '9'; };
+    return addr && v.terminated && v.text.size() == 7 && digit(0) && digit(1) && v.text[2] == '.' && digit(3) &&
+        digit(4) && digit(5) && digit(6);
+}
+
+s32 cellHddGameSetSystemVer(PPUContext& ctx, u32 system_version)
+{
+    return system_ver_ok(thread_of(ctx), system_version) ? lv2::CELL_OK : error(CELL_HDDGAME_ERROR_PARAM);
+}
+
+s32 cellGameDataSetSystemVer(PPUContext& ctx, u32 system_version)
+{
+    return system_ver_ok(thread_of(ctx), system_version) ? lv2::CELL_OK : error(CELL_GAMEDATA_ERROR_PARAM);
+}
+
+// RPCS3 open_exit_dialog: an error dialog with an OK button, and the game is asked to exit when it closes. With no
+// dialog UI it closes at once: the message is logged and CELL_SYSUTIL_REQUEST_EXITGAME goes to the game's callbacks.
+s32 exit_broken(std::string_view message)
+{
+    PS_LOG_ERROR(kChan, "{} (the PS3's error dialog; the game is asked to exit)", message);
+    sysutil_send_event(CELL_SYSUTIL_REQUEST_EXITGAME, 0);
+    return lv2::CELL_OK;
+}
+
+s32 cellHddGameExitBroken(PPUContext&)
+{
+    return exit_broken("There has been an error! Please reinstall the HDD boot game.");
+}
+
+s32 cellGameDataExitBroken(PPUContext&)
+{
+    return exit_broken("There has been an error! Please remove the game data for this title.");
+}
+
 } // namespace
 
 void register_cellGame(Registry& r)
@@ -902,6 +1257,15 @@ void register_cellGame(Registry& r)
         PS_HLE_FUNC(0x42A2E133, cellGameCreateGameData),
         PS_HLE_FUNC(0x3A5D726A, cellGameGetParamString),
         PS_HLE_FUNC(0xB0A1F8C6, cellGameContentErrorDialog),
+        PS_HLE_FUNC(0xCE4374F6, cellGamePatchCheck),
+        PS_HLE_FUNC(0xB367C6E3, cellGameDeleteGameData),
+        PS_HLE_FUNC(0xB7A45CAF, cellGameGetParamInt),
+        PS_HLE_FUNC(0xDAA5CD20, cellGameSetParamString),
+        PS_HLE_FUNC(0xEF9D42D5, cellGameGetSizeKB),
+        PS_HLE_FUNC(0x2A8E6B92, cellGameGetDiscContentInfoUpdatePath),
+        PS_HLE_FUNC(0xA80BF223, cellGameGetLocalWebContentPath),
+        PS_HLE_FUNC(0xD24E3928, cellGameThemeInstall),
+        PS_HLE_FUNC(0x87406734, cellGameThemeInstallFromBuffer),
     });
     // cellSysutil's game data functions (RPCS3 cellSysutil_GameData_init).
     r.add("cellSysutil", {
@@ -909,6 +1273,17 @@ void register_cellGame(Registry& r)
         PS_HLE_FUNC(0xC9645C41, cellGameDataCheckCreate2),
         PS_HLE_FUNC(0xB72BC4E6, cellDiscGameGetBootDiscInfo),
         PS_HLE_FUNC(0xDFDD302E, cellDiscGameRegisterDiscChangeCallback),
+        PS_HLE_FUNC(0x4BDEC82A, cellHddGameCheck2),
+        PS_HLE_FUNC(0xF82E2EF7, cellHddGameGetSizeKB),
+        PS_HLE_FUNC(0x9CA9FFA7, cellHddGameSetSystemVer),
+        PS_HLE_FUNC(0xAFD605B3, cellHddGameExitBroken),
+        PS_HLE_FUNC(0xA9B0C1D9, cellGameDataGetSizeKB),
+        PS_HLE_FUNC(0x523A96C4, cellGameDataSetSystemVer),
+        PS_HLE_FUNC(0x9949BF82, cellGameDataExitBroken),
+        PS_HLE_FUNC(0xE7951DEE, cellGameDataCheckCreate),
+        PS_HLE_FUNC(0xEDC34E1A, cellDiscGameUnregisterDiscChangeCallback),
+        PS_HLE_FUNC(0xF8115D69, cellGameRegisterDiscChangeCallback),
+        PS_HLE_FUNC(0x21FC0C71, cellGameUnregisterDiscChangeCallback),
     });
 }
 

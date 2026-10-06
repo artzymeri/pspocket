@@ -1398,3 +1398,125 @@ TEST_CASE("cellGame: disc boot check and permit, game data created then found; s
     CHECK(a.call("sceNp2Term") == 0xFFFFFFFF8002AA01ull);
     fsys::remove_all(root);
 }
+
+TEST_CASE("cellGame: param ints and strings, sizes, patch check, delete, themes; cellSysutil's game rest (D-183)",
+    "[hle][game]")
+{
+    namespace fsys = std::filesystem;
+    const fsys::path root = fsys::temp_directory_path() / ("pspocket-hle-game2-" + std::to_string(::getpid()));
+    fsys::remove_all(root);
+    fsys::create_directories(root / "hdd0" / "game");
+    fsys::create_directories(root / "bdvd" / "PS3_GAME" / "USRDIR");
+    std::ofstream(root / "bdvd" / "PS3_GAME" / "USRDIR" / "EBOOT.BIN") << std::string(3000, 'e');
+    hle::ProcessConfig config;
+    config.game.title_id = "BLES01807";
+    config.game.param_sfo = make_param_sfo({{"APP_VER", "01.00", 8}, {"CATEGORY", "DG", 4},
+        {"TITLE", "Test Game", 128}, {"TITLE_ID", "BLES01807", 16}, {"VERSION", "01.00", 8}});
+    Fixture f(config);
+    u8* base = f.base();
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+    GuestThread a(f, 0, "a");
+    constexpr u32 kSize = kData + 0x110, kContent = kData + 0x200, kUsrdir = kData + 0x300, kBuf = kData + 0x400,
+                  kInit = kData + 0x500, kName = kData + 0x600, kOut = kData + 0x700, kTheme = kData + 0x10000;
+    constexpr u64 kFailure = 0xFFFFFFFF8002CB22ull, kParam = 0xFFFFFFFF8002CB07ull,
+                  kNotSupported = 0xFFFFFFFF8002CB21ull, kInvalidId = 0xFFFFFFFF8002CB25ull,
+                  kNotFound = 0xFFFFFFFF8002CB04ull, kNotPatch = 0xFFFFFFFF8002CB27ull,
+                  kBadTheme = 0xFFFFFFFF8002CB28ull, kHddParam = 0xFFFFFFFF8002BA04ull,
+                  kHddFailure = 0xFFFFFFFF8002BA07ull, kDataParam = 0xFFFFFFFF8002B604ull;
+    const auto put = [&](u32 addr, std::string_view v) {
+        std::memcpy(base + addr, v.data(), v.size());
+        base[addr + v.size()] = 0;
+    };
+
+    // No session: FAILURE; the disc's session can't set strings and has no integers.
+    CHECK(a.call("cellGameGetParamInt", 102, kOut) == kFailure);
+    CHECK(a.call("cellGameGetSizeKB", kOut) == kFailure);
+    CHECK(a.call("cellGameGetSizeKB", 0) == kParam);
+    REQUIRE(a.call("cellGameDataCheck", 1, 0, kSize) == 0);
+    ps_write32(base, kOut, 7);
+    REQUIRE(a.call("cellGameGetParamInt", 102, kOut) == 0); // PARENTAL_LEVEL: not in this PARAM.SFO
+    CHECK(ps_read32(base, kOut) == 0);
+    CHECK(a.call("cellGameGetParamInt", 105, kOut) == kInvalidId);
+    CHECK(a.call("cellGameGetParamInt", 102, 0) == kParam);
+    put(kBuf, "New Title");
+    CHECK(a.call("cellGameSetParamString", 0, kBuf) == kNotSupported);
+    REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+    CHECK(a.call("cellGameSetParamString", 0, kBuf) == kFailure);
+
+    // Game data: created, its title set, found with that title, sized, then deleted.
+    put(kName, "BLES01807DATA");
+    REQUIRE(a.call("cellGameDataCheck", 3, kName, kSize) == 2);
+    std::memset(base + kInit, 0, 0x100);
+    put(kInit, "Test Data");
+    put(kInit + 128, "BLES01807");
+    put(kInit + 140, "01.00");
+    REQUIRE(a.call("cellGameCreateGameData", kInit, kContent, kUsrdir) == 0);
+    REQUIRE(a.call("cellGameSetParamString", 3, kBuf) == 0);           // TITLE_ENGLISH (TITLE_01)
+    REQUIRE(a.call("cellGameSetParamString", 0, kBuf) == 0);           // TITLE
+    CHECK(a.call("cellGameSetParamString", 100, kBuf) == kNotSupported); // TITLE_ID can't be set
+    CHECK(a.call("cellGameSetParamString", 999, kBuf) == kInvalidId);
+    REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+    std::ofstream(root / "hdd0" / "game" / "BLES01807DATA" / "USRDIR" / "DATA.BIN") << std::string(1500, 'd');
+    REQUIRE(a.call("cellGameDataCheck", 3, kName, kSize) == 0);
+    REQUIRE(a.call("cellGameGetParamString", 0, kBuf, 128) == 0);
+    CHECK(std::string(reinterpret_cast<const char*>(base + kBuf)) == "New Title");
+    REQUIRE(a.call("cellGameGetSizeKB", kOut) == 0);
+    const u64 sfo_kb = (fsys::file_size(root / "hdd0" / "game" / "BLES01807DATA" / "PARAM.SFO") + 1023) / 1024;
+    CHECK(ps_read32(base, kOut) == 2 + sfo_kb);
+    CHECK(a.call("cellGameDeleteGameData", kName) == kNotSupported); // its session may write it (RPCS3)
+    REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+    CHECK(a.call("cellGameDeleteGameData", kName) == 0);
+    CHECK_FALSE(fsys::exists(root / "hdd0" / "game" / "BLES01807DATA"));
+    CHECK(a.call("cellGameDeleteGameData", kName) == kNotFound);
+    put(kName, "bad");
+    CHECK(a.call("cellGameDeleteGameData", kName) == kParam);
+    fsys::create_directories(root / "hdd0" / "game" / "OTHER");
+    std::ofstream(root / "hdd0" / "game" / "OTHER" / "PARAM.SFO") << "not a psf";
+    put(kName, "OTHER");
+    CHECK(a.call("cellGameDeleteGameData", kName) == kNotSupported);
+
+    // A disc game has no patch; the paths RPCS3 leaves empty.
+    CHECK(a.call("cellGamePatchCheck", kSize, 0) == kNotPatch);
+    CHECK(a.call("cellGameGetDiscContentInfoUpdatePath", 0) == kParam);
+    CHECK(a.call("cellGameGetDiscContentInfoUpdatePath", kBuf) == 0);
+    CHECK(a.call("cellGameGetLocalWebContentPath", kBuf) == 0);
+
+    // A theme from a buffer goes to /dev_hdd0/theme, once; a file that isn't one is refused.
+    std::memset(base + kTheme, 0x5A, 4096);
+    std::memcpy(base + kTheme, "P3TF", 4);
+    REQUIRE(a.call("cellGameThemeInstallFromBuffer", 4096, 4096, kTheme, 0, 0) == 0);
+    REQUIRE(fsys::is_directory(root / "hdd0" / "theme"));
+    usize themes = 0;
+    for (const auto& e : fsys::directory_iterator(root / "hdd0" / "theme")) {
+        CHECK(e.path().filename().string().starts_with("BLES01807_"));
+        CHECK(fsys::file_size(e.path()) == 4096);
+        themes++;
+    }
+    CHECK(themes == 1);
+    CHECK(a.call("cellGameThemeInstallFromBuffer", 4096, 4096, kTheme, 0, 0) == 0); // already there
+    std::memcpy(base + kTheme, "XXXX", 4);
+    CHECK(a.call("cellGameThemeInstallFromBuffer", 4096, 4096, kTheme, 0, 0) == kBadTheme);
+    CHECK(a.call("cellGameThemeInstallFromBuffer", 4096, 4095, kTheme, 0, 0) == kParam); // buffer below 4 KB
+    CHECK(a.call("cellGameThemeInstallFromBuffer", 8192, 4096, kTheme, 0, 0) == kParam); // larger, no callback
+
+    // cellSysutil: the booted directory's size (the disc mounted on a host directory), the system versions.
+    CHECK(a.call("cellHddGameGetSizeKB", kOut) == kHddFailure); // no disc mounted
+    REQUIRE(f.kernel->vfs_mount("/dev_bdvd", (root / "bdvd").string(), true));
+    REQUIRE(a.call("cellHddGameGetSizeKB", kOut) == 0);
+    CHECK(ps_read32(base, kOut) == 3);
+    CHECK(a.call("cellHddGameGetSizeKB", 0) == kHddParam);
+    REQUIRE(a.call("cellGameDataGetSizeKB", kOut) == 0); // no check yet: the booted directory
+    CHECK(ps_read32(base, kOut) == 3);
+    put(kBuf, "04.8300");
+    CHECK(a.call("cellHddGameSetSystemVer", kBuf) == 0);
+    CHECK(a.call("cellGameDataSetSystemVer", kBuf) == 0);
+    put(kBuf, "4.83");
+    CHECK(a.call("cellHddGameSetSystemVer", kBuf) == kHddParam);
+    CHECK(a.call("cellGameDataSetSystemVer", 0) == kDataParam);
+    CHECK(a.call("cellGameRegisterDiscChangeCallback", kBuf, kBuf) == 0);
+    CHECK(a.call("cellGameUnregisterDiscChangeCallback") == 0);
+    CHECK(a.call("cellDiscGameUnregisterDiscChangeCallback") == 0);
+    CHECK(a.call("cellGameDataExitBroken") == 0);
+    CHECK(a.call("cellHddGameExitBroken") == 0);
+    fsys::remove_all(root);
+}

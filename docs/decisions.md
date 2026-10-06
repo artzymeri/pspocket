@@ -3607,6 +3607,26 @@ These are 41 more functions.
   - device info and registering a device: DEVICE_NOT_FOUND after RPCS3's checks;
   - the device mode is kept.
 
+**cellGame and cellSysutil's game functions: every function RPCS3 registers (20 more)**
+
+- **cellGame.**
+  - cellGameGetParamInt: PARENTAL_LEVEL, RESOLUTION, SOUND_FORMAT.
+  - cellGameSetParamString: the titles, into game data the session may create.
+  - cellGameGetSizeKB: the checked directory, files rounded up to 1 KB, as RPCS3's fs::get_dir_size.
+  - cellGamePatchCheck: NOTPATCH unless the game booted from a patch (category GD).
+  - cellGameDeleteGameData: refused while a session may write the data, and for what isn't game data.
+  - cellGameGetDiscContentInfoUpdatePath and cellGameGetLocalWebContentPath: nothing written, as RPCS3.
+  - cellGameThemeInstall and cellGameThemeInstallFromBuffer: to /dev_hdd0/theme/<title ID>_<SHA-256>.p3t, once.
+- **cellSysutil.**
+  - HddGameCheck2 and DataCheckCreate are their newer twins.
+  - HddGameGetSizeKB sizes the booted directory, a disc image included.
+  - GameDataGetSizeKB sizes the last checked game data.
+  - The system version checks ("04.8300").
+  - The disc change callbacks under both names, and unregistering them.
+  - The "exit broken" dialogs: logged, then CELL_SYSUTIL_REQUEST_EXITGAME to the game, as RPCS3's dialog does when it
+    closes.
+- **Kernel::vfs_tree_size.** The size of a guest directory, on a host mount or inside a disc image.
+
 `read_cstr` (a checked guest string) moved from cellSaveData.cpp to guest.hpp for every module. The NID check
 (test_hle) accepts RPCS3's REG_FNID names, which end with their NID.
 
@@ -3629,6 +3649,15 @@ Tests (tests/hle/test_sysutil.cpp):
   round trip and the AvconfExt checks;
 - audio out: device info and Availability2;
 - audio in with no microphone.
+
+Tests (tests/hle/test_sysPrxForUser.cpp, cellGame):
+
+- param ints and strings in the disc's and game data's sessions;
+- the game data size;
+- delete: refused during its session, done after it, NOTFOUND, a bad name, not game data;
+- the patch check, the empty paths, themes from a buffer;
+- the booted directory's size before and after the disc is mounted;
+- system versions, the disc change callbacks and the exit dialogs.
 
 ## Open decisions (plan section 14)
 
