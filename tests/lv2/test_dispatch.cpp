@@ -77,10 +77,10 @@ TEST_CASE("lv2: unimplemented syscalls log their number and name and return CELL
     LogCapture log;
     const u64 before = f.kernel->unimplemented_count();
 
-    // sys_spu_thread_group_create: named, not implemented here.
-    CHECK(c.call64(170, 1, 2, 3) == to_r3(err(CELL_ENOSYS)));
-    CHECK(c.call64(170, 1, 2, 3) == 0xFFFFFFFF80010003ull); // sign-extended, as RPCS3's error_code
-    CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 170 (sys_spu_thread_group_create)"));
+    // sys_net_bnet_accept: named, implemented by RPCS3, not here.
+    CHECK(c.call64(700, 1, 2, 3) == to_r3(err(CELL_ENOSYS)));
+    CHECK(c.call64(700, 1, 2, 3) == 0xFFFFFFFF80010003ull); // sign-extended, as RPCS3's error_code
+    CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 700 (sys_net_bnet_accept)"));
     // An unnamed slot and an out-of-range number.
     CHECK(c.call(6) == rc(CELL_ENOSYS));
     CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 6 (unnamed)"));
@@ -146,4 +146,20 @@ TEST_CASE("lv2: bad guest pointers return CELL_EFAULT instead of faulting", "[lv
     // A structure straddling the end of committed memory.
     const u32 edge = Fixture::kScratch + Fixture::kScratchSize - 20;
     CHECK(c.call(kMutexCreate, out, edge) == rc(CELL_EFAULT));
+}
+
+// D-166: a slot RPCS3 answers with null_func returns CELL_OK and logs its first call; it is not counted as
+// unimplemented. Unused slots (uns_func) still return CELL_ENOSYS.
+TEST_CASE("lv2: RPCS3's null_func syscalls return CELL_OK", "[lv2][dispatch]")
+{
+    Fixture f;
+    Caller c(*f.kernel);
+    LogCapture log;
+    const u64 before = f.kernel->unimplemented_count();
+    CHECK(c.call(167, 1, 2) == CELL_OK); // sys_spu_thread_group_start_on_exit
+    CHECK(log.contains("lv2", "syscall 167 (sys_spu_thread_group_start_on_exit) is not implemented; returns CELL_OK"));
+    CHECK(c.call(988) == CELL_OK); // a debug exception handler, as GTA V's CRT registers
+    CHECK(c.call(54) == CELL_OK);  // an unnamed null_func slot (ROOT)
+    CHECK(f.kernel->unimplemented_count() == before);
+    CHECK(c.call(6) == rc(CELL_ENOSYS)); // uns_func
 }

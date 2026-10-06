@@ -466,8 +466,16 @@ Kernel::Impl::Impl(Kernel& k)
     register_fs_syscalls(table);
     register_vm_syscalls(table);
     register_spu_syscalls(table);
-    // null_func syscalls (RPCS3 lv2.cpp) that games are seen calling.
-    table.bind_null(988, "sys_dbg_..._ppu_exception_handler"); // GTA V's CRT registers a debug exception handler
+    // Every other slot RPCS3 answers with null_func (a log, then CELL_OK) is answered so too (D-166): a game calling
+    // one goes on instead of meeting ENOSYS. GTA V's CRT, for one, registers a debug exception handler (988).
+    static constexpr struct {
+        u32 number;
+        const char* what;
+    } kNull[] = {
+#include "syscall_null.inc"
+    };
+    for (const auto& n : kNull)
+        if (!table[n.number].fn) table.bind_null(n.number, n.what);
 }
 
 Kernel::Impl::~Impl() = default;

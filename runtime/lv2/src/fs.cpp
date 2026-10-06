@@ -1063,8 +1063,10 @@ Result sys_fs_fcntl(PpuThread& t, u32 fd, u32 op, u32 arg, u32 size)
         return CELL_OK;
     }
     default:
-        PS_LOG_ERROR(kFs, "sys_fs_fcntl(fd {}, op {:#x}, size {:#x}): operation not implemented", fd, op, size);
-        return err(CELL_EINVAL);
+        // RPCS3 logs an unknown operation and returns CELL_OK (D-166); its 31 no-op operations land here too.
+        PS_LOG_ERROR(kFs, "sys_fs_fcntl(fd {}, op {:#x}, size {:#x}): operation not implemented; CELL_OK as RPCS3", fd,
+            op, size);
+        return CELL_OK;
     }
 }
 
