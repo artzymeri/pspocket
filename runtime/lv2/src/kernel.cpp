@@ -639,6 +639,21 @@ std::shared_ptr<EventQueue> Kernel::event_queue(u32 id) const
     return q->dead ? nullptr : q;
 }
 
+std::shared_ptr<EventQueue> Kernel::event_queue_by_key(u64 key) const
+{
+    if (key == 0) return nullptr;
+    std::shared_ptr<EventQueue> q;
+    {
+        std::lock_guard lk(impl_->ipc_mutex);
+        const auto it = impl_->ipc.find({EventQueue::kIdBase, key});
+        if (it == impl_->ipc.end()) return nullptr;
+        q = std::static_pointer_cast<EventQueue>(it->second.lock());
+    }
+    if (!q) return nullptr;
+    std::lock_guard lk(q->lock);
+    return q->dead ? nullptr : q;
+}
+
 std::shared_ptr<EventFlag> Kernel::event_flag(u32 id) const { return impl_->objects.get<EventFlag>(id); }
 
 bool Kernel::exited() const

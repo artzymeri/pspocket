@@ -56,9 +56,6 @@
 // - Output: RPCS3 mixes every period into its ring buffer, and buffering depends on its backend. Here the mix
 //   (RPCS3's mix<STEREO, ...>) runs only while a host sink is attached, and buffering only while the sink has a
 //   buffer query (pspocket/hle/audio.hpp).
-// - Queues by key: RPCS3 finds any event queue by its IPC key (lv2_event_queue::find). lv2's public interface finds
-//   queues by ID only, so cellAudioSetNotifyEventQueue finds the queues cellAudioCreateNotifyEventQueue made. A keyed
-//   queue the game created itself gives CELL_AUDIO_ERROR_TRANS_EVENT and an error log, until lv2 can look up a key.
 // - RPCS3's short sleeps for the VSH (200 us in open, 30 us in start, 20 us in set) are left out, as cellGame's are
 //   (D-044). So is its wait for libmixer's _mxr000 queue: there is no libmixer here.
 // - cellAudioSetPortLevel moves the level over 624 samples, as RPCS3's comment says; RPCS3's step has the wrong sign,
@@ -245,8 +242,6 @@ struct AudioState {
     u8 event_period = 0;
     u64 counter = 0;         // RPCS3 m_counter: periods played since the first cellAudioInit
     u64 last_period_end = 0; // guest system time (us)
-    // The queues cellAudioCreateNotifyEventQueue made, {key, ID}: what cellAudioSetNotifyEventQueue can find.
-    std::vector<std::pair<u64, u32>> created_queues;
     std::unique_ptr<Runner> runner; // the running thread
     // Logs.
     std::array<bool, AUDIO_PORT_COUNT> config_logged{};
@@ -284,15 +279,8 @@ bool queue_alive(const std::shared_ptr<lv2::EventQueue>& q)
     return !q->dead;
 }
 
-// RPCS3 lv2_event_queue::find(key), among the queues cellAudioCreateNotifyEventQueue made (see the top of the file).
-std::shared_ptr<lv2::EventQueue> find_queue(AudioState& s, u64 key)
-{
-    for (const auto& [k, id] : s.created_queues) {
-        if (k != key) continue;
-        if (auto q = s.kernel.event_queue(id); q && q->key == key) return q; // null once destroyed
-    }
-    return nullptr;
-}
+// RPCS3 lv2_event_queue::find(key).
+std::shared_ptr<lv2::EventQueue> find_queue(AudioState& s, u64 key) { return s.kernel.event_queue_by_key(key); }
 
 void store_be64_release(u8* base, u32 addr, u64 value)
 {
@@ -913,12 +901,6 @@ s32 create_notify_queue(PPUContext& ctx, u32 id, u32 key, u32 queue_type)
         if (r != lv2::CELL_OK) return fail(r, "cellAudioCreateNotifyEventQueue(id {:#x}, key {:#x})", id, key);
         ps_write64(s.base, key, key_value);
         const u32 queue = ps_read32(s.base, id);
-        {
-            std::lock_guard lock(s.mutex);
-            std::erase_if(s.created_queues,
-                [&](const auto& e) { return e.first == key_value || !s.kernel.event_queue(e.second); });
-            s.created_queues.emplace_back(key_value, queue);
-        }
         PS_LOG_INFO(kChan, "cellAudioCreateNotifyEventQueue(id {:#x}, key {:#x}): queue {:#x}, key {:#x}, {} events",
             id, key, queue, key_value, depth);
         return lv2::CELL_OK;
@@ -950,13 +932,7 @@ s32 set_notify_queue(PPUContext& ctx, u64 key, u32 flags)
     std::lock_guard lock(s.mutex);
     if (!s.init) return fail(error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioSetNotifyEventQueue(key {:#x})", key);
     const auto q = find_queue(s, key);
-    if (!q) {
-        PS_LOG_ERROR(kChan, "cellAudioSetNotifyEventQueue(key {:#x}): no live queue from "
-                            "cellAudioCreateNotifyEventQueue has this key (a keyed queue the game made itself is not "
-                            "found: lv2 has no lookup by key yet): CELL_AUDIO_ERROR_TRANS_EVENT",
-            key);
-        return error(CELL_AUDIO_ERROR_TRANS_EVENT);
-    }
+    if (!q) return fail(error(CELL_AUDIO_ERROR_TRANS_EVENT), "cellAudioSetNotifyEventQueue(key {:#x}): no queue", key);
     for (auto i = s.keys.begin(); i != s.keys.end();) {
         if (i->queue == q) {
             return fail(error(CELL_AUDIO_ERROR_TRANS_EVENT), "cellAudioSetNotifyEventQueue(key {:#x}): already set",

@@ -3,9 +3,9 @@
 // an output port has nothing to read, the port attributes report a detached microphone, and connecting ports records
 // nothing. Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellVoice.cpp/.h (voice_manager).
 //
-// Implemented: the 14 functions GTA V imports. Its imports have no notify event queue functions
-// (cellVoiceCreateNotifyEventQueue, cellVoiceSetNotifyEventQueue), so no queue can be registered, and the
-// SERVICE_ATTACHED and SERVICE_DETACHED events RPCS3 sends to such queues on start, stop and end have no receiver.
+// Implemented: every function RPCS3 registers. Notify event queues registered by key (cellVoiceSetNotifyEventQueue)
+// get SERVICE_ATTACHED when the service starts and SERVICE_DETACHED when it stops or the library ends, as in RPCS3;
+// no port ever attaches. Mute flags, volumes, thresholds and bit rates are kept in the port's parameters.
 //
 // Port IDs are RPCS3's: the low byte is a creation counter modulo 0xA0 (the first port gets 1), the next byte the
 // lowest of 1..128 that makes the ID unused; a PS3 puts a varying value there. Functions ignore the upper 16 bits of
@@ -17,6 +17,7 @@
 // CELL_VOICE_ERROR_ADDRESS_INVALID at the point where RPCS3 would fault.
 
 #include <array>
+#include <bit>
 #include <cstring>
 #include <format>
 #include <map>
@@ -24,12 +25,16 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/lv2/kernel.hpp"
+#include "pspocket/lv2/sync.hpp"
+#include "pspocket/lv2/syscalls.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -45,6 +50,8 @@ enum : u32 {
     CELL_VOICE_ERROR_ADDRESS_INVALID = 0x8031080a,
     CELL_VOICE_ERROR_SERVICE_DETACHED = 0x8031080b,
     CELL_VOICE_ERROR_DEVICE_NOT_PRESENT = 0x80310812,
+    CELL_VOICE_ERROR_NOT_IMPLEMENTED = 0x80310809,
+    CELL_VOICE_ERROR_EVENT_QUEUE = 0x8031080f,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -60,6 +67,8 @@ std::string result_name(s32 r)
     case CELL_VOICE_ERROR_ADDRESS_INVALID: return "CELL_VOICE_ERROR_ADDRESS_INVALID";
     case CELL_VOICE_ERROR_SERVICE_DETACHED: return "CELL_VOICE_ERROR_SERVICE_DETACHED";
     case CELL_VOICE_ERROR_DEVICE_NOT_PRESENT: return "CELL_VOICE_ERROR_DEVICE_NOT_PRESENT";
+    case CELL_VOICE_ERROR_NOT_IMPLEMENTED: return "CELL_VOICE_ERROR_NOT_IMPLEMENTED";
+    case CELL_VOICE_ERROR_EVENT_QUEUE: return "CELL_VOICE_ERROR_EVENT_QUEUE";
     }
     return std::format("{:#010x}", static_cast<u32>(r));
 }
@@ -98,7 +107,14 @@ constexpr u32 kBitRateUnknown = 0x4f323285;
 // CellVoicePortParam (28 bytes): be32 portType; be16 threshold, bMute; be f32 volume; then a union at 12: voice
 // {be32 bitrate}, pcmaudio {be32 bufSize; CellVoicePCMFormat {u8 numChannels, sampleAlignment; be32 dataType at 20,
 // sampleRate at 24}}, device {be32 playerId}.
-constexpr u32 kPortParamSize = 28, kParamBitrate = 12, kParamPcmDataType = 20;
+constexpr u32 kPortParamSize = 28, kParamThreshold = 4, kParamMute = 6, kParamVolume = 8, kParamBitrate = 12,
+              kParamPcmDataType = 20;
+// CellVoiceEvent: what the notify queues get.
+constexpr u64 CELLVOICE_EVENT_SERVICE_ATTACHED = 1 << 3, CELLVOICE_EVENT_SERVICE_DETACHED = 1 << 4;
+// RPCS3 cellVoiceCreateNotifyEventQueue: the first key tried, of 10; the queue holds 64 events.
+constexpr u64 kNotifyKeyBase = 0x80004D494F323285ull;
+// RPCS3 builds a source like an lv2 event port ID: lv2_event_port::id_base, lv2_obj's id_step and id_count.
+constexpr u32 kEventPortIdBase = 0x0e000000, kEventPortIdStep = 0x100, kEventPortIdCount = 8192;
 // CellVoiceInitParam: be32 eventMask, version; be s32 appType; reserved[20].
 constexpr u32 kInitParamLogged = 12;
 
@@ -114,13 +130,15 @@ struct Port {
     bool voice() const { return type() == CELLVOICE_PORTTYPE_IN_VOICE || type() == CELLVOICE_PORTTYPE_OUT_VOICE; }
 };
 
-// RPCS3 voice_manager (without the notify queue keys: see the top of the file).
+// RPCS3 voice_manager.
 struct VoiceState {
     std::mutex mutex;
     bool initialized = false;     // is_init
     bool service_started = false; // voice_service_started: from cellVoiceStart to cellVoiceStop or cellVoiceEnd
     u8 id_ctr = 0;                // the creation counter, the low byte of port IDs
+    u32 port_source = 0;          // the next made-up event source
     std::map<u16, Port> ports;
+    std::map<u64, std::vector<u64>> queue_keys; // a notify queue's key -> the sources it was registered with
 
     Port* port(u32 id)
     {
@@ -132,7 +150,9 @@ struct VoiceState {
     void reset()
     {
         id_ctr = 0;
+        port_source = 0;
         ports.clear();
+        queue_keys.clear();
     }
 };
 
@@ -149,6 +169,17 @@ bool usable(PPUContext& ctx, u32 addr, u32 size, std::string_view what)
     if (guest_readable(thread_of(ctx), addr, size)) return true;
     log_call_site(ctx, guest_base(ctx), std::format("{} ({:#x}, {} bytes) is not guest memory", what, addr, size));
     return false;
+}
+
+// Sends `event` from every registered source to its queue, if the queue still exists (RPCS3).
+void notify(VoiceState& s, u64 event)
+{
+    lv2::Kernel& kernel = HleProcess::current()->kernel();
+    for (const auto& [key, sources] : s.queue_keys) {
+        const auto q = kernel.event_queue_by_key(key);
+        if (!q) continue;
+        for (const u64 source : sources) q->send(lv2::Event{source, event, 0, 0});
+    }
 }
 
 // ------------------------------------------------------------------------------------------- init, end, start, stop
@@ -172,37 +203,111 @@ s32 cellVoiceInit(PPUContext& ctx, u32 arg)
     return logged(lv2::CELL_OK, kState, "cellVoiceInit(pArg {:#x}): no voice devices, ports are kept as data", arg);
 }
 
-// RPCS3 also sends SERVICE_DETACHED to the notify queues if the service was started; none can be registered here.
+// cellVoiceInitEx(CellVoiceInitParam*): as cellVoiceInit (RPCS3 reads nothing either).
+s32 cellVoiceInitEx(PPUContext& ctx, u32 arg) { return cellVoiceInit(ctx, arg); }
+
+// A started service sends SERVICE_DETACHED to the notify queues first.
 s32 cellVoiceEnd(PPUContext&)
 {
     VoiceState& s = voice();
     std::lock_guard lock(s.mutex);
     if (!s.initialized) return logged(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kState, "cellVoiceEnd()");
     const usize ports = s.ports.size();
-    s.service_started = false;
+    if (std::exchange(s.service_started, false)) notify(s, CELLVOICE_EVENT_SERVICE_DETACHED);
     s.reset();
     s.initialized = false;
     return logged(lv2::CELL_OK, kState, "cellVoiceEnd() ({} ports deleted)", ports);
 }
 
-// RPCS3 VoiceStart: a second start is a no-op; the first sends SERVICE_ATTACHED to the notify queues (none here).
+// RPCS3 VoiceStart: a second start is a no-op; the first sends SERVICE_ATTACHED to the notify queues.
+s32 voice_start(VoiceState& s)
+{
+    if (!std::exchange(s.service_started, true)) notify(s, CELLVOICE_EVENT_SERVICE_ATTACHED);
+    return lv2::CELL_OK;
+}
+
 s32 cellVoiceStart(PPUContext&)
 {
     VoiceState& s = voice();
     std::lock_guard lock(s.mutex);
     if (!s.initialized) return logged(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kState, "cellVoiceStart()");
-    s.service_started = true;
-    return logged(lv2::CELL_OK, kState, "cellVoiceStart()");
+    return logged(voice_start(s), kState, "cellVoiceStart()");
 }
 
-// Stopping a service that isn't started is a no-op; stopping sends SERVICE_DETACHED to the notify queues (none here).
+// cellVoiceStartEx(CellVoiceStartParam*): its memory container is not used (RPCS3).
+s32 cellVoiceStartEx(PPUContext&, u32 arg)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return logged(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kState, "cellVoiceStartEx()");
+    if (!arg) return logged(error(CELL_VOICE_ERROR_ARGUMENT_INVALID), kState, "cellVoiceStartEx(pArg 0)");
+    return logged(voice_start(s), kState, "cellVoiceStartEx({:#x})", arg);
+}
+
+// Stopping a service that isn't started is a no-op; stopping sends SERVICE_DETACHED to the notify queues.
 s32 cellVoiceStop(PPUContext&)
 {
     VoiceState& s = voice();
     std::lock_guard lock(s.mutex);
     if (!s.initialized) return logged(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kState, "cellVoiceStop()");
-    s.service_started = false;
+    if (std::exchange(s.service_started, false)) notify(s, CELLVOICE_EVENT_SERVICE_DETACHED);
     return logged(lv2::CELL_OK, kState, "cellVoiceStop()");
+}
+
+// ------------------------------------------------------------------------------------------------ notify queues
+
+// cellVoiceCreateNotifyEventQueue(u32* id, u64* key): a PPU event queue (FIFO, 64 events) on the first free key of 10
+// from 0x80004D494F323285 (RPCS3).
+s32 cellVoiceCreateNotifyEventQueue(PPUContext& ctx, u32 id, u32 key)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return logged(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kState, "cellVoiceCreateNotifyEventQueue()");
+    if (!usable(ctx, key, 8, "cellVoiceCreateNotifyEventQueue: key")) return error(CELL_VOICE_ERROR_ADDRESS_INVALID);
+    u8* base = guest_base(ctx);
+    StackVar attr(ctx, base, 16); // sys_event_queue_attribute_t {protocol, type, name[8] = 0}
+    ps_write32(base, attr.addr(), lv2::SYS_SYNC_FIFO);
+    ps_write32(base, attr.addr() + 4, lv2::SYS_PPU_QUEUE);
+    for (u64 i = 0; i < 10; i++) {
+        const u64 key_value = kNotifyKeyBase + i;
+        const s32 r = lv2::sys_event_queue_create(thread_of(ctx), id, attr.addr(), key_value, 0x40);
+        if (r == lv2::err(lv2::CELL_EEXIST)) continue;
+        if (r != lv2::CELL_OK) return logged(r, kState, "cellVoiceCreateNotifyEventQueue({:#x}, {:#x})", id, key);
+        ps_write64(base, key, key_value);
+        return logged(r, kState, "cellVoiceCreateNotifyEventQueue: queue {:#x}, key {:#x}", ps_read32(base, id),
+            key_value);
+    }
+    return logged(error(CELL_VOICE_ERROR_EVENT_QUEUE), kState, "cellVoiceCreateNotifyEventQueue({:#x}, {:#x})", id, key);
+}
+
+// cellVoiceSetNotifyEventQueue(u64 key, u64 source): a queue that exists, by key; the same key may be set again with
+// another source. Source 0 makes one up, like an event port with no name (RPCS3: (pid + 1) << 32 | port ID).
+s32 cellVoiceSetNotifyEventQueue(PPUContext& ctx, u64 key, u64 source)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    const auto done = [&](s32 r) {
+        return logged(r, kState, "cellVoiceSetNotifyEventQueue(key {:#x}, source {:#x})", key, source);
+    };
+    if (!s.initialized) return done(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT));
+    if (!HleProcess::current()->kernel().event_queue_by_key(key)) return done(error(CELL_VOICE_ERROR_EVENT_QUEUE));
+    if (!source) {
+        const u64 pid = static_cast<u32>(lv2::sys_process_getpid(thread_of(ctx)));
+        source = ((pid + 1) << 32) | (kEventPortIdBase + s.port_source * kEventPortIdStep);
+        s.port_source = (s.port_source + 1) % kEventPortIdCount;
+    }
+    s.queue_keys[key].push_back(source);
+    return done(lv2::CELL_OK);
+}
+
+s32 cellVoiceRemoveNotifyEventQueue(PPUContext&, u64 key)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    const auto done = [&](s32 r) { return logged(r, kState, "cellVoiceRemoveNotifyEventQueue(key {:#x})", key); };
+    if (!s.initialized) return done(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT));
+    if (!s.queue_keys.erase(key)) return done(error(CELL_VOICE_ERROR_EVENT_QUEUE));
+    return done(lv2::CELL_OK);
 }
 
 // ------------------------------------------------------------------------------------------------------- ports
@@ -386,6 +491,178 @@ s32 cellVoiceWriteToIPort(PPUContext&, u32 ips, u32 data, u32 size)
     return done(lv2::CELL_OK);
 }
 
+// The Ex writes (with a count of lost frames, or of frame gaps): as cellVoiceWriteToIPort.
+s32 cellVoiceWriteToIPortEx(PPUContext& ctx, u32 ips, u32 data, u32 size, u32)
+{
+    return cellVoiceWriteToIPort(ctx, ips, data, size);
+}
+
+s32 cellVoiceWriteToIPortEx2(PPUContext& ctx, u32 ips, u32 data, u32 size, u32)
+{
+    return cellVoiceWriteToIPort(ctx, ips, data, size);
+}
+
+// ------------------------------------------------------------------------------------------ port parameters
+
+// The checks of the per-port calls: initialised, then a port with this ID (CELL_VOICE_ERROR_TOPOLOGY).
+s32 port_checks(VoiceState& s, u32 port_id, Port** port = nullptr)
+{
+    if (!s.initialized) return error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT);
+    Port* p = s.port(port_id);
+    if (!p) return error(CELL_VOICE_ERROR_TOPOLOGY);
+    if (port) *port = p;
+    return lv2::CELL_OK;
+}
+
+// Pausing, resuming and resetting a port: accepted for an existing one; no data flows to pause (RPCS3).
+s32 cellVoicePausePort(PPUContext&, u32 port_id)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    return logged(port_checks(s, port_id), kState, "cellVoicePausePort({:#x})", port_id);
+}
+
+s32 cellVoiceResumePort(PPUContext&, u32 port_id)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    return logged(port_checks(s, port_id), kState, "cellVoiceResumePort({:#x})", port_id);
+}
+
+s32 cellVoiceResetPort(PPUContext&, u32 port_id)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    return logged(port_checks(s, port_id), kState, "cellVoiceResetPort({:#x})", port_id);
+}
+
+s32 all_ports(const char* fn)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    return logged(s.initialized ? lv2::CELL_OK : error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kState, "{}()", fn);
+}
+
+s32 cellVoicePausePortAll(PPUContext&) { return all_ports("cellVoicePausePortAll"); }
+s32 cellVoiceResumePortAll(PPUContext&) { return all_ports("cellVoiceResumePortAll"); }
+
+// RPCS3: accepted, and no port's mute flag changes.
+s32 cellVoiceSetMuteFlagAll(PPUContext&, u16 muted)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    return logged(s.initialized ? lv2::CELL_OK : error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kState,
+        "cellVoiceSetMuteFlagAll({})", muted);
+}
+
+s32 cellVoiceSetMuteFlag(PPUContext&, u32 port_id, u16 muted)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    Port* port = nullptr;
+    const s32 r = port_checks(s, port_id, &port);
+    if (r == lv2::CELL_OK) ps_st16(port->info.data() + kParamMute, muted);
+    return logged(r, kPolled, "cellVoiceSetMuteFlag({:#x}, {})", port_id, muted);
+}
+
+s32 cellVoiceGetMuteFlag(PPUContext& ctx, u32 port_id, u32 muted)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    Port* port = nullptr;
+    const s32 r = port_checks(s, port_id, &port);
+    if (r != lv2::CELL_OK) return logged(r, kPolled, "cellVoiceGetMuteFlag({:#x})", port_id);
+    if (!usable(ctx, muted, 2, "cellVoiceGetMuteFlag: bMuted")) return error(CELL_VOICE_ERROR_ADDRESS_INVALID);
+    ps_write16(guest_base(ctx), muted, ps_ld16(port->info.data() + kParamMute));
+    return lv2::CELL_OK;
+}
+
+// cellVoiceSetVolume(portId, float volume): volume in f1.
+s32 cellVoiceSetVolume(PPUContext& ctx, u32 port_id)
+{
+    const f32 volume = static_cast<f32>(ctx.fpr[1]);
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    Port* port = nullptr;
+    const s32 r = port_checks(s, port_id, &port);
+    if (r == lv2::CELL_OK) ps_st32(port->info.data() + kParamVolume, std::bit_cast<u32>(volume));
+    return logged(r, kPolled, "cellVoiceSetVolume({:#x}, {})", port_id, volume);
+}
+
+// cellVoiceGetVolume(portId, float* volume): like cellVoiceGetBitRate, RPCS3 writes its "unknown" constant first.
+s32 cellVoiceGetVolume(PPUContext& ctx, u32 port_id, u32 volume)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return logged(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kPolled, "cellVoiceGetVolume()");
+    if (!usable(ctx, volume, 4, "cellVoiceGetVolume: volume")) return error(CELL_VOICE_ERROR_ADDRESS_INVALID);
+    u8* base = guest_base(ctx);
+    ps_write32(base, volume, kBitRateUnknown);
+    const Port* port = s.port(port_id);
+    if (!port) return logged(error(CELL_VOICE_ERROR_TOPOLOGY), kPolled, "cellVoiceGetVolume({:#x})", port_id);
+    ps_write32(base, volume, ps_ld32(port->info.data() + kParamVolume));
+    return lv2::CELL_OK;
+}
+
+bool valid_bitrate(u32 rate)
+{
+    for (const u32 r : kBitRates)
+        if (r == rate) return true;
+    return false;
+}
+
+// cellVoiceSetBitRate(portId, bitrate): a voice port, one of the exact bit rates.
+s32 cellVoiceSetBitRate(PPUContext&, u32 port_id, u32 bitrate)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    const auto done = [&](s32 r) { return logged(r, kState, "cellVoiceSetBitRate({:#x}, {})", port_id, bitrate); };
+    if (!s.initialized) return done(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT));
+    Port* port = s.port(port_id);
+    if (!port || !port->voice()) return done(error(CELL_VOICE_ERROR_TOPOLOGY));
+    if (!valid_bitrate(bitrate)) return done(error(CELL_VOICE_ERROR_ARGUMENT_INVALID));
+    ps_st32(port->info.data() + kParamBitrate, bitrate);
+    return done(lv2::CELL_OK);
+}
+
+// cellVoiceUpdatePort(portId, const CellVoicePortParam*): the mute flag, volume, threshold and (for a voice port) bit
+// rate; the type and the rest stay (RPCS3, which takes the bit rate unchecked).
+s32 cellVoiceUpdatePort(PPUContext& ctx, u32 port_id, u32 arg)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    const auto done = [&](s32 r) { return logged(r, kState, "cellVoiceUpdatePort({:#x}, {:#x})", port_id, arg); };
+    if (!s.initialized) return done(error(CELL_VOICE_ERROR_LIBVOICE_NOT_INIT));
+    if (!arg) return done(error(CELL_VOICE_ERROR_ARGUMENT_INVALID));
+    Port* port = s.port(port_id);
+    if (!port) return done(error(CELL_VOICE_ERROR_TOPOLOGY));
+    if (!usable(ctx, arg, kPortParamSize, "cellVoiceUpdatePort: the CellVoicePortParam")) {
+        return error(CELL_VOICE_ERROR_ADDRESS_INVALID);
+    }
+    const u8* src = guest_base(ctx) + arg;
+    std::memcpy(port->info.data() + kParamThreshold, src + kParamThreshold, 8); // threshold, bMute, volume
+    if (port->voice()) std::memcpy(port->info.data() + kParamBitrate, src + kParamBitrate, 4);
+    return done(lv2::CELL_OK);
+}
+
+// cellVoiceGetSignalState(portId, attr, void* attrValue): the microphone is detached (RPCS3).
+s32 cellVoiceGetSignalState(PPUContext&, u32 port_id, u32 attr, u32 value)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    s32 r = port_checks(s, port_id);
+    if (r == lv2::CELL_OK) r = error(CELL_VOICE_ERROR_DEVICE_NOT_PRESENT);
+    return logged(r, kPolled, "cellVoiceGetSignalState({:#x}, attr {}, value {:#x})", port_id, attr, value);
+}
+
+s32 cellVoiceDebugTopology(PPUContext&)
+{
+    VoiceState& s = voice();
+    std::lock_guard lock(s.mutex);
+    return logged(error(s.initialized ? CELL_VOICE_ERROR_NOT_IMPLEMENTED : CELL_VOICE_ERROR_LIBVOICE_NOT_INIT), kState,
+        "cellVoiceDebugTopology()");
+}
+
 } // namespace
 
 void register_cellVoice(Registry& r)
@@ -405,6 +682,27 @@ void register_cellVoice(Registry& r)
         PS_HLE_FUNC(0xBEF53A2B, cellVoiceGetBitRate),
         PS_HLE_FUNC(0x36472C57, cellVoiceReadFromOPort),
         PS_HLE_FUNC(0x3DAD26E7, cellVoiceWriteToIPort),
+        PS_HLE_FUNC(0x2A01013E, cellVoiceCreateNotifyEventQueue),
+        PS_HLE_FUNC(0x20BAFE31, cellVoiceDebugTopology),
+        PS_HLE_FUNC(0x474609E2, cellVoiceGetMuteFlag),
+        PS_HLE_FUNC(0xD6811AA7, cellVoiceGetSignalState),
+        PS_HLE_FUNC(0x762DC193, cellVoiceGetVolume),
+        PS_HLE_FUNC(0xB1A2C38F, cellVoiceInitEx),
+        PS_HLE_FUNC(0x87C71B06, cellVoicePausePort),
+        PS_HLE_FUNC(0xD14E784D, cellVoicePausePortAll),
+        PS_HLE_FUNC(0xDD000886, cellVoiceRemoveNotifyEventQueue),
+        PS_HLE_FUNC(0xFF0FA43A, cellVoiceResetPort),
+        PS_HLE_FUNC(0x7BF17B15, cellVoiceResumePort),
+        PS_HLE_FUNC(0x7F3963F7, cellVoiceResumePortAll),
+        PS_HLE_FUNC(0x7E60ADC6, cellVoiceSetBitRate),
+        PS_HLE_FUNC(0xDDE35A0C, cellVoiceSetMuteFlag),
+        PS_HLE_FUNC(0xD4D80EA5, cellVoiceSetMuteFlagAll),
+        PS_HLE_FUNC(0x35D84910, cellVoiceSetNotifyEventQueue),
+        PS_HLE_FUNC(0xD5AE37D8, cellVoiceSetVolume),
+        PS_HLE_FUNC(0x94D51F92, cellVoiceStartEx),
+        PS_HLE_FUNC(0x2F24FEA3, cellVoiceUpdatePort),
+        PS_HLE_FUNC(0x30F0B5AB, cellVoiceWriteToIPortEx),
+        PS_HLE_FUNC(0xC4F573B8, cellVoiceWriteToIPortEx2),
     });
 }
 

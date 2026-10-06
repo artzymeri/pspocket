@@ -264,6 +264,8 @@ public:
     std::shared_ptr<PpuThread> thread(u32 id) const;
     // A live event queue by ID, or null (HLE modules that connect queues on the guest's behalf: SPURS ports).
     std::shared_ptr<EventQueue> event_queue(u32 id) const;
+    // A live event queue by its IPC key (RPCS3 lv2_event_queue::find), or null: HLE modules that take queue keys.
+    std::shared_ptr<EventQueue> event_queue_by_key(u64 key) const;
     // An event flag by ID, or null (SPU code sets event flag bits through its interrupt mailbox).
     std::shared_ptr<EventFlag> event_flag(u32 id) const;
 

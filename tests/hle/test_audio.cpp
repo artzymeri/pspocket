@@ -303,12 +303,13 @@ TEST_CASE("cellAudio: notify event queues: creation, registration, an event ever
     REQUIRE(g.call("cellAudioSetNotifyEventQueue", key1) == 0);
     CHECK(g.call("cellAudioSetNotifyEventQueue", key1) == kTransEvent);   // already set
     CHECK(g.call("cellAudioSetNotifyEventQueue", 0x1234) == kTransEvent); // no such queue
-    // A keyed queue the game made itself is not found yet (RPCS3 finds it): lv2 has no lookup by key.
+    // A keyed queue the game made itself is found by its key too (RPCS3 lv2_event_queue::find).
     ps_write32(b, kAttr, lv2::SYS_SYNC_FIFO);
     ps_write32(b, kAttr + 4, lv2::SYS_PPU_QUEUE);
     ps_write64(b, kAttr + 8, 0);
     REQUIRE(lv2::sys_event_queue_create(t, kOtherQueueId, kAttr, 0x8000000012345678ull, 8) == 0);
-    CHECK(g.call("cellAudioSetNotifyEventQueue", 0x8000000012345678ull) == kTransEvent);
+    REQUIRE(g.call("cellAudioSetNotifyEventQueue", 0x8000000012345678ull) == 0);
+    REQUIRE(g.call("cellAudioRemoveNotifyEventQueue", 0x8000000012345678ull) == 0);
 
     // CELL_AUDIO_EVENT_MIX every period: the source is pid 1 << 32 plus a made-up event port ID; data 0, 0, 0.
     REQUIRE(lv2::sys_event_queue_receive(t, q1, 0, 1'000'000) == 0);
@@ -324,10 +325,11 @@ TEST_CASE("cellAudio: notify event queues: creation, registration, an event ever
     CHECK(ms > 15 * kPeriodMs); // about 20 periods
     CHECK(ms < 2000);
 
-    // The next registration gets the next source. A queue holds 8 events (SDK 3.6); the thread drops the rest.
+    // The next registration gets the next source (the game's own queue had the second). A queue holds 8 events
+    // (SDK 3.6); the thread drops the rest.
     REQUIRE(g.call("cellAudioSetNotifyEventQueue", key2) == 0);
     REQUIRE(lv2::sys_event_queue_receive(t, q2, 0, 1'000'000) == 0);
-    CHECK(g.ctx.gpr[4] == kFirstSource + 0x100);
+    CHECK(g.ctx.gpr[4] == kFirstSource + 0x200);
     std::this_thread::sleep_for(80ms);
     CHECK(queued_events(g, q2) == 8);
 
@@ -352,7 +354,7 @@ TEST_CASE("cellAudio: notify event queues: creation, registration, an event ever
     CHECK(queued_events(g, q1) == 0);
     REQUIRE(g.call("cellAudioInit") == 0);
     REQUIRE(lv2::sys_event_queue_receive(t, q1, 0, 1'000'000) == 0);
-    CHECK(g.ctx.gpr[4] == kFirstSource + 0x200); // its third registration
+    CHECK(g.ctx.gpr[4] == kFirstSource + 0x300); // the fourth registration
     // The test ends without cellAudioQuit: the end of the process stops the thread.
 }
 

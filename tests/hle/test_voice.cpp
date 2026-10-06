@@ -7,6 +7,8 @@
 #include <string_view>
 #include <utility>
 
+#include "pspocket/lv2/syscalls.hpp"
+
 using namespace pspocket;
 using namespace pspocket::hle::test;
 
@@ -59,7 +61,7 @@ u32 create(GuestThread& g, u8* b, u32 type, u32 word, u32 pcm_type = 0)
 
 } // namespace
 
-TEST_CASE("cellVoice: the 14 functions GTA V imports", "[hle][voice]")
+TEST_CASE("cellVoice: the functions GTA V imports", "[hle][voice]")
 {
     const std::pair<std::string_view, u32> expected[] = {
         {"cellVoiceInit", 0xC7CF1182},
@@ -318,5 +320,135 @@ TEST_CASE("cellVoice: topology, service state, port info, bit rates, attributes,
     CHECK(g.call("cellVoiceReadFromOPort", voice_out, kBuf, kOut) == kTopology);
     CHECK(g.call("cellVoiceConnectIPortToOPort", voice_in, voice_out) == kTopology);
     CHECK(g.call("cellVoiceGetPortAttr", voice_out, 1001, kOut) == kTopology);
+    REQUIRE(g.call("cellVoiceEnd") == 0);
+}
+
+TEST_CASE("cellVoice: notify event queues get the service events", "[hle][voice]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "voice");
+    u8* b = f.base();
+    lv2::PpuThread& t = *g.t;
+    constexpr u64 kEventQueue = 0xFFFFFFFF8031080Full;
+    constexpr u32 kQueue = kData + 0x900, kKey = kData + 0x908, kCount = kData + 0x910, kEvents = kData + 0xA00;
+    const auto events = [&](u32 q) {
+        REQUIRE(lv2::sys_event_queue_tryreceive(t, q, kEvents, 8, kCount) == 0);
+        return ps_read32(b, kCount);
+    };
+
+    CHECK(g.call("cellVoiceCreateNotifyEventQueue", kQueue, kKey) == kNotInit);
+    voice_up(g, b);
+    REQUIRE(g.call("cellVoiceCreateNotifyEventQueue", kQueue, kKey) == 0);
+    const u32 q = ps_read32(b, kQueue);
+    const u64 key = ps_read64(b, kKey);
+    CHECK(key == 0x80004D494F323285ull);
+    REQUIRE(g.call("cellVoiceCreateNotifyEventQueue", kQueue, kKey) == 0);
+    CHECK(ps_read64(b, kKey) == key + 1);
+
+    CHECK(g.call("cellVoiceSetNotifyEventQueue", 0x1234, 0) == kEventQueue); // no such queue
+    REQUIRE(g.call("cellVoiceSetNotifyEventQueue", key, 0) == 0);      // a made-up source
+    REQUIRE(g.call("cellVoiceSetNotifyEventQueue", key, 0xABCD) == 0); // the same key again, another source
+
+    // Start: SERVICE_ATTACHED from each source; a second start sends nothing.
+    REQUIRE(g.call("cellVoiceStart") == 0);
+    REQUIRE(g.call("cellVoiceStart") == 0);
+    CHECK(events(q) == 2);
+    CHECK(ps_read64(b, kEvents + 0) == 0x20E000000ull); // (pid 1 + 1) << 32 | the first event port ID
+    CHECK(ps_read64(b, kEvents + 8) == 8);              // CELLVOICE_EVENT_SERVICE_ATTACHED
+    CHECK(ps_read64(b, kEvents + 32) == 0xABCD);
+    // Stop: SERVICE_DETACHED; a second stop sends nothing.
+    REQUIRE(g.call("cellVoiceStop") == 0);
+    REQUIRE(g.call("cellVoiceStop") == 0);
+    CHECK(events(q) == 2);
+    CHECK(ps_read64(b, kEvents + 8) == 16);
+    // StartEx needs its parameters; end detaches a started service.
+    CHECK(g.call("cellVoiceStartEx", 0) == kArgInvalid);
+    REQUIRE(g.call("cellVoiceStartEx", kBuf) == 0);
+    CHECK(events(q) == 2);
+    REQUIRE(g.call("cellVoiceRemoveNotifyEventQueue", key) == 0);
+    CHECK(g.call("cellVoiceRemoveNotifyEventQueue", key) == kEventQueue);
+    REQUIRE(g.call("cellVoiceSetNotifyEventQueue", key, 0) == 0);
+    REQUIRE(g.call("cellVoiceEnd") == 0);
+    CHECK(events(q) == 1);
+    CHECK(ps_read64(b, kEvents + 8) == 16);
+    CHECK(ps_read64(b, kEvents + 0) == 0x20E000100ull); // the next made-up source
+    // End forgot the queues: a new init and start notifies nobody.
+    REQUIRE(g.call("cellVoiceInitEx", kInitParam) == 0);
+    CHECK(g.call("cellVoiceInitEx", kInitParam) == kInitialized);
+    REQUIRE(g.call("cellVoiceStart") == 0);
+    CHECK(events(q) == 0);
+    REQUIRE(g.call("cellVoiceEnd") == 0);
+}
+
+TEST_CASE("cellVoice: mute flags, volumes, bit rates, port updates, pause and resume", "[hle][voice]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "voice");
+    u8* b = f.base();
+
+    CHECK(g.call("cellVoiceSetMuteFlagAll", 1) == kNotInit);
+    CHECK(g.call("cellVoiceDebugTopology") == kNotInit);
+    voice_up(g, b);
+    const u32 mic = create(g, b, kInMic, 0);
+    const u32 voice = create(g, b, kOutVoice, 4650);
+
+    REQUIRE(g.call("cellVoiceGetMuteFlag", mic, kOut) == 0);
+    CHECK(ps_read16(b, kOut) == 0);
+    REQUIRE(g.call("cellVoiceSetMuteFlag", mic, 1) == 0);
+    REQUIRE(g.call("cellVoiceGetMuteFlag", mic, kOut) == 0);
+    CHECK(ps_read16(b, kOut) == 1);
+    CHECK(g.call("cellVoiceGetMuteFlag", 0x9999, kOut) == kTopology);
+    CHECK(g.call("cellVoiceGetMuteFlag", mic, kUnmapped) == kAddrInvalid);
+    REQUIRE(g.call("cellVoiceSetMuteFlagAll", 0) == 0);
+    REQUIRE(g.call("cellVoiceGetMuteFlag", mic, kOut) == 0);
+    CHECK(ps_read16(b, kOut) == 1); // RPCS3: the "all" flag leaves the ports' flags alone
+
+    REQUIRE(g.call("cellVoiceGetVolume", mic, kOut) == 0);
+    CHECK(ps_readf32(b, kOut) == 1.0f);
+    g.ctx.fpr[1] = 0.25;
+    REQUIRE(g.call("cellVoiceSetVolume", mic) == 0);
+    REQUIRE(g.call("cellVoiceGetVolume", mic, kOut) == 0);
+    CHECK(ps_readf32(b, kOut) == 0.25f);
+    CHECK(g.call("cellVoiceGetVolume", 0x9999, kOut) == kTopology);
+    CHECK(ps_read32(b, kOut) == kBitRateUnknown); // written before the port is looked up (RPCS3)
+    CHECK(g.call("cellVoiceSetVolume", 0x9999) == kTopology);
+
+    // Bit rates: voice ports only, exact values.
+    CHECK(g.call("cellVoiceSetBitRate", mic, 7300) == kTopology);
+    CHECK(g.call("cellVoiceSetBitRate", voice, 7301) == kArgInvalid);
+    REQUIRE(g.call("cellVoiceSetBitRate", voice, 7300) == 0);
+    REQUIRE(g.call("cellVoiceGetBitRate", voice, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 7300);
+
+    // An update takes the threshold, mute flag, volume, and a voice port's bit rate; not the type.
+    put_port_param(b, kInPcm, 16000);
+    ps_write16(b, kParam + 6, 1);
+    ps_write32(b, kParam + 8, 0x3F000000); // 0.5
+    REQUIRE(g.call("cellVoiceUpdatePort", voice, kParam) == 0);
+    REQUIRE(g.call("cellVoiceGetBitRate", voice, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 16000);
+    REQUIRE(g.call("cellVoiceGetVolume", voice, kOut) == 0);
+    CHECK(ps_readf32(b, kOut) == 0.5f);
+    REQUIRE(g.call("cellVoiceGetMuteFlag", voice, kOut) == 0);
+    CHECK(ps_read16(b, kOut) == 1);
+    REQUIRE(g.call("cellVoiceStart") == 0);
+    REQUIRE(g.call("cellVoiceGetPortInfo", voice, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == kOutVoice);
+    CHECK(g.call("cellVoiceUpdatePort", voice, 0) == kArgInvalid);
+    CHECK(g.call("cellVoiceUpdatePort", 0x9999, kParam) == kTopology);
+
+    for (const char* fn : {"cellVoicePausePort", "cellVoiceResumePort", "cellVoiceResetPort"}) {
+        INFO(fn);
+        CHECK(g.call(fn, mic) == 0);
+        CHECK(g.call(fn, 0x9999) == kTopology);
+    }
+    CHECK(g.call("cellVoicePausePortAll") == 0);
+    CHECK(g.call("cellVoiceResumePortAll") == 0);
+    CHECK(g.call("cellVoiceGetSignalState", mic, 0, kOut) == kNoDevice);
+    CHECK(g.call("cellVoiceGetSignalState", 0x9999, 0, kOut) == kTopology);
+    CHECK(g.call("cellVoiceDebugTopology") == 0xFFFFFFFF80310809ull); // not implemented on the PS3 either
+    CHECK(g.call("cellVoiceWriteToIPortEx", mic, kBuf, kOut, 0) == 0);
+    CHECK(g.call("cellVoiceWriteToIPortEx2", mic, kBuf, kOut, 0) == 0);
+    CHECK(g.call("cellVoiceWriteToIPortEx", voice, kBuf, kOut, 0) == kTopology); // an output port
     REQUIRE(g.call("cellVoiceEnd") == 0);
 }
