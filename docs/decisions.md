@@ -3038,6 +3038,89 @@ from the driver information; lv2's 0x10a and queue notes; the queue handler's he
 in guest code under the interpreter; the command words; the default buffer's sizes; Z-cull and the arrays; the small
 ones) and the flip command's queue in tests/rsx/test_methods.cpp.
 
+## D-174 · 2026-10-06 · Fragment program opcodes and texture controls that skipped or spoiled draws
+
+An audit of the RSX translation against RPCS3 (upstream 431b169: Program/FragmentProgramDecompiler.cpp, the
+GLSLSnippets/RSXProg files, RSXTexture.cpp, Common/TextureUtils.cpp, RSXThread.cpp) found features games use that
+pspocket refused, which skipped the whole draw, or decoded and never applied, which spoiled it. Each now follows RPCS3;
+where pspocket differs, the reason is given.
+
+- **Fragment program ops.** LIT (RPCS3 _builtin_lit), LIF (_builtin_lif), DST, REFL (GLSL reflect(src0, src1);
+  NV_fragment_program's RFL reflects src1 about src0 instead, RPCS3's reading is kept), DP2A, PKG and UPG (PKB and UPB
+  through linear_to_srgb and srgb_to_linear, on all four components), BEM (NV_fragment_program's X2D) and TEXBEM and
+  TXPBEM (BEM's result as the coordinate of a TEX or TXP; RPCS3 marks them untested). LIT, LIF and REFL are not
+  precision-clamped (SetDst). TXP on a cube map divides the direction by w (TEX3D_PROJ); TXD on a shadow map is the
+  plain comparison (TEX2D_SHADOW). Still refused, as RPCS3's decompiler has nothing for them: CAL, POW, BEMLUM and
+  TIMESWTEX.
+- **Loops.** LOOP and REP run their count (SRC1 bits 2-9) times, as RPCS3's decompiler does and NV_fragment_program2
+  defines ("the x, y, and z components ... specify the initial values for the loop count, loop index, and loop index
+  increment"). pspocket ran `for (i = init; i < count; i += increment)`, as RPCS3's interpreter does: wrong whenever
+  the initial index is not 0 or the increment not 1, and a REP encoded with all three fields the count, as nouveau's
+  nv40_fp_rep encodes it after NVIDIA's compilers, never ran. A loop whose condition never holds is skipped (RPCS3:
+  `if (false) for`; pspocket ran its body once), and a BRK outside any loop does nothing (it ended the program).
+- **Indexed inputs** (SRC2.use_index_reg, refused before): texture coordinate A0.x + addr_reg (NV_fragment_program2's
+  fragment.texcoord[A0.x + n]). In a LOOP, A0.x is init + k * increment (the increment signed 8-bit); RPCS3 indexes by
+  its 0-based counter, the same for the {n, 0, 1} loops compilers emit for `for (i = 0; i < n; i++)`. A REP leaves
+  the index (NV_fragment_program2); with no LOOP around it, its own counter is used, as RPCS3. The coordinate comes
+  from a table of the ten with each one's 2D control applied (RPCS3 reads them as they are and logs the case); past
+  TEX9 it is (0, 0, 0, 1), as RPCS3's _indexed_load. Outside loops the input is TEX(addr_reg); past SSA the program is
+  refused (RPCS3: invalid ucode, nothing drawn).
+- **ARL** keeps floor (only its comment changed): NV_vertex_program2 defines ARL as floor and ARR (vector op 0x17) as
+  round, and nouveau emits Gallium's floor ARL as op 0x0d. RPCS3 now truncates (`ivec4($0)`; it used `$ifloor`
+  before); only a negative fractional address tells them apart.
+- **Texture controls**, decoded in state.cpp and never applied. texture_control() (texture.cpp) makes each unit's word
+  as RPCS3's format_ex: what the format allows (get_format_features: the 8-bit formats everything; the depth formats,
+  X16 and HILO8 the biased remap only; Y16_X16 signed and biased, in 16-bit steps; the float formats and HILO_S8
+  nothing), signed channels (TEXTURE_FILTER bits 28-31) through the remap (shuffle_mask_bits, with RPCS3's remap for
+  X16, Y16_X16, HILO and the float formats), gamma (ADDRESS bits 20-23, R G B A in the register, A R G B in the word,
+  not remapped) on the channels not signed, and the biased unsigned remap (ADDRESS bits 12-15 = 1: (x - 128) / 127 in
+  the bytes' steps) on the rest. The fragment shader applies it to the sampled texel (rsx_texel, RPCS3's
+  _process_texel), after the alpha kill (CONTROL0 bit 2: alpha below 1e-6 discards the fragment). Units that convert or
+  alpha-kill are compiled in (FpOptions masks, in the program key), as RPCS3's TEXTURE_FORMAT_CONVERT and
+  TEXTURE_ALPHA_KILL; the word reaches the shader in MslFsParams::tex_control. Gamma decodes after filtering, as
+  RPCS3's shader path does; its GL and Vulkan backends sample an sRGB view instead when the remap is the identity and
+  gamma covers R, G and B (decoding before filtering), not done here.
+- **_bx2** expands only formats with biased renormalization, on the channels the remap reads (a channel forced to 0 or
+  1 stays), as 2x - 1, and replaces gamma (RPCS3 _enable_texture_expand). Before, it expanded every channel of every
+  texture, float formats and shadow lookups included.
+- **LOD bias** (TEXTURE_FILTER bits 0-12, signed 4.8). Metal samplers have none, so the shader adds it: TEX and TXP
+  sample with bias(b), TXB adds b to its own bias, TXL to its level (GL and Vulkan, whose samplers RPCS3 gives the
+  bias, add it to an explicit LOD too), TXD's derivatives grow by 2^b. It applies to textures with more than one level
+  whose min filter reads mipmaps, as RPCS3 sets it on the sampler only then; shadow lookups take none.
+- **The ROP**, in RSXROPEpilogue.glsl's order. NV4097_SET_SHADER_PACKER turns the colour outputs' RGB to sRGB
+  (linear_to_srgb) on 8-bit targets with 16-bit exports (RSXThread.cpp). Alpha to coverage
+  (NV4097_SET_ANTI_ALIASING_CONTROL bit 4) discards a fragment whose alpha is not above RPCS3's _rand of its pixel
+  (targets have one sample here, as RPCS3 emulates it without hardware support). The alpha test reads colour 0's alpha
+  before the B8 and G8B8 channel moves, and runs without colour targets too ("This stage always runs even without a
+  color output"): depth-only passes of alpha-tested geometry, shadow maps, were drawn solid.
+- **The shader cache.** Program records now start with the translation's version (shader::kTranslationVersion, 2);
+  records of another version are skipped, since they hold the old translation under keys the new one makes too. The
+  Mac and the phone compile their programs again once; the shaders the app is seeded with need a new Mac run.
+
+What changes for programs that already translated (GTA V's frames): loops that start their index elsewhere than 0 or
+step by other than 1, and REPs; _bx2 on float formats, on remaps with a constant channel and on shadow lookups;
+mipmapped textures with a LOD bias; textures with gamma, signed or biased-remap bits; alpha kill; alpha-tested draws
+without colour targets or onto B8 and G8B8 targets; the sRGB packer; alpha to coverage. Everything else gives what it
+gave (the samples gain `bias(fp.tex_bias[n])`, 0 for them). Assassin's Creed's washed-out Abstergo lab (status.md)
+may be gamma textures or the sRGB packer; that is for the next run to show.
+
+Not done: TXL and TXB still take their level and bias from src0.w (nouveau's NV40 compiler puts them there too); RPCS3
+reads src1.x. That is outside this audit and changes nothing that worked; a game's TXL would settle it. The border
+colour of signed textures (RPCS3 border_color re-encodes it) is not converted: pspocket's three Metal border colours
+are approximate anyway. RPCS3's RENORMALIZE (its hosts' precision for 16-bit formats) does not apply: pspocket decodes
+those formats to 8 bits as RPCS3's CPU path does.
+
+Tests: tests/rsx/test_shader.cpp (each new op's MSL and RPCS3's helpers; precision exemptions; TXP on a cube map and
+TXD on a shadow map; loops: counts, LOOP's index, REP inside and outside a LOOP, a negative increment, a never
+condition, BRK outside loops, indexed inputs in and out of loops and past SSA; per-unit conversions, alpha kill and LOD
+bias; the ROP order and the alpha test without colour outputs), tests/rsx/test_texture.cpp (texture_control: format
+features, the register orders, signed over gamma over the remap, remaps with constant channels, X32_FLOAT, DEPTH24_D8,
+Y16_X16's remap), and tests/rsx/test_metal.mm, run on the GPU against values worked out from RPCS3's formulas: LIT,
+LIF, DST, REFL, DP2A, BEM, PKG and UPG; loop counts and indexed coordinates; TEXBEM and TXPBEM; ARL's floor through
+c[A0.x + n]; gamma, signed channels and the biased remap; _bx2 by format and remap; alpha kill; LOD bias between two
+mipmap levels; the sRGB packer; the alpha test in a depth-only pass; alpha to coverage's share of pixels; every
+texture op on every texture kind compiles, with and without conversions.
+
 ## D-175 · 2026-10-06 · System libraries chosen per game, as a PS3 links them
 
 Before, a firmware module ran as it is (LLE, D-157) only when the host implemented none of its libraries. A library
