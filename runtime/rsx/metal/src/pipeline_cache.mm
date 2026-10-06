@@ -220,7 +220,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     return vertex_compiled[points ? 1 : 0] = &it->second;
 }
 
-const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& state, const shader::FpOptions& options,
+const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& state, const shader::FpOptions& requested,
     const shader::FragmentProgram** program_out, u32& program_ea)
 {
     const ShaderProgramInfo sp = state.shader_program();
@@ -274,6 +274,11 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     const shader::FragmentProgram& fp = entry.program;
     *program_out = &fp;
     program_ea = *ea;
+    // The per-unit texel options (D-174) of units the program does not sample change nothing in it: without them, draws
+    // that differ only there find their compile in the program's short list.
+    shader::FpOptions options = requested;
+    options.texture_convert_mask = static_cast<u16>(options.texture_convert_mask & fp.texture_mask);
+    options.texture_alpha_kill_mask = static_cast<u16>(options.texture_alpha_kill_mask & fp.texture_mask);
     for (const auto& [o, c] : entry.compiled) {
         if (o == options) return c;
     }
