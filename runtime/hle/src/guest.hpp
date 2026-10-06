@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstring>
 #include <initializer_list>
+#include <string>
 #include <string_view>
 
 #include "pspocket/core/be.h"
@@ -89,6 +90,32 @@ inline bool guest_readable(lv2::PpuThread& t, u32 addr, u32 size)
     if (!size) return true;
     if (u64{addr} + size > GuestMemory::kGuestSize) return false;
     return t.kernel.memory().is_committed(addr) && t.kernel.memory().is_committed(addr + size - 1);
+}
+
+// A NUL-terminated guest string read with the checks of guest_readable: at most `max` bytes.
+struct GuestString {
+    std::string text;        // up to the NUL, or the first `max` bytes
+    bool terminated = false; // a NUL within `max` bytes
+    bool faulted = false;    // ran into memory that isn't committed first
+};
+
+inline GuestString read_cstr(lv2::PpuThread& t, u32 addr, u32 max)
+{
+    GuestString s;
+    u8* base = t.kernel.base();
+    for (u32 i = 0; addr && i < max; i++) {
+        if (!guest_readable(t, addr + i, 1)) {
+            s.faulted = true;
+            break;
+        }
+        const char c = static_cast<char>(ps_read8(base, addr + i));
+        if (!c) {
+            s.terminated = true;
+            break;
+        }
+        s.text += c;
+    }
+    return s;
 }
 
 // Logs (as errors) why an HLE call is refused, the argument registers r3..r10 and the caller's last instructions

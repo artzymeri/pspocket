@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1034,4 +1035,244 @@ TEST_CASE("sys_prx_register_library: CELL_EFAULT outside guest memory, else CELL
     CHECK(logs.count(log::Level::Warn, "sysPrxForUser", "not registered") == 1);
     CHECK(logs.count(log::Level::Warn, "sysPrxForUser", "(\"testlib\", attributes 0x1, 1 functions, 0 variables)") ==
         1);
+}
+
+TEST_CASE("cellMsgDialog: progress bars, a timed close, the error code dialog, the older open (D-183)",
+    "[hle][sysutil][msgdialog]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    write_log_callback(base);
+    REQUIRE(a.call("cellSysutilRegisterCallback", 0, kLogOpd, 0x5150) == 0);
+    const auto check = [&] { REQUIRE(a.call("cellSysutilCheckCallback") == 0); };
+    const Event begin{0x0121, 0, 0x5150}, end{0x0122, 0, 0x5150};
+    const u64 kParam = r3_of_code(0x8002b301);
+    // The dialog's callback(button, userData): two arguments, the third word logged is whatever r5 held.
+    const auto answered = [&](u32 button, u32 userdata) {
+        const std::vector<Event> e = events(base);
+        REQUIRE(e.size() == 3);
+        CHECK(e[0] == begin);
+        CHECK(e[1] == end);
+        CHECK(e[2].status == button);
+        CHECK(e[2].param == userdata);
+    };
+    constexpr u32 kMsg = kData + 0x40000, kBar = kData + 0x40100;
+    std::memcpy(base + kMsg, "Loading", 8);
+    std::memcpy(base + kBar, "Step 1", 7);
+
+    // Nothing is open.
+    a.ctx.fpr[1] = 0.0;
+    CHECK(a.call("cellMsgDialogClose") == kNotOpened);
+    CHECK(a.call("cellMsgDialogProgressBarInc", 0, 10) == kNotOpened);
+
+    // A dialog with one progress bar and no buttons stays open; its bar takes messages and increments.
+    constexpr u32 kProgress = 0x1001; // SE_TYPE_NORMAL, one progress bar
+    REQUIRE(a.call("cellMsgDialogOpen2", kProgress, kMsg, kLogOpd, 0xD1A1, 0) == 0);
+    CHECK(a.call("cellMsgDialogProgressBarSetMsg", 0, kBar) == 0);
+    CHECK(a.call("cellMsgDialogProgressBarSetMsg", 1, kBar) == kParam); // one bar only
+    CHECK(a.call("cellMsgDialogProgressBarSetMsg", 0, 0) == kParam);
+    CHECK(a.call("cellMsgDialogProgressBarInc", 0, 50) == 0);
+    CHECK(a.call("cellMsgDialogProgressBarReset", 0) == 0);
+    CHECK(a.call("cellMsgDialogProgressBarReset", 2) == kParam);
+    check();
+    CHECK(events(base) == std::vector<Event>{begin});
+
+    // cellMsgDialogClose(delay): a long delay leaves it open; then 0 closes it at the next check, with
+    // CELL_MSGDIALOG_BUTTON_NONE (-1) to its callback after the end of the drawing.
+    a.ctx.fpr[1] = 60000.0;
+    CHECK(a.call("cellMsgDialogClose") == 0);
+    check();
+    CHECK(events(base) == std::vector<Event>{begin});
+    a.ctx.fpr[1] = 0.0;
+    CHECK(a.call("cellMsgDialogClose") == 0);
+    check();
+    answered(0xFFFFFFFF, 0xD1A1);
+    CHECK(a.call("cellMsgDialogClose") == kNotOpened);
+
+    // The error code dialog is an OK dialog, answered at once (OK = 1) at the check after the one that begins it.
+    std::memset(base + kLog, 0, 0x400);
+    REQUIRE(a.call("cellMsgDialogOpenErrorCode", 0x80010006, kLogOpd, 0xE1, 0) == 0);
+    check();
+    check();
+    answered(1, 0xE1);
+
+    // The older cellMsgDialogOpen is cellMsgDialogOpen2, checks included.
+    std::memset(base + kLog, 0, 0x400);
+    CHECK(a.call("cellMsgDialogOpen", 0x8000000, kMsg, kLogOpd, 0, 0) == kParam);
+    REQUIRE(a.call("cellMsgDialogOpen", 0x21, kMsg, kLogOpd, 0x0E, 0) == 0);
+    check();
+    check();
+    answered(1, 0x0E);
+    REQUIRE(a.call("cellMsgDialogOpenSimulViewWarning", 0, 0, 0) == 0);
+    check();
+    check();
+}
+
+TEST_CASE("cellSysutil: callback dispatchers, game exits, background music Ex (D-183)", "[hle][sysutil]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    for (u32 i = 0; i < 32; i++) CHECK(a.call("cellSysutilRegisterCallbackDispatcher", 0x100 + i, 0x1000 + i) == 0);
+    CHECK(a.call("cellSysutilRegisterCallbackDispatcher", 0x200, 0x2000) == r3_of_code(0x8002b004));
+    CHECK(a.call("cellSysutilUnregisterCallbackDispatcher", 0x105) == 0);
+    CHECK(a.call("cellSysutilUnregisterCallbackDispatcher", 0x105) == r3_of_code(0x8002b005));
+    CHECK(a.call("cellSysutilRegisterCallbackDispatcher", 0x200, 0x2000) == 0);
+
+    CHECK(a.call("cellSysutilGameDataExit", 4) == 0);
+    CHECK(a.call("cellSysutilGameDataExit", 5) == r3_of_code(0x8002b604));
+    CHECK(a.call("cellSysutilGameExit_I") == 0);
+    CHECK(a.call("cellSysutilGamePowerOff_I") == 0);
+    CHECK(a.call("cellSysutilGameReboot_I") == 0);
+    ps_write32(base, kData, 0xFFFFFFFF);
+    CHECK(a.call("cellSysutil_E1EC7B6A", kData) == 0);
+    CHECK(ps_read32(base, kData) == 0);
+
+    // CellSysutilBgmPlaybackExtraParam: four fade times, -1 to 60000 ms.
+    const u64 kExParam = r3_of_code(0x8002d301);
+    constexpr u32 kParamAddr = kData + 0x100, kStatus = kData + 0x200;
+    const auto fades = [&](s32 a0, s32 a1, s32 a2, s32 a3) {
+        ps_write32(base, kParamAddr + 0, static_cast<u32>(a0));
+        ps_write32(base, kParamAddr + 4, static_cast<u32>(a1));
+        ps_write32(base, kParamAddr + 8, static_cast<u32>(a2));
+        ps_write32(base, kParamAddr + 12, static_cast<u32>(a3));
+    };
+    fades(-1, 0, 60000, 500);
+    CHECK(a.call("cellSysutilEnableBgmPlaybackEx", kParamAddr) == 0);
+    REQUIRE(a.call("cellSysutilGetBgmPlaybackStatus", kStatus) == 0);
+    CHECK(ps_read8(base, kStatus + 1) == 0); // enabled
+    CHECK(a.call("cellSysutilDisableBgmPlaybackEx", kParamAddr) == 0);
+    REQUIRE(a.call("cellSysutilGetBgmPlaybackStatus", kStatus) == 0);
+    CHECK(ps_read8(base, kStatus + 1) == 1); // disabled
+    CHECK(a.call("cellSysutilSetBgmPlaybackExtraParam", kParamAddr) == 0);
+    fades(0, 60001, 0, 0);
+    CHECK(a.call("cellSysutilEnableBgmPlaybackEx", kParamAddr) == kExParam);
+    fades(-2, 0, 0, 0);
+    CHECK(a.call("cellSysutilSetBgmPlaybackExtraParam", kParamAddr) == kExParam);
+    CHECK(a.call("cellSysutilDisableBgmPlaybackEx", 0) == kExParam);
+    std::memset(base + kStatus, 0xAA, 8);
+    CHECK(a.call("cellSysutilGetBgmPlaybackStatus2", kStatus) == 0);
+    CHECK(ps_read8(base, kStatus) == 1); // stopped
+    CHECK(all_bytes(base + kStatus + 1, 7, 0));
+    CHECK(a.call("cellSysutilGetBgmPlaybackStatus2", 0) == kExParam);
+}
+
+TEST_CASE("cellVideoOut, cellAudioOut, cellSysutilAvconfExt: the rest of RPCS3's functions (D-183)", "[hle][sysutil]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u32 kConfig = kData + 0x100, kOption = kData + 0x120, kInfo = kData + 0x200;
+
+    CHECK(a.call("cellVideoOutGetNumberOfDevice", 0) == 1);
+    CHECK(a.call("cellVideoOutGetNumberOfDevice", 1) == 0);
+    CHECK(a.call("cellVideoOutGetNumberOfDevice", 2) == kVideoUnsupportedOut);
+
+    // Before cellVideoOutConfigure: the display's 720p, X8R8G8B8, 16:9, 4 bytes a pixel.
+    std::memset(base + kConfig, 0xAA, 16);
+    ps_write32(base, kOption, 0xAAAAAAAA);
+    REQUIRE(a.call("cellVideoOutGetConfiguration", 0, kConfig, kOption) == 0);
+    CHECK(ps_read8(base, kConfig + 0) == 2);
+    CHECK(ps_read8(base, kConfig + 1) == 0);
+    CHECK(ps_read8(base, kConfig + 2) == 2);
+    CHECK(ps_read32(base, kConfig + 12) == 1280 * 4);
+    CHECK(ps_read32(base, kOption) == 0);
+    // After: what it set.
+    std::memset(base + kConfig, 0, 16);
+    ps_write8(base, kConfig + 0, 4); // 480
+    ps_write8(base, kConfig + 1, 1); // X8B8G8R8
+    ps_write8(base, kConfig + 2, 1); // 4:3
+    ps_write32(base, kConfig + 12, 0x1000);
+    REQUIRE(a.call("cellVideoOutConfigure", 0, kConfig, 0, 0) == 0);
+    std::memset(base + kConfig, 0xAA, 16);
+    REQUIRE(a.call("cellVideoOutGetConfiguration", 0, kConfig, 0) == 0);
+    CHECK(ps_read8(base, kConfig + 0) == 4);
+    CHECK(ps_read8(base, kConfig + 1) == 1);
+    CHECK(ps_read8(base, kConfig + 2) == 1);
+    CHECK(ps_read32(base, kConfig + 12) == 0x1000);
+    REQUIRE(a.call("cellVideoOutGetConfiguration", 1, kConfig, 0) == 0); // the secondary output: zeros
+    CHECK(all_bytes(base + kConfig, 16, 0));
+    CHECK(a.call("cellVideoOutGetConfiguration", 2, kConfig, 0) == kVideoUnsupportedOut);
+    CHECK(a.call("cellVideoOutGetConfiguration", 0, 0, 0) == kVideoIllegal);
+    CHECK(a.call("cellVideoOutGetConvertCursorColorInfo", kInfo) == 0);
+    CHECK(ps_read8(base, kInfo) == 1); // full range
+
+    // Cursor colours: channels 1 to 3 gamma-corrected (8-bit formats) or copied (float), channel 0 left alone.
+    constexpr u32 kSrc = kData + 0x300, kDst = kData + 0x340;
+    const u8 pixel[4] = {0x11, 0x80, 0x40, 0xFF};
+    std::memcpy(base + kSrc, pixel, 4);
+    std::memset(base + kDst, 0xEE, 4);
+    a.ctx.fpr[1] = 1.2;
+    REQUIRE(a.call("cellVideoOutConvertCursorColor", 0, 0, 0, kSrc, kDst, 1) == 0);
+    CHECK(ps_read8(base, kDst) == 0xEE);
+    for (u32 c = 1; c < 4; c++) {
+        const f32 want = std::clamp(std::pow(static_cast<f32>(pixel[c]) / 255.0f, 1.2f), 0.0f, 1.0f) * 255.0f;
+        CHECK(ps_read8(base, kDst + c) == static_cast<u8>(want + 0.5f));
+    }
+    a.ctx.fpr[1] = 0.5; // out of range, except for the float format
+    CHECK(a.call("cellVideoOutConvertCursorColor", 0, 0, 0, kSrc, kDst, 1) == kVideoOutOfRange);
+    REQUIRE(a.call("cellVideoOutConvertCursorColor", 0, 2, 0, kSrc, kDst, 1) == 0);
+    CHECK(ps_read8(base, kDst + 1) == 0x80);
+    CHECK(a.call("cellVideoOutConvertCursorColor", 0, 3, 0, kSrc, kDst, 1) == kVideoOutOfRange);
+    CHECK(a.call("cellVideoOutConvertCursorColor", 0, 0, 1, kSrc, kDst, 1) == kVideoOutOfRange);
+    CHECK(a.call("cellVideoOutConvertCursorColor", 0, 0, 0, 0, kDst, 1) == kVideoIllegal);
+
+    // Gamma round trip, the screen size of a 3D display (none), copy control, XV colour, the secondary display.
+    a.ctx.fpr[1] = 1.1;
+    REQUIRE(a.call("cellVideoOutSetGamma", 0) == 0);
+    REQUIRE(a.call("cellVideoOutGetGamma", 0, kInfo) == 0);
+    CHECK(std::bit_cast<f32>(ps_read32(base, kInfo)) == 1.1f);
+    CHECK(a.call("cellVideoOutGetGamma", 1, kInfo) == kVideoUnsupportedOut);
+    CHECK(a.call("cellVideoOutGetScreenSize", 0, kInfo) == r3_of_code(0x8002b228));
+    CHECK(a.call("cellVideoOutSetCopyControl", 0, 2) == 0);
+    CHECK(a.call("cellVideoOutSetCopyControl", 0, 3) == kVideoIllegal);
+    CHECK(a.call("cellVideoOutSetXVColor", 1, 0, 0) == r3_of_code(0x8002b220));
+    CHECK(a.call("cellVideoOutSetupDisplay", 0) == kVideoUnsupportedOut);
+    CHECK(a.call("cellVideoOutSetupDisplay", 1) == 0);
+    CHECK(a.call("cellVideoOutConfigure2") == 0);
+
+    // Audio out: the primary device's info and modes.
+    CHECK(a.call("cellAudioOutGetNumberOfDevice", 0) == 1);
+    CHECK(a.call("cellAudioOutGetNumberOfDevice", 1) == 0);
+    CHECK(a.call("cellAudioOutGetNumberOfDevice", 2) == kAudioIllegal);
+    std::memset(base + kInfo, 0xAA, 136);
+    REQUIRE(a.call("cellAudioOutGetDeviceInfo", 0, 0, kInfo) == 0);
+    CHECK(ps_read8(base, kInfo + 0) == 0);  // HDMI
+    CHECK(ps_read8(base, kInfo + 1) == 1);  // one mode
+    CHECK(ps_read8(base, kInfo + 2) == 1);  // available
+    CHECK(ps_read16(base, kInfo + 6) == 13); // latency
+    CHECK(ps_read8(base, kInfo + 8 + 1) == 2); // 2 ch
+    CHECK(ps_read8(base, kInfo + 8 + 2) == 4); // 48 kHz
+    CHECK(all_bytes(base + kInfo + 16, 120, 0));
+    CHECK(a.call("cellAudioOutGetDeviceInfo", 0, 1, kInfo) == kAudioOutOfRange);
+    REQUIRE(a.call("cellAudioOutGetDeviceInfo", 1, 0, kInfo) == 0);
+    CHECK(all_bytes(base + kInfo, 136, 0));
+    CHECK(a.call("cellAudioOutGetDeviceInfo", 0, 0, 0) == kAudioIllegal);
+    CHECK(a.call("cellAudioOutGetSoundAvailability2", 0, 0, 4, 2, 0) == 2);
+    CHECK(a.call("cellAudioOutGetSoundAvailability2", 0, 0, 4, 6, 0) == 0);
+    CHECK(a.call("cellAudioOutGetSoundAvailability2", 1, 0, 4, 2, 0) == 0);
+    CHECK(a.call("cellAudioOutRegisterDevice", 1, kInfo, 0, 0) == 0);
+    CHECK(a.call("cellAudioOutRegisterDevice", 1, 0, 0, 0) == r3_of_code(0x8002b262));
+    CHECK(a.call("cellAudioOutSetDeviceMode", 3) == kAudioIllegal);
+    CHECK(a.call("cellAudioOutGetDeviceInfo2", 0, 1, kInfo) == kAudioIllegal);
+
+    // Audio in: no microphone. Every entry asked for is disconnected (device number 0xff).
+    const u64 kInIllegal = r3_of_code(0x8002b262), kInNotFound = r3_of_code(0x8002b264);
+    std::memset(base + kInfo, 0xAA, 2 * 224);
+    CHECK(a.call("cellAudioInGetAvailableDeviceInfo", 2, kInfo) == 0);
+    CHECK(ps_read8(base, kInfo + 2) == 0);
+    CHECK(ps_read8(base, kInfo + 3) == 0xff);
+    CHECK(ps_read8(base, kInfo + 224 + 3) == 0xff);
+    CHECK(a.call("cellAudioInGetAvailableDeviceInfo", 17, kInfo) == kInIllegal);
+    CHECK(a.call("cellAudioInGetDeviceInfo", 0, 0, kInfo) == kInNotFound);
+    CHECK(a.call("cellAudioInGetDeviceInfo", 0, 1, kInfo) == kInIllegal);
+    ps_write8(base, kConfig, 6);
+    CHECK(a.call("cellAudioInRegisterDevice", 1, kInfo, 0, kConfig) == kInIllegal); // volume above 5
+    ps_write8(base, kConfig, 3);
+    CHECK(a.call("cellAudioInRegisterDevice", 1, kInfo, 0, kConfig) == kInNotFound);
+    CHECK(a.call("cellAudioInSetDeviceMode", 3) == kInIllegal);
+    CHECK(a.call("cellAudioInSetDeviceMode", 10) == 0);
+    CHECK(a.call("cellAudioInUnregisterDevice", 0) == 0);
 }

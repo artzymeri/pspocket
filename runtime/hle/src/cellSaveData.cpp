@@ -414,31 +414,6 @@ bool struct_ok(lv2::PpuThread& t, u32 addr, u64 size, std::string_view what)
     return false;
 }
 
-struct GuestString {
-    std::string text;        // up to the NUL, or the first `max` bytes
-    bool terminated = false; // a NUL within `max` bytes
-    bool faulted = false;    // ran into memory that isn't committed first
-};
-
-GuestString read_cstr(lv2::PpuThread& t, u32 addr, u32 max)
-{
-    GuestString s;
-    u8* base = t.kernel.base();
-    for (u32 i = 0; i < max; i++) {
-        if (!guest_readable(t, addr + i, 1)) {
-            s.faulted = true;
-            break;
-        }
-        const char c = static_cast<char>(ps_read8(base, addr + i));
-        if (!c) {
-            s.terminated = true;
-            break;
-        }
-        s.text += c;
-    }
-    return s;
-}
-
 // A char array of `size` bytes in a structure already checked: up to its first NUL (RPCS3's psf::string(char[N])).
 std::string read_chars(u8* base, u32 addr, u32 size)
 {

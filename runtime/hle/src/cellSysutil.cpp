@@ -4,9 +4,10 @@
 // cellAvconfExt.cpp, cellMsgDialog.cpp/.h, with RPCS3's default configuration (Emu/system_config.h, rsx::avconf in
 // Emu/RSX/Utils/rsx_utils.h).
 //
-// Implemented: what GTA V and Assassin's Creed import from these modules (save data: cellSaveData.cpp; the on-screen
-// keyboard: cellOskDialog.cpp; the game data checks: cellGame.cpp). Of the message dialog: cellMsgDialogOpen2 and
-// cellMsgDialogAbort. There is no dialog UI yet, so the user answers a dialog with buttons at once (show_msg_dialog).
+// Implemented: every function RPCS3 implements in these modules (D-183; save data: cellSaveData.cpp; the on-screen
+// keyboard: cellOskDialog.cpp; the game data checks: cellGame.cpp); the ones RPCS3 leaves as stubs are answered from
+// rpcs3_stubs.inc (D-182). There is no dialog UI yet, so the user answers a dialog with buttons at once
+// (show_msg_dialog), and cellMsgDialogClose's timed close happens at a cellSysutilCheckCallback.
 //
 // The console reported is RPCS3's default one, which also suits a fixed iPhone target: one HDMI display at 720p
 // (1280x720 progressive, 16:9: the PS3 mode closest to a phone screen, and the resolution most games render at), RGB,
@@ -32,6 +33,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <bit>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -83,6 +87,16 @@ enum : u32 {
     CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT = 0x8002b245,
 
     CELL_MSGDIALOG_ERROR_PARAM = 0x8002b301,
+    CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED = 0x8002b302,
+
+    CELL_SYSUTIL_BGMPLAYBACK_EX_ERROR_PARAM = 0x8002d301,
+    CELL_SYSUTIL_ERROR_DISPATCHERS_FULL = 0x8002b004, // RPCS3's bare values for the callback dispatchers
+    CELL_SYSUTIL_ERROR_DISPATCHER_NOT_FOUND = 0x8002b005,
+    CELL_GAMEDATA_ERROR_PARAM = 0x8002b604,
+    CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED = 0x8002b220,
+    CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET = 0x8002b228,
+    CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER = 0x8002b262,
+    CELL_AUDIO_IN_ERROR_DEVICE_NOT_FOUND = 0x8002b264,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -107,6 +121,15 @@ std::string result_name(s32 r)
     case CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE: return "CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE";
     case CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT: return "CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT";
     case CELL_MSGDIALOG_ERROR_PARAM: return "CELL_MSGDIALOG_ERROR_PARAM";
+    case CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED: return "CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED";
+    case CELL_SYSUTIL_BGMPLAYBACK_EX_ERROR_PARAM: return "CELL_SYSUTIL_BGMPLAYBACK_EX_ERROR_PARAM";
+    case CELL_SYSUTIL_ERROR_DISPATCHERS_FULL: return "0x8002b004 (no free dispatcher)";
+    case CELL_SYSUTIL_ERROR_DISPATCHER_NOT_FOUND: return "0x8002b005 (no such dispatcher)";
+    case CELL_GAMEDATA_ERROR_PARAM: return "CELL_GAMEDATA_ERROR_PARAM";
+    case CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED: return "CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED";
+    case CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET: return "CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET";
+    case CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER: return "CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER";
+    case CELL_AUDIO_IN_ERROR_DEVICE_NOT_FOUND: return "CELL_AUDIO_IN_ERROR_DEVICE_NOT_FOUND";
     }
     return r > 0 ? std::to_string(r) : std::format("{:#010x}", static_cast<u32>(r));
 }
@@ -146,6 +169,22 @@ enum class Fn : u8 {
     GetBgmPlaybackStatus,
     MsgDialogOpen2,
     MsgDialogAbort,
+    MsgDialogOpen,
+    MsgDialogOpenErrorCode,
+    MsgDialogOpenSimulViewWarning,
+    MsgDialogClose,
+    MsgDialogProgressBar,
+    CallbackDispatcher,
+    BgmPlaybackEx,
+    GetBgmPlaybackStatus2,
+    GameExit,
+    VideoOutGetConfiguration,
+    VideoOutGetNumberOfDevice,
+    VideoOutConvertCursorColor,
+    AudioOutGetNumberOfDevice,
+    AudioOutGetDeviceInfo,
+    AudioOutGetSoundAvailability2,
+    Avconf,
     Count,
 };
 
@@ -245,6 +284,8 @@ struct SysutilCallbacks {
     std::array<Slot, 4> slots{};
     std::deque<QueuedCall> queue;
     bool drawing = false; // RPCS3 draw_cb_started: DRAWING_BEGIN sent, DRAWING_END not yet
+    // RPCS3 registered_dispatcher: {event code, function}, 32 of them. Kept as RPCS3 keeps them: nothing calls them.
+    std::array<std::pair<u32, u32>, 32> dispatchers{};
 };
 
 std::string_view event_name(u64 status)
@@ -295,9 +336,12 @@ s32 cellSysutilUnregisterCallback(PPUContext&, u32 slot)
 // Runs what was queued before the call, in order, on the calling thread (RPCS3); calls queued meanwhile wait for the
 // next check. Deviation: when one returns non-zero (a system event never does), RPCS3 drops the rest of the batch;
 // here it stays queued.
+void close_timed_msg_dialog(); // message dialog section
+
 s32 cellSysutilCheckCallback(PPUContext& ctx)
 {
     const Call call(Fn::CheckCallback, kPolledInfoCalls, kChan, "cellSysutilCheckCallback()");
+    close_timed_msg_dialog(); // a cellMsgDialogClose whose delay has passed: its events join this batch
     SysutilCallbacks& cb = state<SysutilCallbacks>();
     std::deque<QueuedCall> batch;
     {
@@ -314,6 +358,58 @@ s32 cellSysutilCheckCallback(PPUContext& ctx)
             return call(r);
         }
     }
+    return call(lv2::CELL_OK);
+}
+
+// RPCS3 cellSysutilRegisterCallbackDispatcher: the first free one of 32 slots takes {event code, function}; none free
+// is 0x8002b004. RPCS3 never calls them (nor does this).
+s32 cellSysutilRegisterCallbackDispatcher(PPUContext&, u32 event_code, u32 func)
+{
+    const Call call(Fn::CallbackDispatcher, kInfoCalls, kChan,
+        "cellSysutilRegisterCallbackDispatcher(eventCode {:#x}, func {:#x})", event_code, func);
+    SysutilCallbacks& cb = state<SysutilCallbacks>();
+    std::lock_guard lock(cb.mutex);
+    for (auto& d : cb.dispatchers) {
+        if (d.first) continue;
+        d = {event_code, func};
+        return call(lv2::CELL_OK);
+    }
+    return call(error(CELL_SYSUTIL_ERROR_DISPATCHERS_FULL));
+}
+
+// The first dispatcher with this event code goes; none is 0x8002b005.
+s32 cellSysutilUnregisterCallbackDispatcher(PPUContext&, u32 event_code)
+{
+    const Call call(Fn::CallbackDispatcher, kInfoCalls, kChan, "cellSysutilUnregisterCallbackDispatcher(eventCode {:#x})",
+        event_code);
+    SysutilCallbacks& cb = state<SysutilCallbacks>();
+    std::lock_guard lock(cb.mutex);
+    for (auto& d : cb.dispatchers) {
+        if (d.first != event_code) continue;
+        d = {};
+        return call(lv2::CELL_OK);
+    }
+    return call(error(CELL_SYSUTIL_ERROR_DISPATCHER_NOT_FOUND));
+}
+
+// cellSysutilGameDataExit(how): what the system does when the game ends (0 exit, 1 power off, 4 reboot, as RPCS3's
+// _I wrappers pass); above 4 is CELL_GAMEDATA_ERROR_PARAM. RPCS3 does nothing else, nor does this.
+s32 game_exit(std::string_view name, u32 how)
+{
+    const Call call(Fn::GameExit, kInfoCalls, kChan, "{}({})", name, how);
+    if (how > 4) return call(error(CELL_GAMEDATA_ERROR_PARAM));
+    return call(lv2::CELL_OK);
+}
+s32 cellSysutilGameDataExit(PPUContext&, u32 how) { return game_exit("cellSysutilGameDataExit", how); }
+s32 cellSysutilGameExit_I(PPUContext&) { return game_exit("cellSysutilGameExit_I", 0); }
+s32 cellSysutilGamePowerOff_I(PPUContext&) { return game_exit("cellSysutilGamePowerOff_I", 1); }
+s32 cellSysutilGameReboot_I(PPUContext&) { return game_exit("cellSysutilGameReboot_I", 4); }
+
+// An unnamed function (NID 0xE1EC7B6A) that writes 0 to its argument (RPCS3).
+s32 cellSysutil_E1EC7B6A(PPUContext& ctx, u32 out)
+{
+    const Call call(Fn::GameExit, kInfoCalls, kChan, "cellSysutil_E1EC7B6A({:#x})", out);
+    if (out) ps_write32(guest_base(ctx), out, 0);
     return call(lv2::CELL_OK);
 }
 
@@ -815,6 +911,151 @@ s32 cellVideoOutSetGamma(PPUContext& ctx, u32 video_out)
     return call(lv2::CELL_OK);
 }
 
+// One display on the primary output, none on the secondary (a count, not an error code).
+s32 cellVideoOutGetNumberOfDevice(PPUContext&, u32 video_out)
+{
+    const Call call(Fn::VideoOutGetNumberOfDevice, kInfoCalls, kChan, "cellVideoOutGetNumberOfDevice(videoOut {})",
+        video_out);
+    return call(video_out_devices(video_out));
+}
+
+// CellVideoOutConfiguration (16 bytes) and the option's reserved word, cleared first. The primary output reports what
+// cellVideoOutConfigure set, else the display's own mode with a pitch of 4 bytes a pixel; the secondary one zeros.
+s32 cellVideoOutGetConfiguration(PPUContext& ctx, u32 video_out, u32 config, u32 option)
+{
+    const Call call(Fn::VideoOutGetConfiguration, kInfoCalls, kChan,
+        "cellVideoOutGetConfiguration(videoOut {}, config {:#x}, option {:#x})", video_out, config, option);
+    if (!config) return call(error(CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER));
+    u8* base = guest_base(ctx);
+    if (option) ps_write32(base, option, 0);
+    std::memset(base + config, 0, 16);
+    if (video_out == CELL_VIDEO_OUT_SECONDARY) return call(lv2::CELL_OK);
+    if (video_out != CELL_VIDEO_OUT_PRIMARY) return call(error(CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT));
+    VideoOutState& v = state<VideoOutState>();
+    std::lock_guard lock(v.mutex);
+    const u32 pitch = v.configured ? v.pitch : 4u * v.resolution.width;
+    ps_write8(base, config + 0, v.resolution_id);
+    ps_write8(base, config + 1, v.configured ? v.format : u8{0});
+    ps_write8(base, config + 2, v.aspect);
+    ps_write32(base, config + 12, pitch);
+    return call.ok(lv2::CELL_OK, "resolution {:#x}, format {}, aspect {}, pitch {:#x}", v.resolution_id,
+        v.configured ? v.format : u8{0}, v.aspect, pitch);
+}
+
+// The RGB range the cursor colours are converted for: full, as the display reports (cellVideoOutGetDeviceInfo).
+s32 cellVideoOutGetConvertCursorColorInfo(PPUContext& ctx, u32 rgb_output_range)
+{
+    const Call call(Fn::VideoOutConvertCursorColor, kInfoCalls, kChan,
+        "cellVideoOutGetConvertCursorColorInfo({:#x})", rgb_output_range);
+    if (!rgb_output_range) return call(error(CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER));
+    ps_write8(guest_base(ctx), rgb_output_range, CELL_VIDEO_OUT_RGB_OUTPUT_RANGE_FULL);
+    return call(lv2::CELL_OK);
+}
+
+// cellSysutilAvconfExt's cellVideoOutConvertCursorColor(videoOut, displayBufferFormat, gamma, sourceBufferFormat,
+// src, dest, num): num X8R8G8B8 colours converted for the display buffer's format, channels 1 to 3 of each (RPCS3
+// convert_cursor_color, full range): gamma-corrected for the 8-bit formats, copied for the float one. gamma is a
+// float argument (f1); the integer ones keep their registers (r3, r4, then r5 to r8), as RPCS3's binder counts them.
+s32 cellVideoOutConvertCursorColor(PPUContext& ctx, u32 video_out, s32 display_format, s32 source_format, u32 src,
+    u32 dst, s32 num)
+{
+    const f32 gamma = static_cast<f32>(ctx.fpr[1]);
+    const Call call(Fn::VideoOutConvertCursorColor, kInfoCalls, kAvconfChan,
+        "cellVideoOutConvertCursorColor(videoOut {}, displayBufferFormat {}, gamma {}, sourceBufferFormat {}, src "
+        "{:#x}, dest {:#x}, num {})",
+        video_out, display_format, gamma, source_format, src, dst, num);
+    constexpr s32 kFloatFormat = 2; // CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_R16G16B16X16_FLOAT
+    if (!src || !dst) return call(error(CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER));
+    if (display_format < 0 || display_format > kFloatFormat || source_format != 0)
+        return call(error(CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE));
+    if (display_format < kFloatFormat && (gamma < 0.8f || gamma > 1.2f))
+        return call(error(CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE));
+    if (num > 0 && (!guest_readable(thread_of(ctx), src, 4u * static_cast<u32>(num)) ||
+                       !guest_readable(thread_of(ctx), dst, 4u * static_cast<u32>(num)))) {
+        log_call_site(ctx, guest_base(ctx), "cellVideoOutConvertCursorColor: the colours are not guest memory");
+        return call(error(CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER));
+    }
+    u8* base = guest_base(ctx);
+    for (s32 i = 0; i < num; i++) {
+        const u32 from = src + 4u * static_cast<u32>(i), to = dst + 4u * static_cast<u32>(i);
+        for (u32 c = 1; c < 4; c++) {
+            const u8 v = ps_read8(base, from + c);
+            if (display_format == kFloatFormat) {
+                ps_write8(base, to + c, v);
+            } else {
+                const f32 out = std::clamp(std::pow(static_cast<f32>(v) / 255.0f, gamma), 0.0f, 1.0f) * 255.0f;
+                ps_write8(base, to + c, static_cast<u8>(out + 0.5f));
+            }
+        }
+    }
+    return call(lv2::CELL_OK);
+}
+
+// The gamma cellVideoOutSetGamma set (1.0 until then), as a float the game reads.
+s32 cellVideoOutGetGamma(PPUContext& ctx, u32 video_out, u32 gamma)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellVideoOutGetGamma(videoOut {}, gamma {:#x})", video_out,
+        gamma);
+    if (!gamma) return call(error(CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER));
+    if (video_out != CELL_VIDEO_OUT_PRIMARY) return call(error(CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT));
+    VideoOutState& v = state<VideoOutState>();
+    std::lock_guard lock(v.mutex);
+    ps_write32(guest_base(ctx), gamma, std::bit_cast<u32>(v.gamma));
+    return call.ok(lv2::CELL_OK, "{}", v.gamma);
+}
+
+// The screen size of a 3D display: there is none (RPCS3 without stereo: VALUE_IS_NOT_SET).
+s32 cellVideoOutGetScreenSize(PPUContext&, u32 video_out, u32 screen_size)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellVideoOutGetScreenSize(videoOut {}, screenSize {:#x})",
+        video_out, screen_size);
+    if (!screen_size) return call(error(CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER));
+    if (video_out != CELL_VIDEO_OUT_PRIMARY) return call(error(CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT));
+    return call(error(CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET));
+}
+
+s32 cellVideoOutSetCopyControl(PPUContext&, u32 video_out, u32 control)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellVideoOutSetCopyControl(videoOut {}, control {})",
+        video_out, control);
+    if (control > 2) return call(error(CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER)); // CELL_VIDEO_OUT_COPY_CONTROL_COPY_NEVER
+    return call(lv2::CELL_OK);
+}
+
+// RPCS3: an unknown first argument other than 0 is NOT_IMPLEMENTED.
+s32 cellVideoOutSetXVColor(PPUContext&, u32 unk1, u32 unk2, u32 unk3)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellVideoOutSetXVColor({:#x}, {:#x}, {:#x})", unk1, unk2,
+        unk3);
+    if (unk1 != 0) return call(error(CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED));
+    return call(lv2::CELL_OK);
+}
+
+// Only the secondary output is set up this way (RPCS3).
+s32 cellVideoOutSetupDisplay(PPUContext&, u32 video_out)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellVideoOutSetupDisplay(videoOut {})", video_out);
+    if (video_out != CELL_VIDEO_OUT_SECONDARY) return call(error(CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT));
+    return call(lv2::CELL_OK);
+}
+
+// RPCS3 takes no arguments for these three and answers CELL_OK.
+s32 cellVideoOutConfigure2(PPUContext&)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellVideoOutConfigure2()");
+    return call(lv2::CELL_OK);
+}
+s32 cellAudioOutConfigure2(PPUContext&)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellAudioOutConfigure2()");
+    return call(lv2::CELL_OK);
+}
+s32 cellAudioOutGetConfiguration2(PPUContext&)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellAudioOutGetConfiguration2()");
+    return call(lv2::CELL_OK);
+}
+
 // ----------------------------------------------------------------------- audio output (cellAudioOut.cpp/.h)
 
 constexpr u32 CELL_AUDIO_OUT_PRIMARY = 0, CELL_AUDIO_OUT_SECONDARY = 1;
@@ -999,6 +1240,144 @@ s32 cellAudioOutSetCopyControl(PPUContext&, u32 audio_out, u32 control)
     return call(lv2::CELL_OK);
 }
 
+// One device on the primary output, none on the secondary (a count, not an error code).
+s32 cellAudioOutGetNumberOfDevice(PPUContext&, u32 audio_out)
+{
+    const Call call(Fn::AudioOutGetNumberOfDevice, kInfoCalls, kChan, "cellAudioOutGetNumberOfDevice(audioOut {})",
+        audio_out);
+    return call(audio_out_devices(audio_out));
+}
+
+// CellAudioOutDeviceInfo (136 bytes): u8 portType, availableModeCount, state, reserved[3]; be16 latency at 6;
+// CellAudioOutSoundMode availableModes[16] at 8. RPCS3's: HDMI, available, 13 ms, the output's sound modes. A device
+// index past the secondary output's (none) is answered with zeros and CELL_OK, past the primary's is OUT_OF_RANGE.
+s32 cellAudioOutGetDeviceInfo(PPUContext& ctx, u32 audio_out, u32 device_index, u32 info)
+{
+    const Call call(Fn::AudioOutGetDeviceInfo, kInfoCalls, kChan,
+        "cellAudioOutGetDeviceInfo(audioOut {}, deviceIndex {}, info {:#x})", audio_out, device_index, info);
+    if (!info) return call(error(CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER));
+    const s32 devices = audio_out_devices(audio_out);
+    if (devices < 0) return call(devices);
+    u8* base = guest_base(ctx);
+    if (device_index >= static_cast<u32>(devices)) {
+        if (audio_out != CELL_AUDIO_OUT_SECONDARY) return call(error(CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE));
+        std::memset(base + info, 0, 136);
+        return call(lv2::CELL_OK);
+    }
+    AudioOutState& a = state<AudioOutState>();
+    std::lock_guard lock(a.mutex);
+    const AudioOutState::Out& out = a.out[audio_out];
+    std::memset(base + info, 0, 136);
+    ps_write8(base, info + 0, 0); // CELL_AUDIO_OUT_PORT_HDMI
+    ps_write8(base, info + 1, static_cast<u8>(out.sound_modes.size()));
+    ps_write8(base, info + 2, 1); // CELL_AUDIO_OUT_DEVICE_STATE_AVAILABLE
+    ps_write16(base, info + 6, 13);
+    for (usize i = 0; i < out.sound_modes.size() && i < 16; i++)
+        write_sound_mode(base, info + 8 + 8 * static_cast<u32>(i), out.sound_modes[i]);
+    return call.ok(lv2::CELL_OK, "HDMI, {} mode(s)", out.sound_modes.size());
+}
+
+// `ch` when the primary output has a mode of this coding type, sample rate and channel count, else 0.
+s32 cellAudioOutGetSoundAvailability2(PPUContext&, u32 audio_out, u32 type, u32 fs, u32 ch, u32 option)
+{
+    const Call call(Fn::AudioOutGetSoundAvailability2, kInfoCalls, kChan,
+        "cellAudioOutGetSoundAvailability2(audioOut {}, type {}, fs {:#x}, ch {}, option {})", audio_out, type, fs, ch,
+        option);
+    if (audio_out != CELL_AUDIO_OUT_PRIMARY) return call.ok(0, "0 ch");
+    AudioOutState& a = state<AudioOutState>();
+    std::lock_guard lock(a.mutex);
+    for (const SoundMode& m : a.out[audio_out].sound_modes)
+        if (m.type == type && m.fs == fs && m.channel == ch) return call.ok(static_cast<s32>(ch), "{} ch", ch);
+    return call.ok(0, "0 ch");
+}
+
+// cellSysutilAvconfExt's audio devices besides the built-in outputs: none. Registering one gives device 0 (RPCS3),
+// the rest checks its arguments and answers CELL_OK.
+s32 cellAudioOutRegisterDevice(PPUContext&, u64 device_type, u32 name, u32 option, u32 config)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan,
+        "cellAudioOutRegisterDevice(deviceType {:#x}, name {:#x}, option {:#x}, config {:#x})", device_type, name,
+        option, config);
+    if (option || !name) return call(error(CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER)); // RPCS3's (sic) error
+    return call.ok(0, "device 0");
+}
+
+s32 cellAudioOutSetDeviceMode(PPUContext&, u32 mode)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellAudioOutSetDeviceMode({})", mode);
+    if (mode > 2) return call(error(CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER)); // CELL_AUDIO_OUT_MULTI_DEVICE_MODE_2
+    return call(lv2::CELL_OK);
+}
+
+s32 cellAudioOutGetDeviceInfo2(PPUContext&, u32 device_number, u32 device_index, u32 info)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan,
+        "cellAudioOutGetDeviceInfo2(deviceNumber {}, deviceIndex {}, info {:#x})", device_number, device_index, info);
+    if (device_index != 0 || !info) return call(error(CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER));
+    return call(lv2::CELL_OK);
+}
+
+// Audio input (microphones, USB and Bluetooth headsets): there is none, as RPCS3 with no microphone configured.
+// CellAudioInDeviceInfo is 224 bytes: u8 portType, availableModeCount, state, deviceNumber; reserved[12]; be64
+// deviceId, type; char name[64]; CellAudioInSoundMode availableModes[16].
+constexpr u32 kAudioInDeviceInfoSize = 224;
+
+struct AudioInState {
+    std::mutex mutex;
+    u32 device_mode = 0; // CELL_AUDIO_IN_SINGLE_DEVICE_MODE
+};
+
+s32 cellAudioInGetDeviceInfo(PPUContext&, u32 device_number, u32 device_index, u32 info)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan,
+        "cellAudioInGetDeviceInfo(deviceNumber {}, deviceIndex {}, info {:#x})", device_number, device_index, info);
+    if (device_index != 0 || !info) return call(error(CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER));
+    return call(error(CELL_AUDIO_IN_ERROR_DEVICE_NOT_FOUND));
+}
+
+// The available devices (none): every entry asked for is a disconnected one (state UNAVAILABLE, device number 0xff).
+s32 cellAudioInGetAvailableDeviceInfo(PPUContext& ctx, u32 count, u32 info)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellAudioInGetAvailableDeviceInfo(count {}, info {:#x})",
+        count, info);
+    if (count > 16 || !info) return call(error(CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER));
+    u8* base = guest_base(ctx);
+    for (u32 i = 0; i < count; i++) {
+        const u32 at = info + i * kAudioInDeviceInfoSize;
+        std::memset(base + at, 0, kAudioInDeviceInfoSize);
+        ps_write8(base, at + 3, 0xff);
+    }
+    return call.ok(0, "0 devices");
+}
+
+s32 cellAudioInSetDeviceMode(PPUContext&, u32 mode)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellAudioInSetDeviceMode({})", mode);
+    if (mode != 0 && mode != 1 && mode != 2 && mode != 10) return call(error(CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER));
+    AudioInState& a = state<AudioInState>();
+    std::lock_guard lock(a.mutex);
+    a.device_mode = mode;
+    return call(lv2::CELL_OK);
+}
+
+// Volume 1 (soft) to 5 (loud); the device is looked up by name, and there is none.
+s32 cellAudioInRegisterDevice(PPUContext& ctx, u64 device_type, u32 name, u32 option, u32 config)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan,
+        "cellAudioInRegisterDevice(deviceType {:#x}, name {:#x}, option {:#x}, config {:#x})", device_type, name,
+        option, config);
+    // CellAudioInDeviceConfiguration: u8 volume, reserved[31].
+    if (option || !config || !name || ps_read8(guest_base(ctx), config) > 5)
+        return call(error(CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER));
+    return call(error(CELL_AUDIO_IN_ERROR_DEVICE_NOT_FOUND));
+}
+
+s32 cellAudioInUnregisterDevice(PPUContext&, u32 device_number)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellAudioInUnregisterDevice({})", device_number);
+    return call(lv2::CELL_OK);
+}
+
 // ------------------------------------------------------------------------ background music (cellSysutil.cpp)
 
 // CellSysutilBgmPlaybackStatus (32 bytes): u8 playerState, enableState; char contentId[16]; u8 currentFadeRatio;
@@ -1015,6 +1394,8 @@ struct BgmState {
     std::mutex mutex;
     u8 enable_state = CELL_SYSUTIL_BGMPLAYBACK_STATUS_DISABLE;
     u8 player_state = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
+    // CellSysutilBgmPlaybackExtraParam: the fade times (ms) from the Ex functions, kept as RPCS3 keeps them.
+    std::array<s32, 4> fade_ms{};
 };
 
 s32 set_bgm_enable_state(Fn fn, std::string_view name, u8 enable_state)
@@ -1036,6 +1417,53 @@ s32 cellSysutilDisableBgmPlayback(PPUContext&)
 {
     return set_bgm_enable_state(Fn::DisableBgmPlayback, "cellSysutilDisableBgmPlayback",
         CELL_SYSUTIL_BGMPLAYBACK_STATUS_DISABLE);
+}
+
+// The Ex functions' CellSysutilBgmPlaybackExtraParam: be32 systemBgmFadeInTime, systemBgmFadeOutTime,
+// gameBgmFadeInTime, gameBgmFadeOutTime, each -1 (CELL_SYSUTIL_BGMPLAYBACK_FADE_INVALID) to 60000 ms. Stored, then the
+// enable state set (when `enable_state` is given), as RPCS3 (its fades are a TODO).
+s32 bgm_ex(PPUContext& ctx, std::string_view name, u32 param, std::optional<u8> enable_state)
+{
+    const Call call(Fn::BgmPlaybackEx, kInfoCalls, kChan, "{}(param {:#x})", name, param);
+    if (!param || !guest_readable(thread_of(ctx), param, 16)) return call(error(CELL_SYSUTIL_BGMPLAYBACK_EX_ERROR_PARAM));
+    std::array<s32, 4> fade{};
+    for (u32 i = 0; i < 4; i++) {
+        fade[i] = static_cast<s32>(ps_read32(guest_base(ctx), param + 4 * i));
+        if (fade[i] < -1 || fade[i] > 60000) return call(error(CELL_SYSUTIL_BGMPLAYBACK_EX_ERROR_PARAM));
+    }
+    BgmState& b = state<BgmState>();
+    std::lock_guard lock(b.mutex);
+    b.fade_ms = fade;
+    if (enable_state) b.enable_state = *enable_state;
+    return call(lv2::CELL_OK);
+}
+
+s32 cellSysutilEnableBgmPlaybackEx(PPUContext& ctx, u32 param)
+{
+    return bgm_ex(ctx, "cellSysutilEnableBgmPlaybackEx", param, CELL_SYSUTIL_BGMPLAYBACK_STATUS_ENABLE);
+}
+
+s32 cellSysutilDisableBgmPlaybackEx(PPUContext& ctx, u32 param)
+{
+    return bgm_ex(ctx, "cellSysutilDisableBgmPlaybackEx", param, CELL_SYSUTIL_BGMPLAYBACK_STATUS_DISABLE);
+}
+
+s32 cellSysutilSetBgmPlaybackExtraParam(PPUContext& ctx, u32 param)
+{
+    return bgm_ex(ctx, "cellSysutilSetBgmPlaybackExtraParam", param, std::nullopt);
+}
+
+// CellSysutilBgmPlaybackStatus2 (8 bytes): u8 playerState, reserved[7].
+s32 cellSysutilGetBgmPlaybackStatus2(PPUContext& ctx, u32 status)
+{
+    const Call call(Fn::GetBgmPlaybackStatus2, kPolledInfoCalls, kChan, "cellSysutilGetBgmPlaybackStatus2({:#x})",
+        status);
+    if (!status || !guest_readable(thread_of(ctx), status, 8)) return call(error(CELL_SYSUTIL_BGMPLAYBACK_EX_ERROR_PARAM));
+    BgmState& b = state<BgmState>();
+    std::lock_guard lock(b.mutex);
+    std::memset(guest_base(ctx) + status, 0, 8);
+    ps_write8(guest_base(ctx), status, b.player_state);
+    return call(lv2::CELL_OK);
 }
 
 // The whole status is written (RPCS3 copies its bgm_manager::status): the two states, then zeros. Deviation: a pointer
@@ -1074,7 +1502,8 @@ constexpr u32 CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL = 1;
 constexpr u32 CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE = 0, CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO = 1,
               CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK = 2; // button_type
 constexpr u32 CELL_MSGDIALOG_TYPE_DEFAULT_CURSOR_NO = 1; // default_cursor of a YES/NO dialog
-constexpr s32 CELL_MSGDIALOG_BUTTON_OK = 1, CELL_MSGDIALOG_BUTTON_YES = 1, CELL_MSGDIALOG_BUTTON_NO = 2;
+constexpr s32 CELL_MSGDIALOG_BUTTON_NONE = -1, CELL_MSGDIALOG_BUTTON_OK = 1, CELL_MSGDIALOG_BUTTON_YES = 1,
+              CELL_MSGDIALOG_BUTTON_NO = 2;
 
 u32 button_type(u32 type) { return (type >> 4) & 7; }
 u32 default_cursor(u32 type) { return (type >> 8) & 3; }
@@ -1091,6 +1520,11 @@ struct MsgDialog {
     u32 type = 0;     // CELL_MSGDIALOG_TYPE_* bits
     u32 callback = 0; // CellMsgDialogCallback(buttonType, userData) descriptor, for the user's answer; 0 = none
     u32 userdata = 0;
+    // The progress bars (up to two): their messages and how far each is, in percent (for the log; nothing draws).
+    std::array<std::string, 2> bar_message;
+    std::array<u32, 2> bar_percent{};
+    // cellMsgDialogClose's deadline: the next cellSysutilCheckCallback from then closes the dialog.
+    std::optional<std::chrono::steady_clock::time_point> close_at;
 };
 
 std::string_view source_name(MsgDialogSource source)
@@ -1127,6 +1561,9 @@ s32 open_locked(MsgDialog& d, MsgDialogSource source, u32 type, std::string_view
     d.type = type;
     d.callback = callback;
     d.userdata = userdata;
+    d.bar_message = {};
+    d.bar_percent = {};
+    d.close_at.reset();
     return lv2::CELL_OK;
 }
 
@@ -1134,6 +1571,8 @@ s32 open_locked(MsgDialog& d, MsgDialogSource source, u32 type, std::string_view
 // DRAWING_END goes to the game's callbacks, and the dialog's callback(button, userData) is queued as well (RPCS3
 // sysutil_register_cb), so both reach the game at a cellSysutilCheckCallback, the end of the drawing first. The answer
 // is dropped when that dialog isn't open any more: the game aborted it meanwhile.
+void answer_locked(MsgDialog& d, s32 button);
+
 void msg_dialog_answered(u64 generation, s32 button)
 {
     MsgDialog& d = state<MsgDialog>();
@@ -1142,7 +1581,14 @@ void msg_dialog_answered(u64 generation, s32 button)
         PS_LOG_INFO(kChan, "message dialog: an answer for a dialog the game has aborted since: ignored");
         return;
     }
+    answer_locked(d, button);
+}
+
+// The open dialog closes with `button` (RPCS3 on_close): DRAWING_END, then its callback, at the next check.
+void answer_locked(MsgDialog& d, s32 button)
+{
     d.open = false;
+    d.close_at.reset();
     sysutil_send_event(CELL_SYSUTIL_DRAWING_END, 0);
     if (!d.callback) {
         PS_LOG_INFO(kChan, "message dialog (type {:#x}) answered with button {}; it has no callback", d.type, button);
@@ -1268,8 +1714,194 @@ s32 cellMsgDialogAbort(PPUContext&)
         return call.ok(lv2::CELL_OK, "CELL_OK, the open dialog is {}'s and stays open", source_name(d.source));
     }
     d.open = false;
+    d.close_at.reset();
     sysutil_send_event(CELL_SYSUTIL_DRAWING_END, 0);
     return call.ok(lv2::CELL_OK, "CELL_OK, the message dialog (type {:#x}) closed without its callback", d.type);
+}
+
+// cellMsgDialogOpen: the older name of cellMsgDialogOpen2, which RPCS3 calls as it is.
+s32 cellMsgDialogOpen(PPUContext& ctx, u32 type, u32 msg_string, u32 callback, u32 user_data, u32 ext_param)
+{
+    const Call call(Fn::MsgDialogOpen, kInfoCalls, kChan, "cellMsgDialogOpen(type {:#x}, ...): as cellMsgDialogOpen2",
+        type);
+    return call(cellMsgDialogOpen2(ctx, type, msg_string, callback, user_data, ext_param));
+}
+
+// The text of a system error code (RPCS3's localized strings, in English): the message, then the code.
+std::string error_code_text(u32 code)
+{
+    struct Text {
+        u32 code;
+        std::string_view text;
+    };
+    static constexpr Text kTexts[] = {
+        {0x80010001, "The resource is temporarily unavailable."},
+        {0x80010002, "Invalid argument or flag."},
+        {0x80010003, "The feature is not yet implemented."},
+        {0x80010004, "Memory allocation failed."},
+        {0x80010005, "The resource with the specified identifier does not exist."},
+        {0x80010006, "The file does not exist."},
+        {0x80010007, "The file is in an unrecognized format / The file is not a valid ELF file."},
+        {0x80010008, "Resource deadlock is avoided."},
+        {0x80010009, "Operation not permitted."},
+        {0x8001000A, "The device or resource is busy."},
+        {0x8001000B, "The operation is timed out."},
+        {0x8001000C, "The operation is aborted."},
+        {0x8001000D, "Invalid memory access."},
+        {0x8001000F, "State of the target thread is invalid."},
+        {0x80010010, "Alignment is invalid."},
+        {0x80010011, "Shortage of the kernel resources."},
+        {0x80010012, "The file is a directory."},
+        {0x80010013, "Operation cancelled."},
+        {0x80010014, "Entry already exists."},
+        {0x80010015, "Port is already connected."},
+        {0x80010016, "Port is not connected."},
+        {0x80010017, "Failure in authorizing SELF. Program authentication fail."},
+        {0x80010018, "The file is not MSELF."},
+        {0x80010019, "System version error."},
+        {0x8001001A, "Fatal system error occurred while authorizing SELF. SELF auth failure."},
+        {0x8001001B, "Math domain violation."},
+        {0x8001001C, "Math range violation."},
+        {0x8001001D, "Illegal multi-byte sequence in input."},
+        {0x8001001E, "File position error."},
+        {0x8001001F, "Syscall was interrupted."},
+        {0x80010020, "File too large."},
+        {0x80010021, "Too many links."},
+        {0x80010022, "File table overflow."},
+        {0x80010023, "No space left on device."},
+        {0x80010024, "Not a TTY."},
+        {0x80010025, "Broken pipe."},
+        {0x80010026, "Read-only filesystem."},
+        {0x80010027, "Illegal seek."},
+        {0x80010028, "Arg list too long."},
+        {0x80010029, "Access violation."},
+        {0x8001002A, "Invalid file descriptor."},
+        {0x8001002B, "Filesystem mounting failed."},
+        {0x8001002C, "Too many files open."},
+        {0x8001002D, "No device."},
+        {0x8001002E, "Not a directory."},
+        {0x8001002F, "No such device or IO."},
+        {0x80010030, "Cross-device link error."},
+        {0x80010031, "Bad Message."},
+        {0x80010032, "In progress."},
+        {0x80010033, "Message size error."},
+        {0x80010034, "Name too long."},
+        {0x80010035, "No lock."},
+        {0x80010036, "Not empty."},
+        {0x80010037, "Not supported."},
+        {0x80010038, "File-system specific error."},
+        {0x80010039, "Overflow occurred."},
+        {0x8001003A, "Filesystem not mounted."},
+        {0x8001003B, "Not SData."},
+        {0x8001003C, "Incorrect version in sys_load_param."},
+        {0x8001003D, "Pointer is null."},
+        {0x8001003E, "Pointer is null."},
+    };
+    for (const Text& t : kTexts)
+        if (t.code == code) return std::format("{}\n({:08x})", t.text, code);
+    return std::format("An error has occurred.\n({:08x})", code);
+}
+
+// An error dialog with an OK button for a system error code, through cellMsgDialogOpen2 (RPCS3); it is answered at
+// once, as any OK dialog (show_msg_dialog). The message is put in guest memory for cellMsgDialogOpen2 to read.
+s32 open_text_dialog(PPUContext& ctx, u32 type, const std::string& text, u32 callback, u32 user_data, u32 ext_param)
+{
+    HleProcess* p = HleProcess::current();
+    if (!p) PS_FATAL(kChan, "cellMsgDialog without an HLE process");
+    const u32 at = p->main_memory().alloc(static_cast<u32>(text.size() + 1));
+    if (!at) {
+        PS_LOG_ERROR(kChan, "no main-area memory for a dialog message");
+        return error(CELL_MSGDIALOG_ERROR_PARAM);
+    }
+    std::memcpy(guest_base(ctx) + at, text.c_str(), text.size() + 1);
+    const s32 r = cellMsgDialogOpen2(ctx, type, at, callback, user_data, ext_param);
+    p->main_memory().free(at);
+    return r;
+}
+
+constexpr u32 CELL_MSGDIALOG_TYPE_SE_TYPE_ERROR = 0;
+
+s32 cellMsgDialogOpenErrorCode(PPUContext& ctx, u32 error_code, u32 callback, u32 user_data, u32 ext_param)
+{
+    const Call call(Fn::MsgDialogOpenErrorCode, kInfoCalls, kChan,
+        "cellMsgDialogOpenErrorCode({:#010x}, callback {:#x}, userData {:#x}, extParam {:#x})", error_code, callback,
+        user_data, ext_param);
+    return call(open_text_dialog(ctx, CELL_MSGDIALOG_TYPE_SE_TYPE_ERROR | (CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK << 4),
+        error_code_text(error_code), callback, user_data, ext_param));
+}
+
+// The PlayStation 3D display's SimulView warning (RPCS3: an OK dialog with that text, closed after 5 s).
+s32 cellMsgDialogOpenSimulViewWarning(PPUContext& ctx, u32 callback, u32 user_data, u32 ext_param)
+{
+    const Call call(Fn::MsgDialogOpenSimulViewWarning, kInfoCalls, kChan,
+        "cellMsgDialogOpenSimulViewWarning(callback {:#x}, userData {:#x}, extParam {:#x})", callback, user_data,
+        ext_param);
+    return call(open_text_dialog(ctx, CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL | (CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK << 4),
+        "SimulView Warning", callback, user_data, ext_param));
+}
+
+// cellMsgDialogClose(delay): the dialog the game opened closes after `delay` ms (a float, in f1; negative is 0), with
+// the button CELL_MSGDIALOG_BUTTON_NONE (RPCS3's close thread and on_close). Here the close happens at the first
+// cellSysutilCheckCallback after the delay, which is also where its DRAWING_END and callback reach the game. A dialog
+// another module opened, or none, is CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED.
+s32 cellMsgDialogClose(PPUContext& ctx)
+{
+    const f32 delay = static_cast<f32>(ctx.fpr[1]);
+    const Call call(Fn::MsgDialogClose, kInfoCalls, kChan, "cellMsgDialogClose(delay {} ms)", delay);
+    MsgDialog& d = state<MsgDialog>();
+    std::lock_guard lock(d.mutex);
+    if (!d.open || d.source != MsgDialogSource::CellMsgDialog) return call(error(CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED));
+    d.close_at = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(static_cast<s64>(std::max(delay, 0.0f) * 1000.0f));
+    return call(lv2::CELL_OK);
+}
+
+constexpr u32 CELL_MSGDIALOG_PROGRESSBAR_STRING_SIZE = 64;
+
+// The progress bar functions: a bar of the open dialog (any source, as RPCS3), one of its progress_bar_count.
+s32 progress_bar(std::string_view what, u32 index, const std::function<void(MsgDialog&)>& change)
+{
+    MsgDialog& d = state<MsgDialog>();
+    std::lock_guard lock(d.mutex);
+    if (!d.open) return error(CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED);
+    if (index >= progress_bar_count(d.type)) return error(CELL_MSGDIALOG_ERROR_PARAM);
+    change(d);
+    PS_LOG_DEBUG(kChan, "message dialog progress bar {}: {} -> {}% \"{}\"", index, what, d.bar_percent[index],
+        d.bar_message[index]);
+    return lv2::CELL_OK;
+}
+
+s32 cellMsgDialogProgressBarSetMsg(PPUContext& ctx, u32 index, u32 msg_string)
+{
+    const GuestString text = read_cstr(thread_of(ctx), msg_string, CELL_MSGDIALOG_PROGRESSBAR_STRING_SIZE);
+    const Call call(Fn::MsgDialogProgressBar, kInfoCalls, kChan, "cellMsgDialogProgressBarSetMsg({}, {:#x} \"{}\")",
+        index, msg_string, text.text);
+    if (!msg_string || !text.terminated) return call(error(CELL_MSGDIALOG_ERROR_PARAM));
+    return call(progress_bar("message", index, [&](MsgDialog& d) { d.bar_message[index] = text.text; }));
+}
+
+s32 cellMsgDialogProgressBarReset(PPUContext&, u32 index)
+{
+    const Call call(Fn::MsgDialogProgressBar, kInfoCalls, kChan, "cellMsgDialogProgressBarReset({})", index);
+    return call(progress_bar("reset", index, [&](MsgDialog& d) { d.bar_percent[index] = 0; }));
+}
+
+s32 cellMsgDialogProgressBarInc(PPUContext&, u32 index, u32 delta)
+{
+    const Call call(Fn::MsgDialogProgressBar, kPolledInfoCalls, kChan, "cellMsgDialogProgressBarInc({}, {})", index,
+        delta);
+    return call(progress_bar("increment", index,
+        [&](MsgDialog& d) { d.bar_percent[index] = std::min<u32>(100, d.bar_percent[index] + std::min<u32>(delta, 100)); }));
+}
+
+// For cellSysutilCheckCallback: a cellMsgDialogClose whose delay has passed closes the dialog now.
+void close_timed_msg_dialog()
+{
+    MsgDialog& d = state<MsgDialog>();
+    std::lock_guard lock(d.mutex);
+    if (!d.open || !d.close_at || std::chrono::steady_clock::now() < *d.close_at) return;
+    PS_LOG_INFO(kChan, "message dialog (type {:#x}): cellMsgDialogClose's delay has passed; it closes", d.type);
+    answer_locked(d, CELL_MSGDIALOG_BUTTON_NONE);
 }
 
 } // namespace
@@ -1357,10 +1989,51 @@ void register_cellSysutil(Registry& r)
         PS_HLE_FUNC(0xC96E89E9, cellAudioOutSetCopyControl),
         PS_HLE_FUNC(0x7603D3DB, cellMsgDialogOpen2),
         PS_HLE_FUNC(0x62B0F803, cellMsgDialogAbort),
+        PS_HLE_FUNC(0x886D0747, cellSysutilRegisterCallbackDispatcher),
+        PS_HLE_FUNC(0x40C7538E, cellSysutilUnregisterCallbackDispatcher),
+        PS_HLE_FUNC(0x1DFCCE99, cellSysutilGameDataExit),
+        PS_HLE_FUNC(0x2A95D8BC, cellSysutilGameExit_I),
+        PS_HLE_FUNC(0x01F04D94, cellSysutilGamePowerOff_I),
+        PS_HLE_FUNC(0x30D3D12B, cellSysutilGameReboot_I),
+        PS_HLE_FUNC(0xE1EC7B6A, cellSysutil_E1EC7B6A),
+        PS_HLE_FUNC(0x75BBB672, cellVideoOutGetNumberOfDevice),
+        PS_HLE_FUNC(0x15B0B0CD, cellVideoOutGetConfiguration),
+        PS_HLE_FUNC(0x55E425C3, cellVideoOutGetConvertCursorColorInfo),
+        PS_HLE_FUNC(0xE5E2B09D, cellAudioOutGetNumberOfDevice),
+        PS_HLE_FUNC(0x7663E368, cellAudioOutGetDeviceInfo),
+        PS_HLE_FUNC(0x2BEAC488, cellAudioOutGetSoundAvailability2),
+        PS_HLE_FUNC(0xAC58AD2B, cellSysutilEnableBgmPlaybackEx),
+        PS_HLE_FUNC(0xA36335A5, cellSysutilDisableBgmPlaybackEx),
+        PS_HLE_FUNC(0xF3DBF5A7, cellSysutilSetBgmPlaybackExtraParam),
+        PS_HLE_FUNC(0x6CFD856F, cellSysutilGetBgmPlaybackStatus2),
+        PS_HLE_FUNC(0xF81ECA25, cellMsgDialogOpen),
+        PS_HLE_FUNC(0x3E22CB4B, cellMsgDialogOpenErrorCode),
+        PS_HLE_FUNC(0x5D883B1C, cellMsgDialogOpenSimulViewWarning),
+        PS_HLE_FUNC(0x20543730, cellMsgDialogClose),
+        PS_HLE_FUNC(0x9D6AF72A, cellMsgDialogProgressBarSetMsg),
+        PS_HLE_FUNC(0x7BC2C8A8, cellMsgDialogProgressBarReset),
+        PS_HLE_FUNC(0x94862702, cellMsgDialogProgressBarInc),
     });
     r.add("cellSysutilAvconfExt", {
         PS_HLE_FUNC(0xC7020F62, cellVideoOutSetGamma),
         PS_HLE_FUNC(0xC3273D9B, cellAudioOutGetAvailableDeviceInfo),
+        PS_HLE_FUNC(0x4EC8C141, cellVideoOutConvertCursorColor),
+        PS_HLE_FUNC(0x655A0364, cellVideoOutGetGamma),
+        PS_HLE_FUNC(0xFAA275A4, cellVideoOutGetScreenSize),
+        PS_HLE_FUNC(0x1A324E03, cellVideoOutSetCopyControl),
+        PS_HLE_FUNC(0x1CFA1A11, cellVideoOutSetXVColor),
+        PS_HLE_FUNC(0x269FFEDD, cellVideoOutSetupDisplay),
+        PS_HLE_FUNC(0x9FAA12BE, cellVideoOutConfigure2),
+        PS_HLE_FUNC(0xFA611DF4, cellAudioOutConfigure2),
+        PS_HLE_FUNC(0x44D2BA34, cellAudioOutGetConfiguration2),
+        PS_HLE_FUNC(0xC7087631, cellAudioOutRegisterDevice),
+        PS_HLE_FUNC(0xE4645AF8, cellAudioOutSetDeviceMode),
+        PS_HLE_FUNC(0x18D0ADA6, cellAudioOutGetDeviceInfo2),
+        PS_HLE_FUNC(0x3D5730CE, cellAudioInGetDeviceInfo),
+        PS_HLE_FUNC(0x65BF9EA3, cellAudioInGetAvailableDeviceInfo),
+        PS_HLE_FUNC(0xEB6C50FB, cellAudioInSetDeviceMode),
+        PS_HLE_FUNC(0xEB6FCFF1, cellAudioInRegisterDevice),
+        PS_HLE_FUNC(0xFA6BCC17, cellAudioInUnregisterDevice),
     });
 }
 

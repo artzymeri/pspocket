@@ -3573,6 +3573,43 @@ with their default button (show_msg_dialog). Save data's own dialogs now follow 
 
 Every such answer is logged as a warning. A dialog UI (the app) replaces these answers with the user's own.
 
+**cellSysutil, cellMsgDialog, cellVideoOut, cellAudioOut, cellSysutilAvconfExt: every function RPCS3 implements**
+
+These are 41 more functions.
+
+- **The message dialog.**
+  - cellMsgDialogOpen (Open2 under its older name).
+  - OpenErrorCode: an OK dialog with RPCS3's English text for the error code, then the code.
+  - OpenSimulViewWarning.
+  - The progress bars: SetMsg, Reset, Inc.
+  - cellMsgDialogClose(delay): the dialog closes with CELL_MSGDIALOG_BUTTON_NONE at the first
+    cellSysutilCheckCallback after the delay. RPCS3 closes it from a thread of its own, but the end of the drawing and
+    the callback reach the game only at a check either way.
+- **cellSysutil.**
+  - The callback dispatchers, 32 slots, kept as RPCS3 keeps them.
+  - The game exit functions (cellSysutilGameDataExit and its _I wrappers).
+  - cellSysutil_E1EC7B6A.
+  - Background music Ex: the fade times are checked and kept; Status2.
+- **Video out.**
+  - GetNumberOfDevice.
+  - GetConfiguration: the configured mode, else the display's 720p at 4 bytes a pixel.
+  - GetConvertCursorColorInfo (full range).
+  - ConvertCursorColor: RPCS3's gamma conversion. Gamma comes in f1; the integer arguments keep r3 to r8, as RPCS3's
+    binder counts them.
+  - GetGamma, GetScreenSize (VALUE_IS_NOT_SET: no 3D display), SetCopyControl, SetXVColor, SetupDisplay, Configure2.
+- **Audio out.**
+  - GetNumberOfDevice.
+  - GetDeviceInfo: HDMI, 13 ms latency, the output's modes.
+  - GetSoundAvailability2.
+  - Register/SetDeviceMode/GetDeviceInfo2 and the "2" configurations, with RPCS3's checks.
+- **Audio in.** There is no microphone, as RPCS3 with none configured:
+  - available devices: 0, each entry disconnected (device number 0xff);
+  - device info and registering a device: DEVICE_NOT_FOUND after RPCS3's checks;
+  - the device mode is kept.
+
+`read_cstr` (a checked guest string) moved from cellSaveData.cpp to guest.hpp for every module. The NID check
+(test_hle) accepts RPCS3's REG_FNID names, which end with their NID.
+
 Tests (tests/hle/test_savedata.cpp):
 
 - every registered function is in its module;
@@ -3583,6 +3620,15 @@ Tests (tests/hle/test_savedata.cpp):
 - ListDelete with '\*' and Delete leave the saves;
 - import and export: CELL_OK, error 137 and a bad name, with funcDone never called;
 - the overlay switch.
+
+Tests (tests/hle/test_sysutil.cpp):
+
+- the message dialog: progress bars, a timed close, the error code dialog, Open, SimulView;
+- the dispatchers, game exits and BGM Ex with their limits;
+- video out: device counts, the configuration before and after Configure, cursor colours at both formats, the gamma
+  round trip and the AvconfExt checks;
+- audio out: device info and Availability2;
+- audio in with no microphone.
 
 ## Open decisions (plan section 14)
 
