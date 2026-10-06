@@ -72,6 +72,13 @@ public:
 // code with -fno-unwind-tables). Deliberately not derived from std::exception.
 struct ThreadExit {};
 
+// Translated code returned with r1 other than at its entry: a longjmp or a fiber switch moved it elsewhere (D-161).
+// The lifter makes a pseudo-syscall there, marked by cia kNonLocalReturnCia (no guest register touched); the kernel
+// throws this to the outermost guest entry (run_guest), where the interpreter goes on from the restored context.
+// Not derived from std::exception either.
+struct NonLocalJump {};
+inline constexpr u32 kNonLocalReturnCia = 0xFFFFFFF0; // recomp/ppu lifter.cpp emits it
+
 // Runs the guest function at `entry` on the calling host thread until it returns. `ctx` already holds the entry
 // state: r1 (stack), r2 (TOC), r3.. (arguments), r13 (TLS) and LR = kThreadReturnAddress.
 using Executor = void (*)(void* user, PPUContext& ctx, u8* base, u32 entry);
@@ -79,6 +86,12 @@ using Executor = void (*)(void* user, PPUContext& ctx, u8* base, u32 entry);
 // The default: the lifted function registered for `entry` (ps_ppu_call_indirect), or, when there is none, the PPU
 // miss policy (abort in dev builds, interpret in release builds; tests may select interpretation).
 void default_executor(void* user, PPUContext& ctx, u8* base, u32 entry);
+
+// Runs guest code from `entry` through the kernel's executor until it returns: a thread's entry (`thread_top`: until
+// its return to kThreadReturnAddress, whatever r1 is) or a callback (until the return to the LR and r1 it was called
+// with). A non-local jump in translated code (NonLocalJump, D-161) goes on in the interpreter from where the jump
+// went, with the same end.
+void run_guest(Kernel& k, PPUContext& ctx, u8* base, u32 entry, bool thread_top);
 
 // LR at thread entry: returning from the entry function lands here (the interpreter stops at it).
 inline constexpr u32 kThreadReturnAddress = 0;

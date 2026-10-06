@@ -73,7 +73,7 @@ inline u64 call_guest(PPUContext& ctx, u32 opd, std::initializer_list<u64> args)
     ctx.gpr[1] = (saved_r1 - 0x80) & ~u64{15};
     ps_write64(base, static_cast<u32>(ctx.gpr[1]), saved_r1);
     ctx.lr = lv2::kThreadReturnAddress; // returning lands here; the interpreter fallback stops at it
-    t.kernel.config().executor(t.kernel.config().executor_user, ctx, base, entry);
+    lv2::run_guest(t.kernel, ctx, base, entry, false); // a longjmp inside goes on interpreted (D-161)
     const u64 result = ctx.gpr[3];
     ctx.gpr[1] = saved_r1;
     ctx.gpr[2] = saved_r2;

@@ -55,7 +55,7 @@ void* host_thread_main(void* raw)
     }
 #endif
     try {
-        k.config().executor(k.config().executor_user, *t.ctx, k.base(), t.entry);
+        run_guest(k, *t.ctx, k.base(), t.entry, true);
         PS_LOG_ERROR(kChan, "PPU thread {:#x} returned from its entry function {:#010x} (r3 = {:#x}) instead of calling "
                             "sys_ppu_thread_exit; treating it as an exit",
             t.id, t.entry, t.ctx->gpr[3]);

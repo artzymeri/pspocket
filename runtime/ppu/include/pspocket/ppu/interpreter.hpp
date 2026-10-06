@@ -27,6 +27,7 @@ struct RunOptions {
     u64 stop_lr = 0;
     u64 stop_sp = 0;
     bool call_lifted = false;    // interop: a branch to a registered lifted function calls it, then continues at LR
+    bool stop_any_sp = false;    // with stop_at_return: stop at stop_lr whatever r1 is (a thread's return to its end)
 };
 
 enum class StopReason : u8 { Returned, StepLimit };

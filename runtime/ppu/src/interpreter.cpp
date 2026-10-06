@@ -889,7 +889,9 @@ RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
 {
     RunResult res;
     const u32 stop_pc = static_cast<u32>(opt.stop_lr) & ~3u;
-    auto at_stop = [&] { return opt.stop_at_return && ctx.cia == stop_pc && ctx.gpr[1] == opt.stop_sp; };
+    auto at_stop = [&] {
+        return opt.stop_at_return && ctx.cia == stop_pc && (opt.stop_any_sp || ctx.gpr[1] == opt.stop_sp);
+    };
 
     for (;;) {
         if (at_stop()) {
@@ -911,9 +913,11 @@ RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
             while (!at_stop()) {
                 const ps_ppu_fn fn = ps_ppu_dispatch_find(ctx.cia);
                 if (!fn) break;
+                const u32 callee = ctx.cia;
                 fn(&ctx, base);
                 res.lifted_calls++;
                 ctx.cia = static_cast<u32>(ctx.lr) & ~3u;
+                if (ctx.cia == 0 && !at_stop()) t_zero_branch_from = callee; // it came back with LR 0
             }
         }
     }

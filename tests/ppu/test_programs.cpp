@@ -57,8 +57,10 @@ Env& env()
 }
 
 u64 g_syscall_count = 0;
+struct NonLocal {}; // lv2::NonLocalJump's stand-in (D-161)
 void test_syscall(PPUContext* ctx, u8*)
 {
+    if (ctx->cia == 0xFFFFFFF0u) throw NonLocal{}; // the lifter's non-local return
     g_syscall_count++;
     ctx->gpr[3] = ctx->gpr[3] * 3 + ctx->gpr[11];
 }
@@ -110,7 +112,20 @@ Run run(Mode mode, u32 entry, PPUContext ctx, const std::vector<u8>& data)
     if (mode == Mode::Lifted) {
         const ps_ppu_fn fn = ps_ppu_dispatch_find(entry);
         REQUIRE(fn != nullptr);
-        fn(&ctx, e.base);
+        const u64 sp = ctx.gpr[1];
+        try {
+            fn(&ctx, e.base);
+        } catch (const NonLocal&) {
+            // As lv2::run_guest: on in the interpreter from where the jump went, to the same end.
+            RunOptions opt;
+            opt.stop_at_return = true;
+            opt.stop_lr = kSentinel;
+            opt.stop_sp = sp;
+            opt.call_lifted = true;
+            ctx.cia = static_cast<u32>(ctx.lr) & ~3u;
+            REQUIRE(ppu::run(ctx, e.base, opt).reason == StopReason::Returned);
+            r.lifted_calls = 1; // marks the resume for the test
+        }
     } else {
         RunOptions opt;
         opt.stop_at_return = true;
@@ -545,6 +560,20 @@ TEST_CASE("atomics, syscalls, traps, PC-relative code, string moves, CR games, t
     c = start_context(1312);
     c.gpr[3] = 10;
     CHECK(both(env().sym("driver"), c).ctx.gpr[3] == 55 + 55 + 122);
+}
+
+TEST_CASE("setjmp/longjmp: translated code goes on at the setjmp's return in the frame the jump restored (D-161)")
+{
+    Hooks hooks;
+    g_syscall_count = 0;
+    PPUContext c = start_context(1400);
+    c.gpr[3] = 100;
+    const Run lifted = run(Mode::Lifted, env().sym("jmp_test"), c, std::vector<u8>(256, 0));
+    CHECK(lifted.lifted_calls == 1); // the longjmp's return was caught and the interpreter went on
+    const Run r = both(env().sym("jmp_test"), c);
+    CHECK(r.ctx.gpr[3] == 107);      // x + 7, with x from the r31 the jump restored
+    CHECK(r.ctx.gpr[1] == kStackTop);
+    CHECK(g_syscall_count == 0);     // no guest syscall: the marker never reaches the guest's handler
 }
 
 TEST_CASE("rarer control flow: conditional bcctr, blrl, conditional bcl, bdzlr, trap resume, fall-through")

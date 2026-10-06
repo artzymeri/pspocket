@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "internal.hpp"
+#include "pspocket/ppu/interpreter.hpp"
 #include "pspocket/ppu/runtime.h"
 
 namespace pspocket::lv2 {
@@ -632,6 +633,7 @@ void Kernel::syscall(PPUContext& ctx)
     if (!t) PS_FATAL(kChan, "syscall {} at {:#010x} from a PPU context with no lv2 thread", ctx.gpr[11], ctx.cia);
     if (impl_->exiting.load(std::memory_order_relaxed)) throw ThreadExit{};
 
+    if (ctx.cia == kNonLocalReturnCia) throw NonLocalJump{}; // D-161: the lifter's, not the guest's
     const u64 number = ctx.gpr[11];
     if (number < kSyscallCount) {
         const SyscallEntry& entry = impl_->table[static_cast<u32>(number)];
@@ -668,6 +670,36 @@ void Kernel::syscall(PPUContext& ctx)
 }
 
 void default_executor(void*, PPUContext& ctx, u8* base, u32 entry) { ps_ppu_call_indirect(&ctx, base, entry); }
+
+void run_guest(Kernel& k, PPUContext& ctx, u8* base, u32 entry, bool thread_top)
+{
+    const u64 stop_lr = ctx.lr, stop_sp = ctx.gpr[1];
+    try {
+        k.config().executor(k.config().executor_user, ctx, base, entry);
+        return;
+    } catch (const NonLocalJump&) {
+    }
+    // The context the jump restored is in ctx: it continues at LR. Interpreted (translated callees still run as
+    // such) until the code returns where this call would have; a further jump in translated code lands here again.
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+        PS_LOG_INFO(kChan, "a non-local jump (longjmp or a fiber switch) to {:#010x}, r1 {:#x}: interpreting from there "
+                           "(D-161)", static_cast<u32>(ctx.lr), ctx.gpr[1]);
+    ppu::RunOptions options;
+    options.stop_at_return = true;
+    options.stop_lr = stop_lr;
+    options.stop_sp = stop_sp;
+    options.stop_any_sp = thread_top;
+    options.call_lifted = true;
+    for (;;) {
+        ctx.cia = static_cast<u32>(ctx.lr) & ~3u;
+        try {
+            ppu::run(ctx, base, options);
+            return;
+        } catch (const NonLocalJump&) {
+        }
+    }
+}
 
 } // namespace pspocket::lv2
 

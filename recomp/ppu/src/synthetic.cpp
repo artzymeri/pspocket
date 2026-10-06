@@ -592,6 +592,67 @@ Program build_test_programs(u32 base)
     a.emit(mr(4, 5));
     a.b(B.L("gcd"));
 
+    // ---- setjmp/longjmp (D-161): a longjmp's blr leaves r1 elsewhere than at its entry; translated code must go on
+    // at the setjmp's return in the frame the jump restored, as the interpreter does.
+    B.func("jmp_set"); // (buf): r1, r2, r31 and LR saved; returns 0
+    a.emit(std_(1, 0, 3));
+    a.emit(std_(2, 8, 3));
+    a.emit(std_(31, 16, 3));
+    a.emit(mflr(0));
+    a.emit(std_(0, 24, 3));
+    a.emit(li(3, 0));
+    a.emit(blr());
+    B.func("jmp_long"); // (buf, val): back to the jmp_set's return with val
+    a.emit(ld(1, 0, 3));
+    a.emit(ld(2, 8, 3));
+    a.emit(ld(31, 16, 3));
+    a.emit(ld(0, 24, 3));
+    a.emit(mtlr(0));
+    a.emit(mr(3, 4));
+    a.emit(blr());
+    B.func("jmp_deep"); // (buf, depth): depth frames down, then jmp_long(buf, 7)
+    {
+        const Label bottom = a.new_label();
+        a.emit(mflr(0));
+        a.emit(std_(0, 16, 1));
+        a.emit(stdu(1, -112, 1));
+        a.emit(cmpwi(0, 4, 0));
+        a.beq(0, bottom);
+        a.emit(addi(4, 4, -1));
+        a.emit(li(31, 0x55)); // clobbered here: the jump must bring back the jmp_set's r31
+        a.bl(B.L("jmp_deep"));
+        a.bind(bottom);
+        a.emit(li(4, 7));
+        a.bl(B.L("jmp_long"));
+        a.emit(addi(1, 1, 112)); // never reached
+        a.emit(ld(0, 16, 1));
+        a.emit(mtlr(0));
+        a.emit(blr());
+    }
+    B.func("jmp_test"); // (x): r = jmp_set(buf); r == 0 ? jmp_deep(buf, 3) : x + r
+    {
+        const Label after = a.new_label();
+        a.emit(mflr(0));
+        a.emit(std_(0, 16, 1));
+        a.emit(std_(31, -8, 1));
+        a.emit(stdu(1, -160, 1));
+        a.emit(mr(31, 3));
+        a.emit(addi(3, 1, 112));
+        a.bl(B.L("jmp_set"));
+        a.emit(cmpwi(0, 3, 0));
+        a.bne(0, after);
+        a.emit(addi(3, 1, 112));
+        a.emit(li(4, 3));
+        a.bl(B.L("jmp_deep"));
+        a.bind(after);
+        a.emit(add(3, 3, 31));
+        a.emit(addi(1, 1, 160));
+        a.emit(ld(0, 16, 1));
+        a.emit(ld(31, -8, 1));
+        a.emit(mtlr(0));
+        a.emit(blr());
+    }
+
     B.func("tail_calls"); // x + 5 == 10 ? add_one(x + 5) : times_three(x + 5)
     a.emit(addi(3, 3, 5));
     a.emit(cmpwi(0, 3, 10));

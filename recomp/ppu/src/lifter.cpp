@@ -905,8 +905,14 @@ void emit_control(Gen& g, u32 pc, const Inst& in, std::string& o)
                 s += guarded(cond, std::format("{}ps_ppu_call_indirect(ctx, base, t); {}", g.spill, g.reload));
             line(s + " }");
         } else {
+            // A return leaves r1 as it was at the function's entry. One that does not jumped elsewhere (longjmp, a
+            // fiber switch, D-161): a C return would continue in the wrong frame, so a pseudo-syscall marked by cia
+            // 0xFFFFFFF0 (no guest register touched) unwinds to the thread's top, where the interpreter goes on from
+            // the context the jump restored.
+            g.uses_entry_state = true;
             if (dec) line("ctr -= 1;");
-            line(guarded(cond, std::format("{}return;", g.spill)));
+            line(guarded(cond, std::format("{}if (ctx->gpr[1] != entry_sp) {{ ctx->cia = 0xFFFFFFF0u; ps_ppu_syscall(ctx, base); }} "
+                                           "return;", g.spill)));
         }
         return;
     }
