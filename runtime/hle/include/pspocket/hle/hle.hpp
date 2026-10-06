@@ -73,7 +73,7 @@ std::span<const StubFunction> rpcs3_stubs();
 const StubFunction* find_rpcs3_stub(std::string_view module, u32 nid);
 
 // ---- typed binding: R fn(PPUContext&, A...) with A in {bool, u8, u16, u32, s32, u64, s64}, R in {void, s32, u32, u64};
-// up to 16 arguments (the ninth and later on the caller's stack) ----
+// up to 20 arguments (the ninth and later on the caller's stack; sceNpScore's clan rankings take 19) ----
 
 namespace detail {
 
@@ -102,7 +102,7 @@ T arg(PPUContext& ctx, u8* base)
 template <class R, class... A, usize... I>
 void invoke(R (*fn)(PPUContext&, A...), PPUContext& ctx, u8* base, std::index_sequence<I...>)
 {
-    static_assert(sizeof...(A) <= 16, "HLE functions take at most 16 arguments");
+    static_assert(sizeof...(A) <= 20, "HLE functions take at most 20 arguments");
     if constexpr (std::is_void_v<R>) {
         fn(ctx, arg<A, I>(ctx, base)...);
     } else if constexpr (std::is_same_v<R, s32>) {

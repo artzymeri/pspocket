@@ -1391,3 +1391,192 @@ TEST_CASE("sceNpTerm: NP down, its signaling contexts gone; their IDs go on", "[
     CHECK(ps_read32(b, kCtx) == first + 1);
     REQUIRE(g.call("sceNpTerm") == 0);
 }
+
+TEST_CASE("sceNpLookup's PSN calls refused offline; sceNpScore: title contexts kept, every transaction refused",
+    "[hle][np]")
+{
+    constexpr u64 kComTooManyNpId = 0xFFFFFFFF8002A1ADull, kComTooLargeRange = 0xFFFFFFFF8002A1AEull;
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kComm = kData + 0x100, kPass = kData + 0x200, kNpId = kData + 0x300, kOut = kData + 0x400,
+                  kText = kData + 0x800, kOpt = kData + 0xC00;
+    put_comm_id(b, kComm, "NPWR01234", 0);
+    put_np_id(b, kNpId, "");
+    std::memset(b + kOut, 0xAA, 0x40);
+
+    // Lookup: the library first.
+    CHECK(g.call("sceNpLookupNpId", 1, kNpId, kOut, 0) == kComNotInit);
+    CHECK(g.call("sceNpLookupWaitAsync", 1, kOut) == kComNotInit);
+    CHECK(g.call("sceNpLookupAbortTransaction", 1) == kComNotInit);
+    CHECK(g.call("sceNpLookupTitleStorage") == kComNotInit);
+    CHECK(g.call("sceNpScoreInit") == kNotInit); // the score library needs NP
+    np_up(g);
+    REQUIRE(g.call("sceNpLookupInit") == 0);
+
+    // The pointers each needs, a null option, then offline.
+    CHECK(g.call("sceNpLookupNpId", 1, 0, kOut, 0) == kComInsufficient);
+    CHECK(g.call("sceNpLookupNpId", 1, kNpId, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpLookupNpId", 1, kNpId, kOut, kOpt) == kComInval);
+    CHECK(g.call("sceNpLookupNpId", 1, kNpId, kOut, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpLookupTitleSmallStorage", 1, 0, 16, kOut, 0) == kComInsufficient);
+    CHECK(g.call("sceNpLookupTitleSmallStorage", 1, kOut, 16, kOut, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpLookupAvatarImage", 1, kText, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpLookupAvatarImage", 1, kText, kOut, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpLookupAvatarImageAsync", 1, kText, kOut, 1000, kOpt) == kComInval);
+    CHECK(g.call("sceNpLookupAvatarImageAsync", 1, kText, kOut, 1000, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpLookupUserProfile", 1, 0, kOut, 0, 0, 0, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpLookupUserProfile", 1, kNpId, 0, 0, 0, 0, 0, kOpt) == kComInval);
+    CHECK(g.call("sceNpLookupUserProfile", 1, kNpId, 0, 0, 0, 0, 0, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpLookupUserProfileAsync", 1, kNpId, kOut, 0, 0, 0, 0, 1000, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpLookupUserProfileWithAvatarSize", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpLookupUserProfileWithAvatarSize", 1, 0, kNpId, 0, 0, 0, 0, kOut, 64, kOut, kOpt) == kComInval);
+    CHECK(g.call("sceNpLookupUserProfileWithAvatarSize", 1, 0, kNpId, 0, 0, 0, 0, kOut, 64, kOut, 0) ==
+          kComInvalOnlineId);
+    CHECK(g.call("sceNpLookupUserProfileWithAvatarSizeAsync", 1, 2, kNpId, 0, 0, 0, 0, kOut, 64, kOut, 1000, 0) ==
+          kComInvalOnlineId);
+    // RPCS3's TODOs: CELL_OK, nothing written.
+    CHECK(g.call("sceNpLookupWaitAsync", 1, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 0xAAAAAAAAu);
+    CHECK(g.call("sceNpLookupAbortTransaction", 7) == 0);
+    CHECK(g.call("sceNpLookupTitleStorage") == 0);
+    CHECK(g.call("sceNpLookupTitleStorageAsync") == 0);
+
+    // Score: once.
+    CHECK(g.call("sceNpScoreCreateTitleCtx", kComm, kPass, kNpId) == kComNotInit);
+    CHECK(g.call("sceNpScoreTerm") == kComNotInit);
+    REQUIRE(g.call("sceNpScoreInit") == 0);
+    CHECK(g.call("sceNpScoreInit") == kComAlready);
+
+    // Title contexts: 0x2001 on, with a valid communication ID.
+    CHECK(g.call("sceNpScoreCreateTitleCtx", 0, kPass, kNpId) == kComInsufficient);
+    CHECK(g.call("sceNpScoreCreateTitleCtx", kComm, 0, kNpId) == kComInsufficient);
+    CHECK(g.call("sceNpScoreCreateTitleCtx", kComm, kPass, 0) == kComInsufficient);
+    put_comm_id(b, kComm, "npwr01234", 0);
+    CHECK(g.call("sceNpScoreCreateTitleCtx", kComm, kPass, kNpId) == kComInval); // RPCS3 aborts
+    CHECK(g.call("sceNpScoreCreateTitleCtx", kUnmapped, kPass, kNpId) == kComInval);
+    put_comm_id(b, kComm, "NPWR01234", 0);
+    CHECK(g.call("sceNpScoreCreateTitleCtx", kComm, kPass, kNpId) == 0x2001);
+    CHECK(g.call("sceNpScoreCreateTitleCtx", kComm, kPass, kNpId) == 0x2002);
+
+    // No transaction offline: refused at creation, unknown everywhere else.
+    CHECK(g.call("sceNpScoreCreateTransactionCtx", 0x2001) == kComInvalOnlineId);
+    for (const char* name : {"sceNpScoreDestroyTransactionCtx", "sceNpScoreAbortTransaction"}) {
+        INFO(name);
+        CHECK(g.call(name, 0x1001) == kComInvalId);
+    }
+    CHECK(g.call("sceNpScorePollAsync", 0x1001, kOut) == kComInvalId);
+    CHECK(g.call("sceNpScoreWaitAsync", 0x1001, kOut) == kComInvalId);
+
+    // The character ID (checked before the library) and the timeout (at least 10 s, a u64) of a title context.
+    CHECK(g.call("sceNpScoreSetPlayerCharacterId", 0x2001, -1) == kComInval);
+    CHECK(g.call("sceNpScoreSetPlayerCharacterId", 0x2001, 3) == 0);
+    CHECK(g.call("sceNpScoreSetPlayerCharacterId", 0x1001, 3) == kComInvalId);
+    CHECK(g.call("sceNpScoreSetTimeout", 0x2001, 9'999'999) == kComInval);
+    CHECK(g.call("sceNpScoreSetTimeout", 0x2001, 10'000'000) == 0);
+    CHECK(g.call("sceNpScoreSetTimeout", 0x2002, 0x100000000ull) == 0);
+    CHECK(g.call("sceNpScoreSetTimeout", 0x2003, 10'000'000) == kComInvalId);
+
+    // Board info and recording a score: the online check comes before the transaction.
+    CHECK(g.call("sceNpScoreGetBoardInfo", 0x1001, 1, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreGetBoardInfo", 0x1001, 1, kOut, kOpt) == kComInval);
+    CHECK(g.call("sceNpScoreGetBoardInfo", 0x1001, 1, kOut, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreGetBoardInfoAsync", 0x1001, 1, kOut, 1000, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreRecordScore", 0x1001, 1, -5, 0, 0, kOut, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreRecordScoreAsync", 0x1001, 1, 12345, 0, 0, kOut, 1000, 0) == kComInvalOnlineId);
+
+    // Game data and rankings: their pointers and counts, then the transaction.
+    CHECK(g.call("sceNpScoreRecordGameData", 0x1001, 1, 10, 16, 16, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreRecordGameData", 0x1001, 1, 10, 16, 16, kOut, 0) == kComInvalId);
+    CHECK(g.call("sceNpScoreRecordGameDataAsync", 0x1001, 1, 10, 16, 16, kOut, 1000, 0) == kComInvalId);
+    CHECK(g.call("sceNpScoreGetGameData", 0x1001, 1, 0, kOut, 16, kOut, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreGetGameData", 0x1001, 1, kNpId, kOut, 16, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreGetGameData", 0x1001, 1, kNpId, kOut, 16, kOut, 0) == kComInvalId);
+    CHECK(g.call("sceNpScoreGetGameDataAsync", 0x1001, 1, kNpId, kOut, 16, kOut, 1000, 0) == kComInvalId);
+    for (const char* name : {"sceNpScoreGetRankingByNpId", "sceNpScoreGetRankingByNpIdPcId"}) {
+        INFO(name);
+        CHECK(g.call(name, 0x1001, 1, 0, 36, kOut, 64, 0, 0, 0, 0, 1, kOut, kOut, 0) == kComInsufficient);
+        CHECK(g.call(name, 0x1001, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 0, kOut, kOut, 0) == kComInval);
+        CHECK(g.call(name, 0x1001, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 102, kOut, kOut, 0) == kComTooManyNpId);
+        CHECK(g.call(name, 0x1001, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 101, kOut, kOut, 0) == kComInvalId);
+    }
+    for (const char* name : {"sceNpScoreGetRankingByNpIdAsync", "sceNpScoreGetRankingByNpIdPcIdAsync"}) {
+        INFO(name);
+        CHECK(g.call(name, 0x1001, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 102, kOut, kOut, 1000, 0) == kComTooManyNpId);
+        CHECK(g.call(name, 0x1001, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 1, kOut, kOut, 1000, 0) == kComInvalId);
+    }
+    CHECK(g.call("sceNpScoreGetRankingByRange", 0x1001, 1, 1, kOut, 64, 0, 0, 0, 0, 1, kOut, kOut, 0) == kComInvalId);
+    CHECK(g.call("sceNpScoreGetRankingByRangeAsync", 0x1001, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, 0) == kComInvalId);
+    CHECK(g.call("sceNpScoreGetFriendsRanking", 0x1001, 1, 1, kOut, 64, 0, 0, 0, 0, 1, kOut, kOut, 0) == kComInvalId);
+    CHECK(g.call("sceNpScoreGetFriendsRankingAsync", 0x1001, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, 0) == kComInvalId);
+
+    // Comments: at most 255 characters. Censoring needs PSN; sanitizing checks its output before the library.
+    put(b, kText, std::string(256, 'c'));
+    CHECK(g.call("sceNpScoreCensorComment", 0x1001, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreCensorComment", 0x1001, kText, 0) == kComInval);
+    CHECK(g.call("sceNpScoreSanitizeComment", 0x1001, kText, kOut, 0) == kComInval);
+    put(b, kText, std::string(255, 'c'));
+    CHECK(g.call("sceNpScoreCensorComment", 0x1001, kText, kOpt) == kComInval);
+    CHECK(g.call("sceNpScoreCensorComment", 0x1001, kText, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreCensorCommentAsync", 0x1001, kText, 1000, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreSanitizeComment", 0x1001, kText, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreSanitizeComment", 0x1001, 0, kOut, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreSanitizeComment", 0x1001, kText, kOut, 0) == kComInvalId);
+    CHECK(g.call("sceNpScoreSanitizeCommentAsync", 0x1001, kText, kOut, 1000, 0) == kComInvalId);
+
+    // Clans: the synchronous calls end offline; RPCS3's asynchronous ones answer CELL_OK after their checks.
+    CHECK(g.call("sceNpScoreGetClanMemberGameData", 0x1001, 1, 7, kNpId, kOut, 16, 0, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreGetClanMemberGameData", 0x1001, 1, 7, kNpId, kOut, 16, kOut, kOpt) == kComInval);
+    CHECK(g.call("sceNpScoreGetClanMemberGameData", 0x1001, 1, 7, kNpId, kOut, 16, kOut, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreGetClanMemberGameDataAsync", 0x1001, 1, 7, 0, 0, 0, 0, 1000, kOpt) == kComInval);
+    CHECK(g.call("sceNpScoreGetClanMemberGameDataAsync", 0x1001, 1, 7, 0, 0, 0, 0, 1000, 0) == 0);
+    for (const char* name : {"sceNpScoreGetClansMembersRankingByNpId", "sceNpScoreGetClansMembersRankingByNpIdPcId"}) {
+        INFO(name);
+        CHECK(g.call(name, 0x1001, 7, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 0, 0, 1, 0, kOut, 0, 0) == kComInsufficient);
+        CHECK(g.call(name, 0x1001, 7, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 0, 0, 1, 0, kOut, kOut, kOpt) == kComInval);
+        CHECK(g.call(name, 0x1001, 7, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 0, 0, 102, 0, kOut, kOut, 0) ==
+              kComTooManyNpId);
+        CHECK(g.call(name, 0x1001, 7, 1, kNpId, 36, kOut, 64, 0, 0, 0, 0, 0, 0, 1, 0, kOut, kOut, 0) ==
+              kComInvalOnlineId);
+    }
+    for (const char* name :
+        {"sceNpScoreGetClansMembersRankingByNpIdAsync", "sceNpScoreGetClansMembersRankingByNpIdPcIdAsync"}) {
+        INFO(name);
+        CHECK(g.call(name, 0x1001, 7, 1, kNpId, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, 0) == kComInsufficient);
+        CHECK(g.call(name, 0x1001, 7, 1, kNpId, 36, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1000, kOpt) == kComInval);
+        CHECK(g.call(name, 0x1001, 7, 1, kNpId, 36, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1000, 0) == 0);
+    }
+    CHECK(g.call("sceNpScoreGetClansMembersRankingByRange", 0x1001, 7, 1, 0, kOut, 64, 0, 0, 0, 0, 0, 0, 1, 0, kOut,
+              kOut, 0) == kComInval); // no start rank
+    CHECK(g.call("sceNpScoreGetClansMembersRankingByRange", 0x1001, 7, 1, 1, kOut, 64, 0, 0, 0, 0, 0, 0, 101, 0, kOut,
+              kOut, 0) == kComTooLargeRange);
+    CHECK(g.call("sceNpScoreGetClansMembersRankingByRange", 0x1001, 7, 1, 1, kOut, 64, 0, 0, 0, 0, 0, 0, 100, 0, kOut,
+              kOut, 0) == kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreGetClansMembersRankingByRangeAsync", 0x1001, 7, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              1000, 0) == kComInsufficient);
+    CHECK(g.call("sceNpScoreGetClansMembersRankingByRangeAsync", 0x1001, 7, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0,
+              1000, 0) == 0);
+    CHECK(g.call("sceNpScoreGetClansRankingByClanId", 0x1001, 1, kOut, 4, kOut, 64, 0, 1, 0, 0, 1, kOut, kOut, 0) ==
+          kComInval); // a reserved size
+    CHECK(g.call("sceNpScoreGetClansRankingByClanId", 0x1001, 1, kOut, 4, kOut, 64, 0, 0, 0, 0, 102, kOut, kOut, 0) ==
+          kComTooManyNpId);
+    CHECK(g.call("sceNpScoreGetClansRankingByClanId", 0x1001, 1, kOut, 4, kOut, 64, 0, 0, 0, 0, 101, kOut, kOut, 0) ==
+          kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreGetClansRankingByClanIdAsync", 0x1001, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1000, 0) == 0);
+    CHECK(g.call("sceNpScoreGetClansRankingByRange", 0x1001, 1, 1, kOut, 64, 0, 0, 0, 0, 102, kOut, kOut, 0) ==
+          kComTooLargeRange);
+    CHECK(g.call("sceNpScoreGetClansRankingByRange", 0x1001, 1, 1, kOut, 64, 0, 0, 0, 0, 101, kOut, kOut, 0) ==
+          kComInvalOnlineId);
+    CHECK(g.call("sceNpScoreGetClansRankingByRangeAsync", 0x1001, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1000, 0) ==
+          kComInval); // no start rank
+    CHECK(g.call("sceNpScoreGetClansRankingByRangeAsync", 0x1001, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1000, 0) == 0);
+
+    // Destroying a title context; term leaves the others.
+    REQUIRE(g.call("sceNpScoreDestroyTitleCtx", 0x2001) == 0);
+    CHECK(g.call("sceNpScoreDestroyTitleCtx", 0x2001) == kComInvalId);
+    REQUIRE(g.call("sceNpScoreTerm") == 0);
+    CHECK(g.call("sceNpScoreDestroyTitleCtx", 0x2002) == kComNotInit);
+    REQUIRE(g.call("sceNpScoreInit") == 0);
+    CHECK(g.call("sceNpScoreDestroyTitleCtx", 0x2002) == 0);
+    CHECK(g.call("sceNpScoreCreateTitleCtx", kComm, kPass, kNpId) == 0x2003); // IDs go on
+}

@@ -70,6 +70,8 @@ enum : u32 {
     SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT = 0x8002A1A1,
     SCE_NP_COMMUNITY_ERROR_INVALID_ID = 0x8002A1A3,
     SCE_NP_COMMUNITY_ERROR_INVALID_ONLINE_ID = 0x8002A1A4,
+    SCE_NP_COMMUNITY_ERROR_TOO_MANY_NPID = 0x8002A1AD,
+    SCE_NP_COMMUNITY_ERROR_TOO_LARGE_RANGE = 0x8002A1AE,
     SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED = 0x8002A801,
     SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND = 0x8002A805,
     SCE_NP_SIGNALING_ERROR_CONN_NOT_FOUND = 0x8002A80E,
@@ -146,6 +148,10 @@ constexpr u32 kSupplementalNpdrm = 3, kSupplementalHeader = 0x10;
 constexpr u32 kSelfHeadMax = 0x10000; // the SELF's first bytes read for its headers
 constexpr u32 kUpgradeContentIdMax = 0x2F; // npDrmVerifyUpgradeLicense reads at most this many characters
 constexpr u32 SCE_NP_LOOKUP_MAX_CTX_NUM = 32;
+constexpr u32 SCE_NP_SCORE_MAX_CTX_NUM = 32, SCE_NP_SCORE_CENSOR_COMMENT_MAXLEN = 255,
+              SCE_NP_SCORE_MAX_RANGE_NUM_PER_TRANS = 100, SCE_NP_SCORE_MAX_NPID_NUM_PER_TRANS = 101,
+              SCE_NP_SCORE_MAX_CLAN_NUM_PER_TRANS = 101;
+constexpr u64 kScoreTimeoutDefault = 60'000'000, kCommunityTimeoutMin = 10'000'000; // microseconds
 constexpr u32 SCE_NP_SIGNALING_CTX_MAX = 8;
 constexpr u32 SCE_NP_SIGNALING_CONN_STATUS_INACTIVE = 0;
 constexpr u32 SCE_NP_SIGNALING_NETINFO_NAT_STATUS_TYPE2 = 2;
@@ -222,6 +228,14 @@ private:
     u32 next_ = 0; // idm's highest_index
 };
 
+// RPCS3 np_contexts.h score_ctx: a score title context's communication ID ("NPWR01234_00"), and the player character
+// ID and timeout its transactions would start with.
+struct ScoreCtx {
+    std::string communication_id;
+    s32 pc_id = 0;
+    u64 timeout = kScoreTimeoutDefault;
+};
+
 // RPCS3 np_contexts.h signaling_ctx: the creator's NP ID and its connection event handlers. Offline no connection
 // exists, so the handlers are never called.
 struct SignalingCtx {
@@ -244,6 +258,11 @@ struct NpState {
     // lookup transaction contexts: offline sceNpLookupCreateTransactionCtx never makes one.
     bool lookup_initialized = false;
     IdTable<std::string, 0x3001, SCE_NP_LOOKUP_MAX_CTX_NUM> lookup_title_ctxs;
+    // sceNpScoreInit's state (is_NP_Score_init) and the score title contexts (idm score_ctx, IDs 0x2001 on). Neither
+    // NP's term nor the score library's clears the contexts, as in RPCS3. There is no table of score transaction
+    // contexts: offline sceNpScoreCreateTransactionCtx never makes one, so every transaction ID is unknown.
+    bool score_initialized = false;
+    IdTable<ScoreCtx, 0x2001, SCE_NP_SCORE_MAX_CTX_NUM> score_ctxs;
     // The signaling contexts (idm signaling_ctx, IDs 0x6001 on), cleared by NP term as in RPCS3 sceNpTerm.
     IdTable<SignalingCtx, 0x6001, SCE_NP_SIGNALING_CTX_MAX> signaling_ctxs;
     // The custom menu (np_handler custom_menu_*), for the system's friend list and profile dialogs, which never open
@@ -1827,6 +1846,728 @@ s32 sceNpLookupPollAsync(PPUContext& ctx, s32 trans_id, u32 result)
     return lv2::CELL_OK;
 }
 
+// RPCS3 sceNpLookupWaitAsync: a TODO that answers CELL_OK and, unlike sceNpLookupPollAsync, writes no result.
+s32 sceNpLookupWaitAsync(PPUContext&, s32 trans_id, u32 result)
+{
+    if (!lookup_initialized(np())) return error(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
+    PS_LOG_DEBUG(kChan, "sceNpLookupWaitAsync({:#x}, result {:#x}): nothing to wait for", trans_id, result);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpLookupAbortTransaction: checks only the library (no transaction exists offline anyway).
+s32 sceNpLookupAbortTransaction(PPUContext&, s32 trans_id)
+{
+    if (!lookup_initialized(np())) return error(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
+    PS_LOG_DEBUG(kChan, "sceNpLookupAbortTransaction({:#x})", trans_id);
+    return lv2::CELL_OK;
+}
+
+// What RPCS3's lookups that need PSN answer once their checks pass (the library, the pointers they need, a null
+// option: "option check at least until fw 4.71"): SCE_NP_COMMUNITY_ERROR_INVALID_ONLINE_ID, nothing written.
+s32 lookup_offline(std::string_view name, s32 trans_id, std::initializer_list<u32> needed, u32 option)
+{
+    if (!lookup_initialized(np())) return error(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
+    for (const u32 p : needed)
+        if (!p) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (option) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    PS_LOG_DEBUG(kChan, "{}(transaction {:#x}): offline", name, trans_id);
+    return error(SCE_NP_COMMUNITY_ERROR_INVALID_ONLINE_ID);
+}
+
+s32 sceNpLookupNpId(PPUContext&, s32 trans_id, u32 online_id, u32 np_id, u32 option)
+{
+    return lookup_offline("sceNpLookupNpId", trans_id, {online_id, np_id}, option);
+}
+
+s32 sceNpLookupTitleSmallStorage(PPUContext&, s32 trans_id, u32 data, u32 max_size, u32 content_length, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpLookupTitleSmallStorage: {} bytes, length {:#x}", max_size, content_length);
+    return lookup_offline("sceNpLookupTitleSmallStorage", trans_id, {data}, option);
+}
+
+s32 sceNpLookupAvatarImage(PPUContext&, s32 trans_id, u32 avatar_url, u32 avatar_image, u32 option)
+{
+    return lookup_offline("sceNpLookupAvatarImage", trans_id, {avatar_url, avatar_image}, option);
+}
+
+s32 sceNpLookupAvatarImageAsync(PPUContext&, s32 trans_id, u32 avatar_url, u32 avatar_image, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpLookupAvatarImageAsync: prio {}", prio);
+    return lookup_offline("sceNpLookupAvatarImageAsync", trans_id, {avatar_url, avatar_image}, option);
+}
+
+// The user profile lookups: only the NP ID is needed (the outputs are each optional).
+s32 sceNpLookupUserProfile(PPUContext&, s32 trans_id, u32 np_id, u32 user_info, u32 about_me, u32 languages,
+    u32 country_code, u32 avatar_image, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpLookupUserProfile: outputs {:#x} {:#x} {:#x} {:#x} {:#x}", user_info, about_me, languages,
+        country_code, avatar_image);
+    return lookup_offline("sceNpLookupUserProfile", trans_id, {np_id}, option);
+}
+
+s32 sceNpLookupUserProfileAsync(PPUContext&, s32 trans_id, u32 np_id, u32 user_info, u32 about_me, u32 languages,
+    u32 country_code, u32 avatar_image, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpLookupUserProfileAsync: outputs {:#x} {:#x} {:#x} {:#x} {:#x}, prio {}", user_info,
+        about_me, languages, country_code, avatar_image, prio);
+    return lookup_offline("sceNpLookupUserProfileAsync", trans_id, {np_id}, option);
+}
+
+s32 sceNpLookupUserProfileWithAvatarSize(PPUContext&, s32 trans_id, s32 avatar_size_type, u32 np_id, u32 user_info,
+    u32 about_me, u32 languages, u32 country_code, u32 avatar_data, u32 avatar_data_max_size, u32 avatar_data_size,
+    u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpLookupUserProfileWithAvatarSize: avatar size type {}, outputs {:#x} {:#x} {:#x} {:#x} "
+                        "{:#x} ({} bytes) {:#x}", avatar_size_type, user_info, about_me, languages, country_code,
+        avatar_data, avatar_data_max_size, avatar_data_size);
+    return lookup_offline("sceNpLookupUserProfileWithAvatarSize", trans_id, {np_id}, option);
+}
+
+s32 sceNpLookupUserProfileWithAvatarSizeAsync(PPUContext&, s32 trans_id, s32 avatar_size_type, u32 np_id,
+    u32 user_info, u32 about_me, u32 languages, u32 country_code, u32 avatar_data, u32 avatar_data_max_size,
+    u32 avatar_data_size, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpLookupUserProfileWithAvatarSizeAsync: avatar size type {}, outputs {:#x} {:#x} {:#x} "
+                        "{:#x} {:#x} ({} bytes) {:#x}, prio {}", avatar_size_type, user_info, about_me, languages,
+        country_code, avatar_data, avatar_data_max_size, avatar_data_size, prio);
+    return lookup_offline("sceNpLookupUserProfileWithAvatarSizeAsync", trans_id, {np_id}, option);
+}
+
+// RPCS3 sceNpLookupTitleStorage / ...Async: UNIMPLEMENTED_FUNC after the library check, answering CELL_OK (their
+// arguments aren't known). Answered the same, with a warning.
+s32 sceNpLookupTitleStorage(PPUContext&)
+{
+    if (!lookup_initialized(np())) return error(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
+    PS_LOG_WARN(kChan, "sceNpLookupTitleStorage: not implemented in RPCS3 either; CELL_OK as RPCS3 answers");
+    return lv2::CELL_OK;
+}
+
+s32 sceNpLookupTitleStorageAsync(PPUContext&)
+{
+    if (!lookup_initialized(np())) return error(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
+    PS_LOG_WARN(kChan, "sceNpLookupTitleStorageAsync: not implemented in RPCS3 either; CELL_OK as RPCS3 answers");
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- score
+
+// The score (ranking) library: RPCS3 sceNpScore*, on top of NP. Title contexts are made and kept as RPCS3 keeps them;
+// transactions talk to PSN, so offline none is made (sceNpScoreCreateTransactionCtx refuses) and each function that
+// looks a transaction up finds none (SCE_NP_COMMUNITY_ERROR_INVALID_ID). Each function makes RPCS3's checks in
+// RPCS3's order; whichever comes first, the transaction lookup or the online check
+// (SCE_NP_COMMUNITY_ERROR_INVALID_ONLINE_ID), ends it. A few asynchronous clan functions are TODOs in RPCS3 that answer
+// CELL_OK after their checks: so do they here, and their transaction stays unknown to sceNpScorePollAsync.
+
+bool score_initialized(NpState& s)
+{
+    std::lock_guard lock(s.mutex);
+    return s.score_initialized;
+}
+
+// The end of a score call that needs PSN.
+s32 score_offline(std::string_view name, s32 trans_id)
+{
+    PS_LOG_DEBUG(kChan, "{}(transaction {:#x}): offline", name, trans_id);
+    return error(SCE_NP_COMMUNITY_ERROR_INVALID_ONLINE_ID);
+}
+
+// The end of a score call that looks its transaction up (get_score_transaction_context): there is none.
+s32 score_no_transaction(std::string_view name, s32 trans_id)
+{
+    PS_LOG_DEBUG(kChan, "{}(transaction {:#x}): no such transaction", name, trans_id);
+    return error(SCE_NP_COMMUNITY_ERROR_INVALID_ID);
+}
+
+// An asynchronous clan call RPCS3 leaves as a TODO: CELL_OK once its checks pass.
+s32 score_todo_ok(std::string_view name, s32 trans_id)
+{
+    PS_LOG_WARN(kChan, "{}(transaction {:#x}): a TODO in RPCS3, answered CELL_OK as there; nothing is fetched", name,
+        trans_id);
+    return lv2::CELL_OK;
+}
+
+// The first check of every score function.
+#define PS_SCORE_INIT()                                                                                                \
+    if (!score_initialized(np())) return error(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED)
+
+s32 sceNpScoreInit(PPUContext&)
+{
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    if (s.score_initialized) return error(SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED);
+    if (!s.initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    s.score_initialized = true;
+    PS_LOG_INFO(kChan, "sceNpScoreInit(): up; offline every score transaction is refused");
+    return lv2::CELL_OK;
+}
+
+s32 sceNpScoreTerm(PPUContext&)
+{
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    if (!s.score_initialized) return error(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
+    if (!s.initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    s.score_initialized = false;
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpScoreCreateTitleCtx: the new title context's ID. The passphrase and the user's NP ID are only checked for
+// null. As for sceNpLookupCreateTitleCtx, a communication ID that isn't valid (RPCS3 aborts in score_ctx's
+// constructor) is refused with a log.
+s32 sceNpScoreCreateTitleCtx(PPUContext& ctx, u32 communication_id_addr, u32 passphrase, u32 self_np_id)
+{
+    PS_SCORE_INIT();
+    if (!communication_id_addr || !passphrase || !self_np_id) {
+        return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, communication_id_addr, 12)) {
+        log_call_site(ctx, base, std::format("sceNpScoreCreateTitleCtx: the communication ID {:#x} is not guest memory",
+                                     communication_id_addr));
+        return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    }
+    const std::optional<std::string> id = communication_id(base, communication_id_addr);
+    if (!id) {
+        log_call_site(ctx, base, std::format("sceNpScoreCreateTitleCtx: {:#x} is not a valid communication ID (RPCS3 "
+                                             "aborts)", communication_id_addr));
+        return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    }
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    const u32 title_ctx = s.score_ctxs.make(ScoreCtx{*id});
+    if (!title_ctx) {
+        PS_LOG_ERROR(kChan, "sceNpScoreCreateTitleCtx({}): all {} title contexts are in use", *id,
+            SCE_NP_SCORE_MAX_CTX_NUM);
+        return error(SCE_NP_COMMUNITY_ERROR_TOO_MANY_OBJECTS);
+    }
+    PS_LOG_INFO(kChan, "sceNpScoreCreateTitleCtx({}): title context {:#x}", *id, title_ctx);
+    return static_cast<s32>(title_ctx);
+}
+
+s32 sceNpScoreDestroyTitleCtx(PPUContext&, s32 title_ctx_id)
+{
+    PS_SCORE_INIT();
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    if (!s.score_ctxs.remove(static_cast<u32>(title_ctx_id))) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ID);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpScoreCreateTransactionCtx: offline refused before the title context is looked at.
+s32 sceNpScoreCreateTransactionCtx(PPUContext&, s32 title_ctx_id)
+{
+    PS_SCORE_INIT();
+    PS_LOG_INFO(kChan, "sceNpScoreCreateTransactionCtx(title context {:#x}): offline, refused", title_ctx_id);
+    return error(SCE_NP_COMMUNITY_ERROR_INVALID_ONLINE_ID);
+}
+
+s32 sceNpScoreDestroyTransactionCtx(PPUContext&, s32 trans_id)
+{
+    PS_SCORE_INIT();
+    return score_no_transaction("sceNpScoreDestroyTransactionCtx", trans_id);
+}
+
+s32 sceNpScoreAbortTransaction(PPUContext&, s32 trans_id)
+{
+    PS_SCORE_INIT();
+    return score_no_transaction("sceNpScoreAbortTransaction", trans_id);
+}
+
+s32 sceNpScorePollAsync(PPUContext&, s32 trans_id, u32 result)
+{
+    PS_SCORE_INIT();
+    PS_LOG_DEBUG(kChan, "sceNpScorePollAsync: result {:#x}", result);
+    return score_no_transaction("sceNpScorePollAsync", trans_id);
+}
+
+s32 sceNpScoreWaitAsync(PPUContext&, s32 trans_id, u32 result)
+{
+    PS_SCORE_INIT();
+    PS_LOG_DEBUG(kChan, "sceNpScoreWaitAsync: result {:#x}", result);
+    return score_no_transaction("sceNpScoreWaitAsync", trans_id);
+}
+
+// RPCS3 sceNpScoreSetPlayerCharacterId / sceNpScoreSetTimeout: on a transaction (none offline) or a title context,
+// whose later transactions would start with it. The character ID is checked before the library; the timeout (at least
+// 10 s) after it.
+s32 sceNpScoreSetPlayerCharacterId(PPUContext&, s32 ctx_id, s32 pc_id)
+{
+    if (pc_id < 0) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    PS_SCORE_INIT();
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    ScoreCtx* c = s.score_ctxs.find(static_cast<u32>(ctx_id));
+    if (!c) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ID);
+    c->pc_id = pc_id;
+    return lv2::CELL_OK;
+}
+
+s32 sceNpScoreSetTimeout(PPUContext&, s32 ctx_id, u64 timeout_us)
+{
+    PS_SCORE_INIT();
+    if (timeout_us < kCommunityTimeoutMin) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    ScoreCtx* c = s.score_ctxs.find(static_cast<u32>(ctx_id));
+    if (!c) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ID);
+    c->timeout = timeout_us;
+    return lv2::CELL_OK;
+}
+
+// RPCS3 scenp_score_get_board_info: the board info pointer and a null option, then offline.
+s32 score_board_info(std::string_view name, s32 trans_id, u32 board_info, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!board_info) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (option) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    return score_offline(name, trans_id);
+}
+
+s32 sceNpScoreGetBoardInfo(PPUContext&, s32 trans_id, u32 board_id, u32 board_info, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetBoardInfo: board {}", board_id);
+    return score_board_info("sceNpScoreGetBoardInfo", trans_id, board_info, option);
+}
+
+s32 sceNpScoreGetBoardInfoAsync(PPUContext&, s32 trans_id, u32 board_id, u32 board_info, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetBoardInfoAsync: board {}, prio {}", board_id, prio);
+    return score_board_info("sceNpScoreGetBoardInfoAsync", trans_id, board_info, option);
+}
+
+// RPCS3 scenp_score_record_score: offline before anything else is looked at.
+s32 sceNpScoreRecordScore(PPUContext&, s32 trans_id, u32 board_id, s64 score, u32 comment, u32 game_info,
+    u32 tmp_rank, u32 option)
+{
+    PS_SCORE_INIT();
+    PS_LOG_DEBUG(kChan, "sceNpScoreRecordScore: board {}, score {}, comment {:#x}, info {:#x}, rank {:#x}, option {:#x}",
+        board_id, score, comment, game_info, tmp_rank, option);
+    return score_offline("sceNpScoreRecordScore", trans_id);
+}
+
+s32 sceNpScoreRecordScoreAsync(PPUContext&, s32 trans_id, u32 board_id, s64 score, u32 comment, u32 game_info,
+    u32 tmp_rank, s32 prio, u32 option)
+{
+    PS_SCORE_INIT();
+    PS_LOG_DEBUG(kChan, "sceNpScoreRecordScoreAsync: board {}, score {}, comment {:#x}, info {:#x}, rank {:#x}, prio "
+                        "{}, option {:#x}", board_id, score, comment, game_info, tmp_rank, prio, option);
+    return score_offline("sceNpScoreRecordScoreAsync", trans_id);
+}
+
+// RPCS3 scenp_score_record_game_data: the data, then the transaction.
+s32 score_record_game_data(std::string_view name, s32 trans_id, u32 data)
+{
+    PS_SCORE_INIT();
+    if (!data) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    return score_no_transaction(name, trans_id);
+}
+
+s32 sceNpScoreRecordGameData(PPUContext&, s32 trans_id, u32 board_id, s64 score, u32 total_size, u32 send_size,
+    u32 data, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreRecordGameData: board {}, score {}, {} of {} bytes, option {:#x}", board_id, score,
+        send_size, total_size, option);
+    return score_record_game_data("sceNpScoreRecordGameData", trans_id, data);
+}
+
+s32 sceNpScoreRecordGameDataAsync(PPUContext&, s32 trans_id, u32 board_id, s64 score, u32 total_size, u32 send_size,
+    u32 data, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreRecordGameDataAsync: board {}, score {}, {} of {} bytes, prio {}, option {:#x}",
+        board_id, score, send_size, total_size, prio, option);
+    return score_record_game_data("sceNpScoreRecordGameDataAsync", trans_id, data);
+}
+
+// RPCS3 scenp_score_get_game_data: the NP ID and the buffer, then the transaction.
+s32 score_get_game_data(std::string_view name, s32 trans_id, u32 np_id, u32 data)
+{
+    PS_SCORE_INIT();
+    if (!np_id || !data) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    return score_no_transaction(name, trans_id);
+}
+
+s32 sceNpScoreGetGameData(PPUContext&, s32 trans_id, u32 board_id, u32 np_id, u32 total_size, u32 recv_size, u32 data,
+    u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetGameData: board {}, total size {:#x}, {} bytes, option {:#x}", board_id,
+        total_size, recv_size, option);
+    return score_get_game_data("sceNpScoreGetGameData", trans_id, np_id, data);
+}
+
+s32 sceNpScoreGetGameDataAsync(PPUContext&, s32 trans_id, u32 board_id, u32 np_id, u32 total_size, u32 recv_size,
+    u32 data, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetGameDataAsync: board {}, total size {:#x}, {} bytes, prio {}, option {:#x}",
+        board_id, total_size, recv_size, prio, option);
+    return score_get_game_data("sceNpScoreGetGameDataAsync", trans_id, np_id, data);
+}
+
+// RPCS3 scenp_score_get_ranking_by_npid (for NP IDs and NP ID + character ID pairs): the array, a count of 1 to 101,
+// then the transaction.
+s32 score_ranking_by_npid(std::string_view name, s32 trans_id, u32 id_array, u32 array_num)
+{
+    PS_SCORE_INIT();
+    if (!id_array) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (!array_num) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    if (array_num > SCE_NP_SCORE_MAX_NPID_NUM_PER_TRANS) return error(SCE_NP_COMMUNITY_ERROR_TOO_MANY_NPID);
+    return score_no_transaction(name, trans_id);
+}
+
+s32 sceNpScoreGetRankingByNpId(PPUContext&, s32 trans_id, u32 board_id, u32 id_array, u32 id_array_size,
+    u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array,
+    u32 info_array_size, u32 array_num, u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetRankingByNpId: board {}, ids {:#x} ({}), ranks {:#x} ({}), comments {:#x} ({}), "
+                        "infos {:#x} ({}), {} entries, {:#x} {:#x}, option {:#x}", board_id, id_array, id_array_size,
+        rank_array, rank_array_size, comment_array, comment_array_size, info_array, info_array_size, array_num,
+        last_sort_date, total_record, option);
+    return score_ranking_by_npid("sceNpScoreGetRankingByNpId", trans_id, id_array, array_num);
+}
+
+s32 sceNpScoreGetRankingByNpIdAsync(PPUContext&, s32 trans_id, u32 board_id, u32 id_array, u32 id_array_size,
+    u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array,
+    u32 info_array_size, u32 array_num, u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetRankingByNpIdAsync: board {}, ids {:#x} ({}), ranks {:#x} ({}), comments {:#x} "
+                        "({}), infos {:#x} ({}), {} entries, {:#x} {:#x}, prio {}, option {:#x}", board_id, id_array,
+        id_array_size, rank_array, rank_array_size, comment_array, comment_array_size, info_array, info_array_size,
+        array_num, last_sort_date, total_record, prio, option);
+    return score_ranking_by_npid("sceNpScoreGetRankingByNpIdAsync", trans_id, id_array, array_num);
+}
+
+s32 sceNpScoreGetRankingByNpIdPcId(PPUContext&, s32 trans_id, u32 board_id, u32 id_array, u32 id_array_size,
+    u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array,
+    u32 info_array_size, u32 array_num, u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetRankingByNpIdPcId: board {}, ids {:#x} ({}), ranks {:#x} ({}), comments {:#x} "
+                        "({}), infos {:#x} ({}), {} entries, {:#x} {:#x}, option {:#x}", board_id, id_array,
+        id_array_size, rank_array, rank_array_size, comment_array, comment_array_size, info_array, info_array_size,
+        array_num, last_sort_date, total_record, option);
+    return score_ranking_by_npid("sceNpScoreGetRankingByNpIdPcId", trans_id, id_array, array_num);
+}
+
+s32 sceNpScoreGetRankingByNpIdPcIdAsync(PPUContext&, s32 trans_id, u32 board_id, u32 id_array, u32 id_array_size,
+    u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array,
+    u32 info_array_size, u32 array_num, u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetRankingByNpIdPcIdAsync: board {}, ids {:#x} ({}), ranks {:#x} ({}), comments "
+                        "{:#x} ({}), infos {:#x} ({}), {} entries, {:#x} {:#x}, prio {}, option {:#x}", board_id,
+        id_array, id_array_size, rank_array, rank_array_size, comment_array, comment_array_size, info_array,
+        info_array_size, array_num, last_sort_date, total_record, prio, option);
+    return score_ranking_by_npid("sceNpScoreGetRankingByNpIdPcIdAsync", trans_id, id_array, array_num);
+}
+
+// RPCS3 scenp_score_get_ranking_by_range and scenp_score_get_friends_ranking look the transaction up first.
+s32 sceNpScoreGetRankingByRange(PPUContext&, s32 trans_id, u32 board_id, u32 start_serial_rank, u32 rank_array,
+    u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array, u32 info_array_size, u32 array_num,
+    u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_SCORE_INIT();
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetRankingByRange: board {}, from rank {}, ranks {:#x} ({}), comments {:#x} ({}), "
+                        "infos {:#x} ({}), {} entries, {:#x} {:#x}, option {:#x}", board_id, start_serial_rank,
+        rank_array, rank_array_size, comment_array, comment_array_size, info_array, info_array_size, array_num,
+        last_sort_date, total_record, option);
+    return score_no_transaction("sceNpScoreGetRankingByRange", trans_id);
+}
+
+s32 sceNpScoreGetRankingByRangeAsync(PPUContext&, s32 trans_id, u32 board_id, u32 start_serial_rank, u32 rank_array,
+    u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array, u32 info_array_size, u32 array_num,
+    u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_SCORE_INIT();
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetRankingByRangeAsync: board {}, from rank {}, ranks {:#x} ({}), comments {:#x} "
+                        "({}), infos {:#x} ({}), {} entries, {:#x} {:#x}, prio {}, option {:#x}", board_id,
+        start_serial_rank, rank_array, rank_array_size, comment_array, comment_array_size, info_array, info_array_size,
+        array_num, last_sort_date, total_record, prio, option);
+    return score_no_transaction("sceNpScoreGetRankingByRangeAsync", trans_id);
+}
+
+s32 sceNpScoreGetFriendsRanking(PPUContext&, s32 trans_id, u32 board_id, s32 include_self, u32 rank_array,
+    u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array, u32 info_array_size, u32 array_num,
+    u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_SCORE_INIT();
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetFriendsRanking: board {}, self {}, ranks {:#x} ({}), comments {:#x} ({}), infos "
+                        "{:#x} ({}), {} entries, {:#x} {:#x}, option {:#x}", board_id, include_self, rank_array,
+        rank_array_size, comment_array, comment_array_size, info_array, info_array_size, array_num, last_sort_date,
+        total_record, option);
+    return score_no_transaction("sceNpScoreGetFriendsRanking", trans_id);
+}
+
+s32 sceNpScoreGetFriendsRankingAsync(PPUContext&, s32 trans_id, u32 board_id, s32 include_self, u32 rank_array,
+    u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array, u32 info_array_size, u32 array_num,
+    u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_SCORE_INIT();
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetFriendsRankingAsync: board {}, self {}, ranks {:#x} ({}), comments {:#x} ({}), "
+                        "infos {:#x} ({}), {} entries, {:#x} {:#x}, prio {}, option {:#x}", board_id, include_self,
+        rank_array, rank_array_size, comment_array, comment_array_size, info_array, info_array_size, array_num,
+        last_sort_date, total_record, prio, option);
+    return score_no_transaction("sceNpScoreGetFriendsRankingAsync", trans_id);
+}
+
+// The length of a comment, as RPCS3's strlen; nullopt when it runs out of guest memory (logged: RPCS3 faults).
+std::optional<u32> comment_length(PPUContext& ctx, std::string_view name, u32 comment)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    const std::optional<u32> length = guest_strnlen(t, comment, SCE_NP_SCORE_CENSOR_COMMENT_MAXLEN + 1);
+    if (!length) {
+        log_call_site(ctx, t.kernel.base(), std::format("{}: the comment at {:#x} runs out of guest memory", name,
+                                                comment));
+    }
+    return length;
+}
+
+// RPCS3 scenp_score_censor_comment: the comment (at most 255 characters) and a null option, then offline.
+s32 score_censor_comment(PPUContext& ctx, std::string_view name, s32 trans_id, u32 comment, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!comment) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    const std::optional<u32> length = comment_length(ctx, name, comment);
+    if (!length || *length > SCE_NP_SCORE_CENSOR_COMMENT_MAXLEN || option) {
+        return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    }
+    return score_offline(name, trans_id);
+}
+
+s32 sceNpScoreCensorComment(PPUContext& ctx, s32 trans_id, u32 comment, u32 option)
+{
+    return score_censor_comment(ctx, "sceNpScoreCensorComment", trans_id, comment, option);
+}
+
+s32 sceNpScoreCensorCommentAsync(PPUContext& ctx, s32 trans_id, u32 comment, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreCensorCommentAsync: prio {}", prio);
+    return score_censor_comment(ctx, "sceNpScoreCensorCommentAsync", trans_id, comment, option);
+}
+
+// RPCS3 scenp_score_sanitize_comment: the output first (before the library), the comment (at most 255 characters),
+// then the transaction.
+s32 score_sanitize_comment(PPUContext& ctx, std::string_view name, s32 trans_id, u32 comment, u32 sanitized)
+{
+    if (!sanitized) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    PS_SCORE_INIT();
+    if (!comment) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    const std::optional<u32> length = comment_length(ctx, name, comment);
+    if (!length || *length > SCE_NP_SCORE_CENSOR_COMMENT_MAXLEN) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    return score_no_transaction(name, trans_id);
+}
+
+s32 sceNpScoreSanitizeComment(PPUContext& ctx, s32 trans_id, u32 comment, u32 sanitized, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreSanitizeComment: option {:#x}", option);
+    return score_sanitize_comment(ctx, "sceNpScoreSanitizeComment", trans_id, comment, sanitized);
+}
+
+s32 sceNpScoreSanitizeCommentAsync(PPUContext& ctx, s32 trans_id, u32 comment, u32 sanitized, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreSanitizeCommentAsync: prio {}, option {:#x}", prio, option);
+    return score_sanitize_comment(ctx, "sceNpScoreSanitizeCommentAsync", trans_id, comment, sanitized);
+}
+
+// ------------------------------------------------------------------------------------------------- score: clans
+
+// RPCS3 sceNpScoreGetClanMemberGameData: the NP ID, sizes and buffer and a null option, then offline. Its
+// asynchronous form checks only the option (a TODO: CELL_OK).
+s32 sceNpScoreGetClanMemberGameData(PPUContext&, s32 trans_id, u32 board_id, u32 clan_id, u32 np_id, u32 total_size,
+    u32 recv_size, u32 data, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!np_id || !total_size || !data) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (option) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClanMemberGameData: board {}, clan {}, {} bytes", board_id, clan_id, recv_size);
+    return score_offline("sceNpScoreGetClanMemberGameData", trans_id);
+}
+
+s32 sceNpScoreGetClanMemberGameDataAsync(PPUContext&, s32 trans_id, u32 board_id, u32 clan_id, u32 np_id,
+    u32 total_size, u32 recv_size, u32 data, s32 prio, u32 option)
+{
+    PS_SCORE_INIT();
+    if (option) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClanMemberGameDataAsync: board {}, clan {}, NP ID {:#x}, sizes {:#x} {}, data "
+                        "{:#x}, prio {}", board_id, clan_id, np_id, total_size, recv_size, data, prio);
+    return score_todo_ok("sceNpScoreGetClanMemberGameDataAsync", trans_id);
+}
+
+// RPCS3 sceNpScoreGetClansMembersRankingByNpId(PcId): the ID and rank arrays, the dates, a count of 1 to 101 and a
+// null option, then offline. The asynchronous forms check only the ID array, the count and the option (TODOs:
+// CELL_OK).
+s32 clans_members_by_npid(std::string_view name, s32 trans_id, u32 id_array, u32 rank_array, u32 array_num,
+    u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!id_array || !rank_array || !total_record || !last_sort_date || !array_num) {
+        return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    }
+    if (option) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    if (array_num > SCE_NP_SCORE_MAX_NPID_NUM_PER_TRANS) return error(SCE_NP_COMMUNITY_ERROR_TOO_MANY_NPID);
+    return score_offline(name, trans_id);
+}
+
+s32 clans_members_by_npid_async(std::string_view name, s32 trans_id, u32 id_array, u32 array_num, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!id_array || !array_num) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (option) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    return score_todo_ok(name, trans_id);
+}
+
+s32 sceNpScoreGetClansMembersRankingByNpId(PPUContext&, s32 trans_id, u32 clan_id, u32 board_id, u32 id_array,
+    u32 id_array_size, u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array,
+    u32 info_array_size, u32 descript_array, u32 descript_array_size, u32 array_num, u32 clan_info,
+    u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansMembersRankingByNpId: clan {}, board {}, sizes {} {} {} {} {}, {:#x} {:#x} "
+                        "{:#x} {:#x}", clan_id, board_id, id_array_size, rank_array_size, comment_array_size,
+        info_array_size, descript_array_size, comment_array, info_array, descript_array, clan_info);
+    return clans_members_by_npid("sceNpScoreGetClansMembersRankingByNpId", trans_id, id_array, rank_array, array_num,
+        last_sort_date, total_record, option);
+}
+
+s32 sceNpScoreGetClansMembersRankingByNpIdAsync(PPUContext&, s32 trans_id, u32 clan_id, u32 board_id, u32 id_array,
+    u32 id_array_size, u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array,
+    u32 info_array_size, u32 descript_array, u32 descript_array_size, u32 array_num, u32 clan_info,
+    u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansMembersRankingByNpIdAsync: clan {}, board {}, sizes {} {} {} {} {}, {:#x} "
+                        "{:#x} {:#x} {:#x} {:#x} {:#x} {:#x}, prio {}", clan_id, board_id, id_array_size,
+        rank_array_size, comment_array_size, info_array_size, descript_array_size, rank_array, comment_array,
+        info_array, descript_array, clan_info, last_sort_date, total_record, prio);
+    return clans_members_by_npid_async("sceNpScoreGetClansMembersRankingByNpIdAsync", trans_id, id_array, array_num,
+        option);
+}
+
+s32 sceNpScoreGetClansMembersRankingByNpIdPcId(PPUContext&, s32 trans_id, u32 clan_id, u32 board_id, u32 id_array,
+    u32 id_array_size, u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size, u32 info_array,
+    u32 info_array_size, u32 descript_array, u32 descript_array_size, u32 array_num, u32 clan_info,
+    u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansMembersRankingByNpIdPcId: clan {}, board {}, sizes {} {} {} {} {}, {:#x} "
+                        "{:#x} {:#x} {:#x}", clan_id, board_id, id_array_size, rank_array_size, comment_array_size,
+        info_array_size, descript_array_size, comment_array, info_array, descript_array, clan_info);
+    return clans_members_by_npid("sceNpScoreGetClansMembersRankingByNpIdPcId", trans_id, id_array, rank_array,
+        array_num, last_sort_date, total_record, option);
+}
+
+s32 sceNpScoreGetClansMembersRankingByNpIdPcIdAsync(PPUContext&, s32 trans_id, u32 clan_id, u32 board_id,
+    u32 id_array, u32 id_array_size, u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size,
+    u32 info_array, u32 info_array_size, u32 descript_array, u32 descript_array_size, u32 array_num, u32 clan_info,
+    u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansMembersRankingByNpIdPcIdAsync: clan {}, board {}, sizes {} {} {} {} {}, "
+                        "{:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}, prio {}", clan_id, board_id, id_array_size,
+        rank_array_size, comment_array_size, info_array_size, descript_array_size, rank_array, comment_array,
+        info_array, descript_array, clan_info, last_sort_date, total_record, prio);
+    return clans_members_by_npid_async("sceNpScoreGetClansMembersRankingByNpIdPcIdAsync", trans_id, id_array,
+        array_num, option);
+}
+
+// RPCS3 sceNpScoreGetClansMembersRankingByRange: the rank array, the dates, a count; a start rank and a null option;
+// at most 100 entries; then offline. Its asynchronous form checks the count, the start rank and the option (a TODO:
+// CELL_OK).
+s32 sceNpScoreGetClansMembersRankingByRange(PPUContext&, s32 trans_id, u32 clan_id, u32 board_id,
+    u32 start_serial_rank, u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size,
+    u32 info_array, u32 info_array_size, u32 descript_array, u32 descript_array_size, u32 array_num, u32 clan_info,
+    u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!rank_array || !total_record || !last_sort_date || !array_num) {
+        return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    }
+    if (!start_serial_rank || option) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    if (array_num > SCE_NP_SCORE_MAX_RANGE_NUM_PER_TRANS) return error(SCE_NP_COMMUNITY_ERROR_TOO_LARGE_RANGE);
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansMembersRankingByRange: clan {}, board {}, sizes {} {} {} {}, {:#x} {:#x} "
+                        "{:#x} {:#x}", clan_id, board_id, rank_array_size, comment_array_size, info_array_size,
+        descript_array_size, comment_array, info_array, descript_array, clan_info);
+    return score_offline("sceNpScoreGetClansMembersRankingByRange", trans_id);
+}
+
+s32 sceNpScoreGetClansMembersRankingByRangeAsync(PPUContext&, s32 trans_id, u32 clan_id, u32 board_id,
+    u32 start_serial_rank, u32 rank_array, u32 rank_array_size, u32 comment_array, u32 comment_array_size,
+    u32 info_array, u32 info_array_size, u32 descript_array, u32 descript_array_size, u32 array_num, u32 clan_info,
+    u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!array_num) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (!start_serial_rank || option) return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansMembersRankingByRangeAsync: clan {}, board {}, sizes {} {} {} {}, {:#x} "
+                        "{:#x} {:#x} {:#x} {:#x} {:#x} {:#x}, prio {}", clan_id, board_id, rank_array_size,
+        comment_array_size, info_array_size, descript_array_size, rank_array, comment_array, info_array,
+        descript_array, clan_info, last_sort_date, total_record, prio);
+    return score_todo_ok("sceNpScoreGetClansMembersRankingByRangeAsync", trans_id);
+}
+
+// RPCS3 sceNpScoreGetClansRankingByClanId: the arrays, the dates, a count; reserved arguments all 0 and a null
+// option; at most 101 clans; then offline. Its asynchronous form checks the count, the reserved arguments and the
+// option (a TODO: CELL_OK).
+s32 sceNpScoreGetClansRankingByClanId(PPUContext&, s32 trans_id, u32 clan_board_id, u32 clan_id_array,
+    u32 clan_id_array_size, u32 rank_array, u32 rank_array_size, u32 reserved1, u32 reserved_size1, u32 reserved2,
+    u32 reserved_size2, u32 array_num, u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!clan_id_array || !rank_array || !total_record || !last_sort_date || !array_num) {
+        return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    }
+    if (reserved1 || reserved_size1 || reserved2 || reserved_size2 || option) {
+        return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    }
+    if (array_num > SCE_NP_SCORE_MAX_NPID_NUM_PER_TRANS) return error(SCE_NP_COMMUNITY_ERROR_TOO_MANY_NPID);
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansRankingByClanId: board {}, sizes {} {}", clan_board_id, clan_id_array_size,
+        rank_array_size);
+    return score_offline("sceNpScoreGetClansRankingByClanId", trans_id);
+}
+
+s32 sceNpScoreGetClansRankingByClanIdAsync(PPUContext&, s32 trans_id, u32 clan_board_id, u32 clan_id_array,
+    u32 clan_id_array_size, u32 rank_array, u32 rank_array_size, u32 reserved1, u32 reserved_size1, u32 reserved2,
+    u32 reserved_size2, u32 array_num, u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!array_num) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (reserved1 || reserved_size1 || reserved2 || reserved_size2 || option) {
+        return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    }
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansRankingByClanIdAsync: board {}, {:#x} ({}), {:#x} ({}), {:#x} {:#x}, prio "
+                        "{}", clan_board_id, clan_id_array, clan_id_array_size, rank_array, rank_array_size,
+        last_sort_date, total_record, prio);
+    return score_todo_ok("sceNpScoreGetClansRankingByClanIdAsync", trans_id);
+}
+
+// RPCS3 sceNpScoreGetClansRankingByRange: the rank array, the dates, a count; a start rank, reserved arguments all 0
+// and a null option; at most 101 clans; then offline. Its asynchronous form checks the count, the start rank, the
+// reserved arguments and the option (a TODO: CELL_OK).
+s32 sceNpScoreGetClansRankingByRange(PPUContext&, s32 trans_id, u32 clan_board_id, u32 start_serial_rank,
+    u32 rank_array, u32 rank_array_size, u32 reserved1, u32 reserved_size1, u32 reserved2, u32 reserved_size2,
+    u32 array_num, u32 last_sort_date, u32 total_record, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!rank_array || !total_record || !last_sort_date || !array_num) {
+        return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    }
+    if (!start_serial_rank || reserved1 || reserved_size1 || reserved2 || reserved_size2 || option) {
+        return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    }
+    if (array_num > SCE_NP_SCORE_MAX_CLAN_NUM_PER_TRANS) return error(SCE_NP_COMMUNITY_ERROR_TOO_LARGE_RANGE);
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansRankingByRange: board {}, size {}", clan_board_id, rank_array_size);
+    return score_offline("sceNpScoreGetClansRankingByRange", trans_id);
+}
+
+s32 sceNpScoreGetClansRankingByRangeAsync(PPUContext&, s32 trans_id, u32 clan_board_id, u32 start_serial_rank,
+    u32 rank_array, u32 rank_array_size, u32 reserved1, u32 reserved_size1, u32 reserved2, u32 reserved_size2,
+    u32 array_num, u32 last_sort_date, u32 total_record, s32 prio, u32 option)
+{
+    PS_SCORE_INIT();
+    if (!array_num) return error(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (!start_serial_rank || reserved1 || reserved_size1 || reserved2 || reserved_size2 || option) {
+        return error(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+    }
+    PS_LOG_DEBUG(kChan, "sceNpScoreGetClansRankingByRangeAsync: board {}, {:#x} ({}), {:#x} {:#x}, prio {}",
+        clan_board_id, rank_array, rank_array_size, last_sort_date, total_record, prio);
+    return score_todo_ok("sceNpScoreGetClansRankingByRangeAsync", trans_id);
+}
+
+#undef PS_SCORE_INIT
+
 // ------------------------------------------------------------------------------------------------- signaling
 
 // RPCS3 sceNpSignalingCreateCtx: a signaling context for peer-to-peer connections, holding the given NP ID and the
@@ -2242,6 +2983,61 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0xBE3AF96E, sceNpUtilCanonicalizeNpIdForPsp),
         PS_HLE_FUNC(0xC611029A, sceNpUtilGetPlatformType),
         PS_HLE_FUNC(0xAFC62605, sceNpUtilSetPlatformType),
+        PS_HLE_FUNC(0xD737FD2D, sceNpLookupWaitAsync),
+        PS_HLE_FUNC(0x3D1760DC, sceNpLookupAbortTransaction),
+        PS_HLE_FUNC(0x166DCC11, sceNpLookupNpId),
+        PS_HLE_FUNC(0xCA39C4B2, sceNpLookupTitleSmallStorage),
+        PS_HLE_FUNC(0xB6017827, sceNpLookupAvatarImage),
+        PS_HLE_FUNC(0xBF9EEA93, sceNpLookupAvatarImageAsync),
+        PS_HLE_FUNC(0xDFD63B62, sceNpLookupUserProfile),
+        PS_HLE_FUNC(0xFF0A2378, sceNpLookupUserProfileAsync),
+        PS_HLE_FUNC(0x2FCCBFE0, sceNpLookupUserProfileWithAvatarSize),
+        PS_HLE_FUNC(0x1FDB3EC2, sceNpLookupUserProfileWithAvatarSizeAsync),
+        PS_HLE_FUNC(0x9EE9F97E, sceNpLookupTitleStorage),
+        PS_HLE_FUNC(0x5E117ED5, sceNpLookupTitleStorageAsync),
+        PS_HLE_FUNC(0x32CF311F, sceNpScoreInit),
+        PS_HLE_FUNC(0x9851F805, sceNpScoreTerm),
+        PS_HLE_FUNC(0xB9F93BBB, sceNpScoreCreateTitleCtx),
+        PS_HLE_FUNC(0x259113B8, sceNpScoreDestroyTitleCtx),
+        PS_HLE_FUNC(0x6F5E8143, sceNpScoreCreateTransactionCtx),
+        PS_HLE_FUNC(0xC5F4CF82, sceNpScoreDestroyTransactionCtx),
+        PS_HLE_FUNC(0xEE5B20D9, sceNpScoreAbortTransaction),
+        PS_HLE_FUNC(0xA7A090E5, sceNpScorePollAsync),
+        PS_HLE_FUNC(0x1A2704F7, sceNpScoreWaitAsync),
+        PS_HLE_FUNC(0x2706EAA1, sceNpScoreSetPlayerCharacterId),
+        PS_HLE_FUNC(0x29DD45DC, sceNpScoreSetTimeout),
+        PS_HLE_FUNC(0xF4E0F607, sceNpScoreGetBoardInfo),
+        PS_HLE_FUNC(0xDDCE7D15, sceNpScoreGetBoardInfoAsync),
+        PS_HLE_FUNC(0x1672170E, sceNpScoreRecordScore),
+        PS_HLE_FUNC(0xF0B1E399, sceNpScoreRecordScoreAsync),
+        PS_HLE_FUNC(0x04CA5E6A, sceNpScoreRecordGameData),
+        PS_HLE_FUNC(0xF76847C2, sceNpScoreRecordGameDataAsync),
+        PS_HLE_FUNC(0x3B02418D, sceNpScoreGetGameData),
+        PS_HLE_FUNC(0xDB2E4DC2, sceNpScoreGetGameDataAsync),
+        PS_HLE_FUNC(0x05D65DFF, sceNpScoreGetRankingByNpId),
+        PS_HLE_FUNC(0x3DB7914D, sceNpScoreGetRankingByNpIdAsync),
+        PS_HLE_FUNC(0xC3A991EE, sceNpScoreGetRankingByNpIdPcId),
+        PS_HLE_FUNC(0xC4B6CD8F, sceNpScoreGetRankingByNpIdPcIdAsync),
+        PS_HLE_FUNC(0xFBC82301, sceNpScoreGetRankingByRange),
+        PS_HLE_FUNC(0x21206642, sceNpScoreGetRankingByRangeAsync),
+        PS_HLE_FUNC(0xF33291EB, sceNpScoreGetFriendsRanking),
+        PS_HLE_FUNC(0xCC946D56, sceNpScoreGetFriendsRankingAsync),
+        PS_HLE_FUNC(0x7DEB244C, sceNpScoreCensorComment),
+        PS_HLE_FUNC(0x7BE47E61, sceNpScoreCensorCommentAsync),
+        PS_HLE_FUNC(0xF1B77918, sceNpScoreSanitizeComment),
+        PS_HLE_FUNC(0x2CD2A1AF, sceNpScoreSanitizeCommentAsync),
+        PS_HLE_FUNC(0x741FBF24, sceNpScoreGetClanMemberGameData),
+        PS_HLE_FUNC(0xBEF887E5, sceNpScoreGetClanMemberGameDataAsync),
+        PS_HLE_FUNC(0xDED17C26, sceNpScoreGetClansMembersRankingByNpId),
+        PS_HLE_FUNC(0xE8A67160, sceNpScoreGetClansMembersRankingByNpIdAsync),
+        PS_HLE_FUNC(0x41FFD4F2, sceNpScoreGetClansMembersRankingByNpIdPcId),
+        PS_HLE_FUNC(0x433FCB30, sceNpScoreGetClansMembersRankingByNpIdPcIdAsync),
+        PS_HLE_FUNC(0x6D4ADC3B, sceNpScoreGetClansMembersRankingByRange),
+        PS_HLE_FUNC(0x4D5E0670, sceNpScoreGetClansMembersRankingByRangeAsync),
+        PS_HLE_FUNC(0x2A76895A, sceNpScoreGetClansRankingByClanId),
+        PS_HLE_FUNC(0x227F8763, sceNpScoreGetClansRankingByClanIdAsync),
+        PS_HLE_FUNC(0xB082003B, sceNpScoreGetClansRankingByRange),
+        PS_HLE_FUNC(0x7B7E9137, sceNpScoreGetClansRankingByRangeAsync),
     });
 }
 
