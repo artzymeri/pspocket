@@ -7,6 +7,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -16,6 +17,7 @@
 #include <system_error>
 #include <vector>
 
+#include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/ppu/asm.hpp"
 
@@ -902,4 +904,490 @@ TEST_CASE("sceNpDrmIsAvailable: the file at the path as RPCS3 checks it; content
     DrmDirs::write(dirs.hdd0 / name, {1});
     CHECK(check("/dev_hdd0/" + name + "xyz") == 0);
     CHECK(check("/dev_hdd0/" + name.substr(1) + "xyz") == r3_of(lv2::CELL_ENOENT));
+}
+
+namespace {
+
+constexpr u64 kBasicBusy = 0xFFFFFFFF8002A66Full;
+constexpr u64 kFriendlistNotInit = 0xFFFFFFFF8002AB21ull, kFriendlistInval = 0xFFFFFFFF8002AB28ull;
+constexpr u64 kMenuNotInit = 0xFFFFFFFF80023B02ull, kMenuInval = 0xFFFFFFFF80023B09ull,
+              kMenuNotRegistered = 0xFFFFFFFF80023B0Bull, kMenuExceeds = 0xFFFFFFFF80023B0Cull;
+constexpr u64 kUtilUnknownPlatform = 0xFFFFFFFF8002AB10ull;
+constexpr u64 kDrmTimeLimit = 0xFFFFFFFF8002951Bull, kDrmNotStarted = 0xFFFFFFFF8002951Eull;
+
+// A guest function that returns 0 at once, behind the descriptor kNopOpd (a handler RPCS3 never calls offline).
+constexpr u32 kNopCode = kData + 0x22000, kNopOpd = kData + 0x22100;
+
+void write_nop(u8* b)
+{
+    ps_write32(b, kNopCode, as::li(3, 0));
+    ps_write32(b, kNopCode + 4, as::blr());
+    ps_write32(b, kNopOpd, kNopCode);
+    ps_write32(b, kNopOpd + 4, 0x00123400);
+}
+
+// The milliseconds since 1970 now, as sceNpDrmGetTimelimit reads the clock.
+s64 now_ms()
+{
+    s64 sec = 0, nsec = 0;
+    lv2::host_current_time(sec, nsec);
+    return sec * 1000 + nsec / 1'000'000;
+}
+
+// An EDAT's start whose NPD header has this validity window.
+std::vector<u8> npd_window(s64 activate, s64 expire)
+{
+    std::vector<u8> v = npd_file(2, "UP0001-BLES01807_00-PSPOCKETTEST0001", 0);
+    ps_write64(v.data(), 0x70, static_cast<u64>(activate));
+    ps_write64(v.data(), 0x78, static_cast<u64>(expire));
+    return v;
+}
+
+// A SELF's headers: the extended header's supplemental headers at 0x100 (a type 1 one of 0x30 bytes, then, when
+// `npdrm`, a type 3 one holding an NPD header with this expiry), and `key_revision`.
+std::vector<u8> self_with_npd(bool npdrm, s64 expire, u16 key_revision = 0)
+{
+    std::vector<u8> v(0x400, 0);
+    std::memcpy(v.data(), "SCE", 4);
+    ps_write16(v.data(), 8, key_revision);
+    ps_write64(v.data(), 0x58, 0x100);
+    ps_write64(v.data(), 0x60, npdrm ? 0x30 + 0x90 : 0x30);
+    ps_write32(v.data(), 0x100, 1);
+    ps_write32(v.data(), 0x104, 0x30);
+    if (npdrm) {
+        ps_write32(v.data(), 0x130, 3);
+        ps_write32(v.data(), 0x134, 0x90);
+        std::memcpy(v.data() + 0x140, "NPD", 4);
+        ps_write64(v.data(), 0x140 + 0x78, static_cast<u64>(expire));
+    }
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("sceNpBasic offline: lists not found, presence not connected, friends busy, players' history; RPCS3's checks",
+    "[hle][np]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kComm = kData + 0x100, kNpId = kData + 0x200, kOut = kData + 0x300, kText = kData + 0x400,
+                  kPres = kData + 0x800, kBody = kData + 0xC00, kAttach = kData + 0xD00;
+    write_nop(b);
+    put_comm_id(b, kComm, "NPWR01234", 0);
+    put_np_id(b, kNpId, "friend");
+    std::memset(b + kOut, 0xAA, 0x40);
+    const auto out_untouched = [&] { return ps_read32(b, kOut) == 0xAAAAAAAAu; };
+
+    // Without NP. The friend presence functions check the details pointer first, the message entry its type.
+    CHECK(g.call("sceNpBasicRegisterHandler", kComm, kNopOpd, 0) == kBasicNotInit);
+    CHECK(g.call("sceNpBasicGetClanMessageEntryCount", kOut) == kBasicNotInit);
+    CHECK(g.call("sceNpBasicGetFriendListEntry", 0, kOut) == kBasicNotInit);
+    CHECK(g.call("sceNpBasicGetFriendPresenceByIndex", 0, kOut, 0, 0) == kBasicInval);
+    CHECK(g.call("sceNpBasicGetFriendPresenceByNpId2", kNpId, kOut, 0) == kBasicNotInit);
+    CHECK(g.call("sceNpBasicGetMessageEntry", 8, 0, kOut) == kBasicInval);
+    CHECK(g.call("sceNpBasicGetMessageEntry", 7, 0, kOut) == kBasicNotInit);
+    CHECK(g.call("sceNpBasicAddPlayersHistory", kNpId, 0) == kBasicNotInit);
+    CHECK(g.call("sceNpBasicGetPlayersHistoryEntryCount", 2, kOut) == kBasicInval);
+    CHECK(g.call("sceNpBasicGetPlayersHistoryEntryCount", 1, kOut) == kBasicNotInit);
+    np_up(g);
+
+    // Before a handler: those that need one refuse; the friend list and messages don't need one.
+    for (const char* name : {"sceNpBasicGetClanMessageEntryCount", "sceNpBasicGetCustomInvitationEntryCount",
+             "sceNpBasicGetMatchingInvitationEntryCount", "sceNpBasicGetMessageAttachmentEntryCount"}) {
+        INFO(name);
+        CHECK(g.call(name, kOut) == kBasicNotRegistered);
+    }
+    CHECK(g.call("sceNpBasicAbortGui") == kBasicNotRegistered);
+    CHECK(g.call("sceNpBasicMarkMessageAsUsed", 1) == kBasicNotRegistered);
+    CHECK(g.call("sceNpBasicRecvMessageAttachment", 0) == kBasicNotRegistered);
+    CHECK(g.call("sceNpBasicGetPlayersHistoryEntry", 0, 0, kOut) == kBasicNotRegistered);
+    CHECK(g.call("sceNpBasicGetFriendListEntryCount", kOut) == kIdNotFound);
+    CHECK(g.call("sceNpBasicGetMessageEntry", 0, 0, kOut) == kIdNotFound);
+    // A player for the history needs no handler; it isn't kept (only listed online).
+    CHECK(g.call("sceNpBasicAddPlayersHistory", 0, 0) == kBasicInval);
+    put_np_id(b, kNpId, "");
+    CHECK(g.call("sceNpBasicAddPlayersHistory", kNpId, 0) == kBasicInval);
+    put_np_id(b, kNpId, "friend");
+    CHECK(g.call("sceNpBasicAddPlayersHistory", kUnmapped, 0) == kBasicInval); // RPCS3 faults
+    put(b, kText, std::string(342, 'd'));
+    CHECK(g.call("sceNpBasicAddPlayersHistory", kNpId, kText) == kBasicExceeds);
+    put(b, kText, std::string(341, 'd'));
+    CHECK(g.call("sceNpBasicAddPlayersHistory", kNpId, kText) == 0);
+    CHECK(g.call("sceNpBasicAddPlayersHistory", kNpId, 0) == 0);
+
+    // One handler, from either registration function.
+    REQUIRE(g.call("sceNpBasicRegisterHandler", kComm, kNopOpd, 0x1234) == 0);
+    CHECK(g.call("sceNpBasicRegisterHandler", kComm, kNopOpd, 0) == kBasicExceeds);
+    CHECK(g.call("sceNpBasicRegisterContextSensitiveHandler", kComm, kNopOpd, 0) == kBasicExceeds);
+
+    // The lists from PSN: a pointer is needed, then nothing is found offline and nothing is written.
+    for (const char* name : {"sceNpBasicGetClanMessageEntryCount", "sceNpBasicGetCustomInvitationEntryCount",
+             "sceNpBasicGetMatchingInvitationEntryCount", "sceNpBasicGetMessageAttachmentEntryCount",
+             "sceNpBasicGetFriendListEntryCount"}) {
+        INFO(name);
+        CHECK(g.call(name, 0) == kBasicInval);
+        CHECK(g.call(name, kOut) == kIdNotFound);
+    }
+    for (const char* name : {"sceNpBasicGetClanMessageEntry", "sceNpBasicGetCustomInvitationEntry",
+             "sceNpBasicGetMatchingInvitationEntry", "sceNpBasicGetMessageAttachmentEntry"}) {
+        INFO(name);
+        CHECK(g.call(name, 0, 0) == kBasicInval);
+        CHECK(g.call(name, 3, kOut) == kIdNotFound);
+    }
+    CHECK(g.call("sceNpBasicGetMessageEntry", 1, 0, 0) == kBasicInval);
+    CHECK(g.call("sceNpBasicGetMessageEntry", 1, 0, kOut) == kIdNotFound);
+    for (const u32 options : {0u, 1u}) {
+        CHECK(g.call("sceNpBasicGetPlayersHistoryEntryCount", options, 0) == kBasicInval);
+        CHECK(g.call("sceNpBasicGetPlayersHistoryEntryCount", options, kOut) == kIdNotFound);
+        CHECK(g.call("sceNpBasicGetPlayersHistoryEntry", options, 0, kOut) == kIdNotFound);
+    }
+    CHECK(g.call("sceNpBasicGetPlayersHistoryEntry", 2, 0, kOut) == kBasicInval);
+    CHECK(g.call("sceNpBasicGetFriendListEntry", 0, 0) == kBasicInval);
+    CHECK(g.call("sceNpBasicGetFriendListEntry", 0, kOut) == kBasicBusy);
+    CHECK(out_untouched());
+
+    // Friends' presence comes from RPCN: not connected.
+    for (const char* name : {"sceNpBasicGetFriendPresenceByIndex", "sceNpBasicGetFriendPresenceByIndex2"}) {
+        INFO(name);
+        CHECK(g.call(name, 0, kOut, 0, 0) == kBasicInval);
+        CHECK(g.call(name, 0, 0, kPres, 0) == kBasicInval);
+        CHECK(g.call(name, 0, kOut, kPres, 0) == kBasicNotConnected);
+    }
+    for (const char* name : {"sceNpBasicGetFriendPresenceByNpId", "sceNpBasicGetFriendPresenceByNpId2"}) {
+        INFO(name);
+        CHECK(g.call(name, 0, kPres, 0) == kBasicInval);
+        CHECK(g.call(name, kNpId, kPres, 3) == kBasicNotConnected);
+    }
+
+    // The block list is PSN's: an NP ID with an online ID, then not connected.
+    CHECK(g.call("sceNpBasicAddBlockListEntry", 0) == kBasicInval);
+    CHECK(g.call("sceNpBasicAddBlockListEntry", kUnmapped) == kBasicInval); // RPCS3 faults
+    put_np_id(b, kNpId, "");
+    CHECK(g.call("sceNpBasicAddBlockListEntry", kNpId) == kBasicInval);
+    put_np_id(b, kNpId, "friend");
+    CHECK(g.call("sceNpBasicAddBlockListEntry", kNpId) == kBasicNotConnected);
+
+    // Presence details (the older struct): the options, then the data's size (at most 128).
+    std::memset(b + kPres, 0, 392);
+    put(b, kPres + 128, "Racing");
+    CHECK(g.call("sceNpBasicSetPresenceDetails", kPres, 0) == kBasicInval);
+    CHECK(g.call("sceNpBasicSetPresenceDetails", kPres, 4) == kBasicInval);
+    CHECK(g.call("sceNpBasicSetPresenceDetails", kUnmapped, 3) == kBasicInval); // RPCS3 ensure()s
+    ps_write32(b, kPres + 384, 129);
+    CHECK(g.call("sceNpBasicSetPresenceDetails", kPres, 1) == kBasicExceeds);
+    ps_write32(b, kPres + 384, 128);
+    CHECK(g.call("sceNpBasicSetPresenceDetails", kPres, 3) == 0);
+    CHECK(g.call("sceNpBasicSetPresenceDetails", kPres, 2) == 0);
+
+    // Nothing to abort or mark; the attachments to receive: none (cancelled); one to send: not connected.
+    CHECK(g.call("sceNpBasicAbortGui") == 0);
+    CHECK(g.call("sceNpBasicMarkMessageAsUsed", 0x123456789ull) == 0);
+    CHECK(g.call("sceNpBasicRecvMessageAttachment", 0x1234) == kBasicCancel);
+    put(b, kText, "Subject");
+    put(b, kBody, "A body");
+    std::memset(b + kAttach, 7, 16);
+    CHECK(g.call("sceNpBasicSendMessageAttachment", kNpId, kText, kBody, kAttach, 16, 0) == kBasicNotConnected);
+    CHECK(g.call("sceNpBasicSendMessageAttachment", kNpId, kText, kBody, 0, 16, 0) == kBasicInval); // no data
+    CHECK(g.call("sceNpBasicSendMessageAttachment", kNpId, kText, kBody, kAttach, 0, 0) == kBasicInval);
+    CHECK(g.call("sceNpBasicSendMessageAttachment", kNpId, kText, kBody, kAttach, 1048577, 0) == kBasicExceeds);
+
+    // Unregistered again: the checks that want a handler refuse.
+    REQUIRE(g.call("sceNpBasicUnregisterHandler") == 0);
+    CHECK(g.call("sceNpBasicAbortGui") == kBasicNotRegistered);
+    CHECK(g.call("sceNpBasicGetClanMessageEntry", 0, kOut) == kBasicNotRegistered);
+}
+
+TEST_CASE("sceNpManager offline: the user's IDs and languages, tickets; cached info, sign-in ID, sub sign-in",
+    "[hle][np]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kOut = kData + 0x100, kNpId = kData + 0x400, kService = kData + 0x500;
+    const char* const queries[] = {"sceNpManagerGetOnlineId", "sceNpManagerGetPsHandle", "sceNpManagerGetOnlineName",
+        "sceNpManagerGetAvatarUrl", "sceNpManagerGetMyLanguages"};
+    for (const char* name : queries) CHECK(g.call(name, kOut) == kNotInit);
+    CHECK(g.call("sceNpManagerGetCachedInfo", 0, kOut) == kNotInit);
+    CHECK(g.call("sceNpManagerGetSigninId", kOut) == kNotInit);
+    CHECK(g.call("sceNpManagerSubSignin", 1, 0, 0, 0) == kNotInit);
+    CHECK(g.call("sceNpManagerSubSigninAbortGui") == kNotInit);
+    CHECK(g.call("sceNpManagerSubSignout", 0) == kNotInit);
+    np_up(g);
+
+    // The signed-in user's details: offline, and nothing written.
+    std::memset(b + kOut, 0xAA, 0x200);
+    for (const char* name : queries) {
+        INFO(name);
+        CHECK(g.call(name, 0) == kInval);
+        CHECK(g.call(name, kOut) == kOffline);
+    }
+    CHECK(ps_read32(b, kOut) == 0xAAAAAAAAu);
+
+    // A ticket (version 2.1): RPCS3's checks, then offline.
+    put_np_id(b, kNpId, "");
+    put(b, kService, "IV0001-NPXS00001_00");
+    CHECK(g.call("sceNpManagerRequestTicket", 0, kService, 0, 0, 0, 0) == kAuthInval);
+    CHECK(g.call("sceNpManagerRequestTicket", kNpId, 0, 0, 0, 0, 0) == kAuthInval);
+    CHECK(g.call("sceNpManagerRequestTicket", kNpId, kService, 0, 1025, 0, 0) == kAuthInval);
+    CHECK(g.call("sceNpManagerRequestTicket", kNpId, kService, 0, 1024, 0, 0) == kOffline);
+
+    // The cached account details: the current user (0) or user 1, with every field empty; others don't exist.
+    CHECK(g.call("sceNpManagerGetCachedInfo", 0, 0) == kInval);
+    CHECK(g.call("sceNpManagerGetCachedInfo", 2, kOut) == r3_of(lv2::CELL_ENOENT));
+    CHECK(g.call("sceNpManagerGetCachedInfo", 0, kUnmapped) == kInval); // RPCS3 faults
+    for (const u32 user : {0u, 1u}) {
+        std::memset(b + kOut, 0xAA, 0x200);
+        REQUIRE(g.call("sceNpManagerGetCachedInfo", user, kOut) == 0);
+        CHECK(ps_read32(b, kOut) == 240);
+        CHECK(std::all_of(b + kOut + 4, b + kOut + 240, [](u8 x) { return x == 0; }));
+        CHECK(b[kOut + 240] == 0xAA);
+    }
+
+    // The sign-in ID: 64 zero bytes.
+    CHECK(g.call("sceNpManagerGetSigninId", 0) == kInval);
+    std::memset(b + kOut, 0xAA, 0x200);
+    REQUIRE(g.call("sceNpManagerGetSigninId", kOut) == 0);
+    CHECK(std::all_of(b + kOut, b + kOut + 64, [](u8 x) { return x == 0; }));
+    CHECK(b[kOut + 64] == 0xAA);
+
+    // Sub sign-in: RPCS3's TODOs answer CELL_OK.
+    CHECK(g.call("sceNpManagerSubSignin", 1, 0x1000, 0, 0) == 0);
+    CHECK(g.call("sceNpManagerSubSigninAbortGui") == 0);
+    CHECK(g.call("sceNpManagerSubSignout", kNpId) == 0);
+}
+
+TEST_CASE("sceNpFriendlist and the custom menu: RPCS3's checks; the user's NP ID isn't there offline", "[hle][np]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kMenu = kData + 0x100, kActions = kData + 0x200, kNames = kData + 0x400, kArray = kData + 0x800,
+                  kExceptions = kData + 0x1000;
+    write_nop(b);
+    CHECK(g.call("sceNpFriendlist", kNopOpd, 0, 0) == kFriendlistNotInit);
+    CHECK(g.call("sceNpFriendlistCustom", 0, kNopOpd, 0, 0) == kFriendlistNotInit);
+    CHECK(g.call("sceNpFriendlistAbortGui") == kFriendlistNotInit);
+    CHECK(g.call("sceNpProfileAbortGui") == kFriendlistNotInit); // RPCS3: the friend list's error
+    CHECK(g.call("sceNpCustomMenuRegisterActions", kMenu, kNopOpd, 0, 0) == kMenuNotInit);
+    CHECK(g.call("sceNpCustomMenuActionSetActivation", kArray, 0) == kMenuNotInit);
+    CHECK(g.call("sceNpCustomMenuRegisterExceptionList", kExceptions, 1, 0) == kMenuNotInit);
+    np_up(g);
+
+    // The friend list dialog: a handler, then the user's NP ID, which isn't there offline.
+    CHECK(g.call("sceNpFriendlist", 0, 0, 0) == kFriendlistInval);
+    CHECK(g.call("sceNpFriendlist", kNopOpd, 0, 0) == kOffline);
+    CHECK(g.call("sceNpFriendlistCustom", 1, 0, 0, 0) == kFriendlistInval);
+    CHECK(g.call("sceNpFriendlistCustom", 1, kNopOpd, 0, 0) == kOffline);
+    CHECK(g.call("sceNpFriendlistAbortGui") == 0);
+    CHECK(g.call("sceNpProfileAbortGui") == 0);
+
+    // The custom menu: nothing before its actions are registered.
+    CHECK(g.call("sceNpCustomMenuActionSetActivation", kArray, 0) == kMenuNotRegistered);
+    CHECK(g.call("sceNpCustomMenuRegisterExceptionList", kExceptions, 1, 0) == kMenuNotRegistered);
+    // A menu of two actions: names of at most 20 characters, at most 16 actions.
+    const auto put_menu = [&](u32 actions, u32 count) {
+        std::memset(b + kMenu, 0, 16);
+        ps_write32(b, kMenu + 8, actions);
+        ps_write32(b, kMenu + 12, count);
+    };
+    const auto put_action = [&](u32 i, u32 name, u32 mask) {
+        ps_write32(b, kActions + 12 * i, 0);
+        ps_write32(b, kActions + 12 * i + 4, name);
+        ps_write32(b, kActions + 12 * i + 8, mask);
+    };
+    put(b, kNames, "Invite");
+    put(b, kNames + 0x40, std::string(20, 'n'));
+    put_action(0, kNames, 2);
+    put_action(1, kNames + 0x40, 7);
+    CHECK(g.call("sceNpCustomMenuRegisterActions", 0, kNopOpd, 0, 0) == kMenuInval);
+    put_menu(kActions, 2);
+    CHECK(g.call("sceNpCustomMenuRegisterActions", kMenu, 0, 0, 0) == kMenuInval);
+    CHECK(g.call("sceNpCustomMenuRegisterActions", kUnmapped, kNopOpd, 0, 0) == kMenuInval); // RPCS3 faults
+    put_menu(kActions, 17);
+    CHECK(g.call("sceNpCustomMenuRegisterActions", kMenu, kNopOpd, 0, 0) == kMenuExceeds);
+    put_menu(0, 2);
+    CHECK(g.call("sceNpCustomMenuRegisterActions", kMenu, kNopOpd, 0, 0) == kMenuInval);
+    put_menu(kActions, 2);
+    put_action(1, 0, 7);
+    CHECK(g.call("sceNpCustomMenuRegisterActions", kMenu, kNopOpd, 0, 0) == kMenuInval);
+    put(b, kNames + 0x80, std::string(21, 'n'));
+    put_action(1, kNames + 0x80, 7);
+    CHECK(g.call("sceNpCustomMenuRegisterActions", kMenu, kNopOpd, 0, 0) == kMenuExceeds);
+    CHECK(g.call("sceNpCustomMenuActionSetActivation", kArray, 0) == kMenuNotRegistered); // nothing registered yet
+    put_action(1, kNames + 0x40, 7);
+    REQUIRE(g.call("sceNpCustomMenuRegisterActions", kMenu, kNopOpd, 0x55, 0) == 0);
+    put_menu(0, 0); // no actions at all is a menu too
+    CHECK(g.call("sceNpCustomMenuRegisterActions", kMenu, kNopOpd, 0, 0) == 0);
+
+    // Which actions are active, and the exceptions (at most 256).
+    CHECK(g.call("sceNpCustomMenuActionSetActivation", 0, 0) == kMenuInval);
+    CHECK(g.call("sceNpCustomMenuActionSetActivation", kUnmapped, 0) == kMenuInval); // RPCS3 faults
+    std::memset(b + kArray, 0xFF, 16);
+    CHECK(g.call("sceNpCustomMenuActionSetActivation", kArray, 0) == 0);
+    CHECK(g.call("sceNpCustomMenuRegisterExceptionList", kExceptions, 257, 0) == kMenuExceeds);
+    CHECK(g.call("sceNpCustomMenuRegisterExceptionList", 0, 1, 0) == kMenuInval);
+    CHECK(g.call("sceNpCustomMenuRegisterExceptionList", 0, 0, 0) == kMenuInval);
+    CHECK(g.call("sceNpCustomMenuRegisterExceptionList", kExceptions, 256, 0) == 0);
+    CHECK(g.call("sceNpCustomMenuRegisterExceptionList", kExceptions, 0, 0) == 0);
+}
+
+TEST_CASE("sceNpUtil: online IDs compared, NP IDs ordered, platform types", "[hle][np]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kId1 = kData + 0x100, kId2 = kData + 0x200, kOrder = kData + 0x300;
+    // NP need not be up.
+    put_np_id(b, kId1, "alice");
+    put_np_id(b, kId2, "alice");
+    b[kId2 + 20] = 9; // another opt word: still the same online ID
+    CHECK(g.call("sceNpUtilCmpOnlineId", 0, kId2) == kUtilInval);
+    CHECK(g.call("sceNpUtilCmpOnlineId", kId1, kId2) == 0);
+    put_np_id(b, kId2, "bob");
+    CHECK(g.call("sceNpUtilCmpOnlineId", kId1, kId2) == kUtilNotMatch);
+
+    // The order: online IDs, then the first opt word, then the platforms.
+    const auto order = [&](u32 a, u32 c) {
+        ps_write32(b, kOrder, 0x55555555);
+        REQUIRE(g.call("sceNpUtilCmpNpIdInOrder", a, c, kOrder) == 0);
+        return static_cast<s32>(ps_read32(b, kOrder));
+    };
+    CHECK(g.call("sceNpUtilCmpNpIdInOrder", kId1, 0, kOrder) == kUtilInval);
+    CHECK(order(kId1, kId2) == -1);
+    CHECK(order(kId2, kId1) == 1);
+    put_np_id(b, kId2, "alice");
+    CHECK(order(kId1, kId2) == 0);
+    b[kId1 + 23] = 1; // the first opt word
+    CHECK(order(kId1, kId2) == 1);
+    b[kId1 + 23] = 0;
+    std::memcpy(b + kId1 + 24, "ps3", 4); // one platform: against "ps3"
+    CHECK(order(kId1, kId2) == 0);
+    std::memcpy(b + kId1 + 24, "ps4", 4);
+    CHECK(order(kId1, kId2) == 1);
+    CHECK(order(kId2, kId1) == 1);
+    std::memcpy(b + kId2 + 24, "psp2", 4); // both: compared to each other
+    CHECK(order(kId1, kId2) == -1);
+    CHECK(order(kId2, kId1) == 1);
+
+    // Canonicalizing changes nothing (RPCS3 keeps its checks commented out).
+    CHECK(g.call("sceNpUtilCanonicalizeNpIdForPs3", 0) == kUtilInval);
+    CHECK(g.call("sceNpUtilCanonicalizeNpIdForPsp", 0) == kUtilInval);
+    CHECK(g.call("sceNpUtilCanonicalizeNpIdForPs3", kId1) == 0);
+    CHECK(g.call("sceNpUtilCanonicalizeNpIdForPsp", kId1) == 0);
+    CHECK(std::memcmp(b + kId1 + 24, "ps4", 4) == 0);
+
+    // Platform types: the word at +24.
+    CHECK(g.call("sceNpUtilGetPlatformType", 0) == kUtilInval);
+    CHECK(g.call("sceNpUtilSetPlatformType", 0, 1) == kUtilInval);
+    CHECK(g.call("sceNpUtilGetPlatformType", kId1) == 3);
+    CHECK(g.call("sceNpUtilGetPlatformType", kId2) == 2);
+    REQUIRE(g.call("sceNpUtilSetPlatformType", kId1, 1) == 0);
+    CHECK(std::memcmp(b + kId1 + 24, "ps3", 4) == 0);
+    CHECK(g.call("sceNpUtilGetPlatformType", kId1) == 1);
+    CHECK(g.call("sceNpUtilSetPlatformType", kId1, 4) == kUtilUnknownPlatform);
+    REQUIRE(g.call("sceNpUtilSetPlatformType", kId1, 0) == 0);
+    CHECK(ps_read32(b, kId1 + 24) == 0);
+    CHECK(g.call("sceNpUtilGetPlatformType", kId1) == 0);
+    std::memcpy(b + kId1 + 24, "abcd", 4);
+    CHECK(g.call("sceNpUtilGetPlatformType", kId1) == kUtilUnknownPlatform);
+}
+
+TEST_CASE("sceNpDrm: time limits from EDAT and SELF headers, exitspawn's check, upgrade licences", "[hle][np]")
+{
+    DrmDirs dirs;
+    const fsys::path usrdir = dirs.hdd0 / "game" / "BLES01807" / "USRDIR";
+    const s64 now = now_ms();
+    DrmDirs::write(usrdir / "endless.edat", npd_window(0, 0));
+    DrmDirs::write(usrdir / "started.edat", npd_window(now - 60'000, now + 3'600'000));
+    DrmDirs::write(usrdir / "expired.edat", npd_window(0, now - 1000));
+    DrmDirs::write(usrdir / "future.edat", npd_window(now + 3'600'000, 0));
+    DrmDirs::write(usrdir / "rental.self", self_with_npd(true, now + 7'200'000));
+    DrmDirs::write(usrdir / "plain.self", self_with_npd(false, 0));
+    DrmDirs::write(usrdir / "debug.self", self_with_npd(true, 0, 0x8000));
+    DrmDirs::write(usrdir / "plain.dat", {1, 2, 3, 4});
+    const std::string id = "UP0001-BLES01807_00-PSPOCKETTEST0001";
+    DrmDirs::write(dirs.hdd0 / "home" / "00000001" / "exdata" / (id + ".edat"), npd_file(3, id, 0));
+
+    Fixture f;
+    dirs.mount(f);
+    GuestThread g(f, 0, "drm");
+    u8* b = f.base();
+    constexpr u32 kPath = kData + 0x1000, kRemain = kData + 0x100;
+    const std::string game = "/dev_hdd0/game/BLES01807/USRDIR/";
+    const auto limit = [&](const std::string& name) {
+        put(b, kPath, game + name);
+        ps_write64(b, kRemain, 0x5555);
+        return g.call("sceNpDrmGetTimelimit", kPath, kRemain);
+    };
+
+    // The arguments, then the file.
+    put(b, kPath, game + "endless.edat");
+    CHECK(g.call("sceNpDrmGetTimelimit", 0, kRemain) == kDrmInvalParam);
+    CHECK(g.call("sceNpDrmGetTimelimit", kPath, 0) == kDrmInvalParam);
+    CHECK(g.call("sceNpDrmGetTimelimit", kUnmapped, kRemain) == kDrmInvalParam); // RPCS3 aborts
+    CHECK(g.call("sceNpDrmGetTimelimit", kPath, kUnmapped) == kDrmInvalParam);
+    CHECK(limit("missing.edat") == r3_of(lv2::CELL_ENOENT));
+    CHECK(limit("plain.dat") == kDrmBadFormat);
+
+    // An EDAT's window.
+    REQUIRE(limit("endless.edat") == 0);
+    CHECK(ps_read64(b, kRemain) == 0x7FFFFFFFFFFFFFFFull);
+    REQUIRE(limit("started.edat") == 0);
+    CHECK(ps_read64(b, kRemain) <= 3'600'000'000ull);
+    CHECK(ps_read64(b, kRemain) > 3'500'000'000ull);
+    CHECK(limit("expired.edat") == kDrmTimeLimit);
+    CHECK(limit("future.edat") == kDrmNotStarted);
+    CHECK(ps_read64(b, kRemain) == 0x5555); // nothing written on an error
+
+    // A SELF's, from its NPDRM supplemental header; without one (or a debug SELF), a bad format.
+    REQUIRE(limit("rental.self") == 0);
+    CHECK(ps_read64(b, kRemain) <= 7'200'000'000ull);
+    CHECK(ps_read64(b, kRemain) > 7'100'000'000ull);
+    CHECK(limit("plain.self") == kDrmBadFormat);
+    CHECK(limit("debug.self") == kDrmBadFormat);
+
+    // Exitspawn checks the content first; a failed check is the result and the game goes on.
+    put(b, kPath, game + "missing.self");
+    CHECK(g.call("sceNpDrmProcessExitSpawn", 0, kPath, 0, 0, 0, 0, 1001, 0) == r3_of(lv2::CELL_ENOENT));
+    CHECK(g.call("sceNpDrmProcessExitSpawn2", 0, kPath, 0, 0, 0, 0, 1001, 0) == r3_of(lv2::CELL_ENOENT));
+    CHECK(g.call("sceNpDrmProcessExitSpawn", 0, 0, 0, 0, 0, 0, 1001, 0) == kDrmInvalParam);
+    put(b, kPath, game + "endless.edat");
+    CHECK(g.call("sceNpDrmProcessExitSpawn", 0, kPath, 0, 0, 0, 0, 1001, 0) == kDrmLicenseNotFound);
+
+    // The upgrade licence: the user's unlock EDAT, which can't be verified here.
+    const auto upgrade = [&](const char* name, std::string_view content_id) {
+        put(b, kPath, content_id);
+        return g.call(name, kPath);
+    };
+    for (const char* name : {"sceNpDrmVerifyUpgradeLicense", "sceNpDrmVerifyUpgradeLicense2"}) {
+        INFO(name);
+        CHECK(g.call(name, 0) == kDrmInvalParam);
+        CHECK(g.call(name, kUnmapped) == kDrmInvalParam); // RPCS3 aborts
+        CHECK(upgrade(name, "not/valid") == kDrmLicenseNotFound);
+        CHECK(upgrade(name, "UP0001-BLES01807_00-PSPOCKETTEST0002") == kDrmLicenseNotFound);
+        CHECK(upgrade(name, id) == kDrmLicenseNotFound);
+    }
+}
+
+TEST_CASE("sceNpTerm: NP down, its signaling contexts gone; their IDs go on", "[hle][np]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kNpId = kData + 0x100, kCtx = kData + 0x200;
+    CHECK(g.call("sceNpTerm") == kNotInit);
+    REQUIRE(g.call("sceNpInit", 0x20000, kPool) == 0);
+    put_np_id(b, kNpId, "");
+    REQUIRE(g.call("sceNpSignalingCreateCtx", kNpId, 0, 0, kCtx) == 0);
+    const u32 first = ps_read32(b, kCtx);
+    REQUIRE(g.call("sceNpTerm") == 0);
+    CHECK(g.call("sceNpTerm") == kNotInit);
+    CHECK(g.call("sceNpSignalingDestroyCtx", first) == kSigNotInit);
+    CHECK(g.call("sceNpManagerGetStatus", kCtx) == kNotInit);
+    REQUIRE(g.call("sceNpInit", 0x20000, kPool) == 0);
+    CHECK(g.call("sceNpSignalingDestroyCtx", first) == kSigCtxNotFound);
+    REQUIRE(g.call("sceNpSignalingCreateCtx", kNpId, 0, 0, kCtx) == 0);
+    CHECK(ps_read32(b, kCtx) == first + 1);
+    REQUIRE(g.call("sceNpTerm") == 0);
 }

@@ -26,6 +26,7 @@
 
 #include "guest.hpp"
 #include "idm.hpp"
+#include "prx.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
@@ -1332,6 +1333,18 @@ void sys_game_process_exitspawn2(PPUContext& ctx, u32 path, u32 argv, u32 envp, 
 }
 
 } // namespace
+
+void game_process_exitspawn(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,
+    u64 flags)
+{
+    sys_game_process_exitspawn(ctx, path, argv, envp, data, data_size, prio, flags);
+}
+
+void game_process_exitspawn2(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,
+    u64 flags)
+{
+    sys_game_process_exitspawn2(ctx, path, argv, envp, data, data_size, prio, flags);
+}
 
 void register_sysPrxForUser(Registry& r)
 {

@@ -78,6 +78,15 @@ std::string communication_id_text(PPUContext& ctx, u32 addr)
     return text;
 }
 
+// The room callbacks NP's term drops (np_handler::terminate_NP), with Np2State::mutex held.
+void drop_room_callbacks(Np2State& s)
+{
+    s.room_event_cb = s.room_event_cb_arg = 0;
+    s.room_event_cb_ctx = 0;
+    s.room_msg_cb = s.room_msg_cb_arg = 0;
+    s.room_msg_cb_ctx = 0;
+}
+
 // ------------------------------------------------------------------------------------------------- NP 2
 
 // RPCS3 sceNp2Init: NP (sceNpInit; already up is fine), then NP 2's own flag.
@@ -103,12 +112,7 @@ s32 sceNp2Term(PPUContext&)
     std::lock_guard lock(s.mutex);
     if (!s.np2_initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
     s.match2_initialized = false;
-    if (np_term() == lv2::CELL_OK) {
-        s.room_event_cb = s.room_event_cb_arg = 0;
-        s.room_event_cb_ctx = 0;
-        s.room_msg_cb = s.room_msg_cb_arg = 0;
-        s.room_msg_cb_ctx = 0;
-    }
+    if (np_term() == lv2::CELL_OK) drop_room_callbacks(s);
     s.np2_initialized = false;
     PS_LOG_INFO(kChan, "sceNp2Term(): NP down");
     return lv2::CELL_OK;
@@ -348,6 +352,15 @@ s32 sceNpMatching2ClearEventData(PPUContext&, u16 ctx_id, u32 event_key)
 }
 
 } // namespace
+
+void np2_on_np_term()
+{
+    Np2State& s = np2();
+    std::lock_guard lock(s.mutex);
+    drop_room_callbacks(s);
+}
+
+bool np_match2_initialized() { return match2_initialized(); }
 
 void register_sceNp2(Registry& r)
 {

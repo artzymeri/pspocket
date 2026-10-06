@@ -24,4 +24,13 @@ u32 np_init(u32 poolsize, u32 poolptr);
 // caller drops them when this succeeds.
 u32 np_term();
 
+// What NP's term drops in sceNp2.cpp: the matching 2 room callbacks (np_handler::terminate_NP). sceNpTerm calls it
+// after np_term succeeds (sceNp2Term drops them itself).
+void np2_on_np_term();
+
+// Whether matching 2 is initialized (RPCS3 np_handler::is_NP2_Match2_init): from sceNpMatching2Init2 until
+// sceNpMatching2Term2 or sceNp2Term. The older matching library refuses its calls meanwhile
+// (SCE_NP_MATCHING_ERROR_UTILITY_UNAVAILABLE).
+bool np_match2_initialized();
+
 } // namespace pspocket::hle

@@ -30,6 +30,7 @@
 
 #include "guest.hpp"
 #include "np.hpp"
+#include "prx.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
@@ -58,6 +59,7 @@ enum : u32 {
     SCE_NP_BASIC_ERROR_NO_EVENT = 0x8002A66A,
     SCE_NP_BASIC_ERROR_EXCEEDS_MAX = 0x8002A66B,
     SCE_NP_BASIC_ERROR_NOT_REGISTERED = 0x8002A66D,
+    SCE_NP_BASIC_ERROR_BUSY = 0x8002A66F,
     SCE_NP_BASIC_ERROR_CANCEL = 0x8002A671,
     SCE_NP_BASIC_ERROR_INVALID_DATA_ID = 0x8002A673,
     SCE_NP_BASIC_ERROR_NOT_CONNECTED = 0x8002A678,
@@ -78,11 +80,20 @@ enum : u32 {
     SCE_NP_UTIL_ERROR_INVALID_ARGUMENT = 0x8002AB01,
     SCE_NP_UTIL_ERROR_INVALID_CHARACTER = 0x8002AB0B,
     SCE_NP_UTIL_ERROR_NOT_MATCH = 0x8002AB0F,
+    SCE_NP_UTIL_ERROR_UNKNOWN_PLATFORM_TYPE = 0x8002AB10,
+    SCE_NP_FRIENDLIST_ERROR_NOT_INITIALIZED = 0x8002AB21,
+    SCE_NP_FRIENDLIST_ERROR_INVALID_ARGUMENT = 0x8002AB28,
+    SCE_NP_CUSTOM_MENU_ERROR_NOT_INITIALIZED = 0x80023B02,
+    SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT = 0x80023B09,
+    SCE_NP_CUSTOM_MENU_ERROR_NOT_REGISTERED = 0x80023B0B,
+    SCE_NP_CUSTOM_MENU_ERROR_EXCEEDS_MAX = 0x80023B0C,
     SCE_NP_PROFILE_ERROR_NOT_INITIALIZED = 0x8002AB41,
     SCE_NP_PROFILE_ERROR_INVALID_ARGUMENT = 0x8002AB48,
     SCE_NP_DRM_ERROR_INVALID_PARAM = 0x80029502,
     SCE_NP_DRM_ERROR_NO_ENTITLEMENT = 0x80029513,
     SCE_NP_DRM_ERROR_BAD_FORMAT = 0x80029515,
+    SCE_NP_DRM_ERROR_TIME_LIMIT = 0x8002951B,
+    SCE_NP_DRM_ERROR_SERVICE_NOT_STARTED = 0x8002951E,
     SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND = 0x80029521,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
@@ -97,6 +108,7 @@ constexpr u32 SCE_NP_BASIC_PRESENCE_OPTIONS_SET_DATA = 1, SCE_NP_BASIC_PRESENCE_
               SCE_NP_BASIC_PRESENCE_OPTIONS_ALL_OPTIONS = 3;
 constexpr u32 SCE_NP_BASIC_MESSAGE_INFO_TYPE_BOOTABLE_CUSTOM_DATA_MESSAGE = 7;
 constexpr u32 SCE_NP_BASIC_SELECTED_INVITATION_DATA = 1, SCE_NP_BASIC_SELECTED_MESSAGE_DATA = 2;
+constexpr u32 SCE_NP_BASIC_PLAYERS_HISTORY_OPTIONS_ALL = 1; // BY_NP_COMM_ID is 0
 // Messages (sceNpBasicSendMessage, sceNpBasicSendMessageGui, sceNpBasicAddFriend, sceNpBasicRecvMessageCustom).
 constexpr u32 SCE_NP_BASIC_MAX_MESSAGE_SIZE = 512, SCE_NP_BASIC_SEND_MESSAGE_MAX_RECIPIENTS = 12;
 constexpr u32 SCE_NP_BASIC_SUBJECT_CHARACTER_MAX = 18, SCE_NP_BASIC_BODY_CHARACTER_MAX = 512;
@@ -122,6 +134,17 @@ constexpr u32 kNpdHeaderSize = 0x80, kEdatHeaderSize = 0x10, kNpdLicense = 8, kN
 constexpr u32 SDAT_FLAG = 0x01000000;
 constexpr u32 kNpdLicenseFree = 3; // the klicensee alone opens it: no RAP licence needed
 constexpr u32 kDrmPathMax = 0x100; // RPCS3 reads at most this many characters of the path
+constexpr u64 SCE_NP_DRM_TIME_INFO_ENDLESS = 0x7FFFFFFFFFFFFFFFull;
+// NPD_HEADER's validity window (RPCS3 Crypto/unedat.h): be s64 activate_time and expire_time at 0x70 and 0x78, in
+// milliseconds since 1970 (0: no limit).
+constexpr u32 kNpdActivateTime = 0x70, kNpdExpireTime = 0x78;
+// A SELF's NPD header (RPCS3 Crypto/unself.cpp get_npdrm_self_header): the extended header at 0x20 gives the
+// supplemental headers' offset and size (u64s at 0x58 and 0x60); each is be32 type, be32 size, be64 next, then its
+// data, and type 3 holds the NPD header. A debug SELF (key revision 0x8000 or 0xC000) has none.
+constexpr u32 kSelfKeyRevision = 0x08, kSelfSupplementalOffset = 0x58, kSelfSupplementalSize = 0x60;
+constexpr u32 kSupplementalNpdrm = 3, kSupplementalHeader = 0x10;
+constexpr u32 kSelfHeadMax = 0x10000; // the SELF's first bytes read for its headers
+constexpr u32 kUpgradeContentIdMax = 0x2F; // npDrmVerifyUpgradeLicense reads at most this many characters
 constexpr u32 SCE_NP_LOOKUP_MAX_CTX_NUM = 32;
 constexpr u32 SCE_NP_SIGNALING_CTX_MAX = 8;
 constexpr u32 SCE_NP_SIGNALING_CONN_STATUS_INACTIVE = 0;
@@ -139,6 +162,26 @@ constexpr u32 kPresenceDetails2Size = 524, kPresence2Status = 136, kPresence2Sta
 // SceNpSignalingNetInfo (28 bytes): size, local_addr, mapped_addr, nat_status, upnp_status, npport_status, then the u16
 // npport at 24; SceNpSignalingNetInfoDeprecated (24 bytes) stops before npport.
 constexpr u32 kNetInfoSize = 28, kNetInfoDeprecatedSize = 24;
+// SceNpBasicPresenceDetails (392 bytes): title[128], status[64] at 128, comment[64], data[128], then the data's size at
+// 384 and the state.
+constexpr u32 kPresenceDetailsSize = 392, kPresenceStatus = 128, kPresenceStatusMax = 64, kPresenceDataSize = 384;
+// SceNpManagerCacheParam (240 bytes): be32 size; SceNpOnlineId (20), SceNpId (0x24), SceNpOnlineName (52) and
+// SceNpAvatarUrl (128), all empty offline.
+constexpr u32 kCacheParamSize = 240;
+constexpr u32 kSigninIdSize = 64;  // RPCS3: "signInId seems to be a 64 byte thing"
+constexpr u32 kNpIdOpt = 20;       // SceNpId's opt[8] (RPCS3 unk1[2]: be32 each); unk1[1], the platform, at 24
+constexpr u32 kNpIdPlatform = 24;
+constexpr u32 SCE_NP_PLATFORM_TYPE_NONE = 0, SCE_NP_PLATFORM_TYPE_PS3 = 1, SCE_NP_PLATFORM_TYPE_VITA = 2,
+              SCE_NP_PLATFORM_TYPE_PS4 = 3;
+constexpr u32 CELL_SYSUTIL_USERID_CURRENT = 0, kUserId = 1; // the one user, 00000001 (RPCS3 Emu.GetUsrId())
+// The custom menu (RPCS3 sceNp.h): SceNpCustomMenu {be64 options; actions; be32 numActions} (16 bytes);
+// SceNpCustomMenuAction {be32 options; name; be32 mask} (12); SceNpCustomMenuIndexArray (16: four be32 words);
+// SceNpCustomMenuActionExceptions {be32 options; SceNpId; SceNpCustomMenuIndexArray; reserved[4]} (60).
+constexpr u32 kCustomMenuSize = 16, kCustomMenuActions = 8, kCustomMenuNumActions = 12;
+constexpr u32 kCustomMenuActionSize = 12, kCustomMenuActionName = 4, kCustomMenuActionMask = 8;
+constexpr u32 kCustomMenuIndexArraySize = 16, kCustomMenuExceptionSize = 60;
+constexpr u32 SCE_NP_CUSTOM_MENU_ACTION_CHARACTER_MAX = 21, SCE_NP_CUSTOM_MENU_ACTION_ITEMS_TOTAL_MAX = 16,
+              SCE_NP_CUSTOM_MENU_EXCEPTION_ITEMS_MAX = 256;
 
 // The IDs of one kind of NP context, handed out as RPCS3's idm does (Emu/IdManager.cpp idm::allocate_id): Base,
 // Base + 1, ... in order until each has been used once, then the lowest free one; 0, idm's invalid ID, when all are in
@@ -203,6 +246,13 @@ struct NpState {
     IdTable<std::string, 0x3001, SCE_NP_LOOKUP_MAX_CTX_NUM> lookup_title_ctxs;
     // The signaling contexts (idm signaling_ctx, IDs 0x6001 on), cleared by NP term as in RPCS3 sceNpTerm.
     IdTable<SignalingCtx, 0x6001, SCE_NP_SIGNALING_CTX_MAX> signaling_ctxs;
+    // The custom menu (np_handler custom_menu_*), for the system's friend list and profile dialogs, which never open
+    // offline: kept as RPCS3 keeps it, never shown. NP term leaves it, as in RPCS3.
+    bool custom_menu_registered = false;
+    u32 custom_menu_handler = 0, custom_menu_arg = 0;
+    std::vector<std::pair<u32, std::string>> custom_menu_actions; // each action's mask and name
+    std::array<u8, kCustomMenuIndexArraySize> custom_menu_activation{};
+    u32 custom_menu_exceptions = 0;
 };
 
 NpState& np()
@@ -216,6 +266,14 @@ bool basic_registered(NpState& s)
 {
     std::lock_guard lock(s.mutex);
     return s.basic_handler_registered;
+}
+
+// The first checks of most basic functions: NP up, the basic handler registered.
+s32 basic_handler_check(NpState& s)
+{
+    if (!s.initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!basic_registered(s)) return error(SCE_NP_BASIC_ERROR_NOT_REGISTERED);
+    return lv2::CELL_OK;
 }
 
 bool lookup_initialized(NpState& s)
@@ -234,6 +292,17 @@ std::string guest_string(lv2::PpuThread& t, u32 addr, u32 max)
         out += c;
     }
     return out;
+}
+
+// The length of the NUL-terminated guest string at `addr` if it is under `max`, else `max`; nullopt when it runs into
+// memory that isn't guest memory first.
+std::optional<u32> guest_strnlen(lv2::PpuThread& t, u32 addr, u32 max)
+{
+    for (u32 i = 0; i < max; i++) {
+        if (!guest_readable(t, addr + i, 1)) return std::nullopt;
+        if (!ps_read8(t.kernel.base(), addr + i)) return i;
+    }
+    return max;
 }
 
 // A SceNpCommunicationId (data[9 + 1], num, dummy) written as RPCS3 does ("NPWR01234_00"), if it is a valid one
@@ -377,11 +446,234 @@ s32 sceNpManagerGetEntitlementById(PPUContext& ctx, u32 ent_id, u32 ent)
     return error(SCE_NP_ERROR_ID_NOT_FOUND);
 }
 
+// RPCS3 sceNpManagerGetOnlineId, GetPsHandle (the same), GetOnlineName, GetAvatarUrl and GetMyLanguages: the signed-in
+// user's; offline SCE_NP_ERROR_OFFLINE (returned as not an error), as manager_query_offline.
+s32 sceNpManagerGetOnlineId(PPUContext&, u32 online_id)
+{
+    return manager_query_offline("sceNpManagerGetOnlineId", {online_id});
+}
+
+s32 sceNpManagerGetPsHandle(PPUContext&, u32 online_id)
+{
+    return manager_query_offline("sceNpManagerGetPsHandle", {online_id});
+}
+
+s32 sceNpManagerGetOnlineName(PPUContext&, u32 online_name)
+{
+    return manager_query_offline("sceNpManagerGetOnlineName", {online_name});
+}
+
+s32 sceNpManagerGetAvatarUrl(PPUContext&, u32 avatar_url)
+{
+    return manager_query_offline("sceNpManagerGetAvatarUrl", {avatar_url});
+}
+
+s32 sceNpManagerGetMyLanguages(PPUContext&, u32 languages)
+{
+    return manager_query_offline("sceNpManagerGetMyLanguages", {languages});
+}
+
+// RPCS3 sceNpManagerRequestTicket: as sceNpManagerRequestTicket2 (ticket version 2.1), refused offline first.
+s32 sceNpManagerRequestTicket(PPUContext& ctx, u32 np_id, u32 service_id, u32 cookie, u32 cookie_size,
+    u32 entitlement_id, u32 consumed_count)
+{
+    if (!np().initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    if (!np_id || !service_id || cookie_size > SCE_NP_COOKIE_MAX_SIZE) return error(SCE_NP_AUTH_EINVALID_ARGUMENT);
+    PS_LOG_INFO(kChan, "sceNpManagerRequestTicket(npId {:#x}, service \"{}\", cookie {:#x} ({} bytes), entitlement "
+                       "{:#x}, consumed {}): offline, no ticket", np_id, guest_string(thread_of(ctx), service_id, 64),
+        cookie, cookie_size, entitlement_id, consumed_count);
+    return error(SCE_NP_ERROR_OFFLINE);
+}
+
+// RPCS3 sceNpManagerGetCachedInfo: what the system keeps of the user's PSN account (SceNpManagerCacheParam: its size,
+// then the online ID, NP ID, online name and avatar URL), for the current user or the user's ID (1). Offline, with
+// PSN disabled, RPCS3's np_handler has them all empty: the struct is written with its size and zeros. Any other user is
+// CELL_ENOENT. RPCS3 writes the struct unchecked: one that isn't guest memory is refused here with a log.
+s32 sceNpManagerGetCachedInfo(PPUContext& ctx, u32 user_id, u32 param)
+{
+    if (!np().initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    if (!param) return error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    if (user_id != CELL_SYSUTIL_USERID_CURRENT && user_id != kUserId) return lv2::CELL_ENOENT;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, param, kCacheParamSize)) {
+        log_call_site(ctx, base, std::format("sceNpManagerGetCachedInfo: the parameter {:#x} is not guest memory", param));
+        return error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    }
+    std::memset(base + param, 0, kCacheParamSize);
+    ps_write32(base, param, kCacheParamSize);
+    PS_LOG_DEBUG(kChan, "sceNpManagerGetCachedInfo(user {}): offline, every field empty", user_id);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpManagerGetSigninId: 64 zero bytes ("signInId seems to be a 64 byte thing"), signed in or not. RPCS3
+// writes them unchecked: memory that isn't guest memory is refused here with a log.
+s32 sceNpManagerGetSigninId(PPUContext& ctx, u32 signin_id)
+{
+    if (!np().initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    if (!signin_id) return error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_readable(t, signin_id, kSigninIdSize)) {
+        log_call_site(ctx, t.kernel.base(),
+            std::format("sceNpManagerGetSigninId: the sign-in ID {:#x} is not guest memory", signin_id));
+        return error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    }
+    std::memset(t.kernel.base() + signin_id, 0, kSigninIdSize);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpManagerSubSignin, sceNpManagerSubSigninAbortGui and sceNpManagerSubSignout: TODOs that need NP and do
+// nothing else (no second user signs in; the callback isn't called).
+s32 sceNpManagerSubSignin(PPUContext&, u32 user_id, u32 cb_func, u32 cb_arg, s32 flag)
+{
+    if (!np().initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    PS_LOG_WARN(kChan, "sceNpManagerSubSignin(user {}, callback {:#x}, arg {:#x}, flag {}): a TODO in RPCS3; nobody "
+                       "signs in and the callback isn't called", user_id, cb_func, cb_arg, flag);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpManagerSubSigninAbortGui(PPUContext&)
+{
+    if (!np().initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpManagerSubSignout(PPUContext&, u32 np_id)
+{
+    if (!np().initialized) return error(SCE_NP_ERROR_NOT_INITIALIZED);
+    PS_LOG_DEBUG(kChan, "sceNpManagerSubSignout({:#x}): nobody signed in", np_id);
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- friend list
+
+// RPCS3 sceNpFriendlist / sceNpFriendlistCustom: the system's friend list dialog (a TODO: no dialog, the handler isn't
+// called). After the checks RPCS3 asks for the user's NP ID (sceNpManagerGetNpId), which offline answers
+// SCE_NP_ERROR_OFFLINE, and returns that.
+s32 friendlist_offline(std::string_view name, u32 handler)
+{
+    if (!np().initialized) return error(SCE_NP_FRIENDLIST_ERROR_NOT_INITIALIZED);
+    if (!handler) return error(SCE_NP_FRIENDLIST_ERROR_INVALID_ARGUMENT); // RPCS3: "TODO: SCE_NP_FRIENDLIST_ERROR_BUSY"
+    PS_LOG_INFO(kChan, "{}(handler {:#x}): offline, the user's NP ID isn't available", name, handler);
+    return error(SCE_NP_ERROR_OFFLINE);
+}
+
+s32 sceNpFriendlist(PPUContext&, u32 handler, u32 user_arg, u32 container_id)
+{
+    PS_LOG_DEBUG(kChan, "sceNpFriendlist: arg {:#x}, container {:#x}", user_arg, container_id);
+    return friendlist_offline("sceNpFriendlist", handler);
+}
+
+s32 sceNpFriendlistCustom(PPUContext&, u32 options, u32 handler, u32 user_arg, u32 container_id)
+{
+    PS_LOG_DEBUG(kChan, "sceNpFriendlistCustom: options {:#x}, arg {:#x}, container {:#x}", options, user_arg,
+        container_id);
+    return friendlist_offline("sceNpFriendlistCustom", handler);
+}
+
+s32 sceNpFriendlistAbortGui(PPUContext&)
+{
+    if (!np().initialized) return error(SCE_NP_FRIENDLIST_ERROR_NOT_INITIALIZED);
+    return lv2::CELL_OK; // RPCS3: "TODO: abort friendlist GUI interaction"; none is open
+}
+
+// ------------------------------------------------------------------------------------------------- custom menu
+
+// RPCS3 sceNpCustomMenuRegisterActions: the game's actions for the custom menu of the friend list and profile
+// dialogs (at most 16, each with a name of at most 20 characters), the handler for the action picked, and a fresh
+// activation and exception list. The options aren't checked (RPCS3: "TODO: Is there any error if options is not 0 ?").
+// RPCS3 reads the menu, the actions and their names unchecked: ones that aren't guest memory are refused here with a
+// log.
+s32 sceNpCustomMenuRegisterActions(PPUContext& ctx, u32 menu, u32 handler, u32 user_arg, u64 options)
+{
+    NpState& s = np();
+    if (!s.initialized) return error(SCE_NP_CUSTOM_MENU_ERROR_NOT_INITIALIZED);
+    if (!menu || !handler) return error(SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const auto refuse = [&](std::string what) {
+        log_call_site(ctx, base, std::format("sceNpCustomMenuRegisterActions: {} is not guest memory", what));
+        return error(SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT);
+    };
+    if (!guest_readable(t, menu, kCustomMenuSize)) return refuse(std::format("the menu {:#x}", menu));
+    const u32 actions = ps_read32(base, menu + kCustomMenuActions);
+    const u32 count = ps_read32(base, menu + kCustomMenuNumActions);
+    if (count > SCE_NP_CUSTOM_MENU_ACTION_ITEMS_TOTAL_MAX) return error(SCE_NP_CUSTOM_MENU_ERROR_EXCEEDS_MAX);
+    std::vector<std::pair<u32, std::string>> kept;
+    for (u32 i = 0; i < count; i++) {
+        if (!actions) return error(SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT);
+        const u32 action = actions + i * kCustomMenuActionSize;
+        if (!guest_readable(t, action, kCustomMenuActionSize)) return refuse(std::format("action {} ({:#x})", i, action));
+        const u32 name = ps_read32(base, action + kCustomMenuActionName);
+        if (!name) return error(SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT);
+        const std::optional<u32> length = guest_strnlen(t, name, SCE_NP_CUSTOM_MENU_ACTION_CHARACTER_MAX);
+        if (!length) return refuse(std::format("action {}'s name ({:#x})", i, name));
+        if (*length == SCE_NP_CUSTOM_MENU_ACTION_CHARACTER_MAX) return error(SCE_NP_CUSTOM_MENU_ERROR_EXCEEDS_MAX);
+        kept.emplace_back(ps_read32(base, action + kCustomMenuActionMask),
+            std::string(reinterpret_cast<const char*>(base + name), *length));
+    }
+    std::string names;
+    for (const auto& [mask, name] : kept) names += std::format("{}\"{}\" (mask {:#x})", names.empty() ? "" : ", ", name, mask);
+    std::lock_guard lock(s.mutex);
+    s.custom_menu_handler = handler;
+    s.custom_menu_arg = user_arg;
+    s.custom_menu_actions = std::move(kept);
+    s.custom_menu_registered = true;
+    s.custom_menu_activation = {};
+    s.custom_menu_exceptions = 0;
+    PS_LOG_INFO(kChan, "sceNpCustomMenuRegisterActions(handler {:#x}, arg {:#x}, options {:#x}): [{}]; kept, though no "
+                       "dialog shows them offline", handler, user_arg, options, names);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpCustomMenuActionSetActivation: which actions are active (a SceNpCustomMenuIndexArray), once a menu is
+// registered. RPCS3 reads the array unchecked: one that isn't guest memory is refused here with a log.
+s32 sceNpCustomMenuActionSetActivation(PPUContext& ctx, u32 array, u64 options)
+{
+    NpState& s = np();
+    if (!s.initialized) return error(SCE_NP_CUSTOM_MENU_ERROR_NOT_INITIALIZED);
+    std::lock_guard lock(s.mutex);
+    if (!s.custom_menu_registered) return error(SCE_NP_CUSTOM_MENU_ERROR_NOT_REGISTERED);
+    if (!array) return error(SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT);
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_readable(t, array, kCustomMenuIndexArraySize)) {
+        log_call_site(ctx, t.kernel.base(),
+            std::format("sceNpCustomMenuActionSetActivation: the array {:#x} is not guest memory", array));
+        return error(SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT);
+    }
+    std::memcpy(s.custom_menu_activation.data(), t.kernel.base() + array, kCustomMenuIndexArraySize);
+    PS_LOG_DEBUG(kChan, "sceNpCustomMenuActionSetActivation(options {:#x})", options);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpCustomMenuRegisterExceptionList: the users for whom some actions are off (at most 256
+// SceNpCustomMenuActionExceptions), replacing the list. Kept here as a count: no dialog shows the menu.
+s32 sceNpCustomMenuRegisterExceptionList(PPUContext& ctx, u32 items, u32 count, u64 options)
+{
+    NpState& s = np();
+    if (!s.initialized) return error(SCE_NP_CUSTOM_MENU_ERROR_NOT_INITIALIZED);
+    std::lock_guard lock(s.mutex);
+    if (!s.custom_menu_registered) return error(SCE_NP_CUSTOM_MENU_ERROR_NOT_REGISTERED);
+    if (count > SCE_NP_CUSTOM_MENU_EXCEPTION_ITEMS_MAX) return error(SCE_NP_CUSTOM_MENU_ERROR_EXCEEDS_MAX);
+    if (!items) return error(SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT);
+    lv2::PpuThread& t = thread_of(ctx);
+    if (count && !guest_readable(t, items, count * kCustomMenuExceptionSize)) {
+        log_call_site(ctx, t.kernel.base(), std::format("sceNpCustomMenuRegisterExceptionList: the {} exceptions at "
+                                                        "{:#x} are not guest memory", count, items));
+        return error(SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT);
+    }
+    s.custom_menu_exceptions = count;
+    PS_LOG_DEBUG(kChan, "sceNpCustomMenuRegisterExceptionList({} exceptions, options {:#x})", count, options);
+    return lv2::CELL_OK;
+}
+
 // ------------------------------------------------------------------------------------------------- basic
 
-// RPCS3 sceNpBasicRegisterContextSensitiveHandler / sceNpBasicUnregisterHandler: one basic event handler, kept for
-// presence and messages from other users; offline none ever come, so it is never called.
-s32 sceNpBasicRegisterContextSensitiveHandler(PPUContext&, u32 context, u32 handler, u32 arg)
+// RPCS3 sceNpBasicRegisterHandler, sceNpBasicRegisterContextSensitiveHandler (np_handler::register_basic_handler,
+// context sensitive or not) and sceNpBasicUnregisterHandler: one basic event handler, kept for presence and messages
+// from other users; offline none ever come, so it is never called. The communication ID RPCS3 keeps with it is used
+// only online (the players' history and presence).
+s32 register_basic_handler(std::string_view name, u32 context, u32 handler, u32 arg)
 {
     NpState& s = np();
     if (!s.initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
@@ -391,9 +683,19 @@ s32 sceNpBasicRegisterContextSensitiveHandler(PPUContext&, u32 context, u32 hand
     s.basic_handler_registered = true;
     s.basic_handler = handler;
     s.basic_handler_arg = arg;
-    PS_LOG_INFO(kChan, "sceNpBasicRegisterContextSensitiveHandler(context {:#x}, handler {:#x}, arg {:#x}): kept; offline, "
-                       "it is never called", context, handler, arg);
+    PS_LOG_INFO(kChan, "{}(context {:#x}, handler {:#x}, arg {:#x}): kept; offline, it is never called", name, context,
+        handler, arg);
     return lv2::CELL_OK;
+}
+
+s32 sceNpBasicRegisterHandler(PPUContext&, u32 context, u32 handler, u32 arg)
+{
+    return register_basic_handler("sceNpBasicRegisterHandler", context, handler, arg);
+}
+
+s32 sceNpBasicRegisterContextSensitiveHandler(PPUContext&, u32 context, u32 handler, u32 arg)
+{
+    return register_basic_handler("sceNpBasicRegisterContextSensitiveHandler", context, handler, arg);
 }
 
 s32 sceNpBasicUnregisterHandler(PPUContext&)
@@ -507,15 +809,199 @@ s32 sceNpBasicRecvMessageAttachmentLoad(PPUContext&, u32 id, u32 buffer, u32 siz
     return error(SCE_NP_BASIC_ERROR_INVALID_DATA_ID);
 }
 
-// ------------------------------------------------------------------------------------------------- basic: messages
-
-// The first checks of the message functions: NP up, the basic handler registered.
-s32 basic_handler_check(NpState& s)
+// RPCS3 sceNpBasicSetPresenceDetails: as sceNpBasicSetPresenceDetails2, for the older SceNpBasicPresenceDetails (no
+// struct size); offline nothing is sent. RPCS3 ensure()s the struct is readable ("Not checked by API"): refused here
+// with a log.
+s32 sceNpBasicSetPresenceDetails(PPUContext& ctx, u32 pres, u32 options)
 {
-    if (!s.initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
-    if (!basic_registered(s)) return error(SCE_NP_BASIC_ERROR_NOT_REGISTERED);
+    if (const s32 r = basic_handler_check(np())) return r;
+    if (options < SCE_NP_BASIC_PRESENCE_OPTIONS_SET_DATA || options > SCE_NP_BASIC_PRESENCE_OPTIONS_ALL_OPTIONS) {
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, pres, kPresenceDetailsSize)) {
+        log_call_site(ctx, base, std::format("sceNpBasicSetPresenceDetails: the details {:#x} are not guest memory", pres));
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    const u32 size = ps_read32(base, pres + kPresenceDataSize);
+    if (size > SCE_NP_BASIC_MAX_PRESENCE_SIZE) return error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX);
+    PS_LOG_DEBUG(kChan, "sceNpBasicSetPresenceDetails(options {}): status \"{}\", {} bytes of data; offline, not sent",
+        options, (options & SCE_NP_BASIC_PRESENCE_OPTIONS_SET_STATUS) ? guest_string(t, pres + kPresenceStatus,
+                     kPresenceStatusMax) : "(unchanged)", size);
     return lv2::CELL_OK;
 }
+
+// RPCS3 sceNpBasicAbortGui: ends the basic dialog on screen (np_state's abort flag). None is ever open here.
+s32 sceNpBasicAbortGui(PPUContext&)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    PS_LOG_DEBUG(kChan, "sceNpBasicAbortGui(): no dialog to abort");
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpBasicMarkMessageAsUsed: a TODO that only checks NP and the handler (no message ID is checked).
+s32 sceNpBasicMarkMessageAsUsed(PPUContext&, u64 msg_id)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    PS_LOG_DEBUG(kChan, "sceNpBasicMarkMessageAsUsed({:#x}): no messages offline", msg_id);
+    return lv2::CELL_OK;
+}
+
+// What RPCS3 answers for the lists that come from PSN once their checks pass (NP, the basic handler when `need_handler`,
+// the output pointer): offline, SCE_NP_ERROR_ID_NOT_FOUND (RPCS3: "TODO: Find the correct test which returns
+// SCE_NP_ERROR_ID_NOT_FOUND"), and nothing written. For the entries and counts of the clan messages, custom and
+// matching invitations, message attachments, messages, friends and the players' history.
+s32 basic_list_offline(std::string_view name, bool need_handler, u32 out)
+{
+    NpState& s = np();
+    if (!s.initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (need_handler && !basic_registered(s)) return error(SCE_NP_BASIC_ERROR_NOT_REGISTERED);
+    if (!out) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT); // RPCS3: "TODO: check index"
+    PS_LOG_DEBUG(kChan, "{}: offline, not found", name);
+    return error(SCE_NP_ERROR_ID_NOT_FOUND);
+}
+
+s32 sceNpBasicGetClanMessageEntryCount(PPUContext&, u32 count)
+{
+    return basic_list_offline("sceNpBasicGetClanMessageEntryCount", true, count);
+}
+
+s32 sceNpBasicGetClanMessageEntry(PPUContext&, u32 index, u32 from)
+{
+    return basic_list_offline(std::format("sceNpBasicGetClanMessageEntry({})", index), true, from);
+}
+
+s32 sceNpBasicGetCustomInvitationEntryCount(PPUContext&, u32 count)
+{
+    return basic_list_offline("sceNpBasicGetCustomInvitationEntryCount", true, count);
+}
+
+s32 sceNpBasicGetCustomInvitationEntry(PPUContext&, u32 index, u32 from)
+{
+    return basic_list_offline(std::format("sceNpBasicGetCustomInvitationEntry({})", index), true, from);
+}
+
+s32 sceNpBasicGetMatchingInvitationEntryCount(PPUContext&, u32 count)
+{
+    return basic_list_offline("sceNpBasicGetMatchingInvitationEntryCount", true, count);
+}
+
+s32 sceNpBasicGetMatchingInvitationEntry(PPUContext&, u32 index, u32 from)
+{
+    return basic_list_offline(std::format("sceNpBasicGetMatchingInvitationEntry({})", index), true, from);
+}
+
+s32 sceNpBasicGetMessageAttachmentEntryCount(PPUContext&, u32 count)
+{
+    return basic_list_offline("sceNpBasicGetMessageAttachmentEntryCount", true, count);
+}
+
+s32 sceNpBasicGetMessageAttachmentEntry(PPUContext&, u32 index, u32 from)
+{
+    return basic_list_offline(std::format("sceNpBasicGetMessageAttachmentEntry({})", index), true, from);
+}
+
+// The type is checked first, as in sceNpBasicGetMessageEntryCount; the handler isn't asked for.
+s32 sceNpBasicGetMessageEntry(PPUContext&, u32 type, u32 index, u32 from)
+{
+    if (type > SCE_NP_BASIC_MESSAGE_INFO_TYPE_BOOTABLE_CUSTOM_DATA_MESSAGE) {
+        return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    }
+    return basic_list_offline(std::format("sceNpBasicGetMessageEntry(type {}, {})", type, index), false, from);
+}
+
+// The friend list is the PSN account's (RPCS3 asks RPCN). The count needs no handler.
+s32 sceNpBasicGetFriendListEntryCount(PPUContext&, u32 count)
+{
+    return basic_list_offline("sceNpBasicGetFriendListEntryCount", false, count);
+}
+
+// Unlike the count, an entry is refused offline with SCE_NP_BASIC_ERROR_BUSY (RPCS3).
+s32 sceNpBasicGetFriendListEntry(PPUContext&, u32 index, u32 np_id)
+{
+    if (!np().initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!np_id) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT); // RPCS3: "TODO: check index"
+    PS_LOG_DEBUG(kChan, "sceNpBasicGetFriendListEntry({}): offline, busy", index);
+    return error(SCE_NP_BASIC_ERROR_BUSY);
+}
+
+// RPCS3 sceNpBasicGetFriendPresenceByIndex(2) and ByNpId(2) (np_handler::get_friend_presence_by_index / by_npid): a
+// friend's presence, which comes from RPCN; without it, SCE_NP_BASIC_ERROR_NOT_CONNECTED. The details pointer is
+// checked before NP; the options aren't (RPCS3: "TODO ... depending on fw").
+s32 friend_presence_offline(std::string_view name, u32 who, u32 pres)
+{
+    if (!pres) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    if (!np().initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!who) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    PS_LOG_DEBUG(kChan, "{}: offline, not connected", name);
+    return error(SCE_NP_BASIC_ERROR_NOT_CONNECTED);
+}
+
+s32 sceNpBasicGetFriendPresenceByIndex(PPUContext&, u32 index, u32 user, u32 pres, u32 options)
+{
+    return friend_presence_offline(std::format("sceNpBasicGetFriendPresenceByIndex({}, options {:#x})", index, options),
+        user, pres);
+}
+
+s32 sceNpBasicGetFriendPresenceByIndex2(PPUContext&, u32 index, u32 user, u32 pres, u32 options)
+{
+    return friend_presence_offline(std::format("sceNpBasicGetFriendPresenceByIndex2({}, options {:#x})", index, options),
+        user, pres);
+}
+
+s32 sceNpBasicGetFriendPresenceByNpId(PPUContext&, u32 np_id, u32 pres, u32 options)
+{
+    return friend_presence_offline(std::format("sceNpBasicGetFriendPresenceByNpId(options {:#x})", options), np_id, pres);
+}
+
+s32 sceNpBasicGetFriendPresenceByNpId2(PPUContext&, u32 np_id, u32 pres, u32 options)
+{
+    return friend_presence_offline(std::format("sceNpBasicGetFriendPresenceByNpId2(options {:#x})", options), np_id,
+        pres);
+}
+
+// Whether the SceNpId at `np_id` (non-null) has an online ID, as RPCS3 tests it (handle.data[0]); nullopt when it isn't
+// guest memory (logged: RPCS3 would fault).
+std::optional<bool> has_online_id(PPUContext& ctx, std::string_view name, u32 np_id)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_readable(t, np_id, 1)) {
+        log_call_site(ctx, t.kernel.base(), std::format("{}: the NP ID {:#x} is not guest memory", name, np_id));
+        return std::nullopt;
+    }
+    return ps_read8(t.kernel.base(), np_id) != 0;
+}
+
+// RPCS3 sceNpBasicAddBlockListEntry: the block list is the PSN account's; offline, after the checks,
+// SCE_NP_BASIC_ERROR_NOT_CONNECTED (returned as not an error).
+s32 sceNpBasicAddBlockListEntry(PPUContext& ctx, u32 np_id)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    if (!np_id) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    const std::optional<bool> named = has_online_id(ctx, "sceNpBasicAddBlockListEntry", np_id);
+    if (!named || !*named) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    PS_LOG_INFO(kChan, "sceNpBasicAddBlockListEntry(\"{}\"): offline, not connected",
+        guest_string(thread_of(ctx), np_id, kOnlineIdLength));
+    return error(SCE_NP_BASIC_ERROR_NOT_CONNECTED);
+}
+
+// RPCS3 sceNpBasicGetPlayersHistoryEntryCount / sceNpBasicGetPlayersHistoryEntry: the players met, which RPCS3 lists
+// only online; offline SCE_NP_ERROR_ID_NOT_FOUND after the checks (the options first: BY_NP_COMM_ID or ALL).
+s32 sceNpBasicGetPlayersHistoryEntryCount(PPUContext&, u32 options, u32 count)
+{
+    if (options > SCE_NP_BASIC_PLAYERS_HISTORY_OPTIONS_ALL) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    return basic_list_offline(std::format("sceNpBasicGetPlayersHistoryEntryCount(options {})", options), true, count);
+}
+
+s32 sceNpBasicGetPlayersHistoryEntry(PPUContext&, u32 options, u32 index, u32 np_id)
+{
+    if (options > SCE_NP_BASIC_PLAYERS_HISTORY_OPTIONS_ALL) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    return basic_list_offline(std::format("sceNpBasicGetPlayersHistoryEntry(options {}, {})", options, index), true,
+        np_id);
+}
+
+// ------------------------------------------------------------------------------------------------- basic: messages
 
 // RPCS3 sceNpBasicSendMessage (_sceNpBasicSendMessage without the rate limit): a message to one user, which RPCS3 sends
 // through RPCN. Offline it is refused once its arguments pass, with SCE_NP_BASIC_ERROR_NOT_CONNECTED (RPCS3 returns it
@@ -763,17 +1249,59 @@ s32 sceNpBasicRecvMessageCustom(PPUContext&, u16 main_type, u32 recv_options, u3
     return error(SCE_NP_BASIC_ERROR_CANCEL);
 }
 
+// RPCS3 sceNpBasicRecvMessageAttachment: recv_message_gui for data attachments, without options. As for
+// sceNpBasicRecvMessageCustom, the list is empty offline: cancelled at once, no event.
+s32 sceNpBasicRecvMessageAttachment(PPUContext&, u32 container_id)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    PS_LOG_INFO(kChan, "sceNpBasicRecvMessageAttachment(container {:#x}): offline there is no message to list; "
+                       "cancelled", container_id);
+    return error(SCE_NP_BASIC_ERROR_CANCEL);
+}
+
+// RPCS3 sceNpBasicSendMessageAttachment: a data attachment (main type DATA_ATTACHMENT, sub type ACTION_USE, no
+// features) to one user, through sceNpBasicSendMessageGui: offline its checks, then SCE_NP_BASIC_ERROR_NOT_CONNECTED.
+s32 sceNpBasicSendMessageAttachment(PPUContext& ctx, u32 to, u32 subject, u32 body, u32 data, u32 size,
+    u32 container_id)
+{
+    if (const s32 r = basic_handler_check(np())) return r;
+    MessageDetails m;
+    m.main_type = SCE_NP_BASIC_MESSAGE_MAIN_TYPE_DATA_ATTACHMENT;
+    m.npids = to;
+    m.count = 1;
+    m.subject = subject;
+    m.body = body;
+    m.data = data;
+    m.size = size;
+    return send_message_offline(ctx, "sceNpBasicSendMessageAttachment", m, container_id);
+}
+
 // ------------------------------------------------------------------------------------------------- basic: players
 
-// The length of the NUL-terminated guest string at `addr` if it is under `max`, else `max`; nullopt when it runs into
-// memory that isn't guest memory first.
-std::optional<u32> guest_strnlen(lv2::PpuThread& t, u32 addr, u32 max)
+// RPCS3 sceNpBasicAddPlayersHistory (np_handler::add_player_to_history): one player for the history of players met,
+// without a request or an event; it needs no basic handler. As for sceNpBasicAddPlayersHistoryAsync, the player isn't
+// kept: the history is read only online. RPCS3 reads the NP ID and the description unchecked: memory that isn't guest
+// memory is refused here, with a log.
+s32 sceNpBasicAddPlayersHistory(PPUContext& ctx, u32 np_id, u32 description)
 {
-    for (u32 i = 0; i < max; i++) {
-        if (!guest_readable(t, addr + i, 1)) return std::nullopt;
-        if (!ps_read8(t.kernel.base(), addr + i)) return i;
+    if (!np().initialized) return error(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!np_id) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    const std::optional<bool> named = has_online_id(ctx, "sceNpBasicAddPlayersHistory", np_id);
+    if (!named || !*named) return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    lv2::PpuThread& t = thread_of(ctx);
+    if (description) {
+        const std::optional<u32> length = guest_strnlen(t, description, SCE_NP_BASIC_DESCRIPTION_CHARACTER_MAX + 1);
+        if (!length) {
+            log_call_site(ctx, t.kernel.base(), std::format("sceNpBasicAddPlayersHistory: the description at {:#x} runs "
+                                                            "out of guest memory", description));
+            return error(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+        }
+        if (*length > SCE_NP_BASIC_DESCRIPTION_CHARACTER_MAX) return error(SCE_NP_BASIC_ERROR_EXCEEDS_MAX);
     }
-    return max;
+    PS_LOG_INFO(kChan, "sceNpBasicAddPlayersHistory(\"{}\", description \"{}\"): not kept (read only online)",
+        guest_string(t, np_id, kOnlineIdLength),
+        description ? guest_string(t, description, SCE_NP_BASIC_DESCRIPTION_CHARACTER_MAX) : std::string());
+    return lv2::CELL_OK;
 }
 
 // RPCS3 sceNpBasicAddPlayersHistoryAsync (np_handler::add_players_to_history), which works offline too: the players
@@ -781,7 +1309,8 @@ std::optional<u32> guest_strnlen(lv2::PpuThread& t, u32 addr, u32 max)
 // SCE_NP_BASIC_EVENT_ADD_PLAYERS_HISTORY_RESULT with result 0 and the request ID this returns (np_handler::
 // send_basic_event: at the game's next cellSysutilCheckCallback). The request ID is REQUEST_ID_HIGH::MISC << 16 | the
 // next request number. The players aren't kept: RPCS3 writes them to its players_history.yml, which only
-// sceNpBasicGetPlayersHistoryEntryCount and sceNpBasicGetPlayersHistoryEntry read, and GTA V imports neither. RPCS3
+// sceNpBasicGetPlayersHistoryEntryCount and sceNpBasicGetPlayersHistoryEntry read, and those answer
+// SCE_NP_ERROR_ID_NOT_FOUND offline. RPCS3
 // reads the NP IDs and the description unchecked, and writes the request ID after the event is sent: memory that
 // isn't guest memory is refused here first, with a log.
 s32 sceNpBasicAddPlayersHistoryAsync(PPUContext& ctx, u32 npids, u32 count, u32 description, u32 req_id)
@@ -854,6 +1383,14 @@ s32 sceNpProfileCallGui(PPUContext&, u32 np_id, u32 handler, u32 user_arg, u64 o
     PS_LOG_WARN(kChan, "sceNpProfileCallGui(npId {:#x}, handler {:#x}, arg {:#x}, options {:#x}): a TODO in RPCS3; "
                        "offline the user's NP ID isn't available", np_id, handler, user_arg, options);
     return error(SCE_NP_ERROR_OFFLINE);
+}
+
+// RPCS3 sceNpProfileAbortGui: no profile dialog is ever open. Its NP check answers the friend list's error ("Not
+// SCE_NP_PROFILE_ERROR_NOT_INITIALIZED !").
+s32 sceNpProfileAbortGui(PPUContext&)
+{
+    if (!np().initialized) return error(SCE_NP_FRIENDLIST_ERROR_NOT_INITIALIZED);
+    return lv2::CELL_OK;
 }
 
 // ------------------------------------------------------------------------------------------------- DRM
@@ -983,44 +1520,189 @@ s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile&
     return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
 }
 
-// RPCS3 sceNpDrmIsAvailable (npDrmIsAvailable): whether the NPDRM content at drm_path can be used, given the game's
-// klicensee (16 bytes, optional). NP need not be up. The file is opened as RPCS3's lv2_file::open does (an error
-// there is the result: CELL_ENOENT for a missing file) and checked by its first bytes (drm_check_content); then the
-// thread sleeps 5 ms, as in RPCS3. The klicensee is a key: it is never logged. RPCS3 reads the klicensee and the path
-// (at most 0x100 characters) unchecked: ones that aren't guest memory are refused here with a log. RPCS3's key for
-// PSP remasters (category "PE") doesn't apply: pspocket runs PS3 games.
+// The path (at most `max` characters) of the C string at `addr`, which `name` reads; nullopt when it runs out of guest
+// memory first (logged: RPCS3 reads it unchecked and aborts, "Secret access violation").
+std::optional<std::string> drm_string(PPUContext& ctx, std::string_view name, std::string_view what, u32 addr, u32 max)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    const std::optional<u32> length = guest_strnlen(t, addr, max);
+    if (!length) {
+        log_call_site(ctx, t.kernel.base(), std::format("{}: the {} at {:#x} runs out of guest memory", name, what, addr));
+        return std::nullopt;
+    }
+    return std::string(reinterpret_cast<const char*>(t.kernel.base() + addr), *length);
+}
+
+// RPCS3 npDrmIsAvailable: whether the NPDRM content at drm_path can be used, given the game's klicensee (16 bytes,
+// optional). NP need not be up. The file is opened as RPCS3's lv2_file::open does (an error there is the result:
+// CELL_ENOENT for a missing file) and checked by its first bytes (drm_check_content). The klicensee is a key: it is
+// never logged. RPCS3 reads the klicensee and the path (at most 0x100 characters) unchecked: ones that aren't guest
+// memory are refused here with a log. RPCS3's key for PSP remasters (category "PE") doesn't apply: pspocket runs PS3
+// games.
+s32 drm_is_available(PPUContext& ctx, std::string_view name, u32 k_licensee, u32 drm_path)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (k_licensee && !guest_readable(t, k_licensee, 16)) {
+        log_call_site(ctx, t.kernel.base(), std::format("{}: the klicensee {:#x} is not guest memory", name, k_licensee));
+        return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    }
+    const std::optional<std::string> path = drm_string(ctx, name, "path", drm_path, kDrmPathMax);
+    if (!path) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    PS_LOG_INFO(kChan, "{}(\"{}\", {}): checking", name, *path, k_licensee ? "with a klicensee" : "no klicensee");
+    const GuestFile head = read_guest_file(ctx, *path, kNpdHeaderSize + kEdatHeaderSize);
+    if (!head.opened) {
+        PS_LOG_INFO(kChan, "{}(\"{}\"): can't be opened: {}", name, *path, lv2::error_name(head.result));
+        return head.result;
+    }
+    return drm_check_content(ctx, *path, head);
+}
+
+// RPCS3 sceNpDrmIsAvailable: the check, then the thread sleeps 5 ms.
 s32 sceNpDrmIsAvailable(PPUContext& ctx, u32 k_licensee, u32 drm_path)
 {
     if (!drm_path) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
-    lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    if (k_licensee && !guest_readable(t, k_licensee, 16)) {
-        log_call_site(ctx, base, std::format("sceNpDrmIsAvailable: the klicensee {:#x} is not guest memory", k_licensee));
-        return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
-    }
-    const std::optional<u32> length = guest_strnlen(t, drm_path, kDrmPathMax);
-    if (!length) {
-        log_call_site(ctx, base, std::format("sceNpDrmIsAvailable: the path {:#x} runs out of guest memory", drm_path));
-        return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
-    }
-    const std::string path(reinterpret_cast<const char*>(base + drm_path), *length);
-    PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\", {}): checking", path, k_licensee ? "with a klicensee" : "no klicensee");
-    const GuestFile head = read_guest_file(ctx, path, kNpdHeaderSize + kEdatHeaderSize);
-    s32 result = head.result;
-    if (!head.opened) {
-        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): can't be opened: {}", path, lv2::error_name(result));
-    } else {
-        result = drm_check_content(ctx, path, head);
-    }
-    lv2::sys_timer_usleep(t, 5'000);
+    const s32 result = drm_is_available(ctx, "sceNpDrmIsAvailable", k_licensee, drm_path);
+    lv2::sys_timer_usleep(thread_of(ctx), 5'000);
     return result;
 }
 
-// sceNpDrmIsAvailable2: RPCS3 makes the same check (npDrmIsAvailable) without the first one's wait (its sleep is a TODO
-// there): Sniper: Ghost Warrior calls it at boot (phone run of 2026-10-06).
+// sceNpDrmIsAvailable2: RPCS3 makes the same check without the first one's wait (its sleep is a TODO there): Sniper:
+// Ghost Warrior calls it at boot (phone run of 2026-10-06).
 s32 sceNpDrmIsAvailable2(PPUContext& ctx, u32 k_licensee, u32 drm_path)
 {
-    return sceNpDrmIsAvailable(ctx, k_licensee, drm_path);
+    if (!drm_path) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    return drm_is_available(ctx, "sceNpDrmIsAvailable2", k_licensee, drm_path);
+}
+
+// RPCS3 sceNpDrmProcessExitSpawn / sceNpDrmProcessExitSpawn2: the content check (npDrmIsAvailable, no wait), then
+// sys_game_process_exitspawn (or ...2) with the same arguments, which ends the game (starting the next executable is
+// not implemented, D-031) and doesn't return. A failed check is the result.
+s32 sceNpDrmProcessExitSpawn(PPUContext& ctx, u32 k_licensee, u32 path, u32 argv, u32 envp, u32 data, u32 data_size,
+    s32 prio, u64 flags)
+{
+    if (!path) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    if (const s32 r = drm_is_available(ctx, "sceNpDrmProcessExitSpawn", k_licensee, path)) return r;
+    game_process_exitspawn(ctx, path, argv, envp, data, data_size, prio, flags);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpDrmProcessExitSpawn2(PPUContext& ctx, u32 k_licensee, u32 path, u32 argv, u32 envp, u32 data, u32 data_size,
+    s32 prio, u64 flags)
+{
+    if (!path) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    if (const s32 r = drm_is_available(ctx, "sceNpDrmProcessExitSpawn2", k_licensee, path)) return r;
+    game_process_exitspawn2(ctx, path, argv, envp, data, data_size, prio, flags);
+    return lv2::CELL_OK;
+}
+
+// The NPD header of a SELF's NPDRM supplemental header (RPCS3 get_npdrm_self_header), from the file's first bytes;
+// nullopt for a debug SELF, headers past those bytes, or no NPDRM header.
+std::optional<std::vector<u8>> self_npd_header(const std::vector<u8>& b)
+{
+    if (b.size() < kSelfSupplementalSize + 8) return std::nullopt;
+    const u16 key_revision = ps_ld16(b.data() + kSelfKeyRevision);
+    if (key_revision == 0x8000 || key_revision == 0xC000) return std::nullopt;
+    const u64 start = ps_ld64(b.data() + kSelfSupplementalOffset), size = ps_ld64(b.data() + kSelfSupplementalSize);
+    for (u64 at = start; at - start < size;) {
+        if (at > b.size() || b.size() - at < kSupplementalHeader) return std::nullopt;
+        const u32 type = ps_ld32(b.data() + at), length = ps_ld32(b.data() + at + 4);
+        if (type == kSupplementalNpdrm) {
+            if (b.size() - at < kSupplementalHeader + kNpdHeaderSize) return std::nullopt;
+            const auto npd = b.begin() + static_cast<std::ptrdiff_t>(at + kSupplementalHeader);
+            return std::vector<u8>(npd, npd + kNpdHeaderSize);
+        }
+        if (!length) return std::nullopt; // RPCS3 would read the same header forever
+        at += length;
+    }
+    return std::nullopt;
+}
+
+// RPCS3 sceNpDrmGetTimelimit: how long the content at `path` may still be used, from its NPD header's validity window
+// (an EDAT's, or a SELF's NPDRM supplemental header's) and the time now: SCE_NP_DRM_ERROR_SERVICE_NOT_STARTED before
+// it starts, SCE_NP_DRM_TIME_INFO_ENDLESS without an end, SCE_NP_DRM_ERROR_TIME_LIMIT after it ends, else the
+// microseconds left. Any other file is SCE_NP_DRM_ERROR_BAD_FORMAT; a file that can't be opened, the open's error.
+// RPCS3 reads the path (at most 0x100 characters) unchecked: one that isn't guest memory is refused here with a log, as
+// is a result pointer that isn't.
+s32 sceNpDrmGetTimelimit(PPUContext& ctx, u32 drm_path, u32 time_remain)
+{
+    if (!drm_path || !time_remain) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    s64 sec = 0, nsec = 0;
+    lv2::host_current_time(sec, nsec);
+    const std::optional<std::string> path = drm_string(ctx, "sceNpDrmGetTimelimit", "path", drm_path, kDrmPathMax);
+    if (!path) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_readable(t, time_remain, 8)) {
+        log_call_site(ctx, t.kernel.base(),
+            std::format("sceNpDrmGetTimelimit: the result's address {:#x} is not guest memory", time_remain));
+        return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    }
+    const GuestFile head = read_guest_file(ctx, *path, kSelfHeadMax);
+    if (!head.opened) {
+        PS_LOG_INFO(kChan, "sceNpDrmGetTimelimit(\"{}\"): can't be opened: {}", *path, lv2::error_name(head.result));
+        return head.result;
+    }
+    const std::vector<u8>& b = head.bytes;
+    std::vector<u8> npd(kNpdHeaderSize, 0);
+    if (b.size() >= 4 && std::memcmp(b.data(), "SCE", 4) == 0) {
+        std::optional<std::vector<u8>> found = self_npd_header(b);
+        if (!found) {
+            PS_LOG_ERROR(kChan, "sceNpDrmGetTimelimit(\"{}\"): no NPD header in the SELF: bad format", *path);
+            return error(SCE_NP_DRM_ERROR_BAD_FORMAT);
+        }
+        npd = std::move(*found);
+    } else if (b.size() >= 4 && std::memcmp(b.data(), "NPD", 4) == 0) {
+        std::memcpy(npd.data(), b.data(), std::min<usize>(b.size(), kNpdHeaderSize)); // zeros past a short file's end
+    } else {
+        PS_LOG_INFO(kChan, "sceNpDrmGetTimelimit(\"{}\"): neither a SELF nor an EDAT: bad format", *path);
+        return error(SCE_NP_DRM_ERROR_BAD_FORMAT);
+    }
+    const s64 now_ms = sec * 1000 + nsec / 1'000'000;
+    const s64 activate = static_cast<s64>(ps_ld64(npd.data() + kNpdActivateTime));
+    const s64 expire = static_cast<s64>(ps_ld64(npd.data() + kNpdExpireTime));
+    if (activate != 0 && now_ms < activate) return error(SCE_NP_DRM_ERROR_SERVICE_NOT_STARTED);
+    u64 remain = SCE_NP_DRM_TIME_INFO_ENDLESS;
+    if (expire != 0) {
+        if (now_ms >= expire) return error(SCE_NP_DRM_ERROR_TIME_LIMIT);
+        remain = static_cast<u64>(expire - now_ms) * 1000;
+    }
+    ps_write64(t.kernel.base(), time_remain, remain);
+    PS_LOG_INFO(kChan, "sceNpDrmGetTimelimit(\"{}\"): {}", *path,
+        expire ? std::format("{} us left", remain) : std::string("no time limit"));
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpDrmVerifyUpgradeLicense / ...2 (npDrmVerifyUpgradeLicense): whether the user has the unlock licence of a
+// trial game's full version, the EDAT /dev_hdd0/home/<user>/exdata/<content ID>.edat (content ID: at most 0x2F
+// characters). RPCS3 then decrypts it with the free klicensee and checks it holds "GOMA". pspocket can't decrypt it
+// (sceNpDrmIsAvailable's EDAT rule), so a licence that is there is reported as not verified (RPCS3's answer for one
+// that fails its checks), with an error log: the game stays a trial.
+s32 drm_verify_upgrade_license(PPUContext& ctx, std::string_view name, u32 content_id)
+{
+    if (!content_id) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    const std::optional<std::string> id = drm_string(ctx, name, "content ID", content_id, kUpgradeContentIdMax);
+    if (!id) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
+    if (!valid_content_id(*id)) {
+        PS_LOG_INFO(kChan, "{}(\"{}\"): not a valid content ID: licence not found", name, *id);
+        return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
+    }
+    const std::string edat = "/dev_hdd0/home/00000001/exdata/" + *id + ".edat";
+    if (!read_guest_file(ctx, edat, 0).opened) {
+        PS_LOG_INFO(kChan, "{}(\"{}\"): no unlock licence {}: licence not found", name, *id, edat);
+        return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
+    }
+    PS_LOG_ERROR(kChan, "{}(\"{}\"): the unlock licence {} is there, but pspocket can't decrypt it to verify it: licence "
+                        "not found", name, *id, edat);
+    return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
+}
+
+s32 sceNpDrmVerifyUpgradeLicense(PPUContext& ctx, u32 content_id)
+{
+    return drm_verify_upgrade_license(ctx, "sceNpDrmVerifyUpgradeLicense", content_id);
+}
+
+s32 sceNpDrmVerifyUpgradeLicense2(PPUContext& ctx, u32 content_id)
+{
+    return drm_verify_upgrade_license(ctx, "sceNpDrmVerifyUpgradeLicense2", content_id);
 }
 
 // ------------------------------------------------------------------------------------------------- lookup
@@ -1298,17 +1980,102 @@ s32 sceNpSignalingTerminateConnection(PPUContext&, u32 ctx_id, u32 conn_id)
 
 // ------------------------------------------------------------------------------------------------- util
 
+// strncmp of the two NP IDs' online IDs (16 characters), clamped to -1, 0, 1 (np::is_same_npid compares the same way).
+s32 online_id_order(u8* base, u32 id1, u32 id2)
+{
+    for (u32 i = 0; i < kOnlineIdLength; i++) {
+        const u8 a = ps_read8(base, id1 + i), b = ps_read8(base, id2 + i);
+        if (a != b) return a < b ? -1 : 1;
+        if (!a) break;
+    }
+    return 0;
+}
+
 // RPCS3 sceNpUtilCmpNpId: two NP IDs match when their online IDs do (np::is_same_npid: strncmp of 16 characters); the
 // other fields are not compared. NP need not be initialized.
 s32 sceNpUtilCmpNpId(PPUContext& ctx, u32 id1, u32 id2)
 {
     if (!id1 || !id2) return error(SCE_NP_UTIL_ERROR_INVALID_ARGUMENT);
+    return online_id_order(guest_base(ctx), id1, id2) ? error(SCE_NP_UTIL_ERROR_NOT_MATCH) : lv2::CELL_OK;
+}
+
+// RPCS3 sceNpUtilCmpOnlineId: the same comparison as sceNpUtilCmpNpId.
+s32 sceNpUtilCmpOnlineId(PPUContext& ctx, u32 id1, u32 id2)
+{
+    if (!id1 || !id2) return error(SCE_NP_UTIL_ERROR_INVALID_ARGUMENT);
+    return online_id_order(guest_base(ctx), id1, id2) ? error(SCE_NP_UTIL_ERROR_NOT_MATCH) : lv2::CELL_OK;
+}
+
+// memcmp of `n` guest bytes, clamped to -1, 0, 1.
+s32 compare_bytes(u8* base, u32 a, u32 b, u32 n)
+{
+    const s32 r = std::memcmp(base + a, base + b, n);
+    return r < 0 ? -1 : r > 0 ? 1 : 0;
+}
+
+// RPCS3 sceNpUtilCmpNpIdInOrder: the order of two NP IDs: their online IDs (strncmp of 16 characters), then the first
+// opt word; then, when both or neither have a platform (opt[4] set), the platform words (neither: equal); when one
+// has, its platform against "ps3".
+s32 sceNpUtilCmpNpIdInOrder(PPUContext& ctx, u32 id1, u32 id2, u32 order)
+{
+    if (!id1 || !id2) return error(SCE_NP_UTIL_ERROR_INVALID_ARGUMENT);
     u8* base = guest_base(ctx);
-    for (u32 i = 0; i < kOnlineIdLength; i++) {
-        const u8 a = ps_read8(base, id1 + i);
-        if (a != ps_read8(base, id2 + i)) return error(SCE_NP_UTIL_ERROR_NOT_MATCH);
-        if (!a) break;
+    s32 result = online_id_order(base, id1, id2);
+    if (!result) result = compare_bytes(base, id1 + kNpIdOpt, id2 + kNpIdOpt, 4);
+    if (!result) {
+        const u8 platform1 = ps_read8(base, id1 + kNpIdPlatform), platform2 = ps_read8(base, id2 + kNpIdPlatform);
+        if (platform1 && platform2) {
+            result = compare_bytes(base, id1 + kNpIdPlatform, id2 + kNpIdPlatform, 4);
+        } else if (platform1 || platform2) {
+            const int r = std::memcmp(base + (platform1 ? id1 : id2) + kNpIdPlatform, "ps3", 4);
+            result = r < 0 ? -1 : r > 0 ? 1 : 0;
+        }
     }
+    ps_write32(base, order, static_cast<u32>(result));
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpUtilCanonicalizeNpIdForPs3 / ...ForPsp: the checks and the platform they would set are commented out in
+// RPCS3 ("for compatibility with RPCN"): only the pointer is checked.
+s32 sceNpUtilCanonicalizeNpIdForPs3(PPUContext&, u32 np_id)
+{
+    return np_id ? lv2::CELL_OK : error(SCE_NP_UTIL_ERROR_INVALID_ARGUMENT);
+}
+
+s32 sceNpUtilCanonicalizeNpIdForPsp(PPUContext&, u32 np_id)
+{
+    return np_id ? lv2::CELL_OK : error(SCE_NP_UTIL_ERROR_INVALID_ARGUMENT);
+}
+
+// The platform words of SceNpId (its second opt word, RPCS3 unk1[1]).
+constexpr u32 kPlatformPs4 = 0x70733400, kPlatformVita = 0x70737032, kPlatformPs3 = 0x70733300; // "ps4\0" "psp2" "ps3\0"
+
+// RPCS3 sceNpUtilGetPlatformType: the platform the NP ID's platform word names, as the result (not an error).
+s32 sceNpUtilGetPlatformType(PPUContext& ctx, u32 np_id)
+{
+    if (!np_id) return error(SCE_NP_UTIL_ERROR_INVALID_ARGUMENT);
+    switch (ps_read32(guest_base(ctx), np_id + kNpIdPlatform)) {
+    case kPlatformPs4: return SCE_NP_PLATFORM_TYPE_PS4;
+    case kPlatformVita: return SCE_NP_PLATFORM_TYPE_VITA;
+    case kPlatformPs3: return SCE_NP_PLATFORM_TYPE_PS3;
+    case 0: return SCE_NP_PLATFORM_TYPE_NONE;
+    }
+    return error(SCE_NP_UTIL_ERROR_UNKNOWN_PLATFORM_TYPE);
+}
+
+// RPCS3 sceNpUtilSetPlatformType: writes the platform word of a known platform type.
+s32 sceNpUtilSetPlatformType(PPUContext& ctx, u32 np_id, u32 platform_type)
+{
+    if (!np_id) return error(SCE_NP_UTIL_ERROR_INVALID_ARGUMENT);
+    u32 word = 0;
+    switch (platform_type) {
+    case SCE_NP_PLATFORM_TYPE_PS4: word = kPlatformPs4; break;
+    case SCE_NP_PLATFORM_TYPE_VITA: word = kPlatformVita; break;
+    case SCE_NP_PLATFORM_TYPE_PS3: word = kPlatformPs3; break;
+    case SCE_NP_PLATFORM_TYPE_NONE: word = 0; break;
+    default: return error(SCE_NP_UTIL_ERROR_UNKNOWN_PLATFORM_TYPE);
+    }
+    ps_write32(guest_base(ctx), np_id + kNpIdPlatform, word);
     return lv2::CELL_OK;
 }
 
@@ -1349,6 +2116,20 @@ u32 np_term()
     s.signaling_ctxs.clear();
     return lv2::CELL_OK;
 }
+
+namespace {
+
+// sceNpTerm: RPCS3's, through np_term, then the matching 2 room callbacks sceNp2.cpp keeps (terminate_NP drops them
+// too).
+s32 sceNpTerm(PPUContext&)
+{
+    const u32 r = np_term();
+    if (r == lv2::CELL_OK) np2_on_np_term();
+    PS_LOG_INFO(kChan, "sceNpTerm() -> {:#x}", r);
+    return static_cast<s32>(r);
+}
+
+} // namespace
 
 void register_sceNp(Registry& r)
 {
@@ -1406,6 +2187,61 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0x34CE82A0, sceNpSignalingGetConnectionFromPeerAddress),
         PS_HLE_FUNC(0x95C7BBA3, sceNpSignalingTerminateConnection),
         PS_HLE_FUNC(0xD208F91D, sceNpUtilCmpNpId),
+        PS_HLE_FUNC(0x4885AA18, sceNpTerm),
+        PS_HLE_FUNC(0xBCC09FE7, sceNpBasicRegisterHandler),
+        PS_HLE_FUNC(0xBE81C71C, sceNpBasicSetPresenceDetails),
+        PS_HLE_FUNC(0x481CE0E8, sceNpBasicAbortGui),
+        PS_HLE_FUNC(0xE1C9F675, sceNpBasicMarkMessageAsUsed),
+        PS_HLE_FUNC(0xBF607EC6, sceNpBasicGetClanMessageEntryCount),
+        PS_HLE_FUNC(0x4D9C615D, sceNpBasicGetClanMessageEntry),
+        PS_HLE_FUNC(0xA8AFA7D4, sceNpBasicGetCustomInvitationEntryCount),
+        PS_HLE_FUNC(0xD053F113, sceNpBasicGetCustomInvitationEntry),
+        PS_HLE_FUNC(0xAF505DEF, sceNpBasicGetMatchingInvitationEntryCount),
+        PS_HLE_FUNC(0x05AF1CB8, sceNpBasicGetMatchingInvitationEntry),
+        PS_HLE_FUNC(0x9153BDF4, sceNpBasicGetMessageAttachmentEntryCount),
+        PS_HLE_FUNC(0x5D543BBE, sceNpBasicGetMessageAttachmentEntry),
+        PS_HLE_FUNC(0x30D1CBDE, sceNpBasicGetMessageEntry),
+        PS_HLE_FUNC(0xAFEF640D, sceNpBasicGetFriendListEntryCount),
+        PS_HLE_FUNC(0x04372385, sceNpBasicGetFriendListEntry),
+        PS_HLE_FUNC(0x32C78A6A, sceNpBasicGetFriendPresenceByIndex),
+        PS_HLE_FUNC(0x6453B27B, sceNpBasicGetFriendPresenceByIndex2),
+        PS_HLE_FUNC(0xFD39AE13, sceNpBasicGetFriendPresenceByNpId),
+        PS_HLE_FUNC(0x260CAEDD, sceNpBasicGetFriendPresenceByNpId2),
+        PS_HLE_FUNC(0x1AE8A549, sceNpBasicAddBlockListEntry),
+        PS_HLE_FUNC(0xA15F35FE, sceNpBasicGetPlayersHistoryEntryCount),
+        PS_HLE_FUNC(0xBAB91FC9, sceNpBasicGetPlayersHistoryEntry),
+        PS_HLE_FUNC(0xB5CB2D56, sceNpBasicRecvMessageAttachment),
+        PS_HLE_FUNC(0x43B989F5, sceNpBasicSendMessageAttachment),
+        PS_HLE_FUNC(0x168A3117, sceNpBasicAddPlayersHistory),
+        PS_HLE_FUNC(0xBE07C708, sceNpManagerGetOnlineId),
+        PS_HLE_FUNC(0x16F88A6F, sceNpManagerGetPsHandle),
+        PS_HLE_FUNC(0xF42C0DF8, sceNpManagerGetOnlineName),
+        PS_HLE_FUNC(0x36D0C2C5, sceNpManagerGetAvatarUrl),
+        PS_HLE_FUNC(0x32200389, sceNpManagerGetMyLanguages),
+        PS_HLE_FUNC(0x7E2FEF28, sceNpManagerRequestTicket),
+        PS_HLE_FUNC(0x4B9EFB7A, sceNpManagerGetCachedInfo),
+        PS_HLE_FUNC(0x4210C462, sceNpManagerGetSigninId),
+        PS_HLE_FUNC(0x442381F7, sceNpManagerSubSignin),
+        PS_HLE_FUNC(0x60440C73, sceNpManagerSubSigninAbortGui),
+        PS_HLE_FUNC(0x000E53CC, sceNpManagerSubSignout),
+        PS_HLE_FUNC(0xF0A9182B, sceNpFriendlist),
+        PS_HLE_FUNC(0xD7FB1FA6, sceNpFriendlistCustom),
+        PS_HLE_FUNC(0xF59E1DA8, sceNpFriendlistAbortGui),
+        PS_HLE_FUNC(0x45F8F3AA, sceNpCustomMenuRegisterActions),
+        PS_HLE_FUNC(0xF9732AC8, sceNpCustomMenuActionSetActivation),
+        PS_HLE_FUNC(0x9458F464, sceNpCustomMenuRegisterExceptionList),
+        PS_HLE_FUNC(0x2F2C6B3E, sceNpProfileAbortGui),
+        PS_HLE_FUNC(0xAA16695F, sceNpDrmProcessExitSpawn),
+        PS_HLE_FUNC(0xE6C8F3F9, sceNpDrmProcessExitSpawn2),
+        PS_HLE_FUNC(0xCF51864B, sceNpDrmGetTimelimit),
+        PS_HLE_FUNC(0x2ECD48ED, sceNpDrmVerifyUpgradeLicense),
+        PS_HLE_FUNC(0xBE0E3EE2, sceNpDrmVerifyUpgradeLicense2),
+        PS_HLE_FUNC(0x8C760B52, sceNpUtilCmpOnlineId),
+        PS_HLE_FUNC(0xF5FF5F31, sceNpUtilCmpNpIdInOrder),
+        PS_HLE_FUNC(0x91840669, sceNpUtilCanonicalizeNpIdForPs3),
+        PS_HLE_FUNC(0xBE3AF96E, sceNpUtilCanonicalizeNpIdForPsp),
+        PS_HLE_FUNC(0xC611029A, sceNpUtilGetPlatformType),
+        PS_HLE_FUNC(0xAFC62605, sceNpUtilSetPlatformType),
     });
 }
 
