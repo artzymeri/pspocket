@@ -1,6 +1,7 @@
 # Where pspocket stands
 
-2026-10-05, after run 089 and D-149 (route B decided: D-147). Read this first in a new session, then `CLAUDE.md`,
+2026-10-06, after run 099 and D-163 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
 `docs/improve.md`; how each game stands against the "Flawless" bar is `docs/compatibility.md` (both updated after every
@@ -32,7 +33,7 @@ Mac-translated build keeps working throughout. GTA V (BLES01807) is the driving 
 |---|---|
 | Toolchain | `ps3inspect` (inventory), ELF/SELF/PRX loader, NID database from RPCS3 (D-019), ISO 9660 disc reader. PPU: interpreter (the oracle, with a decode cache, D-091), analyzer and lifter with differential fuzzing (D-023, D-028), whole-game translation built into the host (D-092 to D-096, D-098), `ppu-dis`. SPU: interpreter, runtime and lifter (D-029), relocatable programs (D-081), `scripts/lift-spu.sh` (D-076, D-099). One PPU/SPU reservation system (D-030, D-066) |
 | lv2 kernel | Host threads, sync objects, memory, `sys_vm`, event queues and ports, timers, filesystem (host directories and disc images read in place, D-043), SPU threads (D-031), the RSX device (`sys_rsx`, D-045), a report of what every thread waits on (D-053) |
-| HLE modules | sysPrxForUser, cellSysmodule, cellSpurs (native, checked against libsre: workloads, tasksets, tasks, job chains, SPURS queues and semaphores, a game's own policy module; the modules programs load themselves, D-079, D-082, D-099, D-136), cellAudio (D-052, D-072 to D-075), cellGcmSys, cellSysutil, sys_io (D-049), sceNp/sceNp2/commerce/SNS (offline, D-139), sceNpTrophy, cellSaveData, cellRtc, cellVoice, cellNetCtl, sys_net (offline loopback, D-141), cellHttp/cellSsl, sys_fs, cellGame, cellOskDialog (D-140). All 364 of GTA V's imports; 100 of Assassin's Creed's 140 (cellSync, AIO, spinlocks, mmapper and a few more missing). No PRX loading at run time yet |
+| HLE modules | sysPrxForUser, cellSysmodule, cellSpurs (native, checked against libsre: workloads, tasksets, tasks, job chains, SPURS queues and semaphores, a game's own policy module; the modules programs load themselves, D-079, D-082, D-099, D-136), cellAudio (D-052, D-072 to D-075), cellGcmSys, cellSysutil, sys_io (D-049), sceNp/sceNp2/commerce/SNS (offline, D-139), sceNpTrophy, cellSaveData, cellRtc, cellVoice, cellNetCtl, sys_net (offline loopback, D-141), cellHttp/cellSsl, sys_fs (with AIO), cellGame, cellOskDialog (D-140), cellSync (D-160). All 364 of GTA V's imports and all 140 of Assassin's Creed's (D-160). The PS3's own firmware modules serve libraries the host has nothing of (LLE, D-157), and games load their own PRX modules (sys_prx, D-159) |
 | Loader | `pspocket-boot` runs a decrypted EBOOT on the Mac with the game's translated code built in (`-DPSPOCKET_GAME_PPU`, `-DPSPOCKET_GAME_SPU`; used only for the executable it was translated from, D-098). Crash reports show the guest registers and code, the host frames of translated code (D-094) and every thread. `--bdvd IMAGE.iso`, `--flash DIR`, `--frames DIR`, `--trace-frame N`, `--press`/`--press-file`, `--spu-dump DIR`, `--rsx-recover`, `--frame-jumps`, `--summary FILE.json` (D-149) |
 | Gate | `scripts/gate.sh quick\|game\|spu` (D-149): ctest, then GTA V's prologue walk (`games/gta5/walk-prologue.txt`) checked against `games/gta5/gate.json` (fps, frame jumps, render passes, memory, compiles, new messages); `scripts/ios.sh build` and `testflight` run it first. `scripts/ios.sh session` summarises a phone log, `pull-log` fetches the game's |
 | RSX | Portable front end (FIFO methods, state, textures, vertex and fragment programs to MSL with flow control, D-068, D-086, D-089, D-093) and Metal backend (D-032): surfaces and textures over them, GPU conversions of depth buffers and colour targets read as other formats (D-083, D-088, D-097, D-098), frame trace (D-084) |
@@ -66,19 +67,21 @@ phone).
 
 ## Right now: route B, stage by stage (D-147)
 
-0. **Done (D-148, D-149):** the memory-spike fix and the regression gate. To confirm on the phone: a long session in
-   the heavy area of run 089 without memory warnings.
-1. **Go/no-go:** the app writes a tiny ARM64 library itself, signs it on the phone and loads it (development install,
-   then TestFlight). If iOS refuses both, route A.
-2. Code generation on the phone, chosen by measurement (embedded LLVM compiling the lifters' C is the front runner:
-   GTA V's whole translation is about 20 CPU-minutes on the M4, an estimated 6 to 12 minutes on the phone).
-3. The translation as a per-game library loaded at run time, on the Mac first, with GTA V.
-4. The on-phone pipeline ("Preparing game…").
-5. Firmware from PS3UPDAT.PUP and the real firmware modules (PRX loading).
-6. Acceptance: Assassin's Creed to its title screen and GTA V to the prologue's bank, both prepared on the phone.
+0. **Done (D-148, D-149):** the memory-spike fix and the regression gate (to confirm on the phone: a long session).
+1. **Done (D-150):** the app signs and loads code it made itself (development install).
+2. **Done (D-151, D-153):** LLVM in the app compiles the lifters' C on the phone.
+3. **Done (D-152):** a game's translation is a library loaded at run time.
+4. **Done (D-154, D-155):** "Preparing game…" on the phone, PPU and SPU, with progress and the time left; a
+   translator generation makes libraries from before a lifter fix prepare again (D-161).
+5. **Done (D-156, D-157, D-159):** firmware from PS3UPDAT.PUP, firmware modules (LLE), run-time PRX loading.
+6. **On the Mac:** Assassin's Creed reaches its title screen, its first level and the Abstergo lab (26-34 fps with
+   its SPU programs translated, run 099); GTA V passes the gate from a library made with tonight's lifter. **On the
+   phone: not yet tried with these fixes** (the phone was locked): install the build, let it prepare both games
+   again, then Assassin's Creed to its title screen and GTA V to the bank.
 
-In parallel, on the Mac: Assassin's Creed's runtime gaps, starting with cellSync (its main thread spins on
-`cellSyncMutexTryLock`, 24 million calls in 90 s, and never creates the RSX).
+Rendering for any game (D-158): new shaders compile in the background with a 4 ms wait a frame, so a game the phone has
+never seen does not stall; more texture formats decode (D-163). Open: the Abstergo lab looks washed out (compare with
+footage), multisampled targets drawn with one sample, a GPU shader interpreter for the draws left out while compiling.
 
 ## Building and running GTA V on the Mac
 
