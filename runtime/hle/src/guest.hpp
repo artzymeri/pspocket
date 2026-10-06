@@ -52,12 +52,14 @@ private:
     u32 addr_ = 0;
 };
 
-// Calls the guest function whose descriptor (OPD: entry, TOC) is at `opd` on the calling thread, with up to eight
-// arguments in r3..r10, and returns r3: what RPCS3 does with ppu_execute and its callback calls (cellGcmCallback
-// through the context, cellSysutilCheckCallback, interrupt handlers). The callee gets a fresh 0x80-byte frame below r1
-// with a back chain, because the PPC64 ABI lets it write its caller's LR, TOC and parameter save slots
-// (r1 + 16/40/48..) and a StackVar sits right at r1. The caller's r1, r2 and LR are restored afterwards; the callee
-// keeps r13..r31 as the ABI requires. Runs through the kernel's executor (lifted code, or the interpreter fallback).
+// Calls the guest function whose descriptor (OPD: entry, TOC) is at `opd` on the calling thread, with its arguments in
+// r3..r10 and the ninth and later in the parameter save area (r1 + 0x70 + 8 * (i - 8), the PPC64 ELF ABI: a codec
+// core's open takes ten, D-197), and returns r3: what RPCS3 does with ppu_execute and its callback calls
+// (cellGcmCallback through the context, cellSysutilCheckCallback, interrupt handlers). The callee gets a fresh frame
+// (0x80 bytes, more for the arguments past eight) below r1 with a back chain, because the PPC64 ABI lets it write its
+// caller's LR, TOC and parameter save slots (r1 + 16/40/48..) and a StackVar sits right at r1. The caller's r1, r2 and
+// LR are restored afterwards; the callee keeps r13..r31 as the ABI requires. Runs through the kernel's executor (lifted
+// code, or the interpreter fallback).
 inline u64 call_guest(PPUContext& ctx, u32 opd, std::initializer_list<u64> args)
 {
     lv2::PpuThread& t = thread_of(ctx);
@@ -66,13 +68,15 @@ inline u64 call_guest(PPUContext& ctx, u32 opd, std::initializer_list<u64> args)
     const u32 saved_cia = ctx.cia;
     const u32 entry = ps_read32(base, opd);
     ctx.gpr[2] = ps_read32(base, opd + 4);
-    u32 r = 3;
-    for (const u64 a : args) {
-        if (r > 10) PS_FATAL("hle", "call_guest: more than eight arguments");
-        ctx.gpr[r++] = a;
-    }
-    ctx.gpr[1] = (saved_r1 - 0x80) & ~u64{15};
+    const u32 extra = args.size() > 8 ? static_cast<u32>(args.size()) - 8 : 0;
+    ctx.gpr[1] = (saved_r1 - 0x80 - 8 * extra) & ~u64{15};
     ps_write64(base, static_cast<u32>(ctx.gpr[1]), saved_r1);
+    u32 i = 0;
+    for (const u64 a : args) {
+        if (i < 8) ctx.gpr[3 + i] = a;
+        else ps_write64(base, static_cast<u32>(ctx.gpr[1]) + 0x70 + 8 * (i - 8), a);
+        i++;
+    }
     ctx.lr = lv2::kThreadReturnAddress; // returning lands here; the interpreter fallback stops at it
     lv2::run_guest(t.kernel, ctx, base, entry, false); // a longjmp inside goes on interpreted (D-161)
     const u64 result = ctx.gpr[3];

@@ -18,6 +18,8 @@
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
+#include "guest.hpp"
+#include "hle_test_util.hpp"
 #include "synthetic.hpp"
 
 using namespace pspocket;
@@ -266,4 +268,29 @@ TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import
     // HLE allocations stay clear of the executable's pages (text 0x10000+0x4000, data 0x20000+0x2000).
     CHECK(descriptor >= 0x22000);
     CHECK_FALSE(p.hle->main_memory().reserve(0x20000, 0x1000));
+}
+
+TEST_CASE("call_guest: arguments past eight in the caller's parameter save area (D-197)", "[hle]")
+{
+    ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
+    hle::test::Fixture f;
+    hle::test::GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    // A guest function adding its eleven arguments: r3..r10, then r1 + 0x70, + 0x78, + 0x80.
+    constexpr u32 kCode = hle::test::kData, kOpd = hle::test::kData + 0x100;
+    std::vector<u32> code;
+    for (u32 r = 4; r <= 10; r++) code.push_back(as::add(3, 3, r));
+    for (s32 at = 0x70; at <= 0x80; at += 8) {
+        code.push_back(as::ld(11, at, 1));
+        code.push_back(as::add(3, 3, 11));
+    }
+    code.push_back(as::blr());
+    for (usize i = 0; i < code.size(); i++) ps_write32(b, kCode + 4 * static_cast<u32>(i), code[i]);
+    ps_write32(b, kOpd, kCode);
+    ps_write32(b, kOpd + 4, 0);
+    const u64 sp = t.ctx.gpr[1];
+    const u64 sum = hle::call_guest(t.ctx, kOpd, {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024});
+    CHECK(sum == 2047);
+    CHECK(t.ctx.gpr[1] == sp);
+    CHECK(hle::call_guest(t.ctx, kOpd, {1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0}) == 255);
 }
