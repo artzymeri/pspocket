@@ -40,6 +40,7 @@ add_library(pspocket_hle STATIC
     src/sys_fs.cpp
     src/sys_io.cpp
     src/sys_net.cpp
+    src/sysutil_misc.cpp
     src/trophy_files.cpp)
 target_include_directories(pspocket_hle PUBLIC include)
 target_link_libraries(pspocket_hle PUBLIC pspocket::core pspocket::ppu pspocket::spu pspocket::lv2 pspocket::rsx)

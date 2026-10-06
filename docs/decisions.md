@@ -3644,6 +3644,31 @@ These are 41 more functions.
 
 All of these are reset at the unload, as RPCS3's osk_info::reset.
 
+**The small sysutil libraries (sysutil_misc.cpp, 52 functions)**
+
+All are as RPCS3 has them with no device, service or overlay:
+
+- **cellUserInfo.**
+  - The current user (00000001, "User") is made on first use, as RPCS3 makes it at boot.
+  - The list holds every 8-digit home directory with a localusername.
+  - Selection picks the current user, as RPCS3 does without its overlay; an empty fixed list gives NOUSER.
+- **cellScreenShotUtility**: the titles and overlay are kept, with RPCS3's checks.
+- **cellStorageData\* and cellSysconfOpen**: the callback hears CELL_OK, nothing is copied.
+- **The web browser's setup**: 1 MB, then INITIALIZING_FINISHED and SHUTDOWN_FINISHED.
+- **cellSysutilAvc**: each request succeeds at the next check, with no players.
+- **cellSysutilGetLicenseArea**: A.
+- **NP EULA**: already accepted; an abort turns it into ABORTED.
+- **The access point**: 1 MB.
+- **Remote play**: volume 1.0.
+- **Video upload**: INITIALIZED, then FINALIZED.
+- **Print**: each step CELL_OK.
+- **cellAuthDialogOpen**: RPCS3's zero check.
+- **The cross controller**: INITIALIZED, then the user cancels waiting for a PS Vita, since there is no dialog.
+- **cellGameExec**:
+  - the boot type and an HDD game's directory;
+  - the exit parameter;
+  - PlayStation Home is gone (NOAPP).
+
 `read_cstr` (a checked guest string) moved from cellSaveData.cpp to guest.hpp for every module. The NID check
 (test_hle) accepts RPCS3's REG_FNID names, which end with their NID.
 
@@ -3682,6 +3707,13 @@ Tests (tests/hle/test_sysutil.cpp, osk):
 - the finish message confirming the dialog before the missing keyboard's cancel;
 - the settings' limits, GetSize, the separate window option;
 - the Ext callbacks, hooks, floats and switches.
+
+Tests (tests/hle/test_sysutil_misc.cpp):
+
+- user info on a temporary /dev_hdd0;
+- screenshots, storage, sysconf and the web browser;
+- AV chat requests in order;
+- EULA, video upload, print, the cross controller, cellGameExec.
 
 ## Open decisions (plan section 14)
 
