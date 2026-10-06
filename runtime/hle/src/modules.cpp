@@ -29,6 +29,7 @@ void register_sceNpCommerce2(Registry& r);
 void register_sceNpSns(Registry& r);
 void register_sceNpTrophy(Registry& r);
 void register_sysPrxForUser(Registry& r);
+void register_sysPrxForUser_libc(Registry& r);
 void register_sys_fs(Registry& r);
 void register_sys_io(Registry& r);
 void register_sys_net(Registry& r);
@@ -60,6 +61,7 @@ void register_all_modules(Registry& r)
     register_sceNpSns(r);
     register_sceNpTrophy(r);
     register_sysPrxForUser(r);
+    register_sysPrxForUser_libc(r);
     register_sys_fs(r);
     register_sys_io(r);
     register_sys_net(r);

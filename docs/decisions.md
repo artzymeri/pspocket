@@ -2868,6 +2868,69 @@ restart; images; RPCS3's refusals; group exit stopping a spinning sibling; suspe
 mailbox, send_event to a PPU queue and receive_event from an SPU queue (and terminate refused while it waits); event
 flag bits, signal OR mode, local store access, the run event; SPU-to-SPU DMA and a signal through the group window;
 the process ending while a thread waits.
+## D-168 · 2026-10-06 · sysPrxForUser: the C library, heaps, lwcond, mempool and the rest, as RPCS3 has them
+
+D-166's second step starts with sysPrxForUser, which every firmware module imports from: the 50 functions RPCS3
+implements there that pspocket lacked, each from the RPCS3 source its comment names, each tested for its behaviour and
+error codes (tests/hle/test_sysprx_libc.cpp, 20 cases). sysPrxForUser now has 83 of liblv2's 157 functions; the SPU
+printf, SPU image and ELF, raw SPU, interrupt thread and PRX ones are another change's. Where pspocket differs from
+RPCS3, and why:
+
+- **Pointers** are checked before use (D-042), where RPCS3 would fault: functions that write refuse a range that is not
+  all guest memory and write nothing; scans (strlen, strcmp, strchr, memchr, memcmp) check each page as they reach it,
+  so they fail only where RPCS3's would. A refusal is logged with the call site and returns what the function returns
+  for nothing found (0, NULL, the destination), or CELL_EFAULT where the function returns an error code.
+- **C library** (runtime/hle/src/sysPrxForUser_libc.cpp, from sys_libc_.cpp): memset, memcpy, memmove, memcmp,
+  memchr, the str functions, ctype with RPCS3's table, as RPCS3. A guest char is unsigned (the PPU's): strncasecmp
+  folds 'A'..'Z' and compares bytes from 0x80 as they are, where RPCS3's _sys_tolower aborts on its host's negative
+  chars; a ctype argument outside -1..127 has no class or case (a warning the first time) where RPCS3 aborts.
+  _sys_memcpy copies overlapping ranges as memmove.
+- **printf, sprintf, snprintf**: RPCS3's ps3_fmt (Utilities/cfmt.h over the ABI's argument slots): its parsing (flags,
+  width, precision and length in any order; an unknown sequence printed as written, the rest of the format untouched),
+  its conversions (d i u o x X c s p, its b B, and f F e E g G a A by the host's snprintf on the double in the
+  argument's GPR or stack slot, where a variadic call puts it) and its sizes (long and size_t 4 bytes). C99, which
+  liblv2 follows, where RPCS3 departs from it: %d takes an int, not the whole 64-bit slot; precision 0 prints no digits
+  only for 0 ("%.0d" of 5 is "5"); "%#x" and "%#o" of 0 print "0" (RPCS3 "00"); %lf is %f (RPCS3 stops formatting at
+  it). Arguments after the eighth are read at r1 + 0x30 + 8n, where the caller puts them; RPCS3 reads each one slot
+  low (a 0-based index into its 1-based get_stack_arg). A null %s prints "(null)"; one that is not guest memory prints
+  nothing, logged. Widths and precisions stop at 65,536. _sys_printf goes to sys_tty_write on channel 0 in pieces of up
+  to 1 KB on the caller's stack (RPCS3 puts the whole text there). _sys_snprintf returns the bytes written and 0 for a
+  count of 0, as RPCS3, not C99's whole length.
+- **qsort**: a merge sort of the elements' indices; the guest comparator (call_guest) gets the elements' addresses
+  where they lie, then the array is written in its order: stable, about n log2 n comparisons, and a comparator that is
+  not consistent cannot make it leave the array. RPCS3 runs the host's std::qsort, whose comparison order depends on
+  the host.
+- **malloc and heaps** (sys_heap.cpp): vm::alloc in the main area as RPCS3 (MainMemory: first fit, at least 64 KB
+  aligned, zeroed); an alignment that is not a power of two returns NULL with a log (RPCS3 aborts); free(NULL) does
+  nothing. Heaps are names under idm's IDs (1..1023, each new one first, then the lowest free); _sys_heap_malloc
+  ignores the heap, as RPCS3's.
+- **lwcond** (sys_lwcond_.cpp, without hle_lwmutex): over lv2's _sys_lwcond_* (lw.cpp), the signal modes by who owns
+  the lwmutex (1 owner, 2 another thread, 3 taken free and handed to the waiter; a RETRY lwmutex always 2), the
+  waiter count and owner words kept as RPCS3 keeps them, and sys_lwcond_wait's recursion count and its CELL_OK, ESRCH,
+  EBUSY, ETIMEDOUT and EDEADLK paths. An lwcond or lwmutex that is not guest memory, or an lwmutex not 8-byte aligned
+  as its atomics need, is CELL_EFAULT; where RPCS3 throws (an owner free or dead after a handover, an unexpected kernel
+  result) pspocket aborts (CLAUDE.md rule 5).
+- **mempool** (sys_mempool.cpp): blocks handed out from the chunk's end, given-back ones first, each pool with an lv2
+  mutex and condition variable ("mp_m<ID>", "mp_c<ID>") that sys_mempool_allocate_block waits on. RPCS3's vector of
+  free blocks is kept as a count of chunk blocks not taken yet under the returned ones, so a chunk of many small blocks
+  costs no host memory. Differences: block size 0 is CELL_EINVAL (RPCS3 divides by it); destroy removes the condition
+  variable before the mutex (in RPCS3's order lv2 refuses the mutex, a condition variable still bound to it, and it
+  stays); try_allocate looks again under the mutex (RPCS3 can pop an empty vector); out of IDs is CELL_EAGAIN and a
+  mutex or condition variable that cannot be made returns lv2's error (RPCS3 crashes or throws).
+- **atexit** (sys_ppu_thread_.cpp): eight slots for the process (EPERM for one registered already, a null one matching
+  a free slot; ENOMEM when full; ESRCH to unregister one not there), run in slot order by every sys_ppu_thread_exit
+  before its TLS goes. The guard is a recursive lv2 mutex "atexit!" made at the first registration, where RPCS3's
+  sys_initialize_tls makes an lwmutex; a function that is not guest memory is skipped with a log.
+- **Smaller ones**: console_putc and console_write (sys_tty_write on channel 0; console_write returns CELL_OK whatever
+  it returned), sys_process_get_paramsfo (the syscall), sys_mmapper_allocate_memory_from_container (the shared memory
+  syscall from a container, without an IPC key), sys_get_random_number (CELL_EINVAL past 4096 bytes; RPCS3 then calls
+  lv2's sys_ss_random_number_generator, which lv2 here does not have yet, so the library fills the buffer from the
+  host's std::random_device itself), sys_game_process_exitspawn2 (sys_game_process_exitspawn's parameter block, now
+  shared, with RPCS3's flags: top bits 0 or 1 kept, else cleared; the atexitspawn handler runs for 0 and the
+  at_Exitspawn one for 1 before the process ends, D-031).
+
+The synthetic executable's loader test (test_hle.cpp) now counts _sys_printf among its implemented imports.
+
 ## D-170 · 2026-10-06 · cellGcmSys complete, as RPCS3 has it
 
 libgcm_sys is always native (D-166), so it now has every function RPCS3's cellGcmSys.cpp implements: the 36 it
@@ -2925,7 +2988,6 @@ by its NID; before cellGcmInit; mapping, first fit, reserves and unmapping again
 from the driver information; lv2's 0x10a and queue notes; the queue handler's head and order on the interrupt thread,
 in guest code under the interpreter; the command words; the default buffer's sizes; Z-cull and the arrays; the small
 ones) and the flip command's queue in tests/rsx/test_methods.cpp.
-
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
