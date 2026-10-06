@@ -203,6 +203,77 @@ void add_push_waiter(u8* b, u32 queue, u8 task, u8 wid)
     });
 }
 
+// An SPU task's pop as the SPU-side queue library does it (the mirror of SpuPush, for PPU2SPU queues): step 1 claims the
+// entry at the pop index unless the queue is empty, another pop is under way or tasks wait to pop; the entry is read;
+// step 2 stores index + 1 and, when the PPU's push index is marked (a PushBody under way) and the queue was full,
+// returns the port to throw the PPU's wake-up event on.
+struct SpuPop {
+    u8* b;
+    u32 queue;
+    u32 index = 0;
+
+    bool claim()
+    {
+        bool ok = false;
+        hle::reservation_op(b, queue, [&](u8* q) {
+            ok = false;
+            const u32 pop = ps_read32(q, 0x00), depth = ps_read32(q, 0x0C);
+            if (marked(pop) || ps_read8(q, 0x20) || entries(pop, unmarked(ps_read32(q, 0x04)), depth) == 0) return false;
+            index = pop;
+            ps_write32(q, 0x00, ~pop);
+            ok = true;
+            return true;
+        });
+        return ok;
+    }
+    bool read_is(u32 value) const
+    {
+        const u32 size = ps_read32(b, queue + 0x08), depth = ps_read32(b, queue + 0x0C);
+        return entry_is(b + static_cast<u32>(ps_read64(b, queue + 0x10)) + (index % depth) * size, value, size);
+    }
+    u32 finish()
+    {
+        u32 port = 0xFFFFFFFF;
+        hle::reservation_op(b, queue, [&](u8* q) {
+            const u32 pop = ~ps_read32(q, 0x00), push = ps_read32(q, 0x04), depth = ps_read32(q, 0x0C);
+            const bool wake = marked(push) && entries(pop, unmarked(push), depth) == depth;
+            port = wake ? ps_read32(q, 0x18) : 0xFFFFFFFF;
+            ps_write32(q, 0x00, pop + 1 < 2 * depth ? pop + 1 : 0);
+            return true;
+        });
+        return port;
+    }
+};
+
+// A whole SPU pop of an entry expected to hold `value`; false (nothing changed) when the task would have to wait.
+bool spu_pop(QueueFixture& s, u32 queue, u32 value)
+{
+    SpuPop p{s.b, queue};
+    if (!p.claim()) return false;
+    CHECK(p.read_is(value));
+    if (const u32 port = p.finish(); port != 0xFFFFFFFF) throw_event(s.f, kSpurs, port);
+    return true;
+}
+
+// What an SPU task waiting to pop leaves in the queue: its task ID and workload ID appended to the waiter list.
+void add_pop_waiter(u8* b, u32 queue, u8 task, u8 wid)
+{
+    hle::reservation_op(b, queue, [&](u8* q) {
+        const u8 n = ps_read8(q, 0x20);
+        ps_write8(q, 0x21 + n, task);
+        ps_write8(q, 0x20, static_cast<u8>(n + 1));
+        ps_write8(q, 0x41 + n, wid);
+        ps_write8(q, 0x40, static_cast<u8>(n + 1));
+        return true;
+    });
+}
+
+// The PPU's input for a push of `value`.
+void put_entry(u8* b, u32 at, u32 value, u32 size)
+{
+    for (u32 j = 0; j < size; j++) b[at + j] = entry_byte(value, j);
+}
+
 // What the oldest waiter does when it runs again after its signal: it leaves the list (the others move up).
 void remove_push_waiter(u8* b, u32 queue)
 {
@@ -919,4 +990,161 @@ TEST_CASE("SPURS queues: an SPU task pushes and the PPU pops, each waking the ot
     CHECK(ps_read32(b, kQueue + 0x04) == kCount % (2 * kDepth));
     CHECK(ps_read8(b, kQueue + 0x30) == 0);
     REQUIRE(s.a.call("cellSpursQueueDetachLv2EventQueue", kQueue) == 0);
+}
+
+TEST_CASE("SPURS queues: cellSpursQueuePushBody checks, entries in order, full, the indices' wrap; cellSpursQueueSize",
+    "[hle][spurs][spurs-queue]")
+{
+    QueueFixture s;
+    u8* b = s.b;
+    constexpr u32 kSize = 32, kDepth = 4;
+    REQUIRE(s.a.call("_cellSpursQueueInitialize", 0, kTs, kQueue, kEntries, kSize, kDepth, PPU2SPU) == 0);
+    REQUIRE(s.a.call("cellSpursQueueAttachLv2EventQueue", kQueue) == 0);
+    auto push = [&](u32 value, u32 blocking) {
+        put_entry(b, kOut, value, kSize);
+        return s.a.call("cellSpursQueuePushBody", kQueue, kOut, blocking);
+    };
+    auto size = [&] {
+        ps_write32(b, kNumber, 0xDEAD);
+        REQUIRE(s.a.call("cellSpursQueueSize", kQueue, kNumber) == 0);
+        return ps_read32(b, kNumber);
+    };
+
+    CHECK(s.a.call("cellSpursQueuePushBody", 0, kOut, 0) == kNull);
+    CHECK(s.a.call("cellSpursQueuePushBody", kQueue, 0, 0) == kNull);
+    CHECK(s.a.call("cellSpursQueuePushBody", kQueue + 0x40, kOut, 0) == kAlign);
+    REQUIRE(s.a.call("_cellSpursQueueInitialize", 0, kTs, kQueue2, kEntries + 0x800, kSize, kDepth, SPU2PPU) == 0);
+    CHECK(s.a.call("cellSpursQueuePushBody", kQueue2, kOut, 0) == kPerm); // SPU tasks push to SPU2PPU queues
+    REQUIRE(s.a.call("_cellSpursQueueInitialize", 0, kTs, kQueue2, kEntries + 0x800, kSize, kDepth, SPU2SPU) == 0);
+    CHECK(s.a.call("cellSpursQueuePushBody", kQueue2, kOut, 1) == kPerm);
+    REQUIRE(s.a.call("_cellSpursQueueInitialize", 0, kTs, kQueue2, kEntries + 0x800, kSize, kDepth, PPU2SPU) == 0);
+    CHECK(s.a.call("cellSpursQueuePushBody", kQueue2, kOut, 1) == kStat); // blocking needs the lv2 queue
+    CHECK(s.a.call("cellSpursQueuePushBody", kQueue2, 0x40000000, 0) == kFault); // refused before the claim (D-042)
+    CHECK(ps_read32(b, kQueue2 + 0x04) == 0);
+    put_entry(b, kOut, 11, kSize);
+    REQUIRE(s.a.call("cellSpursQueuePushBody", kQueue2, kOut, 0) == 0); // TryPush doesn't need it
+    REQUIRE(spu_pop(s, kQueue2, 11));
+    CHECK(s.a.call("cellSpursQueueSize", 0, kNumber) == kNull);
+    CHECK(s.a.call("cellSpursQueueSize", kQueue, 0) == kNull);
+    CHECK(s.a.call("cellSpursQueueSize", kQueue + 0x40, kNumber) == kAlign);
+
+    // Four entries fill the queue, in their slots; the fifth is AGAIN and leaves the line as it was.
+    CHECK(size() == 0);
+    for (u32 v = 1; v <= 4; v++) {
+        REQUIRE(push(v, v & 1) == 0); // Push and TryPush take the same path while there is room
+        CHECK(entry_is(b + kEntries + (v - 1) * kSize, v, kSize));
+        CHECK(ps_read32(b, kQueue + 0x04) == v);
+        CHECK(size() == v);
+    }
+    CHECK(push(5, 0) == kAgain);
+    CHECK(push(5, 0x100) == kAgain); // only the low byte counts
+    CHECK(ps_read32(b, kQueue + 0x04) == 4);
+
+    // The SPU pops them in order; the indices run to 2 * depth and wrap, an entry's slot is its index mod depth.
+    for (u32 v = 1; v <= 4; v++) REQUIRE(spu_pop(s, kQueue, v));
+    CHECK_FALSE(spu_pop(s, kQueue, 0)); // empty
+    for (u32 v = 5; v <= 8; v++) REQUIRE(push(v, 1) == 0);
+    CHECK(ps_read32(b, kQueue + 0x04) == 0); // index 7 was the last before the wrap
+    CHECK(entry_is(b + kEntries + 3 * kSize, 8, kSize));
+    REQUIRE(spu_pop(s, kQueue, 5));
+    REQUIRE(push(9, 0) == 0); // index 0, slot 0
+    CHECK(entry_is(b + kEntries, 9, kSize));
+    CHECK(size() == 4);
+
+    // Size reads through the marks of calls under way.
+    ps_write32(b, kQueue + 0x04, ~1u);
+    CHECK(size() == 4); // pop 5, push 1 (marked): 1 - 5 + 2 * depth
+    // Another PPU caller's push under way (its index marked): BUSY, blocking or not.
+    CHECK(push(10, 1) == kBusy);
+    CHECK(push(10, 0) == kBusy);
+    ps_write32(b, kQueue + 0x04, 1);
+    CHECK(s.a.call("cellSpursQueueDetachLv2EventQueue", kQueue) == 0);
+}
+
+TEST_CASE("SPURS queues: a blocking push waits for the SPU pop's event on the queue's SPU port",
+    "[hle][spurs][spurs-queue]")
+{
+    QueueFixture s;
+    u8* b = s.b;
+    constexpr u32 kSize = 16, kDepth = 2;
+    REQUIRE(s.a.call("_cellSpursQueueInitialize", 0, kTs, kQueue, kEntries, kSize, kDepth, PPU2SPU) == 0);
+    REQUIRE(s.a.call("cellSpursQueueAttachLv2EventQueue", kQueue) == 0);
+    const u32 port = ps_read32(b, kQueue + 0x18);
+    for (u32 v = 1; v <= 2; v++) {
+        put_entry(b, kOut, v, kSize);
+        REQUIRE(s.a.call("cellSpursQueuePushBody", kQueue, kOut, 0) == 0);
+    }
+
+    std::atomic<u64> rc{~0ull};
+    const hle::Function& push = GuestThread::find("cellSpursQueuePushBody");
+    put_entry(b, kOut + 0x100, 3, kSize);
+    std::thread pusher([&] {
+        GuestThread p(s.f, 1, "pusher");
+        p.ctx.gpr[3] = kQueue;
+        p.ctx.gpr[4] = kOut + 0x100;
+        p.ctx.gpr[5] = 1;
+        push.fn(p.ctx, p.f.base());
+        rc = p.ctx.gpr[3];
+    });
+    // The PPU marks the push index for its whole call and waits on the lv2 queue.
+    REQUIRE(wait_for([&] { return ps_read32(b, kQueue + 0x04) == ~2u; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(rc.load() == ~0ull);
+    put_entry(b, kOut, 9, kSize);
+    CHECK(s.a.call("cellSpursQueuePushBody", kQueue, kOut, 0) == kBusy); // one PPU caller at a time
+    CHECK(s.a.call("cellSpursQueueDetachLv2EventQueue", kQueue) == kBusy);
+
+    // An event while the queue is still full: the PPU looks again and goes on waiting.
+    throw_event(s.f, kSpurs, port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(rc.load() == ~0ull);
+
+    // The SPU pop: step 2 sees the marked push index of a full queue and wakes the PPU through the port.
+    SpuPop p{b, kQueue};
+    REQUIRE(p.claim());
+    CHECK(p.read_is(1));
+    REQUIRE(p.finish() == port);
+    throw_event(s.f, kSpurs, port);
+    pusher.join();
+    CHECK(rc.load() == 0);
+    CHECK(entry_is(b + kEntries, 3, kSize)); // index 2, slot 0
+    CHECK(ps_read32(b, kQueue + 0x04) == 3); // advanced, unmarked
+    REQUIRE(spu_pop(s, kQueue, 2));
+    REQUIRE(spu_pop(s, kQueue, 3));
+    REQUIRE(s.a.call("cellSpursQueueDetachLv2EventQueue", kQueue) == 0);
+}
+
+TEST_CASE("SPURS queues: a push into an empty queue signals the oldest SPU task waiting to pop",
+    "[hle][spurs][spurs-queue]")
+{
+    QueueFixture s; // no workers: the tasks' states are set here
+    u8* b = s.b;
+    constexpr u32 kSize = 16, kDepth = 2;
+    REQUIRE(s.a.call("_cellSpursQueueInitialize", 0, kTs, kQueue, kEntries, kSize, kDepth, PPU2SPU) == 0);
+    const u8 wid = static_cast<u8>(s.wid());
+    // Tasks 3 and 5 exist and wait; both are in the queue's pop waiter list, 3 first.
+    ps_write32(b, kTs + 0x30, (0x80000000u >> 3) | (0x80000000u >> 5)); // enabled
+    ps_write32(b, kTs + 0x50, (0x80000000u >> 3) | (0x80000000u >> 5)); // waiting
+    add_pop_waiter(b, kQueue, 3, wid);
+    add_pop_waiter(b, kQueue, 5, wid);
+
+    // The push fills the empty queue: task 3 gets the signal, and its workload too.
+    put_entry(b, kOut, 1, kSize);
+    REQUIRE(s.a.call("cellSpursQueuePushBody", kQueue, kOut, 0) == 0);
+    CHECK(s.task_bit(0x40, 3));
+    CHECK_FALSE(s.task_bit(0x40, 5));
+    CHECK(ps_read16(b, kSpurs + 0x70) & (0x8000u >> wid)); // wklSignal1
+    // Not empty any more: the next push signals no one; the PPU never edits the list.
+    put_entry(b, kOut, 2, kSize);
+    REQUIRE(s.a.call("cellSpursQueuePushBody", kQueue, kOut, 0) == 0);
+    CHECK_FALSE(s.task_bit(0x40, 5));
+    CHECK(ps_read8(b, kQueue + 0x20) == 2);
+
+    // A waiter's task ID libsre's _cellSpursSendSignal refuses with INVAL: the push is done, the result is FATAL.
+    REQUIRE(s.a.call("_cellSpursQueueInitialize", 0, kTs, kQueue2, kEntries + 0x100, kSize, 1, PPU2SPU) == 0);
+    add_pop_waiter(b, kQueue2, 200, wid);
+    put_entry(b, kOut, 7, kSize);
+    CHECK(s.a.call("cellSpursQueuePushBody", kQueue2, kOut, 0) == kFatal);
+    CHECK(entry_is(b + kEntries + 0x100, 7, kSize));
+    CHECK(ps_read32(b, kQueue2 + 0x04) == 1);
 }

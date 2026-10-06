@@ -40,11 +40,12 @@
 // Everything the SPU side does (GETLLAR/PUTLLC on the line, a DMA of the entry, syscall 2, its own
 // _cellSpursSendSignal, the interrupt-mailbox event) is task code that the native taskset policy runs as it is.
 //
-// Implemented: the four functions GTA V imports. PushBody (the PPU pushing to PPU2SPU queues), Clear, Size, Depth and
-// the getters stay unimplemented until a game calls them (CLAUDE.md rule 4). Where libsre would read a bad pointer,
+// Implemented: the four functions GTA V imports, and PushBody (the PPU pushing to PPU2SPU queues) and Size, which Sony's
+// libdmuxpamf calls (D-194). Clear, Depth and the getters stay unimplemented until a game calls them (CLAUDE.md rule 4). Where libsre would read a bad pointer,
 // these functions refuse the call with TASK_ERROR_FAULT and a log of the call site (D-042); where libsre asserts (it
 // prints the failed condition and aborts the process), pspocket stops with a fatal log naming it (D-047).
 
+#include <atomic>
 #include <cstring>
 #include <format>
 #include <string_view>
@@ -69,8 +70,8 @@ constexpr u32 kNoPort = 0xFFFFFFFF;
 
 namespace q_off {
 constexpr u32 pop = 0x00, push = 0x04, size = 0x08, depth = 0x0C, buffer = 0x10, spu_port = 0x18, direction = 0x1C,
-              pop_waiters = 0x20, push_waiters = 0x30, push_waiter_wids = 0x50, taskset = 0x60, spurs = 0x68,
-              event_queue = 0x70;
+              pop_waiters = 0x20, push_waiters = 0x30, pop_waiter_wids = 0x40, push_waiter_wids = 0x50,
+              taskset = 0x60, spurs = 0x68, event_queue = 0x70;
 }
 
 // An index as the line holds it: a negative value is a mark (~index) left by the push or pop under way.
@@ -249,6 +250,40 @@ s32 cellSpursQueueDetachLv2EventQueue(PPUContext& ctx, u32 queue)
     return rc == lv2::CELL_OK ? rc : queue_error(rc);
 }
 
+// Signals the oldest SPU task waiting on the other side of `queue` (task `waiter` of workload `waiter_wid`), as libsre's
+// PopBody (for a task waiting to push) and PushBody (to pop) do once the entry it waits for is there. Its taskset is
+// the queue's, or for a queue of the whole instance its workload's: _cellSpursSendSignal's INVAL or STAT become
+// TASK_ERROR_FATAL, any other error is a libsre assertion. libsre ignores a failed lookup of a waiter's workload and
+// signals whatever its stack holds; pspocket logs it and returns FATAL.
+s32 wake_oldest(PPUContext& ctx, std::string_view what, u32 queue, u8 waiter, u8 waiter_wid, std::string_view waits_to)
+{
+    u8* base = guest_base(ctx);
+    u32 taskset = static_cast<u32>(ps_read64(base, queue + q_off::taskset));
+    if (!taskset) {
+        const u32 spurs = static_cast<u32>(ps_read64(base, queue + q_off::spurs));
+        if (const s32 rc = workload_argument(base, spurs, waiter_wid, taskset); rc != lv2::CELL_OK) {
+            log_call_site(ctx, base, std::format("{}({:#x}): the taskset of workload {} of SPURS {:#x}, whose task {} "
+                "waits to {}, is unknown ({:#x}); refused with CELL_SPURS_TASK_ERROR_FATAL (libsre signals an "
+                "undefined taskset here)", what, queue, waiter_wid, spurs, waiter, waits_to, static_cast<u32>(rc)));
+            return error(CELL_SPURS_TASK_ERROR_FATAL);
+        }
+    }
+    const s32 rc = send_signal(base, taskset, waiter);
+    PS_LOG_DEBUG(kChan, "{}({:#x}): woke task {} of taskset {:#x}, which waits to {}: {:#x}", what, queue, waiter,
+        taskset, waits_to, static_cast<u32>(rc));
+    if (rc == error(CELL_SPURS_TASK_ERROR_INVAL) || rc == error(CELL_SPURS_TASK_ERROR_STAT)) {
+        PS_LOG_ERROR(kChan, "{}({:#x}): signalling task {} of taskset {:#x}, which waits to {}, returned {:#x}: "
+            "CELL_SPURS_TASK_ERROR_FATAL, as libsre", what, queue, waiter, taskset, waits_to, static_cast<u32>(rc));
+        return error(CELL_SPURS_TASK_ERROR_FATAL);
+    }
+    if (rc != lv2::CELL_OK) {
+        PS_FATAL(kChan, "{}({:#x}): signalling task {} of taskset {:#x} returned {:#x}; libsre (fw 4.92) asserts here "
+            "(ret==CELL_OK; queuePop.c:126 for a pop) and aborts the process", what, queue, waiter, taskset,
+            static_cast<u32>(rc));
+    }
+    return lv2::CELL_OK;
+}
+
 // ------------------------------------------------------------------------------------------------- pop
 
 // cellSpursQueuePopBody(queue, buffer, isPeek, isBlocking), as libsre (0x16CFC): what cellSpursQueuePop (0, 1),
@@ -345,28 +380,119 @@ s32 cellSpursQueuePopBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_peek, u
     PS_LOG_DEBUG(kChan, "{}({:#x}): entry {} of {}{}", what, queue, index, 2 * depth, peek ? " (peek)" : "");
     if (!wake || peek) return lv2::CELL_OK;
 
-    u32 taskset = static_cast<u32>(ps_read64(base, queue + q_off::taskset));
-    if (!taskset) {
-        const u32 spurs = static_cast<u32>(ps_read64(base, queue + q_off::spurs));
-        if (const s32 rc = workload_argument(base, spurs, waiter_wid, taskset); rc != lv2::CELL_OK) {
-            log_call_site(ctx, base, std::format("{}({:#x}): the taskset of workload {} of SPURS {:#x}, whose task {} "
-                "waits to push, is unknown ({:#x}); refused with CELL_SPURS_TASK_ERROR_FATAL (libsre signals an "
-                "undefined taskset here)", what, queue, waiter_wid, spurs, waiter, static_cast<u32>(rc)));
-            return error(CELL_SPURS_TASK_ERROR_FATAL);
+    return wake_oldest(ctx, what, queue, waiter, waiter_wid, "push");
+}
+
+// ------------------------------------------------------------------------------------------------- push
+
+// cellSpursQueuePushBody(queue, buffer, isBlocking), as libsre (0x169D0): what cellSpursQueuePush (1) and TryPush (0)
+// call; the mirror of PopBody. Only the low byte of the flag counts.
+// - Checks: queue or buffer NULL (NULL_POINTER), queue misaligned (ALIGN), not PPU2SPU (PERM: only SPU tasks pop what
+//   the PPU pushes). Then on the line: the push index marked by another PPU caller (BUSY), a blocking call with no lv2
+//   event queue attached (STAT), a non-blocking call on a full queue (AGAIN; the line is stored back as it was).
+// - The push index is marked for the whole call (a blocking call marks it even when the queue is full, then waits on
+//   the lv2 event queue for the SPU pop's event and looks again; libsre asserts that the receive succeeds). The buffer
+//   is copied to the entry at push mod depth, then the push index advances (wrapping at 2 * depth), unmarked.
+// - A push into an empty queue with SPU tasks waiting to pop signals the oldest (task ID at 0x21; its taskset is the
+//   queue's, or for a queue of the whole instance its workload's at 0x41), as PopBody does for pushers.
+// Sony's libdmuxpamf sends its SPU task commands this way (run of the cellDmux comparison, D-194).
+s32 cellSpursQueuePushBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_blocking)
+{
+    constexpr std::string_view what = "cellSpursQueuePushBody";
+    if (!queue || !buffer) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (queue % CELL_SPURS_QUEUE_ALIGN) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (const s32 rc = queue_readable(ctx, what, "queue", queue, CELL_SPURS_QUEUE_SIZE); rc != lv2::CELL_OK) return rc;
+    if (ps_read32(base, queue + q_off::direction) != CELL_SPURS_QUEUE_PPU2SPU) return error(CELL_SPURS_TASK_ERROR_PERM);
+    const u32 size = ps_read32(base, queue + q_off::size), depth = ps_read32(base, queue + q_off::depth);
+    const u32 entries_ea = static_cast<u32>(ps_read64(base, queue + q_off::buffer));
+    const bool blocking = (is_blocking & 0xFF) != 0;
+
+    // Step 1: claim the entry at the push index (mark it), waiting for an SPU pop while the queue is full.
+    bool waited = false;
+    u32 index = 0, entry = 0;
+    for (;;) {
+        s32 rc = lv2::CELL_OK;
+        bool full = false;
+        reservation_op(base, queue, [&](u8* q) {
+            rc = lv2::CELL_OK;
+            u32 push = ps_read32(q, q_off::push);
+            if (!waited && marked(push)) {
+                rc = error(CELL_SPURS_TASK_ERROR_BUSY);
+                return false;
+            }
+            push = waited ? ~push : push; // after a wait the mark is this call's own
+            if (blocking && ps_read32(q, q_off::spu_port) == kNoPort) {
+                rc = error(CELL_SPURS_TASK_ERROR_STAT);
+                return false;
+            }
+            full = entries(unmarked(ps_read32(q, q_off::pop)), push, depth) == depth;
+            if (!blocking && full) {
+                rc = error(CELL_SPURS_TASK_ERROR_AGAIN);
+                return false;
+            }
+            index = push;
+            entry = entries_ea + (push < depth ? push : push - depth) * size;
+            if (!guest_readable(t, entry, size) || !guest_readable(t, buffer, size)) {
+                rc = error(CELL_SPURS_TASK_ERROR_FAULT); // logged below, outside the (retried) update
+                return false;
+            }
+            ps_write32(q, q_off::push, ~push);
+            return true;
+        });
+        if (rc == error(CELL_SPURS_TASK_ERROR_FAULT)) {
+            log_call_site(ctx, base, std::format("{}({:#x}): entry {} ({:#x}) or the input buffer ({:#x}), {} bytes, "
+                "is not readable guest memory; refused with CELL_SPURS_TASK_ERROR_FAULT", what, queue, index, entry,
+                buffer, size));
         }
+        if (rc != lv2::CELL_OK) return rc;
+        if (!full) break;
+        const u32 equeue = static_cast<u32>(ps_read64(base, queue + q_off::event_queue));
+        PS_LOG_DEBUG(kChan, "{}({:#x}): full; waiting on lv2 queue {:#x}", what, queue, equeue);
+        if (const s32 r = lv2::sys_event_queue_receive(t, equeue, 0, 0); r != lv2::CELL_OK) {
+            PS_FATAL(kChan, "{}({:#x}): sys_event_queue_receive on lv2 queue {:#x} returned {:#x}; libsre (fw 4.92) "
+                "asserts here (ret==CELL_OK) and aborts the process", what, queue, equeue, static_cast<u32>(r));
+        }
+        waited = true;
     }
-    const s32 rc = send_signal(base, taskset, waiter);
-    PS_LOG_DEBUG(kChan, "{}({:#x}): woke task {} of taskset {:#x}, which waits to push: {:#x}", what, queue, waiter,
-        taskset, static_cast<u32>(rc));
-    if (rc == error(CELL_SPURS_TASK_ERROR_INVAL) || rc == error(CELL_SPURS_TASK_ERROR_STAT)) {
-        PS_LOG_ERROR(kChan, "{}({:#x}): signalling task {} of taskset {:#x}, which waits to push, returned {:#x}: "
-            "CELL_SPURS_TASK_ERROR_FATAL, as libsre", what, queue, waiter, taskset, static_cast<u32>(rc));
-        return error(CELL_SPURS_TASK_ERROR_FATAL);
-    }
-    if (rc != lv2::CELL_OK) {
-        PS_FATAL(kChan, "{}({:#x}): signalling task {} of taskset {:#x} returned {:#x}; libsre (fw 4.92) asserts here "
-            "(queuePop.c:126: ret==CELL_OK) and aborts the process", what, queue, waiter, taskset, static_cast<u32>(rc));
-    }
+
+    std::memmove(base + entry, base + buffer, size);
+
+    // Step 2: release the claim, the push index advanced.
+    bool wake = false;
+    u8 waiter = 0, waiter_wid = 0;
+    reservation_op(base, queue, [&](u8* q) {
+        const u32 push = ~ps_read32(q, q_off::push);
+        const u32 count = entries(unmarked(ps_read32(q, q_off::pop)), push, depth);
+        wake = ps_read8(q, q_off::pop_waiters) != 0 && count == 0;
+        waiter = ps_read8(q, q_off::pop_waiters + 1);
+        waiter_wid = ps_read8(q, q_off::pop_waiter_wids + 1);
+        ps_write32(q, q_off::push, push + 1 < 2 * depth ? push + 1 : 0);
+        return true;
+    });
+    PS_LOG_DEBUG(kChan, "{}({:#x}): entry {} of {}", what, queue, index, 2 * depth);
+    if (!wake) return lv2::CELL_OK;
+    return wake_oldest(ctx, what, queue, waiter, waiter_wid, "pop");
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- size
+
+// cellSpursQueueSize(queue, size), as libsre (0x168FC): queue or size NULL (NULL_POINTER), queue misaligned (ALIGN);
+// then the pop and push indices read together (one doubleword), marks removed, and the entries between them stored.
+// Any direction. Sony's libdmuxpamf counts its SPU task's events with it (D-194).
+s32 cellSpursQueueSize(PPUContext& ctx, u32 queue, u32 size_out)
+{
+    constexpr std::string_view what = "cellSpursQueueSize";
+    if (!queue || !size_out) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (queue % CELL_SPURS_QUEUE_ALIGN) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = queue_readable(ctx, what, "queue", queue, CELL_SPURS_QUEUE_SIZE); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = queue_readable(ctx, what, "size", size_out, 4); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    const u64 indices = std::atomic_ref<u64>(*reinterpret_cast<u64*>(base + queue)).load(std::memory_order_acquire);
+    const u32 pop = unmarked(ps_bswap32(static_cast<u32>(indices))), push = unmarked(ps_bswap32(static_cast<u32>(indices >> 32)));
+    ps_write32(base, size_out, entries(pop, push, ps_read32(base, queue + q_off::depth)));
     return lv2::CELL_OK;
 }
 
@@ -379,6 +505,8 @@ void register_cellSpursQueue(Registry& r)
         PS_HLE_FUNC(0xE5443BE7, cellSpursQueueAttachLv2EventQueue),
         PS_HLE_FUNC(0x039D70B7, cellSpursQueueDetachLv2EventQueue),
         PS_HLE_FUNC(0x91066667, cellSpursQueuePopBody),
+        PS_HLE_FUNC(0x92CFF6ED, cellSpursQueuePushBody),
+        PS_HLE_FUNC(0x54876603, cellSpursQueueSize),
     });
 }
 
