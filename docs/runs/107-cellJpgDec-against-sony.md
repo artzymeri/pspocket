@@ -50,4 +50,8 @@ of pspocket's answers is a test of its own, so they stay so without the firmware
 
 ## The gate
 
-To run with D-200 (below).
+The gate with D-199 and D-200 (one run, c73a45e+, inventory/gate/20261006-233129-c73a45e+): **PASS**. The 20 test
+suites, then GTA V's prologue walk: 29.8 fps median and in the slowest 5 s window, 833 frames compared, 2 frame jumps,
+24.7 GPU ms per frame at worst, 84.1 render passes, 973 MB process memory at peak, no new warning shapes. Neither game
+in the walk uses an image decoder: this checks that nothing else moved.
+

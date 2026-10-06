@@ -33,4 +33,8 @@ block, every chunk query's answer, the sequence and argument errors, and the han
 
 ## The gate
 
-To run with D-199 (below).
+Run with D-200 (run 107): the gate with D-199 and D-200 (one run, c73a45e+, inventory/gate/20261006-233129-c73a45e+): **PASS**. The 20 test
+suites, then GTA V's prologue walk: 29.8 fps median and in the slowest 5 s window, 833 frames compared, 2 frame jumps,
+24.7 GPU ms per frame at worst, 84.1 render passes, 973 MB process memory at peak, no new warning shapes. Neither game
+in the walk uses an image decoder: this checks that nothing else moved.
+
