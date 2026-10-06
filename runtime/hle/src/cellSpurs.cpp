@@ -1,16 +1,17 @@
 // cellSpurs, native (D-037): the SPURS API on the host. Guest-visible structures keep RPCS3's layouts
 // (rpcs3/Emu/Cell/Modules/cellSpurs.h); API semantics follow RPCS3 cellSpurs.cpp where it implements them. Sony's
-// libsre (fw 4.92, read on the Mac, never copied) is the authority where RPCS3 stubs a function (D-042): task creation,
-// the task attribute, the LS pattern helpers and taskset shutdown are checked against it ("as libsre").
+// libsre (fw 4.92, read on the Mac, never copied) is the authority where RPCS3 stubs a function or differs from it
+// (D-042): task creation, the task attribute, the LS pattern helpers and taskset shutdown are checked against it, and
+// so is every function D-171 added ("as libsre" where it differs from RPCS3).
 //
-// Stage 1: attributes, initialize and finalize. Stage 3a: workload registration and tasksets (PPU side; tasks do not
-// run until the native taskset policy exists). Stage 4 (PPU side): event flags, lv2 event queue ports (D-040),
-// barrier initialize. Initialize fills the CellSpurs fields RPCS3's
-// _spurs::initialize sets that games and SPU code can observe, and registers a host instance. What a native SPURS
-// does not create, because nothing of Sony's SPURS kernel runs: the SPU thread group and its threads (spuTG, spus[]),
-// the PPU handler and event helper threads (ppu0, ppu1), the per-workload lv2 semaphores (wklF1[].sem, semPrv), the
-// guest lwmutex/lwcond at 0xDB0/0xDC8 and the kernel's event queue and port. Those fields stay 0 (ppu0/ppu1 keep
-// RPCS3's 0xFFFFFFFF "no thread"). Workloads, tasksets, tasks, job chains and SPU execution come next.
+// Initialize fills the CellSpurs fields RPCS3's _spurs::initialize sets that games and SPU code can observe, registers a
+// host instance and starts the native scheduler (spurs_scheduler.cpp: SPURS1's 16 workloads, or SPURS2's 32). What a
+// native SPURS does not create, because nothing of Sony's SPURS kernel runs: the SPU thread group and its threads (spuTG,
+// spus[]: cellSpursGetSpuThreadGroupId and cellSpursGetSpuThreadId answer 0, an ID lv2 refuses), the PPU handler thread
+// (ppu0), the per-workload lv2 semaphores (wklF1[].sem, semPrv) and the guest lwmutex/lwcond at 0xDB0/0xDC8. Those
+// fields stay 0 (ppu0/ppu1 keep RPCS3's 0xFFFFFFFF "no thread"). The event helper thread (ppu1, its lv2 event queue,
+// event port and SPU port) is created with the first workload that has a shutdown-completion hook, the only work it
+// has natively: it calls the hooks (D-171).
 
 #include <algorithm>
 #include <atomic>
@@ -37,7 +38,32 @@ namespace {
 
 using namespace spurs;
 
+constexpr std::string_view kModule = "cellSpurs";
+constexpr u32 NID_event_helper = 0x8A1D254E; // nid_of("_pspocket_spurs_event_helper"): pspocket's own
 
+// The instance's SPURS1/SPURS2 workload count, as CellSpurs::max_workloads() (RPCS3): 32 when flags1 says so.
+bool spurs2(u8* base, u32 spurs) { return (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0; }
+u32 max_workloads(u8* base, u32 spurs) { return spurs2(base, spurs) ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD; }
+bool workload_enabled(u8* base, u32 spurs, u32 wid)
+{
+    return wid < CELL_SPURS_MAX_WORKLOAD2 && (ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid));
+}
+
+// A pointer argument that is not guest memory: the call is refused with `code` and the call site logged (D-042), where
+// RPCS3 and libsre would fault.
+s32 refuse_pointer(PPUContext& ctx, std::string_view fn, std::string_view what, u32 addr, u32 size, u32 code)
+{
+    log_call_site(ctx, guest_base(ctx), std::format("{}: the {} ({:#x}, {} bytes) is not guest memory; refused with "
+        "{:#x}", fn, what, addr, size, code));
+    return error(code);
+}
+
+// OK when [addr, addr + size) is guest memory, else `code` with the call site logged.
+s32 check_pointer(PPUContext& ctx, std::string_view fn, std::string_view what, u32 addr, u32 size, u32 code)
+{
+    if (guest_readable(thread_of(ctx), addr, size)) return lv2::CELL_OK;
+    return refuse_pointer(ctx, fn, what, addr, size, code);
+}
 
 // ------------------------------------------------------------------------------------------------- attributes
 
@@ -95,6 +121,22 @@ s32 cellSpursAttributeSetSpuThreadGroupType(PPUContext& ctx, u32 attr, s32 type)
     return lv2::CELL_OK;
 }
 
+// cellSpursAttributeSetMemoryContainerForSpuThread(attr, container), as RPCS3 (libsre agrees): NULL, ALIGN (8), STAT for
+// an exclusive non-context group type; then the container and SAF_SPU_MEMORY_CONTAINER_SET. The container is where
+// the SPU thread group's memory would come from: a native SPURS has no group, so nothing is taken from it (initialize
+// logs it).
+s32 cellSpursAttributeSetMemoryContainerForSpuThread(PPUContext& ctx, u32 attr, u32 container)
+{
+    if (!attr) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    const u32 flags = ps_read32(base, attr + attr_off::flags);
+    if (flags & SAF_SPU_TGT_EXCLUSIVE_NON_CONTEXT) return error(CELL_SPURS_CORE_ERROR_STAT);
+    ps_write32(base, attr + attr_off::container, container);
+    ps_write32(base, attr + attr_off::flags, flags | SAF_SPU_MEMORY_CONTAINER_SET);
+    return lv2::CELL_OK;
+}
+
 // cellSpursAttributeEnableSpuPrintfIfAvailable(attr), as RPCS3: the flag. SPU printf output is not routed (the
 // native workers have no spu_printf server to attach); SPU code's own printf channel writes are logged as before.
 s32 cellSpursAttributeEnableSpuPrintfIfAvailable(PPUContext& ctx, u32 attr)
@@ -144,7 +186,7 @@ s32 cellSpursAttributeEnableSystemWorkload(PPUContext& ctx, u32 attr, u32 priori
 
 // RPCS3 _spurs::initialize, native: see the file comment for what is not created.
 s32 initialize(PPUContext& ctx, u32 spurs, u32 revision, u32 sdk_version, s32 nspus, s32 spu_priority, s32 ppu_priority,
-    u32 flags, u32 prefix, u32 prefix_size)
+    u32 flags, u32 prefix, u32 prefix_size, u32 container)
 {
     if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
     if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
@@ -160,13 +202,19 @@ s32 initialize(PPUContext& ctx, u32 spurs, u32 revision, u32 sdk_version, s32 ns
         // to lend them to here. RPCS3 adds nothing either (_spurs::add_default_syswkl is a TODO).
         PS_LOG_INFO(kChan, "cellSpursInitialize: the system workload is enabled; it does not run natively (as RPCS3)");
     }
+    if (flags & SAF_SPU_MEMORY_CONTAINER_SET) {
+        PS_LOG_INFO(kChan, "cellSpursInitialize: the SPU thread group's memory container {:#x} is not used (no group "
+            "natively)", container);
+    }
 
     const bool second = (flags & SAF_SECOND_VERSION) != 0;
     {
         SpursHost& h = host();
         std::lock_guard lock(h.mutex);
         if (h.instances.contains(spurs)) return error(CELL_SPURS_CORE_ERROR_STAT);
-        h.instances[spurs] = Instance{static_cast<u32>(nspus), second, {}, {}, {}};
+        Instance& inst = h.instances[spurs];
+        inst.nspus = static_cast<u32>(nspus);
+        inst.second = second;
     }
 
     u8* base = guest_base(ctx);
@@ -202,9 +250,17 @@ s32 initialize(PPUContext& ctx, u32 spurs, u32 revision, u32 sdk_version, s32 ns
     ps_write8(base, spurs + spurs_off::handlerWaiting, 0);
     ps_write8(base, spurs + spurs_off::handlerExiting, 0);
     ps_write32(base, spurs + spurs_off::ppuPriority, static_cast<u32>(ppu_priority));
+    // cellSpursEnableExceptionEventHandler(spurs, true), which RPCS3's and libsre's initialize call: the flag (there
+    // is no SPU thread group whose exception event it would connect).
+    ps_write32(base, spurs + spurs_off::enableEH, 1);
+    // Without the system workload, an instance that exits when it has no work is woken once (RPCS3 and libsre end
+    // initialize with cellSpursWakeUp): the handler-dirty flag.
+    if (!(flags & SAF_SYSTEM_WORKLOAD_ENABLED) && (flags & SAF_EXIT_IF_NO_WORK)) {
+        ps_write8(base, spurs + spurs_off::handlerDirty, 1);
+    }
 
     PS_LOG_INFO(kChan, "SPURS {:#010x} initialized natively: {} SPUs, SPU priority {}, PPU priority {}, flags {:#x}{}",
-        spurs, nspus, spu_priority, ppu_priority, flags, second ? " (SPURS2)" : "");
+        spurs, nspus, spu_priority, ppu_priority, flags, second ? " (SPURS2, 32 workloads)" : "");
     // The native scheduler starts once the guest structure is set up: its workers read it.
     {
         SpursHost& h = host();
@@ -213,6 +269,261 @@ s32 initialize(PPUContext& ctx, u32 spurs, u32 revision, u32 sdk_version, s32 ns
         if (it != h.instances.end() && HleProcess::current()->config().spurs_workers) {
             start_scheduler(h, thread_of(ctx).kernel, spurs, it->second);
         }
+    }
+    return lv2::CELL_OK;
+}
+
+// cellSpursInitialize(spurs, nSpus, spuPriority, ppuPriority, exitIfNoWork), as RPCS3 (libsre agrees): revision and SDK
+// version 0, no prefix, SAF_EXIT_IF_NO_WORK for exitIfNoWork (a b8: its low byte).
+s32 cellSpursInitialize(PPUContext& ctx, u32 spurs, s32 nspus, s32 spu_priority, s32 ppu_priority, u32 exit_if_no_work)
+{
+    PS_LOG_INFO(kChan, "cellSpursInitialize(spurs {:#x}, nSpus {}, spuPriority {}, ppuPriority {}, exitIfNoWork {})", spurs,
+        nspus, spu_priority, ppu_priority, exit_if_no_work & 0xFF);
+    return initialize(ctx, spurs, 0, 0, nspus, spu_priority, ppu_priority,
+        (exit_if_no_work & 0xFF) ? SAF_EXIT_IF_NO_WORK : 0, 0, 0, 0);
+}
+
+// ------------------------------------------------------------------------------------------------- event helper
+//
+// The SPURS event helper thread (RPCS3 _spurs::create_event_helper, event_helper_entry, stop_event_helper and
+// wakeup_shutdown_completion_waiter; libsre's "SpursHdlr1"): an lv2 PPU thread at the instance's PPU priority with a 32
+// KB stack, waiting on the instance's lv2 event queue "_spuPrv" (CellSpurs::eventQueue, 42 entries), which is attached
+// to a dynamic SPU port (spuPort) and to a local event port (eventPort) the PPU side sends through. Natively its only
+// work is the shutdown-completion hooks (cellSpursWorkloadAttributeSetShutdownCompletionEventHook): the system service
+// that would send the other events (trace updates, exceptions, event port handlers) does not run. It is created with
+// the first workload that has a hook, not at initialize, so instances without hooks get no thread; its entry is an
+// internal function the loader links (a test that does not link it gets no helper, and a hook is then only logged).
+
+// A hook still to be called: the shutdown is complete (event bit 0x01), a hook is registered (0x02) and it has not run
+// (0x20).
+bool hook_pending(u8 event) { return (event & 0x23) == 0x03; }
+
+// The helper's work for workload `wid` (RPCS3 wakeup_shutdown_completion_waiter): RPCS3's checks (NULL, ALIGN, INVAL,
+// SRCH, a workload that is not REMOVABLE: STAT), then the hook (spurs, wid, hookArg) and event bit 0x20. Natively a
+// worker may still be in the workload's last job or task when the shutdown made it removable (status is never kept,
+// D-136): the hook runs once the workers left it, as a join waits for them. RPCS3 then posts the workload's semaphore
+// for a waiter (event bit 0x10); the native waiter sees bit 0x20 instead.
+s32 call_shutdown_hook(PPUContext& ctx, u32 spurs, u32 wid)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    std::shared_ptr<Scheduler> scheduler;
+    {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.instances.find(spurs); it != h.instances.end()) scheduler = it->second.scheduler;
+    }
+    const u8 mask = wkl_nibble_mask(spurs2(base, spurs), wid);
+    for (;;) {
+        if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+        if (__atomic_load_n(base + spurs + wkl_state(wid), __ATOMIC_SEQ_CST) != SPURS_WKL_STATE_REMOVABLE) {
+            return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+        }
+        const bool left = (!scheduler || workers_inside(*scheduler, wid) == 0) &&
+            !(__atomic_load_n(base + spurs + wkl_off::currentContention + (wid & 15), __ATOMIC_SEQ_CST) & mask);
+        if (left) break;
+        if (!lv2::sleep_us(t.waiter, 100)) throw lv2::ThreadExit{}; // the process ends
+    }
+    const u32 f = wkl_f(spurs, wid);
+    const u32 hook = static_cast<u32>(ps_read64(base, f + wkl_off::f1_hook));
+    u8* const event = base + spurs + wkl_event(wid);
+    if (hook) {
+        PS_LOG_INFO(kChan, "SPURS {:#x}: workload {} shut down; its completion hook {:#x} runs on the event helper", spurs,
+            wid, hook);
+        call_guest(ctx, hook, {spurs, wid, static_cast<u32>(ps_read64(base, f + wkl_off::f1_hook_arg))});
+        const u8 before = __atomic_fetch_or(event, u8{0x20}, __ATOMIC_SEQ_CST);
+        if (!(before & 0x01) || !(before & 0x02) || (before & 0x20)) {
+            PS_LOG_ERROR(kChan, "SPURS {:#x}: workload {}'s event byte was {:#04x} when its hook returned (RPCS3 ensures "
+                "bits 0x01 and 0x02 and not 0x20)", spurs, wid, before);
+        }
+    }
+    return lv2::CELL_OK;
+}
+
+// The helper's body (RPCS3 _spurs::event_helper_entry): an event's data2 low 24 bits say what it is: 0 a shutdown
+// completion (data3: the workloads, bit 0x80000000 >> wid for 0..15, 0x8000 >> (wid & 15) for 16..31), 1 the end
+// (cellSpursFinalize). 2 (a trace update's semaphore) and 3 (the event port multiplexer's handlers) come from the
+// system service, which does not run natively: logged. Ends the thread on the end event; the process ending unwinds it.
+void _pspocket_spurs_event_helper(PPUContext& ctx, u64 arg)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 spurs = static_cast<u32>(arg);
+    const u32 queue = ps_read32(base, spurs + spurs_off::eventQueue);
+    PS_LOG_INFO(kChan, "SPURS {:#x}: event helper waiting on queue {:#x}", spurs, queue);
+    for (;;) {
+        if (const s32 rc = lv2::sys_event_queue_receive(t, queue, 0, 0); rc != lv2::CELL_OK) {
+            PS_LOG_ERROR(kChan, "SPURS {:#x}: the event helper's receive on queue {:#x} failed: {}; it ends", spurs, queue,
+                lv2::error_name(rc));
+            lv2::_sys_ppu_thread_exit(t, 0);
+        }
+        const u64 data2 = ctx.gpr[6], data3 = ctx.gpr[7];
+        const u32 data0 = static_cast<u32>(data2 & 0xFFFFFF);
+        if (data0 == 1) lv2::_sys_ppu_thread_exit(t, 0);
+        if (data0 != 0) {
+            PS_LOG_ERROR(kChan, "SPURS {:#x}: the event helper got event {} (data3 {:#x}), which nothing native sends; "
+                "ignored", spurs, data0, data3);
+            continue;
+        }
+        const u32 shutdown = static_cast<u32>(data3);
+        for (u32 wid = 0; wid < CELL_SPURS_MAX_WORKLOAD2; wid++) {
+            const u32 bit = wid < CELL_SPURS_MAX_WORKLOAD ? 0x80000000u >> wid : 0x8000u >> (wid & 15);
+            if (!(shutdown & bit)) continue;
+            if (const s32 rc = call_shutdown_hook(ctx, spurs, wid); rc != lv2::CELL_OK) {
+                PS_LOG_WARN(kChan, "SPURS {:#x}: workload {}'s shutdown completion: {:#x} (RPCS3 ensures CELL_OK; the "
+                    "workload was removed or replaced before its hook could run)", spurs, wid, static_cast<u32>(rc));
+            }
+        }
+    }
+}
+
+// Creates the event helper for the instance if it has none (see above): the "_spuPrv" queue on a dynamic SPU port,
+// the event port connected to it, the thread. Called on a PPU thread; failures leave the instance without a helper and
+// are logged (its hooks are then not called).
+void ensure_event_helper(PPUContext& ctx, u32 spurs)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    SpursHost& h = host();
+    {
+        std::lock_guard lock(h.mutex);
+        const auto it = h.instances.find(spurs);
+        if (it == h.instances.end() || it->second.helper || it->second.helper_failed) return;
+    }
+    HleProcess& p = *HleProcess::current();
+    const auto give_up = [&](std::string_view why) {
+        PS_LOG_WARN(kChan, "SPURS {:#x}: no event helper ({}): shutdown-completion hooks are not called", spurs, why);
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.instances.find(spurs); it != h.instances.end()) it->second.helper_failed = true;
+    };
+    const u32 entry = p.descriptor_of(kModule, NID_event_helper);
+    if (!entry) return give_up("its function was not linked at load");
+    StackVar v(ctx, base, 0x60); // queue ID, port ID, the queue attribute (0x10), thread ID (0x28), param (0x30), name
+    const u32 queue_out = v.addr(), port_out = v.addr() + 4, qattr = v.addr() + 0x10, thread_out = v.addr() + 0x28,
+              param = v.addr() + 0x30, name = v.addr() + 0x38;
+    ps_write32(base, qattr, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, qattr + 4, lv2::SYS_PPU_QUEUE);
+    std::memcpy(base + qattr + 8, "_spuPrv", 8);
+    if (const s32 rc = lv2::sys_event_queue_create(t, queue_out, qattr, 0, 0x2A); rc != lv2::CELL_OK) {
+        return give_up(std::format("the event queue: {}", lv2::error_name(rc)));
+    }
+    const u32 queue = ps_read32(base, queue_out);
+    u8 spu_port = 0;
+    if (const s32 rc = attach_lv2_eq(ctx, spurs, queue, spu_port, true, true); rc != lv2::CELL_OK) {
+        lv2::sys_event_queue_destroy(t, queue, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+        return give_up(std::format("the SPU port: {:#x}", static_cast<u32>(rc)));
+    }
+    const auto undo_queue = [&] {
+        detach_lv2_eq(base, spurs, spu_port, true, t.kernel.config().sdk_version);
+        lv2::sys_event_queue_destroy(t, queue, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+    };
+    if (const s32 rc = lv2::sys_event_port_create(t, port_out, lv2::SYS_EVENT_PORT_LOCAL, 0); rc != lv2::CELL_OK) {
+        undo_queue();
+        return give_up(std::format("the event port: {}", lv2::error_name(rc)));
+    }
+    const u32 port = ps_read32(base, port_out);
+    if (const s32 rc = lv2::sys_event_port_connect_local(t, port, queue); rc != lv2::CELL_OK) {
+        lv2::sys_event_port_destroy(t, port);
+        undo_queue();
+        return give_up(std::format("connecting the event port: {}", lv2::error_name(rc)));
+    }
+    ps_write32(base, spurs + spurs_off::eventQueue, queue);
+    ps_write32(base, spurs + spurs_off::eventPort, port);
+    ps_write8(base, spurs + spurs_off::spuPort, spu_port);
+    const auto undo_ports = [&] {
+        lv2::sys_event_port_disconnect(t, port);
+        lv2::sys_event_port_destroy(t, port);
+        undo_queue();
+        ps_write32(base, spurs + spurs_off::eventQueue, 0);
+        ps_write32(base, spurs + spurs_off::eventPort, 0);
+        ps_write8(base, spurs + spurs_off::spuPort, 0);
+    };
+    const u32 tls = p.alloc_tls();
+    if (!tls) {
+        undo_ports();
+        return give_up("no TLS block");
+    }
+    ps_write32(base, param, entry);
+    ps_write32(base, param + 4, tls + kTlsR13Offset);
+    const u8 prefix_size = std::min<u8>(ps_read8(base, spurs + spurs_off::prefixSize), CELL_SPURS_NAME_MAX_LENGTH);
+    std::string thread_name(reinterpret_cast<const char*>(base + spurs + spurs_off::prefix), prefix_size);
+    thread_name = thread_name.c_str(); // the prefix is not NUL-terminated, and may hold NULs
+    thread_name += "SpursHdlr1";
+    thread_name.resize(std::min<usize>(thread_name.size(), 0x1F));
+    std::memset(base + name, 0, 0x20);
+    std::memcpy(base + name, thread_name.data(), thread_name.size());
+    const s32 prio = static_cast<s32>(ps_read32(base, spurs + spurs_off::ppuPriority));
+    s32 rc = lv2::_sys_ppu_thread_create(t, thread_out, param, spurs, 0, prio, 0x8000, 1 /* joinable */, name);
+    if (rc == lv2::CELL_OK) rc = lv2::sys_ppu_thread_start(t, static_cast<u32>(ps_read64(base, thread_out)));
+    if (rc != lv2::CELL_OK) {
+        p.free_tls(tls);
+        undo_ports();
+        return give_up(std::format("the thread: {}", lv2::error_name(rc)));
+    }
+    const u32 thread = static_cast<u32>(ps_read64(base, thread_out));
+    ps_write64(base, spurs + spurs_off::ppu1, thread);
+    std::lock_guard lock(h.mutex);
+    if (const auto it = h.instances.find(spurs); it != h.instances.end()) {
+        it->second.helper = thread;
+        it->second.helper_tls = tls;
+    }
+    PS_LOG_INFO(kChan, "SPURS {:#x}: event helper {:#x} \"{}\" (queue {:#x}, SPU port {:#x}, event port {:#x}) for the "
+        "shutdown-completion hooks", spurs, thread, thread_name, queue, spu_port, port);
+}
+
+// RPCS3 _spurs::stop_event_helper: the end event through the event port, the join, then the port, the SPU port and the
+// queue go, and ppu1 is "no thread" again.
+void stop_event_helper(PPUContext& ctx, u32 spurs, u32 thread, u32 tls)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 port = ps_read32(base, spurs + spurs_off::eventPort), queue = ps_read32(base, spurs + spurs_off::eventQueue);
+    if (const s32 rc = lv2::sys_event_port_send(t, port, 0, 1, 0); rc != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "SPURS {:#x}: the event helper's end event: {}", spurs, lv2::error_name(rc));
+    }
+    {
+        StackVar status(ctx, base, 8);
+        if (const s32 rc = lv2::sys_ppu_thread_join(t, thread, status.addr()); rc != lv2::CELL_OK) {
+            PS_LOG_ERROR(kChan, "SPURS {:#x}: joining the event helper {:#x}: {}", spurs, thread, lv2::error_name(rc));
+        }
+    }
+    HleProcess::current()->free_tls(tls);
+    ps_write64(base, spurs + spurs_off::ppu1, 0xFFFFFFFF);
+    lv2::sys_event_port_disconnect(t, port);
+    lv2::sys_event_port_destroy(t, port);
+    detach_lv2_eq(base, spurs, ps_read8(base, spurs + spurs_off::spuPort), true, t.kernel.config().sdk_version);
+    lv2::sys_event_queue_destroy(t, queue, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+}
+
+// A workload's shutdown is complete: the event to the helper when the workload's event byte had a hook or a waiter
+// (0x12) and no completion before (0x01), as RPCS3's cellSpursShutdownWorkload and the system service send it. Without
+// a helper there is no thread to run a hook on: logged. CELL_OK, or CORE_ERROR_STAT when the send fails (RPCS3).
+s32 notify_shutdown_completion(lv2::PpuThread& t, u32 spurs, u32 wid, u8 event_before)
+{
+    if (!(event_before & 0x12) || (event_before & 0x01)) return lv2::CELL_OK;
+    u8* base = t.kernel.base();
+    u32 helper = 0;
+    {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.instances.find(spurs); it != h.instances.end()) helper = it->second.helper;
+    }
+    if (!helper) {
+        if (event_before & 0x02) {
+            PS_LOG_WARN(kChan, "workload {} of SPURS {:#010x} shut down: its completion hook is not called (no event "
+                "helper)", wid, spurs);
+        }
+        return lv2::CELL_OK;
+    }
+    const u32 mask = wid < CELL_SPURS_MAX_WORKLOAD ? 0x80000000u >> wid : 0x8000u >> (wid & 15);
+    if (const s32 rc = lv2::sys_event_port_send(t, ps_read32(base, spurs + spurs_off::eventPort), 0, 0, mask);
+        rc != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "workload {} of SPURS {:#010x}: the shutdown completion event: {}", wid, spurs,
+            lv2::error_name(rc));
+        return error(CELL_SPURS_CORE_ERROR_STAT);
     }
     return lv2::CELL_OK;
 }
@@ -242,22 +553,71 @@ s32 cellSpursSetGlobalExceptionEventHandler(PPUContext& ctx, u32 spurs, u32 hand
     return rc;
 }
 
-s32 cellSpursInitializeWithAttribute(PPUContext& ctx, u32 spurs, u32 attr)
+// cellSpursUnsetGlobalExceptionEventHandler(spurs), as RPCS3 (libsre agrees): NULL, ALIGN, STAT (an instance in
+// exception state); then the argument and the handler cleared, in one update of their line.
+s32 cellSpursUnsetGlobalExceptionEventHandler(PPUContext& ctx, u32 spurs)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    reservation_op(base, spurs + spurs_off::globalSpuExceptionHandler, [](u8* line) {
+        ps_write64(line, 8, 0);
+        ps_write64(line, 0, 0);
+        return true;
+    });
+    return lv2::CELL_OK;
+}
+
+// cellSpursEnableExceptionEventHandler(spurs, flag), as RPCS3 (libsre agrees): NULL, ALIGN, then enableEH exchanged for
+// flag (1 or 0). RPCS3 then connects (or disconnects) the SPU thread group's exception event to the instance's queue
+// when the flag changes; a native SPURS has no group, and an SPU exception stops its worker with a log (CLAUDE.md
+// rule 5), so only the flag changes. CELL_OK.
+s32 cellSpursEnableExceptionEventHandler(PPUContext& ctx, u32 spurs, u32 flag)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    const u32 old = atomic_exchange_be32(guest_base(ctx), spurs + spurs_off::enableEH, (flag & 0xFF) ? 1 : 0);
+    PS_LOG_INFO(kChan, "cellSpursEnableExceptionEventHandler(SPURS {:#x}, {}): was {}", spurs, flag & 0xFF, old);
+    return lv2::CELL_OK;
+}
+
+// cellSpursInitializeWithAttribute and ...WithAttribute2, as RPCS3 (libsre agrees): NULL, ALIGN (8), a revision above
+// 2 (INVAL); then initialize with the attribute's values, its flags with exitIfNoWork's and, for the second,
+// SAF_SECOND_VERSION: a SPURS2 instance of 32 workloads (8 KB).
+s32 initialize_with_attribute(PPUContext& ctx, u32 spurs, u32 attr, bool second)
 {
     if (!attr) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
     if (attr % 8) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, second ? "cellSpursInitializeWithAttribute2" : "cellSpursInitializeWithAttribute",
+            "attribute", attr, attr_off::size, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
     u8* base = guest_base(ctx);
     const u32 revision = ps_read32(base, attr + attr_off::revision);
     if (revision > 2) return error(CELL_SPURS_CORE_ERROR_INVAL);
     const u32 flags = ps_read32(base, attr + attr_off::flags) |
-        (ps_read8(base, attr + attr_off::exitIfNoWork) ? SAF_EXIT_IF_NO_WORK : 0);
+        (ps_read8(base, attr + attr_off::exitIfNoWork) ? SAF_EXIT_IF_NO_WORK : 0) | (second ? SAF_SECOND_VERSION : 0);
     return initialize(ctx, spurs, revision, ps_read32(base, attr + attr_off::sdkVersion),
         static_cast<s32>(ps_read32(base, attr + attr_off::nSpus)), static_cast<s32>(ps_read32(base, attr + attr_off::spuPriority)),
         static_cast<s32>(ps_read32(base, attr + attr_off::ppuPriority)), flags, attr + attr_off::prefix,
-        ps_read32(base, attr + attr_off::prefixSize));
+        ps_read32(base, attr + attr_off::prefixSize), ps_read32(base, attr + attr_off::container));
 }
 
-// RPCS3's cellSpursFinalize is a TODO after its argument checks; here the host instance is released.
+s32 cellSpursInitializeWithAttribute(PPUContext& ctx, u32 spurs, u32 attr)
+{
+    return initialize_with_attribute(ctx, spurs, attr, false);
+}
+
+s32 cellSpursInitializeWithAttribute2(PPUContext& ctx, u32 spurs, u32 attr)
+{
+    PS_LOG_INFO(kChan, "cellSpursInitializeWithAttribute2(spurs {:#x}, attr {:#x})", spurs, attr);
+    return initialize_with_attribute(ctx, spurs, attr, true);
+}
+
+// RPCS3's cellSpursFinalize is a TODO after its argument checks; here the event helper (if any) and the workers stop
+// and the host instance is released.
 s32 cellSpursFinalize(PPUContext& ctx, u32 spurs)
 {
     PS_LOG_INFO(kChan, "cellSpursFinalize({:#x})", spurs);
@@ -266,18 +626,261 @@ s32 cellSpursFinalize(PPUContext& ctx, u32 spurs)
     if (ps_read8(guest_base(ctx), spurs + spurs_off::handlerExiting)) return error(CELL_SPURS_CORE_ERROR_STAT);
     SpursHost& h = host();
     std::shared_ptr<Scheduler> scheduler;
+    u32 helper = 0, helper_tls = 0;
     {
         std::lock_guard lock(h.mutex);
         const auto it = h.instances.find(spurs);
         if (it == h.instances.end()) return error(CELL_SPURS_CORE_ERROR_STAT);
         scheduler = it->second.scheduler;
+        helper = it->second.helper;
+        helper_tls = it->second.helper_tls;
+        it->second.helper = 0;
     }
+    if (helper) stop_event_helper(ctx, spurs, helper, helper_tls);
     // The workers stop before the instance goes: they take the host lock while they finish.
     if (scheduler) stop_scheduler_of(*scheduler);
     std::lock_guard lock(h.mutex);
     h.instances.erase(spurs);
     return lv2::CELL_OK;
 }
+
+// ------------------------------------------------------------------------------------------------- information
+
+// The native SPURS has no SPU thread group or SPU threads: the IDs a game asks for are CellSpurs::spuTG and spus[],
+// which stay 0, an ID lv2 refuses (ESRCH). Logged the first time.
+void note_no_thread_group(std::string_view fn, u32 spurs)
+{
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        PS_LOG_WARN(kChan, "{}(SPURS {:#x}): a native SPURS has no SPU thread group or SPU threads; their IDs are 0 "
+            "(logged once)", fn, spurs);
+    }
+}
+
+// cellSpursGetInfo(spurs, info), as libsre (RPCS3 agrees but for its TODO of syscall 253): NULL (spurs, info), ALIGN;
+// then CellSpursInfo's fields from CellSpurs: SPU and PPU priorities, exitIfNoWork and spurs2 from the flags, the trace
+// buffer (its low two bits are the trace mode), size, the thread group and threads (0 natively), the handler threads,
+// the name prefix (NUL-terminated) and its length. The deadline counters come from sys_spu_thread_group_syscall_253 for
+// an instance with the system workload; without a group natively they are 0, as without it.
+s32 cellSpursGetInfo(PPUContext& ctx, u32 spurs, u32 info)
+{
+    if (!spurs || !info) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpursGetInfo", "CellSpursInfo", info, 0x74, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    const u32 flags = ps_read32(base, spurs + spurs_off::flags);
+    ps_write32(base, info + 0x00, ps_read8(base, spurs + spurs_off::nSpus));
+    ps_write32(base, info + 0x04, ps_read32(base, spurs + spurs_off::spuPriority));
+    ps_write32(base, info + 0x08, ps_read32(base, spurs + spurs_off::ppuPriority));
+    ps_write8(base, info + 0x0C, (flags & SAF_EXIT_IF_NO_WORK) ? 1 : 0);
+    ps_write8(base, info + 0x0D, (flags & SAF_SECOND_VERSION) ? 1 : 0);
+    const u32 trace = static_cast<u32>(ps_read64(base, spurs + spurs_off::traceBuffer));
+    ps_write32(base, info + 0x10, trace & ~3u);
+    ps_write64(base, info + 0x18, ps_read64(base, spurs + spurs_off::traceDataSize));
+    ps_write32(base, info + 0x20, trace & 3u);
+    ps_write32(base, info + 0x24, ps_read32(base, spurs + spurs_off::spuTG));
+    for (u32 i = 0; i < CELL_SPURS_MAX_SPU; i++) ps_write32(base, info + 0x28 + 4 * i, ps_read32(base, spurs + spurs_off::spus + 4 * i));
+    ps_write64(base, info + 0x48, ps_read64(base, spurs + spurs_off::ppu0));
+    ps_write64(base, info + 0x50, ps_read64(base, spurs + spurs_off::ppu1));
+    const u8 prefix_size = std::min<u8>(ps_read8(base, spurs + spurs_off::prefixSize), CELL_SPURS_NAME_MAX_LENGTH);
+    std::memcpy(base + info + 0x58, base + spurs + spurs_off::prefix, prefix_size);
+    ps_write8(base, info + 0x58 + prefix_size, 0);
+    ps_write32(base, info + 0x68, prefix_size);
+    ps_write32(base, info + 0x6C, 0); // deadlineMissCounter
+    ps_write32(base, info + 0x70, 0); // deadlineMeetCounter
+    return lv2::CELL_OK;
+}
+
+// cellSpursGetNumSpuThread(spurs, nThreads), as RPCS3 (libsre agrees): NULL (both), ALIGN, then the instance's SPU count.
+s32 cellSpursGetNumSpuThread(PPUContext& ctx, u32 spurs, u32 nthreads)
+{
+    if (!spurs || !nthreads) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpursGetNumSpuThread", "count", nthreads, 4, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, nthreads, ps_read8(base, spurs + spurs_off::nSpus));
+    return lv2::CELL_OK;
+}
+
+// cellSpursGetSpuThreadGroupId(spurs, group), as RPCS3 (libsre agrees): NULL (both), ALIGN, then CellSpurs::spuTG: 0
+// natively, which no lv2 object has (see note_no_thread_group).
+s32 cellSpursGetSpuThreadGroupId(PPUContext& ctx, u32 spurs, u32 group)
+{
+    if (!spurs || !group) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpursGetSpuThreadGroupId", "group ID", group, 4,
+            CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    note_no_thread_group("cellSpursGetSpuThreadGroupId", spurs);
+    ps_write32(base, group, ps_read32(base, spurs + spurs_off::spuTG));
+    return lv2::CELL_OK;
+}
+
+// cellSpursGetSpuThreadId(spurs, thread, nThreads), as RPCS3 (libsre agrees): NULL (all three), ALIGN; then the first
+// min(*nThreads, nSpus) of CellSpurs::spus[] (0 natively, see note_no_thread_group) and that count in *nThreads.
+s32 cellSpursGetSpuThreadId(PPUContext& ctx, u32 spurs, u32 thread, u32 nthreads)
+{
+    constexpr std::string_view fn = "cellSpursGetSpuThreadId";
+    if (!spurs || !thread || !nthreads) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "count", nthreads, 4, CELL_SPURS_CORE_ERROR_NULL_POINTER); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    const u32 count = std::min<u32>(ps_read32(base, nthreads), ps_read8(base, spurs + spurs_off::nSpus));
+    if (const s32 rc = check_pointer(ctx, fn, "thread IDs", thread, 4 * count, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    note_no_thread_group(fn, spurs);
+    for (u32 i = 0; i < count; i++) ps_write32(base, thread + 4 * i, ps_read32(base, spurs + spurs_off::spus + 4 * i));
+    ps_write32(base, nthreads, count);
+    return lv2::CELL_OK;
+}
+
+// cellSpursGetSpuGuid(guid, dst), as libsre (RPCS3 checks the pointers and writes nothing): NULL (guid, dst), dst
+// 8-byte ALIGN; the 16 bytes at guid must be the .SpuGUID section's four SPU instructions `ila $2, (data << 2) | i`
+// for i = 0..3 (each byte masked as libsre does: 0xFE 0x00 0x01 0xFF; INVAL otherwise); the GUID is their four 16-bit
+// data fields, in order, as a big-endian u64.
+s32 cellSpursGetSpuGuid(PPUContext& ctx, u32 guid, u32 dst)
+{
+    constexpr std::string_view fn = "cellSpursGetSpuGuid";
+    if (!guid || !dst) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (dst % 8) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "GUID section", guid, 16, CELL_SPURS_CORE_ERROR_NULL_POINTER); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "destination", dst, 8, CELL_SPURS_CORE_ERROR_NULL_POINTER); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    static constexpr u8 kMask[4] = {0xFE, 0x00, 0x01, 0xFF};
+    static constexpr u8 kPattern[16] = {0x42, 0x00, 0x00, 0x02, 0x42, 0x00, 0x00, 0x82,
+                                        0x42, 0x00, 0x01, 0x02, 0x42, 0x00, 0x01, 0x82};
+    for (u32 i = 0; i < 16; i++) {
+        if ((ps_read8(base, guid + i) & kMask[i & 3]) != kPattern[i]) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    }
+    u64 value = 0;
+    for (u32 i = 0; i < 4; i++) value = (value << 16) | ((ps_read32(base, guid + 4 * i) >> 9) & 0xFFFF);
+    ps_write64(base, dst, value);
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- trace
+//
+// SPURS traces (RPCS3 _spurs::trace_initialize, trace_start, trace_stop and their exported functions; libsre agrees):
+// the PPU side keeps the buffer, its mode and the per-SPU start indices in CellSpurs, and the kernel's system service
+// writes the packets. No system service runs natively, so a trace buffer stays empty but for the header written here.
+
+constexpr u32 CELL_SPURS_TRACE_MODE_FLAG_WRAP_BUFFER = 0x1, CELL_SPURS_TRACE_MODE_FLAG_SYNCHRONOUS_START_STOP = 0x2,
+              CELL_SPURS_TRACE_MODE_FLAG_MASK = 0x3;
+constexpr u32 kTraceInfoSize = 0x80, kTracePacketSize = 0x10; // CellSpursTraceInfo, CellSpursTracePacket
+
+// RPCS3 _spurs::trace_status_update: once the system service has set the trace up on the SPUs
+// (sysSrvTraceInitialised), it is told to update (notify-complete and one message bit per SPU) and the caller waits on
+// the instance's semaphore for it. The native system service never sets it up, so this changes nothing; were the flag
+// set (a game writing it), there would be nobody to answer the wait: logged instead.
+void trace_status_update(u8* base, u32 spurs)
+{
+    bool initialised = false;
+    reservation_op(base, spurs + spurs_off::sysSrvTrace, [&](u8* line) {
+        const u32 off = spurs_off::sysSrvTrace % PS_RES_LINE_SIZE;
+        initialised = ps_read8(line, off) != 0;
+        if (!initialised) return false;
+        ps_write8(line, off + 1, 1);
+        ps_write8(line, off + 2, static_cast<u8>((1u << ps_read8(base, spurs + spurs_off::nSpus)) - 1));
+        return true;
+    });
+    if (initialised) {
+        PS_LOG_WARN(kChan, "SPURS {:#x}: a trace update for a system service that does not run natively; not waited for",
+            spurs);
+    }
+}
+
+// RPCS3 _spurs::trace_initialize: NULL (spurs, buffer), ALIGN (spurs 128, buffer 16), INVAL (a size below the
+// CellSpursTraceInfo header, a mode outside the two flags), STAT (a buffer already); then the data size, the header
+// (the SPU threads and group: 0 natively; the counts 0; the SPU count), the buffer with the wrap flag in its low bit, the
+// mode, each SPU's start index (8 + i * the packets per SPU, for six SPUs) and the trace control 0.
+s32 trace_initialize(PPUContext& ctx, u32 spurs, u32 buffer, u32 size, u32 mode, bool update)
+{
+    if (!spurs || !buffer) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN || buffer % 16) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (size < kTraceInfoSize || (mode & ~CELL_SPURS_TRACE_MODE_FLAG_MASK)) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    u8* base = guest_base(ctx);
+    if (ps_read64(base, spurs + spurs_off::traceBuffer)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    if (const s32 rc = check_pointer(ctx, "cellSpursTraceInitialize", "trace buffer", buffer, kTraceInfoSize,
+            CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    const u32 data_size = size - kTraceInfoSize;
+    ps_write64(base, spurs + spurs_off::traceDataSize, data_size);
+    for (u32 i = 0; i < 8; i++) {
+        ps_write32(base, buffer + 4 * i, ps_read32(base, spurs + spurs_off::spus + 4 * i));
+        ps_write32(base, buffer + 0x20 + 4 * i, 0);
+    }
+    ps_write32(base, buffer + 0x40, ps_read32(base, spurs + spurs_off::spuTG));
+    const u32 nspus = ps_read8(base, spurs + spurs_off::nSpus);
+    ps_write32(base, buffer + 0x44, nspus);
+    ps_write64(base, spurs + spurs_off::traceBuffer, buffer | ((mode & CELL_SPURS_TRACE_MODE_FLAG_WRAP_BUFFER) ? 1 : 0));
+    ps_write32(base, spurs + spurs_off::traceMode, mode);
+    const u32 per_spu = nspus ? data_size / kTracePacketSize / nspus : 0;
+    for (u32 i = 0, j = 8; i < 6; i++, j += per_spu) ps_write32(base, spurs + spurs_off::traceStartIndex + 4 * i, j);
+    ps_write8(base, spurs + spurs_off::sysSrvTraceControl, 0);
+    if (update) trace_status_update(base, spurs);
+    PS_LOG_INFO(kChan, "cellSpursTraceInitialize(SPURS {:#x}): buffer {:#x}, {:#x} bytes, mode {}; the native kernel "
+        "writes no packets", spurs, buffer, size, mode);
+    return lv2::CELL_OK;
+}
+
+// cellSpursTraceInitialize(spurs, buffer, size, mode), as RPCS3: STAT while libprof is loaded (never natively), then
+// trace_initialize with the status update.
+s32 cellSpursTraceInitialize(PPUContext& ctx, u32 spurs, u32 buffer, u32 size, u32 mode)
+{
+    return trace_initialize(ctx, spurs, buffer, size, mode, true);
+}
+
+// cellSpursTraceFinalize(spurs), as RPCS3: NULL, ALIGN, STAT without a buffer; then the control, the mode and the buffer
+// cleared, and the status update.
+s32 cellSpursTraceFinalize(PPUContext& ctx, u32 spurs)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (!ps_read64(base, spurs + spurs_off::traceBuffer)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    ps_write8(base, spurs + spurs_off::sysSrvTraceControl, 0);
+    ps_write32(base, spurs + spurs_off::traceMode, 0);
+    ps_write64(base, spurs + spurs_off::traceBuffer, 0);
+    trace_status_update(base, spurs);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 _spurs::trace_start (control 1) and trace_stop (control 2), and cellSpursTraceStart and cellSpursTraceStop:
+// NULL, ALIGN, STAT without a buffer; the status update only in the synchronous start/stop mode.
+s32 trace_control(PPUContext& ctx, u32 spurs, u8 control)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (!ps_read64(base, spurs + spurs_off::traceBuffer)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    ps_write8(base, spurs + spurs_off::sysSrvTraceControl, control);
+    if (ps_read32(base, spurs + spurs_off::traceMode) & CELL_SPURS_TRACE_MODE_FLAG_SYNCHRONOUS_START_STOP) {
+        trace_status_update(base, spurs);
+    }
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursTraceStart(PPUContext& ctx, u32 spurs) { return trace_control(ctx, spurs, 1); }
+s32 cellSpursTraceStop(PPUContext& ctx, u32 spurs) { return trace_control(ctx, spurs, 2); }
 
 // ------------------------------------------------------------------------------------------------- workloads
 
@@ -289,9 +892,11 @@ std::string priority_text(const u8 (&priority)[8])
     return out;
 }
 
-// RPCS3 _spurs::add_workload (SPURS1 workloads 0..15): claims the first free workload ID, fills its tables in the guest
-// CellSpurs, gives it the unique ID of an existing workload with the same policy module (or the lowest free one) and
-// makes it runnable. The native scheduler finds the workload through the host instance.
+// RPCS3 _spurs::add_workload: claims the first free workload ID (0..15, or 0..31 for SPURS2), fills its tables in the
+// guest CellSpurs (SPURS2's workloads 16..31 in the second tables and the high nibbles), gives it the unique ID of an
+// existing workload with the same policy module (or the lowest free one) and makes it runnable. The native scheduler
+// finds the workload through the host instance. The updates of CellSpurs' first two lines go through the reservation
+// system, so workers selecting meanwhile see them whole; the state turns RUNNABLE last.
 s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, const u8 (&priority)[8], u32 min_contention,
     u32 max_contention, u32 name_class, u32 name_instance, Workload::Kind kind, u32 hook = 0, u32 hook_arg = 0)
 {
@@ -310,22 +915,29 @@ s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, 
         return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
     }
     Instance& inst = it->second;
-    if (inst.second) {
-        PS_LOG_ERROR(kChan, "add_workload: SPURS2 (32 workloads) is not implemented");
-        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    }
+    const bool second = spurs2(base, spurs);
+    const u32 wmax = second ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD;
 
-    const u32 enabled = ps_read32(base, spurs + wkl_off::enabled);
-    const u32 wid = static_cast<u32>(std::countl_one(enabled));
+    constexpr u32 kLine1 = 0x80; // states, statuses, events, wklEnabled, wklMskB, sysSrvMsgUpdateWorkload (both tables)
+    u32 wid = CELL_SPURS_MAX_WORKLOAD2;
+    reservation_op(base, spurs + kLine1, [&](u8* line) {
+        const u32 enabled = ps_read32(line, wkl_off::enabled - kLine1);
+        wid = static_cast<u32>(std::countl_one(enabled));
+        if (wid >= wmax) return false;
+        ps_write32(line, wkl_off::enabled - kLine1, enabled | (0x80000000u >> wid));
+        return true;
+    });
     wid_out = wid;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return error(CELL_SPURS_POLICY_MODULE_ERROR_AGAIN);
-    ps_write32(base, spurs + wkl_off::enabled, enabled | (0x80000000u >> wid));
-    // RPCS3 ensure()s a free workload slot has no SPUs on it or switching to it. A native worker that selected the
-    // slot's previous workload just before its join removed it counts itself on the slot until its next selection,
-    // which comes at once, since the workload is gone (spurs_scheduler.cpp; D-136): that is waited for, up to a second.
+    if (wid >= wmax) return error(CELL_SPURS_POLICY_MODULE_ERROR_AGAIN);
+    const u32 j = wid & 15;
+    // RPCS3 ensure()s a free workload slot has no SPUs on it or switching to it (its nibble in SPURS2). A native worker
+    // that selected the slot's previous workload just before its join removed it counts itself on the slot until its
+    // next selection, which comes at once, since the workload is gone (spurs_scheduler.cpp; D-136): that is waited
+    // for, up to a second.
+    const u8 nibble = wid < CELL_SPURS_MAX_WORKLOAD ? 0x0F : 0xF0;
     const auto has_contention = [&] {
-        return (__atomic_load_n(base + spurs + wkl_off::currentContention + wid, __ATOMIC_SEQ_CST) & 0xF) ||
-               (ps_read8(base, spurs + wkl_off::pendingContention + wid) & 0xF);
+        return (__atomic_load_n(base + spurs + wkl_off::currentContention + j, __ATOMIC_SEQ_CST) & nibble) ||
+               (ps_read8(base, spurs + wkl_off::pendingContention + j) & nibble);
     };
     for (const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(1);
          has_contention() && std::chrono::steady_clock::now() < end;) {
@@ -333,51 +945,67 @@ s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, 
     }
     if (has_contention()) PS_FATAL(kChan, "add_workload: free workload {} of SPURS {:#010x} still has contention", wid, spurs);
 
-    ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_PREPARING);
-    ps_write8(base, spurs + wkl_off::status1 + wid, 0);
-    ps_write8(base, spurs + wkl_off::event1 + wid, 0);
-    const u32 info = spurs + wkl_off::info1 + wid * wkl_off::info_stride;
+    reservation_op(base, spurs + kLine1, [&](u8* line) {
+        ps_write8(line, wkl_state(wid) - kLine1, SPURS_WKL_STATE_PREPARING);
+        ps_write8(line, wkl_status(wid) - kLine1, 0);
+        ps_write8(line, wkl_event(wid) - kLine1, hook ? 2 : 0); // RPCS3: event bit 2 says there is a hook
+        return true;
+    });
+    const u32 info = wkl_info(spurs, wid);
     ps_write64(base, info + wkl_off::info_addr, pm);
     ps_write64(base, info + wkl_off::info_arg, data);
     ps_write32(base, info + wkl_off::info_size, size);
     for (u32 i = 0; i < 8; i++) ps_write8(base, info + wkl_off::info_priority + i, priority[i]);
-    const u32 names = spurs + wkl_off::h1 + wid * wkl_off::h_stride;
+    const u32 names = wkl_h(spurs, wid);
     ps_write64(base, names, name_class);
     ps_write64(base, names + 8, name_instance);
-    const u32 f = spurs + wkl_off::f1 + wid * wkl_off::f1_stride;
+    const u32 f = wkl_f(spurs, wid);
     std::memset(base + f, 0, 0x20);                 // keeps the semaphore at 0x20
     std::memset(base + f + 0x28, 0, 0x58);
-    if (hook) { // RPCS3: the shutdown-completion hook, and event bit 2 to say there is one
+    if (hook) { // RPCS3: the shutdown-completion hook
         ps_write64(base, f + wkl_off::f1_hook, hook);
         ps_write64(base, f + wkl_off::f1_hook_arg, hook_arg);
-        ps_write8(base, spurs + wkl_off::event1 + wid, static_cast<u8>(ps_read8(base, spurs + wkl_off::event1 + wid) | 2));
     }
-    ps_write8(base, spurs + wkl_off::idleSpuCountOrReadyCount2 + wid, 0);
-    ps_write8(base, spurs + wkl_off::minContention + wid, static_cast<u8>(std::min<u32>(min_contention, 8)));
-    ps_write8(base, spurs + wkl_off::readyCount1 + wid, 0);
-    const u8 maxc = ps_read8(base, spurs + wkl_off::maxContention + wid);
-    ps_write8(base, spurs + wkl_off::maxContention + wid, static_cast<u8>((maxc & 0xF0) | std::min<u32>(max_contention, 8)));
-    ps_write16(base, spurs + wkl_off::signal1, static_cast<u16>(ps_read16(base, spurs + wkl_off::signal1) & ~(0x8000u >> wid)));
-    if (ps_read8(base, spurs + spurs_off::wklFlagReceiver) == wid) ps_write8(base, spurs + spurs_off::wklFlagReceiver, 0xFF);
+    reservation_op(base, spurs, [&](u8* line) {
+        if (!second) { // in SPURS2 these bytes are workload wid + 16's ready count, and unused
+            ps_write8(line, wkl_off::idleSpuCountOrReadyCount2 + wid, 0);
+            ps_write8(line, wkl_off::minContention + wid, static_cast<u8>(std::min<u32>(min_contention, 8)));
+        }
+        ps_write8(line, wkl_ready(wid), 0);
+        const u8 maxc = ps_read8(line, wkl_off::maxContention + j);
+        ps_write8(line, wkl_off::maxContention + j, static_cast<u8>((maxc & ~nibble) |
+            (std::min<u32>(max_contention, 8) << (wid < CELL_SPURS_MAX_WORKLOAD ? 0 : 4))));
+        ps_write16(line, wkl_signal_of(wid), static_cast<u16>(ps_read16(line, wkl_signal_of(wid)) & ~wkl_signal_bit(wid)));
+        if (ps_read8(line, spurs_off::wklFlagReceiver) == wid) ps_write8(line, spurs_off::wklFlagReceiver, 0xFF);
+        return true;
+    });
 
-    // Unique ID: shared with an enabled workload using the same policy module, else the lowest unused one.
+    // Unique ID: shared with an enabled workload using the same policy module, else the lowest unused one (RPCS3's
+    // walk over wklMskB, every workload of the instance).
     const u32 mask = ps_read32(base, spurs + wkl_off::mskB) & ~(0x80000000u >> wid);
     u32 unique = 0, used = 0;
-    for (u32 i = 0, m = 0x80000000u; i < 32; i++, m >>= 1) {
-        if (!(mask & m) || i >= CELL_SPURS_MAX_WORKLOAD) continue;
-        const u32 other = spurs + wkl_off::info1 + i * wkl_off::info_stride;
+    for (u32 i = 0, m = 0x80000000u; i < CELL_SPURS_MAX_WORKLOAD2; i++, m >>= 1) {
+        if (!(mask & m)) continue;
+        const u32 other = wkl_info(spurs, i);
         if (ps_read64(base, other + wkl_off::info_addr) == pm) {
             unique = ps_read8(base, other + wkl_off::info_unique);
             break;
         }
-        used |= 0x80000000u >> ps_read8(base, other + wkl_off::info_unique);
+        used |= 0x80000000u >> (ps_read8(base, other + wkl_off::info_unique) & 31);
         unique = static_cast<u32>(std::countl_one(used));
     }
     ps_write8(base, info + wkl_off::info_unique, static_cast<u8>(unique));
-    ps_write32(base, spurs + wkl_off::mskB, mask | (0x80000000u >> wid));
-    ps_write8(base, spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_RUNNABLE);
-    ps_write8(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, 0xFF);
-    ps_write8(base, spurs + wkl_off::sysSrvMessage, 0xFF);
+    reservation_op(base, spurs + kLine1, [&](u8* line) {
+        ps_write32(line, wkl_off::mskB - kLine1, (ps_read32(line, wkl_off::mskB - kLine1) & ~(0x80000000u >> wid)) |
+            (0x80000000u >> wid));
+        ps_write8(line, wkl_state(wid) - kLine1, SPURS_WKL_STATE_RUNNABLE);
+        ps_write8(line, wkl_off::sysSrvMsgUpdateWorkload - kLine1, 0xFF);
+        return true;
+    });
+    reservation_op(base, spurs, [](u8* line) { // wakes the idle workers
+        ps_write8(line, wkl_off::sysSrvMessage, 0xFF);
+        return true;
+    });
 
     std::string label; // the class name's instance part, as the logs print it
     if (name_instance) label.assign(reinterpret_cast<const char*>(base + name_instance), strnlen(reinterpret_cast<const char*>(base + name_instance), 31));
@@ -456,9 +1084,22 @@ s32 cellSpursWorkloadAttributeSetName(PPUContext& ctx, u32 attr, u32 name_class,
     return lv2::CELL_OK;
 }
 
+// cellSpursWorkloadAttributeSetShutdownCompletionEventHook(attr, hook, arg), as RPCS3 (libsre agrees): NULL (attribute
+// or hook), ALIGN (8); the hook and its argument, which cellSpursAddWorkloadWithAttribute gives the workload. The event
+// helper calls it once the workload's shutdown is complete (see above).
+s32 cellSpursWorkloadAttributeSetShutdownCompletionEventHook(PPUContext& ctx, u32 attr, u32 hook, u32 arg)
+{
+    if (!attr || !hook) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    ps_write32(base, attr + wattr_off::hook, hook);
+    ps_write32(base, attr + wattr_off::hookArg, arg);
+    return lv2::CELL_OK;
+}
+
 // cellSpursAddWorkloadWithAttribute(spurs, wid, attr), as RPCS3: NULL, ALIGN (8), revision 1 only (INVAL), then the
 // add with the attribute's names and shutdown hook. Like cellSpursAddWorkload, a game's own policy module, which the
-// native scheduler runs (spurs_custom.cpp).
+// native scheduler runs (spurs_custom.cpp). A workload with a hook makes sure the instance has an event helper.
 s32 cellSpursAddWorkloadWithAttribute(PPUContext& ctx, u32 spurs, u32 wid, u32 attr)
 {
     if (!attr) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
@@ -479,11 +1120,13 @@ s32 cellSpursAddWorkloadWithAttribute(PPUContext& ctx, u32 spurs, u32 wid, u32 a
     const u32 name_class = ps_read32(base, attr + wattr_off::nameClass);
     const u32 name_instance = ps_read32(base, attr + wattr_off::nameInstance);
     u32 w = 0;
+    const u32 hook = ps_read32(base, attr + wattr_off::hook);
     const s32 r = add_workload(base, spurs, w, pm, size, data, prio, ps_read32(base, attr + wattr_off::minContention),
-        ps_read32(base, attr + wattr_off::maxContention), name_class, name_instance, Workload::Kind::Custom,
-        ps_read32(base, attr + wattr_off::hook), ps_read32(base, attr + wattr_off::hookArg));
+        ps_read32(base, attr + wattr_off::maxContention), name_class, name_instance, Workload::Kind::Custom, hook,
+        ps_read32(base, attr + wattr_off::hookArg));
     if (r == lv2::CELL_OK) {
         ps_write32(base, wid, w);
+        if (hook) ensure_event_helper(ctx, spurs);
         const auto name = [&](u32 addr) {
             return addr && guest_readable(t, addr, 1)
                 ? std::string(reinterpret_cast<const char*>(base + addr), strnlen(reinterpret_cast<const char*>(base + addr), 31))
@@ -499,38 +1142,196 @@ s32 cellSpursAddWorkloadWithAttribute(PPUContext& ctx, u32 spurs, u32 wid, u32 a
 }
 
 // The checks libsre's and RPCS3's workload functions share: NULL, 128-byte alignment, a workload ID within the
-// instance's 16 (32 for SPURS2), registered (SRCH), no exception (STAT).
-s32 check_workload(u8* base, u32 spurs, u32 wid)
+// instance's 16 (32 for SPURS2), registered (SRCH), no exception (STAT). `codes`: the error codes' base (the policy
+// module's 0x80410800 or the core's 0x80410700, whose functions make the same checks).
+s32 check_workload(u8* base, u32 spurs, u32 wid, u32 codes = 0x80410800)
 {
-    if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
-    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
-    const bool second = (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0;
-    if (wid >= (second ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
-        PS_LOG_ERROR(kChan, "SPURS2 workload {} is not implemented", wid);
-        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    }
-    if (!(ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid))) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
-    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    if (!spurs) return error(codes | 0x11);
+    if (spurs % CELL_SPURS_ALIGN) return error(codes | 0x10);
+    if (wid >= max_workloads(base, spurs)) return error(codes | 0x02);
+    if (!workload_enabled(base, spurs, wid)) return error(codes | 0x05);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(codes | 0x0F);
     return lv2::CELL_OK;
 }
 
-// cellSpursReadyCountStore(spurs, wid, value), as libsre (and RPCS3): check_workload, a value of at most 255 (INVAL), a
-// runnable workload (STAT), then the store. Through the reservation system, so idle workers see it at once (libsre
-// stores the byte; an SPU waiting on the line notices any store).
+// cellSpursReadyCountStore(spurs, wid, value), as libsre (and RPCS3): NULL, ALIGN, INVAL (a workload past the
+// instance's, a value above 255), SRCH, STAT (an exception, a workload not runnable), then the store (SPURS2's workloads
+// 16..31: wklIdleSpuCountOrReadyCount2). Through the reservation system, so idle workers see it at once (libsre stores
+// the byte; an SPU waiting on the line notices any store).
 s32 cellSpursReadyCountStore(PPUContext& ctx, u32 spurs, u32 wid, u32 value)
 {
     u8* base = guest_base(ctx);
+    if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    if (wid >= max_workloads(base, spurs) || value > 0xFF) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
     if (const s32 r = check_workload(base, spurs, wid); r != lv2::CELL_OK) return r;
-    if (value > 0xFF) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
-    if (ps_read8(base, spurs + wkl_off::state1 + wid) != SPURS_WKL_STATE_RUNNABLE) {
-        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    }
+    if (ps_read8(base, spurs + wkl_state(wid)) != SPURS_WKL_STATE_RUNNABLE) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
     reservation_op(base, spurs, [&](u8* line) {
-        ps_write8(line, wkl_off::readyCount1 + wid, static_cast<u8>(value));
+        ps_write8(line, wkl_ready(wid), static_cast<u8>(value));
         return true;
     });
     PS_LOG_DEBUG(kChan, "cellSpursReadyCountStore(SPURS {:#x}, workload {}, {})", spurs, wid, value);
+    return lv2::CELL_OK;
+}
+
+// cellSpursReadyCountSwap, ...CompareAndSwap and ...Add (RPCS3; libsre agrees): NULL (spurs, old), ALIGN, INVAL (a
+// workload past the instance's, an operand above 255), SRCH, STAT (an exception, a workload not runnable); then one
+// update of the ready count in CellSpurs line 0 (through the reservation system, as cellSpursReadyCountStore), and the
+// value before it in *old (u32).
+template <typename Op>
+s32 ready_count_op(PPUContext& ctx, std::string_view fn, u32 spurs, u32 wid, u32 old, bool operands_ok, Op&& op)
+{
+    if (!spurs || !old) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (wid >= max_workloads(base, spurs) || !operands_ok) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (ps_read32(base, spurs + wkl_off::exception) || ps_read8(base, spurs + wkl_state(wid)) != SPURS_WKL_STATE_RUNNABLE) {
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "old value", old, 4, CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8 before = 0;
+    reservation_op(base, spurs, [&](u8* line) {
+        before = ps_read8(line, wkl_ready(wid));
+        const u8 after = op(before);
+        if (after == before) return false; // nothing to store (a failed compare, a swap to the same count)
+        ps_write8(line, wkl_ready(wid), after);
+        return true;
+    });
+    ps_write32(base, old, before);
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursReadyCountSwap(PPUContext& ctx, u32 spurs, u32 wid, u32 old, u32 swap)
+{
+    return ready_count_op(ctx, "cellSpursReadyCountSwap", spurs, wid, old, swap <= 0xFF,
+        [swap](u8) { return static_cast<u8>(swap); });
+}
+
+s32 cellSpursReadyCountCompareAndSwap(PPUContext& ctx, u32 spurs, u32 wid, u32 old, u32 compare, u32 swap)
+{
+    return ready_count_op(ctx, "cellSpursReadyCountCompareAndSwap", spurs, wid, old, (swap | compare) <= 0xFF,
+        [compare, swap](u8 v) { return v == compare ? static_cast<u8>(swap) : v; });
+}
+
+// The sum clamps to 0..255 (RPCS3 std::clamp).
+s32 cellSpursReadyCountAdd(PPUContext& ctx, u32 spurs, u32 wid, u32 old, s32 value)
+{
+    return ready_count_op(ctx, "cellSpursReadyCountAdd", spurs, wid, old, true,
+        [value](u8 v) { return static_cast<u8>(std::clamp<s64>(s64{v} + value, 0, 255)); });
+}
+
+// cellSpursGetWorkloadData(spurs, data, wid), as RPCS3 (libsre agrees): NULL (spurs, data), ALIGN, INVAL (past the
+// instance's workloads), SRCH, STAT; then the workload's argument (WorkloadInfo.arg, u64).
+s32 get_workload_data(u8* base, u32 spurs, u32 wid, u64& data)
+{
+    if (const s32 rc = check_workload(base, spurs, wid); rc != lv2::CELL_OK) return rc;
+    data = ps_read64(base, wkl_info(spurs, wid) + wkl_off::info_arg);
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursGetWorkloadData(PPUContext& ctx, u32 spurs, u32 data, u32 wid)
+{
+    if (!spurs || !data) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    u64 value = 0;
+    if (const s32 rc = get_workload_data(guest_base(ctx), spurs, wid, value); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = check_pointer(ctx, "cellSpursGetWorkloadData", "data", data, 8, CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    ps_write64(guest_base(ctx), data, value);
+    return lv2::CELL_OK;
+}
+
+// cellSpursSetMaxContention(spurs, wid, maxContention), as RPCS3 (libsre agrees): the core's checks (NULL, ALIGN, INVAL,
+// SRCH, STAT), the maximum clamped to 8 and stored in the workload's maximum-contention byte (SPURS2: its nibble), in
+// one update of CellSpurs line 0 (which the workers see at once).
+s32 cellSpursSetMaxContention(PPUContext& ctx, u32 spurs, u32 wid, u32 max_contention)
+{
+    u8* base = guest_base(ctx);
+    if (const s32 rc = check_workload(base, spurs, wid, 0x80410700); rc != lv2::CELL_OK) return rc;
+    const u32 value = std::min<u32>(max_contention, CELL_SPURS_MAX_SPU);
+    const u32 shift = wid < CELL_SPURS_MAX_WORKLOAD ? 0 : 4;
+    reservation_op(base, spurs, [&](u8* line) {
+        const u8 old = ps_read8(line, wkl_off::maxContention + (wid & 15));
+        ps_write8(line, wkl_off::maxContention + (wid & 15),
+            static_cast<u8>((old & (wid < CELL_SPURS_MAX_WORKLOAD ? 0xF0 : 0x0F)) | (value << shift)));
+        return true;
+    });
+    return lv2::CELL_OK;
+}
+
+// cellSpursSetPriorities(spurs, wid, priorities), as RPCS3 (libsre agrees): the core's checks, a priority above 15
+// (INVAL); the eight priorities in WorkloadInfo, then every SPU's system service message (sysSrvMsgUpdateWorkload,
+// sysSrvMessage: 0xFF). Natively the workers read the priorities at every selection, and the message's store wakes the
+// idle ones. libsre first refuses the instance's system workload (it has no workload ID natively).
+s32 cellSpursSetPriorities(PPUContext& ctx, u32 spurs, u32 wid, u32 priorities)
+{
+    u8* base = guest_base(ctx);
+    if (const s32 rc = check_workload(base, spurs, wid, 0x80410700); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = check_pointer(ctx, "cellSpursSetPriorities", "priority table", priorities, 8,
+            CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    const u64 prio = ps_read64(base, priorities);
+    if (prio & 0xF0F0F0F0F0F0F0F0ull) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    __atomic_store_n(host_u64(base, wkl_info(spurs, wid) + wkl_off::info_priority), ps_bswap64(prio), __ATOMIC_RELEASE);
+    reservation_op(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, [](u8* line) {
+        ps_write8(line, wkl_off::sysSrvMsgUpdateWorkload % PS_RES_LINE_SIZE, 0xFF);
+        return true;
+    });
+    reservation_op(base, spurs, [](u8* line) {
+        ps_write8(line, wkl_off::sysSrvMessage, 0xFF);
+        return true;
+    });
+    return lv2::CELL_OK;
+}
+
+// cellSpursSetPriority(spurs, wid, spuId, priority), as RPCS3 (libsre agrees): NULL, ALIGN, INVAL (a workload past the
+// instance's; an SPU past its count or a priority above 15), SRCH, STAT; the priority on that SPU, then that SPU's bit
+// in sysSrvMsgUpdateWorkload and sysSrvMessage.
+s32 cellSpursSetPriority(PPUContext& ctx, u32 spurs, u32 wid, u32 spu, u32 priority)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    if (priority > 15 || spu >= ps_read8(base, spurs + spurs_off::nSpus)) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    if (const s32 rc = check_workload(base, spurs, wid, 0x80410700); rc != lv2::CELL_OK) return rc;
+    __atomic_store_n(base + wkl_info(spurs, wid) + wkl_off::info_priority + spu, static_cast<u8>(priority), __ATOMIC_RELEASE);
+    reservation_op(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, [spu](u8* line) {
+        const u32 off = wkl_off::sysSrvMsgUpdateWorkload % PS_RES_LINE_SIZE;
+        ps_write8(line, off, static_cast<u8>(ps_read8(line, off) | (1u << spu)));
+        return true;
+    });
+    reservation_op(base, spurs, [spu](u8* line) {
+        ps_write8(line, wkl_off::sysSrvMessage, static_cast<u8>(ps_read8(line, wkl_off::sysSrvMessage) | (1u << spu)));
+        return true;
+    });
+    return lv2::CELL_OK;
+}
+
+// cellSpursRequestIdleSpu(spurs, wid, count), as libsre: NULL, ALIGN, STAT for SPURS2 (the old API's byte is a ready
+// count there), INVAL (a workload past 15, a count above 8), SRCH, STAT; then the workload's idle SPU request
+// (wklIdleSpuCountOrReadyCount2), which the native selection adds to its ready count, as kernel 1's. RPCS3 has the same
+// steps with the core's error codes and refuses a count of 8; libsre's are the policy module's and 8 is accepted.
+s32 cellSpursRequestIdleSpu(PPUContext& ctx, u32 spurs, u32 wid, u32 count)
+{
+    if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (spurs2(base, spurs)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD || count > CELL_SPURS_MAX_SPU) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    reservation_op(base, spurs, [&](u8* line) {
+        ps_write8(line, wkl_off::idleSpuCountOrReadyCount2 + wid, static_cast<u8>(count));
+        return true;
+    });
     return lv2::CELL_OK;
 }
 
@@ -543,10 +1344,12 @@ s32 cellSpursGetWorkloadFlag(PPUContext& ctx, u32 spurs, u32 flag)
     return lv2::CELL_OK;
 }
 
-// _cellSpursWorkloadFlagReceiver(spurs, wid, isSet), as RPCS3: makes the workload the receiver of the workload flag
-// (BUSY if another one is), or stops it being the receiver; either way the flag is reset to "not raised" (all ones).
+// _cellSpursWorkloadFlagReceiver(spurs, wid, isSet) and _cellSpursWorkloadFlagReceiver2(spurs, wid, isSet, debug), as
+// RPCS3 (libsre agrees): check_workload; then in one update of CellSpurs line 0 the workload becomes the receiver of the
+// workload flag (BUSY if one is already) or stops being it (PERM if it is not the receiver). The first also resets the
+// flag to "not raised" (all ones); the second leaves it (and libsre prints a debug line when asked to: logged here).
 // Code that raises the flag stores 0 into it, which makes a worker select the receiver with poll status 4.
-s32 _cellSpursWorkloadFlagReceiver(PPUContext& ctx, u32 spurs, u32 wid, u32 is_set)
+s32 flag_receiver(PPUContext& ctx, std::string_view fn, u32 spurs, u32 wid, u32 is_set, bool reset_flag)
 {
     u8* base = guest_base(ctx);
     if (const s32 r = check_workload(base, spurs, wid); r != lv2::CELL_OK) return r;
@@ -554,18 +1357,31 @@ s32 _cellSpursWorkloadFlagReceiver(PPUContext& ctx, u32 spurs, u32 wid, u32 is_s
     reservation_op(base, spurs, [&](u8* line) {
         rc = lv2::CELL_OK;
         const u8 receiver = ps_read8(line, spurs_off::wklFlagReceiver);
-        if (is_set && receiver != 0xFF) {
-            rc = error(CELL_SPURS_POLICY_MODULE_ERROR_BUSY);
+        if (is_set ? receiver != 0xFF : receiver != wid) {
+            rc = error(is_set ? CELL_SPURS_POLICY_MODULE_ERROR_BUSY : CELL_SPURS_POLICY_MODULE_ERROR_PERM);
             return false;
         }
-        ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
-        if (is_set) ps_write8(line, spurs_off::wklFlagReceiver, static_cast<u8>(wid));
-        else if (receiver == wid) ps_write8(line, spurs_off::wklFlagReceiver, 0xFF);
+        if (reset_flag) ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
+        ps_write8(line, spurs_off::wklFlagReceiver, is_set ? static_cast<u8>(wid) : 0xFF);
         return true;
     });
-    PS_LOG_INFO(kChan, "_cellSpursWorkloadFlagReceiver(SPURS {:#x}, workload {}, {}) -> {:#x}", spurs, wid,
-        is_set ? "set" : "clear", static_cast<u32>(rc));
+    PS_LOG_INFO(kChan, "{}(SPURS {:#x}, workload {}, {}) -> {:#x}", fn, spurs, wid, is_set ? "set" : "clear",
+        static_cast<u32>(rc));
     return rc;
+}
+
+s32 _cellSpursWorkloadFlagReceiver(PPUContext& ctx, u32 spurs, u32 wid, u32 is_set)
+{
+    return flag_receiver(ctx, "_cellSpursWorkloadFlagReceiver", spurs, wid, is_set, true);
+}
+
+s32 _cellSpursWorkloadFlagReceiver2(PPUContext& ctx, u32 spurs, u32 wid, u32 is_set, u32 print_debug_output)
+{
+    if (print_debug_output) {
+        PS_LOG_DEBUG(kChan, "_cellSpursWorkloadFlagReceiver2(SPURS {:#x}, workload {}): the debug output libsre prints",
+            spurs, wid);
+    }
+    return flag_receiver(ctx, "_cellSpursWorkloadFlagReceiver2", spurs, wid, is_set, false);
 }
 
 // ------------------------------------------------------------------------------------------------- tasksets
@@ -690,47 +1506,261 @@ s32 cellSpursCreateTaskset(PPUContext& ctx, u32 spurs, u32 taskset, u64 args, u3
     return create_taskset(base, spurs, taskset, args, prio, max_contention, 0, kTasksetSize, 0);
 }
 
+// _cellSpursTasksetAttribute2Initialize(attr, revision), as RPCS3 (libsre agrees): the 512 bytes cleared, then the
+// revision, no name, arguments 0, priority 1 on every SPU, maximum contention 8, no LS clearing, no task name buffer.
+// Neither checks the pointer; one that is not guest memory is refused with TASK_ERROR_FAULT here (D-042).
+void write_taskset_attribute2_defaults(u8* base, u32 attr, u32 revision)
+{
+    std::memset(base + attr, 0, tsattr2_off::size);
+    ps_write32(base, attr + tsattr2_off::revision, revision);
+    ps_write32(base, attr + tsattr2_off::name, 0);
+    ps_write64(base, attr + tsattr2_off::args, 0);
+    std::memset(base + attr + tsattr2_off::priority, 1, 8);
+    ps_write32(base, attr + tsattr2_off::max_contention, 8);
+    ps_write32(base, attr + tsattr2_off::enable_clear_ls, 0);
+    ps_write32(base, attr + tsattr2_off::task_name_buffer, 0);
+}
+
+s32 _cellSpursTasksetAttribute2Initialize(PPUContext& ctx, u32 attr, u32 revision)
+{
+    if (const s32 rc = check_pointer(ctx, "_cellSpursTasksetAttribute2Initialize", "attribute", attr, tsattr2_off::size,
+            CELL_SPURS_TASK_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    write_taskset_attribute2_defaults(guest_base(ctx), attr, revision);
+    return lv2::CELL_OK;
+}
+
+// cellSpursCreateTaskset2(spurs, taskset, attr), as libsre (RPCS3 has its first two steps and a TODO): without an
+// attribute, _cellSpursTasksetAttribute2Initialize's defaults (revision 0); create_taskset for a CellSpursTaskset2
+// (10496 bytes) with the attribute's arguments, priorities, maximum contention, name and LS clearing; a task name buffer
+// not 16-byte aligned is ALIGN (after the taskset is created, as both). Then what libsre adds: the exit code handler's
+// descriptor at 0x1900 and the Task2 handler's at 0x78 (markers here: those handlers are libsre's SPU code), two lv2
+// event flags "taskset2" (priority protocol, waiters multiple) at 0x1898 and 0x189C, which cellSpursJoinTask2 waits on,
+// and the task name buffer, cleared (4 KB) and kept at 0x18A8. An event flag that cannot be created gives lv2's error
+// (the first one is destroyed when the second fails, as libsre; the workload stays added, as libsre). Tasks created with
+// cellSpursCreateTask run in it as in any taskset; CellSpursTaskset2's own tasks (cellSpursCreateTask2, JoinTask2) are
+// not implemented (D-171).
+s32 cellSpursCreateTaskset2(PPUContext& ctx, u32 spurs, u32 taskset, u32 attr)
+{
+    constexpr std::string_view fn = "cellSpursCreateTaskset2";
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar vars(ctx, base, tsattr2_off::size + 0x20); // the default attribute; the event flags' attribute
+    if (!attr) {
+        attr = vars.addr();
+        write_taskset_attribute2_defaults(base, attr, 0);
+    } else if (const s32 rc = check_pointer(ctx, fn, "attribute", attr, tsattr2_off::task_name_buffer + 4,
+                   CELL_SPURS_TASK_ERROR_FAULT);
+               rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8 prio[8];
+    std::memcpy(prio, base + attr + tsattr2_off::priority, 8);
+    const u32 name = ps_read32(base, attr + tsattr2_off::name);
+    if (const s32 rc = create_taskset(base, spurs, taskset, ps_read64(base, attr + tsattr2_off::args), prio,
+            ps_read32(base, attr + tsattr2_off::max_contention), name, kTaskset2Size,
+            static_cast<s32>(ps_read32(base, attr + tsattr2_off::enable_clear_ls)));
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    const u32 names = ps_read32(base, attr + tsattr2_off::task_name_buffer);
+    if (names % 16) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    ps_write64(base, taskset + ts_off::exit_code_handler,
+        SPURS_IMG_ADDR_TASK_EXIT_CODE_HANDLER | ((kTaskExitCodeHandlerSize + 127) >> 7));
+    ps_write64(base, taskset + ts_off::x78, SPURS_IMG_ADDR_TASK2_HANDLER | ((kTask2HandlerSize + 127) >> 7));
+    const u32 fattr = vars.addr() + tsattr2_off::size; // sys_event_flag_attribute_t
+    std::memset(base + fattr, 0, 0x20);
+    ps_write32(base, fattr + 0x00, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, fattr + 0x04, 0x200);   // SYS_SYNC_NOT_PROCESS_SHARED
+    ps_write32(base, fattr + 0x14, 0x20000); // SYS_SYNC_WAITER_MULTIPLE
+    std::memcpy(base + fattr + 0x18, "taskset2", 8);
+    if (const s32 rc = lv2::sys_event_flag_create(t, taskset + ts_off::event_flag_id1, fattr, 0); rc != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "{}({:#x}): its first event flag: {}", fn, taskset, lv2::error_name(rc));
+        return rc;
+    }
+    if (const s32 rc = lv2::sys_event_flag_create(t, taskset + ts_off::event_flag_id2, fattr, 0); rc != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "{}({:#x}): its second event flag: {}", fn, taskset, lv2::error_name(rc));
+        lv2::sys_event_flag_destroy(t, ps_read32(base, taskset + ts_off::event_flag_id1));
+        return rc;
+    }
+    if (names) {
+        if (const s32 rc = check_pointer(ctx, fn, "task name buffer", names, 0x1000, CELL_SPURS_TASK_ERROR_FAULT);
+            rc != lv2::CELL_OK) {
+            return rc;
+        }
+        std::memset(base + names, 0, 0x1000);
+        ps_write64(base, taskset + ts_off::task_name_buffer, names);
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    PS_LOG_INFO(kChan, "{}: CellSpursTaskset2 {:#x} (event flags {:#x} {:#x}, task names {:#x})", fn, taskset,
+        ps_read32(base, taskset + ts_off::event_flag_id1), ps_read32(base, taskset + ts_off::event_flag_id2), names);
+    return lv2::CELL_OK;
+}
+
+// _cellSpursTaskAttribute2Initialize(attr, revision), as libsre: the 256 bytes cleared, then the revision, no context
+// (size 0), an empty LS pattern and no name. RPCS3 writes the same fields without clearing the reserved bytes. A pointer
+// that is not guest memory is refused with TASK_ERROR_FAULT (D-042; neither checks it).
+s32 _cellSpursTaskAttribute2Initialize(PPUContext& ctx, u32 attr, u32 revision)
+{
+    if (const s32 rc = check_pointer(ctx, "_cellSpursTaskAttribute2Initialize", "attribute", attr, 0x100,
+            CELL_SPURS_TASK_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    std::memset(base + attr, 0, 0x100);
+    ps_write32(base, attr + 0x00, revision); // revision, sizeContext 0x04, eaContext 0x08 (u64), lsPattern 0x10, name 0x20
+    return lv2::CELL_OK;
+}
+
+// cellSpursTasksetAttributeEnableClearLS(attr, enable), as RPCS3: NULL, ALIGN (8), then 1 or 0.
+s32 cellSpursTasksetAttributeEnableClearLS(PPUContext& ctx, u32 attr, s32 enable)
+{
+    if (!attr) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    ps_write32(guest_base(ctx), attr + tsattr_off::enable_clear_ls, enable ? 1 : 0);
+    return lv2::CELL_OK;
+}
+
+// The checks of the taskset accessors below, as libsre: `outs` pointers NULL after the taskset (NULL_POINTER), the
+// taskset 128-byte aligned (ALIGN), a workload ID past 31 (INVAL; RPCS3 refuses one past 15, which SPURS2 tasksets have).
+// A taskset that is not guest memory is refused with TASK_ERROR_FAULT (D-042).
+s32 check_taskset(PPUContext& ctx, std::string_view fn, u32 taskset, std::initializer_list<u32> outs, bool check_wid)
+{
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    for (const u32 out : outs)
+        if (!out) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "taskset", taskset, ts_off::size + 4, CELL_SPURS_TASK_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    if (check_wid && ps_read32(guest_base(ctx), taskset + ts_off::wid) >= CELL_SPURS_MAX_WORKLOAD2) {
+        return error(CELL_SPURS_TASK_ERROR_INVAL);
+    }
+    for (const u32 out : outs) {
+        if (const s32 rc = check_pointer(ctx, fn, "output", out, 4, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) return rc;
+    }
+    return lv2::CELL_OK;
+}
+
+// cellSpursTasksetSetExceptionEventHandler(taskset, handler, arg), as libsre: the checks (the handler NULL), BUSY when one
+// is set already; then the argument and the handler (u64 each at 0x1888 and 0x1880). An SPU task's exception stops its
+// worker with a log natively (CLAUDE.md rule 5) rather than reaching the handler.
+s32 cellSpursTasksetSetExceptionEventHandler(PPUContext& ctx, u32 taskset, u32 handler, u32 arg)
+{
+    if (!taskset || !handler) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (const s32 rc = check_taskset(ctx, "cellSpursTasksetSetExceptionEventHandler", taskset, {}, true); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (ps_read64(base, taskset + ts_off::exception_handler)) return error(CELL_SPURS_TASK_ERROR_BUSY);
+    ps_write64(base, taskset + ts_off::exception_handler_arg, arg);
+    ps_write64(base, taskset + ts_off::exception_handler, handler);
+    return lv2::CELL_OK;
+}
+
+// cellSpursTasksetUnsetExceptionEventHandler(taskset), as libsre: the checks, then both cleared.
+s32 cellSpursTasksetUnsetExceptionEventHandler(PPUContext& ctx, u32 taskset)
+{
+    if (const s32 rc = check_taskset(ctx, "cellSpursTasksetUnsetExceptionEventHandler", taskset, {}, true); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write64(base, taskset + ts_off::exception_handler_arg, 0);
+    ps_write64(base, taskset + ts_off::exception_handler, 0);
+    return lv2::CELL_OK;
+}
+
+// cellSpursTasksetGetSpursAddress(taskset, spurs), as libsre: the checks, then the taskset's CellSpurs (u32).
+s32 cellSpursTasksetGetSpursAddress(PPUContext& ctx, u32 taskset, u32 spurs)
+{
+    if (const s32 rc = check_taskset(ctx, "cellSpursTasksetGetSpursAddress", taskset, {spurs}, true); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, spurs, static_cast<u32>(ps_read64(base, taskset + ts_off::spurs)));
+    return lv2::CELL_OK;
+}
+
+// cellSpursGetTasksetId(taskset, wid), as RPCS3 (libsre agrees): NULL, ALIGN, then the taskset's workload ID, whatever
+// it is.
+s32 cellSpursGetTasksetId(PPUContext& ctx, u32 taskset, u32 wid)
+{
+    if (const s32 rc = check_taskset(ctx, "cellSpursGetTasksetId", taskset, {wid}, false); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    ps_write32(base, wid, ps_read32(base, taskset + ts_off::wid));
+    return lv2::CELL_OK;
+}
+
+// cellSpursLookUpTasksetAddress(spurs, taskset, id), as RPCS3 (libsre agrees): NULL for the output, then
+// cellSpursGetWorkloadData on workload `id`, a policy module error becoming the task error (code ^ 0x100); the taskset
+// is the workload's argument.
+s32 cellSpursLookUpTasksetAddress(PPUContext& ctx, u32 spurs, u32 taskset, u32 id)
+{
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    u64 data = 0;
+    if (const s32 rc = get_workload_data(guest_base(ctx), spurs, id, data); rc != lv2::CELL_OK) {
+        return static_cast<s32>(static_cast<u32>(rc) ^ 0x100);
+    }
+    if (const s32 rc = check_pointer(ctx, "cellSpursLookUpTasksetAddress", "output", taskset, 4, CELL_SPURS_TASK_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    ps_write32(guest_base(ctx), taskset, static_cast<u32>(data));
+    return lv2::CELL_OK;
+}
+
 // cellSpursShutdownWorkload, checked against libsre (fw 4.92), which RPCS3 follows: NULL, ALIGN, INVAL for a
 // workload ID past the instance's 16 (32 for SPURS2), SRCH for a workload that is not registered (its wklEnabled bit
 // clear), STAT for an instance in exception state or a workload not yet runnable. The native scheduler does not keep
 // wklStatus (which SPUs run a workload; status 0), so a shutdown makes the workload removable at once: a worker that is
-// running it leaves at its next poll, since the selection only takes runnable workloads. The shutdown-completion
-// notification libsre and RPCS3 send to the SPURS event port (when a hook is registered) has no handler thread to go
-// to natively; it is logged instead.
-s32 shutdown_workload(u8* base, u32 spurs, u32 wid)
+// running it leaves at its next poll, since the selection only takes runnable workloads. When the workload has a
+// shutdown-completion hook (event bit 0x02) or a waiter (0x10), its completion goes to the event helper, which calls the
+// hook once the workers left (RPCS3 and libsre send it through the SPURS event port; a failed send is CORE STAT).
+s32 shutdown_workload(PPUContext& ctx, u32 spurs, u32 wid)
 {
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
     if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
     if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
-    const bool second = (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0;
-    if (wid >= (second ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
-    if (!(ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid))) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
     if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
-        PS_LOG_ERROR(kChan, "shutdown_workload: SPURS2 workload {} is not implemented", wid);
-        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    u8 event = 0;
+    {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        u8* const state = base + spurs + wkl_state(wid);
+        const u8 now = __atomic_load_n(state, __ATOMIC_SEQ_CST);
+        if (now <= SPURS_WKL_STATE_PREPARING) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+        if (now == SPURS_WKL_STATE_SHUTTING_DOWN || now == SPURS_WKL_STATE_REMOVABLE) return lv2::CELL_OK;
+        // libsre also reads wklStatus2[wid] for workloads 0..15 (RPCS3 reads only wklStatus1).
+        if (ps_read8(base, spurs + wkl_status(wid)) || (wid < CELL_SPURS_MAX_WORKLOAD && ps_read8(base, spurs + wkl_off::status2 + wid))) {
+            __atomic_store_n(state, SPURS_WKL_STATE_SHUTTING_DOWN, __ATOMIC_SEQ_CST);
+            ps_write8(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, 0xFF);
+            reservation_op(base, spurs, [](u8* line) {
+                ps_write8(line, wkl_off::sysSrvMessage, 0xFF);
+                return true;
+            });
+            return lv2::CELL_OK;
+        }
+        // Sequentially consistent: a worker that selected the workload before this reads the state again after counting
+        // itself inside (spurs_scheduler.cpp), and a join reads the state and then that count (D-136).
+        __atomic_store_n(state, SPURS_WKL_STATE_REMOVABLE, __ATOMIC_SEQ_CST);
+        event = __atomic_fetch_or(base + spurs + wkl_event(wid), u8{1}, __ATOMIC_SEQ_CST);
     }
-    SpursHost& h = host();
-    std::lock_guard lock(h.mutex);
-    const u8 state = ps_read8(base, spurs + wkl_off::state1 + wid);
-    if (state <= SPURS_WKL_STATE_PREPARING) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    if (state == SPURS_WKL_STATE_SHUTTING_DOWN || state == SPURS_WKL_STATE_REMOVABLE) return lv2::CELL_OK;
-    // libsre also reads wklStatus2[wid] for workloads 0..15 (RPCS3 reads only wklStatus1).
-    if (ps_read8(base, spurs + wkl_off::status1 + wid) || ps_read8(base, spurs + wkl_off::status2 + wid)) {
-        __atomic_store_n(base + spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_SHUTTING_DOWN, __ATOMIC_SEQ_CST);
-        ps_write8(base, spurs + wkl_off::sysSrvMsgUpdateWorkload, 0xFF);
-        ps_write8(base, spurs + wkl_off::sysSrvMessage, 0xFF);
-        return lv2::CELL_OK;
-    }
-    // Sequentially consistent: a worker that selected the workload before this reads the state again after counting
-    // itself inside (spurs_scheduler.cpp), and a join reads the state and then that count (D-136).
-    __atomic_store_n(base + spurs + wkl_off::state1 + wid, SPURS_WKL_STATE_REMOVABLE, __ATOMIC_SEQ_CST);
-    const u8 event = ps_read8(base, spurs + wkl_off::event1 + wid);
-    ps_write8(base, spurs + wkl_off::event1 + wid, static_cast<u8>(event | 1));
-    if ((event & 0x12) && !(event & 1)) {
-        PS_LOG_WARN(kChan, "workload {} of SPURS {:#010x} shut down: its completion hook is not called (not implemented)",
-            wid, spurs);
-    }
-    return lv2::CELL_OK;
+    return notify_shutdown_completion(t, spurs, wid, event);
+}
+
+// cellSpursShutdownWorkload(spurs, wid): shutdown_workload.
+s32 cellSpursShutdownWorkload(PPUContext& ctx, u32 spurs, u32 wid)
+{
+    const s32 rc = shutdown_workload(ctx, spurs, wid);
+    PS_LOG_INFO(kChan, "cellSpursShutdownWorkload(SPURS {:#x}, workload {}) -> {:#x}", spurs, wid, static_cast<u32>(rc));
+    return rc;
 }
 
 // cellSpursShutdownTaskset as libsre (fw 4.92): NULL, ALIGN, INVAL for a workload ID past 31 in the taskset, then
@@ -753,7 +1783,7 @@ s32 cellSpursShutdownTaskset(PPUContext& ctx, u32 taskset)
     const u32 wid = ps_read32(base, taskset + ts_off::wid);
     if (wid >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
     const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
-    s32 r = shutdown_workload(base, spurs, wid);
+    s32 r = shutdown_workload(ctx, spurs, wid);
     PS_LOG_INFO(kChan, "cellSpursShutdownTaskset({:#010x}): workload {} of SPURS {:#x} -> {:#x}", taskset, wid, spurs,
         static_cast<u32>(r));
     if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN) || r == error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH)) {
@@ -771,49 +1801,56 @@ s32 cellSpursShutdownTaskset(PPUContext& ctx, u32 taskset)
 // job or task: the wait is for both (D-136), so the game may free what the workload used once a join returns. A
 // workload an SPU shut down (a job chain's error) becomes removable here once its last worker left. The PPU
 // thread sleeps 100 us at a time, as the thread's other waits, so a stop request still ends it. Not a second waiter's
-// STAT (RPCS3's wklSyncInfo x28): the native wait keeps no slot to be taken.
+// STAT (RPCS3's wklSyncInfo x28): the native wait keeps no slot to be taken. A workload with a shutdown-completion hook
+// is waited for until its hook ran (event bit 0x20, which the event helper sets; RPCS3's waiter wakes on the semaphore
+// the helper posts after the hook), when it has a helper. The waiter marks itself in the event byte (0x10) as RPCS3's
+// does. A workload another thread removed meanwhile ends the wait with SRCH.
 s32 wait_for_workload_shutdown(PPUContext& ctx, u32 spurs, u32 wid)
 {
     u8* base = guest_base(ctx);
     if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
     if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
-    const bool second = (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0;
-    if (wid >= (second ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
-    if (!(ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid))) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
     if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
-        PS_LOG_ERROR(kChan, "wait_for_workload_shutdown: SPURS2 workload {} is not implemented", wid);
-        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    }
     std::shared_ptr<Scheduler> scheduler;
+    bool helper = false;
     {
         SpursHost& h = host();
         std::lock_guard lock(h.mutex);
-        if (const auto it = h.instances.find(spurs); it != h.instances.end()) scheduler = it->second.scheduler;
+        if (const auto it = h.instances.find(spurs); it != h.instances.end()) {
+            scheduler = it->second.scheduler;
+            helper = it->second.helper != 0;
+        }
     }
     lv2::PpuThread& t = thread_of(ctx);
-    u8* const state = base + spurs + wkl_off::state1 + wid;
+    u8* const state = base + spurs + wkl_state(wid);
+    u8* const event = base + spurs + wkl_event(wid);
+    // RPCS3: a waiter that will wait (no completion yet, or a hook not called yet) sets bit 0x10.
+    for (u8 e = __atomic_load_n(event, __ATOMIC_SEQ_CST); !(e & 0x01) || (e & 0x22) == 0x02;) {
+        if (__atomic_compare_exchange_n(event, &e, static_cast<u8>(e | 0x10), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+    }
+    const u8 nibble = wid < CELL_SPURS_MAX_WORKLOAD ? 0x0F : 0xF0;
     for (;;) {
+        if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
         // Removable, no worker inside, and none still counted on it: a worker gives its contention back at its next
         // selection, a moment after it leaves (so a workload added in the slot next finds none).
         const u8 now = __atomic_load_n(state, __ATOMIC_SEQ_CST);
         const bool left = (!scheduler || workers_inside(*scheduler, wid) == 0) &&
-                          !(__atomic_load_n(base + spurs + wkl_off::currentContention + wid, __ATOMIC_SEQ_CST) & 0x0F);
-        if (now == SPURS_WKL_STATE_REMOVABLE && left) break;
+            !(__atomic_load_n(base + spurs + wkl_off::currentContention + (wid & 15), __ATOMIC_SEQ_CST) & nibble);
+        if (now == SPURS_WKL_STATE_REMOVABLE && left && !(helper && hook_pending(__atomic_load_n(event, __ATOMIC_SEQ_CST)))) {
+            break;
+        }
         if (now == SPURS_WKL_STATE_SHUTTING_DOWN && left) {
             // The system service's step when the last SPU leaves a workload that shuts down (RPCS3
-            // spursSysServiceUpdateWorkload and spursSysServiceUpdateShutdownCompletionEvents): removable, and the
-            // completion bit in its event byte. Natively the waiter takes it: a job chain that halts on an error shuts
-            // its workload down from the SPU (spurs_jobchain.cpp), and no system service runs. Checked again after this
-            // store, so a worker that counted itself inside meanwhile is seen.
+            // spursSysServiceUpdateWorkload and spursSysServiceUpdateShutdownCompletionEvents): removable, the
+            // completion bit in its event byte, and the completion to the event helper. Natively the waiter takes it: a
+            // job chain that halts on an error shuts its workload down from the SPU (spurs_jobchain.cpp), and no system
+            // service runs. Checked again after this store, so a worker that counted itself inside meanwhile is seen.
             u8 expected = SPURS_WKL_STATE_SHUTTING_DOWN;
             if (__atomic_compare_exchange_n(state, &expected, SPURS_WKL_STATE_REMOVABLE, false, __ATOMIC_SEQ_CST,
                     __ATOMIC_SEQ_CST)) {
-                const u8 event = __atomic_fetch_or(base + spurs + wkl_off::event1 + wid, u8{1}, __ATOMIC_SEQ_CST);
-                if ((event & 0x12) && !(event & 1)) {
-                    PS_LOG_WARN(kChan, "workload {} of SPURS {:#010x} shut down: its completion hook is not called (not "
-                        "implemented)", wid, spurs);
-                }
+                notify_shutdown_completion(t, spurs, wid, __atomic_fetch_or(event, u8{1}, __ATOMIC_SEQ_CST));
             }
             continue;
         }
@@ -824,6 +1861,15 @@ s32 wait_for_workload_shutdown(PPUContext& ctx, u32 spurs, u32 wid)
     return lv2::CELL_OK;
 }
 
+// cellSpursWaitForWorkloadShutdown(spurs, wid): wait_for_workload_shutdown.
+s32 cellSpursWaitForWorkloadShutdown(PPUContext& ctx, u32 spurs, u32 wid)
+{
+    const s32 rc = wait_for_workload_shutdown(ctx, spurs, wid);
+    PS_LOG_INFO(kChan, "cellSpursWaitForWorkloadShutdown(SPURS {:#x}, workload {}) -> {:#x}", spurs, wid,
+        static_cast<u32>(rc));
+    return rc;
+}
+
 // cellSpursRemoveWorkload, as RPCS3 (cellSpurs.cpp): NULL, ALIGN, INVAL, SRCH, STAT; BUSY while the workload shuts
 // down, STAT unless it is removable; the workload flag released if it receives it; then in one update of the state line
 // the state NON_EXISTENT and its enabled and mskB bits cleared. The native instance forgets the workload too.
@@ -832,17 +1878,10 @@ s32 remove_workload(PPUContext& ctx, u32 spurs, u32 wid)
     u8* base = guest_base(ctx);
     if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
     if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
-    const bool second = (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD2 || (wid >= CELL_SPURS_MAX_WORKLOAD && !second)) {
-        return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
-    }
-    if (!(ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid))) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
     if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
-        PS_LOG_ERROR(kChan, "remove_workload: SPURS2 workload {} is not implemented", wid);
-        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    }
-    switch (ps_read8(base, spurs + wkl_off::state1 + wid)) {
+    switch (ps_read8(base, spurs + wkl_state(wid))) {
     case SPURS_WKL_STATE_SHUTTING_DOWN: return error(CELL_SPURS_POLICY_MODULE_ERROR_BUSY);
     case SPURS_WKL_STATE_REMOVABLE: break;
     default: return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
@@ -853,11 +1892,11 @@ s32 remove_workload(PPUContext& ctx, u32 spurs, u32 wid)
                 static_cast<u32>(r));
         }
     }
-    constexpr u32 kLine = wkl_off::state1; // state1, enabled and mskB share the line at 0x80
-    static_assert(wkl_off::enabled - kLine < 128 && wkl_off::mskB - kLine < 128);
+    constexpr u32 kLine = wkl_off::state1; // both state tables, enabled and mskB share the line at 0x80
+    static_assert(wkl_off::enabled - kLine < 128 && wkl_off::mskB - kLine < 128 && wkl_off::state2 + 15 - kLine < 128);
     s32 rc = lv2::CELL_OK;
     reservation_op(base, spurs + kLine, [&](u8* line) {
-        u8& state = line[wid];
+        u8& state = line[wkl_state(wid) - kLine];
         if (state == SPURS_WKL_STATE_SHUTTING_DOWN) {
             rc = error(CELL_SPURS_POLICY_MODULE_ERROR_BUSY); // re-verified, as RPCS3 (libsre does not)
             return false;
@@ -878,6 +1917,14 @@ s32 remove_workload(PPUContext& ctx, u32 spurs, u32 wid)
         std::lock_guard lock(h.mutex);
         if (const auto it = h.instances.find(spurs); it != h.instances.end()) it->second.workloads.erase(wid);
     }
+    return rc;
+}
+
+// cellSpursRemoveWorkload(spurs, wid): remove_workload.
+s32 cellSpursRemoveWorkload(PPUContext& ctx, u32 spurs, u32 wid)
+{
+    const s32 rc = remove_workload(ctx, spurs, wid);
+    PS_LOG_INFO(kChan, "cellSpursRemoveWorkload(SPURS {:#x}, workload {}) -> {:#x}", spurs, wid, static_cast<u32>(rc));
     return rc;
 }
 
@@ -1153,22 +2200,29 @@ s32 check_task(PPUContext& ctx, std::string_view what, const TaskSpec& s, u32& s
     return lv2::CELL_OK;
 }
 
-// RPCS3 cellSpursSendWorkloadSignal (SPURS1 workloads): sets the workload's bit in wklSignal1.
+// RPCS3 cellSpursSendWorkloadSignal (libsre agrees): NULL, ALIGN, INVAL (past the instance's workloads), SRCH, STAT (an
+// exception, a workload not runnable); then the workload's bit in wklSignal1 (SPURS2's 16..31: wklSignal2), which the
+// native selection reads, in one update of CellSpurs line 0 (which wakes idle workers).
 s32 send_workload_signal(u8* base, u32 spurs, u32 wid)
 {
     if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
     if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
-    if (!(ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid))) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
     if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    if (ps_read8(base, spurs + wkl_off::state1 + wid) != SPURS_WKL_STATE_RUNNABLE) {
-        return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
-    }
+    if (ps_read8(base, spurs + wkl_state(wid)) != SPURS_WKL_STATE_RUNNABLE) return error(CELL_SPURS_POLICY_MODULE_ERROR_STAT);
     reservation_op(base, spurs, [wid](u8* line) {
-        ps_write16(line, wkl_off::signal1, static_cast<u16>(ps_read16(line, wkl_off::signal1) | (0x8000u >> wid)));
+        ps_write16(line, wkl_signal_of(wid), static_cast<u16>(ps_read16(line, wkl_signal_of(wid)) | wkl_signal_bit(wid)));
         return true;
     });
     return lv2::CELL_OK;
+}
+
+s32 cellSpursSendWorkloadSignal(PPUContext& ctx, u32 spurs, u32 wid)
+{
+    const s32 rc = send_workload_signal(guest_base(ctx), spurs, wid);
+    PS_LOG_DEBUG(kChan, "cellSpursSendWorkloadSignal(SPURS {:#x}, workload {}) -> {:#x}", spurs, wid, static_cast<u32>(rc));
+    return rc;
 }
 
 // cellSpursWakeUp (RPCS3; libsre's checks are the same): marks the SPURS handler dirty. On the PS3 that wakes SPURS'
@@ -1692,8 +2746,8 @@ s32 cellSpursEventFlagSet(PPUContext& ctx, u32 event_flag, u16 bits)
         if (!(pending_recv & (0x8000 >> slot))) continue;
         u32 taskset = static_cast<u32>(ps_read64(base, event_flag + ef_off::addr));
         if (ps_read8(base, event_flag + ef_off::isIwl)) {
-            const u32 wid = ps_read8(base, event_flag + ef_off::waitingTaskWklId + slot);
-            taskset = static_cast<u32>(ps_read64(base, taskset + wkl_off::info1 + wid * wkl_off::info_stride + wkl_off::info_arg));
+            const u32 wid = ps_read8(base, event_flag + ef_off::waitingTaskWklId + slot) & 31;
+            taskset = static_cast<u32>(ps_read64(base, wkl_info(taskset, wid) + wkl_off::info_arg));
         }
         const u32 task = ps_read8(base, event_flag + ef_off::waitingTaskId + slot);
         const s32 rc = send_signal(base, taskset, task);
@@ -1802,6 +2856,104 @@ s32 cellSpursEventFlagWait(PPUContext& ctx, u32 event_flag, u32 mask, u32 mode)
     return event_flag_wait(ctx, event_flag, mask, mode, true);
 }
 
+// cellSpursEventFlagTryWait(eventFlag, mask, mode), as RPCS3: event_flag_wait without blocking (BUSY when the
+// condition is not met; no lv2 queue needed).
+s32 cellSpursEventFlagTryWait(PPUContext& ctx, u32 event_flag, u32 mask, u32 mode)
+{
+    return event_flag_wait(ctx, event_flag, mask, mode, false);
+}
+
+// cellSpursEventFlagClear(eventFlag, bits), as RPCS3 (libsre agrees): NULL, ALIGN (128), then the bits cleared from the
+// events in one update of the flag's line (SPU tasks update it with GETLLAR/PUTLLC; libsre with ldarx/stdcx.).
+s32 cellSpursEventFlagClear(PPUContext& ctx, u32 event_flag, u16 bits)
+{
+    if (!event_flag) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (event_flag % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpursEventFlagClear", "event flag", event_flag, ef_off::size,
+            CELL_SPURS_TASK_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    reservation_op(guest_base(ctx), event_flag, [bits](u8* ef) {
+        const u16 events = ps_read16(ef, ef_off::events);
+        if (!(events & bits)) return false; // nothing to clear: nothing stored
+        ps_write16(ef, ef_off::events, static_cast<u16>(events & ~bits));
+        return true;
+    });
+    return lv2::CELL_OK;
+}
+
+// The event flag getters, as libsre: the flag NULL, its 128-byte ALIGN, then the output NULL (RPCS3 checks both NULLs
+// before the alignment). A flag or output that is not guest memory is refused with TASK_ERROR_FAULT (D-042).
+s32 check_event_flag_getter(PPUContext& ctx, std::string_view fn, u32 event_flag, u32 out)
+{
+    if (!event_flag) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (event_flag % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (!out) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (const s32 rc = check_pointer(ctx, fn, "event flag", event_flag, ef_off::size, CELL_SPURS_TASK_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    return check_pointer(ctx, fn, "output", out, 4, CELL_SPURS_TASK_ERROR_FAULT);
+}
+
+// cellSpursEventFlagGetDirection(eventFlag, direction): the flag's direction (u32; libsre sign-extends the byte).
+s32 cellSpursEventFlagGetDirection(PPUContext& ctx, u32 event_flag, u32 direction)
+{
+    if (const s32 rc = check_event_flag_getter(ctx, "cellSpursEventFlagGetDirection", event_flag, direction); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, direction, static_cast<u32>(static_cast<s8>(ps_read8(base, event_flag + ef_off::direction))));
+    return lv2::CELL_OK;
+}
+
+// cellSpursEventFlagGetClearMode(eventFlag, clearMode): the flag's clear mode (u32).
+s32 cellSpursEventFlagGetClearMode(PPUContext& ctx, u32 event_flag, u32 clear_mode)
+{
+    if (const s32 rc = check_event_flag_getter(ctx, "cellSpursEventFlagGetClearMode", event_flag, clear_mode); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, clear_mode, static_cast<u32>(static_cast<s8>(ps_read8(base, event_flag + ef_off::clearMode))));
+    return lv2::CELL_OK;
+}
+
+// cellSpursEventFlagGetTasksetAddress(eventFlag, taskset): the flag's taskset (u32), 0 for one made for the whole
+// SPURS instance (isIwl).
+s32 cellSpursEventFlagGetTasksetAddress(PPUContext& ctx, u32 event_flag, u32 taskset)
+{
+    if (const s32 rc = check_event_flag_getter(ctx, "cellSpursEventFlagGetTasksetAddress", event_flag, taskset);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, taskset, ps_read8(base, event_flag + ef_off::isIwl) ? 0 : static_cast<u32>(ps_read64(base, event_flag + ef_off::addr)));
+    return lv2::CELL_OK;
+}
+
+// _cellSpursLFQueueInitialize(tasksetOrSpurs, queue, buffer, size, depth, direction), as libsre: a 16-byte aligned
+// tasksetOrSpurs is a taskset, whose workload ID must be at most 31 (TASK_ERROR_INVAL; RPCS3 checks nothing); then
+// cellSyncLFQueueInitialize(queue, buffer, size, depth, direction, tasksetOrSpurs) (cellSync.cpp), its error becoming the
+// task error with the same low byte (0x80410900 | code & 0xFF, RPCS3's SyncErrorToSpursError). A taskset that is not
+// guest memory is refused with TASK_ERROR_FAULT (D-042).
+s32 _cellSpursLFQueueInitialize(PPUContext& ctx, u32 taskset_or_spurs, u32 queue, u32 buffer, u32 size, u32 depth,
+    u32 direction)
+{
+    if (taskset_or_spurs % 16 == 0) {
+        if (const s32 rc = check_pointer(ctx, "_cellSpursLFQueueInitialize", "taskset", taskset_or_spurs + ts_off::wid, 4,
+                CELL_SPURS_TASK_ERROR_FAULT);
+            rc != lv2::CELL_OK) {
+            return rc;
+        }
+        if (ps_read32(guest_base(ctx), taskset_or_spurs + ts_off::wid) >= CELL_SPURS_MAX_WORKLOAD2) {
+            return error(CELL_SPURS_TASK_ERROR_INVAL);
+        }
+    }
+    const s32 rc = sync_lfqueue_initialize(ctx, queue, buffer, size, depth, direction, taskset_or_spurs);
+    return rc < 0 ? static_cast<s32>(0x80410900u | (static_cast<u32>(rc) & 0xFF)) : rc;
+}
+
 // ------------------------------------------------------------------------------------------------- barriers
 
 // RPCS3 cellSpursBarrierInitialize. CellSpursBarrier (128 bytes, 128-aligned): zero, remained (u32), taskset at 0x34.
@@ -1815,6 +2967,26 @@ s32 cellSpursBarrierInitialize(PPUContext& ctx, u32 taskset, u32 barrier, u32 to
     std::memset(base + barrier, 0, 128);
     ps_write32(base, barrier + 0x04, total);
     ps_write32(base, barrier + 0x34, taskset);
+    return lv2::CELL_OK;
+}
+
+// cellSpursBarrierGetTasksetAddress(barrier, taskset), as libsre: the barrier NULL, its 128-byte ALIGN, the output NULL
+// (RPCS3 checks both NULLs first); then the barrier's taskset (the low word of its u64 at 0x30). Memory that is not
+// guest memory is refused with TASK_ERROR_FAULT (D-042).
+s32 cellSpursBarrierGetTasksetAddress(PPUContext& ctx, u32 barrier, u32 taskset)
+{
+    constexpr std::string_view fn = "cellSpursBarrierGetTasksetAddress";
+    if (!barrier) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (barrier % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (const s32 rc = check_pointer(ctx, fn, "barrier", barrier, 128, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "output", taskset, 4, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, taskset, ps_read32(base, barrier + 0x34));
     return lv2::CELL_OK;
 }
 
@@ -1897,10 +3069,95 @@ s32 cellSpursJobChainAttributeSetHaltOnError(PPUContext& ctx, u32 attr)
     return lv2::CELL_OK;
 }
 
-// cellSpursCreateJobChainWithAttribute + create_job_chain as libsre (fw 4.92, D-054; RPCS3 has the same steps but
-// swaps sizeJobDescriptor and maxGrabbedJob and leaves out autoReadyCount and haltOnError), with the native job chain
-// marker as the policy module. Deviations: no "JobChain" class name, and libsre's one-title firmware quirk (val2F) is
-// not reproduced (no title checks in the runtime, rule 6).
+// libsre's create_job_chain, which cellSpursCreateJobChain and cellSpursCreateJobChainWithAttribute share (fw 4.92,
+// D-054; RPCS3 _spurs::create_job_chain has the same steps but swaps sizeJobDescriptor and maxGrabbedJob and leaves
+// out autoReadyCount and haltOnError): the tags, the haltOnError bit of the flags byte, the entry, sizes, autoReadyCount,
+// the SPURS address, the revision by the process's SDK (1 from 1.5, else 0), the workload (the native job chain marker as
+// its policy module, minimum contention 1; a policy module error AGAIN, INVAL or STAT becomes the job error), then the
+// error, its cause and the workload ID. Deviations: no "JobChain" class name, and libsre's one-title firmware quirk
+// (val2F) is not reproduced (no title checks in the runtime, rule 6).
+s32 create_job_chain(u8* base, u32 spurs, u32 job_chain, u32 entry, u16 size_job, u16 max_grabbed, const u8 (&priority)[8],
+    u32 max_contention, bool auto_ready_count, u32 tag1, u32 tag2, bool halt_on_error, u32 name, u32& wid)
+{
+    const u32 sdk = HleProcess::current()->kernel().config().sdk_version;
+    ps_write8(base, job_chain + jc_off::tag1, static_cast<u8>(tag1));
+    ps_write8(base, job_chain + jc_off::tag2, static_cast<u8>(tag2));
+    const u8 flags = ps_read8(base, job_chain + jc_off::flags);
+    ps_write8(base, job_chain + jc_off::flags,
+        static_cast<u8>((flags & ~jc_off::flagHaltOnError) | (halt_on_error ? jc_off::flagHaltOnError : 0)));
+    ps_write64(base, job_chain + jc_off::pc, entry);
+    ps_write16(base, job_chain + jc_off::sizeJobDescriptor, size_job);
+    ps_write16(base, job_chain + jc_off::maxGrabbedJob, max_grabbed);
+    ps_write8(base, job_chain + jc_off::autoReadyCount, auto_ready_count ? 1 : 0);
+    ps_write64(base, job_chain + jc_off::spurs, spurs);
+    ps_write8(base, job_chain + jc_off::isHalted, 0);
+    ps_write8(base, job_chain + jc_off::jmVer, sdk > 0x14FFFF ? CELL_SPURS_JOB_REVISION_1 : CELL_SPURS_JOB_REVISION_0);
+    ps_write8(base, job_chain + jc_off::val2F, 0);
+    if (s32 r = add_workload(base, spurs, wid, SPURS_IMG_ADDR_JOB_CHAIN_PM, 0, job_chain, priority, 1, max_contention, 0,
+            name, Workload::Kind::JobChain);
+        r != lv2::CELL_OK) {
+        if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_AGAIN)) r = error(CELL_SPURS_JOB_ERROR_AGAIN);
+        else if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL)) r = error(CELL_SPURS_JOB_ERROR_INVAL);
+        else if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) r = error(CELL_SPURS_JOB_ERROR_STAT);
+        return r;
+    }
+    ps_write64(base, job_chain + jc_off::cause, 0);
+    ps_write32(base, job_chain + jc_off::error, 0);
+    ps_write32(base, job_chain + jc_off::workloadId, wid);
+    return lv2::CELL_OK;
+}
+
+// cellSpursCreateJobChain(spurs, jobChain, jobChainEntry, sizeJobDescriptor, maxGrabbedJob, priorities, maxContention,
+// autoReadyCount, tag1, tag2) (the old API; tag1 and tag2 come from the caller's stack), as libsre: its argument check
+// (the entry NULL or not 8-aligned; INVAL for a grab limit outside 1..16, a tag above 31, a priority above 15), INVAL
+// for a descriptor size other than 64, 128 or 256, then NULL and ALIGN (128) for the SPURS instance and the chain, the
+// chain's 0x110 bytes cleared and create_job_chain with no name and no haltOnError: a chain of revision 0 or 1, which
+// cellSpursKickJobChain starts. RPCS3's always fails: it checks the attribute fields the old API has not (a maximum
+// descriptor size of 0 is INVAL). An unreadable priority table is refused with INVAL and a log (D-042).
+s32 cellSpursCreateJobChain(PPUContext& ctx, u32 spurs, u32 job_chain, u32 entry, u16 size_job, u16 max_grabbed,
+    u32 priorities, u32 max_contention, u32 auto_ready_count, u32 tag1, u32 tag2)
+{
+    PS_LOG_INFO(kChan, "cellSpursCreateJobChain(spurs {:#x}, jobChain {:#x}, entry {:#x}, sizeJob {:#x}, maxGrab {}, "
+        "maxContention {}, autoReadyCount {}, tags {}/{})", spurs, job_chain, entry, size_job, max_grabbed, max_contention,
+        auto_ready_count & 0xFF, tag1, tag2);
+    if (!entry) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (entry % 8) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (!max_grabbed || max_grabbed > 16 || tag1 > 31 || tag2 > 31) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (const s32 rc = check_pointer(ctx, "cellSpursCreateJobChain", "priority table", priorities, 8,
+            CELL_SPURS_JOB_ERROR_INVAL);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    u8 priority[8];
+    for (u32 i = 0; i < 8; i++) {
+        priority[i] = ps_read8(base, priorities + i);
+        if (priority[i] > 15) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    }
+    if (size_job != 64 && size_job != 128 && size_job != 256) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (!spurs || !job_chain) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN || job_chain % 128) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpursCreateJobChain", "job chain", job_chain, 0x110,
+            CELL_SPURS_JOB_ERROR_INVAL);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    std::memset(base + job_chain, 0, 0x110);
+    u32 wid = 0;
+    if (const s32 rc = create_job_chain(base, spurs, job_chain, entry, size_job, max_grabbed, priority, max_contention,
+            (auto_ready_count & 0xFF) != 0, tag1, tag2, false, 0, wid);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    PS_LOG_INFO(kChan, "job chain {:#010x} (old API, revision {}) is workload {} of SPURS {:#010x}", job_chain,
+        ps_read8(base, job_chain + jc_off::jmVer), wid, spurs);
+    return lv2::CELL_OK;
+}
+
+// cellSpursCreateJobChainWithAttribute as libsre (fw 4.92, D-054): the attribute's checks, NULL and ALIGN for the chain
+// and the SPURS instance, the chain cleared, revision 2 or 3 only (INVAL), the flags byte (fixed memory, the maximum
+// descriptor size, haltOnError), create_job_chain, then the requested SPU count, the attribute's revision, SDK version
+// and memory check.
 s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_chain, u32 attr)
 {
     if (!attr) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
@@ -1928,35 +3185,15 @@ s32 cellSpursCreateJobChainWithAttribute(PPUContext& ctx, u32 spurs, u32 job_cha
     if (jm_ver != CELL_SPURS_JOB_REVISION_2 && jm_ver != CELL_SPURS_JOB_REVISION_3) return error(CELL_SPURS_JOB_ERROR_INVAL);
     const bool halt_on_error = ps_read32(base, attr + jcattr_off::haltOnError) != 0;
     ps_write8(base, job_chain + jc_off::flags,
-        static_cast<u8>((fixed_mem ? jc_off::flagFixedMem : 0) | ((((max_size_job - 0x100) / 128) & 7) << 4) |
-                        (halt_on_error ? jc_off::flagHaltOnError : 0)));
-
-    // _spurs::create_job_chain
-    const u32 sdk = HleProcess::current()->kernel().config().sdk_version;
-    ps_write64(base, job_chain + jc_off::spurs, spurs);
-    ps_write8(base, job_chain + jc_off::jmVer, sdk > 0x14FFFF ? CELL_SPURS_JOB_REVISION_1 : CELL_SPURS_JOB_REVISION_0);
-    ps_write8(base, job_chain + jc_off::val2F, 0);
-    ps_write8(base, job_chain + jc_off::tag1, static_cast<u8>(tag1));
-    ps_write8(base, job_chain + jc_off::tag2, static_cast<u8>(tag2));
-    ps_write8(base, job_chain + jc_off::isHalted, 0);
-    ps_write16(base, job_chain + jc_off::sizeJobDescriptor, size_job);
-    ps_write16(base, job_chain + jc_off::maxGrabbedJob, max_grabbed);
-    ps_write8(base, job_chain + jc_off::autoReadyCount, auto_spu_count ? 1 : 0);
-    ps_write64(base, job_chain + jc_off::pc, entry);
+        static_cast<u8>((fixed_mem ? jc_off::flagFixedMem : 0) | ((((max_size_job - 0x100) / 128) & 7) << 4)));
     u8 priority[8];
     for (u32 i = 0; i < 8; i++) priority[i] = static_cast<u8>(prio >> (56 - 8 * i));
     u32 wid = 0;
-    if (s32 r = add_workload(base, spurs, wid, SPURS_IMG_ADDR_JOB_CHAIN_PM, 0, job_chain, priority, 1, max_contention, 0,
-            ps_read32(base, attr + jcattr_off::name), Workload::Kind::JobChain);
+    if (const s32 r = create_job_chain(base, spurs, job_chain, entry, size_job, max_grabbed, priority, max_contention,
+            auto_spu_count, tag1, tag2, halt_on_error, ps_read32(base, attr + jcattr_off::name), wid);
         r != lv2::CELL_OK) {
-        if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_AGAIN)) r = error(CELL_SPURS_JOB_ERROR_AGAIN);
-        else if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL)) r = error(CELL_SPURS_JOB_ERROR_INVAL);
-        else if (r == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) r = error(CELL_SPURS_JOB_ERROR_STAT);
         return r;
     }
-    ps_write64(base, job_chain + jc_off::cause, 0);
-    ps_write32(base, job_chain + jc_off::error, 0);
-    ps_write32(base, job_chain + jc_off::workloadId, wid);
     // back in cellSpursCreateJobChainWithAttribute
     ps_write8(base, job_chain + jc_off::initSpuCount, static_cast<u8>(init_spu_count));
     ps_write8(base, job_chain + jc_off::jmVer, static_cast<u8>(jm_ver));
@@ -2028,7 +3265,7 @@ s32 cellSpursShutdownJobChain(PPUContext& ctx, u32 job_chain)
     u32 wid = 0, spurs = 0;
     s32 rc;
     if (!job_chain_workload(ctx, "cellSpursShutdownJobChain", job_chain, wid, spurs, rc)) return rc;
-    rc = shutdown_workload(guest_base(ctx), spurs, wid);
+    rc = shutdown_workload(ctx, spurs, wid);
     PS_LOG_INFO(kChan, "cellSpursShutdownJobChain({:#010x}): workload {} of SPURS {:#x} -> {:#x}", job_chain, wid, spurs,
         static_cast<u32>(rc));
     return rc == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT) ? error(CELL_SPURS_JOB_ERROR_STAT) : rc;
@@ -2078,6 +3315,305 @@ s32 cellSpursAddUrgentCommand(PPUContext& ctx, u32 job_chain, u64 command)
     PS_LOG_DEBUG(kChan, "cellSpursAddUrgentCommand({:#010x}, {:#018x}): workload {} of SPURS {:#x} -> {:#x}", job_chain,
         command, wid, spurs, static_cast<u32>(rc));
     return rc;
+}
+
+// cellSpursAddUrgentCall(jobChain, commandList), as RPCS3 (libsre agrees): the list NULL, not 8-aligned (ALIGN), then
+// cellSpursAddUrgentCommand with CALL to the list (its address | 4).
+s32 cellSpursAddUrgentCall(PPUContext& ctx, u32 job_chain, u32 command_list)
+{
+    if (!command_list) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (command_list % 8) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    return cellSpursAddUrgentCommand(ctx, job_chain, u64{command_list} | 4);
+}
+
+// The checks of the job chain getters and setters below, as libsre: the chain NULL, `outs` NULL (NULL_POINTER), the
+// chain 128-byte aligned (ALIGN), and with `check_wid` a workload ID past 31 (INVAL). A chain or output that is not guest
+// memory is refused with INVAL and a log, as cellSpursRunJobChain does.
+s32 check_job_chain(PPUContext& ctx, std::string_view fn, u32 job_chain, std::initializer_list<u32> outs, bool check_wid)
+{
+    if (!job_chain) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    for (const u32 out : outs)
+        if (!out) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (job_chain % 128) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "job chain", job_chain, 0xA8, CELL_SPURS_JOB_ERROR_INVAL); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    if (check_wid && ps_read32(guest_base(ctx), job_chain + jc_off::workloadId) >= CELL_SPURS_MAX_WORKLOAD2) {
+        return error(CELL_SPURS_JOB_ERROR_INVAL);
+    }
+    for (const u32 out : outs) {
+        if (const s32 rc = check_pointer(ctx, fn, "output", out, 4, CELL_SPURS_JOB_ERROR_INVAL); rc != lv2::CELL_OK) return rc;
+    }
+    return lv2::CELL_OK;
+}
+
+// cellSpursKickJobChain(jobChain, numReadyCount), as libsre: NULL, ALIGN, INVAL (a workload ID past 31), PERM for a chain
+// of revision 2 or 3 (those run with cellSpursRunJobChain); a chain with autoReadyCount gets ready count 1 if it had
+// none (cellSpursReadyCountCompareAndSwap 0 -> 1: its policy keeps the count itself from then on), one without it the
+// count given (cellSpursReadyCountStore), either result ignored; then cellSpursWakeUp, whose STAT becomes JOB_ERROR_STAT
+// and any other result CELL_OK. RPCS3 has the two ready count operations the other way round and passes the wake-up's
+// result through. A worker then runs the chain with the native job chain policy.
+s32 cellSpursKickJobChain(PPUContext& ctx, u32 job_chain, u32 num_ready_count)
+{
+    if (const s32 rc = check_job_chain(ctx, "cellSpursKickJobChain", job_chain, {}, true); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    if (ps_read8(base, job_chain + jc_off::jmVer) > CELL_SPURS_JOB_REVISION_1) return error(CELL_SPURS_JOB_ERROR_PERM);
+    const u32 wid = ps_read32(base, job_chain + jc_off::workloadId);
+    const u32 spurs = static_cast<u32>(ps_read64(base, job_chain + jc_off::spurs));
+    StackVar old(ctx, base, 8);
+    if (ps_read8(base, job_chain + jc_off::autoReadyCount)) {
+        cellSpursReadyCountCompareAndSwap(ctx, spurs, wid, old.addr(), 0, 1);
+    } else {
+        cellSpursReadyCountStore(ctx, spurs, wid, num_ready_count & 0xFF);
+    }
+    const s32 woken = cellSpursWakeUp(ctx, spurs);
+    PS_LOG_DEBUG(kChan, "cellSpursKickJobChain({:#010x}, {}): workload {} of SPURS {:#x}", job_chain, num_ready_count & 0xFF,
+        wid, spurs);
+    return woken == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT) ? error(CELL_SPURS_JOB_ERROR_STAT) : lv2::CELL_OK;
+}
+
+// cellSpursGetJobChainId(jobChain, id), as RPCS3 (libsre agrees): NULL (both), ALIGN, then the workload ID.
+s32 cellSpursGetJobChainId(PPUContext& ctx, u32 job_chain, u32 id)
+{
+    if (const s32 rc = check_job_chain(ctx, "cellSpursGetJobChainId", job_chain, {id}, false); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    ps_write32(base, id, ps_read32(base, job_chain + jc_off::workloadId));
+    return lv2::CELL_OK;
+}
+
+// cellSpursJobChainGetError(jobChain, cause), as libsre: NULL (both; RPCS3 does not check cause), ALIGN; the chain's
+// error word is the result, and *cause its cause (u32), or 0 when there is no error.
+s32 cellSpursJobChainGetError(PPUContext& ctx, u32 job_chain, u32 cause)
+{
+    if (const s32 rc = check_job_chain(ctx, "cellSpursJobChainGetError", job_chain, {cause}, false); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    const s32 chain_error = static_cast<s32>(ps_read32(base, job_chain + jc_off::error));
+    ps_write32(base, cause, chain_error ? static_cast<u32>(ps_read64(base, job_chain + jc_off::cause)) : 0);
+    return chain_error;
+}
+
+// cellSpursJobChainGetSpursAddress(jobChain, spurs), as libsre: NULL (both), ALIGN, INVAL for a workload ID past 31 (RPCS3
+// does not check it); then the chain's CellSpurs (u32).
+s32 cellSpursJobChainGetSpursAddress(PPUContext& ctx, u32 job_chain, u32 spurs)
+{
+    if (const s32 rc = check_job_chain(ctx, "cellSpursJobChainGetSpursAddress", job_chain, {spurs}, true); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, spurs, static_cast<u32>(ps_read64(base, job_chain + jc_off::spurs)));
+    return lv2::CELL_OK;
+}
+
+// cellSpursJobChainAttributeSetJobTypeMemoryCheck(attr), as RPCS3 (libsre agrees): NULL, ALIGN (8), then the attribute's
+// jobMemoryCheck, which cellSpursCreateJobChainWithAttribute gives the chain. The memory check itself is not done
+// natively (spurs_jobchain.cpp: the jobs run without it, logged once).
+s32 cellSpursJobChainAttributeSetJobTypeMemoryCheck(PPUContext& ctx, u32 attr)
+{
+    if (!attr) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    ps_write8(guest_base(ctx), attr + jcattr_off::jobMemoryCheck, 1);
+    return lv2::CELL_OK;
+}
+
+// cellSpursJobChainSetExceptionEventHandler(jobChain, handler, arg), as RPCS3 (libsre agrees): NULL (chain, handler),
+// ALIGN, INVAL (a workload ID past 31), BUSY when one is set; then the argument (u64 at 0xA0) and the handler (0x98). A
+// job that faults stops its worker with a log natively (CLAUDE.md rule 5) rather than reaching the handler.
+s32 cellSpursJobChainSetExceptionEventHandler(PPUContext& ctx, u32 job_chain, u32 handler, u32 arg)
+{
+    if (!job_chain || !handler) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (const s32 rc = check_job_chain(ctx, "cellSpursJobChainSetExceptionEventHandler", job_chain, {}, true);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (ps_read64(base, job_chain + jc_off::exceptionHandler)) return error(CELL_SPURS_JOB_ERROR_BUSY);
+    ps_write64(base, job_chain + jc_off::exceptionHandlerArg, arg);
+    ps_write64(base, job_chain + jc_off::exceptionHandler, handler);
+    return lv2::CELL_OK;
+}
+
+// cellSpursJobChainUnsetExceptionEventHandler(jobChain), as RPCS3 (libsre agrees): NULL, ALIGN, INVAL; both cleared.
+s32 cellSpursJobChainUnsetExceptionEventHandler(PPUContext& ctx, u32 job_chain)
+{
+    if (const s32 rc = check_job_chain(ctx, "cellSpursJobChainUnsetExceptionEventHandler", job_chain, {}, true);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write64(base, job_chain + jc_off::exceptionHandlerArg, 0);
+    ps_write64(base, job_chain + jc_off::exceptionHandler, 0);
+    return lv2::CELL_OK;
+}
+
+// CellSpursWorkloadInfo's fields as libsre's cellSpursGetWorkloadInfo fills them (RPCS3's is a TODO), for
+// cellSpursGetJobChainInfo, which only reads the instance name: NULL, ALIGN, INVAL, SRCH (no exception check), then the
+// name from wklH (wklH2 for SPURS2's 16..31).
+s32 workload_name_instance(u8* base, u32 spurs, u32 wid, u32& name)
+{
+    if (!spurs) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    name = static_cast<u32>(ps_read64(base, wkl_h(spurs, wid) + 8));
+    return lv2::CELL_OK;
+}
+
+// cellSpursGetJobChainInfo(jobChain, info), as libsre: NULL (both), ALIGN, INVAL (a workload ID past 31), the
+// workload's information (cellSpursGetWorkloadInfo: its SRCH becomes INVAL, other errors pass); then CellSpursJobChainInfo
+// (0x54 bytes written): the four urgent command slots, pc, the three link registers (u32 each), the cause, the error,
+// the maximum descriptor size, the workload ID, autoReadyCount, isHalted and isFixedMemAlloc (as 0 or 1), the grab
+// limit (u16 at 0x44), the workload's instance name and the exception handler and argument. RPCS3 reads the same fields
+// at once from the chain's first line, leaves out the grab limit and takes the name from its TODO workload information.
+// The first line here is one snapshot as well.
+s32 cellSpursGetJobChainInfo(PPUContext& ctx, u32 job_chain, u32 info)
+{
+    if (const s32 rc = check_job_chain(ctx, "cellSpursGetJobChainInfo", job_chain, {info}, true); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = check_pointer(ctx, "cellSpursGetJobChainInfo", "CellSpursJobChainInfo", info, 0x54,
+            CELL_SPURS_JOB_ERROR_INVAL);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    const u32 wid = ps_read32(base, job_chain + jc_off::workloadId);
+    u32 name = 0;
+    if (const s32 rc = workload_name_instance(base, static_cast<u32>(ps_read64(base, job_chain + jc_off::spurs)), wid, name);
+        rc != lv2::CELL_OK) {
+        return rc == error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH) ? error(CELL_SPURS_JOB_ERROR_INVAL) : rc;
+    }
+    alignas(16) u8 line[PS_RES_LINE_SIZE];
+    ps_res_acquire(base, job_chain, line);
+    for (u32 k = 0; k < 4; k++) ps_write64(base, info + 8 * k, ps_read64(line, jc_off::urgentCmds + 8 * k));
+    ps_write32(base, info + 0x20, static_cast<u32>(ps_read64(line, jc_off::pc)));
+    for (u32 k = 0; k < 3; k++) ps_write32(base, info + 0x24 + 4 * k, static_cast<u32>(ps_read64(line, jc_off::linkRegister + 8 * k)));
+    ps_write32(base, info + 0x30, static_cast<u32>(ps_read64(base, job_chain + jc_off::cause)));
+    ps_write32(base, info + 0x34, ps_read32(base, job_chain + jc_off::error));
+    const u8 flags = ps_read8(line, jc_off::flags);
+    ps_write32(base, info + 0x38, ((flags & jc_off::flagMaxSizeMask) << 3) + 0x100u);
+    ps_write32(base, info + 0x3C, wid);
+    ps_write8(base, info + 0x40, ps_read8(line, jc_off::autoReadyCount) ? 1 : 0);
+    ps_write8(base, info + 0x41, ps_read8(line, jc_off::isHalted) ? 1 : 0);
+    ps_write8(base, info + 0x42, (flags & jc_off::flagFixedMem) ? 1 : 0);
+    ps_write16(base, info + 0x44, ps_read16(line, jc_off::maxGrabbedJob));
+    ps_write32(base, info + 0x48, name);
+    ps_write32(base, info + 0x4C, static_cast<u32>(ps_read64(base, job_chain + jc_off::exceptionHandler)));
+    ps_write32(base, info + 0x50, static_cast<u32>(ps_read64(base, job_chain + jc_off::exceptionHandlerArg)));
+    return lv2::CELL_OK;
+}
+
+// cellSpursJobSetMaxGrab(jobChain, maxGrabbedJob), as RPCS3 (libsre agrees): NULL, ALIGN, INVAL for a limit outside 1..16;
+// STAT for a chain without a valid SPURS instance (NULL or misaligned), a workload ID past 31 or a workload no longer
+// registered; then the limit (u16 at 0x72, where libsre keeps it; RPCS3's layout has it at 0x70) in one update of the
+// chain's first line, which the native policy merges back after its visits (spurs_jobchain.cpp).
+s32 cellSpursJobSetMaxGrab(PPUContext& ctx, u32 job_chain, u32 max_grabbed)
+{
+    if (const s32 rc = check_job_chain(ctx, "cellSpursJobSetMaxGrab", job_chain, {}, false); rc != lv2::CELL_OK) return rc;
+    if (!max_grabbed || max_grabbed > 16) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    u8* base = guest_base(ctx);
+    const u64 spurs = ps_read64(base, job_chain + jc_off::spurs);
+    if (!spurs || spurs % CELL_SPURS_ALIGN || (spurs >> 32)) return error(CELL_SPURS_JOB_ERROR_STAT);
+    const u32 wid = ps_read32(base, job_chain + jc_off::workloadId);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2 || !workload_enabled(base, static_cast<u32>(spurs), wid)) {
+        return error(CELL_SPURS_JOB_ERROR_STAT);
+    }
+    reservation_op(base, job_chain, [max_grabbed](u8* line) {
+        ps_write16(line, jc_off::maxGrabbedJob, static_cast<u16>(max_grabbed));
+        return true;
+    });
+    return lv2::CELL_OK;
+}
+
+// CellSpursJobGuard (128 bytes, 128-aligned) as libsre lays it out: ncount0 (u32, counting down), ncount1 (the reset
+// value), the job chain (u64 at 0x08; RPCS3 has a u32 there), requestSpuCount (u32 at 0x10), autoReset (u32 at 0x20) and
+// at 0x30 the word the chain's GUARD command sets while it waits on the guard (spurs_jobchain.cpp).
+namespace guard_off {
+constexpr u32 ncount0 = 0x00, ncount1 = 0x04, job_chain = 0x08, request_spu_count = 0x10, auto_reset = 0x20, waiting = 0x30;
+}
+
+// cellSpursJobGuardInitialize(jobChain, jobGuard, notifyCount, requestSpuCount, autoReset), as libsre: NULL (chain,
+// guard), the guard 128-byte ALIGN (RPCS3 also checks the chain's alignment), INVAL for a chain whose workload ID is past
+// 31; the guard cleared, both counts notifyCount, the chain, the requested SPU count and autoReset (their low bytes).
+s32 cellSpursJobGuardInitialize(PPUContext& ctx, u32 job_chain, u32 guard, u32 notify_count, u32 request_spu_count,
+    u32 auto_reset)
+{
+    constexpr std::string_view fn = "cellSpursJobGuardInitialize";
+    if (!job_chain || !guard) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (guard % 128) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "job chain", job_chain, 0x80, CELL_SPURS_JOB_ERROR_INVAL); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "job guard", guard, 0x80, CELL_SPURS_JOB_ERROR_INVAL); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, job_chain + jc_off::workloadId) >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    reservation_op(base, guard, [&](u8* line) {
+        std::memset(line, 0, PS_RES_LINE_SIZE);
+        ps_write32(line, guard_off::ncount0, notify_count);
+        ps_write32(line, guard_off::ncount1, notify_count);
+        ps_write64(line, guard_off::job_chain, job_chain);
+        ps_write32(line, guard_off::request_spu_count, request_spu_count & 0xFF);
+        ps_write32(line, guard_off::auto_reset, auto_reset & 0xFF);
+        return true;
+    });
+    return lv2::CELL_OK;
+}
+
+// cellSpursJobGuardNotify(jobGuard), as libsre (RPCS3 agrees but reads the chain as a u32 at 0x08, the u64's high word):
+// NULL, ALIGN; in one update of the guard, JOB_ERROR_STAT when the count is 0 already, else it counts down, noting
+// whether the chain waits on the guard. At 0 the chain goes on: a revision 0 or 1 chain is kicked with the requested SPU
+// count (cellSpursKickJobChain), a later one, if it waits, is run (cellSpursRunJobChain). CELL_OK.
+s32 cellSpursJobGuardNotify(PPUContext& ctx, u32 guard)
+{
+    if (!guard) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (guard % 128) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpursJobGuardNotify", "job guard", guard, 0x80, CELL_SPURS_JOB_ERROR_INVAL);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    u32 left = 0;
+    bool waiting = false, counted = false;
+    reservation_op(base, guard, [&](u8* line) {
+        const u32 count = ps_read32(line, guard_off::ncount0);
+        waiting = ps_read32(line, guard_off::waiting) != 0;
+        counted = count != 0;
+        if (!counted) return false;
+        left = count - 1;
+        ps_write32(line, guard_off::ncount0, left);
+        return true;
+    });
+    if (!counted) return error(CELL_SPURS_JOB_ERROR_STAT);
+    if (left) return lv2::CELL_OK;
+    const u32 job_chain = static_cast<u32>(ps_read64(base, guard + guard_off::job_chain));
+    if (!guest_readable(thread_of(ctx), job_chain, 0x80)) {
+        log_call_site(ctx, base, std::format("cellSpursJobGuardNotify({:#x}): the guard's job chain {:#x} is not guest "
+            "memory", guard, job_chain));
+        return lv2::CELL_OK;
+    }
+    if (ps_read8(base, job_chain + jc_off::jmVer) <= CELL_SPURS_JOB_REVISION_1) {
+        cellSpursKickJobChain(ctx, job_chain, ps_read32(base, guard + guard_off::request_spu_count) & 0xFF);
+    } else if (waiting) {
+        cellSpursRunJobChain(ctx, job_chain);
+    }
+    return lv2::CELL_OK;
+}
+
+// cellSpursJobGuardReset(jobGuard), as RPCS3 (libsre agrees): NULL, ALIGN; the count back to its reset value.
+s32 cellSpursJobGuardReset(PPUContext& ctx, u32 guard)
+{
+    if (!guard) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (guard % 128) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpursJobGuardReset", "job guard", guard, 0x80, CELL_SPURS_JOB_ERROR_INVAL);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    reservation_op(guest_base(ctx), guard, [](u8* line) {
+        ps_write32(line, guard_off::ncount0, ps_read32(line, guard_off::ncount1));
+        return true;
+    });
+    return lv2::CELL_OK;
 }
 
 } // namespace
@@ -2132,6 +3668,66 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0x303C19CD, cellSpursCreateJobChainWithAttribute),
         PS_HLE_FUNC(0xF31731BB, cellSpursRunJobChain),
         PS_HLE_FUNC(0x17001000, cellSpursAddUrgentCommand),
+        // D-171: the rest of RPCS3's cellSpurs API, on the native scheduler.
+        PS_HLE_FUNC(0xACFC8DBC, cellSpursInitialize),
+        PS_HLE_FUNC(0x30AA96C4, cellSpursInitializeWithAttribute2),
+        PS_HLE_FUNC(0x82275C1C, cellSpursAttributeSetMemoryContainerForSpuThread),
+        PS_HLE_FUNC(0x1F402F8F, cellSpursGetInfo),
+        PS_HLE_FUNC(0xC56DEFB5, cellSpursGetNumSpuThread),
+        PS_HLE_FUNC(0x39C173FB, cellSpursGetSpuThreadGroupId),
+        PS_HLE_FUNC(0x6C960F6D, cellSpursGetSpuThreadId),
+        PS_HLE_FUNC(0x6FCDF6E3, cellSpursGetSpuGuid),
+        PS_HLE_FUNC(0x84D2F6D5, cellSpursSetMaxContention),
+        PS_HLE_FUNC(0x80A29E27, cellSpursSetPriorities),
+        PS_HLE_FUNC(0xB52E1BDA, cellSpursSetPriority),
+        PS_HLE_FUNC(0x182D9890, cellSpursRequestIdleSpu),
+        PS_HLE_FUNC(0x98D5B343, cellSpursShutdownWorkload),
+        PS_HLE_FUNC(0x5FD43FE4, cellSpursWaitForWorkloadShutdown),
+        PS_HLE_FUNC(0x57E4DEC3, cellSpursRemoveWorkload),
+        PS_HLE_FUNC(0x1D2BCA4B, cellSpursSendWorkloadSignal),
+        PS_HLE_FUNC(0xA7F9E716, cellSpursGetWorkloadData),
+        PS_HLE_FUNC(0x0EB4BC38, cellSpursWorkloadAttributeSetShutdownCompletionEventHook),
+        PS_HLE_FUNC(0x75211196, cellSpursReadyCountAdd),
+        PS_HLE_FUNC(0xF1D3552D, cellSpursReadyCountCompareAndSwap),
+        PS_HLE_FUNC(0x49A3426D, cellSpursReadyCountSwap),
+        PS_HLE_FUNC(0x2DDBCC0A, _cellSpursWorkloadFlagReceiver2),
+        PS_HLE_FUNC(0x8FDF50B2, cellSpursAddUrgentCall),
+        PS_HLE_FUNC(0x32B94ADD, cellSpursEnableExceptionEventHandler),
+        PS_HLE_FUNC(0x861237F8, cellSpursUnsetGlobalExceptionEventHandler),
+        PS_HLE_FUNC(0x569674E3, cellSpursTraceInitialize),
+        PS_HLE_FUNC(0xCE853FBF, cellSpursTraceStart),
+        PS_HLE_FUNC(0xDDC81B5A, cellSpursTraceStop),
+        PS_HLE_FUNC(0x7B9CBB74, cellSpursTraceFinalize),
+        PS_HLE_FUNC(0x4A6465E3, cellSpursCreateTaskset2),
+        PS_HLE_FUNC(0xC2ACDF43, _cellSpursTasksetAttribute2Initialize),
+        PS_HLE_FUNC(0x8ADADF65, _cellSpursTaskAttribute2Initialize),
+        PS_HLE_FUNC(0xDCA13593, cellSpursTasksetAttributeEnableClearLS),
+        PS_HLE_FUNC(0x2EDCFF92, cellSpursTasksetSetExceptionEventHandler),
+        PS_HLE_FUNC(0x94034C95, cellSpursTasksetUnsetExceptionEventHandler),
+        PS_HLE_FUNC(0x58D58FCF, cellSpursTasksetGetSpursAddress),
+        PS_HLE_FUNC(0x4CCE88A9, cellSpursLookUpTasksetAddress),
+        PS_HLE_FUNC(0xE7DD87E1, cellSpursGetTasksetId),
+        PS_HLE_FUNC(0x4AC7BAE4, cellSpursEventFlagClear),
+        PS_HLE_FUNC(0x6D2D9339, cellSpursEventFlagTryWait),
+        PS_HLE_FUNC(0x890F9E5A, cellSpursEventFlagGetDirection),
+        PS_HLE_FUNC(0x4D1E9373, cellSpursEventFlagGetClearMode),
+        PS_HLE_FUNC(0x947EFB0B, cellSpursEventFlagGetTasksetAddress),
+        PS_HLE_FUNC(0x9AEB5432, cellSpursBarrierGetTasksetAddress),
+        PS_HLE_FUNC(0x011EE38B, _cellSpursLFQueueInitialize),
+        PS_HLE_FUNC(0x60EB2DEC, cellSpursCreateJobChain),
+        PS_HLE_FUNC(0xBFEA60FA, cellSpursKickJobChain),
+        PS_HLE_FUNC(0x86C864A2, cellSpursGetJobChainId),
+        PS_HLE_FUNC(0x4CEB9694, cellSpursGetJobChainInfo),
+        PS_HLE_FUNC(0x161DA6A7, cellSpursJobChainGetError),
+        PS_HLE_FUNC(0x494613C7, cellSpursJobChainGetSpursAddress),
+        PS_HLE_FUNC(0x2CFCCB99, cellSpursJobChainAttributeSetJobTypeMemoryCheck),
+        PS_HLE_FUNC(0x5202E53B, cellSpursJobChainSetExceptionEventHandler),
+        PS_HLE_FUNC(0x6AA76999, cellSpursJobChainUnsetExceptionEventHandler),
+        PS_HLE_FUNC(0x68AAEBA9, cellSpursJobGuardInitialize),
+        PS_HLE_FUNC(0xD5D0B256, cellSpursJobGuardNotify),
+        PS_HLE_FUNC(0x00AF2519, cellSpursJobGuardReset),
+        PS_HLE_FUNC(0xE7B0E69A, cellSpursJobSetMaxGrab),
+        PS_HLE_INTERNAL(NID_event_helper, _pspocket_spurs_event_helper),
     });
 }
 

@@ -10,9 +10,11 @@
 // (PUTLLC) and from the policy itself. cellSpursWakeUp notifies explicitly. A selection that takes nothing stores
 // nothing, so an idle worker's own look at the line doesn't end its wait.
 //
+// SPURS2 instances (32 workloads, cellSpursInitializeWithAttribute2) select with kernel 2's rules (select2, D-171).
+//
 // Deviations from the SPURS kernel: the system service workload never runs (its jobs, activating workloads and
 // processing their state changes, are read from the guest state directly, and its message bit is just acknowledged);
-// pending contention (switch requests from polls) is not tracked; SPURS2 (32 workloads) is not supported yet.
+// pending contention (switch requests from polls) is not tracked.
 
 #include <pthread.h>
 
@@ -129,8 +131,6 @@ int worker_intr_mbox(SPUContext* ctx, uint32_t value)
 
 constexpr ps_spu_hooks kWorkerHooks{worker_stop, worker_intr_mbox};
 
-u32 info_addr(u32 spurs, u32 wid) { return spurs + wkl_off::info1 + wid * wkl_off::info_stride; }
-
 } // namespace
 
 // ------------------------------------------------------------------------------------------------- worker
@@ -152,12 +152,17 @@ Worker::Worker(Scheduler& scheduler, u32 num) : sched(scheduler), spu_num(num)
     ps_write32(ls, ls::k_dma_tag, 31);
     ps_write32(ls, ls::k_wkl_unique, kIdleWid);
     ps_write32(ls, ls::k_wkl_id, kIdleWid);
-    ps_write32(ls, ls::k_exit_to_kernel, kKernelExit);
+    ps_write32(ls, ls::k_exit_to_kernel, sched.second ? kKernel2Exit : kKernelExit);
     ps_write32(ls, ls::k_select, kKernelSelect);
-    // The kernel's entry points are `stop`s the worker takes (no Sony kernel code runs).
+    // The kernel's entry points are `stop`s the worker takes (no Sony kernel code runs): kernel 1's return from a module
+    // and exit, or kernel 2's (one address).
     ps_write32(ls, kKernelSelect, kKernelSelectStop);
-    ps_write32(ls, kKernelReturn, kKernelExitStop);
-    ps_write32(ls, kKernelExit, kKernelExitStop);
+    if (sched.second) {
+        ps_write32(ls, kKernel2Exit, kKernelExitStop);
+    } else {
+        ps_write32(ls, kKernelReturn, kKernelExitStop);
+        ps_write32(ls, kKernelExit, kKernelExitStop);
+    }
 }
 
 Worker::~Worker()
@@ -222,7 +227,7 @@ void Worker::body()
         const u64 version = ps_res_version(sched.spurs);
         const Selection sel = select(false);
         if (spu_num == 0) sched.report_time(ns(Clock::now().time_since_epoch()));
-        if (sel.wid >= CELL_SPURS_MAX_WORKLOAD) {
+        if (sel.wid >= CELL_SPURS_MAX_WORKLOAD2) {
             const auto t0 = Clock::now();
             ps_res_wait_change(sched.spurs, version, kIdleWaitNs);
             const u64 waited = ns(Clock::now() - t0);
@@ -237,8 +242,7 @@ void Worker::body()
         // again (both sequentially consistent, as the join's read of the state and then of the count): either it sees
         // the shutdown and leaves, or the join sees it inside and waits (D-136).
         sched.inside[sel.wid].fetch_add(1, std::memory_order_seq_cst);
-        if (__atomic_load_n(sched.base + sched.spurs + wkl_off::state1 + sel.wid, __ATOMIC_SEQ_CST) !=
-            SPURS_WKL_STATE_RUNNABLE) {
+        if (__atomic_load_n(sched.base + sched.spurs + wkl_state(sel.wid), __ATOMIC_SEQ_CST) != SPURS_WKL_STATE_RUNNABLE) {
             sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst);
             continue;
         }
@@ -286,8 +290,8 @@ void Scheduler::report_time(u64 now_ns)
     if (now_ns - last_report_ns < kPeriodNs) return;
     const double secs = static_cast<double>(now_ns - last_report_ns) / 1e9;
     last_report_ns = now_ns;
-    std::array<std::pair<u64, u32>, CELL_SPURS_MAX_WORKLOAD> taken{};
-    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) taken[i] = {workload_ns[i].exchange(0, std::memory_order_relaxed), i};
+    std::array<std::pair<u64, u32>, CELL_SPURS_MAX_WORKLOAD2> taken{};
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD2; i++) taken[i] = {workload_ns[i].exchange(0, std::memory_order_relaxed), i};
     std::sort(taken.begin(), taken.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     std::string parts;
     {
@@ -306,10 +310,11 @@ void Scheduler::report_time(u64 now_ns)
         static_cast<double>(wait_ns.exchange(0, std::memory_order_relaxed)) / 1e9);
 }
 
-// Gives this SPU's contention back (the worker stops).
+// Gives this SPU's contention back (the worker stops). SPURS2's packed share subtracts byte by byte: this SPU's nibble
+// is part of the byte's count, so nothing borrows across the nibbles.
 void Worker::release()
 {
-    if (current_wid >= CELL_SPURS_MAX_WORKLOAD) return;
+    if (current_wid >= CELL_SPURS_MAX_WORKLOAD2) return;
     reservation_op(sched.base, sched.spurs, [this](u8* line) {
         for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
             const u8 c = ps_read8(line, wkl_off::currentContention + i);
@@ -321,7 +326,123 @@ void Worker::release()
     current_wid = kIdleWid;
 }
 
-Worker::Selection Worker::select(bool poll)
+Worker::Selection Worker::select(bool poll) { return sched.second ? select2(poll) : select1(poll); }
+
+void Worker::update_kernel_context(const std::array<u8, 16>& priority, const std::array<u8, 16>& unique, u32 wid)
+{
+    // The kernel context in local store: the CellSpurs line 0 copy (task code reads flags1 at 0x174 from it), the
+    // priorities, the current workload.
+    alignas(16) u8 line0[PS_RES_LINE_SIZE];
+    ps_res_acquire(sched.base, sched.spurs, line0);
+    std::memcpy(ls + ls::kernel, line0, PS_RES_LINE_SIZE);
+    std::memcpy(ls + ls::k_priority, priority.data(), priority.size());
+    std::memcpy(ls + ls::k_unique_ids, unique.data(), unique.size());
+    // wklCurrentAddr (0x1D0) and the unique ID are the dispatch's: a custom policy module is reloaded only when the
+    // address changes.
+    ps_write32(ls, ls::k_wkl_id, wid);
+}
+
+// Kernel 2's selection (SPURS2: RPCS3 spursKernel2SelectWorkload, the rules of libsre's second SPU kernel): 32
+// workloads, each counted in its nibble of the contention and maximum contention bytes (wid & 15's byte: wid in the low
+// nibble, wid | 16 in the high one); ready counts from wklReadyCount1 and wklIdleSpuCountOrReadyCount2, signals from
+// wklSignal1 and wklSignal2. A workload is a candidate when it is runnable, has a priority on this SPU, is below its
+// maximum contention and has its flag, its signal or more ready count than contention; the weight is only its priority
+// (16 - the game's value) and the current workload's tie-breaker, the lower ID winning a tie. As kernel 1's here, no
+// pending contention is kept (spurs_scheduler.cpp's header).
+Worker::Selection Worker::select2(bool poll)
+{
+    u8* base = sched.base;
+    const u32 spurs = sched.spurs;
+    // What the system service keeps in each SPU's kernel context (RPCS3 spursSysServiceActivateWorkload): the runnable
+    // workloads, each one's priority on this SPU as 16 - priority (0: not on this SPU), packed as the bytes it keeps
+    // (wid & 15's byte: wid low, wid | 16 high), and the unique IDs of workloads 0..15.
+    std::array<u8, CELL_SPURS_MAX_WORKLOAD2> priority{};
+    std::array<u8, CELL_SPURS_MAX_WORKLOAD> packed{}, unique{};
+    u32 runnable = 0;
+    const u32 enabled = ps_read32(base, spurs + wkl_off::enabled);
+    const u32 unsupported = sched.unsupported.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD2; i++) {
+        const u8 p = ps_read8(base, wkl_info(spurs, i) + wkl_off::info_priority + spu_num);
+        priority[i] = p ? static_cast<u8>((0x10 - p) & 0x0F) : 0;
+        if (i < CELL_SPURS_MAX_WORKLOAD) unique[i] = ps_read8(base, wkl_info(spurs, i) + wkl_off::info_unique);
+        if ((enabled & (0x80000000u >> i)) && ps_read8(base, spurs + wkl_state(i)) == SPURS_WKL_STATE_RUNNABLE &&
+            !(unsupported & (1u << i))) {
+            runnable |= 0x80000000u >> i;
+        }
+    }
+    for (u32 j = 0; j < CELL_SPURS_MAX_WORKLOAD; j++) packed[j] = static_cast<u8>(priority[j] | (priority[j + 16] << 4));
+
+    Selection sel;
+    std::array<u8, CELL_SPURS_MAX_WORKLOAD2> contention{};
+    reservation_op(base, spurs, [&](u8* line) {
+        sel = Selection{};
+        for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD2; i++) {
+            const u8 c = static_cast<u8>(ps_read8(line, wkl_off::currentContention + (i & 15)) - loc_contention[i & 15]);
+            contention[i] = i < CELL_SPURS_MAX_WORKLOAD ? c & 0x0F : c >> 4;
+        }
+        bool changed = false;
+        // The system service's message bit for this SPU: acknowledged (its work is read from the guest state above).
+        const u8 message = ps_read8(line, wkl_off::sysSrvMessage);
+        if (!poll && (message & (1u << spu_num))) {
+            ps_write8(line, wkl_off::sysSrvMessage, static_cast<u8>(message & ~(1u << spu_num)));
+            changed = true;
+        }
+        const u32 flag = ps_read32(line, spurs_off::wklFlag);
+        const u8 flag_receiver = ps_read8(line, spurs_off::wklFlagReceiver);
+        u8 max_weight = 0;
+        for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD2; i++) {
+            const u32 j = i & 15;
+            const bool is_runnable = runnable & (0x80000000u >> i);
+            const bool wkl_signal = ps_read16(line, wkl_signal_of(i)) & wkl_signal_bit(i);
+            const bool wkl_flag = flag == 0 && flag_receiver == i;
+            const u8 ready = ps_read8(line, wkl_ready(i));
+            const u8 max_byte = ps_read8(line, wkl_off::maxContention + j);
+            const u8 max_contention = i < CELL_SPURS_MAX_WORKLOAD ? max_byte & 0x0F : max_byte >> 4;
+            if (!is_runnable || priority[i] == 0 || max_contention <= contention[i]) continue;
+            if (!(wkl_flag || wkl_signal || ready > contention[i])) continue;
+            const u8 weight = static_cast<u8>((priority[i] << 4) | (i == current_wid ? 0x04 : 0));
+            if (weight > max_weight) {
+                max_weight = weight;
+                sel.wid = i;
+                sel.poll_status = (ready > contention[i] ? CELL_SPURS_MODULE_POLL_STATUS_READYCOUNT : 0) |
+                                  (wkl_signal ? CELL_SPURS_MODULE_POLL_STATUS_SIGNAL : 0) |
+                                  (wkl_flag ? CELL_SPURS_MODULE_POLL_STATUS_FLAG : 0);
+            }
+        }
+        if (poll) {
+            // As kernel 1's below: a poll that keeps the current workload consumes its signal and the workload flag.
+            if (sel.wid != current_wid || sel.wid >= CELL_SPURS_MAX_WORKLOAD2) return changed;
+            const u16 signal = ps_read16(line, wkl_signal_of(sel.wid));
+            const bool take_flag = sel.wid == flag_receiver && flag != 0xFFFFFFFF;
+            if (!(signal & wkl_signal_bit(sel.wid)) && !take_flag) return changed;
+            ps_write16(line, wkl_signal_of(sel.wid), static_cast<u16>(signal & ~wkl_signal_bit(sel.wid)));
+            if (take_flag) ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
+            return true;
+        }
+        if (sel.wid < CELL_SPURS_MAX_WORKLOAD2) {
+            const u16 signal = ps_read16(line, wkl_signal_of(sel.wid));
+            ps_write16(line, wkl_signal_of(sel.wid), static_cast<u16>(signal & ~wkl_signal_bit(sel.wid)));
+            if (sel.wid == flag_receiver) ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
+            contention[sel.wid]++;
+            changed = true;
+        }
+        for (u32 j = 0; j < CELL_SPURS_MAX_WORKLOAD; j++) {
+            const u8 v = static_cast<u8>((contention[j] & 0x0F) | (contention[j + 16] << 4));
+            changed |= ps_read8(line, wkl_off::currentContention + j) != v;
+            ps_write8(line, wkl_off::currentContention + j, v);
+        }
+        return changed; // nothing stored while nothing changes (see select1)
+    });
+    if (poll) return sel;
+
+    loc_contention.fill(0);
+    if (sel.wid < CELL_SPURS_MAX_WORKLOAD2) loc_contention[sel.wid & 15] = sel.wid < CELL_SPURS_MAX_WORKLOAD ? 0x01 : 0x10;
+    current_wid = sel.wid;
+    update_kernel_context(packed, unique, sel.wid);
+    return sel;
+}
+
+Worker::Selection Worker::select1(bool poll)
 {
     u8* base = sched.base;
     const u32 spurs = sched.spurs;
@@ -334,9 +455,9 @@ Worker::Selection Worker::select(bool poll)
     const u32 enabled = ps_read32(base, spurs + wkl_off::enabled);
     const u32 unsupported = sched.unsupported.load(std::memory_order_relaxed);
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
-        const u8 p = ps_read8(base, info_addr(spurs, i) + wkl_off::info_priority + spu_num);
+        const u8 p = ps_read8(base, wkl_info(spurs, i) + wkl_off::info_priority + spu_num);
         priority[i] = p ? static_cast<u8>(0x10 - p) : 0;
-        unique[i] = ps_read8(base, info_addr(spurs, i) + wkl_off::info_unique);
+        unique[i] = ps_read8(base, wkl_info(spurs, i) + wkl_off::info_unique);
         if ((enabled & (0x80000000u >> i)) && ps_read8(base, spurs + wkl_off::state1 + i) == SPURS_WKL_STATE_RUNNABLE &&
             !(unsupported & (1u << i))) {
             runnable |= static_cast<u16>(0x8000u >> i);
@@ -419,16 +540,7 @@ Worker::Selection Worker::select(bool poll)
     loc_contention.fill(0);
     if (sel.wid < CELL_SPURS_MAX_WORKLOAD) loc_contention[sel.wid] = 1;
     current_wid = sel.wid;
-    // The kernel context in local store: the CellSpurs line 0 copy (task code reads flags1 at 0x174 from it), the
-    // priorities, the current workload.
-    alignas(16) u8 line0[PS_RES_LINE_SIZE];
-    ps_res_acquire(base, spurs, line0);
-    std::memcpy(ls + ls::kernel, line0, PS_RES_LINE_SIZE);
-    std::memcpy(ls + ls::k_priority, priority.data(), priority.size());
-    std::memcpy(ls + ls::k_unique_ids, unique.data(), unique.size());
-    // wklCurrentAddr (0x1D0) and the unique ID are the dispatch's: a custom policy module is reloaded only when the
-    // address changes.
-    ps_write32(ls, ls::k_wkl_id, sel.wid);
+    update_kernel_context(priority, unique, sel.wid);
     return sel;
 }
 
@@ -443,9 +555,10 @@ bool Worker::run_workload(const Selection& sel)
             known = true;
         }
     }
+    const u32 info = wkl_info(sched.spurs, sel.wid);
     if (known && wkl.kind == Workload::Kind::Taskset) {
-        ps_write64(ls, ls::k_wkl_addr, ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_addr));
-        ps_write32(ls, ls::k_wkl_unique, ps_read8(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_unique));
+        ps_write64(ls, ls::k_wkl_addr, ps_read64(sched.base, info + wkl_off::info_addr));
+        ps_write32(ls, ls::k_wkl_unique, ps_read8(sched.base, info + wkl_off::info_unique));
         run_taskset(*this, sel.wid, wkl.arg, sel.poll_status);
         return false;
     }
@@ -455,8 +568,8 @@ bool Worker::run_workload(const Selection& sel)
     }
     if (known && wkl.kind == Workload::Kind::JobChain) {
         // The job chain module's image replaces whatever policy module was in local store.
-        ps_write64(ls, ls::k_wkl_addr, ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_addr));
-        ps_write32(ls, ls::k_wkl_unique, ps_read8(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_unique));
+        ps_write64(ls, ls::k_wkl_addr, ps_read64(sched.base, info + wkl_off::info_addr));
+        ps_write32(ls, ls::k_wkl_unique, ps_read8(sched.base, info + wkl_off::info_unique));
         run_jobchain(*this, sel.wid, wkl.arg);
         return false;
     }
@@ -464,10 +577,10 @@ bool Worker::run_workload(const Selection& sel)
     // not silent).
     const u32 bit = 1u << sel.wid;
     if (!(sched.unsupported.fetch_or(bit) & bit)) {
-        const u64 pm = ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_addr);
+        const u64 pm = ps_read64(sched.base, info + wkl_off::info_addr);
         PS_LOG_ERROR(kSchedChan, "SPURS {:#x}: workload {} (policy module {:#x}, argument {:#x}) has work, but the native "
             "scheduler does not know it; it does not run", sched.spurs, sel.wid, pm,
-            ps_read64(sched.base, info_addr(sched.spurs, sel.wid) + wkl_off::info_arg));
+            ps_read64(sched.base, info + wkl_off::info_arg));
     }
     return false;
 }
@@ -475,7 +588,7 @@ bool Worker::run_workload(const Selection& sel)
 // ------------------------------------------------------------------------------------------------- scheduler
 
 Scheduler::Scheduler(std::mutex& mutex, lv2::Kernel& k, u32 spurs_addr, Instance& instance)
-    : host_mutex(mutex), kernel(k), base(k.base()), spurs(spurs_addr), inst(instance)
+    : host_mutex(mutex), kernel(k), base(k.base()), spurs(spurs_addr), inst(instance), second(instance.second)
 {
 }
 
@@ -514,8 +627,8 @@ void add_ready_count(Worker& w, u32 wid, s32 n)
         // input and the line: `carry` changes after the update is stored, never inside it.
         s32 left = 0;
         reservation_op(w.sched.base, w.sched.spurs, [&](u8* line) {
-            const s32 now = ps_read8(line, wkl_off::readyCount1 + wid) + carry;
-            ps_write8(line, wkl_off::readyCount1 + wid, static_cast<u8>(std::clamp(now, 0, 255)));
+            const s32 now = ps_read8(line, wkl_ready(wid)) + carry;
+            ps_write8(line, wkl_ready(wid), static_cast<u8>(std::clamp(now, 0, 255)));
             left = now < 0 ? now : 0;
             return true;
         });
@@ -534,10 +647,6 @@ void add_ready_count(Worker& w, u32 wid, s32 n)
 
 void start_scheduler(SpursHost& host, lv2::Kernel& kernel, u32 spurs, Instance& inst)
 {
-    if (inst.second) {
-        PS_LOG_ERROR(kSchedChan, "SPURS {:#x}: SPURS2 (32 workloads) has no native scheduler yet; nothing runs", spurs);
-        return;
-    }
     inst.scheduler = std::make_shared<Scheduler>(host.mutex, kernel, spurs, inst);
     inst.scheduler->start();
 }
@@ -548,7 +657,7 @@ void wake_workers(u32 spurs) { ps_res_notify_write(spurs, PS_RES_LINE_SIZE); }
 
 u32 workers_inside(const Scheduler& scheduler, u32 wid)
 {
-    return wid < CELL_SPURS_MAX_WORKLOAD ? scheduler.inside[wid].load(std::memory_order_seq_cst) : 0;
+    return wid < CELL_SPURS_MAX_WORKLOAD2 ? scheduler.inside[wid].load(std::memory_order_seq_cst) : 0;
 }
 
 // RPCS3 cellSpurs.cpp _cellSpursSendSignal's spurs_taskset_signal_op; libsre's PPU side does the same on the task's
@@ -588,7 +697,7 @@ s32 send_signal(u8* base, u32 taskset, u32 task_id)
         const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
         const u32 wid = ps_read32(base, taskset + ts_off::wid);
         reservation_op(base, spurs, [wid](u8* line) {
-            ps_write16(line, wkl_off::signal1, static_cast<u16>(ps_read16(line, wkl_off::signal1) | (0x8000u >> wid)));
+            ps_write16(line, wkl_signal_of(wid), static_cast<u16>(ps_read16(line, wkl_signal_of(wid)) | wkl_signal_bit(wid)));
             return true;
         });
         if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_TASK_ERROR_STAT);

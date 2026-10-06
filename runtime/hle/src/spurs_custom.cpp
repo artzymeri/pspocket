@@ -9,7 +9,8 @@
 // $0 = 0x804 (the return into the kernel), $1 = 0x3FFB0, $3 = 0x100 (the kernel context), $4 = WorkloadInfo.arg
 // (preferred doubleword), $5 = the poll status, pc = 0xA00. A module leaves by returning to 0x804 or by calling the
 // kernel's exit at [0x1E0] (0x808); it asks whether to give the SPU up by calling [0x1E4] (0x290) with $3 = 1, which
-// answers with the selected workload ID in word 0 and its poll status in word 1.
+// answers with the selected workload ID in word 0 and its poll status in word 1. SPURS2's kernel 2 calls the module from
+// 0x834: $0 and [0x1E0] are 0x838 (libsre's second SPU kernel; D-171).
 
 #include <cstring>
 #include <format>
@@ -37,7 +38,7 @@ ps_spu_v128 word0(u32 v)
 void run_custom(Worker& w, u32 wid, u32 poll_status)
 {
     u8* base = w.sched.base;
-    const u32 info = w.sched.spurs + wkl_off::info1 + wid * wkl_off::info_stride;
+    const u32 info = wkl_info(w.sched.spurs, wid);
     const u32 pm = static_cast<u32>(ps_read64(base, info + wkl_off::info_addr));
     const u64 arg = ps_read64(base, info + wkl_off::info_arg);
     const u32 size = ps_read32(base, info + wkl_off::info_size);
@@ -63,7 +64,7 @@ void run_custom(Worker& w, u32 wid, u32 poll_status)
 
     SPUContext& c = w.ctx;
     for (auto& r : c.gpr) r = ps_spu_v128{};
-    c.gpr[0] = word0(kKernelReturn);
+    c.gpr[0] = word0(w.sched.second ? kKernel2Exit : kKernelReturn); // after kernel 1's call at 0x800, kernel 2's at 0x834
     c.gpr[1] = word0(0x3FFB0);
     c.gpr[3] = word0(ls::kernel);
     c.gpr[4].u64[1] = arg;

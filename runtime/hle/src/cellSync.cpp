@@ -51,6 +51,7 @@
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "spurs.hpp" // spurs::sync_lfqueue_initialize
 
 namespace pspocket::hle {
 namespace {
@@ -1245,6 +1246,14 @@ s32 cellSyncLFQueueGetEntrySize(PPUContext& ctx, u32 queue, u32 entry_size)
 }
 
 } // namespace
+
+// For cellSpurs' _cellSpursLFQueueInitialize (declared in spurs.hpp; RPCS3 calls cellSyncLFQueueInitialize there).
+namespace spurs {
+s32 sync_lfqueue_initialize(PPUContext& ctx, u32 queue, u32 buffer, u32 size, u32 depth, u32 direction, u32 ea_signal)
+{
+    return cellSyncLFQueueInitialize(ctx, queue, buffer, size, depth, direction, ea_signal);
+}
+} // namespace spurs
 
 void register_cellSync(Registry& r)
 {
