@@ -228,11 +228,11 @@ TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import
     loader::LoadReport report;
     REQUIRE(loader::boot(*exe, *p.kernel, *p.hle, p.state, {}, main_id, &report) == lv2::CELL_OK);
     CHECK(report.functions_linked == 14);
-    CHECK(report.functions_implemented == 11); // sysPrxForUser::sys_lwmutex_lock, _sys_printf, sys_ppu_thread_exit,
+    CHECK(report.functions_implemented == 12); // sysPrxForUser::sys_lwmutex_lock, _sys_printf, sys_ppu_thread_exit,
                                                // sys_process_exit, sys_fs::cellFsOpen, cellGcmSys::_cellGcmInitBody,
                                                // cellGcmSetFlipMode and cellGcmGetConfiguration,
                                                // cellSysutil::cellSysutilRegisterCallback, sys_io::cellPadInit,
-                                               // cellSpurs::cellSpursInitialize (D-171)
+                                               // cellSpurs::cellSpursInitialize (D-171), sys_libc::memcpy (D-184)
     CHECK(report.variables_unresolved == 1);
 
     REQUIRE(p.kernel->wait_for_exit(std::chrono::seconds(10)));
