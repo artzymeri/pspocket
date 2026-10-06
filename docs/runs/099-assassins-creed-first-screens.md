@@ -69,3 +69,11 @@ look is bright there, but that much is to be checked against real footage. DEPTH
 pspocket-boot --watch ADDR[@SECONDS], fault reports that name each frame's image and base (atos on a game library
 gives the guest function: `atos -o game.dylib -l BASE ADDR`), r11-r31, CTR and the interpreter's last branch to 0;
 PSPOCKET_SPU_WATCH=LO-HI; PSPOCKET_HIDE_FILES=PATH,...
+
+## GTA V from a library made with these lifters
+
+`pspocket-prepare` for GTA V (PPU) with the D-161 lifter: 502 files compiled, 3:54 on the M4, the time left within +8
+to +14% at every point. `scripts/gate.sh game --library inventory/gta5/prepared-ppu/game.dylib --builtin-spu`:
+PASS, 18 of 18 (inventory/gate/20261006-025251-249d053). The build with all of this was installed on the iPhone at
+02:58 (not launched: the phone prepares GTA V and Assassin's Creed again on their next start, D-161's generation).
+
