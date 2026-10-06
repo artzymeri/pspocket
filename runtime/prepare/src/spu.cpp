@@ -91,16 +91,20 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
                 if (auto it = images.find(m[2].str()); it != images.end()) it->second.seeds.insert(parse(m[1].str()));
         }
     }
-    const std::regex entry_line(R"(^\s*\{(0x[0-9A-Fa-f]+)u, )");
+    // The seeds an earlier lift used (NAME.seeds), not its program's entries: those are every label, also of code only
+    // discovery or a constant found, which as seeds would count as code the next time and a job's own writes to it
+    // would send the whole job to the interpreter (Assassin's Creed, run 115, D-204).
     for (const auto& d : fs::directory_iterator(out_dir, ec)) {
         if (!d.is_directory()) continue;
         const std::string name = d.path().filename().string();
         auto it = images.find(name);
         if (it == images.end()) continue;
-        std::ifstream in(d.path() / (name + "_reg.c"));
+        std::ifstream in(d.path() / (name + ".seeds"));
         for (std::string line; std::getline(in, line);) {
-            std::smatch m;
-            if (std::regex_search(line, m, entry_line)) it->second.seeds.insert(parse(m[1].str()));
+            try {
+                if (!line.empty()) it->second.seeds.insert(parse(line));
+            } catch (...) {
+            }
         }
     }
     // Relocatable images (jobs, modules) are lifted once per hash, at the first copy's base; the other copies' seeds
@@ -155,6 +159,9 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
             if (error) *error = std::format("cannot write {}: {}", name, why);
             return false;
         }
+        std::string seeds;
+        for (const u32 seed : image->seeds) seeds += std::format("{:#x}\n", seed);
+        std::ofstream(fs::path(out_dir) / name / (name + ".seeds")) << seeds;
         decls += std::format("void {}_register(void);\n", name);
         calls += std::format("    {}_register();\n", name);
         lifted.insert(name);

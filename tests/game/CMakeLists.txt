@@ -18,7 +18,7 @@ endif()
 # program it carries (D-191).
 if(TARGET pspocket_codegen)
     pspocket_add_test(test_system_library
-        SOURCES test_system_library.cpp
+        SOURCES test_system_library.cpp test_prepare_spu.cpp
         LIBS pspocket::loader pspocket::prepare pspocket::codegen pspocket::game pspocket_test_synthetic
             pspocket::recomp_ppu pspocket::recomp_spu)
     if(APPLE)
