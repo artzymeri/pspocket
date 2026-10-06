@@ -75,7 +75,7 @@ RPCS3, for comparison, runs 78 of these modules as they are by default and repla
      which has none of it. Fixed in D-177.
 2. **The heavy work runs on the SPUs.** Video decoding (the H.264 decoder alone has 13 SPU programs), audio decoding,
    image decoding and video post-processing all run SPU programs through SPURS, which is ours. Making these modules
-   native therefore means translating their SPU programs too, the way a game's are (D-117).
+   native therefore means translating their SPU programs too, the way a game's are (D-117; done in D-191).
 3. **Fonts come from the system file.** libfont and FreeType read the 35 system fonts through sys_fs from
    /dev_flash/data/font. A game that draws text with cellFont's system fonts needs them on the phone.
 4. **Most of the installed files are never used on the phone.**
@@ -91,8 +91,11 @@ RPCS3, for comparison, runs 78 of these modules as they are by default and repla
    instead of refusals; the phone keeps only sys, data/font and data/cert.
 2. **Translate Sony's code once per firmware** ("Preparing system…", shared by every game). Done for the PPU code
    (D-178): 100 modules at fixed addresses in the PRX region, 18,962 functions, an 18.8 MB system library made in 33
-   s on the Mac. Each module is checked against its translation when it loads. Their SPU programs still come
-   through each game's run-time discovery (D-117).
+   s on the Mac. Each module is checked against its translation when it loads. Done for their SPU programs (D-191):
+   171 images make 216 programs (62 of them overlays); the programs of the modules a game links are added to the
+   system library before its first start, and stay for every game after. All at once would be 421 MB of C, 19
+   minutes on the M4 and a 232 MB library (run 101), mostly encoders and Blu-ray codecs games rarely use. spu-check
+   finds no difference between them and the interpreter.
 3. **iOS frameworks for heavy media, behind the same interfaces.** ImageIO for PNG, JPEG and GIF; VideoToolbox for
    H.264 behind cellVdec; AudioToolbox for AAC, MP3 and AC-3 behind cellAdec. Each is measured against Sony's
    translated version first (rule 8).

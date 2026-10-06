@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-06, after run 099 and D-189 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-06, after run 101 and D-191 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -103,9 +103,22 @@ stub answers. Left out on purpose:
 - cellSysmodule's OpenPSID decryption, which needs a key (D-184).
 
 What no device or service backs is answered as the PS3 answers without it: PSN offline, no camera or microphone, an
-empty media library, dialogs answered at once. Next: the phone's stage 6 with games nobody has analysed (each run's
-log names what is still missing), then D-179's own media libraries and docs/firmware.md's iOS frameworks for the
-heavy media (ImageIO, VideoToolbox, AudioToolbox), and the firmware's SPU programs in the system library.
+empty media library, dialogs answered at once.
+
+**The firmware's SPU programs are in the system library too (D-190, D-191, run 101).** The modules the system library
+translates carry 171 SPU images (216 programs, 62 of them overlays): video and audio decoders, image decoders, video
+post-processing. The programs of the modules a game links are translated into the system library before the game's
+first start ("Preparing…"), and stay for every game after, so a new game's video and sound run native from the
+first frame instead of on the SPU interpreter. All of them at once would be 19 minutes on the M4 and a 232 MB library,
+mostly encoders and Blu-ray codecs, hence per game. On the way: the SPU analyzer no longer copies code for constants
+that point into a function (one decoder lifted to 288 MB of C before, D-190); a SPURS task's program is the segment
+holding its entry; spu-check checks a prepared library's SPU programs (all 216 agree with the interpreter). Not tried
+on the phone yet.
+
+Next: D-179's own media libraries (cellPamf, cellDmux, cellVdec and cellAdec on FFmpeg, D-181; then the image
+decoders), measured against Sony's translated versions, then docs/firmware.md's iOS frameworks for the heavy media
+(ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6 with games nobody has analysed (each run's log names
+what is still missing).
 
 ## Building and running GTA V on the Mac
 

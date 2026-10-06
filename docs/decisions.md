@@ -4104,6 +4104,82 @@ hash changes, which does not make the library be prepared again (D-161).
 Tests: tests/spu/test_discover.cpp (constants into a function's body are labels and entries of the lifted program, a
 constant at code nothing else reaches still starts a function; fails without the fix).
 
+## D-191 · 2026-10-06 · The firmware's SPU programs in the system library, for the modules each game links
+
+The modules the system library translates (D-178) carry SPU programs: the decoders and helpers they hand to SPURS as
+tasks or to lv2 as SPU thread images. They came only through each game's run-time discovery (D-117, D-155), so a
+game's first video or sound through the firmware ran on the SPU interpreter until the game was prepared again. Now
+they are translated into the system library before the game runs.
+
+- **What is translated.** Each SPU ELF a translated module carries (recomp::scan_spu_images over the module as
+  placed, so the bytes are the ones in guest memory), saved as the runtime saves an image it meets and lifted with
+  the games' SPU lifter, discovery on (D-155), at its local store address:
+  - the executable PT_LOAD holding the entry: what a SPURS task or an lv2 SPU thread runs;
+  - every other executable PT_LOAD, as a program of its own: SPU overlays. Six of the firmware's programs (the
+    encoders, the DivX parser and the video decoders' vdec_vpxp_core) keep code in overlays that their overlay
+    manager copies in by DMA; the runtime finds such a copy by its hash where it lands (the module tracker, D-079).
+  - In 4.92, 216 programs from 171 images in the translated modules; one image (libchnnlsv's) has no code segment
+    holding its entry and is left out.
+- **A task's code is the segment holding its entry.** SPURS hashed a task's first executable segment. An overlay
+  program starts with a small one (64 bytes at 0x3000) before the one it enters, so nothing matched and the whole
+  task was interpreted. Policy::attach_code now takes the executable segment holding e_entry, as
+  sys_spu_thread_group_start already did (else the first, as before; every game task seen so far holds its entry in
+  its first).
+- **Measured: all of them is too much at once.** 421 MB of C (after D-190), compiled in 19.4 minutes on the M4's ten
+  cores with a 7.1 GB peak, and the library grows from 18.8 MB to 232 MB. On the phone that is most of an hour before
+  the first game, and space no game needs: most of it is encoders (video recording, which cellRec does not do here,
+  D-189) and Blu-ray codecs (3D video, DTS-HD, TrueHD).
+- **So, the modules each game links.** Before a game starts, the app works out which firmware modules the game
+  links (LleModules::choice_for: decide()'s choice from the executable's imports, without loading or logging), and
+  the system library holds their SPU programs. The first game that links a module adds its programs; the library
+  only grows, and adding compiles only the new programs (the objects of the rest are kept). A game that links no
+  firmware module (GTA V, Assassin's Creed), or only modules without SPU programs, adds nothing.
+  - spu-carriers.txt lists the translated modules that carry SPU programs (68 of the 100 in 4.92); spu-modules.txt
+    the ones whose programs the library holds, written only once the library is made, so a stopped preparation
+    leaves both the library and its list as they were.
+  - The phone: Preparer.checkSystem(executable:) and startSystem(executable:), once per game per session
+    (ps_prepare_system_check/_start take the executable).
+  - The Mac: pspocket-prepare --system DEV_FLASH --game-dir DIR --for EBOOT.elf (or --spu-modules all|KEY,...).
+  - A system library from before this (manifest without system_generation 2) is made again; on the phone its compiled
+    PPU code is kept, so that is a translation, a link and a signature.
+- **What still comes at run time.** Modules a game loads while it runs that its executable's imports do not reach (a
+  PRX of its own that imports more, a module loaded by its path), SPU code a module builds or patches before handing
+  it over (its hash differs) and SPURS job binaries not stored as ELF images: met at run time, saved (D-117) and
+  translated into the game's own library at its next update (D-155), as before.
+- **spu-check --library FILE** checks the SPU programs of a prepared game or system library against the interpreter
+  (D-132's random states), not only those built into pspocket-boot. It is built in every Mac build now. Two of its
+  own faults showed on the firmware's programs, neither the translation's:
+  - A trial that touched more sandbox pages than its reset list holds (a decoder DMA'd over 178,448 pages, 2.8 GB)
+    left them filled for later trials, which then differed: such a trial now has the whole sandbox mapped again.
+  - A trial in which the interpreter wrote over the program's code (a decoder filled local store from 0x3000 and
+    met 0xa7a7a7a7) was left out of the comparison only after the lifted run, which runs what was translated and can
+    loop for ever where no stop request reaches it: such a trial is now left out before the lifted run, and a lifted
+    run that ignores the stop request for 10 s is reported (HANG) and fails the check instead of hanging it.
+
+Tests:
+
+- tests/game/test_system_library.cpp: a synthetic module carrying an SPU ELF laid out as the firmware's overlay
+  programs; no SPU programs for a game that links nothing; the module's added for a game that links it (worked out
+  by choice_for), kept after; the main code and the overlay found under the runtime's keys and run translated with
+  no miss; a library without system_generation is made again.
+- tests/hle/test_spurs_run.cpp: a task whose entry is in its second executable segment runs that segment's program
+  (fails without the fix).
+
+## D-192 · 2026-10-06 · The copies of game libraries that load_library leaves are removed
+
+game::load_library copies each library it loads into the temporary folder before dlopen (the kernel keeps the
+first signature it saw of a file, D-152) and never removed the copy: one per game start, per system library load
+and per test. During run 101 the Mac's disk filled (252 MB left): 303 copies, 24 GB, the system library with every
+SPU program being 232 MB. On the phone each game start left a copy of its library (GTA V's) and of the system
+library in the app's tmp folder, which iOS clears only now and then.
+
+- Each load first removes the copies of processes that have ended (game::remove_stale_copies: the pid in the name,
+  kill(pid, 0) answering ESRCH). A process's own copies stay while it runs, as the libraries are mapped from them;
+  so do those of processes still running (tests run side by side) and those kill cannot see (EPERM).
+
+Tests: tests/game/test_game_library.cpp (an ended process's copies go; this process's, a running one's and other
+files stay).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

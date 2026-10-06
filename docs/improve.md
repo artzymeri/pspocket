@@ -22,6 +22,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
     any thread, D-037), with QoS that keeps the SPU threads on the performance cores.
 - **State:** open.
 
+- **Seen (run 101):** a stop request (thread group stop or terminate, D-031) reaches lifted SPU code at back branches
+  and calls, not at an indirect branch to a label of the same function (`bi` into its dispatch switch). A loop that
+  goes round only that way cannot be stopped; spu-check met one on a random state (a return address equal to the
+  function's own entry). No game is known to loop so.
+- **Try:** an attention check where an indirect branch goes back into the dispatch switch (one relaxed load), measured
+  against GTA V's walk (rule 8).
+- **State:** open.
+
 ## Audio
 
 - **Seen:** when the SPUs are saturated the sound runs at 0.52 to 0.80 of its pace (17:17:31-46: 15 to 95 periods of
@@ -147,8 +155,12 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   the D-161 lifters (run 099). The SPU model cannot be refitted from the text (D-164: per-game speeds differ 6 times);
   the starting speeds now come from the game's own last preparation, else the device's PPU speed. Next: learn faster
   within a preparation (the first SPU files to finish set the rate; largest-first means they are the slowest).
-- **Tests:** one ctest run in five failed once tonight with nothing changed in between (likely the timing-sensitive
-  thread-report test under load): find it and make it robust. Open: the SPU analyzer's copies, per-unit
+- **Seen (run 101):** the firmware's SPU programs: one 57 KB decoder lifted to 288 MB of C, its constants each
+  starting a copy of the code after them; 1.3 GB for all 216. D-190 makes such constants labels: 421 MB, still 19
+  minutes on the M4 and a 232 MB library, so D-191 adds a module's programs only when a game links it. 28 bytes of
+  C per byte of SPU code is the norm now (GTA V's 36): what is left is the lifter's own C per instruction.
+- **Tests:** the timing-sensitive tests are robust now (thread report: CPU time; usleep(0): the backoff state, not
+  wall time). Open: the SPU analyzer's other copies (call targets inside another function's code), per-unit
   prototypes, PGO/LTO clang, LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.
 
 ## Stability: the EDGE/GFX job chain's descriptors written over
