@@ -140,7 +140,12 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   (rate 0.16): the time left said 9:36 for a 0:41 job at 10%. Its programs are small next to GTA V's, which the model
   was fitted on.
 - **State:** -fno-slp-vectorize (PPU) and the allocator budget adopted (D-153: GTA V 8:21 to 6:47 on the M4, the
-  gate the same); the time left within 15% throughout (run 094) for GTA V; refit the SPU model with AC's programs. Open: the SPU analyzer's copies, per-unit
+  gate the same); the time left within 15% throughout (run 094) for GTA V and within 8-14% for GTA V again with
+  the D-161 lifters (run 099). The SPU model cannot be refitted from the text (D-164: per-game speeds differ 6 times);
+  the starting speeds now come from the game's own last preparation, else the device's PPU speed. Next: learn faster
+  within a preparation (the first SPU files to finish set the rate; largest-first means they are the slowest).
+- **Tests:** one ctest run in five failed once tonight with nothing changed in between (likely the timing-sensitive
+  thread-report test under load): find it and make it robust. Open: the SPU analyzer's copies, per-unit
   prototypes, PGO/LTO clang, LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.
 
 ## Stability: the EDGE/GFX job chain's descriptors written over
