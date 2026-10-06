@@ -4254,6 +4254,57 @@ refused events, a full queue that wraps; the API with the game's callbacks as gu
 when the firmware is there); tests/hle/test_spurs_queue.cpp (PushBody's checks, order and wrap, a blocking push woken
 by an SPU pop, a push waking a task waiting to pop; Size).
 
+## D-195 · 2026-10-06 · cellVdec, part 1: Sony's libvdec runs in the comparison, and what it showed
+
+The third of D-179's media libraries is cellVdec, the video decoder (H.264, MPEG-2, MPEG-4/DivX, VC-1). Before
+pspocket's own is written, Sony's libvdec runs in a test (D-193's harness) over synthetic H.264 written there
+(tests/hle/h264_writer.hpp: every macroblock I_PCM, so the samples are stored as they are and any decoder must give
+them back exactly). Getting Sony's library to run took four things pspocket lacked, each useful beyond this test:
+
+- **cellOvis** (libsre's SPU overlay tables), which libvdec calls to set up its H.264 decoder's SPU tasks. RPCS3 has
+  the four functions as TODOs (it runs Sony's libsre); pspocket's follow libsre (fw 4.92, D-046): the table's size
+  (how far the PT_LOAD segments with data reach past the 256 KB local store), its contents (those segments copied to
+  table + p_paddr - 256 KB; a misaligned table is 0x80410416, not RPCS3's 0x80410410), and the overlapping segments
+  of an SPU image swapped to the end and no longer counted (libsre's swap leaves the word at +0xC where it was).
+- **SPURS task exit callbacks.** A task whose ELF word has bit 0 (not bit 2) has one: its descriptor (code EA | size
+  in 128-byte units, as libsre's PPU side encodes them) and argument come from the CellSpursTaskset2's table at 0x1980
+  when it starts; when it exits, the code is loaded at LS 0x10000 and called with $3 the taskset, $4 the task ID, $5
+  the exit code and $6 the argument (RPCS3's draft, spursTasksetOnTaskExit), and returns to a stop of the native
+  policy's own. Sony's libvdec chains its decoder's tasks this way. Before, the native taskset policy stopped with
+  "not implemented".
+- **libsre's exit code handler, natively** (the SPU code a CellSpursTaskset2 names at 0x1900, read from libsre): the
+  exit code goes into the task's exit code container, one 128-byte line (status at +0x20: bit 0 initialized, bit 2 a
+  code stored, bit 16 a PPU thread waits, bit 17 an SPU task waits; the code at +0x28; the waiting task's taskset
+  (u64) at +0x30 and its ID at +0x38), updated atomically; then the waiting task is signalled. The PPU waiter (an event
+  flag at +0x40) stops loudly until something needs it; only three firmware modules (two encoders and an audio
+  post-processor) use the PPU side of these containers.
+- **FFmpeg links with H.264.** 7.1.1's H.264 decoder calls ff_aom_uninit_film_grain_params, which only HEVC's SEI code
+  builds, so the H.264-only build of D-181 did not link once something used it. scripts/build-ffmpeg.sh adds the HEVC
+  parser, which builds that file (the tarball stays unmodified; libavcodec grows 117 KB). FFmpeg is now linked into
+  the HLE library and its tests.
+
+What Sony's libvdec 4.92 does (run over three 64x64 I_PCM pictures):
+
+- **Sizes.** cellVdecQueryAttr asks for the decoder's memory from the codec library. For H.264 (libavcdec's
+  avcDecQueryMemory) the formula is reconstructed from Sony's code: 17 blocks summed per level (a table of 12 level
+  entries: macroblocks per second, maximum frame size, decoded picture buffer size, minimum compression ratio, and the
+  worst-case picture size), with the game's maximum frame size and buffer count when given. It matches Sony's answer in
+  all 46 cases tried (14 levels, then 8 frame sizes and buffer counts at 4 levels). RPCS3's codec memory queries are all
+  TODOs, so its sizes for a new SDK are not Sony's. The version is 0x4920000 (RPCS3: 0x4890000).
+- **The handle is the memory address** the game gave (RPCS3: an ID of its own).
+- **Pictures come one access unit late:** after three access units, two pictures; the third when the sequence ends.
+  The pictures are exactly the I_PCM samples.
+- **Picture items and codec information live in the decoder's memory:** items at +0xDC, 0x90 apart; the H.264
+  information at +0x1B9C, 0x244 apart, read from the stream (the VUI flag, frame rate code 3 for 29.97, IDR, CAVLC; RPCS3
+  writes most of these as fixed guesses). An item's start address is the picture in Sony's own frame buffer (not
+  planar YUV); RPCS3 writes 0x123 there.
+- **Colour conversion** to RGBA is BT.709 limited range as asked (RPCS3: a TODO, swscale's default matrix).
+
+Next (part 2): pspocket's cellVdec on FFmpeg to that description, compared with Sony's in the same test.
+
+Tests: tests/hle/test_ovis.cpp, tests/hle/test_spurs_run.cpp (an exit callback; the exit code container and its
+waiting task), tests/hle/test_vdec.cpp (the H.264 writer checked with FFmpeg; the probe of Sony's libvdec, hidden).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
