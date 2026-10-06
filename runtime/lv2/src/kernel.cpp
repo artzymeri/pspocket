@@ -261,23 +261,26 @@ std::chrono::steady_clock::time_point deadline_after_us(u64 timeout_us)
     return deadline_after_us(std::chrono::steady_clock::now(), timeout_us);
 }
 
-bool yield_wait(PpuThread& t)
+u32 yield_backoff(PpuThread& t, u64 now_ns)
 {
-    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
-    if (now - t.last_yield_ns < 50'000) {
+    if (now_ns - t.last_yield_ns < 50'000) {
         t.yield_streak++;
     } else {
         t.yield_streak = 0;
         t.yield_backoff_us = 0;
     }
+    if (t.yield_streak < 16) return 0;
+    t.yield_backoff_us = t.yield_backoff_us ? std::min<u32>(t.yield_backoff_us * 2, 200) : 20;
+    return t.yield_backoff_us;
+}
+
+bool yield_wait(PpuThread& t)
+{
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
     bool alive = true;
-    if (t.yield_streak >= 16) {
-        t.yield_backoff_us = t.yield_backoff_us ? std::min<u32>(t.yield_backoff_us * 2, 200) : 20;
-        alive = sleep_us(t.waiter, t.yield_backoff_us);
-    } else {
-        std::this_thread::yield();
-    }
+    if (const u32 us = yield_backoff(t, now)) alive = sleep_us(t.waiter, us);
+    else std::this_thread::yield();
     t.last_yield_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     return alive;

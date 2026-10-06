@@ -278,5 +278,8 @@ class PpuThread;
 // usleep(0): a sixth of a core, run 075). After 16 yields less than 50 us apart it sleeps 20 us, doubling up to
 // 200 us, until it goes longer than that between two yields. False when the thread is to exit.
 bool yield_wait(PpuThread& t);
+// yield_wait's rule on its own: the microseconds the yield at `now_ns` (steady clock) sleeps, 0 for a plain yield,
+// with the thread's streak and backoff brought up to date.
+u32 yield_backoff(PpuThread& t, u64 now_ns);
 
 } // namespace pspocket::lv2
