@@ -3536,9 +3536,9 @@ Tests (tests/hle/test_hle.cpp):
 - stub calls are counted apart from the gaps;
 - an implemented function is linked to its implementation, not to its stub.
 
-## D-183 · 2026-10-06 · The sysutil family as RPCS3 has it, and dialogs answered as their cursor starts
+## D-183 · 2026-10-06 · The sysutil family, input, audio and devices as RPCS3 has them; dialogs answered as their cursor starts
 
-The first of the two HLE batches that stopped at a usage limit (status.md). Sysutil and everything built on it is
+The two HLE batches that stopped at a usage limit (status.md). Sysutil and everything built on it is
 always native (D-175), so a function missing there fails the game outright.
 
 **cellSaveData: every function RPCS3 registers (40)**
@@ -3714,6 +3714,90 @@ Tests (tests/hle/test_sysutil_misc.cpp):
 - screenshots, storage, sysconf and the web browser;
 - AV chat requests in order;
 - EULA, video upload, print, the cross controller, cellGameExec.
+
+**Input: sys_io, every function RPCS3 implements (29 more)**
+
+- **cellPad.**
+  - GetRawData: RPCS3's checks, nothing written (its TODO).
+  - GetDataExtra and the PS1 emulator's sys_io_3733EA3C: GetData, a standard device type, the BD remote's words
+    cleared.
+  - Info/Set PressMode and SensorMode, per port. A mode needs the port's capability (UNSUPPORTED_GAMEPAD).
+  - The custom (LDD) controllers. A game registers one on the first free port (1 to 6; the virtual controller has
+    0), feeds it with LddDataInsert, and every read returns what it inserted.
+  - PeriphGetInfo and PeriphGetData: the standard class.
+  - The IIR filter: RPCS3's checks and its clamp to 0..1023.
+- **cellKb.** GetConfiguration (NO_DEVICE before the pointer check) and CnvRawCode, RPCS3's 101, 106 and German
+  layouts, which need no keyboard.
+- **cellMouse.** RPCS3's null mouse: it initialises, no mouse connects. The tablet functions answer FATAL.
+- **sys_config_start/stop** keep a count. RPCS3's event thread there delivers controller connect events; pspocket's
+  controller is connected from cellPadInit and never changes.
+
+**cellAudio: every function RPCS3 implements (12 more)**
+
+- **GetPortTimestamp and GetPortBlockTag**, from the period counter and time the audio thread already kept per port.
+  A null pointer is no error, as RPCS3.
+- **The Ex notify queues.** An SPU queue on request; the decimate (every 2nd, 4th or 8th period) and no-mix flags; a
+  queue is removed only with the flags it was set with.
+- **SendAck** records the time for the source.
+- **Add2chData** (into a 2- or 8-channel port's front pair) and **Add6chData** (5.1 into an 8-channel port's first six
+  channels, in RPCS3's order).
+- **SetPortLevel** moves the level over 624 samples (13 ms), as RPCS3's comment says. RPCS3's step has the wrong sign,
+  so there the level jumps at the next sample; a ramp is what the function is for. When the thread mixes nothing, the
+  level is reached at once (RPCS3 finish_port_volume_stepping).
+- **MiscSetAccessoryVolume and Set/UnsetPersonalDevice**: RPCS3's checks, nothing routed.
+
+**lv2: event queues by key.** Kernel::event_queue_by_key looks a queue up in the IPC map, as RPCS3's
+lv2_event_queue::find. cellAudioSetNotifyEventQueue therefore finds a keyed queue the game made itself (before, only
+the ones cellAudioCreateNotifyEventQueue made), and cellVoice and cellMic find theirs.
+
+**cellVoice: every function RPCS3 registers (21 more).** InitEx and StartEx; the notify queues (keys from
+0x80004D494F323285, 64 events), which get SERVICE_ATTACHED on start and SERVICE_DETACHED on stop and end, from the
+source given or one made up as RPCS3 makes it; mute flags, volumes, bit rates and port updates kept in the port's
+parameters; pause, resume and reset of an existing port; the signal state (no microphone); the Ex writes.
+
+**cellNetCtl and cellSysmodule.**
+
+- **The game update checks** find no update: NO_UPDATE for a start, FINISHED for a finish, to the callback at the next
+  cellSysutilCheckCallback, as RPCS3. The Ex callbacks get a CellGameUpdateResult on the stack.
+- **cellNetCtlNetStartDialogAbortAsync**: accepted once initialised.
+- **cellSysmoduleLoadModuleFile and UnloadModuleFile** load and start (stop and unload) a module file through
+  sys_prx's own calls (prx.hpp), under the library's lock.
+- **GetImagesize and FetchImage**: image 0xFF00 is /dev_flash/sys/external/flashATRAC.pic, read through lv2's file
+  system; 0xFF01 has no file on the PS3 either.
+- **SetDebugmode** records the path; modules are linked at load time here, so nothing else changes.
+- **cellSysmodule_0x59521326** (a key from the console's PSID) waits for sys_ss (D-184).
+- **_sys_net_h_errno_loc**: h_errno beside errno in the thread's TLS system area.
+
+**Camera, microphone and Move with nothing attached (devices.cpp, gem.cpp; 101 functions).** RPCS3's defaults are
+the null camera, microphone and Move handlers, so each function follows RPCS3's path for those:
+
+- **cellCamera.** It initialises; Open checks its arguments and finds no device; OpenEx, GetType and GetBufferSize
+  answer DEVICE_NOT_FOUND; the attribute, buffer info and read functions NOT_OPEN; the Is* queries 0; notify queues
+  are accepted and get nothing.
+- **cellMic.** It initialises with no microphone registered, so the device functions answer DEVICE_NOT_FOUND after
+  RPCS3's argument checks. As RPCS3: IsAttached answers 1, GetType a USB microphone for slots 0 to 7 (Guitar Hero:
+  Warriors of Rock needs it), GetStatus a closed device with fixed levels. A notify queue must exist by key.
+  cellMicStopEx is RPCS3's "unexpected function" (fatal there) and stays unimplemented here, logged.
+- **libgem.** It initialises (allocating its memory when the game gives none) and keeps each controller's colour,
+  hue, rumble and calibration, but none is ever ready: the state functions answer CELL_GEM_NOT_CONNECTED (a value, not
+  an error), the inertial state INVALID_PARAMETER. Calibration ends 0.5 s after it starts, as RPCS3's gem thread ends
+  it. The colour helpers (HSVtoRGB, TrackHues, ForceRGB) are RPCS3's. With no camera an update has no video, and a
+  video conversion writes nothing. RPCS3's gem thread finishes such a conversion at once, so its
+  ConvertVideoFinish usually finds none (a race); here a started conversion waits for its Finish, which answers
+  CELL_OK.
+
+Tests:
+
+- tests/hle/test_sys_io.cpp: raw data, the press and sensor modes, extra data, peripherals and the filter; an LDD
+  controller registered, fed and unregistered, ports 1 to 6; the keyboard configuration and every conversion case;
+  the absent mouse; sys_config.
+- tests/hle/test_audio.cpp: the Ex queues, flags and acknowledgements; block tags and timestamps before and after
+  playing; the Add*Data channel layouts; the level ramp's 624 samples through a sink; a keyed queue the game made.
+- tests/hle/test_voice.cpp: the service events in order from both sources, and gone after end; mute flags, volumes,
+  bit rates, updates, pause and resume.
+- tests/hle/test_misc_hle.cpp: the game update callbacks and their Ex results; test_sysPrxForUser.cpp: module files,
+  images from a temporary /dev_flash, the debug mode; test_net.cpp: h_errno's place.
+- tests/hle/test_devices.cpp: the camera, microphone and Move answers, calibration timing, colours and updates.
 
 ## Open decisions (plan section 14)
 

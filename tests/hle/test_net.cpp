@@ -322,7 +322,8 @@ TEST_CASE("sys_net_errno: in the thread's TLS system area as RPCS3 keeps it, set
     u8* b = f.base();
     GuestThread g(f, 0, "net");
     Net n(g, 0);
-    CHECK(g.call("_sys_net_errno_loc") == n.tls + 0x2c); // r13 - 0x7030 + 0x2c
+    CHECK(g.call("_sys_net_errno_loc") == n.tls + 0x2c);   // r13 - 0x7030 + 0x2c
+    CHECK(g.call("_sys_net_h_errno_loc") == n.tls + 0x28); // r13 - 0x7030 + 0x28
     CHECK(n.call("socketclose", 77) == fail(SYS_NET_EBADF));
     CHECK(ps_read32(b, n.tls + 0x2c) == SYS_NET_EBADF);
     CHECK(n.call("socket", kAfInet, kDgram, 0) == ok(24));

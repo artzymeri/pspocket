@@ -1961,6 +1961,9 @@ s32 sys_net_set_resolver_configurations(PPUContext& ctx)
 // RPCS3 sys_net_.cpp: the location of the calling thread's sys_net_errno (see system_area).
 u32 _sys_net_errno_loc(PPUContext& ctx) { return system_area(ctx) + kErrnoOffset; }
 
+// And of its h_errno, the resolver's error (gethostbyname).
+u32 _sys_net_h_errno_loc(PPUContext& ctx) { return system_area(ctx) + kHErrnoOffset; }
+
 // ------------------------------------------------------------------------------------------------- setup
 
 // RPCS3: a TODO that returns CELL_OK (the parameter only sizes libnet's memory pool).
@@ -2025,6 +2028,7 @@ void register_sys_net(Registry& r)
         PS_HLE_FUNC(0x71F4C717, gethostbyname),
         PS_HLE_FUNC(0x7687D48C, sys_net_set_resolver_configurations),
         PS_HLE_FUNC(0x6005CDE1, _sys_net_errno_loc),
+        PS_HLE_FUNC(0xC9157D30, _sys_net_h_errno_loc),
     });
 }
 
