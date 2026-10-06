@@ -29,6 +29,7 @@ void register_sceNp2(Registry& r);
 void register_sceNpCommerce2(Registry& r);
 void register_sceNpSns(Registry& r);
 void register_sceNpTus(Registry& r);
+void register_sceNpClans(Registry& r);
 void register_sceNpTrophy(Registry& r);
 void register_sysPrxForUser(Registry& r);
 void register_sysPrxForUser_libc(Registry& r);
@@ -66,6 +67,7 @@ void register_all_modules(Registry& r)
     register_sceNpCommerce2(r);
     register_sceNpSns(r);
     register_sceNpTus(r);
+    register_sceNpClans(r);
     register_sceNpTrophy(r);
     register_sysPrxForUser(r);
     register_sysPrxForUser_libc(r);

@@ -30,6 +30,7 @@ add_library(pspocket_hle STATIC
     src/sceNpCommerce2.cpp
     src/sceNpSns.cpp
     src/sceNpTus.cpp
+    src/sceNpClans.cpp
     src/sceNpTrophy.cpp
     src/spu_programs.cpp
     src/spurs_custom.cpp
