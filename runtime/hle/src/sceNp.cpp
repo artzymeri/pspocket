@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <format>
 #include <initializer_list>
@@ -26,6 +27,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "guest.hpp"
@@ -89,6 +92,38 @@ enum : u32 {
     SCE_NP_CUSTOM_MENU_ERROR_INVALID_ARGUMENT = 0x80023B09,
     SCE_NP_CUSTOM_MENU_ERROR_NOT_REGISTERED = 0x80023B0B,
     SCE_NP_CUSTOM_MENU_ERROR_EXCEEDS_MAX = 0x80023B0C,
+    SCE_NP_MATCHING_ERROR_NOT_INITIALIZED = 0x8002A701,
+    SCE_NP_MATCHING_ERROR_INVALID_ARG = 0x8002A703,
+    SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND = 0x8002A709,
+    SCE_NP_MATCHING_ERROR_ROOM_NOT_FOUND = 0x8002A70B,
+    SCE_NP_MATCHING_ERROR_INVALID_ATTR_ID = 0x8002A70F,
+    SCE_NP_MATCHING_ERROR_CTX_STILL_RUNNING = 0x8002A713,
+    SCE_NP_MATCHING_ERROR_CTX_MAX = 0x8002A716,
+    SCE_NP_MATCHING_ERROR_INVALID_REQ_ID = 0x8002A717,
+    SCE_NP_MATCHING_ERROR_RESULT_NOT_FOUND = 0x8002A718,
+    SCE_NP_MATCHING_ERROR_BUSY = 0x8002A719,
+    SCE_NP_MATCHING_ERROR_COND_MAX = 0x8002A71D,
+    SCE_NP_MATCHING_ERROR_INVALID_COND = 0x8002A71E,
+    SCE_NP_MATCHING_ERROR_INVALID_ATTR = 0x8002A71F,
+    SCE_NP_MATCHING_ERROR_COMP_OP_INEQUALITY_MAX = 0x8002A720,
+    SCE_NP_MATCHING_ERROR_CANCELED = 0x8002A723,
+    SCE_NP_MATCHING_ERROR_INVALID_COMP_OP = 0x8002A725,
+    SCE_NP_MATCHING_ERROR_INVALID_COMP_TYPE = 0x8002A726,
+    SCE_NP_MATCHING_ERROR_ATTR_NOT_SPECIFIED = 0x8002A72A,
+    SCE_NP_MATCHING_ERROR_INVALID_ATTR_VALUE = 0x8002A72D,
+    SCE_NP_MATCHING_ERROR_DUPLICATE = 0x8002A72E,
+    SCE_NP_MATCHING_ERROR_UTILITY_UNAVAILABLE = 0x8002A733,
+    SCE_NP_COMMERCE_ERROR_UNSUPPORTED_VERSION = 0x80029404,
+    SCE_NP_COMMERCE_ERROR_INSUFFICIENT_BUFFER = 0x8002940E,
+    SCE_NP_COMMERCE_ERROR_INVALID_DATA_FLAG_NUM = 0x8002941A,
+    SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY = 0x80029421,
+    SCE_NP_COMMERCE_ERROR_CURRENCY_INFO_NOT_FOUND = 0x80029422,
+    SCE_NP_COMMERCE_ERROR_CATEGORY_INFO_NOT_FOUND = 0x80029423,
+    SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_COUNT_NOT_FOUND = 0x80029424,
+    SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_INFO_NOT_FOUND = 0x80029425,
+    SCE_NP_COMMERCE_ERROR_SKU_COUNT_NOT_FOUND = 0x80029426,
+    SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND = 0x80029427,
+    SCE_NP_COMMERCE_ERROR_INVALID_SKU_NUM = 0x80029429,
     SCE_NP_PROFILE_ERROR_NOT_INITIALIZED = 0x8002AB41,
     SCE_NP_PROFILE_ERROR_INVALID_ARGUMENT = 0x8002AB48,
     SCE_NP_DRM_ERROR_INVALID_PARAM = 0x80029502,
@@ -152,6 +187,32 @@ constexpr u32 SCE_NP_SCORE_MAX_CTX_NUM = 32, SCE_NP_SCORE_CENSOR_COMMENT_MAXLEN 
               SCE_NP_SCORE_MAX_RANGE_NUM_PER_TRANS = 100, SCE_NP_SCORE_MAX_NPID_NUM_PER_TRANS = 101,
               SCE_NP_SCORE_MAX_CLAN_NUM_PER_TRANS = 101;
 constexpr u64 kScoreTimeoutDefault = 60'000'000, kCommunityTimeoutMin = 10'000'000; // microseconds
+// The matching library (RPCS3 sceNp.h): attributes (SceNpMatchingAttr: next, be s32 type, be32 id, then the value:
+// be32 num, or a pointer and be32 size; 20 bytes), search conditions (SceNpMatchingSearchCondition: next, be s32
+// target_attr_type, be32 target_attr_id, be s32 comp_op, be s32 comp_type, then the compared attribute; 40 bytes),
+// request ranges (SceNpMatchingReqRange: be32 start, max).
+constexpr u32 kMatchingAttrSize = 20, kMatchingCondSize = 40;
+constexpr s32 SCE_NP_MATCHING_ATTR_TYPE_BASIC_BIN = 1, SCE_NP_MATCHING_ATTR_TYPE_BASIC_NUM = 2,
+              SCE_NP_MATCHING_ATTR_TYPE_GAME_BIN = 3, SCE_NP_MATCHING_ATTR_TYPE_GAME_NUM = 4;
+constexpr u32 SCE_NP_MATCHING_ROOM_ATTR_ID_TOTAL_SLOT = 1, SCE_NP_MATCHING_ROOM_ATTR_ID_PRIVATE_SLOT = 2,
+              SCE_NP_MATCHING_ROOM_ATTR_ID_CUR_TOTAL_NUM = 3, SCE_NP_MATCHING_ROOM_ATTR_ID_CUR_PRIVATE_NUM = 5,
+              SCE_NP_MATCHING_ROOM_ATTR_ID_PRIVILEGE_TYPE = 6, SCE_NP_MATCHING_ROOM_ATTR_ID_ROOM_SEARCH_FLAG = 7;
+constexpr s32 SCE_NP_MATCHING_CONDITION_SEARCH_EQ = 0, SCE_NP_MATCHING_CONDITION_SEARCH_NE = 1,
+              SCE_NP_MATCHING_CONDITION_SEARCH_GE = 5, SCE_NP_MATCHING_CONDITION_TYPE_VALUE = 0;
+constexpr s32 SCE_NP_MATCHING_ROOM_SLOT_TYPE_PUBLIC = 0, SCE_NP_MATCHING_ROOM_SLOT_TYPE_PRIVATE = 1;
+constexpr s32 SCE_NP_MATCHING_ROOM_SEARCH_FLAG_OPEN = 0, SCE_NP_MATCHING_ROOM_SEARCH_FLAG_STEALTH = 1;
+constexpr s32 SCE_NP_MATCHING_INVITATION_DESTINATION_MAX = 12;
+constexpr s32 SCE_NP_MATCHING_GUI_EVENT_CREATE_ROOM = 1, SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM = 2,
+              SCE_NP_MATCHING_GUI_EVENT_SEARCH_JOIN = 4, SCE_NP_MATCHING_GUI_EVENT_QUICK_MATCH = 5,
+              SCE_NP_MATCHING_GUI_EVENT_COMMON_LOAD = 8, SCE_NP_MATCHING_GUI_EVENT_COMMON_UNLOAD = 9,
+              SCE_NP_MATCHING_GUI_EVENT_GET_ROOM_LIST_LIMIT = 11;
+constexpr u32 kMatchingListMax = 256; // pspocket's bound on a guest list walk (a cycle would hang RPCS3)
+constexpr u64 kRoomInfoInterval = 30'000'000; // the limited room info calls: one per 30 s (microseconds)
+// Commerce (version 1): SceNpCommerceProductCategory {be32 version; data; be32 dataSize; be32 dval; reserved[16]};
+// the category, SKU and currency infos {pc; data; reserved[8]}; SceNpCommercePrice {be32 integer, fractional}.
+constexpr u32 SCE_NP_COMMERCE_VERSION = 1;
+constexpr u32 kPcVersion = 0, kPcData = 4, kPcDataSize = 8, kPcDval = 12, kPcSize = 32;
+constexpr u32 kPriceFractional = 4;
 constexpr u32 SCE_NP_SIGNALING_CTX_MAX = 8;
 constexpr u32 SCE_NP_SIGNALING_CONN_STATUS_INACTIVE = 0;
 constexpr u32 SCE_NP_SIGNALING_NETINFO_NAT_STATUS_TYPE2 = 2;
@@ -236,6 +297,15 @@ struct ScoreCtx {
     u64 timeout = kScoreTimeoutDefault;
 };
 
+// RPCS3 np_contexts.h matching_ctx: the creator's NP ID, its request handler, and the GUI call running on it (busy) with
+// that call's handler.
+struct MatchingCtx {
+    std::array<u8, kNpIdSize> npid{};
+    u32 handler = 0, arg = 0;
+    bool busy = false;
+    u32 gui_handler = 0, gui_arg = 0;
+};
+
 // RPCS3 np_contexts.h signaling_ctx: the creator's NP ID and its connection event handlers. Offline no connection
 // exists, so the handlers are never called.
 struct SignalingCtx {
@@ -265,6 +335,13 @@ struct NpState {
     IdTable<ScoreCtx, 0x2001, SCE_NP_SCORE_MAX_CTX_NUM> score_ctxs;
     // The signaling contexts (idm signaling_ctx, IDs 0x6001 on), cleared by NP term as in RPCS3 sceNpTerm.
     IdTable<SignalingCtx, 0x6001, SCE_NP_SIGNALING_CTX_MAX> signaling_ctxs;
+    // The matching library's context (idm matching_ctx: one, ID 0x9001), the one the GUI calls report on (np_handler
+    // gui_notifications.current_gui_ctx_id: set by its creation, cleared by its destruction), and when each limited
+    // room info call was last let through (RPCS3's function statics). Offline no request reaches a server, so no
+    // result or notification is ever kept. NP term leaves them, as in RPCS3.
+    IdTable<MatchingCtx, 0x9001, 1> matching_ctxs;
+    u32 matching_gui_ctx = 0;
+    u64 last_get_room_info = 0, last_set_room_info = 0;
     // The custom menu (np_handler custom_menu_*), for the system's friend list and profile dialogs, which never open
     // offline: kept as RPCS3 keeps it, never shown. NP term leaves it, as in RPCS3.
     bool custom_menu_registered = false;
@@ -2719,6 +2796,850 @@ s32 sceNpSignalingTerminateConnection(PPUContext&, u32 ctx_id, u32 conn_id)
     return lv2::CELL_OK;
 }
 
+// RPCS3 sceNpSignalingDeactivateConnection (signaling_handler::stop_sig): stopping a connection that doesn't exist does
+// nothing, as for sceNpSignalingTerminateConnection.
+s32 sceNpSignalingDeactivateConnection(PPUContext&, u32 ctx_id, u32 conn_id)
+{
+    if (!np().initialized) return error(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
+    PS_LOG_DEBUG(kChan, "sceNpSignalingDeactivateConnection(context {:#x}, connection {:#x}): no such connection",
+        ctx_id, conn_id);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpSignalingGetCtxOpt / sceNpSignalingSetCtxOpt: TODOs that check the option, its value (non-zero) and the
+// context, then answer CELL_OK; the getter writes nothing.
+s32 signaling_ctx_opt(std::string_view name, u32 ctx_id, s32 optname, u32 optval)
+{
+    NpState& s = np();
+    if (!s.initialized) return error(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
+    if (!optname || !optval) return error(SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT);
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.signaling_ctxs.find(ctx_id)) return error(SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND);
+    }
+    PS_LOG_WARN(kChan, "{}(context {:#x}, option {}, {:#x}): a TODO in RPCS3; nothing is read or written", name, ctx_id,
+        optname, optval);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpSignalingGetCtxOpt(PPUContext&, u32 ctx_id, s32 optname, u32 optval)
+{
+    return signaling_ctx_opt("sceNpSignalingGetCtxOpt", ctx_id, optname, optval);
+}
+
+s32 sceNpSignalingSetCtxOpt(PPUContext&, u32 ctx_id, s32 optname, s32 optval)
+{
+    return signaling_ctx_opt("sceNpSignalingSetCtxOpt", ctx_id, optname, static_cast<u32>(optval));
+}
+
+// RPCS3 sceNpSignalingGetPeerNetInfo, sceNpSignalingGetPeerNetInfoResult and sceNpSignalingCancelPeerNetInfo: TODOs
+// that check NP and their pointers and answer CELL_OK, writing nothing (no request ID, no result).
+s32 sceNpSignalingGetPeerNetInfo(PPUContext&, u32 ctx_id, u32 np_id, u32 req_id)
+{
+    if (!np().initialized) return error(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
+    if (!np_id || !req_id) return error(SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT);
+    PS_LOG_WARN(kChan, "sceNpSignalingGetPeerNetInfo(context {:#x}): a TODO in RPCS3; no request is made", ctx_id);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpSignalingGetPeerNetInfoResult(PPUContext&, u32 ctx_id, u32 req_id, u32 info)
+{
+    if (!np().initialized) return error(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
+    if (!info) return error(SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT); // RPCS3: "TODO: check info->size"
+    PS_LOG_WARN(kChan, "sceNpSignalingGetPeerNetInfoResult(context {:#x}, request {:#x}): a TODO in RPCS3; nothing "
+                       "written", ctx_id, req_id);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpSignalingCancelPeerNetInfo(PPUContext&, u32 ctx_id, u32 req_id)
+{
+    if (!np().initialized) return error(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
+    PS_LOG_DEBUG(kChan, "sceNpSignalingCancelPeerNetInfo(context {:#x}, request {:#x})", ctx_id, req_id);
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- matching
+
+// The matching library (RPCS3 sceNpMatching*, np_requests_gui.cpp, np_contexts.cpp), the older lobbies and rooms. Its
+// context works offline; every request goes to RPCN, which RPCS3 needs there and without which it aborts ("RPCN is
+// required to use PSN online features"). pspocket answers instead, as a console without PSN would leave the game:
+// - A GUI call (create, join, search and join, quick match, room list) makes RPCS3's checks, marks the context busy and
+//   queues COMMON_LOAD for its handler (gui_prelude); then, with no dialog (dialogs are answered at once), its event
+//   with SCE_NP_MATCHING_ERROR_CANCELED and COMMON_UNLOAD (gui_epilog), through cellSysutilCheckCallback.
+// - A room request (leave, room info, search flag) after its checks finds no room: SCE_NP_MATCHING_ERROR_ROOM_NOT_FOUND
+//   (no room is ever joined), and no request ID is written.
+// - RPCS3's TODOs (ownership, kicks, invitations) answer CELL_OK after their checks, as there.
+// Guest lists (attributes, conditions) are read with RPCS3's checks; memory that isn't guest memory, or a list longer
+// than 256 entries (a cycle would hang RPCS3), is refused with SCE_NP_MATCHING_ERROR_INVALID_ARG and a log.
+
+// RPCS3's first checks of most matching calls: matching 2 not in use, then NP.
+s32 matching_check(bool need_np)
+{
+    if (np_match2_initialized()) return error(SCE_NP_MATCHING_ERROR_UTILITY_UNAVAILABLE);
+    if (need_np && !np().initialized) return error(SCE_NP_MATCHING_ERROR_NOT_INITIALIZED);
+    return lv2::CELL_OK;
+}
+
+struct MatchingAttr {
+    s32 type = 0;
+    u32 id = 0, num = 0, data_size = 0;
+};
+
+// The attribute list at `attr` (none when 0); nullopt when a node isn't guest memory or the list is too long (logged).
+std::optional<std::vector<MatchingAttr>> read_matching_attrs(PPUContext& ctx, std::string_view name, u32 attr)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    std::vector<MatchingAttr> out;
+    for (u32 at = attr; at; at = ps_read32(base, at)) {
+        if (out.size() == kMatchingListMax || !guest_readable(t, at, kMatchingAttrSize)) {
+            log_call_site(ctx, base, std::format("{}: the attribute list at {:#x} {} at {:#x}", name, attr,
+                out.size() == kMatchingListMax ? "has no end" : "leaves guest memory", at));
+            return std::nullopt;
+        }
+        out.push_back({static_cast<s32>(ps_read32(base, at + 4)), ps_read32(base, at + 8), ps_read32(base, at + 12),
+            ps_read32(base, at + 16)});
+    }
+    return out;
+}
+
+// RPCS3 check_attr_id.
+s32 check_attr_id(const MatchingAttr& a)
+{
+    switch (a.type) {
+    case SCE_NP_MATCHING_ATTR_TYPE_BASIC_BIN: return error(SCE_NP_MATCHING_ERROR_INVALID_ATTR_ID);
+    case SCE_NP_MATCHING_ATTR_TYPE_BASIC_NUM:
+        if (a.id < SCE_NP_MATCHING_ROOM_ATTR_ID_TOTAL_SLOT || a.id > SCE_NP_MATCHING_ROOM_ATTR_ID_ROOM_SEARCH_FLAG) {
+            return error(SCE_NP_MATCHING_ERROR_INVALID_ATTR_ID);
+        }
+        break;
+    case SCE_NP_MATCHING_ATTR_TYPE_GAME_BIN:
+    case SCE_NP_MATCHING_ATTR_TYPE_GAME_NUM:
+        if (a.id < 1 || a.id > 16) return error(SCE_NP_MATCHING_ERROR_INVALID_ATTR_ID);
+        break;
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3 check_duplicate_attr: no type and ID twice.
+s32 check_duplicate_attr(const std::vector<MatchingAttr>& attrs)
+{
+    std::vector<s32> seen;
+    for (const MatchingAttr& a : attrs) {
+        const s32 type_id = (a.type - 1) * 16 + static_cast<s32>(a.id) - 1;
+        if (std::find(seen.begin(), seen.end(), type_id) != seen.end()) return error(SCE_NP_MATCHING_ERROR_DUPLICATE);
+        seen.push_back(type_id);
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3 check_attr_id_and_duplicate.
+s32 check_attr_id_and_duplicate(const std::vector<MatchingAttr>& attrs)
+{
+    for (const MatchingAttr& a : attrs)
+        if (const s32 r = check_attr_id(a)) return r;
+    return check_duplicate_attr(attrs);
+}
+
+// RPCS3 check_attr_create_room: valid IDs, no current-count attributes, binary flags, game data within its size, no
+// duplicates, then the slots: the first point where both the total and the private slot have been given decides.
+s32 check_attr_create_room(const std::vector<MatchingAttr>& attrs)
+{
+    for (const MatchingAttr& a : attrs) {
+        if (const s32 r = check_attr_id(a)) return r;
+        if (a.type == SCE_NP_MATCHING_ATTR_TYPE_BASIC_NUM) {
+            if (a.id >= SCE_NP_MATCHING_ROOM_ATTR_ID_CUR_TOTAL_NUM && a.id <= SCE_NP_MATCHING_ROOM_ATTR_ID_CUR_PRIVATE_NUM) {
+                return error(SCE_NP_MATCHING_ERROR_INVALID_ATTR_ID);
+            }
+            if (a.num > 1 && (a.id == SCE_NP_MATCHING_ROOM_ATTR_ID_PRIVILEGE_TYPE ||
+                                 a.id == SCE_NP_MATCHING_ROOM_ATTR_ID_ROOM_SEARCH_FLAG)) {
+                return error(SCE_NP_MATCHING_ERROR_INVALID_ATTR_VALUE);
+            }
+        } else if (a.type == SCE_NP_MATCHING_ATTR_TYPE_GAME_BIN) {
+            if (a.data_size > (a.id < 3 ? 256u : 64u)) return error(SCE_NP_MATCHING_ERROR_INVALID_ATTR);
+        }
+    }
+    if (const s32 r = check_duplicate_attr(attrs)) return r;
+    bool found_total = false, found_private = false;
+    u32 total = 0, priv = 0;
+    for (const MatchingAttr& a : attrs) {
+        if (a.type != SCE_NP_MATCHING_ATTR_TYPE_BASIC_NUM) continue;
+        if (a.id == SCE_NP_MATCHING_ROOM_ATTR_ID_TOTAL_SLOT) {
+            total = a.num;
+            found_total = true;
+        } else if (a.id == SCE_NP_MATCHING_ROOM_ATTR_ID_PRIVATE_SLOT) {
+            priv = a.num;
+            found_private = true;
+        }
+        if (found_total && found_private) {
+            if (total > 0 && total <= 16 && static_cast<s32>(priv) >= 0 && static_cast<s32>(total - priv) > 0) {
+                return lv2::CELL_OK;
+            }
+            return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+        }
+    }
+    return error(SCE_NP_MATCHING_ERROR_ATTR_NOT_SPECIFIED);
+}
+
+struct MatchingCond {
+    s32 attr_type = 0;
+    u32 attr_id = 0;
+    s32 comp_op = 0, comp_type = 0;
+};
+
+// The search conditions at `cond`, at most `limit` + 1 of them (enough for every check: each call refuses more than
+// `limit` with SCE_NP_MATCHING_ERROR_COND_MAX); nullopt when a node isn't guest memory (logged).
+std::optional<std::vector<MatchingCond>> read_matching_conds(PPUContext& ctx, std::string_view name, u32 cond,
+    u32 limit)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    std::vector<MatchingCond> out;
+    for (u32 at = cond; at && out.size() <= limit; at = ps_read32(base, at)) {
+        if (!guest_readable(t, at, kMatchingCondSize)) {
+            log_call_site(ctx, base, std::format("{}: the condition list at {:#x} leaves guest memory at {:#x}", name,
+                                         cond, at));
+            return std::nullopt;
+        }
+        out.push_back({static_cast<s32>(ps_read32(base, at + 4)), ps_read32(base, at + 8),
+            static_cast<s32>(ps_read32(base, at + 12)), static_cast<s32>(ps_read32(base, at + 16))});
+    }
+    return out;
+}
+
+// The conditions of a room search (RPCS3 sceNpMatchingSearchJoinRoomGUI and check_room_list_params with param_7 1):
+// at most 9; value comparisons EQ to GE, at most 9 of them inequalities; numeric attributes only: for a search and
+// join, only the total slots among the basic ones, for a room list any basic one but the total slots; game numbers
+// 1 to 8.
+s32 check_search_conds(const std::vector<MatchingCond>& conds, bool room_list)
+{
+    constexpr u32 kMax = 9;
+    u32 total = 0, inequalities = 0;
+    for (const MatchingCond& c : conds) {
+        if (++total > kMax) return error(SCE_NP_MATCHING_ERROR_COND_MAX);
+        if (c.comp_type != SCE_NP_MATCHING_CONDITION_TYPE_VALUE || c.comp_op < SCE_NP_MATCHING_CONDITION_SEARCH_EQ ||
+            c.comp_op > SCE_NP_MATCHING_CONDITION_SEARCH_GE) {
+            return error(SCE_NP_MATCHING_ERROR_INVALID_COND);
+        }
+        if (c.comp_op > SCE_NP_MATCHING_CONDITION_SEARCH_NE && ++inequalities > kMax) {
+            return error(SCE_NP_MATCHING_ERROR_COMP_OP_INEQUALITY_MAX);
+        }
+        switch (c.attr_type) {
+        case SCE_NP_MATCHING_ATTR_TYPE_BASIC_BIN:
+        case SCE_NP_MATCHING_ATTR_TYPE_GAME_BIN: return error(SCE_NP_MATCHING_ERROR_INVALID_COND);
+        case SCE_NP_MATCHING_ATTR_TYPE_BASIC_NUM:
+            if (room_list ? c.attr_id == SCE_NP_MATCHING_ROOM_ATTR_ID_TOTAL_SLOT
+                          : c.attr_id != SCE_NP_MATCHING_ROOM_ATTR_ID_TOTAL_SLOT) {
+                return error(SCE_NP_MATCHING_ERROR_INVALID_COND);
+            }
+            break;
+        case SCE_NP_MATCHING_ATTR_TYPE_GAME_NUM:
+            if (c.attr_id < 1 || c.attr_id > 8) return error(SCE_NP_MATCHING_ERROR_INVALID_COND);
+            break;
+        }
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3 gui_prelude, then the offline end of the GUI call: the context must exist and not be busy; its handler gets
+// COMMON_LOAD, `event` with SCE_NP_MATCHING_ERROR_CANCELED, and COMMON_UNLOAD, each through cellSysutilCheckCallback
+// (SceNpMatchingGUIHandler: ctx_id, event, error, arg).
+s32 matching_gui_offline(std::string_view name, u32 ctx_id, s32 event, u32 handler, u32 arg)
+{
+    NpState& s = np();
+    {
+        std::lock_guard lock(s.mutex);
+        MatchingCtx* c = s.matching_ctxs.find(ctx_id);
+        if (!c) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+        if (c->busy) return error(SCE_NP_MATCHING_ERROR_CTX_STILL_RUNNING);
+        c->gui_handler = handler;
+        c->gui_arg = arg;
+    }
+    const auto queue = [=](s32 ev, s32 code) {
+        sysutil_queue_call([=](PPUContext& cb_ctx) -> s32 {
+            call_guest(cb_ctx, handler, {ctx_id, static_cast<u64>(static_cast<s64>(ev)),
+                static_cast<u64>(static_cast<s64>(code)), arg});
+            return lv2::CELL_OK;
+        });
+    };
+    queue(SCE_NP_MATCHING_GUI_EVENT_COMMON_LOAD, 0);
+    queue(event, error(SCE_NP_MATCHING_ERROR_CANCELED));
+    queue(SCE_NP_MATCHING_GUI_EVENT_COMMON_UNLOAD, 0);
+    PS_LOG_INFO(kChan, "{}(context {:#x}): offline, no dialog; the handler {:#x} hears it was cancelled", name, ctx_id,
+        handler);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpMatchingCreateCtx: the one matching context (0x9001), with the user's NP ID and the request handler; it
+// becomes the context GUI results are reported on. RPCS3 reads the NP ID unchecked: one that isn't guest memory is
+// refused here with a log.
+s32 sceNpMatchingCreateCtx(PPUContext& ctx, u32 np_id, u32 handler, u32 arg, u32 ctx_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!np_id || !handler || !ctx_id) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, np_id, kNpIdSize) || !guest_readable(t, ctx_id, 4)) {
+        log_call_site(ctx, base, std::format("sceNpMatchingCreateCtx: the NP ID {:#x} or the result's address {:#x} is "
+                                             "not guest memory", np_id, ctx_id));
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    MatchingCtx c;
+    std::memcpy(c.npid.data(), base + np_id, kNpIdSize);
+    c.handler = handler;
+    c.arg = arg;
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    const u32 id = s.matching_ctxs.make(c);
+    if (!id) return error(SCE_NP_MATCHING_ERROR_CTX_MAX);
+    s.matching_gui_ctx = id;
+    ps_write32(base, ctx_id, id);
+    PS_LOG_INFO(kChan, "sceNpMatchingCreateCtx(handler {:#x}, arg {:#x}): context {:#x}; offline its requests find no "
+                       "room", handler, arg, id);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpMatchingDestroyCtx(PPUContext&, u32 ctx_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    if (!s.matching_ctxs.remove(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    s.matching_gui_ctx = 0;
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpMatchingGetResult (np_handler::get_matching_result): the notification a request left on the GUI's
+// context. Offline no request is ever sent, so none is found.
+s32 sceNpMatchingGetResult(PPUContext&, u32 ctx_id, u32 req_id, u32 buf, u32 size, u32 event)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!size) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    if (!s.matching_gui_ctx || !s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    PS_LOG_DEBUG(kChan, "sceNpMatchingGetResult(context {:#x}, request {:#x}, buf {:#x}, event {:#x}): no such request",
+        ctx_id, req_id, buf, event);
+    return error(SCE_NP_MATCHING_ERROR_INVALID_REQ_ID);
+}
+
+// RPCS3 sceNpMatchingGetResultGUI (np_handler::get_result_gui): the last GUI call's result. Offline every GUI call is
+// cancelled, so there is none. NP isn't checked.
+s32 sceNpMatchingGetResultGUI(PPUContext&, u32 buf, u32 size, u32 event)
+{
+    if (const s32 r = matching_check(false)) return r;
+    if (!size) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    PS_LOG_DEBUG(kChan, "sceNpMatchingGetResultGUI(buf {:#x}, event {:#x}): no result", buf, event);
+    return error(SCE_NP_MATCHING_ERROR_RESULT_NOT_FOUND);
+}
+
+// RPCS3 sceNpMatchingCreateRoomGUI (matching_create_room): the communication ID, the handler and the room's attributes
+// (check_attr_create_room); NP isn't checked.
+s32 sceNpMatchingCreateRoomGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 attr, u32 handler, u32 arg)
+{
+    if (const s32 r = matching_check(false)) return r;
+    if (!comm_id || !handler) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    const std::optional<std::vector<MatchingAttr>> attrs = read_matching_attrs(ctx, "sceNpMatchingCreateRoomGUI", attr);
+    if (!attrs) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (const s32 r = check_attr_create_room(*attrs)) return r;
+    return matching_gui_offline("sceNpMatchingCreateRoomGUI", ctx_id, SCE_NP_MATCHING_GUI_EVENT_CREATE_ROOM, handler,
+        arg);
+}
+
+// RPCS3 sceNpMatchingJoinRoomGUI (matching_join_room): the room and the handler.
+s32 sceNpMatchingJoinRoomGUI(PPUContext&, u32 ctx_id, u32 room_id, u32 handler, u32 arg)
+{
+    if (const s32 r = matching_check(false)) return r;
+    if (!room_id || !handler) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    return matching_gui_offline("sceNpMatchingJoinRoomGUI", ctx_id, SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM, handler, arg);
+}
+
+// RPCS3 sceNpMatchingQuickMatchGUI: the communication ID, the handler, at least 2 players and a timeout of at least
+// 1 s, then the conditions: at most 9, EQ or NE, comp_type not 1 (as RPCS3 writes it: "weird"), game numbers 1 to 8
+// only.
+s32 sceNpMatchingQuickMatchGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 cond, s32 available_num, s32 timeout,
+    u32 handler, u32 arg)
+{
+    if (const s32 r = matching_check(false)) return r;
+    if (!comm_id || !handler || available_num < 2 || timeout < 1) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    const std::optional<std::vector<MatchingCond>> conds = read_matching_conds(ctx, "sceNpMatchingQuickMatchGUI", cond, 9);
+    if (!conds) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    u32 total = 0;
+    for (const MatchingCond& c : *conds) {
+        if (++total > 9) return error(SCE_NP_MATCHING_ERROR_COND_MAX);
+        if (c.comp_op < SCE_NP_MATCHING_CONDITION_SEARCH_EQ || c.comp_op > SCE_NP_MATCHING_CONDITION_SEARCH_NE) {
+            return error(SCE_NP_MATCHING_ERROR_INVALID_COMP_OP);
+        }
+        if (c.comp_type == 1) return error(SCE_NP_MATCHING_ERROR_INVALID_COMP_TYPE);
+        switch (c.attr_type) {
+        case SCE_NP_MATCHING_ATTR_TYPE_BASIC_BIN:
+        case SCE_NP_MATCHING_ATTR_TYPE_BASIC_NUM:
+        case SCE_NP_MATCHING_ATTR_TYPE_GAME_BIN: return error(SCE_NP_MATCHING_ERROR_INVALID_COND);
+        case SCE_NP_MATCHING_ATTR_TYPE_GAME_NUM:
+            if (c.attr_id < 1 || c.attr_id > 8) return error(SCE_NP_MATCHING_ERROR_INVALID_COND);
+            break;
+        }
+    }
+    PS_LOG_DEBUG(kChan, "sceNpMatchingQuickMatchGUI: {} players, timeout {} s", available_num, timeout);
+    return matching_gui_offline("sceNpMatchingQuickMatchGUI", ctx_id, SCE_NP_MATCHING_GUI_EVENT_QUICK_MATCH, handler,
+        arg);
+}
+
+// RPCS3 sceNpMatchingSearchJoinRoomGUI: the communication ID and the handler, the conditions (check_search_conds),
+// then the attributes asked for (valid IDs, no duplicates).
+s32 sceNpMatchingSearchJoinRoomGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 cond, u32 attr, u32 handler, u32 arg)
+{
+    if (const s32 r = matching_check(false)) return r;
+    if (!comm_id || !handler) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    const std::optional<std::vector<MatchingCond>> conds =
+        read_matching_conds(ctx, "sceNpMatchingSearchJoinRoomGUI", cond, 9);
+    if (!conds) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (const s32 r = check_search_conds(*conds, false)) return r;
+    const std::optional<std::vector<MatchingAttr>> attrs =
+        read_matching_attrs(ctx, "sceNpMatchingSearchJoinRoomGUI", attr);
+    if (!attrs) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (const s32 r = check_attr_id_and_duplicate(*attrs)) return r;
+    return matching_gui_offline("sceNpMatchingSearchJoinRoomGUI", ctx_id, SCE_NP_MATCHING_GUI_EVENT_SEARCH_JOIN, handler,
+        arg);
+}
+
+// RPCS3 sceNpMatchingGetRoomListLimitGUI (matching_get_room_list, check_room_list_params with param_7 1, param_8 0):
+// the communication ID, the range (a start, at most 20) and the handler, the conditions, then the attributes.
+s32 sceNpMatchingGetRoomListLimitGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 range, u32 cond, u32 attr,
+    u32 handler, u32 arg)
+{
+    if (const s32 r = matching_check(false)) return r;
+    if (!comm_id || !range || !handler) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_readable(t, range, 8)) {
+        log_call_site(ctx, t.kernel.base(),
+            std::format("sceNpMatchingGetRoomListLimitGUI: the range {:#x} is not guest memory", range));
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    if (!ps_read32(t.kernel.base(), range) || ps_read32(t.kernel.base(), range + 4) > 20) {
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    const std::optional<std::vector<MatchingCond>> conds =
+        read_matching_conds(ctx, "sceNpMatchingGetRoomListLimitGUI", cond, 9);
+    if (!conds) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (const s32 r = check_search_conds(*conds, true)) return r;
+    const std::optional<std::vector<MatchingAttr>> attrs =
+        read_matching_attrs(ctx, "sceNpMatchingGetRoomListLimitGUI", attr);
+    if (!attrs) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (const s32 r = check_attr_id_and_duplicate(*attrs)) return r;
+    return matching_gui_offline("sceNpMatchingGetRoomListLimitGUI", ctx_id,
+        SCE_NP_MATCHING_GUI_EVENT_GET_ROOM_LIST_LIMIT, handler, arg);
+}
+
+// The offline end of a room request (np_handler's *_gui requests): the context must exist; then no room is found.
+s32 matching_room_offline(std::string_view name, u32 ctx_id)
+{
+    NpState& s = np();
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    }
+    PS_LOG_INFO(kChan, "{}(context {:#x}): offline no room is ever joined: room not found", name, ctx_id);
+    return error(SCE_NP_MATCHING_ERROR_ROOM_NOT_FOUND);
+}
+
+// RPCS3 matching_get_room_info / matching_set_room_info: the limited forms let one call through per 30 s (before any
+// other check; SCE_NP_MATCHING_ERROR_BUSY meanwhile); then the lobby, room, request ID and attributes, the attributes'
+// IDs, and the context.
+s32 matching_room_info(PPUContext& ctx, std::string_view name, u64 NpState::*last_call, bool limit, u32 ctx_id,
+    u32 lobby_id, u32 room_id, u32 attr, u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (limit) {
+        NpState& s = np();
+        std::lock_guard lock(s.mutex);
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (s.*last_call != 0 && now - s.*last_call < kRoomInfoInterval) return error(SCE_NP_MATCHING_ERROR_BUSY);
+        s.*last_call = now;
+    }
+    if (!lobby_id || !room_id || !req_id || !attr) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    const std::optional<std::vector<MatchingAttr>> attrs = read_matching_attrs(ctx, name, attr);
+    if (!attrs) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (const s32 r = check_attr_id_and_duplicate(*attrs)) return r;
+    return matching_room_offline(name, ctx_id);
+}
+
+s32 sceNpMatchingGetRoomInfo(PPUContext& ctx, u32 ctx_id, u32 lobby_id, u32 room_id, u32 attr, u32 req_id)
+{
+    return matching_room_info(ctx, "sceNpMatchingGetRoomInfo", &NpState::last_get_room_info, true, ctx_id, lobby_id,
+        room_id, attr, req_id);
+}
+
+s32 sceNpMatchingGetRoomInfoNoLimit(PPUContext& ctx, u32 ctx_id, u32 lobby_id, u32 room_id, u32 attr, u32 req_id)
+{
+    return matching_room_info(ctx, "sceNpMatchingGetRoomInfoNoLimit", &NpState::last_get_room_info, false, ctx_id,
+        lobby_id, room_id, attr, req_id);
+}
+
+s32 sceNpMatchingSetRoomInfo(PPUContext& ctx, u32 ctx_id, u32 lobby_id, u32 room_id, u32 attr, u32 req_id)
+{
+    return matching_room_info(ctx, "sceNpMatchingSetRoomInfo", &NpState::last_set_room_info, true, ctx_id, lobby_id,
+        room_id, attr, req_id);
+}
+
+s32 sceNpMatchingSetRoomInfoNoLimit(PPUContext& ctx, u32 ctx_id, u32 lobby_id, u32 room_id, u32 attr, u32 req_id)
+{
+    return matching_room_info(ctx, "sceNpMatchingSetRoomInfoNoLimit", &NpState::last_set_room_info, false, ctx_id,
+        lobby_id, room_id, attr, req_id);
+}
+
+s32 sceNpMatchingGetRoomSearchFlag(PPUContext&, u32 ctx_id, u32 lobby_id, u32 room_id, u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!lobby_id || !room_id || !req_id) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    return matching_room_offline("sceNpMatchingGetRoomSearchFlag", ctx_id);
+}
+
+s32 sceNpMatchingSetRoomSearchFlag(PPUContext&, u32 ctx_id, u32 lobby_id, u32 room_id, s32 flag, u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!lobby_id || !room_id || !req_id || flag < SCE_NP_MATCHING_ROOM_SEARCH_FLAG_OPEN ||
+        flag > SCE_NP_MATCHING_ROOM_SEARCH_FLAG_STEALTH) {
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    return matching_room_offline("sceNpMatchingSetRoomSearchFlag", ctx_id);
+}
+
+// RPCS3 sceNpMatchingLeaveRoom: the context, then (RPCS3 ensure()s it) a room.
+s32 sceNpMatchingLeaveRoom(PPUContext& ctx, u32 ctx_id, u32 room_id, u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    NpState& s = np();
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    }
+    if (!room_id) {
+        log_call_site(ctx, guest_base(ctx), "sceNpMatchingLeaveRoom: no room (RPCS3 aborts)");
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    PS_LOG_DEBUG(kChan, "sceNpMatchingLeaveRoom: request ID's address {:#x}", req_id);
+    return matching_room_offline("sceNpMatchingLeaveRoom", ctx_id);
+}
+
+// RPCS3 sceNpMatchingGetRoomMemberListLocal (get_room_member_list_local_gui): the members of a room in the GUI cache,
+// which only RPCN's replies fill: none offline.
+s32 sceNpMatchingGetRoomMemberListLocal(PPUContext&, u32 ctx_id, u32 room_id, u32 buflen, u32 buf)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!buflen) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    NpState& s = np();
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    }
+    PS_LOG_DEBUG(kChan, "sceNpMatchingGetRoomMemberListLocal(context {:#x}, room {:#x}, buf {:#x}): no room", ctx_id,
+        room_id, buf);
+    return error(SCE_NP_MATCHING_ERROR_ROOM_NOT_FOUND);
+}
+
+// RPCS3 sceNpMatchingGrantOwnership, sceNpMatchingKickRoomMember(WithOpt): TODOs that answer CELL_OK after checking
+// their pointers (and the option's length, at most 16), with no request made or ID written.
+s32 matching_todo(std::string_view name, u32 ctx_id)
+{
+    PS_LOG_WARN(kChan, "{}(context {:#x}): a TODO in RPCS3, answered CELL_OK as there; nothing is sent", name, ctx_id);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpMatchingGrantOwnership(PPUContext&, u32 ctx_id, u32 room_id, u32 user_id, u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!room_id || !user_id || !req_id) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    return matching_todo("sceNpMatchingGrantOwnership", ctx_id);
+}
+
+s32 sceNpMatchingKickRoomMember(PPUContext&, u32 ctx_id, u32 room_id, u32 user_id, u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!room_id || !user_id || !req_id) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    return matching_todo("sceNpMatchingKickRoomMember", ctx_id);
+}
+
+s32 sceNpMatchingKickRoomMemberWithOpt(PPUContext&, u32 ctx_id, u32 room_id, u32 user_id, u32 opt, s32 opt_len,
+    u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!room_id || !user_id || !req_id) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (opt && (opt_len < 0 || opt_len > 16)) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    return matching_todo("sceNpMatchingKickRoomMemberWithOpt", ctx_id);
+}
+
+// RPCS3 sceNpMatchingAcceptInvitationGUI: a TODO after its checks; no dialog, the handler isn't called. NP isn't
+// checked.
+s32 sceNpMatchingAcceptInvitationGUI(PPUContext&, u32 ctx_id, u32 comm_id, u32 container_id, u32 handler, u32 arg)
+{
+    if (const s32 r = matching_check(false)) return r;
+    if (!comm_id || !handler) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    PS_LOG_DEBUG(kChan, "sceNpMatchingAcceptInvitationGUI: container {:#x}, handler {:#x}, arg {:#x}", container_id,
+        handler, arg);
+    return matching_todo("sceNpMatchingAcceptInvitationGUI", ctx_id);
+}
+
+// RPCS3 sceNpMatchingSendInvitationGUI: the room, the communication ID, the texts; the recipients (1 to 12 when
+// given); a subject of at most 16 characters and a body of at most 128 (RPCS3's check_text); a public or private
+// slot. Then a TODO: no dialog, the handler isn't called. RPCS3 reads the texts unchecked: ones that aren't guest
+// memory are refused here with a log.
+s32 sceNpMatchingSendInvitationGUI(PPUContext& ctx, u32 ctx_id, u32 room_id, u32 comm_id, u32 dsts, s32 num,
+    s32 slot_type, u32 subject, u32 body, u32 container_id, u32 handler, u32 arg)
+{
+    if (const s32 r = matching_check(false)) return r;
+    if (!room_id || !comm_id || !subject || !body) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (dsts && (num <= 0 || num > SCE_NP_MATCHING_INVITATION_DESTINATION_MAX)) {
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    for (const auto& [text, max, what] : {std::tuple{subject, 16, "subject"}, std::tuple{body, 128, "body"}}) {
+        const std::optional<s32> n = check_text(t, text);
+        if (!n) {
+            log_call_site(ctx, t.kernel.base(), std::format("sceNpMatchingSendInvitationGUI: the {} at {:#x} runs out "
+                                                            "of guest memory", what, text));
+            return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+        }
+        if (*n < 0) return *n;
+        if (*n > max) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    if (slot_type < SCE_NP_MATCHING_ROOM_SLOT_TYPE_PUBLIC || slot_type > SCE_NP_MATCHING_ROOM_SLOT_TYPE_PRIVATE) {
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    PS_LOG_DEBUG(kChan, "sceNpMatchingSendInvitationGUI: container {:#x}, handler {:#x}, arg {:#x}", container_id,
+        handler, arg);
+    return matching_todo("sceNpMatchingSendInvitationGUI", ctx_id);
+}
+
+// ------------------------------------------------------------------------------------------------- commerce
+
+// The commerce library (version 1): RPCS3 sceNpCommerce*, nearly all TODOs. Its answers are RPCS3's: the checks it
+// makes (versions, counts, sizes), then CELL_OK, mostly writing nothing (no context ID, no request ID, no count); the
+// product category helpers fill what RPCS3 fills. No store is reached offline. RPCS3 writes the product category and
+// info structs unchecked: ones that aren't guest memory are refused here with a log.
+
+// Whether `size` bytes at `addr` are guest memory; if not, the call site is logged and false returned.
+bool commerce_usable(PPUContext& ctx, std::string_view name, u32 addr, u32 size)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (guest_readable(t, addr, size)) return true;
+    log_call_site(ctx, t.kernel.base(), std::format("{}: {:#x} ({} bytes) is not guest memory", name, addr, size));
+    return false;
+}
+
+s32 commerce_todo(std::string_view name)
+{
+    PS_LOG_WARN(kChan, "{}: a TODO in RPCS3, answered CELL_OK as there; offline no store is reached", name);
+    return lv2::CELL_OK;
+}
+
+s32 sceNpCommerceCreateCtx(PPUContext&, u32 version, u32 np_id, u32 handler, u32 arg, u32 ctx_id)
+{
+    if (version != SCE_NP_COMMERCE_VERSION) return error(SCE_NP_COMMERCE_ERROR_UNSUPPORTED_VERSION);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceCreateCtx(NP ID {:#x}, handler {:#x}, arg {:#x}): no context ID written ({:#x})",
+        np_id, handler, arg, ctx_id);
+    return commerce_todo("sceNpCommerceCreateCtx");
+}
+
+s32 sceNpCommerceDestroyCtx(PPUContext&, u32 ctx_id)
+{
+    PS_LOG_DEBUG(kChan, "sceNpCommerceDestroyCtx({:#x})", ctx_id);
+    return commerce_todo("sceNpCommerceDestroyCtx");
+}
+
+s32 sceNpCommerceGetProductCategoryStart(PPUContext&, u32 ctx_id, u32 category_id, s32 lang_code, u32 req_id)
+{
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetProductCategoryStart(context {:#x}, category {:#x}, language {}, request "
+                        "{:#x})", ctx_id, category_id, lang_code, req_id);
+    return commerce_todo("sceNpCommerceGetProductCategoryStart");
+}
+
+s32 sceNpCommerceGetProductCategoryFinish(PPUContext&, u32 req_id)
+{
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetProductCategoryFinish({:#x})", req_id);
+    return commerce_todo("sceNpCommerceGetProductCategoryFinish");
+}
+
+s32 sceNpCommerceGetProductCategoryAbort(PPUContext&, u32 req_id)
+{
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetProductCategoryAbort({:#x})", req_id);
+    return commerce_todo("sceNpCommerceGetProductCategoryAbort");
+}
+
+// RPCS3 sceNpCommerceGetProductCategoryResult: a buffer size and a fill size are needed; the result is empty.
+s32 sceNpCommerceGetProductCategoryResult(PPUContext& ctx, u32 req_id, u32 buf, u32 buf_size, u32 fill_size)
+{
+    if (!buf_size || !fill_size) return error(SCE_NP_COMMERCE_ERROR_INSUFFICIENT_BUFFER);
+    if (!commerce_usable(ctx, "sceNpCommerceGetProductCategoryResult", fill_size, 4)) {
+        return error(SCE_NP_COMMERCE_ERROR_INSUFFICIENT_BUFFER);
+    }
+    ps_write32(guest_base(ctx), fill_size, 0);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetProductCategoryResult(request {:#x}, buf {:#x}): empty", req_id, buf);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpCommerceInitProductCategory: records the data in the category (data, size), then its version (always
+// SCE_NP_COMMERCE_VERSION: a TODO reads it from the data) and its currency (at least 16 bytes); dval 0.
+s32 sceNpCommerceInitProductCategory(PPUContext& ctx, u32 pc, u32 data, u32 data_size)
+{
+    if (!pc) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    if (!commerce_usable(ctx, "sceNpCommerceInitProductCategory", pc, kPcSize)) {
+        return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, pc + kPcData, data);
+    ps_write32(base, pc + kPcDataSize, data_size);
+    if (data_size < 4) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    ps_write32(base, pc + kPcVersion, SCE_NP_COMMERCE_VERSION);
+    if (data_size < 16) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY); // under 8, or no currency
+    ps_write32(base, pc + kPcDval, 0);
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sceNpCommerceDestroyProductCategory: forgets the data.
+void sceNpCommerceDestroyProductCategory(PPUContext& ctx, u32 pc)
+{
+    if (!pc || !commerce_usable(ctx, "sceNpCommerceDestroyProductCategory", pc, kPcSize)) return;
+    ps_write32(guest_base(ctx), pc + kPcDataSize, 0);
+    ps_write32(guest_base(ctx), pc + kPcData, 0);
+}
+
+// The category's data size, or nullopt when there is no category (or it isn't guest memory: logged).
+std::optional<u32> category_size(PPUContext& ctx, std::string_view name, u32 pc)
+{
+    if (!pc || !commerce_usable(ctx, name, pc, kPcSize)) return std::nullopt;
+    return ps_read32(guest_base(ctx), pc + kPcDataSize);
+}
+
+// RPCS3 sceNpCommerceGetCurrencyInfo / GetCategoryInfo: the category must hold at least 16 (776) bytes; the info, when
+// given, points at it (the data pointer is a TODO).
+s32 commerce_info(PPUContext& ctx, std::string_view name, u32 pc, u32 info, u32 min_size, u32 not_found)
+{
+    const std::optional<u32> size = category_size(ctx, name, pc);
+    if (!size || *size < min_size) return error(not_found);
+    if (info) {
+        if (!commerce_usable(ctx, name, info, 4)) return error(not_found);
+        ps_write32(guest_base(ctx), info, pc);
+    }
+    return lv2::CELL_OK;
+}
+
+s32 sceNpCommerceGetCurrencyInfo(PPUContext& ctx, u32 pc, u32 info)
+{
+    return commerce_info(ctx, "sceNpCommerceGetCurrencyInfo", pc, info, 16, SCE_NP_COMMERCE_ERROR_CURRENCY_INFO_NOT_FOUND);
+}
+
+s32 sceNpCommerceGetCategoryInfo(PPUContext& ctx, u32 pc, u32 info)
+{
+    return commerce_info(ctx, "sceNpCommerceGetCategoryInfo", pc, info, 776, SCE_NP_COMMERCE_ERROR_CATEGORY_INFO_NOT_FOUND);
+}
+
+// RPCS3 sceNpCommerceGetCurrencyDecimals: a TODO that answers 0.
+u32 sceNpCommerceGetCurrencyDecimals(PPUContext&, u32 info)
+{
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetCurrencyDecimals({:#x}): 0 (RPCS3)", info);
+    return 0;
+}
+
+// RPCS3 sceNpCommerceGetNumOfChildCategory / GetNumOfChildProductSku: at least 780 bytes; the count isn't written (a
+// TODO).
+s32 sceNpCommerceGetNumOfChildCategory(PPUContext& ctx, u32 pc, u32 num)
+{
+    const std::optional<u32> size = category_size(ctx, "sceNpCommerceGetNumOfChildCategory", pc);
+    if (!size || *size < 780) return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_COUNT_NOT_FOUND);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetNumOfChildCategory: count {:#x} not written", num);
+    return commerce_todo("sceNpCommerceGetNumOfChildCategory");
+}
+
+s32 sceNpCommerceGetNumOfChildProductSku(PPUContext& ctx, u32 pc, u32 num)
+{
+    const std::optional<u32> size = category_size(ctx, "sceNpCommerceGetNumOfChildProductSku", pc);
+    if (!size || *size < 780) return error(SCE_NP_COMMERCE_ERROR_SKU_COUNT_NOT_FOUND);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetNumOfChildProductSku: count {:#x} not written", num);
+    return commerce_todo("sceNpCommerceGetNumOfChildProductSku");
+}
+
+// RPCS3 sceNpCommerceGetChildCategoryInfo: child n's 760 bytes must lie within the data (n * 760 + 1540); nothing is
+// written (a TODO).
+s32 sceNpCommerceGetChildCategoryInfo(PPUContext& ctx, u32 pc, u32 child_index, u32 info)
+{
+    if (!info) return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_INFO_NOT_FOUND);
+    const std::optional<u32> size = category_size(ctx, "sceNpCommerceGetChildCategoryInfo", pc);
+    if (!size || u64{child_index} * 760 + 1540 > *size) {
+        return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_INFO_NOT_FOUND);
+    }
+    return commerce_todo("sceNpCommerceGetChildCategoryInfo");
+}
+
+// RPCS3 sceNpCommerceGetChildProductSkuInfo: as RPCS3 writes it, a category of more than 780 bytes has no SKU info; a
+// smaller one answers CELL_OK with nothing written (a TODO).
+s32 sceNpCommerceGetChildProductSkuInfo(PPUContext& ctx, u32 pc, u32 child_index, u32 info)
+{
+    if (!info) return error(SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND);
+    const std::optional<u32> size = category_size(ctx, "sceNpCommerceGetChildProductSkuInfo", pc);
+    if (!size || *size > 780) return error(SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetChildProductSkuInfo: child {}", child_index);
+    return commerce_todo("sceNpCommerceGetChildProductSkuInfo");
+}
+
+// RPCS3 sceNpCommerceGetSkuPrice: with a category whose dval is set, nothing (a TODO); otherwise the fraction is 0
+// (the integer part is a TODO).
+void sceNpCommerceGetSkuPrice(PPUContext& ctx, u32 info, u32 price)
+{
+    if (!price || !commerce_usable(ctx, "sceNpCommerceGetSkuPrice", price, 8)) return;
+    u8* base = guest_base(ctx);
+    if (info && commerce_usable(ctx, "sceNpCommerceGetSkuPrice", info, 4)) {
+        const u32 pc = ps_read32(base, info);
+        if (pc && commerce_usable(ctx, "sceNpCommerceGetSkuPrice", pc, kPcSize) && ps_read32(base, pc + kPcDval)) return;
+    }
+    ps_write32(base, price + kPriceFractional, 0);
+}
+
+// RPCS3 sceNpCommerceDoCheckoutStartAsync: 1 to 16 SKUs, then a TODO (no request ID written, nothing bought).
+s32 sceNpCommerceDoCheckoutStartAsync(PPUContext&, u32 ctx_id, u32 sku_ids, u32 sku_num, u32 container_id, u32 req_id)
+{
+    if (!sku_num || sku_num > 16) return error(SCE_NP_COMMERCE_ERROR_INVALID_SKU_NUM);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceDoCheckoutStartAsync(context {:#x}, SKUs {:#x} ({}), container {:#x}, request "
+                        "{:#x})", ctx_id, sku_ids, sku_num, container_id, req_id);
+    return commerce_todo("sceNpCommerceDoCheckoutStartAsync");
+}
+
+s32 sceNpCommerceDoCheckoutFinishAsync(PPUContext&, u32 req_id)
+{
+    PS_LOG_DEBUG(kChan, "sceNpCommerceDoCheckoutFinishAsync({:#x})", req_id);
+    return commerce_todo("sceNpCommerceDoCheckoutFinishAsync");
+}
+
+// RPCS3 sceNpCommerceGetDataFlagStart / SetDataFlagStart (fourth argument: 1 to 16 flags) and GetDataFlagState (third
+// argument): TODOs after that count.
+s32 sceNpCommerceGetDataFlagStart(PPUContext&, u32 a1, u32 a2, u32 a3, u32 a4, u32 a5)
+{
+    if (a4 == 0 || a4 > 16) return error(SCE_NP_COMMERCE_ERROR_INVALID_DATA_FLAG_NUM);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetDataFlagStart({:#x}, {:#x}, {:#x}, {}, {:#x})", a1, a2, a3, a4, a5);
+    return commerce_todo("sceNpCommerceGetDataFlagStart");
+}
+
+s32 sceNpCommerceSetDataFlagStart(PPUContext&, u32 a1, u32 a2, u32 a3, u32 a4, u32 a5)
+{
+    if (a4 == 0 || a4 > 16) return error(SCE_NP_COMMERCE_ERROR_INVALID_DATA_FLAG_NUM);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceSetDataFlagStart({:#x}, {:#x}, {:#x}, {}, {:#x})", a1, a2, a3, a4, a5);
+    return commerce_todo("sceNpCommerceSetDataFlagStart");
+}
+
+s32 sceNpCommerceGetDataFlagState(PPUContext&, u32 a1, u32 a2, u32 a3)
+{
+    if (a3 == 0 || a3 > 16) return error(SCE_NP_COMMERCE_ERROR_INVALID_DATA_FLAG_NUM);
+    PS_LOG_DEBUG(kChan, "sceNpCommerceGetDataFlagState({:#x}, {:#x}, {})", a1, a2, a3);
+    return commerce_todo("sceNpCommerceGetDataFlagState");
+}
+
+// RPCS3 sceNpCommerceGetDataFlagAbort, GetDataFlagFinish and SetDataFlagFinish: UNIMPLEMENTED_FUNC, answering CELL_OK
+// (their arguments aren't known).
+s32 sceNpCommerceGetDataFlagAbort(PPUContext&) { return commerce_todo("sceNpCommerceGetDataFlagAbort"); }
+s32 sceNpCommerceGetDataFlagFinish(PPUContext&) { return commerce_todo("sceNpCommerceGetDataFlagFinish"); }
+s32 sceNpCommerceSetDataFlagFinish(PPUContext&) { return commerce_todo("sceNpCommerceSetDataFlagFinish"); }
+
 // ------------------------------------------------------------------------------------------------- util
 
 // strncmp of the two NP IDs' online IDs (16 characters), clamped to -1, 0, 1 (np::is_same_npid compares the same way).
@@ -3038,6 +3959,58 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0x227F8763, sceNpScoreGetClansRankingByClanIdAsync),
         PS_HLE_FUNC(0xB082003B, sceNpScoreGetClansRankingByRange),
         PS_HLE_FUNC(0x7B7E9137, sceNpScoreGetClansRankingByRangeAsync),
+        PS_HLE_FUNC(0xFD0EB5AE, sceNpSignalingDeactivateConnection),
+        PS_HLE_FUNC(0x2687A127, sceNpSignalingGetCtxOpt),
+        PS_HLE_FUNC(0x276C72B2, sceNpSignalingSetCtxOpt),
+        PS_HLE_FUNC(0x75EB50CB, sceNpSignalingGetPeerNetInfo),
+        PS_HLE_FUNC(0xD0958814, sceNpSignalingGetPeerNetInfoResult),
+        PS_HLE_FUNC(0x64DBB89D, sceNpSignalingCancelPeerNetInfo),
+        PS_HLE_FUNC(0xAC66568C, sceNpMatchingCreateCtx),
+        PS_HLE_FUNC(0x2E1C5068, sceNpMatchingDestroyCtx),
+        PS_HLE_FUNC(0x03C741A7, sceNpMatchingGetResult),
+        PS_HLE_FUNC(0x26B3BC94, sceNpMatchingGetResultGUI),
+        PS_HLE_FUNC(0x3CC8588A, sceNpMatchingCreateRoomGUI),
+        PS_HLE_FUNC(0x474B7B13, sceNpMatchingJoinRoomGUI),
+        PS_HLE_FUNC(0x14497465, sceNpMatchingQuickMatchGUI),
+        PS_HLE_FUNC(0x32FEBB4C, sceNpMatchingSearchJoinRoomGUI),
+        PS_HLE_FUNC(0xE24EEA19, sceNpMatchingGetRoomListLimitGUI),
+        PS_HLE_FUNC(0x691F429D, sceNpMatchingGetRoomInfo),
+        PS_HLE_FUNC(0xB020684E, sceNpMatchingGetRoomInfoNoLimit),
+        PS_HLE_FUNC(0x6F8FD267, sceNpMatchingSetRoomInfo),
+        PS_HLE_FUNC(0x4A18A89E, sceNpMatchingSetRoomInfoNoLimit),
+        PS_HLE_FUNC(0xEE64CF8E, sceNpMatchingGetRoomSearchFlag),
+        PS_HLE_FUNC(0xA284BD1D, sceNpMatchingSetRoomSearchFlag),
+        PS_HLE_FUNC(0xF806C54C, sceNpMatchingLeaveRoom),
+        PS_HLE_FUNC(0x73A2E36B, sceNpMatchingGetRoomMemberListLocal),
+        PS_HLE_FUNC(0xDAE2D351, sceNpMatchingGrantOwnership),
+        PS_HLE_FUNC(0x34CC0CA4, sceNpMatchingKickRoomMember),
+        PS_HLE_FUNC(0xD20D7798, sceNpMatchingKickRoomMemberWithOpt),
+        PS_HLE_FUNC(0x2AD7837D, sceNpMatchingAcceptInvitationGUI),
+        PS_HLE_FUNC(0x8B7BBD73, sceNpMatchingSendInvitationGUI),
+        PS_HLE_FUNC(0xFCAC355A, sceNpCommerceCreateCtx),
+        PS_HLE_FUNC(0xE2877BEA, sceNpCommerceDestroyCtx),
+        PS_HLE_FUNC(0x26F33146, sceNpCommerceGetProductCategoryStart),
+        PS_HLE_FUNC(0xCFD469E4, sceNpCommerceGetProductCategoryFinish),
+        PS_HLE_FUNC(0x674BB9FF, sceNpCommerceGetProductCategoryAbort),
+        PS_HLE_FUNC(0x3F195B3A, sceNpCommerceGetProductCategoryResult),
+        PS_HLE_FUNC(0x8D1D096C, sceNpCommerceInitProductCategory),
+        PS_HLE_FUNC(0x6CB81EB2, sceNpCommerceDestroyProductCategory),
+        PS_HLE_FUNC(0xB1C02D66, sceNpCommerceGetCurrencyInfo),
+        PS_HLE_FUNC(0xEB9DF054, sceNpCommerceGetCategoryInfo),
+        PS_HLE_FUNC(0xAF57D9C9, sceNpCommerceGetCurrencyDecimals),
+        PS_HLE_FUNC(0x2BE41ECE, sceNpCommerceGetNumOfChildCategory),
+        PS_HLE_FUNC(0x7208DC08, sceNpCommerceGetNumOfChildProductSku),
+        PS_HLE_FUNC(0xBA65DE6D, sceNpCommerceGetChildCategoryInfo),
+        PS_HLE_FUNC(0x01CD9CFD, sceNpCommerceGetChildProductSkuInfo),
+        PS_HLE_FUNC(0x78D7F9AD, sceNpCommerceGetSkuPrice),
+        PS_HLE_FUNC(0xE36C660E, sceNpCommerceDoCheckoutStartAsync),
+        PS_HLE_FUNC(0xAF3EBA5A, sceNpCommerceDoCheckoutFinishAsync),
+        PS_HLE_FUNC(0xDBDB909F, sceNpCommerceGetDataFlagStart),
+        PS_HLE_FUNC(0x99AC9952, sceNpCommerceSetDataFlagStart),
+        PS_HLE_FUNC(0xD03CEA35, sceNpCommerceGetDataFlagState),
+        PS_HLE_FUNC(0x0561448B, sceNpCommerceGetDataFlagAbort),
+        PS_HLE_FUNC(0x9281E87A, sceNpCommerceGetDataFlagFinish),
+        PS_HLE_FUNC(0x8D4518A0, sceNpCommerceSetDataFlagFinish),
     });
 }
 

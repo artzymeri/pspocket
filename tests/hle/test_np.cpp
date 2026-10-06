@@ -1580,3 +1580,420 @@ TEST_CASE("sceNpLookup's PSN calls refused offline; sceNpScore: title contexts k
     CHECK(g.call("sceNpScoreDestroyTitleCtx", 0x2002) == 0);
     CHECK(g.call("sceNpScoreCreateTitleCtx", kComm, kPass, kNpId) == 0x2003); // IDs go on
 }
+
+namespace {
+
+constexpr u64 kMatchNotInit = 0xFFFFFFFF8002A701ull, kMatchInval = 0xFFFFFFFF8002A703ull,
+              kMatchCtxNotFound = 0xFFFFFFFF8002A709ull, kMatchRoomNotFound = 0xFFFFFFFF8002A70Bull,
+              kMatchInvalAttrId = 0xFFFFFFFF8002A70Full, kMatchCtxMax = 0xFFFFFFFF8002A716ull,
+              kMatchInvalReqId = 0xFFFFFFFF8002A717ull, kMatchNoResult = 0xFFFFFFFF8002A718ull,
+              kMatchBusy = 0xFFFFFFFF8002A719ull, kMatchCondMax = 0xFFFFFFFF8002A71Dull,
+              kMatchInvalCond = 0xFFFFFFFF8002A71Eull, kMatchInvalAttr = 0xFFFFFFFF8002A71Full,
+              kMatchInvalCompOp = 0xFFFFFFFF8002A725ull, kMatchInvalCompType = 0xFFFFFFFF8002A726ull,
+              kMatchAttrNotSpecified = 0xFFFFFFFF8002A72Aull, kMatchInvalAttrValue = 0xFFFFFFFF8002A72Dull,
+              kMatchDuplicate = 0xFFFFFFFF8002A72Eull, kMatchUnavailable = 0xFFFFFFFF8002A733ull;
+constexpr u32 kMatchCanceled = 0x8002A723;
+
+// A guest GUI handler (SceNpMatchingGUIHandler: ctx_id, event, error, arg) behind kGuiOpd: each call appends r3..r6
+// (low words) to a log at kGuiLog + 16 (16 bytes an entry) and counts the calls at kGuiLog.
+constexpr u32 kGuiCode = kData + 0x24000, kGuiOpd = kData + 0x24800, kGuiLog = kData + 0x25000;
+
+void write_gui_handler(u8* b)
+{
+    const std::vector<u32> code = {
+        as::lis(8, static_cast<s32>(kGuiLog >> 16)),
+        as::ori(8, 8, kGuiLog & 0xFFFF),
+        as::lwz(9, 0, 8),
+        as::slwi(10, 9, 4),
+        as::addi(10, 10, 16),
+        as::stwx(3, 8, 10),
+        as::addi(11, 10, 4),
+        as::stwx(4, 8, 11),
+        as::addi(11, 10, 8),
+        as::stwx(5, 8, 11),
+        as::addi(11, 10, 12),
+        as::stwx(6, 8, 11),
+        as::addi(9, 9, 1),
+        as::stw(9, 0, 8),
+        as::li(3, 0),
+        as::blr(),
+    };
+    for (usize i = 0; i < code.size(); i++) ps_write32(b, kGuiCode + 4 * static_cast<u32>(i), code[i]);
+    ps_write32(b, kGuiOpd, kGuiCode);
+    ps_write32(b, kGuiOpd + 4, 0x00123400);
+    std::memset(b + kGuiLog, 0, 0x1000);
+}
+
+struct GuiCall {
+    u32 ctx_id, event, error, arg;
+    bool operator==(const GuiCall&) const = default;
+};
+
+// The calls logged since the last take, after the sysutil callbacks were checked.
+std::vector<GuiCall> take_gui_calls(GuestThread& g, u8* b)
+{
+    REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+    std::vector<GuiCall> calls;
+    for (u32 i = 0; i < ps_read32(b, kGuiLog); i++) {
+        const u32 e = kGuiLog + 16 + 16 * i;
+        calls.push_back({ps_read32(b, e), ps_read32(b, e + 4), ps_read32(b, e + 8), ps_read32(b, e + 12)});
+    }
+    std::memset(b + kGuiLog, 0, 0x1000);
+    return calls;
+}
+
+// A SceNpMatchingAttr (20 bytes) at `at`: next, type, id, then num (or a pointer and size).
+void put_attr(u8* b, u32 at, u32 next, s32 type, u32 id, u32 num, u32 size = 0)
+{
+    ps_write32(b, at, next);
+    ps_write32(b, at + 4, static_cast<u32>(type));
+    ps_write32(b, at + 8, id);
+    ps_write32(b, at + 12, num);
+    ps_write32(b, at + 16, size);
+}
+
+// A SceNpMatchingSearchCondition (40 bytes) at `at`.
+void put_cond(u8* b, u32 at, u32 next, s32 type, u32 id, s32 op, s32 comp_type = 0)
+{
+    std::memset(b + at, 0, 40);
+    ps_write32(b, at, next);
+    ps_write32(b, at + 4, static_cast<u32>(type));
+    ps_write32(b, at + 8, id);
+    ps_write32(b, at + 12, static_cast<u32>(op));
+    ps_write32(b, at + 16, static_cast<u32>(comp_type));
+}
+
+} // namespace
+
+TEST_CASE("sceNpMatching offline: one context; dialogs answered as cancelled after RPCS3's checks; no room is found",
+    "[hle][np]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kNpId = kData + 0x100, kCtxOut = kData + 0x200, kComm = kData + 0x300, kRoom = kData + 0x400,
+                  kLobby = kData + 0x500, kReq = kData + 0x600, kSize = kData + 0x610, kRange = kData + 0x620,
+                  kAttrs = kData + 0x1000, kConds = kData + 0x2000, kText = kData + 0x3000, kText2 = kData + 0x3200;
+    constexpr u32 kArg = 0x00C0FFEE;
+    write_gui_handler(b);
+    write_nop(b);
+    put_np_id(b, kNpId, "");
+    put_comm_id(b, kComm, "NPWR01234", 0);
+    std::memset(b + kRoom, 1, 36);
+    std::memset(b + kLobby, 2, 36);
+
+    // The result of a dialog needs no NP; a context does.
+    CHECK(g.call("sceNpMatchingGetResultGUI", 0, 0, 0) == kMatchInval);
+    CHECK(g.call("sceNpMatchingGetResultGUI", 0, kSize, 0) == kMatchNoResult);
+    CHECK(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, kCtxOut) == kMatchNotInit);
+    np_up(g);
+
+    // One context, 0x9001.
+    CHECK(g.call("sceNpMatchingCreateCtx", 0, kNopOpd, 0, kCtxOut) == kMatchInval);
+    CHECK(g.call("sceNpMatchingCreateCtx", kNpId, 0, 0, kCtxOut) == kMatchInval);
+    CHECK(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, 0) == kMatchInval);
+    CHECK(g.call("sceNpMatchingCreateCtx", kUnmapped, kNopOpd, 0, kCtxOut) == kMatchInval); // RPCS3 faults
+    REQUIRE(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, kCtxOut) == 0);
+    const u32 ctx = ps_read32(b, kCtxOut);
+    CHECK(ctx == 0x9001);
+    CHECK(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, kCtxOut) == kMatchCtxMax);
+    CHECK(g.call("sceNpMatchingGetResult", ctx, 1, 0, 0, 0) == kMatchInval);
+    CHECK(g.call("sceNpMatchingGetResult", ctx + 1, 1, 0, kSize, 0) == kMatchCtxNotFound);
+    CHECK(g.call("sceNpMatchingGetResult", ctx, 1, 0, kSize, 0) == kMatchInvalReqId);
+
+    // Creating a room: the room's attributes as RPCS3 checks them, then the dialog, cancelled.
+    const auto create = [&](u32 attrs) { return g.call("sceNpMatchingCreateRoomGUI", ctx, kComm, attrs, kGuiOpd, kArg); };
+    CHECK(g.call("sceNpMatchingCreateRoomGUI", ctx, 0, kAttrs, kGuiOpd, kArg) == kMatchInval);
+    CHECK(g.call("sceNpMatchingCreateRoomGUI", ctx, kComm, kAttrs, 0, kArg) == kMatchInval);
+    CHECK(create(0) == kMatchAttrNotSpecified);
+    put_attr(b, kAttrs, kAttrs + 0x20, 2, 1, 4); // total slots 4
+    put_attr(b, kAttrs + 0x20, 0, 2, 2, 1);      // private slots 1
+    put_attr(b, kAttrs + 0x40, 0, 1, 1, 0);      // a basic binary attribute
+    CHECK(create(kAttrs + 0x40) == kMatchInvalAttrId);
+    put_attr(b, kAttrs + 0x40, 0, 2, 3, 0); // a current count
+    CHECK(create(kAttrs + 0x40) == kMatchInvalAttrId);
+    put_attr(b, kAttrs + 0x40, 0, 2, 6, 2); // the privilege type is a flag
+    CHECK(create(kAttrs + 0x40) == kMatchInvalAttrValue);
+    put_attr(b, kAttrs + 0x40, 0, 3, 1, kText, 257); // game data 1 and 2: at most 256 bytes
+    CHECK(create(kAttrs + 0x40) == kMatchInvalAttr);
+    put_attr(b, kAttrs + 0x40, 0, 3, 3, kText, 65); // the others: 64
+    CHECK(create(kAttrs + 0x40) == kMatchInvalAttr);
+    put_attr(b, kAttrs + 0x40, kAttrs + 0x60, 4, 5, 9);
+    put_attr(b, kAttrs + 0x60, 0, 4, 5, 9);
+    CHECK(create(kAttrs + 0x40) == kMatchDuplicate);
+    put_attr(b, kAttrs + 0x60, kAttrs + 0x40, 4, 6, 9); // a cycle
+    CHECK(create(kAttrs + 0x40) == kMatchInval);
+    CHECK(create(kUnmapped) == kMatchInval); // RPCS3 faults
+    CHECK(create(kAttrs + 0x20) == kMatchAttrNotSpecified); // no total
+    put_attr(b, kAttrs, kAttrs + 0x20, 2, 1, 17);
+    CHECK(create(kAttrs) == kMatchInval); // at most 16 slots
+    put_attr(b, kAttrs, kAttrs + 0x20, 2, 1, 1);
+    CHECK(create(kAttrs) == kMatchInval); // no public slot left
+    put_attr(b, kAttrs, kAttrs + 0x20, 2, 1, 4);
+    CHECK(g.call("sceNpMatchingCreateRoomGUI", ctx + 1, kComm, kAttrs, kGuiOpd, kArg) == kMatchCtxNotFound);
+    REQUIRE(create(kAttrs) == 0);
+    CHECK(take_gui_calls(g, b) == std::vector<GuiCall>{{ctx, 8, 0, kArg}, {ctx, 1, kMatchCanceled, kArg},
+                                      {ctx, 9, 0, kArg}});
+    CHECK(g.call("sceNpMatchingGetResultGUI", 0, kSize, 0) == kMatchNoResult);
+
+    // Joining a room.
+    CHECK(g.call("sceNpMatchingJoinRoomGUI", ctx, 0, kGuiOpd, kArg) == kMatchInval);
+    REQUIRE(g.call("sceNpMatchingJoinRoomGUI", ctx, kRoom, kGuiOpd, kArg) == 0);
+    CHECK(take_gui_calls(g, b) == std::vector<GuiCall>{{ctx, 8, 0, kArg}, {ctx, 2, kMatchCanceled, kArg},
+                                      {ctx, 9, 0, kArg}});
+
+    // Quick match: 2 players or more, a timeout, game number conditions only, EQ or NE.
+    const auto quick = [&](u32 conds) {
+        return g.call("sceNpMatchingQuickMatchGUI", ctx, kComm, conds, 2, 10, kGuiOpd, kArg);
+    };
+    CHECK(g.call("sceNpMatchingQuickMatchGUI", ctx, kComm, 0, 1, 10, kGuiOpd, kArg) == kMatchInval);
+    CHECK(g.call("sceNpMatchingQuickMatchGUI", ctx, kComm, 0, 2, 0, kGuiOpd, kArg) == kMatchInval);
+    put_cond(b, kConds, 0, 4, 1, 2);
+    CHECK(quick(kConds) == kMatchInvalCompOp);
+    put_cond(b, kConds, 0, 4, 1, 1, 1);
+    CHECK(quick(kConds) == kMatchInvalCompType);
+    put_cond(b, kConds, 0, 2, 1, 0);
+    CHECK(quick(kConds) == kMatchInvalCond);
+    put_cond(b, kConds, 0, 4, 9, 0);
+    CHECK(quick(kConds) == kMatchInvalCond);
+    for (u32 i = 0; i < 10; i++) put_cond(b, kConds + 0x40 * i, i < 9 ? kConds + 0x40 * (i + 1) : 0, 4, 1, 0);
+    CHECK(quick(kConds) == kMatchCondMax);
+    put_cond(b, kConds + 0x40 * 8, 0, 4, 8, 1); // nine
+    REQUIRE(quick(kConds) == 0);
+    CHECK(take_gui_calls(g, b) == std::vector<GuiCall>{{ctx, 8, 0, kArg}, {ctx, 5, kMatchCanceled, kArg},
+                                      {ctx, 9, 0, kArg}});
+
+    // Search and join: value conditions EQ to GE; of the basic attributes only the total slots; then the attributes.
+    const auto search = [&](u32 conds, u32 attrs) {
+        return g.call("sceNpMatchingSearchJoinRoomGUI", ctx, kComm, conds, attrs, kGuiOpd, kArg);
+    };
+    put_cond(b, kConds, 0, 4, 1, 0, 1);
+    CHECK(search(kConds, 0) == kMatchInvalCond);
+    put_cond(b, kConds, 0, 4, 1, 6);
+    CHECK(search(kConds, 0) == kMatchInvalCond);
+    put_cond(b, kConds, 0, 2, 2, 5);
+    CHECK(search(kConds, 0) == kMatchInvalCond);
+    put_cond(b, kConds, 0, 2, 1, 5);
+    put_attr(b, kAttrs + 0x40, kAttrs + 0x60, 4, 5, 9);
+    put_attr(b, kAttrs + 0x60, 0, 4, 5, 9);
+    CHECK(search(kConds, kAttrs + 0x40) == kMatchDuplicate);
+    REQUIRE(search(kConds, kAttrs) == 0);
+    CHECK(take_gui_calls(g, b) == std::vector<GuiCall>{{ctx, 8, 0, kArg}, {ctx, 4, kMatchCanceled, kArg},
+                                      {ctx, 9, 0, kArg}});
+
+    // The limited room list: a range that starts somewhere, at most 20; the total slots can't be a condition.
+    const auto list = [&](u32 range, u32 conds) {
+        return g.call("sceNpMatchingGetRoomListLimitGUI", ctx, kComm, range, conds, 0, kGuiOpd, kArg);
+    };
+    CHECK(list(0, 0) == kMatchInval);
+    ps_write32(b, kRange, 0);
+    ps_write32(b, kRange + 4, 10);
+    CHECK(list(kRange, 0) == kMatchInval);
+    ps_write32(b, kRange, 1);
+    ps_write32(b, kRange + 4, 21);
+    CHECK(list(kRange, 0) == kMatchInval);
+    ps_write32(b, kRange + 4, 20);
+    put_cond(b, kConds, 0, 2, 1, 0);
+    CHECK(list(kRange, kConds) == kMatchInvalCond);
+    put_cond(b, kConds, 0, 2, 2, 0);
+    REQUIRE(list(kRange, kConds) == 0);
+    CHECK(take_gui_calls(g, b) == std::vector<GuiCall>{{ctx, 8, 0, kArg}, {ctx, 11, kMatchCanceled, kArg},
+                                      {ctx, 9, 0, kArg}});
+
+    // Room requests: their checks, the context, then no room. The limited info calls take one call per 30 s.
+    CHECK(g.call("sceNpMatchingGetRoomInfo", ctx, kLobby, kRoom, kAttrs, kReq) == kMatchRoomNotFound);
+    CHECK(g.call("sceNpMatchingGetRoomInfo", ctx, kLobby, kRoom, kAttrs, kReq) == kMatchBusy);
+    CHECK(g.call("sceNpMatchingGetRoomInfoNoLimit", ctx, 0, kRoom, kAttrs, kReq) == kMatchInval);
+    CHECK(g.call("sceNpMatchingGetRoomInfoNoLimit", ctx, kLobby, kRoom, kAttrs + 0x40, kReq) == kMatchDuplicate);
+    CHECK(g.call("sceNpMatchingGetRoomInfoNoLimit", ctx + 1, kLobby, kRoom, kAttrs, kReq) == kMatchCtxNotFound);
+    CHECK(g.call("sceNpMatchingGetRoomInfoNoLimit", ctx, kLobby, kRoom, kAttrs, kReq) == kMatchRoomNotFound);
+    CHECK(g.call("sceNpMatchingSetRoomInfo", ctx, kLobby, kRoom, 0, kReq) == kMatchInval); // let through: checked
+    CHECK(g.call("sceNpMatchingSetRoomInfo", ctx, kLobby, kRoom, kAttrs, kReq) == kMatchBusy);
+    CHECK(g.call("sceNpMatchingSetRoomInfoNoLimit", ctx, kLobby, kRoom, kAttrs, kReq) == kMatchRoomNotFound);
+    CHECK(g.call("sceNpMatchingGetRoomSearchFlag", ctx, kLobby, 0, kReq) == kMatchInval);
+    CHECK(g.call("sceNpMatchingGetRoomSearchFlag", ctx, kLobby, kRoom, kReq) == kMatchRoomNotFound);
+    CHECK(g.call("sceNpMatchingSetRoomSearchFlag", ctx, kLobby, kRoom, 2, kReq) == kMatchInval);
+    CHECK(g.call("sceNpMatchingSetRoomSearchFlag", ctx, kLobby, kRoom, 1, kReq) == kMatchRoomNotFound);
+    CHECK(g.call("sceNpMatchingLeaveRoom", ctx + 1, kRoom, kReq) == kMatchCtxNotFound);
+    CHECK(g.call("sceNpMatchingLeaveRoom", ctx, 0, kReq) == kMatchInval); // RPCS3 aborts
+    CHECK(g.call("sceNpMatchingLeaveRoom", ctx, kRoom, kReq) == kMatchRoomNotFound);
+    CHECK(g.call("sceNpMatchingGetRoomMemberListLocal", ctx, kRoom, 0, 0) == kMatchInval);
+    CHECK(g.call("sceNpMatchingGetRoomMemberListLocal", ctx, kRoom, kSize, 0) == kMatchRoomNotFound);
+
+    // RPCS3's TODOs: their checks, then CELL_OK and no dialog.
+    CHECK(g.call("sceNpMatchingGrantOwnership", ctx, kRoom, kNpId, 0) == kMatchInval);
+    CHECK(g.call("sceNpMatchingGrantOwnership", ctx, kRoom, kNpId, kReq) == 0);
+    CHECK(g.call("sceNpMatchingKickRoomMember", ctx, kRoom, kNpId, kReq) == 0);
+    CHECK(g.call("sceNpMatchingKickRoomMemberWithOpt", ctx, kRoom, kNpId, kText, 17, kReq) == kMatchInval);
+    CHECK(g.call("sceNpMatchingKickRoomMemberWithOpt", ctx, kRoom, kNpId, kText, 16, kReq) == 0);
+    CHECK(g.call("sceNpMatchingAcceptInvitationGUI", ctx, 0, 0, kGuiOpd, kArg) == kMatchInval);
+    CHECK(g.call("sceNpMatchingAcceptInvitationGUI", ctx, kComm, 0, kGuiOpd, kArg) == 0);
+    const auto invite = [&](u32 dsts, s32 num, s32 slot) {
+        return g.call("sceNpMatchingSendInvitationGUI", ctx, kRoom, kComm, dsts, num, slot, kText, kText2, 0, kGuiOpd,
+            kArg);
+    };
+    put(b, kText, std::string(17, 's'));
+    put(b, kText2, "Come and play");
+    CHECK(invite(0, 0, 0) == kMatchInval); // a subject of at most 16 characters
+    put(b, kText, std::string(16, 's'));
+    CHECK(invite(kNpId, 13, 0) == kMatchInval);
+    CHECK(invite(kNpId, 0, 0) == kMatchInval);
+    CHECK(invite(0, 0, 2) == kMatchInval);
+    put(b, kText2, "\xFF");
+    CHECK(invite(0, 0, 0) == kUtilInvalChar);
+    put(b, kText2, std::string(129, 'b'));
+    CHECK(invite(0, 0, 0) == kMatchInval);
+    put(b, kText2, std::string(128, 'b'));
+    CHECK(invite(kNpId, 12, 1) == 0);
+    CHECK(take_gui_calls(g, b).empty()); // no dialog for the TODOs
+
+    // While matching 2 is in use, the older library is unavailable.
+    REQUIRE(g.call("sceNpMatching2Init2", 0, 0, 0) == 0);
+    CHECK(g.call("sceNpMatchingJoinRoomGUI", ctx, kRoom, kGuiOpd, kArg) == kMatchUnavailable);
+    CHECK(g.call("sceNpMatchingGetResultGUI", 0, kSize, 0) == kMatchUnavailable);
+    CHECK(g.call("sceNpMatchingDestroyCtx", ctx) == kMatchUnavailable);
+    REQUIRE(g.call("sceNpMatching2Term2") == 0);
+
+    // Destroyed: no context for the GUI's results either.
+    REQUIRE(g.call("sceNpMatchingDestroyCtx", ctx) == 0);
+    CHECK(g.call("sceNpMatchingDestroyCtx", ctx) == kMatchCtxNotFound);
+    CHECK(g.call("sceNpMatchingGetResult", ctx, 1, 0, kSize, 0) == kMatchCtxNotFound);
+    CHECK(g.call("sceNpMatchingJoinRoomGUI", ctx, kRoom, kGuiOpd, kArg) == kMatchCtxNotFound);
+}
+
+TEST_CASE("sceNpCommerce (version 1): RPCS3's checks and TODO answers; product categories as RPCS3 fills them",
+    "[hle][np]")
+{
+    constexpr u64 kComUnsupported = 0xFFFFFFFF80029404ull, kComInsufficientBuffer = 0xFFFFFFFF8002940Eull,
+                  kComInvalFlagNum = 0xFFFFFFFF8002941Aull, kComParse = 0xFFFFFFFF80029421ull,
+                  kComCurrencyNotFound = 0xFFFFFFFF80029422ull, kComCategoryNotFound = 0xFFFFFFFF80029423ull,
+                  kComChildCountNotFound = 0xFFFFFFFF80029424ull, kComChildInfoNotFound = 0xFFFFFFFF80029425ull,
+                  kComSkuCountNotFound = 0xFFFFFFFF80029426ull, kComSkuInfoNotFound = 0xFFFFFFFF80029427ull,
+                  kComInvalSkuNum = 0xFFFFFFFF80029429ull;
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kPc = kData + 0x100, kInfo = kData + 0x200, kPrice = kData + 0x300, kOut = kData + 0x400,
+                  kData0 = kData + 0x1000;
+    std::memset(b + kOut, 0xAA, 16);
+
+    // A context (no ID written); its requests answer CELL_OK and fetch nothing.
+    CHECK(g.call("sceNpCommerceCreateCtx", 2, 0, 0, 0, kOut) == kComUnsupported);
+    CHECK(g.call("sceNpCommerceCreateCtx", 1, 0, 0, 0, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 0xAAAAAAAAu);
+    CHECK(g.call("sceNpCommerceGetProductCategoryStart", 1, kOut, 1, kOut) == 0);
+    CHECK(g.call("sceNpCommerceGetProductCategoryResult", 1, kData0, 0, kOut) == kComInsufficientBuffer);
+    CHECK(g.call("sceNpCommerceGetProductCategoryResult", 1, kData0, 16, 0) == kComInsufficientBuffer);
+    REQUIRE(g.call("sceNpCommerceGetProductCategoryResult", 1, kData0, 16, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 0);
+    CHECK(g.call("sceNpCommerceGetProductCategoryFinish", 1) == 0);
+    CHECK(g.call("sceNpCommerceGetProductCategoryAbort", 1) == 0);
+    CHECK(g.call("sceNpCommerceDestroyCtx", 1) == 0);
+
+    // A product category: the data and its size are recorded, then the version, then the currency (16 bytes).
+    std::memset(b + kPc, 0xEE, 32);
+    CHECK(g.call("sceNpCommerceInitProductCategory", 0, kData0, 100) == kComParse);
+    CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 3) == kComParse);
+    CHECK(ps_read32(b, kPc + 4) == kData0);
+    CHECK(ps_read32(b, kPc + 8) == 3);
+    CHECK(ps_read32(b, kPc) == 0xEEEEEEEEu);
+    CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 15) == kComParse);
+    CHECK(ps_read32(b, kPc) == 1);
+    REQUIRE(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 16) == 0);
+    CHECK(ps_read32(b, kPc + 12) == 0); // dval
+
+    // The infos and counts need data of a size; the info points at the category.
+    std::memset(b + kInfo, 0, 16);
+    CHECK(g.call("sceNpCommerceGetCurrencyInfo", 0, kInfo) == kComCurrencyNotFound);
+    REQUIRE(g.call("sceNpCommerceGetCurrencyInfo", kPc, kInfo) == 0);
+    CHECK(ps_read32(b, kInfo) == kPc);
+    CHECK(g.call("sceNpCommerceGetCurrencyInfo", kPc, 0) == 0);
+    CHECK(g.call("sceNpCommerceGetCategoryInfo", kPc, kInfo) == kComCategoryNotFound);
+    CHECK(g.call("sceNpCommerceGetNumOfChildCategory", kPc, kOut) == kComChildCountNotFound);
+    CHECK(g.call("sceNpCommerceGetNumOfChildProductSku", kPc, kOut) == kComSkuCountNotFound);
+    CHECK(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 0, kInfo) == 0); // RPCS3: at most 780 bytes
+    ps_write32(b, kPc + 8, 776);
+    CHECK(g.call("sceNpCommerceGetCategoryInfo", kPc, kInfo) == 0);
+    ps_write32(b, kPc + 8, 780);
+    CHECK(g.call("sceNpCommerceGetNumOfChildCategory", kPc, kOut) == 0);
+    CHECK(g.call("sceNpCommerceGetNumOfChildProductSku", kPc, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 0); // not written (the result above left 0)
+    ps_write32(b, kPc + 8, 781);
+    CHECK(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 0, kInfo) == kComSkuInfoNotFound);
+    CHECK(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 0, 0) == kComSkuInfoNotFound);
+    ps_write32(b, kPc + 8, 1539);
+    CHECK(g.call("sceNpCommerceGetChildCategoryInfo", kPc, 0, kInfo) == kComChildInfoNotFound);
+    ps_write32(b, kPc + 8, 1540);
+    CHECK(g.call("sceNpCommerceGetChildCategoryInfo", kPc, 0, kInfo) == 0);
+    CHECK(g.call("sceNpCommerceGetChildCategoryInfo", kPc, 1, kInfo) == kComChildInfoNotFound);
+    CHECK(g.call("sceNpCommerceGetChildCategoryInfo", kPc, 0, 0) == kComChildInfoNotFound);
+    CHECK(g.call("sceNpCommerceGetCurrencyDecimals", kInfo) == 0);
+
+    // A price: the fraction is 0 without a dval; with one, nothing is written.
+    ps_write32(b, kPrice + 4, 0x55);
+    ps_write32(b, kInfo, kPc);
+    g.call("sceNpCommerceGetSkuPrice", kInfo, kPrice);
+    CHECK(ps_read32(b, kPrice + 4) == 0);
+    ps_write32(b, kPrice + 4, 0x55);
+    ps_write32(b, kPc + 12, 100);
+    g.call("sceNpCommerceGetSkuPrice", kInfo, kPrice);
+    CHECK(ps_read32(b, kPrice + 4) == 0x55);
+
+    // Destroying the category forgets its data.
+    g.call("sceNpCommerceDestroyProductCategory", kPc);
+    CHECK(ps_read32(b, kPc + 4) == 0);
+    CHECK(ps_read32(b, kPc + 8) == 0);
+    g.call("sceNpCommerceDestroyProductCategory", 0);
+
+    // Checkout: 1 to 16 SKUs; data flags: 1 to 16.
+    CHECK(g.call("sceNpCommerceDoCheckoutStartAsync", 1, kData0, 0, 0, kOut) == kComInvalSkuNum);
+    CHECK(g.call("sceNpCommerceDoCheckoutStartAsync", 1, kData0, 17, 0, kOut) == kComInvalSkuNum);
+    CHECK(g.call("sceNpCommerceDoCheckoutStartAsync", 1, kData0, 16, 0, kOut) == 0);
+    CHECK(g.call("sceNpCommerceDoCheckoutFinishAsync", 1) == 0);
+    for (const char* name : {"sceNpCommerceGetDataFlagStart", "sceNpCommerceSetDataFlagStart"}) {
+        INFO(name);
+        CHECK(g.call(name, 1, 2, 3, 0, 5) == kComInvalFlagNum);
+        CHECK(g.call(name, 1, 2, 3, 17, 5) == kComInvalFlagNum);
+        CHECK(g.call(name, 1, 2, 3, 16, 5) == 0);
+    }
+    CHECK(g.call("sceNpCommerceGetDataFlagState", 1, 2, 0) == kComInvalFlagNum);
+    CHECK(g.call("sceNpCommerceGetDataFlagState", 1, 2, 16) == 0);
+    CHECK(g.call("sceNpCommerceGetDataFlagAbort") == 0);
+    CHECK(g.call("sceNpCommerceGetDataFlagFinish") == 0);
+    CHECK(g.call("sceNpCommerceSetDataFlagFinish") == 0);
+}
+
+TEST_CASE("sceNpSignaling's context options and peer information: RPCS3's checks, then its TODO answers", "[hle][np]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kNpId = kData + 0x100, kCtx = kData + 0x200, kOut = kData + 0x300;
+    CHECK(g.call("sceNpSignalingDeactivateConnection", 0x6001, 1) == kSigNotInit);
+    CHECK(g.call("sceNpSignalingGetCtxOpt", 0x6001, 1, kOut) == kSigNotInit);
+    CHECK(g.call("sceNpSignalingGetPeerNetInfo", 0x6001, kNpId, kOut) == kSigNotInit);
+    CHECK(g.call("sceNpSignalingCancelPeerNetInfo", 0x6001, 1) == kSigNotInit);
+    np_up(g);
+    put_np_id(b, kNpId, "");
+    REQUIRE(g.call("sceNpSignalingCreateCtx", kNpId, 0, 0, kCtx) == 0);
+    const u32 ctx = ps_read32(b, kCtx);
+    std::memset(b + kOut, 0xAA, 0x40);
+
+    CHECK(g.call("sceNpSignalingGetCtxOpt", ctx, 0, kOut) == kSigInval);
+    CHECK(g.call("sceNpSignalingGetCtxOpt", ctx, 1, 0) == kSigInval);
+    CHECK(g.call("sceNpSignalingGetCtxOpt", ctx + 1, 1, kOut) == kSigCtxNotFound);
+    CHECK(g.call("sceNpSignalingGetCtxOpt", ctx, 1, kOut) == 0);
+    CHECK(g.call("sceNpSignalingSetCtxOpt", ctx, 1, 0) == kSigInval);
+    CHECK(g.call("sceNpSignalingSetCtxOpt", ctx + 1, 1, 1) == kSigCtxNotFound);
+    CHECK(g.call("sceNpSignalingSetCtxOpt", ctx, 1, 1) == 0);
+    CHECK(g.call("sceNpSignalingGetPeerNetInfo", ctx, 0, kOut) == kSigInval);
+    CHECK(g.call("sceNpSignalingGetPeerNetInfo", ctx, kNpId, 0) == kSigInval);
+    CHECK(g.call("sceNpSignalingGetPeerNetInfo", ctx, kNpId, kOut) == 0);
+    CHECK(g.call("sceNpSignalingGetPeerNetInfoResult", ctx, 1, 0) == kSigInval);
+    CHECK(g.call("sceNpSignalingGetPeerNetInfoResult", ctx, 1, kOut + 4) == 0);
+    CHECK(ps_read32(b, kOut) == 0xAAAAAAAAu); // nothing written by RPCS3's TODOs
+    CHECK(ps_read32(b, kOut + 4) == 0xAAAAAAAAu);
+    CHECK(g.call("sceNpSignalingCancelPeerNetInfo", ctx, 1) == 0);
+    CHECK(g.call("sceNpSignalingDeactivateConnection", ctx, 1) == 0);
+}
