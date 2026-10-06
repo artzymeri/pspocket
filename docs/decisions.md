@@ -3765,7 +3765,7 @@ parameters; pause, resume and reset of an existing port; the signal state (no mi
 - **GetImagesize and FetchImage**: image 0xFF00 is /dev_flash/sys/external/flashATRAC.pic, read through lv2's file
   system; 0xFF01 has no file on the PS3 either.
 - **SetDebugmode** records the path; modules are linked at load time here, so nothing else changes.
-- **cellSysmodule_0x59521326** (a key from the console's PSID) waits for sys_ss (D-184).
+- **cellSysmodule_0x59521326** (a key from the console's PSID) stays unimplemented; D-184 says why.
 - **_sys_net_h_errno_loc**: h_errno beside errno in the thread's TLS system area.
 
 **Camera, microphone and Move with nothing attached (devices.cpp, gem.cpp; 101 functions).** RPCS3's defaults are
@@ -3798,6 +3798,94 @@ Tests:
 - tests/hle/test_misc_hle.cpp: the game update callbacks and their Ex results; test_sysPrxForUser.cpp: module files,
   images from a temporary /dev_flash, the debug mode; test_net.cpp: h_errno's place.
 - tests/hle/test_devices.cpp: the camera, microphone and Move answers, calibration timing, colours and updates.
+
+## D-184 · 2026-10-06 · lv2's gaps as RPCS3 has them: stub syscalls, file system, system services, modules
+
+What a game or Sony's translated code reaches with `sc`, or through liblv2 and libfs (both always native), that
+pspocket did not answer. Each follows RPCS3 (rpcs3/Emu/Cell/lv2/*.cpp, Modules/cellFs.cpp, sys_prx_.cpp).
+
+**RPCS3's stub syscalls.** runtime/lv2/scripts/gen_stub_syscalls.py harvests the syscalls RPCS3 binds to a function
+whose body is a log and `return X;` (gen_rpcs3_stubs.py's rule from D-182, also dropping `state += cpu_flag::wait`
+and `lv2_obj::sleep`, and following header aliases such as sys_console_write2). The 90 are generated into
+runtime/lv2/src/syscall_stub.inc and answered with their constant and a log of the first call, as D-166 answers
+null_func. Examples: sys_fs_chown, link, symbolic_link, truncate2, acl_*, mapped_*; the trace, storage and USB
+families; sys_time_get_rtc; sys_memory_get_user_memory_stat. A syscall pspocket implements takes the slot first.
+
+**The file system (fs.cpp).**
+
+- Each mount carries RPCS3's lv2_fs_mount_point entry: file system, device name, sector and block sizes, uid/gid
+  reporting, and "block sizes of files only" for /app_home and /host_root. /dev_ps2disc's block size is RPCS3's
+  32 KB.
+- fcntl 0xE0000012 (cellFsGetDirectoryEntries): one entry a call with its attributes, the rest of the room cleared.
+  Directory entries keep a stat taken at opendir, as RPCS3's fs::dir entries do ("." and ".." report no times).
+- fcntl 0x80000009 (cellFsSdataOpenByFd): an SDATA file at an offset inside an open file, through the NPD opener
+  (D-165), as a new read-only file.
+- sys_fs_test(6) (a descriptor's path), fget/get_block_size, disk_free (40 GB, /dev_hdd1 2 GB, less a sector;
+  nothing on read-only devices), get_mount_info(_size) (the root and the mounts, sorted, read-only flagged), the
+  LSN calls. newfs, mount and unmount need root except for USB storage, and pspocket has none: EPERM, or EBUSY or
+  ENOTSUP for /dev_usb.
+
+**cellFs complete (sys_fs.cpp).** Truncate, Fdatasync, Get(F)BlockSize, GetPath, GetDirectoryEntries,
+SdataOpenByFd, SetIoBufferFromDefaultContainer and AioWrite (the AIO thread writes too). Stream reads are pspocket's
+own design: RPCS3 leaves cellFsSt* as TODOs because it runs Sony's libfs, which is native here.
+
+- cellFsStReadInit checks the ring buffer (RPCS3's checks) and allocates it in the main area.
+- Reads go straight to the file, so data is always there: cellFsStRead copies from the stream's position;
+  GetCurrentAddr reads the next block into the ring and lends it until PutCurrentAddr; the waits return at once,
+  and cellFsStReadWaitCallback calls its callback before it returns.
+- The stream ends at offset + size (size 0: the end of the file). Status: INITIALIZED with PROGRESS or STOP, else
+  NOT_INITIALIZED. Without cellFsStReadInit, or before cellFsStReadStart: CELL_ENXIO, as cellFsAioRead without its
+  thread.
+
+**System services (system.cpp).**
+
+- _sys_game_*: the watchdog (RPCS3 restarts the game when it expires; pspocket logs it), the system software version
+  (Config::system_sw_version, 49200 for 4.92 by default; the host sets it from the installed firmware), the arcade
+  board's 16 bytes (kept for the process; RPCS3 keeps a file), the RTC status.
+- sys_ss: random numbers (package 2), the OpenPSID (Config::console_psid_*, a fixed default where RPCS3 makes a
+  random one per installation), the console ID and appliance info (root only), the secure RTC, the individual info
+  and access control answers, the product mode, flash flag and boot device.
+
+**Processes and memory.**
+
+- sys_process_get_id (13) lists a type's object IDs; get_id2 (29) needs root.
+- sys_process_is_spu_lock_line_reservation_address (14): RPCS3's answer by 256 MB segment.
+- sys_mmapper_enable_page_fault_notification (327, Assassin's Creed calls it): the watch is registered with RPCS3's
+  checks (an mmapper area's start, a live queue, once per area) through an event port lv2 makes. pspocket has no page
+  faults to report: unmapped guest memory is not caught as a fault.
+
+**Modules (sys_prx.cpp, loader).** hle::ModuleLoader gains load_at (a module inside an archive), id_by_address, list
+and info; RuntimeModules answers them, keeping each module's attributes, version, segment file sizes and
+export/import ranges. sysPrxForUser's get_module_info, get_module_list, get_module_id_by_address,
+get_my_module_id (by the return address), load_module_by_fd, the memory-container loads (no containers for modules:
+as usual) and unregister_library (RPCS3's stub) follow RPCS3. **sys_libc**'s memcpy, memset, memmove and memcmp are
+served under their C names (RPCS3 REG_FNID), although the firmware's module for them is one games don't load.
+
+**Not done, and why.**
+
+- **Raw SPUs (150 to 163, 196 to 199) and interrupt tags and threads (80 to 89).** A raw SPU is driven by PPU loads
+  and stores to its problem-state registers at 0xE0000000; translated code reaches guest memory directly, so those
+  accesses would have to be trapped (a fault handler on the MMIO pages), a project of its own. Interrupt threads
+  serve raw SPU interrupts only. Few retail games use raw SPUs. sysPrxForUser's sys_raw_spu_load and image_load and
+  sys_interrupt_thread_disestablish wait with them; they log and return ENOSYS.
+- **Isolated SPUs (230 to 240)**: root only.
+- **The PRX syscalls (480 to 499) called with `sc`**: games reach them through liblv2's sys_prx_* functions, which are
+  native (above).
+- **cellSysmodule_0x59521326** decrypts the OpenPSID with an AES key from RPCS3's source. Keys are taken from RPCS3
+  at build time and never committed (CLAUDE.md), and no game is known to call it; it logs and returns ENOSYS.
+
+Tests:
+
+- tests/lv2/test_fs.cpp: directory entries with attributes, a descriptor's path (truncated too), block sizes on
+  each kind of device, free space and its limits, mount information, the LSN and mount calls, chown and truncate2
+  as RPCS3's stubs, an SDATA file inside an archive.
+- tests/lv2/test_process.cpp: object IDs and the size quirk, reservation addresses, sys_game and sys_ss, four stub
+  syscalls including an alias.
+- tests/lv2/test_memory.cpp: the page fault notification's checks.
+- tests/hle/test_ac_sysutil_fs_pad.cpp: AIO writes; cellFs's new functions; a stream read in copy and copyless mode
+  to its end.
+- tests/hle/test_lle.cpp: a module by descriptor from inside an archive and on a container; the list, info and
+  lookup by address. tests/hle/test_sysprx_libc.cpp: sys_libc.
 
 ## Open decisions (plan section 14)
 
