@@ -1,4 +1,4 @@
-# Runs 109–116 · Assassin's Creed in the Abstergo lab: what still ran in the interpreters
+# Runs 109–118 · Assassin's Creed in the Abstergo lab: what still ran in the interpreters
 
 2026-10-06 night to 2026-10-07 · pspocket-boot with the library prepared on the Mac (`pspocket-prepare --spu-images
 inventory/BLES00158/spu-images`) · M4 Mac · Assassin's Creed (BLES00158), firmware 4.92 · the scripted walk
@@ -19,7 +19,7 @@ renders right now. No unimplemented calls in any of these runs. Logs in inventor
 | 114 | `--rsx-recover` | none | 32.6 | 114 | 64.8 billion | 380 s; no desync this time |
 | 115 | jump tables (D-203); `--log debug` | none | 59.5 | **0** | 11.2 billion | 200 s; the DMAs that drop SPU programs logged |
 | 116 | D-204, D-205; prepared again | none | **60.0** | 0 | **0** | 380 s; 1.2 CPU cores busy instead of 3.6 |
-| 117 | D-206; prepared again with run 116's misses as seeds | Metal | see below | | | 380 s, frames saved |
+| 117 | D-206; prepared again with run 116's misses as seeds | Metal | **51.0** | 0 | 0 | 380 s, frames saved: the screens, the menu (CONTINUE), the Animus loading, the lab |
 
 "none": pspocket-boot without `--frames` or `--gpu metal` runs the GPU commands without drawing (the null backend), so
 those fps say how fast the CPU side is, not the game on screen. Runs 114 and 116 are the fair pair for the SPU fix.
@@ -59,7 +59,20 @@ header for 173 arguments on subchannel 4, which no game writes; the reader lost 
 to 116, which ran with `--rsx-recover` (the phone's setting) so that a repeat logs the desync report (the words read and
 what memory holds now) instead of stopping.
 
+## With the GPU: run 117 against run 109
+
+Same walk, Metal drawing, frames saved every 900. Run 109 (before): after the menus 27.6, 58.4, 15.0, **1.0**, 38.2,
+then 18 to 24 fps for a minute, then 28 to 30 in the lab. Run 117: 31 to 47 through the same stretch, then **49 to 60
+in the lab** (GPU 13.5 to 15.9 ms a frame, 670 to 1,007 draws, 35 render passes). Median of all 5 s windows 29.2 to 51.0.
+The walk continues a save in run 117 (the menu offers CONTINUE since run 109's new game), so the lab scenes are close,
+not identical.
+
 ## Still interpreted
 
-LS 0x0e408 and 0x0e740 "in no program" (1.9 billion and 0.3 billion instructions in run 114): code no tracked copy
-holds; next to trace with PSPOCKET_SPU_TRACE_RUNS.
+- LS 0x0e408 and 0x0e740 in the job program spu_4944… (16 million instructions from half a million entries in run
+  116, "in no program" before the job stayed lifted): code the translation had not reached. Seeded from run 116's log
+  (`pspocket-prepare --spu-log`), lifted in run 117.
+- LS 0x37c58, 81 million instructions a session: a task on the secondary SPURS instance copies a 32 KB module from
+  guest 0x50195b00 to LS 0x33980 and calls 0x37c58. The guest buffer is reused before the module runs (D-206 now
+  knows it by its local store copy), but each load differs: 398 different images in run 117, so no whole-image hash
+  can name it. Run 118 saves them (`--spu-dump`) to see which bytes differ.
