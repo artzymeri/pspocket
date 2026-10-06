@@ -4412,6 +4412,42 @@ Measured against Sony's libatxdec through Sony's libadec (rule 8, run 105):
 Tests: tests/hle/test_adec.cpp (the flow on built frames; the comparison when the firmware is there; a hidden probe for
 a stream from a file, PSPOCKET_PROBE_AT3).
 
+## D-199 · 2026-10-06 · cellPngDec is pspocket's own, on libpng, the same as Sony's libpngdec where measured
+
+The image decoders, after the media libraries (D-179). Sony's libpngdec is libpng 1.2.8 on zlib 1.2.3 (its strings
+say so) behind a small API. pspocket's (runtime/hle/src/cellPngDec.cpp) is built on libpng too: 1.6.59, compiled from
+the source tree in the RPCS3 checkout the build already reads (third_party/CMakeLists.txt, PSPOCKET_LIBPNG_DIR), with
+the system's zlib; on the phone the same sources through app/ios/project.yml. RPCS3's cellPngDec gave the structures
+and libpng's transformations; Sony's behaviour, measured call by call (run 106), gave the rest:
+
+- **Sequence.** Open, ReadHeader, SetParameter, DecodeData, each once and in that order (SEQ otherwise); one stream per
+  handle (a second Open, or Destroy with a stream open, is SEQ). A refused header, parameter set, line pitch or chunk
+  query puts the stream in an error state where all but Close is SEQ. An Open refused for its source (bad source type,
+  no buffer, an empty one, a missing file, no source or open information) leaves the handle busy for good, as
+  libpngdec does.
+- **Refusals (ARG).** 16-bit output from an image of less; the palette from an image without one; the stream's alpha
+  when the image has none (neither an alpha channel nor tRNS); a line pitch shorter than a row.
+- **Numbers.** Codec version 0x420000; initSpaceAllocated 0x4604; useMemorySpace 0x8441 + 2 x width x components.
+  The handle takes 0x450 and 0xA80 bytes from the game's malloc and a stream 0x98, as Sony's; libpng's own memory is
+  the host's (Sony's libpng allocates through the game's malloc: those calls differ).
+- **Pixels, where libpng 1.6 and 1.2.8 differ.** Gray from colour is done here as 1.2.8 does it: (6969 R + 23432 G +
+  2367 B) >> 15 at the image's bit depth, a gray pixel kept, then the high byte; with the image's gamma known (gAMA,
+  or sRGB's 0.45455) through 1.2.8's gamma tables. The coefficients are what png_set_rgb_to_gray(png, 1, 0.2127,
+  0.7151) gives; they were found by fitting every measured pixel (1.6 has 6968/23434/2366 and rounds). Gray output
+  from 1-, 2- and 4-bit gray is the samples as they are (packing), not scaled. A fixed alpha replaces the image's
+  (tRNS included); without alpha in the output, tRNS's alpha is dropped.
+- **Chunk queries.** After DecodeData only; a chunk that is not there is SEQ and the error state. gAMA and cHRM are
+  libpng 1.2.8's floats; with sRGB present they are sRGB's (0.45455 and the standard chromaticities), as 1.2.8 sets
+  them. tRNS is reported as read with the header (1.6 clears it once expanded). Text chunks (tEXt, zTXt, iTXt) and
+  unknown chunks before or after IDAT, PLTE, tRNS, gAMA, cHRM, sRGB, iCCP, sBIT, bKGD, hIST, pHYs, sPLT, oFFs, tIME,
+  pCAL, sCAL: all measured the same.
+- **Not pspocket's yet:** the Ext functions (partial decoding with display callbacks, stream input callbacks, SPURS);
+  a game that imports one gets Sony's whole libpngdec (D-175). Unmeasured: a 16-bit image with gamma converted to gray
+  (1.2.8's 16-bit tables are approximated in floating point).
+
+Tests: tests/hle/test_pngdec.cpp (PNGs built in code by png_writer.hpp: every colour type and bit depth, Adam7, every
+chunk kind; pspocket alone; the comparison with Sony's when the firmware is there; two hidden probes).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

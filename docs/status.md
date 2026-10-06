@@ -132,8 +132,12 @@ module through pspocket's front end (the loader now links what a pspocket librar
 also the same as through Sony's libadec. ATRAC3plus, the codec games use most, is now pspocket's own on FFmpeg (D-198,
 run 105): on Assassin's Creed's menu music every answer is Sony's and the sound within 0.000001 of Sony's decoder.
 
-Next: the other codec cores on FFmpeg in place of Sony's (MP3, AC-3, AAC, ATRAC3, MPEG audio), then the image decoders,
-each measured against Sony's the same way; then
+The image decoders began with cellPngDec (D-199, run 106): pspocket's own on libpng, the same as Sony's libpngdec in
+2,283 answers and 121 decoded images, every colour type, bit depth, output setting and chunk kind (Sony's libpng 1.2.8
+quirks reproduced, its gray arithmetic found by fitting the pixels).
+
+Next: cellJpgDec and cellGifDec, each measured against Sony's the same way; the other audio codec cores on FFmpeg
+(MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
 docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
 with games nobody has analysed (each run's log names what is still missing).
 

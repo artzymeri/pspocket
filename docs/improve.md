@@ -150,7 +150,11 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   code on pspocket's SPURS): MP3, AC-3, AAC, ATRAC3 and MPEG audio next on FFmpeg, each compared with Sony's core. No
   synthetic writer for those yet: MP2, AC-3 and AAC could use FFmpeg's encoders in a test-only build; layer I frames
   are written in the test; a game's stream can be given to a probe locally (as SND0.AT3 in run 105).
-- **State:** open; the other codec cores next.
+- **cellPngDec (D-199):** decodes the whole image into a host buffer, then copies rows (and converts colour to gray)
+  into the game's: one extra copy per image; measure on a game's loading screens before changing. The Ext functions
+  (partial decoding with display callbacks, stream callbacks) are Sony's still: write them when a game imports one.
+  libpng's NEON filters are off (PNG_ARM_NEON_OPT=0): measure a large PNG with them on.
+- **State:** open; cellJpgDec and cellGifDec next; the other audio cores when a game's log shows one.
 
 ## The gate (D-149)
 
