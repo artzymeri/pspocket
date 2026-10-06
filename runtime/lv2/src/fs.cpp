@@ -1070,6 +1070,30 @@ Result sys_fs_fcntl(PpuThread& t, u32 fd, u32 op, u32 arg, u32 size)
     }
 }
 
+Result fs_read_whole_file(Kernel& k, u32 fd, std::vector<u8>& out)
+{
+    const auto file = get_file(k, fd);
+    if (!file) return err(CELL_EBADF);
+    std::lock_guard lock(file->lock);
+    if (!file->is_open()) return err(CELL_EBADF);
+    if (file->image_file) {
+        out.resize(static_cast<usize>(file->image_file->size()));
+        if (!out.empty() && !file->image_file->read(0, out.data(), out.size())) return err(CELL_EIO);
+        return CELL_OK;
+    }
+    struct stat st {};
+    if (::fstat(file->host_fd, &st) != 0) return map_errno(errno, "fstat", file->vpath);
+    out.resize(static_cast<usize>(st.st_size));
+    usize done = 0;
+    while (done < out.size()) {
+        const ssize_t n = ::pread(file->host_fd, out.data() + done, out.size() - done, static_cast<off_t>(done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return err(CELL_EIO);
+        done += static_cast<usize>(n);
+    }
+    return CELL_OK;
+}
+
 void register_fs_syscalls(SyscallTable& table)
 {
     PS_LV2_BIND(table, 801, sys_fs_open);

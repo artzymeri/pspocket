@@ -143,6 +143,10 @@ void register_fs_syscalls(SyscallTable& table);
 void register_vm_syscalls(SyscallTable& table);
 void register_spu_syscalls(SyscallTable& table);
 
+// The whole of the open file `fd` (a host file or one on an image), without moving its position (fs.cpp; for
+// sys_spu_image_open_by_fd). CELL_EBADF when fd is not an open file.
+Result fs_read_whole_file(Kernel& k, u32 fd, std::vector<u8>& out);
+
 // ---------------------------------------------------------------------------------------------------- helpers
 
 // A blocking call returned because the kernel aborted the wait (process exit, shutdown): unwind the PPU thread.
@@ -276,6 +280,11 @@ public:
     static constexpr u64 kMmapperMin = 0x20000000;
     bool slot_free(u64 addr, u64 size) const;
     u32 allocate_user(u64 size, u32 page_size);
+    // User memory the kernel keeps for itself (SPU images: RPCS3 allocate_user_memory), committed, 64 KB pages, not
+    // charged to a container. 0 when there is no room. With `mutex` held.
+    u32 allocate_kernel(u64 size);
+    void free_kernel(u32 addr);
+    std::map<u32, u64> kernel_allocs;
 
     // Thread stacks: commit [addr, addr + round_up(size)) below a guard page. Returns 0 when the region is full.
     u32 allocate_stack(u32 size, u32& committed);
@@ -448,6 +457,11 @@ struct Kernel::Impl {
     Vfs vfs;
     std::mutex npd_mutex;
     Kernel::NpdOpener npd_opener; // Kernel::set_npd_opener (D-165), under npd_mutex
+    // SPU thread groups (D-167): their IDs, and what the HLE layer adds (under spu_hooks_mutex).
+    IdTable spu_groups{IdSpec{0x100, 255, 0, 8, false}}; // lv2_spu_group, base 0x04000100
+    std::mutex spu_hooks_mutex;
+    Kernel::SpuProgramIdentifier spu_identifier;
+    Kernel::SelfDecrypter self_decrypter;
     RsxDevice rsx;
     TimerService timers;
     std::mutex tty_mutex;

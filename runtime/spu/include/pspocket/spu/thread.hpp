@@ -14,6 +14,18 @@
 #include "pspocket/core/types.hpp"
 #include "pspocket/spu/context.h"
 
+// For lv2's SPU threads (D-167), kept out of runtime.h, whose text is part of the game library ABI (D-152).
+extern "C" {
+/* An SPU thread as sys_spu_thread_group_start leaves it before setting its arguments and entry (RPCS3
+ * spu_thread::cpu_init): registers zero but $1 = 0x3FFF0, FPSCR, SRR0, the MFC (parameters, queue, tag groups, list
+ * stalls, atomic status), the outbound mailboxes, events, interrupts and the reservation cleared, the decrementer
+ * restarted at dec_value; the inbound mailbox, the signal notification registers and their OR modes kept. The local
+ * store, membase, host, identity, hooks and group stay; the program is detached. */
+void ps_spu_thread_reset(SPUContext* ctx, uint32_t dec_value);
+/* Empties the inbound mailbox (RPCS3: an SPU thread's, when it stops). */
+void ps_spu_clear_in_mbox(SPUContext* ctx);
+}
+
 namespace pspocket::spu {
 
 class Thread {

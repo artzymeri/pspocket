@@ -837,12 +837,12 @@ TEST_CASE("sys_process_is_stack and sys_spu_image_close", "[hle][ac]")
     ps_write32(b, kImg + 0xC, 2);
     REQUIRE(a.call("sys_spu_image_close", kImg) == 0);
     CHECK_FALSE(f.mem.is_committed(segs));
-    // A kernel image goes to the syscall _sys_spu_image_close (158), which lv2 does not implement: reported, ENOSYS.
+    // A kernel image goes to the syscall _sys_spu_image_close (158, D-167): an image ID that names nothing is ESRCH.
     ps_write32(b, kImg + 0x0, 1); // SYS_SPU_IMAGE_TYPE_KERNEL
     ps_write32(b, kImg + 0x4, 0x22000001);
     const u64 unimplemented = f.kernel->unimplemented_count();
-    CHECK(a.call("sys_spu_image_close", kImg) == r3_of(lv2::CELL_ENOSYS));
-    CHECK(f.kernel->unimplemented_count() == unimplemented + 1);
+    CHECK(a.call("sys_spu_image_close", kImg) == r3_of(lv2::CELL_ESRCH));
+    CHECK(f.kernel->unimplemented_count() == unimplemented);
     // Any other type: EINVAL; an image that is not guest memory: EFAULT (D-042).
     ps_write32(b, kImg + 0x0, 2);
     CHECK(a.call("sys_spu_image_close", kImg) == r3_of(lv2::CELL_EINVAL));

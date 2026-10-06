@@ -241,6 +241,28 @@ u32 MemoryManager::allocate_user(u64 size, u32 page_size)
     return area ? area->ranges.alloc(size, page_size) : 0;
 }
 
+u32 MemoryManager::allocate_kernel(u64 size)
+{
+    const u64 bytes = align_up(size, 0x10000);
+    const u32 addr = allocate_user(bytes, 0x10000);
+    if (!addr) return 0;
+    if (!kernel.memory().commit(addr, bytes)) {
+        if (Area* a = area_at(addr)) a->ranges.free(addr);
+        return 0;
+    }
+    kernel_allocs[addr] = bytes;
+    return addr;
+}
+
+void MemoryManager::free_kernel(u32 addr)
+{
+    const auto it = kernel_allocs.find(addr);
+    if (it == kernel_allocs.end()) return;
+    kernel.memory().decommit(addr, it->second);
+    if (Area* a = area_at(addr)) a->ranges.free(addr);
+    kernel_allocs.erase(it);
+}
+
 u32 MemoryManager::allocate_stack(u32 size, u32& committed)
 {
     const u64 page = stack_granule();

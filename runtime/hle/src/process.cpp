@@ -21,6 +21,7 @@ namespace pspocket::hle {
 
 void register_all_modules(Registry& r); // modules.cpp
 void install_npd_opener(lv2::Kernel& kernel); // sys_fs.cpp
+void install_spu_thread_hooks(lv2::Kernel& kernel); // spu_programs.cpp
 
 namespace {
 
@@ -161,7 +162,8 @@ void MainMemory::free(u32 addr)
 HleProcess::HleProcess(lv2::Kernel& kernel, u32 main_begin, u32 main_end, ProcessConfig config)
     : kernel_(kernel), config_(config), main_(kernel.memory(), main_begin, main_end)
 {
-    install_npd_opener(kernel); // sys_fs.cpp: encrypted SDATA files (D-165)
+    install_npd_opener(kernel);       // sys_fs.cpp: encrypted SDATA files (D-165)
+    install_spu_thread_hooks(kernel); // spu_programs.cpp: SPU thread groups' programs and SELF images (D-167)
     // Sized once, so linking while guest threads call stubs (D-159) never moves what linked_at reads.
     chunks_.reserve(kPreparedChunks);
     linked_.resize(usize{kPreparedChunks} * kEntriesPerChunk);

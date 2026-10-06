@@ -17,6 +17,7 @@
 #include "pspocket/core/timebase.h"
 #include "pspocket/spu/fp.h"
 #include "pspocket/spu/runtime.h"
+#include "pspocket/spu/thread.hpp"
 
 using namespace pspocket;
 using namespace pspocket::spu::detail;
@@ -254,6 +255,46 @@ void ps_spu_context_init(SPUContext* ctx, uint8_t* ls, uint8_t* membase)
     ctx->membase = membase;
     ctx->xfloat = ps_spu_default_xfloat();
     ctx->ch.dec_start = ps_spu_timebase();
+}
+
+void ps_spu_thread_reset(SPUContext* ctx, uint32_t dec_value)
+{
+    pspocket::spu::detail::ChannelLock lock(ctx);
+    ps_spu_channels& ch = ctx->ch;
+    uint32_t in_mbox[4];
+    std::memcpy(in_mbox, ch.in_mbox, sizeof in_mbox);
+    const uint32_t in_mbox_count = ch.in_mbox_count;
+    const uint32_t snr[2] = {ch.snr[0], ch.snr[1]}, snr_count[2] = {ch.snr_count[0], ch.snr_count[1]};
+    const uint32_t snr_or_mode = ch.snr_or_mode;
+    std::memset(static_cast<void*>(&ch), 0, sizeof ch);
+    std::memcpy(ch.in_mbox, in_mbox, sizeof in_mbox);
+    ch.in_mbox_count = in_mbox_count;
+    ch.snr[0] = snr[0];
+    ch.snr[1] = snr[1];
+    ch.snr_count[0] = snr_count[0];
+    ch.snr_count[1] = snr_count[1];
+    ch.snr_or_mode = snr_or_mode;
+    ch.dec_start = ps_spu_timebase();
+    ch.dec_value = dec_value;
+    std::memset(static_cast<void*>(ctx->gpr), 0, sizeof ctx->gpr);
+    ctx->gpr[1].u32[3] = 0x3FFF0;
+    ctx->fpscr = ps_spu_v128{};
+    ctx->srr0 = 0;
+    ctx->pc = 0;
+    ctx->stop_reason = PS_SPU_STOP_NONE;
+    ctx->stop_code = 0;
+    ctx->exception = 0;
+    ctx->interrupts_enabled = 0;
+    ctx->program = nullptr;
+    ctx->home = nullptr;
+    ctx->reloc = 0;
+    ctx->home_reloc = 0;
+}
+
+void ps_spu_clear_in_mbox(SPUContext* ctx)
+{
+    pspocket::spu::detail::ChannelLock lock(ctx);
+    ctx->ch.in_mbox_count = 0;
 }
 
 void ps_spu_set_stop_handler(ps_spu_stop_handler handler) { g_stop_handler.store(handler); }
@@ -587,6 +628,7 @@ void ps_spu_write_signal(SPUContext* ctx, uint32_t which, uint32_t value)
 {
     ChannelLock lock(ctx);
     push_signal(ctx, which == 2 ? 1 : 0, value);
+    notify(ctx); // an SPU blocked reading the register (set_events wakes only masked events' waiters)
 }
 
 void ps_spu_set_signal_or_mode(SPUContext* ctx, uint32_t which, int or_mode)

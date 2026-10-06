@@ -19,7 +19,8 @@
 
 namespace pspocket::hle::spurs {
 
-enum class ImageKind : u8 { Task, Job, PolicyModule, Module }; // Module: code a program loaded itself (D-079)
+// Module: code a program loaded itself (D-079); Thread: an lv2 SPU thread's image (D-167).
+enum class ImageKind : u8 { Task, Job, PolicyModule, Module, Thread };
 
 struct SpuImage {
     ImageKind kind = ImageKind::Task;

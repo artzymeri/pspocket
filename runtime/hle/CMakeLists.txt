@@ -15,6 +15,7 @@ add_library(pspocket_hle STATIC
     src/cellSsl.cpp
     src/cellSync.cpp
     src/sys_prx.cpp
+    src/sys_spu_.cpp
     src/cellSysmodule.cpp
     src/cellSysutil.cpp
     src/cellVoice.cpp

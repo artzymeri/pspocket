@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "internal.hpp"
+#include "spu.hpp"
 #include "pspocket/ppu/interpreter.hpp"
 #include "pspocket/ppu/runtime.h"
 
@@ -483,6 +484,7 @@ Kernel::Impl::~Impl() = default;
 void Kernel::Impl::abort_all_waits()
 {
     for (const auto& [id, obj] : threads.list(PpuThread::kIdBase)) abort_wait(static_cast<PpuThread&>(*obj).waiter);
+    abort_spu_threads(*this);
 }
 
 void Kernel::Impl::process_exit(s32 status)
@@ -557,6 +559,18 @@ void Kernel::set_npd_opener(NpdOpener opener)
 {
     std::lock_guard lock(impl_->npd_mutex);
     impl_->npd_opener = std::move(opener);
+}
+
+void Kernel::set_spu_program_identifier(SpuProgramIdentifier identifier)
+{
+    std::lock_guard lock(impl_->spu_hooks_mutex);
+    impl_->spu_identifier = std::move(identifier);
+}
+
+void Kernel::set_self_decrypter(SelfDecrypter decrypter)
+{
+    std::lock_guard lock(impl_->spu_hooks_mutex);
+    impl_->self_decrypter = std::move(decrypter);
 }
 
 bool Kernel::vfs_read_file(std::string_view vpath, std::vector<u8>& out) const

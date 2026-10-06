@@ -19,6 +19,7 @@ void register_cellSpursSemaphore(Registry& r);
 void register_cellSsl(Registry& r);
 void register_cellSync(Registry& r);
 void register_sys_prx(Registry& r);
+void register_sys_spu(Registry& r);
 void register_cellSysmodule(Registry& r);
 void register_cellSysutil(Registry& r);
 void register_cellVoice(Registry& r);
@@ -49,6 +50,7 @@ void register_all_modules(Registry& r)
     register_cellSsl(r);
     register_cellSync(r);
     register_sys_prx(r);
+    register_sys_spu(r);
     register_cellSysmodule(r);
     register_cellSysutil(r);
     register_cellVoice(r);

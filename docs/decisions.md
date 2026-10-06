@@ -2827,6 +2827,48 @@ slots still return CELL_ENOSYS and count as unimplemented. sys_fs_fcntl's unknow
 error log, as RPCS3's do (31 of its operations are no-ops). Test: a named, a debug and an unnamed null slot return
 CELL_OK, an unused one ENOSYS.
 
+## D-167 · 2026-10-06 · SPU thread groups: games run SPU programs on lv2 directly, as on a PS3
+
+Until now SPU code ran only inside the native SPURS (D-037); lv2 had none of the SPU thread group syscalls, so a game
+(or a firmware library) that creates its own SPU threads stopped at the first one (the kernel audit of 2026-10-06:
+the largest gap). lv2 now has them as RPCS3 has them (rpcs3/Emu/Cell/lv2/sys_spu.cpp; the SPU side from SPUThread.cpp
+stop_and_signal and set_ch_value), in runtime/lv2/src/spu.cpp:
+
+- **Images.** sys_spu_image_open (a file through the VFS; an SPU SELF decrypts with the build's keys through a hook
+  the HLE layer installs), sys_spu_image_open_by_fd, _sys_spu_image_import, _sys_spu_image_close, the information and
+  segment calls: RPCS3's kernel image (the segment table and a copy of the ELF in user memory, 64 KB pages, an image
+  object 0x22000000, the guest's sys_spu_image {KERNEL, ID, 0, 0}). sysPrxForUser's side (runtime/hle/src/sys_spu_.cpp):
+  sys_spu_image_import (PROTECT through the syscall, DIRECT as a user image whose segments point into the ELF),
+  sys_spu_elf_get_information and get_segments (an SCE header followed to its ELF), and the SPU printf server's
+  callbacks (_sys_spu_printf_*).
+- **Groups and threads.** create (RPCS3's types, the SPU limits shared with sys_spu_initialize, the memory charged to
+  the default or given container), destroy, initialize (user segments checked as RPCS3 does; thread IDs (index << 24)
+  | group ID), set_argument, get_exit_status, start (each image copied into its local store, the context reset as
+  RPCS3's cpu_init: ps_spu_thread_reset keeps the inbound mailbox and signal registers; arguments in $3..$6's preferred
+  doublewords, $1 = 0x3FFF0; the run event), suspend, resume, yield, terminate (refused while a thread waits on an SPU
+  queue), join (cause: group exit, all threads exited, terminated), priorities, read_ls/write_ls, write_spu_mb,
+  write_snr, spu_cfg (signal OR modes), thread and group events, bind/unbind of SPU queues, connect_event_all_threads,
+  cooperative victims and syscall 253 (checked, as RPCS3's TODO).
+- **The SPU side,** through the context's hooks: stop 0x110/0x111 (receive/tryreceive an event from a bound SPU queue
+  into the inbound mailbox), 0x101 (group exit: the first one decides cause and status; the others are stopped), 0x102
+  (thread exit with its status), 0x100 (yield), 0x001/0x002; interrupt-mailbox codes 0..63 send_event (answered),
+  64..127 throw_event, 128/192 event flag bits. Each SPU thread has a parked host thread of its own (8 MB stack); the
+  lifted program for each image is attached at start (ImageKind::Thread, found by hash as SPURS's images are;
+  otherwise the interpreter runs it). Process exit stops every SPU thread and aborts its waits.
+
+Differences from RPCS3: while a thread waits on an SPU queue its group is WAITING, but the group's other threads go on
+(RPCS3 suspends them); a suspend stops threads at their next attention check; local stores are host memory (the PPU
+uses read_ls/write_ls, the group's threads the 0xF0000000 DMA window, spu_num below 8); halts, SPU exceptions and
+unknown stop codes end the thread with an error log (an abort when the SPU miss policy aborts), without the exception
+event; raw and isolated SPUs, SPU page faults and asynchronous interrupts are not implemented. Two bugs this found in
+the SPU runtime: a signal-notification write did not wake an SPU already blocked reading it (fixed:
+ps_spu_write_signal notifies); RPCS3's check for a terminate before a thread starts to wait on its queue was needed
+here too. Tests (tests/hle/test_spu_threads.cpp, synthetic SPU ELFs on the interpreter): arguments, exit status and a
+restart; images; RPCS3's refusals; group exit stopping a spinning sibling; suspend, resume, terminate; the inbound
+mailbox, send_event to a PPU queue and receive_event from an SPU queue (and terminate refused while it waits); event
+flag bits, signal OR mode, local store access, the run event; SPU-to-SPU DMA and a signal through the group window;
+the process ending while a thread waits.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

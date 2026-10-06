@@ -22,6 +22,8 @@
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/runtime.h"
+#include "pspocket/lv2/kernel.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
 #include "spurs_native.hpp"
 
 namespace pspocket::hle::spurs {
@@ -36,6 +38,7 @@ const char* kind_name(ImageKind k)
     case ImageKind::Job: return "job";
     case ImageKind::PolicyModule: return "policy-module";
     case ImageKind::Module: return "module";
+    case ImageKind::Thread: return "thread";
     }
     return "?";
 }
@@ -551,6 +554,29 @@ void attach_program(SPUContext& ctx, u8* base, const SpuImage& image)
 }
 
 } // namespace pspocket::hle::spurs
+
+namespace pspocket::hle {
+
+// lv2's SPU thread groups (D-167): each thread's image gets its lifted program as SPURS's images do, and an SPU SELF
+// opened by sys_spu_image_open decrypts with the build's keys (as the loader's executables do, D-121).
+void install_spu_thread_hooks(lv2::Kernel& kernel)
+{
+    u8* base = kernel.base();
+    kernel.set_spu_program_identifier([base](SPUContext& ctx, u32 guest, u32 ls_start, u32 size, u32 entry) {
+        spurs::attach_program(ctx, base, {spurs::ImageKind::Thread, guest, ls_start, size, entry});
+    });
+    kernel.set_self_decrypter([](std::vector<u8>& bytes, std::string& error) {
+        auto elf = recomp::decrypt_self(bytes, recomp::builtin_self_keys());
+        if (!elf) {
+            error = elf.error().message;
+            return false;
+        }
+        bytes = std::move(*elf);
+        return true;
+    });
+}
+
+} // namespace pspocket::hle
 
 namespace pspocket::hle {
 

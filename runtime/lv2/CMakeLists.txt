@@ -16,6 +16,6 @@ add_library(pspocket_lv2 STATIC
     src/time.cpp
     src/vm.cpp)
 target_include_directories(pspocket_lv2 PUBLIC include PRIVATE src)
-target_link_libraries(pspocket_lv2 PUBLIC pspocket::core pspocket::ppu pspocket::rsx)
+target_link_libraries(pspocket_lv2 PUBLIC pspocket::core pspocket::ppu pspocket::rsx pspocket::spu)
 pspocket_set_warnings(pspocket_lv2)
 add_library(pspocket::lv2 ALIAS pspocket_lv2)

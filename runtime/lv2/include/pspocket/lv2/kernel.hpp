@@ -30,6 +30,7 @@
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/object.hpp"
 #include "pspocket/ppu/context.h"
+#include "pspocket/spu/context.h"
 
 namespace pspocket::rsx {
 class Backend;
@@ -244,6 +245,15 @@ public:
     using NpdOpener = std::function<std::shared_ptr<const VfsImage::File>(
         std::shared_ptr<const VfsImage::File> encrypted, bool edata, std::string& error)>;
     void set_npd_opener(NpdOpener opener);
+    // SPU thread groups (D-167). The identifier attaches to an SPU thread's context the lifted program for the image
+    // sys_spu_thread_group_start just copied into its local store (`guest`: the code's segment in guest memory,
+    // loaded at `ls_start`, `size` bytes; `entry`); unset, the interpreter runs every SPU thread. The decrypter turns
+    // an SPU SELF that sys_spu_image_open reads into its ELF (false with `error` set); unset, SELF images fail with
+    // CELL_ENOEXEC.
+    using SpuProgramIdentifier = std::function<void(SPUContext& ctx, u32 guest, u32 ls_start, u32 size, u32 entry)>;
+    void set_spu_program_identifier(SpuProgramIdentifier identifier);
+    using SelfDecrypter = std::function<bool(std::vector<u8>& bytes, std::string& error)>;
+    void set_self_decrypter(SelfDecrypter decrypter);
 
     // PPU threads. create_thread allocates the guest stack and an ID and leaves the thread stopped.
     Result create_thread(const ThreadParams& params, u32& id_out);
