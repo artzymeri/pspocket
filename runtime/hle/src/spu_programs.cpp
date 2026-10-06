@@ -176,9 +176,13 @@ constexpr u32 kBlocks = PS_SPU_LS_SIZE >> kBlockShift;
 constexpr u32 kRuns = 4096;        // live runs per SPU, more than its 256 KB holds in practice
 constexpr u32 kRunsPerBlock = 32;  // a block of smaller pieces drops its oldest
 
+// A run is what one contiguous copy left in local store. A later GET over part of it leaves the rest (run 109:
+// Assassin's Creed's tasks load a 42 KB module at 0x4c00, then data over its last 10 KB, and run the module's head):
+// the run keeps the extent it was copied with as its identity, and the part still intact as where it holds code.
 struct Run {
-    u32 ls_start = 0, ls_end = 0; // [ls_start, ls_end) of local store; empty: a free slot
-    u32 ea_start = 0;             // where its first byte came from
+    u32 ls_start = 0, ls_end = 0; // [ls_start, ls_end): the part of the copy still in local store; empty: a free slot
+    u32 id_start = 0, id_end = 0; // [id_start, id_end): the whole copy, as it came (its identity)
+    u32 ea_start = 0;             // where the copy's first byte (at id_start) came from
     bool resolved = false;        // identified (the program may still be null)
     u64 hash = 0;
     const ps_spu_program* program = nullptr;
@@ -186,6 +190,17 @@ struct Run {
     bool live() const { return ls_end > ls_start; }
     bool holds(u32 pc) const { return pc >= ls_start && pc < ls_end; }
 };
+
+Run make_run(u32 ls_start, u32 ls_end, u32 ea_start, u32 id_start, u32 id_end)
+{
+    Run r;
+    r.ls_start = ls_start;
+    r.ls_end = ls_end;
+    r.id_start = id_start;
+    r.id_end = id_end;
+    r.ea_start = ea_start;
+    return r;
+}
 
 struct Block {
     u32 count = 0;
@@ -317,35 +332,52 @@ void observe_get(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size)
     Modules& m = modules_for(ctx);
     lsa &= PS_SPU_LS_MASK;
     const u32 end = std::min<u32>(lsa + size, PS_SPU_LS_SIZE);
-    const bool extends = m.last < kRuns && m.runs[m.last].ls_end > m.runs[m.last].ls_start &&
-                         m.runs[m.last].ls_end == lsa &&
-                         m.runs[m.last].ea_start + (m.runs[m.last].ls_end - m.runs[m.last].ls_start) == eal;
+    const bool extends = m.last < kRuns && m.runs[m.last].live() && m.runs[m.last].ls_end == lsa &&
+                         m.runs[m.last].id_end == lsa &&
+                         m.runs[m.last].ea_start + (m.runs[m.last].id_end - m.runs[m.last].id_start) == eal;
     note_event('g', lsa, end, eal);
-    // Runs this GET overwrites lose what they held (not the one it extends: that one ends where this one starts).
+    // Runs this GET overwrites keep what it leaves (not the one it extends: that one ends where this one starts):
+    // the part before it, else the part after it; one it covers entirely is gone.
+    std::array<u32, 64> overlapping{};
+    u32 count = 0;
     for (u32 b = lsa >> kBlockShift; b <= (end - 1) >> kBlockShift; b++) {
-        Block& block = m.blocks[b];
-        for (u32 k = 0; k < block.count;) {
+        const Block& block = m.blocks[b];
+        for (u32 k = 0; k < block.count; k++) {
             const u32 index = block.runs[k];
             const Run& r = m.runs[index];
-            if (r.ls_start < end && lsa < r.ls_end) {
-                note_event('c', r.ls_start, r.ls_end, r.ea_start);
-                drop(m, index); // takes it out of this block too
-                continue;
-            }
-            k++;
+            if (!(r.ls_start < end && lsa < r.ls_end)) continue;
+            if (std::find(overlapping.begin(), overlapping.begin() + count, index) != overlapping.begin() + count) continue;
+            if (count < overlapping.size()) overlapping[count++] = index;
         }
+    }
+    for (u32 i = 0; i < count; i++) {
+        const u32 index = overlapping[i];
+        Run& r = m.runs[index];
+        if (!r.live()) continue; // dropped meanwhile by a full block
+        note_event('c', r.ls_start, r.ls_end, r.ea_start);
+        const u32 left_end = std::min(lsa, r.ls_end), right_start = std::max(end, r.ls_start);
+        if (left_end <= r.ls_start && right_start >= r.ls_end) {
+            drop(m, index);
+            continue;
+        }
+        detach_blocks(m, index);
+        if (left_end > r.ls_start) r.ls_end = left_end;
+        else r.ls_start = right_start;
+        attach_blocks(m, index);
+        if (m.last == index) m.last = kRuns;
     }
     u32 index = m.last;
     if (extends && index < kRuns) {
         detach_blocks(m, index);
         Run& r = m.runs[index];
         r.ls_end = end;
+        r.id_end = end;
         r.resolved = false;
         r.hash = 0;
         r.program = nullptr;
     } else {
         index = take_slot(m);
-        m.runs[index] = Run{lsa, end, eal};
+        m.runs[index] = make_run(lsa, end, eal, lsa, end);
     }
     m.last = index;
     attach_blocks(m, index);
@@ -439,23 +471,25 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
         return nullptr;
     }
     Run& r = *found;
-    const u32 size = (r.ls_end - r.ls_start) & ~3u;
+    const u32 size = (r.id_end - r.id_start) & ~3u;
     if (!r.resolved) {
         r.resolved = true;
         u8* base = ctx->membase;
-        if (std::memcmp(ctx->ls + r.ls_start, base + r.ea_start, size) != 0) {
+        // The part still in local store must be its guest copy; the whole copy is the module's identity.
+        const u32 held = r.ls_end - r.ls_start, from = r.ea_start + (r.ls_start - r.id_start);
+        if (std::memcmp(ctx->ls + r.ls_start, base + from, held) != 0) {
             g_modified.fetch_add(1, std::memory_order_relaxed);
-            log_modified(ctx->ls + r.ls_start, base + r.ea_start, size, r.ls_start, r.ea_start);
+            log_modified(ctx->ls + r.ls_start, base + from, held, r.ls_start, from);
             return nullptr;
         }
-        r.program = identify(base, {ImageKind::Module, r.ea_start, r.ls_start, size, pc}, &r.hash);
+        r.program = identify(base, {ImageKind::Module, r.ea_start, r.id_start, size, pc}, &r.hash);
         if (r.program) g_modules.fetch_add(1, std::memory_order_relaxed);
     }
     if (r.program) {
-        *code_start = r.ls_start;
+        *code_start = r.id_start;
         return r.program;
     }
-    if (r.hash) dump_seed(r.hash, r.ls_start, pc);
+    if (r.hash) dump_seed(r.hash, r.id_start, pc);
     return nullptr;
 }
 
@@ -485,7 +519,7 @@ const ps_spu_program* identify_hashed(u64 hash, u8* base, const SpuImage& image)
 }
 
 struct SavedRun {
-    u32 ls_start, ls_end, ea_start;
+    u32 ls_start, ls_end, ea_start, id_start, id_end;
 };
 
 struct SavedRuns {
@@ -510,7 +544,8 @@ void save_module_runs(const SPUContext& ctx, u32 save_area, const std::function<
         for (u32 k = 0; k < block.count; k++) {
             const Run& r = m.runs[block.runs[k]];
             // Each run once, in the block it starts in.
-            if ((r.ls_start >> kBlockShift) == b && keep(r.ls_start, r.ls_end)) runs.push_back({r.ls_start, r.ls_end, r.ea_start});
+            if ((r.ls_start >> kBlockShift) == b && keep(r.ls_start, r.ls_end))
+                runs.push_back({r.ls_start, r.ls_end, r.ea_start, r.id_start, r.id_end});
         }
     }
     SavedRuns& s = saved_runs();
@@ -534,7 +569,7 @@ void restore_module_runs(SPUContext& ctx, u32 save_area)
         note_event('r', saved.ls_start, saved.ls_end, saved.ea_start);
         // Identified again when execution reaches it: its guest copy is checked against local store as after a GET.
         const u32 index = take_slot(m);
-        m.runs[index] = Run{saved.ls_start, saved.ls_end, saved.ea_start};
+        m.runs[index] = make_run(saved.ls_start, saved.ls_end, saved.ea_start, saved.id_start, saved.id_end);
         attach_blocks(m, index);
     }
     m.last = kRuns;

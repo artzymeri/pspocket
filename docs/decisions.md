@@ -4539,7 +4539,7 @@ clear, every extension kind, animations; six damaged files; eight call orders; s
 Assassin's Creed's switch at 0xa88f18 jumped through the interpreter 86 times a session ("indirect jump to 0x00a88fb4
 has no lifted function"). Its table address is in the game's data, two loads away (r30 from the TOC in the prologue,
 then the table's address from r30's block), and the analyzer reads it on its second pass with the prologue's
-constants (D-125's prefix constants). Two things threw that pass away:
+constants (D-096). Two things threw that pass away:
 
 - **Tail calls.** The prefix constants hold only if nothing else in the function writes the register, apart from the
   restores on the way out. Each case of this switch restores r30 and then branches to another function (GCC's tail

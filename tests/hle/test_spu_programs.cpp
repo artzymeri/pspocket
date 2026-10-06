@@ -342,6 +342,62 @@ TEST_CASE("SPU programs: a module shares its 1 KB block with data, and outlasts 
     ps_spu_unregister_program(&program);
 }
 
+TEST_CASE("SPU programs: a module with data copied over its tail still runs lifted at its head", "[hle][spu]")
+{
+    // Regression, run 109: Assassin's Creed's tasks copy a 42 KB module to 0x4c00, then data over its last 10 KB, and
+    // run the module's head; the data's copy dropped the module, which then ran interpreted (64 billion instructions in
+    // six minutes).
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModule = 0x4C00, kModuleSize = 0x1000;
+    ps_write32(base, kGuest, 0x00000007); // `stop 0x7` at its entry, for the interpreter
+    for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
+    const ps_spu_entry entries[] = {{kModule, &module_entry}, {kModule + 0x400, &module_entry}};
+    ps_spu_program program{"spu_tail_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 2, entries, nullptr, nullptr};
+    ps_spu_register_program(&program);
+    hle::enable_spu_modules();
+    Spu spu(base);
+    const auto get = [&](u32 lsa, u32 eal, u32 size) {
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_LSA, lsa) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAH, 0) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAL, eal) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Size, size) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_TagID, 2) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+    };
+    const auto run_at = [&](u32 pc) {
+        ps_spu_attach_program(&spu.ctx, nullptr);
+        spu.ctx.pc = pc;
+        REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+        return spu.ctx.stop_code;
+    };
+    // The module in four pieces, then data over its last quarter from elsewhere: its head runs lifted.
+    for (u32 i = 0; i < 4; i++) get(kModule + i * 0x400, kGuest + i * 0x400, 0x400);
+    get(kModule + 0xC00, kGuest + 0x8000, 0x400);
+    CHECK(run_at(kModule) == 0x42);
+    CHECK(spu.ctx.program == &program);
+    // Data over its head instead: the rest is still the module (relocatable or not, where it was copied).
+    for (u32 i = 0; i < 4; i++) get(kModule + i * 0x400, kGuest + i * 0x400, 0x400);
+    get(kModule, kGuest + 0x8000, 0x400);
+    CHECK(run_at(kModule) == 0x0); // the data (zeros: `stop 0`) at the entry, interpreted
+    CHECK(spu.ctx.program == nullptr);
+    CHECK(run_at(kModule + 0x400) == 0x42); // the module's second quarter: still the module, lifted
+    CHECK(spu.ctx.program == &program);
+    // Covered entirely: gone.
+    for (u32 i = 0; i < 4; i++) get(kModule + i * 0x400, kGuest + i * 0x400, 0x400);
+    get(kModule, kGuest + 0x8000, kModuleSize);
+    std::memcpy(spu.ls.get() + kModule, base + kGuest, 4); // even with its first word back, not a module any more
+    CHECK(run_at(kModule) == 0x7);
+    CHECK(spu.ctx.program == nullptr);
+
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&program);
+}
+
 namespace {
 
 constexpr u32 kHome = 0x1000;  // a task's code, lifted where it runs
