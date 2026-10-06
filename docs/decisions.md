@@ -2756,6 +2756,47 @@ fix, D-161: the same code on the same device); else the device's speed measured 
 across both games) for PPU and SPU alike, and its table rate; each from the heat it was measured at to the heat now.
 pspocket-prepare on the Mac uses the game's own manifest the same way. Test: the three cases and the heat.
 
+## D-165 · 2026-10-06 · L.A. Noire's first stops: encrypted SDATA files, a workload attribute, GCM handlers
+
+L.A. Noire (BLES00933), prepared on the phone (61,666 PPU functions, no SPU programs in its executable), stopped before
+its first frame (phone log 2026-10-06 05:53): cellFsSdataOpen of its fragment programs (programs.fp.ps3.sdat) was
+missing, so were its SPURS workload (cellSpursAddWorkloadWithAttribute) and eleven smaller calls; its SPURS then waited
+for work for good. All fourteen now follow RPCS3, each with a test (tests/hle/test_la_noire.cpp, test_spurs_run.cpp):
+
+- **Encrypted SDATA files.** recomp::NpdFile (recomp/common/npd.cpp) ports RPCS3's EDATADecrypter and its LZ decoder
+  (Crypto/unedat.cpp, lz.cpp): blocks of the NPD file, each key the file key's AES of the dev hash and block number,
+  AES-128-CBC with the header's digest as IV, the AES-CMAC or HMAC-SHA1 of the encrypted bytes checked, compressed
+  blocks decoded; the last block read is cached. The SDAT key is the header's dev hash XOR SDAT_KEY; the keys
+  (SDAT_KEY, EDAT_KEY_0/1, EDAT_HASH_0/1, EDAT_IV) come from RPCS3's key_vault.h at build time (scripts/self-keys.py,
+  build directory only). lv2 sys_fs_open with the SDATA or EDATA type argument on an "NPD\0" file opens it through
+  the opener the HLE process installs (Kernel::set_npd_opener): a read-only file of its plain bytes, fstat the plain
+  size, as RPCS3's lv2 wraps it; cellFsSdataOpen is RPCS3's (read-only, the type argument {0x180, 0x10}). Differences:
+  EDATA (PSN content) needs the game's klicensee, which nothing keeps yet: refused with a log, as before. RPCS3's LZ
+  decoder returns 0 for a block stored plain (a first byte above 0x80), which would read nothing: the copied length is
+  returned. Damaged input cannot read or write past the buffers (the range decoder's input is bounds-checked, offsets
+  and lengths are checked before a copy), where RPCS3's could. Tests: RFC 4493's AES-CMAC examples, synthetic SDATA
+  files in thirteen layouts (flags 0x02, 0x08, 0x10, 0x20, compressed, debug data; NPD versions 1 to 4) read whole and
+  in pieces across blocks, a damaged block, wrong keys, EDATA, LZ noise; the lv2 open on an image and a host directory;
+  cellFsSdataOpen with the build's keys.
+- **SPURS.** _cellSpursWorkloadAttributeInitialize, cellSpursWorkloadAttributeSetName and
+  cellSpursAddWorkloadWithAttribute (a custom policy module, run by the native scheduler as cellSpursAddWorkload's,
+  D-051, with the attribute's names and shutdown hook in wklH1/wklF1 and event bit 2);
+  cellSpursAttributeEnableSpuPrintfIfAvailable (the flag); cellSpursAttributeEnableSystemWorkload (RPCS3's checks and
+  fields). An instance initialized with the system workload is now accepted: it lends SPUs to the system, and there is
+  no system here, as RPCS3's add_default_syswkl is a TODO. cellSpursSetGlobalExceptionEventHandler keeps the handler
+  (BUSY the second time); SPU exceptions still stop a native worker with a log rather than reach it.
+- **GCM.** cellGcmInitSystemMode: mode 1 makes the IO address space 512 MB (lv2's and cellGcmSys's main_mem_size, as
+  RPCS3's _cellGcmInitBody). cellGcmSetFlipHandler and cellGcmSetUserHandler: the interrupt thread now waits for the
+  vblank on an lv2 event queue of its own, where the RSX thread's flip listener and its new user-command listener
+  (Kernel::set_rsx_user_command_listener, GCM_SET_USER_COMMAND) post an event; it calls the flip handler with head 1
+  and the user handler with the command's argument, on itself, as RPCS3's interrupt thread does.
+- **Smaller ones.** sys_ppu_thread_once (under a "_lv2ppu" lv2 mutex, init called on the calling thread, the control
+  word set to 1), cellRtcGetCurrentClock, sceNpInit (np_init, offline as after sceNp2Init), lv2 syscall 254
+  sys_spu_thread_group_log (the on/off switch).
+
+The phone run after this shows L.A. Noire's next stops (its SPU code comes from its data files and runs interpreted in
+the first session).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

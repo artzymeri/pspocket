@@ -101,10 +101,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 
 ## Other games
 
-- **Seen:** L.A. Noire (BLES00933) boots and stops on about 77 unimplemented imports (cellSync mutexes, cellGcmSys flip
-  and system mode, cellSpurs workloads, sceNpInit, ...). Assassin's Creed (run 099): all imports now there (D-160);
-  title screen after D-161, its first level after D-162 (Joliet names).
-- **Try:** L.A. Noire's imports from its inventory (many are AC's, done). Assassin's Creed in its first level runs
+- **Seen:** L.A. Noire (BLES00933), prepared on the phone (2026-10-06), stopped before its first frame on
+  cellFsSdataOpen (its shaders are an encrypted SDATA file), cellSpursAddWorkloadWithAttribute and 12 more calls: all
+  in D-165 now. Its SPU code is in its data files, so its first session runs it interpreted. Assassin's Creed (run
+  099): all imports now there (D-160); title screen after D-161, its first level after D-162 (Joliet names).
+- **Try:** L.A. Noire on the phone with the D-165 build: its next stops. Engine-wide (the user, 2026-10-06): system
+  functions resolved by the engine like a PS3 links them (the firmware's modules wherever they can run, the native
+  ones complete as RPCS3 has them), SPU thread groups, the whole RSX feature set, instead of game by game. Assassin's Creed in its first level runs
   at 3 to 4 fps on the Mac: its SPU programs interpreted (16.5 billion instructions in 120 s; the phone's preparation
   lifts them, D-155, so try it there or run pspocket-prepare with --spu-images from a --spu-dump), the job loop
   interpreted after fiber switches (D-161), syscall 327 (page-fault notification) still missing.
