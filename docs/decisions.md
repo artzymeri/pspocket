@@ -4534,6 +4534,28 @@ tests/hle/gif_writer.hpp: 87a and 89a, global and local tables of 2 to 256 colou
 interlacing down to one row, code sizes 2 to 8, early clear codes, short sub-blocks, a full table with and without a
 clear, every extension kind, animations; six damaged files; eight call orders; stop and continue).
 
+## D-203 · 2026-10-07 · Jump tables: a bounds check that branches into the table code, and tail calls as a way out
+
+Assassin's Creed's switch at 0xa88f18 jumped through the interpreter 86 times a session ("indirect jump to 0x00a88fb4
+has no lifted function"). Its table address is in the game's data, two loads away (r30 from the TOC in the prologue,
+then the table's address from r30's block), and the analyzer reads it on its second pass with the prologue's
+constants (D-125's prefix constants). Two things threw that pass away:
+
+- **Tail calls.** The prefix constants hold only if nothing else in the function writes the register, apart from the
+  restores on the way out. Each case of this switch restores r30 and then branches to another function (GCC's tail
+  call), and only a restore running into `blr` counted as the way out. Now an unconditional branch out of the
+  function counts too; a restore followed by a branch back into the function still does not.
+- **The bounds check.** GCC put the table code at the branch target: `cmplwi cr7, r0, 4; ble cr7, table_code`, the
+  default case falling through to the epilogue. The matcher looked for the check only on the straight-line path into
+  the table code. When that code starts right after an unconditional exit, the one branch into it is now taken as the
+  guard (`ble`: max + 1 entries, `blt`: max), and the index must stay unchanged from the compare to the branch and
+  from the block's start to the table load. A second way into the block leaves the table unbounded, as before.
+
+Measured on the executables' translation: Assassin's Creed 599 to 620 tables, 144 to 64 analyzer warnings (80 tables
+bounded that were scanned before); GTA V 133 tables either way, 126 to 124 warnings. A guess made first (the words
+after the bctr taken as the table when the base cannot be read) was dropped: the base can be read, so it was not the
+cause, and nothing else needs it.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

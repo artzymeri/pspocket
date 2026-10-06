@@ -204,16 +204,38 @@ u64 copy_bits(const Inst& in)
 // The compared register is the index register itself, a copy of it made before the compare (SNC: "clrlwi r0, r9,
 // 24; cmplwi cr7, r0, 83" for an index masked to 8 bits), or the source of a copy made after it (GCC: "clrldi r9,
 // r3, 32" after "cmplwi cr7, r3, 5"). The compare bounds the index when it sees every index bit unchanged.
+// The check may also branch to the table code instead of past it: "cmplwi cr7, r0, 4; ble cr7, table_code" with the
+// default case falling through (GCC, Assassin's Creed's 0xa88f18). The table code's block then starts after an
+// unconditional terminator, and that branch is the only way into it.
 std::optional<u32> Walker::find_bound(u32 index_reg, u64 index_bits, u32 from_pc) const
 {
     u32 pc = from_pc;
     std::optional<Def> guard; // the conditional branch closest to the table code
+    bool taken = false;       // the table code is the guard's target (else its fall-through)
+    u32 block = 0;            // with taken: the start of the table code's block
     for (int i = 0; i < kSliceLimit; i++) {
-        if (pc < 4) break;
+        const bool in_fn = pc >= 4 && visited_->contains(pc - 4);
+        if (!in_fn || is_terminator(insn(pc - 4)) || is_call(insn(pc - 4))) {
+            // No straight-line predecessor. Nothing falls into a block after an unconditional terminator: the one
+            // branch into it may be the bounds check.
+            if (guard || !in_fn || !is_terminator(insn(pc - 4))) break;
+            std::optional<Def> into;
+            for (const u32 a : *visited_) {
+                const Inst b = insn(a);
+                if (!(b.flags() & rt::OPF_BRANCH) || b.op == Op::BCLR || b.op == Op::BCCTR) continue;
+                if (rt::branch_target(b, a) != pc) continue;
+                if (into || b.op != Op::BC || b.lk()) return std::nullopt;
+                into = Def{a, b};
+            }
+            if (!into) break;
+            guard = into;
+            taken = true;
+            block = pc;
+            pc = into->pc;
+            continue;
+        }
         pc -= 4;
-        if (!visited_->contains(pc)) break;
         const Inst in = insn(pc);
-        if (is_terminator(in) || is_call(in)) break;
         if (!guard) {
             if (in.op == Op::BC && !in.lk()) guard = Def{pc, in};
             continue;
@@ -224,23 +246,29 @@ std::optional<u32> Walker::find_bound(u32 index_reg, u64 index_bits, u32 from_pc
         if (in.op != Op::CMPLI) return std::nullopt;
         const u32 bo = guard->in.bo() & 0x1C, bi = guard->in.bi();
         u32 count;
-        if (bi == field * 4 + 1 && bo == 0x0C) count = in.uimm() + 1; // bgt: taken when the index > max
-        else if (bi == field * 4 + 0 && bo == 0x04) count = in.uimm(); // bge: taken when the index >= max
+        if (!taken && bi == field * 4 + 1 && bo == 0x0C) count = in.uimm() + 1; // bgt: taken when the index > max
+        else if (!taken && bi == field * 4 + 0 && bo == 0x04) count = in.uimm(); // bge: taken when the index >= max
+        else if (taken && bi == field * 4 + 1 && bo == 0x04) count = in.uimm() + 1; // ble: taken when the index <= max
+        else if (taken && bi == field * 4 + 0 && bo == 0x0C) count = in.uimm(); // blt: taken when the index < max
         else return std::nullopt;
+        // No write of reg on the way from a (in the compare's block) to b (in the table code's).
+        const auto kept_on_path = [&](u32 reg, u32 a, u32 b) {
+            return taken ? unchanged(reg, a, guard->pc) && unchanged(reg, block, b) : unchanged(reg, a, b);
+        };
         const u64 compared = in.l10() ? ~0ull : 0xFFFFFFFFull; // cmpldi / cmplwi
         const u32 c = in.ra();
         if (c == index_reg) {
-            if (unchanged(index_reg, pc + 4, from_pc)) return count;
+            if (kept_on_path(index_reg, pc + 4, from_pc)) return count;
             return std::nullopt;
         }
         // A copy of the index register, made before the compare.
         if (const auto d = find_gpr_def(c, pc); d && d->in.rs() == index_reg) {
             const u64 kept = copy_bits(d->in) & compared;
-            if (kept && (index_bits & ~kept) == 0 && unchanged(index_reg, d->pc + 4, from_pc)) return count;
+            if (kept && (index_bits & ~kept) == 0 && kept_on_path(index_reg, d->pc + 4, from_pc)) return count;
         }
-        // The index register as a copy of the compared one, made after the compare.
+        // The index register as a copy of the compared one, made after the compare (in the table code's block).
         if (const auto d = find_gpr_def(index_reg, from_pc); d && d->pc > pc && d->in.rs() == c && copy_bits(d->in)) {
-            if (unchanged(c, pc + 4, d->pc) && unchanged(index_reg, d->pc + 4, from_pc)) return count;
+            if (kept_on_path(c, pc + 4, d->pc) && unchanged(index_reg, d->pc + 4, from_pc)) return count;
         }
         return std::nullopt;
     }
@@ -429,11 +457,14 @@ std::map<u32, std::pair<u64, u32>> Walker::prefix_constants(const Function& f) c
     }
     // Writes on the way out do not count: they run straight into a return, and anything that reads the register after
     // them finds them in its backward slice. SNC's functions branch to shared helpers that restore the saved registers,
-    // and those become the function's own code (GTA V's script VM restores its table base there).
+    // and those become the function's own code (GTA V's script VM restores its table base there). A tail call leaves
+    // the same way: GCC restores the saved registers, then branches to another function (Assassin's Creed's switch
+    // at 0xa88f18, whose cases restore its table base r30, then tail-call).
     const auto on_way_out = [&](u32 a) {
         for (u32 next = a + 4, n = 0; n < kSliceLimit && body.contains(next); next += 4, n++) {
             const Inst in = insn(next);
             if (in.op == Op::BCLR && !in.lk() && always_taken(in)) return true;
+            if (in.op == Op::B && !in.lk() && !body.contains(rt::branch_target(in, next))) return true;
             if (is_terminator(in) || is_call(in) || (in.flags() & rt::OPF_BRANCH)) return false;
         }
         return false;

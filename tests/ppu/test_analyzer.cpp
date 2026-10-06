@@ -337,3 +337,108 @@ TEST_CASE("step-mode lifting stores the next pc")
     CHECK(s.find("ctx->cia = next;") != std::string::npos);
     CHECK_THROWS(lift_step_function("bad", 0x00000000, kBase));
 }
+
+namespace {
+
+// GCC's switch in Assassin's Creed's 0xa88e78 (run 109): the table base comes through two loads from data (r30 from
+// the TOC in the prologue, the table address from r30's block), the bounds check branches to the table code ("ble
+// cr7") with the default case falling through to the epilogue, and every case restores r30 and tail-calls. One way to
+// break it per variant.
+enum class GccFlaw { None, SecondWayIn, CaseLoopsBack };
+
+struct GccSwitch {
+    CodeImage image;
+    u32 toc = 0, table = 0, other = 0;
+    std::vector<u32> cases;
+};
+
+GccSwitch gcc_switch(GccFlaw flaw)
+{
+    using L = as::Assembler::Label;
+    as::Assembler a(kBase);
+    const L table_code = a.new_label(), table = a.new_label(), other = a.new_label(), toc = a.new_label(),
+            pointer = a.new_label();
+    L cases[5];
+    for (L& l : cases) l = a.new_label();
+    const auto epilogue = [&] {
+        a.emit(as::ld(0, 160, 1));
+        a.emit(as::ld(30, 128, 1));
+        a.emit(as::mtlr(0));
+        a.emit(as::addi(1, 1, 144));
+    };
+    a.emit(as::stdu(1, -144, 1));
+    a.emit(as::mflr(0));
+    a.emit(as::std_(30, 128, 1));
+    a.emit(as::std_(0, 160, 1));
+    a.emit(as::lwz(30, 0, 2)); // r30: a pointer from the TOC
+    a.emit(as::lwz(0, 0, 3));
+    a.emit(as::srwi(0, 0, 29));
+    a.emit(as::cmplwi(7, 0, 4));
+    a.ble(7, table_code);
+    if (flaw == GccFlaw::SecondWayIn) {
+        a.emit(as::cmpwi(6, 4, 0));
+        a.beq(6, table_code); // the index is not checked on this way in
+    }
+    epilogue();
+    a.emit(as::blr());
+    a.bind(table_code);
+    a.emit(as::lwz(11, 8, 30)); // the table's address, from r30's block
+    a.emit(as::rldic(9, 0, 2, 59));
+    a.emit(as::lwzx(0, 9, 11));
+    a.emit(as::extsw(0, 0));
+    a.emit(as::add(0, 0, 11));
+    a.emit(as::mtctr(0));
+    a.emit(as::bctr());
+    a.bind(table);
+    for (const L& l : cases) a.label_offset_word(l, table);
+    for (u32 i = 0; i < 5; i++) {
+        a.bind(cases[i]);
+        a.emit(as::li(3, static_cast<s32>(i)));
+        if (flaw == GccFlaw::CaseLoopsBack && i == 4) {
+            a.emit(as::addi(30, 30, 4)); // r30 changes, and the table code reads it again
+            a.b(table_code);
+            continue;
+        }
+        epilogue();
+        a.b(other);
+    }
+    a.bind(other);
+    a.emit(as::blr());
+    a.bind(toc);
+    a.label_word(pointer);
+    a.bind(pointer);
+    a.word(0);
+    a.word(0);
+    a.label_word(table);
+    std::vector<u8> bytes = a.finish();
+    std::vector<u32> case_addresses;
+    for (const L& l : cases) case_addresses.push_back(a.address(l));
+    return GccSwitch{CodeImage(kBase, std::move(bytes)), a.address(toc), a.address(table), a.address(other),
+        std::move(case_addresses)};
+}
+
+} // namespace
+
+TEST_CASE("analyzer: a table base loaded through data, a bounds check into the table code, cases that tail-call")
+{
+    for (const GccFlaw flaw : {GccFlaw::None, GccFlaw::SecondWayIn, GccFlaw::CaseLoopsBack}) {
+        INFO("flaw " << static_cast<int>(flaw));
+        const GccSwitch s = gcc_switch(flaw);
+        const Seed seeds[] = {{kBase, s.toc, "f"}, {s.other, s.toc, "other"}};
+        const Program p = analyze(s.image, seeds);
+        const Function* f = p.find(kBase);
+        REQUIRE(f != nullptr);
+        if (flaw == GccFlaw::CaseLoopsBack) {
+            CHECK(f->jump_tables.empty()); // r30 is not the prologue's value at the table code
+            continue;
+        }
+        REQUIRE(f->jump_tables.size() == 1);
+        const JumpTable& t = f->jump_tables.begin()->second;
+        CHECK(t.relative);
+        CHECK(t.table == s.table);
+        CHECK(t.bounded == (flaw == GccFlaw::None));
+        REQUIRE(t.targets.size() == 5);
+        for (u32 i = 0; i < 5; i++) CHECK(t.targets[i] == s.cases[i]);
+        CHECK(f->tail_calls.contains(s.other));
+    }
+}
