@@ -2731,6 +2731,20 @@ has one (type 2 with %/@, %/C or %/E), its names as UTF-8, lookups still ignorin
 primary descriptor's. RPCS3's Loader/ISO.cpp reads the last of the two as well. Test: a synthetic image with a cut
 primary name and the whole Joliet name.
 
+## D-163 · 2026-10-06 · 24-bit depth textures from memory are decoded, and HILO and Y16_X16_FLOAT
+
+Assassin's Creed's first level samples DEPTH24_D8 textures from memory that no depth buffer the backend drew covers
+(a buffer the CPU or a copy filled): "texture format DEPTH24_D8 is not decoded yet", 264,615 times in 330 s (run
+099), each such draw left without its texture. Both 24-bit depth formats now decode, on the CPU and in the compute
+decoder, to R32Float read in every channel as DEPTH16 already was (RPCS3 VKFormats.cpp get_component_mapping):
+DEPTH24_D8 as the top 24 bits unsigned normalized (the stencil byte dropped), DEPTH24_D8_FLOAT as the 24-bit float
+there, `bits << 7` into a float (RPCS3 ShuffleBytes.glsl d24f_to_f32). Depth buffers the backend drew are still
+sampled directly (D-106). Three more formats no game could use before decode the same way, with RPCS3's channel
+mappings ((A, R, G, B) = {R, G, R, G}): COMPRESSED_HILO8 (RG8, LO in red as RPCS3's R8G8 upload of the big-endian
+word), COMPRESSED_HILO_S8 (signed, kept in RGBA16F) and Y16_X16_FLOAT (RG16F). Still not decoded: DEPTH16_FLOAT and
+the 4:2:2 formats (COMPRESSED_B8R8_G8R8, R8B8_R8G8), which RPCS3 itself marks untested. Tests: the CPU decoder's values
+for each, and the compute decoder against it.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
