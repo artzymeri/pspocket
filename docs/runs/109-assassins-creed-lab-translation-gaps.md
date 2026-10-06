@@ -1,4 +1,4 @@
-# Runs 109–118 · Assassin's Creed in the Abstergo lab: what still ran in the interpreters
+# Runs 109–119 · Assassin's Creed in the Abstergo lab: what still ran in the interpreters
 
 2026-10-06 night to 2026-10-07 · pspocket-boot with the library prepared on the Mac (`pspocket-prepare --spu-images
 inventory/BLES00158/spu-images`) · M4 Mac · Assassin's Creed (BLES00158), firmware 4.92 · the scripted walk
@@ -20,6 +20,8 @@ renders right now. No unimplemented calls in any of these runs. Logs in inventor
 | 115 | jump tables (D-203); `--log debug` | none | 59.5 | **0** | 11.2 billion | 200 s; the DMAs that drop SPU programs logged |
 | 116 | D-204, D-205; prepared again | none | **60.0** | 0 | **0** | 380 s; 1.2 CPU cores busy instead of 3.6 |
 | 117 | D-206; prepared again with run 116's misses as seeds | Metal | **51.0** | 0 | 0 | 380 s, frames saved: the screens, the menu (CONTINUE), the Animus loading, the lab |
+| 118 | D-207; `--spu-dump` to scratch | none | | | | 230 s: the module's 56 copies saved; the PPU's share measured |
+| 119 | D-208; the copies in the images, prepared again | Metal | **54.8** | 0 | 0 | 380 s: SPU code interpreted in the whole session, 184 instructions; every image found |
 
 "none": pspocket-boot without `--frames` or `--gpu metal` runs the GPU commands without drawing (the null backend), so
 those fps say how fast the CPU side is, not the game on screen. Runs 114 and 116 are the fair pair for the SPU fix.
@@ -88,3 +90,12 @@ in 230 s, about 14 instructions each. 0xcf6d90 is the return address of the setj
 (0xcf6d38); every resumed fiber lands there through a longjmp (D-161) and runs those few instructions interpreted
 before it returns to translated code. About 1,000 a second, each one exception throw: under 1% of a core. Translating
 the code after a setjmp as an entry (improve.md, "Fibers") can wait.
+
+## Run 119: nothing SPU-side left interpreted
+
+With D-208 and the 57 saved copies in the game's image folder (prepared: 22 programs, 56 copies merged into the one
+module program): "SPU program loads: 899,268 lifted, 0 interpreted (0 images without a lifted program)", and the SPU
+interpreter ran 184 instructions in the whole session (one entry in the module at 0x33990, a seed for next time).
+Median 54.8 fps with the GPU drawing; 49 to 52 then 55 to 60 in the Animus. The PPU interpreter: the fiber resumes only
+(5.2 million instructions from 502,315 entries at 0xcf6d90 in 380 s).
+
