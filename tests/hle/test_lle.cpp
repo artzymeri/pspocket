@@ -331,6 +331,85 @@ TEST_CASE("Run-time modules: a game's own PRX loaded by path, started (its expor
 }
 
 
+TEST_CASE("Run-time modules: by descriptor at an offset, on a memory container; the list, info and lookup by address "
+          "(D-184)", "[hle][lle][prx]")
+{
+    const fs::path root = fresh_flash("pspocket-test-prx-info");
+    const auto prx = test::build_ppu_prx();
+    std::vector<u8> module = prx_exporting(prx, "synthLib", 0xDEADBEEF);
+    const std::vector<u8> self = debug_self(module);
+    std::vector<u8> archive(0x40, 0xA5); // a header of the game's own before the module
+    archive.insert(archive.end(), self.begin(), self.end());
+    fs::create_directories(root / "usrdir");
+    write(root / "usrdir" / "pack.bin", archive);
+    write(root / "usrdir" / "libsynth.sprx", self);
+
+    const auto x = test::build_ppu_exec();
+    auto exe = loader::Executable::parse(x.bytes);
+    REQUIRE(exe);
+    hle::test::Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/app_home", (root / "usrdir").string(), true));
+    REQUIRE(loader::load(**exe, *f.kernel, *f.hle) == lv2::CELL_OK);
+    loader::RuntimeModules modules(*f.hle, *exe, nullptr);
+    f.hle->set_module_loader(&modules);
+    u8* base = f.base();
+    hle::test::GuestThread t(f, 0, "main");
+    const u32 path = hle::test::kData, fd = hle::test::kData + 0x100, list = hle::test::kData + 0x200,
+              ids = hle::test::kData + 0x240, info = hle::test::kData + 0x300, name = hle::test::kData + 0x400,
+              segs = hle::test::kData + 0x500;
+    const auto put = [&](u32 at, std::string_view text) {
+        std::memcpy(base + at, text.data(), text.size());
+        base[at + text.size()] = 0;
+    };
+
+    // By descriptor, 0x40 bytes in; and by path on a memory container (no containers for modules: as usual).
+    put(path, "/app_home/pack.bin");
+    REQUIRE(t.call("cellFsOpen", path, 0, fd, 0, 0) == 0);
+    const u64 id1 = t.call("sys_prx_load_module_by_fd", ps_read32(base, fd), 0x40, 0, 0);
+    REQUIRE(static_cast<s32>(id1) > 0);
+    CHECK(t.call("sys_prx_load_module_by_fd", 99, 0, 0, 0) == hle::test::r3_of(lv2::CELL_EBADF));
+    put(path, "/app_home/libsynth.sprx");
+    const u64 id2 = t.call("sys_prx_load_module_on_memcontainer", path, 0x12345, 0, 0);
+    REQUIRE(static_cast<s32>(id2) > 0);
+    CHECK(id2 != id1);
+
+    // The list: both, oldest first.
+    std::memset(base + list, 0, 0x20);
+    ps_write64(base, list, 0x20);
+    ps_write32(base, list + 8, 8);
+    ps_write32(base, list + 16, ids);
+    REQUIRE(t.call("sys_prx_get_module_list", 2, list) == 0);
+    CHECK(ps_read32(base, list + 12) == 2);
+    CHECK(ps_read32(base, ids) == id1);
+    CHECK(ps_read32(base, ids + 4) == id2);
+
+    // The info: name, the path, segments where they went; lookup by an address inside one.
+    std::memset(base + info, 0, 0x58);
+    ps_write64(base, info, 0x48);
+    ps_write32(base, info + 0x38, name);
+    ps_write32(base, info + 0x3C, 0x100);
+    ps_write32(base, info + 0x40, segs);
+    ps_write32(base, info + 0x44, 4);
+    REQUIRE(t.call("sys_prx_get_module_info", id1, 0, info) == 0);
+    const loader::PrxModule* loaded = modules.module(static_cast<u32>(id1));
+    REQUIRE(loaded != nullptr);
+    CHECK(std::string(reinterpret_cast<const char*>(base + info + 8)) == loaded->name);
+    CHECK(std::string(reinterpret_cast<const char*>(base + name)) == "/app_home/pack.bin");
+    CHECK(ps_read32(base, info + 0x34) == loaded->segments.size());
+    CHECK(ps_read32(base, info + 0x44) == std::min<usize>(4, loaded->segments.size()));
+    CHECK(ps_read64(base, segs) == loaded->segments[0].first);
+    CHECK(ps_read64(base, segs + 0x10) == loaded->segments[0].second);
+    CHECK(t.call("sys_prx_get_module_id_by_address", loaded->segments[0].first + 4) == id1);
+    CHECK(t.call("sys_prx_get_module_id_by_address", 0x00010000) == hle::test::r3_of_code(0x8001112E)); // the game's
+    ps_write64(base, info, 0x40);
+    CHECK(t.call("sys_prx_get_module_info", id1, 0, info) == hle::test::r3_of(lv2::CELL_EINVAL));
+    ps_write64(base, info, 0x48);
+    CHECK(t.call("sys_prx_get_module_info", 0x23FFFFFF, 0, info) == hle::test::r3_of_code(0x8001112E));
+    CHECK(t.call("sys_prx_unregister_library", 0x1000) == 0);
+    f.hle->set_module_loader(nullptr);
+    fs::remove_all(root);
+}
+
 // D-175: the per-game choice. Synthetic firmware modules (debug SELFs) in a /dev_flash; the "game" is the list of what
 // it imports. A module runs as it is when the host lacks a function the game imports from it (or the game imports a
 // variable of it) and everything the module needs resolves; else its libraries stay on the host.

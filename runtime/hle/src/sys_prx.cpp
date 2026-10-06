@@ -4,6 +4,8 @@
 // The loader does the placing and linking (HleProcess::module_loader, runtime/loader RuntimeModules); this file runs
 // the module's start and stop functions on the calling thread and keeps the order of the calls.
 
+#include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -12,6 +14,7 @@
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/lv2/syscalls.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -154,6 +157,137 @@ s32 sys_prx_get_module_id_by_name(PPUContext& ctx, u32 name, u64 /*flags*/, u32 
     return code(id);
 }
 
+// sys_prx_load_module_on_memcontainer(path, mem_ct, flags, pOpt): there are no memory containers for modules here;
+// the module loads as with sys_prx_load_module.
+s32 sys_prx_load_module_on_memcontainer(PPUContext& ctx, u32 path, u32 /*mem_ct*/, u64 flags, u32 /*opt*/)
+{
+    std::lock_guard lock(HleProcess::current()->state<PrxCalls>().mutex);
+    return load(ctx, path, flags);
+}
+
+s32 sys_prx_load_module_list_on_memcontainer(PPUContext& ctx, s32 count, u32 path_list, u32 /*mem_ct*/, u64 flags,
+    u32 opt, u32 id_list)
+{
+    return sys_prx_load_module_list(ctx, count, path_list, flags, opt, id_list);
+}
+
+// sys_prx_load_module_by_fd(fd, offset, flags, pOpt): a module `offset` bytes into an open file (one inside an
+// archive), read through the file's path.
+s32 sys_prx_load_module_by_fd(PPUContext& ctx, s32 fd, u64 offset, u64 flags, u32 /*opt*/)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (flags) return code(lv2::CELL_EINVAL);
+    StackVar v(ctx, t.kernel.base(), 0x430); // the descriptor, then its path
+    ps_write32(t.kernel.base(), v.addr(), static_cast<u32>(fd));
+    if (const s32 r = lv2::sys_fs_test(t, 6, 0, v.addr(), 4, v.addr() + 0x10, 0x420); r != lv2::CELL_OK) return r;
+    const std::string p = guest_string(t, v.addr() + 0x10, 0x420);
+    ModuleLoader* l = loader_of(ctx);
+    if (!l) return code(kPrxNoLoader);
+    std::lock_guard lock(HleProcess::current()->state<PrxCalls>().mutex);
+    u32 id = 0;
+    const u32 r = l->load_at(p, offset, &id);
+    if (r != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "sys_prx_load_module_by_fd(fd {} = {}, offset {:#x}): {:#010x}", fd, p, offset, r);
+        return code(r);
+    }
+    PS_LOG_INFO(kChan, "sys_prx_load_module_by_fd(fd {} = {}, offset {:#x}): id {:#x}", fd, p, offset, id);
+    return code(id);
+}
+
+s32 sys_prx_load_module_on_memcontainer_by_fd(PPUContext& ctx, s32 fd, u64 offset, u32 /*mem_ct*/, u64 flags, u32 opt)
+{
+    return sys_prx_load_module_by_fd(ctx, fd, offset, flags, opt);
+}
+
+// RPCS3 _sys_prx_get_module_id_by_address: the module whose segments hold addr.
+s32 sys_prx_get_module_id_by_address(PPUContext& ctx, u32 addr)
+{
+    ModuleLoader* l = loader_of(ctx);
+    const u32 id = l ? l->id_by_address(addr) : 0;
+    return id ? code(id) : code(kPrxErrorUnknownModule);
+}
+
+// The calling module: the one whose code the return address is in (RPCS3: by the LR).
+s32 sys_prx_get_my_module_id(PPUContext& ctx) { return sys_prx_get_module_id_by_address(ctx, static_cast<u32>(ctx.lr)); }
+
+// sys_prx_get_module_list(flags, sys_prx_get_module_list_t* info {u64 size; u32 max; u32 count; u32* idlist}).
+s32 sys_prx_get_module_list(PPUContext& ctx, u64, u32 info)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!info || !guest_readable(t, info, 20)) return code(lv2::CELL_EINVAL);
+    const u32 max = ps_read32(base, info + 8), idlist = ps_read32(base, info + 16);
+    if (!idlist) return code(lv2::CELL_EINVAL);
+    ModuleLoader* l = loader_of(ctx);
+    const std::vector<u32> ids = l ? l->list() : std::vector<u32>{};
+    u32 count = 0;
+    for (; count < max && count < ids.size(); count++) {
+        if (!guest_readable(t, idlist + 4 * count, 4)) return code(lv2::CELL_EFAULT);
+        ps_write32(base, idlist + 4 * count, ids[count]);
+    }
+    ps_write32(base, info + 12, count);
+    return lv2::CELL_OK;
+}
+
+// sys_prx_get_module_info(id, flags, sys_prx_module_info_t* info): RPCS3's _sys_prx_get_module_info. The info's
+// size is 0x48 (or 0x58 with the exports and imports ranges); the file name and segments go where the caller says.
+s32 sys_prx_get_module_info(PPUContext& ctx, u32 id, u64, u32 info)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!info) return code(lv2::CELL_EINVAL);
+    if (!guest_readable(t, info, 0x48)) return code(lv2::CELL_EFAULT);
+    const u64 size = ps_read64(base, info);
+    if (size != 0x48 && size != 0x58) return code(lv2::CELL_EINVAL);
+    if (size == 0x58 && !guest_readable(t, info, 0x58)) return code(lv2::CELL_EFAULT);
+    ModuleLoader* l = loader_of(ctx);
+    ModuleInfo m;
+    if (!l || !l->info(id, m)) return code(kPrxErrorUnknownModule);
+    std::memset(base + info + 8, 0, 30);
+    std::memcpy(base + info + 8, m.name.data(), std::min<usize>(m.name.size(), 29));
+    ps_write8(base, info + 0x26, m.version[0]);
+    ps_write8(base, info + 0x27, m.version[1]);
+    ps_write32(base, info + 0x28, m.attributes);
+    ps_write32(base, info + 0x2C, m.start); // the descriptors (RPCS3 lv2_prx::start.addr())
+    ps_write32(base, info + 0x30, m.stop);
+    ps_write32(base, info + 0x34, static_cast<u32>(m.segments.size()));
+    const u32 filename = ps_read32(base, info + 0x38), filename_size = ps_read32(base, info + 0x3C);
+    if (filename && filename_size) {
+        if (!guest_readable(t, filename, filename_size)) return code(lv2::CELL_EFAULT);
+        const usize n = std::min<usize>(m.path.size(), filename_size - 1);
+        std::memcpy(base + filename, m.path.data(), n);
+        base[filename + n] = 0;
+    }
+    if (const u32 segments = ps_read32(base, info + 0x40)) {
+        const u32 room = ps_read32(base, info + 0x44);
+        u32 i = 0;
+        for (; i < m.segments.size() && i < room; i++) {
+            const u32 at = segments + 0x28 * i; // sys_prx_segment_info_t: base, filesz, memsz, index, type (u64 each)
+            if (!guest_readable(t, at, 0x28)) return code(lv2::CELL_EFAULT);
+            ps_write64(base, at + 0x00, m.segments[i].base);
+            ps_write64(base, at + 0x08, m.segments[i].filesz);
+            ps_write64(base, at + 0x10, m.segments[i].memsz);
+            ps_write64(base, at + 0x18, i);
+            ps_write64(base, at + 0x20, 1); // PT_LOAD
+        }
+        ps_write32(base, info + 0x44, i);
+    }
+    if (size == 0x58) {
+        ps_write32(base, info + 0x48, m.exports.first);
+        ps_write32(base, info + 0x4C, m.exports.second - m.exports.first);
+        ps_write32(base, info + 0x50, m.imports.first);
+        ps_write32(base, info + 0x54, m.imports.second - m.imports.first);
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3's _sys_prx_unregister_library is a stub: CELL_OK.
+s32 sys_prx_unregister_library(PPUContext&, u32 lib_entry)
+{
+    PS_LOG_WARN(kChan, "sys_prx_unregister_library({:#x}): nothing to do (RPCS3)", lib_entry);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 s32 prx_load_module(PPUContext& ctx, u32 path, u64 flags) { return sys_prx_load_module(ctx, path, flags, 0); }
@@ -179,6 +313,15 @@ void register_sys_prx(Registry& r)
         PS_HLE_FUNC(0x80FB0C19, sys_prx_stop_module),
         PS_HLE_FUNC(0xF0AECE0D, sys_prx_unload_module),
         PS_HLE_FUNC(0xE0998DBF, sys_prx_get_module_id_by_name),
+        PS_HLE_FUNC(0xAA6D9BFF, sys_prx_load_module_on_memcontainer),
+        PS_HLE_FUNC(0xE7EF3A80, sys_prx_load_module_list_on_memcontainer),
+        PS_HLE_FUNC(0xEF68C17C, sys_prx_load_module_by_fd),
+        PS_HLE_FUNC(0xA330AD84, sys_prx_load_module_on_memcontainer_by_fd),
+        PS_HLE_FUNC(0x0341BB97, sys_prx_get_module_id_by_address),
+        PS_HLE_FUNC(0x74311398, sys_prx_get_my_module_id),
+        PS_HLE_FUNC(0xA5D06BF0, sys_prx_get_module_list),
+        PS_HLE_FUNC(0x84BB6774, sys_prx_get_module_info),
+        PS_HLE_FUNC(0xD0EA47A7, sys_prx_unregister_library),
     });
 }
 

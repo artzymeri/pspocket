@@ -16,6 +16,7 @@
 // RSX, audio, input, files, network, sysutil and its dialogs, devices). Before decide() (tests, runtime loads with no
 // decision), a module file goes LLE only when the host implements none of its libraries (D-157).
 
+#include <array>
 #include <functional>
 #include <map>
 #include <memory>
@@ -41,6 +42,10 @@ struct PrxModule {
     std::string file; // its file in /dev_flash/sys/external ("libsync2.sprx"); empty for load_prx
     u32 toc = 0;
     std::vector<std::pair<u32, u32>> segments;             // where its segments went: (address, size)
+    std::vector<u64> segment_filesz;                       // each placed segment's file size, as `segments`
+    u16 attributes = 0;                                    // the module info's (sys_prx_get_module_info)
+    std::array<u8, 2> version{};
+    std::pair<u32, u32> exports{}, imports{};               // the module info's ranges (start, end)
     std::map<std::pair<std::string, u32>, u32> functions; // exported (library, NID) -> function descriptor
     std::map<std::pair<std::string, u32>, u32> variables; // exported (library, NID) -> variable address
     u32 start = 0, stop = 0;                              // module_start, module_stop descriptors (0: none)
@@ -173,6 +178,10 @@ public:
     ~RuntimeModules() override;
 
     u32 load(std::string_view path, u32* id) override;
+    u32 load_at(std::string_view path, u64 offset, u32* id) override;
+    u32 id_by_address(u32 addr) override;
+    std::vector<u32> list() override;
+    bool info(u32 id, hle::ModuleInfo& out) override;
     u32 start(u32 id, u32* entry) override;
     void started(u32 id, s32 result) override;
     u32 stop(u32 id, u32* entry) override;

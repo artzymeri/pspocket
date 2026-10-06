@@ -1189,3 +1189,25 @@ TEST_CASE("sys_game_process_exitspawn2: RPCS3's flags, and the atexitspawn or at
         CHECK(logs.count(log::Level::Info, "sysPrxForUser", "handler") == 0);
     }
 }
+
+TEST_CASE("sys_libc: memcpy, memset, memmove and memcmp under their C names (RPCS3, D-184)", "[hle][libc]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "libc");
+    u8* b = f.base();
+    for (const char* name : {"memcpy", "memset", "memmove", "memcmp"}) {
+        INFO(name);
+        CHECK(GuestThread::find(name).module == "sys_libc");
+    }
+    const u32 a = kData + 0x100, c = kData + 0x200;
+    std::memcpy(b + a, "abcdefgh", 8);
+    CHECK(g.call("memcpy", c, a, 8) == c);
+    CHECK(std::memcmp(b + c, "abcdefgh", 8) == 0);
+    CHECK(g.call("memmove", a + 2, a, 6) == a + 2); // overlapping
+    CHECK(std::memcmp(b + a, "ababcdef", 8) == 0);
+    CHECK(g.call("memset", c, 'z', 3) == c);
+    CHECK(std::memcmp(b + c, "zzzdefgh", 8) == 0);
+    CHECK(g.call("memcmp", a, a, 8) == 0);
+    CHECK(g.call("memcmp", a, c, 8) == 0xFFFFFFFFull); // 'a' < 'z': -1, zero-extended as RPCS3's u32
+    CHECK(g.call("memcmp", c, a, 8) == 1);
+}

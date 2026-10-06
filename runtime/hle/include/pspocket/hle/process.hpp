@@ -3,6 +3,7 @@
 // Per-process HLE state: the main-area allocator, the import linkage (host functions reachable from guest code) and
 // the TLS template. One HleProcess exists while a guest process runs; HLE functions reach it with current().
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -65,11 +66,34 @@ struct GameInfo {
 // Modules the game loads while it runs (sys_prx_load_module and the rest, D-159): the loader's (runtime/loader
 // RuntimeModules), installed in the process before guest threads run. Each call returns CELL_OK or a CELL_PRX_ERROR /
 // CELL_E* code; the HLE functions in sys_prx.cpp run the start and stop functions on the calling thread.
+// What sys_prx_get_module_info reports of a loaded module (RPCS3 lv2_prx).
+struct ModuleInfo {
+    std::string name, path;
+    std::array<u8, 2> version{};
+    u16 attributes = 0;
+    u32 start = 0, stop = 0; // module_start, module_stop descriptors
+    struct Segment {
+        u32 base = 0;
+        u64 filesz = 0, memsz = 0;
+    };
+    std::vector<Segment> segments;
+    std::pair<u32, u32> exports{}, imports{};
+};
+
 class ModuleLoader {
 public:
     virtual ~ModuleLoader() = default;
     // Places and links the module at guest path `path`; its ID in *id.
     virtual u32 load(std::string_view path, u32* id) = 0;
+    // The same for a module that starts `offset` bytes into the file (sys_prx_load_module_by_fd: one inside an
+    // archive). Loaders without it take offset 0 only.
+    virtual u32 load_at(std::string_view path, u64 offset, u32* id) { return offset ? 0x80011881 : load(path, id); }
+    // The loaded module whose segments hold `addr`; 0 when none.
+    virtual u32 id_by_address(u32) { return 0; }
+    // The loaded modules' IDs, oldest first.
+    virtual std::vector<u32> list() { return {}; }
+    // A loaded module's information; false for an unknown ID.
+    virtual bool info(u32, ModuleInfo&) { return false; }
     // Its exports linked into the imports waiting for them; *entry its module_start descriptor (0: none).
     virtual u32 start(u32 id, u32* entry) = 0;
     // module_start returned `result` (SYS_PRX_RESIDENT 0: it stays; else it goes).

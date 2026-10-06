@@ -144,6 +144,16 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
         }
         std::memcpy(base + seg.addr, seg.bytes.data(), seg.memsz);
         out->segments.emplace_back(seg.addr, seg.memsz);
+        u64 filesz = seg.memsz; // the PT_LOAD this segment came from (one each, in order)
+        usize load_index = 0, placed_index = static_cast<usize>(&seg - placed->segments.data());
+        for (const recomp::ProgramHeader& ph : elf.segments()) {
+            if (ph.type != 1) continue;
+            if (load_index++ == placed_index) {
+                filesz = ph.filesz;
+                break;
+            }
+        }
+        out->segment_filesz.push_back(filesz);
     }
     for (const std::string& e : placed->errors) PS_LOG_ERROR(kChan, "{}", e);
     out->relocations = placed->relocations;
@@ -158,9 +168,13 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
     // the first segment at the first program header's p_paddr - p_offset.
     const u32 info = placed->segments[0].addr + static_cast<u32>(first->paddr - first->offset);
     out->name = guest_string(base, info + 4, 28);
+    out->attributes = ps_read16(base, info);
+    out->version = {ps_read8(base, info + 2), ps_read8(base, info + 3)};
     out->toc = ps_read32(base, info + 0x20);
     const u32 exports_start = ps_read32(base, info + 0x24), exports_end = ps_read32(base, info + 0x28);
     *imports = {ps_read32(base, info + 0x2C), ps_read32(base, info + 0x30)};
+    out->exports = {exports_start, exports_end};
+    out->imports = *imports;
     // Exports (ppu_prx_module_info: u8 size, u8, u16 version, u16 attributes, u16 num_func, u16 num_var, u16
     // num_tlsvar, u8, u8, u8[2], name, nids, addrs, ...). Attribute 0x0001: a library; 0x8000 alone: the nameless
     // management library (module_start, module_stop); neither: ignored.
@@ -754,7 +768,9 @@ u32 RuntimeModules::link_variable(std::string_view library, u32 nid, std::string
     return 0;
 }
 
-u32 RuntimeModules::load(std::string_view path, u32* id)
+u32 RuntimeModules::load(std::string_view path, u32* id) { return load_at(path, 0, id); }
+
+u32 RuntimeModules::load_at(std::string_view path, u64 offset, u32* id)
 {
     std::lock_guard lock(mutex_);
     auto e = std::make_unique<Entry>();
@@ -763,6 +779,10 @@ u32 RuntimeModules::load(std::string_view path, u32* id)
     const std::string file = (path.starts_with(kFirmwareInternal) ? std::string(kInternal) : std::string()) +
         fs::path(e->path).filename().string();
     const auto syscall_bound = [this](u32 n) { return hle_.kernel().syscall_bound(n); };
+    if (offset && (path.starts_with(kFirmware) || path.starts_with(kFirmwareInternal))) {
+        PS_LOG_ERROR(kChan, "{} at offset {:#x}: firmware modules load from their own files only", path, offset);
+        return kPrxErrorUnsupportedType;
+    }
     if (path.starts_with(kFirmware) || path.starts_with(kFirmwareInternal)) {
         // A firmware module by its path: as it is when chosen for the game (D-175), or when the host replaces none of it
         // (it joins, with the modules it needs); else empty (the host's functions serve its libraries).
@@ -781,6 +801,10 @@ u32 RuntimeModules::load(std::string_view path, u32* id)
     } else {
         std::vector<u8> bytes;
         if (!hle_.kernel().vfs_read_file(path, bytes)) return kNoEntry;
+        if (offset) { // a module inside an archive (sys_prx_load_module_by_fd)
+            if (offset >= bytes.size()) return kPrxErrorUnsupportedType;
+            bytes.erase(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+        }
         std::vector<u8> elf;
         if (bytes.size() >= 4 && bytes[0] == 0x7F && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F') {
             elf = std::move(bytes);
@@ -897,6 +921,49 @@ u32 RuntimeModules::unload(u32 id)
     // Its memory stays: code of it may still sit in a caller's frames or in function pointers the game kept.
     e->state = State::Unloaded;
     return kOk;
+}
+
+u32 RuntimeModules::id_by_address(u32 addr)
+{
+    std::lock_guard lock(mutex_);
+    for (const auto& e : entries_) {
+        if (e->state == State::Unloaded || !e->module) continue;
+        for (const auto& [base, size] : e->module->segments)
+            if (size && addr >= base && addr - base < size) return e->id;
+    }
+    return 0;
+}
+
+std::vector<u32> RuntimeModules::list()
+{
+    std::lock_guard lock(mutex_);
+    std::vector<u32> ids;
+    for (const auto& e : entries_)
+        if (e->state != State::Unloaded) ids.push_back(e->id);
+    return ids;
+}
+
+bool RuntimeModules::info(u32 id, hle::ModuleInfo& out)
+{
+    std::lock_guard lock(mutex_);
+    const Entry* e = find(id);
+    if (!e || e->state == State::Unloaded) return false;
+    out = {};
+    out.path = e->path;
+    if (const PrxModule* m = e->module) { // an empty module (the host serves it) has no more to say
+        out.name = m->name;
+        out.version = m->version;
+        out.attributes = m->attributes;
+        out.start = m->start;
+        out.stop = m->stop;
+        for (usize i = 0; i < m->segments.size(); i++) {
+            const u64 filesz = i < m->segment_filesz.size() ? m->segment_filesz[i] : m->segments[i].second;
+            out.segments.push_back({m->segments[i].first, filesz, m->segments[i].second});
+        }
+        out.exports = m->exports;
+        out.imports = m->imports;
+    }
+    return true;
 }
 
 u32 RuntimeModules::id_by_name(std::string_view name)

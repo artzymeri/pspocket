@@ -207,6 +207,12 @@ s32 _sys_memcmp(PPUContext& ctx, u32 buf1, u32 buf2, u32 size)
     return 0;
 }
 
+// sys_libc's (RPCS3 sys_libc_*): the destination back; memcmp's result zero-extended, as RPCS3's u32.
+u32 sys_libc_memcpy(PPUContext& ctx, u32 dst, u32 src, u32 size) { return copy_memory(ctx, "memcpy", dst, src, size); }
+u32 sys_libc_memmove(PPUContext& ctx, u32 dst, u32 src, u32 size) { return copy_memory(ctx, "memmove", dst, src, size); }
+u32 sys_libc_memset(PPUContext& ctx, u32 dst, s32 value, u32 size) { return _sys_memset(ctx, dst, value, size); }
+u32 sys_libc_memcmp(PPUContext& ctx, u32 a, u32 b, u32 size) { return static_cast<u32>(_sys_memcmp(ctx, a, b, size)); }
+
 // RPCS3: NULL for a null buffer or a size that is not positive.
 u32 _sys_memchr(PPUContext& ctx, u32 buf, u8 ch, s32 size)
 {
@@ -897,6 +903,15 @@ void register_sysPrxForUser_libc(Registry& r)
         PS_HLE_FUNC(0x35168520, _sys_heap_malloc),
         PS_HLE_FUNC(0x44265C08, _sys_heap_memalign),
         PS_HLE_FUNC(0x8A561D92, _sys_heap_free),
+    });
+    // sys_libc (RPCS3 sys_libc.cpp, REG_FNID by the C names): the same memory functions under libc's names. The
+    // firmware has the library in a module of its own that games don't load (docs/firmware.md), but RPCS3 serves it.
+    using detail::thunk;
+    r.add("sys_libc", {
+        Function{{}, "memcpy", 0x831D70A5, &thunk<&sys_libc_memcpy>, false},
+        Function{{}, "memset", 0x5909E3C4, &thunk<&sys_libc_memset>, false},
+        Function{{}, "memmove", 0x5B162B7F, &thunk<&sys_libc_memmove>, false},
+        Function{{}, "memcmp", 0xC3E14CBE, &thunk<&sys_libc_memcmp>, false},
     });
 }
 
