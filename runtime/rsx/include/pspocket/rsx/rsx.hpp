@@ -104,7 +104,8 @@ public:
 
     // Callbacks into HLE, run on the RSX thread. Set them before start().
     std::function<void(u32 buffer_id)> on_flip;            // after the backend presented the buffer
-    std::function<void(u32 head, u32 buffer_id)> on_queue; // GCM_DRIVER_QUEUE (lv1 driver flip queue)
+    // GCM_DRIVER_QUEUE (lv1 driver flip queue), and the HLE GCM_FLIP_COMMAND, which queues on head 1 before it flips
+    std::function<void(u32 head, u32 buffer_id)> on_queue;
     std::function<void(u32 arg)> on_user_command;          // GCM_SET_USER_COMMAND (user interrupt)
     std::function<void(const Failure&)> on_failure;        // every failure, before an abort
 

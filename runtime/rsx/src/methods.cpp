@@ -671,7 +671,10 @@ void Rsx::do_flip(u32 buffer_id)
 
 void Rsx::m_flip_command(u32, u32 value)
 {
-    // RPCS3 rsx_methods.cpp flip_command (HLE cellGcmSetFlip): flip, then clear the 16-byte flip label (label 1).
+    // RPCS3 rsx_methods.cpp flip_command (HLE cellGcmSetFlip): the buffer is first queued on head 1, as a
+    // GCM_DRIVER_QUEUE queues it (RPCS3 calls the game's queue handler there, before the flip's), then flipped; then
+    // the 16-byte flip label (label 1) is cleared.
+    m_driver_queue(m::GCM_DRIVER_QUEUE + 1, value);
     do_flip(value);
     ps_write64(base(), config_.layout.label_addr(1), 0);
     ps_write64(base(), config_.layout.label_addr(1) + 8, 0);

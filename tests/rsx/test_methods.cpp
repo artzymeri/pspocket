@@ -151,12 +151,21 @@ TEST_CASE("reports and notifies write timestamps and values")
     CHECK(f.read32(f.layout().report_addr(3) + 8) == f.config.fake_zpass_count);
 }
 
-TEST_CASE("the HLE flip command flips the display buffer and clears the flip label")
+TEST_CASE("the HLE flip command queues on head 1, flips the display buffer and clears the flip label")
 {
     Fixture f;
     f.rsx->set_display_buffer(1, {0x100000, 1280 * 4, 1280, 720});
     std::vector<u32> flipped;
-    f.rsx->on_flip = [&](u32 id) { flipped.push_back(id); };
+    std::vector<std::pair<u32, u32>> queued;
+    std::string order;
+    f.rsx->on_flip = [&](u32 id) {
+        flipped.push_back(id);
+        order += 'f';
+    };
+    f.rsx->on_queue = [&](u32 head, u32 id) {
+        queued.emplace_back(head, id);
+        order += 'q';
+    };
     f.write32(f.layout().label_addr(1), 0x12345678);
     auto b = f.at(0);
     b.method(m::GCM_FLIP_COMMAND, 1);
@@ -168,6 +177,9 @@ TEST_CASE("the HLE flip command flips the display buffer and clears the flip lab
     CHECK(flips[0]->display->width == 1280);
     CHECK(flips[0]->display->offset == 0x100000);
     CHECK(flipped == std::vector<u32>{1});
+    // RPCS3 flip_command: the queue (its queue handler) before the flip (D-170).
+    CHECK(queued == std::vector<std::pair<u32, u32>>{{1, 1}});
+    CHECK(order == "qf");
     CHECK(f.read32(f.layout().label_addr(1)) == 0);
     CHECK(f.rsx->flip_count() == 1);
 }

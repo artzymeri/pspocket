@@ -292,6 +292,10 @@ public:
     // Called on the RSX thread when it runs GCM_SET_USER_COMMAND, after the drain it makes (HLE cellGcmSys: the
     // game's user handler, with the command's argument). Replaces the previous one.
     void set_rsx_user_command_listener(std::function<void(u32 arg)> fn);
+    // Called on the RSX thread when it queues a buffer for a flip on a head (GCM_DRIVER_QUEUE, and the HLE flip
+    // command, which queues on head 1 before it flips), after lv2 noted it in the driver information (HLE cellGcmSys:
+    // the game's queue handler). Replaces the previous one.
+    void set_rsx_queue_listener(std::function<void(u32 head, u32 buffer_id)> fn);
 
     struct Impl;
     Impl& impl() { return *impl_; }

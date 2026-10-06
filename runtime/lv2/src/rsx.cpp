@@ -15,10 +15,11 @@
 // - One context per process (RPCS3 aborts on a second one too); context free and device unmap are not implemented.
 // - The driver information's handler event queue and port are not created: the HLE interrupt handlers do not go
 //   through lv2 event queues.
-// - Display flip (0x102), display queue (0x103), flip status (0x10a), and RPCS3's flip-event (0xFEC) and user-command
-//   (0xFEF) hacks are not implemented (the HLE flip goes through the FIFO: GCM_FLIP_COMMAND, and the RSX's on_flip
-//   does what 0xFEC does); they log and return CELL_EINVAL until a game needs them. The vblank hack (0xFED) counts
-//   vblanks for the HLE GCM interrupt thread.
+// - Display flip (0x102), display queue (0x103), and RPCS3's flip-event (0xFEC) and user-command (0xFEF) hacks are
+//   not packages here (the HLE flip goes through the FIFO: GCM_FLIP_COMMAND; the RSX's on_flip does what 0xFEC does
+//   and its on_queue, for GCM_DRIVER_QUEUE and the HLE flip, what 0x103 does); they log and return CELL_EINVAL until a
+//   game needs them. The vblank hack (0xFED) counts vblanks for the HLE GCM interrupt thread. Flip status (0x10a) is
+//   RPCS3's: cellGcmResetFlipStatus and cellGcmSetFlipStatus change head 1's flip flags through it.
 
 #include <format>
 
@@ -47,11 +48,25 @@ constexpr u32 version_driver = 0x0, version_gpu = 0x4, memory_size = 0x8, hardwa
               nvcore_frequency = 0x10, memory_frequency = 0x14, reportsNotifyOffset = 0x2C, reportsOffset = 0x30,
               reportsReportOffset = 0x34, systemModeFlags = 0x54, head = 0x10B8, head_size = 0x40, size = 0x12F8;
 // RsxDriverInfo::Head
-constexpr u32 h_lastFlipTime = 0x0, h_flipFlags = 0x8, h_flipBufferId = 0x10, h_lastVTimeLow = 0x1C,
-              h_vBlankCount = 0x30, h_lastVTimeHigh = 0x3C;
+constexpr u32 h_lastFlipTime = 0x0, h_flipFlags = 0x8, h_flipBufferId = 0x10, h_lastQueuedBufferId = 0x14,
+              h_lastVTimeLow = 0x1C, h_vBlankCount = 0x30, h_lastVTimeHigh = 0x3C;
+// flipFlags: bit 31 a flip ran (0xFEC; cleared by 0x10a), bit 30 a buffer was queued, bit n buffer n was queued (0x103)
+constexpr u32 kFlipDone = 0x80000000, kQueued = 0x40000000;
 } // namespace di
 
 RsxDevice& dev(PpuThread& t) { return t.kernel.impl().rsx; }
+
+// A head's flip flags change on the RSX thread (flips, queues) and on PPU threads (0x10a): an atomic read-modify-write
+// of the big-endian word, as RPCS3's atomic_be_t<u32> flipFlags.
+template <class F>
+void update_flip_flags(Guest& g, u32 addr, F f)
+{
+    auto* word = reinterpret_cast<u32*>(g.ptr(addr));
+    u32 old = __atomic_load_n(word, __ATOMIC_RELAXED);
+    while (!__atomic_compare_exchange_n(word, &old, ps_bswap32(f(ps_bswap32(old))), true, __ATOMIC_SEQ_CST,
+        __ATOMIC_RELAXED)) {
+    }
+}
 
 } // namespace
 
@@ -186,9 +201,9 @@ Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_contr
     d.rsx->on_flip = [&s, info](u32 buffer_id) {
         // RPCS3 sys_rsx_context_attribute 0xFEC (what RSXThread's flip calls): head 1 records the flip.
         const u32 head = info + di::head + 1 * di::head_size;
-        s.guest.w32(head + di::h_flipFlags, s.guest.r32(head + di::h_flipFlags) | 0x80000000);
         s.guest.w64(head + di::h_lastFlipTime, rsx::Rsx::timestamp_ns());
         s.guest.w32(head + di::h_flipBufferId, buffer_id);
+        update_flip_flags(s.guest, head + di::h_flipFlags, [](u32 f) { return f | di::kFlipDone; });
         RsxDevice& dv = s.rsx;
         dv.flips.fetch_add(1, std::memory_order_relaxed);
         std::function<void(u32)> listener;
@@ -206,6 +221,25 @@ Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_contr
         }
         if (listener) listener(arg);
         else PS_LOG_WARN(kRsxChan, "GCM_SET_USER_COMMAND {:#x} with no user handler", arg);
+    };
+    d.rsx->on_queue = [&s, info](u32 head, u32 buffer_id) {
+        // RPCS3 sys_rsx_context_attribute 0x103 (display queue, what its GCM_DRIVER_QUEUE method calls): the head notes
+        // the queued buffer, then the queue event, which is the listener here (HLE cellGcmSys: the queue handler).
+        if (head >= 2) {
+            PS_LOG_ERROR(kRsxChan, "buffer {} queued on head {}: only heads 0 and 1 exist (RPCS3 aborts); ignored",
+                buffer_id, head);
+            return;
+        }
+        const u32 h = info + di::head + head * di::head_size;
+        s.guest.w32(h + di::h_lastQueuedBufferId, buffer_id);
+        update_flip_flags(s.guest, h + di::h_flipFlags,
+            [buffer_id](u32 f) { return f | di::kQueued | (buffer_id < 32 ? 1u << buffer_id : 0u); });
+        std::function<void(u32, u32)> listener;
+        {
+            std::lock_guard l(s.rsx.listener_mutex);
+            listener = s.rsx.on_queue;
+        }
+        if (listener) listener(head, buffer_id);
     };
     d.rsx->start();
 
@@ -278,6 +312,19 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
             b.pitch);
         return CELL_OK;
     }
+    case 0x10a: { // flip status (RPCS3: "managing flip status through cellGcmResetFlipStatus")
+        if (a3 > 7) return LV1_ILLEGAL_PARAMETER_VALUE;
+        if (a3 >= 2) {
+            PS_LOG_ERROR(kRsxChan, "sys_rsx_context_attribute 0x10a: head {} (only heads 0 and 1 exist; RPCS3 aborts) "
+                                   "-> CELL_EINVAL", a3);
+            return err(CELL_EINVAL);
+        }
+        // flipFlags = (flipFlags & a4) | a5
+        update_flip_flags(t.kernel.impl().guest, d.driver_info + di::head + static_cast<u32>(a3) * di::head_size +
+                di::h_flipFlags,
+            [a4, a5](u32 f) { return (f & static_cast<u32>(a4)) | static_cast<u32>(a5); });
+        return CELL_OK;
+    }
     case 0x105: // destroy buffer? (no-op in RPCS3)
     case 0x106: // cellGcmInitPerfMon
     case 0x10D: // cellGcmInitCursor
@@ -305,12 +352,29 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
     }
     case 0x301: { // Z-cull
         if (a3 >= d.zculls.size()) return LV1_ILLEGAL_PARAMETER_VALUE;
+        const u32 width = static_cast<u32>(((a4 & 0xFFFFFFFF) >> 22) << 6);
+        const u32 height = static_cast<u32>(((a4 & 0x0000FFFF) >> 6) << 6);
+        const u32 cull_start = static_cast<u32>((a5 >> 32) & ~0xFFFull);
+        const u32 offset = static_cast<u32>(a5 & 0x0FFFFFFF);
+        const bool bound = (a6 & 0xFFFFFFFF) != 0;
+        if (bound) {
+            // RPCS3: the cull range (width * height from cullStart) lies in the 3 MB of Z-cull RAM, without wrapping,
+            // and the depth buffer's offset in local memory.
+            const u32 length = width * height;
+            const u32 last = cull_start + length - 1;
+            if (!length || last < cull_start || last >= (3u << 20) || offset >= d.local_size) {
+                PS_LOG_ERROR(kRsxChan,
+                    "Z-cull {}: cull range {:#x} + {}x{} or offset {:#x} out of range -> CELL_EINVAL", a3, cull_start,
+                    width, height, offset);
+                return err(CELL_EINVAL);
+            }
+        }
         RsxDevice::Zcull& z = d.zculls[a3];
-        z.width = static_cast<u32>(((a4 & 0xFFFFFFFF) >> 22) << 6);
-        z.height = static_cast<u32>(((a4 & 0x0000FFFF) >> 6) << 6);
-        z.cull_start = static_cast<u32>((a5 >> 32) & ~0xFFFull);
-        z.offset = static_cast<u32>(a5 & 0x0FFFFFFF);
-        z.bound = (a6 & 0xFFFFFFFF) != 0;
+        z.width = width;
+        z.height = height;
+        z.cull_start = cull_start;
+        z.offset = offset;
+        z.bound = bound;
         return CELL_OK;
     }
     case 0xFED: { // vblank (RPCS3's "hack: vblank command", sent by its vblank thread)

@@ -2868,6 +2868,63 @@ restart; images; RPCS3's refusals; group exit stopping a spinning sibling; suspe
 mailbox, send_event to a PPU queue and receive_event from an SPU queue (and terminate refused while it waits); event
 flag bits, signal OR mode, local store access, the run event; SPU-to-SPU DMA and a signal through the group window;
 the process ending while a thread waits.
+## D-170 · 2026-10-06 · cellGcmSys complete, as RPCS3 has it
+
+libgcm_sys is always native (D-166), so it now has every function RPCS3's cellGcmSys.cpp implements: the 36 it
+lacked, each from RPCS3 (and RPCS3's sys_rsx.cpp where the firmware goes through lv2), with RPCS3's error codes and a
+comment citing RPCS3's function. Where pspocket differs, and why:
+
+- **IO mapping.** cellGcmMapEaIoAddress, cellGcmMapMainMemory (RPCS3's first fit over the offset table's eaAddress
+  half, below the reserved MBs; CELL_GCM_ERROR_NO_IO_PAGE_TABLE without room), cellGcmUnmapIoAddress and
+  cellGcmUnmapEaIoAddress (a mapping is unmapped from where it starts: RPCS3's IoMapTable, the size of each mapping by
+  its first EA MB, is kept beside the table), cellGcmReserveIoMapSize, cellGcmUnreserveIoMapSize,
+  cellGcmGetMaxIoMapSize (256 or 512 MB less the reserve; 0 before cellGcmInit, as RPCS3's renderer),
+  cellGcmGetOffsetTable, cellGcmGetNotifyDataAddress, cellGcmMapLocalMemory (once, before cellGcmInit, which then keeps
+  that local memory). Every map and unmap changes lv2's IO map and both halves of the offset table together.
+  Differences: an EA range at or past 3 GB, an IO offset past 512 MB and an unmapped one are CELL_GCM_ERROR_FAILURE,
+  where RPCS3 reads or writes past its tables; before cellGcmInit a map gets CELL_EINVAL, as lv2 answers RPCS3 then.
+- **Flips.** cellGcmGetFlipStatus, cellGcmResetFlipStatus, cellGcmSetFlipStatus, cellGcmGetCurrentDisplayBufferId and
+  cellGcmGetLastFlipTime read and change head 1 of lv2's driver information, where the firmware keeps them; RPCS3's
+  HLE keeps them in its renderer. lv2 sets the flip-done bit of flipFlags, the time and the buffer at each flip (the
+  bit atomically now), and its package 0x10a, as RPCS3's (flipFlags = (flipFlags & a4) | a5; LV1_ILLEGAL_PARAMETER_VALUE
+  past head 7, CELL_EINVAL for heads 2 to 7 where RPCS3 aborts), resets and sets it. The status is DONE from
+  cellGcmInit on (RPCS3 rsx::thread::init). cellGcmGetLastFlipTime is the flip's time in microseconds on the guest's
+  system-time clock; RPCS3 returns its host clock less one second, which no guest clock matches. cellGcmGetVBlankCount
+  counts the interrupt thread's vblanks.
+- **Queue handler.** cellGcmSetQueueHandler: RPCS3 calls the handler with head 1 from its HLE flip command, before the
+  flip handler. The RSX's GCM_FLIP_COMMAND now queues the buffer on head 1 before it flips, on the path a
+  GCM_DRIVER_QUEUE method takes: lv2 notes the queue in the driver information as RPCS3's 0x103 does
+  (lastQueuedBufferId, the queued bits), then a new listener (Kernel::set_rsx_queue_listener) posts it to the GCM
+  interrupt thread, which calls the handler with the head. A GCM_DRIVER_QUEUE a game writes itself calls the handler
+  too, as lv1's queue event does through the firmware's interrupt thread; RPCS3's HLE does not.
+- **Command words.** cellGcmSetPrepareFlip (returns the id; cellGcmSetFlip now shares RPCS3's gcmSetPrepareFlip with
+  it), cellGcmSetUserCommand and cellGcmSetWaitFlipUnsafe write RPCS3's words, with its room check and callback.
+- **Z-cull.** cellGcmBindZcull returns lv2's result (LV1_ILLEGAL_PARAMETER_VALUE past region 7). lv2's 0x301 now checks
+  a region it binds as RPCS3's lv2 does: the cull range not empty, not wrapping and inside the 3 MB of Z-cull RAM, the
+  offset inside local memory, else CELL_EINVAL; cellGcmSetZcull meets the same checks (logged). The packed words reach
+  the game's CellGcmZcullInfo array only when lv2 took them. cellGcmUnbindZcull: CELL_GCM_ERROR_INVALID_VALUE past 7,
+  else the region keeps its settings, unbound (RPCS3 clears its renderer's bound flag; lv2 gets the last words with
+  status1 0).
+- **The rest.** cellGcmGetDisplayInfo, cellGcmGetTileInfo and cellGcmGetZcullInfo (the arrays), _cellGcmFunc12 (the
+  local report area), cellGcmGetDefaultCommandWordSize and cellGcmGetDefaultSegmentWordSize with
+  cellGcmSetDefaultCommandBufferAndSegmentWordSize (only while put and get are both 0x1000; the sizes are only read
+  back, as in RPCS3), cellGcmSetDefaultCommandBuffer, cellGcmSetDebugOutputLevel (levels 1 to 3 kept, read by nothing,
+  as in RPCS3), cellGcmSetSecondVFrequency (logged), cellGcmInitDefaultFifoMode, cellGcmSetDefaultFifoSize and
+  cellGcmTerminate (CELL_OK). cellGcmSetFlipImmediate checks the id (past 7 CELL_GCM_ERROR_FAILURE); RPCS3's TODO
+  passes the id to cellGcmSetFlipMode as the mode (vsync for buffer 2), which is not what the call means: here nothing
+  changes and the first call is logged, since nothing is flipped outside the command buffer yet.
+- Pointers these functions write through are checked (D-042): CELL_GCM_ERROR_FAILURE, or a log for the void ones,
+  where RPCS3 would fault. Before cellGcmInit, calls that need the context refuse or log where RPCS3 writes address 0.
+
+Not done: RPCS3's bare TODO and UNIMPLEMENTED stubs (the cursor and GPAD functions, the "2" variants,
+cellGcmSetVBlankFrequency, cellGcmSetSecondVHandler, cellGcmSetGraphicsHandler, cellGcmSortRemapEaIoAddress,
+cellGcmGetDisplayBufferByFlipIndex, cellGcmGetLastSecondVTime, cellGcmSysGetLastVBlankTime, cellGcmGetCurrentField,
+cellGcmDumpGraphicsError, cellGcmSetInvalidateTile, _cellGcmFunc1/2/3/4/13/38, _cellGcmSetFlipCommand2) stay
+unimplemented, logged with CELL_ENOSYS, until a game calls one. Tests: tests/hle/test_gcm_sys.cpp (every name resolves
+by its NID; before cellGcmInit; mapping, first fit, reserves and unmapping against lv2's IO map; 512 MB; the flip state
+from the driver information; lv2's 0x10a and queue notes; the queue handler's head and order on the interrupt thread,
+in guest code under the interpreter; the command words; the default buffer's sizes; Z-cull and the arrays; the small
+ones) and the flip command's queue in tests/rsx/test_methods.cpp.
 
 ## Open decisions (plan section 14)
 
