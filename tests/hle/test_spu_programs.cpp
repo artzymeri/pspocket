@@ -291,6 +291,17 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     CHECK(run_at_module() == 0x7);
     CHECK(spu.ctx.program == nullptr);
 
+    // Copied in, then its guest buffer reused before it runs: local store still holds the module, and that is what
+    // runs, so it is known by that copy (D-206; Assassin's Creed's 32 KB module at 0x33980, interpreted in every run).
+    ps_spu_attach_program(&spu.ctx, nullptr);
+    get(kModule, kGuest, 0x400);
+    get(kModule + 0x400, kGuest + 0x400, 0x400);
+    const std::vector<u8> saved(base + kGuest, base + kGuest + kModuleSize);
+    std::memset(base + kGuest, 0x5A, kModuleSize);
+    CHECK(run_at_module() == 0x42);
+    CHECK(spu.ctx.program == &program);
+    std::memcpy(base + kGuest, saved.data(), kModuleSize);
+
     ps_spu_set_resolver(nullptr);
     ps_spu_set_get_observer(nullptr);
     ps_spu_unregister_program(&program);

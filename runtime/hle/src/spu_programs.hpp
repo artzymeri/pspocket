@@ -28,6 +28,9 @@ struct SpuImage {
     u32 ls_start = 0; // where it sits in local store
     u32 size = 0;     // bytes of code (and read-only data) from ls_start, a multiple of 4
     u32 entry = 0;    // where it is entered (LS)
+    // Its bytes when not its guest copy: a module whose guest copy changed after it was copied in is known by what
+    // local store holds (D-206).
+    const u8* bytes = nullptr;
 };
 
 // The lifted program for an image just copied into local store (nullptr: the interpreter runs it), from the hash of its

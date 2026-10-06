@@ -75,7 +75,7 @@ void dump(const std::string& dir, u8* base, const SpuImage& image, u64 hash)
     if (std::filesystem::exists(bin, ec)) return; // an earlier run saved it
     {
         std::ofstream out(bin, std::ios::binary);
-        out.write(reinterpret_cast<const char*>(base + image.guest), image.size);
+        out.write(reinterpret_cast<const char*>(image.bytes ? image.bytes : base + image.guest), image.size);
         if (!out) {
             PS_LOG_ERROR(kChan, "--spu-dump: cannot write {}", bin.string());
             return;
@@ -141,7 +141,7 @@ u64 content_check(const u8* data, usize size)
 // identify_hashed, by way of the images found before; *hash gets the image's program hash.
 const ps_spu_program* identify(u8* base, const SpuImage& image, u64* hash)
 {
-    const u8* bytes = base + image.guest;
+    const u8* bytes = image.bytes ? image.bytes : base + image.guest;
     const u64 check = content_check(bytes, image.size);
     const u64 registry = ps_spu_registry_generation();
     KnownImage& k = t_known[((image.guest >> 4) ^ (image.size >> 2) ^ image.ls_start) % kKnownImages];
@@ -165,7 +165,8 @@ const ps_spu_program* identify(u8* base, const SpuImage& image, u64* hash)
 // when execution reaches an address no attached program has lifted code for. Each SPU's GETs into local store are kept
 // as runs of contiguous copies (one module comes in several 16 KB GETs); the run holding pc is the module, known by the
 // hash of its guest copy and its LS address like any image. A module whose local store copy differs from its guest
-// copy (patched after loading) is not attached: its lifted code could be stale. Per SPU thread, so no lock.
+// copy is known by its local store copy instead (D-206): a program lifted from other bytes would be stale. Per SPU
+// thread, so no lock.
 
 // The runs live until a GET overwrites part of them: GTA V's dependency tasks copy hundreds of small pieces of data
 // between loading a module and running it (run 068: with 128 runs, the oldest that had not run yet, the module, was
@@ -389,7 +390,7 @@ void observe_get(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size)
 
 // A module whose local store copy is not its guest copy any more: logged once per guest address, with where the copies
 // part (what the program changes in it before it runs).
-void log_modified(const u8* ls, const u8* guest, u32 size, u32 ls_start, u32 ea_start)
+void log_modified(const u8* ls, const u8* guest, u32 size, u32 ls_start, u32 ea_start, bool whole)
 {
     static std::mutex mutex;
     static std::unordered_set<u32> logged;
@@ -404,7 +405,8 @@ void log_modified(const u8* ls, const u8* guest, u32 size, u32 ls_start, u32 ea_
             last = i;
         }
     PS_LOG_INFO(kChan, "SPU module at LS 0x{:05x}+{:#x} (guest {:#x}) changed before it ran: {} words differ from its guest "
-        "copy, +{:#x} to +{:#x}; interpreted", ls_start, size, ea_start, words, first, last);
+        "copy, +{:#x} to +{:#x}; {}", ls_start, size, ea_start, words, first, last,
+        whole ? "known by its local store copy" : "interpreted");
 }
 
 // Whether program p lifted any instruction outside [from, to) (offsets from its start): what a copy over part of its
@@ -503,14 +505,19 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
     if (!r.resolved) {
         r.resolved = true;
         u8* base = ctx->membase;
-        // The part still in local store must be its guest copy; the whole copy is the module's identity.
+        // The part still in local store must be its guest copy; the whole copy is the module's identity. A whole one
+        // whose guest copy changed since (the buffer reused, or the module patched where it runs) is known by what
+        // local store holds: that is the code that runs (D-206).
         const u32 held = r.ls_end - r.ls_start, from = r.ea_start + (r.ls_start - r.id_start);
+        const u8* bytes = nullptr;
         if (std::memcmp(ctx->ls + r.ls_start, base + from, held) != 0) {
             g_modified.fetch_add(1, std::memory_order_relaxed);
-            log_modified(ctx->ls + r.ls_start, base + from, held, r.ls_start, from);
-            return nullptr;
+            const bool whole = r.ls_start == r.id_start && r.ls_end == r.id_end;
+            log_modified(ctx->ls + r.ls_start, base + from, held, r.ls_start, from, whole);
+            if (!whole) return nullptr;
+            bytes = ctx->ls + r.ls_start;
         }
-        r.program = identify(base, {ImageKind::Module, r.ea_start, r.id_start, size, pc}, &r.hash);
+        r.program = identify(base, {ImageKind::Module, r.ea_start, r.id_start, size, pc, bytes}, &r.hash);
         // A copy over part of it may only have written over its data (D-085): code there would be stale.
         if (r.program && lifted_outside(r.program, r.ls_start - r.id_start, r.ls_end - r.id_start)) {
             g_modified.fetch_add(1, std::memory_order_relaxed);
