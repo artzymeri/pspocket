@@ -5,6 +5,9 @@
 // NP (sceNpCommerce2) ask whether it is up. Reference: RPCS3 rpcs3/Emu/Cell/Modules/sceNp.cpp (sceNpInit, sceNpTerm)
 // and rpcs3/Emu/NP/np_handler.cpp (is_NP_init, init_NP, terminate_NP).
 
+#include <optional>
+#include <string>
+
 #include "pspocket/core/types.hpp"
 
 namespace pspocket::hle {
@@ -36,5 +39,10 @@ void np2_on_np_term();
 // sceNpMatching2Term2 or sceNp2Term. The older matching library refuses its calls meanwhile
 // (SCE_NP_MATCHING_ERROR_UTILITY_UNAVAILABLE).
 bool np_match2_initialized();
+
+// The SceNpCommunicationId at `addr` (12 bytes of guest memory) as RPCS3 names it ("NPWR01234_00") when it is valid
+// (np::validate_communication_id: nine characters of 0-9 and A-Z, num at most 99); nullopt otherwise. For the title
+// contexts of the community libraries (lookup, score, TUS), whose constructors ensure() it in RPCS3.
+std::optional<std::string> np_communication_id(u8* base, u32 addr);
 
 } // namespace pspocket::hle

@@ -3760,6 +3760,8 @@ u32 np_init(u32 poolsize, u32 poolptr)
     return lv2::CELL_OK;
 }
 
+std::optional<std::string> np_communication_id(u8* base, u32 addr) { return communication_id(base, addr); }
+
 u32 np_pool_size()
 {
     NpState& s = np();
