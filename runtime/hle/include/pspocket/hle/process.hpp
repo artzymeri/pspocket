@@ -49,6 +49,7 @@ struct LinkedFunction {
     u32 nid = 0;
     u32 descriptor = 0; // guest address of the 8-byte entry: {func = descriptor + 4, toc = 0}
     const Function* impl = nullptr;
+    const StubFunction* stub = nullptr; // with no impl: answered as RPCS3's stub (D-182)
     std::atomic<u64> calls{0};
 };
 
@@ -125,8 +126,10 @@ public:
     void set_module_loader(ModuleLoader* loader) { module_loader_ = loader; }
     ModuleLoader* module_loader() const { return module_loader_; }
     std::vector<const LinkedFunction*> linked() const;
-    // Calls that reached a function without a host implementation.
+    // Calls that reached a function without a host implementation (and no RPCS3 stub, D-182).
     u64 unimplemented_calls() const { return unimplemented_calls_.load(std::memory_order_relaxed); }
+    // Calls answered as RPCS3's stub answers them (D-182).
+    u64 stub_calls() const { return stub_calls_.load(std::memory_order_relaxed); }
 
     // ---- TLS (RPCS3 Emu/Cell/Modules/sys_ppu_thread_.cpp) ----
     struct Tls {
@@ -144,6 +147,7 @@ public:
 
     // Used by the stub trampoline.
     void on_unimplemented() { unimplemented_calls_.fetch_add(1, std::memory_order_relaxed); }
+    void on_stub() { stub_calls_.fetch_add(1, std::memory_order_relaxed); }
 
     // Per-process state of an HLE module (RPCS3 g_fxo): created on first use (from this process when T has a
     // constructor taking HleProcess&), destroyed with the process. T does its own locking.
@@ -174,6 +178,7 @@ private:
     std::vector<std::unique_ptr<LinkedFunction>> linked_; // index = chunk * kEntriesPerChunk + entry
     ModuleLoader* module_loader_ = nullptr;
     std::atomic<u64> unimplemented_calls_{0};
+    std::atomic<u64> stub_calls_{0};
 
     Tls tls_{};
     std::mutex tls_mutex_;

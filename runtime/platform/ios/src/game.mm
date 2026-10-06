@@ -511,8 +511,9 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         g_session->running = false;
         return fail(error, error_size, std::string("cannot start the main thread: ") + lv2::error_name(r));
     }
-    PS_LOG_INFO(kChan, "{} \"{}\" booted from {}: {} imported functions ({} implemented)", disc.title_id, disc.title,
-        o->iso_path, report.functions_linked, report.functions_implemented);
+    PS_LOG_INFO(kChan, "{} \"{}\" booted from {}: {} imported functions ({} implemented, {} RPCS3 stubs)",
+        disc.title_id, disc.title, o->iso_path, report.functions_linked, report.functions_implemented,
+        report.functions_stubbed);
     watch_for_freezes(g_session);
     return 0;
 }

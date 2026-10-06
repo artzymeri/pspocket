@@ -53,8 +53,20 @@ void stub_trampoline(PPUContext* ctx, uint8_t* base)
         f->impl->fn(*ctx, base);
         return;
     }
-    p->on_unimplemented();
     const std::string_view name = f->name.empty() ? std::string_view("?") : std::string_view(f->name);
+    if (f->stub) {
+        // D-182: RPCS3's module has this function as a stub too; it is answered the same way, and logged like a gap
+        // (the first calls, then every 1024th), so the log still lists what is not implemented.
+        p->on_stub();
+        if (n <= 8 || n % 1024 == 0) {
+            PS_LOG_WARN(kChan, "STUB {}::{} ({:#010x}) called from {:#010x}, r3..r10 = {} -> {} as RPCS3 (call #{})",
+                f->module, name, f->nid, static_cast<u32>(ctx->lr) - 4, arg_registers(*ctx),
+                f->stub->sets_r3 ? std::format("{:#x}", f->stub->r3) : std::string("void"), n);
+        }
+        if (f->stub->sets_r3) ctx->gpr[3] = f->stub->r3;
+        return;
+    }
+    p->on_unimplemented();
     if (p->config().abort_on_unimplemented) {
         PS_FATAL(kChan, "UNIMPLEMENTED {}::{} ({:#010x}) called from {:#010x}, r3..r10 = {}", f->module, name, f->nid,
             static_cast<u32>(ctx->lr) - 4, arg_registers(*ctx));
@@ -214,6 +226,7 @@ u32 HleProcess::link_function(std::string_view module, u32 nid, std::string_view
     f->nid = nid;
     f->descriptor = descriptor;
     f->impl = registry().find(module, nid);
+    if (!f->impl) f->stub = find_rpcs3_stub(module, nid);
 
     u8* base = kernel_.memory().base();
     ps_write32(base, descriptor, descriptor + 4);
@@ -221,7 +234,7 @@ u32 HleProcess::link_function(std::string_view module, u32 nid, std::string_view
     ps_ppu_dispatch_register(descriptor + 4, stub_trampoline);
 
     PS_LOG_DEBUG(kChan, "import {}::{} ({:#010x}) -> {:#010x}{}", module, name.empty() ? "?" : name, nid, descriptor,
-        f->impl ? "" : " (unimplemented)");
+        f->impl ? "" : f->stub ? " (RPCS3 stub)" : " (unimplemented)");
     linked_[index] = std::move(f);
     return descriptor;
 }

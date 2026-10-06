@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <format>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/guest_memory.hpp"
@@ -134,6 +135,55 @@ TEST_CASE("Linked stubs: descriptor layout, implemented and unimplemented calls"
     CHECK(p.hle->unimplemented_calls() == 1);
     CHECK(p.hle->linked_at(missing + 4)->calls.load() == 1);
     CHECK(p.hle->linked_at(missing) == nullptr); // the descriptor word is not a stub
+}
+
+TEST_CASE("RPCS3 stubs: their NIDs, the answer, and an implementation taking precedence (D-182)", "[hle]")
+{
+    // Each NID is its name's, or a REG_FNID's own number, which then ends the generated name.
+    REQUIRE(hle::rpcs3_stubs().size() > 200);
+    for (const hle::StubFunction& s : hle::rpcs3_stubs()) {
+        INFO(s.module << "::" << s.name);
+        CHECK((s.nid == recomp::nid_of(s.name) || s.name.ends_with(std::format("{:08X}", s.nid))));
+        CHECK(hle::find_rpcs3_stub(s.module, s.nid) == &s);
+    }
+    CHECK(hle::find_rpcs3_stub("cellSysutil", 0x12345678) == nullptr);
+
+    const auto x = test::build_ppu_exec();
+    auto exe = loader::Executable::parse(x.bytes);
+    REQUIRE(exe);
+    Process p(**exe);
+    u8* base = p.memory.base();
+
+    // cellSysutil::cellSysutilPacketBegin is a stub in RPCS3: CELL_OK, counted apart from the gaps.
+    const u32 packet = recomp::nid_of("cellSysutilPacketBegin");
+    REQUIRE(hle::registry().find("cellSysutil", packet) == nullptr);
+    REQUIRE(hle::find_rpcs3_stub("cellSysutil", packet) != nullptr);
+    const u32 stub = p.hle->link_function("cellSysutil", packet, "cellSysutilPacketBegin");
+    REQUIRE(stub != 0);
+    CHECK(p.hle->linked_at(stub + 4)->stub != nullptr);
+    PPUContext ctx;
+    ps_ppu_context_init(&ctx);
+    ctx.gpr[3] = 0x1234;
+    ps_ppu_call_indirect(&ctx, base, stub + 4);
+    CHECK(ctx.gpr[3] == 0);
+    CHECK(p.hle->stub_calls() == 1);
+    CHECK(p.hle->unimplemented_calls() == 0);
+
+    // cellMic::cellMicIsAttached answers 1 there.
+    const u32 attached = p.hle->link_function("cellMic", recomp::nid_of("cellMicIsAttached"), "cellMicIsAttached");
+    if (!hle::registry().find("cellMic", recomp::nid_of("cellMicIsAttached"))) {
+        ps_ppu_call_indirect(&ctx, base, attached + 4);
+        CHECK(ctx.gpr[3] == 1);
+    }
+
+    // Wherever the registry implements a stubbed function, the implementation is linked.
+    for (const hle::StubFunction& s : hle::rpcs3_stubs()) {
+        if (!hle::registry().find(s.module, s.nid)) continue;
+        const u32 d = p.hle->link_function(s.module, s.nid, s.name);
+        INFO(s.module << "::" << s.name);
+        CHECK(p.hle->linked_at(d + 4)->impl != nullptr);
+        CHECK(p.hle->linked_at(d + 4)->stub == nullptr);
+    }
 }
 
 TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import and its exit", "[hle][loader]")

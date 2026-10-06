@@ -58,6 +58,20 @@ private:
 // Every module in src/modules.cpp, built on first use.
 const Registry& registry();
 
+// A function RPCS3's own module leaves as a stub: it logs and returns a constant (D-182). Only for the libraries
+// pspocket always serves itself (no firmware fallback) and RPCS3 serves with HLE by default; generated from RPCS3's
+// source into src/rpcs3_stubs.inc by scripts/gen_rpcs3_stubs.py. The linkage answers an import with one when the
+// registry has no implementation: a log of the call, then `r3` (left alone when !sets_r3, a void function).
+struct StubFunction {
+    std::string_view module;
+    std::string_view name;
+    u32 nid = 0;
+    u64 r3 = 0;
+    bool sets_r3 = true;
+};
+std::span<const StubFunction> rpcs3_stubs();
+const StubFunction* find_rpcs3_stub(std::string_view module, u32 nid);
+
 // ---- typed binding: R fn(PPUContext&, A...) with A in {bool, u8, u16, u32, s32, u64, s64}, R in {void, s32, u32, u64};
 // up to 16 arguments (the ninth and later on the caller's stack) ----
 

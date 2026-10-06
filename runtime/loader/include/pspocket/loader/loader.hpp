@@ -89,6 +89,7 @@ struct LoadReport {
     u32 segments = 0;
     u32 functions_linked = 0;
     u32 functions_implemented = 0; // linked to an HLE implementation
+    u32 functions_stubbed = 0;     // linked to no implementation but an RPCS3 stub's answer (D-182)
     u32 functions_lle = 0;         // linked to a firmware module's export
     u32 lle_modules = 0;           // firmware modules loaded
     u32 variables_unresolved = 0;

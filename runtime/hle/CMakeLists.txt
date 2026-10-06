@@ -24,6 +24,7 @@ add_library(pspocket_hle STATIC
     src/pad_script.cpp
     src/process.cpp
     src/psf.cpp
+    src/rpcs3_stubs.cpp
     src/sceNp.cpp
     src/sceNp2.cpp
     src/sceNpCommerce2.cpp

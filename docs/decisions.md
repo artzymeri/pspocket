@@ -3488,6 +3488,54 @@ the pictures. pspocket's versions of those libraries follow RPCS3's, so they use
 - **Hardware decoding later.** VideoToolbox (H.264 in hardware) and AudioToolbox can take over a format later, measured
   against these first (rule 8).
 
+## D-182 · 2026-10-06 · Functions RPCS3 leaves as stubs are answered as RPCS3 answers them
+
+A library pspocket always serves itself (recomp::firmware_module_native, D-175) has no firmware fallback. A
+function the host lacks there returns CELL_ENOSYS to the game. RPCS3 also serves most of these libraries itself
+(g_prx_list in rpcs3/Emu/Cell/lv2/sys_prx.cpp says HLE for them). Many of its functions there are stubs: a log line,
+then a constant, nearly always CELL_OK. Games run on RPCS3 with those answers. pspocket now gives the same answers,
+as D-166 did for lv2's null syscalls:
+
+- **The table.** runtime/hle/scripts/gen_rpcs3_stubs.py reads RPCS3's module sources and writes
+  runtime/hle/src/rpcs3_stubs.inc. A function counts as a stub when its body is nothing but log statements and
+  `return X;`, with X a constant. 296 functions in 28 libraries qualify, among them:
+  - cellSysutil's web browser and packet functions;
+  - cellCamera's async calls;
+  - the netctl GameInt calls;
+  - sceNp's commerce getters;
+  - cellSysutilAvc2/AvcExt, cellPrint, cellRemotePlay, cellVideoPlayer, cellDtcpIp, cellPesm, cellBgdl;
+  - sys_io's sys_config calls.
+- **Which libraries.** Only those whose firmware file pspocket keeps native *and* RPCS3 serves itself:
+  - every libsysutil* library, the NP libraries among them;
+  - libsysmodule, libaudio, libvoice, libio, libcamera, libmic, libgem, libnetctl and libfs_utility_init.
+
+  Left out are liblv2, libsre, libgcm_sys, libfs, libnet, libusbd and libusbpspcm. RPCS3 loads those from the
+  firmware by default, so its stubs there are not what games meet on RPCS3.
+- **The answer.** HleProcess links an import to the registry's implementation when there is one, else to the stub's
+  answer (LinkedFunction::stub), else to the unimplemented stub (CELL_ENOSYS).
+  - A stub call logs `STUB module::name (NID) ... -> 0x0 as RPCS3`, for the first 8 calls and then every 1024th.
+    It counts apart from the gaps (HleProcess::stub_calls), so the log still names what is not implemented.
+  - --stop-at-first does not stop on a stub.
+  - A real implementation added to the registry always wins; the table does not need regenerating for that.
+- **What the user sees.**
+  - pspocket-boot lists the stubbed calls apart from the unimplemented ones, at the end of a run.
+  - `--imports` marks stubs with ~.
+  - The phone's boot line counts the stubs.
+  - LleModules' list of what the host lacks counts how many of those are stubs.
+- **D-175's choice is unchanged.** A stub is not an implementation: a library that is not always native still goes to
+  its firmware module when the host lacks one of its imported functions.
+
+Also: the Linux host build is warning-free again with -DPSPOCKET_WERROR=ON. Apple-only helpers and options are marked
+unused, sys/sysctl.h is used on Apple only, and test_firmware's using-directives moved out of its Apple-only block.
+ctest passes on Linux x86, apart from the SPU float fuzz, which needs AArch64 (D-027).
+
+Tests (tests/hle/test_hle.cpp):
+
+- every stub's NID matches its name or its REG_FNID;
+- a stub answers CELL_OK, and cellMicIsAttached answers 1;
+- stub calls are counted apart from the gaps;
+- an implemented function is linked to its implementation, not to its stub.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

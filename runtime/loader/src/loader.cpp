@@ -314,6 +314,7 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
             if (fn.refs) patch_refs(mem, *fn.refs, descriptor, std::format("{}::{}", lib.name, fn.resolved.name));
             rep.functions_linked++;
             if (hle::registry().find(lib.name, fn.nid)) rep.functions_implemented++;
+            else if (!module && hle::find_rpcs3_stub(lib.name, fn.nid)) rep.functions_stubbed++;
         }
         for (const auto& var : lib.variables) {
             if (module) {

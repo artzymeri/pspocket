@@ -515,7 +515,7 @@ void print_imports(const hle::HleProcess& hle)
     std::vector<std::string> modules;
     for (const auto* f : linked)
         if (std::find(modules.begin(), modules.end(), f->module) == modules.end()) modules.push_back(f->module);
-    usize implemented = 0;
+    usize implemented = 0, stubbed = 0;
     for (const auto& m : modules) {
         usize count = 0, done = 0;
         for (const auto* f : linked)
@@ -523,10 +523,13 @@ void print_imports(const hle::HleProcess& hle)
         std::printf("%s: %zu imported, %zu implemented\n", m.c_str(), count, done);
         for (const auto* f : linked)
             if (f->module == m)
-                std::printf("  %c %s (0x%08X)\n", f->impl ? '*' : ' ', f->name.empty() ? "?" : f->name.c_str(), f->nid);
+                std::printf("  %c %s (0x%08X)\n", f->impl ? '*' : f->stub ? '~' : ' ',
+                    f->name.empty() ? "?" : f->name.c_str(), f->nid);
         implemented += done;
+        for (const auto* f : linked) stubbed += f->module == m && f->stub;
     }
-    std::printf("total: %zu imported functions, %zu implemented (*)\n", linked.size(), implemented);
+    std::printf("total: %zu imported functions, %zu implemented (*), %zu answered as RPCS3's stubs (~, D-182)\n",
+        linked.size(), implemented, stubbed);
 }
 
 bool read_file(const char* path, std::vector<u8>& out)
@@ -1285,14 +1288,16 @@ int main(int argc, char** argv)
     if (!done) print_thread_report(kernel, std::format("timeout after {:.1f} s", secs));
 
     // Summary: which gaps the run hit, most-called first.
-    std::vector<const hle::LinkedFunction*> missing;
+    std::vector<const hle::LinkedFunction*> missing, stubbed;
     for (const auto* f : hle.linked())
-        if (!f->impl && f->calls.load() > 0) missing.push_back(f);
-    std::sort(missing.begin(), missing.end(), [](auto* a, auto* b) { return a->calls.load() > b->calls.load(); });
+        if (!f->impl && f->calls.load() > 0) (f->stub ? stubbed : missing).push_back(f);
+    const auto by_calls = [](auto* a, auto* b) { return a->calls.load() > b->calls.load(); };
+    std::sort(missing.begin(), missing.end(), by_calls);
+    std::sort(stubbed.begin(), stubbed.end(), by_calls);
     std::printf("\n%s after %.1f s\n", done ? "process exited" : "timeout", secs);
     if (done) std::printf("exit status: %d\n", kernel.exit_status());
-    std::printf("imports: %u functions (%u implemented), %u unresolved variables\n", report.functions_linked,
-        report.functions_implemented, report.variables_unresolved);
+    std::printf("imports: %u functions (%u implemented, %u RPCS3 stubs), %u unresolved variables\n",
+        report.functions_linked, report.functions_implemented, report.functions_stubbed, report.variables_unresolved);
     if (!frames_dir.empty()) {
         frame_writer.finish();
         std::printf("frames saved: %u in %s\n", frame_writer.written(), frames_dir.c_str());
@@ -1329,6 +1334,10 @@ int main(int argc, char** argv)
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());
     for (const auto* f : missing)
+        std::printf("  %8llu  %s::%s (0x%08X)\n", static_cast<unsigned long long>(f->calls.load()), f->module.c_str(),
+            f->name.empty() ? "?" : f->name.c_str(), f->nid);
+    std::printf("functions answered as RPCS3's stubs (D-182): %zu\n", stubbed.size());
+    for (const auto* f : stubbed)
         std::printf("  %8llu  %s::%s (0x%08X)\n", static_cast<unsigned long long>(f->calls.load()), f->module.c_str(),
             f->name.empty() ? "?" : f->name.c_str(), f->nid);
     if (!summary_path.empty()) {

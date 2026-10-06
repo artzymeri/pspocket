@@ -604,8 +604,11 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& i
     for (const auto& [library, nids] : lacking) {
         std::string list;
         for (usize i = 0; i < nids.size() && i < 8; i++) list += std::format("{}{:#010x}", i ? " " : "", nids[i]);
-        PS_LOG_WARN(kChan, "{}: {} imports {} function(s) the host lacks ({}{}): calls to them fail", library, who,
-            nids.size(), list, nids.size() > 8 ? " ..." : "");
+        const auto stubs = std::count_if(nids.begin(), nids.end(),
+            [&](u32 nid) { return hle::find_rpcs3_stub(library, nid) != nullptr; });
+        PS_LOG_WARN(kChan, "{}: {} imports {} function(s) the host lacks ({}{}): calls to them fail{}", library, who,
+            nids.size(), list, nids.size() > 8 ? " ..." : "",
+            stubs ? std::format(", except {} answered as RPCS3's stubs (D-182)", stubs) : std::string());
     }
 }
 
