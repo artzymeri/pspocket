@@ -1,4 +1,4 @@
-# Runs 109–120 · Assassin's Creed in the Abstergo lab: what still ran in the interpreters
+# Runs 109–121 · Assassin's Creed in the Abstergo lab: what still ran in the interpreters
 
 2026-10-06 night to 2026-10-07 · pspocket-boot with the library prepared on the Mac (`pspocket-prepare --spu-images
 inventory/BLES00158/spu-images`) · M4 Mac · Assassin's Creed (BLES00158), firmware 4.92 · the scripted walk
@@ -118,4 +118,17 @@ interpreter's 184 instructions as in run 119, the PPU's the fiber resumes (6.8 m
 only errors logged: one multisampled target drawn with one sample (known, improve.md) and two tile compression modes
 RPCS3 does not emulate either. The stick walk at the end did not move him: the captions come first. Next: a walk that
 answers the training's prompts.
+
+## Run 121: playing the training
+
+`games/ac1/walk-training.txt`, 570 s: after the captions Altaïr walks with the left stick, the camera turns, START
+opens "Memory Paused" (Resume Session, Memory Log, Additional Memories, Map, Options, Quit Game) and Cross resumes, and
+the training moves on to "Gentle Push": a crowd of dozens of animated people across the Animus space, the DNA helix
+above. All drawn right, 58 to 60 fps until the crowd, then 28 to 39. Still nothing missing (no unimplemented call), 0
+SPU images interpreted, the SPU interpreter's 184 instructions, the PPU's fiber resumes (8.5 million instructions in
+570 s).
+
+In the crowd: 5.7 cores busy; the RSX thread 4.05 s of every 5 s (81%), one PPU thread 3.8 s, each of the five SPU
+threads 3.7 s; the GPU 22 ms a frame with 1,123 draws and 37 render passes. The RSX thread is nearest its limit:
+about 24 µs of CPU per draw. Next: profile it there (run 122).
 
