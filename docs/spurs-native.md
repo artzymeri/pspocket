@@ -34,9 +34,9 @@ and hands the cores back to the PPU threads and the renderer otherwise.
 ## Stages
 
 1. Attributes, initialize, finalize (done).
-2. Workload registry (done for SPURS1: the guest tables as RPCS3 fills them) and the scheduler (done for SPURS1, D-050:
-   host workers, kernel 1 workload selection, ReadyCountStore, WakeUp, the workload flag). SPURS2 (32 workloads) has no
-   scheduler yet.
+2. Workload registry (done: the guest tables as RPCS3 fills them) and the scheduler (done, D-050: host workers, kernel 1
+   workload selection, ReadyCountStore, WakeUp, the workload flag; SPURS2's 32 workloads under kernel 2's selection,
+   D-171). The rest of RPCS3's cellSpurs API: D-171.
 3. Tasksets and tasks (done, D-047, D-050: creation checked against libsre; the native taskset policy runs task ELFs
    with libsre's local-store layout and task syscalls: GTA V's dependency tasks, Bink, zlib inflate).
 4. Event flags (done: PPU side, and SPU-side waits through the taskset policy), lv2 event queue attachment (done: SPU

@@ -22,16 +22,19 @@
 // fetches them while the previous job runs, unless that job has the stall-successor flag), so a job that reads what the
 // previous job on the same SPU wrote gets the new data here. An SPU that leaves the chain after running jobs makes one
 // more visit without taking jobs, so its busy bit doesn't hold up a SYNC elsewhere. A visit that changes nothing (a JTS
-// waiting for the PPU) is followed by a short sleep instead of libsre's spin. Not implemented (each stops with a fatal
-// log): the memory check (jobType bit 1, jobMemoryCheck), trace packets, the exception event handler.
+// waiting for the PPU) is followed by a short sleep instead of libsre's spin. Not implemented: the memory check (jobType
+// bit 1, jobMemoryCheck: logged once, the jobs run without it, D-171); trace packets; the exception event handler
+// (cellSpursJobChainSetExceptionEventHandler keeps one, but a job that faults stops with a fatal log).
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstring>
 #include <format>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -76,6 +79,20 @@ constexpr u32 CELL_SPURS_MODULE_POLL_STATUS_READYCOUNT = 1;
 constexpr u32 kGrabBlocked = 2, kGrabEnded = 1;
 
 u32 pages_of(u32 bytes) { return std::max(1u, (bytes + kPage - 1) / kPage); }
+
+// The job memory check (cellSpursJobChainAttributeSetJobTypeMemoryCheck sets the chain's jobMemoryCheck; a descriptor's
+// jobType bit 1 asks for it per job) is libsre's debugging aid: the module watches the local store around a job's buffers
+// and halts the chain with CELL_SPURS_JOB_ERROR_MEMORY_CORRUPTED when the job wrote outside them. It is not done
+// natively (D-171): the jobs run as they would without it, so a job writing outside its buffers is not caught. Logged
+// the first time.
+void note_memory_check(std::string_view who)
+{
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        PS_LOG_WARN(kJobChan, "{} asks for the job memory check: not done natively, the jobs run without it (logged once)",
+            who);
+    }
+}
 
 const char* job_error_name(u32 code)
 {
@@ -304,9 +321,7 @@ void JobChainPolicy::init()
     tags_[0] = ps_read8(base_, jc_ + jc_off::tag1);
     tags_[1] = ps_read8(base_, jc_ + jc_off::tag2);
     sdk_ = ps_read32(base_, jc_ + jc_off::sdkVer);
-    if (ps_read8(base_, jc_ + jc_off::jobMemoryCheck)) {
-        fatal("the chain asks for the job memory check (jobMemoryCheck), which is not implemented");
-    }
+    if (ps_read8(base_, jc_ + jc_off::jobMemoryCheck)) note_memory_check("the chain (cellSpursJobChainAttributeSetJobTypeMemoryCheck)");
     // A job returns into a `stop` the worker takes (libsre: the instruction after its call).
     ps_write32(ls_, ls::jc_return, kJobReturnStop);
 }
@@ -669,7 +684,7 @@ void JobChainPolicy::store_ready_count(const Grab& g)
     }
     if (count == current) return;
     reservation_op(base_, w_.sched.spurs, [&](u8* line) {
-        ps_write8(line, wkl_off::readyCount1 + wid_, count);
+        ps_write8(line, wkl_ready(wid_), count);
         std::memcpy(ls_ + ls::kernel, line, PS_RES_LINE_SIZE); // libsre updates it through the kernel's line buffer
         return true;
     });
@@ -692,10 +707,10 @@ void JobChainPolicy::fail(u32 code, u64 cause)
     if (first) {
         if (!halt) {
             // cellSpursShutdownWorkload for a running workload: SHUTTING_DOWN and the system service messages.
-            reservation_op(base_, w_.sched.spurs + 0x80, [&](u8* line) {
-                const u8 state = ps_read8(line, wkl_off::state1 - 0x80 + wid_);
+            reservation_op(base_, w_.sched.spurs + 0x80, [&](u8* line) { // state1 and state2 are both in line 1
+                const u8 state = ps_read8(line, wkl_state(wid_) - 0x80);
                 if (state == SPURS_WKL_STATE_SHUTTING_DOWN || state == SPURS_WKL_STATE_REMOVABLE) return false;
-                ps_write8(line, wkl_off::state1 - 0x80 + wid_, SPURS_WKL_STATE_SHUTTING_DOWN);
+                ps_write8(line, wkl_state(wid_) - 0x80, SPURS_WKL_STATE_SHUTTING_DOWN);
                 ps_write8(line, wkl_off::sysSrvMsgUpdateWorkload - 0x80, 0xFF);
                 return true;
             });
@@ -864,7 +879,7 @@ bool JobChainPolicy::run_job(const Job& job)
         fail(CELL_SPURS_JOB_ERROR_DMALIST_ELEMENT, job.ea);
         return false;
     }
-    if (job_type & 2) fatal(std::format("job {:#x} asks for the memory check (jobType bit 1), which is not implemented", job.ea));
+    if (job_type & 2) note_memory_check(std::format("job {:#x} (jobType bit 1)", job.ea));
 
     // The previous job's scratch + stack stays for this one only when it is the same size; libsre frees it after the
     // previous job otherwise, before this job's buffers are allocated.

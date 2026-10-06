@@ -69,11 +69,13 @@ constexpr u32 size = 0x40000;
 
 // Stop codes the worker plants in local store (any codes work: worker contexts have their own stop hook): the taskset
 // policy's syscall entry, and the SPURS kernel's entry points a game's own policy module may reach (spurs_custom.cpp):
-// select workload (0x290, [0x1E4]), the return from a module (0x804) and the exit to the kernel (0x808, [0x1E0]).
+// select workload (0x290, [0x1E4]), the return from a module (kernel 1: 0x804) and the exit to the kernel (kernel 1:
+// 0x808, [0x1E0]). SPURS2's kernel 2 (libsre's second SPU kernel, entry 0x848) calls a module from 0x834, so a module
+// returns to 0x838, which is also its exit ([0x1E0]; RPCS3 CELL_SPURS_KERNEL2_EXIT_ADDR).
 constexpr u32 kSyscallStop = ls::pm_syscall;
 // The return address of a job (job chains).
 constexpr u32 kJobReturnStop = ls::jc_return;
-constexpr u32 kKernelSelect = 0x290, kKernelReturn = 0x804, kKernelExit = 0x808;
+constexpr u32 kKernelSelect = 0x290, kKernelReturn = 0x804, kKernelExit = 0x808, kKernel2Exit = 0x838;
 constexpr u32 kKernelSelectStop = kKernelSelect, kKernelExitStop = kKernelExit;
 // "Idle": the SPURS kernel's ID for the system service workload, which a native worker never runs.
 constexpr u32 kIdleWid = 0x20;
@@ -96,8 +98,8 @@ public:
     u8* ls = nullptr; // 256 KB, 128-byte aligned
     SPUContext ctx{};
 
-    // Kernel bookkeeping (RPCS3 SpursKernelContext): this SPU's share of each workload's contention, the current
-    // workload.
+    // Kernel bookkeeping (RPCS3 SpursKernelContext): this SPU's share of each workload's contention (SPURS2: packed
+    // as CellSpurs::wklCurrentContention, wid & 15's byte, 0x01 or 0x10), the current workload.
     std::array<u8, 16> loc_contention{};
     u32 current_wid = kIdleWid;
     // A game's own policy module is reloaded whenever another policy ran in between: logged once per worker.
@@ -108,8 +110,9 @@ public:
         u32 wid = kIdleWid;
         u32 poll_status = 0; // CELL_SPURS_MODULE_POLL_STATUS_*: 1 ready count, 2 signal, 4 workload flag
     };
-    // The SPURS kernel's workload selection (RPCS3 spursKernel1SelectWorkload) on the guest CellSpurs. `poll` asks
-    // whether another workload should take this SPU without changing anything (cellSpursModulePollStatus).
+    // The SPURS kernel's workload selection (RPCS3 spursKernel1SelectWorkload; for SPURS2 spursKernel2SelectWorkload)
+    // on the guest CellSpurs. `poll` asks whether another workload should take this SPU without changing anything
+    // (cellSpursModulePollStatus).
     Selection select(bool poll);
     // True when the policy running on this worker should give the SPU back to the kernel.
     bool poll_switch() { return select(true).wid != current_wid; }
@@ -125,6 +128,11 @@ private:
     void body();
     bool run_workload(const Selection& sel); // true: a game's own policy module ran
     void release();
+    Selection select1(bool poll); // kernel 1: SPURS1, workloads 0..15
+    Selection select2(bool poll); // kernel 2: SPURS2, workloads 0..31
+    // After a selection: the kernel context in local store (CellSpurs line 0's copy, priorities, unique IDs, the
+    // current workload ID).
+    void update_kernel_context(const std::array<u8, 16>& priority, const std::array<u8, 16>& unique, u32 wid);
 
     void* thread_ = nullptr; // pthread_t
     bool joinable_ = false;
@@ -146,15 +154,16 @@ public:
     u8* const base;
     const u32 spurs;
     Instance& inst;
+    const bool second; // SPURS2: 32 workloads, kernel 2's selection and exit address
     std::atomic<bool> stopping{false};
     // Workloads the native scheduler does not know (not registered through the HLE API): left out of the selection
-    // after the first time a worker picked one, which is logged.
+    // after the first time a worker picked one, which is logged. Bit `wid`.
     std::atomic<u32> unsupported{0};
     // Where the workers' time went since the last report (D-131): each workload's runs, policy polls that found no
     // work, waits. The first worker reports every 5 s.
-    std::array<std::atomic<u64>, CELL_SPURS_MAX_WORKLOAD> workload_ns{};
+    std::array<std::atomic<u64>, CELL_SPURS_MAX_WORKLOAD2> workload_ns{};
     // Workers inside each workload right now (D-136): a join waits for them to leave before the game frees its memory.
-    std::array<std::atomic<u32>, CELL_SPURS_MAX_WORKLOAD> inside{};
+    std::array<std::atomic<u32>, CELL_SPURS_MAX_WORKLOAD2> inside{};
     std::atomic<u64> idle_poll_ns{0}, wait_ns{0};
     void report_time(u64 now_ns);
     u64 last_report_ns = 0; // the reporting worker's

@@ -2868,6 +2868,7 @@ restart; images; RPCS3's refusals; group exit stopping a spinning sibling; suspe
 mailbox, send_event to a PPU queue and receive_event from an SPU queue (and terminate refused while it waits); event
 flag bits, signal OR mode, local store access, the run event; SPU-to-SPU DMA and a signal through the group window;
 the process ending while a thread waits.
+
 ## D-168 · 2026-10-06 · sysPrxForUser: the C library, heaps, lwcond, mempool and the rest, as RPCS3 has them
 
 D-166's second step starts with sysPrxForUser, which every firmware module imports from: the 50 functions RPCS3
@@ -3038,6 +3039,76 @@ from the driver information; lv2's 0x10a and queue notes; the queue handler's he
 in guest code under the interpreter; the command words; the default buffer's sizes; Z-cull and the arrays; the small
 ones) and the flip command's queue in tests/rsx/test_methods.cpp.
 
+## D-171 · 2026-10-06 · cellSpurs up to RPCS3's API, on the native scheduler
+
+Every function RPCS3's cellSpurs.cpp implements now runs on the native SPURS (D-037): the 58 pspocket lacked
+(initialize and SPURS2, the information and thread IDs, the SPU GUID, workload priorities, contention, idle SPU
+requests, signals, data and ready counts, the second flag receiver, shutdown, wait and remove with the
+shutdown-completion hook, the exception handler flags, traces, CellSpursTaskset2 and the taskset accessors, the event
+flag getters, clear and try-wait, the barrier's taskset, the LF queue, the old job chain API, the job chain getters,
+exception handlers, guards, grab limit and urgent call). Each cites RPCS3's function and was compared with libsre (fw
+4.92, the reference, D-046); where the two differ, or RPCS3 has a TODO, libsre's behaviour is taken ("as libsre" in the
+comments), as in D-047 and D-054. Updates of CellSpurs line 0 (ready counts, contention, signals, the flag receiver,
+the system service message bits) are one reservation_op each, so idle workers waiting on the line wake (D-073).
+
+- **SPURS2.** cellSpursInitializeWithAttribute2 makes an instance of 32 workloads (8 KB, SAF_SECOND_VERSION, flags1's
+  SF1_32_WORKLOADS), and the native scheduler runs it with kernel 2's selection (RPCS3 spursKernel2SelectWorkload):
+  contention and maximum contention in nibbles (byte wid & 15, low nibble for 0..15, high for 16..31), the ready
+  counts of 16..31 in wklIdleSpuCountOrReadyCount2, signals in wklSignal2, the second state, status and event tables,
+  and the information, F and H tables at 0x1000, 0x1200 and 0x1A00; the weight is the priority and the current
+  workload's tie-breaker only. A game's policy module on SPURS2 is entered as kernel 2 calls it, from 0x834 ($0 and
+  [0x1E0] are 0x838). Every workload function, the job chain policy's ready count and its error path's shutdown use
+  the second tables for 16..31. cellSpursRequestIdleSpu is STAT on SPURS2 (its byte is a ready count there), as libsre.
+- **Shutdown-completion hooks.** RPCS3 creates the event helper thread at initialize; natively it exists for the hooks
+  only, created with the first workload whose attribute has one: an lv2 PPU thread "<prefix>SpursHdlr1" at the
+  instance's PPU priority, waiting on the "_spuPrv" queue (42 entries) attached to a dynamic SPU port and a local event
+  port, as RPCS3's. A completed shutdown sends it the workload's bit (data3); it calls the hook (spurs, wid, arg) once
+  the workers have left the workload (D-136) and sets event bit 0x20, which cellSpursWaitForWorkloadShutdown waits for
+  where RPCS3 waits on the semaphore the helper posts. cellSpursFinalize stops it (the end event, the join, the port,
+  SPU port and queue). Its entry is an internal function the loader links (_pspocket_spurs_event_helper, NID
+  0x8A1D254E); without it a hook is logged, not called. A shutdown an SPU starts (a job chain's error) is completed by
+  the waiter, which sends the completion as the system service would.
+- **libsre where RPCS3 differs.** cellSpursGetSpuGuid decodes the .SpuGUID section's four `ila $2` instructions (RPCS3
+  writes nothing). cellSpursCreateJobChain makes the old API's chain with libsre's checks (entry, a grab limit of 1 to
+  16, tags up to 31, priorities, descriptors of 64, 128 or 256 bytes), revision 1 from SDK 1.5, else 0; RPCS3's checks
+  attribute fields the old API has not and always fails. cellSpursKickJobChain gives a chain with autoReadyCount ready
+  count 1 if it had none (compare-and-swap 0 to 1) and one without it the count given (ReadyCountStore); RPCS3 has the
+  two the other way round. A job guard keeps its chain as a u64 at 0x08 (RPCS3 reads a u32 there, the high word); the
+  last notify kicks a revision 0 or 1 chain with the requested SPU count, runs a later one that waits on the guard.
+  cellSpursGetJobChainInfo also gives the grab limit (0x44) and takes the name from the workload's information;
+  cellSpursJobSetMaxGrab writes the limit at 0x72, where libsre keeps it (RPCS3's layout: 0x70), and the policy keeps
+  a limit changed during a visit. cellSpursJobChainGetError refuses a NULL cause and writes it only with an error;
+  cellSpursJobChainGetSpursAddress and the taskset accessors refuse a workload ID past 31 (RPCS3 checks none, or 15,
+  which a SPURS2 taskset passes); the event flag and barrier getters check alignment before the output's NULL and
+  sign-extend direction and clear mode; _cellSpursLFQueueInitialize refuses a taskset whose workload ID is past 31;
+  _cellSpursTaskAttribute2Initialize clears all 256 bytes; cellSpursRequestIdleSpu answers with the policy module's
+  codes and accepts a count of 8 (RPCS3: the core's, and 8 is INVAL). cellSpursCreateTaskset2 (RPCS3: a TODO after
+  the first two steps) adds the Task2 and exit-code handler descriptors, two lv2 event flags "taskset2" and the task
+  name buffer, cleared.
+- **Fixes (rule 7).** _cellSpursWorkloadFlagReceiver clearing for a workload that is not the receiver is PERM and
+  changes nothing; it returned CELL_OK and reset the flag. cellSpursReadyCountStore: a value above 255 is INVAL before
+  SRCH, as RPCS3 and libsre.
+- **What a native SPURS has not.** No SPU thread group or SPU threads: cellSpursGetSpuThreadGroupId,
+  cellSpursGetSpuThreadId, cellSpursGetInfo and the trace header give their IDs as 0, an ID lv2 refuses (logged
+  once); a memory container from cellSpursAttributeSetMemoryContainerForSpuThread is kept and not used (logged). No
+  system service: a trace keeps its buffer, mode and per-SPU start indices and gets no packets; GetInfo's deadline
+  counters are 0. The exception handlers (global, taskset, job chain) are kept and cellSpursEnableExceptionEventHandler
+  sets the flag, but an SPU exception still stops its worker with a fatal log (rule 5). The job memory check
+  (cellSpursJobChainAttributeSetJobTypeMemoryCheck, a descriptor's jobType bit 1) is not done: logged once, the jobs
+  run without it, where the policy stopped with a fatal log before.
+
+Not done: RPCS3's UNIMPLEMENTED stubs for CellSpursTaskset2's own tasks (cellSpursCreateTask2, JoinTask2,
+TryJoinTask2, DestroyTaskset2, CreateTask2WithBinInfo) and cellSpursGetWorkloadInfo (a TODO in RPCS3) stay
+unimplemented (rule 4); tasks made with cellSpursCreateTask run in a Taskset2 as in any taskset. Tests:
+tests/hle/test_spurs_api.cpp (11 cases): the 58 names by NID and the internal helper; initialize, the container, the
+information and thread IDs; the GUID decoder; priorities, contention, idle SPU requests, signals, data and ready counts;
+the flag receivers (the PERM regression); shutdown, wait and remove with a hook run by guest code on the event helper,
+and without the helper; traces and the exception handler flags; Taskset2 and the accessors, a task running in it; event
+flags, the barrier and the LF queue; a SPURS2 instance whose taskset (workload 16) runs a task and whose policy module
+(workload 17) is entered as kernel 2 does. tests/hle/test_spurs_jobchain.cpp (3 more cases): the old API made and
+kicked; IDs, errors, information, handlers, grab limits, urgent calls and the memory check; guards that run and kick
+chains. The synthetic executable's loader test (test_hle.cpp) counts cellSpursInitialize among its implemented imports.
+
 ## D-175 · 2026-10-06 · System libraries chosen per game, as a PS3 links them
 
 Before, a firmware module ran as it is (LLE, D-157) only when the host implemented none of its libraries. A library
@@ -3088,7 +3159,6 @@ Tests (tests/hle/test_lle.cpp):
 - The choice: host-covered, partial, native list, gaps, variable refusal, the game's variables, extend, host-bound
   libraries, forced libraries. Each runs twice, the second time from the cached index.
 - A game PRX loaded while the game runs, whose firmware dependency joins and starts first, once.
-
 
 ## D-176 · 2026-10-06 · The PS3 system software analysed: what it holds and how each part meets the engine
 
@@ -3268,29 +3338,6 @@ Tests (tests/hle):
   refused codecs).
 - test_np.cpp: sceNpDrmIsAvailable2.
 
-## D-181 · 2026-10-06 · FFmpeg's decoders for pspocket's own media libraries
-
-To run any game with no PS3 firmware file (D-179's direction), video and audio decoding must be pspocket's own. RPCS3
-decodes with FFmpeg in its own cellVdec (H.264, MPEG-2, MPEG-4) and cellAtracXdec (ATRAC3plus), and swscale converts
-the pictures. pspocket's versions of those libraries follow RPCS3's, so they use FFmpeg too.
-
-- **The build.** scripts/build-ffmpeg.sh builds FFmpeg 7.1.1 from the unmodified release tarball, SHA-256 pinned and
-  not kept in the repository (the build needs no network), for macOS arm64 (build/ffmpeg/macos: the Mac's tests and
-  pspocket-boot) and iOS arm64 (build/ffmpeg/ios: the app).
-- **What goes in.** libavcodec with the decoders the PS3's formats need (H.264, MPEG-1/2 video, MPEG-4 part 2; ATRAC3,
-  ATRAC3plus and their AL forms, MP1/2/3, AAC, AC-3, E-AC-3, PCM) and their parsers, plus libswscale, libswresample
-  and libavutil. Nothing else: no formats, devices, filters, network or autodetected system libraries.
-- **Licence.** Configured --disable-gpl --disable-nonfree --disable-version3, so only LGPL-2.1-or-later code, which
-  combines with pspocket's GPLv2 (D-001). Recorded in third_party/README.md.
-- **Size and time.** About 5 MB of static libraries per platform (libavcodec 3.1 MB), built in 69 s for both on the
-  M4.
-- **Wiring.** CMake makes pspocket::ffmpeg (an INTERFACE target defining PSPOCKET_HAVE_FFMPEG=1) from build/ffmpeg/macos
-  or -DPSPOCKET_FFMPEG_DIR. scripts/ios.sh and app/ios/project.yml add build/ffmpeg/ios's headers and libraries to
-  the app. Without them the media libraries build with their decoders left out (#if PSPOCKET_HAVE_FFMPEG), and
-  decoding fails, logged.
-- **Hardware decoding later.** VideoToolbox (H.264 in hardware) and AudioToolbox can take over a format later, measured
-  against these first (rule 8).
-
 ## D-180 · 2026-10-06 · cellResc on the host: the game's frame goes to the screen as it is
 
 The first of the libraries D-179 moves to pspocket's own. On a PS3, libresc (the resolution scaler) has the RSX draw the
@@ -3334,6 +3381,29 @@ Tests: tests/hle/test_gcm_sys.cpp (cellResc). Covers the checks before and after
 the surface conversion with 4x multisampling, a source flipped through the command buffer and shown (display buffer 0
 holds its geometry, the RSX counts the flip), the buffer address alignments, float arguments in f1 and f2, and the PAL
 combination.
+
+## D-181 · 2026-10-06 · FFmpeg's decoders for pspocket's own media libraries
+
+To run any game with no PS3 firmware file (D-179's direction), video and audio decoding must be pspocket's own. RPCS3
+decodes with FFmpeg in its own cellVdec (H.264, MPEG-2, MPEG-4) and cellAtracXdec (ATRAC3plus), and swscale converts
+the pictures. pspocket's versions of those libraries follow RPCS3's, so they use FFmpeg too.
+
+- **The build.** scripts/build-ffmpeg.sh builds FFmpeg 7.1.1 from the unmodified release tarball, SHA-256 pinned and
+  not kept in the repository (the build needs no network), for macOS arm64 (build/ffmpeg/macos: the Mac's tests and
+  pspocket-boot) and iOS arm64 (build/ffmpeg/ios: the app).
+- **What goes in.** libavcodec with the decoders the PS3's formats need (H.264, MPEG-1/2 video, MPEG-4 part 2; ATRAC3,
+  ATRAC3plus and their AL forms, MP1/2/3, AAC, AC-3, E-AC-3, PCM) and their parsers, plus libswscale, libswresample
+  and libavutil. Nothing else: no formats, devices, filters, network or autodetected system libraries.
+- **Licence.** Configured --disable-gpl --disable-nonfree --disable-version3, so only LGPL-2.1-or-later code, which
+  combines with pspocket's GPLv2 (D-001). Recorded in third_party/README.md.
+- **Size and time.** About 5 MB of static libraries per platform (libavcodec 3.1 MB), built in 69 s for both on the
+  M4.
+- **Wiring.** CMake makes pspocket::ffmpeg (an INTERFACE target defining PSPOCKET_HAVE_FFMPEG=1) from build/ffmpeg/macos
+  or -DPSPOCKET_FFMPEG_DIR. scripts/ios.sh and app/ios/project.yml add build/ffmpeg/ios's headers and libraries to
+  the app. Without them the media libraries build with their decoders left out (#if PSPOCKET_HAVE_FFMPEG), and
+  decoding fails, logged.
+- **Hardware decoding later.** VideoToolbox (H.264 in hardware) and AudioToolbox can take over a format later, measured
+  against these first (rule 8).
 
 ## Open decisions (plan section 14)
 

@@ -571,3 +571,293 @@ TEST_CASE("job chains: a chain halted by an error is joined, and the join return
     CHECK((ps_read8(b, kSpurs + 0xA0 + wid) & 1) == 1); // the shutdown's completion bit
     CHECK(ps_read32(b, kJc + 0x74) == 32);
 }
+
+// ------------------------------------------------------------------------------------------------- D-171
+
+namespace {
+
+constexpr u64 kJobNull = 0xFFFFFFFF80410A11ull, kJobAlign = 0xFFFFFFFF80410A10ull, kJobInval = 0xFFFFFFFF80410A02ull,
+              kJobPerm = 0xFFFFFFFF80410A09ull, kJobStat = 0xFFFFFFFF80410A0Full, kJobBusy = 0xFFFFFFFF80410A0Aull;
+constexpr u32 kOld = kData + 0x5800; // a chain of the old API (0x110 bytes)
+constexpr u32 kOldCmds = kCmds + 0x400;
+
+// The old API's chain over the recorder: descriptors of 128 bytes, grab limit 4, contention 1, tags 4/5.
+u64 create_old_chain(ChainFixture& s, u32 chain, u32 entry, u32 auto_ready_count = 1)
+{
+    return s.a.call("cellSpursCreateJobChain", kSpurs, chain, entry, 0x80, 4, kPrio, 1, auto_ready_count, 4, 5);
+}
+
+} // namespace
+
+// cellSpursCreateJobChain follows libsre: RPCS3's checks the attribute fields the old API has not, and always fails.
+TEST_CASE("job chains (D-171): cellSpursCreateJobChain, the old API, runs with cellSpursKickJobChain",
+    "[hle][spurs][spurs-jobchain]")
+{
+    ChainFixture s;
+    u8* b = s.base;
+    write_desc(b, desc(0), {.out = out(0)});
+    write_desc(b, desc(1), {.out = out(1)});
+    s.cmd(kOldCmds + 0x00, desc(0));
+    s.cmd(kOldCmds + 0x08, desc(1));
+    s.cmd(kOldCmds + 0x10, kEnd);
+
+    // libsre's checks, in its order.
+    CHECK(create_old_chain(s, kOld, 0) == kJobNull);
+    CHECK(create_old_chain(s, kOld, kOldCmds + 4) == kJobAlign);
+    CHECK(s.a.call("cellSpursCreateJobChain", kSpurs, kOld, kOldCmds, 0x80, 0, kPrio, 1, 1, 4, 5) == kJobInval);
+    CHECK(s.a.call("cellSpursCreateJobChain", kSpurs, kOld, kOldCmds, 0x80, 17, kPrio, 1, 1, 4, 5) == kJobInval);
+    CHECK(s.a.call("cellSpursCreateJobChain", kSpurs, kOld, kOldCmds, 0x80, 4, kPrio, 1, 1, 32, 5) == kJobInval);
+    ps_write8(b, kPrio + 3, 16);
+    CHECK(create_old_chain(s, kOld, kOldCmds) == kJobInval);
+    ps_write8(b, kPrio + 3, 1);
+    CHECK(s.a.call("cellSpursCreateJobChain", kSpurs, kOld, kOldCmds, 0x180, 4, kPrio, 1, 1, 4, 5) == kJobInval);
+    CHECK(s.a.call("cellSpursCreateJobChain", 0, kOld, kOldCmds, 0x80, 4, kPrio, 1, 1, 4, 5) == kJobNull);
+    CHECK(s.a.call("cellSpursCreateJobChain", kSpurs, kOld + 0x40, kOldCmds, 0x80, 4, kPrio, 1, 1, 4, 5) == kJobAlign);
+    // Tag 31 is accepted (the attribute's check refuses it from SDK 1.9).
+    std::memset(b + kOld, 0xAB, 0x110);
+    REQUIRE(s.a.call("cellSpursCreateJobChain", kSpurs, kOld, kOldCmds, 0x80, 4, kPrio, 1, 1, 31, 5) == 0);
+    const u32 wid = ps_read32(b, kOld + 0x74);
+    CHECK(wid == s.wid() + 1);
+    CHECK(ps_read64(b, kOld + 0x00) == kOldCmds);
+    CHECK(ps_read8(b, kOld + 0x2A) == 31);
+    CHECK(ps_read8(b, kOld + 0x2B) == 5);
+    CHECK(ps_read8(b, kOld + 0x2C) == 0); // no fixed memory, 0x100-byte descriptors at most, no haltOnError
+    CHECK(ps_read8(b, kOld + 0x2D) == 1); // revision 1 (SDK 3.6)
+    CHECK(ps_read8(b, kOld + 0x24) == 1); // autoReadyCount
+    CHECK(ps_read16(b, kOld + 0x70) == 0x80);
+    CHECK(ps_read16(b, kOld + 0x72) == 4);
+    CHECK(ps_read64(b, kOld + 0x78) == kSpurs);
+    CHECK(ps_read32(b, kOld + 0x80) == 0);
+    CHECK(ps_read32(b, kOld + 0x10C) == 0); // 0x110 bytes cleared
+    REQUIRE(s.a.call("cellSpursShutdownJobChain", kOld) == 0); // created again below with the recorder's tags
+    REQUIRE(s.a.call("cellSpursJoinJobChain", kOld) == 0);
+    REQUIRE(create_old_chain(s, kOld, kOldCmds) == 0);
+
+    // cellSpursRunJobChain is for revisions 2 and 3, cellSpursKickJobChain for 0 and 1.
+    CHECK(s.a.call("cellSpursRunJobChain", kOld) == kJobPerm);
+    CHECK(s.a.call("cellSpursKickJobChain", kJc, 1) == kJobPerm);
+    CHECK(s.a.call("cellSpursKickJobChain", 0, 1) == kJobNull);
+    CHECK(s.a.call("cellSpursKickJobChain", kOld + 0x40, 1) == kJobAlign);
+    REQUIRE(s.a.call("cellSpursKickJobChain", kOld, 0) == 0); // autoReadyCount: count 0 becomes 1 (libsre)
+    REQUIRE(s.wait_done(0));
+    REQUIRE(s.wait_done(1));
+    CHECK(s.rec(0, 0x80) == 1);
+    CHECK(s.rec(1, 0x80) == 2);
+    const u32 old_wid = ps_read32(b, kOld + 0x74);
+    REQUIRE(wait_for([&] { return ps_read8(b, kSpurs + 0x20 + old_wid) == 0 && ps_read8(b, kSpurs + old_wid) == 0; }));
+    CHECK(ps_read64(b, kOld + 0x00) == kOldCmds + 0x10); // on its END
+
+    // Without autoReadyCount the kick stores the count given (libsre; RPCS3 has the two the other way round).
+    constexpr u32 kOld2 = kOld + 0x200;
+    s.cmd(kOldCmds + 0x80, kEnd);
+    REQUIRE(create_old_chain(s, kOld2, kOldCmds + 0x80, 0) == 0);
+    const u32 wid2 = ps_read32(b, kOld2 + 0x74);
+    ps_write8(b, kSpurs + 0xB00 + 0x20 * wid2 + 0x18, 0); // off SPU 0: the count stays as stored
+    REQUIRE(s.a.call("cellSpursKickJobChain", kOld2, 3) == 0);
+    CHECK(ps_read8(b, kSpurs + wid2) == 3);
+}
+
+TEST_CASE("job chains (D-171): ids, errors, the SPURS address, information, exception handlers, grab limits, urgent "
+          "calls", "[hle][spurs][spurs-jobchain]")
+{
+    ChainFixture s;
+    u8* b = s.base;
+    const u32 wid = s.wid();
+    constexpr u32 kOutWord = kData + 0x5700, kInfo = kData + 0x5A00;
+
+    CHECK(s.a.call("cellSpursGetJobChainId", 0, kOutWord) == kJobNull);
+    CHECK(s.a.call("cellSpursGetJobChainId", kJc, 0) == kJobNull);
+    CHECK(s.a.call("cellSpursGetJobChainId", kJc + 0x40, kOutWord) == kJobAlign);
+    REQUIRE(s.a.call("cellSpursGetJobChainId", kJc, kOutWord) == 0);
+    CHECK(ps_read32(b, kOutWord) == wid);
+
+    // cellSpursJobChainGetError: the error word is the result; its cause only with an error (libsre checks cause).
+    CHECK(s.a.call("cellSpursJobChainGetError", kJc, 0) == kJobNull);
+    ps_write32(b, kOutWord, 0x1234);
+    REQUIRE(s.a.call("cellSpursJobChainGetError", kJc, kOutWord) == 0);
+    CHECK(ps_read32(b, kOutWord) == 0);
+    ps_write32(b, kJc + 0x80, 0x80410A18);
+    ps_write64(b, kJc + 0x88, kCmds + 0x18);
+    CHECK(s.a.call("cellSpursJobChainGetError", kJc, kOutWord) == 0xFFFFFFFF80410A18ull);
+    CHECK(ps_read32(b, kOutWord) == kCmds + 0x18);
+
+    // cellSpursGetJobChainInfo (libsre's fields, the grab limit included).
+    ps_write64(b, kJc + 0x30, 0x1111);
+    ps_write64(b, kJc + 0x38, 0x2222);
+    ps_write64(b, kJc + 0x10, 0x3333);
+    ps_write8(b, kJc + 0x23, 1);
+    std::memset(b + kInfo, 0xAB, 0x58);
+    CHECK(s.a.call("cellSpursGetJobChainInfo", kJc, 0) == kJobNull);
+    CHECK(s.a.call("cellSpursGetJobChainInfo", kJc + 0x40, kInfo) == kJobAlign);
+    REQUIRE(s.a.call("cellSpursGetJobChainInfo", kJc, kInfo) == 0);
+    CHECK(ps_read64(b, kInfo + 0x00) == 0x1111);
+    CHECK(ps_read64(b, kInfo + 0x08) == 0x2222);
+    CHECK(ps_read64(b, kInfo + 0x10) == 0);
+    CHECK(ps_read32(b, kInfo + 0x20) == kCmds);        // pc
+    CHECK(ps_read32(b, kInfo + 0x24) == 0);            // link registers
+    CHECK(ps_read32(b, kInfo + 0x28) == 0x3333);
+    CHECK(ps_read32(b, kInfo + 0x30) == kCmds + 0x18); // cause
+    CHECK(ps_read32(b, kInfo + 0x34) == 0x80410A18);   // status
+    CHECK(ps_read32(b, kInfo + 0x38) == 0x100);        // maximum descriptor size
+    CHECK(ps_read32(b, kInfo + 0x3C) == wid);
+    CHECK(ps_read8(b, kInfo + 0x40) == 1);  // autoReadyCount
+    CHECK(ps_read8(b, kInfo + 0x41) == 1);  // isHalted
+    CHECK(ps_read8(b, kInfo + 0x42) == 0);  // isFixedMemAlloc
+    CHECK(ps_read8(b, kInfo + 0x43) == 0xAB);
+    CHECK(ps_read16(b, kInfo + 0x44) == 4); // grab limit
+    CHECK(ps_read32(b, kInfo + 0x48) == 0); // no name
+    CHECK(ps_read32(b, kInfo + 0x4C) == 0);
+    ps_write64(b, kJc + 0x30, 0);
+    ps_write64(b, kJc + 0x38, 0);
+    ps_write64(b, kJc + 0x10, 0);
+    ps_write8(b, kJc + 0x23, 0);
+    ps_write32(b, kJc + 0x80, 0);
+    ps_write64(b, kJc + 0x88, 0);
+
+    // cellSpursJobChainGetSpursAddress (libsre checks the workload ID).
+    REQUIRE(s.a.call("cellSpursJobChainGetSpursAddress", kJc, kOutWord) == 0);
+    CHECK(ps_read32(b, kOutWord) == kSpurs);
+    CHECK(s.a.call("cellSpursJobChainGetSpursAddress", kJc, 0) == kJobNull);
+
+    // The exception handler.
+    CHECK(s.a.call("cellSpursJobChainSetExceptionEventHandler", kJc, 0, 0) == kJobNull);
+    CHECK(s.a.call("cellSpursJobChainSetExceptionEventHandler", kJc + 0x40, 0x5000, 0) == kJobAlign);
+    REQUIRE(s.a.call("cellSpursJobChainSetExceptionEventHandler", kJc, 0x5000, 0x77) == 0);
+    CHECK(ps_read64(b, kJc + 0x98) == 0x5000);
+    CHECK(ps_read64(b, kJc + 0xA0) == 0x77);
+    CHECK(s.a.call("cellSpursJobChainSetExceptionEventHandler", kJc, 0x5000, 0x77) == kJobBusy);
+    REQUIRE(s.a.call("cellSpursGetJobChainInfo", kJc, kInfo) == 0);
+    CHECK(ps_read32(b, kInfo + 0x4C) == 0x5000);
+    CHECK(ps_read32(b, kInfo + 0x50) == 0x77);
+    REQUIRE(s.a.call("cellSpursJobChainUnsetExceptionEventHandler", kJc) == 0);
+    CHECK(ps_read64(b, kJc + 0x98) == 0);
+    CHECK(ps_read64(b, kJc + 0xA0) == 0);
+
+    // A workload ID past 31.
+    ps_write32(b, kJc + 0x74, 40);
+    CHECK(s.a.call("cellSpursJobChainGetSpursAddress", kJc, kOutWord) == kJobInval);
+    CHECK(s.a.call("cellSpursJobChainSetExceptionEventHandler", kJc, 0x5000, 0) == kJobInval);
+    CHECK(s.a.call("cellSpursJobChainUnsetExceptionEventHandler", kJc) == kJobInval);
+    CHECK(s.a.call("cellSpursGetJobChainInfo", kJc, kInfo) == kJobInval);
+    CHECK(s.a.call("cellSpursKickJobChain", kJc, 1) == kJobInval);
+    CHECK(s.a.call("cellSpursJobSetMaxGrab", kJc, 2) == kJobStat);
+    REQUIRE(s.a.call("cellSpursGetJobChainId", kJc, kOutWord) == 0); // not checked
+    CHECK(ps_read32(b, kOutWord) == 40);
+    ps_write32(b, kJc + 0x74, wid);
+
+    // cellSpursJobSetMaxGrab: the limit at 0x72 (libsre); STAT for a chain whose SPURS or workload is not valid.
+    CHECK(s.a.call("cellSpursJobSetMaxGrab", 0, 2) == kJobNull);
+    CHECK(s.a.call("cellSpursJobSetMaxGrab", kJc + 0x40, 2) == kJobAlign);
+    CHECK(s.a.call("cellSpursJobSetMaxGrab", kJc, 0) == kJobInval);
+    CHECK(s.a.call("cellSpursJobSetMaxGrab", kJc, 17) == kJobInval);
+    ps_write64(b, kJc + 0x78, 0);
+    CHECK(s.a.call("cellSpursJobSetMaxGrab", kJc, 2) == kJobStat);
+    ps_write64(b, kJc + 0x78, kSpurs + 0x40);
+    CHECK(s.a.call("cellSpursJobSetMaxGrab", kJc, 2) == kJobStat);
+    ps_write64(b, kJc + 0x78, kSpurs);
+    ps_write32(b, kJc + 0x74, 9); // not registered
+    CHECK(s.a.call("cellSpursJobSetMaxGrab", kJc, 2) == kJobStat);
+    ps_write32(b, kJc + 0x74, wid);
+    REQUIRE(s.a.call("cellSpursJobSetMaxGrab", kJc, 2) == 0);
+    CHECK(ps_read16(b, kJc + 0x72) == 2);
+    CHECK(ps_read16(b, kJc + 0x70) == 0x80); // the descriptor size is left
+
+    // cellSpursAddUrgentCall: a CALL to the list in the first free urgent slot.
+    CHECK(s.a.call("cellSpursAddUrgentCall", kJc, 0) == kJobNull);
+    CHECK(s.a.call("cellSpursAddUrgentCall", kJc, kCmds + 0x204) == kJobAlign);
+    REQUIRE(s.a.call("cellSpursAddUrgentCall", kJc, kCmds + 0x200) == 0);
+    CHECK(ps_read64(b, kJc + 0x30) == kCmds + 0x204); // | CALL
+    ps_write64(b, kJc + 0x30, 0);
+
+    // cellSpursJobChainAttributeSetJobTypeMemoryCheck: the attribute's flag, the chain's 2; the jobs run (the check
+    // itself is not done natively).
+    CHECK(s.a.call("cellSpursJobChainAttributeSetJobTypeMemoryCheck", 0) == kJobNull);
+    CHECK(s.a.call("cellSpursJobChainAttributeSetJobTypeMemoryCheck", kJcAttr + 4) == kJobAlign);
+    REQUIRE(s.a.call("cellSpursJobChainAttributeSetJobTypeMemoryCheck", kJcAttr) == 0);
+    CHECK(ps_read8(b, kJcAttr + 0x3C) == 1);
+    constexpr u32 kChecked = kData + 0x5C00;
+    s.cmd(kCmds + 0x300, desc(0));
+    s.cmd(kCmds + 0x308, kEnd);
+    write_desc(b, desc(0), {.out = out(0)});
+    ps_write32(b, kJcAttr + 0x08, kCmds + 0x300);
+    REQUIRE(s.a.call("cellSpursCreateJobChainWithAttribute", kSpurs, kChecked, kJcAttr) == 0);
+    CHECK(ps_read8(b, kChecked + 0x94) == 2);
+    REQUIRE(s.a.call("cellSpursRunJobChain", kChecked) == 0);
+    REQUIRE(s.wait_done(0));
+}
+
+TEST_CASE("job chains (D-171): guards: initialize, notify runs or kicks the chain waiting on it, reset",
+    "[hle][spurs][spurs-jobchain]")
+{
+    ChainFixture s;
+    u8* b = s.base;
+    constexpr u32 kGuard2 = kGuard + 0x80;
+
+    CHECK(s.a.call("cellSpursJobGuardInitialize", 0, kGuard, 1, 1, 0) == kJobNull);
+    CHECK(s.a.call("cellSpursJobGuardInitialize", kJc, 0, 1, 1, 0) == kJobNull);
+    CHECK(s.a.call("cellSpursJobGuardInitialize", kJc, kGuard + 8, 1, 1, 0) == kJobAlign);
+    const u32 wid = s.wid();
+    ps_write32(b, kJc + 0x74, 40);
+    CHECK(s.a.call("cellSpursJobGuardInitialize", kJc, kGuard, 1, 1, 0) == kJobInval);
+    ps_write32(b, kJc + 0x74, wid);
+    std::memset(b + kGuard, 0xAB, 128);
+    REQUIRE(s.a.call("cellSpursJobGuardInitialize", kJc, kGuard, 1, 0x102, 0x101) == 0);
+    CHECK(ps_read32(b, kGuard + 0x00) == 1);
+    CHECK(ps_read32(b, kGuard + 0x04) == 1);
+    CHECK(ps_read64(b, kGuard + 0x08) == kJc); // a u64, as libsre
+    CHECK(ps_read32(b, kGuard + 0x10) == 2);   // the low bytes
+    CHECK(ps_read32(b, kGuard + 0x20) == 1);
+    CHECK(ps_read32(b, kGuard + 0x30) == 0);
+    CHECK(ps_read32(b, kGuard + 0x7C) == 0);
+
+    // The chain waits on the guard; the notify that brings its count to 0 runs it again (a chain of revision 2 or 3:
+    // cellSpursRunJobChain), and the guard, passed with autoReset, counts from notifyCount again.
+    write_desc(b, desc(0), {.out = out(0)});
+    write_desc(b, desc(1), {.out = out(1)});
+    s.cmd(kCmds + 0x00, desc(0));
+    s.cmd(kCmds + 0x08, guard(kGuard));
+    s.cmd(kCmds + 0x10, desc(1));
+    s.cmd(kCmds + 0x18, kEnd);
+    s.run();
+    REQUIRE(s.wait_done(0));
+    REQUIRE(s.wait_left());
+    CHECK(ps_read32(b, kGuard + 0x30) == 1); // the chain waits on it
+    CHECK_FALSE(s.done(1));
+    CHECK(s.a.call("cellSpursJobGuardNotify", 0) == kJobNull);
+    CHECK(s.a.call("cellSpursJobGuardNotify", kGuard + 8) == kJobAlign);
+    REQUIRE(s.a.call("cellSpursJobGuardNotify", kGuard) == 0);
+    REQUIRE(s.wait_done(1));
+    REQUIRE(s.wait_left());
+    CHECK(ps_read32(b, kGuard + 0x00) == 1); // autoReset
+    CHECK(ps_read32(b, kGuard + 0x30) == 0);
+    // No chain waits now: the count goes down and nothing is run; a notify at 0 is STAT.
+    REQUIRE(s.a.call("cellSpursJobGuardNotify", kGuard) == 0);
+    CHECK(ps_read32(b, kGuard + 0x00) == 0);
+    CHECK(s.a.call("cellSpursJobGuardNotify", kGuard) == kJobStat);
+    CHECK(s.a.call("cellSpursJobGuardReset", 0) == kJobNull);
+    CHECK(s.a.call("cellSpursJobGuardReset", kGuard + 8) == kJobAlign);
+    REQUIRE(s.a.call("cellSpursJobGuardReset", kGuard) == 0);
+    CHECK(ps_read32(b, kGuard + 0x00) == 1);
+
+    // A guard of two notifications on an old-API chain: the last one kicks the chain (cellSpursKickJobChain).
+    write_desc(b, desc(2), {.out = out(2)});
+    write_desc(b, desc(3), {.out = out(3)});
+    s.cmd(kOldCmds + 0x00, desc(2));
+    s.cmd(kOldCmds + 0x08, guard(kGuard2));
+    s.cmd(kOldCmds + 0x10, desc(3));
+    s.cmd(kOldCmds + 0x18, kEnd);
+    REQUIRE(create_old_chain(s, kOld, kOldCmds) == 0);
+    const u32 old_wid = ps_read32(b, kOld + 0x74);
+    REQUIRE(s.a.call("cellSpursJobGuardInitialize", kOld, kGuard2, 2, 1, 0) == 0);
+    REQUIRE(s.a.call("cellSpursKickJobChain", kOld, 0) == 0);
+    REQUIRE(s.wait_done(2));
+    REQUIRE(wait_for([&] { return ps_read32(b, kGuard2 + 0x30) == 1; }));
+    // Blocked on the guard: its ready count 0, and no SPU on it.
+    REQUIRE(wait_for([&] { return ps_read8(b, kSpurs + 0x20 + old_wid) == 0 && ps_read8(b, kSpurs + old_wid) == 0; }));
+    REQUIRE(s.a.call("cellSpursJobGuardNotify", kGuard2) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(s.done(3)); // one notification left
+    REQUIRE(s.a.call("cellSpursJobGuardNotify", kGuard2) == 0);
+    REQUIRE(s.wait_done(3));
+    CHECK(ps_read32(b, kGuard2 + 0x00) == 0); // no autoReset
+}
