@@ -457,6 +457,20 @@ void LleModules::decide(const std::vector<LibraryNeeds>& imports, const std::fun
     choose("the game", imports, {}, syscall_bound);
 }
 
+std::set<std::string, std::less<>> LleModules::choice_for(const std::vector<LibraryNeeds>& imports)
+{
+    quiet_ = true;
+    decide(imports, [](u32) { return true; }); // syscalls only name gaps: they do not change the choice
+    std::set<std::string, std::less<>> chosen = std::move(chosen_);
+    quiet_ = false;
+    decided_ = false;
+    chosen_.clear();
+    refused_.clear();
+    gaps_.clear();
+    host_linked_.clear();
+    return chosen;
+}
+
 void LleModules::extend(std::string_view who, const std::vector<LibraryNeeds>& imports, std::string_view file,
     const std::function<bool(u32)>& syscall_bound)
 {
@@ -561,7 +575,7 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& i
                 changed = true;
                 continue;
             }
-            if (!why.empty() && !chosen_.contains(file))
+            if (!why.empty() && !chosen_.contains(file) && !quiet_)
                 PS_LOG_WARN(kChan, "{} is forced to run as it is although {}", file, why);
             for (const std::string& d : joins)
                 if (candidates.insert(d).second) changed = true;
@@ -601,17 +615,23 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& i
     }
     std::string added_list;
     for (const std::string& f : added) added_list += (added_list.empty() ? "" : ", ") + f;
-    PS_LOG_INFO(kChan, "system libraries for {}: {} firmware module(s) {}{}{}", who, added.size(),
-        decided_ && who != "the game" ? "join" : "run as they are", added_list.empty() ? "" : ": ", added_list);
+    if (!quiet_)
+        PS_LOG_INFO(kChan, "system libraries for {}: {} firmware module(s) {}{}{}", who, added.size(),
+            decided_ && who != "the game" ? "join" : "run as they are", added_list.empty() ? "" : ": ", added_list);
     for (const std::string& f : added) {
         auto list = std::move(gaps[f]);
         if (list.empty()) continue;
+        if (quiet_) {
+            gaps_[f] = std::move(list);
+            continue;
+        }
         std::string shown;
         for (usize i = 0; i < list.size() && i < 6; i++) shown += (i ? ", " : "") + list[i];
         PS_LOG_WARN(kChan, "{} runs as it is; {} of what it needs has no implementation here ({}{}): calls to it fail", f,
             list.size(), shown, list.size() > 6 ? ", ..." : "");
         gaps_[f] = std::move(list);
     }
+    if (quiet_) return;
     for (const auto& [file, why] : refused_)
         if (roots.contains(file) || candidates.contains(file) || who == "the game")
             PS_LOG_WARN(kChan, "{} stays on the host: {}", file, why);

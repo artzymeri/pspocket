@@ -1,10 +1,11 @@
-// spu-check: the game's translated SPU functions against the interpreter, from random states (CLAUDE.md rule 3 on the
-// game's own code, D-132).
+// spu-check: translated SPU functions against the interpreter, from random states (CLAUDE.md rule 3 on the game's own
+// code, D-132).
 //
-//   spu-check DUMP [--trials N] [--steps N] [--seed S] [--program PREFIX] [--entries N]
+//   spu-check DUMP [--library FILE] [--trials N] [--steps N] [--seed S] [--program PREFIX] [--entries N]
 //
 // For each SPU image in DUMP (what scripts/lift-spu.sh lifts: spu_<hash>_<base>.bin and .txt) whose lifted program is
-// built in, and for each of the program's entries (every block start), runs N trials. A trial fills local store with
+// built in, or is in the game or system library FILE (D-191: pspocket-prepare's game.dylib), and for each of the
+// program's entries (every block start), runs N trials. A trial fills local store with
 // random bytes, puts the image's code at its base, points the link register at a stop planted outside the code and
 // the stack pointer into local store, fills the other registers with random values and fixes the timebase; then the
 // interpreter runs it (at most --steps instructions) and the lifted program runs from the same state. Registers,
@@ -13,8 +14,8 @@
 // code is not compared (the lifted code would run what was translated, the
 // interpreter what is there now), nor one the interpreter did not finish.
 //
-// Built only with -DPSPOCKET_GAME_SPU, like pspocket-boot: it runs the game's translated code; nothing of the game is
-// in it.
+// Built with -DPSPOCKET_GAME_SPU, it has the game's translated code built in, like pspocket-boot; nothing of the game
+// is in its source.
 
 #include <signal.h>
 #include <sys/mman.h>
@@ -36,10 +37,13 @@
 #include "pspocket/core/be.h"
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
+#include "pspocket/game/host.hpp"
 #include "pspocket/spu/context.h"
 #include "pspocket/spu/runtime.h"
 
+#if PSPOCKET_HAVE_GAME_SPU
 extern "C" void pspocket_game_spu_register(void); // the game's lifted SPU programs (scripts/lift-spu.sh, D-076)
+#endif
 
 using namespace pspocket;
 
@@ -164,12 +168,19 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
     signal(sig, SIG_DFL);
 }
 
-// Throws away what the trial touched: the pages read as zeros again.
+// Throws away what the trial touched: the pages read as zeros again. A trial that touched more pages than the list
+// holds (random DMA lists reach gigabytes: one of the firmware's decoders touched 178,448 pages, D-191) has the whole
+// sandbox mapped again; else the pages past the list kept their bytes into later trials, which then differed between
+// the interpreter and the lifted run for nothing the lifted code did.
 void reset(Sandbox& box)
 {
     const usize page = GuestMemory::host_page_size();
-    const u32 n = std::min(box.touched_count.exchange(0), Sandbox::kMaxPages);
-    for (u32 i = 0; i < n; i++)
+    const u32 touched = box.touched_count.exchange(0);
+    if (touched > Sandbox::kMaxPages) {
+        ::mmap(box.mem.base(), GuestMemory::kGuestSize, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        return;
+    }
+    for (u32 i = 0; i < touched; i++)
         ::mmap(box.mem.base() + box.touched[i], page, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
 }
 
@@ -178,13 +189,14 @@ void reset(Sandbox& box)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: spu-check DUMP [--trials N] [--steps N] [--seed S] [--program PREFIX] [--entries N]\n");
+        std::fprintf(stderr, "usage: spu-check DUMP [--library FILE] [--trials N] [--steps N] [--seed S] [--program PREFIX] "
+                             "[--entries N]\n");
         return 64;
     }
     const std::filesystem::path dump = argv[1];
     u32 trials = 4, max_entries = 0;
     u64 steps = 200'000, seed = 1;
-    std::string prefix = "spu_";
+    std::string prefix = "spu_", library;
     for (int i = 2; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--trials") trials = static_cast<u32>(std::stoul(v));
@@ -192,6 +204,7 @@ int main(int argc, char** argv)
         else if (a == "--seed") seed = std::stoull(v);
         else if (a == "--program") prefix = v;
         else if (a == "--entries") max_entries = static_cast<u32>(std::stoul(v));
+        else if (a == "--library") library = v;
         else {
             std::fprintf(stderr, "spu-check: unknown option %s\n", a.c_str());
             return 64;
@@ -211,8 +224,24 @@ int main(int argc, char** argv)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGBUS, &sa, &g_previous_bus);
     sigaction(SIGSEGV, &sa, &g_previous_segv);
+    if (!library.empty()) {
+        // Its SPU programs only: no executable or modules to check it against (game::LoadOptions).
+        game::LoadOptions options;
+        options.check_image_words = false;
+        std::string error;
+        if (!game::load_library(library, box_i.mem, nullptr, &error, options)) {
+            std::fprintf(stderr, "spu-check: %s\n", error.c_str());
+            return 1;
+        }
+    } else {
+#if PSPOCKET_HAVE_GAME_SPU
+        pspocket_game_spu_register();
+#else
+        std::fprintf(stderr, "spu-check: this build has no game's SPU programs built in: give --library\n");
+        return 64;
+#endif
+    }
     log::set_min_level(log::Level::Fatal); // random states raise exceptions and misses by the thousand
-    pspocket_game_spu_register();
     ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
     ps_spu_set_timebase_source(fixed_timebase);
 
@@ -268,20 +297,37 @@ int main(int argc, char** argv)
                     unfinished++;
                     continue;
                 }
-                // The lifted run, with a watchdog: what the interpreter finished must finish here too.
+                // The interpreter ran code it wrote over (one of the firmware's decoders filled local store from its
+                // own start, D-191): the lifted code runs what was translated, so the two part ways, and the lifted
+                // run may never stop. Not compared, so not run.
+                if (std::memcmp(ls_i.p + at, im.code.data(), im.code.size()) != 0) {
+                    overwrote++;
+                    continue;
+                }
+                // The lifted run, with a watchdog: what the interpreter finished must finish here too. A stop request
+                // reaches lifted code at back branches and calls; a run that does not stop after it is a failure of
+                // its own, reported rather than waited for.
                 std::atomic<bool> done{false};
                 std::thread watchdog([&] {
-                    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                     while (!done.load() && std::chrono::steady_clock::now() < until)
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    if (!done.load()) __atomic_fetch_or(&cl.attention, PS_SPU_ATTN_STOP, __ATOMIC_ACQ_REL);
+                    if (done.load()) return;
+                    __atomic_fetch_or(&cl.attention, PS_SPU_ATTN_STOP, __ATOMIC_ACQ_REL);
+                    until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                    while (!done.load() && std::chrono::steady_clock::now() < until)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    if (done.load()) return;
+                    std::printf("HANG %s entry %05x seed %llu: the lifted run does not stop (the interpreter stopped at "
+                                "%05x)\n", p->name, entry, static_cast<unsigned long long>(trial_seed), ci.pc);
+                    std::fflush(stdout);
+                    std::_Exit(1);
                 });
                 ps_spu_run(&cl);
                 done = true;
                 watchdog.join();
 
-                if (std::memcmp(ls_i.p + at, im.code.data(), im.code.size()) != 0 ||
-                    std::memcmp(ls_l.p + at, im.code.data(), im.code.size()) != 0) {
+                if (std::memcmp(ls_l.p + at, im.code.data(), im.code.size()) != 0) {
                     overwrote++;
                     continue;
                 }

@@ -88,6 +88,9 @@ public:
     void extend(std::string_view who, const std::vector<LibraryNeeds>& imports, std::string_view file,
         const std::function<bool(u32)>& syscall_bound);
     bool decided() const { return decided_; }
+    // The module files decide() would choose for these imports, worked out without logging and leaving this undecided:
+    // the modules whose SPU programs the system library is to hold for a game (D-191).
+    std::set<std::string, std::less<>> choice_for(const std::vector<LibraryNeeds>& imports);
     bool chosen(std::string_view file) const { return chosen_.contains(file); }
     // The firmware module files decide() chose, and those it refused with the reason (for reports and tests).
     const std::set<std::string, std::less<>>& chosen_files() const { return chosen_; }
@@ -152,6 +155,7 @@ private:
     std::map<std::string, FileInfo, std::less<>> files_;                          // file -> what it exports and needs
     std::vector<std::string> forced_;
     bool decided_ = false;
+    bool quiet_ = false; // choice_for(): no report
     std::set<std::string, std::less<>> chosen_;                         // decide(), extend(): files that run as they are
     std::map<std::string, std::string, std::less<>> refused_;           // file -> why it stays on the host
     std::map<std::string, std::vector<std::string>, std::less<>> gaps_; // chosen file -> what it lacks

@@ -37,11 +37,19 @@ if(PSPOCKET_GAME_SPU)
     pspocket_set_generated_warnings(pspocket_game_spu)
     target_link_libraries(pspocket-boot PRIVATE pspocket_game_spu)
     target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_GAME_SPU=1)
-    # spu-check DUMP: the game's translated SPU functions against the interpreter from random states (D-132).
-    add_executable(spu-check tools/spu_check.cpp)
-    target_link_libraries(spu-check PRIVATE pspocket_game_spu pspocket::spu pspocket::core)
-    pspocket_set_warnings(spu-check)
 endif()
+# spu-check DUMP: translated SPU functions against the interpreter from random states (D-132): the game's built in
+# (-DPSPOCKET_GAME_SPU), or a game or system library's (--library, D-191).
+add_executable(spu-check tools/spu_check.cpp)
+target_link_libraries(spu-check PRIVATE pspocket::game pspocket::spu pspocket::core)
+if(PSPOCKET_GAME_SPU)
+    target_link_libraries(spu-check PRIVATE pspocket_game_spu)
+    target_compile_definitions(spu-check PRIVATE PSPOCKET_HAVE_GAME_SPU=1)
+endif()
+if(APPLE)
+    target_link_options(spu-check PRIVATE -Wl,-no_warn_duplicate_libraries) # the static libraries pspocket::game brings again
+endif()
+pspocket_set_warnings(spu-check)
 
 # The game's PPU code translated ahead of time (D-092): ppu-lift over the executable's loaded segments
 # (--name game_ppu --prefix game_ppu_), from the user's own game, outside the repository (CLAUDE.md rule 1);
