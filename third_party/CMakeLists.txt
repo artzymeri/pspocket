@@ -34,7 +34,7 @@ endif()
 # 3rdparty/libpng/libpng), with the system's zlib. Optional: without it cellPngDec is not pspocket's (the firmware's
 # libpngdec serves the games, D-175).
 set(pspocket_libpng_default "")
-foreach(rpcs3 "${PSPOCKET_RPCS3_DIR}" "${CMAKE_SOURCE_DIR}/../ps3-ios-engine/external/rpcs3")
+foreach(rpcs3 "${PSPOCKET_RPCS3_DIR}" "${CMAKE_SOURCE_DIR}/external/rpcs3")
     if(rpcs3 AND NOT pspocket_libpng_default AND EXISTS "${rpcs3}/3rdparty/libpng/libpng/png.h")
         get_filename_component(pspocket_libpng_default "${rpcs3}/3rdparty/libpng/libpng" ABSOLUTE)
     endif()

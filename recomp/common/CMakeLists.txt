@@ -19,8 +19,8 @@ endforeach()
 # The SELF keys the build carries (D-121), read from RPCS3's key_vault.cpp into the build directory only: keys never go
 # into the repository (CLAUDE.md rule 1). Without an RPCS3 source tree the table is empty and decrypt_self says so.
 set(PSPOCKET_RPCS3_DIR_DEFAULT "")
-if(EXISTS ${CMAKE_SOURCE_DIR}/../ps3-ios-engine/external/rpcs3/rpcs3/Crypto/key_vault.cpp)
-    get_filename_component(PSPOCKET_RPCS3_DIR_DEFAULT ${CMAKE_SOURCE_DIR}/../ps3-ios-engine/external/rpcs3 ABSOLUTE)
+if(EXISTS ${CMAKE_SOURCE_DIR}/external/rpcs3/rpcs3/Crypto/key_vault.cpp)
+    set(PSPOCKET_RPCS3_DIR_DEFAULT ${CMAKE_SOURCE_DIR}/external/rpcs3) # inside pspocket, gitignored
 endif()
 set(PSPOCKET_RPCS3_DIR "${PSPOCKET_RPCS3_DIR_DEFAULT}" CACHE PATH "RPCS3 source tree for the SELF keys (D-121)")
 find_package(Python3 COMPONENTS Interpreter REQUIRED)

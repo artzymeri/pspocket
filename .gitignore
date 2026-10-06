@@ -63,3 +63,6 @@ xcuserdata/
 # --- Logs / traces ---
 *.log
 *.trace
+
+# --- Outside sources the build reads (RPCS3, LLVM): kept inside pspocket, never committed ---
+/external/

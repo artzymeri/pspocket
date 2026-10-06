@@ -4448,6 +4448,23 @@ and libpng's transformations; Sony's behaviour, measured call by call (run 106),
 Tests: tests/hle/test_pngdec.cpp (PNGs built in code by png_writer.hpp: every colour type and bit depth, Adam7, every
 chunk kind; pspocket alone; the comparison with Sony's when the firmware is there; two hidden probes).
 
+## D-201 · 2026-10-06 · Outside sources the build reads live in external/, inside the repository folder
+
+The build reads three things from outside pspocket's own code: the RPCS3 source (the SELF keys for decrypting a game's
+EBOOT, D-121; libpng for cellPngDec, D-199; the reference RPCS3 behaviour is cited from), and the LLVM source the
+on-phone compiler was built from (D-147: build/llvm-host and build/llvm-ios still read its CMake modules and headers).
+Until now they sat beside the repository, in ../ps3-ios-engine/external/rpcs3 (an older project), which looked like a
+separate project and was deleted.
+
+- **Where:** `external/rpcs3` (a shallow clone of RPCS3 with its libpng submodule, libpng 1.6.59 as before) and
+  `external/llvm-project` (LLVM at ca7933e47d3a, the exact revision build/llvm-host was built from, sparse: llvm,
+  clang, lld, cmake, third-party). `/external/` is in .gitignore: nothing in it is ever committed (rule 1 covers the
+  keys it holds).
+- **Defaults:** recomp/common (PSPOCKET_RPCS3_DIR), third_party (PSPOCKET_LIBPNG_DIR) and scripts/build-llvm-ios.sh
+  look in external/ first; the LLVM build trees' configuration was pointed at external/llvm-project (same revision, so
+  nothing was rebuilt).
+- **Rule:** every new outside dependency goes in external/ too, never beside the repository.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

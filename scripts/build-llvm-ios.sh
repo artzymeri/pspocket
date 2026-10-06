@@ -4,17 +4,16 @@
 #
 #   scripts/build-llvm-ios.sh [host|ios|all]
 #
-# Source: an llvm-project checkout at $PSPOCKET_LLVM_SRC (default: the copy RPCS3 bundles, beside this repository in
-# ../ps3-ios-engine/external/rpcs3/3rdparty/llvm/llvm, LLVM 22.1.8), else a shallow clone of llvmorg-22.1.8 into
-# build/llvm-src. Outputs: build/llvm-host (llvm-tblgen and clang-tblgen, which the cross build runs on the Mac) and
+# Source: an llvm-project checkout at $PSPOCKET_LLVM_SRC (default: external/llvm-project inside this repository,
+# gitignored, LLVM 22.1.8 at ca7933e47d3a), else a shallow clone of llvmorg-22.1.8 there. Outputs: build/llvm-host (llvm-tblgen and clang-tblgen, which the cross build runs on the Mac) and
 # build/llvm-ios (the static libraries, AArch64 only, no tools, no tests). Release, no assertions; zlib, zstd, libxml2
 # and terminfo off (nothing to link on iOS). Licence: Apache-2.0 WITH LLVM-exception, compatible with GPLv2 (D-151).
 set -eu
 cd "$(dirname "$0")/.."
 mode=${1:-all}
-src=${PSPOCKET_LLVM_SRC:-$PWD/../ps3-ios-engine/external/rpcs3/3rdparty/llvm/llvm}
+src=${PSPOCKET_LLVM_SRC:-$PWD/external/llvm-project}
 if [[ ! -f $src/llvm/CMakeLists.txt ]]; then
-  src=$PWD/build/llvm-src
+  src=$PWD/external/llvm-project
   if [[ ! -f $src/llvm/CMakeLists.txt ]]; then
     echo "==> cloning llvm-project llvmorg-22.1.8 (shallow) into $src"
     git clone --depth 1 --branch llvmorg-22.1.8 https://github.com/llvm/llvm-project.git $src

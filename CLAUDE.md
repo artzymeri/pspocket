@@ -36,6 +36,10 @@ D-025). The plan is `docs/plan.md`; decisions are `docs/decisions.md`; where thi
 git config core.hooksPath .githooks   # pre-commit refuses PS3 executables, PKGs, SFOs, disc images, key-like text
 ```
 
+Outside sources the build reads live in `external/` (gitignored, never committed, D-201): `external/rpcs3` (RPCS3 with
+its libpng submodule: the SELF keys, libpng) and `external/llvm-project` (the LLVM revision build/llvm-host was built
+from). Anything else from outside goes there too, never beside the repository.
+
 ## Build and test
 
 ```sh
