@@ -39,6 +39,9 @@ add_library(pspocket_hle STATIC
     src/cellImeJp.cpp
     src/cellRec.cpp
     src/cellPamf.cpp
+    src/cellDmux.cpp
+    src/cellDmuxPamf.cpp
+    src/dmux_pamf.cpp
     src/sceNpTrophy.cpp
     src/spu_programs.cpp
     src/spurs_custom.cpp
