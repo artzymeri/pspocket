@@ -114,3 +114,40 @@ TEST_CASE("SPU analyzer: a constant pointing into a function is a label of it, n
     for (const char* e : {"{0x00010u, ", "{0x00014u, ", "{0x00018u, ", "{0x00020u, "})
         CHECK(reg.find(e) != std::string::npos);
 }
+
+TEST_CASE("SPU analyzer: code only a constant reaches is speculative, out of the code words (D-204)")
+{
+    // 0x00: the entry forms 0x20 with an il (a data address as often as a function pointer: Assassin's Creed's jobs
+    // point at their shuffle patterns this way, run 115), calls 0x28 and returns. 0x20: what the constant points at.
+    // 0x28: a real function.
+    const std::vector<u32> program = {
+        as::il(7, 0x20), as::brsl(0, 0x28 - 0x04), as::bi(0), as::lnop(),
+        as::lnop(), as::lnop(), as::lnop(), as::lnop(),
+        as::il(8, 1), as::bi(0),
+        as::il(9, 2), as::bi(0),
+    };
+    for (const bool seeded : {false, true}) {
+        INFO("execution was seen entering 0x20: " << seeded);
+        auto image = load_raw_image(code(program), 0, {0}, "speculative_test");
+        REQUIRE(image);
+        if (seeded) image->seeds.push_back(0x20);
+        const Program p = analyze(*image, {});
+        const Function* data = p.find(0x20);
+        REQUIRE(data);
+        CHECK(data->speculative == !seeded);
+        REQUIRE(p.find(0x28));
+        CHECK_FALSE(p.find(0x28)->speculative); // called by the entry
+        CHECK_FALSE(p.find(0x00)->speculative);
+
+        LiftOptions lift;
+        lift.name = "speculative_test";
+        const LiftResult r = recomp::spu::lift(*image, p, lift);
+        std::string reg;
+        for (const auto& file : r.files)
+            if (file.name == "speculative_test_reg.c") reg = file.content;
+        REQUIRE_FALSE(reg.empty());
+        CHECK(reg.find("{0x00020u, ") != std::string::npos); // lifted and entered either way
+        // Code words: the entry (words 0..2) and 0x28 (words 10, 11), plus 0x20 (words 8, 9) when seeded.
+        CHECK(reg.find(seeded ? "0x00000F07u" : "0x00000C07u") != std::string::npos);
+    }
+}

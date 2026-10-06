@@ -28,6 +28,10 @@ struct Function {
     // Found only by AnalyzerOptions::discover: possibly data decoded as code, so a DMA over it does not make the
     // program stale (the lifter leaves it out of the program's code words, D-155).
     bool discovered = false;
+    // Reached only from an ila/il constant pointing into the code (a data address as often as a function pointer: the
+    // shuffle patterns of Assassin's Creed's jobs, run 115), not from an entry, a seed or a direct call of code that
+    // is: left out of the code words too (D-204).
+    bool speculative = false;
 };
 
 struct Diagnostic {

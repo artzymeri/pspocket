@@ -71,6 +71,7 @@ public:
             drain();
         }
         if (options_.discover) discover(functions, pending, drain);
+        mark_speculative(functions);
         for (auto& [entry, f] : functions) {
             program_.entries.insert(entry);
             program_.functions.push_back(std::move(f));
@@ -91,6 +92,32 @@ private:
         for (auto& [entry, f] : functions)
             if (std::binary_search(f.insns.begin(), f.insns.end(), addr)) return &f;
         return nullptr;
+    }
+
+    // Functions the entries and seeds reach through direct calls are code; the rest of those not found by discovery
+    // were started from constants only. A function holding a seed is code (execution entered it there).
+    void mark_speculative(std::map<u32, Function>& functions) const
+    {
+        std::set<u32> real;
+        std::deque<u32> work;
+        const auto reach = [&](u32 entry) {
+            if (functions.contains(entry) && real.insert(entry).second) work.push_back(entry);
+        };
+        for (const u32 e : image_.entries) reach(e);
+        for (const u32 s : image_.seeds) {
+            if (functions.contains(s)) {
+                reach(s);
+                continue;
+            }
+            for (const auto& [entry, f] : functions)
+                if (std::binary_search(f.insns.begin(), f.insns.end(), s)) reach(entry);
+        }
+        while (!work.empty()) {
+            const Function& f = functions.at(work.front());
+            work.pop_front();
+            for (const u32 c : f.calls) reach(c);
+        }
+        for (auto& [entry, f] : functions) f.speculative = !f.discovered && !real.contains(entry);
     }
 
     // AnalyzerOptions::discover: rounds until nothing new is reached (code found leads to more such places).
