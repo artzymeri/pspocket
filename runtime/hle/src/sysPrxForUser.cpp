@@ -1,21 +1,31 @@
 // sysPrxForUser: the liblv2 user-side library (thread and TLS setup, lightweight sync, process exit, ...).
-// References: RPCS3 rpcs3/Emu/Cell/Modules/sysPrxForUser.cpp, sys_ppu_thread_.cpp, sys_lwmutex_.cpp, sys_prx_.cpp,
-// sys_spinlock.cpp, sys_mmapper_.cpp, sys_spu_.cpp, sys_game_.cpp.
+// References: RPCS3 rpcs3/Emu/Cell/Modules/sysPrxForUser.cpp, sys_ppu_thread_.cpp, sys_lwmutex_.cpp, sys_lwcond_.cpp,
+// sys_prx_.cpp, sys_spinlock.cpp, sys_mmapper_.cpp, sys_mempool.cpp, sys_spu_.cpp, sys_game_.cpp.
 //
 // Implemented: what GTA V's first boot log called (docs/runs/004), plus the rest of the lwmutex set that a created
 // lwmutex is used through, and sys_prx_register_library (a GTA V import); Assassin's Creed's imports: the spinlocks,
-// the sys_mmapper wrappers, sys_process_is_stack, sys_spu_image_close and sys_game_process_exitspawn. Everything else
-// stays unimplemented until a log shows the game calls it (CLAUDE.md rule 4).
+// the sys_mmapper wrappers, sys_process_is_stack, sys_spu_image_close and sys_game_process_exitspawn; and, as RPCS3 has
+// them for every firmware module importing them (D-166, D-168): lwcond, mempool, the atexit list, console output,
+// sys_process_get_paramsfo, sys_get_random_number, sys_mmapper_allocate_memory_from_container and
+// sys_game_process_exitspawn2. The C library and the heaps are in sysPrxForUser_libc.cpp, the PRX functions in
+// sys_prx.cpp.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <mutex>
+#include <optional>
+#include <random>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "guest.hpp"
+#include "idm.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
@@ -30,7 +40,8 @@ constexpr std::string_view kChan = "sysPrxForUser";
 
 // RPCS3 sys_ppu_thread_.cpp sys_initialize_tls. The loader calls it before the executable's entry with the
 // executable's PT_TLS segment (RPCS3 ppu_load_exec queues the same HLE call). Deviation: RPCS3 also creates the
-// "atexit!" lwmutex and the "_lv2ppu" mutex here; they back functions that are not implemented yet.
+// "atexit!" lwmutex and the "_lv2ppu" mutex here; here they are made at their first use
+// (sys_ppu_thread_register_atexit, sys_ppu_thread_once).
 void sys_initialize_tls(PPUContext& ctx, u64 main_thread_id, u32 tls_seg_addr, u32 tls_seg_size, u32 tls_mem_size)
 {
     PS_LOG_INFO(kChan, "sys_initialize_tls(thread {:#x}, image {:#010x}, size {:#x}, mem_size {:#x})", main_thread_id,
@@ -87,13 +98,95 @@ s32 sys_ppu_thread_create(PPUContext& ctx, u32 thread_id, u32 entry, u64 arg, s3
     return lv2::sys_ppu_thread_start(t, static_cast<u32>(ps_read64(base, thread_id)));
 }
 
-// RPCS3 sys_ppu_thread_.cpp sys_ppu_thread_exit: atexit handlers, the TLS block, then the syscall. Deviation: no atexit
-// list (sys_ppu_thread_register_atexit is not implemented, so nothing can be registered).
+// RPCS3 sys_ppu_thread_.cpp g_ppu_atexit: up to eight functions (descriptors) for the whole process, which every
+// sys_ppu_thread_exit calls, in slot order on the exiting thread, under the recursive "atexit!" lwmutex RPCS3's
+// sys_initialize_tls creates. Deviation: a recursive lv2 mutex of that name in its place (it needs no guest memory),
+// made at the first registration; an exit before that has nothing to call.
+struct AtexitState {
+    std::mutex create; // the lv2 mutex's creation
+    std::atomic<u32> lv2_mutex{0};
+    std::array<u32, 8> funcs{}; // guarded by the lv2 mutex
+};
+
+u32 atexit_mutex(PPUContext& ctx, AtexitState& s)
+{
+    if (const u32 m = s.lv2_mutex.load(std::memory_order_acquire)) return m;
+    std::lock_guard lock(s.create);
+    if (const u32 m = s.lv2_mutex.load(std::memory_order_acquire)) return m;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar v(ctx, base, 0x30); // the ID, then sys_mutex_attribute_t
+    const u32 id = v.addr(), attr = v.addr() + 8;
+    ps_write32(base, attr + 0x00, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, attr + 0x04, lv2::SYS_SYNC_RECURSIVE);
+    ps_write32(base, attr + 0x08, lv2::SYS_SYNC_NOT_PROCESS_SHARED);
+    ps_write32(base, attr + 0x0C, lv2::SYS_SYNC_NOT_ADAPTIVE);
+    std::memcpy(base + attr + 0x20, "atexit!", 8);
+    if (const s32 r = lv2::sys_mutex_create(t, id, attr); r != lv2::CELL_OK)
+        PS_FATAL(kChan, "the atexit! mutex: {}", lv2::error_name(r));
+    s.lv2_mutex.store(ps_read32(base, id), std::memory_order_release);
+    return ps_read32(base, id);
+}
+
+// RPCS3: CELL_EPERM when `func` is in the list already (a null one matches a free slot), CELL_ENOMEM when the eight
+// slots are taken.
+s32 sys_ppu_thread_register_atexit(PPUContext& ctx, u32 func)
+{
+    PS_LOG_DEBUG(kChan, "sys_ppu_thread_register_atexit({:#x})", func);
+    lv2::PpuThread& t = thread_of(ctx);
+    AtexitState& s = HleProcess::current()->state<AtexitState>();
+    const u32 m = atexit_mutex(ctx, s);
+    lv2::sys_mutex_lock(t, m, 0);
+    s32 r = lv2::err(lv2::CELL_ENOMEM);
+    if (std::find(s.funcs.begin(), s.funcs.end(), func) != s.funcs.end()) {
+        r = lv2::err(lv2::CELL_EPERM);
+    } else if (const auto slot = std::find(s.funcs.begin(), s.funcs.end(), 0u); slot != s.funcs.end()) {
+        *slot = func;
+        r = lv2::CELL_OK;
+    }
+    lv2::sys_mutex_unlock(t, m);
+    return r;
+}
+
+// RPCS3: CELL_ESRCH when `func` is not in the list.
+s32 sys_ppu_thread_unregister_atexit(PPUContext& ctx, u32 func)
+{
+    PS_LOG_DEBUG(kChan, "sys_ppu_thread_unregister_atexit({:#x})", func);
+    lv2::PpuThread& t = thread_of(ctx);
+    AtexitState& s = HleProcess::current()->state<AtexitState>();
+    const u32 m = atexit_mutex(ctx, s);
+    lv2::sys_mutex_lock(t, m, 0);
+    s32 r = lv2::err(lv2::CELL_ESRCH);
+    if (const auto slot = std::find(s.funcs.begin(), s.funcs.end(), func); slot != s.funcs.end()) {
+        *slot = 0;
+        r = lv2::CELL_OK;
+    }
+    lv2::sys_mutex_unlock(t, m);
+    return r;
+}
+
+// RPCS3 sys_ppu_thread_.cpp sys_ppu_thread_exit: the atexit functions, the TLS block, then the syscall. A function
+// whose descriptor is not guest memory is skipped with the call site logged (RPCS3 faults).
 void sys_ppu_thread_exit(PPUContext& ctx, u64 val)
 {
     lv2::PpuThread& t = thread_of(ctx);
-    if (HleProcess* p = HleProcess::current(); p && ctx.gpr[13] >= kTlsR13Offset) {
-        p->free_tls(static_cast<u32>(ctx.gpr[13]) - kTlsR13Offset);
+    if (HleProcess* p = HleProcess::current()) {
+        AtexitState& s = p->state<AtexitState>();
+        if (const u32 m = s.lv2_mutex.load(std::memory_order_acquire)) {
+            lv2::sys_mutex_lock(t, m, 0);
+            for (usize i = 0; i < s.funcs.size(); i++) {
+                const u32 func = s.funcs[i];
+                if (!func) continue;
+                if (guest_readable(t, func, 8)) {
+                    call_guest(ctx, func, {});
+                } else {
+                    log_call_site(ctx, t.kernel.base(), std::format("sys_ppu_thread_exit: the atexit function {:#x} is "
+                                                                    "not guest memory; skipped", func));
+                }
+            }
+            lv2::sys_mutex_unlock(t, m);
+        }
+        if (ctx.gpr[13] >= kTlsR13Offset) p->free_tls(static_cast<u32>(ctx.gpr[13]) - kTlsR13Offset);
     }
     lv2::_sys_ppu_thread_exit(t, val); // does not return
 }
@@ -166,7 +259,7 @@ void _sys_process_at_Exitspawn(PPUContext&, u32 func)
     PS_LOG_DEBUG(kChan, "_sys_process_at_Exitspawn({:#x})", func);
 }
 
-// RPCS3 sysPrxForUser.cpp sys_process_exit. Deviation: RPCS3 first locks the "_lv2ppu" exit mutex that its
+// RPCS3 sysPrxForUser.cpp sys_process_exit. Deviation: RPCS3 first locks the "_lv2tls" exit mutex that its
 // sys_initialize_tls creates; atexit handlers are a TODO there too.
 void sys_process_exit(PPUContext& ctx, s32 status)
 {
@@ -430,6 +523,216 @@ s32 sys_lwmutex_unlock(PPUContext& ctx, u32 lwmutex)
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------------------------- lwcond
+// User-space half of the lightweight condition variable (RPCS3 sys_lwcond_.cpp, without its hle_lwmutex option): the
+// guest's sys_lwcond_t and the kernel's _sys_lwcond_* (runtime/lv2/src/lw.cpp), with the lwmutex's owner and waiter
+// words kept as the lwmutex functions above keep them. The signal modes: 1 when the caller owns the lwmutex (the
+// waiter moves to the lwmutex's sleep queue, one more waiter counted), 2 when it does not (the waiter locks it again
+// itself), 3 when the caller took it free (it is handed to the waiter); a RETRY lwmutex always uses 2. RPCS3 reads the
+// structures unchecked; here an lwcond, or the lwmutex it names, that is not guest memory (or an lwmutex not 8-byte
+// aligned, as its atomics need) is refused with CELL_EFAULT and the call site logged (D-042).
+
+constexpr u32 kCondMutex = 0x0, kCondQueue = 0x4; // sys_lwcond_t (RPCS3 sys_lwcond.h)
+constexpr u32 kLwmutexSize = 0x18;
+constexpr u64 kAnyThread = 0xFFFFFFFF; // RPCS3's u32{umax}: the first waiter
+
+// RPCS3 lock_var.atomic_op: the owner and waiter words of a sys_lwmutex_t changed in one step.
+template <class Fn>
+void lwmutex_update(u8* base, u32 lwmutex, Fn&& fn)
+{
+    u64* word = host_u64(base, lwmutex + kAllInfo);
+    u64 old = __atomic_load_n(word, __ATOMIC_RELAXED);
+    for (;;) {
+        const u64 v = ps_bswap64(old);
+        u32 owner = static_cast<u32>(v >> 32), waiter = static_cast<u32>(v);
+        fn(owner, waiter);
+        if (__atomic_compare_exchange_n(word, &old, ps_bswap64((u64{owner} << 32) | waiter), true, __ATOMIC_SEQ_CST,
+                __ATOMIC_RELAXED)) {
+            return;
+        }
+    }
+}
+
+// The lwmutex of `lwcond` when both are guest memory, else 0 (refused, logged).
+u32 lwcond_mutex(PPUContext& ctx, u32 lwcond, std::string_view what)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (guest_readable(t, lwcond, 8)) {
+        const u32 lwmutex = ps_read32(base, lwcond + kCondMutex);
+        if (lwmutex % 8 == 0 && guest_readable(t, lwmutex, kLwmutexSize)) return lwmutex;
+    }
+    log_call_site(ctx, base, std::format("{}({:#x}): the lwcond or its lwmutex is not guest memory; CELL_EFAULT", what,
+        lwcond));
+    return 0;
+}
+
+bool lwmutex_retry(u8* base, u32 lwmutex)
+{
+    return (ps_read32(base, lwmutex + kAttribute) & lv2::SYS_SYNC_ATTR_PROTOCOL_MASK) == lv2::SYS_SYNC_RETRY;
+}
+
+s32 sys_lwcond_create(PPUContext& ctx, u32 lwcond, u32 lwmutex, u32 attr)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, lwcond, 8) || !guest_readable(t, lwmutex, kLwmutexSize) || !guest_readable(t, attr, 8)) {
+        log_call_site(ctx, base, std::format("sys_lwcond_create({:#x}, {:#x}, {:#x}): not guest memory; CELL_EFAULT",
+            lwcond, lwmutex, attr));
+        return err(lv2::CELL_EFAULT);
+    }
+    StackVar out_id(ctx, base, 4);
+    if (const s32 r = lv2::_sys_lwcond_create(t, out_id.addr(), ps_read32(base, lwmutex + kSleepQueue), lwcond,
+            ps_read64(base, attr));
+        r != lv2::CELL_OK) {
+        return r;
+    }
+    ps_write32(base, lwcond + kCondMutex, lwmutex);
+    ps_write32(base, lwcond + kCondQueue, ps_read32(base, out_id.addr()));
+    return lv2::CELL_OK;
+}
+
+// RPCS3: the queue ID becomes lwmutex_dead once the kernel has let it go.
+s32 sys_lwcond_destroy(PPUContext& ctx, u32 lwcond)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, lwcond, 8)) {
+        log_call_site(ctx, base, std::format("sys_lwcond_destroy({:#x}): not guest memory; CELL_EFAULT", lwcond));
+        return err(lv2::CELL_EFAULT);
+    }
+    if (const s32 r = lv2::_sys_lwcond_destroy(t, ps_read32(base, lwcond + kCondQueue)); r != lv2::CELL_OK) return r;
+    ps_write32(base, lwcond + kCondQueue, kLwDead);
+    return lv2::CELL_OK;
+}
+
+// sys_lwcond_signal (`target` kAnyThread, `any` true) and sys_lwcond_signal_to, which RPCS3 writes out twice and which
+// differ only in what an error of the syscall becomes: signal ignores "no waiter" (CELL_EPERM in mode 1, CELL_ENOENT
+// in mode 3), signal_to returns it.
+s32 lwcond_signal(PPUContext& ctx, u32 lwcond, u64 target, bool any, std::string_view what)
+{
+    const u32 lwmutex = lwcond_mutex(ctx, lwcond, what);
+    if (!lwmutex) return err(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 queue = ps_read32(base, lwcond + kCondQueue), sleep_queue = ps_read32(base, lwmutex + kSleepQueue);
+    if (lwmutex_retry(base, lwmutex)) return lv2::_sys_lwcond_signal(t, queue, 0, target, 2);
+
+    if (atomic_load_be32(base, lwmutex + kOwner) == t.id) {
+        atomic_add_be64(base, lwmutex + kAllInfo, 1); // the waiter will sleep on the lwmutex
+        if (const s32 r = lv2::_sys_lwcond_signal(t, queue, sleep_queue, target, 1); r != lv2::CELL_OK) {
+            atomic_add_be64(base, lwmutex + kAllInfo, ~u64{0});
+            if (!any || r != err(lv2::CELL_EPERM)) return r;
+        }
+        return lv2::CELL_OK;
+    }
+
+    if (const s32 r = sys_lwmutex_trylock(ctx, lwmutex); r != lv2::CELL_OK) {
+        if (r != err(lv2::CELL_EBUSY)) return err(lv2::CELL_ESRCH);
+        return lv2::_sys_lwcond_signal(t, queue, 0, target, 2);
+    }
+    // Locked: reserved for the waiter, who is handed the lwmutex.
+    lwmutex_update(base, lwmutex, [](u32& owner, u32& waiter) {
+        waiter++;
+        owner = kLwReserved;
+    });
+    if (const s32 r = lv2::_sys_lwcond_signal(t, queue, sleep_queue, target, 3); r != lv2::CELL_OK) {
+        lwmutex_update(base, lwmutex, [&](u32& owner, u32& waiter) {
+            waiter--;
+            owner = t.id;
+        });
+        sys_lwmutex_unlock(ctx, lwmutex);
+        if (!any || r != err(lv2::CELL_ENOENT)) return r;
+    }
+    return lv2::CELL_OK;
+}
+
+s32 sys_lwcond_signal(PPUContext& ctx, u32 lwcond)
+{
+    return lwcond_signal(ctx, lwcond, kAnyThread, true, "sys_lwcond_signal");
+}
+
+s32 sys_lwcond_signal_to(PPUContext& ctx, u32 lwcond, u64 ppu_thread_id)
+{
+    return lwcond_signal(ctx, lwcond, ppu_thread_id, false, "sys_lwcond_signal_to");
+}
+
+// RPCS3: in mode 1 the syscall returns how many waiters moved to the lwmutex's sleep queue, all counted as waiters.
+s32 sys_lwcond_signal_all(PPUContext& ctx, u32 lwcond)
+{
+    const u32 lwmutex = lwcond_mutex(ctx, lwcond, "sys_lwcond_signal_all");
+    if (!lwmutex) return err(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 queue = ps_read32(base, lwcond + kCondQueue), sleep_queue = ps_read32(base, lwmutex + kSleepQueue);
+    if (lwmutex_retry(base, lwmutex)) return lv2::_sys_lwcond_signal_all(t, queue, sleep_queue, 2);
+
+    if (atomic_load_be32(base, lwmutex + kOwner) == t.id) {
+        const s32 r = lv2::_sys_lwcond_signal_all(t, queue, sleep_queue, 1);
+        if (r <= 0) return r; // an error, or none moved
+        atomic_add_be64(base, lwmutex + kAllInfo, static_cast<u64>(r));
+        return lv2::CELL_OK;
+    }
+
+    if (const s32 r = sys_lwmutex_trylock(ctx, lwmutex); r != lv2::CELL_OK) {
+        if (r != err(lv2::CELL_EBUSY)) return err(lv2::CELL_ESRCH);
+        return lv2::_sys_lwcond_signal_all(t, queue, sleep_queue, 2);
+    }
+    s32 r = lv2::_sys_lwcond_signal_all(t, queue, sleep_queue, 1);
+    if (r > 0) {
+        atomic_add_be64(base, lwmutex + kAllInfo, static_cast<u64>(r));
+        r = lv2::CELL_OK;
+    }
+    sys_lwmutex_unlock(ctx, lwmutex);
+    return r;
+}
+
+// RPCS3 sys_lwcond_wait: the caller must own the lwmutex (CELL_EPERM). Its recursion count is kept aside and the owner
+// set to reserved while the kernel sleeps; then CELL_OK (the lwmutex handed over, one waiter less) or CELL_ESRCH give
+// it back to the caller at once, CELL_EBUSY (signalled in mode 2) and CELL_ETIMEDOUT lock it again first (CELL_EBUSY
+// then returns CELL_OK), and CELL_EDEADLK gives it back and returns CELL_ETIMEDOUT. RPCS3 throws on an owner that is
+// free or dead after the handover, and on any other result; pspocket aborts (CLAUDE.md rule 5).
+s32 sys_lwcond_wait(PPUContext& ctx, u32 lwcond, u64 timeout)
+{
+    const u32 lwmutex = lwcond_mutex(ctx, lwcond, "sys_lwcond_wait");
+    if (!lwmutex) return err(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 tid = t.id;
+    if (atomic_load_be32(base, lwmutex + kOwner) != tid) return err(lv2::CELL_EPERM);
+
+    const u32 recursive_value = ps_read32(base, lwmutex + kRecursiveCount);
+    atomic_store_be32(base, lwmutex + kOwner, kLwReserved);
+    ps_write32(base, lwmutex + kRecursiveCount, 0);
+    const s32 res = lv2::_sys_lwcond_queue_wait(t, ps_read32(base, lwcond + kCondQueue),
+        ps_read32(base, lwmutex + kSleepQueue), timeout);
+
+    const auto take_back = [&] {
+        const u32 old = atomic_exchange_be32(base, lwmutex + kOwner, tid);
+        ps_write32(base, lwmutex + kRecursiveCount, recursive_value);
+        if (old == kLwFree || old == kLwDead) {
+            PS_FATAL(kChan, "sys_lwcond_wait({:#010x}): locking failed (lwmutex {:#010x}, owner {:#x})", lwcond,
+                lwmutex, old);
+        }
+    };
+    if (res == lv2::CELL_OK || res == err(lv2::CELL_ESRCH)) {
+        if (res == lv2::CELL_OK) atomic_add_be64(base, lwmutex + kAllInfo, ~u64{0});
+        take_back();
+        return res;
+    }
+    if (res == err(lv2::CELL_EBUSY) || res == err(lv2::CELL_ETIMEDOUT)) {
+        if (const s32 r2 = sys_lwmutex_lock(ctx, lwmutex, 0); r2 != lv2::CELL_OK) return r2;
+        ps_write32(base, lwmutex + kRecursiveCount, recursive_value);
+        return res == err(lv2::CELL_EBUSY) ? lv2::CELL_OK : res;
+    }
+    if (res == err(lv2::CELL_EDEADLK)) {
+        take_back();
+        return err(lv2::CELL_ETIMEDOUT);
+    }
+    PS_FATAL(kChan, "sys_lwcond_wait({:#010x}): unexpected result {} from _sys_lwcond_queue_wait", lwcond,
+        lv2::error_name(res));
+}
+
 // ------------------------------------------------------------------------------------------------- spinlocks
 // RPCS3 sys_spinlock.cpp: a spinlock is one big-endian guest word, 0 when free; lock and trylock exchange 0xabadcafe
 // into it and own the lock when the exchange found 0. Every store goes through the reservation system (one update of
@@ -520,6 +823,14 @@ s32 sys_mmapper_allocate_memory(PPUContext& ctx, u32 size, u64 flags, u32 mem_id
     return lv2::sys_mmapper_allocate_shared_memory(thread_of(ctx), SYS_MMAPPER_NO_SHM_KEY, size, flags, mem_id);
 }
 
+s32 sys_mmapper_allocate_memory_from_container(PPUContext& ctx, u32 size, u32 cid, u64 flags, u32 mem_id)
+{
+    PS_LOG_DEBUG(kChan, "sys_mmapper_allocate_memory_from_container(size {:#x}, container {:#x}, flags {:#x}, mem_id "
+                        "{:#x})", size, cid, flags, mem_id);
+    return lv2::sys_mmapper_allocate_shared_memory_from_container(thread_of(ctx), SYS_MMAPPER_NO_SHM_KEY, size, cid,
+        flags, mem_id);
+}
+
 s32 sys_mmapper_map_memory(PPUContext& ctx, u32 addr, u32 mem_id, u64 flags)
 {
     PS_LOG_DEBUG(kChan, "sys_mmapper_map_memory(addr {:#x}, mem_id {:#x}, flags {:#x})", addr, mem_id, flags);
@@ -536,6 +847,309 @@ s32 sys_mmapper_free_memory(PPUContext& ctx, u32 mem_id)
 {
     PS_LOG_DEBUG(kChan, "sys_mmapper_free_memory(mem_id {:#x})", mem_id);
     return lv2::sys_mmapper_free_shared_memory(thread_of(ctx), mem_id);
+}
+
+// ------------------------------------------------------------------------------------------------- SFO, random, TTY
+
+// RPCS3 sysPrxForUser.cpp: the syscall _sys_process_get_paramsfo (0x40 bytes, the title ID at +1; CELL_ENOENT when the
+// title is not known).
+s32 sys_process_get_paramsfo(PPUContext& ctx, u32 buffer)
+{
+    PS_LOG_DEBUG(kChan, "sys_process_get_paramsfo({:#x})", buffer);
+    return lv2::_sys_process_get_paramsfo(thread_of(ctx), buffer);
+}
+
+constexpr u64 RANDOM_NUMBER_MAX_SIZE = 4096;
+
+// RPCS3 sysPrxForUser.cpp sys_get_random_number: CELL_EINVAL above 4096 bytes, else lv2's
+// sys_ss_random_number_generator(2, addr, size) (lv2/sys_ss.cpp), which fills the buffer from the host's random
+// source; its errors, which RPCS3 maps to CELL_ENOMEM, CELL_EAGAIN, CELL_EINVAL or CELL_EABORT, do not happen for these
+// sizes. lv2 here has no syscall 865 yet, so the library fills the buffer itself, from std::random_device. A buffer
+// that is not guest memory is refused with CELL_EFAULT (D-042; RPCS3 faults).
+s32 sys_get_random_number(PPUContext& ctx, u32 addr, u64 size)
+{
+    PS_LOG_DEBUG(kChan, "sys_get_random_number({:#x}, {})", addr, size);
+    if (size > RANDOM_NUMBER_MAX_SIZE) return err(lv2::CELL_EINVAL);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, addr, static_cast<u32>(size))) {
+        log_call_site(ctx, base, std::format("sys_get_random_number({:#x}, {}): not guest memory; CELL_EFAULT", addr,
+            size));
+        return err(lv2::CELL_EFAULT);
+    }
+    std::random_device random;
+    for (u32 i = 0; i < size; i += 4) {
+        const u32 bits = random();
+        std::memcpy(base + addr + i, &bits, std::min<u64>(4, size - i));
+    }
+    return lv2::CELL_OK;
+}
+
+// RPCS3 sysPrxForUser.cpp console_putc / console_write: the TTY's channel 0 through sys_tty_write (lv2 logs it on the
+// "tty" channel), console_putc's character from a stack variable as RPCS3's vm::var. console_write returns CELL_OK
+// whatever the write returned (a failure is logged here).
+void console_putc(PPUContext& ctx, u8 ch)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar v(ctx, base, 16); // the character, then the written length
+    ps_write8(base, v.addr(), ch);
+    lv2::sys_tty_write(t, 0, v.addr(), 1, v.addr() + 8);
+}
+
+s32 console_write(PPUContext& ctx, u32 data, u32 len)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar written(ctx, base, 4);
+    if (const s32 r = lv2::sys_tty_write(t, 0, data, len, written.addr()); r != lv2::CELL_OK) {
+        log_call_site(ctx, base, std::format("console_write({:#x}, {}): the TTY write returned {}; CELL_OK as RPCS3",
+            data, len, lv2::error_name(r)));
+    }
+    return lv2::CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- sys_mempool
+// RPCS3 sys_mempool.cpp: a pool of fixed-size blocks in a chunk of the game's memory, with an lv2 mutex (priority
+// order, not recursive) and a condition variable of its own, named "mp_m<ID>" and "mp_c<ID>", that
+// sys_mempool_allocate_block waits on for a block. IDs 1..1023 as idm hands them out (memory_pool_t). The pool's
+// fields are the host's (MempoolState's lock, held only briefly); the lv2 mutex orders the guest's calls, as in RPCS3.
+
+struct Mempool {
+    u32 mutex_id = 0, cond_id = 0;
+    u32 chunk = 0;
+    u64 chunk_size = 0, block_size = 0, alignment = 0;
+    // RPCS3 keeps the free blocks' addresses in a vector, the chunk's blocks in order to begin with, and takes from its
+    // end. The same stack in two parts: the chunk's first `fresh` blocks, not taken yet, under the blocks given back
+    // (`returned`), so a chunk of many small blocks costs no host memory.
+    u64 fresh = 0;
+    std::vector<u32> returned;
+
+    u64 count() const { return fresh + returned.size(); }
+    u32 take() // count() > 0
+    {
+        if (!returned.empty()) {
+            const u32 block = returned.back();
+            returned.pop_back();
+            return block;
+        }
+        fresh--;
+        return chunk + static_cast<u32>(fresh) * static_cast<u32>(block_size); // RPCS3's 32-bit arithmetic
+    }
+};
+
+struct MempoolState {
+    std::mutex mutex; // the table and every pool's fields
+    IdTable<std::shared_ptr<Mempool>, 1, 1023> pools;
+
+    std::shared_ptr<Mempool> find(u32 id)
+    {
+        std::lock_guard lock(mutex);
+        const std::shared_ptr<Mempool>* p = pools.find(id);
+        return p ? *p : nullptr;
+    }
+    // The pool's lv2 mutex and condition variable.
+    std::pair<u32, u32> sync_ids(const Mempool& pool)
+    {
+        std::lock_guard lock(mutex);
+        return {pool.mutex_id, pool.cond_id};
+    }
+};
+
+MempoolState& mempools() { return HleProcess::current()->state<MempoolState>(); }
+
+// An lv2 object name (8 bytes) as RPCS3's strcpy_trunc writes it: at most 7 characters, NUL-padded.
+void put_object_name(u8* base, u32 at, std::string_view name)
+{
+    std::memcpy(base + at, name.data(), std::min<usize>(name.size(), 7));
+}
+
+// RPCS3: CELL_EINVAL for a block larger than the chunk, an alignment that is not a power of two (0 and 2 mean 4), or a
+// chunk that is not 8-byte aligned; then the pool with chunk_size / block_size blocks at chunk + i * block_size, its ID
+// in *mempool, its mutex and condition variable. Deviations: a block size of 0 is CELL_EINVAL (RPCS3 divides by it),
+// a mempool pointer that is not guest memory CELL_EFAULT; with all IDs in use CELL_EAGAIN, and an lv2 object that
+// cannot be made returns lv2's error with nothing left behind (RPCS3 crashes or throws).
+s32 sys_mempool_create(PPUContext& ctx, u32 mempool, u32 chunk, u64 chunk_size, u64 block_size, u64 ralignment)
+{
+    PS_LOG_DEBUG(kChan, "sys_mempool_create({:#x}, chunk {:#x}, size {:#x}, block size {:#x}, alignment {})", mempool,
+        chunk, chunk_size, block_size, ralignment);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (block_size > chunk_size) return err(lv2::CELL_EINVAL);
+    const u64 alignment = ralignment == 0 || ralignment == 2 ? 4 : ralignment;
+    if (alignment & (alignment - 1)) return err(lv2::CELL_EINVAL);
+    if (chunk % 8) return err(lv2::CELL_EINVAL);
+    if (block_size == 0) {
+        PS_LOG_ERROR(kChan, "sys_mempool_create: block size 0; CELL_EINVAL (RPCS3 divides by it)");
+        return err(lv2::CELL_EINVAL);
+    }
+    if (!guest_readable(t, mempool, 4)) {
+        log_call_site(ctx, base, std::format("sys_mempool_create({:#x}): not guest memory; CELL_EFAULT", mempool));
+        return err(lv2::CELL_EFAULT);
+    }
+
+    auto pool = std::make_shared<Mempool>();
+    pool->chunk = chunk;
+    pool->chunk_size = chunk_size;
+    pool->block_size = block_size;
+    pool->alignment = alignment;
+    pool->fresh = chunk_size / block_size;
+    MempoolState& s = mempools();
+    u32 id = 0;
+    {
+        std::lock_guard lock(s.mutex);
+        id = s.pools.make(pool);
+    }
+    if (!id) {
+        PS_LOG_ERROR(kChan, "sys_mempool_create: all 1023 mempool IDs in use; CELL_EAGAIN");
+        return err(lv2::CELL_EAGAIN);
+    }
+
+    StackVar v(ctx, base, 0x60); // the mutex ID, the condition variable's, sys_mutex_attribute_t, sys_cond_attribute_t
+    const u32 mutex_id = v.addr(), cond_id = v.addr() + 4, mutex_attr = v.addr() + 0x10, cond_attr = v.addr() + 0x40;
+    ps_write32(base, mutex_attr + 0x00, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, mutex_attr + 0x04, lv2::SYS_SYNC_NOT_RECURSIVE);
+    ps_write32(base, mutex_attr + 0x08, lv2::SYS_SYNC_NOT_PROCESS_SHARED);
+    ps_write32(base, mutex_attr + 0x0C, lv2::SYS_SYNC_NOT_ADAPTIVE);
+    put_object_name(base, mutex_attr + 0x20, std::format("mp_m{}", id));
+    ps_write32(base, cond_attr + 0x00, lv2::SYS_SYNC_NOT_PROCESS_SHARED);
+    put_object_name(base, cond_attr + 0x10, std::format("mp_c{}", id));
+    s32 r = lv2::sys_mutex_create(t, mutex_id, mutex_attr);
+    if (r == lv2::CELL_OK) {
+        r = lv2::sys_cond_create(t, cond_id, ps_read32(base, mutex_id), cond_attr);
+        if (r != lv2::CELL_OK) lv2::sys_mutex_destroy(t, ps_read32(base, mutex_id));
+    }
+    std::lock_guard lock(s.mutex);
+    if (r != lv2::CELL_OK) {
+        s.pools.remove(id);
+        PS_LOG_ERROR(kChan, "sys_mempool_create: its mutex or condition variable: {}", lv2::error_name(r));
+        return r;
+    }
+    pool->mutex_id = ps_read32(base, mutex_id);
+    pool->cond_id = ps_read32(base, cond_id);
+    ps_write32(base, mempool, id);
+    return lv2::CELL_OK;
+}
+
+// RPCS3: the pool goes under its mutex, then the mutex and the condition variable; an ID that is no pool is logged.
+// Deviation: the condition variable is destroyed first (in RPCS3's order lv2 refuses to destroy the mutex, a
+// condition variable still bound to it, and it stays).
+void sys_mempool_destroy(PPUContext& ctx, u32 mempool)
+{
+    PS_LOG_DEBUG(kChan, "sys_mempool_destroy({})", mempool);
+    lv2::PpuThread& t = thread_of(ctx);
+    MempoolState& s = mempools();
+    const std::shared_ptr<Mempool> pool = s.find(mempool);
+    if (!pool) {
+        PS_LOG_ERROR(kChan, "sys_mempool_destroy({}): no such mempool (destroyed already?)", mempool);
+        return;
+    }
+    const auto [m, c] = s.sync_ids(*pool);
+    lv2::sys_mutex_lock(t, m, 0);
+    {
+        std::lock_guard lock(s.mutex);
+        if (const std::shared_ptr<Mempool>* p = s.pools.find(mempool); p && *p == pool) s.pools.remove(mempool);
+    }
+    lv2::sys_mutex_unlock(t, m);
+    lv2::sys_cond_destroy(t, c);
+    lv2::sys_mutex_destroy(t, m);
+}
+
+// RPCS3: CELL_EINVAL for an ID that is no pool or a block past the chunk's end (all it checks); else the block goes
+// back on the stack and a waiting sys_mempool_allocate_block is signalled.
+s32 sys_mempool_free_block(PPUContext& ctx, u32 mempool, u32 block)
+{
+    PS_LOG_DEBUG(kChan, "sys_mempool_free_block({}, {:#x})", mempool, block);
+    lv2::PpuThread& t = thread_of(ctx);
+    MempoolState& s = mempools();
+    const std::shared_ptr<Mempool> pool = s.find(mempool);
+    if (!pool) return err(lv2::CELL_EINVAL);
+    const auto [m, c] = s.sync_ids(*pool);
+    lv2::sys_mutex_lock(t, m, 0);
+    bool outside = false;
+    {
+        std::lock_guard lock(s.mutex);
+        outside = u64{block} > u64{pool->chunk} + pool->chunk_size;
+        if (!outside) pool->returned.push_back(block);
+    }
+    if (outside) {
+        lv2::sys_mutex_unlock(t, m);
+        return err(lv2::CELL_EINVAL);
+    }
+    lv2::sys_cond_signal(t, c);
+    lv2::sys_mutex_unlock(t, m);
+    return lv2::CELL_OK;
+}
+
+// RPCS3: the number of free blocks; CELL_EINVAL for an ID that is no pool, as a u64 (not sign-extended).
+u64 sys_mempool_get_count(PPUContext& ctx, u32 mempool)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    MempoolState& s = mempools();
+    const std::shared_ptr<Mempool> pool = s.find(mempool);
+    if (!pool) return lv2::CELL_EINVAL;
+    const u32 m = s.sync_ids(*pool).first;
+    lv2::sys_mutex_lock(t, m, 0);
+    u64 count = 0;
+    {
+        std::lock_guard lock(s.mutex);
+        count = pool->count();
+    }
+    lv2::sys_mutex_unlock(t, m);
+    return count;
+}
+
+// RPCS3: NULL for an ID that is no pool; else the last free block, waiting on the pool's condition variable while
+// there is none (NULL when the pool is destroyed meanwhile, its mutex with it).
+u32 sys_mempool_allocate_block(PPUContext& ctx, u32 mempool)
+{
+    PS_LOG_DEBUG(kChan, "sys_mempool_allocate_block({})", mempool);
+    lv2::PpuThread& t = thread_of(ctx);
+    MempoolState& s = mempools();
+    std::shared_ptr<Mempool> pool = s.find(mempool);
+    if (!pool) return 0;
+    auto [m, c] = s.sync_ids(*pool);
+    lv2::sys_mutex_lock(t, m, 0);
+    for (;;) {
+        std::optional<u32> block;
+        {
+            std::lock_guard lock(s.mutex);
+            if (pool->count()) block = pool->take();
+        }
+        if (block) {
+            lv2::sys_mutex_unlock(t, m);
+            return *block;
+        }
+        lv2::sys_cond_wait(t, c, 0);
+        pool = s.find(mempool);
+        if (!pool) return 0;
+        std::tie(m, c) = s.sync_ids(*pool);
+    }
+}
+
+// RPCS3: NULL for an ID that is no pool or a pool without a free block; else its last free block, taken under the
+// pool's mutex (waiting for the mutex if another thread holds it). Deviation: the pool is looked at again under the
+// mutex, where RPCS3 takes a block without looking again (from an empty vector if another thread took the last).
+u32 sys_mempool_try_allocate_block(PPUContext& ctx, u32 mempool)
+{
+    PS_LOG_DEBUG(kChan, "sys_mempool_try_allocate_block({})", mempool);
+    lv2::PpuThread& t = thread_of(ctx);
+    MempoolState& s = mempools();
+    const std::shared_ptr<Mempool> pool = s.find(mempool);
+    if (!pool) return 0;
+    {
+        std::lock_guard lock(s.mutex);
+        if (!pool->count()) return 0;
+    }
+    const u32 m = s.sync_ids(*pool).first;
+    lv2::sys_mutex_lock(t, m, 0);
+    u32 block = 0;
+    {
+        std::lock_guard lock(s.mutex);
+        if (pool->count()) block = pool->take();
+    }
+    lv2::sys_mutex_unlock(t, m);
+    return block;
 }
 
 // ------------------------------------------------------------------------------------------------- process, SPU images
@@ -624,18 +1238,19 @@ std::string quoted_list(const std::vector<std::string>& v)
     return out;
 }
 
-// RPCS3 sys_game_.cpp sys_game_process_exitspawn(path, argv, envp, data, data_size, prio, flags): the game ends itself
-// and asks lv2 to start the executable `path` with these arguments. As RPCS3's exitspawn, the parameter block of
-// _sys_process_exit2 goes in the main area: sys_exit2_param {0x85, 0x30, the size after it, prio, flags, the strings'
-// EA} (u64 each); then the path, argv and envp as arrays of u64 pointers that end in 0, and the strings, 16-byte
-// rounded (argv and envp are left out when the block would pass 0x1000 bytes); the game's data (up to 4 KB) in the
-// last 0x1000 bytes. The flags are (flags & 0xf0) with bit 63 set, for which neither the atexitspawn nor the
-// at_Exitspawn handler runs. Then _sys_process_exit2(0, block, size, 0x10000000), which in pspocket ends the process:
-// starting another executable is not implemented (D-031), so the request is logged as an error with its path and
-// arguments. Deviation: RPCS3 first locks the "_lv2ppu" exit mutex, which pspocket's sys_initialize_tls does not create
-// (as sys_process_exit).
-void sys_game_process_exitspawn(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,
-    u64 flags)
+// RPCS3 sys_game_.cpp exitspawn(path, argv, envp, data, data_size, prio, flags), behind sys_game_process_exitspawn and
+// sys_game_process_exitspawn2 with the flags each makes (`spawn_flags`; `flags` is what the game passed): the game ends
+// itself and asks lv2 to start the executable `path` with these arguments. The parameter block of _sys_process_exit2
+// goes in the main area: sys_exit2_param {0x85, 0x30, the size after it, prio, flags, the strings' EA} (u64 each);
+// then the path, argv and envp as arrays of u64 pointers that end in 0, and the strings, 16-byte rounded (argv and
+// envp are left out when the block would pass 0x1000 bytes); the game's data (up to 4 KB) in the last 0x1000 bytes.
+// The flags' top two bits choose a handler to run on this thread first: 0 the one _sys_process_atexitspawn registered,
+// 1 the one _sys_process_at_Exitspawn did. Then _sys_process_exit2(0, block, size, 0x10000000), which in pspocket ends
+// the process: starting another executable is not implemented (D-031), so the request is logged as an error with its
+// path and arguments. Deviation: RPCS3 first locks the "_lv2tls" exit mutex, which pspocket's sys_initialize_tls does
+// not create (as sys_process_exit).
+void exitspawn(PPUContext& ctx, std::string_view what, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,
+    u64 flags, u64 spawn_flags)
 {
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
@@ -653,11 +1268,11 @@ void sys_game_process_exitspawn(PPUContext& ctx, u32 path, u32 argv, u32 envp, u
     const u32 copied = std::min<u32>(data_size, 0x1000);
     const bool data_ok = guest_readable(t, data, copied);
     const u32 block = HleProcess::current()->main_memory().alloc(size);
-    PS_LOG_ERROR(kChan, "sys_game_process_exitspawn(path \"{}\", argv [{}], envp [{}], data {:#x} ({:#x} bytes{}), "
-                        "prio {}, flags {:#x}): starting another executable is not implemented (D-031); the process "
-                        "ends (parameter block {:#010x}, {:#x} bytes{})",
-        file, quoted_list(asked_args), quoted_list(asked_env), data, data_size, data_ok ? "" : ", not readable", prio,
-        flags, block, size, args.size() < asked_args.size() || env.size() < asked_env.size() ?
+    PS_LOG_ERROR(kChan, "{}(path \"{}\", argv [{}], envp [{}], data {:#x} ({:#x} bytes{}), prio {}, flags {:#x}): "
+                        "starting another executable is not implemented (D-031); the process ends (parameter block "
+                        "{:#010x}, {:#x} bytes{})",
+        what, file, quoted_list(asked_args), quoted_list(asked_env), data, data_size, data_ok ? "" : ", not readable",
+        prio, flags, block, size, args.size() < asked_args.size() || env.size() < asked_env.size() ?
             "; argv and envp left out, as RPCS3 does past 0x1000 bytes" : "");
     if (!block) {
         lv2::_sys_process_exit(t, err(lv2::CELL_ENOMEM), 0, 0); // RPCS3: no memory for the block; does not return
@@ -687,9 +1302,33 @@ void sys_game_process_exitspawn(PPUContext& ctx, u32 path, u32 argv, u32 envp, u
     ps_write64(base, block + 0x08, 0x30);
     ps_write64(base, block + 0x10, size - 0x30);
     ps_write64(base, block + 0x18, static_cast<u64>(static_cast<s64>(prio)));
-    ps_write64(base, block + 0x20, (flags & 0xF0) | (u64{1} << 63));
+    ps_write64(base, block + 0x20, spawn_flags);
     ps_write64(base, block + 0x28, block + 0x30);
+    const ExitspawnState& handlers = HleProcess::current()->state<ExitspawnState>();
+    const u64 kind = spawn_flags >> 62;
+    if (const u32 handler = kind == 0 ? handlers.atexitspawn.load() : kind == 1 ? handlers.at_exitspawn.load() : 0) {
+        PS_LOG_INFO(kChan, "{}: the {} handler {:#x} runs", what, kind == 0 ? "atexitspawn" : "at_Exitspawn", handler);
+        if (guest_readable(t, handler, 8)) call_guest(ctx, handler, {});
+        else PS_LOG_ERROR(kChan, "{}: the handler {:#x} is not guest memory; skipped", what, handler);
+    }
     lv2::_sys_process_exit2(t, 0, block, size, 0x10000000); // does not return
+}
+
+// RPCS3 sys_game_.cpp: (flags & 0xf0) with bit 63 set, so neither handler runs.
+void sys_game_process_exitspawn(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,
+    u64 flags)
+{
+    exitspawn(ctx, "sys_game_process_exitspawn", path, argv, envp, data, data_size, prio, flags,
+        (flags & 0xF0) | (u64{1} << 63));
+}
+
+// RPCS3 sys_game_.cpp: the flags' top two bits kept when they are 0 or 1 (the atexitspawn or the at_Exitspawn handler
+// runs), else cleared with everything else above bit 7 (the atexitspawn handler runs); bits 4..7 kept.
+void sys_game_process_exitspawn2(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,
+    u64 flags)
+{
+    exitspawn(ctx, "sys_game_process_exitspawn2", path, argv, envp, data, data_size, prio, flags,
+        (flags >> 62) >= 2 ? flags & 0xF0 : flags & 0xC0000000000000F0ull);
 }
 
 } // namespace
@@ -702,6 +1341,8 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0x24A1EA07, sys_ppu_thread_create),
         PS_HLE_FUNC(0xAFF080A4, sys_ppu_thread_exit),
         PS_HLE_FUNC(0xA3E3BE68, sys_ppu_thread_once),
+        PS_HLE_FUNC(0x3DD4A957, sys_ppu_thread_register_atexit),
+        PS_HLE_FUNC(0xAC6FC404, sys_ppu_thread_unregister_atexit),
         PS_HLE_FUNC(0xE6F2C1E7, sys_process_exit),
         PS_HLE_FUNC(0x2C847572, _sys_process_atexitspawn),
         PS_HLE_FUNC(0x96328741, _sys_process_at_Exitspawn),
@@ -713,14 +1354,32 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0x1573DC3F, sys_lwmutex_lock),
         PS_HLE_FUNC(0xAEB78725, sys_lwmutex_trylock),
         PS_HLE_FUNC(0x1BC200F4, sys_lwmutex_unlock),
+        PS_HLE_FUNC(0xDA0EB71A, sys_lwcond_create),
+        PS_HLE_FUNC(0x1C9A942C, sys_lwcond_destroy),
+        PS_HLE_FUNC(0x2A6D9D51, sys_lwcond_wait),
+        PS_HLE_FUNC(0xEF87A695, sys_lwcond_signal),
+        PS_HLE_FUNC(0xE9A1BD84, sys_lwcond_signal_all),
+        PS_HLE_FUNC(0x52AADADF, sys_lwcond_signal_to),
         PS_HLE_FUNC(0x8C2BB498, sys_spinlock_initialize),
         PS_HLE_FUNC(0xA285139D, sys_spinlock_lock),
         PS_HLE_FUNC(0x722A0254, sys_spinlock_trylock),
         PS_HLE_FUNC(0x5267CB35, sys_spinlock_unlock),
         PS_HLE_FUNC(0xB257540B, sys_mmapper_allocate_memory),
+        PS_HLE_FUNC(0x70258515, sys_mmapper_allocate_memory_from_container),
         PS_HLE_FUNC(0xDC578057, sys_mmapper_map_memory),
         PS_HLE_FUNC(0x4643BA6E, sys_mmapper_unmap_memory),
         PS_HLE_FUNC(0x409AD939, sys_mmapper_free_memory),
+        PS_HLE_FUNC(0xE75C40F2, sys_process_get_paramsfo),
+        PS_HLE_FUNC(0x71A8472A, sys_get_random_number),
+        PS_HLE_FUNC(0xE66BAC36, console_putc),
+        PS_HLE_FUNC(0xF57E1D6F, console_write),
+        PS_HLE_FUNC(0xCA9A60BF, sys_mempool_create),
+        PS_HLE_FUNC(0x9D3C0F81, sys_mempool_destroy),
+        PS_HLE_FUNC(0xA146A143, sys_mempool_allocate_block),
+        PS_HLE_FUNC(0x05C65656, sys_mempool_try_allocate_block),
+        PS_HLE_FUNC(0x608212FC, sys_mempool_free_block),
+        PS_HLE_FUNC(0x25596F51, sys_mempool_get_count),
+        PS_HLE_FUNC(0x67F9FEDB, sys_game_process_exitspawn2),
         PS_HLE_FUNC(0x4F7172C9, sys_process_is_stack),
         PS_HLE_FUNC(0xE0DA8EFD, sys_spu_image_close),
         PS_HLE_FUNC(0xFC52A7A9, sys_game_process_exitspawn),

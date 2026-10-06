@@ -33,6 +33,7 @@ add_library(pspocket_hle STATIC
     src/spurs_scheduler.cpp
     src/spurs_taskset.cpp
     src/sysPrxForUser.cpp
+    src/sysPrxForUser_libc.cpp
     src/sys_fs.cpp
     src/sys_io.cpp
     src/sys_net.cpp
