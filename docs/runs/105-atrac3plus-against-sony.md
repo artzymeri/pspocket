@@ -24,4 +24,14 @@ The first frame of the sequence and the frame after an error come out empty from
 
 ## The gate
 
-Run with D-198 on a quiet machine (below).
+scripts/gate.sh at d431227, three runs of GTA V's walk (load average 4.4 to 5.6; an iOS simulator running PSPocket
+throughout). GTA V does not import cellAdec, so none of the changed code runs in it.
+
+| run | result |
+|---|---|
+| 20261006-211613 (with the 20 test suites, all passed) | 17 of 18: one 5 s window late in the walk compiled 3 new shader programs (564 ms), so 7 programs and pipelines in play against a limit of 4; median 29.8 fps |
+| 20261006-211917 | 17 of 18: one window at 22.0 fps (window 12; the limit is 24); median 29.8; 2 compiled |
+| 20261006-212158 | 18 of 18: median 29.8 fps, slowest window 28.6 |
+
+Each failure is one window at a different moment, with no code GTA V runs changed: interference from the machine,
+not the change. Run 104's gate at c861df4 passed 18 of 18 the first time.
