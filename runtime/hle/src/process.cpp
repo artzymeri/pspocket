@@ -110,6 +110,14 @@ const Function* Registry::find(std::string_view module, u32 nid) const
     return nullptr;
 }
 
+void Registry::add_imports(std::string_view module, std::span<const HostImport> list)
+{
+    for (HostImport i : list) {
+        i.module = module;
+        imports_.push_back(i);
+    }
+}
+
 const Registry& registry()
 {
     static const Registry r = [] {
@@ -259,6 +267,19 @@ u32 HleProcess::descriptor_of(std::string_view module, u32 nid) const
         }
     }
     return 0;
+}
+
+void HleProcess::link_import(std::string_view library, u32 nid, u32 address)
+{
+    std::lock_guard lock(link_mutex_);
+    imports_[{std::string(library), nid}] = address;
+}
+
+u32 HleProcess::imported(std::string_view library, u32 nid) const
+{
+    std::lock_guard lock(link_mutex_);
+    const auto it = imports_.find({std::string(library), nid});
+    return it == imports_.end() ? 0 : it->second;
 }
 
 LinkedFunction* HleProcess::linked_at(u32 cia)

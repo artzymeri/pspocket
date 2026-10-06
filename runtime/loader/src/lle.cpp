@@ -477,9 +477,52 @@ void LleModules::extend(std::string_view who, const std::vector<LibraryNeeds>& i
     if (decided_) choose(who, imports, file, syscall_bound);
 }
 
-void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& imports, std::string_view root_file,
+std::vector<LleModules::LibraryNeeds> LleModules::with_host_imports(const std::vector<LibraryNeeds>& imports) const
+{
+    std::vector<LibraryNeeds> all = imports;
+    for (const LibraryNeeds& need : imports) {
+        for (const hle::HostImport& i : hle::registry().imports()) {
+            if (i.module != need.library || !file_for(i.library)) continue;
+            auto it = std::find_if(all.begin(), all.end(), [&](const LibraryNeeds& n) { return n.library == i.library; });
+            if (it == all.end()) it = all.insert(all.end(), LibraryNeeds{std::string(i.library), {}, {}});
+            std::vector<u32>& nids = i.variable ? it->variables : it->functions;
+            if (std::find(nids.begin(), nids.end(), i.nid) == nids.end()) nids.push_back(i.nid);
+        }
+    }
+    return all;
+}
+
+void LleModules::link_host_imports(const std::vector<LibraryNeeds>& imports, hle::HleProcess& hle)
+{
+    for (const LibraryNeeds& need : imports) {
+        if (chooses(need.library)) continue; // its firmware module imports for itself
+        for (const hle::HostImport& i : hle::registry().imports()) {
+            if (i.module != need.library || hle.imported(i.library, i.nid)) continue;
+            if (!chooses(i.library)) {
+                PS_LOG_DEBUG(kChan, "{} imports {}::{:#010x}: no firmware module gives it", i.module, i.library, i.nid);
+                continue;
+            }
+            std::string why;
+            const PrxModule* m = load(i.library, hle, &why);
+            if (!m) {
+                PS_LOG_ERROR(kChan, "{} needs {}: {}", i.module, i.library, why);
+                continue;
+            }
+            const auto& exports = i.variable ? m->variables : m->functions;
+            const auto it = exports.find({std::string(i.library), i.nid});
+            if (it == exports.end()) {
+                PS_LOG_ERROR(kChan, "{} imports {}::{:#010x}, which {} does not export", i.module, i.library, i.nid, m->file);
+                continue;
+            }
+            hle.link_import(i.library, i.nid, it->second);
+        }
+    }
+}
+
+void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& game_imports, std::string_view root_file,
     const std::function<bool(u32)>& syscall_bound)
 {
+    const std::vector<LibraryNeeds> imports = with_host_imports(game_imports);
     const auto on_host = [](std::string_view library, u32 nid) { return hle::registry().find(library, nid) != nullptr; };
     // A file whose libraries something already linked to the host stays there (a library has one implementation).
     const auto host_bound = [&](std::string_view file) {
@@ -838,10 +881,13 @@ u32 RuntimeModules::load_at(std::string_view path, u64 offset, u32* id)
             elf = std::move(*decrypted);
         }
         // The firmware modules its imports need, chosen as for the game's (D-175).
+        std::vector<LleModules::LibraryNeeds> needs;
         if (lle_ && lle_->decided())
             if (const auto parsed = recomp::ElfFile::parse(elf))
-                if (const auto info = recomp::analyze_ppu_module(*parsed))
-                    lle_->extend(path, LleModules::needs_of(*info), {}, syscall_bound);
+                if (const auto info = recomp::analyze_ppu_module(*parsed)) {
+                    needs = LleModules::needs_of(*info);
+                    lle_->extend(path, needs, {}, syscall_bound);
+                }
         e->owned = std::make_unique<PrxModule>();
         e->owned->file = file;
         std::string why;
@@ -854,6 +900,7 @@ u32 RuntimeModules::load_at(std::string_view path, u64 offset, u32* id)
             return kPrxErrorIllegalLibrary;
         }
         e->module = e->owned.get();
+        if (lle_) lle_->link_host_imports(needs, hle_);
         PS_LOG_INFO(kChan, "{} ({}): {} segments at {:#x}, {} relocations ({} bad), {} functions exported", path,
             e->module->name, e->module->segments.size(), e->module->segments.empty() ? 0 : e->module->segments[0].first,
             e->module->relocations, e->module->relocation_errors, e->module->functions.size());

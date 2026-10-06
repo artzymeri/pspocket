@@ -329,6 +329,8 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
         }
         for (const auto& p : lib.problems) PS_LOG_WARN(kChan, "import library {}: {}", lib.name, p);
     }
+    // What the host's modules for those libraries take from the firmware's (D-197): cellAdec's codec cores.
+    if (lle) lle->link_host_imports(LleModules::needs_of(exe->module()), hle);
     if (lle) rep.lle_modules = static_cast<u32>(lle->loaded().size());
     // Functions the imported modules hand to the game by address (cellGcmCallback), linked while no guest thread runs.
     std::vector<std::string> modules;

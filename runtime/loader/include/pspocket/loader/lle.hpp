@@ -123,6 +123,12 @@ public:
     // the module's code against its translation, D-178).
     void set_on_load(std::function<void(const PrxModule&)> hook) { on_load_ = std::move(hook); }
 
+    // What the host's modules for these import libraries take from the firmware's modules (hle::Registry::add_imports,
+    // D-197), for the libraries the host serves: each module loaded (with what it needs) and each export linked into
+    // HleProcess::link_import. decide() and extend() chose the modules: a library the host imports from counts as one
+    // the game imports. Before guest threads run, or under RuntimeModules' lock.
+    void link_host_imports(const std::vector<LibraryNeeds>& imports, hle::HleProcess& hle);
+
     // Loads the module exporting `library` (once), with the modules its own imports need that the host lacks. nullptr
     // with the reason in *error. Before guest threads run, or under RuntimeModules' lock.
     const PrxModule* load(std::string_view library, hle::HleProcess& hle, std::string* error);
@@ -135,6 +141,10 @@ public:
     const std::vector<u32>& starts() const { return starts_; }
 
 private:
+    // `imports` and what the host's modules for them import from the firmware's (D-197), for the libraries a firmware
+    // module exports: the host's imports are chosen as the game's are.
+    std::vector<LibraryNeeds> with_host_imports(const std::vector<LibraryNeeds>& imports) const;
+
     // What the index knows of a module file: its libraries' exports, its imports and the syscalls its code makes.
     struct FileInfo {
         std::map<std::string, std::set<u32>, std::less<>> export_functions, export_variables;

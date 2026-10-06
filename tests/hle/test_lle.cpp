@@ -516,6 +516,48 @@ TEST_CASE("LLE: per game, a module runs as it is only when the host lacks what t
     fs::remove_all(root);
 }
 
+// D-197: what the host's cellAdec imports from the firmware's codec cores is chosen as the game's imports are, and
+// linked for the host's code: a core module exporting cellAtracXdec's operation table (a synthetic PRX whose library,
+// variable and imported variable are renamed).
+TEST_CASE("LLE: the host's own imports (cellAdec's codec cores) chosen with the game's and linked for the host",
+    "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    const fs::path root = fresh_flash("pspocket-test-lle-host-imports");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    test::PrxOptions o;
+    o.variables = true;
+    const auto x = test::build_ppu_prx(o);
+    constexpr u32 kAtracXOps = 0x4944AF9A;
+    std::vector<u8> core = prx_exporting(x, "cellAtracXdec", 0x12340001);
+    std::fill(core.begin() + 0x320, core.begin() + 0x330, u8{0});
+    std::memcpy(core.data() + 0x320, "cellAtracXdec", 13); // its imported variable: its own
+    ps_st32(core.data() + 0x40C, kAtracXOps);              // the variable it exports
+    ps_st32(core.data() + 0x418, kAtracXOps);              // the variable it imports
+    write(external / "libatxdec.sprx", debug_self(core));
+    const auto bound = [](u32) { return true; };
+    const std::vector<Needs> game = {Needs{"cellAdec", {recomp::nid_of("cellAdecQueryAttr")}, {}}};
+    for (int pass = 0; pass < 2; pass++) { // the second from the cached index
+        INFO("pass " << pass);
+        hle::test::Fixture f;
+        loader::LleModules lle((root / "dev_flash").string());
+        REQUIRE(lle.index());
+        lle.decide({Needs{"cellGcmSys", {recomp::nid_of("cellGcmGetConfiguration")}, {}}}, bound);
+        CHECK(lle.chosen_files().empty()); // no cellAdec, no core
+        lle.decide(game, bound);
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libatxdec.sprx"});
+        lle.link_host_imports(game, *f.hle);
+        REQUIRE(lle.loaded().size() == 1);
+        const auto exported = lle.loaded()[0]->variables.find({"cellAtracXdec", kAtracXOps});
+        REQUIRE(exported != lle.loaded()[0]->variables.end());
+        CHECK(f.hle->imported("cellAtracXdec", kAtracXOps) == exported->second);
+        CHECK(ps_read32(f.base(), exported->second) == test::kPrxVariableValue);
+        CHECK(f.hle->imported("cellMP3dec", 0x84276A23) == 0); // no module exports it
+        CHECK(lle.take_starts().size() == 1);                   // the core starts before the game
+    }
+    fs::remove_all(root);
+}
+
 // D-175: a game's own PRX loaded while it runs needs a firmware module the boot did not choose: the module joins, is
 // loaded for it, and its module_start runs before the PRX's own (on the thread that starts the PRX).
 TEST_CASE("Run-time modules: the firmware modules a game's PRX needs join, and start before it", "[hle][lle][prx]")

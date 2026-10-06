@@ -41,6 +41,7 @@ add_library(pspocket_hle STATIC
     src/cellPamf.cpp
     src/cellDmux.cpp
     src/cellOvis.cpp
+    src/cellAdec.cpp
     src/cellVdec.cpp
     src/cellDmuxPamf.cpp
     src/dmux_pamf.cpp

@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -12,6 +13,7 @@
 #include <type_traits>
 #include <typeindex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
@@ -144,6 +146,12 @@ public:
     // The descriptor of an already linked function, or 0. Safe while guest threads run.
     u32 descriptor_of(std::string_view module, u32 nid) const;
 
+    // A firmware module's export a host module imports (Registry::add_imports, D-197): the variable's address or the
+    // function's descriptor, linked by the loader before guest threads run (or when a module the game loads needs it).
+    // imported() is 0 for what no firmware module gave.
+    void link_import(std::string_view library, u32 nid, u32 address);
+    u32 imported(std::string_view library, u32 nid) const;
+
     // The linked function whose stub is at code address `cia` (descriptor + 4), or nullptr.
     LinkedFunction* linked_at(u32 cia);
     // Modules loaded at run time (D-159); null when nothing installed one.
@@ -201,6 +209,7 @@ private:
     std::vector<Chunk> chunks_;
     std::vector<std::unique_ptr<LinkedFunction>> linked_; // index = chunk * kEntriesPerChunk + entry
     ModuleLoader* module_loader_ = nullptr;
+    std::map<std::pair<std::string, u32>, u32> imports_; // under link_mutex_
     std::atomic<u64> unimplemented_calls_{0};
     std::atomic<u64> stub_calls_{0};
 

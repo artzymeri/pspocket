@@ -44,15 +44,31 @@ struct Function {
     bool internal = false;
 };
 
+// What a host module takes from the firmware's modules, as the firmware's own module of that library imports it
+// (D-197): a codec core's operation table (a variable) or function that pspocket's cellAdec calls for a codec it has no
+// core of its own for, as RPCS3's cellAdec calls the LLE cores. The loader chooses the modules for a game importing
+// `module` as it chooses the game's own (loader::LleModules) and links each export into HleProcess::link_import; HLE
+// code reads it with HleProcess::imported.
+struct HostImport {
+    std::string_view module;  // the host module importing
+    std::string_view library; // the firmware library exporting
+    u32 nid = 0;
+    bool variable = false;
+};
+
 class Registry {
 public:
     // Adds a module's functions (their `module` field is set to `module`). A duplicate (module, NID) aborts.
     void add(std::string_view module, std::initializer_list<Function> list);
     std::span<const Function> functions() const { return functions_; }
     const Function* find(std::string_view module, u32 nid) const;
+    // Adds what `module` imports from firmware modules (their `module` field is set to `module`).
+    void add_imports(std::string_view module, std::span<const HostImport> list);
+    std::span<const HostImport> imports() const { return imports_; }
 
 private:
     std::vector<Function> functions_;
+    std::vector<HostImport> imports_;
 };
 
 // Every module in src/modules.cpp, built on first use.
