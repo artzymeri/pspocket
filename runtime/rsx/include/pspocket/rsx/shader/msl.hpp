@@ -2,13 +2,14 @@
 
 // RSX shader microcode -> Metal Shading Language.
 //
-// This wave translates a working subset (plan section 7: hash with embedded constants masked out, pass the constants
-// in a buffer). Vertex programs: vector MOV MUL ADD MAD DP3 DPH DP4 DST MIN MAX SLT SGE SEQ SNE SGT SLE SFL STR FRC
-// FLR SSG; scalar MOV RCP RCC RSQ EX2 LG2 SIN COS. Fragment programs: MOV MUL ADD MAD DP2 DP3 DP4 MIN MAX DIV RCP
-// RSQ EX2 LG2 SIN COS FRC FLR SLT SGE SLE SGT SNE SEQ STR SFL LRP NRM DDX DDY KIL TEX TXP TXL TXB, plus NOP and the
-// fences. Everything else (flow control, condition codes, address registers, pack/unpack, LIT, texture-in-vertex)
-// fails with an "unsupported" error naming the opcode and its position, so the backend skips the draw loudly.
-// Semantics follow RPCS3 VertexProgramDecompiler.cpp / FragmentProgramDecompiler.cpp, cited per operation.
+// Programs are hashed with embedded constants masked out; the constants reach the shader in a buffer (plan section 7).
+// Vertex programs: every vector op RPCS3 translates, the scalar ops but PSH and POP, condition codes, the address
+// registers and flow control (D-086, D-113). Fragment programs: every op RPCS3 translates (D-174 added LIT, LIF, DST,
+// REFL, DP2A, PKG, UPG, BEM, TEXBEM and TXPBEM), condition codes, IFE, LOOP, REP, BRK and RET, inputs indexed by the
+// loop index. What is left (CAL, POW, BEMLUM, TIMESWTEX, the vertex stack ops) fails with an "unsupported" error
+// naming the opcode and its position, so the backend skips the draw loudly. Semantics follow RPCS3
+// VertexProgramDecompiler.cpp / FragmentProgramDecompiler.cpp, cited per operation; where pspocket differs, the
+// comment says why.
 //
 // Vertex pulling (plan section 7): the vertex shader reads raw guest bytes (big-endian) from a buffer and decodes
 // every attribute itself (RPCS3 GLSLSnippets/RSXProg/RSXVertexFetch.glsl), so the CPU never converts vertex data.
@@ -22,6 +23,11 @@
 #include "pspocket/rsx/shader/ir.hpp"
 
 namespace pspocket::rsx::shader {
+
+// The translation's version: raised whenever the MSL made for a program and its options changes. The shader cache
+// (metal/src/shader_cache.mm) loads only the records of this version: a record of another one holds MSL of the old
+// translation under a key the new one also uses. 2: D-174.
+inline constexpr u32 kTranslationVersion = 2;
 
 // Argument table slots shared by the translator and the Metal backend.
 namespace slot {

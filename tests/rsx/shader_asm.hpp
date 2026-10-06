@@ -151,6 +151,10 @@ struct FpInst {
     // Flow control (IFE, LOOP, REP): SRC1 bits 0-30 (IFE: else offset; LOOP/REP: counters) and SRC2 bits 0-30 (the
     // end offset), in place of sources 1 and 2.
     std::optional<u32> flow_src1, flow_src2;
+    bool texture_expand = false; // OPDEST.exp_tex: _bx2
+    bool indexed = false;        // SRC2.use_index_reg: inputs at TEX(A0.x + index_offset)
+    u32 index_offset = 0;        // SRC2.addr_reg
+    bool perspective = false;    // SRC2.perspective_corr
 };
 
 // IFE's operands: else and end at these byte offsets of the program.
@@ -159,11 +163,19 @@ inline void fp_if(FpInst& in, u32 else_offset, u32 end_offset)
     in.flow_src1 = else_offset >> 2;
     in.flow_src2 = end_offset >> 2;
 }
-// LOOP/REP's operands: for (i = init; i < end; i += inc) up to the end offset.
-inline void fp_loop(FpInst& in, u32 init, u32 end, u32 inc, u32 end_offset)
+// LOOP/REP's operands (SRC1, NV_fragment_program2 LOOP {count, init, increment}): the body runs `count` times up to the
+// end offset; LOOP's index starts at `init` and goes up by `inc` (signed 8-bit) each time.
+inline void fp_loop(FpInst& in, u32 count, u32 init, s32 inc, u32 end_offset)
 {
-    in.flow_src1 = (end << 2) | (init << 10) | (inc << 19);
+    in.flow_src1 = (count << 2) | (init << 10) | ((static_cast<u32>(inc) & 0xff) << 19);
     in.flow_src2 = end_offset >> 2;
+}
+
+// An input read through the loop index: f[TEX(A0.x + offset)] (SRC2.addr_reg, use_index_reg).
+inline void fp_indexed(FpInst& in, u32 offset)
+{
+    in.index_offset = offset;
+    in.indexed = true;
 }
 
 inline u32 fp_src_bits(const FpSrc& s)
@@ -177,15 +189,17 @@ inline u32 fp_src_bits(const FpSrc& s)
 inline void encode_fp(const FpInst& in, std::vector<u8>& bytes)
 {
     const u32 dst = u32{in.end} | (in.dst << 1) | (u32{in.fp16} << 7) | (u32{in.set_cond} << 8) | (u32{in.mask} << 9) |
-        (in.input << 13) | (in.tex << 17) | (in.prec << 22) | ((in.op & 0x3f) << 24) | (u32{in.no_dest} << 30) |
-        (u32{in.saturate} << 31);
+        (in.input << 13) | (in.tex << 17) | (u32{in.texture_expand} << 21) | (in.prec << 22) | ((in.op & 0x3f) << 24) |
+        (u32{in.no_dest} << 30) | (u32{in.saturate} << 31);
     const u32 s0 = fp_src_bits(in.src[0]) | (u32{in.exec_lt} << 18) | (u32{in.exec_eq} << 19) | (u32{in.exec_gt} << 20) |
         (u32{in.cond_sw[0]} << 21) | (u32{in.cond_sw[1]} << 23) | (u32{in.cond_sw[2]} << 25) | (u32{in.cond_sw[3]} << 27) |
         (u32{in.src[0].abs} << 29) | (in.cond_mod_reg << 30) | (in.cond_reg << 31);
     const u32 s1 = (in.flow_src1 ? (*in.flow_src1 & 0x7fffffffu)
                                  : (fp_src_bits(in.src[1]) | (u32{in.src[1].abs} << 18) | (in.scale << 28))) |
         (((in.op >> 6) & 1) << 31);
-    const u32 s2 = in.flow_src2 ? (*in.flow_src2 & 0x7fffffffu) : (fp_src_bits(in.src[2]) | (u32{in.src[2].abs} << 18));
+    const u32 s2 = in.flow_src2 ? (*in.flow_src2 & 0x7fffffffu)
+                                : (fp_src_bits(in.src[2]) | (u32{in.src[2].abs} << 18) | ((in.index_offset & 0x7ff) << 19) |
+                                      (u32{in.indexed} << 30) | (u32{in.perspective} << 31));
     auto put = [&](u32 w) {
         const u32 be = (w << 16) | (w >> 16);
         u8 b[4];

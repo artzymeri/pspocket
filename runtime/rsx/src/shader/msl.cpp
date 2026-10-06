@@ -310,7 +310,9 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
 
         body += std::format("    {{ // {}: {}\n", in.slot, disassemble(in));
         if (vec && static_cast<VpVecOp>(in.vec_op) == VpVecOp::ARL) {
-            // ARL: the address register gets floor(src0) (RPCS3: "$awm = $ifloor($0)").
+            // ARL: the address register gets floor(src0), as NV_vertex_program2 defines ARL for this hardware family
+            // (ARR rounds, its own opcode 0x17; nouveau emits Gallium's floor ARL as opcode 0x0d). RPCS3 now truncates
+            // (VertexProgramDecompiler "ivec4($0)", earlier "$ifloor"): only a negative fraction tells them apart (D-174).
             uses_address = true;
             body += std::format("        a{} = int4(floor({}));\n", in.addr_reg, vp_source(in, 0, temps));
         } else if (vec) {
@@ -502,7 +504,10 @@ struct FpContext {
     std::set<u32> r_written, h_written;
     u32 inputs = 0;
     u32 textures = 0;
-    u32 constant_index = 0; // fc[] slot of the current instruction's constant
+    u32 constant_index = 0;      // fc[] slot of the current instruction's constant
+    std::string index;           // the loop index (A0.x) inputs are indexed by here; empty outside loops
+    bool indexed_inputs = false; // tcs[] (the texture coordinates an index selects from) is declared
+    bool bad_input = false;      // an indexed input past SSA (RPCS3: invalid ucode, nothing drawn)
 };
 
 bool fp_supported(u32 op)
@@ -516,7 +521,8 @@ bool fp_supported(u32 op)
     case FpOp::DDY: case FpOp::KIL: case FpOp::TEX: case FpOp::TXP: case FpOp::TXL: case FpOp::TXB: case FpOp::TXD:
     case FpOp::FENCT: case FpOp::FENCB: case FpOp::DIVSQ: case FpOp::PK16: case FpOp::UP16: case FpOp::RET:
     case FpOp::PKB: case FpOp::UPB: case FpOp::PK4: case FpOp::UP4: case FpOp::PK2: case FpOp::UP2: case FpOp::IFE:
-    case FpOp::LOOP: case FpOp::REP: case FpOp::BRK: return true;
+    case FpOp::LOOP: case FpOp::REP: case FpOp::BRK: case FpOp::LIT: case FpOp::LIF: case FpOp::DST: case FpOp::REFL:
+    case FpOp::DP2A: case FpOp::PKG: case FpOp::UPG: case FpOp::BEM: case FpOp::TEXBEM: case FpOp::TXPBEM: return true;
     default: return false;
     }
 }
@@ -553,7 +559,27 @@ std::string fp_source(FpContext& c, const FpInstruction& in, u32 n)
     case FpRegType::Input: {
         // FragmentProgramDecompiler.cpp GetSRC: COL0/COL1 read clamped to [0, 1]; TEXn with the 2D texcoord control
         // bit read (x, y, 0, w).
-        const u32 id = in.input;
+        u32 id = in.input;
+        if (in.use_index_reg) {
+            // SRC2.use_index_reg: the input is texture coordinate A0.x + addr_reg (NV_fragment_program2
+            // fragment.texcoord[A0.x + n]). A0.x is the loop index: in a loop, the coordinate is picked from tcs[] at
+            // run time, (0, 0, 0, 1) past TEX9 (RPCS3 _indexed_load); outside loops it is 0, so the input is TEX(n)
+            // (RPCS3 GetSRC register_id = addr_reg + 4).
+            if (!c.index.empty()) {
+                c.inputs |= 0x3ffu << 4;
+                c.indexed_inputs = true;
+                const std::string i = std::format("({} + {})", c.index, in.addr_reg);
+                r = std::format("(uint{} < 10u ? tcs[{}] : float4(0.0, 0.0, 0.0, 1.0))", i, i);
+                if (in.perspective_correct) r = std::format("({} * in.position.w)", r);
+                break;
+            }
+            id = in.addr_reg + 4u;
+            if (id > static_cast<u32>(FpInput::SSA)) {
+                c.bad_input = true;
+                r = "float4(0.0)";
+                break;
+            }
+        }
         c.inputs |= 1u << id;
         if (id == 0) {
             r = "wpos";
@@ -613,8 +639,8 @@ std::string fp_condition(const FpInstruction& in)
 TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOptions& opt)
 {
     TranslateResult result;
-    FpContext c{fp, opt, {}, {}, {}, {}, 0, 0, 0};
-    bool uses_divsq = false;
+    FpContext c{fp, opt, {}, {}, {}, {}, 0, 0, 0, {}, false, false};
+    bool uses_divsq = false, uses_lit = false, uses_refl = false, uses_to_srgb = false, uses_from_srgb = false;
     std::string body;
     u32 const_slot = 0;
 
@@ -624,11 +650,18 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     struct Block {
         u32 end;
         bool loop;
+        std::string index; // a loop's index (A0.x) inside it: what indexed inputs read
     };
     std::vector<Block> blocks;
     std::vector<u32> elses;
     u32 loops = 0;
     bool uses_ret_flag = false;
+    const auto loop_index = [&]() -> std::string {
+        for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+            if (it->loop) return it->index;
+        }
+        return {};
+    };
     auto close_blocks = [&](u32 offset) {
         for (auto it = blocks.end(); it != blocks.begin();) {
             --it;
@@ -667,28 +700,45 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
             if (op == FpOp::IFE) {
                 body += std::format("    if ({}) {{\n", cond);
                 if (else_offset != end_offset) elses.push_back(else_offset);
-                blocks.push_back({end_offset, false});
-            } else if (in.never()) {
-                // RPCS3: a loop that never runs is commented out, its body left in line.
-                body += "    // (never: the body runs once, in line)\n";
+                blocks.push_back({end_offset, false, {}});
             } else {
-                // SRC1: end counter bits 2-9, initial value bits 10-17, increment bits 19-26.
+                // SRC1: the loop count (bits 2-9), the loop index's initial value (10-17) and its increment (19-26,
+                // signed). NV_fragment_program2 LOOP: the body runs `count` times, none for 0, and the loop index (A0.x,
+                // which indexed inputs add to their register) is init + k * increment in run k; REP is the same without
+                // the index. RPCS3 runs rep_count times as well (Decompile, "for (i = 0; i < rep_count; i++)"), its
+                // interpreter and pspocket before D-174 from init up to count: a REP that NVIDIA's compilers encode
+                // with all three fields the count (nouveau nv40_fp_rep) never ran. A condition that never holds skips
+                // the loop (RPCS3: "if (false) for (...)"; before D-174 the body ran once).
                 const u32 s1w = in.words[2];
-                const u32 end = (s1w >> 2) & 0xff, init = (s1w >> 10) & 0xff, inc = (s1w >> 19) & 0xff;
-                body += std::format("    if ({}) for (int i{} = {}; i{} < {}; i{} += {}) {{\n", cond, loops, init, loops, end,
-                    loops, std::max<u32>(inc, 1));
+                const u32 count = (s1w >> 2) & 0xff, init = (s1w >> 10) & 0xff;
+                const s32 inc = static_cast<s8>((s1w >> 19) & 0xff);
+                body += std::format("    if ({}) for (int i{} = 0; i{} < {}; i{}++) {{\n", cond, loops, loops, count, loops);
+                std::string index;
+                if (op == FpOp::LOOP) {
+                    index = std::format("a{}", loops);
+                    body += std::format("    const int a{} = {} + i{} * ({}); (void)a{};\n", loops, init, loops, inc, loops);
+                } else {
+                    // A REP leaves the index as the LOOP around it set it (NV_fragment_program2); without one, the
+                    // REP's own counter (RPCS3: inputs indexed by the innermost loop's counter).
+                    index = loop_index();
+                    if (index.empty()) index = std::format("i{}", loops);
+                }
                 loops++;
-                blocks.push_back({end_offset, true});
+                blocks.push_back({end_offset, true, index});
             }
             continue;
         }
         if (op == FpOp::BRK) {
             body += std::format("    // {:04x}: {}\n", in.offset, disassemble(in));
-            if (!in.never()) body += in.always() ? "    break;\n" : std::format("    if (any({})) break;\n", fp_condition(in));
+            if (loops == 0) {
+                body += "    // (outside a loop: no effect, as RPCS3)\n"; // a break here would end the program
+            } else if (!in.never()) {
+                body += in.always() ? "    break;\n" : std::format("    if (any({})) break;\n", fp_condition(in));
+            }
             continue;
         }
         if (in.never()) continue; // conditional execution that never executes
-        if (in.use_index_reg) return fail("indexed input (loop counter)");
+        c.index = loop_index();
         // Condition codes (RPCS3 SetDst, AddCodeCond, AddFlowOp): RC0 and RC1 start at 0. A conditional instruction
         // writes only the destination components whose condition holds; one with set_cond also copies what it wrote
         // to RC{cond_mod_reg}, or without a destination its result when any component's condition holds.
@@ -713,7 +763,14 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         const std::string s0 = fp_source(c, in, 0);
         auto s1 = [&] { return fp_source(c, in, 1); };
         auto s2 = [&] { return fp_source(c, in, 2); };
+        // BEM (RPCS3 handle_tex_srb; NV_fragment_program's X2D): src0.xy plus the 2x2 matrix src2 times src1.xy, in
+        // x and y and again in z and w.
+        const auto bem = [&] {
+            const std::string b = s1(), m = s2();
+            return std::format("(({}).xyxy + ({}).xxxx * ({}).xzxz + ({}).yyyy * ({}).ywyw)", s0, b, m, b, m);
+        };
         std::string e;
+        std::string pre; // statements the result needs first
         bool exempt_prec = false; // ops RPCS3 SetDst does not precision-clamp
         switch (op) {
         case FpOp::MOV: e = s0; break;
@@ -740,6 +797,43 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         case FpOp::UP4: e = std::format("unpack_snorm4x8_to_float(as_type<uint>(({}).x))", s0); break;
         case FpOp::PK2: e = std::format("float4(as_type<float>(half2(({}).xy)))", s0); break;
         case FpOp::UP2: e = std::format("float2(as_type<half2>(as_type<uint>(({}).x))).xyxy", s0); break;
+        // PKG and UPG: PKB and UPB with gamma (RPCS3 _builtin_pkg, _builtin_upg: linear_to_srgb before packing,
+        // srgb_to_linear after unpacking, on all four components).
+        case FpOp::PKG:
+            e = std::format("float4(as_type<float>(pack_float_to_unorm4x8(rsx_linear_to_srgb({}))))", s0);
+            uses_to_srgb = true;
+            break;
+        case FpOp::UPG:
+            e = std::format("rsx_srgb_to_linear(unpack_unorm4x8_to_float(as_type<uint>(({}).x)))", s0);
+            uses_from_srgb = true;
+            break;
+        // LIT (RPCS3 _builtin_lit, as NV_fragment_program) and LIF, the RSX's own (RPCS3 _builtin_lif): neither is
+        // precision-clamped.
+        case FpOp::LIT:
+            e = std::format("rsx_lit({})", s0);
+            uses_lit = exempt_prec = true;
+            break;
+        case FpOp::LIF:
+            e = std::format("rsx_lif({})", s0);
+            uses_lit = exempt_prec = true;
+            break;
+        case FpOp::DST: { // RPCS3: (1, a.y * b.y, a.z, b.w)
+            const std::string b = s1();
+            e = std::format("float4(1.0, ({}).y * ({}).y, ({}).z, ({}).w)", s0, b, s0, b);
+            break;
+        }
+        case FpOp::DP2A: { // RPCS3 DP2A: dot(a.xy, b.xy) + c.x in every component
+            const std::string b = s1(), d = s2();
+            e = std::format("float4(dot(({}).xy, ({}).xy) + ({}).x)", s0, b, d);
+            break;
+        }
+        // REFL (RPCS3: GLSL reflect(src0, src1) = src0 - 2 dot(src1, src0) src1, on four components; not
+        // precision-clamped). NV_fragment_program's RFL reflects src1 about src0 instead; RPCS3's reading is kept.
+        case FpOp::REFL:
+            e = std::format("rsx_refl({}, {})", s0, s1());
+            uses_refl = exempt_prec = true;
+            break;
+        case FpOp::BEM: e = bem(); break;
         case FpOp::RCP: e = std::format("float4(1.0 / ({}).x)", s0); break;
         case FpOp::RSQ: e = std::format("float4(1.0 / sqrt(abs(({}).x)))", s0); break; // RSQ ignores the sign (GTA4)
         case FpOp::EX2: e = std::format("float4(exp2(({}).x))", s0); break;
@@ -767,10 +861,22 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         case FpOp::TXP:
         case FpOp::TXL:
         case FpOp::TXB:
-        case FpOp::TXD: {
+        case FpOp::TXD:
+        case FpOp::TEXBEM:
+        case FpOp::TXPBEM: {
             const u32 t = in.tex;
             c.textures |= 1u << t;
             const TextureKind kind = opt.texture_kind[t];
+            // TEXBEM and TXPBEM (RPCS3 handle_tex_srb, which marks them untested): BEM's transform of the operands into
+            // x2d, then TEX or TXP with x2d as the coordinate.
+            std::string cs = s0; // the coordinate's source
+            FpOp sop = op;       // the sample it is
+            if (op == FpOp::TEXBEM || op == FpOp::TXPBEM) {
+                pre += std::format("        const float4 x2d = {};\n", bem());
+                cs = "x2d";
+                sop = op == FpOp::TEXBEM ? FpOp::TEX : FpOp::TXP;
+            }
+            const bool proj = sop == FpOp::TXP;
             // TXD: the coordinate's derivatives are the second and third sources (RPCS3 FragmentProgramDecompiler.cpp,
             // FUNCTION_TEXTURE_SAMPLE*_GRAD: textureGrad(tex, coord, ddx, ddy)). RPCS3 scales only the coordinate of an
             // unnormalised texture; the derivatives scale with it here, as the derivatives of the scaled coordinate.
@@ -778,19 +884,19 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 return std::format("gradient2d(({}).xy * {}, ({}).xy * {})", s1(), scale, s2(), scale);
             };
             if (kind == TextureKind::Shadow2D || kind == TextureKind::DepthShadow2D) {
-                // The reference is the coordinate's z (TXP: z / w); LOD and bias do not apply to the comparison.
-                const std::string uv = op == FpOp::TXP ? std::format("(({}).xy / ({}).w)", s0, s0) : std::format("({}).xy", s0);
-                const std::string ref = op == FpOp::TXP ? std::format("(({}).z / ({}).w)", s0, s0) : std::format("({}).z", s0);
-                if (op == FpOp::TXD) return fail("TXD on a shadow map");
+                // The reference is the coordinate's z (TXP: z / w); LOD, bias and TXD's derivatives do not apply to the
+                // comparison (RPCS3 maps every sample but TXP to TEX2D_SHADOW, TXP to TEX2D_SHADOWPROJ).
+                const std::string uv = proj ? std::format("(({}).xy / ({}).w)", cs, cs) : std::format("({}).xy", cs);
+                const std::string ref = proj ? std::format("(({}).z / ({}).w)", cs, cs) : std::format("({}).z", cs);
                 e = std::format("{}(t{}, s{}, {} * fp.tex_scale[{}].xy, {}, fp.tex_scale[{}])",
                     kind == TextureKind::Shadow2D ? "rsx_shadow" : "rsx_shadow_depth", t, t, uv, t, ref, t);
             } else if (kind == TextureKind::Depth2D) {
                 // The depth in every channel (RPCS3's depth formats: R in every channel).
-                const std::string uv = op == FpOp::TXP ? std::format("(({}).xy / ({}).w)", s0, s0) : std::format("({}).xy", s0);
+                const std::string uv = proj ? std::format("(({}).xy / ({}).w)", cs, cs) : std::format("({}).xy", cs);
                 const std::string c2 = std::format("({} * fp.tex_scale[{}].xy)", uv, t);
-                switch (op) {
-                case FpOp::TXL: e = std::format("float4(t{}.sample(s{}, {}, level(({}).w)))", t, t, c2, s0); break;
-                case FpOp::TXB: e = std::format("float4(t{}.sample(s{}, {}, bias(({}).w)))", t, t, c2, s0); break;
+                switch (sop) {
+                case FpOp::TXL: e = std::format("float4(t{}.sample(s{}, {}, level(({}).w)))", t, t, c2, cs); break;
+                case FpOp::TXB: e = std::format("float4(t{}.sample(s{}, {}, bias(({}).w)))", t, t, c2, cs); break;
                 case FpOp::TXD:
                     e = std::format("float4(t{}.sample(s{}, {}, {}))", t, t, c2, grad2(std::format("fp.tex_scale[{}].xy", t)));
                     break;
@@ -798,11 +904,11 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 }
             } else if (kind == TextureKind::Tex3D) {
                 // 3D textures (D-102): coord.xyz (TXP: / w); unnormalised coordinates scale x and y.
-                const std::string coord = op == FpOp::TXP ? std::format("(({}).xyz / ({}).w)", s0, s0) : std::format("({}).xyz", s0);
+                const std::string coord = proj ? std::format("(({}).xyz / ({}).w)", cs, cs) : std::format("({}).xyz", cs);
                 const std::string c3 = std::format("({} * float3(fp.tex_scale[{}].xy, 1.0))", coord, t);
-                switch (op) {
-                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, c3, s0); break;
-                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, c3, s0); break;
+                switch (sop) {
+                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, c3, cs); break;
+                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, c3, cs); break;
                 case FpOp::TXD:
                     e = std::format("t{}.sample(s{}, {}, gradient3d(({}).xyz * float3(fp.tex_scale[{}].xy, 1.0), ({}).xyz * "
                         "float3(fp.tex_scale[{}].xy, 1.0)))", t, t, c3, s1(), t, s2(), t);
@@ -810,23 +916,23 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 default: e = std::format("t{}.sample(s{}, {})", t, t, c3); break;
                 }
             } else if (kind == TextureKind::Cube) {
-                switch (op) {
-                case FpOp::TEX: e = std::format("t{}.sample(s{}, ({}).xyz)", t, t, s0); break;
-                case FpOp::TXL: e = std::format("t{}.sample(s{}, ({}).xyz, level(({}).w))", t, t, s0, s0); break;
-                case FpOp::TXB: e = std::format("t{}.sample(s{}, ({}).xyz, bias(({}).w))", t, t, s0, s0); break;
+                // TXP divides the direction by w (RPCS3 TEX3D_PROJ, its cube maps' projected sample).
+                const std::string dir = proj ? std::format("(({}).xyz / ({}).w)", cs, cs) : std::format("({}).xyz", cs);
+                switch (sop) {
+                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, dir, cs); break;
+                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, dir, cs); break;
                 case FpOp::TXD:
-                    e = std::format("t{}.sample(s{}, ({}).xyz, gradientcube(({}).xyz, ({}).xyz))", t, t, s0, s1(), s2());
+                    e = std::format("t{}.sample(s{}, {}, gradientcube(({}).xyz, ({}).xyz))", t, t, dir, s1(), s2());
                     break;
-                default: return fail(std::format("{} on a cube map", fp_op_name(in.op)));
+                default: e = std::format("t{}.sample(s{}, {})", t, t, dir); break;
                 }
             } else {
-                std::string coord = std::format("({}).xy", s0);
-                if (op == FpOp::TXP) coord = std::format("(({}).xy / ({}).w)", s0, s0);
+                std::string coord = proj ? std::format("(({}).xy / ({}).w)", cs, cs) : std::format("({}).xy", cs);
                 if (kind == TextureKind::Tex1D) coord = std::format("float2(({}).x, 0.5)", coord);
                 coord = std::format("({} * fp.tex_scale[{}].xy)", coord, t);
-                switch (op) {
-                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, coord, s0); break;
-                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, coord, s0); break;
+                switch (sop) {
+                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, coord, cs); break;
+                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, coord, cs); break;
                 case FpOp::TXD: {
                     // A 1D texture is a row of a 2D one: its y derivatives are zero.
                     const std::string scale = std::format("fp.tex_scale[{}].xy", t);
@@ -844,6 +950,7 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         }
         default: return fail(std::format("opcode {}", fp_op_name(in.op)));
         }
+        if (c.bad_input) return fail(std::format("input TEX0 + {} (indexed, outside a loop: past SSA)", in.addr_reg));
 
         // Result modifiers (SetDst): scale, then (with a destination) saturate or the destination precision.
         static constexpr const char* kScale[] = {"", " * 2.0", " * 4.0", " * 8.0", "", " / 2.0", " / 4.0", " / 8.0"};
@@ -853,6 +960,7 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         } else if (!in.no_dest && in.prec && !exempt_prec && !(in.prec == 1 && !in.dst_fp16)) {
             e = clamp_precision(e, in.prec);
         }
+        body += pre;
         body += std::format("        const float4 res = {};\n", e);
         const std::string m = mask_suffix(in.mask);
         if (!in.no_dest && in.mask) {
@@ -924,6 +1032,25 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         // when b is zero.
         src += "static float4 rsx_divsq(float4 a, float b) { return select(a, a / sqrt(abs(b)), abs(a) > 0.0); }\n";
     }
+    if (uses_lit) {
+        // RPCS3 RSXProgramCommon.glsl _builtin_lit (NV_fragment_program LIT; y kept above 0 so that 0 to the power 0
+        // is 1) and _builtin_lif.
+        src += "static float4 rsx_lit(float4 v)\n{\n    const float x = max(v.x, 0.0), y = max(v.y, 1e-10);\n"
+               "    return float4(1.0, x, x > 0.0 ? exp2(v.w * log2(y)) : 0.0, 1.0);\n}\n";
+        src += "static float4 rsx_lif(float4 v) { return float4(1.0, v.y, v.y > 0.0 ? exp2(v.w) : 0.0, 1.0); }\n";
+    }
+    if (uses_refl) src += "static float4 rsx_refl(float4 i, float4 n) { return i - 2.0 * dot(n, i) * n; }\n";
+    if (uses_to_srgb) {
+        // RPCS3 RSXFragmentPrologue.glsl linear_to_srgb.
+        src += "static float4 rsx_linear_to_srgb(float4 c)\n{\n"
+               "    const float4 low = c * 12.92, high = 1.055 * pow(c, float4(1.0 / 2.4)) - 0.055;\n"
+               "    return clamp(select(high, low, c < 0.0031308), 0.0, 1.0);\n}\n";
+    }
+    if (uses_from_srgb) {
+        // RPCS3 RSXFragmentPrologue.glsl srgb_to_linear.
+        src += "static float4 rsx_srgb_to_linear(float4 c) { return select(c / 12.92, pow((c + 0.055) / 1.055, "
+               "float4(2.4)), c > 0.04045); }\n";
+    }
     src += "\n";
 
     result.shader.entry = std::format("rsx_fp_{:016x}", fp.hash);
@@ -944,6 +1071,16 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     src += "    const float4 wpos = float4(in.position.x + fp.wpos.z, in.position.y * fp.wpos.x + fp.wpos.y + fp.wpos.z,"
            " in.position.z, in.position.w);\n";
     src += "    const float in_w = 1.0 / in.position.w;\n";
+    if (c.indexed_inputs) {
+        // The texture coordinates a loop-indexed input picks from (RPCS3 _indexed_load), each with its 2D control as when
+        // it is read directly (RPCS3 logs that case and reads the coordinate as it is).
+        src += "    const float4 tcs[10] = {";
+        for (u32 t = 0; t < 10; t++) {
+            if (t) src += ", ";
+            src += (opt.texcoord_2d_mask & (1u << t)) ? std::format("float4(in.tc{}.xy, 0.0, in_w)", t) : std::format("in.tc{}", t);
+        }
+        src += "};\n";
+    }
     src += "    const float4 ssa = float4(front ? 1.0 : -1.0);\n";
     src += "    (void)wpos; (void)in_w; (void)ssa; (void)fc;\n";
     src += "    float4 cc0 = float4(0.0), cc1 = float4(0.0); // condition registers RC0, RC1\n";

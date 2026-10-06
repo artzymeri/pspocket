@@ -7,6 +7,7 @@
 
 #import <Metal/Metal.h>
 
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -509,11 +510,13 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
     points.point_size = true;
     compile(shader::translate_vertex_program(*decoded, points));
 
-    // Every supported FP opcode.
+    // Every supported FP opcode (D-174 added LIT 0x1E, LIF 0x3C, DST 0x07, REFL 0x36, DP2A 0x2E, PKG 0x2C, UPG 0x2D,
+    // BEM 0x2B, TEXBEM 0x33 and TXPBEM 0x34).
     std::vector<FpInst> fp;
     for (u32 op : {0x01u, 0x02u, 0x03u, 0x04u, 0x38u, 0x05u, 0x06u, 0x08u, 0x09u, 0x3Au, 0x1Au, 0x1Bu, 0x1Cu, 0x1Du,
              0x23u, 0x22u, 0x10u, 0x11u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu, 0x20u, 0x21u, 0x1Fu, 0x39u, 0x15u,
-             0x16u, 0x17u, 0x18u, 0x19u, 0x2Fu, 0x31u, 0x3Bu, 0x29u, 0x2Au}) {
+             0x16u, 0x17u, 0x18u, 0x19u, 0x2Fu, 0x31u, 0x3Bu, 0x29u, 0x2Au, 0x1Eu, 0x3Cu, 0x07u, 0x36u, 0x2Eu, 0x2Cu,
+             0x2Du, 0x2Bu, 0x33u, 0x34u}) {
         FpInst in;
         in.op = op;
         in.dst = op % 3;
@@ -549,13 +552,20 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
     fo.texcoord_2d_mask = 0x3;
     fo.alpha_test = true;
     fo.output_swizzle[1] = {2, 1, 4, 4};
-    // TXP/TXL/TXB on the cube unit are rejected; keep unit 1 2D for the compile check.
-    fo.texture_kind[1] = shader::TextureKind::Tex2D;
     compile(shader::translate_fragment_program(*fdecoded, fo));
     fo.flat_colors = true;
     fo.shader_control = 0;
     fo.mrt_count = 1;
     compile(shader::translate_fragment_program(*fdecoded, fo));
+    // Every texture op on every kind of texture (D-174: TXP on cube maps and TXD on shadow maps were refused).
+    for (const auto kind : {shader::TextureKind::Tex2D, shader::TextureKind::Cube, shader::TextureKind::Tex1D,
+             shader::TextureKind::Shadow2D, shader::TextureKind::Tex3D, shader::TextureKind::Depth2D,
+             shader::TextureKind::DepthShadow2D}) {
+        INFO(std::format("texture kind {}", static_cast<u32>(kind)));
+        shader::FpOptions k;
+        k.texture_kind.fill(kind);
+        compile(shader::translate_fragment_program(*fdecoded, k));
+    }
 
     // Condition codes: RC0 set without a destination, a conditional masked write, RC1 set with one, a conditional KIL.
     FpInst set;
@@ -641,7 +651,7 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
         b.constant = std::array<float, 4>{0.f, 1.f, 0.f, 1.f};
         FpInst loop;
         loop.op = 0x43;
-        fp_loop(loop, 0, 4, 1, 0x100);
+        fp_loop(loop, 4, 0, 1, 0x100);
         std::vector<FpInst> prog{setcc, ife, a, b, loop};
         for (u32 op : {0x27u, 0x28u, 0x13u, 0x14u, 0x24u, 0x25u}) { // PKB UPB PK4 UP4 PK2 UP2 at 0x70..0xC0
             FpInst p;
@@ -3019,12 +3029,288 @@ TEST_CASE("metal e2e: every Nth flip is also copied to the CPU (capture)")
           std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the blue clear, in BGRA
 }
 
+// ---- D-174: fragment program ops and texture controls, run on the GPU -------------------------------------------
+
+namespace {
+
+std::string failure_text(const E2E& e)
+{
+    std::string s;
+    for (const auto& f : e.failures) s += f.message + "\n";
+    return s;
+}
+
+// Fragment program `prog` (32-bit exports: R0 is the colour) drawn over the triangle into a kW x kH F_W32Z32Y32X32
+// target: pixel (32, 48) as floats. `setup` adds commands before the draw (textures, a vertex program of its own).
+std::array<float, 4> fp_pixel(const std::vector<FpInst>& prog, const std::function<void(E2E&, CommandBuilder&)>& setup = {})
+{
+    E2E e;
+    e.put_local_bytes(kFpOffset, assemble_fp(prog));
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    auto b = e.at(0);
+    setup_surface_as(b, kSurfaceOffset, SurfaceColorFormat::F_W32Z32Y32X32, kW * 16);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    if (setup) setup(e, b);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    INFO(failure_text(e));
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().draws == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 16));
+    const u8* p = e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + (48 * kW + 32) * 16);
+    return {ps_ldf32(p), ps_ldf32(p + 4), ps_ldf32(p + 8), ps_ldf32(p + 12)};
+}
+
+bool near(const std::array<float, 4>& a, const std::array<float, 4>& b, float tolerance = 1e-5f)
+{
+    for (u32 i = 0; i < 4; i++) {
+        if (!(std::abs(a[i] - b[i]) <= tolerance * std::max(1.f, std::abs(b[i])))) return false;
+    }
+    return true;
+}
+
+std::string show(const std::array<float, 4>& v) { return std::format("({}, {}, {}, {})", v[0], v[1], v[2], v[3]); }
+
+#define CHECK_NEAR4(a, b)                                                                                               \
+    do {                                                                                                                \
+        const auto got_ = (a);                                                                                          \
+        const std::array<float, 4> want_ = b;                                                                           \
+        INFO("got " << show(got_) << ", want " << show(want_));                                                         \
+        CHECK(near(got_, want_));                                                                                       \
+    } while (0)
+
+// MOV R<dst>, {k}
+FpInst fp_mov_const(u32 dst, std::array<float, 4> k)
+{
+    FpInst in;
+    in.op = 0x01;
+    in.dst = dst;
+    in.src[0] = fp_const();
+    in.constant = k;
+    return in;
+}
+
+// OP R0, {k}, R1, R2 (with the end bit)
+FpInst fp_op_const(u32 op, std::array<float, 4> k)
+{
+    FpInst in;
+    in.op = op;
+    in.dst = 0;
+    in.src[0] = fp_const();
+    in.constant = k;
+    in.src[1] = fp_r(1);
+    in.src[2] = fp_r(2);
+    in.end = true;
+    return in;
+}
+
+// RPCS3 RSXFragmentPrologue.glsl srgb_to_linear, on the CPU.
+float srgb_to_linear(float c) { return c > 0.04045f ? std::pow((c + 0.055f) / 1.055f, 2.4f) : c / 12.92f; }
+
+} // namespace
+
+TEST_CASE("metal e2e: LIT, LIF, DST, REFL, DP2A and BEM compute what RPCS3 computes (D-174)")
+{
+    REQUIRE_METAL();
+    // LIT (RPCS3 _builtin_lit): (1, max(x, 0), x > 0 ? max(y, 0) ^ w : 0, 1), y kept above 0 so that 0 ^ 0 is 1.
+    CHECK_NEAR4(fp_pixel({fp_op_const(0x1E, {0.5f, 0.25f, 7.f, 2.f})}), (std::array<float, 4>{1.f, 0.5f, 0.0625f, 1.f}));
+    CHECK_NEAR4(fp_pixel({fp_op_const(0x1E, {-1.f, 0.5f, 7.f, 2.f})}), (std::array<float, 4>{1.f, 0.f, 0.f, 1.f}));
+    CHECK_NEAR4(fp_pixel({fp_op_const(0x1E, {0.5f, 0.f, 7.f, 0.f})}), (std::array<float, 4>{1.f, 0.5f, 1.f, 1.f}));
+    // LIF (RPCS3 _builtin_lif): (1, y, y > 0 ? 2 ^ w : 0, 1), nothing clamped.
+    CHECK_NEAR4(fp_pixel({fp_op_const(0x3C, {9.f, 0.5f, 9.f, 3.f})}), (std::array<float, 4>{1.f, 0.5f, 8.f, 1.f}));
+    CHECK_NEAR4(fp_pixel({fp_op_const(0x3C, {9.f, -0.5f, 9.f, 3.f})}), (std::array<float, 4>{1.f, -0.5f, 0.f, 1.f}));
+    // DST: (1, a.y * b.y, a.z, b.w)
+    CHECK_NEAR4(fp_pixel({fp_mov_const(1, {9.f, 5.f, 9.f, 7.f}), fp_op_const(0x07, {9.f, 2.f, 3.f, 9.f})}),
+        (std::array<float, 4>{1.f, 10.f, 3.f, 7.f}));
+    // REFL (RPCS3: GLSL reflect(src0, src1) = src0 - 2 dot(src1, src0) src1): (1, -1) about the unnormalised (0, 2) is
+    // (1, 7). NV_fragment_program's RFL (src1 reflected about src0) would give (-2, 0).
+    CHECK_NEAR4(fp_pixel({fp_mov_const(1, {0.f, 2.f, 0.f, 0.f}), fp_op_const(0x36, {1.f, -1.f, 0.f, 0.f})}),
+        (std::array<float, 4>{1.f, 7.f, 0.f, 0.f}));
+    // DP2A: dot(a.xy, b.xy) + c.x everywhere: 1 * 3 + 2 * 4 + 5
+    CHECK_NEAR4(fp_pixel({fp_mov_const(1, {3.f, 4.f, 0.f, 0.f}), fp_mov_const(2, {5.f, 6.f, 7.f, 8.f}),
+                    fp_op_const(0x2E, {1.f, 2.f, 0.f, 0.f})}),
+        (std::array<float, 4>{16.f, 16.f, 16.f, 16.f}));
+    // BEM (NV_fragment_program X2D): a.xy + [[m.x m.y] [m.z m.w]] * b.xy, twice
+    CHECK_NEAR4(fp_pixel({fp_mov_const(1, {1.f, 2.f, 0.f, 0.f}), fp_mov_const(2, {0.5f, 0.25f, 2.f, 4.f}),
+                    fp_op_const(0x2B, {0.1f, 0.2f, 0.f, 0.f})}),
+        (std::array<float, 4>{1.1f, 10.2f, 1.1f, 10.2f}));
+}
+
+TEST_CASE("metal e2e: PKG packs four bytes through sRGB, UPG unpacks them back to linear (D-174)")
+{
+    REQUIRE_METAL();
+    // Bytes 0x20, 0x80, 0xC0, 0x40 (x lowest): the word 0x40C08020, a normal float, so it reads back as it is.
+    const std::array<u32, 4> bytes{0x20, 0x80, 0xC0, 0x40};
+    std::array<float, 4> linear{};
+    for (u32 i = 0; i < 4; i++) linear[i] = srgb_to_linear(static_cast<float>(bytes[i]) / 255.f);
+    const auto packed = fp_pixel({fp_op_const(0x2C, linear)}); // PKG R0, {linear}: linear_to_srgb, then the bytes
+    for (u32 i = 0; i < 4; i++) {
+        INFO(std::format("component {}: {:#010x}", i, std::bit_cast<u32>(packed[i])));
+        CHECK(std::bit_cast<u32>(packed[i]) == 0x40C08020u);
+    }
+    // UPG R0, {the word}: the bytes, srgb_to_linear on all four.
+    CHECK_NEAR4(fp_pixel({fp_op_const(0x2D, {std::bit_cast<float>(0x40C08020u), 0.f, 0.f, 0.f})}), linear);
+}
+
+TEST_CASE("metal e2e: fragment program loops run their count, and their index picks texture coordinates (D-174)")
+{
+    REQUIRE_METAL();
+    // 0x00: LOOP/REP, end 0x30    0x10: ADD R0, R0, {1, 1, 1, 1}    0x30: MOV R0, R0 END
+    const auto count_runs = [](u32 op, u32 count, u32 init, s32 inc, bool never = false) {
+        FpInst loop;
+        loop.op = op;
+        fp_loop(loop, count, init, inc, 0x30);
+        if (never) loop.exec_lt = loop.exec_eq = loop.exec_gt = false;
+        FpInst add;
+        add.op = 0x03;
+        add.src[0] = fp_r(0);
+        add.src[1] = fp_const();
+        add.constant = std::array<float, 4>{1.f, 1.f, 1.f, 1.f};
+        FpInst last;
+        last.op = 0x01;
+        last.src[0] = fp_r(0);
+        last.end = true;
+        return fp_pixel({loop, add, last})[0];
+    };
+    CHECK(count_runs(0x43, 3, 2, 1) == 3.f);         // LOOP {3, 2, 1}: three runs (before D-174: from 2 up to 3, one)
+    CHECK(count_runs(0x44, 4, 4, 4) == 4.f);         // REP with every field 4, as nouveau encodes it (before: none)
+    CHECK(count_runs(0x43, 0, 0, 1) == 0.f);         // a count of 0 skips the body
+    CHECK(count_runs(0x43, 3, 0, 1, true) == 0.f);   // so does a condition that never holds (before: once)
+
+    // f[TEX(A0.x + n)] in LOOP {count, init, inc}: the vertex program writes TEX0-TEX3 = c[0..3], c[k].x = 2^k, so the
+    // sum's x names the coordinates read. TEX9 (o[6]) is left (0, 0, 0, 1), and an index past TEX9 reads (0, 0, 0, 1).
+    const auto indexed_sum = [](u32 count, u32 init, s32 inc, u32 offset) {
+        FpInst loop;
+        loop.op = 0x43;
+        fp_loop(loop, count, init, inc, 0x20);
+        FpInst add;
+        add.op = 0x03;
+        add.src[0] = fp_r(0);
+        add.src[1] = fp_in();
+        fp_indexed(add, offset);
+        FpInst last;
+        last.op = 0x01;
+        last.src[0] = fp_r(0);
+        last.end = true;
+        return fp_pixel({loop, add, last}, [](E2E&, CommandBuilder& b) {
+            const auto mov = [](u32 out, VpSrc src, u32 constant) {
+                VpInst in;
+                in.vec_op = 1;
+                in.src[0] = src;
+                in.constant = constant;
+                in.out = out;
+                in.vec_mask = 0xf;
+                return in;
+            };
+            std::vector<VpInst> vp{mov(0, vp_in(), 0)};
+            for (u32 k = 0; k < 4; k++) vp.push_back(mov(7 + k, vp_const(), k));
+            vp.back().end = true;
+            b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+            b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp(vp));
+            b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+            b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+            b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+            std::vector<u32> c;
+            for (u32 k = 0; k < 4; k++) {
+                for (const float f : {static_cast<float>(1u << k), 0.f, 0.f, 0.f}) c.push_back(f2u(f));
+            }
+            b.method(m::NV4097_SET_TRANSFORM_CONSTANT, c);
+        });
+    };
+    CHECK_NEAR4(indexed_sum(3, 1, 1, 0), (std::array<float, 4>{14.f, 0.f, 0.f, 0.f})); // TEX1 + TEX2 + TEX3
+    CHECK_NEAR4(indexed_sum(2, 0, 2, 1), (std::array<float, 4>{10.f, 0.f, 0.f, 0.f})); // TEX1 + TEX3
+    CHECK_NEAR4(indexed_sum(2, 3, -1, 0), (std::array<float, 4>{12.f, 0.f, 0.f, 0.f})); // TEX3 + TEX2
+    CHECK_NEAR4(indexed_sum(2, 9, 1, 0), (std::array<float, 4>{0.f, 0.f, 0.f, 2.f}));   // TEX9 + past it
+}
+
+TEST_CASE("metal e2e: TEXBEM samples at BEM's transform of its coordinate, TXPBEM at that divided by its w (D-174)")
+{
+    REQUIRE_METAL();
+    // A 4x4 linear A8R8G8B8 texture, texel (x, y) = (A, R, G, B) (0xff, 64x, 64y, 0x80), nearest, clamped.
+    const auto setup = [](E2E& e, CommandBuilder& b) {
+        for (u32 y = 0; y < 4; y++)
+            for (u32 x = 0; x < 4; x++) e.put_local32(kTexOffset + (y * 4 + x) * 4, 0xff000080u | (64 * x) << 16 | (64 * y) << 8);
+        bind_linear_texture(b, kTexOffset, tex::A8R8G8B8, 16, 4, 4);
+    };
+    // x2d = (0.125, 0.125) + [[0.25 0.25] [0.125 0.125]] * (1, 1) = (0.625, 0.375): texel (2, 1).
+    const auto prog = [](u32 op) {
+        FpInst in;
+        in.op = op;
+        in.src[0] = fp_r(1);
+        in.src[1] = fp_r(2);
+        in.src[2] = fp_r(3);
+        in.end = true;
+        return std::vector<FpInst>{fp_mov_const(1, {0.125f, 0.125f, 0.f, 0.f}), fp_mov_const(2, {1.f, 1.f, 0.f, 0.f}),
+            fp_mov_const(3, {0.25f, 0.25f, 0.125f, 0.125f}), in};
+    };
+    CHECK_NEAR4(fp_pixel(prog(0x33), setup), (std::array<float, 4>{128.f / 255.f, 64.f / 255.f, 128.f / 255.f, 1.f}));
+    // TXPBEM divides x2d.xy by its w, BEM's second row (RPCS3; untested there): (1.67, 1) clamps to texel (3, 3).
+    CHECK_NEAR4(fp_pixel(prog(0x34), setup), (std::array<float, 4>{192.f / 255.f, 192.f / 255.f, 128.f / 255.f, 1.f}));
+}
+
+TEST_CASE("metal e2e: ARL takes the floor: c[A0.x + 6] with A0.x from -0.5 reads c[5] (NV_vertex_program2, D-174)")
+{
+    REQUIRE_METAL();
+    const auto colour = [](float address) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        VpInst arl; // ARL A0, c[0]
+        arl.vec_op = 0x0d;
+        arl.src[0] = vp_const();
+        arl.constant = 0;
+        arl.vec_mask = 0xf;
+        VpInst rel; // MOV o[1], c[A0.x + 6]
+        rel.vec_op = 1;
+        rel.src[0] = vp_const();
+        rel.constant = 6;
+        rel.constant_relative = true;
+        rel.out = 1;
+        rel.vec_mask = 0xf;
+        VpInst pos; // MOV o[0], v[0] END
+        pos.vec_op = 1;
+        pos.src[0] = vp_in();
+        pos.out = 0;
+        pos.vec_mask = 0xf;
+        pos.end = true;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({arl, rel, pos}));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(address), f2u(address), f2u(address), f2u(address)});
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 5);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(0.f), f2u(1.f), f2u(0.f), f2u(1.f),   // c[5] green
+                                                       f2u(1.f), f2u(0.f), f2u(0.f), f2u(1.f),   // c[6] red
+                                                       f2u(0.f), f2u(0.f), f2u(1.f), f2u(1.f)}); // c[7] blue
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        INFO(failure_text(e));
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 48);
+    };
+    CHECK(colour(-0.5f) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // floor: c[5] (RPCS3's truncation: c[6], red)
+    CHECK(colour(0.f) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});   // c[6]
+    CHECK(colour(1.5f) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});  // c[7]
+}
+
 TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")
 {
     REQUIRE_METAL();
     E2E e;
     FpInst bad;
-    bad.op = 0x2B; // BEM: not translated yet
+    bad.op = 0x26; // POW: RPCS3's decompiler has none either
     bad.dst = 0;
     bad.input = 1;
     bad.src[0] = fp_in();
@@ -3042,5 +3328,5 @@ TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")
     CHECK(e.backend->stats().draws_skipped == 1);
     REQUIRE_FALSE(e.failures.empty());
     CHECK(e.failures[0].kind == FailKind::Unsupported);
-    CHECK(e.failures[0].message.find("BEM") != std::string::npos);
+    CHECK(e.failures[0].message.find("POW") != std::string::npos);
 }

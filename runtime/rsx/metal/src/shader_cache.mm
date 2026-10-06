@@ -5,7 +5,8 @@
 // pipelines in its first minutes, 8.3 s of stalls on an M4 Mac and several times that on an iPhone (run 082).
 //
 // A program is a file programs/<hash>.txt: its key, its translation's entry and masks, its ucode (the collision
-// check) and its MSL source. A pipeline is a line of pipelines.txt: its two program keys and PipelineParams.
+// check) and its MSL source, under a first line naming the translation's version (shader::kTranslationVersion); records
+// of another version are not loaded. A pipeline is a line of pipelines.txt: its two program keys and PipelineParams.
 //
 // D-143: the pipelines are made in the order they were first needed (pipelines.txt grows in that order), each with
 // its two programs, then the programs no pipeline names: the first ones a game needs are ready first, where all
@@ -35,7 +36,9 @@
 namespace pspocket::rsx::metal {
 namespace {
 
-constexpr std::string_view kMagic = "pspocket-shader 1";
+// The first line of a program record: the record format and the translation's version. A record of another version is
+// skipped: its MSL is an older translation's, under a key the current one also makes (D-174).
+const std::string kMagic = std::format("pspocket-shader {}", shader::kTranslationVersion);
 
 u64 fnv(std::string_view s, u64 h = 0xcbf29ce484222325ull)
 {
