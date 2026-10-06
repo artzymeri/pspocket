@@ -1,4 +1,4 @@
-# Runs 109–119 · Assassin's Creed in the Abstergo lab: what still ran in the interpreters
+# Runs 109–120 · Assassin's Creed in the Abstergo lab: what still ran in the interpreters
 
 2026-10-06 night to 2026-10-07 · pspocket-boot with the library prepared on the Mac (`pspocket-prepare --spu-images
 inventory/BLES00158/spu-images`) · M4 Mac · Assassin's Creed (BLES00158), firmware 4.92 · the scripted walk
@@ -106,3 +106,16 @@ GTA V's prologue walk with its PPU code translated again by today's translator (
 2026-10-05: 505 of 514 files changed, so this run also checks every translator change since): 29.8 fps median, 29.7 in
 the slowest 5 s window, 833 frames compared, 2 frame jumps, 24.8 GPU ms per frame at worst, 84.1 render passes, 973 MB
 process memory at peak, no SPU load interpreted, no new warning shapes.
+
+## Run 120: into the Animus, Altaïr in the training
+
+`games/ac1/walk-memory.txt`, 480 s, Metal, frames every 600 from frame 16,000: after CONTINUE, the d-pad left twice
+and Cross in the Memory DNA Timeline (its seagull loading animation), Cross through what follows, and the game loads the
+Animus training: **Altaïr standing in the white Animus space, the synchronization bar and the button prompts drawn,
+the tutorial's captions ("Puppeteering Concept", "Synchronization Bar") one after another**, at 50 to 60 fps (44.6 at
+the load). No unimplemented call in the session, every SPU image found (1,222,461 lifted, 0 interpreted), the SPU
+interpreter's 184 instructions as in run 119, the PPU's the fiber resumes (6.8 million instructions in 480 s). The
+only errors logged: one multisampled target drawn with one sample (known, improve.md) and two tile compression modes
+RPCS3 does not emulate either. The stick walk at the end did not move him: the captions come first. Next: a walk that
+answers the training's prompts.
+
