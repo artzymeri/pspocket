@@ -44,6 +44,7 @@ add_library(pspocket_hle STATIC
     src/cellAdec.cpp
     src/adec_lpcm.cpp
     src/adec_atracx.cpp
+    src/cellPngDec.cpp
     src/cellVdec.cpp
     src/cellDmuxPamf.cpp
     src/dmux_pamf.cpp
@@ -69,6 +70,10 @@ target_link_libraries(pspocket_hle PRIVATE pspocket::recomp_common)
 # FFmpeg's decoders for the media libraries (D-181, cellVdec D-195); without them those build without decoding.
 if(TARGET pspocket::ffmpeg)
     target_link_libraries(pspocket_hle PRIVATE pspocket::ffmpeg)
+endif()
+# libpng for cellPngDec (D-199); without it the firmware's libpngdec serves the games.
+if(TARGET pspocket::libpng)
+    target_link_libraries(pspocket_hle PRIVATE pspocket::libpng)
 endif()
 pspocket_set_warnings(pspocket_hle)
 add_library(pspocket::hle ALIAS pspocket_hle)

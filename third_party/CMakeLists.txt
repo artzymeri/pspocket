@@ -28,3 +28,36 @@ else()
     message(STATUS "FFmpeg decoders: none (scripts/build-ffmpeg.sh): the media libraries build without decoding")
 endif()
 
+
+# libpng (D-199): Sony's libpngdec is libpng 1.2.8 on zlib 1.2.3; pspocket's cellPngDec is built on libpng too, from a
+# source tree outside the repository (default: the one in the RPCS3 checkout the build already reads its keys from,
+# 3rdparty/libpng/libpng), with the system's zlib. Optional: without it cellPngDec is not pspocket's (the firmware's
+# libpngdec serves the games, D-175).
+set(pspocket_libpng_default "")
+foreach(rpcs3 "${PSPOCKET_RPCS3_DIR}" "${CMAKE_SOURCE_DIR}/../ps3-ios-engine/external/rpcs3")
+    if(rpcs3 AND NOT pspocket_libpng_default AND EXISTS "${rpcs3}/3rdparty/libpng/libpng/png.h")
+        get_filename_component(pspocket_libpng_default "${rpcs3}/3rdparty/libpng/libpng" ABSOLUTE)
+    endif()
+endforeach()
+set(PSPOCKET_LIBPNG_DIR "${pspocket_libpng_default}" CACHE PATH "libpng source tree (D-199)")
+if(PSPOCKET_LIBPNG_DIR AND EXISTS ${PSPOCKET_LIBPNG_DIR}/png.h)
+    find_package(ZLIB REQUIRED)
+    set(pspocket_libpng_sources)
+    foreach(f png pngerror pngget pngmem pngpread pngread pngrio pngrtran pngrutil pngset pngtrans pngwio pngwrite
+              pngwtran pngwutil)
+        list(APPEND pspocket_libpng_sources ${PSPOCKET_LIBPNG_DIR}/${f}.c)
+    endforeach()
+    add_library(pspocket_libpng STATIC ${pspocket_libpng_sources})
+    configure_file(${PSPOCKET_LIBPNG_DIR}/scripts/pnglibconf.h.prebuilt ${CMAKE_CURRENT_BINARY_DIR}/libpng/pnglibconf.h
+        COPYONLY)
+    target_include_directories(pspocket_libpng SYSTEM PUBLIC ${PSPOCKET_LIBPNG_DIR} ${CMAKE_CURRENT_BINARY_DIR}/libpng)
+    # No NEON filters: the C ones only, until a measurement asks for them (rule 8).
+    target_compile_definitions(pspocket_libpng PRIVATE PNG_ARM_NEON_OPT=0)
+    target_compile_definitions(pspocket_libpng INTERFACE PSPOCKET_HAVE_LIBPNG=1)
+    target_compile_options(pspocket_libpng PRIVATE -w)
+    target_link_libraries(pspocket_libpng PUBLIC ZLIB::ZLIB)
+    add_library(pspocket::libpng ALIAS pspocket_libpng)
+    message(STATUS "libpng: ${PSPOCKET_LIBPNG_DIR}")
+else()
+    message(STATUS "libpng: none (PSPOCKET_LIBPNG_DIR): cellPngDec is not pspocket's")
+endif()

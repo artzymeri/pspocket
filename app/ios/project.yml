@@ -130,6 +130,15 @@ targets:
         name: hle
         group: Runtime
         includes: *compiled
+      # libpng for cellPngDec (D-199), compiled from the source tree the host build uses (scripts/ios.sh sets
+      # PSPOCKET_LIBPNG_SRC; pnglibconf.h is the host build's). Not ours: no warnings.
+      - path: ${PSPOCKET_LIBPNG_SRC}
+        name: libpng
+        group: ThirdParty
+        optional: true
+        includes: [png.c, pngerror.c, pngget.c, pngmem.c, pngpread.c, pngread.c, pngrio.c, pngrtran.c, pngrutil.c,
+                   pngset.c, pngtrans.c, pngwio.c, pngwrite.c, pngwtran.c, pngwutil.c]
+        compilerFlags: [-w, -DPNG_ARM_NEON_OPT=0]
       - path: ../../runtime/rsx/src
         name: rsx
         group: Runtime
@@ -221,11 +230,15 @@ targets:
           - $(PSPOCKET_HOST_BUILD_DIR)/generated
           # FFmpeg's decoders for the media libraries (D-181): build/ffmpeg/ios (scripts/build-ffmpeg.sh).
           - ${PSPOCKET_FFMPEG_IOS_DIR}/include
+          # libpng (D-199) and the host build's pnglibconf.h.
+          - ${PSPOCKET_LIBPNG_SRC}
+          - $(PSPOCKET_HOST_BUILD_DIR)/third_party/libpng
         GCC_PREPROCESSOR_DEFINITIONS:
           - $(inherited)
           - PSPOCKET_HAVE_GAME_SPU=${PSPOCKET_HAVE_GAME_SPU}
           - PSPOCKET_HAVE_GAME_PPU=${PSPOCKET_HAVE_GAME_PPU}
           - PSPOCKET_HAVE_FFMPEG=${PSPOCKET_HAVE_FFMPEG}
+          - PSPOCKET_HAVE_LIBPNG=${PSPOCKET_HAVE_LIBPNG}
         # cmake/PSPocketWarnings.cmake, without -Werror. Xcode's defaults that the host build doesn't use are off,
         # so warning-free on the host means warning-free here (bar iOS-only code paths).
         CLANG_WARN_COMMA: NO
@@ -311,7 +324,7 @@ targets:
         # generated code) is never dropped by the static linker.
         # The device's compiler (D-151): build/llvm-ios's static libraries, as one string Xcode splits at spaces.
         OTHER_LDFLAGS: [$(inherited), -force_load, $(BUILT_PRODUCTS_DIR)/libPSPocketRuntime.a,
-                        '${PSPOCKET_LLVM_LDFLAGS}', '${PSPOCKET_FFMPEG_LDFLAGS}']
+                        '${PSPOCKET_LLVM_LDFLAGS}', '${PSPOCKET_FFMPEG_LDFLAGS}', -lz]
 
 schemes:
   PSPocket:

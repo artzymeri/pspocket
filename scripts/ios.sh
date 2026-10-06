@@ -343,6 +343,16 @@ cmd_gen() {
     else
         warn "no FFmpeg for iOS (scripts/build-ffmpeg.sh ios): the media libraries are built without decoders"
     fi
+    # libpng for cellPngDec (D-199): the source tree the host build compiles it from, and the host build's pnglibconf.h.
+    local libpng_src="" have_libpng=0
+    libpng_src="$(sed -n 's/^PSPOCKET_LIBPNG_DIR:PATH=//p' "$HOST_BUILD/CMakeCache.txt" 2>/dev/null || true)"
+    if [ -n "$libpng_src" ] && [ -f "$libpng_src/png.h" ] && [ -f "$HOST_BUILD/third_party/libpng/pnglibconf.h" ]; then
+        have_libpng=1
+        say "PNG decoder: libpng from $libpng_src"
+    else
+        libpng_src=""
+        warn "no libpng (the host build's PSPOCKET_LIBPNG_DIR): games get the firmware's PNG decoder"
+    fi
     say "xcodegen: $PROJECT"
     PSPOCKET_HOST_BUILD_DIR="$HOST_BUILD" PSPOCKET_PPU_SRC="$ppu_src" PSPOCKET_GAME_SPU_SRC="$game_spu" \
         PSPOCKET_HAVE_GAME_SPU="$have_game_spu" PSPOCKET_GAME_PPU_SRC="$game_ppu" PSPOCKET_HAVE_GAME_PPU="$have_game_ppu" \
@@ -350,6 +360,7 @@ cmd_gen() {
         PSPOCKET_CODEGEN_BUNDLE_SRC="$codegen_bundle" PSPOCKET_LLVM_SRC_DIR="$llvm_src" PSPOCKET_LLVM_IOS_DIR="$llvm_ios" \
         PSPOCKET_LLVM_LDFLAGS="$llvm_ldflags" PSPOCKET_PREPARE_SRC="$prepare_src" \
         PSPOCKET_HAVE_FFMPEG="$have_ffmpeg" PSPOCKET_FFMPEG_IOS_DIR="$ffmpeg_ios" PSPOCKET_FFMPEG_LDFLAGS="$ffmpeg_ldflags" \
+        PSPOCKET_HAVE_LIBPNG="$have_libpng" PSPOCKET_LIBPNG_SRC="$libpng_src" \
         "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
 }
 
