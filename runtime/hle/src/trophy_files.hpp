@@ -48,6 +48,9 @@ const XmlNode& trophy_root(const XmlNode& document);
 // C atoi, as RPCS3 reads the numeric attributes ("000", "-1").
 s32 atoi(std::string_view s);
 
+// The whole host file at `path`, or nullopt when it can't be opened or read.
+std::optional<std::vector<u8>> read_host_file(const std::filesystem::path& path);
+
 // ------------------------------------------------------------------------------------------------------ TROPHY.TRP
 
 // The trophy pack (RPCS3 TRPHeader, TRPEntry): a 0x40-byte header (be32 magic 0xDCA24D00, version; be64 file size;

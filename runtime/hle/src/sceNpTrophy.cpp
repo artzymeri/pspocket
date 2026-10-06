@@ -7,7 +7,8 @@
 // default user, as cellSysutil and cellSaveData use). Creating one checks the communication signature's header and
 // opens no file. Registering it (sceNpTrophyRegisterContext) reads the trophy pack TROPDIR/<set>/TROPHY.TRP through
 // lv2's file system (the disc image or a host directory), installs it into the user's directory as RPCS3 lays it out
-// and loads or creates TROPUSR.DAT there; the game and trophy details and unlocking work on that installed set:
+// and loads or creates TROPUSR.DAT there; the game and trophy details, the progress, the unlock flags, the icons and
+// unlocking work on that installed set:
 //   <set>/TROPCONF.SFM   the configuration in the system language: TROP_01.SFM (English, cellSysutil's language), or
 //                        else TROP.SFM, or else the pack's TROPCONF.SFM; the other TROP*.SFM are left out
 //   <set>/*.PNG ...      every other file of the pack (ICON0.PNG, TROP000.PNG, ...), as the pack names them
@@ -84,12 +85,14 @@ enum : u32 {
     SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED = 0x8002290f,
     SCE_NP_TROPHY_ERROR_ABORT = 0x80022910,
     SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE = 0x80022911,
+    SCE_NP_TROPHY_ERROR_LOCKED = 0x80022912,
     SCE_NP_TROPHY_ERROR_HIDDEN = 0x80022913,
     SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM = 0x80022914,
     SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED = 0x80022915,
     SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID = 0x80022918,
     SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST = 0x8002291b,
     SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID = 0x80022920,
+    SCE_NP_TROPHY_ERROR_UNKNOWN_FILE = 0x80022923,
     SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE = 0x8002292a,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
@@ -109,12 +112,14 @@ std::string result_name(s32 r)
     case SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED: return "SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED";
     case SCE_NP_TROPHY_ERROR_ABORT: return "SCE_NP_TROPHY_ERROR_ABORT";
     case SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE: return "SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE";
+    case SCE_NP_TROPHY_ERROR_LOCKED: return "SCE_NP_TROPHY_ERROR_LOCKED";
     case SCE_NP_TROPHY_ERROR_HIDDEN: return "SCE_NP_TROPHY_ERROR_HIDDEN";
     case SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM: return "SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM";
     case SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED: return "SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED";
     case SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID: return "SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID";
     case SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST: return "SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST";
     case SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID: return "SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID";
+    case SCE_NP_TROPHY_ERROR_UNKNOWN_FILE: return "SCE_NP_TROPHY_ERROR_UNKNOWN_FILE";
     case SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE: return "SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE";
     }
     return std::format("{:#010x}", static_cast<u32>(r));
@@ -175,6 +180,9 @@ constexpr u32 kDetailsSize = 1164, kDetailsName = 8, kDetailsDescription = 136, 
 constexpr u32 kNameSize = 128;
 // SceNpTrophyData (16 bytes): be64 timestamp (an RTC tick); be s32 trophyId at 8; b8 unlocked at 12; reserved[3].
 constexpr u32 kDataSize = 16;
+// SceNpTrophyFlagArray (16 bytes): be32 flag_bits[4], trophy n at bit n % 32 of word n / 32 (SCE_NP_TROPHY_FLAG_SETSIZE
+// 128).
+constexpr u32 kFlagArraySize = 16, kFlagSetSize = 128;
 
 // RPCS3 cellRtcGetCurrentTick, for unlock times: microseconds since 0001-01-01 (RTC_MAGIC_OFFSET is 1970-01-01).
 u64 current_rtc_tick()
@@ -909,6 +917,197 @@ s32 sceNpTrophyUnlockTrophy(PPUContext& ctx, u32 context, u32 handle, s32 trophy
                                   : std::string(": unlocked"));
 }
 
+// ------------------------------------------------------------------------------------- progress, flags and icons
+
+// sceNpTrophyGetGameProgress(context, handle, s32* percentage): the share of the set's trophies that are unlocked, in
+// percent, rounded as RPCS3's utils::rounded_div does (to the nearest, a half down: 1 of 8 is 12); 0 for a set without
+// trophies.
+s32 sceNpTrophyGetGameProgress(PPUContext& ctx, u32 context, u32 handle, u32 percentage)
+{
+    const auto done = [&](s32 r, std::string_view what = {}) {
+        return logged(r, "sceNpTrophyGetGameProgress(context {}, handle {}, percentage {:#x}){}", context, handle,
+            percentage, what);
+    };
+    if (!percentage) return done(error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT));
+    TrophyState& s = trophy();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return done(error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED));
+    const Lookup l = get_context(s, context, handle);
+    if (l.error) return done(l.error);
+    if (!l.context->tropusr) return done(error(SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED));
+    if (!usable(ctx, percentage, 4, "sceNpTrophyGetGameProgress: percentage")) {
+        return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    }
+    const u32 unlocked = l.context->tropusr->unlocked_count(), count = l.context->tropusr->trophy_count();
+    const u32 hundredfold = unlocked * 100;
+    const u32 percent = count ? hundredfold / count + (hundredfold % count > count / 2 ? 1 : 0) : 0;
+    if (count == 0 || count > kFlagSetSize) {
+        PS_LOG_WARN(kChan, "sceNpTrophyGetGameProgress: {} trophies in the set (RPCS3: may be invalid)", count);
+    }
+    ps_write32(guest_base(ctx), percentage, percent);
+    return done(lv2::CELL_OK, std::format(": {}% ({} of {} trophies)", percent, unlocked, count));
+}
+
+// sceNpTrophyGetTrophyUnlockState(context, handle, SceNpTrophyFlagArray* flags, u32* count): which of the first 128
+// trophies are unlocked, and how many the set has. A read-only context (which can't be registered) reads the user's
+// installed copy of the set, as RPCS3 does: its TROPUSR.DAT, made from the configuration when it is missing; when the
+// set isn't installed, no trophies and CELL_OK (RPCS3: "TODO: confirm").
+s32 sceNpTrophyGetTrophyUnlockState(PPUContext& ctx, u32 context, u32 handle, u32 flags, u32 count)
+{
+    const auto done = [&](s32 r, std::string_view what = {}) {
+        return logged(r, "sceNpTrophyGetTrophyUnlockState(context {}, handle {}, flags {:#x}, count {:#x}){}", context,
+            handle, flags, count, what);
+    };
+    if (!flags || !count) return done(error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT));
+    TrophyState& s = trophy();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return done(error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED));
+    const Lookup l = get_context(s, context, handle);
+    if (l.error) return done(l.error);
+    trophy::TropUsr installed;
+    const trophy::TropUsr* usr = nullptr;
+    if (l.context->read_only) {
+        const std::string dir = installed_dir(ctx, l.context->trp_name);
+        std::string why;
+        if (is_installed(dir) &&
+            installed.load(fs::path(dir) / "TROPUSR.DAT", fs::path(dir) / "TROPCONF.SFM", &why).success) {
+            usr = &installed;
+        } else {
+            PS_LOG_INFO(kChan, "sceNpTrophyGetTrophyUnlockState: no installed trophy set {}{}", l.context->trp_name,
+                why.empty() ? std::string() : std::format(" ({})", why));
+        }
+    } else if (!(usr = l.context->tropusr.get())) {
+        return done(error(SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED));
+    }
+    if (!usable(ctx, flags, kFlagArraySize, "sceNpTrophyGetTrophyUnlockState: flags") ||
+        !usable(ctx, count, 4, "sceNpTrophyGetTrophyUnlockState: count")) {
+        return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    }
+    u8* base = guest_base(ctx);
+    std::memset(base + flags, 0, kFlagArraySize);
+    const u32 trophies = usr ? usr->trophy_count() : 0;
+    ps_write32(base, count, trophies);
+    if (trophies > kFlagSetSize) {
+        PS_LOG_ERROR(kChan, "sceNpTrophyGetTrophyUnlockState: {} trophies; flags for the first {}", trophies,
+            kFlagSetSize);
+    }
+    u32 unlocked = 0;
+    for (u32 id = 0; id < std::min(trophies, kFlagSetSize); id++) {
+        if (!usr->unlocked(id)) continue;
+        const u32 word = flags + 4 * (id / 32);
+        ps_write32(base, word, ps_read32(base, word) | 1u << (id % 32));
+        unlocked++;
+    }
+    return done(lv2::CELL_OK, std::format(": {} trophies, {} of them unlocked", trophies, unlocked));
+}
+
+// The file `name` of the user's installed copy of a set, or nullopt when there is none.
+std::optional<std::vector<u8>> read_installed_file(const std::string& dir, const std::string& name)
+{
+    std::error_code ec;
+    if (dir.empty() || !fs::is_regular_file(fs::path(dir) / name, ec)) return std::nullopt;
+    return trophy::read_host_file(fs::path(dir) / name);
+}
+
+// RPCS3's answer with an icon: the file into `buffer` when there is one and *size is at least the file's size, then
+// the file's size into *size. False when a pointer is not guest memory (logged; nothing written).
+bool put_icon(PPUContext& ctx, std::string_view who, const std::vector<u8>& icon, u32 buffer, u32 size)
+{
+    if (!usable(ctx, size, 4, std::format("{}: size", who))) return false;
+    u8* base = guest_base(ctx);
+    const u32 icon_size = static_cast<u32>(icon.size());
+    if (buffer && icon_size && ps_read32(base, size) >= icon_size) {
+        if (!usable(ctx, buffer, icon_size, std::format("{}: buffer", who))) return false;
+        std::memcpy(base + buffer, icon.data(), icon_size);
+    }
+    ps_write32(base, size, icon_size);
+    return true;
+}
+
+// sceNpTrophyGetGameIcon(context, handle, void* buffer, u32* size): the set's icon from the user's installed copy,
+// ICON0_<language>.PNG (the system language's, ICON0_01.PNG) or else ICON0.PNG; see put_icon. The context needn't be
+// registered (RPCS3).
+s32 sceNpTrophyGetGameIcon(PPUContext& ctx, u32 context, u32 handle, u32 buffer, u32 size)
+{
+    const auto done = [&](s32 r, std::string_view what = {}) {
+        return logged(r, "sceNpTrophyGetGameIcon(context {}, handle {}, buffer {:#x}, size {:#x}){}", context, handle,
+            buffer, size, what);
+    };
+    TrophyState& s = trophy();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return done(error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED));
+    const Lookup l = get_context(s, context, handle);
+    if (l.error) return done(l.error);
+    if (!size) return done(error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT));
+    const std::string dir = installed_dir(ctx, l.context->trp_name);
+    std::string name = std::format("ICON0_{:02}.PNG", kSystemLanguage);
+    std::optional<std::vector<u8>> icon = read_installed_file(dir, name);
+    if (!icon) icon = read_installed_file(dir, name = "ICON0.PNG");
+    if (!icon) return done(error(SCE_NP_TROPHY_ERROR_UNKNOWN_FILE), std::format(": no game icon for {}", dir));
+    if (!put_icon(ctx, "sceNpTrophyGetGameIcon", *icon, buffer, size)) {
+        return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    }
+    return done(lv2::CELL_OK, std::format(": {}, {} bytes", name, icon->size()));
+}
+
+// sceNpTrophyGetTrophyIcon(context, handle, trophyId, void* buffer, u32* size): an unlocked trophy's icon,
+// TROP<id>.PNG of the user's installed copy (see put_icon). A locked trophy is refused, a hidden one with
+// SCE_NP_TROPHY_ERROR_HIDDEN, the others with SCE_NP_TROPHY_ERROR_LOCKED.
+s32 sceNpTrophyGetTrophyIcon(PPUContext& ctx, u32 context, u32 handle, s32 trophy_id, u32 buffer, u32 size)
+{
+    const auto done = [&](s32 r, std::string_view what = {}) {
+        return logged(r, "sceNpTrophyGetTrophyIcon(context {}, handle {}, trophyId {}, buffer {:#x}, size {:#x}){}",
+            context, handle, trophy_id, buffer, size, what);
+    };
+    TrophyState& s = trophy();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return done(error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED));
+    const Lookup l = get_context(s, context, handle);
+    if (l.error) return done(l.error);
+    if (!size) return done(error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT));
+    const trophy::TropUsr* usr = l.context->tropusr.get();
+    if (!usr) return done(error(SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED));
+    const u32 id = static_cast<u32>(trophy_id); // a negative ID is beyond any set
+    if (id >= usr->trophy_count()) return done(error(SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID));
+    const std::string dir = installed_dir(ctx, l.context->trp_name);
+    if (!usr->unlocked(id)) {
+        // Hidden when the configuration says so (RPCS3: an unreadable configuration makes it only locked).
+        bool missing = false;
+        if (const std::optional<trophy::XmlNode> doc = read_installed_config(dir, missing)) {
+            for (const trophy::XmlNode& n : trophy::trophy_root(*doc).children) {
+                if (!n.text_node && n.name == "trophy" && trophy::atoi(n.attribute("id")) == trophy_id &&
+                    n.attribute("hidden").starts_with('y')) {
+                    return done(error(SCE_NP_TROPHY_ERROR_HIDDEN));
+                }
+            }
+        }
+        return done(error(SCE_NP_TROPHY_ERROR_LOCKED));
+    }
+    const std::string name = std::format("TROP{:03}.PNG", trophy_id);
+    const std::optional<std::vector<u8>> icon = read_installed_file(dir, name);
+    if (!icon) return done(error(SCE_NP_TROPHY_ERROR_UNKNOWN_FILE), std::format(": no {} in {}", name, dir));
+    if (!put_icon(ctx, "sceNpTrophyGetTrophyIcon", *icon, buffer, size)) {
+        return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    }
+    return done(lv2::CELL_OK, std::format(": {}, {} bytes", name, icon->size()));
+}
+
+// sceNpTrophySetSoundLevel(context, handle, level, u64 options): the volume of the unlock notification's sound, 20 to
+// 100. There is no notification (nor in RPCS3), so only the arguments are checked.
+s32 sceNpTrophySetSoundLevel(PPUContext&, u32 context, u32 handle, u32 level, u64 options)
+{
+    const auto done = [&](s32 r) {
+        return logged(r, "sceNpTrophySetSoundLevel(context {}, handle {}, level {}, options {:#x})", context, handle,
+            level, options);
+    };
+    if (level > 100 || level < 20) return done(error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT));
+    if (options > 0) return done(error(SCE_NP_TROPHY_ERROR_NOT_SUPPORTED));
+    TrophyState& s = trophy();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return done(error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED));
+    return done(get_context(s, context, handle).error);
+}
+
 } // namespace
 
 void register_sceNpTrophy(Registry& r)
@@ -926,6 +1125,11 @@ void register_sceNpTrophy(Registry& r)
         PS_HLE_FUNC(0x49D18217, sceNpTrophyGetGameInfo),
         PS_HLE_FUNC(0xFCE6D30A, sceNpTrophyGetTrophyInfo),
         PS_HLE_FUNC(0x8CEEDD21, sceNpTrophyUnlockTrophy),
+        PS_HLE_FUNC(0x079F0E87, sceNpTrophyGetGameProgress),
+        PS_HLE_FUNC(0xB3AC3478, sceNpTrophyGetTrophyUnlockState),
+        PS_HLE_FUNC(0xFF299E03, sceNpTrophyGetGameIcon),
+        PS_HLE_FUNC(0xBAEDF689, sceNpTrophyGetTrophyIcon),
+        PS_HLE_FUNC(0x27DEDA93, sceNpTrophySetSoundLevel),
     });
 }
 

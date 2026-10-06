@@ -30,15 +30,6 @@ void set_error(std::string* error, std::string message)
     if (error) *error = std::move(message);
 }
 
-std::optional<std::vector<u8>> read_host_file(const fs::path& path)
-{
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
-    std::vector<u8> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (in.bad()) return std::nullopt;
-    return data;
-}
-
 // Writes `data` to a temporary file next to `path` and renames it over `path` (RPCS3 fs::pending_file).
 bool write_host_file_atomic(const fs::path& path, std::span<const u8> data)
 {
@@ -344,6 +335,15 @@ std::optional<XmlNode> read_config(const fs::path& conf, std::string_view who)
 std::atomic<u64> g_install_serial{0};
 
 } // namespace
+
+std::optional<std::vector<u8>> read_host_file(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    std::vector<u8> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (in.bad()) return std::nullopt;
+    return data;
+}
 
 // ------------------------------------------------------------------------------------------------------------ XML
 

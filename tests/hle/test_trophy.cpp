@@ -783,3 +783,195 @@ TEST_CASE("sceNpTrophy: an HDD game's own pack; a game booted from its game data
         }
     }
 }
+
+namespace {
+
+constexpr u64 kLocked = 0xFFFFFFFF80022912ull, kUnknownFile = 0xFFFFFFFF80022923ull;
+constexpr u32 kPercent = kData + 0x340, kCount = kData + 0x344, kSize = kData + 0x348, kFlags = kData + 0x350;
+constexpr u32 kIcon = kData + 0x2000, kIconSpace = 0x100;
+
+// A set of `count` bronze trophies and no platinum one, in the default language (TROP.SFM, installed as
+// TROPCONF.SFM). Trophy 1 is hidden.
+std::string many_trophies(u32 count)
+{
+    std::string xml = "<trophyconf><title-name>Many</title-name>";
+    for (u32 id = 0; id < count; id++) {
+        xml += std::format("<trophy id=\"{:03}\" hidden=\"{}\" ttype=\"B\" pid=\"-1\"><name>T{}</name></trophy>", id,
+            id == 1 ? "yes" : "no", id);
+    }
+    return xml + "</trophyconf>";
+}
+
+// sceNpTrophyRegisterContext(context, handle) with the status callback, while a second thread checks sysutil callbacks
+// as a game's main loop does; then whatever that thread didn't take is checked here.
+void register_checked(Fixture& f, GuestThread& a, u8* b, u32 context, u32 handle)
+{
+    const hle::Function& check = GuestThread::find("cellSysutilCheckCallback");
+    std::atomic<bool> stop{false};
+    std::thread checker([&] {
+        GuestThread c(f, 1, "checker");
+        while (!stop) {
+            check.fn(c.ctx, b);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    const u64 r = a.call("sceNpTrophyRegisterContext", context, handle, kCbOpd, 0, 0);
+    stop = true;
+    checker.join();
+    REQUIRE(r == 0);
+    REQUIRE(a.call("cellSysutilCheckCallback") == 0);
+}
+
+std::string_view guest_bytes(u8* b, u32 addr, u32 size) { return {reinterpret_cast<const char*>(b + addr), size}; }
+
+} // namespace
+
+TEST_CASE("sceNpTrophy progress, unlock flags, icons and sound level: RPCS3's checks and answers", "[hle][trophy]")
+{
+    TrophyDirs dirs("progress");
+    constexpr u32 kTrophies = 136; // more than the 128 flags hold
+    std::vector<TrpFile> files = {{"TROP.SFM", many_trophies(kTrophies)}, {"ICON0.PNG", "\x89PNG many"}};
+    for (const u32 id : {0u, 1u, 2u, 127u, 135u}) {
+        files.emplace_back(std::format("TROP{:03}.PNG", id), std::format("\x89PNG icon {}", id));
+    }
+    dirs.add_disc_pack("NPWR24680_00", make_trp(files));
+    const fsys::path installed = dirs.installed("NPWR24680_00");
+    InterpretMisses interpret;
+    Fixture f;
+    dirs.mount(f);
+    GuestThread a(f, 0, "trophy");
+    u8* b = f.base();
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    write_status_callback(b);
+
+    // Before init: the arguments each function checks first, then the library.
+    CHECK(a.call("sceNpTrophyGetGameProgress", 1, 1, 0) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetGameProgress", 1, 1, kPercent) == kNotInit);
+    CHECK(a.call("sceNpTrophyGetTrophyUnlockState", 1, 1, kFlags, 0) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetTrophyUnlockState", 1, 1, 0, kCount) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetTrophyUnlockState", 1, 1, kFlags, kCount) == kNotInit);
+    CHECK(a.call("sceNpTrophyGetGameIcon", 1, 1, 0, 0) == kNotInit); // the size is checked after the context
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 0, 0, 0) == kNotInit);
+    CHECK(a.call("sceNpTrophySetSoundLevel", 1, 1, 19, 0) == kInvalArg);
+    CHECK(a.call("sceNpTrophySetSoundLevel", 1, 1, 101, 1) == kInvalArg); // the level before the options
+    CHECK(a.call("sceNpTrophySetSoundLevel", 1, 1, 50, 1) == kNotSupported);
+    CHECK(a.call("sceNpTrophySetSoundLevel", 1, 1, 50, 0) == kNotInit);
+
+    open_session(a, b, "NPWR24680", 0); // context 1, handle 1
+    CHECK(a.call("sceNpTrophyGetGameProgress", 5, 1, kPercent) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetGameProgress", 2, 1, kPercent) == kUnknownContext);
+    CHECK(a.call("sceNpTrophyGetTrophyUnlockState", 1, 2, kFlags, kCount) == kUnknownHandle);
+    CHECK(a.call("sceNpTrophyGetGameIcon", 1, 0, 0, kSize) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 2, 1, 0, 0, kSize) == kUnknownContext);
+    CHECK(a.call("sceNpTrophySetSoundLevel", 1, 2, 50, 0) == kUnknownHandle);
+    for (const u32 level : {20u, 75u, 100u}) CHECK(a.call("sceNpTrophySetSoundLevel", 1, 1, level, 0) == 0);
+
+    // Not registered yet: no progress, flags or trophy icons. The game icon is looked for in the installed set: none.
+    CHECK(a.call("sceNpTrophyGetGameProgress", 1, 1, kPercent) == kNotRegistered);
+    CHECK(a.call("sceNpTrophyGetTrophyUnlockState", 1, 1, kFlags, kCount) == kNotRegistered);
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 0, 0, 0) == kInvalArg); // the size before the registration
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 0, 0, kSize) == kNotRegistered);
+    CHECK(a.call("sceNpTrophyGetGameIcon", 1, 1, 0, 0) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetGameIcon", 1, 1, 0, kSize) == kUnknownFile);
+    // A read-only context of the set, not installed yet: no trophies and CELL_OK; nothing is made for it.
+    REQUIRE(create_context(a, b, 1) == 2);
+    std::memset(b + kFlags, 0xAA, 16);
+    ps_write32(b, kCount, 0xEEEEEEEE);
+    REQUIRE(a.call("sceNpTrophyGetTrophyUnlockState", 2, 1, kFlags, kCount) == 0);
+    CHECK(ps_read32(b, kCount) == 0);
+    CHECK(all_bytes(b, kFlags, 16, 0));
+    CHECK_FALSE(fsys::exists(installed));
+
+    register_checked(f, a, b, 1, 1);
+    REQUIRE(fsys::exists(installed / "TROPUSR.DAT"));
+
+    // Nothing unlocked: 0%, no flags; the count is the set's, past the 128 flags.
+    ps_write32(b, kPercent, 0xEEEEEEEE);
+    REQUIRE(a.call("sceNpTrophyGetGameProgress", 1, 1, kPercent) == 0);
+    CHECK(ps_read32(b, kPercent) == 0);
+    CHECK(a.call("sceNpTrophyGetGameProgress", 1, 1, kUnmapped) == kInvalArg); // RPCS3 faults
+    std::memset(b + kFlags, 0xAA, 16);
+    REQUIRE(a.call("sceNpTrophyGetTrophyUnlockState", 1, 1, kFlags, kCount) == 0);
+    CHECK(ps_read32(b, kCount) == kTrophies);
+    CHECK(all_bytes(b, kFlags, 16, 0));
+    CHECK(a.call("sceNpTrophyGetTrophyUnlockState", 1, 1, kUnmapped, kCount) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetTrophyUnlockState", 1, 1, kFlags, kUnmapped) == kInvalArg);
+
+    // The progress, rounded to the nearest percent as RPCS3 rounds (a half down): 1 of 136 trophies is 0.74% (1),
+    // 2 are 1.47% (1), 17 are 12.5% (12).
+    const auto unlock = [&](s32 id) { REQUIRE(a.call("sceNpTrophyUnlockTrophy", 1, 1, id, 0) == 0); };
+    const auto progress = [&] {
+        REQUIRE(a.call("sceNpTrophyGetGameProgress", 1, 1, kPercent) == 0);
+        return ps_read32(b, kPercent);
+    };
+    unlock(0);
+    CHECK(progress() == 1);
+    unlock(127); // the last flag
+    CHECK(progress() == 1);
+    unlock(135); // past the flags
+    for (s32 id = 2; id < 16; id++) unlock(id);
+    CHECK(progress() == 12);
+
+    // The flags: bit n % 32 of word n / 32, for the first 128 trophies.
+    REQUIRE(a.call("sceNpTrophyGetTrophyUnlockState", 1, 1, kFlags, kCount) == 0);
+    CHECK(ps_read32(b, kCount) == kTrophies);
+    CHECK(ps_read32(b, kFlags + 0) == 0x0000FFFDu); // 0 and 2 to 15
+    CHECK(ps_read32(b, kFlags + 4) == 0);
+    CHECK(ps_read32(b, kFlags + 8) == 0);
+    CHECK(ps_read32(b, kFlags + 12) == 0x80000000u); // 127
+
+    // The game icon: its size, and the file when the buffer is large enough; the system language's icon first.
+    const std::string_view game_icon = "\x89PNG many";
+    const u32 game_icon_size = static_cast<u32>(game_icon.size());
+    ps_write32(b, kSize, 0);
+    REQUIRE(a.call("sceNpTrophyGetGameIcon", 1, 1, 0, kSize) == 0);
+    CHECK(ps_read32(b, kSize) == game_icon_size);
+    std::memset(b + kIcon, 0xAA, kIconSpace);
+    ps_write32(b, kSize, game_icon_size - 1); // too small: only the size
+    REQUIRE(a.call("sceNpTrophyGetGameIcon", 1, 1, kIcon, kSize) == 0);
+    CHECK(ps_read32(b, kSize) == game_icon_size);
+    CHECK(all_bytes(b, kIcon, kIconSpace, 0xAA));
+    ps_write32(b, kSize, kIconSpace);
+    REQUIRE(a.call("sceNpTrophyGetGameIcon", 1, 1, kIcon, kSize) == 0);
+    CHECK(ps_read32(b, kSize) == game_icon_size);
+    CHECK(guest_bytes(b, kIcon, game_icon_size) == game_icon);
+    CHECK(all_bytes(b, kIcon + game_icon_size, kIconSpace - game_icon_size, 0xAA));
+    ps_write32(b, kSize, kIconSpace);
+    CHECK(a.call("sceNpTrophyGetGameIcon", 1, 1, kUnmapped, kSize) == kInvalArg); // RPCS3 faults
+    CHECK(ps_read32(b, kSize) == kIconSpace);                                     // nothing written
+    CHECK(a.call("sceNpTrophyGetGameIcon", 1, 1, kIcon, kUnmapped) == kInvalArg);
+    TrophyDirs::write(installed / "ICON0_01.PNG", {'E', 'N'});
+    REQUIRE(a.call("sceNpTrophyGetGameIcon", 1, 1, kIcon, kSize) == 0);
+    CHECK(ps_read32(b, kSize) == 2);
+    CHECK(guest_bytes(b, kIcon, 2) == "EN");
+    ps_write32(b, kSize, 0);
+    REQUIRE(a.call("sceNpTrophyGetGameIcon", 2, 1, 0, kSize) == 0); // a read-only context: no registration needed
+    CHECK(ps_read32(b, kSize) == 2);
+
+    // Trophy icons, of unlocked trophies only: a locked hidden trophy is HIDDEN, any other locked one LOCKED.
+    for (const s32 id : {136, -1}) CHECK(a.call("sceNpTrophyGetTrophyIcon", 1, 1, id, 0, kSize) == kInvalidTrophyId);
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 1, 0, kSize) == kHidden);
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 16, 0, kSize) == kLocked);
+    const std::string icon_127 = "\x89PNG icon 127";
+    ps_write32(b, kSize, kIconSpace);
+    REQUIRE(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 127, kIcon, kSize) == 0);
+    CHECK(ps_read32(b, kSize) == icon_127.size());
+    CHECK(guest_bytes(b, kIcon, static_cast<u32>(icon_127.size())) == icon_127);
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 3, 0, kSize) == kUnknownFile); // unlocked; the pack has no icon
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 127, kUnmapped, kSize) == kInvalArg);
+    unlock(1);
+    REQUIRE(a.call("sceNpTrophyGetTrophyIcon", 1, 1, 1, 0, kSize) == 0); // the hidden one, now unlocked
+    CHECK(ps_read32(b, kSize) == std::string("\x89PNG icon 1").size());
+
+    // A read-only context reads the installed set afresh: what the registered one saved. It has no progress or trophy
+    // icons (only a registered context does).
+    std::memset(b + kFlags, 0xAA, 16);
+    REQUIRE(a.call("sceNpTrophyGetTrophyUnlockState", 2, 1, kFlags, kCount) == 0);
+    CHECK(ps_read32(b, kCount) == kTrophies);
+    CHECK(ps_read32(b, kFlags + 0) == 0x0000FFFFu);
+    CHECK(ps_read32(b, kFlags + 12) == 0x80000000u);
+    CHECK(a.call("sceNpTrophyGetGameProgress", 2, 1, kPercent) == kNotRegistered);
+    CHECK(a.call("sceNpTrophyGetTrophyIcon", 2, 1, 0, 0, kSize) == kNotRegistered);
+    CHECK(a.call("sceNpTrophySetSoundLevel", 2, 1, 20, 0) == 0);
+    REQUIRE(a.call("sceNpTrophyTerm") == 0);
+}
