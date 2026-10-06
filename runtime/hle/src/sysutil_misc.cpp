@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -511,6 +512,169 @@ s32 cellSysutilAvcSetSpeakerVolumeLevel(PPUContext&, s32 level)
     return logged(kSysutilChan, level < 0 || level > 10 ? error(CELL_AVC_ERROR_INVALID_ARGUMENT) : lv2::CELL_OK, call);
 }
 
+// ------------------------------------------------------------------------------------- cellSysutilAvcExt
+
+// RPCS3 cellSysutilAvcExt.cpp: the AV chat's windows, panel and name plates. Nothing is shown, so the getters check
+// their pointers and write nothing (RPCS3's TODOs), the setters check the player and the transition (at most
+// EXPONENT, so NONE is refused too, as RPCS3) or the z-order; cellSysutilAvcExtLoadAsyncEx checks its option and loads
+// through cellSysutilAvcLoadAsync. Float arguments come in f1.. and take no general register (RPCS3's binder). RPCS3's
+// stubs here are answered from rpcs3_stubs.inc.
+constexpr std::string_view kAvcExtChan = "cellSysutilAvcExt";
+constexpr u32 CELL_AVC_ERROR_UNKNOWN = 0x8002b701;
+constexpr u32 CELL_SYSUTIL_AVC_TRANSITION_EXPONENT = 4, CELL_SYSUTIL_AVC_ZORDER_FORWARD_MOST = 2,
+              CELL_SYSUTIL_AVC_ZORDER_BEHIND_MOST = 3, CELL_SYSUTIL_AVC_VOICE_CHAT = 1;
+constexpr s32 CELL_SYSUTIL_AVC_OPTION_PARAM_VERSION = 100, kAvcOptionParamVersion180 = 180;
+// CellSysutilAvcOptionParam (12 bytes): be s32 avcOptionParamVersion, b8 sharingVideoBuffer at 4, be s32 maxPlayers
+// at 8.
+constexpr u32 kAvcOptionSize = 12;
+
+// The getters: every pointer non-null, nothing written.
+s32 avc_ext_checked(std::string_view name, std::initializer_list<u32> ptrs)
+{
+    std::string call = std::string(name) + "(";
+    bool ok = true;
+    for (const u32 p : ptrs) {
+        call += std::format("{}{:#x}", call.back() == '(' ? "" : ", ", p);
+        ok = ok && p;
+    }
+    return logged(kAvcExtChan, ok ? lv2::CELL_OK : error(CELL_AVC_ERROR_INVALID_ARGUMENT), call + ")");
+}
+
+// The window setters: a player and a transition up to EXPONENT.
+s32 avc_ext_window(std::string_view name, u32 player_id, u32 transition, const std::string& detail = {})
+{
+    const bool ok = player_id && transition <= CELL_SYSUTIL_AVC_TRANSITION_EXPONENT;
+    return logged(kAvcExtChan, ok ? lv2::CELL_OK : error(CELL_AVC_ERROR_INVALID_ARGUMENT),
+        std::format("{}(player {:#x}{}, transition {:#x})", name, player_id, detail, transition));
+}
+
+// RPCS3 ensure()s the pointer ("Not actually checked") and writes nothing: here a null one is refused.
+s32 avc_ext_attached(PPUContext& ctx, std::string_view name, u32 status)
+{
+    if (!status) log_call_site(ctx, guest_base(ctx), std::format("{}: a null status (RPCS3 aborts)", name));
+    return logged(kAvcExtChan, status ? lv2::CELL_OK : error(CELL_AVC_ERROR_INVALID_ARGUMENT),
+        std::format("{}({:#x}): nothing written", name, status));
+}
+
+s32 cellSysutilAvcExtIsMicAttached(PPUContext& ctx, u32 status)
+{
+    return avc_ext_attached(ctx, "cellSysutilAvcExtIsMicAttached", status);
+}
+
+s32 cellSysutilAvcExtIsCameraAttached(PPUContext& ctx, u32 status)
+{
+    return avc_ext_attached(ctx, "cellSysutilAvcExtIsCameraAttached", status);
+}
+
+s32 cellSysutilAvcExtGetWindowPosition(PPUContext&, u32 player_id, u32 x, u32 y, u32 z)
+{
+    return avc_ext_checked("cellSysutilAvcExtGetWindowPosition", {player_id, x, y, z});
+}
+
+s32 cellSysutilAvcExtGetWindowSize(PPUContext&, u32 player_id, u32 x, u32 y)
+{
+    return avc_ext_checked("cellSysutilAvcExtGetWindowSize", {player_id, x, y});
+}
+
+s32 cellSysutilAvcExtGetWindowShowStatus(PPUContext&, u32 player_id, u32 visible)
+{
+    return avc_ext_checked("cellSysutilAvcExtGetWindowShowStatus", {player_id, visible});
+}
+
+s32 cellSysutilAvcExtGetNamePlateShowStatus(PPUContext&, u32 visible)
+{
+    return avc_ext_checked("cellSysutilAvcExtGetNamePlateShowStatus", {visible});
+}
+
+s32 cellSysutilAvcExtGetWindowRotation(PPUContext&, u32 player_id, u32 x, u32 y, u32 z)
+{
+    return avc_ext_checked("cellSysutilAvcExtGetWindowRotation", {player_id, x, y, z});
+}
+
+s32 cellSysutilAvcExtGetWindowAlpha(PPUContext&, u32 player_id, u32 alpha)
+{
+    return avc_ext_checked("cellSysutilAvcExtGetWindowAlpha", {player_id, alpha});
+}
+
+s32 cellSysutilAvcExtGetSurfacePointer(PPUContext&, u32 player_id, u32 surface, u32 size, u32 size_x, u32 size_y)
+{
+    return avc_ext_checked("cellSysutilAvcExtGetSurfacePointer", {player_id, surface, size, size_x, size_y});
+}
+
+// (player_id, float alpha in f1, transition).
+s32 cellSysutilAvcExtSetWindowAlpha(PPUContext& ctx, u32 player_id, u32 transition)
+{
+    return avc_ext_window("cellSysutilAvcExtSetWindowAlpha", player_id, transition,
+        std::format(", alpha {}", ctx.fpr[1]));
+}
+
+// (player_id, float size_x in f1, float size_y in f2, transition).
+s32 cellSysutilAvcExtSetWindowSize(PPUContext& ctx, u32 player_id, u32 transition)
+{
+    return avc_ext_window("cellSysutilAvcExtSetWindowSize", player_id, transition,
+        std::format(", {}x{}", ctx.fpr[1], ctx.fpr[2]));
+}
+
+s32 cellSysutilAvcExtShowWindow(PPUContext&, u32 player_id, u32 transition)
+{
+    return avc_ext_window("cellSysutilAvcExtShowWindow", player_id, transition);
+}
+
+s32 cellSysutilAvcExtHideWindow(PPUContext&, u32 player_id, u32 transition)
+{
+    return avc_ext_window("cellSysutilAvcExtHideWindow", player_id, transition);
+}
+
+s32 cellSysutilAvcExtSetWindowZorder(PPUContext&, u32 player_id, u32 zorder)
+{
+    const bool ok = player_id && zorder >= CELL_SYSUTIL_AVC_ZORDER_FORWARD_MOST &&
+                    zorder <= CELL_SYSUTIL_AVC_ZORDER_BEHIND_MOST;
+    return logged(kAvcExtChan, ok ? lv2::CELL_OK : error(CELL_AVC_ERROR_INVALID_ARGUMENT),
+        std::format("cellSysutilAvcExtSetWindowZorder(player {:#x}, {})", player_id, zorder));
+}
+
+// RPCS3 cellSysutilAvcExtInitOptionParam(version, option): the version written, then 100, or 180 with 16 players;
+// another version is ERROR_UNKNOWN. The video buffer is not shared.
+s32 cellSysutilAvcExtInitOptionParam(PPUContext& ctx, s32 version, u32 option)
+{
+    const std::string call = std::format("cellSysutilAvcExtInitOptionParam({}, {:#x})", version, option);
+    if (!option || !guest_readable(thread_of(ctx), option, kAvcOptionSize)) {
+        if (option) log_call_site(ctx, guest_base(ctx), call + ": option is not guest memory");
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, option, static_cast<u32>(version));
+    if (version == kAvcOptionParamVersion180) ps_write32(base, option + 8, 16);
+    else if (version != CELL_SYSUTIL_AVC_OPTION_PARAM_VERSION) {
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_UNKNOWN), call);
+    }
+    ps_write8(base, option + 4, 0);
+    return logged(kAvcExtChan, lv2::CELL_OK, call);
+}
+
+// RPCS3 cellSysutilAvcExtLoadAsyncEx(func, userdata, container, media, videoQuality, voiceQuality, option,
+// request_id): an option of version 100 or 180 (a shared video buffer only for a video chat), then
+// cellSysutilAvcLoadAsync.
+s32 cellSysutilAvcExtLoadAsyncEx(PPUContext& ctx, u32 func, u32 userdata, u32 container, u32 media, u32 video_quality,
+    u32 voice_quality, u32 option, u32 request_id)
+{
+    const std::string call = std::format("cellSysutilAvcExtLoadAsyncEx(func {:#x}, media {}, option {:#x})", func,
+        media, option);
+    if (!option || !guest_readable(thread_of(ctx), option, kAvcOptionSize)) {
+        if (option) log_call_site(ctx, guest_base(ctx), call + ": option is not guest memory");
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+    }
+    u8* base = guest_base(ctx);
+    const s32 version = static_cast<s32>(ps_read32(base, option));
+    if (version != CELL_SYSUTIL_AVC_OPTION_PARAM_VERSION && version != kAvcOptionParamVersion180) {
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_UNKNOWN), call);
+    }
+    if (ps_read8(base, option + 4) && media == CELL_SYSUTIL_AVC_VOICE_CHAT) {
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call + ": a shared video buffer");
+    }
+    return cellSysutilAvcLoadAsync(ctx, func, userdata, container, media, video_quality, voice_quality, request_id);
+}
+
 // ------------------------------------------------------------------------------------- small libraries
 
 // cellSysutilMisc: the console's licence area, RPCS3's default (CELL_SYSUTIL_LICENSE_AREA_A).
@@ -796,6 +960,24 @@ void register_sysutil_misc(Registry& r)
     });
     r.add("cellCrossController", {
         PS_HLE_FUNC(0x37E1F502, cellCrossControllerInitialize),
+    });
+    r.add("cellSysutilAvcExt", {
+        PS_HLE_FUNC(0x001074D0, cellSysutilAvcExtIsMicAttached),
+        PS_HLE_FUNC(0x22A36B23, cellSysutilAvcExtGetWindowPosition),
+        PS_HLE_FUNC(0x28F0DC04, cellSysutilAvcExtGetWindowSize),
+        PS_HLE_FUNC(0x2D9A1997, cellSysutilAvcExtGetWindowShowStatus),
+        PS_HLE_FUNC(0x326FAB55, cellSysutilAvcExtGetNamePlateShowStatus),
+        PS_HLE_FUNC(0x332EE22C, cellSysutilAvcExtSetWindowAlpha),
+        PS_HLE_FUNC(0x40BC33C8, cellSysutilAvcExtSetWindowSize),
+        PS_HLE_FUNC(0x51CCBE09, cellSysutilAvcExtLoadAsyncEx),
+        PS_HLE_FUNC(0x61B1CB18, cellSysutilAvcExtShowWindow),
+        PS_HLE_FUNC(0x646C6C5F, cellSysutilAvcExtIsCameraAttached),
+        PS_HLE_FUNC(0x739C2F63, cellSysutilAvcExtHideWindow),
+        PS_HLE_FUNC(0x8ED310E5, cellSysutilAvcExtGetWindowRotation),
+        PS_HLE_FUNC(0xAED82C21, cellSysutilAvcExtGetWindowAlpha),
+        PS_HLE_FUNC(0xCBE0C10A, cellSysutilAvcExtGetSurfacePointer),
+        PS_HLE_FUNC(0xD8685383, cellSysutilAvcExtInitOptionParam),
+        PS_HLE_FUNC(0xE8B1C18D, cellSysutilAvcExtSetWindowZorder),
     });
     r.add("cellGameExec", {
         PS_HLE_FUNC(0xF6ACD0BC, cellGameGetBootGameInfo),

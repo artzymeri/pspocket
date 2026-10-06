@@ -4003,6 +4003,34 @@ initialize, their commands, volume and contexts, the two decoders' separate stat
 suffixes, moves and copies, path rule and progress; the photo import's cancellation and checks; the photo decode's
 checks.
 
+## D-187 · 2026-10-06 · AV chat (cellSysutilAvc2, cellSysutilAvcExt) as RPCS3, with no camera, microphone or peers
+
+libsysutil_avc2 and libsysutil_avc_ext are always native. The 38 functions RPCS3 implements in cellSysutilAvc2 and the
+16 in cellSysutilAvcExt are now there (their 30 stubs answer through D-182's table).
+
+- **Load and unload.** cellSysutilAvc2Load checks RPCS3's init parameters (voice: version 100 to 140, 2 to 64
+  players, 1 to 16 speakers, normal quality, the streaming modes each version allows; video: up to 6 windows, or 16
+  with intra frames only, 1000 to 512000 bit/s, up to 30 frames a second) and keeps the voice chat's callback.
+  LoadAsync, UnloadAsync(2), JoinChatRequest and LeaveChatRequest answer through it at the game's next
+  cellSysutilCheckCallback, and succeed, as RPCS3's TODOs do: there is nobody to talk to. An unload's event drops the
+  callback once it has run; cellSysutilAvc2Unload(2) drops it at once together with the events still waiting (RPCS3
+  sysutil_unregister_cb_with_id; here a generation count skips them).
+- **Settings.** Voice, video and speaker muting start on; the speaker volume at 40; muted players are kept. Camera and
+  microphone are detached, the microphone's stream is empty, the chat's screen and windows are never shown, and the
+  player list holds one player.
+- **Memory.** cellSysutilAvc2EstimateMemoryContainerSize follows RPCS3's arithmetic exactly (checked against a model of
+  it for five video set-ups).
+- **cellSysutilAvcExt.** Window getters check their pointers and write nothing; setters check the player and the
+  transition (up to EXPONENT, so NONE is refused, as in RPCS3) or the z-order; the option is version 100 or 180 (16
+  players); cellSysutilAvcExtLoadAsyncEx loads through pspocket's cellSysutilAvcLoadAsync (D-183).
+
+Differences from RPCS3: pointers are checked before use (D-042); where RPCS3 ensure()s a pointer
+(cellSysutilAvc2IsMicAttached, cellSysutilAvcExtIs*Attached), a null one is logged and refused with
+CELL_AVC(2)_ERROR_INVALID_ARGUMENT instead of aborting.
+
+Tests: tests/hle/test_avc.cpp (the load and unload events through a guest callback, the dropped events, the
+parameter checks, the settings, the size estimate, cellSysutilAvcExt's checks and its load).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
