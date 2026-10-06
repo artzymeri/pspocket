@@ -853,8 +853,19 @@ TEST_CASE("cellFsAio: reads complete on the AIO thread, which calls back with th
     REQUIRE(wait_for(5));
     CHECK(done(4).xid == 5);
     CHECK(std::string(reinterpret_cast<const char*>(base + kBuf + 0x80), 2) == "01");
+
+    // cellFsAioWrite: the same thread writes at the offset; a file open for reading only is CELL_EBADF.
+    put(base, kBuf + 0xA0, "WXYZ");
+    REQUIRE(a.call("cellFsAioWrite", request(5, write_fd, 2, kBuf + 0xA0, 4), kId, kAioOpd) == 0);
+    REQUIRE(a.call("cellFsAioWrite", request(6, fd, 0, kBuf + 0xA0, 4), kId, kAioOpd) == 0);
+    REQUIRE(wait_for(7));
+    CHECK((done(5).xid == 6 && done(5).error == 0 && done(5).size == 4));
+    CHECK((done(6).xid == 7 && done(6).error == ebadf && done(6).size == 0));
     REQUIRE(a.call("cellFsClose", fd) == 0);
     REQUIRE(a.call("cellFsClose", write_fd) == 0);
+    std::ifstream written(root / "tmp" / "out.bin", std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(written)), std::istreambuf_iterator<char>());
+    CHECK(bytes == std::string("\0\0WXYZ", 6));
     fsys::remove_all(root);
 }
 
@@ -937,4 +948,114 @@ TEST_CASE("cellPad: the old info, capability info, clearing the buffer", "[hle][
     CHECK(ps_read32(b, kInfo + 0x0) == 1);
     CHECK(g.call("cellPadGetCapabilityInfo", 1, kCaps) == kPadNoDevice);
     CHECK(g.call("cellPadClearBuf", 1) == kPadNoDevice);
+}
+
+TEST_CASE("cellFs: directory entries, paths, block sizes, truncate, stream reads (D-184)", "[hle][fs]")
+{
+    InterpretMisses interpret;
+    const fsys::path root = temp_root("fs2");
+    fsys::create_directories(root / "hdd0" / "game" / "TEST00000" / "sub");
+    std::string data;
+    for (int i = 0; i < 10000; i++) data += static_cast<char>('a' + i % 26);
+    {
+        std::ofstream out(root / "hdd0" / "game" / "TEST00000" / "stream.bin", std::ios::binary);
+        out << data;
+    }
+    Fixture f;
+    u8* base = f.base();
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+    GuestThread a(f, 0, "a");
+    constexpr u32 kPath = kStrings, kFd = kOut, kCount = kOut + 8, kEntries = kOut + 0x100, kSizes = kOut + 0x400,
+                  kRing = kOut + 0x500, kAddr = kOut + 0x540, kStatus = kOut + 0x548, kStBuf = kBuf;
+    const u64 kEbadf = r3_of(lv2::CELL_EBADF), kEfault = r3_of(lv2::CELL_EFAULT), kEnxio = r3_of(lv2::CELL_ENXIO);
+
+    // cellFsGetDirectoryEntries: one entry a call, then none.
+    put(base, kPath, "/dev_hdd0/game/TEST00000");
+    REQUIRE(a.call("cellFsOpendir", kPath, kFd) == 0);
+    const u32 dir = ps_read32(base, kFd);
+    std::vector<std::string> names;
+    for (int i = 0; i < 6; i++) {
+        REQUIRE(a.call("cellFsGetDirectoryEntries", dir, kEntries, 2 * 312, kCount) == 0);
+        if (!ps_read32(base, kCount)) break;
+        names.emplace_back(reinterpret_cast<const char*>(base + kEntries + 52 + 2), base[kEntries + 52 + 1]);
+    }
+    CHECK(names == std::vector<std::string>{".", "..", "stream.bin", "sub"});
+    CHECK(a.call("cellFsGetDirectoryEntries", dir, kEntries, 312, 0) == kEfault);
+    CHECK(a.call("cellFsGetDirectoryEntries", 2, kEntries, 312, kCount) == kEbadf);
+
+    // cellFsGetPath, the block sizes, cellFsTruncate, cellFsFdatasync.
+    put(base, kPath, "/dev_hdd0/game/TEST00000/stream.bin");
+    REQUIRE(a.call("cellFsOpen", kPath, 0, kFd, 0, 0) == 0);
+    const u32 fd = ps_read32(base, kFd);
+    REQUIRE(a.call("cellFsGetPath", fd, kEntries) == 0);
+    CHECK(std::string(reinterpret_cast<const char*>(base + kEntries)) == "/dev_hdd0/game/TEST00000/stream.bin");
+    CHECK(a.call("cellFsGetPath", fd, 0) == kEfault);
+    REQUIRE(a.call("cellFsGetBlockSize", kPath, kSizes, kSizes + 8) == 0);
+    CHECK(ps_read64(base, kSizes + 8) == 4096);
+    CHECK(a.call("cellFsGetBlockSize", kPath, 0, kSizes + 8) == kEfault);
+    REQUIRE(a.call("cellFsFGetBlockSize", fd, kSizes, kSizes + 8) == 0);
+    CHECK(ps_read64(base, kSizes) == 512);
+    CHECK(a.call("cellFsFdatasync", fd) == kEbadf); // read-only: nothing to sync (RPCS3)
+    CHECK(a.call("cellFsSetIoBufferFromDefaultContainer", fd, 0x10000, 0) == 0);
+    CHECK(a.call("cellFsSetIoBufferFromDefaultContainer", 99, 0x10000, 0) == kEbadf);
+    CHECK(a.call("cellFsSdataOpenByFd", fd, 1, kCount, 0, 0, 0) == r3_of(lv2::CELL_EINVAL));
+    CHECK(ps_read32(base, kCount) == 0xFFFFFFFF);
+    CHECK(a.call("cellFsSdataOpenByFd", 1, 0, kCount, 0, 0, 0) == kEbadf);
+
+    // Stream reads. CellFsRingBuffer {ringbuf_size, block_size, transfer_rate, copy}.
+    const auto ring = [&](u64 size, u64 block, u32 copy) {
+        ps_write64(base, kRing, size);
+        ps_write64(base, kRing + 8, block);
+        ps_write64(base, kRing + 16, 0);
+        ps_write32(base, kRing + 24, copy);
+    };
+    REQUIRE(a.call("cellFsStReadGetStatus", fd, kStatus) == 0);
+    CHECK(ps_read64(base, kStatus) == 0x2); // not initialized
+    CHECK(a.call("cellFsStRead", fd, kStBuf, 16, kCount) == kEnxio);
+    ring(0x4000, 0x1001, 0);
+    CHECK(a.call("cellFsStReadInit", fd, kRing) == r3_of(lv2::CELL_EINVAL)); // a block not a multiple of 4 KB
+    ring(0x3000, 0x2000, 0);
+    CHECK(a.call("cellFsStReadInit", fd, kRing) == r3_of(lv2::CELL_EINVAL)); // a ring not a multiple of the block
+    ring(0x4000, 0x1000, 2);
+    CHECK(a.call("cellFsStReadInit", fd, kRing) == r3_of(lv2::CELL_EINVAL)); // an unknown copy mode
+    ring(0x4000, 0x1000, 1);
+    REQUIRE(a.call("cellFsStReadInit", fd, kRing) == 0);
+    REQUIRE(a.call("cellFsStReadGetStatus", fd, kStatus) == 0);
+    CHECK(ps_read64(base, kStatus) == 0x101); // initialized, stopped
+    CHECK(a.call("cellFsStRead", fd, kStBuf, 16, kCount) == kEnxio); // not started
+    REQUIRE(a.call("cellFsStReadStart", fd, 100, 5000) == 0);
+    REQUIRE(a.call("cellFsStReadGetStatus", fd, kStatus) == 0);
+    CHECK(ps_read64(base, kStatus) == 0x201);
+    REQUIRE(a.call("cellFsStReadWait", fd, 16) == 0);
+    REQUIRE(a.call("cellFsStRead", fd, kStBuf, 16, kCount) == 0);
+    CHECK(ps_read64(base, kCount) == 16);
+    CHECK(std::string(reinterpret_cast<const char*>(base + kStBuf), 16) == data.substr(100, 16));
+    // Copyless: the next block, in the ring buffer, until it is put back.
+    REQUIRE(a.call("cellFsStReadGetCurrentAddr", fd, kAddr, kSizes) == 0);
+    const u32 at = ps_read32(base, kAddr);
+    CHECK(ps_read64(base, kSizes) == 0x1000);
+    CHECK(std::string(reinterpret_cast<const char*>(base + at), 8) == data.substr(116, 8));
+    REQUIRE(a.call("cellFsStReadPutCurrentAddr", fd, at, 0x1000) == 0);
+    // The stream ends at 100 + 5000: what is left, then nothing.
+    REQUIRE(a.call("cellFsStRead", fd, kStBuf, 0x2000, kCount) == 0);
+    CHECK(ps_read64(base, kCount) == 5000 - 16 - 0x1000);
+    CHECK(base[kStBuf] == static_cast<u8>(data[116 + 0x1000]));
+    REQUIRE(a.call("cellFsStRead", fd, kStBuf, 16, kCount) == 0);
+    CHECK(ps_read64(base, kCount) == 0);
+    REQUIRE(a.call("cellFsStReadGetRingBuf", fd, kRing) == 0);
+    CHECK(ps_read64(base, kRing) == 0x4000);
+    CHECK(ps_read32(base, kRing + 24) == 1);
+    REQUIRE(a.call("cellFsStReadGetRegid", fd, kSizes) == 0);
+    REQUIRE(a.call("cellFsStReadStop", fd) == 0);
+    REQUIRE(a.call("cellFsStReadFinish", fd) == 0);
+    REQUIRE(a.call("cellFsStReadGetStatus", fd, kStatus) == 0);
+    CHECK(ps_read64(base, kStatus) == 0x2);
+    CHECK(a.call("cellFsStReadStart", 99, 0, 0) == kEbadf);
+    REQUIRE(a.call("cellFsClose", fd) == 0);
+
+    // cellFsTruncate on a path.
+    REQUIRE(a.call("cellFsTruncate", kPath, 10) == 0);
+    CHECK(fsys::file_size(root / "hdd0" / "game" / "TEST00000" / "stream.bin") == 10);
+    REQUIRE(a.call("cellFsClosedir", dir) == 0);
+    fsys::remove_all(root);
 }

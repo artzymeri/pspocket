@@ -5,6 +5,7 @@ add_library(pspocket_lv2 STATIC
     src/event.cpp
     src/fs.cpp
     src/kernel.cpp
+    src/system.cpp
     src/lw.cpp
     src/memory.cpp
     src/process.cpp

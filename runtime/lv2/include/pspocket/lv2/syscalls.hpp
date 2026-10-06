@@ -185,6 +185,7 @@ enum : u8 {
 };
 inline constexpr u32 kCellFsStatSize = 52;    // CellFsStat (4-byte aligned 64-bit fields)
 inline constexpr u32 kCellFsDirentSize = 258; // CellFsDirent
+inline constexpr u32 kCellFsDirectoryEntrySize = 312; // CellFsDirectoryEntry: CellFsStat, CellFsDirent, 4-aligned
 
 Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg, u64 size);
 Result sys_fs_read(PpuThread& t, u32 fd, u32 buf, u64 nbytes, u32 nread);
@@ -207,6 +208,19 @@ Result sys_fs_ftruncate(PpuThread& t, u32 fd, u64 size);
 Result sys_fs_chmod(PpuThread& t, u32 path, s32 mode);
 Result sys_fs_utime(PpuThread& t, u32 path, u32 timep);
 Result sys_fs_fcntl(PpuThread& t, u32 fd, u32 op, u32 arg, u32 size);
+Result sys_fs_test(PpuThread& t, u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 buf, u32 buf_size);
+Result sys_fs_fget_block_size(PpuThread& t, u32 fd, u32 sector_size, u32 block_size, u32 arg4, u32 out_flags);
+Result sys_fs_get_block_size(PpuThread& t, u32 path, u32 sector_size, u32 block_size, u32 arg4);
+Result sys_fs_disk_free(PpuThread& t, u32 path, u32 total_free, u32 avail_free);
+Result sys_fs_get_mount_info_size(PpuThread& t, u32 len);
+Result sys_fs_get_mount_info(PpuThread& t, u32 info, u64 len, u32 out_len);
+Result sys_fs_lsn_get_cda_size(PpuThread& t, u32 fd, u32 ptr);
+Result sys_fs_lsn_lock(PpuThread& t, u32 fd);
+Result sys_fs_lsn_unlock(PpuThread& t, u32 fd);
+Result sys_fs_newfs(PpuThread& t, u32 dev_name, u32 file_system, s32 unk1, u32 str1);
+Result sys_fs_mount(PpuThread& t, u32 dev_name, u32 file_system, u32 path, s32 unk1, s32 prot, s32 unk2, u32 str1,
+    u32 str_len);
+Result sys_fs_unmount(PpuThread& t, u32 path, s32 unk1, s32 force);
 
 // ---- virtual memory (sys_vm.cpp)
 Result sys_vm_memory_map(PpuThread& t, u64 vsize, u64 psize, u32 cid, u64 flag, u64 policy, u32 addr_out);

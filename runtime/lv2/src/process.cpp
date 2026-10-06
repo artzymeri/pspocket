@@ -7,7 +7,9 @@
 //   retail mode silently drops such writes.
 // - _sys_process_exit2 (exitspawn) ignores the program to launch next and just exits.
 
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 #include "internal.hpp"
 
@@ -90,6 +92,89 @@ Result sys_process_get_number_of_object(PpuThread& t, u32 object, u32 nump)
     return CELL_OK;
 }
 
+// RPCS3 process_get_id: the IDs of the process's objects of one type, lowest first, at most `size` of them (a size of
+// 0 or less counts as 1, as the firmware's signed do-while does). Types this kernel doesn't create list none.
+Result process_get_id(PpuThread& t, u32 object, u32 buffer, u32 size, u32 set_size)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    std::vector<u32> ids;
+    switch (object) {
+    case SYS_MEM_OBJECT:
+    case SYS_MUTEX_OBJECT:
+    case SYS_COND_OBJECT:
+    case SYS_RWLOCK_OBJECT:
+    case SYS_EVENT_QUEUE_OBJECT:
+    case SYS_EVENT_PORT_OBJECT:
+    case SYS_LWMUTEX_OBJECT:
+    case SYS_TIMER_OBJECT:
+    case SYS_SEMAPHORE_OBJECT:
+    case SYS_LWCOND_OBJECT:
+    case SYS_EVENT_FLAG_OBJECT:
+        for (const auto& [id, obj] : s.objects.list(object << 24)) ids.push_back(id);
+        break;
+    case SYS_FS_FD_OBJECT:
+        for (const auto& obj : s.fds.all()) ids.push_back(obj->id);
+        break;
+    case SYS_INTR_TAG_OBJECT:
+    case SYS_INTR_SERVICE_HANDLE_OBJECT:
+    case SYS_SPUIMAGE_OBJECT:
+    case SYS_PRX_OBJECT:
+    case SYS_OVERLAY_OBJECT: break; // none made by this kernel
+    case SYS_TRACE_OBJECT:
+    case SYS_SPUPORT_OBJECT:
+        PS_LOG_ERROR(kTty, "sys_process_get_id: object type {:#x} (RPCS3 aborts on it)", object);
+        return err(CELL_EINVAL);
+    default: return err(CELL_EINVAL);
+    }
+    std::sort(ids.begin(), ids.end());
+    const u32 max = static_cast<u32>(std::max<s32>(static_cast<s32>(size), 1));
+    u32 i = 0;
+    for (; i < max && i < ids.size(); i++) {
+        if (!s.guest.put32(buffer + 4 * i, ids[i])) return err(CELL_EFAULT);
+    }
+    if (!s.guest.put32(set_size, i)) return err(CELL_EFAULT);
+    return CELL_OK;
+}
+
+Result sys_process_get_id(PpuThread& t, u32 object, u32 buffer, u32 size, u32 set_size)
+{
+    if (object == SYS_SPUPORT_OBJECT) return err(CELL_EINVAL); // not allowed here (RPCS3)
+    return process_get_id(t, object, buffer, size, set_size);
+}
+
+// The same with a root permission check (RPCS3).
+Result sys_process_get_id2(PpuThread& t, u32 object, u32 buffer, u32 size, u32 set_size)
+{
+    if (!t.kernel.config().root) return err(CELL_ENOSYS);
+    return process_get_id(t, object, buffer, size, set_size);
+}
+
+// RPCS3 process_is_spu_lock_line_reservation_address: whether SPU threads (flag 1) or raw SPUs (flag 2) may take a
+// lock-line reservation at addr, by its 256 MB segment: main memory, user memory, RSX local memory and raw SPU MMIO
+// may; private SPU MMIO may not for raw SPUs; the PPU stack area may not. Another segment must be mapped (EINVAL); a
+// sys_vm area is refused (EPERM, or EINVAL past the block's end), as RPCS3.
+Result sys_process_is_spu_lock_line_reservation_address(PpuThread& t, u32 addr, u64 flags)
+{
+    constexpr u64 SYS_MEMORY_ACCESS_RIGHT_SPU_THR = 0x2, SYS_MEMORY_ACCESS_RIGHT_RAW_SPU = 0x4;
+    if (!flags || (flags & ~(SYS_MEMORY_ACCESS_RIGHT_SPU_THR | SYS_MEMORY_ACCESS_RIGHT_RAW_SPU))) return err(CELL_EINVAL);
+    switch (addr >> 28) {
+    case 0x0:
+    case 0x1:
+    case 0x2:
+    case 0xC:
+    case 0xE: return CELL_OK;
+    case 0xF: return (flags & SYS_MEMORY_ACCESS_RIGHT_RAW_SPU) ? err(CELL_EPERM) : CELL_OK;
+    case 0xD: return err(CELL_EPERM);
+    default: break;
+    }
+    MemoryManager& m = t.kernel.impl().memory;
+    std::lock_guard lock(m.mutex);
+    const Area* area = m.area_at(addr & 0xF0000000);
+    if (!area) return err(CELL_EINVAL);
+    if (area->kind == Area::Kind::Vm) return addr - area->addr < area->size ? err(CELL_EPERM) : err(CELL_EINVAL);
+    return CELL_OK;
+}
+
 Result sys_process_get_sdk_version(PpuThread& t, u32, u32 version)
 {
     if (!t.kernel.impl().guest.put32(version, t.kernel.config().sdk_version)) return err(CELL_EFAULT);
@@ -151,6 +236,9 @@ void register_process_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 1, sys_process_getpid);
     PS_LV2_BIND(table, 3, sys_process_exit3);
     PS_LV2_BIND(table, 12, sys_process_get_number_of_object);
+    PS_LV2_BIND(table, 13, sys_process_get_id);
+    PS_LV2_BIND(table, 14, sys_process_is_spu_lock_line_reservation_address);
+    PS_LV2_BIND(table, 29, sys_process_get_id2);
     PS_LV2_BIND(table, 18, sys_process_getppid);
     PS_LV2_BIND(table, 22, _sys_process_exit);
     PS_LV2_BIND(table, 25, sys_process_get_sdk_version);

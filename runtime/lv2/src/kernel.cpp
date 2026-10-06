@@ -425,7 +425,30 @@ void null_syscall(PpuThread& t, PPUContext& ctx)
     ctx.gpr[3] = 0;
 }
 
+std::array<u64, kSyscallCount> g_stub_r3{};
+
+void stub_syscall(PpuThread& t, PPUContext& ctx)
+{
+    const u32 number = static_cast<u32>(ctx.gpr[11]);
+    if (!g_null_logged[number].exchange(true)) {
+        PS_LOG_WARN(kChan, "syscall {} ({}) is a stub in RPCS3; returns {:#x} as RPCS3 does (first call at {:#010x}, "
+                           "r3={:#x} r4={:#x}, thread {:#x})",
+            number, g_null_what[number], g_stub_r3[number], ctx.cia, ctx.gpr[3], ctx.gpr[4], t.id);
+    }
+    ctx.gpr[3] = g_stub_r3[number];
+}
+
 } // namespace
+
+void SyscallTable::bind_stub(u32 number, const char* name, u64 r3)
+{
+    if (number >= kSyscallCount) PS_FATAL(kChan, "syscall {} ({}) out of range", number, name);
+    if (entries_[number].fn) PS_FATAL(kChan, "syscall {} is already bound", number);
+    g_null_what[number] = name;
+    g_stub_r3[number] = r3;
+    entries_[number].fn = stub_syscall;
+    if (!entries_[number].name) entries_[number].name = name;
+}
 
 void SyscallTable::bind_null(u32 number, const char* what)
 {
@@ -468,6 +491,7 @@ Kernel::Impl::Impl(Kernel& k)
     register_fs_syscalls(table);
     register_vm_syscalls(table);
     register_spu_syscalls(table);
+    register_system_syscalls(table);
     // Every other slot RPCS3 answers with null_func (a log, then CELL_OK) is answered so too (D-166): a game calling
     // one goes on instead of meeting ENOSYS. GTA V's CRT, for one, registers a debug exception handler (988).
     static constexpr struct {
@@ -478,6 +502,16 @@ Kernel::Impl::Impl(Kernel& k)
     };
     for (const auto& n : kNull)
         if (!table[n.number].fn) table.bind_null(n.number, n.what);
+    // And every syscall RPCS3 binds to a stub (a log, then a constant) answers that constant (D-184).
+    static constexpr struct {
+        u32 number;
+        const char* name;
+        u64 r3;
+    } kStub[] = {
+#include "syscall_stub.inc"
+    };
+    for (const auto& n : kStub)
+        if (!table[n.number].fn) table.bind_stub(n.number, n.name, n.r3);
 }
 
 Kernel::Impl::~Impl() = default;

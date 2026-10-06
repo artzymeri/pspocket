@@ -2,6 +2,8 @@
 
 #include "lv2_test_util.hpp"
 
+#include <cstring>
+
 using namespace pspocket;
 using namespace pspocket::lv2;
 using namespace pspocket::lv2::test;
@@ -107,4 +109,114 @@ TEST_CASE("lv2 process: exit unwinds every guest thread", "[lv2][process]")
     CHECK_FALSE(blocked_returned.load());
     // After the exit, syscalls unwind their caller too.
     CHECK_THROWS_AS(main.call(kGetPid), ThreadExit);
+}
+
+TEST_CASE("lv2 process: object IDs and lock-line reservation addresses (D-184)", "[lv2][process]")
+{
+    Fixture f;
+    Caller c(*f.kernel);
+    const u32 out = f.alloc(4);
+    u32 ids[3];
+    for (u32& id : ids) {
+        REQUIRE(c.call(kMutexCreate, out, mutex_attr(f, SYS_SYNC_FIFO, SYS_SYNC_NOT_RECURSIVE)) == CELL_OK);
+        id = f.r32(out);
+    }
+    const u32 buf = f.alloc(16), set = f.alloc(4);
+    REQUIRE(c.call(13, 0x85, buf, 4, set) == CELL_OK); // sys_process_get_id
+    CHECK(f.r32(set) == 3);
+    CHECK(f.r32(buf) == ids[0]);
+    CHECK(f.r32(buf + 8) == ids[2]);
+    REQUIRE(c.call(13, 0x85, buf, 0, set) == CELL_OK); // 0 counts as 1 (the firmware's signed do-while)
+    CHECK(f.r32(set) == 1);
+    REQUIRE(c.call(13, 0x96, buf, 4, set) == CELL_OK); // no semaphores
+    CHECK(f.r32(set) == 0);
+    CHECK(c.call(13, 0x24, buf, 4, set) == rc(CELL_EINVAL)); // SPU ports: not here
+    CHECK(c.call(13, 0x99, buf, 4, set) == rc(CELL_EINVAL));
+    CHECK(c.call(29, 0x85, buf, 4, set) == rc(CELL_ENOSYS)); // get_id2: root only
+
+    // sys_process_is_spu_lock_line_reservation_address(addr, flags): by 256 MB segment (RPCS3).
+    CHECK(c.call(14, 0x00100000, 2) == CELL_OK);  // main memory, SPU threads
+    CHECK(c.call(14, 0xC0000000, 4) == CELL_OK);  // RSX local memory, raw SPU
+    CHECK(c.call(14, 0xF0000000, 2) == CELL_OK);  // private SPU MMIO, SPU threads
+    CHECK(c.call(14, 0xF0000000, 4) == rc(CELL_EPERM));
+    CHECK(c.call(14, 0xD0000000, 2) == rc(CELL_EPERM)); // the PPU stack area
+    CHECK(c.call(14, 0x40000000, 2) == rc(CELL_EINVAL)); // nothing mapped there
+    CHECK(c.call(14, 0x00100000, 0) == rc(CELL_EINVAL));
+    CHECK(c.call(14, 0x00100000, 1) == rc(CELL_EINVAL));
+}
+
+TEST_CASE("lv2 sys_game and sys_ss: watchdog, versions, board storage, random numbers, PSID (D-184)",
+    "[lv2][process]")
+{
+    Config config;
+    config.system_sw_version = 48800;
+    config.console_psid_high = 0x1122334455667788ull;
+    config.console_psid_low = 0x99AABBCCDDEEFF00ull;
+    Fixture f(config);
+    Caller c(*f.kernel);
+
+    REQUIRE(c.call(372, 30) == CELL_OK);              // watchdog start, 30 s
+    CHECK(c.call(372, 30) == rc(CELL_EABORT));        // already running
+    CHECK(c.call(374) == CELL_OK);                    // clear
+    CHECK(c.call(373) == CELL_OK);                    // stop
+    CHECK(c.call(372, 30) == CELL_OK);                // and again
+    CHECK(c.call64(376) == 48800);                    // the system software version
+    CHECK(c.call(375, 49000) == rc(CELL_ENOSYS));     // setting it: root only
+
+    const u32 board = f.alloc(16), status = f.alloc(4);
+    REQUIRE(c.call(410, board, status) == CELL_OK);
+    CHECK(f.r32(board) == 0xFFFFFFFF); // unwritten: all ones
+    CHECK(f.base()[status] == 0);
+    for (u32 i = 0; i < 16; i++) f.base()[board + i] = static_cast<u8>(i);
+    REQUIRE(c.call(411, board, status) == CELL_OK);
+    std::memset(f.base() + board, 0, 16);
+    REQUIRE(c.call(410, board, status) == CELL_OK);
+    CHECK(f.base()[board + 15] == 15);
+    CHECK(c.call(410, 0, status) == rc(CELL_EFAULT));
+    REQUIRE(c.call(412, status) == CELL_OK);
+    CHECK(f.r32(status) == 0);
+
+    // Random numbers: package 2 only for a game; at most 256 MB.
+    const u32 rnd = f.alloc(64);
+    std::memset(f.base() + rnd, 0, 64);
+    REQUIRE(c.call(865, 2, rnd, 64) == CELL_OK);
+    bool any = false;
+    for (u32 i = 0; i < 64; i++) any |= f.base()[rnd + i] != 0;
+    CHECK(any);
+    CHECK(c.call(865, 1, rnd, 0x18) == rc(CELL_ENOSYS));
+    CHECK(static_cast<u32>(c.call(865, 3, rnd, 8)) == 0x80010500u);
+    CHECK(static_cast<u32>(c.call(865, 2, rnd, 0x10000001)) == 0x80010501u);
+
+    const u32 psid = f.alloc(16);
+    REQUIRE(c.call(872, psid) == CELL_OK);
+    CHECK(f.r64(psid) == 0x1122334455667788ull);
+    CHECK(f.r64(psid + 8) == 0x99AABBCCDDEEFF00ull);
+    CHECK(c.call(870, psid) == rc(CELL_ENOSYS)); // the console ID: root only
+    const u32 value = f.alloc(8);
+    REQUIRE(c.call(873, value) == CELL_OK);
+    CHECK(f.base()[value] == 0xFF);
+    REQUIRE(c.call(874, value) == CELL_OK);
+    CHECK(f.r64(value) == 0xFE);
+    REQUIRE(c.call(875, value) == CELL_OK);
+    CHECK(f.r64(value) == 0x190);
+    CHECK(c.call(875, 0) == rc(CELL_EINVAL));
+    REQUIRE(c.call(866, 0x3002, 0, value, psid) == CELL_OK); // the secure RTC: the time base, status 0
+    CHECK(f.r64(value) > 0);
+    CHECK(f.r64(psid) == 0);
+    CHECK(static_cast<u32>(c.call(866, 0x3004, 0, 0, 0)) == 0x80010500u);
+    REQUIRE(c.call(871, 2, value, 0) == CELL_OK); // the authority ID
+    CHECK(c.call(871, 1, 1, value) == rc(CELL_ENOSYS));
+    CHECK(static_cast<u32>(c.call(871, 9, 0, 0)) == 0x8001051Du);
+    REQUIRE(c.call(868, 0x17001, 0, value, 0, 0, 0) == CELL_OK);
+    CHECK(f.r64(value) == 0x100);
+}
+
+TEST_CASE("lv2 process: RPCS3's stub syscalls answer its constant (D-184)", "[lv2][process]")
+{
+    Fixture f;
+    Caller c(*f.kernel);
+    CHECK(c.call(60, 0, 0) == static_cast<s32>(0x80010003)); // sys_trace_create: CELL_ENOSYS-like constant
+    CHECK(c.call(810, f.cstr("/a"), f.cstr("/b")) == CELL_OK); // sys_fs_link
+    CHECK(c.call(213, f.cstr("text"), 4) == CELL_OK);         // sys_console_write2 (an alias of sys_console_write)
+    CHECK(c.call(510) == 1);                                  // sys_hid_manager_check_focus
 }

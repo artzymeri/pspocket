@@ -536,3 +536,170 @@ TEST_CASE("lv2 fs: encrypted SDATA files open through the NPD opener, on an imag
     REQUIRE(t.read(t.f.r32(out), 4, s) == CELL_OK);
     CHECK(s == std::string("NPD\0", 4));
 }
+
+TEST_CASE("lv2 fs: directory entries, a descriptor's path, block sizes, free space, mount information (D-184)",
+    "[lv2][fs]")
+{
+    FsFixture t;
+    std::ofstream(t.root / "hdd0" / "game" / "TEST00000" / "a.bin") << "12345";
+    fs::create_directories(t.root / "hdd0" / "game" / "TEST00000" / "sub");
+
+    // fcntl 0xE0000012 (cellFsGetDirectoryEntries): one entry a call, with its attributes; the rest cleared.
+    const u32 dfd_out = t.f.alloc(4);
+    REQUIRE(t.c.call(kFsOpendir, t.f.cstr("/dev_hdd0/game/TEST00000"), dfd_out) == CELL_OK);
+    const u32 dfd = t.f.r32(dfd_out);
+    const u32 info = t.f.alloc(0x10), entries = t.f.alloc(2 * kCellFsDirectoryEntrySize);
+    t.f.w32(info + 8, entries);
+    t.f.w32(info + 12, 2);
+    std::vector<std::string> names;
+    for (int i = 0; i < 5; i++) {
+        std::memset(t.f.base() + entries, 0xAA, 2 * kCellFsDirectoryEntrySize);
+        REQUIRE(t.c.call(817, dfd, 0xE0000012, info, 0x10) == CELL_OK);
+        CHECK(t.f.r32(info) == 0);
+        const u32 count = t.f.r32(info + 4);
+        CHECK(t.f.base()[entries + kCellFsDirectoryEntrySize] == 0); // the second slot is cleared
+        if (!count) {
+            CHECK(t.f.base()[entries] == 0);
+            break;
+        }
+        const u8* name = t.f.base() + entries + kCellFsStatSize;
+        names.emplace_back(reinterpret_cast<const char*>(name + 2), name[1]);
+        if (names.back() == "a.bin") {
+            const Stat st = read_stat(t.f, entries);
+            CHECK(st.mode == (CELL_FS_S_IFREG | 0666));
+            CHECK(st.size == 5);
+            CHECK(st.blksize == 4096);
+            CHECK(name[0] == CELL_FS_TYPE_REGULAR);
+        }
+        if (names.back() == "sub") CHECK(name[0] == CELL_FS_TYPE_DIRECTORY);
+    }
+    CHECK(names == std::vector<std::string>{".", "..", "a.bin", "sub"});
+    CHECK(t.c.call(817, dfd, 0xE0000012, info, 8) == rc(CELL_EINVAL));
+    CHECK(t.c.call(817, 99, 0xE0000012, info, 0x10) == rc(CELL_EBADF));
+
+    // sys_fs_test(6): the path a descriptor was opened with.
+    const u32 fd = t.open_ok("/dev_hdd0/game/TEST00000/a.bin", CELL_FS_O_RDONLY);
+    const u32 fdv = t.f.alloc(4), buf = t.f.alloc(0x420);
+    t.f.w32(fdv, fd);
+    REQUIRE(t.c.call(800, 6, 0, fdv, 4, buf, 0x420) == CELL_OK);
+    CHECK(std::string(reinterpret_cast<const char*>(t.f.base() + buf)) == "/dev_hdd0/game/TEST00000/a.bin");
+    REQUIRE(t.c.call(800, 6, 0, fdv, 4, buf, 10) == CELL_OK); // truncated, terminated
+    CHECK(std::string(reinterpret_cast<const char*>(t.f.base() + buf)) == "/dev_hdd0");
+    t.f.w32(fdv, dfd);
+    REQUIRE(t.c.call(800, 6, 0, fdv, 4, buf, 0x420) == CELL_OK); // a directory has one too
+    t.f.w32(fdv, 99);
+    CHECK(t.c.call(800, 6, 0, fdv, 4, buf, 0x420) == rc(CELL_EBADF));
+    CHECK(t.c.call(800, 6, 0, 0, 4, buf, 0x420) == rc(CELL_EFAULT));
+
+    // Block sizes: the device's (RPCS3's mount point table); a missing path off /dev_hdd0 is ENOENT.
+    const u32 sizes = t.f.alloc(32);
+    REQUIRE(t.c.call(822, t.f.cstr("/dev_hdd0/game/TEST00000/a.bin"), sizes, sizes + 8, sizes + 16) == CELL_OK);
+    CHECK(t.f.r64(sizes) == 512);
+    CHECK(t.f.r64(sizes + 8) == 4096);
+    REQUIRE(t.c.call(822, t.f.cstr("/dev_hdd0/nothing"), sizes, sizes + 8, sizes + 16) == CELL_OK); // hdd0: any path
+    REQUIRE(t.c.call(822, t.f.cstr("/dev_bdvd/PS3_GAME"), sizes, sizes + 8, sizes + 16) == CELL_OK);
+    CHECK(t.f.r64(sizes) == 2048);
+    CHECK(t.c.call(822, t.f.cstr("/dev_bdvd/nothing"), sizes, sizes + 8, sizes + 16) == rc(CELL_ENOENT));
+    CHECK(t.c.call(822, t.f.cstr("/"), sizes, sizes + 8, sizes + 16) == rc(CELL_EISDIR));
+    CHECK(t.c.call(822, t.f.cstr("/dev_usb000/x"), sizes, sizes + 8, sizes + 16) == rc(CELL_ENOTMOUNTED));
+    REQUIRE(t.c.call(821, fd, sizes, sizes + 8, sizes + 16, sizes + 24) == CELL_OK);
+    CHECK(t.f.r64(sizes + 8) == 4096);
+    CHECK(t.f.r32(sizes + 24) == static_cast<u32>(CELL_FS_O_RDONLY));
+    CHECK(t.c.call(821, dfd, sizes, sizes + 8, sizes + 16, sizes + 24) == rc(CELL_EBADF)); // a directory
+
+    // Free space: RPCS3's 40 GB (2 GB on /dev_hdd1) less a sector; none on a read-only device.
+    const u32 total = t.f.alloc(8), avail = t.f.alloc(8);
+    REQUIRE(t.c.call(840, t.f.cstr("/dev_hdd0"), total, avail) == CELL_OK);
+    CHECK(t.f.r64(avail) == (40ull << 30) - 512);
+    CHECK(t.f.r64(total) >= t.f.r64(avail) + 512); // plus what the device holds
+    REQUIRE(t.c.call(840, t.f.cstr("/dev_hdd1/anything"), total, avail) == CELL_OK);
+    CHECK(t.f.r64(avail) == (2ull << 30) - 512);
+    REQUIRE(t.c.call(840, t.f.cstr("/dev_bdvd"), total, avail) == CELL_OK);
+    CHECK(t.f.r64(avail) == 0);
+    CHECK(t.c.call(840, t.f.cstr("/"), total, avail) == rc(CELL_ENOTSUP));
+    CHECK(t.c.call(840, t.f.cstr("//dev_hdd0"), total, avail) == rc(CELL_EINVAL));
+    CHECK(t.c.call(840, t.f.cstr("/dev_hdd0/a_path_longer_than_31_chars"), total, avail) == rc(CELL_ENAMETOOLONG));
+    CHECK(t.c.call(840, t.f.cstr("/dev_usb000"), total, avail) == rc(CELL_EINVAL));
+
+    // Mount information: the root and the three mounts, sorted, with RPCS3's file systems and devices.
+    const u32 len = t.f.alloc(8);
+    REQUIRE(t.c.call(841, len) == CELL_OK);
+    REQUIRE(t.f.r64(len) == 4);
+    const u32 mi = t.f.alloc(4 * 0x94);
+    REQUIRE(t.c.call(842, mi, 4, len) == CELL_OK);
+    CHECK(t.f.r64(len) == 4);
+    const auto field = [&](u32 i, u32 off) { return std::string(reinterpret_cast<const char*>(t.f.base() + mi + i * 0x94 + off)); };
+    CHECK(field(0, 0) == "/");
+    CHECK(field(1, 0) == "/dev_bdvd");
+    CHECK(field(1, 0x20) == "CELL_FS_ISO9660");
+    CHECK(t.f.r32(mi + 0x94 + 0x90) == 0x10000000); // read-only
+    CHECK(field(2, 0) == "/dev_hdd0");
+    CHECK(field(2, 0x40) == "CELL_FS_UTILITY:HDD0");
+    CHECK(t.f.r32(mi + 2 * 0x94 + 0x90) == 0);
+    REQUIRE(t.c.call(842, mi, 1, len) == CELL_OK);
+    CHECK(t.f.r64(len) == 1);
+
+    // The LSN calls want an open file; formatting and mounting need root, except USB storage, which there is none of.
+    CHECK(t.c.call(825, fd, len) == CELL_OK);
+    CHECK(t.f.r64(len) == 0);
+    CHECK(t.c.call(827, fd) == CELL_OK);
+    CHECK(t.c.call(828, 99) == rc(CELL_EBADF));
+    CHECK(t.c.call(836, t.f.cstr("CELL_FS_UTILITY:HDD1"), t.f.cstr("CELL_FS_FAT"), 0, 0) == rc(CELL_EPERM));
+    CHECK(t.c.call(836, t.f.cstr("CELL_FS_IOS:USB_MASS_STORAGE000"), t.f.cstr("CELL_FS_FAT"), 0, 0) ==
+          rc(CELL_ENOTSUP));
+    CHECK(t.c.call(838, t.f.cstr("/dev_hdd1"), 0, 0) == rc(CELL_EPERM));
+
+    // RPCS3's stub syscalls answer its constant: sys_fs_chown and sys_fs_truncate2 succeed, doing nothing.
+    CHECK(t.c.call(835, t.f.cstr("/dev_hdd0/game/TEST00000/a.bin"), 0, 0) == CELL_OK);
+    CHECK(t.c.call(847, fd, 0) == CELL_OK);
+    CHECK(t.host_file(t.root / "hdd0" / "game" / "TEST00000" / "a.bin") == "12345");
+}
+
+TEST_CASE("lv2 fs: an SDATA file inside an open file (fcntl 0x80000009, cellFsSdataOpenByFd)", "[lv2][fs][npd]")
+{
+    FsFixture t;
+    const std::string plain = "inner";
+    std::string archive = "MSELF-header....";
+    archive += std::string("NPD\0", 4);
+    for (char c : plain) archive += static_cast<char>(c ^ 0x5A);
+    std::ofstream(t.root / "hdd0" / "game" / "TEST00000" / "pack.msf", std::ios::binary) << archive;
+    t.f.kernel->set_npd_opener([](std::shared_ptr<const VfsImage::File> enc, bool, std::string& error)
+                                   -> std::shared_ptr<const VfsImage::File> {
+        u8 magic[4]{};
+        if (!enc->read(0, magic, 4) || std::memcmp(magic, "NPD\0", 4) != 0) {
+            error = "not NPD";
+            return nullptr;
+        }
+        class Xor final : public VfsImage::File {
+        public:
+            explicit Xor(std::shared_ptr<const VfsImage::File> e) : e_(std::move(e)) {}
+            u64 size() const override { return e_->size() - 4; }
+            bool read(u64 offset, void* dst, usize size) const override
+            {
+                if (!e_->read(offset + 4, dst, size)) return false;
+                for (usize i = 0; i < size; i++) static_cast<u8*>(dst)[i] ^= 0x5A;
+                return true;
+            }
+
+        private:
+            std::shared_ptr<const VfsImage::File> e_;
+        };
+        return std::make_shared<Xor>(std::move(enc));
+    });
+    const u32 fd = t.open_ok("/dev_hdd0/game/TEST00000/pack.msf", CELL_FS_O_RDONLY);
+    const u32 ctrl = t.f.alloc(0x40);
+    std::memset(t.f.base() + ctrl, 0, 0x40);
+    t.f.w32(ctrl + 4, 0x80000009);
+    t.f.w32(ctrl + 0x10, fd);
+    t.f.w64(ctrl + 0x18, 16);
+    REQUIRE(t.c.call(817, fd, 0x80000009, ctrl, 0x40) == CELL_OK);
+    CHECK(t.f.r32(ctrl + 0x38) == 0);
+    const u32 inner = t.f.r32(ctrl + 0x3C);
+    CHECK(inner != fd);
+    std::string s;
+    REQUIRE(t.read(inner, 100, s) == CELL_OK);
+    CHECK(s == plain);
+    t.f.w64(ctrl + 0x18, 0); // not an SDATA file there
+    CHECK(t.c.call(817, fd, 0x80000009, ctrl, 0x40) == rc(CELL_EFSSPECIFIC));
+    CHECK(t.c.call(817, fd, 0x80000009, ctrl, 0x20) == rc(CELL_EINVAL));
+}

@@ -174,6 +174,12 @@ struct Config {
     std::string title_id;
     // Debug/root process permissions (allows negative thread priorities and root-only syscalls).
     bool root = false;
+    // The console's OpenPSID (sys_ss_get_open_psid). RPCS3 makes a random one per installation; pspocket's default is
+    // a fixed value a host can replace with one of its own.
+    u64 console_psid_high = 0x50535047'4F434B45ull, console_psid_low = 0x54000000'00000001ull;
+    // The system software version (_sys_game_get_system_sw_version): RPCS3 reads the installed firmware's
+    // version.txt and multiplies it by 10000 (4.92 is 49200). The host sets it from the installed firmware.
+    u64 system_sw_version = 49200;
     // Abort (instead of logging and returning ENOSYS) on an unimplemented syscall. CLAUDE.md rule 4 asks for the
     // error return; this flag is for bring-up sessions that want to stop at the first gap.
     bool abort_on_unimplemented = false;

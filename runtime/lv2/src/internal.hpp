@@ -122,6 +122,8 @@ public:
     // Binds a syscall RPCS3 answers with null_func (lv2.cpp): it logs the first call and returns CELL_OK. Only for
     // numbers a game is seen calling; `what` describes the syscall (RPCS3's table comment) for the log.
     void bind_null(u32 number, const char* what);
+    // Binds a syscall RPCS3 binds to a stub (a log, then a constant; D-184): it logs the first call and returns `r3`.
+    void bind_stub(u32 number, const char* name, u64 r3);
     // Binds `fn` to `number`; `name` must match the generated name table (catches a wrong number at startup).
     void bind(u32 number, const char* name, SyscallFn fn);
     const SyscallEntry& operator[](u32 number) const { return entries_[number]; }
@@ -142,6 +144,7 @@ void register_memory_syscalls(SyscallTable& table);
 void register_fs_syscalls(SyscallTable& table);
 void register_vm_syscalls(SyscallTable& table);
 void register_spu_syscalls(SyscallTable& table);
+void register_system_syscalls(SyscallTable& table);
 
 // The whole of the open file `fd` (a host file or one on an image), without moving its position (fs.cpp; for
 // sys_spu_image_open_by_fd). CELL_EBADF when fd is not an open file.
@@ -345,6 +348,11 @@ struct Mount {
     bool read_only = false;
     u32 block_size = 4096;
     bool no_uid_gid = false;
+    // RPCS3 lv2_fs_mount_point, for the mount information and block size syscalls.
+    u32 sector_size = 512;
+    std::string file_system; // "CELL_FS_UFS"
+    std::string device;      // "CELL_FS_UTILITY:HDD0"
+    bool strict_block_size = false; // lv2_mp_flag::strict_get_block_size: block sizes only of files
 };
 
 class Vfs {
@@ -456,6 +464,9 @@ struct Kernel::Impl {
 
     MemoryManager memory;
     Vfs vfs;
+    // sys_game's and sys_ss's state (system.cpp), made at first use under system_mutex.
+    std::mutex system_mutex;
+    std::shared_ptr<void> system_state;
     std::mutex npd_mutex;
     Kernel::NpdOpener npd_opener; // Kernel::set_npd_opener (D-165), under npd_mutex
     // SPU thread groups (D-167): their IDs, and what the HLE layer adds (under spu_hooks_mutex).

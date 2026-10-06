@@ -69,6 +69,10 @@ public:
     struct Entry {
         std::string name;
         bool dir = false;
+        // cellFsGetDirectoryEntries' attributes, taken at opendir (RPCS3's fs::dir entries carry them): host files'
+        // stat, image files' size (no times).
+        u64 size = 0;
+        s64 atime = 0, mtime = 0, ctime = 0;
     };
     std::vector<Entry> entries;
     usize pos = 0; // guarded by lock
@@ -99,29 +103,49 @@ Result map_errno(int e, std::string_view what, std::string_view path)
     }
 }
 
-// RPCS3 lv2_fs_mount_point table: block size and uid/gid reporting per device.
+// RPCS3 lv2_fs_mount_point table (rpcs3/Emu/Cell/lv2/sys_fs.cpp g_mp_sys_*): per device its file system, device
+// name, sector and block sizes, and whether it reports uid/gid and gives block sizes of files only.
+struct MountPointInfo {
+    std::string_view root, file_system, device;
+    u32 sector_size, block_size;
+    bool no_uid_gid, strict_block_size;
+};
+constexpr MountPointInfo kMountPoints[] = {
+    {"/dev_usb", "CELL_FS_FAT", "CELL_FS_IOS:USB_MASS_STORAGE", 512, 4096, true, false},
+    {"/dev_ps2disc", "CELL_FS_ISO9660", "CELL_FS_IOS:PATA1_BDVD_DRIVE", 2048, 32768, true, false},
+    {"/dev_bdvd", "CELL_FS_ISO9660", "CELL_FS_IOS:PATA0_BDVD_DRIVE", 2048, 2048, true, false},
+    {"/dev_hdd1", "CELL_FS_FAT", "CELL_FS_UTILITY:HDD1", 512, 32768, true, false},
+    {"/dev_hdd0", "CELL_FS_UFS", "CELL_FS_UTILITY:HDD0", 512, 4096, false, false},
+    {"/dev_flash3", "CELL_FS_FAT", "CELL_FS_IOS:BUILTIN_FLSH3", 512, 8192, true, false},
+    {"/dev_flash2", "CELL_FS_FAT", "CELL_FS_IOS:BUILTIN_FLSH2", 512, 8192, true, false},
+    {"/dev_flash", "CELL_FS_FAT", "CELL_FS_IOS:BUILTIN_FLSH1", 512, 8192, true, false},
+    {"/host_root", "CELL_FS_DUMMYFS", "CELL_FS_DUMMY:/", 512, 512, true, true},
+    {"/app_home", "CELL_FS_DUMMYFS", "CELL_FS_DUMMY:", 512, 512, true, true},
+};
+// The root ("/"), always there and read-only.
+constexpr MountPointInfo kRootMountPoint = {"/", "CELL_FS_ADMINFS", "CELL_FS_ADMINFS:", 512, 512, true, true};
+
 void mount_properties(Mount& m)
 {
     const std::string_view p = m.point;
-    if (p == "/dev_bdvd" || p == "/dev_ps2disc") {
-        m.block_size = 2048;
-        m.no_uid_gid = true;
-    } else if (p == "/dev_hdd0") {
-        m.block_size = 4096;
-        m.no_uid_gid = false;
-    } else if (p == "/dev_hdd1") {
-        m.block_size = 32768;
-        m.no_uid_gid = true;
-    } else if (p == "/app_home" || p == "/host_root") {
-        m.block_size = 512;
-        m.no_uid_gid = true;
-    } else if (p.starts_with("/dev_flash")) {
-        m.block_size = 8192;
-        m.no_uid_gid = true;
-    } else {
-        m.block_size = 4096; // /dev_usb* and anything else
-        m.no_uid_gid = true;
+    for (const MountPointInfo& mp : kMountPoints) {
+        // /dev_usb000 .. /dev_usb007 share /dev_usb's entry; the device name takes the number too.
+        const bool usb = mp.root == "/dev_usb" && p.starts_with("/dev_usb");
+        if (!usb && p != mp.root) continue;
+        m.block_size = mp.block_size;
+        m.sector_size = mp.sector_size;
+        m.no_uid_gid = mp.no_uid_gid;
+        m.strict_block_size = mp.strict_block_size;
+        m.file_system = mp.file_system;
+        m.device = std::string(mp.device) + std::string(usb ? p.substr(8) : std::string_view());
+        return;
     }
+    // Anything else (a test's own mount point): /dev_usb's properties, as before.
+    m.block_size = 4096;
+    m.sector_size = 512;
+    m.no_uid_gid = true;
+    m.file_system = "CELL_FS_FAT";
+    m.device = "CELL_FS_UNKNOWN:";
 }
 
 // RPCS3 has_fs_write_rights: games may not create entries directly in /dev_hdd0, /dev_hdd0/game or /dev_flash*.
@@ -334,6 +358,18 @@ public:
 private:
     int fd_;
     u64 size_;
+};
+
+// The bytes of another file from `offset` on (an SDATA file inside an MSELF archive: cellFsSdataOpenByFd).
+class OffsetFile final : public VfsImage::File {
+public:
+    OffsetFile(std::shared_ptr<const VfsImage::File> base, u64 offset) : base_(std::move(base)), offset_(offset) {}
+    u64 size() const override { return base_->size() > offset_ ? base_->size() - offset_ : 0; }
+    bool read(u64 offset, void* dst, usize size) const override { return base_->read(offset_ + offset, dst, size); }
+
+private:
+    std::shared_ptr<const VfsImage::File> base_;
+    u64 offset_;
 };
 
 // sys_fs_open's 8-byte type argument: SDATA (0x18000000010) or EDATA (2), else 0 (RPCS3 sys_fs_open).
@@ -743,7 +779,7 @@ Result sys_fs_opendir(PpuThread& t, u32 path, u32 fd)
             if (!st->dir) return err(CELL_ENOTDIR);
             const auto list = res.mount->image->list(res.image_path);
             if (!list) return err(CELL_EIO);
-            for (const auto& [name, entry] : *list) dir->entries.push_back({name, entry.dir});
+            for (const auto& [name, entry] : *list) dir->entries.push_back({name, entry.dir, entry.size});
             return finish_opendir(s, std::move(dir), fd);
         }
         struct stat st {};
@@ -754,9 +790,17 @@ Result sys_fs_opendir(PpuThread& t, u32 path, u32 fd)
         while (const dirent* e = ::readdir(d)) {
             const std::string_view name = e->d_name;
             if (name == "." || name == "..") continue;
+            const std::string host = res.host + "/" + std::string(name);
             bool is_dir = e->d_type == DT_DIR;
-            if (e->d_type == DT_UNKNOWN || e->d_type == DT_LNK) is_dir = host_is_dir(res.host + "/" + std::string(name));
-            dir->entries.push_back({std::string(name), is_dir});
+            if (e->d_type == DT_UNKNOWN || e->d_type == DT_LNK) is_dir = host_is_dir(host);
+            FsDir::Entry entry{std::string(name), is_dir};
+            if (struct stat est {}; ::stat(host.c_str(), &est) == 0) {
+                entry.size = static_cast<u64>(est.st_size);
+                entry.atime = est.st_atime;
+                entry.mtime = est.st_mtime;
+                entry.ctime = est.st_ctime;
+            }
+            dir->entries.push_back(std::move(entry));
         }
         ::closedir(d);
     }
@@ -1017,6 +1061,8 @@ Result sys_fs_utime(PpuThread& t, u32 path, u32 timep)
 // - 0x8000000A / 0x8000000B (cellFsReadWithOffset / cellFsWriteWithOffset): read or write at an offset without
 //   moving the file position. lv2_file_op_rw (0x38 bytes): vtable, op, 2 x u32, fd, buf, offset (u64), size (u64),
 //   out_code (s32) at 0x28, out_size (u64) at 0x30.
+// - 0x80000009 (cellFsSdataOpenByFd): an SDATA file inside an open file, as a new file.
+// - 0xE0000012 (cellFsGetDirectoryEntries): the next directory entry with its attributes.
 // - 0xE0000017 (cellFsAllocateFileAreaWithoutZeroFill): sets a file's size. lv2_file_e0000017 (0x28 bytes): size,
 //   0x10, 0x20, -, path, size (u64) at 0x18, out_code at 0x20.
 // Deviation: any other operation logs an error and returns CELL_EINVAL (RPCS3 logs and returns CELL_OK), so nothing
@@ -1062,12 +1108,313 @@ Result sys_fs_fcntl(PpuThread& t, u32 fd, u32 op, u32 arg, u32 size)
         s.guest.w32(arg + 0x20, static_cast<u32>(r));
         return CELL_OK;
     }
+    case 0x80000009: {
+        // cellFsSdataOpenByFd: an SDATA file at an offset inside the open file `fd` (an MSELF archive), opened as a
+        // new read-only file through the NPD opener (RPCS3 wraps a view of the file in its EDATADecrypter).
+        // lv2_file_op_09 (0x40 bytes): fd at 0x10, offset (u64) at 0x18, out_code at 0x38, out_fd at 0x3C.
+        if (size < 0x40) return err(CELL_EINVAL);
+        if (!s.guest.valid(arg, 0x40)) return err(CELL_EFAULT);
+        const auto file = get_file(t.kernel, fd);
+        if (!file) return err(CELL_EBADF);
+        const u64 offset = s.guest.r64(arg + 0x18);
+        std::shared_ptr<const VfsImage::File> view;
+        {
+            std::lock_guard lock(file->lock);
+            if (!file->is_open()) return err(CELL_EBADF);
+            if (file->image_file) {
+                view = std::make_shared<OffsetFile>(file->image_file, offset);
+            } else {
+                struct stat st {};
+                const int dup_fd = ::dup(file->host_fd);
+                if (dup_fd < 0 || ::fstat(dup_fd, &st) != 0) {
+                    if (dup_fd >= 0) ::close(dup_fd);
+                    return map_errno(errno, "cellFsSdataOpenByFd", file->vpath);
+                }
+                view = std::make_shared<OffsetFile>(std::make_shared<HostFdFile>(dup_fd, static_cast<u64>(st.st_size)),
+                    offset);
+            }
+        }
+        std::shared_ptr<const VfsImage::File> plain;
+        if (open_npd(s, std::move(view), 0x18000000010ull, CELL_FS_O_RDONLY, file->vpath, plain) != CELL_OK) {
+            return err(CELL_EFSSPECIFIC);
+        }
+        auto sdata = std::make_shared<FsFile>();
+        sdata->vpath = file->vpath;
+        sdata->mount = file->mount;
+        sdata->image_file = std::move(plain);
+        sdata->flags = CELL_FS_O_RDONLY;
+        sdata->mode = file->mode;
+        if (const Result r = install_file(s, std::move(sdata), arg + 0x3C); r != CELL_OK) return r;
+        s.guest.w32(arg + 0x38, CELL_OK);
+        return CELL_OK;
+    }
+    case 0xE0000012: {
+        // cellFsGetDirectoryEntries. dir_info (0x10 bytes): out code, count written, entries pointer, entries room.
+        // lv2 returns at most one entry a call and clears the rest of the room (RPCS3).
+        if (size < 0x10) return err(CELL_EINVAL);
+        if (!s.guest.valid(arg, 0x10)) return err(CELL_EFAULT);
+        const auto dir = get_dir(t.kernel, fd);
+        if (!dir) return err(CELL_EBADF);
+        const u32 ptr = s.guest.r32(arg + 8), max = s.guest.r32(arg + 12);
+        u32 count = 0;
+        if (max) {
+            if (!s.guest.valid(ptr, u64{max} * kCellFsDirectoryEntrySize)) return err(CELL_EFAULT);
+            std::lock_guard lock(dir->lock);
+            if (dir->pos < dir->entries.size()) {
+                const FsDir::Entry& e = dir->entries[dir->pos++];
+                s32 mode = e.dir ? (CELL_FS_S_IFDIR | 0777) : (CELL_FS_S_IFREG | 0666);
+                const Mount* m = dir->mount.get();
+                if (!m || m->read_only) mode &= ~0222; // the root's listing is read-only too
+                const s32 id = !m || m->no_uid_gid ? -1 : 0;
+                write_stat(s.guest, ptr, mode, id, id, e.atime, e.mtime, e.ctime, e.size, m ? m->block_size : 512);
+                u8 name[kCellFsDirentSize]{};
+                const usize len = std::min(e.name.size(), kMaxName);
+                name[0] = e.dir ? CELL_FS_TYPE_DIRECTORY : CELL_FS_TYPE_REGULAR;
+                name[1] = static_cast<u8>(len);
+                std::memcpy(name + 2, e.name.data(), len);
+                std::memcpy(s.guest.ptr(ptr + kCellFsStatSize), name, sizeof(name));
+                count = 1;
+            }
+            std::memset(s.guest.ptr(ptr + count * kCellFsDirectoryEntrySize), 0,
+                (max - count) * kCellFsDirectoryEntrySize);
+        }
+        s.guest.w32(arg + 4, count);
+        s.guest.w32(arg + 0, CELL_OK);
+        return CELL_OK;
+    }
     default:
         // RPCS3 logs an unknown operation and returns CELL_OK (D-166); its 31 no-op operations land here too.
         PS_LOG_ERROR(kFs, "sys_fs_fcntl(fd {}, op {:#x}, size {:#x}): operation not implemented; CELL_OK as RPCS3", fd,
             op, size);
         return CELL_OK;
     }
+}
+
+// ------------------------------------------------------------------------------------------------- D-184
+
+// sys_fs_test(6, 0, u32* fd, 4, buf, buf_size): the path an open file or directory was opened with (cellFsGetPath).
+// RPCS3 accepts other arguments with a log.
+Result sys_fs_test(PpuThread& t, u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 buf, u32 buf_size)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    if (arg1 != 6 || arg2 != 0 || arg4 != 4) {
+        PS_LOG_WARN(kFs, "sys_fs_test({:#x}, {:#x}, {:#x}, {:#x}): not the get-path call (RPCS3 goes on)", arg1, arg2,
+            arg3, arg4);
+    }
+    if (!arg3) return err(CELL_EFAULT);
+    if (!s.guest.valid(arg3, 4)) return err(CELL_EFAULT);
+    const auto obj = std::dynamic_pointer_cast<FsObject>(s.fds.find(FsObject::kIdBase, s.guest.r32(arg3)));
+    if (!obj) return err(CELL_EBADF);
+    if (buf_size && !s.guest.valid(buf, buf_size)) return err(CELL_EFAULT);
+    const std::string& name = obj->vpath;
+    for (u32 i = 0; i < buf_size; i++) {
+        const char c = i < name.size() ? name[i] : '\0';
+        ps_write8(s.guest.ptr(0), buf + i, static_cast<u8>(c));
+        if (!c) return CELL_OK;
+    }
+    if (buf_size) ps_write8(s.guest.ptr(0), buf + buf_size - 1, 0);
+    return CELL_OK;
+}
+
+// sys_fs_fget_block_size(fd, u64* sector_size, u64* block_size, u64* arg4, s32* out_flags): the file's device's sizes,
+// and its open flags.
+Result sys_fs_fget_block_size(PpuThread& t, u32 fd, u32 sector_size, u32 block_size, u32 arg4, u32 out_flags)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const auto file = get_file(t.kernel, fd);
+    if (!file) return err(CELL_EBADF);
+    if (!s.guest.valid(sector_size, 8) || !s.guest.valid(block_size, 8) || !s.guest.valid(arg4, 8) ||
+        !s.guest.valid(out_flags, 4))
+        return err(CELL_EFAULT);
+    s.guest.w64(sector_size, file->mount->sector_size);
+    s.guest.w64(block_size, file->mount->block_size);
+    s.guest.w64(arg4, file->mount->sector_size);
+    s.guest.w32(out_flags, static_cast<u32>(file->flags));
+    return CELL_OK;
+}
+
+// sys_fs_get_block_size(path, u64* sector_size, u64* block_size, u64* arg4): the device's sizes, for an existing path
+// (any path on /dev_hdd0; only a file on the dummy file systems, /app_home and /host_root).
+Result sys_fs_get_block_size(PpuThread& t, u32 path, u32 sector_size, u32 block_size, u32 arg4)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const PathArg p = read_path(s.guest, path);
+    if (p.error) return p.error;
+    const Vfs::Resolved res = s.vfs.resolve(p.vpath);
+    if (res.root) return err(CELL_EISDIR);
+    if (!res.mount) return err(CELL_ENOTMOUNTED);
+    if (res.mount->point != "/dev_hdd0") {
+        bool exists = false, is_dir = false;
+        if (res.mount->image) {
+            const auto st = res.mount->image->stat(res.image_path);
+            exists = st.has_value();
+            is_dir = st && st->dir;
+        } else if (struct stat st {}; ::stat(res.host.c_str(), &st) == 0) {
+            exists = true;
+            is_dir = S_ISDIR(st.st_mode);
+        }
+        if (!exists) return err(CELL_ENOENT);
+        if (res.mount->strict_block_size && is_dir) return err(CELL_EISDIR);
+    }
+    if (!s.guest.valid(sector_size, 8) || !s.guest.valid(block_size, 8) || !s.guest.valid(arg4, 8)) {
+        return err(CELL_EFAULT);
+    }
+    s.guest.w64(sector_size, res.mount->sector_size);
+    s.guest.w64(block_size, res.mount->block_size);
+    s.guest.w64(arg4, res.mount->sector_size);
+    return CELL_OK;
+}
+
+// sys_fs_disk_free(path, u64* total_free, u64* avail_free): a device path ("/dev_hdd0", at most 31 characters, one
+// leading slash). Read-only devices have none; /dev_hdd1 has 2 GB, the rest 40 GB less a sector, as RPCS3 (its
+// cellHddGameCheck explains the 40 GB); the total adds what the device holds now.
+Result sys_fs_disk_free(PpuThread& t, u32 path, u32 total_free, u32 avail_free)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    if (!path) return err(CELL_EFAULT);
+    std::string vpath;
+    if (s.guest.read_cstr(path, kMaxPath, vpath) != Guest::Str::Ok) return err(CELL_EFAULT);
+    if (vpath.empty()) return err(CELL_EINVAL);
+    if (vpath == "/") return err(CELL_ENOTSUP);
+    if (vpath.size() > 31) return err(CELL_ENAMETOOLONG);
+    if (vpath.find_first_not_of('/') != 1) return err(CELL_EINVAL);
+    const std::string device = vpath.substr(0, vpath.find('/', 1));
+    const Vfs::Resolved res = s.vfs.resolve(device);
+    if (!res.mount) return err(CELL_EINVAL);
+    if (res.mount->strict_block_size) return err(CELL_ENOTSUP);
+    if (!s.guest.valid(total_free, 8) || !s.guest.valid(avail_free, 8)) return err(CELL_EFAULT);
+    if (res.mount->read_only) {
+        s.guest.w64(total_free, 0);
+        s.guest.w64(avail_free, 0);
+        return CELL_OK;
+    }
+    const u64 sector = res.mount->sector_size;
+    const u64 available = res.mount->point == "/dev_hdd1" ? (1ull << 31) - sector : (40ull << 30) - sector;
+    const u64 used = t.kernel.vfs_tree_size(device, sector).value_or(0);
+    s.guest.w64(total_free, available + used);
+    s.guest.w64(avail_free, available);
+    return CELL_OK;
+}
+
+namespace {
+
+// CellFsMountInfo (0x94 bytes): mount_path[0x20], filesystem[0x20], dev_name[0x40], u32 unk[5] (unk[4] bit 28: read-
+// only). The mounts sorted by path, the root first, as RPCS3's lv2_fs_mount_info_map.
+constexpr u32 kMountInfoSize = 0x94;
+
+struct MountEntry {
+    std::string path, file_system, device;
+    bool read_only;
+};
+
+std::vector<MountEntry> mount_entries(Kernel::Impl& s)
+{
+    std::vector<MountEntry> out;
+    out.push_back({"/", std::string(kRootMountPoint.file_system), std::string(kRootMountPoint.device), true});
+    for (const std::string& point : s.vfs.mount_points()) {
+        const Vfs::Resolved res = s.vfs.resolve(point);
+        if (!res.mount) continue;
+        out.push_back({point, res.mount->file_system, res.mount->device, res.mount->read_only});
+    }
+    std::sort(out.begin(), out.end(), [](const MountEntry& a, const MountEntry& b) { return a.path < b.path; });
+    return out;
+}
+
+} // namespace
+
+Result sys_fs_get_mount_info_size(PpuThread& t, u32 len)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    if (!len) return err(CELL_EFAULT);
+    if (!s.guest.put64(len, mount_entries(s).size())) return err(CELL_EFAULT);
+    return CELL_OK;
+}
+
+Result sys_fs_get_mount_info(PpuThread& t, u32 info, u64 len, u32 out_len)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    if (!info || !out_len) return err(CELL_EFAULT);
+    const std::vector<MountEntry> entries = mount_entries(s);
+    const u64 n = std::min<u64>(len, entries.size());
+    if (n && !s.guest.valid(info, n * kMountInfoSize)) return err(CELL_EFAULT);
+    if (!s.guest.valid(out_len, 8)) return err(CELL_EFAULT);
+    for (u64 i = 0; i < n; i++) {
+        const u32 at = info + static_cast<u32>(i) * kMountInfoSize;
+        std::memset(s.guest.ptr(at), 0, kMountInfoSize);
+        const auto put = [&](u32 off, const std::string& text, usize room) {
+            std::memcpy(s.guest.ptr(at + off), text.data(), std::min(text.size(), room - 1));
+        };
+        put(0x00, entries[i].path, 0x20);
+        put(0x20, entries[i].file_system, 0x20);
+        put(0x40, entries[i].device, 0x40);
+        if (entries[i].read_only) s.guest.w32(at + 0x80 + 16, 0x10000000);
+    }
+    s.guest.w64(out_len, n);
+    return CELL_OK;
+}
+
+// The LSN calls on an open file: RPCS3 keeps a lock flag (nothing reads it) and reports no CD-DA data.
+Result sys_fs_lsn_get_cda_size(PpuThread& t, u32 fd, u32 ptr)
+{
+    if (!get_file(t.kernel, fd)) return err(CELL_EBADF);
+    if (!t.kernel.impl().guest.put64(ptr, 0)) return err(CELL_EFAULT);
+    return CELL_OK;
+}
+
+Result sys_fs_lsn_lock(PpuThread& t, u32 fd) { return get_file(t.kernel, fd) ? CELL_OK : err(CELL_EBADF); }
+Result sys_fs_lsn_unlock(PpuThread& t, u32 fd) { return get_file(t.kernel, fd) ? CELL_OK : err(CELL_EBADF); }
+
+// Formatting, mounting and unmounting devices need a root process, except for USB storage (RPCS3), and pspocket has
+// no USB storage to give: EPERM, or for /dev_usb EBUSY while one is mounted, else ENOTSUP (no device behind it).
+namespace {
+
+Result usb_only(Kernel& k, std::string_view device_or_path, bool path)
+{
+    const bool usb = path ? device_or_path.starts_with("/dev_usb")
+                          : device_or_path.starts_with("CELL_FS_IOS:USB_MASS_STORAGE");
+    if (!k.config().root && !usb) return err(CELL_EPERM);
+    if (!usb) {
+        PS_LOG_ERROR(kFs, "a root process formats or mounts {}: not supported", device_or_path);
+        return err(CELL_ENOTSUP);
+    }
+    return CELL_OK;
+}
+
+} // namespace
+
+Result sys_fs_newfs(PpuThread& t, u32 dev_name, u32, s32, u32)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    std::string device;
+    if (s.guest.read_cstr(dev_name, kMaxPath, device) != Guest::Str::Ok) return err(CELL_EFAULT);
+    if (const Result r = usb_only(t.kernel, device, false); r != CELL_OK) return r;
+    for (const MountEntry& m : mount_entries(s))
+        if (m.device == device) return err(CELL_EBUSY);
+    return err(CELL_ENOTSUP);
+}
+
+Result sys_fs_mount(PpuThread& t, u32 dev_name, u32, u32, s32, s32, s32, u32, u32)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    std::string device;
+    if (s.guest.read_cstr(dev_name, kMaxPath, device) != Guest::Str::Ok) return err(CELL_EFAULT);
+    if (const Result r = usb_only(t.kernel, device, false); r != CELL_OK) return r;
+    for (const MountEntry& m : mount_entries(s))
+        if (m.device == device) return err(CELL_EBUSY);
+    return err(CELL_ENOTSUP);
+}
+
+Result sys_fs_unmount(PpuThread& t, u32 path, s32, s32)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const PathArg p = read_path(s.guest, path);
+    if (p.error) return p.error;
+    const Vfs::Resolved res = s.vfs.resolve(p.vpath);
+    if (res.root) return err(CELL_EBUSY);
+    if (!res.mount) return err(CELL_EINVAL);
+    if (const Result r = usb_only(t.kernel, res.mount->point, true); r != CELL_OK) return r;
+    s.vfs.unmount(res.mount->point);
+    return CELL_OK;
 }
 
 Result fs_read_whole_file(Kernel& k, u32 fd, std::vector<u8>& out)
@@ -1117,6 +1464,18 @@ void register_fs_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 831, sys_fs_truncate);
     PS_LV2_BIND(table, 832, sys_fs_ftruncate);
     PS_LV2_BIND(table, 834, sys_fs_chmod);
+    PS_LV2_BIND(table, 800, sys_fs_test);
+    PS_LV2_BIND(table, 821, sys_fs_fget_block_size);
+    PS_LV2_BIND(table, 822, sys_fs_get_block_size);
+    PS_LV2_BIND(table, 825, sys_fs_lsn_get_cda_size);
+    PS_LV2_BIND(table, 827, sys_fs_lsn_lock);
+    PS_LV2_BIND(table, 828, sys_fs_lsn_unlock);
+    PS_LV2_BIND(table, 836, sys_fs_newfs);
+    PS_LV2_BIND(table, 837, sys_fs_mount);
+    PS_LV2_BIND(table, 838, sys_fs_unmount);
+    PS_LV2_BIND(table, 840, sys_fs_disk_free);
+    PS_LV2_BIND(table, 841, sys_fs_get_mount_info_size);
+    PS_LV2_BIND(table, 842, sys_fs_get_mount_info);
 }
 
 } // namespace pspocket::lv2
