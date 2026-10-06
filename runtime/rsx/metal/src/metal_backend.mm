@@ -825,6 +825,15 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const RasterInfo raster = state.raster();
     fo.alpha_test = raster.alpha_test;
     fo.flat_colors = raster.shade_mode == static_cast<u32>(ShadeMode::Flat);
+    // D-174 (RPCS3 RSXThread.cpp): NV4097_SET_SHADER_PACKER turns the colours sRGB on the 8-bit targets, never from
+    // 32-bit exports; alpha to coverage is emulated (one sample here, as RPCS3 without hardware support).
+    const u32 colour_format = state.surface().color_format;
+    const bool float_target = colour_format == static_cast<u32>(SurfaceColorFormat::F_W16Z16Y16X16) ||
+                              colour_format == static_cast<u32>(SurfaceColorFormat::F_W32Z32Y32X32) ||
+                              colour_format == static_cast<u32>(SurfaceColorFormat::F_X32);
+    fo.srgb_output = state.reg(m::NV4097_SET_SHADER_PACKER) != 0 && !(fo.shader_control & 0x40) && !float_target &&
+                     targets.color_count > 0;
+    fo.alpha_to_coverage = ((state.reg(m::NV4097_SET_ANTI_ALIASING_CONTROL) >> 4) & 1) != 0;
     const shader::FragmentProgram* fprog = nullptr;
     u32 fp_ea = 0;
     const CompiledProgram* fp = fragment_program_for(state, fo, &fprog, fp_ea);

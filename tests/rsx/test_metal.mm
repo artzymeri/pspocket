@@ -3442,6 +3442,125 @@ TEST_CASE("metal e2e: a texture's LOD bias moves its samples between mipmap leve
     CHECK_NEAR4(level_colour(-1.f, true), red);
 }
 
+TEST_CASE("metal e2e: NV4097_SET_SHADER_PACKER writes 16-bit exports to 8-bit targets as sRGB (D-174)")
+{
+    REQUIRE_METAL();
+    // Linear values whose sRGB forms are the bytes 0x40, 0x80, 0xC0; alpha 0.25 (0x40), never converted.
+    const std::array<float, 4> colour{srgb_to_linear(0x40 / 255.f), srgb_to_linear(0x80 / 255.f), srgb_to_linear(0xC0 / 255.f),
+        0.25f};
+    const auto draw = [&](bool packer, bool fp16) {
+        E2E e;
+        FpInst mov = fp_mov_const(0, colour); // MOV H0 or R0, {colour} END
+        mov.fp16 = fp16;
+        mov.end = true;
+        e.put_local_bytes(kFpOffset, assemble_fp({mov}));
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, fp16 ? 0 : 0x40);
+        b.method(m::NV4097_SET_SHADER_PACKER, packer ? 1 : 0);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        INFO(failure_text(e));
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 48);
+    };
+    const auto byte = [](float v) { return static_cast<u8>(std::lround(v * 255.f)); };
+    const std::array<u8, 4> linear{byte(colour[3]), byte(colour[0]), byte(colour[1]), byte(colour[2])}; // A R G B
+    CHECK(draw(true, true) == std::array<u8, 4>{0x40, 0x40, 0x80, 0xC0});
+    CHECK(draw(true, false) == linear); // 32-bit exports are never converted (RPCS3)
+    CHECK(draw(false, true) == linear);
+}
+
+TEST_CASE("metal e2e: the alpha test discards in a pass without colour targets too (RPCS3's ROP, D-174)")
+{
+    // A depth-only pass (shadow maps of alpha-tested geometry): the triangle writes depth 0.75 over a 1.0 clear where
+    // alpha passes GREATER 0.5. Before D-174 the alpha test needed a colour output.
+    REQUIRE_METAL();
+    constexpr u32 kDepth = 0x180000;
+    for (const float alpha : {0.25f, 0.75f}) {
+        INFO(std::format("alpha {}", alpha));
+        E2E e;
+        FpInst mov = fp_mov_const(0, {1.f, 0.f, 0.f, alpha}); // MOV H0, {1, 0, 0, alpha} END
+        mov.fp16 = true;
+        mov.end = true;
+        e.put_local_bytes(kFpOffset, assemble_fp({mov}));
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (1u << 5) | (1u << 8)); // Z16
+        b.method(m::NV4097_SET_SURFACE_COLOR_TARGET, static_cast<u32>(SurfaceTarget::None));
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kDepth);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 2);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xffff);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth);
+        b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 1);
+        b.method(m::NV4097_SET_DEPTH_FUNC, 0x201); // LESS
+        b.method(m::NV4097_SET_DEPTH_MASK, 1);
+        b.method(m::NV4097_SET_ALPHA_TEST_ENABLE, 1);
+        b.method(m::NV4097_SET_ALPHA_FUNC, 0x204); // GREATER
+        b.method(m::NV4097_SET_ALPHA_REF, 0x80);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        INFO(failure_text(e));
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().draws == 1);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kDepth, kW * kH * 2));
+        const u32 depth = ps_ld16(e.mem.host(PS_MEM_RSX_LOCAL_BASE + kDepth + (48 * kW + 32) * 2));
+        if (alpha > 0.5f) {
+            CHECK(std::abs(static_cast<int>(depth) - 0xBFFF) <= 1); // 0.75
+        } else {
+            CHECK(depth == 0xFFFF); // discarded
+        }
+    }
+}
+
+TEST_CASE("metal e2e: alpha to coverage keeps a share of the pixels as large as the alpha (RPCS3's emulation, D-174)")
+{
+    // NV4097_SET_ANTI_ALIASING_CONTROL bit 4 on a one-sample target: RPCS3 discards where alpha is not above a
+    // pseudo-random value of the pixel. Counted over a 17x15 box inside the triangle.
+    REQUIRE_METAL();
+    const auto drawn = [](float alpha) {
+        E2E e;
+        FpInst mov = fp_mov_const(0, {1.f, 1.f, 1.f, alpha});
+        mov.end = true;
+        e.put_local_bytes(kFpOffset, assemble_fp({mov}));
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_ANTI_ALIASING_CONTROL, 0xffff0000u | (1u << 4));
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        INFO(failure_text(e));
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        u32 n = 0;
+        for (u32 y = 48; y < 63; y++)
+            for (u32 x = 24; x <= 40; x++) n += guest_pixel(e, kSurfaceOffset, x, y)[1] == 0xff ? 1 : 0;
+        return n;
+    };
+    CHECK(drawn(1.f) == 17 * 15);
+    CHECK(drawn(0.f) == 0);
+    const u32 half = drawn(0.5f);
+    INFO(std::format("{} of {} drawn at alpha 0.5", half, 17 * 15));
+    CHECK(half > 17 * 15 / 4);
+    CHECK(half < 17 * 15 * 3 / 4);
+}
+
 TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")
 {
     REQUIRE_METAL();

@@ -1069,7 +1069,7 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         src += "static float4 rsx_lif(float4 v) { return float4(1.0, v.y, v.y > 0.0 ? exp2(v.w) : 0.0, 1.0); }\n";
     }
     if (uses_refl) src += "static float4 rsx_refl(float4 i, float4 n) { return i - 2.0 * dot(n, i) * n; }\n";
-    if (uses_to_srgb) {
+    if (uses_to_srgb || (opt.srgb_output && mrt > 0)) {
         // RPCS3 RSXFragmentPrologue.glsl linear_to_srgb.
         src += "static float4 rsx_linear_to_srgb(float4 c)\n{\n"
                "    const float4 low = c * 12.92, high = 1.055 * pow(c, float4(1.0 / 2.4)) - 0.055;\n"
@@ -1155,6 +1155,18 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
     src += "    do {\n";
     src += body;
     src += "    } while (false);\n";
+    // The ROP, in RPCS3's order (RSXROPEpilogue.glsl): the colours to sRGB (D-174), then the alpha test and alpha to
+    // coverage on colour 0's alpha, with or without colour outputs and before the target's channel moves (before
+    // D-174 the alpha test read the moved output, and passes without colour outputs had none), then the outputs.
+    if (opt.srgb_output) {
+        for (u32 i = 0; i < mrt; i++) src += std::format("    {}.xyz = rsx_linear_to_srgb({}).xyz;\n", outputs[i], outputs[i]);
+    }
+    if (opt.alpha_test) src += std::format("    if (!rsx_compare(fp.alpha_func, {}.w, fp.alpha_ref)) discard_fragment();\n", outputs[0]);
+    if (opt.alpha_to_coverage) {
+        // RPCS3 coverage_test_passes: the alpha against _rand(gl_FragCoord), a value of the pixel; one sample here.
+        src += std::format("    if (!({}.w > fract(sin(dot(in.position.xy, float2(12.9898, 78.233))) * 43758.5453))) "
+                           "discard_fragment(); // alpha to coverage\n", outputs[0]);
+    }
     src += "    rsx_fs_out out;\n";
     static constexpr const char* kChan[6] = {"x", "y", "z", "w", "0.0", "1.0"};
     for (u32 i = 0; i < mrt; i++) {
@@ -1168,9 +1180,6 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
     }
     if (mrt == 0 && !depth_export) src += "    out.c0 = float4(0.0);\n";
     if (depth_export) src += "    out.depth = r1.z;\n";
-    if (opt.alpha_test && mrt > 0) {
-        src += "    if (!rsx_compare(fp.alpha_func, out.c0.w, fp.alpha_ref)) discard_fragment();\n";
-    }
     src += "    return out;\n}\n";
 
     result.shader.source = std::move(src);

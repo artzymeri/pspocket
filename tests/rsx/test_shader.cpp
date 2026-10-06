@@ -795,6 +795,48 @@ TEST_CASE("fragment program texel conversions, alpha kill and LOD bias, per unit
     CHECK(plain.shader.source.find("discard_fragment") == std::string::npos);
 }
 
+TEST_CASE("fragment program outputs: sRGB, then the alpha test and alpha to coverage on colour 0 (RPCS3's ROP, D-174)")
+{
+    FpInst mov; // MOV H0, f[COL0] END (16-bit exports: H0, H4, H6, H8)
+    mov.op = static_cast<u32>(FpOp::MOV);
+    mov.fp16 = true;
+    mov.input = 1;
+    mov.src[0] = fp_in();
+    mov.end = true;
+    FpOptions opt;
+    opt.mrt_count = 2;
+    opt.srgb_output = true;
+    opt.alpha_test = true;
+    opt.alpha_to_coverage = true;
+    opt.output_swizzle[0] = {2, 2, 2, 2}; // a B8 target: blue in every channel
+    TranslateResult r = translate_fp({mov}, opt);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    std::string s = r.shader.source;
+    {
+        INFO(s);
+        const usize srgb = s.find("    h0.xyz = rsx_linear_to_srgb(h0).xyz;\n    h4.xyz = rsx_linear_to_srgb(h4).xyz;\n");
+        const usize test = s.find("    if (!rsx_compare(fp.alpha_func, h0.w, fp.alpha_ref)) discard_fragment();\n");
+        const usize a2c = s.find("    if (!(h0.w > fract(sin(dot(in.position.xy, float2(12.9898, 78.233))) * 43758.5453))) "
+                                 "discard_fragment();");
+        const usize out = s.find("    out.c0 = float4(h0.z, h0.z, h0.z, h0.z);");
+        CHECK(srgb != std::string::npos);
+        CHECK(test != std::string::npos);
+        CHECK(a2c != std::string::npos);
+        CHECK(out != std::string::npos);
+        CHECK((srgb < test && test < a2c && a2c < out)); // RPCS3 RSXROPEpilogue.glsl's order
+        CHECK(s.find("static float4 rsx_linear_to_srgb(float4 c)") != std::string::npos);
+    }
+    // Without colour outputs the alpha test still runs ("This stage always runs even without a color output").
+    opt.mrt_count = 0;
+    opt.srgb_output = opt.alpha_to_coverage = false;
+    r = translate_fp({mov}, opt);
+    REQUIRE(r.ok);
+    s = r.shader.source;
+    CHECK(s.find("if (!rsx_compare(fp.alpha_func, h0.w, fp.alpha_ref)) discard_fragment();") != std::string::npos);
+    CHECK(s.find("rsx_linear_to_srgb") == std::string::npos);
+}
+
 TEST_CASE("fragment program loops run their count; the LOOP index picks texture coordinates (NV_fragment_program2, D-174)")
 {
     // 0x00: LOOP 3 times, index from 1 by 2, end 0x20    0x10: ADD R0, R0, f[TEX(A0.x + 2)]    0x20: MOV R0, R0 END

@@ -280,8 +280,8 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
 
     std::vector<u32> ucode;
     for (const auto& in : fp.instructions) ucode.insert(ucode.end(), in.words.begin(), in.words.end());
-    std::string opt = std::format("{:x}.{}.{}.{}.{}", options.shader_control, options.mrt_count, options.texcoord_2d_mask,
-        options.alpha_test ? 1 : 0, options.flat_colors ? 1 : 0);
+    std::string opt = std::format("{:x}.{}.{}.{}.{}.{}{}", options.shader_control, options.mrt_count, options.texcoord_2d_mask,
+        options.alpha_test ? 1 : 0, options.flat_colors ? 1 : 0, options.srgb_output ? 1 : 0, options.alpha_to_coverage ? 1 : 0);
     for (u32 i = 0; i < options.mrt_count && i < 4; i++) {
         for (u8 c : options.output_swizzle[i]) opt += static_cast<char>('0' + c);
     }

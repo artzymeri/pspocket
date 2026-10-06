@@ -119,6 +119,11 @@ struct FpOptions {
     // RSX_SHADER_CONTROL_TEXTURE_ALPHA_KILL). Shadow lookups have neither (RPCS3: no _process_texel).
     u16 texture_convert_mask = 0;
     u16 texture_alpha_kill_mask = 0;
+    // D-174, the ROP as RPCS3's RSXROPEpilogue.glsl orders it: the colour outputs to sRGB (NV4097_SET_SHADER_PACKER on
+    // an 8-bit target with 16-bit exports; RSXThread.cpp), then the alpha test and alpha to coverage
+    // (NV4097_SET_ANTI_ALIASING_CONTROL bit 4, emulated as RPCS3 does without hardware support) on colour 0's alpha.
+    bool srgb_output = false;
+    bool alpha_to_coverage = false;
     bool operator==(const FpOptions&) const = default;
 };
 
