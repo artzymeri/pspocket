@@ -83,8 +83,9 @@ Result prepare_game(const Options& options);
 
 // The lifters' generation: raised when a change fixes how translated code behaves (not for every change, which only
 // the translator hash follows): a library of an older generation is prepared again (library_is_current). 2: D-161
-// (a longjmp or fiber switch in translated code).
-inline constexpr int kTranslatorGeneration = 2;
+// (a longjmp or fiber switch in translated code). 3: D-203 (jump tables a bounds check branches into) and D-205 (SPU
+// code words without guessed code, seeds carried over as used).
+inline constexpr int kTranslatorGeneration = 3;
 
 // What a game library was made from and by (game_dir/manifest.json).
 struct Manifest {
