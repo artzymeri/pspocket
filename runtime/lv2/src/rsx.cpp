@@ -169,7 +169,9 @@ Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_contr
     d.dma_control = layout.dma_control_addr;
     d.driver_info = info;
     d.reports = layout.reports_addr;
-    d.main_mem_size = 0x10000000; // 256 MB IO space (512 MB only for debug consoles in RPCS3)
+    // The IO address space: 512 MB in system mode CELL_GCM_SYSTEM_MODE_IOMAP_512MB (cellGcmInitSystemMode(1); RPCS3
+    // sets the renderer's main_mem_size in _cellGcmInitBody from the same mode), else 256 MB.
+    d.main_mem_size = system_mode == 1 ? 0x20000000 : 0x10000000;
 
     rsx::Config config;
     config.layout = layout;
@@ -195,6 +197,15 @@ Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_contr
             listener = dv.on_flip;
         }
         if (listener) listener(buffer_id);
+    };
+    d.rsx->on_user_command = [&s](u32 arg) {
+        std::function<void(u32)> listener;
+        {
+            std::lock_guard l(s.rsx.listener_mutex);
+            listener = s.rsx.on_user_command;
+        }
+        if (listener) listener(arg);
+        else PS_LOG_WARN(kRsxChan, "GCM_SET_USER_COMMAND {:#x} with no user handler", arg);
     };
     d.rsx->start();
 

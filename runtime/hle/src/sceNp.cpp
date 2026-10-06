@@ -5,7 +5,8 @@
 // rpcs3/Emu/RSX/Overlays/Network/overlay_recvmessage_dialog.cpp, and the DRM check's rpcs3/Crypto/unedat.cpp,
 // unself.cpp and rpcs3/Emu/system_utils.cpp.
 //
-// sceNpInit is not imported by GTA V; sceNp2Init (module sceNp2, sceNp2.cpp) initializes NP through np_init (np.hpp).
+// GTA V initializes NP with sceNp2Init (module sceNp2, sceNp2.cpp), L.A. Noire with sceNpInit; both go through np_init
+// (np.hpp).
 // Until then the manager functions return SCE_NP_ERROR_NOT_INITIALIZED, as RPCS3 does before init; afterwards they
 // report a user who is signed out (offline). The callbacks and handlers registered are kept; the basic handler gets
 // the one event RPCS3 sends offline too (sceNpBasicAddPlayersHistoryAsync's result), the others are never called.
@@ -1321,6 +1322,15 @@ u32 np_init(u32 poolsize, u32 poolptr)
     return lv2::CELL_OK;
 }
 
+// sceNpInit(poolsize, poolptr): RPCS3's, through np_init. NP comes up offline (D-059): the manager reports a signed-out
+// user, as after sceNp2Init.
+s32 sceNpInit(PPUContext&, u32 poolsize, u32 poolptr)
+{
+    const u32 r = np_init(poolsize, poolptr);
+    PS_LOG_INFO(kChan, "sceNpInit(pool {:#x} bytes at {:#x}) -> {:#x}", poolsize, poolptr, r);
+    return static_cast<s32>(r);
+}
+
 u32 np_term()
 {
     NpState& s = np();
@@ -1336,6 +1346,7 @@ u32 np_term()
 void register_sceNp(Registry& r)
 {
     r.add("sceNp", {
+        PS_HLE_FUNC(0xBD28FDBF, sceNpInit),
         PS_HLE_FUNC(0xA7BFF757, sceNpManagerGetStatus),
         PS_HLE_FUNC(0xE7DCD3B4, sceNpManagerRegisterCallback),
         PS_HLE_FUNC(0x52A6B523, sceNpManagerUnregisterCallback),

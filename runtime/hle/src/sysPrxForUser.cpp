@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstring>
 #include <format>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,53 @@ void sys_ppu_thread_exit(PPUContext& ctx, u64 val)
         p->free_tls(static_cast<u32>(ctx.gpr[13]) - kTlsR13Offset);
     }
     lv2::_sys_ppu_thread_exit(t, val); // does not return
+}
+
+// sys_ppu_thread_once(once_ctrl, init), as RPCS3 (sys_ppu_thread_.cpp): under the process's "_lv2ppu" lv2 mutex
+// (priority order, not recursive; RPCS3 creates it with the TLS, here at the first call), a control word still
+// SYS_PPU_THREAD_ONCE_INIT (0) runs init (a function descriptor) on the calling thread, then becomes
+// SYS_PPU_THREAD_DONE_INIT (1). Other threads asking meanwhile wait on the mutex until it has run.
+struct OnceState {
+    std::mutex mutex; // the lv2 mutex's creation
+    u32 lv2_mutex = 0;
+};
+
+void sys_ppu_thread_once(PPUContext& ctx, u32 once_ctrl, u32 init)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, once_ctrl, 4)) {
+        log_call_site(ctx, base, std::format("sys_ppu_thread_once: control word {:#x} is not guest memory", once_ctrl));
+        return;
+    }
+    OnceState& s = HleProcess::current()->state<OnceState>();
+    u32 m = 0;
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.lv2_mutex) {
+            StackVar v(ctx, base, 0x30); // the ID, then sys_mutex_attribute_t
+            const u32 id = v.addr(), attr = v.addr() + 8;
+            std::memset(base + attr, 0, 0x28);
+            ps_write32(base, attr + 0x00, lv2::SYS_SYNC_PRIORITY);
+            ps_write32(base, attr + 0x04, lv2::SYS_SYNC_NOT_RECURSIVE);
+            ps_write32(base, attr + 0x08, lv2::SYS_SYNC_NOT_PROCESS_SHARED);
+            ps_write32(base, attr + 0x0C, lv2::SYS_SYNC_NOT_ADAPTIVE);
+            std::memcpy(base + attr + 0x20, "_lv2ppu", 8);
+            if (const s32 r = lv2::sys_mutex_create(t, id, attr); r != lv2::CELL_OK)
+                PS_FATAL(kChan, "sys_ppu_thread_once: the _lv2ppu mutex: {}", lv2::error_name(r));
+            s.lv2_mutex = ps_read32(base, id);
+        }
+        m = s.lv2_mutex;
+    }
+    if (const s32 r = lv2::sys_mutex_lock(t, m, 0); r != lv2::CELL_OK)
+        PS_FATAL(kChan, "sys_ppu_thread_once({:#x}, {:#x}): locking _lv2ppu: {} (init called itself?)", once_ctrl, init,
+            lv2::error_name(r));
+    if (ps_read32(base, once_ctrl) == 0) {
+        PS_LOG_DEBUG(kChan, "sys_ppu_thread_once({:#x}): running {:#x}", once_ctrl, init);
+        call_guest(ctx, init, {});
+        ps_write32(base, once_ctrl, 1);
+    }
+    lv2::sys_mutex_unlock(t, m);
 }
 
 // RPCS3 sysPrxForUser.cpp _sys_process_atexitspawn / _sys_process_at_Exitspawn: remember the first function given.
@@ -653,6 +701,7 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0x350D454E, sys_ppu_thread_get_id),
         PS_HLE_FUNC(0x24A1EA07, sys_ppu_thread_create),
         PS_HLE_FUNC(0xAFF080A4, sys_ppu_thread_exit),
+        PS_HLE_FUNC(0xA3E3BE68, sys_ppu_thread_once),
         PS_HLE_FUNC(0xE6F2C1E7, sys_process_exit),
         PS_HLE_FUNC(0x2C847572, _sys_process_atexitspawn),
         PS_HLE_FUNC(0x96328741, _sys_process_at_Exitspawn),

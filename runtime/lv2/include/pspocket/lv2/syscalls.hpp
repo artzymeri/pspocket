@@ -226,6 +226,7 @@ Result sys_vm_get_statistics(PpuThread& t, u32 addr, u32 stat);
 
 // ---- SPU (sys_spu.cpp)
 Result sys_spu_initialize(PpuThread& t, u32 max_usable_spu, u32 max_raw_spu);
+Result sys_spu_thread_group_log(PpuThread& t, s32 command, u32 stat);
 
 // ---- RSX (sys_rsx.cpp; rsx.cpp). Called by HLE cellGcmSys; not bound to syscall numbers yet.
 Result sys_rsx_memory_allocate(PpuThread& t, u32 mem_handle, u32 mem_addr, u64 size, u64 flags, u64 a5, u64 a6, u64 a7);

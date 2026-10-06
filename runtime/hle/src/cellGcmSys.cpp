@@ -14,8 +14,10 @@
 // The interrupt thread (_gcm_intr_thread, RPCS3 creates it in _cellGcmInitBody) is an lv2 PPU thread whose entry is
 // an internal HLE function: every 1/59.94 s it counts a vblank in the driver information (lv2 package 0xFED, as
 // RPCS3's vblank thread does) and calls the game's vblank handler with head 1. RPCS3 runs its handlers on that thread
-// too. Flip and user handlers: not imported by any game so far. Tile, Z-cull and flip mode (vsync) settings reach lv2,
-// but the RSX front end does not use them yet.
+// too, and so does this one: between vblanks it waits on an lv2 event queue of its own, where the RSX thread's flip
+// and user-command listeners put an event for the game's flip handler (argument 1, the head) and user handler (the
+// command's argument). Tile, Z-cull and flip mode (vsync) settings reach lv2, but the RSX front end does not use them
+// yet.
 
 #include <array>
 #include <atomic>
@@ -32,6 +34,7 @@
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/rsx/gcm.hpp"
 #include "pspocket/rsx/rsx.hpp"
@@ -61,6 +64,8 @@ constexpr u32 kFragment = 32 * 1024; // the default command buffer's 32 KB segme
 constexpr u32 NID_cellGcmCallback = 0x8DD39C9C;
 constexpr u32 NID_interrupt_thread = 0x24A45AFC; // nid_of("_pspocket_gcm_interrupt_thread"): pspocket's own
 constexpr auto kVblankPeriod = std::chrono::microseconds(16683); // 59.94 Hz
+constexpr u64 CELL_GCM_SYSTEM_MODE_IOMAP_512MB = 1;
+constexpr u64 kIntrFlip = 1, kIntrUser = 2; // the interrupt thread's event sources
 
 // CellGcmContextData
 constexpr u32 ctx_begin = 0x0, ctx_end = 0x4, ctx_current = 0x8, ctx_callback = 0xC;
@@ -87,7 +92,11 @@ struct GcmState {
     u32 cmd_begin = 0;    // the default command buffer (RPCS3 g_defaultCommandBufferBegin)
     u32 cmd_fragments = 0;
     u32 main_mem_size = 0x10000000;
+    u64 system_mode = 0; // cellGcmInitSystemMode
+    u32 intr_queue = 0;  // the interrupt thread's event queue (flip and user handler events)
     std::atomic<u32> vblank_handler{0};
+    std::atomic<u32> flip_handler{0};
+    std::atomic<u32> user_handler{0};
     std::atomic<u64> vblanks{0};
     struct Tile {
         u32 location = 0, offset = 0, size = 0, pitch = 0, comp = 0, base = 0, bank = 0;
@@ -196,14 +205,30 @@ void _pspocket_gcm_interrupt_thread(PPUContext& ctx, u64)
     GcmState& g = gcm();
     lv2::PpuThread& t = thread_of(ctx);
     auto next = std::chrono::steady_clock::now();
-    bool logged = false;
+    bool logged = false, flip_logged = false, user_logged = false;
     for (;;) {
         next += kVblankPeriod;
-        const auto now = std::chrono::steady_clock::now();
-        if (next > now) {
-            lv2::sys_timer_usleep(t, static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::microseconds>(next - now).count()));
-        } else if (now - next > std::chrono::milliseconds(100)) {
+        // Until the vblank: the flip and user handlers the RSX thread asks for, on this thread (as RPCS3's).
+        for (auto now = std::chrono::steady_clock::now(); next > now; now = std::chrono::steady_clock::now()) {
+            const u64 us = static_cast<u64>(
+                std::max<s64>(1, std::chrono::duration_cast<std::chrono::microseconds>(next - now).count()));
+            if (!g.intr_queue) {
+                lv2::sys_timer_usleep(t, us);
+                break;
+            }
+            if (lv2::sys_event_queue_receive(t, g.intr_queue, 0, us) != lv2::CELL_OK) break; // the vblank is due
+            const bool flip = ctx.gpr[4] == kIntrFlip;
+            const u32 arg = static_cast<u32>(ctx.gpr[5]);
+            const u32 handler = (flip ? g.flip_handler : g.user_handler).load(std::memory_order_acquire);
+            if (!handler) continue;
+            bool& first = flip ? flip_logged : user_logged;
+            if (!first) {
+                PS_LOG_INFO(kChan, "first call of the {} handler {:#x} ({:#x})", flip ? "flip" : "user", handler, arg);
+                first = true;
+            }
+            call_guest(ctx, handler, {arg});
+        }
+        if (const auto now = std::chrono::steady_clock::now(); now - next > std::chrono::milliseconds(100)) {
             next = now; // fell far behind (a debugger, a stalled host): no burst of vblanks
         }
         lv2::sys_rsx_context_attribute(t, kContextId, 0xFED, 1, 0, 0, 0);
@@ -269,10 +294,11 @@ s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u3
     }
     if (const s32 r = lv2::sys_rsx_device_map(t, v + 0x10, 0, 8); r != lv2::CELL_OK) return r;
     const u32 device = static_cast<u32>(ps_read64(base, v + 0x10));
-    if (const s32 r = lv2::sys_rsx_context_allocate(t, v + 0x18, v + 0x20, v + 0x28, v + 0x30, 0, 0);
+    if (const s32 r = lv2::sys_rsx_context_allocate(t, v + 0x18, v + 0x20, v + 0x28, v + 0x30, 0, g.system_mode);
         r != lv2::CELL_OK) {
         return r;
     }
+    g.main_mem_size = g.system_mode == CELL_GCM_SYSTEM_MODE_IOMAP_512MB ? 0x20000000 : 0x10000000;
     const u32 dma_control = static_cast<u32>(ps_read64(base, v + 0x20));
     const u32 reports = static_cast<u32>(ps_read64(base, v + 0x30));
 
@@ -310,8 +336,40 @@ s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u3
     g.initialized = true;
 
     PS_LOG_INFO(kChan, "GCM ready: local memory {:#010x} ({} MB), command buffer {:#010x} ({} segments), IO {} MB, "
-                       "context {:#010x}, control {:#010x}, labels {:#010x}",
-        g.local_addr, g.local_size >> 20, io_address, g.cmd_fragments, io_size >> 20, device, g.control_addr, reports);
+                       "context {:#010x}, control {:#010x}, labels {:#010x}{}",
+        g.local_addr, g.local_size >> 20, io_address, g.cmd_fragments, io_size >> 20, device, g.control_addr, reports,
+        g.main_mem_size > 0x10000000 ? ", 512 MB IO address space" : "");
+
+    // The interrupt thread's queue, and the RSX thread's listeners that feed it (flip and user handlers).
+    {
+        const u32 q = v + 0x38, attr = v; // the context's outputs above are read: reuse the space
+        ps_write32(base, attr, lv2::SYS_SYNC_FIFO);
+        ps_write32(base, attr + 4, lv2::SYS_PPU_QUEUE);
+        std::memcpy(base + attr + 8, "_gcmIntr", 8);
+        if (const s32 r = lv2::sys_event_queue_create(t, q, attr, 0, 64); r != lv2::CELL_OK) {
+            PS_LOG_ERROR(kChan, "_cellGcmInitBody: the interrupt queue: {} (flip and user handlers will not run)",
+                lv2::error_name(r));
+        } else {
+            g.intr_queue = ps_read32(base, q);
+        }
+        lv2::Kernel& k = t.kernel;
+        const u32 queue = g.intr_queue;
+        const auto post = [&k, queue](u64 source, u32 arg) {
+            if (!queue) return;
+            if (const auto eq = k.event_queue(queue)) {
+                if (eq->send(lv2::Event{source, arg, 0, 0}) != lv2::CELL_OK)
+                    PS_LOG_WARN(kChan, "the interrupt queue is full: a {} handler call is dropped",
+                        source == kIntrFlip ? "flip" : "user");
+            }
+        };
+        k.set_rsx_flip_listener([&g, post](u32) {
+            if (g.flip_handler.load(std::memory_order_acquire)) post(kIntrFlip, 1);
+        });
+        k.set_rsx_user_command_listener([&g, post](u32 arg) {
+            if (g.user_handler.load(std::memory_order_acquire)) post(kIntrUser, arg);
+            else PS_LOG_WARN(kChan, "GCM_SET_USER_COMMAND {:#x} with no user handler set", arg);
+        });
+    }
     if (const s32 r = start_interrupt_thread(ctx, p); r != lv2::CELL_OK) {
         PS_LOG_ERROR(kChan, "_cellGcmInitBody: the interrupt thread could not be created: {}", lv2::error_name(r));
         return error(CELL_GCM_ERROR_FAILURE);
@@ -587,6 +645,44 @@ void cellGcmSetVBlankHandler(PPUContext&, u32 handler)
     PS_LOG_INFO(kChan, "cellGcmSetVBlankHandler({:#x})", handler);
 }
 
+// cellGcmSetFlipHandler(handler), as RPCS3: once the RSX is initialized, called on the interrupt thread with head 1
+// after each flip.
+void cellGcmSetFlipHandler(PPUContext&, u32 handler)
+{
+    GcmState& g = gcm();
+    if (!g.initialized) {
+        PS_LOG_WARN(kChan, "cellGcmSetFlipHandler({:#x}) before cellGcmInit: ignored (as RPCS3)", handler);
+        return;
+    }
+    g.flip_handler.store(handler, std::memory_order_release);
+    PS_LOG_INFO(kChan, "cellGcmSetFlipHandler({:#x})", handler);
+}
+
+// cellGcmSetUserHandler(handler), as RPCS3: once the RSX is initialized, called on the interrupt thread with the
+// argument of each GCM_SET_USER_COMMAND the RSX runs.
+void cellGcmSetUserHandler(PPUContext&, u32 handler)
+{
+    GcmState& g = gcm();
+    if (!g.initialized) {
+        PS_LOG_WARN(kChan, "cellGcmSetUserHandler({:#x}) before cellGcmInit: ignored (as RPCS3)", handler);
+        return;
+    }
+    g.user_handler.store(handler, std::memory_order_release);
+    PS_LOG_INFO(kChan, "cellGcmSetUserHandler({:#x})", handler);
+}
+
+// cellGcmInitSystemMode(mode), as RPCS3: kept for _cellGcmInitBody, where CELL_GCM_SYSTEM_MODE_IOMAP_512MB (1) makes
+// the IO address space 512 MB instead of 256.
+s32 cellGcmInitSystemMode(PPUContext&, u64 mode)
+{
+    GcmState& g = gcm();
+    std::lock_guard lock(g.mutex);
+    g.system_mode = mode;
+    PS_LOG_INFO(kChan, "cellGcmInitSystemMode({:#x}){}", mode,
+        mode == CELL_GCM_SYSTEM_MODE_IOMAP_512MB ? ": 512 MB IO address space" : "");
+    return lv2::CELL_OK;
+}
+
 // ------------------------------------------------------------------------------------------------- tiles and Z-cull
 
 // RPCS3 GcmTileInfo::pack (Emu/RSX/GCM.h): {tile, limit, pitch, format}.
@@ -708,6 +804,9 @@ void register_cellGcmSys(Registry& r)
         PS_HLE_FUNC(0xDC09357E, cellGcmSetFlip),
         PS_HLE_FUNC(0x983FB9AA, cellGcmSetWaitFlip),
         PS_HLE_FUNC(0xA91B0402, cellGcmSetVBlankHandler),
+        PS_HLE_FUNC(0xA41EF7E8, cellGcmSetFlipHandler),
+        PS_HLE_FUNC(0x06EDEA9E, cellGcmSetUserHandler),
+        PS_HLE_FUNC(0xFCE9E764, cellGcmInitSystemMode),
         PS_HLE_FUNC(0xBD100DBC, cellGcmSetTileInfo),
         PS_HLE_FUNC(0xD0B1D189, cellGcmSetTile),
         PS_HLE_FUNC(0x4524CCCD, cellGcmBindTile),

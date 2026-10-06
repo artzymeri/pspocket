@@ -166,6 +166,14 @@ s32 cellRtcGetCurrentTick(PPUContext& ctx, u32 tick)
     return lv2::CELL_OK;
 }
 
+// RPCS3 cellRtcGetCurrentClock(pClock, iTimeZone): the current tick moved by iTimeZone minutes.
+s32 cellRtcGetCurrentClock(PPUContext& ctx, u32 clock, s32 time_zone)
+{
+    if (!pointer_ok(ctx, clock, 16)) return error(CELL_RTC_ERROR_INVALID_POINTER);
+    write_date_time(guest_base(ctx), clock, tick_to_date_time(add_minutes(current_tick(), time_zone)));
+    return lv2::CELL_OK;
+}
+
 // RPCS3 cellRtcGetCurrentClockLocalTime: the current tick moved by the time zone and daylight saving offset.
 s32 cellRtcGetCurrentClockLocalTime(PPUContext& ctx, u32 clock)
 {
@@ -482,6 +490,7 @@ void register_cellRtc(Registry& r)
 {
     r.add("cellRtc", {
         PS_HLE_FUNC(0x9DAFC0D9, cellRtcGetCurrentTick),
+        PS_HLE_FUNC(0x32C941CF, cellRtcGetCurrentClock),
         PS_HLE_FUNC(0x2CCE9CF5, cellRtcGetCurrentClockLocalTime),
         PS_HLE_FUNC(0xC7BDB7EB, cellRtcGetTick),
         PS_HLE_FUNC(0x99B13034, cellRtcSetTick),
