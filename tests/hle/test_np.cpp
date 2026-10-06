@@ -873,6 +873,8 @@ TEST_CASE("sceNpDrmIsAvailable: the file at the path as RPCS3 checks it; content
 
     // Neither a SELF nor an EDAT: unencrypted, available, with or without a klicensee.
     CHECK(check("/dev_bdvd/PS3_GAME/USRDIR/plain.dat") == 0);
+    CHECK(g.call("sceNpDrmIsAvailable2", kKlicensee, kPath) == 0); // the same check (RPCS3)
+    CHECK(g.call("sceNpDrmIsAvailable2", kKlicensee, 0) == kDrmInvalParam);
     CHECK(check("/dev_bdvd/PS3_GAME/USRDIR/plain.dat", 0) == 0);
     CHECK(check("/dev_bdvd/PS3_GAME/USRDIR/empty.dat") == 0);
     CHECK(check("/dev_bdvd/PS3_GAME/USRDIR/sce3") == 0); // too short for a magic

@@ -1016,6 +1016,13 @@ s32 sceNpDrmIsAvailable(PPUContext& ctx, u32 k_licensee, u32 drm_path)
     return result;
 }
 
+// sceNpDrmIsAvailable2: RPCS3 makes the same check (npDrmIsAvailable) without the first one's wait (its sleep is a TODO
+// there): Sniper: Ghost Warrior calls it at boot (phone run of 2026-10-06).
+s32 sceNpDrmIsAvailable2(PPUContext& ctx, u32 k_licensee, u32 drm_path)
+{
+    return sceNpDrmIsAvailable(ctx, k_licensee, drm_path);
+}
+
 // ------------------------------------------------------------------------------------------------- lookup
 
 // RPCS3 sceNpLookupInit / sceNpLookupTerm: the lookup (community) library on top of NP. Term leaves the title
@@ -1377,6 +1384,7 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0xBCDBB2AB, sceNpBasicAddPlayersHistoryAsync),
         PS_HLE_FUNC(0xCEEEBC7A, sceNpProfileCallGui),
         PS_HLE_FUNC(0xAD218FAF, sceNpDrmIsAvailable),
+        PS_HLE_FUNC(0xF042B14F, sceNpDrmIsAvailable2),
         PS_HLE_FUNC(0x5F2D9257, sceNpLookupInit),
         PS_HLE_FUNC(0x8440537C, sceNpLookupTerm),
         PS_HLE_FUNC(0xCE81C7F0, sceNpLookupCreateTitleCtx),

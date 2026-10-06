@@ -372,6 +372,7 @@ bool LleModules::index(std::string* error)
 void LleModules::lay_out()
 {
     // Every module in key order, fixed in the PRX region (D-178): the same addresses for every game.
+    if (files_.empty()) return;
     std::vector<std::vector<u32>> sizes;
     for (const auto& [key, info] : files_) sizes.push_back(info.load_sizes);
     const auto layout = recomp::prx_fixed_layout(sizes, PS_MEM_PRX_BASE, PS_MEM_PRX_SIZE);

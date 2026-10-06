@@ -264,8 +264,46 @@ TEST_CASE("cellSysmodule: load counts, dependencies, default and virtual modules
     CHECK(a.call("cellSysmoduleIsLoaded", kNet) == 0); // SSL -> NET
 
     CHECK(a.call("cellSysmoduleLoadModule", 0x58) == kUnknown);
-    CHECK(a.call("cellSysmoduleIsLoaded", 0xF000) == kUnknown);
+    CHECK(a.call("cellSysmoduleIsLoaded", 0xF000) == kUnknown); // internal, but not one the public calls take
     CHECK(a.call("cellSysmoduleFinalize") == 0);
+}
+
+TEST_CASE("cellSysmodule: internal module IDs, as RPCS3 has them (D-179)", "[hle][sysmodule]")
+{
+    Fixture f; // SDK 0x00360001: the NP trophy module (0xF035) is loaded by lv2
+    GuestThread a(f, 0, "a");
+    constexpr u64 kUnloaded = 0xFFFFFFFF80012003ull, kUnknown = 0xFFFFFFFF80012002ull;
+    constexpr u32 kNpTrophy = 0xF035, kFs = 0x0E, kAdecAl = 0x2C;
+
+    // CELL_SYSMODULE_SYSUTIL_NP_TROPHY: the public calls take it (Sniper: Ghost Warrior loads it at boot).
+    CHECK(a.call("cellSysmoduleIsLoaded", kNpTrophy) == 0);
+    CHECK(a.call("cellSysmoduleLoadModule", kNpTrophy) == 0);
+    CHECK(a.call("cellSysmoduleUnloadModule", kNpTrophy) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kNpTrophy) == 0); // still lv2's
+    // One the public calls refuse, the internal ones take, with its dependencies (0xF018, libtiffdec: FS).
+    CHECK(a.call("cellSysmoduleLoadModule", 0xF018) == kUnknown);
+    REQUIRE(a.call("cellSysmoduleUnloadModule", kFs) == 0); // FS is a default: it stays loaded
+    REQUIRE(a.call("cellSysmoduleLoadModuleInternal", 0xF018) == 0);
+    CHECK(a.call("cellSysmoduleIsLoadedEx", 0xF018) == 0);
+    REQUIRE(a.call("cellSysmoduleUnloadModuleInternal", 0xF018) == 0);
+    CHECK(a.call("cellSysmoduleIsLoadedEx", 0xF018) == kUnloaded);
+    // An internal dependency: 0xF054 (libatrac3multi) needs 0xF053 (libat3multidec), which needs ADEC_AL.
+    REQUIRE(a.call("cellSysmoduleLoadModule", 0xF054) == 0);
+    CHECK(a.call("cellSysmoduleIsLoadedEx", 0xF053) == 0);
+    CHECK(a.call("cellSysmoduleIsLoaded", kAdecAl) == 0);
+    REQUIRE(a.call("cellSysmoduleUnloadModule", 0xF054) == 0);
+    CHECK(a.call("cellSysmoduleIsLoadedEx", 0xF053) == kUnloaded);
+    CHECK(a.call("cellSysmoduleIsLoaded", kAdecAl) == kUnloaded);
+    // The Ex calls: only LOADABLE_INTERNAL_MODULES_EX (0xF005 is, 0xF000 is not).
+    CHECK(a.call("cellSysmoduleLoadModuleEx", 0xF000) == kUnknown);
+    CHECK(a.call("cellSysmoduleLoadModuleEx", 0xF005) == 0);
+    CHECK(a.call("cellSysmoduleUnloadModuleEx", 0xF005) == 0);
+    // Out of the table, or a public ID given to the internal calls.
+    CHECK(a.call("cellSysmoduleLoadModuleInternal", 0xF057) == kUnknown);
+    CHECK(a.call("cellSysmoduleLoadModuleInternal", 0x0E) == kUnknown);
+    CHECK(a.call("cellSysmoduleIsLoadedEx", 0x1000) == kUnknown);
+    // The codecs whose PARAM.SFO flags lv2 leaves clear (VC-1, WMA, the ASF parser) are refused, as in RPCS3.
+    CHECK(a.call("cellSysmoduleLoadModuleInternal", 0xF024) == kUnknown);
 }
 
 TEST_CASE("cellSysmoduleSetMemcontainer: a container with room, none, or an unusable one (RPCS3)", "[hle][sysmodule]")

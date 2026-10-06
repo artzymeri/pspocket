@@ -3234,6 +3234,40 @@ Tests:
 - tests/game/test_system_library.cpp: a synthetic firmware module translated with the device's compiler, placed,
   checked, its module_start run translated with no miss; changed code refused; another firmware not current.
 
+## D-179 · 2026-10-06 · Internal module IDs, two small imports, and what the phone run of 2026-10-06 showed
+
+Run 100 and the phone sessions after it (Sniper: Ghost Warrior, L.A. Noire, in a copy of the app with no system
+software installed) showed gaps in pspocket's own modules.
+
+- **cellSysmodule's internal module IDs, as RPCS3.**
+  - Its table of 87 internal modules (0xF000 + index) and their dependencies, generated from cellSysmodule.cpp.
+  - LOADABLE_INTERNAL_MODULES says which the public calls take. LOADABLE_INTERNAL_MODULES_EX says which the Ex calls
+    take.
+  - cellSysmoduleLoadModuleInternal, UnloadModuleInternal, IsLoadedEx, LoadModuleEx and UnloadModuleEx are new.
+  - 0xF035 is CELL_SYSMODULE_SYSUTIL_NP_TROPHY, which lv2 counts as loaded from SDK 3.3 on (DEFAULT_MODULES) and
+    many games load. Sniper: Ghost Warrior got CELL_SYSMODULE_ERROR_UNKNOWN for it.
+  - 0xF020, 0xF024 and 0xF03E (VC-1, WMA, the ASF parser) need flags in the PARAM.SFO buffer that lv2 leaves zero, so
+    they are refused, as in RPCS3.
+- **cellGcmSetGraphicsHandler**: noted and not kept, as RPCS3.
+- **sceNpDrmIsAvailable2**: the same check as sceNpDrmIsAvailable, as RPCS3.
+- **Job chain stops.** Every job chain stop now first reports what the SPU read of the job at hand, what memory holds,
+  who wrote over it and the commands around pc (D-138's report). Run 100's stop came through the job binary's fetch,
+  which stopped without it.
+- **The app warns when the system software is missing.** It says so in the game's info when no system software is
+  installed. A copy of /dev_flash pushed from the Mac holds only the sound decoders games load themselves, and the
+  app had used it without a word. LleModules no longer reports an empty firmware as "does not fit".
+
+The direction after this (the user, 2026-10-06): any PS3 game on iOS-native infrastructure, no emulation, no
+interpreting. Every library a game calls is to be pspocket's own (docs/firmware.md's "iOS framework" and "Sony's code,
+translated once" families become "ours"). D-178's system library stays only as a fallback for what is not written yet.
+Every SPU and PPU function is to be translated before the game runs.
+
+Tests (tests/hle):
+
+- test_sysPrxForUser.cpp: internal IDs (the trophy module, dependencies through internal IDs, the Ex lists, the
+  refused codecs).
+- test_np.cpp: sceNpDrmIsAvailable2.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

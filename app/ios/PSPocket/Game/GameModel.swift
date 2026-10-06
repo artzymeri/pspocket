@@ -81,7 +81,12 @@ final class GameModel {
             }
         }
         if status != 0 { return String(cString: error) }
-        problem = hasFlash ? nil : "No system software on this iPhone: install PS3UPDAT.PUP in Settings (the game's sound needs it)"
+        // Without the installed system software, the parts of Sony's libraries pspocket has not written yet are missing
+        // (a copy pushed from the Mac holds only the sound decoders games load themselves).
+        let installedFirmware = FileManager.default.fileExists(atPath: installed.appendingPathComponent("sys/external").path)
+        problem = installedFirmware ? nil
+            : "No PS3 system software on this iPhone: install PS3UPDAT.PUP in Settings. Some games use its libraries " +
+              "where pspocket has none of its own yet"
         running = true
         sendPad()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refresh() }

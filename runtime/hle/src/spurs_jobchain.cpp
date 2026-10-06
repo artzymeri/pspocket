@@ -241,6 +241,9 @@ private:
 
 [[noreturn]] void JobChainPolicy::fatal(std::string_view what) const
 {
+    // What the SPU read of the job at hand, what memory holds now, who wrote over it and the commands around pc (D-138):
+    // a descriptor written over stops a chain on more paths than the job errors (run 100: a binary at EA 0x10).
+    if (job_ea_) report_descriptor(job_ea_);
     // The descriptor of the job at hand as the PPU wrote it (header, DMA list and cache list), when there is one.
     std::string job;
     const u32 size = ps_read16(base_, jc_ + jc_off::sizeJobDescriptor);

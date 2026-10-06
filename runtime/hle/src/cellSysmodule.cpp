@@ -6,12 +6,18 @@
 // first and unloaded last, and the modules lv2 loads at process start (DEFAULT_MODULES) counted as loaded. That is
 // RPCS3's logic with its sys_prx_load_module / start / stop / unload calls removed.
 //
-// Deviations: internal module IDs (0xF000 and up) return CELL_SYSMODULE_ERROR_UNKNOWN with an error log until a game
-// is seen loading one; the debug/retail variants of libfs, libgcm_sys and liblv2dbg are one module each.
+// Internal module IDs (0xF000 + index, D-179) as RPCS3 has them: its 87 internal modules with their dependencies, the
+// ones the public functions may load (LOADABLE_INTERNAL_MODULES: 0xF035 is CELL_SYSMODULE_SYSUTIL_NP_TROPHY, which
+// many games load; Sniper: Ghost Warrior on the phone got CELL_SYSMODULE_ERROR_UNKNOWN for it) and the ones the Ex
+// functions may. 0xF020, 0xF024 and 0xF03E (VC-1, WMA, the ASF parser) need flags in the process's PARAM.SFO buffer,
+// which lv2 leaves zero, as RPCS3's: they are refused, as there.
+//
+// Deviations: the debug/retail variants of libfs, libgcm_sys and liblv2dbg are one module each.
 
 #include <array>
 #include <initializer_list>
 #include <mutex>
+#include <string_view>
 
 #include "guest.hpp"
 #include "pspocket/core/be.h"
@@ -147,13 +153,120 @@ static_assert(std::size(kModules) == kExternalCount);
 
 constexpr u16 kSyschat = 0x58; // listed, but load / unload / is-loaded refuse it (RPCS3)
 
+// RPCS3 MODULE_INFOS' 87 internal modules (IDs 0xF000 + index): the file and its dependencies (public IDs, or internal
+// ones from 0xF000), generated from cellSysmodule.cpp.
+struct InternalInfo {
+    const char* name;
+    std::initializer_list<u16> dependencies;
+};
+const InternalInfo kInternal[] = {
+    {"libat3enc", {}}, // 0xf000
+    {"libatxenc", {}}, // 0xf001
+    {"libvdec", {}}, // 0xf002
+    {"libvpost", {}}, // 0xf003
+    {"libmp3enc", {0x000e}}, // 0xf004
+    {"libaacenc", {}}, // 0xf005
+    {"libadec_internal", {}}, // 0xf006
+    {"libapostsrc", {}}, // 0xf007
+    {"libaudio_internal", {}}, // 0xf008
+    {"libavchatjpgdec", {}}, // 0xf009
+    {"libcelpenc", {}}, // 0xf00a
+    {"libddlenc", {}}, // 0xf00b
+    {"libdmux", {}}, // 0xf00c
+    {"libexif", {0x000e}}, // 0xf00d
+    {"libft2d", {}}, // 0xf00e
+    {"libgcm_osd", {}}, // 0xf00f
+    {"libgifdec", {0x000e}}, // 0xf010
+    {"libjpgdec", {0x000e}}, // 0xf011
+    {"libjpgenc", {0x000e}}, // 0xf012
+    {"libm4venc", {}}, // 0xf013
+    {"libpamf", {}}, // 0xf014
+    {"libpngdec", {0x000e}}, // 0xf015
+    {"libpngenc", {0x000e}}, // 0xf016
+    {"libps2savedata", {}}, // 0xf017
+    {"libtiffdec", {0x000e}}, // 0xf018
+    {"libcelpdec", {0x002c}}, // 0xf019
+    {"libdtsdec", {0x002c}}, // 0xf01a
+    {"libm2bcdec", {0x002c}}, // 0xf01b
+    {"libm2aacdec", {0x002c}}, // 0xf01c
+    {"libm4aacdec", {0x002c}}, // 0xf01d
+    {"libmp3dec", {0x002c}}, // 0xf01e
+    {"libtrhddec", {0x002c}}, // 0xf01f
+    {"libsvc1d", {0x002b}}, // 0xf020
+    {"libsmvd4", {0x002b}}, // 0xf021
+    {"libsysutil_remoteplay", {}}, // 0xf022
+    {"libsysutil_imejp", {}}, // 0xf023
+    {"libwmadec", {0x002c}}, // 0xf024
+    {"libasfparser", {}}, // 0xf025
+    {"libddpdec", {0x002c}}, // 0xf026
+    {"libdtslbrdec", {0x002c}}, // 0xf027
+    {"libsysutil_music", {}}, // 0xf028
+    {"libsysutil_photo_export", {}}, // 0xf029
+    {"libsysutil_print", {}}, // 0xf02a
+    {"libsysutil_photo_import", {}}, // 0xf02b
+    {"libsysutil_music_export", {}}, // 0xf02c
+    {"libavcenc_small", {}}, // 0xf02d
+    {"libsysutil_photo_decode", {}}, // 0xf02e
+    {"libsysutil_search", {}}, // 0xf02f
+    {"libsysutil_avc2", {}}, // 0xf030
+    {"libmp4", {}}, // 0xf031
+    {"libsysutil_rtcalarm", {}}, // 0xf032
+    {"libavcenc_small", {}}, // 0xf033
+    {"libsail_rec", {}}, // 0xf034
+    {"libsysutil_np_trophy", {}}, // 0xf035
+    {"libsjvtd", {0x002b}}, // 0xf036
+    {"libdtshddec", {0x002c}}, // 0xf037
+    {"libmp3sdec", {0x002c}}, // 0xf038
+    {"libsail_avi", {}}, // 0xf039
+    {"libavcenc", {}}, // 0xf03a
+    {"libapostsrc_mini", {}}, // 0xf03b
+    {"libvoice_internal", {}}, // 0xf03c
+    {"libmpl1dec", {0x002c}}, // 0xf03d
+    {"libasfparser2_astd", {}}, // 0xf03e
+    {"libadec2", {}}, // 0xf03f
+    {"libac3dec2", {0xf03f}}, // 0xf040
+    {"libatxdec2", {0xf03f}}, // 0xf041
+    {"libdivx311dec", {0x002b}}, // 0xf042
+    {"libvpost2", {}}, // 0xf043
+    {"libsysutil_np_eula", {}}, // 0xf044
+    {"libsysutil_storagedata", {}}, // 0xf045
+    {"libm4hdenc", {}}, // 0xf046
+    {"libsysutil_savedata_psp", {}}, // 0xf047
+    {"libsysutil_video_player", {}}, // 0xf048
+    {"libmvcdec", {0x002b}}, // 0xf049
+    {"libaacenc_spurs", {}}, // 0xf04a
+    {"libdtshdcoredec", {0x002c}}, // 0xf04b
+    {"libpidvd", {}}, // 0xf04c
+    {"libsysutil_dtcp_ip", {}}, // 0xf04d
+    {"libsysutil_syschat", {}}, // 0xf04e
+    {"libsysutil_np_installer", {}}, // 0xf04f
+    {"libbemp2sys", {}}, // 0xf050
+    {"libbeisobmf", {}}, // 0xf051
+    {"libsysutil_photo_export2", {}}, // 0xf052
+    {"libat3multidec", {0x002c}}, // 0xf053
+    {"libatrac3multi", {0xf053}}, // 0xf054
+    {"libsysutil_dec_psnvideo", {}}, // 0xf055
+    {"libdtslbrdec", {0x002c}}, // 0xf056
+};
+constexpr u16 kInternalBase = 0xF000;
+constexpr u16 kInternalMask = 0x0FFF;
+constexpr u16 kInternalCount = 87;
+static_assert(std::size(kInternal) == kInternalCount);
+// RPCS3 LOADABLE_INTERNAL_MODULES (through cellSysmoduleLoadModule and the rest) and LOADABLE_INTERNAL_MODULES_EX
+// (through the Ex functions), by index.
+constexpr std::string_view kLoadable = "000000000010000010000000010101100001000011111011100011000000000000001000000000000000100";
+constexpr std::string_view kLoadableEx = "000001000010000010010000010101101111101011111011101111100110011111011111111001111110111";
+constexpr u16 kNpTrophy = 0xF035; // CELL_SYSMODULE_SYSUTIL_NP_TROPHY: loaded by lv2 from SDK 3.3 on (DEFAULT_MODULES)
+
+bool internal_id(u16 id) { return id >= kInternalBase && (id & kInternalMask) < kInternalCount; }
+
 // RPCS3 DEFAULT_MODULES: SYSUTIL, GCM_SYS, AUDIO, IO, SPURS, and from SDK 3.3 on FS and the internal NP trophy
 // module (not tracked here).
 constexpr u16 kDefaultModules[] = {0x15, 0x10, 0x11, 0x17, 0x0A, 0x0E};
 
 struct SysmoduleState {
     std::mutex mutex;
-    std::array<s32, kExternalCount> loaded{};
+    std::array<s32, kExternalCount + kInternalCount> loaded{}; // external IDs, then internal ones by index
     u32 container = kNoContainer; // cellSysmoduleSetMemcontainer's: where later loads would put their PRX images
 
     explicit SysmoduleState(HleProcess& p)
@@ -161,6 +274,7 @@ struct SysmoduleState {
         const bool sdk_330 = p.kernel().config().sdk_version >= 0x330000;
         for (usize i = 0; i < std::size(kDefaultModules); i++)
             if (i < 5 || sdk_330) loaded[kDefaultModules[i]] = 1;
+        if (sdk_330) loaded[kExternalCount + (kNpTrophy & kInternalMask)] = 1;
     }
 };
 
@@ -171,7 +285,10 @@ SysmoduleState& state()
     return p->state<SysmoduleState>();
 }
 
-const char* name_of(u16 id) { return id < kExternalCount ? kModules[id].name : "internal"; }
+const char* name_of(u16 id)
+{
+    return id < kExternalCount ? kModules[id].name : internal_id(id) ? kInternal[id & kInternalMask].name : "unknown";
+}
 
 // RPCS3 load_module / unload_module without the PRX calls.
 s32 load_one(SysmoduleState& s, u16 id)
@@ -214,11 +331,53 @@ s32 unload(SysmoduleState& s, u16 id)
     return lv2::CELL_OK;
 }
 
-s32 unknown_internal(const char* what, u16 id)
+s32 unknown(const char* what, u16 id)
 {
-    PS_LOG_ERROR(kChan, "{}({:#06x}): internal module IDs are not implemented -> CELL_SYSMODULE_ERROR_UNKNOWN", what, id);
+    PS_LOG_WARN(kChan, "{}({:#06x}): not a module this call takes -> CELL_SYSMODULE_ERROR_UNKNOWN", what, id);
     return error(CELL_SYSMODULE_ERROR_UNKNOWN);
 }
+
+// RPCS3 cellSysmoduleLoadModuleInternal / UnloadModuleInternal / IsLoadedEx, without the PRX calls.
+s32 load_internal(SysmoduleState& s, u16 id)
+{
+    if (!internal_id(id)) return error(CELL_SYSMODULE_ERROR_UNKNOWN);
+    if (id == 0xF024 || id == 0xF03E || id == 0xF020) return error(CELL_SYSMODULE_ERROR_UNKNOWN); // PARAM.SFO flags
+    for (const u16 dep : kInternal[id & kInternalMask].dependencies) {
+        const s32 r = dep < kInternalBase ? load(s, dep) : load_internal(s, dep);
+        if (r != lv2::CELL_OK && r != error(CELL_SYSMODULE_ERROR_DUPLICATED)) return r;
+    }
+    std::lock_guard lock(s.mutex);
+    s32& count = s.loaded[kExternalCount + (id & kInternalMask)];
+    if (count == 0x7FFFFFFF) return error(CELL_SYSMODULE_ERROR_FATAL);
+    count++;
+    return lv2::CELL_OK;
+}
+
+s32 unload_internal(SysmoduleState& s, u16 id)
+{
+    if (!internal_id(id)) return error(CELL_SYSMODULE_ERROR_UNKNOWN);
+    {
+        std::lock_guard lock(s.mutex);
+        s32& count = s.loaded[kExternalCount + (id & kInternalMask)];
+        if (count > 0) count--;
+    }
+    const auto& deps = kInternal[id & kInternalMask].dependencies;
+    for (auto it = std::rbegin(deps); it != std::rend(deps); ++it) {
+        if (const s32 r = *it < kInternalBase ? unload(s, *it) : unload_internal(s, *it); r != lv2::CELL_OK) return r;
+    }
+    return lv2::CELL_OK;
+}
+
+s32 is_loaded_internal(SysmoduleState& s, u16 id)
+{
+    if (!internal_id(id)) return error(CELL_SYSMODULE_ERROR_UNKNOWN);
+    std::lock_guard lock(s.mutex);
+    return s.loaded[kExternalCount + (id & kInternalMask)] > 0 ? lv2::CELL_OK : error(CELL_SYSMODULE_ERROR_UNLOADED);
+}
+
+// Through the public functions, the internal modules RPCS3 lets them load.
+bool publicly_loadable(u16 id) { return internal_id(id) && kLoadable[id & kInternalMask] == '1'; }
+bool ex_loadable(u16 id) { return internal_id(id) && kLoadableEx[id & kInternalMask] == '1'; }
 
 s32 cellSysmoduleInitialize(PPUContext&)
 {
@@ -235,7 +394,8 @@ s32 cellSysmoduleFinalize(PPUContext&)
 s32 cellSysmoduleLoadModule(PPUContext&, u16 id)
 {
     PS_LOG_INFO(kChan, "cellSysmoduleLoadModule({:#06x} {})", id, name_of(id));
-    if (id >= kExternalCount) return unknown_internal("cellSysmoduleLoadModule", id);
+    if (id >= kExternalCount)
+        return publicly_loadable(id) ? load_internal(state(), id) : unknown("cellSysmoduleLoadModule", id);
     if (id == kSyschat) return error(CELL_SYSMODULE_ERROR_UNKNOWN);
     return load(state(), id);
 }
@@ -243,14 +403,16 @@ s32 cellSysmoduleLoadModule(PPUContext&, u16 id)
 s32 cellSysmoduleUnloadModule(PPUContext&, u16 id)
 {
     PS_LOG_INFO(kChan, "cellSysmoduleUnloadModule({:#06x} {})", id, name_of(id));
-    if (id >= kExternalCount) return unknown_internal("cellSysmoduleUnloadModule", id);
+    if (id >= kExternalCount)
+        return publicly_loadable(id) ? unload_internal(state(), id) : unknown("cellSysmoduleUnloadModule", id);
     if (id == kSyschat) return error(CELL_SYSMODULE_ERROR_UNKNOWN);
     return unload(state(), id);
 }
 
 s32 cellSysmoduleIsLoaded(PPUContext&, u16 id)
 {
-    if (id >= kExternalCount) return unknown_internal("cellSysmoduleIsLoaded", id);
+    if (id >= kExternalCount)
+        return publicly_loadable(id) ? is_loaded_internal(state(), id) : unknown("cellSysmoduleIsLoaded", id);
     if (id == kSyschat) return error(CELL_SYSMODULE_ERROR_UNKNOWN);
     // A virtual module is loaded when its last dependency is (RPCS3).
     const u16 m = kModules[id].has_image ? id : *(kModules[id].dependencies.end() - 1);
@@ -282,6 +444,34 @@ s32 cellSysmoduleSetMemcontainer(PPUContext& ctx, u32 ct_id)
     return usable ? lv2::CELL_OK : error(CELL_SYSMODULE_ERROR_INVALID_MEMCONTAINER);
 }
 
+// The internal functions, as RPCS3: any internal module by its ID; the Ex ones only those LOADABLE_INTERNAL_MODULES_EX
+// lists (else as an invalid ID).
+s32 cellSysmoduleLoadModuleInternal(PPUContext&, u16 id)
+{
+    PS_LOG_INFO(kChan, "cellSysmoduleLoadModuleInternal({:#06x} {})", id, name_of(id));
+    return load_internal(state(), id);
+}
+
+s32 cellSysmoduleUnloadModuleInternal(PPUContext&, u16 id)
+{
+    PS_LOG_INFO(kChan, "cellSysmoduleUnloadModuleInternal({:#06x} {})", id, name_of(id));
+    return unload_internal(state(), id);
+}
+
+s32 cellSysmoduleIsLoadedEx(PPUContext&, u16 id) { return is_loaded_internal(state(), id); }
+
+s32 cellSysmoduleLoadModuleEx(PPUContext&, u16 id)
+{
+    PS_LOG_INFO(kChan, "cellSysmoduleLoadModuleEx({:#06x} {})", id, name_of(id));
+    return ex_loadable(id) ? load_internal(state(), id) : error(CELL_SYSMODULE_ERROR_UNKNOWN);
+}
+
+s32 cellSysmoduleUnloadModuleEx(PPUContext&, u16 id)
+{
+    PS_LOG_INFO(kChan, "cellSysmoduleUnloadModuleEx({:#06x} {})", id, name_of(id));
+    return ex_loadable(id) ? unload_internal(state(), id) : error(CELL_SYSMODULE_ERROR_UNKNOWN);
+}
+
 } // namespace
 
 void register_cellSysmodule(Registry& r)
@@ -293,6 +483,11 @@ void register_cellSysmodule(Registry& r)
         PS_HLE_FUNC(0x112A5EE9, cellSysmoduleUnloadModule),
         PS_HLE_FUNC(0x5A59E258, cellSysmoduleIsLoaded),
         PS_HLE_FUNC(0xA193143C, cellSysmoduleSetMemcontainer),
+        PS_HLE_FUNC(0xD9B8C0EE, cellSysmoduleLoadModuleInternal),
+        PS_HLE_FUNC(0xB498BF77, cellSysmoduleUnloadModuleInternal),
+        PS_HLE_FUNC(0x70E319B5, cellSysmoduleIsLoadedEx),
+        PS_HLE_FUNC(0x1A267F98, cellSysmoduleLoadModuleEx),
+        PS_HLE_FUNC(0xFD0E1CAC, cellSysmoduleUnloadModuleEx),
     });
 }
 

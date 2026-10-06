@@ -1081,6 +1081,13 @@ s32 cellGcmTerminate(PPUContext&)
 }
 
 // RPCS3: the handler takes effect once the RSX is initialized.
+// cellGcmSetGraphicsHandler(handler): RPCS3 notes it (cellGcmSys.todo) and keeps nothing: the RSX's graphics errors
+// it would report never reach a game there or here. Sniper: Ghost Warrior sets one at boot (phone run of 2026-10-06).
+void cellGcmSetGraphicsHandler(PPUContext&, u32 handler)
+{
+    PS_LOG_INFO(kChan, "cellGcmSetGraphicsHandler({:#x}): kept by nothing, as RPCS3", handler);
+}
+
 void cellGcmSetVBlankHandler(PPUContext&, u32 handler)
 {
     GcmState& g = gcm();
@@ -1335,6 +1342,7 @@ void register_cellGcmSys(Registry& r)
         PS_HLE_FUNC(0x51C9D62B, cellGcmSetDebugOutputLevel),
         PS_HLE_FUNC(0x527C6439, cellGcmTerminate),
         PS_HLE_FUNC(0xA91B0402, cellGcmSetVBlankHandler),
+        PS_HLE_FUNC(0xD01B570D, cellGcmSetGraphicsHandler),
         PS_HLE_FUNC(0xA41EF7E8, cellGcmSetFlipHandler),
         PS_HLE_FUNC(0x06EDEA9E, cellGcmSetUserHandler),
         PS_HLE_FUNC(0x0A862772, cellGcmSetQueueHandler),
