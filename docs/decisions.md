@@ -4180,6 +4180,33 @@ library in the app's tmp folder, which iOS clears only now and then.
 Tests: tests/game/test_game_library.cpp (an ended process's copies go; this process's, a running one's and other
 files stay).
 
+## D-193 · 2026-10-06 · cellPamf is pspocket's own, and each own library is compared with Sony's
+
+The first of D-179's media libraries (the user's step 3): cellPamf, the reader of PAMF headers, the container of the
+PS3's movies. It parses the header in guest memory (the stream list, each stream's codec information, the entry
+points a player seeks to); no SPU, no decoder. All 25 functions, as RPCS3 has them (cellPamf.cpp), which reproduces
+Sony's libpamf down to its bugs: the stream search that steps 16 headers at a time, the error code left as the stream
+index, the "broken" EP-with-timestamp. With every function on the host, D-175 gives a game the host's, not libpamf.sprx.
+
+- **Compared with Sony's, call by call.** tests/hle/firmware_compare.hpp loads a library's firmware module from the
+  user's installed system software into a test (LLE, D-157), starts it and calls its exports under the interpreter.
+  test_pamf.cpp sends the same 207 calls to Sony's libpamf and to pspocket's (a valid header, 16 defective ones, every
+  reader function on each stream, the entry points by index and by time, the iterator's moves, every stream type as an
+  ES filter) and compares the return values and every byte written.
+  - The firmware is read where the user installed it (PSPOCKET_TEST_DEV_FLASH; scripts/gate.sh sets it when
+    inventory/firmware/installed/dev_flash exists) and never enters the repository (rule 1). Without it the
+    comparison is skipped.
+  - Result: 195 of 207 the same at once. The 12 others were one difference: cellPamfReaderGetEpWithTimeStamp gives the
+    next entry point's offset in bytes in Sony's libpamf, in 2048-byte units in RPCS3's. pspocket follows Sony's
+    (rule 11); now 207 of 207.
+- **Measured against Sony's (rule 8).** For a parser the measure is the answers, above. Speed: the host's runs a call
+  in microseconds; Sony's was interpreted until D-178, and is a PRX the game had to load.
+- **Refusals.** Where RPCS3 ensure()s a pointer LLE never checks, pspocket logs the call site and answers
+  CELL_PAMF_ERROR_INVALID_ARG (D-042); a header running off guest memory is refused the same way.
+
+Tests: tests/hle/test_pamf.cpp (synthetic header: the checks, the reader, the codec information, the entry points
+and iterator, the bugs kept; and the comparison with Sony's when the firmware is there).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

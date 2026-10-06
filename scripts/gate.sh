@@ -36,6 +36,8 @@ if [[ $mode == quick || $mode == all ]]; then
   if ! ninja -C $build > $out/build.log 2>&1; then
     tail -30 $out/build.log; echo "gate: FAIL (build, $out/build.log)"; exit 1
   fi
+  # pspocket's own libraries against Sony's, from the user's installed firmware when there is one (D-193).
+  [[ -d inventory/firmware/installed/dev_flash ]] && export PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash
   if ! ctest --test-dir $build -j 8 --timeout 300 --output-on-failure > $out/ctest.log 2>&1; then
     grep -E "Failed|FAILED|\*\*\*" $out/ctest.log | head -20; echo "gate: FAIL (tests, $out/ctest.log)"; exit 1
   fi
