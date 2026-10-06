@@ -127,6 +127,17 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   disc too. NPDRM modules need the game's klicensee.
 - **State:** open.
 
+## Media libraries (D-179, D-193, D-194)
+
+- **Seen:** cellPamf and cellDmux are pspocket's own and the same as Sony's on synthetic streams (run 102). No game on
+  the Mac imports them; the phone's L.A. Noire uses cellVdec.
+- **Try:** a real movie through cellDmux (a game that plays PAMF, on the phone or the Mac): the time per access unit
+  and the callbacks per second. Each unit is one event through the SPU side's queue and one guest callback on the
+  demuxer's lv2 thread; the SPU side's host thread sleeps 1.5 ms after each new stream (RPCS3's delay for White Knight
+  Chronicles II). The raw elementary stream core (g_cell_dmux_core_ops_raw_es, which other firmware modules use) is
+  not pspocket's: only libdmux's PAMF core is.
+- **State:** open; cellVdec and cellAdec next.
+
 ## The gate (D-149)
 
 - **Seen:** one walk failed on the fps floor (a single 5 s window at 19.8 fps at flip 2,400 while the Mac's GPU was in

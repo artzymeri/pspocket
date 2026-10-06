@@ -4207,6 +4207,53 @@ index, the "broken" EP-with-timestamp. With every function on the host, D-175 gi
 Tests: tests/hle/test_pamf.cpp (synthetic header: the checks, the reader, the codec information, the entry points
 and iterator, the bugs kept; and the comparison with Sony's when the firmware is there).
 
+## D-194 · 2026-10-06 · cellDmux is pspocket's own, on a PAMF core that matches Sony's to the byte
+
+The second of D-179's media libraries: cellDmux, the demultiplexer that splits a PAMF movie (an MPEG program stream
+in 2048-byte packs) into its elementary streams, each access unit (a video picture, an audio frame, a block of user
+data) put in a queue in the game's memory and reported through the game's callback. On a PS3 it is two modules:
+libdmux (the API, 21 functions) and libdmuxpamf (the PAMF core, whose demuxing runs as a SPURS task). Both are
+pspocket's own now, ported from RPCS3 (cellDmux.cpp, cellDmuxPamf.cpp), which reproduces them:
+
+- **cellDmux.cpp**: the API with its contexts in the game's memory (the demuxer's, then one per stream with its access
+  unit queue after it), their lv2 mutexes, the checks, the queue and the release error recovery; the core is called
+  directly (RPCS3 goes through the CellDmuxCoreOps table).
+- **cellDmuxPamf.cpp**: the core. Libdmuxpamf's SPU task is a host thread running the demultiplexer
+  (dmux_pamf.cpp: the pack and PES parsing and the AVC, M2V, LPCM, AC3, ATRAC3plus and user data parsers); its PPU
+  thread is a real lv2 thread ("_dmux_pamf_ppu_thread", as Sony names it) that turns the SPU side's events into the
+  game's callbacks at the priority and with the stack the game asked for. Without a SPURS instance from the game,
+  libdmuxpamf starts its own ("_libdmux_pamf", one SPU); here an SPU thread group of that name is created and never
+  started, so it takes the same 256 KB and SPU from the game and fails where the console's would.
+- **Compared with Sony's (D-193's harness).** test_dmux.cpp runs a demuxer's whole life (sizes, open, two streams, a
+  synthetic stream of AVC video and ATRAC3plus audio with a start code and a sync word split between packs, every
+  unit peeked, taken and released, the flushes, a second run, a reset, the errors on the way, close) through
+  pspocket's library and through Sony's libdmux and libdmuxpamf, which run with their SPU task in the interpreter.
+  Result: 81 of 83 observations the same at once, down to each access unit's address in the game's memory, its
+  timestamps and every callback. The two others were one difference: cellDmuxQueryAttr's size. Sony's libdmux asks
+  for align16(0xC0 + 4 × streams) + the core's + 0xF; RPCS3 adds an elementary stream context (0x50) more. pspocket
+  follows Sony's (rule 11): a game that gives exactly Sony's size was refused before. Now 83 of 83.
+- **Two SPURS queue functions** (cellSpursQueue.cpp) that Sony's libdmuxpamf needs and pspocket lacked, found by the
+  comparison: cellSpursQueuePushBody (the PPU pushing to a PPU2SPU queue: its commands to the SPU task) and
+  cellSpursQueueSize (its event count), both as libsre (fw 4.92, D-046). Without them Sony's cellDmuxEnableEs failed
+  with CELL_DMUX_ERROR_FATAL: every game that played PAMF movies through the firmware's libdmux until now could not.
+- **With all 21 functions on the host, D-175 gives a game the host's cellDmux**, not libdmux.sprx and
+  libdmuxpamf.sprx (and their SPU program, D-191, is no longer needed for it).
+- **Measured against Sony's (rule 8).** The answers, above. Speed, on the test's six packs: the whole run takes
+  0.007 s with pspocket's library and about 0.010 s with Sony's, whose PPU code and SPU task are interpreted here
+  (translated on a game's run, D-178, D-191). Too short a stream to measure a movie's throughput; that waits for a
+  game that plays one.
+- **Refusals.** Pointers RPCS3 dereferences without a check are checked; one that is not guest memory is logged and
+  refused with CELL_DMUX_ERROR_ARG (D-042). Where RPCS3 ensure()s an access unit queue invariant, the demultiplexer
+  logs it and leaves the queue as it is.
+- **What the comparison taught about the stream.** A unit that begins in the bytes kept from the last packet (its
+  delimiter split between packs) and ends in the next packet takes none of that packet's timestamps; the unit after
+  it does. RPCS3 has it so, and Sony's does the same.
+
+Tests: tests/hle/test_dmux.cpp (the demultiplexer alone: units cut across packs, timestamps, random access points,
+refused events, a full queue that wraps; the API with the game's callbacks as guest code; the comparison with Sony's
+when the firmware is there); tests/hle/test_spurs_queue.cpp (PushBody's checks, order and wrap, a blocking push woken
+by an SPU pop, a push waking a task waiting to pop; Size).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

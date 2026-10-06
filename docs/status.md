@@ -115,10 +115,17 @@ that point into a function (one decoder lifted to 288 MB of C before, D-190); a 
 holding its entry; spu-check checks a prepared library's SPU programs (all 216 agree with the interpreter). Not tried
 on the phone yet.
 
-Next: D-179's own media libraries (cellPamf, cellDmux, cellVdec and cellAdec on FFmpeg, D-181; then the image
-decoders), measured against Sony's translated versions, then docs/firmware.md's iOS frameworks for the heavy media
-(ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6 with games nobody has analysed (each run's log names
-what is still missing).
+**pspocket's own media libraries, each compared with Sony's (D-179, D-193, D-194, run 102).** A test loads the
+firmware's module from the user's installed system software and sends it the same calls as pspocket's library
+(tests/hle/firmware_compare.hpp; skipped without the firmware). cellPamf, the reader of movie headers: 207 of 207
+calls the same (D-193). cellDmux, the demultiplexer that splits a movie into its video and audio: a demuxer's whole
+life on a synthetic stream, every answer, callback and access unit the same, down to its address (D-194). The
+comparison found that Sony's own libdmux could not run here (two SPURS queue functions were missing, now added) and
+that RPCS3 asks for 0x50 bytes more memory than Sony's libdmux (pspocket follows Sony's).
+
+Next: cellVdec and cellAdec on FFmpeg (D-181), then the image decoders, each measured against Sony's translated
+version the same way; then docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox),
+and the phone's stage 6 with games nobody has analysed (each run's log names what is still missing).
 
 ## Building and running GTA V on the Mac
 
