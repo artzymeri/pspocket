@@ -2827,6 +2827,55 @@ slots still return CELL_ENOSYS and count as unimplemented. sys_fs_fcntl's unknow
 error log, as RPCS3's do (31 of its operations are no-ops). Test: a named, a debug and an unnamed null slot return
 CELL_OK, an unused one ENOSYS.
 
+## D-169 · 2026-10-06 · cellSync and cellRtc complete, as RPCS3 has them
+
+Every function RPCS3 implements in the two libraries is now native: 33 more in cellSync (the mutex's Lock; the
+barrier, the reader-writer buffer and the queue, five, five and nine functions; the lock-free queue's thirteen) and 32
+in cellRtc. Each follows RPCS3's rpcs3/Emu/Cell/Modules/cellSync.cpp or cellRtc.cpp, cited per function; cellSync was
+compared with libsre (fw 4.92, the reference, D-046) function by function as well. Where pspocket differs, and why:
+
+- **Atomicity.** Every cellSync structure lies in one 128-byte line, and every update of it is one reservation_op
+  (D-160), never a host atomic. The lock-free queue is the whole line, so each pass of RPCS3's loops is one update: what
+  the pass reads is one snapshot, and it stores only if nothing in the line changed since, as libsre's lwarx/stwcx. on
+  the line give. The second compare-and-swap of a completion (push3/pop3), which RPCS3 ensures and libsre asserts
+  nobody changed in between, therefore cannot fail. cellSyncLFQueueInitialize's claim of `init`, the set-up and its
+  end are one update too: nobody sees the queue half set up.
+- **Waiting.** Where RPCS3 spins (Lock, Notify, Wait, Read, Write, Push, Pop, Peek, Clear, the blocking pointer calls,
+  a completion waiting for an SPU waiter to leave), the thread sleeps until the line changes (ps_res_wait_change: an
+  HLE update, a stwcx., a PUTLLC or PUTLLUC, a DMA PUT), and looks again every 1 ms for plain guest stores, which don't
+  move the line's version. The end of the process unwinds it (ThreadExit), where RPCS3 returns 0. A thread waiting
+  300 ms in Lock used under 50 ms of CPU. A contended Lock hands over through a wake-up: 24,000 handovers among six
+  threads took 0.08 to 9.4 s over 15 runs on a Mac loaded by other builds (load average above 100); a spin before the
+  sleep waits for a game that needs it (rule 8).
+- **libsre where RPCS3 differs.** cellSyncLFQueueInitialize ends with init = 2: RPCS3 stores 0, after which a second
+  Initialize of the queue is STAT, where libsre's accepts the same arguments again (the SPU side initializes the same
+  queue). The push completion stops only when var2 + var4 is above 16, libsre's assertion (RPCS3 ensures below 16).
+- **Fatal where RPCS3 throws or ensures and libsre asserts (D-047):** a queue whose next or count is beyond its depth;
+  the lock-free queue's receive from its lv2 event queue failing; `16 - var2 <= 1` in a completion; a completion with
+  an SPU waiter to wake and no signal function, which is what PushBody and PopBody pass, in RPCS3 and in libsre.
+- **Not here:** RPCS3's todo stubs that return CELL_OK: the ANY2ANY functions (_cellSyncLFQueue*Pointer2) and
+  _cellSyncLFQueueAttach/DetachLv2EventQueue stay unimplemented (rule 4); PushBody and PopBody refuse an ANY2ANY queue
+  with CELL_SYNC_ERROR_NOSYS, where RPCS3 copies an entry at a pointer nothing handed out.
+- **Checks (D-042).** Objects, entries, buffers and signal functions that are not guest memory are FAULT with the call
+  site logged, the structure left as it was. The four pointer functions, which check nothing in RPCS3 and libsre, also
+  refuse a queue that is not 128-aligned (ALIGN): Initialize sets none up there.
+- **cellRtc sets no clock.** cellRtcSetCurrentTick and cellRtcSetConf go through lv2's sys_time_set_current_time and
+  sys_time_set_timezone (CELL_ENOSYS without root, nothing changed), as RPCS3; cellRtcSetCurrentSecureTick returns
+  CELL_OK and keeps nothing, as RPCS3's sys_ss_secure_rtc stub. cellRtcGetCurrentSecureTick is the host's UTC time in
+  whole seconds: RPCS3's stub answers with the timebase counter, which its arithmetic turns into a date 150 years
+  further per minute of running. CheckValid and CompareTick refuse a bad pointer with INVALID_POINTER and a log, where
+  RPCS3 ensure()s it. Sums wrap at 32 or 64 bits, as the PS3's, where RPCS3's signed ones would overflow.
+- **A fix in the date parser.** A year RPCS3's cellRtcGetTick refuses (0, or 0xFFFF for a cellRtcParseRfc3339 string
+  that doesn't start with digits) writes no tick, and the offset is added to what the tick held, as RPCS3 does
+  (cellRtcGetTick, then cellRtcTickAddMinutes); cellRtcParseDateTime computed a tick from year 0 before.
+
+Tests: tests/hle/test_sync.cpp (25 cases): every NID; each function's checks in RPCS3's order and its effect byte for
+byte; blocking calls woken by other threads and by SPU-style GETLLAR/PUTLLC, and unwound at exit; the mutex hammered
+with Lock and with TryLock against a PPU's lwarx/stwcx. and an SPU's tickets; barrier rounds; readers of the rwm never
+seeing half a buffer; queue producers and consumers; the lock-free queue's layout, out-of-order completions, a waiter
+signalled through a guest function, the lv2 event queue wait, and a PPU pushing (popping) 3,001 entries against an SPU
+popping (pushing). tests/hle/test_rtc.cpp (10 cases): every function's values (from Python's datetime) and errors.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
