@@ -43,6 +43,7 @@ add_library(pspocket_hle STATIC
     src/cellOvis.cpp
     src/cellAdec.cpp
     src/adec_lpcm.cpp
+    src/adec_atracx.cpp
     src/cellVdec.cpp
     src/cellDmuxPamf.cpp
     src/dmux_pamf.cpp

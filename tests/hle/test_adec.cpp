@@ -380,7 +380,7 @@ Observed core_run(u8* b, const Call& call, u32 type, std::initializer_list<u32> 
     }
     u32 outs = 0;
     for (u32 k = 0; k < aus.size(); k++) {
-        const u32 at = kStream + 0x2000 * k;
+        const u32 at = kStream + 0x2000 * (k % 16);
         std::memcpy(b + at, aus[k].data(), aus[k].size());
         ps_write32(b, kAu + 0, at);
         ps_write32(b, kAu + 4, static_cast<u32>(aus[k].size()));
@@ -389,11 +389,13 @@ Observed core_run(u8* b, const Call& call, u32 type, std::initializer_list<u32> 
         ps_write64(b, kAu + 16, 0x77000000 + k);
         if (r("cellAdecDecodeAu", 0x1529E506, {handle, kAu}) != 0) continue;
         if (!wait_until([&] { return count_of(b, 0) >= k + 1; })) note("no AUDONE");
-        // The core may hold an access unit back: take what is out once it settles.
-        for (int quiet = 0; quiet < 25; quiet++) {
-            const u32 now = count_of(b, 1);
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            if (count_of(b, 1) != now) quiet = 0;
+        // The PCM of this access unit (a core may hold one back: then what is out once it settles).
+        if (!wait_until([&] { return count_of(b, 1) >= outs + 1; }, std::chrono::seconds(2))) {
+            for (int quiet = 0; quiet < 25; quiet++) {
+                const u32 now = count_of(b, 1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                if (count_of(b, 1) != now) quiet = 0;
+            }
         }
         for (; outs < count_of(b, 1); outs++) {
             ps_write32(b, kItemOut, 0);
@@ -601,4 +603,188 @@ TEST_CASE("cellAdec: a firmware core (MPEG layer I) through pspocket's front end
     CHECK(loud > 1000); // sound, not silence
     WARN(std::format("MPEG layer I through Sony's core: {} lines, {} PCM outputs the same; {} samples above -60 dB",
         theirs.lines.size(), theirs.pcm.size(), loud));
+}
+
+// ATRAC3plus, pspocket's core on FFmpeg against Sony's (libatxdec through Sony's libadec), on a stream from a RIFF .at3
+// file named by PSPOCKET_PROBE_AT3 (a game's SND0.AT3, say: game data, never in the repository; run 105). The answers,
+// items, information and callbacks are compared exactly; the samples by their difference.
+TEST_CASE("cellAdec: ATRAC3plus on FFmpeg against Sony's core (probe)", "[hle][adec][firmware][.probe]")
+{
+    const auto flash = test_dev_flash();
+    const char* path = std::getenv("PSPOCKET_PROBE_AT3");
+    if (!flash || !path) return;
+    std::vector<u8> file;
+    {
+        FILE* fp = std::fopen(path, "rb");
+        REQUIRE(fp);
+        u8 buf[4096];
+        for (usize n; (n = std::fread(buf, 1, sizeof(buf), fp)) > 0;) file.insert(file.end(), buf, buf + n);
+        std::fclose(fp);
+    }
+    // RIFF WAVE: fmt (channels +2, rate +4, block_align +12; the ATRAC3plus config word big-endian at +0x2A), data.
+    REQUIRE(file.size() > 12);
+    u32 channels = 0, rate = 0, block = 0, data = 0, data_size = 0;
+    u8 config[4] = {};
+    const auto le32 = [&](usize at) { return u32{file[at]} | u32{file[at + 1]} << 8 | u32{file[at + 2]} << 16 | u32{file[at + 3]} << 24; };
+    for (usize off = 12; off + 8 <= file.size();) {
+        const u32 size = le32(off + 4);
+        if (std::memcmp(&file[off], "fmt ", 4) == 0) {
+            channels = file[off + 10] | file[off + 11] << 8;
+            rate = le32(off + 12);
+            block = file[off + 20] | file[off + 21] << 8;
+            std::memcpy(config, &file[off + 8 + 0x28], 4);
+        }
+        if (std::memcmp(&file[off], "data", 4) == 0) {
+            data = static_cast<u32>(off + 8);
+            data_size = size;
+            break;
+        }
+        off += 8 + size + (size & 1);
+    }
+    REQUIRE((data && block && channels));
+    std::vector<std::vector<u8>> aus;
+    for (u32 at = data; at + block <= data + data_size && aus.size() < 1024; at += block)
+        aus.emplace_back(file.begin() + at, file.begin() + at + block);
+    const u32 ch_config = channels <= 4 ? channels : channels - 1;
+    // CellAdecParamAtracX: sampling_freq, ch_config_idx, nch_out, nbytes, extra_config_data, bw_pcm (float), downmix,
+    // ATS headers (none).
+    const u32 extra = u32{config[0]} << 24 | u32{config[1]} << 16 | u32{config[2]} << 8 | config[3];
+    const std::initializer_list<u32> param = {rate, ch_config, channels, block, extra, 0x84, 0};
+    InterpretMisses interpret;
+    Observed ours, theirs;
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        ours = core_run(f.base(), hle_calls(f, t), 3, param, aus);
+    }
+    const auto t1 = clock::now();
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        FirmwareLibrary sony(f, t, *flash, "cellAdec");
+        theirs = core_run(f.base(),
+            [&](const char*, u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); }, 3, param, aus);
+    }
+    const auto t2 = clock::now();
+    if (const char* dump = std::getenv("PSPOCKET_PROBE_DUMP")) {
+        if (FILE* fp = std::fopen(dump, "w")) {
+            for (usize i = 0; i < std::max(ours.lines.size(), theirs.lines.size()); i++)
+                std::fprintf(fp, "S %s\nP %s\n", i < theirs.lines.size() ? theirs.lines[i].c_str() : "-",
+                    i < ours.lines.size() ? ours.lines[i].c_str() : "-");
+            std::fclose(fp);
+        }
+    }
+    usize differ = 0;
+    for (usize i = 0; i < std::max(ours.lines.size(), theirs.lines.size()); i++) {
+        const std::string x = i < ours.lines.size() ? ours.lines[i] : "(none)";
+        const std::string y = i < theirs.lines.size() ? theirs.lines[i] : "(none)";
+        if (x != y && ++differ <= 30) UNSCOPED_INFO(std::format("line {}:\n  pspocket: {}\n  Sony:     {}", i, x, y));
+    }
+    double signal = 0, noise = 0, max_diff = 0;
+    usize samples = 0;
+    for (usize i = 0; i < std::min(ours.pcm.size(), theirs.pcm.size()); i++) {
+        const usize n = std::min(ours.pcm[i].size(), theirs.pcm[i].size()) / 4;
+        for (usize k = 0; k < n; k++) {
+            const double a = static_cast<double>(be_float(ours.pcm[i], k)), c = static_cast<double>(be_float(theirs.pcm[i], k));
+            signal += c * c;
+            noise += (a - c) * (a - c);
+            max_diff = std::max(max_diff, std::abs(a - c));
+            samples++;
+        }
+    }
+    const double snr = noise > 0 ? 10 * std::log10(signal / noise) : 999;
+    WARN(std::format("ATRAC3plus, {} frames: {} of {} lines differ; {} PCM outputs (Sony {}), {} samples: SNR {:.1f} dB, "
+                     "largest difference {:.6f}; pspocket {:.2f} s, Sony {:.2f} s (interpreted)",
+        aus.size(), differ, theirs.lines.size(), ours.pcm.size(), theirs.pcm.size(), samples, snr, max_diff,
+        std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count()));
+}
+
+// ATRAC3plus frames built here: a valid silent stereo frame (a zero start bit; one stereo channel unit of `units`
+// quantisation units, every word length zero, no flags, gain data, tones or noise; the terminator) and an invalid one
+// (the start bit set). The decoder's flow: the first frame of the sequence silent, the invalid frame an error and the
+// frame after it silent, the sizes and information Sony's.
+std::vector<u8> atrac3plus_silent_frame(u32 units)
+{
+    std::vector<u8> f(0x2B0, 0);
+    u32 bit = 0;
+    const auto put = [&](u32 v, u32 n) {
+        for (u32 i = 0; i < n; i++, bit++)
+            if ((v >> (n - 1 - i)) & 1) f[bit / 8] |= static_cast<u8>(0x80 >> (bit % 8));
+    };
+    put(0, 1);         // start bit
+    put(1, 2);         // a stereo channel unit
+    put(units - 1, 5); // quantisation units
+    put(0, 1);         // not muted
+    for (u32 ch = 0; ch < 2; ch++) {
+        put(0, 2); // word lengths coded directly
+        for (u32 q = 0; q < units; q++) put(0, 3);
+    }
+    put(0, 2); // no swapped or negated subbands
+    put(0, 2); // window shapes
+    put(0, 2); // no gain control data
+    put(0, 1); // no tones
+    put(0, 1); // no noise
+    put(3, 2); // terminator
+    return f;
+}
+
+std::vector<std::vector<u8>> atrac3plus_frames()
+{
+    std::vector<std::vector<u8>> aus;
+    for (const u32 units : {1u, 8u, 28u, 0u, 32u, 16u}) {
+        if (units == 0) {
+            std::vector<u8> bad(0x2B0, 0);
+            bad[0] = 0x80; // the start bit set
+            aus.push_back(std::move(bad));
+        } else {
+            aus.push_back(atrac3plus_silent_frame(units));
+        }
+    }
+    return aus;
+}
+
+TEST_CASE("cellAdec: ATRAC3plus on FFmpeg, its flow on frames built here (D-198)", "[hle][adec]")
+{
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    // 48 kHz, stereo, 688-byte frames, floats, no ATS headers.
+    const Observed o = core_run(f.base(), hle_calls(f, t), 3, {48000, 2, 2, 0x2B0, 0, 0x84, 0}, atrac3plus_frames());
+    INFO(all_lines(o.lines));
+    std::string all = all_lines(o.lines);
+    CHECK(o.lines[1] == "attr 3: 0x59f8b 0x492000 0x1020000"); // Sony's
+    REQUIRE(o.pcm.size() == 6);
+    CHECK(o.pcm[0].empty());        // the sequence's first frame: silence
+    CHECK(o.pcm[1].size() == 16384); // 2048 samples, 2 channels, floats
+    CHECK(o.pcm[4].empty());        // the frame after the error
+    CHECK(o.pcm[5].size() == 16384);
+    CHECK(all.find("callback 6: type 2 data 0x806122b2") != std::string::npos); // the invalid frame: an error first
+}
+
+TEST_CASE("cellAdec: ATRAC3plus on FFmpeg against Sony's core, on frames built here", "[hle][adec][firmware]")
+{
+    const auto flash = test_dev_flash();
+    if (!flash) {
+        SUCCEED("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+        return;
+    }
+    InterpretMisses interpret;
+    Observed ours, theirs;
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        ours = core_run(f.base(), hle_calls(f, t), 3, {48000, 2, 2, 0x2B0, 0, 0x84, 0}, atrac3plus_frames());
+    }
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        FirmwareLibrary sony(f, t, *flash, "cellAdec");
+        theirs = core_run(f.base(),
+            [&](const char*, u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); }, 3,
+            {48000, 2, 2, 0x2B0, 0, 0x84, 0}, atrac3plus_frames());
+    }
+    INFO(all_lines(theirs.lines));
+    CHECK(compare(ours, theirs) == 0);
 }

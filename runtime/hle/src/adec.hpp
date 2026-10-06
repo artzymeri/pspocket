@@ -4,7 +4,8 @@
 // calls each codec's core (LPCM inside libadec; ATRAC3plus, MP3, AC-3, ... in their own modules) through the core's
 // table of operations (CellAdecCoreOps); the cores report back through four notification functions. pspocket's front
 // end (cellAdec.cpp) keeps the same context, laid out as Sony's, and calls a core through AdecCore: its own (LPCM,
-// adec_lpcm.cpp) directly, or Sony's core module through its operation table, as RPCS3's cellAdec calls the LLE cores.
+// adec_lpcm.cpp; ATRAC3plus, adec_atracx.cpp) directly, or Sony's core module through its operation table, as RPCS3's
+// cellAdec calls the LLE cores.
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h.
 
 #include <memory>
@@ -26,7 +27,11 @@ constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
 enum : s32 {
     CELL_ADEC_TYPE_LPCM_PAMF = 1,
+    CELL_ADEC_TYPE_ATRACX = 3,
     CELL_ADEC_TYPE_LPCM_BLURAY = 12,
+    CELL_ADEC_TYPE_ATRACX_2CH = 13,
+    CELL_ADEC_TYPE_ATRACX_6CH = 14,
+    CELL_ADEC_TYPE_ATRACX_8CH = 15,
     CELL_ADEC_TYPE_M4AAC = 16,
     CELL_ADEC_TYPE_LPCM_DVD = 17,
     CELL_ADEC_TYPE_M4AAC_2CH = 20,
@@ -83,6 +88,9 @@ public:
 
 // pspocket's LPCM core (adec_lpcm.cpp), for the three LPCM types.
 std::unique_ptr<AdecCore> make_lpcm_core();
+// pspocket's ATRAC3plus core on FFmpeg (adec_atracx.cpp), for up to `max_channels` channels (its memory size); none in a
+// build without FFmpeg.
+std::unique_ptr<AdecCore> make_atracx_core(u32 max_channels);
 
 // What the front end sets in the LPCM core's context (RPCS3 adecOpen, adecSetLpcmBlurayParams, adecSetLpcmDvdParams,
 // cellAdecGetPcm): the DVD packing before it opens, the Blu-ray and DVD forms' parameters from each access unit's user
@@ -103,12 +111,13 @@ s32 notify_seq_done(PPUContext& ctx, u32 context);
 // The four notifications as guest functions, for Sony's cores (internal functions of cellAdec, linked with it), and
 // the LPCM core's thread. pspocket's own NIDs: nid_of of each name.
 constexpr u32 NID_notify_au_done = 0x22351FEC, NID_notify_pcm_out = 0xAF08E5A0, NID_notify_error = 0xF1642C29,
-              NID_notify_seq_done = 0xD2B167B0, NID_lpcm_dec_thread = 0x4ED4A064;
+              NID_notify_seq_done = 0xD2B167B0, NID_lpcm_dec_thread = 0x4ED4A064, NID_atracx_dec_thread = 0x346C0076;
 s32 _pspocket_adec_notify_au_done(PPUContext& ctx, s32 pcm_handle, u32 context);
 s32 _pspocket_adec_notify_pcm_out(PPUContext& ctx, s32 pcm_handle, u32 pcm_addr, u32 pcm_size, u32 context,
     u32 bsi_info_ptr, u8 correct_pts_type, s32 error_code);
 s32 _pspocket_adec_notify_error(PPUContext& ctx, s32 error_code, u32 context);
 s32 _pspocket_adec_notify_seq_done(PPUContext& ctx, u32 context);
 void _pspocket_lpcm_dec_thread(PPUContext& ctx, u64 core_handle);
+void _pspocket_atracx_dec_thread(PPUContext& ctx, u64 core_handle);
 
 } // namespace pspocket::hle::adec

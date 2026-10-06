@@ -1,7 +1,8 @@
 // cellAdec: the audio decoder games use for their movies' and streams' audio (D-197). The front end keeps Sony's
 // context in the memory the game gives (AdecContext, its frames and bitstream information blocks, then the core's
-// memory) and decodes through a core: pspocket's own LPCM core (adec_lpcm.cpp) for the three LPCM types; for every
-// other codec, the firmware's core module (ATRAC3plus, MP3, AC-3, AAC, ...) through the operation table it exports, as
+// memory) and decodes through a core: pspocket's own for the three LPCM types (adec_lpcm.cpp) and ATRAC3plus
+// (adec_atracx.cpp, on FFmpeg, D-198); for every other codec, the firmware's core module (MP3, AC-3, AAC, ...) through
+// the operation table it exports, as
 // Sony's libadec and RPCS3's cellAdec call it. The core modules are the host's imports of cellAdec
 // (Registry::add_imports): the loader chooses and links them for a game importing cellAdec, as it would for libadec.
 // pspocket's own cores on FFmpeg replace them one codec at a time.
@@ -41,10 +42,12 @@ namespace {
 // imports in the user's 4.92 firmware). DTS, DTS-HD core, WMA Pro and WMA Lossless are in no retail firmware.
 constexpr HostImport kImports[] = {
     {{}, "cell_libac3dec", 0xC58BB170, true},     // AC-3 operations
+#if !PSPOCKET_HAVE_FFMPEG // pspocket's own otherwise (D-198)
     {{}, "cellAtracXdec", 0x4944AF9A, true},      // ATRAC3plus
     {{}, "cellAtracXdec", 0x076B33AB, true},      // ATRAC3plus, 2 channels
     {{}, "cellAtracXdec", 0x1D210EAA, true},      // ATRAC3plus, 6 channels
     {{}, "cellAtracXdec", 0xE9A86E54, true},      // ATRAC3plus, 8 channels
+#endif
     {{}, "cellMP3dec", 0x84276A23, true},         // MP3
     {{}, "cellAtrac3dec", 0x60487D65, true},      // ATRAC3
     {{}, "cellM2BCdec", 0x300AFE4D, true},        // MPEG-1/2 layer II
@@ -203,12 +206,25 @@ private:
     u32 ops_;
 };
 
+// pspocket's own core for a codec type, or none.
+std::unique_ptr<AdecCore> own_core(s32 type)
+{
+    if (is_lpcm(type)) return make_lpcm_core();
+    switch (type) {
+    case CELL_ADEC_TYPE_ATRACX:
+    case CELL_ADEC_TYPE_ATRACX_8CH: return make_atracx_core(8);
+    case CELL_ADEC_TYPE_ATRACX_2CH: return make_atracx_core(2);
+    case CELL_ADEC_TYPE_ATRACX_6CH: return make_atracx_core(6);
+    default: return nullptr;
+    }
+}
+
 // The core for a codec type: pspocket's, else the core module's table the loader linked; none (logged) when no
 // firmware module gives it.
 std::unique_ptr<AdecCore> core_for(s32 type, u32* ops_out = nullptr)
 {
     if (ops_out) *ops_out = 0;
-    if (is_lpcm(type)) return make_lpcm_core();
+    if (std::unique_ptr<AdecCore> own = own_core(type)) return own;
     const CoreOps& c = kCoreOps[static_cast<usize>(type)];
     const u32 ops = c.library.empty() ? 0 : HleProcess::current()->imported(c.library, c.nid);
     if (!ops) {
@@ -225,7 +241,7 @@ std::unique_ptr<AdecCore> core_for(s32 type, u32* ops_out = nullptr)
 std::unique_ptr<AdecCore> core_of(u8* base, u32 h)
 {
     const s32 type = static_cast<s32>(ps_read32(base, h + ctx_off::type));
-    if (is_lpcm(type)) return make_lpcm_core();
+    if (std::unique_ptr<AdecCore> own = own_core(type)) return own;
     return std::make_unique<GuestCore>(ps_read32(base, h + ctx_off::core_ops));
 }
 
@@ -897,6 +913,7 @@ void register_cellAdec(Registry& r)
     using adec::_pspocket_adec_notify_error;
     using adec::_pspocket_adec_notify_pcm_out;
     using adec::_pspocket_adec_notify_seq_done;
+    using adec::_pspocket_atracx_dec_thread;
     using adec::_pspocket_lpcm_dec_thread;
     r.add("cellAdec", {
         PS_HLE_FUNC(0x7E4A4A49, cellAdecQueryAttr),
@@ -914,6 +931,7 @@ void register_cellAdec(Registry& r)
         PS_HLE_INTERNAL(adec::NID_notify_error, _pspocket_adec_notify_error),
         PS_HLE_INTERNAL(adec::NID_notify_seq_done, _pspocket_adec_notify_seq_done),
         PS_HLE_INTERNAL(adec::NID_lpcm_dec_thread, _pspocket_lpcm_dec_thread),
+        PS_HLE_INTERNAL(adec::NID_atracx_dec_thread, _pspocket_atracx_dec_thread),
     });
     r.add_imports("cellAdec", kImports);
 }

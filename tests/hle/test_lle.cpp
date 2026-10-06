@@ -517,7 +517,7 @@ TEST_CASE("LLE: per game, a module runs as it is only when the host lacks what t
 }
 
 // D-197: what the host's cellAdec imports from the firmware's codec cores is chosen as the game's imports are, and
-// linked for the host's code: a core module exporting cellAtracXdec's operation table (a synthetic PRX whose library,
+// linked for the host's code: a core module exporting cellMP3dec's operation table (a synthetic PRX whose library,
 // variable and imported variable are renamed).
 TEST_CASE("LLE: the host's own imports (cellAdec's codec cores) chosen with the game's and linked for the host",
     "[hle][lle]")
@@ -528,13 +528,13 @@ TEST_CASE("LLE: the host's own imports (cellAdec's codec cores) chosen with the 
     test::PrxOptions o;
     o.variables = true;
     const auto x = test::build_ppu_prx(o);
-    constexpr u32 kAtracXOps = 0x4944AF9A;
-    std::vector<u8> core = prx_exporting(x, "cellAtracXdec", 0x12340001);
+    constexpr u32 kMp3Ops = 0x84276A23;
+    std::vector<u8> core = prx_exporting(x, "cellMP3dec", 0x12340001);
     std::fill(core.begin() + 0x320, core.begin() + 0x330, u8{0});
-    std::memcpy(core.data() + 0x320, "cellAtracXdec", 13); // its imported variable: its own
-    ps_st32(core.data() + 0x40C, kAtracXOps);              // the variable it exports
-    ps_st32(core.data() + 0x418, kAtracXOps);              // the variable it imports
-    write(external / "libatxdec.sprx", debug_self(core));
+    std::memcpy(core.data() + 0x320, "cellMP3dec", 10); // its imported variable: its own
+    ps_st32(core.data() + 0x40C, kMp3Ops);              // the variable it exports
+    ps_st32(core.data() + 0x418, kMp3Ops);              // the variable it imports
+    write(external / "libmp3dec.sprx", debug_self(core));
     const auto bound = [](u32) { return true; };
     const std::vector<Needs> game = {Needs{"cellAdec", {recomp::nid_of("cellAdecQueryAttr")}, {}}};
     for (int pass = 0; pass < 2; pass++) { // the second from the cached index
@@ -545,14 +545,14 @@ TEST_CASE("LLE: the host's own imports (cellAdec's codec cores) chosen with the 
         lle.decide({Needs{"cellGcmSys", {recomp::nid_of("cellGcmGetConfiguration")}, {}}}, bound);
         CHECK(lle.chosen_files().empty()); // no cellAdec, no core
         lle.decide(game, bound);
-        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libatxdec.sprx"});
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libmp3dec.sprx"});
         lle.link_host_imports(game, *f.hle);
         REQUIRE(lle.loaded().size() == 1);
-        const auto exported = lle.loaded()[0]->variables.find({"cellAtracXdec", kAtracXOps});
+        const auto exported = lle.loaded()[0]->variables.find({"cellMP3dec", kMp3Ops});
         REQUIRE(exported != lle.loaded()[0]->variables.end());
-        CHECK(f.hle->imported("cellAtracXdec", kAtracXOps) == exported->second);
+        CHECK(f.hle->imported("cellMP3dec", kMp3Ops) == exported->second);
         CHECK(ps_read32(f.base(), exported->second) == test::kPrxVariableValue);
-        CHECK(f.hle->imported("cellMP3dec", 0x84276A23) == 0); // no module exports it
+        CHECK(f.hle->imported("cellM2BCdec", 0x300AFE4D) == 0); // no module exports it
         CHECK(lle.take_starts().size() == 1);                   // the core starts before the game
     }
     fs::remove_all(root);
