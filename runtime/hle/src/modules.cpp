@@ -36,6 +36,7 @@ void register_cellMusic(Registry& r);
 void register_media_export(Registry& r);
 void register_cellSysutilAvc2(Registry& r);
 void register_cellImeJp(Registry& r);
+void register_cellRec(Registry& r);
 void register_sceNpTrophy(Registry& r);
 void register_sysPrxForUser(Registry& r);
 void register_sysPrxForUser_libc(Registry& r);
@@ -80,6 +81,7 @@ void register_all_modules(Registry& r)
     register_media_export(r);
     register_cellSysutilAvc2(r);
     register_cellImeJp(r);
+    register_cellRec(r);
     register_sceNpTrophy(r);
     register_sysPrxForUser(r);
     register_sysPrxForUser_libc(r);

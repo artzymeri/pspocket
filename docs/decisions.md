@@ -4055,6 +4055,30 @@ there.
 Tests: tests/hle/test_imejp.cpp (open and close, typing, editing, the focus through extend, shorten and clause moves,
 the candidate list, confirming, the 127-character limit, reset).
 
+## D-189 · 2026-10-06 · cellRec, cellSubDisplay and libfs_utility_init: the last always-native gaps
+
+With these, every function RPCS3 implements in the libraries pspocket always serves itself is there (D-175's list:
+liblv2*, libsysutil*, libfs_utility*, libaudio, libio, libnet, libnetctl, libcamera, libmic, libgem, libusbd and the
+rest). Three are left out on purpose: cellMicStopEx (RPCS3's "unexpected function", fatal there), cellSysmodule's
+0x59521326 (it decrypts with a key taken from RPCS3, D-184) and nothing else: sceNpMatchingInt's OLD_ functions are
+registered under their real names (D-185).
+
+- **cellRec** (game video recording, 7 functions). RPCS3 records through FFmpeg's encoders; pspocket's FFmpeg has
+  decoders only (D-181). So cellRecStart answers through the callback with CELL_REC_STATUS_ERR and
+  CELL_REC_ERROR_FILE_OPEN, RPCS3's answer when its encoder fails to start, and the recorder stays stopped.
+  Everything else is RPCS3's: cellRecOpen's checks in its order (formats and their pairings, every option, the path on
+  /dev_hdd0 or /dev_hdd1, the container), cellRecQueryMemSize's sizes, the input buffers a game may fill (allocated
+  from the main area, freed at close), the OPEN and CLOSE events, cellRecGetInfo (the input frame's size for the
+  format on a 720p 16:9 output), cellRecSetInfo's movie and scene metadata, and the close's FILE_NO_DATA when the
+  scene ends past what was recorded. Difference: the buffers are allocated after the checks, so a refused open
+  leaves none (RPCS3 keeps them).
+- **cellSubDisplay** (a PSP or PS Vita as a second screen, 11 functions). As RPCS3: init checks the parameters, keeps
+  the handler and answers CELL_SUBDISPLAY_ERROR_ZERO_REGISTERED, nothing ever starts (NOT_INITIALIZED), the required
+  memory is 8 or 10 MB by version, and version 3's touch information is empty.
+- **fs_utility_init_6B5896B0**: two partitions, as RPCS3.
+
+Tests: tests/hle/test_rec.cpp.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

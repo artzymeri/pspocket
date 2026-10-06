@@ -888,6 +888,20 @@ private:
     std::unique_ptr<recomp::NpdFile> npd_;
 };
 
+// RPCS3 libfs_utility_init.cpp fs_utility_init_6B5896B0(u64* dest): the number of partitions, 2. The library's other
+// functions are RPCS3's stubs (rpcs3_stubs.inc).
+s32 fs_utility_init_6B5896B0(PPUContext& ctx, u32 dest)
+{
+    if (!dest || !guest_readable(thread_of(ctx), dest, 8)) {
+        if (dest) log_call_site(ctx, guest_base(ctx), "fs_utility_init_6B5896B0: dest is not guest memory");
+        PS_LOG_WARN(kChan, "fs_utility_init_6B5896B0({:#x}): CELL_EFAULT", dest);
+        return lv2::err(lv2::CELL_EFAULT);
+    }
+    ps_write64(guest_base(ctx), dest, 2);
+    PS_LOG_INFO(kChan, "fs_utility_init_6B5896B0({:#x}): 2 partitions", dest);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void install_npd_opener(lv2::Kernel& kernel)
@@ -963,6 +977,9 @@ void register_sys_fs(Registry& r)
         PS_HLE_FUNC(0x866F6AEC, cellFsStReadWaitCallback),
         PS_HLE_FUNC(0x4CEF342E, cellFsAioWrite),
         PS_HLE_FUNC(0x6D3BB15B, cellFsSdataOpenByFd),
+    });
+    r.add("fs_utility_init", {
+        PS_HLE_FUNC(0x6B5896B0, fs_utility_init_6B5896B0),
     });
 }
 

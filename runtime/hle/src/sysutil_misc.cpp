@@ -675,6 +675,162 @@ s32 cellSysutilAvcExtLoadAsyncEx(PPUContext& ctx, u32 func, u32 userdata, u32 co
     return cellSysutilAvcLoadAsync(ctx, func, userdata, container, media, video_quality, voice_quality, request_id);
 }
 
+// ------------------------------------------------------------------------------------- cellSubDisplay
+
+// RPCS3 cellSubDisplay.cpp: a PSP or PS Vita as a second screen (remote play). Its init keeps the parameters and
+// handler, then answers CELL_SUBDISPLAY_ERROR_ZERO_REGISTERED (no device registered) without starting anything, so
+// every call that needs it started answers NOT_INITIALIZED, as in RPCS3; GetRequiredMemory gives the container size
+// for the parameters' version; touch information, for version 3, is empty.
+constexpr std::string_view kSubDisplayChan = "cellSubDisplay";
+enum : u32 {
+    CELL_SUBDISPLAY_ERROR_INVALID_VALUE = 0x80029854,
+    CELL_SUBDISPLAY_ERROR_NOT_INITIALIZED = 0x80029855,
+    CELL_SUBDISPLAY_ERROR_NOT_SUPPORTED = 0x80029856,
+    CELL_SUBDISPLAY_ERROR_SET_SAMPLE = 0x80029860,
+    CELL_SUBDISPLAY_ERROR_ZERO_REGISTERED = 0x80029813,
+};
+// CellSubDisplayParam (48 bytes): be s32 version, mode, nGroup, nPeer; video: format at 16, width, height, pitch,
+// aspectRatio, videoMode; audio: ch at 40, audioMode at 44. CellSubDisplayTouchInfo: 6 bytes.
+constexpr u32 kSubDisplayParamSize = 48, kTouchInfoSize = 6, kMaxTouchInfo = 6;
+
+enum class SubDisplayStatus : u8 { Uninitialized, Stopped, Started };
+
+struct SubDisplayState {
+    std::mutex mutex;
+    SubDisplayStatus status = SubDisplayStatus::Uninitialized; // RPCS3's: init never changes it
+    s32 version = 0;
+    u32 handler = 0, userdata = 0;
+};
+
+// RPCS3 check_param.
+s32 subdisplay_check_param(PPUContext& ctx, u32 param)
+{
+    if (!param) return error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE);
+    if (!guest_readable(thread_of(ctx), param, kSubDisplayParamSize)) {
+        log_call_site(ctx, guest_base(ctx), std::format("cellSubDisplay: param {:#x} is not guest memory", param));
+        return error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE);
+    }
+    u8* b = guest_base(ctx);
+    const auto at = [&](u32 off) { return static_cast<s32>(ps_read32(b, param + off)); };
+    const s32 version = at(0);
+    if (version < 1 || version > 3 || at(4) != 1 || at(8) != 1 || at(12) != 1 || at(40) != 2 || at(44) < 0 ||
+        at(44) > 1) {
+        return error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE);
+    }
+    switch (at(16)) {
+    case 1: // A8R8G8B8
+    case 2: // R8G8B8A8
+        if (version == 3 || at(20) != 480 || at(24) != 272 || (at(28) != 1920 && at(28) != 2048) || at(32) < 0 ||
+            at(32) > 1 || at(36) < 0 || at(36) > 1) {
+            return error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE);
+        }
+        return lv2::CELL_OK;
+    case 3: // YUV420
+        if (version != 3 || at(20) != 864 || at(24) != 480 || at(28) != 864 || at(32) != 0 || at(36) != 0) {
+            return error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE);
+        }
+        return lv2::CELL_OK;
+    default: return error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE);
+    }
+}
+
+s32 cellSubDisplayInit(PPUContext& ctx, u32 param, u32 handler, u32 userdata, u32 container)
+{
+    const std::string call =
+        std::format("cellSubDisplayInit({:#x}, {:#x}, {:#x}, {:#x})", param, handler, userdata, container);
+    SubDisplayState& s = state<SubDisplayState>();
+    std::lock_guard lock(s.mutex);
+    if (s.handler) return logged(kSubDisplayChan, error(CELL_SUBDISPLAY_ERROR_NOT_INITIALIZED), call);
+    if (const s32 r = subdisplay_check_param(ctx, param)) return logged(kSubDisplayChan, r, call);
+    if (!handler) return logged(kSubDisplayChan, error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE), call);
+    s.version = static_cast<s32>(ps_read32(guest_base(ctx), param));
+    s.handler = handler;
+    s.userdata = userdata;
+    return logged(kSubDisplayChan, error(CELL_SUBDISPLAY_ERROR_ZERO_REGISTERED), call + ": no device registered");
+}
+
+s32 cellSubDisplayEnd(PPUContext&)
+{
+    SubDisplayState& s = state<SubDisplayState>();
+    std::lock_guard lock(s.mutex);
+    if (!s.handler) return logged(kSubDisplayChan, error(CELL_SUBDISPLAY_ERROR_NOT_INITIALIZED), "cellSubDisplayEnd()");
+    s.version = 0;
+    s.handler = s.userdata = 0;
+    s.status = SubDisplayStatus::Uninitialized;
+    return logged(kSubDisplayChan, lv2::CELL_OK, "cellSubDisplayEnd()");
+}
+
+// RPCS3 cellSubDisplayGetRequiredMemory: 8 MB for version 1, 10 MB for 2 and 3, returned as a value.
+s32 cellSubDisplayGetRequiredMemory(PPUContext& ctx, u32 param)
+{
+    const std::string call = std::format("cellSubDisplayGetRequiredMemory({:#x})", param);
+    if (const s32 r = subdisplay_check_param(ctx, param)) return logged(kSubDisplayChan, r, call);
+    const s32 version = static_cast<s32>(ps_read32(guest_base(ctx), param));
+    return logged(kSubDisplayChan, version == 1 ? 8 * 1024 * 1024 : 10 * 1024 * 1024, call);
+}
+
+// The calls that need the sub display set up: never, as init leaves it uninitialized (RPCS3).
+s32 subdisplay_status(const std::string& call)
+{
+    SubDisplayState& s = state<SubDisplayState>();
+    std::lock_guard lock(s.mutex);
+    return logged(kSubDisplayChan,
+        s.status == SubDisplayStatus::Uninitialized ? error(CELL_SUBDISPLAY_ERROR_NOT_INITIALIZED) : lv2::CELL_OK, call);
+}
+
+s32 cellSubDisplayStart(PPUContext&) { return subdisplay_status("cellSubDisplayStart()"); }
+s32 cellSubDisplayStop(PPUContext&) { return subdisplay_status("cellSubDisplayStop()"); }
+
+s32 cellSubDisplayGetVideoBuffer(PPUContext&, s32 group, u32 buf, u32 size)
+{
+    return subdisplay_status(std::format("cellSubDisplayGetVideoBuffer({}, {:#x}, {:#x})", group, buf, size));
+}
+
+s32 cellSubDisplayAudioOutBlocking(PPUContext&, s32 group, u32 data, s32 samples)
+{
+    return subdisplay_status(std::format("cellSubDisplayAudioOutBlocking({}, {:#x}, {})", group, data, samples));
+}
+
+s32 cellSubDisplayAudioOutNonBlocking(PPUContext&, s32 group, u32 data, s32 samples)
+{
+    return subdisplay_status(std::format("cellSubDisplayAudioOutNonBlocking({}, {:#x}, {})", group, data, samples));
+}
+
+s32 cellSubDisplayGetPeerNum(PPUContext&, s32 group)
+{
+    return subdisplay_status(std::format("cellSubDisplayGetPeerNum({})", group));
+}
+
+s32 cellSubDisplayGetPeerList(PPUContext&, s32 group, u32 info, u32 num)
+{
+    return subdisplay_status(std::format("cellSubDisplayGetPeerList({}, {:#x}, {:#x})", group, info, num));
+}
+
+// RPCS3 cellSubDisplayGetTouchInfo(groupId, pTouchInfo, pNumTouchInfo): version 3 only; at most six, all empty.
+s32 cellSubDisplayGetTouchInfo(PPUContext& ctx, s32 group, u32 info, u32 num)
+{
+    const std::string call = std::format("cellSubDisplayGetTouchInfo({}, {:#x}, {:#x})", group, info, num);
+    if (group != 0 || !num || !info || !guest_readable(thread_of(ctx), num, 4)) {
+        return logged(kSubDisplayChan, error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE), call);
+    }
+    SubDisplayState& s = state<SubDisplayState>();
+    std::lock_guard lock(s.mutex);
+    if (s.version != 3) return logged(kSubDisplayChan, error(CELL_SUBDISPLAY_ERROR_NOT_SUPPORTED), call);
+    u8* b = guest_base(ctx);
+    s32 n = static_cast<s32>(ps_read32(b, num));
+    if (n > static_cast<s32>(kMaxTouchInfo)) {
+        n = kMaxTouchInfo;
+        ps_write32(b, num, kMaxTouchInfo);
+    }
+    if (n > 0) {
+        if (!guest_readable(thread_of(ctx), info, kTouchInfoSize * static_cast<u32>(n))) {
+            return logged(kSubDisplayChan, error(CELL_SUBDISPLAY_ERROR_INVALID_VALUE), call);
+        }
+        std::memset(b + info, 0, kTouchInfoSize * static_cast<u32>(n));
+    }
+    return logged(kSubDisplayChan, lv2::CELL_OK, call);
+}
+
 // ------------------------------------------------------------------------------------- small libraries
 
 // cellSysutilMisc: the console's licence area, RPCS3's default (CELL_SYSUTIL_LICENSE_AREA_A).
@@ -978,6 +1134,19 @@ void register_sysutil_misc(Registry& r)
         PS_HLE_FUNC(0xCBE0C10A, cellSysutilAvcExtGetSurfacePointer),
         PS_HLE_FUNC(0xD8685383, cellSysutilAvcExtInitOptionParam),
         PS_HLE_FUNC(0xE8B1C18D, cellSysutilAvcExtSetWindowZorder),
+    });
+    r.add("cellSubDisplay", {
+        PS_HLE_FUNC(0xF9A7E8A5, cellSubDisplayInit),
+        PS_HLE_FUNC(0x551D80A5, cellSubDisplayEnd),
+        PS_HLE_FUNC(0x6595CE22, cellSubDisplayGetRequiredMemory),
+        PS_HLE_FUNC(0xA5BCCB47, cellSubDisplayStart),
+        PS_HLE_FUNC(0x6D85DDB3, cellSubDisplayStop),
+        PS_HLE_FUNC(0x938AC642, cellSubDisplayGetVideoBuffer),
+        PS_HLE_FUNC(0xAEE1E0C2, cellSubDisplayAudioOutBlocking),
+        PS_HLE_FUNC(0x5468D6B0, cellSubDisplayAudioOutNonBlocking),
+        PS_HLE_FUNC(0x8A264D71, cellSubDisplayGetPeerNum),
+        PS_HLE_FUNC(0xE2485F79, cellSubDisplayGetPeerList),
+        PS_HLE_FUNC(0x415ED9DC, cellSubDisplayGetTouchInfo),
     });
     r.add("cellGameExec", {
         PS_HLE_FUNC(0xF6ACD0BC, cellGameGetBootGameInfo),

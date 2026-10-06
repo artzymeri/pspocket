@@ -37,6 +37,7 @@ add_library(pspocket_hle STATIC
     src/media_export.cpp
     src/cellSysutilAvc2.cpp
     src/cellImeJp.cpp
+    src/cellRec.cpp
     src/sceNpTrophy.cpp
     src/spu_programs.cpp
     src/spurs_custom.cpp
