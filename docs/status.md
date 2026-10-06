@@ -121,11 +121,15 @@ firmware's module from the user's installed system software and sends it the sam
 calls the same (D-193). cellDmux, the demultiplexer that splits a movie into its video and audio: a demuxer's whole
 life on a synthetic stream, every answer, callback and access unit the same, down to its address (D-194). The
 comparison found that Sony's own libdmux could not run here (two SPURS queue functions were missing, now added) and
-that RPCS3 asks for 0x50 bytes more memory than Sony's libdmux (pspocket follows Sony's).
+that RPCS3 asks for 0x50 bytes more memory than Sony's libdmux (pspocket follows Sony's). cellVdec, the video
+decoder, on FFmpeg (D-195, D-196, run 103): Sony's libvdec now runs in the test too (it needed libsre's overlay tables
+and SPURS task exit callbacks, now pspocket's), and pspocket's matches it: Sony's sizes for every codec and level,
+pictures one access unit late as Sony's, items and H.264 information in Sony's places read from the stream, frame
+buffers in Sony's layout, pictures exact (RGB within one step). VC-1, DivX 3.11 and MVC are not decoded yet.
 
-Next: cellVdec and cellAdec on FFmpeg (D-181), then the image decoders, each measured against Sony's translated
-version the same way; then docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox),
-and the phone's stage 6 with games nobody has analysed (each run's log names what is still missing).
+Next: cellAdec and ATRAC on FFmpeg (D-181), then the image decoders, each measured against Sony's the same way; then
+docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
+with games nobody has analysed (each run's log names what is still missing).
 
 ## Building and running GTA V on the Mac
 

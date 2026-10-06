@@ -4305,6 +4305,45 @@ Next (part 2): pspocket's cellVdec on FFmpeg to that description, compared with 
 Tests: tests/hle/test_ovis.cpp, tests/hle/test_spurs_run.cpp (an exit callback; the exit code container and its
 waiting task), tests/hle/test_vdec.cpp (the H.264 writer checked with FFmpeg; the probe of Sony's libvdec, hidden).
 
+## D-196 · 2026-10-06 · cellVdec is pspocket's own, on FFmpeg, the same as Sony's libvdec where measured
+
+Part 2 of D-195. pspocket's libvdec (runtime/hle/src/cellVdec.cpp) decodes H.264 (and its JVT form), MPEG-2 and
+MPEG-4 part 2 (DivX) with FFmpeg as RPCS3's does, and shows the game what Sony's libvdec showed in D-195's runs:
+
+- **Sizes:** Sony's for every codec and level (440 queries compared, all the same): H.264 from libavcdec's formula
+  (with the game's frame size, buffer count and deblocking choice), the others Sony's answers per level; the version
+  0x4920000. The codec specific information of codecs other than H.264 is logged and Sony's size without it given.
+- **Handle, items, information:** the handle is the decoder's memory; picture items at +0xDC (0x90 apart) and the
+  H.264 information at +0x1B9C (0x244 apart), rings of 16 (Sony's ring length is not known yet); the information read
+  from the stream's SPS, PPS and NAL units (VUI, colour, timing, frame rate code, IDR, entropy coding, the NAL units
+  present) and, past RPCS3's structure, the picture order count type, the VUI timing, the picture's number and size.
+- **Timing:** a picture is announced one access unit late (PICOUT after the next AUDONE), the last ones when the
+  sequence ends, before SEQDONE.
+- **Frame buffers:** an item's start address is the picture in Sony's layout (luma in 16-byte strips with two of
+  repeated edge each side, then chroma rows of 8 Cb and 8 Cr), in frame buffers after the rings (their place and count
+  are pspocket's: as many of the picture's size as fit, at most 16).
+- **Pictures:** YUV 4:2:0 and UYVY exactly Sony's; RGBA and ARGB with the colour matrix asked for (BT.601 or BT.709,
+  limited range, exact coefficients, truncated) and the alpha: 9.1% of the colour values one step off Sony's, none
+  more. UYVY: Sony writes 384 more zero bytes after a 64x64 picture; pspocket does not.
+- **Close:** a closed decoder stays known, so later calls on it are SEQ, as Sony's (its context stays in its memory).
+  Sony's libvdec does not refuse less memory than it asks for (one byte less opened); pspocket refuses only memory too
+  small for its rings and logs the rest.
+- **Only what is known is pspocket's.** The functions registered are those RPCS3 implements and Sony's runs confirm
+  (QueryAttr, QueryAttrEx, Open, OpenEx, Close, StartSeq, EndSeq, DecodeAu, GetPicture, GetPictureExt, GetPicItem,
+  SetFrameRate). A game that imports another (OpenExt, DecodeAuEx2, StartSeqExt, GetInputStatus, GetPicItemEx,
+  GetPicItemExt, SetFrameRateExt, SetPts) or the variable _cell_vdec_prx_ver gets Sony's whole libvdec (D-175), which
+  runs since D-195.
+- **Not yet:** VC-1, DivX 3.11 and MVC are not decoded (no FFmpeg decoder in pspocket's build: open fails, logged);
+  the MPEG-2 and MPEG-4 paths decode with FFmpeg but are not compared with Sony's yet (no synthetic MPEG-2 writer),
+  and their information blocks are RPCS3's.
+- **Measured (rule 8):** the comparison (test_vdec.cpp): every answer, item, information block, frame buffer and
+  picture the same, the RGB values as above. Speed: on the test's six 64x64 pictures both are quick (about 0.2 s and
+  0.3 s past a fixed 1 s wait; Sony's SPU decoder interpreted); a real movie's speed waits for a game that plays one.
+- FFmpeg is opened with one thread, so a picture is out of FFmpeg as soon as decoded, and Sony's lag is added on top.
+
+Tests: tests/hle/test_vdec.cpp (pspocket's decoder over synthetic H.264; the comparison with Sony's when the firmware
+is there; two hidden probes that dump Sony's output for working out the formats).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -136,7 +136,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   demuxer's lv2 thread; the SPU side's host thread sleeps 1.5 ms after each new stream (RPCS3's delay for White Knight
   Chronicles II). The raw elementary stream core (g_cell_dmux_core_ops_raw_es, which other firmware modules use) is
   not pspocket's: only libdmux's PAMF core is.
-- **State:** open; cellVdec and cellAdec next.
+- **cellVdec (D-196):** Sony's item and information rings are 16 long in pspocket (Sony's length not known: decode
+  more than 16 pictures in the probe to find it); the frame buffers' place and count are pspocket's; Sony's RGB rounding
+  (9% of values one step off) could come from libvdec's conversion code; the H.264 information's fields past RPCS3's
+  structure are inferred from two streams (try a stream with picture order count type 0, cropping, no VUI); VC-1,
+  DivX 3.11 and MVC need FFmpeg decoders (vc1, msmpeg4v3: LGPL) and a comparison; MPEG-2 needs a synthetic writer to be
+  compared. Speed on a real movie: FFmpeg on one thread, then VideoToolbox for H.264.
+- **State:** open; cellAdec next.
 
 ## The gate (D-149)
 
