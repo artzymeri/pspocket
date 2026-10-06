@@ -121,7 +121,8 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "pspocket-firmware: %s\n", r.error().message.c_str());
         return 1;
     }
-    std::printf("firmware %s: %zu packages, %zu files, %.1f MB into %s\n", r->version.c_str(), r->packages, r->files,
-        static_cast<double>(r->bytes) / 1048576.0, argv[2]);
+    std::printf("firmware %s: %zu packages, %zu files, %.1f MB into %s (%zu files, %.1f MB of no use to games left out)\n",
+        r->version.c_str(), r->packages, r->files, static_cast<double>(r->bytes) / 1048576.0, argv[2], r->files_skipped,
+        static_cast<double>(r->bytes_skipped) / 1048576.0);
     return 0;
 }

@@ -47,6 +47,7 @@
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
+#include "pspocket/recomp/firmware.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/platform/audio_output.hpp"
 #include "pspocket/platform/ios.h"
@@ -392,6 +393,9 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         return fail(error, error_size, std::string("cannot mount ") + o->hdd0_dir + " as /dev_hdd0");
     }
     if (o->flash_dir && std::filesystem::is_directory(o->flash_dir, ec)) {
+        // An install from before D-177 also holds the XMB, the Blu-ray player and the emulators: 150 MB no game reads.
+        if (const u64 freed = recomp::prune_firmware(o->flash_dir))
+            PS_LOG_INFO(kChan, "/dev_flash: {:.0f} MB of no use to games removed", static_cast<double>(freed) / 1048576.0);
         if (!s->kernel->vfs_mount("/dev_flash", o->flash_dir, true)) {
             return fail(error, error_size, std::string("cannot mount ") + o->flash_dir + " as /dev_flash");
         }

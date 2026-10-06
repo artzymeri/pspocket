@@ -10,8 +10,8 @@
 // Which modules run as they are is decided per game, per module file, as a PS3 links a game to the system's libraries
 // (D-175, decide()): the host's module when it implements every function the game imports from it; else the firmware's
 // own module, its imports linked to other firmware modules chosen with it or to the host, as RPCS3 links a module
-// (what nothing implements fails when called, logged), unless it needs a variable no module exports; else the host's,
-// with what it lacks listed. Some modules
+// (what nothing implements fails when called, a variable no module exports stays unlinked, both logged). Modules in
+// sys/internal (codec cores, services) are indexed too, keyed "internal/NAME" (D-177). Some modules
 // always stay on the host, as pspocket must own what they do (the process runtime, module loading, SPURS (D-037), the
 // RSX, audio, input, files, network, sysutil and its dialogs, devices). Before decide() (tests, runtime loads with no
 // decision), a module file goes LLE only when the host implements none of its libraries (D-157).

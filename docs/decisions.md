@@ -3132,6 +3132,43 @@ The order of work:
    measured against the translated original.
 4. The parts that are ours, filled in from what games call.
 
+## D-177 · 2026-10-06 · Firmware modules linked as a PS3 links them; the phone keeps only what games use
+
+The first step of D-176's plan.
+
+- **sys/internal is indexed too.**
+  - cellAdec's codec cores partly live there: DTS-HD, MPEG-2 AAC, AAC 2ch, MP3 surround and TrueHD, among 37
+    modules.
+  - LleModules keys a module by its file name for sys/external and "internal/NAME" for sys/internal. libvpost.sprx is
+    in both, as different modules. sys/external's exports win when both export a library.
+  - The index (lle-index.txt) is format 3 and is rebuilt when either folder changes.
+  - Loading a module by its path (sys_prx_load_module, D-159) accepts both folders.
+  - The always-native list also covers sys/internal's audio and voice services (sys_audio, sysvoice_modules,
+    libvoice_internal) and the file utilities (libfs_utility*).
+- **An imported variable no module exports no longer refuses a module.**
+  - lv2 leaves such an import unlinked on a PS3. libadec imports the WMA Pro, WMA Lossless, DTS and DTS-HD core
+    decoders, which are in no retail firmware, and still decodes every other format.
+  - The variable is listed in the module's gaps (with the functions and syscalls nothing implements) and stays
+    unlinked.
+  - D-175 refused libadec over it, which left cellAdec on the host, which has none of it. Only a module missing from
+    the index is refused now.
+- **The phone keeps only what games use.**
+  - install_firmware writes sys/, data/font and data/cert (recomp::firmware_path_used). It leaves out the XMB, the
+    Blu-ray player, the PS1/PS2/PSP emulators and the keyboard dictionaries: 150 of 4.92's 188 MB. FirmwareInstall
+    counts what it left out.
+  - An install from before this is pruned once when a game starts on the phone (recomp::prune_firmware, game.mm).
+  - The Mac's copy in inventory/ is left whole for analysis (pspocket-boot does not prune).
+
+Checked against the user's 4.92 firmware: 177 modules indexed, 198 libraries. Assassin's Creed still takes all of its
+140 imports from the host (no firmware module chosen). Its ATRAC audio comes from sys/external/flashATRAC.pic, an SPU
+program its audio library loads itself, as GTA V loads flashMP3.pic.
+
+Tests:
+
+- tests/common/test_firmware.cpp: install skips vsh; firmware_path_used; prune once.
+- tests/hle/test_lle.cpp: an unlinked variable is a gap; a sys/internal core serves the sys/external module that
+  needs it; both run twice, the second time from the cached index.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

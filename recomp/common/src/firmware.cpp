@@ -155,10 +155,15 @@ Result<FirmwareInstall> install_firmware(const std::string& pup_path, const std:
             if (name.empty() || name.find("..") != std::string::npos) continue;
             const fs::path target = fs::path(dev_flash_dir) / name;
             if (f.type == '5') {
-                fs::create_directories(target, ec);
+                if (firmware_path_used(name)) fs::create_directories(target, ec);
                 continue;
             }
             if (f.type != '0' && f.type != 0) continue;
+            if (!firmware_path_used(name)) {
+                result.files_skipped++;
+                result.bytes_skipped += f.size;
+                continue;
+            }
             fs::create_directories(target.parent_path(), ec);
             std::ofstream out(target, std::ios::binary | std::ios::trunc);
             out.write(reinterpret_cast<const char*>(inner.data() + f.offset), static_cast<std::streamsize>(f.size));
@@ -170,6 +175,25 @@ Result<FirmwareInstall> install_firmware(const std::string& pup_path, const std:
     }
     if (progress) progress(1.0, "done");
     return result;
+}
+
+bool firmware_path_used(std::string_view path)
+{
+    return path.starts_with("sys/") || path.starts_with("data/font/") || path.starts_with("data/cert/");
+}
+
+u64 prune_firmware(const std::string& dev_flash_dir)
+{
+    u64 freed = 0;
+    std::error_code ec;
+    for (const char* sub : {"vsh", "bdplayer", "ps1emu", "ps2emu", "pspemu", "data/dic"}) {
+        const fs::path dir = fs::path(dev_flash_dir) / sub;
+        if (!fs::exists(dir, ec)) continue;
+        for (const auto& e : fs::recursive_directory_iterator(dir, ec))
+            if (e.is_regular_file(ec)) freed += e.file_size(ec);
+        fs::remove_all(dir, ec);
+    }
+    return freed;
 }
 
 } // namespace pspocket::recomp

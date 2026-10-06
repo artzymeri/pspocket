@@ -166,6 +166,7 @@ TEST_CASE("firmware: /dev_flash installs from a PUP's dev_flash packages (D-156)
     key.present = true;
     const std::vector<u8> files = ustar({{"dev_flash/sys", '5', ""},
         {"dev_flash/sys/hello.txt", '0', "hello from a synthetic update"},
+        {"dev_flash/data/font/F.TTF", '0', "a font"},
         {"dev_flash/vsh/data.bin", '0', std::string(2000, 'x')},
         {"not_dev_flash/skip.txt", '0', "outside /dev_flash"}});
     const std::vector<u8> package = sce_package(key, files);
@@ -187,7 +188,11 @@ TEST_CASE("firmware: /dev_flash installs from a PUP's dev_flash packages (D-156)
     CHECK(r->files == 2);
     CHECK(calls >= 2);
     CHECK(read(dir / "dev_flash/sys/hello.txt") == "hello from a synthetic update");
-    CHECK(read(dir / "dev_flash/vsh/data.bin") == std::string(2000, 'x'));
+    CHECK(read(dir / "dev_flash/data/font/F.TTF") == "a font");
+    // The XMB and the rest no game reads stay out (D-177).
+    CHECK(r->files_skipped == 1);
+    CHECK(r->bytes_skipped == 2000);
+    CHECK_FALSE(fs::exists(dir / "dev_flash/vsh"));
     CHECK_FALSE(fs::exists(dir / "dev_flash/skip.txt"));
     CHECK_FALSE(fs::exists(dir / "dev_flash/not_dev_flash"));
 
@@ -206,3 +211,30 @@ TEST_CASE("firmware: /dev_flash installs from a PUP's dev_flash packages (D-156)
     fs::remove_all(dir);
 }
 #endif
+
+TEST_CASE("firmware: what a game can use, and an older install pruned to it (D-177)")
+{
+    CHECK(firmware_path_used("sys/external/libfs.sprx"));
+    CHECK(firmware_path_used("sys/internal/libtrhddec.sprx"));
+    CHECK(firmware_path_used("data/font/SCE-PS3-RD-R-LATIN.TTF"));
+    CHECK(firmware_path_used("data/cert/CA01.cer"));
+    CHECK_FALSE(firmware_path_used("data/dic/Zi8DatDE.z8d"));
+    CHECK_FALSE(firmware_path_used("vsh/module/vsh.self"));
+    CHECK_FALSE(firmware_path_used("bdplayer/libbdplayer.sprx"));
+    CHECK_FALSE(firmware_path_used("ps2emu/ps2_emu.self"));
+
+    const fs::path dir = fs::temp_directory_path() / std::format("pspocket-firmware-prune-{}", getpid());
+    fs::remove_all(dir);
+    for (const char* f : {"sys/external/a.sprx", "data/font/F.TTF", "data/dic/d.z8d", "vsh/x.rco", "pspemu/y.bin"}) {
+        fs::create_directories((dir / f).parent_path());
+        std::ofstream(dir / f) << std::string(100, 'z');
+    }
+    CHECK(prune_firmware(dir.string()) == 300);
+    CHECK(fs::exists(dir / "sys/external/a.sprx"));
+    CHECK(fs::exists(dir / "data/font/F.TTF"));
+    CHECK_FALSE(fs::exists(dir / "data/dic"));
+    CHECK_FALSE(fs::exists(dir / "vsh"));
+    CHECK_FALSE(fs::exists(dir / "pspemu"));
+    CHECK(prune_firmware(dir.string()) == 0); // once
+    fs::remove_all(dir);
+}

@@ -358,6 +358,17 @@ TEST_CASE("LLE: per game, a module runs as it is only when the host lacks what t
     std::fill(novar.begin() + 0x320, novar.begin() + 0x330, u8{0});
     std::memcpy(novar.data() + 0x320, "synthNoVar", 10);
     write(external / "libnovar.sprx", debug_self(novar));
+    // A core in sys/internal exporting a variable only it has, and a module in sys/external that needs it.
+    const auto renamed_import = [&](std::string_view library, u32 nid, const char* imported) {
+        std::vector<u8> m = prx_exporting(x, library, nid);
+        std::fill(m.begin() + 0x320, m.begin() + 0x330, u8{0});
+        std::memcpy(m.data() + 0x320, imported, std::strlen(imported));
+        return m;
+    };
+    fs::create_directories(root / "dev_flash" / "sys" / "internal");
+    write(root / "dev_flash" / "sys" / "internal" / "libcore.sprx",
+        debug_self(renamed_import("synthCore", 0x77777777, "synthCore")));
+    write(external / "libfront.sprx", debug_self(renamed_import("synthFront", 0x88888888, "synthCore")));
     std::vector<u8> orphan = prx_exporting(plain, "synthOrphan", 0x44444444);
     ps_st32(orphan.data() + 0x100 + 0x310, 0x0BADF00Du);
     write(external / "liborphan.sprx", debug_self(orphan));
@@ -393,11 +404,17 @@ TEST_CASE("LLE: per game, a module runs as it is only when the host lacks what t
         CHECK(lle.gaps().at("libsc.sprx").front().find("syscall 700") != std::string::npos);
         REQUIRE(lle.gaps().contains("liborphan.sprx"));
         CHECK(lle.gaps().at("liborphan.sprx").front().find("0x0badf00d") != std::string::npos);
-        // A module whose imported variable no module exports is refused: its libraries stay on the host.
+        // A module whose imported variable no module exports still runs, the variable left unlinked as lv2 leaves it,
+        // and the variable is listed (D-177).
         lle.decide({Needs{"synthNoVarLib", {0x55555555}, {}}}, bound);
-        CHECK(lle.chosen_files().empty());
-        REQUIRE(lle.refused_files().contains("libnovar.sprx"));
-        CHECK(lle.refused_files().at("libnovar.sprx").find("synthNoVar") != std::string::npos);
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libnovar.sprx"});
+        CHECK(lle.refused_files().empty());
+        REQUIRE(lle.gaps().contains("libnovar.sprx"));
+        CHECK(lle.gaps().at("libnovar.sprx").front().find("variable synthNoVar") != std::string::npos);
+        // A codec core in sys/internal serves the module that needs it (D-177).
+        lle.decide({Needs{"synthFront", {0x88888888}, {}}}, bound);
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"internal/libcore.sprx", "libfront.sprx"});
+        CHECK(lle.file_for("synthCore") == "internal/libcore.sprx");
         // A game's imported variable needs the module (the host exports no variables).
         lle.decide({Needs{"synthVarLib", {}, {test::kPrxVariableNid}}}, bound);
         CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libvar.sprx"});

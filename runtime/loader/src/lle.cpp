@@ -91,7 +91,17 @@ std::set<u32> scan_syscalls(const recomp::ElfFile& elf, std::span<const u8> byte
     return out;
 }
 
-constexpr std::string_view kIndexHeader = "pspocket-lle-index 2";
+constexpr std::string_view kIndexHeader = "pspocket-lle-index 3";
+
+// A module's key: its file name for sys/external, "internal/" and the name for sys/internal (codec cores and services
+// other modules load, D-177; libvpost.sprx is in both, as different modules).
+constexpr std::string_view kInternal = "internal/";
+
+fs::path module_path(const fs::path& flash, std::string_view key)
+{
+    return key.starts_with(kInternal) ? flash / "sys" / "internal" / key.substr(kInternal.size())
+                                      : flash / "sys" / "external" / key;
+}
 
 fs::path flash_path(const std::string& dir)
 {
@@ -273,7 +283,10 @@ bool LleModules::index(std::string* error)
     // Kept beside /dev_flash: the modules are decrypted once, not at every boot. Each module file: its libraries, what
     // they export, what it imports and the syscalls its code makes (D-175).
     std::error_code cache_ec;
-    if (const auto cached = fs::last_write_time(cache, cache_ec); !cache_ec && cached >= fs::last_write_time(external, ec)) {
+    const fs::path internal = flash / "sys" / "internal";
+    const auto newest = std::max(fs::last_write_time(external, ec),
+        fs::is_directory(internal, cache_ec) ? fs::last_write_time(internal, cache_ec) : fs::file_time_type::min());
+    if (const auto cached = fs::last_write_time(cache, cache_ec); !cache_ec && cached >= newest) {
         std::ifstream in(cache);
         std::string line;
         if (std::getline(in, line) && line == kIndexHeader) {
@@ -308,11 +321,15 @@ bool LleModules::index(std::string* error)
         files_.clear();
     }
     size_t modules = 0;
-    std::vector<fs::path> files;
-    for (const auto& e : fs::directory_iterator(external, ec))
-        if (e.path().extension() == ".sprx") files.push_back(e.path());
-    std::sort(files.begin(), files.end());
-    for (const fs::path& path : files) {
+    std::vector<std::pair<std::string, fs::path>> files; // key, path: sys/external first, so its exports win
+    for (const auto& [dir, prefix] : {std::pair{external, std::string()}, std::pair{internal, std::string(kInternal)}}) {
+        std::vector<fs::path> found;
+        for (const auto& e : fs::directory_iterator(dir, ec))
+            if (e.path().extension() == ".sprx") found.push_back(e.path());
+        std::sort(found.begin(), found.end());
+        for (const fs::path& f : found) files.emplace_back(prefix + f.filename().string(), f);
+    }
+    for (const auto& [key, path] : files) {
         auto elf_bytes = module_elf(path);
         if (!elf_bytes) continue;
         auto elf = recomp::ElfFile::parse(*elf_bytes);
@@ -320,7 +337,7 @@ bool LleModules::index(std::string* error)
         auto module = recomp::analyze_ppu_module(*elf);
         if (!module) continue;
         modules++;
-        const std::string file = path.filename().string();
+        const std::string& file = key;
         FileInfo& info = files_[file];
         for (const recomp::ExportedLibrary& lib : module->exports) {
             if (lib.name.empty() || lib.management || lib.skipped) continue;
@@ -384,11 +401,14 @@ bool LleModules::chooses(std::string_view library) const
 bool LleModules::always_native(std::string_view file)
 {
     // The process runtime and its debug modules (liblv2*), module loading, SPURS (D-037), the RSX, audio and voice,
-    // input, files, network, sysutil and everything on it (dialogs, save data, game data, NP), devices.
-    if (file.starts_with("liblv2") || file.starts_with("libsysutil")) return true;
+    // input, files, network, sysutil and everything on it (dialogs, save data, game data, NP), devices; in
+    // sys/internal the audio and voice services and the file utilities (D-177).
+    if (file.starts_with(kInternal)) file.remove_prefix(kInternal.size());
+    if (file.starts_with("liblv2") || file.starts_with("libsysutil") || file.starts_with("libfs_utility")) return true;
     static constexpr std::string_view kNative[] = {"libsysmodule.sprx", "libsre.sprx", "libgcm_sys.sprx",
         "libaudio.sprx", "libvoice.sprx", "libio.sprx", "libfs.sprx", "libfs_155.sprx", "libnet.sprx",
-        "libnetctl.sprx", "libcamera.sprx", "libmic.sprx", "libgem.sprx", "libusbd.sprx", "libusbpspcm.sprx"};
+        "libnetctl.sprx", "libcamera.sprx", "libmic.sprx", "libgem.sprx", "libusbd.sprx", "libusbpspcm.sprx",
+        "sys_audio.sprx", "sysvoice_modules.sprx", "libvoice_internal.sprx"};
     return std::find(std::begin(kNative), std::end(kNative), file) != std::end(kNative);
 }
 
@@ -455,9 +475,10 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& i
     candidates.insert(roots.begin(), roots.end());
     // What each candidate needs, as RPCS3 links a module (PPUModule.cpp ppu_load_imports): a function from a candidate,
     // else the host, else a module that can join the candidates; one with none of these links to the host's
-    // unimplemented stub (logged when called) and is listed here, as is a syscall lv2 lacks. A variable must resolve
-    // to a candidate's export (the host exports none): a module that needs one that cannot is refused, which may refuse
-    // others in turn.
+    // unimplemented stub (logged when called) and is listed here, as is a syscall lv2 lacks. A variable comes from a
+    // candidate or a module that can join (the host exports none); one no module exports stays unlinked, as lv2 leaves
+    // it on a PS3 (libadec's DTS and WMA Pro cores are in no retail firmware, D-177), and is listed too. Only a module
+    // missing from the index is refused.
     std::map<std::string, std::vector<std::string>, std::less<>> gaps;
     for (bool changed = true; changed;) {
         changed = false;
@@ -495,17 +516,14 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& i
                     if (dep && candidates.contains(*dep)) {
                         const auto& exported = files_[*dep].export_variables;
                         const auto e = exported.find(library);
-                        if (e != exported.end() && e->second.contains(nid)) continue;
-                        why = std::format("it imports variable {}::{:#010x}, which {} does not export", library, nid, *dep);
+                        if (e == exported.end() || !e->second.contains(nid))
+                            gap.push_back(std::format("variable {}::{:#010x} (not exported by {})", library, nid, *dep));
                     } else if (dep && can_join(*dep)) {
                         joins.push_back(*dep);
-                        continue;
                     } else {
-                        why = std::format("its imported variable {}::{:#010x} has no module to come from", library, nid);
+                        gap.push_back(std::format("variable {}::{:#010x} (no module exports it)", library, nid));
                     }
-                    break;
                 }
-                if (!why.empty()) break;
             }
             if (info != files_.end())
                 for (const u32 n : info->second.syscalls)
@@ -603,7 +621,7 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
 {
     for (const auto& m : loaded_)
         if (m->file == file) return m.get();
-    auto elf_bytes = module_elf(flash_path(dev_flash_) / "sys" / "external" / file);
+    auto elf_bytes = module_elf(module_path(flash_path(dev_flash_), file));
     if (!elf_bytes) {
         if (error) *error = std::format("{}: {}", file, elf_bytes.error().message);
         return nullptr;
@@ -728,10 +746,11 @@ u32 RuntimeModules::load(std::string_view path, u32* id)
     std::lock_guard lock(mutex_);
     auto e = std::make_unique<Entry>();
     e->path = std::string(path);
-    const std::string file = fs::path(e->path).filename().string();
-    constexpr std::string_view kFirmware = "/dev_flash/sys/external/";
+    constexpr std::string_view kFirmware = "/dev_flash/sys/external/", kFirmwareInternal = "/dev_flash/sys/internal/";
+    const std::string file = (path.starts_with(kFirmwareInternal) ? std::string(kInternal) : std::string()) +
+        fs::path(e->path).filename().string();
     const auto syscall_bound = [this](u32 n) { return hle_.kernel().syscall_bound(n); };
-    if (path.starts_with(kFirmware)) {
+    if (path.starts_with(kFirmware) || path.starts_with(kFirmwareInternal)) {
         // A firmware module by its path: as it is when chosen for the game (D-175), or when the host replaces none of it
         // (it joins, with the modules it needs); else empty (the host's functions serve its libraries).
         if (lle_ && lle_->decided() && !lle_->chosen(file) && lle_->runs_whole(file))
