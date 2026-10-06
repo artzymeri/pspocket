@@ -14,7 +14,8 @@ add_library(pspocket::prepare ALIAS pspocket_prepare)
 # Host tool: a game prepared on the Mac as the phone prepares it.
 if(NOT IOS)
     add_executable(pspocket-prepare tools/pspocket_prepare.cpp)
-    target_link_libraries(pspocket-prepare PRIVATE pspocket::prepare pspocket::codegen pspocket::game)
+    # The loader: which firmware modules a game links (--for, D-191).
+    target_link_libraries(pspocket-prepare PRIVATE pspocket::prepare pspocket::codegen pspocket::game pspocket::loader)
     target_compile_definitions(pspocket-prepare PRIVATE PSPOCKET_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     # CMake repeats static libraries that other static libraries need; Apple's linker warns about the repeats.
     target_link_options(pspocket-prepare PRIVATE -Wl,-no_warn_duplicate_libraries)

@@ -146,6 +146,7 @@ bool read_manifest(const std::string& game_dir, Manifest* out)
     m.abi_hash = json_field(json, "abi_hash");
     m.translator_hash = json_field(json, "translator_hash");
     if (const std::string g = json_field(json, "translator_generation"); !g.empty()) m.translator_generation = std::atoi(g.c_str());
+    m.system_generation = std::atoi(json_field(json, "system_generation").c_str());
     m.made_at = std::atoll(json_field(json, "made_at").c_str());
     m.seconds = std::atof(json_field(json, "seconds").c_str());
     m.files = static_cast<size_t>(std::atoll(json_field(json, "files").c_str()));
@@ -453,13 +454,14 @@ Result prepare_game(const Options& o)
     // 4. What it was made from and by.
     const std::string manifest = std::format(
         "{{\n  \"title_id\": {},\n  \"executable_sha256\": \"{}\",\n  \"abi_hash\": \"{:016x}\",\n"
-        "  \"translator_hash\": \"{:016x}\",\n  \"translator_generation\": {},\n  \"made_by\": {},\n  \"compiler\": {},\n"
-        "  \"cpu\": {},\n"
+        "  \"translator_hash\": \"{:016x}\",\n  \"translator_generation\": {},\n{}  \"made_by\": {},\n"
+        "  \"compiler\": {},\n  \"cpu\": {},\n"
         "  \"made_at\": {},\n"
         "  \"seconds\": {:.1f},\n  \"translate_seconds\": {:.1f},\n  \"compile_seconds\": {:.1f},\n"
         "  \"link_seconds\": {:.1f},\n  \"files\": {},\n  \"rate_0\": {:.3f},\n  \"rate_1\": {:.3f},\n"
         "  \"rate_2\": {:.3f},\n  \"thermal\": {},\n  \"bytes\": {}\n}}\n",
         json_string(o.title_id), exe_sha, ps_game_abi_hash, ps_game_translator_hash, kTranslatorGeneration,
+        o.system_generation ? std::format("  \"system_generation\": {},\n", o.system_generation) : std::string(),
         json_string(std::string("pspocket ") + PSPOCKET_VERSION), json_string(codegen::compiler_version()),
         json_string(o.toolchain.cpu == "native" ? codegen::host_cpu() : o.toolchain.cpu),
         static_cast<long long>(std::time(nullptr)), r.seconds, r.translate_seconds, r.compile_seconds, r.link_seconds,

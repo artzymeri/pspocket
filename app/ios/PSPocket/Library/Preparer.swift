@@ -35,11 +35,13 @@ final class Preparer {
         return (ready, String(cString: why))
     }
 
-    /// Whether the PS3 system software's own modules are translated for the system software installed now (D-178):
-    /// done once on this iPhone, shared by every game.
-    static func checkSystem() -> (ready: Bool, why: String) {
+    /// Whether the PS3 system software's own modules are translated for the system software installed now (D-178),
+    /// with the SPU programs of the system modules this game links (D-191): done once on this iPhone, shared by every
+    /// game; a game that links more modules adds theirs.
+    static func checkSystem(executable: URL) -> (ready: Bool, why: String) {
         var why = [CChar](repeating: 0, count: 256)
-        let ready = ps_prepare_system_check(Firmware.devFlash.path, Firmware.systemLibrary.path, &why, why.count) != 0
+        let ready = ps_prepare_system_check(Firmware.devFlash.path, Firmware.systemLibrary.path, executable.path, &why,
+                                            why.count) != 0
         return (ready, String(cString: why))
     }
 
@@ -55,10 +57,12 @@ final class Preparer {
         return nil
     }
 
-    /// Starts translating the PS3 system software's modules (D-178), as `start` does a game.
-    func startSystem(finish: @escaping (Result<URL, PreparationError>) -> Void) -> String? {
+    /// Starts translating the PS3 system software's modules (D-178), for the game whose executable is given (the SPU
+    /// programs of the modules it links, D-191), as `start` does a game.
+    func startSystem(executable: URL, finish: @escaping (Result<URL, PreparationError>) -> Void) -> String? {
         var error = [CChar](repeating: 0, count: 512)
-        guard ps_prepare_system_start(Firmware.devFlash.path, Firmware.systemLibrary.path, &error, error.count) == 0
+        guard ps_prepare_system_start(Firmware.devFlash.path, Firmware.systemLibrary.path, executable.path, &error,
+                                      error.count) == 0
         else { return String(cString: error) }
         begin(finish)
         return nil

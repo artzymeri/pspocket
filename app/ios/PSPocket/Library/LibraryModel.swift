@@ -49,8 +49,9 @@ final class LibraryModel {
     private(set) var boot: Boot?
     /// Preparing a game on this iPhone the first time it is played (D-154): the overlay shows its progress.
     let preparer = Preparer()
-    /// The system software's translation was checked (and made if need be) this session (D-178).
-    @ObservationIgnored private var systemChecked = false
+    /// The games for which the system software's translation was checked (and made if need be) this session (D-178,
+    /// D-191: each game may link system modules whose SPU programs it does not hold yet), by title ID.
+    @ObservationIgnored private var systemChecked = Set<String>()
     /// Why a game runs without its library this session (it could not be prepared), by title ID.
     private(set) var preparationNotes: [String: String] = [:]
     @ObservationIgnored static let log = Logger(subsystem: "com.artzymeri.pspocket", category: "library")
@@ -424,15 +425,17 @@ final class LibraryModel {
             return
         }
         // The PS3 system software's own modules, translated once (D-178), before the first game after it is
-        // installed (or after an update of pspocket that translates differently). A game goes on without them if
-        // that fails: its firmware modules then run under the interpreter.
-        if !systemChecked, FileManager.default.fileExists(atPath: Firmware.devFlash.appendingPathComponent("sys").path) {
-            systemChecked = true
-            let system = Preparer.checkSystem()
+        // installed (or after an update of pspocket that translates differently), and the SPU programs of the system
+        // modules a game links, the first time a game links them (D-191). A game goes on without them if that fails:
+        // its firmware modules then run under the interpreter.
+        if !systemChecked.contains(titleID),
+           FileManager.default.fileExists(atPath: Firmware.devFlash.appendingPathComponent("sys").path) {
+            systemChecked.insert(titleID)
+            let system = Preparer.checkSystem(executable: elf)
             if !system.ready {
                 Self.log.notice("pspocket: preparing the system software: \(system.why, privacy: .public)")
                 let entryID = entry.id
-                let message = preparer.startSystem(finish: { [weak self] result in
+                let message = preparer.startSystem(executable: elf, finish: { [weak self] result in
                     guard let self else { return }
                     UIApplication.shared.isIdleTimerDisabled = false
                     if case .failure(let error) = result {

@@ -6,10 +6,13 @@
 //                    [--spu-log FILE]...] [-j N] [--memory MB]
 //                    [--ppu-arg ARG]... [--spu-arg ARG]... [--mllvm OPT]... [--keep-sources] [--events FILE.csv]
 //                    [--quiet]
-//   pspocket-prepare --system DEV_FLASH --game-dir DIR [-j N] [--memory MB] [--keep-sources] [--quiet]
+//   pspocket-prepare --system DEV_FLASH --game-dir DIR [--for EBOOT.elf]... [--spu-modules all|KEY,...] [-j N]
+//                    [--memory MB] [--keep-sources] [--quiet]
 //
 // --system makes the system library (D-178): the firmware's modules in DEV_FLASH translated once, into DIR (by
-// convention the folder "system" beside DEV_FLASH, where pspocket-boot and the app look for it).
+// convention the folder "system" beside DEV_FLASH, where pspocket-boot and the app look for it), with the SPU programs
+// of the modules the games given with --for link (D-191), as the phone adds them before a game, or of the modules
+// --spu-modules names ("libvdec.sprx,internal/libtrhddec.sprx", or all), besides those DIR's library holds already.
 // --ppu uses translated PPU code (ppu-lift's output) instead of translating; --spu adds lifted SPU programs
 // (scripts/lift-spu.sh's output); --spu-images lifts the SPU images runs saved (pspocket-boot --spu-dump) into
 // DIR/spu, as the phone does, with --spu-log runs' logs for more entry points. Objects stay in DIR/objects, so a second run compiles only what changed.
@@ -22,9 +25,13 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
+#include <set>
 #include <string>
 #include <vector>
 
+#include "pspocket/loader/lle.hpp"
+#include "pspocket/loader/loader.hpp"
 #include "pspocket/prepare/prepare.hpp"
 #include "pspocket/prepare/spu.hpp"
 #include "pspocket/prepare/system.hpp"
@@ -40,7 +47,8 @@ int usage()
                "                        --spu-images DIR [--spu-log FILE]...] [-j N]\n"
                "                        [--memory MB] [--ppu-arg ARG]... [--spu-arg ARG]... [--mllvm OPT]...\n"
                "                        [--keep-sources] [--events FILE.csv] [--quiet]\n"
-               "       pspocket-prepare --system DEV_FLASH --game-dir DIR [-j N] [--memory MB] [--keep-sources]\n",
+               "       pspocket-prepare --system DEV_FLASH --game-dir DIR [--for EBOOT.elf]... [--spu-modules all|KEY,...]\n"
+               "                        [-j N] [--memory MB] [--keep-sources]\n",
         stderr);
     return 64;
 }
@@ -58,6 +66,8 @@ int main(int argc, char** argv)
 {
     prepare::Options o;
     std::string events_path, system_flash;
+    std::vector<std::string> system_for;
+    std::set<std::string> spu_modules;
     bool quiet = false, lift_spu_only = false, discover_spu = false;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -83,7 +93,16 @@ int main(int argc, char** argv)
         else if (a == "--spu-arg") o.extra_spu_args.emplace_back(v);
         else if (a == "--mllvm") o.llvm_options.emplace_back(v);
         else if (a == "--events") events_path = v;
-        else return usage();
+        else if (a == "--for") system_for.emplace_back(v);
+        else if (a == "--spu-modules") {
+            std::string list = v;
+            for (size_t at = 0; at <= list.size();) {
+                const size_t end = std::min(list.find(',', at), list.size());
+                const std::string key = list.substr(at, end - at);
+                if (!key.empty()) spu_modules.insert(key == "all" ? prepare::kAllModules : key);
+                at = end + 1;
+            }
+        } else return usage();
     }
     if (lift_spu_only) { // only the SPU step: --spu-images into --game-dir/spu (comparing with lift-spu.sh)
         if (o.spu_images_dir.empty() || o.game_dir.empty()) return usage();
@@ -151,6 +170,26 @@ int main(int argc, char** argv)
         for (int k = 0; k < 3; k++) s.prior_rates[k] = o.prior_rates[k];
         s.keep_sources = o.keep_sources;
         s.progress = o.progress;
+        s.spu_modules = spu_modules;
+        loader::LleModules lle(system_flash);
+        if (!system_for.empty() && !lle.index()) {
+            std::fprintf(stderr, "pspocket-prepare: no firmware modules in %s\n", system_flash.c_str());
+            return 1;
+        }
+        for (const std::string& path : system_for) { // the modules each game links (LleModules::choice_for)
+            std::ifstream in(path, std::ios::binary);
+            auto exe = loader::Executable::parse(std::vector<u8>(std::istreambuf_iterator<char>(in), {}));
+            if (!exe) {
+                std::fprintf(stderr, "pspocket-prepare: %s: %s\n", path.c_str(), exe.error().message.c_str());
+                return 1;
+            }
+            const auto chosen = lle.choice_for(loader::LleModules::needs_of((*exe)->module()));
+            std::string list;
+            for (const std::string& f : chosen) list += (list.empty() ? "" : ", ") + f;
+            if (!quiet) std::printf("%s links %zu system modules%s%s\n", path.c_str(), chosen.size(), list.empty() ? "" : ": ",
+                list.c_str());
+            s.spu_modules.insert(chosen.begin(), chosen.end());
+        }
         r = prepare::prepare_system(s);
     } else {
         r = prepare::prepare_game(o);

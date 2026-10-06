@@ -626,11 +626,13 @@ SyntheticPrx build_ppu_prx(const PrxOptions& options)
     constexpr u32 kSeg0Size = 0x700;
     constexpr u32 kSeg1Off = 0x800;
     constexpr u32 kSeg1Vaddr = 0x1000;
-    constexpr u32 kRelOff = 0xA00;
+    const u32 extra = static_cast<u32>(align_up(options.extra_data.size(), 16));
+    const u32 kRelOff = static_cast<u32>(align_up(kSeg1Off + kPrxExtraData + extra, 0x100)); // 0xA00 without extra data
     auto s0 = [](u32 off) { return static_cast<usize>(kSeg0Off + off); };
 
     Buffer b;
-    b.reserve_to(kSeg1Off + 0x200);
+    b.reserve_to(kSeg1Off + kPrxExtraData + extra);
+    if (!options.extra_data.empty()) b.put(kSeg1Off + kPrxExtraData, options.extra_data);
     SyntheticPrx x;
 
     // Code: module_start, module_stop, synthPrxFunc; two import stubs.
@@ -750,7 +752,7 @@ SyntheticPrx build_ppu_prx(const PrxOptions& options)
     x.out_of_range_relocations = 1;
 
     phdr64(b, 0, 1, 0x5, kSeg0Off, 0, kSeg0Off + 0x600, kSeg0Size, kSeg0Size, 0x100);
-    phdr64(b, 1, 1, 0x6, kSeg1Off, kSeg1Vaddr, 0, 0x200, 0x300, 0x100);
+    phdr64(b, 1, 1, 0x6, kSeg1Off, kSeg1Vaddr, 0, kPrxExtraData + extra, kPrxExtraData + extra + 0x100, 0x100);
     phdr64(b, 2, 0x700000A4, 0, kRelOff, 0, 0, 24ull * count, 0, 8);
     elf64_header(b, 0xFFA4, 0x66, 0, 3, 0, 0, 0);
 

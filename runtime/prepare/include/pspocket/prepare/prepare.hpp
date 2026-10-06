@@ -60,6 +60,7 @@ struct Options {
     double prior_rates[3] = {1.0, 1.0, 1.0};
     int thermal = 0; // the device's heat when it starts (0 nominal .. 3 critical): kept in the manifest beside the rates
     bool keep_sources = false; // keep the translated C after a successful build (it is about 0.8 GB for GTA V)
+    int system_generation = 0; // the system library's (kSystemGeneration, system.hpp), in its manifest; 0 for a game
     std::vector<std::string> extra_ppu_args, extra_spu_args, llvm_options; // added to translated_code_settings()
     std::function<void(const Progress&)> progress;
     // Every file's start (seconds -1) and end, for recording a build (pspocket-prepare --events).
@@ -90,6 +91,7 @@ struct Manifest {
     std::string title_id, executable_sha256, made_by, compiler, cpu;
     std::string abi_hash, translator_hash; // hex
     int translator_generation = 1;         // kTranslatorGeneration it was made with (1: before the field)
+    int system_generation = 0;             // a system library's kSystemGeneration; 0 for a game, or from before D-190
     long long made_at = 0;                 // seconds since 1970
     double seconds = 0;
     size_t files = 0;

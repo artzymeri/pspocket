@@ -49,12 +49,16 @@ void ps_prepare_get_status(ps_prepare_status* out);
 void ps_prepare_cancel(void);
 
 /* The system library (D-178, pspocket/prepare/system.hpp): the PS3 system software's own modules, translated once and
- * shared by every game. Whether system_dir holds one this app can run for the firmware installed in flash_dir (1), or
- * not (0, with why). */
-int ps_prepare_system_check(const char* flash_dir, const char* system_dir, char* why, size_t why_size);
+ * shared by every game, with the SPU programs of the modules the games played link (D-191). Whether system_dir holds
+ * one this app can run for the firmware installed in flash_dir and the game whose decrypted executable is `executable`
+ * (NULL: any game), with the SPU programs of the system modules it links (1), or not (0, with why). */
+int ps_prepare_system_check(const char* flash_dir, const char* system_dir, const char* executable, char* why,
+    size_t why_size);
 
-/* Starts making it, as ps_prepare_start does a game's (ps_prepare_get_status reports it; ps_prepare_cancel stops it). */
-int ps_prepare_system_start(const char* flash_dir, const char* system_dir, char* error, size_t error_size);
+/* Starts making it, for that game too, as ps_prepare_start does a game's (ps_prepare_get_status reports it;
+ * ps_prepare_cancel stops it). */
+int ps_prepare_system_start(const char* flash_dir, const char* system_dir, const char* executable, char* error,
+    size_t error_size);
 
 #ifdef __cplusplus
 } /* extern "C" */

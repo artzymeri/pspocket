@@ -14,12 +14,13 @@ if(TARGET pspocket_codegen AND TARGET pspocket_selftest_ppu_generated)
         PSPOCKET_SELFTEST_GENERATED_DIR="${CMAKE_BINARY_DIR}/generated/selftest")
 endif()
 
-# The system library (D-178): a synthetic firmware module translated, placed, checked and run translated.
+# The system library (D-178): a synthetic firmware module translated, placed, checked and run translated, with the SPU
+# program it carries (D-191).
 if(TARGET pspocket_codegen)
     pspocket_add_test(test_system_library
         SOURCES test_system_library.cpp
         LIBS pspocket::loader pspocket::prepare pspocket::codegen pspocket::game pspocket_test_synthetic
-            pspocket::recomp_ppu)
+            pspocket::recomp_ppu pspocket::recomp_spu)
     if(APPLE)
         target_link_options(test_system_library PRIVATE -Wl,-no_warn_duplicate_libraries)
     endif()

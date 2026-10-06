@@ -118,7 +118,11 @@ struct PrxOptions {
     // synthPrxLib also exports a variable (kPrxVariableNid at segment 1 + 0x60, holding kPrxVariableValue), and the
     // module imports that NID from library "synthVarLib" through a reference table that patches segment 1 + 0xC0.
     bool variables = false;
+    // Bytes the module carries at segment 1 + kPrxExtraData (vaddr 0x1200), after the segment's own 0x200 (an SPU ELF,
+    // as the firmware's modules carry their SPU programs). Segment 1 grows to hold them; the relocations move after.
+    std::vector<u8> extra_data;
 };
+inline constexpr u32 kPrxExtraData = 0x200;
 inline constexpr u32 kPrxVariableNid = 0x5EED0001;
 inline constexpr u32 kPrxVariableValue = 0xC0FFEE01;
 

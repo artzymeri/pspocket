@@ -15,6 +15,7 @@
 #include <iterator>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +25,7 @@
 #if PSPOCKET_HAVE_CODEGEN
 #include "pspocket/codesign/codesign.hpp"
 #include "pspocket/loader/lle.hpp"
+#include "pspocket/loader/loader.hpp"
 #include "pspocket/prepare/prepare.hpp"
 #include "pspocket/prepare/system.hpp"
 #endif
@@ -276,7 +278,32 @@ extern "C" void ps_prepare_get_status(ps_prepare_status* out)
 
 extern "C" void ps_prepare_cancel(void) { g_cancel = true; }
 
-extern "C" int ps_prepare_system_check(const char* flash_dir, const char* system_dir, char* why, size_t why_size)
+#if PSPOCKET_HAVE_CODEGEN
+namespace {
+
+// The firmware modules the game whose decrypted executable is at `path` links (LleModules::choice_for, D-191): the ones
+// whose SPU programs the system library is to hold for it. Empty when it cannot be read.
+std::set<std::string> modules_for(pspocket::loader::LleModules& lle, const char* path)
+{
+    std::set<std::string> out;
+    if (!path) return out;
+    std::ifstream in(path, std::ios::binary);
+    std::vector<pspocket::u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    auto exe = pspocket::loader::Executable::parse(std::move(bytes));
+    if (!exe) {
+        PS_LOG_WARN(kChan, "{}: {}: no system modules worked out for it", path, exe.error().message);
+        return out;
+    }
+    for (const std::string& file : lle.choice_for(pspocket::loader::LleModules::needs_of((*exe)->module())))
+        out.insert(file);
+    return out;
+}
+
+} // namespace
+#endif
+
+extern "C" int ps_prepare_system_check(const char* flash_dir, const char* system_dir, const char* executable, char* why,
+    size_t why_size)
 {
 #if PSPOCKET_HAVE_CODEGEN
     if (!flash_dir || !system_dir) return 0;
@@ -286,18 +313,21 @@ extern "C" int ps_prepare_system_check(const char* flash_dir, const char* system
         copy_text(why, why_size, "no system software: " + reason);
         return 0;
     }
-    const bool ok = pspocket::prepare::system_library_is_current(system_dir, lle.identity_text(), &reason);
+    const bool ok = pspocket::prepare::system_library_is_current(system_dir, lle.identity_text(), &reason,
+        modules_for(lle, executable));
     copy_text(why, why_size, reason);
     return ok ? 1 : 0;
 #else
     (void)flash_dir;
     (void)system_dir;
+    (void)executable;
     copy_text(why, why_size, "this build of pspocket has no compiler");
     return 0;
 #endif
 }
 
-extern "C" int ps_prepare_system_start(const char* flash_dir, const char* system_dir, char* error, size_t error_size)
+extern "C" int ps_prepare_system_start(const char* flash_dir, const char* system_dir, const char* executable,
+    char* error, size_t error_size)
 {
 #if PSPOCKET_HAVE_CODEGEN
     if (!flash_dir || !system_dir) {
@@ -309,6 +339,10 @@ extern "C" int ps_prepare_system_start(const char* flash_dir, const char* system
     if (!begin(system_dir, &key, &o.toolchain, error, error_size)) return 1;
     o.dev_flash = flash_dir;
     o.dir = system_dir;
+    {
+        pspocket::loader::LleModules lle(flash_dir);
+        if (lle.index()) o.spu_modules = modules_for(lle, executable);
+    }
     o.workers = std::max(1u, std::thread::hardware_concurrency());
     o.memory_mb = static_cast<double>(os_proc_available_memory()) / 1048576.0 * 0.5;
     NSString* bundle = [[NSBundle mainBundle] bundleIdentifier];
@@ -332,6 +366,7 @@ extern "C" int ps_prepare_system_start(const char* flash_dir, const char* system
 #else
     (void)flash_dir;
     (void)system_dir;
+    (void)executable;
     copy_text(error, error_size, "this build of pspocket has no compiler (scripts/build-llvm-ios.sh)");
     return 1;
 #endif
