@@ -105,8 +105,8 @@ TEST_CASE("texture layouts: linear mips share the pitch, swizzled mips are packe
     // Failures
     CHECK_FALSE(compute_texture_layout(make_texture(0x7f, 4, 4), &why).has_value());
     CHECK(why.find("unknown") != std::string::npos);
-    CHECK_FALSE(compute_texture_layout(make_texture(tex::COMPRESSED_HILO8, 4, 4), &why).has_value());
-    CHECK(why.find("HILO8") != std::string::npos);
+    CHECK_FALSE(compute_texture_layout(make_texture(tex::DEPTH16_FLOAT, 4, 4), &why).has_value());
+    CHECK(why.find("DEPTH16_FLOAT") != std::string::npos);
     TextureInfo volume = make_texture(tex::COMPRESSED_DXT1, 4, 4);
     volume.dimension = 3;
     volume.depth = 4;
