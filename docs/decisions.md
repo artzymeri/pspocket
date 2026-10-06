@@ -4610,6 +4610,20 @@ run): local store holds the module intact, and it ran interpreted.
 
 Test: tests/hle/test_spu_programs.cpp (a module whose guest buffer is reused before it runs).
 
+## D-207 · 2026-10-07 · The PPU interpreter's share is counted and reported, as the SPU's is
+
+The runs reported how much SPU code ran interpreted, per site, but not PPU code: the fallbacks (an indirect call or
+jump with no translated function) and Assassin's Creed's fiber switches (D-161, whose loops never return to translated
+code) were visible only as one log line each. The goal is no interpreting, so it must be measured.
+
+- The interpreter counts instructions per address it was entered at (ps_ppu_interp_sites: a lock-free table of 4,096
+  sites, the SPU's layout). A run adds its count every 65,536 instructions as well as at its end, so a loop that never
+  returns shows while it runs. One masked compare per interpreted instruction.
+- pspocket-boot logs "PPU interpreted: N instructions in 5.0 s" beside the frame rate when there were any, and the
+  twelve busiest sites at the end ("PPU interpreted: N instructions from M entries at 0x...").
+
+Test: tests/ppu/test_interp_branch_mem.cpp (a loop's count and entries, a run stopped by its step limit).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

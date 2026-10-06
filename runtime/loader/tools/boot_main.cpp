@@ -540,6 +540,16 @@ bool read_file(const char* path, std::vector<u8>& out)
     return true;
 }
 
+// Every instruction the PPU interpreter has run (D-207).
+u64 ppu_interpreted_total()
+{
+    std::vector<ps_ppu_interp_site> sites(4096);
+    const u32 n = ps_ppu_interp_sites(sites.data(), static_cast<u32>(sites.size()));
+    u64 total = 0;
+    for (u32 i = 0; i < n; i++) total += sites[i].steps;
+    return total;
+}
+
 // The memory the system counts against the process (the iOS app's status line has it too, D-145), in MB; 0 elsewhere.
 double footprint_mb()
 {
@@ -1236,6 +1246,7 @@ int main(int argc, char** argv)
     auto next_rate = start + seconds(kRateEvery);
     auto rate_since = start;
     u64 rate_flips = 0;
+    u64 rate_ppu_interpreted = 0;
     bool done = false;
     // Scripted presses (--press): which buttons are down is checked every 20 ms while any press is scheduled.
     std::string pad_text;
@@ -1267,6 +1278,12 @@ int main(int argc, char** argv)
                     PS_LOG_INFO("boot", "{:.1f} fps ({} frames in {:.1f} s; {} since the boot); memory {:.2f} GB", fps,
                         flips - rate_flips, dt, flips, footprint / 1024);
                     PS_LOG_INFO("boot", "threads: {}", thread_cpu_report(dt));
+                    // The PPU interpreter's share (D-207), when it ran.
+                    const u64 interpreted = ppu_interpreted_total();
+                    if (interpreted != rate_ppu_interpreted)
+                        PS_LOG_INFO("boot", "PPU interpreted: {} instructions in {:.1f} s", interpreted - rate_ppu_interpreted,
+                            dt);
+                    rate_ppu_interpreted = interpreted;
                     std::lock_guard lock(g_summary.mutex);
                     g_summary.fps.push_back(fps);
                     g_summary.peak_footprint_mb = std::max(g_summary.peak_footprint_mb, footprint);
@@ -1323,6 +1340,14 @@ int main(int argc, char** argv)
         std::printf("SPU interpreted: %llu instructions from %llu entries at LS 0x%05x in %s\n",
             static_cast<unsigned long long>(sites[i].steps), static_cast<unsigned long long>(sites[i].entries), sites[i].pc,
             sites[i].program ? sites[i].program->name : "no program");
+    }
+    // And the PPU's (D-207): where the interpreter was entered, by instructions run from there.
+    ps_ppu_interp_site ppu_sites[12];
+    const u32 nppu = ps_ppu_interp_sites(ppu_sites, 12);
+    for (u32 i = 0; i < nppu; i++) {
+        std::printf("PPU interpreted: %llu instructions from %llu entries at %#010x\n",
+            static_cast<unsigned long long>(ppu_sites[i].steps), static_cast<unsigned long long>(ppu_sites[i].entries),
+            ppu_sites[i].pc);
     }
     for (u32 mb = 0; mb < (PS_MEM_RSX_LOCAL_SIZE >> 20); mb++) {
         const u64 got = ps_spu_video_dma(mb, 0), put = ps_spu_video_dma(mb, 1);

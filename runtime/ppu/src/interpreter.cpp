@@ -10,10 +10,12 @@
 
 #include "pspocket/ppu/interpreter.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
@@ -883,6 +885,33 @@ inline Inst decode_cached(u32 pc, u32 raw, bool& branch)
     return inst;
 }
 
+// ps_ppu_interp_sites (D-207): instructions interpreted per address the interpreter was entered at, an open-addressed
+// table filled without locks. A run adds its count every 65,536 instructions as well as at its end, so one that never
+// returns (a fiber's loop after a longjmp, D-161) shows too.
+constexpr u32 kSites = 4096;
+constexpr u64 kFlushSteps = 0x10000;
+struct Site {
+    std::atomic<u32> pc{~0u};
+    std::atomic<u64> steps{0}, entries{0};
+};
+Site g_sites[kSites];
+
+Site* site_for(u32 pc)
+{
+    u32 h = (pc >> 2) * 0x9E3779B1u % kSites;
+    for (u32 probe = 0; probe < 32; probe++, h = (h + 1) % kSites) {
+        Site& s = g_sites[h];
+        u32 current = s.pc.load(std::memory_order_relaxed);
+        if (current == ~0u && !s.pc.compare_exchange_strong(current, pc)) {
+            // another thread took the slot meanwhile: current is its address now
+        } else if (current == ~0u) {
+            return &s; // taken for pc
+        }
+        if (current == pc) return &s;
+    }
+    return nullptr; // the table is full here: not counted
+}
+
 } // namespace
 
 RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
@@ -892,20 +921,28 @@ RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
     auto at_stop = [&] {
         return opt.stop_at_return && ctx.cia == stop_pc && (opt.stop_any_sp || ctx.gpr[1] == opt.stop_sp);
     };
+    Site* const site = site_for(ctx.cia);
+    if (site) site->entries.fetch_add(1, std::memory_order_relaxed);
+    const auto count_rest = [&] {
+        if (site) site->steps.fetch_add(res.steps % kFlushSteps, std::memory_order_relaxed);
+    };
 
     for (;;) {
         if (at_stop()) {
             res.reason = StopReason::Returned;
+            count_rest();
             return res;
         }
         if (res.steps >= opt.max_steps) {
             res.reason = StopReason::StepLimit;
+            count_rest();
             return res;
         }
         bool branch = false;
         const Inst inst = decode_cached(ctx.cia, ps_read32(base, ctx.cia), branch);
         execute(ctx, base, inst);
         res.steps++;
+        if (res.steps % kFlushSteps == 0 && site) site->steps.fetch_add(kFlushSteps, std::memory_order_relaxed);
 
         // Interop: a branch that lands on a lifted function runs it. Lifted code returns like the guest's blr, so
         // execution continues at LR afterwards (also correct for tail calls and local branches to an entry).
@@ -936,3 +973,17 @@ std::vector<Form> supported_forms()
 } // namespace pspocket::ppu
 
 extern "C" uint32_t ps_ppu_zero_branch_from(void) { return pspocket::ppu::t_zero_branch_from_value(); }
+
+extern "C" uint32_t ps_ppu_interp_sites(ps_ppu_interp_site* out, uint32_t n)
+{
+    std::vector<ps_ppu_interp_site> all;
+    for (const auto& s : pspocket::ppu::g_sites) {
+        const uint32_t pc = s.pc.load(std::memory_order_relaxed);
+        if (pc == ~0u) continue;
+        all.push_back({pc, s.steps.load(std::memory_order_relaxed), s.entries.load(std::memory_order_relaxed)});
+    }
+    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.steps > b.steps; });
+    const uint32_t count = std::min<uint32_t>(n, static_cast<uint32_t>(all.size()));
+    std::copy_n(all.begin(), count, out);
+    return count;
+}

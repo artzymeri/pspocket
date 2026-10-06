@@ -85,6 +85,15 @@ void ps_ppu_set_miss_policy(ps_ppu_miss_policy policy);
 ps_ppu_miss_policy ps_ppu_get_miss_policy(void);
 uint64_t ps_ppu_dispatch_miss_count(void);
 
+/* Where the interpreter ran guest code (D-207): instructions and entries per address it was entered at, most first.
+ * Fills up to n; returns how many. */
+typedef struct ps_ppu_interp_site {
+    uint32_t pc;
+    uint64_t steps;
+    uint64_t entries;
+} ps_ppu_interp_site;
+uint32_t ps_ppu_interp_sites(ps_ppu_interp_site* out, uint32_t n);
+
 /* Indirect call (bctrl, blrl, bl outside the image). ctx->lr already holds the return address. */
 static inline void ps_ppu_call_indirect(PPUContext* ctx, uint8_t* base, uint32_t target)
 {

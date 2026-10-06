@@ -504,3 +504,45 @@ TEST_CASE("run: code patched after it ran runs as patched (the decode cache chec
     m.ctx.lr = kSentinel;
     CHECK(run_code() == 42);
 }
+
+TEST_CASE("run: instructions interpreted are counted per entry address, also while a run goes on (D-207)")
+{
+    Machine m;
+    constexpr u32 kSentinel = 0x00030000, kAt = Machine::kCode + 0x100;
+    // r3 counts down from r4 to 0: 3 instructions a turn, then blr.
+    m.w32(kAt, as::addi(3, 4, 0));
+    m.w32(kAt + 4, as::addi(3, 3, -1));
+    m.w32(kAt + 8, as::cmpwi(0, 3, 0));
+    m.w32(kAt + 12, 0x4082FFF8); // bne cr0, kAt + 4
+    m.w32(kAt + 16, 0x4E800020); // blr
+    const auto site = [&]() -> ps_ppu_interp_site {
+        std::vector<ps_ppu_interp_site> sites(4096);
+        const u32 n = ps_ppu_interp_sites(sites.data(), static_cast<u32>(sites.size()));
+        for (u32 i = 0; i < n; i++)
+            if (sites[i].pc == kAt) return sites[i];
+        return {kAt, 0, 0};
+    };
+    const ps_ppu_interp_site before = site();
+    const auto run_loop = [&](u64 turns, u64 max_steps) {
+        m.ctx.lr = kSentinel;
+        m.ctx.gpr[1] = 0x00028000;
+        m.ctx.gpr[4] = turns;
+        m.ctx.cia = kAt;
+        RunOptions opt;
+        opt.stop_at_return = true;
+        opt.stop_lr = kSentinel;
+        opt.stop_sp = m.ctx.gpr[1];
+        opt.max_steps = max_steps;
+        return run(m.ctx, m.base(), opt);
+    };
+    const RunResult a = run_loop(10, ~0ull);
+    REQUIRE(a.reason == StopReason::Returned);
+    CHECK(a.steps == 1 + 3 * 10 + 1);
+    CHECK(site().steps - before.steps == a.steps);
+    CHECK(site().entries - before.entries == 1);
+    // A run stopped by its step limit counts what it ran, the 65,536-instruction flushes included.
+    const RunResult b = run_loop(100000, 200000);
+    CHECK(b.reason == StopReason::StepLimit);
+    CHECK(site().steps - before.steps == a.steps + 200000);
+    CHECK(site().entries - before.entries == 2);
+}
