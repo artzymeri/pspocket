@@ -99,3 +99,10 @@ interpreter ran 184 instructions in the whole session (one entry in the module a
 Median 54.8 fps with the GPU drawing; 49 to 52 then 55 to 60 in the Animus. The PPU interpreter: the fiber resumes only
 (5.2 million instructions from 502,315 entries at 0xcf6d90 in 380 s).
 
+## The gate
+
+The gate after D-203 to D-209 (032016e, inventory/gate/20261007-013346-032016e): **PASS**. The 20 test suites, then
+GTA V's prologue walk with its PPU code translated again by today's translator (the built-in translation dated from
+2026-10-05: 505 of 514 files changed, so this run also checks every translator change since): 29.8 fps median, 29.7 in
+the slowest 5 s window, 833 frames compared, 2 frame jumps, 24.8 GPU ms per frame at worst, 84.1 render passes, 973 MB
+process memory at peak, no SPU load interpreted, no new warning shapes.
