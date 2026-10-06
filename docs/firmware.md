@@ -26,8 +26,10 @@ of the plans below.
 | vsh | 673 | 102.5 | The XMB menu and its resources |
 | bdplayer, ps1emu, ps2emu, pspemu | 97 | 34 | Blu-ray player and the PS1, PS2 and PSP emulators |
 
-Across the 179 modules there are 206 libraries and 5,385 exported functions. The host implements 607 of those
-functions today.
+Across the 179 modules there are 206 libraries and 5,385 exported functions. The host implemented 607 of those
+functions at D-176. Since D-182 to D-189 it implements every function RPCS3 implements in the "ours" libraries below:
+1,536 host functions in 58 modules, plus RPCS3's 296 stub answers. The per-module counts below are D-176's; rerun
+`scripts/firmware-report.py` on the Mac with the installed firmware to refresh them.
 
 Inside the modules are 188 SPU programs (17.5 MB): the decoders and helpers that run on the PS3's SPUs.
 

@@ -4059,9 +4059,9 @@ the candidate list, confirming, the 127-character limit, reset).
 
 With these, every function RPCS3 implements in the libraries pspocket always serves itself is there (D-175's list:
 liblv2*, libsysutil*, libfs_utility*, libaudio, libio, libnet, libnetctl, libcamera, libmic, libgem, libusbd and the
-rest). Three are left out on purpose: cellMicStopEx (RPCS3's "unexpected function", fatal there), cellSysmodule's
-0x59521326 (it decrypts with a key taken from RPCS3, D-184) and nothing else: sceNpMatchingInt's OLD_ functions are
-registered under their real names (D-185).
+rest). Two are left out on purpose: cellMicStopEx (RPCS3's "unexpected function", fatal there) and cellSysmodule's
+0x59521326 (it decrypts with a key taken from RPCS3, D-184). sceNpMatchingInt's OLD_ functions are there, under their
+real names (D-185).
 
 - **cellRec** (game video recording, 7 functions). RPCS3 records through FFmpeg's encoders; pspocket's FFmpeg has
   decoders only (D-181). So cellRecStart answers through the callback with CELL_REC_STATUS_ERR and

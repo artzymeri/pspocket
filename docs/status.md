@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-06, after run 099 and D-178 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-06, after run 099 and D-189 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -33,7 +33,7 @@ Mac-translated build keeps working throughout. GTA V (BLES01807) is the driving 
 |---|---|
 | Toolchain | `ps3inspect` (inventory), ELF/SELF/PRX loader, NID database from RPCS3 (D-019), ISO 9660 disc reader. PPU: interpreter (the oracle, with a decode cache, D-091), analyzer and lifter with differential fuzzing (D-023, D-028), whole-game translation built into the host (D-092 to D-096, D-098), `ppu-dis`. SPU: interpreter, runtime and lifter (D-029), relocatable programs (D-081), `scripts/lift-spu.sh` (D-076, D-099). One PPU/SPU reservation system (D-030, D-066) |
 | lv2 kernel | Host threads, sync objects, memory, `sys_vm`, event queues and ports, timers, filesystem (host directories and disc images read in place, D-043), SPU threads (D-031), the RSX device (`sys_rsx`, D-045), a report of what every thread waits on (D-053) |
-| HLE modules | sysPrxForUser, cellSysmodule, cellSpurs (native, checked against libsre: workloads, tasksets, tasks, job chains, SPURS queues and semaphores, a game's own policy module; the modules programs load themselves, D-079, D-082, D-099, D-136), cellAudio (D-052, D-072 to D-075), cellGcmSys, cellSysutil, sys_io (D-049), sceNp/sceNp2/commerce/SNS (offline, D-139), sceNpTrophy, cellSaveData, cellRtc, cellVoice, cellNetCtl, sys_net (offline loopback, D-141), cellHttp/cellSsl, sys_fs (with AIO), cellGame, cellOskDialog (D-140), cellSync (D-160). All 364 of GTA V's imports and all 140 of Assassin's Creed's (D-160). The PS3's own firmware modules serve libraries the host has nothing of (LLE, D-157), and games load their own PRX modules (sys_prx, D-159) |
+| HLE modules | sysPrxForUser, cellSysmodule, cellSpurs (native, checked against libsre: workloads, tasksets, tasks, job chains, SPURS queues and semaphores, a game's own policy module; the modules programs load themselves, D-079, D-082, D-099, D-136), cellAudio (D-052, D-072 to D-075), cellGcmSys, cellSysutil, sys_io (D-049), sceNp/sceNp2/commerce/SNS (offline, D-139), sceNpTrophy, cellSaveData, cellRtc, cellVoice, cellNetCtl, sys_net (offline loopback, D-141), cellHttp/cellSsl, sys_fs (with AIO), cellGame, cellOskDialog (D-140), cellSync (D-160). All 364 of GTA V's imports and all 140 of Assassin's Creed's (D-160). Every function RPCS3 implements in the libraries pspocket always serves (D-182 to D-189). The PS3's own firmware modules serve libraries the host has nothing of (LLE, D-157), and games load their own PRX modules (sys_prx, D-159) |
 | Loader | `pspocket-boot` runs a decrypted EBOOT on the Mac with the game's translated code built in (`-DPSPOCKET_GAME_PPU`, `-DPSPOCKET_GAME_SPU`; used only for the executable it was translated from, D-098). Crash reports show the guest registers and code, the host frames of translated code (D-094) and every thread. `--bdvd IMAGE.iso`, `--flash DIR`, `--frames DIR`, `--trace-frame N`, `--press`/`--press-file`, `--spu-dump DIR`, `--rsx-recover`, `--frame-jumps`, `--summary FILE.json` (D-149) |
 | Gate | `scripts/gate.sh quick\|game\|spu` (D-149): ctest, then GTA V's prologue walk (`games/gta5/walk-prologue.txt`) checked against `games/gta5/gate.json` (fps, frame jumps, render passes, memory, compiles, new messages); `scripts/ios.sh build` and `testflight` run it first. `scripts/ios.sh session` summarises a phone log, `pull-log` fetches the game's |
 | RSX | Portable front end (FIFO methods, state, textures, vertex and fragment programs to MSL with flow control, D-068, D-086, D-089, D-093) and Metal backend (D-032): surfaces and textures over them, GPU conversions of depth buffers and colour targets read as other formats (D-083, D-088, D-097, D-098), frame trace (D-084) |
@@ -87,10 +87,25 @@ footage), multisampled targets drawn with one sample, a GPU shader interpreter f
 Sony's firmware and which are pspocket's own (D-175, D-177), as a PS3 links them. The firmware is analysed in
 docs/firmware.md (D-176: what it holds, the plan for each part). Its 100 modules that are not pspocket's own are
 translated once into a system library, at fixed addresses, and checked one by one as they load (D-178). On the phone
-that happens once, before the first game after the system software is installed. Next from docs/firmware.md: iOS
-frameworks behind the heavy media (ImageIO, VideoToolbox, AudioToolbox), the firmware's SPU programs in the system
-library, and the native libraries' gaps that D-175's log names. Four HLE batches (cellSpurs API, the cellSysutil
-family, input/audio/game/net, RSX shader opcodes) were stopped part-way at a usage limit and are still to do.
+that happens once, before the first game after the system software is installed.
+
+**The libraries pspocket always serves itself are complete against RPCS3 (D-182 to D-189).** These are the ones with
+no firmware fallback (D-175: liblv2*, libsysutil*, libio, libaudio, libnet, libnetctl, libcamera, libmic, libgem,
+libusbd...), where a missing function used to stop an unknown game with ENOSYS. Every function RPCS3 implements there
+is now pspocket's own, with RPCS3's checks and answers: the sysutil family, save data, dialogs, game data, input,
+audio, devices and the network (D-183); the NP/PSN family offline (D-185); the media library utilities (D-186); AV
+chat (D-187); the Japanese IME (D-188); recording, the sub display (D-189). The functions RPCS3 leaves as stubs answer
+as RPCS3's do (D-182), and the kernel's gaps are filled (D-184). That is 1,536 host functions in 58 modules, plus 296
+stub answers. Left out on purpose:
+
+- raw SPUs and interrupt threads, which few retail games use (D-184);
+- cellMicStopEx, fatal in RPCS3 too;
+- cellSysmodule's OpenPSID decryption, which needs a key (D-184).
+
+What no device or service backs is answered as the PS3 answers without it: PSN offline, no camera or microphone, an
+empty media library, dialogs answered at once. Next: the phone's stage 6 with games nobody has analysed (each run's
+log names what is still missing), then D-179's own media libraries and docs/firmware.md's iOS frameworks for the
+heavy media (ImageIO, VideoToolbox, AudioToolbox), and the firmware's SPU programs in the system library.
 
 ## Building and running GTA V on the Mac
 
