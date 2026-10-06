@@ -357,3 +357,70 @@ TEST_CASE("half floats")
     CHECK(half_to_float(0x0001) == Catch::Approx(5.96046448e-8f));
     CHECK(std::isinf(half_to_float(0x7c00)));
 }
+
+TEST_CASE("texture controls: what each format allows, through the remap, signed over gamma over the biased remap (D-174)")
+{
+    // RPCS3 RSXTexture.cpp format_ex and TextureUtils.cpp get_format_features. Masks in A, R, G, B order (bit 0 alpha).
+    using namespace texctl;
+    const auto field = [](u32 control, u32 shift) { return (control >> shift) & 0xfu; };
+    TextureInfo t = make_texture(tex::A8R8G8B8, 4, 4);
+    const u32 argb8 = texfeature::kSigned | texfeature::kGamma | texfeature::kBiasedRenormalization;
+    CHECK(texture_format_features(tex::A8R8G8B8) == argb8);
+    // Nothing set: only what _bx2 would expand (every channel the remap reads) and the format's features.
+    CHECK(texture_control(t) == ((0xfu << kBx2Shift) | (argb8 << kFeatureShift)));
+    // Gamma's register bits are R, G, B, A (bit 0 red); the control's A, R, G, B.
+    t.gamma = 0x7;
+    CHECK(field(texture_control(t), kGammaShift) == 0xe);
+    t.gamma = 0x8;
+    CHECK(field(texture_control(t), kGammaShift) == 0x1);
+    // Signed red (FILTER bit 29) wins over gamma on red.
+    t.gamma = 0x7;
+    t.argb_signed = 0x2;
+    CHECK(field(texture_control(t), kSignShift) == 0x2);
+    CHECK(field(texture_control(t), kGammaShift) == 0xc);
+    // The biased unsigned remap takes what the two left: alpha here, every channel without them.
+    t.unsigned_remap = 1;
+    CHECK(field(texture_control(t), kExpandShift) == 0x1);
+    t.gamma = 0;
+    t.argb_signed = 0;
+    CHECK(field(texture_control(t), kExpandShift) == 0xf);
+    // Signed channels follow the remap: with R <- B and B <- R (0xAA6C) signed red input is the blue output.
+    t.unsigned_remap = 0;
+    t.remap = 0xAA6C;
+    t.argb_signed = 0x2;
+    CHECK(field(texture_control(t), kSignShift) == 0x8);
+    // A channel the remap forces to one (control 1) is no channel _bx2 or the remap expands.
+    t.argb_signed = 0;
+    t.remap = 0xA9E4;
+    CHECK(field(texture_control(t), kBx2Shift) == 0xe);
+    t.unsigned_remap = 1;
+    CHECK(field(texture_control(t), kExpandShift) == 0xe);
+    // The alpha kill, whatever the format.
+    t.alpha_kill = true;
+    CHECK((texture_control(t) & kAlphaKill) != 0);
+
+    // Float formats: nothing works (RPCS3), the alpha kill aside.
+    TextureInfo f = make_texture(tex::X32_FLOAT, 4, 4);
+    f.gamma = 0xf;
+    f.argb_signed = 0xf;
+    f.unsigned_remap = 1;
+    CHECK(texture_control(f) == 0);
+    f.alpha_kill = true;
+    CHECK(texture_control(f) == kAlphaKill);
+    // Depth formats: the biased remap only (gamma would hang the hardware, signed does nothing).
+    TextureInfo d = make_texture(tex::DEPTH24_D8, 4, 4);
+    d.gamma = 0xf;
+    d.argb_signed = 0xf;
+    d.unsigned_remap = 1;
+    CHECK(texture_control(d) ==
+          ((0xfu << kExpandShift) | (0xfu << kBx2Shift) | (texfeature::kBiasedRenormalization << kFeatureShift)));
+    // Y16_X16: signed, in 16-bit steps, through its rewritten remap (0xE4 is 0x66: A <- G, R <- R, G <- G, B <- R).
+    CHECK(texture_hardware_remap(tex::Y16_X16, 0xAAE4) == 0xAA66);
+    CHECK(texture_hardware_remap(tex::Y16_X16, 0x1AAE4) == 0xAA56); // the override bit: R-R-R-G
+    CHECK(texture_hardware_remap(tex::W16_Z16_Y16_X16_FLOAT, 0xAA1B) == 0xAAE4);
+    TextureInfo y = make_texture(tex::Y16_X16, 4, 4);
+    y.argb_signed = 0x2;
+    CHECK(field(texture_control(y), kSignShift) == 0xa);
+    CHECK((texture_control(y) & (texfeature::k16BitChannels << kFeatureShift)) != 0);
+    CHECK(texture_remap_mask(0xAA66, 0x4) == 0x5); // green input: the alpha and green outputs
+}

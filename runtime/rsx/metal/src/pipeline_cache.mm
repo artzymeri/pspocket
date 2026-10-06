@@ -286,7 +286,10 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
         for (u8 c : options.output_swizzle[i]) opt += static_cast<char>('0' + c);
     }
     for (u32 t = 0; t < 16; t++) {
-        if (fp.texture_mask & (1u << t)) opt += std::format(".{}{}", t, static_cast<u32>(options.texture_kind[t]));
+        if (!(fp.texture_mask & (1u << t))) continue;
+        opt += std::format(".{}{}", t, static_cast<u32>(options.texture_kind[t]));
+        if (options.texture_convert_mask & (1u << t)) opt += 'c'; // texel conversions (D-174)
+        if (options.texture_alpha_kill_mask & (1u << t)) opt += 'k';
     }
     const std::string key = std::format("fp:{:016x}:{}", fp.hash, opt);
     const auto remember = [&](const CompiledProgram* c) {

@@ -88,8 +88,11 @@ struct alignas(16) MslFsParams {
     u32 alpha_func = 0x207;               // CompareFunc, only read when FpOptions::alpha_test
     float alpha_ref = 0.f;
     u32 pad0 = 0, pad1 = 0;
+    u32 tex_control[16] = {};             // per unit: the texel conversions (texture.hpp texture_control), read by the
+                                          // units FpOptions::texture_convert_mask names and by _bx2 samples
+    float tex_bias[16] = {};              // per unit: the LOD bias (NV4097_SET_TEXTURE_FILTER), 0 without mipmaps
 };
-static_assert(sizeof(MslFsParams) == 16 + 256 + 16);
+static_assert(sizeof(MslFsParams) == 16 + 256 + 16 + 64 + 64);
 
 struct VpOptions {
     bool point_size = false; // emit [[point_size]] (point primitives)
@@ -111,6 +114,11 @@ struct FpOptions {
     u32 texcoord_2d_mask = 0; // NV4097_SET_TEX_COORD_CONTROL bit 0 per unit: z = 0, w = 1/w
     bool alpha_test = false;
     bool flat_colors = false;
+    // D-174. Per unit: texels converted (texture_control() & texctl::kConvertMask: signed channels, gamma, the biased
+    // unsigned remap; RPCS3 RSX_SHADER_CONTROL_TEXTURE_FORMAT_CONVERT), and the alpha kill (RPCS3
+    // RSX_SHADER_CONTROL_TEXTURE_ALPHA_KILL). Shadow lookups have neither (RPCS3: no _process_texel).
+    u16 texture_convert_mask = 0;
+    u16 texture_alpha_kill_mask = 0;
     bool operator==(const FpOptions&) const = default;
 };
 

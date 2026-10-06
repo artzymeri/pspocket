@@ -31,6 +31,8 @@ struct rsx_fs_params {
     float4 wpos;
     float4 tex_scale[16]; // Shadow2D: z compare function, w flags (1 linear, 2 clamp the reference to 1)
     uint alpha_func; float alpha_ref; uint pad0; uint pad1;
+    uint tex_control[16]; // per unit: the texel conversions (pspocket/rsx/texture.hpp texctl)
+    float tex_bias[16];   // per unit: the LOD bias
 };
 
 static inline uint rsx_ld8(device const uchar* b, uint o) { return uint(b[o]); }
@@ -641,6 +643,7 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     TranslateResult result;
     FpContext c{fp, opt, {}, {}, {}, {}, 0, 0, 0, {}, false, false};
     bool uses_divsq = false, uses_lit = false, uses_refl = false, uses_to_srgb = false, uses_from_srgb = false;
+    bool uses_texel = false;
     std::string body;
     u32 const_slot = 0;
 
@@ -877,11 +880,19 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 sop = op == FpOp::TEXBEM ? FpOp::TEX : FpOp::TXP;
             }
             const bool proj = sop == FpOp::TXP;
+            // The unit's LOD bias (D-174; RPCS3 sets it on the sampler, and GL and Vulkan add a sampler's bias to every
+            // LOD, an explicit one too; Metal samplers have none): TEX and TXP sample with it, TXB adds it to its own,
+            // TXL to its level, and TXD's derivatives grow by 2^bias (the LOD is the log2 of their length).
+            const std::string lb = std::format("fp.tex_bias[{}]", t);
+            const std::string implicit = std::format("bias({})", lb);
+            const std::string level = std::format("level(({}).w + {})", cs, lb);
+            const std::string biased = std::format("bias(({}).w + {})", cs, lb);
             // TXD: the coordinate's derivatives are the second and third sources (RPCS3 FragmentProgramDecompiler.cpp,
             // FUNCTION_TEXTURE_SAMPLE*_GRAD: textureGrad(tex, coord, ddx, ddy)). RPCS3 scales only the coordinate of an
             // unnormalised texture; the derivatives scale with it here, as the derivatives of the scaled coordinate.
             const auto grad2 = [&](const std::string& scale) {
-                return std::format("gradient2d(({}).xy * {}, ({}).xy * {})", s1(), scale, s2(), scale);
+                return std::format("gradient2d(({}).xy * {} * exp2({}), ({}).xy * {} * exp2({}))", s1(), scale, lb, s2(),
+                    scale, lb);
             };
             if (kind == TextureKind::Shadow2D || kind == TextureKind::DepthShadow2D) {
                 // The reference is the coordinate's z (TXP: z / w); LOD, bias and TXD's derivatives do not apply to the
@@ -895,57 +906,75 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 const std::string uv = proj ? std::format("(({}).xy / ({}).w)", cs, cs) : std::format("({}).xy", cs);
                 const std::string c2 = std::format("({} * fp.tex_scale[{}].xy)", uv, t);
                 switch (sop) {
-                case FpOp::TXL: e = std::format("float4(t{}.sample(s{}, {}, level(({}).w)))", t, t, c2, cs); break;
-                case FpOp::TXB: e = std::format("float4(t{}.sample(s{}, {}, bias(({}).w)))", t, t, c2, cs); break;
+                case FpOp::TXL: e = std::format("float4(t{}.sample(s{}, {}, {}))", t, t, c2, level); break;
+                case FpOp::TXB: e = std::format("float4(t{}.sample(s{}, {}, {}))", t, t, c2, biased); break;
                 case FpOp::TXD:
                     e = std::format("float4(t{}.sample(s{}, {}, {}))", t, t, c2, grad2(std::format("fp.tex_scale[{}].xy", t)));
                     break;
-                default: e = std::format("float4(t{}.sample(s{}, {}))", t, t, c2); break;
+                default: e = std::format("float4(t{}.sample(s{}, {}, {}))", t, t, c2, implicit); break;
                 }
             } else if (kind == TextureKind::Tex3D) {
                 // 3D textures (D-102): coord.xyz (TXP: / w); unnormalised coordinates scale x and y.
                 const std::string coord = proj ? std::format("(({}).xyz / ({}).w)", cs, cs) : std::format("({}).xyz", cs);
-                const std::string c3 = std::format("({} * float3(fp.tex_scale[{}].xy, 1.0))", coord, t);
+                const std::string scale = std::format("float3(fp.tex_scale[{}].xy, 1.0)", t);
+                const std::string c3 = std::format("({} * {})", coord, scale);
                 switch (sop) {
-                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, c3, cs); break;
-                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, c3, cs); break;
+                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, {})", t, t, c3, level); break;
+                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, {})", t, t, c3, biased); break;
                 case FpOp::TXD:
-                    e = std::format("t{}.sample(s{}, {}, gradient3d(({}).xyz * float3(fp.tex_scale[{}].xy, 1.0), ({}).xyz * "
-                        "float3(fp.tex_scale[{}].xy, 1.0)))", t, t, c3, s1(), t, s2(), t);
+                    e = std::format("t{}.sample(s{}, {}, gradient3d(({}).xyz * {} * exp2({}), ({}).xyz * {} * exp2({})))", t, t,
+                        c3, s1(), scale, lb, s2(), scale, lb);
                     break;
-                default: e = std::format("t{}.sample(s{}, {})", t, t, c3); break;
+                default: e = std::format("t{}.sample(s{}, {}, {})", t, t, c3, implicit); break;
                 }
             } else if (kind == TextureKind::Cube) {
                 // TXP divides the direction by w (RPCS3 TEX3D_PROJ, its cube maps' projected sample).
                 const std::string dir = proj ? std::format("(({}).xyz / ({}).w)", cs, cs) : std::format("({}).xyz", cs);
                 switch (sop) {
-                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, dir, cs); break;
-                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, dir, cs); break;
+                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, {})", t, t, dir, level); break;
+                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, {})", t, t, dir, biased); break;
                 case FpOp::TXD:
-                    e = std::format("t{}.sample(s{}, {}, gradientcube(({}).xyz, ({}).xyz))", t, t, dir, s1(), s2());
+                    e = std::format("t{}.sample(s{}, {}, gradientcube(({}).xyz * exp2({}), ({}).xyz * exp2({})))", t, t, dir,
+                        s1(), lb, s2(), lb);
                     break;
-                default: e = std::format("t{}.sample(s{}, {})", t, t, dir); break;
+                default: e = std::format("t{}.sample(s{}, {}, {})", t, t, dir, implicit); break;
                 }
             } else {
                 std::string coord = proj ? std::format("(({}).xy / ({}).w)", cs, cs) : std::format("({}).xy", cs);
                 if (kind == TextureKind::Tex1D) coord = std::format("float2(({}).x, 0.5)", coord);
                 coord = std::format("({} * fp.tex_scale[{}].xy)", coord, t);
                 switch (sop) {
-                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, level(({}).w))", t, t, coord, cs); break;
-                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, bias(({}).w))", t, t, coord, cs); break;
+                case FpOp::TXL: e = std::format("t{}.sample(s{}, {}, {})", t, t, coord, level); break;
+                case FpOp::TXB: e = std::format("t{}.sample(s{}, {}, {})", t, t, coord, biased); break;
                 case FpOp::TXD: {
                     // A 1D texture is a row of a 2D one: its y derivatives are zero.
                     const std::string scale = std::format("fp.tex_scale[{}].xy", t);
                     e = kind == TextureKind::Tex1D
-                        ? std::format("t{}.sample(s{}, {}, gradient2d(float2(({}).x, 0.0) * {}, float2(({}).x, 0.0) * {}))",
-                              t, t, coord, s1(), scale, s2(), scale)
+                        ? std::format("t{}.sample(s{}, {}, gradient2d(float2(({}).x, 0.0) * {} * exp2({}), float2(({}).x, 0.0) "
+                              "* {} * exp2({})))", t, t, coord, s1(), scale, lb, s2(), scale, lb)
                         : std::format("t{}.sample(s{}, {}, {})", t, t, coord, grad2(scale));
                     break;
                 }
-                default: e = std::format("t{}.sample(s{}, {})", t, t, coord); break;
+                default: e = std::format("t{}.sample(s{}, {}, {})", t, t, coord, implicit); break;
                 }
             }
-            if (in.tex_bx2) e = std::format("(({}) * 2.0 - 1.0)", e); // _bx2 texture expansion
+            if (kind != TextureKind::Shadow2D && kind != TextureKind::DepthShadow2D) {
+                // RPCS3 _process_texel (RSXFragmentTextureOps.glsl): the alpha kill on the texel as sampled, then the
+                // conversions (signed channels, gamma, the biased unsigned remap and _bx2: rsx_texel, with the unit's
+                // bits). _bx2 expands what the unit's format allows, on the channels its remap reads (before D-174: every
+                // channel of every texture, shadow lookups too). Shadow lookups have neither (RPCS3 TEX2D_SHADOW).
+                const bool kill = (opt.texture_alpha_kill_mask >> t) & 1;
+                const bool convert = ((opt.texture_convert_mask >> t) & 1) || in.tex_bx2;
+                if (kill || convert) {
+                    pre += std::format("        float4 tex = {};\n", e);
+                    if (kill) pre += "        if (tex.w < 0.000001) discard_fragment(); // alpha kill\n";
+                    if (convert) {
+                        pre += std::format("        tex = rsx_texel(tex, fp.tex_control[{}], {});\n", t, in.tex_bx2 ? "true" : "false");
+                        uses_texel = true;
+                    }
+                    e = "tex";
+                }
+            }
             break;
         }
         default: return fail(std::format("opcode {}", fp_op_name(in.op)));
@@ -1046,10 +1075,46 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                "    const float4 low = c * 12.92, high = 1.055 * pow(c, float4(1.0 / 2.4)) - 0.055;\n"
                "    return clamp(select(high, low, c < 0.0031308), 0.0, 1.0);\n}\n";
     }
-    if (uses_from_srgb) {
+    if (uses_from_srgb || uses_texel) {
         // RPCS3 RSXFragmentPrologue.glsl srgb_to_linear.
         src += "static float4 rsx_srgb_to_linear(float4 c) { return select(c / 12.92, pow((c + 0.055) / 1.055, "
                "float4(2.4)), c > 0.04045); }\n";
+    }
+    if (uses_texel) {
+        // RPCS3 RSXFragmentTextureOps.glsl _process_texel, with _enable_texture_expand for _bx2. c: the unit's
+        // texture.hpp texctl bits; channel masks A, R, G, B from bit 0. Signed channels first (the byte, or 16-bit word,
+        // as two's complement over 127 or 32767), then gamma (sRGB to linear), then the biased unsigned remap ((x - 128)
+        // / 127 in the bytes' steps), each on the channels the ones before left. _bx2 on a format with biased
+        // renormalization drops gamma and expands the channels the remap reads as 2x - 1.
+        src += R"MSL(static bool4 rsx_channels(uint m) { return bool4((m & 2u) != 0u, (m & 4u) != 0u, (m & 8u) != 0u, (m & 1u) != 0u); }
+static float4 rsx_texel(float4 v, uint c, bool bx2)
+{
+    const bool wide = (c & (1u << 28)) != 0u;
+    const bool expand_bx2 = bx2 && (c & (1u << 26)) != 0u;
+    if (expand_bx2) c = (c & ~0xfu) | (((c >> 16) & 0xfu) << 6);
+    uint left = 0xfu;
+    uint m = (c >> 10) & 0xfu;
+    if (m != 0u) {
+        const float4 s = wide ? float4(as_type<int4>(uint4(floor(fma(v, float4(65535.0), float4(0.5)))) << uint4(16u)) >> int4(16)) / 32767.0
+                              : float4(as_type<int4>(uint4(floor(fma(v, float4(255.0), float4(0.5)))) << uint4(24u)) >> int4(24)) / 127.0;
+        v = select(v, s, rsx_channels(m));
+        left &= ~m;
+    }
+    m = c & 0xfu & left;
+    if (m != 0u) {
+        v = select(v, rsx_srgb_to_linear(v), rsx_channels(m));
+        left &= ~m;
+    }
+    m = (c >> 6) & 0xfu & left;
+    if (m != 0u) {
+        const float4 x = expand_bx2 ? v * 2.0 - 1.0
+                       : wide ? (floor(fma(v, float4(65535.0), float4(0.5))) - 32768.0) / 32767.0
+                              : (floor(fma(v, float4(255.0), float4(0.5))) - 128.0) / 127.0;
+        v = select(v, x, rsx_channels(m));
+    }
+    return v;
+}
+)MSL";
     }
     src += "\n";
 

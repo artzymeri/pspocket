@@ -530,6 +530,7 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
         in.saturate = op == 0x02;
         in.scale = op == 0x03 ? 1 : 0;
         in.prec = op == 0x04 ? 2 : 0;
+        in.texture_expand = (op & 2) != 0; // _bx2 on half the texture ops (D-174)
         fp.push_back(in);
     }
     FpInst kil;
@@ -564,6 +565,8 @@ TEST_CASE("metal: translated vertex and fragment programs compile")
         INFO(std::format("texture kind {}", static_cast<u32>(kind)));
         shader::FpOptions k;
         k.texture_kind.fill(kind);
+        compile(shader::translate_fragment_program(*fdecoded, k));
+        k.texture_convert_mask = k.texture_alpha_kill_mask = 0xffff; // and with every texel conversion (D-174)
         compile(shader::translate_fragment_program(*fdecoded, k));
     }
 
@@ -3303,6 +3306,140 @@ TEST_CASE("metal e2e: ARL takes the floor: c[A0.x + 6] with A0.x from -0.5 reads
     CHECK(colour(-0.5f) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // floor: c[5] (RPCS3's truncation: c[6], red)
     CHECK(colour(0.f) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});   // c[6]
     CHECK(colour(1.5f) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});  // c[7]
+}
+
+namespace {
+
+// Texture unit 0: a linear texture of `format` at kTexOffset, w x h with `mips` levels and `pitch`, with the ADDRESS,
+// CONTROL0 (the enable bit added), FILTER and CONTROL1 (remap) words given.
+void bind_texture_unit0(CommandBuilder& b, u32 format, u32 w, u32 h, u32 mips, u32 pitch, u32 address, u32 control0,
+    u32 filter, u32 remap = tex::kRemapIdentity)
+{
+    b.method(m::NV4097_SET_TEXTURE_OFFSET, {
+        kTexOffset,
+        (loc::kLocal + 1) | (1u << 3) | (2u << 4) | ((format | tex::kLinearFlag) << 8) | (mips << 16),
+        address,
+        (1u << 31) | control0,
+        remap,
+        filter,
+        (w << 16) | h,
+        0,
+    });
+    b.method(m::NV4097_SET_TEXTURE_CONTROL3, pitch);
+}
+
+constexpr u32 kClampAddress = 3u | (3u << 8) | (3u << 16);
+constexpr u32 kNearest = (1u << 16) | (1u << 24);
+
+// TEX R0, f[TEX0], TEX0, with _bx2 or not.
+std::vector<FpInst> fp_tex0(bool bx2)
+{
+    FpInst tex;
+    tex.op = 0x17;
+    tex.input = 4;
+    tex.src[0] = fp_in();
+    tex.texture_expand = bx2;
+    tex.end = true;
+    return {tex};
+}
+
+// A 4x4 A8R8G8B8 texture, every texel (A, R, G, B) = (0x80, 0x20, 0x80, 0xC0), sampled through TEX0 with the given
+// controls into the float target.
+std::array<float, 4> sample_argb(u32 address, u32 filter, u32 remap = tex::kRemapIdentity, bool bx2 = false)
+{
+    return fp_pixel(fp_tex0(bx2), [&](E2E& e, CommandBuilder& b) {
+        for (u32 i = 0; i < 16; i++) e.put_local32(kTexOffset + i * 4, 0x802080C0u);
+        bind_texture_unit0(b, tex::A8R8G8B8, 4, 4, 1, 16, kClampAddress | address, 0, kNearest | filter, remap);
+    });
+}
+
+} // namespace
+
+TEST_CASE("metal e2e: gamma, signed channels and the biased unsigned remap convert texels as RPCS3 does (D-174)")
+{
+    REQUIRE_METAL();
+    const float r = 0x20 / 255.f, g = 0x80 / 255.f, b = 0xC0 / 255.f, a = 0x80 / 255.f;
+    CHECK_NEAR4(sample_argb(0, 0), (std::array<float, 4>{r, g, b, a})); // no controls: as stored
+    // Gamma on R, G and B (ADDRESS bits 20-22): sRGB to linear; alpha stays.
+    CHECK_NEAR4(sample_argb(0x7u << 20, 0), (std::array<float, 4>{srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a}));
+    // Gamma on alpha alone (bit 23).
+    CHECK_NEAR4(sample_argb(0x8u << 20, 0), (std::array<float, 4>{r, g, b, srgb_to_linear(a)}));
+    // Signed red and blue (FILTER bits 29 and 31): the bytes as two's complement over 127.
+    CHECK_NEAR4(sample_argb(0, (0x2u | 0x8u) << 28), (std::array<float, 4>{32.f / 127.f, g, -64.f / 127.f, a}));
+    // The biased unsigned remap (ADDRESS bits 12-15 = 1): (byte - 128) / 127 in every channel.
+    CHECK_NEAR4(sample_argb(1u << 12, 0), (std::array<float, 4>{-96.f / 127.f, 0.f, 64.f / 127.f, 0.f}));
+    // All three: red signed, green and blue gamma, alpha (what is left) biased.
+    CHECK_NEAR4(sample_argb((0x7u << 20) | (1u << 12), 0x2u << 28),
+        (std::array<float, 4>{32.f / 127.f, srgb_to_linear(g), srgb_to_linear(b), 0.f}));
+}
+
+TEST_CASE("metal e2e: _bx2 expands the channels the remap reads on formats that allow it, and replaces gamma (D-174)")
+{
+    REQUIRE_METAL();
+    const auto x2 = [](u32 byte) { return byte / 255.f * 2.f - 1.f; };
+    CHECK_NEAR4(sample_argb(0, 0, tex::kRemapIdentity, true), (std::array<float, 4>{x2(0x20), x2(0x80), x2(0xC0), x2(0x80)}));
+    // Alpha forced to zero by the remap (control 0): it stays zero (before D-174: -1).
+    CHECK_NEAR4(sample_argb(0, 0, 0xA8E4, true), (std::array<float, 4>{x2(0x20), x2(0x80), x2(0xC0), 0.f}));
+    // With gamma on: _bx2 wins (RPCS3 _enable_texture_expand erases gamma).
+    CHECK_NEAR4(sample_argb(0x7u << 20, 0, tex::kRemapIdentity, true),
+        (std::array<float, 4>{x2(0x20), x2(0x80), x2(0xC0), x2(0x80)}));
+    // A float format has no biased renormalization: _bx2 does nothing (before D-174: 2x - 1).
+    const auto f = fp_pixel(fp_tex0(true), [](E2E& e, CommandBuilder& b) {
+        for (u32 i = 0; i < 16; i++) e.put_local_f(kTexOffset + i * 4, 0.25f);
+        bind_texture_unit0(b, tex::X32_FLOAT, 4, 4, 1, 16, kClampAddress, 0, kNearest);
+    });
+    CHECK_NEAR4(f, (std::array<float, 4>{0.25f, 0.25f, 0.25f, 0.25f}));
+}
+
+TEST_CASE("metal e2e: a texture's alpha kill discards fragments whose texel has no alpha (D-174)")
+{
+    REQUIRE_METAL();
+    for (const u32 alpha : {0x00u, 0x01u}) {
+        INFO(std::format("texel alpha {:#04x}", alpha));
+        E2E e;
+        e.put_local_bytes(kFpOffset, assemble_fp(fp_tex0(false)));
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        for (u32 i = 0; i < 16; i++) e.put_local32(kTexOffset + i * 4, (alpha << 24) | 0x00ff00u);
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x11223344);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        bind_texture_unit0(b, tex::A8R8G8B8, 4, 4, 1, 16, kClampAddress, 1u << 2, kNearest); // CONTROL0 bit 2
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        INFO(failure_text(e));
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const auto expected = alpha ? std::array<u8, 4>{static_cast<u8>(alpha), 0x00, 0xff, 0x00}
+                                    : std::array<u8, 4>{0x11, 0x22, 0x33, 0x44}; // discarded: the clear stays
+        CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == expected);
+    }
+}
+
+TEST_CASE("metal e2e: a texture's LOD bias moves its samples between mipmap levels (D-174)")
+{
+    REQUIRE_METAL();
+    // A 64x64 texture drawn 1:1 (LOD 0), level 0 red and level 1 green, nearest mip filtering, max LOD 12.
+    const auto level_colour = [](float bias, bool txl) {
+        std::vector<FpInst> prog = fp_tex0(false);
+        if (txl) prog[0].op = 0x2F; // TXL: the level is the coordinate's w (1) plus the bias
+        return fp_pixel(prog, [&](E2E& e, CommandBuilder& b) {
+            for (u32 i = 0; i < 64 * 64; i++) e.put_local32(kTexOffset + i * 4, 0xffff0000u);
+            for (u32 y = 0; y < 32; y++)
+                for (u32 x = 0; x < 32; x++) e.put_local32(kTexOffset + 64 * 64 * 4 + y * 256 + x * 4, 0xff00ff00u);
+            const u32 bias_bits = static_cast<u32>(static_cast<s32>(bias * 256.f)) & 0x1fff; // signed 4.8
+            bind_texture_unit0(b, tex::A8R8G8B8, 64, 64, 2, 256, kClampAddress, 0xC00u << 7,
+                (3u << 16) | (1u << 24) | bias_bits);
+        });
+    };
+    const std::array<float, 4> red{1.f, 0.f, 0.f, 1.f}, green{0.f, 1.f, 0.f, 1.f};
+    CHECK_NEAR4(level_colour(0.f, false), red);
+    CHECK_NEAR4(level_colour(1.f, false), green);
+    CHECK_NEAR4(level_colour(0.f, true), green);
+    CHECK_NEAR4(level_colour(-1.f, true), red);
 }
 
 TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")

@@ -814,6 +814,13 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             }
         }
         if (t < 10 && (state.texcoord_control(t) & 1)) fo.texcoord_2d_mask |= 1u << t;
+        // Texel conversions and the alpha kill (D-174): compiled in for the units that have them, as RPCS3's
+        // TEXTURE_FORMAT_CONVERT and TEXTURE_ALPHA_KILL; the bits reach the shader in fs.tex_control.
+        if (ti.enabled) {
+            const u32 control = texture_control(ti);
+            if (control & texctl::kConvertMask) fo.texture_convert_mask = static_cast<u16>(fo.texture_convert_mask | (1u << t));
+            if (control & texctl::kAlphaKill) fo.texture_alpha_kill_mask = static_cast<u16>(fo.texture_alpha_kill_mask | (1u << t));
+        }
     }
     const RasterInfo raster = state.raster();
     fo.alpha_test = raster.alpha_test;
@@ -868,6 +875,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             fs.tex_scale[t][3] = static_cast<float>((ti.mag_filter != static_cast<u32>(tex::MagFilter::Nearest) ? 1u : 0u) |
                                                     (bf == tex::DEPTH16 || bf == tex::DEPTH24_D8 ? 2u : 0u));
         }
+        fs.tex_control[t] = ti.enabled ? texture_control(ti) : 0u; // D-174
         if (Surface* zs = depth_source[t]) {
             bound[t] = zs->texture;
             zs->last_used = tick;
@@ -904,6 +912,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                      : wanted == MTLTextureTypeCube       ? dummy_cube
                      : wanted == MTLTextureType3D         ? dummy_volume
                                                           : dummy_texture;
+        }
+        // The LOD bias (D-174), for a texture with mipmaps its filter reads, as RPCS3 sets it on the sampler only then
+        // (VKDraw.cpp, GL sampler_state::apply): on one level it would only move magnification to minification.
+        if (bound[t].mipmapLevelCount > 1 && ti.min_filter >= static_cast<u32>(tex::MinFilter::NearestNearest)) {
+            fs.tex_bias[t] = ti.bias;
         }
     }
 

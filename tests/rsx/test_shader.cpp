@@ -402,7 +402,7 @@ TEST_CASE("fragment program MSL for the supported subset")
     const std::string& s = r.shader.source;
     CHECK(s.find("fragment rsx_fs_out " + r.shader.entry) != std::string::npos);
     CHECK(s.find("(clamp(in.col0, 0.0, 1.0)) * (fc[0])") != std::string::npos);
-    CHECK(s.find("t0.sample(s0, ((in.tc0).xy * fp.tex_scale[0].xy))") != std::string::npos);
+    CHECK(s.find("t0.sample(s0, ((in.tc0).xy * fp.tex_scale[0].xy), bias(fp.tex_bias[0]))") != std::string::npos);
     CHECK(s.find("(r0) + (fc[1].xxxx)") != std::string::npos);
     CHECK(s.find("r0.xyz = res.xyz;") != std::string::npos);
     CHECK(s.find("out.c0 = r0;") != std::string::npos);
@@ -696,9 +696,9 @@ TEST_CASE("fragment programs: LIT, LIF, DST, REFL, DP2A, PKG, UPG, BEM, TEXBEM a
           std::string::npos);
     // TEXBEM samples x2d as TEX does its coordinate, TXPBEM as TXP.
     const std::string bem = translate_fp({fp_op3(FpOp::TEXBEM)}).shader.source;
-    CHECK(bem.find("t0.sample(s0, ((x2d).xy * fp.tex_scale[0].xy))") != std::string::npos);
-    CHECK(translate_fp({fp_op3(FpOp::TXPBEM)}).shader.source.find("t0.sample(s0, (((x2d).xy / (x2d).w) * fp.tex_scale[0].xy))") !=
-          std::string::npos);
+    CHECK(bem.find("t0.sample(s0, ((x2d).xy * fp.tex_scale[0].xy), bias(fp.tex_bias[0]))") != std::string::npos);
+    const std::string txpbem = translate_fp({fp_op3(FpOp::TXPBEM)}).shader.source;
+    CHECK(txpbem.find("t0.sample(s0, (((x2d).xy / (x2d).w) * fp.tex_scale[0].xy), bias(fp.tex_bias[0]))") != std::string::npos);
     // LIT, LIF and REFL are not precision-clamped (RPCS3 SetDst); DST is.
     for (const FpOp op : {FpOp::LIT, FpOp::LIF, FpOp::REFL, FpOp::DST}) {
         FpInst in = fp_op3(op);
@@ -740,6 +740,59 @@ TEST_CASE("fragment program TXP on a cube map divides by w; TXD on a shadow map 
     CHECK(s.find("t0.sample(s0, ((in.tc0).xyz / (in.tc0).w)") != std::string::npos);
     CHECK(s.find("rsx_shadow(t1, s1, (in.tc1).xy * fp.tex_scale[1].xy, (in.tc1).z, fp.tex_scale[1])") != std::string::npos);
     CHECK(s.find("texturecube<float> t0 [[texture(0)]]") != std::string::npos);
+}
+
+TEST_CASE("fragment program texel conversions, alpha kill and LOD bias, per unit (RPCS3 _process_texel, D-174)")
+{
+    // TEX R0, f[TEX0], TEX0    TXL R1, f[TEX1], TEX1    TXD_bx2 R2, f[TEX2], R3, R4, TEX2    TEX_bx2 R5, f[TEX3], TEX3 END
+    const auto sample = [](FpOp op, u32 unit, bool bx2) {
+        FpInst in;
+        in.op = static_cast<u32>(op);
+        in.dst = unit == 3 ? 5 : unit;
+        in.input = 4 + unit;
+        in.tex = unit;
+        in.src[0] = fp_in();
+        in.src[1] = fp_r(3);
+        in.src[2] = fp_r(4);
+        in.texture_expand = bx2;
+        return in;
+    };
+    std::vector<FpInst> prog{sample(FpOp::TEX, 0, false), sample(FpOp::TXL, 1, false), sample(FpOp::TXD, 2, true),
+        sample(FpOp::TEX, 3, true)};
+    prog.back().end = true;
+    FpOptions opt;
+    opt.texture_convert_mask = 0x1;
+    opt.texture_alpha_kill_mask = 0x1;
+    opt.texture_kind[3] = TextureKind::Shadow2D;
+    const TranslateResult r = translate_fp(prog, opt);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    const std::string& s = r.shader.source;
+    INFO(s);
+    // Unit 0: alpha kill on the texel as sampled, then its conversions; the unit's LOD bias on the implicit LOD.
+    CHECK(s.find("float4 tex = t0.sample(s0, ((in.tc0).xy * fp.tex_scale[0].xy), bias(fp.tex_bias[0]));\n"
+                 "        if (tex.w < 0.000001) discard_fragment(); // alpha kill\n"
+                 "        tex = rsx_texel(tex, fp.tex_control[0], false);") != std::string::npos);
+    // Unit 1: TXL's level plus the bias, nothing converted.
+    CHECK(s.find("t1.sample(s1, ((in.tc1).xy * fp.tex_scale[1].xy), level((in.tc1).w + fp.tex_bias[1]))") != std::string::npos);
+    CHECK(s.find("fp.tex_control[1]") == std::string::npos);
+    // Unit 2: _bx2 converts as the unit's format allows; TXD's derivatives grow by 2^bias.
+    CHECK(s.find("gradient2d((r3).xy * fp.tex_scale[2].xy * exp2(fp.tex_bias[2]), (r4).xy * fp.tex_scale[2].xy * "
+                 "exp2(fp.tex_bias[2]))") != std::string::npos);
+    CHECK(s.find("tex = rsx_texel(tex, fp.tex_control[2], true);") != std::string::npos);
+    // Unit 3: a shadow lookup: neither _bx2 nor conversions (RPCS3 TEX2D_SHADOW).
+    CHECK(s.find("fp.tex_control[3]") == std::string::npos);
+    CHECK(s.find("const float4 res = rsx_shadow(t3, s3, (in.tc3).xy * fp.tex_scale[3].xy, (in.tc3).z, fp.tex_scale[3]);") !=
+          std::string::npos);
+    CHECK(s.find("static float4 rsx_texel(float4 v, uint c, bool bx2)") != std::string::npos);
+    CHECK(s.find("uint tex_control[16];") != std::string::npos);
+    // Without conversions, alpha kill or _bx2, no helper and no extra statements.
+    FpInst only = sample(FpOp::TEX, 0, false);
+    only.end = true;
+    const TranslateResult plain = translate_fp({only}, FpOptions{});
+    REQUIRE(plain.ok);
+    CHECK(plain.shader.source.find("rsx_texel") == std::string::npos);
+    CHECK(plain.shader.source.find("discard_fragment") == std::string::npos);
 }
 
 TEST_CASE("fragment program loops run their count; the LOOP index picks texture coordinates (NV_fragment_program2, D-174)")
