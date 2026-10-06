@@ -54,6 +54,16 @@ from frame 6,450. 3 to 4 fps there and 1.1 GB: the library prepared on the Mac h
 interpreted: one task executed 16.5 billion SPU instructions in 120 s before), and the job loop runs interpreted
 after the fiber switches (D-161). The GTA V gate passes 18 of 18 after D-161 and after D-162.
 
+## With its SPU programs translated
+
+A run with `--spu-dump` (330 s, the same presses) collected 22 SPU programs (48 billion interpreted SPU instructions
+in that run). `pspocket-prepare --spu-images` lifted them into the library in 49 s (46 files; the PPU objects kept;
+the time-left estimate overshot by up to 14 times for these smaller SPU programs, rate 0.16 learned for next time).
+The same session again: 1,608,542 SPU program loads, all translated, none interpreted. Frame rate: 17-18 fps on the
+autosave notice (as before), 60 fps in the menus, 26-31 fps through the first level, and **30-34 fps in the
+Abstergo lab cutscene** (Desmond, Vidic, Lucy) at the end of the run. The picture is very white and flat; the game's
+look is bright there, but that much is to be checked against real footage. DEPTH24_D8 textures now decode (D-163).
+
 ## Tools added
 
 pspocket-boot --watch ADDR[@SECONDS], fault reports that name each frame's image and base (atos on a game library
