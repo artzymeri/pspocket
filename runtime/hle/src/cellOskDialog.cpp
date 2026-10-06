@@ -17,15 +17,18 @@
 // copied). A keyboard UI plugs in at show_keyboard(): it shows the request there, and calls keyboard_closed() with the
 // user's answer and text.
 //
-// Not implemented, as GTA V doesn't import them: the separate-window mode (cellOskDialogSetSeparateWindowOption), so
-// the device mask changes nothing (RPCS3 applies it to separate windows only) and those windows' events
-// (DISPLAY_CHANGED, INPUT_ENTERED, INPUT_CANCELED) never occur; cellOskDialogGetInputText, cellOskDialogGetSize and the
-// other settings; the cellOskExtUtility functions (word filter, keyboard hooks, ...).
+// Every function RPCS3 registers is here (D-183): the rest of the settings and the separate-window option are kept for
+// a keyboard UI (nothing draws them), cellOskDialogGetInputText serves the text the unload or
+// cellOskDialogExtUpdateInputText last copied, and cellOskExtUtility's callbacks, colours and switches are kept as
+// RPCS3 keeps them. cellOskDialogExtSendFinishMessage closes the dialog as the user would.
 //
 // Deviation from RPCS3: pointers are checked before use (D-042). One that is not guest memory, or a message or initial
 // text that runs into such memory, is logged with the call site and refused with CELL_OSKDIALOG_ERROR_PARAM (RPCS3
 // faults).
 
+#include <algorithm>
+#include <array>
+#include <functional>
 #include <bit>
 #include <format>
 #include <mutex>
@@ -131,6 +134,22 @@ struct Settings {
     u32 key_layout_options = CELL_OSKDIALOG_10KEY_PANEL; // the panels it offers: 10-key, full keyboard, or both
     u32 supported_languages = 0;                         // CELL_OSKDIALOG_PANELMODE_* it may offer besides the defaults
     Layout layout{};
+    // The rest of RPCS3's osk_info, reset with these (D-183).
+    bool dimmer = true;            // the screen dims behind the dialog
+    u32 initial_input_device = 0;  // CELL_OSKDIALOG_INPUT_DEVICE_PAD
+    u32 initial_key_layout = 0;    // CELL_OSKDIALOG_INITIAL_PANEL_LAYOUT_SYSTEM
+    bool separate_windows = false; // cellOskDialogSetSeparateWindowOption
+    u32 continuous_mode = 0;       // CELL_OSKDIALOG_CONTINUOUS_MODE_NONE
+    s32 field_window_width = 0;
+    f32 field_transparency = 1.0f;
+    Layout field_layout{}, panel_layout{};
+    bool lock_input_device = false; // cellOskDialogExtInputDeviceLock
+    bool clipboard = false, half_byte_kana = false, pointer = false;
+    f32 pointer_x = 0.0f, pointer_y = 0.0f;
+    std::array<f32, 4> base_color{0.2f, 0.2f, 0.2f, 1.0f};
+    f32 initial_scale = 1.0f;
+    u32 confirm_callback = 0, force_finish_callback = 0, keyboard_hook = 0; // descriptors, kept (no keyboard UI)
+    u16 hook_event_mode = 0;
 };
 
 // What a keyboard UI shows (RPCS3 OskDialogBase::osk_params, the parts the load sets).
@@ -151,6 +170,7 @@ struct OskState {
     bool open = false;   // shown, waiting for the user (RPCS3 OskDialogState::Open); false once it closed
     s32 input_result = CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK;
     std::u16string text; // the keyboard's text (RPCS3 osk_text): the initial text, then the user's
+    std::u16string valid_text; // the text served to the game (RPCS3 valid_text): copied at the unload or ExtUpdate
     Settings settings;
 };
 
@@ -369,6 +389,7 @@ s32 cellOskDialogUnloadAsync(PPUContext& ctx, u32 output_info)
     s.open = false;
     s.input_result = CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK;
     s.text.clear();
+    s.valid_text.clear();
     s.settings = {};
     sysutil_send_event(CELL_SYSUTIL_OSKDIALOG_UNLOADED, 0);
     return logged(lv2::CELL_OK, call,
@@ -445,6 +466,262 @@ s32 cellOskDialogSetLayoutMode(PPUContext&, s32 layout_mode)
         std::format(" {{x align {:#x}, y align {:#x}}}", s.settings.layout.x_align, s.settings.layout.y_align));
 }
 
+// cellOskDialogGetInputText(OutputInfo): RPCS3's getText outside the unload. The text served is the one last copied
+// (by an unload or cellOskDialogExtUpdateInputText): OK when there is one, else NO_INPUT_TEXT; copied as the unload
+// copies it, only with OK.
+s32 cellOskDialogGetInputText(PPUContext& ctx, u32 output_info)
+{
+    const std::string call = std::format("cellOskDialogGetInputText(OutputInfo {:#x})", output_info);
+    if (!output_info || !usable(ctx, output_info, kReturnParamSize, "cellOskDialogGetInputText: OutputInfo"))
+        return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    u8* base = guest_base(ctx);
+    const s32 num_chars = static_cast<s32>(ps_read32(base, output_info + 4));
+    const u32 result_string = ps_read32(base, output_info + 8);
+    if (num_chars < 0) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    OskState& s = osk();
+    std::lock_guard lock(s.mutex);
+    if (!s.loaded) return logged(error(CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED), call);
+    const std::u16string& text = s.valid_text;
+    const s32 result = text.empty() ? CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT : CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK;
+    ps_write32(base, output_info + 0, static_cast<u32>(result));
+    if (result_string && result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK) {
+        const u32 limit = static_cast<u32>(num_chars);
+        const auto unit = [&](u32 i) -> char16_t { return i < limit && i < text.size() ? text[i] : u'\0'; };
+        u32 units = 0;
+        while (units < CELL_OSKDIALOG_STRING_SIZE - 1)
+            if (!unit(units++)) break;
+        if (!usable(ctx, result_string, 2 * units, "cellOskDialogGetInputText: pResultString"))
+            return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+        for (u32 i = 0; i < units; i++) ps_write16(base, result_string + 2 * i, unit(i));
+    }
+    return logged(lv2::CELL_OK, call, std::format(" {{result {}, \"{}\"}}", result, utf8(text)));
+}
+
+// cellOskDialogGetSize(width, height, dialogType): RPCS3's 1 x 1, the width 0 for the separate window types (4 up).
+s32 cellOskDialogGetSize(PPUContext& ctx, u32 width, u32 height, u32 dialog_type)
+{
+    const std::string call = std::format("cellOskDialogGetSize({:#x}, {:#x}, type {})", width, height, dialog_type);
+    if (!width || !height) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    ps_write16(guest_base(ctx), width, dialog_type >= 4 ? 0 : 1);
+    ps_write16(guest_base(ctx), height, 1);
+    return logged(lv2::CELL_OK, call);
+}
+
+// A setting changed under the state's lock, logged.
+s32 set(std::string_view call, const std::function<void(Settings&)>& change)
+{
+    OskState& s = osk();
+    std::lock_guard lock(s.mutex);
+    change(s.settings);
+    return logged(lv2::CELL_OK, call);
+}
+
+s32 cellOskDialogDisableDimmer(PPUContext&)
+{
+    return set("cellOskDialogDisableDimmer()", [](Settings& st) { st.dimmer = false; });
+}
+
+// 0 the pad, 1 the keyboard (CELL_OSKDIALOG_INPUT_DEVICE_*).
+s32 cellOskDialogSetInitialInputDevice(PPUContext&, u32 device)
+{
+    const std::string call = std::format("cellOskDialogSetInitialInputDevice({})", device);
+    if (device > 1) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    return set(call, [&](Settings& st) { st.initial_input_device = device; });
+}
+
+// The panel shown first: SYSTEM, 10KEY or FULLKEY; kept only when the key layout option offers it (RPCS3).
+s32 cellOskDialogSetInitialKeyLayout(PPUContext&, u32 layout)
+{
+    const std::string call = std::format("cellOskDialogSetInitialKeyLayout({})", layout);
+    if (layout > 2) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    return set(call, [&](Settings& st) {
+        if (st.key_layout_options & layout) st.initial_key_layout = layout;
+    });
+}
+
+// CellOskDialogSeparateWindowOption (28 bytes): be32 continuousMode; be s32 deviceMask, inputFieldWindowWidth; be f32
+// inputFieldBackgroundTrans; be32 inputFieldLayoutInfo, inputPanelLayoutInfo, reserved. A CellOskDialogLayoutInfo is
+// be s32 layoutMode and a CellOskDialogPoint {be f32 x, y}. The panel aligns with the field when it has no layout.
+s32 cellOskDialogSetSeparateWindowOption(PPUContext& ctx, u32 option)
+{
+    const std::string call = std::format("cellOskDialogSetSeparateWindowOption({:#x})", option);
+    if (!option || !usable(ctx, option, 28, "cellOskDialogSetSeparateWindowOption: windowOption"))
+        return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    u8* base = guest_base(ctx);
+    const u32 continuous = ps_read32(base, option + 0);
+    const s32 mask = static_cast<s32>(ps_read32(base, option + 4));
+    const u32 field = ps_read32(base, option + 16), panel = ps_read32(base, option + 20);
+    if (!field || ps_read32(base, option + 24) || continuous > 3 || mask > static_cast<s32>(CELL_OSKDIALOG_DEVICE_MASK_PAD) ||
+        !usable(ctx, field, 12, "cellOskDialogSetSeparateWindowOption: inputFieldLayoutInfo") ||
+        (panel && !usable(ctx, panel, 12, "cellOskDialogSetSeparateWindowOption: inputPanelLayoutInfo"))) {
+        return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    }
+    const auto layout_at = [&](u32 at) {
+        Layout l;
+        l.mode = ps_read32(base, at);
+        l.x_align = aligned_x(l.mode);
+        l.y_align = aligned_y(l.mode);
+        l.x_offset = std::bit_cast<f32>(ps_read32(base, at + 4));
+        l.y_offset = std::bit_cast<f32>(ps_read32(base, at + 8));
+        return l;
+    };
+    return set(call, [&](Settings& st) {
+        st.separate_windows = true;
+        st.continuous_mode = continuous;
+        st.device_mask = static_cast<u32>(mask);
+        st.field_window_width = static_cast<s32>(ps_read32(base, option + 8));
+        st.field_transparency = std::clamp(std::bit_cast<f32>(ps_read32(base, option + 12)), 0.0f, 1.0f);
+        st.field_layout = layout_at(field);
+        st.panel_layout = panel ? layout_at(panel) : st.field_layout;
+    });
+}
+
+// ------------------------------------------------------------------------------------- cellOskExtUtility (RPCS3)
+
+s32 cellOskDialogExtInputDeviceLock(PPUContext&)
+{
+    return set("cellOskDialogExtInputDeviceLock()", [](Settings& st) { st.lock_input_device = true; });
+}
+
+s32 cellOskDialogExtInputDeviceUnlock(PPUContext&)
+{
+    return set("cellOskDialogExtInputDeviceUnlock()", [](Settings& st) { st.lock_input_device = false; });
+}
+
+// The callbacks a keyboard UI would call; kept (there is none).
+s32 register_callback(std::string_view name, u32 callback, u32 Settings::*slot)
+{
+    const std::string call = std::format("{}({:#x})", name, callback);
+    if (!callback) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    return set(call, [&](Settings& st) { st.*slot = callback; });
+}
+
+s32 cellOskDialogExtRegisterConfirmWordFilterCallback(PPUContext&, u32 callback)
+{
+    return register_callback("cellOskDialogExtRegisterConfirmWordFilterCallback", callback, &Settings::confirm_callback);
+}
+
+s32 cellOskDialogExtRegisterForceFinishCallback(PPUContext&, u32 callback)
+{
+    return register_callback("cellOskDialogExtRegisterForceFinishCallback", callback, &Settings::force_finish_callback);
+}
+
+// The hardware keyboard hook: function keys (1), ASCII keys (2), and for the Ex one modifiers alone (4).
+s32 keyboard_hook(std::string_view name, u16 mode, u16 allowed, u32 callback)
+{
+    const std::string call = std::format("{}(hookEventMode {:#x}, {:#x})", name, mode, callback);
+    if (mode == 0 || mode > allowed || !callback) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    return set(call, [&](Settings& st) {
+        st.keyboard_hook = callback;
+        st.hook_event_mode = mode;
+    });
+}
+
+s32 cellOskDialogExtRegisterKeyboardEventHookCallback(PPUContext&, u16 mode, u32 callback)
+{
+    return keyboard_hook("cellOskDialogExtRegisterKeyboardEventHookCallback", mode, 3, callback);
+}
+
+s32 cellOskDialogExtRegisterKeyboardEventHookCallbackEx(PPUContext&, u16 mode, u32 callback)
+{
+    return keyboard_hook("cellOskDialogExtRegisterKeyboardEventHookCallbackEx", mode, 7, callback);
+}
+
+// Option dictionaries for the Japanese input method: logged, as RPCS3 (nothing uses them).
+s32 cellOskDialogExtAddJapaneseOptionDictionary(PPUContext&, u32 paths)
+{
+    return logged(lv2::CELL_OK, std::format("cellOskDialogExtAddJapaneseOptionDictionary({:#x})", paths));
+}
+
+s32 cellOskDialogExtAddOptionDictionary(PPUContext&, u32 info)
+{
+    const std::string call = std::format("cellOskDialogExtAddOptionDictionary({:#x})", info);
+    if (!info) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    return logged(lv2::CELL_OK, call);
+}
+
+s32 cellOskDialogExtEnableClipboard(PPUContext&)
+{
+    return set("cellOskDialogExtEnableClipboard()", [](Settings& st) { st.clipboard = true; });
+}
+
+s32 cellOskDialogExtEnableHalfByteKana(PPUContext&)
+{
+    return set("cellOskDialogExtEnableHalfByteKana()", [](Settings& st) { st.half_byte_kana = true; });
+}
+
+s32 cellOskDialogExtDisableHalfByteKana(PPUContext&)
+{
+    return set("cellOskDialogExtDisableHalfByteKana()", [](Settings& st) { st.half_byte_kana = false; });
+}
+
+s32 cellOskDialogExtSetPointerEnable(PPUContext&, bool enable)
+{
+    return set(std::format("cellOskDialogExtSetPointerEnable({})", enable), [&](Settings& st) { st.pointer = enable; });
+}
+
+// CellOskDialogPoint {be f32 x, y}; a null one changes nothing (RPCS3).
+s32 cellOskDialogExtUpdatePointerDisplayPos(PPUContext& ctx, u32 pos)
+{
+    const std::string call = std::format("cellOskDialogExtUpdatePointerDisplayPos({:#x})", pos);
+    if (!pos) return logged(lv2::CELL_OK, call);
+    if (!usable(ctx, pos, 8, "cellOskDialogExtUpdatePointerDisplayPos: pos")) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    const f32 x = std::bit_cast<f32>(ps_read32(guest_base(ctx), pos)), y = std::bit_cast<f32>(ps_read32(guest_base(ctx), pos + 4));
+    return set(call, [&](Settings& st) {
+        st.pointer_x = x;
+        st.pointer_y = y;
+    });
+}
+
+// cellOskDialogExtSetBaseColor(red, green, blue, alpha): floats in f1 to f4, each 0 to 1.
+s32 cellOskDialogExtSetBaseColor(PPUContext& ctx)
+{
+    const std::array<f32, 4> c{static_cast<f32>(ctx.fpr[1]), static_cast<f32>(ctx.fpr[2]), static_cast<f32>(ctx.fpr[3]),
+        static_cast<f32>(ctx.fpr[4])};
+    const std::string call = std::format("cellOskDialogExtSetBaseColor({}, {}, {}, {})", c[0], c[1], c[2], c[3]);
+    for (const f32 v : c)
+        if (v < 0.0f || v > 1.0f) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    return set(call, [&](Settings& st) { st.base_color = c; });
+}
+
+// cellOskDialogExtSetInitialScale(scale): a float in f1, 0.80 to 1.05.
+s32 cellOskDialogExtSetInitialScale(PPUContext& ctx)
+{
+    const f32 scale = static_cast<f32>(ctx.fpr[1]);
+    const std::string call = std::format("cellOskDialogExtSetInitialScale({})", scale);
+    if (scale < 0.80f || scale > 1.05f) return logged(error(CELL_OSKDIALOG_ERROR_PARAM), call);
+    return set(call, [&](Settings& st) { st.initial_scale = scale; });
+}
+
+// The current text becomes the text cellOskDialogGetInputText serves, while the dialog is still in use.
+s32 cellOskDialogExtUpdateInputText(PPUContext&)
+{
+    OskState& s = osk();
+    std::lock_guard lock(s.mutex);
+    if (s.loaded) s.valid_text = s.text.substr(0, CELL_OSKDIALOG_STRING_SIZE - 1);
+    return logged(lv2::CELL_OK, "cellOskDialogExtUpdateInputText()", std::format(" {{\"{}\"}}", utf8(s.valid_text)));
+}
+
+// The game closes the dialog as the user would (CellOskDialogFinishReason: CONFIRM keeps the text, else cancelled).
+// No dialog loaded: CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (RPCS3).
+s32 cellOskDialogExtSendFinishMessage(PPUContext&, u32 reason)
+{
+    const std::string call = std::format("cellOskDialogExtSendFinishMessage({})", reason);
+    u64 generation = 0;
+    std::u16string text;
+    {
+        OskState& s = osk();
+        std::lock_guard lock(s.mutex);
+        if (!s.loaded) return logged(error(CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED), call);
+        generation = s.generation;
+        text = s.text;
+    }
+    keyboard_closed(generation, reason == CELL_OSKDIALOG_CLOSE_CONFIRM ? CELL_OSKDIALOG_CLOSE_CONFIRM
+                                                                       : CELL_OSKDIALOG_CLOSE_CANCEL,
+        std::move(text));
+    return logged(lv2::CELL_OK, call);
+}
+
 } // namespace
 
 void register_cellOskDialog(Registry& r)
@@ -457,6 +734,31 @@ void register_cellOskDialog(Registry& r)
         PS_HLE_FUNC(0xB53C54FA, cellOskDialogSetKeyLayoutOption),
         PS_HLE_FUNC(0x7F21C918, cellOskDialogAddSupportLanguage),
         PS_HLE_FUNC(0xF0EC3CCC, cellOskDialogSetLayoutMode),
+        PS_HLE_FUNC(0x1D99C3EE, cellOskDialogGetInputText),
+        PS_HLE_FUNC(0x35BEADE0, cellOskDialogGetSize),
+        PS_HLE_FUNC(0x41F20828, cellOskDialogDisableDimmer),
+        PS_HLE_FUNC(0xF3B4B43E, cellOskDialogSetInitialInputDevice),
+        PS_HLE_FUNC(0xC427890C, cellOskDialogSetInitialKeyLayout),
+        PS_HLE_FUNC(0x53E39DF3, cellOskDialogSetSeparateWindowOption),
+    });
+    r.add("cellOskExtUtility", {
+        PS_HLE_FUNC(0x09565B21, cellOskDialogExtInputDeviceUnlock),
+        PS_HLE_FUNC(0x1E1B4C97, cellOskDialogExtRegisterKeyboardEventHookCallback),
+        PS_HLE_FUNC(0xBDCF8383, cellOskDialogExtRegisterKeyboardEventHookCallbackEx),
+        PS_HLE_FUNC(0x23A2EDE6, cellOskDialogExtAddJapaneseOptionDictionary),
+        PS_HLE_FUNC(0x40187C25, cellOskDialogExtEnableClipboard),
+        PS_HLE_FUNC(0x42439DB5, cellOskDialogExtSendFinishMessage),
+        PS_HLE_FUNC(0x4FE14D09, cellOskDialogExtAddOptionDictionary),
+        PS_HLE_FUNC(0x75370397, cellOskDialogExtSetInitialScale),
+        PS_HLE_FUNC(0x7C95FEB8, cellOskDialogExtInputDeviceLock),
+        PS_HLE_FUNC(0x7EB292CD, cellOskDialogExtSetBaseColor),
+        PS_HLE_FUNC(0x8692FCD2, cellOskDialogExtRegisterConfirmWordFilterCallback),
+        PS_HLE_FUNC(0x8B60C469, cellOskDialogExtUpdateInputText),
+        PS_HLE_FUNC(0x9CB12C89, cellOskDialogExtDisableHalfByteKana),
+        PS_HLE_FUNC(0xC5447A90, cellOskDialogExtSetPointerEnable),
+        PS_HLE_FUNC(0xD3EA496B, cellOskDialogExtUpdatePointerDisplayPos),
+        PS_HLE_FUNC(0xE6C43C58, cellOskDialogExtEnableHalfByteKana),
+        PS_HLE_FUNC(0xE800F586, cellOskDialogExtRegisterForceFinishCallback),
     });
 }
 

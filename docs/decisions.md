@@ -3627,6 +3627,23 @@ These are 41 more functions.
     closes.
 - **Kernel::vfs_tree_size.** The size of a guest directory, on a host mount or inside a disc image.
 
+**cellOskDialog and cellOskExtUtility: every function RPCS3 registers (23 more)**
+
+- **cellOskDialogGetInputText** serves the text last copied, by an unload or cellOskDialogExtUpdateInputText. Its
+  result is OK with that text, else NO_INPUT_TEXT, as RPCS3's getText.
+- **GetSize**: RPCS3's 1 x 1, width 0 for separate windows.
+- **DisableDimmer, SetInitialInputDevice and SetInitialKeyLayout.** The key layout is kept only when the layout
+  option offers it.
+- **SetSeparateWindowOption**: RPCS3's checks; the field and panel layouts are kept.
+- **cellOskExtUtility.**
+  - The confirm filter, force-finish and keyboard-hook callbacks are kept: there is no keyboard to call them.
+  - Base colour and initial scale take floats in f1 to f4; the pointer, clipboard, half-byte kana and device lock are
+    switches.
+  - The dictionaries are logged.
+  - ExtSendFinishMessage closes the dialog as the user would; CONFIRM keeps the text.
+
+All of these are reset at the unload, as RPCS3's osk_info::reset.
+
 `read_cstr` (a checked guest string) moved from cellSaveData.cpp to guest.hpp for every module. The NID check
 (test_hle) accepts RPCS3's REG_FNID names, which end with their NID.
 
@@ -3658,6 +3675,13 @@ Tests (tests/hle/test_sysPrxForUser.cpp, cellGame):
 - the patch check, the empty paths, themes from a buffer;
 - the booted directory's size before and after the disc is mounted;
 - system versions, the disc change callbacks and the exit dialogs.
+
+Tests (tests/hle/test_sysutil.cpp, osk):
+
+- the input text before and after ExtUpdateInputText;
+- the finish message confirming the dialog before the missing keyboard's cancel;
+- the settings' limits, GetSize, the separate window option;
+- the Ext callbacks, hooks, floats and switches.
 
 ## Open decisions (plan section 14)
 

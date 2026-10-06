@@ -1276,3 +1276,101 @@ TEST_CASE("cellVideoOut, cellAudioOut, cellSysutilAvconfExt: the rest of RPCS3's
     CHECK(a.call("cellAudioInSetDeviceMode", 10) == 0);
     CHECK(a.call("cellAudioInUnregisterDevice", 0) == 0);
 }
+
+TEST_CASE("cellOskDialog: input text, the finish message, settings and separate windows; cellOskExtUtility (D-183)",
+    "[hle][sysutil][osk]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    write_log_callback(base);
+    REQUIRE(a.call("cellSysutilRegisterCallback", 0, kLogOpd, 0x5150) == 0);
+    write_osk_load_args(base);
+    const auto check = [&] { REQUIRE(a.call("cellSysutilCheckCallback") == 0); };
+
+    // No dialog: the input text and the finish message have nothing to act on.
+    write_osk_output(base, 32);
+    CHECK(a.call("cellOskDialogGetInputText", kOskOut) == kNotOpened);
+    CHECK(a.call("cellOskDialogExtSendFinishMessage", 0) == kNotOpened);
+
+    // Loaded: nothing copied yet (NO_INPUT_TEXT); after ExtUpdateInputText the initial text is served.
+    REQUIRE(a.call("cellOskDialogLoadAsync", 0, kOskParam, kOskField) == 0);
+    REQUIRE(a.call("cellOskDialogGetInputText", kOskOut) == 0);
+    CHECK(ps_read32(base, kOskOut) == 3); // CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT
+    CHECK(all_bytes(base + kOskString, 0x400, 0xAA));
+    REQUIRE(a.call("cellOskDialogExtUpdateInputText") == 0);
+    write_osk_output(base, 32);
+    REQUIRE(a.call("cellOskDialogGetInputText", kOskOut) == 0);
+    CHECK(ps_read32(base, kOskOut) == 0);
+    CHECK(get_utf16(base, kOskString, 32) == u"Niko");
+    CHECK(a.call("cellOskDialogGetInputText", 0) == kOskParamError);
+
+    // The game confirms the dialog itself, before the missing keyboard's cancel: the unload gets OK and the text.
+    REQUIRE(a.call("cellOskDialogExtSendFinishMessage", 0) == 0); // CELL_OSKDIALOG_CLOSE_CONFIRM
+    check();
+    check();
+    write_osk_output(base, 32);
+    REQUIRE(a.call("cellOskDialogUnloadAsync", kOskOut) == 0);
+    CHECK(ps_read32(base, kOskOut) == 0);
+    CHECK(get_utf16(base, kOskString, 32) == u"Niko");
+    const std::vector<Event> e = events(base);
+    REQUIRE(e.size() == 2);
+    CHECK(e[0].status == kOskLoaded);
+    CHECK(e[1].status == kOskFinished); // one FINISHED: the keyboard's later cancel finds the dialog closed
+
+    // The settings: RPCS3's limits.
+    CHECK(a.call("cellOskDialogDisableDimmer") == 0);
+    CHECK(a.call("cellOskDialogSetInitialInputDevice", 1) == 0);
+    CHECK(a.call("cellOskDialogSetInitialInputDevice", 2) == kOskParamError);
+    CHECK(a.call("cellOskDialogSetInitialKeyLayout", 2) == 0);
+    CHECK(a.call("cellOskDialogSetInitialKeyLayout", 3) == kOskParamError);
+    constexpr u32 kDialogSize = kData + 0x31000;
+    REQUIRE(a.call("cellOskDialogGetSize", kDialogSize, kDialogSize + 2, 0) == 0);
+    CHECK(ps_read16(base, kDialogSize) == 1);
+    CHECK(ps_read16(base, kDialogSize + 2) == 1);
+    REQUIRE(a.call("cellOskDialogGetSize", kDialogSize, kDialogSize + 2, 4) == 0); // a separate window
+    CHECK(ps_read16(base, kDialogSize) == 0);
+    CHECK(a.call("cellOskDialogGetSize", 0, kDialogSize + 2, 0) == kOskParamError);
+
+    // CellOskDialogSeparateWindowOption: a field layout is needed, continuousMode up to SHOW, no reserved pointer.
+    constexpr u32 kWindow = kData + 0x31100, kField = kData + 0x31200;
+    std::memset(base + kWindow, 0, 28);
+    ps_write32(base, kWindow + 0, 3);
+    ps_write32(base, kWindow + 12, std::bit_cast<u32>(0.5f));
+    ps_write32(base, kField, 0x400 | 0x1000);
+    CHECK(a.call("cellOskDialogSetSeparateWindowOption", kWindow) == kOskParamError); // no field layout
+    ps_write32(base, kWindow + 16, kField);
+    CHECK(a.call("cellOskDialogSetSeparateWindowOption", kWindow) == 0);
+    ps_write32(base, kWindow + 0, 4);
+    CHECK(a.call("cellOskDialogSetSeparateWindowOption", kWindow) == kOskParamError);
+    CHECK(a.call("cellOskDialogSetSeparateWindowOption", 0) == kOskParamError);
+
+    // cellOskExtUtility: callbacks need a function, hooks a mode the variant allows, floats a range.
+    CHECK(a.call("cellOskDialogExtRegisterConfirmWordFilterCallback", 0) == kOskParamError);
+    CHECK(a.call("cellOskDialogExtRegisterConfirmWordFilterCallback", kLogOpd) == 0);
+    CHECK(a.call("cellOskDialogExtRegisterForceFinishCallback", kLogOpd) == 0);
+    CHECK(a.call("cellOskDialogExtRegisterKeyboardEventHookCallback", 0, kLogOpd) == kOskParamError);
+    CHECK(a.call("cellOskDialogExtRegisterKeyboardEventHookCallback", 4, kLogOpd) == kOskParamError);
+    CHECK(a.call("cellOskDialogExtRegisterKeyboardEventHookCallback", 3, kLogOpd) == 0);
+    CHECK(a.call("cellOskDialogExtRegisterKeyboardEventHookCallbackEx", 7, kLogOpd) == 0);
+    CHECK(a.call("cellOskDialogExtRegisterKeyboardEventHookCallbackEx", 8, kLogOpd) == kOskParamError);
+    a.ctx.fpr[1] = 0.5;
+    CHECK(a.call("cellOskDialogExtSetInitialScale") == kOskParamError);
+    a.ctx.fpr[1] = 1.0;
+    CHECK(a.call("cellOskDialogExtSetInitialScale") == 0);
+    a.ctx.fpr[1] = 0.2, a.ctx.fpr[2] = 0.4, a.ctx.fpr[3] = 0.6, a.ctx.fpr[4] = 1.0;
+    CHECK(a.call("cellOskDialogExtSetBaseColor") == 0);
+    a.ctx.fpr[4] = 1.5;
+    CHECK(a.call("cellOskDialogExtSetBaseColor") == kOskParamError);
+    CHECK(a.call("cellOskDialogExtInputDeviceLock") == 0);
+    CHECK(a.call("cellOskDialogExtInputDeviceUnlock") == 0);
+    CHECK(a.call("cellOskDialogExtEnableClipboard") == 0);
+    CHECK(a.call("cellOskDialogExtEnableHalfByteKana") == 0);
+    CHECK(a.call("cellOskDialogExtDisableHalfByteKana") == 0);
+    CHECK(a.call("cellOskDialogExtSetPointerEnable", 1) == 0);
+    CHECK(a.call("cellOskDialogExtUpdatePointerDisplayPos", 0) == 0);
+    CHECK(a.call("cellOskDialogExtUpdatePointerDisplayPos", kField + 4) == 0);
+    CHECK(a.call("cellOskDialogExtAddOptionDictionary", 0) == kOskParamError);
+    CHECK(a.call("cellOskDialogExtAddJapaneseOptionDictionary", 0) == 0);
+}
