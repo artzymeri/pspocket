@@ -164,10 +164,20 @@ void note_video_dma(u32 cmd, u32 eal, u32 size)
 }
 
 // The DMA write log (ps_spu_dma_writes_over): a ring of the last writes per host thread, registered for the search and
-// dropped with its thread. A write costs a clock read and five stores.
+// dropped with its thread. A write costs a clock read and five stores. 2,048 entries, or PSPOCKET_DMA_LOG=N (finding
+// an overwrite older than a few milliseconds of SPU traffic, run 100).
+u32 dma_log_size()
+{
+    static const u32 size = [] {
+        const char* e = std::getenv("PSPOCKET_DMA_LOG");
+        const unsigned long n = e ? std::strtoul(e, nullptr, 0) : 0;
+        return n >= 16 && n <= (1u << 24) ? static_cast<u32>(n) : 2048u;
+    }();
+    return size;
+}
+
 struct DmaWriteRing {
-    static constexpr u32 kSize = 2048;
-    std::array<ps_spu_dma_write, kSize> e{};
+    std::vector<ps_spu_dma_write> e = std::vector<ps_spu_dma_write>(dma_log_size());
     std::atomic<u32> next{0};
     u64 tag = 0;
 };
@@ -201,7 +211,7 @@ void log_write(u32 cmd, u32 pc, u32 ea, u32 size)
     const u32 i = r.next.load(std::memory_order_relaxed);
     const u64 now = static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-    r.e[i % DmaWriteRing::kSize] = ps_spu_dma_write{ea, size, r.tag, now, pc, cmd};
+    r.e[i % r.e.size()] = ps_spu_dma_write{ea, size, r.tag, now, pc, cmd};
     r.next.store(i + 1, std::memory_order_release);
 }
 
@@ -544,9 +554,10 @@ extern "C" uint32_t ps_spu_dma_writes_over(uint32_t ea, uint32_t size, ps_spu_dm
         std::lock_guard lock(g_rings_mutex);
         for (const DmaWriteRing* r : g_rings) {
             const u32 next = r->next.load(std::memory_order_acquire);
-            const u32 count = std::min<u32>(next, DmaWriteRing::kSize);
+            const u32 ring = static_cast<u32>(r->e.size());
+            const u32 count = std::min<u32>(next, ring);
             for (u32 k = 0; k < count; k++) {
-                const ps_spu_dma_write& w = r->e[(next - 1 - k) % DmaWriteRing::kSize];
+                const ps_spu_dma_write& w = r->e[(next - 1 - k) % ring];
                 if (u64{w.ea} < u64{ea} + size && ea < u64{w.ea} + w.size) found.push_back(w);
             }
         }

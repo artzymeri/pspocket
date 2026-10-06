@@ -281,8 +281,8 @@ void JobChainPolicy::report_descriptor(u64 cause) const
             "ago, by {}", w[i].size, w[i].ea, w[i].cmd, w[i].pc, static_cast<double>(now - w[i].time_ns) / 1e6, by);
     }
     if (!n) {
-        PS_LOG_ERROR(kJobChan, "  no SPU DMA write over it among the last 2048 of each thread: the PPU or the RSX wrote "
-            "it, or the SPU read it before the game wrote it");
+        PS_LOG_ERROR(kJobChan, "  no SPU DMA write over it among the last writes each thread keeps (PSPOCKET_DMA_LOG): the "
+            "PPU or the RSX wrote it, an SPU before that, or the SPU read it before the game wrote it");
     }
     // The commands before and after the chain's pc (the JOB that named the descriptor is behind it).
     const u64 pc = ps_read64(base_, jc_ + jc_off::pc);

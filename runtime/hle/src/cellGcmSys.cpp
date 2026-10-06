@@ -36,6 +36,7 @@
 #include <string_view>
 #include <thread>
 
+#include "gcm_api.hpp"
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
@@ -1284,6 +1285,22 @@ u32 cellGcmGetTiledPitchSize(PPUContext&, u32 size)
 }
 
 } // namespace
+
+namespace gcm {
+
+s32 set_display_buffer(PPUContext& ctx, u8 id, u32 offset, u32 pitch, u32 width, u32 height)
+{
+    return cellGcmSetDisplayBuffer(ctx, id, offset, pitch, width, height);
+}
+s32 set_flip(PPUContext& ctx, u32 context, u32 id) { return cellGcmSetFlip(ctx, context, id); }
+void set_wait_flip(PPUContext& ctx, u32 context) { cellGcmSetWaitFlip(ctx, context); }
+void set_flip_handler(PPUContext& ctx, u32 handler) { cellGcmSetFlipHandler(ctx, handler); }
+void set_vblank_handler(PPUContext& ctx, u32 handler) { cellGcmSetVBlankHandler(ctx, handler); }
+u32 get_flip_status(PPUContext& ctx) { return cellGcmGetFlipStatus(ctx); }
+void reset_flip_status(PPUContext& ctx) { cellGcmResetFlipStatus(ctx); }
+u64 get_last_flip_time(PPUContext& ctx) { return cellGcmGetLastFlipTime(ctx); }
+
+} // namespace gcm
 
 void register_cellGcmSys(Registry& r)
 {

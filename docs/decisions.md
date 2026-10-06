@@ -3291,6 +3291,50 @@ the pictures. pspocket's versions of those libraries follow RPCS3's, so they use
 - **Hardware decoding later.** VideoToolbox (H.264 in hardware) and AudioToolbox can take over a format later, measured
   against these first (rule 8).
 
+## D-180 · 2026-10-06 · cellResc on the host: the game's frame goes to the screen as it is
+
+The first of the libraries D-179 moves to pspocket's own. On a PS3, libresc (the resolution scaler) has the RSX draw the
+game's frame (a "source", cellRescSetSrc) into colour buffers of its own at the TV's resolution and mode (PAL 50/60,
+interlacing, letterbox), then flips those. Here the display is the iPhone's screen, and Metal already shows any
+display buffer scaled to it, so cellRescSetConvertAndFlip flips the source as it is:
+
+- **The flip.** The source becomes a display buffer (cellGcmSetDisplayBuffer, with its index as the buffer id, again
+  only when its geometry changes), and cellGcmSetFlip's command goes into the game's command buffer. The RSX flips it
+  in command order, and the Metal backend presents it.
+- **No conversion pass.** None runs, and the colour buffers the game gives libresc are kept and unused.
+- **Handlers and status.** Flip and vblank handlers, flip status and the last flip time are GCM's.
+
+Where a game can see the difference, libresc is matched. RPCS3 runs Sony's libresc by default, and its own functions
+only check arguments, so its checks are taken. The rest comes from reading the firmware's libresc.sprx for
+interoperability (D-176):
+
+- **cellRescGetNumColorBuffers**: six buffers for PAL 60 interpolated from 576 lines, three for PAL 60 dropped, else
+  two.
+- **cellRescVideoOutResolutionId2RescBufferMode**: 1080 to 1920x1080, 720 to 1280x720, 480 to 720x480, 576 to
+  720x576.
+- **cellRescGcmSurface2RescSrc**:
+  - a pitch A8R8G8B8 surface is texture 0xA5 (0x85 swizzled); W16Z16Y16X16 float is 0xBA/0x9A; another format is
+    0xFF;
+  - with a 24- or 28-byte configuration, 2x multisampling doubles the width and 4x doubles both sides.
+- **cellRescGetBufferSize**:
+  - libresc's 384 bytes of vertices and its largest shader (0x300);
+  - colour buffers per destination mode: the pitch given (cellRescSetDsts) times the mode's height aligned as asked,
+    times its buffer count;
+  - the display mode's with MINIMUM_VRAM, the largest supported mode's otherwise.
+  - The game's memory is therefore laid out as on a PS3, though the buffers stay unused.
+
+Kept and not applied: the aspect ratio, the PAL flex ratio and the register count of libresc's shader. The interlace
+table is checked and not written, since the screen is progressive. Sniper: Ghost Warrior showed frames only through
+cellResc (phone run of 2026-10-06).
+
+Also: the SPU DMA write log's size is PSPOCKET_DMA_LOG (2,048 entries per thread by default). Run 100's descriptor
+overwrite on the Mac found no writer among the last 2,048, which is a few milliseconds of EDGE traffic.
+
+Tests: tests/hle/test_gcm_sys.cpp (cellResc). Covers the checks before and after init, libresc's tables and sizes,
+the surface conversion with 4x multisampling, a source flipped through the command buffer and shown (display buffer 0
+holds its geometry, the RSX counts the flip), the buffer address alignments, float arguments in f1 and f2, and the PAL
+combination.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

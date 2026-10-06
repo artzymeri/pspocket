@@ -787,3 +787,142 @@ TEST_CASE("cellGcmSys: _cellGcmFunc12, debug level, second V frequency, immediat
     CHECK(g.call("cellGcmSetDefaultFifoSize", 0x100000, 0x8000) == 0);
     CHECK(g.call("cellGcmTerminate") == 0);
 }
+
+TEST_CASE("cellResc (D-180): the game's frame flipped as it is, with libresc's checks, sizes and conversions",
+    "[hle][gcm][resc]")
+{
+    InterpretMisses interpret;
+    GcmFixture f;
+    GuestThread g(f, 0, "resc");
+    u8* b = f.base();
+    write_failing_callbacks(b);
+    REQUIRE(g.call("_cellGcmInitBody", kCtxPtr, kCmdSize, 0x100000, kIo) == 0);
+    const u32 ctx = ps_read32(b, kCtxPtr);
+    const u64 kNotInit = r3_of_code(0x80210301), kReinit = r3_of_code(0x80210302), kBadAlign = r3_of_code(0x80210303),
+              kBadArg = r3_of_code(0x80210304), kBadComb = r3_of_code(0x80210307);
+    constexpr u32 kCfg = kData + 0x3000, kDsts = kData + 0x3100, kSrc = kData + 0x3200, kSurf = kData + 0x3300,
+                  kSizes = kData + 0x3400;
+
+    // Before cellRescInit.
+    CHECK(g.call("cellRescSetDisplayMode", 4) == kNotInit);
+    CHECK(g.call("cellRescGetBufferSize", kSizes, kSizes + 4, kSizes + 8) == kNotInit);
+    // A 28-byte configuration: CONSTANT_VRAM, 720p and 1080p, PAL 50, VSYNC.
+    const u32 cfg[7] = {28, 0, 0x4 | 0x8, 0, 0, 0, 0};
+    for (u32 i = 0; i < 7; i++) ps_write32(b, kCfg + 4 * i, cfg[i]);
+    ps_write32(b, kCfg, 32);
+    CHECK(g.call("cellRescInit", kCfg) == kBadArg);
+    ps_write32(b, kCfg, 28);
+    CHECK(g.call("cellRescInit", 0) == kBadArg);
+    REQUIRE(g.call("cellRescInit", kCfg) == 0);
+    CHECK(g.call("cellRescInit", kCfg) == kReinit);
+
+    // libresc's resolution IDs and colour buffer counts.
+    for (const auto& [id, mode] : {std::pair{1u, 8u}, std::pair{2u, 4u}, std::pair{4u, 1u}, std::pair{5u, 2u}}) {
+        REQUIRE(g.call("cellRescVideoOutResolutionId2RescBufferMode", id, kOut) == 0);
+        CHECK(ps_read32(b, kOut) == mode);
+    }
+    CHECK(g.call("cellRescVideoOutResolutionId2RescBufferMode", 3, kOut) == kBadArg);
+    CHECK(g.call("cellRescVideoOutResolutionId2RescBufferMode", 2, 0) == kBadArg);
+    CHECK(g.call("cellRescGetNumColorBuffers", 4, 0, 0) == 2);
+    CHECK(g.call("cellRescGetNumColorBuffers", 2, 2, 0) == 6); // 720x576, PAL 60 interpolated
+    CHECK(g.call("cellRescGetNumColorBuffers", 2, 1, 0) == 3); // PAL 60 dropped
+    CHECK(g.call("cellRescGetNumColorBuffers", 2, 0, 0) == 2);
+    CHECK(g.call("cellRescGetNumColorBuffers", 4, 0, 1) == kBadArg);
+
+    // Destinations, the display mode, and the sizes: CONSTANT_VRAM takes the largest supported mode (1080p: pitch
+    // 0x2000, 1080 lines aligned to 16 = 1088, two buffers), libresc's vertices and shader.
+    const auto dsts = [&](u32 mode, u32 pitch) {
+        ps_write32(b, kDsts, 8);
+        ps_write32(b, kDsts + 4, pitch);
+        ps_write32(b, kDsts + 8, 16);
+        return g.call("cellRescSetDsts", mode, kDsts);
+    };
+    CHECK(dsts(4, 0x1400) == 0);
+    CHECK(dsts(8, 0x2000) == 0);
+    CHECK(dsts(0x10, 0x2000) == kBadArg);
+    CHECK(g.call("cellRescSetDsts", 4, 0) == kBadArg);
+    CHECK(g.call("cellRescSetDisplayMode", 1) == kBadArg); // 720x480 is not among the supported modes
+    REQUIRE(g.call("cellRescSetDisplayMode", 4) == 0);
+    REQUIRE(g.call("cellRescGetBufferSize", kSizes, kSizes + 4, kSizes + 8) == 0);
+    CHECK(ps_read32(b, kSizes) == 0x2000u * 1088u * 2u);
+    CHECK(ps_read32(b, kSizes + 4) == 384);
+    CHECK(ps_read32(b, kSizes + 8) == 0x300);
+
+    // A GCM surface as a source (libresc): a pitch A8R8G8B8 surface is texture 0xA5; 4x multisampling doubles both
+    // sides with a 28-byte configuration.
+    for (u32 i = 0; i < 64; i += 4) ps_write32(b, kSurf + i, 0);
+    ps_write8(b, kSurf, 1);                  // CELL_GCM_SURFACE_PITCH
+    ps_write8(b, kSurf + 2, 8);              // CELL_GCM_SURFACE_A8R8G8B8
+    ps_write32(b, kSurf + 8, 0x00100000);    // colorOffset[0]
+    ps_write32(b, kSurf + 24, 0x1400);       // colorPitch[0]
+    ps_write16(b, kSurf + 52, 1280);
+    ps_write16(b, kSurf + 54, 720);
+    REQUIRE(g.call("cellRescGcmSurface2RescSrc", kSurf, kSrc) == 0);
+    CHECK(ps_read32(b, kSrc) == 0xA5);
+    CHECK(ps_read32(b, kSrc + 4) == 0x1400);
+    CHECK(ps_read16(b, kSrc + 8) == 1280);
+    CHECK(ps_read16(b, kSrc + 10) == 720);
+    CHECK(ps_read32(b, kSrc + 12) == 0x00100000);
+    ps_write8(b, kSurf + 1, 4); // SQUARE_CENTERED_4
+    REQUIRE(g.call("cellRescGcmSurface2RescSrc", kSurf, kSrc + 0x40) == 0);
+    CHECK(ps_read16(b, kSrc + 0x48) == 2560);
+    CHECK(ps_read16(b, kSrc + 0x4A) == 1440);
+    ps_write8(b, kSurf + 2, 5); // R5G6B5: no source texture
+    REQUIRE(g.call("cellRescGcmSurface2RescSrc", kSurf, kSrc + 0x80) == 0);
+    CHECK(ps_read32(b, kSrc + 0x80) == 0xFF);
+    CHECK(g.call("cellRescGcmSurface2RescSrc", 0, kSrc) == kBadArg);
+
+    // Sources: RPCS3's checks.
+    CHECK(g.call("cellRescSetSrc", 8, kSrc) == kBadArg);
+    CHECK(g.call("cellRescSetSrc", 0, 0) == kBadArg);
+    ps_write16(b, kSrc + 10, 0);
+    CHECK(g.call("cellRescSetSrc", 0, kSrc) == kBadArg);
+    ps_write16(b, kSrc + 10, 720);
+    REQUIRE(g.call("cellRescSetSrc", 0, kSrc) == 0);
+
+    // Convert and flip: source 0 becomes display buffer 0 and the flip goes into the game's command buffer.
+    CHECK(g.call("cellRescSetConvertAndFlip", ctx, 1) == kBadArg); // no source 1
+    CHECK(g.call("cellRescSetConvertAndFlip", ctx, 8) == kBadArg);
+    flush_to_current(f, g);
+    const u32 c0 = ps_read32(b, ctx + 0x8);
+    REQUIRE(g.call("cellRescSetConvertAndFlip", ctx, 0) == 0);
+    CHECK(ps_read32(b, c0) == rsx::cmd::method_header(rsx::m::GCM_FLIP_COMMAND, 1));
+    CHECK(ps_read32(b, c0 + 4) == 0);
+    const u32 info = static_cast<u32>(g.call("cellGcmGetDisplayInfo"));
+    CHECK(ps_read32(b, info) == 0x00100000); // offset, pitch, width, height of buffer 0
+    CHECK(ps_read32(b, info + 4) == 0x1400);
+    CHECK(ps_read32(b, info + 8) == 1280);
+    CHECK(ps_read32(b, info + 12) == 720);
+    rsx::Rsx* rsx = f.kernel->rsx();
+    REQUIRE(rsx->wait_idle(2 * kSecond));
+    CHECK(rsx->flip_count() == 1);
+
+    // Buffer addresses: libresc's alignments.
+    CHECK(g.call("cellRescSetBufferAddress", 0xC0000080, 0xC0100004, 0xC0200040) == 0);
+    CHECK(g.call("cellRescSetBufferAddress", 0xC0000040, 0xC0100004, 0xC0200040) == kBadAlign);
+    CHECK(g.call("cellRescSetBufferAddress", 0xC0000080, 0xC0100002, 0xC0200040) == kBadAlign);
+    CHECK(g.call("cellRescSetBufferAddress", 0, 0xC0100004, 0xC0200040) == kBadArg);
+
+    // Floats arrive in f1 and f2.
+    g.ctx.fpr[1] = 1.0;
+    g.ctx.fpr[2] = 3.0;
+    CHECK(g.call("cellRescAdjustAspectRatio") == kBadArg);
+    g.ctx.fpr[2] = 1.5;
+    CHECK(g.call("cellRescAdjustAspectRatio") == 0);
+    g.ctx.fpr[1] = 1.5;
+    CHECK(g.call("cellRescSetPalInterpolateDropFlexRatio") == kBadArg);
+    g.ctx.fpr[1] = 720.0;
+    CHECK(g.call("cellRescCreateInterlaceTable", kData + 0x5000, 0, 64) == 0);
+    CHECK(g.call("cellRescCreateInterlaceTable", kData + 0x5000, 2, 64) == kBadArg);
+
+    // The register count is kept; after cellRescExit nothing works until the next cellRescInit.
+    g.call("cellRescSetRegisterCount", 5);
+    CHECK(g.call("cellRescGetRegisterCount") == 5);
+    g.call("cellRescExit");
+    CHECK(g.call("cellRescSetDisplayMode", 4) == kNotInit);
+    // 720x576 with PAL 60 interpolated needs VSYNC flips (RPCS3's combination check).
+    const u32 pal[7] = {28, 0, 0x2, 0, 2, 0, 1};
+    for (u32 i = 0; i < 7; i++) ps_write32(b, kCfg + 4 * i, pal[i]);
+    REQUIRE(g.call("cellRescInit", kCfg) == 0);
+    CHECK(g.call("cellRescSetDisplayMode", 2) == kBadComb);
+}

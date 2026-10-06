@@ -10,6 +10,7 @@ void register_cellGcmSys(Registry& r);
 void register_cellHttp(Registry& r);
 void register_cellNetCtl(Registry& r);
 void register_cellOskDialog(Registry& r);
+void register_cellResc(Registry& r);
 void register_cellRtc(Registry& r);
 void register_cellSaveData(Registry& r);
 void register_cellSheap(Registry& r);
@@ -42,6 +43,7 @@ void register_all_modules(Registry& r)
     register_cellHttp(r);
     register_cellNetCtl(r);
     register_cellOskDialog(r);
+    register_cellResc(r);
     register_cellRtc(r);
     register_cellSaveData(r);
     register_cellSheap(r);

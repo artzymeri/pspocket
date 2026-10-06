@@ -6,6 +6,7 @@ add_library(pspocket_hle STATIC
     src/cellHttp.cpp
     src/cellNetCtl.cpp
     src/cellOskDialog.cpp
+    src/cellResc.cpp
     src/cellRtc.cpp
     src/cellSaveData.cpp
     src/cellSheap.cpp
