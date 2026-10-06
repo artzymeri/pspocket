@@ -31,3 +31,9 @@ With SPU threads on, Sony's images are the same; Create takes 0x33880 more bytes
 The answers compared include every result code, screen descriptor, output parameter set (useMemorySpace included),
 record (type, label, buffer address, status), extension bytes, image (with what a failed call left in the buffer),
 and the handle and stream lifetimes. A digest of pspocket's answers is a test of its own.
+
+## The gate
+
+With D-202 (705e93e, inventory/gate/20261006-233848-705e93e): **PASS**. The 20 test suites, then GTA V's prologue
+walk: 29.8 fps median, 29.4 in the slowest 5 s window, 833 frames compared, 2 frame jumps, 25.6 GPU ms per frame at
+worst, no SPU code interpreted, 972 MB process memory at peak, no new warning shapes.
