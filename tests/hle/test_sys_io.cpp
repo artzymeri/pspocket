@@ -128,3 +128,194 @@ TEST_CASE("cellKb: initialized with no keyboard connected", "[hle][io]")
     REQUIRE(g.call("cellKbEnd") == 0);
     CHECK(g.call("cellKbEnd") == kKbUninit);
 }
+
+TEST_CASE("cellPad: raw data, press and sensor modes, extra data, peripherals and the IIR filter", "[hle][io]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "pad2");
+    u8* b = f.base();
+    constexpr u64 kUnsupported = 0xFFFFFFFF80121108ull;
+
+    CHECK(g.call("cellPadInfoPressMode", 0) == kPadUninit);
+    REQUIRE(g.call("cellPadInit", 2) == 0);
+    CHECK(g.call("cellPadGetRawData", 0, kPad) == 0);
+    CHECK(g.call("cellPadGetRawData", 0, 0) == kPadInval);
+    CHECK(g.call("cellPadGetRawData", 1, kPad) == kPadNoDevice);
+    CHECK(g.call("cellPadGetRawData", 2, kPad) == kPadNoDevice); // past max_connect
+
+    // The virtual controller has press-sensitive buttons and sensors: the answers are values, not codes.
+    CHECK(g.call("cellPadInfoPressMode", 0) == 1);
+    CHECK(g.call("cellPadInfoSensorMode", 0) == 1);
+    CHECK(g.call("cellPadInfoPressMode", 1) == kPadNoDevice);
+    CHECK(g.call("cellPadInfoSensorMode", 127) == kPadInval);
+    REQUIRE(g.call("cellPadSetPressMode", 0, 1) == 0);
+    REQUIRE(g.call("cellPadGetInfo2", kInfo) == 0);
+    CHECK(ps_read32(b, kInfo + 0x28) == 2); // port_setting[0]: press on
+    REQUIRE(g.call("cellPadSetSensorMode", 0, 1) == 0);
+    REQUIRE(g.call("cellPadGetInfo2", kInfo) == 0);
+    CHECK(ps_read32(b, kInfo + 0x28) == 6);
+    REQUIRE(g.call("cellPadSetPressMode", 0, 0) == 0);
+    REQUIRE(g.call("cellPadSetSensorMode", 0, 0) == 0);
+    CHECK(g.call("cellPadSetPressMode", 0, 2) == kPadInval);
+    CHECK(g.call("cellPadSetPressMode", 1, 1) == kUnsupported); // no controller there: no capability
+    CHECK(g.call("cellPadSetSensorMode", 9, 1) == 0);           // past the 7 ports: accepted, as RPCS3
+
+    // cellPadGetDataExtra: cellPadGetData, the device type, the BD remote's words cleared.
+    std::memset(b + kPad, 0xAA, 0x84);
+    ps_write32(b, kAct, 0xDEADBEEF);
+    REQUIRE(g.call("cellPadGetDataExtra", 0, kAct, kPad) == 0);
+    CHECK(len(b) == 8);
+    CHECK(ps_read32(b, kAct) == 0); // CELL_PAD_DEV_TYPE_STANDARD
+    CHECK(button(b, 24) == 0);
+    CHECK(button(b, 25) == 0);
+    CHECK(g.call("cellPadGetDataExtra", 0, 0, kPad) == 0); // no device type pointer: no error
+    CHECK(len(b) == 0);
+    CHECK(g.call("cellPadGetDataExtra", 1, kAct, kPad) == kPadNoDevice);
+
+    // Peripherals: cellPadGetInfo2's fields then the classes; data with the class first.
+    REQUIRE(g.call("cellPadClearBuf", 0) == 0);
+    std::memset(b + kInfo, 0xAA, 0xB4);
+    REQUIRE(g.call("cellPadPeriphGetInfo", kInfo) == 0);
+    CHECK(ps_read32(b, kInfo + 0x0) == 2);  // max_connect
+    CHECK(ps_read32(b, kInfo + 0x4) == 1);  // now_connect
+    CHECK(ps_read32(b, kInfo + 0x44) == 0x1F);
+    CHECK(ps_read32(b, kInfo + 0x7C) == 0); // pclass_type[0]: standard
+    CHECK(ps_read32(b, kInfo + 0xB0) == 0); // pclass_profile[6]
+    CHECK(g.call("cellPadPeriphGetInfo", 0) == kPadInval);
+    ps_write32(b, kPad, 0xAAAAAAAA);
+    REQUIRE(g.call("cellPadPeriphGetData", 0, kPad) == 0);
+    CHECK(ps_read32(b, kPad + 0) == 0); // pclass_type
+    CHECK(ps_read32(b, kPad + 8) == 8); // CellPadData.len after the buffer was cleared
+    CHECK(g.call("cellPadPeriphGetData", 7, kPad) == kPadInval);
+    CHECK(g.call("cellPadPeriphGetData", 1, kPad) == kPadNoDevice);
+
+    CHECK(g.call("cellPadFilterIIRInit", 0, 0) == 0xFFFFFFFF80121401ull);
+    CHECK(g.call("cellPadFilterIIRInit", kAct, 0) == 0);
+    CHECK(g.call("cellPadFilterIIRFilter", kAct, 512) == 512);
+    CHECK(g.call("cellPadFilterIIRFilter", kAct, 5000) == 1023);
+    REQUIRE(g.call("cellPadEnd") == 0);
+}
+
+TEST_CASE("cellPad: a custom (LDD) controller the game registers and feeds", "[hle][io]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "ldd");
+    u8* b = f.base();
+    constexpr u64 kFatal = 0xFFFFFFFF80121101ull, kTooMany = 0xFFFFFFFF80121109ull;
+
+    CHECK(g.call("cellPadLddRegisterController") == kPadUninit);
+    REQUIRE(g.call("cellPadInit", 7) == 0);
+    REQUIRE(g.call("cellPadGetInfo2", kInfo) == 0); // takes the virtual controller's assignment-changed flag
+    const u64 handle = g.call("cellPadLddRegisterController");
+    REQUIRE(handle == 1); // the first free port
+    CHECK(g.call("cellPadLddGetPortNo", 1) == 1);
+    CHECK(g.call("cellPadLddGetPortNo", 2) == kFatal);
+    CHECK(g.call("cellPadLddGetPortNo", 7) == kPadInval);
+
+    REQUIRE(g.call("cellPadGetInfo2", kInfo) == 0);
+    CHECK(ps_read32(b, kInfo + 0x4) == 2);    // now_connect
+    CHECK(ps_read32(b, kInfo + 0x10) == 7);   // port_status[1]: connected | assign changes | custom controller
+    CHECK(ps_read32(b, kInfo + 0x48) == 1);   // device_capability[1]: PS3 conformity
+    CHECK(ps_read32(b, kInfo + 0x64) == 5);   // device_type[1]: LDD
+
+    // What the game inserts is what reads return, every time.
+    std::memset(b + kAct, 0, 0x84);
+    ps_write16(b, kAct + 4 + 2 * 2, 0x0010);
+    ps_write16(b, kAct + 4 + 2 * 4, 0x00C0);
+    REQUIRE(g.call("cellPadLddDataInsert", 1, kAct) == 0);
+    for (int i = 0; i < 2; i++) {
+        REQUIRE(g.call("cellPadGetData", 1, kPad) == 0);
+        CHECK(len(b) == 8);
+        CHECK(button(b, 2) == 0x0010);
+        CHECK(button(b, 4) == 0x00C0);
+    }
+    CHECK(g.call("cellPadLddDataInsert", 1, 0) == kPadInval);
+    CHECK(g.call("cellPadLddDataInsert", 2, kAct) == kPadNoDevice);
+
+    for (u64 port = 2; port < 7; port++) CHECK(g.call("cellPadLddRegisterController") == port);
+    CHECK(g.call("cellPadLddRegisterController") == kTooMany);
+
+    REQUIRE(g.call("cellPadLddUnregisterController", 1) == 0);
+    CHECK(g.call("cellPadLddUnregisterController", 1) == kPadNoDevice);
+    CHECK(g.call("cellPadGetData", 1, kPad) == kPadNoDevice);
+    CHECK(g.call("cellPadLddRegisterController") == 1); // the port is free again
+    REQUIRE(g.call("cellPadEnd") == 0);
+}
+
+TEST_CASE("cellKb: configuration and raw code conversion", "[hle][io]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "kbcnv");
+
+    CHECK(g.call("cellKbGetConfiguration", 0, kKb) == kKbUninit);
+    REQUIRE(g.call("cellKbInit", 1) == 0);
+    CHECK(g.call("cellKbGetConfiguration", 0, kKb) == kKbNoDevice);
+    CHECK(g.call("cellKbGetConfiguration", 0, 0) == kKbNoDevice); // the device is checked before the pointer
+    CHECK(g.call("cellKbGetConfiguration", 127, kKb) == kKbInval);
+    REQUIRE(g.call("cellKbEnd") == 0);
+
+    // cellKbCnvRawCode(arrange, mkey, led, rawcode) needs no keyboard (RPCS3's mapping).
+    constexpr u64 k101 = 0, k106 = 1, kGerman = 3, kShift = 0x02, kAlt = 0x04, kNum = 0x01, kCaps = 0x02;
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, 0, 0x29) == 0x8029);       // escape: raw
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, 0, 0x39) == 0x8039);       // caps lock: raw
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, 0, 0x04) == 'a');
+    CHECK(g.call("cellKbCnvRawCode", k101, kShift, 0, 0x04) == 'A');
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, kCaps, 0x04) == 'A');
+    CHECK(g.call("cellKbCnvRawCode", k101, kShift, kCaps, 0x04) == 'a');
+    CHECK(g.call("cellKbCnvRawCode", k101, kShift, 0, 0x1F) == '@');    // shift 2, US
+    CHECK(g.call("cellKbCnvRawCode", k106, kShift, 0, 0x1F) == '"');    // shift 2, Japanese
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, kCaps, 0x1F) == '2');     // caps lock leaves digits alone
+    CHECK(g.call("cellKbCnvRawCode", kGerman, 0, kCaps, 0x1F) == '"');  // ... except as a shift lock
+    CHECK(g.call("cellKbCnvRawCode", kGerman, kAlt, 0, 0x14) == '@');   // AltGr Q
+    CHECK(g.call("cellKbCnvRawCode", kGerman, 0, 0, 0x92) == 225);      // ß
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, kNum, 0x59) == 0x4031);   // keypad 1 with num lock
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, kNum, 0x58) == 0x400A);   // keypad enter
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, 0, 0x27) == '0');
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, 0, 0x28) == '\n');
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, 0, 0x2C) == ' ');
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, 0, 0x3A) == 0x803A); // F1: raw (0x39 to 0x53 are)
+    CHECK(g.call("cellKbCnvRawCode", k101, 0, 0, 0x64) == 0);      // a key the layout lacks: no character
+}
+
+TEST_CASE("cellMouse: initialized with no mouse connected; sys_config", "[hle][io]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "mouse");
+    u8* b = f.base();
+    constexpr u64 kFatal = 0xFFFFFFFF80121201ull, kInval = 0xFFFFFFFF80121202ull,
+                  kAlready = 0xFFFFFFFF80121203ull, kUninit = 0xFFFFFFFF80121204ull,
+                  kNoDevice = 0xFFFFFFFF80121207ull;
+
+    CHECK(g.call("cellMouseGetInfo", kKb) == kUninit);
+    CHECK(g.call("cellMouseEnd") == kUninit);
+    CHECK(g.call("cellMouseInit", 0) == kInval);
+    CHECK(g.call("cellMouseInit", 128) == kInval);
+    REQUIRE(g.call("cellMouseInit", 2) == 0);
+    CHECK(g.call("cellMouseInit", 2) == kAlready);
+
+    std::memset(b + kKb, 0xAA, 648);
+    REQUIRE(g.call("cellMouseGetInfo", kKb) == 0);
+    CHECK(ps_read32(b, kKb + 0) == 2); // max_connect
+    CHECK(ps_read32(b, kKb + 4) == 0); // now_connect
+    CHECK(ps_read8(b, kKb + 12 + 2 * 127 * 2) == 0); // status[0]
+    CHECK(ps_read8(b, kKb + 647) == 0);
+    CHECK(g.call("cellMouseGetInfo", 0) == kInval);
+
+    for (const char* fn : {"cellMouseGetData", "cellMouseGetDataList", "cellMouseGetTabletDataList",
+                           "cellMouseGetRawData"}) {
+        INFO(fn);
+        CHECK(g.call(fn, 0, kPad) == kNoDevice);
+        CHECK(g.call(fn, 0, 0) == kInval);
+        CHECK(g.call(fn, 127, kPad) == kInval);
+    }
+    CHECK(g.call("cellMouseClearBuf", 0) == kNoDevice);
+    CHECK(g.call("cellMouseClearBuf", 127) == kInval);
+    CHECK(g.call("cellMouseInfoTabletMode", 0, 0) == kFatal); // RPCS3: the port only, then FATAL
+    CHECK(g.call("cellMouseSetTabletMode", 0, 9) == kFatal);
+    CHECK(g.call("cellMouseSetTabletMode", 127, 1) == kInval);
+    REQUIRE(g.call("cellMouseEnd") == 0);
+
+    CHECK(g.call("sys_config_start") == 0);
+    CHECK(g.call("sys_config_stop") == 0);
+    CHECK(g.call("sys_config_stop") == 0); // RPCS3: an unbalanced stop is accepted
+}
