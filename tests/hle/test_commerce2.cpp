@@ -650,3 +650,69 @@ TEST_CASE("sceNpCommerce2's store browsing, empty store check, product lists and
     CHECK(g.call("sceNpCommerce2GetGameProductInfoFromGetProductInfoListResult", 0, 0, kOut) == kInval);
     CHECK(g.call("sceNpCommerce2GetGameProductInfoFromGetProductInfoListResult", kParam, 0, kOut) == 0);
 }
+
+TEST_CASE("sceNpSns: the short access token, throttles, config and stream publish, as RPCS3's TODOs", "[hle][np]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "fb");
+    u8* b = f.base();
+    constexpr u32 kParams = kData + 0x100, kHandle = kData + 0x110, kParam = kData + 0x200, kResult = kData + 0x400,
+                  kArg = kData + 0x1800;
+    // SceNpSnsFbAccessTokenResult {be64 expiration, char access_token[129]} (144 bytes).
+    constexpr u32 kResultSize = 144;
+    ps_write32(b, kParams, kPool);
+    ps_write32(b, kParams + 4, 0x10000);
+    std::memset(b + kParam, 0, 272);
+    ps_write64(b, kParam, 123456789012345ull);
+    std::memset(b + kResult, 0xAA, kResultSize);
+    std::memset(b + kArg, 0xAA, 64);
+
+    // Before init: the config and throttle checks need the library (a null throttle argument is refused first); a
+    // token request checks its arguments first.
+    CHECK(g.call("sceNpSnsFbCheckConfig", kArg) == kFbNotInit);
+    CHECK(g.call("sceNpSnsFbCheckThrottle", 0) == kSnsInval);
+    CHECK(g.call("sceNpSnsFbCheckThrottle", kArg) == kFbNotInit);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", 1, kParam, 0) == kSnsInval);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", 1, kParam, kResult) == kFbNotInit);
+
+    REQUIRE(g.call("sceNpSnsFbInit", kParams) == 0);
+    CHECK(g.call("sceNpSnsFbCheckConfig", 0) == 0); // arg0 isn't looked at
+    CHECK(g.call("sceNpSnsFbCheckConfig", kArg) == 0);
+    CHECK(g.call("sceNpSnsFbCheckThrottle", 0) == kSnsInval);
+    CHECK(g.call("sceNpSnsFbCheckThrottle", kArg) == 0);
+    CHECK(all_bytes(b + kArg, 64, 0xAA));
+
+    REQUIRE(g.call("sceNpSnsFbCreateHandle", kHandle) == 0);
+    const u32 handle = ps_read32(b, kHandle);
+    REQUIRE(handle == 1);
+
+    // The access token: as the long one, refused because nobody is signed in to PSN; nothing written.
+    CHECK(g.call("sceNpSnsFbGetAccessToken", handle, 0, kResult) == kSnsInval);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", handle, kUnmapped, kResult) == kSnsInval); // RPCS3 faults
+    ps_write64(b, kParam, 0);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", handle, kParam, kResult) == kSnsInval); // no app ID
+    ps_write64(b, kParam, 123456789012345ull);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", 0, kParam, kResult) == kSnsInval);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", 5, kParam, kResult) == kSnsInval);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", 2, kParam, kResult) == kFbUnknown);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", handle, kParam, kResult) == kSnsNotSignIn);
+    CHECK(all_bytes(b + kResult, kResultSize, 0xAA));
+
+    // Loading the throttle and publishing to the stream: the handle (1 to 4, known), then CELL_OK.
+    for (const std::string_view name : {"sceNpSnsFbLoadThrottle", "sceNpSnsFbStreamPublish"}) {
+        INFO(name);
+        CHECK(g.call(name, 0) == kSnsInval);
+        CHECK(g.call(name, 5) == kSnsInval);
+        CHECK(g.call(name, 2) == kFbUnknown);
+        CHECK(g.call(name, handle) == 0);
+    }
+
+    // They look only at the handle, which outlives the library's term (RPCS3's idm keeps it).
+    REQUIRE(g.call("sceNpSnsFbTerm") == 0);
+    CHECK(g.call("sceNpSnsFbCheckConfig", kArg) == kFbNotInit);
+    CHECK(g.call("sceNpSnsFbCheckThrottle", kArg) == kFbNotInit);
+    CHECK(g.call("sceNpSnsFbGetAccessToken", handle, kParam, kResult) == kFbNotInit);
+    CHECK(g.call("sceNpSnsFbLoadThrottle", handle) == 0);
+    CHECK(g.call("sceNpSnsFbStreamPublish", handle) == 0);
+    CHECK(g.call("sceNpSnsFbLoadThrottle", 3) == kFbUnknown);
+}

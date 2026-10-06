@@ -8,6 +8,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -15,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "pspocket/lv2/syscalls.hpp"
@@ -1996,4 +1999,156 @@ TEST_CASE("sceNpSignaling's context options and peer information: RPCS3's checks
     CHECK(ps_read32(b, kOut + 4) == 0xAAAAAAAAu);
     CHECK(g.call("sceNpSignalingCancelPeerNetInfo", ctx, 1) == 0);
     CHECK(g.call("sceNpSignalingDeactivateConnection", ctx, 1) == 0);
+}
+
+TEST_CASE("sceNpMatchingInt: the matching library's internal entry points, as sceNp's", "[hle][np]")
+{
+    // Three share sceNp's names and NIDs (RPCS3 registers its OLD_ functions under them) and do the same.
+    for (const auto& [name, nid] : {std::pair<std::string_view, u32>{"sceNpMatchingJoinRoomGUI", 0x474B7B13},
+             {"sceNpMatchingSetRoomInfoNoLimit", 0x4A18A89E}, {"sceNpMatchingGetRoomInfoNoLimit", 0xB020684E}}) {
+        INFO(name);
+        const hle::Function* internal = hle::registry().find("sceNpMatchingInt", nid);
+        const hle::Function* np = hle::registry().find("sceNp", nid);
+        REQUIRE(internal != nullptr);
+        REQUIRE(np != nullptr);
+        CHECK(internal->name == name);
+        CHECK(internal->fn == np->fn);
+    }
+    for (const auto& [name, nid] : {std::pair<std::string_view, u32>{"sceNpMatchingGetRoomMemberList", 0x170829D3},
+             {"sceNpMatchingJoinRoomWithoutGUI", 0x31B2B978}, {"sceNpMatchingGetRoomListWithoutGUI", 0x92D5C77B},
+             {"sceNpMatchingGetRoomListGUI", 0xB00F408A}, {"sceNpMatchingCreateRoomWithoutGUI", 0xEADCB5CA}}) {
+        INFO(name);
+        const hle::Function* fn = hle::registry().find("sceNpMatchingInt", nid);
+        REQUIRE(fn != nullptr);
+        CHECK(fn->name == name);
+    }
+
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kNpId = kData + 0x100, kCtxOut = kData + 0x200, kComm = kData + 0x300, kRoom = kData + 0x400,
+                  kSize = kData + 0x610, kRange = kData + 0x620, kAttrs = kData + 0x1000, kConds = kData + 0x2000;
+    constexpr u32 kArg = 0x00C0FFEE;
+    write_gui_handler(b);
+    write_nop(b);
+    put_np_id(b, kNpId, "");
+    put_comm_id(b, kComm, "NPWR01234", 0);
+    std::memset(b + kRoom, 1, 36);
+
+    CHECK(g.call("sceNpMatchingGetRoomMemberList", 0x9001, kRoom, kSize, 0) == kMatchNotInit);
+    np_up(g);
+    REQUIRE(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, kCtxOut) == 0);
+    const u32 ctx = ps_read32(b, kCtxOut);
+
+    // Creating a room without the dialog: sceNpMatchingCreateRoomGUI's checks, and the same answer.
+    put_attr(b, kAttrs, kAttrs + 0x20, 2, 1, 4); // total slots 4
+    put_attr(b, kAttrs + 0x20, 0, 2, 2, 1);      // private slots 1
+    CHECK(g.call("sceNpMatchingCreateRoomWithoutGUI", ctx, 0, kAttrs, kGuiOpd, kArg) == kMatchInval);
+    CHECK(g.call("sceNpMatchingCreateRoomWithoutGUI", ctx, kComm, 0, kGuiOpd, kArg) == kMatchAttrNotSpecified);
+    CHECK(g.call("sceNpMatchingCreateRoomWithoutGUI", ctx + 1, kComm, kAttrs, kGuiOpd, kArg) == kMatchCtxNotFound);
+    REQUIRE(g.call("sceNpMatchingCreateRoomWithoutGUI", ctx, kComm, kAttrs, kGuiOpd, kArg) == 0);
+    CHECK(take_gui_calls(g, b) == std::vector<GuiCall>{{ctx, 8, 0, kArg}, {ctx, 1, kMatchCanceled, kArg},
+                                      {ctx, 9, 0, kArg}});
+
+    // Joining one.
+    CHECK(g.call("sceNpMatchingJoinRoomWithoutGUI", ctx, 0, kGuiOpd, kArg) == kMatchInval);
+    CHECK(g.call("sceNpMatchingJoinRoomWithoutGUI", ctx, kRoom, 0, kArg) == kMatchInval);
+    REQUIRE(g.call("sceNpMatchingJoinRoomWithoutGUI", ctx, kRoom, kGuiOpd, kArg) == 0);
+    CHECK(take_gui_calls(g, b) == std::vector<GuiCall>{{ctx, 8, 0, kArg}, {ctx, 2, kMatchCanceled, kArg},
+                                      {ctx, 9, 0, kArg}});
+
+    // The room lists without the limit: the limited list's checks, and the GET_ROOM_LIST event (10), not 11.
+    for (const std::string_view name : {"sceNpMatchingGetRoomListGUI", "sceNpMatchingGetRoomListWithoutGUI"}) {
+        INFO(name);
+        ps_write32(b, kRange, 0);
+        ps_write32(b, kRange + 4, 10);
+        CHECK(g.call(name, ctx, kComm, kRange, 0, 0, kGuiOpd, kArg) == kMatchInval); // no start
+        ps_write32(b, kRange, 1);
+        ps_write32(b, kRange + 4, 21);
+        CHECK(g.call(name, ctx, kComm, kRange, 0, 0, kGuiOpd, kArg) == kMatchInval); // more than 20
+        ps_write32(b, kRange + 4, 20);
+        CHECK(g.call(name, ctx, kComm, kUnmapped, 0, 0, kGuiOpd, kArg) == kMatchInval); // RPCS3 faults
+        put_cond(b, kConds, 0, 2, 1, 0);
+        CHECK(g.call(name, ctx, kComm, kRange, kConds, 0, kGuiOpd, kArg) == kMatchInvalCond); // the total slots
+        put_cond(b, kConds, 0, 2, 2, 0);
+        CHECK(g.call(name, ctx + 1, kComm, kRange, kConds, 0, kGuiOpd, kArg) == kMatchCtxNotFound);
+        REQUIRE(g.call(name, ctx, kComm, kRange, kConds, 0, kGuiOpd, kArg) == 0);
+        CHECK(take_gui_calls(g, b) == std::vector<GuiCall>{{ctx, 8, 0, kArg}, {ctx, 10, kMatchCanceled, kArg},
+                                          {ctx, 9, 0, kArg}});
+    }
+
+    // A room's members: none offline, as sceNpMatchingGetRoomMemberListLocal.
+    CHECK(g.call("sceNpMatchingGetRoomMemberList", ctx, kRoom, 0, 0) == kMatchInval);
+    CHECK(g.call("sceNpMatchingGetRoomMemberList", ctx + 1, kRoom, kSize, 0) == kMatchCtxNotFound);
+    CHECK(g.call("sceNpMatchingGetRoomMemberList", ctx, kRoom, kSize, 0) == kMatchRoomNotFound);
+
+    // While matching 2 is in use, these are unavailable too.
+    REQUIRE(g.call("sceNpMatching2Init2", 0, 0, 0) == 0);
+    CHECK(g.call("sceNpMatchingGetRoomListGUI", ctx, kComm, kRange, 0, 0, kGuiOpd, kArg) == kMatchUnavailable);
+    CHECK(g.call("sceNpMatchingCreateRoomWithoutGUI", ctx, kComm, kAttrs, kGuiOpd, kArg) == kMatchUnavailable);
+    CHECK(g.call("sceNpMatchingGetRoomMemberList", ctx, kRoom, kSize, 0) == kMatchUnavailable);
+    REQUIRE(g.call("sceNpMatching2Term2") == 0);
+    CHECK(take_gui_calls(g, b).empty());
+}
+
+TEST_CASE("sceNpUtil's bandwidth test: a fake of about 100 ms, as RPCS3; one at a time", "[hle][np]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u64 kAlready = 0xFFFFFFFF8002AA02ull;
+    constexpr s64 kRunning = 1, kFinished = 2;
+    constexpr u32 kResult = kData + 0x100;
+    // SceNpUtilBandwidthTestResult: be f64 upload_bps, be f64 download_bps, be s32 result, 4 bytes of padding.
+    const auto check_result = [&] {
+        CHECK(std::bit_cast<double>(ps_read64(b, kResult)) == 100'000'000.0);
+        CHECK(std::bit_cast<double>(ps_read64(b, kResult + 8)) == 100'000'000.0);
+        CHECK(ps_read32(b, kResult + 16) == 0);
+        CHECK(ps_read32(b, kResult + 20) == 0);
+    };
+    const auto status = [&] { return static_cast<s64>(g.call("sceNpUtilBandwidthTestGetStatus")); };
+
+    // Nothing before a test starts; NP isn't needed.
+    CHECK(g.call("sceNpUtilBandwidthTestGetStatus") == kNotInit);
+    CHECK(g.call("sceNpUtilBandwidthTestAbort") == kNotInit);
+    CHECK(g.call("sceNpUtilBandwidthTestShutdown", kResult) == kNotInit);
+
+    // A test runs for about 100 ms, then finishes by itself; one at a time, until it is shut down.
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(g.call("sceNpUtilBandwidthTestInitStart", 1000, 0x4000) == 0);
+    const s64 first = status();
+    if (std::chrono::steady_clock::now() - started < std::chrono::milliseconds(100)) CHECK(first == kRunning);
+    CHECK(g.call("sceNpUtilBandwidthTestInitStart", 1000, 0x4000) == kAlready);
+    while (status() == kRunning && std::chrono::steady_clock::now() - started < std::chrono::seconds(10)) {
+        usleep(1000);
+    }
+    CHECK(status() == kFinished);
+    CHECK(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(100));
+    CHECK(g.call("sceNpUtilBandwidthTestInitStart", 1000, 0x4000) == kAlready);
+
+    // Shutdown writes the result when given a buffer (one that is not guest memory is refused and the test kept) and
+    // drops the test.
+    std::memset(b + kResult, 0xAA, 24);
+    CHECK(g.call("sceNpUtilBandwidthTestShutdown", kUnmapped) == kInval); // RPCS3 faults
+    CHECK(status() == kFinished);
+    REQUIRE(g.call("sceNpUtilBandwidthTestShutdown", kResult) == 0);
+    check_result();
+    CHECK(g.call("sceNpUtilBandwidthTestGetStatus") == kNotInit);
+    CHECK(g.call("sceNpUtilBandwidthTestShutdown", kResult) == kNotInit);
+
+    // Aborted, a test finishes at once, with the same result.
+    REQUIRE(g.call("sceNpUtilBandwidthTestInitStart", 0, 0) == 0);
+    REQUIRE(g.call("sceNpUtilBandwidthTestAbort") == 0);
+    CHECK(status() == kFinished);
+    std::memset(b + kResult, 0xAA, 24);
+    REQUIRE(g.call("sceNpUtilBandwidthTestShutdown", kResult) == 0);
+    check_result();
+
+    // A shutdown while it runs ends it too; a null result is allowed and nothing is written.
+    REQUIRE(g.call("sceNpUtilBandwidthTestInitStart", 0, 0) == 0);
+    std::memset(b + kResult, 0xAA, 24);
+    REQUIRE(g.call("sceNpUtilBandwidthTestShutdown", 0) == 0);
+    CHECK(ps_read32(b, kResult) == 0xAAAAAAAAu);
+    CHECK(g.call("sceNpUtilBandwidthTestGetStatus") == kNotInit);
 }

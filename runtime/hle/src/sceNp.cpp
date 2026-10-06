@@ -205,7 +205,7 @@ constexpr s32 SCE_NP_MATCHING_INVITATION_DESTINATION_MAX = 12;
 constexpr s32 SCE_NP_MATCHING_GUI_EVENT_CREATE_ROOM = 1, SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM = 2,
               SCE_NP_MATCHING_GUI_EVENT_SEARCH_JOIN = 4, SCE_NP_MATCHING_GUI_EVENT_QUICK_MATCH = 5,
               SCE_NP_MATCHING_GUI_EVENT_COMMON_LOAD = 8, SCE_NP_MATCHING_GUI_EVENT_COMMON_UNLOAD = 9,
-              SCE_NP_MATCHING_GUI_EVENT_GET_ROOM_LIST_LIMIT = 11;
+              SCE_NP_MATCHING_GUI_EVENT_GET_ROOM_LIST = 10, SCE_NP_MATCHING_GUI_EVENT_GET_ROOM_LIST_LIMIT = 11;
 constexpr u32 kMatchingListMax = 256; // pspocket's bound on a guest list walk (a cycle would hang RPCS3)
 constexpr u64 kRoomInfoInterval = 30'000'000; // the limited room info calls: one per 30 s (microseconds)
 // Commerce (version 1): SceNpCommerceProductCategory {be32 version; data; be32 dataSize; be32 dval; reserved[16]};
@@ -3134,25 +3134,46 @@ s32 sceNpMatchingGetResultGUI(PPUContext&, u32 buf, u32 size, u32 event)
     return error(SCE_NP_MATCHING_ERROR_RESULT_NOT_FOUND);
 }
 
-// RPCS3 sceNpMatchingCreateRoomGUI (matching_create_room): the communication ID, the handler and the room's attributes
-// (check_attr_create_room); NP isn't checked.
-s32 sceNpMatchingCreateRoomGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 attr, u32 handler, u32 arg)
+// RPCS3 matching_create_room (sceNpMatchingCreateRoomGUI, and sceNpMatchingInt's sceNpMatchingCreateRoomWithoutGUI):
+// the communication ID, the handler and the room's attributes (check_attr_create_room); NP isn't checked.
+s32 matching_create_room(PPUContext& ctx, std::string_view name, u32 ctx_id, u32 comm_id, u32 attr, u32 handler,
+    u32 arg)
 {
     if (const s32 r = matching_check(false)) return r;
     if (!comm_id || !handler) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
-    const std::optional<std::vector<MatchingAttr>> attrs = read_matching_attrs(ctx, "sceNpMatchingCreateRoomGUI", attr);
+    const std::optional<std::vector<MatchingAttr>> attrs = read_matching_attrs(ctx, name, attr);
     if (!attrs) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
     if (const s32 r = check_attr_create_room(*attrs)) return r;
-    return matching_gui_offline("sceNpMatchingCreateRoomGUI", ctx_id, SCE_NP_MATCHING_GUI_EVENT_CREATE_ROOM, handler,
-        arg);
+    return matching_gui_offline(name, ctx_id, SCE_NP_MATCHING_GUI_EVENT_CREATE_ROOM, handler, arg);
 }
 
-// RPCS3 sceNpMatchingJoinRoomGUI (matching_join_room): the room and the handler.
-s32 sceNpMatchingJoinRoomGUI(PPUContext&, u32 ctx_id, u32 room_id, u32 handler, u32 arg)
+s32 sceNpMatchingCreateRoomGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 attr, u32 handler, u32 arg)
+{
+    return matching_create_room(ctx, "sceNpMatchingCreateRoomGUI", ctx_id, comm_id, attr, handler, arg);
+}
+
+s32 sceNpMatchingCreateRoomWithoutGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 attr, u32 handler, u32 arg)
+{
+    return matching_create_room(ctx, "sceNpMatchingCreateRoomWithoutGUI", ctx_id, comm_id, attr, handler, arg);
+}
+
+// RPCS3 matching_join_room (sceNpMatchingJoinRoomGUI, and sceNpMatchingInt's sceNpMatchingJoinRoomWithoutGUI and its
+// own sceNpMatchingJoinRoomGUI): the room and the handler.
+s32 matching_join_room(std::string_view name, u32 ctx_id, u32 room_id, u32 handler, u32 arg)
 {
     if (const s32 r = matching_check(false)) return r;
     if (!room_id || !handler) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
-    return matching_gui_offline("sceNpMatchingJoinRoomGUI", ctx_id, SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM, handler, arg);
+    return matching_gui_offline(name, ctx_id, SCE_NP_MATCHING_GUI_EVENT_JOIN_ROOM, handler, arg);
+}
+
+s32 sceNpMatchingJoinRoomGUI(PPUContext&, u32 ctx_id, u32 room_id, u32 handler, u32 arg)
+{
+    return matching_join_room("sceNpMatchingJoinRoomGUI", ctx_id, room_id, handler, arg);
+}
+
+s32 sceNpMatchingJoinRoomWithoutGUI(PPUContext&, u32 ctx_id, u32 room_id, u32 handler, u32 arg)
+{
+    return matching_join_room("sceNpMatchingJoinRoomWithoutGUI", ctx_id, room_id, handler, arg);
 }
 
 // RPCS3 sceNpMatchingQuickMatchGUI: the communication ID, the handler, at least 2 players and a timeout of at least
@@ -3204,32 +3225,52 @@ s32 sceNpMatchingSearchJoinRoomGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32
         arg);
 }
 
-// RPCS3 sceNpMatchingGetRoomListLimitGUI (matching_get_room_list, check_room_list_params with param_7 1, param_8 0):
-// the communication ID, the range (a start, at most 20) and the handler, the conditions, then the attributes.
-s32 sceNpMatchingGetRoomListLimitGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 range, u32 cond, u32 attr,
-    u32 handler, u32 arg)
+// RPCS3 matching_get_room_list (check_room_list_params with param_7 1, param_8 0): the communication ID, the range (a
+// start, at most 20) and the handler, the conditions, then the attributes. The limited form
+// (sceNpMatchingGetRoomListLimitGUI) answers with GET_ROOM_LIST_LIMIT, sceNpMatchingInt's sceNpMatchingGetRoomListGUI
+// and sceNpMatchingGetRoomListWithoutGUI with GET_ROOM_LIST (np_handler::reply_get_room_list_gui).
+s32 matching_get_room_list(PPUContext& ctx, std::string_view name, bool limit, u32 ctx_id, u32 comm_id, u32 range,
+    u32 cond, u32 attr, u32 handler, u32 arg)
 {
     if (const s32 r = matching_check(false)) return r;
     if (!comm_id || !range || !handler) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
     lv2::PpuThread& t = thread_of(ctx);
     if (!guest_readable(t, range, 8)) {
-        log_call_site(ctx, t.kernel.base(),
-            std::format("sceNpMatchingGetRoomListLimitGUI: the range {:#x} is not guest memory", range));
+        log_call_site(ctx, t.kernel.base(), std::format("{}: the range {:#x} is not guest memory", name, range));
         return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
     }
     if (!ps_read32(t.kernel.base(), range) || ps_read32(t.kernel.base(), range + 4) > 20) {
         return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
     }
-    const std::optional<std::vector<MatchingCond>> conds =
-        read_matching_conds(ctx, "sceNpMatchingGetRoomListLimitGUI", cond, 9);
+    const std::optional<std::vector<MatchingCond>> conds = read_matching_conds(ctx, name, cond, 9);
     if (!conds) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
     if (const s32 r = check_search_conds(*conds, true)) return r;
-    const std::optional<std::vector<MatchingAttr>> attrs =
-        read_matching_attrs(ctx, "sceNpMatchingGetRoomListLimitGUI", attr);
+    const std::optional<std::vector<MatchingAttr>> attrs = read_matching_attrs(ctx, name, attr);
     if (!attrs) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
     if (const s32 r = check_attr_id_and_duplicate(*attrs)) return r;
-    return matching_gui_offline("sceNpMatchingGetRoomListLimitGUI", ctx_id,
-        SCE_NP_MATCHING_GUI_EVENT_GET_ROOM_LIST_LIMIT, handler, arg);
+    return matching_gui_offline(name, ctx_id,
+        limit ? SCE_NP_MATCHING_GUI_EVENT_GET_ROOM_LIST_LIMIT : SCE_NP_MATCHING_GUI_EVENT_GET_ROOM_LIST, handler, arg);
+}
+
+s32 sceNpMatchingGetRoomListLimitGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 range, u32 cond, u32 attr,
+    u32 handler, u32 arg)
+{
+    return matching_get_room_list(ctx, "sceNpMatchingGetRoomListLimitGUI", true, ctx_id, comm_id, range, cond, attr,
+        handler, arg);
+}
+
+s32 sceNpMatchingGetRoomListGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 range, u32 cond, u32 attr, u32 handler,
+    u32 arg)
+{
+    return matching_get_room_list(ctx, "sceNpMatchingGetRoomListGUI", false, ctx_id, comm_id, range, cond, attr,
+        handler, arg);
+}
+
+s32 sceNpMatchingGetRoomListWithoutGUI(PPUContext& ctx, u32 ctx_id, u32 comm_id, u32 range, u32 cond, u32 attr,
+    u32 handler, u32 arg)
+{
+    return matching_get_room_list(ctx, "sceNpMatchingGetRoomListWithoutGUI", false, ctx_id, comm_id, range, cond, attr,
+        handler, arg);
 }
 
 // The offline end of a room request (np_handler's *_gui requests): the context must exist; then no room is found.
@@ -3324,9 +3365,10 @@ s32 sceNpMatchingLeaveRoom(PPUContext& ctx, u32 ctx_id, u32 room_id, u32 req_id)
     return matching_room_offline("sceNpMatchingLeaveRoom", ctx_id);
 }
 
-// RPCS3 sceNpMatchingGetRoomMemberListLocal (get_room_member_list_local_gui): the members of a room in the GUI cache,
+// RPCS3 matching_get_room_member_list (sceNpMatchingGetRoomMemberListLocal, and sceNpMatchingInt's
+// sceNpMatchingGetRoomMemberList), np_handler::get_room_member_list_local_gui: the members of a room in the GUI cache,
 // which only RPCN's replies fill: none offline.
-s32 sceNpMatchingGetRoomMemberListLocal(PPUContext&, u32 ctx_id, u32 room_id, u32 buflen, u32 buf)
+s32 matching_get_room_member_list(std::string_view name, u32 ctx_id, u32 room_id, u32 buflen, u32 buf)
 {
     if (const s32 r = matching_check(true)) return r;
     if (!buflen) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
@@ -3335,9 +3377,18 @@ s32 sceNpMatchingGetRoomMemberListLocal(PPUContext&, u32 ctx_id, u32 room_id, u3
         std::lock_guard lock(s.mutex);
         if (!s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
     }
-    PS_LOG_DEBUG(kChan, "sceNpMatchingGetRoomMemberListLocal(context {:#x}, room {:#x}, buf {:#x}): no room", ctx_id,
-        room_id, buf);
+    PS_LOG_DEBUG(kChan, "{}(context {:#x}, room {:#x}, buf {:#x}): no room", name, ctx_id, room_id, buf);
     return error(SCE_NP_MATCHING_ERROR_ROOM_NOT_FOUND);
+}
+
+s32 sceNpMatchingGetRoomMemberListLocal(PPUContext&, u32 ctx_id, u32 room_id, u32 buflen, u32 buf)
+{
+    return matching_get_room_member_list("sceNpMatchingGetRoomMemberListLocal", ctx_id, room_id, buflen, buf);
+}
+
+s32 sceNpMatchingGetRoomMemberList(PPUContext&, u32 ctx_id, u32 room_id, u32 buflen, u32 buf)
+{
+    return matching_get_room_member_list("sceNpMatchingGetRoomMemberList", ctx_id, room_id, buflen, buf);
 }
 
 // RPCS3 sceNpMatchingGrantOwnership, sceNpMatchingKickRoomMember(WithOpt): TODOs that answer CELL_OK after checking
@@ -4023,6 +4074,19 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0x0561448B, sceNpCommerceGetDataFlagAbort),
         PS_HLE_FUNC(0x9281E87A, sceNpCommerceGetDataFlagFinish),
         PS_HLE_FUNC(0x8D4518A0, sceNpCommerceSetDataFlagFinish),
+    });
+    // sceNpMatchingInt (RPCS3 sceNpMatchingInt.cpp): the matching library's internal entry points. Three share their
+    // names, and so their NIDs, with sceNp's (RPCS3 registers its OLD_ functions under them); they do the same here.
+    // RPCS3's sceNpMatchingCancelRequest(GUI) and sceNpMatchingSendRoomMessage are stubs (rpcs3_stubs.inc).
+    r.add("sceNpMatchingInt", {
+        PS_HLE_FUNC(0x170829D3, sceNpMatchingGetRoomMemberList),
+        PS_HLE_FUNC(0x31B2B978, sceNpMatchingJoinRoomWithoutGUI),
+        PS_HLE_FUNC(0x474B7B13, sceNpMatchingJoinRoomGUI),
+        PS_HLE_FUNC(0x4A18A89E, sceNpMatchingSetRoomInfoNoLimit),
+        PS_HLE_FUNC(0x92D5C77B, sceNpMatchingGetRoomListWithoutGUI),
+        PS_HLE_FUNC(0xB00F408A, sceNpMatchingGetRoomListGUI),
+        PS_HLE_FUNC(0xB020684E, sceNpMatchingGetRoomInfoNoLimit),
+        PS_HLE_FUNC(0xEADCB5CA, sceNpMatchingCreateRoomWithoutGUI),
     });
 }
 

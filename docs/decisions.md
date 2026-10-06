@@ -3887,6 +3887,71 @@ Tests:
 - tests/hle/test_lle.cpp: a module by descriptor from inside an archive and on a container; the list, info and
   lookup by address. tests/hle/test_sysprx_libc.cpp: sys_libc.
 
+## D-185 · 2026-10-06 · The NP family complete, offline as RPCS3 with PSN disabled
+
+The NP libraries (libsysutil_np*.sprx) are always native, like every libsysutil* module, so a function pspocket
+lacked returned ENOSYS to the game with no fallback. Every function RPCS3 implements in sceNp, sceNp2, sceNpTrophy,
+sceNpTus, sceNpClans, sceNpCommerce2, sceNpSns, sceNpUtil and sceNpMatchingInt is now there: 355 added, 483 in all.
+RPCS3's stubs in these modules answer through D-182's table.
+
+**Policy, as D-059 and D-139.** RPCS3 with PSN disabled and no RPCN:
+
+- Each function makes RPCS3's checks in RPCS3's order, then takes RPCS3's offline path.
+- Where RPCS3 needs RPCN (get_rpcn()) and would abort or wait for a server, the request ends offline. A request that
+  needs a signed-in user is refused (INVALID_ONLINE_ID, NOT_CONNECTED, NOT_SIGN_IN), a lookup of the server's objects
+  finds none (ID_NOT_FOUND, INVALID_ID, ROOM_NOT_FOUND), and matching 2's requests end at RPCS3's context check (no
+  context exists offline).
+- Dialogs are answered at once, as D-183's are: the matching library's dialogs (create, join, quick match, search and
+  join, room lists) report COMMON_LOAD, their event with SCE_NP_MATCHING_ERROR_CANCELED, then COMMON_UNLOAD to the
+  game's GUI handler through cellSysutilCheckCallback.
+- RPCS3's TODOs answer CELL_OK after their checks, with nothing written, logged at warn (RPCS3's todo level).
+
+**By module.**
+
+- **sceNpTrophy:** game progress (rounded as utils::rounded_div), unlock flags (a read-only context reads the
+  installed TROPUSR.DAT afresh), the game's and the trophies' icons (LOCKED or HIDDEN until unlocked), sound level.
+- **sceNp:**
+  - basic (lists, presence, block list, players' history, attachments), manager (the user's IDs, name, avatar and
+    languages are offline; cached info empty), friend list, the custom menu (kept, never shown);
+  - DRM: time limits from an EDAT's or a SELF's NPD header, sceNpDrmProcessExitSpawn(2) after the content check,
+    upgrade licences not found (they would need decrypting);
+  - NP ID utilities and platform types, sceNpTerm (which also drops matching 2's room callbacks, as RPCS3's
+    terminate_NP);
+  - lookup, and score: title contexts from 0x2001 kept with their timeout, transactions refused at creation;
+  - matching (version 1): one context (0x9001), the limited room info calls one per 30 s; commerce (version 1);
+    the rest of signaling.
+- **sceNp2:** the rest of matching 2 (23 server requests through one offline path), its signaling (no room: status
+  inactive), the queue and memory info, OAuth and sceNpUtilBuildCdnUrl (RPCS3's TODOs).
+- **sceNpTus (new):** title contexts from 0x7001; every variable, data and data status request in its four forms (NP
+  ID or virtual user, synchronous or not), the friends' calls and TSS.
+- **sceNpClans (new):** clans are off by RPCS3's default, so no request handle is made (SERVICE_UNAVAILABLE); calls
+  that need a clan ticket answer SERVICE_UNAVAILABLE, the others NOT_INITIALIZED (no request for the handle).
+- **sceNpCommerce2:** the empty store check reports to the context's handler and finds the store not empty; product
+  and service list browsing and product info lists check their arguments and do nothing; no background downloads.
+- **sceNpSns:** the short access token as the long one (nobody signed in: NOT_SIGN_IN); the throttle, config and
+  stream-publish TODOs. sceNpSnsFbLoadThrottle and sceNpSnsFbStreamPublish look only at the handle, as RPCS3.
+- **sceNpUtil (new):** the bandwidth test is RPCS3's fake: about 100 ms (or until aborted or shut down), then
+  100,000,000 bits per second both ways and CELL_OK. One test at a time; the shutdown writes the result and drops it.
+- **sceNpMatchingInt (new):** the library's internal entry points. Three share sceNp's names and NIDs (RPCS3
+  registers its OLD_ functions under them) and do the same; the room lists without the limit report GET_ROOM_LIST
+  (10) where sceNpMatchingGetRoomListLimitGUI reports 11.
+
+**Other changes.** HLE functions may take 20 arguments (sceNpScore's clan rankings take 19).
+sceNpDrmIsAvailable2 no longer waits the 5 ms that only sceNpDrmIsAvailable waits in RPCS3 (a pspocket bug).
+sysPrxForUser's exitspawn is shared with the DRM calls (prx.hpp).
+
+**Differences from RPCS3.**
+
+- Guest memory a check reads, or a result buffer, that is not guest memory is logged with the call site and refused
+  with the library's invalid-argument error before anything changes (D-042; RPCS3 faults).
+- Where RPCS3 aborts (an ensure(), get_rpcn() without RPCN, sceNpMatchingLeaveRoom without a room), pspocket logs
+  and returns an error.
+- sceNpUtil's bandwidth test is a deadline on the host's clock, not a thread.
+
+Tests: tests/hle/test_np.cpp, test_np2.cpp, test_np_tus.cpp, test_np_clans.cpp, test_commerce2.cpp and
+test_trophy.cpp, with synthetic data only: each function's checks and offline answers, the dialogs' events through a
+guest handler, idm's ID order, the bandwidth test's timing, abort and result.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

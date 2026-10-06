@@ -6,8 +6,11 @@
 // hands them out for id_base 1, id_step 1, id_count 5 (SCE_NP_SNS_FB_HANDLE_SLOT_MAX + 1): a fifth handle can be
 // made, but, as in RPCS3, only IDs 1 to 4 can be destroyed, aborted or used. sceNpSnsFbTerm leaves the handles.
 // An access token needs a user signed in to PSN: none ever is here (sceNp.cpp), so the request is refused with
-// SCE_NP_SNS_ERROR_NOT_SIGN_IN and nothing written, RPCS3's answer while PSN is offline. Aborting a handle does
-// nothing: nothing ever runs on one. What RPCS3 implements is logged at info; its TODOs at warn (RPCS3's todo level).
+// SCE_NP_SNS_ERROR_NOT_SIGN_IN and nothing written, RPCS3's answer while PSN is offline (both the short and the long
+// token). Aborting a handle does nothing: nothing ever runs on one. The throttle, config and stream-publish calls are
+// RPCS3's TODOs: they check what RPCS3 checks and succeed with nothing written (sceNpSnsFbLoadThrottle and
+// sceNpSnsFbStreamPublish look only at the handle, not at the library, as RPCS3). What RPCS3 implements is logged at
+// info; its TODOs at warn (RPCS3's todo level).
 //
 // Difference from RPCS3: pointers are checked before use (D-042): one that is not guest memory is logged with the call
 // site and refused with SCE_NP_SNS_ERROR_INVALID_ARGUMENT before anything changes (RPCS3 faults).
@@ -167,20 +170,20 @@ s32 sceNpSnsFbAbortHandle(PPUContext&, u32 handle)
     return done(lv2::CELL_OK, "; RPCS3 todo: nothing runs on the handle to abort");
 }
 
-// RPCS3 sceNpSnsFbGetLongAccessToken(handle, const SceNpSnsFbAccessTokenParam* param,
-// SceNpSnsFbLongAccessTokenResult* result): the arguments first (before the library, as RPCS3), then the handle, then
-// PSN: np_handler::get_psn_status() is SCE_NP_MANAGER_STATUS_OFFLINE, so SCE_NP_SNS_ERROR_NOT_SIGN_IN and nothing is
+// RPCS3 sceNpSnsFbGetAccessToken and sceNpSnsFbGetLongAccessToken(handle, const SceNpSnsFbAccessTokenParam* param,
+// result): the arguments first (before the library, as RPCS3), then the handle, then PSN:
+// np_handler::get_psn_status() is SCE_NP_MANAGER_STATUS_OFFLINE, so SCE_NP_SNS_ERROR_NOT_SIGN_IN and nothing is
 // written. (RPCS3 returns it as not_an_error: it isn't logged as an error, but the game gets the same code.)
-s32 sceNpSnsFbGetLongAccessToken(PPUContext& ctx, u32 handle, u32 param, u32 result)
+s32 access_token(PPUContext& ctx, std::string_view name, u32 handle, u32 param, u32 result)
 {
     std::string app; // the param's fb_app_id once read, for the log
     const auto done = [&](s32 r) {
-        PS_LOG_WARN(kChan, "sceNpSnsFbGetLongAccessToken(handle {}, param {:#x}{}, result {:#x}): {}", handle, param,
-            app, result, result_name(r));
+        PS_LOG_WARN(kChan, "{}(handle {}, param {:#x}{}, result {:#x}): {}", name, handle, param, app, result,
+            result_name(r));
         return r;
     };
     if (!param || !result) return done(error(SCE_NP_SNS_ERROR_INVALID_ARGUMENT));
-    if (!usable(ctx, param, kAppIdSize, "sceNpSnsFbGetLongAccessToken: param")) {
+    if (!usable(ctx, param, kAppIdSize, std::format("{}: param", name))) {
         return done(error(SCE_NP_SNS_ERROR_INVALID_ARGUMENT));
     }
     const u64 app_id = ps_read64(guest_base(ctx), param);
@@ -194,6 +197,67 @@ s32 sceNpSnsFbGetLongAccessToken(PPUContext& ctx, u32 handle, u32 param, u32 res
     return done(error(SCE_NP_SNS_ERROR_NOT_SIGN_IN));
 }
 
+// SceNpSnsFbAccessTokenResult {be64 expiration, char access_token[129]}.
+s32 sceNpSnsFbGetAccessToken(PPUContext& ctx, u32 handle, u32 param, u32 result)
+{
+    return access_token(ctx, "sceNpSnsFbGetAccessToken", handle, param, result);
+}
+
+// SceNpSnsFbLongAccessTokenResult {be64 expiration, char access_token[4097]}.
+s32 sceNpSnsFbGetLongAccessToken(PPUContext& ctx, u32 handle, u32 param, u32 result)
+{
+    return access_token(ctx, "sceNpSnsFbGetLongAccessToken", handle, param, result);
+}
+
+// RPCS3 sceNpSnsFbCheckConfig(void* arg0): a TODO behind the library check; arg0 (of unknown layout) is not looked at.
+s32 sceNpSnsFbCheckConfig(PPUContext&, u32 arg0)
+{
+    SnsState& s = sns();
+    std::lock_guard lock(s.mutex);
+    const s32 r = s.initialized ? lv2::CELL_OK : error(SCE_NP_SNS_FB_ERROR_NOT_INITIALIZED);
+    PS_LOG_WARN(kChan, "sceNpSnsFbCheckConfig({:#x}): {}{}", arg0, result_name(r),
+        r == lv2::CELL_OK ? "; RPCS3 todo: nothing is checked" : "");
+    return r;
+}
+
+// RPCS3 sceNpSnsFbCheckThrottle(void* arg0): a TODO behind a null check, then the library check.
+s32 sceNpSnsFbCheckThrottle(PPUContext&, u32 arg0)
+{
+    SnsState& s = sns();
+    std::lock_guard lock(s.mutex);
+    s32 r = lv2::CELL_OK;
+    if (!arg0) r = error(SCE_NP_SNS_ERROR_INVALID_ARGUMENT);
+    else if (!s.initialized) r = error(SCE_NP_SNS_FB_ERROR_NOT_INITIALIZED);
+    PS_LOG_WARN(kChan, "sceNpSnsFbCheckThrottle({:#x}): {}{}", arg0, result_name(r),
+        r == lv2::CELL_OK ? "; RPCS3 todo: nothing is throttled" : "");
+    return r;
+}
+
+// RPCS3 sceNpSnsFbLoadThrottle(handle) and sceNpSnsFbStreamPublish(handle, ...): TODOs behind the handle checks, which
+// look at idm only (a handle outlives sceNpSnsFbTerm), not at the library. RPCS3 takes only the handle for the stream
+// publish ("add more arguments"); nothing is ever published here.
+s32 handle_todo(std::string_view name, u32 handle, std::string_view todo)
+{
+    SnsState& s = sns();
+    std::lock_guard lock(s.mutex);
+    s32 r = lv2::CELL_OK;
+    if (!in_range(handle)) r = error(SCE_NP_SNS_ERROR_INVALID_ARGUMENT);
+    else if (!s.handles.find(handle)) r = error(SCE_NP_SNS_FB_ERROR_UNKNOWN_HANDLE);
+    PS_LOG_WARN(kChan, "{}(handle {}): {}{}", name, handle, result_name(r),
+        r == lv2::CELL_OK ? std::format("; RPCS3 todo: {}", todo) : std::string());
+    return r;
+}
+
+s32 sceNpSnsFbLoadThrottle(PPUContext&, u32 handle)
+{
+    return handle_todo("sceNpSnsFbLoadThrottle", handle, "nothing is loaded");
+}
+
+s32 sceNpSnsFbStreamPublish(PPUContext&, u32 handle)
+{
+    return handle_todo("sceNpSnsFbStreamPublish", handle, "nothing is published (no user is signed in)");
+}
+
 } // namespace
 
 void register_sceNpSns(Registry& r)
@@ -205,6 +269,11 @@ void register_sceNpSns(Registry& r)
         PS_HLE_FUNC(0x6E42C0DD, sceNpSnsFbDestroyHandle),
         PS_HLE_FUNC(0x3711833F, sceNpSnsFbAbortHandle),
         PS_HLE_FUNC(0xBA8C569E, sceNpSnsFbGetLongAccessToken),
+        PS_HLE_FUNC(0x702DC876, sceNpSnsFbGetAccessToken),
+        PS_HLE_FUNC(0x021D6C1F, sceNpSnsFbStreamPublish),
+        PS_HLE_FUNC(0x53D03CE1, sceNpSnsFbCheckThrottle),
+        PS_HLE_FUNC(0xAA9ED7FF, sceNpSnsFbCheckConfig),
+        PS_HLE_FUNC(0xAF86C77A, sceNpSnsFbLoadThrottle),
     });
 }
 
