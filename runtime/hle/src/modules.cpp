@@ -36,6 +36,7 @@ void register_sys_io(Registry& r);
 void register_sys_net(Registry& r);
 void register_sysutil_misc(Registry& r);
 void register_devices(Registry& r);
+void register_gem(Registry& r);
 
 void register_all_modules(Registry& r)
 {
@@ -71,6 +72,7 @@ void register_all_modules(Registry& r)
     register_sys_net(r);
     register_sysutil_misc(r);
     register_devices(r);
+    register_gem(r);
 }
 
 } // namespace pspocket::hle
