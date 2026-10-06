@@ -61,3 +61,31 @@ TEST_CASE("prepare: discovered SPU code stays out of the code words when the gam
     }
     fs::remove_all(dir);
 }
+
+TEST_CASE("prepare: copies of a job that differ only in data are lifted once (D-208)")
+{
+    const fs::path dir = fs::temp_directory_path() / ("pspocket-prepare-spu-copies-" + std::to_string(getpid()));
+    fs::remove_all(dir);
+    const fs::path dump = dir / "images", out = dir / "spu";
+    fs::create_directories(dump);
+    // The entry (code words 0 and 1) and three words the job never runs (its data, as far as the program knows).
+    const auto save = [&](const std::string& name, u32 data, u32 entry_word) {
+        const std::vector<u32> words = {entry_word, as::bi(0), as::lnop(), data, data + 1, data + 2};
+        std::string bin(words.size() * 4, '\0');
+        for (size_t i = 0; i < words.size(); i++) ps_st32(reinterpret_cast<u8*>(bin.data()) + 4 * i, words[i]);
+        std::ofstream(dump / (name + ".bin"), std::ios::binary) << bin;
+        std::ofstream(dump / (name + ".txt")) << "kind job\nguest 0x10000\nbase 0x0\nsize 0x18\nentry 0x0\n";
+    };
+    save("spu_00000000000000a1_00000", 0x1000, as::il(3, 1));
+    save("spu_00000000000000a2_00000", 0x2000, as::il(3, 1)); // the same code, other data
+    save("spu_00000000000000a3_00000", 0x3000, as::il(3, 2)); // other code
+    std::string error;
+    prepare::SpuLiftReport report;
+    REQUIRE(prepare::lift_spu_images(dump.string(), out.string(), {}, &report, &error, true));
+    CHECK(report.lifted == 2);
+    CHECK(report.merged == 1);
+    CHECK(fs::exists(out / "spu_00000000000000a1_00000"));
+    CHECK_FALSE(fs::exists(out / "spu_00000000000000a2_00000"));
+    CHECK(fs::exists(out / "spu_00000000000000a3_00000"));
+    fs::remove_all(dir);
+}

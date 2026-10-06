@@ -232,6 +232,28 @@ const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, ui
     return nullptr;
 }
 
+uint64_t ps_spu_code_hash(const uint8_t* image, uint32_t code_size, const uint32_t* code_words)
+{
+    std::vector<u8> code;
+    code.reserve(code_size);
+    for (u32 w = 0; w < code_size / 4; w++)
+        if (!code_words || ((code_words[w >> 5] >> (w & 31)) & 1)) code.insert(code.end(), image + 4 * w, image + 4 * w + 4);
+    return ps_spu_hash64(code.data(), code.size());
+}
+
+const ps_spu_program* ps_spu_find_program_by_code(const uint8_t* image, uint32_t code_size)
+{
+    std::vector<const ps_spu_program*> candidates;
+    {
+        std::lock_guard lock(g_registry_mutex);
+        for (const ps_spu_program* p : g_programs)
+            if (p->relocatable && p->code_hash && p->code_words && p->code_size == code_size) candidates.push_back(p);
+    }
+    for (const ps_spu_program* p : candidates)
+        if (ps_spu_code_hash(image, code_size, p->code_words) == p->code_hash) return p;
+    return nullptr;
+}
+
 const ps_spu_program* ps_spu_identify(SPUContext* ctx, uint32_t code_start, uint32_t code_size)
 {
     PS_CHECK(code_start < PS_SPU_LS_SIZE && code_size <= PS_SPU_LS_SIZE - code_start);

@@ -4624,6 +4624,28 @@ code) were visible only as one log line each. The goal is no interpreting, so it
 
 Test: tests/ppu/test_interp_branch_mem.cpp (a loop's count and entries, a run stopped by its step limit).
 
+## D-208 · 2026-10-07 · An SPU program is also known by its code words alone
+
+A task of Assassin's Creed loads one 32 KB module into its own data area at LS 0x33980 and calls 0x37c58, about twice
+a second. Its whole-image hash was new every time: 398 different images in run 117, so it ran interpreted (81 million
+instructions a session). The 56 copies run 118 saved differ only in 18 words at the module's end, a parameter block;
+the other 8,078 words are the same. Whole-image hashing cannot name such a module, however many copies are lifted.
+
+- **Code hash.** Each lifted SPU program carries `code_hash`: ps_spu_hash64 over the bytes of its code words only
+  (the words it lifted as instructions, D-085, D-155, D-205). Programs lifted before the field leave it zero (not
+  known); generated code may omit trailing fields (-Wno-missing-field-initializers for generated sources).
+- **At run time.** A relocatable image (job or module) whose whole hash no program has is checked against the
+  relocatable programs of its size: one whose code words hold the same bytes is the program. The data is read from
+  local store at run time, as with any program, so it may be anything. Cost: one hash over the code words of each
+  candidate, only for images not found by their whole hash.
+- **In prepare.** A relocatable image whose code words match a program lifted earlier in the same preparation is
+  merged into it instead of lifted again (the 57 saved copies of that module give one program).
+- What it does not cover: code that itself changes with the load (patched instructions) stays a different program,
+  as it must.
+
+Tests: tests/hle/test_spu_programs.cpp (a module loaded with other data three times stays lifted; other code does
+not), tests/game/test_prepare_spu.cpp (copies differing in data are lifted once).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

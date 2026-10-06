@@ -65,7 +65,7 @@ TEST_CASE("SPU programs: a load attaches the lifted program with the image's key
 
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
     ps_spu_program program{"spu_test", ps_spu_hash64(base + kGuest, kSize), kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1,
-        entries, nullptr, nullptr};
+        entries, nullptr, nullptr, 0};
     ps_spu_register_program(&program);
     Spu spu(base);
     const hle::SpuProgramStats before = hle::spu_program_stats();
@@ -103,7 +103,7 @@ TEST_CASE("SPU programs: an image loaded again is the program found before, unle
     for (u32 i = 0; i < kSize; i++) base[kGuest + i] = static_cast<u8>(i * 11 + 5);
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
     ps_spu_program program{"spu_test_again", ps_spu_hash64(base + kGuest, kSize), kLs, kSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&program);
     Spu spu(base);
     const hle::spurs::SpuImage job{ImageKind::Job, kGuest, kLs, kSize, kLs};
@@ -136,7 +136,7 @@ TEST_CASE("SPU programs: a relocatable program attaches wherever its image sits 
 
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
     ps_spu_program program{"spu_test_reloc", ps_spu_hash64(base + kGuest, kSize), kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE,
-        1, 1, entries, nullptr, nullptr};
+        1, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&program);
     Spu spu(base);
 
@@ -195,7 +195,7 @@ TEST_CASE("SPU programs: a DMA over the attached program's code drops it", "[hle
     REQUIRE(mem.commit(kGuest, 0x10000));
     u8* base = mem.base();
     const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
-    ps_spu_program program{"spu_test", 1, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_program program{"spu_test", 1, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&program);
     Spu spu(base);
     ps_spu_attach_program(&spu.ctx, &program);
@@ -221,7 +221,7 @@ TEST_CASE("SPU programs: a DMA over the attached program's code drops it", "[hle
     // run). Instructions in the first 0x100 bytes, data after.
     uint32_t code_words[kSize / 4 / 32] = {};
     for (u32 w = 0; w < 0x100 / 4; w++) code_words[w / 32] |= 1u << (w % 32);
-    ps_spu_program partial{"spu_test_data", 2, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, code_words};
+    ps_spu_program partial{"spu_test_data", 2, kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, code_words, 0};
     ps_spu_register_program(&partial);
     ps_spu_attach_program(&spu.ctx, &partial);
     get(kLs + 0x100, 0x100); // its data: stays
@@ -250,7 +250,7 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i); // nops with distinct bits
     const ps_spu_entry entries[] = {{kModule, &module_entry}};
     ps_spu_program program{"spu_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&program);
     hle::enable_spu_modules();
     Spu spu(base);
@@ -307,6 +307,59 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     ps_spu_unregister_program(&program);
 }
 
+TEST_CASE("SPU programs: a module whose data changes with every load is known by its code words (D-208)", "[hle][spu]")
+{
+    // Regression, runs 117-118: Assassin's Creed loads one 32 KB module whose last 18 words differ each time; as whole
+    // images, 398 different ones in a session, none known.
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModule = 0x8000, kModuleSize = 0x800;
+    ps_write32(base, kGuest, 0x00000007); // `stop 0x7` at its entry, for the interpreter
+    for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
+    std::array<u32, kModuleSize / 128> code_words{}; // its first half is code, the rest data
+    for (u32 w = 0; w < kModuleSize / 8; w++) code_words[w >> 5] |= 1u << (w & 31);
+    const ps_spu_entry entries[] = {{kModule, &module_entry}};
+    ps_spu_program program{"spu_data_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr, code_words.data(),
+        ps_spu_code_hash(base + kGuest, kModuleSize, code_words.data())};
+    ps_spu_register_program(&program);
+    hle::enable_spu_modules();
+    Spu spu(base);
+    const auto get = [&](u32 lsa, u32 eal, u32 size) {
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_LSA, lsa) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAH, 0) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAL, eal) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Size, size) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_TagID, 2) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+    };
+    const auto load_and_run = [&] {
+        ps_spu_attach_program(&spu.ctx, nullptr);
+        get(kModule, kGuest, kModuleSize);
+        spu.ctx.pc = kModule;
+        REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+        return spu.ctx.stop_code;
+    };
+    // As lifted, then with other data three times: lifted each time.
+    CHECK(load_and_run() == 0x42);
+    for (u32 k = 1; k <= 3; k++) {
+        ps_write32(base, kGuest + kModuleSize - 8, 0xABCD0000 | k);
+        ps_write32(base, kGuest + kModuleSize / 2, 0x12340000 | k);
+        CHECK(load_and_run() == 0x42);
+        CHECK(spu.ctx.program == &program);
+    }
+    // Other code (a word of its first half): not this program.
+    ps_write32(base, kGuest + 0x100, 0x40200000);
+    CHECK(load_and_run() == 0x7);
+    CHECK(spu.ctx.program == nullptr);
+
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&program);
+}
+
 TEST_CASE("SPU programs: a module shares its 1 KB block with data, and outlasts hundreds of data copies", "[hle][spu]")
 {
     // Regression, run 066: GTA V's dependency tasks copy a small module to LS 0x71f0 and their data to 0x7310, in the
@@ -320,7 +373,7 @@ TEST_CASE("SPU programs: a module shares its 1 KB block with data, and outlasts 
     for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
     const ps_spu_entry entries[] = {{kModule, &module_entry}};
     ps_spu_program program{"spu_small_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&program);
     hle::enable_spu_modules();
     Spu spu(base);
@@ -370,7 +423,7 @@ TEST_CASE("SPU programs: a module with data copied over its tail still runs lift
     std::array<u32, kModuleSize / 128> code_words{}; // its first three quarters are instructions, the rest data
     for (u32 w = 0; w < kModuleSize * 3 / 16; w++) code_words[w >> 5] |= 1u << (w & 31);
     ps_spu_program program{"spu_tail_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 0, 2, entries, nullptr, code_words.data()};
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 2, entries, nullptr, code_words.data(), 0};
     ps_spu_register_program(&program);
     hle::enable_spu_modules();
     Spu spu(base);
@@ -451,9 +504,9 @@ TEST_CASE("SPU programs: a relocatable module runs where it was copied, then its
     for (u32 i = 0; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i); // nops with distinct bits
     const ps_spu_entry module_entries[] = {{kLifted, &reloc_module_entry}};
     ps_spu_program module{"spu_module_reloc", ps_spu_hash64(base + kGuest, kModuleSize), kLifted, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, module_entries, nullptr, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, module_entries, nullptr, nullptr, 0};
     const ps_spu_entry home_entries[] = {{kHome, &home_entry}, {kHome + 4, &home_return}};
-    ps_spu_program home{"spu_home", 2, kHome, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 2, home_entries, nullptr, nullptr};
+    ps_spu_program home{"spu_home", 2, kHome, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 2, home_entries, nullptr, nullptr, 0};
     ps_spu_register_program(&module);
     ps_spu_register_program(&home);
     hle::enable_spu_modules();
@@ -540,7 +593,7 @@ TEST_CASE("SPU programs: a task's modules stay known across its context switch t
     for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
     const ps_spu_entry entries[] = {{kModule, &module_entry}};
     ps_spu_program program{"spu_module_switch", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&program);
     hle::enable_spu_modules();
     const auto run_at_module = [](Spu& spu) {
@@ -592,7 +645,7 @@ TEST_CASE("SPU programs: the worker's stops in local store run as lifted stand-i
     Spu spu(mem.base());
     ps_write32(spu.ls.get(), 0x808, 0x808); // `stop 0x808`, as the worker plants it
     const ps_spu_entry entries[] = {{0xA00, &jump_to_kernel_exit}};
-    ps_spu_program pm{"spu_pm", 3, 0xA00, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_program pm{"spu_pm", 3, 0xA00, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&pm);
     const ps_spu_miss_policy policy = ps_spu_get_miss_policy();
     ps_spu_set_miss_policy(PS_SPU_MISS_ABORT); // a miss would end the test
@@ -633,7 +686,7 @@ TEST_CASE("SPU programs: a task's syscall entry runs as a lifted stand-in, not a
     Spu spu(mem.base());
     ps_write32(spu.ls.get(), 0xA70, 0xA70); // `stop 0xA70`, as the taskset's policy plants it
     const ps_spu_entry entries[] = {{0x3000, &call_task_syscall}};
-    ps_spu_program task{"spu_task", 5, 0x3000, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_program task{"spu_task", 5, 0x3000, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&task);
     const ps_spu_miss_policy policy = ps_spu_get_miss_policy();
     ps_spu_set_miss_policy(PS_SPU_MISS_ABORT);
@@ -660,7 +713,7 @@ TEST_CASE("SPU programs: a miss is also written to the miss log, in the words sc
     Spu spu(mem.base());
     ps_write32(spu.ls.get(), 0xA10, 0x00000123); // `stop 0x123`, no lifted code for it
     const ps_spu_entry entries[] = {{0xA00, &jump_to_unlifted}};
-    ps_spu_program p{"spu_misslog", 7, 0xA00, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_program p{"spu_misslog", 7, 0xA00, 0x100, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&p);
     const auto path = std::filesystem::temp_directory_path() / std::format("pspocket-misses-{}.log", getpid());
     std::filesystem::remove(path);

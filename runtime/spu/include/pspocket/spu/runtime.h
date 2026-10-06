@@ -60,17 +60,28 @@ typedef struct ps_spu_program {
      * of them). A DMA over the range invalidates the program only when it writes one of these (D-085): a binary's own
      * data and bss share its range, and jobs copy their buffers there. */
     const uint32_t* code_words;
+    /* ps_spu_code_hash of the image it was lifted from: the bytes of its code words only (0: not known). An image whose
+     * whole hash is new is this program when its code words hold the same bytes: a module with data that changes with
+     * every load (D-208). */
+    uint64_t code_hash;
 } ps_spu_program;
 
 /* Program key: 64-bit hash of the code bytes (multiply-xorshift over 8-byte words, then the tail). The same function
  * runs in the toolchain (spu-lift) and at runtime. */
 uint64_t ps_spu_hash64(const uint8_t* data, size_t size);
 
+/* The hash of an image's code words only (ps_spu_hash64 over their bytes, in order): code_words as in ps_spu_program,
+ * NULL for every word of the image. */
+uint64_t ps_spu_code_hash(const uint8_t* image, uint32_t code_size, const uint32_t* code_words);
+
 /* Registration happens at startup, before SPU threads run. The program must stay alive. */
 PS_SPU_IMPORT(void, ps_spu_register_program, (ps_spu_program* program));
 void ps_spu_unregister_program(ps_spu_program* program);
 /* The registered program with this key: hash, code start and size; a relocatable program matches any code start. */
 const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, uint32_t code_size);
+/* A registered relocatable program of this size whose code words hold the same bytes as `image` (D-208): for an image
+ * ps_spu_find_program does not know. NULL: none. */
+const ps_spu_program* ps_spu_find_program_by_code(const uint8_t* image, uint32_t code_size);
 /* Changes whenever a program is registered or unregistered: what a caller remembered from ps_spu_find_program holds
  * while it stays the same (D-109). */
 uint64_t ps_spu_registry_generation(void);

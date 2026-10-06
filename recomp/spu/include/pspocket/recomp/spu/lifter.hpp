@@ -50,6 +50,8 @@ struct LiftResult {
     std::vector<OutputFile> files;
     LiftStats stats;
     u64 hash = 0;
+    std::vector<u32> code_words; // the program's code words (a bit per word, ps_spu_program)
+    u64 code_hash = 0;           // ps_spu_code_hash of the image over them (D-208)
 };
 
 LiftResult lift(const LsImage& image, const Program& program, const LiftOptions& options);

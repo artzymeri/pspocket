@@ -18,6 +18,7 @@
 #include "pspocket/recomp/spu/image.hpp"
 #include "pspocket/recomp/spu/lifter.hpp"
 #include "pspocket/spu/context.h"
+#include "pspocket/spu/runtime.h"
 
 namespace pspocket::prepare {
 namespace {
@@ -124,6 +125,14 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
     fs::create_directories(out_dir, ec);
     std::string decls, calls;
     std::set<std::string> lifted;
+    // The relocatable programs lifted so far, by size: another image whose code words hold the same bytes is that
+    // program with other data (a module whose data changes with every load: Assassin's Creed saved 56 copies of one in
+    // a session, run 118), found by its code hash at run time (D-208). It is not lifted again.
+    struct ByCode {
+        std::vector<u32> code_words;
+        u64 code_hash;
+    };
+    std::map<u32, std::vector<ByCode>> by_size;
     for (auto& [name, img] : images) {
         if (merged.contains(name)) {
             rep.merged++;
@@ -131,6 +140,18 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
         }
         std::string bin;
         read_text(fs::path(dump_dir) / (name + ".bin"), bin);
+        const bool reloc = img.kind == "job" || img.kind == "module";
+        if (reloc && bin.size() >= img.size) {
+            const auto* bytes = reinterpret_cast<const u8*>(bin.data());
+            const auto same = [&](const ByCode& p) {
+                return ps_spu_code_hash(bytes, img.size, p.code_words.data()) == p.code_hash;
+            };
+            if (const auto it = by_size.find(img.size);
+                it != by_size.end() && std::any_of(it->second.begin(), it->second.end(), same)) {
+                rep.merged++;
+                continue;
+            }
+        }
         auto image = recomp::spu::load_raw_image(
             std::span<const u8>(reinterpret_cast<const u8*>(bin.data()), bin.size()), img.base, {img.entry}, name);
         if (!image) {
@@ -154,6 +175,7 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
         }
         const recomp::spu::Program program = recomp::spu::analyze(*image, analyzer);
         const recomp::spu::LiftResult result = recomp::spu::lift(*image, program, lift);
+        if (reloc) by_size[img.size].push_back({result.code_words, result.code_hash});
         std::string why;
         if (!recomp::spu::write_files((fs::path(out_dir) / name).string(), result.files, why)) {
             if (error) *error = std::format("cannot write {}: {}", name, why);

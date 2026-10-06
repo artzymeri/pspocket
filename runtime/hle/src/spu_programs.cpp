@@ -455,15 +455,15 @@ const ps_spu_entry kJobReturnEntry[] = {{ls::jc_return, &stop_job_return}};
 const ps_spu_entry kSyscallEntry[] = {{ls::pm_syscall, &stop_syscall}};
 std::array<ps_spu_program, 5> g_stubs{{
     {"spurs_stop_select", 0x5350555253000001ull, kKernelSelect, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kSelectEntry, nullptr,
-        nullptr},
+        nullptr, 0},
     {"spurs_stop_return", 0x5350555253000002ull, kKernelReturn, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kReturnEntry, nullptr,
-        nullptr},
+        nullptr, 0},
     {"spurs_stop_exit", 0x5350555253000003ull, kKernelExit, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kExitEntry, nullptr,
-        nullptr},
+        nullptr, 0},
     {"spurs_stop_job_return", 0x5350555253000004ull, ls::jc_return, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kJobReturnEntry,
-        nullptr, nullptr},
+        nullptr, nullptr, 0},
     {"spurs_stop_syscall", 0x5350555253000005ull, ls::pm_syscall, 4, PS_SPU_XFLOAT_APPROXIMATE, 0, 1, kSyscallEntry,
-        nullptr, nullptr},
+        nullptr, nullptr, 0},
 }};
 
 const ps_spu_program* worker_stop(const SPUContext* ctx, u32 pc)
@@ -538,6 +538,10 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
 const ps_spu_program* identify_hashed(u64 hash, u8* base, const SpuImage& image)
 {
     const ps_spu_program* program = ps_spu_find_program(hash, image.ls_start, image.size);
+    // A relocatable image new as a whole may still be a known program with other data: Assassin's Creed loads one
+    // 32 KB module whose last 18 words change every time (398 images in a session, run 117, D-208).
+    if (!program && relocatable(image.kind))
+        program = ps_spu_find_program_by_code(image.bytes ? image.bytes : base + image.guest, image.size);
     if (program) {
         g_attached.fetch_add(1, std::memory_order_relaxed);
         return program;

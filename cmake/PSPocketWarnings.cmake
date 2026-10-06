@@ -15,6 +15,8 @@ endfunction()
 
 # Generated (lifted) code gets a reduced set: it is machine-written and intentionally repetitive.
 function(pspocket_set_generated_warnings target)
+    # -Wno-missing-field-initializers: code lifted before a field was added to a descriptor leaves it zero, which
+    # each such field takes as "not known" (ps_spu_program's code_hash, D-208).
     target_compile_options(${target} PRIVATE -Wno-unused-variable -Wno-unused-but-set-variable
-        -Wno-unused-label -Wno-unused-function -Wno-unused-parameter)
+        -Wno-unused-label -Wno-unused-function -Wno-unused-parameter -Wno-missing-field-initializers)
 endfunction()

@@ -766,7 +766,7 @@ TEST_CASE("SPURS workers: a task runs the translated program of the segment hold
 
     const ps_spu_entry entries[] = {{0x3100, &entry_segment_lifted}};
     ps_spu_program program{"spu_entry_segment", ps_spu_hash64(b + kElf + 0x200, size), 0x3100, size,
-        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr, 0};
     ps_spu_register_program(&program);
     g_entry_segment_runs = 0;
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
