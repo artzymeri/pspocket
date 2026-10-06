@@ -647,6 +647,12 @@ void Kernel::set_rsx_user_command_listener(std::function<void(u32 arg)> fn)
     impl_->rsx.on_user_command = std::move(fn);
 }
 
+void Kernel::set_rsx_queue_listener(std::function<void(u32 head, u32 buffer_id)> fn)
+{
+    std::lock_guard lock(impl_->rsx.listener_mutex);
+    impl_->rsx.on_queue = std::move(fn);
+}
+
 void Kernel::syscall(PPUContext& ctx)
 {
     auto* t = static_cast<PpuThread*>(ctx.runtime);

@@ -320,6 +320,7 @@ struct RsxDevice {
     std::mutex listener_mutex;
     std::function<void(u32)> on_flip; // Kernel::set_rsx_flip_listener
     std::function<void(u32)> on_user_command; // Kernel::set_rsx_user_command_listener
+    std::function<void(u32, u32)> on_queue; // Kernel::set_rsx_queue_listener
 
     std::unique_ptr<rsx::Backend> backend;
     std::unique_ptr<rsx::Rsx> rsx; // after `backend`, so it is destroyed first
