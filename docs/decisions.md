@@ -3037,6 +3037,59 @@ by its NID; before cellGcmInit; mapping, first fit, reserves and unmapping again
 from the driver information; lv2's 0x10a and queue notes; the queue handler's head and order on the interrupt thread,
 in guest code under the interpreter; the command words; the default buffer's sizes; Z-cull and the arrays; the small
 ones) and the flip command's queue in tests/rsx/test_methods.cpp.
+
+## D-175 · 2026-10-06 · System libraries chosen per game, as a PS3 links them
+
+Before, a firmware module ran as it is (LLE, D-157) only when the host implemented none of its libraries. A library
+the host implemented only in part stayed on the host, and the game's calls to the missing functions failed. Now the
+loader chooses per game, before it links the executable's imports (LleModules::decide, runtime/loader/src/lle.cpp):
+
+- **Host or firmware.** A library goes to the host when the host implements every function the game imports from it
+  and the game imports none of its variables (the host exports none). Otherwise its firmware module runs as it is.
+- **Always native.** Some module files never run as they are. These are the process runtime (liblv2*), module loading
+  (libsysmodule), SPURS (libsre, D-037), the RSX (libgcm_sys), audio, voice, input (libio), files (libfs), the network
+  (libnet, libnetctl), sysutil and everything built on it (libsysutil*), and devices (camera, mic, gem, usbd,
+  usbpspcm). pspocket must own what they do.
+- **Linking a chosen module.** Its imports link as RPCS3 links a module (PPUModule.cpp ppu_load_imports): from another
+  chosen module, else the host, else a firmware module that can join.
+  - A function none of these has links to the host's unimplemented stub, which logs and fails when called (rule 4).
+    The same goes for a syscall lv2 does not answer. Both are listed (gaps()).
+  - A variable must come from a chosen module. A module whose imported variable no module exports is refused, and its
+    libraries stay on the host; refusals can cascade.
+  - The choice is a fixpoint over module files. Only the modules the game's libraries reach are kept.
+- **The log.** It names the modules chosen and what each lacks, the modules refused and why, and the functions the
+  host lacks for libraries left on it. That is the list of what to implement next.
+- **The index.** The module index (lle-index.txt) moves to format 2. For each module file it lists the libraries, the
+  functions and variables each exports, what the file imports, and the syscalls its code makes (an `sc` with
+  `li r11,N` in the eight instructions before it). An old index is rebuilt.
+- **Modules loaded while the game runs (D-159).**
+  - A game's own PRX gets the same choice for its imports (LleModules::extend). What was chosen stays chosen, since it
+    is linked, and more modules may join.
+  - A library something already linked to the host stays on the host, so a library has one implementation.
+  - Firmware modules loaded for the PRX start before its module_start, on the thread that starts it
+    (ModuleLoader::take_dependency_starts).
+  - A firmware module loaded by its path runs as it is when it was chosen, or when the host implements none of its
+    libraries.
+  - A module start runs once (take_starts marks each start as run).
+
+Probed against the user's 4.92 firmware (144 modules), assuming a game needs something the host lacks in each library:
+
+- **Would run as they are:** libdmux, libdmuxpamf, libpamf, libpngdec, libjpgdec, libgifdec, libfont (with libfontFT
+  and libfreetype), libl10n, libresc, libsync2 (with libfiber and libspurs_jq), libatrac3plus, libatrac3multi,
+  libvpost, libsail (with its 15 decoders), libkey2char, librudp, libhttp (with libssl).
+- **Refused: libadec.** It imports a variable of the DTS-HD core decoder that no module exports, so cellAdec needs a
+  native implementation.
+- **Host functions those modules lack, which they log when called:** cellSpursQueuePushBody, cellSpursQueueSize,
+  cellSpursSendWorkloadSignal, cellSpursDestroyTaskset2, cellGcmGetLastSecondVTime, _sys_vsnprintf,
+  _sys_heap_get_total_free_size, cellSysmoduleUnloadModuleInternal and cellKbGetConfiguration, among others.
+
+Tests (tests/hle/test_lle.cpp):
+
+- The choice: host-covered, partial, native list, gaps, variable refusal, the game's variables, extend, host-bound
+  libraries, forced libraries. Each runs twice, the second time from the cached index.
+- A game PRX loaded while the game runs, whose firmware dependency joins and starts first, once.
+
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

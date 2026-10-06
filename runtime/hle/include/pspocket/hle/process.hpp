@@ -78,6 +78,9 @@ public:
     virtual u32 unload(u32 id) = 0;
     // By the name in its module info; 0 when none.
     virtual u32 id_by_name(std::string_view name) = 0;
+    // The module_start descriptors of firmware modules loaded for the modules loaded so far that have not run
+    // (dependencies first), each returned once: sys_prx_start_module runs them before the module's own (D-175).
+    virtual std::vector<u32> take_dependency_starts() { return {}; }
 };
 
 struct ProcessConfig {

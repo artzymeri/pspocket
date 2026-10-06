@@ -286,8 +286,11 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
         rep.segments++;
     }
 
+    // Which system libraries this game gets from the firmware's own modules and which from the host (D-175).
+    if (lle) lle->decide(LleModules::needs_of(exe->module()), [&kernel](u32 n) { return kernel.syscall_bound(n); });
+
     // Imports (RPCS3 ppu_load_imports): each stub table slot gets the linked descriptor: the firmware module's export
-    // when the library goes LLE (D-157), else the host module's stub.
+    // when the library goes LLE (D-157, D-175), else the host module's stub.
     for (const auto& lib : exe->module().imports) {
         const PrxModule* module = nullptr;
         if (lle && lle->chooses(lib.name)) {

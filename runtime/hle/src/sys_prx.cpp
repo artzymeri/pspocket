@@ -102,6 +102,11 @@ s32 sys_prx_start_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result
     std::lock_guard lock(HleProcess::current()->state<PrxCalls>().mutex);
     u32 entry = 0;
     if (const u32 r = l->start(id, &entry); r != lv2::CELL_OK) return code(r);
+    // Firmware modules loaded for it start first, as at boot (D-175).
+    for (const u32 dep : l->take_dependency_starts()) {
+        const u32 r = static_cast<u32>(call_guest(ctx, dep, {0, 0}));
+        PS_LOG_INFO(kChan, "sys_prx_start_module({:#x}): firmware module_start {:#x} returned {:#x}", id, dep, r);
+    }
     const s32 res = entry ? static_cast<s32>(call_guest(ctx, entry, {args, argp})) : 0;
     ps_write32(t.kernel.base(), result, static_cast<u32>(res));
     l->started(id, res);

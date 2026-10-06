@@ -10,6 +10,8 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <set>
+#include <sstream>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
@@ -66,6 +68,30 @@ bool host_has(std::string_view library)
         if (f.module == library) return true;
     return false;
 }
+
+// The syscalls a module's code makes: an `sc` with `li r11, N` within the eight instructions before it (D-175).
+std::set<u32> scan_syscalls(const recomp::ElfFile& elf, std::span<const u8> bytes)
+{
+    std::set<u32> out;
+    for (const recomp::ProgramHeader& ph : elf.segments()) {
+        if (ph.type != 1 || !(ph.flags & 1) || !ph.data_in_file) continue;
+        const u8* code = bytes.data() + ph.offset;
+        const u64 words = ph.filesz / 4;
+        for (u64 i = 0; i < words; i++) {
+            if (ps_ld32(code + 4 * i) != 0x44000002) continue; // sc
+            for (u64 j = 1; j <= 8 && j <= i; j++) {
+                const u32 w = ps_ld32(code + 4 * (i - j));
+                if ((w & 0xFFFF0000u) == 0x39600000u) { // addi r11, 0, N
+                    out.insert(w & 0xFFFF);
+                    break;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+constexpr std::string_view kIndexHeader = "pspocket-lle-index 2";
 
 fs::path flash_path(const std::string& dir)
 {
@@ -231,6 +257,7 @@ bool LleModules::index(std::string* error)
 {
     library_file_.clear();
     file_libraries_.clear();
+    files_.clear();
     const fs::path flash = flash_path(dev_flash_);
     const fs::path external = flash / "sys" / "external";
     const fs::path cache = flash.parent_path() / "lle-index.txt";
@@ -243,12 +270,42 @@ bool LleModules::index(std::string* error)
         library_file_.emplace(library, file);
         file_libraries_[file].push_back(library);
     };
-    // Kept beside /dev_flash: the modules are decrypted once, not at every boot.
+    // Kept beside /dev_flash: the modules are decrypted once, not at every boot. Each module file: its libraries, what
+    // they export, what it imports and the syscalls its code makes (D-175).
     std::error_code cache_ec;
     if (const auto cached = fs::last_write_time(cache, cache_ec); !cache_ec && cached >= fs::last_write_time(external, ec)) {
         std::ifstream in(cache);
-        for (std::string file, library; in >> file >> library;) add(file, library);
-        if (!library_file_.empty()) return true;
+        std::string line;
+        if (std::getline(in, line) && line == kIndexHeader) {
+            std::string file;
+            while (std::getline(in, line)) {
+                std::istringstream words(line);
+                std::string kind, name;
+                words >> kind;
+                if (kind == "F") {
+                    words >> file;
+                    files_[file];
+                    continue;
+                }
+                if (file.empty()) continue;
+                FileInfo& info = files_[file];
+                if (kind == "S") {
+                    for (u32 n; words >> n;) info.syscalls.insert(n);
+                    continue;
+                }
+                words >> name;
+                if (kind == "L") {
+                    add(file, name);
+                    continue;
+                }
+                auto& table = kind == "EF" ? info.export_functions : kind == "EV" ? info.export_variables
+                    : kind == "IF" ? info.import_functions : info.import_variables;
+                auto& nids = table[name];
+                for (std::string nid; words >> nid;) nids.insert(static_cast<u32>(std::stoul(nid, nullptr, 16)));
+            }
+            if (!library_file_.empty()) return true;
+        }
+        files_.clear();
     }
     size_t modules = 0;
     std::vector<fs::path> files;
@@ -263,12 +320,41 @@ bool LleModules::index(std::string* error)
         auto module = recomp::analyze_ppu_module(*elf);
         if (!module) continue;
         modules++;
-        for (const recomp::ExportedLibrary& lib : module->exports)
-            if (!lib.name.empty() && !lib.management && !lib.skipped) add(path.filename().string(), lib.name);
+        const std::string file = path.filename().string();
+        FileInfo& info = files_[file];
+        for (const recomp::ExportedLibrary& lib : module->exports) {
+            if (lib.name.empty() || lib.management || lib.skipped) continue;
+            add(file, lib.name);
+            for (const auto& f : lib.functions) info.export_functions[lib.name].insert(f.nid);
+            for (const auto& v : lib.variables) info.export_variables[lib.name].insert(v.nid);
+        }
+        for (const recomp::ImportedLibrary& lib : module->imports) {
+            for (const auto& f : lib.functions) info.import_functions[lib.name].insert(f.nid);
+            for (const auto& v : lib.variables) info.import_variables[lib.name].insert(v.nid);
+        }
+        info.syscalls = scan_syscalls(*elf, *elf_bytes);
     }
-    if (std::ofstream out(cache); out)
-        for (const auto& [file, libraries] : file_libraries_)
-            for (const std::string& library : libraries) out << file << ' ' << library << '\n';
+    if (std::ofstream out(cache); out) {
+        out << kIndexHeader << '\n';
+        const auto nids = [&](std::string_view kind, const std::map<std::string, std::set<u32>, std::less<>>& table) {
+            for (const auto& [lib, set] : table) {
+                out << kind << ' ' << lib;
+                for (const u32 nid : set) out << std::format(" {:08x}", nid);
+                out << '\n';
+            }
+        };
+        for (const auto& [file, info] : files_) {
+            out << "F " << file << '\n';
+            for (const std::string& library : file_libraries_[file]) out << "L " << library << '\n';
+            nids("EF", info.export_functions);
+            nids("EV", info.export_variables);
+            nids("IF", info.import_functions);
+            nids("IV", info.import_variables);
+            out << 'S';
+            for (const u32 n : info.syscalls) out << ' ' << n;
+            out << '\n';
+        }
+    }
     PS_LOG_INFO(kChan, "{} of {} firmware modules read: {} libraries", modules, files.size(), library_file_.size());
     if (library_file_.empty() && error) *error = "no firmware module could be read (a build without the keys?)";
     return !library_file_.empty();
@@ -281,12 +367,219 @@ std::optional<std::string> LleModules::file_for(std::string_view library) const
     return it->second;
 }
 
+bool LleModules::forced(std::string_view library) const
+{
+    return std::find(forced_.begin(), forced_.end(), library) != forced_.end();
+}
+
 bool LleModules::chooses(std::string_view library) const
 {
     const auto file = file_for(library);
     if (!file) return false;
-    if (std::find(forced_.begin(), forced_.end(), library) != forced_.end()) return true;
+    if (forced(library)) return true;
+    if (decided_) return chosen_.contains(*file);
     return runs_whole(*file);
+}
+
+bool LleModules::always_native(std::string_view file)
+{
+    // The process runtime and its debug modules (liblv2*), module loading, SPURS (D-037), the RSX, audio and voice,
+    // input, files, network, sysutil and everything on it (dialogs, save data, game data, NP), devices.
+    if (file.starts_with("liblv2") || file.starts_with("libsysutil")) return true;
+    static constexpr std::string_view kNative[] = {"libsysmodule.sprx", "libsre.sprx", "libgcm_sys.sprx",
+        "libaudio.sprx", "libvoice.sprx", "libio.sprx", "libfs.sprx", "libfs_155.sprx", "libnet.sprx",
+        "libnetctl.sprx", "libcamera.sprx", "libmic.sprx", "libgem.sprx", "libusbd.sprx", "libusbpspcm.sprx"};
+    return std::find(std::begin(kNative), std::end(kNative), file) != std::end(kNative);
+}
+
+std::vector<LleModules::LibraryNeeds> LleModules::needs_of(const recomp::PpuModule& module)
+{
+    std::vector<LibraryNeeds> needs;
+    for (const recomp::ImportedLibrary& lib : module.imports) {
+        LibraryNeeds n{lib.name, {}, {}};
+        for (const auto& fn : lib.functions) n.functions.push_back(fn.nid);
+        for (const auto& var : lib.variables) n.variables.push_back(var.nid);
+        needs.push_back(std::move(n));
+    }
+    return needs;
+}
+
+void LleModules::decide(const std::vector<LibraryNeeds>& imports, const std::function<bool(u32)>& syscall_bound)
+{
+    decided_ = true;
+    chosen_.clear();
+    refused_.clear();
+    gaps_.clear();
+    host_linked_.clear();
+    choose("the game", imports, {}, syscall_bound);
+}
+
+void LleModules::extend(std::string_view who, const std::vector<LibraryNeeds>& imports, std::string_view file,
+    const std::function<bool(u32)>& syscall_bound)
+{
+    if (decided_) choose(who, imports, file, syscall_bound);
+}
+
+void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& imports, std::string_view root_file,
+    const std::function<bool(u32)>& syscall_bound)
+{
+    const auto on_host = [](std::string_view library, u32 nid) { return hle::registry().find(library, nid) != nullptr; };
+    // A file whose libraries something already linked to the host stays there (a library has one implementation).
+    const auto host_bound = [&](std::string_view file) {
+        const auto it = file_libraries_.find(file);
+        return it != file_libraries_.end() && std::any_of(it->second.begin(), it->second.end(),
+            [&](const std::string& l) { return host_linked_.contains(l); });
+    };
+    const auto can_join = [&](std::string_view file) {
+        return !always_native(file) && !refused_.contains(file) && !host_bound(file);
+    };
+    // The roots: the files of the import libraries the host cannot serve (it lacks one of their imported functions, or
+    // a variable is imported: the host exports none), and `root_file`. What was chosen before stays: it is linked.
+    std::set<std::string, std::less<>> candidates = chosen_, roots;
+    std::map<std::string, std::vector<u32>, std::less<>> lacking; // library -> imported functions the host lacks
+    if (!root_file.empty() && files_.contains(root_file) && (chosen_.contains(root_file) || can_join(root_file)))
+        roots.emplace(root_file);
+    for (const LibraryNeeds& need : imports) {
+        const auto file = file_for(need.library);
+        if (file && forced(need.library)) {
+            roots.insert(*file);
+            continue;
+        }
+        std::vector<u32> missing;
+        for (const u32 nid : need.functions)
+            if (!on_host(need.library, nid)) missing.push_back(nid);
+        if (missing.empty() && need.variables.empty()) continue;
+        if (file && (chosen_.contains(*file) || can_join(*file))) roots.insert(*file);
+        else if (!missing.empty()) lacking[need.library] = std::move(missing);
+    }
+    candidates.insert(roots.begin(), roots.end());
+    // What each candidate needs, as RPCS3 links a module (PPUModule.cpp ppu_load_imports): a function from a candidate,
+    // else the host, else a module that can join the candidates; one with none of these links to the host's
+    // unimplemented stub (logged when called) and is listed here, as is a syscall lv2 lacks. A variable must resolve
+    // to a candidate's export (the host exports none): a module that needs one that cannot is refused, which may refuse
+    // others in turn.
+    std::map<std::string, std::vector<std::string>, std::less<>> gaps;
+    for (bool changed = true; changed;) {
+        changed = false;
+        gaps.clear();
+        for (auto it = candidates.begin(); it != candidates.end();) {
+            const std::string file = *it;
+            const auto info = files_.find(file);
+            std::string why;
+            std::vector<std::string> joins;
+            std::vector<std::string>& gap = gaps[file];
+            if (info == files_.end()) why = "not in the module index";
+            for (const auto& [library, nids] : info == files_.end() ? decltype(info->second.import_functions){}
+                                                                      : info->second.import_functions) {
+                const auto dep = file_for(library);
+                for (const u32 nid : nids) {
+                    if (dep && candidates.contains(*dep)) {
+                        const auto& exported = files_[*dep].export_functions;
+                        const auto e = exported.find(library);
+                        if (e == exported.end() || !e->second.contains(nid))
+                            gap.push_back(std::format("{}::{:#010x} (not exported by {})", library, nid, *dep));
+                        continue;
+                    }
+                    if (on_host(library, nid)) continue;
+                    if (dep && can_join(*dep)) {
+                        joins.push_back(*dep);
+                        continue;
+                    }
+                    gap.push_back(std::format("{}::{:#010x}", library, nid));
+                }
+            }
+            for (const auto& [library, nids] : info == files_.end() ? decltype(info->second.import_variables){}
+                                                                      : info->second.import_variables) {
+                const auto dep = file_for(library);
+                for (const u32 nid : nids) {
+                    if (dep && candidates.contains(*dep)) {
+                        const auto& exported = files_[*dep].export_variables;
+                        const auto e = exported.find(library);
+                        if (e != exported.end() && e->second.contains(nid)) continue;
+                        why = std::format("it imports variable {}::{:#010x}, which {} does not export", library, nid, *dep);
+                    } else if (dep && can_join(*dep)) {
+                        joins.push_back(*dep);
+                        continue;
+                    } else {
+                        why = std::format("its imported variable {}::{:#010x} has no module to come from", library, nid);
+                    }
+                    break;
+                }
+                if (!why.empty()) break;
+            }
+            if (info != files_.end())
+                for (const u32 n : info->second.syscalls)
+                    if (!syscall_bound(n))
+                        gap.push_back(std::format("syscall {} ({})", n, lv2::syscall_name(n) ? lv2::syscall_name(n) : "unnamed"));
+            const bool keep = chosen_.contains(file) || std::any_of(file_libraries_[file].begin(),
+                file_libraries_[file].end(), [&](const std::string& l) { return forced(l); });
+            if (!why.empty() && !keep) {
+                refused_[file] = why;
+                gaps.erase(file);
+                it = candidates.erase(it);
+                changed = true;
+                continue;
+            }
+            if (!why.empty() && !chosen_.contains(file))
+                PS_LOG_WARN(kChan, "{} is forced to run as it is although {}", file, why);
+            for (const std::string& d : joins)
+                if (candidates.insert(d).second) changed = true;
+            ++it;
+        }
+    }
+    // Only what the roots reach: a module that joined for one refused later goes again.
+    std::set<std::string, std::less<>> reached;
+    std::vector<std::string> todo(roots.begin(), roots.end());
+    while (!todo.empty()) {
+        const std::string f = std::move(todo.back());
+        todo.pop_back();
+        if (!candidates.contains(f) || !reached.insert(f).second) continue;
+        const auto info = files_.find(f);
+        if (info == files_.end()) continue;
+        for (const auto* table : {&info->second.import_functions, &info->second.import_variables})
+            for (const auto& entry : *table)
+                if (const auto dep = file_for(entry.first); dep && candidates.contains(*dep)) todo.push_back(*dep);
+    }
+    std::vector<std::string> added;
+    for (const std::string& f : reached)
+        if (chosen_.insert(f).second) added.push_back(f);
+    // The libraries the game, this module and the modules chosen now link to the host stay there.
+    for (const LibraryNeeds& need : imports)
+        if (const auto file = file_for(need.library); !file || !chosen_.contains(*file)) host_linked_.insert(need.library);
+    for (const std::string& f : added)
+        for (const auto& entry : files_[f].import_functions)
+            if (const auto file = file_for(entry.first); !file || !chosen_.contains(*file)) host_linked_.insert(entry.first);
+    // Libraries of refused modules stay on the host: what is imported from them that the host lacks is listed too.
+    for (const LibraryNeeds& need : imports) {
+        const auto file = file_for(need.library);
+        if (!file || !refused_.contains(*file)) continue;
+        std::vector<u32> missing;
+        for (const u32 nid : need.functions)
+            if (!on_host(need.library, nid)) missing.push_back(nid);
+        if (!missing.empty()) lacking[need.library] = std::move(missing);
+    }
+    std::string added_list;
+    for (const std::string& f : added) added_list += (added_list.empty() ? "" : ", ") + f;
+    PS_LOG_INFO(kChan, "system libraries for {}: {} firmware module(s) {}{}{}", who, added.size(),
+        decided_ && who != "the game" ? "join" : "run as they are", added_list.empty() ? "" : ": ", added_list);
+    for (const std::string& f : added) {
+        auto list = std::move(gaps[f]);
+        if (list.empty()) continue;
+        std::string shown;
+        for (usize i = 0; i < list.size() && i < 6; i++) shown += (i ? ", " : "") + list[i];
+        PS_LOG_WARN(kChan, "{} runs as it is; {} of what it needs has no implementation here ({}{}): calls to it fail", f,
+            list.size(), shown, list.size() > 6 ? ", ..." : "");
+        gaps_[f] = std::move(list);
+    }
+    for (const auto& [file, why] : refused_)
+        if (roots.contains(file) || candidates.contains(file) || who == "the game")
+            PS_LOG_WARN(kChan, "{} stays on the host: {}", file, why);
+    for (const auto& [library, nids] : lacking) {
+        std::string list;
+        for (usize i = 0; i < nids.size() && i < 8; i++) list += std::format("{}{:#010x}", i ? " " : "", nids[i]);
+        PS_LOG_WARN(kChan, "{}: {} imports {} function(s) the host lacks ({}{}): calls to them fail", library, who,
+            nids.size(), list, nids.size() > 8 ? " ..." : "");
+    }
 }
 
 bool LleModules::runs_whole(std::string_view file) const
@@ -437,10 +730,13 @@ u32 RuntimeModules::load(std::string_view path, u32* id)
     e->path = std::string(path);
     const std::string file = fs::path(e->path).filename().string();
     constexpr std::string_view kFirmware = "/dev_flash/sys/external/";
+    const auto syscall_bound = [this](u32 n) { return hle_.kernel().syscall_bound(n); };
     if (path.starts_with(kFirmware)) {
-        // A firmware module by its path: as it is when the host replaces none of it, else empty (the host's functions
-        // serve its libraries).
-        if (lle_ && lle_->runs_whole(file)) {
+        // A firmware module by its path: as it is when chosen for the game (D-175), or when the host replaces none of it
+        // (it joins, with the modules it needs); else empty (the host's functions serve its libraries).
+        if (lle_ && lle_->decided() && !lle_->chosen(file) && lle_->runs_whole(file))
+            lle_->extend(path, {}, file, syscall_bound);
+        if (lle_ && (lle_->decided() ? lle_->chosen(file) : lle_->runs_whole(file))) {
             std::string why;
             e->module = lle_->load_file(file, hle_, &why);
             if (!e->module) {
@@ -465,6 +761,11 @@ u32 RuntimeModules::load(std::string_view path, u32* id)
             }
             elf = std::move(*decrypted);
         }
+        // The firmware modules its imports need, chosen as for the game's (D-175).
+        if (lle_ && lle_->decided())
+            if (const auto parsed = recomp::ElfFile::parse(elf))
+                if (const auto info = recomp::analyze_ppu_module(*parsed))
+                    lle_->extend(path, LleModules::needs_of(*info), {}, syscall_bound);
         e->owned = std::make_unique<PrxModule>();
         e->owned->file = file;
         std::string why;
@@ -518,8 +819,16 @@ u32 RuntimeModules::start(u32 id, u32* entry)
     }
     PS_LOG_INFO(kChan, "{} starts: {} of the game's imported functions and {} variables now go to it", e->path, functions,
         variables);
-    *entry = e->module->start;
+    // A firmware module started already (at boot, or before a module that needed it, D-175) is not started again.
+    *entry = !e->owned && lle_ && lle_->started(e->module->start) ? 0 : e->module->start;
+    if (!e->owned && lle_ && *entry) lle_->mark_started(*entry);
     return kOk;
+}
+
+std::vector<u32> RuntimeModules::take_dependency_starts()
+{
+    std::lock_guard lock(mutex_);
+    return lle_ ? lle_->take_starts() : std::vector<u32>{};
 }
 
 void RuntimeModules::started(u32 id, s32 result)

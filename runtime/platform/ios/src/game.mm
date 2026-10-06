@@ -441,7 +441,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report, s->lle.get()); r != lv2::CELL_OK) {
         return fail(error, error_size, std::string("loading the executable failed: ") + lv2::error_name(r));
     }
-    if (s->lle) s->state.module_starts = s->lle->starts();
+    if (s->lle) s->state.module_starts = s->lle->take_starts();
     // Modules the game loads while it runs (sys_prx_load_module, D-159).
     s->modules = std::make_unique<loader::RuntimeModules>(*s->hle, s->exe, s->lle.get());
     s->hle->set_module_loader(s->modules.get());

@@ -5,6 +5,7 @@
 #include <catch_amalgamated.hpp>
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -329,3 +330,141 @@ TEST_CASE("Run-time modules: a game's own PRX loaded by path, started (its expor
     fs::remove_all(root);
 }
 
+
+// D-175: the per-game choice. Synthetic firmware modules (debug SELFs) in a /dev_flash; the "game" is the list of what
+// it imports. A module runs as it is when the host lacks a function the game imports from it (or the game imports a
+// variable of it) and everything the module needs resolves; else its libraries stay on the host.
+TEST_CASE("LLE: per game, a module runs as it is only when the host lacks what the game imports and the module's own "
+          "needs resolve", "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    const fs::path root = fresh_flash("pspocket-test-lle-decide");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    test::PrxOptions o;
+    o.variables = true; // synthLib's module imports synthVarLib's variable
+    const auto x = test::build_ppu_prx(o);
+    const auto plain = test::build_ppu_prx();
+    write(external / "libvar.sprx", debug_self(prx_exporting(x, "synthVarLib", 0x11111111))); // exports the variable
+    write(external / "libsynth.sprx", debug_self(prx_exporting(x, "synthLib", 0xDEADBEEF)));
+    write(external / "libgcm_synth.sprx", debug_self(prx_exporting(plain, "cellGcmSys", 0x12345678)));
+    write(external / "libgcm_sys.sprx", debug_self(prx_exporting(plain, "cellResc", 0x22222222)));
+    // A module whose code makes syscall 700 (li r11, 700; sc in module_start's padding) and one whose import has no
+    // implementation anywhere (sys_lwmutex_lock's NID replaced).
+    std::vector<u8> sc = prx_exporting(plain, "synthScLib", 0x33333333);
+    ps_st32(sc.data() + 0x100 + 4 * 7, 0x39600000u | 700);
+    ps_st32(sc.data() + 0x100 + 4 * 8, 0x44000002u);
+    write(external / "libsc.sprx", debug_self(sc));
+    std::vector<u8> novar = prx_exporting(x, "synthNoVarLib", 0x55555555); // its variable's library: none has it
+    std::fill(novar.begin() + 0x320, novar.begin() + 0x330, u8{0});
+    std::memcpy(novar.data() + 0x320, "synthNoVar", 10);
+    write(external / "libnovar.sprx", debug_self(novar));
+    std::vector<u8> orphan = prx_exporting(plain, "synthOrphan", 0x44444444);
+    ps_st32(orphan.data() + 0x100 + 0x310, 0x0BADF00Du);
+    write(external / "liborphan.sprx", debug_self(orphan));
+    const auto bound = [](u32 n) { return n != 700; };
+    const u32 host_gcm = recomp::nid_of("cellGcmGetConfiguration");
+
+    for (int pass = 0; pass < 2; pass++) { // the second from lle-index.txt (format 2)
+        INFO("pass " << pass);
+        loader::LleModules lle((root / "dev_flash").string());
+        REQUIRE(lle.index());
+        // The host implements what the game imports: nothing runs as it is.
+        lle.decide({Needs{"cellGcmSys", {host_gcm}, {}}}, bound);
+        CHECK(lle.chosen_files().empty());
+        CHECK_FALSE(lle.chooses("cellGcmSys"));
+        // A function the host lacks in a library it partly implements: the module runs (it is not on the native
+        // list), and so do the modules it needs (libvar for synthLib's module, by its variable).
+        lle.decide({Needs{"cellGcmSys", {host_gcm, 0x12345678}, {}}, Needs{"synthLib", {0xDEADBEEF}, {}}}, bound);
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libgcm_synth.sprx", "libsynth.sprx", "libvar.sprx"});
+        CHECK(lle.chooses("cellGcmSys"));
+        CHECK(lle.chooses("synthVarLib"));
+        // A module on the native list never runs as it is, whatever the game imports from it.
+        lle.decide({Needs{"cellResc", {0x22222222}, {}}}, bound);
+        CHECK(lle.chosen_files().empty());
+        CHECK_FALSE(lle.chooses("cellResc"));
+        CHECK(loader::LleModules::always_native("libgcm_sys.sprx"));
+        CHECK(loader::LleModules::always_native("libsysutil_np2.sprx"));
+        CHECK_FALSE(loader::LleModules::always_native("libl10n.sprx"));
+        // A module that makes a syscall lv2 lacks, or imports a function nothing implements, still runs (as RPCS3
+        // links it): those fail when called, and are listed.
+        lle.decide({Needs{"synthScLib", {0x33333333}, {}}, Needs{"synthOrphan", {0x44444444}, {}}}, bound);
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"liborphan.sprx", "libsc.sprx"});
+        REQUIRE(lle.gaps().contains("libsc.sprx"));
+        CHECK(lle.gaps().at("libsc.sprx").front().find("syscall 700") != std::string::npos);
+        REQUIRE(lle.gaps().contains("liborphan.sprx"));
+        CHECK(lle.gaps().at("liborphan.sprx").front().find("0x0badf00d") != std::string::npos);
+        // A module whose imported variable no module exports is refused: its libraries stay on the host.
+        lle.decide({Needs{"synthNoVarLib", {0x55555555}, {}}}, bound);
+        CHECK(lle.chosen_files().empty());
+        REQUIRE(lle.refused_files().contains("libnovar.sprx"));
+        CHECK(lle.refused_files().at("libnovar.sprx").find("synthNoVar") != std::string::npos);
+        // A game's imported variable needs the module (the host exports no variables).
+        lle.decide({Needs{"synthVarLib", {}, {test::kPrxVariableNid}}}, bound);
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libvar.sprx"});
+        // A module the game loads while it runs: what it needs joins, what was chosen stays.
+        lle.decide({Needs{"cellGcmSys", {host_gcm}, {}}, Needs{"synthVarLib", {}, {test::kPrxVariableNid}}}, bound);
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libvar.sprx"});
+        lle.extend("/app_home/a.sprx", {Needs{"synthOrphan", {0x44444444}, {}}}, {}, bound);
+        CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"liborphan.sprx", "libvar.sprx"});
+        // A library something linked to the host (the game's cellGcmSys) stays there: one implementation per library.
+        lle.extend("/app_home/b.sprx", {Needs{"cellGcmSys", {0x12345678}, {}}}, {}, bound);
+        CHECK_FALSE(lle.chooses("cellGcmSys"));
+        // A firmware module loaded by its path joins when nothing linked its libraries to the host.
+        lle.extend("/dev_flash/sys/external/libsc.sprx", {}, "libsc.sprx", bound);
+        CHECK(lle.chosen("libsc.sprx"));
+        // A forced library runs as it is even from a module on the native list.
+        lle.force("cellResc");
+        lle.decide({Needs{"cellResc", {0x22222222}, {}}}, bound);
+        CHECK(lle.chooses("cellResc"));
+    }
+    fs::remove_all(root);
+}
+
+// D-175: a game's own PRX loaded while it runs needs a firmware module the boot did not choose: the module joins, is
+// loaded for it, and its module_start runs before the PRX's own (on the thread that starts the PRX).
+TEST_CASE("Run-time modules: the firmware modules a game's PRX needs join, and start before it", "[hle][lle][prx]")
+{
+    const fs::path root = fresh_flash("pspocket-test-prx-runtime-deps");
+    constexpr u32 kGameMarker = 0x21100, kFirmwareMarker = 0x21108; // the executable's bss
+    test::PrxOptions o;
+    o.variables = true; // each imports synthVarLib's variable
+    const auto x = test::build_ppu_prx(o);
+    std::vector<u8> firmware = prx_exporting(x, "synthVarLib", 0x11111111);
+    mark_module_start(firmware, kFirmwareMarker);
+    write(root / "dev_flash" / "sys" / "external" / "libvar.sprx", debug_self(firmware));
+    std::vector<u8> game = prx_exporting(x, "synthGame", 0xDEADBEEF);
+    mark_module_start(game, kGameMarker);
+    fs::create_directories(root / "usrdir");
+    write(root / "usrdir" / "libgame.sprx", debug_self(game));
+
+    const auto exe_bytes = test::build_ppu_exec();
+    auto exe = loader::Executable::parse(exe_bytes.bytes);
+    REQUIRE(exe);
+    hle::test::Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/app_home", (root / "usrdir").string(), true));
+    loader::LleModules lle((root / "dev_flash").string());
+    REQUIRE(lle.index());
+    REQUIRE(loader::load(**exe, *f.kernel, *f.hle, nullptr, &lle) == lv2::CELL_OK);
+    CHECK(lle.decided());
+    CHECK(lle.chosen_files().empty()); // the executable needs nothing of libvar
+    CHECK(lle.take_starts().empty());
+    loader::RuntimeModules modules(*f.hle, *exe, &lle);
+    f.hle->set_module_loader(&modules);
+
+    u8* base = f.base();
+    hle::test::GuestThread t(f, 0, "main");
+    const u32 path = hle::test::kData, result = hle::test::kData + 0x300;
+    const std::string p = "/app_home/libgame.sprx";
+    std::memcpy(base + path, p.c_str(), p.size() + 1);
+    const u64 id = t.call("sys_prx_load_module", path, 0, 0);
+    REQUIRE(static_cast<s32>(id) > 0);
+    CHECK(lle.chosen("libvar.sprx"));
+    CHECK(lle.loaded().size() == 1);
+    CHECK(ps_read32(base, kFirmwareMarker) == 0); // loaded, not started yet
+    CHECK(t.call("sys_prx_start_module", id, 0, 0, result, 0, 0) == lv2::CELL_OK);
+    CHECK(ps_read32(base, kFirmwareMarker) == 0x77); // the firmware module's module_start ran
+    CHECK(ps_read32(base, kGameMarker) == 0x77);
+    CHECK(modules.take_dependency_starts().empty()); // once
+    f.hle->set_module_loader(nullptr);
+    fs::remove_all(root);
+}

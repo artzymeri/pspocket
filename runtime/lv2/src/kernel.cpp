@@ -643,6 +643,8 @@ bool Kernel::shutdown(std::chrono::milliseconds timeout)
 
 u64 Kernel::unimplemented_count() const { return impl_->unimplemented.load(); }
 
+bool Kernel::syscall_bound(u32 number) const { return number < kSyscallCount && impl_->table[number].fn != nullptr; }
+
 rsx::Rsx* Kernel::rsx()
 {
     std::lock_guard lock(impl_->rsx.mutex);

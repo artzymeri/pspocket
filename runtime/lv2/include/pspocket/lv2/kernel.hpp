@@ -284,6 +284,9 @@ public:
 
     // Number of syscalls dispatched to the unimplemented handler since start (for tests and reports).
     u64 unimplemented_count() const;
+    // Whether the syscall table answers `number` (implemented, or answered with CELL_OK as RPCS3's null_func, D-166):
+    // the firmware module choice checks the syscalls a module makes (D-175).
+    bool syscall_bound(u32 number) const;
 
     // The RSX front end, once sys_rsx_context_allocate created it; null before.
     rsx::Rsx* rsx();

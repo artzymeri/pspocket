@@ -1115,7 +1115,7 @@ int main(int argc, char** argv)
         ~ForgetModules() { hle.set_module_loader(nullptr); }
     } forget_modules{hle};
     if (lle) {
-        state.module_starts = lle->starts();
+        state.module_starts = lle->take_starts();
         for (const auto& m : lle->loaded())
             PS_LOG_INFO("boot", "firmware module {} ({}): {} functions, {} variables exported, {} imported variables "
                                 "linked, {} relocations ({} bad)", m->name, m->file, m->functions.size(),
