@@ -76,7 +76,8 @@ void hmac_sha1(const u8* key, usize key_size, const u8* in, usize size, u8 (&out
 
 // RPCS3 generate_key / generate_hash: the mode's top nibble says whether the block's key (or hash key) is used as
 // it is (0), decrypted with EDAT_KEY and EDAT_IV (1), or replaced by EDAT_KEY/EDAT_IV (EDAT_HASH) (2).
-bool final_key(const NpdKeys& k, u32 mode, bool v4, const u8* key, const u8* iv, u8* key_out, u8* iv_out)
+[[maybe_unused]] bool final_key(
+    const NpdKeys& k, u32 mode, bool v4, const u8* key, const u8* iv, u8* key_out, u8* iv_out)
 {
     const u8* edat_key = v4 ? k.edat_key1.data() : k.edat_key0.data();
     switch (mode & 0xF0000000u) {
@@ -99,7 +100,7 @@ bool final_key(const NpdKeys& k, u32 mode, bool v4, const u8* key, const u8* iv,
     }
 }
 
-bool final_hash(const NpdKeys& k, u32 mode, bool v4, const u8* hash, u8* out)
+[[maybe_unused]] bool final_hash(const NpdKeys& k, u32 mode, bool v4, const u8* hash, u8* out)
 {
     switch (mode & 0xF0000000u) {
     case 0x10000000u:

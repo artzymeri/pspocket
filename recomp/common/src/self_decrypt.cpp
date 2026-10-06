@@ -18,9 +18,10 @@ namespace pspocket::recomp {
 
 namespace {
 
-constexpr usize kMetadataInfoSize = 0x40;    // key, key pad, IV, IV pad
-constexpr usize kMetadataHeaderSize = 0x20;
-constexpr usize kMetadataSectionSize = 0x30;
+// Used only where CommonCrypto decrypts (Apple platforms).
+[[maybe_unused]] constexpr usize kMetadataInfoSize = 0x40; // key, key pad, IV, IV pad
+[[maybe_unused]] constexpr usize kMetadataHeaderSize = 0x20;
+[[maybe_unused]] constexpr usize kMetadataSectionSize = 0x30;
 
 struct MetadataSection {
     u64 offset = 0;
@@ -56,7 +57,7 @@ bool aes128_ctr(const u8* key, const u8* iv, const u8* in, usize size, u8* out)
 }
 #endif
 
-void put(std::vector<u8>& out, u64 offset, std::span<const u8> bytes)
+[[maybe_unused]] void put(std::vector<u8>& out, u64 offset, std::span<const u8> bytes)
 {
     if (out.size() < offset + bytes.size()) out.resize(static_cast<usize>(offset + bytes.size()));
     std::copy(bytes.begin(), bytes.end(), out.begin() + static_cast<std::ptrdiff_t>(offset));

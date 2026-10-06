@@ -18,16 +18,16 @@
 #include "pspocket/recomp/firmware.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 
+using namespace pspocket;
+using namespace pspocket::recomp;
+
+namespace fs = std::filesystem;
+
 #if defined(__APPLE__) && __has_include(<zlib.h>)
 #include <CommonCrypto/CommonCryptor.h>
 #include <zlib.h>
 
-using namespace pspocket;
-using namespace pspocket::recomp;
-
 namespace {
-
-namespace fs = std::filesystem;
 
 template <usize N>
 std::array<u8, N> made_up(u8 seed)

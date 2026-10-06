@@ -104,7 +104,7 @@ TEST_CASE("thread report: a receiver blocked on an event queue names the syscall
     CHECK(m.state == State::Running);
     CHECK(m.current);
 
-    const std::string report = format_report(*t.f.kernel, {.title = "test"});
+    const std::string report = format_report(*t.f.kernel, {.title = "test", .describe_address = {}});
     CHECK_THAT(report, ContainsSubstring("==== thread report: test ====\n2 PPU threads, 1 blocked, 1 running\n"));
     CHECK_THAT(report, ContainsSubstring(std::format("{:#010x}  receiver                     prio  700  blocked      "
                                                      "in sys_event_queue_receive (syscall 130) for ",

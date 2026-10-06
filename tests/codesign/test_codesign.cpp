@@ -27,19 +27,19 @@ using namespace pspocket::codesign;
 
 namespace {
 
-std::string temp_path(const std::string& name)
+[[maybe_unused]] std::string temp_path(const std::string& name)
 {
     return (std::filesystem::temp_directory_path() / std::format("pspocket-codesign-{}-{}", getpid(), name)).string();
 }
 
-void write(const std::string& path, const std::vector<u8>& data)
+[[maybe_unused]] void write(const std::string& path, const std::vector<u8>& data)
 {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
 }
 
 // A command's exit status and its output (stdout and stderr).
-std::pair<int, std::string> run(const std::string& command)
+[[maybe_unused]] std::pair<int, std::string> run(const std::string& command)
 {
     std::string out;
     FILE* p = popen((command + " 2>&1").c_str(), "r");
@@ -56,7 +56,7 @@ u32 be32(const std::vector<u8>& b, usize at)
 }
 
 // The blob in slot `slot` of the file's code signature (its bytes, with its own header).
-std::vector<u8> signature_slot(const std::vector<u8>& file, u32 slot)
+[[maybe_unused]] std::vector<u8> signature_slot(const std::vector<u8>& file, u32 slot)
 {
     const auto l = read_layout(file);
     if (!l) return {};

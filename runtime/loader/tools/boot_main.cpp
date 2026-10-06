@@ -81,9 +81,9 @@
 #include <vector>
 
 #include <pthread.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <sys/sysctl.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <sys/ucontext.h>
@@ -487,6 +487,7 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
     _exit(128 + sig);
 }
 
+#if defined(__APPLE__)
 bool debugger_attached()
 {
     kinfo_proc info{};
@@ -494,6 +495,7 @@ bool debugger_attached()
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
     return sysctl(mib, 4, &info, &size, nullptr, 0) == 0 && (info.kp_proc.p_flag & P_TRACED) != 0;
 }
+#endif
 
 void install_fault_reporter(GuestMemory& memory)
 {
@@ -613,7 +615,7 @@ void summary_sink(void*, log::Level level, std::string_view channel, std::string
 }
 
 // A frame for --frame-jumps: its mean difference from the frame before, 64x36 box-filtered, over 25 a jump (run 088).
-void compare_frame(const u8* bgra, u32 w, u32 h, u64 flip)
+[[maybe_unused]] void compare_frame(const u8* bgra, u32 w, u32 h, u64 flip) // Metal builds only
 {
     constexpr u32 kW = 64, kH = 36;
     std::vector<int> thumb(kW * kH * 3);
@@ -796,10 +798,11 @@ int main(int argc, char** argv)
     bool list_imports = false;
     std::string gpu = "null", frames_dir;
     std::string shader_cache; // --shader-cache (D-114)
-    double compile_wait_ms = -1; // --async-shaders MS (D-158); -1: each draw waits for its compile
-    u32 frame_every = 60;
-    u64 frame_from = 0;
-    u64 trace_frame = 0;
+    // The frame and shader options are read only by a build with Metal.
+    [[maybe_unused]] double compile_wait_ms = -1; // --async-shaders MS (D-158); -1: each draw waits for its compile
+    [[maybe_unused]] u32 frame_every = 60;
+    [[maybe_unused]] u64 frame_from = 0;
+    [[maybe_unused]] u64 trace_frame = 0;
     bool rsx_recover = false;
     std::vector<hle::PadPress> presses;
     bool audio = false;
@@ -813,7 +816,7 @@ int main(int argc, char** argv)
     double watch_after = 0;
     std::vector<std::string> lle_force; // --lle LIBRARY: that library from its firmware module whatever the host has
     std::vector<std::string> lle_load;  // --lle-load LIBRARY: its module (and theirs) loaded and started at boot
-    bool frame_jumps = false;
+    [[maybe_unused]] bool frame_jumps = false;
     std::string summary_path;
     const auto add_press = [&](std::string_view spec) {
         std::string error;
