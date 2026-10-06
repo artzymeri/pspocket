@@ -5,6 +5,10 @@
 // Opens and stats are logged with their path and result (info; failures as warnings), so a boot log shows which
 // files the game asks for.
 //
+// Encrypted SDATA files (cellFsSdataOpen, and sys_fs_open's SDATA type argument) are decrypted by the kernel through
+// the NPD opener this module installs in every process (install_npd_opener, D-165): recomp::NpdFile with the build's
+// keys, as RPCS3's lv2 sys_fs_open wraps them in an EDATADecrypter.
+//
 // Asynchronous reads (cellFsAio*) follow RPCS3's fs_aio_thread, which its HLE never starts (it logs "use LLE", for
 // the firmware's libfs): the first cellFsAioInit creates the AIO thread, an lv2 PPU thread whose entry is an internal
 // HLE function. cellFsAioRead queues a request and returns its ID at once; the AIO thread reads at the request's
@@ -24,6 +28,7 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/npd.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -66,6 +71,24 @@ s32 cellFsOpen(PPUContext& ctx, u32 path, s32 flags, u32 fd, u32 arg, u64 size)
         arg, size);
     log_result(ctx, "cellFsOpen", path, r,
         r == lv2::CELL_OK ? std::format(", flags {:#o} -> fd {}", flags, ps_read32(t.kernel.base(), fd)) : std::string());
+    return r;
+}
+
+// cellFsSdataOpen(path, flags, fd, arg, size): an encrypted SDATA file, read-only. As RPCS3: other flags are
+// CELL_EINVAL; the open is sys_fs_open's with the SDATA type argument {0x180, 0x10} (the caller's argument is not
+// used), so the kernel decrypts it.
+s32 cellFsSdataOpen(PPUContext& ctx, u32 path, s32 flags, u32 fd, u32 /*arg*/, u64 /*size*/)
+{
+    if (flags != 0) return error(lv2::CELL_EINVAL); // CELL_FS_O_RDONLY
+    if (!fd) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar type(ctx, base, 8);
+    ps_write32(base, type.addr(), 0x180);
+    ps_write32(base, type.addr() + 4, 0x10);
+    const s32 r = lv2::sys_fs_open(t, path, 0, fd, 0, type.addr(), 8);
+    log_result(ctx, "cellFsSdataOpen", path, r,
+        r == lv2::CELL_OK ? std::format(" -> fd {}", ps_read32(base, fd)) : std::string());
     return r;
 }
 
@@ -497,12 +520,51 @@ s32 cellFsAioCancel(PPUContext&, s32 id)
     return error(lv2::CELL_EINVAL);
 }
 
+// An NPD file's plain bytes, as the kernel reads an image file (D-165).
+class NpdPlainFile final : public lv2::VfsImage::File {
+public:
+    explicit NpdPlainFile(std::unique_ptr<recomp::NpdFile> npd) : npd_(std::move(npd)) {}
+    u64 size() const override { return npd_->size(); }
+    bool read(u64 offset, void* dst, usize size) const override
+    {
+        std::string error;
+        if (npd_->read(offset, dst, size, &error)) return true;
+        PS_LOG_ERROR(kChan, "encrypted file ({}): {}", npd_->header().content_id, error);
+        return false;
+    }
+
+private:
+    std::unique_ptr<recomp::NpdFile> npd_;
+};
+
 } // namespace
+
+void install_npd_opener(lv2::Kernel& kernel)
+{
+    kernel.set_npd_opener([](std::shared_ptr<const lv2::VfsImage::File> encrypted, bool edata,
+                              std::string& error) -> std::shared_ptr<const lv2::VfsImage::File> {
+        const u64 size = encrypted->size();
+        auto npd = recomp::NpdFile::open(
+            [encrypted](u64 offset, void* dst, usize n) { return encrypted->read(offset, dst, n); }, size,
+            recomp::builtin_npd_keys());
+        if (!npd) {
+            error = npd.error().message;
+            return nullptr;
+        }
+        if (edata != !((*npd)->header().flags & recomp::kNpdSdatFlag)) {
+            PS_LOG_WARN(kChan, "an {} file opened as {}", edata ? "SDATA" : "EDATA", edata ? "EDATA" : "SDATA");
+        }
+        PS_LOG_INFO(kChan, "encrypted file: NPD version {}, flags {:#x}, {:#x}-byte blocks, {} bytes", (*npd)->header().version,
+            (*npd)->header().flags, (*npd)->header().block_size, (*npd)->size());
+        return std::make_shared<NpdPlainFile>(std::move(*npd));
+    });
+}
 
 void register_sys_fs(Registry& r)
 {
     r.add("sys_fs", {
         PS_HLE_FUNC(0x718BF5F8, cellFsOpen),
+        PS_HLE_FUNC(0xB1840B53, cellFsSdataOpen),
         PS_HLE_FUNC(0x4D5FF8E2, cellFsRead),
         PS_HLE_FUNC(0xECDCF2AB, cellFsWrite),
         PS_HLE_FUNC(0x2CB51F0D, cellFsClose),

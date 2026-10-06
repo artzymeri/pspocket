@@ -448,3 +448,91 @@ TEST_CASE("lv2 fs: a disc image mounted read-only as /dev_bdvd and /app_home", "
     CHECK(t.c.call(kFsOpendir, t.f.cstr("/dev_bdvd/PS3_GAME/PARAM.SFO"), out) == rc(CELL_ENOTDIR));
     CHECK(t.c.call(kFsOpendir, t.f.cstr("/dev_bdvd/missing"), out) == rc(CELL_ENOENT));
 }
+
+// D-165: sys_fs_open with the SDATA (0x18000000010) or EDATA (2) type argument on a file starting "NPD\0" reads the
+// file through the host's NPD opener. Here a stand-in opener whose "plain" bytes are the encrypted ones after the
+// 4-byte magic, each XORed with 0x5A; the real one (recomp::NpdFile) is tested in tests/common and tests/hle.
+TEST_CASE("lv2 fs: encrypted SDATA files open through the NPD opener, on an image and on a host directory",
+    "[lv2][fs][npd]")
+{
+    FsFixture t;
+    class XorFile final : public VfsImage::File {
+    public:
+        explicit XorFile(std::shared_ptr<const VfsImage::File> enc) : enc_(std::move(enc)) {}
+        u64 size() const override { return enc_->size() - 4; }
+        bool read(u64 offset, void* dst, usize size) const override
+        {
+            if (!enc_->read(offset + 4, dst, size)) return false;
+            for (usize i = 0; i < size; i++) static_cast<u8*>(dst)[i] ^= 0x5A;
+            return true;
+        }
+
+    private:
+        std::shared_ptr<const VfsImage::File> enc_;
+    };
+    std::string plain = "the game's own shader programs";
+    std::string encrypted = std::string("NPD\0", 4);
+    for (char c : plain) encrypted += static_cast<char>(c ^ 0x5A);
+    auto image = std::make_shared<MemImage>();
+    image->files["PS3_GAME/USRDIR/programs.sdat"] = encrypted;
+    image->files["PS3_GAME/USRDIR/plain.sdat"] = "not encrypted";
+    REQUIRE(t.f.kernel->vfs_mount_image("/dev_bdvd", image));
+    std::ofstream(t.root / "hdd0" / "game" / "TEST00000" / "programs.sdat", std::ios::binary) << encrypted;
+
+    const u32 type = t.f.alloc(8);
+    t.f.w32(type, 0x180);
+    t.f.w32(type + 4, 0x10);
+    const u32 out = t.f.alloc(4);
+    auto open_sdata = [&](std::string_view path, s32 flags) {
+        return t.c.call(kFsOpen, t.f.cstr(path), flags, out, 0, type, 8);
+    };
+
+    // No opener: refused, as before (RPCS3's answer when the header does not open).
+    CHECK(open_sdata("/dev_bdvd/PS3_GAME/USRDIR/programs.sdat", CELL_FS_O_RDONLY) == rc(CELL_EFSSPECIFIC));
+
+    bool asked_edata = true;
+    t.f.kernel->set_npd_opener([&](std::shared_ptr<const VfsImage::File> enc, bool edata,
+                                   std::string& error) -> std::shared_ptr<const VfsImage::File> {
+        asked_edata = edata;
+        u8 magic[4]{};
+        if (!enc->read(0, magic, 4) || std::memcmp(magic, "NPD\0", 4) != 0) {
+            error = "not NPD";
+            return nullptr;
+        }
+        return std::make_shared<XorFile>(std::move(enc));
+    });
+    for (const char* path : {"/dev_bdvd/PS3_GAME/USRDIR/programs.sdat", "/dev_hdd0/game/TEST00000/programs.sdat"}) {
+        INFO(path);
+        REQUIRE(open_sdata(path, CELL_FS_O_RDONLY) == CELL_OK);
+        CHECK_FALSE(asked_edata);
+        const u32 fd = t.f.r32(out);
+        std::string s;
+        REQUIRE(t.read(fd, 100, s) == CELL_OK);
+        CHECK(s == plain);
+        const u32 pos = t.f.alloc(8);
+        REQUIRE(t.c.call(kFsLseek, fd, 4, CELL_FS_SEEK_SET, pos) == CELL_OK);
+        REQUIRE(t.read(fd, 4, s) == CELL_OK);
+        CHECK(s == "game");
+        const u32 sb = t.f.alloc(kCellFsStatSize);
+        REQUIRE(t.c.call(kFsFstat, fd, sb) == CELL_OK);
+        CHECK(read_stat(t.f, sb).size == plain.size()); // the plain size, as RPCS3's EDATADecrypter reports
+        u64 n = 0;
+        CHECK(t.write(fd, "x", n) == rc(CELL_EBADF));
+        REQUIRE(t.c.call(kFsClose, fd) == CELL_OK);
+    }
+    // Writing is refused; a file without the magic opens as it is; EDATA asks the opener for EDATA.
+    CHECK(open_sdata("/dev_hdd0/game/TEST00000/programs.sdat", CELL_FS_O_RDWR) == rc(CELL_EPERM));
+    REQUIRE(open_sdata("/dev_bdvd/PS3_GAME/USRDIR/plain.sdat", CELL_FS_O_RDONLY) == CELL_OK);
+    std::string s;
+    REQUIRE(t.read(t.f.r32(out), 100, s) == CELL_OK);
+    CHECK(s == "not encrypted");
+    t.f.w32(type, 0);
+    t.f.w32(type + 4, 2);
+    REQUIRE(open_sdata("/dev_bdvd/PS3_GAME/USRDIR/programs.sdat", CELL_FS_O_RDONLY) == CELL_OK);
+    CHECK(asked_edata);
+    // Opened without the type argument, the file is its encrypted bytes (as RPCS3).
+    REQUIRE(t.c.call(kFsOpen, t.f.cstr("/dev_bdvd/PS3_GAME/USRDIR/programs.sdat"), CELL_FS_O_RDONLY, out, 0, 0, 0) ==
+            CELL_OK);
+    REQUIRE(t.read(t.f.r32(out), 4, s) == CELL_OK);
+    CHECK(s == std::string("NPD\0", 4));
+}

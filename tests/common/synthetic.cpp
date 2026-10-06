@@ -878,3 +878,147 @@ std::vector<u8> wrap_in_self(std::span<const u8> elf, const SelfOptions& o)
 }
 
 } // namespace pspocket::test
+
+// ---- SDATA file ----
+
+#if defined(__APPLE__)
+#include <CommonCrypto/CommonCryptor.h>
+#include <CommonCrypto/CommonHMAC.h>
+#endif
+
+namespace pspocket::test {
+
+std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const SdataOptions& options)
+{
+#if defined(__APPLE__)
+    using namespace recomp;
+    const u32 flags = kNpdSdatFlag | options.extra_flags;
+    const u32 bs = options.block_size;
+    const bool compressed = flags & kNpdCompressedFlag;
+    const bool flag20 = flags & kNpdFlag20;
+    const bool flag10 = flags & kNpdFlag10;
+    const bool v4 = options.version == 4;
+    const u32 total = static_cast<u32>((plain.size() + bs - 1) / bs);
+    const u64 meta_size = (compressed || flag20) ? 0x20 : 0x10;
+
+    Buffer b;
+    b.put(0, std::span<const u8>(reinterpret_cast<const u8*>("NPD\0"), 4));
+    b.put32(4, static_cast<u32>(options.version));
+    b.put32(8, 3);  // licence
+    b.put32(12, 0); // type
+    b.put_str(0x10, kSelfContentId);
+    u8 digest[16], title_hash[16], dev_hash[16];
+    for (int i = 0; i < 16; i++) {
+        digest[i] = static_cast<u8>(0x11 * i + 5);
+        title_hash[i] = static_cast<u8>(0x23 * i + 7);
+        dev_hash[i] = static_cast<u8>(0x35 * i + 9);
+    }
+    b.put(0x40, digest);
+    b.put(0x50, title_hash);
+    b.put(0x60, dev_hash);
+    b.put32(0x80, flags);
+    b.put32(0x84, bs);
+    b.put64(0x88, plain.size());
+    b.reserve_to(0x100);
+
+    u8 key[16];
+    for (int i = 0; i < 16; i++) key[i] = static_cast<u8>(dev_hash[i] ^ keys.sdat[i]);
+    auto ecb = [](const u8* k, const u8* in, u8* out) {
+        usize moved = 0;
+        CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode, k, 16, nullptr, in, 16, out, 16, &moved);
+    };
+    auto cbc = [](CCOperation op, const u8* k, const u8* iv, const u8* in, usize n, u8* out) {
+        usize moved = 0;
+        CCCrypt(op, kCCAlgorithmAES, 0, k, 16, iv, in, n, out, n, &moved);
+    };
+    const u8 zero_iv[16]{};
+    const u8* iv = options.version <= 1 ? zero_iv : digest;
+    const u8* edat_key = v4 ? keys.edat_key1.data() : keys.edat_key0.data();
+
+    u64 data_at = compressed ? 0x100 + u64{total} * meta_size : 0; // compressed files: the data after the table
+    for (u32 i = 0; i < total; i++) {
+        const usize from = usize{i} * bs;
+        std::vector<u8> payload(plain.begin() + static_cast<std::ptrdiff_t>(from),
+            plain.begin() + static_cast<std::ptrdiff_t>(std::min<usize>(from + bs, plain.size())));
+        u32 compression_end = 0;
+        if (compressed && i % 2 == 0) {
+            std::vector<u8> packed(5 + payload.size());
+            packed[0] = 0x81;
+            ps_st32(packed.data() + 1, static_cast<u32>(payload.size()));
+            std::copy(payload.begin(), payload.end(), packed.begin() + 5);
+            payload = std::move(packed);
+            compression_end = 1;
+        }
+        const usize length = payload.size();
+        payload.resize((length + 15) & ~usize{15}, 0);
+
+        u8 block_key[16]{};
+        if (options.version > 1) std::copy(dev_hash, dev_hash + 12, block_key);
+        ps_st32(block_key + 12, i);
+        u8 key_result[16], hash_key[16];
+        ecb(key, block_key, key_result);
+        if (flag10) ecb(key, key_result, hash_key);
+        else std::copy(key_result, key_result + 16, hash_key);
+        u8 key_final[16], hash_final[0x14]{};
+        if (flags & kNpdEncryptedKeyFlag) {
+            cbc(kCCDecrypt, edat_key, keys.edat_iv.data(), key_result, 16, key_final);
+            cbc(kCCDecrypt, edat_key, keys.edat_iv.data(), hash_key, 16, hash_final);
+        } else {
+            std::copy(key_result, key_result + 16, key_final);
+            std::copy(hash_key, hash_key + 16, hash_final);
+        }
+        std::vector<u8> enc(payload.size());
+        if ((flags & kNpdDebugDataFlag) || (flags & kNpdFlag02)) enc = payload;
+        else cbc(kCCEncrypt, key_final, iv, payload.data(), payload.size(), enc.data());
+        u8 hash[0x14]{};
+        if (!(flags & kNpdDebugDataFlag)) {
+            if (!flag10) {
+                npd_aes_cmac(hash_final, enc.data(), enc.size(), hash);
+            } else {
+                u8 mac[CC_SHA1_DIGEST_LENGTH];
+                CCHmac(kCCHmacAlgSHA1, hash_final, flag20 ? 0x14 : 0x10, enc.data(), enc.size(), mac);
+                std::copy(mac, mac + (flag20 ? 0x14 : 0x10), hash);
+            }
+        }
+
+        if (compressed) {
+            u8 m[0x20]{};
+            std::copy(hash, hash + 16, m);
+            u8 d[16];
+            ps_st64(d, data_at);
+            ps_st32(d + 8, static_cast<u32>(length));
+            ps_st32(d + 12, compression_end);
+            if (options.version <= 1) {
+                std::copy(d, d + 16, m + 0x10);
+            } else { // RPCS3 dec_section, solved for the second half
+                for (int j = 0; j < 4; j++) {
+                    m[0x10 + j] = static_cast<u8>(d[j] ^ m[0xC + j] ^ m[0x8 + j]);
+                    m[0x14 + j] = static_cast<u8>(d[4 + j] ^ m[0x4 + j] ^ m[0x8 + j]);
+                    m[0x18 + j] = static_cast<u8>(d[8 + j] ^ m[0xC + j] ^ m[j]);
+                    m[0x1C + j] = static_cast<u8>(d[12 + j] ^ m[0x4 + j] ^ m[j]);
+                }
+            }
+            b.put(0x100 + u64{i} * meta_size, m);
+            b.put(data_at, enc);
+            data_at += enc.size();
+        } else if (flag20) {
+            // The hash's first 16 bytes are the metadata's two halves XORed; its last 4 are the second half's first 4.
+            u8 m[0x20]{};
+            for (int j = 0; j < 0x10; j++) m[0x10 + j] = static_cast<u8>(j < 4 ? hash[0x10 + j] : 0x5A + j);
+            for (int j = 0; j < 0x10; j++) m[j] = static_cast<u8>(hash[j] ^ m[0x10 + j]);
+            const u64 at = 0x100 + u64{i} * (meta_size + bs);
+            b.put(at, m);
+            b.put(at + 0x20, enc);
+        } else {
+            b.put(0x100 + u64{i} * meta_size, std::span<const u8>(hash, 16));
+            b.put(0x100 + u64{total} * meta_size + u64{i} * bs, enc);
+        }
+    }
+    return std::move(b.bytes);
+#else
+    (void)plain, (void)keys, (void)options;
+    return {};
+#endif
+}
+
+} // namespace pspocket::test

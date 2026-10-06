@@ -238,6 +238,12 @@ public:
     // A whole guest file read into `out` (a host-directory mount or an image), for the host's own use (the loader
     // reading a PRX module the game loads, D-159). False when it is not a readable regular file.
     bool vfs_read_file(std::string_view vpath, std::vector<u8>& out) const;
+    // Opens an NPD-encrypted file (D-165): sys_fs_open's 8-byte type argument asks for SDATA (0x18000000010) or
+    // EDATA (2) and the file starts "NPD\0". Returns the plain file read through `encrypted`, or null with `error`
+    // set; sys_fs_open then fails with CELL_EFSSPECIFIC, as RPCS3's does. Unset (the default), every such file fails.
+    using NpdOpener = std::function<std::shared_ptr<const VfsImage::File>(
+        std::shared_ptr<const VfsImage::File> encrypted, bool edata, std::string& error)>;
+    void set_npd_opener(NpdOpener opener);
 
     // PPU threads. create_thread allocates the guest stack and an ID and leaves the thread stopped.
     Result create_thread(const ThreadParams& params, u32& id_out);
@@ -273,6 +279,9 @@ public:
     rsx::Rsx* rsx();
     // Called on the RSX thread after each flip (HLE cellGcmSys: the game's flip handler). Replaces the previous one.
     void set_rsx_flip_listener(std::function<void(u32 buffer_id)> fn);
+    // Called on the RSX thread when it runs GCM_SET_USER_COMMAND, after the drain it makes (HLE cellGcmSys: the
+    // game's user handler, with the command's argument). Replaces the previous one.
+    void set_rsx_user_command_listener(std::function<void(u32 arg)> fn);
 
     struct Impl;
     Impl& impl() { return *impl_; }

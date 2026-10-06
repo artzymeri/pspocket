@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "pspocket/core/types.hpp"
+#include "pspocket/recomp/npd.hpp"
 
 namespace pspocket::test {
 
@@ -137,5 +138,20 @@ struct SelfOptions {
 std::vector<u8> wrap_in_self(std::span<const u8> elf, const SelfOptions& options = {});
 
 inline constexpr std::string_view kSelfContentId = "XX0000-TEST00000_00-0000000000000000";
+
+// ---- SDATA file (D-165) ----
+
+struct SdataOptions {
+    s32 version = 3;          // NPD version: 0 and 1 have no IV and keep compressed blocks' metadata plain; 4 uses
+                              // EDAT_KEY_1 for an encrypted key
+    u32 extra_flags = 0;      // recomp::kNpd*Flag besides the SDAT flag
+    u32 block_size = 0x400;
+};
+
+// `plain` as an SDATA file, encrypted, hashed and laid out the way recomp::NpdFile reads Sony's (RPCS3 unedat.cpp
+// in reverse), with `keys`. A compressed file (kNpdCompressedFlag) holds its blocks in the decoder's plain form (a
+// byte above 0x80, the length, the bytes), every other block marked compressed. Empty on platforms without
+// CommonCrypto.
+std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const SdataOptions& options = {});
 
 } // namespace pspocket::test

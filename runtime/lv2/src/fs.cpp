@@ -9,8 +9,9 @@
 // syscall then reads the image, with the same results a read-only host directory gives.
 //
 // Deviations:
-// - No NPDRM: opening an encrypted SDATA/EDATA file (sys_fs_open with the 8-byte type argument and an "NPD\0"
-//   header) fails with CELL_EFSSPECIFIC; unencrypted ones open as plain files.
+// - Encrypted SDATA/EDATA files (sys_fs_open with the 8-byte type argument and an "NPD\0" header) open through the
+//   host's NPD opener (Kernel::set_npd_opener, D-165) as read-only files of their plain bytes; without one, or when
+//   it refuses the file, the open fails with CELL_EFSSPECIFIC. Unencrypted ones open as plain files.
 // - No split-file (".66600") gathering, no HDD speed emulation, no I/O memory containers.
 // - Invalid open flags return CELL_EINVAL with an error log (RPCS3 throws).
 // - Lookups are case-sensitive where the host filesystem is (iOS APFS is): extracted assets must keep their case.
@@ -312,6 +313,61 @@ bool is_mself(const u8 (&header)[0x40])
     return ps_ld32(header) == 0x4D534600u && ps_ld32(header + 4) == 1 && ps_ld32(header + 20) == 0x40;
 }
 
+// A host file seen as an image file, so an NPD opener can read it (D-165). Owns the descriptor.
+class HostFdFile final : public VfsImage::File {
+public:
+    HostFdFile(int fd, u64 size) : fd_(fd), size_(size) {}
+    ~HostFdFile() override { ::close(fd_); }
+    u64 size() const override { return size_; }
+    bool read(u64 offset, void* dst, usize size) const override
+    {
+        usize done = 0;
+        while (done < size) {
+            const ssize_t n = ::pread(fd_, static_cast<u8*>(dst) + done, size - done, static_cast<off_t>(offset + done));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return false;
+            done += static_cast<usize>(n);
+        }
+        return true;
+    }
+
+private:
+    int fd_;
+    u64 size_;
+};
+
+// sys_fs_open's 8-byte type argument: SDATA (0x18000000010) or EDATA (2), else 0 (RPCS3 sys_fs_open).
+u64 npd_type(Kernel::Impl& s, u32 arg, u64 size)
+{
+    if (size != 8 || !s.guest.valid(arg, 8)) return 0;
+    const u64 type = s.guest.r64(arg);
+    return type == 0x18000000010ull || type == 2 ? type : 0;
+}
+
+// An SDATA or EDATA file that starts "NPD\0", through the host's opener: the plain file, or the error to return.
+Result open_npd(Kernel::Impl& s, std::shared_ptr<const VfsImage::File> encrypted, u64 type, s32 flags,
+    std::string_view vpath, std::shared_ptr<const VfsImage::File>& plain)
+{
+    const char* kind = type == 2 ? "EDATA" : "SDATA";
+    if ((flags & CELL_FS_O_ACCMODE) != CELL_FS_O_RDONLY) {
+        PS_LOG_ERROR(kFs, "sys_fs_open({}): an encrypted {} file opened for writing ({:#o})", vpath, kind, flags);
+        return err(CELL_EPERM);
+    }
+    Kernel::NpdOpener opener;
+    {
+        std::lock_guard lock(s.npd_mutex);
+        opener = s.npd_opener;
+    }
+    std::string error = "no NPD opener in this process";
+    if (opener) plain = opener(std::move(encrypted), type == 2, error);
+    if (!plain) {
+        PS_LOG_ERROR(kFs, "sys_fs_open({}): the encrypted {} file does not open: {}", vpath, kind, error);
+        return err(CELL_EFSSPECIFIC);
+    }
+    PS_LOG_INFO(kFs, "sys_fs_open({}): encrypted {} file, {} bytes plain", vpath, kind, plain->size());
+    return CELL_OK;
+}
+
 // sys_fs_open on an image mount. The mount is read-only, so this follows the host path's read-only rules: creating,
 // truncating or opening for writing is CELL_EPERM, a missing file CELL_ENOENT.
 Result open_image_file(Kernel::Impl& s, const Vfs::Resolved& res, const std::optional<VfsImage::Stat>& st, s32 flags,
@@ -330,13 +386,12 @@ Result open_image_file(Kernel::Impl& s, const Vfs::Resolved& res, const std::opt
             return err(CELL_ENOTMSELF);
         }
     }
-    if (size == 8 && s.guest.valid(arg, 8)) {
-        const u64 type = s.guest.r64(arg);
+    if (const u64 type = npd_type(s, arg, size)) {
         u8 magic[4]{};
-        if ((type == 0x18000000010ull || type == 2) && image_file->size() >= 4 && image_file->read(0, magic, 4) &&
-            std::memcmp(magic, "NPD\0", 4) == 0) {
-            PS_LOG_ERROR(kFs, "sys_fs_open({}): encrypted {} is not supported", res.vpath, type == 2 ? "EDATA" : "SDATA");
-            return err(CELL_EFSSPECIFIC);
+        if (image_file->size() >= 4 && image_file->read(0, magic, 4) && std::memcmp(magic, "NPD\0", 4) == 0) {
+            std::shared_ptr<const VfsImage::File> plain;
+            if (Result r = open_npd(s, std::move(image_file), type, flags, res.vpath, plain); r != CELL_OK) return r;
+            image_file = std::move(plain);
         }
     }
     auto file = std::make_shared<FsFile>();
@@ -550,14 +605,22 @@ Result sys_fs_open(PpuThread& t, u32 path, s32 flags, u32 fd, s32 mode, u32 arg,
             is_mself(header);
         if (!ok) return close_fail(err(CELL_ENOTMSELF));
     }
-    if (size == 8 && s.guest.valid(arg, 8)) {
-        const u64 type = s.guest.r64(arg);
-        if (type == 0x18000000010ull || type == 2) { // SDATA / EDATA
-            u8 magic[4]{};
-            if (::pread(host_fd, magic, 4, 0) == 4 && std::memcmp(magic, "NPD\0", 4) == 0) {
-                PS_LOG_ERROR(kFs, "sys_fs_open({}): encrypted {} is not supported", p.vpath, type == 2 ? "EDATA" : "SDATA");
-                return close_fail(err(CELL_EFSSPECIFIC));
-            }
+    if (const u64 type = npd_type(s, arg, size)) {
+        u8 magic[4]{};
+        struct stat st {};
+        if (::pread(host_fd, magic, 4, 0) == 4 && std::memcmp(magic, "NPD\0", 4) == 0 && ::fstat(host_fd, &st) == 0) {
+            // The descriptor goes to the encrypted file's reader: the open file reads its plain bytes.
+            std::shared_ptr<const VfsImage::File> plain;
+            const Result r = open_npd(s, std::make_shared<HostFdFile>(host_fd, static_cast<u64>(st.st_size)), type,
+                flags, p.vpath, plain);
+            if (r != CELL_OK) return r;
+            auto file = std::make_shared<FsFile>();
+            file->vpath = res.vpath;
+            file->mount = res.mount_ref;
+            file->image_file = std::move(plain);
+            file->flags = flags;
+            file->mode = mode;
+            return install_file(s, std::move(file), fd);
         }
     }
 

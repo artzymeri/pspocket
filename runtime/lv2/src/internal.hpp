@@ -319,6 +319,7 @@ struct RsxDevice {
     std::atomic<u64> flips{0};
     std::mutex listener_mutex;
     std::function<void(u32)> on_flip; // Kernel::set_rsx_flip_listener
+    std::function<void(u32)> on_user_command; // Kernel::set_rsx_user_command_listener
 
     std::unique_ptr<rsx::Backend> backend;
     std::unique_ptr<rsx::Rsx> rsx; // after `backend`, so it is destroyed first
@@ -427,6 +428,7 @@ struct Kernel::Impl {
         std::mutex mutex;
         u32 max_raw = 0;
         u32 max_spu = 6;
+        s32 group_log = 0; // sys_spu_thread_group_log: 0 on, 1 off
     } spu_limits;
 
     std::mutex ipc_mutex;
@@ -444,6 +446,8 @@ struct Kernel::Impl {
 
     MemoryManager memory;
     Vfs vfs;
+    std::mutex npd_mutex;
+    Kernel::NpdOpener npd_opener; // Kernel::set_npd_opener (D-165), under npd_mutex
     RsxDevice rsx;
     TimerService timers;
     std::mutex tty_mutex;

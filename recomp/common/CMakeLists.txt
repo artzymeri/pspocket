@@ -49,6 +49,7 @@ add_library(pspocket_recomp_common STATIC
     src/json_writer.cpp
     src/manifest.cpp
     src/nid.cpp
+    src/npd.cpp
     src/ppu_module.cpp
     src/sce.cpp
     src/self_decrypt.cpp

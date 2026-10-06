@@ -545,6 +545,12 @@ std::string Kernel::vfs_host_path(std::string_view vpath) const
     return r.host;
 }
 
+void Kernel::set_npd_opener(NpdOpener opener)
+{
+    std::lock_guard lock(impl_->npd_mutex);
+    impl_->npd_opener = std::move(opener);
+}
+
 bool Kernel::vfs_read_file(std::string_view vpath, std::vector<u8>& out) const
 {
     const Vfs::Resolved r = impl_->vfs.resolve(vpath);
@@ -625,6 +631,12 @@ void Kernel::set_rsx_flip_listener(std::function<void(u32 buffer_id)> fn)
 {
     std::lock_guard lock(impl_->rsx.listener_mutex);
     impl_->rsx.on_flip = std::move(fn);
+}
+
+void Kernel::set_rsx_user_command_listener(std::function<void(u32 arg)> fn)
+{
+    std::lock_guard lock(impl_->rsx.listener_mutex);
+    impl_->rsx.on_user_command = std::move(fn);
 }
 
 void Kernel::syscall(PPUContext& ctx)
