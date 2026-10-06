@@ -4383,6 +4383,35 @@ Tests: tests/hle/test_adec.cpp (pspocket's LPCM alone; both comparisons when the
 tests/hle/test_lle.cpp (the host's imports chosen and linked), tests/hle/test_hle.cpp (call_guest with eleven
 arguments).
 
+## D-198 · 2026-10-06 · ATRAC3plus in cellAdec is pspocket's own, on FFmpeg
+
+The first of D-197's codec cores to replace Sony's. ATRAC3plus is the codec games use most for their movies' and
+streams' sound. runtime/hle/src/adec_atracx.cpp is RPCS3's port of libatxdec's PPU side (cellAtracXdec.cpp): its
+context in the game's memory (0x268 bytes), its command queue of four, mutexes and conditions, the ATS headers some
+streams put before each frame, the first frame of a sequence (and the frame after an error) given out as silence,
+the four output formats (16, 24, 32 bits, float) and libatxdec's channel order. It decodes with FFmpeg's atrac3p
+decoder on a PPU thread of its own ("HLE ATRAC3plus decoder"); libatxdec decodes on an SPU.
+
+- The cellAdec front end uses it for the four ATRAC3plus types; libatxdec is no longer among cellAdec's imports, so
+  the loader does not load it (a build without FFmpeg keeps importing it).
+- FFmpeg's objects are kept on the host, per decoder; RPCS3 puts their pointers in the guest context.
+- One change from RPCS3, measured: a frame whose first bit is set gets libatxdec's own error, 0x806122B2, checked
+  before FFmpeg (RPCS3 gives FFmpeg's generic 0x80612281). Other bad frames still get the generic code: FFmpeg does
+  not say why it refuses one.
+- A decode without a valid configuration (libatxdec's SPU program would crash; RPCS3 aborts) is logged and reported to
+  the game as a fatal error with no samples.
+
+Measured against Sony's libatxdec through Sony's libadec (rule 8, run 105):
+
+- Frames built in the test (valid silent stereo frames of 1, 8, 28, 32 and 16 quantisation units, and one with its
+  start bit set): every answer, item, information block, callback and output the same.
+- A game's stream (Assassin's Creed's SND0.AT3, read from the disc image in place for the run, never in the
+  repository): 302 frames, 2,423 lines the same; the samples within 0.000001 of Sony's (101 dB below the signal).
+  pspocket decoded the 12.9 s of sound in 0.79 s on the M4 (Sony's SPU code, interpreted in the test, 3.5 s).
+
+Tests: tests/hle/test_adec.cpp (the flow on built frames; the comparison when the firmware is there; a hidden probe for
+a stream from a file, PSPOCKET_PROBE_AT3).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

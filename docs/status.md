@@ -129,10 +129,11 @@ buffers in Sony's layout, pictures exact (RGB within one step). VC-1, DivX 3.11 
 cellAdec, the audio decoder (D-197, run 104): pspocket's own front end and LPCM decoder, the same as Sony's libadec to
 the byte (221 answers and callbacks, 22 PCM outputs, every LPCM packing); every other codec goes to Sony's codec
 module through pspocket's front end (the loader now links what a pspocket library takes from the firmware's modules),
-also the same as through Sony's libadec.
+also the same as through Sony's libadec. ATRAC3plus, the codec games use most, is now pspocket's own on FFmpeg (D-198,
+run 105): on Assassin's Creed's menu music every answer is Sony's and the sound within 0.000001 of Sony's decoder.
 
-Next: pspocket's own codec cores on FFmpeg in place of Sony's, ATRAC3plus first (D-181), then the image decoders, each
-measured against Sony's the same way; then
+Next: the other codec cores on FFmpeg in place of Sony's (MP3, AC-3, AAC, ATRAC3, MPEG audio), then the image decoders,
+each measured against Sony's the same way; then
 docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
 with games nobody has analysed (each run's log names what is still missing).
 
