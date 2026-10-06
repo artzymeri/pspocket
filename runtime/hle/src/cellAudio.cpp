@@ -17,8 +17,8 @@
 //   CellAudioPortParam {be u64 nChannel, nBlock, attr; be f32 level}.
 //   CellAudioPortConfig {be u32 readIndexAddr, status; be u64 nChannel, nBlock; be u32 portSize, portAddr}.
 // Besides clearing played blocks, the thread writes only the read indices, and in buffering mode RPCS3's -0.0f tags into
-// each block it clears (below). RPCS3 keeps each port's block counter and timestamp on the host (for
-// cellAudioGetPortBlockTag and cellAudioGetPortTimestamp, not imported yet).
+// each block it clears (below). Each port's period counter and timestamp stay on the host, as in RPCS3, for
+// cellAudioGetPortBlockTag and cellAudioGetPortTimestamp.
 //
 // Timing (D-074, pspocket/hle/audio.hpp). With a host sink that can say how much it holds (the speaker on the Mac and
 // the iPhone), the thread runs RPCS3's buffering mode with its default settings (audio_buffering.hpp): each period
@@ -61,6 +61,8 @@
 //   queue the game created itself gives CELL_AUDIO_ERROR_TRANS_EVENT and an error log, until lv2 can look up a key.
 // - RPCS3's short sleeps for the VSH (200 us in open, 30 us in start, 20 us in set) are left out, as cellGame's are
 //   (D-044). So is its wait for libmixer's _mxr000 queue: there is no libmixer here.
+// - cellAudioSetPortLevel moves the level over 624 samples, as RPCS3's comment says; RPCS3's step has the wrong sign,
+//   so there the level jumps at once.
 // - Pointers are checked before use (D-042): a bad one gives CELL_AUDIO_ERROR_PARAM and the call site in the log.
 //   cellAudioAddData on a port closed since it was opened gives CELL_AUDIO_ERROR_PORT_NOT_OPEN; RPCS3 writes into
 //   the unmapped buffer.
@@ -113,6 +115,7 @@ enum : u32 {
     CELL_AUDIO_ERROR_TRANS_EVENT = 0x80310709,
     CELL_AUDIO_ERROR_SHAREDMEMORY = 0x8031070b,
     CELL_AUDIO_ERROR_EVENT_QUEUE = 0x8031070d,
+    CELL_AUDIO_ERROR_TAG_NOT_FOUND = 0x8031070f,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -123,6 +126,12 @@ constexpr u64 CELL_AUDIO_EVENT_MIX = 0;
 constexpr u32 CELL_AUDIO_EVENTFLAG_BEFOREMIX = 0x80000000, CELL_AUDIO_EVENTFLAG_DECIMATE_2 = 0x08000000,
               CELL_AUDIO_EVENTFLAG_DECIMATE_4 = 0x10000000, CELL_AUDIO_EVENTFLAG_NOMIX = 0x40000000;
 constexpr u64 CELL_AUDIO_PORTATTR_INITLEVEL = 0x1000;
+constexpr u32 CELL_AUDIO_CREATEEVENTFLAG_SPU = 1;
+constexpr s32 CELL_AUDIO_PERSONAL_DEVICE_PRIMARY = 0x8000;
+// RPCS3 cfg.audio_block_period: one period in whole microseconds, for cellAudioGetPortTimestamp.
+constexpr u64 kBlockPeriodUs = CELL_AUDIO_BLOCK_SAMPLES * 1'000'000 / 48'000;
+// RPCS3 cellAudioSetPortLevel: a new level is reached over 624 samples (13 ms).
+constexpr f32 kLevelSteps = 624.0f;
 // Port attributes RPCS3 accepts without emulating them: BGM (0x10), the secondary output (0x1), no route (0x100000)
 // and the four personal outputs (0x01000000..0x08000000). Bits outside these and INITLEVEL are unknown.
 constexpr u64 kPortAttrNotEmulated = 0x0F100011;
@@ -154,6 +163,7 @@ const char* error_name(s32 r)
     case CELL_AUDIO_ERROR_TRANS_EVENT: return "CELL_AUDIO_ERROR_TRANS_EVENT";
     case CELL_AUDIO_ERROR_SHAREDMEMORY: return "CELL_AUDIO_ERROR_SHAREDMEMORY";
     case CELL_AUDIO_ERROR_EVENT_QUEUE: return "CELL_AUDIO_ERROR_EVENT_QUEUE";
+    case CELL_AUDIO_ERROR_TAG_NOT_FOUND: return "CELL_AUDIO_ERROR_TAG_NOT_FOUND";
     }
     return lv2::error_name(r);
 }
@@ -168,7 +178,7 @@ s32 fail(s32 code, std::format_string<A...> fmt, A&&... args)
 
 enum class PortState : u8 { Closed, Opened, Started };
 
-// RPCS3 audio_port, without the volume ramp of cellAudioSetPortLevel (not imported) and the buffering-mode tags.
+// RPCS3 audio_port, with pspocket's buffering-mode tags.
 struct Port {
     PortState state = PortState::Closed;
     u32 number = 0;
@@ -185,6 +195,8 @@ struct Port {
     u64 active_counter = 0; // periods played
     u64 timestamp = 0;      // guest system time (us) of the port's last period
     f32 level = 1.0f;
+    f32 level_target = 1.0f; // cellAudioSetPortLevel: the level being moved to (RPCS3 level_set.value)
+    f32 level_inc = 0.0f;    // per sample (RPCS3 level_set.inc); 0 when the level is reached
     audio_buffering::PortTags tags; // buffering mode: what the game has written of the next block (fresh at open)
     u32 adds = 0;                   // cellAudioAddData calls into the block at the read index (the sound line)
 
@@ -198,6 +210,7 @@ struct NotifyKey {
     u32 flags = 0;
     u64 source = 0; // the events' source: a made-up event port ID, as RPCS3
     std::shared_ptr<lv2::EventQueue> queue;
+    u64 ack_timestamp = 0; // guest system time (us) of the last cellAudioSendAck for this source (kept, as RPCS3)
 };
 
 // One run of the audio thread, from cellAudioInit to cellAudioQuit.
@@ -300,15 +313,24 @@ std::chrono::nanoseconds period_offset(u64 n) { return std::chrono::nanoseconds(
 // RPCS3 cell_audio_thread::mix<STEREO, downmix> for the stereo output cellSysutil reports, with RPCS3's default
 // downmixer, CELL_AUDIO_OUT_DOWNMIXER_NONE (also what GTA V configures): an 8-channel port contributes its front left
 // and right, a port without channels its one sample to both. RPCS3 takes the downmixer from cellAudioOutConfigure
-// (TYPE_A: its Dolby stereo downmix of all channels); that is not followed yet. Master volume 1. With s.mutex held.
+// (TYPE_A: its Dolby stereo downmix of all channels); that is not followed yet. Master volume 1. A level set with
+// cellAudioSetPortLevel moves one step per sample (RPCS3 step_volume). With s.mutex held.
 void mix_ports(AudioState& s, MixBlock& out)
 {
     out.fill(0.0f);
-    for (const Port& port : s.ports) {
+    for (Port& port : s.ports) {
         if (port.state != PortState::Started) continue;
         const u32 block = port.block_addr(port.cur_pos);
         const u32 stride = 4 * std::max(port.num_channels, 1u);
         for (u32 i = 0; i < kAudioBlockFrames; i++) {
+            if (port.level_inc != 0.0f) {
+                port.level += port.level_inc;
+                const bool up = port.level_inc > 0.0f;
+                if ((up && port.level >= port.level_target) || (!up && port.level <= port.level_target)) {
+                    port.level = port.level_target;
+                    port.level_inc = 0.0f;
+                }
+            }
             const u32 in = block + i * stride;
             const f32 left = ps_readf32(s.base, in) * port.level;
             const f32 right = port.num_channels ? ps_readf32(s.base, in + 4) * port.level : left;
@@ -359,7 +381,15 @@ bool run_period(AudioState& s, Runner& r, MixBlock& mix, std::vector<Notify>& no
     {
         std::lock_guard lock(s.mutex);
         if (s.runner.get() != &r) return false;
-        if (out == Output::Mix) mix_ports(s, mix);
+        if (out == Output::Mix) {
+            mix_ports(s, mix);
+        } else {
+            // Nothing mixed: a level being moved gets there at once (RPCS3 finish_port_volume_stepping).
+            for (Port& port : s.ports) {
+                port.level = port.level_target;
+                port.level_inc = 0.0f;
+            }
+        }
         advance(s, lv2::guest_system_time_us(), notify, tag);
     }
     if (out != Output::None) {
@@ -767,6 +797,8 @@ s32 cellAudioPortOpen(PPUContext& ctx, u32 param, u32 port_num)
     port->active_counter = 0;
     port->timestamp = s.last_period_end;
     port->level = (attr & CELL_AUDIO_PORTATTR_INITLEVEL) ? ps_readf32(s.base, param + 24) : 1.0f;
+    port->level_target = port->level;
+    port->level_inc = 0.0f;
     if (const s32 r = allocate_port(s, *port); r != lv2::CELL_OK) return r;
     ps_write32(s.base, port_num, port->number);
     PS_LOG_INFO(kChan, "cellAudioPortOpen(param {:#x} {{nChannel {}, nBlock {}, attr {:#x}}}): port {}, buffer "
@@ -859,10 +891,10 @@ s32 cellAudioPortClose(PPUContext&, u32 port_num)
     return lv2::CELL_OK;
 }
 
-// RPCS3 AudioCreateNotifyEventQueue for a PPU queue: an lv2 event queue (FIFO, 8 events deep, or 2 once cellAudioInit
+// RPCS3 AudioCreateNotifyEventQueue: an lv2 event queue of the given type (FIFO, 8 events deep, or 2 once cellAudioInit
 // ran for SDK 3.5 and older) on the first free key from 0x80004D494F323221. It doesn't need cellAudioInit. RPCS3
 // writes the key unchecked; here a bad key pointer is refused before the queue is made.
-s32 cellAudioCreateNotifyEventQueue(PPUContext& ctx, u32 id, u32 key)
+s32 create_notify_queue(PPUContext& ctx, u32 id, u32 key, u32 queue_type)
 {
     AudioState& s = audio();
     lv2::PpuThread& t = thread_of(ctx);
@@ -872,7 +904,7 @@ s32 cellAudioCreateNotifyEventQueue(PPUContext& ctx, u32 id, u32 key)
     }
     StackVar attr(ctx, s.base, 16); // sys_event_queue_attribute_t {protocol, type, name[8] = 0}
     ps_write32(s.base, attr.addr(), lv2::SYS_SYNC_FIFO);
-    ps_write32(s.base, attr.addr() + 4, lv2::SYS_PPU_QUEUE);
+    ps_write32(s.base, attr.addr() + 4, queue_type);
     for (u64 i = 0; i < MAX_AUDIO_EVENT_QUEUES; i++) {
         const u64 key_value = kNotifyKeyBase + i;
         const s32 depth = s.init && s.kernel.config().sdk_version <= kSdk35 ? 2 : 8;
@@ -894,9 +926,24 @@ s32 cellAudioCreateNotifyEventQueue(PPUContext& ctx, u32 id, u32 key)
     return fail(error(CELL_AUDIO_ERROR_EVENT_QUEUE), "cellAudioCreateNotifyEventQueue(id {:#x}, key {:#x})", id, key);
 }
 
-// RPCS3 AudioSetNotifyEventQueue without flags: the queue with this key gets CELL_AUDIO_EVENT_MIX every period, with
-// a source of its own.
-s32 cellAudioSetNotifyEventQueue(PPUContext& ctx, u64 key)
+s32 cellAudioCreateNotifyEventQueue(PPUContext& ctx, u32 id, u32 key)
+{
+    return create_notify_queue(ctx, id, key, lv2::SYS_PPU_QUEUE);
+}
+
+// cellAudioCreateNotifyEventQueueEx(id, key, iFlags): CELL_AUDIO_CREATEEVENTFLAG_SPU makes an SPU queue.
+s32 cellAudioCreateNotifyEventQueueEx(PPUContext& ctx, u32 id, u32 key, u32 flags)
+{
+    if (flags & ~CELL_AUDIO_CREATEEVENTFLAG_SPU) {
+        return fail(error(CELL_AUDIO_ERROR_PARAM), "cellAudioCreateNotifyEventQueueEx(flags {:#x})", flags);
+    }
+    return create_notify_queue(ctx, id, key,
+        (flags & CELL_AUDIO_CREATEEVENTFLAG_SPU) ? lv2::SYS_SPU_QUEUE : lv2::SYS_PPU_QUEUE);
+}
+
+// RPCS3 AudioSetNotifyEventQueue: the queue with this key gets CELL_AUDIO_EVENT_MIX every period (or every 2nd, 4th or
+// 8th with the decimate flags, none with NOMIX), with a source of its own.
+s32 set_notify_queue(PPUContext& ctx, u64 key, u32 flags)
 {
     AudioState& s = audio();
     if (!s.init) return fail(error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioSetNotifyEventQueue(key {:#x})", key);
@@ -923,28 +970,66 @@ s32 cellAudioSetNotifyEventQueue(PPUContext& ctx, u64 key)
     }
     const u64 pid = static_cast<u32>(lv2::sys_process_getpid(thread_of(ctx)));
     const u64 source = (pid << 32) + kEventPortIdBase + s.key_count++ * kEventPortIdStep;
-    s.keys.push_back({s.event_period, 0, source, q});
+    s.keys.push_back({s.event_period, flags, source, q});
     s.key_count %= kEventPortIdCount;
-    PS_LOG_INFO(kChan, "cellAudioSetNotifyEventQueue(key {:#x}): queue {:#x} gets an event every period, source {:#x}",
-        key, q->id, source);
+    PS_LOG_INFO(kChan, "cellAudioSetNotifyEventQueue(key {:#x}, flags {:#x}): queue {:#x} gets events, source {:#x}",
+        key, flags, q->id, source);
     return lv2::CELL_OK;
 }
 
-// RPCS3 AudioRemoveNotifyEventQueue without flags.
-s32 cellAudioRemoveNotifyEventQueue(PPUContext&, u64 key)
+s32 cellAudioSetNotifyEventQueue(PPUContext& ctx, u64 key) { return set_notify_queue(ctx, key, 0); }
+
+// The Ex variants take the event flags in the top 5 bits; any other bit is CELL_AUDIO_ERROR_PARAM (RPCS3).
+constexpr u32 kNotifyFlagsInvalid = ~0u >> 5;
+
+s32 cellAudioSetNotifyEventQueueEx(PPUContext& ctx, u64 key, u32 flags)
+{
+    if (flags & kNotifyFlagsInvalid) {
+        return fail(error(CELL_AUDIO_ERROR_PARAM), "cellAudioSetNotifyEventQueueEx(key {:#x}, flags {:#x})", key, flags);
+    }
+    return set_notify_queue(ctx, key, flags);
+}
+
+// RPCS3 AudioRemoveNotifyEventQueue: the queue must have been set with the same flags.
+s32 remove_notify_queue(u64 key, u32 flags)
 {
     AudioState& s = audio();
     std::lock_guard lock(s.mutex);
     if (!s.init) return fail(error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioRemoveNotifyEventQueue(key {:#x})", key);
     for (auto i = s.keys.begin(); i != s.keys.end(); ++i) {
         if (!queue_alive(i->queue) || i->queue->key != key) continue;
-        if (i->flags != 0) break; // registered with other flags (cellAudioSetNotifyEventQueueEx)
+        if (i->flags != flags) break; // registered with other flags
         const u32 queue = i->queue->id;
         s.keys.erase(i);
         PS_LOG_INFO(kChan, "cellAudioRemoveNotifyEventQueue(key {:#x}): queue {:#x} gets no more events", key, queue);
         return lv2::CELL_OK;
     }
     return fail(error(CELL_AUDIO_ERROR_TRANS_EVENT), "cellAudioRemoveNotifyEventQueue(key {:#x})", key);
+}
+
+s32 cellAudioRemoveNotifyEventQueue(PPUContext&, u64 key) { return remove_notify_queue(key, 0); }
+
+s32 cellAudioRemoveNotifyEventQueueEx(PPUContext&, u64 key, u32 flags)
+{
+    if (flags & kNotifyFlagsInvalid) {
+        return fail(error(CELL_AUDIO_ERROR_PARAM), "cellAudioRemoveNotifyEventQueueEx(key {:#x}, flags {:#x})", key,
+            flags);
+    }
+    return remove_notify_queue(key, flags);
+}
+
+// cellAudioSendAck(data3): the game acknowledges an event; RPCS3 records when, for the key with that source.
+s32 cellAudioSendAck(PPUContext&, u64 data3)
+{
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (!s.init) return fail(error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioSendAck({:#x})", data3);
+    for (NotifyKey& k : s.keys) {
+        if (k.source != data3) continue;
+        k.ack_timestamp = lv2::guest_system_time_us();
+        break;
+    }
+    return lv2::CELL_OK;
 }
 
 // cellAudioAddData(portNum, float* src, samples, float volume): adds src * volume to the block at the port's read
@@ -987,6 +1072,194 @@ s32 cellAudioAddData(PPUContext& ctx, u32 port_num, u32 src, u32 samples)
     return lv2::CELL_OK;
 }
 
+// The block at a port's read index, for the Add*Data functions (RPCS3 audio_port::get_vm_ptr), or an error: like
+// cellAudioAddData, a port whose buffer is gone is CELL_AUDIO_ERROR_PORT_NOT_OPEN, where RPCS3 writes into it anyway.
+// 0 with r == OK: the port has no channels (never opened), nothing to add to.
+u32 add_target(AudioState& s, const Port& port, const char* fn, s32& r)
+{
+    r = lv2::CELL_OK;
+    if (!port.num_channels) return 0;
+    if (!port.mapped) {
+        r = fail_polled(s, error(CELL_AUDIO_ERROR_PORT_NOT_OPEN), "{}({}): the port was closed", fn, port.number);
+        return 0;
+    }
+    return port.block_addr(static_cast<u16>(ps_read64(s.base, port.index)) & (port.num_blocks - 1));
+}
+
+f32 clamp_volume(f32 v) { return std::isfinite(v) ? std::clamp(v, -16.0f, 16.0f) : 0.0f; }
+
+// cellAudioAdd2chData(portNum, float* src, samples, float volume): stereo samples into a 2- or 8-channel port's front
+// left and right (RPCS3). volume in f1.
+s32 cellAudioAdd2chData(PPUContext& ctx, u32 port_num, u32 src, u32 samples)
+{
+    const f32 volume = clamp_volume(static_cast<f32>(ctx.fpr[1]));
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (!s.init) return fail_polled(s, error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioAdd2chData({})", port_num);
+    if (port_num >= AUDIO_PORT_COUNT || !src || (src & 3) || samples != CELL_AUDIO_BLOCK_SAMPLES) {
+        return fail_polled(s, error(CELL_AUDIO_ERROR_PARAM), "cellAudioAdd2chData({}, src {:#x}, samples {})",
+            port_num, src, samples);
+    }
+    if (!guest_readable(thread_of(ctx), src, samples * 2 * 4)) {
+        log_call_site(ctx, s.base, "cellAudioAdd2chData: the samples are not in guest memory");
+        return error(CELL_AUDIO_ERROR_PARAM);
+    }
+    const Port& port = s.ports[port_num];
+    if (port.num_channels != 2 && port.num_channels != 8) {
+        PS_LOG_ERROR(kChan, "cellAudioAdd2chData({}): a port of {} channels", port_num, port.num_channels);
+        return lv2::CELL_OK; // RPCS3
+    }
+    s32 r;
+    const u32 dst = add_target(s, port, "cellAudioAdd2chData", r);
+    if (!dst) return r;
+    for (u32 i = 0; i < samples; i++) {
+        for (u32 c = 0; c < 2; c++) {
+            const u32 d = dst + 4 * (i * port.num_channels + c);
+            ps_writef32(s.base, d, ps_readf32(s.base, d) + ps_readf32(s.base, src + 4 * (i * 2 + c)) * volume);
+        }
+    }
+    return lv2::CELL_OK;
+}
+
+// cellAudioAdd6chData(portNum, float* src, float volume): a block of 5.1 samples (front left, centre, front right,
+// surround left, surround right, LFE) into an 8-channel port's channels 0 to 5 in its order (L, R, C, LFE, rear L,
+// rear R; RPCS3). volume in f1.
+s32 cellAudioAdd6chData(PPUContext& ctx, u32 port_num, u32 src)
+{
+    const f32 volume = clamp_volume(static_cast<f32>(ctx.fpr[1]));
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (!s.init) return fail_polled(s, error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioAdd6chData({})", port_num);
+    if (port_num >= AUDIO_PORT_COUNT || !src || (src & 3)) {
+        return fail_polled(s, error(CELL_AUDIO_ERROR_PARAM), "cellAudioAdd6chData({}, src {:#x})", port_num, src);
+    }
+    if (!guest_readable(thread_of(ctx), src, CELL_AUDIO_BLOCK_SAMPLES * 6 * 4)) {
+        log_call_site(ctx, s.base, "cellAudioAdd6chData: the samples are not in guest memory");
+        return error(CELL_AUDIO_ERROR_PARAM);
+    }
+    const Port& port = s.ports[port_num];
+    if (port.num_channels != 8) {
+        PS_LOG_ERROR(kChan, "cellAudioAdd6chData({}): a port of {} channels", port_num, port.num_channels);
+        return lv2::CELL_OK; // RPCS3
+    }
+    s32 r;
+    const u32 dst = add_target(s, port, "cellAudioAdd6chData", r);
+    if (!dst) return r;
+    static constexpr u32 kFrom[6] = {0, 2, 1, 5, 3, 4}; // port channel c takes source channel kFrom[c]
+    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES; i++) {
+        for (u32 c = 0; c < 6; c++) {
+            const u32 d = dst + 4 * (i * 8 + c);
+            ps_writef32(s.base, d, ps_readf32(s.base, d) + ps_readf32(s.base, src + 4 * (i * 6 + kFrom[c])) * volume);
+        }
+    }
+    return lv2::CELL_OK;
+}
+
+// The checks the port queries share (RPCS3): init, a port number below 8, an open port.
+s32 open_port_checks(AudioState& s, u32 port_num, const char* fn)
+{
+    if (!s.init) return fail_polled(s, error(CELL_AUDIO_ERROR_NOT_INIT), "{}({})", fn, port_num);
+    if (port_num >= AUDIO_PORT_COUNT) return fail_polled(s, error(CELL_AUDIO_ERROR_PARAM), "{}({})", fn, port_num);
+    if (s.ports[port_num].state == PortState::Closed) {
+        return fail_polled(s, error(CELL_AUDIO_ERROR_PORT_NOT_OPEN), "{}({})", fn, port_num);
+    }
+    return lv2::CELL_OK;
+}
+
+// cellAudioGetPortTimestamp(portNum, u64 tag, u64* stamp): the guest system time (us) at which the period with this
+// tag (a value of the global period counter) ended: the port's last period's time, less a period per tag since
+// (RPCS3). A tag the port has not reached is CELL_AUDIO_ERROR_TAG_NOT_FOUND.
+s32 cellAudioGetPortTimestamp(PPUContext& ctx, u32 port_num, u64 tag, u32 stamp)
+{
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (const s32 r = open_port_checks(s, port_num, "cellAudioGetPortTimestamp"); r != lv2::CELL_OK) return r;
+    const Port& port = s.ports[port_num];
+    if (port.global_counter < tag) {
+        return fail_polled(s, error(CELL_AUDIO_ERROR_TAG_NOT_FOUND), "cellAudioGetPortTimestamp({}, tag {})",
+            port_num, tag);
+    }
+    if (!stamp) return lv2::CELL_OK; // RPCS3: "apparently no error is returned if stamp is null"
+    if (!guest_readable(thread_of(ctx), stamp, 8)) {
+        log_call_site(ctx, s.base, "cellAudioGetPortTimestamp: the stamp pointer is not in guest memory");
+        return error(CELL_AUDIO_ERROR_PARAM);
+    }
+    ps_write64(s.base, stamp, port.timestamp - (port.global_counter - tag) * kBlockPeriodUs);
+    return lv2::CELL_OK;
+}
+
+// cellAudioGetPortBlockTag(portNum, u64 blockNo, u64* tag): the period counter value at which block blockNo plays,
+// counted from the port's current block (RPCS3: global_counter + blockNo - cur_pos).
+s32 cellAudioGetPortBlockTag(PPUContext& ctx, u32 port_num, u64 block_no, u32 tag)
+{
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (const s32 r = open_port_checks(s, port_num, "cellAudioGetPortBlockTag"); r != lv2::CELL_OK) return r;
+    const Port& port = s.ports[port_num];
+    if (block_no >= port.num_blocks) {
+        return fail_polled(s, error(CELL_AUDIO_ERROR_PARAM), "cellAudioGetPortBlockTag({}, block {})", port_num,
+            block_no);
+    }
+    if (!tag) return lv2::CELL_OK; // RPCS3: no error for a null tag either
+    if (!guest_readable(thread_of(ctx), tag, 8)) {
+        log_call_site(ctx, s.base, "cellAudioGetPortBlockTag: the tag pointer is not in guest memory");
+        return error(CELL_AUDIO_ERROR_PARAM);
+    }
+    ps_write64(s.base, tag, port.global_counter + block_no - port.cur_pos);
+    return lv2::CELL_OK;
+}
+
+// cellAudioSetPortLevel(portNum, float level): the port's level moves to `level` over 624 samples (13 ms). RPCS3
+// computes the step as (old - new) / 624, the wrong sign, so its level jumps at the first sample; here it moves as its
+// comment says it should. A negative level is accepted and ignored (RPCS3). level in f1.
+s32 cellAudioSetPortLevel(PPUContext& ctx, u32 port_num)
+{
+    const f32 level = static_cast<f32>(ctx.fpr[1]);
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (const s32 r = open_port_checks(s, port_num, "cellAudioSetPortLevel"); r != lv2::CELL_OK) return r;
+    Port& port = s.ports[port_num];
+    if (!(level >= 0.0f)) {
+        PS_LOG_WARN(kChan, "cellAudioSetPortLevel({}, {}): a negative level is ignored (as RPCS3)", port_num, level);
+        return lv2::CELL_OK;
+    }
+    port.level_target = level;
+    port.level_inc = (level - port.level) / kLevelSteps;
+    if (port.level_inc == 0.0f) port.level = level;
+    return lv2::CELL_OK;
+}
+
+// cellAudioMiscSetAccessoryVolume(devNum, float volume): no accessories; accepted once initialised (RPCS3).
+s32 cellAudioMiscSetAccessoryVolume(PPUContext& ctx, u32 dev)
+{
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (!s.init) return fail(error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioMiscSetAccessoryVolume({})", dev);
+    PS_LOG_DEBUG(kChan, "cellAudioMiscSetAccessoryVolume({}, {}): no accessory", dev, ctx.fpr[1]);
+    return lv2::CELL_OK;
+}
+
+// Personal (headset) streams: 4 streams, devices 0 to 4 or the primary one; accepted and not routed (RPCS3).
+s32 cellAudioSetPersonalDevice(PPUContext&, s32 stream, s32 device)
+{
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (!s.init) return fail(error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioSetPersonalDevice({})", stream);
+    if (stream < 0 || stream >= 4 || (device != CELL_AUDIO_PERSONAL_DEVICE_PRIMARY && (device < 0 || device >= 5))) {
+        return fail(error(CELL_AUDIO_ERROR_PARAM), "cellAudioSetPersonalDevice({}, {})", stream, device);
+    }
+    return lv2::CELL_OK;
+}
+
+s32 cellAudioUnsetPersonalDevice(PPUContext&, s32 stream)
+{
+    AudioState& s = audio();
+    std::lock_guard lock(s.mutex);
+    if (!s.init) return fail(error(CELL_AUDIO_ERROR_NOT_INIT), "cellAudioUnsetPersonalDevice({})", stream);
+    if (stream < 0 || stream >= 4) return fail(error(CELL_AUDIO_ERROR_PARAM), "cellAudioUnsetPersonalDevice({})", stream);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void set_audio_sink(HleProcess& process, AudioSink sink, AudioBufferQuery query, AudioStretch stretch)
@@ -1016,6 +1289,18 @@ void register_cellAudio(Registry& r)
         PS_HLE_FUNC(0x377E0CD9, cellAudioSetNotifyEventQueue),
         PS_HLE_FUNC(0xFF3626FD, cellAudioRemoveNotifyEventQueue),
         PS_HLE_FUNC(0xDAB029AA, cellAudioAddData),
+        PS_HLE_FUNC(0xA4C9BA65, cellAudioCreateNotifyEventQueueEx),
+        PS_HLE_FUNC(0xB56EF5A1, cellAudioSetNotifyEventQueueEx),
+        PS_HLE_FUNC(0x2B9BD9AD, cellAudioRemoveNotifyEventQueueEx),
+        PS_HLE_FUNC(0x17D1213B, cellAudioSendAck),
+        PS_HLE_FUNC(0x9E4B1DB8, cellAudioAdd2chData),
+        PS_HLE_FUNC(0x832DF17E, cellAudioAdd6chData),
+        PS_HLE_FUNC(0x4109D08C, cellAudioGetPortTimestamp),
+        PS_HLE_FUNC(0xE4046AFE, cellAudioGetPortBlockTag),
+        PS_HLE_FUNC(0x56DFE179, cellAudioSetPortLevel),
+        PS_HLE_FUNC(0x31211F6B, cellAudioMiscSetAccessoryVolume),
+        PS_HLE_FUNC(0x5676F81C, cellAudioSetPersonalDevice),
+        PS_HLE_FUNC(0x28BC1409, cellAudioUnsetPersonalDevice),
     });
 }
 

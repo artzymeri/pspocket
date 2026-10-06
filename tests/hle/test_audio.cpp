@@ -1,5 +1,6 @@
 // cellAudio (synthetic: no game data): init and quit, ports and their configuration, the audio thread's periods (read
-// indices, cleared blocks, notify events), cellAudioAddData, the host sink, and the end of the thread.
+// indices, cleared blocks, notify events and their Ex variants), the Add*Data functions, block tags and timestamps,
+// port levels, the host sink, and the end of the thread.
 
 #include "hle_test_util.hpp"
 
@@ -625,4 +626,199 @@ TEST_CASE("cellAudio: the audio thread stops when the guest exits the process, a
         std::this_thread::sleep_for(20ms);
     }
     CHECK(ms_since(t0) < 2000);
+}
+
+TEST_CASE("cellAudio: the Ex notify queues, flags, and acknowledgements", "[hle][audio]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "audio");
+    u8* b = f.base();
+    lv2::PpuThread& t = *g.t;
+    constexpr u32 kDecimate2 = 0x08000000, kNoMix = 0x40000000;
+
+    // CELL_AUDIO_CREATEEVENTFLAG_SPU makes an SPU queue; any other flag is a parameter error.
+    CHECK(g.call("cellAudioCreateNotifyEventQueueEx", kQueueId, kKey, 2) == kParamError);
+    REQUIRE(g.call("cellAudioCreateNotifyEventQueueEx", kQueueId, kKey, 1) == 0);
+    const auto spu = f.kernel->event_queue(ps_read32(b, kQueueId));
+    REQUIRE(spu);
+    CHECK(spu->type == lv2::SYS_SPU_QUEUE);
+    CHECK(ps_read64(b, kKey) == kFirstKey);
+    REQUIRE(g.call("cellAudioCreateNotifyEventQueueEx", kQueueId, kKey, 0) == 0);
+    const u32 q = ps_read32(b, kQueueId);
+    const u64 key = ps_read64(b, kKey);
+    CHECK(f.kernel->event_queue(q)->type == lv2::SYS_PPU_QUEUE);
+
+    CHECK(g.call("cellAudioSendAck", kFirstSource) == kNotInit);
+    REQUIRE(g.call("cellAudioInit") == 0);
+    CHECK(g.call("cellAudioSetNotifyEventQueueEx", key, 1) == kParamError); // only the top 5 bits are flags
+    REQUIRE(g.call("cellAudioSetNotifyEventQueueEx", key, kDecimate2) == 0);
+
+    // DECIMATE_2: an event every second period.
+    REQUIRE(lv2::sys_event_queue_receive(t, q, 0, 1'000'000) == 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 10; i++) REQUIRE(lv2::sys_event_queue_receive(t, q, 0, 1'000'000) == 0);
+    const double ms = ms_since(t0);
+    INFO("10 events in " << ms << " ms");
+    CHECK(ms > 15 * kPeriodMs); // about 20 periods
+    CHECK(g.call("cellAudioSendAck", g.ctx.gpr[4]) == 0);
+    CHECK(g.call("cellAudioSendAck", 0x1234) == 0); // no such source: accepted (RPCS3)
+
+    // Removal needs the flags the queue was set with.
+    CHECK(g.call("cellAudioRemoveNotifyEventQueue", key) == kTransEvent);
+    CHECK(g.call("cellAudioRemoveNotifyEventQueueEx", key, kNoMix) == kTransEvent);
+    CHECK(g.call("cellAudioRemoveNotifyEventQueueEx", key, 2) == kParamError);
+    REQUIRE(g.call("cellAudioRemoveNotifyEventQueueEx", key, kDecimate2) == 0);
+
+    // NOMIX: registered, but no events.
+    REQUIRE(g.call("cellAudioSetNotifyEventQueueEx", key, kNoMix) == 0);
+    REQUIRE(lv2::sys_event_queue_drain(t, q) == 0);
+    std::this_thread::sleep_for(30ms);
+    CHECK(queued_events(g, q) == 0);
+    REQUIRE(g.call("cellAudioQuit") == 0);
+}
+
+TEST_CASE("cellAudio: block tags and timestamps", "[hle][audio]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "audio");
+    u8* b = f.base();
+    const u64 kTagNotFound = r3_of_code(0x8031070F);
+    const u32 kTag = kData + 0x900, kStamp = kData + 0x908;
+
+    CHECK(g.call("cellAudioGetPortBlockTag", 0, 0, kTag) == kNotInit);
+    REQUIRE(g.call("cellAudioInit") == 0);
+    CHECK(g.call("cellAudioGetPortBlockTag", 0, 0, kTag) == kNotOpen);
+    CHECK(g.call("cellAudioGetPortTimestamp", 8, 0, kStamp) == kParamError);
+    const u32 port = open_ok(g, 2, 8);
+    const PortConfig c = port_config(g, port);
+
+    // Opened, not started: block n plays n periods after the port's current block.
+    REQUIRE(g.call("cellAudioGetPortBlockTag", port, 0, kTag) == 0);
+    const u64 tag0 = ps_read64(b, kTag);
+    REQUIRE(g.call("cellAudioGetPortBlockTag", port, 5, kTag) == 0);
+    CHECK(ps_read64(b, kTag) == tag0 + 5);
+    CHECK(g.call("cellAudioGetPortBlockTag", port, 8, kTag) == kParamError);
+    CHECK(g.call("cellAudioGetPortBlockTag", port, 0, 0) == 0); // a null pointer: no error (RPCS3)
+
+    // The current block's tag has a timestamp; a tag not reached yet has none; earlier tags are a period apart.
+    REQUIRE(g.call("cellAudioGetPortTimestamp", port, tag0, kStamp) == 0);
+    const u64 stamp0 = ps_read64(b, kStamp);
+    CHECK(stamp0 <= lv2::guest_system_time_us());
+    CHECK(g.call("cellAudioGetPortTimestamp", port, tag0 + 1, kStamp) == kTagNotFound);
+    if (tag0 > 0) {
+        REQUIRE(g.call("cellAudioGetPortTimestamp", port, tag0 - 1, kStamp) == 0);
+        CHECK(ps_read64(b, kStamp) == stamp0 - 5333);
+    }
+
+    // Played: the tag of the block at the read index is the port's latest period, with a later time.
+    REQUIRE(g.call("cellAudioPortStart", port) == 0);
+    std::this_thread::sleep_for(30ms);
+    REQUIRE(g.call("cellAudioPortStop", port) == 0);
+    const u64 cur = ps_read64(b, c.read_index_addr);
+    REQUIRE(g.call("cellAudioGetPortBlockTag", port, cur, kTag) == 0);
+    const u64 tag = ps_read64(b, kTag);
+    CHECK(tag > tag0);
+    REQUIRE(g.call("cellAudioGetPortTimestamp", port, tag, kStamp) == 0);
+    CHECK(ps_read64(b, kStamp) > stamp0);
+    REQUIRE(g.call("cellAudioQuit") == 0);
+}
+
+TEST_CASE("cellAudio: cellAudioAdd2chData and cellAudioAdd6chData", "[hle][audio]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "audio");
+    u8* b = f.base();
+    REQUIRE(g.call("cellAudioInit") == 0);
+    const u32 p2 = open_ok(g, 2, 2), p8 = open_ok(g, 8, 2);
+    const PortConfig c2 = port_config(g, p2), c8 = port_config(g, p8);
+    for (u32 i = 0; i < 256 * 6; i++) ps_writef32(b, kSrc + 4 * i, static_cast<f32>(i % 6 + 1)); // 1..6 per frame
+
+    // Stereo samples (here 1, 2 per frame) into a stereo port, and into an 8-channel port's front left and right.
+    g.ctx.fpr[1] = 2.0;
+    for (u32 i = 0; i < 256 * 2; i++) ps_writef32(b, kSrc + 0x4000 + 4 * i, static_cast<f32>(i % 2 + 1));
+    REQUIRE(g.call("cellAudioAdd2chData", p2, kSrc + 0x4000, 256) == 0);
+    CHECK(ps_readf32(b, c2.addr + 0) == 2.0f);
+    CHECK(ps_readf32(b, c2.addr + 4) == 4.0f);
+    CHECK(ps_readf32(b, c2.addr + 8 * 255 + 4) == 4.0f);
+    REQUIRE(g.call("cellAudioAdd2chData", p8, kSrc + 0x4000, 256) == 0);
+    CHECK(ps_readf32(b, c8.addr + 0) == 2.0f);
+    CHECK(ps_readf32(b, c8.addr + 4) == 4.0f);
+    CHECK(ps_readf32(b, c8.addr + 8) == 0.0f); // centre untouched
+    CHECK(g.call("cellAudioAdd2chData", p2, kSrc, 128) == kParamError);
+    CHECK(g.call("cellAudioAdd2chData", p2, kSrc + 1, 256) == kParamError);
+    CHECK(g.call("cellAudioAdd2chData", 8, kSrc, 256) == kParamError);
+
+    // 5.1 samples (L, C, R, SL, SR, LFE = 1..6) into an 8-channel port's L, R, C, LFE, rear L, rear R.
+    g.ctx.fpr[1] = 1.0;
+    REQUIRE(g.call("cellAudioAdd6chData", p8, kSrc) == 0);
+    const f32 expected[8] = {2.0f + 1.0f, 4.0f + 3.0f, 2.0f, 6.0f, 4.0f, 5.0f, 0.0f, 0.0f};
+    for (u32 ch = 0; ch < 8; ch++) {
+        INFO("channel " << ch);
+        CHECK(ps_readf32(b, c8.addr + 32 * 0 + 4 * ch) == expected[ch]);
+    }
+    CHECK(ps_readf32(b, c8.addr + 32 * 255 + 4 * 3) == 6.0f);
+    // A stereo port takes no 5.1 data: accepted, nothing written (RPCS3).
+    const f32 before = ps_readf32(b, c2.addr);
+    CHECK(g.call("cellAudioAdd6chData", p2, kSrc) == 0);
+    CHECK(ps_readf32(b, c2.addr) == before);
+    CHECK(g.call("cellAudioAdd6chData", p8, 0) == kParamError);
+    REQUIRE(g.call("cellAudioPortClose", p8) == 0);
+    CHECK(g.call("cellAudioAdd6chData", p8, kSrc) == kNotOpen);
+    REQUIRE(g.call("cellAudioQuit") == 0);
+}
+
+TEST_CASE("cellAudio: cellAudioSetPortLevel moves the level over 13 ms; accessories and personal devices", "[hle][audio]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "audio");
+    u8* b = f.base();
+    std::mutex mutex;
+    std::vector<f32> left; // the left channel of every block mixed
+    hle::set_audio_sink(*f.hle, [&](const f32* samples, u32 frames) {
+        std::lock_guard lock(mutex);
+        for (u32 i = 0; i < frames; i++) left.push_back(samples[2 * i]);
+    });
+
+    REQUIRE(g.call("cellAudioInit") == 0);
+    g.ctx.fpr[1] = 0.5;
+    CHECK(g.call("cellAudioSetPortLevel", 0) == kNotOpen);
+    const u32 port = open_ok(g, 2, 32);
+    const PortConfig c = port_config(g, port);
+    REQUIRE(g.call("cellAudioPortStart", port) == 0); // clears the ring: filled after
+    for (u32 i = 0; i < 32 * 256 * 2; i++) ps_writef32(b, c.addr + 4 * i, 1.0f);
+    std::this_thread::sleep_for(15ms);
+    g.ctx.fpr[1] = 0.0;
+    REQUIRE(g.call("cellAudioSetPortLevel", port) == 0);
+    std::this_thread::sleep_for(40ms); // well within the 32 filled blocks (170 ms)
+    REQUIRE(g.call("cellAudioPortStop", port) == 0);
+    {
+        std::lock_guard lock(mutex);
+        // Full volume, then down to silence through values between, never back up.
+        const auto first_full = std::find(left.begin(), left.end(), 1.0f); // silence until the port starts
+        REQUIRE(first_full != left.end());
+        const auto first_lower = std::find_if(first_full, left.end(), [](f32 v) { return v < 1.0f; });
+        REQUIRE(first_lower != left.end());
+        const auto first_zero = std::find(first_lower, left.end(), 0.0f);
+        REQUIRE(first_zero != left.end());
+        const auto steps = first_zero - first_lower;
+        INFO(steps << " samples to silence");
+        CHECK(steps >= 600);
+        CHECK(steps <= 630);
+        CHECK(std::is_sorted(first_lower, first_zero, std::greater<f32>()));
+    }
+    hle::set_audio_sink(*f.hle, {});
+    g.ctx.fpr[1] = -1.0;
+    CHECK(g.call("cellAudioSetPortLevel", port) == 0); // a negative level: ignored
+
+    g.ctx.fpr[1] = 0.5;
+    CHECK(g.call("cellAudioMiscSetAccessoryVolume", 0) == 0);
+    CHECK(g.call("cellAudioSetPersonalDevice", 0, 4) == 0);
+    CHECK(g.call("cellAudioSetPersonalDevice", 3, 0x8000) == 0); // the primary device
+    CHECK(g.call("cellAudioSetPersonalDevice", 4, 0) == kParamError);
+    CHECK(g.call("cellAudioSetPersonalDevice", 0, 5) == kParamError);
+    CHECK(g.call("cellAudioUnsetPersonalDevice", 3) == 0);
+    CHECK(g.call("cellAudioUnsetPersonalDevice", static_cast<u64>(-1)) == kParamError);
+    REQUIRE(g.call("cellAudioQuit") == 0);
+    CHECK(g.call("cellAudioMiscSetAccessoryVolume", 0) == kNotInit);
+    CHECK(g.call("cellAudioUnsetPersonalDevice", 0) == kNotInit);
 }
