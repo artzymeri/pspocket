@@ -21,6 +21,7 @@
 #include "hle_test_util.hpp"
 #include "psf.hpp" // runtime/hle/src (internal): the PARAM.SFO reader and writer
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 
 using namespace pspocket;
@@ -82,9 +83,9 @@ enum : u32 { excResult = 0, dirName = 4, sizeKB = 36, hddFreeSizeKB = 40 };
 constexpr u32 kCode = kData + 0x10000;        // the scripted callback
 constexpr u32 kReenterCode = kData + 0x10400; // a funcStat that calls cellSaveDataAutoLoad2 again
 constexpr u32 kOpdStat = kData + 0x10800, kOpdFile = kOpdStat + 8, kOpdFixed = kOpdStat + 16,
-              kOpdDone = kOpdStat + 24, kOpdReenter = kOpdStat + 32;
+              kOpdDone = kOpdStat + 24, kOpdReenter = kOpdStat + 32, kOpdList = kOpdStat + 40;
 // The descriptors' TOCs: the callback logs r2, which tells which of them the game's side ran as.
-constexpr u32 kTagStat = 0x5A7, kTagFile = 0xF11E, kTagFixed = 0xF1C5, kTagDone = 0xD0E;
+constexpr u32 kTagStat = 0x5A7, kTagFile = 0xF11E, kTagFixed = 0xF1C5, kTagDone = 0xD0E, kTagList = 0x115;
 constexpr u32 kScript = kData + 0x20000; // +0 calls so far, +4 steps; step i at +0x100 + 0x80 * i
 constexpr u32 kLog = kData + 0x30000;    // call i at +0x20 * i
 constexpr u32 kMaxSteps = 64;
@@ -144,6 +145,7 @@ void write_script_callback(u8* base)
     write_opd(base, kOpdFile, kCode, kTagFile);
     write_opd(base, kOpdFixed, kCode, kTagFixed);
     write_opd(base, kOpdDone, kCode, kTagDone);
+    write_opd(base, kOpdList, kCode, kTagList);
 }
 
 // A funcStat that calls cellSaveDataAutoLoad2 (through its import descriptor) for `dir` while its own operation runs,
@@ -428,6 +430,30 @@ TEST_CASE("cellSaveData: the functions GTA V imports, in their modules", "[hle][
         const hle::Function* fn = hle::registry().find(e.module, e.nid);
         REQUIRE(fn != nullptr);
         CHECK(fn->name == e.name);
+    }
+}
+
+TEST_CASE("cellSaveData: every function RPCS3 registers, in its module (D-183)", "[hle][savedata]")
+{
+    const char* sysutil[] = {"cellSaveDataGetEnableOverlay", "cellSaveDataEnableOverlay", "cellSaveDataDelete2",
+        "cellSaveDataDelete", "cellSaveDataUserFixedDelete", "cellSaveDataFixedDelete", "cellSaveDataUserFixedLoad",
+        "cellSaveDataUserFixedSave", "cellSaveDataFixedLoad2", "cellSaveDataFixedSave2", "cellSaveDataFixedLoad",
+        "cellSaveDataFixedSave", "cellSaveDataUserListLoad", "cellSaveDataUserListSave", "cellSaveDataListLoad2",
+        "cellSaveDataListSave2", "cellSaveDataListLoad", "cellSaveDataListSave", "cellSaveDataUserListAutoLoad",
+        "cellSaveDataUserListAutoSave", "cellSaveDataListAutoLoad", "cellSaveDataListAutoSave",
+        "cellSaveDataUserAutoLoad", "cellSaveDataUserAutoSave", "cellSaveDataAutoLoad2", "cellSaveDataAutoSave2",
+        "cellSaveDataAutoLoad", "cellSaveDataAutoSave"};
+    const char* savedata[] = {"cellSaveDataUserGetListItem", "cellSaveDataGetListItem", "cellSaveDataUserListDelete",
+        "cellSaveDataListDelete", "cellSaveDataUserFixedExport", "cellSaveDataUserFixedImport",
+        "cellSaveDataUserListExport", "cellSaveDataUserListImport", "cellSaveDataFixedExport",
+        "cellSaveDataFixedImport", "cellSaveDataListExport", "cellSaveDataListImport"};
+    for (const char* name : sysutil) {
+        INFO(name);
+        CHECK(hle::registry().find("cellSysutil", recomp::nid_of(name)) != nullptr);
+    }
+    for (const char* name : savedata) {
+        INFO(name);
+        CHECK(hle::registry().find("cellSaveData", recomp::nid_of(name)) != nullptr);
     }
 }
 
@@ -902,10 +928,12 @@ TEST_CASE("cellSaveDataFixedDelete, cellSaveDataDelete2: deleting without dialog
     CHECK(p.a.call("cellSaveDataDelete2", 0xFFFFFFFFu) == kCancel);
     CHECK(entries(savedata(root)) == std::vector<std::string>{"BLES01807-AUTOSAVE", "BLES01807-PROFILE"});
 
-    // Without OPTION_NOCONFIRM the user has to confirm: no message dialog (RPCS3 then fails the same way).
-    p.script.step(kOkNext, fixed_set(autosave, kOptionNone)).step(kOkNext);
-    CHECK(p.fixed_delete() == kInternal);
-    CHECK(p.script.tags() == std::vector<u32>{kTagFixed});
+    // Without OPTION_NOCONFIRM the user has to confirm: there is no dialog UI, so the answer is YES (D-183).
+    make_save(root, "BLES01807-EXTRA", "Extra", "X", {{"X.BIN", "x"}}, 2'000'000'500);
+    p.script.step(kOkNext, fixed_set(p.str("BLES01807-EXTRA"), kOptionNone)).step(kOkNext);
+    CHECK(p.fixed_delete() == 0);
+    CHECK(p.script.tags() == std::vector<u32>{kTagFixed, kTagDone});
+    CHECK_FALSE(fsys::exists(savedata(root) / "BLES01807-EXTRA"));
     CHECK(fsys::is_directory(savedata(root) / "BLES01807-AUTOSAVE"));
 
     // NOCONFIRM: deleted, and funcDone hears it. Its size counts every file, PARAM.SFO too, each rounded up to 1 KB
@@ -981,5 +1009,210 @@ TEST_CASE("cellSaveDataGetListItem: one save's directory, PARAM.SFO fields and s
         SaveProcess none({});
         CHECK(none.a.call("cellSaveDataGetListItem", none.str("BLES01807-PROFILE"), 0, 0, 0, 0) == kNoUser);
     }
+    fsys::remove_all(root);
+}
+
+namespace {
+
+// CellSaveDataListSet as script words, and a CellSaveDataListNewData and a fixedList in guest memory.
+constexpr u32 kNewData = kData + 0x46000, kFixedList = kData + 0x46100;
+enum : u32 { kFocusDirName = 0, kFocusHead = 1, kFocusTail = 2, kFocusLatest = 3, kFocusOldest = 4, kFocusNew = 5 };
+std::vector<u32> list_set(u32 focus, u32 focus_dir = 0, u32 fixed_num = 0, u32 fixed_list = 0, u32 new_data = 0)
+{
+    return {focus, focus_dir, fixed_num, fixed_list, new_data, 0};
+}
+
+void write_new_data(u8* base, u32 icon_position, u32 dir)
+{
+    ps_write32(base, kNewData, icon_position);
+    ps_write32(base, kNewData + 4, dir);
+    ps_write32(base, kNewData + 8, 0);
+    ps_write32(base, kNewData + 12, 0);
+}
+
+void write_fixed_list(u8* base, const std::vector<std::string_view>& names)
+{
+    std::memset(base + kFixedList, 0, 48 * names.size());
+    for (usize i = 0; i < names.size(); i++) write_bytes(base, kFixedList + 48 * static_cast<u32>(i), names[i]);
+}
+
+} // namespace
+
+TEST_CASE("cellSaveDataListLoad2, cellSaveDataListSave2: funcList's list, the save the cursor is on (D-183)",
+    "[hle][savedata]")
+{
+    const fsys::path root = temp_root("listsel");
+    make_save(root, "BLES01807-SLOT1", "One", "A", {{"S.BIN", "one"}}, 2'000'000'000);
+    make_save(root, "BLES01807-SLOT2", "Two", "B", {{"S.BIN", "two"}}, 2'000'002'000);
+    make_save(root, "BLES01807-SLOT3", "Three", "C", {{"S.BIN", "three"}}, 2'000'001'000);
+    SaveProcess p(root);
+    u8* base = p.base();
+    write_set_list(base, 0, 0, p.str("BLES01807"));
+    write_set_buf(base, 4, 4, 4 * file_stat::kSize);
+    const auto list_load = [&](u32 func_list = kOpdList) {
+        return p.a.call("cellSaveDataListLoad2", 1, kSetList, kSetBuf, func_list, kOpdStat, kOpdFile, 0xFFFFFFFFu,
+            0x77);
+    };
+    const auto list_save = [&]() {
+        return p.a.call("cellSaveDataListSave2", 1, kSetList, kSetBuf, kOpdList, kOpdStat, kOpdFile, 0xFFFFFFFFu, 0);
+    };
+    // The save funcStat is called for, after funcList set `set` (funcStat then ends the operation).
+    const auto chosen = [&](const std::vector<u32>& set, bool save = false) -> std::string {
+        p.script.clear();
+        p.script.step(kOkNext, set).step(kOkLast);
+        const u64 r = save ? list_save() : list_load();
+        if (r != 0 || p.script.calls() != 2) return "result " + std::to_string(r);
+        return guest_string(base, p.script.call(1).get + stat_get::dirName);
+    };
+
+    // funcList sees the list (dirNum, dirListNum, the userdata). Games show what it lists by naming those saves in
+    // fixedList (an empty fixedList shows none, as RPCS3's); its order is the list's, newest first here.
+    write_fixed_list(base, {"BLES01807-SLOT2", "BLES01807-SLOT3", "BLES01807-SLOT1"});
+    const auto all = [&](u32 focus, u32 focus_dir = 0) { return list_set(focus, focus_dir, 3, kFixedList); };
+    CHECK(chosen(all(kFocusHead)) == "BLES01807-SLOT2");
+    Call list = p.script.call(0);
+    CHECK(list.tag == kTagList);
+    CHECK(list.get0 == 3);
+    CHECK(list.get1 == 3);
+    CHECK(list.userdata == 0x77);
+    CHECK(p.script.call(1).tag == kTagStat);
+    CHECK(chosen(all(kFocusTail)) == "BLES01807-SLOT1");
+    CHECK(chosen(all(kFocusLatest)) == "BLES01807-SLOT2");
+    CHECK(chosen(all(kFocusOldest)) == "BLES01807-SLOT1");
+    CHECK(chosen(all(kFocusDirName, p.str("BLES01807-SLOT3"))) == "BLES01807-SLOT3");
+    CHECK(chosen(all(kFocusDirName, p.str("BLES01807-NONE"))) == "BLES01807-SLOT2"); // not shown: the first
+    CHECK(chosen(list_set(kFocusHead)) == "result 1"); // nothing shown, no new save: the user cancels
+
+    // fixedList: only the saves it names are shown.
+    write_fixed_list(base, {"BLES01807-SLOT3", "BLES01807-SLOT1"});
+    CHECK(chosen(list_set(kFocusHead, 0, 2, kFixedList)) == "BLES01807-SLOT3");
+    CHECK(chosen(list_set(kFocusDirName, p.str("BLES01807-SLOT2"), 2, kFixedList)) == "BLES01807-SLOT3");
+
+    // newData: the new save when the cursor is on it, or on nothing listed.
+    const u32 fresh = p.str("BLES01807-SLOT9");
+    write_new_data(base, 0, fresh);
+    CHECK(chosen(list_set(kFocusNew, 0, 0, 0, kNewData), true) == "BLES01807-SLOT9");
+    CHECK(ps_read32(base, p.script.call(1).get + stat_get::isNewData) == 1);
+    CHECK(chosen(list_set(kFocusHead, 0, 0, 0, kNewData), true) == "BLES01807-SLOT9"); // nothing shown
+    write_fixed_list(base, {"BLES01807-SLOT1"});
+    CHECK(chosen(list_set(kFocusHead, 0, 1, kFixedList, kNewData), true) == "BLES01807-SLOT1");
+
+    // A save made through the list.
+    write_param(base, "Title", "Sub", "Detail", "LP");
+    p.script.clear();
+    p.script.step(kOkNext, list_set(kFocusNew, 0, 0, 0, kNewData))
+        .step(kOkNext, stat_set(kParamBlock))
+        .step(kOkNext, file_set(kWrite, kNormalFile, p.str("NEW.BIN"), 0, 3, 3, p.str("new")))
+        .step(kOkLast);
+    CHECK(list_save() == 0);
+    CHECK(read_file(savedata(root) / "BLES01807-SLOT9" / "NEW.BIN") == "new");
+
+    // Nothing to pick: the user cancels. funcList's OK_LAST ends the operation with CELL_OK.
+    write_fixed_list(base, {"BLES01807-GONE"});
+    CHECK(chosen(list_set(kFocusHead, 0, 1, kFixedList)) == "result 1");
+    p.script.clear();
+    p.script.step(kOkLast);
+    CHECK(list_load() == 0);
+    CHECK(p.script.calls() == 1);
+    p.script.clear();
+    p.script.step(kErrFailure);
+    CHECK(list_load() == kCbResult);
+
+    // funcList's answer is checked (RPCS3's parameter errors 34 to 46).
+    const auto answer = [&](const std::vector<u32>& set) {
+        p.script.clear();
+        p.script.step(kOkNext, set).step(kOkLast);
+        return list_load();
+    };
+    CHECK(answer(list_set(6)) == kParam);                               // 34: focusPosition
+    CHECK(answer(list_set(kFocusNew)) == kParam);                       // 34: NEWDATA without newData
+    CHECK(answer(list_set(kFocusDirName)) == kParam);                   // 35
+    CHECK(answer(list_set(kFocusDirName, p.str("bad"))) == kParam);     // 36
+    CHECK(answer(list_set(kFocusHead, 0, 2049, kFixedList)) == kParam); // 38
+    CHECK(answer(list_set(kFocusHead, 0, 1, 0)) == kParam);             // 39
+    write_fixed_list(base, {"bad"});
+    CHECK(answer(list_set(kFocusHead, 0, 1, kFixedList)) == kParam); // 40
+    write_new_data(base, 2, fresh);
+    CHECK(answer(list_set(kFocusHead, 0, 0, 0, kNewData)) == kParam); // 43
+    write_new_data(base, 1, 0);
+    CHECK(answer(list_set(kFocusHead, 0, 0, 0, kNewData)) == kParam); // 44
+    write_new_data(base, 1, p.str("bad"));
+    CHECK(answer(list_set(kFocusHead, 0, 0, 0, kNewData)) == kParam); // 45
+    CHECK(list_load(0) == kParam);                                    // 18: no funcList
+    fsys::remove_all(root);
+}
+
+TEST_CASE("cellSaveDataFixedLoad2/FixedSave2, the user variants, list delete, import and export (D-183)",
+    "[hle][savedata]")
+{
+    const fsys::path root = temp_root("fixed");
+    make_save(root, "BLES01807-SLOT1", "One", "A", {{"S.BIN", "one"}}, 2'000'000'000);
+    SaveProcess p(root);
+    u8* base = p.base();
+    write_set_list(base, 0, 0, p.str("BLES01807"));
+    write_set_buf(base, 4, 4, 4 * file_stat::kSize);
+    const u32 slot1 = p.str("BLES01807-SLOT1");
+
+    // Fixed: funcFixed names the save; without NOCONFIRM the user confirms (YES, no dialog UI).
+    p.script.step(kOkNext, fixed_set(slot1, kOptionNone))
+        .step(kOkNext, stat_set(0))
+        .step(kOkNext, file_set(kRead, kNormalFile, p.str("S.BIN"), 0, 3, 3, kReadBuf))
+        .step(kOkLast);
+    CHECK(p.a.call("cellSaveDataFixedLoad2", 1, kSetList, kSetBuf, kOpdFixed, kOpdStat, kOpdFile, 0xFFFFFFFFu, 0) == 0);
+    CHECK(p.script.tags() == std::vector<u32>{kTagFixed, kTagStat, kTagFile, kTagFile});
+    CHECK(std::string(reinterpret_cast<const char*>(base + kReadBuf), 3) == "one");
+    write_param(base, "Title", "Sub", "Detail", "LP");
+    p.script.clear();
+    p.script.step(kOkNext, fixed_set(p.str("BLES01807-SLOT2"), kOptionNoConfirm))
+        .step(kOkNext, stat_set(kParamBlock))
+        .step(kOkNext, file_set(kWrite, kNormalFile, p.str("T.BIN"), 0, 3, 3, p.str("two")))
+        .step(kOkLast);
+    CHECK(p.a.call("cellSaveDataFixedSave", 1, kSetList, kSetBuf, kOpdFixed, kOpdStat, kOpdFile, 0xFFFFFFFFu) == 0);
+    CHECK(read_file(savedata(root) / "BLES01807-SLOT2" / "T.BIN") == "two");
+
+    // The user variants: user 1 is the current user; a user with no directory is NOUSER; past the maximum, PARAM.
+    p.script.clear();
+    p.script.step(kOkLast);
+    CHECK(p.a.call("cellSaveDataUserAutoLoad", 1, 1, slot1, 0, kSetBuf, kOpdStat, kOpdFile, 0xFFFFFFFFu, 0) == 0);
+    CHECK(p.script.calls() == 1);
+    CHECK(guest_string(base, p.script.call(0).get + stat_get::dirName) == "BLES01807-SLOT1");
+    CHECK(p.a.call("cellSaveDataUserAutoLoad", 1, 2, slot1, 0, kSetBuf, kOpdStat, kOpdFile, 0xFFFFFFFFu, 0) ==
+        kNoUser);
+    CHECK(p.a.call("cellSaveDataUserAutoLoad", 1, 100000000, slot1, 0, kSetBuf, kOpdStat, kOpdFile, 0xFFFFFFFFu, 0) ==
+        kParam);
+    p.script.clear();
+    p.script.step(kOkNext, fixed_set(slot1, kOptionNoConfirm)).step(kOkLast);
+    CHECK(p.a.call("cellSaveDataUserFixedLoad", 1, 1, kSetList, kSetBuf, kOpdFixed, kOpdStat, kOpdFile, 0xFFFFFFFFu,
+              0) == 0);
+    CHECK(p.script.tags() == std::vector<u32>{kTagFixed, kTagStat});
+    constexpr u32 kSizeOut = kData + 0x45100;
+    CHECK(p.a.call("cellSaveDataUserGetListItem", 1, slot1, 0, 0, 0, kSizeOut) == 0);
+    CHECK(p.a.call("cellSaveDataUserGetListItem", 3, slot1, 0, 0, 0, kSizeOut) == kNoUser);
+
+    // The list delete is left at once: nothing deleted. '*' lists the game's saves there.
+    write_set_list(base, 0, 0, p.str("*"));
+    write_set_buf(base, 4, 0, 4 * 48);
+    p.script.clear();
+    p.script.step(kOkNext, list_set(kFocusHead));
+    CHECK(p.a.call("cellSaveDataListDelete", kSetList, kSetBuf, kOpdList, kOpdDone, 0xFFFFFFFFu, 0) == kCancel);
+    CHECK(p.script.tags() == std::vector<u32>{kTagList});
+    CHECK(p.script.call(0).get0 == 2);
+    CHECK(entries(savedata(root)) == std::vector<std::string>{"BLES01807-SLOT1", "BLES01807-SLOT2"});
+    CHECK(p.a.call("cellSaveDataDelete", 0xFFFFFFFFu) == kCancel);
+
+    // Import and export: RPCS3's checks, then CELL_OK; funcDone is not called.
+    write_set_list(base, 0, 0, p.str("BLES01807"));
+    p.script.clear();
+    CHECK(p.a.call("cellSaveDataListImport", kSetList, 1024, kOpdDone, 0xFFFFFFFFu, 0) == 0);
+    CHECK(p.a.call("cellSaveDataListExport", kSetList, 1024, 0, 0xFFFFFFFFu, 0) == kParam); // 137: no funcDone
+    CHECK(p.a.call("cellSaveDataFixedExport", slot1, 1024, kOpdDone, 0xFFFFFFFFu, 0) == 0);
+    CHECK(p.a.call("cellSaveDataFixedImport", p.str("bad"), 1024, kOpdDone, 0xFFFFFFFFu, 0) == kParam);
+    CHECK(p.a.call("cellSaveDataUserFixedImport", 1, slot1, 1024, kOpdDone, 0xFFFFFFFFu, 0) == 0);
+    CHECK(p.a.call("cellSaveDataUserListExport", 100000000, kSetList, 1024, kOpdDone, 0xFFFFFFFFu, 0) == kParam);
+    CHECK(p.script.calls() == 0);
+
+    // The overlay switch.
+    p.a.call("cellSaveDataEnableOverlay", 1);
+    CHECK(p.a.call("cellSaveDataGetEnableOverlay") == 0);
     fsys::remove_all(root);
 }

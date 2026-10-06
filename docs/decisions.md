@@ -3536,6 +3536,54 @@ Tests (tests/hle/test_hle.cpp):
 - stub calls are counted apart from the gaps;
 - an implemented function is linked to its implementation, not to its stub.
 
+## D-183 · 2026-10-06 · The sysutil family as RPCS3 has it, and dialogs answered as their cursor starts
+
+The first of the two HLE batches that stopped at a usage limit (status.md). Sysutil and everything built on it is
+always native (D-175), so a function missing there fails the game outright.
+
+**cellSaveData: every function RPCS3 registers (40)**
+
+The new functions sit on the existing savedata_op:
+
+- **The variants:** List{Save,Load}[2], Fixed{Save,Load}[2], Auto{Save,Load} and ListAutoSave.
+- **The cellSaveDataUser\* variants.** Each takes a user ID:
+  - 0 is the current user (00000001).
+  - Another user's /dev_hdd0/home/NNNNNNNN/savedata must exist, else CELL_SAVEDATA_ERROR_NOUSER.
+  - Above 99999999 is parameter error 91.
+- **The rest:** ListDelete, Delete, UserGetListItem, Enable/GetEnableOverlay, and the import and export functions.
+  For the last, RPCS3 checks the arguments (error 137), then returns CELL_OK without doing anything; so does pspocket.
+- **The list step, as RPCS3's:**
+  - funcList sees the list.
+  - Its listSet is checked (parameter errors 34 to 46).
+  - Its fixedList filters what is shown; an empty one shows nothing, as RPCS3's (games copy the listing into it).
+  - newData offers a new save.
+  - focusPosition puts the cursor: DIRNAME, HEAD, TAIL, LATEST, OLDEST or NEWDATA.
+- **ListDelete's '\*' prefix** lists the game's own saves, as RPCS3.
+
+**No dialog UI: the user answers as the cursor starts.** cellMsgDialogOpen2's dialogs are already answered at once
+with their default button (show_msg_dialog). Save data's own dialogs now follow the same rule:
+
+- **The YES/NO confirmations** of the fixed variants (CELL_SAVEDATA_OPTION_NONE) and of a list choice are answered YES.
+  Before, they failed with CELL_SAVEDATA_ERROR_INTERNAL, as RPCS3 does when it cannot open a dialog. A game that saves
+  with OPTION_NONE could not save at all.
+- **The save list.** The user picks the save funcList focused. Failing that, the new save when there is one, else the
+  first save shown. With nothing to pick, CELL_CANCEL.
+- **The delete lists** (Delete, Delete2, ListDelete) are left at once: CELL_CANCEL, nothing deleted. Accepting one
+  would delete the saves one by one with nobody choosing.
+
+Every such answer is logged as a warning. A dialog UI (the app) replaces these answers with the user's own.
+
+Tests (tests/hle/test_savedata.cpp):
+
+- every registered function is in its module;
+- the list step: each focus position, fixedList, newData, a new save made through the list, cancel, funcList's
+  OK_LAST and errors, and parameter errors 18 and 34 to 45;
+- the fixed load and save with the YES confirmation;
+- the user variants: user 1, NOUSER, error 91, the list item;
+- ListDelete with '\*' and Delete leave the saves;
+- import and export: CELL_OK, error 137 and a bad name, with funcDone never called;
+- the overlay switch.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

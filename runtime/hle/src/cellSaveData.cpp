@@ -3,8 +3,9 @@
 // select_and_delete), cellSysutil.cpp (sysutil_check_name_string), cellMsgDialog.cpp (open_msg_dialog),
 // cellUserInfo.h, Loader/PSF.cpp (psf::load's category check), Utilities/File.cpp (fs::get_stat's times).
 //
-// Implemented: what GTA V imports. From cellSysutil: cellSaveDataAutoLoad2, cellSaveDataAutoSave2,
-// cellSaveDataListAutoLoad, cellSaveDataDelete2, cellSaveDataFixedDelete; from cellSaveData: cellSaveDataGetListItem.
+// Implemented: every function RPCS3 registers (D-183): the auto, list-auto, list and fixed variants, with and without
+// a user ID, the deletes, the list item, the overlay switch, and the import and export functions (RPCS3: argument
+// checks only, then CELL_OK).
 //
 // Layout, as RPCS3's: the current user's saves are the directories /dev_hdd0/home/00000001/savedata/<dir name>/. Each
 // holds PARAM.SFO (category SD, TITLE, SUB_TITLE, DETAIL, SAVEDATA_LIST_PARAM, SAVEDATA_DIRECTORY, ATTRIBUTE,
@@ -20,11 +21,13 @@
 // one becomes .backup_<dir>, the new one takes its place and the backup goes, so a save interrupted at any point
 // leaves the old save or the new one.
 //
-// No dialogs exist yet. The auto and list-auto variants need none. cellSaveDataDelete2 shows the system's list of the
-// game's saves to delete from: without one it returns CELL_CANCEL, as RPCS3 does without a save dialog.
-// cellSaveDataFixedDelete asks the user to confirm unless the game passes CELL_SAVEDATA_OPTION_NOCONFIRM: without a
-// message dialog that is CELL_SAVEDATA_ERROR_INTERNAL, as in RPCS3 when open_msg_dialog can't open one. Errors the PS3
-// would show in an error dialog (errDialog) are logged.
+// There is no dialog UI (D-183). Where the PS3 asks the user, the answer is what its cursor starts on, as
+// show_msg_dialog answers cellMsgDialog's dialogs (cellSysutil.cpp):
+// - a YES/NO confirmation (the fixed variants with CELL_SAVEDATA_OPTION_NONE, a list choice) is answered YES;
+// - the list variants' save list: the user picks the save funcList focused, else the new save when funcList offers
+//   one, else the first save listed; with nothing to pick, CELL_CANCEL (RPCS3 without a save dialog);
+// - the delete lists (cellSaveDataDelete2, cellSaveDataListDelete) are left at once: CELL_CANCEL, nothing deleted.
+// Errors the PS3 would show in an error dialog (errDialog) are logged.
 //
 // Deviations from RPCS3:
 // - RPCS3's sleeps, which imitate the PS3's slow save data calls, are left out (as cellGame's, D-044), except the
@@ -56,6 +59,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -154,7 +158,7 @@ enum : u32 {
     CELL_SAVEDATA_OPTION_NOCONFIRM = 1,
 };
 
-// RPCS3's operations (savedata_op). The import and export ones (9 to 12) belong to functions GTA V doesn't import.
+// RPCS3's operations (savedata_op).
 enum : u32 {
     SAVEDATA_OP_AUTO_SAVE = 0,
     SAVEDATA_OP_AUTO_LOAD = 1,
@@ -164,8 +168,25 @@ enum : u32 {
     SAVEDATA_OP_LIST_LOAD = 5,
     SAVEDATA_OP_FIXED_SAVE = 6,
     SAVEDATA_OP_FIXED_LOAD = 7,
+    SAVEDATA_OP_LIST_IMPORT = 9,
+    SAVEDATA_OP_LIST_EXPORT = 10,
+    SAVEDATA_OP_FIXED_IMPORT = 11,
+    SAVEDATA_OP_FIXED_EXPORT = 12,
     SAVEDATA_OP_LIST_DELETE = 13,
     SAVEDATA_OP_FIXED_DELETE = 14,
+};
+
+enum : u32 {
+    CELL_SAVEDATA_LISTITEM_MAX = 2048,
+    CELL_SAVEDATA_FOCUSPOS_DIRNAME = 0,
+    CELL_SAVEDATA_FOCUSPOS_LISTHEAD = 1,
+    CELL_SAVEDATA_FOCUSPOS_LISTTAIL = 2,
+    CELL_SAVEDATA_FOCUSPOS_LATEST = 3,
+    CELL_SAVEDATA_FOCUSPOS_OLDEST = 4,
+    CELL_SAVEDATA_FOCUSPOS_NEWDATA = 5,
+    CELL_SAVEDATA_ICONPOS_HEAD = 0,
+    CELL_SAVEDATA_ICONPOS_TAIL = 1,
+    CELL_SYSUTIL_USERID_MAX = 99999999, // cellUserInfo.h
 };
 
 // RPCS3 reports 40 GB free less 256 KB (see its cellHddGameCheck), and 35 KB for PARAM.SFO and PARAM.PFD.
@@ -182,6 +203,12 @@ enum : u32 { dirListMax = 0, fileListMax = 4, reserved = 8, kReservedWords = 6, 
 }
 namespace dir_list { // CellSaveDataDirList
 enum : u32 { dirName = 0, listParam = 32, kSize = 48 };
+}
+namespace list_set { // CellSaveDataListSet
+enum : u32 { focusPosition = 0, focusDirName = 4, fixedListNum = 8, fixedList = 12, newData = 16, reserved = 20 };
+}
+namespace new_data { // CellSaveDataListNewData
+enum : u32 { iconPosition = 0, dirName = 4, icon = 8, reserved = 12, kSize = 16 };
 }
 namespace list_get { // CellSaveDataListGet
 enum : u32 { dirNum = 0, dirListNum = 4, dirList = 8 };
@@ -276,6 +303,7 @@ struct SaveDataState {
     // than a mutex, because a callback may call back into save data on the same thread.
     std::atomic<bool> busy{false};
     std::atomic<s32> last_cbresult_error_dialog{0}; // for CELL_SAVEDATA_ERRDIALOG_NOREPEAT
+    std::atomic<bool> enable_overlay{false};        // cellSaveDataEnableOverlay (no overlay exists to use it)
     u32 context = 0; // allocated by the first operation; only the busy holder touches it
 };
 
@@ -570,17 +598,26 @@ void set_host_times(const std::string& path, s64 atime, s64 mtime)
     if (::utimes(path.c_str(), times) != 0) PS_LOG_WARN(kChan, "cannot restore the times of {}", path);
 }
 
-// The current user's save data directory on the host, with a trailing '/': /dev_hdd0/home/00000001/savedata/ (RPCS3:
-// user 0 is the current user, 00000001). RPCS3 creates it when it boots a game; here the first save data call does.
+// A user's save data directory on the host, with a trailing '/': /dev_hdd0/home/<user, 8 digits>/savedata/ (RPCS3:
+// user 0 is the current user, 00000001). RPCS3 creates the current user's when it boots a game; here the first save
+// data call does. Another user's must exist (RPCS3: CELL_SAVEDATA_ERROR_NOUSER), and *no_user says when it doesn't.
 // Empty (logged) when /dev_hdd0 is not mounted on a host directory.
-std::string savedata_dir(lv2::Kernel& kernel)
+std::string savedata_dir(lv2::Kernel& kernel, u32 user_id = 0, bool* no_user = nullptr)
 {
-    const std::string host = kernel.vfs_host_path("/dev_hdd0/home/00000001/savedata");
+    const std::string host = kernel.vfs_host_path(std::format("/dev_hdd0/home/{:08}/savedata", user_id ? user_id : 1));
     if (host.empty()) {
         PS_LOG_ERROR(kChan, "/dev_hdd0 is not mounted on a host directory: there is no place for save data");
         return {};
     }
     std::error_code ec;
+    if (user_id) {
+        if (!fs::is_directory(host, ec)) {
+            PS_LOG_WARN(kChan, "user {:08} has no save data directory ({}): CELL_SAVEDATA_ERROR_NOUSER", user_id, host);
+            if (no_user) *no_user = true;
+            return {};
+        }
+        return host + "/";
+    }
     fs::create_directories(host, ec);
     if (ec) {
         PS_LOG_ERROR(kChan, "cannot create {} ({})", host, ec.message());
@@ -671,17 +708,17 @@ struct OpArgs {
     u32 err_dialog = 0;
     u32 set_list = 0;
     u32 set_buf = 0;
-    u32 func_list = 0; // the list dialog variants (none implemented): always 0 here
+    u32 func_list = 0; // the list variants: the game's list callback, before the user picks a save
     u32 func_fixed = 0;
     u32 func_stat = 0;
     u32 func_file = 0;
     u32 unk_op_flags = 0;
     u32 userdata = 0;
+    u32 user_id = 0; // the cellSaveDataUser* variants; 0 is the current user
     u32 func_done = 0;
 };
 
-// RPCS3 savedata_check_args: 0, or the parameter error number. User IDs are always the current user's (no
-// cellSaveDataUser* function is implemented), so RPCS3's user ID check (91) can't fail.
+// RPCS3 savedata_check_args: 0, or the parameter error number.
 u32 savedata_check_args(lv2::PpuThread& t, const OpArgs& a)
 {
     u8* base = t.kernel.base();
@@ -690,7 +727,7 @@ u32 savedata_check_args(lv2::PpuThread& t, const OpArgs& a)
     if (a.version > CELL_SAVEDATA_VERSION_420) return 1;
     if (a.err_dialog > CELL_SAVEDATA_ERRDIALOG_NOREPEAT) return 5;
 
-    if (op <= SAVEDATA_OP_AUTO_LOAD) {
+    if (op <= SAVEDATA_OP_AUTO_LOAD || op == SAVEDATA_OP_FIXED_IMPORT || op == SAVEDATA_OP_FIXED_EXPORT) {
         if (!a.dir_name) return 2;
         const GuestString dir = read_cstr(t, a.dir_name, CELL_SAVEDATA_DIRNAME_SIZE + 1);
         if (dir.faulted) {
@@ -706,7 +743,7 @@ u32 savedata_check_args(lv2::PpuThread& t, const OpArgs& a)
 
     const bool listed = (op >= SAVEDATA_OP_LIST_AUTO_SAVE && op <= SAVEDATA_OP_FIXED_LOAD) ||
         op == SAVEDATA_OP_LIST_DELETE || op == SAVEDATA_OP_FIXED_DELETE;
-    if (listed) {
+    if (listed || op == SAVEDATA_OP_LIST_IMPORT || op == SAVEDATA_OP_LIST_EXPORT) {
         if (!a.set_list || !struct_ok(t, a.set_list, set_list::kSize, "setList")) return 11;
         if (ps_read32(base, a.set_list + set_list::sortType) > CELL_SAVEDATA_SORTTYPE_SUBTITLE) return 12;
         if (ps_read32(base, a.set_list + set_list::sortOrder) > CELL_SAVEDATA_SORTORDER_ASCENT) return 13;
@@ -740,6 +777,11 @@ u32 savedata_check_args(lv2::PpuThread& t, const OpArgs& a)
         if (ps_read32(base, a.set_list + set_list::reserved)) return 14;
     }
 
+    if (op >= SAVEDATA_OP_LIST_IMPORT && op <= SAVEDATA_OP_FIXED_EXPORT) {
+        // Nothing more is checked for the import and export functions.
+        return !a.func_done || a.user_id > CELL_SYSUTIL_USERID_MAX ? 137 : 0;
+    }
+
     if (!a.set_buf || !struct_ok(t, a.set_buf, set_buf::kSize, "setBuf")) return 74;
     const u64 dir_list_max = ps_read32(base, a.set_buf + set_buf::dirListMax);
     const u64 file_list_max = ps_read32(base, a.set_buf + set_buf::fileListMax);
@@ -770,6 +812,7 @@ u32 savedata_check_args(lv2::PpuThread& t, const OpArgs& a)
         if (!a.func_stat) return 20;
         if (!(a.unk_op_flags & 0x2) && !a.func_file) return 18;
     }
+    if (a.user_id > CELL_SYSUTIL_USERID_MAX) return 91;
     return 0;
 }
 
@@ -818,10 +861,11 @@ s32 call_callback(PPUContext& ctx, u32 func, u32 result, u32 get, std::optional<
 
 // The guest addresses of the context's structures.
 struct Context {
-    u32 result, listGet, fixedSet, statGet, statSet, fileGet, fileSet, doneGet;
+    u32 result, listGet, listSet, fixedSet, statGet, statSet, fileGet, fileSet, doneGet;
 
     explicit Context(u32 c)
-        : result(c + context::result), listGet(c + context::listGet), fixedSet(c + context::fixedSet),
+        : result(c + context::result), listGet(c + context::listGet), listSet(c + context::listSet),
+          fixedSet(c + context::fixedSet),
           statGet(c + context::statGet), statSet(c + context::statSet), fileGet(c + context::fileGet),
           fileSet(c + context::fileSet), doneGet(c + context::doneGet)
     {
@@ -927,7 +971,152 @@ std::string_view file_op_name(u32 op)
     return "?";
 }
 
-// RPCS3 savedata_op, without its list dialog (funcList: no function GTA V imports has one).
+// What the user would answer in the PS3's YES/NO confirmation of a save data operation (RPCS3: a blocking message
+// dialog, YES as its default cursor). There is no dialog UI, so it is answered YES at once, as show_msg_dialog
+// answers a dialog with its default button (cellSysutil.cpp).
+void confirm(std::string_view what)
+{
+    PS_LOG_WARN(kChan, "  the PS3 asks the user to confirm {}; there is no dialog UI, so the answer is YES", what);
+}
+
+// RPCS3 savedata_op's list step (cellSaveDataList{Save,Load}*, cellSaveDataListDelete): funcList sees the saves
+// (listGet) and says which the PS3 shows (listSet: fixedList, newData, focusPosition); then the user picks one, or the
+// new save, and confirms. There is no save data dialog here, so the user takes what the game put the cursor on: the
+// focused save, else the new save when there is one, else the first save listed; with nothing to pick the user
+// cancels (CELL_CANCEL, as RPCS3 without a save dialog). The PS3's delete list would let the user delete saves one by
+// one until they leave it: the user leaves it at once (CELL_CANCEL), as cellSaveDataDelete2 does. A result means the
+// operation ends with it; otherwise `selected` is the chosen entry (-1: the new save, named `new_dir`).
+std::optional<s32> list_step(PPUContext& ctx, const OpArgs& a, const Context& c, std::vector<SaveEntry>& entries,
+    s32& selected, std::string& new_dir)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 sdk = t.kernel.config().sdk_version;
+    ps_write32(base, c.listSet + list_set::focusPosition, CELL_SAVEDATA_FOCUSPOS_LISTHEAD);
+    if (const s32 res = call_callback(ctx, a.func_list, c.result, c.listGet, c.listSet);
+        res != CELL_SAVEDATA_CBRESULT_OK_NEXT) {
+        // OK_LAST (or NOCONFIRM): the game wanted no list after all, typically at launch.
+        if (res == CELL_SAVEDATA_CBRESULT_OK_LAST || res == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM) {
+            PS_LOG_INFO(kChan, "  funcList returned {}", cbresult_name(res));
+            return lv2::CELL_OK;
+        }
+        return callback_error(t, c.result, a.err_dialog, "funcList");
+    }
+
+    // The saves to show: those fixedList names (none when it is empty).
+    const u32 fixed_num = ps_read32(base, c.listSet + list_set::fixedListNum);
+    const u32 fixed_list = ps_read32(base, c.listSet + list_set::fixedList);
+    if (fixed_num > CELL_SAVEDATA_LISTITEM_MAX) return param_error(38, std::format("(fixedListNum={})", fixed_num));
+    if (fixed_num && !fixed_list) return param_error(39);
+    if (fixed_num && !struct_ok(t, fixed_list, u64{fixed_num} * dir_list::kSize, "listSet->fixedList"))
+        return param_refused("listSet->fixedList");
+    std::set<std::string, std::less<>> shown;
+    for (u32 i = 0; i < fixed_num; i++) {
+        const u32 at = fixed_list + i * dir_list::kSize + dir_list::dirName;
+        switch (check_name_string(read_chars(base, at, CELL_SAVEDATA_DIRNAME_SIZE + 1), 1, CELL_SAVEDATA_DIRNAME_SIZE,
+            sdk)) {
+        case -1: return param_error(40);
+        case -2:
+            if (ps_read8(base, at)) return param_error(41);
+            break;
+        default: break;
+        }
+        shown.insert(read_chars(base, at, CELL_SAVEDATA_DIRNAME_SIZE));
+    }
+    std::erase_if(entries, [&](const SaveEntry& e) { return !shown.contains(e.dir_name); });
+
+    const u32 new_data = ps_read32(base, c.listSet + list_set::newData);
+    u32 icon_position = CELL_SAVEDATA_ICONPOS_HEAD;
+    if (new_data) {
+        if (!struct_ok(t, new_data, new_data::kSize, "listSet->newData")) return param_refused("listSet->newData");
+        icon_position = ps_read32(base, new_data + new_data::iconPosition);
+        if (icon_position > CELL_SAVEDATA_ICONPOS_TAIL)
+            return param_error(43, std::format("(iconPosition={:#x})", icon_position));
+        const u32 dir = ps_read32(base, new_data + new_data::dirName);
+        if (!dir) return param_error(44);
+        const GuestString name = read_cstr(t, dir, CELL_SAVEDATA_DIRNAME_SIZE + 1);
+        if (name.faulted) return param_refused("listSet->newData->dirName is outside committed guest memory");
+        switch (check_name_string(name.text, 1, CELL_SAVEDATA_DIRNAME_SIZE, sdk)) {
+        case -1: return param_error(45);
+        case -2:
+            if (!name.text.empty()) return param_error(46);
+            break;
+        default: break;
+        }
+        new_dir = name.text;
+    }
+
+    s32 focused = -1;
+    bool focus_new = false;
+    switch (const u32 pos = ps_read32(base, c.listSet + list_set::focusPosition)) {
+    case CELL_SAVEDATA_FOCUSPOS_DIRNAME: {
+        const u32 dir = ps_read32(base, c.listSet + list_set::focusDirName);
+        if (!dir) return param_error(35);
+        const GuestString name = read_cstr(t, dir, CELL_SAVEDATA_DIRNAME_SIZE + 1);
+        if (name.faulted) return param_refused("listSet->focusDirName is outside committed guest memory");
+        switch (check_name_string(name.text, 1, CELL_SAVEDATA_DIRNAME_SIZE, sdk)) {
+        case -1: return param_error(36);
+        case -2:
+            if (!name.text.empty()) return param_error(37);
+            break;
+        default: break;
+        }
+        for (usize i = 0; i < entries.size(); i++) {
+            if (entries[i].dir_name == name.text) {
+                focused = static_cast<s32>(i);
+                break;
+            }
+        }
+        break;
+    }
+    case CELL_SAVEDATA_FOCUSPOS_LISTHEAD: focused = entries.empty() ? -1 : 0; break;
+    case CELL_SAVEDATA_FOCUSPOS_LISTTAIL: focused = static_cast<s32>(entries.size()) - 1; break;
+    case CELL_SAVEDATA_FOCUSPOS_LATEST:
+    case CELL_SAVEDATA_FOCUSPOS_OLDEST: {
+        const bool latest = pos == CELL_SAVEDATA_FOCUSPOS_LATEST;
+        for (usize i = 0; i < entries.size(); i++) {
+            if (focused < 0 || (latest ? entries[i].mtime > entries[static_cast<usize>(focused)].mtime
+                                       : entries[i].mtime < entries[static_cast<usize>(focused)].mtime)) {
+                focused = static_cast<s32>(i);
+            }
+        }
+        break;
+    }
+    case CELL_SAVEDATA_FOCUSPOS_NEWDATA:
+        if (!new_data) return param_error(34, "(focusPosition NEWDATA without newData)");
+        focus_new = true;
+        break;
+    default: return param_error(34, std::format("(focusPosition={:#x})", pos));
+    }
+
+    PS_LOG_INFO(kChan, "  funcList shows {} save(s){}; the cursor is on {}", entries.size(),
+        new_data ? std::format(" and the new save \"{}\" at the {}", new_dir,
+                       icon_position == CELL_SAVEDATA_ICONPOS_TAIL ? "tail" : "head")
+                 : std::string(),
+        focus_new ? "the new save"
+            : focused >= 0 ? std::format("\"{}\"", entries[static_cast<usize>(focused)].dir_name)
+                           : std::string("nothing"));
+    if (a.operation == SAVEDATA_OP_LIST_DELETE) {
+        PS_LOG_WARN(kChan, "  the PS3 would let the user delete saves from this list; there is no save data dialog, so "
+                           "the user leaves it");
+        return lv2::CELL_CANCEL;
+    }
+    if (!focus_new && focused >= 0 && focused < static_cast<s32>(entries.size())) selected = focused;
+    else if (new_data) selected = -1;
+    else if (!entries.empty()) selected = 0;
+    else {
+        PS_LOG_WARN(kChan, "  there is nothing to pick: the user cancels");
+        return lv2::CELL_CANCEL;
+    }
+    PS_LOG_WARN(kChan, "  no save data dialog: the user picks {}",
+        selected < 0 ? std::format("the new save \"{}\"", new_dir)
+                     : std::format("\"{}\"", entries[static_cast<usize>(selected)].dir_name));
+    confirm(selected < 0 ? std::string("saving a new save")
+                         : std::format("\"{}\"", entries[static_cast<usize>(selected)].dir_name));
+    return std::nullopt;
+}
+
+// RPCS3 savedata_op.
 s32 savedata_op(PPUContext& ctx, const OpArgs& a)
 {
     lv2::PpuThread& t = thread_of(ctx);
@@ -948,7 +1137,9 @@ s32 savedata_op(PPUContext& ctx, const OpArgs& a)
     std::memset(base + s.context, 0, context::kSize);
     const Context c(s.context);
 
-    const std::string base_dir = savedata_dir(t.kernel);
+    bool no_user = false;
+    const std::string base_dir = savedata_dir(t.kernel, a.user_id, &no_user);
+    if (no_user) return error(CELL_SAVEDATA_ERROR_NOUSER);
     if (base_dir.empty()) return error(CELL_SAVEDATA_ERROR_ACCESS_ERROR);
 
     const u32 buf = ps_read32(base, a.set_buf + set_buf::buf);
@@ -967,8 +1158,14 @@ s32 savedata_op(PPUContext& ctx, const OpArgs& a)
         const std::string prefixes =
             read_cstr(t, ps_read32(base, a.set_list + set_list::dirNamePrefix), CELL_SAVEDATA_PREFIX_SIZE).text;
         std::vector<std::string> prefix_list = split(prefixes, '|', true);
-        // An empty prefix lists every save for these (and, with RPCS3's '*', for LIST_DELETE: not implemented).
+        // An empty prefix lists every save for these.
         if (prefix_list.empty() && (op == SAVEDATA_OP_LIST_LOAD || op == SAVEDATA_OP_FIXED_LOAD)) prefix_list = {""};
+        // '*' lists every save of the game for LIST_DELETE (RPCS3: its title ID as the prefix, to be cautious).
+        if (op == SAVEDATA_OP_LIST_DELETE && prefix_list.size() == 1 && prefix_list.front() == "*") {
+            std::string title = s.process.config().game.title_id;
+            if (title.empty()) title = t.kernel.config().title_id;
+            prefix_list.front() = title;
+        }
 
         // The saves matching the prefixes: all are counted (dirNum), the first dirListMax are listed (dirListNum,
         // which counts directories without a valid PARAM.SFO too, as RPCS3's does).
@@ -1025,6 +1222,11 @@ s32 savedata_op(PPUContext& ctx, const OpArgs& a)
         PS_LOG_INFO(kChan, "  {} save(s) match \"{}\", {} listed", dir_num, prefixes, save_entries.size());
 
         s32 selected = -1;
+        if (a.func_list) {
+            std::string new_dir;
+            if (const std::optional<s32> r = list_step(ctx, a, c, save_entries, selected, new_dir)) return *r;
+            if (selected == -1) save_entry.dir_name = new_dir;
+        }
         if (a.func_fixed) {
             const s32 res = call_callback(ctx, a.func_fixed, c.result, c.listGet, c.fixedSet);
             if (res != CELL_SAVEDATA_CBRESULT_OK_NEXT) {
@@ -1054,11 +1256,9 @@ s32 savedata_op(PPUContext& ctx, const OpArgs& a)
                 option);
             switch (option) {
             case CELL_SAVEDATA_OPTION_NONE:
-                // The fixed variants ask the user to confirm (RPCS3 open_msg_dialog). Without a message dialog that
-                // fails, and RPCS3 returns CELL_SAVEDATA_ERROR_INTERNAL.
+                // The fixed variants ask the user to confirm (RPCS3 open_msg_dialog, YES/NO).
                 if (op == SAVEDATA_OP_FIXED_SAVE || op == SAVEDATA_OP_FIXED_LOAD || op == SAVEDATA_OP_FIXED_DELETE) {
-                    PS_LOG_ERROR(kChan, "  the user must confirm \"{}\", but there is no message dialog", dir_str);
-                    return error(CELL_SAVEDATA_ERROR_INTERNAL);
+                    confirm(std::format("{} \"{}\"", op == SAVEDATA_OP_FIXED_DELETE ? "deleting" : "using", dir_str));
                 }
                 break;
             case CELL_SAVEDATA_OPTION_NOCONFIRM: break;
@@ -1434,96 +1634,362 @@ s32 savedata_op(PPUContext& ctx, const OpArgs& a)
 
 // ---- functions ----
 
-// cellSaveDataAutoSave2 / cellSaveDataAutoLoad2: the save named dirName, no list, no dialog (errDialog chooses whether
-// callback errors show one).
-s32 auto_op(PPUContext& ctx, std::string_view fn, u32 operation, u32 version, u32 dir_name, u32 err_dialog,
-    u32 set_buf, u32 func_stat, u32 func_file, u32 container, u32 userdata)
+// Logs the call and runs the operation (every savedata_op variant: the arguments it doesn't take are 0).
+s32 run_op(PPUContext& ctx, std::string_view fn, const OpArgs& a, u32 container)
 {
     lv2::PpuThread& t = thread_of(ctx);
     PS_LOG_INFO(kChan,
-        "{}(version {}, dirName {}, errDialog {}, setBuf {:#x}, funcStat {:#x}, funcFile {:#x}, container {:#x}, "
-        "userdata {:#x})",
-        fn, version, describe(t, dir_name, CELL_SAVEDATA_DIRNAME_SIZE + 1), err_dialog, set_buf, func_stat, func_file,
-        container, userdata);
+        "{}(version {}, userId {}, dirName {}, errDialog {}, setList {:#x}, setBuf {:#x}, funcList {:#x}, funcFixed "
+        "{:#x}, funcStat {:#x}, funcFile {:#x}, funcDone {:#x}, container {:#x}, userdata {:#x})",
+        fn, a.version, a.user_id, describe(t, a.dir_name, CELL_SAVEDATA_DIRNAME_SIZE + 1), a.err_dialog, a.set_list,
+        a.set_buf, a.func_list, a.func_fixed, a.func_stat, a.func_file, a.func_done, container, a.userdata);
+    return finish(fn, savedata_op(ctx, a));
+}
+
+// RPCS3's flags (unk_op_flags) for the plain variants, the cellSaveDataUser* ones and the list delete.
+constexpr u32 kOpFlags = 2, kUserOpFlags = 6, kDeleteOpFlags = 0x40, kImportOpFlags = 0x44;
+
+// cellSaveData{Auto,UserAuto}{Save,Load}[2]: the save named dirName, no list, no dialog (errDialog chooses whether
+// callback errors show one).
+s32 auto_op(PPUContext& ctx, std::string_view fn, u32 operation, u32 version, u32 user_id, u32 dir_name,
+    u32 err_dialog, u32 set_buf, u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
     OpArgs a;
     a.operation = operation;
     a.version = version;
+    a.user_id = user_id;
     a.dir_name = dir_name;
     a.err_dialog = err_dialog;
     a.set_buf = set_buf;
     a.func_stat = func_stat;
     a.func_file = func_file;
-    a.unk_op_flags = 2;
+    a.unk_op_flags = user_id ? kUserOpFlags : kOpFlags;
     a.userdata = userdata;
-    return finish(fn, savedata_op(ctx, a));
+    return run_op(ctx, fn, a, container);
+}
+
+// The listed variants: List (funcList, then the user's choice), Fixed (funcFixed names the save) and ListAuto
+// (funcFixed, no dialog). The List and Fixed ones show callback errors in a dialog, their User ones never.
+s32 listed_op(PPUContext& ctx, std::string_view fn, u32 operation, u32 version, u32 user_id, bool user, u32 err_dialog,
+    u32 set_list, u32 set_buf, u32 func_list, u32 func_fixed, u32 func_stat, u32 func_file, u32 container,
+    u32 userdata)
+{
+    OpArgs a;
+    a.operation = operation;
+    a.version = version;
+    a.user_id = user_id;
+    a.err_dialog = err_dialog;
+    a.set_list = set_list;
+    a.set_buf = set_buf;
+    a.func_list = func_list;
+    a.func_fixed = func_fixed;
+    a.func_stat = func_stat;
+    a.func_file = func_file;
+    a.unk_op_flags = user ? kUserOpFlags : kOpFlags;
+    a.userdata = userdata;
+    return run_op(ctx, fn, a, container);
 }
 
 s32 cellSaveDataAutoSave2(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog, u32 set_buf, u32 func_stat,
     u32 func_file, u32 container, u32 userdata)
 {
-    return auto_op(ctx, "cellSaveDataAutoSave2", SAVEDATA_OP_AUTO_SAVE, version, dir_name, err_dialog, set_buf,
+    return auto_op(ctx, "cellSaveDataAutoSave2", SAVEDATA_OP_AUTO_SAVE, version, 0, dir_name, err_dialog, set_buf,
         func_stat, func_file, container, userdata);
 }
 
 s32 cellSaveDataAutoLoad2(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog, u32 set_buf, u32 func_stat,
     u32 func_file, u32 container, u32 userdata)
 {
-    return auto_op(ctx, "cellSaveDataAutoLoad2", SAVEDATA_OP_AUTO_LOAD, version, dir_name, err_dialog, set_buf,
+    return auto_op(ctx, "cellSaveDataAutoLoad2", SAVEDATA_OP_AUTO_LOAD, version, 0, dir_name, err_dialog, set_buf,
         func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataAutoSave(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog, u32 set_buf, u32 func_stat,
+    u32 func_file, u32 container)
+{
+    return auto_op(ctx, "cellSaveDataAutoSave", SAVEDATA_OP_AUTO_SAVE, version, 0, dir_name, err_dialog, set_buf,
+        func_stat, func_file, container, 0);
+}
+
+s32 cellSaveDataAutoLoad(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog, u32 set_buf, u32 func_stat,
+    u32 func_file, u32 container)
+{
+    return auto_op(ctx, "cellSaveDataAutoLoad", SAVEDATA_OP_AUTO_LOAD, version, 0, dir_name, err_dialog, set_buf,
+        func_stat, func_file, container, 0);
+}
+
+s32 cellSaveDataUserAutoSave(PPUContext& ctx, u32 version, u32 user_id, u32 dir_name, u32 err_dialog, u32 set_buf,
+    u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return auto_op(ctx, "cellSaveDataUserAutoSave", SAVEDATA_OP_AUTO_SAVE, version, user_id, dir_name, err_dialog,
+        set_buf, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataUserAutoLoad(PPUContext& ctx, u32 version, u32 user_id, u32 dir_name, u32 err_dialog, u32 set_buf,
+    u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return auto_op(ctx, "cellSaveDataUserAutoLoad", SAVEDATA_OP_AUTO_LOAD, version, user_id, dir_name, err_dialog,
+        set_buf, func_stat, func_file, container, userdata);
 }
 
 // The saves whose names start with setList's prefixes are listed for funcFixed, which picks one; no dialog.
 s32 cellSaveDataListAutoLoad(PPUContext& ctx, u32 version, u32 err_dialog, u32 set_list, u32 set_buf, u32 func_fixed,
     u32 func_stat, u32 func_file, u32 container, u32 userdata)
 {
-    PS_LOG_INFO(kChan,
-        "cellSaveDataListAutoLoad(version {}, errDialog {}, setList {:#x}, setBuf {:#x}, funcFixed {:#x}, funcStat "
-        "{:#x}, funcFile {:#x}, container {:#x}, userdata {:#x})",
-        version, err_dialog, set_list, set_buf, func_fixed, func_stat, func_file, container, userdata);
-    OpArgs a;
-    a.operation = SAVEDATA_OP_LIST_AUTO_LOAD;
-    a.version = version;
-    a.err_dialog = err_dialog;
-    a.set_list = set_list;
-    a.set_buf = set_buf;
-    a.func_fixed = func_fixed;
-    a.func_stat = func_stat;
-    a.func_file = func_file;
-    a.unk_op_flags = 2;
-    a.userdata = userdata;
-    return finish("cellSaveDataListAutoLoad", savedata_op(ctx, a));
+    return listed_op(ctx, "cellSaveDataListAutoLoad", SAVEDATA_OP_LIST_AUTO_LOAD, version, 0, false, err_dialog,
+        set_list, set_buf, 0, func_fixed, func_stat, func_file, container, userdata);
 }
 
-// funcFixed names the save to delete; funcDone hears how it went. With CELL_SAVEDATA_OPTION_NONE the PS3 asks the
-// user first: no dialog exists, so that is CELL_SAVEDATA_ERROR_INTERNAL (RPCS3 without a message dialog).
+s32 cellSaveDataListAutoSave(PPUContext& ctx, u32 version, u32 err_dialog, u32 set_list, u32 set_buf, u32 func_fixed,
+    u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataListAutoSave", SAVEDATA_OP_LIST_AUTO_SAVE, version, 0, false, err_dialog,
+        set_list, set_buf, 0, func_fixed, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataUserListAutoLoad(PPUContext& ctx, u32 version, u32 user_id, u32 err_dialog, u32 set_list, u32 set_buf,
+    u32 func_fixed, u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataUserListAutoLoad", SAVEDATA_OP_LIST_AUTO_LOAD, version, user_id, true,
+        err_dialog, set_list, set_buf, 0, func_fixed, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataUserListAutoSave(PPUContext& ctx, u32 version, u32 user_id, u32 err_dialog, u32 set_list, u32 set_buf,
+    u32 func_fixed, u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataUserListAutoSave", SAVEDATA_OP_LIST_AUTO_SAVE, version, user_id, true,
+        err_dialog, set_list, set_buf, 0, func_fixed, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataListSave2(PPUContext& ctx, u32 version, u32 set_list, u32 set_buf, u32 func_list, u32 func_stat,
+    u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataListSave2", SAVEDATA_OP_LIST_SAVE, version, 0, false,
+        CELL_SAVEDATA_ERRDIALOG_ALWAYS, set_list, set_buf, func_list, 0, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataListLoad2(PPUContext& ctx, u32 version, u32 set_list, u32 set_buf, u32 func_list, u32 func_stat,
+    u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataListLoad2", SAVEDATA_OP_LIST_LOAD, version, 0, false,
+        CELL_SAVEDATA_ERRDIALOG_ALWAYS, set_list, set_buf, func_list, 0, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataListSave(PPUContext& ctx, u32 version, u32 set_list, u32 set_buf, u32 func_list, u32 func_stat,
+    u32 func_file, u32 container)
+{
+    return listed_op(ctx, "cellSaveDataListSave", SAVEDATA_OP_LIST_SAVE, version, 0, false,
+        CELL_SAVEDATA_ERRDIALOG_ALWAYS, set_list, set_buf, func_list, 0, func_stat, func_file, container, 0);
+}
+
+s32 cellSaveDataListLoad(PPUContext& ctx, u32 version, u32 set_list, u32 set_buf, u32 func_list, u32 func_stat,
+    u32 func_file, u32 container)
+{
+    return listed_op(ctx, "cellSaveDataListLoad", SAVEDATA_OP_LIST_LOAD, version, 0, false,
+        CELL_SAVEDATA_ERRDIALOG_ALWAYS, set_list, set_buf, func_list, 0, func_stat, func_file, container, 0);
+}
+
+s32 cellSaveDataUserListSave(PPUContext& ctx, u32 version, u32 user_id, u32 set_list, u32 set_buf, u32 func_list,
+    u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataUserListSave", SAVEDATA_OP_LIST_SAVE, version, user_id, true,
+        CELL_SAVEDATA_ERRDIALOG_NONE, set_list, set_buf, func_list, 0, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataUserListLoad(PPUContext& ctx, u32 version, u32 user_id, u32 set_list, u32 set_buf, u32 func_list,
+    u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataUserListLoad", SAVEDATA_OP_LIST_LOAD, version, user_id, true,
+        CELL_SAVEDATA_ERRDIALOG_NONE, set_list, set_buf, func_list, 0, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataFixedSave2(PPUContext& ctx, u32 version, u32 set_list, u32 set_buf, u32 func_fixed, u32 func_stat,
+    u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataFixedSave2", SAVEDATA_OP_FIXED_SAVE, version, 0, false,
+        CELL_SAVEDATA_ERRDIALOG_ALWAYS, set_list, set_buf, 0, func_fixed, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataFixedLoad2(PPUContext& ctx, u32 version, u32 set_list, u32 set_buf, u32 func_fixed, u32 func_stat,
+    u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataFixedLoad2", SAVEDATA_OP_FIXED_LOAD, version, 0, false,
+        CELL_SAVEDATA_ERRDIALOG_ALWAYS, set_list, set_buf, 0, func_fixed, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataFixedSave(PPUContext& ctx, u32 version, u32 set_list, u32 set_buf, u32 func_fixed, u32 func_stat,
+    u32 func_file, u32 container)
+{
+    return listed_op(ctx, "cellSaveDataFixedSave", SAVEDATA_OP_FIXED_SAVE, version, 0, false,
+        CELL_SAVEDATA_ERRDIALOG_ALWAYS, set_list, set_buf, 0, func_fixed, func_stat, func_file, container, 0);
+}
+
+s32 cellSaveDataFixedLoad(PPUContext& ctx, u32 version, u32 set_list, u32 set_buf, u32 func_fixed, u32 func_stat,
+    u32 func_file, u32 container)
+{
+    return listed_op(ctx, "cellSaveDataFixedLoad", SAVEDATA_OP_FIXED_LOAD, version, 0, false,
+        CELL_SAVEDATA_ERRDIALOG_ALWAYS, set_list, set_buf, 0, func_fixed, func_stat, func_file, container, 0);
+}
+
+s32 cellSaveDataUserFixedSave(PPUContext& ctx, u32 version, u32 user_id, u32 set_list, u32 set_buf, u32 func_fixed,
+    u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataUserFixedSave", SAVEDATA_OP_FIXED_SAVE, version, user_id, true,
+        CELL_SAVEDATA_ERRDIALOG_NONE, set_list, set_buf, 0, func_fixed, func_stat, func_file, container, userdata);
+}
+
+s32 cellSaveDataUserFixedLoad(PPUContext& ctx, u32 version, u32 user_id, u32 set_list, u32 set_buf, u32 func_fixed,
+    u32 func_stat, u32 func_file, u32 container, u32 userdata)
+{
+    return listed_op(ctx, "cellSaveDataUserFixedLoad", SAVEDATA_OP_FIXED_LOAD, version, user_id, true,
+        CELL_SAVEDATA_ERRDIALOG_NONE, set_list, set_buf, 0, func_fixed, func_stat, func_file, container, userdata);
+}
+
+// funcFixed (FIXED_DELETE) or the user's choice from funcList's list (LIST_DELETE) names the save to delete; funcDone
+// hears how it went. The fixed one asks the user to confirm unless funcFixed says NOCONFIRM (answered YES here).
+s32 delete_op(PPUContext& ctx, std::string_view fn, u32 operation, u32 user_id, u32 set_list, u32 set_buf,
+    u32 func_list, u32 func_fixed, u32 func_done, u32 container, u32 userdata)
+{
+    OpArgs a;
+    a.operation = operation;
+    a.user_id = user_id;
+    a.err_dialog = operation == SAVEDATA_OP_FIXED_DELETE ? CELL_SAVEDATA_ERRDIALOG_ALWAYS : CELL_SAVEDATA_ERRDIALOG_NONE;
+    a.set_list = set_list;
+    a.set_buf = set_buf;
+    a.func_list = func_list;
+    a.func_fixed = func_fixed;
+    a.unk_op_flags = operation == SAVEDATA_OP_LIST_DELETE ? kDeleteOpFlags : user_id ? kUserOpFlags : kOpFlags;
+    a.userdata = userdata;
+    a.func_done = func_done;
+    return run_op(ctx, fn, a, container);
+}
+
 s32 cellSaveDataFixedDelete(PPUContext& ctx, u32 set_list, u32 set_buf, u32 func_fixed, u32 func_done, u32 container,
     u32 userdata)
 {
-    PS_LOG_INFO(kChan,
-        "cellSaveDataFixedDelete(setList {:#x}, setBuf {:#x}, funcFixed {:#x}, funcDone {:#x}, container {:#x}, "
-        "userdata {:#x})",
-        set_list, set_buf, func_fixed, func_done, container, userdata);
+    return delete_op(ctx, "cellSaveDataFixedDelete", SAVEDATA_OP_FIXED_DELETE, 0, set_list, set_buf, 0, func_fixed,
+        func_done, container, userdata);
+}
+
+s32 cellSaveDataUserFixedDelete(PPUContext& ctx, u32 user_id, u32 set_list, u32 set_buf, u32 func_fixed,
+    u32 func_done, u32 container, u32 userdata)
+{
+    return delete_op(ctx, "cellSaveDataUserFixedDelete", SAVEDATA_OP_FIXED_DELETE, user_id, set_list, set_buf, 0,
+        func_fixed, func_done, container, userdata);
+}
+
+s32 cellSaveDataListDelete(PPUContext& ctx, u32 set_list, u32 set_buf, u32 func_list, u32 func_done, u32 container,
+    u32 userdata)
+{
+    return delete_op(ctx, "cellSaveDataListDelete", SAVEDATA_OP_LIST_DELETE, 0, set_list, set_buf, func_list, 0,
+        func_done, container, userdata);
+}
+
+s32 cellSaveDataUserListDelete(PPUContext& ctx, u32 user_id, u32 set_list, u32 set_buf, u32 func_list, u32 func_done,
+    u32 container, u32 userdata)
+{
+    return delete_op(ctx, "cellSaveDataUserListDelete", SAVEDATA_OP_LIST_DELETE, user_id, set_list, set_buf,
+        func_list, 0, func_done, container, userdata);
+}
+
+// Import and export (to and from a memory stick, a PS3 feature games rarely use): RPCS3 checks the arguments and
+// returns CELL_OK without doing anything or calling funcDone (its TODO); so does pspocket.
+s32 transfer_op(PPUContext& ctx, std::string_view fn, u32 operation, u32 user_id, u32 set_list, u32 dir_name,
+    u32 max_size_kb, u32 func_done, u32 container, u32 userdata)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    PS_LOG_WARN(kChan,
+        "{}(userId {}, setList {:#x}, dirName {}, maxSizeKB {}, funcDone {:#x}, container {:#x}, userdata {:#x}): not "
+        "implemented in RPCS3 either; CELL_OK after its checks, funcDone not called",
+        fn, user_id, set_list, describe(t, dir_name, CELL_SAVEDATA_DIRNAME_SIZE + 1), max_size_kb, func_done,
+        container, userdata);
     OpArgs a;
-    a.operation = SAVEDATA_OP_FIXED_DELETE;
-    a.err_dialog = CELL_SAVEDATA_ERRDIALOG_ALWAYS;
+    a.operation = operation;
+    a.user_id = user_id;
+    a.dir_name = dir_name;
     a.set_list = set_list;
-    a.set_buf = set_buf;
-    a.func_fixed = func_fixed;
-    a.unk_op_flags = 2;
+    a.unk_op_flags = user_id || operation >= SAVEDATA_OP_FIXED_IMPORT ? kImportOpFlags : kDeleteOpFlags;
     a.userdata = userdata;
     a.func_done = func_done;
-    return finish("cellSaveDataFixedDelete", savedata_op(ctx, a));
+    if (const u32 e = savedata_check_args(t, a)) return finish(fn, param_error(e));
+    return finish(fn, lv2::CELL_OK);
+}
+
+s32 cellSaveDataListImport(PPUContext& ctx, u32 set_list, u32 max_size_kb, u32 func_done, u32 container, u32 userdata)
+{
+    return transfer_op(ctx, "cellSaveDataListImport", SAVEDATA_OP_LIST_IMPORT, 0, set_list, 0, max_size_kb,
+        func_done, container, userdata);
+}
+
+s32 cellSaveDataListExport(PPUContext& ctx, u32 set_list, u32 max_size_kb, u32 func_done, u32 container, u32 userdata)
+{
+    return transfer_op(ctx, "cellSaveDataListExport", SAVEDATA_OP_LIST_EXPORT, 0, set_list, 0, max_size_kb,
+        func_done, container, userdata);
+}
+
+s32 cellSaveDataFixedImport(PPUContext& ctx, u32 dir_name, u32 max_size_kb, u32 func_done, u32 container, u32 userdata)
+{
+    return transfer_op(ctx, "cellSaveDataFixedImport", SAVEDATA_OP_FIXED_IMPORT, 0, 0, dir_name, max_size_kb,
+        func_done, container, userdata);
+}
+
+s32 cellSaveDataFixedExport(PPUContext& ctx, u32 dir_name, u32 max_size_kb, u32 func_done, u32 container, u32 userdata)
+{
+    return transfer_op(ctx, "cellSaveDataFixedExport", SAVEDATA_OP_FIXED_EXPORT, 0, 0, dir_name, max_size_kb,
+        func_done, container, userdata);
+}
+
+s32 cellSaveDataUserListImport(PPUContext& ctx, u32 user_id, u32 set_list, u32 max_size_kb, u32 func_done,
+    u32 container, u32 userdata)
+{
+    return transfer_op(ctx, "cellSaveDataUserListImport", SAVEDATA_OP_LIST_IMPORT, user_id, set_list, 0, max_size_kb,
+        func_done, container, userdata);
+}
+
+s32 cellSaveDataUserListExport(PPUContext& ctx, u32 user_id, u32 set_list, u32 max_size_kb, u32 func_done,
+    u32 container, u32 userdata)
+{
+    return transfer_op(ctx, "cellSaveDataUserListExport", SAVEDATA_OP_LIST_EXPORT, user_id, set_list, 0, max_size_kb,
+        func_done, container, userdata);
+}
+
+s32 cellSaveDataUserFixedImport(PPUContext& ctx, u32 user_id, u32 dir_name, u32 max_size_kb, u32 func_done,
+    u32 container, u32 userdata)
+{
+    return transfer_op(ctx, "cellSaveDataUserFixedImport", SAVEDATA_OP_FIXED_IMPORT, user_id, 0, dir_name,
+        max_size_kb, func_done, container, userdata);
+}
+
+s32 cellSaveDataUserFixedExport(PPUContext& ctx, u32 user_id, u32 dir_name, u32 max_size_kb, u32 func_done,
+    u32 container, u32 userdata)
+{
+    return transfer_op(ctx, "cellSaveDataUserFixedExport", SAVEDATA_OP_FIXED_EXPORT, user_id, 0, dir_name,
+        max_size_kb, func_done, container, userdata);
+}
+
+// The save data overlay (the PS3's own progress indicator over the game). RPCS3 keeps the flag and its getter is a
+// stub returning CELL_OK; there is no overlay here either.
+void cellSaveDataEnableOverlay(PPUContext&, s32 enable)
+{
+    PS_LOG_INFO(kChan, "cellSaveDataEnableOverlay(enable {})", enable);
+    save_state().enable_overlay = enable != 0;
+}
+
+s32 cellSaveDataGetEnableOverlay(PPUContext&)
+{
+    PS_LOG_INFO(kChan, "cellSaveDataGetEnableOverlay(): CELL_OK (as RPCS3, which leaves it a stub)");
+    return lv2::CELL_OK;
 }
 
 // RPCS3 select_and_delete: the system's list of this game's saves, to delete them one by one until the user leaves
 // it. There is no save data dialog, so the user leaves it at once: CELL_CANCEL, as RPCS3 without a save dialog.
-s32 cellSaveDataDelete2(PPUContext& ctx, u32 container)
+s32 select_and_delete(PPUContext& ctx, std::string_view fn, u32 container)
 {
-    PS_LOG_INFO(kChan, "cellSaveDataDelete2(container {:#x})", container);
+    PS_LOG_INFO(kChan, "{}(container {:#x})", fn, container);
     lv2::PpuThread& t = thread_of(ctx);
     SaveDataState& s = save_state();
     BusyGuard busy(s.busy);
-    if (!busy.owned()) return finish("cellSaveDataDelete2", error(CELL_SAVEDATA_ERROR_BUSY));
+    if (!busy.owned()) return finish(fn, error(CELL_SAVEDATA_ERROR_BUSY));
     std::string title = s.process.config().game.title_id;
     if (title.empty()) title = t.kernel.config().title_id;
     usize count = 0;
@@ -1535,21 +2001,31 @@ s32 cellSaveDataDelete2(PPUContext& ctx, u32 container)
             }
         }
     }
-    PS_LOG_WARN(kChan, "cellSaveDataDelete2: the PS3 would list the {} save(s) of {} to delete; there is no save data "
-                       "dialog, so the user cancels",
-        count, title.empty() ? "this game" : title);
-    return finish("cellSaveDataDelete2", lv2::CELL_CANCEL);
+    PS_LOG_WARN(kChan, "{}: the PS3 would list the {} save(s) of {} to delete; there is no save data dialog, so the "
+                       "user cancels",
+        fn, count, title.empty() ? "this game" : title);
+    return finish(fn, lv2::CELL_CANCEL);
 }
 
-// RPCS3 savedata_get_list_item, for the current user.
-s32 cellSaveDataGetListItem(PPUContext& ctx, u32 dir_name, u32 dir, u32 sys_file_param, u32 bind, u32 size_kb)
+s32 cellSaveDataDelete2(PPUContext& ctx, u32 container)
+{
+    return select_and_delete(ctx, "cellSaveDataDelete2", container);
+}
+
+s32 cellSaveDataDelete(PPUContext& ctx, u32 container)
+{
+    return select_and_delete(ctx, "cellSaveDataDelete", container);
+}
+
+// RPCS3 savedata_get_list_item (0 is the current user).
+s32 get_list_item(PPUContext& ctx, std::string_view fn, u32 user_id, u32 dir_name, u32 dir, u32 sys_file_param,
+    u32 bind, u32 size_kb)
 {
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
     const u32 sdk = t.kernel.config().sdk_version;
-    constexpr std::string_view fn = "cellSaveDataGetListItem";
-    PS_LOG_INFO(kChan, "{}(dirName {}, dir {:#x}, sysFileParam {:#x}, bind {:#x}, sizeKB {:#x})", fn,
-        describe(t, dir_name, CELL_SAVEDATA_DIRNAME_SIZE + 1), dir, sys_file_param, bind, size_kb);
+    PS_LOG_INFO(kChan, "{}(userId {}, dirName {}, dir {:#x}, sysFileParam {:#x}, bind {:#x}, sizeKB {:#x})", fn,
+        user_id, describe(t, dir_name, CELL_SAVEDATA_DIRNAME_SIZE + 1), dir, sys_file_param, bind, size_kb);
     if (!dir_name) return finish(fn, param_error(107));
     const GuestString name = read_cstr(t, dir_name, CELL_SAVEDATA_DIRNAME_SIZE + 1);
     if (name.faulted) return finish(fn, param_refused("dirName is outside committed guest memory"));
@@ -1564,7 +2040,7 @@ s32 cellSaveDataGetListItem(PPUContext& ctx, u32 dir_name, u32 dir, u32 sys_file
         return finish(fn, param_refused("an output"));
     }
 
-    const std::string base_dir = savedata_dir(t.kernel);
+    const std::string base_dir = savedata_dir(t.kernel, user_id);
     if (base_dir.empty() || !host_is_dir(base_dir)) return finish(fn, error(CELL_SAVEDATA_ERROR_NOUSER));
     const std::string save_path = base_dir + name.text, sfo_path = save_path + "/PARAM.SFO";
     std::error_code ec;
@@ -1603,19 +2079,64 @@ s32 cellSaveDataGetListItem(PPUContext& ctx, u32 dir_name, u32 dir, u32 sys_file
     return finish(fn, lv2::CELL_OK);
 }
 
+s32 cellSaveDataGetListItem(PPUContext& ctx, u32 dir_name, u32 dir, u32 sys_file_param, u32 bind, u32 size_kb)
+{
+    return get_list_item(ctx, "cellSaveDataGetListItem", 0, dir_name, dir, sys_file_param, bind, size_kb);
+}
+
+s32 cellSaveDataUserGetListItem(PPUContext& ctx, u32 user_id, u32 dir_name, u32 dir, u32 sys_file_param, u32 bind,
+    u32 size_kb)
+{
+    return get_list_item(ctx, "cellSaveDataUserGetListItem", user_id, dir_name, dir, sys_file_param, bind, size_kb);
+}
+
 } // namespace
 
 void register_cellSaveData(Registry& r)
 {
     r.add("cellSysutil", {
+        PS_HLE_FUNC(0xB96F2F5D, cellSaveDataGetEnableOverlay),
+        PS_HLE_FUNC(0xE7FA820B, cellSaveDataEnableOverlay),
+        PS_HLE_FUNC(0xEDADD797, cellSaveDataDelete2),
+        PS_HLE_FUNC(0xA4ED7DFE, cellSaveDataDelete),
+        PS_HLE_FUNC(0x8B8A2F48, cellSaveDataUserFixedDelete),
+        PS_HLE_FUNC(0xCED17573, cellSaveDataFixedDelete),
+        PS_HLE_FUNC(0x6E7264ED, cellSaveDataUserFixedLoad),
+        PS_HLE_FUNC(0x40B34847, cellSaveDataUserFixedSave),
+        PS_HLE_FUNC(0x2A8EADA2, cellSaveDataFixedLoad2),
+        PS_HLE_FUNC(0x2AAE9EF5, cellSaveDataFixedSave2),
+        PS_HLE_FUNC(0x50183B44, cellSaveDataFixedLoad),
+        PS_HLE_FUNC(0x41BC2CA1, cellSaveDataFixedSave),
+        PS_HLE_FUNC(0x39DD8425, cellSaveDataUserListLoad),
+        PS_HLE_FUNC(0x0F03CFB0, cellSaveDataUserListSave),
+        PS_HLE_FUNC(0x1DFBFDD6, cellSaveDataListLoad2),
+        PS_HLE_FUNC(0x2DE0D663, cellSaveDataListSave2),
+        PS_HLE_FUNC(0xEF5A353D, cellSaveDataListLoad),
+        PS_HLE_FUNC(0x3DBD2314, cellSaveDataListSave),
+        PS_HLE_FUNC(0x248BD1D8, cellSaveDataUserListAutoLoad),
+        PS_HLE_FUNC(0x0E091C36, cellSaveDataUserListAutoSave),
+        PS_HLE_FUNC(0x21425307, cellSaveDataListAutoLoad),
+        PS_HLE_FUNC(0x4DD03A4E, cellSaveDataListAutoSave),
+        PS_HLE_FUNC(0xCDC6AEFD, cellSaveDataUserAutoLoad),
+        PS_HLE_FUNC(0x52AAC4FA, cellSaveDataUserAutoSave),
         PS_HLE_FUNC(0xFBD5C856, cellSaveDataAutoLoad2),
         PS_HLE_FUNC(0x8B7ED64B, cellSaveDataAutoSave2),
-        PS_HLE_FUNC(0x21425307, cellSaveDataListAutoLoad),
-        PS_HLE_FUNC(0xEDADD797, cellSaveDataDelete2),
-        PS_HLE_FUNC(0xCED17573, cellSaveDataFixedDelete),
+        PS_HLE_FUNC(0xC22C79B5, cellSaveDataAutoLoad),
+        PS_HLE_FUNC(0xF8A175EC, cellSaveDataAutoSave),
     });
     r.add("cellSaveData", {
+        PS_HLE_FUNC(0xF6482036, cellSaveDataUserGetListItem),
         PS_HLE_FUNC(0x04C06FC2, cellSaveDataGetListItem),
+        PS_HLE_FUNC(0x7048A9BA, cellSaveDataUserListDelete),
+        PS_HLE_FUNC(0x27CB8BC2, cellSaveDataListDelete),
+        PS_HLE_FUNC(0x95AE2CDE, cellSaveDataUserFixedExport),
+        PS_HLE_FUNC(0x529231B0, cellSaveDataUserFixedImport),
+        PS_HLE_FUNC(0x273D116A, cellSaveDataUserListExport),
+        PS_HLE_FUNC(0x39D6EE43, cellSaveDataUserListImport),
+        PS_HLE_FUNC(0x46A2D878, cellSaveDataFixedExport),
+        PS_HLE_FUNC(0x52541151, cellSaveDataFixedImport),
+        PS_HLE_FUNC(0x491CC554, cellSaveDataListExport),
+        PS_HLE_FUNC(0x6B4E0DE6, cellSaveDataListImport),
     });
 }
 
