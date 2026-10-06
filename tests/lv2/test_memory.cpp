@@ -288,3 +288,22 @@ TEST_CASE("lv2 sys_vm: map the whole virtual size, charge the physical size, pag
     CHECK(c.call(kVmUnmap, vm) == kInval);
     CHECK(c.call(kVmMap, 0x2000000, 0x100000, 0xFFFFFFFF, k64K, kPolicy, out2) == CELL_OK); // room again
 }
+
+TEST_CASE("lv2 mmapper: page fault notification, registered with RPCS3's checks (D-184)", "[lv2][memory]")
+{
+    Fixture f;
+    Caller c(*f.kernel);
+    const u32 out = f.alloc(4);
+    REQUIRE(c.call(kMmAllocateAddress, 0x10000000, k1M, 0x10000000, out) == CELL_OK);
+    const u32 area = f.r32(out);
+    REQUIRE(c.call(kQueueCreate, out, queue_attr(f, SYS_SYNC_FIFO), 0, 8) == CELL_OK);
+    const u32 queue = f.r32(out);
+    CHECK(c.call(327, area + 0x10000, queue) == rc(CELL_EINVAL)); // not the area's start
+    CHECK(c.call(327, 0x00100000, queue) == rc(CELL_EINVAL));     // not an mmapper area
+    CHECK(c.call(327, area, 0x8D00FFFF) == rc(CELL_ESRCH));       // no such queue
+    REQUIRE(c.call(327, area, queue) == CELL_OK);
+    CHECK(c.call(327, area, queue) == rc(CELL_EBUSY)); // once per area
+    const u32 n = f.alloc(4);
+    REQUIRE(c.call(kGetNumberOfObject, 0x0E, n) == CELL_OK);
+    CHECK(f.r32(n) == 1); // the port lv2 made for it
+}

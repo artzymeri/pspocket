@@ -269,6 +269,12 @@ public:
     };
     std::map<u32, UserAlloc> user_allocs;
     RangeSet stacks; // PPU thread stacks, PS_MEM_STACK_BASE..+SIZE
+    // sys_mmapper_enable_page_fault_notification: the mmapper areas a queue watches (RPCS3
+    // page_fault_notification_entry: area start, queue, the port made for it).
+    struct PageFaultWatch {
+        u32 start_addr, queue_id, port_id;
+    };
+    std::vector<PageFaultWatch> page_fault_watches;
     u32 vm_total = 0; // virtual size of all sys_vm blocks
     bool fixed_area_mapped = false;
 

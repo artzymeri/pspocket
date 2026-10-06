@@ -12,7 +12,7 @@ implements (PS_LV2_BIND) always takes the slot first.
 
 A function is a stub by runtime/hle/scripts/gen_rpcs3_stubs.py's rule (its body, comments, log statements and
 UNIMPLEMENTED_FUNC removed, is `return X;`), with two statements that change nothing for a constant answer also
-removed: `ppu.state += cpu_flag::wait;` and `lv2_obj::sleep(ppu);`. A void stub is left out (a syscall's r3 is its
+removed: `ppu.state += cpu_flag::wait;` and `lv2_obj::sleep(ppu);` (or `cpu`). A void stub is left out (a syscall's r3 is its
 result).
 
 Output: one `{number, "name", 0xR3},` line per stub, sorted by number; R3 as gen_rpcs3_stubs.py computes it.
@@ -28,7 +28,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 DST = ROOT / "runtime" / "lv2" / "src" / "syscall_stub.inc"
 TABLE_SIZE = 1024
 ENTRY = re.compile(r"^(?:(BIND_SYSC|NULL_FUNC)\s*\(\s*(\w*)\s*\)|(null_func|uns_func))$")
-NO_EFFECT = re.compile(r"\bppu\.state\s*\+=\s*cpu_flag::wait\s*;|\blv2_obj::sleep\s*\(\s*ppu\s*\)\s*;")
+NO_EFFECT = re.compile(r"\b(?:ppu|cpu)\.state\s*\+=\s*cpu_flag::wait\s*;|\blv2_obj::sleep\s*\(\s*(?:ppu|cpu)\s*\)\s*;")
 
 sys.dont_write_bytecode = True  # no __pycache__ beside gen_rpcs3_stubs.py
 _spec = importlib.util.spec_from_file_location("gen_rpcs3_stubs", ROOT / "runtime" / "hle" / "scripts" / "gen_rpcs3_stubs.py")

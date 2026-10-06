@@ -480,6 +480,47 @@ Result sys_mmapper_allocate_address(PpuThread& t, u64 size, u64 flags, u64 align
     return CELL_OK;
 }
 
+// sys_mmapper_enable_page_fault_notification(start_addr, event_queue_id): the queue hears of page faults in the
+// mmapper area starting at start_addr, through an event port lv2 makes for it (name SYS_MEMORY_PAGE_FAULT_EVENT_KEY).
+// RPCS3's checks: the start of an mmapper area (EINVAL), a live queue (ESRCH), once per area (EBUSY). pspocket
+// registers the watch but has no page faults to report: guest memory that isn't mapped is not caught as a fault.
+Result sys_mmapper_enable_page_fault_notification(PpuThread& t, u32 start_addr, u32 event_queue_id)
+{
+    constexpr u64 SYS_MEMORY_PAGE_FAULT_EVENT_KEY = 0xFFFE000000000000ull;
+    Kernel::Impl& s = t.kernel.impl();
+    {
+        std::lock_guard lock(s.memory.mutex);
+        const Area* area = s.memory.area_at(start_addr);
+        if (!area || area->kind != Area::Kind::Mmapper || area->addr != start_addr) return err(CELL_EINVAL);
+    }
+    auto queue = s.objects.get<EventQueue>(event_queue_id);
+    if (!queue) return err(CELL_ESRCH);
+    auto port = std::make_shared<EventPort>(SYS_EVENT_PORT_LOCAL, SYS_MEMORY_PAGE_FAULT_EVENT_KEY);
+    port->refs = 1;
+    const u32 port_id = s.objects.insert(EventPort::kIdBase, port);
+    if (!port_id) return err(CELL_EAGAIN);
+    port->id = port_id;
+    {
+        std::lock_guard lk(port->lock);
+        port->queue = queue;
+    }
+    std::lock_guard lock(s.memory.mutex);
+    for (const auto& w : s.memory.page_fault_watches) {
+        if (w.start_addr != start_addr) continue;
+        {
+            std::lock_guard lk(port->lock);
+            port->queue.reset();
+        }
+        s.objects.remove(EventPort::kIdBase, port_id);
+        return err(CELL_EBUSY);
+    }
+    s.memory.page_fault_watches.push_back({start_addr, event_queue_id, port_id});
+    PS_LOG_WARN(kChan, "sys_mmapper_enable_page_fault_notification({:#010x}, queue {:#x}): registered (port {:#x}); "
+                       "pspocket reports no page faults",
+        start_addr, event_queue_id, port_id);
+    return CELL_OK;
+}
+
 Result sys_mmapper_allocate_fixed_address(PpuThread& t)
 {
     // RPCS3 maps 0xB0000000 as a plain 1 MB-page block: it is not a sys_mmapper mapping area (no mapping_comp),
@@ -688,6 +729,7 @@ void register_memory_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 351, sys_memory_get_page_attribute);
     PS_LV2_BIND(table, 352, sys_memory_get_user_memory_size);
     PS_LV2_BIND(table, 362, sys_mmapper_allocate_shared_memory_from_container);
+    PS_LV2_BIND(table, 327, sys_mmapper_enable_page_fault_notification);
 }
 
 } // namespace pspocket::lv2

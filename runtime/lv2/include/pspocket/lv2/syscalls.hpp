@@ -140,6 +140,7 @@ Result sys_event_port_connect_ipc(PpuThread& t, u32 eport_id, u64 ipc_key);
 Result sys_memory_container_create(PpuThread& t, u32 cid, u64 size);
 Result sys_memory_container_destroy(PpuThread& t, u32 cid);
 Result sys_memory_container_get_size(PpuThread& t, u32 mem_info, u32 cid);
+Result sys_mmapper_enable_page_fault_notification(PpuThread& t, u32 start_addr, u32 event_queue_id);
 Result sys_memory_allocate(PpuThread& t, u64 size, u64 flags, u32 alloc_addr);
 Result sys_memory_free(PpuThread& t, u32 start_addr);
 Result sys_memory_allocate_from_container(PpuThread& t, u64 size, u32 cid, u64 flags, u32 alloc_addr);
