@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-06, after run 101 and D-191 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-07, after run 117 and D-206 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -146,6 +146,18 @@ in `external/` inside the repository, gitignored (D-201).
 cellGifDec (D-202, run 108): pspocket's own, the same as Sony's libgifdec in 1,131 answers and 85 images, with SPU
 threads off and on (libgifdec is giflib; each DecodeData returns one record, an image being the whole logical screen).
 With it, step 3's image decoders are pspocket's (their Ext functions are still Sony's).
+
+**Assassin's Creed in the Abstergo lab, what still ran interpreted (runs 109 to 117, 2026-10-07).** A new game starts
+in the lab, which renders right. Three gaps the logs named are closed, all general:
+- a GCC switch whose bounds check branches into the table code and whose cases tail-call went through the PPU
+  interpreter 100 times a session (D-203: 21 more tables found and 80 more bounded in the game);
+- its busiest SPU job chain ran interpreted, 64 billion instructions in six minutes: prepare had promoted guessed
+  code (data decoded as instructions) to real code by carrying every label over as a seed, and a job's own writes to
+  its data then dropped its translation (D-205; D-204 and D-206 keep modules lifted when a copy cuts them or their
+  guest buffer is reused). After: 1.2 CPU cores busy instead of 3.6, 60 fps without drawing (run 116);
+- the translator generation is 3, so the phone prepares its games again with these fixes.
+Open: one GPU command reader desync (run 113, not seen since), the SPU code at 0xe408 of one job (half a million
+entries a session, seeded now).
 
 Next: the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then

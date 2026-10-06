@@ -85,6 +85,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Try:** nothing needed now; keep reading the status line in every session.
 - **State:** fine.
 
+- **Seen (runs 109 to 116):** Assassin's Creed's busiest job chain (workload 1, 14 to 15 s of SPU time per 5 s) ran
+  interpreted, about 64 billion instructions per six-minute session: the prepared programs counted guessed code
+  (shuffle patterns, zeros) as instructions, and a job's own writes there dropped it (D-205). Fixed: 1.5 s of SPU time
+  per 5 s, run 116. Still interpreted: LS 0x0e408 and 0x0e740 "in no program" (1.9 and 0.3 billion instructions in
+  run 114), code no tracked copy holds.
+- **Try:** trace 0x0e408 with PSPOCKET_SPU_TRACE_RUNS (what copies it in), then track that kind of copy.
+- **State:** the job chain fixed (D-204 to D-206); 0x0e408 open.
+
 ## PPU
 
 - **Seen:** no per-thread measurement on the phone yet: the status lines show the SPUs, the GPU and the sound, not
@@ -198,6 +206,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   starting a copy of the code after them; 1.3 GB for all 216. D-190 makes such constants labels: 421 MB, still 19
   minutes on the M4 and a 232 MB library, so D-191 adds a module's programs only when a game links it. 28 bytes of
   C per byte of SPU code is the norm now (GTA V's 36): what is left is the lifter's own C per instruction.
+- **Seen (2026-10-07, Assassin's Creed prepared again on the Mac):** "time left" said 3:18 at the start of a
+  preparation that took 0:16: 404 of 410 files were kept from the last one, and the estimate counts them as compiled
+  again.
+- **Try:** the time left from the files that will compile only (the kept ones known before the first compile starts).
 - **Tests:** the timing-sensitive tests are robust now (thread report: CPU time; usleep(0): the backoff state, not
   wall time). Open: the SPU analyzer's other copies (call targets inside another function's code), per-unit
   prototypes, PGO/LTO clang, LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.

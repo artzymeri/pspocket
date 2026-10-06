@@ -4556,6 +4556,60 @@ bounded that were scanned before); GTA V 133 tables either way, 126 to 124 warni
 after the bctr taken as the table when the base cannot be read) was dropped: the base can be read, so it was not the
 cause, and nothing else needs it.
 
+## D-204 · 2026-10-07 · An SPU module cut by a later copy keeps its identity while its code is intact
+
+The module tracker (D-079) knows a module by the run of GETs that copied it into local store. A later GET over part of
+a run used to drop the whole run, so a module whose tail a task then filled with data ran interpreted (Assassin's
+Creed: a 42 KB module at 0x4c00, data over its last 10 KB, run 109).
+
+- **What stays.** A run cut by a copy keeps the extent it was copied with (its identity: hash, size, where it was
+  lifted) and the part still in local store (where it holds code): the part before the copy, else the part after it.
+  One the copy covers entirely is gone. Only the part still there must equal its guest copy.
+- **Only data may be written over.** The cut part must not hold any word the program lifted as an instruction (its
+  code words, D-085): a branch there would run the old code where the copy now is. Then the module runs
+  interpreted, as before. A run cut after it was identified is identified again when it runs next.
+- The first half (the identity kept) went in with ffe091c by mistake, under a docs message; acaddd9 adds the code
+  check. Test: tests/hle/test_spu_programs.cpp, a module with data over its tail, its code, its head, and all of it.
+
+## D-205 · 2026-10-07 · SPU code only a constant reaches is speculative; prepare carries over the seeds it used
+
+Assassin's Creed's busiest job chain (workload 1) ran interpreted: 64.8 billion SPU instructions at LS 0x4c00 in a
+six-minute session (run 114), 11.2 billion in 200 s (run 115). Each job writes into its own binary's tail (a 4-byte
+DMA at +0xa730, its own data), and the translated program claimed those words as instructions, so the DMA dropped the
+program (D-085) and the cached binary ran interpreted from then on. The words were the job's shuffle patterns and the
+zeros after them (`stop 0` falls through, so tracing ran on to the image's end). The cause, and the same hole
+where constants start functions:
+
+- **Prepare promoted guesses to code.** Each prepare took every entry of the previous program as a seed, and a
+  program's entries are all its labels, also those of code only discovery (D-155) found. As seeds they counted as
+  code on the next prepare. Now each program directory keeps NAME.seeds, the seeds that lift used (the images' seed
+  lines and the runs' logs), and the next prepare carries over those. An output from before has no such file and
+  contributes nothing. Test: tests/game/test_prepare_spu.cpp (a job prepared twice keeps its code words).
+- **Code a constant points at.** An ila/il constant that points into the image starts a function when constants are
+  entries (the default outside jobs and modules: thread images, the firmware's programs). Such a function is now
+  speculative unless an entry, a seed or a direct call from code that is reaches it, and like discovered code it is
+  lifted and entered but left out of the code words. A DMA over it does not make the program stale; a program that
+  overwrote such a function with other code would run the old one (as with discovered code since D-155). Test:
+  tests/spu/test_discover.cpp.
+
+The job's code words went from 10,656 to 4,389 of its 10,764 words.
+
+## D-206 · 2026-10-07 · An SPU module whose guest copy changed is known by its local store copy
+
+The module tracker identified a module by hashing its guest copy, and refused one whose local store copy no longer
+matched it ("changed before it ran"), in case the module had been patched where it runs. Assassin's Creed copies a
+32 KB module to LS 0x33980 and then reuses the guest buffer before the module runs (all 6,705 words differ, in every
+run): local store holds the module intact, and it ran interpreted.
+
+- A module still whole in local store (no later copy cut it, D-204) whose guest copy differs is identified by the
+  bytes in local store: they are the code that runs, so a program lifted from them is right whichever copy changed.
+  A module patched where it runs gets no program by that hash (unless such a patched copy was saved and lifted
+  before) and is interpreted, as before; with --spu-dump the local store copy is what gets saved.
+- A module cut by a later copy and changed in the part still there stays interpreted (its identity is the whole
+  copy, which local store no longer holds).
+
+Test: tests/hle/test_spu_programs.cpp (a module whose guest buffer is reused before it runs).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
