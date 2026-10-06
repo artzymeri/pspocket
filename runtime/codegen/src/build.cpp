@@ -275,6 +275,12 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
         }
     };
     {
+        // The time left once the kept files are known, before the first compile: an estimate made before (the caller's,
+        // from the executable's size) counts every file (Assassin's Creed prepared again: 3:18 said, 0:16 taken).
+        std::lock_guard lock(m);
+        report(BuildProgress::Phase::Compiling, SIZE_MAX, -1, "");
+    }
+    {
         std::vector<std::thread> threads;
         for (unsigned t = 0; t < std::min<size_t>(workers, std::max<size_t>(order.size(), 1)); t++)
             threads.emplace_back(worker);

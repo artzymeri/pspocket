@@ -4646,6 +4646,17 @@ the other 8,078 words are the same. Whole-image hashing cannot name such a modul
 Tests: tests/hle/test_spu_programs.cpp (a module loaded with other data three times stays lifted; other code does
 not), tests/game/test_prepare_spu.cpp (copies differing in data are lifted once).
 
+## D-209 · 2026-10-07 · "Time left" knows the kept files before the first compile
+
+Preparing a game again keeps every object whose source and settings are unchanged. The time left shown until the
+first file finished still counted every file: Assassin's Creed prepared again with 404 of 410 files kept said 3:18 for
+a 0:16 job. The first estimate comes from the executable's size, before translation, and the compile phase only
+reported when files started or finished. The build now reports once as soon as it knows which files it keeps, before
+the first compile, with the time left of the files it will compile (none kept: the same model as before; all kept:
+0). The estimate before translation stays a guess from the executable's size.
+
+Test: tests/game/test_game_library.cpp (the first report comes before any file, and says 0 when every file is kept).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

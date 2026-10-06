@@ -209,7 +209,7 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Seen (2026-10-07, Assassin's Creed prepared again on the Mac):** "time left" said 3:18 at the start of a
   preparation that took 0:16: 404 of 410 files were kept from the last one, and the estimate counts them as compiled
   again.
-- **Try:** the time left from the files that will compile only (the kept ones known before the first compile starts).
+- **State:** the build reports the time left of the files it will compile before the first one (D-209).
 - **Tests:** the timing-sensitive tests are robust now (thread report: CPU time; usleep(0): the backoff state, not
   wall time). Open: the SPU analyzer's other copies (call targets inside another function's code), per-unit
   prototypes, PGO/LTO clang, LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.

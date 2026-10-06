@@ -9,6 +9,7 @@
 
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <format>
 #include <fstream>
 #include <iterator>
@@ -303,3 +304,41 @@ TEST_CASE("time left: the starting speeds come from the game's own last preparat
     CHECK(warm[0] == Catch::Approx(0.9 * pspocket::prepare::thermal_slowdown(2)));
 }
 
+
+TEST_CASE("game library: the time left counts only the files that will compile, from before the first one (D-209)")
+{
+    const fs::path dir = temp_dir();
+    fs::create_directories(dir);
+    std::vector<codegen::BuildJob> jobs;
+    for (int k = 0; k < 2; k++) {
+        const fs::path c = dir / std::format("kept_{}.c", k);
+        std::ofstream(c) << std::format("int pspocket_kept_{}(int x) {{ return x + {}; }}\n", k, k);
+        jobs.push_back({.source = c.string(), .cost = 5.0, .memory_mb = 50});
+    }
+    codegen::BuildOptions o;
+    o.compile.target = "arm64-apple-macos13.0";
+    o.compile.cpu = "apple-m1";
+    o.compile.resource_dir = PSPOCKET_CODEGEN_RESOURCE_DIR;
+    o.compile.system_dirs = {std::string(PSPOCKET_CODEGEN_SYSROOT) + "/include"};
+    o.link.platform = "macos";
+    o.link.min_os = "13.0";
+    o.link.libraries = {std::string(PSPOCKET_CODEGEN_SYSROOT) + "/lib/libSystem.tbd"};
+    o.object_dir = (dir / "kept-objects").string();
+    o.workers = 1;
+    for (const bool again : {false, true}) {
+        INFO("built before: " << again);
+        std::optional<codegen::BuildProgress> first;
+        o.progress = [&](const codegen::BuildProgress& p) {
+            if (!first && p.phase == codegen::BuildProgress::Phase::Compiling) first = p;
+        };
+        const codegen::BuildResult r = codegen::build_library(jobs, {}, (dir / "kept.dylib").string(), o);
+        INFO(r.error);
+        REQUIRE(r.ok);
+        REQUIRE(first);
+        CHECK(first->file.empty()); // reported before any file started
+        CHECK(first->files_done == (again ? 2u : 0u));
+        if (again) CHECK(first->seconds_left == Catch::Approx(0.0)); // everything kept
+        else CHECK(first->seconds_left > 0.0);
+    }
+    fs::remove_all(dir);
+}
