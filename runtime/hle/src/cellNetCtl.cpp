@@ -7,7 +7,8 @@
 // address, which np_handler discovers only on a connected network and otherwise leaves at FF:FF:FF:FF:FF:FF; every
 // other code is CELL_NET_CTL_ERROR_NOT_CONNECTED. The NAT info is RPCS3's fixed answer (NAT type 2, STUN OK) with UPnP
 // not in use. The network start dialog has no UI: as in RPCS3 it reports itself loaded and finished 500 ms after the
-// load, and the unload reports it canceled (no IP address was obtained).
+// load, and the unload reports it canceled (no IP address was obtained). A game update check (cellGameUpdateCheck*,
+// also in this library) finds no update and finishes, from the next cellSysutilCheckCallback, as in RPCS3.
 //
 // Differences from RPCS3: pointers are checked before use (D-042): one that is not guest memory is logged with the call
 // site and refused with CELL_NET_CTL_ERROR_INVALID_ADDR (RPCS3 faults). RPCS3 sends the dialog's LOADED and FINISHED
@@ -241,6 +242,71 @@ s32 cellNetCtlNetStartDialogUnloadAsync(PPUContext& ctx, u32 result)
     return done(lv2::CELL_OK);
 }
 
+// RPCS3 accepts an abort whenever the library is initialised.
+s32 cellNetCtlNetStartDialogAbortAsync(PPUContext&)
+{
+    const s32 r = netctl().initialized ? lv2::CELL_OK : error(CELL_NET_CTL_ERROR_NOT_INITIALIZED);
+    PS_LOG_INFO(kChan, "cellNetCtlNetStartDialogAbortAsync(): {}", result_name(r));
+    return r;
+}
+
+// ---- game update checks (RPCS3: they need no cellGameUpdateInit and check nothing)
+
+constexpr s32 CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE = 0, CELL_GAMEUPDATE_RESULT_STATUS_FINISHED = 5;
+constexpr u32 kGameUpdateResultSize = 16; // CellGameUpdateResult: be s32 status, error_code; char app_ver[6]; pad[2]
+
+// The callback, from the next cellSysutilCheckCallback: (status, error 0, userdata), or for the Ex functions
+// (CellGameUpdateResult*, userdata).
+s32 game_update(const char* fn, u32 func, u32 userdata, s32 status, bool ex)
+{
+    PS_LOG_INFO(kChan, "{}(func {:#x}, userdata {:#x}): no update server; status {}", fn, func, userdata, status);
+    if (!func) return lv2::CELL_OK; // RPCS3 would call address 0
+    sysutil_queue_call([=](PPUContext& ctx) -> s32 {
+        if (!ex) {
+            call_guest(ctx, func, {static_cast<u64>(status), 0, userdata});
+            return lv2::CELL_OK;
+        }
+        u8* base = guest_base(ctx);
+        StackVar result(ctx, base, kGameUpdateResultSize);
+        ps_write32(base, result.addr(), static_cast<u32>(status));
+        call_guest(ctx, func, {result.addr(), userdata});
+        return lv2::CELL_OK;
+    });
+    return lv2::CELL_OK;
+}
+
+s32 cellGameUpdateCheckStartAsync(PPUContext&, u32, u32 func, u32 userdata)
+{
+    return game_update("cellGameUpdateCheckStartAsync", func, userdata, CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE, false);
+}
+
+s32 cellGameUpdateCheckStartAsyncEx(PPUContext&, u32, u32 func, u32 userdata)
+{
+    return game_update("cellGameUpdateCheckStartAsyncEx", func, userdata, CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE, true);
+}
+
+s32 cellGameUpdateCheckStartWithoutDialogAsync(PPUContext&, u32 func, u32 userdata)
+{
+    return game_update("cellGameUpdateCheckStartWithoutDialogAsync", func, userdata,
+        CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE, false);
+}
+
+s32 cellGameUpdateCheckStartWithoutDialogAsyncEx(PPUContext&, u32 func, u32 userdata)
+{
+    return game_update("cellGameUpdateCheckStartWithoutDialogAsyncEx", func, userdata,
+        CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE, true);
+}
+
+s32 cellGameUpdateCheckFinishAsync(PPUContext&, u32 func, u32 userdata)
+{
+    return game_update("cellGameUpdateCheckFinishAsync", func, userdata, CELL_GAMEUPDATE_RESULT_STATUS_FINISHED, false);
+}
+
+s32 cellGameUpdateCheckFinishAsyncEx(PPUContext&, u32 func, u32 userdata)
+{
+    return game_update("cellGameUpdateCheckFinishAsyncEx", func, userdata, CELL_GAMEUPDATE_RESULT_STATUS_FINISHED, true);
+}
+
 } // namespace
 
 void register_cellNetCtl(Registry& r)
@@ -255,6 +321,13 @@ void register_cellNetCtl(Registry& r)
         PS_HLE_FUNC(0x3A12865F, cellNetCtlGetNatInfo),
         PS_HLE_FUNC(0x04459230, cellNetCtlNetStartDialogLoadAsync),
         PS_HLE_FUNC(0x0F1F13D3, cellNetCtlNetStartDialogUnloadAsync),
+        PS_HLE_FUNC(0x71D53210, cellNetCtlNetStartDialogAbortAsync),
+        PS_HLE_FUNC(0xD0A5D727, cellGameUpdateCheckStartAsync),
+        PS_HLE_FUNC(0x0791015F, cellGameUpdateCheckStartAsyncEx),
+        PS_HLE_FUNC(0xA5E1FA60, cellGameUpdateCheckStartWithoutDialogAsync),
+        PS_HLE_FUNC(0x558700F6, cellGameUpdateCheckStartWithoutDialogAsyncEx),
+        PS_HLE_FUNC(0xFFA3D791, cellGameUpdateCheckFinishAsync),
+        PS_HLE_FUNC(0xF463981C, cellGameUpdateCheckFinishAsyncEx),
     });
 }
 

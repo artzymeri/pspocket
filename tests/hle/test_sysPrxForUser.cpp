@@ -1520,3 +1520,57 @@ TEST_CASE("cellGame: param ints and strings, sizes, patch check, delete, themes;
     CHECK(a.call("cellHddGameExitBroken") == 0);
     fsys::remove_all(root);
 }
+
+TEST_CASE("cellSysmodule: module files, images and the debug mode (RPCS3)", "[hle][sysmodule]")
+{
+    namespace fsys = std::filesystem;
+    const fsys::path root = fsys::temp_directory_path() / ("pspocket-hle-flash-" + std::to_string(::getpid()));
+    fsys::remove_all(root);
+    fsys::create_directories(root / "sys" / "external");
+    {
+        std::ofstream out(root / "sys" / "external" / "flashATRAC.pic", std::ios::binary);
+        for (int i = 0; i < 300; i++) out.put(static_cast<char>(i)); // synthetic bytes
+    }
+    {
+        Fixture f;
+        REQUIRE(f.kernel->vfs_mount("/dev_flash", root.string(), true));
+        GuestThread g(f, 0, "sysmodule");
+        u8* b = f.base();
+        constexpr u64 kFatal = 0xFFFFFFFF800120FFull;
+        constexpr u32 kSize = kData + 0x100, kUnk = kData + 0x108, kPath = kData + 0x200, kBuf = kData + 0x1000;
+
+        // 0xFF00 is the Flash ATRAC picture; 0xFF01 has no file; others are FATAL.
+        REQUIRE(g.call("cellSysmoduleGetImagesize", 0xFF00, kSize) == 0);
+        CHECK(ps_read32(b, kSize) == 300);
+        ps_write32(b, kSize, 0xAAAA);
+        CHECK(g.call("cellSysmoduleGetImagesize", 0xFF01, kSize) == kFatal);
+        CHECK(ps_read32(b, kSize) == 0);
+        CHECK(g.call("cellSysmoduleGetImagesize", 0x0010, kSize) == kFatal);
+        CHECK(g.call("cellSysmoduleGetImagesize", 0xFF02, kSize) == kFatal);
+
+        ps_write32(b, kSize, 100); // at most 100 bytes
+        REQUIRE(g.call("cellSysmoduleFetchImage", 0xFF00, kBuf, kSize) == 0);
+        CHECK(ps_read32(b, kSize) == 100);
+        CHECK(ps_read8(b, kBuf + 99) == 99);
+        ps_write32(b, kSize, 1000); // more than there is
+        REQUIRE(g.call("cellSysmoduleFetchImage", 0xFF00, kBuf, kSize) == 0);
+        CHECK(ps_read32(b, kSize) == 300);
+        CHECK(ps_read8(b, kBuf + 299) == static_cast<u8>(299));
+        ps_write32(b, kSize, 1000);
+        CHECK(g.call("cellSysmoduleFetchImage", 0xFF01, kBuf, kSize) == kFatal);
+        CHECK(ps_read32(b, kSize) == 0);
+        CHECK(g.call("cellSysmoduleFetchImage", 0x0001, kBuf, kSize) == kFatal);
+
+        // A module file this process can't load (the tests have no module loader): FATAL, with the error as the ID.
+        const char path[] = "/app_home/mod.sprx";
+        std::memcpy(b + kPath, path, sizeof(path));
+        REQUIRE(g.call("cellSysmoduleLoadModuleFile", kPath, kUnk) == kFatal);
+        CHECK(static_cast<s32>(ps_read32(b, kUnk)) < 0);
+        CHECK(ps_read32(b, kUnk + 4) == 0xFFFFFFFF);
+        CHECK(g.call("cellSysmoduleUnloadModuleFile", kUnk) == kFatal);
+
+        CHECK(g.call("cellSysmoduleSetDebugmode", 1) == 0);
+        CHECK(g.call("cellSysmoduleSetDebugmode", 0) == 0);
+    }
+    fsys::remove_all(root);
+}

@@ -14,12 +14,14 @@
 //
 // Deviations: the debug/retail variants of libfs, libgcm_sys and liblv2dbg are one module each.
 
+#include <algorithm>
 #include <array>
 #include <initializer_list>
 #include <mutex>
 #include <string_view>
 
 #include "guest.hpp"
+#include "prx.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
@@ -268,6 +270,8 @@ struct SysmoduleState {
     std::mutex mutex;
     std::array<s32, kExternalCount + kInternalCount> loaded{}; // external IDs, then internal ones by index
     u32 container = kNoContainer; // cellSysmoduleSetMemcontainer's: where later loads would put their PRX images
+    bool debug_mode = false;      // cellSysmoduleSetDebugmode(1): modules from /app_home/ (recorded only)
+    std::recursive_mutex file_mutex; // the module file calls (RPCS3's lwmutex; module_start may load more)
 
     explicit SysmoduleState(HleProcess& p)
     {
@@ -472,6 +476,143 @@ s32 cellSysmoduleUnloadModuleEx(PPUContext&, u16 id)
     return ex_loadable(id) ? unload_internal(state(), id) : error(CELL_SYSMODULE_ERROR_UNKNOWN);
 }
 
+// ---- module files, images and the debug mode (RPCS3)
+
+// SysmoduleUnk: be s32 prx_id, unk.
+constexpr u32 kSysmoduleUnkSize = 8;
+
+// cellSysmoduleLoadModuleFile(path, SysmoduleUnk*): loads and starts a module file by path (RPCS3: sys_prx_load_module
+// and sys_prx_start_module under the library's mutex). The ID goes to unk->prx_id even when it is an error.
+s32 cellSysmoduleLoadModuleFile(PPUContext& ctx, u32 path, u32 unk)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!unk || !guest_readable(t, unk, kSysmoduleUnkSize)) {
+        log_call_site(ctx, guest_base(ctx), "cellSysmoduleLoadModuleFile: the SysmoduleUnk is not guest memory");
+        return error(CELL_SYSMODULE_ERROR_FATAL);
+    }
+    std::lock_guard lock(state().file_mutex);
+    u8* base = guest_base(ctx);
+    const s32 id = prx_load_module(ctx, path, 0);
+    ps_write32(base, unk, static_cast<u32>(id));
+    ps_write32(base, unk + 4, 0xFFFFFFFF);
+    if (id < 1) {
+        PS_LOG_ERROR(kChan, "cellSysmoduleLoadModuleFile: loading failed ({:#010x})", static_cast<u32>(id));
+        return error(CELL_SYSMODULE_ERROR_FATAL);
+    }
+    StackVar result(ctx, base, 4);
+    if (const s32 r = prx_start_module(ctx, static_cast<u32>(id), 0, 0, result.addr()); r != lv2::CELL_OK) {
+        prx_unload_module(ctx, static_cast<u32>(id));
+        PS_LOG_ERROR(kChan, "cellSysmoduleLoadModuleFile: starting module {:#x} failed ({:#010x})", id,
+            static_cast<u32>(r));
+        return r;
+    }
+    PS_LOG_INFO(kChan, "cellSysmoduleLoadModuleFile: module {:#x} loaded and started", id);
+    return lv2::CELL_OK;
+}
+
+// cellSysmoduleUnloadModuleFile(const SysmoduleUnk*): stops and unloads it; any failure is FATAL.
+s32 cellSysmoduleUnloadModuleFile(PPUContext& ctx, u32 unk)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!unk || !guest_readable(t, unk, kSysmoduleUnkSize)) {
+        log_call_site(ctx, guest_base(ctx), "cellSysmoduleUnloadModuleFile: the SysmoduleUnk is not guest memory");
+        return error(CELL_SYSMODULE_ERROR_FATAL);
+    }
+    std::lock_guard lock(state().file_mutex);
+    u8* base = guest_base(ctx);
+    const u32 id = ps_read32(base, unk);
+    StackVar result(ctx, base, 4);
+    if (prx_stop_module(ctx, id, 0, 0, result.addr()) != lv2::CELL_OK || prx_unload_module(ctx, id) != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "cellSysmoduleUnloadModuleFile({:#x}): stopping or unloading failed", id);
+        return error(CELL_SYSMODULE_ERROR_FATAL);
+    }
+    return lv2::CELL_OK;
+}
+
+// cellSysmoduleSetDebugmode(mode): where modules load from (mode 1: /app_home/, else /dev_flash/sys/). Modules are
+// linked at load time here (see the top of the file), so the path is only recorded.
+s32 cellSysmoduleSetDebugmode(PPUContext&, u32 mode)
+{
+    SysmoduleState& s = state();
+    std::lock_guard lock(s.mutex);
+    s.debug_mode = mode == 1;
+    PS_LOG_INFO(kChan, "cellSysmoduleSetDebugmode({}): modules from {}", mode, s.debug_mode ? "/app_home/" : "/dev_flash/sys/");
+    return lv2::CELL_OK;
+}
+
+// The images of IDs 0xFF00 and up: 0xFF00 is the firmware's Flash ATRAC picture; 0xFF01 has no path (RPCS3: the
+// string is empty on the PS3 as well); the rest are FATAL.
+constexpr u16 kImageIdBase = 0xFF00;
+constexpr char kFlashAtracImage[] = "/dev_flash/sys/external/flashATRAC.pic";
+constexpr u32 kFsStatSize = 0x34, kFsStatSizeOffset = 36; // CellFsStat, its be u64 size
+
+// Opens the image of `id` and returns its descriptor and size, or nothing (the file is missing or can't be read).
+bool open_image(PPUContext& ctx, u16 id, u32& fd, u64& size)
+{
+    if (id < kImageIdBase || (id & 0xFF) >= 2) return false;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = guest_base(ctx);
+    const std::string_view path = (id & 0xFF) == 0 ? std::string_view(kFlashAtracImage) : std::string_view();
+    StackVar vars(ctx, base, 0x80 + kFsStatSize);
+    const u32 path_addr = vars.addr(), fd_addr = vars.addr() + 0x40, sb = vars.addr() + 0x80;
+    for (usize i = 0; i < path.size(); i++) ps_write8(base, path_addr + static_cast<u32>(i), static_cast<u8>(path[i]));
+    if (lv2::sys_fs_open(t, path_addr, 0, fd_addr, 0, 0, 0) != lv2::CELL_OK) return false;
+    fd = ps_read32(base, fd_addr);
+    if (lv2::sys_fs_fstat(t, fd, sb) != lv2::CELL_OK) {
+        lv2::sys_fs_close(t, fd);
+        return false;
+    }
+    size = ps_read64(base, sb + kFsStatSizeOffset);
+    return true;
+}
+
+s32 cellSysmoduleGetImagesize(PPUContext& ctx, u16 id, u32 image_size)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!image_size || !guest_readable(t, image_size, 4)) {
+        log_call_site(ctx, guest_base(ctx), "cellSysmoduleGetImagesize: the size pointer is not guest memory");
+        return error(CELL_SYSMODULE_ERROR_FATAL);
+    }
+    ps_write32(guest_base(ctx), image_size, 0);
+    u32 fd = 0;
+    u64 size = 0;
+    if (!open_image(ctx, id, fd, size)) {
+        PS_LOG_WARN(kChan, "cellSysmoduleGetImagesize({:#06x}): no such image", id);
+        return error(CELL_SYSMODULE_ERROR_FATAL);
+    }
+    lv2::sys_fs_close(t, fd);
+    ps_write32(guest_base(ctx), image_size, static_cast<u32>(size));
+    return lv2::CELL_OK;
+}
+
+// cellSysmoduleFetchImage(id, void* buf, u32* size): at most *size bytes of the image; *size becomes what was read.
+s32 cellSysmoduleFetchImage(PPUContext& ctx, u16 id, u32 buf, u32 buf_size)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (id < kImageIdBase) return error(CELL_SYSMODULE_ERROR_FATAL);
+    if (!buf_size || !guest_readable(t, buf_size, 4)) {
+        log_call_site(ctx, guest_base(ctx), "cellSysmoduleFetchImage: the size pointer is not guest memory");
+        return error(CELL_SYSMODULE_ERROR_FATAL);
+    }
+    u8* base = guest_base(ctx);
+    u32 fd = 0;
+    u64 size = 0;
+    if (!open_image(ctx, id, fd, size)) {
+        ps_write32(base, buf_size, 0);
+        PS_LOG_WARN(kChan, "cellSysmoduleFetchImage({:#06x}): no such image", id);
+        return error(CELL_SYSMODULE_ERROR_FATAL);
+    }
+    StackVar nread(ctx, base, 8);
+    const u64 want = std::min<u64>(ps_read32(base, buf_size), size);
+    if (lv2::sys_fs_read(t, fd, buf, want, nread.addr()) != lv2::CELL_OK) {
+        ps_write32(base, buf_size, 0);
+    } else {
+        ps_write32(base, buf_size, static_cast<u32>(ps_read64(base, nread.addr())));
+    }
+    lv2::sys_fs_close(t, fd);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_cellSysmodule(Registry& r)
@@ -488,6 +629,11 @@ void register_cellSysmodule(Registry& r)
         PS_HLE_FUNC(0x70E319B5, cellSysmoduleIsLoadedEx),
         PS_HLE_FUNC(0x1A267F98, cellSysmoduleLoadModuleEx),
         PS_HLE_FUNC(0xFD0E1CAC, cellSysmoduleUnloadModuleEx),
+        PS_HLE_FUNC(0xC93200DE, cellSysmoduleLoadModuleFile),
+        PS_HLE_FUNC(0x205FE2A0, cellSysmoduleUnloadModuleFile),
+        PS_HLE_FUNC(0x03D90241, cellSysmoduleSetDebugmode),
+        PS_HLE_FUNC(0x1EF115EF, cellSysmoduleGetImagesize),
+        PS_HLE_FUNC(0x3C92BE09, cellSysmoduleFetchImage),
     });
 }
 

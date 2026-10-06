@@ -8,6 +8,7 @@
 #include <string>
 
 #include "guest.hpp"
+#include "prx.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
@@ -154,6 +155,20 @@ s32 sys_prx_get_module_id_by_name(PPUContext& ctx, u32 name, u64 /*flags*/, u32 
 }
 
 } // namespace
+
+s32 prx_load_module(PPUContext& ctx, u32 path, u64 flags) { return sys_prx_load_module(ctx, path, flags, 0); }
+
+s32 prx_start_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result)
+{
+    return sys_prx_start_module(ctx, id, args, argp, result, 0, 0);
+}
+
+s32 prx_stop_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result)
+{
+    return sys_prx_stop_module(ctx, id, args, argp, result, 0, 0);
+}
+
+s32 prx_unload_module(PPUContext& ctx, u32 id) { return sys_prx_unload_module(ctx, id, 0, 0); }
 
 void register_sys_prx(Registry& r)
 {

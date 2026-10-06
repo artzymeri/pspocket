@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "pspocket/ppu/runtime.h"
@@ -276,4 +277,53 @@ TEST_CASE("sys_net_free_thread_context: there is no thread context to free", "[h
     GuestThread g(f, 0, "net");
     CHECK(g.call("sys_net_free_thread_context", 0, 1) == 0); // GTA V's call
     CHECK(g.call("sys_net_free_thread_context", 0x0100000000000001ull, 0) == 0);
+}
+
+TEST_CASE("cellNetCtl: game update checks find no update; the start dialog abort", "[hle][net]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread g(f, 0, "update");
+    u8* b = f.base();
+    write_callback(b);
+    constexpr u32 kParam = kData + 0x100;
+
+    CHECK(g.call("cellNetCtlNetStartDialogAbortAsync") == kNetNotInit);
+    REQUIRE(g.call("cellNetCtlInit") == 0);
+    CHECK(g.call("cellNetCtlNetStartDialogAbortAsync") == 0);
+
+    // (status, error, userdata) from the next cellSysutilCheckCallback: NO_UPDATE (0) for a start, FINISHED (5) at the
+    // finish; no cellGameUpdateInit needed (RPCS3).
+    REQUIRE(g.call("cellGameUpdateCheckStartAsync", kParam, kOpd, 0x1111) == 0);
+    REQUIRE(g.call("cellGameUpdateCheckStartWithoutDialogAsync", kOpd, 0x2222) == 0);
+    REQUIRE(g.call("cellGameUpdateCheckFinishAsync", kOpd, 0x3333) == 0);
+    CHECK(callback_calls(b) == 0);
+    REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+    REQUIRE(callback_calls(b) == 3);
+    CHECK(callback_status(b, 0) == 0);
+    CHECK(callback_param(b, 0) == 0);
+    CHECK(callback_userdata(b, 0) == 0x1111);
+    CHECK(callback_status(b, 1) == 0);
+    CHECK(callback_userdata(b, 1) == 0x2222);
+    CHECK(callback_status(b, 2) == 5);
+    CHECK(callback_userdata(b, 2) == 0x3333);
+
+    // The Ex callbacks get (CellGameUpdateResult*, userdata): {status, error_code, app_ver}.
+    for (const auto& [fn, status] : {std::pair<const char*, u32>{"cellGameUpdateCheckStartWithoutDialogAsyncEx", 0},
+             {"cellGameUpdateCheckFinishAsyncEx", 5}}) {
+        INFO(fn);
+        std::memset(b + kLog, 0, 0x100);
+        REQUIRE(g.call(fn, kOpd, 0x4444) == 0);
+        REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+        REQUIRE(callback_calls(b) == 1);
+        const u32 result = callback_status(b, 0);
+        CHECK(callback_param(b, 0) == 0x4444);
+        CHECK(ps_read32(b, result) == status);
+        CHECK(ps_read32(b, result + 4) == 0);
+    }
+    std::memset(b + kLog, 0, 0x100);
+    REQUIRE(g.call("cellGameUpdateCheckStartAsyncEx", kParam, kOpd, 0x5555) == 0);
+    REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+    CHECK(callback_param(b, 0) == 0x5555);
+    REQUIRE(g.call("cellNetCtlTerm") == 0);
 }
