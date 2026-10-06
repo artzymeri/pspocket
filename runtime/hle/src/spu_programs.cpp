@@ -365,6 +365,10 @@ void observe_get(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size)
         else r.ls_start = right_start;
         attach_blocks(m, index);
         if (m.last == index) m.last = kRuns;
+        // Identified again when it runs next: what the copy wrote over may be the program's code.
+        r.resolved = false;
+        r.hash = 0;
+        r.program = nullptr;
     }
     u32 index = m.last;
     if (extends && index < kRuns) {
@@ -401,6 +405,30 @@ void log_modified(const u8* ls, const u8* guest, u32 size, u32 ls_start, u32 ea_
         }
     PS_LOG_INFO(kChan, "SPU module at LS 0x{:05x}+{:#x} (guest {:#x}) changed before it ran: {} words differ from its guest "
         "copy, +{:#x} to +{:#x}; interpreted", ls_start, size, ea_start, words, first, last);
+}
+
+// Whether program p lifted any instruction outside [from, to) (offsets from its start): what a copy over part of its
+// module wrote over (D-085: code_words; none means all words are instructions).
+bool lifted_outside(const ps_spu_program* p, u32 from, u32 to)
+{
+    for (u32 w = 0; w < p->code_size / 4; w++) {
+        if (w * 4 >= from && w * 4 < to) continue;
+        if (!p->code_words || ((p->code_words[w >> 5] >> (w & 31)) & 1)) return true;
+    }
+    return false;
+}
+
+// A module part of whose code was written over: logged once per guest address.
+void log_cut_code(const Run& r)
+{
+    static std::mutex mutex;
+    static std::unordered_set<u32> logged;
+    {
+        std::lock_guard lock(mutex);
+        if (!logged.insert(r.ea_start).second) return;
+    }
+    PS_LOG_INFO(kChan, "SPU module at LS 0x{:05x}+{:#x} (guest {:#x}): a copy wrote over its code, 0x{:05x} to 0x{:05x} "
+        "is left; interpreted", r.id_start, r.id_end - r.id_start, r.ea_start, r.ls_start, r.ls_end);
 }
 
 // ---- the worker's stops (D-087)
@@ -483,6 +511,13 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
             return nullptr;
         }
         r.program = identify(base, {ImageKind::Module, r.ea_start, r.id_start, size, pc}, &r.hash);
+        // A copy over part of it may only have written over its data (D-085): code there would be stale.
+        if (r.program && lifted_outside(r.program, r.ls_start - r.id_start, r.ls_end - r.id_start)) {
+            g_modified.fetch_add(1, std::memory_order_relaxed);
+            log_cut_code(r);
+            r.program = nullptr;
+            return nullptr;
+        }
         if (r.program) g_modules.fetch_add(1, std::memory_order_relaxed);
     }
     if (r.program) {

@@ -5,6 +5,7 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -355,8 +356,10 @@ TEST_CASE("SPU programs: a module with data copied over its tail still runs lift
     ps_write32(base, kGuest, 0x00000007); // `stop 0x7` at its entry, for the interpreter
     for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
     const ps_spu_entry entries[] = {{kModule, &module_entry}, {kModule + 0x400, &module_entry}};
+    std::array<u32, kModuleSize / 128> code_words{}; // its first three quarters are instructions, the rest data
+    for (u32 w = 0; w < kModuleSize * 3 / 16; w++) code_words[w >> 5] |= 1u << (w & 31);
     ps_spu_program program{"spu_tail_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
-        PS_SPU_XFLOAT_APPROXIMATE, 0, 2, entries, nullptr, nullptr};
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 2, entries, nullptr, code_words.data()};
     ps_spu_register_program(&program);
     hle::enable_spu_modules();
     Spu spu(base);
@@ -379,13 +382,17 @@ TEST_CASE("SPU programs: a module with data copied over its tail still runs lift
     get(kModule + 0xC00, kGuest + 0x8000, 0x400);
     CHECK(run_at(kModule) == 0x42);
     CHECK(spu.ctx.program == &program);
-    // Data over its head instead: the rest is still the module (relocatable or not, where it was copied).
+    // Data over its code: the rest is interpreted (a branch into the copied part would run stale code), also when
+    // the module ran lifted before the copy.
+    get(kModule + 0x800, kGuest + 0x8000, 0x400);
+    CHECK(run_at(kModule) == 0x7);
+    CHECK(spu.ctx.program == nullptr);
     for (u32 i = 0; i < 4; i++) get(kModule + i * 0x400, kGuest + i * 0x400, 0x400);
     get(kModule, kGuest + 0x8000, 0x400);
     CHECK(run_at(kModule) == 0x0); // the data (zeros: `stop 0`) at the entry, interpreted
     CHECK(spu.ctx.program == nullptr);
-    CHECK(run_at(kModule + 0x400) == 0x42); // the module's second quarter: still the module, lifted
-    CHECK(spu.ctx.program == &program);
+    CHECK(run_at(kModule + 0x400) == 0x0); // its second quarter, interpreted to the zeros past it
+    CHECK(spu.ctx.program == nullptr);
     // Covered entirely: gone.
     for (u32 i = 0; i < 4; i++) get(kModule + i * 0x400, kGuest + i * 0x400, 0x400);
     get(kModule, kGuest + 0x8000, kModuleSize);
