@@ -85,6 +85,7 @@ T reg_arg(u64 v)
     else if constexpr (std::is_same_v<T, u32>) return static_cast<u32>(v); // low word, as RPCS3 ppu_gpr_cast
     else if constexpr (std::is_same_v<T, s32>) return static_cast<s32>(static_cast<u32>(v));
     else if constexpr (std::is_same_v<T, u16>) return static_cast<u16>(v);
+    else if constexpr (std::is_same_v<T, s16>) return static_cast<s16>(static_cast<u16>(v));
     else if constexpr (std::is_same_v<T, u8>) return static_cast<u8>(v);
     else if constexpr (std::is_same_v<T, bool>) return (v & 0xFF) != 0; // b8: the low byte
     else static_assert(sizeof(T) == 0, "unsupported HLE argument type");

@@ -4031,6 +4031,30 @@ CELL_AVC(2)_ERROR_INVALID_ARGUMENT instead of aborting.
 Tests: tests/hle/test_avc.cpp (the load and unload events through a guest callback, the dropped events, the
 parameter checks, the settings, the size estimate, cellSysutilAvcExt's checks and its load).
 
+## D-188 · 2026-10-06 · cellImeJp, the Japanese input method, as RPCS3
+
+libsysutil_imejp is always native. The 41 functions RPCS3 implements in cellImeJpUtility are now there
+(cellImeJpOpenExt is its stub). A game drives the IME with its own text entry, so this is RPCS3's ime_jp_manager:
+
+- One IME per process, opened (Open, Open2, Open3 with up to four dictionaries, noted and not used) with a non-zero
+  memory container and closed again; the handle is RPCS3's 0xF0000000, and no call checks it.
+- The input (UTF-16, at most 127 characters), its cursor and its focus (the part to convert) move by RPCS3's rules:
+  a character typed inside the focus grows it, one typed outside becomes the focus; delete and backspace shrink it;
+  the convert area's end wraps between one character and the rest of the input; clauses move to the next, previous,
+  first or last part.
+- Converting offers one candidate, the focus string itself (RPCS3 has no dictionary); confirming takes the input as
+  typed. RPCS3's states and their checks decide what each call may do (BEFORE_INPUT, BEFORE_CONVERT, CONVERTING,
+  CANDIDATES); no predictions.
+- The extension characters allowed by default follow the game's SDK version (before 3.6: two sets; then three).
+
+pspocket's HLE functions may now take s16 arguments (cellImeJp's options and indices).
+
+Difference from RPCS3: pointers are checked before use (D-042); an input string that runs out of guest memory ends
+there.
+
+Tests: tests/hle/test_imejp.cpp (open and close, typing, editing, the focus through extend, shorten and clause moves,
+the candidate list, confirming, the 127-character limit, reset).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
