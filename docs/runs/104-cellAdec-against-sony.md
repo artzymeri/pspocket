@@ -34,5 +34,6 @@ starts under the interpreter.
 
 ## The gate
 
-Pending: run on a quiet machine with run 103's repeat (GTA V and Assassin's Creed do not import cellAdec; the loader
-change runs for every game).
+scripts/gate.sh all at c861df4 (inventory/gate/20261006-210554-c861df4, load average 6.6 with an iOS simulator
+running): 20 of 20 test suites; GTA V's walk 18 of 18, 29.8 fps median, 29.0 in the slowest 5 s window, 823 frames
+compared, 921 MB peak. GTA V and Assassin's Creed do not import cellAdec; the loader change runs for every game.

@@ -53,3 +53,6 @@ its slowest 5 s window at 24.4 (the limit is 24; 29.4 in run 102). A rerun of th
 42 (an iOS simulator running PSPocket, a system asset service at 98% CPU, a browser). GTA V creates no task with an
 exit callback, so the SPURS change does not run for it; the check is repeated on a quiet machine before this is
 settled.
+
+Settled in run 104's gate (20261006-210554-c861df4, load average 6.6, D-197 on top): 18 of 18, 29.8 fps median and
+29.0 in the slowest window.
