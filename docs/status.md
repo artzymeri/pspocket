@@ -143,7 +143,11 @@ own mean and memory estimate; all reproduced.
 The outside sources the build reads (RPCS3 for the keys and libpng, the LLVM source of the phone's compiler) now live
 in `external/` inside the repository, gitignored (D-201).
 
-Next: cellGifDec, measured against Sony's the same way; the other audio codec cores on FFmpeg
+cellGifDec (D-202, run 108): pspocket's own, the same as Sony's libgifdec in 1,131 answers and 85 images, with SPU
+threads off and on (libgifdec is giflib; each DecodeData returns one record, an image being the whole logical screen).
+With it, step 3's image decoders are pspocket's (their Ext functions are still Sony's).
+
+Next: the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
 docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
 with games nobody has analysed (each run's log names what is still missing).

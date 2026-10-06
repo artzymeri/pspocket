@@ -160,7 +160,11 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   versions must keep the same rounding (the digest test and the comparison show it). The quality IDCT runs in double
   as Sony's does: keep it so. The Ext functions are Sony's still: write them when a game imports one. The SPU
   program's IDCTs (jpeg_dec_spu) were never used in the measured runs; if a game ever shows otherwise, compare again.
-- **State:** open; cellGifDec next; the other audio cores when a game's log shows one.
+- **cellGifDec (D-202):** each image record decodes into a host buffer, then fills the whole screen into the game's
+  (as libgifdec's output is). The LZW decoder follows giflib's line by line: fine for a game's few small GIFs; measure
+  before changing. Not reproduced: the bytes past an extension in libgifdec's buffer (its own state) and a background
+  index past the table. Ext functions still Sony's.
+- **State:** open; the other audio cores when a game's log shows one.
 
 ## The gate (D-149)
 
