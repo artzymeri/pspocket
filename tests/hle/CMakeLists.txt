@@ -1,11 +1,15 @@
 # HLE linkage, sysPrxForUser and the process loader: registry checks, stub calls, lwmutex on real lv2 threads, a
 # synthetic executable booted end to end, and pspocket-boot's fault report.
 pspocket_add_test(test_hle
-    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_audio.cpp test_audio_buffering.cpp test_spu_programs.cpp test_gcm.cpp test_np.cpp test_np2.cpp test_np_tus.cpp test_np_clans.cpp test_commerce2.cpp test_spurs_api.cpp test_spurs_jobchain.cpp test_spurs_queue.cpp test_spurs_run.cpp test_spurs_semaphore.cpp test_sys_io.cpp test_sysutil.cpp test_sysutil_misc.cpp test_media.cpp test_avc.cpp test_imejp.cpp test_rec.cpp test_pamf.cpp test_dmux.cpp test_ovis.cpp test_devices.cpp test_savedata.cpp test_misc_hle.cpp test_pad_script.cpp test_trophy.cpp test_trophy_files.cpp test_voice.cpp test_rtc.cpp test_net.cpp test_lle.cpp test_sync.cpp test_ac_sysutil_fs_pad.cpp test_ac_gcm_spurs_prx.cpp test_la_noire.cpp test_spu_threads.cpp test_gcm_sys.cpp test_sysprx_libc.cpp
+    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_audio.cpp test_audio_buffering.cpp test_spu_programs.cpp test_gcm.cpp test_np.cpp test_np2.cpp test_np_tus.cpp test_np_clans.cpp test_commerce2.cpp test_spurs_api.cpp test_spurs_jobchain.cpp test_spurs_queue.cpp test_spurs_run.cpp test_spurs_semaphore.cpp test_sys_io.cpp test_sysutil.cpp test_sysutil_misc.cpp test_media.cpp test_avc.cpp test_imejp.cpp test_rec.cpp test_pamf.cpp test_dmux.cpp test_vdec.cpp test_ovis.cpp test_devices.cpp test_savedata.cpp test_misc_hle.cpp test_pad_script.cpp test_trophy.cpp test_trophy_files.cpp test_voice.cpp test_rtc.cpp test_net.cpp test_lle.cpp test_sync.cpp test_ac_sysutil_fs_pad.cpp test_ac_gcm_spurs_prx.cpp test_la_noire.cpp test_spu_threads.cpp test_gcm_sys.cpp test_sysprx_libc.cpp
     LIBS pspocket::loader pspocket_test_synthetic pspocket::recomp_ppu pspocket::recomp_spu)
 # HLE modules' internal headers (sysutil.hpp: the event queue other modules use), and lv2's (internal.hpp: the RSX
 # device's flip mode and tiles, which cellGcmSys sets through lv2, white-box).
 target_include_directories(test_hle PRIVATE ${PROJECT_SOURCE_DIR}/runtime/hle/src ${PROJECT_SOURCE_DIR}/runtime/lv2/src)
+# FFmpeg, to check the synthetic H.264 the cellVdec tests write (h264_writer.hpp) with a decoder of its own.
+if(TARGET pspocket::ffmpeg)
+    target_link_libraries(test_hle PRIVATE pspocket::ffmpeg)
+endif()
 
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.

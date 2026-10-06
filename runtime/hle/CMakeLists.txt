@@ -62,5 +62,9 @@ target_include_directories(pspocket_hle PUBLIC include)
 target_link_libraries(pspocket_hle PUBLIC pspocket::core pspocket::ppu pspocket::spu pspocket::lv2 pspocket::rsx)
 # SHA-1, for the checksum of trophy packs (trophy_files.cpp).
 target_link_libraries(pspocket_hle PRIVATE pspocket::recomp_common)
+# FFmpeg's decoders for the media libraries (D-181, cellVdec D-195); without them those build without decoding.
+if(TARGET pspocket::ffmpeg)
+    target_link_libraries(pspocket_hle PRIVATE pspocket::ffmpeg)
+endif()
 pspocket_set_warnings(pspocket_hle)
 add_library(pspocket::hle ALIAS pspocket_hle)
