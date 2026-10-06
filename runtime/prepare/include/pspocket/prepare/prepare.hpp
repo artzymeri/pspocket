@@ -79,10 +79,16 @@ struct Result {
 
 Result prepare_game(const Options& options);
 
+// The lifters' generation: raised when a change fixes how translated code behaves (not for every change, which only
+// the translator hash follows): a library of an older generation is prepared again (library_is_current). 2: D-161
+// (a longjmp or fiber switch in translated code).
+inline constexpr int kTranslatorGeneration = 2;
+
 // What a game library was made from and by (game_dir/manifest.json).
 struct Manifest {
     std::string title_id, executable_sha256, made_by, compiler, cpu;
     std::string abi_hash, translator_hash; // hex
+    int translator_generation = 1;         // kTranslatorGeneration it was made with (1: before the field)
     long long made_at = 0;                 // seconds since 1970
     double seconds = 0;
     size_t files = 0;

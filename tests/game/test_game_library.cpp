@@ -19,6 +19,7 @@
 #include "pspocket/codesign/codesign.hpp"
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/game/host.hpp"
+#include "pspocket/prepare/prepare.hpp"
 #include "pspocket/ppu/context.h"
 #include "pspocket/ppu/runtime.h"
 #include "ps_selftest_ppu_image.h"
@@ -234,3 +235,29 @@ TEST_CASE("time left: follows the files done, per kind, and lays the rest out ov
     // A file far past its prediction is given a tenth of it more, not a negative time.
     CHECK(one.seconds_left({File{0, 1.0, 50.0}}, {}) == Catch::Approx(0.15));
 }
+
+TEST_CASE("prepared libraries: one made before a fix to the lifters is prepared again (D-161)")
+{
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / std::format("pspocket-manifest-{}", static_cast<long>(getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    std::ofstream(dir / "game.dylib") << "not a library: only its presence is checked";
+    const auto manifest = [&](const std::string& generation) {
+        std::ofstream(dir / "manifest.json")
+            << std::format("{{\n  \"title_id\": \"TEST00000\",\n  \"executable_sha256\": \"abc\",\n"
+                           "  \"abi_hash\": \"{:016x}\",\n  \"translator_hash\": \"{:016x}\",\n{}"
+                           "  \"cpu\": \"{}\",\n  \"made_at\": 1\n}}\n",
+                   ps_game_abi_hash, ps_game_translator_hash, generation, pspocket::codegen::host_cpu());
+    };
+    std::string why;
+    manifest(""); // made before the field: generation 1
+    CHECK_FALSE(pspocket::prepare::library_is_current(dir.string(), "abc", &why));
+    CHECK(why.find("fix") != std::string::npos);
+    manifest(std::format("  \"translator_generation\": {},\n", pspocket::prepare::kTranslatorGeneration));
+    CHECK(pspocket::prepare::library_is_current(dir.string(), "abc", &why));
+    CHECK(why == "ready");
+    CHECK_FALSE(pspocket::prepare::library_is_current(dir.string(), "another executable", &why));
+    fs::remove_all(dir);
+}
+
