@@ -26,21 +26,21 @@ constexpr TextureFormatInfo kFormats[] = {
     {tex::COMPRESSED_B8R8_G8R8, "COMPRESSED_B8R8_G8R8", 4, 2, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::COMPRESSED_R8B8_R8G8, "COMPRESSED_R8B8_R8G8", 4, 2, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::R6G5B5, "R6G5B5", 2, 1, TexelDecode::R6G5B5, DecodedFormat::RGBA8},
-    {tex::DEPTH24_D8, "DEPTH24_D8", 4, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
-    {tex::DEPTH24_D8_FLOAT, "DEPTH24_D8_FLOAT", 4, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
+    {tex::DEPTH24_D8, "DEPTH24_D8", 4, 1, TexelDecode::D24, DecodedFormat::R32F},
+    {tex::DEPTH24_D8_FLOAT, "DEPTH24_D8_FLOAT", 4, 1, TexelDecode::D24F, DecodedFormat::R32F},
     {tex::DEPTH16, "DEPTH16", 2, 1, TexelDecode::D16, DecodedFormat::R16},
     {tex::DEPTH16_FLOAT, "DEPTH16_FLOAT", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
     {tex::X16, "X16", 2, 1, TexelDecode::X16, DecodedFormat::R16},
     {tex::Y16_X16, "Y16_X16", 4, 1, TexelDecode::Y16X16, DecodedFormat::RG16},
     {tex::R5G5B5A1, "R5G5B5A1", 2, 1, TexelDecode::R5G5B5A1, DecodedFormat::RGBA8},
-    {tex::COMPRESSED_HILO8, "COMPRESSED_HILO8", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
-    {tex::COMPRESSED_HILO_S8, "COMPRESSED_HILO_S8", 2, 1, TexelDecode::Unsupported, DecodedFormat::RGBA8},
+    {tex::COMPRESSED_HILO8, "COMPRESSED_HILO8", 2, 1, TexelDecode::HILO8, DecodedFormat::RGBA8},
+    {tex::COMPRESSED_HILO_S8, "COMPRESSED_HILO_S8", 2, 1, TexelDecode::HILOS8, DecodedFormat::RGBA16F},
     {tex::W16_Z16_Y16_X16_FLOAT, "W16_Z16_Y16_X16_FLOAT", 8, 1, TexelDecode::W16Z16Y16X16F, DecodedFormat::RGBA16F},
     {tex::W32_Z32_Y32_X32_FLOAT, "W32_Z32_Y32_X32_FLOAT", 16, 1, TexelDecode::W32Z32Y32X32F, DecodedFormat::RGBA32F},
     {tex::X32_FLOAT, "X32_FLOAT", 4, 1, TexelDecode::X32F, DecodedFormat::R32F},
     {tex::D1R5G5B5, "D1R5G5B5", 2, 1, TexelDecode::D1R5G5B5, DecodedFormat::RGBA8},
     {tex::D8R8G8B8, "D8R8G8B8", 4, 1, TexelDecode::DRGB8, DecodedFormat::RGBA8},
-    {tex::Y16_X16_FLOAT, "Y16_X16_FLOAT", 4, 1, TexelDecode::Unsupported, DecodedFormat::RG16F},
+    {tex::Y16_X16_FLOAT, "Y16_X16_FLOAT", 4, 1, TexelDecode::Y16X16F, DecodedFormat::RG16F},
 };
 
 u32 floor_log2(u32 v) { return v ? 31u - static_cast<u32>(std::countl_zero(v)) : 0u; }
@@ -214,13 +214,21 @@ std::array<u8, 4> texture_channel_sources(const TextureFormatInfo& fmt, u32 rema
     bool float_format = false;
     switch (fmt.decode) {
     case TexelDecode::X32F:
+    case TexelDecode::D24:
+    case TexelDecode::D24F:
     case TexelDecode::D16: // RPCS3 VKFormats.cpp get_component_mapping: the depth formats read R in every channel
         base = {0, 0, 0, 0};
         float_format = true;
         break;
     case TexelDecode::W16Z16Y16X16F:
-    case TexelDecode::W32Z32Y32X32F:
-    case TexelDecode::Y16X16F: float_format = true; break;
+    case TexelDecode::W32Z32Y32X32F: float_format = true; break;
+    // RPCS3 VKFormats.cpp get_component_mapping (A, R, G, B): Y16_X16_FLOAT, HILO8 and HILO_S8 {R, G, R, G}.
+    case TexelDecode::Y16X16F:
+        base = {0, 1, 0, 1};
+        float_format = true;
+        break;
+    case TexelDecode::HILO8:
+    case TexelDecode::HILOS8: base = {0, 1, 0, 1}; break;
     // RPCS3 VKFormats.cpp get_component_mapping (A, R, G, B): X16 {R, 1, R, 1}, Y16_X16 and G8B8 {G, R, G, R}.
     case TexelDecode::X16: base = {0, kChannelOne, 0, kChannelOne}; break;
     case TexelDecode::Y16X16:
@@ -370,6 +378,20 @@ bool decode_level_cpu(const TextureLayout& layout, const TextureLevel& level, co
             case TexelDecode::Y16X16F: o = {half_to_float(ps_ld16(p)), half_to_float(ps_ld16(p + 2)), 0.f, 1.f}; break;
             case TexelDecode::X16:
             case TexelDecode::D16: o = {ps_ld16(p) / 65535.f, 0.f, 0.f, 1.f}; break;
+            case TexelDecode::D24: o = {static_cast<float>(ps_ld32(p) >> 8) / 16777215.f, 0.f, 0.f, 1.f}; break;
+            case TexelDecode::HILO8: o = {unorm8(p[1]), unorm8(p[0]), 0.f, 1.f}; break;
+            case TexelDecode::HILOS8: {
+                auto snorm = [](u8 v) { return std::max(static_cast<float>(static_cast<s8>(v)) / 127.f, -1.f); };
+                o = {snorm(p[1]), snorm(p[0]), 0.f, 1.f};
+                break;
+            }
+            case TexelDecode::D24F: {
+                const u32 bits = (ps_ld32(p) >> 8) << 7;
+                float f;
+                std::memcpy(&f, &bits, 4);
+                o = {f, 0.f, 0.f, 1.f};
+                break;
+            }
             case TexelDecode::Y16X16: o = {ps_ld16(p) / 65535.f, ps_ld16(p + 2) / 65535.f, 0.f, 1.f}; break;
             default: return false;
             }

@@ -45,7 +45,8 @@ static bool is_shadow_texture(const TextureInfo& t)
 
 static_assert(static_cast<u32>(TexelDecode::ARGB8) == 1 && static_cast<u32>(TexelDecode::X16) == 14 &&
                   static_cast<u32>(TexelDecode::Y16X16) == 15 && static_cast<u32>(TexelDecode::DXT45) == 18 &&
-                  static_cast<u32>(TexelDecode::D16) == 19,
+                  static_cast<u32>(TexelDecode::D16) == 19 && static_cast<u32>(TexelDecode::D24) == 21 &&
+                  static_cast<u32>(TexelDecode::D24F) == 22 && static_cast<u32>(TexelDecode::HILOS8) == 24,
     "TexelDecode values are mirrored in kernels.hpp");
 
 // ---- transient allocator ------------------------------------------------------------------------------------------

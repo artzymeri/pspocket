@@ -211,6 +211,65 @@ TEST_CASE("CPU decoders: 16-bit formats are big-endian with RPCS3's bit expansio
     CHECK(decode_one(tex::DEPTH16, 0x8080) == std::array<int, 4>{128, 0, 0, 255});
 }
 
+TEST_CASE("CPU decoders: 24-bit depth textures in memory, fixed and float (Assassin's Creed, D-163)")
+{
+    auto decode = [](u32 format, u32 word) {
+        TextureInfo t;
+        t.format = format | tex::kLinearFlag;
+        t.width = 1;
+        t.height = 1;
+        t.pitch = 4;
+        t.dimension = 2;
+        t.mipmaps = 1;
+        t.border_type = true;
+        std::string why;
+        const auto l = compute_texture_layout(t, &why);
+        INFO(why);
+        REQUIRE(l);
+        const u8 bytes[4] = {static_cast<u8>(word >> 24), static_cast<u8>(word >> 16), static_cast<u8>(word >> 8),
+            static_cast<u8>(word)};
+        std::vector<std::array<float, 4>> out;
+        REQUIRE(decode_level_cpu(*l, l->levels[0], bytes, out));
+        return out[0][0];
+    };
+    CHECK(decode(tex::DEPTH24_D8, 0xFFFFFF00) == 1.f);           // the depth in the top 24 bits, unorm
+    CHECK(decode(tex::DEPTH24_D8, 0x000000FF) == 0.f);           // the stencil byte is not depth
+    CHECK(decode(tex::DEPTH24_D8, 0x80000012) == Catch::Approx(0.5).epsilon(1e-6));
+    CHECK(decode(tex::DEPTH24_D8_FLOAT, 0x7F000034) == 1.f);     // f24 0x7F0000 << 7 = 1.0f (RPCS3 d24f_to_f32)
+    CHECK(decode(tex::DEPTH24_D8_FLOAT, 0x7E000000) == 0.5f);
+    CHECK(decode(tex::DEPTH24_D8_FLOAT, 0x00000000) == 0.f);
+    const TextureFormatInfo& d24 = *texture_format_info(tex::DEPTH24_D8);
+    CHECK(d24.decode == TexelDecode::D24);
+    CHECK(texture_channel_sources(d24, tex::kRemapIdentity) == std::array<u8, 4>{0, 0, 0, 0}); // in every channel
+}
+
+TEST_CASE("CPU decoders: HILO8, HILO_S8 and Y16_X16_FLOAT, read as RPCS3 maps them (D-163)")
+{
+    auto decode = [](u32 format, std::vector<u8> bytes, u16 pitch) {
+        TextureInfo t;
+        t.format = format | tex::kLinearFlag;
+        t.width = 1;
+        t.height = 1;
+        t.pitch = pitch;
+        t.dimension = 2;
+        t.mipmaps = 1;
+        t.border_type = true;
+        const auto l = compute_texture_layout(t, nullptr);
+        REQUIRE(l);
+        std::vector<std::array<float, 4>> out;
+        REQUIRE(decode_level_cpu(*l, l->levels[0], bytes.data(), out));
+        return out[0];
+    };
+    // HILO: HI first in memory; the texture holds LO in red, HI in green; (A, R, G, B) read {R, G, R, G}.
+    CHECK(decode(tex::COMPRESSED_HILO8, {0xFF, 0x00}, 2) == std::array<float, 4>{0.f, 1.f, 0.f, 1.f});
+    CHECK(decode(tex::COMPRESSED_HILO_S8, {0x81, 0x7F}, 2) == std::array<float, 4>{1.f, -1.f, 0.f, 1.f});
+    CHECK(decode(tex::COMPRESSED_HILO_S8, {0x80, 0x00}, 2)[1] == -1.f); // -128 clamps to -1
+    CHECK(texture_channel_sources(*texture_format_info(tex::COMPRESSED_HILO8), tex::kRemapIdentity) ==
+        std::array<u8, 4>{1, 0, 1, 0}); // Metal r, g, b, a = logical R (green), G (red), B (green), A (red)
+    // Y16_X16_FLOAT: two BE halves, the first in red.
+    CHECK(decode(tex::Y16_X16_FLOAT, {0x3C, 0x00, 0xC0, 0x00}, 4) == std::array<float, 4>{1.f, -2.f, 0.f, 1.f});
+}
+
 TEST_CASE("CPU decoders: DXT1, DXT3 and DXT5 blocks")
 {
     // DXT1, 4-colour mode: c0 = red (0xf800) > c1 = blue (0x001f); indices 0,1,2,3 on the first row, then 0s.

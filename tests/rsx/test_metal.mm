@@ -171,6 +171,21 @@ TEST_CASE("metal: float texture formats decode exactly")
     // DEPTH16 in memory (GTA V's shadow maps outside a depth buffer the cache knows): the depth as 16-bit unorm.
     CHECK(compare_decode(g, tex_info(tex::DEPTH16, 32, 16, 2), 0, 0, false, false) < 1e-7);
     CHECK(compare_decode(g, tex_info(tex::DEPTH16, 32, 16, 2), 0, 1, false, false) < 1e-7);
+    // 24-bit depth in memory (D-163): unorm, and the 24-bit float (exponents below 0xFF: no infinities or NaNs).
+    for (u32 i = 0; i < 0x8000; i += 4) ps_write32(g.mem.base(), GpuFixture::kTexEa + i, static_cast<u32>(rng()));
+    CHECK(compare_decode(g, tex_info(tex::DEPTH24_D8, 16, 16, 1), 0, 0, false, false) < 1e-6);
+    for (u32 i = 0; i < 0x8000; i += 4)
+        ps_write32(g.mem.base(), GpuFixture::kTexEa + i, (static_cast<u32>(rng()) & 0x00FFFFFFu) | ((rng() % 0xFE) << 24));
+    CHECK(compare_decode(g, tex_info(tex::DEPTH24_D8_FLOAT, 16, 16, 1), 0, 0, false, false) == 0);
+    // HILO8 and HILO_S8 (D-163): two bytes each, unsigned and signed normalized.
+    for (u32 i = 0; i < 0x8000; i++) ps_write8(g.mem.base(), GpuFixture::kTexEa + i, static_cast<u8>(rng()));
+    CHECK(compare_decode(g, tex_info(tex::COMPRESSED_HILO8, 32, 16, 1), 0, 0, false, false) < 1e-6);
+    CHECK(compare_decode(g, tex_info(tex::COMPRESSED_HILO_S8, 32, 16, 1), 0, 0, false, false) < 1e-3); // half storage
+    for (u32 i = 0; i < 0x8000; i += 2) {
+        const u16 h = static_cast<u16>((rng() & 0x8000) | ((rng() % 30 + 1) << 10) | (rng() & 0x3ff));
+        ps_write16(g.mem.base(), GpuFixture::kTexEa + i, h);
+    }
+    CHECK(compare_decode(g, tex_info(tex::Y16_X16_FLOAT, 16, 16, 1), 0, 0, false, false) == 0);
 }
 
 TEST_CASE("metal: DXT1/3/5 decode in compute matches the CPU reference, BC upload agrees")
