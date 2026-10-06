@@ -1,6 +1,6 @@
 # Run 108 · pspocket's cellGifDec against Sony's libgifdec
 
-2026-10-07 night · tests/hle/test_gifdec.cpp after D-202 · M4 Mac · the user's firmware 4.92 (PSPOCKET_TEST_DEV_FLASH).
+2026-10-06 night · tests/hle/test_gifdec.cpp after D-202 · M4 Mac · the user's firmware 4.92 (PSPOCKET_TEST_DEV_FLASH).
 No game: neither game on the Mac imports cellGifDec. The GIFs are built in the test (gif_writer.hpp): 18 files from
 7x5 to 64x64: GIF87a and 89a; global and local colour tables of 2 to 256 colours; frames filling the screen, smaller
 than it at an offset, and past its edge; interlacing (frames of 1, 2, 3 and 5 rows too); LZW at code sizes 2 to 8,
