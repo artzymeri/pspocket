@@ -8,6 +8,7 @@
 //                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]... [--audio]
 //                 [--spu-dump DIR] [--trace-frame N] [--rsx-recover]
 //   pspocket-boot --probe-disc IMAGE.iso
+//   pspocket-boot --hle-list
 //
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
 // /app_home from PS3_GAME/USRDIR unless --app-home says otherwise).
@@ -132,7 +133,8 @@ int usage()
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
         "                     [--async-shaders MS] [--watch ADDR]\n"
-        "       pspocket-boot --probe-disc IMAGE.iso\n");
+        "       pspocket-boot --probe-disc IMAGE.iso\n"
+        "       pspocket-boot --hle-list\n");
     return 64;
 }
 
@@ -771,6 +773,15 @@ int main(int argc, char** argv)
             return 1;
         }
         std::printf("%s %s\n", disc.title_id.c_str(), disc.title.c_str());
+        return 0;
+    }
+    // --hle-list: every function the host implements, one "module nid name" line each (scripts/firmware-report.py,
+    // D-176).
+    if (argc == 2 && std::string_view(argv[1]) == "--hle-list") {
+        for (const hle::Function& f : hle::registry().functions())
+            if (!f.internal)
+                std::printf("%.*s %08x %.*s\n", static_cast<int>(f.module.size()), f.module.data(), f.nid,
+                    static_cast<int>(f.name.size()), f.name.data());
         return 0;
     }
     if (argc < 2) return usage();

@@ -3090,6 +3090,48 @@ Tests (tests/hle/test_lle.cpp):
 - A game PRX loaded while the game runs, whose firmware dependency joins and starts first, once.
 
 
+## D-176 · 2026-10-06 · The PS3 system software analysed: what it holds and how each part meets the engine
+
+The user asked for the system file (PS3UPDAT.PUP 4.92, already installed on the Mac) to be taken apart and its useful
+parts connected to the iOS-native engine, "like analysing a car engine and making it work for another car". It is
+Sony's closed software, free to download but not open source, under a licence that allows reverse engineering only
+as far as the law does. That covers interoperability, which is what this is. Two lines hold:
+
+- Nothing from the file enters the repository or the app's code. The analysis output stays in inventory/ (rule 1).
+- pspocket uses the user's own copy on the user's own device.
+
+The tools (none holds firmware content):
+
+- `pspocket-firmware --decrypt DEV_FLASH OUT` writes every module of sys/external and sys/internal as an ELF.
+- `pspocket-boot --hle-list` prints every function the host implements.
+- `scripts/firmware-report.py` runs both and ps3inspect, reads RPCS3's g_prx_list, and writes report.md and
+  report.json under inventory/firmware/analysis/.
+
+docs/firmware.md is the committed summary. The firmware holds 179 modules, 206 libraries, 5,385 exported functions
+and 188 SPU programs, plus 35 system fonts, 60 root certificates, keyboard dictionaries, the XMB, a Blu-ray player and
+three emulators. The host implements 607 of the functions.
+
+Each part gets one of five plans:
+
+- **Ours on iOS** (77 modules): lv2, SPURS, RSX to Metal, audio, input, files, network, sysutil and everything on it,
+  devices. These never run as they are (D-175).
+- **iOS framework** (24 modules): ImageIO for image decoding and encoding, VideoToolbox for H.264, Metal/vImage and
+  AudioConverter for post-processing.
+- **Sony's code, translated once per firmware** (75 modules): media front ends and decoder cores without an iOS
+  counterpart, movie containers and players, fonts with FreeType, text conversion, cellSync2/fibers/job queue,
+  cellResc, HTTP/SSL/RUDP, encoders.
+- **Data kept**: fonts and certificates.
+- **Not used**: debug modules, the XMB, the Blu-ray player, the emulators, the dictionaries.
+
+The order of work:
+
+1. Link like a PS3 and keep only what games use (D-177).
+2. Translate Sony's modules and their SPU programs once per firmware, at fixed addresses, Mac first; then on the
+   phone.
+3. iOS frameworks behind cellPngDec/cellJpgDec/cellGifDec, cellVdec (H.264) and cellAdec (AAC, MP3, AC-3), each
+   measured against the translated original.
+4. The parts that are ours, filled in from what games call.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

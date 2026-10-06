@@ -3,10 +3,13 @@
 //
 //   pspocket-firmware PS3UPDAT.PUP DEV_FLASH_DIR
 //   pspocket-firmware --modules DEV_FLASH_DIR
+//   pspocket-firmware --decrypt DEV_FLASH_DIR OUT_DIR
 //
 // Prints the update's version and, per dev_flash package, its name; then how many files and bytes went in. --modules
 // lists the firmware modules (sys/external/*.sprx) as the LLE loader sees them (D-157): each module's libraries, and
-// what it imports from others, functions and variables.
+// what it imports from others, functions and variables. --decrypt writes every module of sys/external and
+// sys/internal (.sprx, .self) as an ELF to OUT_DIR/external and OUT_DIR/internal, for ps3inspect and
+// scripts/firmware-report.py (D-176); OUT_DIR belongs under inventory/ (rule 1).
 
 #include <algorithm>
 #include <cstdio>
@@ -67,13 +70,46 @@ int list_modules(const std::string& dev_flash)
     return 0;
 }
 
+int decrypt_modules(const std::string& dev_flash, const std::string& out_dir)
+{
+    namespace fs = std::filesystem;
+    using namespace pspocket;
+    size_t written = 0, failed = 0;
+    for (const char* sub : {"external", "internal"}) {
+        std::vector<fs::path> files;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(fs::path(dev_flash) / "sys" / sub, ec))
+            if (e.path().extension() == ".sprx" || e.path().extension() == ".self") files.push_back(e.path());
+        std::sort(files.begin(), files.end());
+        const fs::path out = fs::path(out_dir) / sub;
+        fs::create_directories(out, ec);
+        for (const fs::path& path : files) {
+            std::ifstream in(path, std::ios::binary);
+            const std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            auto elf = recomp::decrypt_self(bytes, recomp::builtin_self_keys());
+            if (!elf) {
+                std::printf("%s/%s: %s\n", sub, path.filename().c_str(), elf.error().message.c_str());
+                failed++;
+                continue;
+            }
+            std::ofstream(out / (path.filename().string() + ".elf"), std::ios::binary)
+                .write(reinterpret_cast<const char*>(elf->data()), static_cast<std::streamsize>(elf->size()));
+            written++;
+        }
+    }
+    std::printf("%zu modules decrypted into %s, %zu failed\n", written, out_dir.c_str(), failed);
+    return written ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     if (argc == 3 && std::string(argv[1]) == "--modules") return list_modules(argv[2]);
+    if (argc == 4 && std::string(argv[1]) == "--decrypt") return decrypt_modules(argv[2], argv[3]);
     if (argc != 3) {
-        std::fputs("usage: pspocket-firmware PS3UPDAT.PUP DEV_FLASH_DIR\n       pspocket-firmware --modules DEV_FLASH_DIR\n",
+        std::fputs("usage: pspocket-firmware PS3UPDAT.PUP DEV_FLASH_DIR\n       pspocket-firmware --modules DEV_FLASH_DIR\n"
+                   "       pspocket-firmware --decrypt DEV_FLASH_DIR OUT_DIR\n",
             stderr);
         return 64;
     }
