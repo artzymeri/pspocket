@@ -129,7 +129,9 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   interpreted after fiber switches (D-161), syscall 327 (page-fault notification) still missing.
 - **Fibers (D-161):** after a longjmp in translated code the frames above the jump target run interpreted until they
   return; a fiber-based job loop never does, so its loop stays interpreted (its jobs are translated). Each switch costs
-  a C++ throw. Better: translate the code after a setjmp's return as a continuation the dispatcher can enter (a
+  a C++ throw. Measured (run 118, D-207): Assassin's Creed resumes fibers about 1,000 times a second, each landing at
+  its setjmp's return (0xcf6d90) and running about 14 instructions interpreted: 3.1 million in 230 s, under 1% of a
+  core with the throws. Better: translate the code after a setjmp's return as a continuation the dispatcher can enter (a
   setjmp return address as a seed), so a jump lands in translated code.
 - **Modules (D-159):** a game's own PRX modules run interpreted; the preparation could translate the PRX files on the
   disc too. NPDRM modules need the game's klicensee.

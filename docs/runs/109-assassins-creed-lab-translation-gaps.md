@@ -75,4 +75,16 @@ not identical.
 - LS 0x37c58, 81 million instructions a session: a task on the secondary SPURS instance copies a 32 KB module from
   guest 0x50195b00 to LS 0x33980 and calls 0x37c58. The guest buffer is reused before the module runs (D-206 now
   knows it by its local store copy), but each load differs: 398 different images in run 117, so no whole-image hash
-  can name it. Run 118 saves them (`--spu-dump`) to see which bytes differ.
+  can name it.
+
+## Run 118: the module's copies, and the PPU's share
+
+`--spu-dump` to a scratch folder, 230 s. 56 copies of the module saved: 8,078 of its 8,096 words are the same in all,
+18 words at its end (0x3b7a0 to 0x3b7f0) differ, a parameter block. So the code is one program: D-208 knows a program by
+its code words alone too (a hash over them), at run time and when preparing (the 57 copies give one program).
+
+The PPU counter (D-207), first run: the interpreter was entered 224,459 times at 0xcf6d90 for 3.1 million instructions
+in 230 s, about 14 instructions each. 0xcf6d90 is the return address of the setjmp in the game's "switch to fiber"
+(0xcf6d38); every resumed fiber lands there through a longjmp (D-161) and runs those few instructions interpreted
+before it returns to translated code. About 1,000 a second, each one exception throw: under 1% of a core. Translating
+the code after a setjmp as an entry (improve.md, "Fibers") can wait.
