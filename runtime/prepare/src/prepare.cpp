@@ -158,6 +158,21 @@ bool read_manifest(const std::string& game_dir, Manifest* out)
     return !m.abi_hash.empty();
 }
 
+std::array<double, 3> prior_rates(const Manifest* own, const Manifest* last, int thermal_now)
+{
+    std::array<double, 3> r{1.0, 1.0, 1.0};
+    const Manifest* m = own ? own : last;
+    if (!m) return r;
+    const double heat = thermal_slowdown(thermal_now) / thermal_slowdown(m->thermal);
+    if (own) {
+        for (int k = 0; k < 3; k++) r[static_cast<size_t>(k)] = own->rates[k] * heat;
+    } else {
+        r[0] = r[1] = last->rates[0] * heat; // the device, measured on PPU code
+        r[2] = last->rates[2] * heat;
+    }
+    return r;
+}
+
 double thermal_slowdown(int thermal)
 {
     static constexpr double kSlowdown[] = {1.0, 1.2, 1.5, 2.0};

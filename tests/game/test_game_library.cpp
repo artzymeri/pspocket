@@ -261,3 +261,25 @@ TEST_CASE("prepared libraries: one made before a fix to the lifters is prepared 
     fs::remove_all(dir);
 }
 
+TEST_CASE("time left: the starting speeds come from the game's own last preparation, else the device's PPU speed (D-164)")
+{
+    using pspocket::prepare::Manifest;
+    using pspocket::prepare::prior_rates;
+    Manifest ac;     // Assassin's Creed on this device: its SPU code 5 times faster than the cost model says
+    ac.rates[0] = 0.9;
+    ac.rates[1] = 0.19;
+    ac.rates[2] = 0.3;
+    CHECK(prior_rates(nullptr, nullptr, 0) == std::array<double, 3>{1.0, 1.0, 1.0});
+    // Preparing Assassin's Creed again: its own rates.
+    CHECK(prior_rates(&ac, nullptr, 0) == std::array<double, 3>{0.9, 0.19, 0.3});
+    CHECK(prior_rates(&ac, &ac, 0) == std::array<double, 3>{0.9, 0.19, 0.3});
+    // GTA V for the first time after it: the device's PPU speed for its SPU code too, not AC's SPU rate.
+    const auto gta = prior_rates(nullptr, &ac, 0);
+    CHECK(gta[0] == 0.9);
+    CHECK(gta[1] == 0.9);
+    CHECK(gta[2] == 0.3);
+    // Measured cool, prepared warm: slower by the heat's factor.
+    const auto warm = prior_rates(&ac, nullptr, 2);
+    CHECK(warm[0] == Catch::Approx(0.9 * pspocket::prepare::thermal_slowdown(2)));
+}
+

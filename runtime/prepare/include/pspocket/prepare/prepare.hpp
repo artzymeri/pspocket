@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <functional>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -101,6 +102,13 @@ struct Manifest {
 // ("fair"), at 1.05: about 1.2 per level, refined as more preparations are recorded.
 double thermal_slowdown(int thermal);
 bool read_manifest(const std::string& game_dir, Manifest* out);
+
+// The time left's starting speed per kind of file (D-164), each brought from the heat it was measured at to
+// `thermal_now`: this game's own last preparation when there is one (the same code on the same device); else the
+// device's speed from the last game's PPU code, for PPU and SPU code alike, and the last game's table rate. SPU code's
+// speed against the cost model depends on the game (Assassin's Creed's compiled 6 times faster than GTA V's, run 099),
+// so it is not carried from one game to another. {1, 1, 1} with neither.
+std::array<double, 3> prior_rates(const Manifest* own, const Manifest* last, int thermal_now);
 
 // Whether game_dir holds a library this build can load for this executable: made for this runtime (ABI hash), for
 // this CPU, from an executable with this SHA-256. A different translator hash leaves it usable (`*why` says a newer

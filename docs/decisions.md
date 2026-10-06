@@ -2745,6 +2745,17 @@ word), COMPRESSED_HILO_S8 (signed, kept in RGBA16F) and Y16_X16_FLOAT (RG16F). S
 the 4:2:2 formats (COMPRESSED_B8R8_G8R8, R8B8_R8G8), which RPCS3 itself marks untested. Tests: the CPU decoder's values
 for each, and the compute decoder against it.
 
+## D-164 · 2026-10-06 · The time left starts from the game's own speeds, else the device's PPU speed
+
+Assassin's Creed's SPU code compiled 6 times faster than the cost model predicts (rate 0.16-0.19), GTA V's at about
+the model (1.13 of it), and the model cannot tell them apart from the text (a 1.3 MB GTA V program takes 170 s, a
+3.2 MB Assassin's Creed one 18 s; run 099). The app started each preparation from the last game's per-kind rates,
+so one game's SPU code skewed the next game's first estimate (GTA V after Assassin's Creed would have started 5
+times low). prepare::prior_rates: this game's own last preparation when there is one (re-preparing after a lifter
+fix, D-161: the same code on the same device); else the device's speed measured on the last game's PPU code (0.84-1.0
+across both games) for PPU and SPU alike, and its table rate; each from the heat it was measured at to the heat now.
+pspocket-prepare on the Mac uses the game's own manifest the same way. Test: the three cases and the heat.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

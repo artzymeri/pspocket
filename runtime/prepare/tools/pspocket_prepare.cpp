@@ -105,8 +105,10 @@ int main(int argc, char** argv)
     o.toolchain.platform = "macos";
     o.toolchain.min_os = "13.0";
     // The last preparation here says how fast this Mac compiles each kind of file (its manifest's rates).
-    if (prepare::Manifest m; prepare::read_manifest(o.game_dir, &m))
-        for (int k = 0; k < 3; k++) o.prior_rates[k] = m.rates[k];
+    if (prepare::Manifest m; prepare::read_manifest(o.game_dir, &m)) { // this game's last preparation (D-164)
+        const auto r = prepare::prior_rates(&m, nullptr, m.thermal);
+        for (int k = 0; k < 3; k++) o.prior_rates[k] = r[static_cast<size_t>(k)];
+    }
 
     std::ofstream events;
     if (!events_path.empty()) {
