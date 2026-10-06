@@ -45,6 +45,8 @@ add_library(pspocket_hle STATIC
     src/adec_lpcm.cpp
     src/adec_atracx.cpp
     src/cellPngDec.cpp
+    src/cellJpgDec.cpp
+    src/jpeg_decoder.cpp
     src/cellVdec.cpp
     src/cellDmuxPamf.cpp
     src/dmux_pamf.cpp

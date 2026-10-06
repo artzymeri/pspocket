@@ -4448,6 +4448,41 @@ and libpng's transformations; Sony's behaviour, measured call by call (run 106),
 Tests: tests/hle/test_pngdec.cpp (PNGs built in code by png_writer.hpp: every colour type and bit depth, Adam7, every
 chunk kind; pspocket alone; the comparison with Sony's when the firmware is there; two hidden probes).
 
+## D-200 · 2026-10-06 · cellJpgDec is pspocket's own decoder, the same as Sony's libjpgdec sample for sample
+
+Step 3's image decoders (after cellPngDec, D-199): cellJpgDec's seven functions are pspocket's (runtime/hle/src/
+cellJpgDec.cpp), on a JPEG decoder written here (jpeg_decoder.cpp) to decode exactly as Sony's libjpgdec does. Its
+strings say IJG libjpeg 6b, but it is 6b with Sony's changes; each was found by comparing outputs, then reading what
+libjpgdec runs (disassembly in scratch only, D-046), and written here from that description, nothing copied:
+
+- **Quality method (0):** libjpeg's float IDCT (jidctflt.c) with FAST_FLOAT double, four multiply-adds fused as Sony's
+  compiler fused them, and fancy upsampling.
+- **Fast method (5):** libjpeg's dct_method 3, Sony's own: a 16-bit AltiVec IDCT in the tangent form (prescale rows of
+  Q15 constants, rounded multiplies, saturating adds, +128), and box upsampling (the merged upsampler for 2x1 and 2x2).
+- **Reduced sizes:** 1/2 a four-lane float AltiVec 4-point IDCT of the low 4x4 coefficients (+128.5, truncated); 1/4
+  a float 2-point IDCT of the low 2x2 (+0.5, truncated); 1/8 6b's. A subsampled component is enlarged through a
+  larger IDCT first (jdmaster.c), as 6b does.
+- **Colour:** each row's first multiple of 16 pixels (32 in the merged upsampler) goes through Sony's AltiVec YCbCr to
+  RGB (14-bit constants 22970, -11700, -5638, 29032); the rest through 6b's tables.
+- **Entropy decoding:** 6b's, with a 64-bit bit buffer (refilled to 57 bits), its marker and restart handling, its
+  zeros after a premature marker. libjpgdec's source is the whole file: running past its end stops the decode
+  (STREAM_FORMAT, outputLines the lines written so far, context rows held back as jdmainct.c holds them); libjpeg's
+  warnings on corrupt data give the whole image, its mean, and STREAM_FORMAT. Progressive files decode the same.
+- **Mean:** Sony's addition: the Huffman decoder sums each MCU place's DC value; the mean of component 0 is those sums
+  times q0/8 plus 128 per MCU, in single precision, over MCUs x h x v (-1 for progressive files).
+- **useMemorySpace:** Sony's estimate over libjpeg's state (a fixed part by the scaled DCT size plus the upsampling and
+  conversion row buffers it will use, chosen by colour space and sampling; another branch for progressive files).
+- **SPU threads on:** the images are the same (the PPU decodes); Create also takes 0x187FF, 0x17F and 0x167 bytes from
+  the game's allocator and Open reports 0x187FF more. pspocket takes the same memory, so a game's budget sees the same.
+- **Bug found on the way:** the range-limit table now clamps IDCT outputs 128..511 to 255 (6b's); it clamped only to
+  383, which damaged data showed.
+
+Measured (run 107): 1848 answers and 149 images, the same as Sony's with SPU threads off and on (7 baseline and 2
+progressive JPEGs built in code by tests/hle/jpeg_writer.hpp, 4:2:0, 4:2:2, 4:4:4, gray, restart markers, Adobe and no
+APP0; 20 settings each: both methods, every scale, every colour space and row order; 14 damaged files and calls out of
+order). A digest of pspocket's answers keeps them so without the firmware. Not pspocket's yet: the Ext functions and
+six exports with no known names (a game importing one gets Sony's whole libjpgdec, D-175).
+
 ## D-201 · 2026-10-06 · Outside sources the build reads live in external/, inside the repository folder
 
 The build reads three things from outside pspocket's own code: the RPCS3 source (the SELF keys for decrypting a game's
