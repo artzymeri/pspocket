@@ -3952,6 +3952,57 @@ Tests: tests/hle/test_np.cpp, test_np2.cpp, test_np_tus.cpp, test_np_clans.cpp, 
 test_trophy.cpp, with synthetic data only: each function's checks and offline answers, the dialogs' events through a
 guest handler, idm's ID order, the bandwidth test's timing, abort and result.
 
+## D-186 · 2026-10-06 · The media library utilities: an empty library, selections cancelled, exports as RPCS3
+
+The PS3's media utilities live in libsysutil_*.sprx, which pspocket always serves itself: a function missing there
+returned ENOSYS to the game, with no fallback. Every function RPCS3 implements in cellSearchUtility (21),
+cellMusicUtility (22), cellMusicDecodeUtility (20), cellMusicExportUtility (5), cellPhotoUtility (9),
+cellVideoExportUtility (6), cellPhotoImportUtil (2) and cellPhotoDecodeUtil (4) is now there, with RPCS3's checks in
+RPCS3's order and its results through the game's callbacks at its next cellSysutilCheckCallback.
+
+**No media library.** RPCS3 searches /dev_hdd0/music, photo and video, probing each file with FFmpeg. Nothing puts
+media on pspocket's /dev_hdd0, and its FFmpeg build has no demuxers (D-181), so pspocket's library is empty and
+nothing scans those folders: every search completes with no content (resultNum 0), every lookup by offset or content
+ID finds nothing (OUT_OF_RANGE, CONTENT_NOT_FOUND). cellSearch's states (initializing, idle, in progress, finalizing)
+and search IDs (idm order, 1024) follow RPCS3.
+
+**Selections cancelled.** RPCS3 lets the user pick music or a photo in its media list dialog, and cancels the
+selection without its native UI. pspocket has no such UI, so cellMusicSelectContents, cellMusicDecodeSelectContents
+and cellPhotoImport are cancelled at once (CELL_MUSIC_CANCELED, CELL_CANCEL with the file data cleared). With nothing
+ever selected:
+
+- cellMusic plays nothing: the status stays STOP (RPCS3's null player), playback commands fail with ERROR_GENERIC
+  (returned and to the callback), the volume is kept (it starts at 1.0, RPCS3's Qt player's).
+- cellMusicDecode decodes nothing: START fails at once (RPCS3's decoder with an empty playlist), so a read answers
+  DECODE_FAILURE until a STOP, NEXT or PREV (no next track: NO_MORE_CONTENT); otherwise NO_LPCM_DATA.
+- A selection context the game saved names a playlist RPCS3 kept in its own cache; pspocket has none, so setting one
+  answers INVALID_CONTEXT. cellMusicDecode keeps a well-formed hash, as RPCS3's does, and reads it back.
+
+**Exports as RPCS3.** Music, photo and video exports check the path (RPCS3's character, device and length rule), then
+at the callback copy the file into /dev_hdd0/music/<file>, /dev_hdd0/video/<file> ("_N" when taken) or
+/dev_hdd0/photo/YYYY/MM/DD/<game title> DD-MM-YYYY HH-MM-SS<ext> (" N" when taken, RPCS3's photo path). The plain forms
+move the file (music and video unless it is on the disc, photos only from /dev_hdd0); "WithCopy" keeps it. A failed
+copy reports ERROR_MOVE; Progress reports 0 to 0xFFFF. Metadata is ignored (RPCS3's TODO). The source is read
+through the VFS, so a file on a disc image exports too.
+
+**No image decoder.** cellPhotoDecodeFromFile makes RPCS3's checks (a file on /dev_hdd0, /dev_hdd1 or /dev_bdvd) and
+then answers CELL_PHOTO_DECODE_ERROR_DECODE, logged: RPCS3 decodes with Qt, and pspocket has no image decoder yet
+(ImageIO on the Apple hosts could do it later).
+
+**Differences from RPCS3.**
+
+- A search refused after cellSearch marked itself busy (an unknown list or video, a sort RPCS3 doesn't support)
+  leaves it idle. RPCS3 leaves it busy, so that every later call answers BUSY.
+- With all 1024 search IDs in use, a search answers CELL_SEARCH_ERROR_NO_MEMORY (RPCS3 crashes).
+- Pointers and strings are checked before use (D-042): memory that isn't guest memory is logged with the call site and
+  refused with the library's PARAM error before anything changes (RPCS3 faults).
+
+Tests: tests/hle/test_media.cpp, with synthetic data on a temporary /dev_hdd0: cellSearch's states, checks and empty
+results (the result parameter read inside the guest callback); cellMusic and cellMusicDecode before and after
+initialize, their commands, volume and contexts, the two decoders' separate states; the exports' destinations,
+suffixes, moves and copies, path rule and progress; the photo import's cancellation and checks; the photo decode's
+checks.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
