@@ -4500,6 +4500,40 @@ separate project and was deleted.
   nothing was rebuilt).
 - **Rule:** every new outside dependency goes in external/ too, never beside the repository.
 
+## D-202 · 2026-10-06 · cellGifDec is pspocket's own, the same as Sony's libgifdec
+
+The last of step 3's image decoders: cellGifDec's seven functions are pspocket's (runtime/hle/src/cellGifDec.cpp), with
+its own LZW decoder. Sony's libgifdec is giflib (its allocations show giflib's 12-byte colour maps and the 0x6148-byte
+private state holding the LZW tables) behind Sony's API; what it does was measured call by call (run 108):
+
+- **Records.** Each DecodeData returns the file's next record: an extension (label, and a pointer to its sub-blocks
+  with their terminator, in a buffer libgifdec took at Open and grows a sub-block at a time in whole 0x100s), an
+  image, or the trailer. Once the parameters are set the status is written first (0); a stop asked through
+  commandPtr writes 1 and decodes nothing.
+- **Images.** An image record is the whole logical screen, 4 bytes a pixel (RGBA or ARGB): every pixel the background
+  index looked up in the image's own colour table (the local one if it has one), the image at its place (interlaced
+  rows put back in order); a pixel whose index, the background's included, is the transparent one of the last graphic
+  control extension gets alpha1 with its colour kept, every other alpha2. The transparency stays for later images
+  until another graphic control extension. No earlier image shows through. The game's row padding is not touched.
+- **LZW.** giflib's decoding (dgif_lib.c): codes from the low bit, the width growing with the table up to 12 bits and
+  kept there, a code past the next free one a defect; the rest of the data skipped to its terminator.
+- **Errors.** An image past the screen, no colour table, a defect, cut data, no trailer: STREAM_FORMAT, the game's
+  buffer untouched. A cut colour table or a file not starting "GIF": STREAM_FORMAT from ReadHeader (the version is not
+  checked). A call out of order answers SEQ and fails the stream for everything but Close; a row pitch narrower than
+  the image ARG; reading past the trailer SEQ.
+- **Numbers.** Codec version 0x240000; initSpaceAllocated 0x6D70; useMemorySpace width x height + 4 x height + 40.
+- **Memory.** pspocket takes from the game's allocator what libgifdec takes, in the same order (Create 0x380, plus
+  0x33880 with SPU threads; Open 0x140, 0x100, 0x5C, 0x6148; colour tables; each image's raster and row pointers),
+  and gives it all back at Close and Destroy, so the extension pointer and the game's memory are the same.
+- **Not reproduced:** the bytes in libgifdec's extension buffer past an extension's terminator (its own state), and a
+  background index past the colour table (libgifdec reads past its table; pspocket gives black). Not pspocket's yet:
+  the Ext functions (a game importing one gets Sony's whole libgifdec, D-175).
+
+Measured: 1131 answers and 85 images, the same with SPU threads off and on (18 GIFs built in code by
+tests/hle/gif_writer.hpp: 87a and 89a, global and local tables of 2 to 256 colours, frames inside and past the screen,
+interlacing down to one row, code sizes 2 to 8, early clear codes, short sub-blocks, a full table with and without a
+clear, every extension kind, animations; six damaged files; eight call orders; stop and continue).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

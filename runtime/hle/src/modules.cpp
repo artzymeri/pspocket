@@ -44,6 +44,7 @@ void register_libvdec(Registry& r);
 void register_cellAdec(Registry& r);
 void register_cellPngDec(Registry& r);
 void register_cellJpgDec(Registry& r);
+void register_cellGifDec(Registry& r);
 void register_sceNpTrophy(Registry& r);
 void register_sysPrxForUser(Registry& r);
 void register_sysPrxForUser_libc(Registry& r);
@@ -96,6 +97,7 @@ void register_all_modules(Registry& r)
     register_cellAdec(r);
     register_cellPngDec(r);
     register_cellJpgDec(r);
+    register_cellGifDec(r);
     register_sceNpTrophy(r);
     register_sysPrxForUser(r);
     register_sysPrxForUser_libc(r);
