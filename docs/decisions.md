@@ -4079,6 +4079,31 @@ real names (D-185).
 
 Tests: tests/hle/test_rec.cpp.
 
+## D-190 · 2026-10-06 · SPU constants that point into a function's code are labels of it, not copies of it
+
+The SPU analyzer takes the immediates of ila and il that point at code as possible code addresses (function pointers,
+D-029): each started a function of its own, which copies all the code it reaches. A constant is often a number that
+happens to point into code. Lifting the firmware's SPU programs for the system library (D-191) showed the cost: one
+57 KB decoder lifted to 288 MB of C, with a function every 16 bytes into one long body, each a copy of the rest of it;
+the 216 programs came to 1.3 GB of C, about three hours of compiling.
+
+- **Constants wait, then go in address order.** The entries and the direct call targets are traced first. Then each
+  constant is a label of the function whose code holds it, entered through that function's dispatch switch, as seeds
+  already were (D-081). Only a constant no function holds starts a function, and the code it reaches can make later
+  constants labels in turn.
+- **The same code runs.** A label is entered exactly as a function start is: the run loop finds it in the program's
+  entries. Only the copies go.
+- **Result.** The firmware's 216 programs: 1.3 GB of C down to 421 MB (with comments), the largest 8 MB. That is 28
+  bytes of C per byte of code, as for GTA V's programs (36).
+- **spu-lift --discover** lifts code only registers reach too (D-155), as the preparations do, so a program can be
+  looked at the way a game or the system library lifts it.
+
+Programs lifted before this stay as they were. A game prepared again gets the smaller translation; its translator
+hash changes, which does not make the library be prepared again (D-161).
+
+Tests: tests/spu/test_discover.cpp (constants into a function's body are labels and entries of the lifted program, a
+constant at code nothing else reaches still starts a function; fails without the fix).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

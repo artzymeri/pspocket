@@ -25,13 +25,34 @@ public:
     {
         std::deque<u32> pending(image_.entries.begin(), image_.entries.end());
         std::map<u32, Function> functions;
-        const auto drain = [&] {
+        const auto trace_pending = [&] {
             while (!pending.empty()) {
                 const u32 entry = pending.front();
                 pending.pop_front();
                 if (functions.contains(entry) || !image_.in_code(entry)) continue;
                 Function f = function(entry, pending);
                 functions.emplace(entry, std::move(f));
+            }
+        };
+        // Code addresses formed by ila/il wait until the entries and the calls are traced, then go in address order: one
+        // inside a function's code is a label of it, entered through its dispatch switch; only the others start
+        // functions. A constant is often a number that happens to point into code: started as functions of their own,
+        // the firmware's SPU decoders' constants copied the code each reached, a function every 16 bytes into one
+        // long body (one 57 KB program lifted to 288 MB of C, D-190).
+        const auto drain = [&] {
+            trace_pending();
+            while (!constants_.empty()) {
+                const std::set<u32> batch = std::move(constants_);
+                constants_.clear();
+                for (const u32 c : batch) {
+                    if (functions.contains(c) || !image_.in_code(c)) continue;
+                    if (Function* holder = holding(functions, c)) {
+                        holder->labels.insert(c);
+                        continue;
+                    }
+                    pending.push_back(c);
+                    trace_pending();
+                }
             }
         };
         drain();
@@ -42,13 +63,7 @@ public:
         std::sort(seeds.begin(), seeds.end());
         for (u32 seed : seeds) {
             if (!image_.in_code(seed) || functions.contains(seed)) continue;
-            Function* holder = nullptr;
-            for (auto& [entry, f] : functions)
-                if (std::binary_search(f.insns.begin(), f.insns.end(), seed)) {
-                    holder = &f;
-                    break;
-                }
-            if (holder) {
+            if (Function* holder = holding(functions, seed)) {
                 holder->labels.insert(seed);
                 continue;
             }
@@ -69,6 +84,14 @@ public:
 
 private:
     bool valid_code(u32 addr) const { return image_.in_code(addr) && is_supported(decode(image_.word(addr))); }
+
+    // The function whose code holds addr, if any.
+    static Function* holding(std::map<u32, Function>& functions, u32 addr)
+    {
+        for (auto& [entry, f] : functions)
+            if (std::binary_search(f.insns.begin(), f.insns.end(), addr)) return &f;
+        return nullptr;
+    }
 
     // AnalyzerOptions::discover: rounds until nothing new is reached (code found leads to more such places).
     template <class Drain>
@@ -168,7 +191,7 @@ private:
 
         if (options_.constant_entries)
             for (u32 c : constants)
-                if (valid_code(c)) pending.push_back(c);
+                if (valid_code(c)) constants_.insert(c);
 
         f.insns.assign(visited.begin(), visited.end());
         // Labels must be lifted instructions.
@@ -247,6 +270,7 @@ private:
     const LsImage& image_;
     const AnalyzerOptions& options_;
     Program& program_;
+    std::set<u32> constants_;                 // code addresses formed by ila/il, not traced yet (run())
     const std::vector<bool>* stop_ = nullptr; // discover(): code reached before it
     std::vector<u32> boundaries_;             // where discovered code met it
 };
