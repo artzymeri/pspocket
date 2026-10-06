@@ -266,6 +266,50 @@ TEST_CASE("ISO 9660: volume, lookup, listing and reads")
     CHECK_FALSE(iso->read(*eboot, disc.eboot.size() - 10, part, sizeof(part))); // past the end
 }
 
+TEST_CASE("ISO 9660: a Joliet tree is read when the disc has one, with names longer than 31 characters (D-162)")
+{
+    // The primary tree cuts names to 31 characters (Assassin's Creed: DATAPS3_FLASHBACK_PARADISE.FORG;1); the Joliet
+    // tree holds them whole, in UCS-2, and is what the game's paths name.
+    IsoBuilder b;
+    const std::string long_name = "dataps3_flashback_paradise.forge";
+    const auto bytes = pattern(3000, 7);
+    b.file(40, bytes);
+    // Primary tree at 20: the cut name.
+    b.write_records(20, {dir_record(std::string(1, '\0'), 20, kSectorSize, 0x02),
+                            dir_record(std::string(1, '\1'), 20, kSectorSize, 0x02),
+                            dir_record("DATAPS3_FLASHBACK_PARADISE.FORG;1", 40, 3000, 0)});
+    // Joliet tree at 30: the whole name, UCS-2 big-endian.
+    std::string ucs2;
+    for (const char c : long_name + ";1") ucs2 += std::string{'\0', c};
+    b.write_records(30, {dir_record(std::string(1, '\0'), 30, kSectorSize, 0x02),
+                            dir_record(std::string(1, '\1'), 30, kSectorSize, 0x02), dir_record(ucs2, 40, 3000, 0)});
+    b.pvd(20, kSectorSize, "JOLIET");
+    // The terminator pvd() wrote at 17 moves to 18; the supplementary descriptor takes 17.
+    std::memcpy(b.sector(18), b.sector(17), kSectorSize);
+    u8* svd = b.sector(17);
+    std::memcpy(svd, b.sector(16), kSectorSize);
+    svd[0] = 2;
+    svd[88] = '%';
+    svd[89] = '/';
+    svd[90] = 'E';
+    const auto root = dir_record(std::string(1, '\0'), 30, kSectorSize, 0x02);
+    std::memcpy(svd + 156, root.data(), 34);
+
+    std::string error;
+    auto iso = Iso9660::open(memory_source(b.image), &error);
+    INFO(error);
+    REQUIRE(iso);
+    CHECK(iso->volume_id() == "JOLIET"); // from the primary descriptor
+    const auto file = iso->stat(long_name);
+    REQUIRE(file);
+    CHECK(file->size == 3000);
+    CHECK(iso->stat("DATAPS3_FLASHBACK_PARADISE.FORGE")); // case still ignored
+    CHECK_FALSE(iso->stat("DATAPS3_FLASHBACK_PARADISE.FORG"));
+    const auto all = iso->read_all(*file, 1u << 20);
+    REQUIRE(all);
+    CHECK(*all == bytes);
+}
+
 TEST_CASE("ISO 9660: multi-extent files read across extents")
 {
     Ps3Disc disc(false);

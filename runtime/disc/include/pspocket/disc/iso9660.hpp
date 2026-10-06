@@ -85,6 +85,7 @@ private:
     std::string volume_id_;
     u64 volume_bytes_ = 0;
     Entry root_;
+    bool joliet_ = false; // the tree read is the Joliet one: full names in UCS-2 (D-162)
 };
 
 // PARAM.SFO ("\0PSF", little-endian): the keys the app shell needs (TITLE_ID, TITLE, APP_VER, VERSION, CATEGORY,

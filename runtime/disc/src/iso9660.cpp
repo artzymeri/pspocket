@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <optional>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -89,8 +90,28 @@ struct Record {
     bool self_or_parent = false;
 };
 
-// One directory record. `avail` bytes are readable at rec. False for malformed records.
-bool parse_record(const u8* rec, usize avail, Record& out)
+// A Joliet name: UCS-2 big-endian, as UTF-8 (RPCS3 Loader/ISO.cpp iso_read_directory_entry).
+std::string from_ucs2(const u8* p, usize bytes)
+{
+    std::string s;
+    for (usize i = 0; i + 1 < bytes; i += 2) {
+        const u32 c = u32{p[i]} << 8 | p[i + 1];
+        if (c < 0x80) {
+            s += static_cast<char>(c);
+        } else if (c < 0x800) {
+            s += static_cast<char>(0xC0 | (c >> 6));
+            s += static_cast<char>(0x80 | (c & 0x3F));
+        } else {
+            s += static_cast<char>(0xE0 | (c >> 12));
+            s += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            s += static_cast<char>(0x80 | (c & 0x3F));
+        }
+    }
+    return s;
+}
+
+// One directory record. `avail` bytes are readable at rec. False for malformed records. `ucs2`: a Joliet tree's.
+bool parse_record(const u8* rec, usize avail, Record& out, bool ucs2 = false)
 {
     if (avail < 34) return false;
     const u8 length = rec[0];
@@ -101,7 +122,8 @@ bool parse_record(const u8* rec, usize avail, Record& out)
     out.size = le32(rec + 10);
     out.flags = rec[25];
     out.self_or_parent = name_len == 1 && (rec[33] == 0 || rec[33] == 1);
-    out.name.assign(reinterpret_cast<const char*>(rec + 33), name_len);
+    if (ucs2 && !out.self_or_parent) out.name = from_ucs2(rec + 33, name_len);
+    else out.name.assign(reinterpret_cast<const char*>(rec + 33), name_len);
     if (const auto semi = out.name.find(';'); semi != std::string::npos) out.name.resize(semi);
     if (!out.name.empty() && out.name.back() == '.') out.name.pop_back(); // "NAME." for extensionless files
     return true;
@@ -148,28 +170,46 @@ std::optional<Iso9660> Iso9660::open(std::shared_ptr<Source> source, std::string
     };
     if (!source) return fail("no source");
 
-    // Volume descriptors start at sector 16; take the primary one (type 1), stop at the terminator (255).
+    // Volume descriptors start at sector 16, up to the terminator (255): the primary one (type 1) and, when there is
+    // one, the Joliet supplementary one (type 2, escape sequence %/@, %/C or %/E), whose tree is read instead: its
+    // names are whole, where the primary tree's are cut to 31 characters (Assassin's Creed opens
+    // dataps3_flashback_paradise.forge, which the primary tree calls DATAPS3_FLASHBACK_PARADISE.FORG; D-162). RPCS3
+    // Loader/ISO.cpp also reads the last of the two.
     u8 vd[kSectorSize];
+    std::optional<Record> primary_root, joliet_root;
+    std::string volume_id;
+    u64 volume_bytes = 0;
     for (u32 sector = 16; sector < 16 + 64; sector++) {
         if (!source->read(u64{sector} * kSectorSize, vd, sizeof(vd))) return fail("image too small for ISO 9660");
         if (std::memcmp(vd + 1, "CD001", 5) != 0) return fail("no ISO 9660 volume descriptor at sector 16");
-        if (vd[0] == 255) return fail("no primary volume descriptor");
-        if (vd[0] != 1) continue;
-
+        if (vd[0] == 255) break;
+        const bool joliet = vd[0] == 2 && vd[88] == '%' && vd[89] == '/' && (vd[90] == '@' || vd[90] == 'C' || vd[90] == 'E');
+        if (vd[0] != 1 && !joliet) continue;
         if (le16(vd + 128) != kSectorSize) return fail("unsupported logical block size");
         Record root;
-        if (!parse_record(vd + 156, 34, root) || !(root.flags & kFlagDirectory)) return fail("bad root directory record");
-
-        Iso9660 iso(std::move(source));
-        iso.volume_id_ = trim_right(std::string(reinterpret_cast<const char*>(vd + 40), 32));
-        iso.volume_bytes_ = u64{le32(vd + 80)} * kSectorSize;
-        iso.root_.name = "/";
-        iso.root_.directory = true;
-        iso.root_.size = root.size;
-        iso.root_.extents.push_back({root.lba, root.size});
-        return iso;
+        if (!parse_record(vd + 156, 34, root) || !(root.flags & kFlagDirectory)) {
+            if (vd[0] == 1) return fail("bad root directory record");
+            continue; // a Joliet tree that cannot be read: the primary one serves
+        }
+        if (vd[0] == 1) {
+            primary_root = root;
+            volume_id = trim_right(std::string(reinterpret_cast<const char*>(vd + 40), 32));
+            volume_bytes = u64{le32(vd + 80)} * kSectorSize;
+        } else {
+            joliet_root = root;
+        }
     }
-    return fail("no primary volume descriptor in the first 64 descriptors");
+    if (!primary_root) return fail("no primary volume descriptor");
+    const Record& root = joliet_root ? *joliet_root : *primary_root;
+    Iso9660 iso(std::move(source));
+    iso.volume_id_ = volume_id;
+    iso.volume_bytes_ = volume_bytes;
+    iso.joliet_ = joliet_root.has_value();
+    iso.root_.name = "/";
+    iso.root_.directory = true;
+    iso.root_.size = root.size;
+    iso.root_.extents.push_back({root.lba, root.size});
+    return iso;
 }
 
 std::optional<std::vector<Entry>> Iso9660::read_directory(const Entry& dir) const
@@ -190,7 +230,7 @@ std::optional<std::vector<Entry>> Iso9660::read_directory(const Entry& dir) cons
         }
         const usize sector_end = std::min<usize>(data.size(), (pos / kSectorSize + 1) * kSectorSize);
         Record rec;
-        if (!parse_record(data.data() + pos, sector_end - pos, rec)) return std::nullopt;
+        if (!parse_record(data.data() + pos, sector_end - pos, rec, joliet_)) return std::nullopt;
         pos += data[pos];
         if (rec.self_or_parent) continue;
 
