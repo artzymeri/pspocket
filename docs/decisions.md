@@ -3037,6 +3037,77 @@ by its NID; before cellGcmInit; mapping, first fit, reserves and unmapping again
 from the driver information; lv2's 0x10a and queue notes; the queue handler's head and order on the interrupt thread,
 in guest code under the interpreter; the command words; the default buffer's sizes; Z-cull and the arrays; the small
 ones) and the flip command's queue in tests/rsx/test_methods.cpp.
+
+## D-171 · 2026-10-06 · cellSpurs up to RPCS3's API, on the native scheduler
+
+Every function RPCS3's cellSpurs.cpp implements now runs on the native SPURS (D-037): the 58 pspocket lacked
+(initialize and SPURS2, the information and thread IDs, the SPU GUID, workload priorities, contention, idle SPU
+requests, signals, data and ready counts, the second flag receiver, shutdown, wait and remove with the
+shutdown-completion hook, the exception handler flags, traces, CellSpursTaskset2 and the taskset accessors, the event
+flag getters, clear and try-wait, the barrier's taskset, the LF queue, the old job chain API, the job chain getters,
+exception handlers, guards, grab limit and urgent call). Each cites RPCS3's function and was compared with libsre (fw
+4.92, the reference, D-046); where the two differ, or RPCS3 has a TODO, libsre's behaviour is taken ("as libsre" in the
+comments), as in D-047 and D-054. Updates of CellSpurs line 0 (ready counts, contention, signals, the flag receiver,
+the system service message bits) are one reservation_op each, so idle workers waiting on the line wake (D-073).
+
+- **SPURS2.** cellSpursInitializeWithAttribute2 makes an instance of 32 workloads (8 KB, SAF_SECOND_VERSION, flags1's
+  SF1_32_WORKLOADS), and the native scheduler runs it with kernel 2's selection (RPCS3 spursKernel2SelectWorkload):
+  contention and maximum contention in nibbles (byte wid & 15, low nibble for 0..15, high for 16..31), the ready
+  counts of 16..31 in wklIdleSpuCountOrReadyCount2, signals in wklSignal2, the second state, status and event tables,
+  and the information, F and H tables at 0x1000, 0x1200 and 0x1A00; the weight is the priority and the current
+  workload's tie-breaker only. A game's policy module on SPURS2 is entered as kernel 2 calls it, from 0x834 ($0 and
+  [0x1E0] are 0x838). Every workload function, the job chain policy's ready count and its error path's shutdown use
+  the second tables for 16..31. cellSpursRequestIdleSpu is STAT on SPURS2 (its byte is a ready count there), as libsre.
+- **Shutdown-completion hooks.** RPCS3 creates the event helper thread at initialize; natively it exists for the hooks
+  only, created with the first workload whose attribute has one: an lv2 PPU thread "<prefix>SpursHdlr1" at the
+  instance's PPU priority, waiting on the "_spuPrv" queue (42 entries) attached to a dynamic SPU port and a local event
+  port, as RPCS3's. A completed shutdown sends it the workload's bit (data3); it calls the hook (spurs, wid, arg) once
+  the workers have left the workload (D-136) and sets event bit 0x20, which cellSpursWaitForWorkloadShutdown waits for
+  where RPCS3 waits on the semaphore the helper posts. cellSpursFinalize stops it (the end event, the join, the port,
+  SPU port and queue). Its entry is an internal function the loader links (_pspocket_spurs_event_helper, NID
+  0x8A1D254E); without it a hook is logged, not called. A shutdown an SPU starts (a job chain's error) is completed by
+  the waiter, which sends the completion as the system service would.
+- **libsre where RPCS3 differs.** cellSpursGetSpuGuid decodes the .SpuGUID section's four `ila $2` instructions (RPCS3
+  writes nothing). cellSpursCreateJobChain makes the old API's chain with libsre's checks (entry, a grab limit of 1 to
+  16, tags up to 31, priorities, descriptors of 64, 128 or 256 bytes), revision 1 from SDK 1.5, else 0; RPCS3's checks
+  attribute fields the old API has not and always fails. cellSpursKickJobChain gives a chain with autoReadyCount ready
+  count 1 if it had none (compare-and-swap 0 to 1) and one without it the count given (ReadyCountStore); RPCS3 has the
+  two the other way round. A job guard keeps its chain as a u64 at 0x08 (RPCS3 reads a u32 there, the high word); the
+  last notify kicks a revision 0 or 1 chain with the requested SPU count, runs a later one that waits on the guard.
+  cellSpursGetJobChainInfo also gives the grab limit (0x44) and takes the name from the workload's information;
+  cellSpursJobSetMaxGrab writes the limit at 0x72, where libsre keeps it (RPCS3's layout: 0x70), and the policy keeps
+  a limit changed during a visit. cellSpursJobChainGetError refuses a NULL cause and writes it only with an error;
+  cellSpursJobChainGetSpursAddress and the taskset accessors refuse a workload ID past 31 (RPCS3 checks none, or 15,
+  which a SPURS2 taskset passes); the event flag and barrier getters check alignment before the output's NULL and
+  sign-extend direction and clear mode; _cellSpursLFQueueInitialize refuses a taskset whose workload ID is past 31;
+  _cellSpursTaskAttribute2Initialize clears all 256 bytes; cellSpursRequestIdleSpu answers with the policy module's
+  codes and accepts a count of 8 (RPCS3: the core's, and 8 is INVAL). cellSpursCreateTaskset2 (RPCS3: a TODO after
+  the first two steps) adds the Task2 and exit-code handler descriptors, two lv2 event flags "taskset2" and the task
+  name buffer, cleared.
+- **Fixes (rule 7).** _cellSpursWorkloadFlagReceiver clearing for a workload that is not the receiver is PERM and
+  changes nothing; it returned CELL_OK and reset the flag. cellSpursReadyCountStore: a value above 255 is INVAL before
+  SRCH, as RPCS3 and libsre.
+- **What a native SPURS has not.** No SPU thread group or SPU threads: cellSpursGetSpuThreadGroupId,
+  cellSpursGetSpuThreadId, cellSpursGetInfo and the trace header give their IDs as 0, an ID lv2 refuses (logged
+  once); a memory container from cellSpursAttributeSetMemoryContainerForSpuThread is kept and not used (logged). No
+  system service: a trace keeps its buffer, mode and per-SPU start indices and gets no packets; GetInfo's deadline
+  counters are 0. The exception handlers (global, taskset, job chain) are kept and cellSpursEnableExceptionEventHandler
+  sets the flag, but an SPU exception still stops its worker with a fatal log (rule 5). The job memory check
+  (cellSpursJobChainAttributeSetJobTypeMemoryCheck, a descriptor's jobType bit 1) is not done: logged once, the jobs
+  run without it, where the policy stopped with a fatal log before.
+
+Not done: RPCS3's UNIMPLEMENTED stubs for CellSpursTaskset2's own tasks (cellSpursCreateTask2, JoinTask2,
+TryJoinTask2, DestroyTaskset2, CreateTask2WithBinInfo) and cellSpursGetWorkloadInfo (a TODO in RPCS3) stay
+unimplemented (rule 4); tasks made with cellSpursCreateTask run in a Taskset2 as in any taskset. Tests:
+tests/hle/test_spurs_api.cpp (11 cases): the 58 names by NID and the internal helper; initialize, the container, the
+information and thread IDs; the GUID decoder; priorities, contention, idle SPU requests, signals, data and ready counts;
+the flag receivers (the PERM regression); shutdown, wait and remove with a hook run by guest code on the event helper,
+and without the helper; traces and the exception handler flags; Taskset2 and the accessors, a task running in it; event
+flags, the barrier and the LF queue; a SPURS2 instance whose taskset (workload 16) runs a task and whose policy module
+(workload 17) is entered as kernel 2 does. tests/hle/test_spurs_jobchain.cpp (3 more cases): the old API made and
+kicked; IDs, errors, information, handlers, grab limits, urgent calls and the memory check; guards that run and kick
+chains. The synthetic executable's loader test (test_hle.cpp) counts cellSpursInitialize among its implemented imports.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
