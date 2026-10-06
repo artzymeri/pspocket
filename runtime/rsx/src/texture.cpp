@@ -251,6 +251,97 @@ std::array<u8, 4> texture_channel_sources(const TextureFormatInfo& fmt, u32 rema
     return out;
 }
 
+u32 texture_format_features(u32 base_format)
+{
+    // RPCS3 Common/TextureUtils.cpp get_format_features, with its notes from hardware tests.
+    using namespace texfeature;
+    switch (base_format) {
+    case tex::B8:
+    case tex::A1R5G5B5:
+    case tex::A4R4G4B4:
+    case tex::R5G6B5:
+    case tex::A8R8G8B8:
+    case tex::COMPRESSED_DXT1:
+    case tex::COMPRESSED_DXT23:
+    case tex::COMPRESSED_DXT45:
+    case tex::G8B8:
+    case tex::COMPRESSED_B8R8_G8R8:
+    case tex::COMPRESSED_R8B8_R8G8:
+    case tex::R6G5B5:
+    case tex::R5G5B5A1:
+    case tex::D1R5G5B5:
+    case tex::D8R8G8B8: return kSigned | kGamma | kBiasedRenormalization; // the base formats: everything
+    case tex::DEPTH24_D8:
+    case tex::DEPTH24_D8_FLOAT:
+    case tex::DEPTH16:
+    case tex::DEPTH16_FLOAT: return kBiasedRenormalization; // gamma and _bx2 hang the hardware, signed does nothing
+    case tex::X16: return kBiasedRenormalization | k16BitChannels;
+    case tex::Y16_X16: return kSigned | kBiasedRenormalization | k16BitChannels;
+    case tex::COMPRESSED_HILO8: return kBiasedRenormalization;
+    default: return 0; // HILO_S8 and the float formats: nothing works
+    }
+}
+
+u32 texture_hardware_remap(u32 base_format, u32 remap)
+{
+    // RPCS3 RSXTexture.cpp decoded_remap.
+    const u32 override_bits = (remap >> 16) & 0xffff;
+    switch (base_format) {
+    case tex::X32_FLOAT:
+    case tex::W32_Z32_Y32_X32_FLOAT:
+    case tex::W16_Z16_Y16_X16_FLOAT: return (remap & ~0xffu) | 0xe4; // floating point textures cannot be remapped
+    case tex::Y16_X16_FLOAT: return (remap & ~0xffu) | (override_bits ? 0x56u : 0x66u);
+    case tex::X16:
+    case tex::Y16_X16:
+    case tex::COMPRESSED_HILO8:
+    case tex::COMPRESSED_HILO_S8: {
+        // Two 16-bit channels: 0xE4 or 0x4E, the low bit of the high word choosing R-R-R-G over R-G-R-G.
+        u32 lo = remap & 0xff;
+        switch (lo) {
+        case 0xe4: lo = override_bits ? 0x56 : 0x66; break;
+        case 0x4e: lo = override_bits ? 0xa9 : 0x99; break;
+        case 0xee: lo = 0xaa; break;
+        case 0x44: lo = 0x55; break;
+        default: break;
+        }
+        return (remap & 0xff00) | lo;
+    }
+    default: return remap;
+    }
+}
+
+u32 texture_remap_mask(u32 hardware_remap, u32 bits)
+{
+    // RPCS3 texture_channel_remap_t::shuffle_mask_bits: output channel c (A, R, G, B) is in the result when its control
+    // is REMAP (2) and the input channel it reads is in `bits`.
+    if (!bits || hardware_remap == tex::kRemapIdentity) return bits;
+    u32 result = 0;
+    for (u32 c = 0; c < 4; c++) {
+        const u32 control = (hardware_remap >> (8 + 2 * c)) & 3, source = (hardware_remap >> (2 * c)) & 3;
+        if (control == 2 && (bits & (1u << source))) result |= 1u << c;
+    }
+    return result;
+}
+
+u32 texture_control(const TextureInfo& t)
+{
+    u32 c = t.alpha_kill ? texctl::kAlphaKill : 0u;
+    const u32 features = texture_format_features(t.base_format());
+    if (!features) return c;
+    // RPCS3 RSXTexture.cpp format_ex: signed over gamma over the unsigned remap, each on the channels the ones before
+    // left. Signed channels are a property of the bytes read, so they follow the remap; gamma applies to what the
+    // remap made (RPCS3's hardware notes), and its register bits are R, G, B, A where the others are A, R, G, B.
+    const u32 remap = texture_hardware_remap(t.base_format(), t.remap);
+    const u32 sign = (features & texfeature::kSigned) ? texture_remap_mask(remap, t.argb_signed & 0xf) : 0u;
+    const u32 gamma = (features & texfeature::kGamma) ? ((((t.gamma << 1) & 0xf) | ((t.gamma >> 3) & 1)) & ~sign) : 0u;
+    const u32 read = texture_remap_mask(remap, 0xf);
+    const bool biased = t.unsigned_remap == 1; // CELL_GCM_TEXTURE_UNSIGNED_REMAP_BIASED
+    const u32 expand = (features & texfeature::kBiasedRenormalization) && biased ? read & ~(sign | gamma) : 0u;
+    c |= (gamma << texctl::kGammaShift) | (expand << texctl::kExpandShift) | (sign << texctl::kSignShift);
+    c |= (read << texctl::kBx2Shift) | (features << texctl::kFeatureShift);
+    return c;
+}
+
 float half_to_float(u16 h)
 {
     const u32 sign = (h >> 15) & 1, exp = (h >> 10) & 31, mant = h & 0x3ff;

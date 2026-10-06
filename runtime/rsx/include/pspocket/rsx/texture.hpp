@@ -178,6 +178,41 @@ inline constexpr u8 kChannelZero = 4;
 inline constexpr u8 kChannelOne = 5;
 std::array<u8, 4> texture_channel_sources(const TextureFormatInfo& fmt, u32 remap);
 
+// ---- texel conversions in the fragment shader (D-174) -------------------------------------------------------------
+
+// What a texture format allows of the per-channel controls (RPCS3 Common/TextureUtils.cpp get_format_features): signed
+// channels (NV4097_SET_TEXTURE_FILTER bits 28-31), gamma (NV4097_SET_TEXTURE_ADDRESS bits 20-23) and the biased
+// unsigned remap (ADDRESS bits 12-15, and the fragment program's _bx2); 16-bit channels sign and expand by 16-bit steps.
+namespace texfeature {
+inline constexpr u32 kSigned = 1u << 0;
+inline constexpr u32 kBiasedRenormalization = 1u << 1;
+inline constexpr u32 kGamma = 1u << 2;
+inline constexpr u32 k16BitChannels = 1u << 3;
+} // namespace texfeature
+u32 texture_format_features(u32 base_format);
+
+// The remap as the hardware applies it, for the formats that cannot remap freely (RPCS3 RSXTexture.cpp decoded_remap:
+// float formats keep their order, X16/Y16_X16/HILO remap two 16-bit channels).
+u32 texture_hardware_remap(u32 base_format, u32 remap);
+// The channels (A, R, G, B order, bit 0 alpha) after the remap that read an input channel in `bits` (RPCS3
+// color_utils.hpp texture_channel_remap_t::shuffle_mask_bits); channels the remap forces to 0 or 1 are left out.
+u32 texture_remap_mask(u32 hardware_remap, u32 bits);
+
+// What the fragment shader does to a texel a unit returns (MslFsParams::tex_control, msl.cpp rsx_texel): RPCS3's
+// texture_control_bits (Utils/color_utils.hpp) as RSXTexture.cpp format_ex and RSXThread.cpp make them. Channel masks
+// are in A, R, G, B order (bit 0 alpha), over the channels after the remap.
+namespace texctl {
+inline constexpr u32 kGammaShift = 0;    // bits 0-3: sRGB to linear (not remapped, RPCS3)
+inline constexpr u32 kAlphaKill = 1u << 4; // NV4097_SET_TEXTURE_CONTROL0 bit 2: a texel with alpha 0 discards the fragment
+inline constexpr u32 kExpandShift = 6;   // bits 6-9: the unsigned remap BIASED: (x * 255 - 128) / 127
+inline constexpr u32 kSignShift = 10;    // bits 10-13: the channel's byte is signed: (s8)(x * 255) / 127
+inline constexpr u32 kBx2Shift = 16;     // bits 16-19: what _bx2 expands, the channels the remap reads (RPCS3 keeps
+                                         // them in the remap's high word; its control word has other bits here)
+inline constexpr u32 kFeatureShift = 25; // bits 25-28: texture_format_features (RPCS3 FF_SIGNED_BIT and on)
+inline constexpr u32 kConvertMask = (0xfu << kGammaShift) | (0xfu << kExpandShift) | (0xfu << kSignShift);
+} // namespace texctl
+u32 texture_control(const TextureInfo& t);
+
 // ---- CPU reference decoders -------------------------------------------------------------------------------------
 
 // Decodes one level to RGBA float (r, g, b, a) per texel, row-major, width x height. src points at the texture's

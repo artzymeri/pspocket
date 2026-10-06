@@ -191,7 +191,10 @@ std::string fp_source_str(const FpInstruction& in, const FpSource& s)
     std::string r;
     switch (s.type) {
     case FpRegType::Temp: r = std::format("{}{}", s.fp16 ? 'H' : 'R', s.index); break;
-    case FpRegType::Input: r = std::format("f[{}]", fp_input_name(in.input)); break;
+    case FpRegType::Input:
+        // SRC2.use_index_reg: the texture coordinate A0.x + addr_reg (NV_fragment_program2 fragment.texcoord[A0.x + n])
+        r = in.use_index_reg ? std::format("f[TEX(A0.x + {})]", in.addr_reg) : std::format("f[{}]", fp_input_name(in.input));
+        break;
     case FpRegType::Constant: {
         float f[4];
         for (u32 i = 0; i < 4; i++) __builtin_memcpy(&f[i], &in.constant[i], 4);
@@ -225,6 +228,8 @@ u32 fp_operand_count(u32 op)
     case FpOp::LRP:
     case FpOp::TXD:
     case FpOp::BEM:
+    case FpOp::TEXBEM:
+    case FpOp::TXPBEM:
     case FpOp::DP2A: return 3;
     case FpOp::MUL:
     case FpOp::ADD:
@@ -274,7 +279,9 @@ std::string disassemble(const FpInstruction& in)
         case FpOp::TXP:
         case FpOp::TXD:
         case FpOp::TXL:
-        case FpOp::TXB: s += std::format(", TEX{}", in.tex); break;
+        case FpOp::TXB:
+        case FpOp::TEXBEM:
+        case FpOp::TXPBEM: s += std::format(", TEX{}", in.tex); break;
         default: break;
         }
     } else if (in.op == static_cast<u8>(FpOp::KIL) || in.op == static_cast<u8>(FpOp::RET) || in.op == static_cast<u8>(FpOp::BRK)) {

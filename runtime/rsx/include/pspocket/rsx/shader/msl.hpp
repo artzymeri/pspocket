@@ -2,13 +2,14 @@
 
 // RSX shader microcode -> Metal Shading Language.
 //
-// This wave translates a working subset (plan section 7: hash with embedded constants masked out, pass the constants
-// in a buffer). Vertex programs: vector MOV MUL ADD MAD DP3 DPH DP4 DST MIN MAX SLT SGE SEQ SNE SGT SLE SFL STR FRC
-// FLR SSG; scalar MOV RCP RCC RSQ EX2 LG2 SIN COS. Fragment programs: MOV MUL ADD MAD DP2 DP3 DP4 MIN MAX DIV RCP
-// RSQ EX2 LG2 SIN COS FRC FLR SLT SGE SLE SGT SNE SEQ STR SFL LRP NRM DDX DDY KIL TEX TXP TXL TXB, plus NOP and the
-// fences. Everything else (flow control, condition codes, address registers, pack/unpack, LIT, texture-in-vertex)
-// fails with an "unsupported" error naming the opcode and its position, so the backend skips the draw loudly.
-// Semantics follow RPCS3 VertexProgramDecompiler.cpp / FragmentProgramDecompiler.cpp, cited per operation.
+// Programs are hashed with embedded constants masked out; the constants reach the shader in a buffer (plan section 7).
+// Vertex programs: every vector op RPCS3 translates, the scalar ops but PSH and POP, condition codes, the address
+// registers and flow control (D-086, D-113). Fragment programs: every op RPCS3 translates (D-174 added LIT, LIF, DST,
+// REFL, DP2A, PKG, UPG, BEM, TEXBEM and TXPBEM), condition codes, IFE, LOOP, REP, BRK and RET, inputs indexed by the
+// loop index. What is left (CAL, POW, BEMLUM, TIMESWTEX, the vertex stack ops) fails with an "unsupported" error
+// naming the opcode and its position, so the backend skips the draw loudly. Semantics follow RPCS3
+// VertexProgramDecompiler.cpp / FragmentProgramDecompiler.cpp, cited per operation; where pspocket differs, the
+// comment says why.
 //
 // Vertex pulling (plan section 7): the vertex shader reads raw guest bytes (big-endian) from a buffer and decodes
 // every attribute itself (RPCS3 GLSLSnippets/RSXProg/RSXVertexFetch.glsl), so the CPU never converts vertex data.
@@ -22,6 +23,11 @@
 #include "pspocket/rsx/shader/ir.hpp"
 
 namespace pspocket::rsx::shader {
+
+// The translation's version: raised whenever the MSL made for a program and its options changes. The shader cache
+// (metal/src/shader_cache.mm) loads only the records of this version: a record of another one holds MSL of the old
+// translation under a key the new one also uses. 2: D-174.
+inline constexpr u32 kTranslationVersion = 2;
 
 // Argument table slots shared by the translator and the Metal backend.
 namespace slot {
@@ -82,8 +88,11 @@ struct alignas(16) MslFsParams {
     u32 alpha_func = 0x207;               // CompareFunc, only read when FpOptions::alpha_test
     float alpha_ref = 0.f;
     u32 pad0 = 0, pad1 = 0;
+    u32 tex_control[16] = {};             // per unit: the texel conversions (texture.hpp texture_control), read by the
+                                          // units FpOptions::texture_convert_mask names and by _bx2 samples
+    float tex_bias[16] = {};              // per unit: the LOD bias (NV4097_SET_TEXTURE_FILTER), 0 without mipmaps
 };
-static_assert(sizeof(MslFsParams) == 16 + 256 + 16);
+static_assert(sizeof(MslFsParams) == 16 + 256 + 16 + 64 + 64);
 
 struct VpOptions {
     bool point_size = false; // emit [[point_size]] (point primitives)
@@ -105,6 +114,16 @@ struct FpOptions {
     u32 texcoord_2d_mask = 0; // NV4097_SET_TEX_COORD_CONTROL bit 0 per unit: z = 0, w = 1/w
     bool alpha_test = false;
     bool flat_colors = false;
+    // D-174. Per unit: texels converted (texture_control() & texctl::kConvertMask: signed channels, gamma, the biased
+    // unsigned remap; RPCS3 RSX_SHADER_CONTROL_TEXTURE_FORMAT_CONVERT), and the alpha kill (RPCS3
+    // RSX_SHADER_CONTROL_TEXTURE_ALPHA_KILL). Shadow lookups have neither (RPCS3: no _process_texel).
+    u16 texture_convert_mask = 0;
+    u16 texture_alpha_kill_mask = 0;
+    // D-174, the ROP as RPCS3's RSXROPEpilogue.glsl orders it: the colour outputs to sRGB (NV4097_SET_SHADER_PACKER on
+    // an 8-bit target with 16-bit exports; RSXThread.cpp), then the alpha test and alpha to coverage
+    // (NV4097_SET_ANTI_ALIASING_CONTROL bit 4, emulated as RPCS3 does without hardware support) on colour 0's alpha.
+    bool srgb_output = false;
+    bool alpha_to_coverage = false;
     bool operator==(const FpOptions&) const = default;
 };
 

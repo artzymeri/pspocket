@@ -814,10 +814,26 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             }
         }
         if (t < 10 && (state.texcoord_control(t) & 1)) fo.texcoord_2d_mask |= 1u << t;
+        // Texel conversions and the alpha kill (D-174): compiled in for the units that have them, as RPCS3's
+        // TEXTURE_FORMAT_CONVERT and TEXTURE_ALPHA_KILL; the bits reach the shader in fs.tex_control.
+        if (ti.enabled) {
+            const u32 control = texture_control(ti);
+            if (control & texctl::kConvertMask) fo.texture_convert_mask = static_cast<u16>(fo.texture_convert_mask | (1u << t));
+            if (control & texctl::kAlphaKill) fo.texture_alpha_kill_mask = static_cast<u16>(fo.texture_alpha_kill_mask | (1u << t));
+        }
     }
     const RasterInfo raster = state.raster();
     fo.alpha_test = raster.alpha_test;
     fo.flat_colors = raster.shade_mode == static_cast<u32>(ShadeMode::Flat);
+    // D-174 (RPCS3 RSXThread.cpp): NV4097_SET_SHADER_PACKER turns the colours sRGB on the 8-bit targets, never from
+    // 32-bit exports; alpha to coverage is emulated (one sample here, as RPCS3 without hardware support).
+    const u32 colour_format = state.surface().color_format;
+    const bool float_target = colour_format == static_cast<u32>(SurfaceColorFormat::F_W16Z16Y16X16) ||
+                              colour_format == static_cast<u32>(SurfaceColorFormat::F_W32Z32Y32X32) ||
+                              colour_format == static_cast<u32>(SurfaceColorFormat::F_X32);
+    fo.srgb_output = state.reg(m::NV4097_SET_SHADER_PACKER) != 0 && !(fo.shader_control & 0x40) && !float_target &&
+                     targets.color_count > 0;
+    fo.alpha_to_coverage = ((state.reg(m::NV4097_SET_ANTI_ALIASING_CONTROL) >> 4) & 1) != 0;
     const shader::FragmentProgram* fprog = nullptr;
     u32 fp_ea = 0;
     const CompiledProgram* fp = fragment_program_for(state, fo, &fprog, fp_ea);
@@ -868,6 +884,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             fs.tex_scale[t][3] = static_cast<float>((ti.mag_filter != static_cast<u32>(tex::MagFilter::Nearest) ? 1u : 0u) |
                                                     (bf == tex::DEPTH16 || bf == tex::DEPTH24_D8 ? 2u : 0u));
         }
+        fs.tex_control[t] = ti.enabled ? texture_control(ti) : 0u; // D-174
         if (Surface* zs = depth_source[t]) {
             bound[t] = zs->texture;
             zs->last_used = tick;
@@ -904,6 +921,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                      : wanted == MTLTextureTypeCube       ? dummy_cube
                      : wanted == MTLTextureType3D         ? dummy_volume
                                                           : dummy_texture;
+        }
+        // The LOD bias (D-174), for a texture with mipmaps its filter reads, as RPCS3 sets it on the sampler only then
+        // (VKDraw.cpp, GL sampler_state::apply): on one level it would only move magnification to minification.
+        if (bound[t].mipmapLevelCount > 1 && ti.min_filter >= static_cast<u32>(tex::MinFilter::NearestNearest)) {
+            fs.tex_bias[t] = ti.bias;
         }
     }
 

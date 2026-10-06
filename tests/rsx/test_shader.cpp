@@ -402,7 +402,7 @@ TEST_CASE("fragment program MSL for the supported subset")
     const std::string& s = r.shader.source;
     CHECK(s.find("fragment rsx_fs_out " + r.shader.entry) != std::string::npos);
     CHECK(s.find("(clamp(in.col0, 0.0, 1.0)) * (fc[0])") != std::string::npos);
-    CHECK(s.find("t0.sample(s0, ((in.tc0).xy * fp.tex_scale[0].xy))") != std::string::npos);
+    CHECK(s.find("t0.sample(s0, ((in.tc0).xy * fp.tex_scale[0].xy), bias(fp.tex_bias[0]))") != std::string::npos);
     CHECK(s.find("(r0) + (fc[1].xxxx)") != std::string::npos);
     CHECK(s.find("r0.xyz = res.xyz;") != std::string::npos);
     CHECK(s.find("out.c0 = r0;") != std::string::npos);
@@ -555,13 +555,13 @@ TEST_CASE("fragment program DIVSQ, PK16, UP16 and RET")
 TEST_CASE("unsupported fragment program features are named")
 {
     auto prog = sample_fp();
-    prog[1].op = static_cast<u32>(FpOp::BEM);
+    prog[1].op = static_cast<u32>(FpOp::POW); // RPCS3's decompiler has no POW either
     auto bytes = assemble_fp(prog);
     auto fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
     REQUIRE(fp.has_value());
     TranslateResult r = translate_fragment_program(*fp);
     CHECK_FALSE(r.ok);
-    CHECK(r.error.find("opcode BEM") != std::string::npos);
+    CHECK(r.error.find("opcode POW") != std::string::npos);
     CHECK(r.error.find("0x0020") != std::string::npos);
 
     prog = sample_fp();
@@ -579,7 +579,7 @@ TEST_CASE("fragment programs: IFE with else, LOOP with BRK and RET, and byte pac
 {
     // 0x00: MOV R1, f[COL0] (sets RC0)    0x10: IFE (RC0 > 0) else 0x40, end 0x60
     // 0x20: MOV R0, {1, 0, 0, 1}           0x40: MOV R0, {0, 1, 0, 1}  (each with its 16-byte constant)
-    // 0x60: LOOP i = 0..3, end 0xA0         0x70: UPB R2, R1    0x80: BRK (RC0.y < 0)    0x90: RET (RC0 == 0)
+    // 0x60: LOOP 4 times, end 0xA0          0x70: UPB R2, R1    0x80: BRK (RC0.y < 0)    0x90: RET (RC0 == 0)
     // 0xA0: MOV R0, R2 END
     FpInst setcc;
     setcc.op = static_cast<u32>(FpOp::MOV);
@@ -597,9 +597,9 @@ TEST_CASE("fragment programs: IFE with else, LOOP with BRK and RET, and byte pac
     then_mov.constant = std::array<float, 4>{1.f, 0.f, 0.f, 1.f};
     FpInst else_mov = then_mov; // at 0x40
     else_mov.constant = std::array<float, 4>{0.f, 1.f, 0.f, 1.f};
-    FpInst loop; // at 0x60: for (i = 0; i < 4; i++) up to 0xA0
+    FpInst loop; // at 0x60: 4 times, the index from 0 by 1, up to 0xA0
     loop.op = static_cast<u32>(FpOp::LOOP);
-    fp_loop(loop, 0, 4, 1, 0xA0);
+    fp_loop(loop, 4, 0, 1, 0xA0);
     FpInst upb; // 0x70: UPB R2, R1
     upb.op = static_cast<u32>(FpOp::UPB);
     upb.dst = 2;
@@ -625,12 +625,306 @@ TEST_CASE("fragment programs: IFE with else, LOOP with BRK and RET, and byte pac
     INFO(s);
     CHECK(s.find("if (any((cc0 > float4(0.0)))) {") != std::string::npos);
     CHECK(s.find("} else {") != std::string::npos);
-    CHECK(s.find("if (true) for (int i0 = 0; i0 < 4; i0 += 1) {") != std::string::npos);
+    CHECK(s.find("if (true) for (int i0 = 0; i0 < 4; i0++) {") != std::string::npos);
+    CHECK(s.find("const int a0 = 0 + i0 * (1);") != std::string::npos);
     CHECK(s.find("unpack_unorm4x8_to_float(as_type<uint>((r1).x))") != std::string::npos);
     CHECK(s.find("if (any((cc0.yyyy < float4(0.0)))) break;") != std::string::npos);
     CHECK(s.find("{ fp_ret = true; break; }") != std::string::npos);
     CHECK(s.find("if (fp_ret) break;") != std::string::npos);
     CHECK(s.find("bool fp_ret = false;") != std::string::npos);
+}
+
+namespace {
+
+TranslateResult translate_fp(const std::vector<FpInst>& prog, const FpOptions& opt = {})
+{
+    const auto bytes = assemble_fp(prog);
+    const auto fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
+    REQUIRE(fp.has_value());
+    return translate_fragment_program(*fp, opt);
+}
+
+// OP R0, R1, R2, R3 (with the end bit)
+FpInst fp_op3(FpOp op)
+{
+    FpInst in;
+    in.op = static_cast<u32>(op);
+    in.dst = 0;
+    in.src[0] = fp_r(1);
+    in.src[1] = fp_r(2);
+    in.src[2] = fp_r(3);
+    in.end = true;
+    return in;
+}
+
+} // namespace
+
+TEST_CASE("fragment programs: LIT, LIF, DST, REFL, DP2A, PKG, UPG, BEM, TEXBEM and TXPBEM translate (RPCS3, D-174)")
+{
+    struct Row {
+        FpOp op;
+        const char* code;
+    };
+    for (const Row& row : {
+             Row{FpOp::LIT, "const float4 res = rsx_lit(r1);"},
+             Row{FpOp::LIF, "const float4 res = rsx_lif(r1);"},
+             Row{FpOp::DST, "float4(1.0, (r1).y * (r2).y, (r1).z, (r2).w)"},
+             Row{FpOp::REFL, "const float4 res = rsx_refl(r1, r2);"},
+             Row{FpOp::DP2A, "float4(dot((r1).xy, (r2).xy) + (r3).x)"},
+             Row{FpOp::PKG, "float4(as_type<float>(pack_float_to_unorm4x8(rsx_linear_to_srgb(r1))))"},
+             Row{FpOp::UPG, "rsx_srgb_to_linear(unpack_unorm4x8_to_float(as_type<uint>((r1).x)))"},
+             Row{FpOp::BEM, "((r1).xyxy + (r2).xxxx * (r3).xzxz + (r2).yyyy * (r3).ywyw)"},
+             Row{FpOp::TEXBEM, "const float4 x2d = ((r1).xyxy + (r2).xxxx * (r3).xzxz + (r2).yyyy * (r3).ywyw);"},
+             Row{FpOp::TXPBEM, "const float4 x2d = ((r1).xyxy + (r2).xxxx * (r3).xzxz + (r2).yyyy * (r3).ywyw);"},
+         }) {
+        INFO(fp_op_name(static_cast<u32>(row.op)));
+        const TranslateResult r = translate_fp({fp_op3(row.op)});
+        INFO(r.error);
+        REQUIRE(r.ok);
+        INFO(r.shader.source);
+        CHECK(r.shader.source.find(row.code) != std::string::npos);
+    }
+    // The helpers, as RPCS3 has them (RSXProgramCommon.glsl, RSXFragmentPrologue.glsl).
+    const std::string lit = translate_fp({fp_op3(FpOp::LIT)}).shader.source;
+    CHECK(lit.find("const float x = max(v.x, 0.0), y = max(v.y, 1e-10);") != std::string::npos);
+    CHECK(lit.find("float4(1.0, x, x > 0.0 ? exp2(v.w * log2(y)) : 0.0, 1.0)") != std::string::npos);
+    CHECK(lit.find("float4(1.0, v.y, v.y > 0.0 ? exp2(v.w) : 0.0, 1.0)") != std::string::npos);
+    CHECK(translate_fp({fp_op3(FpOp::REFL)}).shader.source.find("return i - 2.0 * dot(n, i) * n;") != std::string::npos);
+    CHECK(translate_fp({fp_op3(FpOp::PKG)}).shader.source.find("clamp(select(high, low, c < 0.0031308), 0.0, 1.0)") !=
+          std::string::npos);
+    CHECK(translate_fp({fp_op3(FpOp::UPG)}).shader.source.find("pow((c + 0.055) / 1.055, float4(2.4)), c > 0.04045)") !=
+          std::string::npos);
+    // TEXBEM samples x2d as TEX does its coordinate, TXPBEM as TXP.
+    const std::string bem = translate_fp({fp_op3(FpOp::TEXBEM)}).shader.source;
+    CHECK(bem.find("t0.sample(s0, ((x2d).xy * fp.tex_scale[0].xy), bias(fp.tex_bias[0]))") != std::string::npos);
+    const std::string txpbem = translate_fp({fp_op3(FpOp::TXPBEM)}).shader.source;
+    CHECK(txpbem.find("t0.sample(s0, (((x2d).xy / (x2d).w) * fp.tex_scale[0].xy), bias(fp.tex_bias[0]))") != std::string::npos);
+    // LIT, LIF and REFL are not precision-clamped (RPCS3 SetDst); DST is.
+    for (const FpOp op : {FpOp::LIT, FpOp::LIF, FpOp::REFL, FpOp::DST}) {
+        FpInst in = fp_op3(op);
+        in.prec = 2; // fixed12
+        const std::string s = translate_fp({in}).shader.source;
+        INFO(fp_op_name(static_cast<u32>(op)));
+        CHECK((s.find("clamp(") != std::string::npos && s.find(", -2.0, 2.0)") != std::string::npos) == (op == FpOp::DST));
+    }
+    // Disassembly names the unit and the three sources.
+    const auto bytes = assemble_fp({fp_op3(FpOp::TEXBEM)});
+    const auto fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
+    REQUIRE(fp.has_value());
+    CHECK(disassemble(fp->instructions[0]) == "TEXBEMR R0, R1, R2, R3, TEX0; END");
+}
+
+TEST_CASE("fragment program TXP on a cube map divides by w; TXD on a shadow map compares (RPCS3, D-174)")
+{
+    FpInst txp; // TXP R0, f[TEX0], TEX0 (a cube map)
+    txp.op = static_cast<u32>(FpOp::TXP);
+    txp.input = 4;
+    txp.src[0] = fp_in();
+    FpInst txd; // TXD R1, f[TEX1], R2, R3, TEX1 (a shadow map)
+    txd.op = static_cast<u32>(FpOp::TXD);
+    txd.dst = 1;
+    txd.input = 5;
+    txd.tex = 1;
+    txd.src[0] = fp_in();
+    txd.src[1] = fp_r(2);
+    txd.src[2] = fp_r(3);
+    txd.end = true;
+    FpOptions opt;
+    opt.texture_kind[0] = TextureKind::Cube;
+    opt.texture_kind[1] = TextureKind::Shadow2D;
+    const TranslateResult r = translate_fp({txp, txd}, opt);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    const std::string& s = r.shader.source;
+    INFO(s);
+    CHECK(s.find("t0.sample(s0, ((in.tc0).xyz / (in.tc0).w)") != std::string::npos);
+    CHECK(s.find("rsx_shadow(t1, s1, (in.tc1).xy * fp.tex_scale[1].xy, (in.tc1).z, fp.tex_scale[1])") != std::string::npos);
+    CHECK(s.find("texturecube<float> t0 [[texture(0)]]") != std::string::npos);
+}
+
+TEST_CASE("fragment program texel conversions, alpha kill and LOD bias, per unit (RPCS3 _process_texel, D-174)")
+{
+    // TEX R0, f[TEX0], TEX0    TXL R1, f[TEX1], TEX1    TXD_bx2 R2, f[TEX2], R3, R4, TEX2    TEX_bx2 R5, f[TEX3], TEX3 END
+    const auto sample = [](FpOp op, u32 unit, bool bx2) {
+        FpInst in;
+        in.op = static_cast<u32>(op);
+        in.dst = unit == 3 ? 5 : unit;
+        in.input = 4 + unit;
+        in.tex = unit;
+        in.src[0] = fp_in();
+        in.src[1] = fp_r(3);
+        in.src[2] = fp_r(4);
+        in.texture_expand = bx2;
+        return in;
+    };
+    std::vector<FpInst> prog{sample(FpOp::TEX, 0, false), sample(FpOp::TXL, 1, false), sample(FpOp::TXD, 2, true),
+        sample(FpOp::TEX, 3, true)};
+    prog.back().end = true;
+    FpOptions opt;
+    opt.texture_convert_mask = 0x1;
+    opt.texture_alpha_kill_mask = 0x1;
+    opt.texture_kind[3] = TextureKind::Shadow2D;
+    const TranslateResult r = translate_fp(prog, opt);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    const std::string& s = r.shader.source;
+    INFO(s);
+    // Unit 0: alpha kill on the texel as sampled, then its conversions; the unit's LOD bias on the implicit LOD.
+    CHECK(s.find("float4 tex = t0.sample(s0, ((in.tc0).xy * fp.tex_scale[0].xy), bias(fp.tex_bias[0]));\n"
+                 "        if (tex.w < 0.000001) discard_fragment(); // alpha kill\n"
+                 "        tex = rsx_texel(tex, fp.tex_control[0], false);") != std::string::npos);
+    // Unit 1: TXL's level plus the bias, nothing converted.
+    CHECK(s.find("t1.sample(s1, ((in.tc1).xy * fp.tex_scale[1].xy), level((in.tc1).w + fp.tex_bias[1]))") != std::string::npos);
+    CHECK(s.find("fp.tex_control[1]") == std::string::npos);
+    // Unit 2: _bx2 converts as the unit's format allows; TXD's derivatives grow by 2^bias.
+    CHECK(s.find("gradient2d((r3).xy * fp.tex_scale[2].xy * exp2(fp.tex_bias[2]), (r4).xy * fp.tex_scale[2].xy * "
+                 "exp2(fp.tex_bias[2]))") != std::string::npos);
+    CHECK(s.find("tex = rsx_texel(tex, fp.tex_control[2], true);") != std::string::npos);
+    // Unit 3: a shadow lookup: neither _bx2 nor conversions (RPCS3 TEX2D_SHADOW).
+    CHECK(s.find("fp.tex_control[3]") == std::string::npos);
+    CHECK(s.find("const float4 res = rsx_shadow(t3, s3, (in.tc3).xy * fp.tex_scale[3].xy, (in.tc3).z, fp.tex_scale[3]);") !=
+          std::string::npos);
+    CHECK(s.find("static float4 rsx_texel(float4 v, uint c, bool bx2)") != std::string::npos);
+    CHECK(s.find("uint tex_control[16];") != std::string::npos);
+    // Without conversions, alpha kill or _bx2, no helper and no extra statements.
+    FpInst only = sample(FpOp::TEX, 0, false);
+    only.end = true;
+    const TranslateResult plain = translate_fp({only}, FpOptions{});
+    REQUIRE(plain.ok);
+    CHECK(plain.shader.source.find("rsx_texel") == std::string::npos);
+    CHECK(plain.shader.source.find("discard_fragment") == std::string::npos);
+}
+
+TEST_CASE("fragment program outputs: sRGB, then the alpha test and alpha to coverage on colour 0 (RPCS3's ROP, D-174)")
+{
+    FpInst mov; // MOV H0, f[COL0] END (16-bit exports: H0, H4, H6, H8)
+    mov.op = static_cast<u32>(FpOp::MOV);
+    mov.fp16 = true;
+    mov.input = 1;
+    mov.src[0] = fp_in();
+    mov.end = true;
+    FpOptions opt;
+    opt.mrt_count = 2;
+    opt.srgb_output = true;
+    opt.alpha_test = true;
+    opt.alpha_to_coverage = true;
+    opt.output_swizzle[0] = {2, 2, 2, 2}; // a B8 target: blue in every channel
+    TranslateResult r = translate_fp({mov}, opt);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    std::string s = r.shader.source;
+    {
+        INFO(s);
+        const usize srgb = s.find("    h0.xyz = rsx_linear_to_srgb(h0).xyz;\n    h4.xyz = rsx_linear_to_srgb(h4).xyz;\n");
+        const usize test = s.find("    if (!rsx_compare(fp.alpha_func, h0.w, fp.alpha_ref)) discard_fragment();\n");
+        const usize a2c = s.find("    if (!(h0.w > fract(sin(dot(in.position.xy, float2(12.9898, 78.233))) * 43758.5453))) "
+                                 "discard_fragment();");
+        const usize out = s.find("    out.c0 = float4(h0.z, h0.z, h0.z, h0.z);");
+        CHECK(srgb != std::string::npos);
+        CHECK(test != std::string::npos);
+        CHECK(a2c != std::string::npos);
+        CHECK(out != std::string::npos);
+        CHECK((srgb < test && test < a2c && a2c < out)); // RPCS3 RSXROPEpilogue.glsl's order
+        CHECK(s.find("static float4 rsx_linear_to_srgb(float4 c)") != std::string::npos);
+    }
+    // Without colour outputs the alpha test still runs ("This stage always runs even without a color output").
+    opt.mrt_count = 0;
+    opt.srgb_output = opt.alpha_to_coverage = false;
+    r = translate_fp({mov}, opt);
+    REQUIRE(r.ok);
+    s = r.shader.source;
+    CHECK(s.find("if (!rsx_compare(fp.alpha_func, h0.w, fp.alpha_ref)) discard_fragment();") != std::string::npos);
+    CHECK(s.find("rsx_linear_to_srgb") == std::string::npos);
+}
+
+TEST_CASE("fragment program loops run their count; the LOOP index picks texture coordinates (NV_fragment_program2, D-174)")
+{
+    // 0x00: LOOP 3 times, index from 1 by 2, end 0x20    0x10: ADD R0, R0, f[TEX(A0.x + 2)]    0x20: MOV R0, R0 END
+    FpInst loop;
+    loop.op = static_cast<u32>(FpOp::LOOP);
+    fp_loop(loop, 3, 1, 2, 0x20);
+    FpInst add;
+    add.op = static_cast<u32>(FpOp::ADD);
+    add.src[0] = fp_r(0);
+    add.src[1] = fp_in();
+    fp_indexed(add, 2);
+    FpInst last;
+    last.op = static_cast<u32>(FpOp::MOV);
+    last.src[0] = fp_r(0);
+    last.end = true;
+    FpOptions opt;
+    opt.texcoord_2d_mask = 0x2; // TEX1: (x, y, 0, w), in the table too
+    TranslateResult r = translate_fp({loop, add, last}, opt);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    std::string s = r.shader.source;
+    {
+        INFO(s);
+        CHECK(s.find("if (true) for (int i0 = 0; i0 < 3; i0++) {") != std::string::npos);
+        CHECK(s.find("const int a0 = 1 + i0 * (2);") != std::string::npos);
+        CHECK(s.find("(uint(a0 + 2) < 10u ? tcs[(a0 + 2)] : float4(0.0, 0.0, 0.0, 1.0))") != std::string::npos);
+        CHECK(s.find("const float4 tcs[10] = {in.tc0, float4(in.tc1.xy, 0.0, in_w), in.tc2,") != std::string::npos);
+        CHECK(s.find("float4 tc9 [[user(tc9)]];") != std::string::npos); // every coordinate an index can pick
+    }
+    const auto bytes = assemble_fp({loop, add, last});
+    const auto fp = decode_fragment_program(bytes.data(), static_cast<u32>(bytes.size()));
+    REQUIRE(fp.has_value());
+    CHECK(disassemble(fp->instructions[1]) == "ADDR R0, R0, f[TEX(A0.x + 2)];");
+
+    // A REP with every counter field the count, as NVIDIA's compilers encode it (nouveau nv40_fp_rep): 5 runs.
+    FpInst rep = loop;
+    rep.op = static_cast<u32>(FpOp::REP);
+    fp_loop(rep, 5, 5, 5, 0x20);
+    r = translate_fp({rep, add, last});
+    REQUIRE(r.ok);
+    s = r.shader.source;
+    {
+        INFO(s);
+        CHECK(s.find("if (true) for (int i0 = 0; i0 < 5; i0++) {") != std::string::npos);
+        CHECK(s.find("const int a0") == std::string::npos); // REP leaves the index...
+        CHECK(s.find("tcs[(i0 + 2)]") != std::string::npos); // ...so with no LOOP around, its counter (RPCS3) indexes
+    }
+    // REP inside LOOP: the LOOP's index. 0x00 LOOP end 0x40, 0x10 REP end 0x30, 0x20 ADD, 0x30 NOP, 0x40 MOV END.
+    FpInst outer = loop, inner = rep;
+    fp_loop(outer, 2, 0, -1, 0x40);
+    fp_loop(inner, 2, 0, 0, 0x30);
+    r = translate_fp({outer, inner, add, FpInst{}, last});
+    REQUIRE(r.ok);
+    s = r.shader.source;
+    {
+        INFO(s);
+        CHECK(s.find("const int a0 = 0 + i0 * (-1);") != std::string::npos); // a signed increment
+        CHECK(s.find("for (int i1 = 0; i1 < 2; i1++)") != std::string::npos);
+        CHECK(s.find("tcs[(a0 + 2)]") != std::string::npos);
+    }
+    // A condition that never holds skips the loop (RPCS3 "if (false) for (...)").
+    FpInst never = loop;
+    never.exec_lt = never.exec_eq = never.exec_gt = false;
+    r = translate_fp({never, add, last});
+    REQUIRE(r.ok);
+    CHECK(r.shader.source.find("if (false) for (int i0 = 0; i0 < 3; i0++) {") != std::string::npos);
+    // BRK outside a loop does nothing (RPCS3); a break there would leave the program.
+    FpInst brk;
+    brk.op = static_cast<u32>(FpOp::BRK);
+    r = translate_fp({brk, last});
+    REQUIRE(r.ok);
+    const std::string brk_body = r.shader.source.substr(r.shader.source.find("    do {\n"));
+    CHECK(brk_body.find("break;") == std::string::npos);
+    CHECK(brk_body.find("// (outside a loop: no effect, as RPCS3)") != std::string::npos);
+    // Outside loops A0.x is 0: the input is TEX(offset) itself.
+    FpInst direct = add;
+    direct.end = true;
+    fp_indexed(direct, 3);
+    r = translate_fp({direct});
+    INFO(r.error);
+    REQUIRE(r.ok);
+    CHECK(r.shader.source.find("(r0) + (in.tc3)") != std::string::npos);
+    CHECK(r.shader.source.find("tcs[") == std::string::npos);
+    // ... and past SSA it is no input at all (RPCS3: invalid ucode, nothing drawn): refused loudly.
+    fp_indexed(direct, 11);
+    r = translate_fp({direct});
+    CHECK_FALSE(r.ok);
+    CHECK(r.error.find("TEX0 + 11") != std::string::npos);
 }
 
 TEST_CASE("fragment program opcode names cover the ISA")

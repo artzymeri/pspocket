@@ -220,7 +220,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     return vertex_compiled[points ? 1 : 0] = &it->second;
 }
 
-const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& state, const shader::FpOptions& options,
+const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& state, const shader::FpOptions& requested,
     const shader::FragmentProgram** program_out, u32& program_ea)
 {
     const ShaderProgramInfo sp = state.shader_program();
@@ -274,19 +274,27 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     const shader::FragmentProgram& fp = entry.program;
     *program_out = &fp;
     program_ea = *ea;
+    // The per-unit texel options (D-174) of units the program does not sample change nothing in it: without them, draws
+    // that differ only there find their compile in the program's short list.
+    shader::FpOptions options = requested;
+    options.texture_convert_mask = static_cast<u16>(options.texture_convert_mask & fp.texture_mask);
+    options.texture_alpha_kill_mask = static_cast<u16>(options.texture_alpha_kill_mask & fp.texture_mask);
     for (const auto& [o, c] : entry.compiled) {
         if (o == options) return c;
     }
 
     std::vector<u32> ucode;
     for (const auto& in : fp.instructions) ucode.insert(ucode.end(), in.words.begin(), in.words.end());
-    std::string opt = std::format("{:x}.{}.{}.{}.{}", options.shader_control, options.mrt_count, options.texcoord_2d_mask,
-        options.alpha_test ? 1 : 0, options.flat_colors ? 1 : 0);
+    std::string opt = std::format("{:x}.{}.{}.{}.{}.{}{}", options.shader_control, options.mrt_count, options.texcoord_2d_mask,
+        options.alpha_test ? 1 : 0, options.flat_colors ? 1 : 0, options.srgb_output ? 1 : 0, options.alpha_to_coverage ? 1 : 0);
     for (u32 i = 0; i < options.mrt_count && i < 4; i++) {
         for (u8 c : options.output_swizzle[i]) opt += static_cast<char>('0' + c);
     }
     for (u32 t = 0; t < 16; t++) {
-        if (fp.texture_mask & (1u << t)) opt += std::format(".{}{}", t, static_cast<u32>(options.texture_kind[t]));
+        if (!(fp.texture_mask & (1u << t))) continue;
+        opt += std::format(".{}{}", t, static_cast<u32>(options.texture_kind[t]));
+        if (options.texture_convert_mask & (1u << t)) opt += 'c'; // texel conversions (D-174)
+        if (options.texture_alpha_kill_mask & (1u << t)) opt += 'k';
     }
     const std::string key = std::format("fp:{:016x}:{}", fp.hash, opt);
     const auto remember = [&](const CompiledProgram* c) {
