@@ -134,9 +134,16 @@ run 105): on Assassin's Creed's menu music every answer is Sony's and the sound 
 
 The image decoders began with cellPngDec (D-199, run 106): pspocket's own on libpng, the same as Sony's libpngdec in
 2,283 answers and 121 decoded images, every colour type, bit depth, output setting and chunk kind (Sony's libpng 1.2.8
-quirks reproduced, its gray arithmetic found by fitting the pixels).
+quirks reproduced, its gray arithmetic found by fitting the pixels). cellJpgDec (D-200, run 107): pspocket's own
+decoder, the same as Sony's libjpgdec sample for sample in 1,848 answers and 149 images, with SPU threads off and on,
+progressive and damaged files included. libjpgdec turned out to be libjpeg 6b with Sony's own IDCTs (double float for
+quality, 16-bit AltiVec for fast, float for the reduced sizes), AltiVec colour conversion, a 64-bit bit buffer, and its
+own mean and memory estimate; all reproduced.
 
-Next: cellJpgDec and cellGifDec, each measured against Sony's the same way; the other audio codec cores on FFmpeg
+The outside sources the build reads (RPCS3 for the keys and libpng, the LLVM source of the phone's compiler) now live
+in `external/` inside the repository, gitignored (D-201).
+
+Next: cellGifDec, measured against Sony's the same way; the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
 docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
 with games nobody has analysed (each run's log names what is still missing).
@@ -163,7 +170,7 @@ build/host/runtime/loader/pspocket-boot inventory/gta5/decrypt/EBOOT.elf --timeo
 Debugging translated code: a fault prints host frames for `atos -o pspocket-boot -s SLIDE ADDR...` (D-094);
 `PSPOCKET_PPU_ONLY=LO-HI` keeps only some translated PPU functions; `PSPOCKET_SPU_TRACE_RUNS=N` shows why the module
 tracker missed code; `--trace-frame N` logs every draw of a frame (D-084). Keep one build directory and delete old
-frame dumps: the disk has about 10 GB free.
+frame dumps: the disk has about 65 GB free (2026-10-06).
 
 ## Checked against libsre
 

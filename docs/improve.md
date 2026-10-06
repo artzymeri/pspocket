@@ -154,7 +154,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   into the game's: one extra copy per image; measure on a game's loading screens before changing. The Ext functions
   (partial decoding with display callbacks, stream callbacks) are Sony's still: write them when a game imports one.
   libpng's NEON filters are off (PNG_ARM_NEON_OPT=0): measure a large PNG with them on.
-- **State:** open; cellJpgDec and cellGifDec next; the other audio cores when a game's log shows one.
+- **cellJpgDec (D-200):** all scalar: the IDCTs that are AltiVec in libjpgdec (the fast one, the 1/2 one, the colour
+  conversion) are written lane by lane in C++, and the whole image goes to a host buffer before rows are copied. Speed
+  is not measured: time a game's large JPEG (a loading screen, a photo) on the phone before changing anything; NEON
+  versions must keep the same rounding (the digest test and the comparison show it). The quality IDCT runs in double
+  as Sony's does: keep it so. The Ext functions are Sony's still: write them when a game imports one. The SPU
+  program's IDCTs (jpeg_dec_spu) were never used in the measured runs; if a game ever shows otherwise, compare again.
+- **State:** open; cellGifDec next; the other audio cores when a game's log shows one.
 
 ## The gate (D-149)
 
