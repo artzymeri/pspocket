@@ -317,6 +317,7 @@ struct SignalingCtx {
 struct NpState {
     std::mutex mutex;                     // everything below but `initialized`, which changes only with it held
     std::atomic<bool> initialized{false}; // sceNpInit's state (RPCS3 is_NP_init); sceNp2Init's is in sceNp2.cpp
+    u32 pool_size = 0;                     // the pool's size while NP is up (np_memory)
     u32 manager_cb = 0, manager_cb_arg = 0;
     bool basic_handler_registered = false;
     u32 basic_handler = 0, basic_handler_arg = 0;
@@ -3755,7 +3756,15 @@ u32 np_init(u32 poolsize, u32 poolptr)
     if (poolsize == 0 || !poolptr) return SCE_NP_ERROR_INVALID_ARGUMENT;
     if (poolsize < SCE_NP_MIN_POOL_SIZE) return SCE_NP_ERROR_INSUFFICIENT_BUFFER;
     s.initialized = true;
+    s.pool_size = poolsize;
     return lv2::CELL_OK;
+}
+
+u32 np_pool_size()
+{
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    return s.pool_size;
 }
 
 // sceNpInit(poolsize, poolptr): RPCS3's, through np_init. NP comes up offline (D-059): the manager reports a signed-out
@@ -3773,6 +3782,7 @@ u32 np_term()
     std::lock_guard lock(s.mutex);
     if (!s.initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     s.initialized = false;
+    s.pool_size = 0;
     s.basic_handler_registered = false;
     s.manager_cb = s.manager_cb_arg = 0;
     s.signaling_ctxs.clear();

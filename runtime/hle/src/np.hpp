@@ -18,6 +18,10 @@ bool np_initialized();
 // offline.
 u32 np_init(u32 poolsize, u32 poolptr);
 
+// The size of the pool NP was initialized with (RPCS3 np_memory: set up by init, released by term), 0 while NP is down.
+// Nothing is allocated from it offline.
+u32 np_pool_size();
+
 // RPCS3 sceNpTerm: CELL_OK, or SCE_NP_ERROR_NOT_INITIALIZED. Drops the manager callback, the basic handler and the
 // signaling contexts (np_handler::terminate_NP, idm::clear<signaling_ctx>); the lookup library and its title contexts
 // stay ("TODO: Other contexts"). terminate_NP also drops the matching 2 room callbacks, which sceNp2.cpp keeps: its
