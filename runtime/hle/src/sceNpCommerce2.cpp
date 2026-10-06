@@ -100,6 +100,12 @@ constexpr u32 SCE_NP_COMMERCE2_PRODUCT_CODE_BLOCK_LEN = 4;
 constexpr u32 SCE_NP_COMMERCE2_PRODUCT_CODE_INPUT_MODE_USER_INPUT = 0;
 constexpr u32 SCE_NP_COMMERCE2_PRODUCT_CODE_INPUT_MODE_CODE_SPECIFIED = 1;
 constexpr s32 SCE_NP_COMMERCE2_EVENT_CREATE_SESSION_DONE = 0x0011;
+constexpr s32 SCE_NP_COMMERCE2_EVENT_EMPTY_STORE_CHECK_DONE = 0x0061;
+constexpr u32 SCE_NP_COMMERCE2_STORE_IS_NOT_EMPTY = 0;
+constexpr s32 SCE_NP_COMMERCE2_STORE_CHECK_TYPE_CATEGORY = 1;
+constexpr s32 SCE_NP_COMMERCE2_STORE_BROWSE_TYPE_CATEGORY = 1, SCE_NP_COMMERCE2_STORE_BROWSE_TYPE_PRODUCT_CODE = 3;
+constexpr u32 SCE_NP_COMMERCE2_GETPRODLIST_MAX_COUNT = 60;
+constexpr u32 kProductBrowseParamSize = 4; // SceNpCommerce2ProductBrowseParam: be32 size
 
 // Guest structures (RPCS3 sceNpCommerce2.h, sceNp.h).
 // SceNpId (0x24 bytes), whose first 16 characters are the online ID.
@@ -598,6 +604,242 @@ s32 sceNpCommerce2DoProductCodeFinishAsync(PPUContext&, u32 ctx_id)
     return finish_dialog("sceNpCommerce2DoProductCodeFinishAsync", ctx_id);
 }
 
+s32 sceNpCommerce2DoProductBrowseFinishAsync(PPUContext&, u32 ctx_id)
+{
+    return finish_dialog("sceNpCommerce2DoProductBrowseFinishAsync", ctx_id);
+}
+
+s32 sceNpCommerce2DoServiceListFinishAsync(PPUContext&, u32 ctx_id)
+{
+    return finish_dialog("sceNpCommerce2DoServiceListFinishAsync", ctx_id);
+}
+
+// RPCS3 sceNpCommerce2CreateSessionAbort: the library and the context; the session is made at once, so there is
+// nothing to abort.
+s32 sceNpCommerce2CreateSessionAbort(PPUContext&, u32 ctx_id)
+{
+    const Call done = todo("nothing to abort", "sceNpCommerce2CreateSessionAbort(ctx {:#x})", ctx_id);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!find_ctx(ctx_id)) return done(error(SCE_NP_COMMERCE2_ERROR_CTX_NOT_FOUND));
+    return done(lv2::CELL_OK);
+}
+
+// The size field of an optional SceNpCommerce2ProductBrowseParam: nullopt when it isn't guest memory (logged).
+std::optional<u32> browse_param_size(PPUContext& ctx, std::string_view fn, u32 param)
+{
+    if (!usable(ctx, param, kProductBrowseParamSize, std::format("{}: param", fn))) return std::nullopt;
+    return ps_read32(guest_base(ctx), param);
+}
+
+// RPCS3 sceNpCommerce2DoProductBrowseStartAsync(ctx_id, const char* productId, container, const
+// SceNpCommerce2ProductBrowseParam* param): a product ID, a param of its size when given, then the context.
+s32 sceNpCommerce2DoProductBrowseStartAsync(PPUContext& ctx, u32 ctx_id, u32 product_id, u32 container, u32 param)
+{
+    const Call done = todo("no product browse dialog opens and the handler gets no event",
+        "sceNpCommerce2DoProductBrowseStartAsync(ctx {:#x}, product {}, container {:#x}, param {:#x})", ctx_id,
+        text_at(ctx, product_id), container, param);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!product_id || !usable(ctx, product_id, 1, "sceNpCommerce2DoProductBrowseStartAsync: productId") ||
+        !ps_read8(guest_base(ctx), product_id)) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    }
+    if (param) {
+        const std::optional<u32> size = browse_param_size(ctx, "sceNpCommerce2DoProductBrowseStartAsync", param);
+        if (!size) return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+        if (*size != kProductBrowseParamSize) return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_SIZE));
+    }
+    if (!find_ctx(ctx_id)) return done(error(SCE_NP_COMMERCE2_ERROR_CTX_NOT_FOUND));
+    return done(lv2::CELL_OK);
+}
+
+// RPCS3 sceNpCommerce2DoServiceListStartAsync(ctx_id, char* serviceId, container, SceNpCommerce2ProductBrowseParam*
+// param): both needed, the param of its size, a service ID, then the context.
+s32 sceNpCommerce2DoServiceListStartAsync(PPUContext& ctx, u32 ctx_id, u32 service_id, u32 container, u32 param)
+{
+    const Call done = todo("no service list dialog opens and the handler gets no event",
+        "sceNpCommerce2DoServiceListStartAsync(ctx {:#x}, service {}, container {:#x}, param {:#x})", ctx_id,
+        text_at(ctx, service_id), container, param);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!param || !service_id) return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    const std::optional<u32> size = browse_param_size(ctx, "sceNpCommerce2DoServiceListStartAsync", param);
+    if (!size) return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    if (*size != kProductBrowseParamSize) return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_SIZE));
+    if (!usable(ctx, service_id, 1, "sceNpCommerce2DoServiceListStartAsync: serviceId")) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    }
+    if (!ps_read8(guest_base(ctx), service_id)) return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_TARGET_ID));
+    if (!find_ctx(ctx_id)) return done(error(SCE_NP_COMMERCE2_ERROR_CTX_NOT_FOUND));
+    return done(lv2::CELL_OK);
+}
+
+// RPCS3 sceNpCommerce2EmptyStoreCheckStart(ctx_id, store_check_type, const char* target_id): a target, the category
+// check type, the context; its handler, when there is one, gets EMPTY_STORE_CHECK_DONE (subject 0, error 0) from the
+// game's next cellSysutilCheckCallback. EmptyStoreCheckFinish then reports the store not empty (RPCS3); Abort checks
+// only the library.
+s32 sceNpCommerce2EmptyStoreCheckStart(PPUContext& ctx, u32 ctx_id, s32 store_check_type, u32 target_id)
+{
+    const Call done = implemented("sceNpCommerce2EmptyStoreCheckStart(ctx {:#x}, type {}, target {})", ctx_id,
+        store_check_type, text_at(ctx, target_id));
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!target_id || !usable(ctx, target_id, 1, "sceNpCommerce2EmptyStoreCheckStart: target_id") ||
+        !ps_read8(guest_base(ctx), target_id)) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_TARGET_ID));
+    }
+    if (store_check_type != SCE_NP_COMMERCE2_STORE_CHECK_TYPE_CATEGORY) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    }
+    const std::optional<Commerce2Ctx> c = find_ctx(ctx_id);
+    if (!c) return done(error(SCE_NP_COMMERCE2_ERROR_CTX_NOT_FOUND));
+    if (!c->handler) return done(lv2::CELL_OK, "; no handler to tell");
+    sysutil_queue_call([ctx_id, handler = c->handler, arg = c->arg](PPUContext& cb_ctx) -> s32 {
+        call_guest(cb_ctx, handler, {ctx_id, 0, SCE_NP_COMMERCE2_EVENT_EMPTY_STORE_CHECK_DONE, 0, arg});
+        return lv2::CELL_OK;
+    });
+    return done(lv2::CELL_OK, "; EMPTY_STORE_CHECK_DONE goes to the handler at the next cellSysutilCheckCallback");
+}
+
+s32 sceNpCommerce2EmptyStoreCheckFinish(PPUContext& ctx, u32 ctx_id, u32 is_empty)
+{
+    const Call done = implemented("sceNpCommerce2EmptyStoreCheckFinish(ctx {:#x}, is_empty {:#x})", ctx_id, is_empty);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!is_empty || !usable(ctx, is_empty, 4, "sceNpCommerce2EmptyStoreCheckFinish: is_empty")) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    }
+    ps_write32(guest_base(ctx), is_empty, SCE_NP_COMMERCE2_STORE_IS_NOT_EMPTY);
+    return done(lv2::CELL_OK, ": the store is not empty");
+}
+
+s32 sceNpCommerce2EmptyStoreCheckAbort(PPUContext&, u32 ctx_id)
+{
+    const Call done = todo("nothing to abort", "sceNpCommerce2EmptyStoreCheckAbort(ctx {:#x})", ctx_id);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    return done(lv2::CELL_OK);
+}
+
+// RPCS3 sceNpCommerce2ExecuteStoreBrowse(targetType, const char* targetId, userdata): a target type (category, product
+// or product code), with a target ID except for a product code; the store doesn't open.
+s32 sceNpCommerce2ExecuteStoreBrowse(PPUContext& ctx, s32 target_type, u32 target_id, s32 userdata)
+{
+    const Call done = todo("the store doesn't open", "sceNpCommerce2ExecuteStoreBrowse(type {}, target {}, userdata {})",
+        target_type, text_at(ctx, target_id), userdata);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (target_type < SCE_NP_COMMERCE2_STORE_BROWSE_TYPE_CATEGORY ||
+        target_type > SCE_NP_COMMERCE2_STORE_BROWSE_TYPE_PRODUCT_CODE) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_TARGET_TYPE));
+    }
+    if (target_type < SCE_NP_COMMERCE2_STORE_BROWSE_TYPE_PRODUCT_CODE &&
+        (!target_id || !usable(ctx, target_id, 1, "sceNpCommerce2ExecuteStoreBrowse: targetId") ||
+            !ps_read8(guest_base(ctx), target_id))) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_TARGET_ID));
+    }
+    return done(lv2::CELL_OK);
+}
+
+// RPCS3 sceNpCommerce2GetStoreBrowseUserdata: 0 (a TODO: no store browse ever returns).
+s32 sceNpCommerce2GetStoreBrowseUserdata(PPUContext& ctx, u32 userdata)
+{
+    const Call done = implemented("sceNpCommerce2GetStoreBrowseUserdata({:#x})", userdata);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!userdata || !usable(ctx, userdata, 4, "sceNpCommerce2GetStoreBrowseUserdata: userdata")) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    }
+    ps_write32(guest_base(ctx), userdata, 0);
+    return done(lv2::CELL_OK, ": 0");
+}
+
+// RPCS3 sceNpCommerce2GetBGDLAvailability / SetBGDLAvailability: background downloads are never available (a TODO);
+// setting is only checked.
+s32 sceNpCommerce2GetBGDLAvailability(PPUContext& ctx, u32 availability)
+{
+    const Call done = implemented("sceNpCommerce2GetBGDLAvailability({:#x})", availability);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!availability || !usable(ctx, availability, 1, "sceNpCommerce2GetBGDLAvailability: bgdlAvailability")) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    }
+    ps_write8(guest_base(ctx), availability, 0);
+    return done(lv2::CELL_OK, ": not available");
+}
+
+s32 sceNpCommerce2SetBGDLAvailability(PPUContext&, bool availability)
+{
+    const Call done = todo("nothing changes", "sceNpCommerce2SetBGDLAvailability({})", availability);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    return done(lv2::CELL_OK);
+}
+
+// RPCS3 sceNpCommerce2GetProductInfoListCreateReq(ctx_id, u32* req_id): unlike the other requests, the context is
+// looked at.
+s32 sceNpCommerce2GetProductInfoListCreateReq(PPUContext&, u32 ctx_id, u32 req_id)
+{
+    const Call done = todo("no request is made and *req_id is not written",
+        "sceNpCommerce2GetProductInfoListCreateReq(ctx {:#x}, req_id {:#x})", ctx_id, req_id);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!req_id) return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    if (!find_ctx(ctx_id)) return done(error(SCE_NP_COMMERCE2_ERROR_CTX_NOT_FOUND));
+    return done(lv2::CELL_OK);
+}
+
+// RPCS3 sceNpCommerce2GetProductInfoListStart(req_id, const char** productIds, productNum): 1 to 60 products.
+s32 sceNpCommerce2GetProductInfoListStart(PPUContext&, u32 req_id, u32 product_ids, u32 product_num)
+{
+    const Call done = todo("nothing is asked of the store",
+        "sceNpCommerce2GetProductInfoListStart(req {:#x}, products {:#x}, {})", req_id, product_ids, product_num);
+    if (!initialized()) return done(error(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED));
+    if (!product_ids || !product_num || product_num > SCE_NP_COMMERCE2_GETPRODLIST_MAX_COUNT) {
+        return done(error(SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT));
+    }
+    return done(lv2::CELL_OK);
+}
+
+s32 sceNpCommerce2GetProductInfoListGetResult(PPUContext&, u32 req_id, u32 buf, u32 buf_size, u32 fill_size)
+{
+    return get_result("sceNpCommerce2GetProductInfoListGetResult", req_id, buf, buf_size, fill_size);
+}
+
+s32 sceNpCommerce2InitGetProductInfoListResult(PPUContext&, u32 result, u32 data, u32 data_size)
+{
+    return init_result("sceNpCommerce2InitGetProductInfoListResult", result, data, data_size);
+}
+
+// RPCS3's other getters of result data (TODOs): both pointers, nothing written.
+s32 sceNpCommerce2GetGameProductInfoFromGetProductInfoListResult(PPUContext&, u32 result, u32 index,
+    u32 game_product_info)
+{
+    return get_info(todo("*gameProductInfo is not written",
+                        "sceNpCommerce2GetGameProductInfoFromGetProductInfoListResult(result {:#x}, {}, {:#x})", result,
+                        index, game_product_info),
+        result, game_product_info);
+}
+
+s32 sceNpCommerce2GetCategoryInfoFromContentInfo(PPUContext&, u32 content_info, u32 category_info)
+{
+    return get_info(todo("*categoryInfo is not written", "sceNpCommerce2GetCategoryInfoFromContentInfo({:#x}, {:#x})",
+                        content_info, category_info),
+        content_info, category_info);
+}
+
+s32 sceNpCommerce2GetContentRatingInfoFromCategoryInfo(PPUContext&, u32 category_info, u32 rating_info)
+{
+    return get_info(todo("*contentRatingInfo is not written",
+                        "sceNpCommerce2GetContentRatingInfoFromCategoryInfo({:#x}, {:#x})", category_info, rating_info),
+        category_info, rating_info);
+}
+
+s32 sceNpCommerce2GetContentRatingInfoFromGameProductInfo(PPUContext&, u32 game_product_info, u32 rating_info)
+{
+    return get_info(todo("*contentRatingInfo is not written",
+                        "sceNpCommerce2GetContentRatingInfoFromGameProductInfo({:#x}, {:#x})", game_product_info,
+                        rating_info),
+        game_product_info, rating_info);
+}
+
+s32 sceNpCommerce2GetContentRatingDescriptor(PPUContext&, u32 rating_info, u32 index, u32 descriptor)
+{
+    return get_info(todo("*contentRatingDescriptor is not written",
+                        "sceNpCommerce2GetContentRatingDescriptor({:#x}, {}, {:#x})", rating_info, index, descriptor),
+        rating_info, descriptor);
+}
+
 } // namespace
 
 void register_sceNpCommerce2(Registry& r)
@@ -633,6 +875,27 @@ void register_sceNpCommerce2(Registry& r)
         PS_HLE_FUNC(0x410D42BE, sceNpCommerce2DoDlListFinishAsync),
         PS_HLE_FUNC(0xDE7AB33D, sceNpCommerce2DoProductCodeStartAsync),
         PS_HLE_FUNC(0xA9F945B3, sceNpCommerce2DoProductCodeFinishAsync),
+        PS_HLE_FUNC(0xB23E3BD1, sceNpCommerce2DoProductBrowseFinishAsync),
+        PS_HLE_FUNC(0x9050617D, sceNpCommerce2DoServiceListFinishAsync),
+        PS_HLE_FUNC(0x62023E98, sceNpCommerce2CreateSessionAbort),
+        PS_HLE_FUNC(0x9825A0FC, sceNpCommerce2DoProductBrowseStartAsync),
+        PS_HLE_FUNC(0xC7AFC42A, sceNpCommerce2DoServiceListStartAsync),
+        PS_HLE_FUNC(0x542B74CC, sceNpCommerce2EmptyStoreCheckStart),
+        PS_HLE_FUNC(0xC1EB3B92, sceNpCommerce2EmptyStoreCheckFinish),
+        PS_HLE_FUNC(0x1C153E5C, sceNpCommerce2EmptyStoreCheckAbort),
+        PS_HLE_FUNC(0xEEF51BE0, sceNpCommerce2ExecuteStoreBrowse),
+        PS_HLE_FUNC(0x1FA1B312, sceNpCommerce2GetStoreBrowseUserdata),
+        PS_HLE_FUNC(0x3D627D81, sceNpCommerce2GetBGDLAvailability),
+        PS_HLE_FUNC(0xA5A863FE, sceNpCommerce2SetBGDLAvailability),
+        PS_HLE_FUNC(0xE1E7B5AC, sceNpCommerce2GetProductInfoListCreateReq),
+        PS_HLE_FUNC(0x9CDE07CC, sceNpCommerce2GetProductInfoListStart),
+        PS_HLE_FUNC(0x146618DF, sceNpCommerce2GetProductInfoListGetResult),
+        PS_HLE_FUNC(0xE0F90E44, sceNpCommerce2InitGetProductInfoListResult),
+        PS_HLE_FUNC(0xD9956CE7, sceNpCommerce2GetGameProductInfoFromGetProductInfoListResult),
+        PS_HLE_FUNC(0xFC216890, sceNpCommerce2GetCategoryInfoFromContentInfo),
+        PS_HLE_FUNC(0xAC78C1F3, sceNpCommerce2GetContentRatingInfoFromCategoryInfo),
+        PS_HLE_FUNC(0xEC324C8F, sceNpCommerce2GetContentRatingInfoFromGameProductInfo),
+        PS_HLE_FUNC(0x150FDCA3, sceNpCommerce2GetContentRatingDescriptor),
     });
 }
 

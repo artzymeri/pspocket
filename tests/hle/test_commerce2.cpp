@@ -543,3 +543,110 @@ TEST_CASE("sceNpSns: Facebook handles in idm order; no access token without a si
     REQUIRE(g.call("sceNpSnsFbCreateHandle", kHandle) == 0);
     CHECK(ps_read32(b, kHandle) == 2); // the lowest free (2 and 3 are)
 }
+
+TEST_CASE("sceNpCommerce2's store browsing, empty store check, product lists and rating getters, as RPCS3", "[hle][np]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread g(f, 0, "store");
+    u8* b = f.base();
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    write_handler(b);
+    constexpr u32 kNpId = kData + 0x100, kCtx = kData + 0x140, kId = kData + 0x200, kParam = kData + 0x300,
+                  kOut = kData + 0x400, kBuf = kData + 0x40000 + 0x30000, kEmpty = kData + 0x500;
+    constexpr u32 kArg = 0xCAFE0000u;
+    std::memset(b + kNpId, 0, 0x24);
+    put(b, kId, "UP0001-NPXX00001_00");
+    b[kEmpty] = 0;
+
+    CHECK(g.call("sceNpCommerce2EmptyStoreCheckAbort", 0x5001) == kNotInit);
+    CHECK(g.call("sceNpCommerce2GetBGDLAvailability", kOut) == kNotInit);
+    np_up(g);
+    REQUIRE(g.call("sceNpCommerce2Init") == 0);
+    REQUIRE(g.call("sceNpCommerce2CreateCtx", 2, kNpId, kOpd, kArg, kCtx) == 0);
+    const u32 ctx = ps_read32(b, kCtx);
+
+    // The session can't be aborted where there is no context.
+    CHECK(g.call("sceNpCommerce2CreateSessionAbort", 0x5002) == kCtxNotFound);
+    CHECK(g.call("sceNpCommerce2CreateSessionAbort", ctx) == 0);
+
+    // Browsing a product: a product ID, a param of 4 bytes when given, then the context.
+    ps_write32(b, kParam, 8);
+    CHECK(g.call("sceNpCommerce2DoProductBrowseStartAsync", ctx, 0, 0, 0) == kInval);
+    CHECK(g.call("sceNpCommerce2DoProductBrowseStartAsync", ctx, kEmpty, 0, 0) == kInval);
+    CHECK(g.call("sceNpCommerce2DoProductBrowseStartAsync", ctx, kId, 0, kParam) == kBadSize);
+    ps_write32(b, kParam, 4);
+    CHECK(g.call("sceNpCommerce2DoProductBrowseStartAsync", 0x5002, kId, 0, kParam) == kCtxNotFound);
+    CHECK(g.call("sceNpCommerce2DoProductBrowseStartAsync", ctx, kId, 0, kParam) == 0);
+    CHECK(g.call("sceNpCommerce2DoProductBrowseStartAsync", ctx, kId, 0, 0) == 0);
+    CHECK(g.call("sceNpCommerce2DoProductBrowseFinishAsync", ctx) == 0);
+    // The service list: both needed, the param's size, a service ID.
+    CHECK(g.call("sceNpCommerce2DoServiceListStartAsync", ctx, kId, 0, 0) == kInval);
+    ps_write32(b, kParam, 5);
+    CHECK(g.call("sceNpCommerce2DoServiceListStartAsync", ctx, kId, 0, kParam) == kBadSize);
+    ps_write32(b, kParam, 4);
+    CHECK(g.call("sceNpCommerce2DoServiceListStartAsync", ctx, kEmpty, 0, kParam) == kBadTargetId);
+    CHECK(g.call("sceNpCommerce2DoServiceListStartAsync", ctx, kId, 0, kParam) == 0);
+    CHECK(g.call("sceNpCommerce2DoServiceListFinishAsync", 0x5002) == kCtxNotFound);
+    CHECK(g.call("sceNpCommerce2DoServiceListFinishAsync", ctx) == 0);
+    CHECK(handler_calls(b) == 0);
+
+    // The empty store check: a target and the category type; the handler hears it is done; the store isn't empty.
+    CHECK(g.call("sceNpCommerce2EmptyStoreCheckStart", ctx, 1, kEmpty) == kBadTargetId);
+    CHECK(g.call("sceNpCommerce2EmptyStoreCheckStart", ctx, 2, kId) == kInval);
+    CHECK(g.call("sceNpCommerce2EmptyStoreCheckStart", 0x5002, 1, kId) == kCtxNotFound);
+    REQUIRE(g.call("sceNpCommerce2EmptyStoreCheckStart", ctx, 1, kId) == 0);
+    CHECK(handler_calls(b) == 0);
+    REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+    REQUIRE(handler_calls(b) == 1);
+    CHECK(handler_arg(b, 0, 0) == ctx);
+    CHECK(handler_arg(b, 0, 1) == 0);
+    CHECK(handler_arg(b, 0, 2) == 0x61); // SCE_NP_COMMERCE2_EVENT_EMPTY_STORE_CHECK_DONE
+    CHECK(handler_arg(b, 0, 3) == 0);
+    CHECK(handler_arg(b, 0, 4) == kArg);
+    CHECK(g.call("sceNpCommerce2EmptyStoreCheckFinish", ctx, 0) == kInval);
+    ps_write32(b, kOut, 0x55);
+    REQUIRE(g.call("sceNpCommerce2EmptyStoreCheckFinish", ctx, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 0); // SCE_NP_COMMERCE2_STORE_IS_NOT_EMPTY
+    CHECK(g.call("sceNpCommerce2EmptyStoreCheckAbort", 0x5002) == 0);
+
+    // The store itself: category, product or product code (no ID needed for a code).
+    CHECK(g.call("sceNpCommerce2ExecuteStoreBrowse", 0, kId, 7) == kBadTargetType);
+    CHECK(g.call("sceNpCommerce2ExecuteStoreBrowse", 4, kId, 7) == kBadTargetType);
+    CHECK(g.call("sceNpCommerce2ExecuteStoreBrowse", 2, kEmpty, 7) == kBadTargetId);
+    CHECK(g.call("sceNpCommerce2ExecuteStoreBrowse", 1, kId, 7) == 0);
+    CHECK(g.call("sceNpCommerce2ExecuteStoreBrowse", 3, 0, 7) == 0);
+    ps_write32(b, kOut, 0x55);
+    CHECK(g.call("sceNpCommerce2GetStoreBrowseUserdata", 0) == kInval);
+    REQUIRE(g.call("sceNpCommerce2GetStoreBrowseUserdata", kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 0);
+    b[kOut] = 1;
+    REQUIRE(g.call("sceNpCommerce2GetBGDLAvailability", kOut) == 0);
+    CHECK(b[kOut] == 0);
+    CHECK(g.call("sceNpCommerce2SetBGDLAvailability", 1) == 0);
+
+    // Product lists: the request needs the context; 1 to 60 products; a 256 KB buffer; result data isn't parsed.
+    CHECK(g.call("sceNpCommerce2GetProductInfoListCreateReq", ctx, 0) == kInval);
+    CHECK(g.call("sceNpCommerce2GetProductInfoListCreateReq", 0x5002, kOut) == kCtxNotFound);
+    CHECK(g.call("sceNpCommerce2GetProductInfoListCreateReq", ctx, kOut) == 0);
+    CHECK(g.call("sceNpCommerce2GetProductInfoListStart", 1, kParam, 0) == kInval);
+    CHECK(g.call("sceNpCommerce2GetProductInfoListStart", 1, kParam, 61) == kInval);
+    CHECK(g.call("sceNpCommerce2GetProductInfoListStart", 1, kParam, 60) == 0);
+    CHECK(g.call("sceNpCommerce2GetProductInfoListGetResult", 1, kBuf, kRecvBufSize - 1, kOut) == kBufTooSmall);
+    CHECK(g.call("sceNpCommerce2GetProductInfoListGetResult", 1, kBuf, kRecvBufSize, kOut) == 0);
+    CHECK(g.call("sceNpCommerce2InitGetProductInfoListResult", kOut, kBuf, 0) == kInval);
+    CHECK(g.call("sceNpCommerce2InitGetProductInfoListResult", kOut, kBuf, 100) == kBadResultData);
+
+    // The getters: both pointers, nothing written.
+    for (const char* name : {"sceNpCommerce2GetCategoryInfoFromContentInfo",
+             "sceNpCommerce2GetContentRatingInfoFromCategoryInfo",
+             "sceNpCommerce2GetContentRatingInfoFromGameProductInfo"}) {
+        INFO(name);
+        CHECK(g.call(name, kParam, 0) == kInval);
+        CHECK(g.call(name, kParam, kOut) == 0);
+    }
+    CHECK(g.call("sceNpCommerce2GetContentRatingDescriptor", kParam, 0, 0) == kInval);
+    CHECK(g.call("sceNpCommerce2GetContentRatingDescriptor", kParam, 0, kOut) == 0);
+    CHECK(g.call("sceNpCommerce2GetGameProductInfoFromGetProductInfoListResult", 0, 0, kOut) == kInval);
+    CHECK(g.call("sceNpCommerce2GetGameProductInfoFromGetProductInfoListResult", kParam, 0, kOut) == 0);
+}
