@@ -148,6 +148,26 @@ TEST_CASE("game library: made with the device's compiler, loaded through the run
     fs::remove_all(dir);
 }
 
+TEST_CASE("game library: the copies of processes that ended are removed, a running one's kept")
+{
+    // load_library copies each library into the temporary folder and never removed the copies: 24 GB of them filled
+    // the Mac's disk (D-191).
+    const fs::path dir = temp_dir();
+    const auto touch = [&](const std::string& name) { std::ofstream(dir / name) << "x"; };
+    // A process that ended: a pid past the largest the system gives (kill answers ESRCH).
+    touch("pspocket-game-99999999-0.dylib");
+    touch("pspocket-game-99999999-1.dylib");
+    touch(std::format("pspocket-game-{}-0.dylib", getpid())); // this process's own
+    touch(std::format("pspocket-game-{}-0.dylib", getppid())); // a running process's
+    touch("other-99999999.dylib");                                // not a copy
+    CHECK(game::remove_stale_copies(dir) == 2);
+    CHECK_FALSE(fs::exists(dir / "pspocket-game-99999999-0.dylib"));
+    CHECK(fs::exists(dir / std::format("pspocket-game-{}-0.dylib", getpid())));
+    CHECK(fs::exists(dir / std::format("pspocket-game-{}-0.dylib", getppid())));
+    CHECK(fs::exists(dir / "other-99999999.dylib"));
+    fs::remove_all(dir);
+}
+
 TEST_CASE("game library: one made for another runtime, or another executable, is refused before it runs")
 {
     const fs::path dir = temp_dir();

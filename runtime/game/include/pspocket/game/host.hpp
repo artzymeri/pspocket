@@ -4,6 +4,7 @@
 // library, and loading one for the executable in guest memory.
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 #include "pspocket/core/types.hpp"
@@ -39,8 +40,11 @@ struct LoadOptions {
     bool check_image_words = true;
 };
 
-// Loads a game library: copies it to a new file (the kernel keeps the first signature it saw of a file), registers its
-// signature, dlopen, binds it to host_runtime(), checks it was made for this runtime (layout, ABI hash) and for the
+// The copies load_library made for processes that have ended, removed from `dir` (the temporary folder): how many.
+size_t remove_stale_copies(const std::filesystem::path& dir);
+
+// Loads a game library: copies it to a new file in the temporary folder (the kernel keeps the first signature it saw of
+// a file; the copies of ended processes are removed first), registers its signature, dlopen, binds it to host_runtime(), checks it was made for this runtime (layout, ABI hash) and for the
 // executable now in guest memory (its D-098 samples), then registers its PPU functions and SPU programs. Never
 // unloaded. On refusal returns false with the reason in *error, and nothing is registered.
 bool load_library(const std::string& path, const GuestMemory& memory, LoadedLibrary* out, std::string* error,

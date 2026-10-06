@@ -1,9 +1,12 @@
 #include "pspocket/game/host.hpp"
 
 #include <dlfcn.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -64,6 +67,24 @@ const ps_game_runtime& host_runtime()
     return rt;
 }
 
+size_t remove_stale_copies(const std::filesystem::path& dir)
+{
+    // The copies of processes that ended (kill(pid, 0) finds no such process; another app's or user's answers EPERM
+    // and stays). A process keeps its own while it runs: the library is mapped from it. Nothing removed them before:
+    // a game, the system library (232 MB with every SPU program, D-191) and each test made one per load, and the
+    // Mac's disk filled with 24 GB of them.
+    size_t removed = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (!name.starts_with("pspocket-game-") || !name.ends_with(".dylib")) continue;
+        const long pid = std::strtol(name.c_str() + 14, nullptr, 10);
+        if (pid <= 0 || pid == getpid() || kill(static_cast<pid_t>(pid), 0) == 0 || errno != ESRCH) continue;
+        if (std::filesystem::remove(e.path(), ec)) removed++;
+    }
+    return removed;
+}
+
 bool load_library(const std::string& path, const GuestMemory& memory, LoadedLibrary* out, std::string* error,
     const LoadOptions& options)
 {
@@ -77,6 +98,7 @@ bool load_library(const std::string& path, const GuestMemory& memory, LoadedLibr
     const fs::path copy = fs::temp_directory_path() /
         std::format("pspocket-game-{}-{}.dylib", getpid(), counter.fetch_add(1));
     std::error_code ec;
+    remove_stale_copies(copy.parent_path());
     fs::copy_file(path, copy, fs::copy_options::overwrite_existing, ec);
     if (ec) return fail(std::format("cannot copy {}: {}", path, ec.message()));
     std::string steps;
