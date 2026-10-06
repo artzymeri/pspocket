@@ -3268,6 +3268,29 @@ Tests (tests/hle):
   refused codecs).
 - test_np.cpp: sceNpDrmIsAvailable2.
 
+## D-181 · 2026-10-06 · FFmpeg's decoders for pspocket's own media libraries
+
+To run any game with no PS3 firmware file (D-179's direction), video and audio decoding must be pspocket's own. RPCS3
+decodes with FFmpeg in its own cellVdec (H.264, MPEG-2, MPEG-4) and cellAtracXdec (ATRAC3plus), and swscale converts
+the pictures. pspocket's versions of those libraries follow RPCS3's, so they use FFmpeg too.
+
+- **The build.** scripts/build-ffmpeg.sh builds FFmpeg 7.1.1 from the unmodified release tarball, SHA-256 pinned and
+  not kept in the repository (the build needs no network), for macOS arm64 (build/ffmpeg/macos: the Mac's tests and
+  pspocket-boot) and iOS arm64 (build/ffmpeg/ios: the app).
+- **What goes in.** libavcodec with the decoders the PS3's formats need (H.264, MPEG-1/2 video, MPEG-4 part 2; ATRAC3,
+  ATRAC3plus and their AL forms, MP1/2/3, AAC, AC-3, E-AC-3, PCM) and their parsers, plus libswscale, libswresample
+  and libavutil. Nothing else: no formats, devices, filters, network or autodetected system libraries.
+- **Licence.** Configured --disable-gpl --disable-nonfree --disable-version3, so only LGPL-2.1-or-later code, which
+  combines with pspocket's GPLv2 (D-001). Recorded in third_party/README.md.
+- **Size and time.** About 5 MB of static libraries per platform (libavcodec 3.1 MB), built in 69 s for both on the
+  M4.
+- **Wiring.** CMake makes pspocket::ffmpeg (an INTERFACE target defining PSPOCKET_HAVE_FFMPEG=1) from build/ffmpeg/macos
+  or -DPSPOCKET_FFMPEG_DIR. scripts/ios.sh and app/ios/project.yml add build/ffmpeg/ios's headers and libraries to
+  the app. Without them the media libraries build with their decoders left out (#if PSPOCKET_HAVE_FFMPEG), and
+  decoding fails, logged.
+- **Hardware decoding later.** VideoToolbox (H.264 in hardware) and AudioToolbox can take over a format later, measured
+  against these first (rule 8).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

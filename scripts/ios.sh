@@ -334,12 +334,22 @@ cmd_gen() {
         mkdir -p "$codegen_bundle"
         say "no compiler on the device (scripts/build-llvm-ios.sh builds it)"
     fi
+    # FFmpeg's decoders for the media libraries (D-181): build/ffmpeg/ios, made by scripts/build-ffmpeg.sh.
+    local ffmpeg_ios="$ROOT/build/ffmpeg/ios" have_ffmpeg=0 ffmpeg_ldflags=""
+    if [ -f "$ffmpeg_ios/lib/libavcodec.a" ]; then
+        have_ffmpeg=1
+        ffmpeg_ldflags="$ffmpeg_ios/lib/libavcodec.a $ffmpeg_ios/lib/libswscale.a $ffmpeg_ios/lib/libswresample.a $ffmpeg_ios/lib/libavutil.a"
+        say "media decoders: FFmpeg from $ffmpeg_ios"
+    else
+        warn "no FFmpeg for iOS (scripts/build-ffmpeg.sh ios): the media libraries are built without decoders"
+    fi
     say "xcodegen: $PROJECT"
     PSPOCKET_HOST_BUILD_DIR="$HOST_BUILD" PSPOCKET_PPU_SRC="$ppu_src" PSPOCKET_GAME_SPU_SRC="$game_spu" \
         PSPOCKET_HAVE_GAME_SPU="$have_game_spu" PSPOCKET_GAME_PPU_SRC="$game_ppu" PSPOCKET_HAVE_GAME_PPU="$have_game_ppu" \
         PSPOCKET_GAME_SHADERS_SRC="$game_shaders" PSPOCKET_HAVE_CODEGEN="$have_codegen" PSPOCKET_CODEGEN_SRC="$codegen_src" \
         PSPOCKET_CODEGEN_BUNDLE_SRC="$codegen_bundle" PSPOCKET_LLVM_SRC_DIR="$llvm_src" PSPOCKET_LLVM_IOS_DIR="$llvm_ios" \
         PSPOCKET_LLVM_LDFLAGS="$llvm_ldflags" PSPOCKET_PREPARE_SRC="$prepare_src" \
+        PSPOCKET_HAVE_FFMPEG="$have_ffmpeg" PSPOCKET_FFMPEG_IOS_DIR="$ffmpeg_ios" PSPOCKET_FFMPEG_LDFLAGS="$ffmpeg_ldflags" \
         "$xcodegen" generate --spec "$APP_DIR/project.yml" --quiet >&2
 }
 
