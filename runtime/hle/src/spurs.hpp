@@ -110,6 +110,7 @@ constexpr u32 CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS = 16;
 constexpr u32 SAF_EXIT_IF_NO_WORK = 0x00000001;
 constexpr u32 SAF_SECOND_VERSION = 0x00000004;
 constexpr u32 SAF_SYSTEM_WORKLOAD_ENABLED = 0x02000000;
+constexpr u32 SAF_SPU_PRINTF_ENABLED = 0x10000000;
 constexpr u32 SAF_SPU_TGT_EXCLUSIVE_NON_CONTEXT = 0x20000000;
 constexpr u32 SAF_SPU_MEMORY_CONTAINER_SET = 0x40000000;
 // SpursFlags1
@@ -123,7 +124,9 @@ constexpr s32 SYS_SPU_THREAD_GROUP_TYPE_EXCLUSIVE_NON_CONTEXT = 0x18;
 namespace attr_off {
 constexpr u32 revision = 0x0, sdkVersion = 0x4, nSpus = 0x8, spuPriority = 0xC, ppuPriority = 0x10,
               exitIfNoWork = 0x14, prefix = 0x15, prefixSize = 0x24, flags = 0x28, size = 0x200;
-// Not read yet: container 0x2C, swlPriority 0x38, swlMaxSpu 0x40, swlIsPreem 0x44 (system workload).
+// The system workload's priorities, SPUs and preemptible-SPU mask (cellSpursAttributeEnableSystemWorkload).
+constexpr u32 swlPriority = 0x38, swlMaxSpu = 0x40, swlIsPreem = 0x44;
+// Not read yet: container 0x2C.
 }
 
 // CellSpurs (4096 bytes for SPURS1, 8192 for SPURS2; 128-aligned): the fields stage 1 writes.
@@ -133,7 +136,14 @@ constexpr u32 wklFlagStruct = 0x60, wklFlag = 0x6C, flags1 = 0x74, nSpus = 0x76,
               sysSrvPreemptWklId = 0xC0, sysSrvTrace = 0xCC, unk11 = 0x988, unk12 = 0x98C, unk13 = 0x990,
               wklInfoSysSrv = 0xD00, ppu0 = 0xD20, ppu1 = 0xD28, handlerDirty = 0xD64, handlerWaiting = 0xD65,
               handlerExiting = 0xD66, spuImg = 0xD70, flags = 0xD80, spuPriority = 0xD84, ppuPriority = 0xD88,
-              prefix = 0xD8C, prefixSize = 0xD9B, revision = 0xDA0, sdkVersion = 0xDA4;
+              prefix = 0xD8C, prefixSize = 0xD9B, revision = 0xDA0, sdkVersion = 0xDA4,
+              globalSpuExceptionHandler = 0xF80, globalSpuExceptionHandlerArgs = 0xF88;
+}
+// CellSpursWorkloadAttribute (512 bytes, 8-aligned; RPCS3 cellSpurs.h).
+namespace wattr_off {
+constexpr u32 revision = 0x00, sdkVersion = 0x04, pm = 0x08, size = 0x0C, data = 0x10, priority = 0x18,
+              minContention = 0x20, maxContention = 0x24, nameClass = 0x28, nameInstance = 0x2C, hook = 0x30,
+              hookArg = 0x34, struct_size = 0x200;
 }
 // Workload tables of CellSpurs (SPURS1: wid 0..15).
 namespace wkl_off {
@@ -143,6 +153,8 @@ constexpr u32 readyCount1 = 0x00, idleSpuCountOrReadyCount2 = 0x10, currentConte
               status2 = 0xE0,
               sysSrvMsgUpdateWorkload = 0xBD, f1 = 0x100, f1_stride = 0x80, info1 = 0xB00, info_stride = 0x20,
               h1 = 0xE00, h_stride = 0x10, exception = 0xD6C;
+// In a workload's wklF1 entry: the shutdown-completion hook and its argument (u64 each).
+constexpr u32 f1_hook = 0x30, f1_hook_arg = 0x38;
 // WorkloadInfo: addr (u64), arg (u64), size (u32), uniqueId (u8), priority[8] at 0x18.
 constexpr u32 info_addr = 0x00, info_arg = 0x08, info_size = 0x10, info_unique = 0x14, info_priority = 0x18;
 } // namespace wkl_off

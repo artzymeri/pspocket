@@ -572,3 +572,136 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
     CHECK(ps_read8(b, kSpurs + 0x77) == 0xFF);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 }
+
+// L.A. Noire (BLES00933) registers its own policy module with an attribute (D-165): _cellSpursWorkloadAttributeInitialize,
+// cellSpursWorkloadAttributeSetName and cellSpursAddWorkloadWithAttribute, on an instance whose attribute asked for
+// SPU printf and the system workload. The workload gets the attribute's module, data, priorities, names and shutdown
+// hook, and runs as cellSpursAddWorkload's does.
+TEST_CASE("SPURS workers: a policy module added with a workload attribute (L.A. Noire)", "[hle][spurs][spurs-run]")
+{
+    constexpr u32 kPm = kData + 0x14000, kWid = kData + 0x8600, kWattr = kData + 0x15000, kNames = kData + 0x15400,
+                  kSwlPrio = kData + 0x15500, kPreempt = kData + 0x15510, kHandler = kData + 0x15600;
+    Fixture f;
+    GuestThread a(f, 0, "ppu");
+    u8* b = f.base();
+    const u64 kCoreNull = r3_of_code(0x80410711), kCoreAlign = r3_of_code(0x80410710),
+              kCoreInval = r3_of_code(0x80410702), kCorePerm = r3_of_code(0x80410709),
+              kCoreBusy = r3_of_code(0x8041070A), kPmNull = r3_of_code(0x80410811), kPmAlign = r3_of_code(0x80410810),
+              kPmInval = r3_of_code(0x80410802);
+
+    // The SPURS attribute: SPU printf, then the system workload (RPCS3's checks).
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 2, 200, 2016, 0) == 0);
+    CHECK(a.call("cellSpursAttributeEnableSpuPrintfIfAvailable", 0) == kCoreNull);
+    CHECK(a.call("cellSpursAttributeEnableSpuPrintfIfAvailable", kSpursAttr + 4) == kCoreAlign);
+    REQUIRE(a.call("cellSpursAttributeEnableSpuPrintfIfAvailable", kSpursAttr) == 0);
+    CHECK(ps_read32(b, kSpursAttr + 0x28) == 0x10000000u);
+    const u8 swl_prio[8] = {0, 1, 0, 0, 0, 0, 0, 0}, preempt[8] = {1, 1, 0, 0, 0, 0, 0, 0}, none[8] = {};
+    std::memcpy(b + kPreempt, preempt, 8);
+    std::memcpy(b + kSwlPrio, none, 8);
+    CHECK(a.call("cellSpursAttributeEnableSystemWorkload", kSpursAttr, kSwlPrio, 1, kPreempt) == kCoreInval); // no 1
+    std::memcpy(b + kSwlPrio, swl_prio, 8);
+    CHECK(a.call("cellSpursAttributeEnableSystemWorkload", kSpursAttr, kSwlPrio, 0, kPreempt) == kCoreInval); // maxSpu
+    REQUIRE(a.call("cellSpursAttributeEnableSystemWorkload", kSpursAttr, kSwlPrio, 1, kPreempt) == 0);
+    CHECK(ps_read32(b, kSpursAttr + 0x28) == 0x12000000u);
+    CHECK(std::memcmp(b + kSpursAttr + 0x38, swl_prio, 8) == 0);
+    CHECK(ps_read32(b, kSpursAttr + 0x40) == 1);
+    CHECK(ps_read32(b, kSpursAttr + 0x44) == 0b11);
+    CHECK(a.call("cellSpursAttributeEnableSystemWorkload", kSpursAttr, kSwlPrio, 1, kPreempt) == kCoreBusy);
+    {
+        constexpr u32 kOne = kData + 0x15800;
+        REQUIRE(a.call("_cellSpursAttributeInitialize", kOne, 2, 0x330000, 1, 200, 2016, 0) == 0);
+        const u8 first[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+        std::memcpy(b + kSwlPrio + 8, first, 8);
+        CHECK(a.call("cellSpursAttributeEnableSystemWorkload", kOne, kSwlPrio + 8, 1, kPreempt) == kCorePerm); // 1 SPU
+    }
+    // Initialized with the system workload: accepted (it does not run natively, as in RPCS3).
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
+
+    // The global exception handler: kept once (BUSY after), as RPCS3.
+    CHECK(a.call("cellSpursSetGlobalExceptionEventHandler", kSpurs, 0, 0) == kCoreNull);
+    REQUIRE(a.call("cellSpursSetGlobalExceptionEventHandler", kSpurs, kHandler, 0x1234) == 0);
+    CHECK(ps_read64(b, kSpurs + 0xF80) == kHandler);
+    CHECK(ps_read64(b, kSpurs + 0xF88) == 0x1234);
+    CHECK(a.call("cellSpursSetGlobalExceptionEventHandler", kSpurs, kHandler, 0) == kCoreBusy);
+
+    // The module: as in the cellSpursAddWorkload test above, it records its poll status and the kernel context once.
+    Program p;
+    p.emit(as::rotqbyi(80, 4, 4));
+    p.emit(as::il(73, kBuf + 0x10));
+    p.dma16(PS_MFC_GET, 73, 80);
+    p.emit(as::lqd(74, 0, 73));
+    const usize skip = p.code.size();
+    p.emit(0);
+    p.put(5, 80, 0);
+    p.emit(as::lqa(7, 0x1D0));
+    p.put(7, 80, 32);
+    p.code[skip] = as::brnz(74, static_cast<s32>(p.code.size() - skip) * 4);
+    p.emit(as::lqa(2, 0x1E0));
+    p.emit(as::bisl(0, 2));
+    for (usize i = 0; i < p.code.size(); i++) ps_write32(b, kPm + 4 * static_cast<u32>(i), p.code[i]);
+    const u32 size = static_cast<u32>(p.code.size() * 4);
+    const u8 prio[8] = {1, 1, 0, 0, 0, 0, 0, 0};
+    std::memcpy(b + kPrio, prio, 8);
+
+    // _cellSpursWorkloadAttributeInitialize's checks, then the attribute.
+    CHECK(a.call("_cellSpursWorkloadAttributeInitialize", 0, 1, 0x330000, kPm, size, u64{kOut}, kPrio, 1, 1) == kPmNull);
+    CHECK(a.call("_cellSpursWorkloadAttributeInitialize", kWattr + 4, 1, 0x330000, kPm, size, u64{kOut}, kPrio, 1, 1) ==
+          kPmAlign);
+    CHECK(a.call("_cellSpursWorkloadAttributeInitialize", kWattr, 1, 0x330000, 0, size, u64{kOut}, kPrio, 1, 1) == kPmNull);
+    CHECK(a.call("_cellSpursWorkloadAttributeInitialize", kWattr, 1, 0x330000, kPm + 8, size, u64{kOut}, kPrio, 1, 1) ==
+          kPmAlign);
+    CHECK(a.call("_cellSpursWorkloadAttributeInitialize", kWattr, 1, 0x330000, kPm, size, u64{kOut}, kPrio, 0, 1) ==
+          kPmInval); // no minimum contention
+    ps_write8(b, kPrio + 7, 16);
+    CHECK(a.call("_cellSpursWorkloadAttributeInitialize", kWattr, 1, 0x330000, kPm, size, u64{kOut}, kPrio, 1, 1) ==
+          kPmInval); // a priority above 15
+    ps_write8(b, kPrio + 7, 0);
+    std::memset(b + kWattr, 0xAB, 0x200);
+    REQUIRE(a.call("_cellSpursWorkloadAttributeInitialize", kWattr, 1, 0x330000, kPm, size, u64{kOut}, kPrio, 1, 2) == 0);
+    CHECK(ps_read32(b, kWattr + 0x00) == 1);
+    CHECK(ps_read32(b, kWattr + 0x08) == kPm);
+    CHECK(ps_read32(b, kWattr + 0x0C) == size);
+    CHECK(ps_read64(b, kWattr + 0x10) == kOut);
+    CHECK(std::memcmp(b + kWattr + 0x18, prio, 8) == 0);
+    CHECK(ps_read32(b, kWattr + 0x20) == 1);
+    CHECK(ps_read32(b, kWattr + 0x24) == 2);
+    CHECK(ps_read32(b, kWattr + 0x28) == 0); // names, hook: zeroed
+    CHECK(ps_read32(b, kWattr + 0x1FC) == 0);
+    std::memcpy(b + kNames, "LANoire\0Jobs", 13);
+    CHECK(a.call("cellSpursWorkloadAttributeSetName", 0, kNames, kNames + 8) == kPmNull);
+    REQUIRE(a.call("cellSpursWorkloadAttributeSetName", kWattr, kNames, kNames + 8) == 0);
+    CHECK(ps_read32(b, kWattr + 0x28) == kNames);
+    CHECK(ps_read32(b, kWattr + 0x2C) == kNames + 8);
+    ps_write32(b, kWattr + 0x30, kHandler); // a shutdown-completion hook, as its setter would leave it
+    ps_write32(b, kWattr + 0x34, 0x77);
+
+    // cellSpursAddWorkloadWithAttribute: revision 1 only; then the workload, with the attribute's values.
+    ps_write32(b, kWattr, 2);
+    CHECK(a.call("cellSpursAddWorkloadWithAttribute", kSpurs, kWid, kWattr) == kPmInval);
+    ps_write32(b, kWattr, 1);
+    CHECK(a.call("cellSpursAddWorkloadWithAttribute", kSpurs, kWid, 0) == kPmNull);
+    CHECK(a.call("cellSpursAddWorkloadWithAttribute", kSpurs, 0, kWattr) == kPmNull);
+    REQUIRE(a.call("cellSpursAddWorkloadWithAttribute", kSpurs, kWid, kWattr) == 0);
+    const u32 wid = ps_read32(b, kWid);
+    REQUIRE(wid < 16);
+    const u32 info = kSpurs + 0xB00 + 0x20 * wid;
+    CHECK(ps_read64(b, info + 0x00) == kPm);
+    CHECK(ps_read64(b, info + 0x08) == kOut);
+    CHECK(ps_read32(b, info + 0x10) == size);
+    CHECK(std::memcmp(b + info + 0x18, prio, 8) == 0);
+    CHECK(ps_read64(b, kSpurs + 0xE00 + 0x10 * wid) == kNames);      // wklH1: nameClass
+    CHECK(ps_read64(b, kSpurs + 0xE00 + 0x10 * wid + 8) == kNames + 8); // nameInstance
+    CHECK(ps_read64(b, kSpurs + 0x100 + 0x80 * wid + 0x30) == kHandler); // wklF1: hook
+    CHECK(ps_read64(b, kSpurs + 0x100 + 0x80 * wid + 0x38) == 0x77);
+    CHECK((ps_read8(b, kSpurs + 0xA0 + wid) & 2) != 0); // wklEvent1: a hook is set
+    CHECK(ps_read8(b, kSpurs + 0x50 + wid) % 16 == 2); // max contention
+
+    // It runs when work arrives.
+    std::memset(b + kOut, 0, 48);
+    REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 1) == 0);
+    REQUIRE(wait_for([&] { return ps_read64(b, kOut + 32) == kPm; }));
+    REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 0) == 0);
+    CHECK(ps_read32(b, kOut + 0) == 1);
+    CHECK(ps_read32(b, kOut + 44) == wid);
+    REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+}

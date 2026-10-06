@@ -95,6 +95,51 @@ s32 cellSpursAttributeSetSpuThreadGroupType(PPUContext& ctx, u32 attr, s32 type)
     return lv2::CELL_OK;
 }
 
+// cellSpursAttributeEnableSpuPrintfIfAvailable(attr), as RPCS3: the flag. SPU printf output is not routed (the
+// native workers have no spu_printf server to attach); SPU code's own printf channel writes are logged as before.
+s32 cellSpursAttributeEnableSpuPrintfIfAvailable(PPUContext& ctx, u32 attr)
+{
+    if (!attr) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    ps_write32(base, attr + attr_off::flags, ps_read32(base, attr + attr_off::flags) | SAF_SPU_PRINTF_ENABLED);
+    return lv2::CELL_OK;
+}
+
+// cellSpursAttributeEnableSystemWorkload(attr, priority[8], maxSpu, isPreemptible[8]), as RPCS3: the first of the
+// instance's SPUs with priority 1 enables it (no such SPU: INVAL; no maxSpu: INVAL; a 1-SPU or exit-if-no-work
+// instance: PERM; already enabled: BUSY), keeping the priorities, maxSpu and the preemptible SPUs as a mask.
+s32 cellSpursAttributeEnableSystemWorkload(PPUContext& ctx, u32 attr, u32 priority, u32 max_spu, u32 is_preemptible)
+{
+    if (!attr) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 nspus = ps_read32(base, attr + attr_off::nSpus);
+    if (!nspus) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    if (!guest_readable(t, priority, 8) || !guest_readable(t, is_preemptible, 8)) {
+        log_call_site(ctx, base, std::format("cellSpursAttributeEnableSystemWorkload: priority {:#x} or isPreemptible "
+            "{:#x} is not guest memory", priority, is_preemptible));
+        return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    }
+    for (u32 i = 0; i < std::min<u32>(nspus, 8); i++) {
+        if (ps_read8(base, priority + i) != 1) continue;
+        if (!max_spu) return error(CELL_SPURS_CORE_ERROR_INVAL);
+        if (nspus == 1 || ps_read8(base, attr + attr_off::exitIfNoWork)) return error(CELL_SPURS_CORE_ERROR_PERM);
+        const u32 flags = ps_read32(base, attr + attr_off::flags);
+        if (flags & SAF_SYSTEM_WORKLOAD_ENABLED) return error(CELL_SPURS_CORE_ERROR_BUSY);
+        ps_write32(base, attr + attr_off::flags, flags | SAF_SYSTEM_WORKLOAD_ENABLED);
+        ps_write64(base, attr + attr_off::swlPriority, ps_read64(base, priority));
+        u32 preemptible = 0;
+        for (u32 j = 0; j < std::min<u32>(nspus, 8); j++)
+            if (ps_read8(base, is_preemptible + j)) preemptible |= 1u << j;
+        ps_write32(base, attr + attr_off::swlMaxSpu, max_spu);
+        ps_write32(base, attr + attr_off::swlIsPreem, preemptible);
+        return lv2::CELL_OK;
+    }
+    return error(CELL_SPURS_CORE_ERROR_INVAL);
+}
+
 // ------------------------------------------------------------------------------------------------- initialize
 
 // RPCS3 _spurs::initialize, native: see the file comment for what is not created.
@@ -111,8 +156,9 @@ s32 initialize(PPUContext& ctx, u32 spurs, u32 revision, u32 sdk_version, s32 ns
         return lv2::err(lv2::CELL_EINVAL);
     }
     if (flags & SAF_SYSTEM_WORKLOAD_ENABLED) {
-        PS_LOG_ERROR(kChan, "cellSpursInitialize: the system workload (SAF_SYSTEM_WORKLOAD_ENABLED) is not implemented");
-        return error(CELL_SPURS_CORE_ERROR_STAT);
+        // The system workload lends SPUs to the system (cellSpursAttributeEnableSystemWorkload); there is no system
+        // to lend them to here. RPCS3 adds nothing either (_spurs::add_default_syswkl is a TODO).
+        PS_LOG_INFO(kChan, "cellSpursInitialize: the system workload is enabled; it does not run natively (as RPCS3)");
     }
 
     const bool second = (flags & SAF_SECOND_VERSION) != 0;
@@ -171,6 +217,31 @@ s32 initialize(PPUContext& ctx, u32 spurs, u32 revision, u32 sdk_version, s32 ns
     return lv2::CELL_OK;
 }
 
+// cellSpursSetGlobalExceptionEventHandler(spurs, eaHandler, arg), as RPCS3: NULL, ALIGN, STAT (an instance in
+// exception state), BUSY (a handler already set); else the handler and its argument are kept. SPU exceptions stop a
+// native worker with a log (CLAUDE.md rule 5) rather than reaching the handler.
+s32 cellSpursSetGlobalExceptionEventHandler(PPUContext& ctx, u32 spurs, u32 handler, u32 arg)
+{
+    if (!spurs || !handler) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    s32 rc = lv2::CELL_OK;
+    reservation_op(base, spurs + spurs_off::globalSpuExceptionHandler, [&](u8* line) { // a 128-byte line of its own
+        rc = lv2::CELL_OK;
+        if (ps_read64(line, 0)) {
+            rc = error(CELL_SPURS_CORE_ERROR_BUSY);
+            return false;
+        }
+        ps_write64(line, 8, arg);
+        ps_write64(line, 0, handler);
+        return true;
+    });
+    PS_LOG_INFO(kChan, "cellSpursSetGlobalExceptionEventHandler(SPURS {:#x}, handler {:#x}, arg {:#x}) -> {:#x}", spurs,
+        handler, arg, static_cast<u32>(rc));
+    return rc;
+}
+
 s32 cellSpursInitializeWithAttribute(PPUContext& ctx, u32 spurs, u32 attr)
 {
     if (!attr) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
@@ -222,7 +293,7 @@ std::string priority_text(const u8 (&priority)[8])
 // CellSpurs, gives it the unique ID of an existing workload with the same policy module (or the lowest free one) and
 // makes it runnable. The native scheduler finds the workload through the host instance.
 s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, const u8 (&priority)[8], u32 min_contention,
-    u32 max_contention, u32 name_class, u32 name_instance, Workload::Kind kind)
+    u32 max_contention, u32 name_class, u32 name_instance, Workload::Kind kind, u32 hook = 0, u32 hook_arg = 0)
 {
     if (!spurs || !pm) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
     if (spurs % CELL_SPURS_ALIGN || pm % 16) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
@@ -276,6 +347,11 @@ s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, 
     const u32 f = spurs + wkl_off::f1 + wid * wkl_off::f1_stride;
     std::memset(base + f, 0, 0x20);                 // keeps the semaphore at 0x20
     std::memset(base + f + 0x28, 0, 0x58);
+    if (hook) { // RPCS3: the shutdown-completion hook, and event bit 2 to say there is one
+        ps_write64(base, f + wkl_off::f1_hook, hook);
+        ps_write64(base, f + wkl_off::f1_hook_arg, hook_arg);
+        ps_write8(base, spurs + wkl_off::event1 + wid, static_cast<u8>(ps_read8(base, spurs + wkl_off::event1 + wid) | 2));
+    }
     ps_write8(base, spurs + wkl_off::idleSpuCountOrReadyCount2 + wid, 0);
     ps_write8(base, spurs + wkl_off::minContention + wid, static_cast<u8>(std::min<u32>(min_contention, 8)));
     ps_write8(base, spurs + wkl_off::readyCount1 + wid, 0);
@@ -334,6 +410,90 @@ s32 cellSpursAddWorkload(PPUContext& ctx, u32 spurs, u32 wid, u32 pm, u32 size, 
         ps_write32(base, wid, w);
         PS_LOG_INFO(kChan, "custom workload {} of SPURS {:#x}: policy module {:#x} ({:#x} bytes), priority {} {} {} {} {} "
             "{} {} {}", w, spurs, pm, size, prio[0], prio[1], prio[2], prio[3], prio[4], prio[5], prio[6], prio[7]);
+    }
+    return r;
+}
+
+// _cellSpursWorkloadAttributeInitialize(attr, revision, sdkVersion, pm, size, data, priority, minCnt, maxCnt), as
+// RPCS3: NULL (attribute or policy module), ALIGN (an 8-aligned attribute, a 16-aligned module), INVAL (no minimum
+// contention, a priority above 15), then the attribute zeroed and filled.
+s32 _cellSpursWorkloadAttributeInitialize(PPUContext& ctx, u32 attr, u32 revision, u32 sdk_version, u32 pm, u32 size,
+    u64 data, u32 priority, u32 min_contention, u32 max_contention)
+{
+    if (!attr) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    if (!pm) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (pm % 16) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, priority, 8)) {
+        log_call_site(ctx, base, std::format("_cellSpursWorkloadAttributeInitialize: priority array {:#x} is not readable "
+            "guest memory", priority));
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    }
+    const u64 prio = ps_read64(base, priority);
+    if (min_contention == 0 || (prio & 0xF0F0F0F0F0F0F0F0ull)) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    std::memset(base + attr, 0, wattr_off::struct_size);
+    ps_write32(base, attr + wattr_off::revision, revision);
+    ps_write32(base, attr + wattr_off::sdkVersion, sdk_version);
+    ps_write32(base, attr + wattr_off::pm, pm);
+    ps_write32(base, attr + wattr_off::size, size);
+    ps_write64(base, attr + wattr_off::data, data);
+    ps_write64(base, attr + wattr_off::priority, prio);
+    ps_write32(base, attr + wattr_off::minContention, min_contention);
+    ps_write32(base, attr + wattr_off::maxContention, max_contention);
+    return lv2::CELL_OK;
+}
+
+// cellSpursWorkloadAttributeSetName(attr, nameClass, nameInstance), as RPCS3: the two pointers, kept as they are.
+s32 cellSpursWorkloadAttributeSetName(PPUContext& ctx, u32 attr, u32 name_class, u32 name_instance)
+{
+    if (!attr) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    ps_write32(base, attr + wattr_off::nameClass, name_class);
+    ps_write32(base, attr + wattr_off::nameInstance, name_instance);
+    return lv2::CELL_OK;
+}
+
+// cellSpursAddWorkloadWithAttribute(spurs, wid, attr), as RPCS3: NULL, ALIGN (8), revision 1 only (INVAL), then the
+// add with the attribute's names and shutdown hook. Like cellSpursAddWorkload, a game's own policy module, which the
+// native scheduler runs (spurs_custom.cpp).
+s32 cellSpursAddWorkloadWithAttribute(PPUContext& ctx, u32 spurs, u32 wid, u32 attr)
+{
+    if (!attr) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, attr, wattr_off::struct_size)) {
+        log_call_site(ctx, base, std::format("cellSpursAddWorkloadWithAttribute: attribute {:#x} is not guest memory", attr));
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    }
+    if (ps_read32(base, attr + wattr_off::revision) != 1) return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    if (!spurs || !wid) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    const u32 pm = ps_read32(base, attr + wattr_off::pm);
+    const u32 size = ps_read32(base, attr + wattr_off::size);
+    const u64 data = ps_read64(base, attr + wattr_off::data);
+    u8 prio[8];
+    for (u32 i = 0; i < 8; i++) prio[i] = ps_read8(base, attr + wattr_off::priority + i);
+    const u32 name_class = ps_read32(base, attr + wattr_off::nameClass);
+    const u32 name_instance = ps_read32(base, attr + wattr_off::nameInstance);
+    u32 w = 0;
+    const s32 r = add_workload(base, spurs, w, pm, size, data, prio, ps_read32(base, attr + wattr_off::minContention),
+        ps_read32(base, attr + wattr_off::maxContention), name_class, name_instance, Workload::Kind::Custom,
+        ps_read32(base, attr + wattr_off::hook), ps_read32(base, attr + wattr_off::hookArg));
+    if (r == lv2::CELL_OK) {
+        ps_write32(base, wid, w);
+        const auto name = [&](u32 addr) {
+            return addr && guest_readable(t, addr, 1)
+                ? std::string(reinterpret_cast<const char*>(base + addr), strnlen(reinterpret_cast<const char*>(base + addr), 31))
+                : std::string("-");
+        };
+        PS_LOG_INFO(kChan, "custom workload {} of SPURS {:#x} (\"{}\" \"{}\"): policy module {:#x} ({:#x} bytes), data {:#x}, "
+            "priority {}", w, spurs, name(name_class), name(name_instance), pm, size, data, priority_text(prio));
+    } else {
+        PS_LOG_WARN(kChan, "cellSpursAddWorkloadWithAttribute(SPURS {:#x}, policy module {:#x}) -> {:#x}", spurs, pm,
+            static_cast<u32>(r));
     }
     return r;
 }
@@ -1940,6 +2100,12 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0x738E40E6, cellSpursShutdownJobChain),
         PS_HLE_FUNC(0xA7C066DE, cellSpursJoinJobChain),
         PS_HLE_FUNC(0x69726AA2, cellSpursAddWorkload),
+        PS_HLE_FUNC(0xEFEB2679, _cellSpursWorkloadAttributeInitialize),
+        PS_HLE_FUNC(0x4A5EAB63, cellSpursWorkloadAttributeSetName),
+        PS_HLE_FUNC(0xC0158D8B, cellSpursAddWorkloadWithAttribute),
+        PS_HLE_FUNC(0x1051D134, cellSpursAttributeEnableSpuPrintfIfAvailable),
+        PS_HLE_FUNC(0x9DCBCB5D, cellSpursAttributeEnableSystemWorkload),
+        PS_HLE_FUNC(0x7517724A, cellSpursSetGlobalExceptionEventHandler),
         PS_HLE_FUNC(0xF843818D, cellSpursReadyCountStore),
         PS_HLE_FUNC(0xC765B995, cellSpursGetWorkloadFlag),
         PS_HLE_FUNC(0xA73BF47E, _cellSpursWorkloadFlagReceiver),
