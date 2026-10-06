@@ -1,0 +1,6 @@
+# Assassin's Creed (BLES00158): through the start screens, CONTINUE (a save in the Animus), then the Memory DNA
+# Timeline: the d-pad to the memory before the locked one, Cross to enter it, Cross through what follows, then a walk
+# with the left stick and a turn of the camera (run 120). Timed in seconds from the boot (pspocket-boot --press-file).
+start@60 start@75 cross@100 start@130 cross@160 cross@200 cross@240 cross@280
+left@292 left@296 cross@300 cross@310 cross@325 cross@345
+ls-up@380:8 ls-left@389:2 ls-up@392:8 rs-right@401:2 ls-up@404:10 ls-right@415:3 ls-up@419:10

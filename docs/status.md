@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-07, after run 117 and D-206 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-07, after run 119 and D-209 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -155,9 +155,13 @@ in the lab, which renders right. Three gaps the logs named are closed, all gener
   code (data decoded as instructions) to real code by carrying every label over as a seed, and a job's own writes to
   its data then dropped its translation (D-205; D-204 and D-206 keep modules lifted when a copy cuts them or their
   guest buffer is reused). After: 1.2 CPU cores busy instead of 3.6, 60 fps without drawing (run 116);
+- one module loaded twice a second differs in 18 data words each time (398 whole images a session): SPU programs are
+  now also known by their code words alone (D-208), at run time and when preparing;
 - the translator generation is 3, so the phone prepares its games again with these fixes.
-Open: one GPU command reader desync (run 113, not seen since), the SPU code at 0xe408 of one job (half a million
-entries a session, seeded now).
+With the GPU drawing, the walk's median went from 29 to 51 fps, the lab from 28-30 to 49-60 (run 117). The PPU's
+interpreted share is now counted (D-207): in Assassin's Creed only its fiber resumes, about 14 instructions each, under
+1% of a core (run 118). "Time left" no longer counts the files a preparation keeps (D-209). Open: one GPU command
+reader desync (run 113, not seen since).
 
 Next: the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
