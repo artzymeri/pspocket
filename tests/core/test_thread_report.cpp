@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <pthread.h>
 #include <string>
 #include <thread>
@@ -19,9 +20,17 @@ TEST_CASE("thread_cpu_report names a busy thread with the CPU time it used")
     std::atomic<bool> spun{false}, done{false};
     std::thread busy([&] {
         pthread_setname_np("busy-report-test");
-        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+        // 300 ms of this thread's own CPU time, however loaded the machine is (a wall-clock spin got less than 0.2 s of
+        // CPU while builds ran beside it), within 20 s.
+        const auto cpu = [] {
+            timespec ts{};
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+            return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+        };
+        const double start = cpu();
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(20);
         volatile u64 x = 0;
-        while (std::chrono::steady_clock::now() < end) x = x + 1;
+        while (cpu() - start < 0.3 && std::chrono::steady_clock::now() < give_up) x = x + 1;
         spun = true;
         while (!done) std::this_thread::sleep_for(std::chrono::milliseconds(1)); // alive while it is reported
     });
