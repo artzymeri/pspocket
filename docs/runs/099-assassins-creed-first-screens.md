@@ -1,4 +1,4 @@
-# Run 099 · Assassin's Creed: its first screens on the Mac, then a task-thread crash
+# Run 099 · Assassin's Creed on the Mac: first screens, a fiber crash fixed, the title screen, the first level
 
 2026-10-06 night · pspocket-boot after D-160 · M4 Mac · Assassin's Creed (BLES00158), the library prepared on the Mac
 (inventory/BLES00158/prepared, 70,830 PPU functions, no SPU programs), firmware 4.92 at
@@ -32,9 +32,27 @@ known:
 - Not the new cellPadGetInfo (its 648 bytes fit the game's 656-byte buffer), not cellFsStat (52 bytes, as RPCS3),
   not the spinlocks or lwmutex trylock (both as RPCS3).
 - The task threads lock almost only with sys_lwmutex_trylock loops (9,390 of the last 40,000 calls).
-Open: which host-side behaviour lets a job be freed under another thread. Next: compare the job object's lifetime
-with --watch on its fields; check syscall 327's absence (the game's memory manager expects page-fault events) and
-the AIO completion order.
+**Found:** the interpreter reported that translated 0xCF6CD4 came back with LR 0; it is the game's "switch to fiber",
+which calls the game's longjmp (0x10AA544) with r4 the target context sign-extended. Translated code returned from
+the longjmp to its C caller instead of jumping, and unwound through the other fiber's stack. Fixed in D-161.
+
+## After D-161
+
+The same session (START at 60 and 75 s, ✕ at 100 s, START at 130 s), the library prepared again (2:17 on the M4): two
+non-local jumps logged and interpreted from, no crash in 240 s, 6,306 frames. Frames: the intro video (the city
+render) at frame 2,700, the logo at 3,450, and **the title screen, "< NEW > / CONTINUE", at 4,500**. After ✕ on NEW
+(160 s, 200 s) the screen stays black to the end of the run: the game opens
+USRDIR/dataps3_flashback_paradise.forge, is told it is missing, and loops on "There's a problem with the disc
+you're using" (a dialog without buttons). The image's primary ISO 9660 tree cuts that name to 31 characters; its
+Joliet tree has it whole. Fixed in D-162.
+
+## After D-162
+
+✕ on NEW (160 s), then ✕ every 40 s, 330 s in all: the level file opens, the game loads its first level and shows
+**Altaïr in the Animus garden with the tutorial ("Move Ⓛ to WALK", "Press the R3 button to center the camera")**,
+from frame 6,450. 3 to 4 fps there and 1.1 GB: the library prepared on the Mac has no SPU programs (they run
+interpreted: one task executed 16.5 billion SPU instructions in 120 s before), and the job loop runs interpreted
+after the fiber switches (D-161). The GTA V gate passes 18 of 18 after D-161 and after D-162.
 
 ## Tools added
 

@@ -102,8 +102,18 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 ## Other games
 
 - **Seen:** L.A. Noire (BLES00933) boots and stops on about 77 unimplemented imports (cellSync mutexes, cellGcmSys flip
-  and system mode, cellSpurs workloads, sceNpInit, ...).
-- **Try:** implement them from its inventory, as for GTA V (D-139 to D-141).
+  and system mode, cellSpurs workloads, sceNpInit, ...). Assassin's Creed (run 099): all imports now there (D-160);
+  title screen after D-161, its first level after D-162 (Joliet names).
+- **Try:** L.A. Noire's imports from its inventory (many are AC's, done). Assassin's Creed in its first level runs
+  at 3 to 4 fps on the Mac: its SPU programs interpreted (16.5 billion instructions in 120 s; the phone's preparation
+  lifts them, D-155, so try it there or run pspocket-prepare with --spu-images from a --spu-dump), the job loop
+  interpreted after fiber switches (D-161), syscall 327 (page-fault notification) still missing.
+- **Fibers (D-161):** after a longjmp in translated code the frames above the jump target run interpreted until they
+  return; a fiber-based job loop never does, so its loop stays interpreted (its jobs are translated). Each switch costs
+  a C++ throw. Better: translate the code after a setjmp's return as a continuation the dispatcher can enter (a
+  setjmp return address as a seed), so a jump lands in translated code.
+- **Modules (D-159):** a game's own PRX modules run interpreted; the preparation could translate the PRX files on the
+  disc too. NPDRM modules need the game's klicensee.
 - **State:** open.
 
 ## The gate (D-149)

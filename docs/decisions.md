@@ -2695,6 +2695,42 @@ store that other processors may race through the reservation system. Where pspoc
 
 With them the game boots on the Mac to its autosave notice and its disclaimer, at 60 fps (run 099).
 
+## D-161 · 2026-10-06 · A longjmp or a fiber switch in translated code goes on in the interpreter
+
+Assassin's Creed crashed after its disclaimer, in a task thread, with registers r27-r31 and LR zero (run 099). Its
+job system runs jobs as fibers, switching with its libc's setjmp/longjmp (0x10AA544: r1, r2, r13-r31, LR, CR, the
+FPRs and the VRs loaded from a buffer). Translated code turns a guest function into a host C function and `blr` into
+a C return, so the translated longjmp returned to its C caller instead of to the other fiber's setjmp, and the caller
+went on with the other fiber's r1, restoring its registers from someone else's stack. The interpreter follows LR and
+r1 and was always right.
+- The lifter: a function's plain return (bclr to LR, no link) checks that r1 is what it was at the function's entry,
+  as every return the ABI allows leaves it. When it is not, the code makes a pseudo-syscall marked by cia 0xFFFFFFF0
+  (no guest register is touched, so the differential tests stay exact) and the kernel throws lv2::NonLocalJump.
+- lv2::run_guest, the only caller of the executor (a thread's entry, call_guest's callbacks), catches it and goes on
+  in the interpreter from the context the jump restored (cia = LR), translated callees still called as such, until
+  the code returns where the call would have: for a thread, to kThreadReturnAddress at any r1 (RunOptions::
+  stop_any_sp). Another jump in translated code lands there again: the host stack never grows with fiber switches.
+- The cost: one compare per translated return; after a jump the frames above the jump target run interpreted until
+  they return (Assassin's Creed: its job loop).
+- The interpreter now remembers its last taken branch to address 0, and a translated function that came back with LR
+  0 (the fault report names it): what found 0xCF6CD4, the game's "switch to fiber".
+Libraries prepared by older lifters lack the check: a translator generation (prepare::kTranslatorGeneration, 2 now)
+goes into each manifest, and library_is_current prepares a library of an older generation again, where an ordinary
+translator change only leaves a note. Result (run 099): Assassin's Creed plays its intro and reaches its title
+screen (NEW / CONTINUE) on the Mac. Test: jmp_set / jmp_long / jmp_deep / jmp_test, lifted and interpreted, the same
+context; a manifest without the generation is not current.
+
+## D-162 · 2026-10-06 · Disc images: the Joliet tree when there is one
+
+Assassin's Creed, after NEW on its title screen, opens /dev_bdvd/PS3_GAME/USRDIR/dataps3_flashback_paradise.forge,
+was told it does not exist, and showed "There's a problem with the disc you're using" for ever (a dialog without
+buttons, so a black screen here). The image's primary ISO 9660 tree cuts names to 31 characters
+(DATAPS3_FLASHBACK_PARADISE.FORG;1); its Joliet supplementary tree (volume descriptor 17, escape sequence %/E) holds
+the whole names in UCS-2, as the disc's UDF tree does on a PS3. runtime/disc reads the Joliet tree whenever the image
+has one (type 2 with %/@, %/C or %/E), its names as UTF-8, lookups still ignoring case; the volume name stays the
+primary descriptor's. RPCS3's Loader/ISO.cpp reads the last of the two as well. Test: a synthetic image with a cut
+primary name and the whole Joliet name.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
