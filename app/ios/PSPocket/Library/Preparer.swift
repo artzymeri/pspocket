@@ -35,6 +35,14 @@ final class Preparer {
         return (ready, String(cString: why))
     }
 
+    /// Whether the PS3 system software's own modules are translated for the system software installed now (D-178):
+    /// done once on this iPhone, shared by every game.
+    static func checkSystem() -> (ready: Bool, why: String) {
+        var why = [CChar](repeating: 0, count: 256)
+        let ready = ps_prepare_system_check(Firmware.devFlash.path, Firmware.systemLibrary.path, &why, why.count) != 0
+        return (ready, String(cString: why))
+    }
+
     /// Starts preparing; `finish` runs on the main thread with the library, or why it failed. Nil, or why it could
     /// not start.
     func start(executable: URL, titleID: String, gameDir: URL,
@@ -43,6 +51,20 @@ final class Preparer {
         guard ps_prepare_start(executable.path, titleID, gameDir.path, &error, error.count) == 0 else {
             return String(cString: error)
         }
+        begin(finish)
+        return nil
+    }
+
+    /// Starts translating the PS3 system software's modules (D-178), as `start` does a game.
+    func startSystem(finish: @escaping (Result<URL, PreparationError>) -> Void) -> String? {
+        var error = [CChar](repeating: 0, count: 512)
+        guard ps_prepare_system_start(Firmware.devFlash.path, Firmware.systemLibrary.path, &error, error.count) == 0
+        else { return String(cString: error) }
+        begin(finish)
+        return nil
+    }
+
+    private func begin(_ finish: @escaping (Result<URL, PreparationError>) -> Void) {
         self.finish = finish
         smoothedEnd = nil
         timeLeft = "Working out how long it takes…"
@@ -50,7 +72,6 @@ final class Preparer {
                             detail: "Starting")
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.poll() }
-        return nil
     }
 
     /// Stops at the next file; what is compiled is kept for the next start.

@@ -105,6 +105,16 @@ public:
     bool started(u32 start) const { return started_.contains(start); }
     void mark_started(u32 start) { started_.insert(start); }
 
+    // The firmware's modules have fixed addresses in the PRX region, the same for every game (D-178): `file`'s, per
+    // PT_LOAD (empty when it is not indexed or the layout did not fit).
+    std::span<const u32> fixed_addresses(std::string_view file) const;
+    // What a system library is made from (D-178): one line per module in key order (its key, its file's SHA-256, its
+    // fixed addresses). A system library holds this text's SHA-256.
+    std::string identity_text() const;
+    // Called for each module as it loads, placed and linked, before its module_start runs (the system library checks
+    // the module's code against its translation, D-178).
+    void set_on_load(std::function<void(const PrxModule&)> hook) { on_load_ = std::move(hook); }
+
     // Loads the module exporting `library` (once), with the modules its own imports need that the host lacks. nullptr
     // with the reason in *error. Before guest threads run, or under RuntimeModules' lock.
     const PrxModule* load(std::string_view library, hle::HleProcess& hle, std::string* error);
@@ -122,7 +132,11 @@ private:
         std::map<std::string, std::set<u32>, std::less<>> export_functions, export_variables;
         std::map<std::string, std::set<u32>, std::less<>> import_functions, import_variables;
         std::set<u32> syscalls;
+        std::vector<u32> load_sizes; // each PT_LOAD's memsz (D-178)
+        std::string sha256;          // the module file's (hex)
+        std::vector<u32> addrs;      // its fixed addresses, per PT_LOAD (empty: placed in main memory)
     };
+    void lay_out();
     bool forced(std::string_view library) const;
     void choose(std::string_view who, const std::vector<LibraryNeeds>& imports, std::string_view file,
         const std::function<bool(u32)>& syscall_bound);
@@ -140,6 +154,7 @@ private:
     std::set<u32> started_;
     std::vector<std::unique_ptr<PrxModule>> loaded_;
     std::vector<u32> starts_;
+    std::function<void(const PrxModule&)> on_load_;
 };
 
 class Executable;

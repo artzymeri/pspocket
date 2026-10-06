@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-06, after run 099 and D-163 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-06, after run 099 and D-178 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -82,6 +82,15 @@ phone).
 Rendering for any game (D-158): new shaders compile in the background with a 4 ms wait a frame, so a game the phone has
 never seen does not stall; more texture formats decode (D-163). Open: the Abstergo lab looks washed out (compare with
 footage), multisampled targets drawn with one sample, a GPU shader interpreter for the draws left out while compiling.
+
+**The system software (2026-10-06, D-165 to D-178).** The engine works out per game which system libraries come from
+Sony's firmware and which are pspocket's own (D-175, D-177), as a PS3 links them. The firmware is analysed in
+docs/firmware.md (D-176: what it holds, the plan for each part). Its 100 modules that are not pspocket's own are
+translated once into a system library, at fixed addresses, and checked one by one as they load (D-178). On the phone
+that happens once, before the first game after the system software is installed. Next from docs/firmware.md: iOS
+frameworks behind the heavy media (ImageIO, VideoToolbox, AudioToolbox), the firmware's SPU programs in the system
+library, and the native libraries' gaps that D-175's log names. Four HLE batches (cellSpurs API, the cellSysutil
+family, input/audio/game/net, RSX shader opcodes) were stopped part-way at a usage limit and are still to do.
 
 ## Building and running GTA V on the Mac
 

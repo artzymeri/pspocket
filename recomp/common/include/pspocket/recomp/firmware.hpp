@@ -58,4 +58,16 @@ bool firmware_path_used(std::string_view path);
 // freed.
 u64 prune_firmware(const std::string& dev_flash_dir);
 
+// A firmware module's key: its file name in sys/external ("libfont.sprx"), or "internal/" and its name in sys/internal
+// (D-177).
+// Modules pspocket always serves itself, which never run as they are (D-175, D-177): the process runtime and its
+// debug modules, module loading, SPURS, the RSX, audio and voice, input, files, network, sysutil and everything on it,
+// devices; in sys/internal the audio and voice services and the file utilities.
+bool firmware_module_native(std::string_view key);
+// Modules translated into the system library (D-178): every one but the native ones and those of no use to a game.
+bool firmware_module_translated(std::string_view key);
+// One module's line of what a system library is made from (D-178): its key, its file's SHA-256 (hex) and its fixed
+// addresses, per PT_LOAD. The loader (LleModules::identity_text) and the preparation write the same lines.
+std::string firmware_identity_line(std::string_view key, std::string_view sha256, std::span<const u32> addrs);
+
 } // namespace pspocket::recomp

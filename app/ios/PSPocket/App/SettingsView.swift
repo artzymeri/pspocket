@@ -84,6 +84,8 @@ final class Firmware {
             .appendingPathComponent("pspocket-firmware")
     }
     static var devFlash: URL { folder.appendingPathComponent("dev_flash") }
+    /// Its modules translated once on this iPhone (D-178), beside it, where the runtime looks.
+    static var systemLibrary: URL { folder.appendingPathComponent("system") }
     private static var versionFile: URL { folder.appendingPathComponent("version.txt") }
 
     init() {

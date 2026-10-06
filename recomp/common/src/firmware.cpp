@@ -1,5 +1,6 @@
 #include "pspocket/recomp/firmware.hpp"
 
+#include <algorithm>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -180,6 +181,30 @@ Result<FirmwareInstall> install_firmware(const std::string& pup_path, const std:
 bool firmware_path_used(std::string_view path)
 {
     return path.starts_with("sys/") || path.starts_with("data/font/") || path.starts_with("data/cert/");
+}
+
+bool firmware_module_native(std::string_view key)
+{
+    if (key.starts_with("internal/")) key.remove_prefix(9);
+    if (key.starts_with("liblv2") || key.starts_with("libsysutil") || key.starts_with("libfs_utility")) return true;
+    static constexpr std::string_view kNative[] = {"libsysmodule.sprx", "libsre.sprx", "libgcm_sys.sprx",
+        "libaudio.sprx", "libvoice.sprx", "libio.sprx", "libfs.sprx", "libfs_155.sprx", "libnet.sprx",
+        "libnetctl.sprx", "libcamera.sprx", "libmic.sprx", "libgem.sprx", "libusbd.sprx", "libusbpspcm.sprx",
+        "sys_audio.sprx", "sysvoice_modules.sprx", "libvoice_internal.sprx"};
+    return std::find(std::begin(kNative), std::end(kNative), key) != std::end(kNative);
+}
+
+bool firmware_module_translated(std::string_view key)
+{
+    // liblv2coredump and liblv2dbg_for_cex are native already (liblv2*).
+    return key.ends_with(".sprx") && !firmware_module_native(key);
+}
+
+std::string firmware_identity_line(std::string_view key, std::string_view sha256, std::span<const u32> addrs)
+{
+    std::string line = std::format("{} {}", key, sha256);
+    for (const u32 a : addrs) line += std::format(" {:x}", a);
+    return line + '\n';
 }
 
 u64 prune_firmware(const std::string& dev_flash_dir)

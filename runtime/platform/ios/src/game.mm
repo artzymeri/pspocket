@@ -47,6 +47,7 @@
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
+#include "pspocket/loader/system.hpp"
 #include "pspocket/recomp/firmware.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/platform/audio_output.hpp"
@@ -82,6 +83,7 @@ struct Session {
     std::unique_ptr<lv2::Kernel> kernel;
     std::unique_ptr<hle::HleProcess> hle;
     std::unique_ptr<loader::LleModules> lle; // the firmware modules it runs (D-157)
+    std::unique_ptr<loader::SystemLibrary> system; // their translation (D-178)
     std::unique_ptr<loader::RuntimeModules> modules; // the modules it loads while it runs (D-159)
     std::unique_ptr<platform::AudioOutput> audio; // the game's sound (cellAudio's mix) on the phone's output
     loader::BootState state;
@@ -440,6 +442,14 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
             PS_LOG_WARN(kChan, "no firmware modules: {}", why);
             s->lle.reset();
         }
+    }
+    // Their translation, made once on this iPhone (D-178): the folder "system" beside /dev_flash's.
+    if (s->lle) {
+        std::filesystem::path flash = std::filesystem::path(o->flash_dir).lexically_normal();
+        if (!flash.has_filename()) flash = flash.parent_path();
+        std::string why;
+        s->system = loader::SystemLibrary::load((flash.parent_path() / "system").string(), *s->lle, *s->memory, &why);
+        if (!s->system) PS_LOG_INFO(kChan, "{}", why);
     }
     loader::LoadReport report;
     if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report, s->lle.get()); r != lv2::CELL_OK) {

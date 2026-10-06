@@ -49,6 +49,8 @@ final class LibraryModel {
     private(set) var boot: Boot?
     /// Preparing a game on this iPhone the first time it is played (D-154): the overlay shows its progress.
     let preparer = Preparer()
+    /// The system software's translation was checked (and made if need be) this session (D-178).
+    @ObservationIgnored private var systemChecked = false
     /// Why a game runs without its library this session (it could not be prepared), by title ID.
     private(set) var preparationNotes: [String: String] = [:]
     @ObservationIgnored static let log = Logger(subsystem: "com.artzymeri.pspocket", category: "library")
@@ -420,6 +422,33 @@ final class LibraryModel {
             self.boot = nil
             bootError = entry.problem ?? "The game's executable is missing"
             return
+        }
+        // The PS3 system software's own modules, translated once (D-178), before the first game after it is
+        // installed (or after an update of pspocket that translates differently). A game goes on without them if
+        // that fails: its firmware modules then run under the interpreter.
+        if !systemChecked, FileManager.default.fileExists(atPath: Firmware.devFlash.appendingPathComponent("sys").path) {
+            systemChecked = true
+            let system = Preparer.checkSystem()
+            if !system.ready {
+                Self.log.notice("pspocket: preparing the system software: \(system.why, privacy: .public)")
+                let entryID = entry.id
+                let message = preparer.startSystem(finish: { [weak self] result in
+                    guard let self else { return }
+                    UIApplication.shared.isIdleTimerDisabled = false
+                    if case .failure(let error) = result {
+                        Self.log.error("pspocket: preparing the system software failed: \(error.message, privacy: .public)")
+                    }
+                    guard self.boot?.entryID == entryID, self.boot?.phase == .preparing else { return }
+                    self.boot?.phase = .armed
+                    self.armBoot()
+                })
+                if message == nil {
+                    UIApplication.shared.isIdleTimerDisabled = true
+                    self.boot?.phase = .preparing
+                    return
+                }
+                Self.log.error("pspocket: cannot prepare the system software: \(message ?? "", privacy: .public)")
+            }
         }
         // Route B (D-154): the game runs from the library this iPhone made of it; the first time, it is made now.
         let gameDir = Self.decryptedGames.appendingPathComponent(titleID)

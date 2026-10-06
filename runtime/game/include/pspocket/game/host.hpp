@@ -30,10 +30,20 @@ struct LoadedLibrary {
     bool translator_current = false; // translated by the lifters of this build
 };
 
+struct LoadOptions {
+    // The SHA-256 its executable_sha256 must hold (32 bytes), or none. The system library's (D-178): what it was made
+    // from (LleModules::identity_text).
+    const u8* executable_sha256 = nullptr;
+    // Check its D-098 samples against guest memory. Off for the system library: its modules are not in memory yet,
+    // and each is checked as it loads (loader::SystemLibrary).
+    bool check_image_words = true;
+};
+
 // Loads a game library: copies it to a new file (the kernel keeps the first signature it saw of a file), registers its
 // signature, dlopen, binds it to host_runtime(), checks it was made for this runtime (layout, ABI hash) and for the
 // executable now in guest memory (its D-098 samples), then registers its PPU functions and SPU programs. Never
 // unloaded. On refusal returns false with the reason in *error, and nothing is registered.
-bool load_library(const std::string& path, const GuestMemory& memory, LoadedLibrary* out, std::string* error);
+bool load_library(const std::string& path, const GuestMemory& memory, LoadedLibrary* out, std::string* error,
+    const LoadOptions& options = {});
 
 } // namespace pspocket::game

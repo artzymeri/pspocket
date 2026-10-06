@@ -14,6 +14,8 @@
 // /app_home from PS3_GAME/USRDIR unless --app-home says otherwise).
 // --flash mounts DIR read-only as /dev_flash: the system files a game reads itself (GTA V's MultiStream loads its MP3
 // codec, sys/external/flashMP3.pic), taken from the user's own firmware and kept out of the repository (D-067).
+// --system-library DIR runs the firmware's modules from their translation (pspocket-prepare --system, D-178); by
+// default the folder "system" beside the --flash folder, when it holds one; "none" keeps them under the interpreter.
 // --imports lists every imported function by module (implemented ones marked) and exits without running.
 // --audio plays the game's sound (cellAudio's mix) on the Mac's default output, through AVAudioEngine.
 // --spu-dump DIR saves every SPU program SPURS loads that has no lifted program into DIR, for scripts/lift-spu.sh
@@ -98,6 +100,7 @@
 #include "pspocket/hle/process.hpp"
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/loader.hpp"
+#include "pspocket/loader/system.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/report.hpp"
 #include "pspocket/core/png.hpp"
@@ -132,7 +135,7 @@ int usage()
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
-        "                     [--async-shaders MS] [--watch ADDR]\n"
+        "                     [--async-shaders MS] [--watch ADDR] [--system-library DIR|none]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n"
         "       pspocket-boot --hle-list\n");
     return 64;
@@ -802,6 +805,7 @@ int main(int argc, char** argv)
     bool audio = false;
     std::string spu_dump;
     std::string game_library; // --game-library (D-152)
+    std::string system_dir;   // --system-library DIR|none (D-178); empty: beside --flash
     [[maybe_unused]] bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the
                                                // app's way); only a build with them uses it
     bool lle_on = true;                // --no-lle: no firmware modules even with --flash (D-157)
@@ -908,6 +912,7 @@ int main(int argc, char** argv)
         else if (a == "--audio") audio = true;
         else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
         else if (a == "--game-library") { const char* v = value(); if (!v) return usage(); game_library = v; }
+        else if (a == "--system-library") { const char* v = value(); if (!v) return usage(); system_dir = v; }
         else if (a == "--builtin-spu") builtin_spu = true;
         else if (a == "--stop-at-first") stop_at_first = true;
         else if (a == "--imports") list_imports = true;
@@ -1098,6 +1103,17 @@ int main(int argc, char** argv)
             PS_LOG_WARN("boot", "no firmware modules: {}", why);
             lle.reset();
         }
+    }
+    // The firmware's modules translated once (D-178): --system-library DIR, else the folder "system" beside the
+    // /dev_flash folder when it holds one.
+    std::unique_ptr<loader::SystemLibrary> system_library;
+    if (lle && system_dir != "none") {
+        std::filesystem::path beside = std::filesystem::path(flash).lexically_normal();
+        if (!beside.has_filename()) beside = beside.parent_path();
+        const std::string dir = !system_dir.empty() ? system_dir : (beside.parent_path() / "system").string();
+        std::string why;
+        system_library = loader::SystemLibrary::load(dir, *lle, memory, &why);
+        if (!system_library) PS_LOG_INFO("boot", "{}", why);
     }
     u32 main_id = 0;
     loader::LoadReport report;

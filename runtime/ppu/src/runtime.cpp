@@ -3,16 +3,20 @@
 #include "pspocket/ppu/runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
+#include "pspocket/core/memory_map.h"
 #include "pspocket/core/reservation.h"
 #include "pspocket/core/timebase.h"
 #include "pspocket/ppu/disasm.hpp"
 #include "pspocket/ppu/interpreter.hpp"
+#include "pspocket/ppu/prx_dispatch.hpp"
 
 using namespace pspocket;
 
@@ -47,6 +51,40 @@ std::atomic<int> g_policy{
 std::atomic<u64> g_misses{0};
 
 bool should_log_miss(u64 n) { return n <= 32 || (n % 4096) == 0; }
+
+// The PRX region's lifted functions (D-178, pspocket/ppu/prx_dispatch.hpp). The entries change only while nothing
+// runs (registration at startup); the enabled ranges only grow, each published before the count that covers it.
+struct PrxTable {
+    std::vector<ps_ppu_dispatch_entry> entries; // sorted by address, one per address
+    std::array<std::pair<u32, u32>, 1024> ranges{};
+    std::atomic<u32> range_count{0};
+    std::mutex enable_mutex;
+};
+
+PrxTable& prx_table()
+{
+    static PrxTable t;
+    return t;
+}
+
+void prx_insert(const ps_ppu_dispatch_entry* entries, size_t count)
+{
+    auto& e = prx_table().entries;
+    for (size_t i = 0; i < count; i++) {
+        PS_CHECK((entries[i].addr & 3) == 0);
+        PS_CHECK(entries[i].fn != nullptr && entries[i].fn != ps_ppu_dispatch_miss_stub);
+        e.push_back(entries[i]);
+    }
+    // The later of two registrations of one address wins, as in the first table.
+    std::stable_sort(e.begin(), e.end(), [](const auto& a, const auto& b) { return a.addr < b.addr; });
+    std::vector<ps_ppu_dispatch_entry> unique;
+    unique.reserve(e.size());
+    for (const auto& x : e) {
+        if (!unique.empty() && unique.back().addr == x.addr) unique.back() = x;
+        else unique.push_back(x);
+    }
+    e.swap(unique);
+}
 
 // Makes the table cover [lo, hi). Grows geometrically so one-by-one registration stays linear.
 void ensure_range(u32 lo, u64 hi)
@@ -99,17 +137,55 @@ std::atomic<ps_ppu_timebase_source> g_timebase{nullptr};
 
 // ---------------------------------------------------------------------------------------------- dispatch table
 
+namespace pspocket::ppu {
+
+bool in_prx_region(u32 addr) { return addr >= PS_MEM_PRX_BASE && addr - PS_MEM_PRX_BASE < PS_MEM_PRX_SIZE; }
+
+void prx_dispatch_enable(u32 lo, u32 hi)
+{
+    PrxTable& t = prx_table();
+    std::lock_guard lock(t.enable_mutex);
+    const u32 n = t.range_count.load(std::memory_order_relaxed);
+    if (n == t.ranges.size()) PS_FATAL(kChan, "more than {} translated module ranges", t.ranges.size());
+    t.ranges[n] = {lo, hi};
+    t.range_count.store(n + 1, std::memory_order_release);
+}
+
+ps_ppu_fn prx_dispatch_find(u32 addr)
+{
+    if (!in_prx_region(addr) || (addr & 3)) return nullptr;
+    const PrxTable& t = prx_table();
+    const u32 n = t.range_count.load(std::memory_order_acquire);
+    bool enabled = false;
+    for (u32 i = 0; i < n && !enabled; i++) enabled = addr >= t.ranges[i].first && addr < t.ranges[i].second;
+    if (!enabled) return nullptr;
+    const auto it = std::lower_bound(t.entries.begin(), t.entries.end(), addr,
+        [](const ps_ppu_dispatch_entry& e, u32 a) { return e.addr < a; });
+    return it != t.entries.end() && it->addr == addr ? it->fn : nullptr;
+}
+
+size_t prx_dispatch_registered() { return prx_table().entries.size(); }
+size_t prx_dispatch_enabled_ranges() { return prx_table().range_count.load(std::memory_order_acquire); }
+
+} // namespace pspocket::ppu
+
 extern "C" ps_ppu_fn ps_ppu_dispatch_find(uint32_t addr)
 {
     if (addr & 3) return nullptr;
     const ps_ppu_fn fn = ps_ppu_dispatch_slot(addr);
-    return fn == ps_ppu_dispatch_miss_stub ? nullptr : fn;
+    if (fn != ps_ppu_dispatch_miss_stub) return fn;
+    return ppu::prx_dispatch_find(addr);
 }
 
 extern "C" void ps_ppu_dispatch_register(uint32_t addr, ps_ppu_fn fn)
 {
     PS_CHECK((addr & 3) == 0);
     PS_CHECK(fn != nullptr && fn != ps_ppu_dispatch_miss_stub);
+    if (ppu::in_prx_region(addr)) {
+        const ps_ppu_dispatch_entry e{addr, fn};
+        prx_insert(&e, 1);
+        return;
+    }
     ensure_range(addr, u64{addr} + 4);
     ps_ppu_fn& slot = ps_ppu_dispatch.slots[(addr - ps_ppu_dispatch.base) >> 2];
     if (slot == ps_ppu_dispatch_miss_stub) g_registered++;
@@ -119,18 +195,32 @@ extern "C" void ps_ppu_dispatch_register(uint32_t addr, ps_ppu_fn fn)
 extern "C" void ps_ppu_dispatch_register_table(const ps_ppu_dispatch_entry* entries, size_t count)
 {
     if (count == 0) return;
+    // The PRX region's go to the second table (D-178), all at once.
+    std::vector<ps_ppu_dispatch_entry> prx;
     u32 lo = ~0u;
     u64 hi = 0;
     for (size_t i = 0; i < count; i++) {
+        if (ppu::in_prx_region(entries[i].addr)) {
+            prx.push_back(entries[i]);
+            continue;
+        }
         lo = std::min(lo, entries[i].addr);
         hi = std::max<u64>(hi, u64{entries[i].addr} + 4);
     }
+    if (!prx.empty()) prx_insert(prx.data(), prx.size());
+    if (prx.size() == count) return;
     ensure_range(lo, hi);
-    for (size_t i = 0; i < count; i++) ps_ppu_dispatch_register(entries[i].addr, entries[i].fn);
+    for (size_t i = 0; i < count; i++)
+        if (!ppu::in_prx_region(entries[i].addr)) ps_ppu_dispatch_register(entries[i].addr, entries[i].fn);
 }
 
 extern "C" void ps_ppu_dispatch_unregister(uint32_t addr)
 {
+    if (ppu::in_prx_region(addr)) {
+        auto& e = prx_table().entries;
+        std::erase_if(e, [&](const ps_ppu_dispatch_entry& x) { return x.addr == addr; });
+        return;
+    }
     if (ps_ppu_dispatch_find(addr) == nullptr) return;
     ps_ppu_dispatch.slots[(addr - ps_ppu_dispatch.base) >> 2] = ps_ppu_dispatch_miss_stub;
     g_registered--;
@@ -141,6 +231,10 @@ extern "C" void ps_ppu_dispatch_clear(void)
     std::vector<ps_ppu_fn>().swap(slot_storage());
     ps_ppu_dispatch = {nullptr, 0, 0};
     g_registered = 0;
+    PrxTable& t = prx_table();
+    std::lock_guard lock(t.enable_mutex);
+    std::vector<ps_ppu_dispatch_entry>().swap(t.entries);
+    t.range_count.store(0, std::memory_order_release);
 }
 
 extern "C" size_t ps_ppu_dispatch_count(void) { return g_registered; }
@@ -152,6 +246,11 @@ extern "C" uint64_t ps_ppu_dispatch_miss_count(void) { return g_misses.load(); }
 extern "C" void ps_ppu_dispatch_miss_stub(PPUContext* ctx, uint8_t* base)
 {
     const u32 target = ctx->cia;
+    // A translated firmware module's function (D-178).
+    if (const ps_ppu_fn fn = ppu::prx_dispatch_find(target)) {
+        fn(ctx, base);
+        return;
+    }
     const u64 n = ++g_misses;
     if (ps_ppu_get_miss_policy() == PS_PPU_MISS_ABORT)
         PS_FATAL(kChan, "indirect call to {:#010x} has no lifted function (LR {:#x}); add it as a seed", target, ctx->lr);
@@ -162,6 +261,11 @@ extern "C" void ps_ppu_dispatch_miss_stub(PPUContext* ctx, uint8_t* base)
 
 extern "C" void ps_ppu_jump_miss(PPUContext* ctx, uint8_t* base, uint32_t target, uint64_t stop_lr, uint64_t stop_sp)
 {
+    if (const ps_ppu_fn fn = ppu::prx_dispatch_find(target)) { // a translated firmware module's (D-178), tail-called
+        ctx->cia = target;
+        fn(ctx, base);
+        return;
+    }
     const u64 n = ++g_misses;
     if (ps_ppu_get_miss_policy() == PS_PPU_MISS_ABORT)
         PS_FATAL(kChan, "indirect jump to {:#010x} has no lifted function (function LR {:#x}); add it as a seed or "

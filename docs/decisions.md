@@ -3169,6 +3169,71 @@ Tests:
 - tests/hle/test_lle.cpp: an unlinked variable is a gap; a sys/internal core serves the sys/external module that
   needs it; both run twice, the second time from the cached index.
 
+## D-178 · 2026-10-06 · The PS3 system software's modules translated once: the system library
+
+The second step of D-176's plan. The firmware modules a game gets (D-175) ran under the interpreter (D-157). Now they
+are translated once per firmware, as a game is, and shared by every game.
+
+- **Fixed addresses.**
+  - Every module the index holds has a fixed place in the PRX region (PS_MEM_PRX_BASE, 256 MB). The region was
+    reserved in lv2's map and unused until now.
+  - The modules are laid out in key order (sys/internal's, then sys/external's), each PT_LOAD at a 64 KB boundary,
+    as RPCS3 allocates segments (recomp::prx_fixed_layout). 4.92's 177 modules fit.
+  - A module's code is the same bytes in every game. Placement and relocation are one function,
+    recomp::place_prx, which the loader copies into guest memory and the preparation translates.
+  - None of the modules translated patch code when they are linked. Code patched by function references exists only
+    in the modules pspocket serves itself (45 sysutil modules and libnetctl). Variable references patch data only.
+  - The index (format 4) keeps each module's PT_LOAD sizes and its file's SHA-256, so the layout costs nothing at
+    boot.
+  - A game's own PRX modules still go to main memory.
+- **The library.**
+  - prepare_system (runtime/prepare/src/system.cpp) places every module that is not native (100 of 177; 77 are
+    pspocket's own) and seeds the analysis with every exported function's descriptor and each module's descriptor
+    table, read relocated. It analyses them as one program and lifts them with the game lifter.
+  - prepare_game's compile, link and sign steps then make game.dylib in the folder "system" beside /dev_flash.
+  - identity.txt (LleModules::identity_text: each module's key, file SHA-256 and addresses) is what it was made
+    from; the library holds its SHA-256.
+  - modules.txt has each translated module's code segments and their SHA-256 as placed.
+  - pspocket-prepare --system DEV_FLASH --game-dir DIR makes it on the Mac.
+- **Loading.**
+  - loader::SystemLibrary loads it, before the executable's imports are linked, when it was made for the installed
+    modules (game::load_library with an expected SHA-256 and no D-098 samples) and this runtime.
+  - Its functions go to a second dispatch table, for the PRX region, sorted by address
+    (pspocket/ppu/prx_dispatch.hpp). ps_ppu_dispatch_register(_table) routes there; the miss stub, ps_ppu_jump_miss
+    and ps_ppu_dispatch_find look there first.
+  - The first table keeps to the game's range; its one-range limit would otherwise have been 3/4 GB away.
+  - Each firmware module that loads (LleModules' load hook) is checked: its code segments' SHA-256 in guest memory
+    against modules.txt. Its range is enabled only on a match; else it runs under the interpreter, logged.
+  - The library ABI is unchanged (the new header is host-only), so no game needs preparing again.
+- **The phone.** Before the first game after the system software is installed (or after an update that translates
+  differently), the app prepares the system library with the game's "Preparing…" overlay
+  (ps_prepare_system_check/_start, LibraryModel.armBoot). game.mm loads it from beside /dev_flash. pspocket-boot
+  does the same (--system-library DIR|none).
+
+Results on the user's 4.92:
+
+- 100 modules translated: 18,962 functions, 1.26 million instructions, none unsupported, one illegal word reached (now
+  logged).
+- 105 files compiled in 33 s on the M4 into an 18.8 MB library.
+- Booting Assassin's Creed with five libraries forced in (cellPngDec, cellFontFT, cellL10n, cellSync2, cellAdec):
+  each "runs translated", and their module_starts ran with no interpreter fallback at a firmware address.
+- GTA V's gate passes unchanged.
+
+A bug found on the way: in 38 modules the first PT_LOAD reserves more than its file part, past the second's vaddr
+(libpngdec: 0x50000 bytes from 0, its data at 0x40a00). An analysis address there belongs to the later segment.
+
+Not yet:
+
+- The modules' 188 SPU programs. They are found at run time as a game's are (D-117) and translated into that game's
+  library at its next preparation.
+
+Tests:
+
+- tests/common/test_prx_place.cpp: layout and placement at fixed addresses; native, translated and identity lines.
+- tests/ppu/test_dispatch.cpp: the second table, its enabling, a call through the miss stub with no miss.
+- tests/game/test_system_library.cpp: a synthetic firmware module translated with the device's compiler, placed,
+  checked, its module_start run translated with no miss; changed code refused; another firmware not current.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

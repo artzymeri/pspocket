@@ -87,9 +87,10 @@ RPCS3, for comparison, runs 78 of these modules as they are by default and repla
 
 1. **D-177: link like a PS3, keep only what games use.** Index sys/internal as well; unlinked imports become gaps
    instead of refusals; the phone keeps only sys, data/font and data/cert.
-2. **Translate Sony's code once per firmware** ("Preparing system…", shared by every game). This covers the PPU code
-   of the modules and their SPU programs, with the same translators as games. Modules go at fixed addresses so the
-   translation stays valid for every game. Mac first (rule 2), then the phone's preparing pipeline.
+2. **Translate Sony's code once per firmware** ("Preparing system…", shared by every game). Done for the PPU code
+   (D-178): 100 modules at fixed addresses in the PRX region, 18,962 functions, an 18.8 MB system library made in 33
+   s on the Mac. Each module is checked against its translation when it loads. Their SPU programs still come
+   through each game's run-time discovery (D-117).
 3. **iOS frameworks for heavy media, behind the same interfaces.** ImageIO for PNG, JPEG and GIF; VideoToolbox for
    H.264 behind cellVdec; AudioToolbox for AAC, MP3 and AC-3 behind cellAdec. Each is measured against Sony's
    translated version first (rule 8).

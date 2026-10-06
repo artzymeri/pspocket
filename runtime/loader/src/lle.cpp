@@ -15,11 +15,15 @@
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
+#include "pspocket/core/memory_map.h"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/recomp/elf.hpp"
+#include "pspocket/recomp/firmware.hpp"
+#include "pspocket/recomp/hash.hpp"
 #include "pspocket/recomp/ppu_module.hpp"
+#include "pspocket/recomp/prx_place.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 #include "refs.hpp"
 
@@ -29,7 +33,6 @@ namespace {
 namespace fs = std::filesystem;
 constexpr std::string_view kChan = "lle";
 
-constexpr u32 kSceRelocations = 0x700000A4; // PT_SCE_PPURELA
 constexpr u32 kLibraryEntrySize = 0x2C;     // sizeof(ppu_prx_module_info), when an entry's size byte is 0
 
 using Linker = std::function<u32(std::string_view library, u32 nid)>;
@@ -91,7 +94,7 @@ std::set<u32> scan_syscalls(const recomp::ElfFile& elf, std::span<const u8> byte
     return out;
 }
 
-constexpr std::string_view kIndexHeader = "pspocket-lle-index 3";
+constexpr std::string_view kIndexHeader = "pspocket-lle-index 4";
 
 // A module's key: its file name for sys/external, "internal/" and the name for sys/internal (codec cores and services
 // other modules load, D-177; libvpost.sprx is in both, as different modules).
@@ -112,81 +115,48 @@ fs::path flash_path(const std::string& dir)
 // Segments and relocations (ppu_load_prx), the module info and the exports (ppu_load_exports). Returns the imports'
 // range.
 bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProcess& hle, PrxModule* out,
-    std::pair<u32, u32>* imports, std::string* error)
+    std::pair<u32, u32>* imports, std::string* error, std::span<const u32> fixed = {})
 {
     u8* base = hle.kernel().base();
-    // Per PT_LOAD header, in order; an empty one keeps its index with no memory.
-    std::vector<std::pair<u32, u32>> segs;
-    const recomp::ProgramHeader* first = nullptr;
-    for (const recomp::ProgramHeader& ph : elf.segments()) {
-        if (ph.type != 1) continue;
-        if (!first) first = &ph;
-        if (!ph.memsz) {
-            segs.emplace_back(0, 0);
-            continue;
+    // Each PT_LOAD at its fixed address (a firmware module, D-178), else where main memory has room (a game's own).
+    std::vector<u32> where(fixed.begin(), fixed.end());
+    if (fixed.empty()) {
+        for (const u32 memsz : recomp::prx_load_sizes(elf)) {
+            const u32 addr = memsz ? hle.main_memory().alloc(memsz) : 0;
+            if (memsz && !addr) {
+                *error = std::format("no main memory for a {:#x}-byte segment", memsz);
+                return false;
+            }
+            where.push_back(addr);
         }
-        if (ph.filesz > ph.memsz || (ph.filesz && !ph.data_in_file)) {
-            *error = std::format("segment {} lies outside the file", segs.size());
-            return false;
-        }
-        const u32 addr = hle.main_memory().alloc(static_cast<u32>(ph.memsz));
-        if (!addr) {
-            *error = std::format("no main memory for a {:#x}-byte segment", ph.memsz);
-            return false;
-        }
-        std::memcpy(base + addr, bytes.data() + ph.offset, static_cast<size_t>(ph.filesz));
-        segs.emplace_back(addr, static_cast<u32>(ph.memsz));
-        out->segments.emplace_back(addr, static_cast<u32>(ph.memsz));
     }
-    if (!first || segs.empty() || !segs[0].first) {
-        *error = "no first segment";
+    auto placed = recomp::place_prx(elf, bytes, where);
+    if (!placed) {
+        *error = placed.error().message;
         return false;
     }
-    // Relocations: {u64 offset, u16, u8 index of the value's segment (0xFF: none), u8 index of the address's segment,
-    // u32 type, u64 ptr} (ppu_prx_relocation_info). Bit fields count from the most significant bit (ppu_bf_t).
-    for (const recomp::ProgramHeader& ph : elf.segments()) {
-        if (ph.type != kSceRelocations || !ph.data_in_file) continue;
-        for (u64 i = 0; i + 24 <= ph.filesz; i += 24) {
-            const u8* r = bytes.data() + ph.offset + i;
-            const u64 offset = ps_ld64(r);
-            const u8 index_value = r[10], index_addr = r[11];
-            const u32 type = ps_ld32(r + 12);
-            const u64 ptr = ps_ld64(r + 16);
-            if (index_addr >= segs.size() || offset >= ((u64{segs[index_addr].second} + 0xFF) & ~u64{0xFF}) ||
-                (index_value != 0xFF && (index_value >= segs.size() || !segs[index_value].first))) {
-                PS_LOG_ERROR(kChan, "relocation {} lies outside its segments", i / 24);
-                out->relocation_errors++;
-                continue;
-            }
-            const u32 at = segs[index_addr].first + static_cast<u32>(offset);
-            const u64 data = (index_value == 0xFF ? 0 : segs[index_value].first) + ptr;
-            switch (type) {
-            case 1: ps_write32(base, at, static_cast<u32>(data)); break;       // ADDR32
-            case 4: ps_write16(base, at, static_cast<u16>(data)); break;       // ADDR16_LO
-            case 5: ps_write16(base, at, static_cast<u16>(data >> 16)); break; // ADDR16_HI
-            case 6: ps_write16(base, at, static_cast<u16>((data >> 16) + ((data & 0x8000) ? 1 : 0))); break; // _HA
-            case 10: // REL24: bits 6..29 of the word
-                ps_write32(base, at, (ps_read32(base, at) & ~0x03FFFFFCu) | (static_cast<u32>(data - at) & 0x03FFFFFCu));
-                break;
-            case 11: // REL14: bits 16..29
-                ps_write32(base, at, (ps_read32(base, at) & ~0x0000FFFCu) | (static_cast<u32>(data - at) & 0x0000FFFCu));
-                break;
-            case 38: ps_write64(base, at, data); break;      // ADDR64
-            case 44: ps_write64(base, at, data - at); break; // REL64
-            case 57: // ADDR16_LO_DS: the halfword's top 14 bits
-                ps_write16(base, at, static_cast<u16>((ps_read16(base, at) & 3u) | (static_cast<u16>(data) & 0xFFFCu)));
-                break;
-            default:
-                PS_LOG_ERROR(kChan, "relocation type {} at {:#x} is unknown", type, at);
-                out->relocation_errors++;
-                continue;
-            }
-            out->relocations++;
+    GuestMemory& mem = hle.kernel().memory();
+    for (const recomp::PlacedSegment& seg : placed->segments) {
+        if (!seg.addr) continue;
+        if (!fixed.empty() && !mem.commit(seg.addr, seg.memsz)) {
+            *error = std::format("cannot map {:#x} bytes at {:#010x}", seg.memsz, seg.addr);
+            return false;
         }
+        std::memcpy(base + seg.addr, seg.bytes.data(), seg.memsz);
+        out->segments.emplace_back(seg.addr, seg.memsz);
     }
+    for (const std::string& e : placed->errors) PS_LOG_ERROR(kChan, "{}", e);
+    out->relocations = placed->relocations;
+    out->relocation_errors = static_cast<u32>(placed->errors.size());
+    const recomp::ProgramHeader* first = nullptr;
+    for (const recomp::ProgramHeader& ph : elf.segments())
+        if (ph.type == 1) {
+            first = &ph;
+            break;
+        }
     // The module info (ppu_prx_library_info: attributes, version, name[28], toc, exports and imports ranges) sits in
     // the first segment at the first program header's p_paddr - p_offset.
-    const u32 info = segs[0].first + static_cast<u32>(first->paddr - first->offset);
+    const u32 info = placed->segments[0].addr + static_cast<u32>(first->paddr - first->offset);
     out->name = guest_string(base, info + 4, 28);
     out->toc = ps_read32(base, info + 0x20);
     const u32 exports_start = ps_read32(base, info + 0x24), exports_end = ps_read32(base, info + 0x28);
@@ -276,8 +246,10 @@ bool LleModules::index(std::string* error)
         if (error) *error = "no firmware modules in " + external.string();
         return false;
     }
+    // A library both folders export goes to sys/external's module, whatever order the files are read in.
     auto add = [&](const std::string& file, const std::string& library) {
-        library_file_.emplace(library, file);
+        const auto [it, added] = library_file_.emplace(library, file);
+        if (!added && it->second.starts_with(kInternal) && !file.starts_with(kInternal)) it->second = file;
         file_libraries_[file].push_back(library);
     };
     // Kept beside /dev_flash: the modules are decrypted once, not at every boot. Each module file: its libraries, what
@@ -306,6 +278,14 @@ bool LleModules::index(std::string* error)
                     for (u32 n; words >> n;) info.syscalls.insert(n);
                     continue;
                 }
+                if (kind == "Z") {
+                    for (u32 n; words >> n;) info.load_sizes.push_back(n);
+                    continue;
+                }
+                if (kind == "H") {
+                    words >> info.sha256;
+                    continue;
+                }
                 words >> name;
                 if (kind == "L") {
                     add(file, name);
@@ -316,9 +296,14 @@ bool LleModules::index(std::string* error)
                 auto& nids = table[name];
                 for (std::string nid; words >> nid;) nids.insert(static_cast<u32>(std::stoul(nid, nullptr, 16)));
             }
-            if (!library_file_.empty()) return true;
+            if (!library_file_.empty()) {
+                lay_out();
+                return true;
+            }
         }
         files_.clear();
+        library_file_.clear();
+        file_libraries_.clear();
     }
     size_t modules = 0;
     std::vector<std::pair<std::string, fs::path>> files; // key, path: sys/external first, so its exports win
@@ -330,7 +315,9 @@ bool LleModules::index(std::string* error)
         for (const fs::path& f : found) files.emplace_back(prefix + f.filename().string(), f);
     }
     for (const auto& [key, path] : files) {
-        auto elf_bytes = module_elf(path);
+        std::vector<u8> raw;
+        if (!read_file(path, raw)) continue;
+        auto elf_bytes = recomp::decrypt_self(raw, recomp::builtin_self_keys());
         if (!elf_bytes) continue;
         auto elf = recomp::ElfFile::parse(*elf_bytes);
         if (!elf) continue;
@@ -350,7 +337,10 @@ bool LleModules::index(std::string* error)
             for (const auto& v : lib.variables) info.import_variables[lib.name].insert(v.nid);
         }
         info.syscalls = scan_syscalls(*elf, *elf_bytes);
+        info.load_sizes = recomp::prx_load_sizes(*elf);
+        info.sha256 = recomp::to_hex(recomp::Sha256::hash(std::span<const u8>(raw)));
     }
+    lay_out();
     if (std::ofstream out(cache); out) {
         out << kIndexHeader << '\n';
         const auto nids = [&](std::string_view kind, const std::map<std::string, std::set<u32>, std::less<>>& table) {
@@ -369,12 +359,42 @@ bool LleModules::index(std::string* error)
             nids("IV", info.import_variables);
             out << 'S';
             for (const u32 n : info.syscalls) out << ' ' << n;
-            out << '\n';
+            out << "\nZ";
+            for (const u32 n : info.load_sizes) out << ' ' << n;
+            out << "\nH " << info.sha256 << '\n';
         }
     }
     PS_LOG_INFO(kChan, "{} of {} firmware modules read: {} libraries", modules, files.size(), library_file_.size());
     if (library_file_.empty() && error) *error = "no firmware module could be read (a build without the keys?)";
     return !library_file_.empty();
+}
+
+void LleModules::lay_out()
+{
+    // Every module in key order, fixed in the PRX region (D-178): the same addresses for every game.
+    std::vector<std::vector<u32>> sizes;
+    for (const auto& [key, info] : files_) sizes.push_back(info.load_sizes);
+    const auto layout = recomp::prx_fixed_layout(sizes, PS_MEM_PRX_BASE, PS_MEM_PRX_SIZE);
+    if (layout.empty()) {
+        PS_LOG_ERROR(kChan, "the firmware's modules do not fit in the PRX region: they go to main memory, untranslated");
+        for (auto& [key, info] : files_) info.addrs.clear();
+        return;
+    }
+    usize i = 0;
+    for (auto& [key, info] : files_) info.addrs = layout[i++];
+}
+
+std::string LleModules::identity_text() const
+{
+    std::string text;
+    for (const auto& [key, info] : files_) text += recomp::firmware_identity_line(key, info.sha256, info.addrs);
+    return text;
+}
+
+std::span<const u32> LleModules::fixed_addresses(std::string_view file) const
+{
+    const auto it = files_.find(file);
+    return it == files_.end() ? std::span<const u32>{} : std::span<const u32>(it->second.addrs);
 }
 
 std::optional<std::string> LleModules::file_for(std::string_view library) const
@@ -398,19 +418,7 @@ bool LleModules::chooses(std::string_view library) const
     return runs_whole(*file);
 }
 
-bool LleModules::always_native(std::string_view file)
-{
-    // The process runtime and its debug modules (liblv2*), module loading, SPURS (D-037), the RSX, audio and voice,
-    // input, files, network, sysutil and everything on it (dialogs, save data, game data, NP), devices; in
-    // sys/internal the audio and voice services and the file utilities (D-177).
-    if (file.starts_with(kInternal)) file.remove_prefix(kInternal.size());
-    if (file.starts_with("liblv2") || file.starts_with("libsysutil") || file.starts_with("libfs_utility")) return true;
-    static constexpr std::string_view kNative[] = {"libsysmodule.sprx", "libsre.sprx", "libgcm_sys.sprx",
-        "libaudio.sprx", "libvoice.sprx", "libio.sprx", "libfs.sprx", "libfs_155.sprx", "libnet.sprx",
-        "libnetctl.sprx", "libcamera.sprx", "libmic.sprx", "libgem.sprx", "libusbd.sprx", "libusbpspcm.sprx",
-        "sys_audio.sprx", "sysvoice_modules.sprx", "libvoice_internal.sprx"};
-    return std::find(std::begin(kNative), std::end(kNative), file) != std::end(kNative);
-}
+bool LleModules::always_native(std::string_view file) { return recomp::firmware_module_native(file); }
 
 std::vector<LleModules::LibraryNeeds> LleModules::needs_of(const recomp::PpuModule& module)
 {
@@ -635,7 +643,7 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
     module->file = file;
     std::pair<u32, u32> imports;
     std::string why;
-    if (!place(*elf, *elf_bytes, hle, module.get(), &imports, &why)) {
+    if (!place(*elf, *elf_bytes, hle, module.get(), &imports, &why, fixed_addresses(file))) {
         if (error) *error = std::format("{}: {}", file, why);
         return nullptr;
     }
@@ -665,6 +673,7 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
         },
         [&](std::string_view library, u32 nid) { return from_module(library, nid, true); });
     if (m->start) starts_.push_back(m->start);
+    if (on_load_) on_load_(*m);
     PS_LOG_INFO(kChan, "{} ({}): {} segments at {:#x}, {} relocations ({} bad), {} functions exported, module_start {:#x}",
         m->name, file, m->segments.size(), m->segments.empty() ? 0 : m->segments[0].first, m->relocations,
         m->relocation_errors, m->functions.size(), m->start);

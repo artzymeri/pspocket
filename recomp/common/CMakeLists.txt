@@ -51,6 +51,7 @@ add_library(pspocket_recomp_common STATIC
     src/nid.cpp
     src/npd.cpp
     src/ppu_module.cpp
+    src/prx_place.cpp
     src/sce.cpp
     src/self_decrypt.cpp
     src/firmware.cpp

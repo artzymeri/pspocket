@@ -23,7 +23,9 @@
 
 #if PSPOCKET_HAVE_CODEGEN
 #include "pspocket/codesign/codesign.hpp"
+#include "pspocket/loader/lle.hpp"
 #include "pspocket/prepare/prepare.hpp"
+#include "pspocket/prepare/system.hpp"
 #endif
 
 namespace {
@@ -114,6 +116,73 @@ void set_status(const pspocket::prepare::Progress& p)
         std::fflush(g_trace);
     }
 }
+// What every preparation starts with: the signing identity, the compiler folder, one at a time. The toolchain into
+// *toolchain; false with the reason in error.
+bool begin(const std::string& dir, std::optional<pspocket::codesign::SigningKey>* key,
+    pspocket::prepare::Toolchain* toolchain, char* error, size_t error_size)
+{
+    std::string why;
+    *key = signing_key(&why);
+    if (!*key) {
+        copy_text(error, error_size, why);
+        return false;
+    }
+    const std::string codegen = resources() + "/codegen";
+    std::error_code ec;
+    if (!fs::exists(codegen + "/clang/include/arm_neon.h", ec)) {
+        copy_text(error, error_size, "this build of pspocket has no compiler headers");
+        return false;
+    }
+    {
+        std::lock_guard lock(g_mutex);
+        if (g_running) {
+            copy_text(error, error_size, "a game is being prepared already");
+            return false;
+        }
+        g_running = true;
+        g_status = {};
+        std::error_code e;
+        fs::create_directories(dir, e);
+        if (g_trace) std::fclose(g_trace);
+        g_trace = std::fopen((fs::path(dir) / "prepare-progress.csv").c_str(), "w");
+        if (g_trace) std::fprintf(g_trace, "seconds,phase,fraction,seconds_left,files_done,files_total\n");
+        g_traced_at = -10;
+        g_status.phase = PS_PREPARE_TRANSLATING;
+        g_status.seconds_left = -1;
+        copy_text(g_status.detail, sizeof g_status.detail, "Starting");
+    }
+    g_cancel = false;
+    toolchain->resource_dir = codegen + "/clang";
+    toolchain->sysroot = codegen + "/sysroot";
+    toolchain->include_dirs = {codegen + "/include"};
+    toolchain->entry_source = codegen + "/library/library_entry.c";
+    toolchain->cpu = "native"; // compiled on this phone, for this phone
+    return true;
+}
+
+// The end of every preparation: the status the Swift side polls.
+void finish(const pspocket::prepare::Result& r)
+{
+    std::lock_guard lock(g_mutex);
+    g_running = false;
+    if (g_trace) {
+        std::fprintf(g_trace, "# %s in %.1f s (translate %.1f, compile %.1f, link %.1f, sign %.1f), %zu files, rates "
+                              "%.3f %.3f %.3f%s%s\n",
+            r.ok ? "done" : "failed", r.seconds, r.translate_seconds, r.compile_seconds, r.link_seconds, r.sign_seconds,
+            r.files_compiled, r.rates[0], r.rates[1], r.rates[2], r.ok ? "" : ": ", r.ok ? "" : r.error.c_str());
+        std::fclose(g_trace);
+        g_trace = nullptr;
+    }
+    if (r.ok) {
+        g_status.phase = PS_PREPARE_DONE;
+        g_status.fraction = 1;
+        g_status.seconds_left = 0;
+        copy_text(g_status.library, sizeof g_status.library, r.library);
+    } else {
+        g_status.phase = PS_PREPARE_FAILED;
+        copy_text(g_status.error, sizeof g_status.error, r.error);
+    }
+}
 #endif
 
 } // namespace
@@ -145,47 +214,12 @@ extern "C" int ps_prepare_start(const char* executable, const char* title_id, co
         copy_text(error, error_size, "missing paths");
         return 1;
     }
-    std::string why;
-    auto key = signing_key(&why);
-    if (!key) {
-        copy_text(error, error_size, why);
-        return 1;
-    }
-    const std::string codegen = resources() + "/codegen";
-    std::error_code ec;
-    if (!fs::exists(codegen + "/clang/include/arm_neon.h", ec)) {
-        copy_text(error, error_size, "this build of pspocket has no compiler headers");
-        return 1;
-    }
-    {
-        std::lock_guard lock(g_mutex);
-        if (g_running) {
-            copy_text(error, error_size, "a game is being prepared already");
-            return 1;
-        }
-        g_running = true;
-        g_status = {};
-        std::error_code e;
-        fs::create_directories(game_dir, e);
-        if (g_trace) std::fclose(g_trace);
-        g_trace = std::fopen((fs::path(game_dir) / "prepare-progress.csv").c_str(), "w");
-        if (g_trace) std::fprintf(g_trace, "seconds,phase,fraction,seconds_left,files_done,files_total\n");
-        g_traced_at = -10;
-        g_status.phase = PS_PREPARE_TRANSLATING;
-        g_status.seconds_left = -1;
-        copy_text(g_status.detail, sizeof g_status.detail, "Starting");
-    }
-    g_cancel = false;
-
+    std::optional<pspocket::codesign::SigningKey> key;
     pspocket::prepare::Options o;
+    if (!begin(game_dir, &key, &o.toolchain, error, error_size)) return 1;
     o.executable = executable;
     o.title_id = title_id;
     o.game_dir = game_dir;
-    o.toolchain.resource_dir = codegen + "/clang";
-    o.toolchain.sysroot = codegen + "/sysroot";
-    o.toolchain.include_dirs = {codegen + "/include"};
-    o.toolchain.entry_source = codegen + "/library/library_entry.c";
-    o.toolchain.cpu = "native"; // compiled on this phone, for this phone
     // The SPU programs the game met without a translation (saved while it ran), with the misses for more entries.
     const std::string coverage = coverage_dir(title_id);
     o.spu_images_dir = coverage + "/spu";
@@ -221,26 +255,7 @@ extern "C" int ps_prepare_start(const char* executable, const char* title_id, co
             fs::copy_file(fs::path(o.game_dir) / "manifest.json", last_dir / "manifest.json",
                 fs::copy_options::overwrite_existing, e);
         }
-        std::lock_guard lock(g_mutex);
-        g_running = false;
-        if (g_trace) {
-            std::fprintf(g_trace, "# %s in %.1f s (translate %.1f, compile %.1f, link %.1f, sign %.1f), %zu files, rates "
-                                  "%.3f %.3f %.3f%s%s\n",
-                r.ok ? "done" : "failed", r.seconds, r.translate_seconds, r.compile_seconds, r.link_seconds,
-                r.sign_seconds, r.files_compiled, r.rates[0], r.rates[1], r.rates[2], r.ok ? "" : ": ",
-                r.ok ? "" : r.error.c_str());
-            std::fclose(g_trace);
-            g_trace = nullptr;
-        }
-        if (r.ok) {
-            g_status.phase = PS_PREPARE_DONE;
-            g_status.fraction = 1;
-            g_status.seconds_left = 0;
-            copy_text(g_status.library, sizeof g_status.library, r.library);
-        } else {
-            g_status.phase = PS_PREPARE_FAILED;
-            copy_text(g_status.error, sizeof g_status.error, r.error);
-        }
+        finish(r);
     }).detach();
     return 0;
 #else
@@ -260,3 +275,64 @@ extern "C" void ps_prepare_get_status(ps_prepare_status* out)
 }
 
 extern "C" void ps_prepare_cancel(void) { g_cancel = true; }
+
+extern "C" int ps_prepare_system_check(const char* flash_dir, const char* system_dir, char* why, size_t why_size)
+{
+#if PSPOCKET_HAVE_CODEGEN
+    if (!flash_dir || !system_dir) return 0;
+    pspocket::loader::LleModules lle(flash_dir);
+    std::string reason;
+    if (!lle.index(&reason)) {
+        copy_text(why, why_size, "no system software: " + reason);
+        return 0;
+    }
+    const bool ok = pspocket::prepare::system_library_is_current(system_dir, lle.identity_text(), &reason);
+    copy_text(why, why_size, reason);
+    return ok ? 1 : 0;
+#else
+    (void)flash_dir;
+    (void)system_dir;
+    copy_text(why, why_size, "this build of pspocket has no compiler");
+    return 0;
+#endif
+}
+
+extern "C" int ps_prepare_system_start(const char* flash_dir, const char* system_dir, char* error, size_t error_size)
+{
+#if PSPOCKET_HAVE_CODEGEN
+    if (!flash_dir || !system_dir) {
+        copy_text(error, error_size, "missing paths");
+        return 1;
+    }
+    std::optional<pspocket::codesign::SigningKey> key;
+    pspocket::prepare::SystemOptions o;
+    if (!begin(system_dir, &key, &o.toolchain, error, error_size)) return 1;
+    o.dev_flash = flash_dir;
+    o.dir = system_dir;
+    o.workers = std::max(1u, std::thread::hardware_concurrency());
+    o.memory_mb = static_cast<double>(os_proc_available_memory()) / 1048576.0 * 0.5;
+    NSString* bundle = [[NSBundle mainBundle] bundleIdentifier];
+    o.identifier = bundle ? bundle.UTF8String : "com.artzymeri.pspocket.testhost";
+    o.thermal = static_cast<int>([[NSProcessInfo processInfo] thermalState]);
+    pspocket::prepare::Manifest last;
+    if (pspocket::prepare::read_manifest(system_dir, &last) ||
+        pspocket::prepare::read_manifest((fs::path(system_dir).parent_path() / "last-preparation").string(), &last)) {
+        const auto rates = pspocket::prepare::prior_rates(&last, nullptr, o.thermal);
+        for (int k = 0; k < 3; k++) o.prior_rates[k] = rates[static_cast<size_t>(k)];
+    }
+    o.progress = set_status;
+    o.cancel = &g_cancel;
+    PS_LOG_INFO(kChan, "the PS3 system software: translating its modules with {} workers", o.workers);
+    std::thread([o = std::move(o), key = std::move(*key)]() mutable {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+        o.key = &key;
+        finish(pspocket::prepare::prepare_system(o));
+    }).detach();
+    return 0;
+#else
+    (void)flash_dir;
+    (void)system_dir;
+    copy_text(error, error_size, "this build of pspocket has no compiler (scripts/build-llvm-ios.sh)");
+    return 1;
+#endif
+}

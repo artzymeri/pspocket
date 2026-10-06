@@ -6,7 +6,10 @@
 //                    [--spu-log FILE]...] [-j N] [--memory MB]
 //                    [--ppu-arg ARG]... [--spu-arg ARG]... [--mllvm OPT]... [--keep-sources] [--events FILE.csv]
 //                    [--quiet]
+//   pspocket-prepare --system DEV_FLASH --game-dir DIR [-j N] [--memory MB] [--keep-sources] [--quiet]
 //
+// --system makes the system library (D-178): the firmware's modules in DEV_FLASH translated once, into DIR (by
+// convention the folder "system" beside DEV_FLASH, where pspocket-boot and the app look for it).
 // --ppu uses translated PPU code (ppu-lift's output) instead of translating; --spu adds lifted SPU programs
 // (scripts/lift-spu.sh's output); --spu-images lifts the SPU images runs saved (pspocket-boot --spu-dump) into
 // DIR/spu, as the phone does, with --spu-log runs' logs for more entry points. Objects stay in DIR/objects, so a second run compiles only what changed.
@@ -24,6 +27,7 @@
 
 #include "pspocket/prepare/prepare.hpp"
 #include "pspocket/prepare/spu.hpp"
+#include "pspocket/prepare/system.hpp"
 
 namespace fs = std::filesystem;
 using namespace pspocket;
@@ -35,7 +39,8 @@ int usage()
     std::fputs("usage: pspocket-prepare --title ID --exe EBOOT.elf --game-dir DIR [--ppu DIR] [--spu DIR |\n"
                "                        --spu-images DIR [--spu-log FILE]...] [-j N]\n"
                "                        [--memory MB] [--ppu-arg ARG]... [--spu-arg ARG]... [--mllvm OPT]...\n"
-               "                        [--keep-sources] [--events FILE.csv] [--quiet]\n",
+               "                        [--keep-sources] [--events FILE.csv] [--quiet]\n"
+               "       pspocket-prepare --system DEV_FLASH --game-dir DIR [-j N] [--memory MB] [--keep-sources]\n",
         stderr);
     return 64;
 }
@@ -52,7 +57,7 @@ std::string clock_text(double s)
 int main(int argc, char** argv)
 {
     prepare::Options o;
-    std::string events_path;
+    std::string events_path, system_flash;
     bool quiet = false, lift_spu_only = false, discover_spu = false;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -64,6 +69,7 @@ int main(int argc, char** argv)
         else if (a == "--discover-spu") discover_spu = true;
         else if (a == "--no-discover-spu") o.discover_spu = false;
         else if (!(v = value())) return usage();
+        else if (a == "--system") system_flash = v;
         else if (a == "--title") o.title_id = v;
         else if (a == "--exe") o.executable = v;
         else if (a == "--game-dir") o.game_dir = v;
@@ -92,7 +98,7 @@ int main(int argc, char** argv)
             rep.merged, rep.seeds);
         return 0;
     }
-    if (o.title_id.empty() || o.executable.empty() || o.game_dir.empty()) return usage();
+    if (o.game_dir.empty() || (system_flash.empty() && (o.title_id.empty() || o.executable.empty()))) return usage();
 
     // This machine: the LLVM build's headers and the source tree's, compiling for the Mac.
     o.toolchain.resource_dir = PSPOCKET_CODEGEN_RESOURCE_DIR;
@@ -134,7 +140,21 @@ int main(int argc, char** argv)
             p.seconds_left >= 0 ? std::format(", about {} left", clock_text(p.seconds_left)).c_str() : "");
         std::fflush(stdout);
     };
-    const prepare::Result r = prepare::prepare_game(o);
+    prepare::Result r;
+    if (!system_flash.empty()) {
+        prepare::SystemOptions s;
+        s.dev_flash = system_flash;
+        s.dir = o.game_dir;
+        s.toolchain = o.toolchain;
+        s.workers = o.workers;
+        s.memory_mb = o.memory_mb;
+        for (int k = 0; k < 3; k++) s.prior_rates[k] = o.prior_rates[k];
+        s.keep_sources = o.keep_sources;
+        s.progress = o.progress;
+        r = prepare::prepare_system(s);
+    } else {
+        r = prepare::prepare_game(o);
+    }
     if (!r.ok) {
         std::fprintf(stderr, "pspocket-prepare: %s\n", r.error.c_str());
         return 1;

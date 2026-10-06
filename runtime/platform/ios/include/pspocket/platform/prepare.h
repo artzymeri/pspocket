@@ -48,6 +48,14 @@ void ps_prepare_get_status(ps_prepare_status* out);
 /* Stops at the next file; what is compiled is kept, so the next start goes on from there. */
 void ps_prepare_cancel(void);
 
+/* The system library (D-178, pspocket/prepare/system.hpp): the PS3 system software's own modules, translated once and
+ * shared by every game. Whether system_dir holds one this app can run for the firmware installed in flash_dir (1), or
+ * not (0, with why). */
+int ps_prepare_system_check(const char* flash_dir, const char* system_dir, char* why, size_t why_size);
+
+/* Starts making it, as ps_prepare_start does a game's (ps_prepare_get_status reports it; ps_prepare_cancel stops it). */
+int ps_prepare_system_start(const char* flash_dir, const char* system_dir, char* error, size_t error_size);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

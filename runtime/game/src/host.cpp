@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <format>
 
@@ -63,7 +64,8 @@ const ps_game_runtime& host_runtime()
     return rt;
 }
 
-bool load_library(const std::string& path, const GuestMemory& memory, LoadedLibrary* out, std::string* error)
+bool load_library(const std::string& path, const GuestMemory& memory, LoadedLibrary* out, std::string* error,
+    const LoadOptions& options)
 {
     namespace fs = std::filesystem;
     auto fail = [&](std::string why) {
@@ -95,8 +97,10 @@ bool load_library(const std::string& path, const GuestMemory& memory, LoadedLibr
             path, hex(lib->abi_hash), hex(ps_game_abi_hash)));
     if (!lib->ppu_register && lib->ppu_function_count != 0)
         return fail(std::format("{} did not bind to this runtime", path));
+    if (options.executable_sha256 && std::memcmp(options.executable_sha256, lib->executable_sha256, 32) != 0)
+        return fail(std::format("{} ({}) was made from something else", path, lib->title_id ? lib->title_id : "?"));
     // The executable it was translated from only (D-098): the sampled words must be in guest memory.
-    for (u32 i = 0; i < lib->ppu_image_word_count; i++) {
+    for (u32 i = 0; options.check_image_words && i < lib->ppu_image_word_count; i++) {
         const u32 addr = lib->ppu_image_words[2 * i], word = lib->ppu_image_words[2 * i + 1];
         if (!memory.is_committed(addr) || ps_read32(memory.base(), addr) != word)
             return fail(std::format("{} ({}) is for another executable: the word at {:#010x} differs", path,

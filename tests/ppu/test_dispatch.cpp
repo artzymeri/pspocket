@@ -2,6 +2,7 @@
 
 #include <catch_amalgamated.hpp>
 
+#include "pspocket/ppu/prx_dispatch.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/ppu/code_image.hpp"
 
@@ -60,6 +61,41 @@ TEST_CASE("dispatch table: register, find, grow in both directions, unregister, 
     ps_ppu_dispatch_clear();
     CHECK(ps_ppu_dispatch_count() == 0);
     CHECK(ps_ppu_dispatch_find(0x00300000) == nullptr);
+}
+
+TEST_CASE("dispatch table: the PRX region's functions go to a second table and run once enabled (D-178)")
+{
+    ps_ppu_dispatch_clear();
+    // A firmware module's function far above the game's code: the first table keeps to the game's range.
+    const ps_ppu_dispatch_entry table[] = {{0x00010000, fn_a}, {0x30010000, fn_b}, {0x30020000, fn_a}};
+    ps_ppu_dispatch_register_table(table, 3);
+    CHECK(ps_ppu_dispatch_count() == 1);
+    CHECK(u64{ps_ppu_dispatch.base} + 4ull * ps_ppu_dispatch.count < 0x30000000);
+    CHECK(ppu::prx_dispatch_registered() == 2);
+    CHECK(ppu::in_prx_region(0x30010000));
+    CHECK_FALSE(ppu::in_prx_region(0x00010000));
+    // Not before its module was checked.
+    CHECK(ps_ppu_dispatch_find(0x30010000) == nullptr);
+    ppu::prx_dispatch_enable(0x30010000, 0x30018000);
+    CHECK(ps_ppu_dispatch_find(0x30010000) == fn_b);
+    CHECK(ps_ppu_dispatch_find(0x30020000) == nullptr); // another module, not enabled
+    CHECK(ps_ppu_dispatch_find(0x30010004) == nullptr);
+    // An indirect call reaches it through the miss stub, which counts no miss.
+    const u64 misses = ps_ppu_dispatch_miss_count();
+    PPUContext ctx{};
+    g_called = 0;
+    ps_ppu_call_indirect(&ctx, nullptr, 0x30010000);
+    CHECK(g_called == 2);
+    CHECK(ps_ppu_dispatch_miss_count() == misses);
+    // A later registration of one address wins; one registered alone joins the table.
+    ps_ppu_dispatch_register(0x30010000, fn_a);
+    CHECK(ps_ppu_dispatch_find(0x30010000) == fn_a);
+    CHECK(ppu::prx_dispatch_registered() == 2);
+    ps_ppu_dispatch_unregister(0x30010000);
+    CHECK(ps_ppu_dispatch_find(0x30010000) == nullptr);
+    ps_ppu_dispatch_clear();
+    CHECK(ppu::prx_dispatch_registered() == 0);
+    CHECK(ppu::prx_dispatch_enabled_ranges() == 0);
 }
 
 TEST_CASE("miss policy is configurable; default follows NDEBUG")
