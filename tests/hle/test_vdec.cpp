@@ -117,27 +117,38 @@ bool is_yuv420(const u8* out, int seed)
            std::memcmp(out + want.y.size() + want.cb.size(), want.cr.data(), want.cr.size()) == 0;
 }
 
-// The life of a decoder, every observation a line: sizes, open, three I_PCM pictures decoded, their items and
-// pictures (YUV 4:2:0, then RGBA and ARGB with alpha), the end of the sequence, close.
-std::vector<std::string> vdec_flow(u8* b, const Call& call)
+// What a decoder's life shows: every answer, item, information block and callback as lines (compared exactly), and
+// each picture's frame buffer and output (compared byte by byte; RGB within one step).
+struct Observed {
+    std::vector<std::string> lines;
+    std::vector<std::vector<u8>> frames, pictures;
+    std::vector<u32> formats;
+};
+
+// YUV420 planar; RGBA BT.709 alpha 0x80; ARGB BT.601 alpha 0xFF; UYVY422; RGBA BT.601 alpha 0; ARGB BT.709 alpha 0x10.
+constexpr u32 kFormats[kPictures * 2][3] = {{3, 0, 0}, {1, 1, 0x80}, {0, 0, 0xFF}, {2, 0, 0}, {1, 0, 0}, {0, 1, 0x10}};
+
+Observed vdec_run(u8* b, const Call& call)
 {
-    std::vector<std::string> out;
+    Observed o;
     const auto r = [&](const char* name, u32 nid, std::initializer_list<u64> args) {
         const u32 v = call(name, nid, args);
-        out.push_back(std::format("{} -> {:#x}", name, v));
+        o.lines.push_back(std::format("{} -> {:#x}", name, v));
         return v;
     };
-    const auto note = [&](std::string s) { out.push_back(std::move(s)); };
+    const auto note = [&](std::string s) { o.lines.push_back(std::move(s)); };
     write_callback(b);
     std::memset(b + kArgs, 0, 0x200);
 
-    // Sizes: H.264 level 2.1, then with its specific information (64x64, the deblocking filter on, default buffers).
+    // Sizes: H.264 level 2.1; with its specific information (64x64; a wrong size field is refused); refusals.
     ps_write32(b, kType, 1);
     ps_write32(b, kType + 4, 21);
     r("cellVdecQueryAttr", 0xFF6F6EBE, {kType, kAttr});
     note(std::format("attr {:#x} {} {:#x} {:#x}", ps_read32(b, kAttr), ps_read8(b, kAttr + 4), ps_read32(b, kAttr + 8),
         ps_read32(b, kAttr + 12)));
     ps_write32(b, kType + 8, kSpec);
+    ps_write32(b, kSpec, 16);
+    r("cellVdecQueryAttrEx", 0xC982A84A, {kType, kAttr});
     ps_write32(b, kSpec, 12);
     ps_write16(b, kSpec + 4, kWidth);
     ps_write16(b, kSpec + 6, kHeight);
@@ -145,23 +156,32 @@ std::vector<std::string> vdec_flow(u8* b, const Call& call)
     const u32 mem_size = ps_read32(b, kAttr);
     note(std::format("attr ex {:#x} {}", mem_size, ps_read8(b, kAttr + 4)));
     r("cellVdecQueryAttr", 0xFF6F6EBE, {0, kAttr});
+    ps_write32(b, kAttr + 0x40, 4); // codec 4: none
+    ps_write32(b, kAttr + 0x44, 0);
+    r("cellVdecQueryAttr", 0xFF6F6EBE, {kAttr + 0x40, kAttr});
+    ps_write32(b, kAttr + 0x40, 1); // H.264 level 5: none
+    ps_write32(b, kAttr + 0x44, 5);
+    r("cellVdecQueryAttr", 0xFF6F6EBE, {kAttr + 0x40, kAttr});
 
-    // Open (CellVdecResource: memory, PPU priority and stack, SPU priority, SPUs), with too little memory first.
-    const u32 res[6] = {kDecoderMem, mem_size, 1000, 0x4000, 200, 1};
+    // Open (CellVdecResource: memory, PPU priority and stack, SPU priority, SPUs), a too small stack first.
+    const u32 res[6] = {kDecoderMem, mem_size, 1000, 0x800, 200, 1};
     for (u32 i = 0; i < 6; i++) ps_write32(b, kRes + 4 * i, res[i]);
     ps_write32(b, kCb, kOpd);
     ps_write32(b, kCb + 4, kLog);
-    if (r("cellVdecOpenEx", 0x0053E2D8, {kType, kRes, kCb, kHandle}) != 0) return out;
+    r("cellVdecOpenEx", 0x0053E2D8, {kType, kRes, kCb, kHandle});
+    ps_write32(b, kRes + 12, 0x4000);
+    if (r("cellVdecOpenEx", 0x0053E2D8, {kType, kRes, kCb, kHandle}) != 0) return o;
     const u32 handle = ps_read32(b, kHandle);
     note(std::format("handle {:#x} (memory {:+#x})", handle, static_cast<s64>(handle) - kDecoderMem));
 
-    // Before a sequence: decoding is refused, no picture.
+    // Before a sequence: no picture, nothing to end.
     r("cellVdecGetPicItem", 0x17C702B9, {handle, kItemOut});
     r("cellVdecEndSeq", 0x824433F0, {handle});
-    if (r("cellVdecStartSeq", 0xC757C2AA, {handle}) != 0) return out;
+    if (r("cellVdecStartSeq", 0xC757C2AA, {handle}) != 0) return o;
 
-    // Three access units (CellVdecAuInfo: address, size, PTS, DTS, user data, codec specific data).
-    for (int i = 0; i < kPictures; i++) {
+    // Six access units (CellVdecAuInfo: address, size, PTS, DTS, user data, codec specific data), each decoded
+    // (AUDONE) before the next; the second without a DTS.
+    for (int i = 0; i < kPictures * 2; i++) {
         const std::vector<u8> au = h::access_unit(h::pattern(kWidth, kHeight, i), static_cast<u32>(i & 1));
         const u32 at = kStream + 0x10000 * static_cast<u32>(i);
         std::memcpy(b + at, au.data(), au.size());
@@ -169,18 +189,16 @@ std::vector<std::string> vdec_flow(u8* b, const Call& call)
         ps_write32(b, kAu + 4, static_cast<u32>(au.size()));
         ps_write32(b, kAu + 8, 0);
         ps_write32(b, kAu + 12, 0x1000 + 3003 * static_cast<u32>(i));
-        ps_write32(b, kAu + 16, 0xFFFFFFFF);
-        ps_write32(b, kAu + 20, 0xFFFFFFFF);
+        ps_write32(b, kAu + 16, i == 1 ? 0xFFFFFFFF : 0);
+        ps_write32(b, kAu + 20, i == 1 ? 0xFFFFFFFF : 0x800 + 3003 * static_cast<u32>(i));
         ps_write64(b, kAu + 24, 0xABCD0000 + static_cast<u64>(i));
         ps_write64(b, kAu + 32, 0);
         r("cellVdecDecodeAu", 0x2BF4DDD2, {handle, 0, kAu});
+        if (!wait_until([&] { return count_of(b, 0) >= static_cast<u32>(i + 1); })) note("no AUDONE");
     }
-    // Every access unit decoded (AUDONE); then the pictures out so far (PICOUT stops changing), each item then its
-    // picture; the end of the sequence (SEQDONE) and the pictures it let out.
-    if (!wait_until([&] { return count_of(b, 0) >= kPictures; })) note("not all access units decoded");
     const auto settle = [&] {
         u32 seen = count_of(b, 1);
-        for (int quiet = 0; quiet < 100; quiet++) {
+        for (int quiet = 0; quiet < 50; quiet++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             const u32 now = count_of(b, 1);
             if (now != seen) quiet = 0;
@@ -188,35 +206,31 @@ std::vector<std::string> vdec_flow(u8* b, const Call& call)
         }
     };
     settle();
-    note(std::format("pictures out after {} access units: {}", kPictures, count_of(b, 1)));
-    const u32 formats[3][3] = {{3, 0, 0}, {1, 1, 0x80}, {0, 0, 0xFF}}; // YUV420 planar; RGBA BT.709; ARGB BT.601
+    note(std::format("pictures out after {} access units: {}", kPictures * 2, count_of(b, 1)));
+
+    // The pictures: each item (its start address as the frame buffer's contents), its H.264 information, its picture.
     int next = 0;
     const auto take = [&] {
-        for (; next < kPictures; next++) {
+        for (; next < kPictures * 2; next++) {
             ps_write32(b, kItemOut, 0);
             if (r("cellVdecGetPicItem", 0x17C702B9, {handle, kItemOut}) != 0) return;
-            const u32 item = ps_read32(b, kItemOut);
-            note(std::format("item {} at {:+#x}", next, static_cast<s64>(item) - kDecoderMem));
-            note(std::format("item {} raw {}", next, hex(b + item, 0x4C)));
-            const u32 start = ps_read32(b, item + 4), info = ps_read32(b, item + 0x48);
-            if (start >= kDecoderMem && start < kDecoderMem + kDecoderMemSize)
-                note(std::format("item {} start {:+#x}: YUV420 of the picture there: {}", next,
-                    static_cast<s64>(start) - kDecoderMem, is_yuv420(b + start, next)));
-            if (info >= kDecoderMem && info < kDecoderMem + kDecoderMemSize)
-                note(std::format("item {} info at item {:+#x}: {}", next, static_cast<s64>(info) - item, hex(b + info, 0x60)));
-            const u32* f = formats[next];
+            const u32 item = ps_read32(b, kItemOut), start = ps_read32(b, item + 4), info = ps_read32(b, item + 0x48);
+            std::vector<u8> fields(b + item, b + item + 0x4C);
+            std::memset(fields.data() + 4, 0, 4); // the frame buffer's address: pspocket's own place
+            note(std::format("item {} at {:+#x}: {}", next, static_cast<s64>(item) - kDecoderMem, hex(fields.data(), 0x48)));
+            note(std::format("item {} information at item {:+#x}: {}", next, static_cast<s64>(info) - item,
+                hex(b + info, 0x244)));
+            o.frames.emplace_back(b + start, b + start + 0x3800);
+            const u32* f = kFormats[next];
             ps_write32(b, kFormat, f[0]);
             ps_write32(b, kFormat + 4, f[1]);
             ps_write8(b, kFormat + 8, static_cast<u8>(f[2]));
-            std::memset(b + kPicture, 0xCC, kWidth * kHeight * 4 + 0x100);
+            std::memset(b + kPicture, 0xCC, kWidth * kHeight * 4);
             if (r("cellVdecGetPicture", 0x807C861A, {handle, kFormat, kPicture}) != 0) return;
-            const u32 bytes = f[0] == 3 ? kWidth * kHeight * 3 / 2 : kWidth * kHeight * 4;
+            const u32 bytes = f[0] == 3 ? kWidth * kHeight * 3 / 2 : f[0] == 2 ? kWidth * kHeight * 2 : kWidth * kHeight * 4;
+            o.pictures.emplace_back(b + kPicture, b + kPicture + bytes);
+            o.formats.push_back(f[0]);
             if (f[0] == 3) note(std::format("picture {} is the I_PCM samples: {}", next, is_yuv420(b + kPicture, next)));
-            note(std::format("picture {} first bytes {} ... last {} after {}", next, hex(b + kPicture, 16),
-                hex(b + kPicture + bytes - 8, 8), hex(b + kPicture + bytes, 4)));
-            u64 sum = 0;
-            for (u32 k = 0; k < bytes; k++) sum = sum * 31 + b[kPicture + k];
-            note(std::format("picture {} checksum {:#x}", next, sum));
         }
     };
     take();
@@ -230,31 +244,153 @@ std::vector<std::string> vdec_flow(u8* b, const Call& call)
         note(std::format("callback {}: type {} data {:#x} handle {:#x}", i, ps_read32(b, kLog + 16 + 16 * i),
             ps_read32(b, kLog + 20 + 16 * i), ps_read32(b, kLog + 24 + 16 * i)));
     r("cellVdecClose", 0x16698E83, {handle});
-    return out;
+    r("cellVdecClose", 0x16698E83, {handle}); // closed
+    return o;
 }
 
 struct BigFixture : Fixture {
     BigFixture()
     {
+        REQUIRE(hle->link_internal_functions({"libvdec"}));
         REQUIRE(hle->main_memory().reserve(kDecoderMem, kDecoderMemSize));
         REQUIRE(mem.commit(kDecoderMem, kDecoderMemSize));
         REQUIRE(hle->initialize_tls({0, 0, 0x100}));
     }
 };
 
+// pspocket's libvdec, linked as a game's imports would be.
+Call hle_calls(Fixture& f, GuestThread& t)
+{
+    return [&f, &t](const char* name, u32 nid, std::initializer_list<u64> args) {
+        const u32 descriptor = f.hle->link_function("libvdec", nid, name);
+        REQUIRE(descriptor != 0);
+        return static_cast<u32>(hle::call_guest(t.ctx, descriptor, args));
+    };
+}
+
+std::string all_lines(const std::vector<std::string>& lines)
+{
+    std::string s;
+    for (const std::string& l : lines) s += l + "\n";
+    return s;
+}
+
+const std::string* find_line(const std::vector<std::string>& lines, std::string_view prefix)
+{
+    for (const std::string& l : lines)
+        if (l.starts_with(prefix)) return &l;
+    return nullptr;
+}
+
 } // namespace
 
-TEST_CASE("cellVdec: Sony's libvdec over the synthetic H.264 (probe)", "[hle][vdec][firmware][.probe]")
+#if PSPOCKET_HAVE_FFMPEG
+TEST_CASE("cellVdec: H.264 decoded as Sony's libvdec does it (D-195)", "[hle][vdec]")
 {
-    const auto flash = test_dev_flash();
-    if (!flash) return;
     InterpretMisses interpret;
     BigFixture f;
     GuestThread t(f, 0, "ppu");
-    FirmwareLibrary sony(f, t, *flash, "libvdec");
-    const std::vector<std::string> lines =
-        vdec_flow(f.base(), [&](const char*, u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); });
-    for (const std::string& l : lines) std::printf("%s\n", l.c_str());
+    u8* b = f.base();
+    const Observed o = vdec_run(b, hle_calls(f, t));
+    INFO(all_lines(o.lines));
+    const auto line = [&](std::string_view prefix) {
+        const std::string* l = find_line(o.lines, prefix);
+        return l ? *l : std::string("(missing)");
+    };
+    CHECK(line("attr ") == "attr 0xe90dfd 4 0x4920000 0x11300"); // Sony's, level 2.1
+    CHECK(line("attr ex ") == "attr ex 0x7165fd 4");             // Sony's, 64x64
+    CHECK(line("handle ") == std::format("handle {:#x} (memory +0x0)", kDecoderMem));
+    CHECK(line("pictures out after") == "pictures out after 6 access units: 5"); // one access unit late
+    CHECK(line("item 0 at ").starts_with("item 0 at +0xdc: 00000001"));
+    CHECK(line("item 1 at ").starts_with("item 1 at +0x16c: "));
+    for (int i = 0; i < kPictures * 2; i++)
+        if (kFormats[i][0] == 3) CHECK(line(std::format("picture {} is", i)).ends_with("true"));
+    REQUIRE(o.pictures.size() == kPictures * 2);
+    CHECK(o.lines.back() == "cellVdecClose -> 0x80610102"); // closed: SEQ, as Sony's
+}
+#endif
+
+TEST_CASE("cellVdec: the same as Sony's libvdec (the user's firmware): sizes, answers, items, information, pictures",
+    "[hle][vdec][firmware]")
+{
+    const auto flash = test_dev_flash();
+    if (!flash) {
+        SUCCEED("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+        return;
+    }
+    InterpretMisses interpret;
+    Observed ours, theirs;
+    std::vector<std::string> our_sizes, their_sizes;
+    const auto sizes = [](u8* b, const auto& query, std::vector<std::string>& out) {
+        for (const u32 codec : {0u, 1u, 2u, 3u, 4u, 5u, 7u, 9u, 11u, 13u}) {
+            for (u32 level = 0; level <= 43; level++) {
+                ps_write32(b, kType, codec);
+                ps_write32(b, kType + 4, level == 43 ? 1042 : level);
+                std::memset(b + kAttr, 0xEE, 0x10);
+                const u32 r = query(kType, kAttr);
+                if (r == 0)
+                    out.push_back(std::format("codec {} level {}: {:#x} {} {:#x} {:#x}", codec, level, ps_read32(b, kAttr),
+                        ps_read8(b, kAttr + 4), ps_read32(b, kAttr + 8), ps_read32(b, kAttr + 12)));
+                else
+                    out.push_back(std::format("codec {} level {}: {:#x}", codec, level, r));
+            }
+        }
+    };
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        const Call c = hle_calls(f, t);
+        ours = vdec_run(f.base(), c);
+        sizes(f.base(), [&](u32 type, u32 attr) { return c("cellVdecQueryAttr", 0xFF6F6EBE, {type, attr}); }, our_sizes);
+    }
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        FirmwareLibrary sony(f, t, *flash, "libvdec");
+        theirs = vdec_run(f.base(),
+            [&](const char*, u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); });
+        sizes(f.base(), [&](u32 type, u32 attr) { return sony.call(t, 0xFF6F6EBE, {type, attr}); }, their_sizes);
+    }
+    usize differ = 0;
+    std::string report;
+    const auto compare_lines = [&](const std::vector<std::string>& a, const std::vector<std::string>& c) {
+        for (usize i = 0; i < std::max(a.size(), c.size()); i++) {
+            const std::string x = i < a.size() ? a[i] : "(none)", y = i < c.size() ? c[i] : "(none)";
+            if (x == y) continue;
+            if (++differ <= 30) report += std::format("line {}:\n  pspocket: {}\n  Sony:     {}\n", i, x, y);
+        }
+    };
+    compare_lines(our_sizes, their_sizes);
+    compare_lines(ours.lines, theirs.lines);
+    REQUIRE(ours.frames.size() == theirs.frames.size());
+    for (usize i = 0; i < ours.frames.size(); i++)
+        if (ours.frames[i] != theirs.frames[i] && ++differ <= 40) report += std::format("frame buffer {} differs\n", i);
+    REQUIRE(ours.pictures.size() == theirs.pictures.size());
+    usize rgb_values = 0, rgb_off_by_one = 0;
+    for (usize i = 0; i < ours.pictures.size(); i++) {
+        const std::vector<u8>& a = ours.pictures[i];
+        const std::vector<u8>& c = theirs.pictures[i];
+        if (ours.formats[i] >= 2) { // YUV 4:2:0 and UYVY: exact
+            if (a != c && ++differ <= 40) report += std::format("picture {} (format {}) differs\n", i, ours.formats[i]);
+            continue;
+        }
+        for (usize k = 0; k < a.size(); k++) {
+            const bool alpha = ours.formats[i] == 1 ? k % 4 == 3 : k % 4 == 0;
+            if (alpha) {
+                if (a[k] != c[k] && ++differ <= 40) report += std::format("picture {} alpha at {} differs\n", i, k);
+                continue;
+            }
+            rgb_values++;
+            const int d = std::abs(a[k] - c[k]);
+            if (d == 1) rgb_off_by_one++;
+            if (d > 1 && ++differ <= 40) report += std::format("picture {} byte {}: {} vs {}\n", i, k, a[k], c[k]);
+        }
+    }
+    INFO(report);
+    INFO(std::format("{} differences; RGB values one step off Sony's: {} of {}", differ, rgb_off_by_one, rgb_values));
+    CHECK(differ == 0);
+    WARN(std::format("RGB values one step off Sony's: {} of {} ({:.1f}%)", rgb_off_by_one, rgb_values,
+        100.0 * static_cast<double>(rgb_off_by_one) / static_cast<double>(std::max<usize>(rgb_values, 1))));
 }
 
 #if PSPOCKET_HAVE_FFMPEG
@@ -298,3 +434,102 @@ TEST_CASE("cellVdec tests: the synthetic H.264 decodes to its own samples (FFmpe
     avcodec_free_context(&ctx);
 }
 #endif
+
+// Sony's pictures in every output format, its picture items, H.264 information and frame buffers, written to the
+// directory PSPOCKET_PROBE_DUMP names (for working out pspocket's to match; nothing from it is committed).
+TEST_CASE("cellVdec: Sony's libvdec pictures, items and frame buffers dumped (probe)", "[hle][vdec][firmware][.probe]")
+{
+    const auto flash = test_dev_flash();
+    const char* dump = std::getenv("PSPOCKET_PROBE_DUMP");
+    if (!flash || !dump) return;
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    FirmwareLibrary sony(f, t, *flash, "libvdec");
+    u8* b = f.base();
+    const auto call = [&](u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); };
+    const auto save = [&](const std::string& name, u32 addr, u32 size) {
+        FILE* out = std::fopen((std::string(dump) + "/" + name).c_str(), "wb");
+        REQUIRE(out);
+        std::fwrite(b + addr, 1, size, out);
+        std::fclose(out);
+    };
+    write_callback(b);
+    std::memset(b + kArgs, 0, 0x200);
+    ps_write32(b, kType, 1);
+    ps_write32(b, kType + 4, 21);
+    ps_write32(b, kType + 8, kSpec);
+    ps_write32(b, kSpec, 12);
+    ps_write16(b, kSpec + 4, kWidth);
+    ps_write16(b, kSpec + 6, kHeight);
+    REQUIRE(call(0xC982A84A, {kType, kAttr}) == 0);
+    const u32 res[6] = {kDecoderMem, ps_read32(b, kAttr), 1000, 0x4000, 200, 1};
+    for (u32 i = 0; i < 6; i++) ps_write32(b, kRes + 4 * i, res[i]);
+    ps_write32(b, kCb, kOpd);
+    ps_write32(b, kCb + 4, kLog);
+    REQUIRE(call(0x0053E2D8, {kType, kRes, kCb, kHandle}) == 0);
+    const u32 handle = ps_read32(b, kHandle);
+    REQUIRE(call(0xC757C2AA, {handle}) == 0);
+    constexpr int kCount = 6;
+    for (int i = 0; i < kCount; i++) {
+        const std::vector<u8> au = h::access_unit(h::pattern(kWidth, kHeight, i), static_cast<u32>(i & 1));
+        const u32 at = kStream + 0x10000 * static_cast<u32>(i % 8);
+        std::memcpy(b + at, au.data(), au.size());
+        ps_write32(b, kAu + 0, at);
+        ps_write32(b, kAu + 4, static_cast<u32>(au.size()));
+        ps_write32(b, kAu + 8, 0);
+        ps_write32(b, kAu + 12, 0x1000 + 3003 * static_cast<u32>(i));
+        ps_write32(b, kAu + 16, 0);
+        ps_write32(b, kAu + 20, 0x800 + 3003 * static_cast<u32>(i));
+        ps_write64(b, kAu + 24, 0xABCD0000 + static_cast<u64>(i));
+        ps_write64(b, kAu + 32, 0);
+        REQUIRE(call(0x2BF4DDD2, {handle, 0, kAu}) == 0);
+        REQUIRE(wait_until([&] { return count_of(b, 0) >= static_cast<u32>(i + 1); }));
+    }
+    REQUIRE(call(0x824433F0, {handle}) == 0);
+    REQUIRE(wait_until([&] { return count_of(b, 2) >= 1; }));
+    // YUV420 planar; RGBA BT.709 alpha 0x80; ARGB BT.601 alpha 0xFF; UYVY422; RGBA BT.601 alpha 0; ARGB BT.709 0x10.
+    const u32 formats[kCount][3] = {{3, 0, 0}, {1, 1, 0x80}, {0, 0, 0xFF}, {2, 0, 0}, {1, 0, 0}, {0, 1, 0x10}};
+    for (int i = 0; i < kCount; i++) {
+        REQUIRE(call(0x17C702B9, {handle, kItemOut}) == 0);
+        const u32 item = ps_read32(b, kItemOut);
+        save(std::format("item{}.bin", i), item, 0x90);
+        save(std::format("info{}.bin", i), ps_read32(b, item + 0x48), 0x244);
+        save(std::format("frame{}.bin", i), ps_read32(b, item + 4), 0x3800);
+        std::printf("item %d at %#x start %#x info %#x\n", i, item - kDecoderMem, ps_read32(b, item + 4) - kDecoderMem,
+            ps_read32(b, item + 0x48) - kDecoderMem);
+        ps_write32(b, kFormat, formats[i][0]);
+        ps_write32(b, kFormat + 4, formats[i][1]);
+        ps_write8(b, kFormat + 8, static_cast<u8>(formats[i][2]));
+        std::memset(b + kPicture, 0xCC, kWidth * kHeight * 4 + 0x100);
+        REQUIRE(call(0x807C861A, {handle, kFormat, kPicture}) == 0);
+        save(std::format("pic{}.bin", i), kPicture, kWidth * kHeight * 4 + 0x100);
+    }
+    save("decoder_memory.bin", kDecoderMem, 0x4000);
+    for (u32 i = 0; i < log_count(b); i++) std::printf("callback %u: type %u\n", i, ps_read32(b, kLog + 16 + 16 * i));
+    REQUIRE(call(0x16698E83, {handle}) == 0);
+}
+
+// Sony's cellVdecQueryAttr over every codec and level (the sizes pspocket's must give).
+TEST_CASE("cellVdec: Sony's sizes for every codec and level (probe)", "[hle][vdec][firmware][.probe]")
+{
+    const auto flash = test_dev_flash();
+    if (!flash) return;
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    FirmwareLibrary sony(f, t, *flash, "libvdec");
+    u8* b = f.base();
+    for (const u32 codec : {0u, 1u, 2u, 3u, 5u, 7u, 9u, 11u, 13u}) {
+        for (u32 level = 0; level < 1100; level++) {
+            if (level > 50 && level != 1042) continue;
+            ps_write32(b, kType, codec);
+            ps_write32(b, kType + 4, level);
+            std::memset(b + kAttr, 0xEE, 0x10);
+            const u32 r = sony.call(t, 0xFF6F6EBE, {kType, kAttr});
+            if (r == 0)
+                std::printf("codec %u level %u: mem %#x depth %u lower %#x\n", codec, level, ps_read32(b, kAttr),
+                    ps_read8(b, kAttr + 4), ps_read32(b, kAttr + 12));
+        }
+    }
+}

@@ -40,6 +40,7 @@ void register_cellRec(Registry& r);
 void register_cellPamf(Registry& r);
 void register_cellDmux(Registry& r);
 void register_cellOvis(Registry& r);
+void register_libvdec(Registry& r);
 void register_sceNpTrophy(Registry& r);
 void register_sysPrxForUser(Registry& r);
 void register_sysPrxForUser_libc(Registry& r);
@@ -88,6 +89,7 @@ void register_all_modules(Registry& r)
     register_cellPamf(r);
     register_cellDmux(r);
     register_cellOvis(r);
+    register_libvdec(r);
     register_sceNpTrophy(r);
     register_sysPrxForUser(r);
     register_sysPrxForUser_libc(r);
