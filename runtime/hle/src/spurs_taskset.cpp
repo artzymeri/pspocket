@@ -260,21 +260,32 @@ void Policy::load_elf(u32 id, u32 elf, bool skip_writable, u32* entry, u32* lowe
     if (lowest) *lowest = low;
 }
 
-// The task's code is its ELF's first executable PT_LOAD segment (load_elf checked the headers): attach the lifted
-// program for it, if the game's build has one (D-076).
+// The task's code is the executable PT_LOAD segment of its ELF that holds the entry (load_elf checked the headers),
+// else its first executable one: attach the lifted program for it, if there is one (D-076). An ELF with SPU overlays
+// starts with a small executable segment before the one it enters (the firmware's encoders and video decoder, D-190);
+// lv2's SPU threads take the segment holding the entry too (sys_spu_thread_group_start).
 void Policy::attach_code(u32 elf)
 {
     u8* e = guest(elf);
     const u32 phoff = ps_read32(e, 0x1C), phentsize = ps_read16(e, 0x2A), phnum = ps_read16(e, 0x2C);
+    const u32 entry = ps_read32(e, 0x18);
+    u8* code = nullptr;
     for (u32 i = 0; i < phnum; i++) {
         u8* ph = e + phoff + i * phentsize;
         if (ps_read32(ph, 0x0C) >= ls::size) break;
         if (ps_read32(ph, 0x00) != 1 || !(ps_read32(ph, 0x18) & 1)) continue; // PT_LOAD with PF_X
-        attach_program(w_.ctx, base_, {ImageKind::Task, elf + ps_read32(ph, 0x04), ps_read32(ph, 0x08),
-                                          ps_read32(ph, 0x10) & ~3u, ps_read32(e, 0x18)});
+        if (!code) code = ph;
+        if (entry >= ps_read32(ph, 0x08) && entry - ps_read32(ph, 0x08) < ps_read32(ph, 0x10)) {
+            code = ph;
+            break;
+        }
+    }
+    if (!code) {
+        ps_spu_attach_program(&w_.ctx, nullptr);
         return;
     }
-    ps_spu_attach_program(&w_.ctx, nullptr);
+    attach_program(w_.ctx, base_, {ImageKind::Task, elf + ps_read32(code, 0x04), ps_read32(code, 0x08),
+                                      ps_read32(code, 0x10) & ~3u, entry});
 }
 
 // A task starts (libsre: its image loaded, the execution context initialized, then the registers). Local store is not

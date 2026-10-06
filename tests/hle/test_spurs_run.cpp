@@ -1,7 +1,8 @@
 // The native SPURS scheduler running synthetic SPU tasks (built in code with the SPU assembler: no game data):
 // a task that exits, one that waits for a signal and resumes from its context save area, a PPU event flag set waking
 // a waiting task, an SPU-to-PPU event through a SPURS port, event flag bits set from SPU code, two tasks yielding
-// to each other on one SPU, and two workloads taking one SPU in priority order.
+// to each other on one SPU, two workloads taking one SPU in priority order, and a task whose translated program is
+// that of the segment it is entered in.
 
 #include "hle_test_util.hpp"
 
@@ -18,6 +19,7 @@
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/spu/asm.hpp"
 #include "pspocket/spu/context.h"
+#include "pspocket/spu/runtime.h"
 #include "guest.hpp" // runtime/hle/src: reservation_op
 #include "spurs.hpp"
 
@@ -704,4 +706,71 @@ TEST_CASE("SPURS workers: a policy module added with a workload attribute (L.A. 
     CHECK(ps_read32(b, kOut + 0) == 1);
     CHECK(ps_read32(b, kOut + 44) == wid);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+}
+
+namespace {
+
+std::atomic<int> g_entry_segment_runs{0};
+
+// The "translated" program of the task's second segment: counts its runs, then leaves the task to the interpreter.
+void entry_segment_lifted(SPUContext* ctx, uint8_t*)
+{
+    g_entry_segment_runs.fetch_add(1);
+    ps_spu_attach_program(ctx, nullptr);
+}
+
+} // namespace
+
+TEST_CASE("SPURS workers: a task runs the translated program of the segment holding its entry (D-191)",
+    "[hle][spurs][spurs-run]")
+{
+    // An SPU ELF with overlays starts with a small executable segment before the one it is entered in (the firmware's
+    // encoders and video decoder): the task's program is the entry's segment, as for lv2's SPU threads. Before, the
+    // first executable segment was hashed, no program matched it, and the whole task was interpreted.
+    SpursFixture s;
+    u8* b = s.base;
+    Program p; // stores 0x77 at the EA in its argument's first word, then exits
+    p.emit(as::il(10, kBuf));
+    p.emit(as::il(12, 0x77));
+    p.emit(as::stqd(12, 0, 10));
+    p.dma16(PS_MFC_PUT, 10, 3);
+    p.syscall(0);
+    const u32 size = static_cast<u32>(p.code.size() * 4);
+    std::memset(b + kElf, 0, 0x200 + size + 16);
+    static constexpr u8 kIdent[16] = {0x7F, 'E', 'L', 'F', 1, 2, 1, 0};
+    std::memcpy(b + kElf, kIdent, 16);
+    ps_write16(b, kElf + 0x10, 2);    // ET_EXEC
+    ps_write16(b, kElf + 0x12, 0x17); // EM_SPU
+    ps_write32(b, kElf + 0x14, 1);
+    ps_write32(b, kElf + 0x18, 0x3100); // entry: the second segment
+    ps_write32(b, kElf + 0x1C, 0x34);
+    ps_write16(b, kElf + 0x28, 0x34);
+    ps_write16(b, kElf + 0x2A, 0x20);
+    ps_write16(b, kElf + 0x2C, 2);
+    const auto phdr = [&](u32 i, u32 offset, u32 vaddr, u32 filesz) {
+        const u32 ph = kElf + 0x34 + 0x20 * i;
+        ps_write32(b, ph + 0x00, 1); // PT_LOAD
+        ps_write32(b, ph + 0x04, offset);
+        ps_write32(b, ph + 0x08, vaddr);
+        ps_write32(b, ph + 0x0C, vaddr);
+        ps_write32(b, ph + 0x10, filesz);
+        ps_write32(b, ph + 0x14, (filesz + 15) & ~15u);
+        ps_write32(b, ph + 0x18, 5); // R X
+        ps_write32(b, ph + 0x1C, 0x80);
+    };
+    phdr(0, 0x100, 0x3000, 0x10);
+    phdr(1, 0x200, 0x3100, size);
+    for (u32 i = 0; i < 4; i++) ps_write32(b, kElf + 0x100 + 4 * i, 0x00000007); // stop 7: never run
+    for (usize i = 0; i < p.code.size(); i++) ps_write32(b, kElf + 0x200 + 4 * static_cast<u32>(i), p.code[i]);
+    ps_write32(b, kArg, kOut);
+
+    const ps_spu_entry entries[] = {{0x3100, &entry_segment_lifted}};
+    ps_spu_program program{"spu_entry_segment", ps_spu_hash64(b + kElf + 0x200, size), 0x3100, size,
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, nullptr};
+    ps_spu_register_program(&program);
+    g_entry_segment_runs = 0;
+    REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut) == 0x77; }));
+    CHECK(g_entry_segment_runs.load() == 1);
+    ps_spu_unregister_program(&program);
 }
