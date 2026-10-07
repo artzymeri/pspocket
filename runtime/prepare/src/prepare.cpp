@@ -1,4 +1,5 @@
 #include "pspocket/prepare/prepare.hpp"
+#include "pspocket/prepare/session.hpp"
 #include "pspocket/prepare/spu.hpp"
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include "pspocket/recomp/hash.hpp"
 #include "pspocket/recomp/ppu/executable.hpp"
 #include "pspocket/prepare/spu_static.hpp"
+#include "jobs.hpp"
 
 namespace pspocket::prepare {
 namespace {
@@ -30,72 +32,11 @@ constexpr const char* kChan = "prepare";
 
 double since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
 
-bool read_bytes(const fs::path& p, std::string& out)
-{
-    std::ifstream in(p, std::ios::binary);
-    if (!in) return false;
-    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    return true;
-}
-
-bool write_bytes(const fs::path& p, const void* data, size_t size)
-{
-    // Beside the destination, then renamed: a file is there whole or not at all.
-    const fs::path tmp = p.string() + ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size))) return false;
-    }
-    std::error_code ec;
-    fs::rename(tmp, p, ec);
-    return !ec;
-}
-
-uint64_t fnv(std::string_view text)
-{
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (const char c : text) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ull;
-    return h;
-}
-
-// The headers beside a file (the game's prototypes): part of its object's name, so a unit is compiled again when they
-// change though its own text did not.
-std::string headers_define(const fs::path& dir)
-{
-    std::vector<fs::path> headers;
-    std::error_code ec;
-    for (const auto& e : fs::directory_iterator(dir, ec))
-        if (e.path().extension() == ".h") headers.push_back(e.path());
-    std::sort(headers.begin(), headers.end());
-    std::string all;
-    for (const fs::path& p : headers) {
-        std::string text;
-        read_bytes(p, text);
-        all += text;
-    }
-    return std::format("PSPOCKET_HEADERS_HASH=0x{:016x}ull", fnv(all));
-}
-
-codegen::BuildJob job_for(const fs::path& source, bool spu, const std::string& headers,
-    const std::vector<std::string>& ppu_args, const std::vector<std::string>& spu_args)
-{
-    std::string text;
-    read_bytes(source, text);
-    const std::string name = source.filename().string();
-    const codegen::FileKind kind = name.ends_with("_reg.c") || name == "game_spu.c" ? codegen::FileKind::Table
-        : spu                                                                       ? codegen::FileKind::SpuCode
-                                                                                    : codegen::FileKind::PpuCode;
-    const codegen::CostEstimate e = codegen::estimate_cost(text, kind);
-    codegen::BuildJob j;
-    j.source = source.string();
-    j.include_dirs = {source.parent_path().string()};
-    if (!headers.empty()) j.defines = {headers};
-    j.extra_args = spu ? spu_args : ppu_args;
-    j.cost = e.seconds;
-    j.memory_mb = e.memory_mb;
-    j.group = static_cast<int>(kind);
-    return j;
-}
+using detail::fnv;
+using detail::headers_define;
+using detail::job_for;
+using detail::read_bytes;
+using detail::write_bytes;
 
 std::string hex(const recomp::Sha256Digest& d) { return recomp::to_hex(d); }
 
@@ -419,6 +360,7 @@ Result prepare_game(const Options& o)
     b.compile.include_dirs = o.toolchain.include_dirs;
     b.compile.defines = {"PSPOCKET_GAME_LIBRARY"};
     b.compile.extra_args = {"-fvisibility=hidden"};
+    b.compile.qos_class = o.qos_class;
     b.link.platform = o.toolchain.platform;
     b.link.min_os = o.toolchain.min_os;
     b.link.install_name = "@rpath/game.dylib";
@@ -432,12 +374,7 @@ Result prepare_game(const Options& o)
     llvm_options.insert(llvm_options.end(), o.llvm_options.begin(), o.llvm_options.end());
     b.cache_key = std::format("abi {:016x} {}", ps_game_abi_hash, codegen::compiler_version());
     for (const std::string& l : llvm_options) b.cache_key += " " + l;
-    {
-        static std::once_flag once; // LLVM's options are the process's: set once, before any compile
-        static std::string llvm_error;
-        std::call_once(once, [&] { codegen::set_llvm_options(llvm_options, &llvm_error); });
-        if (!llvm_error.empty()) return fail("LLVM's options: " + llvm_error);
-    }
+    if (std::string llvm_error; !ensure_llvm_options(o.llvm_options, &llvm_error)) return fail(llvm_error);
     b.cancel = o.cancel;
     b.progress = [&](const codegen::BuildProgress& p) {
         if (o.on_file && !p.file.empty() && p.phase == codegen::BuildProgress::Phase::Compiling)
@@ -456,7 +393,9 @@ Result prepare_game(const Options& o)
         }
     };
     const fs::path unsigned_library = dir / "objects" / "game-unsigned.dylib";
+    std::unique_lock compiling(compiler_mutex()); // a session's translator waits (D-236)
     const codegen::BuildResult built = codegen::build_library(jobs, {}, unsigned_library.string(), b);
+    compiling.unlock();
     r.compile_seconds = built.compile_seconds;
     r.link_seconds = built.link_seconds;
     r.files_compiled = built.compiled;

@@ -53,6 +53,7 @@ struct Options {
     Toolchain toolchain;
     unsigned workers = 0;     // 0: one per core
     double memory_mb = 0;     // compiles start while their predicted peaks fit; 0: no limit
+    unsigned qos_class = 0;   // the compiling threads' QoS class (codegen::CompileOptions::qos_class); 0: the default
     const codesign::SigningKey* key = nullptr; // nullptr: ad hoc
     std::string identifier;   // the signature's identifier (the app's bundle ID on the phone)
     // This device's speed against the cost model's, per kind of file (PPU code, SPU code, tables): the last

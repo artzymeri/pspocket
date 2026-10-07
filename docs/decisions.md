@@ -5114,6 +5114,48 @@ can now be given its class (codegen::CompileOptions::qos_class: the build's work
 it; not part of what names an object): the preparation's are USER_INITIATED (the player waits), a session's
 translator's UTILITY (behind the game's threads).
 
+## D-236 · 2026-10-07 · SPU programs are translated during the session
+
+The game library holds the SPU programs the executable carries (D-226) and the ones earlier sessions saved (D-155),
+but a game's first session met the rest only as images to save: Assassin's Creed interprets 21.6 billion SPU
+instructions in its first 150 s, in the modules and jobs its tasks copy in from data (run 207), until the next launch
+prepares them. (docs/plan-background-spu.md, from a design workflow: four readers, two designs, two judges.)
+
+- **The translator** (prepare::SessionTranslator, runtime/prepare/src/session.cpp): one thread at UTILITY QoS looks at
+  the folder the session saves its images in every second; an image whose program is registered already (the game
+  library's, an earlier batch's) is left; the new ones are lifted together (copies with the same code once, D-208),
+  then built one program per library, the cheapest first (a small module does not wait behind a big job binary):
+  compiled on one core, linked, signed, and loaded under a RegistryBatch. The next loads find them (D-232), and the
+  SPUs running them switch at their next taken branch (D-233, D-234). A program predicted to compile longer than a
+  limit waits for the next launch's preparation: the cost model's seconds scaled by how fast this session's compiles
+  ran against it (fitted on GTA V's SPU code, it predicted 0.2 to 577 s for Assassin's Creed's 0.2 to 5.4). A program
+  that does not compile is logged and skipped; a link, signature or load that fails stops the translator for the
+  session (the game keeps interpreting).
+- **LLVM's signal handlers:** LLVM installs SIGSEGV and SIGBUS handlers the first time a compile or link opens a file,
+  over the process's, and they delete the files of the compiles and links running before passing the signal on. A
+  game faults on purpose (write tracking, D-134): in the first try every compile lost its object (run 218).
+  codegen::install_llvm_signal_handlers() installs them once, before the game's fault handler goes in over them, and
+  clang's outputs are not registered with them at all (an on-disk output backend with RemoveOnSignal off).
+- **SPU-only libraries** (prepare::build_spu_library): a game library with PS_GAME_HAS_PPU 0 and the programs only,
+  each with its own install name; game::load_library loads it as any other (no image words to check).
+- **One compiler:** LLVM's options are set once in the process (prepare::ensure_llvm_options, shared with
+  prepare_game), and a build holds prepare::compiler_mutex(): a preparation and the translator never compile at once.
+  prepare_game's helpers that both use moved to runtime/prepare/src/jobs.cpp (unchanged).
+- **pspocket-boot --spu-translate DIR** (builds with the device's compiler): images saved in DIR/images, the work in
+  DIR/work, both emptied at the start; PSPOCKET_SPU_TRANSLATE=0 turns it off; the end of the run reports what it did.
+- **The app** starts it once the game library is loaded, with the phone's signing identity, saving into the game's
+  coverage folder (what the next preparation reads): not after a memory warning, not with under 2 GB left, not at
+  "serious" heat, not in Low Power Mode, not in the background, not while a preparation runs; programs predicted
+  longer than 60 s (scaled) wait for the next launch. Not tried on the phone yet (CLAUDE.md rule 10: with the user, later).
+- **Measured** (runs 217-219, Assassin's Creed's first 150 s on a library from the executable alone): SPU instructions
+  interpreted 22.06 billion to 0.94 billion (-96%), almost all of the rest in the first 10 s; all 17 programs met
+  translated (four batches; compiled in 0.2 to 5.4 s each, 33 s in all; at most 17.1 s from first sighting to loaded);
+  the Animus training 25-33 fps to 60.
+- Tests: tests/game/test_session_translate.cpp (two copies of a job and a job registered already: one program
+  translated in the background, found for both copies, running as the interpreter runs them; a program over the limit
+  left to the next launch; a refused load stops the translator; a compile and link while another thread takes page
+  faults, which fails as run 218 did without the fix).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

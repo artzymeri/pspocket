@@ -3,7 +3,7 @@
 if(NOT TARGET pspocket_codegen)
     return()
 endif()
-add_library(pspocket_prepare STATIC src/prepare.cpp src/spu.cpp src/spu_static.cpp src/system.cpp)
+add_library(pspocket_prepare STATIC src/prepare.cpp src/jobs.cpp src/session.cpp src/spu.cpp src/spu_static.cpp src/system.cpp)
 target_include_directories(pspocket_prepare PUBLIC include)
 target_link_libraries(pspocket_prepare PUBLIC pspocket::codesign
     PRIVATE pspocket::codegen pspocket::game pspocket::recomp_ppu pspocket::recomp_spu pspocket::recomp_common)
