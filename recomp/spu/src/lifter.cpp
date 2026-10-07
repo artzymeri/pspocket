@@ -437,6 +437,90 @@ std::string reg_decls(const RegSet& used)
     return n ? decl + ";\n" : "";
 }
 
+// ---- what a call can touch (D-127, again in D-216)
+//
+// A direct call stored every register the caller writes and reloaded every register it uses: up to 127 of each around
+// each call (calls and the entry and exit loads and stores were over a third of GTA V's translated SPU time, run 134).
+// A callee reads from ctx the registers it uses (its entry loads them) and stores back the ones it writes (its exits),
+// and so does everything it calls in turn: around a call the caller stores only what it wrote of the callee's
+// "touched" set and reloads only what it uses of the callee's "written" set. When the callee does not come back to
+// the call (it left for the run loop), the caller stores the rest of what it wrote before it returns: with each caller
+// up the chain doing the same, ctx holds every register again. A stop (the runtime's handlers read and write any
+// register) or a call through a register (any function) touches everything. Other ways out of a function (an absolute
+// call in relocatable code, an indirect jump that is not its own label) leave for the run loop and store everything.
+struct CallSummary {
+    RegSet touched; // registers the callee and its callees may read or write through ctx
+    RegSet written; // registers they may write
+};
+
+RegSet all_regs()
+{
+    RegSet r;
+    r.bits = {~0ull, ~0ull};
+    return r;
+}
+
+RegSet operator&(const RegSet& a, const RegSet& b)
+{
+    RegSet r;
+    r.bits = {a.bits[0] & b.bits[0], a.bits[1] & b.bits[1]};
+    return r;
+}
+
+RegSet without(const RegSet& a, const RegSet& b)
+{
+    RegSet r;
+    r.bits = {a.bits[0] & ~b.bits[0], a.bits[1] & ~b.bits[1]};
+    return r;
+}
+
+std::map<u32, CallSummary> call_summaries(const LsImage& image, const Program& program)
+{
+    std::map<u32, CallSummary> sums;
+    for (const Function& f : program.functions) {
+        CallSummary s{f.used, f.written};
+        for (u32 a : f.insns) {
+            const Op op = decode(image.word(a)).op;
+            if (op == Op::STOP || op == Op::STOPD || op == Op::BISL) {
+                s = {all_regs(), all_regs()};
+                break;
+            }
+        }
+        sums.emplace(f.entry, s);
+    }
+    for (bool changed = true; changed;) { // the callees' sets, to a fixpoint (calls may recurse)
+        changed = false;
+        for (const Function& f : program.functions) {
+            CallSummary& s = sums.at(f.entry);
+            const CallSummary before = s;
+            for (u32 c : f.calls) {
+                const auto it = sums.find(c);
+                if (it == sums.end()) continue; // not lifted: the call leaves for the run loop
+                s.touched |= it->second.touched;
+                s.written |= it->second.written;
+            }
+            changed |= !(s.touched == before.touched && s.written == before.written);
+        }
+    }
+    return sums;
+}
+
+std::string stores(const RegSet& regs)
+{
+    std::string o;
+    for (u32 r = 0; r < 128; r++)
+        if (regs.test(r)) o += std::format(" psl_st(ctx, {}, r{});", r, r);
+    return o;
+}
+
+std::string loads(const RegSet& regs)
+{
+    std::string o;
+    for (u32 r = 0; r < 128; r++)
+        if (regs.test(r)) o += std::format(" r{} = psl_ld(ctx, {});", r, r);
+    return o;
+}
+
 // ---- step mode ----
 
 class StepFlow final : public Flow {
@@ -452,8 +536,9 @@ public:
 
 class FunctionFlow final : public Flow {
 public:
-    FunctionFlow(const Function& f, const std::map<u32, std::string>& symbols, bool relocatable)
-        : Flow(relocatable), f_(f), symbols_(symbols)
+    FunctionFlow(const Function& f, const std::map<u32, std::string>& symbols, const std::map<u32, CallSummary>& sums,
+        bool relocatable)
+        : Flow(relocatable), f_(f), symbols_(symbols), sums_(sums)
     {
     }
 
@@ -471,7 +556,21 @@ public:
     {
         const auto it = symbols_.find(target);
         if (it == symbols_.end()) return leave(target);
-        return std::format("    PSL_SPILL();\n    ctx->pc = {};\n    {}(ctx, ls);\n{}", pc(target), it->second, after_call(ret));
+        const auto sum = sums_.find(target);
+        if (sum == sums_.end())
+            return std::format("    PSL_SPILL();\n    ctx->pc = {};\n    {}(ctx, ls);\n{}", pc(target), it->second, after_call(ret));
+        const CallSummary& callee = sum->second;
+        std::string o;
+        if (const std::string st = stores(f_.written & callee.touched); !st.empty()) o += "   " + st + "\n";
+        o += std::format("    ctx->pc = {};\n    {}(ctx, ls);\n", pc(target), it->second);
+        // Not back here: store what the callee left alone, then return to the run loop.
+        const std::string rest = stores(without(f_.written, callee.touched));
+        o += rest.empty() ? std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n", pc(ret))
+                          : std::format("    if (ctx->pc != {} || ctx->stop_reason) {{\n       {}\n        goto exit_now;\n    }}\n",
+                                pc(ret), rest);
+        if (const std::string ld = loads(f_.used & callee.written); !ld.empty()) o += "   " + ld + "\n";
+        o += continue_at(ret);
+        return o;
     }
     std::string call_dynamic(u32 ret) const override
     {
@@ -484,17 +583,21 @@ private:
     std::string after_call(u32 ret) const
     {
         // Continue only if the callee returned to us; otherwise ctx is current and the run loop takes over.
-        std::string s = std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n    PSL_RELOAD();\n", pc(ret));
-        s += f_.labels.contains(ret) ? std::format("    goto L_{:05X};\n", ret) : std::format("    goto exit_spill;\n");
-        return s;
+        return std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n    PSL_RELOAD();\n", pc(ret)) +
+            continue_at(ret);
+    }
+    std::string continue_at(u32 ret) const
+    {
+        return f_.labels.contains(ret) ? std::format("    goto L_{:05X};\n", ret) : std::string("    goto exit_spill;\n");
     }
 
     const Function& f_;
     const std::map<u32, std::string>& symbols_;
+    const std::map<u32, CallSummary>& sums_;
 };
 
 std::string lift_function(const LsImage& image, const Function& f, const std::string& symbol,
-    const std::map<u32, std::string>& symbols, const LiftOptions& options)
+    const std::map<u32, std::string>& symbols, const std::map<u32, CallSummary>& sums, const LiftOptions& options)
 {
     std::string o;
     o += reg_macros(f.used, f.written);
@@ -502,7 +605,7 @@ std::string lift_function(const LsImage& image, const Function& f, const std::st
     o += reg_decls(f.used);
     if (options.relocatable) o += "    const uint32_t rel = ctx->reloc;\n";
     o += "    PSL_RELOAD();\n    goto dispatch;\n";
-    const FunctionFlow flow(f, symbols, options.relocatable);
+    const FunctionFlow flow(f, symbols, sums, options.relocatable);
     for (usize i = 0; i < f.insns.size(); i++) {
         const u32 a = f.insns[i];
         const u32 word = image.word(a);
@@ -585,9 +688,10 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
     std::vector<std::string> units(tus,
         std::format("/* Generated by spu-lift ({}). Do not edit. */\n#include \"pspocket/spu/lifted.h\"\n#include \"{}.h\"\n\n",
             image.name, options.name));
+    const std::map<u32, CallSummary> sums = call_summaries(image, program);
     usize index = 0;
     for (const Function& f : program.functions) {
-        units[index++ % tus] += lift_function(image, f, symbols[f.entry], symbols, options);
+        units[index++ % tus] += lift_function(image, f, symbols[f.entry], symbols, sums, options);
         result.stats.instructions += f.insns.size();
         result.stats.labels += f.labels.size();
     }

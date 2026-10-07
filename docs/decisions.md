@@ -4776,6 +4776,29 @@ between shuffles. The lifted code converted each lane through double precision i
 - History: D-127 had the same form, withdrawn with the rest of D-127 in D-131 when the EDGE/GFX chain stopped on the
   iPhone; D-138 later saw the same stops without D-127 (something writes over the chain's descriptors).
 
+## D-216 · 2026-10-07 · D-127's call saves again: a call stores and reloads only what the callee can touch
+
+Run 134's profile of GTA V: calls (brsl) were 13.5% of the SPU samples and the lines with no instruction (function
+entry loads, exit stores) 22%. Each direct call stored every register the caller writes and reloaded every one it
+uses, up to 127 of each. D-127 had made a call store only what the caller wrote of what the callee (and its callees)
+may touch, and reload only what it uses of what they may write, with each caller storing the rest when the callee
+leaves for the run loop; D-131 withdrew it with D-127's other changes when the EDGE/GFX chain stopped on the iPhone,
+"until a check of the game's own translated functions against the interpreter finds what differs". D-138 saw the
+same stops later without D-127 (something writes over the chain's descriptors), and that check now exists (D-132).
+
+- The same rules, ported to today's lifter: a function's summary is what it and its callees use and write, to a fixed
+  point; a stop or a call through a register (bisl) makes it everything. Other ways out (an absolute call in
+  relocatable code, an indirect jump that is not the function's own label) leave for the run loop and store
+  everything, as before. Reviewed again: the callee's entry loads come from ctx, which holds every register the
+  caller wrote that the callee may read; the caller's other registers stay in its locals until it calls again or
+  leaves; a callee that leaves has each caller up the chain store the rest.
+- Checked: the program-level fuzz test of D-127 (registers kept across a call that does not touch them, read and
+  written by the callee, written two calls deep, across a call that leaves for the run loop and comes back), and
+  spu-check over all 150 of GTA V's programs (5,002 trials of its own functions against the interpreter, no
+  difference). The gate passes.
+- Measured (run 136, GTA V's walk, 60-90 s): the main SPU threads 7.62 to 7.33 s of CPU per 5 s, the audio SPU 1.88
+  to 1.73, the process 13.0 to 12.4. What is left: each function's own loads at entry and stores at exit.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
