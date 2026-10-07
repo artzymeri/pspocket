@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <set>
 #include <thread>
 
 namespace pspocket::codegen {
@@ -314,6 +315,21 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
         return result;
     }
     result.ok = true;
+    // Objects this build neither compiled nor kept are from earlier builds of other sources or settings (a re-preparation
+    // after the game met new SPU programs, a translator change): nothing links them again, and on the phone they fill
+    // its storage (D-227). Only .o files of the object folder; what it links is kept.
+    {
+        std::set<fs::path> used;
+        for (const std::string& o : all) used.insert(fs::path(o).lexically_normal());
+        for (const auto& e : fs::directory_iterator(options.object_dir, ec)) {
+            if (!e.is_regular_file(ec) || e.path().extension() != ".o" || used.contains(e.path().lexically_normal())) continue;
+            const auto bytes = e.file_size(ec);
+            if (fs::remove(e.path(), ec)) {
+                result.removed++;
+                result.removed_bytes += bytes;
+            }
+        }
+    }
     report(BuildProgress::Phase::Done, SIZE_MAX, -1, output);
     return result;
 }

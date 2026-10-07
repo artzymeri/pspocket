@@ -115,6 +115,8 @@ struct BuildResult {
     bool ok = false;
     std::string error;
     size_t compiled = 0, reused = 0; // files compiled now, objects kept from an earlier build
+    size_t removed = 0;              // objects of earlier builds nothing links any more, deleted after the link (D-227)
+    unsigned long long removed_bytes = 0;
     double compile_seconds = 0, link_seconds = 0;
     double predicted = 0, compile_thread_seconds = 0;
     double rates[TimeLeft::kGroups] = {1.0, 1.0, 1.0}; // real seconds per predicted second, per FileKind (1: none)

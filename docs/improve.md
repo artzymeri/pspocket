@@ -306,6 +306,8 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   preparation that took 0:16: 404 of 410 files were kept from the last one, and the estimate counts them as compiled
   again.
 - **State:** the build reports the time left of the files it will compile before the first one (D-209).
+- **Done (D-227):** objects of earlier preparations nothing links any more are deleted after the link (Assassin's
+  Creed: 566 MB freed).
 - **Tests:** the timing-sensitive tests are robust now (thread report: CPU time; usleep(0): the backoff state, not
   wall time). Open: the SPU analyzer's other copies (call targets inside another function's code), per-unit
   prototypes, PGO/LTO clang, LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.

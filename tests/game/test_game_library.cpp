@@ -348,5 +348,21 @@ TEST_CASE("game library: the time left counts only the files that will compile, 
         if (again) CHECK(first->seconds_left == Catch::Approx(0.0)); // everything kept
         else CHECK(first->seconds_left > 0.0);
     }
+    // A source changed: its old object is deleted once the new one is linked, the other one kept, and what is not an
+    // object left alone (D-227: re-preparations on the phone no longer pile up objects).
+    std::ofstream(dir / "kept_1.c") << "int pspocket_kept_1(int x) { return x + 7; }\n";
+    std::ofstream(fs::path(o.object_dir) / "note.txt") << "not an object";
+    o.progress = nullptr;
+    const codegen::BuildResult changed = codegen::build_library(jobs, {}, (dir / "kept.dylib").string(), o);
+    REQUIRE(changed.ok);
+    CHECK(changed.compiled == 1);
+    CHECK(changed.reused == 1);
+    CHECK(changed.removed == 1);
+    CHECK(changed.removed_bytes > 0);
+    size_t objects = 0;
+    for (const auto& e : fs::directory_iterator(o.object_dir))
+        if (e.path().extension() == ".o") objects++;
+    CHECK(objects == 2);
+    CHECK(fs::exists(fs::path(o.object_dir) / "note.txt"));
     fs::remove_all(dir);
 }

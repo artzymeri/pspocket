@@ -5007,6 +5007,20 @@ never looked for, though the system library has found its modules' since D-191.
   sits, position independent ones relocatable, two folders lifted with the seeds of both); test_game_library.cpp (the
   inputs generation).
 
+## D-227 · 2026-10-07 · A build deletes the objects nothing links any more
+
+Each object is named by everything that makes it (source, settings, include folders), so a re-preparation keeps what is
+unchanged (D-209) and compiles the rest, but nothing ever deleted the objects of sources that changed or went: every
+time a game met new SPU programs, or the translator changed, the old objects stayed. Assassin's Creed's prepared folder
+on the Mac held 2,957 objects (637 MB) for a build of 418. On the phone that is storage gone with every update.
+
+- After a successful link, codegen::build_library deletes the .o files of its object folder that this build neither
+  compiled nor kept; other files are left alone, and nothing is deleted when the build fails.
+- Measured: Assassin's Creed prepared again in place (with D-226's executable programs): 2,545 objects deleted (566 MB),
+  the folder 637 to 89 MB, in 12 s (411 files kept, 6 compiled).
+- Test: tests/game/test_game_library.cpp (a changed source's old object deleted, the unchanged one kept, a file that is
+  not an object left).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

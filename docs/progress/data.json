@@ -1,5 +1,5 @@
 {
-  "as_of": "2026-10-07, after runs 192-207 (D-226)",
+  "as_of": "2026-10-07, after D-227",
   "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: GTA V's rare job chain stop found and fixed (D-225). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
   "checklist": [
     {
@@ -69,6 +69,11 @@
           "name": "Firmware SPU programs translated per game",
           "state": "done",
           "ref": "D-190, D-191"
+        },
+        {
+          "name": "Re-preparations free the storage of what they replace",
+          "state": "done",
+          "ref": "D-227"
         },
         {
           "name": "A game's own PRX modules translated (they run interpreted)",

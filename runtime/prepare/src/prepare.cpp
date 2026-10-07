@@ -461,6 +461,10 @@ Result prepare_game(const Options& o)
     r.link_seconds = built.link_seconds;
     r.files_compiled = built.compiled;
     r.files_kept = built.reused;
+    if (built.removed) {
+        PS_LOG_INFO(kChan, "{}: {} objects of earlier preparations deleted ({:.1f} MB)", o.title_id, built.removed,
+            static_cast<double>(built.removed_bytes) / 1e6);
+    }
     for (int k = 0; k < 3; k++) r.rates[k] = built.compiled ? built.rates[k] : o.prior_rates[k];
     if (!built.ok) return fail(built.error);
 
