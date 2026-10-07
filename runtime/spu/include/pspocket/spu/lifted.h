@@ -246,7 +246,11 @@ PSL ps_spu_vec psl_shufb(ps_spu_vec a, ps_spu_vec b, ps_spu_vec c)
     const psv_u8 cc = (psv_u8)c;
 #if defined(__aarch64__)
     const uint8x16x2_t table = {{(uint8x16_t)b, (uint8x16_t)a}};
-    const psv_u8 picked = (psv_u8)vqtbl2q_u8(table, (uint8x16_t)(~cc & 0x1F));
+    const uint8x16_t picked = vqtbl2q_u8(table, vbicq_u8(vdupq_n_u8(0x1F), (uint8x16_t)cc));
+    /* The special controls in one table lookup (D-218): (c ^ 0x80) >> 3 is 0-7 for 10xxxxxx (0x00), 8-11 for
+       110xxxxx (0xFF), 12-15 for 111xxxxx (0x80), and 16 or more for the other bytes, which tbx leaves as picked. */
+    const uint8x16_t special = {0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80};
+    return (ps_spu_vec)vqtbx1q_u8(picked, special, vshrq_n_u8(veorq_u8((uint8x16_t)cc, vdupq_n_u8(0x80)), 3));
 #else
     psv_u8 picked;
     const psv_u8 bb = (psv_u8)b, aa = (psv_u8)a;
@@ -254,13 +258,13 @@ PSL ps_spu_vec psl_shufb(ps_spu_vec a, ps_spu_vec b, ps_spu_vec c)
         const unsigned idx = 0x1Fu & ~(unsigned)cc[j];
         picked[j] = idx < 16 ? bb[idx] : aa[idx - 16];
     }
-#endif
     /* control 10xxxxxx -> 0x00, 110xxxxx -> 0xFF, 111xxxxx -> 0x80 */
     const psv_u8 special = (psv_u8)((psv_s8)cc < 0);
     const psv_u8 top3 = cc & 0xE0;
     const psv_u8 ff = (psv_u8)(top3 == 0xC0);
     const psv_u8 x80 = (psv_u8)(top3 == 0xE0) & 0x80;
     return (ps_spu_vec)((picked & ~special) | ((ff | x80) & special));
+#endif
 }
 
 /* cbd/chd/cwd/cdd and x forms: identity mask over rb bytes with an insertion slot for `size` bytes at addr */

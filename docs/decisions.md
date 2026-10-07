@@ -4814,6 +4814,19 @@ index shift down.
   to 1.57, the process 12.4 to 11.9. Since run 134 (D-215 to D-217): the main SPU threads 12% less, the audio SPU 15%
   less, the process 11% less.
 
+## D-218 · 2026-10-07 · shufb's special control bytes in one table lookup
+
+The lifted shufb picked each byte with a two-register table lookup, then made the three special control values
+(10xxxxxx gives 0x00, 110xxxxx 0xFF, 111xxxxx 0x80) with compares, masks and a select: nine NEON instructions. shufb
+was 11% of GTA V's translated SPU samples (run 137b). Now (c ^ 0x80) >> 3 indexes a 16-byte table of the special values
+for those bytes and is 16 or more for the others, which an extending table lookup (tbx) leaves as picked: five
+instructions. Other hosts keep the portable code.
+
+- Checked: the same result as the old code for 2 million random operands and for every control byte value (a scratch
+  test), the differential fuzz test with 1,000 contexts per case.
+- Measured (run 140, GTA V's walk, 60-90 s): the main SPU threads 6.95 to 6.91 s of CPU per 5 s, the audio SPU 1.57
+  to 1.55. That is within the noise between runs, but never slower; kept for fewer instructions with the same results.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
