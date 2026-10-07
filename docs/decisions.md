@@ -4759,6 +4759,20 @@ copied: with only the first laid over, the right half shows memory; a depth buff
 the buffer each time; a texture with half a target's pitch inside its memory is not laid over); D-137's tests keep the
 partial case (a texture larger than its target).
 
+## D-215 · 2026-10-07 · cflts and cfltu in NEON
+
+A profile of GTA V's prologue walk (run 134, macOS `sample`, 15 s) put 35% of the five main SPU threads' busy time in
+one geometry job (spu_dad457863220b1cc), and its hottest lines in float-to-integer conversions (`cflts $r, $a, 173`)
+between shuffles. The lifted code converted each lane through double precision in scalar code.
+
+- When the scale 2^(173 - I8) is a normal float (I8 from 47 to 255, 173 the common plain conversion), the lanes are
+  multiplied by it (exact, or past the integer range) and converted with FCVTZS/FCVTZU, which truncate and saturate as
+  the SPU does. The SPU's float range is applied around it: exponent 0 is zero, exponent 255 (infinity or NaN to the
+  host) is a huge number saturated by its sign. Other scales keep the scalar form.
+- Checked: the differential fuzz test (every lifted instruction against the interpreter, 256 encodings of each, three
+  more seeds of 200 contexts). GTA V's walk: the main SPU threads 7.93 to 7.62 s of CPU per 5 s (4%, the same
+  windows); the gate passes.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

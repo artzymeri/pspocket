@@ -497,8 +497,38 @@ PSL ps_spu_vec psl_cuflt(ps_spu_vec x, unsigned i8, int accurate)
     }
     return r;
 }
+#if defined(__aarch64__)
+/* cflts/cfltu in NEON (D-215) when the scale 2^(173 - i8) is a normal float: x times it is exact or past the integer
+ * range, and FCVTZS/FCVTZU truncate and saturate as the SPU does. The SPU's own float range: exponent 0 is zero, and
+ * exponent 255 (infinity or NaN to the host) is a huge number, saturated by its sign. GTA V's busiest geometry job
+ * converts four lanes at a time through double precision lane by lane in the scalar form (run 133's profile). */
+PSL int psl_cflt_neon_scale(unsigned i8) { return (int)i8 >= 173 - 126 && (int)i8 <= 173 + 126; }
+PSL ps_spu_vec psl_cflt_neon(ps_spu_vec x, unsigned i8, int is_signed)
+{
+    const uint32x4_t v = (uint32x4_t)x;
+    const uint32x4_t expo = vandq_u32(v, vdupq_n_u32(0x7F800000u));
+    const uint32x4_t is_zero = vceqq_u32(expo, vdupq_n_u32(0));
+    const uint32x4_t is_huge = vceqq_u32(expo, vdupq_n_u32(0x7F800000u));
+    float32x4_t f = vreinterpretq_f32_u32(v);
+    if (i8 != 173) f = vmulq_f32(f, vdupq_n_f32(ps_spu_f32((uint32_t)(127 + 173 - (int)i8) << 23)));
+    const uint32x4_t negative = vcltq_s32(vreinterpretq_s32_u32(v), vdupq_n_s32(0));
+    uint32x4_t r, huge;
+    if (is_signed) {
+        r = vreinterpretq_u32_s32(vcvtq_s32_f32(f));
+        huge = vaddq_u32(vdupq_n_u32(0x7FFFFFFFu), vshrq_n_u32(v, 31)); /* 0x7FFFFFFF, or 0x80000000 if negative */
+    } else {
+        r = vcvtq_u32_f32(f);
+        huge = vbicq_u32(vdupq_n_u32(0xFFFFFFFFu), negative); /* 0xFFFFFFFF, or 0 if negative */
+    }
+    r = vbslq_u32(is_huge, huge, r);
+    return (ps_spu_vec)vbicq_u32(r, is_zero);
+}
+#endif
 PSL ps_spu_vec psl_cflts(ps_spu_vec x, unsigned i8)
 {
+#if defined(__aarch64__)
+    if (psl_cflt_neon_scale(i8)) return psl_cflt_neon(x, i8, 1);
+#endif
     const double scale = psl_pow2(173 - (int)i8);
     ps_spu_vec r;
     for (int i = 0; i < 4; i++) {
@@ -513,6 +543,9 @@ PSL ps_spu_vec psl_cflts(ps_spu_vec x, unsigned i8)
 }
 PSL ps_spu_vec psl_cfltu(ps_spu_vec x, unsigned i8)
 {
+#if defined(__aarch64__)
+    if (psl_cflt_neon_scale(i8)) return psl_cflt_neon(x, i8, 0);
+#endif
     const double scale = psl_pow2(173 - (int)i8);
     ps_spu_vec r;
     for (int i = 0; i < 4; i++) {
