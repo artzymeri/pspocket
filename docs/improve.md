@@ -93,6 +93,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Try:** nothing needed now; keep reading the status line in every session.
 - **State:** fine.
 
+- **Seen (runs 126-127, Assassin's Creed's crowd):** the module tracker's GET observer (D-079) is 11-12% of the busy
+  SPU time: 1.6 to 3 million GETs a second at peak, 85% of them 256 bytes or less (641 on average), each testing about
+  12 runs of the 1 KB blocks it covers and cutting or dropping 1.4 of them, about 240 ns a GET (scattered reads of a
+  250 KB per-thread table). A free-slot list and run extents kept in the blocks changed nothing measurable (reverted).
+  Small GETs cannot be skipped: GTA V has real code modules of 32 to 176 bytes.
+- **Try:** record GETs in a cheap per-SPU ring and build the run holding pc only when the run loop misses lifted code
+  (resolves are rare next to GETs), with the resolved runs cached and checked against later GETs; or take a DMA list
+  as one event.
 - **Seen (runs 109 to 116):** Assassin's Creed's busiest job chain (workload 1, 14 to 15 s of SPU time per 5 s) ran
   interpreted, about 64 billion instructions per six-minute session: the prepared programs counted guessed code
   (shuffle patterns, zeros) as instructions, and a job's own writes there dropped it (D-205). Fixed: 1.5 s of SPU time
