@@ -33,9 +33,12 @@
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "guest.hpp"
@@ -152,6 +155,32 @@ u64 now_ns()
 
 std::atomic<u64> g_descriptors_changed{0};
 
+// A chain's last visits, by any SPU, for a stop's report (D-224): where pc was before and after, the commands the visit
+// read and how many jobs it took. GTA V's EDGE/GFX chain stopped on a JOB whose descriptor was already other data when
+// the chain took it (repro-edge2): the visits before show whether that command came from the list as the PPU had just
+// written it or from an older lap. Written without locks (a report reads it racily; diagnostics only).
+struct Visit {
+    u64 time_ns = 0;
+    u64 pc_before = 0, pc_after = 0;
+    std::array<u64, 8> cmds{};
+    u8 spu = 0, read = 0, jobs = 0, urgent = 0;
+    bool more = false; // it read more commands than cmds holds
+};
+struct VisitLog {
+    std::array<Visit, 64> ring{};
+    std::atomic<u32> next{0};
+};
+
+VisitLog& visit_log(u32 jc)
+{
+    static std::mutex mutex;
+    static std::unordered_map<u32, std::unique_ptr<VisitLog>> logs;
+    std::lock_guard lock(mutex);
+    auto& log = logs[jc];
+    if (!log) log = std::make_unique<VisitLog>();
+    return *log;
+}
+
 // n bytes at p + at as big-endian words, a space between them and two every 16 bytes.
 std::string words(const u8* p, u32 at, u32 n)
 {
@@ -222,7 +251,8 @@ struct CacheEntry {
 class JobChainPolicy {
 public:
     JobChainPolicy(Worker& w, u32 wid, u32 jc)
-        : w_(w), wid_(wid), jc_(jc), base_(w.sched.base), ls_(w.ls), me_(static_cast<u8>(1u << w.spu_num))
+        : w_(w), wid_(wid), jc_(jc), base_(w.sched.base), ls_(w.ls), me_(static_cast<u8>(1u << w.spu_num)),
+          visits_(visit_log(jc))
     {
     }
 
@@ -297,6 +327,9 @@ private:
     u32 jobs_run_ = 0;
     u32 job_ea_ = 0; // the descriptor of the job being loaded or run, for fatal logs
     Job job_{}; // that job, as the grab took it
+    std::vector<Job> batch_; // the jobs of the visit being run, for a stop's report
+    mutable bool reported_ = false;
+    VisitLog& visits_;
     u32 desc_ls_ = 0; // where in LS it was read
     Heap heap_;
     std::array<CacheEntry, kCacheEntries> cache_{};
@@ -324,6 +357,8 @@ private:
 void JobChainPolicy::report_descriptor(u64 cause) const
 {
     if (!job_ea_ || cause != job_ea_) return; // the error is not about the descriptor at hand
+    if (reported_) return;                     // the error path and the fatal stop both ask
+    reported_ = true;
     const u32 size = std::min<u32>(ps_read16(base_, jc_ + jc_off::sizeJobDescriptor), 0x800);
     if (job_.ea == job_ea_ && job_.check) {
         PS_LOG_ERROR(kJobChan, "  descriptor {:#x} at the grab, {:.3f} ms ago: {}", job_ea_,
@@ -357,6 +392,26 @@ void JobChainPolicy::report_descriptor(u64 cause) const
         cmds += std::format("{}{:#x}: {:016x}", cmds.empty() ? "" : ", ", at, ps_read64(base_, static_cast<u32>(at)));
     }
     PS_LOG_ERROR(kJobChan, "  commands around pc {:#x}: {}", pc, cmds);
+    // The batch this job came with: each descriptor's header at the grab and now (D-224).
+    for (const Job& j : batch_) {
+        std::array<u8, 0x30> head{};
+        const bool in_memory = descriptor_check(w_.sched.kernel, j.ea, j.size, head.data()) != 0;
+        PS_LOG_ERROR(kJobChan, "  batch job {:#x}: at the grab {} / now {}", j.ea, words(j.head.data(), 0, 0x10),
+            in_memory ? words(head.data(), 0, 0x10) : std::string("not in memory"));
+    }
+    // The chain's last visits, oldest first (D-224).
+    const u32 next = visits_.next.load(std::memory_order_relaxed), count = std::min<u32>(next, visits_.ring.size());
+    const u64 t = now_ns();
+    for (u32 k = next - count; k != next; k++) {
+        const Visit& v = visits_.ring[k % visits_.ring.size()];
+        std::string c;
+        for (u32 i = 0; i < v.read; i++) c += std::format(" {:x}", v.cmds[i]);
+        if (v.more) c += " ...";
+        // Signed: another SPU may record a visit while this prints.
+        PS_LOG_ERROR(kJobChan, "  visit {:.3f} ms ago, SPU {}: pc {:#x} -> {:#x}, {} jobs{}; read:{}",
+            static_cast<double>(static_cast<s64>(t - v.time_ns)) / 1e6, v.spu, v.pc_before, v.pc_after, v.jobs,
+            v.urgent ? " (urgent)" : "", c);
+    }
 }
 
 // A descriptor that changed between the grab and the job's start: the job runs with what memory holds now, which the
@@ -409,6 +464,7 @@ void JobChainPolicy::run()
         const bool could_take = may_take_;
         const Grab g = grab();
         if (g.exit) return;
+        batch_ = g.jobs;
         for (const Job& job : g.jobs) {
             if (!run_job(job)) return;
         }
@@ -490,6 +546,9 @@ JobChainPolicy::Grab JobChainPolicy::grab()
     }
     alignas(16) u8 before[PS_RES_LINE_SIZE];
     std::memcpy(before, line_, sizeof before);
+    Visit visit;
+    visit.pc_before = ps_read64(line_, jc_off::pc);
+    visit.spu = static_cast<u8>(w_.spu_num);
 
     // Another SPU lowered the ready count: no jobs until this SPU's next poll.
     if (ps_read8(line_, jc_off::lowered) & me_) {
@@ -527,6 +586,9 @@ JobChainPolicy::Grab JobChainPolicy::grab()
         const u32 n = std::min<u32>(16 - first, ps_read16(line_, jc_off::maxGrabbedJob));
         u64 cmds[16];
         for (u32 i = 0; i < n; i++) cmds[i] = ps_read64(cmds_line, 8 * (first + i));
+        visit.read = static_cast<u8>(std::min<u32>(n, visit.cmds.size()));
+        visit.more = n > visit.cmds.size();
+        std::copy_n(cmds, visit.read, visit.cmds.begin());
         bool list_loaded = false;
         batch(cmds, n, false, g, &list_loaded);
         // A job list just started: take from it at once.
@@ -543,6 +605,11 @@ JobChainPolicy::Grab JobChainPolicy::grab()
     }
     store_ready_count(g);
     g.changed = !g.jobs.empty() || std::memcmp(before, line_, sizeof before) != 0;
+    visit.pc_after = ps_read64(line_, jc_off::pc);
+    visit.jobs = static_cast<u8>(g.jobs.size());
+    visit.urgent = urgent_taken_ ? 1 : 0;
+    visit.time_ns = now_ns();
+    visits_.ring[visits_.next.fetch_add(1, std::memory_order_relaxed) % visits_.ring.size()] = visit;
     release();
     for (Job& job : g.jobs) note_grab(job); // after the release: the other SPUs wait for the lock, not for this
     return g;

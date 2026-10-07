@@ -4946,6 +4946,15 @@ them one at a time.
   and the SPU threads' CPU rose 5% under load; the idle Mac was unchanged. Reverted; the SPURS line is the item now
   (improve.md).
 
+## D-224 · 2026-10-07 · A job chain stop reports its batch and the chain's last visits
+
+D-222's grab snapshot showed GTA V's EDGE/GFX stops with the descriptor already other data when the chain took the job
+(repro-edge2 run 1, runs 173, 178, 179): not changed after the grab, never a descriptor for this job. To see where the
+command came from, each chain keeps its last 64 visits (by any SPU: pc before and after, the commands read, the jobs
+taken; written without locks, read only by a report), and a stop's report lists them oldest first with every job of the
+failing batch (its header at the grab and now). The report is printed once per stop (the error path and the fatal stop
+both asked). The visits of the next stop (repro-edge2 run 26) found the cause, D-225.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
