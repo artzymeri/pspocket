@@ -1,4 +1,4 @@
-# Runs 134–137 · GTA V's SPU time, profiled: conversions, calls, byte rotates
+# Runs 134–139 · GTA V's SPU time, profiled: conversions, calls, byte rotates
 
 2026-10-07 morning · pspocket-boot with GTA V's built-in translation (PPU re-lifted on 2026-10-07, SPU programs as
 noted) · M4 Mac · GTA V's prologue walk (`games/gta5/walk-prologue.txt`, 128 s, Metal), macOS `sample` on the running
@@ -43,3 +43,17 @@ registers it uses and writes).
 
 D-217 (byte rotates) was checked the same way: fuzz, spu-check over all 150 programs (5,002 trials, no difference), the
 gate. All three together: the main SPU threads 12% less CPU, the audio SPU 15% less, the process 11% less.
+
+## Run 138: inlining small leaves, not kept
+
+Inlining leaf helpers of up to 32 instructions into their callers (the fuzz tests passed): GTA V's main SPU threads
+6.98 to 6.97 s per 5 s, nothing. Since D-216 such a call stores and loads only a few registers. Reverted. A second
+profile after D-217 (run 137b): untagged code (the C compiler's own spills of SPU registers it cannot keep in 32 NEON
+registers) 14%, shufb 11%, calls 9.5%, function entry loads 9.4%, quadword loads 12%, fma 4.6%.
+
+## Run 139: Assassin's Creed with D-215 to D-217
+
+Prepared again (157 s, all files: the SPU header changed), the training walk to the crowd: the five SPU threads 15.0
+to 13.9 s of CPU per 5 s (-7.6%), the process 22.1 to 20.9, 33 fps; nothing interpreted beyond the module's 184
+instructions, nothing unimplemented. spu-check on its prepared library (22 programs, 1,446 trials): no difference.
+
