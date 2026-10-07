@@ -313,7 +313,8 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Ruled out (D-222, runs 150-152):** the game rewriting a descriptor between our grab and the job's start (we read
   descriptors later than libsre does): 0 changes to what a job uses in 300 s of GTA V. A stop's report now includes the
   descriptor as it was at the grab.
-- **Try next:** walks in a loop (under load, as run2-3) until a stop is caught with the grab snapshot; if the descriptor
-  was already broken when taken, log the chain's command list over time (which lap wrote that JOB command) and the
-  PPU's command-buffer allocations around the slot.
-- **State:** open; it stands between GTA V and an hour without a stop (the Flawless bar).
+- **Found (D-224, D-225, repro-edge2 run 26):** with the chain's last visits in the report: a job's 8-byte PUT
+  turning an END into a jump-to-self was written word by word (D-124's first word last), and the chain read the low
+  word alone, 0x12, a light sync, then the previous lap's commands. A PUT now writes its first eight bytes in one store.
+- **State:** fixed (D-225): 0 stops in 11 loaded walks where 3 in 10 stopped before. Confirm on the iPhone (run 100's
+  stop came after 110 s there).

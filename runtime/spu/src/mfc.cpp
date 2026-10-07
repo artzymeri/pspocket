@@ -255,14 +255,19 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
     if (cmd == PS_MFC_SDCRZ) {
         std::memset(mem, 0, size);
     } else if (!is_get(cmd) && size > 4) {
-        // The first word last, as a release store (D-124). GTA V's graphics jobs write each block of RSX commands with
-        // one PUT, from 16 bytes to 4.5 KB, over the jump-to-self the RSX is parked on: the block's first word. A plain
-        // copy's stores can reach another core in any order, and the RSX, seeing that word change, read on into words
-        // not written yet (the iPhone's FIFO desyncs, several a minute in the first mission's escape).
-        ls_copy(ctx->ls, lsa + 4, mem + 4, size - 4, false);
-        u32 head; // its bytes as they are
-        std::memcpy(&head, ctx->ls + (lsa & PS_SPU_LS_MASK), 4);
-        __atomic_store_n(reinterpret_cast<u32*>(mem), head, __ATOMIC_RELEASE);
+        // The first doubleword last, as one release store (D-124, D-225). GTA V's graphics jobs write each block of RSX
+        // commands with one PUT, from 16 bytes to 4.5 KB, over the jump-to-self the RSX is parked on: the block's first
+        // word. A plain copy's stores can reach another core in any order, and the RSX, seeing that word change, read on
+        // into words not written yet (the iPhone's FIFO desyncs, several a minute in the first mission's escape).
+        // The first 8 bytes go in one store, not as two words: an aligned 8-byte DMA lands whole on the Cell, and GTA V's
+        // jobs write job chain commands with 8-byte PUTs. Written word by word, a jump-to-self (0x00000008_00000012) over
+        // an END showed its low word alone for a moment, 0x12, a light sync; the job chain passed it and ran the previous
+        // lap's commands, whose descriptors the game had reused (the EDGE/GFX stops since D-124: D-130, D-138, runs 095,
+        // 100, repro-edge, runs 173-179).
+        if (size > 8) ls_copy(ctx->ls, lsa + 8, mem + 8, size - 8, false);
+        u64 head; // its bytes as they are
+        std::memcpy(&head, ctx->ls + (lsa & PS_SPU_LS_MASK), 8);
+        __atomic_store_n(reinterpret_cast<u64*>(mem), head, __ATOMIC_RELEASE);
     } else {
         ls_copy(ctx->ls, lsa, mem, size, is_get(cmd));
         if (is_get(cmd)) {

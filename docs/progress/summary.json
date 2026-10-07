@@ -1,5 +1,5 @@
 {
-  "engine_percent": 68.3,
+  "engine_percent": 70.8,
   "libraries": {
     "own": 1719,
     "answered_as_rpcs3": 290,
@@ -23,12 +23,12 @@
     "Translating on the iPhone (route B)": 75,
     "PPU code (the main processor)": 80,
     "SPU code (the six co-processors)": 67,
-    "SPURS and the kernel": 50,
+    "SPURS and the kernel": 75,
     "Graphics (RSX to Metal)": 61,
     "Sound": 50,
     "Video and images": 60,
     "System services": 80,
-    "Speed and stability on the iPhone": 50
+    "Speed and stability on the iPhone": 60
   },
   "games": {
     "BLES01807": "Playable",

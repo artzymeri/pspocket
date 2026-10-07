@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-07, after runs 142-149 and D-220 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). **A new
+2026-10-07, after runs 172-191 and D-225 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). **A new
 session: read `docs/handoff.md` first** (what was in flight, the user's rules, commands), then this file, `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -180,6 +180,12 @@ cflts in NEON (D-215), calls saving only what the callee touches (D-216), byte r
 threads 12% less CPU, the audio SPU 15% less. Then each function's own register loads and stores (D-219: the main
 SPU threads -6%, the audio SPU -11%; Assassin's Creed's crowd -7.7%) and the module tracker by line owners (D-220:
 Assassin's Creed's crowd SPU threads -12%, runs 142-149).
+
+**GTA V's EDGE/GFX job chain stop, found (runs 150-191, D-222 to D-225).** The stop that had halted GTA V's geometry
+now and then since 2026-10-05 (the iPhone after 110 s in run 100; the Mac about once in ten walks under load) was an
+8-byte job chain command written by an SPU job's PUT word by word (D-124's first word last): the chain read a
+jump-to-self's low word alone, a light sync, and ran the previous lap's commands. A PUT's first eight bytes now land in
+one store: 0 stops in 11 loaded walks, 3 in 10 before. Also: the module tracker's scan in NEON (D-223).
 
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,

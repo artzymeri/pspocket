@@ -1,6 +1,6 @@
 {
-  "as_of": "2026-10-07, after runs 157-171 (D-223)",
-  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac; nothing is Flawless yet: the iPhone is too slow in heavy scenes and GTA V's EDGE job chain stops now and then.",
+  "as_of": "2026-10-07, after runs 172-191 (D-225)",
+  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: GTA V's rare job chain stop found and fixed (D-225). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
   "checklist": [
     {
       "area": "Reading any PS3 disc on the iPhone",
@@ -167,8 +167,8 @@
         },
         {
           "name": "GTA V's EDGE job chain never stops on a reused descriptor",
-          "state": "todo",
-          "ref": "improve.md Stability"
+          "state": "done",
+          "ref": "D-225 (runs 172-191; to confirm on the phone)"
         }
       ]
     },
@@ -332,8 +332,8 @@
         },
         {
           "name": "An hour without a crash",
-          "state": "todo",
-          "ref": "improve.md Stability"
+          "state": "partial",
+          "ref": "D-225 fixed the EDGE stop; an hour on the phone not yet tried"
         }
       ]
     }

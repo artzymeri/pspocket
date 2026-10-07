@@ -4955,6 +4955,30 @@ taken; written without locks, read only by a report), and a stop's report lists 
 failing batch (its header at the grab and now). The report is printed once per stop (the error path and the fatal stop
 both asked). The visits of the next stop (repro-edge2 run 26) found the cause, D-225.
 
+## D-225 · 2026-10-07 · An SPU PUT writes its first eight bytes in one store
+
+The visits before repro-edge2 run 26's stop: the chain waited on an END at 0x1074ca00, the game appended a JOB there and
+a new END at 0x1074ca08, then rewrote that END: a visit read it as **0x00000000_00000012**, a light sync, passed it
+(no jobs in flight) and took the next four commands, the previous lap's, whose descriptors the game had long reused
+(garbage, floats, zeros; only the fourth still held a whole descriptor). Memory a moment later:
+0x1074ca08 a JOB, 0x1074ca10 an END. The game had been turning the END into a jump-to-self (0x00000008_00000012),
+written by an SPU job with an 8-byte PUT, and D-124 writes every PUT longer than a word with its first word last: the
+low word (0x12) first, alone in memory until the high word (0x8) landed. On the Cell an aligned 8-byte DMA lands whole.
+Under load the SPU thread can be preempted between the two stores, which is why the stop needed a busy machine (the
+iPhone always is) and why it came about once in ten walks under load since D-124.
+
+- **The fix:** a PUT longer than four bytes copies all but its first eight bytes, then stores those eight with one
+  release store. D-124's purpose holds (the RSX parked on a block's first word sees the block whole once that word
+  changes) and no command of eight bytes can be seen half written.
+- D-125 saw the other half of the same tearing (a JTS turning into a JOB showing 0x00000008_<job EA>) and blamed the
+  PPU; its wait on the JTS bit stays as a net.
+- Test: tests/spu/test_interp_branch_mem.cpp, one thread PUTs a JTS and an END alternately into a doubleword, another
+  reads it whole: without the fix it sees halves (3 of 3 runs), with it never.
+- Measured: GTA V's walk under a load of six spinning threads, where it had stopped in 3 of 10 walks (repro-edge2 run 1,
+  runs 178, repro-edge2 run 26): 0 stops in 11 walks of 150 s (repro-edge2 runs 41-51; run 40 was cut short, the Mac
+  apparently asleep). The gate passes. An adversarial review (four lenses, two refuters per finding) found nothing that stood;
+  the test now waits for its reader and checks every PUT landed.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -3,6 +3,9 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <atomic>
+#include <thread>
+
 #include "pspocket/recomp/spu/asm.hpp"
 #include "spu_test_util.hpp"
 
@@ -273,4 +276,42 @@ TEST_CASE("run loop: a loop with a call, executed by ps_spu_interpret")
 
     m.ctx.pc = 0x100;
     CHECK(ps_spu_interpret(&m.ctx, 5) == PS_SPU_STOP_LIMIT);
+}
+
+TEST_CASE("MFC: an 8-byte PUT lands whole: another core never sees half of it")
+{
+    // Regression (D-225): GTA V's jobs write job chain commands with 8-byte PUTs. Written word by word (D-124's first
+    // word last), a jump-to-self 0x00000008_00000012 over an END 0x00000000_0000007f showed 0x00000000_00000012, a light
+    // sync, and the chain ran on into the previous lap's commands.
+    Machine m(true);
+    REQUIRE(m.mem.commit(0x10000, 0x10000));
+    constexpr u64 kJts = 0x0000000800000012ull, kEnd = 0x000000000000007Full;
+    ps_st64(m.ls.data() + 0x100, kJts);
+    ps_st64(m.ls.data() + 0x110, kEnd);
+    ps_st64(m.mem.base() + 0x10000, kEnd);
+    std::atomic<bool> stop{false};
+    std::atomic<u64> torn{0}, reads{0}, refused{0};
+    std::thread reader([&] {
+        const u64* slot = reinterpret_cast<const u64*>(m.mem.base() + 0x10000);
+        while (!stop.load(std::memory_order_relaxed)) {
+            const u64 v = ps_bswap64(__atomic_load_n(slot, __ATOMIC_ACQUIRE));
+            if (v != kJts && v != kEnd) torn.fetch_add(1, std::memory_order_relaxed);
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    while (reads.load(std::memory_order_relaxed) == 0) std::this_thread::yield(); // the reader is running
+    for (u32 i = 0; i < 200000; i++) {
+        u32 r = ps_spu_wrch(&m.ctx, 0, PS_MFC_LSA, i & 1 ? 0x110 : 0x100);
+        r |= ps_spu_wrch(&m.ctx, 0, PS_MFC_EAH, 0);
+        r |= ps_spu_wrch(&m.ctx, 0, PS_MFC_EAL, 0x10000);
+        r |= ps_spu_wrch(&m.ctx, 0, PS_MFC_Size, 8);
+        r |= ps_spu_wrch(&m.ctx, 0, PS_MFC_TagID, 1);
+        r |= ps_spu_wrch(&m.ctx, 0, PS_MFC_Cmd, PS_MFC_PUT);
+        if (r) refused.fetch_add(1, std::memory_order_relaxed);
+    }
+    stop = true;
+    reader.join();
+    CHECK(refused.load() == 0);
+    CHECK(ps_ld64(m.mem.base() + 0x10000) == kEnd); // the last PUT (i odd: the END) landed
+    CHECK(torn.load() == 0);
 }
