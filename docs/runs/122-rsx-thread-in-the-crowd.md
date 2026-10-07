@@ -1,4 +1,4 @@
-# Runs 122–125 · The RSX thread in Assassin's Creed's crowd
+# Runs 122–129 · CPU time in Assassin's Creed's crowd: the RSX thread, the SPU tracker, the fiber switches
 
 2026-10-07 · pspocket-boot with the Metal backend · M4 Mac · Assassin's Creed (BLES00158), `games/ac1/walk-training.txt`
 (600 to 620 s) to the training's "Gentle Push" lesson: a crowd of dozens of animated people, 1,700 to 2,200 draws a
@@ -40,3 +40,27 @@ threshold of 25), the third just after the scene cut the walk always has. The sa
 game step again: **PASS** (inventory/gate/20261007-024742-787e5ee): 29.8 fps median, 29.6 in the slowest window, 2
 frame jumps, 23.9 GPU ms per frame at worst, **write faults per frame 0.0 (40.6 before)**, 991 MB at peak, no new
 warning shapes.
+
+## The SPU threads (runs 126–127): the module tracker, not changed
+
+The five SPU threads of the crowd use about 3.5 cores; their profile puts the module tracker's GET observer (D-079)
+at 11-12% of their busy time. A counting build (run 127's walk) found why: 1.6 to 3 million GETs a second at peak, 85%
+of them 256 bytes or less, each testing about 12 runs and cutting or dropping 1.4, about 240 ns each. A free-slot list
+(run 126) and run extents kept in the blocks (run 127) changed nothing measurable, and were reverted. GTA V has code
+modules of 32 to 176 bytes, so small GETs cannot be skipped; the way on is in improve.md (a lazy ring of GETs).
+
+## The fiber switches (runs 128–129, D-213)
+
+Run 128 (a longer walk, `games/ac1/walk-training2.txt`, 690 s): 8.1 million fiber switches through the interpreter
+(about 12,000 a second in the later scenes). The profile of the PPU task threads in the crowd: most of their time in
+the C++ unwinder (dyld's image lookup per frame, the unwinder's lock contended by the two threads), from the exception
+D-161 throws for each switch. D-213 goes back with _longjmp instead:
+
+| | runs 125 and 127 | run 129 |
+|---|---|---|
+| the task threads, CPU s per 5 s | 5.45 | **1.89** |
+| the whole process, CPU s per 5 s | 27.4–28.3 | **20.8** |
+| fps | 29.8–31.2 | 33.7 |
+
+The gate after D-213 (f810feb): **PASS**, 29.8 fps median and in the slowest window, 2 frame jumps, write faults 0.
+
