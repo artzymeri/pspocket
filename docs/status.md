@@ -1,7 +1,7 @@
 # Where pspocket stands
 
-2026-10-07, after run 137 and D-217 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
-first in a new session, then `CLAUDE.md`,
+2026-10-07, after run 141 and D-219 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). **A new
+session: read `docs/handoff.md` first** (what was in flight, the user's rules, commands), then this file, `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
 `docs/improve.md`; how each game stands against the "Flawless" bar is `docs/compatibility.md` (both updated after every
