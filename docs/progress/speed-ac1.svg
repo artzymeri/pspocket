@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="260" viewBox="0 0 440 260" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="440" height="260" fill="#ffffff"/>
+<text x="4" y="18" font-size="13.5" font-weight="600" fill="#24292f">Assassin&#x27;s Creed&#x27;s crowd on the Mac: CPU per 5 s and fps</text>
+<line x1="46" x2="428" y1="226.0" y2="226.0" stroke="#eaeef2"/>
+<text x="40" y="230.0" font-size="10" text-anchor="end" fill="#57606a">0</text>
+<line x1="46" x2="428" y1="182.5" y2="182.5" stroke="#eaeef2"/>
+<text x="40" y="186.5" font-size="10" text-anchor="end" fill="#57606a">11</text>
+<line x1="46" x2="428" y1="139.0" y2="139.0" stroke="#eaeef2"/>
+<text x="40" y="143.0" font-size="10" text-anchor="end" fill="#57606a">21</text>
+<line x1="46" x2="428" y1="95.5" y2="95.5" stroke="#eaeef2"/>
+<text x="40" y="99.5" font-size="10" text-anchor="end" fill="#57606a">32</text>
+<line x1="46" x2="428" y1="52.0" y2="52.0" stroke="#eaeef2"/>
+<text x="40" y="56.0" font-size="10" text-anchor="end" fill="#57606a">43</text>
+<text x="46" y="252" font-size="10" fill="#57606a">run 121</text>
+<text x="428" y="252" font-size="10" text-anchor="end" fill="#57606a">run 143</text>
+<text x="237.0" y="252" font-size="10" text-anchor="middle" fill="#57606a">CPU seconds per 5 s / fps</text>
+<path d="M115.5,112.7 L184.9,141.4 L358.5,141.0 L410.6,144.0 L428.0,150.6" fill="none" stroke="#0969da" stroke-width="2"/>
+<circle cx="115.5" cy="112.7" r="2.6" fill="#0969da"><title>run 125: 27.85</title></circle>
+<circle cx="184.9" cy="141.4" r="2.6" fill="#0969da"><title>run 129: 20.8</title></circle>
+<circle cx="358.5" cy="141.0" r="2.6" fill="#0969da"><title>run 139: 20.9</title></circle>
+<circle cx="410.6" cy="144.0" r="2.6" fill="#0969da"><title>run 142: 20.16</title></circle>
+<circle cx="428.0" cy="150.6" r="2.6" fill="#0969da"><title>run 143: 18.54</title></circle>
+<rect x="50" y="30" width="10" height="3" fill="#0969da"/>
+<text x="64" y="34" font-size="10" fill="#24292f">whole process</text>
+<path d="M358.5,169.5 L410.6,172.5 L428.0,178.9" fill="none" stroke="#8250df" stroke-width="2"/>
+<circle cx="358.5" cy="169.5" r="2.6" fill="#8250df"><title>run 139: 13.9</title></circle>
+<circle cx="410.6" cy="172.5" r="2.6" fill="#8250df"><title>run 142: 13.16</title></circle>
+<circle cx="428.0" cy="178.9" r="2.6" fill="#8250df"><title>run 143: 11.59</title></circle>
+<rect x="146" y="30" width="10" height="3" fill="#8250df"/>
+<text x="160" y="34" font-size="10" fill="#24292f">5 SPU threads</text>
+<path d="M46.0,116.2 L115.5,99.5 L184.9,88.9 L358.5,91.8 L410.6,91.4 L428.0,74.7" fill="none" stroke="#2da44e" stroke-width="2"/>
+<circle cx="46.0" cy="116.2" r="2.6" fill="#2da44e"><title>run 121: 27.0</title></circle>
+<circle cx="115.5" cy="99.5" r="2.6" fill="#2da44e"><title>run 125: 31.1</title></circle>
+<circle cx="184.9" cy="88.9" r="2.6" fill="#2da44e"><title>run 129: 33.7</title></circle>
+<circle cx="358.5" cy="91.8" r="2.6" fill="#2da44e"><title>run 139: 33.0</title></circle>
+<circle cx="410.6" cy="91.4" r="2.6" fill="#2da44e"><title>run 142: 33.1</title></circle>
+<circle cx="428.0" cy="74.7" r="2.6" fill="#2da44e"><title>run 143: 37.2</title></circle>
+<rect x="242" y="30" width="10" height="3" fill="#2da44e"/>
+<text x="256" y="34" font-size="10" fill="#24292f">fps</text>
+</svg>

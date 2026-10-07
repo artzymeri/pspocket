@@ -4889,6 +4889,26 @@ far less), the same modules lifted, none interpreted; the gate passes.
 Tests: tests/hle/test_spu_programs.cpp (data into a module's middle leaves its code part lifted; the module still known
 after 10,000 copies elsewhere, more than the tracker has slots; D-204's and D-206's cases unchanged).
 
+## D-221 · 2026-10-07 · Progress is counted from the code and shown in the README on every push
+
+The user asked for a table of how far each part of the engine is, as percentages, with diagrams, updated after every run
+and on every push, like boykopovar/AnyPS5's README (its badges count implemented system functions and GPU shader
+instructions against the known ones, with a map of every function). scripts/progress.py writes docs/progress/ and the
+README's Status section; the GitHub description gets the headline numbers.
+
+- **Counted, never estimated:** system library functions pspocket implements itself (`pspocket-boot --hle-list`)
+  against every function and variable RPCS3 registers (nids.txt: 6,625 in 148 libraries), with RPCS3's stub answers
+  apart; kernel calls (PS_LV2_BIND) and the ones answered as RPCS3 answers them, against RPCS3's 634; PPU and SPU
+  instructions the translators handle (every one fuzz-checked against the interpreter) against the instruction tables.
+  First count: libraries 1,719 own and 290 stub answers of 6,625 (the C library, libm and libstdc++ are 2,756 of the
+  rest: the PS3 firmware's own, translated, serves them); kernel 219 own and 271 answered of 634; PPU 380 of 382
+  instructions (eciwx and ecowx left out), SPU 194 of 199 (the ISA 1.2 double compares the Cell's SPUs do not have).
+- **A checklist for what cannot be counted** (docs/progress/data.json): ten areas from reading discs to speed and
+  stability on the iPhone, each item done, partial or to do, with the decision or run behind it; the games against the
+  Flawless bar; speed charts from runs measured the same way.
+- The engine percentage is the plain mean of the four counted parts and the ten areas (68% today). It is a guide, not a
+  promise: nothing is Flawless until a game meets docs/compatibility.md's bar on the iPhone.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-07, after run 141 and D-219 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). **A new
+2026-10-07, after runs 142-149 and D-220 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). **A new
 session: read `docs/handoff.md` first** (what was in flight, the user's rules, commands), then this file, `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -177,7 +177,14 @@ it (and copies nothing when they cover it): the shadows are there now, and the l
 samples, cflts 8.5%, byte rotates 5%. D-127's three changes, withdrawn on 2026-10-05 for stops seen later without them,
 are back one by one, each checked with spu-check over all 150 of GTA V's programs (no difference) and the gate:
 cflts in NEON (D-215), calls saving only what the callee touches (D-216), byte rotates in NEON (D-217). The main SPU
-threads 12% less CPU, the audio SPU 15% less. Next there: each function's own register loads and stores.
+threads 12% less CPU, the audio SPU 15% less. Then each function's own register loads and stores (D-219: the main
+SPU threads -6%, the audio SPU -11%; Assassin's Creed's crowd -7.7%) and the module tracker by line owners (D-220:
+Assassin's Creed's crowd SPU threads -12%, runs 142-149).
+
+**Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
+shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,
+kernel calls, PPU and SPU instructions translated and fuzz-checked, a checklist per area (each item with its decision)
+and the games against the Flawless bar.
 
 Next: the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then

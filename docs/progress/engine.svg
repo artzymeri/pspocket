@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="294" viewBox="0 0 900 294" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="900" height="294" fill="#ffffff"/>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">The engine, part by part (checklist in docs/progress/data.json)</text>
+<text x="4" y="47" font-size="12.5" fill="#24292f">Reading any PS3 disc on the iPhone</text>
+<rect x="300" y="35" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="35" width="441.7" height="16" rx="3" fill="#57ab5a"/>
+<text x="838" y="47" font-size="12.5" fill="#24292f">83%  (5/6 done)</text>
+<text x="4" y="73" font-size="12.5" fill="#24292f">Translating on the iPhone (route B)</text>
+<rect x="300" y="61" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="61" width="397.5" height="16" rx="3" fill="#57ab5a"/>
+<text x="838" y="73" font-size="12.5" fill="#24292f">75%  (6/8 done)</text>
+<text x="4" y="99" font-size="12.5" fill="#24292f">PPU code (the main processor)</text>
+<rect x="300" y="87" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="87" width="424.0" height="16" rx="3" fill="#57ab5a"/>
+<text x="838" y="99" font-size="12.5" fill="#24292f">80%  (3/5 done)</text>
+<text x="4" y="125" font-size="12.5" fill="#24292f">SPU code (the six co-processors)</text>
+<rect x="300" y="113" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="113" width="353.3" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="125" font-size="12.5" fill="#24292f">67%  (3/6 done)</text>
+<text x="4" y="151" font-size="12.5" fill="#24292f">SPURS and the kernel</text>
+<rect x="300" y="139" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="139" width="265.0" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="151" font-size="12.5" fill="#24292f">50%  (2/4 done)</text>
+<text x="4" y="177" font-size="12.5" fill="#24292f">Graphics (RSX to Metal)</text>
+<rect x="300" y="165" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="165" width="323.9" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="177" font-size="12.5" fill="#24292f">61%  (5/9 done)</text>
+<text x="4" y="203" font-size="12.5" fill="#24292f">Sound</text>
+<rect x="300" y="191" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="191" width="265.0" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="203" font-size="12.5" fill="#24292f">50%  (2/4 done)</text>
+<text x="4" y="229" font-size="12.5" fill="#24292f">Video and images</text>
+<rect x="300" y="217" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="217" width="318.0" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="229" font-size="12.5" fill="#24292f">60%  (3/5 done)</text>
+<text x="4" y="255" font-size="12.5" fill="#24292f">System services</text>
+<rect x="300" y="243" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="243" width="424.0" height="16" rx="3" fill="#57ab5a"/>
+<text x="838" y="255" font-size="12.5" fill="#24292f">80%  (4/5 done)</text>
+<text x="4" y="281" font-size="12.5" fill="#24292f">Speed and stability on the iPhone</text>
+<rect x="300" y="269" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="269" width="265.0" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="281" font-size="12.5" fill="#24292f">50%  (2/5 done)</text>
+</svg>

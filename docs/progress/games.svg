@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="112" viewBox="0 0 900 112" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="900" height="112" fill="#ffffff"/>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">Games against the Flawless bar (docs/compatibility.md)</text>
+<text x="4" y="47" font-size="12.5" fill="#24292f">Grand Theft Auto V (BLES01807)</text>
+<rect x="300" y="35" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="35" width="349.8" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="47" font-size="12.5" fill="#24292f">Playable</text>
+<text x="4" y="73" font-size="12.5" fill="#24292f">Assassin&#x27;s Creed (BLES00158)</text>
+<rect x="300" y="61" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="61" width="174.9" height="16" rx="3" fill="#cf222e"/>
+<text x="838" y="73" font-size="12.5" fill="#24292f">Boots</text>
+<text x="4" y="99" font-size="12.5" fill="#24292f">L.A. Noire (BLES00933)</text>
+<rect x="300" y="87" width="530" height="16" rx="3" fill="#e6e8eb"/>
+<rect x="300" y="87" width="0.0" height="16" rx="3" fill="#cf222e"/>
+<text x="838" y="99" font-size="12.5" fill="#24292f">Broken</text>
+</svg>
