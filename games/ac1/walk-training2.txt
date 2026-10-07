@@ -1,0 +1,9 @@
+# Assassin's Creed (BLES00158): walk-training.txt to the "Gentle Push" lesson, then answer it (Circle held while
+# walking to the marker) and go on through the next lessons: walk, turn, Cross, Triangle, R1 held (run 128).
+start@60 start@75 cross@100 start@130 cross@160 cross@200 cross@240 cross@280
+left@292 left@296 cross@300 cross@310 cross@325 cross@345
+ls-up@440:6 rs-right@447:2 ls-up@450:6 triangle@458:3 ls-up@462:5 cross@468:3 ls-up@468:3
+circle@473 ls-up@475:4 square@480 r1@484:6 ls-up@484:6 ls-left@491:2 ls-up@494:8 cross@503 select@506 start@510
+cross@514 ls-up@518:10 rs-left@529:2 ls-up@532:10 triangle@543:2 ls-down@546:4 ls-up@551:10
+circle@565:15 ls-up@565:15 ls-left@581:2 circle@584:12 ls-up@584:12 cross@598 ls-up@600:10 rs-right@611:2
+ls-up@614:12 cross@628 triangle@631:3 r1@636:10 ls-up@636:10 cross@648 ls-up@651:12 circle@664:8 ls-up@664:8
