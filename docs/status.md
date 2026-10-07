@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-07, after run 119 and D-209 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-07, after run 125 and D-211 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -162,6 +162,13 @@ With the GPU drawing, the walk's median went from 29 to 51 fps, the lab from 28-
 interpreted share is now counted (D-207): in Assassin's Creed only its fiber resumes, about 14 instructions each, under
 1% of a core (run 118). "Time left" no longer counts the files a preparation keeps (D-209). Open: one GPU command
 reader desync (run 113, not seen since).
+
+**Assassin's Creed in play (runs 120-125).** A walk that picks a memory in the Animus DNA timeline reaches the training:
+Altaïr walks, the pause menu works, the "Gentle Push" lesson fills the Animus with a crowd (2,000 draws a frame). Profiled
+there with macOS `sample`: the RSX thread re-decoded shader programs the game uploads again before every draw (D-210),
+copied interleaved vertex data once per attribute and took a write fault per draw on fragment program constants
+(D-211). Now about 11.3 µs per draw (13.0 before), the crowd at 30-32 fps (25-29), no write faults (GTA V's 40 a frame
+to 0 too; the gate passes).
 
 Next: the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
