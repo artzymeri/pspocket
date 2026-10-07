@@ -113,11 +113,52 @@ const char* job_error_name(u32 code)
     }
 }
 
-// A job taken from the chain: its descriptor's EA and size.
+// A job taken from the chain: its descriptor's EA and size, and what the descriptor held when it was taken.
 struct Job {
     u64 ea = 0;
     u32 size = 0;
+    u64 check = 0;      // a hash of the descriptor at the grab (0: not read)
+    u64 grabbed_ns = 0; // when
+    std::array<u8, 0x30> head{}; // its header then
 };
+
+// A job's descriptor as guest memory holds it now: the hash of what the job uses (its header, input DMA list and
+// cache list: the chain reads sizeJobDescriptor bytes, and GTA V's EDGE jobs put other jobs' output right after their
+// own 0x200), and its header into head (when given). 0 when it is not in guest memory.
+u64 descriptor_check(lv2::Kernel& kernel, u64 ea, u32 size, u8* head)
+{
+    if ((ea >> 32) || size < 0x30 || !kernel.memory().is_committed(static_cast<u32>(ea)) ||
+        !kernel.memory().is_committed(static_cast<u32>(ea + 0x2F))) {
+        return 0;
+    }
+    const u8* p = kernel.base() + static_cast<u32>(ea);
+    size = std::min<u32>(std::min<u32>(size, 0x30 + ps_ld16(p + 0x0A) + ps_ld32(p + 0x24)), 0x800) & ~7u;
+    if (!kernel.memory().is_committed(static_cast<u32>(ea + size - 1))) return 0;
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 i = 0; i < size; i += 8) {
+        u64 w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+    }
+    if (head) std::memcpy(head, p, 0x30);
+    return h | 1;
+}
+
+u64 now_ns()
+{
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::atomic<u64> g_descriptors_changed{0};
+
+// n bytes at p + at as big-endian words, a space between them and two every 16 bytes.
+std::string words(const u8* p, u32 at, u32 n)
+{
+    std::string s;
+    for (u32 off = 0; off < n; off += 4) s += std::format("{}{:08x}", off == 0 ? "" : off % 16 ? " " : "  ", ps_ld32(p + at + off));
+    return s;
+}
 
 // libsre's job heap: whole 1 KB pages from 0x4C00 up to the descriptor buffers, best fit among the gaps (the lowest
 // address among equal gaps).
@@ -204,6 +245,12 @@ private:
     bool guard(u64 ea, Grab& g);
     void release_guard_wait();
     void take_from_list(u32 slot, Grab& g);
+    void note_grab(Job& job) const
+    {
+        job.check = descriptor_check(w_.sched.kernel, job.ea, job.size, job.head.data());
+        job.grabbed_ns = now_ns();
+    }
+    void check_descriptor(const Job& job) const;
     u32 list_left(u32 slot) { return ps_read32(line_, jc_off::jobLists + 16 * slot); }
     void store_ready_count(const Grab& g);
     void advance(bool urgent)
@@ -249,6 +296,7 @@ private:
     u32 sdk_ = 0;
     u32 jobs_run_ = 0;
     u32 job_ea_ = 0; // the descriptor of the job being loaded or run, for fatal logs
+    Job job_{}; // that job, as the grab took it
     u32 desc_ls_ = 0; // where in LS it was read
     Heap heap_;
     std::array<CacheEntry, kCacheEntries> cache_{};
@@ -276,12 +324,11 @@ private:
 void JobChainPolicy::report_descriptor(u64 cause) const
 {
     if (!job_ea_ || cause != job_ea_) return; // the error is not about the descriptor at hand
-    const auto words = [](u8* p, u32 at, u32 n) {
-        std::string s;
-        for (u32 off = 0; off < n; off += 4) s += std::format("{}{:08x}", off == 0 ? "" : off % 16 ? " " : "  ", ps_read32(p, at + off));
-        return s;
-    };
     const u32 size = std::min<u32>(ps_read16(base_, jc_ + jc_off::sizeJobDescriptor), 0x800);
+    if (job_.ea == job_ea_ && job_.check) {
+        PS_LOG_ERROR(kJobChan, "  descriptor {:#x} at the grab, {:.3f} ms ago: {}", job_ea_,
+            static_cast<double>(now_ns() - job_.grabbed_ns) / 1e6, words(job_.head.data(), 0, 0x30));
+    }
     PS_LOG_ERROR(kJobChan, "  descriptor {:#x} as the SPU read it: {}", job_ea_, words(ls_, desc_ls_, 0x30));
     PS_LOG_ERROR(kJobChan, "  descriptor {:#x} in memory now:      {}", job_ea_, words(base_, job_ea_, 0x30));
     std::array<ps_spu_dma_write, 12> w{};
@@ -310,6 +357,30 @@ void JobChainPolicy::report_descriptor(u64 cause) const
         cmds += std::format("{}{:#x}: {:016x}", cmds.empty() ? "" : ", ", at, ps_read64(base_, static_cast<u32>(at)));
     }
     PS_LOG_ERROR(kJobChan, "  commands around pc {:#x}: {}", pc, cmds);
+}
+
+// A descriptor that changed between the grab and the job's start: the job runs with what memory holds now, which the
+// game may have written for other work (the EDGE/GFX stops, improve.md). Counted, and the first ones logged.
+void JobChainPolicy::check_descriptor(const Job& job) const
+{
+    if (!job.check) return;
+    std::array<u8, 0x30> head{};
+    const u64 now = descriptor_check(w_.sched.kernel, job.ea, job.size, head.data());
+    if (now == job.check) return;
+    if (g_descriptors_changed.fetch_add(1, std::memory_order_relaxed) >= 20) return;
+    PS_LOG_WARN(kJobChan, "SPURS {:#x} SPU {}, job chain {:#x} (workload {}): the descriptor of job {:#x} changed between "
+        "its grab and its start, {:.3f} ms later", w_.sched.spurs, w_.spu_num, jc_, wid_, job.ea,
+        static_cast<double>(now_ns() - job.grabbed_ns) / 1e6);
+    PS_LOG_WARN(kJobChan, "  at the grab: {}", words(job.head.data(), 0, 0x30));
+    PS_LOG_WARN(kJobChan, "  at the start: {}", words(head.data(), 0, 0x30));
+    std::array<ps_spu_dma_write, 8> w{};
+    const u32 used = std::min<u32>(job.size, 0x30 + ps_ld16(job.head.data() + 0x0A) + ps_ld32(job.head.data() + 0x24));
+    const u32 n = ps_spu_dma_writes_over(static_cast<u32>(job.ea), used, w.data(), static_cast<u32>(w.size()));
+    for (u32 i = 0; i < n; i++) {
+        if (w[i].time_ns < job.grabbed_ns) continue; // newest first; older ones were there at the grab
+        PS_LOG_WARN(kJobChan, "  SPU write since the grab: {:#x} bytes at {:#x} (MFC command {:#x}, SPU pc {:#x}, tag {:#x})",
+            w[i].size, w[i].ea, w[i].cmd, w[i].pc, w[i].tag);
+    }
 }
 
 void JobChainPolicy::init()
@@ -486,6 +557,7 @@ void JobChainPolicy::batch(const u64* cmds, u32 n, bool urgent, Grab& g, bool* l
         if (cmd != 0 && (cmd & 7) == kOpJob) {
             if (!may_take_) return;
             g.jobs.push_back({cmd, ps_read16(line_, jc_off::sizeJobDescriptor)});
+            note_grab(g.jobs.back());
             advance(urgent);
             continue;
         }
@@ -661,7 +733,10 @@ void JobChainPolicy::take_from_list(u32 slot, Grab& g)
     const u32 left = ps_read32(line_, at), stride = ps_read32(line_, at + 4);
     const u64 next = ps_read64(line_, at + 8);
     const u32 n = std::min<u32>(left, ps_read16(line_, jc_off::maxGrabbedJob));
-    for (u32 i = 0; i < n; i++) g.jobs.push_back({next + u64{i} * stride, stride});
+    for (u32 i = 0; i < n; i++) {
+        g.jobs.push_back({next + u64{i} * stride, stride});
+        note_grab(g.jobs.back());
+    }
     ps_write32(line_, at, left - n);
     ps_write64(line_, at + 8, next + u64{n} * stride);
     if (slot == 1 && left == n) ps_write8(line_, jc_off::urgentList, 0); // the urgent list is done
@@ -840,6 +915,8 @@ bool JobChainPolicy::run_job(const Job& job)
         return false;
     }
     job_ea_ = job.ea;
+    job_ = job;
+    check_descriptor(job);
     const u32 desc = desc_base_ + (jobs_run_ % kRing) * max_size_;
     desc_ls_ = desc;
     const u32 tag = tags_[jobs_run_ % 2]; // jobs alternate between the chain's two tags
@@ -1056,3 +1133,9 @@ void run_jobchain(Worker& w, u32 wid, u32 job_chain)
 }
 
 } // namespace pspocket::hle::spurs
+
+namespace pspocket::hle {
+
+u64 job_descriptors_changed() { return spurs::g_descriptors_changed.load(std::memory_order_relaxed); }
+
+} // namespace pspocket::hle

@@ -1,119 +1,359 @@
 {
-  "as_of": "2026-10-07, after runs 142-149 (D-220)",
+  "as_of": "2026-10-07, after runs 150-156 (D-222)",
   "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac; nothing is Flawless yet: the iPhone is too slow in heavy scenes and GTA V's EDGE job chain stops now and then.",
   "checklist": [
     {
       "area": "Reading any PS3 disc on the iPhone",
       "items": [
-        {"name": "Disc images read in place (ISO 9660, Joliet long names)", "state": "done", "ref": "D-043, D-162"},
-        {"name": "EBOOT decrypted on the phone", "state": "done", "ref": "D-121"},
-        {"name": "System software from PS3UPDAT.PUP", "state": "done", "ref": "D-156"},
-        {"name": "Encrypted SDATA files", "state": "done", "ref": "D-165"},
-        {"name": "PSN/NPDRM content (EDAT with the game's licence key)", "state": "todo", "ref": "improve.md Other games"},
-        {"name": "A game's own PRX modules loaded", "state": "done", "ref": "D-159"}
+        {
+          "name": "Disc images read in place (ISO 9660, Joliet long names)",
+          "state": "done",
+          "ref": "D-043, D-162"
+        },
+        {
+          "name": "EBOOT decrypted on the phone",
+          "state": "done",
+          "ref": "D-121"
+        },
+        {
+          "name": "System software from PS3UPDAT.PUP",
+          "state": "done",
+          "ref": "D-156"
+        },
+        {
+          "name": "Encrypted SDATA files",
+          "state": "done",
+          "ref": "D-165"
+        },
+        {
+          "name": "PSN/NPDRM content (EDAT with the game's licence key)",
+          "state": "todo",
+          "ref": "improve.md Other games"
+        },
+        {
+          "name": "A game's own PRX modules loaded",
+          "state": "done",
+          "ref": "D-159"
+        }
       ]
     },
     {
       "area": "Translating on the iPhone (route B)",
       "items": [
-        {"name": "The app signs and loads code it made", "state": "done", "ref": "D-150"},
-        {"name": "LLVM in the app compiles the translation", "state": "done", "ref": "D-151, D-153"},
-        {"name": "A game's translation is a library loaded at run time", "state": "done", "ref": "D-152"},
-        {"name": "Preparing game: PPU and SPU, progress and time left", "state": "done", "ref": "D-154, D-155, D-209"},
-        {"name": "Firmware modules translated once into a system library", "state": "done", "ref": "D-178"},
-        {"name": "Firmware SPU programs translated per game", "state": "done", "ref": "D-190, D-191"},
-        {"name": "A game's own PRX modules translated (they run interpreted)", "state": "todo", "ref": "D-159"},
-        {"name": "Everything since D-164 confirmed on the iPhone", "state": "todo", "ref": "compatibility.md"}
+        {
+          "name": "The app signs and loads code it made",
+          "state": "done",
+          "ref": "D-150"
+        },
+        {
+          "name": "LLVM in the app compiles the translation",
+          "state": "done",
+          "ref": "D-151, D-153"
+        },
+        {
+          "name": "A game's translation is a library loaded at run time",
+          "state": "done",
+          "ref": "D-152"
+        },
+        {
+          "name": "Preparing game: PPU and SPU, progress and time left",
+          "state": "done",
+          "ref": "D-154, D-155, D-209"
+        },
+        {
+          "name": "Firmware modules translated once into a system library",
+          "state": "done",
+          "ref": "D-178"
+        },
+        {
+          "name": "Firmware SPU programs translated per game",
+          "state": "done",
+          "ref": "D-190, D-191"
+        },
+        {
+          "name": "A game's own PRX modules translated (they run interpreted)",
+          "state": "todo",
+          "ref": "D-159"
+        },
+        {
+          "name": "Everything since D-164 confirmed on the iPhone",
+          "state": "todo",
+          "ref": "compatibility.md"
+        }
       ]
     },
     {
       "area": "PPU code (the main processor)",
       "items": [
-        {"name": "Whole executables translated ahead of time", "state": "done", "ref": "D-092 to D-096"},
-        {"name": "Jump tables and switch statements", "state": "done", "ref": "D-203"},
-        {"name": "Fiber switches without exceptions", "state": "done", "ref": "D-213"},
-        {"name": "Code after a setjmp return translated (14 instructions per switch interpreted)", "state": "partial", "ref": "improve.md Fibers"},
-        {"name": "No PPU code interpreted in a session", "state": "partial", "ref": "D-207: AC under 1% of a core"}
+        {
+          "name": "Whole executables translated ahead of time",
+          "state": "done",
+          "ref": "D-092 to D-096"
+        },
+        {
+          "name": "Jump tables and switch statements",
+          "state": "done",
+          "ref": "D-203"
+        },
+        {
+          "name": "Fiber switches without exceptions",
+          "state": "done",
+          "ref": "D-213"
+        },
+        {
+          "name": "Code after a setjmp return translated (14 instructions per switch interpreted)",
+          "state": "partial",
+          "ref": "improve.md Fibers"
+        },
+        {
+          "name": "No PPU code interpreted in a session",
+          "state": "partial",
+          "ref": "D-207: AC under 1% of a core"
+        }
       ]
     },
     {
       "area": "SPU code (the six co-processors)",
       "items": [
-        {"name": "SPURS tasks, jobs and the modules they load translated", "state": "done", "ref": "D-076 to D-099, D-204 to D-208"},
-        {"name": "Programs known by their code alone", "state": "done", "ref": "D-208"},
-        {"name": "Module tracker cheap enough for 3 million copies a second", "state": "done", "ref": "D-220"},
-        {"name": "No SPU code interpreted (GTA V 0, AC 184 instructions a session)", "state": "partial", "ref": "runs 142-149"},
-        {"name": "SPU programs kept in data files translated before the first session", "state": "todo", "ref": "improve.md Other games"},
-        {"name": "Translated SPU code fast enough for the iPhone's heavy scenes", "state": "partial", "ref": "D-215 to D-220"}
+        {
+          "name": "SPURS tasks, jobs and the modules they load translated",
+          "state": "done",
+          "ref": "D-076 to D-099, D-204 to D-208"
+        },
+        {
+          "name": "Programs known by their code alone",
+          "state": "done",
+          "ref": "D-208"
+        },
+        {
+          "name": "Module tracker cheap enough for 3 million copies a second",
+          "state": "done",
+          "ref": "D-220"
+        },
+        {
+          "name": "No SPU code interpreted (GTA V 0, AC 184 instructions a session)",
+          "state": "partial",
+          "ref": "runs 142-149"
+        },
+        {
+          "name": "SPU programs kept in data files translated before the first session",
+          "state": "todo",
+          "ref": "improve.md Other games"
+        },
+        {
+          "name": "Translated SPU code fast enough for the iPhone's heavy scenes",
+          "state": "partial",
+          "ref": "D-215 to D-220"
+        }
       ]
     },
     {
       "area": "SPURS and the kernel",
       "items": [
-        {"name": "Native SPURS: workloads, tasksets, job chains, queues, semaphores", "state": "done", "ref": "D-037, D-055, D-136"},
-        {"name": "SPU thread groups", "state": "done", "ref": "D-167"},
-        {"name": "Raw SPUs and interrupt threads", "state": "todo", "ref": "D-184"},
-        {"name": "GTA V's EDGE job chain never stops on a reused descriptor", "state": "todo", "ref": "improve.md Stability"}
+        {
+          "name": "Native SPURS: workloads, tasksets, job chains, queues, semaphores",
+          "state": "done",
+          "ref": "D-037, D-055, D-136"
+        },
+        {
+          "name": "SPU thread groups",
+          "state": "done",
+          "ref": "D-167"
+        },
+        {
+          "name": "Raw SPUs and interrupt threads",
+          "state": "todo",
+          "ref": "D-184"
+        },
+        {
+          "name": "GTA V's EDGE job chain never stops on a reused descriptor",
+          "state": "todo",
+          "ref": "improve.md Stability"
+        }
       ]
     },
     {
       "area": "Graphics (RSX to Metal)",
       "items": [
-        {"name": "Command stream, every method RPCS3 accepts", "state": "done", "ref": "D-102"},
-        {"name": "Vertex and fragment programs to Metal shaders, flow control", "state": "done", "ref": "D-068, D-089"},
-        {"name": "Render targets read as textures, converted on the GPU", "state": "done", "ref": "D-083, D-088, D-098, D-214"},
-        {"name": "Texture formats", "state": "done", "ref": "D-163"},
-        {"name": "Shaders compiled ahead and in the background", "state": "done", "ref": "D-143, D-158"},
-        {"name": "Per-draw CPU cost (9.2 us a draw)", "state": "partial", "ref": "D-210, D-211, D-214"},
-        {"name": "Multisampled render targets (drawn with one sample)", "state": "todo", "ref": "improve.md RSX"},
-        {"name": "Draws while a shader compiles (a shader interpreter)", "state": "todo", "ref": "improve.md Shaders"},
-        {"name": "Fewer render passes for the tile GPU", "state": "todo", "ref": "improve.md RSX"}
+        {
+          "name": "Command stream, every method RPCS3 accepts",
+          "state": "done",
+          "ref": "D-102"
+        },
+        {
+          "name": "Vertex and fragment programs to Metal shaders, flow control",
+          "state": "done",
+          "ref": "D-068, D-089"
+        },
+        {
+          "name": "Render targets read as textures, converted on the GPU",
+          "state": "done",
+          "ref": "D-083, D-088, D-098, D-214"
+        },
+        {
+          "name": "Texture formats",
+          "state": "done",
+          "ref": "D-163"
+        },
+        {
+          "name": "Shaders compiled ahead and in the background",
+          "state": "done",
+          "ref": "D-143, D-158"
+        },
+        {
+          "name": "Per-draw CPU cost (9.2 us a draw)",
+          "state": "partial",
+          "ref": "D-210, D-211, D-214"
+        },
+        {
+          "name": "Multisampled render targets (drawn with one sample)",
+          "state": "todo",
+          "ref": "improve.md RSX"
+        },
+        {
+          "name": "Draws while a shader compiles (a shader interpreter)",
+          "state": "todo",
+          "ref": "improve.md Shaders"
+        },
+        {
+          "name": "Fewer render passes for the tile GPU",
+          "state": "todo",
+          "ref": "improve.md RSX"
+        }
       ]
     },
     {
       "area": "Sound",
       "items": [
-        {"name": "cellAudio through AVAudioEngine, stretched to the game's pace", "state": "done", "ref": "D-052, D-072 to D-075"},
-        {"name": "LPCM and ATRAC3plus decoders pspocket's own", "state": "done", "ref": "D-197, D-198"},
-        {"name": "MP3, AC-3, AAC, ATRAC3 decoders pspocket's own", "state": "todo", "ref": "improve.md Media"},
-        {"name": "Sound at full pace when the iPhone's cores are full", "state": "todo", "ref": "improve.md Audio"}
+        {
+          "name": "cellAudio through AVAudioEngine, stretched to the game's pace",
+          "state": "done",
+          "ref": "D-052, D-072 to D-075"
+        },
+        {
+          "name": "LPCM and ATRAC3plus decoders pspocket's own",
+          "state": "done",
+          "ref": "D-197, D-198"
+        },
+        {
+          "name": "MP3, AC-3, AAC, ATRAC3 decoders pspocket's own",
+          "state": "todo",
+          "ref": "improve.md Media"
+        },
+        {
+          "name": "Sound at full pace when the iPhone's cores are full",
+          "state": "todo",
+          "ref": "improve.md Audio"
+        }
       ]
     },
     {
       "area": "Video and images",
       "items": [
-        {"name": "Movie headers and demultiplexer (cellPamf, cellDmux)", "state": "done", "ref": "D-193, D-194"},
-        {"name": "Video decoder H.264 and MPEG-2 (cellVdec)", "state": "done", "ref": "D-195, D-196"},
-        {"name": "VC-1, DivX 3.11, MVC video", "state": "todo", "ref": "improve.md Media"},
-        {"name": "PNG, JPEG, GIF decoders", "state": "done", "ref": "D-199, D-200, D-202"},
-        {"name": "Hardware video decoding (VideoToolbox)", "state": "todo", "ref": "docs/firmware.md"}
+        {
+          "name": "Movie headers and demultiplexer (cellPamf, cellDmux)",
+          "state": "done",
+          "ref": "D-193, D-194"
+        },
+        {
+          "name": "Video decoder H.264 and MPEG-2 (cellVdec)",
+          "state": "done",
+          "ref": "D-195, D-196"
+        },
+        {
+          "name": "VC-1, DivX 3.11, MVC video",
+          "state": "todo",
+          "ref": "improve.md Media"
+        },
+        {
+          "name": "PNG, JPEG, GIF decoders",
+          "state": "done",
+          "ref": "D-199, D-200, D-202"
+        },
+        {
+          "name": "Hardware video decoding (VideoToolbox)",
+          "state": "todo",
+          "ref": "docs/firmware.md"
+        }
       ]
     },
     {
       "area": "System services",
       "items": [
-        {"name": "Saves, game data, trophies", "state": "done", "ref": "D-183"},
-        {"name": "PSN and network answered offline", "state": "done", "ref": "D-139, D-141, D-185"},
-        {"name": "Dialogs, on-screen keyboard, IME", "state": "done", "ref": "D-140, D-188"},
-        {"name": "Controllers", "state": "done", "ref": "app/ios MenuInput, GameModel"},
-        {"name": "On-screen touch controls", "state": "todo", "ref": "decisions.md open decisions"}
+        {
+          "name": "Saves, game data, trophies",
+          "state": "done",
+          "ref": "D-183"
+        },
+        {
+          "name": "PSN and network answered offline",
+          "state": "done",
+          "ref": "D-139, D-141, D-185"
+        },
+        {
+          "name": "Dialogs, on-screen keyboard, IME",
+          "state": "done",
+          "ref": "D-140, D-188"
+        },
+        {
+          "name": "Controllers",
+          "state": "done",
+          "ref": "app/ios MenuInput, GameModel"
+        },
+        {
+          "name": "On-screen touch controls",
+          "state": "todo",
+          "ref": "decisions.md open decisions"
+        }
       ]
     },
     {
       "area": "Speed and stability on the iPhone",
       "items": [
-        {"name": "Preparing a game in minutes (GTA V 7:20)", "state": "done", "ref": "run 096"},
-        {"name": "GTA V at 30 fps in light scenes", "state": "done", "ref": "run 100"},
-        {"name": "GTA V at 30 fps in heavy scenes (10-20 today)", "state": "todo", "ref": "run 089"},
-        {"name": "Memory under iOS's limit for a whole session", "state": "partial", "ref": "D-148, run 100"},
-        {"name": "An hour without a crash", "state": "todo", "ref": "improve.md Stability"}
+        {
+          "name": "Preparing a game in minutes (GTA V 7:20)",
+          "state": "done",
+          "ref": "run 096"
+        },
+        {
+          "name": "GTA V at 30 fps in light scenes",
+          "state": "done",
+          "ref": "run 100"
+        },
+        {
+          "name": "GTA V at 30 fps in heavy scenes (10-20 today)",
+          "state": "todo",
+          "ref": "run 089"
+        },
+        {
+          "name": "Memory under iOS's limit for a whole session",
+          "state": "partial",
+          "ref": "D-148, run 100"
+        },
+        {
+          "name": "An hour without a crash",
+          "state": "todo",
+          "ref": "improve.md Stability"
+        }
       ]
     }
   ],
   "games": [
-    {"title": "Grand Theft Auto V", "id": "BLES01807", "rating": "Playable"},
-    {"title": "Assassin's Creed", "id": "BLES00158", "rating": "Boots"},
-    {"title": "L.A. Noire", "id": "BLES00933", "rating": "Broken"}
+    {
+      "title": "Grand Theft Auto V",
+      "id": "BLES01807",
+      "rating": "Playable"
+    },
+    {
+      "title": "Assassin's Creed",
+      "id": "BLES00158",
+      "rating": "Boots"
+    },
+    {
+      "title": "L.A. Noire",
+      "id": "BLES00933",
+      "rating": "Broken"
+    }
   ],
   "charts": [
     {
@@ -121,8 +361,62 @@
       "title": "GTA V on the Mac: CPU of the main SPU threads per 5 s (lower is faster)",
       "ylabel": "CPU seconds per 5 s",
       "series": [
-        {"name": "main SPU threads", "colour": "#0969da", "points": [[134, 7.93], [135, 7.62], [136, 7.33], [137, 6.98], [140, 6.91], [141, 6.56]]},
-        {"name": "audio SPU", "colour": "#bf3989", "points": [[135, 1.88], [136, 1.73], [137, 1.57], [140, 1.55], [141, 1.39]]}
+        {
+          "name": "main SPU threads",
+          "colour": "#0969da",
+          "points": [
+            [
+              134,
+              7.93
+            ],
+            [
+              135,
+              7.62
+            ],
+            [
+              136,
+              7.33
+            ],
+            [
+              137,
+              6.98
+            ],
+            [
+              140,
+              6.91
+            ],
+            [
+              141,
+              6.56
+            ]
+          ]
+        },
+        {
+          "name": "audio SPU",
+          "colour": "#bf3989",
+          "points": [
+            [
+              135,
+              1.88
+            ],
+            [
+              136,
+              1.73
+            ],
+            [
+              137,
+              1.57
+            ],
+            [
+              140,
+              1.55
+            ],
+            [
+              141,
+              1.39
+            ]
+          ]
+        }
       ]
     },
     {
@@ -130,9 +424,80 @@
       "title": "Assassin's Creed's crowd on the Mac: CPU per 5 s and fps",
       "ylabel": "CPU seconds per 5 s / fps",
       "series": [
-        {"name": "whole process", "colour": "#0969da", "points": [[125, 27.85], [129, 20.8], [139, 20.9], [142, 20.16], [143, 18.54]]},
-        {"name": "5 SPU threads", "colour": "#8250df", "points": [[139, 13.9], [142, 13.16], [143, 11.59]]},
-        {"name": "fps", "colour": "#2da44e", "points": [[121, 27.0], [125, 31.1], [129, 33.7], [139, 33.0], [142, 33.1], [143, 37.2]]}
+        {
+          "name": "whole process",
+          "colour": "#0969da",
+          "points": [
+            [
+              125,
+              27.85
+            ],
+            [
+              129,
+              20.8
+            ],
+            [
+              139,
+              20.9
+            ],
+            [
+              142,
+              20.16
+            ],
+            [
+              143,
+              18.54
+            ]
+          ]
+        },
+        {
+          "name": "5 SPU threads",
+          "colour": "#8250df",
+          "points": [
+            [
+              139,
+              13.9
+            ],
+            [
+              142,
+              13.16
+            ],
+            [
+              143,
+              11.59
+            ]
+          ]
+        },
+        {
+          "name": "fps",
+          "colour": "#2da44e",
+          "points": [
+            [
+              121,
+              27.0
+            ],
+            [
+              125,
+              31.1
+            ],
+            [
+              129,
+              33.7
+            ],
+            [
+              139,
+              33.0
+            ],
+            [
+              142,
+              33.1
+            ],
+            [
+              143,
+              37.2
+            ]
+          ]
+        }
       ]
     }
   ]

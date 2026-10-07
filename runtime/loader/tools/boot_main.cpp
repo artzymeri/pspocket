@@ -1333,6 +1333,10 @@ int main(int argc, char** argv)
         static_cast<unsigned long long>(spu.attached), static_cast<unsigned long long>(spu.unknown),
         static_cast<unsigned long long>(spu.images), static_cast<unsigned long long>(spu.modules),
         static_cast<unsigned long long>(spu.modified));
+    if (const u64 changed = hle::job_descriptors_changed()) {
+        std::printf("job descriptors changed between their grab and their start: %llu\n",
+            static_cast<unsigned long long>(changed));
+    }
     // Where SPU code was interpreted most (the program current when the interpreter took over, and where).
     ps_spu_interp_site sites[12];
     const u32 nsites = ps_spu_interp_sites(sites, 12);

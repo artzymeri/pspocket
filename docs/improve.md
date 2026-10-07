@@ -64,7 +64,16 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   Earlier (run 087) the shader cache's threads did the same to it.
 - **Try:** the native scheduler picks AudioEngine first when it has work (a priority boost for the workload that
   feeds cellAudio); a larger host buffer while the pace falls, so a late block stretches less.
-- **State:** open.
+- **Tried (runs 153-156), not kept:** the host threads that feed the sound found by what they write (cellAudio's port
+  buffers and the samples cellAudioAdd*Data copies, through the SPU DMA write path; the PPU thread calling
+  cellAudioAddData) and raised to cellAudio's own QoS. It found GTA V's two (the mixer's SPU thread writing 0x10c51000,
+  the PPU thread adding it), but on the Mac with every core loaded by ten spinning threads of the SPU threads' class
+  (which reproduces the phone: sound at 0.8 of its pace, 25 fps) nothing changed: pace 0.81 and 0.85 without, 0.80 and
+  0.88 with; the mixer's SPU thread had the CPU it wanted either way (1.9-2.1 s per 5 s). The pace falls with the
+  game's frame loop and its main SPU workloads, upstream of the mixer. On the phone the mixer may be held on an
+  efficiency core (it was 85-90% busy there): try the raise again in a phone session, with the threads' core types
+  in the log. Reverted until then (rule 8).
+- **State:** open; making the SPU work faster is what moves it.
 
 ## RSX and Metal: the GPU
 
@@ -277,4 +286,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Try:** which SPU program binary 0x18fcc80 is and where its output address comes from (its job descriptor's
   output list, the interpreter against the lifted program for that job: spu-check with that image); whether lv2 or
   the game's heap handed out the ring and the job's buffer overlapping (log both allocations).
+- **Seen (2026-10-06, inventory/repro-edge run2-3):** caught on the Mac, about one walk in ten under load: the
+  descriptor at 0x103b3c00 held the game's own RSX state commands (stencil, polygon mode, cull face, transform
+  constants), and no SPU wrote over it among the last 2,048 writes of each thread.
+- **Ruled out (D-222, runs 150-152):** the game rewriting a descriptor between our grab and the job's start (we read
+  descriptors later than libsre does): 0 changes to what a job uses in 300 s of GTA V. A stop's report now includes the
+  descriptor as it was at the grab.
+- **Try next:** walks in a loop (under load, as run2-3) until a stop is caught with the grab snapshot; if the descriptor
+  was already broken when taken, log the chain's command list over time (which lap wrote that JOB command) and the
+  PPU's command-buffer allocations around the slot.
 - **State:** open; it stands between GTA V and an hour without a stop (the Flawless bar).

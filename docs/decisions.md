@@ -4909,6 +4909,26 @@ README's Status section; the GitHub description gets the headline numbers.
 - The engine percentage is the plain mean of the four counted parts and the ten areas (68% today). It is a guide, not a
   promise: nothing is Flawless until a game meets docs/compatibility.md's bar on the iPhone.
 
+## D-222 · 2026-10-07 · A job chain remembers what each job's descriptor held when it took the job
+
+GTA V's EDGE/GFX job chain stops now and then on a descriptor that holds something else (D-130, D-131, D-138, run 100;
+on the Mac about one walk in ten: inventory/repro-edge, run2-3, a descriptor full of the game's own RSX state commands
+and no SPU write over it). One explanation was ours: a job's descriptor is read when the job starts, up to three jobs
+after the visit that took it, where libsre's pipeline (FETCH, INPUT, EXECUTE, OUTPUT) reads it about two jobs ahead; a
+game reusing a descriptor once the chain has taken it would then hand us its new contents.
+
+- **At the grab** the chain now keeps a hash of what the job uses (its header, input DMA list and cache list) and the
+  header itself; **at the start** it hashes again. A difference is counted ("job descriptors changed between their
+  grab and their start" at the end of a run), the first 20 are logged with both headers and the SPU writes over the
+  descriptor since the grab, and a job chain stop's report (D-138) now begins with the descriptor as it was at the
+  grab.
+- **Measured:** GTA V's walk for 300 s (run 152): 0 changes. The theory is ruled out for normal play. A first version
+  hashed all 0x280 bytes the chain reads per descriptor and found 28,518 changes in 300 s (run 150): all past +0x200,
+  where GTA V's EDGE jobs put other jobs' output (the descriptors are 0x200 apart). Nothing a job uses.
+- What is left: the next stop's report will say whether the descriptor was already broken when the job was taken (a
+  stale command in the list, or the game's command buffer laid over a slot before the chain reached it) or changed
+  after (a writer). The cost: two hashes of about 0x100 bytes per job.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

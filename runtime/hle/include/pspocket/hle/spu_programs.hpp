@@ -28,4 +28,8 @@ struct SpuProgramStats {
 };
 SpuProgramStats spu_program_stats();
 
+// Job chain jobs whose descriptor changed between the visit that took them and their start (D-222): the job runs with
+// what memory holds at its start.
+u64 job_descriptors_changed();
+
 } // namespace pspocket::hle
