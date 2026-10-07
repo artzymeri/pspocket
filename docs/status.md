@@ -189,8 +189,15 @@ one store: 0 stops in 11 loaded walks, 3 in 10 before. Also: the module tracker'
 
 **A game's first session (D-226, docs/plan-game-modules.md).** Preparing a game now also translates the SPU programs
 its executable carries (found by their ELF headers, as the system library's), so a game met for the first time runs
-its SPURS tasks translated at once. Next on the plan: the modules a task copies in from game data, and a game's own PRX
-modules, still found only by running the game.
+its SPURS tasks translated at once.
+
+**SPU programs translated during the session (D-230 to D-236, docs/plan-background-spu.md, runs 217-219).** The SPU
+programs a game meets that its library lacks (the modules and jobs its tasks copy in from data) are lifted, compiled,
+signed and loaded on one background core while it plays; the SPUs switch to them at their next load or taken branch.
+Assassin's Creed's first 150 s: 22.06 to 0.94 billion SPU instructions interpreted, the training 25-33 to 60 fps.
+pspocket-boot --spu-translate on the Mac; the app starts it after the game library loads (not tried on the phone yet).
+Also: the RSX reading a packet's arguments in one run was measured and not kept (D-229). Next: a game's own PRX
+modules (docs/plan-game-modules.md), still found only by running the game.
 
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,

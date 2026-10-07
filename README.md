@@ -14,7 +14,7 @@ signs and loads it, and plays it flawlessly. Driving title: GTA V (BLES01807); s
 
 ![engine](docs/progress/badge-0.svg) ![system libraries](docs/progress/badge-1.svg) ![kernel calls](docs/progress/badge-2.svg) ![PPU instructions](docs/progress/badge-3.svg) ![SPU instructions](docs/progress/badge-4.svg) ![games flawless](docs/progress/badge-5.svg)
 
-_2026-10-07, after D-227._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: GTA V's rare job chain stop found and fixed (D-225). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.
+_2026-10-07, after D-236._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: SPU programs a game meets for the first time are translated while it plays (D-236): Assassin's Creed's first session interprets 96% less SPU code and its training runs at 60 fps instead of 25-33. Nothing is Flawless yet: the iPhone is too slow in heavy scenes.
 
 ![The engine, part by part](docs/progress/engine.svg)
 
@@ -22,6 +22,7 @@ _2026-10-07, after D-227._ Route B (D-147): the iPhone alone prepares any PS3 di
 
 ![GTA V on the Mac: CPU of the main SPU threads per 5 s (lower is faster)](docs/progress/speed-gta5.svg)
 ![Assassin's Creed's crowd on the Mac: CPU per 5 s and fps](docs/progress/speed-ac1.svg)
+![Assassin's Creed's first session: SPU code interpreted (D-236)](docs/progress/interpreted-ac1.svg)
 
 ![System libraries](docs/progress/libraries.svg)
 

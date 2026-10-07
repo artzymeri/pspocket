@@ -261,8 +261,8 @@ def bars_svg(title, rows, width=900):
     return "\n".join(parts)
 
 
-def line_chart_svg(title, series, ylabel, width=440, height=260, higher_is_better=True):
-    """series: [(name, colour, [(x, y)])] with x = run number."""
+def line_chart_svg(title, series, ylabel, width=440, height=260, higher_is_better=True, xname="run"):
+    """series: [(name, colour, [(x, y)])] with x = run number (or xname: "s" for seconds into a run)."""
     pts = [p for _, _, s in series for p in s]
     if not pts:
         return None
@@ -288,8 +288,9 @@ def line_chart_svg(title, series, ylabel, width=440, height=260, higher_is_bette
         yv = y0 + (y1 - y0) * k / 4
         parts.append(f'<line x1="{L}" x2="{width - R}" y1="{sy(yv):.1f}" y2="{sy(yv):.1f}" stroke="#eaeef2"/>')
         parts.append(f'<text x="{L - 6}" y="{sy(yv) + 4:.1f}" font-size="10" text-anchor="end" fill="#57606a">{yv:.0f}</text>')
-    parts.append(f'<text x="{L}" y="{height - 8}" font-size="10" fill="#57606a">run {x0}</text>')
-    parts.append(f'<text x="{width - R}" y="{height - 8}" font-size="10" text-anchor="end" fill="#57606a">run {x1}</text>')
+    xl = (lambda x: f"run {x}") if xname == "run" else (lambda x: f"{x} {xname}")
+    parts.append(f'<text x="{L}" y="{height - 8}" font-size="10" fill="#57606a">{xl(x0)}</text>')
+    parts.append(f'<text x="{width - R}" y="{height - 8}" font-size="10" text-anchor="end" fill="#57606a">{xl(x1)}</text>')
     parts.append(f'<text x="{(L + width - R) / 2}" y="{height - 8}" font-size="10" text-anchor="middle" fill="#57606a">'
                  f'{html.escape(ylabel)}</text>')
     lx = L + 4
@@ -300,7 +301,7 @@ def line_chart_svg(title, series, ylabel, width=440, height=260, higher_is_bette
         d = " ".join(f'{"M" if i == 0 else "L"}{sx(x):.1f},{sy(y):.1f}' for i, (x, y) in enumerate(s))
         parts.append(f'<path d="{d}" fill="none" stroke="{colour}" stroke-width="2"/>')
         for x, y in s:
-            parts.append(f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="2.6" fill="{colour}"><title>run {x}: {y}</title></circle>')
+            parts.append(f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="2.6" fill="{colour}"><title>{xl(x)}: {y}</title></circle>')
         parts.append(f'<rect x="{lx}" y="{T - 22}" width="10" height="3" fill="{colour}"/>')
         parts.append(f'<text x="{lx + 14}" y="{T - 18}" font-size="10" fill="#24292f">{html.escape(name)}</text>')
         lx += 18 + 6 * len(name)
@@ -359,7 +360,7 @@ def main():
     charts = []
     for chart in data["charts"]:
         svg = line_chart_svg(chart["title"], [(s["name"], s["colour"], [tuple(p) for p in s["points"]]) for s in chart["series"]],
-                             chart["ylabel"])
+                             chart["ylabel"], xname=chart.get("xname", "run"))
         if svg:
             write(chart["file"], svg)
             charts.append(chart)

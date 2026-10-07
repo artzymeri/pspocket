@@ -1,6 +1,6 @@
 {
-  "as_of": "2026-10-07, after D-227",
-  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: GTA V's rare job chain stop found and fixed (D-225). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
+  "as_of": "2026-10-07, after D-236",
+  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: SPU programs a game meets for the first time are translated while it plays (D-236): Assassin's Creed's first session interprets 96% less SPU code and its training runs at 60 fps instead of 25-33. Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
   "checklist": [
     {
       "area": "Reading any PS3 disc on the iPhone",
@@ -146,9 +146,9 @@
           "ref": "D-226"
         },
         {
-          "name": "SPU programs kept in data files translated before the first session",
-          "state": "todo",
-          "ref": "improve.md Other games"
+          "name": "SPU programs kept in data files translated during the first session",
+          "state": "done",
+          "ref": "D-236"
         },
         {
           "name": "Translated SPU code fast enough for the iPhone's heavy scenes",
@@ -513,6 +513,258 @@
             [
               143,
               37.2
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "file": "interpreted-ac1.svg",
+      "title": "Assassin's Creed's first session: SPU code interpreted (D-236)",
+      "ylabel": "million SPU instructions per 5 s",
+      "xname": "s",
+      "series": [
+        {
+          "name": "without the translator",
+          "colour": "#cf222e",
+          "points": [
+            [
+              5,
+              614
+            ],
+            [
+              10,
+              678
+            ],
+            [
+              15,
+              683
+            ],
+            [
+              20,
+              680
+            ],
+            [
+              25,
+              679
+            ],
+            [
+              30,
+              686
+            ],
+            [
+              35,
+              682
+            ],
+            [
+              40,
+              680
+            ],
+            [
+              45,
+              677
+            ],
+            [
+              50,
+              678
+            ],
+            [
+              55,
+              676
+            ],
+            [
+              60,
+              681
+            ],
+            [
+              65,
+              1033
+            ],
+            [
+              70,
+              1321
+            ],
+            [
+              75,
+              1029
+            ],
+            [
+              80,
+              660
+            ],
+            [
+              85,
+              663
+            ],
+            [
+              90,
+              616
+            ],
+            [
+              95,
+              644
+            ],
+            [
+              100,
+              660
+            ],
+            [
+              105,
+              726
+            ],
+            [
+              110,
+              739
+            ],
+            [
+              115,
+              741
+            ],
+            [
+              120,
+              740
+            ],
+            [
+              125,
+              729
+            ],
+            [
+              130,
+              742
+            ],
+            [
+              135,
+              744
+            ],
+            [
+              140,
+              719
+            ],
+            [
+              145,
+              734
+            ]
+          ]
+        },
+        {
+          "name": "translated while it plays",
+          "colour": "#1a7f37",
+          "points": [
+            [
+              5,
+              639
+            ],
+            [
+              10,
+              112
+            ],
+            [
+              15,
+              0
+            ],
+            [
+              20,
+              0
+            ],
+            [
+              25,
+              0
+            ],
+            [
+              30,
+              0
+            ],
+            [
+              35,
+              0
+            ],
+            [
+              40,
+              0
+            ],
+            [
+              45,
+              0
+            ],
+            [
+              50,
+              0
+            ],
+            [
+              55,
+              0
+            ],
+            [
+              60,
+              0
+            ],
+            [
+              65,
+              1
+            ],
+            [
+              70,
+              2
+            ],
+            [
+              75,
+              0
+            ],
+            [
+              80,
+              0
+            ],
+            [
+              85,
+              0
+            ],
+            [
+              90,
+              0
+            ],
+            [
+              95,
+              0
+            ],
+            [
+              100,
+              0
+            ],
+            [
+              105,
+              57
+            ],
+            [
+              110,
+              79
+            ],
+            [
+              115,
+              46
+            ],
+            [
+              120,
+              0
+            ],
+            [
+              125,
+              0
+            ],
+            [
+              130,
+              0
+            ],
+            [
+              135,
+              0
+            ],
+            [
+              140,
+              0
+            ],
+            [
+              145,
+              0
             ]
           ]
         }

@@ -224,8 +224,20 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   Now the executable's SPU ELFs are translated when it is prepared (Assassin's Creed: 6, its 4 tasks under the runtime's
   names). Left: the modules and jobs a task copies in from game data (Assassin's Creed's at LS 0x2fba0 and 0x04c00: 21
   billion instructions in a 150 s first session), and a game's own PRX modules (docs/plan-game-modules.md).
-- **Try:** record where each module a task copies in comes from (guest address, size, the file and offset it was read
-  from); when that is the executable or a plain file on the disc, find the same bytes when preparing.
+- **Done (runs 217-219, D-230 to D-236):** the SPU programs a session meets untranslated are translated while it runs,
+  on one core in the background, and loaded as they are ready: Assassin's Creed's first 150 s interpret 0.94 billion
+  SPU instructions instead of 22.06 billion, the training at 60 fps instead of 25-33. Left: the first 10 s (before
+  the first programs land: 0.75 billion) and the windows where new jobs appear (up to 79 million per 5 s for a few
+  seconds); about 0.3 million per 5 s after (entries the lifts had no seed for).
+- **Try:**
+  - Record where each module a task copies in comes from (guest address, size, the file and offset it was read from);
+    when that is the executable or a plain file on the disc, find the same bytes when preparing: the first seconds
+    translated too.
+  - The phone: compiles run slower and the cores are full with the game; measure the time from first sighting to
+    loaded there, the heat, and whether the 60 s limit ever defers a program (the cost model is 8 to 100 times too
+    pessimistic for Assassin's Creed's code; the session scales it by its own compiles).
+  - A program's later entries (the 0.3 million per 5 s): lift the image again with the misses as seeds and load it over
+    the first (a registry "supersede"; tables are never freed, D-231), if the numbers grow in other games.
 
 ## Media libraries (D-179, D-193, D-194)
 
