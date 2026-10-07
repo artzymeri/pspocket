@@ -4827,6 +4827,37 @@ instructions. Other hosts keep the portable code.
 - Measured (run 140, GTA V's walk, 60-90 s): the main SPU threads 6.95 to 6.91 s of CPU per 5 s, the audio SPU 1.57
   to 1.55. That is within the noise between runs, but never slower; kept for fewer instructions with the same results.
 
+## D-219 · 2026-10-07 · SPU functions load registers where they are needed and store only what changed
+
+Each lifted SPU function loaded every register it uses when it was entered and stored every register it writes on
+every way out. Function entry loads were 9.4% of GTA V's translated SPU samples, calls 9.5% (run 137b).
+
+- **Two analyses per function** (recomp/spu/src/lifter.cpp, RegFlow), mirroring how each instruction is lowered:
+  forward, the "dirty" registers (written since the entry on some path, so ctx may not hold them; a call stores what
+  the callee can touch, a stop or an indirect call stores everything); backward, the live registers, where every
+  store of dirty registers counts as a read (the local must hold the right value whichever path led there).
+- **Entry.** Called at its entry (ctx->pc is the entry), a function loads only the registers live there. Resumed
+  anywhere else by the run loop it loads all it uses, as before.
+- **Ways out.** Each stores only the dirty registers at that point: one exit block per distinct set. Around a direct
+  call the caller stores the dirty registers the callee can touch (D-216 stored all it had written) and loads
+  afterwards only the live ones the callee can write; after a stop or an indirect call only the live ones.
+- **Indirect jumps** continue inside the function only at labels the analyzer found such jumps may reach
+  (Function::dynamic: jump table targets, code addresses formed by constants, seeds that were not labels anyway).
+  Anything else, a return above all, leaves: to the calling C function, which continues when the return address is
+  its call's, or to the run loop. Before, every label was a possible target, so the dirty set of every return flowed
+  to every label. Seeds that are labels anyway come from scripts/lift-spu.sh, which carries all of the previous lift's
+  labels over as seeds. A side effect: a loop that goes round only through an indirect jump to its own function's
+  label (improve.md, run 101) now passes the run loop's attention check, except at those labels.
+- **Statically**, GTA V's 150 programs (4,056 functions): registers loaded at entry 192,707 to 86,743 (45%), stores
+  per way out 46.4 to 42.9; a dispatch switch for indirect jumps in 97 functions. The C is 4% longer.
+- **Checked:** a lifter unit test (tests/spu/test_lift_regs.cpp); the program-level fuzz program gained a callee that
+  writes a register on one path only and one that writes before it reads, run against the interpreter; clang's
+  uninitialised-use warnings (errors here) over all of GTA V's lifted code, which would catch a load the analysis
+  missed on any path: none; the differential fuzz test; spu-check over all 150 of GTA V's programs (5,002 trials, no
+  difference); the gate (PASS).
+- **Measured** (run 141, GTA V's walk, 60-90 s, before and after in the same session): the main SPU threads 7.00 to
+  6.56 s of CPU per 5 s (-6%), the audio SPU 1.57 to 1.39 (-11%), the process 11.9 to 11.2.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

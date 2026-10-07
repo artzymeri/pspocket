@@ -289,7 +289,8 @@ private:
 // program (to a stub test_spu_fuzz puts at PS_SPU_FUZZ_PROGRAM_STUB) and a jump through a register, so lifted code
 // runs through every address it derives from its own: pcs, links, the dispatch switch, call returns. Then the
 // registers around calls (D-127): kept across a call that doesn't touch them, read and written by the callee, written
-// two calls deep, and kept across a call that leaves the program and comes back through the run loop.
+// two calls deep, and kept across a call that leaves the program and comes back through the run loop. And registers a
+// callee writes on one path only or before it reads them (D-219).
 struct SyntheticProgram {
     std::vector<u8> bytes; // at PS_SPU_FUZZ_PROGRAM_BASE
     u32 entry = 0;
@@ -319,6 +320,18 @@ SyntheticProgram synthetic_program()
     m.brsl(0, func1);
     m.emit(as::il(27, 9));
     m.emit(as::bi(28));
+    const auto cond_write = m.here(); // D-219: r41 = 0x1234 only when r40 is not zero, r42 += 3 otherwise; two returns
+    const auto cond_skip = m.label();
+    m.brz(40, cond_skip);
+    m.emit(as::il(41, 0x1234));
+    m.emit(as::ret());
+    m.bind(cond_skip);
+    m.emit(as::ai(42, 42, 3));
+    m.emit(as::ret());
+    const auto temp_first = m.here(); // r43 written before it is read: r43 = 0x10 + r44
+    m.emit(as::il(43, 0x10));
+    m.emit(as::a(43, 43, 44));
+    m.emit(as::ret());
     const auto leaf_out = m.here(); // leaves the program for the stub and comes back, then r24 = 7
     m.emit(as::ori(26, 0, 0));
     m.emit(as::brasl(0, PS_SPU_FUZZ_PROGRAM_STUB));
@@ -362,6 +375,16 @@ SyntheticProgram synthetic_program()
     m.brsl(0, leaf_out);        // r20, r23, r25 and r29 must reach ctx when it leaves
     m.emit(as::a(30, 29, 24));
     m.emit(as::a(31, 20, 23));
+    // Registers a callee writes on one path only, or before it reads them (D-219).
+    m.emit(as::il(40, 0));
+    m.emit(as::il(41, 0x55));
+    m.emit(as::il(42, 0x100));
+    m.brsl(0, cond_write); // r41 kept, r42 = 0x103
+    m.emit(as::ori(45, 41, 0));
+    m.emit(as::il(40, 1));
+    m.brsl(0, cond_write); // r41 = 0x1234, r42 kept
+    m.emit(as::il(44, 0x20));
+    m.brsl(0, temp_first); // r43 = 0x30
     m.emit(as::stop(0x11));
     return {m.finish(), entry, {func2, target}};
 }

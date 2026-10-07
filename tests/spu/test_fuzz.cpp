@@ -374,6 +374,11 @@ TEST_CASE("program-level fuzz: a lifted program agrees with the interpreter wher
         CHECK(gw(lifted.gpr[25], 0) == 21 + 9);
         CHECK(gw(lifted.gpr[30], 0) == 0x99 + 7);
         CHECK(gw(lifted.gpr[31], 0) == 0x7123 + 0x7123 + 0x56);
+        // Written on one path only, or before being read (D-219).
+        CHECK(gw(lifted.gpr[45], 0) == 0x55);
+        CHECK(gw(lifted.gpr[41], 0) == 0x1234);
+        CHECK(gw(lifted.gpr[42], 0) == 0x103);
+        CHECK(gw(lifted.gpr[43], 0) == 0x30);
         // Lifted code ran throughout: the misses are the stub, outside the program, called twice.
         CHECK(lifted.program == program);
         CHECK(ps_spu_miss_count() - misses == 2);

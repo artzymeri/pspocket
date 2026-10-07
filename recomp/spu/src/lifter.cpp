@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <format>
 #include <map>
+#include <optional>
 
 #include "pspocket/spu/context.h"
 #include "pspocket/spu/decoder.hpp"
@@ -42,6 +43,9 @@ public:
     virtual std::string call(u32 target, u32 ret) const = 0;
     // Indirect call, ctx->pc already set to the target.
     virtual std::string call_dynamic(u32 ret) const = 0;
+    // Around a stop the runtime may read and write any register in ctx.
+    virtual std::string spill_for_stop() const { return "    PSL_SPILL();\n"; }
+    virtual std::string reload_after_stop() const { return "    PSL_RELOAD();\n"; }
 
     // bra and brasl.
     std::string jump_absolute(u32 target, u32 from) const { return relocatable_ ? leave_absolute(target) : jump(target, from); }
@@ -111,7 +115,9 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     case Op::STOPD: {
         const u32 code = inst.op == Op::STOP ? inst.stop_signal() : 0x3FFF;
         if (spill_around_stop) {
-            o += std::format("    PSL_SPILL();\n    if (ps_spu_stop(ctx, {}, 0x{:X}u)) goto exit_now;\n    PSL_RELOAD();\n", flow.pc(a), code);
+            o += flow.spill_for_stop();
+            o += std::format("    if (ps_spu_stop(ctx, {}, 0x{:X}u)) goto exit_now;\n", flow.pc(a), code);
+            o += flow.reload_after_stop();
         } else {
             o += std::format("    if (ps_spu_stop(ctx, {}, 0x{:X}u)) goto exit_spill;\n", flow.pc(a), code);
         }
@@ -532,15 +538,303 @@ public:
     std::string call_dynamic(u32) const override { return "    goto exit_spill;\n"; }
 };
 
+// ---- registers loaded where needed, stored where changed (D-219)
+//
+// A function loaded every register it uses when it was entered and stored every register it writes when it left
+// (function entry loads alone were 9.4% of GTA V's translated SPU time, run 137b). Now, entered at its entry (a
+// call), it loads only the registers that may be read before they are written; and every way out stores only the
+// registers that may have been written since ctx last held them ("dirty"). Entered anywhere else (the run loop
+// resuming it at a label) it still loads them all.
+//
+// Two analyses over the function's instructions, mirroring how lower() and FunctionFlow leave each one:
+// - forward, the dirty set before each instruction: what the instructions on some path from the entry wrote, less
+//   what a call stored (the callee's touched set) or a stop or an indirect call stored (everything);
+// - backward, the live set: the registers an instruction reads, and at every store of dirty registers (each way
+//   out, a call, a stop) those registers, since their locals must hold the right value whichever path led there.
+//   After a call only the live registers the callee may have written are loaded; after a stop or an indirect call
+//   only the live ones.
+// An indirect jump goes on in the function only to the labels the analyzer found such jumps may reach
+// (Function::dynamic: jump tables, constants, seeds); anything else, a return above all, leaves to the run loop (or to
+// the calling C function, when it returns to the call). Their live sets are live at the jump and the dirty set flows
+// to them. Each distinct dirty set at a way out gets its own exit block, and each one at an indirect jump its own
+// dispatch switch over those labels, whose default leaves through that exit.
+struct RegSetLess {
+    bool operator()(const RegSet& a, const RegSet& b) const { return a.bits < b.bits; }
+};
+
+class RegFlow {
+public:
+    struct Node {
+        RegSet read, write;
+        bool falls = false;     // continues at a + 4
+        bool exit_pre = false;  // may leave before its write (a channel that blocks, a halt, an illegal instruction)
+        bool exit_post = false; // may leave after it (a branch or call out of the function, a loop's attention poll)
+        bool dispatch = false;  // an indirect jump (to any label, or out)
+        bool stop = false;      // stores the dirty registers, may leave, loads the live ones
+        bool call = false;      // a direct call of a lifted function (sum), returning to ret
+        bool call_dynamic = false;
+        const CallSummary* sum = nullptr;
+        u32 ret = 0;
+        std::vector<usize> targets; // local branch targets (indexes)
+    };
+
+    RegFlow(const LsImage& image, const Function& f, const std::map<u32, std::string>& symbols,
+        const std::map<u32, CallSummary>& sums, const LiftOptions& options)
+        : f_(f)
+    {
+        for (usize i = 0; i < f.insns.size(); i++) index_.emplace(f.insns[i], i);
+        nodes_.resize(f.insns.size());
+        for (usize i = 0; i < f.insns.size(); i++) nodes_[i] = node(image, f.insns[i], symbols, sums, options);
+        for (u32 l : f.dynamic) dynamic_.push_back(index_.at(l));
+        dirty_.resize(nodes_.size());
+        live_.resize(nodes_.size());
+        forward();
+        backward();
+    }
+
+    const Node& node(usize i) const { return nodes_[i]; }
+    // Dirty before instruction i, after its write, and after it (to a + 4 or its call's return).
+    const RegSet& dirty_in(usize i) const { return dirty_[i]; }
+    RegSet dirty_def(usize i) const
+    {
+        RegSet d = dirty_[i];
+        d |= nodes_[i].write;
+        return d;
+    }
+    RegSet dirty_after(usize i) const
+    {
+        const Node& n = nodes_[i];
+        if (n.stop || n.call_dynamic) return {};
+        if (n.call) return without(dirty_def(i), n.sum->touched);
+        return dirty_def(i);
+    }
+    const RegSet& live_in(usize i) const { return live_[i]; }
+    // Live at address a when it is a lifted instruction of the function (else nothing: the code there leaves).
+    RegSet live_at(u32 a) const
+    {
+        const auto it = index_.find(a);
+        return it == index_.end() ? RegSet{} : live_[it->second];
+    }
+    std::optional<usize> index(u32 a) const
+    {
+        const auto it = index_.find(a);
+        return it == index_.end() ? std::nullopt : std::optional<usize>(it->second);
+    }
+
+private:
+    Node node(const LsImage& image, u32 a, const std::map<u32, std::string>& symbols, const std::map<u32, CallSummary>& sums,
+        const LiftOptions& options) const
+    {
+        const u32 word = image.word(a);
+        const Inst inst = decode(word);
+        const RegUse use = reg_use(inst);
+        Node n;
+        n.read = use.read;
+        n.write = use.write;
+        const u32 ret = (a + 4) & PS_SPU_PC_MASK;
+        const auto jump = [&](u32 target) {
+            if (!f_.labels.contains(target)) {
+                n.exit_post = true;
+                return;
+            }
+            n.targets.push_back(index_.at(target));
+            if (target <= a) n.exit_post = true; // the attention poll
+        };
+        const auto call = [&](u32 target) {
+            n.ret = ret;
+            if (!symbols.contains(target)) {
+                n.exit_post = true;
+                return;
+            }
+            const auto sum = sums.find(target);
+            if (sum == sums.end()) {
+                n.call_dynamic = true;
+                return;
+            }
+            n.call = true;
+            n.sum = &sum->second;
+        };
+        switch (inst.op) {
+        case Op::STOP:
+        case Op::STOPD: n.stop = n.falls = true; return n;
+        case Op::RDCH:
+        case Op::RCHCNT:
+        case Op::WRCH:
+        case Op::HEQ:
+        case Op::HGT:
+        case Op::HLGT:
+        case Op::HEQI:
+        case Op::HGTI:
+        case Op::HLGTI: n.exit_pre = n.falls = true; return n;
+        case Op::BR: jump(branch_target(inst, a)); return n;
+        case Op::BRA:
+            if (options.relocatable) n.exit_post = true;
+            else jump(branch_target(inst, a));
+            return n;
+        case Op::BRZ:
+        case Op::BRNZ:
+        case Op::BRHZ:
+        case Op::BRHNZ:
+            jump(branch_target(inst, a));
+            n.falls = true;
+            return n;
+        case Op::BRSL: call(branch_target(inst, a)); return n;
+        case Op::BRASL:
+            if (options.relocatable) n.exit_post = true;
+            else call(branch_target(inst, a));
+            return n;
+        case Op::BI:
+        case Op::IRET: n.dispatch = n.exit_post = true; return n;
+        case Op::BISL:
+            n.call_dynamic = n.exit_post = true;
+            n.ret = ret;
+            return n;
+        case Op::BISLED:
+        case Op::BIZ:
+        case Op::BINZ:
+        case Op::BIHZ:
+        case Op::BIHNZ: n.dispatch = n.exit_post = n.falls = true; return n;
+        default: break;
+        }
+        // Everything else falls through, unless lower() has no code for it (it raises the illegal instruction).
+        std::string probe;
+        const StepFlow flow(options.relocatable);
+        n.falls = lower(probe, inst, a, flow, options.xfloat, true);
+        if (!n.falls) n.exit_pre = true;
+        return n;
+    }
+
+    // a + 4 as the next instruction in order, when it is one.
+    std::optional<usize> next(usize i) const
+    {
+        if (i + 1 < f_.insns.size() && f_.insns[i + 1] == f_.insns[i] + 4) return i + 1;
+        return std::nullopt;
+    }
+    std::optional<usize> ret_index(const Node& n) const
+    {
+        if (!f_.labels.contains(n.ret)) return std::nullopt; // continue_at() leaves
+        return index(n.ret);
+    }
+
+    void forward()
+    {
+        for (bool changed = true; changed;) {
+            changed = false;
+            const auto flow_to = [&](usize j, const RegSet& d) {
+                RegSet merged = dirty_[j];
+                merged |= d;
+                if (!(merged == dirty_[j])) {
+                    dirty_[j] = merged;
+                    changed = true;
+                }
+            };
+            for (usize i = 0; i < nodes_.size(); i++) {
+                const Node& n = nodes_[i];
+                const RegSet def = dirty_def(i);
+                for (usize t : n.targets) flow_to(t, def);
+                if (n.dispatch)
+                    for (usize l : dynamic_) flow_to(l, def);
+                if (n.falls)
+                    if (const auto j = next(i)) flow_to(*j, dirty_after(i));
+                if (n.call || n.call_dynamic)
+                    if (const auto j = ret_index(n)) flow_to(*j, dirty_after(i));
+            }
+        }
+    }
+
+    void backward()
+    {
+        for (bool changed = true; changed;) {
+            changed = false;
+            RegSet dynamic_live;
+            for (usize l : dynamic_) dynamic_live |= live_[l];
+            for (usize k = nodes_.size(); k-- > 0;) {
+                const Node& n = nodes_[k];
+                const RegSet def = dirty_def(k);
+                RegSet after;
+                if (n.exit_post) after |= def;
+                for (usize t : n.targets) after |= live_[t];
+                if (n.dispatch) {
+                    after |= def;
+                    after |= dynamic_live;
+                }
+                if (n.falls) {
+                    const auto j = next(k);
+                    if (!j) after |= dirty_after(k); // falls out of the function
+                    else if (!n.stop) after |= live_[*j];  // (a stop loads what is live after it)
+                }
+                if (n.call || n.call_dynamic) {
+                    after |= def; // the stores before the call (and of the rest when it does not come back)
+                    const auto j = ret_index(n);
+                    if (!j) after |= dirty_after(k);
+                    else if (n.call) after |= without(live_[*j], n.sum->written); // kept in locals across it
+                }
+                RegSet in = n.read;
+                if (n.exit_pre || n.stop) in |= dirty_[k];
+                in |= without(after, n.write);
+                if (!(in == live_[k])) {
+                    live_[k] = in;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    const Function& f_;
+    std::map<u32, usize> index_;
+    std::vector<Node> nodes_;
+    std::vector<usize> dynamic_;
+    std::vector<RegSet> dirty_, live_;
+};
+
 // ---- full mode ----
+
+// The function's ways out, one per distinct set of dirty registers to store ("exit_now" stores nothing), and its
+// dispatch switches for indirect jumps, one per dirty set (the default leaves through that set's exit).
+class Exits {
+public:
+    std::string exit(const RegSet& dirty)
+    {
+        if (dirty.empty()) return "exit_now";
+        return std::format("exit_{}", exits_.emplace(dirty, exits_.size()).first->second);
+    }
+    // Where an indirect jump goes: a switch over the labels it may reach, or straight out when there are none.
+    std::string dispatch(const Function& f, const RegSet& dirty)
+    {
+        if (f.dynamic.empty()) return exit(dirty);
+        return std::format("dispatch_{}", dispatches_.emplace(dirty, dispatches_.size()).first->second);
+    }
+    // The dispatch switches, then the exits.
+    std::string emit(const Function& f, bool relocatable)
+    {
+        const std::string sw = relocatable ? "    switch ((ctx->pc - rel) & 0x3FFFFu) {\n" : "    switch (ctx->pc) {\n";
+        const auto cases = [](const std::set<u32>& labels) {
+            std::string c;
+            for (u32 l : labels) c += std::format("    case 0x{:05X}u: goto L_{:05X};\n", l, l);
+            return c;
+        };
+        std::string o = "dispatch:\n" + sw + cases(f.labels) + "    default: goto exit_now;\n    }\n";
+        const std::string dynamic = cases(f.dynamic);
+        for (const auto& [dirty, n] : std::map<RegSet, usize, RegSetLess>(dispatches_))
+            o += std::format("dispatch_{}:\n{}{}    default: goto {};\n    }}\n", n, sw, dynamic, exit(dirty));
+        for (const auto& [dirty, n] : exits_) o += std::format("exit_{}:\n   {}\n    return;\n", n, stores(dirty));
+        return o + "exit_now:\n    return;\n";
+    }
+
+private:
+    std::map<RegSet, usize, RegSetLess> exits_, dispatches_;
+};
 
 class FunctionFlow final : public Flow {
 public:
-    FunctionFlow(const Function& f, const std::map<u32, std::string>& symbols, const std::map<u32, CallSummary>& sums,
+    FunctionFlow(const Function& f, const std::map<u32, std::string>& symbols, const RegFlow& regs, Exits& exits,
         bool relocatable)
-        : Flow(relocatable), f_(f), symbols_(symbols), sums_(sums)
+        : Flow(relocatable), f_(f), symbols_(symbols), regs_(regs), exits_(&exits)
     {
     }
+
+    // The instruction lowered next (its index in f.insns).
+    void at(usize i) { i_ = i; }
 
     std::string jump(u32 target, u32 from) const override
     {
@@ -551,76 +845,104 @@ public:
                 pc(target), target);
         return std::format("    goto L_{:05X};\n", target);
     }
-    std::string jump_dynamic() const override { return "    goto dispatch;\n"; }
+    std::string jump_dynamic() const override { return std::format("    goto {};\n", exits_->dispatch(f_, regs_.dirty_def(i_))); }
     std::string call(u32 target, u32 ret) const override
     {
         const auto it = symbols_.find(target);
         if (it == symbols_.end()) return leave(target);
-        const auto sum = sums_.find(target);
-        if (sum == sums_.end())
-            return std::format("    PSL_SPILL();\n    ctx->pc = {};\n    {}(ctx, ls);\n{}", pc(target), it->second, after_call(ret));
-        const CallSummary& callee = sum->second;
+        const RegFlow::Node& n = regs_.node(i_);
+        const RegSet dirty = regs_.dirty_def(i_);
+        if (!n.call)
+            return std::format("   {}\n    ctx->pc = {};\n    {}(ctx, ls);\n{}", stores(dirty), pc(target), it->second, after_call(ret));
+        const CallSummary& callee = *n.sum;
         std::string o;
-        if (const std::string st = stores(f_.written & callee.touched); !st.empty()) o += "   " + st + "\n";
+        if (const std::string st = stores(dirty & callee.touched); !st.empty()) o += "   " + st + "\n";
         o += std::format("    ctx->pc = {};\n    {}(ctx, ls);\n", pc(target), it->second);
         // Not back here: store what the callee left alone, then return to the run loop.
-        const std::string rest = stores(without(f_.written, callee.touched));
+        const std::string rest = stores(without(dirty, callee.touched));
         o += rest.empty() ? std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n", pc(ret))
                           : std::format("    if (ctx->pc != {} || ctx->stop_reason) {{\n       {}\n        goto exit_now;\n    }}\n",
                                 pc(ret), rest);
-        if (const std::string ld = loads(f_.used & callee.written); !ld.empty()) o += "   " + ld + "\n";
+        if (const std::string ld = loads(regs_.live_at(ret) & callee.written); !ld.empty()) o += "   " + ld + "\n";
         o += continue_at(ret);
         return o;
     }
     std::string call_dynamic(u32 ret) const override
     {
         return std::format("    {{\n        const ps_spu_fn fn = ps_spu_lookup(ctx, ctx->pc);\n        if (!fn) goto exit_spill;\n"
-                           "        PSL_SPILL();\n        fn(ctx, ls);\n    }}\n{}",
-            after_call(ret));
+                           "       {}\n        fn(ctx, ls);\n    }}\n{}",
+            stores(regs_.dirty_def(i_)), after_call(ret));
+    }
+    std::string spill_for_stop() const override { return std::format("   {}\n", stores(regs_.dirty_in(i_))); }
+    std::string reload_after_stop() const override
+    {
+        return std::format("   {}\n", loads(regs_.live_at(f_.insns[i_] + 4)));
     }
 
 private:
     std::string after_call(u32 ret) const
     {
         // Continue only if the callee returned to us; otherwise ctx is current and the run loop takes over.
-        return std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n    PSL_RELOAD();\n", pc(ret)) +
+        return std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n   {}\n", pc(ret), loads(regs_.live_at(ret))) +
             continue_at(ret);
     }
     std::string continue_at(u32 ret) const
     {
-        return f_.labels.contains(ret) ? std::format("    goto L_{:05X};\n", ret) : std::string("    goto exit_spill;\n");
+        return f_.labels.contains(ret) ? std::format("    goto L_{:05X};\n", ret)
+                                       : std::format("    goto {};\n", exits_->exit(regs_.dirty_after(i_)));
     }
 
     const Function& f_;
     const std::map<u32, std::string>& symbols_;
-    const std::map<u32, CallSummary>& sums_;
+    const RegFlow& regs_;
+    Exits* exits_;
+    usize i_ = 0;
 };
+
+std::string replace_all(std::string s, std::string_view from, std::string_view to)
+{
+    for (usize at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size())) s.replace(at, from.size(), to);
+    return s;
+}
 
 std::string lift_function(const LsImage& image, const Function& f, const std::string& symbol,
     const std::map<u32, std::string>& symbols, const std::map<u32, CallSummary>& sums, const LiftOptions& options)
 {
+    const RegFlow regs(image, f, symbols, sums, options);
+    Exits exits;
+    FunctionFlow flow(f, symbols, regs, exits, options.relocatable);
     std::string o;
     o += reg_macros(f.used, f.written);
     o += std::format("void {}(SPUContext* ctx, uint8_t* ls)\n{{\n", symbol);
     o += reg_decls(f.used);
     if (options.relocatable) o += "    const uint32_t rel = ctx->reloc;\n";
+    // Called (or resumed) at the entry: only what may be read before it is written. Anywhere else: everything.
+    if (const auto entry = regs.index(f.entry); entry && f.labels.contains(f.entry))
+        o += std::format("    if (ctx->pc == {}) {{\n   {}\n        goto L_{:05X};\n    }}\n", flow.pc(f.entry),
+            loads(regs.live_in(*entry)), f.entry);
     o += "    PSL_RELOAD();\n    goto dispatch;\n";
-    const FunctionFlow flow(f, symbols, sums, options.relocatable);
     for (usize i = 0; i < f.insns.size(); i++) {
         const u32 a = f.insns[i];
         const u32 word = image.word(a);
         if (f.labels.contains(a)) o += std::format("L_{:05X}:\n", a);
         if (options.comments) o += std::format("    /* {:05x}: {:08x}  {} */\n", a, word, disassemble(word, a));
-        const bool falls = lower(o, decode(word), a, flow, options.xfloat, true);
+        flow.at(i);
+        std::string code;
+        const bool falls = lower(code, decode(word), a, flow, options.xfloat, true);
+        // The ways out lower() and Flow::leave() write: before the instruction's write or after it.
+        const RegFlow::Node& n = regs.node(i);
+        if (code.find("goto exit_spill;") != std::string::npos)
+            code = replace_all(std::move(code), "goto exit_spill;",
+                std::format("goto {};", exits.exit(n.exit_pre ? regs.dirty_in(i) : regs.dirty_def(i))));
+        o += code;
         if (falls) {
             const bool next_emitted = i + 1 < f.insns.size() && f.insns[i + 1] == a + 4;
-            if (!next_emitted) o += std::format("    ctx->pc = {};\n    goto exit_spill;\n", flow.pc((a + 4) & PS_SPU_PC_MASK));
+            if (!next_emitted)
+                o += std::format("    ctx->pc = {};\n    goto {};\n", flow.pc((a + 4) & PS_SPU_PC_MASK), exits.exit(regs.dirty_after(i)));
         }
     }
-    o += "exit_spill:\n    PSL_SPILL();\nexit_now:\n    return;\ndispatch:\n";
-    o += options.relocatable ? "    switch ((ctx->pc - rel) & 0x3FFFFu) {\n" : "    switch (ctx->pc) {\n";
-    for (u32 l : f.labels) o += std::format("    case 0x{:05X}u: goto L_{:05X};\n", l, l);
-    o += "    default: goto exit_spill;\n    }\n}\n#undef PSL_SPILL\n#undef PSL_RELOAD\n\n";
+    o += exits.emit(f, options.relocatable);
+    o += "}\n#undef PSL_SPILL\n#undef PSL_RELOAD\n\n";
     return o;
 }
 

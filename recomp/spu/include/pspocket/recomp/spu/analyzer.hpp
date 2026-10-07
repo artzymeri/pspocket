@@ -21,6 +21,10 @@ struct Function {
     u32 entry = 0;
     std::vector<u32> insns;      // every instruction address, ascending
     std::set<u32> labels;        // block starts (entry included)
+    // Labels an indirect jump of the function itself may go to: jump table targets, code addresses formed by
+    // constants, seeds (D-219). Any other target of an indirect jump leaves to the run loop, which enters the right
+    // function there.
+    std::set<u32> dynamic;
     std::set<u32> calls;         // direct call targets
     std::set<u32> exits;         // instructions whose fall-through leaves the function (end of code)
     ::pspocket::spu::RegSet used;    // registers read or written

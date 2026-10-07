@@ -48,6 +48,7 @@ public:
                     if (functions.contains(c) || !image_.in_code(c)) continue;
                     if (Function* holder = holding(functions, c)) {
                         holder->labels.insert(c);
+                        holder->dynamic.insert(c);
                         continue;
                     }
                     pending.push_back(c);
@@ -64,7 +65,9 @@ public:
         for (u32 seed : seeds) {
             if (!image_.in_code(seed) || functions.contains(seed)) continue;
             if (Function* holder = holding(functions, seed)) {
-                holder->labels.insert(seed);
+                // A run reached it through a register only when no lifted code had it as a label (a seed that is a
+                // label anyway was carried over from an earlier lift's entries: scripts/lift-spu.sh).
+                if (holder->labels.insert(seed).second) holder->dynamic.insert(seed);
                 continue;
             }
             pending.push_back(seed);
@@ -206,6 +209,7 @@ private:
                         const u32 target = image_.word(at);
                         if (!valid_code(target)) break;
                         f.labels.insert(target);
+                        f.dynamic.insert(target);
                         if (!visited.contains(target)) {
                             work.push_back(target);
                             grew = true;
@@ -223,6 +227,7 @@ private:
         f.insns.assign(visited.begin(), visited.end());
         // Labels must be lifted instructions.
         for (auto it = f.labels.begin(); it != f.labels.end();) it = visited.contains(*it) ? std::next(it) : f.labels.erase(it);
+        for (auto it = f.dynamic.begin(); it != f.dynamic.end();) it = visited.contains(*it) ? std::next(it) : f.dynamic.erase(it);
         return f;
     }
 

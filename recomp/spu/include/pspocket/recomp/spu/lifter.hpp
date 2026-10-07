@@ -6,8 +6,10 @@
 // block starts (a switch on ctx->pc). Registers it uses live in ps_spu_vec locals; local branches are gotos (loop
 // back edges poll ctx->attention); direct calls into lifted functions are C calls that continue only when the
 // callee returned to the expected address (anything else returns to the run loop); indirect branches switch over
-// the function's labels and otherwise return to the run loop, which dispatches through the program table or falls
-// back to the interpreter (logging the address).
+// the labels such branches may reach (Function::dynamic) and otherwise return to the run loop, which dispatches
+// through the program table or falls back to the interpreter (logging the address). Called at its entry, a function
+// loads only the registers it may read before writing them; every way out stores only those it may have written
+// (D-219).
 //
 // Output of lift() for options.name = N:
 //   N.h          prototypes, N_program, N_register()
