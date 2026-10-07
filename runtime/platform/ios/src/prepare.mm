@@ -21,13 +21,22 @@
 #include <vector>
 
 #include "pspocket/core/log.hpp"
+#include "session_translator.hpp"
 
 #if PSPOCKET_HAVE_CODEGEN
+#import <UIKit/UIKit.h>
+#include <sys/qos.h>
+
+#include "pspocket/codegen/toolchain.hpp"
 #include "pspocket/codesign/codesign.hpp"
+#include "pspocket/core/guest_memory.hpp"
+#include "pspocket/game/host.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/prepare/prepare.hpp"
+#include "pspocket/prepare/session.hpp"
 #include "pspocket/prepare/system.hpp"
+#include "pspocket/spu/registry.hpp"
 #endif
 
 namespace {
@@ -246,8 +255,11 @@ extern "C" int ps_prepare_start(const char* executable, const char* title_id, co
     PS_LOG_INFO(kChan, "{}: preparing with {} workers, {:.0f} MB for compiles, rates {:.2f}/{:.2f}", title_id, o.workers,
         o.memory_mb, o.prior_rates[0], o.prior_rates[1]);
 
+    // The player waits for it. Threads made without a QoS class get the default one, not their creator's (sys/qos.h),
+    // so the compiles are given theirs (D-235).
+    o.qos_class = QOS_CLASS_USER_INITIATED;
     std::thread([o = std::move(o), key = std::move(*key)]() mutable {
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0); // the compiles it starts inherit it
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
         o.key = &key;
         const pspocket::prepare::Result r = pspocket::prepare::prepare_game(o);
         if (r.ok) { // the rates for the next game's time left
@@ -371,3 +383,87 @@ extern "C" int ps_prepare_system_start(const char* flash_dir, const char* system
     return 1;
 #endif
 }
+
+namespace pspocket::ios {
+
+std::shared_ptr<prepare::SessionTranslator> start_session_translator(const std::string& title_id,
+    const std::string& images_dir, GuestMemory& memory)
+{
+#if PSPOCKET_HAVE_CODEGEN
+    if (const char* off = std::getenv("PSPOCKET_SPU_TRANSLATE"); off && std::string(off) == "0") return nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        if (g_running) { // the compiler is the preparation's (it holds compiler_mutex too)
+            PS_LOG_INFO(kChan, "SPU programs are not translated during this session: a preparation is running");
+            return nullptr;
+        }
+    }
+    // The identity signs every library the session makes: read once, kept for the process.
+    static std::optional<codesign::SigningKey> key;
+    if (!key) {
+        std::string why;
+        key = signing_key(&why);
+        if (!key) {
+            PS_LOG_INFO(kChan, "SPU programs are not translated during this session: {}", why);
+            return nullptr;
+        }
+    }
+    const std::string codegen = resources() + "/codegen";
+    std::error_code ec;
+    if (!fs::exists(codegen + "/clang/include/arm_neon.h", ec)) return nullptr;
+    prepare::SessionOptions o;
+    o.images_dir = images_dir;
+    o.work_dir = (fs::temp_directory_path() / "pspocket-session" / title_id).string();
+    prepare::Toolchain& t = o.library.toolchain;
+    t.resource_dir = codegen + "/clang";
+    t.sysroot = codegen + "/sysroot";
+    t.include_dirs = {codegen + "/include"};
+    t.entry_source = codegen + "/library/library_entry.c";
+    t.cpu = "native";
+    o.library.key = &*key;
+    NSString* bundle = [[NSBundle mainBundle] bundleIdentifier];
+    o.library.identifier = bundle ? bundle.UTF8String : "com.artzymeri.pspocket.testhost";
+    o.library.title_id = title_id;
+    o.library.workers = 1; // one core, behind the game's threads
+    o.library.qos_class = QOS_CLASS_UTILITY;
+    // Programs that would compile for longer wait for the next launch's preparation (the game would run hot meanwhile).
+    // Assassin's Creed's slowest took 5.4 s on the M4 (run 219).
+    o.max_program_seconds = 60;
+    // Not after a memory warning (for the rest of the session), not with under 2 GB left, not hot, not in Low Power
+    // Mode, not while the app is in the background.
+    static std::atomic<bool> warned{false}, active{true};
+    NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+    [center addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil
+                    usingBlock:^(NSNotification*) { warned = true; }];
+    [center addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil
+                    usingBlock:^(NSNotification*) { active = false; }];
+    [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil
+                    usingBlock:^(NSNotification*) { active = true; }];
+    o.may_compile = [] {
+        NSProcessInfo* info = [NSProcessInfo processInfo];
+        return !warned && active && !info.lowPowerModeEnabled && info.thermalState < NSProcessInfoThermalStateSerious &&
+            os_proc_available_memory() > (2048ull << 20);
+    };
+    o.load = [&memory](const std::string& path, std::string* error) {
+        const spu::RegistryBatch batch; // its programs land at once (D-231)
+        game::LoadedLibrary out;
+        return game::load_library(path, memory, &out, error);
+    };
+    // Under the game's fault handler, installed after this (D-236): the game's faults must not reach LLVM's.
+    codegen::install_llvm_signal_handlers();
+    auto translator = std::make_shared<prepare::SessionTranslator>(std::move(o));
+    if (std::string error; !translator->start(&error)) {
+        PS_LOG_WARN(kChan, "SPU programs are not translated during this session: {}", error);
+        return nullptr;
+    }
+    PS_LOG_INFO(kChan, "SPU programs the game meets untranslated are translated during the session");
+    return translator;
+#else
+    (void)title_id;
+    (void)images_dir;
+    (void)memory;
+    return nullptr;
+#endif
+}
+
+} // namespace pspocket::ios

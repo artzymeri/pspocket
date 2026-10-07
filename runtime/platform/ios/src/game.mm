@@ -56,6 +56,7 @@
 #include "pspocket/rsx/metal/metal_backend.hpp"
 #include "pspocket/rsx/write_tracker.hpp"
 #include "pspocket/spu/runtime.h"
+#include "session_translator.hpp"
 
 using namespace pspocket;
 
@@ -102,6 +103,9 @@ struct Session {
     bool translated = false;
     // The game's Metal backend, once the RSX made it: asked to trim when memory runs low (D-148).
     std::atomic<rsx::metal::MetalBackend*> backend{nullptr};
+    // SPU programs translated while it runs (D-236), when the app carries the compiler.
+    std::shared_ptr<prepare::SessionTranslator> spu_translator;
+    std::string coverage; // where the SPU images it meets are saved
 };
 
 constexpr auto kRateInterval = std::chrono::seconds(5);
@@ -404,6 +408,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         std::error_code cov_ec;
         std::filesystem::create_directories(coverage + "/spu", cov_ec);
         if (!cov_ec) {
+            s->coverage = coverage;
             hle::set_spu_dump_dir(coverage + "/spu");
             ps_spu_set_miss_log((coverage + "/spu-misses.log").c_str());
             enable_spu_modules(); // the images SPURS loads are only seen with the module hooks in (as --spu-dump)
@@ -496,6 +501,8 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         if (loaded.library->spu_register) enable_spu_modules();
         s->translated = loaded.library->ppu_function_count > 0;
     }
+    // What the game meets that no preparation knew, translated while it runs (D-236).
+    if (!s->coverage.empty()) s->spu_translator = ios::start_session_translator(s->title_id, s->coverage + "/spu", *s->memory);
 #if PSPOCKET_HAVE_GAME_PPU
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098).
     if (game_library.empty() &&
