@@ -24,9 +24,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   instruction, calls (brsl) 13.5%, function entry loads and exit stores 22%, cflts 8.5%, shufb 7%, rotqby 5.3%. D-215
   (cflts in NEON), D-216 (D-127's call saves back) and D-217 (byte rotates in NEON), each checked with spu-check over
   all 150 programs: the main SPU threads 12% less CPU, the audio SPU 15% less.
-- **Try next:** each function still loads every register it uses at entry and stores every one it writes at exit.
-  Inline small leaf helpers into their callers (a return to the call's address continues there; anything else goes
-  to the run loop as now), or load registers where first needed and store only those written; spu-check both.
+- **Tried (run 138), not kept:** inlining small leaf helpers (up to 32 instructions, 512 a function) into their
+  callers: the fuzz tests passed, but GTA V's SPU time did not move (6.98 to 6.97 s per 5 s): since D-216 a call to
+  a small leaf stores and loads only a few registers. What is left in the profile (run 137b): untagged code (the C
+  compiler's own spills of the SPU registers it cannot keep in 32 NEON registers, 14%), shufb 11%, calls 9.5%, entry
+  loads 9.4%, quadword loads 12%.
+- **Try next:** entry loads only of the registers a function reads before writing (lazily, where first needed), and
+  exit stores only of the ones written on the way (a register not written is unchanged in ctx); spu-check it.
 - **State:** open (D-215 to D-217 done).
 
 - **Seen (run 101):** a stop request (thread group stop or terminate, D-031) reaches lifted SPU code at back branches
