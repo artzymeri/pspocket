@@ -75,8 +75,11 @@ struct ThreadExit {};
 
 // Translated code returned with r1 other than at its entry: a longjmp or a fiber switch moved it elsewhere (D-161).
 // The lifter makes a pseudo-syscall there, marked by cia kNonLocalReturnCia (no guest register touched); the kernel
-// throws this to the outermost guest entry (run_guest), where the interpreter goes on from the restored context.
-// Not derived from std::exception either.
+// goes back to the innermost guest entry (run_guest), where the interpreter goes on from the restored context. It
+// jumps there with _longjmp (D-213): a C++ exception through the translated frames cost Assassin's Creed's task
+// threads most of their time in the unwinder (12,000 fiber switches a second). Between the two there are only
+// translated C frames and the interpreter's, which hold nothing to destroy; every way from host code into guest code
+// goes through run_guest. NonLocalJump is thrown only when no run_guest is on the thread (not expected).
 struct NonLocalJump {};
 inline constexpr u32 kNonLocalReturnCia = 0xFFFFFFF0; // recomp/ppu lifter.cpp emits it
 

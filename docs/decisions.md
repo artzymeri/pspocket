@@ -4700,6 +4700,31 @@ Two more costs of the RSX thread in Assassin's Creed's crowd (D-210's profile an
 Tests: tests/rsx/test_metal.mm (interleaved position and colour drawn right, 60 bytes copied, not 100; D-210's
 fragment program test covers the check).
 
+## D-213 · 2026-10-07 · A non-local jump goes back to run_guest by _longjmp, not a C++ exception
+
+D-161 made a longjmp or a fiber switch in translated code throw lv2::NonLocalJump from the lifter's marker syscall to
+run_guest, which goes on in the interpreter. Assassin's Creed switches fibers about 12,000 times a second in its later
+scenes (run 128: 8.1 million in 690 s, through the interpreter at its setjmp's return, 0xcf6d90), and a profile of
+its two task threads in the crowd (run 127) showed most of their time in the C++ unwinder: dyld looking up the image
+of every frame, and the unwinder's lock (the two threads contend for it). One of them was 76% busy, mostly unwinding.
+
+- run_guest keeps a per-thread stack of targets (its own jmp_buf, the outer one restored when it returns or an
+  exception leaves it) and Kernel::syscall jumps to the innermost with _longjmp as its first act on the marker.
+  _setjmp/_longjmp, not setjmp: on Darwin setjmp saves the signal mask with a system call.
+- Why it is safe: between that point and run_guest there are only translated C frames and the interpreter's
+  (trivially destructible locals) and the syscall entry before it constructs anything. Every way from host code into
+  guest code (a thread's entry, call_guest's callbacks) goes through run_guest, so an HLE function's frame, which may
+  hold objects with destructors, is always below the innermost target, never skipped. NonLocalJump stays for a thread
+  with no run_guest (not expected).
+- ThreadExit (process exit) is still an exception: rare, and it must run destructors.
+
+Measured in the crowd (run 129 against runs 125 and 127, the same walk and windows): the two task threads from 5.45 to
+1.89 s of CPU per 5 s, the whole process from 27.4-28.3 to 20.8 s per 5 s (a quarter less), 30-31 to 33.7 fps.
+
+Test: tests/lv2/test_threads.cpp (an executor standing in for translated code makes the marker syscall with LR and r1
+moved, three threads in a row: each goes on in the interpreter at the landing code and exits with its result; the
+executor never gets control back).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

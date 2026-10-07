@@ -348,3 +348,59 @@ TEST_CASE("lv2 threads: a guest program runs through the PPU interpreter and mak
 
     ps_ppu_set_miss_policy(old_policy);
 }
+
+namespace {
+
+// Stands in for translated code whose return finds r1 moved (a longjmp or a fiber switch, D-161): the jump restored
+// LR to `landing` and r1 elsewhere, then the lifter's marker syscall. Counts its entries; never gets control back.
+struct JumpingExecutor {
+    u32 landing = 0;
+    std::atomic<u32> entries{0}, returned{0};
+};
+
+void jumping_executor(void* user, PPUContext& ctx, u8* base, u32)
+{
+    auto& j = *static_cast<JumpingExecutor*>(user);
+    j.entries++;
+    ctx.lr = j.landing;
+    ctx.gpr[1] -= 0x200;
+    ctx.cia = kNonLocalReturnCia;
+    ps_lv2_syscall(&ctx, base);
+    j.returned++; // not reached: the kernel goes back to run_guest
+}
+
+} // namespace
+
+TEST_CASE("lv2 threads: a non-local jump in translated code goes on in the interpreter, by _longjmp (D-161, D-213)",
+    "[lv2][thread][ppu]")
+{
+    JumpingExecutor j;
+    Config config;
+    config.executor = jumping_executor;
+    config.executor_user = &j;
+    Fixture f(std::move(config));
+    Caller main(*f.kernel, "main");
+    auto li = [](u32 rd, s16 v) { return (14u << 26) | (rd << 21) | static_cast<u16>(v); };
+    constexpr u32 kMtlrR0 = 0x7C0803A6, kBlr = 0x4E800020;
+    // Where the jump lands: r3 = 77, then return to the thread's end (LR 0) whatever r1 is.
+    j.landing = f.alloc(16, 4);
+    f.w32(j.landing, li(3, 77));
+    f.w32(j.landing + 4, li(0, 0));
+    f.w32(j.landing + 8, kMtlrR0);
+    f.w32(j.landing + 12, kBlr);
+    for (int round = 0; round < 3; round++) {
+        const u32 opd = f.alloc(8);
+        f.w32(opd, 0x00200000); // the entry: the executor never runs it
+        const u32 param = f.alloc(8);
+        f.w32(param, opd);
+        const u32 idp = f.alloc(8);
+        REQUIRE(main.call(kThreadCreate, idp, param, 0, 0, 1000, 0x10000, kJoinable, f.cstr("jumper")) == CELL_OK);
+        const u32 id = static_cast<u32>(f.r64(idp));
+        REQUIRE(main.call(kThreadStart, id) == CELL_OK);
+        const u32 out = f.alloc(8);
+        REQUIRE(main.call(kThreadJoin, id, out) == CELL_OK);
+        CHECK(f.r64(out) == 77);
+    }
+    CHECK(j.entries == 3);
+    CHECK(j.returned == 0);
+}

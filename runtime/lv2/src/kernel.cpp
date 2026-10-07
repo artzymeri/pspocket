@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <setjmp.h>
 #include <thread>
 
 #include "internal.hpp"
@@ -17,6 +18,13 @@
 #include "pspocket/ppu/runtime.h"
 
 namespace pspocket::lv2 {
+
+// The innermost run_guest of this thread: where a non-local jump in translated code goes back to (D-213).
+struct NonLocalTarget {
+    jmp_buf buf;
+    NonLocalTarget* outer = nullptr;
+};
+thread_local NonLocalTarget* t_nonlocal = nullptr;
 
 // ------------------------------------------------------------------------------------------------- error names
 
@@ -763,7 +771,10 @@ void Kernel::syscall(PPUContext& ctx)
     if (!t) PS_FATAL(kChan, "syscall {} at {:#010x} from a PPU context with no lv2 thread", ctx.gpr[11], ctx.cia);
     if (impl_->exiting.load(std::memory_order_relaxed)) throw ThreadExit{};
 
-    if (ctx.cia == kNonLocalReturnCia) throw NonLocalJump{}; // D-161: the lifter's, not the guest's
+    if (ctx.cia == kNonLocalReturnCia) { // D-161: the lifter's, not the guest's
+        if (t_nonlocal) _longjmp(t_nonlocal->buf, 1); // D-213: nothing between here and run_guest to destroy
+        throw NonLocalJump{};
+    }
     const u64 number = ctx.gpr[11];
     if (number < kSyscallCount) {
         const SyscallEntry& entry = impl_->table[static_cast<u32>(number)];
@@ -804,10 +815,18 @@ void default_executor(void*, PPUContext& ctx, u8* base, u32 entry) { ps_ppu_call
 void run_guest(Kernel& k, PPUContext& ctx, u8* base, u32 entry, bool thread_top)
 {
     const u64 stop_lr = ctx.lr, stop_sp = ctx.gpr[1];
-    try {
+    // Where a non-local jump in the guest code below comes back to (D-213); the outer one again when this returns or
+    // a C++ exception (ThreadExit) leaves.
+    NonLocalTarget target;
+    target.outer = t_nonlocal;
+    t_nonlocal = &target;
+    const struct Pop {
+        NonLocalTarget* outer;
+        ~Pop() { t_nonlocal = outer; }
+    } pop{target.outer};
+    if (_setjmp(target.buf) == 0) {
         k.config().executor(k.config().executor_user, ctx, base, entry);
         return;
-    } catch (const NonLocalJump&) {
     }
     // The context the jump restored is in ctx: it continues at LR. Interpreted (translated callees still run as
     // such) until the code returns where this call would have; a further jump in translated code lands here again.
@@ -823,10 +842,9 @@ void run_guest(Kernel& k, PPUContext& ctx, u8* base, u32 entry, bool thread_top)
     options.call_lifted = true;
     for (;;) {
         ctx.cia = static_cast<u32>(ctx.lr) & ~3u;
-        try {
+        if (_setjmp(target.buf) == 0) {
             ppu::run(ctx, base, options);
             return;
-        } catch (const NonLocalJump&) {
         }
     }
 }
