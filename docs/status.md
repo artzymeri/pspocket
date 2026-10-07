@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-07, after run 125 and D-211 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-07, after run 129 and D-213 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -168,7 +168,8 @@ Altaïr walks, the pause menu works, the "Gentle Push" lesson fills the Animus w
 there with macOS `sample`: the RSX thread re-decoded shader programs the game uploads again before every draw (D-210),
 copied interleaved vertex data once per attribute and took a write fault per draw on fragment program constants
 (D-211). Now about 11.3 µs per draw (13.0 before), the crowd at 30-32 fps (25-29), no write faults (GTA V's 40 a frame
-to 0 too; the gate passes).
+to 0 too; the gate passes). Its fiber switches (12,000 a second) each threw a C++ exception, and the unwinder took
+most of two threads: D-213 goes back by _longjmp, a quarter less CPU for the whole process (run 129).
 
 Next: the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
