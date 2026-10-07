@@ -269,37 +269,32 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     // its first instruction (a copy that writes a program writes its start).
     before_access(*ea, entry.program.ucode_length ? entry.program.ucode_length : 16, false);
     const u64 epoch = check_epoch();
-    // Decoded again when its bytes changed: checked once per epoch, and whenever the program is set again (a game that
-    // writes a new program over the old one between draws of one batch sets it again). GTA V sets one nearly every
+    // Decoded again when its instructions changed: checked once per epoch, and whenever the program is set again (a game
+    // that writes a new program over the old one between draws of one batch sets it again). GTA V sets one nearly every
     // draw: decoding it each time, and looking its compile up again, was most of what the RSX thread spent on programs
-    // (D-109).
-    bool redecode = entry.program.instructions.empty() ||
-        (((state.dirty_bits & dirty::kFragmentProgram) || entry.checked != epoch) && tracker.is_dirty(entry.watch));
-    entry.checked = epoch;
-    state.dirty_bits &= ~dirty::kFragmentProgram;
-    if (redecode && !entry.program.instructions.empty() && entry.code.size() == entry.program.ucode_length &&
-        entry.program.ucode_length <= max_len) {
-        // Written since, but with the same instructions? Only the constants between them may differ (D-210).
+    // (D-109). The check compares its bytes with the ones it was decoded from, embedded constants left out (they are
+    // read every draw): no page protection, so a game writing its constants in place before each draw takes no write
+    // fault, and the RSX thread no mprotect (D-211; Assassin's Creed's crowd: 170 to 210 faults a frame).
+    bool redecode = entry.program.instructions.empty() || entry.code.size() != entry.program.ucode_length ||
+        entry.program.ucode_length > max_len;
+    if (!redecode && ((state.dirty_bits & dirty::kFragmentProgram) || entry.checked != epoch)) {
         const u8* now = mem.host(*ea);
         u32 at = 0;
-        bool same = true;
         for (const u32 c : entry.program.constant_offsets) {
-            if (c > at && std::memcmp(now + at, entry.code.data() + at, c - at) != 0) same = false;
+            if (c > at && std::memcmp(now + at, entry.code.data() + at, c - at) != 0) {
+                redecode = true;
+                break;
+            }
             at = std::max(at, c + 16);
-            if (!same) break;
         }
-        if (same && at < entry.program.ucode_length)
-            same = std::memcmp(now + at, entry.code.data() + at, entry.program.ucode_length - at) == 0;
-        if (same) {
-            tracker.unwatch(entry.watch);
-            entry.watch = tracker.watch(*ea, entry.program.ucode_length);
-            redecode = false;
-        }
+        if (!redecode && at < entry.program.ucode_length)
+            redecode = std::memcmp(now + at, entry.code.data() + at, entry.program.ucode_length - at) != 0;
     }
+    entry.checked = epoch;
+    state.dirty_bits &= ~dirty::kFragmentProgram;
     if (redecode) {
         std::string why;
         auto fp = shader::decode_fragment_program(mem.host(*ea), max_len, &why);
-        tracker.unwatch(entry.watch);
         if (!fp) {
             fragment_programs.erase(*ea);
             unsupported(std::format("fragment program at {:#010x}: {}", *ea, why));
@@ -307,7 +302,6 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
         }
         entry.address = *ea;
         entry.program = std::move(*fp);
-        entry.watch = tracker.watch(*ea, entry.program.ucode_length);
         entry.compiled.clear();
         const u8* bytes = mem.host(*ea);
         entry.code.assign(bytes, bytes + entry.program.ucode_length);

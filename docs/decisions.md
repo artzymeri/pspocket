@@ -4679,6 +4679,27 @@ again only to find the compile it already had.
 Tests: tests/rsx/test_metal.mm (two vertex programs alternating at one start and a third differing in one word; a
 fragment program with new constants, new instructions, then its first form again).
 
+## D-211 · 2026-10-07 · Vertex data copied once per buffer; fragment programs checked by their bytes, unprotected
+
+Two more costs of the RSX thread in Assassin's Creed's crowd (D-210's profile and the per-frame numbers):
+
+- **Interleaved vertices copied several times.** Each enabled attribute copied its own range of guest memory into the
+  draw's upload; with interleaved vertices (position, normal, texture coordinates side by side) those ranges overlap
+  almost entirely, so a mesh with six attributes was copied about six times per draw. Now the ranges are merged
+  (overlapping or touching ones), each group is copied once, and its attributes point into that copy at their offset
+  (the shader reads bytes at any offset). The backend counts the bytes it copies (BackendStats::vertex_bytes_copied).
+- **Write faults on fragment programs.** A fragment program's memory was write-protected to notice changes; the game
+  writes the program's embedded constants in place before each draw, so each draw cost the game's thread a write
+  fault and the RSX thread an mprotect to protect it again: 170 to 210 faults a frame. Since D-210 the backend compares
+  the program's bytes with the ones it decoded (constants left out) anyway, so fragment programs are no longer
+  protected: the same check runs at the same moments (the program set again, or a new batch of commands).
+- Measured on the crowd: the copying in the draw from about 11% of the RSX thread to 3.6% (run 124); write faults 170
+  to 210 a frame to 0.1 (run 125); the RSX thread 3.2-3.5 s to 3.0-3.4 s per 5 s, about 11.1 to 11.6 µs per draw
+  (13.0 before D-210); 30.4 to 31.8 fps.
+
+Tests: tests/rsx/test_metal.mm (interleaved position and colour drawn right, 60 bytes copied, not 100; D-210's
+fragment program test covers the check).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

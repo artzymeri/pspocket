@@ -317,13 +317,12 @@ struct CompiledProgram;
 struct FragmentProgramEntry {
     u32 address = 0;
     shader::FragmentProgram program;
-    WriteTracker::Watch watch{};
     u64 checked = ~0ull; // as CachedTexture::checked
     // What the program compiled to with these options, until it is decoded again (D-109): the lookup by hash and
     // ucode is not repeated every draw.
     std::vector<std::pair<shader::FpOptions, const CompiledProgram*>> compiled;
-    // The program's bytes as decoded, its embedded constants zeroed: written again with the same instructions (only
-    // new constants, or the same program uploaded again), it is not decoded again (D-210).
+    // The program's bytes as decoded, its embedded constants zeroed: what tells whether it changed since (D-210,
+    // D-211). Written again with the same instructions (new constants, or the same program again), it is not decoded.
     std::vector<u8> code;
 };
 

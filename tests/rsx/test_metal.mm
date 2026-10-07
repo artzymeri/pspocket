@@ -1800,6 +1800,41 @@ TEST_CASE("metal e2e: vertex programs uploaded again before each draw are found 
     }
 }
 
+TEST_CASE("metal e2e: interleaved vertex attributes are copied once and read right (D-211)")
+{
+    // Position (four floats) and colour (four bytes) in one 20-byte vertex: the two attributes' ranges overlap, and
+    // the vertex data is copied once (60 bytes, not 56 + 44).
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    const float xy[3][2] = {{-1.f, -1.f}, {1.f, -1.f}, {0.f, 1.f}};
+    for (u32 v = 0; v < 3; v++) {
+        e.put_local_f(kVertexOffset + v * 20 + 0, xy[v][0]);
+        e.put_local_f(kVertexOffset + v * 20 + 4, xy[v][1]);
+        e.put_local_f(kVertexOffset + v * 20 + 8, 0.5f);
+        e.put_local_f(kVertexOffset + v * 20 + 12, 1.f);
+        e.put_local32(kVertexOffset + v * 20 + 16, 0x00ff00ffu); // RGBA: green
+    }
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0, static_cast<u32>(VertexType::F) | (4u << 4) | (20u << 8));
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0, kVertexOffset);
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3, static_cast<u32>(VertexType::UB) | (4u << 4) | (20u << 8));
+    b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3, kVertexOffset + 16);
+    const u64 before = e.backend->stats().vertex_bytes_copied;
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().vertex_bytes_copied - before == 60);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == (std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}));
+}
+
 TEST_CASE("metal e2e: PSPOCKET_RSX_CHECK_SURFACES reports a surface sampled after its memory changed under it")
 {
     REQUIRE_METAL();

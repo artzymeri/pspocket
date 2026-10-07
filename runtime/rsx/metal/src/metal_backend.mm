@@ -1116,16 +1116,36 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             const u32 base = (state.vertex_data_base_offset() + a.offset) & 0x0fffffff; // rsx_utils.h
             const auto ea = rsx->translate(base + first * a.stride, a.location, bytes);
             if (!ea || !guest_ok(*ea, bytes)) return skip(std::format("vertex array {} at {:#x} is not mapped", i, base));
-            vs.attribs[i] = {total, a.stride, static_cast<u32>(a.type), a.size, a.frequency,
+            vs.attribs[i] = {0, a.stride, static_cast<u32>(a.type), a.size, a.frequency,
                 shader::kAttribSwap | (modulo ? shader::kAttribModulo : 0u), first, 0, {}};
             copies.push_back({i, *ea, bytes});
-            total += (bytes + 15) & ~15u;
+        }
+        // Interleaved attributes read overlapping ranges of one buffer (position, normal, texture coordinates in one
+        // vertex): each overlapping or touching group is copied once, and its attributes point into that copy
+        // (D-211). The shader reads bytes at any offset.
+        std::sort(copies.begin(), copies.end(), [](const Copy& x, const Copy& y) { return x.ea < y.ea; });
+        struct Span {
+            u32 ea, end, offset;
+        };
+        std::vector<Span> spans;
+        for (const Copy& c : copies) {
+            if (!spans.empty() && c.ea <= spans.back().end) spans.back().end = std::max(spans.back().end, c.ea + c.size);
+            else spans.push_back({c.ea, c.ea + c.size, 0});
+        }
+        for (Span& sp : spans) {
+            sp.offset = total;
+            total += (sp.end - sp.ea + 15) & ~15u;
         }
         vertex_data = transient.alloc(std::max<u32>(total, 16), 16);
+        for (const Span& sp : spans) {
+            before_access(sp.ea, sp.end - sp.ea, false);
+            std::memcpy(vertex_data.data + sp.offset, mem.host(sp.ea), sp.end - sp.ea);
+            stats.vertex_bytes_copied += sp.end - sp.ea;
+        }
         for (const Copy& c : copies) {
-            before_access(c.ea, c.size, false);
-            std::memcpy(vertex_data.data + vs.attribs[c.attr].offset, mem.host(c.ea), c.size);
-            vs.attribs[c.attr].offset += vertex_data.offset;
+            const Span& sp = *std::prev(std::upper_bound(spans.begin(), spans.end(), c.ea,
+                [](u32 ea, const Span& x) { return ea < x.ea; }));
+            vs.attribs[c.attr].offset = vertex_data.offset + sp.offset + (c.ea - sp.ea);
         }
     }
     if (!index_data.buffer) index_data = vertex_data; // bound but unused
@@ -1403,7 +1423,6 @@ MetalBackend::~MetalBackend()
             for (u32 i = 0; i < impl_->frames_in_flight_limit; i++) dispatch_semaphore_signal(impl_->frames_in_flight);
         }
         for (auto& [key, t] : impl_->textures) impl_->tracker.unwatch(t->watch);
-        for (auto& [ea, f] : impl_->fragment_programs) impl_->tracker.unwatch(f.watch);
         for (auto& s : impl_->surfaces) impl_->tracker.unwatch(s->watch);
     }
 }
