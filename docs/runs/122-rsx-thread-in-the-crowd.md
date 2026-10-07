@@ -90,3 +90,11 @@ Run 132's log also showed a compressed texture inside a large depth buffer's mem
 not laid over (as before), only those in the texture's own rows. The gate after D-214: **PASS** (29.8 fps, 2 frame
 jumps, no new messages).
 
+## Run 133: the lab's shadows
+
+The lab walk of run 117 again (`games/ac1/walk-garden.txt`, frames every 900), after D-214: median **57.7 fps** with
+the GPU drawing (51.0 in run 117, 29.2 in run 109). Frame 11,700, the same view of the lab in both runs: in run 117
+the floor has almost no shadows; in run 133 the sun's shadows are there (the stairs, the window bars across the floor,
+the Animus table, the people). The shadow cascades beside the first were read from stale memory before D-214. That is
+likely much of the "washed out" look noted since run 099.
+

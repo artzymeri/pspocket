@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-07, after run 129 and D-213 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-07, after run 133 and D-214 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -80,8 +80,7 @@ phone).
    again, then Assassin's Creed to its title screen and GTA V to the bank.
 
 Rendering for any game (D-158): new shaders compile in the background with a 4 ms wait a frame, so a game the phone has
-never seen does not stall; more texture formats decode (D-163). Open: the Abstergo lab looks washed out (compare with
-footage), multisampled targets drawn with one sample, a GPU shader interpreter for the draws left out while compiling.
+never seen does not stall; more texture formats decode (D-163). Open (the lab's washed-out look was mostly missing shadows, D-214), multisampled targets drawn with one sample, a GPU shader interpreter for the draws left out while compiling.
 
 **The system software (2026-10-06, D-165 to D-178).** The engine works out per game which system libraries come from
 Sony's firmware and which are pspocket's own (D-175, D-177), as a PS3 links them. The firmware is analysed in
@@ -169,7 +168,10 @@ there with macOS `sample`: the RSX thread re-decoded shader programs the game up
 copied interleaved vertex data once per attribute and took a write fault per draw on fragment program constants
 (D-211). Now about 11.3 µs per draw (13.0 before), the crowd at 30-32 fps (25-29), no write faults (GTA V's 40 a frame
 to 0 too; the gate passes). Its fiber switches (12,000 a second) each threw a C++ exception, and the unwinder took
-most of two threads: D-213 goes back by _longjmp, a quarter less CPU for the whole process (run 129).
+most of two threads: D-213 goes back by _longjmp, a quarter less CPU for the whole process (run 129). Its shadow
+cascades are four depth buffers side by side sampled as one texture, and only the first was laid over the decode: the
+rest came from stale memory, so the lab had almost no sun shadows. D-214 lays every target in the texture's rows over
+it (and copies nothing when they cover it): the shadows are there now, and the lab walk's median is 57.7 fps (run 133).
 
 Next: the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
