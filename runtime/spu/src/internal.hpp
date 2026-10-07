@@ -10,11 +10,21 @@
 #include "pspocket/spu/context.h"
 #include "pspocket/spu/runtime.h"
 
+// An image the context runs with no lifted program (D-233): looked up again when programs are registered during the
+// session (pspocket::spu::set_pending_home). The SPU's own thread only.
+struct ps_spu_pending_home {
+    pspocket::u64 hash = 0; // the image's ps_spu_hash64 when it was loaded
+    pspocket::u32 ls_start = 0, size = 0;
+    bool relocatable = false, armed = false;
+    pspocket::u64 checked = 0; // pspocket::spu::registry_additions() at the last lookup
+};
+
 struct ps_spu_host {
     std::mutex mutex;
     std::condition_variable cv; // channel state changed (SPU waits for data/space, PPU waits for the outbound mailbox)
     std::atomic<bool> stop_requested{false};
     std::atomic<pspocket::u32> status{PS_SPU_STATUS_STOPPED};
+    ps_spu_pending_home pending;
 };
 
 namespace pspocket::spu::detail {
@@ -75,6 +85,12 @@ bool holds(const ps_spu_program* p, u32 reloc, u32 pc);
 u32 reloc_for(const ps_spu_program* p, u32 code_start);
 // Makes p (at reloc) the current program; home stays.
 void set_current(SPUContext* ctx, const ps_spu_program* p, u32 reloc);
+// Forgets the context's pending home (an attach, a reset).
+inline void disarm_pending(SPUContext* ctx)
+{
+    if (ctx->host) ctx->host->pending.armed = false;
+}
+inline bool pending_armed(const SPUContext* ctx) { return ctx->host && ctx->host->pending.armed; }
 // The GET observer (ps_spu_set_get_observer).
 void observe_get(SPUContext* ctx, u32 lsa, u32 eal, u32 size);
 

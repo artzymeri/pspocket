@@ -14,6 +14,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/fp.h"
 #include "pspocket/spu/interpreter.hpp"
+#include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
@@ -35,7 +36,13 @@ static_assert(std::endian::native == std::endian::little, "ps_spu_hash64 reads w
 
 std::mutex g_registry_mutex;
 std::vector<ps_spu_program*> g_programs;
+// The tables of programs unregistered: a context may still run one, so they are never freed (D-231).
+std::vector<ps_spu_fn*> g_retired_tables;
 std::atomic<u64> g_registry_generation{0};
+std::atomic<u64> g_registry_additions{0}, g_registry_removals{0};
+// RegistryBatch: how many live on this thread, and whether a registration was made under them.
+thread_local u32 t_batch_depth = 0;
+thread_local bool t_batch_added = false;
 
 #ifdef NDEBUG
 std::atomic<ps_spu_miss_policy> g_miss_policy{PS_SPU_MISS_INTERPRET};
@@ -61,6 +68,35 @@ struct Site {
     std::atomic<u64> steps{0}, entries{0};
 };
 Site g_sites[kSites];
+
+// The interpreted steps of contexts running an image with no lifted program, by image (D-233): (hash, LS start) keys,
+// filled without locks as g_sites.
+struct ImageSite {
+    std::atomic<u64> hash{0};
+    std::atomic<u32> ls_start{~0u};
+    std::atomic<u64> steps{0};
+};
+constexpr u32 kImageSites = 1024;
+ImageSite g_image_sites[kImageSites];
+std::atomic<u64> g_pending_adopted{0};
+std::mutex g_pending_log_mutex;
+std::unordered_set<u64> g_pending_logged;
+
+void count_image(u64 hash, u32 ls_start, u64 steps)
+{
+    u32 h = static_cast<u32>((hash ^ (hash >> 29) ^ ls_start * 0x85EBCA6Bu) % kImageSites);
+    for (u32 probe = 0; probe < 32; probe++, h = (h + 1) % kImageSites) {
+        ImageSite& s = g_image_sites[h];
+        u32 expected = ~0u;
+        if (s.ls_start.load(std::memory_order_relaxed) == ~0u && s.ls_start.compare_exchange_strong(expected, ls_start)) {
+            s.hash.store(hash, std::memory_order_relaxed);
+        } else if (s.ls_start.load(std::memory_order_relaxed) != ls_start || s.hash.load(std::memory_order_relaxed) != hash) {
+            continue;
+        }
+        s.steps.fetch_add(steps, std::memory_order_relaxed);
+        return;
+    }
+}
 
 void count_interpreted(const ps_spu_program* program, u32 pc, u64 steps)
 {
@@ -119,6 +155,31 @@ void set_current(SPUContext* ctx, const ps_spu_program* p, u32 reloc)
     if (p) ctx->xfloat = p->xfloat;
 }
 
+// A context running an image with no lifted program takes the program registered for it since (D-233): looked up
+// once per batch of registrations, attached if its code words in local store are still the program's code and it was
+// lifted for the floating-point model the context runs with (switching models mid-run would change results).
+bool adopt_pending(SPUContext* ctx)
+{
+    ps_spu_pending_home& pend = ctx->host->pending;
+    const u64 additions = pspocket::spu::registry_additions();
+    if (additions == pend.checked) return false;
+    pend.checked = additions;
+    const ps_spu_program* p =
+        pspocket::spu::find_program_checked(pend.hash, pend.ls_start, pend.size, pend.relocatable, ctx->ls);
+    if (!p) return false;
+    if (p->xfloat != ctx->xfloat) {
+        pend.armed = false; // its next load attaches it
+        std::lock_guard lock(g_pending_log_mutex);
+        if (g_pending_logged.insert(pend.hash).second)
+            PS_LOG_WARN("spu", "SPU {}: program {} registered for the image it runs, lifted for another floating-point "
+                               "model: attached at its next load", ctx->id, p->name);
+        return false;
+    }
+    ps_spu_attach_program_at(ctx, p, pend.ls_start);
+    g_pending_adopted.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool resolve_program(SPUContext* ctx, u32 pc)
 {
     if (const ps_spu_program* p = ctx->program; p && holds(p, ctx->reloc, pc)) return false; // its own code
@@ -127,6 +188,8 @@ bool resolve_program(SPUContext* ctx, u32 pc)
         set_current(ctx, h, ctx->home_reloc);
         return ps_spu_lookup(ctx, pc) != nullptr;
     }
+    if (!ctx->home && pending_armed(ctx) && adopt_pending(ctx) && holds(ctx->home, ctx->home_reloc, pc))
+        return ps_spu_lookup(ctx, pc) != nullptr;
     const ps_spu_resolver resolver = g_resolver.load(std::memory_order_relaxed);
     if (!resolver) return false;
     u32 code_start = 0;
@@ -199,26 +262,48 @@ void ps_spu_register_program(ps_spu_program* program)
 {
     PS_CHECK(program && (program->code_start & 3) == 0 && (program->code_size & 3) == 0);
     PS_CHECK(program->code_start + program->code_size <= PS_SPU_LS_SIZE);
-    std::lock_guard lock(g_registry_mutex);
-    if (!program->table) {
-        program->table = new ps_spu_fn[program->code_size / 4]();
+    // The table is built outside the lock (SPU threads look programs up meanwhile, D-231) and published under it,
+    // before the program can be found: whoever finds it through the lock sees it whole.
+    bool built_already;
+    {
+        std::lock_guard lock(g_registry_mutex);
+        built_already = program->table != nullptr;
+    }
+    ps_spu_fn* table = nullptr;
+    if (!built_already) {
+        table = new ps_spu_fn[program->code_size / 4]();
         for (u32 i = 0; i < program->entry_count; i++) {
             const ps_spu_entry& e = program->entries[i];
             const u32 off = e.addr - program->code_start;
             PS_CHECK(off < program->code_size && (off & 3) == 0);
-            program->table[off >> 2] = e.fn;
+            table[off >> 2] = e.fn;
         }
     }
-    if (std::find(g_programs.begin(), g_programs.end(), program) == g_programs.end()) g_programs.push_back(program);
-    g_registry_generation.fetch_add(1, std::memory_order_release);
+    {
+        std::lock_guard lock(g_registry_mutex);
+        if (!program->table) std::swap(program->table, table); // another thread's registration may have won
+        if (std::find(g_programs.begin(), g_programs.end(), program) == g_programs.end()) {
+            g_programs.push_back(program);
+            if (t_batch_depth) t_batch_added = true;
+            else g_registry_additions.fetch_add(1, std::memory_order_release);
+        }
+        g_registry_generation.fetch_add(1, std::memory_order_release);
+    }
+    delete[] table;
 }
 
 void ps_spu_unregister_program(ps_spu_program* program)
 {
     std::lock_guard lock(g_registry_mutex);
-    g_programs.erase(std::remove(g_programs.begin(), g_programs.end(), program), g_programs.end());
-    delete[] program->table;
-    program->table = nullptr;
+    const auto it = std::remove(g_programs.begin(), g_programs.end(), program);
+    if (it != g_programs.end()) {
+        g_programs.erase(it, g_programs.end());
+        // Its table stays: a context attached to it may be running it right now (D-231). Registering it again finds
+        // the table built.
+        if (std::find(g_retired_tables.begin(), g_retired_tables.end(), program->table) == g_retired_tables.end())
+            g_retired_tables.push_back(program->table);
+        g_registry_removals.fetch_add(1, std::memory_order_release);
+    }
     g_registry_generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -234,7 +319,9 @@ const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, ui
 
 uint64_t ps_spu_code_hash(const uint8_t* image, uint32_t code_size, const uint32_t* code_words)
 {
-    std::vector<u8> code;
+    // The code words gathered in a buffer kept per thread: SPU threads hash images as they load them (D-231).
+    thread_local std::vector<u8> code;
+    code.clear();
     code.reserve(code_size);
     for (u32 w = 0; w < code_size / 4; w++)
         if (!code_words || ((code_words[w >> 5] >> (w & 31)) & 1)) code.insert(code.end(), image + 4 * w, image + 4 * w + 4);
@@ -277,6 +364,7 @@ void ps_spu_attach_program(SPUContext* ctx, const ps_spu_program* program)
 
 void ps_spu_attach_program_at(SPUContext* ctx, const ps_spu_program* program, uint32_t code_start)
 {
+    detail::disarm_pending(ctx); // a new image (or none): a key set before is another's (D-233)
     const u32 reloc = detail::reloc_for(program, code_start);
     detail::set_current(ctx, program, reloc);
     ctx->home = program;
@@ -327,10 +415,14 @@ uint32_t ps_spu_run(SPUContext* ctx)
             if (detail::resolve_program(ctx, ctx->pc)) continue; // another program has lifted code here (D-079)
             if (ctx->program) report_miss(ctx, ctx->pc);
             RunOptions options;
-            options.stop_at_lifted = ctx->program || ctx->home || g_resolver.load(std::memory_order_relaxed);
+            const bool pending = detail::pending_armed(ctx);
+            options.stop_at_lifted =
+                ctx->program || ctx->home || pending || g_resolver.load(std::memory_order_relaxed);
             const ps_spu_program* program = ctx->program;
             const u32 pc = ctx->pc;
-            count_interpreted(program, pc, run(*ctx, options).steps);
+            const u64 steps = run(*ctx, options).steps;
+            count_interpreted(program, pc, steps);
+            if (pending && !program) count_image(ctx->host->pending.hash, ctx->host->pending.ls_start, steps);
         }
         if (ctx->stop_reason != PS_SPU_STOP_NONE) break;
     }
@@ -361,3 +453,54 @@ uint32_t ps_spu_interpret(SPUContext* ctx, uint64_t max_steps)
 }
 
 } // extern "C"
+
+namespace pspocket::spu {
+
+uint64_t registry_additions() { return g_registry_additions.load(std::memory_order_acquire); }
+uint64_t registry_removals() { return g_registry_removals.load(std::memory_order_acquire); }
+
+void set_pending_home(SPUContext* ctx, uint64_t hash, uint32_t ls_start, uint32_t size, bool relocatable,
+    uint64_t additions)
+{
+    if (!ctx->host || ctx->home) return;
+    PS_CHECK(ls_start < PS_SPU_LS_SIZE && size <= PS_SPU_LS_SIZE - ls_start);
+    ctx->host->pending = {hash, ls_start, size, relocatable, true, additions};
+}
+
+uint64_t pending_homes_adopted() { return g_pending_adopted.load(std::memory_order_relaxed); }
+
+std::vector<InterpretedImage> interpreted_images(uint32_t n)
+{
+    std::vector<InterpretedImage> all;
+    for (const ImageSite& s : g_image_sites) {
+        if (s.ls_start.load(std::memory_order_relaxed) == ~0u) continue;
+        all.push_back({s.hash.load(std::memory_order_relaxed), s.ls_start.load(std::memory_order_relaxed),
+            s.steps.load(std::memory_order_relaxed)});
+    }
+    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.steps > b.steps; });
+    if (all.size() > n) all.resize(n);
+    return all;
+}
+
+RegistryBatch::RegistryBatch() { t_batch_depth++; }
+
+RegistryBatch::~RegistryBatch()
+{
+    if (--t_batch_depth == 0 && t_batch_added) {
+        t_batch_added = false;
+        g_registry_additions.fetch_add(1, std::memory_order_release);
+    }
+}
+
+const ps_spu_program* find_program_checked(uint64_t hash, uint32_t ls_start, uint32_t size, bool relocatable,
+    const uint8_t* ls)
+{
+    PS_CHECK(ls_start < PS_SPU_LS_SIZE && size <= PS_SPU_LS_SIZE - ls_start);
+    const ps_spu_program* p = ps_spu_find_program(hash, ls_start, size);
+    if (!p && relocatable) p = ps_spu_find_program_by_code(ls + ls_start, size);
+    if (!p || !p->code_hash) return nullptr;
+    // Its data may have changed since `hash` was taken; its code must not have.
+    return ps_spu_code_hash(ls + ls_start, size, p->code_words) == p->code_hash ? p : nullptr;
+}
+
+} // namespace pspocket::spu

@@ -289,6 +289,7 @@ void ps_spu_thread_reset(SPUContext* ctx, uint32_t dec_value)
     ctx->home = nullptr;
     ctx->reloc = 0;
     ctx->home_reloc = 0;
+    pspocket::spu::detail::disarm_pending(ctx);
 }
 
 void ps_spu_clear_in_mbox(SPUContext* ctx)

@@ -5038,6 +5038,46 @@ end) instead of one per pass of the reader's loop. Measured in one sitting (runs
 time is in the draws (D-210, D-211). Kept: a test that an acquire blocking inside a packet parks on its own word and
 the rest of the packet runs after (tests/rsx/test_fifo.cpp).
 
+## D-231 · 2026-10-07 · Programs can be registered while SPU threads run
+
+The registry assumed every program was registered at startup. A translator adding programs during the session
+(D-236) needs more:
+
+- **Whole or not at all:** a program's lookup table is built outside the registry's lock and published under it,
+  before the program can be found; a thread that finds it sees it whole.
+- **Unregistered programs keep their table:** ps_spu_unregister_program freed it while a context could still be
+  running the program (a use after free in waiting); the table now stays (kept on a list, never freed), and
+  registering the program again finds it built.
+- **Counts for those who remember answers:** registrations and unregistrations are counted apart
+  (spu::registry_additions, registry_removals, in the new registry.hpp, outside the game library's ABI headers). A
+  spu::RegistryBatch makes a library's registrations one addition.
+- **A checked lookup:** spu::find_program_checked finds the program for an image met earlier (by its key, or by its
+  code words for a relocatable one, D-208) and returns it only while the image's code words in local store still hash
+  to the program's code hash: what a context switching mid-run needs, its data having changed since.
+- ps_spu_code_hash gathers the code words in a buffer kept per thread (SPU threads hash images as they load them).
+- Test: tests/spu/test_spu_registry.cpp (four threads looking programs up while 500 are registered in batches of 50:
+  every program found is whole, one addition per batch, no removal; a context keeps running a program unregistered
+  under it; the first of two equal keys wins; a changed code word refuses the checked lookup, a changed data word does
+  not, a program with no code hash never answers).
+
+## D-233 · 2026-10-07 · A context running an image with no program switches to one registered meanwhile
+
+An SPU thread or task whose image had no program ran interpreted until its next load, which for a thread that loops
+forever is never. When the HLE attaches no program to an image (a task, an lv2 SPU thread, a job not in the job
+cache), it leaves the image's key with the context (spu::set_pending_home: its hash, local store address, size,
+whether it is relocatable, the registry's additions at the lookup). At its next taken branch after programs are
+registered, the interpreter looks once per batch (find_program_checked) and attaches the program as the context's
+home: the run continues translated from there. Not when a code word changed since the load, nor when the program was
+lifted for the other floating-point model (the run would change models halfway: logged, and its next load attaches
+it). Any attach and ps_spu_thread_reset forget the key, so a task's key never reaches the job or policy module that
+runs next on the worker. The interpreter's steps in such images are counted per image ("SPU image interpreted" at the
+end of pspocket-boot's run). Tests: tests/spu/test_spu_switch.cpp (the program-level fuzz program, lifted at build time:
+interpreted to its first stop, its program registered, then translated to its second, with registers and local store
+equal to the interpreter's; no switch for a changed code word, another model, a program registered before the lookup,
+an attach in between, a context without a host; a registration racing the run 50 times changes nothing but where it
+runs); tests/hle/test_spu_threads.cpp (an lv2 thread looping 10 million times switches to its program, registered
+after it started).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

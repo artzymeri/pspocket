@@ -4,7 +4,7 @@
 # ---- unit tests (hand-checked vectors, decoder, disassembler, assembler)
 pspocket_add_test(test_spu
     SOURCES test_decoder.cpp test_interp_int.cpp test_interp_float.cpp test_interp_branch_mem.cpp bench_interp.cpp
-        test_discover.cpp test_lift_regs.cpp
+        test_discover.cpp test_lift_regs.cpp test_spu_registry.cpp
     LIBS pspocket::recomp_spu)
 target_include_directories(test_spu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -37,5 +37,5 @@ target_link_libraries(spu_fuzz_generated PRIVATE pspocket::spu)
 pspocket_set_warnings(spu_fuzz_generated)
 pspocket_set_generated_warnings(spu_fuzz_generated)
 
-pspocket_add_test(test_spu_fuzz SOURCES test_fuzz.cpp $<TARGET_OBJECTS:spu_fuzz_generated> LIBS pspocket::spu)
+pspocket_add_test(test_spu_fuzz SOURCES test_fuzz.cpp test_spu_switch.cpp $<TARGET_OBJECTS:spu_fuzz_generated> LIBS pspocket::spu)
 target_include_directories(test_spu_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
