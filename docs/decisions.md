@@ -4770,8 +4770,11 @@ between shuffles. The lifted code converted each lane through double precision i
   the SPU does. The SPU's float range is applied around it: exponent 0 is zero, exponent 255 (infinity or NaN to the
   host) is a huge number saturated by its sign. Other scales keep the scalar form.
 - Checked: the differential fuzz test (every lifted instruction against the interpreter, 256 encodings of each, three
-  more seeds of 200 contexts). GTA V's walk: the main SPU threads 7.93 to 7.62 s of CPU per 5 s (4%, the same
-  windows); the gate passes.
+  more seeds of 200 contexts), and spu-check (D-132) on the 53 of GTA V's 300 programs that use cflts or cfltu: 2,679
+  trials of the game's own translated functions against the interpreter, no difference. GTA V's walk: the main SPU
+  threads 7.93 to 7.62 s of CPU per 5 s (4%, the same windows); the gate passes.
+- History: D-127 had the same form, withdrawn with the rest of D-127 in D-131 when the EDGE/GFX chain stopped on the
+  iPhone; D-138 later saw the same stops without D-127 (something writes over the chain's descriptors).
 
 ## Open decisions (plan section 14)
 
