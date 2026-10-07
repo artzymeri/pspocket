@@ -95,6 +95,7 @@ struct Session {
     std::chrono::steady_clock::time_point rate_since;
     u64 rate_flips = 0;
     u64 rate_underruns = 0; // the speaker's, at the last line
+    u64 rate_ppu_interpreted = 0, rate_spu_interpreted = 0; // instructions, at the last line (D-228)
     // The disc's title ID, which keeps each game's shader cache and coverage apart (D-118), and whether the build's
     // translated PPU code is this game's: the shaders recorded on the Mac for it come with it.
     std::string title_id;
@@ -213,6 +214,17 @@ void install_fault_handler()
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS, &sa, nullptr);
+}
+
+// Every instruction an interpreter has run so far, from its per-site counts (D-207).
+template <typename Site>
+u64 interpreted_total(uint32_t (*sites_of)(Site*, uint32_t))
+{
+    std::vector<Site> sites(4096);
+    const u32 n = sites_of(sites.data(), static_cast<u32>(sites.size()));
+    u64 total = 0;
+    for (u32 i = 0; i < n; i++) total += sites[i].steps;
+    return total;
 }
 
 int fail(char* error, size_t size, const std::string& message)
@@ -334,6 +346,14 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
                     underruns - raw->rate_underruns, kThermal[std::min<usize>(thermal, 3)], footprint / 1e9,
                     static_cast<double>(os_proc_available_memory()) / 1e9);
                 PS_LOG_INFO(kChan, "threads: {}", thread_cpu_report(dt)); // which thread holds a slow stretch back
+                // Code the translation did not cover, run by the interpreters (D-207, D-228): the goal is none.
+                const u64 ppu = interpreted_total(&ps_ppu_interp_sites), spu = interpreted_total(&ps_spu_interp_sites);
+                if (ppu != raw->rate_ppu_interpreted || spu != raw->rate_spu_interpreted) {
+                    PS_LOG_INFO(kChan, "interpreted in {:.1f} s: {} PPU and {} SPU instructions", dt,
+                        ppu - raw->rate_ppu_interpreted, spu - raw->rate_spu_interpreted);
+                    raw->rate_ppu_interpreted = ppu;
+                    raw->rate_spu_interpreted = spu;
+                }
                 // Under 1.5 GB left before iOS stops the app: the backend frees what it can make again (D-148).
                 if (os_proc_available_memory() < (1536ull << 20)) {
                     if (rsx::metal::MetalBackend* b = raw->backend.load(std::memory_order_acquire)) b->trim_memory();

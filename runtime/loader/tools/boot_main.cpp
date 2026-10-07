@@ -1345,13 +1345,35 @@ int main(int argc, char** argv)
             static_cast<unsigned long long>(sites[i].steps), static_cast<unsigned long long>(sites[i].entries), sites[i].pc,
             sites[i].program ? sites[i].program->name : "no program");
     }
-    // And the PPU's (D-207): where the interpreter was entered, by instructions run from there.
-    ps_ppu_interp_site ppu_sites[12];
-    const u32 nppu = ps_ppu_interp_sites(ppu_sites, 12);
-    for (u32 i = 0; i < nppu; i++) {
-        std::printf("PPU interpreted: %llu instructions from %llu entries at %#010x\n",
-            static_cast<unsigned long long>(ppu_sites[i].steps), static_cast<unsigned long long>(ppu_sites[i].entries),
-            ppu_sites[i].pc);
+    // And the PPU's (D-207): where the interpreter was entered, by instructions run from there, and whose code that is
+    // (D-228): the executable's, a firmware module's (the PRX region, D-178), a module the game loaded (D-159), or
+    // other (HLE stubs, code the game made in memory). "No interpreting" is measured per owner.
+    {
+        const auto owner = [&](u32 pc) -> std::string {
+            for (const recomp::ProgramHeader& ph : (*exe)->elf().segments())
+                if (ph.type == 1 && pc >= ph.vaddr && pc < ph.vaddr + ph.memsz) return "the executable";
+            if (pc - PS_MEM_PRX_BASE < PS_MEM_PRX_SIZE) return "a firmware module";
+            if (const u32 id = runtime_modules.id_by_address(pc)) {
+                hle::ModuleInfo info;
+                if (runtime_modules.info(id, info)) return "the game's module " + info.name;
+                return "a module the game loaded";
+            }
+            return "other code";
+        };
+        std::vector<ps_ppu_interp_site> all(4096);
+        all.resize(ps_ppu_interp_sites(all.data(), static_cast<u32>(all.size())));
+        std::map<std::string, u64> by_owner;
+        for (const ps_ppu_interp_site& site : all) by_owner[owner(site.pc)] += site.steps;
+        for (u32 i = 0; i < std::min<size_t>(all.size(), 12); i++) {
+            std::printf("PPU interpreted: %llu instructions from %llu entries at %#010x (%s)\n",
+                static_cast<unsigned long long>(all[i].steps), static_cast<unsigned long long>(all[i].entries), all[i].pc,
+                owner(all[i].pc).c_str());
+        }
+        if (!by_owner.empty()) {
+            std::string line;
+            for (const auto& [who, steps] : by_owner) line += std::format("{}{} {}", line.empty() ? "" : ", ", who, steps);
+            std::printf("PPU interpreted by owner: %s\n", line.c_str());
+        }
     }
     for (u32 mb = 0; mb < (PS_MEM_RSX_LOCAL_SIZE >> 20); mb++) {
         const u64 got = ps_spu_video_dma(mb, 0), put = ps_spu_video_dma(mb, 1);

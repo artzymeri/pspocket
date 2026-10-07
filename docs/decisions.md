@@ -5021,6 +5021,15 @@ on the Mac held 2,957 objects (637 MB) for a build of 418. On the phone that is 
 - Test: tests/game/test_game_library.cpp (a changed source's old object deleted, the unchanged one kept, a file that is
   not an object left).
 
+## D-228 · 2026-10-07 · Interpreted PPU code is reported by its owner; the app logs both interpreters' counts
+
+"No interpreting" has to be measured per game, and the PPU report (D-207) listed only addresses. pspocket-boot's
+end-of-run report now names whose code each interpreted site is (the executable, a firmware module in the PRX region,
+a module the game loaded, or other code: HLE stubs, code made in memory) and sums the instructions per owner. The app,
+which never read the counters, logs every 5 s how many PPU and SPU instructions the interpreters ran since the last
+line, when there were any. Assassin's Creed, 90 s (run 208): 196,608 PPU instructions, all the executable's (its fiber
+resumes, D-161), and the SPU's 184 at the one module entry D-208 left.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

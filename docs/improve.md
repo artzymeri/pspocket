@@ -179,7 +179,8 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   how busy the PPU threads are. In the 10 to 20 fps stretches neither the GPU nor the SPURS instances were full, so
   a PPU thread or the RSX thread is the likely limit.
 - **Try:** read the busiest threads off the new status line (D-146) in the next session, then work on that thread.
-- **State:** measurement built (D-146), not yet on the phone.
+- **State:** measurement built (D-146), not yet on the phone. Interpreted code is now counted by owner (pspocket-boot)
+  and logged every 5 s by the app (D-228): read both in the next phone session.
 
 ## Heat
 
