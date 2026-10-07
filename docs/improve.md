@@ -41,6 +41,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 
 ## RSX and Metal: the GPU
 
+- **Seen (runs 121-125):** in Assassin's Creed's crowd (2,000 draws a frame) the RSX thread is the busiest thread.
+  D-210 and D-211 took it from 13.0 to about 11.3 µs per draw (decodes gone, vertex data copied once, no write
+  faults on fragment programs). Left: the command reader per word (step_commands, dispatch, io_to_ea: about 15%:
+  one atomic counter, a put read and an IO lookup per word), texture uploads (6.7%), texture watches (mprotect, 7%),
+  the transform constants copied whole (7.5 KB) after any write.
+- **Try:** read the FIFO in runs of words within one IO page (one lookup, one put read a run); the constants copied
+  from the lowest written to the highest used register; textures that change every frame hashed instead of watched.
+
 - **Seen:** 25 ms of GPU time per frame at 1,504 draws and 83 render passes (55 ended by a target change, 19 by a
   target copy) in the heaviest stretch; 17 to 21 ms in most of play. The GPU is close to its budget too.
 - **Seen later in the session (17:19-17:23):** the work per frame follows the scene: 800 to 1,900 draws, 55 to 96
