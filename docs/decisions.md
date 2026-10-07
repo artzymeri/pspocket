@@ -5106,6 +5106,14 @@ The other images the HLE keeps an answer for:
   store changed); test_spurs_jobchain.cpp (a cached binary takes the program registered while the job before it ran);
   test_spurs_run.cpp (a policy module that keeps running takes its program).
 
+## D-235 · 2026-10-07 · Compiles can be given a QoS class
+
+Threads made without a QoS class get the system's default, not their creator's (sys/qos.h), so the phone's
+preparation, started on a USER_INITIATED thread, compiled at DEFAULT (prepare.mm said they inherited it). A compile
+can now be given its class (codegen::CompileOptions::qos_class: the build's workers and compile_c's own thread take
+it; not part of what names an object): the preparation's are USER_INITIATED (the player waits), a session's
+translator's UTILITY (behind the game's threads).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

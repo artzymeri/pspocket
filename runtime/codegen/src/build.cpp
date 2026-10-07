@@ -10,6 +10,10 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
 #include <set>
 #include <thread>
 
@@ -219,6 +223,10 @@ BuildResult build_library(std::vector<BuildJob> jobs, const std::vector<std::str
     };
 
     auto worker = [&] {
+#if defined(__APPLE__)
+        if (options.compile.qos_class) // as compile_c's own thread (D-235)
+            pthread_set_qos_class_self_np(static_cast<qos_class_t>(options.compile.qos_class), 0);
+#endif
         std::unique_lock lock(m);
         for (;;) {
             // The slowest file left whose memory fits, or any file when nothing runs (one bigger than the budget).

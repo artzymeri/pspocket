@@ -5,6 +5,8 @@
 
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
+#include <pthread.h>
+#include <sys/qos.h>
 #endif
 
 #include <clang/Basic/Diagnostic.h>
@@ -21,6 +23,8 @@
 #include <lld/Common/Driver.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/Signals.h>
+#include <llvm/Support/VirtualOutputBackends.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
@@ -115,6 +119,12 @@ bool compile_here(const std::string& source, const std::string& object, const Co
         invocation->getCodeGenOpts().DisableFree = false;
         clang::CompilerInstance compiler(std::move(invocation));
         compiler.createDiagnostics(new clang::TextDiagnosticPrinter(os, compiler.getDiagnosticOpts()), true);
+        // Its outputs are not registered with LLVM's signal handlers: those delete the files of the compiles running
+        // on any fault, and a game running in this process faults on purpose (write tracking, D-134): every compile
+        // lost its object (D-236). A temporary file renamed at the end all the same.
+        auto outputs = llvm::makeIntrusiveRefCnt<llvm::vfs::OnDiskOutputBackend>();
+        outputs->Settings.RemoveOnSignal = false;
+        compiler.setOutputManager(std::move(outputs));
         clang::EmitObjAction action;
         ok = compiler.ExecuteAction(action) && !compiler.getDiagnostics().hasErrorOccurred();
     }
@@ -132,6 +142,9 @@ bool compile_c(const std::string& source, const std::string& object, const Compi
     // threads other than the main one 512 KB, and clang recurses through large functions.
     bool ok = false;
     llvm::thread worker(std::optional<unsigned>(clang::DesiredStackSize), [&] {
+#if defined(__APPLE__)
+        if (o.qos_class) pthread_set_qos_class_self_np(static_cast<qos_class_t>(o.qos_class), 0); // D-235
+#endif
         clang::noteBottomOfStack();
         ok = compile_here(source, object, o, diagnostics);
     });
@@ -141,6 +154,18 @@ bool compile_c(const std::string& source, const std::string& object, const Compi
     malloc_zone_pressure_relief(nullptr, 0);
 #endif
     return ok;
+}
+
+void install_llvm_signal_handlers()
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        // A file registered and let go: LLVM installs its handlers then, once (it does not install them again while
+        // they are in).
+        const char* path = "/pspocket-no-such-file";
+        llvm::sys::RemoveFileOnSignal(path);
+        llvm::sys::DontRemoveFileOnSignal(path);
+    });
 }
 
 std::string compiler_version() { return "LLVM " LLVM_VERSION_STRING; }

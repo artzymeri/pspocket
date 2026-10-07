@@ -22,7 +22,17 @@ struct CompileOptions {
     std::vector<std::string> defines;       // -D
     std::vector<std::string> extra_args;    // more of clang's driver arguments (-fno-slp-vectorize)
     int opt_level = 2;
+    // The compiling thread's QoS class on Apple systems (qos_class_t, sys/qos.h; 0: the system's default, which is
+    // what a thread made without one gets, not its creator's class). Not part of what makes an object (D-235).
+    unsigned qos_class = 0;
 };
+
+// LLVM's own SIGSEGV and SIGBUS handlers, installed now (D-236). LLVM installs them the first time a compile or a link
+// opens a file, over whatever handler the process has, and they delete the files of the compiles and links running
+// before passing the signal on: a game running in the process faults on purpose (write tracking, D-134), so compiling
+// while it runs lost the files. A process that compiles while a game runs calls this before it installs its own fault
+// handler, which then runs first.
+void install_llvm_signal_handlers();
 
 // The compiler's name and version ("LLVM 22.1.8"): part of what names a kept object.
 std::string compiler_version();
