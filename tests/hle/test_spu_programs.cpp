@@ -469,6 +469,60 @@ TEST_CASE("SPU programs: a module with data copied over its tail still runs lift
     ps_spu_unregister_program(&program);
 }
 
+TEST_CASE("SPU programs: a module with data copied into its middle runs lifted in the part holding its code (D-220)",
+    "[hle][spu]")
+{
+    // Each 16-byte line of local store knows the copy that wrote it last: data copied into the middle of a module
+    // leaves two parts of it, and pc in either is that module. (Before D-220 only the part before the data stayed.)
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModule = 0x4C00, kModuleSize = 0x1000;
+    for (u32 i = 0; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | i);
+    ps_write32(base, kGuest + 0xC00, 0x00000007); // `stop 0x7` at its entry, for the interpreter
+    const ps_spu_entry entries[] = {{kModule + 0xC00, &module_entry}};
+    std::array<u32, kModuleSize / 128> code_words{}; // only its last quarter is instructions
+    for (u32 w = kModuleSize * 3 / 16; w < kModuleSize / 4; w++) code_words[w >> 5] |= 1u << (w & 31);
+    ps_spu_program program{"spu_middle_module", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 0, 1, entries, nullptr, code_words.data(), 0};
+    ps_spu_register_program(&program);
+    hle::enable_spu_modules();
+    Spu spu(base);
+    const auto get = [&](u32 lsa, u32 eal, u32 size) {
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_LSA, lsa) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAH, 0) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAL, eal) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Size, size) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_TagID, 2) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+    };
+    const auto run_at = [&](u32 pc) {
+        ps_spu_attach_program(&spu.ctx, nullptr);
+        spu.ctx.pc = pc;
+        REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+        return spu.ctx.stop_code;
+    };
+    // The module in four pieces, then data over its second quarter: its code, in the last quarter, runs lifted.
+    for (u32 i = 0; i < 4; i++) get(kModule + i * 0x400, kGuest + i * 0x400, 0x400);
+    get(kModule + 0x400, kGuest + 0x8000, 0x400);
+    CHECK(run_at(kModule + 0xC00) == 0x42);
+    CHECK(spu.ctx.program == &program);
+    // Ten thousand copies elsewhere, more than the tracker has slots: the module still holds its lines, so it is
+    // still known when execution comes back to it (a tracker that kept only the newest runs forgot it).
+    for (u32 i = 0; i < 10000; i++) get(0x20000 + (i % 512) * 0x20, kGuest + 0x9000 + (i % 7) * 0x40, 0x10);
+    CHECK(run_at(kModule + 0xC00) == 0x42);
+    CHECK(spu.ctx.program == &program);
+    // A few bytes of data into its code: interpreted from there.
+    get(kModule + 0xC10, kGuest + 0x8000, 0x10);
+    CHECK(run_at(kModule + 0xC00) == 0x7);
+    CHECK(spu.ctx.program == nullptr);
+
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&program);
+}
+
 namespace {
 
 constexpr u32 kHome = 0x1000;  // a task's code, lifted where it runs

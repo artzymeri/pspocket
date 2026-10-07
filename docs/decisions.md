@@ -4858,6 +4858,37 @@ every way out. Function entry loads were 9.4% of GTA V's translated SPU samples,
 - **Measured** (run 141, GTA V's walk, 60-90 s, before and after in the same session): the main SPU threads 7.00 to
   6.56 s of CPU per 5 s (-6%), the audio SPU 1.57 to 1.39 (-11%), the process 11.9 to 11.2.
 
+## D-220 · 2026-10-07 · The SPU module tracker knows each 16-byte line's run
+
+The module tracker (D-079) watched every SPU GET into local store as runs of contiguous copies, listed in the 1 KB
+blocks they touched; each GET tested the runs of its blocks and cut the ones it wrote over. In Assassin's Creed's crowd
+(1.6 to 3 million GETs a second, 85% of them 256 bytes or less) that was about 240 ns a GET, 11-12% of the SPU threads'
+busy time (runs 126-127). A free-slot list and run extents kept in the blocks had changed nothing (reverted then).
+
+- **Line owners.** Each 16-byte line of local store holds the run that wrote it last (16,384 per SPU thread). A GET
+  takes its lines from the runs that held them (each is identified again when it runs next: what was written may be its
+  code), then extends the last run (contiguous in local store and in guest memory) or starts one. The run holding pc is
+  its line's; the part of it still in local store is the stretch of lines around pc it still holds. So data copied into
+  the middle of a module leaves both parts known, where D-204 kept only the part before the copy.
+- **Runs live while they hold a line.** Each run counts its lines and its slot is freed at zero: a module loaded once
+  stays known however many copies go elsewhere afterwards (it is looked up again every time execution comes back to it
+  from the task's own code). A first draft kept only the newest 4,096 runs, which in the crowd is a few milliseconds of
+  GETs: modules would have dropped to the interpreter. 4,096 slots; when all hold lines (a game copying thousands of
+  tiny pieces) the next one round is given up, its lines cleared, as before.
+- **Forgetting is one increment.** A line names its run by slot and epoch; a task switch (forget_module_runs) starts a
+  new epoch, and lines of another epoch hold no run. Every million epochs the table is cleared once.
+- A GET of fewer than 16 bytes takes its whole line, so a module whose code shares a 16-byte line with a variable the
+  program DMAs into loses that line (the old tracker was exact to the byte). Not seen: the counts of modules lifted and
+  instructions interpreted are unchanged in both games.
+
+Measured (runs 142-149, before and after alternating in one session): Assassin's Creed's crowd, the SPU threads 13.16
+to 11.59 and 14.56 to 12.79 s of CPU per 5 s (-12% both times), the process -8 to -10%; SPU code interpreted 184
+instructions and 56,400 to 57,100 modules lifted either way. GTA V: within the noise between runs (its SPU code copies
+far less), the same modules lifted, none interpreted; the gate passes.
+
+Tests: tests/hle/test_spu_programs.cpp (data into a module's middle leaves its code part lifted; the module still known
+after 10,000 copies elsewhere, more than the tracker has slots; D-204's and D-206's cases unchanged).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -168,55 +168,90 @@ const ps_spu_program* identify(u8* base, const SpuImage& image, u64* hash)
 // copy is known by its local store copy instead (D-206): a program lifted from other bytes would be stale. Per SPU
 // thread, so no lock.
 
-// The runs live until a GET overwrites part of them: GTA V's dependency tasks copy hundreds of small pieces of data
-// between loading a module and running it (run 068: with 128 runs, the oldest that had not run yet, the module, was
-// replaced). Each 1 KB block of local store lists the runs that touch it, so a GET only looks at the runs it may
-// overwrite, and the resolver only at the runs in pc's block.
-constexpr u32 kBlockShift = 10;
-constexpr u32 kBlocks = PS_SPU_LS_SIZE >> kBlockShift;
-constexpr u32 kRuns = 4096;        // live runs per SPU, more than its 256 KB holds in practice
-constexpr u32 kRunsPerBlock = 32;  // a block of smaller pieces drops its oldest
+// The runs live until GETs overwrite them: GTA V's dependency tasks copy hundreds of small pieces of data between
+// loading a module and running it (run 068: with 128 runs, the oldest that had not run yet, the module, was replaced).
+//
+// Each 16-byte line of local store records the run that wrote it last (D-220): a GET takes the lines it covers from
+// the runs that held them, which are identified again when they run next; the run holding pc is its line's, and the
+// part of that run still in local store is the lines around pc it still holds. Before, each 1 KB block listed the
+// runs touching it and a GET tested about 12 runs and cut 1.4 of them: 240 ns a GET, 11% of Assassin's Creed's busy
+// SPU time (run 126). A later GET over part of a run leaves the rest (run 109: Assassin's Creed's tasks load a 42 KB
+// module at 0x4c00, then data over its last 10 KB, and run the module's head): the run keeps the extent it was copied
+// with as its identity.
+//
+// A run lives while it holds a line: a module stays known however many copies go elsewhere after it (it is looked up
+// again each time execution comes back to it from the task's own code). A line names its run by slot and epoch, so
+// forgetting everything (a task switch) is one increment.
+constexpr u32 kLineShift = 4;
+constexpr u32 kLines = PS_SPU_LS_SIZE >> kLineShift;
+constexpr u32 kSlotBits = 12;
+constexpr u32 kSlots = 1u << kSlotBits; // live runs per SPU, more than its 256 KB holds in practice
+constexpr u32 kSlotMask = kSlots - 1;
+constexpr u32 kEpochs = 1u << (32 - kSlotBits);
+constexpr u32 kNoRun = ~0u;
 
-// A run is what one contiguous copy left in local store. A later GET over part of it leaves the rest (run 109:
-// Assassin's Creed's tasks load a 42 KB module at 0x4c00, then data over its last 10 KB, and run the module's head):
-// the run keeps the extent it was copied with as its identity, and the part still intact as where it holds code.
 struct Run {
-    u32 ls_start = 0, ls_end = 0; // [ls_start, ls_end): the part of the copy still in local store; empty: a free slot
+    u32 lines = 0;                // the lines of local store it holds (0: a free slot)
     u32 id_start = 0, id_end = 0; // [id_start, id_end): the whole copy, as it came (its identity)
     u32 ea_start = 0;             // where the copy's first byte (at id_start) came from
-    bool resolved = false;        // identified (the program may still be null)
+    u32 ls_start = 0, ls_end = 0; // the part of it still in local store when it was identified
+    bool resolved = false;        // identified (the program may still be null) for [ls_start, ls_end)
     u64 hash = 0;
     const ps_spu_program* program = nullptr;
-
-    bool live() const { return ls_end > ls_start; }
-    bool holds(u32 pc) const { return pc >= ls_start && pc < ls_end; }
-};
-
-Run make_run(u32 ls_start, u32 ls_end, u32 ea_start, u32 id_start, u32 id_end)
-{
-    Run r;
-    r.ls_start = ls_start;
-    r.ls_end = ls_end;
-    r.id_start = id_start;
-    r.id_end = id_end;
-    r.ea_start = ea_start;
-    return r;
-}
-
-struct Block {
-    u32 count = 0;
-    std::array<u16, kRunsPerBlock> runs{}; // indices of the runs touching the block
 };
 
 struct Modules {
-    const SPUContext* ctx = nullptr; // the context these runs belong to (one SPU per thread)
-    std::array<Block, kBlocks> blocks{};
-    std::array<Run, kRuns> runs{};
-    u32 next = 0;
-    u32 last = kRuns; // the run the last GET started or extended
+    const SPUContext* ctx = nullptr;   // the context these runs belong to (one SPU per thread)
+    std::array<u32, kLines> owner{};   // epoch << kSlotBits | slot of the run that wrote each line last
+    std::array<Run, kSlots> runs{};
+    std::array<u16, kSlots> free_slots{}; // slots freed in this epoch
+    u32 free_count = 0;
+    u32 fresh = 0;      // slots from here on are unused in this epoch
+    u32 evict = 0;      // the next slot to give up when every one is live
+    u32 epoch = 1;      // a line of another epoch holds no run
+    u32 last = kNoRun;  // the slot of the run the last GET started or extended
 };
 
 thread_local Modules t_modules;
+
+u32 tag_of(const Modules& m, u32 slot) { return m.epoch << kSlotBits | slot; }
+
+Run* run_at(Modules& m, u32 tag) { return (tag >> kSlotBits) == m.epoch ? &m.runs[tag & kSlotMask] : nullptr; }
+
+// Lines [first, last] lose the runs that held them (except the run tagged keep): each is identified again when it runs
+// next, since what is written there may be its code, and one left with no line is gone.
+void release(Modules& m, u32 first, u32 last, u32 keep);
+
+// A slot for a new run: a freed one, else one not used yet, else (every one live) the next one given up.
+u32 take_slot(Modules& m)
+{
+    if (m.free_count) return m.free_slots[--m.free_count];
+    if (m.fresh < kSlots) return m.fresh++;
+    const u32 slot = m.evict;
+    m.evict = (m.evict + 1) & kSlotMask;
+    const Run& r = m.runs[slot];
+    const u32 tag = tag_of(m, slot);
+    for (u32 l = r.id_start >> kLineShift; l <= (r.id_end - 1) >> kLineShift; l++)
+        if (m.owner[l] == tag) m.owner[l] = 0;
+    if (m.last == slot) m.last = kNoRun;
+    return slot;
+}
+
+// A new run that holds [ls_start, ls_end) of the copy [id_start, id_end) from ea_start; returns its slot.
+u32 new_run(Modules& m, u32 ls_start, u32 ls_end, u32 ea_start, u32 id_start, u32 id_end)
+{
+    const u32 first = ls_start >> kLineShift, last = (ls_end - 1) >> kLineShift;
+    release(m, first, last, 0);
+    const u32 slot = take_slot(m);
+    Run& r = m.runs[slot];
+    r = Run{};
+    r.id_start = id_start;
+    r.id_end = id_end;
+    r.ea_start = ea_start;
+    r.lines = last - first + 1;
+    std::fill(m.owner.begin() + first, m.owner.begin() + last + 1, tag_of(m, slot));
+    return slot;
+}
 
 // PSPOCKET_SPU_TRACE_RUNS=N (debugging): when the resolver finds no run at an address, print the tracker's last events
 // over that address's 1 KB block, for the first N such addresses.
@@ -260,15 +295,31 @@ void trace_no_run(const SPUContext* ctx, u32 pc)
     PS_LOG_INFO(kChan, "{}", out);
 }
 
-// Forgets every run: the live ones are found through the blocks (resetting all 4096 would cost more than a task start).
+void release(Modules& m, u32 first, u32 last, u32 keep)
+{
+    for (u32 l = first; l <= last;) {
+        const u32 tag = m.owner[l];
+        u32 e = l + 1;
+        while (e <= last && m.owner[e] == tag) e++;
+        if (Run* r = tag != keep ? run_at(m, tag) : nullptr) {
+            note_event('c', r->id_start, r->id_end, r->ea_start);
+            r->resolved = false;
+            r->lines -= e - l;
+            if (!r->lines) m.free_slots[m.free_count++] = static_cast<u16>(tag & kSlotMask);
+        }
+        l = e;
+    }
+}
+
+// Forgets every run.
 void reset(Modules& m)
 {
-    for (Block& b : m.blocks) {
-        for (u32 k = 0; k < b.count; k++) m.runs[b.runs[k]] = Run{};
-        b.count = 0;
+    if (++m.epoch == kEpochs) { // once in a million resets: no line may keep a tag of the epoch that comes back
+        m.owner.fill(0);
+        m.epoch = 1;
     }
-    m.next = 0;
-    m.last = kRuns;
+    m.free_count = m.fresh = m.evict = 0;
+    m.last = kNoRun;
 }
 
 Modules& modules_for(const SPUContext* ctx)
@@ -281,111 +332,31 @@ Modules& modules_for(const SPUContext* ctx)
     return m;
 }
 
-void detach_blocks(Modules& m, u32 index)
-{
-    const Run& r = m.runs[index];
-    for (u32 b = r.ls_start >> kBlockShift; b <= (r.ls_end - 1) >> kBlockShift; b++) {
-        Block& block = m.blocks[b];
-        for (u32 k = 0; k < block.count; k++) {
-            if (block.runs[k] != index) continue;
-            block.runs[k] = block.runs[--block.count];
-            break;
-        }
-    }
-}
-
-void drop(Modules& m, u32 index)
-{
-    detach_blocks(m, index);
-    m.runs[index] = Run{};
-    if (m.last == index) m.last = kRuns;
-}
-
-void attach_blocks(Modules& m, u32 index)
-{
-    const Run& r = m.runs[index];
-    for (u32 b = r.ls_start >> kBlockShift; b <= (r.ls_end - 1) >> kBlockShift; b++) {
-        Block& block = m.blocks[b];
-        if (block.count == kRunsPerBlock) drop(m, block.runs[0]);
-        block.runs[block.count++] = static_cast<u16>(index);
-    }
-}
-
-// The slot for a new run: the next free one, else (every slot live) the next one.
-u32 take_slot(Modules& m)
-{
-    for (u32 k = 0; k < kRuns; k++) {
-        const u32 i = (m.next + k) % kRuns;
-        if (!m.runs[i].live()) {
-            m.next = (i + 1) % kRuns;
-            return i;
-        }
-    }
-    const u32 i = m.next;
-    drop(m, i);
-    m.next = (m.next + 1) % kRuns;
-    return i;
-}
-
 void observe_get(SPUContext* ctx, uint32_t lsa, uint32_t eal, uint32_t size)
 {
     if (!size) return;
     Modules& m = modules_for(ctx);
     lsa &= PS_SPU_LS_MASK;
     const u32 end = std::min<u32>(lsa + size, PS_SPU_LS_SIZE);
-    const bool extends = m.last < kRuns && m.runs[m.last].live() && m.runs[m.last].ls_end == lsa &&
-                         m.runs[m.last].id_end == lsa &&
-                         m.runs[m.last].ea_start + (m.runs[m.last].id_end - m.runs[m.last].id_start) == eal;
     note_event('g', lsa, end, eal);
-    // Runs this GET overwrites keep what it leaves (not the one it extends: that one ends where this one starts):
-    // the part before it, else the part after it; one it covers entirely is gone.
-    std::array<u32, 64> overlapping{};
-    u32 count = 0;
-    for (u32 b = lsa >> kBlockShift; b <= (end - 1) >> kBlockShift; b++) {
-        const Block& block = m.blocks[b];
-        for (u32 k = 0; k < block.count; k++) {
-            const u32 index = block.runs[k];
-            const Run& r = m.runs[index];
-            if (!(r.ls_start < end && lsa < r.ls_end)) continue;
-            if (std::find(overlapping.begin(), overlapping.begin() + count, index) != overlapping.begin() + count) continue;
-            if (count < overlapping.size()) overlapping[count++] = index;
+    // The copy goes on where the last GET's ended, in local store and in guest memory: the same run, which keeps the
+    // line it may share with this GET.
+    if (m.last != kNoRun) {
+        Run& prev = m.runs[m.last];
+        if (prev.id_end == lsa && prev.ea_start + (prev.id_end - prev.id_start) == eal) {
+            const u32 tag = tag_of(m, m.last);
+            u32 first = lsa >> kLineShift;
+            const u32 last = (end - 1) >> kLineShift;
+            release(m, first, last, tag);
+            if (m.owner[first] == tag) first++;
+            prev.id_end = end;
+            prev.resolved = false;
+            prev.lines += last + 1 - first;
+            std::fill(m.owner.begin() + first, m.owner.begin() + last + 1, tag);
+            return;
         }
     }
-    for (u32 i = 0; i < count; i++) {
-        const u32 index = overlapping[i];
-        Run& r = m.runs[index];
-        if (!r.live()) continue; // dropped meanwhile by a full block
-        note_event('c', r.ls_start, r.ls_end, r.ea_start);
-        const u32 left_end = std::min(lsa, r.ls_end), right_start = std::max(end, r.ls_start);
-        if (left_end <= r.ls_start && right_start >= r.ls_end) {
-            drop(m, index);
-            continue;
-        }
-        detach_blocks(m, index);
-        if (left_end > r.ls_start) r.ls_end = left_end;
-        else r.ls_start = right_start;
-        attach_blocks(m, index);
-        if (m.last == index) m.last = kRuns;
-        // Identified again when it runs next: what the copy wrote over may be the program's code.
-        r.resolved = false;
-        r.hash = 0;
-        r.program = nullptr;
-    }
-    u32 index = m.last;
-    if (extends && index < kRuns) {
-        detach_blocks(m, index);
-        Run& r = m.runs[index];
-        r.ls_end = end;
-        r.id_end = end;
-        r.resolved = false;
-        r.hash = 0;
-        r.program = nullptr;
-    } else {
-        index = take_slot(m);
-        m.runs[index] = make_run(lsa, end, eal, lsa, end);
-    }
-    m.last = index;
-    attach_blocks(m, index);
+    m.last = new_run(m, lsa, end, eal, lsa, end);
 }
 
 // A module whose local store copy is not its guest copy any more: logged once per guest address, with where the copies
@@ -490,17 +461,24 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
         return stub;
     }
     Modules& m = modules_for(ctx);
-    Run* found = nullptr;
-    // Runs share a block when one ends inside it and another starts there: GTA V's dependency tasks copy a module to
-    // 0x71f0 and its data to 0x7310 (run 066: the data's run took the block, and the modules were interpreted).
-    const Block& block = m.blocks[pc >> kBlockShift];
-    for (u32 k = 0; k < block.count && !found; k++)
-        if (m.runs[block.runs[k]].holds(pc)) found = &m.runs[block.runs[k]];
-    if (!found) {
+    const u32 line = pc >> kLineShift, tag = m.owner[line];
+    Run* found = run_at(m, tag);
+    if (!found || pc < found->id_start || pc >= found->id_end) {
         trace_no_run(ctx, pc);
         return nullptr;
     }
     Run& r = *found;
+    if (r.resolved && (pc < r.ls_start || pc >= r.ls_end)) r.resolved = false; // another part of it, cut in two
+    if (!r.resolved) {
+        // The part still in local store: the lines around pc it still holds.
+        u32 a = line, b = line;
+        while (a > (r.id_start >> kLineShift) && m.owner[a - 1] == tag) a--;
+        while (b < ((r.id_end - 1) >> kLineShift) && m.owner[b + 1] == tag) b++;
+        r.ls_start = std::max(r.id_start, a << kLineShift);
+        r.ls_end = std::min(r.id_end, (b + 1) << kLineShift);
+        r.hash = 0;
+        r.program = nullptr;
+    }
     const u32 size = (r.id_end - r.id_start) & ~3u;
     if (!r.resolved) {
         r.resolved = true;
@@ -585,14 +563,17 @@ void save_module_runs(const SPUContext& ctx, u32 save_area, const std::function<
 {
     Modules& m = modules_for(&ctx);
     std::vector<SavedRun> runs;
-    for (u32 b = 0; b < kBlocks; b++) {
-        const Block& block = m.blocks[b];
-        for (u32 k = 0; k < block.count; k++) {
-            const Run& r = m.runs[block.runs[k]];
-            // Each run once, in the block it starts in.
-            if ((r.ls_start >> kBlockShift) == b && keep(r.ls_start, r.ls_end))
-                runs.push_back({r.ls_start, r.ls_end, r.ea_start, r.id_start, r.id_end});
+    // Each stretch of lines one run still holds (a run cut in two gives two, with the same identity).
+    for (u32 l = 0; l < kLines;) {
+        const u32 tag = m.owner[l];
+        u32 e = l + 1;
+        while (e < kLines && m.owner[e] == tag) e++;
+        if (const Run* r = run_at(m, tag)) {
+            const u32 ls_start = std::max(r->id_start, l << kLineShift), ls_end = std::min(r->id_end, e << kLineShift);
+            if (ls_start < ls_end && keep(ls_start, ls_end))
+                runs.push_back({ls_start, ls_end, r->ea_start, r->id_start, r->id_end});
         }
+        l = e;
     }
     SavedRuns& s = saved_runs();
     std::lock_guard lock(s.mutex);
@@ -614,11 +595,9 @@ void restore_module_runs(SPUContext& ctx, u32 save_area)
     for (const SavedRun& saved : runs) {
         note_event('r', saved.ls_start, saved.ls_end, saved.ea_start);
         // Identified again when execution reaches it: its guest copy is checked against local store as after a GET.
-        const u32 index = take_slot(m);
-        m.runs[index] = make_run(saved.ls_start, saved.ls_end, saved.ea_start, saved.id_start, saved.id_end);
-        attach_blocks(m, index);
+        new_run(m, saved.ls_start, saved.ls_end, saved.ea_start, saved.id_start, saved.id_end);
     }
-    m.last = kRuns;
+    m.last = kNoRun;
 }
 
 void forget_module_runs(SPUContext& ctx)

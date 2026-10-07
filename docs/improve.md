@@ -128,13 +128,20 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Try:** record GETs in a cheap per-SPU ring and build the run holding pc only when the run loop misses lifted code
   (resolves are rare next to GETs), with the resolved runs cached and checked against later GETs; or take a DMA list
   as one event.
+- **Done (D-220, runs 142-145):** each 16-byte line of local store knows the run that wrote it last; a run lives while
+  it holds a line. The crowd's SPU threads -12% (13.16 to 11.59 s per 5 s). Left: a 16 KB GET walks its 1,024 lines
+  twice (release, then the fill), so outside the crowd (bigger GETs) the tracker costs about what the old one did
+  (3.4-3.7% of the SPU threads' samples, run 145's profile): scan the lines four at a time (NEON), or skip lines a
+  single run holds whole.
 - **Seen (runs 109 to 116):** Assassin's Creed's busiest job chain (workload 1, 14 to 15 s of SPU time per 5 s) ran
   interpreted, about 64 billion instructions per six-minute session: the prepared programs counted guessed code
   (shuffle patterns, zeros) as instructions, and a job's own writes there dropped it (D-205). Fixed: 1.5 s of SPU time
   per 5 s, run 116. Still interpreted: LS 0x0e408 and 0x0e740 "in no program" (1.9 and 0.3 billion instructions in
   run 114), code no tracked copy holds.
 - **Try:** trace 0x0e408 with PSPOCKET_SPU_TRACE_RUNS (what copies it in), then track that kind of copy.
-- **State:** the job chain fixed (D-204 to D-206); 0x0e408 open.
+- **Seen (runs 133-145):** 0x0e408 and 0x0e740 no longer run interpreted; the only SPU code interpreted in a session is
+  one module entry, 184 instructions (LS 0x33990, D-208).
+- **State:** the job chain fixed (D-204 to D-206); 0x0e408 gone since D-205 to D-208.
 
 ## PPU
 
