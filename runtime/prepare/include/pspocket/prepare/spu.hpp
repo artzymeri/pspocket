@@ -16,10 +16,13 @@ struct SpuLiftReport {
 // Lifts every SPU image a run saved in dump_dir (spu_<hash>_<ls>.bin with its .txt: pspocket-boot --spu-dump, or the
 // app while the game runs) into out_dir: one directory per program and game_spu.c, whose pspocket_game_spu_register()
 // registers them all. Seeds: the images' own "seed" lines, the runs' logs ("no lifted code at ... in program ..."),
-// and the seeds the programs an earlier lift left in out_dir used (NAME.seeds beside each program, D-204). Relocatable images (jobs, modules) are lifted once
+// and the seeds the programs an earlier lift left in out_dir used (NAME.seeds beside each program, D-205). Relocatable images (jobs, modules) are lifted once
 // per hash, at the first copy's base. Programs out_dir held that are not lifted now are removed.
 // `discover` also lifts code only registers reach (recomp::spu::AnalyzerOptions::discover).
 bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, const std::vector<std::string>& logs,
     SpuLiftReport* report, std::string* error, bool discover = false);
+// The images of several folders (D-226): an image in more than one is the first folder's, with the seeds of all.
+bool lift_spu_images(const std::vector<std::string>& dump_dirs, const std::string& out_dir,
+    const std::vector<std::string>& logs, SpuLiftReport* report, std::string* error, bool discover = false);
 
 } // namespace pspocket::prepare

@@ -5,7 +5,9 @@
 #include <catch_amalgamated.hpp>
 
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <span>
 #include <iterator>
 #include <string>
 #include <unistd.h>
@@ -13,7 +15,11 @@
 
 #include "pspocket/core/be.h"
 #include "pspocket/prepare/spu.hpp"
+#include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/spu/asm.hpp"
+#include "pspocket/spu/runtime.h"
+#include "pspocket/prepare/spu_static.hpp"
+#include "synthetic.hpp"
 
 using namespace pspocket;
 namespace as = pspocket::recomp::spu::as;
@@ -87,5 +93,64 @@ TEST_CASE("prepare: copies of a job that differ only in data are lifted once (D-
     CHECK(fs::exists(out / "spu_00000000000000a1_00000"));
     CHECK_FALSE(fs::exists(out / "spu_00000000000000a2_00000"));
     CHECK(fs::exists(out / "spu_00000000000000a3_00000"));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("prepare: the SPU programs an executable carries are saved under the runtime's names (D-226)")
+{
+    const fs::path dir = fs::temp_directory_path() / ("pspocket-prepare-static-" + std::to_string(getpid()));
+    fs::remove_all(dir);
+    const fs::path statics = dir / "static", coverage = dir / "coverage", out = dir / "spu";
+    fs::create_directories(statics);
+    fs::create_directories(coverage);
+
+    // The synthetic executable carries two SPU ELFs entered below 0x3000 (code at 0, entries 0 and 0x40), with the same
+    // code: position independent, one program, a module lifted relocatable.
+    const test::SyntheticPpuExec exe = test::build_ppu_exec();
+    auto elf = recomp::ElfFile::parse(exe.bytes);
+    REQUIRE(elf);
+    prepare::SpuStaticCount count;
+    prepare::SpuStaticOptions o;
+    o.low_entry_relocatable = true;
+    o.who = "test";
+    CHECK(prepare::save_spu_images(prepare::executable_segments(*elf), "the executable", statics, o, count));
+    CHECK(count.images == 2);
+    CHECK(count.programs == 1);
+    const std::span<const u8> code(exe.spu_images[0].data() + 0x100, 0x80);
+    const std::string pic = std::format("spu_{:016x}_00000", ps_spu_hash64(code.data(), code.size()));
+    REQUIRE(fs::exists(statics / (pic + ".bin")));
+    CHECK(read_file(statics / (pic + ".txt")).starts_with("kind module\n"));
+
+    // A task: its code at 0x3000, entered at 0x3040, as SPURS starts it; named by the hash of that segment at its
+    // vaddr, as the task start looks it up (spurs_taskset.cpp attach_code), and lifted where it sits.
+    test::SyntheticSpuElf task = test::build_spu_elf({"synthetic_task", "", 0x3040, true});
+    ps_st32(task.bytes.data() + 0x18, 0x3040);                  // e_entry
+    ps_st32(task.bytes.data() + 52 + 8, 0x3000);                // code segment vaddr and paddr
+    ps_st32(task.bytes.data() + 52 + 12, 0x3000);
+    ps_st32(task.bytes.data() + 52 + 32 + 8, 0x3080);           // data segment
+    ps_st32(task.bytes.data() + 52 + 32 + 12, 0x3080);
+    std::vector<u8> carrier(0x1000, 0);
+    std::copy(task.bytes.begin(), task.bytes.end(), carrier.begin() + 0x200);
+    const prepare::SpuSegment segment{0x20000, carrier};
+    prepare::SpuStaticCount count2;
+    CHECK(prepare::save_spu_images(std::span(&segment, 1), "the executable", statics, o, count2));
+    CHECK(count2.programs == 1);
+    const std::string task_name = std::format("spu_{:016x}_03000", ps_spu_hash64(task.bytes.data() + 0x100, 0x80));
+    REQUIRE(fs::exists(statics / (task_name + ".txt")));
+    const std::string txt = read_file(statics / (task_name + ".txt"));
+    CHECK(txt.starts_with("kind task\nguest 0x20300\nbase 0x3000\nsize 0x80\nentry 0x3040\n"));
+
+    // A run met the task too and saved it, with where execution entered it: the run's copy is the one lifted (it knows
+    // how the game used it), with the seeds of both.
+    fs::copy_file(statics / (task_name + ".bin"), coverage / (task_name + ".bin"));
+    std::ofstream(coverage / (task_name + ".txt")) << txt << "seed 0x3010\n";
+    std::ofstream(statics / (task_name + ".txt"), std::ios::app) << "seed 0x3020\n";
+    std::string error;
+    prepare::SpuLiftReport report;
+    REQUIRE(prepare::lift_spu_images({coverage.string(), statics.string()}, out.string(), {}, &report, &error, true));
+    CHECK(report.lifted == 2);
+    const std::string seeds = read_file(out / task_name / (task_name + ".seeds"));
+    CHECK(seeds.find("0x3010") != std::string::npos);
+    CHECK(seeds.find("0x3020") != std::string::npos);
     fs::remove_all(dir);
 }

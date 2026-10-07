@@ -1,5 +1,5 @@
 {
-  "as_of": "2026-10-07, after runs 172-191 (D-225)",
+  "as_of": "2026-10-07, after runs 192-207 (D-226)",
   "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: GTA V's rare job chain stop found and fixed (D-225). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
   "checklist": [
     {
@@ -134,6 +134,11 @@
           "name": "No SPU code interpreted (GTA V 0, AC 184 instructions a session)",
           "state": "partial",
           "ref": "runs 142-149"
+        },
+        {
+          "name": "SPU programs inside the executable translated before the first session",
+          "state": "done",
+          "ref": "D-226"
         },
         {
           "name": "SPU programs kept in data files translated before the first session",

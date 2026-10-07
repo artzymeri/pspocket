@@ -29,6 +29,7 @@ constexpr u32 kLsSize = 0x40000;
 
 struct Image {
     std::string name, kind;
+    fs::path dir; // where its .bin is
     u32 base = 0, size = 0, entry = 0;
     std::set<u32> seeds;
 };
@@ -48,11 +49,19 @@ u32 parse(const std::string& text) { return static_cast<u32>(std::stoul(text, nu
 bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, const std::vector<std::string>& logs,
     SpuLiftReport* report, std::string* error, bool discover)
 {
+    return lift_spu_images(std::vector<std::string>{dump_dir}, out_dir, logs, report, error, discover);
+}
+
+bool lift_spu_images(const std::vector<std::string>& dump_dirs, const std::string& out_dir,
+    const std::vector<std::string>& logs, SpuLiftReport* report, std::string* error, bool discover)
+{
     SpuLiftReport rep;
     std::error_code ec;
     // The images: spu_<hash>_<ls>.txt (kind, guest, base, size, entry, and "seed" lines: where execution entered a
-    // module) beside its .bin.
+    // module) beside its .bin. An image in several folders is the first folder's, with the seeds of all (D-226: the
+    // runs' images, which know how the game used them, before the ones found in the executable).
     std::map<std::string, Image> images;
+    for (const std::string& dump_dir : dump_dirs)
     for (const auto& e : fs::directory_iterator(dump_dir, ec)) {
         const fs::path p = e.path();
         const std::string stem = p.stem().string();
@@ -62,6 +71,7 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
         if (!read_text(p, text)) continue;
         Image img;
         img.name = stem;
+        img.dir = p.parent_path();
         bool have_entry = false;
         std::istringstream lines(text);
         for (std::string line; std::getline(lines, line);) {
@@ -79,7 +89,9 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
             } catch (...) {
             }
         }
-        if (have_entry && img.size) images.emplace(img.name, std::move(img));
+        if (!have_entry || !img.size) continue;
+        if (auto it = images.find(img.name); it != images.end()) it->second.seeds.insert(img.seeds.begin(), img.seeds.end());
+        else images.emplace(img.name, std::move(img));
     }
     // Seeds from runs' logs ("no lifted code at 0xADDR in program NAME") and from the programs an earlier lift made
     // here (every entry of theirs stays a seed: the seeds accumulate).
@@ -94,7 +106,7 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
     }
     // The seeds an earlier lift used (NAME.seeds), not its program's entries: those are every label, also of code only
     // discovery or a constant found, which as seeds would count as code the next time and a job's own writes to it
-    // would send the whole job to the interpreter (Assassin's Creed, run 115, D-204).
+    // would send the whole job to the interpreter (Assassin's Creed, run 115, D-205).
     for (const auto& d : fs::directory_iterator(out_dir, ec)) {
         if (!d.is_directory()) continue;
         const std::string name = d.path().filename().string();
@@ -139,7 +151,7 @@ bool lift_spu_images(const std::string& dump_dir, const std::string& out_dir, co
             continue;
         }
         std::string bin;
-        read_text(fs::path(dump_dir) / (name + ".bin"), bin);
+        read_text(img.dir / (name + ".bin"), bin);
         const bool reloc = img.kind == "job" || img.kind == "module";
         if (reloc && bin.size() >= img.size) {
             const auto* bytes = reinterpret_cast<const u8*>(bin.data());

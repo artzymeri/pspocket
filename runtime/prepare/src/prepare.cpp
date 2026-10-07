@@ -15,8 +15,10 @@
 #include "pspocket/codegen/toolchain.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/game/host.hpp"
+#include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/hash.hpp"
 #include "pspocket/recomp/ppu/executable.hpp"
+#include "pspocket/prepare/spu_static.hpp"
 
 namespace pspocket::prepare {
 namespace {
@@ -147,6 +149,7 @@ bool read_manifest(const std::string& game_dir, Manifest* out)
     m.translator_hash = json_field(json, "translator_hash");
     if (const std::string g = json_field(json, "translator_generation"); !g.empty()) m.translator_generation = std::atoi(g.c_str());
     m.system_generation = std::atoi(json_field(json, "system_generation").c_str());
+    m.inputs_generation = std::atoi(json_field(json, "inputs_generation").c_str());
     m.made_at = std::atoll(json_field(json, "made_at").c_str());
     m.seconds = std::atof(json_field(json, "seconds").c_str());
     m.files = static_cast<size_t>(std::atoll(json_field(json, "files").c_str()));
@@ -206,6 +209,10 @@ bool library_is_current(const std::string& game_dir, const std::string& executab
     }
     if (m.translator_generation < kTranslatorGeneration) {
         say("prepared before a fix to how pspocket translates games: preparing it again");
+        return false;
+    }
+    if (m.system_generation == 0 && m.inputs_generation < kGameInputsGeneration) {
+        say("prepared before pspocket found more of the game's code to translate: preparing it again");
         return false;
     }
     if (!spu_images_dir.empty()) { // SPU programs the game loaded that the library has not got yet
@@ -307,20 +314,44 @@ Result prepare_game(const Options& o)
     }
     if (cancelled()) return fail("cancelled");
 
-    // 1b. The SPU programs the game's runs saved, lifted (a fraction of a second each).
+    // 1b. The SPU programs: the ones the game's runs saved, and the ones the executable carries as ELF images (D-226:
+    // its SPURS tasks and SPU thread images, found as the system library finds a module's, D-191), so even a game's
+    // first session runs them translated. Lifted together (a fraction of a second each).
     fs::path spu_dir = o.spu_dir;
-    if (spu_dir.empty() && !o.spu_images_dir.empty() && fs::exists(o.spu_images_dir, ec)) {
+    if (spu_dir.empty()) {
         const auto t2 = Clock::now();
+        std::vector<std::string> inputs;
         size_t images = 0;
-        for (const auto& e : fs::directory_iterator(o.spu_images_dir, ec))
-            if (e.path().extension() == ".bin") images++;
+        if (!o.spu_images_dir.empty() && fs::exists(o.spu_images_dir, ec)) {
+            inputs.push_back(o.spu_images_dir);
+            for (const auto& e : fs::directory_iterator(o.spu_images_dir, ec))
+                if (e.path().extension() == ".bin") images++;
+        }
+        const fs::path statics = dir / "spu-static";
+        fs::remove_all(statics, ec);
+        fs::create_directories(statics, ec);
+        SpuStaticCount found;
+        if (auto elf = recomp::ElfFile::parse(std::span<const u8>(reinterpret_cast<const u8*>(exe.data()), exe.size()),
+                {.symbols = false})) {
+            SpuStaticOptions so;
+            so.low_entry_relocatable = true;
+            so.who = o.title_id;
+            const std::vector<SpuSegment> segments = executable_segments(*elf);
+            save_spu_images(segments, "the executable", statics, so, found);
+        }
+        if (found.programs) {
+            inputs.push_back(statics.string());
+            images += found.programs;
+            PS_LOG_INFO(kChan, "{}: {} SPU programs in the executable's {} SPU images ({} overlays)", o.title_id,
+                found.programs, found.images, found.overlays);
+        }
         if (images > 0) {
             report(Progress::Phase::Translating, 0.2 * static_cast<double>(images) + left_after_translation(), 0, 0,
                 std::format("Translating {} SPU programs", images));
             spu_dir = dir / "spu";
             SpuLiftReport spu;
             std::string error;
-            if (!lift_spu_images(o.spu_images_dir, spu_dir.string(), o.spu_logs, &spu, &error, o.discover_spu))
+            if (!lift_spu_images(inputs, spu_dir.string(), o.spu_logs, &spu, &error, o.discover_spu))
                 return fail("the SPU programs: " + error);
             r.spu_programs = spu.lifted;
         }
@@ -461,7 +492,8 @@ Result prepare_game(const Options& o)
         "  \"link_seconds\": {:.1f},\n  \"files\": {},\n  \"rate_0\": {:.3f},\n  \"rate_1\": {:.3f},\n"
         "  \"rate_2\": {:.3f},\n  \"thermal\": {},\n  \"bytes\": {}\n}}\n",
         json_string(o.title_id), exe_sha, ps_game_abi_hash, ps_game_translator_hash, kTranslatorGeneration,
-        o.system_generation ? std::format("  \"system_generation\": {},\n", o.system_generation) : std::string(),
+        o.system_generation ? std::format("  \"system_generation\": {},\n", o.system_generation)
+                            : std::format("  \"inputs_generation\": {},\n", kGameInputsGeneration),
         json_string(std::string("pspocket ") + PSPOCKET_VERSION), json_string(codegen::compiler_version()),
         json_string(o.toolchain.cpu == "native" ? codegen::host_cpu() : o.toolchain.cpu),
         static_cast<long long>(std::time(nullptr)), r.seconds, r.translate_seconds, r.compile_seconds, r.link_seconds,

@@ -14,7 +14,7 @@ signs and loads it, and plays it flawlessly. Driving title: GTA V (BLES01807); s
 
 ![engine](docs/progress/badge-0.svg) ![system libraries](docs/progress/badge-1.svg) ![kernel calls](docs/progress/badge-2.svg) ![PPU instructions](docs/progress/badge-3.svg) ![SPU instructions](docs/progress/badge-4.svg) ![games flawless](docs/progress/badge-5.svg)
 
-_2026-10-07, after runs 172-191 (D-225)._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: GTA V's rare job chain stop found and fixed (D-225). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.
+_2026-10-07, after runs 192-207 (D-226)._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: GTA V's rare job chain stop found and fixed (D-225). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.
 
 ![The engine, part by part](docs/progress/engine.svg)
 

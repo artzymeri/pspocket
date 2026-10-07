@@ -257,7 +257,7 @@ TEST_CASE("time left: follows the files done, per kind, and lays the rest out ov
     CHECK(one.seconds_left({File{0, 1.0, 50.0}}, {}) == Catch::Approx(0.15));
 }
 
-TEST_CASE("prepared libraries: one made before a fix to the lifters is prepared again (D-161)")
+TEST_CASE("prepared libraries: one made before a fix to the lifters or its inputs is prepared again (D-161, D-226)")
 {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / std::format("pspocket-manifest-{}", static_cast<long>(getpid()));
@@ -275,7 +275,15 @@ TEST_CASE("prepared libraries: one made before a fix to the lifters is prepared 
     manifest(""); // made before the field: generation 1
     CHECK_FALSE(pspocket::prepare::library_is_current(dir.string(), "abc", &why));
     CHECK(why.find("fix") != std::string::npos);
-    manifest(std::format("  \"translator_generation\": {},\n", pspocket::prepare::kTranslatorGeneration));
+    const std::string current = std::format("  \"translator_generation\": {},\n", pspocket::prepare::kTranslatorGeneration);
+    // A game library made before preparation fed the lifters more of the game's code (D-226: the executable's SPU
+    // programs) is prepared again; a system library takes its inputs from the firmware and is not asked.
+    manifest(current);
+    CHECK_FALSE(pspocket::prepare::library_is_current(dir.string(), "abc", &why));
+    CHECK(why.find("more of the game's code") != std::string::npos);
+    manifest(current + "  \"system_generation\": 1,\n");
+    CHECK(pspocket::prepare::library_is_current(dir.string(), "abc", &why));
+    manifest(current + std::format("  \"inputs_generation\": {},\n", pspocket::prepare::kGameInputsGeneration));
     CHECK(pspocket::prepare::library_is_current(dir.string(), "abc", &why));
     CHECK(why == "ready");
     CHECK_FALSE(pspocket::prepare::library_is_current(dir.string(), "another executable", &why));

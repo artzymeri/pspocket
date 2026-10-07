@@ -25,6 +25,7 @@
 #include "pspocket/recomp/self_decrypt.hpp"
 #include "pspocket/recomp/spu/image.hpp"
 #include "pspocket/recomp/spu_scan.hpp"
+#include "pspocket/prepare/spu_static.hpp"
 
 namespace pspocket::prepare {
 namespace {
@@ -57,76 +58,26 @@ struct Module {
 
 // ---- The modules' SPU programs (D-191)
 //
-// The modules translated carry their SPU programs (decoders and helpers) as ELF images inside their segments
-// (recomp::scan_spu_images), and hand them to SPURS as tasks or to lv2 as SPU thread images. Each is saved as the
-// runtime saves an image it meets (hle spu_programs.cpp: spu_<hash>_<ls>.bin and .txt), from the module as placed, so
-// its hash is the one the runtime computes, then lifted as a game's are (lift_spu_images).
-// - The code a task or thread runs: the executable PT_LOAD holding the entry, at its vaddr. That is the segment SPURS's
-//   task start (Policy::attach_code) and sys_spu_thread_group_start identify.
+// The modules translated carry their SPU programs (decoders and helpers) as ELF images inside their segments, and hand
+// them to SPURS as tasks or to lv2 as SPU thread images: saved and lifted as a game's are (spu_static.hpp).
+// - The code a task or thread runs: the executable PT_LOAD holding the entry, at its vaddr.
 // - Overlays: the other executable PT_LOADs. Several share one local store range, and the program's overlay manager
 //   copies one in by DMA when it calls into it; the runtime identifies the copy by the hash of what it copied (the
 //   module tracker, D-079), at the address it sits. Each is a program of its own at its vaddr, entered at its start.
-struct SpuCount {
-    size_t modules = 0, images = 0, programs = 0, overlays = 0, skipped = 0;
+struct SpuCount : SpuStaticCount {
+    size_t modules = 0;
 };
-
-void save_spu_program(const fs::path& out, std::span<const u8> code, u32 guest, u32 base, u32 entry, bool overlay,
-    std::string_view source, SpuCount& count)
-{
-    const auto image = recomp::spu::load_raw_image(code, base, {entry});
-    if (!image) {
-        PS_LOG_WARN(kChan, "system library: an SPU program of {}: {}", source, image.error().message);
-        count.skipped++;
-        return;
-    }
-    const std::string name = std::format("spu_{:016x}_{:05x}", image->hash(), base);
-    std::error_code ec;
-    if (fs::exists(out / (name + ".bin"), ec)) return; // the same program in another module
-    std::ofstream(out / (name + ".bin"), std::ios::binary)
-        .write(reinterpret_cast<const char*>(code.data()), static_cast<std::streamsize>(code.size()));
-    // "task" lifts it where it sits (not relocatable); lift_spu_images reads kind, base, size and entry.
-    write_text(out / (name + ".txt"), std::format("kind task\nguest {:#x}\nbase {:#x}\nsize {:#x}\nentry {:#x}\nsource {}{}\n",
-        guest, base, code.size(), entry, source, overlay ? " (overlay)" : ""));
-    count.programs++;
-    if (overlay) count.overlays++;
-}
 
 // Every SPU ELF in a placed module's segments; with `save`, saved for lifting. Whether the module carries any.
 bool save_spu_images(const recomp::PlacedPrx& placed, const std::string& key, const fs::path& out, bool save,
     SpuCount& count)
 {
-    bool carries = false;
-    for (const recomp::PlacedSegment& seg : placed.segments) {
-        if (!seg.addr) continue;
-        const std::span<const u8> bytes(seg.bytes.data(), seg.memsz);
-        for (const recomp::SpuImage& img : recomp::scan_spu_images(bytes)) {
-            carries = true;
-            if (!save) continue;
-            count.images++;
-            const recomp::ProgramHeader* main = nullptr;
-            std::vector<const recomp::ProgramHeader*> code;
-            for (const recomp::ProgramHeader& ph : img.segments) {
-                if (ph.type != 1 || !(ph.flags & 1) || (ph.filesz & ~u64{3}) == 0 || !ph.data_in_file) continue;
-                if (img.offset + ph.offset + ph.filesz > bytes.size() || ph.vaddr + ph.filesz > 0x40000) continue;
-                code.push_back(&ph);
-                if (!main && img.entry >= ph.vaddr && img.entry < ph.vaddr + ph.filesz) main = &ph;
-            }
-            const std::string source = std::format("{} {}", key, img.name.empty() ? "(unnamed)" : img.name);
-            if (!main) {
-                PS_LOG_WARN(kChan, "system library: SPU image at {:#x} of {}: no executable segment holds its entry "
-                                   "{:#x}; not translated", seg.addr + img.offset, source, img.entry);
-                count.skipped++;
-                continue;
-            }
-            for (const recomp::ProgramHeader* ph : code) {
-                const u64 at = img.offset + ph->offset;
-                const auto vaddr = static_cast<u32>(ph->vaddr);
-                save_spu_program(out, bytes.subspan(at, ph->filesz & ~u64{3}), static_cast<u32>(seg.addr + at), vaddr,
-                    ph == main ? img.entry : vaddr, ph != main, source, count);
-            }
-        }
-    }
-    return carries;
+    std::vector<SpuSegment> segments;
+    for (const recomp::PlacedSegment& seg : placed.segments)
+        segments.push_back({static_cast<u32>(seg.addr), std::span<const u8>(seg.bytes.data(), seg.memsz)});
+    SpuStaticOptions options;
+    options.save = save;
+    return prepare::save_spu_images(segments, key, out, options, count);
 }
 
 std::set<std::string> read_lines(const fs::path& p)

@@ -15,8 +15,8 @@
 <text x="838" y="99" font-size="12.5" fill="#24292f">80%  (3/5 done)</text>
 <text x="4" y="125" font-size="12.5" fill="#24292f">SPU code (the six co-processors)</text>
 <rect x="300" y="113" width="530" height="16" rx="3" fill="#e6e8eb"/>
-<rect x="300" y="113" width="353.3" height="16" rx="3" fill="#d4a72c"/>
-<text x="838" y="125" font-size="12.5" fill="#24292f">67%  (3/6 done)</text>
+<rect x="300" y="113" width="378.6" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="125" font-size="12.5" fill="#24292f">71%  (4/7 done)</text>
 <text x="4" y="151" font-size="12.5" fill="#24292f">SPURS and the kernel</text>
 <rect x="300" y="139" width="530" height="16" rx="3" fill="#e6e8eb"/>
 <rect x="300" y="139" width="397.5" height="16" rx="3" fill="#57ab5a"/>

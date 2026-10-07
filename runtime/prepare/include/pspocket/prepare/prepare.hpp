@@ -87,12 +87,18 @@ Result prepare_game(const Options& options);
 // code words without guessed code, seeds carried over as used).
 inline constexpr int kTranslatorGeneration = 3;
 
+// What a game's preparation feeds the lifters: raised when a change adds inputs (not covered by the translator hash,
+// which follows the lifters only). A game library of an older inputs generation is prepared again; the system library
+// is not (it takes its inputs from the firmware). 1: D-226 (the SPU programs the executable carries).
+inline constexpr int kGameInputsGeneration = 1;
+
 // What a game library was made from and by (game_dir/manifest.json).
 struct Manifest {
     std::string title_id, executable_sha256, made_by, compiler, cpu;
     std::string abi_hash, translator_hash; // hex
     int translator_generation = 1;         // kTranslatorGeneration it was made with (1: before the field)
     int system_generation = 0;             // a system library's kSystemGeneration; 0 for a game, or from before D-190
+    int inputs_generation = 0;             // a game library's kGameInputsGeneration (0: before the field)
     long long made_at = 0;                 // seconds since 1970
     double seconds = 0;
     size_t files = 0;

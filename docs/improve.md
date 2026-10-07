@@ -53,9 +53,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Tried (runs 158-166), not kept:** the chain lock's waiter sleeping on the line (ps_res_wait_change) after 32 looks
   instead of yielding: the chain-lock yields went to 0 but the same threads then piled up on the SPURS line (select1's
   yields 252 to 535); idle Mac unchanged, under load fps 28.2 to 28.75 but SPU CPU +5%. Reverted.
-- **Try:** fewer read-modify-writes of the SPURS line per visit (select only when a poll could change the choice: a
-  workload signalled or a priority changed, else keep the current one, as libsre's poll already short-cuts); a wait
-  in ps_res_acquire that spins on the version alone (cheap) before re-reading the 128 bytes; measure under load.
+- **Tried (runs 192-205), not kept:** polls deciding on a plain copy of the SPURS line, through the reservation only
+  when they store. Idle unchanged (7.21, 7.16 to 7.05, 7.34 s per 5 s); under load too noisy to tell (runs 198 and 203
+  fell to 22-25 fps with less CPU, the Mac busy elsewhere); the profile under load (runs 204, 205) shows the select1
+  yields not gone (142 to 217 samples): they come from the dispatch's selection and from DMA (ps_res_acquire in
+  mfc_command), not from the polls. Reverted. Since D-223/D-225 the yields are smaller anyway: 379 samples of the
+  SPU threads' 26,155 in run 204 (1.4%), against 1,256 of 21,145 in run 157.
+- **Try:** a wait in ps_res_acquire that spins on the version alone (one load) before re-reading the 128 bytes, and
+  only for lines it found changing; measure with profiles, not CPU totals, under load (the totals swing by 20%).
 - **Seen (run 157):** ps_res_notify_write, called for every SPU PUT, bumps one version per 128-byte line, each in its own
   host cache line of the 4 MB table (2.4% of the SPU threads' busy time in GTA V): a 16 KB PUT touches 128 scattered
   cache lines. **Try:** skip lines no reservation was ever taken on (a 4 KB bitmap set by ps_res_acquire), with a test
@@ -213,6 +218,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Modules (D-159):** a game's own PRX modules run interpreted; the preparation could translate the PRX files on the
   disc too. NPDRM modules need the game's klicensee.
 - **State:** open.
+
+- **Seen (run 207, D-226):** a game met for the first time ran all its SPU code interpreted until its next launch.
+  Now the executable's SPU ELFs are translated when it is prepared (Assassin's Creed: 6, its 4 tasks under the runtime's
+  names). Left: the modules and jobs a task copies in from game data (Assassin's Creed's at LS 0x2fba0 and 0x04c00: 21
+  billion instructions in a 150 s first session), and a game's own PRX modules (docs/plan-game-modules.md).
+- **Try:** record where each module a task copies in comes from (guest address, size, the file and offset it was read
+  from); when that is the executable or a plain file on the disc, find the same bytes when preparing.
 
 ## Media libraries (D-179, D-193, D-194)
 

@@ -4979,6 +4979,34 @@ iPhone always is) and why it came about once in ten walks under load since D-124
   apparently asleep). The gate passes. An adversarial review (four lenses, two refuters per finding) found nothing that stood;
   the test now waits for its reader and checks every PUT landed.
 
+## D-226 · 2026-10-07 · Preparing a game translates the SPU programs its executable carries
+
+A game's SPU programs came only from images its runs had saved: on the phone, a game met for the first time ran all of
+its SPU code interpreted until the next launch prepared it again (route B; docs/plan-game-modules.md, from a design
+workflow: four readers, three designs, three judges). The executable's own SPU ELFs (SPURS tasks, SPU thread images) were
+never looked for, though the system library has found its modules' since D-191.
+
+- **The scan:** preparation reads the executable's PT_LOADs for SPU ELF headers (recomp::scan_spu_images) and saves each
+  program as the runtime saves an image it meets: the executable segment holding the entry at its vaddr (what SPURS's
+  task start and sys_spu_thread_group_start identify), the other executable segments as overlays. The saver is now
+  shared with the system library (runtime/prepare/src/spu_static.cpp; the system library's output unchanged).
+- **Tasks and the rest:** an image entered below 0x3000 cannot be a SPURS task (SPURS refuses such an entry): it is
+  position independent code a program copies in, saved as a module and lifted relocatable, found at any local store
+  address. Others are lifted where they sit.
+- **Two inputs:** the SPU lift reads several folders; an image in more than one is the first folder's (the runs' copy,
+  which knows how the game used it), with the seeds of all.
+- **Prepared again once:** a game library records kGameInputsGeneration (1); an older one is prepared again. The system
+  library is not asked (its inputs come from the firmware).
+- **Measured:** GTA V's executable carries 8 SPU ELFs, Assassin's Creed's 6. Assassin's Creed prepared with no saved
+  images (as the phone meets it): 6 programs from the executable, 4 tasks at 0x3000 under exactly the names its runs
+  saved and 2 position independent ones at 0x80 (never met in our walks). A 150 s session on that library (run 207):
+  the task it runs there found translated (never "no lifted program"); most of its SPU time is in modules that task
+  copies in from game data (19 billion instructions interpreted at LS 0x2fba0), which only a run finds today: the next
+  step.
+- Tests: tests/game/test_prepare_spu.cpp (an executable's SPU ELFs saved under the runtime's names, a task where it
+  sits, position independent ones relocatable, two folders lifted with the seeds of both); test_game_library.cpp (the
+  inputs generation).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

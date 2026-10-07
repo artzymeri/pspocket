@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-07, after runs 172-191 and D-225 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). **A new
+2026-10-07, after runs 192-207 and D-226 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). **A new
 session: read `docs/handoff.md` first** (what was in flight, the user's rules, commands), then this file, `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -186,6 +186,11 @@ now and then since 2026-10-05 (the iPhone after 110 s in run 100; the Mac about 
 8-byte job chain command written by an SPU job's PUT word by word (D-124's first word last): the chain read a
 jump-to-self's low word alone, a light sync, and ran the previous lap's commands. A PUT's first eight bytes now land in
 one store: 0 stops in 11 loaded walks, 3 in 10 before. Also: the module tracker's scan in NEON (D-223).
+
+**A game's first session (D-226, docs/plan-game-modules.md).** Preparing a game now also translates the SPU programs
+its executable carries (found by their ELF headers, as the system library's), so a game met for the first time runs
+its SPURS tasks translated at once. Next on the plan: the modules a task copies in from game data, and a game's own PRX
+modules, still found only by running the game.
 
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,
