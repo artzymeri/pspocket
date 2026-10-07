@@ -1,5 +1,5 @@
 {
-  "as_of": "2026-10-07, after runs 150-156 (D-222)",
+  "as_of": "2026-10-07, after runs 157-171 (D-223)",
   "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac; nothing is Flawless yet: the iPhone is too slow in heavy scenes and GTA V's EDGE job chain stops now and then.",
   "checklist": [
     {
@@ -388,6 +388,10 @@
             [
               141,
               6.56
+            ],
+            [
+              170,
+              6.4
             ]
           ]
         },
@@ -414,6 +418,10 @@
             [
               141,
               1.39
+            ],
+            [
+              170,
+              1.36
             ]
           ]
         }

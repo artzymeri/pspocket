@@ -544,6 +544,7 @@ JobChainPolicy::Grab JobChainPolicy::grab()
     store_ready_count(g);
     g.changed = !g.jobs.empty() || std::memcmp(before, line_, sizeof before) != 0;
     release();
+    for (Job& job : g.jobs) note_grab(job); // after the release: the other SPUs wait for the lock, not for this
     return g;
 }
 
@@ -557,7 +558,6 @@ void JobChainPolicy::batch(const u64* cmds, u32 n, bool urgent, Grab& g, bool* l
         if (cmd != 0 && (cmd & 7) == kOpJob) {
             if (!may_take_) return;
             g.jobs.push_back({cmd, ps_read16(line_, jc_off::sizeJobDescriptor)});
-            note_grab(g.jobs.back());
             advance(urgent);
             continue;
         }
@@ -733,10 +733,7 @@ void JobChainPolicy::take_from_list(u32 slot, Grab& g)
     const u32 left = ps_read32(line_, at), stride = ps_read32(line_, at + 4);
     const u64 next = ps_read64(line_, at + 8);
     const u32 n = std::min<u32>(left, ps_read16(line_, jc_off::maxGrabbedJob));
-    for (u32 i = 0; i < n; i++) {
-        g.jobs.push_back({next + u64{i} * stride, stride});
-        note_grab(g.jobs.back());
-    }
+    for (u32 i = 0; i < n; i++) g.jobs.push_back({next + u64{i} * stride, stride});
     ps_write32(line_, at, left - n);
     ps_write64(line_, at + 8, next + u64{n} * stride);
     if (slot == 1 && left == n) ps_write8(line_, jc_off::urgentList, 0); // the urgent list is done

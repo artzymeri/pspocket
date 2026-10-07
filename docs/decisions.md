@@ -4929,6 +4929,23 @@ game reusing a descriptor once the chain has taken it would then hand us its new
   stale command in the list, or the game's command buffer laid over a slot before the chain reached it) or changed
   after (a writer). The cost: two hashes of about 0x100 bytes per job.
 
+## D-223 · 2026-10-07 · The module tracker scans lines eight at a time; a job chain hashes descriptors after its release
+
+A profile of GTA V's walk (run 157, `sample` on the five main SPU threads) still found the module tracker's release
+(D-220) at about 3% of their busy time: GTA V loads its modules in 16 KB GETs, 1,024 lines each, and release walked
+them one at a time.
+
+- **release** finds where a run's lines end eight at a time (two NEON compares and a horizontal minimum); other hosts
+  keep the plain loop. Its samples 311 to 100 (runs 157, 171); GTA V's main SPU threads 6.67 and 6.45 to 6.40 and 6.40
+  s of CPU per 5 s (runs 167-170, alternating), the process 11.39 and 11.06 to 11.01 and 10.96.
+- **D-222's hashes** of the jobs a visit took are made after the visit releases the chain, not while other SPUs wait
+  for its lock.
+- **Tried, not kept** (runs 158-166): the same profile showed the SPU threads yielding about 12% of their busy time, a
+  third of it waiting for the EDGE/GFX chain's lock. Sleeping on the chain's line (ps_res_wait_change) after 32 looks
+  instead of yielding removed that, but the threads then piled up on the SPURS line in the workload selection (select1)
+  and the SPU threads' CPU rose 5% under load; the idle Mac was unchanged. Reverted; the SPURS line is the item now
+  (improve.md).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

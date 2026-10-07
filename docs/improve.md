@@ -45,6 +45,22 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
     the address arithmetic (a lane moved to a general register for each access), may be cheaper in another shape.
 - **State:** open (D-215 to D-219 done).
 
+- **Seen (runs 157, 166, GTA V's walk under a load of six spinning threads, `sample`):** the five main SPU threads
+  spend about 12% of their busy time yielding (swtch_pri): waiting for the EDGE/GFX chain's lock (552 samples) and
+  re-reading contended 128-byte lines in ps_res_acquire (300+, mostly select1: the SPURS kernel's workload selection,
+  which every SPU makes after each batch of jobs, on the one SPURS line all of them update). On the Cell each SPU has
+  its own core and its atomic unit; here the threads outnumber the free cores on the iPhone.
+- **Tried (runs 158-166), not kept:** the chain lock's waiter sleeping on the line (ps_res_wait_change) after 32 looks
+  instead of yielding: the chain-lock yields went to 0 but the same threads then piled up on the SPURS line (select1's
+  yields 252 to 535); idle Mac unchanged, under load fps 28.2 to 28.75 but SPU CPU +5%. Reverted.
+- **Try:** fewer read-modify-writes of the SPURS line per visit (select only when a poll could change the choice: a
+  workload signalled or a priority changed, else keep the current one, as libsre's poll already short-cuts); a wait
+  in ps_res_acquire that spins on the version alone (cheap) before re-reading the 128 bytes; measure under load.
+- **Seen (run 157):** ps_res_notify_write, called for every SPU PUT, bumps one version per 128-byte line, each in its own
+  host cache line of the 4 MB table (2.4% of the SPU threads' busy time in GTA V): a 16 KB PUT touches 128 scattered
+  cache lines. **Try:** skip lines no reservation was ever taken on (a 4 KB bitmap set by ps_res_acquire), with a test
+  of the reservation-lost event on a line a PUT writes; careful: concurrency.
+
 - **Seen (run 101):** a stop request (thread group stop or terminate, D-031) reaches lifted SPU code at back branches
   and calls, not at an indirect branch to a label of the same function (`bi` into its dispatch switch). A loop that
   goes round only that way cannot be stopped; spu-check met one on a random state (a return address equal to the
@@ -238,6 +254,11 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **State:** open; the other audio cores when a game's log shows one.
 
 ## The gate (D-149)
+
+- **Seen (2026-10-07 14:14):** test_lv2 failed once in a `ctest -j8` run (LastTestsFailed.log; its output was
+  overwritten), then passed 3 suite runs, 30 runs alone and 25 runs under a full-core load. Some test there is timing
+  sensitive about 1 in 60 times. **Try:** run it in a loop under load with `--reporter compact` saved per run until
+  it fails, then fix the test's timing assumption.
 
 - **Seen:** one walk failed on the fps floor (a single 5 s window at 19.8 fps at flip 2,400 while the Mac's GPU was in
   its slow state, no wait for the GPU, nothing on the walk's path changed) and passed when run again (run 091).

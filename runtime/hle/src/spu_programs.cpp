@@ -19,6 +19,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/runtime.h"
@@ -295,12 +299,27 @@ void trace_no_run(const SPUContext* ctx, u32 pc)
     PS_LOG_INFO(kChan, "{}", out);
 }
 
+// The first line in [from, end) that `tag` does not own, or end. A 16 KB GET covers 1,024 lines, usually of one run:
+// eight at a time (GTA V's 16 KB module loads made release 3% of the SPU threads' busy time, run 157).
+u32 run_end(const u32* owner, u32 from, u32 end, u32 tag)
+{
+#if defined(__aarch64__)
+    const uint32x4_t t = vdupq_n_u32(tag);
+    while (from + 8 <= end) {
+        const uint32x4_t same = vandq_u32(vceqq_u32(vld1q_u32(owner + from), t), vceqq_u32(vld1q_u32(owner + from + 4), t));
+        if (vminvq_u32(same) != ~0u) break;
+        from += 8;
+    }
+#endif
+    while (from < end && owner[from] == tag) from++;
+    return from;
+}
+
 void release(Modules& m, u32 first, u32 last, u32 keep)
 {
     for (u32 l = first; l <= last;) {
         const u32 tag = m.owner[l];
-        u32 e = l + 1;
-        while (e <= last && m.owner[e] == tag) e++;
+        const u32 e = run_end(m.owner.data(), l + 1, last + 1, tag);
         if (Run* r = tag != keep ? run_at(m, tag) : nullptr) {
             note_event('c', r->id_start, r->id_end, r->ea_start);
             r->resolved = false;
