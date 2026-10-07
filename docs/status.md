@@ -1,6 +1,6 @@
 # Where pspocket stands
 
-2026-10-07, after run 133 and D-214 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
+2026-10-07, after run 137 and D-217 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). Read this
 first in a new session, then `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
@@ -172,6 +172,12 @@ most of two threads: D-213 goes back by _longjmp, a quarter less CPU for the who
 cascades are four depth buffers side by side sampled as one texture, and only the first was laid over the decode: the
 rest came from stale memory, so the lab had almost no sun shadows. D-214 lays every target in the texture's rows over
 it (and copies nothing when they cover it): the shadows are there now, and the lab walk's median is 57.7 fps (run 133).
+
+**GTA V's SPU time (runs 134-137).** Profiled the same way: calls and function entry/exit were over a third of the SPU
+samples, cflts 8.5%, byte rotates 5%. D-127's three changes, withdrawn on 2026-10-05 for stops seen later without them,
+are back one by one, each checked with spu-check over all 150 of GTA V's programs (no difference) and the gate:
+cflts in NEON (D-215), calls saving only what the callee touches (D-216), byte rotates in NEON (D-217). The main SPU
+threads 12% less CPU, the audio SPU 15% less. Next there: each function's own register loads and stores.
 
 Next: the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then

@@ -20,7 +20,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   - Six SPU threads, the PPU threads and the RSX thread share six cores, four of them efficiency cores: measure the
     context switches and try fewer host threads for the 5-SPU instance (the native scheduler runs any workload on
     any thread, D-037), with QoS that keeps the SPU threads on the performance cores.
-- **State:** open.
+- **Seen (runs 134-137, GTA V's walk profiled):** one geometry job is 35% of the main SPU threads; summed by SPU
+  instruction, calls (brsl) 13.5%, function entry loads and exit stores 22%, cflts 8.5%, shufb 7%, rotqby 5.3%. D-215
+  (cflts in NEON), D-216 (D-127's call saves back) and D-217 (byte rotates in NEON), each checked with spu-check over
+  all 150 programs: the main SPU threads 12% less CPU, the audio SPU 15% less.
+- **Try next:** each function still loads every register it uses at entry and stores every one it writes at exit.
+  Inline small leaf helpers into their callers (a return to the call's address continues there; anything else goes
+  to the run loop as now), or load registers where first needed and store only those written; spu-check both.
+- **State:** open (D-215 to D-217 done).
 
 - **Seen (run 101):** a stop request (thread group stop or terminate, D-031) reaches lifted SPU code at back branches
   and calls, not at an indirect branch to a label of the same function (`bi` into its dispatch switch). A loop that
