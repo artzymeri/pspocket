@@ -368,6 +368,34 @@ TEST_CASE("NV406E semaphore acquire blocks until the label matches")
     CHECK(f.backend.clears() == std::vector<u32>{0x10});
 }
 
+// Kept from D-229 (reading a packet's arguments in one run, tried and not kept): what any reader must do.
+TEST_CASE("an acquire blocking inside a packet parks on its own word; the rest of the packet runs after (D-229)")
+{
+    Fixture f;
+    const u32 label = f.layout().label_addr(64);
+    f.write32(label, 0);
+    auto b = f.at(0);
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    // One packet: SEMAPHORE_OFFSET, then SEMAPHORE_ACQUIRE (the next register).
+    const u32 packet_at = b.offset();
+    b.method(m::NV406E_SEMAPHORE_OFFSET, {64 * 0x10, 0x1234});
+    // A long run of arguments after it: 32 transform constants, then a clear.
+    std::vector<u32> constants(32);
+    for (u32 i = 0; i < 32; i++) constants[i] = 0x3F800000 + i;
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT, constants);
+    b.method(m::NV4097_CLEAR_SURFACE, 0x10);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Blocked);
+    CHECK(f.rsx->get() == packet_at + 8); // on the acquire's word, the offset before it taken
+    CHECK(f.read32(f.layout().get_addr()) == packet_at + 8);
+    CHECK(f.backend.clears().empty());
+    f.write32(label, 0x1234);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.backend.clears() == std::vector<u32>{0x10});
+    CHECK(f.rsx->get() == b.offset());
+    CHECK(f.read32(f.layout().get_addr()) == b.offset()); // the guest's get register published at the end
+}
+
 TEST_CASE("semaphore releases and the reference register are written in command order")
 {
     Fixture f;

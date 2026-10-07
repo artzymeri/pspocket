@@ -5030,6 +5030,14 @@ which never read the counters, logs every 5 s how many PPU and SPU instructions 
 line, when there were any. Assassin's Creed, 90 s (run 208): 196,608 PPU instructions, all the executable's (its fiber
 resumes, D-161), and the SPU's 184 at the one module entry D-208 left.
 
+## D-229 · 2026-10-07 · The RSX keeps reading a packet's arguments one at a time
+
+Tried: reading the words a packet still has in one inner loop (one acquire per word still, get published once at the
+end) instead of one per pass of the reader's loop. Measured in one sitting (runs 209-216): GTA V's RSX thread 1.70 to
+1.71 CPU s per 5 s, Assassin's Creed's crowd 3.15 to 3.16: no gain, so not kept (CLAUDE.md rule 8); the RSX thread's
+time is in the draws (D-210, D-211). Kept: a test that an acquire blocking inside a packet parks on its own word and
+the rest of the packet runs after (tests/rsx/test_fifo.cpp).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
