@@ -4725,6 +4725,40 @@ Test: tests/lv2/test_threads.cpp (an executor standing in for translated code ma
 moved, three threads in a row: each goes on in the interpreter at the landing code and exits with its result; the
 executor never gets control back).
 
+## D-214 · 2026-10-07 · A texture decoded from memory gets every GPU-newer target it overlaps; one covered whole copies nothing
+
+The RSX thread's profile in Assassin's Creed's crowd (run 129) still had about 15% in texture decoding: copying the
+texture's bytes from guest memory (memmove), and watching and unwatching its pages (mprotect). New counts in the
+per-frame line showed only 2 decodes a frame, both over a target drawn to again, and a one-off log of their shapes
+showed why they were expensive, and also wrong:
+
+- a 4096x1024 texture over a 1024x1024 depth buffer with a 16 KB row pitch: four depth buffers side by side (by the
+  look of it the shadow cascades), sampled as one texture; and a 2560x720 texture over two 1280x720 depth buffers.
+- D-137 laid over the decode only the target at the texture's own address. The others' part came from guest memory,
+  which the GPU's drawing never reaches (targets are written back only when the RSX itself reads them): stale.
+
+Now:
+- **Every target in its rows.** A linear texture decoded from memory gets every GPU-newer target with its row pitch
+  that its bytes overlap laid over the copy, oldest first after the one at its address (each synced with its
+  children, D-122); a target that cannot be laid over is written back first. Targets with another layout inside the
+  texture's range are left alone, as before (run 132 showed a compressed texture inside a big depth buffer's memory:
+  memory the game may reuse). The cache entry keeps the list (serials and generations): any of them drawn to again,
+  or a different set, decodes it again. As RPCS3 gathers the sections of a texture from its render targets.
+- **Nothing copied when covered.** When the targets together write every texel position the decode reads (one linear
+  level; each target with the texture's row pitch and all its rows; their columns together the texture's row),
+  nothing is copied from memory and no watch is set: the texture holds while the overlays do (a CPU write there makes
+  a target older than memory, and then it is not laid over).
+- The backend counts textures decoded again over a target drawn to since or over written memory, the bytes copied for
+  textures, and the textures that came from targets alone; a texture not covered logs its shape once.
+
+Measured on the crowd (runs 129, 131, 132; the same walk and windows): the RSX thread 11.0 to 9.2 µs per draw, the
+watching and unwatching gone from its profile. The gate passes (GTA V 29.8 fps, no new messages).
+
+Tests: tests/rsx/test_metal.mm (two depth buffers side by side sampled as one texture show both, from the GPU, nothing
+copied: with only the first laid over, the right half shows memory; a depth buffer sampled at its row size twice, from
+the buffer each time; a texture with half a target's pitch inside its memory is not laid over); D-137's tests keep the
+partial case (a texture larger than its target).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

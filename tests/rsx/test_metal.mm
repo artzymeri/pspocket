@@ -2310,6 +2310,115 @@ TEST_CASE("metal e2e: a texture laid over a target is decoded again after the ta
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 20) == std::array<u8, 4>{0x00, 0x00, 0x3C, 0x00});
 }
 
+TEST_CASE("metal e2e: a texture a target covers whole comes from the target alone, no copy of memory (D-214)")
+{
+    // A depth buffer sampled through a texture format at its own row size every frame (Assassin's Creed, 2 a frame):
+    // its texels all come from the buffer laid over, so nothing is copied from guest memory and nothing is watched.
+    REQUIRE_METAL();
+    constexpr u32 kDepth = 0x180000;
+    E2E e;
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    const auto clear_and_sample = [&](u32 at, u32 depth_value) {
+        auto b = e.at(at);
+        setup_surface_as(b, kSurfaceB, SurfaceColorFormat::A8R8G8B8, kW * 4, kDepth);
+        b.method(m::NV4097_SET_STENCIL_MASK, 0xff);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, depth_value);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth | clear::kStencil);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        bind_linear_texture(b, kDepth, tex::R5G6B5, kW * 4, 2 * kW, kH); // two texels per depth word
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return b.offset();
+    };
+    // Every texel the same R5G6B5 value: both halves of the depth word (depth 0xFFFFFF and stencil 0xFF).
+    u32 at = clear_and_sample(0, 0xffffffff);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().textures_from_target == 1);
+    CHECK(e.backend->stats().texture_bytes_copied == 0);
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == (std::array<u8, 4>{0xff, 0xff, 0xff, 0xff}));
+    // Cleared again (zero): the texture follows the buffer, still without a copy.
+    at = clear_and_sample(at, 0);
+    CHECK(e.backend->stats().textures_from_target == 2);
+    CHECK(e.backend->stats().texture_bytes_copied == 0);
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == (std::array<u8, 4>{0xff, 0x00, 0x00, 0x00}));
+}
+
+TEST_CASE("metal e2e: a texture over two depth buffers side by side shows both, from the GPU (D-214)")
+{
+    // Assassin's Creed samples four 1024x1024 depth buffers side by side (one row pitch) as one 4096x1024 texture.
+    // Only the buffer at the texture's address was laid over; the others' part came from stale memory.
+    REQUIRE_METAL();
+    constexpr u32 kDepth = 0x180000, kPitch = 2 * kW * 4;
+    E2E e;
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    auto b = e.at(0);
+    const auto clear_depth = [&](u32 colour, u32 depth, u32 value) {
+        setup_surface_as(b, colour, SurfaceColorFormat::A8R8G8B8, kPitch, depth);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kPitch);
+        b.method(m::NV4097_SET_STENCIL_MASK, 0xff);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, value);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth | clear::kStencil);
+    };
+    clear_depth(kSurfaceB, kDepth, 0xffffffff);             // the left buffer: R5G6B5 0xFFFF, white
+    clear_depth(kSurfaceB + kW * 4, kDepth + kW * 4, 0xf800f800u); // the right one, beside it: R5G6B5 0xF800, red
+    e.put_local32(kDepth + kW * 4 + 40 * kPitch + 16, 0x12345678u); // memory there is stale (not what the GPU has)
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x00808080);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kDepth, tex::R5G6B5, kPitch, 4 * kW, kH); // both buffers' rows, two texels per word
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().readbacks == 0);
+    CHECK(e.backend->stats().textures_from_target == 1);
+    CHECK(e.backend->stats().texture_bytes_copied == 0);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 16, 48) == (std::array<u8, 4>{0xff, 0xff, 0xff, 0xff})); // u 0.25: the left
+    CHECK(guest_pixel(e, kSurfaceOffset, 48, 48) == (std::array<u8, 4>{0xff, 0xff, 0x00, 0x00})); // u 0.75: the right
+}
+
+TEST_CASE("metal e2e: a texture with its own layout inside a target's memory is not laid over by it (D-214)")
+{
+    // Run 132: a compressed texture inside a big depth buffer's memory. Only targets in the texture's own rows (the
+    // same pitch) are laid over; this one is decoded from memory alone, as before.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceB); // kW x kH, pitch kW * 4
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffff0000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x00808080);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kSurfaceB + 4096, tex::A8R8G8B8, kW * 2, kW / 2, kH / 2); // half the pitch, inside it
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().texture_overlays == 0);
+    CHECK(e.backend->stats().textures_from_target == 0);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == (std::array<u8, 4>{0x00, 0x00, 0x00, 0x00})); // memory: zeros
+}
+
 TEST_CASE("metal e2e: a Z24S8 depth buffer read as a texture of another size is laid over memory on the GPU, as a "
           "write-back would give (D-137)")
 {

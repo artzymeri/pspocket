@@ -1509,13 +1509,16 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
                            "{:.2f} targets laid over memory on the GPU; "
-                           "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {} programs and {} pipelines "
+                           "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {:.1f} textures decoded "
+                           "({:.1f} over a target drawn to again, {:.1f} written); {} programs and {} pipelines "
                            "made ({:.1f} ms, {:.2f} draws waiting for one); "
                            "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB); "
                            "{:.2f} feedback copies, {:.2f} corner textures, {:.2f} surface reloads; {:.2f} ms waiting for "
                            "the GPU; GPU memory {:.0f} MB, {} deferred",
             w.flips, w.gpu_ms, w.draws, w.render_passes, ends, w.readbacks, w.deferred_readbacks, w.deferred_conflicts,
             w.readback_wait_ms, w.texture_overlays, w.texture_checks, w.texture_mb_hashed, w.write_faults,
+            per_frame(m.stats.textures_decoded, m.report_decoded), per_frame(m.stats.textures_decoded_overlay,
+                m.report_decoded_overlay), per_frame(m.stats.textures_decoded_written, m.report_decoded_written),
             w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.textures, w.texture_mb, w.surfaces, w.surface_mb,
             w.feedback_copies, w.corner_textures, w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb, w.deferred_queue);
         if (m.config.on_window) m.config.on_window(w);
@@ -1524,6 +1527,9 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns + m.stats.compile_wait_ns;
         m.report_draws_compiling = m.stats.draws_compiling;
         m.report_texture_checks = m.stats.texture_checks;
+        m.report_decoded = m.stats.textures_decoded;
+        m.report_decoded_overlay = m.stats.textures_decoded_overlay;
+        m.report_decoded_written = m.stats.textures_decoded_written;
         m.report_texture_bytes = m.stats.texture_check_bytes;
         m.report_faults = m.tracker.faults_handled();
         m.report_readback_ns = m.stats.readback_wait_ns;

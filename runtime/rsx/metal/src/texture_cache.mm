@@ -185,7 +185,7 @@ void MetalBackend::Impl::encode_overlay(Surface& s, const TransientAllocator::Al
 }
 
 CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, bool force_compute_dxt, std::string* error,
-    Surface* overlay)
+    const std::vector<Surface*>& overlays)
 {
     std::string why;
     auto layout = compute_texture_layout(t, &why);
@@ -231,16 +231,63 @@ CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, 
     entry->texture = texture;
     entry->last_used = tick;
     entry->last_frame = stats.flips;
-    // Watch first, copy second: a store racing with the copy either lands in it or dirties the entry.
-    entry->watch = tracker.watch(ea, size);
-    auto staging = transient.alloc(size, 256);
-    std::memcpy(staging.data, mem.host(ea), size);
-    // A target the GPU drew since memory held it goes over the copy, and the decode follows on the render buffer (D-137).
-    if (overlay) {
-        encode_overlay(*overlay, staging, ea, size);
-        entry->overlay = {overlay->serial, overlay->generation, overlay->stencil_generation};
+    // Targets laid over the whole texture write every texel position the decode reads (D-214): one linear level, each
+    // target with the texture's row pitch and all its rows, and their columns together the texture's row. Then the
+    // copy from guest memory (a depth buffer sampled every frame: 3.6 MB, and a watch over its ~900 pages) would only
+    // be covered.
+    bool covered = false;
+    if (!overlays.empty() && !layout->volume && !layout->cubemap && !layout->swizzled && layout->mips == 1 && !compressed) {
+        std::vector<std::pair<u64, u64>> columns;
+        bool rows_ok = true;
+        for (const Surface* o : overlays) {
+            const u32 bpp = o->depth ? (o->pixel_format == MTLPixelFormatDepth16Unorm ? 2u : 4u)
+                                     : surface_color_bpp(o->gcm_format);
+            if (o->swizzled || o->pitch != base.pitch || bpp == 0 || base.pitch == 0) {
+                rows_ok = false;
+                break;
+            }
+            const s64 delta = static_cast<s64>(o->address) - static_cast<s64>(ea);
+            const s64 col0 = ((delta % base.pitch) + base.pitch) % base.pitch, row0 = (delta - col0) / base.pitch;
+            if (row0 > 0 || row0 + o->height < base.height) continue; // not every row: no help for whole columns
+            columns.emplace_back(col0, std::min<u64>(col0 + u64{o->width} * bpp, base.pitch));
+        }
+        if (rows_ok) {
+            std::sort(columns.begin(), columns.end());
+            u64 reach = 0;
+            for (const auto& [a, b] : columns)
+                if (a <= reach) reach = std::max(reach, b);
+            covered = reach >= u64{base.width} * fmt.block_bytes;
+        }
     }
-    id<MTLCommandBuffer> cb = overlay ? render_buffer() : upload_buffer();
+    if (!overlays.empty() && !covered) {
+        // Why the targets do not cover it, once per texture and target (D-214).
+        static std::unordered_set<u64> logged;
+        const Surface* o = overlays.front();
+        if (logged.size() < 32 && logged.insert((u64{ea} << 32) ^ (u64{t.base_format()} << 16) ^ base.width).second) {
+            PS_LOG_INFO(kChan, "texture {:#010x} {}x{} pitch {} ({} levels{}{}, {} bytes a texel) over {} target(s), the "
+                "first at {:#010x} {}x{} pitch {} ({}{}): copied from memory first", ea, base.width, base.height, base.pitch,
+                layout->mips, layout->swizzled ? ", swizzled" : "", compressed ? ", compressed" : "", fmt.block_bytes,
+                overlays.size(), o->address, o->width, o->height, o->pitch, o->depth ? "depth" : "colour",
+                o->swizzled ? ", swizzled" : "");
+        }
+    }
+    // Watch first, copy second: a store racing with the copy either lands in it or dirties the entry.
+    auto staging = transient.alloc(size, 256);
+    if (covered) {
+        entry->from_target = true;
+        stats.textures_from_target++;
+    } else {
+        entry->watch = tracker.watch(ea, size);
+        std::memcpy(staging.data, mem.host(ea), size);
+        stats.texture_bytes_copied += size;
+    }
+    // Targets the GPU drew since memory held them go over the copy, oldest first, and the decode follows on the render
+    // buffer (D-137, D-214).
+    for (Surface* o : overlays) {
+        encode_overlay(*o, staging, ea, size);
+        entry->overlays.push_back({o->serial, o->generation, o->stencil_generation});
+    }
+    id<MTLCommandBuffer> cb = overlays.empty() ? upload_buffer() : render_buffer();
 
     if (layout->volume) {
         // A 3D texture (D-102): every slice of a level in one dispatch.
@@ -367,6 +414,28 @@ void MetalBackend::Impl::evict_unused(u64 unused_flips)
         remove_surface(s);
         stats.surfaces_evicted++;
     }
+}
+
+std::vector<Surface*> MetalBackend::Impl::overlays_for(u32 ea, u32 size, u32 pitch, Surface* first)
+{
+    std::vector<Surface*> out;
+    const u64 end = u64{ea} + size;
+    for (const auto& s : surfaces) {
+        Surface* o = s.get();
+        // Only targets in the texture's own rows: a target elsewhere in the range with another layout (a compressed
+        // texture inside a big depth buffer's memory, run 132) may be memory the game reuses, and was never laid over.
+        if (o == first || !o->gpu_newer || o->cpu_newer || o->swizzled || o->pitch != pitch || pitch == 0) continue;
+        if (!(u64{o->address} < end && ea < u64{o->address} + o->bytes())) continue;
+        if (overlay_supported(*o)) {
+            sync_surface(*o); // what its children wrote (D-122)
+            out.push_back(o);
+        } else {
+            write_back(*o, "a texture over several targets");
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const Surface* a, const Surface* b) { return a->last_used < b->last_used; });
+    if (first) out.insert(out.begin(), first);
+    return out;
 }
 
 id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, bool& ok)
@@ -546,16 +615,23 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         }
     }
 
+    // Every other GPU-newer target the texture overlaps goes over the copy too, or to memory first (D-214): a texture
+    // over several targets side by side (Assassin's Creed's 4096x1024 over four 1024x1024 depth buffers) read the
+    // others' stale memory.
+    std::vector<Surface*> lays;
+    const auto layout = compute_texture_layout(t);
+    if (layout && !layout->swizzled && layout->format->block_texels == 1 && !layout->volume && !layout->cubemap)
+        lays = overlays_for(*ea, layout->total_size, layout->levels[0].pitch, overlay);
+    else if (overlay) lays.push_back(overlay);
     const u64 key = texture_key(t, *ea, false);
     CachedTexture* entry = nullptr;
     const u64 epoch = check_epoch();
-    const CachedTexture::Overlay want = overlay
-        ? CachedTexture::Overlay{overlay->serial, overlay->generation, overlay->stencil_generation}
-        : CachedTexture::Overlay{};
+    std::vector<CachedTexture::Overlay> want;
+    for (const Surface* o : lays) want.push_back({o->serial, o->generation, o->stencil_generation});
     if (auto it = textures.find(key); it != textures.end()) {
-        // Decoded over another target, or before this one was drawn to again, or over one guest memory now holds.
-        bool dirty = it->second->overlay != want;
-        if (!dirty && it->second->checked != epoch) {
+        // Decoded over other targets, or before one was drawn to again, or over one guest memory now holds.
+        bool dirty = it->second->overlays != want;
+        if (!dirty && it->second->checked != epoch && !it->second->from_target) {
             // Protection mode reads the bytes only when a page under the texture was written (D-134).
             bool hashed = false;
             dirty = tracker.check(it->second->watch, &hashed);
@@ -563,6 +639,8 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             if (hashed) stats.texture_check_bytes += it->second->watch.size;
         }
         if (dirty) {
+            if (it->second->overlays != want) stats.textures_decoded_overlay++;
+            else stats.textures_decoded_written++;
             tracker.unwatch(it->second->watch);
             textures.erase(it);
         } else {
@@ -573,7 +651,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     }
     if (!entry) {
         std::string why;
-        entry = decode_texture(t, *ea, false, &why, overlay);
+        entry = decode_texture(t, *ea, false, &why, lays);
         if (!entry) {
             unsupported(why);
             ok = false;

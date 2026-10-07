@@ -133,12 +133,17 @@ struct CachedTexture {
     u64 last_used = 0;
     u64 last_frame = 0;  // the flip it was last sampled in (D-116)
     u64 checked = ~0ull; // the check epoch (MetalBackend::Impl::check_epoch) it was last found clean in (D-104)
-    // The GPU-newer target laid over guest memory when it was decoded (D-137; serial 0: none): the texture is out of
-    // date once that target is drawn to again, or another one (or none) is newer than memory there.
+    // The GPU-newer targets laid over guest memory when it was decoded, in the order laid (D-137; every one the
+    // texture overlaps, D-214): the texture is out of date once one of them is drawn to again, or the set changes.
     struct Overlay {
         u64 serial = 0, generation = 0, stencil_generation = 0;
         bool operator==(const Overlay&) const = default;
-    } overlay;
+    };
+    std::vector<Overlay> overlays;
+    // Every texel came from those targets (D-214): nothing was copied from guest memory and nothing there is watched;
+    // the texture holds while the overlays do (a CPU write there makes a target older than memory, and then it is not
+    // laid over and the texture is decoded from memory again).
+    bool from_target = false;
 };
 
 // ---- pipelines ----------------------------------------------------------------------------------------------------
@@ -440,6 +445,7 @@ struct MetalBackend::Impl {
     }
     u64 report_flips = 0, report_draws = 0, report_passes = 0, report_gpu_ns = 0, report_readback_ns = 0;
     u64 report_readbacks = 0, report_deferred = 0, report_conflicts = 0, report_texture_checks = 0, report_texture_bytes = 0;
+    u64 report_decoded = 0, report_decoded_overlay = 0, report_decoded_written = 0;
     u64 report_faults = 0; // the tracker's write faults at the last report (D-134)
     u64 report_overlays = 0;
     u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0, report_draws_compiling = 0;
@@ -628,7 +634,11 @@ struct MetalBackend::Impl {
     id<MTLTexture> bind_texture(const TextureInfo& t, u32 unit, bool& ok);
     // `overlay`: a GPU-newer target over the texture's memory whose pixels go into the decode on the GPU (D-137).
     CachedTexture* decode_texture(const TextureInfo& t, u32 ea, bool force_compute_dxt, std::string* error,
-        Surface* overlay = nullptr);
+        const std::vector<Surface*>& overlays = {});
+    // The GPU-newer targets a linear texture decoded from memory at [ea, ea + size) with row pitch `pitch` overlaps
+    // with the same pitch (side by side in its rows), besides `first` (the one at its address, laid over first): laid
+    // over on the GPU when they can be, else written back (D-214). Oldest first.
+    std::vector<Surface*> overlays_for(u32 ea, u32 size, u32 pitch, Surface* first);
     // D-137: whether a target's pixels can be laid over guest memory on the GPU (else it is written back), and the
     // encoding of that into `staging` (a copy of `size` bytes of guest memory from `ea`), on the render buffer.
     bool overlay_supported(const Surface& s);

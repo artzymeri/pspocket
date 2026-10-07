@@ -138,6 +138,11 @@ struct BackendStats {
     u64 programs_compiled = 0;
     u64 textures_decoded = 0;
     u64 texture_cache_hits = 0;
+    // Of the textures decoded, the ones cached before that were decoded again because the target laid over them was
+    // drawn to since, or because their memory was written (the rest are new).
+    u64 textures_decoded_overlay = 0, textures_decoded_written = 0;
+    u64 textures_from_target = 0;   // of the decoded, the ones a target laid over covered whole (D-214)
+    u64 texture_bytes_copied = 0;   // bytes copied from guest memory for texture decodes
     u64 surfaces_created = 0;
     u64 surface_samples = 0; // texture binds served by a render target
     u64 readbacks = 0;       // GPU-to-CPU surface readbacks (expensive)
