@@ -20,6 +20,16 @@ if(TARGET pspocket::platform_apple)
     target_link_libraries(pspocket-boot PRIVATE pspocket::platform_apple)
     target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_AUDIO_OUTPUT=1)
 endif()
+# --spu-translate: SPU programs translated while the game runs (D-236), with the device's compiler when this build has
+# it (-DPSPOCKET_LLVM_DIR).
+if(TARGET pspocket_prepare)
+    target_link_libraries(pspocket-boot PRIVATE pspocket::prepare pspocket::codegen)
+    target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_SESSION_TRANSLATOR=1
+        PSPOCKET_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    if(APPLE)
+        target_link_options(pspocket-boot PRIVATE -Wl,-no_warn_duplicate_libraries)
+    endif()
+endif()
 pspocket_set_warnings(pspocket-boot)
 
 # The game's lifted SPU programs (D-076): scripts/lift-spu.sh writes them, from the user's own game, outside the

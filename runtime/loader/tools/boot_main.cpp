@@ -6,7 +6,7 @@
 //                 [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]
 //                 [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]
 //                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]... [--audio]
-//                 [--spu-dump DIR] [--trace-frame N] [--rsx-recover]
+//                 [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--spu-translate DIR]
 //   pspocket-boot --probe-disc IMAGE.iso
 //   pspocket-boot --hle-list
 //
@@ -49,6 +49,10 @@
 // executable it was made from only; a library made for another runtime or executable stops the run. With
 // --builtin-spu the SPU programs built into this program run too, registered first (the app's way, D-155); without it
 // the library runs alone.
+// --spu-translate DIR translates the SPU programs the game meets without a translation while it runs (D-236): saved
+// into DIR/images, lifted, compiled, signed and loaded in DIR/work on one background thread, each running translated
+// from its next taken branch (D-233). Both folders are emptied at the start; PSPOCKET_SPU_TRANSLATE=0 turns it off
+// (A/B runs). Only in builds with the device's compiler (-DPSPOCKET_LLVM_DIR).
 // --dump-on-fault FILE writes the guest's committed memory below the RSX's local memory to FILE when a guest fault
 // ends the run, for offline analysis (game data: keep it in inventory/). The file is a sequence of blocks: a
 // big-endian u32 guest address, a u32 byte count, then the bytes. A fault in SPU code also writes that SPU's local
@@ -107,6 +111,12 @@
 #include "pspocket/core/thread_report.hpp"
 #include "pspocket/game/host.hpp"
 #include "pspocket/loader/lle.hpp"
+#if defined(PSPOCKET_HAVE_SESSION_TRANSLATOR)
+#include <sys/qos.h>
+
+#include "pspocket/codegen/toolchain.hpp"
+#include "pspocket/prepare/session.hpp"
+#endif
 #if defined(PSPOCKET_HAVE_AUDIO_OUTPUT)
 #include "pspocket/platform/audio_output.hpp"
 #endif
@@ -118,6 +128,7 @@
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/rsx/rsx.hpp"
 #include "pspocket/spu/disasm.hpp"
+#include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
@@ -136,6 +147,7 @@ int usage()
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
         "                     [--async-shaders MS] [--watch ADDR] [--system-library DIR|none]\n"
+        "                     [--spu-translate DIR]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n"
         "       pspocket-boot --hle-list\n");
     return 64;
@@ -550,6 +562,16 @@ u64 ppu_interpreted_total()
     return total;
 }
 
+// And the SPU interpreter's (D-230), over every site it counted (the table holds 4096).
+u64 spu_interpreted_total()
+{
+    std::vector<ps_spu_interp_site> sites(4096);
+    const u32 n = ps_spu_interp_sites(sites.data(), static_cast<u32>(sites.size()));
+    u64 total = 0;
+    for (u32 i = 0; i < n; i++) total += sites[i].steps;
+    return total;
+}
+
 // The memory the system counts against the process (the iOS app's status line has it too, D-145), in MB; 0 elsewhere.
 double footprint_mb()
 {
@@ -821,6 +843,7 @@ int main(int argc, char** argv)
     bool audio = false;
     std::string spu_dump;
     std::string game_library; // --game-library (D-152)
+    std::string spu_translate; // --spu-translate (D-236)
     std::string system_dir;   // --system-library DIR|none (D-178); empty: beside --flash
     [[maybe_unused]] bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the
                                                // app's way); only a build with them uses it
@@ -928,6 +951,7 @@ int main(int argc, char** argv)
         else if (a == "--audio") audio = true;
         else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
         else if (a == "--game-library") { const char* v = value(); if (!v) return usage(); game_library = v; }
+        else if (a == "--spu-translate") { const char* v = value(); if (!v) return usage(); spu_translate = v; }
         else if (a == "--system-library") { const char* v = value(); if (!v) return usage(); system_dir = v; }
         else if (a == "--builtin-spu") builtin_spu = true;
         else if (a == "--stop-at-first") stop_at_first = true;
@@ -962,6 +986,9 @@ int main(int argc, char** argv)
 
     GuestMemory memory;
     if (!memory.reserve()) return 71;
+#if defined(PSPOCKET_HAVE_SESSION_TRANSLATOR)
+    if (!spu_translate.empty()) codegen::install_llvm_signal_handlers(); // under the fault reporter (D-236)
+#endif
     install_fault_reporter(memory);
 
     // Guest code the build has no translation for (a build without -DPSPOCKET_GAME_PPU: all of it) runs in the
@@ -1191,6 +1218,45 @@ int main(int argc, char** argv)
         if (loaded.library->spu_register && !spu_modules) hle::enable_spu_modules();
         translated = loaded.library->ppu_function_count > 0;
     }
+#if defined(PSPOCKET_HAVE_SESSION_TRANSLATOR)
+    // SPU programs translated while the game runs (D-236), with this machine's compiler, as the phone does.
+    std::unique_ptr<prepare::SessionTranslator> session;
+    if (const char* off = std::getenv("PSPOCKET_SPU_TRANSLATE"); off && std::string_view(off) == "0") spu_translate.clear();
+    if (!spu_translate.empty()) {
+        namespace fs = std::filesystem;
+        prepare::SessionOptions so;
+        so.images_dir = (fs::path(spu_translate) / "images").string();
+        so.work_dir = (fs::path(spu_translate) / "work").string();
+        std::error_code ec;
+        fs::remove_all(so.images_dir, ec);
+        if (spu_dump.empty()) hle::set_spu_dump_dir(so.images_dir);
+        else so.images_dir = spu_dump; // saved there already
+        if (!std::exchange(spu_modules, true)) hle::enable_spu_modules();
+        prepare::Toolchain& t = so.library.toolchain;
+        t.resource_dir = PSPOCKET_CODEGEN_RESOURCE_DIR;
+        t.sysroot = PSPOCKET_CODEGEN_SYSROOT;
+        t.include_dirs = {PSPOCKET_SOURCE_DIR "/runtime/ppu/include", PSPOCKET_SOURCE_DIR "/runtime/spu/include",
+            PSPOCKET_SOURCE_DIR "/runtime/core/include", PSPOCKET_SOURCE_DIR "/runtime/game/include"};
+        t.entry_source = PSPOCKET_GAME_LIBRARY_ENTRY_SOURCE;
+        t.target = "arm64-apple-macos13.0";
+        t.cpu = "native";
+        t.platform = "macos";
+        t.min_os = "13.0";
+        so.library.title_id = "session";
+        so.library.workers = 1;
+        so.library.qos_class = QOS_CLASS_UTILITY;
+        so.load = [&memory](const std::string& path, std::string* error) {
+            const spu::RegistryBatch batch; // its programs land at once (D-231)
+            game::LoadedLibrary out;
+            return game::load_library(path, memory, &out, error);
+        };
+        session = std::make_unique<prepare::SessionTranslator>(std::move(so));
+        if (std::string error; !session->start(&error)) {
+            std::fprintf(stderr, "pspocket-boot: --spu-translate: %s\n", error.c_str());
+            return 64;
+        }
+    }
+#endif
 #if defined(PSPOCKET_HAVE_GAME_PPU)
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098):
     // branches into it from the interpreter run it. A game library replaces it.
@@ -1246,7 +1312,7 @@ int main(int argc, char** argv)
     auto next_rate = start + seconds(kRateEvery);
     auto rate_since = start;
     u64 rate_flips = 0;
-    u64 rate_ppu_interpreted = 0;
+    u64 rate_ppu_interpreted = 0, rate_spu_interpreted = 0;
     bool done = false;
     // Scripted presses (--press): which buttons are down is checked every 20 ms while any press is scheduled.
     std::string pad_text;
@@ -1284,6 +1350,11 @@ int main(int argc, char** argv)
                         PS_LOG_INFO("boot", "PPU interpreted: {} instructions in {:.1f} s", interpreted - rate_ppu_interpreted,
                             dt);
                     rate_ppu_interpreted = interpreted;
+                    const u64 spu_interpreted = spu_interpreted_total();
+                    if (spu_interpreted != rate_spu_interpreted)
+                        PS_LOG_INFO("boot", "SPU interpreted: {} instructions in {:.1f} s",
+                            spu_interpreted - rate_spu_interpreted, dt);
+                    rate_spu_interpreted = spu_interpreted;
                     std::lock_guard lock(g_summary.mutex);
                     g_summary.fps.push_back(fps);
                     g_summary.peak_footprint_mb = std::max(g_summary.peak_footprint_mb, footprint);
@@ -1300,6 +1371,18 @@ int main(int argc, char** argv)
         }
     }
     const double secs = std::chrono::duration<double>(Clock::now() - start).count();
+#if defined(PSPOCKET_HAVE_SESSION_TRANSLATOR)
+    if (session) { // stopped while the process it loads into is still there
+        session->stop();
+        const prepare::SessionStats st = session->stats();
+        std::printf("SPU programs translated during the session: %zu loaded of %zu lifted (%zu images met, %zu known "
+                    "already), %zu left to the next launch, %zu failed%s; compile %.1f s, link %.1f s, sign %.1f s; met "
+                    "to loaded at most %.1f s\n",
+            st.loaded, st.lifted, st.images, st.known, st.deferred, st.failed,
+            st.stopped_on_failure ? " (stopped on a failure)" : "", st.compile_seconds, st.link_seconds,
+            st.sign_seconds, st.first_seen_to_loaded_max);
+    }
+#endif
 
     // At a timeout, what every thread waits for (the summary stays the last thing printed).
     if (!done) print_thread_report(kernel, std::format("timeout after {:.1f} s", secs));
@@ -1333,11 +1416,19 @@ int main(int argc, char** argv)
         static_cast<unsigned long long>(spu.attached), static_cast<unsigned long long>(spu.unknown),
         static_cast<unsigned long long>(spu.images), static_cast<unsigned long long>(spu.modules),
         static_cast<unsigned long long>(spu.modified));
+    std::printf("SPU program loads known from an earlier load without hashing: %llu lifted, %llu interpreted\n",
+        static_cast<unsigned long long>(spu.found_again), static_cast<unsigned long long>(spu.none_again));
+    if (spu.reidentified)
+        std::printf("SPU images loaded with no lifted program that found one registered later: %llu\n",
+            static_cast<unsigned long long>(spu.reidentified));
     if (const u64 changed = hle::job_descriptors_changed()) {
         std::printf("job descriptors changed between their grab and their start: %llu\n",
             static_cast<unsigned long long>(changed));
     }
-    // Where SPU code was interpreted most (the program current when the interpreter took over, and where).
+    // Where SPU code was interpreted most (the program current when the interpreter took over, and where), after the
+    // total (D-230).
+    if (const u64 total = spu_interpreted_total())
+        std::printf("SPU interpreted in all: %llu instructions\n", static_cast<unsigned long long>(total));
     ps_spu_interp_site sites[12];
     const u32 nsites = ps_spu_interp_sites(sites, 12);
     for (u32 i = 0; i < nsites; i++) {
@@ -1345,6 +1436,14 @@ int main(int argc, char** argv)
             static_cast<unsigned long long>(sites[i].steps), static_cast<unsigned long long>(sites[i].entries), sites[i].pc,
             sites[i].program ? sites[i].program->name : "no program");
     }
+    // The images run with no program, by image (D-233), and the contexts that switched to one registered meanwhile.
+    for (const spu::InterpretedImage& im : spu::interpreted_images(8)) {
+        std::printf("SPU image interpreted: %llu instructions in spu_%016llx_%05x\n",
+            static_cast<unsigned long long>(im.steps), static_cast<unsigned long long>(im.hash), im.ls_start);
+    }
+    if (const u64 adopted = spu::pending_homes_adopted())
+        std::printf("SPU contexts switched to a program registered while they ran: %llu\n",
+            static_cast<unsigned long long>(adopted));
     // And the PPU's (D-207): where the interpreter was entered, by instructions run from there, and whose code that is
     // (D-228): the executable's, a firmware module's (the PRX region, D-178), a module the game loaded (D-159), or
     // other (HLE stubs, code the game made in memory). "No interpreting" is measured per owner.

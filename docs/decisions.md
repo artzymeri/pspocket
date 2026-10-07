@@ -5038,6 +5038,13 @@ end) instead of one per pass of the reader's loop. Measured in one sitting (runs
 time is in the draws (D-210, D-211). Kept: a test that an acquire blocking inside a packet parks on its own word and
 the rest of the packet runs after (tests/rsx/test_fifo.cpp).
 
+## D-230 · 2026-10-07 · pspocket-boot counts every interpreted SPU instruction
+
+Translating SPU code during a session (docs/plan-background-spu.md) is judged by how much SPU code the interpreter
+still runs, and pspocket-boot printed only the twelve largest sites. It now prints the total of the whole site table
+at the end ("SPU interpreted in all") and, with the frame rate every 5 s, the instructions interpreted since the last
+line ("SPU interpreted: N instructions in 5.0 s"), as it does for the PPU (D-207).
+
 ## D-231 · 2026-10-07 · Programs can be registered while SPU threads run
 
 The registry assumed every program was registered at startup. A translator adding programs during the session
