@@ -1,4 +1,4 @@
-# Runs 122–129 · CPU time in Assassin's Creed's crowd: the RSX thread, the SPU tracker, the fiber switches
+# Runs 122–133 · CPU time in Assassin's Creed's crowd: the RSX thread, the SPU tracker, the fiber switches, textures
 
 2026-10-07 · pspocket-boot with the Metal backend · M4 Mac · Assassin's Creed (BLES00158), `games/ac1/walk-training.txt`
 (600 to 620 s) to the training's "Gentle Push" lesson: a crowd of dozens of animated people, 1,700 to 2,200 draws a
@@ -63,4 +63,30 @@ D-161 throws for each switch. D-213 goes back with _longjmp instead:
 | fps | 29.8–31.2 | 33.7 |
 
 The gate after D-213 (f810feb): **PASS**, 29.8 fps median and in the slowest window, 2 frame jumps, write faults 0.
+
+## Textures over several targets (runs 130–132, D-214)
+
+The RSX thread's profile after D-213 still had about 15% in texture decoding (memmove from guest memory, then watching
+and unwatching the pages). New per-frame counts (run 130): 2 textures decoded a frame, both over a target drawn to
+again. A one-off log of their shapes (run 131):
+
+| texture | the target at its address |
+|---|---|
+| 4096x1024, row pitch 16 KB | a 1024x1024 depth buffer, the same pitch |
+| 2560x720, row pitch 10 KB | a 1280x720 depth buffer, the same pitch |
+
+The textures span several depth buffers side by side (the shadow cascades, by the look of it): only the one at the
+texture's address was laid over (D-137); the others' part came from guest memory, which the GPU's drawing never
+reaches, so it was stale. D-214 lays every GPU-newer target in the texture's rows over it, and copies nothing from
+memory when they cover it whole (run 131 was the first, narrower try: the same address only).
+
+| run | | RSX µs per draw | fps |
+|---|---|---|---|
+| 129 | (before) | 11.0 | 33.7 |
+| 131 | covered: the target at the address only | 10.4 | 32.0 |
+| 132 | every target in the rows | **9.2** | 32.7 |
+
+Run 132's log also showed a compressed texture inside a large depth buffer's memory (another layout): such targets are
+not laid over (as before), only those in the texture's own rows. The gate after D-214: **PASS** (29.8 fps, 2 frame
+jumps, no new messages).
 
