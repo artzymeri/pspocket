@@ -159,24 +159,44 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
 {
     take_shader_cache(); // programs and pipelines the shader cache made since (D-114)
     take_async();        // ... and the background compiles (D-158)
-    if ((state.dirty_bits & dirty::kVertexProgram) || !vertex_program) {
+    if ((state.dirty_bits & dirty::kVertexProgram) || !vertex_program_ok) {
         state.dirty_bits &= ~dirty::kVertexProgram;
-        std::string why;
-        auto vp = shader::decode_vertex_program(state.transform_program.data(), kMaxVertexProgramInstructions,
-            state.transform_program_start(), &why);
-        if (!vp) {
-            vertex_program.reset();
-            unsupported(why);
-            return nullptr;
+        vertex_program_ok = false;
+        // A program decoded lately with the same words from the same start: decoding reads only those (D-210).
+        const u32 start = state.transform_program_start();
+        const u32* at = state.transform_program.data() + std::min<usize>(start, kMaxVertexProgramInstructions) * 4;
+        const usize room = state.transform_program.size() - static_cast<usize>(at - state.transform_program.data());
+        for (usize i = 0; i < vertex_programs.size(); i++) {
+            const DecodedVertexProgram& d = vertex_programs[i];
+            if (d.program.start != start || d.words.size() > room || std::memcmp(at, d.words.data(), d.words.size() * 4))
+                continue;
+            std::rotate(vertex_programs.begin(), vertex_programs.begin() + static_cast<std::ptrdiff_t>(i),
+                vertex_programs.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            vertex_program_ok = true;
+            break;
         }
-        vertex_program = std::move(*vp);
-        vertex_compiled = {};
+        if (!vertex_program_ok) {
+            std::string why;
+            auto vp = shader::decode_vertex_program(state.transform_program.data(), kMaxVertexProgramInstructions,
+                start, &why);
+            if (!vp) {
+                unsupported(why);
+                return nullptr;
+            }
+            DecodedVertexProgram d;
+            for (const auto& in : vp->instructions) d.words.insert(d.words.end(), in.words.begin(), in.words.end());
+            d.program = std::move(*vp);
+            if (vertex_programs.size() == kDecodedVertexPrograms) vertex_programs.pop_back();
+            vertex_programs.insert(vertex_programs.begin(), std::move(d));
+            vertex_program_ok = true;
+        }
     }
-    if (!vertex_program) return nullptr;
+    if (!vertex_program_ok) return nullptr;
+    DecodedVertexProgram& current = vertex_programs.front();
+    auto& vertex_compiled = current.compiled;
     if (const CompiledProgram* c = vertex_compiled[points ? 1 : 0]) return c;
-    const shader::VertexProgram& vp = *vertex_program;
-    std::vector<u32> ucode;
-    for (const auto& in : vp.instructions) ucode.insert(ucode.end(), in.words.begin(), in.words.end());
+    const shader::VertexProgram& vp = current.program;
+    const std::vector<u32>& ucode = current.words;
     const std::string key = std::format("vp:{:016x}:{}", vp.hash, points ? 1 : 0);
     if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) {
         return vertex_compiled[points ? 1 : 0] = &it->second;
@@ -212,7 +232,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     }
     auto compiled = compile(tr, "vertex program");
     if (!compiled) return nullptr;
-    compiled->ucode = std::move(ucode);
+    compiled->ucode = ucode;
     compiled->key = key;
     auto [it, inserted] = programs.insert_or_assign(key, std::move(*compiled));
     if (shader_cache) shader_cache->record_program(it->second);
@@ -253,10 +273,29 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     // writes a new program over the old one between draws of one batch sets it again). GTA V sets one nearly every
     // draw: decoding it each time, and looking its compile up again, was most of what the RSX thread spent on programs
     // (D-109).
-    const bool redecode = entry.program.instructions.empty() ||
+    bool redecode = entry.program.instructions.empty() ||
         (((state.dirty_bits & dirty::kFragmentProgram) || entry.checked != epoch) && tracker.is_dirty(entry.watch));
     entry.checked = epoch;
     state.dirty_bits &= ~dirty::kFragmentProgram;
+    if (redecode && !entry.program.instructions.empty() && entry.code.size() == entry.program.ucode_length &&
+        entry.program.ucode_length <= max_len) {
+        // Written since, but with the same instructions? Only the constants between them may differ (D-210).
+        const u8* now = mem.host(*ea);
+        u32 at = 0;
+        bool same = true;
+        for (const u32 c : entry.program.constant_offsets) {
+            if (c > at && std::memcmp(now + at, entry.code.data() + at, c - at) != 0) same = false;
+            at = std::max(at, c + 16);
+            if (!same) break;
+        }
+        if (same && at < entry.program.ucode_length)
+            same = std::memcmp(now + at, entry.code.data() + at, entry.program.ucode_length - at) == 0;
+        if (same) {
+            tracker.unwatch(entry.watch);
+            entry.watch = tracker.watch(*ea, entry.program.ucode_length);
+            redecode = false;
+        }
+    }
     if (redecode) {
         std::string why;
         auto fp = shader::decode_fragment_program(mem.host(*ea), max_len, &why);
@@ -270,6 +309,10 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
         entry.program = std::move(*fp);
         entry.watch = tracker.watch(*ea, entry.program.ucode_length);
         entry.compiled.clear();
+        const u8* bytes = mem.host(*ea);
+        entry.code.assign(bytes, bytes + entry.program.ucode_length);
+        for (const u32 c : entry.program.constant_offsets)
+            if (c + 16 <= entry.code.size()) std::memset(entry.code.data() + c, 0, 16);
     }
     const shader::FragmentProgram& fp = entry.program;
     *program_out = &fp;
@@ -341,7 +384,7 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
 void MetalBackend::Impl::forget_program_lookups()
 {
     for (auto& [ea, e] : fragment_programs) e.compiled.clear();
-    vertex_compiled = {};
+    for (auto& d : vertex_programs) d.compiled = {};
 }
 
 PipelineKey pipeline_key(const PipelineParams& p, id<MTLFunction> vp, id<MTLFunction> fp)

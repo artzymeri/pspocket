@@ -4657,6 +4657,28 @@ the first compile, with the time left of the files it will compile (none kept: t
 
 Test: tests/game/test_game_library.cpp (the first report comes before any file, and says 0 when every file is kept).
 
+## D-210 · 2026-10-07 · Shader programs uploaded again are found by their words, not decoded again
+
+In Assassin's Creed's crowd (the training's "Gentle Push", run 121: 2,150 draws a frame) the RSX thread was the busiest
+thread, 81% of a core, about 13 µs per draw. A profile (macOS `sample`, 15 s, run 122) put 7% of it in decoding vertex
+programs and 3.7% in decoding fragment programs: the game uploads its vertex program again before nearly every draw,
+and writes its fragment programs' embedded constants in place, and each time the backend decoded the whole program
+again only to find the compile it already had.
+
+- **Vertex programs.** The backend keeps the 16 programs it decoded last, each with its words from its start to its
+  end (what the decoder read: the result depends on nothing else). After an upload it compares the words at the
+  start slot with each (memcmp) and takes the one that matches, compiled lookups included; only a new program is
+  decoded.
+- **Fragment programs.** After a write to a program's memory, its bytes are compared with the ones it was decoded
+  from, embedded constants left out (they are read every draw anyway): the same instructions keep the decode and its
+  compiles, and only the watch is set again.
+- Measured on the crowd (run 122 against run 123, the same walk, windows without the sampler): 25 to 28.8 fps to 29
+  to 30.2 (the game's 30 cap there); the RSX thread 3.9-4.1 s to 3.4-3.8 s of CPU per 5 s, about 13.0 to 11.6-12.2 µs
+  per draw. The decoders left the profile; copying (vertex data and constants, 19%) is the next cost.
+
+Tests: tests/rsx/test_metal.mm (two vertex programs alternating at one start and a third differing in one word; a
+fragment program with new constants, new instructions, then its first form again).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

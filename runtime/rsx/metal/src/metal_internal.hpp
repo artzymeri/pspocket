@@ -322,6 +322,9 @@ struct FragmentProgramEntry {
     // What the program compiled to with these options, until it is decoded again (D-109): the lookup by hash and
     // ucode is not repeated every draw.
     std::vector<std::pair<shader::FpOptions, const CompiledProgram*>> compiled;
+    // The program's bytes as decoded, its embedded constants zeroed: written again with the same instructions (only
+    // new constants, or the same program uploaded again), it is not decoded again (D-210).
+    std::vector<u8> code;
 };
 
 // ---- the backend --------------------------------------------------------------------------------------------------
@@ -510,8 +513,17 @@ struct MetalBackend::Impl {
     std::unordered_map<u64, id<MTLRenderPipelineState>> clear_pipelines;
     std::unordered_map<u32, id<MTLRenderPipelineState>> blit_pipelines; // by destination MTLPixelFormat
     std::unordered_map<u32, FragmentProgramEntry> fragment_programs; // by guest EA
-    std::optional<shader::VertexProgram> vertex_program;             // decoded at the last dirty VP
-    std::array<const CompiledProgram*, 2> vertex_compiled{};          // it compiled, without and with point size (D-109)
+    // Vertex programs decoded lately, the current one first (D-210). A game that uploads its programs again before
+    // nearly every draw (Assassin's Creed's crowds: 2,150 draws a frame) finds the one it uploads here by its words
+    // instead of decoding it again: decoding was 7% of the RSX thread.
+    struct DecodedVertexProgram {
+        shader::VertexProgram program;
+        std::vector<u32> words;                         // its instructions' words, from its start to its end
+        std::array<const CompiledProgram*, 2> compiled{}; // it compiled, without and with point size (D-109)
+    };
+    static constexpr usize kDecodedVertexPrograms = 16;
+    std::vector<DecodedVertexProgram> vertex_programs;
+    bool vertex_program_ok = false; // vertex_programs.front() is the program the state holds
     void forget_program_lookups();                                   // a program key now names another program
     std::vector<id<MTLTexture>> outputs;
     u32 next_output = 0;

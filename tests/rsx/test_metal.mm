@@ -1748,6 +1748,58 @@ TEST_CASE("metal e2e: a transform constant written between two draws of one batc
     CHECK(guest_pixel(e, kSurfaceOffset + 0x200000, 32, 48) == green);
 }
 
+TEST_CASE("metal e2e: vertex programs uploaded again before each draw are found by their words (D-210)")
+{
+    // Assassin's Creed uploads its vertex programs again before nearly every draw (2,150 draws a frame in a crowd);
+    // the backend finds the one uploaded among those it decoded lately. Two programs at the same start alternate, then
+    // one that differs from the first in one word only (the constant it reads).
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    const auto program = [](u32 constant) {
+        VpInst colour; // MOV o[1], c[constant]
+        colour.vec_op = 1;
+        colour.src[0] = vp_const();
+        colour.constant = constant;
+        colour.out = 1;
+        colour.vec_mask = 0xf;
+        VpInst pos; // MOV o[0], v[0] END
+        pos.vec_op = 1;
+        pos.src[0] = vp_in();
+        pos.out = 0;
+        pos.vec_mask = 0xf;
+        pos.end = true;
+        return assemble_vp({colour, pos});
+    };
+    auto b = e.at(0);
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(1.f), 0, 0, f2u(1.f), 0, f2u(1.f), 0, f2u(1.f), 0, 0, f2u(1.f), f2u(1.f)});
+    const u32 constants[] = {0, 1, 0, 1, 2};
+    for (u32 i = 0; i < 5; i++) {
+        setup_surface(b, kSurfaceOffset + i * 0x100000);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, program(constants[i]));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+    }
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00}, blue{0xff, 0x00, 0x00, 0xff};
+    const std::array<u8, 4> expected[] = {red, green, red, green, blue};
+    for (u32 i = 0; i < 5; i++) {
+        INFO("draw " << i);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + i * 0x100000, kW * kH * 4));
+        CHECK(guest_pixel(e, kSurfaceOffset + i * 0x100000, 32, 48) == expected[i]);
+    }
+}
+
 TEST_CASE("metal e2e: PSPOCKET_RSX_CHECK_SURFACES reports a surface sampled after its memory changed under it")
 {
     REQUIRE_METAL();
@@ -3115,6 +3167,45 @@ FpInst fp_op_const(u32 op, std::array<float, 4> k)
 float srgb_to_linear(float c) { return c > 0.04045f ? std::pow((c + 0.055f) / 1.055f, 2.4f) : c / 12.92f; }
 
 } // namespace
+
+TEST_CASE("metal e2e: a fragment program written again draws its new constants, and new instructions (D-210)")
+{
+    // Games write a fragment program's embedded constants in place between draws: the backend keeps the decode when
+    // only constants changed, and decodes again when an instruction did.
+    REQUIRE_METAL();
+    E2E e;
+    write_triangle(e, {0x0000ffffu, 0x0000ffffu, 0x0000ffffu}); // vertex colour (RGBA): blue
+    const auto with_constant = [](std::array<float, 4> k) {
+        FpInst in = fp_mov_const(0, k);
+        in.end = true;
+        return assemble_fp({in});
+    };
+    const std::vector<u8> programs[] = {with_constant({1.f, 0.f, 0.f, 1.f}), with_constant({0.f, 1.f, 0.f, 1.f}),
+        fp_color(false), with_constant({1.f, 0.f, 0.f, 1.f})};
+    u32 offset = 0;
+    for (u32 i = 0; i < 4; i++) {
+        e.put_local_bytes(kFpOffset, programs[i]);
+        auto b = e.at(offset);
+        setup_surface(b, kSurfaceOffset + i * 0x100000);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        offset = b.offset();
+    }
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00}, blue{0xff, 0x00, 0x00, 0xff};
+    const std::array<u8, 4> expected[] = {red, green, blue, red};
+    for (u32 i = 0; i < 4; i++) {
+        INFO("draw " << i);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + i * 0x100000, kW * kH * 4));
+        CHECK(guest_pixel(e, kSurfaceOffset + i * 0x100000, 32, 48) == expected[i]);
+    }
+}
 
 TEST_CASE("metal e2e: LIT, LIF, DST, REFL, DP2A and BEM compute what RPCS3 computes (D-174)")
 {
