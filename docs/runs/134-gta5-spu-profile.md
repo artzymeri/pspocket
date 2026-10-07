@@ -1,4 +1,4 @@
-# Runs 134–139 · GTA V's SPU time, profiled: conversions, calls, byte rotates
+# Runs 134–141 · GTA V's SPU time, profiled: conversions, calls, byte rotates, shuffles, register traffic
 
 2026-10-07 morning · pspocket-boot with GTA V's built-in translation (PPU re-lifted on 2026-10-07, SPU programs as
 noted) · M4 Mac · GTA V's prologue walk (`games/gta5/walk-prologue.txt`, 128 s, Metal), macOS `sample` on the running
@@ -57,3 +57,38 @@ Prepared again (157 s, all files: the SPU header changed), the training walk to 
 to 13.9 s of CPU per 5 s (-7.6%), the process 22.1 to 20.9, 33 fps; nothing interpreted beyond the module's 184
 instructions, nothing unimplemented. spu-check on its prepared library (22 programs, 1,446 trials): no difference.
 
+
+## Run 140: shufb in five instructions (D-218)
+
+shufb was 11% of the SPU samples in run 137b. Its special control bytes now take one extending table lookup instead of
+compares and a select (nine NEON instructions to five). Checked against the old code on 2 million random operands and
+every control byte value, then the differential fuzz test with 1,000 contexts per case. GTA V's walk: the main SPU
+threads 6.95 to 6.91 s per 5 s, the audio SPU 1.57 to 1.55: within the noise between runs, never slower.
+
+## Run 141: registers loaded where needed, stored where changed (D-219)
+
+Each translated SPU function now loads at its entry only the registers that may be read before they are written, and
+each way out stores only those that may have been written (dirty). Over GTA V's 150 programs the entry loads fell to
+45% (192,707 registers to 86,743).
+
+Measuring it took three tries, worth remembering:
+
+- The first two runs said the opposite: the main SPU threads 8.0 and 8.3 s per 5 s. A statistics script of mine had
+  been left running (57% of a core) and every run since was slower; the old translation measured 8.33 too.
+- The first before-and-after swap of the lifted directories rebuilt nothing: `mv` keeps file times, the old C files
+  were older than the objects, so ninja compiled only the descriptor files. Every file now gets `touch`ed after a
+  swap (150 function units recompiled each way).
+- A temporary counter of the run loop's entries (90.4 million in 80 s, the same with both translations) ruled out
+  that returns which now leave the function instead of going through its dispatch switch reach the run loop more.
+
+Same session, the stray script stopped, each side built from its own lifted directory:
+
+| | main SPU threads, CPU s per 5 s (60–90 s) | the audio SPU | the process |
+|---|---|---|---|
+| before (D-217 lift, D-218 shufb) | 6.98, 7.01 | 1.56, 1.57 | 11.9 |
+| after (D-219) | 6.53, 6.53, 6.62 | 1.38, 1.39, 1.39 | 11.2 |
+
+The main SPU threads -6%, the audio SPU -11%. A profile at 95–110 s (`sample`): calls (brsl) 9.5% to 6.3% of the
+lifted samples, lines with loads only (function entries, after calls) 9.4% to 3.6%, lines with stores only 3.4% to
+3.9%. Since run 134 (D-215 to D-219, measured on different days) the main SPU threads use about 17% less CPU and the audio
+SPU about 25% less.

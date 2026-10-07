@@ -29,9 +29,21 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   a small leaf stores and loads only a few registers. What is left in the profile (run 137b): untagged code (the C
   compiler's own spills of the SPU registers it cannot keep in 32 NEON registers, 14%), shufb 11%, calls 9.5%, entry
   loads 9.4%, quadword loads 12%.
-- **Try next:** entry loads only of the registers a function reads before writing (lazily, where first needed), and
-  exit stores only of the ones written on the way (a register not written is unchanged in ctx); spu-check it.
-- **State:** open (D-215 to D-217 done).
+- **Done (runs 140-141):** shufb in five instructions (D-218, within noise); each function loads at its entry only the
+  registers it may read before writing them and stores at each way out only those it may have written (D-219): the
+  main SPU threads -6%, the audio SPU -11%. Profile after it: shufb 9.7% of the lifted samples, quadword loads 13.6%,
+  untagged lines 15.5% (the C compiler's own spills, the dispatch), calls 6.5%, fma 6%.
+- **Try next:**
+  - Stores at the ways out barely fell (46.4 to 42.9 a way out): a callee must store whatever it wrote, since its
+    caller might read it. Calls from lifted code could tell the callee which of its written registers the caller
+    reads (live after the call); the run loop, which knows nothing, keeps the full set. Two entries per function, or
+    a mask argument.
+  - scripts/lift-spu.sh carries every label of the previous lift over as a seed (prepare keeps only the seeds a lift
+    used since D-205): code only a constant or discovery reached becomes "real" there and its words count as code.
+    Make the script keep NAME.seeds as prepare does.
+  - quadword loads and stores reverse the bytes on every access (D-004); a load whose value only goes to a store, or
+    the address arithmetic (a lane moved to a general register for each access), may be cheaper in another shape.
+- **State:** open (D-215 to D-219 done).
 
 - **Seen (run 101):** a stop request (thread group stop or terminate, D-031) reaches lifted SPU code at back branches
   and calls, not at an indirect branch to a label of the same function (`bi` into its dispatch switch). A loop that
@@ -39,7 +51,11 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   function's own entry). No game is known to loop so.
 - **Try:** an attention check where an indirect branch goes back into the dispatch switch (one relaxed load), measured
   against GTA V's walk (rule 8).
-- **State:** open.
+- **Since D-219:** an indirect branch goes on inside its function only at the labels the analyzer found such branches
+  may reach (jump tables, constants, seeds; 97 of GTA V's 4,056 functions have any); a return to the function's own
+  entry or another label now leaves through the run loop, which checks for attention. The loop above is possible only
+  through those labels.
+- **State:** open, much narrower.
 
 ## Audio
 
