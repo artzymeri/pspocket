@@ -4799,6 +4799,21 @@ same stops later without D-127 (something writes over the chain's descriptors), 
 - Measured (run 136, GTA V's walk, 60-90 s): the main SPU threads 7.62 to 7.33 s of CPU per 5 s, the audio SPU 1.88
   to 1.73, the process 13.0 to 12.4. What is left: each function's own loads at entry and stores at exit.
 
+## D-217 · 2026-10-07 · Byte shifts and rotates in NEON, again
+
+The third part of D-127 that D-131 withdrew: shlqby, rotqby and rotqmby (and their immediate and bit-count forms,
+which use the same helpers) moved the 128-bit value through general registers (about 6 instructions for a constant
+count, 30 and a branch for a register count). rotqby alone was 5.3% of GTA V's SPU samples (run 134). On AArch64 each
+is one table lookup over the byte indices: host byte k of the result is byte k - n (left) or k + n (right) of the
+operand, an index past 15 reading zero; the register layout is D-004's full reverse, so a guest shift left is a host
+index shift down.
+
+- Checked: the differential fuzz test (three seeds of 100 contexts, every encoding), spu-check over all 150 of GTA V's
+  programs (5,002 trials, no difference), the gate.
+- Measured (run 137, GTA V's walk, 60-90 s): the main SPU threads 7.33 to 6.98 s of CPU per 5 s, the audio SPU 1.73
+  to 1.57, the process 12.4 to 11.9. Since run 134 (D-215 to D-217): the main SPU threads 12% less, the audio SPU 15%
+  less, the process 11% less.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

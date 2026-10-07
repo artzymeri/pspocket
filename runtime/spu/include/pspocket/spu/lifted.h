@@ -348,6 +348,25 @@ PSL ps_spu_vec psl_from128(psl_u128 r)
     memcpy(&v, &r, 16);
     return v;
 }
+#if defined(__aarch64__)
+/* Byte shifts and rotates as one table lookup (D-127, again in D-217): the 128-bit integer forms moved the value
+ * through general registers (6 instructions for a constant count, about 30 and a branch for a register count; rotqby
+ * was 5% of GTA V's SPU samples, run 134). Host byte k of the result is host byte k - n (left: shlqby, rotqby) or
+ * k + n (right: rotqmby) of x; an index past 15 reads zero. n < 32. */
+PSL uint8x16_t psl_iota8(void) { return (uint8x16_t){0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}; }
+PSL ps_spu_vec psl_shlqby(ps_spu_vec x, unsigned n)
+{
+    return (ps_spu_vec)vqtbl1q_u8((uint8x16_t)x, vsubq_u8(psl_iota8(), vdupq_n_u8((uint8_t)n)));
+}
+PSL ps_spu_vec psl_rotqmby(ps_spu_vec x, unsigned n)
+{
+    return (ps_spu_vec)vqtbl1q_u8((uint8x16_t)x, vaddq_u8(psl_iota8(), vdupq_n_u8((uint8_t)n)));
+}
+PSL ps_spu_vec psl_rotqby(ps_spu_vec x, unsigned n)
+{
+    return (ps_spu_vec)vqtbl1q_u8((uint8x16_t)x, vandq_u8(vsubq_u8(psl_iota8(), vdupq_n_u8((uint8_t)n)), vdupq_n_u8(15)));
+}
+#else
 PSL ps_spu_vec psl_shlqby(ps_spu_vec x, unsigned n) { return n < 16 ? psl_from128(psl_to128(x) << (8 * n)) : (ps_spu_vec){0, 0, 0, 0}; }
 PSL ps_spu_vec psl_rotqmby(ps_spu_vec x, unsigned n) { return n < 16 ? psl_from128(psl_to128(x) >> (8 * n)) : (ps_spu_vec){0, 0, 0, 0}; }
 PSL ps_spu_vec psl_rotqby(ps_spu_vec x, unsigned n)
@@ -356,6 +375,7 @@ PSL ps_spu_vec psl_rotqby(ps_spu_vec x, unsigned n)
     n &= 15;
     return n ? psl_from128((v << (8 * n)) | (v >> (128 - 8 * n))) : x;
 }
+#endif
 PSL ps_spu_vec psl_shlqbi(ps_spu_vec x, unsigned n) { return psl_from128(psl_to128(x) << (n & 7)); }
 PSL ps_spu_vec psl_rotqmbi(ps_spu_vec x, unsigned n) { return psl_from128(psl_to128(x) >> (n & 7)); }
 PSL ps_spu_vec psl_rotqbi(ps_spu_vec x, unsigned n)
