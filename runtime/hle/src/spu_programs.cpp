@@ -25,6 +25,7 @@
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
+#include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
@@ -64,7 +65,8 @@ Registry& registry()
     return r;
 }
 
-std::atomic<u64> g_attached{0}, g_unknown{0}, g_images{0}, g_modules{0}, g_modified{0};
+std::atomic<u64> g_attached{0}, g_unknown{0}, g_images{0}, g_modules{0}, g_modified{0}, g_found_again{0}, g_none_again{0},
+    g_reidentified{0};
 std::atomic<bool> g_dumping{false};
 
 // The file name of an image: its program key, as spu-lift names the program (see scripts/lift-spu.sh).
@@ -113,13 +115,17 @@ const ps_spu_program* identify_hashed(u64 hash, u8* base, const SpuImage& image)
 // Jobs and modules load from the same guest addresses thousands of times a second, and each load hashed its whole
 // image and searched the registry under its lock (3.6% of a core in run 080's profile). An image found before, at the
 // same guest address, size and local store address, with the same bytes by a hash four times as fast (four lanes, as
-// the RSX's texture checks), is the program found then. Only lifted programs are kept: an image without one goes the
-// whole way each time, as before. Per worker thread, so no lock.
+// the RSX's texture checks), is the program found then. So is an image without one (D-232): Assassin's Creed's first
+// session loads its jobs and modules untranslated 180,000 times in 150 s (run 207), each hashed whole and looked up
+// under the registry's lock. Per worker thread, so no lock.
 struct KnownImage {
     u32 guest = 0, size = 0, ls_start = 0;
     u64 check = 0, hash = 0;
-    u64 registry = 0; // ps_spu_registry_generation when it was found: a program unregistered since is not used
+    // The registry's counts when it was looked up: a program found holds until one is unregistered, "none" until one
+    // is registered (D-231).
+    u64 removals = 0, additions = 0;
     const ps_spu_program* program = nullptr;
+    bool filled = false;
 };
 constexpr u32 kKnownImages = 256;
 thread_local std::array<KnownImage, kKnownImages> t_known{};
@@ -147,17 +153,26 @@ const ps_spu_program* identify(u8* base, const SpuImage& image, u64* hash)
 {
     const u8* bytes = image.bytes ? image.bytes : base + image.guest;
     const u64 check = content_check(bytes, image.size);
-    const u64 registry = ps_spu_registry_generation();
+    // Read before the lookup: a program registered meanwhile makes the entry stale, never wrong.
+    const u64 additions = spu::registry_additions(), removals = spu::registry_removals();
     KnownImage& k = t_known[((image.guest >> 4) ^ (image.size >> 2) ^ image.ls_start) % kKnownImages];
-    if (k.program && k.registry == registry && k.guest == image.guest && k.size == image.size &&
-        k.ls_start == image.ls_start && k.check == check) {
-        g_attached.fetch_add(1, std::memory_order_relaxed);
-        if (hash) *hash = k.hash;
-        return k.program;
+    if (k.filled && k.guest == image.guest && k.size == image.size && k.ls_start == image.ls_start && k.check == check) {
+        if (k.program && k.removals == removals) {
+            g_attached.fetch_add(1, std::memory_order_relaxed);
+            g_found_again.fetch_add(1, std::memory_order_relaxed);
+            if (hash) *hash = k.hash;
+            return k.program;
+        }
+        if (!k.program && k.additions == additions) { // seen (and saved) the first time
+            g_unknown.fetch_add(1, std::memory_order_relaxed);
+            g_none_again.fetch_add(1, std::memory_order_relaxed);
+            if (hash) *hash = k.hash;
+            return nullptr;
+        }
     }
     const u64 h = ps_spu_hash64(bytes, image.size);
     const ps_spu_program* program = identify_hashed(h, base, image);
-    if (program) k = {image.guest, image.size, image.ls_start, check, h, registry, program};
+    k = {image.guest, image.size, image.ls_start, check, h, removals, additions, program, true};
     if (hash) *hash = h;
     return program;
 }
@@ -202,6 +217,7 @@ struct Run {
     bool resolved = false;        // identified (the program may still be null) for [ls_start, ls_end)
     u64 hash = 0;
     const ps_spu_program* program = nullptr;
+    u64 additions = 0; // spu::registry_additions() when it was identified: with none, looked up again after (D-234)
 };
 
 struct Modules {
@@ -514,6 +530,7 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
             if (!whole) return nullptr;
             bytes = ctx->ls + r.ls_start;
         }
+        r.additions = spu::registry_additions();
         r.program = identify(base, {ImageKind::Module, r.ea_start, r.id_start, size, pc, bytes}, &r.hash);
         // A copy over part of it may only have written over its data (D-085): code there would be stale.
         if (r.program && lifted_outside(r.program, r.ls_start - r.id_start, r.ls_end - r.id_start)) {
@@ -523,6 +540,16 @@ const ps_spu_program* resolve(SPUContext* ctx, uint32_t pc, uint32_t* code_start
             return nullptr;
         }
         if (r.program) g_modules.fetch_add(1, std::memory_order_relaxed);
+    } else if (!r.program && r.hash && spu::registry_additions() != r.additions) {
+        // Registered since it was identified (D-234): its program, if its code words in local store are still that
+        // program's code (a copy over any of them since leaves it interpreted). A run with no key (cut, or changed and
+        // partial) never finds one.
+        r.additions = spu::registry_additions();
+        r.program = spu::find_program_checked(r.hash, r.id_start, size, true, ctx->ls);
+        if (r.program) {
+            g_modules.fetch_add(1, std::memory_order_relaxed);
+            g_reidentified.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (r.program) {
         *code_start = r.id_start;
@@ -625,11 +652,22 @@ void forget_module_runs(SPUContext& ctx)
     reset(modules_for(&ctx));
 }
 
-const ps_spu_program* identify_program(u8* base, const SpuImage& image) { return identify(base, image, nullptr); }
+const ps_spu_program* identify_program(u8* base, const SpuImage& image, u64* hash) { return identify(base, image, hash); }
+
+void attach_identified(SPUContext& ctx, const ps_spu_program* program, const SpuImage& image, u64 hash, u64 additions)
+{
+    ps_spu_attach_program_at(&ctx, program, image.ls_start);
+    if (!program) spu::set_pending_home(&ctx, hash, image.ls_start, image.size, relocatable(image.kind), additions);
+}
+
+void count_reidentified() { g_reidentified.fetch_add(1, std::memory_order_relaxed); }
 
 void attach_program(SPUContext& ctx, u8* base, const SpuImage& image)
 {
-    ps_spu_attach_program_at(&ctx, identify_program(base, image), image.ls_start);
+    const u64 additions = spu::registry_additions();
+    u64 hash = 0;
+    const ps_spu_program* program = identify_program(base, image, &hash);
+    attach_identified(ctx, program, image, hash, additions);
 }
 
 } // namespace pspocket::hle::spurs
@@ -678,7 +716,8 @@ SpuProgramStats spu_program_stats()
 {
     return {spurs::g_attached.load(std::memory_order_relaxed), spurs::g_unknown.load(std::memory_order_relaxed),
         spurs::g_images.load(std::memory_order_relaxed), spurs::g_modules.load(std::memory_order_relaxed),
-        spurs::g_modified.load(std::memory_order_relaxed)};
+        spurs::g_modified.load(std::memory_order_relaxed), spurs::g_found_again.load(std::memory_order_relaxed),
+        spurs::g_none_again.load(std::memory_order_relaxed), spurs::g_reidentified.load(std::memory_order_relaxed)};
 }
 
 } // namespace pspocket::hle

@@ -25,6 +25,9 @@ struct SpuProgramStats {
     u64 images = 0;   // distinct images without one, seen so far
     u64 modules = 0;  // modules (code a program loaded itself) that found a lifted program
     u64 modified = 0; // module loads changed in local store before they ran (interpreted: lifted code could be stale)
+    u64 found_again = 0; // of the lifted loads, those known from an earlier load without hashing (D-109)
+    u64 none_again = 0;  // of the interpreted loads, those known to have no lifted program without hashing (D-232)
+    u64 reidentified = 0; // images loaded with no lifted program that found one registered later (D-234)
 };
 SpuProgramStats spu_program_stats();
 

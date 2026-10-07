@@ -111,6 +111,11 @@ public:
     // A game's own policy module is reloaded whenever another policy ran in between: logged once per worker.
     bool custom_load_logged = false;
     const ps_spu_program* custom_program = nullptr; // the lifted program of the policy module in LS (D-076)
+    // With none, the module's key and the registrations it was looked up after (D-234): looked up again when programs
+    // are registered during the session, unless a DMA over its code dropped the one it had.
+    u64 custom_hash = 0, custom_additions = 0;
+    u32 custom_size = 0;
+    bool custom_dropped = false;
 
     struct Selection {
         u32 wid = kIdleWid;

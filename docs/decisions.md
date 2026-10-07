@@ -5078,6 +5078,34 @@ an attach in between, a context without a host; a registration racing the run 50
 runs); tests/hle/test_spu_threads.cpp (an lv2 thread looping 10 million times switches to its program, registered
 after it started).
 
+## D-232 · 2026-10-07 · An image without a lifted program is known as such until a program is registered
+
+D-109 remembered the program found for an image (per worker thread, by guest address, size, local store address and a
+fast content check), but an image with none was hashed whole and looked up under the registry's lock at every load:
+Assassin's Creed's first session loads untranslated jobs and modules 180,000 times in 150 s (run 207). "None" is now
+remembered too, until a program is registered (registry_additions moves); a program found is remembered until one is
+unregistered (registry_removals), no longer until anything at all changes in the registry, so a batch of new programs
+does not make every worker hash every image again. pspocket-boot prints how many loads were answered so: Assassin's
+Creed's first session, 154,913 of its 180,891 untranslated loads (run 217). Test:
+tests/hle/test_spu_programs.cpp (an unknown image loaded three times is hashed once; registered, the next load finds
+it; registering another program keeps the answer, unregistering one does not).
+
+## D-234 · 2026-10-07 · Modules, cached job binaries and policy modules look again after registrations
+
+The other images the HLE keeps an answer for:
+
+- **Modules** (code a program copies in, D-079): a run identified with no program is looked up again
+  (find_program_checked by its key) the next time execution reaches it after registrations. A run with no key (cut
+  in two, or changed in local store and partial) stays interpreted.
+- **Job binaries in the job chain's LS cache** (D-076): an entry with no program is looked up again at its next job
+  after registrations; an entry whose program a DMA over its code dropped (D-085) stays interpreted for good.
+- **A game's policy module** (resident in local store, D-076): looked up again at its next entry after registrations,
+  and while it runs (D-233); a dropped one stays interpreted.
+- pspocket-boot prints how many images found a program registered after their load. Tests: test_spu_programs.cpp (a
+  module run identified with no program runs translated once its program is registered; not when a code word in local
+  store changed); test_spurs_jobchain.cpp (a cached binary takes the program registered while the job before it ran);
+  test_spurs_run.cpp (a policy module that keeps running takes its program).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

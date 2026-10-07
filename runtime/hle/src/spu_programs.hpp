@@ -38,10 +38,19 @@ struct SpuImage {
 // Hashing costs about what copying the image does several times over: callers identify an image when they load it
 // and keep the answer while the image stays in local store (run 050: hashing every entry of GTA V's own policy
 // module and every job took a fifth of the workers' time).
-const ps_spu_program* identify_program(u8* base, const SpuImage& image);
+// *hash, when given, gets the image's program key (its ps_spu_hash64).
+const ps_spu_program* identify_program(u8* base, const SpuImage& image, u64* hash = nullptr);
 
-// identify_program, then attaches the result to the context.
+// Attaches a program identified for the image (or none) to the context. With none, the context looks again when
+// programs are registered while it runs (D-233): `additions` is spu::registry_additions() read before the
+// identification, `hash` the key it found.
+void attach_identified(SPUContext& ctx, const ps_spu_program* program, const SpuImage& image, u64 hash, u64 additions);
+
+// identify_program, then attach_identified.
 void attach_program(SPUContext& ctx, u8* base, const SpuImage& image);
+
+// An image loaded with no lifted program found one registered since (D-234): SpuProgramStats::reidentified.
+void count_reidentified();
 
 // The modules a program loaded (D-079) across a task's context switch (D-082). Restoring local store from a save area
 // does not go through the MFC, so the runs the tracker knew when the context was saved (those `keep` accepts: inside

@@ -5,6 +5,7 @@
 
 #include "hle_test_util.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -13,6 +14,8 @@
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/spu/asm.hpp"
+#include "pspocket/spu/interpreter.hpp"
+#include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
@@ -474,4 +477,60 @@ TEST_CASE("SPU thread groups: the process can end while a thread waits on its qu
     CHECK(s->f.kernel->shutdown(std::chrono::milliseconds(3000)));
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
     s.reset();
+}
+
+namespace {
+
+std::atomic<u64> g_thread_stepped{0};
+
+// A "translated" thread image: an entry at every instruction that runs it in the interpreter, counted.
+void thread_step(SPUContext* ctx, uint8_t*)
+{
+    g_thread_stepped.fetch_add(1, std::memory_order_relaxed);
+    spu::step(*ctx);
+}
+
+} // namespace
+
+TEST_CASE("SPU thread groups: a looping thread switches to the program registered for its image while it runs (D-233)",
+    "[hle][spu-threads]")
+{
+    SpuFixture s;
+    Program p; // says it started, loops 10 million times, stores its counter and exits 0x55
+    p.emit(as::il(10, 1));
+    p.put(10, kOut, 0x10);
+    p.load32(20, 10000000);
+    p.emit(as::ai(20, 20, -1));
+    p.emit(as::brnz(20, -4));
+    p.emit(as::il(21, 0x77));
+    p.put(20, kOut, 0x20);
+    p.put(21, kOut, 0x30);
+    p.thread_exit(0x55);
+    write_elf(s.b, kElf, p);
+    const u32 size = static_cast<u32>(p.code.size() * 4);
+    s.import_image(kImg, kElf, 0x100 + size);
+    std::vector<ps_spu_entry> entries;
+    for (u32 at = 0; at < size; at += 4) entries.push_back({at, &thread_step});
+    ps_spu_program program{"spu_thread_later", ps_spu_hash64(s.b + kElf + 0x100, size), 0, size,
+        PS_SPU_XFLOAT_APPROXIMATE, 0, static_cast<u32>(entries.size()), entries.data(), nullptr, nullptr,
+        ps_spu_code_hash(s.b + kElf + 0x100, size, nullptr)};
+
+    g_thread_stepped = 0;
+    const u64 adopted = spu::pending_homes_adopted();
+    std::memset(s.b + kOut, 0, 0x40);
+    const u32 group = s.create_group(1);
+    s.init_thread(group, 0, kImg);
+    REQUIRE(lv2::sys_spu_thread_group_start(s.t, group) == lv2::CELL_OK);
+    for (int i = 0; i < 5000 && ps_read32(s.b, kOut + 0x10) != 1; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(ps_read32(s.b, kOut + 0x10) == 1);
+    ps_spu_register_program(&program);
+    const auto [cause, status] = s.join(group);
+    CHECK(cause == 2); // all threads exited
+    CHECK(ps_read32(s.b, kOut + 0x20) == 0);
+    CHECK(ps_read32(s.b, kOut + 0x30) == 0x77);
+    CHECK(g_thread_stepped.load() > 0);
+    CHECK(spu::pending_homes_adopted() - adopted == 1);
+    REQUIRE(lv2::sys_spu_thread_group_destroy(s.t, group) == lv2::CELL_OK);
+    ps_spu_unregister_program(&program);
 }

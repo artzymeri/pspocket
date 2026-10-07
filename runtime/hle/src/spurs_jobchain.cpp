@@ -45,6 +45,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/reservation.h"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 #include "spu_programs.hpp"
 #include "spurs_native.hpp"
@@ -243,9 +244,12 @@ struct CacheEntry {
     u32 pages = 0;
     u32 refs = 0; // jobs using it
     u64 used = 0; // LRU stamp
-    // A binary's lifted program, identified when the binary was loaded (D-076).
-    bool identified = false;
+    // A binary's lifted program, identified when the binary was loaded (D-076). With none, its key and the
+    // registrations it was looked up after: looked up again when programs are registered during the session (D-234),
+    // unless a DMA over its code dropped the program it had (D-085).
+    bool identified = false, dropped = false;
     const ps_spu_program* program = nullptr;
+    u64 hash = 0, additions = 0;
 };
 
 class JobChainPolicy {
@@ -1166,10 +1170,23 @@ bool JobChainPolicy::run_job(const Job& job)
     const SpuImage image{ImageKind::Job, binary_ea, binary, size_binary, binary};
     CacheEntry* cached = binary_entry >= 0 ? &cache_[static_cast<u32>(binary_entry)] : nullptr;
     if (cached && !cached->identified) {
-        cached->program = identify_program(base_, image);
+        cached->additions = spu::registry_additions();
+        cached->program = identify_program(base_, image, &cached->hash);
         cached->identified = true;
+    } else if (cached && !cached->program && !cached->dropped && spu::registry_additions() != cached->additions) {
+        cached->additions = spu::registry_additions();
+        cached->program = spu::find_program_checked(cached->hash, binary, size_binary, true, ls_);
+        if (cached->program) count_reidentified();
     }
-    ps_spu_attach_program_at(&ctx, cached ? cached->program : identify_program(base_, image), binary); // relocatable (D-081)
+    if (cached) {
+        ps_spu_attach_program_at(&ctx, cached->program, binary); // relocatable (D-081)
+    } else {
+        // Not in the cache: a program registered while it runs is taken at its next taken branch (D-233).
+        const u64 additions = spu::registry_additions();
+        u64 hash = 0;
+        const ps_spu_program* program = identify_program(base_, image, &hash);
+        attach_identified(ctx, program, image, hash, additions);
+    }
 
     ps_spu_set_dma_tag((u64{binary_ea} << 32) | job.ea); // the job's DMA writes carry it (D-138)
     for (;;) {
@@ -1183,7 +1200,10 @@ bool JobChainPolicy::run_job(const Job& job)
     }
     ps_spu_set_dma_tag(policy_tag());
     // A DMA over the binary's code dropped its lifted program: the cached copy is interpreted from now on.
-    if (cached && !ctx.home) cached->program = nullptr;
+    if (cached && cached->program && !ctx.home) {
+        cached->program = nullptr;
+        cached->dropped = true;
+    }
     // The job's own DMA (its output) completed with it: the MFC is synchronous.
     release_buffers();
     return true;

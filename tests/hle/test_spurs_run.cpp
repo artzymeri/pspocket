@@ -18,7 +18,9 @@
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/spu/asm.hpp"
+#include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/spu/context.h"
+#include "pspocket/spu/interpreter.hpp"
 #include "pspocket/spu/runtime.h"
 #include "guest.hpp" // runtime/hle/src: reservation_op
 #include "spurs.hpp"
@@ -573,6 +575,68 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
     REQUIRE(a.call("_cellSpursWorkloadFlagReceiver", kSpurs, wid, 0) == 0);
     CHECK(ps_read8(b, kSpurs + 0x77) == 0xFF);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+}
+
+namespace {
+
+std::atomic<u64> g_pm_stepped{0};
+
+// A "translated" policy module: an entry at every instruction that runs it in the interpreter, counted.
+void pm_step(SPUContext* ctx, uint8_t*)
+{
+    g_pm_stepped.fetch_add(1, std::memory_order_relaxed);
+    spu::step(*ctx);
+}
+
+} // namespace
+
+TEST_CASE("SPURS workers: a policy module loaded with no program runs the one registered since (D-234)",
+    "[hle][spurs][spurs-run]")
+{
+    constexpr u32 kPm = kData + 0x14000, kWid = kData + 0x8600;
+    const ps_spu_miss_policy policy = ps_spu_get_miss_policy();
+    ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET); // its calls into the kernel leave the program (CLAUDE.md rule 5)
+    Fixture f;
+    GuestThread a(f, 0, "ppu");
+    u8* b = f.base();
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 1, 200, 2016, 0) == 0);
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
+    // A module that counts its runs in its output's first word, then exits to the kernel; it runs again and again
+    // while the ready count stays.
+    Program p;
+    p.emit(as::rotqbyi(80, 4, 4)); // the output EA
+    p.emit(as::il(73, kBuf + 0x10));
+    p.dma16(PS_MFC_GET, 73, 80);
+    p.emit(as::lqd(74, 0, 73));
+    p.emit(as::ai(74, 74, 1));
+    p.emit(as::stqd(74, 0, 73));
+    p.dma16(PS_MFC_PUT, 73, 80);
+    p.emit(as::lqa(2, 0x1E0)); // [0x1E0]: exit to the kernel
+    p.emit(as::bisl(0, 2));
+    for (usize i = 0; i < p.code.size(); i++) ps_write32(b, kPm + 4 * static_cast<u32>(i), p.code[i]);
+    const u32 size = static_cast<u32>(p.code.size() * 4);
+    std::vector<ps_spu_entry> entries;
+    for (u32 at = 0; at < size; at += 4) entries.push_back({0xA00 + at, &pm_step});
+    ps_spu_program program{"spu_policy_later", ps_spu_hash64(b + kPm, size), 0xA00, size, PS_SPU_XFLOAT_APPROXIMATE, 0,
+        static_cast<u32>(entries.size()), entries.data(), nullptr, nullptr, ps_spu_code_hash(b + kPm, size, nullptr)};
+    const u8 prio[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+    std::memcpy(b + kPrio, prio, 8);
+    REQUIRE(a.call("cellSpursAddWorkload", kSpurs, kWid, kPm, size, u64{kOut}, kPrio, 1, 1) == 0);
+    const u32 wid = ps_read32(b, kWid);
+
+    g_pm_stepped = 0;
+    std::memset(b + kOut, 0, 16);
+    REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 1) == 0);
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut) >= 3; })); // interpreted runs
+    CHECK(g_pm_stepped.load() == 0);
+    ps_spu_register_program(&program);
+    const u32 runs = ps_read32(b, kOut);
+    REQUIRE(wait_for([&] { return ps_read32(b, kOut) >= runs + 3; }));
+    REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 0) == 0);
+    CHECK(g_pm_stepped.load() > 0);
+    REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
+    ps_spu_unregister_program(&program);
+    ps_spu_set_miss_policy(policy);
 }
 
 // L.A. Noire (BLES00933) registers its own policy module with an attribute (D-165): _cellSpursWorkloadAttributeInitialize,

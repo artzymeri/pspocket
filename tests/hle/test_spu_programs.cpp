@@ -126,6 +126,43 @@ TEST_CASE("SPU programs: an image loaded again is the program found before, unle
     ps_spu_unregister_program(&again);
 }
 
+TEST_CASE("SPU programs: an image without a lifted program is hashed once, until a program is registered (D-232)",
+    "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    for (u32 i = 0; i < kSize; i++) base[kGuest + i] = static_cast<u8>(i * 13 + 9);
+    const hle::spurs::SpuImage job{ImageKind::Job, kGuest, kLs, kSize, kLs};
+    const hle::SpuProgramStats before = hle::spu_program_stats();
+    for (int i = 0; i < 3; i++) CHECK(hle::spurs::identify_program(base, job) == nullptr);
+    CHECK(hle::spu_program_stats().unknown - before.unknown == 3);
+    CHECK(hle::spu_program_stats().none_again - before.none_again == 2);
+
+    // Its program registered, the next load finds it.
+    const ps_spu_entry entries[] = {{kLs, &lifted_entry}};
+    ps_spu_program program{"spu_test_none", ps_spu_hash64(base + kGuest, kSize), kLs, kSize, PS_SPU_XFLOAT_APPROXIMATE, 1,
+        1, entries, nullptr, nullptr, 0};
+    ps_spu_register_program(&program);
+    CHECK(hle::spurs::identify_program(base, job) == &program);
+    // Another program registered: the one found is still known without hashing.
+    ps_spu_program other = program;
+    other.name = "spu_test_none_other";
+    other.hash ^= 1;
+    other.table = nullptr;
+    ps_spu_register_program(&other);
+    const u64 found = hle::spu_program_stats().found_again;
+    CHECK(hle::spurs::identify_program(base, job) == &program);
+    CHECK(hle::spu_program_stats().found_again - found == 1);
+    // One unregistered: looked up again.
+    ps_spu_unregister_program(&other);
+    CHECK(hle::spurs::identify_program(base, job) == &program);
+    CHECK(hle::spu_program_stats().found_again - found == 1);
+    ps_spu_unregister_program(&program);
+    CHECK(hle::spurs::identify_program(base, job) == nullptr);
+}
+
 TEST_CASE("SPU programs: a relocatable program attaches wherever its image sits (D-081)", "[hle][spu]")
 {
     GuestMemory mem;
@@ -301,6 +338,60 @@ TEST_CASE("SPU programs: code a program copies in itself runs lifted when execut
     CHECK(run_at_module() == 0x42);
     CHECK(spu.ctx.program == &program);
     std::memcpy(base + kGuest, saved.data(), kModuleSize);
+
+    ps_spu_set_resolver(nullptr);
+    ps_spu_set_get_observer(nullptr);
+    ps_spu_unregister_program(&program);
+}
+
+TEST_CASE("SPU programs: a module identified with no program runs lifted once its program is registered (D-234)",
+    "[hle][spu]")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    REQUIRE(mem.commit(kGuest, 0x10000));
+    u8* base = mem.base();
+    constexpr u32 kModule = 0x8000, kModuleSize = 0x800;
+    ps_write32(base, kGuest, 0x00000007); // `stop 0x7` at its entry, as the interpreter runs it
+    for (u32 i = 4; i < kModuleSize; i += 4) ps_write32(base, kGuest + i, 0x40200000 | (i * 3)); // distinct nops
+    const ps_spu_entry entries[] = {{kModule, &module_entry}};
+    ps_spu_program program{"spu_module_later", ps_spu_hash64(base + kGuest, kModuleSize), kModule, kModuleSize,
+        PS_SPU_XFLOAT_APPROXIMATE, 1, 1, entries, nullptr, nullptr, ps_spu_code_hash(base + kGuest, kModuleSize, nullptr)};
+    hle::enable_spu_modules();
+    Spu spu(base);
+    const auto get = [&](u32 lsa, u32 eal, u32 size) {
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_LSA, lsa) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAH, 0) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_EAL, eal) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Size, size) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_TagID, 2) == 0);
+        REQUIRE(ps_spu_wrch(&spu.ctx, 0, PS_MFC_Cmd, PS_MFC_GET) == 0);
+    };
+    const auto run_at_module = [&] {
+        ps_spu_attach_program(&spu.ctx, nullptr); // back in the program's own code
+        spu.ctx.pc = kModule;
+        REQUIRE(ps_spu_run(&spu.ctx) == PS_SPU_STOP_SIGNAL);
+        return spu.ctx.stop_code;
+    };
+    const hle::SpuProgramStats before = hle::spu_program_stats();
+
+    // Identified with none, interpreted; once its program is registered, execution reaching it runs that.
+    get(kModule, kGuest, kModuleSize);
+    CHECK(run_at_module() == 0x7);
+    ps_spu_register_program(&program);
+    CHECK(run_at_module() == 0x42);
+    CHECK(spu.ctx.program == &program);
+    CHECK(hle::spu_program_stats().reidentified - before.reidentified == 1);
+    ps_spu_unregister_program(&program);
+
+    // Not when a code word in local store changed since it was identified: the program's code is not what runs.
+    get(kModule, kGuest, kModuleSize);
+    CHECK(run_at_module() == 0x7);
+    ps_write32(spu.ls.get(), kModule + 0x100, 0x40200000);
+    ps_spu_register_program(&program);
+    CHECK(run_at_module() == 0x7);
+    CHECK(spu.ctx.program == nullptr);
+    CHECK(hle::spu_program_stats().reidentified - before.reidentified == 1);
 
     ps_spu_set_resolver(nullptr);
     ps_spu_set_get_observer(nullptr);

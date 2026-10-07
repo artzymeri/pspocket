@@ -15,8 +15,11 @@
 #include <utility>
 #include <vector>
 
+#include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/recomp/spu/asm.hpp"
 #include "pspocket/spu/context.h"
+#include "pspocket/spu/interpreter.hpp"
+#include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
 using namespace pspocket::hle::test;
@@ -272,6 +275,57 @@ TEST_CASE("job chains: jobs start with libsre's registers, context and LS pages;
     CHECK(s.rec(2, 0x10) == 0x3F400);
     REQUIRE(s.wait_left());
     CHECK(ps_read64(b, kJc + 0x00) == kCmds + 0x18);
+}
+
+namespace {
+
+std::atomic<u64> g_stepped{0};
+
+// A "translated" recorder: an entry at every instruction that runs it in the interpreter, counted.
+void step_one(SPUContext* ctx, uint8_t*)
+{
+    g_stepped.fetch_add(1, std::memory_order_relaxed);
+    spu::step(*ctx);
+}
+
+} // namespace
+
+TEST_CASE("job chains: a cached binary loaded with no program takes the one registered since at its next job (D-234)",
+    "[hle][spurs][spurs-jobchain]")
+{
+    // Its program, lifted from the recorder (every word before its counter at +0x200 code).
+    const ps_spu_miss_policy policy = ps_spu_get_miss_policy();
+    ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET); // the job's return leaves the program (CLAUDE.md rule 5)
+    ChainFixture s;
+    u8* b = s.base;
+    std::vector<ps_spu_entry> entries;
+    for (u32 a = 0; a < kBinSize; a += 4) entries.push_back({0x4C00 + a, &step_one});
+    const u32 code_words[(kBinSize / 4 + 31) / 32] = {~0u, ~0u, ~0u, ~0u, 0};
+    ps_spu_program program{"spu_recorder", ps_spu_hash64(b + kBin, kBinSize), 0x4C00, kBinSize, PS_SPU_XFLOAT_APPROXIMATE,
+        1, static_cast<u32>(entries.size()), entries.data(), nullptr, code_words,
+        ps_spu_code_hash(b + kBin, kBinSize, code_words)};
+
+    // The first job loads the binary into the LS cache (none registered: interpreted) and waits after it started;
+    // the program is registered meanwhile; the second job, from the cache, runs it.
+    write_desc(b, desc(0), {.out = out(0), .delay = 3000000, .started = kStarted});
+    write_desc(b, desc(1), {.out = out(1)});
+    s.cmd(kCmds + 0x00, desc(0));
+    s.cmd(kCmds + 0x08, desc(1));
+    s.cmd(kCmds + 0x10, kEnd);
+    g_stepped = 0;
+    const u64 before = hle::spu_program_stats().reidentified;
+    s.run();
+    REQUIRE(wait_for([&] { return ps_read32(b, kStarted) != 0; }));
+    ps_spu_register_program(&program);
+    REQUIRE(s.wait_done(0));
+    REQUIRE(s.wait_done(1));
+    REQUIRE(s.wait_left());
+    CHECK(g_stepped.load() > 0);
+    CHECK(hle::spu_program_stats().reidentified - before == 1);
+    CHECK(s.rec(1, 0x80) == 2); // the binary's counter, kept in the cache
+    CHECK(s.rec(1, 0x20) == 0x4C00);
+    ps_spu_unregister_program(&program);
+    ps_spu_set_miss_policy(policy);
 }
 
 // Regression: the previous job's scratch + stack was freed only when the next job's was allocated, after that job's
