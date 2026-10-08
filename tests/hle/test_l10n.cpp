@@ -473,3 +473,97 @@ TEST_CASE("cellL10n: the Chinese converters are libl10n's (D-517)", "[hle][l10n]
     }
     CHECK(l.mismatches == 0);
 }
+
+TEST_CASE("cellL10n: the Japanese text tools are libl10n's (D-517)", "[hle][l10n]")
+{
+    L10n l;
+    if (!l.sony) SKIP("PSPOCKET_TEST_DEV_FLASH is not set");
+    u8* b = l.b;
+    std::mt19937 rng(41);
+    for (u32 c = 0; c < 0x10000; c++)
+        for (const char* fn : {"eucjphan2zen", "eucjpzen2han", "sjishan2zen", "sjiszen2han", "isEucJpKigou", "isSjisKigou"})
+            l.same(fn, [&](u32) { return std::vector<u64>{c}; }, std::format("{:#x}", c));
+    // Kana-heavy text: hiragana, katakana, the marks, half-width kana and marks, ASCII, cut sequences.
+    const auto euc_text = [&] {
+        std::vector<u8> s;
+        for (u32 i = 0, n = 1 + rng() % 12; i < n; i++) {
+            const u32 r = rng() % 10;
+            u32 c;
+            if (r < 2) c = 0xA4A1 + rng() % 83;
+            else if (r < 4) c = 0xA5A1 + rng() % 86;
+            else if (r < 5) c = rng() % 2 ? 0xA1AB : 0xA1AC;
+            else if (r < 6) c = 0xA3C1 + rng() % 58;
+            else if (r < 7) { s.push_back(0x8E); s.push_back(static_cast<u8>(0xA1 + rng() % 63)); continue; }
+            else if (r < 8) { s.push_back(static_cast<u8>(0x20 + rng() % 0x5F)); continue; }
+            else if (r < 9) { s.push_back(0x8F); s.push_back(static_cast<u8>(0xA1 + rng() % 94)); s.push_back(static_cast<u8>(0xA1 + rng() % 94)); continue; }
+            else { const auto x = random_bytes(rng, 1 + rng() % 2); s.insert(s.end(), x.begin(), x.end()); continue; }
+            s.push_back(static_cast<u8>(c >> 8));
+            s.push_back(static_cast<u8>(c));
+        }
+        return s;
+    };
+    const auto sjis_text = [&] {
+        std::vector<u8> s;
+        for (u32 i = 0, n = 1 + rng() % 12; i < n; i++) {
+            const u32 r = rng() % 9;
+            u32 c;
+            if (r < 2) c = 0x829F + rng() % 83;
+            else if (r < 4) c = 0x8340 + rng() % 87;
+            else if (r < 5) c = rng() % 2 ? 0x814A : 0x814B;
+            else if (r < 6) c = 0x8260 + rng() % 0x3B;
+            else if (r < 7) { s.push_back(static_cast<u8>(0xA1 + rng() % 63)); continue; }
+            else if (r < 8) { s.push_back(static_cast<u8>(0x20 + rng() % 0x5F)); continue; }
+            else { const auto x = random_bytes(rng, 1 + rng() % 2); s.insert(s.end(), x.begin(), x.end()); continue; }
+            s.push_back(static_cast<u8>(c >> 8));
+            s.push_back(static_cast<u8>(c));
+        }
+        return s;
+    };
+    for (u32 round = 0; round < 1500; round++) {
+        const std::vector<u8> e = euc_text(), j = sjis_text();
+        for (const char* fn : {"EucJpHan2Zen", "EucJpZen2Han", "ToEucJpHira", "ToEucJpKata", "ToEucJpLower", "ToEucJpUpper",
+                 "SjisHan2Zen", "SjisZen2Han", "ToSjisHira", "ToSjisKata", "ToSjisLower", "ToSjisUpper"}) {
+            const std::vector<u8>& in = std::string(fn).find("Euc") != std::string::npos ? e : j;
+            const u32 n = static_cast<u32>(in.size());
+            for (const u32 sl : {n, n > 1 ? n - 1 : n})
+                for (const u32 cap : {0x100u, 0u, 1u, 3u})
+                    for (const bool null_dst : {false, true})
+                        l.same(fn, [&](u32 base) {
+                            put_bytes(b, base + 0x200, in);
+                            ps_write32(b, base + 0x3F0, sl);
+                            ps_write32(b, base + 0x3F4, cap);
+                            return std::vector<u64>{base + 0x200, base + 0x3F0, null_dst ? 0u : base, base + 0x3F4};
+                        }, std::format("{} n {} cap {}{}", hex(in), sl, cap, null_dst ? " NULL" : ""));
+        }
+    }
+    // The combining marks after kana in the converters into EUC-JP and Shift-JIS.
+    const u32 kana[] = {0x304B, 0x30AB, 0x306F, 0x30CF, 0x3046, 0x30A6, 0x3042, 0x3063, 0x3068, 0x30C8, 0x0041, 0x30DB};
+    for (u32 round = 0; round < 1500; round++) {
+        std::vector<u32> chars;
+        for (u32 i = 0, n = 1 + rng() % 6; i < n; i++) {
+            const u32 r = rng() % 4;
+            chars.push_back(r < 2 ? kana[rng() % std::size(kana)] : r < 3 ? 0x3099 + rng() % 2 : 0x20 + rng() % 0x5F);
+        }
+        std::vector<u8> ucs2, utf8;
+        for (const u32 c : chars) {
+            ucs2.push_back(static_cast<u8>(c >> 8));
+            ucs2.push_back(static_cast<u8>(c));
+            if (c < 0x80) utf8.push_back(static_cast<u8>(c));
+            else { utf8.push_back(static_cast<u8>(0xE0 | (c >> 12))); utf8.push_back(static_cast<u8>(0x80 | ((c >> 6) & 0x3F))); utf8.push_back(static_cast<u8>(0x80 | (c & 0x3F))); }
+        }
+        for (const char* fn : {"UCS2stoEUCJPs", "UCS2stoSJISs", "UTF8stoEUCJPs", "UTF8stoSJISs"}) {
+            const bool wide = std::string(fn).starts_with("UCS2");
+            const std::vector<u8>& in = wide ? ucs2 : utf8;
+            const u32 n = static_cast<u32>(wide ? in.size() / 2 : in.size());
+            for (const u32 cap : {0x100u, 2u, 3u})
+                for (const bool null_dst : {false, true})
+                    l.same(fn, [&](u32 base) {
+                        put_bytes(b, base + 0x200, in);
+                        ps_write32(b, base + 0x3F0, n);
+                        ps_write32(b, base + 0x3F4, cap);
+                        return std::vector<u64>{base + 0x200, base + 0x3F0, null_dst ? 0u : base, base + 0x3F4};
+                    }, std::format("{} cap {}{}", hex(in), cap, null_dst ? " NULL" : ""));
+        }
+    }
+    CHECK(l.mismatches == 0);
+}

@@ -1445,21 +1445,120 @@ u32 utf8_string(PPUContext& ctx, const char* fn, u32 src, u32 sl, u32 dst, u32 d
     });
 }
 
+// The kana a combining voiced (U+3099) or semi-voiced (U+309A) mark may join, in EUC-JP and Shift-JIS: the h-rows
+// first (the ten that take the semi-voiced mark), then k-, s- and t-rows, then katakana U (U+3099 makes it VU).
+constexpr u16 kDakutenEuc[] = {0xA4CF, 0xA4D2, 0xA4D5, 0xA4D8, 0xA4DB, 0xA5CF, 0xA5D2, 0xA5D5, 0xA5D8, 0xA5DB, 0xA4AB,
+    0xA4AD, 0xA4AF, 0xA4B1, 0xA4B3, 0xA4B5, 0xA4B7, 0xA4B9, 0xA4BB, 0xA4BD, 0xA4BF, 0xA4C1, 0xA4C4, 0xA4C6, 0xA4C8,
+    0xA5AB, 0xA5AD, 0xA5AF, 0xA5B1, 0xA5B3, 0xA5B5, 0xA5B7, 0xA5B9, 0xA5BB, 0xA5BD, 0xA5BF, 0xA5C1, 0xA5C4, 0xA5C6,
+    0xA5C8, 0xA5A6};
+constexpr u16 kDakutenSjis[] = {0x82CD, 0x82D0, 0x82D3, 0x82D6, 0x82D9, 0x836E, 0x8371, 0x8374, 0x8377, 0x837A, 0x82A9,
+    0x82AB, 0x82AD, 0x82AF, 0x82B1, 0x82B3, 0x82B5, 0x82B7, 0x82B9, 0x82BB, 0x82BD, 0x82BF, 0x82C2, 0x82C4, 0x82C6,
+    0x834A, 0x834C, 0x834E, 0x8350, 0x8352, 0x8354, 0x8356, 0x8358, 0x835A, 0x835C, 0x835E, 0x8360, 0x8363, 0x8365,
+    0x8367, 0x8345};
+
+s32 dakuten_index(const u16* list, u32 code)
+{
+    for (s32 i = 0; i < 41; i++)
+        if (list[i] == code) return i;
+    return -1;
+}
+
+// The string converters into EUC-JP and Shift-JIS (libl10n 0x9bfc and its kin): a combining voiced or semi-voiced
+// mark after a kana that takes it replaces the two bytes last written with the voiced kana (and counts nothing). The
+// kana is remembered until a mark comes, whatever is written in between, as libl10n does.
+template <bool kSjis, bool kUtf8, class Enc>
+u32 kana_string(PPUContext& ctx, const char* fn, u32 src, u32 src_len, u32 dst, u32 dst_len, Enc enc)
+{
+    Mem m(ctx, fn);
+    const u16* list = kSjis ? kDakutenSjis : kDakutenEuc;
+    if (!m.r32(src_len)) {
+        m.w32(dst_len, 0);
+        return m.ok() ? kOK : kIllegal;
+    }
+    u32 consumed = 0, count = 0;
+    s32 state = -1;
+    for (;;) {
+        u32 c = 0, took = 1;
+        if constexpr (kUtf8) {
+            took = utf8_decode([&](u32 i) { return m.r8(src + consumed + i); }, &c, false);
+            if (!took || m.r32(src_len) < consumed + took) {
+                m.w32(src_len, m.r32(src_len) - consumed);
+                m.w32(dst_len, count);
+                return m.ok() ? kIllegal : kIllegal;
+            }
+        } else {
+            c = m.r16(src + 2 * consumed);
+        }
+        if (!m.ok()) return kIllegal;
+        u8 out[4];
+        u32 n = enc(c, out);
+        if (!n) {
+            const u32 c16 = c & 0xFFFF;
+            if (state < 0 || (c16 != 0x3099 && !(c16 == 0x309A && state <= 9))) {
+                m.w32(src_len, m.r32(src_len) - consumed);
+                m.w32(dst_len, count);
+                return kIllegal;
+            }
+            if (!dst) {
+                state = -1;
+                consumed += took;
+                if (m.r32(src_len) <= consumed) {
+                    m.w32(dst_len, count);
+                    return m.ok() ? kOK : kIllegal;
+                }
+                continue;
+            }
+            u32 v = list[state] + (c16 == 0x3099 ? 1 : 2);
+            if (c16 == 0x3099 && list[state] == (kSjis ? 0x8345 : 0xA5A6)) v = kSjis ? 0x8394 : 0xA5F4;
+            dst -= 2;
+            out[0] = static_cast<u8>(v >> 8);
+            out[1] = static_cast<u8>(v);
+            n = 2;
+            state = -1;
+        } else {
+            if (state < 0) {
+                const u32 code = (u32{out[0]} << 8) | out[1];
+                const bool kana = kSjis ? (((out[0] - 0x81) & 0xFF) <= 30 || ((out[0] - 0xE0) & 0xFF) <= 28) &&
+                                              ((((code - 0x8340) & 0xFFFF) <= 86 && code != 0x837F) ||
+                                                  ((code - 0x829F) & 0xFFFF) <= 82)
+                                        : in_a1_fe(out[0]) &&
+                                              (((code - 0xA5A1) & 0xFFFF) <= 85 || ((code - 0xA4A1) & 0xFFFF) <= 82);
+                if (kana) state = dakuten_index(list, code);
+            }
+            count += n;
+        }
+        if (dst) {
+            if (m.r32(dst_len) < count) {
+                m.w32(src_len, m.r32(src_len) - consumed);
+                m.w32(dst_len, count - n);
+                return m.ok() ? kExhausted : kIllegal;
+            }
+            for (u32 k = 0; k < n; k++) m.w8(dst + k, out[k]);
+            dst += n;
+        }
+        consumed += took;
+        if (m.r32(src_len) <= consumed) {
+            m.w32(dst_len, count);
+            return m.ok() ? kOK : kIllegal;
+        }
+    }
+}
+
 u32 UCS2stoEUCJPs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
 {
-    return ucs2_string(ctx, "UCS2stoEUCJPs", src, sl, dst, dl, ucs2_to_eucjp);
+    return kana_string<false, false>(ctx, "UCS2stoEUCJPs", src, sl, dst, dl, ucs2_to_eucjp);
 }
 u32 UCS2stoSJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
 {
-    return ucs2_string(ctx, "UCS2stoSJISs", src, sl, dst, dl, ucs2_to_sjis);
+    return kana_string<true, false>(ctx, "UCS2stoSJISs", src, sl, dst, dl, ucs2_to_sjis);
 }
 u32 UTF8stoEUCJPs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
 {
-    return utf8_string(ctx, "UTF8stoEUCJPs", src, sl, dst, dl, ucs2_to_eucjp);
+    return kana_string<false, true>(ctx, "UTF8stoEUCJPs", src, sl, dst, dl, ucs2_to_eucjp);
 }
 u32 UTF8stoSJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
 {
-    return utf8_string(ctx, "UTF8stoSJISs", src, sl, dst, dl, ucs2_to_sjis);
+    return kana_string<true, true>(ctx, "UTF8stoSJISs", src, sl, dst, dl, ucs2_to_sjis);
 }
 
 // The cp932 string forms: source and destination codes as big-endian u16 (MSJIS) units.
@@ -1521,6 +1620,393 @@ u32 UTF8stoMSJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
         s.took = took;
         return s;
     });
+}
+
+// ------------------------------------------------------------------------------------------------- Japanese text
+
+// The full-width forms of ASCII 20-7E and of the half-width katakana A1-DF as EUC-JP codes (libl10n's han2zen table,
+// 158 entries; backslash is FULLWIDTH REVERSE SOLIDUS A1C0, as Sony's): its zen2han functions take the first entry of a
+// code.
+const std::array<u16, 158>& han2zen()
+{
+    static constexpr std::array<u16, 158> kTable = {
+        0xA1A1, 0xA1AA, 0xA1C9, 0xA1F4, 0xA1F0, 0xA1F3, 0xA1F5, 0xA1C7, 0xA1CA, 0xA1CB, 0xA1F6, 0xA1DC, 0xA1A4, 0xA1DD,
+        0xA1A5, 0xA1BF, 0xA3B0, 0xA3B1, 0xA3B2, 0xA3B3, 0xA3B4, 0xA3B5, 0xA3B6, 0xA3B7, 0xA3B8, 0xA3B9, 0xA1A7, 0xA1A8,
+        0xA1E3, 0xA1E1, 0xA1E4, 0xA1A9, 0xA1F7, 0xA3C1, 0xA3C2, 0xA3C3, 0xA3C4, 0xA3C5, 0xA3C6, 0xA3C7, 0xA3C8, 0xA3C9,
+        0xA3CA, 0xA3CB, 0xA3CC, 0xA3CD, 0xA3CE, 0xA3CF, 0xA3D0, 0xA3D1, 0xA3D2, 0xA3D3, 0xA3D4, 0xA3D5, 0xA3D6, 0xA3D7,
+        0xA3D8, 0xA3D9, 0xA3DA, 0xA1CE, 0xA1C0, 0xA1CF, 0xA1B0, 0xA1B2, 0xA1C6, 0xA3E1, 0xA3E2, 0xA3E3, 0xA3E4, 0xA3E5,
+        0xA3E6, 0xA3E7, 0xA3E8, 0xA3E9, 0xA3EA, 0xA3EB, 0xA3EC, 0xA3ED, 0xA3EE, 0xA3EF, 0xA3F0, 0xA3F1, 0xA3F2, 0xA3F3,
+        0xA3F4, 0xA3F5, 0xA3F6, 0xA3F7, 0xA3F8, 0xA3F9, 0xA3FA, 0xA1D0, 0xA1C3, 0xA1D1, 0xA1B1,
+        // A1-DF
+        0xA1A3, 0xA1D6, 0xA1D7, 0xA1A2, 0xA1A6, 0xA5F2, 0xA5A1, 0xA5A3, 0xA5A5, 0xA5A7, 0xA5A9, 0xA5E3, 0xA5E5, 0xA5E7,
+        0xA5C3, 0xA1BC, 0xA5A2, 0xA5A4, 0xA5A6, 0xA5A8, 0xA5AA, 0xA5AB, 0xA5AD, 0xA5AF, 0xA5B1, 0xA5B3, 0xA5B5, 0xA5B7,
+        0xA5B9, 0xA5BB, 0xA5BD, 0xA5BF, 0xA5C1, 0xA5C4, 0xA5C6, 0xA5C8, 0xA5CA, 0xA5CB, 0xA5CC, 0xA5CD, 0xA5CE, 0xA5CF,
+        0xA5D2, 0xA5D5, 0xA5D8, 0xA5DB, 0xA5DE, 0xA5DF, 0xA5E0, 0xA5E1, 0xA5E2, 0xA5E4, 0xA5E6, 0xA5E8, 0xA5E9, 0xA5EA,
+        0xA5EB, 0xA5EC, 0xA5ED, 0xA5EF, 0xA5F3, 0xA1AB, 0xA1AC};
+    return kTable;
+}
+
+u32 euc_han2zen(u32 c)
+{
+    const u32 c16 = c & 0xFFFF;
+    if (c16 <= 0x1F || ((c - 0x7F) & 0xFFFF) <= 0x8E21 || c16 > 0x8EDF) return c16;
+    const u32 lo = c & 0xFF;
+    return han2zen()[(lo > 0xA0 ? lo - 34 : lo) - 32];
+}
+
+u32 euc_zen2han(u32 c)
+{
+    const auto& t = han2zen();
+    for (u32 i = 0; i < t.size(); i++) {
+        if (t[i] == c) return i + 32 <= 0x7E ? i + 32 : (i + 0x8E42) & 0xFFFF;
+    }
+    return c;
+}
+
+u32 sjis_han2zen(u32 c)
+{
+    const u32 c16 = c & 0xFFFF;
+    if (c16 <= 0x1F || ((c16 - 0x7F) & 0xFFFF) <= 0x21 || c16 > 0xDF) return c16;
+    return jis_to_sjis(han2zen()[(c16 > 0xA0 ? c16 - 34 : c16) - 32] & 0x7F7F);
+}
+
+u32 sjis_zen2han(u32 c)
+{
+    const u32 e = sjis_to_jis(c & 0xFFFF);
+    if (!e) return c & 0xFFFF;
+    const auto& t = han2zen();
+    for (u32 i = 0; i < t.size(); i++) {
+        if (t[i] == (e | 0x8080)) return i + 32 <= 0x7E ? i + 32 : i + 66;
+    }
+    return c & 0xFFFF;
+}
+
+u32 eucjphan2zen(PPUContext&, u32 c) { return euc_han2zen(c); }
+u32 eucjpzen2han(PPUContext&, u32 c) { return euc_zen2han(c & 0xFFFFFFFF); }
+u32 sjishan2zen(PPUContext&, u32 c) { return sjis_han2zen(c); }
+u32 sjiszen2han(PPUContext&, u32 c) { return sjis_zen2han(c); }
+
+// The symbols of JIS X 0208 rows 1 and 2 (isSjisKigou's table, Shift-JIS 8141-81FC; isEucJpKigou reads its row 2).
+const std::array<u8, 188>& kigou_table()
+{
+    static const std::array<u8, 188> t = [] {
+        std::array<u8, 188> f{};
+        const auto& j = table(kJis0208);
+        for (u32 i = 0; i < 188; i++) {
+            const u32 code = 0x8141 + i;
+            u32 row, cell;
+            if ((code & 0xFF) == 0x7F || !sjis_split(code, &row, &cell)) continue;
+            f[i] = row == 1 ? 1 : (j[(row - 1) * 94 + cell - 1] != 0xFFFF ? 1 : 0);
+        }
+        return f;
+    }();
+    return t;
+}
+
+u32 isEucJpKigou(PPUContext&, u32 c)
+{
+    const u32 c16 = c & 0xFFFF;
+    if (((c16 - 0xA1A2) & 0xFFFF) <= 92) return 1;
+    if (((c16 - 0xA2A1) & 0xFFFF) <= 93 && kigou_table()[c16 - 0xA2A1 + 94]) return 1;
+    return ((c16 - 0xA8A1) & 0xFFFF) <= 31 ? 1 : 0;
+}
+
+u32 isSjisKigou(PPUContext&, u32 c)
+{
+    const u32 c16 = c & 0xFFFF;
+    if (((c16 - 0x8141) & 0xFFFF) <= 187 && kigou_table()[c16 - 0x8141]) return 1;
+    return ((c16 - 0x849F) & 0xFFFF) <= 31 ? 1 : 0;
+}
+
+// The voiced-mark joins of the text tools (0x16c8 EUC-JP, 0x1808 Shift-JIS): the voiced (or semi-voiced) kana of
+// `prev` and the mark `code`, or 0.
+u32 combine_euc(u32 prev, u32 code)
+{
+    if (((code - 0xA1AB) & 0xFFFF) > 1) return 0;
+    u32 k;
+    bool kata;
+    if (((prev - 0xA4A1) & 0xFFFF) <= 82) {
+        k = euc_zen2han((prev + 0x100) & 0xFFFF) & 0xFF;
+        kata = false;
+    } else if (((prev - 0xA5A1) & 0xFFFF) <= 85) {
+        k = euc_zen2han(prev) & 0xFF;
+        kata = true;
+    } else {
+        return 0;
+    }
+    if (((k - 0xB6) & 0xFFFF) <= 14 || ((k - 0xCA) & 0xFFFF) <= 4) {
+        if (code == 0xA1AB) return (prev + 1) & 0xFFFF;
+        return k > 0xC9 ? (prev + 2) & 0xFFFF : 0;
+    }
+    if (k == 0xB3 && kata && code == 0xA1AB) return 0xA5F4;
+    return 0;
+}
+
+u32 combine_sjis(u32 prev, u32 code)
+{
+    if (((code - 0x814A) & 0xFFFF) > 1) return 0;
+    u32 conv;
+    bool kata;
+    if (((prev - 0x829F) & 0xFFFF) <= 82) {
+        kata = false;
+        conv = ((prev - 0x829F) & 0xFFFF) <= 62 ? prev + 161 : ((prev - 0x82DE) & 0xFFFF) <= 19 ? prev + 162 : prev;
+    } else if (((prev - 0x8340) & 0xFFFF) <= 86 && prev != 0x837F) {
+        kata = true;
+        conv = prev;
+    } else {
+        return 0;
+    }
+    const u32 k = sjis_zen2han(conv & 0xFFFF) & 0xFF;
+    if (((k - 0xB6) & 0xFFFF) <= 14 || ((k - 0xCA) & 0xFFFF) <= 4) {
+        if (code == 0x814A) return (prev + 1) & 0xFFFF;
+        return k > 0xC9 ? (prev + 2) & 0xFFFF : 0;
+    }
+    if (k == 0xB3 && kata && code == 0x814A) return 0x8394;
+    return 0;
+}
+
+// The text tools' loop: `next(at, total, &code, &took)` reads a character at `at` (false: an illegal or cut
+// sequence); `join` (0 for none) joins a two-byte code with the one before it, overwriting its two bytes.
+template <class Next>
+u32 text_loop(Mem& m, u32 src, u32 src_len, u32 dst, u32 dst_len, u32 (*join)(u32, u32), Next next)
+{
+    u32 consumed = 0, count = 0, prev = 0;
+    while (consumed < m.r32(src_len)) {
+        if (!m.ok()) return kIllegal;
+        u32 code = 0, took = 0;
+        if (!next(src + consumed, m.r32(src_len) - consumed, &code, &took)) {
+            m.w32(src_len, m.r32(src_len) - consumed);
+            m.w32(dst_len, count);
+            return m.ok() ? kIllegal : kIllegal;
+        }
+        u32 size = code > 0xFFFFFF ? 4 : code > 0xFFFF ? 3 : code > 0xFF ? 2 : 1;
+        bool skip = false;
+        if (size == 2 && join) {
+            if (prev) {
+                if (const u32 joined = join(prev, code)) {
+                    prev = 0;
+                    if (!dst) {
+                        skip = true;
+                    } else {
+                        dst -= 2;
+                        code = joined;
+                        size = 0;
+                    }
+                } else {
+                    prev = code;
+                }
+            } else {
+                prev = code;
+            }
+        } else {
+            prev = 0;
+        }
+        if (!skip) {
+            count += size;
+            if (dst) {
+                if (m.r32(dst_len) < count) {
+                    m.w32(src_len, m.r32(src_len) - consumed);
+                    m.w32(dst_len, count - size);
+                    return m.ok() ? kExhausted : kIllegal;
+                }
+                const u32 bytes = size ? size : 2;
+                for (u32 k = 0; k < bytes; k++) m.w8(dst + k, static_cast<u8>(code >> (8 * (bytes - 1 - k))));
+                dst += bytes;
+            }
+        }
+        consumed += took;
+    }
+    m.w32(dst_len, count);
+    return m.ok() ? kOK : kIllegal;
+}
+
+bool sjis_lead(u32 b) { return ((b - 0x81) & 0xFF) <= 30 || ((b - 0xE0) & 0xFF) <= 28; }
+bool sjis_trail(u32 t) { return ((t - 0x40) & 0xFF) <= 188 && t != 0x7F; }
+
+// EUC-JP characters for the text tools: 8F (with `three`), 8E and A1-FE pairs, the rest single bytes; `pair(c)` maps
+// a two-byte code, `single(b)` a byte and `kana(c)` an 8Exx code.
+template <class Pair, class Single, class Kana>
+auto euc_reader(Mem& m, bool three, Pair pair, Single single, Kana kana)
+{
+    return [&m, three, pair, single, kana](u32 at, u32 left, u32* code, u32* took) {
+        const u8 b = m.r8(at);
+        if (three && b == 0x8F) {
+            if (left <= 2) return false;
+            const u8 b1 = m.r8(at + 1);
+            if (!in_a1_fe(b1)) return false;
+            const u8 b2 = m.r8(at + 2);
+            if (!in_a1_fe(b2)) return false;
+            *code = 0x8F0000 | (u32{b1} << 8) | b2;
+            *took = 3;
+            return true;
+        }
+        if (b == 0x8E) {
+            if (left <= 1) return false;
+            const u8 b1 = m.r8(at + 1);
+            if (((b1 - 0xA1) & 0xFF) > 62) return false;
+            *code = kana(0x8E00 | b1);
+            *took = 2;
+            return true;
+        }
+        if (in_a1_fe(b)) {
+            if (left <= 1) return false;
+            const u8 b1 = m.r8(at + 1);
+            if (!in_a1_fe(b1)) return false;
+            *code = pair((u32{b} << 8) | b1);
+            *took = 2;
+            return true;
+        }
+        *code = single(b);
+        *took = 1;
+        return true;
+    };
+}
+
+template <class Pair, class Single>
+auto sjis_reader(Mem& m, Pair pair, Single single)
+{
+    return [&m, pair, single](u32 at, u32 left, u32* code, u32* took) {
+        const u8 b = m.r8(at);
+        if (sjis_lead(b)) {
+            if (left <= 1) return false;
+            const u8 t = m.r8(at + 1);
+            if (!sjis_trail(t)) return false;
+            *code = pair((u32{b} << 8) | t);
+            *took = 2;
+            return true;
+        }
+        *code = single(b);
+        *took = 1;
+        return true;
+    };
+}
+
+auto same = [](u32 c) { return c; };
+
+// EucJpZen2Han's split of a voiced or semi-voiced katakana into its half-width kana and mark (A5F4 is 8EB3 8EDE).
+u32 euc_zen2han_split(u32 c)
+{
+    u32 code = euc_zen2han(c) & 0xFFFF;
+    if (((code - 0xA5AC) & 0xFFFF) <= 29 || ((code - 0xA5D0) & 0xFFFF) <= 12) {
+        const u32 t = euc_zen2han(code - 1);
+        if (t != code - 1) code = (t << 16) | 0x8EDE;
+    }
+    if (code <= 0xFFFF && ((code - 0xA5D1) & 0xFFFF) <= 12) {
+        const u32 t = euc_zen2han(code - 2);
+        if (t != code - 2) code = (t << 16) | 0x8EDF;
+    }
+    if (code == 0xA5F4) code = 0x8EB38EDEu;
+    return code;
+}
+
+u32 sjis_zen2han_split(u32 c)
+{
+    const u32 code = sjis_zen2han(c) & 0xFFFF;
+    u32 out = code;
+    bool split = false;
+    if (((code - 0x834B) & 0xFFFF) <= 29 || ((code - 0x836F) & 0xFFFF) <= 12) {
+        const u32 t = sjis_zen2han(code - 1) & 0xFFFF;
+        if (t != code - 1) {
+            out = (t << 8) | 0xDE;
+            split = true;
+        }
+    }
+    if (!split && ((out - 0x8370) & 0xFFFF) <= 12) {
+        const u32 t = sjis_zen2han(out - 2) & 0xFFFF;
+        if (t != out - 2) out = (t << 8) | 0xDF;
+    }
+    if ((out & 0xFFFF) == 0x8394) out = 0xB3DE;
+    return out;
+}
+
+u32 EucJpHan2Zen(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "EucJpHan2Zen");
+    return text_loop(m, src, sl, dst, dl, combine_euc,
+        euc_reader(m, true, same, [](u32 b) { return euc_han2zen(b); }, [](u32 c) { return euc_han2zen(c); }));
+}
+
+u32 EucJpZen2Han(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "EucJpZen2Han");
+    return text_loop(m, src, sl, dst, dl, nullptr, euc_reader(m, true, euc_zen2han_split, same, same));
+}
+
+u32 SjisHan2Zen(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "SjisHan2Zen");
+    return text_loop(m, src, sl, dst, dl, combine_sjis, sjis_reader(m, same, [](u32 b) { return sjis_han2zen(b); }));
+}
+
+u32 SjisZen2Han(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "SjisZen2Han");
+    return text_loop(m, src, sl, dst, dl, nullptr, sjis_reader(m, sjis_zen2han_split, same));
+}
+
+u32 ToEucJpHira(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "ToEucJpHira");
+    return text_loop(m, src, sl, dst, dl, combine_euc, euc_reader(m, false, [](u32 c) {
+        if (((c - 0xA5A1) & 0xFFFF) <= 82) return c - 0x100;
+        return c == 0xA5F4 ? 0xA4A6A1ABu : c;
+    }, same, same));
+}
+
+u32 ToEucJpKata(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "ToEucJpKata");
+    return text_loop(m, src, sl, dst, dl, combine_euc, euc_reader(m, false, [](u32 c) {
+        return ((c - 0xA4A1) & 0xFFFF) <= 82 ? c + 0x100 : c;
+    }, same, same));
+}
+
+u32 ToSjisHira(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "ToSjisHira");
+    return text_loop(m, src, sl, dst, dl, combine_sjis, sjis_reader(m, [](u32 c) {
+        if (((c - 0x8340) & 0xFFFF) <= 62) return c - 161;
+        if (((c - 0x8380) & 0xFFFF) <= 19) return c - 162;
+        return c == 0x8394 ? 0x82A4814Au : c;
+    }, same));
+}
+
+u32 ToSjisKata(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "ToSjisKata");
+    return text_loop(m, src, sl, dst, dl, combine_sjis, sjis_reader(m, [](u32 c) {
+        if (((c - 0x829F) & 0xFFFF) <= 62) return c + 161;
+        if (((c - 0x82DE) & 0xFFFF) <= 19) return c + 162;
+        return c;
+    }, same));
+}
+
+u32 ToEucJpLower(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "ToEucJpLower");
+    return text_loop(m, src, sl, dst, dl, nullptr,
+        euc_reader(m, false, [](u32 c) { return ((c - 0xA3C1) & 0xFFFF) <= 25 ? c + 32 : c; }, same, same));
+}
+
+u32 ToEucJpUpper(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "ToEucJpUpper");
+    return text_loop(m, src, sl, dst, dl, nullptr,
+        euc_reader(m, false, [](u32 c) { return ((c - 0xA3E1) & 0xFFFF) <= 25 ? c - 32 : c; }, same, same));
+}
+
+u32 ToSjisLower(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "ToSjisLower");
+    return text_loop(m, src, sl, dst, dl, nullptr,
+        sjis_reader(m, [](u32 c) { return ((c - 0x8260) & 0xFFFF) <= 25 ? c + 33 : c; }, same));
+}
+
+u32 ToSjisUpper(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "ToSjisUpper");
+    return text_loop(m, src, sl, dst, dl, nullptr,
+        sjis_reader(m, [](u32 c) { return ((c - 0x8281) & 0xFFFF) <= 25 ? c - 33 : c; }, same));
 }
 
 // ------------------------------------------------------------------------------------------------- Korean
@@ -2210,6 +2696,15 @@ void register_cellL10n(Registry& r)
         f("UTF8stoSJISs", &thunk<&UTF8stoSJISs>), f("MSJISstoUCS2s", &thunk<&MSJISstoUCS2s>),
         f("MSJISstoUTF8s", &thunk<&MSJISstoUTF8s>), f("UCS2stoMSJISs", &thunk<&UCS2stoMSJISs>),
         f("UTF8stoMSJISs", &thunk<&UTF8stoMSJISs>), f("EUCKRtoUCS2", &thunk<&EUCKRtoUCS2>),
+        f("eucjphan2zen", &thunk<&eucjphan2zen>), f("eucjpzen2han", &thunk<&eucjpzen2han>),
+        f("sjishan2zen", &thunk<&sjishan2zen>), f("sjiszen2han", &thunk<&sjiszen2han>),
+        f("isEucJpKigou", &thunk<&isEucJpKigou>), f("isSjisKigou", &thunk<&isSjisKigou>),
+        f("EucJpHan2Zen", &thunk<&EucJpHan2Zen>), f("EucJpZen2Han", &thunk<&EucJpZen2Han>),
+        f("SjisHan2Zen", &thunk<&SjisHan2Zen>), f("SjisZen2Han", &thunk<&SjisZen2Han>),
+        f("ToEucJpHira", &thunk<&ToEucJpHira>), f("ToEucJpKata", &thunk<&ToEucJpKata>),
+        f("ToSjisHira", &thunk<&ToSjisHira>), f("ToSjisKata", &thunk<&ToSjisKata>),
+        f("ToEucJpLower", &thunk<&ToEucJpLower>), f("ToEucJpUpper", &thunk<&ToEucJpUpper>),
+        f("ToSjisLower", &thunk<&ToSjisLower>), f("ToSjisUpper", &thunk<&ToSjisUpper>),
         f("UHCtoUCS2", &thunk<&UHCtoUCS2>), f("EUCKRtoUTF8", &thunk<&EUCKRtoUTF8>), f("UHCtoUTF8", &thunk<&UHCtoUTF8>),
         f("UCS2toEUCKR", &thunk<&UCS2toEUCKR>), f("UCS2toUHC", &thunk<&UCS2toUHC>),
         f("UTF8toEUCKR", &thunk<&UTF8toEUCKR>), f("UTF8toUHC", &thunk<&UTF8toUHC>),
