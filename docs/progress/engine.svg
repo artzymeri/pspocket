@@ -31,8 +31,8 @@
 <text x="838" y="203" font-size="12.5" fill="#24292f">50%  (2/4 done)</text>
 <text x="4" y="229" font-size="12.5" fill="#24292f">Video and images</text>
 <rect x="300" y="217" width="530" height="16" rx="3" fill="#e6e8eb"/>
-<rect x="300" y="217" width="318.0" height="16" rx="3" fill="#d4a72c"/>
-<text x="838" y="229" font-size="12.5" fill="#24292f">60%  (3/5 done)</text>
+<rect x="300" y="217" width="424.0" height="16" rx="3" fill="#57ab5a"/>
+<text x="838" y="229" font-size="12.5" fill="#24292f">80%  (4/5 done)</text>
 <text x="4" y="255" font-size="12.5" fill="#24292f">System services</text>
 <rect x="300" y="243" width="530" height="16" rx="3" fill="#e6e8eb"/>
 <rect x="300" y="243" width="530.0" height="16" rx="3" fill="#2da44e"/>
