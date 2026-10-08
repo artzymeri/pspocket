@@ -68,6 +68,7 @@ struct WindowStats {
     double texture_overlays = 0, texture_checks = 0, texture_mb_hashed = 0, write_faults = 0;
     double feedback_copies = 0, corner_textures = 0, surface_reloads = 0;
     double depth_bounds_draws = 0; // draws with the depth bounds test (D-261)
+    double attachment_load_mb = 0, attachment_store_mb = 0; // render pass attachments loaded and stored (D-273)
     double gpu_wait_ms = 0;        // the RSX thread's wait for the GPU at flips (frames in flight capped)
     u64 programs_made = 0, pipelines_made = 0; // in the window, by the RSX thread or for it in the background
     double compile_ms = 0;                      // in the window: the RSX thread's compiling, or waiting for compiles
@@ -174,6 +175,9 @@ struct BackendStats {
     u64 feedback_copies = 0;   // copies of a target a draw samples while drawing to it, made once per write (D-148)
     u64 depth_bounds_draws = 0; // draws with the depth bounds test, which read a copy of the depth buffer (D-261)
     u64 ranges_indexed_by_metal = 0; // indexed ranges Metal ran over the game's own indices (D-271)
+    u64 attachment_load_bytes = 0;   // render pass attachments loaded from memory at their start (D-273)
+    u64 attachment_store_bytes = 0;  // ... and stored at their end
+    u64 clear_only_passes = 0, clear_only_store_bytes = 0; // passes that only cleared (load-action clears, no draw)
     u64 corner_textures = 0;   // corner textures allocated (D-120); later corners of the same size reuse them (D-148)
     u64 gpu_wait_ns = 0;       // the RSX thread's wait at flips for the GPU to finish an older frame (D-148)
     u64 budget_submits = 0;    // command buffers submitted early, past MetalBackendConfig::transient_budget (D-148)

@@ -484,6 +484,7 @@ struct MetalBackend::Impl {
     u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0, report_draws_compiling = 0;
     u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
     u64 report_depth_bounds = 0; // D-261
+    u64 report_load_bytes = 0, report_store_bytes = 0, report_clear_only = 0, report_clear_only_bytes = 0; // D-273
     // At most config.frames_in_flight frames queued for the GPU (D-148): a flip waits for the oldest to complete. Each
     // frame queued holds what it allocated until then, and nothing else held the RSX thread back.
     dispatch_semaphore_t frames_in_flight = nil;

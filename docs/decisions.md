@@ -5691,6 +5691,23 @@ to run: GPU time a frame in the same window differs by 2 ms between runs of one 
   in microseconds, on the Mac and on the phone alike.
 - PSPOCKET_SKIP_FP=HASH skips the draws of one fragment program (what one costs).
 
+## D-273 · 2026-10-08 · Render pass traffic counted; draws kept in a larger pass: measured, not kept
+
+On a tile GPU each render pass loads its attachments from memory at its start (unless cleared) and stores them at its
+end. The backend's status line now gives both per frame (BackendStats::attachment_load_bytes, _store_bytes), and the
+passes that only clear. GTA V's walk (run 305): about 188 MB loaded and 209 MB stored a frame in 85 passes, some
+12 GB/s at 30 fps: a small part of the M4's bandwidth, a large one of an iPhone's. Passes that only clear: 3 a frame,
+7 MB.
+- Where it comes from (a traced frame, run 291): the game switches between its four G-buffer targets with depth and the
+  first of them alone (or depth alone) several times a frame, and each switch ended the pass, storing and loading all
+  five attachments; the lighting passes do the same with their target and depth.
+- Tried: a draw whose targets are part of the open pass's (the same surfaces in the same places) stayed in it, the
+  other attachments' writes and the depth test off for it; not when it samples one of them. Correct (a test, the
+  walk's frames), 85 to 78 passes a frame, the traffic 188 to 129 MB loaded and 209 to 150 MB stored (-30%).
+- Measured (run 308, D-272's A/B): GPU time a frame on the M4 13.54 to 14.40, 13.73 to 13.79, 14.29 to 15.33 ms with it
+  (+0.4 to +7%): the M4 has the bandwidth to spare, and the subset draws now run with five attachments in tile memory.
+  Not kept (rule 8). On the iPhone the traffic may weigh more: worth trying there when the phone can be measured.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

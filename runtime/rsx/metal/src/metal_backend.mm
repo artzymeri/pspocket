@@ -523,6 +523,19 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
         pass_started = true;
         stats.render_passes++;
         pass_draws_start = stats.draws;
+        // What the pass moves between memory and the tile memory (D-273): attachments loaded at its start, stored at
+        // its end, over its area.
+        const u64 area = u64{pass_width} * pass_height;
+        for (u32 i = 0; i < pass.color_count; i++) {
+            const u64 bytes = area * surface_bytes_per_pixel(pass.color[i]->gcm_format, false);
+            if (pass_desc.colorAttachments[i].loadAction == MTLLoadActionLoad) stats.attachment_load_bytes += bytes;
+            if (pass_desc.colorAttachments[i].storeAction == MTLStoreActionStore) stats.attachment_store_bytes += bytes;
+        }
+        if (pass.depth) {
+            const u64 bytes = area * surface_bytes_per_pixel(pass.depth->gcm_format, true);
+            if (pass_desc.depthAttachment.loadAction == MTLLoadActionLoad) stats.attachment_load_bytes += bytes;
+            if (pass_desc.depthAttachment.storeAction == MTLStoreActionStore) stats.attachment_store_bytes += bytes;
+        }
         // A surface's generation counts the passes and draws that write it, not the passes it is attached to (D-105):
         // GTA V's lighting pass samples the depth buffer it tests against without writing it, and every conversion
         // of it ended the pass, which the next draw restarted, which made the depth buffer new again (30 passes a
@@ -558,7 +571,12 @@ void MetalBackend::Impl::end_pass()
             clears |= pass_desc.colorAttachments[i].loadAction == MTLLoadActionClear && pass.color[i]->initialized;
         }
         if (pass.depth) clears |= pass_desc.depthAttachment.loadAction == MTLLoadActionClear && pass.depth->initialized;
-        if (clears) start_encoder();
+        if (clears) {
+            const u64 stored = stats.attachment_store_bytes;
+            start_encoder();
+            stats.clear_only_passes++;
+            stats.clear_only_store_bytes += stats.attachment_store_bytes - stored;
+        }
     }
     const bool timed = pass_times && encoder && !pass_times_submitting;
     if (encoder) {
@@ -1802,6 +1820,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.write_faults = per_frame(m.tracker.faults_handled(), m.report_faults);
         w.feedback_copies = per_frame(m.stats.feedback_copies, m.report_feedback);
         w.depth_bounds_draws = per_frame(m.stats.depth_bounds_draws, m.report_depth_bounds);
+        w.attachment_load_mb = per_frame(m.stats.attachment_load_bytes, m.report_load_bytes) / 1048576.0;
+        w.attachment_store_mb = per_frame(m.stats.attachment_store_bytes, m.report_store_bytes) / 1048576.0;
         w.corner_textures = per_frame(m.stats.corner_textures, m.report_corners);
         w.surface_reloads = per_frame(m.stats.surface_reloads, m.report_reloads);
         w.gpu_wait_ms = per_frame(m.stats.gpu_wait_ns, m.report_gpu_wait_ns) / 1e6;
@@ -1816,7 +1836,9 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.surface_mb = static_cast<double>(m.surface_bytes()) / 1048576.0;
         w.gpu_allocated_mb = static_cast<double>(m.device.currentAllocatedSize) / 1048576.0;
         w.deferred_queue = m.deferred.size();
-        PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}); "
+        PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}; "
+                           "attachments {:.1f} MB loaded, {:.1f} MB stored; {:.1f} passes only clearing, {:.1f} MB "
+                           "stored by them); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
                            "{:.2f} targets laid over memory on the GPU; "
                            "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {:.1f} textures decoded "
@@ -1825,7 +1847,9 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                            "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB); "
                            "{:.2f} feedback copies ({:.1f} draws with depth bounds), {:.2f} corner textures, {:.2f} "
                            "surface reloads; {:.2f} ms waiting for the GPU; GPU memory {:.0f} MB, {} deferred",
-            w.flips, w.gpu_ms, w.draws, w.render_passes, ends, w.readbacks, w.deferred_readbacks, w.deferred_conflicts,
+            w.flips, w.gpu_ms, w.draws, w.render_passes, ends, w.attachment_load_mb, w.attachment_store_mb,
+            per_frame(m.stats.clear_only_passes, m.report_clear_only),
+            per_frame(m.stats.clear_only_store_bytes, m.report_clear_only_bytes) / 1048576.0, w.readbacks, w.deferred_readbacks, w.deferred_conflicts,
             w.readback_wait_ms, w.texture_overlays, w.texture_checks, w.texture_mb_hashed, w.write_faults,
             per_frame(m.stats.textures_decoded, m.report_decoded), per_frame(m.stats.textures_decoded_overlay,
                 m.report_decoded_overlay), per_frame(m.stats.textures_decoded_written, m.report_decoded_written),
@@ -1850,6 +1874,10 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_conflicts = m.stats.deferred_conflicts;
         m.report_feedback = m.stats.feedback_copies;
         m.report_depth_bounds = m.stats.depth_bounds_draws;
+        m.report_load_bytes = m.stats.attachment_load_bytes;
+        m.report_store_bytes = m.stats.attachment_store_bytes;
+        m.report_clear_only = m.stats.clear_only_passes;
+        m.report_clear_only_bytes = m.stats.clear_only_store_bytes;
         m.report_corners = m.stats.corner_textures;
         m.report_reloads = m.stats.surface_reloads;
         m.report_gpu_wait_ns = m.stats.gpu_wait_ns;

@@ -160,6 +160,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   lists still pull indices), the post-processing chain (0.3 ms a pass on 160x90 to 640x360 targets), the 64x32 pass
   (0.8 ms in the timing mode, 2 microseconds alone: likely the timing mode's), the fragment stage of the G-buffer
   and lighting passes.
+- **Render pass traffic (D-273):** GTA V loads about 188 MB and stores 209 MB of attachments a frame (status line).
+  Keeping draws to part of the open pass's targets in it cut that by 30% but cost the M4 up to 7% GPU time (not
+  kept). Try it on the iPhone when it can be measured; other cuts: a store the next pass's clear makes dead, depth
+  buffers no later pass reads (memoryless).
 - **State the RSX keeps that the backend ignored (census, 2026-10-08):** of 32 registers stored without a use, 7 change
   what a game sees. Done: the fog factor in FOGC (D-256), two-sided lighting (D-257), the clip range and depth clamp
   (D-258), user clip planes (D-259), constants and vertex bases written inside a draw (D-260), the depth bounds test
