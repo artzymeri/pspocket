@@ -63,8 +63,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   only for lines it found changing; measure with profiles, not CPU totals, under load (the totals swing by 20%).
 - **Seen (run 157):** ps_res_notify_write, called for every SPU PUT, bumps one version per 128-byte line, each in its own
   host cache line of the 4 MB table (2.4% of the SPU threads' busy time in GTA V): a 16 KB PUT touches 128 scattered
-  cache lines. **Try:** skip lines no reservation was ever taken on (a 4 KB bitmap set by ps_res_acquire), with a test
-  of the reservation-lost event on a line a PUT writes; careful: concurrency.
+  cache lines. **Done (D-243, runs 230-233):** only slots someone reads a version of are bumped (a 4 KB bitmap, a
+  Dekker pairing): the main SPU threads -3 to -8% under load.
+- **Seen (run 221):** every store to the SPURS line wakes all the workers parked on it (a mutex and a notify_all in
+  the storing thread, about 3% of the SPU threads' busy time), and each woken worker selects again for nothing.
+  **Try:** wake one waiter per store unless the store adds work, or park idle workers on a futex-like wait
+  (__ulock_wait, which C++20's atomic wait uses on Apple platforms) with the stop request as one more wake.
+- **Done (D-241):** the clock and idle sleeps of the SPURS workers (about 7% of their busy time): one multiply of
+  mach_absolute_time, mach_wait_until.
 
 - **Seen (run 101):** a stop request (thread group stop or terminate, D-031) reaches lifted SPU code at back branches
   and calls, not at an indirect branch to a label of the same function (`bi` into its dispatch switch). A loop that
@@ -97,6 +103,16 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **State:** open; making the SPU work faster is what moves it.
 
 ## RSX and Metal: the GPU
+
+- **Seen (run 221):** the RSX thread is the busiest single thread of GTA V's frame (42% of a core), 78% of it in draws:
+  fragment programs (19%: re-decoding those GTA V writes again into memory it reuses), texture binds (9%), vertex data
+  and constants copied into Metal buffers (7.5%, needed: the GPU runs behind the game, which reuses its buffers).
+  **Done (D-240, D-242):** programs by content, texture layouts kept, the FIFO translation inline: the RSX thread
+  1.69 to 1.55 CPU s per 5 s (idle). **Left:** per-draw allocations (the overlay lists of texture binds, the compile
+  key's strings on a program's first options), the dispatch per method.
+- **Seen (gate):** the GPU spends 24-26 ms of a frame in play on the M4 with 84 render passes a frame; on the iPhone
+  20-27 ms (run 096). **Try:** count what ends each pass (a target change, a copy, a readback, a clear) in a frame and
+  merge the ones Metal can keep open (a tile-based GPU pays each pass's loads and stores).
 
 - **Seen (runs 121-125):** in Assassin's Creed's crowd (2,000 draws a frame) the RSX thread is the busiest thread.
   D-210 and D-211 took it from 13.0 to about 11.3 µs per draw (decodes gone, vertex data copied once, no write
