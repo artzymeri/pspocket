@@ -155,7 +155,8 @@ std::optional<CompiledProgram> MetalBackend::Impl::compile(const shader::Transla
     return p;
 }
 
-const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& state, bool points)
+const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& state, bool points, u32 fp_inputs,
+    bool two_sided)
 {
     take_shader_cache(); // programs and pipelines the shader cache made since (D-114)
     take_async();        // ... and the background compiles (D-158)
@@ -194,16 +195,59 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     if (!vertex_program_ok) return nullptr;
     DecodedVertexProgram& current = vertex_programs.front();
     auto& vertex_compiled = current.compiled;
-    if (const CompiledProgram* c = vertex_compiled[points ? 1 : 0]) return c;
-    const shader::VertexProgram& vp = current.program;
-    const std::vector<u32>& ucode = current.words;
-    const std::string key = std::format("vp:{:016x}:{}", vp.hash, points ? 1 : 0);
-    if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) {
-        return vertex_compiled[points ? 1 : 0] = &it->second;
+    // User clip planes (D-259): the planes that are on and whose distances the vertex program puts out
+    // (NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK bits 6-11, RPCS3 VKVertexProgram.cpp insertMainEnd).
+    u32 user_clip = 0;
+    const u32 clip_control = state.reg(m::NV4097_SET_USER_CLIP_PLANE_CONTROL);
+    if (clip_control) {
+        const u32 output_mask = state.reg(m::NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK);
+        for (u32 i = 0; i < 6; i++) {
+            const u32 op = (clip_control >> (4 * i)) & 0xf;
+            if ((op == 1 || op == 2) && (output_mask & (1u << (6 + i)))) user_clip |= op << (4 * i);
+        }
     }
+    // Outputs the program writes that the output mask leaves out and the fragment program reads (D-267; RPCS3
+    // VKVertexProgram.cpp reg_table: the colours go with either side's bit).
+    const shader::VertexProgram& vp = current.program;
+    u16 masked = 0;
+    {
+        u16 read = 0; // the outputs the fragment program's inputs come from
+        if (fp_inputs & (1u << 1)) read |= static_cast<u16>((1u << 1) | (two_sided ? 1u << 3 : 0u)); // COL0
+        if (fp_inputs & (1u << 2)) read |= static_cast<u16>((1u << 2) | (two_sided ? 1u << 4 : 0u)); // COL1
+        if (fp_inputs & (1u << 3)) read |= 1u << 5;                                                    // FOGC
+        for (u32 t = 0; t < 8; t++)
+            if (fp_inputs & (1u << (4 + t))) read |= static_cast<u16>(1u << (7 + t)); // TEX0-7
+        if (fp_inputs & (1u << 12)) read |= 1u << 15; // TEX8
+        if (fp_inputs & (1u << 13)) read |= 1u << 6;  // TEX9
+        const u32 sent = state.reg(m::NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK);
+        const auto off = [&](u32 bits) { return (sent & bits) == 0; };
+        if (off(0x5)) masked |= (1u << 1) | (1u << 3);  // FRONTDIFFUSE, BACKDIFFUSE: o1, o3
+        if (off(0xa)) masked |= (1u << 2) | (1u << 4);  // FRONTSPECULAR, BACKSPECULAR: o2, o4
+        if (off(1u << 4)) masked |= 1u << 5;            // FOG: o5
+        if (off(1u << 13)) masked |= 1u << 6;           // TEX9: o6
+        if (off(1u << 12)) masked |= 1u << 15;          // TEX8: o15
+        for (u32 t = 0; t < 8; t++)
+            if (off(1u << (14 + t))) masked |= static_cast<u16>(1u << (7 + t)); // TEX0-7: o7-o14
+        masked &= vp.output_mask & read;
+    }
+    // The usual variants stay with the decoded program; one with clip planes or masked outputs is found by its key.
+    const bool usual = !user_clip && !masked;
+    const auto remember = [&](const CompiledProgram* c) {
+        if (usual) vertex_compiled[points ? 1 : 0] = c;
+        return c;
+    };
+    if (usual) {
+        if (const CompiledProgram* c = vertex_compiled[points ? 1 : 0]) return c;
+    }
+    const std::vector<u32>& ucode = current.words;
+    std::string key = std::format("vp:{:016x}:{}", vp.hash, (points ? 1u : 0u) | (user_clip << 1));
+    if (masked) key += std::format(":m{:x}", masked);
+    if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) return remember(&it->second);
 
     shader::VpOptions options;
     options.point_size = points;
+    options.user_clip = user_clip;
+    options.masked_outputs = masked;
     if (async) {
         // Compiled in the background; this draw waits for it within the frame's budget, or goes without (D-158).
         if (async_failed_programs.contains(key)) return nullptr;
@@ -223,7 +267,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
             compile_pending = true;
             return nullptr;
         }
-        return vertex_compiled[points ? 1 : 0] = &programs.find(key)->second;
+        return remember(&programs.find(key)->second);
     }
     const shader::TranslateResult tr = shader::translate_vertex_program(vp, options);
     if (!tr.ok) {
@@ -237,7 +281,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     auto [it, inserted] = programs.insert_or_assign(key, std::move(*compiled));
     if (shader_cache) shader_cache->record_program(it->second);
     if (!inserted) forget_program_lookups(); // the key's program changed under the lookups that hold it
-    return vertex_compiled[points ? 1 : 0] = &it->second;
+    return remember(&it->second);
 }
 
 const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& state, const shader::FpOptions& requested,
@@ -354,6 +398,10 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     for (u32 i = 0; i < options.mrt_count && i < 4; i++) {
         for (u8 c : options.output_swizzle[i]) opt += static_cast<char>('0' + c);
     }
+    if (options.two_sided_lighting) opt += ".t"; // D-257
+    if (options.depth_bounds) opt += ".b";       // D-261
+    if (options.point_coord_mask) opt += std::format(".p{:x}", options.point_coord_mask); // D-262
+    if (options.polygon_stipple) opt += ".s"; // D-263
     for (u32 t = 0; t < 16; t++) {
         if (!(fp.texture_mask & (1u << t))) continue;
         opt += std::format(".{}{}", t, static_cast<u32>(options.texture_kind[t]));

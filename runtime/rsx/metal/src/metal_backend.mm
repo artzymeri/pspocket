@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <format>
 
@@ -335,7 +336,10 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
     }
     u32 width = si.clip_width * aa.x, height = si.clip_height * aa.y;
     if (width == 0 || height == 0) return false;
-    if (si.window_offset_x || si.window_offset_y) unsupported("NV4097_SET_WINDOW_OFFSET is ignored");
+    // NV4097_SET_WINDOW_OFFSET moves where the targets start in memory (D-265; RPCS3 RSXThread.cpp
+    // get_framebuffer_layout: "Window offset is what affects the raster position", Turbo: Super Stunt Squad declares
+    // its framebuffers that way).
+    const u32 window_x = si.window_offset_x, window_y = si.window_offset_y;
     const bool swizzled = si.type == 2;
 
     const DepthStencilInfo ds = state.depth_stencil();
@@ -363,9 +367,10 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
             if (pitch <= 64) continue; // "could not fit colour buffer": dropped
             width = std::min(width, pitch / bpp);
         }
-        const auto ea = rsx->translate(cb.offset, cb.dma == loc::kDmaHostBuffer ? loc::kMain : loc::kLocal);
+        const u32 offset = cb.offset + cb.pitch * window_y + bpp * window_x;
+        const auto ea = rsx->translate(offset, cb.dma == loc::kDmaHostBuffer ? loc::kMain : loc::kLocal);
         if (!ea) {
-            unsupported(std::format("colour surface {} at offset {:#x} is not mapped", idx[i], cb.offset));
+            unsupported(std::format("colour surface {} at offset {:#x} is not mapped", idx[i], offset));
             continue;
         }
         before_access(*ea, swizzled ? bpp * width * height : pitch * height, false); // a deferred copy there lands first
@@ -379,7 +384,8 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
     if (depth_used && (si.depth_format == 1 || si.depth_format == 2)) {
         const u32 dbpp = si.depth_format == 1 ? 2 : 4;
         if (swizzled || si.depth.pitch >= dbpp * width || si.depth.pitch > 64) {
-            const auto ea = rsx->translate(si.depth.offset, si.depth.dma == loc::kDmaHostBuffer ? loc::kMain : loc::kLocal);
+            const u32 offset = si.depth.offset + si.depth.pitch * window_y + dbpp * window_x;
+            const auto ea = rsx->translate(offset, si.depth.dma == loc::kDmaHostBuffer ? loc::kMain : loc::kLocal);
             if (ea) before_access(*ea, swizzled ? dbpp * width * height : si.depth.pitch * height, false);
             if (ea) out.depth = get_depth_surface(*ea, si.depth.pitch, width, height, si.depth_format, si.depth_float);
         }
@@ -723,6 +729,14 @@ struct Range {
     u32 count;
 };
 
+// The clip range as Metal's viewport takes it (D-258): its ends in order, inside [0, 1]; [0, 1] when they are not
+// numbers.
+std::pair<float, float> depth_range(const ViewportInfo& v)
+{
+    if (!(v.clip_min == v.clip_min) || !(v.clip_max == v.clip_max)) return {0.f, 1.f};
+    return {std::clamp(std::min(v.clip_min, v.clip_max), 0.f, 1.f), std::clamp(std::max(v.clip_min, v.clip_max), 0.f, 1.f)};
+}
+
 // Primitives Metal draws natively; the rest become index lists (positions relative to a range).
 bool native_primitive(Primitive p, MTLPrimitiveType& type)
 {
@@ -822,12 +836,6 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     if (!select_targets(state, targets, ~0u)) return skip("");
     const bool points = d.primitive == Primitive::Points;
     compile_pending = false;
-    const CompiledProgram* vp = vertex_program_for(state, points);
-    skip_reason = compile_pending ? "vertex program compiling" : "vertex program";
-    if (!vp) {
-        if (compile_pending) stats.draws_compiling++;
-        return skip("");
-    }
     shader::FpOptions fo;
     fo.shader_control = state.shader_program().control;
     fo.mrt_count = targets.color_count;
@@ -860,6 +868,17 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const RasterInfo raster = state.raster();
     fo.alpha_test = raster.alpha_test;
     fo.flat_colors = raster.shade_mode == static_cast<u32>(ShadeMode::Flat);
+    fo.two_sided_lighting = raster.two_side_light; // D-257
+    // Polygon stipple (D-263; RPCS3 RSXThread.cpp: only on polygons).
+    fo.polygon_stipple = raster.polygon_stipple && d.primitive >= Primitive::Triangles;
+    if (points) { // point sprites (D-262; RPCS3 RSXThread.cpp: only on point draws)
+        const u32 sprite = state.reg(m::NV4097_SET_POINT_SPRITE_CONTROL);
+        if (sprite & 1) fo.point_coord_mask = static_cast<u16>((sprite >> 8) & 0x3ff);
+    }
+    // The depth bounds test (D-261), when its bounds can leave something out.
+    const DepthStencilInfo bounds = state.depth_stencil();
+    fo.depth_bounds = targets.depth && bounds.depth_bounds_test &&
+        (bounds.depth_bounds_min > 0.f || bounds.depth_bounds_max < 1.f || !(bounds.depth_bounds_min <= bounds.depth_bounds_max));
     // D-174 (RPCS3 RSXThread.cpp): NV4097_SET_SHADER_PACKER turns the colours sRGB on the 8-bit targets, never from
     // 32-bit exports; alpha to coverage is emulated (one sample here, as RPCS3 without hardware support).
     const u32 colour_format = state.surface().color_format;
@@ -874,6 +893,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const CompiledProgram* fp = fragment_program_for(state, fo, &fprog, fp_ea);
     skip_reason = compile_pending ? "fragment program compiling" : "fragment program";
     if (!fp) {
+        if (compile_pending) stats.draws_compiling++;
+        return skip("");
+    }
+    // The vertex program after the fragment program: an output the output mask leaves out matters only when the
+    // fragment program reads it (D-267).
+    const CompiledProgram* vp = vertex_program_for(state, points, fp->shader.input_mask, fo.two_sided_lighting);
+    skip_reason = compile_pending ? "vertex program compiling" : "vertex program";
+    if (!vp) {
         if (compile_pending) stats.draws_compiling++;
         return skip("");
     }
@@ -1014,11 +1041,24 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     vs.pos_x[3] = (vpi.offset[0] - cw) / cw;
     vs.pos_y[1] = -vpi.scale[1] / ch;
     vs.pos_y[3] = -(vpi.offset[1] - ch) / ch;
-    vs.pos_z[2] = vpi.scale[2];
-    vs.pos_z[3] = vpi.offset[2];
+    // Depth range (D-258): the RSX clips window z to [NV4097_SET_CLIP_MIN, _MAX] and stores it as it is. z goes from
+    // that range to [0, 1] here, where Metal clips, and the viewport's depth range takes it back (RPCS3
+    // VKGSRender.cpp set_viewport with an unrestricted depth range, RSXVertexPrologue.glsl apply_zclip_xform). Metal's
+    // depth range stays inside [0, 1].
+    const auto [z_near, z_far] = depth_range(vpi);
+    const float z_span = z_far - z_near;
+    if (z_span > 1e-6f) {
+        vs.pos_z[2] = vpi.scale[2] / z_span;
+        vs.pos_z[3] = (vpi.offset[2] - z_near) / z_span;
+    } else {
+        vs.pos_z[2] = vs.pos_z[3] = 0.f; // an empty range: every depth is its near end, as RPCS3 has it
+    }
     vs.base_index = state.vertex_data_base_index();
     vs.restart_enable = raster.restart_index_enable;
     vs.branch_bits = state.transform_branch_bits(); // BRB and CLB (D-113)
+    // The point size: the register, or the program's when the output mask says so (negative, D-262).
+    vs.point_size = (state.reg(m::NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) & (1u << 5)) ? -std::abs(raster.point_size)
+                                                                                   : std::abs(raster.point_size);
     vs.restart_index = raster.restart_index;
 
     // ---- vertex and index data: raw guest bytes, decoded by the vertex shader (vertex pulling) ----
@@ -1226,7 +1266,29 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     }
     if (win.pixel_center_integer) fs.wpos[2] = -0.5f;
     fs.alpha_func = raster.alpha_func;
-    fs.alpha_ref = static_cast<float>(raster.alpha_ref & 0xff) / 255.f;
+    // The reference as the colour format reads it (D-264; RPCS3 rsx_methods.h alpha_ref): a float for 32-bit float
+    // targets, a half for 16-bit ones, else the low byte as unorm.
+    fs.alpha_ref = colour_format == static_cast<u32>(SurfaceColorFormat::F_X32) ||
+                           colour_format == static_cast<u32>(SurfaceColorFormat::F_W32Z32Y32X32)
+                       ? bits_to_float(raster.alpha_ref)
+                   : colour_format == static_cast<u32>(SurfaceColorFormat::F_W16Z16Y16X16)
+                       ? half_to_float(static_cast<u16>(raster.alpha_ref & 0xffff))
+                       : static_cast<float>(raster.alpha_ref & 0xff) / 255.f;
+    // FOGC's fog factor (D-256; RPCS3 RSXDrawCommands.cpp fill_fragment_state_buffer).
+    fs.fog_mode = state.reg(m::NV4097_SET_FOG_MODE);
+    fs.fog_param[0] = state.reg_f(m::NV4097_SET_FOG_PARAMS);
+    fs.fog_param[1] = state.reg_f(m::NV4097_SET_FOG_PARAMS + 1);
+
+    // The depth bounds test (D-261; RPCS3 VKDraw.cpp): a fragment whose pixel's stored depth is outside the bounds
+    // goes. Metal has no such test: the shader reads the depth buffer as it was before the draw, a copy made again
+    // only after depth was written (as D-148's copies of a target a draw samples).
+    id<MTLTexture> bounds_texture = nil;
+    if (fo.depth_bounds) {
+        bounds_texture = feedback_copy(*targets.depth, true);
+        fs.depth_bounds[0] = bounds.depth_bounds_min;
+        fs.depth_bounds[1] = bounds.depth_bounds_max;
+        stats.depth_bounds_draws++;
+    }
 
     // ---- encode ----
     open_pass(targets);
@@ -1255,7 +1317,10 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     [enc setDepthStencilState:depth_state_for(state)];
     const DepthStencilInfo ds = state.depth_stencil();
     [enc setStencilFrontReferenceValue:ds.front.ref backReferenceValue:ds.back.ref];
-    [enc setViewport:MTLViewport{0, 0, static_cast<double>(surf_w), static_cast<double>(surf_h), 0, 1}];
+    [enc setViewport:MTLViewport{0, 0, static_cast<double>(surf_w), static_cast<double>(surf_h), static_cast<double>(z_near),
+                                 static_cast<double>(z_far)}];
+    // NV4097_SET_ZMIN_MAX_CONTROL: depth clamped rather than clipped (RPCS3 VKGSRender.cpp: clamp, or no clip).
+    [enc setDepthClipMode:raster.depth_clamp || !raster.depth_clip ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
     [enc setScissorRect:MTLScissorRect{sx0 * aa.x, sy0 * aa.y, (sx1 - sx0) * aa.x, (sy1 - sy0) * aa.y}];
     if (raster.cull_enable) {
         [enc setCullMode:static_cast<CullFace>(raster.cull_face) == CullFace::Front ? MTLCullModeFront : MTLCullModeBack];
@@ -1287,6 +1352,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (!bound[t]) continue;
         [enc setFragmentTexture:bound[t] atIndex:t];
         [enc setFragmentSamplerState:sampler_for(state.fragment_texture(t)) atIndex:t];
+    }
+    if (bounds_texture) [enc setFragmentTexture:bounds_texture atIndex:shader::slot::kFsDepthBounds];
+    if (fo.polygon_stipple) {
+        [enc setFragmentBytes:&state.regs[m::NV4097_SET_POLYGON_STIPPLE_PATTERN] length:32 * sizeof(u32)
+                      atIndex:shader::slot::kFsStipple];
     }
     for (u32 t = 0; t < 4; t++) {
         if (!vbound[t]) continue;
@@ -1553,6 +1623,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.texture_mb_hashed = per_frame(m.stats.texture_check_bytes, m.report_texture_bytes) / 1048576.0;
         w.write_faults = per_frame(m.tracker.faults_handled(), m.report_faults);
         w.feedback_copies = per_frame(m.stats.feedback_copies, m.report_feedback);
+        w.depth_bounds_draws = per_frame(m.stats.depth_bounds_draws, m.report_depth_bounds);
         w.corner_textures = per_frame(m.stats.corner_textures, m.report_corners);
         w.surface_reloads = per_frame(m.stats.surface_reloads, m.report_reloads);
         w.gpu_wait_ms = per_frame(m.stats.gpu_wait_ns, m.report_gpu_wait_ns) / 1e6;
@@ -1574,14 +1645,15 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                            "({:.1f} over a target drawn to again, {:.1f} written); {} programs and {} pipelines "
                            "made ({:.1f} ms, {:.2f} draws waiting for one); "
                            "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB); "
-                           "{:.2f} feedback copies, {:.2f} corner textures, {:.2f} surface reloads; {:.2f} ms waiting for "
-                           "the GPU; GPU memory {:.0f} MB, {} deferred",
+                           "{:.2f} feedback copies ({:.1f} draws with depth bounds), {:.2f} corner textures, {:.2f} "
+                           "surface reloads; {:.2f} ms waiting for the GPU; GPU memory {:.0f} MB, {} deferred",
             w.flips, w.gpu_ms, w.draws, w.render_passes, ends, w.readbacks, w.deferred_readbacks, w.deferred_conflicts,
             w.readback_wait_ms, w.texture_overlays, w.texture_checks, w.texture_mb_hashed, w.write_faults,
             per_frame(m.stats.textures_decoded, m.report_decoded), per_frame(m.stats.textures_decoded_overlay,
                 m.report_decoded_overlay), per_frame(m.stats.textures_decoded_written, m.report_decoded_written),
             w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.textures, w.texture_mb, w.surfaces, w.surface_mb,
-            w.feedback_copies, w.corner_textures, w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb, w.deferred_queue);
+            w.feedback_copies, w.depth_bounds_draws, w.corner_textures, w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb,
+            w.deferred_queue);
         if (m.config.on_window) m.config.on_window(w);
         m.report_programs = m.stats.programs_compiled;
         m.report_pipelines = m.stats.pipelines_created;
@@ -1599,6 +1671,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_deferred = m.stats.deferred_readbacks;
         m.report_conflicts = m.stats.deferred_conflicts;
         m.report_feedback = m.stats.feedback_copies;
+        m.report_depth_bounds = m.stats.depth_bounds_draws;
         m.report_corners = m.stats.corner_textures;
         m.report_reloads = m.stats.surface_reloads;
         m.report_gpu_wait_ns = m.stats.gpu_wait_ns;

@@ -120,6 +120,9 @@ struct RasterInfo {
     bool two_side_light = false;
     u32 user_clip_control = 0;
     bool polygon_stipple = false;
+    // NV4097_SET_ZMIN_MAX_CONTROL (RPCS3 rsx_decode.h zmin_max_control): bits 0-3 clip window z to the clip range,
+    // bits 4-7 clamp it there instead.
+    bool depth_clip = true, depth_clamp = false;
 };
 
 // Color write mask per target: bit 0 = R, 1 = G, 2 = B, 3 = A.

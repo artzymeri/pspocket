@@ -265,9 +265,9 @@ std::string rsx_text(Kernel& kernel)
         : st.fifo_location == rsx::FifoLocation::Io                  ? "IO"
                                                                      : "IO, the default";
     std::string out = std::format("RSX: FIFO get {:#010x}, put {:#010x} ({}), {} words processed, {}, {}, {} skipped "
-                                  "by conditional rendering{}\n", st.get, st.put, where, st.words, count(st.flips, "flip"),
-        count(st.failures, "failure"), count(st.conditional_skips, "draw"),
-        st.running ? "" : "; the RSX thread is not running");
+                                  "by conditional rendering, {} split where their constants changed{}\n", st.get, st.put,
+        where, st.words, count(st.flips, "flip"), count(st.failures, "failure"), count(st.conditional_skips, "draw"),
+        count(st.draw_splits, "draw"), st.running ? "" : "; the RSX thread is not running");
     switch (st.block) {
     case Block::Semaphore:
         if (st.semaphore_addr) {

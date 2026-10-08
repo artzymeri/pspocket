@@ -160,6 +160,7 @@ public:
         u64 flips = 0;
         u64 failures = 0;
         u64 conditional_skips = 0; // draws conditional rendering skipped (D-102)
+        u64 draw_splits = 0;       // draws split where their vertex constants or bases changed (D-260)
         BlockReason block = BlockReason::None;
         u32 block_value = 0;  // Semaphore: the value it waits for; JumpToSelf: the jump word
         // Semaphore: where the acquire looks (NV406E_SEMAPHORE_OFFSET in the NV406E_SET_CONTEXT_DMA_SEMAPHORE
@@ -199,6 +200,10 @@ private:
     RunStatus step(u64 max_words);
     RunStatus step_commands(u64 max_words);
     Dispatch dispatch(u32 reg, u32 value);
+    // Whether writing `value` to `reg` between BEGIN and END changes what the vertices drawn so far saw (D-260).
+    bool splits_draw(u32 reg, u32 value) const;
+    // The draw clause so far to the backend (END, or a split at such a write).
+    void submit_draw_clause();
     void fifo_error(std::string message);
     void publish_get();
     void thread_main();
@@ -327,6 +332,7 @@ private:
     std::atomic<u64> failures_{0};
     std::atomic<u64> flips_{0};
     std::atomic<u64> conditional_skips_{0};
+    std::atomic<u64> draw_splits_{0};
     std::atomic<u64> data_epoch_{0};
     u32 epoch_put_ = ~0u;
     bool render_enabled_ = true; // NV4097_SET_RENDER_ENABLE: false while the report it names was zero (D-102)

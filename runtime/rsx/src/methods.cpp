@@ -119,7 +119,11 @@ void Rsx::m_begin_end(u32, u32 value)
     }
     if (!state_.in_begin_end) return;
     state_.in_begin_end = false;
+    submit_draw_clause();
+}
 
+void Rsx::submit_draw_clause()
+{
     const u32 begin_prim = static_cast<u32>(state_.draw.primitive);
     if (begin_prim == 0 || begin_prim > 10 || state_.draw.empty()) return;
     if (!render_enabled_) { // conditional rendering: the report said nothing passed

@@ -371,6 +371,9 @@ RasterInfo RsxState::raster() const
     r.two_side_light = regs[m::NV4097_SET_TWO_SIDE_LIGHT_EN] != 0;
     r.user_clip_control = regs[m::NV4097_SET_USER_CLIP_PLANE_CONTROL];
     r.polygon_stipple = regs[m::NV4097_SET_POLYGON_STIPPLE] != 0;
+    const u32 zc = regs[m::NV4097_SET_ZMIN_MAX_CONTROL];
+    r.depth_clip = (zc & 0xf) != 0;
+    r.depth_clamp = ((zc >> 4) & 0xf) != 0;
     return r;
 }
 

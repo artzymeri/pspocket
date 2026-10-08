@@ -26,8 +26,10 @@ namespace pspocket::rsx::shader {
 
 // The translation's version: raised whenever the MSL made for a program and its options changes. The shader cache
 // (metal/src/shader_cache.mm) loads only the records of this version: a record of another one holds MSL of the old
-// translation under a key the new one also uses. 2: D-174.
-inline constexpr u32 kTranslationVersion = 2;
+// translation under a key the new one also uses. 2: D-174. 4: D-256 to D-263 (FOGC's fog factor, two-sided
+// lighting, user clip planes, the depth bounds test, point sizes and sprites, polygon stipple); 3 was a step on the
+// way that never left the Mac.
+inline constexpr u32 kTranslationVersion = 4;
 
 // Argument table slots shared by the translator and the Metal backend.
 namespace slot {
@@ -37,6 +39,8 @@ inline constexpr u32 kVsConstants = 2;  // constant float4*: transform constants
 inline constexpr u32 kVsIndexData = 3;  // device const uchar*: index data (guest byte order)
 inline constexpr u32 kFsConstants = 0;  // constant float4*: embedded fragment constants, in program order
 inline constexpr u32 kFsParams = 1;     // constant MslFsParams&
+inline constexpr u32 kFsStipple = 2;    // constant uint*: NV4097_SET_POLYGON_STIPPLE_PATTERN's 32 rows (D-263)
+inline constexpr u32 kFsDepthBounds = 16; // depth2d<float>: the depth buffer as it was before the draw (D-261)
 } // namespace slot
 
 inline constexpr u32 kAttribModulo = 1;   // vertex index % divisor instead of / divisor
@@ -75,7 +79,9 @@ struct alignas(16) MslVsParams {
     u32 restart_enable = 0;
     u32 restart_index = 0;
     u32 branch_bits = 0; // NV4097_SET_TRANSFORM_BRANCH_BITS: what BRB and CLB test (D-113)
-    u32 pad1 = 0;
+    // Points: NV4097_SET_POINT_SIZE, negated when NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK bit 5 makes the program's o6.x
+    // the size where it writes o6 (D-262).
+    float point_size = 1.f;
     MslAttrib attribs[16];
 };
 static_assert(sizeof(MslVsParams) == 80 + 16 * 48);
@@ -87,15 +93,25 @@ struct alignas(16) MslFsParams {
                                           // the reference to 1 (integer depth)
     u32 alpha_func = 0x207;               // CompareFunc, only read when FpOptions::alpha_test
     float alpha_ref = 0.f;
-    u32 pad0 = 0, pad1 = 0;
+    float depth_bounds[2] = {0.f, 1.f};   // NV4097_SET_DEPTH_BOUNDS_MIN/MAX, read when FpOptions::depth_bounds (D-261)
     u32 tex_control[16] = {};             // per unit: the texel conversions (texture.hpp texture_control), read by the
                                           // units FpOptions::texture_convert_mask names and by _bx2 samples
     float tex_bias[16] = {};              // per unit: the LOD bias (NV4097_SET_TEXTURE_FILTER), 0 without mipmaps
+    u32 fog_mode = 0x800;                 // NV4097_SET_FOG_MODE and _PARAMS: FOGC's fog factor (D-256)
+    float fog_param[2] = {};
+    u32 pad2 = 0;
 };
-static_assert(sizeof(MslFsParams) == 16 + 256 + 16 + 64 + 64);
+static_assert(sizeof(MslFsParams) == 16 + 256 + 16 + 64 + 64 + 16);
 
 struct VpOptions {
     bool point_size = false; // emit [[point_size]] (point primitives)
+    // User clip planes (D-259): NV4097_SET_USER_CLIP_PLANE_CONTROL's layout, 4 bits per plane: 1 keeps what the
+    // plane's distance (o5.y, o5.z, o5.w, o6.y, o6.z, o6.w) has below zero, 2 at or above it; 0 (and anything else)
+    // leaves the plane off (RPCS3 RSXDrawCommands.cpp fill_user_clip_data, VKVertexProgram.cpp reg_table).
+    u32 user_clip = 0;
+    // o[] registers NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK leaves out (bit n: o[n]): they reach the fragment program as
+    // (0, 0, 0, 1) whatever the program wrote (RPCS3 VKVertexProgram.cpp reg_table, D-267).
+    u16 masked_outputs = 0;
 };
 
 // Shadow2D: a depth texture sampled with a depth comparison (RPCS3 shadow_textures: a depth format and a compare
@@ -124,6 +140,19 @@ struct FpOptions {
     // (NV4097_SET_ANTI_ALIASING_CONTROL bit 4, emulated as RPCS3 does without hardware support) on colour 0's alpha.
     bool srgb_output = false;
     bool alpha_to_coverage = false;
+    // NV4097_SET_TWO_SIDE_LIGHT_EN: COL0 and COL1 are the back colours (the vertex program's o3, o4) on back faces
+    // (RPCS3 VKFragmentProgram.cpp two_sided_lighting, D-257).
+    bool two_sided_lighting = false;
+    // NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE: a fragment whose pixel's stored depth (slot::kFsDepthBounds) is outside
+    // MslFsParams::depth_bounds is discarded (RPCS3 VKDraw.cpp depth bounds, D-261).
+    bool depth_bounds = false;
+    // Point sprites (NV4097_SET_POINT_SPRITE_CONTROL on a point draw): the texture coordinates whose bit is set are the
+    // fragment's place in its point, (x, y, 1, 0), or (x, y, 0, 1/w) when 2D (RPCS3 FragmentProgramDecompiler.cpp
+    // texcoord_is_point_coord, D-262).
+    u16 point_coord_mask = 0;
+    // NV4097_SET_POLYGON_STIPPLE on a polygon draw: a fragment whose bit in the 32x32 pattern (row y % 32, bit x % 32)
+    // is clear is discarded (RPCS3 RSXROPPrologue.glsl, D-263).
+    bool polygon_stipple = false;
     bool operator==(const FpOptions&) const = default;
 };
 

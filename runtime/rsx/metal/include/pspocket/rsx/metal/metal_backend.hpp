@@ -67,6 +67,7 @@ struct WindowStats {
     double readbacks = 0, deferred_readbacks = 0, deferred_conflicts = 0, readback_wait_ms = 0;
     double texture_overlays = 0, texture_checks = 0, texture_mb_hashed = 0, write_faults = 0;
     double feedback_copies = 0, corner_textures = 0, surface_reloads = 0;
+    double depth_bounds_draws = 0; // draws with the depth bounds test (D-261)
     double gpu_wait_ms = 0;        // the RSX thread's wait for the GPU at flips (frames in flight capped)
     u64 programs_made = 0, pipelines_made = 0; // in the window, by the RSX thread or for it in the background
     double compile_ms = 0;                      // in the window: the RSX thread's compiling, or waiting for compiles
@@ -171,6 +172,7 @@ struct BackendStats {
     u64 texture_overlays = 0;  // targets laid over guest memory on the GPU for a texture decoded from it (D-137)
     u64 occlusion_reports = 0; // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) answered from the GPU's counters (D-102)
     u64 feedback_copies = 0;   // copies of a target a draw samples while drawing to it, made once per write (D-148)
+    u64 depth_bounds_draws = 0; // draws with the depth bounds test, which read a copy of the depth buffer (D-261)
     u64 corner_textures = 0;   // corner textures allocated (D-120); later corners of the same size reuse them (D-148)
     u64 gpu_wait_ns = 0;       // the RSX thread's wait at flips for the GPU to finish an older frame (D-148)
     u64 budget_submits = 0;    // command buffers submitted early, past MetalBackendConfig::transient_budget (D-148)

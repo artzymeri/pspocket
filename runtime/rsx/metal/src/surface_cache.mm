@@ -341,10 +341,11 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blit_pipeline_for(MTLPixelFormat 
 // (GTA V's, colour mask 0 there) share one copy and keep their pass. A new copy is a new texture: copying into the
 // one earlier draws read made the GPU wait for them each time (GPU time per frame 8.5 ms to 22 ms on the Mac walk);
 // the old one goes when the GPU is done with it, so a frame holds as many as it has writes between such draws.
-id<MTLTexture> MetalBackend::Impl::feedback_copy(Surface& s)
+id<MTLTexture> MetalBackend::Impl::feedback_copy(Surface& s, bool depth_only)
 {
     Surface::Conversion& c = s.feedback;
-    const bool fresh = !c.texture || c.generation != s.generation || c.stencil_generation != s.stencil_generation;
+    const bool fresh = !c.texture || c.generation != s.generation ||
+        (!depth_only && c.stencil_generation != s.stencil_generation);
     if (fresh) {
         MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s.texture.pixelFormat
                                                                                      width:s.texture.width

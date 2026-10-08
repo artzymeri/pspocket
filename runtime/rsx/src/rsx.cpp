@@ -307,6 +307,7 @@ Rsx::Status Rsx::status() const
     s.flips = flips_.load(std::memory_order_relaxed);
     s.failures = failures_.load(std::memory_order_relaxed);
     s.conditional_skips = conditional_skips_.load(std::memory_order_relaxed);
+    s.draw_splits = draw_splits_.load(std::memory_order_relaxed);
     s.block = block_reason_.load(std::memory_order_acquire);
     s.block_value = block_value_.load(std::memory_order_relaxed);
     if (s.block == BlockReason::JumpToSelf) {
@@ -582,6 +583,15 @@ Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
         data_epoch_.fetch_add(1, std::memory_order_release); // what its releaser wrote is for the commands after it
     }
 
+    // A vertex constant, the constants' load slot or a vertex base changed between BEGIN and END: what was drawn so
+    // far goes first, with the state it saw (RPCS3 common.cpp push_draw_parameter_change, nv4097.cpp
+    // set_transform_constant: the draw clause's command barriers).
+    if (state_.in_begin_end && !state_.draw.ranges.empty() && splits_draw(reg, value)) [[unlikely]] {
+        const Primitive primitive = state_.draw.primitive;
+        submit_draw_clause();
+        state_.draw.reset(primitive);
+        draw_splits_.fetch_add(1, std::memory_order_relaxed);
+    }
     state_.regs[reg] = value;
     const HandlerTable& h = handlers();
     if (const Handler handler = h.table[reg]) {
@@ -593,6 +603,18 @@ Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
                 value, get_.load(std::memory_order_relaxed), packet_header_));
     }
     return Dispatch::Done;
+}
+
+bool Rsx::splits_draw(u32 reg, u32 value) const
+{
+    if (reg >= m::NV4097_SET_TRANSFORM_CONSTANT && reg < m::NV4097_SET_TRANSFORM_CONSTANT + 32) {
+        const u32 index = reg - m::NV4097_SET_TRANSFORM_CONSTANT;
+        const u32 slot = state_.regs[m::NV4097_SET_TRANSFORM_CONSTANT_LOAD] + index / 4;
+        return slot < kTransformConstantCount && std::bit_cast<u32>(state_.transform_constants[slot][index % 4]) != value;
+    }
+    return (reg == m::NV4097_SET_TRANSFORM_CONSTANT_LOAD || reg == m::NV4097_SET_VERTEX_DATA_BASE_OFFSET ||
+               reg == m::NV4097_SET_VERTEX_DATA_BASE_INDEX) &&
+        state_.regs[reg] != value;
 }
 
 bool Rsx::semaphore_acquire_satisfied(u32 value)

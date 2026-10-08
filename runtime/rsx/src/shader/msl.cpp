@@ -5,6 +5,7 @@
 
 #include <format>
 #include <set>
+#include <vector>
 
 #include "pspocket/core/be.h"
 
@@ -23,17 +24,36 @@ struct rsx_attrib {
 struct rsx_vs_params {
     float4 pos_x; float4 pos_y; float4 pos_z;
     uint index_mode; uint index_offset; uint base_index; uint first_vertex;
-    uint restart_enable; uint restart_index; uint branch_bits; uint pad1;
+    uint restart_enable; uint restart_index; uint branch_bits; float point_size;
     rsx_attrib attribs[16];
 };
 
 struct rsx_fs_params {
     float4 wpos;
     float4 tex_scale[16]; // Shadow2D: z compare function, w flags (1 linear, 2 clamp the reference to 1)
-    uint alpha_func; float alpha_ref; uint pad0; uint pad1;
+    uint alpha_func; float alpha_ref; float depth_bounds_min; float depth_bounds_max;
     uint tex_control[16]; // per unit: the texel conversions (pspocket/rsx/texture.hpp texctl)
     float tex_bias[16];   // per unit: the LOD bias
+    uint fog_mode; float fog_param0; float fog_param1; uint pad2; // FOGC's fog factor
 };
+
+// FOGC as the RSX gives it: x the fog coordinate (the vertex program's o5.x), y the fog factor from NV4097_SET_FOG_MODE
+// and _PARAMS clamped to [0, 1], z and w zero (RPCS3 RSXFragmentPrologue.glsl fetch_fog_value; modes gcm_enums.h).
+static inline float4 rsx_fog(float x, constant rsx_fs_params& fp)
+{
+    float4 r = float4(x, 0.0, 0.0, 0.0);
+    switch (fp.fog_mode) {
+    case 0x2601u: r.y = fp.fog_param1 * x + (fp.fog_param0 - 1.0); break;                             // linear
+    case 0x0800u: r.y = exp(11.084 * (fp.fog_param1 * x + fp.fog_param0 - 1.5)); break;               // exp
+    case 0x0801u: r.y = exp(-pow(4.709 * (fp.fog_param1 * x + fp.fog_param0 - 1.5), 2.0)); break;     // exp2
+    case 0x0802u: r.y = exp(11.084 * (fp.fog_param1 * abs(x) + fp.fog_param0 - 1.5)); break;          // exp, abs
+    case 0x0803u: r.y = exp(-pow(4.709 * (fp.fog_param1 * abs(x) + fp.fog_param0 - 1.5), 2.0)); break;// exp2, abs
+    case 0x0804u: r.y = fp.fog_param1 * abs(x) + (fp.fog_param0 - 1.0); break;                        // linear, abs
+    default: return r;
+    }
+    r.y = clamp(r.y, 0.0, 1.0);
+    return r;
+}
 
 static inline uint rsx_ld8(device const uchar* b, uint o) { return uint(b[o]); }
 static inline uint rsx_ld16(device const uchar* b, uint o, bool swap)
@@ -449,6 +469,14 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
     src += "    float4 fogc [[user(fogc)]];\n";
     for (u32 i = 0; i < 10; i++) src += std::format("    float4 tc{} [[user(tc{})]];\n", i, i);
     if (options.point_size) src += "    float point_size [[point_size]];\n";
+    // User clip planes (D-259): only the planes that are on, as Metal clip distances (kept at or above zero).
+    std::vector<std::string> clip;
+    for (u32 i = 0; i < 6; i++) {
+        const u32 op = (options.user_clip >> (4 * i)) & 0xf;
+        if (op != 1 && op != 2) continue;
+        clip.push_back(std::format("{}o{}.{}", op == 1 ? "-" : "", i < 3 ? 5 : 6, "yzw"[i % 3]));
+    }
+    if (!clip.empty()) src += std::format("    float clip [[clip_distance]] [{}];\n", clip.size());
     src += "};\n\n";
 
     result.shader.entry = std::format("rsx_vp_{:016x}", vp.hash);
@@ -484,10 +512,21 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
     // o7-o14 TEX0-TEX7, o15 TEX8 (RPCS3 GL/GLVertexProgram.cpp register table).
     src += "    rsx_vs_out out;\n";
     src += "    out.position = float4(dot(p.pos_x, o0), dot(p.pos_y, o0), dot(p.pos_z, o0), o0.w);\n";
-    src += "    out.col0 = o1;\n    out.col1 = o2;\n    out.bfc0 = o3;\n    out.bfc1 = o4;\n    out.fogc = o5.xxxx;\n";
-    for (u32 i = 0; i < 8; i++) src += std::format("    out.tc{} = o{};\n", i, 7 + i);
-    src += "    out.tc8 = o15;\n    out.tc9 = o6;\n";
-    if (options.point_size) src += "    out.point_size = o6.x;\n";
+    // An output the output mask leaves out is (0, 0, 0, 1) (D-267).
+    const auto o = [&](u32 n) {
+        return (options.masked_outputs & (1u << n)) ? std::string("float4(0.0, 0.0, 0.0, 1.0)") : std::format("o{}", n);
+    };
+    src += std::format("    out.col0 = {};\n    out.col1 = {};\n    out.bfc0 = {};\n    out.bfc1 = {};\n", o(1), o(2), o(3), o(4));
+    src += (options.masked_outputs & (1u << 5)) ? "    out.fogc = float4(0.0, 0.0, 0.0, 1.0);\n" : "    out.fogc = o5.xxxx;\n";
+    for (u32 i = 0; i < 8; i++) src += std::format("    out.tc{} = {};\n", i, o(7 + i));
+    src += std::format("    out.tc8 = {};\n    out.tc9 = {};\n", o(15), o(6));
+    if (options.point_size) {
+        // The program's o6.x when the output mask says so and it writes o6, else the register (RPCS3
+        // VKVertexProgram.cpp insertMainEnd, D-262).
+        src += (vp.output_mask & (1u << 6)) ? "    out.point_size = signbit(p.point_size) ? o6.x : p.point_size;\n"
+                                            : "    out.point_size = abs(p.point_size);\n";
+    }
+    for (usize i = 0; i < clip.size(); i++) src += std::format("    out.clip[{}] = {};\n", i, clip[i]);
     src += "    return out;\n}\n";
 
     result.shader.source = std::move(src);
@@ -586,10 +625,15 @@ std::string fp_source(FpContext& c, const FpInstruction& in, u32 n)
         if (id == 0) {
             r = "wpos";
         } else if (id == 1 || id == 2) {
-            r = std::format("clamp(in.col{}, 0.0, 1.0)", id - 1);
+            // Two-sided lighting: the back colour on back faces (D-257).
+            r = c.opt.two_sided_lighting ? std::format("clamp(front ? in.col{0} : in.bfc{0}, 0.0, 1.0)", id - 1)
+                                         : std::format("clamp(in.col{}, 0.0, 1.0)", id - 1);
             prec = 0;
         } else if (id == 3) {
-            r = "in.fogc";
+            r = "fogc"; // the fog factor in y (D-256)
+        } else if (id >= 4 && id <= 13 && (c.opt.point_coord_mask & (1u << (id - 4)))) {
+            // A point sprite's coordinate (D-262): its place in the point, not perspective-corrected.
+            r = (c.opt.texcoord_2d_mask & (1u << (id - 4))) ? "float4(point_coord, 0.0, in_w)" : "float4(point_coord, 1.0, 0.0)";
         } else if (id >= 4 && id <= 13) {
             const u32 t = id - 4;
             if (c.opt.texcoord_2d_mask & (1u << t)) {
@@ -1045,6 +1089,8 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     const char* interp = opt.flat_colors ? " [[flat]]" : "";
     if (c.inputs & (1u << 1)) src += std::format("    float4 col0 [[user(col0)]]{};\n", interp);
     if (c.inputs & (1u << 2)) src += std::format("    float4 col1 [[user(col1)]]{};\n", interp);
+    if (opt.two_sided_lighting && (c.inputs & (1u << 1))) src += std::format("    float4 bfc0 [[user(bfc0)]]{};\n", interp);
+    if (opt.two_sided_lighting && (c.inputs & (1u << 2))) src += std::format("    float4 bfc1 [[user(bfc1)]]{};\n", interp);
     if (c.inputs & (1u << 3)) src += "    float4 fogc [[user(fogc)]];\n";
     for (u32 t = 0; t < 10; t++) {
         if (c.inputs & (1u << (4 + t))) src += std::format("    float4 tc{} [[user(tc{})]];\n", t, t);
@@ -1131,18 +1177,35 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
                                                                                              : "texture2d<float>";
         params += std::format(",\n    {} t{} [[texture({})]], sampler s{} [[sampler({})]]", type, t, t, t, t);
     }
+    if (opt.depth_bounds) params += std::format(",\n    depth2d<float> depth_bounds [[texture({})]]", slot::kFsDepthBounds);
+    if (opt.point_coord_mask) params += ",\n    float2 point_coord [[point_coord]]";
+    if (opt.polygon_stipple) params += std::format(",\n    constant uint* stipple [[buffer({})]]", slot::kFsStipple);
     src += std::format("fragment rsx_fs_out {}({})\n{{\n", result.shader.entry, params);
+    if (opt.polygon_stipple) {
+        // Polygon stipple (D-263): the pattern's bit for this pixel.
+        src += "    {\n        const uint2 at = uint2(in.position.xy) % 32u;\n"
+               "        if (((stipple[at.y] >> at.x) & 1u) == 0u) discard_fragment();\n    }\n";
+    }
+    if (opt.depth_bounds) {
+        // The depth bounds test (D-261): the depth stored at this pixel before the draw, against the bounds.
+        src += "    {\n        const float stored = depth_bounds.read(uint2(in.position.xy));\n"
+               "        if (stored < fp.depth_bounds_min || stored > fp.depth_bounds_max) discard_fragment();\n    }\n";
+    }
     // WPOS (x, y, z, 1/w): origin and pixel centre adjusted by fp.wpos (shader window registers).
     src += "    const float4 wpos = float4(in.position.x + fp.wpos.z, in.position.y * fp.wpos.x + fp.wpos.y + fp.wpos.z,"
            " in.position.z, in.position.w);\n";
     src += "    const float in_w = 1.0 / in.position.w;\n";
+    if (c.inputs & (1u << 3)) src += "    const float4 fogc = rsx_fog(in.fogc.x, fp);\n"; // FOGC (D-256)
     if (c.indexed_inputs) {
         // The texture coordinates a loop-indexed input picks from (RPCS3 _indexed_load), each with its 2D control as when
         // it is read directly (RPCS3 logs that case and reads the coordinate as it is).
         src += "    const float4 tcs[10] = {";
         for (u32 t = 0; t < 10; t++) {
             if (t) src += ", ";
-            src += (opt.texcoord_2d_mask & (1u << t)) ? std::format("float4(in.tc{}.xy, 0.0, in_w)", t) : std::format("in.tc{}", t);
+            src += (opt.point_coord_mask & (1u << t))  ? ((opt.texcoord_2d_mask & (1u << t)) ? std::string("float4(point_coord, 0.0, in_w)")
+                                                                                              : std::string("float4(point_coord, 1.0, 0.0)"))
+                 : (opt.texcoord_2d_mask & (1u << t)) ? std::format("float4(in.tc{}.xy, 0.0, in_w)", t)
+                                                      : std::format("in.tc{}", t);
         }
         src += "};\n";
     }
@@ -1179,6 +1242,8 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
         }
     }
     if (mrt == 0 && !depth_export) src += "    out.c0 = float4(0.0);\n";
+    // Exported depth is clamped to [0, 1], float depth buffers too (RPCS3 VKFragmentProgram.cpp, from tests on the
+    // hardware): Metal clamps it to the viewport's depth range itself (D-266, checked in tests/rsx).
     if (depth_export) src += "    out.depth = r1.z;\n";
     src += "    return out;\n}\n";
 

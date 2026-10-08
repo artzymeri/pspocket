@@ -475,6 +475,7 @@ struct MetalBackend::Impl {
     u64 report_overlays = 0;
     u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0, report_draws_compiling = 0;
     u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
+    u64 report_depth_bounds = 0; // D-261
     // At most config.frames_in_flight frames queued for the GPU (D-148): a flip waits for the oldest to complete. Each
     // frame queued holds what it allocated until then, and nothing else held the RSX thread back.
     dispatch_semaphore_t frames_in_flight = nil;
@@ -662,7 +663,8 @@ struct MetalBackend::Impl {
     void upload_surface_bytes(Surface& s); // the formats store_readback writes, but A8R8G8B8 (D-110)
     bool newer_in_guest(const PassTargets& t) const; // a target whose guest memory is newer: reloaded by open_pass
     void remove_surface(Surface* s);
-    id<MTLTexture> feedback_copy(Surface& s); // D-148
+    // D-148; `depth_only`: a stencil written since does not matter (the depth bounds test reads the depth, D-261).
+    id<MTLTexture> feedback_copy(Surface& s, bool depth_only = false);
     // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the
     // buffer was drawn to since; nil when it cannot be.
     Surface::Conversion* depth_as_texture(Surface& d, u32 mode);
@@ -693,7 +695,9 @@ struct MetalBackend::Impl {
     bool read_texture(id<MTLTexture> tex, u32 face, u32 level, u32 w, u32 h, std::vector<std::array<float, 4>>& out);
 
     // ---- programs and pipelines (pipeline_cache.mm) ----
-    const CompiledProgram* vertex_program_for(const RsxState& state, bool points);
+    // `fp_inputs`: the inputs the draw's fragment program reads (TranslatedShader::input_mask), `two_sided`: whether
+    // it reads the back colours too (D-267).
+    const CompiledProgram* vertex_program_for(const RsxState& state, bool points, u32 fp_inputs, bool two_sided);
     const CompiledProgram* fragment_program_for(const RsxState& state, const shader::FpOptions& options,
         const shader::FragmentProgram** program_out, u32& program_ea);
     std::optional<CompiledProgram> compile(const shader::TranslateResult& tr, const char* what);

@@ -1076,6 +1076,681 @@ TEST_CASE("metal e2e: back-face culling follows the RSX winding")
     CHECK(run(static_cast<u32>(FrontFace::CW), true));
 }
 
+namespace {
+
+// The triangle drawn with a vertex program that writes o[1] (COL0) = c[0], o[3] (BFC0) = c[1] and o[5] (FOGC) = c[2],
+// a fragment program that moves fragment input `fp_input` to R0, and `state` set before the draw. The centre pixel
+// as guest bytes (a, r, g, b).
+std::array<u8, 4> draw_with_outputs(const std::array<std::array<float, 4>, 3>& c, u32 fp_input, bool flip,
+    const std::function<void(CommandBuilder&)>& state)
+{
+    E2E e;
+    FpInst mov;
+    mov.op = 0x01;
+    mov.dst = 0;
+    mov.input = fp_input;
+    mov.src[0] = fp_in();
+    mov.end = true;
+    e.put_local_bytes(kFpOffset, assemble_fp({mov}));
+    write_triangle(e, {0, 0, 0}, flip);
+    const auto vp_mov = [](u32 out, VpSrc src, u32 constant = 0) {
+        VpInst in;
+        in.vec_op = 1;
+        in.src[0] = src;
+        in.constant = constant;
+        in.out = out;
+        in.vec_mask = 0xf;
+        return in;
+    };
+    VpInst last = vp_mov(5, vp_const(), 2);
+    last.end = true;
+    const std::vector<VpInst> prog = {vp_mov(0, vp_in()), vp_mov(1, vp_const(), 0), vp_mov(3, vp_const(), 1), last};
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp(prog));
+    b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+    b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+    std::vector<u32> words;
+    for (const auto& v : c)
+        for (float f : v) words.push_back(f2u(f));
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT, words);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    state(b);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    return guest_pixel(e, kSurfaceOffset, 32, 40);
+}
+
+constexpr std::array<std::array<float, 4>, 3> kRedGreenFog = {{{1.f, 0.f, 0.f, 1.f}, {0.f, 1.f, 0.f, 1.f}, {0.5f, 0.f, 0.f, 0.f}}};
+
+} // namespace
+
+TEST_CASE("metal e2e: two-sided lighting colours back faces with the back colour, BFC0 (D-257)")
+{
+    REQUIRE_METAL();
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00};
+    const auto draw = [](bool flip, bool two_sided, u32 front_face) {
+        return draw_with_outputs(kRedGreenFog, 1, flip, [&](CommandBuilder& b) {
+            b.method(m::NV4097_SET_TWO_SIDE_LIGHT_EN, two_sided ? 1u : 0u);
+            b.method(m::NV4097_SET_FRONT_FACE, front_face);
+        });
+    };
+    const u32 ccw = static_cast<u32>(FrontFace::CCW), cw = static_cast<u32>(FrontFace::CW);
+    CHECK(draw(false, false, ccw) == red); // one-sided: COL0 on both faces
+    CHECK(draw(true, false, ccw) == red);
+    CHECK(draw(false, true, ccw) == red);  // two-sided, front face: COL0
+    CHECK(draw(true, true, ccw) == green); // back face: BFC0
+    CHECK(draw(false, true, cw) == green); // the same triangle is a back face when the front winds clockwise
+}
+
+TEST_CASE("metal e2e: FOGC carries the fog coordinate and the fog factor of NV4097_SET_FOG_MODE (D-256)")
+{
+    REQUIRE_METAL();
+    // R0 = FOGC = (coordinate, factor, 0, 0): red is the coordinate, green the factor (RPCS3 RSXFragmentPrologue.glsl).
+    const auto fog = [](u32 mode, float p0, float p1, float coord = 0.5f) {
+        auto c = kRedGreenFog;
+        c[2][0] = coord;
+        return draw_with_outputs(c, 3, false, [&](CommandBuilder& b) {
+            b.method(m::NV4097_SET_FOG_MODE, mode);
+            b.method(m::NV4097_SET_FOG_PARAMS, {f2u(p0), f2u(p1)});
+        });
+    };
+    const auto near = [](u8 got, double want) { return std::abs(got - want * 255.0) <= 2.0; };
+    auto px = fog(0x2601, 1.25f, 1.f); // linear: 1 * 0.5 + (1.25 - 1)
+    CHECK(near(px[1], 0.5));
+    CHECK(near(px[2], 0.75));
+    CHECK(px[3] == 0);
+    CHECK(px[0] == 0);
+    px = fog(0x0800, 1.5f, -0.1f); // exp: exp(11.084 * (-0.1 * 0.5 + 1.5 - 1.5))
+    CHECK(near(px[2], std::exp(11.084 * -0.05)));
+    px = fog(0x0801, 1.5f, 0.2f); // exp2: exp(-(4.709 * (0.2 * 0.5))^2)
+    CHECK(near(px[2], std::exp(-std::pow(4.709 * 0.1, 2.0))));
+    px = fog(0x0804, 1.25f, 1.f, -0.5f); // linear on |coordinate|; the coordinate itself is negative (red 0)
+    CHECK(near(px[2], 0.75));
+    CHECK(px[1] == 0);
+    px = fog(0x2601, 1.25f, 1.f, -0.5f); // the same without abs: -0.25, clamped to 0
+    CHECK(px[2] == 0);
+    px = fog(0x2601, 2.f, 1.f); // 1.5, clamped to 1
+    CHECK(px[2] == 0xff);
+    px = fog(0x0802, 1.5f, -0.1f, -0.5f); // exp on |coordinate|
+    CHECK(near(px[2], std::exp(11.084 * -0.05)));
+}
+
+TEST_CASE("metal e2e: window z is clipped to NV4097_SET_CLIP_MIN/MAX and stored as it is, or clamped there (D-258)")
+{
+    REQUIRE_METAL();
+    // The triangle's window z is 0.75 (z 0.5, viewport scale and offset 0.5). Drawn into a Z16 depth buffer that
+    // takes every depth: (whether colour 0 was drawn, the depth stored at the centre).
+    const auto draw = [](float clip_min, float clip_max, u32 zmin_max_control) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        constexpr u32 kDepth = 0x180000;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (1u << 5) | (1u << 8));
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kDepth);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 2);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xffff);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepth);
+        b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 1);
+        b.method(m::NV4097_SET_DEPTH_FUNC, static_cast<u32>(CompareFunc::Always));
+        b.method(m::NV4097_SET_DEPTH_MASK, 1);
+        b.method(m::NV4097_SET_CLIP_MIN, {f2u(clip_min), f2u(clip_max)});
+        b.method(m::NV4097_SET_ZMIN_MAX_CONTROL, zmin_max_control);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kDepth, kW * kH * 2));
+        const bool drawn = guest_pixel(e, kSurfaceOffset, 32, 40)[1] == 0xff;
+        const double depth = ps_read16(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kDepth + 40 * kW * 2 + 32 * 2) / 65535.0;
+        return std::pair{drawn, depth};
+    };
+    const auto near = [](double got, double want) { return std::abs(got - want) < 2.0 / 65535.0; };
+    auto [drawn, depth] = draw(0.f, 1.f, 1); // the reset state
+    CHECK(drawn);
+    CHECK(near(depth, 0.75));
+    std::tie(drawn, depth) = draw(0.5f, 1.f, 1); // inside the range: stored as it is, not as its place in the range
+    CHECK(drawn);
+    CHECK(near(depth, 0.75));
+    std::tie(drawn, depth) = draw(1.f, 0.5f, 1); // the ends either way round
+    CHECK(drawn);
+    CHECK(near(depth, 0.75));
+    std::tie(drawn, depth) = draw(0.f, 0.7f, 1); // beyond the far end: clipped
+    CHECK_FALSE(drawn);
+    CHECK(depth == 1.0);
+    std::tie(drawn, depth) = draw(0.8f, 1.f, 1); // before the near end: clipped
+    CHECK_FALSE(drawn);
+    std::tie(drawn, depth) = draw(0.f, 0.7f, 0x11); // clamped to the far end instead
+    CHECK(drawn);
+    CHECK(near(depth, 0.7));
+    std::tie(drawn, depth) = draw(0.f, 0.7f, 0); // not clipped: clamped too (RPCS3)
+    CHECK(drawn);
+    CHECK(near(depth, 0.7));
+}
+
+TEST_CASE("metal e2e: user clip planes keep what their distance has on the side they name (D-259)")
+{
+    REQUIRE_METAL();
+    // o[5] = v[0]: plane 0's distance (o5.y) is the clip-space y, 1 at the top row, -1 at the bottom. Whether red was
+    // drawn at (32, 20), above the middle, and at (32, 50), below it.
+    const auto draw = [](u32 control, u32 output_mask) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        const auto vp_mov = [](u32 out, VpSrc src, u32 constant = 0) {
+            VpInst in;
+            in.vec_op = 1;
+            in.src[0] = src;
+            in.constant = constant;
+            in.out = out;
+            in.vec_mask = 0xf;
+            return in;
+        };
+        VpInst last = vp_mov(5, vp_in());
+        last.end = true;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({vp_mov(0, vp_in()), vp_mov(1, vp_const(), 0), last}));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(1.f), f2u(0.f), f2u(0.f), f2u(1.f)});
+        b.method(m::NV4097_SET_USER_CLIP_PLANE_CONTROL, control);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, output_mask);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return std::pair{guest_pixel(e, kSurfaceOffset, 32, 20)[1] == 0xff, guest_pixel(e, kSurfaceOffset, 32, 50)[1] == 0xff};
+    };
+    constexpr u32 kAll = 0x3fffff, kUc0 = 1u << 6;
+    CHECK(draw(0, kAll) == std::pair{true, true});              // off
+    CHECK(draw(2, kAll) == std::pair{true, false});             // plane 0, at or above zero: the top half
+    CHECK(draw(1, kAll) == std::pair{false, true});             // plane 0, below zero: the bottom half
+    CHECK(draw(2, kAll & ~kUc0) == std::pair{true, true});      // its distance is not put out: off
+    CHECK(draw(2u << 4, kAll) == std::pair{true, true});        // plane 1 reads o5.z, the z of 0.5: kept everywhere
+    CHECK(draw(1u << 4, kAll) == std::pair{false, false});      // ... or nowhere
+    CHECK(draw(2 | (2u << 4), kAll) == std::pair{true, false}); // both: plane 0 decides
+}
+
+TEST_CASE("metal e2e: a constant or vertex base written between the ranges of one draw reaches only the ranges after it (D-260)")
+{
+    REQUIRE_METAL();
+    // Two triangles in one BEGIN/END, the left one (vertices 0-2) and the right one (3-5); o[1] = c[0]. `between`
+    // goes between their DRAW_ARRAYS. The pixels at the middle of the left and right triangles, and the draws made.
+    struct Result {
+        std::array<u8, 4> left, right;
+        u64 draws, splits;
+    };
+    const auto draw = [](const std::function<void(CommandBuilder&)>& between, u32 second_first) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        const float xy[6][2] = {{-1.f, -1.f}, {0.f, -1.f}, {-0.5f, 1.f}, {0.f, -1.f}, {1.f, -1.f}, {0.5f, 1.f}};
+        for (u32 v = 0; v < 6; v++) {
+            e.put_local_f(kVertexOffset + v * 16 + 0, xy[v][0]);
+            e.put_local_f(kVertexOffset + v * 16 + 4, xy[v][1]);
+            e.put_local_f(kVertexOffset + v * 16 + 8, 0.5f);
+            e.put_local_f(kVertexOffset + v * 16 + 12, 1.f);
+        }
+        const auto vp_mov = [](u32 out, VpSrc src, u32 constant = 0) {
+            VpInst in;
+            in.vec_op = 1;
+            in.src[0] = src;
+            in.constant = constant;
+            in.out = out;
+            in.vec_mask = 0xf;
+            return in;
+        };
+        VpInst last = vp_mov(1, vp_const(), 0);
+        last.end = true;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({vp_mov(0, vp_in()), last}));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(1.f), f2u(0.f), f2u(0.f), f2u(1.f)}); // red
+        set_fragment_program(b, kFpOffset, 0x40);
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0, static_cast<u32>(VertexType::F) | (4u << 4) | (16u << 8));
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0, kVertexOffset);
+        b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Triangles));
+        b.method(m::NV4097_DRAW_ARRAYS, (2u << 24) | 0);
+        between(b);
+        b.method(m::NV4097_DRAW_ARRAYS, (2u << 24) | second_first);
+        b.method(m::NV4097_SET_BEGIN_END, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return Result{guest_pixel(e, kSurfaceOffset, 16, 48), guest_pixel(e, kSurfaceOffset, 48, 48),
+            e.backend->stats().draws, e.rsx->status().draw_splits};
+    };
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00};
+    // The colour changes between the triangles: the left one keeps red.
+    Result r = draw([](CommandBuilder& b) {
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(0.f), f2u(1.f), f2u(0.f), f2u(1.f)});
+    }, 3);
+    CHECK(r.left == red);
+    CHECK(r.right == green);
+    CHECK(r.draws == 2);
+    CHECK(r.splits == 1);
+    // The same colour written again (and the load slot it already had): one draw.
+    r = draw([](CommandBuilder& b) {
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(1.f), f2u(0.f), f2u(0.f), f2u(1.f)});
+    }, 3);
+    CHECK(r.left == red);
+    CHECK(r.right == red);
+    CHECK(r.draws == 1);
+    CHECK(r.splits == 0);
+    // The vertex base moves by three vertices: the second range's vertices 0-2 are the right triangle.
+    r = draw([](CommandBuilder& b) { b.method(m::NV4097_SET_VERTEX_DATA_BASE_OFFSET, 3 * 16); }, 0);
+    CHECK(r.left == red);
+    CHECK(r.right == red);
+    CHECK(r.draws == 2);
+    // Without anything between them the two ranges are one draw.
+    r = draw([](CommandBuilder&) {}, 3);
+    CHECK(r.left == red);
+    CHECK(r.right == red);
+    CHECK(r.draws == 1);
+}
+
+TEST_CASE("metal e2e: the depth bounds test passes the pixels whose stored depth is inside the bounds (D-261)")
+{
+    REQUIRE_METAL();
+    // A Z16 depth buffer cleared to 0.25; the triangle drawn red with depth 0.75 written, then drawn green under the
+    // bounds test (depth test off). The centre (stored 0.75) and a corner outside the triangle (stored 0.25) after a
+    // full-screen green draw under the same bounds: whether each is green.
+    const auto draw = [](bool enable, float lo, float hi) {
+        E2E e;
+        const auto vp_mov = [](u32 out, VpSrc src, u32 constant = 0) {
+            VpInst in;
+            in.vec_op = 1;
+            in.src[0] = src;
+            in.constant = constant;
+            in.out = out;
+            in.vec_mask = 0xf;
+            return in;
+        };
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0, 0, 0});
+        // Vertices 3-6: a full-screen quad at depth 0.5 (window 0.75 as well; its depth is not written).
+        const float quad[4][2] = {{-1.f, -1.f}, {1.f, -1.f}, {1.f, 1.f}, {-1.f, 1.f}};
+        for (u32 v = 0; v < 4; v++) {
+            e.put_local_f(kVertexOffset + (3 + v) * 16 + 0, quad[v][0]);
+            e.put_local_f(kVertexOffset + (3 + v) * 16 + 4, quad[v][1]);
+            e.put_local_f(kVertexOffset + (3 + v) * 16 + 8, 0.5f);
+            e.put_local_f(kVertexOffset + (3 + v) * 16 + 12, 1.f);
+        }
+        VpInst last = vp_mov(1, vp_const(), 0);
+        last.end = true;
+        constexpr u32 kDepth = 0x180000;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (1u << 5) | (1u << 8));
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kDepth);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 2);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x4000);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepth);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({vp_mov(0, vp_in()), last}));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0, static_cast<u32>(VertexType::F) | (4u << 4) | (16u << 8));
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0, kVertexOffset);
+        set_fragment_program(b, kFpOffset, 0x40);
+        // Pass 1: red, depth written
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(1.f), f2u(0.f), f2u(0.f), f2u(1.f)});
+        b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 1);
+        b.method(m::NV4097_SET_DEPTH_FUNC, static_cast<u32>(CompareFunc::Always));
+        b.method(m::NV4097_SET_DEPTH_MASK, 1);
+        draw_triangle(b);
+        // Pass 2: green under the bounds, the depth left alone
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(0.f), f2u(1.f), f2u(0.f), f2u(1.f)});
+        b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 0);
+        b.method(m::NV4097_SET_DEPTH_MASK, 0);
+        b.method(m::NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE, enable ? 1u : 0u);
+        b.method(m::NV4097_SET_DEPTH_BOUNDS_MIN, {f2u(lo), f2u(hi)});
+        b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Quads));
+        b.method(m::NV4097_DRAW_ARRAYS, (3u << 24) | 3);
+        b.method(m::NV4097_SET_BEGIN_END, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().depth_bounds_draws == (enable && (lo > 0.f || hi < 1.f) ? 1u : 0u));
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const auto green = [&](u32 x, u32 y) { return guest_pixel(e, kSurfaceOffset, x, y)[2] == 0xff; };
+        return std::pair{green(32, 40), green(2, 2)};
+    };
+    CHECK(draw(false, 0.5f, 1.f) == std::pair{true, true});  // off
+    CHECK(draw(true, 0.5f, 1.f) == std::pair{true, false});  // 0.75 inside, 0.25 not
+    CHECK(draw(true, 0.f, 0.5f) == std::pair{false, true});  // the other way round
+    CHECK(draw(true, 0.2f, 0.8f) == std::pair{true, true});  // both inside
+    CHECK(draw(true, 0.8f, 0.9f) == std::pair{false, false}); // neither
+    CHECK(draw(true, 0.f, 1.f) == std::pair{true, true});    // the whole range: no copy needed
+}
+
+TEST_CASE("metal e2e: points take NV4097_SET_POINT_SIZE unless the program's size is on; sprites replace coordinates (D-262)")
+{
+    REQUIRE_METAL();
+    // One point at the centre (32, 32): o[1] = c[0] (red); with `program_size` also o[6] = c[1] (x 16). `fp_tex0`:
+    // R0 = TEX0 instead of COL0. Pixels (a, r, g, b) at `at` after the draw.
+    const auto draw = [](bool program_size, u32 output_mask, u32 sprite_control, bool fp_tex0, std::vector<std::pair<u32, u32>> at) {
+        E2E e;
+        const auto vp_mov = [](u32 out, VpSrc src, u32 constant = 0) {
+            VpInst in;
+            in.vec_op = 1;
+            in.src[0] = src;
+            in.constant = constant;
+            in.out = out;
+            in.vec_mask = 0xf;
+            return in;
+        };
+        FpInst mov;
+        mov.op = 0x01;
+        mov.dst = 0;
+        mov.input = fp_tex0 ? 4 : 1;
+        mov.src[0] = fp_in();
+        mov.end = true;
+        e.put_local_bytes(kFpOffset, assemble_fp({mov}));
+        e.put_local_f(kVertexOffset + 0, 0.f);
+        e.put_local_f(kVertexOffset + 4, 0.f);
+        e.put_local_f(kVertexOffset + 8, 0.5f);
+        e.put_local_f(kVertexOffset + 12, 1.f);
+        std::vector<VpInst> prog = {vp_mov(0, vp_in()), vp_mov(1, vp_const(), 0)};
+        if (program_size) prog.push_back(vp_mov(6, vp_const(), 1));
+        prog.back().end = true;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp(prog));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, output_mask);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT,
+            {f2u(1.f), f2u(0.f), f2u(0.f), f2u(1.f), f2u(16.f), f2u(0.f), f2u(0.f), f2u(0.f)});
+        b.method(m::NV4097_SET_POINT_SIZE, f2u(8.f));
+        b.method(m::NV4097_SET_POINT_SPRITE_CONTROL, sprite_control);
+        set_fragment_program(b, kFpOffset, 0x40);
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0, static_cast<u32>(VertexType::F) | (4u << 4) | (16u << 8));
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0, kVertexOffset);
+        b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Points));
+        b.method(m::NV4097_DRAW_ARRAYS, 0);
+        b.method(m::NV4097_SET_BEGIN_END, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        std::vector<std::array<u8, 4>> out;
+        for (auto [x, y] : at) out.push_back(guest_pixel(e, kSurfaceOffset, x, y));
+        return out;
+    };
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, none{0, 0, 0, 0};
+    constexpr u32 kAll = 0x3fffff, kPointSize = 1u << 5;
+    // The register's 8: x and y 28 to 35.
+    auto px = draw(false, kAll, 0, false, {{28, 28}, {35, 35}, {37, 37}, {27, 32}});
+    CHECK(px == std::vector{red, red, none, none});
+    // The program writes 16 and the output mask has its size: 24 to 39.
+    px = draw(true, kAll, 0, false, {{24, 24}, {39, 39}, {40, 40}});
+    CHECK(px == std::vector{red, red, none});
+    // ... the mask without it: the register's 8 again.
+    px = draw(true, kAll & ~kPointSize, 0, false, {{28, 28}, {37, 37}});
+    CHECK(px == std::vector{red, none});
+    // A sprite: TEX0 is the place in the point, (x, y, 1, 0): red and green rise to the right and down, blue 1, alpha 0.
+    px = draw(false, kAll, 1u | (1u << 8), true, {{28, 28}, {35, 35}, {35, 28}});
+    const auto near = [](u8 got, double want) { return std::abs(got - want * 255.0) <= 2.0; };
+    CHECK(near(px[0][1], 0.5 / 8));
+    CHECK(near(px[0][2], 0.5 / 8));
+    CHECK(near(px[1][1], 7.5 / 8));
+    CHECK(near(px[1][2], 7.5 / 8));
+    CHECK(near(px[2][1], 7.5 / 8));
+    CHECK(near(px[2][2], 0.5 / 8));
+    CHECK(px[0][3] == 0xff);
+    CHECK(px[0][0] == 0);
+    // The sprite control off, or another coordinate in its mask: TEX0 is the vertex program's o[7], (0, 0, 0, 1) here.
+    const std::array<u8, 4> unwritten{0xff, 0x00, 0x00, 0x00};
+    px = draw(false, kAll, 1u << 8, true, {{35, 35}});
+    CHECK(px[0] == unwritten);
+    px = draw(false, kAll, 1u | (1u << 9), true, {{35, 35}});
+    CHECK(px[0] == unwritten);
+}
+
+TEST_CASE("metal e2e: polygon stipple keeps the pixels whose pattern bit is set (D-263)")
+{
+    REQUIRE_METAL();
+    // A checkerboard: even rows keep even x, odd rows odd x. Whether red was drawn at each pixel.
+    const auto draw = [](bool stipple, std::vector<std::pair<u32, u32>> at) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        std::vector<u32> pattern(32);
+        for (u32 y = 0; y < 32; y++) pattern[y] = y % 2 ? 0xaaaaaaaau : 0x55555555u;
+        b.method(m::NV4097_SET_POLYGON_STIPPLE_PATTERN, pattern);
+        b.method(m::NV4097_SET_POLYGON_STIPPLE, stipple ? 1u : 0u);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        std::vector<bool> out;
+        for (auto [x, y] : at) out.push_back(guest_pixel(e, kSurfaceOffset, x, y)[1] == 0xff);
+        return out;
+    };
+    const std::vector<std::pair<u32, u32>> at = {{32, 40}, {33, 40}, {32, 41}, {33, 41}};
+    CHECK(draw(false, at) == std::vector{true, true, true, true});
+    CHECK(draw(true, at) == std::vector{true, false, false, true});
+}
+
+TEST_CASE("metal e2e: the alpha test's reference is a half on a float16 target and a float on a float32 one (D-264)")
+{
+    REQUIRE_METAL();
+    // The triangle's alpha is 0x99 / 255 (0.6); the test passes greater than the reference. Whether red was drawn.
+    const auto draw = [](SurfaceColorFormat format, u32 bpp, u32 ref) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff000099, 0xff000099, 0xff000099});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(format) | (2u << 5) | (1u << 8));
+        b.method(m::NV4097_SET_SURFACE_PITCH_A, kW * bpp);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_ALPHA_TEST_ENABLE, 1);
+        b.method(m::NV4097_SET_ALPHA_FUNC, static_cast<u32>(CompareFunc::Greater));
+        b.method(m::NV4097_SET_ALPHA_REF, ref);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * bpp));
+        const u8* p = e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + (40 * kW + 32) * bpp);
+        return bpp == 8 ? ps_ld16(p) != 0 : bpp == 16 ? ps_ld32(p) != 0 : p[1] != 0; // red
+    };
+    CHECK(draw(SurfaceColorFormat::F_W16Z16Y16X16, 8, 0x3800));      // 0.5: passes
+    CHECK_FALSE(draw(SurfaceColorFormat::F_W16Z16Y16X16, 8, 0x3a00)); // 0.75: fails (its low byte, 0, would pass)
+    CHECK(draw(SurfaceColorFormat::F_W32Z32Y32X32, 16, f2u(0.5f)));
+    CHECK_FALSE(draw(SurfaceColorFormat::F_W32Z32Y32X32, 16, f2u(0.75f)));
+    CHECK(draw(SurfaceColorFormat::A8R8G8B8, 4, 0x80));        // 128 / 255: passes
+    CHECK_FALSE(draw(SurfaceColorFormat::A8R8G8B8, 4, 0xa0)); // 160 / 255: fails
+}
+
+TEST_CASE("metal e2e: NV4097_SET_WINDOW_OFFSET moves where the target starts in memory (D-265)")
+{
+    REQUIRE_METAL();
+    E2E e;
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // the whole 64x64 at the surface's offset
+    b.method(m::NV4097_SET_WINDOW_OFFSET, (4u << 16) | 8u); // x 8, y 4
+    b.method(m::NV4097_SET_SURFACE_CLIP_HORIZONTAL, {16u << 16, 16u << 16});
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {16u << 16, 16u << 16});
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00); // green
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    const std::array<u8, 4> green{0xff, 0x00, 0xff, 0x00}, none{0, 0, 0, 0};
+    CHECK(guest_pixel(e, kSurfaceOffset, 8, 4) == green);   // the window's first pixel
+    CHECK(guest_pixel(e, kSurfaceOffset, 23, 19) == green); // its last
+    CHECK(guest_pixel(e, kSurfaceOffset, 7, 4) == none);
+    CHECK(guest_pixel(e, kSurfaceOffset, 8, 3) == none);
+    CHECK(guest_pixel(e, kSurfaceOffset, 24, 19) == none);
+    CHECK(guest_pixel(e, kSurfaceOffset, 23, 20) == none);
+}
+
+TEST_CASE("metal e2e: a fragment program's exported depth is clamped to [0, 1], in a float depth buffer too (D-266)")
+{
+    REQUIRE_METAL();
+    // As the RSX does (RPCS3 VKFragmentProgram.cpp, from tests on the hardware); Metal clamps it to the viewport's range.
+    // Z24S8 (a float depth buffer here). Pass 1 exports `first` in green; pass 2 exports `second` in red, tested with
+    // `func` against what pass 1 stored. Whether the centre ends red.
+    const auto draw = [](float first, float second, CompareFunc func) {
+        E2E e;
+        const auto program = [](std::array<float, 4> colour, float z) {
+            FpInst c;
+            c.op = 0x01;
+            c.dst = 0;
+            c.src[0] = fp_const();
+            c.constant = colour;
+            FpInst d = c;
+            d.dst = 1;
+            d.constant = std::array<float, 4>{0.f, 0.f, z, 0.f};
+            d.end = true;
+            return assemble_fp({c, d});
+        };
+        e.put_local_bytes(kFpOffset, program({0.f, 1.f, 0.f, 1.f}, first));
+        e.put_local_bytes(kFp2Offset, program({1.f, 0.f, 0.f, 1.f}, second));
+        write_triangle(e, {0, 0, 0});
+        constexpr u32 kDepth = 0x180000;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kDepth);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 4);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xffffff00u);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepth);
+        upload_vertex_program(b);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 1);
+        b.method(m::NV4097_SET_DEPTH_MASK, 1);
+        b.method(m::NV4097_SET_DEPTH_FUNC, static_cast<u32>(CompareFunc::Always));
+        set_fragment_program(b, kFpOffset, 0x4e); // 32-bit exports and depth export
+        draw_triangle(b);
+        b.method(m::NV4097_SET_DEPTH_FUNC, static_cast<u32>(func));
+        set_fragment_program(b, kFp2Offset, 0x4e);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 40)[1] == 0xff;
+    };
+    CHECK_FALSE(draw(1.5f, 1.f, CompareFunc::Less));   // 1.5 stored as 1: 1 is not less
+    CHECK_FALSE(draw(-0.5f, 0.f, CompareFunc::Greater)); // -0.5 stored as 0: 0 is not greater
+    CHECK(draw(0.75f, 0.5f, CompareFunc::Less));          // inside the range, as it is
+}
+
+TEST_CASE("metal e2e: an output the vertex output mask leaves out reaches the fragment program as (0, 0, 0, 1) (D-267)")
+{
+    REQUIRE_METAL();
+    // o[1] = c[0] (red), o[7] = c[1] (green); the fragment program moves COL0 (input 1) or TEX0 (input 4) to R0.
+    const auto draw = [](u32 output_mask, u32 fp_input) {
+        E2E e;
+        const auto vp_mov = [](u32 out, VpSrc src, u32 constant = 0) {
+            VpInst in;
+            in.vec_op = 1;
+            in.src[0] = src;
+            in.constant = constant;
+            in.out = out;
+            in.vec_mask = 0xf;
+            return in;
+        };
+        FpInst mov;
+        mov.op = 0x01;
+        mov.dst = 0;
+        mov.input = fp_input;
+        mov.src[0] = fp_in();
+        mov.end = true;
+        e.put_local_bytes(kFpOffset, assemble_fp({mov}));
+        write_triangle(e, {0, 0, 0});
+        VpInst last = vp_mov(7, vp_const(), 1);
+        last.end = true;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({vp_mov(0, vp_in()), vp_mov(1, vp_const(), 0), last}));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, output_mask);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT,
+            {f2u(1.f), f2u(0.f), f2u(0.f), f2u(1.f), f2u(0.f), f2u(1.f), f2u(0.f), f2u(1.f)});
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 40);
+    };
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00}, unset{0xff, 0x00, 0x00, 0x00};
+    constexpr u32 kAll = 0x3fffff, kFrontDiffuse = 1u << 0, kBackDiffuse = 1u << 2, kTex0 = 1u << 14;
+    CHECK(draw(kAll, 1) == red);
+    CHECK(draw(kAll & ~kFrontDiffuse, 1) == red);                  // either side's bit sends the colour
+    CHECK(draw(kAll & ~(kFrontDiffuse | kBackDiffuse), 1) == unset); // neither: (0, 0, 0, 1)
+    CHECK(draw(kAll, 4) == green);
+    CHECK(draw(kAll & ~kTex0, 4) == unset);
+    CHECK(draw(kTex0, 4) == green); // only what is read needs its bit
+}
+
 TEST_CASE("metal e2e: an indexed strip restarts at the restart index, which is no vertex (D-249)")
 {
     REQUIRE_METAL();
