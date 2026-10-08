@@ -112,6 +112,8 @@ static float4 rsx_fetch(constant rsx_attrib& a, uint vertex_index, device const 
 static uint rsx_vertex_index(uint vid, constant rsx_vs_params& p, device const uchar* ib)
 {
     switch (p.index_mode) {
+    case 4u: return ((((vid & 0xffu) << 8) | ((vid >> 8) & 0xffu)) + p.base_index) & 0xfffffu; // Metal read it (D-271)
+    case 5u: return (as_type<uint>(as_type<uchar4>(vid).wzyx) + p.base_index) & 0xfffffu;
     case 1u: return (rsx_ld16(ib, p.index_offset + vid * 2u, true) + p.base_index) & 0xfffffu;
     case 2u: return (rsx_ld32(ib, p.index_offset + vid * 4u, true) + p.base_index) & 0xfffffu;
     case 3u: return (rsx_ld32(ib, p.index_offset + vid * 4u, false) + p.base_index) & 0xfffffu;
@@ -274,6 +276,47 @@ std::string vp_branch_condition(const VpInstruction& in)
 }
 
 } // namespace
+
+u64 translation_fingerprint()
+{
+    static const u64 fingerprint = [] {
+        u64 h = 0xcbf29ce484222325ull ^ kTranslationVersion;
+        const auto mix = [&](const std::string& text) {
+            for (unsigned char ch : text) h = (h ^ ch) * 0x100000001b3ull;
+        };
+        mix(msl_prologue());
+        // o0 = v0; o1 = c0; o7 = v8
+        static const u32 kVp[] = {0x401f9c6c, 0x0040000d, 0x8106c083, 0x6041ff80, 0x401f9c6c, 0x0040000d, 0x8186c083,
+            0x6041ff84, 0x401f9c6c, 0x0040080d, 0x8106c083, 0x6041ff9d};
+        if (const auto vp = decode_vertex_program(kVp, 3, 0)) {
+            mix(translate_vertex_program(*vp).shader.source);
+            VpOptions all;
+            all.point_size = true;
+            all.user_clip = 0x21;
+            all.masked_outputs = 1u << 7;
+            all.read_outputs = (1u << 1) | (1u << 7);
+            mix(translate_vertex_program(*vp, all).shader.source);
+        }
+        // R0 = TEX0(f[TEX0]); R0 = R0 * f[COL0]
+        static const u8 kFp[] = {0x9e, 0x00, 0x17, 0x00, 0xc8, 0x01, 0x1c, 0x9d, 0xc8, 0x00, 0x00, 0x01, 0xc8, 0x00, 0x00,
+            0x01, 0x3e, 0x01, 0x02, 0x00, 0xc8, 0x00, 0x1c, 0x9d, 0xc8, 0x01, 0x00, 0x01, 0xc8, 0x00, 0x00, 0x01};
+        if (const auto fp = decode_fragment_program(kFp, sizeof kFp)) {
+            mix(translate_fragment_program(*fp).shader.source);
+            FpOptions all;
+            all.shader_control = 0x4e;
+            all.mrt_count = 4;
+            all.texcoord_2d_mask = 1;
+            all.alpha_test = all.flat_colors = all.srgb_output = all.alpha_to_coverage = true;
+            all.two_sided_lighting = all.depth_bounds = all.polygon_stipple = true;
+            all.point_coord_mask = 1;
+            all.texture_convert_mask = all.texture_alpha_kill_mask = 1;
+            all.texture_kind[0] = TextureKind::Shadow2D;
+            mix(translate_fragment_program(*fp, all).shader.source);
+        }
+        return h;
+    }();
+    return fingerprint;
+}
 
 const std::string& msl_prologue()
 {

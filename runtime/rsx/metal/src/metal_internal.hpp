@@ -453,6 +453,14 @@ struct MetalBackend::Impl {
     // and passes every kGpuReportFlips flips: what a slower GPU (the iPhone's) has to fit in a frame.
     static constexpr u64 kGpuReportFlips = 300;
     std::shared_ptr<std::atomic<u64>> gpu_ns = std::make_shared<std::atomic<u64>>(0);
+    // PSPOCKET_GPU_AB=N (a measuring aid, D-272): a change under test, written to apply only where ab_on(), is on in
+    // every other run of N frames, and the GPU time of each half is summed apart, so both see the same scenes (each
+    // command buffer's span, which overlap: compare the halves, not with other runs). ab_frames counts each half's
+    // frames. Nothing calls ab_on() between experiments.
+    u32 ab_period = 0;
+    std::shared_ptr<std::array<std::atomic<u64>, 2>> ab_ns = std::make_shared<std::array<std::atomic<u64>, 2>>();
+    std::array<u64, 2> ab_frames{};
+    bool ab_on() const { return !ab_period || (stats.flips / ab_period) % 2 == 1; } // the change applies
     // Why render passes ended (a started pass only), for the same report: the pass loads and stores its targets. The
     // copies between targets are told apart (D-148): an NV0039 copy on the GPU, a target sampled while drawn to, a
     // corner of a larger target, pixels between a target and its parent, a target grown over a smaller one.
@@ -677,6 +685,7 @@ struct MetalBackend::Impl {
     id<MTLCounterSampleBuffer> pass_samples = nil; // the timed pass's four stage boundary timestamps
     u64 pass_draws_start = 0; // stats.draws when the pass started
     u64 pass_last_fp = 0;     // the hash of the last fragment program the pass drew with
+    u64 skip_fp = 0;          // PSPOCKET_SKIP_FP: draws with this fragment program are skipped (measuring what one costs)
     bool pass_times_submitting = false;
     void note_guest(Surface& s);
     void check_guest(const Surface& s, const TextureInfo& t, u32 unit);

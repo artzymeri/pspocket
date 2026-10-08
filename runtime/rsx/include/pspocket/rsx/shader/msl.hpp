@@ -28,8 +28,9 @@ namespace pspocket::rsx::shader {
 // (metal/src/shader_cache.mm) loads only the records of this version: a record of another one holds MSL of the old
 // translation under a key the new one also uses. 2: D-174. 4: D-256 to D-263 (FOGC's fog factor, two-sided
 // lighting, user clip planes, the depth bounds test, point sizes and sprites, polygon stipple); 3 was a step on the
-// way that never left the Mac. 5: D-269 (a vertex program puts out only what its fragment program reads).
-inline constexpr u32 kTranslationVersion = 5;
+// way that never left the Mac. 5: D-269 (a vertex program puts out only what its fragment program reads). 6: D-271
+// (indexed draws run by Metal over the game's indices; a cached vertex program of 5 reads such an index as a vertex).
+inline constexpr u32 kTranslationVersion = 6;
 
 // Argument table slots shared by the translator and the Metal backend.
 namespace slot {
@@ -51,6 +52,10 @@ inline constexpr u32 kIndexNone = 0;     // vertex = first_vertex + vertex_id
 inline constexpr u32 kIndexU16BE = 1;    // index buffer of big-endian u16
 inline constexpr u32 kIndexU32BE = 2;    // big-endian u32
 inline constexpr u32 kIndexU32Host = 3;  // host-order u32 (immediate ARRAY_ELEMENT indices)
+// An indexed draw Metal runs over the game's own big-endian indices (D-271): vertex_id is the index as Metal read it,
+// byte-reversed, so shared vertices are run once; the shader reverses it back.
+inline constexpr u32 kIndexDrawnU16BE = 4;
+inline constexpr u32 kIndexDrawnU32BE = 5;
 
 struct alignas(16) MslAttrib {
     u32 offset = 0;  // byte offset in the vertex data buffer of element `first`
@@ -181,5 +186,10 @@ void read_fragment_constants(const FragmentProgram& fp, const u8* program_data, 
 
 // The shared MSL prologue (types, varyings, vertex fetch). Exposed for tests and the backend's own kernels.
 const std::string& msl_prologue();
+
+// A fingerprint of the translation itself (D-272): the version, and the MSL made of two built-in programs with no
+// option and with every option. A change to what the translator writes changes it, so the shader cache drops records
+// of another translation even when kTranslationVersion was not raised.
+u64 translation_fingerprint();
 
 } // namespace pspocket::rsx::shader

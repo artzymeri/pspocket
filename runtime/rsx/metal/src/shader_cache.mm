@@ -36,9 +36,14 @@
 namespace pspocket::rsx::metal {
 namespace {
 
-// The first line of a program record: the record format and the translation's version. A record of another version is
-// skipped: its MSL is an older translation's, under a key the current one also makes (D-174).
-const std::string kMagic = std::format("pspocket-shader {}", shader::kTranslationVersion);
+// The first line of a program record: the record format, the translation's version and its fingerprint. A record of
+// another one is skipped: its MSL is another translation's, under a key the current one also makes (D-174, D-272).
+const std::string& magic()
+{
+    static const std::string m =
+        std::format("pspocket-shader {} {:016x}", shader::kTranslationVersion, shader::translation_fingerprint());
+    return m;
+}
 
 u64 fnv(std::string_view s, u64 h = 0xcbf29ce484222325ull)
 {
@@ -69,7 +74,7 @@ bool parse_program(const std::string& text, ShaderCache::Record& r)
 {
     std::istringstream in(text);
     std::string line;
-    if (!std::getline(in, line) || line != kMagic) return false;
+    if (!std::getline(in, line) || line != magic()) return false;
     while (std::getline(in, line)) {
         const usize sp = line.find(' ');
         const std::string field = line.substr(0, sp), value = sp == std::string::npos ? "" : line.substr(sp + 1);
@@ -395,7 +400,7 @@ void ShaderCache::record_program(const CompiledProgram& p)
         if (!recorded_programs_.insert(p.key).second) return;
     }
     std::string text = std::format("{}\nkey {}\nentry {}\ninput_mask {}\ntexture_mask {}\nconstant_count {}\nucode {}",
-        kMagic, p.key, p.shader.entry, p.shader.input_mask, p.shader.texture_mask, p.shader.constant_count, p.ucode.size());
+        magic(), p.key, p.shader.entry, p.shader.input_mask, p.shader.texture_mask, p.shader.constant_count, p.ucode.size());
     for (u32 w : p.ucode) text += std::format(" {:x}", w);
     text += std::format("\nsource {}\n", p.shader.source.size());
     text += p.shader.source;

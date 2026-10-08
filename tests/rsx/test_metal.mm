@@ -1809,6 +1809,124 @@ TEST_CASE("metal e2e: an indexed strip restarts at the restart index, which is n
     CHECK((through[1] || through[2]));
 }
 
+TEST_CASE("metal e2e: indexed draws run over the game's own indices, 16 and 32 bits, ranges and a base index (D-271)")
+{
+    REQUIRE_METAL();
+    // Vertices 0-2 the left triangle, 3-5 the right one. Indices (big-endian): 0 1 2 X 3 4 5, drawn as two ranges, the
+    // second starting at an odd index; then the right triangle again as 0 1 2 with a base index of 3.
+    for (const bool wide : {false, true}) {
+        INFO((wide ? "32-bit" : "16-bit"));
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        const float xy[6][2] = {{-1.f, -1.f}, {0.f, -1.f}, {-0.5f, 1.f}, {0.f, -1.f}, {1.f, -1.f}, {0.5f, 1.f}};
+        for (u32 v = 0; v < 6; v++) {
+            e.put_local_f(kVertexOffset + v * 16 + 0, xy[v][0]);
+            e.put_local_f(kVertexOffset + v * 16 + 4, xy[v][1]);
+            e.put_local_f(kVertexOffset + v * 16 + 8, 0.5f);
+            e.put_local_f(kVertexOffset + v * 16 + 12, 1.f);
+            e.put_local32(kColorOffset + v * 4, v < 3 ? 0xff0000ffu : 0x00ff00ffu); // left red, right green
+        }
+        constexpr u32 kIndexOffset = 0x013000;
+        std::vector<u8> be;
+        for (u32 i : {0u, 1u, 2u, 7u, 3u, 4u, 5u, 0u, 1u, 2u}) {
+            if (wide) be.insert(be.end(), {static_cast<u8>(i >> 24), static_cast<u8>(i >> 16), static_cast<u8>(i >> 8), static_cast<u8>(i)});
+            else be.insert(be.end(), {static_cast<u8>(i >> 8), static_cast<u8>(i)});
+        }
+        e.put_local_bytes(kIndexOffset, be);
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_INDEX_ARRAY_ADDRESS, {kIndexOffset, loc::kLocal | (wide ? 0u : 1u << 4)});
+        b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Triangles));
+        b.method(m::NV4097_DRAW_INDEX_ARRAY, (2u << 24) | 0);
+        b.method(m::NV4097_DRAW_INDEX_ARRAY, (2u << 24) | 4);
+        b.method(m::NV4097_SET_BEGIN_END, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        CHECK(e.backend->stats().ranges_indexed_by_metal == 2);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        CHECK(guest_pixel(e, kSurfaceOffset, 16, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
+        CHECK(guest_pixel(e, kSurfaceOffset, 48, 48) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});
+        // The right triangle alone, by indices 0 1 2 and a base index of 3, over a cleared target.
+        auto c = e.at(b.offset());
+        c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        c.method(m::NV4097_SET_VERTEX_DATA_BASE_INDEX, 3);
+        c.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Triangles));
+        c.method(m::NV4097_DRAW_INDEX_ARRAY, (2u << 24) | 7);
+        c.method(m::NV4097_SET_BEGIN_END, 0);
+        REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().ranges_indexed_by_metal == 3);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        CHECK(guest_pixel(e, kSurfaceOffset, 16, 48) == std::array<u8, 4>{0, 0, 0, 0});
+        CHECK(guest_pixel(e, kSurfaceOffset, 48, 48) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});
+    }
+}
+
+TEST_CASE("metal e2e: a mesh of 400 vertices draws the same through 16-bit and 32-bit indices (D-271)")
+{
+    REQUIRE_METAL();
+    // A 20x20 grid of vertices over the target, coloured by their index, as a triangle list (two per cell), the
+    // vertices far apart in the index buffer as in a real mesh.
+    const auto draw = [](bool wide) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        for (u32 v = 0; v < 400; v++) {
+            const float x = -1.f + 2.f * static_cast<float>(v % 20) / 19.f, y = -1.f + 2.f * static_cast<float>(v / 20) / 19.f;
+            e.put_local_f(kVertexOffset + v * 16 + 0, x);
+            e.put_local_f(kVertexOffset + v * 16 + 4, y);
+            e.put_local_f(kVertexOffset + v * 16 + 8, 0.5f);
+            e.put_local_f(kVertexOffset + v * 16 + 12, 1.f);
+            e.put_local32(kColorOffset + v * 4, ((v * 37) & 0xff) << 24 | ((v * 91) & 0xff) << 16 | (v & 0xff) << 8 | 0xff);
+        }
+        constexpr u32 kIndexOffset = 0x015000;
+        std::vector<u8> be;
+        u32 count = 0;
+        for (u32 cy = 0; cy < 19; cy++)
+            for (u32 cx = 0; cx < 19; cx++) {
+                const u32 a = cy * 20 + cx;
+                for (u32 i : {a, a + 1, a + 20, a + 1, a + 21, a + 20}) {
+                    if (wide) be.insert(be.end(), {static_cast<u8>(i >> 24), static_cast<u8>(i >> 16), static_cast<u8>(i >> 8), static_cast<u8>(i)});
+                    else be.insert(be.end(), {static_cast<u8>(i >> 8), static_cast<u8>(i)});
+                    count++;
+                }
+            }
+        e.put_local_bytes(kIndexOffset, be);
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 8, 0); // no texture coordinates here
+        b.method(m::NV4097_SET_INDEX_ARRAY_ADDRESS, {kIndexOffset, loc::kLocal | (wide ? 0u : 1u << 4)});
+        b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Triangles));
+        for (u32 first = 0; first < count; first += 256)
+            b.method(m::NV4097_DRAW_INDEX_ARRAY, ((std::min(256u, count - first) - 1) << 24) | first);
+        b.method(m::NV4097_SET_BEGIN_END, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().ranges_indexed_by_metal >= 1);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        std::vector<u8> pixels(kW * kH * 4);
+        std::memcpy(pixels.data(), e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset), pixels.size());
+        return pixels;
+    };
+    const auto narrow = draw(false), wide = draw(true);
+    usize differ = 0;
+    for (usize i = 0; i < narrow.size(); i++) differ += narrow[i] != wide[i];
+    CHECK(differ == 0);
+    usize lit = 0;
+    for (usize i = 0; i < wide.size(); i += 4) lit += wide[i] != 0;
+    CHECK(lit > kW * kH / 2); // the grid covers the target
+}
+
 TEST_CASE("metal e2e: textured draw with a swizzled texture and a channel remap")
 {
     REQUIRE_METAL();

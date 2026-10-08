@@ -173,6 +173,7 @@ struct BackendStats {
     u64 occlusion_reports = 0; // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) answered from the GPU's counters (D-102)
     u64 feedback_copies = 0;   // copies of a target a draw samples while drawing to it, made once per write (D-148)
     u64 depth_bounds_draws = 0; // draws with the depth bounds test, which read a copy of the depth buffer (D-261)
+    u64 ranges_indexed_by_metal = 0; // indexed ranges Metal ran over the game's own indices (D-271)
     u64 corner_textures = 0;   // corner textures allocated (D-120); later corners of the same size reuse them (D-148)
     u64 gpu_wait_ns = 0;       // the RSX thread's wait at flips for the GPU to finish an older frame (D-148)
     u64 budget_submits = 0;    // command buffers submitted early, past MetalBackendConfig::transient_budget (D-148)

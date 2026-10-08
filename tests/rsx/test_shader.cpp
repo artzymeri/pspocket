@@ -937,3 +937,11 @@ TEST_CASE("fragment program opcode names cover the ISA")
     CHECK(std::string(vp_vec_op_name(0x19)) == "TXL");
     CHECK(std::string(vp_sca_op_name(0x14)) == "POP");
 }
+
+TEST_CASE("the translation's fingerprint is stable and covers what the translator writes (D-272)")
+{
+    const u64 a = translation_fingerprint(), b = translation_fingerprint();
+    CHECK(a == b);
+    CHECK(a != 0);
+    CHECK(a != (0xcbf29ce484222325ull ^ kTranslationVersion)); // the programs and the prologue went into it
+}

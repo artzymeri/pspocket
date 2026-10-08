@@ -212,6 +212,8 @@ bool MetalBackend::Impl::init()
         outputs.push_back(t);
     }
     check_surfaces = std::getenv("PSPOCKET_RSX_CHECK_SURFACES") != nullptr;
+    if (const char* f = std::getenv("PSPOCKET_SKIP_FP")) skip_fp = std::strtoull(f, nullptr, 16); // a measuring aid
+    if (const char* f = std::getenv("PSPOCKET_GPU_AB")) ab_period = static_cast<u32>(std::max(1, std::atoi(f)));
     if (std::getenv("PSPOCKET_GPU_PASS_TIMES")) {
         pass_times = std::make_shared<PassTimes>();
         if ([device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
@@ -317,9 +319,12 @@ void MetalBackend::Impl::submit(bool wait)
         last = render_cb;
         transient.retire(render_cb);
         auto gpu = gpu_ns;
+        auto ab = ab_period ? ab_ns : nullptr;
+        const usize half = ab_on() ? 1 : 0;
         [render_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             const double s = cb.GPUEndTime - cb.GPUStartTime;
             if (s > 0) gpu->fetch_add(static_cast<u64>(s * 1e9), std::memory_order_relaxed);
+            if (ab && s > 0) (*ab)[half].fetch_add(static_cast<u64>(s * 1e9), std::memory_order_relaxed);
         }];
         [render_cb commit];
         render_cb = nil;
@@ -565,9 +570,15 @@ void MetalBackend::Impl::end_pass()
     if (timed) {
         // The pass alone in a command buffer, timed (PSPOCKET_GPU_PASS_TIMES).
         auto times = pass_times;
-        const u32 place = pass_place++;
+        const u32 place = pass_place++ + (ab_period && ab_on() ? 1000u : 0u); // with PSPOCKET_GPU_AB: 1000 + place when on
         const u64 draws = stats.draws - pass_draws_start;
         std::string targets = describe_targets(pass) + std::format("; last fp {:016x}", pass_last_fp);
+        for (u32 i = 0; i < pass.color_count; i++) {
+            id<MTLTexture> t = pass.color[i]->texture;
+            targets += std::format("; texture {}x{} x{} parent {}", t.width, t.height, t.sampleCount,
+                t.parentTexture ? std::format("{}x{}", t.parentTexture.width, t.parentTexture.height) : "none");
+        }
+        targets += std::format("; area {}x{}", pass_width, pass_height);
         id<MTLCounterSampleBuffer> samples = pass_samples;
         pass_samples = nil;
         [render_buffer() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
@@ -1023,6 +1034,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         return skip("");
     }
     if (pass_times && fprog) pass_last_fp = fprog->hash;
+    if (skip_fp && fprog && fprog->hash == skip_fp) return skip("PSPOCKET_SKIP_FP");
     // The vertex program after the fragment program: an output the output mask leaves out matters only when the
     // fragment program reads it (D-267).
     const CompiledProgram* vp = vertex_program_for(state, points, fp->shader.input_mask, fo.two_sided_lighting);
@@ -1149,14 +1161,16 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         const ColorMaskInfo cm = state.color_mask();
         u32 vertices = 0;
         for (const DrawRange& r : d.ranges) vertices += r.count;
+        vertices += static_cast<u32>(d.array_elements.size()) + d.immediate_vertex_count;
         std::string blend = "off";
         if (b.enable || b.enable_mrt) {
             blend = std::format("eq {:#x}/{:#x} src {:#x}/{:#x} dst {:#x}/{:#x} mrt {:#x}", b.equation_rgb, b.equation_a,
                 b.sfactor_rgb, b.sfactor_a, b.dfactor_rgb, b.dfactor_a, b.enable_mrt);
         }
-        PS_LOG_INFO("rsx.trace", "#{} draw prim {} x{} ->{}; fp {:#010x}; mask {:x}{:x}{:x}{:x}; blend {};{}", ++trace_count,
-            static_cast<u32>(d.primitive), vertices, describe_targets(targets), fp_ea, cm.mask[0], cm.mask[1], cm.mask[2],
-            cm.mask[3], blend, trace_tex);
+        PS_LOG_INFO("rsx.trace", "#{} draw prim {} x{}{} ->{}; fp {:#010x}; mask {:x}{:x}{:x}{:x}; blend {};{}", ++trace_count,
+            static_cast<u32>(d.primitive), vertices,
+            d.inline_words.empty() ? std::string() : std::format(" (inline array, {} words)", d.inline_words.size()),
+            describe_targets(targets), fp_ea, cm.mask[0], cm.mask[1], cm.mask[2], cm.mask[3], blend, trace_tex);
     }
 
     // ---- vertex parameters: viewport transform into Metal NDC for this surface
@@ -1192,6 +1206,12 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     std::vector<Range> ranges;
     std::vector<u32> index_offsets; // per range, for pulled indices
     std::vector<std::vector<u32>> restarts; // per indexed range: where its restart indices are (D-249)
+    struct DrawnIndices {
+        bool ok;     // Metal can run the range over its indices as they are (D-271)
+        u32 offset;  // of its first index in index_data's buffer
+        u32 size;    // 2 or 4
+    };
+    std::vector<DrawnIndices> drawn_indices; // per indexed range
     TransientAllocator::Allocation vertex_data{}, index_data{};
     u32 min_vi = ~0u, max_vi = 0;
     const u32 inputs = vp->shader.input_mask & state.vertex_attrib_input_mask();
@@ -1219,7 +1239,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         const bool restart_on = raster.restart_index_enable && (isize == 4 || raster.restart_index <= 0xffff);
         vs.index_mode = ia.u16_indices ? shader::kIndexU16BE : shader::kIndexU32BE;
         u32 total = 0;
-        for (const DrawRange& r : d.ranges) total += r.count * isize;
+        for (const DrawRange& r : d.ranges) total += (r.count * isize + 3) & ~3u; // each range 4-byte aligned (D-271)
         index_data = transient.alloc(total, 16);
         u32 at = 0;
         for (const DrawRange& r : d.ranges) {
@@ -1230,8 +1250,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             u8* dst = index_data.data + at;
             std::memcpy(dst, mem.host(*ea), bytes);
             std::vector<u32> at_restart;
+            const u32 all_ones = isize == 2 ? 0xffffu : 0xffffffffu;
+            bool has_all_ones = false;
             for (u32 i = 0; i < r.count; i++) {
                 const u32 raw = isize == 2 ? ps_ld16(dst + i * 2) : ps_ld32(dst + i * 4);
+                has_all_ones |= raw == all_ones;
                 if (restart_on && raw == raster.restart_index) {
                     at_restart.push_back(i); // not a vertex: it must not widen the vertex range
                     continue;
@@ -1240,10 +1263,12 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                 min_vi = std::min(min_vi, vi);
                 max_vi = std::max(max_vi, vi);
             }
+            // Metal runs it over these very bytes (D-271), unless an index of all ones would restart a strip there.
+            drawn_indices.push_back({at_restart.empty() && !has_all_ones, index_data.offset + at, isize});
             restarts.push_back(std::move(at_restart));
             ranges.push_back({r.first, r.count});
             index_offsets.push_back(index_data.offset + at - r.first * isize); // wraps; so does the shader
-            at += bytes;
+            at += (bytes + 3) & ~3u;
         }
         break;
     }
@@ -1493,10 +1518,22 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 
     MTLPrimitiveType ptype = MTLPrimitiveTypeTriangle;
     const bool native = native_primitive(d.primitive, ptype);
+    const u32 pulled_mode = vs.index_mode;
     for (usize r = 0; r < ranges.size(); r++) {
         if (r < index_offsets.size()) vs.index_offset = index_offsets[r];
-        [enc setVertexBytes:&vs length:sizeof(vs) atIndex:shader::slot::kVsParams];
         const Range rg = ranges[r];
+        // An indexed range Metal runs over the game's indices: each vertex they share runs once (D-271).
+        const bool drawn = native && r < drawn_indices.size() && drawn_indices[r].ok;
+        vs.index_mode = !drawn ? pulled_mode
+                      : drawn_indices[r].size == 2 ? shader::kIndexDrawnU16BE : shader::kIndexDrawnU32BE;
+        [enc setVertexBytes:&vs length:sizeof(vs) atIndex:shader::slot::kVsParams];
+        if (drawn) {
+            stats.ranges_indexed_by_metal++;
+            [enc drawIndexedPrimitives:ptype indexCount:rg.count
+                             indexType:drawn_indices[r].size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                           indexBuffer:index_data.buffer indexBufferOffset:drawn_indices[r].offset];
+            continue;
+        }
         const bool restart = r < restarts.size() && !restarts[r].empty();
         if (native && !restart) {
             [enc drawPrimitives:ptype vertexStart:rg.first vertexCount:rg.count];
@@ -1540,6 +1577,16 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     if (pass_times) {
         pass_place = 0;
         if (stats.flips % 300 == 0) log_pass_times();
+    }
+    if (ab_period) {
+        ab_frames[ab_on() ? 1 : 0]++; // the frame that ends here (D-272)
+        if (stats.flips % (ab_period * 20) == 0) {
+            const double off = static_cast<double>((*ab_ns)[0].exchange(0)), on = static_cast<double>((*ab_ns)[1].exchange(0));
+            PS_LOG_INFO(kChan, "GPU A/B (PSPOCKET_GPU_AB): change off {:.3f} ms a frame ({} frames), on {:.3f} ms ({} frames)",
+                ab_frames[0] ? off / 1e6 / static_cast<double>(ab_frames[0]) : 0.0, ab_frames[0],
+                ab_frames[1] ? on / 1e6 / static_cast<double>(ab_frames[1]) : 0.0, ab_frames[1]);
+            ab_frames = {};
+        }
     }
     compile_wait_left_ns = static_cast<s64>(config.compile_wait_ms * 1e6); // each frame's budget (D-158)
     if (stats.flips % std::clamp<u64>(config.evict_after_flips / 2, 1, 150) == 0) evict_unused(config.evict_after_flips); // D-116
