@@ -5409,6 +5409,16 @@ the hosts.
 - Measured (GTA V's 512 units, the build's flags, ten at a time on the M4, old and new alternating): 165.3 and 162.9 s
   to 154.6 and 150.9 s (-7%), CPU 1,423 and 1,377 s to 1,331 and 1,297 s (-6%). Preparing a game on the phone compiles
   these units too: the PPU part of it 6-7% shorter.
+## D-252 · 2026-10-08 · Input: a game controller when one is connected, the on-screen controls otherwise
+
+The open decision "controller required, or a polished touch overlay as well" (plan section 14), settled as both. A
+controller paired with the iPhone (DualShock 4, DualSense, Xbox, MFi) drives the pad through GameController whenever
+one is connected (GameModel.controllerMoved); without one, the on-screen controls laid over the game (GameView
+TouchPad, since 7ac7e8c) are the pad: the D-pad, the four face buttons, L1/R1/L2/R2, Start, Select, L3/R3 and two
+analog sticks that follow the thumb and recentre, each button held while touched, several at once. Connecting a
+controller hides them, disconnecting shows them again. What a polished overlay still needs (improve.md, The iOS app):
+a thumb sliding from one button to the next presses the next (today each button follows only the touch that began on
+it), a light haptic tap on press, an adjustable opacity, and L2/R2 as analog triggers.
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
@@ -5417,5 +5427,5 @@ the hosts.
 - [x] SPURS → D-037: native (HLE module + host scheduler). libsre from the user's firmware is a reference only, for job
   chains and queues.
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
-- [ ] Input: controller required, or a polished touch overlay as well.
+- [x] Input → D-252: a controller when one is connected, the on-screen controls otherwise.
 - [x] ISO handling → D-043 (read directly from the ISO).

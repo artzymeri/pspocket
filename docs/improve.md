@@ -226,6 +226,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Try:** catch it in the log and fix it.
 - **State:** open.
 
+- **On-screen controls (D-252):** they work (multi-touch buttons, two sticks, hidden while a controller is connected).
+  **Try:** a thumb sliding from one button to the next presses the next (one view hit-testing every touch instead of
+  a gesture per button), a light haptic tap on press, an opacity setting, L2/R2 as analog triggers.
+
 ## Other games
 
 - **Seen:** L.A. Noire (BLES00933), prepared on the phone (2026-10-06), stopped before its first frame on

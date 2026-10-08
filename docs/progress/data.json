@@ -317,8 +317,8 @@
         },
         {
           "name": "On-screen touch controls",
-          "state": "todo",
-          "ref": "decisions.md open decisions"
+          "state": "done",
+          "ref": "D-252 (polish: improve.md)"
         }
       ]
     },
