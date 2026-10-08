@@ -696,6 +696,53 @@ TEST_CASE("reservation: plain stores mixed with conditional stores lose nothing"
     CHECK(putllc_done > 0);
 }
 
+TEST_CASE("reservation: a waiter that read the version races DMA writes and is always woken (D-243)", "[reservation][stress]")
+{
+    // notify_write bumps only the slots someone reads a version of: a waiter that reads the version, then the line,
+    // then waits, must never sleep through a write made around its read (the Dekker pairing of the watch bits).
+    Arena a;
+    u8* base = a.base();
+    std::atomic<bool> stop{false};
+    std::atomic<u64> waits{0}, slept_through{0};
+    std::atomic<u32> generation{0};
+    std::vector<std::thread> pool;
+    for (u32 t = 0; t < 4; t++) {
+        pool.emplace_back([&, t] {
+            const u32 line = kArena + 0xC000 + t * 0x1000; // a fresh line each: its first reads race the writer's first
+            alignas(16) u8 snap[PS_RES_LINE_SIZE];
+            u32 seen = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                const u64 v = ps_res_acquire(base, line, snap); // the version, then the bytes
+                const u32 now = ps_ld32(snap);
+                if (now != seen) { // it changed: done with this one
+                    seen = now;
+                    continue;
+                }
+                // Nothing new in the bytes read after the version: a write after them must change the version.
+                waits++;
+                if (!ps_res_wait_change(line, v, 200'000'000) && ps_read32(base, line) != seen) slept_through++;
+            }
+        });
+    }
+    std::thread writer([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            const u32 g = generation.fetch_add(1) + 1;
+            for (u32 t = 0; t < 4; t++) {
+                const u32 line = kArena + 0xC000 + t * 0x1000;
+                __atomic_store_n(reinterpret_cast<u32*>(base + line), ps_bswap32(g), __ATOMIC_RELAXED); // a DMA PUT
+                ps_res_notify_write(line, 4);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::duration<double>(stress_seconds()));
+    stop = true;
+    writer.join();
+    for (auto& t : pool) t.join();
+    CHECK(waits.load() > 0);
+    CHECK(slept_through.load() == 0); // a wait that timed out though the line had changed
+}
+
 TEST_CASE("reservation: wait_change wakes on stores and notify_write, and times out", "[reservation]")
 {
     Arena a;

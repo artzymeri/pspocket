@@ -30,6 +30,7 @@
 // the volatile accessors of be.h on ARM64 and keep ThreadSanitizer quiet about the seqlock data reads.
 
 #include "pspocket/core/reservation.h"
+#include "pspocket/core/timebase.h"
 
 #include <atomic>
 #include <chrono>
@@ -62,6 +63,25 @@ struct Bucket {
 
 Slot g_slots[kSlots];
 Bucket g_buckets[kBuckets];
+
+// The slots someone reads a version of (a reservation, a wait, ps_res_version), a bit each (D-243): a write
+// notification bumps only those. ps_res_notify_write runs for every SPU PUT, and each slot is its own host cache line:
+// a 16 KB PUT touched 128 of them, 2.5% of GTA V's busy SPU time (run 221), nearly all for lines nobody reserves.
+// Dekker pairing: the reader sets the bit, then a seq_cst fence, then reads the version and the bytes; the writer
+// writes the bytes, then a seq_cst fence, then reads the bit. Either the reader's reads come after the writer's fence
+// (it sees the new bytes: no bump needed) or the writer's read comes after the reader's fence (it sees the bit, and
+// bumps). A bit once set stays.
+std::atomic<u64> g_watched[kSlots / 64];
+
+inline void watch(u32 index)
+{
+    std::atomic<u64>& word = g_watched[index / 64];
+    const u64 bit = 1ull << (index % 64);
+    if (!(word.load(std::memory_order_relaxed) & bit)) word.fetch_or(bit, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+inline bool watched(u32 index) { return g_watched[index / 64].load(std::memory_order_relaxed) & (1ull << (index % 64)); }
 
 static_assert(sizeof(Slot) == 128);
 
@@ -182,6 +202,7 @@ inline void unlock_unchanged(Slot& slot) { slot.version.fetch_sub(1, std::memory
 
 extern "C" uint64_t ps_res_acquire(uint8_t* base, uint32_t addr, void* out128)
 {
+    watch(slot_index(addr));
     Slot& slot = slot_of(addr);
     const u64* line = line_words(base, addr);
     u32 spins = 0;
@@ -207,6 +228,7 @@ extern "C" uint64_t ps_res_acquire(uint8_t* base, uint32_t addr, void* out128)
 
 extern "C" uint64_t ps_res_version(uint32_t addr)
 {
+    watch(slot_index(addr));
     return slot_of(addr).version.load(std::memory_order_acquire) & ~u64{1};
 }
 
@@ -284,12 +306,14 @@ extern "C" bool ps_res_store_conditional(uint8_t* base, uint32_t addr, uint32_t 
 extern "C" bool ps_res_wait_change(uint32_t addr, uint64_t version, uint64_t timeout_ns)
 {
     const u32 index = slot_index(addr);
+    watch(index); // the version waited on came from ps_res_version or ps_res_acquire, which watch it already
     Slot& slot = g_slots[index];
     Bucket& bucket = bucket_of(index);
     // Clamp so the deadline can't overflow the clock's signed representation (~31 years is "forever").
     constexpr u64 kMaxTimeoutNs = 1'000'000'000'000'000'000ull;
     if (timeout_ns > kMaxTimeoutNs) timeout_ns = kMaxTimeoutNs;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(static_cast<s64>(timeout_ns));
+    // The host clock of one multiply while spinning (D-241); steady_clock's deadline only for a wait that blocks.
+    const u64 deadline_ns = ps_host_now_ns() + timeout_ns;
 
     u32 spins = 0;
     for (;;) {
@@ -297,7 +321,7 @@ extern "C" bool ps_res_wait_change(uint32_t addr, uint64_t version, uint64_t tim
         if (cur & 1) {
             // A store holds the line and finishes within a few hundred nanoseconds: its result decides.
             backoff(spins);
-            if (timeout_ns && std::chrono::steady_clock::now() >= deadline) return false;
+            if (timeout_ns && ps_host_now_ns() >= deadline_ns) return false;
             continue;
         }
         if (cur != version) return true;
@@ -305,6 +329,9 @@ extern "C" bool ps_res_wait_change(uint32_t addr, uint64_t version, uint64_t tim
         slot.waiters.fetch_add(1, std::memory_order_seq_cst);
         bool timed_out = false;
         {
+            const u64 now_ns = ps_host_now_ns();
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::nanoseconds(static_cast<s64>(deadline_ns > now_ns ? deadline_ns - now_ns : 0));
             std::unique_lock lock(bucket.mutex);
             while (slot.version.load(std::memory_order_seq_cst) == version) {
                 if (timeout_ns == 0) {
@@ -335,8 +362,11 @@ extern "C" void ps_res_notify_write(uint32_t addr, uint32_t size)
         }
         return;
     }
+    std::atomic_thread_fence(std::memory_order_seq_cst); // the bytes written before, the bits read after (D-243)
     for (u64 line = first; line < end; line += PS_RES_LINE_SIZE) {
-        Slot& slot = slot_of(static_cast<u32>(line));
+        const u32 index = slot_index(static_cast<u32>(line));
+        if (!watched(index)) continue;
+        Slot& slot = g_slots[index];
         slot.version.fetch_add(2, std::memory_order_seq_cst);
         wake_waiters(slot);
     }

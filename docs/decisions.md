@@ -5235,15 +5235,6 @@ forgotten past that, decoded again as they come). Measured (runs 222-225, GTA V'
 thread 1.71, 1.67 to 1.65, 1.64 CPU s per 5 s (-2.7%). Test: tests/rsx/test_metal.mm (a program written again where
 another was: not decoded or compiled again, and both draw right).
 
-## D-242 · 2026-10-08 · Texture layouts are kept by shape; the FIFO's address translation is inline
-
-Two more of the RSX thread's small costs in run 221: every texture bind computed the texture's layout twice, each
-time building its levels' vector (compute_texture_layout, about 2% of the thread's busy time with its allocations),
-and the FIFO reader called the IO address translation out of line for every command word (3%). Layouts are now kept
-by every field that shapes them (format byte, width, height, depth, mip count, dimension, cube map, pitch, border; at
-most 4,096, all forgotten past that), and IoMap::io_to_ea is inline. Measured with D-241 (runs 226-229): the RSX thread 1.68, 1.49 to
-1.57, 1.47 CPU s per 5 s.
-
 ## D-241 · 2026-10-08 · The host clock in one multiply; idle SPURS workers sleep by a Mach trap
 
 Run 221's profile of GTA V under load: of the main SPU threads' busy time, about 7% was the clock and the sleep around
@@ -5254,6 +5245,28 @@ more for the DMA log (D-138). ps_host_now_ns is now one multiply of mach_absolut
 ps_host_sleep_ns sleeps by mach_wait_until; the workers, the DMA log and ps_res_wait_change's spins use them. Measured with D-242 (runs 226-229, before and after alternating; the idle Mac, the load meant
 for them having failed to start): the main SPU threads 7.54, 6.65 to 7.23, 6.45 CPU s per 5 s, the process 12.59,
 11.26 to 11.99, 11.03; fps the same.
+
+## D-242 · 2026-10-08 · Texture layouts are kept by shape; the FIFO's address translation is inline
+
+Two more of the RSX thread's small costs in run 221: every texture bind computed the texture's layout twice, each
+time building its levels' vector (compute_texture_layout, about 2% of the thread's busy time with its allocations),
+and the FIFO reader called the IO address translation out of line for every command word (3%). Layouts are now kept
+by every field that shapes them (format byte, width, height, depth, mip count, dimension, cube map, pitch, border; at
+most 4,096, all forgotten past that), and IoMap::io_to_ea is inline. Measured with D-241 (runs 226-229): the RSX thread 1.68, 1.49 to
+1.57, 1.47 CPU s per 5 s.
+
+## D-243 · 2026-10-08 · A write notification bumps only the lines someone holds a version of
+
+ps_res_notify_write runs for every SPU PUT and bumped the version of every 128-byte line written, each version on its
+own host cache line of the 4 MB table: a 16 KB PUT touched 128 scattered cache lines, 2.5% of GTA V's busy SPU time
+(run 221), nearly all for lines no reservation or wait ever reads. A bitmap (4 KB, a bit per version slot) now marks
+the slots whose version someone reads (ps_res_acquire, ps_res_version, ps_res_wait_change), and a notification bumps
+only those. The reader sets its bit and fences before reading the version and the bytes; the writer fences after
+writing the bytes and before reading the bits (a Dekker pairing, as the waiter count's): either the reader sees the
+new bytes, or the writer sees the bit and bumps. Measured under a full-core load (runs 230-233, six spinning threads, before and after
+alternating): the main SPU threads 8.82, 8.77 to 8.53, 8.09 CPU s per 5 s, the process 15.60, 15.44 to 15.07, 14.50; fps
+the same. (ps_res_wait_change also takes its spin deadline from the one-multiply clock, D-241.) Tests: tests/core/test_reservation.cpp (waiters
+racing DMA-style writes on fresh lines are always woken; with every bump skipped the tests fail).
 
 ## Open decisions (plan section 14)
 
