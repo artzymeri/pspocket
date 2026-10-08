@@ -3,9 +3,10 @@
 #
 #   scripts/gate.sh quick    builds the tests and runs them (ctest; about 15 s once built)
 #   scripts/gate.sh game     GTA V's prologue walk with --summary, checked against games/gta5/gate.json (2.5 min)
-#   scripts/gate.sh [all]    both
-#   scripts/gate.sh spu      spu-check over the game's SPU programs (2 trials, 40 entries each: about 27 s a program,
-#                            two hours for GTA V's): for changes to the SPU translation, run before the gate
+#   scripts/gate.sh spu      spu-check over the game's SPU programs: each entry of each against the interpreter from
+#                            random states (about 90 s for GTA V's 150 programs, 100,000 trials)
+#   scripts/gate.sh [all]    quick, spu, then game (spu found a build of translated SPU code the host compiler got
+#                            wrong, D-253, which no test and no walk showed)
 #
 # Options: --accept-messages (game) adds the run's new warning and error shapes to the baseline instead of failing.
 # --library FILE (game) runs the walk with the game's code from a game library (pspocket-prepare, D-152) instead of the
@@ -44,11 +45,11 @@ if [[ $mode == quick || $mode == all ]]; then
   tail -3 $out/ctest.log | head -1
 fi
 
-if [[ $mode == spu ]]; then
+if [[ $mode == spu || $mode == all ]]; then
   spu=inventory/gta5/spu
   [[ -x $build/runtime/loader/spu-check && -d $spu ]] || { echo "gate: spu-check needs $spu and a game SPU build"; exit 2; }
-  echo "==> gate spu: spu-check $spu (2 trials, 40 entries a program)"
-  if ! $build/runtime/loader/spu-check $spu --trials 2 --entries 40 > $out/spu-check.log 2>&1; then
+  echo "==> gate spu: spu-check $spu (every entry, 4 trials each)"
+  if ! $build/runtime/loader/spu-check $spu > $out/spu-check.log 2>&1; then
     grep -v " 0 differences" $out/spu-check.log | head -20
     echo "gate: FAIL (translated SPU code differs from the interpreter, $out/spu-check.log)"; exit 1
   fi

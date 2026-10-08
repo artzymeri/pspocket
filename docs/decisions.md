@@ -5419,6 +5419,22 @@ analog sticks that follow the thumb and recentre, each button held while touched
 controller hides them, disconnecting shows them again. What a polished overlay still needs (improve.md, The iOS app):
 a thumb sliding from one button to the next presses the next (today each button follows only the touch that began on
 it), a light haptic tap on press, an adjustable opacity, and L2/R2 as analog triggers.
+## D-253 · 2026-10-08 · A local store access's byte reversal in one table lookup: not kept (Apple clang built it wrong); spu-check joins the gate
+
+Every quadword load and store of translated SPU code reverses the 16 bytes (D-004's lane order): clang makes the
+shuffle a rev64 and an ext (two permutes, four cycles), and loads and stores are 18% of the EDGE job's samples. One
+table lookup (vqtbl1q_u8 with a constant index vector, kept in a register through loops) does it in one (two cycles).
+
+- spu-check over GTA V's 150 programs then found 3 trials of 102,098 that differ, all in one program
+  (spu_27914b1c61f0e8b6, entries 0x07e88, 0x08860, 0x088a0: a register restored from a stack slot that another store
+  had changed). The same file built by Apple clang 17 (clang-1700.3.19.1) at -O0, at -O2 with the undefined-behaviour
+  sanitizer (which reports nothing), or by pspocket's own LLVM at -O2 (the compiler the iPhone prepares games with)
+  gives no difference; only Apple clang at -O2 with the table lookup does, and the shuffle is the same function of its
+  input either way. Most likely a miscompile; undefined behaviour the sanitizer cannot see is not ruled out. Not kept:
+  the Mac's built-in translation is compiled by Apple clang.
+- No test and no walk had shown it. scripts/gate.sh all now runs spu-check over the game's SPU programs between the
+  tests and the walk (about 90 s, every entry, four trials each; `gate.sh spu` alone as before), so a change to the
+  SPU lifter, its header or the host compiler that builds translated code wrong fails the gate.
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

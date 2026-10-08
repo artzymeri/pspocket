@@ -50,6 +50,8 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
     Make the script keep NAME.seeds as prepare does.
   - quadword loads and stores reverse the bytes on every access (D-004); a load whose value only goes to a store, or
     the address arithmetic (a lane moved to a general register for each access), may be cheaper in another shape.
+    **Tried (D-253):** the reversal as one table lookup instead of rev64 and ext: Apple clang built one program wrong
+    with it (spu-check, 3 trials of 102,098; pspocket's own LLVM, -O0 and the sanitizer build it right). Not kept.
 - **State:** open (D-215 to D-219 done).
 
 - **Seen (runs 157, 166, GTA V's walk under a load of six spinning threads, `sample`):** the five main SPU threads
@@ -326,6 +328,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   overwritten), then passed 3 suite runs, 30 runs alone and 25 runs under a full-core load. Some test there is timing
   sensitive about 1 in 60 times. **Try:** run it in a loop under load with `--reporter compact` saved per run until
   it fails, then fix the test's timing assumption.
+  **Tried (2026-10-08):** 500 runs of test_lv2 under a full-core load and 40 runs of the whole suite with `ctest -j8`:
+  no failure. Not reproducible now; the gate keeps `--output-on-failure` logs, so the next one shows its test.
+- **Done (D-253):** spu-check over the game's SPU programs is part of `gate.sh all` (about 90 s): a build of translated
+  SPU code that the host compiler got wrong showed in no test and no walk, only there.
 
 - **Seen:** one walk failed on the fps floor (a single 5 s window at 19.8 fps at flip 2,400 while the Mac's GPU was in
   its slow state, no wait for the GPU, nothing on the walk's path changed) and passed when run again (run 091).
