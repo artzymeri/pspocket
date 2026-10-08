@@ -294,3 +294,42 @@ TEST_CASE("call_guest: arguments past eight in the caller's parameter save area 
     CHECK(t.ctx.gpr[1] == sp);
     CHECK(hle::call_guest(t.ctx, kOpd, {1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0}) == 255);
 }
+
+namespace {
+double fp_mix(PPUContext&, double a, u32 b, float c, s32 d, double e) { return a + b + static_cast<double>(c) + d + e; }
+float fp_half(PPUContext&, float x) { return x / 2; }
+} // namespace
+
+// D-503: floating point arguments come from f1.. by their own count and still take their slot in the sequence, so the
+// integers after them come from the registers after theirs; a float or double result goes to f1.
+TEST_CASE("Typed binding: floating point arguments and results", "[hle]")
+{
+    PPUContext ctx;
+    ps_ppu_context_init(&ctx);
+    ctx.fpr[1] = 1.5;                       // a: slot 0
+    ctx.gpr[4] = 2;                         // b: slot 1
+    ctx.fpr[2] = 0.25;                      // c: slot 2
+    ctx.gpr[6] = static_cast<u64>(-3);      // d: slot 3
+    ctx.fpr[3] = 10.0;                      // e: slot 4
+    hle::detail::thunk<&fp_mix>(ctx, nullptr);
+    CHECK(ctx.fpr[1] == 1.5 + 2 + 0.25 - 3 + 10.0);
+    ctx.fpr[1] = 3.0;
+    hle::detail::thunk<&fp_half>(ctx, nullptr);
+    CHECK(ctx.fpr[1] == 1.5);
+}
+
+// D-503: a host variable is laid out once per process, initialised, and every import of it gets the same address.
+TEST_CASE("Host variables: laid out once and linked by address", "[hle]")
+{
+    const auto x = test::build_ppu_exec();
+    auto exe = loader::Executable::parse(x.bytes);
+    REQUIRE(exe);
+    Process p(**exe);
+    REQUIRE(hle::registry().find_variable("sysPrxForUser", 0x7DF066CF) != nullptr);
+    const u32 a = p.hle->link_variable("sysPrxForUser", 0x7DF066CF);
+    REQUIRE(a != 0);
+    CHECK(a % 4 == 0);
+    CHECK(ps_read32(p.memory.base(), a) == 0x00010001);
+    CHECK(p.hle->link_variable("sysPrxForUser", 0x7DF066CF) == a);
+    CHECK(p.hle->link_variable("sysPrxForUser", 0x12345678) == 0);
+}

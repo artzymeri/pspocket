@@ -4,6 +4,9 @@ add_library(pspocket_hle STATIC
     src/cellGame.cpp
     src/cellGcmSys.cpp
     src/cellHttp.cpp
+    src/cellHttpUtil.cpp
+    src/cellKey2char.cpp
+    src/cellL10n.cpp
     src/cellNetCtl.cpp
     src/cellOskDialog.cpp
     src/cellResc.cpp
@@ -58,8 +61,37 @@ add_library(pspocket_hle STATIC
     src/spurs_jobchain.cpp
     src/spurs_scheduler.cpp
     src/spurs_taskset.cpp
+    src/lv2_heap.cpp
     src/sysPrxForUser.cpp
     src/sysPrxForUser_libc.cpp
+    src/sysPrxForUser_sys.cpp
+    src/sys_libc.cpp
+    src/sys_libm.cpp
+    src/cellFont.cpp
+    src/cellFontFT.cpp
+    src/cell_FreeType2.cpp
+    src/cellSail.cpp
+    src/cellSailRec.cpp
+    src/cellSpursJq.cpp
+    src/cellFiber.cpp
+    src/cellSync2.cpp
+    src/cellDaisy.cpp
+    src/sys_lv2dbg.cpp
+    src/usbd.cpp
+    src/vdec_cores.cpp
+    src/cellVpost.cpp
+    src/cellAtrac.cpp
+    src/cellJpgEnc.cpp
+    src/cellPngEnc.cpp
+    src/libsnd3.cpp
+    src/libsynth2.cpp
+    src/libmixer.cpp
+    src/cellCelpEnc.cpp
+    src/cellRudp.cpp
+    src/cellNetAoi.cpp
+    src/libad.cpp
+    src/sys_libstdcxx.cpp
+    src/sysutil_more.cpp
     src/sys_fs.cpp
     src/sys_io.cpp
     src/sys_net.cpp
@@ -74,6 +106,10 @@ target_link_libraries(pspocket_hle PRIVATE pspocket::recomp_common)
 # FFmpeg's decoders for the media libraries (D-181, cellVdec D-195); without them those build without decoding.
 if(TARGET pspocket::ffmpeg)
     target_link_libraries(pspocket_hle PRIVATE pspocket::ffmpeg)
+endif()
+# FreeType 2.2.1 for the font libraries (D-500); without it the firmware's font modules serve the games.
+if(TARGET pspocket::freetype)
+    target_link_libraries(pspocket_hle PRIVATE pspocket::freetype)
 endif()
 # libpng for cellPngDec (D-199); without it the firmware's libpngdec serves the games.
 if(TARGET pspocket::libpng)

@@ -449,70 +449,82 @@ TEST_CASE("__sys_look_ctype_table, _sys_tolower, _sys_toupper: RPCS3's table", "
 
 // ------------------------------------------------------------------------------------------------- malloc, heaps
 
-TEST_CASE("_sys_malloc, _sys_memalign, _sys_free: the main area, 64 KB aligned, as RPCS3's vm::alloc", "[hle][libc]")
+TEST_CASE("_sys_malloc, _sys_memalign, _sys_free: blocks of liblv2's own 512 KB heap (D-502)", "[hle][libc]")
+{
+    // liblv2's dlmalloc (compared with Sony's in tests/hle/test_lv2_compare.cpp): 16-byte aligned blocks of the
+    // "__sys_heap" heap it makes as it starts, 512 KB that never grow.
+    LogLines logs;
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    const u32 p = static_cast<u32>(a.call("_sys_malloc", 0x100));
+    REQUIRE(p != 0);
+    CHECK(p % 16 == 0);
+    REQUIRE(f.mem.is_committed(p));
+    const u32 q = static_cast<u32>(a.call("_sys_malloc", 0x100));
+    REQUIRE(q != 0);
+    CHECK((q >= p + 0x100 || q + 0x100 <= p)); // apart
+    CHECK(a.call("_sys_malloc", 0x100000) == 0); // more than the heap holds
+    CHECK(a.call("_sys_malloc", 0) != 0);        // dlmalloc's smallest block
+
+    const u32 r = static_cast<u32>(a.call("_sys_memalign", 0x1000, 0x20));
+    REQUIRE(r != 0);
+    CHECK(r % 0x1000 == 0);
+    const u32 odd = static_cast<u32>(a.call("_sys_memalign", 0x30, 0x20)); // raised to a power of two (64)
+    REQUIRE(odd != 0);
+    CHECK(odd % 0x40 == 0);
+
+    a.call("_sys_free", p);
+    CHECK(a.call("_sys_malloc", 0x100) == p); // the freed block of that size, again
+    a.call("_sys_free", 0);                    // nothing
+    CHECK(logs.messages(log::Level::Error, "hle").empty());
+}
+
+TEST_CASE("_sys_heap_*: liblv2's dlmalloc heaps, each named by its address (D-502)", "[hle][libc]")
 {
     LogLines logs;
     Fixture f;
     GuestThread a(f, 0, "a");
     u8* b = f.base();
-    const u32 p = static_cast<u32>(a.call("_sys_malloc", 0x100));
-    REQUIRE(p != 0);
-    CHECK(p % 0x10000 == 0);
-    REQUIRE(f.mem.is_committed(p));
-    CHECK(b[p] == 0); // zeroed
-    b[p + 0xFF] = 1;
-    CHECK(a.call("_sys_malloc", 0) == 0);
-
-    const u32 q = static_cast<u32>(a.call("_sys_memalign", 0x100000, 0x20));
-    REQUIRE(q != 0);
-    CHECK(q % 0x100000 == 0);
-    const u32 r = static_cast<u32>(a.call("_sys_memalign", 0x10, 0x20)); // raised to 64 KB
-    REQUIRE(r != 0);
-    CHECK(r % 0x10000 == 0);
-    CHECK(a.call("_sys_memalign", 0x30000, 0x20) == 0); // not a power of two: refused (RPCS3 aborts)
-    CHECK(logs.count(log::Level::Error, "hle", "_sys_memalign(size 0x20): alignment 0x30000") == 1);
-
-    a.call("_sys_free", p);
-    CHECK_FALSE(f.mem.is_committed(p));
-    CHECK(a.call("_sys_malloc", 0x100) == p); // first fit again
-    a.call("_sys_free", 0);                    // nothing
-    CHECK(logs.count(log::Level::Error, "hle", "not an allocation") == 0);
-    a.call("_sys_free", q);
-    a.call("_sys_free", r);
-}
-
-TEST_CASE("_sys_heap_*: heap IDs as idm hands them out; allocations from the main area", "[hle][libc]")
-{
-    Fixture f;
-    GuestThread a(f, 0, "a");
-    u8* b = f.base();
     put(b, kStr, "myheap");
-    CHECK(a.call("_sys_heap_create_heap", kStr, 1, 2, 3) == 1);
-    CHECK(a.call("_sys_heap_create_heap", 0, 0, 0, 0) == 2);
-    CHECK(a.call("_sys_heap_delete_heap", 1) == 0);
-    CHECK(a.call("_sys_heap_delete_heap", 77) == 0);           // any ID: CELL_OK (RPCS3)
-    CHECK(a.call("_sys_heap_create_heap", kStr, 0, 0, 0) == 3); // the next ID, not the one freed
-
-    const u32 m = static_cast<u32>(a.call("_sys_heap_malloc", 2, 0x40));
+    const u32 h = static_cast<u32>(a.call("_sys_heap_create_heap", kStr, 0x18000, 0, 0)); // 96 KB: two 64 KB pages
+    REQUIRE(h != 0);
+    REQUIRE(f.mem.is_committed(h));
+    const u32 m = static_cast<u32>(a.call("_sys_heap_malloc", h, 0x40));
     REQUIRE(m != 0);
-    CHECK(m % 0x10000 == 0);
-    const u32 n = static_cast<u32>(a.call("_sys_heap_memalign", 2, 0x200000, 0x40));
+    CHECK((m > h && m < h + 0x20000)); // inside its memory
+    CHECK(m % 16 == 0);
+    const u32 n = static_cast<u32>(a.call("_sys_heap_memalign", h, 0x2000, 0x40));
     REQUIRE(n != 0);
-    CHECK(n % 0x200000 == 0);
-    CHECK(a.call("_sys_heap_free", 2, m) == 0);
-    CHECK_FALSE(f.mem.is_committed(m));
-    CHECK(a.call("_sys_heap_free", 99, n) == 0); // whichever heap is named
-    CHECK_FALSE(f.mem.is_committed(n));
+    CHECK(n % 0x2000 == 0);
+    const u32 free_before = static_cast<u32>(a.call("_sys_heap_get_total_free_size", h));
+    CHECK(a.call("_sys_heap_free", h, m) == 0);
+    CHECK(a.call("_sys_heap_get_total_free_size", h) > free_before);
+    CHECK(a.call("_sys_heap_malloc", h, 0x30000) == 0); // the heap does not grow
 
-    // After 1023 IDs, the lowest free one, then 0 when none is.
-    for (u32 id = 4; id <= 1023; id++) REQUIRE(a.call("_sys_heap_create_heap", kStr, 0, 0, 0) == id);
-    CHECK(a.call("_sys_heap_create_heap", kStr, 0, 0, 0) == 1);
-    CHECK(a.call("_sys_heap_create_heap", kStr, 0, 0, 0) == 0);
+    // The caller's memory, with the flags' top bit and the attribute {8, address}.
+    const u32 attr = kOut;
+    ps_write32(b, attr, 8);
+    ps_write32(b, attr + 4, kStr2);
+    const u32 g = static_cast<u32>(a.call("_sys_heap_create_heap", kStr, 0x1000, 0x80000000u, attr));
+    REQUIRE(g == kStr2 + 0x10); // the malloc_state, after dlmalloc's first chunk header, 16-byte aligned
+    const u32 k = static_cast<u32>(a.call("_sys_heap_malloc", g, 0x20));
+    CHECK((k > kStr2 && k < kStr2 + 0x1000));
+    ps_write32(b, attr, 4); // an attribute that is not 8 bytes
+    CHECK(a.call("_sys_heap_create_heap", kStr, 0x1000, 0x80000000u, attr) == 0);
+
+    CHECK(a.call("_sys_heap_delete_heap", h) == 0);
+    CHECK_FALSE(f.mem.is_committed(h)); // its pages back
+    CHECK(a.call("_sys_heap_delete_heap", g) == 0);
+    CHECK(logs.messages(log::Level::Error, "hle").empty());
+
+    // A heap of 0: liblv2 prints "invalid heap area".
+    CHECK(a.call("_sys_heap_malloc", 0, 0x10) == 0);
+    CHECK(logs.count(log::Level::Info, "tty", "invalid heap area 0x0") == 1);
 }
 
 // ------------------------------------------------------------------------------------------------- printf
 
-TEST_CASE("_sys_sprintf: the conversions, flags, widths, precisions and lengths RPCS3's formatter has", "[hle][libc]")
+TEST_CASE("_sys_sprintf: the conversions, flags, widths, precisions and lengths of liblv2's formatter", "[hle][libc]")
 {
     LogLines logs;
     Fixture f;
@@ -522,48 +534,48 @@ TEST_CASE("_sys_sprintf: the conversions, flags, widths, precisions and lengths 
     CHECK(sprintf_(a, "%d %i %u", -5, 42, 7) == "-5 42 7");
     CHECK(sprintf_(a, "%d", 0xFFFFFFFBull) == "-5"); // an int: the slot's low word (RPCS3 takes the whole slot)
     CHECK(sprintf_(a, "%u", -1) == "4294967295");
-    CHECK(sprintf_(a, "%lu %zu %ju %llu", -1, -1, -1, -1) ==
-        "4294967295 4294967295 18446744073709551615 18446744073709551615"); // long and size_t are 4 bytes
+    // Every answer here is liblv2's (D-501), compared with Sony's module in tests/hle/test_lv2_compare.cpp.
+    CHECK(sprintf_(a, "%lu %zu %ju %llu", -1, -1, -1, -1) == "4294967295 zu ju 18446744073709551615"); // no z or j
     CHECK(sprintf_(a, "%lld %ld", 0x8000000000000000ull, 0x1FFFFFFFFull) == "-9223372036854775808 -1");
-    CHECK(sprintf_(a, "%hd %hhd %hu %hhu", 0x18000, 0x1FF, 0x18000, 0x1FF) == "-32768 -1 32768 255");
+    CHECK(sprintf_(a, "%hd %hhd %hu %hhu", 0x18000, 0x1FF, 0x18000, 0x1FF) == "98304 511 98304 511"); // h: %n only
     CHECK(sprintf_(a, "[%5d|%-5d|%05d|%+d|% d|%+05d]", 42, 42, 42, 7, 7, -7) == "[   42|42   |00042|+7| 7|-0007]");
     CHECK(sprintf_(a, "[%.3d|%.0d|%.0d|%5.3d|%-6.2d|%05.1d]", 7, 0, 5, 7, 3, 4) == "[007||5|  007|03    |    4]");
     CHECK(sprintf_(a, "[%x|%X|%#x|%#X|%#x|%08x|%#08x|%.4x|%-#6x]", 255, 255, 255, 255, 0, 0xABC, 0xABC, 0x1F, 10) ==
         "[ff|FF|0xff|0XFF|0|00000abc|0x000abc|001f|0xa   ]");
-    CHECK(sprintf_(a, "[%o|%#o|%#o|%#.3o|%#.0o]", 8, 8, 0, 8, 0) == "[10|010|0|010|0]");
-    CHECK(sprintf_(a, "%llx %hx %hhx", 0x123456789ABCull, 0x12345, 0x1FF) == "123456789abc 2345 ff");
-    CHECK(sprintf_(a, "%b|%5b|%B", 5, 2, 0) == "101|   10|0"); // RPCS3's binary
+    CHECK(sprintf_(a, "[%o|%#o|%#o|%#.3o|%#.0o]", 8, 8, 0, 8, 0) == "[10|010|0|010|]"); // '#' adds no digit
+    CHECK(sprintf_(a, "%llx %hx %hhx", 0x123456789ABCull, 0x12345, 0x1FF) == "123456789abc 12345 1ff");
+    CHECK(sprintf_(a, "%b|%5b|%B", 5, 2, 0) == "b|b|B"); // no binary: printed as it is, no argument taken
 
     CHECK(sprintf_(a, "[%c%c%c|%3c|%-3c]", 'a', 'b', 0x163, 'x', 'y') == "[abc|  x|y  ]");
     put(b, kStr, "hello");
     CHECK(sprintf_(a, "[%s|%10s|%-10s|%.2s|%s]", kStr, kStr, kStr, kStr, 0) ==
         "[hello|     hello|hello     |he|(null)]");
-    CHECK(sprintf_(a, "%p|%20p|%-18p|", 0x10000, 0xD0001234, 1) ==
-        "0000000000010000|    00000000d0001234|0000000000000001  |"); // RPCS3's: 16 digits, no 0x
+    CHECK(sprintf_(a, "%p|%20p|%-18p|", 0x10000, 0xD0001234, 1) == "0x10000|          0xd0001234|0x1               |");
     CHECK(sprintf_(a, "%%|100%%") == "%|100%");
     CHECK(sprintf_(a, "[%*d|%-*d|%.*d|%*d|%.*d]", 5, 42, 5, 42, 3, 7, -4, 1, -1, 9) == "[   42|42   |007|1   |9]");
 
-    // Floating point: the host's printf on the double in the argument's slot.
+    // No floating point: f e g a and their capitals are printed as they are and take no argument ("%*.*f" takes the
+    // two of its '*'s).
     CHECK(sprintf_(a, "%f|%.2f|%e|%g|%8.3f|%-8.1f|%lf|%E|%G", bits(1.5), bits(3.14159), bits(12345.678), bits(0.0001),
-              bits(2.5), bits(2.5), bits(2.0), bits(0.5), bits(1e-10)) ==
-        "1.500000|3.14|1.234568e+04|0.0001|   2.500|2.5     |2.000000|5.000000E-01|1E-10");
-    CHECK(sprintf_(a, "%*.*f|%+.1e|%08.2f|%a", 6, 2, bits(1.0), bits(-0.5), bits(-3.25), bits(1.0)) ==
-        "  1.00|-5.0e-01|-0003.25|0x1p+0");
-    CHECK(sprintf_(a, "%d %f %d", 1, bits(0.25), 2) == "1 0.250000 2"); // a double takes one slot, as an integer does
+              bits(2.5), bits(2.5), bits(2.0), bits(0.5), bits(1e-10)) == "f|f|e|g|f|f|f|E|G");
+    CHECK(sprintf_(a, "%*.*f|%+.1e|%08.2f|%a", 6, 2, bits(1.0), bits(-0.5), bits(-3.25), bits(1.0)) == "f|e|f|a");
+    CHECK(sprintf_(a, "%d %f %d", 1, bits(0.25), 2) == "1 f 0"); // the second %d reads the double's slot
 
     // Arguments past r10: from the caller's parameter save area (r1 + 0x30 + 8n).
     CHECK(sprintf_(a, "%d %d %d %d %d %d %d %d %d %d %s", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, kStr) ==
         "1 2 3 4 5 6 7 8 9 10 hello");
 
-    // A sequence RPCS3 does not know is printed as written, with the rest of the format untouched.
-    CHECK(sprintf_(a, "a%yb%dc", 5) == "a%yb%dc");
-    CHECK(sprintf_(a, "%d %Lf %d", 1, bits(1.0), 3) == "1 %Lf %d");
-    CHECK(sprintf_(a, "%d%n", 1, kOut) == "1%n");
-    CHECK(sprintf_(a, "%d %hld", 1, 2) == "1 %hld"); // two lengths
-    CHECK(sprintf_(a, "%5*d", 3, 4) == "%5*d");      // a second width
-    CHECK(sprintf_(a, "%lc", 'x') == "%lc");
-    CHECK(sprintf_(a, "100%") == "100%"); // unfinished
-    CHECK(sprintf_(a, "50%-") == "50%-");
+    // A character liblv2 does not convert is printed as it is; flags, widths and lengths come in any order, a later
+    // one replacing an earlier one; a sequence the format ends in prints nothing.
+    CHECK(sprintf_(a, "a%yb%dc", 5) == "ayb5c");
+    CHECK(sprintf_(a, "%d %Lf %d", 1, bits(1.0), 3) == "1 f 0");
+    CHECK(sprintf_(a, "%d%n", 1, kOut) == "1");      // %n prints nothing
+    CHECK(sprintf_(a, "%d %hld", 1, 2) == "1 2");    // two lengths
+    CHECK(sprintf_(a, "%5*d", 3, 4) == "  4");       // '*' after the digits: the width is the argument's
+    CHECK(sprintf_(a, "%5-d|%D", 7, -2) == "7    |-2"); // a flag after the width; D as d
+    CHECK(sprintf_(a, "%lc", 'x') == "x");
+    CHECK(sprintf_(a, "100%") == "100");
+    CHECK(sprintf_(a, "50%-") == "50");
     CHECK(logs.count(log::Level::Error, "hle", "_sys_sprintf") == 0);
 
     // A %s that is not guest memory prints nothing, logged.
@@ -577,33 +589,40 @@ TEST_CASE("_sys_sprintf: the conversions, flags, widths, precisions and lengths 
     CHECK(a.call("_sys_sprintf", kUnmapped, kFmt) == r3_of(lv2::CELL_EFAULT));
 }
 
-TEST_CASE("_sys_snprintf: RPCS3's count rules; _sys_printf to the TTY", "[hle][libc]")
+TEST_CASE("_sys_snprintf: the whole length back and the NUL at that length; _sys_printf to the TTY", "[hle][libc]")
 {
+    // liblv2 (D-501): snprintf returns the text's whole length and writes its NUL at dst + that length, past the
+    // buffer when the text was cut; a count of 0 writes nothing.
     LogLines logs;
     Fixture f;
     GuestThread a(f, 0, "a");
     u8* b = f.base();
     put(b, kFmt, "hello %s");
     put(b, kStr, "world");
-    std::memset(b + kOut, 0x7E, 0x40);
-    CHECK(a.call("_sys_snprintf", kOut, 0, kFmt, kStr) == 0); // nothing written
+    const auto fill = [&] { std::memset(b + kOut, 0x7E, 0x40); };
+    fill();
+    CHECK(a.call("_sys_snprintf", kOut, 0, kFmt, kStr) == 11); // nothing written
     CHECK(b[kOut] == 0x7E);
-    CHECK(a.call("_sys_snprintf", kOut, 6, kFmt, kStr) == 5); // the bytes written, not the text's length
-    CHECK(cstr(b, kOut) == "hello");
-    CHECK(a.call("_sys_snprintf", kOut, 11, kFmt, kStr) == 10);
-    CHECK(cstr(b, kOut) == "hello worl");
-    CHECK(a.call("_sys_snprintf", kOut, 12, kFmt, kStr) == 11);
+    CHECK(b[kOut + 11] == 0x7E);
+    fill();
+    CHECK(a.call("_sys_snprintf", kOut, 6, kFmt, kStr) == 11);
+    CHECK(std::string_view(reinterpret_cast<const char*>(b + kOut), 5) == "hello");
+    CHECK(b[kOut + 5] == 0x7E);  // the buffer's last byte left as it was
+    CHECK(b[kOut + 11] == 0);    // liblv2's overrun
+    fill();
     CHECK(a.call("_sys_snprintf", kOut, 100, kFmt, kStr) == 11);
     CHECK(cstr(b, kOut) == "hello world");
     CHECK(b[kOut + 12] == 0x7E);
-    CHECK(a.call("_sys_snprintf", kOut, 1, kFmt, kStr) == 0);
-    CHECK(b[kOut] == 0);
+    fill();
+    CHECK(a.call("_sys_snprintf", kOut, 1, kFmt, kStr) == 11);
+    CHECK(b[kOut] == 0x7E);
+    CHECK(b[kOut + 11] == 0);
     CHECK(a.call("_sys_snprintf", kUnmapped, 4, kFmt, kStr) == r3_of(lv2::CELL_EFAULT));
     CHECK(a.call("_sys_snprintf", kOut, 4, 0) == r3_of(lv2::CELL_EFAULT));
 
-    // _sys_printf: CELL_OK; the text on the TTY's channel 0, a line a log line.
+    // _sys_printf: the number of characters; the text on the TTY's channel 0, a line a log line.
     put(b, kFmt, "frame %d: %s\nsecond line\n");
-    CHECK(a.call("_sys_printf", kFmt, 7, kStr) == 0);
+    CHECK(a.call("_sys_printf", kFmt, 7, kStr) == 27);
     CHECK(logs.count(log::Level::Info, "tty", "frame 7: world") == 1);
     CHECK(logs.count(log::Level::Info, "tty", "second line") == 1);
     // A long text goes out in pieces, nothing lost, through no more than 1 KB of the caller's stack.
@@ -611,7 +630,7 @@ TEST_CASE("_sys_snprintf: RPCS3's count rules; _sys_printf to the TTY", "[hle][l
     put(b, kStr2, long_text);
     put(b, kFmt, "%s");
     const usize before = logs.messages(log::Level::Info, "tty").size();
-    CHECK(a.call("_sys_printf", kFmt, kStr2) == 0);
+    CHECK(a.call("_sys_printf", kFmt, kStr2) == 3000);
     std::string joined;
     const std::vector<std::string> tty = logs.messages(log::Level::Info, "tty");
     for (usize i = before; i < tty.size(); i++) joined += tty[i];

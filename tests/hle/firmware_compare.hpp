@@ -27,12 +27,14 @@ inline std::optional<std::string> test_dev_flash()
 }
 
 // The firmware module exporting `library`, loaded into `f` and started on `t`. Its functions are called by NID.
+// `start` false leaves module_start out: liblv2's is the process's own start-up (it loads the process's modules
+// through lv2), which a test's functions do not need.
 struct FirmwareLibrary {
     std::string library;
     loader::LleModules lle;
     const loader::PrxModule* module = nullptr;
 
-    FirmwareLibrary(Fixture& f, GuestThread& t, const std::string& dev_flash, std::string lib)
+    FirmwareLibrary(Fixture& f, GuestThread& t, const std::string& dev_flash, std::string lib, bool start = true)
         : library(std::move(lib)), lle(dev_flash)
     {
         REQUIRE(lle.index());
@@ -41,7 +43,8 @@ struct FirmwareLibrary {
         module = lle.load(library, *f.hle, &why);
         INFO(why);
         REQUIRE(module);
-        for (const u32 start : lle.take_starts()) call_guest(t.ctx, start, {0, 0});
+        for (const u32 s : lle.take_starts())
+            if (start) call_guest(t.ctx, s, {0, 0});
     }
 
     // Calls the module's export `nid` with up to eight arguments: r3's low word.

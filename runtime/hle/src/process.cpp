@@ -94,20 +94,43 @@ void log_call_site(PPUContext& ctx, u8* base, std::string_view why)
 
 // ------------------------------------------------------------------------------------------------- registry
 
+namespace {
+std::string registry_key(std::string_view prefix, std::string_view module, u32 nid)
+{
+    return std::format("{}{}:{:08x}", prefix, module, nid);
+}
+} // namespace
+
 void Registry::add(std::string_view module, std::initializer_list<Function> list)
 {
     for (Function f : list) {
         f.module = module;
-        if (find(module, f.nid)) PS_FATAL(kChan, "HLE function {}::{} ({:#010x}) registered twice", module, f.name, f.nid);
+        if (!index_.emplace(registry_key("", module, f.nid), functions_.size()).second)
+            PS_FATAL(kChan, "HLE function {}::{} ({:#010x}) registered twice", module, f.name, f.nid);
         functions_.push_back(f);
     }
 }
 
 const Function* Registry::find(std::string_view module, u32 nid) const
 {
-    for (const Function& f : functions_)
-        if (f.nid == nid && f.module == module) return &f;
-    return nullptr;
+    const auto it = index_.find(registry_key("", module, nid));
+    return it == index_.end() ? nullptr : &functions_[it->second];
+}
+
+void Registry::add_variables(std::string_view module, std::initializer_list<Variable> list)
+{
+    for (Variable v : list) {
+        v.module = module;
+        if (!index_.emplace(registry_key("v", module, v.nid), variables_.size()).second)
+            PS_FATAL(kChan, "HLE variable {}::{} ({:#010x}) registered twice", module, v.name, v.nid);
+        variables_.push_back(v);
+    }
+}
+
+const Variable* Registry::find_variable(std::string_view module, u32 nid) const
+{
+    const auto it = index_.find(registry_key("v", module, nid));
+    return it == index_.end() ? nullptr : &variables_[it->second];
 }
 
 void Registry::add_imports(std::string_view module, std::span<const HostImport> list)
@@ -267,6 +290,36 @@ u32 HleProcess::descriptor_of(std::string_view module, u32 nid) const
         }
     }
     return 0;
+}
+
+u32 HleProcess::link_variable(std::string_view module, u32 nid)
+{
+    const Variable* v = registry().find_variable(module, nid);
+    if (!v) return 0;
+    std::lock_guard lock(link_mutex_);
+    if (const auto it = variables_.find({std::string(module), nid}); it != variables_.end()) return it->second;
+    // Laid out one after another in blocks of 64 KB of the main area (a larger one gets a block of its own).
+    constexpr u32 kBlock = 0x10000;
+    const u32 align = std::max<u32>(v->align, 1);
+    u32 at = variable_block_ ? (variable_block_ + variable_used_ + align - 1) & ~(align - 1) : 0;
+    if (!variable_block_ || at + v->size > variable_block_ + kBlock) {
+        const u32 size = std::max<u32>(kBlock, (v->size + 0xFFFF) & ~0xFFFFu);
+        const u32 block = main_.alloc(size, kBlock);
+        if (!block) {
+            PS_LOG_ERROR(kChan, "no main-area memory for the host variable {}::{}", module, v->name);
+            return 0;
+        }
+        variable_block_ = block;
+        variable_used_ = 0;
+        at = block;
+    }
+    variable_used_ = at + v->size - variable_block_;
+    u8* base = kernel_.memory().base();
+    std::memset(base + at, 0, v->size);
+    if (v->init) v->init(base, at);
+    variables_[{std::string(module), nid}] = at;
+    PS_LOG_DEBUG(kChan, "variable {}::{} ({:#010x}) at {:#010x}", module, v->name, nid, at);
+    return at;
 }
 
 void HleProcess::link_import(std::string_view library, u32 nid, u32 address)

@@ -299,3 +299,14 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 - The iPhone: `scripts/ios.sh` (bundle `com.artzymeri.pspocket.testhost`, team M7XJA39ZV6). The phone has to be
   connected and unlocked.
 - Pre-commit hook, once per clone: `git config core.hooksPath .githooks`.
+
+## System libraries (D-500 on)
+
+A session of its own makes every system library function pspocket's own native code (D-500): the chart in the README
+at 100%, each library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed
+already need no firmware module. Done so far:
+- **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
+  dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
+  (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
+Next: the rest of the functions Sony's modules call in the libraries pspocket always serves (cellSpurs' Task2 and
+exit codes, sys_net, cellUsbd, cellGcmSys, cellSysutil), then the firmware-backed libraries one by one.

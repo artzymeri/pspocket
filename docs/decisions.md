@@ -5751,3 +5751,106 @@ Creed's training, two programs, run 310). The RSX shades each pixel once and giv
 - [~] Target devices: primary test device is D-011; minimum chip and the iPad question are still open.
 - [x] Input → D-252: a controller when one is connected, the on-screen controls otherwise.
 - [x] ISO handling → D-043 (read directly from the ISO).
+
+# System libraries: D-500 and up
+
+A second session works on the system libraries beside the main one (2026-10-08): runtime/hle and tests/hle are its
+own, its decisions are D-500 and up and its runs 500 and up, it builds in build/libs at low priority and runs games
+only when inventory/mac-busy is absent.
+
+## D-500 · 2026-10-08 · Every system library function pspocket's own, in this order
+
+The user's goal (2026-10-08): the system libraries chart at 100%, every function it counts (the 6,625 RPCS3 registers)
+pspocket's own native code on iOS. At the start 1,719 were (25.9%) and 290 answered as RPCS3's stubs do (D-182).
+
+What the analysis showed (scratch scripts over the installed firmware's module index and `pspocket-boot --hle-list`;
+nothing of the firmware enters the repository):
+- GTA V and Assassin's Creed run no firmware module ("0 firmware module(s) run as they are" in their logs): every
+  function they import is pspocket's already.
+- The firmware's modules that may run as Sony's code export 2,305 functions; 177 of them were pspocket's.
+- sys_libc, sys_libm and sys_libstdcxx (2,752 functions, 41% of the count) are in no firmware module: a game links its
+  C and C++ library into itself, and RPCS3 only names these (PPUFunction.cpp). They are checked against the C and C++
+  standards and the SDK's documented behaviour, there being no Sony module to compare with.
+- Sony's own modules import functions of the libraries pspocket always serves (D-175) that pspocket lacked, which fail
+  when called: sysPrxForUser 6 (one with no known name), cellSpurs 9, sys_net 8 (four unnamed), cellUsbd 7, cellGcmSys
+  2, cellSysutil 1. These are the firmware's own imports of rule 4.
+
+The order:
+1. The libraries pspocket always serves (no firmware module can stand in for them), the firmware's imports first.
+2. The libraries Sony's modules serve today, one by one, the ones games use most first; each replaces its module.
+3. sys_libc, sys_libm and sys_libstdcxx.
+4. The functions answered as RPCS3's stubs, made real.
+
+How each library is made: its functions are read in Sony's module (disassembly stays in scratch, D-046) and compared
+with it call for call with made-up inputs in tests (firmware_compare.hpp, D-193; FirmwareLibrary can now leave the
+module's start out, as liblv2's is the process's own start-up). Where Sony's code and RPCS3 differ, Sony's wins
+(CLAUDE.md rule 11). Speed: native code at least as fast as the translated module it replaces (rule 8).
+
+## D-501 · 2026-10-08 · liblv2's printf, panic, exit list and syscall wrappers, the same as liblv2
+
+The sysPrxForUser functions Sony's modules call that pspocket lacked, and the rest of liblv2's that are calls into
+lv2 with little around them, are pspocket's own, each doing what liblv2.sprx (4.92) does:
+- **printf.** _sys_vprintf, _sys_vsprintf and _sys_vsnprintf (a va_list is the address of the next argument's 64-bit
+  slot, VarArgs::list). The comparison (tests/hle/test_lv2_compare.cpp: 89 made-up formats, every function of the family
+  at five sizes, 1,246 calls, every answer and byte the same, the TTY text too) showed that liblv2 has a small printf of
+  its own, not the C library's RPCS3's cfmt follows, so the formatter is now liblv2's:
+  - after '%' every character goes through one table: flags, width digits, '*', '.' and the length letters only
+    change the conversion's state, in any order and as often as they come (a later width replaces an earlier one, so
+    "%5*d" takes its width from the argument; "%5-d" is left-aligned), and D O U are d o u;
+  - integers, chars, strings, %p ("0x" and the digits) and %n (it stores the count, 2 bytes with h, else 4); no
+    floating point: %f, %e, %g and %a print their letter;
+  - h and hh change nothing but %n's store; l is 32 bits; ll and L 64; z, t, j, q and any other character print as
+    they are and take no argument; a sequence the format ends in prints nothing;
+  - '0' fills %s, %c and %p (after the 0x) as well; '#' gives an octal 0 only to a number with digits;
+  - _sys_snprintf returns the text's whole length and puts its NUL at dst + that length, past the buffer when the text
+    was cut (liblv2's own overrun); _sys_printf returns the number of characters (RPCS3: CELL_OK).
+- **Ends.** _sys_panic (the message, then the process ends with CELL_EABORT, no atexit), the export 0x9FB6228E whose
+  name is unknown (libfiber, libspurs_jq and libsync2's fatal errors: the message by _sys_vprintf, then
+  _sys_panic("\n")), __tls_get_addr (liblv2 panics: "__tls_get_addr called -> panic").
+- **The process exit list.** sys_process_atexit; sys_process_exit takes an exit mutex it keeps, calls the list from the
+  last to the first, then ends the process (RPCS3: a TODO).
+- **Wrappers.** sys_game_* (watchdog, board storage, RTC, temperature, version), sys_rsxaudio_*, the Wi-Fi command,
+  sys_process_spawn and _proc_spawn (liblv2's argument block), sys_interrupt_thread_disestablish (the TLS block freed
+  one teardown late), console_getc, __sys_time, __sys_printf_basename; and the three that liblv2 answers with
+  CELL_ENOSYS itself. Each makes liblv2's syscall through lv2's own dispatcher (Kernel::syscall), so the answer is
+  lv2's: the kernel's gaps among them (RSX audio, interrupt threads, spawning) answer CELL_ENOSYS and are logged there.
+Not comparable in a test: the functions that end the process, console_getc (liblv2 returns what its stack held) and
+the timebase. GTA V and Assassin's Creed import none of these; the firmware's modules do (D-166).
+
+## D-502 · 2026-10-08 · liblv2's heaps and malloc: dlmalloc 2.8.3 as liblv2 builds it
+
+sysPrxForUser's heap functions and its malloc were RPCS3's (sys_heap.cpp): a heap was only an ID, and every block,
+whatever its size, a 64 KB-aligned allocation of the main area. A firmware module making many small allocations took
+64 KB each. Now they are liblv2's (runtime/hle/src/lv2_heap.cpp; read from liblv2.sprx 4.92):
+- **The allocator.** dlmalloc 2.8.3 (Doug Lea, public domain), built as liblv2 builds it: mspaces, FOOTERS,
+  MALLOC_ALIGNMENT 16, no mmap and no morecore (a heap never grows), trim threshold 2 MB, the magic from the timebase,
+  errors ignored (liblv2's error actions are an empty function). Its malloc_state carries three fields of liblv2's
+  (the heap's lwmutex, flags and name). The heap lives in guest memory as liblv2's does: the malloc_state at the start,
+  every chunk's header and footer between the blocks, in big-endian words.
+- **Heaps.** _sys_heap_create_heap(name, size, flags, attr) takes 64 KB pages from sys_memory_allocate, or the
+  caller's memory given in an attribute {8, address} with the flags' top bit; the ID is the malloc_state's address.
+  _sys_heap_delete_heap gives the pages back. New: _sys_heap_get_mallinfo (dlmalloc's mallinfo),
+  _sys_heap_get_total_free_size (its fordblks), _sys_heap_alloc_heap_memory (malloc, or memalign with an attribute),
+  _sys_heap_stats (dlmalloc's malloc_stats with liblv2's printing left out). A heap of 0 prints "invalid heap area".
+- **malloc.** _sys_malloc, _sys_memalign and _sys_free use liblv2's own heap, "__sys_heap", 512 KB, flags 0x110000,
+  made with the first of them (liblv2 makes it as it starts): the 512 KB the firmware's modules have on a PS3.
+- **Compared.** Six heaps (allocated or on the caller's memory, odd sizes and flags) through allocations of every size
+  class, frees that merge, memalign at nine alignments, the attribute forms, 200 small blocks freed alternately and
+  reused, a report after each step: every block at the same distance from its heap as liblv2's, every mallinfo word
+  and free total the same (tests/hle/test_lv2_compare.cpp; 11,531 checks).
+GTA V and Assassin's Creed import none of these.
+
+## D-503 · 2026-10-08 · Host libraries export variables and take floating point arguments
+
+Two things the libraries still to come need (the C and maths libraries above all):
+- **Variables.** A host module can export variables (`Registry::add_variables`, `PS_HLE_VAR(nid, name, size, align,
+  init)`, as RPCS3's REG_VAR): the first import of one lays it out in guest memory (in 64 KB blocks of the main area,
+  zeroed, then its `init`), and every import gets that address (`HleProcess::link_variable`). The loader links them for
+  the game's executable, the firmware's modules and the game's own modules, and a library whose imported variables
+  the host all exports may now stay on the host (D-175 refused that: "the host exports none"). `--hle-list` lists them.
+  The first one: liblv2's sys_prx_version (0x00010001).
+- **Floating point.** The typed binding reads float and double arguments from f1..f13 by their count among the
+  floating ones, each still taking its slot in the sequence so the integers after it come from the registers after
+  theirs (the PPC64 ELF ABI), and puts a float or double result in f1.
+- The registry's lookup is a hash map now: with thousands of functions its linear scan made registration quadratic.
+Tests: the binding with mixed arguments; a variable laid out once, initialised, linked by address.

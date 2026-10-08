@@ -22,11 +22,13 @@
 
 #include "guest.hpp"
 #include "idm.hpp"
+#include "lv2_heap.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/ppu/runtime.h"
 
 namespace pspocket::hle {
 namespace {
@@ -376,87 +378,6 @@ u32 _sys_strrchr(PPUContext& ctx, u32 str, u8 ch)
     }
 }
 
-// ------------------------------------------------------------------------------------------------- malloc, heaps
-
-// RPCS3 vm::alloc(size, vm::main, align) with the alignment at least 64 KB: the main area's first fit, zeroed; 0 when
-// nothing fits (or for size 0). RPCS3 aborts on an alignment that is not a power of two; refused with a log here.
-u32 main_alloc(PPUContext& ctx, std::string_view what, u32 size, u32 align)
-{
-    align = std::max<u32>(align, 0x10000);
-    if (!std::has_single_bit(align)) {
-        refuse(ctx, std::format("{}(size {:#x}): alignment {:#x} is not a power of two; NULL", what, size, align));
-        return 0;
-    }
-    HleProcess* p = HleProcess::current();
-    const u32 addr = p ? p->main_memory().alloc(size, align) : 0;
-    PS_LOG_DEBUG(kChan, "{}(size {:#x}, align {:#x}) -> {:#010x}", what, size, align, addr);
-    return addr;
-}
-
-// RPCS3 vm::dealloc(addr, vm::main). free(NULL) does nothing; another address that is no allocation is logged by the
-// allocator (RPCS3 ignores it).
-void main_free(std::string_view what, u32 addr)
-{
-    PS_LOG_DEBUG(kChan, "{}({:#010x})", what, addr);
-    if (HleProcess* p = HleProcess::current(); p && addr) p->main_memory().free(addr);
-}
-
-u32 _sys_malloc(PPUContext& ctx, u32 size) { return main_alloc(ctx, "_sys_malloc", size, 0x10000); }
-
-u32 _sys_memalign(PPUContext& ctx, u32 align, u32 size) { return main_alloc(ctx, "_sys_memalign", size, align); }
-
-void _sys_free(PPUContext&, u32 addr) { main_free("_sys_free", addr); }
-
-// RPCS3 sys_heap.cpp: a heap is only a name under an ID (idm's HeapInfo: 1..1023); allocations come from the main area
-// as _sys_malloc's whichever heap is named, and deleting a heap or freeing returns CELL_OK whatever the ID.
-struct HeapState {
-    std::mutex mutex;
-    IdTable<std::string, 1, 1023> heaps;
-};
-
-std::string guest_name(lv2::PpuThread& t, u32 addr)
-{
-    if (!addr) return {};
-    const std::optional<u64> n = guest_strnlen(t, addr, 0x100);
-    return n ? std::string(reinterpret_cast<const char*>(t.kernel.base() + addr), *n) : std::string("?");
-}
-
-u32 _sys_heap_create_heap(PPUContext& ctx, u32 name, u32 arg2, u32 arg3, u32 arg4)
-{
-    std::string heap_name = guest_name(thread_of(ctx), name);
-    HeapState& s = HleProcess::current()->state<HeapState>();
-    u32 id = 0;
-    {
-        std::lock_guard lock(s.mutex);
-        id = s.heaps.make(heap_name);
-    }
-    PS_LOG_DEBUG(kChan, "_sys_heap_create_heap(\"{}\", {:#x}, {:#x}, {:#x}) -> {}", heap_name, arg2, arg3, arg4, id);
-    if (!id) PS_LOG_ERROR(kChan, "_sys_heap_create_heap(\"{}\"): all 1023 heap IDs in use; 0", heap_name);
-    return id;
-}
-
-s32 _sys_heap_delete_heap(PPUContext&, u32 heap)
-{
-    PS_LOG_DEBUG(kChan, "_sys_heap_delete_heap({})", heap);
-    HeapState& s = HleProcess::current()->state<HeapState>();
-    std::lock_guard lock(s.mutex);
-    s.heaps.remove(heap);
-    return lv2::CELL_OK;
-}
-
-u32 _sys_heap_malloc(PPUContext& ctx, u32, u32 size) { return main_alloc(ctx, "_sys_heap_malloc", size, 0x10000); }
-
-u32 _sys_heap_memalign(PPUContext& ctx, u32, u32 align, u32 size)
-{
-    return main_alloc(ctx, "_sys_heap_memalign", size, align);
-}
-
-s32 _sys_heap_free(PPUContext&, u32, u32 addr)
-{
-    main_free("_sys_heap_free", addr);
-    return lv2::CELL_OK;
-}
-
 // ------------------------------------------------------------------------------------------------- printf
 
 // The variadic arguments of a call after its `fixed` named ones, as the PPC64 ELF ABI passes them (RPCS3 ps3_fmt_src):
@@ -464,15 +385,28 @@ s32 _sys_heap_free(PPUContext&, u32, u32 addr)
 // A double is in its slot as well (a variadic call puts it there besides an FPR), which is where RPCS3 reads it too.
 // Deviation: RPCS3 reads the ninth argument and the ones after it one slot low (it passes its 0-based index to
 // get_stack_arg, which counts from 1); here from where the caller put them.
+// Or the arguments of a va_list (VarArgs::list): the ABI's va_list is the address of the next argument's 64-bit slot,
+// va_start having stored r4..r10 into the parameter save area beside the ones the caller put there (liblv2's variadic
+// functions start with those stores and hand their formatter r1 + the first slot), so argument n is at ap + 8n.
 class VarArgs {
 public:
     VarArgs(PPUContext& ctx, u32 fixed) : ctx_(ctx), sp_(static_cast<u32>(ctx.gpr[1])), next_(fixed) {}
 
+    static VarArgs list(PPUContext& ctx, u32 ap)
+    {
+        VarArgs a(ctx, 0);
+        a.list_ = ap;
+        a.from_list_ = true;
+        return a;
+    }
+
     u64 next()
     {
         const u32 n = next_++;
-        if (n < 8) return ctx_.gpr[3 + n];
-        const u64 slot = u64{sp_} + 0x30 + 8 * u64{n};
+        u64 slot = 0;
+        if (from_list_) slot = u64{list_} + 8 * u64{n};
+        else if (n < 8) return ctx_.gpr[3 + n];
+        else slot = u64{sp_} + 0x30 + 8 * u64{n};
         if (slot + 8 > GuestMemory::kGuestSize || !guest_readable(thread_of(ctx_), static_cast<u32>(slot), 8)) {
             unreadable_ = true;
             return 0;
@@ -485,27 +419,27 @@ private:
     PPUContext& ctx_;
     const u32 sp_; // r1 at the call (StackVars move it later)
     u32 next_;
+    u32 list_ = 0;
+    bool from_list_ = false;
     bool unreadable_ = false;
 };
 
-// A conversion's flags, width, precision and length (RPCS3 cfmt_append's cfmt_context).
+// A conversion's flags, width and precision.
 struct Conversion {
     bool left = false, sign = false, space = false, alter = false, zeros = false, dot = false;
     u32 width = 0, prec = 0;
-    u32 size = 0;            // the argument's bytes by the length modifier (ps3_fmt_src: long, size_t 4); 0 if none
-    bool plain_long = false; // the modifier was one 'l'
 };
 
 // Widths and precisions are cut to this, so a "%999999999d" cannot exhaust the host's memory.
 constexpr u32 kMaxWidth = 0x10000;
 
 // `v` in `radix`, at least `prec` digits with a precision, else at least one; none for 0 at precision 0 (C99).
-std::string digits(u64 v, u32 radix, bool upper, const Conversion& c, u32 min_digits = 1)
+std::string digits(u64 v, u32 radix, bool upper, const Conversion& c)
 {
     const char* set = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     std::string d;
     for (; v; v /= radix) d += set[v % radix];
-    const u32 want = c.dot ? c.prec : min_digits;
+    const u32 want = c.dot ? c.prec : 1;
     if (d.size() < want) d.append(want - d.size(), '0');
     std::reverse(d.begin(), d.end());
     return d;
@@ -532,224 +466,156 @@ void put_padded(std::string& out, const Conversion& c, std::string_view prefix, 
     }
 }
 
-// RPCS3 formats the floating conversions with the host's snprintf, the sequence as written; the same here, with the
-// width and precision a '*' gave written in (RPCS3 passes those arguments in an order only some hosts read right).
-std::string format_double(const Conversion& c, char conv, double v)
-{
-    std::string spec = "%";
-    if (c.left) spec += '-';
-    if (c.sign) spec += '+';
-    if (c.space) spec += ' ';
-    if (c.alter) spec += '#';
-    if (c.zeros) spec += '0';
-    if (c.width) spec += std::to_string(c.width);
-    if (c.dot) spec += '.' + std::to_string(c.prec);
-    spec += conv;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wformat-nonliteral" // built above from the parsed flags only
-    const int n = std::snprintf(nullptr, 0, spec.c_str(), v);
-    std::string out(n > 0 ? static_cast<usize>(n) : 0, '\0');
-    if (n > 0) std::snprintf(out.data(), out.size() + 1, spec.c_str(), v);
-#pragma clang diagnostic pop
-    return out;
-}
-
-// RPCS3 sys_libc_.cpp ps3_fmt: Utilities/cfmt.h cfmt_append over the guest's arguments. Its parsing is kept: flags,
-// width, precision and length in any order, "%%" only right after the '%', and a sequence it does not know (or a second
-// width, precision or length) printed as written with the rest of the format after it untouched. Conversions: d i u o x
-// X c s p, RPCS3's b and B (binary), and f F e E g G a A; h hh l ll z j t. What differs (C99 is what liblv2 follows):
-// - d and i take the argument at the conversion's size and sign (RPCS3 takes %d's whole 64-bit slot), as u, o and x
-//   always did in both.
-// - Precision 0 prints no digits only for the value 0, and '#' gives "0x" and a leading 0 as C99 (RPCS3 prints nothing
-//   for "%.0d" of any value, and "00" for "%#x" or "%#o" of 0).
-// - %lf is %f (RPCS3 stops at it); %Lf stays unknown.
+// liblv2's formatter, which _sys_printf, _sys_sprintf, _sys_snprintf and their v forms share (the function at 0xc958
+// of liblv2.sprx 4.92), compared call for call with made-up formats in tests/hle/test_lv2_compare.cpp (D-501). It is a
+// small printf of integers, not RPCS3's ps3_fmt (Utilities/cfmt.h, which this followed before):
+// - '%', then flags (- + space # 0), a width (digits, or '*' whose negative value means '-'), a precision ('.' and
+//   digits, or ".*" whose negative value means none) and a length (h and hh, which change nothing but %n's store; l,
+//   32 bits as int; a second l, or L, 64) in any order and any number of times, each later one replacing what it
+//   sets, then the conversion (liblv2 looks every character after '%' up in one table).
+// - d i u o x X c s p n %, as C99 has them, and D O U as d o u, except: %p is "0x" and the hex digits (a precision
+//   ignored, '0' filling after the 0x); '0' fills %s and %c with zeros too; '#' gives an octal number a leading 0
+//   only when it has digits (so "%#.0o" of 0 is empty); %n prints nothing and stores the count.
+// - Any other character, the floating conversions f e g a among them, is printed as it is and takes no argument; a
+//   sequence the format ends in prints nothing.
 // - %s of a null pointer prints "(null)"; a %s or stack argument that is not guest memory is noted in `problems` and
-//   printed as nothing or 0 (RPCS3 faults).
-// - %p is RPCS3's: 16 hex digits without "0x".
+//   printed as nothing or 0 (liblv2 faults).
 std::string format_args(lv2::PpuThread& t, std::string_view fmt, VarArgs& args, std::vector<std::string>& problems)
 {
     std::string out;
     usize i = 0;
+    const auto at = [&](usize k) { return k < fmt.size() ? fmt[k] : '\0'; };
+    const auto decimal = [&] { // digits as liblv2 adds them up, wrapping at 32 bits
+        u32 r = 0;
+        while (at(i) >= '0' && at(i) <= '9') r = r * 10 + static_cast<u32>(fmt[i++] - '0');
+        return r;
+    };
     while (i < fmt.size()) {
         const char first = fmt[i++];
         if (first != '%') {
             out += first;
             continue;
         }
-        const usize start = i - 1;
-        if (i < fmt.size() && fmt[i] == '%') {
-            out += '%';
-            i++;
-            continue;
-        }
-        const auto decimal = [&](u32 v) {
-            u64 r = v;
-            while (i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9')
-                r = std::min<u64>(r * 10 + static_cast<u64>(fmt[i++] - '0'), kMaxWidth);
-            return static_cast<u32>(r);
-        };
+        // After '%' every character goes through one table, as in liblv2: flags, width digits, '*', '.' and the
+        // length letters change the conversion's state and the next character is looked at, in any order and as often
+        // as they come (a later width replaces an earlier one: "%5*d" takes its width from the argument); the first
+        // other character is the conversion.
         Conversion c;
-        bool done = false, dropped = false;
-        while (!done && !dropped) {
-            if (i == fmt.size()) { // an unfinished sequence
-                dropped = true;
-                break;
-            }
+        u32 size = 4;
+        bool half = false;      // h or hh: only %n's store is shorter for it
+        bool long_once = false; // one l: 32 bits still; a second one makes it 64
+        char conv = 0;
+        while (i < fmt.size() && !conv) {
             const char ch = fmt[i++];
             switch (ch) {
             case '-': c.left = true; break;
             case '+': c.sign = true; break;
-            case ' ': c.space = true; break;
+            case ' ': c.space = true; break; // printed only without '+'
             case '#': c.alter = true; break;
             case '0': c.zeros = true; break;
-            case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
-                if (c.width) dropped = true;
-                else c.width = decimal(static_cast<u32>(ch - '0'));
+            case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9': {
+                i--;
+                const u32 w = decimal(); // wraps at 32 bits as liblv2's does; a negative width pads nothing
+                c.width = static_cast<s32>(w) < 0 ? 0 : std::min(w, kMaxWidth);
                 break;
+            }
             case '*': {
-                if (c.width) {
-                    dropped = true;
-                    break;
-                }
                 const s32 w = static_cast<s32>(args.next());
                 c.width = std::min<u32>(w < 0 ? 0u - static_cast<u32>(w) : static_cast<u32>(w), kMaxWidth);
                 c.left |= w < 0;
                 break;
             }
             case '.':
-                if (c.dot || c.prec) {
-                    dropped = true;
-                } else if (i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9') {
-                    c.prec = decimal(0);
-                    c.dot = true;
-                } else if (i < fmt.size() && fmt[i] == '*') {
+                if (at(i) == '*') {
                     i++;
                     const s32 p = static_cast<s32>(args.next());
-                    c.prec = p > 0 ? std::min<u32>(static_cast<u32>(p), kMaxWidth) : 0;
-                    c.dot = p >= 0;
+                    c.dot = p >= 0; // a negative one: none
+                    c.prec = c.dot ? std::min<u32>(static_cast<u32>(p), kMaxWidth) : 0;
                 } else {
-                    c.dot = true;
+                    const u32 p = decimal(); // none digits: 0; one past 31 bits: none
+                    c.dot = static_cast<s32>(p) >= 0;
+                    c.prec = c.dot ? std::min(p, kMaxWidth) : 0;
                 }
                 break;
-            case 'h':
-                if (c.size) dropped = true;
-                else if (i < fmt.size() && fmt[i] == 'h') c.size = 1, i++;
-                else c.size = 2;
-                break;
+            case 'h': half = true; break;
             case 'l':
-                if (c.size) dropped = true;
-                else if (i < fmt.size() && fmt[i] == 'l') c.size = 8, i++;
-                else c.size = 4, c.plain_long = true;
+                if (long_once) size = 8;
+                long_once = !long_once;
                 break;
-            case 'z':
-            case 't':
-                if (c.size) dropped = true;
-                else c.size = 4;
-                break;
-            case 'j':
-                if (c.size) dropped = true;
-                else c.size = 8;
-                break;
-            case 'c': {
-                if (c.size) {
-                    dropped = true;
-                    break;
-                }
-                const char v = static_cast<char>(args.next() & 0xFF);
-                put_padded(out, c, "", std::string_view(&v, 1), false);
-                done = true;
-                break;
-            }
-            case 's': {
-                if (c.size) {
-                    dropped = true;
-                    break;
-                }
-                const u32 addr = static_cast<u32>(args.next());
-                std::string s;
-                if (!addr) {
-                    s = "(null)";
-                } else if (const std::optional<u64> n = guest_strnlen(t, addr, c.dot ? c.prec : kMaxString)) {
-                    s.assign(reinterpret_cast<const char*>(t.kernel.base() + addr), *n);
-                } else {
-                    problems.push_back(
-                        std::format("the %s argument {:#x} is not guest memory (printed as nothing)", addr));
-                }
-                if (c.dot && s.size() > c.prec) s.resize(c.prec);
-                put_padded(out, c, "", s, false);
-                done = true;
-                break;
-            }
-            case 'd':
-            case 'i': {
-                const u64 raw = args.next();
-                const u32 size = c.size ? c.size : 4;
-                const s64 v = size == 1 ? s64{static_cast<s8>(raw)} :
-                    size == 2           ? s64{static_cast<s16>(raw)} :
-                    size == 4           ? s64{static_cast<s32>(raw)} :
-                                          static_cast<s64>(raw);
-                const u64 magnitude = v < 0 ? 0 - static_cast<u64>(v) : static_cast<u64>(v);
-                put_padded(out, c, v < 0 ? "-" : c.sign ? "+" : c.space ? " " : "", digits(magnitude, 10, false, c),
-                    !c.dot);
-                done = true;
-                break;
-            }
-            case 'u': case 'o': case 'x': case 'X': case 'b': case 'B': {
-                const u64 raw = args.next();
-                const u32 size = c.size ? c.size : 4;
-                const u64 v = size == 8 ? raw : raw & ((u64{1} << (8 * size)) - 1);
-                std::string_view prefix;
-                std::string body;
-                if (ch == 'u') {
-                    body = digits(v, 10, false, c);
-                } else if (ch == 'o') {
-                    body = digits(v, 8, false, c);
-                    if (c.alter && (body.empty() || body[0] != '0')) body.insert(body.begin(), '0');
-                } else if (ch == 'x' || ch == 'X') {
-                    body = digits(v, 16, ch == 'X', c);
-                    if (c.alter && v) prefix = ch == 'x' ? "0x" : "0X";
-                } else {
-                    body = digits(v, 2, false, c);
-                }
-                put_padded(out, c, prefix, body, !c.dot);
-                done = true;
-                break;
-            }
-            case 'p': {
-                if (c.size) {
-                    dropped = true;
-                    break;
-                }
-                Conversion hex16 = c;
-                hex16.dot = false;
-                put_padded(out, c, "", digits(args.next(), 16, false, hex16, 16), false);
-                done = true;
-                break;
-            }
-            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
-                if (c.size && !c.plain_long) {
-                    dropped = true;
-                    break;
-                }
-                out += format_double(c, ch, std::bit_cast<double>(args.next()));
-                done = true;
-                break;
-            default: // 'L', 'n' and anything else: unknown, as RPCS3
-                dropped = true;
-                break;
+            case 'L': size = 8; break;
+            case 'D': case 'O': case 'U': conv = static_cast<char>(ch + ('a' - 'A')); break; // as d o u
+            default: conv = ch; break;
             }
         }
-        if (dropped) {
-            out.append(fmt.substr(start));
+        if (!conv) break; // a sequence the format ends in prints nothing
+        switch (conv) {
+        case 'd':
+        case 'i': {
+            const u64 raw = args.next();
+            const s64 v = size == 8 ? static_cast<s64>(raw) : s64{static_cast<s32>(raw)};
+            const u64 magnitude = v < 0 ? 0 - static_cast<u64>(v) : static_cast<u64>(v);
+            put_padded(out, c, v < 0 ? "-" : c.sign ? "+" : c.space ? " " : "", digits(magnitude, 10, false, c),
+                !c.dot);
+            break;
+        }
+        case 'u': case 'o': case 'x': case 'X': {
+            const u64 raw = args.next();
+            const u64 v = size == 8 ? raw : static_cast<u32>(raw);
+            std::string_view prefix;
+            std::string body = digits(v, conv == 'u' ? 10 : conv == 'o' ? 8 : 16, conv == 'X', c);
+            if (conv == 'o' && c.alter && !body.empty() && body[0] != '0') body.insert(body.begin(), '0');
+            if ((conv == 'x' || conv == 'X') && c.alter && v) prefix = conv == 'x' ? "0x" : "0X";
+            put_padded(out, c, prefix, body, !c.dot);
+            break;
+        }
+        case 'c': {
+            const char v = static_cast<char>(args.next() & 0xFF);
+            put_padded(out, c, "", std::string_view(&v, 1), true);
+            break;
+        }
+        case 's': {
+            const u32 addr = static_cast<u32>(args.next());
+            std::string s;
+            if (!addr) {
+                s = "(null)";
+            } else if (const std::optional<u64> n = guest_strnlen(t, addr, c.dot ? c.prec : kMaxString)) {
+                s.assign(reinterpret_cast<const char*>(t.kernel.base() + addr), *n);
+            } else {
+                problems.push_back(std::format("the %s argument {:#x} is not guest memory (printed as nothing)", addr));
+            }
+            if (c.dot && s.size() > c.prec) s.resize(c.prec);
+            put_padded(out, c, "", s, true);
+            break;
+        }
+        case 'p': {
+            Conversion hex = c;
+            hex.dot = false;
+            put_padded(out, c, "0x", digits(static_cast<u32>(args.next()), 16, false, hex), true);
+            break;
+        }
+        case 'n': { // the number of characters so far, stored at the argument: 4 bytes (ll too), 2 with h or hh
+            const u32 addr = static_cast<u32>(args.next());
+            const u32 bytes = half ? 2 : 4;
+            if (!guest_range(t, addr, bytes)) {
+                problems.push_back(std::format("the %n argument {:#x} is not guest memory (nothing stored)", addr));
+            } else if (bytes == 2) {
+                ps_write16(t.kernel.base(), addr, static_cast<u16>(out.size()));
+            } else {
+                ps_write32(t.kernel.base(), addr, static_cast<u32>(out.size()));
+            }
+            break;
+        }
+        default: // '%' and any character liblv2 does not convert
+            out += conv;
             break;
         }
     }
     return out;
 }
 
-// The text of a printf-family call: the guest format at `fmt` with the arguments after the call's `fixed` named ones.
-// False (the call site logged) when the format is not guest memory: RPCS3 faults, the call returns CELL_EFAULT here.
-bool format_call(PPUContext& ctx, std::string_view what, u32 fmt, u32 fixed, std::string& out)
+// The text of a printf-family call: the guest format at `fmt` with `args`. False (the call site logged) when the format
+// is not guest memory: RPCS3 faults, the call returns CELL_EFAULT here.
+bool format_text(PPUContext& ctx, std::string_view what, u32 fmt, VarArgs& args, std::string& out)
 {
     lv2::PpuThread& t = thread_of(ctx);
     const std::optional<u64> n = fmt ? guest_strnlen(t, fmt, kMaxString) : std::nullopt;
@@ -758,7 +624,6 @@ bool format_call(PPUContext& ctx, std::string_view what, u32 fmt, u32 fixed, std
         return false;
     }
     const std::string format(reinterpret_cast<const char*>(t.kernel.base() + fmt), *n);
-    VarArgs args(ctx, fixed);
     std::vector<std::string> problems;
     out = format_args(t, format, args, problems);
     if (args.unreadable()) problems.emplace_back("an argument on the stack is not guest memory (read as 0)");
@@ -771,13 +636,25 @@ bool format_call(PPUContext& ctx, std::string_view what, u32 fmt, u32 fixed, std
     return true;
 }
 
-// RPCS3 _sys_printf: the text to sys_tty_write on channel 0, from guest memory (vm::make_str puts it on the stack).
+// ... with the arguments after the call's `fixed` named ones.
+bool format_call(PPUContext& ctx, std::string_view what, u32 fmt, u32 fixed, std::string& out)
+{
+    VarArgs args(ctx, fixed);
+    return format_text(ctx, what, fmt, args, out);
+}
+
+// ... with the arguments of the va_list `ap` (the v functions).
+bool format_list(PPUContext& ctx, std::string_view what, u32 fmt, u32 ap, std::string& out)
+{
+    VarArgs args = VarArgs::list(ctx, ap);
+    return format_text(ctx, what, fmt, args, out);
+}
+
+// The text to sys_tty_write on channel 0, from guest memory (RPCS3 _sys_printf; liblv2 writes it 127 bytes at a time).
 // Here in pieces of up to 1 KB on the caller's stack, each ending after a line where one ends in it, so a long text
 // needs no more stack than that.
-s32 _sys_printf(PPUContext& ctx, u32 fmt)
+void tty_print(PPUContext& ctx, std::string_view text)
 {
-    std::string text;
-    if (!format_call(ctx, "_sys_printf", fmt, 1, text)) return err(lv2::CELL_EFAULT);
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
     constexpr usize kPiece = 0x400;
@@ -792,17 +669,32 @@ s32 _sys_printf(PPUContext& ctx, u32 fmt)
         lv2::sys_tty_write(t, 0, piece.addr(), static_cast<u32>(n), piece.addr() + kPiece);
         rest.remove_prefix(n);
     }
-    return lv2::CELL_OK;
+}
+
+// liblv2's: the number of characters printed (RPCS3 returns CELL_OK).
+s32 _sys_printf(PPUContext& ctx, u32 fmt)
+{
+    std::string text;
+    if (!format_call(ctx, "_sys_printf", fmt, 1, text)) return err(lv2::CELL_EFAULT);
+    tty_print(ctx, text);
+    return static_cast<s32>(text.size());
+}
+
+// liblv2's _sys_vprintf: _sys_printf with a va_list.
+s32 _sys_vprintf(PPUContext& ctx, u32 fmt, u32 ap)
+{
+    std::string text;
+    if (!format_list(ctx, "_sys_vprintf", fmt, ap, text)) return err(lv2::CELL_EFAULT);
+    tty_print(ctx, text);
+    return static_cast<s32>(text.size());
 }
 
 // RPCS3: the text and its NUL into `buffer`; its length.
-s32 _sys_sprintf(PPUContext& ctx, u32 buffer, u32 fmt)
+s32 put_sprintf(PPUContext& ctx, std::string_view what, u32 buffer, std::string_view text)
 {
-    std::string text;
-    if (!format_call(ctx, "_sys_sprintf", fmt, 2, text)) return err(lv2::CELL_EFAULT);
     lv2::PpuThread& t = thread_of(ctx);
     if (!guest_range(t, buffer, text.size() + 1)) {
-        refuse(ctx, std::format("_sys_sprintf({:#x}): {} bytes do not fit guest memory there; CELL_EFAULT", buffer,
+        refuse(ctx, std::format("{}({:#x}): {} bytes do not fit guest memory there; CELL_EFAULT", what, buffer,
             text.size() + 1));
         return err(lv2::CELL_EFAULT);
     }
@@ -811,23 +703,337 @@ s32 _sys_sprintf(PPUContext& ctx, u32 buffer, u32 fmt)
     return static_cast<s32>(text.size());
 }
 
-// RPCS3: 0 for a count of 0 (nothing written); else up to count - 1 bytes of the text and a NUL, and the number of
-// bytes written (not the text's whole length, which C99's snprintf returns).
+s32 _sys_sprintf(PPUContext& ctx, u32 buffer, u32 fmt)
+{
+    std::string text;
+    if (!format_call(ctx, "_sys_sprintf", fmt, 2, text)) return err(lv2::CELL_EFAULT);
+    return put_sprintf(ctx, "_sys_sprintf", buffer, text);
+}
+
+// liblv2's _sys_vsprintf: _sys_sprintf with a va_list.
+s32 _sys_vsprintf(PPUContext& ctx, u32 buffer, u32 fmt, u32 ap)
+{
+    std::string text;
+    if (!format_list(ctx, "_sys_vsprintf", fmt, ap, text)) return err(lv2::CELL_EFAULT);
+    return put_sprintf(ctx, "_sys_vsprintf", buffer, text);
+}
+
+// liblv2's (compared in tests/hle/test_lv2_compare.cpp, D-501): up to count - 1 bytes of the text, the text's whole
+// length back (as C99's snprintf; RPCS3 returns the bytes written), and, for a count other than 0, a NUL at dst + that
+// length: past the bytes written, and past the buffer when the text was cut, which is what liblv2 does.
+s32 put_snprintf(PPUContext& ctx, std::string_view what, u32 dst, u32 count, std::string_view text)
+{
+    if (!count) return static_cast<s32>(text.size());
+    const u32 n = static_cast<u32>(std::min<usize>(count - 1, text.size()));
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_range(t, dst, n) || !guest_range(t, static_cast<u32>(dst + text.size()), 1)) {
+        refuse(ctx, std::format("{}({:#x}, {}): not guest memory; CELL_EFAULT", what, dst, count));
+        return err(lv2::CELL_EFAULT);
+    }
+    std::memcpy(t.kernel.base() + dst, text.data(), n);
+    t.kernel.base()[dst + text.size()] = 0;
+    return static_cast<s32>(text.size());
+}
+
 s32 _sys_snprintf(PPUContext& ctx, u32 dst, u32 count, u32 fmt)
 {
     std::string text;
     if (!format_call(ctx, "_sys_snprintf", fmt, 3, text)) return err(lv2::CELL_EFAULT);
-    if (!count) return 0;
-    const u32 n = static_cast<u32>(std::min<usize>(count - 1, text.size()));
-    lv2::PpuThread& t = thread_of(ctx);
-    if (!guest_range(t, dst, u64{n} + 1)) {
-        refuse(ctx, std::format("_sys_snprintf({:#x}, {}): not guest memory; CELL_EFAULT", dst, count));
-        return err(lv2::CELL_EFAULT);
-    }
-    std::memcpy(t.kernel.base() + dst, text.data(), n);
-    t.kernel.base()[dst + n] = 0;
-    return static_cast<s32>(n);
+    return put_snprintf(ctx, "_sys_snprintf", dst, count, text);
 }
+
+// liblv2's _sys_vsnprintf: _sys_snprintf with a va_list.
+s32 _sys_vsnprintf(PPUContext& ctx, u32 dst, u32 count, u32 fmt, u32 ap)
+{
+    std::string text;
+    if (!format_list(ctx, "_sys_vsnprintf", fmt, ap, text)) return err(lv2::CELL_EFAULT);
+    return put_snprintf(ctx, "_sys_vsnprintf", dst, count, text);
+}
+
+// liblv2's _sys_panic (code read from the firmware's module, D-500): the message as _sys_printf prints it, then the
+// process ends with CELL_EABORT through the syscall itself (no atexit handlers run). liblv2 also tells a debugger
+// first (syscall 988, which RPCS3 and pspocket leave unanswered) and traps instead when one is attached.
+[[noreturn]] void panic_exit(PPUContext& ctx, std::string_view text)
+{
+    tty_print(ctx, text);
+    PS_LOG_ERROR(kChan, "_sys_panic: \"{}\": the process ends (CELL_EABORT)", text);
+    lv2::_sys_process_exit(thread_of(ctx), static_cast<s32>(lv2::CELL_EABORT), 0, 0);
+    PS_FATAL(kChan, "_sys_process_exit returned");
+}
+
+void _sys_panic(PPUContext& ctx, u32 fmt)
+{
+    std::string text;
+    if (!format_call(ctx, "_sys_panic", fmt, 1, text)) text = "(the panic message is not guest memory)\n";
+    panic_exit(ctx, text);
+}
+
+// liblv2's export 0x9FB6228E, whose name is not known (libfiber, libspurs_jq and libsync2 import it for their fatal
+// errors): the message by _sys_vprintf, then _sys_panic("\n").
+void sysPrxForUser_9FB6228E(PPUContext& ctx, u32 fmt)
+{
+    std::string text;
+    if (!format_call(ctx, "sysPrxForUser_9FB6228E", fmt, 1, text)) text.clear();
+    tty_print(ctx, text);
+    panic_exit(ctx, "\n");
+}
+
+// liblv2's __tls_get_addr: not supported there; it panics with this message.
+u32 __tls_get_addr(PPUContext& ctx)
+{
+    panic_exit(ctx, "__tls_get_addr called -> panic\n");
+}
+
+// liblv2's __sys_printf_basename: the part of the path after its last '/' that something follows (the whole path
+// without one; "dir/" stays "dir/", as liblv2's loop keeps the start when a '/' ends the path).
+u32 __sys_printf_basename(PPUContext& ctx, u32 path)
+{
+    GuestBytes s(thread_of(ctx), path);
+    u32 base = path;
+    for (u64 i = 0;; i++) {
+        const int c = s.at(i);
+        const int next = c == '/' ? s.at(i + 1) : 1;
+        if (c < 0 || next < 0) {
+            refuse(ctx, std::format("__sys_printf_basename({:#x}): not guest memory; the path itself", path));
+            return path;
+        }
+        if (c == 0 || next == 0) return base;
+        if (c == '/') base = static_cast<u32>(path + i + 1);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------- heaps, malloc
+
+// liblv2's heaps (D-502), read from liblv2.sprx and compared with it (tests/hle/test_lv2_compare.cpp). A heap is a
+// dlmalloc mspace (lv2_heap.hpp) in memory of its own, and its ID is the address of its malloc_state:
+// - _sys_heap_create_heap(name, size, flags, attr) takes the memory from sys_memory_allocate (size rounded up to 64 KB,
+//   64 KB pages), or, with the flags' top bit set and an attribute {u32 8, u32 address} whose address is not 0 (and
+//   flag 1 clear), the caller's memory at that address, `size` bytes of it. The name (31 characters) and the flags go
+//   into the malloc_state where liblv2 keeps them; 0 when the attribute is not 8 bytes or the memory cannot be had.
+// - _sys_heap_delete_heap gives the memory back with sys_memory_free when liblv2 took it (the flags' top bit clear).
+// - _sys_malloc, _sys_memalign and _sys_free use liblv2's own heap, "__sys_heap": 512 KB, flags 0x110000, made as
+//   liblv2 starts (here at the first of them), so liblv2's C library has 512 KB in all, as on a PS3.
+// - A heap of 0 prints "invalid heap area 0x0" (and _sys_heap_free and _sys_heap_stats return what printf did).
+// liblv2 holds each heap's lwmutex around its calls; one host mutex for all of them here (no guest code runs inside).
+// Before, as RPCS3's sys_heap.cpp: an ID only, and every block a 64 KB-aligned allocation of the main area.
+struct HeapState {
+    std::mutex mutex;
+    lv2heap::Params params;
+    bool params_set = false;
+    u32 count = 0;              // liblv2 counts its heaps
+    std::atomic<u32> own{0};    // "__sys_heap"
+    std::atomic<bool> own_tried{false};
+};
+
+HeapState& heaps(PPUContext&)
+{
+    HeapState& s = HleProcess::current()->state<HeapState>();
+    return s;
+}
+
+// liblv2's init_mparams: the magic from the timebase's low word, as dlmalloc makes it from time(0).
+const lv2heap::Params& heap_params(HeapState& s)
+{
+    if (!s.params_set) {
+        const u32 t = static_cast<u32>(ps_ppu_timebase());
+        s.params.magic = ((t ^ 0x55555555u) | 8u) & ~7u;
+        s.params_set = true;
+    }
+    return s.params;
+}
+
+s32 invalid_heap(PPUContext& ctx, u32 heap)
+{
+    const std::string text = std::format("invalid heap area 0x{:x}\n", heap);
+    tty_print(ctx, text);
+    return static_cast<s32>(text.size());
+}
+
+u32 _sys_heap_create_heap(PPUContext& ctx, u32 name, u32 size, u32 flags, u32 attr)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    u32 memory = 0, capacity = 0, info_flags = 0;
+    bool own_memory = true;
+    if (attr) {
+        if (!guest_range(t, attr, 8) || ps_read32(base, attr) != 8) return 0;
+        if ((flags & 0x80000000u) && ps_read32(base, attr + 4) != 0 && !(flags & 1)) {
+            own_memory = false;
+            memory = ps_read32(base, attr + 4);
+            capacity = size;
+            info_flags = flags;
+        }
+    }
+    if (own_memory) {
+        capacity = static_cast<u32>((u64{size} + 0xFFFF) & ~u64{0xFFFF});
+        StackVar addr(ctx, base, 8);
+        if (lv2::sys_memory_allocate(t, capacity, 0x200, addr.addr()) != lv2::CELL_OK) return 0;
+        memory = ps_read32(base, addr.addr());
+        info_flags = flags & 0x7FFFFFFF;
+    }
+    HeapState& s = heaps(ctx);
+    std::lock_guard lock(s.mutex);
+    lv2heap::Space space(base, heap_params(s));
+    const u32 m = guest_range(t, memory, capacity) ? space.create_with_base(memory, capacity) : 0;
+    if (m) {
+        ps_write32(base, m + lv2heap::kStateFlags, info_flags);
+        const std::string n = name ? read_cstr(t, name, lv2heap::kStateNameMax).text : std::string();
+        for (u32 i = 0; i < lv2heap::kStateNameMax; i++)
+            ps_write8(base, m + lv2heap::kStateName + i, i < n.size() ? static_cast<u8>(n[i]) : 0);
+        ps_write8(base, m + lv2heap::kStateName + lv2heap::kStateNameMax, 0);
+    }
+    s.count++;
+    PS_LOG_DEBUG(kChan, "_sys_heap_create_heap({:#x}, {:#x}, {:#x}, {:#x}) -> {:#x}", name, size, flags, attr, m);
+    return m;
+}
+
+s32 _sys_heap_delete_heap(PPUContext& ctx, u32 heap)
+{
+    if (!heap) {
+        invalid_heap(ctx, heap);
+        return lv2::CELL_OK;
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    HeapState& s = heaps(ctx);
+    std::lock_guard lock(s.mutex);
+    if (!guest_range(t, heap, lv2heap::kStateSize)) {
+        refuse(ctx, std::format("_sys_heap_delete_heap({:#x}): not guest memory (liblv2 faults)", heap));
+        return lv2::CELL_OK;
+    }
+    const u32 info_flags = ps_read32(base, heap + lv2heap::kStateFlags);
+    const u32 memory = ps_read32(base, heap + 16); // least_addr: the segment's base
+    lv2heap::Space(base, heap_params(s)).destroy(heap);
+    if (!(info_flags & 0x80000000u)) lv2::sys_memory_free(t, memory);
+    s.count--;
+    return lv2::CELL_OK;
+}
+
+// A heap's operation under the lock, when the heap is not 0 and its malloc_state is guest memory.
+template <class F>
+auto with_heap(PPUContext& ctx, u32 heap, F&& f)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    HeapState& s = heaps(ctx);
+    std::lock_guard lock(s.mutex);
+    lv2heap::Space space(t.kernel.base(), heap_params(s));
+    return f(space, guest_range(t, heap, lv2heap::kStateSize));
+}
+
+u32 _sys_heap_malloc(PPUContext& ctx, u32 heap, u32 size)
+{
+    if (!heap) {
+        invalid_heap(ctx, heap);
+        return 0;
+    }
+    return with_heap(ctx, heap, [&](lv2heap::Space& space, bool ok) { return ok ? space.malloc(heap, size) : 0u; });
+}
+
+u32 _sys_heap_memalign(PPUContext& ctx, u32 heap, u32 align, u32 size)
+{
+    if (!heap) {
+        invalid_heap(ctx, heap);
+        return 0;
+    }
+    return with_heap(ctx, heap,
+        [&](lv2heap::Space& space, bool ok) { return ok ? space.memalign(heap, align, size) : 0u; });
+}
+
+s32 _sys_heap_free(PPUContext& ctx, u32 heap, u32 addr)
+{
+    if (!heap) return invalid_heap(ctx, heap);
+    with_heap(ctx, heap, [&](lv2heap::Space& space, bool ok) {
+        if (ok && (!addr || guest_range(thread_of(ctx), addr - 8, 8))) space.free(heap, addr);
+        return 0;
+    });
+    return lv2::CELL_OK;
+}
+
+// liblv2: malloc, or with an attribute {u32 size > 7, u32 alignment} memalign by a power of two that is a multiple of
+// 4 (0 for any other).
+u32 _sys_heap_alloc_heap_memory(PPUContext& ctx, u32 heap, u32 size, u32 attr)
+{
+    if (!heap) {
+        invalid_heap(ctx, heap);
+        return 0;
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    u32 align = 0;
+    if (attr) {
+        if (!guest_range(t, attr, 8) || ps_read32(t.kernel.base(), attr) <= 7) return 0;
+        align = ps_read32(t.kernel.base(), attr + 4);
+        if (!align || (align & 3) || !std::has_single_bit(align)) return 0;
+    }
+    return with_heap(ctx, heap, [&](lv2heap::Space& space, bool ok) {
+        return !ok ? 0u : align ? space.memalign(heap, align, size) : space.malloc(heap, size);
+    });
+}
+
+// struct mallinfo's ten words into `info`.
+s32 _sys_heap_get_mallinfo(PPUContext& ctx, u32 heap, u32 info)
+{
+    if (!heap) {
+        invalid_heap(ctx, heap);
+        return lv2::CELL_OK;
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    const lv2heap::MallInfo mi =
+        with_heap(ctx, heap, [&](lv2heap::Space& space, bool ok) { return ok ? space.mallinfo(heap) : lv2heap::MallInfo{}; });
+    if (!guest_range(t, info, 40)) {
+        refuse(ctx, std::format("_sys_heap_get_mallinfo({:#x}, {:#x}): not guest memory (liblv2 faults)", heap, info));
+        return lv2::CELL_OK;
+    }
+    const u32 words[] = {mi.arena, mi.ordblks, mi.smblks, mi.hblks, mi.hblkhd, mi.usmblks, mi.fsmblks, mi.uordblks,
+                         mi.fordblks, mi.keepcost};
+    for (u32 i = 0; i < 10; i++) ps_write32(t.kernel.base(), info + 4 * i, words[i]);
+    return lv2::CELL_OK;
+}
+
+// mallinfo's fordblks: the free bytes, the top's included.
+u32 _sys_heap_get_total_free_size(PPUContext& ctx, u32 heap)
+{
+    if (!heap) {
+        invalid_heap(ctx, heap);
+        return 0;
+    }
+    return with_heap(ctx, heap, [&](lv2heap::Space& space, bool ok) { return ok ? space.mallinfo(heap).fordblks : 0u; });
+}
+
+// dlmalloc's malloc_stats, whose printing liblv2 leaves out: 0 for a heap, the heap itself when it is not one.
+u32 _sys_heap_stats(PPUContext& ctx, u32 heap)
+{
+    if (!heap) return static_cast<u32>(invalid_heap(ctx, heap));
+    return with_heap(ctx, heap, [&](lv2heap::Space& space, bool ok) {
+        if (!ok || !space.ok_magic(heap)) return heap;
+        space.malloc_stats(heap);
+        return 0u;
+    });
+}
+
+// liblv2's own heap, made with the first call that needs it (liblv2 makes it as it starts); a process that cannot have
+// its 512 KB ends there with CELL_EAGAIN.
+u32 own_heap(PPUContext& ctx)
+{
+    HeapState& s = heaps(ctx);
+    if (const u32 h = s.own.load(std::memory_order_acquire)) return h;
+    static std::mutex make;
+    std::lock_guard lock(make);
+    if (const u32 h = s.own.load(std::memory_order_acquire)) return h;
+    lv2::PpuThread& t = thread_of(ctx);
+    StackVar name(ctx, t.kernel.base(), 16);
+    std::memcpy(t.kernel.base() + name.addr(), "__sys_heap", 11);
+    const u32 h = _sys_heap_create_heap(ctx, name.addr(), 0x80000, 0x110000, 0);
+    if (!h) {
+        PS_LOG_ERROR(kChan, "liblv2's heap (512 KB) could not be made: the process ends (CELL_EAGAIN), as liblv2's does");
+        lv2::_sys_process_exit(t, static_cast<s32>(lv2::CELL_EAGAIN), 0, 0);
+    }
+    s.own.store(h, std::memory_order_release);
+    return h;
+}
+
+u32 _sys_malloc(PPUContext& ctx, u32 size) { return _sys_heap_malloc(ctx, own_heap(ctx), size); }
+u32 _sys_memalign(PPUContext& ctx, u32 align, u32 size) { return _sys_heap_memalign(ctx, own_heap(ctx), align, size); }
+void _sys_free(PPUContext& ctx, u32 addr) { _sys_heap_free(ctx, own_heap(ctx), addr); }
 
 // ------------------------------------------------------------------------------------------------- qsort
 
@@ -870,6 +1076,11 @@ void _sys_qsort(PPUContext& ctx, u32 base_addr, u32 nelem, u32 size, u32 cmp)
 
 } // namespace
 
+// For sysPrxForUser_sys.cpp: liblv2's own _sys_malloc and _sys_free, and _sys_panic's end.
+u32 lv2_malloc(PPUContext& ctx, u32 size) { return _sys_malloc(ctx, size); }
+void lv2_free(PPUContext& ctx, u32 addr) { _sys_free(ctx, addr); }
+[[noreturn]] void lv2_panic(PPUContext& ctx, std::string_view text) { panic_exit(ctx, text); }
+
 void register_sysPrxForUser_libc(Registry& r)
 {
     r.add("sysPrxForUser", {
@@ -897,12 +1108,23 @@ void register_sysPrxForUser_libc(Registry& r)
         PS_HLE_FUNC(0x06574237, _sys_snprintf),
         PS_HLE_FUNC(0x9F04F7AF, _sys_printf),
         PS_HLE_FUNC(0xA1F9EAFE, _sys_sprintf),
+        PS_HLE_FUNC(0x0618936B, _sys_vsnprintf),
+        PS_HLE_FUNC(0xFA7F693D, _sys_vprintf),
+        PS_HLE_FUNC(0x791B9219, _sys_vsprintf),
+        PS_HLE_FUNC(0x4232B0DB, _sys_panic),
+        PS_HLE_FUNC(0x9FB6228E, sysPrxForUser_9FB6228E),
+        PS_HLE_FUNC(0x8CFEF376, __tls_get_addr),
+        PS_HLE_FUNC(0x02E20EC1, __sys_printf_basename),
         PS_HLE_FUNC(0xC4FD6121, _sys_qsort),
         PS_HLE_FUNC(0xB2FCF2C8, _sys_heap_create_heap),
         PS_HLE_FUNC(0xAEDE4B03, _sys_heap_delete_heap),
         PS_HLE_FUNC(0x35168520, _sys_heap_malloc),
         PS_HLE_FUNC(0x44265C08, _sys_heap_memalign),
         PS_HLE_FUNC(0x8A561D92, _sys_heap_free),
+        PS_HLE_FUNC(0xB9BF1078, _sys_heap_alloc_heap_memory),
+        PS_HLE_FUNC(0xD1AD4570, _sys_heap_get_mallinfo),
+        PS_HLE_FUNC(0xB6369393, _sys_heap_get_total_free_size),
+        PS_HLE_FUNC(0x8985B5B6, _sys_heap_stats),
     });
     // sys_libc (RPCS3 sys_libc.cpp, REG_FNID by the C names): the same memory functions under libc's names. The
     // firmware has the library in a module of its own that games don't load (docs/firmware.md), but RPCS3 serves it.

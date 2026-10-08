@@ -437,3 +437,15 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   word alone, 0x12, a light sync, then the previous lap's commands. A PUT now writes its first eight bytes in one store.
 - **State:** fixed (D-225): 0 stops in 11 loaded walks where 3 in 10 stopped before. Confirm on the iPhone (run 100's
   stop came after 110 s there).
+
+## System libraries (D-500)
+
+- **The count.** The chart counts every function RPCS3 registers (6,625). 2,752 of them are sys_libc, sys_libm and
+  sys_libstdcxx, which no firmware module has (games link them into themselves); the firmware-backed libraries are
+  2,305 functions. Next for the count: the firmware-backed libraries in order of use, then the C and C++ libraries.
+- **liblv2's printf (D-501).** Sony's formatter has no floating point; one that games call with %f prints "f". Faithful,
+  not an improvement to make.
+- **liblv2's heap (D-502).** One host mutex for every heap (liblv2 locks each heap's own); if heap calls ever show in a
+  profile, a mutex per heap.
+- **Kernel gaps behind liblv2's wrappers.** sys_rsxaudio (650-658), interrupt threads (84, 89) and process spawning
+  (21) answer CELL_ENOSYS in lv2; RPCS3 implements sys_rsxaudio.

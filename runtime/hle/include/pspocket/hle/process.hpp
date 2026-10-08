@@ -139,6 +139,9 @@ public:
     // game loads, D-159) it is safe for the first kPreparedChunks chunks of stubs: the tables linked_at reads without
     // the lock never move before then.
     u32 link_function(std::string_view module, u32 nid, std::string_view name);
+    // The guest address of the host variable module::nid (Registry::find_variable), laid out the first time: 0 when
+    // the registry has none or no memory is left for it (D-503).
+    u32 link_variable(std::string_view module, u32 nid);
 
     // Links every internal function (Function::internal) of the modules in `modules` (the game's imports). Same rule
     // as link_function: before guest threads run. Returns false when the main area is full.
@@ -210,6 +213,8 @@ private:
     std::vector<std::unique_ptr<LinkedFunction>> linked_; // index = chunk * kEntriesPerChunk + entry
     ModuleLoader* module_loader_ = nullptr;
     std::map<std::pair<std::string, u32>, u32> imports_; // under link_mutex_
+    std::map<std::pair<std::string, u32>, u32> variables_; // host variables linked, under link_mutex_
+    u32 variable_block_ = 0, variable_used_ = 0;           // where they are laid out, under link_mutex_
     std::atomic<u64> unimplemented_calls_{0};
     std::atomic<u64> stub_calls_{0};
 

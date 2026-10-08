@@ -544,7 +544,7 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
         return !always_native(file) && !refused_.contains(file) && !host_bound(file);
     };
     // The roots: the files of the import libraries the host cannot serve (it lacks one of their imported functions, or
-    // a variable is imported: the host exports none), and `root_file`. What was chosen before stays: it is linked.
+    // a variable is imported that the host does not export, D-503), and `root_file`. What was chosen before stays: it is linked.
     std::set<std::string, std::less<>> candidates = chosen_, roots;
     std::map<std::string, std::vector<u32>, std::less<>> lacking; // library -> imported functions the host lacks
     if (!root_file.empty() && files_.contains(root_file) && (chosen_.contains(root_file) || can_join(root_file)))
@@ -558,7 +558,9 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
         std::vector<u32> missing;
         for (const u32 nid : need.functions)
             if (!on_host(need.library, nid)) missing.push_back(nid);
-        if (missing.empty() && need.variables.empty()) continue;
+        const bool variables_on_host = std::all_of(need.variables.begin(), need.variables.end(),
+            [&](u32 nid) { return hle::registry().find_variable(need.library, nid) != nullptr; });
+        if (missing.empty() && variables_on_host) continue;
         if (file && (chosen_.contains(*file) || can_join(*file))) roots.insert(*file);
         else if (!missing.empty()) lacking[need.library] = std::move(missing);
     }
@@ -741,8 +743,8 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
     // Known before its imports are linked, so modules that import from each other find each other.
     PrxModule* m = module.get();
     loaded_.push_back(std::move(module));
-    // From a firmware module the host does not replace (loaded now if need be), else the host's stub; variables only
-    // from firmware modules (the host exports none).
+    // From a firmware module the host does not replace (loaded now if need be), else the host's stub; a variable
+    // likewise, else the host's variable (D-503).
     const auto from_module = [&](std::string_view library, u32 nid, bool variable) -> u32 {
         if (!chooses(library)) return 0;
         std::string dep_error;
@@ -762,7 +764,10 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
             if (const u32 d = from_module(library, nid, false)) return d;
             return hle.link_function(library, nid, {});
         },
-        [&](std::string_view library, u32 nid) { return from_module(library, nid, true); });
+        [&](std::string_view library, u32 nid) {
+            if (const u32 v = from_module(library, nid, true)) return v;
+            return chooses(library) ? 0u : hle.link_variable(library, nid); // the host's (D-503)
+        });
     if (m->start) starts_.push_back(m->start);
     if (on_load_) on_load_(*m);
     PS_LOG_INFO(kChan, "{} ({}): {} segments at {:#x}, {} relocations ({} bad), {} functions exported, module_start {:#x}",
@@ -838,7 +843,7 @@ u32 RuntimeModules::link_variable(std::string_view library, u32 nid, std::string
             PS_LOG_ERROR(kChan, "{} needs {}: {}", who, library, why);
         }
     }
-    return 0;
+    return hle_.link_variable(library, nid); // the host's, or 0 (D-503)
 }
 
 u32 RuntimeModules::load(std::string_view path, u32* id) { return load_at(path, 0, id); }

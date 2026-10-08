@@ -260,12 +260,68 @@ void _sys_process_at_Exitspawn(PPUContext&, u32 func)
     PS_LOG_DEBUG(kChan, "_sys_process_at_Exitspawn({:#x})", func);
 }
 
-// RPCS3 sysPrxForUser.cpp sys_process_exit. Deviation: RPCS3 first locks the "_lv2tls" exit mutex that its
-// sys_initialize_tls creates; atexit handlers are a TODO there too.
+// liblv2's process exit list (read from the firmware's module, D-501; RPCS3 has a TODO): sys_process_atexit appends a
+// function (a descriptor) under an lv2 mutex, the table growing by 8 entries from _sys_malloc; sys_process_exit calls
+// them from the last to the first, each taken off the list before its call, then ends the process. Before that it
+// takes an exit mutex it never gives back, so a second thread exiting at the same time waits there until the process
+// ends. Deviations: the table lives on the host (a game cannot see liblv2's), so no _sys_malloc and no ENOMEM; both
+// mutexes are made at their first use (liblv2 makes them as it starts).
+struct ProcessAtexitState {
+    std::mutex create; // the lv2 mutexes' creation
+    std::atomic<u32> list_mutex{0}, exit_mutex{0};
+    std::vector<u32> funcs; // guarded by list_mutex
+};
+
+u32 process_mutex(PPUContext& ctx, ProcessAtexitState& s, std::atomic<u32>& slot, const char (&name)[8])
+{
+    if (const u32 m = slot.load(std::memory_order_acquire)) return m;
+    std::lock_guard lock(s.create);
+    if (const u32 m = slot.load(std::memory_order_acquire)) return m;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar v(ctx, base, 0x30); // the ID, then sys_mutex_attribute_t
+    const u32 id = v.addr(), attr = v.addr() + 8;
+    ps_write32(base, attr + 0x00, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, attr + 0x04, lv2::SYS_SYNC_RECURSIVE);
+    ps_write32(base, attr + 0x08, lv2::SYS_SYNC_NOT_PROCESS_SHARED);
+    ps_write32(base, attr + 0x0C, lv2::SYS_SYNC_NOT_ADAPTIVE);
+    std::memcpy(base + attr + 0x20, name, 8);
+    if (const s32 r = lv2::sys_mutex_create(t, id, attr); r != lv2::CELL_OK)
+        PS_FATAL(kChan, "the {} mutex: {}", name, lv2::error_name(r));
+    slot.store(ps_read32(base, id), std::memory_order_release);
+    return ps_read32(base, id);
+}
+
+s32 sys_process_atexit(PPUContext& ctx, u32 func)
+{
+    PS_LOG_DEBUG(kChan, "sys_process_atexit({:#x})", func);
+    if (!func) return lv2::err(lv2::CELL_EINVAL);
+    lv2::PpuThread& t = thread_of(ctx);
+    ProcessAtexitState& s = HleProcess::current()->state<ProcessAtexitState>();
+    const u32 m = process_mutex(ctx, s, s.list_mutex, "atexitp");
+    lv2::sys_mutex_lock(t, m, 0);
+    s.funcs.push_back(func);
+    lv2::sys_mutex_unlock(t, m);
+    return lv2::CELL_OK;
+}
+
+// liblv2's sys_process_exit: the exit mutex, the exit list, then _sys_process_exit(status, 0, 0).
 void sys_process_exit(PPUContext& ctx, s32 status)
 {
     PS_LOG_INFO(kChan, "sys_process_exit({})", status);
-    lv2::_sys_process_exit(thread_of(ctx), status, 0, 0); // does not return
+    lv2::PpuThread& t = thread_of(ctx);
+    ProcessAtexitState& s = HleProcess::current()->state<ProcessAtexitState>();
+    lv2::sys_mutex_lock(t, process_mutex(ctx, s, s.exit_mutex, "exitprc"), 0);
+    if (const u32 m = s.list_mutex.load(std::memory_order_acquire)) {
+        lv2::sys_mutex_lock(t, m, 0);
+        while (!s.funcs.empty()) {
+            const u32 func = s.funcs.back();
+            s.funcs.pop_back();
+            call_guest(ctx, func, {});
+        }
+        lv2::sys_mutex_unlock(t, m);
+    }
+    lv2::_sys_process_exit(t, status, 0, 0); // does not return
 }
 
 // RPCS3 sysPrxForUser.cpp: the library's copy of the syscall.
@@ -1357,6 +1413,7 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0x3DD4A957, sys_ppu_thread_register_atexit),
         PS_HLE_FUNC(0xAC6FC404, sys_ppu_thread_unregister_atexit),
         PS_HLE_FUNC(0xE6F2C1E7, sys_process_exit),
+        PS_HLE_FUNC(0xDE2F9C85, sys_process_atexit),
         PS_HLE_FUNC(0x2C847572, _sys_process_atexitspawn),
         PS_HLE_FUNC(0x96328741, _sys_process_at_Exitspawn),
         PS_HLE_FUNC(0xA2C7BA64, sys_prx_exitspawn_with_level),

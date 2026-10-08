@@ -831,6 +831,9 @@ int main(int argc, char** argv)
             if (!f.internal)
                 std::printf("%.*s %08x %.*s\n", static_cast<int>(f.module.size()), f.module.data(), f.nid,
                     static_cast<int>(f.name.size()), f.name.data());
+        for (const hle::Variable& v : hle::registry().variables())
+            std::printf("%.*s %08x %.*s\n", static_cast<int>(v.module.size()), v.module.data(), v.nid,
+                static_cast<int>(v.name.size()), v.name.data());
         return 0;
     }
     if (argc < 2) return usage();

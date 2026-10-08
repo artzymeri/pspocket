@@ -66,3 +66,39 @@ if(PSPOCKET_LIBPNG_DIR AND EXISTS ${PSPOCKET_LIBPNG_DIR}/png.h)
 else()
     message(STATUS "libpng: none (PSPOCKET_LIBPNG_DIR): cellPngDec is not pspocket's")
 endif()
+
+# FreeType 2.2.1 for cellFont, cellFontFT and cell_FreeType2 (D-500): Sony's libfreetype is FreeType 2.2.1 (its library
+# is cell_FreeType2_2_1), so pspocket's font libraries are built on the same version, from external/freetype-2.2.1
+# (gitignored, D-201). Its module list and options are pspocket's own headers (runtime/hle/src/freetype), made to match
+# Sony's build. Optional: without it the firmware's font modules serve the games.
+set(pspocket_freetype_default "")
+if(EXISTS "${PROJECT_SOURCE_DIR}/external/freetype-2.2.1/include/ft2build.h")
+    set(pspocket_freetype_default "${PROJECT_SOURCE_DIR}/external/freetype-2.2.1")
+endif()
+set(PSPOCKET_FREETYPE_DIR "${pspocket_freetype_default}" CACHE PATH "FreeType 2.2.1 source tree")
+if(PSPOCKET_FREETYPE_DIR AND EXISTS ${PSPOCKET_FREETYPE_DIR}/include/ft2build.h)
+    find_package(ZLIB REQUIRED)
+    set(ft ${PSPOCKET_FREETYPE_DIR}/src)
+    add_library(pspocket_freetype STATIC
+        ${ft}/base/ftsystem.c ${ft}/base/ftinit.c ${ft}/base/ftdebug.c ${ft}/base/ftbase.c ${ft}/base/ftbbox.c
+        ${ft}/base/ftglyph.c ${ft}/base/ftbitmap.c ${ft}/base/ftstroke.c ${ft}/base/ftsynth.c ${ft}/base/ftmm.c
+        ${ft}/base/fttype1.c ${ft}/base/ftwinfnt.c ${ft}/base/ftgxval.c ${ft}/base/ftotval.c ${ft}/base/ftpfr.c
+        ${ft}/base/ftbdf.c ${ft}/base/ftxf86.c
+        ${ft}/autofit/autofit.c ${ft}/truetype/truetype.c ${ft}/type1/type1.c ${ft}/cff/cff.c ${ft}/cid/type1cid.c
+        ${ft}/pfr/pfr.c ${ft}/type42/type42.c ${ft}/winfonts/winfnt.c ${ft}/pcf/pcf.c ${ft}/bdf/bdf.c
+        ${ft}/psaux/psaux.c ${ft}/psnames/psnames.c ${ft}/pshinter/pshinter.c ${ft}/raster/raster.c ${ft}/sfnt/sfnt.c
+        ${ft}/smooth/smooth.c ${ft}/gzip/ftgzip.c ${ft}/lzw/ftlzw.c ${ft}/cache/ftcache.c)
+    target_include_directories(pspocket_freetype SYSTEM BEFORE PUBLIC ${PROJECT_SOURCE_DIR}/runtime/hle/src/freetype
+        ${PSPOCKET_FREETYPE_DIR}/include)
+    target_compile_definitions(pspocket_freetype PUBLIC "FT_CONFIG_MODULES_H=<pspocket_ftmodule.h>"
+        "FT_CONFIG_OPTIONS_H=<pspocket_ftoption.h>")
+    # DARWIN_NO_CARBON: FreeType 2.2.1 would build its Carbon (Mac OS 9 font) support on Apple systems.
+    target_compile_definitions(pspocket_freetype PRIVATE FT2_BUILD_LIBRARY)
+    target_compile_definitions(pspocket_freetype PUBLIC DARWIN_NO_CARBON)
+    target_compile_definitions(pspocket_freetype PRIVATE FT_CONFIG_OPTION_SYSTEM_ZLIB) # its bundled zlib is too old
+    target_compile_definitions(pspocket_freetype INTERFACE PSPOCKET_HAVE_FREETYPE=1)
+    target_compile_options(pspocket_freetype PRIVATE -w)
+    target_link_libraries(pspocket_freetype PUBLIC ZLIB::ZLIB)
+    add_library(pspocket::freetype ALIAS pspocket_freetype)
+    message(STATUS "FreeType: ${PSPOCKET_FREETYPE_DIR}")
+endif()

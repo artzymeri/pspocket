@@ -331,6 +331,10 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
                     continue;
                 }
             }
+            if (const u32 addr = module ? 0 : hle.link_variable(lib.name, var.nid)) { // the host's (D-503)
+                patch_refs(mem, var.ref_table, addr, std::format("{}::{}", lib.name, var.resolved.name));
+                continue;
+            }
             PS_LOG_ERROR(kChan, "UNIMPLEMENTED variable {}::{} ({:#010x}): {} references left unpatched", lib.name,
                 var.resolved.name.empty() ? "?" : var.resolved.name, var.nid, var.refs.size());
             rep.variables_unresolved++;

@@ -16,11 +16,14 @@
 // References: RPCS3 rpcs3/Emu/Cell/PPUModule.cpp (ppu_load_imports, ppu_register_function_at), PPUFunction.h
 // (REG_FUNC, ppu_function_manager), Emu/Cell/Modules/*.cpp (the module implementations each file here cites).
 
+#include <array>
+#include <bit>
 #include <initializer_list>
 #include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -56,19 +59,36 @@ struct HostImport {
     bool variable = false;
 };
 
+// A variable a host module exports (D-503; RPCS3 REG_VAR): `size` bytes of guest memory aligned to `align`, zeroed and
+// then laid out by `init` (when there is one) as the first import of it is linked; every import of it gets that address.
+struct Variable {
+    std::string_view module;
+    std::string_view name;
+    u32 nid = 0;
+    u32 size = 4;
+    u32 align = 4;
+    void (*init)(u8* base, u32 addr) = nullptr;
+};
+
 class Registry {
 public:
     // Adds a module's functions (their `module` field is set to `module`). A duplicate (module, NID) aborts.
     void add(std::string_view module, std::initializer_list<Function> list);
     std::span<const Function> functions() const { return functions_; }
     const Function* find(std::string_view module, u32 nid) const;
+    // Adds a module's variables, likewise.
+    void add_variables(std::string_view module, std::initializer_list<Variable> list);
+    std::span<const Variable> variables() const { return variables_; }
+    const Variable* find_variable(std::string_view module, u32 nid) const;
     // Adds what `module` imports from firmware modules (their `module` field is set to `module`).
     void add_imports(std::string_view module, std::span<const HostImport> list);
     std::span<const HostImport> imports() const { return imports_; }
 
 private:
     std::vector<Function> functions_;
+    std::vector<Variable> variables_;
     std::vector<HostImport> imports_;
+    std::unordered_map<std::string, usize> index_; // "module:NID" -> functions_ (or variables_ with a 'v' prefix)
 };
 
 // Every module in src/modules.cpp, built on first use.
@@ -88,8 +108,9 @@ struct StubFunction {
 std::span<const StubFunction> rpcs3_stubs();
 const StubFunction* find_rpcs3_stub(std::string_view module, u32 nid);
 
-// ---- typed binding: R fn(PPUContext&, A...) with A in {bool, u8, u16, u32, s32, u64, s64}, R in {void, s32, u32, u64};
-// up to 20 arguments (the ninth and later on the caller's stack; sceNpScore's clan rankings take 19) ----
+// ---- typed binding: R fn(PPUContext&, A...) with A in {bool, u8, u16, u32, s32, u64, s64, float, double}, R in {void,
+// s32, u32, u64, float, double}; up to 20 arguments (the ninth and later on the caller's stack; sceNpScore's clan
+// rankings take 19) ----
 
 namespace detail {
 
@@ -108,25 +129,51 @@ T reg_arg(u64 v)
 }
 
 // Argument I: r3..r10 for the first eight, then the caller's parameter save area at r1 + 0x70 + 8 * (I - 8) (the
-// PPC64 ELF ABI; RPCS3 ppu_func_detail reads the same slots).
-template <class T, usize I>
+// PPC64 ELF ABI; RPCS3 ppu_func_detail reads the same slots). A floating point argument (float, double) comes from
+// f1..f13 by its count F among the floating ones, and takes its slot in the sequence all the same (so the integers
+// after it move on), past f13 from that slot of the save area (a double, or a float in the slot's low word).
+template <class T, usize I, usize F>
 T arg(PPUContext& ctx, u8* base)
 {
-    if constexpr (I < 8) return reg_arg<T>(ctx.gpr[3 + I]);
-    else return reg_arg<T>(ps_read64(base, static_cast<u32>(ctx.gpr[1]) + 0x70 + 8 * static_cast<u32>(I - 8)));
+    if constexpr (std::is_floating_point_v<T>) {
+        if constexpr (F < 13) {
+            return static_cast<T>(ctx.fpr[1 + F]);
+        } else {
+            const u32 slot = static_cast<u32>(ctx.gpr[1]) + 0x30 + 8 * static_cast<u32>(I);
+            if constexpr (std::is_same_v<T, float>) return std::bit_cast<float>(ps_read32(base, slot + 4));
+            else return std::bit_cast<double>(ps_read64(base, slot));
+        }
+    } else if constexpr (I < 8) {
+        return reg_arg<T>(ctx.gpr[3 + I]);
+    } else {
+        return reg_arg<T>(ps_read64(base, static_cast<u32>(ctx.gpr[1]) + 0x70 + 8 * static_cast<u32>(I - 8)));
+    }
+}
+
+// For each argument, its count among the floating point ones before it.
+template <class... A>
+constexpr std::array<usize, sizeof...(A) + 1> fp_ordinals()
+{
+    std::array<usize, sizeof...(A) + 1> out{};
+    usize n = 0, i = 0;
+    ((out[i++] = std::is_floating_point_v<A> ? n++ : n), ...);
+    return out;
 }
 
 template <class R, class... A, usize... I>
 void invoke(R (*fn)(PPUContext&, A...), PPUContext& ctx, u8* base, std::index_sequence<I...>)
 {
     static_assert(sizeof...(A) <= 20, "HLE functions take at most 20 arguments");
+    constexpr auto F = fp_ordinals<A...>();
     if constexpr (std::is_void_v<R>) {
-        fn(ctx, arg<A, I>(ctx, base)...);
+        fn(ctx, arg<A, I, F[I]>(ctx, base)...);
     } else if constexpr (std::is_same_v<R, s32>) {
         // error_code results are sign-extended into r3 (RPCS3 ppu_func_detail::bind_result).
-        ctx.gpr[3] = static_cast<u64>(static_cast<s64>(fn(ctx, arg<A, I>(ctx, base)...)));
+        ctx.gpr[3] = static_cast<u64>(static_cast<s64>(fn(ctx, arg<A, I, F[I]>(ctx, base)...)));
     } else if constexpr (std::is_same_v<R, u32> || std::is_same_v<R, u64>) {
-        ctx.gpr[3] = fn(ctx, arg<A, I>(ctx, base)...);
+        ctx.gpr[3] = fn(ctx, arg<A, I, F[I]>(ctx, base)...);
+    } else if constexpr (std::is_floating_point_v<R>) {
+        ctx.fpr[1] = static_cast<double>(fn(ctx, arg<A, I, F[I]>(ctx, base)...)); // f1, a float in double format
     } else {
         static_assert(sizeof(R) == 0, "unsupported HLE return type");
     }
@@ -146,5 +193,7 @@ void thunk(PPUContext& ctx, u8* base)
 #define PS_HLE_FUNC(nid, fn) ::pspocket::hle::Function{{}, #fn, nid, &::pspocket::hle::detail::thunk<&fn>, false}
 // An internal function (Function::internal), with the NID its name hashes to.
 #define PS_HLE_INTERNAL(nid, fn) ::pspocket::hle::Function{{}, #fn, nid, &::pspocket::hle::detail::thunk<&fn>, true}
+// Registry::add_variables(module, {PS_HLE_VAR(0x12345678, _Stdin, 4, 4, init_stdin), ...})
+#define PS_HLE_VAR(nid, name, size, align, init) ::pspocket::hle::Variable{{}, #name, nid, size, align, init}
 
 } // namespace pspocket::hle
