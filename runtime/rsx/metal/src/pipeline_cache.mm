@@ -185,7 +185,11 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
                 return nullptr;
             }
             DecodedVertexProgram d;
-            for (const auto& in : vp->instructions) d.words.insert(d.words.end(), in.words.begin(), in.words.end());
+            for (const auto& in : vp->instructions) {
+                d.words.insert(d.words.end(), in.words.begin(), in.words.end());
+                if (static_cast<shader::VpVecOp>(in.vec_op) == shader::VpVecOp::TXL)
+                    d.texture_units = static_cast<u8>(d.texture_units | (1u << (in.tex_num & 3)));
+            }
             d.program = std::move(*vp);
             if (vertex_programs.size() == kDecodedVertexPrograms) vertex_programs.pop_back();
             vertex_programs.insert(vertex_programs.begin(), std::move(d));
@@ -230,9 +234,25 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
             if (off(1u << (14 + t))) masked |= static_cast<u16>(1u << (7 + t)); // TEX0-7: o7-o14
         masked &= vp.output_mask & read;
     }
-    // The variants made of this program stay with it, by what tells them apart (D-109): point size, clip planes,
-    // masked outputs, and the outputs the fragment program reads, the only ones it puts out (D-269).
-    const u64 variant = (points ? 1ull : 0ull) | (u64{user_clip} << 1) | (u64{masked} << 25) | (u64{read} << 41);
+    // The kinds of the vertex textures it samples (D-274), 3 bits each, 0 for 2D.
+    std::array<shader::TextureKind, 4> kinds{};
+    u32 kind_bits = 0;
+    for (u32 t = 0; t < 4; t++) {
+        if (!(current.texture_units & (1u << t))) continue;
+        const TextureInfo vt = state.vertex_texture(t);
+        kinds[t] = vt.cubemap && vt.dimension == 2 ? shader::TextureKind::Cube
+                 : vt.dimension == 3               ? shader::TextureKind::Tex3D
+                 : vt.dimension == 1               ? shader::TextureKind::Tex1D
+                                                   : shader::TextureKind::Tex2D;
+        kind_bits |= static_cast<u32>(kinds[t]) << (3 * t);
+    }
+    // The variants made of this program stay with it, by what tells them apart (D-109): point size, clip planes (two
+    // bits a plane), masked outputs, the outputs the fragment program reads, the only ones it puts out (D-269), and the
+    // vertex textures' kinds.
+    u64 clip_bits = 0;
+    for (u32 i = 0; i < 6; i++) clip_bits |= u64{(user_clip >> (4 * i)) & 3} << (2 * i);
+    const u64 variant = (points ? 1ull : 0ull) | (clip_bits << 1) | (u64{masked} << 13) | (u64{read} << 29) |
+        (u64{kind_bits} << 45);
     const auto remember = [&](const CompiledProgram* c) {
         if (vertex_compiled.size() >= 8) vertex_compiled.erase(vertex_compiled.begin());
         vertex_compiled.emplace_back(variant, c);
@@ -244,6 +264,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     std::string key = std::format("vp:{:016x}:{}", vp.hash, (points ? 1u : 0u) | (user_clip << 1));
     if (masked) key += std::format(":m{:x}", masked);
     key += std::format(":r{:x}", read);
+    if (kind_bits) key += std::format(":k{:x}", kind_bits);
     if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) return remember(&it->second);
 
     shader::VpOptions options;
@@ -251,6 +272,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     options.user_clip = user_clip;
     options.masked_outputs = masked;
     options.read_outputs = read;
+    options.texture_kind = kinds;
     if (async) {
         // Compiled in the background; this draw waits for it within the frame's budget, or goes without (D-158).
         if (async_failed_programs.contains(key)) return nullptr;

@@ -5708,6 +5708,19 @@ passes that only clear. GTA V's walk (run 305): about 188 MB loaded and 209 MB s
   (+0.4 to +7%): the M4 has the bandwidth to spare, and the subset draws now run with five attachments in tile memory.
   Not kept (rule 8). On the iPhone the traffic may weigh more: worth trying there when the phone can be measured.
 
+## D-274 · 2026-10-08 · Vertex textures of every kind: 1D, 3D and cube
+
+A vertex program's texture fetch (TXL) sampled a 2D texture with xy; a 1D, 3D or cube vertex texture was not bound
+(a blank one stood in). RPCS3 samples each kind at level 0: 1D with x, 2D with xy, 3D and cube with xyz
+(GLSLCommon.cpp VERTEX_TEXTURE_FETCH1D/2D/3D/CUBE).
+- The decoded program notes which units its TXL instructions sample; the kinds of those units (NV4097_SET_VERTEX_TEXTURE_FORMAT:
+  dimension and the cube bit) go into the variant (VpOptions::texture_kind, the key's ":k" part), and the shader
+  declares texture3d or texturecube for them and samples with xyz; a 1D texture is the 2D one a texel high that
+  fragment programs use (D-174), sampled at (x, 0.5). A missing texture of a kind is that kind's blank one.
+- The variant's clip planes now take two bits a plane (their ops are 1 or 2), so the variant still fits 64 bits.
+- kTranslationVersion 7.
+- Checked on the GPU: a cube vertex texture by direction (+X, +Y, -Z) and a 1x1x2 volume by z.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

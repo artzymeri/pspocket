@@ -30,7 +30,8 @@ namespace pspocket::rsx::shader {
 // lighting, user clip planes, the depth bounds test, point sizes and sprites, polygon stipple); 3 was a step on the
 // way that never left the Mac. 5: D-269 (a vertex program puts out only what its fragment program reads). 6: D-271
 // (indexed draws run by Metal over the game's indices; a cached vertex program of 5 reads such an index as a vertex).
-inline constexpr u32 kTranslationVersion = 6;
+// 7: D-274 (vertex textures of every kind).
+inline constexpr u32 kTranslationVersion = 7;
 
 // Argument table slots shared by the translator and the Metal backend.
 namespace slot {
@@ -108,6 +109,12 @@ struct alignas(16) MslFsParams {
 };
 static_assert(sizeof(MslFsParams) == 16 + 256 + 16 + 64 + 64 + 16);
 
+// Shadow2D: a depth texture sampled with a depth comparison (RPCS3 shadow_textures: a depth format and a compare
+// function other than never and always); the lookup returns the comparison's result in every channel.
+// Depth2D and DepthShadow2D: a depth buffer sampled directly (depth2d<float>, D-106), for its value in every channel
+// or a depth comparison as Shadow2D.
+enum class TextureKind : u8 { Tex2D = 0, Cube = 1, Tex1D = 2, Shadow2D = 3, Tex3D = 4, Depth2D = 5, DepthShadow2D = 6 };
+
 struct VpOptions {
     bool point_size = false; // emit [[point_size]] (point primitives)
     // User clip planes (D-259): NV4097_SET_USER_CLIP_PLANE_CONTROL's layout, 4 bits per plane: 1 keeps what the
@@ -120,13 +127,11 @@ struct VpOptions {
     // o[] registers (bit n: o[n], 1-15) the fragment program reads: the only outputs put out besides the position, so
     // a vertex writes no more than the draw needs (D-269). 0xfffe: all of them.
     u16 read_outputs = 0xfffe;
+    // The four vertex texture units' kinds (D-274): 2D, 1D (a 2D texture one texel high, at y 0.5), 3D and cube
+    // sampled with xyz (RPCS3 GLSLCommon.cpp VERTEX_TEXTURE_FETCH1D/2D/3D/CUBE: textureLod at level 0).
+    std::array<TextureKind, 4> texture_kind{};
 };
 
-// Shadow2D: a depth texture sampled with a depth comparison (RPCS3 shadow_textures: a depth format and a compare
-// function other than never and always); the lookup returns the comparison's result in every channel.
-// Depth2D and DepthShadow2D: a depth buffer sampled directly (depth2d<float>, D-106), for its value in every channel
-// or a depth comparison as Shadow2D.
-enum class TextureKind : u8 { Tex2D = 0, Cube = 1, Tex1D = 2, Shadow2D = 3, Tex3D = 4, Depth2D = 5, DepthShadow2D = 6 };
 
 struct FpOptions {
     u32 shader_control = 0; // NV4097_SET_SHADER_CONTROL (0x40: 32-bit exports, 0xe: depth export)

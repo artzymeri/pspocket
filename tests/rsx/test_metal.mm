@@ -4088,6 +4088,67 @@ TEST_CASE("metal e2e: a vertex program samples a vertex texture (TXL, D-093)")
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x20, 0x40, 0x80});
 }
 
+TEST_CASE("metal e2e: a vertex program samples cube and 3D vertex textures with xyz (D-274)")
+{
+    REQUIRE_METAL();
+    // o[1] = TXL(c[0], TEX0): the colour at direction or coordinate c[0] of a linear A8R8G8B8 texture, one texel a
+    // cube face (+X red, -X green, +Y blue, -Y white, +Z yellow, -Z cyan) or a 1x1x2 volume (slice 0 red, slice 1 green).
+    const auto draw = [](bool cube, std::array<float, 4> at) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0, 0, 0});
+        const u32 texels[6] = {0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff, 0xffffff00, 0xff00ffff}; // A R G B
+        for (u32 i = 0; i < 6; i++) e.put_local32(kTexOffset + i * 4, texels[i]);
+        VpInst pos;
+        pos.vec_op = 1;
+        pos.src[0] = vp_in();
+        pos.input = 0;
+        pos.out = 0;
+        pos.vec_mask = 0xf;
+        VpInst txl;
+        txl.vec_op = 0x19;
+        txl.src[0] = vp_const();
+        txl.constant = 0;
+        txl.src[1] = vp_temp(0); // tex_num 0
+        txl.out = 1;
+        txl.vec_mask = 0xf;
+        txl.end = true;
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, assemble_vp({pos, txl}));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(at[0]), f2u(at[1]), f2u(at[2]), f2u(at[3])});
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_VERTEX_TEXTURE_OFFSET, {
+            kTexOffset,
+            (loc::kLocal + 1) | (cube ? 1u << 2 : 0u) | ((cube ? 2u : 3u) << 4) | ((tex::A8R8G8B8 | tex::kLinearFlag) << 8) |
+                (1u << 16),
+            3u | (3u << 8) | (3u << 16),
+            (1u << 31),
+            4u | (cube ? 0u : 2u << 20), // CONTROL3: pitch, and the depth of a volume
+            (1u << 16) | (1u << 24),     // nearest
+            (1u << 16) | 1u,             // 1x1
+        });
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 48);
+    };
+    CHECK(draw(true, {1.f, 0.f, 0.f, 0.f}) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});  // +X: red
+    CHECK(draw(true, {0.f, 1.f, 0.f, 0.f}) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});  // +Y: blue
+    CHECK(draw(true, {0.f, 0.f, -1.f, 0.f}) == std::array<u8, 4>{0xff, 0x00, 0xff, 0xff}); // -Z: cyan
+    CHECK(draw(false, {0.5f, 0.5f, 0.25f, 0.f}) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // slice 0: red
+    CHECK(draw(false, {0.5f, 0.5f, 0.75f, 0.f}) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00}); // slice 1: green
+}
+
 TEST_CASE("metal e2e: a texture unused for a while is freed, and decoded again when used again (D-116)")
 {
     REQUIRE_METAL();

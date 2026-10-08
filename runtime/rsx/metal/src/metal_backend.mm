@@ -1165,7 +1165,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         const TextureInfo vt = state.vertex_texture(t);
         bool ok = true;
         id<MTLTexture> tex = vt.enabled ? bind_texture(vt, 16 + t, ok) : nil;
-        vbound[t] = tex && tex.textureType == MTLTextureType2D ? tex : dummy_texture;
+        // Of the kind the program was translated for (D-274: 1D textures are 2D ones a texel high).
+        const MTLTextureType wanted = vt.cubemap && vt.dimension == 2 ? MTLTextureTypeCube
+                                    : vt.dimension == 3               ? MTLTextureType3D
+                                                                      : MTLTextureType2D;
+        vbound[t] = tex && tex.textureType == wanted ? tex
+                  : wanted == MTLTextureTypeCube      ? dummy_cube
+                  : wanted == MTLTextureType3D        ? dummy_volume
+                                                      : dummy_texture;
         if (tracing) {
             trace_tex += std::format(" vt{} {:#010x} fmt {:#04x} {}x{}{} ({})", t,
                 rsx->translate(vt.offset, vt.location).value_or(0), vt.base_format(), vt.width, vt.height,

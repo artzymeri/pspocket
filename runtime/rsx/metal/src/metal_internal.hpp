@@ -577,6 +577,7 @@ struct MetalBackend::Impl {
         shader::VertexProgram program;
         std::vector<u32> words;                         // its instructions' words, from its start to its end
         std::vector<std::pair<u64, const CompiledProgram*>> compiled; // its variants compiled, by what tells them apart (D-109, D-269)
+        u8 texture_units = 0; // the vertex texture units its TXL instructions sample (D-274)
     };
     static constexpr usize kDecodedVertexPrograms = 16;
     std::vector<DecodedVertexProgram> vertex_programs;

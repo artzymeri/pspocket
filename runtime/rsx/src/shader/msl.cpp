@@ -405,11 +405,16 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
             case VpVecOp::FRC: e = std::format("fract({})", s0); break;
             case VpVecOp::FLR: e = std::format("floor({})", s0); break;
             case VpVecOp::SSG: e = std::format("sign({})", s0); break;
-            // Vertex texture fetch (RPCS3 VERTEX_TEXTURE_FETCH2D: textureLod($t, $0.xy, 0)).
-            case VpVecOp::TXL:
-                e = std::format("vtex{}.sample(vsmp{}, ({}).xy, level(0.0))", in.tex_num, in.tex_num, s0);
+            // Vertex texture fetch at level 0 (RPCS3 GLSLCommon.cpp VERTEX_TEXTURE_FETCH1D/2D/3D/CUBE, D-274).
+            case VpVecOp::TXL: {
+                const TextureKind k = options.texture_kind[in.tex_num & 3];
+                const std::string coord = k == TextureKind::Tex3D || k == TextureKind::Cube ? std::format("({}).xyz", s0)
+                                        : k == TextureKind::Tex1D ? std::format("float2(({}).x, 0.5)", s0)
+                                                                  : std::format("({}).xy", s0);
+                e = std::format("vtex{}.sample(vsmp{}, {}, level(0.0))", in.tex_num, in.tex_num, coord);
                 result.shader.texture_mask |= 1u << in.tex_num;
                 break;
+            }
             default: break;
             }
             body += std::format("        float4 vec = {};\n", e);
@@ -537,11 +542,15 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
         "    device const uchar* ib [[buffer({})]]{})\n{{\n",
         result.shader.entry, slot::kVsVertexData, slot::kVsParams, slot::kVsConstants, slot::kVsIndexData,
         [&] {
-            // Vertex textures (D-093): the four RSX vertex texture units, sampled 2D.
+            // Vertex textures (D-093, D-274): the four RSX vertex texture units, of their kinds.
             std::string t;
             for (u32 i = 0; i < 4; i++) {
-                if (result.shader.texture_mask & (1u << i))
-                    t += std::format(",\n    texture2d<float> vtex{} [[texture({})]], sampler vsmp{} [[sampler({})]]", i, i, i, i);
+                if (!(result.shader.texture_mask & (1u << i))) continue;
+                const TextureKind k = options.texture_kind[i];
+                const char* type = k == TextureKind::Tex3D ? "texture3d<float>"
+                                 : k == TextureKind::Cube  ? "texturecube<float>"
+                                                           : "texture2d<float>";
+                t += std::format(",\n    {} vtex{} [[texture({})]], sampler vsmp{} [[sampler({})]]", type, i, i, i, i);
             }
             return t;
         }());
