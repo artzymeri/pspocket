@@ -235,6 +235,11 @@ the fragment program reads (D-269, -2%) and indexed draws run by Metal over the 
 runs once (D-271: -8 to -15% GPU time a frame in play). GPU changes are measured within one run (PSPOCKET_GPU_AB), and
 the shader cache checks a fingerprint of the translation (D-272).
 
+**Assassin's Creed plays its training clean (D-273 to D-276, runs 304-311).** Vertex textures of every kind (D-274),
+points and WPOS on multisampled targets in pixels (D-275, D-276): a 600 s training walk with no PPU code interpreted
+and no RSX failure (38 continuations). Its last minute is its heaviest, 31-43 flips a second on the M4 with the RSX
+thread the busiest at 60% of a core: next to cut. kTranslationVersion 9.
+
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,
 kernel calls, PPU and SPU instructions translated and fuzz-checked, a checklist per area (each item with its decision)
