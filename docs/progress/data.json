@@ -1,6 +1,6 @@
 {
-  "as_of": "2026-10-07, after D-236",
-  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: SPU programs a game meets for the first time are translated while it plays (D-236): Assassin's Creed's first session interprets 96% less SPU code and its training runs at 60 fps instead of 25-33. Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
+  "as_of": "2026-10-08, after D-239",
+  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. New: a game's own PRX modules are found on its disc and translated at fixed slots (D-238, D-239), and SPU programs a game meets are translated while it plays (D-236). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
   "checklist": [
     {
       "area": "Reading any PS3 disc on the iPhone",
@@ -76,9 +76,9 @@
           "ref": "D-227"
         },
         {
-          "name": "A game's own PRX modules translated (they run interpreted)",
-          "state": "todo",
-          "ref": "D-159"
+          "name": "A game's own PRX modules translated, from its disc or its first session",
+          "state": "done",
+          "ref": "D-237 to D-239"
         },
         {
           "name": "Everything since D-164 confirmed on the iPhone",

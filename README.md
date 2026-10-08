@@ -14,7 +14,7 @@ signs and loads it, and plays it flawlessly. Driving title: GTA V (BLES01807); s
 
 ![engine](docs/progress/badge-0.svg) ![system libraries](docs/progress/badge-1.svg) ![kernel calls](docs/progress/badge-2.svg) ![PPU instructions](docs/progress/badge-3.svg) ![SPU instructions](docs/progress/badge-4.svg) ![games flawless](docs/progress/badge-5.svg)
 
-_2026-10-07, after D-236._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. Today: SPU programs a game meets for the first time are translated while it plays (D-236): Assassin's Creed's first session interprets 96% less SPU code and its training runs at 60 fps instead of 25-33. Nothing is Flawless yet: the iPhone is too slow in heavy scenes.
+_2026-10-08, after D-239._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. New: a game's own PRX modules are found on its disc and translated at fixed slots (D-238, D-239), and SPU programs a game meets are translated while it plays (D-236). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.
 
 ![The engine, part by part](docs/progress/engine.svg)
 
@@ -30,7 +30,7 @@ Green: pspocket's own code. Light green: answered as RPCS3's own stub answers. G
 
 ![Kernel calls](docs/progress/kernel.svg)
 
-PPU instructions: 380 of 382 translated, each checked against the interpreter by the differential fuzz tests (the two left out, eciwx and ecowx, are external control instructions games do not use). SPU instructions: 194 of 199 (the five left out are ISA 1.2 double-precision compares the PS3's SPUs do not have).
+PPU instructions: 380 of 380 translated, each checked against the interpreter by the differential fuzz tests (the two left out, eciwx and ecowx, are external control instructions games do not use). SPU instructions: 194 of 194 (the five left out are ISA 1.2 double-precision compares the PS3's SPUs do not have).
 
 Per game: [docs/compatibility.md](docs/compatibility.md) · runs: [docs/runs](docs/runs/README.md) · where each part can improve: [docs/improve.md](docs/improve.md)
 <!-- progress:end -->

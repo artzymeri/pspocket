@@ -16,7 +16,7 @@ What is counted, and against what:
   constant; D-166, D-184).
 - PPU and SPU instructions: the instruction tables (ops.inc) against the ones the translators handle; every one of those
   is checked against the interpreter by the differential fuzz tests (CLAUDE.md rule 3). The ones left out are marked
-  OPF_NOSUPPORT.
+  OPF_NOSUPPORT; those the PS3's processors do not have are not counted at all (NOT_ON_PS3).
 - Everything else (graphics, sound, the app, games, speed) is a checklist and measurements kept in data.json, each item
   with the decision or run behind it.
 
@@ -130,10 +130,19 @@ def kernel():
     return [{"name": g, "cells": c} for g, c in groups.items()]
 
 
+# In the tables, not on the PS3: the SPU's double-precision compares came with the PowerXCell 8i's SPU (ISA 1.2), and
+# eciwx/ecowx are the PowerPC's optional external control the PS3 does not provide. RPCS3 stops on all of them
+# (SPUInterpreter.cpp DFCEQ..., PPUInterpreter.cpp ECIWX/ECOWX); a game that ran one would fault on the PS3 too.
+NOT_ON_PS3 = {"DFCGT", "DFCMGT", "DFTSV", "DFCEQ", "DFCMEQ", "ECIWX", "ECOWX"}
+
+
 def instructions(path, macro):
     total = supported = 0
     for line in read(path).splitlines():
         if line.startswith(macro + "("):
+            name = line[len(macro) + 1:].split(",")[0].strip()
+            if name in NOT_ON_PS3:
+                continue
             total += 1
             if "OPF_NOSUPPORT" not in line:
                 supported += 1

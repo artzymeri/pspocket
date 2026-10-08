@@ -1,5 +1,5 @@
 {
-  "engine_percent": 72.4,
+  "engine_percent": 73.4,
   "libraries": {
     "own": 1719,
     "answered_as_rpcs3": 290,
@@ -12,15 +12,15 @@
   },
   "ppu_instructions": {
     "translated_and_fuzzed": 380,
-    "known": 382
+    "known": 380
   },
   "spu_instructions": {
     "translated_and_fuzzed": 194,
-    "known": 199
+    "known": 194
   },
   "checklist": {
     "Reading any PS3 disc on the iPhone": 83,
-    "Translating on the iPhone (route B)": 78,
+    "Translating on the iPhone (route B)": 89,
     "PPU code (the main processor)": 80,
     "SPU code (the six co-processors)": 86,
     "SPURS and the kernel": 75,

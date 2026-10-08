@@ -196,8 +196,12 @@ programs a game meets that its library lacks (the modules and jobs its tasks cop
 signed and loaded on one background core while it plays; the SPUs switch to them at their next load or taken branch.
 Assassin's Creed's first 150 s: 22.06 to 0.94 billion SPU instructions interpreted, the training 25-33 to 60 fps.
 pspocket-boot --spu-translate on the Mac; the app starts it after the game library loads (not tried on the phone yet).
-Also: the RSX reading a packet's arguments in one run was measured and not kept (D-229). Next: a game's own PRX
-modules (docs/plan-game-modules.md), still found only by running the game.
+Also: the RSX reading a packet's arguments in one run was measured and not kept (D-229).
+
+**A game's own PRX modules translated (D-237 to D-239).** The modules a game ships besides its executable are found on
+its disc (or saved the first time it loads them), translated at fixed slots at the top of the PRX region into the
+game's "modules library", and run translated once their code is checked; synthetic tests only, as neither local game
+has one (run 220). Next: speed for the iPhone's heavy scenes (a fresh GTA V profile under load).
 
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,

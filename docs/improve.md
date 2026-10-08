@@ -216,9 +216,17 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   back by _longjmp: the process a quarter less CPU in the crowd (run 129). Left: the few instructions after each
   setjmp, interpreted. Better: translate the code after a setjmp's return as a continuation the dispatcher can enter (a
   setjmp return address as a seed), so a jump lands in translated code.
-- **Modules (D-159):** a game's own PRX modules run interpreted; the preparation could translate the PRX files on the
-  disc too. NPDRM modules need the game's klicensee.
-- **State:** open.
+- **Modules (D-159):** a game's own PRX modules ran interpreted. **Done (D-237 to D-239):** they are translated at
+  fixed slots at the top of the PRX region, found on the disc before the first session or saved when the game loads
+  them, checked before linking, and run translated (synthetic tests; no local game has modules: run 220).
+- **Left:**
+  - A module whose reference tables patch its code stays interpreted: lift those instructions as loads from the
+    patched words (needs a game that has them, rule 4).
+  - A newly found module recompiles all of the game's modules: per-module lift folders, as plan-game-modules commit 8
+    describes, if a game has many.
+  - NPDRM modules need the game's klicensee (a PSN game).
+  - Sniper: Ghost Warrior's engine_jobs.sprx (seen on the phone, D-159) is the first real check, when its disc is
+    here.
 
 - **Seen (run 207, D-226):** a game met for the first time ran all its SPU code interpreted until its next launch.
   Now the executable's SPU ELFs are translated when it is prepared (Assassin's Creed: 6, its 4 tasks under the runtime's
