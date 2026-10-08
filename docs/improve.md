@@ -149,7 +149,7 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   pass does not read, memoryless depth where it is never sampled. Metal System Trace on the phone (needs the user)
   to see where the 25 ms go.
 - **Multisampling:** done (D-250): multisampled targets are drawn one texel per sample, as the RSX lays them out, and
-  the gate's last RSX failure is gone. Left: WPOS in such a target counts samples (logged per program).
+  the gate's last RSX failure is gone. WPOS there is the pixel's (D-276).
 - **Blending:** ADD_SIGNED (0xf006) draws as ADD, as RPCS3 does (VKGSRender.cpp): only the log line says otherwise.
 - **Where the GPU time goes (D-270, runs 272-279):** PSPOCKET_GPU_PASS_TIMES=1 times each render pass, vertex and
   fragment apart. GTA V: 17-18 ms in 89 passes; the G-buffer pass 2.7-4.2 ms, mostly its vertex stage; the geometry

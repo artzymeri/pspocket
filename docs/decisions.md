@@ -5729,6 +5729,18 @@ across a pixel, the larger count when a mode has two across and one down (a Meta
 point size by its resolution scale the same way, VKGSRender.cpp). It multiplies the register's size and the program's.
 kTranslationVersion 8. Checked on the GPU: a point of 4 on a two-by-two target covers 8x8 samples.
 
+## D-276 · 2026-10-08 · WPOS on a multisampled target is its pixel's position
+
+A multisampled target is drawn one texel per sample (D-250), so a fragment program reading WPOS got the sample's
+position, twice the pixel's across in a two-by-two mode, and the backend logged it as an RSX failure (Assassin's
+Creed's training, two programs, run 310). The RSX shades each pixel once and gives its centre.
+- The fragment parameters carry the samples across and down a pixel (MslFsParams::aa, in the fog block's spare word);
+  the fragment program's prologue takes its pixel's centre, floor(position / samples) + 0.5, for WPOS and polygon
+  stipple's pattern. With one sample a pixel it is the position as before. The depth bounds test keeps reading its
+  copy per sample, which is per sample too.
+- kTranslationVersion 9. The log line and the failure go.
+- Checked on the GPU: on a two-by-two target, every sample of a pixel gets that pixel's WPOS.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -1074,13 +1074,6 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     }
     // A multisampled target is drawn in samples (D-250): the scissor and the viewport are in pixels.
     const AaFactors aa = aa_factors(state.surface().antialias);
-    if ((aa.x > 1 || aa.y > 1) && (fprog->input_mask & (1u << static_cast<u32>(shader::FpInput::WPOS)))) {
-        // WPOS counts samples there, not pixels (the generated shaders have no scale for it).
-        static std::unordered_set<u64> seen;
-        if (seen.size() < 16 && seen.insert(fprog->hash).second)
-            unsupported(std::format("fragment program {:#018x} reads WPOS in a multisampled target: it gets samples, not "
-                                    "pixels", fprog->hash));
-    }
     const u32 pix_w = surf_w / aa.x, pix_h = surf_h / aa.y;
     const ScissorInfo sc = state.scissor();
     const ViewportInfo vpi = state.viewport();
@@ -1448,6 +1441,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         fs.wpos[1] = static_cast<float>(win.height);
     }
     if (win.pixel_center_integer) fs.wpos[2] = -0.5f;
+    fs.aa = aa.x | (aa.y << 8); // WPOS in pixels on a multisampled target (D-276)
     fs.alpha_func = raster.alpha_func;
     // The reference as the colour format reads it (D-264; RPCS3 rsx_methods.h alpha_ref): a float for 32-bit float
     // targets, a half for 16-bit ones, else the low byte as unorm.

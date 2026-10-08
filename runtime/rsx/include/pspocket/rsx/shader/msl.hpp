@@ -30,8 +30,9 @@ namespace pspocket::rsx::shader {
 // lighting, user clip planes, the depth bounds test, point sizes and sprites, polygon stipple); 3 was a step on the
 // way that never left the Mac. 5: D-269 (a vertex program puts out only what its fragment program reads). 6: D-271
 // (indexed draws run by Metal over the game's indices; a cached vertex program of 5 reads such an index as a vertex).
-// 7: D-274 (vertex textures of every kind). 8: D-275 (point sizes on multisampled targets).
-inline constexpr u32 kTranslationVersion = 8;
+// 7: D-274 (vertex textures of every kind). 8: D-275 (point sizes on multisampled targets). 9: D-276 (WPOS in pixels on
+// multisampled targets).
+inline constexpr u32 kTranslationVersion = 9;
 
 // Argument table slots shared by the translator and the Metal backend.
 namespace slot {
@@ -109,7 +110,7 @@ struct alignas(16) MslFsParams {
     float tex_bias[16] = {};              // per unit: the LOD bias (NV4097_SET_TEXTURE_FILTER), 0 without mipmaps
     u32 fog_mode = 0x800;                 // NV4097_SET_FOG_MODE and _PARAMS: FOGC's fog factor (D-256)
     float fog_param[2] = {};
-    u32 pad2 = 0;
+    u32 aa = 0x0101;                      // samples across (bits 0-7) and down (8-15) a pixel: WPOS in pixels (D-276)
 };
 static_assert(sizeof(MslFsParams) == 16 + 256 + 16 + 64 + 64 + 16);
 

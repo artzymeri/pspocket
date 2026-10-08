@@ -35,7 +35,7 @@ struct rsx_fs_params {
     uint alpha_func; float alpha_ref; float depth_bounds_min; float depth_bounds_max;
     uint tex_control[16]; // per unit: the texel conversions (pspocket/rsx/texture.hpp texctl)
     float tex_bias[16];   // per unit: the LOD bias
-    uint fog_mode; float fog_param0; float fog_param1; uint pad2; // FOGC's fog factor
+    uint fog_mode; float fog_param0; float fog_param1; uint aa; // FOGC's fog factor; samples across and down a pixel
 };
 
 // FOGC as the RSX gives it: x the fog coordinate (the vertex program's o5.x), y the fog factor from NV4097_SET_FOG_MODE
@@ -1239,9 +1239,12 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
     if (opt.point_coord_mask) params += ",\n    float2 point_coord [[point_coord]]";
     if (opt.polygon_stipple) params += std::format(",\n    constant uint* stipple [[buffer({})]]", slot::kFsStipple);
     src += std::format("fragment rsx_fs_out {}({})\n{{\n", result.shader.entry, params);
+    // The pixel's centre: a multisampled target is drawn one texel per sample (D-250), and the RSX gives a fragment its
+    // pixel's position (D-276). With one sample a pixel it is the position as it is.
+    src += "    const float2 pixel = floor(in.position.xy / float2(fp.aa & 0xffu, (fp.aa >> 8) & 0xffu)) + 0.5;\n";
     if (opt.polygon_stipple) {
         // Polygon stipple (D-263): the pattern's bit for this pixel.
-        src += "    {\n        const uint2 at = uint2(in.position.xy) % 32u;\n"
+        src += "    {\n        const uint2 at = uint2(pixel) % 32u;\n"
                "        if (((stipple[at.y] >> at.x) & 1u) == 0u) discard_fragment();\n    }\n";
     }
     if (opt.depth_bounds) {
@@ -1250,7 +1253,7 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
                "        if (stored < fp.depth_bounds_min || stored > fp.depth_bounds_max) discard_fragment();\n    }\n";
     }
     // WPOS (x, y, z, 1/w): origin and pixel centre adjusted by fp.wpos (shader window registers).
-    src += "    const float4 wpos = float4(in.position.x + fp.wpos.z, in.position.y * fp.wpos.x + fp.wpos.y + fp.wpos.z,"
+    src += "    const float4 wpos = float4(pixel.x + fp.wpos.z, pixel.y * fp.wpos.x + fp.wpos.y + fp.wpos.z,"
            " in.position.z, in.position.w);\n";
     src += "    const float in_w = 1.0 / in.position.w;\n";
     if (c.inputs & (1u << 3)) src += "    const float4 fogc = rsx_fog(in.fogc.x, fp);\n"; // FOGC (D-256)

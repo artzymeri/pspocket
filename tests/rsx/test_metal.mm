@@ -3025,6 +3025,48 @@ TEST_CASE("metal e2e: a point on a two-by-two multisampled target covers its siz
     CHECK_FALSE(red(64, 68));
 }
 
+TEST_CASE("metal e2e: WPOS on a multisampled target is the pixel's position, the same for all its samples (D-276)")
+{
+    REQUIRE_METAL();
+    // R0 = WPOS * (1/64, 0, 0, 0) + (1/64, 0, 0, 0) (one embedded constant serves both): red is (x + 1) / 64 for the
+    // pixel's x. AA mode 4: two by two samples a pixel.
+    const u32 sx = 2, sy = 2, pitch = kW * sx * 4;
+    E2E e;
+    FpInst mad;
+    mad.op = 0x04; // MAD
+    mad.dst = 0;
+    mad.input = 0; // WPOS
+    mad.src[0] = fp_in();
+    mad.src[1] = fp_const();
+    mad.constant = std::array<float, 4>{1.f / 64.f, 0.f, 0.f, 0.f};
+    mad.src[2] = fp_const();
+    e.put_local_bytes(kFpOffset, assemble_fp({[&] { mad.end = true; return mad; }()}));
+    write_triangle(e, {0, 0, 0});
+    auto b = e.at(0);
+    setup_surface_sized(b, kSurfaceOffset, kW, kH, pitch);
+    b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (1u << 8) | (4u << 12));
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, pitch * kH * sy));
+    // Pixel (24, 48) and (40, 48), inside the triangle: each of their four samples holds (x + 0.5 + 1) / 64.
+    for (const u32 px : {24u, 40u}) {
+        const double want = (px + 0.5 + 1.0) / 64.0 * 255.0;
+        for (u32 j = 0; j < sy; j++)
+            for (u32 i = 0; i < sx; i++) {
+                const auto p = guest_pixel_pitch(e, kSurfaceOffset, pitch, px * sx + i, 48 * sy + j);
+                INFO("pixel " << px << " sample " << i << "," << j << " red " << int(p[1]));
+                CHECK(std::abs(p[1] - want) <= 1.0);
+            }
+    }
+}
+
 TEST_CASE("metal e2e: a target narrower than the one at its address is its left part, and the rest stays (D-120)")
 {
     // GTA V clears the right half of a 2560x512 target for its characters, then draws into the left half as a
