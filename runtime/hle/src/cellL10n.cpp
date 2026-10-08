@@ -1523,6 +1523,649 @@ u32 UTF8stoMSJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
     });
 }
 
+// ------------------------------------------------------------------------------------------------- Korean
+
+// KS X 1001 (EUC-KR's two-byte area, rows A1-AC, B0-C8, CA-FD): the UCS-2 value of a pair of A1-FE bytes, FFFF for
+// none (libl10n 0x4bc8).
+u16 ksx1001_ucs2(u32 b0, u32 b1)
+{
+    const u32 c = (b0 << 8) | b1;
+    u32 index;
+    if (b0 <= 0xAC) {
+        index = b0 * 94 + b1 - 15295;
+    } else if (((b0 - 0xB0) & 0xFF) <= 24) {
+        index = b0 * 94 + b1 - 15295 - 282;
+    } else {
+        if (b0 <= 0xC9 || c > 0xFDFE) return 0xFFFF;
+        index = b0 * 94 + b1 - 15295 - 282 - 94;
+    }
+    return table(kKsx1001)[index];
+}
+
+template <class Byte>
+u32 euckr_decode(Byte&& at, u16* out)
+{
+    const u8 b0 = at(0);
+    if (in_a1_fe(b0)) {
+        const u8 b1 = at(1);
+        if (in_a1_fe(b1)) {
+            const u16 v = ksx1001_ucs2(b0, b1);
+            if (v == 0xFFFF) return 0;
+            *out = v;
+            return 2;
+        }
+    }
+    if (b0 & 0x80) {
+        if ((b0 & 0xE0) != 0x80 || b0 == 0x8E || b0 == 0x8F) return 0;
+    }
+    *out = b0;
+    return 1;
+}
+
+// UHCtoUCS2 (0xcfdc): KS X 1001 for a pair of A1-FE bytes, cp949's extension for leads 81-C6 with trails A-Z, a-z
+// and 81-FE (no FFFF check there), a byte up to 80 as itself.
+template <class Byte>
+u32 uhc_decode(Byte&& at, u16* out)
+{
+    const auto alpha = [](u32 b) { return ((b - 0x41) & 0xFF) <= 25 || ((b - 0x61) & 0xFF) <= 25; };
+    const auto trail_index = [](u32 b) { return b <= 0x5A ? b - 0x41 : b <= 0x7A ? b - 0x47 : b - 0x4D; };
+    const u8 b0 = at(0);
+    if (in_a1_fe(b0)) {
+        const u8 b1 = at(1);
+        if (in_a1_fe(b1)) {
+            const u16 v = ksx1001_ucs2(b0, b1);
+            if (v == 0xFFFF) return 0;
+            *out = v;
+            return 2;
+        }
+        if (!alpha(b1) && ((b1 - 0x81) & 0xFF) > 125) return 0;
+        const u32 c = (u32{b0} << 8) | b1;
+        if (((c - 0xA141) & 0xFFFF) > 0x2511) return 0;
+        *out = table(kUhc2)[(b0 - 0xA1) * 84 + trail_index(b1)];
+        return 2;
+    }
+    if (((b0 - 0x81) & 0xFF) <= 125) {
+        const u8 b1 = at(1);
+        if (!alpha(b1) && ((b1 - 0x81) & 0xFF) > 125) return 0;
+        const u32 c = (u32{b0} << 8) | b1;
+        if (((c - 0x8141) & 0xFFFF) > 0x1FBD) return 0;
+        *out = table(kUhc1)[(b0 - 0x81) * 178 + trail_index(b1)];
+        return 2;
+    }
+    if (b0 > 0x80) return 0;
+    *out = b0;
+    return 1;
+}
+
+// A KS X 1001 table index's EUC-KR code.
+u32 ksx1001_code(u32 i)
+{
+    u32 e = ((i / 94) << 8) + (i % 94) + 0xA1A1;
+    if ((e & 0xFFFF) > 0xACFF) e += 0x300;
+    if ((e & 0xFFFF) > 0xC8FF) e += 0x100;
+    return e & 0xFFFF;
+}
+
+u32 ucs2_to_euckr(u32 c, u8* out)
+{
+    c &= 0xFFFF;
+    if (c > 0xFFFD) return 0;
+    if (c <= 0x8D || ((c - 0x90) & 0xFFFF) <= 15) {
+        out[0] = static_cast<u8>(c);
+        return 1;
+    }
+    const auto& ks = table(kKsx1001);
+    for (u32 i = 0; i < ks.size(); i++) {
+        if (ks[i] == c) {
+            const u32 e = ksx1001_code(i);
+            out[0] = static_cast<u8>(e >> 8);
+            out[1] = static_cast<u8>(e);
+            return 2;
+        }
+    }
+    return 0;
+}
+
+// UCS2toUHC (0xc760): bytes up to 80 as themselves, KS X 1001, then cp949's extension.
+u32 ucs2_to_uhc(u32 c, u8* out)
+{
+    c &= 0xFFFF;
+    if (c > 0xFFFD) return 0;
+    if (c <= 0x80) {
+        out[0] = static_cast<u8>(c);
+        return 1;
+    }
+    const auto& ks = table(kKsx1001);
+    for (u32 i = 0; i < ks.size(); i++) {
+        if (ks[i] == c) {
+            const u32 e = ksx1001_code(i);
+            out[0] = static_cast<u8>(e >> 8);
+            out[1] = static_cast<u8>(e);
+            return 2;
+        }
+    }
+    const auto ext = [&](const std::vector<u16>& t, u32 per_lead, u32 base) -> u32 {
+        for (u32 i = 0; i < t.size(); i++) {
+            if (t[i] == c) {
+                u32 e = ((i / per_lead) << 8) + (i % per_lead) + base;
+                if ((e & 0xFF) > 0x5A) e += 6;
+                if ((e & 0xFF) > 0x7A) e += 6;
+                out[0] = static_cast<u8>((e & 0xFFFF) >> 8);
+                out[1] = static_cast<u8>(e);
+                return 2;
+            }
+        }
+        return 0;
+    };
+    if (const u32 n = ext(table(kUhc1), 178, 0x8141)) return n;
+    return ext(table(kUhc2), 84, 0xA141);
+}
+
+// EUCKRtoUHC and UHCtoEUCKR (0x4cf0, 0xcf64): the same work, a KS X 1001 pair or a single byte copied.
+template <class Byte>
+u32 ks_copy(Byte&& at, u8* out)
+{
+    const u8 b0 = at(0);
+    if (in_a1_fe(b0)) {
+        const u8 b1 = at(1);
+        if (in_a1_fe(b1)) {
+            out[0] = b0;
+            out[1] = b1;
+            return 2;
+        }
+    }
+    if (((b0 - 0x81) & 0xFF) <= 125) return 0;
+    out[0] = b0;
+    return 1;
+}
+
+u32 EUCKRtoUCS2(PPUContext& ctx, u32 src, u32 dst)
+{
+    Mem m(ctx, "EUCKRtoUCS2");
+    u16 v = 0;
+    const u32 n = euckr_decode([&](u32 i) { return m.r8(src + i); }, &v);
+    if (!m.ok() || !n) return 0;
+    m.w16(dst, v);
+    return m.ok() ? n : 0;
+}
+
+u32 UHCtoUCS2(PPUContext& ctx, u32 src, u32 dst)
+{
+    Mem m(ctx, "UHCtoUCS2");
+    u16 v = 0;
+    const u32 n = uhc_decode([&](u32 i) { return m.r8(src + i); }, &v);
+    if (!m.ok() || !n) return 0;
+    m.w16(dst, v);
+    return m.ok() ? n : 0;
+}
+
+template <class Dec>
+u32 to_utf8_one(PPUContext& ctx, const char* fn, u32 src, u32 dst, u32 len, Dec dec)
+{
+    Mem m(ctx, fn);
+    u16 v = 0;
+    const u32 n = dec([&](u32 i) { return m.r8(src + i); }, &v);
+    if (!m.ok() || !n) return 0;
+    u8 out[4];
+    const u32 k = ucs2_to_utf8(v, out);
+    for (u32 i = 0; i < k; i++) m.w8(dst + i, out[i]);
+    m.w32(len, k);
+    return m.ok() ? n : 0;
+}
+
+auto euckr_dec = [](auto&& at, u16* v) { return euckr_decode(at, v); };
+auto uhc_dec = [](auto&& at, u16* v) { return uhc_decode(at, v); };
+
+u32 EUCKRtoUTF8(PPUContext& ctx, u32 src, u32 dst, u32 len) { return to_utf8_one(ctx, "EUCKRtoUTF8", src, dst, len, euckr_dec); }
+u32 UHCtoUTF8(PPUContext& ctx, u32 src, u32 dst, u32 len) { return to_utf8_one(ctx, "UHCtoUTF8", src, dst, len, uhc_dec); }
+
+u32 UCS2toEUCKR(PPUContext& ctx, u32 c, u32 dst)
+{
+    Mem m(ctx, "UCS2toEUCKR");
+    u8 out[2];
+    const u32 n = ucs2_to_euckr(c, out);
+    for (u32 i = 0; i < n; i++) m.w8(dst + i, out[i]);
+    return m.ok() ? n : 0;
+}
+
+u32 UCS2toUHC(PPUContext& ctx, u32 c, u32 dst)
+{
+    Mem m(ctx, "UCS2toUHC");
+    u8 out[2];
+    const u32 n = ucs2_to_uhc(c, out);
+    for (u32 i = 0; i < n; i++) m.w8(dst + i, out[i]);
+    return m.ok() ? n : 0;
+}
+
+u32 UTF8toEUCKR(PPUContext& ctx, u32 src, u32 dst, u32 len)
+{
+    return from_utf8_one(ctx, "UTF8toEUCKR", src, dst, len, [](u32 c, u8* o) { return ucs2_to_euckr(c, o); });
+}
+
+u32 UTF8toUHC(PPUContext& ctx, u32 src, u32 dst, u32 len)
+{
+    return from_utf8_one(ctx, "UTF8toUHC", src, dst, len, [](u32 c, u8* o) { return ucs2_to_uhc(c, o); });
+}
+
+u32 ks_copy_one(PPUContext& ctx, const char* fn, u32 src, u32 dst, u32 len)
+{
+    Mem m(ctx, fn);
+    u8 out[2];
+    const u32 n = ks_copy([&](u32 i) { return m.r8(src + i); }, out);
+    if (!m.ok() || !n) return 0;
+    for (u32 i = 0; i < n; i++) m.w8(dst + i, out[i]);
+    m.w32(len, n);
+    return m.ok() ? n : 0;
+}
+
+u32 EUCKRtoUHC(PPUContext& ctx, u32 src, u32 dst, u32 len) { return ks_copy_one(ctx, "EUCKRtoUHC", src, dst, len); }
+u32 UHCtoEUCKR(PPUContext& ctx, u32 src, u32 dst, u32 len) { return ks_copy_one(ctx, "UHCtoEUCKR", src, dst, len); }
+
+u32 EUCKRstoUCS2s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    return mb_string(ctx, "EUCKRstoUCS2s", src, sl, dst, dl, 2, euckr_dec, to_ucs2_unit);
+}
+u32 EUCKRstoUTF8s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    return mb_string(ctx, "EUCKRstoUTF8s", src, sl, dst, dl, 1, euckr_dec, to_utf8_units);
+}
+u32 UHCstoUCS2s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    return mb_string(ctx, "UHCstoUCS2s", src, sl, dst, dl, 2, uhc_dec, to_ucs2_unit);
+}
+u32 UHCstoUTF8s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    return mb_string(ctx, "UHCstoUTF8s", src, sl, dst, dl, 1, uhc_dec, to_utf8_units);
+}
+u32 UCS2stoEUCKRs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    return ucs2_string(ctx, "UCS2stoEUCKRs", src, sl, dst, dl, ucs2_to_euckr);
+}
+u32 UCS2stoUHCs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    return ucs2_string(ctx, "UCS2stoUHCs", src, sl, dst, dl, ucs2_to_uhc);
+}
+u32 UTF8stoEUCKRs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    return utf8_string(ctx, "UTF8stoEUCKRs", src, sl, dst, dl, ucs2_to_euckr);
+}
+u32 UTF8stoUHCs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    return utf8_string(ctx, "UTF8stoUHCs", src, sl, dst, dl, ucs2_to_uhc);
+}
+
+u32 ks_copy_string(PPUContext& ctx, const char* fn, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, fn);
+    return string_loop(m, src, sl, dst, dl, 1, 1, true, [&](u32 at) {
+        Step s;
+        u8 out[2];
+        s.n = ks_copy([&](u32 i) { return m.r8(at + i); }, out);
+        if (!s.n) return s;
+        for (u32 k = 0; k < s.n; k++) s.out[k] = out[k];
+        s.took = s.n;
+        return s;
+    });
+}
+
+u32 EUCKRstoUHCs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return ks_copy_string(ctx, "EUCKRstoUHCs", src, sl, dst, dl); }
+u32 UHCstoEUCKRs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return ks_copy_string(ctx, "UHCstoEUCKRs", src, sl, dst, dl); }
+
+// ------------------------------------------------------------------------------------------------- Chinese
+
+// GB2312's rows A1-A9, B0-F7 (EUC-CN): the UCS-2 value of a pair of A1-FE bytes, FFFF for none (libl10n 0x3838).
+u16 gb2312_ucs2(u32 b0, u32 b1)
+{
+    const u32 c = (b0 << 8) | b1;
+    if (((c - 0xA1A1) & 0xFFFF) > 0x565D || ((b0 - 0xAA) & 0xFF) <= 5) return 0xFFFF;
+    return table(kGb2312)[b0 * 94 + b1 - (b0 <= 0xAF ? 15295 : 15859)];
+}
+
+template <class Byte>
+u32 euccn_decode(Byte&& at, u16* out)
+{
+    const u8 b0 = at(0);
+    if (in_a1_fe(b0)) {
+        const u8 b1 = at(1);
+        if (in_a1_fe(b1)) {
+            const u16 v = gb2312_ucs2(b0, b1);
+            if (v == 0xFFFF) return 0;
+            *out = v;
+            return 2;
+        }
+    }
+    if (b0 & 0x80) {
+        if ((b0 & 0xE0) != 0x80 || b0 == 0x8E || b0 == 0x8F) return 0;
+    }
+    *out = b0;
+    return 1;
+}
+
+// A GB2312 table index's code (rows A1-A9, then B0-F7).
+u32 gb2312_code(u32 i)
+{
+    u32 e = ((i / 94) << 8) + (i % 94) + 0xA1A1;
+    if ((e & 0xFFFF) > 0xA9FF) e += 0x600;
+    return e & 0xFFFF;
+}
+
+bool find_code(const std::vector<u16>& t, u32 c, u32* index, usize from = 0, usize to = ~usize{0})
+{
+    for (usize i = from; i < t.size() && i < to; i++) {
+        if (t[i] == c) {
+            *index = static_cast<u32>(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+u32 put2(u8* out, u32 e)
+{
+    out[0] = static_cast<u8>((e & 0xFFFF) >> 8);
+    out[1] = static_cast<u8>(e);
+    return 2;
+}
+
+u32 ucs2_to_euccn(u32 c, u8* out)
+{
+    c &= 0xFFFF;
+    if (c > 0xFFFD) return 0;
+    if (c <= 0x8D || ((c - 0x90) & 0xFFFF) <= 15) {
+        out[0] = static_cast<u8>(c);
+        return 1;
+    }
+    u32 i;
+    if (find_code(table(kGb2312), c, &i)) return put2(out, gb2312_code(i));
+    return 0;
+}
+
+// GBK's code of a GBK/3 index (leads 81-A0) and a GBK/4 index (leads A8-FE): trails 40-7E, 80-FE / 80-A0.
+u32 gbk3_code(u32 i)
+{
+    u32 e = ((i / 190) << 8) + (i % 190) + 0x8140;
+    if ((e & 0xFF) > 0x7E) e += 1;
+    return e;
+}
+
+u32 gbk4_code(u32 i)
+{
+    u32 e = ((i / 96) << 8) + (i % 96) + 0xA840;
+    if ((e & 0xFF) > 0x7E) e += 1;
+    return e;
+}
+
+// GBKtoUCS2 (0x5ba8): 80 is the euro sign; the two-byte GBK/3 and GBK/4 cells are read without an FFFF check.
+template <class Byte>
+u32 gbk_decode(Byte&& at, u16* out)
+{
+    const u8 b0 = at(0);
+    if (in_a1_fe(b0)) {
+        const u8 b1 = at(1);
+        if (in_a1_fe(b1)) {
+            u16 v;
+            if (b0 == 0xA2) v = table(kGbkrows)[b1 - 0xA1];
+            else if (b0 == 0xA6) v = table(kGbkrows)[94 + b1 - 0xA1];
+            else if (b0 == 0xA8) v = table(kGbkrows)[188 + b1 - 0xA1];
+            else v = gb2312_ucs2(b0, b1);
+            if (v == 0xFFFF) return 0;
+            *out = v;
+            return 2;
+        }
+    }
+    if (((b0 - 0x81) & 0xFF) <= 125) {
+        const u8 b1 = at(1);
+        if (((b1 - 0x40) & 0xFF) > 190 || b1 == 0x7F) return 0;
+        const u32 t = b1 < 0x80 ? b1 - 0x40 : b1 - 0x41;
+        if (b0 <= 0xA0) {
+            *out = table(kGbk3)[(b0 - 0x81) * 190 + t];
+            return 2;
+        }
+        if (b0 <= 0xA7) return 0;
+        const u32 index = (b0 - 0xA8) * 96 + t;
+        if (index > 8271) return 0;
+        const u16 v = table(kGbk4)[index];
+        if (v == 0xFFFF) return 0;
+        *out = v;
+        return 2;
+    }
+    if (!(b0 & 0x80)) {
+        *out = b0;
+        return 1;
+    }
+    if (b0 != 0x80) return 0;
+    *out = 0x20AC;
+    return 1;
+}
+
+// UCS2toGBK (0xc07c): ASCII, the euro sign, then GBK's rows A2/A6/A8, GBK/3, GBK/4 and GB2312, in that order.
+u32 ucs2_to_gbk(u32 c, u8* out)
+{
+    c &= 0xFFFF;
+    if (c > 0xFFFD) return 0;
+    if (c <= 0x7F) {
+        out[0] = static_cast<u8>(c);
+        return 1;
+    }
+    if (c == 0x20AC) {
+        out[0] = 0x80;
+        return 1;
+    }
+    u32 i;
+    if (find_code(table(kGbkrows), c, &i)) {
+        u32 e = ((i / 94) << 8) + (i % 94) + 0xA2A1;
+        if ((e & 0xFFFF) > 0xA2FF) e += 0x300;
+        if ((e & 0xFFFF) > 0xA6FF) e += 0x100;
+        return put2(out, e);
+    }
+    if (find_code(table(kGbk3), c, &i)) return put2(out, gbk3_code(i));
+    if (find_code(table(kGbk4), c, &i)) return put2(out, gbk4_code(i));
+    if (find_code(table(kGb2312), c, &i)) return put2(out, gb2312_code(i));
+    return 0;
+}
+
+// GB18030toUCS2 (0x5e34): GB2312's area with GB18030's rows A2, A4-A9 and D7, GBK's areas with GB18030's A8-A9 and FE
+// cells, and the four-byte cells of CJK Extension A (no FFFF checks: every such cell is assigned).
+template <class Byte>
+u32 gb18030_decode(Byte&& at, u16* out)
+{
+    const u8 b0 = at(0);
+    if (in_a1_fe(b0)) {
+        const u8 b1 = at(1);
+        if (in_a1_fe(b1)) {
+            if (b0 == 0xA2) *out = table(kGbrows18030)[b1 - 0xA1];
+            else if (((b0 - 0xA4) & 0xFF) <= 5) *out = table(kGbrows18030)[(b0 - 0xA3) * 94 + b1 - 0xA1];
+            else if (b0 == 0xD7) *out = table(kGbd7)[b1 - 0xA1];
+            else {
+                const u32 c = (u32{b0} << 8) | b1;
+                if (c - 0xA1A1 > 0x565D || ((b0 - 0xAA) & 0xFF) <= 5) return 0;
+                *out = table(kGb2312)[b0 * 94 + b1 - (b0 <= 0xAF ? 15295 : 15859)];
+            }
+            return 2;
+        }
+    }
+    if (((b0 - 0x81) & 0xFF) <= 125) {
+        const u8 b1 = at(1);
+        if (((b1 - 0x40) & 0xFF) <= 190 && b1 != 0x7F) {
+            const u32 t = b1 < 0x80 ? b1 - 0x40 : b1 - 0x41;
+            if (((b0 - 0xA8) & 0xFF) <= 1) *out = table(kGba8)[(b0 - 0xA8) * 96 + t];
+            else if (b0 == 0xFE) *out = table(kGbfe)[t];
+            else if (b0 <= 0xA0) *out = table(kGbk3)[(b0 - 0x81) * 190 + t];
+            else if (b0 <= 0xA7) return 0;
+            else *out = table(kGbk4)[(b0 - 0xA8) * 96 + t];
+            return 2;
+        }
+        if (((b1 - 0x30) & 0xFF) > 9) return 0;
+        const u8 b2 = at(2);
+        if (((b2 - 0x81) & 0xFF) > 125) return 0;
+        const u8 b3 = at(3);
+        if (((b3 - 0x30) & 0xFF) > 9) return 0;
+        const u32 v = (u32{b0} << 24) | (u32{b1} << 16) | (u32{b2} << 8) | b3;
+        if (v - 0x8139EE39u > 0xFB98FFu) return 0;
+        const u32 linear = ((((b0 - 0x81u) * 10 + (b1 - 0x30u)) * 126 + (b2 - 0x81u)) * 10 + (b3 - 0x30u)) & 0xFFFF;
+        for (const auto& r : l10n_data::kGb18030Ranges) {
+            if (linear >= r.linear && linear < r.linear + r.count) {
+                *out = static_cast<u16>(linear - r.linear + r.ucs);
+                return 4;
+            }
+        }
+        return 0;
+    }
+    if (b0 & 0x80) return 0;
+    *out = b0;
+    return 1;
+}
+
+// UCS2toGB18030 (0xbc50): GB18030's rows, D7, A8-A9 and FE cells, GBK/3, GBK/4 (from lead AA), GB2312, then the
+// four-byte cells.
+u32 ucs2_to_gb18030(u32 c, u8* out)
+{
+    c &= 0xFFFF;
+    if (c > 0xFFFD) return 0;
+    if (c <= 0x7F) {
+        out[0] = static_cast<u8>(c);
+        return 1;
+    }
+    u32 i;
+    if (find_code(table(kGbrows18030), c, &i)) {
+        u32 e = ((i / 94) << 8) + (i % 94) + 0xA2A1;
+        if ((e & 0xFFFF) > 0xA2FF) e += 0x100;
+        return put2(out, e);
+    }
+    if (find_code(table(kGbd7), c, &i)) return put2(out, 0xD7A1 + i);
+    if (find_code(table(kGba8), c, &i)) return put2(out, gbk4_code(i));
+    if (find_code(table(kGbfe), c, &i)) {
+        u32 e = 0xFE40 + i;
+        if ((e & 0xFF) > 0x7E) e += 1;
+        return put2(out, e);
+    }
+    if (find_code(table(kGbk3), c, &i)) return put2(out, gbk3_code(i));
+    if (find_code(table(kGbk4), c, &i, 192, 8256)) return put2(out, gbk4_code(i));
+    if (find_code(table(kGb2312), c, &i)) return put2(out, gb2312_code(i));
+    for (const auto& r : l10n_data::kGb18030Ranges) {
+        if (c >= r.ucs && c < r.ucs + r.count) {
+            const u32 linear = r.linear + (c - r.ucs);
+            const u32 q1 = linear / 10, t2 = q1 / 126;
+            out[0] = static_cast<u8>(t2 / 10 + 0x81);
+            out[1] = static_cast<u8>(t2 % 10 + 0x30);
+            out[2] = static_cast<u8>(q1 % 126 + 0x81);
+            out[3] = static_cast<u8>(linear % 10 + 0x30);
+            return 4;
+        }
+    }
+    return 0;
+}
+
+// Big5 (cp950 without ETEN's C6A1-C6FE; leads C7 and C8 have nothing): BIG5toUCS2 (0x336c), UCS2toBIG5 (0xb74c).
+template <class Byte>
+u32 big5_decode(Byte&& at, u16* out)
+{
+    const u8 b0 = at(0);
+    if (in_a1_fe(b0)) {
+        const u8 b1 = at(1);
+        if (((b1 - 0x40) & 0xFF) > 62 && !in_a1_fe(b1)) return 0;
+        const u32 c = (u32{b0} << 8) | b1;
+        if (((c - 0xA140) & 0xFFFF) > 0x58BE || b0 == 0xC7 || b0 == 0xC8) return 0;
+        u32 index = b0 * 157 + b1 - (b0 <= 0xC8 ? 25341 : 25655);
+        if (b1 > 0xA0) index -= 34;
+        const u16 v = table(kBig5)[index];
+        if (v == 0xFFFF) return 0;
+        *out = v;
+        return 2;
+    }
+    if (b0 > 0x80) return 0;
+    *out = b0;
+    return 1;
+}
+
+u32 ucs2_to_big5(u32 c, u8* out)
+{
+    c &= 0xFFFF;
+    if (c > 0xFFFD) return 0;
+    if (c <= 0x80) {
+        out[0] = static_cast<u8>(c);
+        return 1;
+    }
+    u32 i;
+    if (!find_code(table(kBig5), c, &i)) return 0;
+    u32 e = ((i / 157) << 8) + (i % 157) + 0xA140;
+    if ((e & 0xFFFF) > 0xC6FF) e += 0x200;
+    if ((e & 0xFF) > 0x7E) e += 34;
+    return put2(out, e);
+}
+
+auto euccn_dec = [](auto&& at, u16* v) { return euccn_decode(at, v); };
+auto gbk_dec = [](auto&& at, u16* v) { return gbk_decode(at, v); };
+auto gb18030_dec = [](auto&& at, u16* v) { return gb18030_decode(at, v); };
+auto big5_dec = [](auto&& at, u16* v) { return big5_decode(at, v); };
+
+template <class Dec>
+u32 to_ucs2_one(PPUContext& ctx, const char* fn, u32 src, u32 dst, Dec dec)
+{
+    Mem m(ctx, fn);
+    u16 v = 0;
+    const u32 n = dec([&](u32 i) { return m.r8(src + i); }, &v);
+    if (!m.ok() || !n) return 0;
+    m.w16(dst, v);
+    return m.ok() ? n : 0;
+}
+
+template <class Enc>
+u32 from_ucs2_one(PPUContext& ctx, const char* fn, u32 c, u32 dst, Enc enc)
+{
+    Mem m(ctx, fn);
+    u8 out[4];
+    const u32 n = enc(c, out);
+    for (u32 i = 0; i < n; i++) m.w8(dst + i, out[i]);
+    return m.ok() ? n : 0;
+}
+
+u32 EUCCNtoUCS2(PPUContext& ctx, u32 s, u32 d) { return to_ucs2_one(ctx, "EUCCNtoUCS2", s, d, euccn_dec); }
+u32 GBKtoUCS2(PPUContext& ctx, u32 s, u32 d) { return to_ucs2_one(ctx, "GBKtoUCS2", s, d, gbk_dec); }
+u32 GB18030toUCS2(PPUContext& ctx, u32 s, u32 d) { return to_ucs2_one(ctx, "GB18030toUCS2", s, d, gb18030_dec); }
+u32 BIG5toUCS2(PPUContext& ctx, u32 s, u32 d) { return to_ucs2_one(ctx, "BIG5toUCS2", s, d, big5_dec); }
+u32 EUCCNtoUTF8(PPUContext& ctx, u32 s, u32 d, u32 l) { return to_utf8_one(ctx, "EUCCNtoUTF8", s, d, l, euccn_dec); }
+u32 GBKtoUTF8(PPUContext& ctx, u32 s, u32 d, u32 l) { return to_utf8_one(ctx, "GBKtoUTF8", s, d, l, gbk_dec); }
+u32 GB18030toUTF8(PPUContext& ctx, u32 s, u32 d, u32 l) { return to_utf8_one(ctx, "GB18030toUTF8", s, d, l, gb18030_dec); }
+u32 BIG5toUTF8(PPUContext& ctx, u32 s, u32 d, u32 l) { return to_utf8_one(ctx, "BIG5toUTF8", s, d, l, big5_dec); }
+u32 UCS2toEUCCN(PPUContext& ctx, u32 c, u32 d) { return from_ucs2_one(ctx, "UCS2toEUCCN", c, d, ucs2_to_euccn); }
+u32 UCS2toGBK(PPUContext& ctx, u32 c, u32 d) { return from_ucs2_one(ctx, "UCS2toGBK", c, d, ucs2_to_gbk); }
+u32 UCS2toGB18030(PPUContext& ctx, u32 c, u32 d) { return from_ucs2_one(ctx, "UCS2toGB18030", c, d, ucs2_to_gb18030); }
+u32 UCS2toBIG5(PPUContext& ctx, u32 c, u32 d) { return from_ucs2_one(ctx, "UCS2toBIG5", c, d, ucs2_to_big5); }
+u32 UTF8toEUCCN(PPUContext& ctx, u32 s, u32 d, u32 l)
+{
+    return from_utf8_one(ctx, "UTF8toEUCCN", s, d, l, [](u32 c, u8* o) { return ucs2_to_euccn(c, o); });
+}
+u32 UTF8toGBK(PPUContext& ctx, u32 s, u32 d, u32 l)
+{
+    return from_utf8_one(ctx, "UTF8toGBK", s, d, l, [](u32 c, u8* o) { return ucs2_to_gbk(c, o); });
+}
+u32 UTF8toGB18030(PPUContext& ctx, u32 s, u32 d, u32 l)
+{
+    return from_utf8_one(ctx, "UTF8toGB18030", s, d, l, [](u32 c, u8* o) { return ucs2_to_gb18030(c, o); });
+}
+u32 UTF8toBIG5(PPUContext& ctx, u32 s, u32 d, u32 l)
+{
+    return from_utf8_one(ctx, "UTF8toBIG5", s, d, l, [](u32 c, u8* o) { return ucs2_to_big5(c, o); });
+}
+
+u32 EUCCNstoUCS2s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return mb_string(ctx, "EUCCNstoUCS2s", s, sl, d, dl, 2, euccn_dec, to_ucs2_unit); }
+u32 EUCCNstoUTF8s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return mb_string(ctx, "EUCCNstoUTF8s", s, sl, d, dl, 1, euccn_dec, to_utf8_units); }
+u32 GBKstoUCS2s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return mb_string(ctx, "GBKstoUCS2s", s, sl, d, dl, 2, gbk_dec, to_ucs2_unit); }
+u32 GBKstoUTF8s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return mb_string(ctx, "GBKstoUTF8s", s, sl, d, dl, 1, gbk_dec, to_utf8_units); }
+u32 GB18030stoUCS2s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return mb_string(ctx, "GB18030stoUCS2s", s, sl, d, dl, 2, gb18030_dec, to_ucs2_unit); }
+u32 GB18030stoUTF8s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return mb_string(ctx, "GB18030stoUTF8s", s, sl, d, dl, 1, gb18030_dec, to_utf8_units); }
+u32 BIG5stoUCS2s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return mb_string(ctx, "BIG5stoUCS2s", s, sl, d, dl, 2, big5_dec, to_ucs2_unit); }
+u32 BIG5stoUTF8s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return mb_string(ctx, "BIG5stoUTF8s", s, sl, d, dl, 1, big5_dec, to_utf8_units); }
+u32 UCS2stoEUCCNs(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return ucs2_string(ctx, "UCS2stoEUCCNs", s, sl, d, dl, ucs2_to_euccn); }
+u32 UCS2stoGBKs(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return ucs2_string(ctx, "UCS2stoGBKs", s, sl, d, dl, ucs2_to_gbk); }
+u32 UCS2stoGB18030s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return ucs2_string(ctx, "UCS2stoGB18030s", s, sl, d, dl, ucs2_to_gb18030); }
+u32 UCS2stoBIG5s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return ucs2_string(ctx, "UCS2stoBIG5s", s, sl, d, dl, ucs2_to_big5); }
+u32 UTF8stoEUCCNs(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return utf8_string(ctx, "UTF8stoEUCCNs", s, sl, d, dl, ucs2_to_euccn); }
+u32 UTF8stoGBKs(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return utf8_string(ctx, "UTF8stoGBKs", s, sl, d, dl, ucs2_to_gbk); }
+u32 UTF8stoGB18030s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return utf8_string(ctx, "UTF8stoGB18030s", s, sl, d, dl, ucs2_to_gb18030); }
+u32 UTF8stoBIG5s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return utf8_string(ctx, "UTF8stoBIG5s", s, sl, d, dl, ucs2_to_big5); }
+
 } // namespace
 
 void register_cellL10n(Registry& r)
@@ -1566,7 +2209,32 @@ void register_cellL10n(Registry& r)
         f("UCS2stoSJISs", &thunk<&UCS2stoSJISs>), f("UTF8stoEUCJPs", &thunk<&UTF8stoEUCJPs>),
         f("UTF8stoSJISs", &thunk<&UTF8stoSJISs>), f("MSJISstoUCS2s", &thunk<&MSJISstoUCS2s>),
         f("MSJISstoUTF8s", &thunk<&MSJISstoUTF8s>), f("UCS2stoMSJISs", &thunk<&UCS2stoMSJISs>),
-        f("UTF8stoMSJISs", &thunk<&UTF8stoMSJISs>),
+        f("UTF8stoMSJISs", &thunk<&UTF8stoMSJISs>), f("EUCKRtoUCS2", &thunk<&EUCKRtoUCS2>),
+        f("UHCtoUCS2", &thunk<&UHCtoUCS2>), f("EUCKRtoUTF8", &thunk<&EUCKRtoUTF8>), f("UHCtoUTF8", &thunk<&UHCtoUTF8>),
+        f("UCS2toEUCKR", &thunk<&UCS2toEUCKR>), f("UCS2toUHC", &thunk<&UCS2toUHC>),
+        f("UTF8toEUCKR", &thunk<&UTF8toEUCKR>), f("UTF8toUHC", &thunk<&UTF8toUHC>),
+        f("EUCKRtoUHC", &thunk<&EUCKRtoUHC>), f("UHCtoEUCKR", &thunk<&UHCtoEUCKR>),
+        f("EUCKRstoUCS2s", &thunk<&EUCKRstoUCS2s>), f("EUCKRstoUTF8s", &thunk<&EUCKRstoUTF8s>),
+        f("UHCstoUCS2s", &thunk<&UHCstoUCS2s>), f("UHCstoUTF8s", &thunk<&UHCstoUTF8s>),
+        f("UCS2stoEUCKRs", &thunk<&UCS2stoEUCKRs>), f("UCS2stoUHCs", &thunk<&UCS2stoUHCs>),
+        f("UTF8stoEUCKRs", &thunk<&UTF8stoEUCKRs>), f("UTF8stoUHCs", &thunk<&UTF8stoUHCs>),
+        f("EUCKRstoUHCs", &thunk<&EUCKRstoUHCs>), f("UHCstoEUCKRs", &thunk<&UHCstoEUCKRs>),
+        f("EUCCNtoUCS2", &thunk<&EUCCNtoUCS2>), f("EUCCNtoUTF8", &thunk<&EUCCNtoUTF8>),
+        f("UCS2toEUCCN", &thunk<&UCS2toEUCCN>), f("UTF8toEUCCN", &thunk<&UTF8toEUCCN>),
+        f("EUCCNstoUCS2s", &thunk<&EUCCNstoUCS2s>), f("EUCCNstoUTF8s", &thunk<&EUCCNstoUTF8s>),
+        f("UCS2stoEUCCNs", &thunk<&UCS2stoEUCCNs>), f("UTF8stoEUCCNs", &thunk<&UTF8stoEUCCNs>),
+        f("GBKtoUCS2", &thunk<&GBKtoUCS2>), f("GBKtoUTF8", &thunk<&GBKtoUTF8>), f("UCS2toGBK", &thunk<&UCS2toGBK>),
+        f("UTF8toGBK", &thunk<&UTF8toGBK>), f("GBKstoUCS2s", &thunk<&GBKstoUCS2s>),
+        f("GBKstoUTF8s", &thunk<&GBKstoUTF8s>), f("UCS2stoGBKs", &thunk<&UCS2stoGBKs>),
+        f("UTF8stoGBKs", &thunk<&UTF8stoGBKs>), f("GB18030toUCS2", &thunk<&GB18030toUCS2>),
+        f("GB18030toUTF8", &thunk<&GB18030toUTF8>), f("UCS2toGB18030", &thunk<&UCS2toGB18030>),
+        f("UTF8toGB18030", &thunk<&UTF8toGB18030>), f("GB18030stoUCS2s", &thunk<&GB18030stoUCS2s>),
+        f("GB18030stoUTF8s", &thunk<&GB18030stoUTF8s>), f("UCS2stoGB18030s", &thunk<&UCS2stoGB18030s>),
+        f("UTF8stoGB18030s", &thunk<&UTF8stoGB18030s>), f("BIG5toUCS2", &thunk<&BIG5toUCS2>),
+        f("BIG5toUTF8", &thunk<&BIG5toUTF8>), f("UCS2toBIG5", &thunk<&UCS2toBIG5>),
+        f("UTF8toBIG5", &thunk<&UTF8toBIG5>), f("BIG5stoUCS2s", &thunk<&BIG5stoUCS2s>),
+        f("BIG5stoUTF8s", &thunk<&BIG5stoUTF8s>), f("UCS2stoBIG5s", &thunk<&UCS2stoBIG5s>),
+        f("UTF8stoBIG5s", &thunk<&UTF8stoBIG5s>),
     });
 }
 

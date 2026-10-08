@@ -336,3 +336,140 @@ TEST_CASE("cellL10n: the Japanese converters are libl10n's (D-517)", "[hle][l10n
     }
     CHECK(l.mismatches == 0);
 }
+
+TEST_CASE("cellL10n: the Korean converters are libl10n's (D-517)", "[hle][l10n]")
+{
+    L10n l;
+    if (!l.sony) SKIP("PSPOCKET_TEST_DEV_FLASH is not set");
+    u8* b = l.b;
+    std::mt19937 rng(21);
+    for (u32 b0 = 0; b0 < 256; b0++) {
+        for (u32 b1 = 0; b1 < 256; b1++) {
+            const std::vector<u8> s{static_cast<u8>(b0), static_cast<u8>(b1), 0xA1};
+            for (const char* fn : {"EUCKRtoUCS2", "UHCtoUCS2"})
+                l.same(fn, [&](u32 base) { put_bytes(b, base + 0x100, s); return std::vector<u64>{base + 0x100, base}; }, hex(s));
+            for (const char* fn : {"EUCKRtoUTF8", "UHCtoUTF8", "EUCKRtoUHC", "UHCtoEUCKR"})
+                l.same(fn, [&](u32 base) { put_bytes(b, base + 0x100, s); return std::vector<u64>{base + 0x100, base, base + 0x80}; }, hex(s));
+        }
+    }
+    std::vector<u32> values;
+    for (u32 c = 0; c < 0x2700; c++) values.push_back(c);
+    for (u32 c = 0x3000; c < 0x3400; c++) values.push_back(c);
+    for (u32 c = 0xF900; c < 0x10000; c++) values.push_back(c);
+    for (u32 k = 0; k < 2500; k++) values.push_back(0xAC00 + rng() % 0x2BA4);
+    for (u32 k = 0; k < 1500; k++) values.push_back(0x4E00 + rng() % 0x5200);
+    for (const u32 c : values)
+        for (const char* fn : {"UCS2toEUCKR", "UCS2toUHC"})
+            l.same(fn, [&](u32 base) { return std::vector<u64>{c, base}; }, std::format("{:#x}", c));
+    for (u32 k = 0; k < 1500; k++) {
+        const u32 c = values[rng() % values.size()];
+        std::vector<u8> s;
+        if (c < 0x80) s = {static_cast<u8>(c)};
+        else if (c < 0x800) s = {static_cast<u8>(0xC0 | (c >> 6)), static_cast<u8>(0x80 | (c & 0x3F))};
+        else s = {static_cast<u8>(0xE0 | (c >> 12)), static_cast<u8>(0x80 | ((c >> 6) & 0x3F)), static_cast<u8>(0x80 | (c & 0x3F))};
+        for (const char* fn : {"UTF8toEUCKR", "UTF8toUHC"})
+            l.same(fn, [&](u32 base) { put_bytes(b, base + 0x100, s); return std::vector<u64>{base + 0x100, base, base + 0x80}; }, hex(s));
+    }
+    for (u32 round = 0; round < 400; round++) {
+        std::vector<u8> bytes, units;
+        for (u32 i = 0, n = 1 + rng() % 10; i < n; i++) {
+            const u32 r = rng() % 6;
+            if (r < 2) bytes.push_back(static_cast<u8>(0x20 + rng() % 0x5F));
+            else if (r < 4) { bytes.push_back(static_cast<u8>(0xA1 + rng() % 0x5E)); bytes.push_back(static_cast<u8>(0xA1 + rng() % 0x5E)); }
+            else if (r < 5) { bytes.push_back(static_cast<u8>(0x81 + rng() % 0x46)); bytes.push_back(static_cast<u8>(0x41 + rng() % 0xBE)); }
+            else { const auto x = random_bytes(rng, 2); bytes.insert(bytes.end(), x.begin(), x.end()); }
+            const u32 v = values[rng() % values.size()];
+            units.push_back(static_cast<u8>(v >> 8));
+            units.push_back(static_cast<u8>(v));
+        }
+        for (const char* fn : {"EUCKRstoUCS2s", "EUCKRstoUTF8s", "UHCstoUCS2s", "UHCstoUTF8s", "UTF8stoEUCKRs",
+                 "UTF8stoUHCs", "EUCKRstoUHCs", "UHCstoEUCKRs", "UCS2stoEUCKRs", "UCS2stoUHCs"}) {
+            const bool wide = std::string(fn).starts_with("UCS2s");
+            const std::vector<u8>& in = wide ? units : bytes;
+            const u32 n = static_cast<u32>(wide ? in.size() / 2 : in.size());
+            for (const u32 sl : {n, n > 1 ? n - 1 : n})
+                for (const u32 cap : {0x100u, 0u, 1u, 2u, 3u})
+                    l.same(fn, [&](u32 base) {
+                        put_bytes(b, base + 0x200, in);
+                        ps_write32(b, base + 0x3F0, sl);
+                        ps_write32(b, base + 0x3F4, cap);
+                        return std::vector<u64>{base + 0x200, base + 0x3F0, base, base + 0x3F4};
+                    }, std::format("{} n {} cap {}", hex(in), sl, cap));
+        }
+    }
+    CHECK(l.mismatches == 0);
+}
+
+TEST_CASE("cellL10n: the Chinese converters are libl10n's (D-517)", "[hle][l10n]")
+{
+    L10n l;
+    if (!l.sony) SKIP("PSPOCKET_TEST_DEV_FLASH is not set");
+    u8* b = l.b;
+    std::mt19937 rng(31);
+    for (u32 b0 = 0; b0 < 256; b0++) {
+        for (u32 b1 = 0; b1 < 256; b1++) {
+            const std::vector<u8> s{static_cast<u8>(b0), static_cast<u8>(b1), 0x81, 0x30};
+            for (const char* fn : {"EUCCNtoUCS2", "GBKtoUCS2", "GB18030toUCS2", "BIG5toUCS2"})
+                l.same(fn, [&](u32 base) { put_bytes(b, base + 0x100, s); return std::vector<u64>{base + 0x100, base}; }, hex(s));
+            if ((b0 & 7) == 0 || b0 >= 0x80)
+                for (const char* fn : {"EUCCNtoUTF8", "GBKtoUTF8", "GB18030toUTF8", "BIG5toUTF8"})
+                    l.same(fn, [&](u32 base) { put_bytes(b, base + 0x100, s); return std::vector<u64>{base + 0x100, base, base + 0x80}; }, hex(s));
+        }
+    }
+    // GB18030's four-byte area around CJK Extension A.
+    for (u32 b0 : {0x81u, 0x82u, 0x84u, 0x90u, 0xE3u, 0xFEu})
+        for (u32 b1 = 0x2F; b1 <= 0x3A; b1++)
+            for (u32 k = 0; k < 60; k++) {
+                const std::vector<u8> s{static_cast<u8>(b0), static_cast<u8>(b1), static_cast<u8>(0x80 + rng() % 0x80), static_cast<u8>(0x2F + rng() % 12)};
+                l.same("GB18030toUCS2", [&](u32 base) { put_bytes(b, base + 0x100, s); return std::vector<u64>{base + 0x100, base}; }, hex(s));
+            }
+    std::vector<u32> values;
+    for (u32 c = 0; c < 0x3200; c++) values.push_back(c);
+    for (u32 c = 0x3400; c < 0x4DC0; c += 3) values.push_back(c);
+    for (u32 c = 0xE000; c < 0xE900; c++) values.push_back(c);
+    for (u32 c = 0xF900; c < 0x10000; c++) values.push_back(c);
+    for (u32 k = 0; k < 2500; k++) values.push_back(0x4E00 + rng() % 0x5200);
+    for (const u32 c : values)
+        for (const char* fn : {"UCS2toEUCCN", "UCS2toGBK", "UCS2toGB18030", "UCS2toBIG5"})
+            l.same(fn, [&](u32 base) { return std::vector<u64>{c, base}; }, std::format("{:#x}", c));
+    for (u32 k = 0; k < 1500; k++) {
+        const u32 c = values[rng() % values.size()];
+        std::vector<u8> s;
+        if (c < 0x80) s = {static_cast<u8>(c)};
+        else if (c < 0x800) s = {static_cast<u8>(0xC0 | (c >> 6)), static_cast<u8>(0x80 | (c & 0x3F))};
+        else s = {static_cast<u8>(0xE0 | (c >> 12)), static_cast<u8>(0x80 | ((c >> 6) & 0x3F)), static_cast<u8>(0x80 | (c & 0x3F))};
+        for (const char* fn : {"UTF8toEUCCN", "UTF8toGBK", "UTF8toGB18030", "UTF8toBIG5"})
+            l.same(fn, [&](u32 base) { put_bytes(b, base + 0x100, s); return std::vector<u64>{base + 0x100, base, base + 0x80}; }, hex(s));
+    }
+    for (u32 round = 0; round < 300; round++) {
+        std::vector<u8> bytes, units;
+        for (u32 i = 0, n = 1 + rng() % 10; i < n; i++) {
+            const u32 r = rng() % 7;
+            if (r < 2) bytes.push_back(static_cast<u8>(0x20 + rng() % 0x5F));
+            else if (r < 4) { bytes.push_back(static_cast<u8>(0xA1 + rng() % 0x5E)); bytes.push_back(static_cast<u8>(0xA1 + rng() % 0x5E)); }
+            else if (r < 5) { bytes.push_back(static_cast<u8>(0x81 + rng() % 0x7E)); bytes.push_back(static_cast<u8>(0x40 + rng() % 0xBF)); }
+            else if (r < 6) { bytes.push_back(0x81 + rng() % 2); bytes.push_back(static_cast<u8>(0x30 + rng() % 10)); bytes.push_back(static_cast<u8>(0x81 + rng() % 0x7E)); bytes.push_back(static_cast<u8>(0x30 + rng() % 10)); }
+            else { const auto x = random_bytes(rng, 2); bytes.insert(bytes.end(), x.begin(), x.end()); }
+            const u32 v = values[rng() % values.size()];
+            units.push_back(static_cast<u8>(v >> 8));
+            units.push_back(static_cast<u8>(v));
+        }
+        for (const char* fam : {"EUCCN", "GBK", "GB18030", "BIG5"}) {
+            const std::string F(fam);
+            for (const std::string& name : {F + "stoUCS2s", F + "stoUTF8s", "UCS2sto" + F + "s", "UTF8sto" + F + "s"}) {
+                const bool wide = name.starts_with("UCS2s");
+                const std::vector<u8>& in = wide ? units : bytes;
+                const u32 n = static_cast<u32>(wide ? in.size() / 2 : in.size());
+                for (const u32 sl : {n, n > 1 ? n - 1 : n})
+                    for (const u32 cap : {0x100u, 0u, 1u, 3u})
+                        l.same(name, [&](u32 base) {
+                            put_bytes(b, base + 0x200, in);
+                            ps_write32(b, base + 0x3F0, sl);
+                            ps_write32(b, base + 0x3F4, cap);
+                            return std::vector<u64>{base + 0x200, base + 0x3F0, base, base + 0x3F4};
+                        }, std::format("{} n {} cap {}", hex(in), sl, cap));
+            }
+        }
+    }
+    CHECK(l.mismatches == 0);
+}

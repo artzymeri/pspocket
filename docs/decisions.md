@@ -6186,3 +6186,6 @@ Guest pointers are checked (D-042): libl10n would fault where pspocket refuses a
   numbers 5..23, 28, 29, 38..51), and the Japanese codes' core (42: EUC-JP, Shift-JIS and cp932 to and from UCS-2 and
   UTF-8, EUC-JP and Shift-JIS to each other, and the kuten, JIS, EUC-JP and Shift-JIS number conversions). Over 4.4
   million comparisons, none differing.
+- Part 2: Korean (20: EUC-KR and cp949's UHC, KS X 1001 then cp949's extension, UHC's extension cells read without an
+  FFFF check as libl10n does) and Chinese (32: EUC-CN, GBK with the euro sign at 80, GB18030 with its own rows, A8-A9,
+  D7 and FE cells and CJK Extension A's four-byte cells, Big5). Two million comparisons more, none differing.
