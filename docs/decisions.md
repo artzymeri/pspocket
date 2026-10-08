@@ -5163,6 +5163,12 @@ prepares them. (docs/plan-background-spu.md, from a design workflow: four reader
   left to the next launch; a refused load stops the translator; a compile and link while another thread takes page
   faults, which fails as run 218 did without the fix).
 
+## D-237 · 2026-10-08 · Enabling a translated module's range again adds nothing
+
+ppu::prx_dispatch_enable appended a range each time, and a full range table stops the process: a game module loaded,
+unloaded and loaded again at its slot (D-238) would have filled it. A range inside one enabled already is now left as
+it is. Test: tests/ppu/test_dispatch.cpp (2,000 enables of one range and one of its parts: one range).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

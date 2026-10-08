@@ -98,6 +98,24 @@ TEST_CASE("dispatch table: the PRX region's functions go to a second table and r
     CHECK(ppu::prx_dispatch_enabled_ranges() == 0);
 }
 
+TEST_CASE("dispatch table: enabling a module's range again adds nothing (D-237)")
+{
+    ps_ppu_dispatch_clear();
+    const ps_ppu_dispatch_entry table[] = {{0x30010000, fn_b}, {0x30014000, fn_a}};
+    ps_ppu_dispatch_register_table(table, 2);
+    // A module loaded, unloaded and loaded again at its slot 2,000 times, and a part of it: one range.
+    for (int i = 0; i < 2000; i++) ppu::prx_dispatch_enable(0x30010000, 0x30018000);
+    ppu::prx_dispatch_enable(0x30014000, 0x30016000);
+    CHECK(ppu::prx_dispatch_enabled_ranges() == 1);
+    CHECK(ps_ppu_dispatch_find(0x30010000) == fn_b);
+    CHECK(ps_ppu_dispatch_find(0x30014000) == fn_a);
+    // Another module's range is its own.
+    ppu::prx_dispatch_enable(0x30020000, 0x30028000);
+    CHECK(ppu::prx_dispatch_enabled_ranges() == 2);
+    ps_ppu_dispatch_clear();
+    CHECK(ppu::prx_dispatch_enabled_ranges() == 0);
+}
+
 TEST_CASE("miss policy is configurable; default follows NDEBUG")
 {
 #ifdef NDEBUG

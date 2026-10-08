@@ -146,6 +146,9 @@ void prx_dispatch_enable(u32 lo, u32 hi)
     PrxTable& t = prx_table();
     std::lock_guard lock(t.enable_mutex);
     const u32 n = t.range_count.load(std::memory_order_relaxed);
+    // A range inside one enabled already adds nothing: a module loaded again at its slot (D-237) or placed twice.
+    for (u32 i = 0; i < n; i++)
+        if (lo >= t.ranges[i].first && hi <= t.ranges[i].second) return;
     if (n == t.ranges.size()) PS_FATAL(kChan, "more than {} translated module ranges", t.ranges.size());
     t.ranges[n] = {lo, hi};
     t.range_count.store(n + 1, std::memory_order_release);
