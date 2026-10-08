@@ -6165,3 +6165,24 @@ Part 5b of D-511 (runtime/hle/src/sys_libc_process.cpp), under sys_libc and sys_
   would have to unwind), the raw_spu_/spu_thread_ read and write families and the __*_printf/putfld/puttxt internals.
 Tests: tests/hle/test_libc_process.cpp (exit's order, assertions, locks, _Once, _Printf/_Scanf through guest code, an
 SPU program's spu_printf through the server and spu_thread_snprintf on its store).
+
+## D-517 · 2026-10-08 · cellL10n, libl10n's character-set conversions, the same as Sony's
+
+cellL10n made pspocket's own (runtime/hle/src/cellL10n.cpp), each function read from the firmware's libl10n and
+compared with it on the same inputs (tests/hle/test_l10n.cpp, PSPOCKET_TEST_DEV_FLASH): answers, every byte written and
+the lengths reported, over every value where a sweep is possible (all 16-bit codes, every one- and two-byte sequence,
+every 8F sequence) and random strings with every source length and short destinations. Its conventions are libl10n's:
+a character function answers the units it read or wrote (0: cannot convert); a string function answers 0, 1 (an
+illegal or unconvertible character: *src_len the units left from it) or 2 (the destination full), *dst_len the units
+written before; the multibyte decoders and UTF8stoUCS2s refuse a character read past *src_len, the others read on.
+Guest pointers are checked (D-042): libl10n would fault where pspocket refuses and logs.
+- The tables (runtime/hle/src/l10n_tables.hpp) come from public mapping data only, scripts/l10n/ (Python's codecs:
+  cp932, euc_jp, cp949, gbk, gb2312, gb18030, cp950, ISO 8859 and the DOS/Windows code pages; libaribcaption's ARIB
+  additional-symbol table, ISC licence); the comparison found the few cells Sony reads otherwise, patched there by
+  name (JIS X 0212 A2B7/A2C3 as Microsoft's EUC-JP, KS X 1001 A2E8, GB18030-2000's A8BF, Big5 without ETEN's C6A1-FE,
+  three ARIB cells). An IBM extension's EUC-JP code is its character's NEC-selected cell, else its NEC row 13 cell,
+  else its JIS X 0208 cell (FA54 is FCFB, FA5B ADDA, as Sony's).
+- Part 1: the Unicode family (UTF-8, UTF-16, UTF-32, UCS-2: 24 functions), the 35 single-byte code pages (8: the code
+  numbers 5..23, 28, 29, 38..51), and the Japanese codes' core (42: EUC-JP, Shift-JIS and cp932 to and from UCS-2 and
+  UTF-8, EUC-JP and Shift-JIS to each other, and the kuten, JIS, EUC-JP and Shift-JIS number conversions). Over 4.4
+  million comparisons, none differing.
