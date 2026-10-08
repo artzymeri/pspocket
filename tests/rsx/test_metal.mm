@@ -2992,6 +2992,39 @@ TEST_CASE("metal e2e: a multisampled target is drawn one texel per sample, its s
     }
 }
 
+TEST_CASE("metal e2e: a point on a two-by-two multisampled target covers its size in pixels, twice that in samples (D-275)")
+{
+    REQUIRE_METAL();
+    // One point of size 4 at the centre of a kW x kH target in AA mode 4: 8x8 samples around sample (64, 64).
+    const u32 sx = 2, sy = 2, pitch = kW * sx * 4;
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    e.put_local_f(kVertexOffset + 0, 0.f);
+    e.put_local_f(kVertexOffset + 4, 0.f);
+    auto b = e.at(0);
+    setup_surface_sized(b, kSurfaceOffset, kW, kH, pitch);
+    b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (1u << 8) | (4u << 12));
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    b.method(m::NV4097_SET_POINT_SIZE, f2u(4.f));
+    b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Points));
+    b.method(m::NV4097_DRAW_ARRAYS, 0);
+    b.method(m::NV4097_SET_BEGIN_END, 0);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, pitch * kH * sy));
+    const auto red = [&](u32 x, u32 y) { return guest_pixel_pitch(e, kSurfaceOffset, pitch, x, y)[1] == 0xff; };
+    CHECK(red(60, 60));   // the point's first sample row and column (4 pixels: 8 samples, 60 to 67)
+    CHECK(red(67, 67));
+    CHECK_FALSE(red(59, 64));
+    CHECK_FALSE(red(64, 68));
+}
+
 TEST_CASE("metal e2e: a target narrower than the one at its address is its left part, and the rest stays (D-120)")
 {
     // GTA V clears the right half of a 2560x512 target for its characters, then draws into the left half as a

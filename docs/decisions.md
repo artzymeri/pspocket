@@ -5721,6 +5721,14 @@ A vertex program's texture fetch (TXL) sampled a 2D texture with xy; a 1D, 3D or
 - kTranslationVersion 7.
 - Checked on the GPU: a cube vertex texture by direction (+X, +Y, -Z) and a 1x1x2 volume by z.
 
+## D-275 · 2026-10-08 · Points on multisampled targets keep their size in pixels
+
+A multisampled target is drawn one texel per sample (D-250), so a point of N pixels covered N texels, a quarter of its
+pixels in a two-by-two mode. The vertex parameters now carry a point scale (MslVsParams::point_scale): the samples
+across a pixel, the larger count when a mode has two across and one down (a Metal point is square; RPCS3 scales the
+point size by its resolution scale the same way, VKGSRender.cpp). It multiplies the register's size and the program's.
+kTranslationVersion 8. Checked on the GPU: a point of 4 on a two-by-two target covers 8x8 samples.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

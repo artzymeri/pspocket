@@ -169,8 +169,8 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   (D-258), user clip planes (D-259), constants and vertex bases written inside a draw (D-260), the depth bounds test
   (D-261); then the rest of the list: point sizes and sprites (D-262), polygon stipple (D-263), the alpha reference on
   float targets (D-264), the window offset (D-265), an exported depth's clamp (D-266: Metal already did it), the vertex
-  output mask (D-267), vertex textures of every kind (D-274). Left: points on multisampled targets (drawn a sample per
-  texel, smaller).
+  output mask (D-267), vertex textures of every kind (D-274), points on multisampled targets (D-275). The census's list
+  is done.
 - **State:** open.
 
 ## Shaders

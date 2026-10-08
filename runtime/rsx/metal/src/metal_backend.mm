@@ -1225,6 +1225,12 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // The point size: the register, or the program's when the output mask says so (negative, D-262).
     vs.point_size = (state.reg(m::NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) & (1u << 5)) ? -std::abs(raster.point_size)
                                                                                    : std::abs(raster.point_size);
+    // A multisampled target is drawn one texel per sample (D-250): a point's pixels are that many texels (D-275). A
+    // point is square, so with two samples across and one down it takes the larger count.
+    {
+        const AaFactors point_aa = aa_factors(state.surface().antialias);
+        vs.point_scale = static_cast<float>(std::max(point_aa.x, point_aa.y));
+    }
     vs.restart_index = raster.restart_index;
 
     // ---- vertex and index data: raw guest bytes, decoded by the vertex shader (vertex pulling) ----

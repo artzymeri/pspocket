@@ -26,6 +26,7 @@ struct rsx_vs_params {
     uint index_mode; uint index_offset; uint base_index; uint first_vertex;
     uint restart_enable; uint restart_index; uint branch_bits; float point_size;
     rsx_attrib attribs[16];
+    float point_scale; uint pad2a; uint pad2b; uint pad2c;
 };
 
 struct rsx_fs_params {
@@ -580,8 +581,8 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
     if (options.point_size) {
         // The program's o6.x when the output mask says so and it writes o6, else the register (RPCS3
         // VKVertexProgram.cpp insertMainEnd, D-262).
-        src += (vp.output_mask & (1u << 6)) ? "    out.point_size = signbit(p.point_size) ? o6.x : p.point_size;\n"
-                                            : "    out.point_size = abs(p.point_size);\n";
+        src += (vp.output_mask & (1u << 6)) ? "    out.point_size = (signbit(p.point_size) ? o6.x : p.point_size) * p.point_scale;\n"
+                                            : "    out.point_size = abs(p.point_size) * p.point_scale;\n";
     }
     for (usize i = 0; i < clip.size(); i++) src += std::format("    out.clip[{}] = {};\n", i, clip[i]);
     src += "    return out;\n}\n";
