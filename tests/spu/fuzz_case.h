@@ -59,9 +59,10 @@ extern const ps_spu_fuzz_override ps_spu_fuzz_overrides[];
 extern const uint32_t ps_spu_fuzz_cases_per_op;
 
 /* The program-level case (D-081): a synthetic program (big-endian bytes, lifted at PROGRAM_BASE) lifted whole,
- * relocatable (ps_spu_fzp) and fixed (ps_spu_fzq); its absolute call goes to a stub (bi $lr) at PROGRAM_STUB. */
+ * relocatable (ps_spu_fzp) and fixed (ps_spu_fzq); its absolute call goes to a stub (bi $lr) at PROGRAM_STUB, clear
+ * of every placement test_spu_fuzz gives the program (one wraps past the end of local store to address 0). */
 #define PS_SPU_FUZZ_PROGRAM_BASE 0x1000u
-#define PS_SPU_FUZZ_PROGRAM_STUB 0x100u
+#define PS_SPU_FUZZ_PROGRAM_STUB 0x20000u
 extern const uint8_t ps_spu_fuzz_program[];
 extern const uint32_t ps_spu_fuzz_program_size;
 extern const uint32_t ps_spu_fuzz_program_entry;

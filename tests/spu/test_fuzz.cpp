@@ -351,7 +351,11 @@ TEST_CASE("program-level fuzz: a lifted program agrees with the interpreter wher
         ps_spu_attach_program_at(&lifted, program, at);
         const u64 misses = ps_spu_miss_count();
 
-        for (const u32 code : {0x10u, 0x11u}) { // runs to the first stop, then resumes after it
+        // Stop 0x12 is answered and the code goes on (no register touched: the runtime's handlers use the channels);
+        // the others leave (D-247).
+        const ps_spu_hooks answers{[](SPUContext*, u32 code) { return code == 0x12 ? 1 : 0; }, nullptr};
+        interp.hooks = lifted.hooks = &answers;
+        for (const u32 code : {0x10u, 0x13u, 0x11u}) { // runs to each stop that leaves, then resumes after it
             REQUIRE(ps_spu_interpret(&interp, 0) == PS_SPU_STOP_SIGNAL);
             REQUIRE(ps_spu_run(&lifted) == PS_SPU_STOP_SIGNAL);
             CHECK(interp.stop_code == code);
@@ -379,6 +383,9 @@ TEST_CASE("program-level fuzz: a lifted program agrees with the interpreter wher
         CHECK(gw(lifted.gpr[41], 0) == 0x1234);
         CHECK(gw(lifted.gpr[42], 0) == 0x103);
         CHECK(gw(lifted.gpr[43], 0) == 0x30);
+        // Stops in callees (D-247).
+        CHECK(gw(lifted.gpr[48], 0) == 0x4747 + 0x47);
+        CHECK(gw(lifted.gpr[51], 0) == 0x5050 + 0x4A);
         // Lifted code ran throughout: the misses are the stub, outside the program, called twice.
         CHECK(lifted.program == program);
         CHECK(ps_spu_miss_count() - misses == 2);

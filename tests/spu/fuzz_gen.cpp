@@ -290,7 +290,8 @@ private:
 // runs through every address it derives from its own: pcs, links, the dispatch switch, call returns. Then the
 // registers around calls (D-127): kept across a call that doesn't touch them, read and written by the callee, written
 // two calls deep, and kept across a call that leaves the program and comes back through the run loop. And registers a
-// callee writes on one path only or before it reads them (D-219).
+// callee writes on one path only or before it reads them (D-219). And stops in callees, one the runtime answers and one
+// that leaves (D-247).
 struct SyntheticProgram {
     std::vector<u8> bytes; // at PS_SPU_FUZZ_PROGRAM_BASE
     u32 entry = 0;
@@ -332,6 +333,21 @@ SyntheticProgram synthetic_program()
     m.emit(as::il(43, 0x10));
     m.emit(as::a(43, 43, 44));
     m.emit(as::ret());
+    const auto stop_inline = m.here(); // D-247: r46 = 0x46, a stop the runtime answers and continues, r46 += 1
+    m.emit(as::il(46, 0x46));
+    m.emit(as::stop(0x12));
+    m.emit(as::ai(46, 46, 1));
+    m.emit(as::ret());
+    const auto stop_leave = m.here(); // D-247: r49 = 0x49, a stop that leaves for the run loop, r49 += 1
+    m.emit(as::il(49, 0x49));
+    m.emit(as::stop(0x13));
+    m.emit(as::ai(49, 49, 1));
+    m.emit(as::ret());
+    const auto stop_mid = m.here(); // calls stop_inline, then stop_leave, two calls deep from the entry; link in r52
+    m.emit(as::ori(52, 0, 0));
+    m.brsl(0, stop_inline);
+    m.brsl(0, stop_leave);
+    m.emit(as::bi(52));
     const auto leaf_out = m.here(); // leaves the program for the stub and comes back, then r24 = 7
     m.emit(as::ori(26, 0, 0));
     m.emit(as::brasl(0, PS_SPU_FUZZ_PROGRAM_STUB));
@@ -385,6 +401,13 @@ SyntheticProgram synthetic_program()
     m.brsl(0, cond_write); // r41 = 0x1234, r42 kept
     m.emit(as::il(44, 0x20));
     m.brsl(0, temp_first); // r43 = 0x30
+    // Stops in callees (D-247): r47 and r50, written here and touched by no callee, must reach ctx when a stop two
+    // calls deep leaves, and stay right across one the runtime answers.
+    m.emit(as::il(47, 0x4747));
+    m.emit(as::il(50, 0x5050));
+    m.brsl(0, stop_mid); // stops 0x12 (answered) and 0x13 (leaves; the run loop resumes after it)
+    m.emit(as::a(48, 47, 46)); // 0x4747 + 0x47
+    m.emit(as::a(51, 50, 49)); // 0x5050 + 0x4A
     m.emit(as::stop(0x11));
     return {m.finish(), entry, {func2, target}};
 }

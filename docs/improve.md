@@ -38,6 +38,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
     caller might read it. Calls from lifted code could tell the callee which of its written registers the caller
     reads (live after the call); the run loop, which knows nothing, keeps the full set. Two entries per function, or
     a mask argument.
+  - **Tried (D-247, runs 238-241), not kept:** a stop as a way out instead of a touch of every register: 3% fewer stores
+    before calls statically, nothing measurable. Run 237's profile: entry loads 6.9%, calls 6.0%, exit stores 5.3% of
+    translated SPU time; 30% of the calls' samples are calls that store 60 registers or more, into functions that use
+    that many themselves. What would cut it: registers passed in host registers. A second entry per function taking
+    up to eight of the registers it reads at entry as vector arguments (AArch64 passes them in v0-v7), the caller
+    passing its locals instead of storing them; the callee stores an argument only when it leaves for the run loop or
+    wrote it (its exits know which). Returns could come back in v0-v3 (a four-vector aggregate) the same way.
   - scripts/lift-spu.sh carries every label of the previous lift over as a seed (prepare keeps only the seeds a lift
     used since D-205): code only a constant or discovery reached becomes "real" there and its words count as code.
     Make the script keep NAME.seeds as prepare does.
@@ -67,8 +74,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   Dekker pairing): the main SPU threads -3 to -8% under load.
 - **Seen (run 221):** every store to the SPURS line wakes all the workers parked on it (a mutex and a notify_all in
   the storing thread, about 3% of the SPU threads' busy time), and each woken worker selects again for nothing.
-  **Try:** wake one waiter per store unless the store adds work, or park idle workers on a futex-like wait
-  (__ulock_wait, which C++20's atomic wait uses on Apple platforms) with the stop request as one more wake.
+  **Tried (D-245, runs 234-237), not kept:** waiters parked on the slot's version word itself
+  (os_sync_wait_on_address, iOS 17.4): the wake's mutex contention went, but the wake system call costs what the
+  broadcast did and CPU per frame did not move (0.103 s either way under load). Waking one waiter is not possible: each
+  waits on a lost reservation, which every store to the line causes (the Cell sends each SPU its event).
 - **Done (D-241):** the clock and idle sleeps of the SPURS workers (about 7% of their busy time): one multiply of
   mach_absolute_time, mach_wait_until.
 

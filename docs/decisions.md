@@ -5291,6 +5291,47 @@ internal/libchnnlsv, the PSP save-data library, which is not in cellSysmodule's 
 in libatxenc, an unnamed number RPCS3 treats as unused, sitting in a table of one-call syscall wrappers. Tests:
 tests/lv2/test_memory.cpp, tests/hle/test_spu_threads.cpp.
 
+## D-245 · 2026-10-08 · Waiters on a line's version word itself (os_sync): measured, not kept
+
+Run 221's profile put the wake of SPU threads parked on a 128-byte line (ps_res_wait_change: a bucket's mutex and a
+condition variable broadcast in the storing thread, the woken threads taking the mutex again) at about 3% of the SPU
+threads' busy time. The try: a waiter sleeps on the slot's version word with os_sync_wait_on_address_with_timeout (iOS
+17.4, macOS 14.4: the kernel compares the word before it sleeps, so a bump in between is never missed) and a store
+wakes everyone on that word with os_sync_wake_by_address_all, no lock; older systems keep the buckets. The reservation
+tests passed (a sabotaged wake fails the early-wake test).
+
+Measured (runs 234-237, GTA V's walk under a full-core load, old and new alternating, profiled at 70 s): the mutex
+contention of the wake went (40 samples of the SPU threads' mutex waits to 0), but the wake system call costs what
+the broadcast did (103 and 244 samples of pthread_cond_broadcast against 109 and 325 of __ulock_wake), and CPU per
+frame stayed the same: 0.103 and 0.102 s (old) against 0.106 and 0.101 (new), the main SPU threads 0.058 against 0.060
+and 0.058 s. Not kept (rule 8): the condition variables stay.
+
+## D-247 · 2026-10-08 · A stop as one more way out of translated SPU code: measured, not kept; its tests stay
+
+D-216 counts a stop (and stopd) as reading and writing every register: a function with one anywhere in its call tree
+makes each call into it store every register the caller has written, and the stop stores the function's dirty
+registers before it and loads its live ones after it. The runtime's stop handlers never touch the registers while the
+code goes on (lv2's answer in the mailboxes; the SPURS workers' leave for the run loop first), so the try made a stop
+touch nothing: lowered like a channel that blocks (`if (ps_spu_stop(...)) goto exit_N;`), with the rule written into
+ps_spu_stop_handler (a handler that lets the code go on must not use ctx->gpr).
+
+- **Statically** (GTA V's 150 programs, 11,140 direct calls): stores before a call 19.2 to 18.6 on average, loads
+  after 16.7 to 16.0, calls storing 60 registers or more 1,119 to 1,057. Most full stores are calls into functions
+  that use that many registers themselves (one of GTA V's busiest uses r0-r79) or that call through a register further
+  down (bisl: 551 in GTA V's code, 233 of them one callback in three programs). Of the eight call sites with the most
+  samples, one went from 96 stores to 48.
+- **Checked**: spu-check over all 150 programs (102,098 trials, no difference); the fuzz tests below.
+- **Measured** (runs 238-241, GTA V's walk under a full-core load, before and after alternating): CPU per frame 0.1000
+  and 0.0992 s against 0.1028 and 0.0939, the main SPU threads 0.0562 and 0.0557 against 0.0572 and 0.0538; in the
+  profiles the calls' share of translated SPU time stayed where it was (brsl 6.6 and 6.3% against 6.0 and 6.6%, entry
+  loads 7.2 and 7.4% against 7.2 and 7.3%). Not kept (rule 8): a rule for the handlers without a gain to show for it.
+- **Kept**: the program-level fuzz program gained a stop the runtime answers and one that leaves, both two calls deep,
+  with registers the caller keeps across them (a stop that leaves without storing fails it), and the switch test runs
+  through both. Its stub moved from 0x100 to 0x20000: the placement across the end of local store wraps the program to
+  address 0, and as it grew it reached the stub, which then overwrote its code (the interpreter looped).
+
+What the call boundaries still cost (entry loads, calls, exit stores: 18% of translated SPU time) needs registers
+passed in host registers between translated functions, not fewer stores: docs/improve.md.
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

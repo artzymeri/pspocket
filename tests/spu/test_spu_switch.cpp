@@ -44,6 +44,9 @@ struct Quiet {
 constexpr u32 kAt = PS_SPU_FUZZ_PROGRAM_BASE + 0x2340; // relocated, as a job binary would be
 constexpr u32 kIlR21 = 0x40802A95u;                    // il r21, 0x55: run after the first stop
 
+// The program's stop 0x12 is answered and goes on; 0x10, 0x13 and 0x11 leave (D-247).
+const ps_spu_hooks kAnswers{[](SPUContext*, u32 code) { return code == 0x12 ? 1 : 0; }, nullptr};
+
 // Two contexts over the same local store contents: the interpreter's, and one that starts with no program.
 struct Pair {
     GuestMemory mem;
@@ -68,6 +71,7 @@ struct Pair {
         ps_spu_context_init(&run, ls_run.data(), mem.base());
         interp.pc = run.pc = ps_spu_fuzz_program_entry - PS_SPU_FUZZ_PROGRAM_BASE + kAt;
         ps_spu_host_attach(&run);
+        interp.hooks = run.hooks = &kAnswers;
     }
     ~Pair() { ps_spu_host_detach(&run); }
     void arm(u64 additions)
@@ -98,6 +102,7 @@ TEST_CASE("SPU switch: a context running an image with no program takes the one 
     p.step(0x10); // nothing registered: interpreted throughout
     CHECK(p.run.home == nullptr);
     ps_spu_fzp_register();
+    p.step(0x13);
     p.step(0x11);
     CHECK(p.run.home == &ps_spu_fzp_program);
     CHECK(p.run.program == &ps_spu_fzp_program);
@@ -115,6 +120,7 @@ TEST_CASE("SPU switch: not when the image's code changed, the program's model di
         p.arm(registry_additions());
         ps_spu_fzp_register();
         p.step(0x10);
+        p.step(0x13);
         p.step(0x11);
         CHECK(p.run.home == nullptr);
         CHECK(gw(p.run.gpr[23], 0) == 0x7123 + 0x57);
@@ -126,6 +132,7 @@ TEST_CASE("SPU switch: not when the image's code changed, the program's model di
         p.arm(registry_additions());
         ps_spu_fzp_register();
         p.step(0x10);
+        p.step(0x13);
         p.step(0x11);
         CHECK(p.run.home == nullptr);
     }
@@ -135,6 +142,7 @@ TEST_CASE("SPU switch: not when the image's code changed, the program's model di
         Pair p;
         p.arm(registry_additions());
         p.step(0x10);
+        p.step(0x13);
         p.step(0x11);
         CHECK(p.run.home == nullptr);
     }
@@ -145,6 +153,7 @@ TEST_CASE("SPU switch: not when the image's code changed, the program's model di
         ps_spu_attach_program_at(&p.run, nullptr, kAt);
         ps_spu_fzp_register();
         p.step(0x10);
+        p.step(0x13);
         p.step(0x11);
         CHECK(p.run.home == nullptr);
     }
@@ -155,6 +164,7 @@ TEST_CASE("SPU switch: not when the image's code changed, the program's model di
         p.arm(registry_additions());
         ps_spu_fzp_register();
         p.step(0x10);
+        p.step(0x13);
         p.step(0x11);
         CHECK(p.run.home == nullptr);
     }
@@ -168,7 +178,7 @@ TEST_CASE("SPU switch: a registration racing the run changes nothing but where i
         p.arm(registry_additions());
         u32 stops = 0; // assertions stay on the test's thread
         std::thread runner([&] {
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 3; i++) {
                 stops += ps_spu_interpret(&p.interp, 0) == PS_SPU_STOP_SIGNAL;
                 stops += ps_spu_run(&p.run) == PS_SPU_STOP_SIGNAL;
             }
@@ -176,7 +186,7 @@ TEST_CASE("SPU switch: a registration racing the run changes nothing but where i
         for (int spin = 0; spin < round * 20; spin++) std::this_thread::yield();
         ps_spu_fzp_register();
         runner.join();
-        CHECK(stops == 4);
+        CHECK(stops == 6);
         CHECK(p.run.stop_code == 0x11);
         CHECK(diff_contexts(p.interp, p.run).empty());
         CHECK(std::memcmp(p.ls_interp.data(), p.ls_run.data(), PS_SPU_LS_SIZE) == 0);
