@@ -11,8 +11,8 @@
 <text x="838" y="73" font-size="12.5" fill="#24292f">89%  (8/9 done)</text>
 <text x="4" y="99" font-size="12.5" fill="#24292f">PPU code (the main processor)</text>
 <rect x="300" y="87" width="530" height="16" rx="3" fill="#e6e8eb"/>
-<rect x="300" y="87" width="424.0" height="16" rx="3" fill="#57ab5a"/>
-<text x="838" y="99" font-size="12.5" fill="#24292f">80%  (3/5 done)</text>
+<rect x="300" y="87" width="530.0" height="16" rx="3" fill="#2da44e"/>
+<text x="838" y="99" font-size="12.5" fill="#24292f">100%  (5/5 done)</text>
 <text x="4" y="125" font-size="12.5" fill="#24292f">SPU code (the six co-processors)</text>
 <rect x="300" y="113" width="530" height="16" rx="3" fill="#e6e8eb"/>
 <rect x="300" y="113" width="454.3" height="16" rx="3" fill="#57ab5a"/>
@@ -23,8 +23,8 @@
 <text x="838" y="151" font-size="12.5" fill="#24292f">75%  (3/4 done)</text>
 <text x="4" y="177" font-size="12.5" fill="#24292f">Graphics (RSX to Metal)</text>
 <rect x="300" y="165" width="530" height="16" rx="3" fill="#e6e8eb"/>
-<rect x="300" y="165" width="397.5" height="16" rx="3" fill="#57ab5a"/>
-<text x="838" y="177" font-size="12.5" fill="#24292f">75%  (7/10 done)</text>
+<rect x="300" y="165" width="409.5" height="16" rx="3" fill="#57ab5a"/>
+<text x="838" y="177" font-size="12.5" fill="#24292f">77%  (8/11 done)</text>
 <text x="4" y="203" font-size="12.5" fill="#24292f">Sound</text>
 <rect x="300" y="191" width="530" height="16" rx="3" fill="#e6e8eb"/>
 <rect x="300" y="191" width="265.0" height="16" rx="3" fill="#d4a72c"/>

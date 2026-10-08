@@ -1,6 +1,6 @@
 {
-  "as_of": "2026-10-08, after D-239",
-  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac. New: a game's own PRX modules are found on its disc and translated at fixed slots (D-238, D-239), and SPU programs a game meets are translated while it plays (D-236). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
+  "as_of": "2026-10-08, after D-267",
+  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac with no PPU code interpreted (D-255). New: every RSX state games set is now used (fog, two-sided lighting, clip planes, depth bounds, point sprites and more, D-256 to D-267). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.",
   "checklist": [
     {
       "area": "Reading any PS3 disc on the iPhone",
@@ -106,14 +106,14 @@
           "ref": "D-213"
         },
         {
-          "name": "Code after a setjmp return translated (14 instructions per switch interpreted)",
-          "state": "partial",
-          "ref": "improve.md Fibers"
+          "name": "Code after a setjmp return translated (continuations learned from the interpreter)",
+          "state": "done",
+          "ref": "D-255"
         },
         {
           "name": "No PPU code interpreted in a session",
-          "state": "partial",
-          "ref": "D-207: AC under 1% of a core"
+          "state": "done",
+          "ref": "D-255: GTA V and AC 0"
         }
       ]
     },
@@ -234,6 +234,11 @@
           "name": "Fewer render passes for the tile GPU",
           "state": "todo",
           "ref": "improve.md RSX"
+        },
+        {
+          "name": "Every RSX state a game sets used (census: fog, two-sided lighting, clip range, clip planes, depth bounds, point sprites, stipple, window offset, output mask)",
+          "state": "done",
+          "ref": "D-256 to D-267"
         }
       ]
     },
