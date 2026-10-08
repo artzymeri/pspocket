@@ -5924,3 +5924,19 @@ work area the same):
   that starts with a .SpuGUID section's four `ila $2`; zeros without one.
 Their earlier comments said they would stay unimplemented until a game calls them (CLAUDE.md rule 4); the library
 work (D-500) does them all.
+
+## D-506 · 2026-10-08 · cellSpurs: exception event handlers, victim hints, jobbin2 headers, exit code container setup
+
+Seven more of libsre's cellSpurs functions, read from libsre.sprx (4.92) and compared with it (tests/hle/
+test_spurs_compare.cpp: 292 calls, every answer and byte the same):
+- cellSpursSetExceptionEventHandler / Unset: the workload's checks, then its F entry's first two u64s (handler,
+  argument); setting over a handler is BUSY. libsre's own tasksets install a default handler there (and a
+  shutdown-completion hook), which pspocket's tasksets do not yet: to come with CellSpursTaskset2 (D-505's list).
+- cellSpursSetPreemptionVictimHints: PERM without the system workload; the mask of preemptible SPUs goes to the SPU
+  thread group a native SPURS does not have, so the hints change nothing (libsre prints a report when that system call
+  fails and still returns CELL_OK). Compared up to the system call.
+- cellSpursJobHeaderSetJobbin2Param: a "jobbin2" job binary (an SPU ELF of three or five program headers in a fixed
+  shape, tagged "BIN2" or "bin2") into a job header: its address, its size less the bss, and the bss in 16-byte units in
+  the upper half of eaBinary, flag 4.
+- cellSpursTaskAttributeSetExitCodeContainer and cellSpursTaskExitCodeInitialize.
+- 0xE279681F, an export no SDK names: the word at CellSpurs + 0x10 (named cellSpurs_E279681F).

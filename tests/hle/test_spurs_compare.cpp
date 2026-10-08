@@ -54,7 +54,11 @@ u32 ours(GuestThread& t, const char* name, const std::vector<u64>& args)
 
 u32 theirs(GuestThread& t, const FirmwareLibrary& sony, const char* name, const std::vector<u64>& args)
 {
-    const auto it = sony.module->functions.find({"cellSpurs", recomp::nid_of(name)});
+    // A function known only by its NID is named "<library>_<NID>".
+    const std::string_view n(name);
+    const u32 nid = n.starts_with("cellSpurs_") ? static_cast<u32>(std::stoul(std::string(n.substr(10)), nullptr, 16))
+                                                : recomp::nid_of(name);
+    const auto it = sony.module->functions.find({"cellSpurs", nid});
     REQUIRE(it != sony.module->functions.end());
     std::array<u64, 8> a{};
     std::copy(args.begin(), args.end(), a.begin());
@@ -209,6 +213,145 @@ TEST_CASE("cellSpurs' workload and taskset information against libsre", "[hle][l
     compare(t, sony, calls);
 }
 
+namespace {
+
+// A jobbin2 binary at kElf: `phnum` program headers (3 or 5) of the given types and flags, segments from 0x200, the
+// tag "BIN2" at the first segment's +32.
+struct Jobbin2 {
+    u32 phnum = 3;
+    u32 types[5] = {1, 1, 4, 0, 0};
+    u32 flags[5] = {5, 6, 4, 0, 0};
+    u32 tag = 0x42494E32;
+    u32 phoff = 52;
+    u32 first_offset = 0x200;
+    u32 bss = 0x40;
+};
+
+void put_jobbin2(u8* b, const Jobbin2& j)
+{
+    std::memset(b + kElf, 0, 0x1000);
+    std::memcpy(b + kElf, "\x7F" "ELF\x01\x02\x01", 7);
+    ps_write16(b, kElf + 18, 23);
+    ps_write32(b, kElf + 28, j.phoff);
+    ps_write16(b, kElf + 42, 32);
+    ps_write16(b, kElf + 44, static_cast<u16>(j.phnum));
+    for (u32 i = 0; i < 5; i++) {
+        const u32 ph = kElf + 52 + 32 * i;
+        ps_write32(b, ph, j.types[i]);
+        ps_write32(b, ph + 4, i == 0 ? j.first_offset : 0x200 + 0x100 * i);
+        ps_write32(b, ph + 8, 0x3000 + 0x400 * i);   // vaddr
+        ps_write32(b, ph + 16, 0x100);              // filesz
+        ps_write32(b, ph + 20, 0x100 + (j.flags[i] & 2 ? j.bss : 0)); // memsz
+        ps_write32(b, ph + 24, j.flags[i]);
+    }
+    ps_write32(b, kElf + j.first_offset + 32, j.tag);
+}
+
+} // namespace
+
+TEST_CASE("cellSpurs' exception handlers, victim hints, jobbin2 headers and exit code containers against libsre",
+    "[hle][lle][spurs]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    FirmwareLibrary sony(f, t, *flash, "cellSpurs", false);
+    std::mt19937 rng(20261010);
+    std::vector<Call> calls;
+    for (u32 round = 0; round < 8; round++) {
+        const u32 seed = static_cast<u32>(rng());
+        const bool second = round % 2, exception = round == 5;
+        const u32 enabled = round < 4 ? 0xFFFFFFFFu : static_cast<u32>(rng());
+        const auto setup = [=](u8* b) {
+            std::mt19937 r(seed);
+            put_spurs(b, r, second, enabled);
+            ps_write32(b, kSpurs + 0xD6C, exception ? 1 : 0);
+            for (u32 w = 0; w < 32; w++) { // every other F entry free
+                const u32 fe = w < 16 ? kSpurs + 0x100 + 0x80 * w : kSpurs + 0x1200 + 0x80 * (w - 16);
+                if (w % 2 == 0) ps_write64(b, fe, 0);
+            }
+        };
+        for (const u32 wid : {0u, 1u, 2u, 15u, 16u, 17u, 31u, 32u}) {
+            calls.push_back({"cellSpursSetExceptionEventHandler", {kSpurs, wid, 0x12345678, 0xABCDEF01}, setup,
+                std::format("set wid {} round {}", wid, round)});
+            calls.push_back({"cellSpursUnsetExceptionEventHandler", {kSpurs, wid}, setup,
+                std::format("unset wid {} round {}", wid, round)});
+        }
+        for (const u32 sp : {0u, kSpurs + 0x20}) {
+            calls.push_back({"cellSpursSetExceptionEventHandler", {sp, 2, 0x12345678, 1}, setup, "bad spurs"});
+            calls.push_back({"cellSpursUnsetExceptionEventHandler", {sp, 2}, setup, "bad spurs"});
+        }
+        calls.push_back({"cellSpursSetExceptionEventHandler", {kSpurs, 2, 0, 1}, setup, "no handler"});
+        // The victim hints up to the system call, which libsre's error report would follow into made-up memory.
+        const auto no_system_workload = [=](u8* b) {
+            setup(b);
+            ps_write32(b, kSpurs + 0xD80, ps_read32(b, kSpurs + 0xD80) & ~0x02000000u);
+        };
+        calls.push_back({"cellSpursSetPreemptionVictimHints", {kSpurs, kOut}, no_system_workload, "no system workload"});
+        calls.push_back({"cellSpursSetPreemptionVictimHints", {0, kOut}, setup, "NULL"});
+        calls.push_back({"cellSpursSetPreemptionVictimHints", {kSpurs, 0}, setup, "NULL array"});
+        calls.push_back({"cellSpursSetPreemptionVictimHints", {kSpurs + 8, kOut}, setup, "misaligned"});
+        for (const u32 sp : {kSpurs, 0u, kSpurs + 4})
+            for (const u32 o : {kOut, 0u})
+                calls.push_back({"cellSpurs_E279681F", {sp, o}, setup, std::format("{:#x} {:#x}", sp, o)});
+    }
+    // jobbin2 headers: both shapes, and each way of not being one.
+    std::vector<std::pair<Jobbin2, std::string>> bins;
+    bins.push_back({Jobbin2{}, "three headers"});
+    Jobbin2 five{5, {1, 1, 1, 1, 4}, {5, 5, 5, 6, 4}};
+    bins.push_back({five, "five headers"});
+    Jobbin2 j = five;
+    j.tag = 0x62696E32;
+    bins.push_back({j, "bin2"});
+    j = five;
+    j.tag = 0x42494E33;
+    bins.push_back({j, "wrong tag"});
+    j = five;
+    j.flags[1] = 6;
+    bins.push_back({j, "two writable"});
+    j = five;
+    j.types[4] = 1;
+    bins.push_back({j, "no note"});
+    j = Jobbin2{};
+    j.phnum = 4;
+    bins.push_back({j, "four headers"});
+    j = Jobbin2{};
+    j.phoff = 64;
+    bins.push_back({j, "headers elsewhere"});
+    j = Jobbin2{};
+    j.first_offset = 0x208;
+    bins.push_back({j, "misaligned code"});
+    j = Jobbin2{};
+    j.bss = 0;
+    bins.push_back({j, "no bss"});
+    j = Jobbin2{};
+    j.flags[1] = 5;
+    j.types[1] = 1;
+    bins.push_back({j, "no writable segment"});
+    for (const auto& [bin, what] : bins) {
+        const auto setup = [bin](u8* b) { put_jobbin2(b, bin); };
+        calls.push_back({"cellSpursJobHeaderSetJobbin2Param", {kOut, kElf}, setup, what});
+    }
+    calls.push_back({"cellSpursJobHeaderSetJobbin2Param", {0, kElf}, [](u8* b) { put_jobbin2(b, Jobbin2{}); }, "NULL"});
+    calls.push_back({"cellSpursJobHeaderSetJobbin2Param", {kOut, 0}, nullptr, "NULL binary"});
+    calls.push_back({"cellSpursJobHeaderSetJobbin2Param", {kOut, kElf + 8}, nullptr, "misaligned binary"});
+    // Exit code containers: the attribute setter and the initializer.
+    for (const u32 revision : {1u, 0u, 2u}) {
+        const auto setup = [revision](u8* b) {
+            ps_write32(b, kArea + 0x1000, revision);
+            ps_write64(b, kArea + 0x1040, 0x5555);
+        };
+        for (const u32 attr : {kArea + 0x1000, 0u, kArea + 0x1004})
+            for (const u32 container : {kArea + 0x1800u, 0u, kArea + 0x1808u})
+                calls.push_back({"cellSpursTaskAttributeSetExitCodeContainer", {attr, container}, setup,
+                    std::format("revision {} attr {:#x} container {:#x}", revision, attr, container)});
+    }
+    for (const u32 container : {kArea + 0x1800u, 0u, kArea + 0x1840u})
+        calls.push_back({"cellSpursTaskExitCodeInitialize", {container}, nullptr, std::format("{:#x}", container)});
+    compare(t, sony, calls);
+}
+
 TEST_CASE("cellSpurs' queue, semaphore and LF queue accessors against libsre", "[hle][lle][spurs]")
 {
     const std::optional<std::string> flash = test_dev_flash();
@@ -287,4 +430,24 @@ TEST_CASE("cellSpursGetTasksetInfo: a task's state, context size and its ELF's G
     CHECK(b[kInfo + 4 * 0x48 + 0x2C] == 0); // no task 4
     CHECK(ps_read32(b, kInfo + 0x2408) == 3);
     CHECK(ps_read32(b, kInfo + 0x241C) == 6400);
+}
+
+TEST_CASE("cellSpursSetPreemptionVictimHints needs the system workload; jobbin2 headers (D-506)", "[hle][spurs]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    std::memset(b + kSpurs, 0, 0x2000);
+    b[kSpurs + 0x76] = 5;
+    CHECK(t.call("cellSpursSetPreemptionVictimHints", kSpurs, kOut) == r3_of_code(0x80410709)); // PERM
+    ps_write32(b, kSpurs + 0xD80, 0x02000000);
+    CHECK(t.call("cellSpursSetPreemptionVictimHints", kSpurs, kOut) == 0);
+    // Three program headers: code at 0x3000 (0x100), data at 0x3400 (0x100 + 0x40 bss), a note.
+    put_jobbin2(b, Jobbin2{});
+    std::memset(b + kOut, 0, 48);
+    REQUIRE(t.call("cellSpursJobHeaderSetJobbin2Param", kOut, kElf) == 0);
+    CHECK(ps_read16(b, kOut + 2) == 0x40 / 16);
+    CHECK(ps_read32(b, kOut + 4) == kElf + 0x200);
+    CHECK(ps_read16(b, kOut + 8) == (0x3400 + 0x140 - 0x3000 - 0x40) / 16);
+    CHECK(b[kOut + 44] == 4);
 }

@@ -582,6 +582,45 @@ s32 cellSpursEnableExceptionEventHandler(PPUContext& ctx, u32 spurs, u32 flag)
     return lv2::CELL_OK;
 }
 
+// cellSpursSetPreemptionVictimHints(spurs, isPreemptible), as libsre (0xF6AC): NULL (both), ALIGN, PERM without the
+// system workload (SAF_SYSTEM_WORKLOAD_ENABLED); then a bit for each of the instance's SPUs whose byte of the array is
+// not 0 goes to sys_spu_thread_group_set_cooperative_victims on its SPU thread group, whose error libsre only prints.
+// The native scheduler has no SPU thread group nor victims to choose: the hints change nothing. CELL_OK.
+s32 cellSpursSetPreemptionVictimHints(PPUContext& ctx, u32 spurs, u32 is_preemptible)
+{
+    if (!spurs || !is_preemptible) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (!(ps_read32(base, spurs + spurs_off::flags) & SAF_SYSTEM_WORKLOAD_ENABLED)) return error(CELL_SPURS_CORE_ERROR_PERM);
+    const u32 n = ps_read8(base, spurs + spurs_off::nSpus);
+    u32 mask = 0;
+    if (const s32 rc = check_pointer(ctx, "cellSpursSetPreemptionVictimHints", "array", is_preemptible, n ? n : 1,
+            CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    for (u32 i = 0; i < n; i++)
+        if (ps_read8(base, is_preemptible + i)) mask |= 1u << i;
+    PS_LOG_DEBUG(kChan, "cellSpursSetPreemptionVictimHints(SPURS {:#x}): SPUs {:#x} preemptible (no effect natively)",
+        spurs, mask);
+    return lv2::CELL_OK;
+}
+
+// cellSpurs 0xE279681F, a libsre export no SDK names (0xF664): NULL (both), ALIGN, then the word at CellSpurs + 0x10
+// (the first four idle SPU counts, or SPURS2's ready counts of workloads 16..19).
+s32 cellSpurs_E279681F(PPUContext& ctx, u32 spurs, u32 out)
+{
+    if (!spurs || !out) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpurs_E279681F", "output", out, 4, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, out, ps_read32(base, spurs + 0x10));
+    return lv2::CELL_OK;
+}
+
 // cellSpursInitializeWithAttribute and ...WithAttribute2, as RPCS3 (libsre agrees): NULL, ALIGN (8), a revision above
 // 2 (INVAL); then initialize with the attribute's values, its flags with exitIfNoWork's and, for the second,
 // SAF_SECOND_VERSION: a SPURS2 instance of 32 workloads (8 KB).
@@ -1151,6 +1190,38 @@ s32 check_workload(u8* base, u32 spurs, u32 wid, u32 codes = 0x80410800)
     if (wid >= max_workloads(base, spurs)) return error(codes | 0x02);
     if (!workload_enabled(base, spurs, wid)) return error(codes | 0x05);
     if (ps_read32(base, spurs + wkl_off::exception)) return error(codes | 0x0F);
+    return lv2::CELL_OK;
+}
+
+// cellSpursSetExceptionEventHandler(spurs, wid, handler, arg), as libsre (0xDC5C; RPCS3 has none): NULL (spurs,
+// handler), ALIGN, the workload's checks (INVAL, SRCH, STAT with an exception pending); then the workload's F entry
+// takes the handler at 0x00 (u64) and its argument at 0x08, unless it has one (BUSY): libsre claims the entry with 1,
+// stores the argument and then the handler. The native scheduler stops a worker whose SPU code faults (CLAUDE.md rule 5)
+// and calls no handler; libsre's would run on the PPU from its exception event queue.
+s32 cellSpursSetExceptionEventHandler(PPUContext& ctx, u32 spurs, u32 wid, u32 handler, u32 arg)
+{
+    if (!spurs || !handler) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    u8* base = guest_base(ctx);
+    if (const s32 rc = check_workload(base, spurs, wid); rc != lv2::CELL_OK) return rc;
+    const u32 f = wkl_f(spurs, wid);
+    if (!atomic_cas_be64(base, f, 0, 1)) return error(CELL_SPURS_POLICY_MODULE_ERROR_BUSY);
+    ps_write64(base, f + 8, arg);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    ps_write64(base, f, handler);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    ps_res_notify_write(f, 16);
+    return lv2::CELL_OK;
+}
+
+// cellSpursUnsetExceptionEventHandler(spurs, wid), as libsre (0xD884): NULL, ALIGN, the workload's checks, then the
+// handler (the F entry's u64 at 0x00) is cleared; the argument stays.
+s32 cellSpursUnsetExceptionEventHandler(PPUContext& ctx, u32 spurs, u32 wid)
+{
+    u8* base = guest_base(ctx);
+    if (const s32 rc = check_workload(base, spurs, wid); rc != lv2::CELL_OK) return rc;
+    ps_write64(base, wkl_f(spurs, wid), 0);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    ps_res_notify_write(wkl_f(spurs, wid), 8);
     return lv2::CELL_OK;
 }
 
@@ -2574,6 +2645,39 @@ s32 _cellSpursTaskAttributeInitialize(PPUContext& ctx, u32 attr, u32 revision, u
     return lv2::CELL_OK;
 }
 
+// cellSpursTaskAttributeSetExitCodeContainer(attr, container), as libsre (0x10BA4): NULL (attr, container), the
+// attribute's 8-byte and the container's 128-byte ALIGN, revision 1 (INVAL); then the container at 0x40.
+s32 cellSpursTaskAttributeSetExitCodeContainer(PPUContext& ctx, u32 attr, u32 container)
+{
+    if (!attr || !container) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (attr % 8 || container % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = task_readable(ctx, "cellSpursTaskAttributeSetExitCodeContainer", "attribute", attr,
+            taskattr_off::exit_code_container + 8);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, attr + taskattr_off::revision) != CELL_SPURS_TASK_ATTRIBUTE_REVISION) {
+        return error(CELL_SPURS_TASK_ERROR_INVAL);
+    }
+    ps_write64(base, attr + taskattr_off::exit_code_container, container);
+    return lv2::CELL_OK;
+}
+
+// cellSpursTaskExitCodeInitialize(container), as libsre (0x13638): NULL, the 128-byte ALIGN, then the 128 bytes zeroed.
+s32 cellSpursTaskExitCodeInitialize(PPUContext& ctx, u32 container)
+{
+    if (!container) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (container % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = task_readable(ctx, "cellSpursTaskExitCodeInitialize", "container", container, 128);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    std::memset(guest_base(ctx) + container, 0, 128);
+    ps_res_notify_write(container, 128);
+    return lv2::CELL_OK;
+}
+
 // cellSpursCreateTaskWithAttribute(taskset, id, attr), as libsre: id and taskset NULL, taskset 128-byte aligned, attr
 // NULL, attr 8-byte aligned, revision 1 (INVAL). An exit code container needs a CellSpursTaskset2 (PERM for a
 // CellSpursTaskset; a misaligned one is a libsre assertion). Then create_task with the attribute's ELF, context and
@@ -3651,6 +3755,65 @@ s32 workload_name_instance(u8* base, u32 spurs, u32 wid, u32& name)
     return lv2::CELL_OK;
 }
 
+// cellSpursJobHeaderSetJobbin2Param(header, binary), as libsre (0x1AE64; RPCS3 has none): a job's code in the "jobbin2"
+// format, an SPU ELF whose program headers are three (code R+X, data R+W, a note) or five (three R+X, data R+W, a note)
+// from offset 52, and whose first segment's file data, 16-aligned, has "BIN2" or "bin2" at +32. NULL (header, binary),
+// the binary's 16-byte ALIGN, any other shape (INVAL; a second writable segment too). Then the job header gets the
+// first segment's address (the low word of eaBinary), the size of what is loaded less the writable segment's bss
+// (sizeBinary, 16-byte units) and the bss in 16-byte units (in eaBinary's upper half, at +2), and flag 4 at +44. A
+// binary libsre would fault on reading is refused with JOB_ERROR_NULL_POINTER and logged (D-042).
+s32 cellSpursJobHeaderSetJobbin2Param(PPUContext& ctx, u32 header, u32 bin)
+{
+    constexpr std::string_view fn = "cellSpursJobHeaderSetJobbin2Param";
+    if (!header || !bin) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (bin % 16) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "binary", bin, 52, CELL_SPURS_JOB_ERROR_NULL_POINTER); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, bin + 28) != 52) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    const u32 phnum = ps_read16(base, bin + 44), ph = bin + 52;
+    if (phnum != 3 && phnum != 5) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (const s32 rc = check_pointer(ctx, fn, "program headers", ph, 32 * phnum, CELL_SPURS_JOB_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    const auto load = [&](u32 i, u32 flags) {
+        return ps_read32(base, ph + 32 * i) == 1 && (ps_read32(base, ph + 32 * i + 24) & 7) == flags;
+    };
+    const bool shape = phnum == 5 ? load(0, 5) && load(1, 5) && load(2, 5) && load(3, 6) && ps_read32(base, ph + 128) == 4
+                                  : load(0, 5) && load(1, 6) && ps_read32(base, ph + 64) == 4;
+    if (!shape) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    u32 lo = 0xFFFFFFFFu, hi = 0, bss = 0xFFFFFFFFu; // bss: none yet (libsre's -1)
+    for (u32 i = 0; i < phnum; i++) {
+        const u32 e = ph + 32 * i;
+        if (ps_read32(base, e) != 1) continue;
+        const u32 vaddr = ps_read32(base, e + 8), memsz = ps_read32(base, e + 20);
+        lo = std::min(lo, vaddr);
+        hi = std::max(hi, vaddr + memsz);
+        if (ps_read32(base, e + 24) & 2) {
+            if (bss != 0xFFFFFFFFu) return error(CELL_SPURS_JOB_ERROR_INVAL);
+            bss = memsz - ps_read32(base, e + 16);
+        }
+    }
+    const u32 code = bin + ps_read32(base, ph + 4);
+    if (code % 16) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (const s32 rc = check_pointer(ctx, fn, "binary's tag", code + 32, 4, CELL_SPURS_JOB_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    const u32 tag = ps_read32(base, code + 32);
+    if (tag != 0x42494E32 && tag != 0x62696E32) return error(CELL_SPURS_JOB_ERROR_INVAL); // "BIN2", "bin2"
+    if (const s32 rc = check_pointer(ctx, fn, "header", header, 48, CELL_SPURS_JOB_ERROR_NULL_POINTER); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    ps_write16(base, header + 2, static_cast<u16>(static_cast<s32>(bss) / 16));
+    ps_write32(base, header + 4, code);
+    ps_write16(base, header + 8, static_cast<u16>(((hi - lo) - bss) >> 4));
+    ps_write8(base, header + 44, static_cast<u8>(ps_read8(base, header + 44) | 4));
+    return lv2::CELL_OK;
+}
+
 // cellSpursGetJobChainInfo(jobChain, info), as libsre: NULL (both), ALIGN, INVAL (a workload ID past 31), the
 // workload's information (cellSpursGetWorkloadInfo: its SRCH becomes INVAL, other errors pass); then CellSpursJobChainInfo
 // (0x54 bytes written): the four urgent command slots, pc, the three link registers (u32 each), the cause, the error,
@@ -3908,6 +4071,13 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xB792CA1A, cellSpursLFQueueGetTasksetAddress),
         PS_HLE_FUNC(0x4E153E3E, cellSpursGetWorkloadInfo),
         PS_HLE_FUNC(0x9FCB567B, cellSpursGetTasksetInfo),
+        PS_HLE_FUNC(0xD2E23FA9, cellSpursSetExceptionEventHandler),
+        PS_HLE_FUNC(0x4C75DEB8, cellSpursUnsetExceptionEventHandler),
+        PS_HLE_FUNC(0x4DE203E2, cellSpursSetPreemptionVictimHints),
+        PS_HLE_FUNC(0xE279681F, cellSpurs_E279681F),
+        PS_HLE_FUNC(0xA121A224, cellSpursTaskAttributeSetExitCodeContainer),
+        PS_HLE_FUNC(0x34552FA6, cellSpursTaskExitCodeInitialize),
+        PS_HLE_FUNC(0x97A2F6C8, cellSpursJobHeaderSetJobbin2Param),
         PS_HLE_FUNC(0x60EB2DEC, cellSpursCreateJobChain),
         PS_HLE_FUNC(0xBFEA60FA, cellSpursKickJobChain),
         PS_HLE_FUNC(0x86C864A2, cellSpursGetJobChainId),
