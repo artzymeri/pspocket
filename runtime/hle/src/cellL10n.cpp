@@ -2009,6 +2009,414 @@ u32 ToSjisUpper(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
         sjis_reader(m, [](u32 c) { return ((c - 0x8281) & 0xFFFF) <= 25 ? c - 33 : c; }, same));
 }
 
+// ------------------------------------------------------------------------------------------------- ISO-2022-JP
+
+// The escape sequences libl10n's decoders know: ESC ( B and ESC ( J (ASCII, mode 1), ESC $ @ and ESC $ B (JIS X 0208,
+// mode 3), ESC $ ( D (JIS X 0212, mode 4). Its encoders write ESC ( B, ESC $ B and ESC $ ( D when the mode changes,
+// and nothing at the end. Half-width katakana (mode 2, ESC ( I) is off: the switch for it is a variable nothing sets.
+struct Escape {
+    std::string_view seq;
+    u32 mode;
+};
+constexpr Escape kEscapes[] = {{"(B", 1}, {"(J", 1}, {"$@", 3}, {"$B", 3}, {"$(D", 4}};
+
+bool jis_byte(u32 b) { return ((b - 0x21) & 0xFF) <= 93; }
+
+// The decoders' loop: `put(mode, at, n, out, &took)` converts the character at `at` in `mode` (n bytes left), its
+// units in out; 0 for an error, else the units. `bad_count_minus_one` reports *dst_len one less on an error (the
+// JIS X 0212 lookups' quirk) when put says so through *took == ~0u.
+template <class Put>
+u32 jis_decode_loop(Mem& m, u32 src, u32 src_len, u32 dst, u32 dst_len, u32 out_unit, Put put)
+{
+    u32 consumed = 0, count = 0, mode = 1;
+    const auto fail = [&](u32 reported) {
+        m.w32(src_len, m.r32(src_len) - consumed);
+        m.w32(dst_len, reported);
+        return kIllegal;
+    };
+    while (consumed < m.r32(src_len)) {
+        if (!m.ok()) return kIllegal;
+        const u32 n = m.r32(src_len);
+        const u8 b = m.r8(src + consumed);
+        if (b == 0x1B) {
+            bool matched = false;
+            for (const Escape& e : kEscapes) {
+                if (n <= consumed + e.seq.size()) continue;
+                bool equal = true;
+                for (usize i = 0; i < e.seq.size() && equal; i++)
+                    equal = m.r8(src + consumed + 1 + static_cast<u32>(i)) == static_cast<u8>(e.seq[i]);
+                if (equal) {
+                    mode = e.mode;
+                    consumed += static_cast<u32>(e.seq.size()) + 1;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return fail(count);
+            continue;
+        }
+        u32 out[4];
+        u32 took = 0;
+        const u32 units = put(mode, src + consumed, n - consumed, out, &took);
+        if (!units) return fail(took == ~0u ? count - 1 : count);
+        count += units;
+        if (dst) {
+            if (m.r32(dst_len) < count) {
+                m.w32(src_len, m.r32(src_len) - consumed);
+                m.w32(dst_len, count - units);
+                return m.ok() ? kExhausted : kIllegal;
+            }
+            for (u32 k = 0; k < units; k++) {
+                if (out_unit == 1) m.w8(dst + k, static_cast<u8>(out[k]));
+                else m.w16(dst + 2 * k, static_cast<u16>(out[k]));
+            }
+            dst += units * out_unit;
+        }
+        consumed += took;
+    }
+    m.w32(dst_len, count);
+    return m.ok() ? kOK : kIllegal;
+}
+
+// The two bytes of a JIS X 0208 or 0212 character in mode 3 or 4: false when cut or not 21-7E.
+bool jis_pair(Mem& m, u32 at, u32 left, u8* b0, u8* b1)
+{
+    if (left < 2) return false;
+    *b0 = m.r8(at);
+    if (!jis_byte(*b0)) return false;
+    *b1 = m.r8(at + 1);
+    return jis_byte(*b1);
+}
+
+// JIS X 0212 in the UCS-2 and UTF-8 decoders (0x70b4): the code's range is checked on the two bytes read, but the
+// table cell is taken from the second and the byte after them (libl10n reads three bytes and moves on by two); a cell
+// outside the table (libl10n reads beyond it) counts as unassigned here.
+u16 jis0212_quirk(Mem& m, u32 at, u8 b0, u8 b1)
+{
+    const u32 c = (u32{b0} << 8) | b1 | 0x8080;
+    if (((c - 0xA2AF) & 0xFFFF) > 0x4B34) return 0xFFFF;
+    if (((b1 - 0x23) & 0xFF) <= 2 || b1 == 0x28 || ((b1 - 0x2C) & 0xFF) <= 3) return 0xFFFF;
+    const s32 base = b1 <= 0x25 ? 3229 : b1 <= 0x28 ? 3511 : b1 <= 0x2F ? 3605 : 3981;
+    const s32 index = static_cast<s32>(b1) * 94 + m.r8(at + 2) - base;
+    const auto& t = table(kJis0212);
+    if (index < 0 || index >= static_cast<s32>(t.size())) return 0xFFFF;
+    return t[static_cast<u32>(index)];
+}
+
+template <bool kUtf8>
+u32 jis_to_unicode(Mem& m, u32 mode, u32 at, u32 left, u32* out, u32* took)
+{
+    const u8 b = m.r8(at);
+    u16 v;
+    if (mode == 1) {
+        if (b >= 0x80 || b == 0x0E || b == 0x0F) return 0;
+        v = b;
+        *took = 1;
+    } else if (mode == 3) {
+        u8 b0, b1;
+        if (!jis_pair(m, at, left, &b0, &b1)) return 0;
+        v = eucjp2_ucs2(b0 | 0x80u, b1 | 0x80u);
+        if (v == 0xFFFF) return 0;
+        *took = 2;
+    } else if (mode == 4) {
+        u8 b0, b1;
+        if (!jis_pair(m, at, left, &b0, &b1)) return 0;
+        v = jis0212_quirk(m, at, b0, b1);
+        if (v == 0xFFFF) {
+            *took = ~0u;
+            return 0;
+        }
+        *took = 2;
+    } else {
+        return 0;
+    }
+    if constexpr (kUtf8) {
+        u8 bytes[4];
+        const u32 n = ucs2_to_utf8(v, bytes);
+        for (u32 k = 0; k < n; k++) out[k] = bytes[k];
+        return n;
+    } else {
+        out[0] = v;
+        return 1;
+    }
+}
+
+u32 JISstoUCS2s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "JISstoUCS2s");
+    return jis_decode_loop(m, src, sl, dst, dl, 2, [&](u32 mode, u32 at, u32 left, u32* out, u32* took) {
+        return jis_to_unicode<false>(m, mode, at, left, out, took);
+    });
+}
+
+u32 JISstoUTF8s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "JISstoUTF8s");
+    return jis_decode_loop(m, src, sl, dst, dl, 1, [&](u32 mode, u32 at, u32 left, u32* out, u32* took) {
+        return jis_to_unicode<true>(m, mode, at, left, out, took);
+    });
+}
+
+u32 JISstoEUCJPs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "JISstoEUCJPs");
+    return jis_decode_loop(m, src, sl, dst, dl, 1, [&](u32 mode, u32 at, u32 left, u32* out, u32* took) -> u32 {
+        const u8 b = m.r8(at);
+        if (mode == 1) {
+            if (b >= 0x80 || b == 0x0E || b == 0x0F) return 0;
+            out[0] = b;
+            *took = 1;
+            return 1;
+        }
+        u8 b0, b1;
+        if (!jis_pair(m, at, left, &b0, &b1)) return 0;
+        *took = 2;
+        if (mode == 3) {
+            out[0] = b0 | 0x80u;
+            out[1] = b1 | 0x80u;
+            return 2;
+        }
+        out[0] = 0x8F;
+        out[1] = b0 | 0x80u;
+        out[2] = b1 | 0x80u;
+        return 3;
+    });
+}
+
+u32 JISstoSJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "JISstoSJISs");
+    return jis_decode_loop(m, src, sl, dst, dl, 1, [&](u32 mode, u32 at, u32 left, u32* out, u32* took) -> u32 {
+        const u8 b = m.r8(at);
+        if (mode == 1) {
+            if (b >= 0x80 || b == 0x0E || b == 0x0F) return 0;
+            out[0] = b;
+            *took = 1;
+            return 1;
+        }
+        if (mode != 3) return 0;
+        u8 b0, b1;
+        if (!jis_pair(m, at, left, &b0, &b1)) return 0;
+        const u32 sj = jis_to_sjis((u32{b0} << 8) | b1);
+        out[0] = (sj >> 8) & 0xFF;
+        out[1] = sj & 0xFF;
+        *took = 2;
+        return 2;
+    });
+}
+
+// The encoders' escape for a mode: ESC ( B, ESC ( I, ESC $ B, ESC $ ( D.
+u32 escape_of(u32 mode, u8* out)
+{
+    out[0] = 0x1B;
+    switch (mode) {
+    case 1: out[1] = '('; out[2] = 'B'; return 3;
+    case 2: out[1] = '('; out[2] = 'I'; return 3;
+    case 3: out[1] = '$'; out[2] = 'B'; return 3;
+    default: out[1] = '$'; out[2] = '('; out[3] = 'D'; return 4;
+    }
+}
+
+// EUCJPstoJISs and SJISstoJISs (0x3994, 0x8348): each character in its mode, an escape first when the mode changes.
+// A JIS X 0212 character counts three bytes but writes two (libl10n's count).
+template <class Read>
+u32 jis_encode_loop(Mem& m, u32 src, u32 src_len, u32 dst, u32 dst_len, Read read)
+{
+    if (!m.r32(src_len)) {
+        m.w32(dst_len, 0);
+        return m.ok() ? kOK : kIllegal;
+    }
+    u32 consumed = 0, count = 0, mode = 1;
+    for (;;) {
+        const u32 left = m.r32(src_len) - consumed;
+        u32 code = 0, took = 0, newmode = 0;
+        if (!read(src + consumed, left, &code, &took, &newmode) || !m.ok()) {
+            m.w32(src_len, left);
+            m.w32(dst_len, count);
+            return kIllegal;
+        }
+        const u32 esc = newmode != mode ? 3 : 0;
+        const u32 size = esc + (newmode == 3 ? 2 : newmode == 4 ? 3 : 1);
+        count += size;
+        if (dst) {
+            if (m.r32(dst_len) < count) {
+                m.w32(src_len, left);
+                m.w32(dst_len, count - size);
+                return m.ok() ? kExhausted : kIllegal;
+            }
+            if (newmode != mode) {
+                u8 e[4];
+                const u32 n = escape_of(newmode, e);
+                for (u32 k = 0; k < n; k++) m.w8(dst++, e[k]);
+            }
+            if ((code & 0xFFFF) > 0xFF) m.w8(dst++, static_cast<u8>((code & 0xFFFF) >> 8 & 0x7F));
+            m.w8(dst++, static_cast<u8>(code & 0x7F));
+        }
+        consumed += took;
+        mode = newmode;
+        if (m.r32(src_len) <= consumed) {
+            m.w32(dst_len, count);
+            return m.ok() ? kOK : kIllegal;
+        }
+    }
+}
+
+u32 EUCJPstoJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "EUCJPstoJISs");
+    return jis_encode_loop(m, src, sl, dst, dl, [&](u32 at, u32 left, u32* code, u32* took, u32* mode) {
+        const u8 b = m.r8(at);
+        if (b < 0x80 && b != 0x1B && b != 0x0E && b != 0x0F) {
+            *code = b;
+            *took = 1;
+            *mode = 1;
+            return true;
+        }
+        if (b < 0x80 || left <= 1) return false;
+        if (in_a1_fe(b)) {
+            const u8 b1 = m.r8(at + 1);
+            if (in_a1_fe(b1)) {
+                *code = (u32{b} << 8) | b1;
+                *took = 2;
+                *mode = 3;
+                return true;
+            }
+        }
+        if (left == 2 || b != 0x8F) return false;
+        const u8 b1 = m.r8(at + 1);
+        if (!in_a1_fe(b1)) return false;
+        const u8 b2 = m.r8(at + 2);
+        if (!in_a1_fe(b2)) return false;
+        *code = (u32{b1} << 8) | b2;
+        *took = 3;
+        *mode = 4;
+        return true;
+    });
+}
+
+u32 SJISstoJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    Mem m(ctx, "SJISstoJISs");
+    return jis_encode_loop(m, src, sl, dst, dl, [&](u32 at, u32 left, u32* code, u32* took, u32* mode) {
+        const u8 b = m.r8(at);
+        if (b < 0x80 && b != 0x1B && b != 0x0E && b != 0x0F) {
+            *code = b;
+            *took = 1;
+            *mode = 1;
+            return true;
+        }
+        if (b < 0x80 || left <= 1 || !sjis_lead(b)) return false;
+        const u8 t = m.r8(at + 1);
+        if (!sjis_trail(t)) return false;
+        const u32 jis = sjis_to_kuten((u32{b} << 8) | t) + 0x2020;
+        if (((jis - 0x9321) & 0xFFFF) <= 1035) {
+            *code = ibm_to_jis((jis >> 8) * 94 + (jis & 0xFF) - 13851);
+        } else if ((jis & 0xFFFF) <= 0x7EFF) {
+            *code = jis & 0xFFFF;
+        } else {
+            return false;
+        }
+        *took = 2;
+        *mode = 3;
+        return true;
+    });
+}
+
+// UCS2stoJISs and UTF8stoJISs (0xa614, 0xf110): UCS2toEUCJP's code in its mode, with the voiced-mark joins of the
+// EUC-JP converters; a JIS X 0212 character counts three bytes and writes only its first byte's low seven bits (0F),
+// as libl10n does.
+template <bool kUtf8>
+u32 unicode_to_jis(PPUContext& ctx, const char* fn, u32 src, u32 src_len, u32 dst, u32 dst_len)
+{
+    Mem m(ctx, fn);
+    if (!m.r32(src_len)) {
+        m.w32(dst_len, 0);
+        return m.ok() ? kOK : kIllegal;
+    }
+    u32 consumed = 0, count = 0, prevmode = 1;
+    s32 state = -1;
+    const auto fail = [&] {
+        m.w32(src_len, m.r32(src_len) - consumed);
+        m.w32(dst_len, count);
+        return kIllegal;
+    };
+    for (;;) {
+        u32 c = 0, took = 1;
+        if constexpr (kUtf8) {
+            took = utf8_decode([&](u32 i) { return m.r8(src + consumed + i); }, &c, false);
+            if (!took || m.r32(src_len) < consumed + took) return fail();
+        } else {
+            c = m.r16(src + 2 * consumed);
+        }
+        if (!m.ok()) return kIllegal;
+        u8 tmp[4] = {};
+        u32 r = ucs2_to_eucjp(c, tmp);
+        u32 mode = prevmode, esc = 0;
+        bool joined = false;
+        if (r == 0) {
+            const u32 c16 = c & 0xFFFF;
+            if (state < 0 || (c16 != 0x3099 && !(c16 == 0x309A && state <= 9))) return fail();
+            if (!dst) {
+                state = -1;
+                consumed += took;
+                if (m.r32(src_len) <= consumed) {
+                    m.w32(dst_len, count);
+                    return m.ok() ? kOK : kIllegal;
+                }
+                continue;
+            }
+            u32 v = kDakutenEuc[state] + (c16 == 0x3099 ? 1 : 2);
+            if (c16 == 0x3099 && kDakutenEuc[state] == 0xA5A6) v = 0xA5F4;
+            tmp[0] = static_cast<u8>(v >> 8);
+            tmp[1] = static_cast<u8>(v);
+            r = 2;
+            dst -= 2;
+            state = -1;
+            joined = true;
+        } else {
+            if (r == 1) {
+                if (tmp[0] == 0x1B || tmp[0] == 0x0E || tmp[0] == 0x0F || ((tmp[0] - 0x80) & 0xFF) <= 31) return fail();
+                mode = 1;
+            } else if (r == 2) {
+                if (tmp[0] == 0x8E) return fail();
+                mode = 3;
+            } else {
+                mode = 4;
+            }
+            if (state < 0 && in_a1_fe(tmp[0])) {
+                const u32 code = (u32{tmp[0]} << 8) | tmp[1];
+                if (((code - 0xA5A1) & 0xFFFF) <= 85 || ((code - 0xA4A1) & 0xFFFF) <= 82)
+                    state = dakuten_index(kDakutenEuc, code);
+            }
+            if (mode != prevmode) esc = mode == 4 ? 4 : 3;
+            count += r + esc;
+        }
+        if (dst) {
+            if (!joined && m.r32(dst_len) < count) {
+                m.w32(src_len, m.r32(src_len) - consumed);
+                m.w32(dst_len, count - r - esc);
+                return m.ok() ? kExhausted : kIllegal;
+            }
+            if (mode != prevmode) {
+                u8 e[4];
+                const u32 n = escape_of(mode, e);
+                for (u32 k = 0; k < n; k++) m.w8(dst++, e[k]);
+            }
+            m.w8(dst++, tmp[0] & 0x7F);
+            if (r == 2) m.w8(dst++, tmp[1] & 0x7F);
+        }
+        consumed += took;
+        prevmode = mode;
+        if (m.r32(src_len) <= consumed) {
+            m.w32(dst_len, count);
+            return m.ok() ? kOK : kIllegal;
+        }
+    }
+}
+
+u32 UCS2stoJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return unicode_to_jis<false>(ctx, "UCS2stoJISs", src, sl, dst, dl); }
+u32 UTF8stoJISs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return unicode_to_jis<true>(ctx, "UTF8stoJISs", src, sl, dst, dl); }
+
 // ------------------------------------------------------------------------------------------------- Korean
 
 // KS X 1001 (EUC-KR's two-byte area, rows A1-AC, B0-C8, CA-FD): the UCS-2 value of a pair of A1-FE bytes, FFFF for
@@ -2652,6 +3060,183 @@ u32 UTF8stoGBKs(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return utf8_str
 u32 UTF8stoGB18030s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return utf8_string(ctx, "UTF8stoGB18030s", s, sl, d, dl, ucs2_to_gb18030); }
 u32 UTF8stoBIG5s(PPUContext& ctx, u32 s, u32 sl, u32 d, u32 dl) { return utf8_string(ctx, "UTF8stoBIG5s", s, sl, d, dl, ucs2_to_big5); }
 
+// ------------------------------------------------------------------------------------------------- HZ
+
+// HZ (RFC 1843): ASCII, "~{" into GB2312 (two 7-bit bytes a character), "~}" back, "~~" a tilde. libl10n writes "~\n"
+// as a newline (not a line continuation) and a few of its lengths differ between the UCS-2 and UTF-8 forms; both are
+// kept, see the comments.
+// The decoders: `utf8` picks the UTF-8 form's lengths.
+template <bool kUtf8>
+u32 hz_decode(PPUContext& ctx, const char* fn, u32 src, u32 src_len, u32 dst, u32 dst_len)
+{
+    Mem m(ctx, fn);
+    u32 consumed = 0, count = 0, mode = 1;
+    const auto done = [&](u32 r, u32 left, u32 written) {
+        m.w32(src_len, left);
+        m.w32(dst_len, written);
+        return m.ok() ? r : kIllegal;
+    };
+    // The bytes of a UCS-2 value to write (one unit, or the UTF-8 bytes).
+    const auto emit = [&](u16 v, u32* units, u32* out) {
+        if constexpr (kUtf8) {
+            u8 bytes[4];
+            *units = ucs2_to_utf8(v, bytes);
+            for (u32 k = 0; k < *units; k++) out[k] = bytes[k];
+        } else {
+            *units = 1;
+            out[0] = v;
+        }
+    };
+    const auto write = [&](const u32* out, u32 units) {
+        for (u32 k = 0; k < units; k++) {
+            if constexpr (kUtf8) m.w8(dst + k, static_cast<u8>(out[k]));
+            else m.w16(dst + 2 * k, static_cast<u16>(out[k]));
+        }
+        dst += units * (kUtf8 ? 1 : 2);
+    };
+    while (consumed < m.r32(src_len)) {
+        if (!m.ok()) return kIllegal;
+        const u32 n = m.r32(src_len);
+        const u8 b = m.r8(src + consumed);
+        if (b == '~') {
+            if (consumed + 1 == n) return done(kIllegal, 1, count);
+            const u8 b1 = m.r8(src + consumed + 1);
+            if (b1 == '}' && mode != 1) {
+                mode = 1;
+                consumed += 2;
+                continue;
+            }
+            if (b1 == '{' && mode != 12) {
+                mode = 12;
+                consumed += 2;
+                continue;
+            }
+            if ((b1 == '~' || b1 == '\n') && mode != 12) {
+                count += 1;
+                if (dst) {
+                    if (m.r32(dst_len) < count) return done(kExhausted, kUtf8 ? n - consumed : n - consumed - 1, count - 1);
+                    const u32 out[1] = {b1};
+                    write(out, 1);
+                }
+                consumed += 2;
+                continue;
+            }
+            return done(kIllegal, n - consumed, count);
+        }
+        if (mode == 1) {
+            if (b >= 0x80) return done(kIllegal, n - consumed, count);
+            count += 1;
+            if (dst) {
+                if (m.r32(dst_len) < count) return done(kExhausted, n - consumed, count - 1);
+                const u32 out[1] = {b};
+                write(out, 1);
+            }
+            consumed += 1;
+            continue;
+        }
+        // GB2312 in 7 bits: rows 21-29, 30-77; the UCS-2 form reports one unit less on a code outside them.
+        if (consumed + 2 > n || !jis_byte(b)) return done(kIllegal, n - consumed, count);
+        const u8 b1 = m.r8(src + consumed + 1);
+        if (!jis_byte(b1)) return done(kIllegal, n - consumed, count);
+        const u32 c = (u32{b} << 8) | b1;
+        if (((c - 0x2121) & 0xFFFF) > 0x565D || ((b - 0x2A) & 0xFF) <= 5)
+            return done(kIllegal, n - consumed, kUtf8 ? count : count - 1);
+        const u16 v = table(kGb2312)[b * 94 + b1 - (b <= 0x2F ? 3135 : 3699)];
+        if (v == 0xFFFF) return done(kIllegal, n - consumed, count);
+        u32 out[4], units = 0;
+        emit(v, &units, out);
+        count += units;
+        if (dst) {
+            if (m.r32(dst_len) < count) return done(kExhausted, m.r32(src_len) - consumed, count - units);
+            write(out, units);
+        }
+        consumed += 2;
+    }
+    m.w32(dst_len, count);
+    return m.ok() ? kOK : kIllegal;
+}
+
+u32 HZstoUCS2s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return hz_decode<false>(ctx, "HZstoUCS2s", src, sl, dst, dl); }
+u32 HZstoUTF8s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return hz_decode<true>(ctx, "HZstoUTF8s", src, sl, dst, dl); }
+
+// 0xc2d4: a UCS-2 value's HZ form: 1 (ASCII, the byte), 12 (GB2312's 7-bit code), 0 (none).
+u32 hz_code(u32 c, u32* code)
+{
+    if (c > 0xFFFD) return 0;
+    if (c <= 0x7F) {
+        *code = c;
+        return 1;
+    }
+    u32 i;
+    if (!find_code(table(kGb2312), c, &i)) return 0;
+    u32 e = ((i / 94) << 8) + (i % 94) + 0x2121;
+    if ((e & 0xFFFF) > 0x29FF) e += 0x600;
+    *code = e & 0xFFFF;
+    return 12;
+}
+
+// The encoders: "~{" or "~}" when the mode changes, "~~" for a tilde, nothing at the end.
+template <bool kUtf8>
+u32 hz_encode(PPUContext& ctx, const char* fn, u32 src, u32 src_len, u32 dst, u32 dst_len)
+{
+    Mem m(ctx, fn);
+    if (!m.r32(src_len)) {
+        m.w32(dst_len, 0);
+        return m.ok() ? kOK : kIllegal;
+    }
+    u32 consumed = 0, count = 0, prevmode = 1;
+    for (;;) {
+        u32 c = 0, took = 1;
+        if constexpr (kUtf8) {
+            took = utf8_decode([&](u32 i) { return m.r8(src + consumed + i); }, &c, false);
+            if (!took || m.r32(src_len) < consumed + took) {
+                m.w32(src_len, m.r32(src_len) - consumed);
+                m.w32(dst_len, count);
+                return kIllegal;
+            }
+        } else {
+            c = m.r16(src + 2 * consumed);
+        }
+        if (!m.ok()) return kIllegal;
+        u32 code = 0;
+        const u32 mode = hz_code(c, &code);
+        if (!mode) {
+            m.w32(src_len, m.r32(src_len) - consumed);
+            m.w32(dst_len, count);
+            return kIllegal;
+        }
+        u32 size = mode == 12 ? 2 : 1;
+        if (mode == 1 && code == '~') {
+            code = 0x7E7E;
+            size = 2;
+        }
+        const u32 esc = mode != prevmode ? 2 : 0;
+        count += esc + size;
+        if (dst) {
+            if (m.r32(dst_len) < count) {
+                m.w32(src_len, m.r32(src_len) - consumed);
+                m.w32(dst_len, count - size - esc);
+                return m.ok() ? kExhausted : kIllegal;
+            }
+            if (mode != prevmode) {
+                m.w8(dst++, '~');
+                m.w8(dst++, mode == 1 ? '}' : '{');
+            }
+            if (size == 2) m.w8(dst++, static_cast<u8>(code >> 8));
+            m.w8(dst++, static_cast<u8>(code));
+        }
+        consumed += took;
+        prevmode = mode;
+        if (m.r32(src_len) <= consumed) {
+            m.w32(dst_len, count);
+            return m.ok() ? kOK : kIllegal;
+        }
+    }
+}
+
+u32 UCS2stoHZs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return hz_encode<false>(ctx, "UCS2stoHZs", src, sl, dst, dl); }
+u32 UTF8stoHZs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return hz_encode<true>(ctx, "UTF8stoHZs", src, sl, dst, dl); }
+
 } // namespace
 
 void register_cellL10n(Registry& r)
@@ -2705,6 +3290,12 @@ void register_cellL10n(Registry& r)
         f("ToSjisHira", &thunk<&ToSjisHira>), f("ToSjisKata", &thunk<&ToSjisKata>),
         f("ToEucJpLower", &thunk<&ToEucJpLower>), f("ToEucJpUpper", &thunk<&ToEucJpUpper>),
         f("ToSjisLower", &thunk<&ToSjisLower>), f("ToSjisUpper", &thunk<&ToSjisUpper>),
+        f("JISstoUCS2s", &thunk<&JISstoUCS2s>), f("JISstoUTF8s", &thunk<&JISstoUTF8s>),
+        f("JISstoEUCJPs", &thunk<&JISstoEUCJPs>), f("JISstoSJISs", &thunk<&JISstoSJISs>),
+        f("EUCJPstoJISs", &thunk<&EUCJPstoJISs>), f("SJISstoJISs", &thunk<&SJISstoJISs>),
+        f("UCS2stoJISs", &thunk<&UCS2stoJISs>), f("UTF8stoJISs", &thunk<&UTF8stoJISs>),
+        f("HZstoUCS2s", &thunk<&HZstoUCS2s>), f("HZstoUTF8s", &thunk<&HZstoUTF8s>),
+        f("UCS2stoHZs", &thunk<&UCS2stoHZs>), f("UTF8stoHZs", &thunk<&UTF8stoHZs>),
         f("UHCtoUCS2", &thunk<&UHCtoUCS2>), f("EUCKRtoUTF8", &thunk<&EUCKRtoUTF8>), f("UHCtoUTF8", &thunk<&UHCtoUTF8>),
         f("UCS2toEUCKR", &thunk<&UCS2toEUCKR>), f("UCS2toUHC", &thunk<&UCS2toUHC>),
         f("UTF8toEUCKR", &thunk<&UTF8toEUCKR>), f("UTF8toUHC", &thunk<&UTF8toUHC>),

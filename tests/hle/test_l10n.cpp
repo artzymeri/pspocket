@@ -567,3 +567,117 @@ TEST_CASE("cellL10n: the Japanese text tools are libl10n's (D-517)", "[hle][l10n
     }
     CHECK(l.mismatches == 0);
 }
+
+TEST_CASE("cellL10n: the ISO-2022-JP converters are libl10n's (D-517)", "[hle][l10n]")
+{
+    L10n l;
+    if (!l.sony) SKIP("PSPOCKET_TEST_DEV_FLASH is not set");
+    u8* b = l.b;
+    std::mt19937 rng(51);
+    static const std::vector<std::vector<u8>> kEsc = {{0x1B, '(', 'B'}, {0x1B, '(', 'J'}, {0x1B, '$', '@'},
+        {0x1B, '$', 'B'}, {0x1B, '$', '(', 'D'}, {0x1B, '(', 'I'}, {0x1B, '$'}, {0x1B}};
+    const auto jis_text = [&](bool mode4) {
+        std::vector<u8> s;
+        for (u32 i = 0, n = 1 + rng() % 10; i < n; i++) {
+            const u32 r = rng() % 8;
+            if (r < 2) {
+                u32 e = rng() % kEsc.size();
+                if (!mode4 && e == 4) e = 3;
+                s.insert(s.end(), kEsc[e].begin(), kEsc[e].end());
+            } else if (r < 4) s.push_back(static_cast<u8>(0x21 + rng() % 0x5E));
+            else if (r < 6) { s.push_back(static_cast<u8>(0x21 + rng() % 0x5E)); s.push_back(static_cast<u8>(0x21 + rng() % 0x5E)); }
+            else if (r < 7) { s.push_back(0x30); s.push_back(static_cast<u8>(0x21 + rng() % 0x5E)); }
+            else { const auto x = random_bytes(rng, 1); s.insert(s.end(), x.begin(), x.end()); }
+        }
+        return s;
+    };
+    const auto run = [&](const char* fn, const std::vector<u8>& in, u32 n) {
+        for (const u32 cap : {0x100u, 0u, 1u, 3u, 4u})
+            for (const bool null_dst : {false, true})
+                l.same(fn, [&](u32 base) {
+                    put_bytes(b, base + 0x200, in);
+                    ps_write32(b, base + 0x3F0, n);
+                    ps_write32(b, base + 0x3F4, cap);
+                    return std::vector<u64>{base + 0x200, base + 0x3F0, null_dst ? 0u : base, base + 0x3F4};
+                }, std::format("{} n {} cap {}{}", hex(in), n, cap, null_dst ? " NULL" : ""));
+    };
+    for (u32 round = 0; round < 1500; round++) {
+        const std::vector<u8> any = jis_text(true), safe = jis_text(false);
+        for (const char* fn : {"JISstoEUCJPs", "JISstoSJISs"}) {
+            run(fn, any, static_cast<u32>(any.size()));
+            run(fn, any, static_cast<u32>(any.size() > 1 ? any.size() - 1 : any.size()));
+        }
+        for (const char* fn : {"JISstoUCS2s", "JISstoUTF8s"}) {
+            run(fn, safe, static_cast<u32>(safe.size()));
+            run(fn, safe, static_cast<u32>(safe.size() > 1 ? safe.size() - 1 : safe.size()));
+        }
+        // The encoders.
+        std::vector<u8> euc, sjis, ucs2, utf8;
+        for (u32 i = 0, n = 1 + rng() % 8; i < n; i++) {
+            const u32 r = rng() % 6;
+            if (r < 2) euc.push_back(static_cast<u8>(0x20 + rng() % 0x5F));
+            else if (r < 4) { euc.push_back(static_cast<u8>(0xA1 + rng() % 0x5E)); euc.push_back(static_cast<u8>(0xA1 + rng() % 0x5E)); }
+            else if (r < 5) { euc.push_back(0x8F); euc.push_back(static_cast<u8>(0xA1 + rng() % 0x5E)); euc.push_back(static_cast<u8>(0xA1 + rng() % 0x5E)); }
+            else { const auto x = random_bytes(rng, 1 + rng() % 2); euc.insert(euc.end(), x.begin(), x.end()); }
+            const u32 q = rng() % 5;
+            if (q < 2) sjis.push_back(static_cast<u8>(0x20 + rng() % 0x5F));
+            else if (q < 4) { sjis.push_back(static_cast<u8>(rng() % 2 ? 0x81 + rng() % 0x1F : 0xE0 + rng() % 0x1D)); sjis.push_back(static_cast<u8>(0x40 + rng() % 0xBD)); }
+            else { const auto x = random_bytes(rng, 1 + rng() % 2); sjis.insert(sjis.end(), x.begin(), x.end()); }
+            static const u32 kChars[] = {0x41, 0x304B, 0x30AB, 0x306F, 0x30A6, 0x3099, 0x309A, 0x4E00, 0x4E02, 0x7E6B, 0xFF76, 0x1B, 0x85, 0x2170, 0x3042};
+            const u32 c = rng() % 3 ? kChars[rng() % std::size(kChars)] : rng() % 0x10000;
+            ucs2.push_back(static_cast<u8>(c >> 8));
+            ucs2.push_back(static_cast<u8>(c));
+            if (c < 0x80) utf8.push_back(static_cast<u8>(c));
+            else if (c < 0x800) { utf8.push_back(static_cast<u8>(0xC0 | (c >> 6))); utf8.push_back(static_cast<u8>(0x80 | (c & 0x3F))); }
+            else { utf8.push_back(static_cast<u8>(0xE0 | (c >> 12))); utf8.push_back(static_cast<u8>(0x80 | ((c >> 6) & 0x3F))); utf8.push_back(static_cast<u8>(0x80 | (c & 0x3F))); }
+        }
+        run("EUCJPstoJISs", euc, static_cast<u32>(euc.size()));
+        run("SJISstoJISs", sjis, static_cast<u32>(sjis.size()));
+        run("UCS2stoJISs", ucs2, static_cast<u32>(ucs2.size() / 2));
+        run("UTF8stoJISs", utf8, static_cast<u32>(utf8.size()));
+    }
+    CHECK(l.mismatches == 0);
+}
+
+TEST_CASE("cellL10n: the HZ converters are libl10n's (D-517)", "[hle][l10n]")
+{
+    L10n l;
+    if (!l.sony) SKIP("PSPOCKET_TEST_DEV_FLASH is not set");
+    u8* b = l.b;
+    std::mt19937 rng(61);
+    const auto run = [&](const char* fn, const std::vector<u8>& in, u32 n) {
+        for (const u32 cap : {0x100u, 0u, 1u, 2u, 3u, 5u})
+            for (const bool null_dst : {false, true})
+                l.same(fn, [&](u32 base) {
+                    put_bytes(b, base + 0x200, in);
+                    ps_write32(b, base + 0x3F0, n);
+                    ps_write32(b, base + 0x3F4, cap);
+                    return std::vector<u64>{base + 0x200, base + 0x3F0, null_dst ? 0u : base, base + 0x3F4};
+                }, std::format("{} n {} cap {}{}", hex(in), n, cap, null_dst ? " NULL" : ""));
+    };
+    static const std::vector<std::vector<u8>> kPieces = {{'~', '{'}, {'~', '}'}, {'~', '~'}, {'~', '\n'}, {'~'}, {'~', 'x'}};
+    for (u32 round = 0; round < 2000; round++) {
+        std::vector<u8> hz, ucs2, utf8;
+        for (u32 i = 0, n = 1 + rng() % 10; i < n; i++) {
+            const u32 r = rng() % 6;
+            if (r < 2) { const auto& p = kPieces[rng() % kPieces.size()]; hz.insert(hz.end(), p.begin(), p.end()); }
+            else if (r < 4) hz.push_back(static_cast<u8>(0x21 + rng() % 0x5E));
+            else if (r < 5) { hz.push_back(static_cast<u8>(0x21 + rng() % 0x5E)); hz.push_back(static_cast<u8>(0x21 + rng() % 0x5E)); }
+            else hz.push_back(static_cast<u8>(rng()));
+            static const u32 kChars[] = {0x41, 0x7E, 0x4E00, 0x554A, 0x3000, 0xFF01, 0x00B7, 0x2014, 0x00E9, 0x3042};
+            const u32 c = rng() % 3 ? kChars[rng() % std::size(kChars)] : rng() % 0x10000;
+            ucs2.push_back(static_cast<u8>(c >> 8));
+            ucs2.push_back(static_cast<u8>(c));
+            if (c < 0x80) utf8.push_back(static_cast<u8>(c));
+            else if (c < 0x800) { utf8.push_back(static_cast<u8>(0xC0 | (c >> 6))); utf8.push_back(static_cast<u8>(0x80 | (c & 0x3F))); }
+            else { utf8.push_back(static_cast<u8>(0xE0 | (c >> 12))); utf8.push_back(static_cast<u8>(0x80 | ((c >> 6) & 0x3F))); utf8.push_back(static_cast<u8>(0x80 | (c & 0x3F))); }
+        }
+        for (const char* fn : {"HZstoUCS2s", "HZstoUTF8s"}) {
+            run(fn, hz, static_cast<u32>(hz.size()));
+            run(fn, hz, static_cast<u32>(hz.size() > 1 ? hz.size() - 1 : hz.size()));
+        }
+        run("UCS2stoHZs", ucs2, static_cast<u32>(ucs2.size() / 2));
+        run("UTF8stoHZs", utf8, static_cast<u32>(utf8.size()));
+    }
+    CHECK(l.mismatches == 0);
+}
