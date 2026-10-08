@@ -45,10 +45,12 @@
 #include "pspocket/lv2/report.hpp"
 #include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/loader/disc.hpp"
+#include "pspocket/loader/game_modules.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/loader/system.hpp"
 #include "pspocket/recomp/firmware.hpp"
+#include "pspocket/recomp/hash.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/platform/audio_output.hpp"
 #include "pspocket/platform/ios.h"
@@ -105,6 +107,8 @@ struct Session {
     std::atomic<rsx::metal::MetalBackend*> backend{nullptr};
     // SPU programs translated while it runs (D-236), when the app carries the compiler.
     std::shared_ptr<prepare::SessionTranslator> spu_translator;
+    // Its own PRX modules translated ahead of time (D-238): after `modules`, which it is installed on.
+    std::unique_ptr<loader::GameModules> game_modules;
     std::string coverage; // where the SPU images it meets are saved
 };
 
@@ -268,6 +272,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     if (bytes.size() >= 4 && bytes[0] == 'S' && bytes[1] == 'C' && bytes[2] == 'E' && bytes[3] == 0) {
         return fail(error, error_size, "the executable is still an encrypted SELF; it has to be decrypted to an ELF");
     }
+    const std::string exe_sha256 = recomp::to_hex(recomp::Sha256::hash(std::span<const u8>(bytes)));
     auto exe = loader::Executable::parse(std::move(bytes));
     if (!exe) return fail(error, error_size, "the executable: " + exe.error().message);
 
@@ -484,6 +489,16 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     // Modules the game loads while it runs (sys_prx_load_module, D-159).
     s->modules = std::make_unique<loader::RuntimeModules>(*s->hle, s->exe, s->lle.get());
     s->hle->set_module_loader(s->modules.get());
+    // The game's own modules: saved for the next preparation when they have no translation, to their slots when
+    // they have (D-238).
+    if (!s->coverage.empty()) s->modules->set_capture_dir(s->coverage + "/prx");
+    if (!game_library.empty()) {
+        std::string why;
+        s->game_modules = loader::GameModules::load(
+            (std::filesystem::path(game_library).parent_path() / "modules").string(), exe_sha256, *s->modules,
+            s->lle.get(), *s->memory, &why);
+        if (!s->game_modules && why != "none") PS_LOG_INFO(kChan, "the game's modules library: {}", why);
+    }
 #if PSPOCKET_HAVE_GAME_SPU
     // The lifted SPU programs built into the app (scripts/ios.sh), first: a program is found by its code's hash, the
     // first registered winning, so these (with the entries the Mac's runs collected, D-099) run where the library has

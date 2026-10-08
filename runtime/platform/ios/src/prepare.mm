@@ -33,6 +33,7 @@
 #include "pspocket/game/host.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
+#include "pspocket/prepare/modules.hpp"
 #include "pspocket/prepare/prepare.hpp"
 #include "pspocket/prepare/session.hpp"
 #include "pspocket/prepare/system.hpp"
@@ -108,12 +109,13 @@ void set_status(const pspocket::prepare::Progress& p)
 {
     using Phase = pspocket::prepare::Progress::Phase;
     std::lock_guard lock(g_mutex);
-    g_status.phase = p.phase == Phase::Translating ? PS_PREPARE_TRANSLATING
-        : p.phase == Phase::Compiling             ? PS_PREPARE_COMPILING
-        : p.phase == Phase::Linking               ? PS_PREPARE_LINKING
-        : p.phase == Phase::Signing               ? PS_PREPARE_SIGNING
-        : p.phase == Phase::Done                  ? PS_PREPARE_DONE
-                                                  : PS_PREPARE_FAILED;
+    // Done and failed are finish()'s to say, with the library or the error: a step's own end is not the preparation's
+    // (the game's library, then its modules, D-238; the app starts the game the moment it reads "done").
+    if (p.phase != Phase::Done && p.phase != Phase::Failed)
+        g_status.phase = p.phase == Phase::Translating ? PS_PREPARE_TRANSLATING
+            : p.phase == Phase::Compiling             ? PS_PREPARE_COMPILING
+            : p.phase == Phase::Linking               ? PS_PREPARE_LINKING
+                                                      : PS_PREPARE_SIGNING;
     g_status.fraction = p.fraction;
     g_status.seconds = p.seconds;
     g_status.seconds_left = p.seconds_left;
@@ -206,7 +208,23 @@ extern "C" int ps_prepare_check(const char* game_dir, const char* executable, ch
     std::string reason = "the executable cannot be read";
     // The title is the game folder's name (Application Support/pspocket-games/<TITLE_ID>).
     const std::string spu = coverage_dir(fs::path(game_dir).filename().string()) + "/spu";
-    const bool ok = !sha.empty() && pspocket::prepare::library_is_current(game_dir, sha, &reason, spu);
+    bool ok = !sha.empty() && pspocket::prepare::library_is_current(game_dir, sha, &reason, spu);
+    // And its own PRX modules: on its disc (D-239) and saved while it ran (D-238).
+    if (ok)
+        ok = pspocket::prepare::game_modules_are_current((fs::path(game_dir) / "modules").string(), sha,
+            {coverage_dir(fs::path(game_dir).filename().string()) + "/prx", (fs::path(game_dir) / "disc-prx").string()},
+            pspocket::prepare::kGameModuleFloor, &reason);
+    // And the disc's SPU programs, when they were found after the library was made (D-239).
+    if (ok) {
+        std::error_code e;
+        const auto made = fs::last_write_time(fs::path(game_dir) / "manifest.json", e);
+        for (const auto& f : fs::directory_iterator(fs::path(game_dir) / "disc-spu", e))
+            if (f.path().extension() == ".elf" && f.last_write_time(e) > made) {
+                ok = false;
+                reason = "the disc's SPU programs to translate";
+                break;
+            }
+    }
     copy_text(why, why_size, reason);
     return ok ? 1 : 0;
 #else
@@ -235,6 +253,7 @@ extern "C" int ps_prepare_start(const char* executable, const char* title_id, co
     const std::string coverage = coverage_dir(title_id);
     o.spu_images_dir = coverage + "/spu";
     o.spu_logs = {coverage + "/spu-misses.log"};
+    o.spu_elf_dirs = {(fs::path(game_dir) / "disc-spu").string()}; // the disc's own (D-239)
     // Every core; compiles start while their predicted peaks fit in half of what iOS lets the app have now.
     o.workers = std::max(1u, std::thread::hardware_concurrency());
     o.memory_mb = static_cast<double>(os_proc_available_memory()) / 1048576.0 * 0.5;
@@ -268,6 +287,26 @@ extern "C" int ps_prepare_start(const char* executable, const char* title_id, co
             fs::create_directories(last_dir, e);
             fs::copy_file(fs::path(o.game_dir) / "manifest.json", last_dir / "manifest.json",
                 fs::copy_options::overwrite_existing, e);
+            // Then the game's own PRX modules it saved while it ran (D-238). A failure leaves them interpreted.
+            pspocket::prepare::ModulesOptions m;
+            m.inputs = {coverage_dir(o.title_id) + "/prx", (fs::path(o.game_dir) / "disc-prx").string()};
+            m.title_id = o.title_id;
+            m.executable_sha256 = pspocket::prepare::file_sha256(o.executable);
+            m.dir = (fs::path(o.game_dir) / "modules").string();
+            m.toolchain = o.toolchain;
+            m.workers = o.workers;
+            m.memory_mb = o.memory_mb;
+            m.qos_class = o.qos_class;
+            m.key = o.key;
+            m.identifier = o.identifier;
+            m.thermal = o.thermal;
+            m.progress = o.progress;
+            m.cancel = o.cancel;
+            const pspocket::prepare::ModulesResult mr = pspocket::prepare::prepare_game_modules(m);
+            if (!mr.library.ok)
+                PS_LOG_WARN(kChan, "{}: its own modules stay under the interpreter: {}", o.title_id, mr.library.error);
+            else if (!mr.none)
+                PS_LOG_INFO(kChan, "{}: {} of its own modules translated", o.title_id, mr.modules);
         }
         finish(r);
     }).detach();

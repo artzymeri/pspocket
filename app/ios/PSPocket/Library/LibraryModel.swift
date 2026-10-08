@@ -328,6 +328,29 @@ final class LibraryModel {
         }
     }
 
+    /// The disc's own PRX modules and SPU ELFs saved into the game's folder for its preparation (D-239), once.
+    private func ensureDiscModules(titleID: String, iso: URL, gameDir: URL) {
+        guard !decrypting.contains(titleID) else { return }
+        decrypting.insert(titleID)
+        try? FileManager.default.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        decryptQueue.async {
+            var error = [CChar](repeating: 0, count: 512)
+            let saved = ps_disc_save_modules(iso.path, gameDir.appendingPathComponent("disc-prx").path,
+                                             gameDir.appendingPathComponent("disc-spu").path, &error, error.count)
+            if saved < 0 {
+                Self.log.error("pspocket: \(titleID, privacy: .public): the disc's modules: \(String(cString: error), privacy: .public)")
+            } else {
+                Self.log.notice("pspocket: \(titleID, privacy: .public): \(saved) executable files of its own on the disc")
+            }
+            // Done, whatever it found (a disc that cannot be read now is not read again on every start).
+            FileManager.default.createFile(atPath: gameDir.appendingPathComponent("disc-scanned").path, contents: nil)
+            DispatchQueue.main.async {
+                self.decrypting.remove(titleID)
+                if let boot = self.boot, boot.phase == .armed { self.armBoot() }
+            }
+        }
+    }
+
     // MARK: covers
 
     /// GameTDB's cover (350x408), cached; else the disc's ICON0.PNG; else none (the title shows as text).
@@ -453,8 +476,14 @@ final class LibraryModel {
                 Self.log.error("pspocket: cannot prepare the system software: \(message ?? "", privacy: .public)")
             }
         }
-        // Route B (D-154): the game runs from the library this iPhone made of it; the first time, it is made now.
+        // The disc's own PRX modules and SPU programs (D-239), found once, so its first session runs them translated
+        // too (scanning reads only files named as executables: a few MB).
         let gameDir = Self.decryptedGames.appendingPathComponent(titleID)
+        if !FileManager.default.fileExists(atPath: gameDir.appendingPathComponent("disc-scanned").path) {
+            ensureDiscModules(titleID: titleID, iso: entry.url, gameDir: gameDir)
+            return // comes back here when done
+        }
+        // Route B (D-154): the game runs from the library this iPhone made of it; the first time, it is made now.
         let check = Preparer.check(gameDir: gameDir, executable: elf)
         if check.ready {
             startGame(entry: entry, titleID: titleID, elf: elf, library: gameDir.appendingPathComponent("game.dylib"))

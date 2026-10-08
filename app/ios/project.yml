@@ -165,8 +165,10 @@ targets:
         name: platform-ios
         group: Runtime
         includes: *compiled
-        # prepare.mm: preparing games on the phone (D-154) when the app carries the compiler.
-        compilerFlags: ['-DPSPOCKET_HAVE_CODEGEN=${PSPOCKET_HAVE_CODEGEN}', '-I$(PSPOCKET_ROOT)/runtime/prepare/include']
+        # prepare.mm: preparing games on the phone (D-154) when the app carries the compiler, and translating SPU
+        # programs while a game runs (D-236).
+        compilerFlags: ['-DPSPOCKET_HAVE_CODEGEN=${PSPOCKET_HAVE_CODEGEN}', '-I$(PSPOCKET_ROOT)/runtime/prepare/include',
+                        '-I$(PSPOCKET_ROOT)/runtime/codegen/include']
       - path: ../../runtime/platform/apple/src
         name: platform-apple
         group: Runtime
