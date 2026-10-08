@@ -360,8 +360,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Done (D-227):** objects of earlier preparations nothing links any more are deleted after the link (Assassin's
   Creed: 566 MB freed).
 - **Tests:** the timing-sensitive tests are robust now (thread report: CPU time; usleep(0): the backoff state, not
-  wall time). Open: the SPU analyzer's other copies (call targets inside another function's code), per-unit
-  prototypes, PGO/LTO clang, LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.
+  wall time). Open: the SPU analyzer's other copies (call targets inside another function's code), PGO/LTO clang,
+  LLVM IR from the lifters, a scheduler that keeps the biggest files on performance cores.
+- **Done (D-251):** per-unit prototypes: GTA V's PPU units compile 6-7% faster (165 to 151-155 s on the M4).
+- **Seen (2026-10-08):** GTA V's SPU programs lift 813,469 instructions for 515,520 distinct ones (1.58 times; up to
+  4.5 in one program, 2.9 in the busiest module): a function's body takes in the code of others it runs into. Not
+  touched: cutting the copies makes each shared path a call between functions, the costliest part of translated SPU
+  code at run time, for a one-time saving when preparing.
 
 ## Stability: the EDGE/GFX job chain's descriptors written over
 

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <filesystem>
 #include <format>
 #include <set>
@@ -1164,9 +1165,28 @@ LiftResult lift(const CodeImage& image, const Program& program, const LiftOption
         units[unit] += emit_function(image, program, f, options, result.stats);
         in_unit += f.insns.size();
     }
+    // Each unit declares only the functions it names (D-251): including the header's prototype of every function of
+    // the executable (85,000 for GTA V, 6 MB) cost each of its 514 units about 0.1 s of parsing.
+    const std::string fprefix = options.prefix + "f_";
     for (u32 i = 0; i < tus; i++) {
+        std::set<u32> named;
+        for (usize at = units[i].find(fprefix); at != std::string::npos; at = units[i].find(fprefix, at + 1)) {
+            const usize h = at + fprefix.size();
+            if (at > 0 && (std::isalnum(static_cast<unsigned char>(units[i][at - 1])) || units[i][at - 1] == '_')) continue;
+            if (h + 8 > units[i].size()) continue;
+            u32 addr = 0;
+            bool hex = true;
+            for (usize k = h; k < h + 8 && hex; k++) {
+                const char ch = units[i][k];
+                hex = std::isxdigit(static_cast<unsigned char>(ch)) && !std::islower(static_cast<unsigned char>(ch));
+                addr = (addr << 4) | static_cast<u32>(ch <= '9' ? ch - '0' : ch - 'A' + 10);
+            }
+            if (hex) named.insert(addr);
+        }
         std::string c(kBanner);
-        c += std::format("#include \"{}.h\"\n\n", name);
+        c += "#include \"pspocket/ppu/lifted.h\"\n\n";
+        for (u32 addr : named) c += signature(function_symbol(options.prefix, addr)) + ";\n";
+        c += "\n";
         c += units[i];
         result.files.push_back({std::format("{}_{}.c", name, i), std::move(c)});
     }

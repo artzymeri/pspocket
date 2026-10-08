@@ -5396,6 +5396,19 @@ gate's one RSX failure: GTA V's 128x128 AA mode 3 target), so a resolve read a s
   (about half covered), some pixels have samples on both sides of an edge (per-sample coverage, not doubled pixels),
   and a scissor over the left half of the pixels covers the left half of the samples. With mode 3 drawn with one
   sample, the test fails.
+## D-251 · 2026-10-08 · Each translated PPU unit declares only the functions it names
+
+ppu-lift's units each included the program's header, which declares every translated function: 85,376 prototypes
+(6 MB) for GTA V, parsed again by each of its 512 units, about 0.1 s apiece (improve.md had it at 12% of the PPU
+compile). Now a unit includes pspocket/ppu/lifted.h and declares the functions its own code names (found by their
+symbol prefix after the unit is written: 344 in GTA V's unit 100); the header stays for the registration unit and
+the hosts.
+
+- Same code otherwise: GTA V's units from the old and the new lifter differ only in their declarations. The PPU tests
+  (whose programs are lifted at build time), the prepare tests and the gate pass.
+- Measured (GTA V's 512 units, the build's flags, ten at a time on the M4, old and new alternating): 165.3 and 162.9 s
+  to 154.6 and 150.9 s (-7%), CPU 1,423 and 1,377 s to 1,331 and 1,297 s (-6%). Preparing a game on the phone compiles
+  these units too: the PPU part of it 6-7% shorter.
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
