@@ -36,7 +36,6 @@ namespace pspocket::hle::spurs {
 namespace {
 
 constexpr std::string_view kTaskChan = "spurs";
-constexpr u32 CELL_SPURS_MAX_TASK = 128;
 constexpr u32 kBlock = 0x800;
 constexpr u32 CELL_SPURS_TASK_ERROR_NOSYS = 0x80410903;
 

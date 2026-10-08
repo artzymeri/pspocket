@@ -32,10 +32,9 @@
 // syscall 2, DMA, and the kernel and taskset context fields it reads (module ID, CellSpurs, workload ID 0x1DC, DMA
 // tag 0x1CC; task ID 0x27D4, context 0x2798, LS pattern 0x27A0, the syscall entry at 0x27C4).
 //
-// Implemented: _cellSpursSemaphoreInitialize, the one function GTA V imports. cellSpursSemaphoreGetTasksetAddress
-// (semaphore NULL, misaligned, output NULL; then the taskset at 0x38) stays unimplemented until a game calls it
-// (CLAUDE.md rule 4). Where libsre would touch a bad pointer, initialize refuses the call with TASK_ERROR_FAULT and a
-// log of the call site (D-042).
+// Implemented: both of libsre's functions, _cellSpursSemaphoreInitialize (the one GTA V imports) and
+// cellSpursSemaphoreGetTasksetAddress (D-505). Where libsre would touch a bad pointer, they refuse the call with
+// TASK_ERROR_FAULT and a log of the call site (D-042).
 
 #include <atomic>
 #include <cstring>
@@ -119,12 +118,32 @@ s32 _cellSpursSemaphoreInitialize(PPUContext& ctx, u32 spurs, u32 taskset, u32 s
     return lv2::CELL_OK;
 }
 
+// cellSpursSemaphoreGetTasksetAddress(semaphore, taskset), as libsre (0x18024): the semaphore NULL (NULL_POINTER), its
+// 128-byte alignment (ALIGN), the output NULL (NULL_POINTER); then the taskset, the low word of the u64 at 0x38 (0 for
+// a semaphore of the whole SPURS instance). Memory that is not guest memory: TASK_ERROR_FAULT (D-042).
+s32 cellSpursSemaphoreGetTasksetAddress(PPUContext& ctx, u32 semaphore, u32 taskset)
+{
+    if (!semaphore) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (semaphore % CELL_SPURS_SEMAPHORE_ALIGN) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    lv2::PpuThread& t = thread_of(ctx);
+    if (!guest_readable(t, semaphore, CELL_SPURS_SEMAPHORE_SIZE) || !guest_readable(t, taskset, 4)) {
+        log_call_site(ctx, t.kernel.base(), std::format("cellSpursSemaphoreGetTasksetAddress({:#x}, {:#x}): not guest "
+            "memory; refused with CELL_SPURS_TASK_ERROR_FAULT", semaphore, taskset));
+        return error(CELL_SPURS_TASK_ERROR_FAULT);
+    }
+    u8* base = t.kernel.base();
+    ps_write32(base, taskset, static_cast<u32>(ps_read64(base, semaphore + sem_off::taskset)));
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_cellSpursSemaphore(Registry& r)
 {
     r.add("cellSpurs", {
         PS_HLE_FUNC(0x77CDAC0C, _cellSpursSemaphoreInitialize),
+        PS_HLE_FUNC(0x568B2352, cellSpursSemaphoreGetTasksetAddress),
     });
 }
 

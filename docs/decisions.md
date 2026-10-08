@@ -5904,3 +5904,23 @@ parser, which libhttp's own does not match).
 - Compared with libhttp call for call (tests/hle/test_httputil.cpp, made-up and random inputs: 157,970 calls, every
   answer and byte of the structures, pools and their guards the same), plus known answers without the firmware.
 GTA V and Assassin's Creed import none of these.
+
+## D-505 · 2026-10-08 · cellSpurs: the accessors and information functions libsre has
+
+Nine of the 29 cellSpurs functions pspocket lacked, each read from libsre.sprx (4.92) and compared with it call for
+call (tests/hle/test_spurs_compare.cpp: made-up and random structures, 982 calls, every answer and every byte of the
+work area the same):
+- cellSpursQueueDepth, GetEntrySize, GetDirection, GetTasksetAddress: NULL (the queue, then the output), the 128-byte
+  ALIGN, then the field. cellSpursQueueClear: both indices to 0 in one update of the line, BUSY while a push or pop is
+  under way or a task waits.
+- cellSpursSemaphoreGetTasksetAddress (its alignment checked before the output, unlike the queue's) and
+  cellSpursLFQueueGetTasksetAddress (the queue's signal address, which holds a SPURS LF queue's taskset; 0 when its
+  bit 0 marks a queue of the whole instance; cellSync's errors as task errors).
+- cellSpursGetWorkloadInfo: the workload's argument, priorities, policy module, names, hook, contention, ready count
+  and signal. With 32 workloads libsre reports the signal as bit (wid & 15) counted from the right, where the
+  workload's bit is counted from the left: kept.
+- cellSpursGetTasksetInfo: the 128 task records (pattern, argument, ELF, context and its size, state, signal, the
+  Taskset2 exit code container), each with its ELF's GUID as libsre finds it: the first loadable segment of an SPU ELF
+  that starts with a .SpuGUID section's four `ila $2`; zeros without one.
+Their earlier comments said they would stay unimplemented until a game calls them (CLAUDE.md rule 4); the library
+work (D-500) does them all.

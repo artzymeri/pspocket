@@ -40,8 +40,8 @@
 // Everything the SPU side does (GETLLAR/PUTLLC on the line, a DMA of the entry, syscall 2, its own
 // _cellSpursSendSignal, the interrupt-mailbox event) is task code that the native taskset policy runs as it is.
 //
-// Implemented: the four functions GTA V imports, and PushBody (the PPU pushing to PPU2SPU queues) and Size, which Sony's
-// libdmuxpamf calls (D-194). Clear, Depth and the getters stay unimplemented until a game calls them (CLAUDE.md rule 4). Where libsre would read a bad pointer,
+// Implemented: every function of libsre's: the four GTA V imports, PushBody (the PPU pushing to PPU2SPU queues) and
+// Size, which Sony's libdmuxpamf calls (D-194), and Clear, Depth and the getters (D-505). Where libsre would read a bad pointer,
 // these functions refuse the call with TASK_ERROR_FAULT and a log of the call site (D-042); where libsre asserts (it
 // prints the failed condition and aborts the process), pspocket stops with a fatal log naming it (D-047).
 
@@ -496,6 +496,80 @@ s32 cellSpursQueueSize(PPUContext& ctx, u32 queue, u32 size_out)
     return lv2::CELL_OK;
 }
 
+// The getters' checks, as libsre (0x1705C, 0x170A4, 0x170EC, 0x16988): the queue NULL, the output NULL
+// (NULL_POINTER), the queue's 128-byte alignment (ALIGN). Memory that is not guest memory: TASK_ERROR_FAULT (D-042).
+s32 check_getter(PPUContext& ctx, std::string_view what, u32 queue, u32 out)
+{
+    if (!queue || !out) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (queue % CELL_SPURS_QUEUE_ALIGN) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = queue_readable(ctx, what, "queue", queue, CELL_SPURS_QUEUE_SIZE); rc != lv2::CELL_OK) return rc;
+    return queue_readable(ctx, what, "output", out, 4);
+}
+
+// cellSpursQueueDepth(queue, depth): the depth (0x0C).
+s32 cellSpursQueueDepth(PPUContext& ctx, u32 queue, u32 depth)
+{
+    if (const s32 rc = check_getter(ctx, "cellSpursQueueDepth", queue, depth); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    ps_write32(base, depth, ps_read32(base, queue + q_off::depth));
+    return lv2::CELL_OK;
+}
+
+// cellSpursQueueGetEntrySize(queue, size): the entry size (0x08).
+s32 cellSpursQueueGetEntrySize(PPUContext& ctx, u32 queue, u32 size)
+{
+    if (const s32 rc = check_getter(ctx, "cellSpursQueueGetEntrySize", queue, size); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    ps_write32(base, size, ps_read32(base, queue + q_off::size));
+    return lv2::CELL_OK;
+}
+
+// cellSpursQueueGetDirection(queue, direction): the direction (0x1C).
+s32 cellSpursQueueGetDirection(PPUContext& ctx, u32 queue, u32 direction)
+{
+    if (const s32 rc = check_getter(ctx, "cellSpursQueueGetDirection", queue, direction); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    ps_write32(base, direction, ps_read32(base, queue + q_off::direction));
+    return lv2::CELL_OK;
+}
+
+// cellSpursQueueGetTasksetAddress(queue, taskset): the taskset, the low word of the u64 at 0x60 (0 for a queue of the
+// whole SPURS instance).
+s32 cellSpursQueueGetTasksetAddress(PPUContext& ctx, u32 queue, u32 taskset)
+{
+    if (const s32 rc = check_getter(ctx, "cellSpursQueueGetTasksetAddress", queue, taskset); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, taskset, static_cast<u32>(ps_read64(base, queue + q_off::taskset)));
+    return lv2::CELL_OK;
+}
+
+// cellSpursQueueClear(queue), as libsre (0x16868): NULL (NULL_POINTER), the 128-byte alignment (ALIGN); then, in one
+// atomic update of the line, both indices to 0 unless a push or pop is under way (an index marked) or a task waits
+// to pop or push (the counts at 0x20 and 0x30): then BUSY and nothing changes.
+s32 cellSpursQueueClear(PPUContext& ctx, u32 queue)
+{
+    if (!queue) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (queue % CELL_SPURS_QUEUE_ALIGN) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = queue_readable(ctx, "cellSpursQueueClear", "queue", queue, CELL_SPURS_QUEUE_SIZE);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    s32 rc = lv2::CELL_OK;
+    reservation_op(guest_base(ctx), queue, [&rc](u8* line) {
+        if (marked(ps_read32(line, q_off::pop)) || marked(ps_read32(line, q_off::push)) || line[q_off::pop_waiters] ||
+            line[q_off::push_waiters]) {
+            rc = error(CELL_SPURS_TASK_ERROR_BUSY);
+            return false;
+        }
+        rc = lv2::CELL_OK;
+        ps_write64(line, q_off::pop, 0);
+        return true;
+    });
+    return rc;
+}
+
 } // namespace
 
 void register_cellSpursQueue(Registry& r)
@@ -507,6 +581,11 @@ void register_cellSpursQueue(Registry& r)
         PS_HLE_FUNC(0x91066667, cellSpursQueuePopBody),
         PS_HLE_FUNC(0x92CFF6ED, cellSpursQueuePushBody),
         PS_HLE_FUNC(0x54876603, cellSpursQueueSize),
+        PS_HLE_FUNC(0x247414D0, cellSpursQueueClear),
+        PS_HLE_FUNC(0x35F02287, cellSpursQueueDepth),
+        PS_HLE_FUNC(0xEC68442C, cellSpursQueueGetDirection),
+        PS_HLE_FUNC(0x369FE03D, cellSpursQueueGetEntrySize),
+        PS_HLE_FUNC(0x2093252B, cellSpursQueueGetTasksetAddress),
     });
 }
 

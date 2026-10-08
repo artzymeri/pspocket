@@ -96,6 +96,7 @@ constexpr u32 SPURS_IMG_ADDR_TASK2_HANDLER = 0x500, kTask2HandlerSize = 0x670;
 constexpr u32 CELL_SPURS_JOB_REVISION_0 = 0, CELL_SPURS_JOB_REVISION_1 = 1, CELL_SPURS_JOB_REVISION_2 = 2,
               CELL_SPURS_JOB_REVISION_3 = 3;
 constexpr u32 CELL_SPURS_MAX_WORKLOAD = 16;
+constexpr u32 CELL_SPURS_MAX_TASK = 128; // tasks of a taskset
 constexpr u32 CELL_SPURS_TASKSET_ATTRIBUTE_REVISION = 1;
 constexpr u32 kTasksetSize = 6400;   // CellSpursTaskset
 constexpr u32 kTaskset2Size = 10496; // CellSpursTaskset2

@@ -1246,6 +1246,71 @@ s32 cellSpursGetWorkloadData(PPUContext& ctx, u32 spurs, u32 data, u32 wid)
     return lv2::CELL_OK;
 }
 
+// cellSpursGetWorkloadInfo(spurs, wid, info), as libsre (0xE814; RPCS3 has a TODO): NULL (spurs, info), the 128-byte
+// ALIGN, INVAL past the instance's workloads (16 or 32), SRCH for a workload not enabled; then CellSpursWorkloadInfo:
+// the argument (u64) at 0x00, the priorities at 0x08, the policy module's address and size at 0x10 and 0x14, the name
+// class and instance at 0x18 and 0x1C, the contention bytes and ready count at 0x20, the signal at 0x25, the
+// shutdown-completion hook and its argument at 0x28 and 0x2C (bytes 0x26, 0x27 and 0x30 on left alone). With 32
+// workloads libsre reports the contention nibbles, no minimum contention or idle count, and the signal as bit
+// (wid & 15) of its word counted from the right, where the workload's own bit is counted from the left (0x8000 >> wid,
+// which it uses with 16 workloads): kept, as libsre.
+s32 cellSpursGetWorkloadInfo(PPUContext& ctx, u32 spurs, u32 wid, u32 info)
+{
+    constexpr std::string_view fn = "cellSpursGetWorkloadInfo";
+    if (!spurs || !info) return error(CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "SPURS", spurs, CELL_SPURS_SIZE, CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    const bool second = ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS;
+    if (wid >= (second ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD)) {
+        return error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    }
+    if (!((ps_read32(base, spurs + wkl_off::enabled) >> (31 - wid)) & 1)) return error(CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
+        if (const s32 rc = check_pointer(ctx, fn, "SPURS2", spurs, CELL_SPURS_SIZE2, CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+            rc != lv2::CELL_OK) {
+            return rc;
+        }
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "info", info, 0x30, CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    const u32 w = wid & 15, winfo = wkl_info(spurs, wid), h = wkl_h(spurs, wid), f = wkl_f(spurs, wid);
+    ps_write64(base, info + 0x00, ps_read64(base, winfo + wkl_off::info_arg));
+    std::memcpy(base + info + 0x08, base + winfo + wkl_off::info_priority, 8);
+    ps_write32(base, info + 0x10, static_cast<u32>(ps_read64(base, winfo + wkl_off::info_addr)));
+    ps_write32(base, info + 0x14, ps_read32(base, winfo + wkl_off::info_size));
+    ps_write32(base, info + 0x18, static_cast<u32>(ps_read64(base, h + 0x00))); // name class
+    ps_write32(base, info + 0x1C, static_cast<u32>(ps_read64(base, h + 0x08))); // name instance
+    ps_write32(base, info + 0x28, static_cast<u32>(ps_read64(base, f + wkl_off::f1_hook)));
+    ps_write32(base, info + 0x2C, static_cast<u32>(ps_read64(base, f + wkl_off::f1_hook_arg)));
+    if (second) {
+        const bool high = wid >= CELL_SPURS_MAX_WORKLOAD;
+        const auto nibble = [&](u32 off) {
+            const u8 v = ps_read8(base, spurs + off + w);
+            return static_cast<u8>(high ? v >> 4 : v & 0x0F);
+        };
+        ps_write8(base, info + 0x20, nibble(wkl_off::currentContention));
+        ps_write8(base, info + 0x21, 0);
+        ps_write8(base, info + 0x22, nibble(wkl_off::maxContention));
+        ps_write8(base, info + 0x23, ps_read8(base, spurs + wkl_ready(wid)));
+        ps_write8(base, info + 0x24, 0);
+        ps_write8(base, info + 0x25, static_cast<u8>((ps_read16(base, spurs + wkl_signal_of(wid)) >> w) & 1));
+    } else {
+        ps_write8(base, info + 0x20, ps_read8(base, spurs + wkl_off::currentContention + wid));
+        ps_write8(base, info + 0x22, ps_read8(base, spurs + wkl_off::maxContention + wid));
+        ps_write8(base, info + 0x21, ps_read8(base, spurs + wkl_off::minContention + wid));
+        ps_write8(base, info + 0x23, ps_read8(base, spurs + wkl_off::readyCount1 + wid));
+        ps_write8(base, info + 0x24, ps_read8(base, spurs + wkl_off::idleSpuCountOrReadyCount2 + wid));
+        ps_write8(base, info + 0x25, (ps_read16(base, spurs + wkl_off::signal1) & wkl_signal_bit(wid)) ? 1 : 0);
+    }
+    return lv2::CELL_OK;
+}
+
 // cellSpursSetMaxContention(spurs, wid, maxContention), as RPCS3 (libsre agrees): the core's checks (NULL, ALIGN, INVAL,
 // SRCH, STAT), the maximum clamped to 8 and stored in the workload's maximum-contention byte (SPURS2: its nibble), in
 // one update of CellSpurs line 0 (which the workers see at once).
@@ -1685,6 +1750,111 @@ s32 cellSpursTasksetGetSpursAddress(PPUContext& ctx, u32 taskset, u32 spurs)
     return lv2::CELL_OK;
 }
 
+// libsre's GUID of an SPU ELF (0xEE4C), for cellSpursGetTasksetInfo: none (false) unless the ELF is 16-aligned memory
+// that is there (sys_memory_get_page_attribute), an ELF ("\x7FELF") for the SPU (machine 23) with program headers;
+// then the first loadable segment (type 1) that starts with the four `ila $2` of a .SpuGUID section
+// (cellSpursGetSpuGuid's pattern) gives the eight bytes, bits 9-24 of each instruction. Memory libsre would fault on
+// reading: none here.
+bool elf_spu_guid(lv2::PpuThread& t, u32 elf, std::array<u8, 8>& out)
+{
+    u8* base = t.kernel.base();
+    if (!elf || elf % 16 || !guest_readable(t, elf, 0x34)) return false;
+    if (std::memcmp(base + elf, "\x7F" "ELF", 4) != 0 || ps_read16(base, elf + 18) != 23) return false;
+    const u32 phnum = ps_read16(base, elf + 44), phoff = ps_read32(base, elf + 28), phentsize = ps_read16(base, elf + 42);
+    for (u32 i = 0; i < phnum; i++) {
+        const u32 ph = elf + phoff + i * phentsize;
+        if (!guest_readable(t, ph, 8)) return false;
+        if (ps_read32(base, ph) != 1) continue;
+        const u32 seg = elf + ps_read32(base, ph + 4);
+        if (!guest_readable(t, seg, 16)) return false;
+        bool guid = true;
+        for (u32 k = 0; k < 4 && guid; k++) {
+            const u32 w = ps_read32(base, seg + 4 * k);
+            guid = std::rotl(std::rotl(w, 7) & 0xFFFFu, 25) == 0x42000002u + 0x80u * k; // opcode, $2, the word's index
+        }
+        if (!guid) continue;
+        for (u32 k = 0; k < 4; k++) {
+            const u32 w = ps_read32(base, seg + 4 * k);
+            out[2 * k] = static_cast<u8>(w >> 17);
+            out[2 * k + 1] = static_cast<u8>(w >> 9);
+        }
+        return true;
+    }
+    return false;
+}
+
+// cellSpursGetTasksetInfo(taskset, info), as libsre (0x14568; RPCS3 has none): NULL (taskset, info), the 128-byte
+// ALIGN, the taskset's workload ID past 31 (INVAL); cellSpursGetWorkloadInfo of it, whose SRCH becomes INVAL (its
+// other errors as they are). Then CellSpursTasksetInfo: for each of the 128 task slots (0x48 bytes each, whether the
+// task exists or not) its LS pattern, argument, ELF (8-aligned), context (128-aligned) and context size (0x400 + 0x800
+// a saved LS block; 0 without a context), its state (0 none, 1 running, 2 waiting, 3 ready or pending ready), whether it
+// is signalled, its exit code container (a CellSpursTaskset2's, else 0) and its ELF's GUID (zeros without one); then the
+// argument, workload ID, last scheduled task, name, exception handler and its argument, and the taskset's size.
+s32 cellSpursGetTasksetInfo(PPUContext& ctx, u32 taskset, u32 info)
+{
+    constexpr std::string_view fn = "cellSpursGetTasksetInfo";
+    if (!taskset || !info) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "taskset", taskset, kTasksetSize, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u32 wid = ps_read32(base, taskset + ts_off::wid);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    u32 name = 0;
+    {
+        StackVar w(ctx, base, 0x30);
+        if (const s32 rc = cellSpursGetWorkloadInfo(ctx, static_cast<u32>(ps_read64(base, taskset + ts_off::spurs)), wid,
+                w.addr());
+            rc != lv2::CELL_OK) {
+            return static_cast<u32>(rc) == CELL_SPURS_POLICY_MODULE_ERROR_SRCH ? error(CELL_SPURS_TASK_ERROR_INVAL) : rc;
+        }
+        name = ps_read32(base, w.addr() + 0x1C);
+    }
+    const u32 size = ps_read32(base, taskset + ts_off::size);
+    const bool second = size > kTaskset2Size - 1;
+    if (second) {
+        if (const s32 rc = check_pointer(ctx, fn, "taskset", taskset, kTaskset2Size, CELL_SPURS_TASK_ERROR_FAULT);
+            rc != lv2::CELL_OK) {
+            return rc;
+        }
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "info", info, 0x2420, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    ps_write32(base, info + 0x2408, wid);
+    ps_write64(base, info + 0x2400, ps_read64(base, taskset + ts_off::args));
+    ps_write32(base, info + 0x240C, ps_read8(base, taskset + 0x73)); // the task scheduled last
+    ps_write32(base, info + 0x241C, size);
+    ps_write32(base, info + 0x2410, name);
+    ps_write32(base, info + 0x2414, static_cast<u32>(ps_read64(base, taskset + ts_off::exception_handler)));
+    ps_write32(base, info + 0x2418, static_cast<u32>(ps_read64(base, taskset + ts_off::exception_handler_arg)));
+    for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
+        const u32 ti = taskset + ts_off::task_info + i * ts_off::task_info_stride, out = info + i * 0x48;
+        ps_write64(base, out + 0x00, ps_read64(base, ti + ts_off::ti_ls_pattern));
+        ps_write64(base, out + 0x08, ps_read64(base, ti + ts_off::ti_ls_pattern + 8));
+        ps_write64(base, out + 0x10, ps_read64(base, ti + ts_off::ti_args));
+        ps_write64(base, out + 0x18, ps_read64(base, ti + ts_off::ti_args + 8));
+        const u64 context = ps_read64(base, ti + ts_off::ti_context);
+        const u32 elf = static_cast<u32>(ps_read64(base, ti + ts_off::ti_elf)) & ~7u;
+        ps_write32(base, out + 0x20, elf);
+        ps_write32(base, out + 0x24, static_cast<u32>(context) & ~0x7Fu);
+        ps_write32(base, out + 0x28, context ? ((static_cast<u32>(context) & 0x7F) << 11) + 0x400 : 0);
+        ps_write32(base, out + 0x30, second ? static_cast<u32>(ps_read64(base, taskset + 0x1988 + 16 * i)) : 0);
+        const u32 word = 4 * (i / 32), bit = 0x80000000u >> (i % 32);
+        const auto has = [&](u32 set) { return (ps_read32(base, taskset + set + word) & bit) != 0; };
+        u8 state = 0;
+        if (has(0x30)) state = has(0x00) ? 1 : has(0x10) || has(0x20) ? 3 : 2; // enabled: running, ready, waiting
+        ps_write8(base, out + 0x2C, state);
+        ps_write8(base, out + 0x2D, has(0x40) ? 1 : 0);
+        std::array<u8, 8> guid{};
+        if (!elf_spu_guid(t, elf, guid)) guid = {};
+        std::memcpy(base + out + 0x34, guid.data(), 8);
+    }
+    return lv2::CELL_OK;
+}
+
 // cellSpursGetTasksetId(taskset, wid), as RPCS3 (libsre agrees): NULL, ALIGN, then the taskset's workload ID, whatever
 // it is.
 s32 cellSpursGetTasksetId(PPUContext& ctx, u32 taskset, u32 wid)
@@ -1962,7 +2132,6 @@ s32 cellSpursJoinTaskset(PPUContext& ctx, u32 taskset)
 // bad pointer, pspocket checks first and refuses the call with TASK_ERROR_FAULT and a log of the call site (D-042).
 // Where libsre asserts (it prints the failed condition and aborts the process), pspocket stops with a fatal log.
 
-constexpr u32 CELL_SPURS_MAX_TASK = 128;
 constexpr u32 CELL_SPURS_TASK_TOP = 0x3000;     // task code and data start here; LS below belongs to SPURS
 constexpr u32 CELL_SPURS_TASK_BOTTOM = 0x40000; // end of local store
 constexpr u32 CELL_SPURS_TASK_EXECUTION_CONTEXT_SIZE = 1024;
@@ -2954,6 +3123,28 @@ s32 _cellSpursLFQueueInitialize(PPUContext& ctx, u32 taskset_or_spurs, u32 queue
     return rc < 0 ? static_cast<s32>(0x80410900u | (static_cast<u32>(rc) & 0xFF)) : rc;
 }
 
+// cellSpursLFQueueGetTasksetAddress(queue, taskset), as libsre (0x17D40): the output NULL (NULL_POINTER); the queue's
+// signal address (_cellSyncLFQueueGetSignalAddress's checks: NULL, 128-byte alignment, as task errors with the same
+// low byte), which a SPURS LF queue holds its taskset in (_cellSpursLFQueueInitialize), 0 when its bit 0 says it is a
+// queue of the whole SPURS instance. Memory that is not guest memory: TASK_ERROR_FAULT (D-042).
+s32 cellSpursLFQueueGetTasksetAddress(PPUContext& ctx, u32 queue, u32 taskset)
+{
+    constexpr std::string_view fn = "cellSpursLFQueueGetTasksetAddress";
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (!queue) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (queue % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "queue", queue, 128, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "output", taskset, 4, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    const u32 signal = static_cast<u32>(ps_read64(base, queue + 0x70)); // CellSyncLFQueue::m_eaSignal
+    ps_write32(base, taskset, signal & 1 ? 0 : signal);
+    return lv2::CELL_OK;
+}
+
 // ------------------------------------------------------------------------------------------------- barriers
 
 // RPCS3 cellSpursBarrierInitialize. CellSpursBarrier (128 bytes, 128-aligned): zero, remained (u32), taskset at 0x34.
@@ -3714,6 +3905,9 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0x947EFB0B, cellSpursEventFlagGetTasksetAddress),
         PS_HLE_FUNC(0x9AEB5432, cellSpursBarrierGetTasksetAddress),
         PS_HLE_FUNC(0x011EE38B, _cellSpursLFQueueInitialize),
+        PS_HLE_FUNC(0xB792CA1A, cellSpursLFQueueGetTasksetAddress),
+        PS_HLE_FUNC(0x4E153E3E, cellSpursGetWorkloadInfo),
+        PS_HLE_FUNC(0x9FCB567B, cellSpursGetTasksetInfo),
         PS_HLE_FUNC(0x60EB2DEC, cellSpursCreateJobChain),
         PS_HLE_FUNC(0xBFEA60FA, cellSpursKickJobChain),
         PS_HLE_FUNC(0x86C864A2, cellSpursGetJobChainId),
