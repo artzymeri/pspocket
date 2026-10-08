@@ -211,6 +211,13 @@ modules make were counted (scripts/firmware-syscalls.py): the six a game can rea
 SPU-side tries measured and not kept (D-245 waiters on the line's word, D-247 stops as ways out). Where the SPU time
 goes now: the EDGE geometry job is 35% of the translated SPU time (shufb, quadword loads and fma inside it); calls
 and function entry and exit 18% across all programs, which only registers passed in host registers would cut.
+Then (D-246 to D-254): primitive restart in indexed draws (D-249), multisampled targets drawn one texel per sample
+(D-250: the gate's last RSX failure gone, its limit now 0), PPU units that declare only the functions they name
+(D-251: GTA V's PPU code compiles 6-7% faster), input settled as a controller or the on-screen controls (D-252),
+spu-check in every full gate (D-253, after Apple clang built one SPU program wrong with a tried change), and H.264 on
+VideoToolbox (D-254: the same pictures, 77% less CPU). Measured and not kept: event flag sets without allocations
+(D-246), corner copies at the end of a pass (D-248), a one-instruction byte reversal (D-253). A booted iOS Simulator
+had been skewing GPU and fps numbers; shut down.
 
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,

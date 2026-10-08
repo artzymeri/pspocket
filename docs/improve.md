@@ -165,6 +165,11 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
     run 098), 4 ms of waiting per frame at most, then the draw is skipped. Next: a shader interpreter (one MSL
     program that runs RSX microcode, RPCS3's "async with shader interpreter") would draw those instead of leaving
     them out; tune the 4 ms on the phone.
+  - **Weighed (2026-10-08), not started:** an interpreter only helps if its pipelines exist before the draw, and a
+    Metal pipeline is compiled per vertex and fragment function *and* per attachment formats, blending and write masks:
+    the interpreter's own pipelines would still be compiled on first sight of each such combination (fewer, but not
+    none). A shader is new once per install (the cache keeps it), so the gain is a game's first session. Before
+    building it: count on the phone how many draws a first session leaves out, and for how long.
 - **Archives:** off on the phone (D-145): iOS keeps compiled pipelines between launches itself, and the archives cost
   gigabytes. After an iOS update its cache is empty and the first launch compiles everything (84 s and more, run 087).
 - **State:** open.
