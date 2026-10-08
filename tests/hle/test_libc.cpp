@@ -9,12 +9,14 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <format>
 #include <limits>
 #include <string>
 #include <vector>
 
 #include "hle_test_util.hpp"
+#include "pspocket/recomp/nid.hpp"
 
 using namespace pspocket;
 using namespace pspocket::hle;
@@ -23,7 +25,7 @@ using namespace pspocket::hle::test;
 namespace {
 
 constexpr u32 kA = kData + 0x1000, kB = kData + 0x2000, kOut = kData + 0x3000, kCode = kData + 0x4000,
-              kOpd = kData + 0x4100, kCounter = kData + 0x4200, kArr = kData + 0x5000;
+              kOpd = kData + 0x4100, kCounter = kData + 0x4200, kArr = kData + 0x5000, kFmtW = kData + 0x6000;
 
 void put(u8* b, u32 at, std::string_view s)
 {
@@ -502,4 +504,128 @@ TEST_CASE("sys_libc: mspaces in the caller's memory and in lv2's", "[hle][libc]"
     CHECK(t.call("mspace_destroy", lv2) == 0x20000);
     // Too small a memory for an mspace.
     CHECK(t.call("mspace_create", kSpace, 64) == 0);
+}
+
+TEST_CASE("sys_libc: time.h on lv2's clock and time zone", "[hle][libc]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    // time: lv2's seconds since 1970, also stored through the pointer.
+    const s64 host = static_cast<s64>(std::time(nullptr));
+    const s64 now = static_cast<s64>(t.call("time", kOut));
+    CHECK(std::llabs(now - host) < 5);
+    CHECK(static_cast<s64>(ps_read64(b, kOut)) == now);
+    // gmtime of 1234567890: 2009-02-13 23:31:30 UTC, a Friday, the 44th day; asctime's text.
+    ps_write64(b, kA, 1234567890);
+    const u32 tm = static_cast<u32>(t.call("gmtime", kA));
+    REQUIRE(tm != 0);
+    const s32 want[] = {30, 31, 23, 13, 1, 109, 5, 43, 0};
+    for (u32 i = 0; i < 9; i++) CHECK(static_cast<s32>(ps_read32(b, tm + 4 * i)) == want[i]);
+    CHECK(cstr(b, static_cast<u32>(t.call("asctime", tm))) == "Fri Feb 13 23:31:30 2009\n");
+    ps_write64(b, kA, static_cast<u64>(-1));
+    t.call("gmtime", kA);
+    CHECK(static_cast<s32>(ps_read32(b, tm + 20)) == 69); // 1969-12-31 23:59:59, a Wednesday
+    CHECK(static_cast<s32>(ps_read32(b, tm + 24)) == 3);
+    CHECK(static_cast<s32>(ps_read32(b, tm)) == 59);
+    // localtime and mktime undo each other; mktime normalizes its fields.
+    ps_write64(b, kA, 1234567890);
+    const u32 lt = static_cast<u32>(t.call("localtime", kA));
+    std::memcpy(b + kB, b + lt, 36);
+    CHECK(t.call("mktime", kB) == 1234567890);
+    const s32 over[] = {60, 59, 23, 31, 11, 99, 0, 0, 0}; // 1999-12-31 23:59:60 -> 2000-01-01 00:00:00
+    for (u32 i = 0; i < 9; i++) ps_write32(b, kB + 4 * i, static_cast<u32>(over[i]));
+    t.call("mktime", kB);
+    CHECK(ps_read32(b, kB + 20) == 100);
+    CHECK(ps_read32(b, kB + 12) == 1);
+    CHECK(ps_read32(b, kB + 24) == 6); // a Saturday
+    t.call("difftime", 10, 4);
+    CHECK(t.ctx.fpr[1] == 6.0);
+    // strftime: C99's conversions in the "C" locale, the same as the host's for the same broken-down time.
+    ps_write64(b, kA, 1234567890);
+    t.call("gmtime", kA);
+    const char* fmt = "%a %A %b %B %c %C %d %D %e %F %g %G %h %H %I %j %m %M %n %p %r %R %S %t %T %u %U %V %w %W %x "
+                      "%X %y %Y %% %Ey %OH";
+    put(b, kFmtW, fmt);
+    CHECK(t.call("strftime", kOut, 512, kFmtW, tm) > 0);
+    std::tm h{};
+    h.tm_sec = 30;
+    h.tm_min = 31;
+    h.tm_hour = 23;
+    h.tm_mday = 13;
+    h.tm_mon = 1;
+    h.tm_year = 109;
+    h.tm_wday = 5;
+    h.tm_yday = 43;
+    char expect[512];
+    std::strftime(expect, sizeof expect, fmt, &h);
+    CHECK(cstr(b, kOut) == expect);
+    CHECK(t.call("strftime", kOut, 5, kFmtW, tm) == 0); // does not fit
+    // The internals: _Daysto (leap days since 1900 and the month's start), _Gettime's fields.
+    CHECK(i32(t.call("_Daysto", 109, 1)) == 27 + 31);
+    CHECK(i32(t.call("_Daysto", 100, 2)) == 24 + 60);
+    put(b, kA, ":Sun:Sunday:Mon");
+    const u32 field = static_cast<u32>(t.call("_Gettime", kA, 1, kOut));
+    CHECK(field == kA + 5);
+    CHECK(ps_read32(b, kOut) == 6);
+    CHECK(t.call("clock") <= t.call("clock"));
+}
+
+TEST_CASE("sys_libc: the C locale and Dinkumware's conversion internals", "[hle][libc]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    CHECK(cstr(b, static_cast<u32>(t.call("setlocale", 0, 0))) == "C");
+    put(b, kA, "");
+    CHECK(cstr(b, static_cast<u32>(t.call("setlocale", 2, kA))) == "C");
+    put(b, kA, "fr_FR");
+    CHECK(t.call("setlocale", 0, kA) == 0);
+    CHECK(t.call("setlocale", 99, 0) == 0);
+    const u32 lc = static_cast<u32>(t.call("localeconv"));
+    REQUIRE(lc != 0);
+    CHECK(cstr(b, ps_read32(b, lc + 44)) == ".");
+    CHECK(cstr(b, ps_read32(b, lc)).empty());
+    CHECK(b[lc + 28] == 0x7F);
+    // The class and case tables, entry 0 at the pointer, EOF before it.
+    const u32 ct = static_cast<u32>(t.call("_Getpctype"));
+    REQUIRE(ct != 0);
+    CHECK((ps_read16(b, ct + 2 * 'a') & 0x10) != 0);   // _LO
+    CHECK((ps_read16(b, ct + 2 * '7') & 0x20) != 0);   // _DI
+    CHECK((ps_read16(b, ct + 2 * '\t') & 0x400) != 0); // _XB: isblank
+    CHECK(ps_read16(b, ct - 2) == 0);                  // EOF
+    CHECK(ps_read16(b, ct + 2 * 0xE9) == 0);
+    const u32 lo = static_cast<u32>(t.call("_Getptolower"));
+    CHECK(ps_read16(b, lo + 2 * 'Q') == 'q');
+    CHECK(static_cast<s16>(ps_read16(b, lo - 2)) == -1);
+    CHECK(ps_read16(b, static_cast<u32>(t.call("_Getptoupper")) + 2 * 'q') == 'Q');
+    const u32 nl = ps_read32(b, HleProcess::current()->link_variable("sys_libc", recomp::nid_of("__ctype_ptr")));
+    CHECK(b[nl + 'G'] == 001);           // _U
+    CHECK(b[nl + 'A'] == (001 | 0100)); // _U | _X
+    CHECK(b[nl + ' '] == (010 | 0200));
+    // _Stod scales by 10^pten with one rounding; the x forms report range errors in *perr.
+    put(b, kA, "1.5xyz");
+    t.call("_Stod", kA, kOut, 2);
+    CHECK(t.ctx.fpr[1] == 150.0);
+    CHECK(ps_read32(b, kOut) == kA + 3);
+    put(b, kA, "2e3");
+    t.call("_Stod", kA, 0, static_cast<u64>(-1));
+    CHECK(t.ctx.fpr[1] == 200.0);
+    put(b, kA, "0.1");
+    t.call("_Stod", kA, 0, 1);
+    CHECK(t.ctx.fpr[1] == 1.0);
+    put(b, kA, "1e999");
+    t.call("_Stodx", kA, 0, 0, kOut);
+    CHECK(std::isinf(t.ctx.fpr[1]));
+    CHECK(ps_read32(b, kOut) == 1);
+    put(b, kA, "99999999999");
+    CHECK(i32(t.call("_Stolx", kA, 0, 10, kOut)) == INT_MAX);
+    CHECK(ps_read32(b, kOut) == 1);
+    CHECK(t.call("_Stoull", kA, 0, 10) == 99999999999ull);
+    // _Strerror: the message, in the caller's buffer.
+    CHECK(t.call("_Strerror", 0x80010006u, kOut) == kOut);
+    CHECK(cstr(b, kOut) == "no such file or directory");
+    put(b, kA, "abc");
+    put(b, kB, "abd");
+    CHECK(i32(t.call("_Strcollx", kA, kB, 0)) == -1);
 }

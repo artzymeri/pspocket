@@ -6102,3 +6102,30 @@ Part 4 of D-511 (runtime/hle/src/sys_libc_stdio.cpp), under sys_libc and sys_lib
 - Fixed on the way: guest_strnlen with a limit of "no limit" (the %s of printf without a precision) overflowed its end
   address and claimed a string of 2^64 bytes.
 Tests: tests/hle/test_libc_stdio.cpp (streams on mounted host directories, the TTY, the string forms, POSIX).
+
+## D-515 · 2026-10-08 · The C library, part 5a: time, the "C" locale's tables, Dinkumware's conversions
+
+Part 5a of D-511 (runtime/hle/src/sys_libc_time.cpp), under sys_libc and sys_libm.
+- time.h: time_t is 64 bits (the SDK's CellFsStat and CellFsUtimbuf hold it in 64-bit fields) from 1970, lv2's clock.
+  Local time adds lv2's time zone and summer offsets (sys_time_get_timezone, minutes east of UTC); tm_isdst is 1 while
+  the summer offset is not 0. gmtime, localtime, mktime (normalizing, tm_isdst > 0 the summer offset, < 0 lv2's
+  current choice), asctime (C99's algorithm) and ctime in the thread's block, difftime, strftime and wcsftime (C99's
+  conversions in the "C" locale, the host's strftime as the test's reference; %Z empty: no zone names), clock in
+  microseconds from its first call (POSIX's CLOCKS_PER_SEC; the SDK's value is not known).
+- Plauger's time internals with his semantics: _Daysto (leap days since 1900 and the month's first day), _Ttotm,
+  _Isdst (lv2's summer time), _Gettime (a delimited field and its length).
+- locale.h: setlocale knows the "C" locale only ("C", "POSIX", ""; NULL asks: "C"), categories 0..6; localeconv's
+  struct lconv in Dinkumware's C99 layout (seven monetary strings, fourteen chars at CHAR_MAX, decimal_point "." at
+  +44, then grouping, thousands_sep and Dinkumware's five strings, all "").
+- The ctype tables a header's macros may read: _Ctype, _Tolotab and _Touptab (Dinkumware's 257 shorts from EOF, its
+  C99 class bits, _XB for isblank on tab) with _Getpctype, _Getptolower and _Getptoupper, and newlib's __ctype_ptr
+  (257 chars of its bits). Each variable holds the pointer to entry 0, as Plauger's `const short *_Ctype =
+  &ctyp_tab[1]`, the table after it.
+- Dinkumware's conversion internals: _Stoul, _Stoull, _Stoll and the x forms (_Stolx ... _Stoullx, a range error in
+  *perr), the wide _WStoll, _WStoul, _WStoull; _Stod, _Stof, _Stold (scaled by 10^pten with one rounding: the decimal
+  exponent moved before converting) and their x and wide forms; _Strcollx, _Strxfrmx, _Wcscollx, _Wcsxfrmx,
+  _CStrxfrm, _CWcsxfrm (the "C" locale's code order whatever table they get); _Strerror.
+- Not done (layouts or signatures not known): _Times and _Getptimes, _Gentime, _Getdst, _CStrftime, _Wcsftime, the
+  locale objects (_Locale, _Clocale, _Loctab, _Defloc, _Findloc, _Getloc, _Makeloc, _Setloc and their kin), _Stoflt,
+  _Stopfx, _Stoxflt and their wide forms (Dinkumware's digit-array parsing steps).
+Tests: tests/hle/test_libc.cpp, two cases more.

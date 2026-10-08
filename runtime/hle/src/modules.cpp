@@ -58,6 +58,7 @@ void register_sys_libc(Registry& r);
 void register_sys_libc_wide(Registry& r);
 void register_sys_libc_malloc(Registry& r);
 void register_sys_libc_stdio(Registry& r);
+void register_sys_libc_time(Registry& r);
 void register_cellFont(Registry& r);
 void register_cellFontFT(Registry& r);
 void register_cell_FreeType2(Registry& r);
@@ -146,6 +147,7 @@ void register_all_modules(Registry& r)
     register_sys_libc_wide(r);
     register_sys_libc_malloc(r);
     register_sys_libc_stdio(r);
+    register_sys_libc_time(r);
     register_cellFont(r);
     register_cellFontFT(r);
     register_cell_FreeType2(r);
