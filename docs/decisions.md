@@ -5967,3 +5967,18 @@ test_spurs_compare.cpp): cellSpudllHandleConfigSetDefaultValues (every field 0 b
 cellSpudllGetImageSize (an ELF32 big-endian ET_DYN SPU object with 32-byte program headers, at most four loadable
 segments and a dynamic one at a non-zero address; its span from the lowest loadable address, which starts at 0x40000,
 plus the tables of referred and depended-on objects, each part rounded up to 128 bytes; INVAL otherwise).
+
+## D-509 · 2026-10-08 · cellSpurs: SPU sharing, the same as libsre
+
+Five functions for SPURS instances that share their SPUs with the system, read from libsre (4.92) and compared with it
+(tests/hle/test_spurs_compare.cpp, 88 calls the same):
+- cellSpursInitializeForSpuSharing: libsre's initialize with revision and SDK version 0 and flags exitIfNoWork |
+  0x80000000 | 0x2 (RPCS3's SAF_UNKNOWN_FLAG_0 and _30, SPU thread group types there); kept in CellSpurs::flags, a
+  native SPURS having no SPU thread group. Compared on its refusals only (libsre's initialize would start its SPURS
+  kernel inside the test).
+- 0x5C3A614C and 0xB55782F9, attribute setters no SDK names (cellSpurs_<NID>): the first sets 0x80000000 (and 0x2),
+  refused (STAT) when the second's 0x00800000 or 0x01000000 is set; the second wants one SPU (PERM) and sets
+  0x00800000 or 0x01000000, 0x00400000, and 0x2.
+- 0xBAC24478 and 0x7025A5EC: PERM unless those flags are set, then lv2 system calls 248 and 249 on the instance's SPU
+  thread group, root-only calls RPCS3 does not name; their EAGAIN and EBUSY become INVAL and STAT, the rest is lv2's
+  answer (pspocket's lv2 answers both with CELL_OK and a warning, as RPCS3's null_func).

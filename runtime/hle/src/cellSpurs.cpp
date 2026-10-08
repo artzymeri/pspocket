@@ -621,6 +621,93 @@ s32 cellSpurs_E279681F(PPUContext& ctx, u32 spurs, u32 out)
     return lv2::CELL_OK;
 }
 
+// cellSpursInitializeForSpuSharing(spurs, nSpus, spuPriority, ppuPriority, exitIfNoWork, a, b), as libsre (0x8328;
+// RPCS3 has none): libsre's initialize with revision and SDK version 0 and the flags exitIfNoWork | 0x80000000 with
+// `a` | 0x2 with `b` (RPCS3's SAF_UNKNOWN_FLAG_0 and _30, which choose the system's SPU thread group types there). A
+// native SPURS has no SPU thread group: the flags are kept in CellSpurs::flags, as libsre keeps them.
+s32 cellSpursInitializeForSpuSharing(PPUContext& ctx, u32 spurs, s32 nspus, s32 spu_priority, s32 ppu_priority,
+    u32 exit_if_no_work, u32 a, u32 b)
+{
+    u32 flags = exit_if_no_work;
+    if (a) flags |= 0x80000000u;
+    if (b) flags |= 0x2;
+    return initialize(ctx, spurs, 0, 0, nspus, spu_priority, ppu_priority, flags, 0, 0, 0);
+}
+
+// cellSpurs 0x5C3A614C (libsre 0x714C), an attribute setter no SDK names: NULL, the attribute's 8-byte ALIGN, STAT
+// when SPU sharing (flag 0x00800000 or 0x01000000, 0xB55782F9) is set; then flag 0x80000000, and 0x2 with `b`.
+s32 cellSpurs_5C3A614C(PPUContext& ctx, u32 attr, u32 b)
+{
+    if (!attr) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpurs_5C3A614C", "attribute", attr, attr_off::size, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    const u32 flags = ps_read32(base, attr + attr_off::flags);
+    if (flags & (0x00800000u | 0x01000000u)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    ps_write32(base, attr + attr_off::flags, flags | 0x80000000u | (b ? 0x2u : 0u));
+    return lv2::CELL_OK;
+}
+
+// cellSpurs 0xB55782F9 (libsre 0x728C), another: NULL, ALIGN, PERM for more than one SPU, STAT with flag 0x80000000
+// (0x5C3A614C); then flag 0x00800000 with `a` (else 0x01000000), 0x00400000 with `b`, and 0x2.
+s32 cellSpurs_B55782F9(PPUContext& ctx, u32 attr, u32 a, u32 b)
+{
+    if (!attr) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (attr % 8) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, "cellSpurs_B55782F9", "attribute", attr, attr_off::size, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, attr + attr_off::nSpus) > 1) return error(CELL_SPURS_CORE_ERROR_PERM);
+    u32 flags = ps_read32(base, attr + attr_off::flags);
+    if (flags & 0x80000000u) return error(CELL_SPURS_CORE_ERROR_STAT);
+    flags |= a ? 0x00800000u : 0x01000000u;
+    if (b) flags |= 0x00400000u;
+    ps_write32(base, attr + attr_off::flags, flags | 0x2);
+    return lv2::CELL_OK;
+}
+
+// lv2's answer to `number` with these arguments (libsre's `sc`), through the kernel's own dispatcher.
+u64 lv2_syscall(PPUContext& ctx, u32 number, std::initializer_list<u64> args)
+{
+    u32 i = 0;
+    for (const u64 a : args) ctx.gpr[3 + i++] = a;
+    ctx.gpr[11] = number;
+    thread_of(ctx).kernel.syscall(ctx);
+    return ctx.gpr[3];
+}
+
+// cellSpurs 0xBAC24478 (libsre 0x108A8) and 0x7025A5EC (0x10970), which no SDK names: NULL, ALIGN, PERM unless the
+// instance shares its SPUs (0x00800000 or 0x01000000); then lv2 system calls 248 and 249 on its SPU thread group, two
+// calls RPCS3 does not name either (root only). Their EAGAIN becomes INVAL, their EBUSY STAT, anything else is
+// returned as it is: here lv2's own answer.
+s32 cellSpurs_BAC24478(PPUContext& ctx, u32 spurs, u32 a, u32 b, u32 c, u32 d)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (!(ps_read32(base, spurs + spurs_off::flags) & (0x00800000u | 0x01000000u))) return error(CELL_SPURS_CORE_ERROR_PERM);
+    const u32 rc = static_cast<u32>(lv2_syscall(ctx, 248, {ps_read32(base, spurs + spurs_off::spuTG), a, b, c, d}));
+    if (rc == 0x80010002) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    if (rc == 0x8001000F) return error(CELL_SPURS_CORE_ERROR_STAT);
+    return static_cast<s32>(rc);
+}
+
+s32 cellSpurs_7025A5EC(PPUContext& ctx, u32 spurs)
+{
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    u8* base = guest_base(ctx);
+    if (!(ps_read32(base, spurs + spurs_off::flags) & (0x00800000u | 0x01000000u))) return error(CELL_SPURS_CORE_ERROR_PERM);
+    const u32 rc = static_cast<u32>(lv2_syscall(ctx, 249, {ps_read32(base, spurs + spurs_off::spuTG)}));
+    if (rc == 0x8001000F) return error(CELL_SPURS_CORE_ERROR_STAT);
+    return static_cast<s32>(rc);
+}
+
 // cellSpursInitializeWithAttribute and ...WithAttribute2, as RPCS3 (libsre agrees): NULL, ALIGN (8), a revision above
 // 2 (INVAL); then initialize with the attribute's values, its flags with exitIfNoWork's and, for the second,
 // SAF_SECOND_VERSION: a SPURS2 instance of 32 workloads (8 KB).
@@ -4078,6 +4165,11 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xA121A224, cellSpursTaskAttributeSetExitCodeContainer),
         PS_HLE_FUNC(0x34552FA6, cellSpursTaskExitCodeInitialize),
         PS_HLE_FUNC(0x97A2F6C8, cellSpursJobHeaderSetJobbin2Param),
+        PS_HLE_FUNC(0x90C82BFC, cellSpursInitializeForSpuSharing),
+        PS_HLE_FUNC(0x5C3A614C, cellSpurs_5C3A614C),
+        PS_HLE_FUNC(0xB55782F9, cellSpurs_B55782F9),
+        PS_HLE_FUNC(0xBAC24478, cellSpurs_BAC24478),
+        PS_HLE_FUNC(0x7025A5EC, cellSpurs_7025A5EC),
         PS_HLE_FUNC(0x60EB2DEC, cellSpursCreateJobChain),
         PS_HLE_FUNC(0xBFEA60FA, cellSpursKickJobChain),
         PS_HLE_FUNC(0x86C864A2, cellSpursGetJobChainId),

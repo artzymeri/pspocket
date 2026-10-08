@@ -563,3 +563,49 @@ TEST_CASE("cellSpudll against libsre (D-508)", "[hle][lle][spurs]")
     }
     CHECK(differ == 0);
 }
+
+TEST_CASE("cellSpurs' SPU sharing functions against libsre (D-509)", "[hle][lle][spurs]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    FirmwareLibrary sony(f, t, *flash, "cellSpurs", false);
+    std::vector<Call> calls;
+    const u32 attr = kArea + 0x1000;
+    for (const u32 flags : {0u, 0x00800000u, 0x01000000u, 0x80000000u, 0x80000002u, 0x00400001u})
+        for (const u32 nspus : {1u, 2u}) {
+            const auto setup = [=](u8* b) {
+                for (u32 i = 0; i < 0x200; i += 4) ps_write32(b, attr + i, 0x11111111u * (i / 4 % 7));
+                ps_write32(b, attr + 0x8, nspus);
+                ps_write32(b, attr + 0x28, flags);
+            };
+            const std::string what = std::format("flags {:#x} nSpus {}", flags, nspus);
+            for (const u32 x : {0u, 1u}) {
+                calls.push_back({"cellSpurs_5C3A614C", {attr, x}, setup, what});
+                for (const u32 y : {0u, 1u}) calls.push_back({"cellSpurs_B55782F9", {attr, x, y}, setup, what});
+            }
+        }
+    for (const u32 a : {0u, attr + 4}) {
+        calls.push_back({"cellSpurs_5C3A614C", {a, 1}, nullptr, std::format("attr {:#x}", a)});
+        calls.push_back({"cellSpurs_B55782F9", {a, 1, 1}, nullptr, std::format("attr {:#x}", a)});
+    }
+    // The root system calls' wrappers: refused without SPU sharing; with it, lv2 answers both sides alike.
+    for (const u32 flags : {0u, 0x00800000u, 0x01000000u}) {
+        const auto setup = [flags](u8* b) {
+            std::memset(b + kSpurs, 0, 0x1000);
+            ps_write32(b, kSpurs + 0xD80, flags);
+            ps_write32(b, kSpurs + 0xD30, 0x12345);
+        };
+        calls.push_back({"cellSpurs_BAC24478", {kSpurs, 1, 2, 3, 4}, setup, std::format("flags {:#x}", flags)});
+        calls.push_back({"cellSpurs_7025A5EC", {kSpurs}, setup, std::format("flags {:#x}", flags)});
+    }
+    for (const u32 sp : {0u, kSpurs + 0x40}) {
+        calls.push_back({"cellSpurs_BAC24478", {sp, 1, 2, 3, 4}, nullptr, "bad spurs"});
+        calls.push_back({"cellSpurs_7025A5EC", {sp}, nullptr, "bad spurs"});
+    }
+    // cellSpursInitializeForSpuSharing's refusals (a successful one would start libsre's SPURS kernel here).
+    calls.push_back({"cellSpursInitializeForSpuSharing", {0, 1, 100, 1000, 0, 1, 1}, nullptr, "NULL"});
+    calls.push_back({"cellSpursInitializeForSpuSharing", {kSpurs + 0x40, 1, 100, 1000, 0, 1, 1}, nullptr, "misaligned"});
+    compare(t, sony, calls);
+}
