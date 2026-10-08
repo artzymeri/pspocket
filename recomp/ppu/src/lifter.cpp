@@ -11,6 +11,8 @@
 #include <format>
 #include <set>
 #include <fstream>
+#include <map>
+#include <optional>
 #include <sstream>
 
 #include "pspocket/ppu/decoder.hpp"
@@ -1032,7 +1034,42 @@ std::string comment(u32 pc, const Inst& in)
 
 std::string signature(const std::string& symbol) { return std::format("void {}(PPUContext* PS_RESTRICT ctx, uint8_t* base)", symbol); }
 
-std::string emit_function(const CodeImage& image, const Program& prog, const Function& fn, const LiftOptions& opt, LiftStats& stats)
+// A continuation (D-255): an address in a function where execution resumes after a non-local jump.
+struct Continuation {
+    u32 addr = 0;
+};
+
+std::string continuation_symbol(std::string_view prefix, u32 addr) { return std::format("{}c_{:08X}", prefix, addr); }
+
+// Whether a function's prologue makes a frame of its own the ABI way: `stdu r1,-N(r1)`, which also stores the back
+// chain (its r1 at entry) at the new r1, and the return address saved in the caller's slot (`mflr r0`, then
+// `std r0,16(r1)` before it or `std r0,N+16(r1)` after it). A resume inside such a function (after a call: its prologue
+// done, its epilogue not begun) then finds its r1 at entry as the word at r1, however its body moved r1 since (an
+// alloca's `stdux` keeps the back chain too), and its return address 16 bytes above that: what its returns check.
+bool abi_frame(const CodeImage& image, const Function& f)
+{
+    const auto field = [](u32 raw, u32 at) { return (raw >> at) & 31; };
+    const auto ds = [](u32 raw) { return static_cast<s32>(static_cast<s16>(raw & 0xFFFC)); };
+    std::optional<u32> frame;
+    bool mflr = false, lr_saved = false;
+    for (u32 pc = f.entry, k = 0; k < 32 && !(frame && lr_saved); pc += 4, k++) { // the prologue, in a straight line
+        const auto word = image.read32(pc);
+        if (!word) break;
+        const u32 raw = *word, op = raw >> 26;
+        if (raw == 0x7C0802A6u) mflr = true; // mflr r0
+        if (op == 62 && (raw & 3) == 0 && field(raw, 21) == 0 && field(raw, 16) == 1 && mflr) // std r0,ds(r1)
+            lr_saved |= frame ? ds(raw) == static_cast<s32>(*frame) + 16 : ds(raw) == 16;
+        if (op == 62 && (raw & 3) == 1 && field(raw, 21) == 1 && field(raw, 16) == 1) { // stdu r1,ds(r1)
+            if (frame || ds(raw) >= 0) return false;
+            frame = static_cast<u32>(-ds(raw));
+        }
+        if (op == 16 || op == 18 || op == 19) break; // control flow ends the straight line
+    }
+    return frame && lr_saved;
+}
+
+std::string emit_function(const CodeImage& image, const Program& prog, const Function& fn, const LiftOptions& opt,
+    LiftStats& stats, const std::vector<Continuation>& conts = {})
 {
     Gen g;
     g.image = &image;
@@ -1060,7 +1097,8 @@ std::string emit_function(const CodeImage& image, const Program& prog, const Fun
     for (usize i = 0; i < fn.insns.size(); i++) {
         const u32 pc = fn.insns[i];
         const Inst& in = insts[i];
-        if (fn.labels.contains(pc) || (pc == fn.entry && !entry_first)) body += std::format("L_{:08X}: ;\n", pc);
+        const bool resume_here = std::any_of(conts.begin(), conts.end(), [&](const Continuation& c) { return c.addr == pc; });
+        if (fn.labels.contains(pc) || resume_here || (pc == fn.entry && !entry_first)) body += std::format("L_{:08X}: ;\n", pc);
         if (opt.comments) body += comment(pc, in);
         emit_instruction(g, pc, in, body);
         stats.instructions++;
@@ -1091,14 +1129,39 @@ std::string emit_function(const CodeImage& image, const Program& prog, const Fun
                                 "(uint32_t)ctr & ~3u, entry_lr, entry_sp); return;\n    }}\n", cases, g.spill);
     }
 
-    std::string o = std::format("{}\n{{\n", signature(function_symbol(opt.prefix, fn.entry)));
+    stats.functions++;
+    if (conts.empty()) {
+        std::string o = std::format("{}\n{{\n", signature(function_symbol(opt.prefix, fn.entry)));
+        o += "    base = (uint8_t*)__builtin_assume_aligned(base, PS_PPU_BASE_ALIGN);\n";
+        o += declarations(g);
+        if (g.uses_entry_state) o += "    const uint64_t entry_lr = ctx->lr, entry_sp = ctx->gpr[1];\n";
+        if (g.uses_table_dispatch) o += "    uint32_t jt_site = 0;\n";
+        o += body;
+        o += "}\n\n";
+        return o;
+    }
+    // With continuations (D-255): the body takes where it resumes (0: at its entry), the function and each continuation
+    // call it. Every register it uses is loaded from ctx at its top, so a resume is a jump to the label after that;
+    // its r1 and return address at entry come from its frame's back chain (abi_frame), for the returns' check.
+    const std::string body_symbol = std::format("{}b_{:08X}", opt.prefix, fn.entry);
+    std::string o = std::format("static inline __attribute__((always_inline)) void {}(PPUContext* PS_RESTRICT ctx, "
+                                "uint8_t* base, uint32_t resume)\n{{\n", body_symbol);
     o += "    base = (uint8_t*)__builtin_assume_aligned(base, PS_PPU_BASE_ALIGN);\n";
     o += declarations(g);
-    if (g.uses_entry_state) o += "    const uint64_t entry_lr = ctx->lr, entry_sp = ctx->gpr[1];\n";
+    o += "    const uint64_t entry_sp = resume ? ps_read64(base, (uint32_t)ctx->gpr[1]) : ctx->gpr[1];\n";
+    o += "    const uint64_t entry_lr = resume ? ps_read64(base, (uint32_t)(entry_sp + 16u)) : ctx->lr;\n";
+    o += "    (void)entry_lr; (void)entry_sp;\n";
     if (g.uses_table_dispatch) o += "    uint32_t jt_site = 0;\n";
+    o += "    switch (resume) {\n";
+    for (const Continuation& c : conts) o += std::format("    case {}: goto L_{:08X};\n", hex32(c.addr), c.addr);
+    o += "    default: break;\n    }\n";
     o += body;
-    o += "}\n\n";
-    stats.functions++;
+    o += "}\n";
+    o += std::format("{} {{ {}(ctx, base, 0u); }}\n", signature(function_symbol(opt.prefix, fn.entry)), body_symbol);
+    for (const Continuation& c : conts)
+        o += std::format("{} {{ {}(ctx, base, {}); }}\n", signature(continuation_symbol(opt.prefix, c.addr)), body_symbol,
+            hex32(c.addr));
+    o += "\n";
     return o;
 }
 
@@ -1136,11 +1199,40 @@ LiftResult lift(const CodeImage& image, const Program& program, const LiftOption
     const std::string& name = options.name;
     const u32 tus = std::max(1u, options.tu_count);
 
+    // Continuations (D-255): a function that holds each and makes its frame the ABI way (an address can lie in
+    // several: the analyzer also makes functions that start inside others).
+    std::map<u32, std::vector<Continuation>> conts; // by function entry
+    std::vector<u32> cont_addrs;
+    if (!options.continuations.empty()) {
+        std::map<u32, std::vector<const Function*>> owners;
+        for (const Function& f : program.functions)
+            for (u32 pc : f.insns)
+                if (options.continuations.contains(pc)) owners[pc].push_back(&f);
+        for (u32 c : options.continuations) {
+            const Function* owner = nullptr;
+            if (const auto it = owners.find(c); it != owners.end())
+                for (const Function* f : it->second)
+                    if (abi_frame(image, *f)) {
+                        owner = f;
+                        break;
+                    }
+            if (!owner) {
+                result.stats.continuations_refused++;
+                continue;
+            }
+            conts[owner->entry].push_back({c});
+            cont_addrs.push_back(c);
+            result.stats.continuations++;
+        }
+    }
+    const std::vector<Continuation> no_conts;
+
     // Header
     {
         std::string h(kBanner);
         h += std::format("#ifndef {0}_H\n#define {0}_H\n\n#include \"pspocket/ppu/lifted.h\"\n\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n\n", name);
         for (const Function& f : program.functions) h += signature(function_symbol(options.prefix, f.entry)) + ";\n";
+        for (u32 c : cont_addrs) h += signature(continuation_symbol(options.prefix, c)) + ";\n";
         h += std::format("\n/* Registers / unregisters every function above in the dispatch table (ps_ppu_dispatch_*). */\n"
                          "void {0}_register(void);\nvoid {0}_unregister(void);\nextern const uint32_t {0}_function_count;\n"
                          "/* (address, word) pairs of the image the functions were translated from, at a sample of their entries:\n"
@@ -1162,7 +1254,8 @@ LiftResult lift(const CodeImage& image, const Program& program, const LiftOption
             unit++;
             in_unit = 0;
         }
-        units[unit] += emit_function(image, program, f, options, result.stats);
+        const auto cit = conts.find(f.entry);
+        units[unit] += emit_function(image, program, f, options, result.stats, cit == conts.end() ? no_conts : cit->second);
         in_unit += f.insns.size();
     }
     // Each unit declares only the functions it names (D-251): including the header's prototype of every function of
@@ -1210,12 +1303,15 @@ LiftResult lift(const CodeImage& image, const Program& program, const LiftOption
         if (words.empty()) r += "    0u, 0u,\n";
         r += "};\n\n";
         if (n) {
-            r += std::format("static const ps_ppu_dispatch_entry {}_entries[{}] = {{\n", name, n);
+            // The functions, then the continuations (D-255): a jump that lands at one goes on in translated code.
+            const usize entries = n + cont_addrs.size();
+            r += std::format("static const ps_ppu_dispatch_entry {}_entries[{}] = {{\n", name, entries);
             for (const Function& f : program.functions) r += std::format("    {{{}, {}}},\n", hex32(f.entry), function_symbol(options.prefix, f.entry));
+            for (u32 c : cont_addrs) r += std::format("    {{{}, {}}},\n", hex32(c), continuation_symbol(options.prefix, c));
             r += "};\n\n";
-            r += std::format("void {0}_register(void) {{ ps_ppu_dispatch_register_table({0}_entries, {1}u); }}\n\n", name, n);
+            r += std::format("void {0}_register(void) {{ ps_ppu_dispatch_register_table({0}_entries, {1}u); }}\n\n", name, entries);
             r += std::format("void {0}_unregister(void)\n{{\n    for (uint32_t i = 0; i < {1}u; i++) ps_ppu_dispatch_unregister({0}_entries[i].addr);\n}}\n",
-                name, n);
+                name, entries);
         } else {
             r += std::format("void {0}_register(void) {{}}\nvoid {0}_unregister(void) {{}}\n", name);
         }

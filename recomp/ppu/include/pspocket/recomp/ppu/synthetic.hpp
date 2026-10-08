@@ -20,6 +20,7 @@ struct Program {
     std::vector<Seed> seeds;          // functions to lift (with TOC)
     std::map<std::string, u32> symbols; // functions and data labels
     u32 toc = 0;                      // r2 the code expects (0 when unused)
+    std::vector<u32> continuations;   // where a non-local jump lands, for the lifter (D-255)
 
     u32 symbol(const std::string& name) const { return symbols.at(name); }
     CodeImage image() const { return CodeImage(base, bytes); }

@@ -16,6 +16,7 @@
 #include "pspocket/codegen/toolchain.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/game/host.hpp"
+#include "pspocket/ppu/interpreter.hpp"
 #include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/hash.hpp"
 #include "pspocket/recomp/ppu/executable.hpp"
@@ -125,7 +126,7 @@ double thermal_slowdown(int thermal)
 }
 
 bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why,
-    const std::string& spu_images_dir)
+    const std::string& spu_images_dir, const std::string& ppu_landings)
 {
     Manifest m;
     std::error_code ec;
@@ -163,6 +164,15 @@ bool library_is_current(const std::string& game_dir, const std::string& executab
                 say("the game has met SPU programs to translate: updating it");
                 return false;
             }
+    }
+    if (!ppu_landings.empty()) { // places the PPU interpreter ran code: rewritten only when one is new (D-255)
+        const auto made = fs::last_write_time(fs::path(game_dir) / "manifest.json", ec);
+        std::error_code lec;
+        const auto saved = fs::last_write_time(ppu_landings, lec);
+        if (!ec && !lec && saved > made) {
+            say("the game ran PPU code its library can now go on translated: updating it");
+            return false;
+        }
     }
     say(m.translator_hash == std::format("{:016x}", ps_game_translator_hash)
             ? "ready"
@@ -242,16 +252,23 @@ Result prepare_game(const Options& o)
         lift.name = "game_ppu";
         lift.prefix = "game_ppu_";
         lift.comments = false;
+        usize continuations_refused = 0;
         lift.tu_count = static_cast<u32>(std::max<size_t>(1, instructions / 12000)); // GTA V: 6.1 M in 512 units
+        if (!o.ppu_landings.empty()) // where earlier sessions interpreted: continuations (D-255)
+            for (u32 a : ppu::read_landings(o.ppu_landings)) lift.continuations.insert(a);
         std::string error;
         {
             recomp::ppu::LiftResult lifted = recomp::ppu::lift(loaded->image, program, lift);
+            continuations_refused = lifted.stats.continuations_refused;
             if (!recomp::ppu::write_files(ppu.string(), lifted.files, error))
                 return fail("cannot write the translation: " + error);
         }
         r.translate_seconds = since(t1);
         PS_LOG_INFO(kChan, "{}: {}; {} functions, {} instructions in {} units, translated in {:.1f} s", o.title_id,
             loaded->summary, program.functions.size(), instructions, lift.tu_count, r.translate_seconds);
+        if (!lift.continuations.empty())
+            PS_LOG_INFO(kChan, "{}: {} continuations from {}, {} refused (D-255)", o.title_id,
+                lift.continuations.size() - continuations_refused, o.ppu_landings, continuations_refused);
     }
     if (cancelled()) return fail("cancelled");
 

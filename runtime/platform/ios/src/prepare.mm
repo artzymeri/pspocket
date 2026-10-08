@@ -208,7 +208,8 @@ extern "C" int ps_prepare_check(const char* game_dir, const char* executable, ch
     std::string reason = "the executable cannot be read";
     // The title is the game folder's name (Application Support/pspocket-games/<TITLE_ID>).
     const std::string spu = coverage_dir(fs::path(game_dir).filename().string()) + "/spu";
-    bool ok = !sha.empty() && pspocket::prepare::library_is_current(game_dir, sha, &reason, spu);
+    const std::string landings = coverage_dir(fs::path(game_dir).filename().string()) + "/ppu-landings.txt"; // D-255
+    bool ok = !sha.empty() && pspocket::prepare::library_is_current(game_dir, sha, &reason, spu, landings);
     // And its own PRX modules: on its disc (D-239) and saved while it ran (D-238).
     if (ok)
         ok = pspocket::prepare::game_modules_are_current((fs::path(game_dir) / "modules").string(), sha,
@@ -253,6 +254,7 @@ extern "C" int ps_prepare_start(const char* executable, const char* title_id, co
     const std::string coverage = coverage_dir(title_id);
     o.spu_images_dir = coverage + "/spu";
     o.spu_logs = {coverage + "/spu-misses.log"};
+    o.ppu_landings = coverage + "/ppu-landings.txt"; // where it interpreted PPU code: continuations (D-255)
     o.spu_elf_dirs = {(fs::path(game_dir) / "disc-spu").string()}; // the disc's own (D-239)
     // Every core; compiles start while their predicted peaks fit in half of what iOS lets the app have now.
     o.workers = std::max(1u, std::thread::hardware_concurrency());

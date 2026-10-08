@@ -828,18 +828,20 @@ void run_guest(Kernel& k, PPUContext& ctx, u8* base, u32 entry, bool thread_top)
         k.config().executor(k.config().executor_user, ctx, base, entry);
         return;
     }
-    // The context the jump restored is in ctx: it continues at LR. Interpreted (translated callees still run as
-    // such) until the code returns where this call would have; a further jump in translated code lands here again.
+    // The context the jump restored is in ctx: it continues at LR, in the landing's continuation when the game's
+    // preparation translated one (D-255), else interpreted (translated callees still run as such), until the code
+    // returns where this call would have; a further jump in translated code lands here again.
     static std::atomic<u32> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
         PS_LOG_INFO(kChan, "a non-local jump (longjmp or a fiber switch) to {:#010x}, r1 {:#x}: interpreting from there "
-                           "(D-161)", static_cast<u32>(ctx.lr), ctx.gpr[1]);
+                           "(D-161), or in its continuation (D-255)", static_cast<u32>(ctx.lr), ctx.gpr[1]);
     ppu::RunOptions options;
     options.stop_at_return = true;
     options.stop_lr = stop_lr;
     options.stop_sp = stop_sp;
     options.stop_any_sp = thread_top;
     options.call_lifted = true;
+    options.lifted_first = true; // the landing's continuation, when it was translated (D-255)
     for (;;) {
         ctx.cia = static_cast<u32>(ctx.lr) & ~3u;
         if (_setjmp(target.buf) == 0) {

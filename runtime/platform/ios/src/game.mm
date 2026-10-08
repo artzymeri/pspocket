@@ -54,6 +54,7 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/platform/audio_output.hpp"
 #include "pspocket/platform/ios.h"
+#include "pspocket/ppu/interpreter.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/rsx/metal/metal_backend.hpp"
 #include "pspocket/rsx/write_tracker.hpp"
@@ -172,8 +173,14 @@ void watch_for_freezes(Session* s)
         u64 seen = 0;
         auto since = std::chrono::steady_clock::now();
         bool reported = false;
+        u32 ticks = 0;
         while (s->running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
+            // Every minute: where the PPU interpreter ran code, for the next preparation's continuations (D-255).
+            if (++ticks % 30 == 0 && !s->coverage.empty()) {
+                if (const u32 added = ppu::save_landings(s->coverage + "/ppu-landings.txt"))
+                    PS_LOG_INFO(kChan, "{} new PPU landings saved: the next preparation translates them (D-255)", added);
+            }
             const u64 flips = s->flips.load(std::memory_order_relaxed);
             const auto now = std::chrono::steady_clock::now();
             if (flips != seen) {

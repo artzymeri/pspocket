@@ -8,6 +8,7 @@
 //   N_0.c ...     the lifted functions, options.tu_count translation units
 //   N_reg.c       the dispatch-table registration unit
 
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +24,11 @@ struct LiftOptions {
     std::string prefix;              // prefix of the lifted function symbols: <prefix>f_XXXXXXXX
     u32 tu_count = 1;
     bool comments = true;            // "address: word  disassembly" before every instruction
+    // Addresses inside functions where execution resumes after a non-local jump (a setjmp's return, D-255): each gets
+    // an entry of its own (<prefix>c_XXXXXXXX, in the dispatch table) that goes on in its function's translated code.
+    // One the lifter cannot give an entry (no function holds it, or its function's frame is not a plain prologue)
+    // is counted in LiftStats::continuations_refused.
+    std::set<u32> continuations;
 };
 
 struct OutputFile {
@@ -38,6 +44,8 @@ struct LiftStats {
     usize indirect_jumps = 0; // bctr without a recognised table
     usize illegal = 0;
     usize entry_not_first = 0; // functions whose entry is above code they branch back into
+    usize continuations = 0;          // entries made for LiftOptions::continuations
+    usize continuations_refused = 0;  // and those that could not be made
 };
 
 struct LiftResult {

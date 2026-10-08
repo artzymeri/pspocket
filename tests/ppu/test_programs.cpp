@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <string>
 #include <vector>
 
 #include "ppu_progs.h"
@@ -122,9 +124,12 @@ Run run(Mode mode, u32 entry, PPUContext ctx, const std::vector<u8>& data)
             opt.stop_lr = kSentinel;
             opt.stop_sp = sp;
             opt.call_lifted = true;
+            opt.lifted_first = true; // as the kernel resumes a non-local jump
             ctx.cia = static_cast<u32>(ctx.lr) & ~3u;
-            REQUIRE(ppu::run(ctx, e.base, opt).reason == StopReason::Returned);
-            r.lifted_calls = 1; // marks the resume for the test
+            const RunResult res = ppu::run(ctx, e.base, opt);
+            REQUIRE(res.reason == StopReason::Returned);
+            r.steps = res.steps;                      // instructions interpreted after the jump
+            r.lifted_calls = 1 + res.lifted_calls;    // the resume, then what the interpreter called
         }
     } else {
         RunOptions opt;
@@ -569,11 +574,38 @@ TEST_CASE("setjmp/longjmp: translated code goes on at the setjmp's return in the
     PPUContext c = start_context(1400);
     c.gpr[3] = 100;
     const Run lifted = run(Mode::Lifted, env().sym("jmp_test"), c, std::vector<u8>(256, 0));
-    CHECK(lifted.lifted_calls == 1); // the longjmp's return was caught and the interpreter went on
+    // The longjmp's return was caught, and the jump's landing (jmp_set's return in jmp_test) went on in translated
+    // code: its continuation (D-255), no instruction interpreted.
+    CHECK(lifted.lifted_calls == 2);
+    CHECK(lifted.steps == 0);
+    CHECK(lifted.ctx.gpr[3] == 107);
     const Run r = both(env().sym("jmp_test"), c);
     CHECK(r.ctx.gpr[3] == 107);      // x + 7, with x from the r31 the jump restored
     CHECK(r.ctx.gpr[1] == kStackTop);
     CHECK(g_syscall_count == 0);     // no guest syscall: the marker never reaches the guest's handler
+}
+
+TEST_CASE("setjmp/longjmp: a landing without a continuation is noted for the next preparation, with the return "
+          "sites above it (D-255)")
+{
+    Hooks hooks;
+    PPUContext c = start_context(1410);
+    c.gpr[3] = 100;
+    const Run lifted = run(Mode::Lifted, env().sym("jmp_wrap"), c, std::vector<u8>(256, 0));
+    CHECK(lifted.steps > 0); // interpreted from the landing
+    CHECK(lifted.ctx.gpr[3] == 108);
+    CHECK(lifted.ctx.gpr[1] == kStackTop);
+    const std::string path = (std::filesystem::temp_directory_path() / "pspocket-test-landings.txt").string();
+    std::filesystem::remove(path);
+    CHECK(ppu::save_landings(path) >= 2);
+    const std::vector<u32> landings = ppu::read_landings(path);
+    const auto has = [&](u32 a) { return std::find(landings.begin(), landings.end(), a) != landings.end(); };
+    CHECK(has(env().sym("jmp_mid.set_returned"))); // where the jump landed
+    CHECK(has(env().sym("jmp_wrap.mid_returned"))); // where the interpreter returned to, one frame up
+    CHECK(!has(kSentinel));                          // not where the run stopped
+    CHECK(ppu::save_landings(path) == 0);            // nothing new: the file stays as it is
+    CHECK(ppu::read_landings(path) == landings);
+    std::filesystem::remove(path);
 }
 
 TEST_CASE("rarer control flow: conditional bcctr, blrl, conditional bcl, bdzlr, trap resume, fall-through")

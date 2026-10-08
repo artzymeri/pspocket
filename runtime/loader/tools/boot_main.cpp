@@ -50,6 +50,8 @@
 // executable it was made from only; a library made for another runtime or executable stops the run. With
 // --builtin-spu the SPU programs built into this program run too, registered first (the app's way, D-155); without it
 // the library runs alone.
+// --ppu-landings FILE merges where the PPU interpreter ran guest code (a fiber switch's landing, an indirect jump's
+// unknown target) into FILE at exit: pspocket-prepare --ppu-continuations FILE translates them (D-255).
 // --prx-dump DIR saves each of the game's own PRX modules that has no translation (D-238): pspocket-prepare --modules
 // DIR translates them. --modules-library DIR loads the game's modules library (default: "modules" beside
 // --game-library's file): its modules go to their slots and run translated; none: not even looked for.
@@ -131,6 +133,7 @@
 #include "pspocket/rsx/write_tracker.hpp"
 #endif
 #include "pspocket/ppu/disasm.hpp"
+#include "pspocket/ppu/interpreter.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/rsx/rsx.hpp"
 #include "pspocket/spu/disasm.hpp"
@@ -153,7 +156,7 @@ int usage()
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
         "                     [--async-shaders MS] [--watch ADDR] [--system-library DIR|none]\n"
-        "                     [--spu-translate DIR] [--prx-dump DIR] [--modules-library DIR|none]\n"
+        "                     [--spu-translate DIR] [--prx-dump DIR] [--modules-library DIR|none] [--ppu-landings FILE]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n"
         "       pspocket-boot --hle-list\n");
     return 64;
@@ -851,6 +854,7 @@ int main(int argc, char** argv)
     std::string game_library; // --game-library (D-152)
     std::string spu_translate; // --spu-translate (D-236)
     std::string prx_dump, modules_library; // --prx-dump, --modules-library (D-238)
+    std::string ppu_landings;              // --ppu-landings (D-255)
     std::string system_dir;   // --system-library DIR|none (D-178); empty: beside --flash
     [[maybe_unused]] bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the
                                                // app's way); only a build with them uses it
@@ -960,6 +964,7 @@ int main(int argc, char** argv)
         else if (a == "--game-library") { const char* v = value(); if (!v) return usage(); game_library = v; }
         else if (a == "--spu-translate") { const char* v = value(); if (!v) return usage(); spu_translate = v; }
         else if (a == "--prx-dump") { const char* v = value(); if (!v) return usage(); prx_dump = v; }
+        else if (a == "--ppu-landings") { const char* v = value(); if (!v) return usage(); ppu_landings = v; }
         else if (a == "--modules-library") { const char* v = value(); if (!v) return usage(); modules_library = v; }
         else if (a == "--system-library") { const char* v = value(); if (!v) return usage(); system_dir = v; }
         else if (a == "--builtin-spu") builtin_spu = true;
@@ -1499,6 +1504,10 @@ int main(int argc, char** argv)
             for (const auto& [who, steps] : by_owner) line += std::format("{}{} {}", line.empty() ? "" : ", ", who, steps);
             std::printf("PPU interpreted by owner: %s\n", line.c_str());
         }
+    }
+    if (!ppu_landings.empty()) {
+        const u32 added = ppu::save_landings(ppu_landings);
+        std::printf("PPU landings: %u new in %s (D-255)\n", added, ppu_landings.c_str());
     }
     for (u32 mb = 0; mb < (PS_MEM_RSX_LOCAL_SIZE >> 20); mb++) {
         const u64 got = ps_spu_video_dma(mb, 0), put = ps_spu_video_dma(mb, 1);

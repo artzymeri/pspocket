@@ -96,6 +96,7 @@ int main(int argc, char** argv)
         else if (a == "--ppu") o.ppu_dir = v;
         else if (a == "--spu") o.spu_dir = v;
         else if (a == "--spu-images") o.spu_images_dir = v;
+        else if (a == "--ppu-continuations") o.ppu_landings = v; // pspocket-boot --ppu-landings (D-255)
         else if (a == "--spu-log") o.spu_logs.emplace_back(v);
         else if (a == "-j") o.workers = static_cast<unsigned>(std::max(1, std::atoi(v)));
         else if (a == "--memory") o.memory_mb = std::atof(v);

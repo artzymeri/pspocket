@@ -34,6 +34,13 @@ public:
 
     void data(const std::string& name) { a.bind(L(name)); }
 
+    // A place a non-local jump lands (a setjmp's return), given to the lifter as a continuation (D-255).
+    void continuation(const std::string& name)
+    {
+        a.bind(L(name));
+        continuations_.push_back(name);
+    }
+
     Program finish(u32 toc)
     {
         Program p;
@@ -42,6 +49,7 @@ public:
         p.bytes = a.finish();
         for (const auto& [name, label] : labels_)
             if (a.is_bound(label)) p.symbols[name] = a.address(label);
+        for (const std::string& name : continuations_) p.continuations.push_back(p.symbols.at(name));
         for (const auto& [name, seed] : functions_) {
             if (!seed) continue;
             Seed s;
@@ -58,6 +66,7 @@ public:
 private:
     std::map<std::string, Label> labels_;
     std::vector<std::pair<std::string, bool>> functions_;
+    std::vector<std::string> continuations_;
 };
 
 // Standard frame helpers (PPC64 ELF ABI: LR saved at 16(r1) of the caller's frame).
@@ -639,6 +648,7 @@ Program build_test_programs(u32 base)
         a.emit(mr(31, 3));
         a.emit(addi(3, 1, 112));
         a.bl(B.L("jmp_set"));
+        B.continuation("jmp_test.set_returned"); // where jmp_long lands: translated as a continuation (D-255)
         a.emit(cmpwi(0, 3, 0));
         a.bne(0, after);
         a.emit(addi(3, 1, 112));
@@ -652,6 +662,44 @@ Program build_test_programs(u32 base)
         a.emit(mtlr(0));
         a.emit(blr());
     }
+
+    // A landing without a continuation (D-255): the interpreter runs it and the frame above, and notes the return it
+    // makes into jmp_wrap (no translated code there either) for the next preparation.
+    B.func("jmp_mid"); // (x): as jmp_test
+    {
+        const Label after = a.new_label();
+        a.emit(mflr(0));
+        a.emit(std_(0, 16, 1));
+        a.emit(std_(31, -8, 1));
+        a.emit(stdu(1, -160, 1));
+        a.emit(mr(31, 3));
+        a.emit(addi(3, 1, 112));
+        a.bl(B.L("jmp_set"));
+        B.data("jmp_mid.set_returned");
+        a.emit(cmpwi(0, 3, 0));
+        a.bne(0, after);
+        a.emit(addi(3, 1, 112));
+        a.emit(li(4, 3));
+        a.bl(B.L("jmp_deep"));
+        a.bind(after);
+        a.emit(add(3, 3, 31));
+        a.emit(addi(1, 1, 160));
+        a.emit(ld(0, 16, 1));
+        a.emit(ld(31, -8, 1));
+        a.emit(mtlr(0));
+        a.emit(blr());
+    }
+    B.func("jmp_wrap"); // (x): jmp_mid(x) + 1
+    a.emit(mflr(0));
+    a.emit(std_(0, 16, 1));
+    a.emit(stdu(1, -112, 1));
+    a.bl(B.L("jmp_mid"));
+    B.data("jmp_wrap.mid_returned");
+    a.emit(addi(3, 3, 1));
+    a.emit(addi(1, 1, 112));
+    a.emit(ld(0, 16, 1));
+    a.emit(mtlr(0));
+    a.emit(blr());
 
     B.func("tail_calls"); // x + 5 == 10 ? add_one(x + 5) : times_three(x + 5)
     a.emit(addi(3, 3, 5));

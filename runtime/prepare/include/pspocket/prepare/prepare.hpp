@@ -52,6 +52,9 @@ struct Options {
     // Folders of SPU ELFs from the disc (disc::save_disc_modules, D-239): translated as the executable's are (D-226).
     std::vector<std::string> spu_elf_dirs;
     bool discover_spu = true;          // also lift SPU code only registers reach (recomp::spu discover, D-155)
+    // Where the PPU interpreter ran code in earlier sessions (ppu::save_landings: pspocket-boot --ppu-landings, the app
+    // while the game runs): translated as continuations (D-255), so a fiber switch's landing goes on translated.
+    std::string ppu_landings;
     Toolchain toolchain;
     unsigned workers = 0;     // 0: one per core
     double memory_mb = 0;     // compiles start while their predicted peaks fit; 0: no limit
@@ -125,9 +128,10 @@ std::array<double, 3> prior_rates(const Manifest* own, const Manifest* last, int
 // Whether game_dir holds a library this build can load for this executable: made for this runtime (ABI hash), for
 // this CPU, from an executable with this SHA-256. A different translator hash leaves it usable (`*why` says a newer
 // translation exists).
-// With spu_images_dir, also whether the game saved SPU images since the library was made (programs to add to it).
+// With spu_images_dir, also whether the game saved SPU images since the library was made (programs to add to it); with
+// ppu_landings, whether new places the PPU interpreter ran code were saved since (continuations to add, D-255).
 bool library_is_current(const std::string& game_dir, const std::string& executable_sha256, std::string* why,
-    const std::string& spu_images_dir = {});
+    const std::string& spu_images_dir = {}, const std::string& ppu_landings = {});
 
 // The SHA-256 of a file, in hex ("" if it cannot be read).
 std::string file_sha256(const std::string& path);

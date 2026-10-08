@@ -60,7 +60,9 @@ add_custom_command(
     OUTPUT ${progs_sources}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${progs_dir}
     COMMAND ppu-progs-gen --bin ${progs_dir}/progs.bin --seeds ${progs_dir}/progs.seeds
+            --continuations ${progs_dir}/progs.continuations
     COMMAND ppu-lift --image ${progs_dir}/progs.bin --base 0x00100000 --seeds-file ${progs_dir}/progs.seeds
+            --continuations-file ${progs_dir}/progs.continuations
             --out ${progs_dir} --tu ${progs_tus} --name ppu_progs --prefix ppu_progs_ --quiet
     DEPENDS ppu-progs-gen ppu-lift
     COMMENT "Lifting the PPU test programs"

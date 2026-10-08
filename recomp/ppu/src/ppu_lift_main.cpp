@@ -37,7 +37,7 @@ void usage()
     std::fprintf(stderr,
         "usage: ppu-lift --elf FILE | --image FILE --base ADDR [--seed ADDR[:TOC] ...] [--seeds-file FILE]\n"
         "                [--toc ADDR] [--opd ADDR:SIZE] --out DIR [--tu N] [--name NAME] [--prefix PREFIX]\n"
-        "                [--no-comments] [--strict] [--quiet]\n");
+        "                [--continuation ADDR ...] [--continuations-file FILE] [--no-comments] [--strict] [--quiet]\n");
 }
 
 bool read_file(const std::string& path, std::vector<u8>& out)
@@ -104,6 +104,16 @@ int main(int argc, char** argv)
                 return 2;
             }
             opd_areas.emplace_back(area->addr, *area->toc);
+        } else if (arg == "--continuation") {
+            lift_options.continuations.insert(address(value())); // D-255: a setjmp's return, say
+        } else if (arg == "--continuations-file") {
+            std::string error;
+            const auto more = read_seeds_file(value(), error); // the seeds file's shape: ADDR [name] per line
+            if (!more) {
+                std::fprintf(stderr, "ppu-lift: %s\n", error.c_str());
+                return 2;
+            }
+            for (const Seed& c : *more) lift_options.continuations.insert(c.addr);
         } else if (arg == "--toc") analyzer_options.toc = address(value());
         else if (arg == "--out") out_dir = value();
         else if (arg == "--tu") lift_options.tu_count = static_cast<u32>(std::stoul(value()));
@@ -175,6 +185,9 @@ int main(int argc, char** argv)
                     "tables, %zu indirect jumps, %zu fallbacks, %zu illegal -> %s (%zu files)\n",
             s.functions, s.entry_not_first, s.instructions, s.jump_tables, s.indirect_jumps, s.fallbacks, s.illegal,
             out_dir.c_str(), lifted.files.size());
+        if (s.continuations || s.continuations_refused)
+            std::printf("ppu-lift: %zu continuations (D-255), %zu refused (no function holds it, or its frame is not a "
+                        "plain prologue)\n", s.continuations, s.continuations_refused);
         for (const Diagnostic& d : program.warnings)
             std::printf("warning: %08x: %s\n", d.addr, d.message.c_str());
     }

@@ -14,7 +14,13 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <set>
+#include <string>
 #include <vector>
 
 #include "pspocket/core/be.h"
@@ -912,6 +918,23 @@ Site* site_for(u32 pc)
     return nullptr; // the table is full here: not counted
 }
 
+// Return sites an interpreted blr went to that had no translated code (D-255): the frames above a non-local jump's
+// landing, which a run climbs back through. Each becomes a continuation with the landing, so one session finds the
+// whole chain instead of one frame per preparation.
+constexpr u32 kReturnSites = 1024;
+std::atomic<u32> g_return_sites[kReturnSites]; // 0: free
+
+void note_return_site(u32 pc)
+{
+    if (pc == 0) return;
+    u32 h = (pc >> 2) * 0x9E3779B1u % kReturnSites;
+    for (u32 probe = 0; probe < 32; probe++, h = (h + 1) % kReturnSites) {
+        u32 current = g_return_sites[h].load(std::memory_order_relaxed);
+        if (current == pc) return;
+        if (current == 0 && (g_return_sites[h].compare_exchange_strong(current, pc) || current == pc)) return;
+    }
+}
+
 } // namespace
 
 RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
@@ -921,7 +944,22 @@ RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
     auto at_stop = [&] {
         return opt.stop_at_return && ctx.cia == stop_pc && (opt.stop_any_sp || ctx.gpr[1] == opt.stop_sp);
     };
-    Site* const site = site_for(ctx.cia);
+    // Interop: lifted code where execution stands runs as such. Lifted code returns like the guest's blr, so execution
+    // continues at LR afterwards (also correct for tail calls and local branches to an entry). Checked after every
+    // taken branch, and first of all when asked: a non-local jump lands where a continuation (D-255) may be.
+    const auto run_lifted = [&] {
+        while (!at_stop()) {
+            const ps_ppu_fn fn = ps_ppu_dispatch_find(ctx.cia);
+            if (!fn) break;
+            const u32 callee = ctx.cia;
+            fn(&ctx, base);
+            res.lifted_calls++;
+            ctx.cia = static_cast<u32>(ctx.lr) & ~3u;
+            if (ctx.cia == 0 && !at_stop()) t_zero_branch_from = callee; // it came back with LR 0
+        }
+    };
+    if (opt.call_lifted && opt.lifted_first) run_lifted();
+    Site* const site = at_stop() ? nullptr : site_for(ctx.cia);
     if (site) site->entries.fetch_add(1, std::memory_order_relaxed);
     const auto count_rest = [&] {
         if (site) site->steps.fetch_add(res.steps % kFlushSteps, std::memory_order_relaxed);
@@ -944,20 +982,55 @@ RunResult run(PPUContext& ctx, u8* base, const RunOptions& opt)
         res.steps++;
         if (res.steps % kFlushSteps == 0 && site) site->steps.fetch_add(kFlushSteps, std::memory_order_relaxed);
 
-        // Interop: a branch that lands on a lifted function runs it. Lifted code returns like the guest's blr, so
-        // execution continues at LR afterwards (also correct for tail calls and local branches to an entry).
         if (opt.call_lifted && branch) {
-            while (!at_stop()) {
-                const ps_ppu_fn fn = ps_ppu_dispatch_find(ctx.cia);
-                if (!fn) break;
-                const u32 callee = ctx.cia;
-                fn(&ctx, base);
-                res.lifted_calls++;
-                ctx.cia = static_cast<u32>(ctx.lr) & ~3u;
-                if (ctx.cia == 0 && !at_stop()) t_zero_branch_from = callee; // it came back with LR 0
-            }
+            run_lifted(); // a branch that lands on lifted code runs it
+            // A return the interpreter makes into code that has no translation, not where this run stops.
+            if (inst.op == Op::BCLR && !at_stop() && !ps_ppu_dispatch_find(ctx.cia)) note_return_site(ctx.cia);
         }
     }
+}
+
+std::vector<u32> read_landings(const std::string& path)
+{
+    std::vector<u32> out;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        const usize start = line.find_first_not_of(" \t");
+        if (start == std::string::npos || line[start] == '#') continue;
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(line.c_str() + start, &end, 0);
+        if (end != line.c_str() + start && v <= 0xFFFFFFFFul) out.push_back(static_cast<u32>(v));
+    }
+    return out;
+}
+
+u32 save_landings(const std::string& path)
+{
+    std::vector<u32> known = read_landings(path);
+    std::set<u32> all(known.begin(), known.end());
+    u32 added = 0;
+    for (const auto& s : g_sites) {
+        const u32 pc = s.pc.load(std::memory_order_relaxed);
+        if (pc == ~0u || s.steps.load(std::memory_order_relaxed) == 0) continue;
+        added += all.insert(pc).second ? 1 : 0;
+    }
+    for (const auto& r : g_return_sites) {
+        const u32 pc = r.load(std::memory_order_relaxed);
+        if (pc != 0) added += all.insert(pc).second ? 1 : 0;
+    }
+    if (!added) return 0;
+    std::string text = "# PPU code the interpreter ran (pspocket D-255): continuations for the next preparation\n";
+    for (u32 a : all) text += std::format("{:#010x}\n", a);
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        out << text;
+        if (!out) return 0;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    return ec ? 0 : added;
 }
 
 std::vector<Form> supported_forms()
