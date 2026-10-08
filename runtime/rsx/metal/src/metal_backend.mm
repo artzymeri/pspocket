@@ -763,6 +763,40 @@ std::vector<u32> convert_primitive(Primitive p, u32 count, MTLPrimitiveType& typ
     return out;
 }
 
+// Index list (positions from `first`) for a range whose indices include the restart index at `restarts` (positions in
+// the range, ascending), as RPCS3 uploads them (Emu/RSX/Common/BufferUtils.cpp upload_untouched,
+// expand_indexed_triangle_fan, expand_indexed_quads): strips restart at Metal's own restart index (0xFFFFFFFF, always
+// on for strips); points, lines and triangles drop the restart indices and go on; fans, polygons, quads, quad strips
+// and line loops start again after each one. Empty: nothing to draw.
+std::vector<u32> restart_list(Primitive p, u32 first, u32 count, const std::vector<u32>& restarts, MTLPrimitiveType& type)
+{
+    std::vector<u32> out;
+    if (native_primitive(p, type)) {
+        const bool strip = type == MTLPrimitiveTypeTriangleStrip || type == MTLPrimitiveTypeLineStrip;
+        usize next = 0;
+        for (u32 k = 0; k < count; k++) {
+            if (next < restarts.size() && restarts[next] == k) {
+                next++;
+                if (strip) out.push_back(0xFFFFFFFFu);
+                continue;
+            }
+            out.push_back(first + k);
+        }
+        return out;
+    }
+    u32 start = 0;
+    const auto segment = [&](u32 end) {
+        if (end <= start) return;
+        for (u32 v : convert_primitive(p, end - start, type)) out.push_back(first + start + v);
+    };
+    for (u32 r : restarts) {
+        segment(r);
+        start = r + 1;
+    }
+    segment(count);
+    return out;
+}
+
 } // namespace
 
 void MetalBackend::Impl::do_draw(const RsxState& state)
@@ -974,11 +1008,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     vs.restart_enable = raster.restart_index_enable;
     vs.branch_bits = state.transform_branch_bits(); // BRB and CLB (D-113)
     vs.restart_index = raster.restart_index;
-    if (raster.restart_index_enable && d.command == DrawCommand::Indexed) unsupported("primitive restart is not implemented");
 
     // ---- vertex and index data: raw guest bytes, decoded by the vertex shader (vertex pulling) ----
     std::vector<Range> ranges;
     std::vector<u32> index_offsets; // per range, for pulled indices
+    std::vector<std::vector<u32>> restarts; // per indexed range: where its restart indices are (D-249)
     TransientAllocator::Allocation vertex_data{}, index_data{};
     u32 min_vi = ~0u, max_vi = 0;
     const u32 inputs = vp->shader.input_mask & state.vertex_attrib_input_mask();
@@ -1001,6 +1035,9 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     case DrawCommand::Indexed: {
         const IndexArrayInfo ia = state.index_array();
         const u32 isize = ia.u16_indices ? 2 : 4;
+        // The restart index is compared with the index as stored, before the base index (RPCS3 upload_untouched); a
+        // 16-bit index never equals one above 0xFFFF.
+        const bool restart_on = raster.restart_index_enable && (isize == 4 || raster.restart_index <= 0xffff);
         vs.index_mode = ia.u16_indices ? shader::kIndexU16BE : shader::kIndexU32BE;
         u32 total = 0;
         for (const DrawRange& r : d.ranges) total += r.count * isize;
@@ -1013,12 +1050,18 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             before_access(*ea, bytes, false); // a deferred copy to it lands first (D-107)
             u8* dst = index_data.data + at;
             std::memcpy(dst, mem.host(*ea), bytes);
+            std::vector<u32> at_restart;
             for (u32 i = 0; i < r.count; i++) {
                 const u32 raw = isize == 2 ? ps_ld16(dst + i * 2) : ps_ld32(dst + i * 4);
+                if (restart_on && raw == raster.restart_index) {
+                    at_restart.push_back(i); // not a vertex: it must not widen the vertex range
+                    continue;
+                }
                 const u32 vi = (raw + vs.base_index) & 0xfffff;
                 min_vi = std::min(min_vi, vi);
                 max_vi = std::max(max_vi, vi);
             }
+            restarts.push_back(std::move(at_restart));
             ranges.push_back({r.first, r.count});
             index_offsets.push_back(index_data.offset + at - r.first * isize); // wraps; so does the shader
             at += bytes;
@@ -1245,14 +1288,20 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (r < index_offsets.size()) vs.index_offset = index_offsets[r];
         [enc setVertexBytes:&vs length:sizeof(vs) atIndex:shader::slot::kVsParams];
         const Range rg = ranges[r];
-        if (native) {
+        const bool restart = r < restarts.size() && !restarts[r].empty();
+        if (native && !restart) {
             [enc drawPrimitives:ptype vertexStart:rg.first vertexCount:rg.count];
             continue;
         }
         MTLPrimitiveType ctype = MTLPrimitiveTypeTriangle;
-        std::vector<u32> list = convert_primitive(d.primitive, rg.count, ctype);
+        std::vector<u32> list;
+        if (restart) {
+            list = restart_list(d.primitive, rg.first, rg.count, restarts[r], ctype); // positions, restarts (D-249)
+        } else {
+            list = convert_primitive(d.primitive, rg.count, ctype);
+            for (u32& v : list) v += rg.first; // vertex_id = position in the range, as for native draws
+        }
         if (list.empty()) continue;
-        for (u32& v : list) v += rg.first; // vertex_id = position in the range, as for native draws
         auto ib = transient.alloc(static_cast<u32>(list.size() * 4), 16);
         std::memcpy(ib.data, list.data(), list.size() * 4);
         [enc drawIndexedPrimitives:ctype indexCount:list.size() indexType:MTLIndexTypeUInt32 indexBuffer:ib.buffer

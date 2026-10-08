@@ -122,6 +122,11 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Seen (gate):** the GPU spends 24-26 ms of a frame in play on the M4 with 84 render passes a frame; on the iPhone
   20-27 ms (run 096). **Try:** count what ends each pass (a target change, a copy, a readback, a clear) in a frame and
   merge the ones Metal can keep open (a tile-based GPU pays each pass's loads and stores).
+  **Counted (runs 243, 245):** of the passes a target change ends, 84% go to other colour targets, 14% keep the colour
+  targets with another depth buffer, 2% are a draw without depth after one with it. Corner copies are all of a target
+  the same pass draws to (D-248, not kept). What is left to merge is small; the cost per pass is the lever: load and
+  store actions that skip what the next pass does not read (needs knowing the next use, a frame later at the
+  earliest), and memoryless depth where a depth buffer is never sampled nor reloaded.
 
 - **Seen (runs 121-125):** in Assassin's Creed's crowd (2,000 draws a frame) the RSX thread is the busiest thread.
   D-210 and D-211 took it from 13.0 to about 11.3 µs per draw (decodes gone, vertex data copied once, no write

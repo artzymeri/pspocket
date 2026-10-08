@@ -5306,6 +5306,18 @@ the broadcast did (103 and 244 samples of pthread_cond_broadcast against 109 and
 frame stayed the same: 0.103 and 0.102 s (old) against 0.106 and 0.101 (new), the main SPU threads 0.058 against 0.060
 and 0.058 s. Not kept (rule 8): the condition variables stay.
 
+## D-246 · 2026-10-08 · An lv2 event flag set without allocations: measured, not kept; its test stays
+
+sys_event_flag_set (and the SPU's sys_event_flag_set_bit, which GTA V's SPURS jobs use to tell PPU threads that work
+is done) copies the flag's waiters into a new vector and gathers the satisfied ones in another, under the lock every
+setter and waiter of that flag takes: 1.0 to 1.3% of the SPU threads' samples in GTA V's walk, mostly with nobody
+waiting. The try: a set with no waiter only ORs the bits; otherwise the order on the stack for up to 16 waiters.
+
+- Measured (runs 248-257, GTA V's walk on an idle Mac, three binaries alternating, two to four runs each): CPU per
+  frame 0.0761, 0.0709, 0.0620, 0.0666 s without it and 0.0646, 0.0658, 0.0681, 0.0730 with it (with D-248 and D-249);
+  the run-to-run spread (8%) is larger than anything it could save. Not kept (rule 8).
+- Kept: tests/lv2/test_event.cpp, one set waking twenty waiters in FIFO and in priority order, each seeing the pattern
+  the clears before it left, and a twenty-first left waiting until cancelled.
 ## D-247 · 2026-10-08 · A stop as one more way out of translated SPU code: measured, not kept; its tests stay
 
 D-216 counts a stop (and stopd) as reading and writing every register: a function with one anywhere in its call tree
@@ -5332,6 +5344,37 @@ ps_spu_stop_handler (a handler that lets the code go on must not use ctx->gpr).
 
 What the call boundaries still cost (entry loads, calls, exit stores: 18% of translated SPU time) needs registers
 passed in host registers between translated functions, not fewer stores: docs/improve.md.
+## D-248 · 2026-10-08 · Corner copies made when the pass that drew the target ends: measured, not kept
+
+A texture smaller than the target at its address samples the target's top-left corner through a copy, made again
+after each write to the target (D-120, D-148). The copy is made when a draw binds the texture, which ends that draw's
+render pass (a blit cannot run inside one): 4 to 6 passes a frame in one stretch of GTA V's walk. The try: when a pass
+ends, the corners of its colour targets sampled in this frame or the last are copied again at once, so a later draw
+finds them current. Its synthetic test showed the pass kept.
+
+- GTA V did not change (corner copies 0.54 to 0.67 a frame either way, runs 248-257): logged, every one of its stale
+  corners is the top-left 256x128 of a 512x256 target that the same pass is drawing to (a downsampling chain that
+  draws one part of the target while sampling another). The copy must hold what that pass drew so far, so it cannot be
+  made earlier; avoiding the break would take drawing those parts into separate textures. Not kept, test included.
+## D-249 · 2026-10-08 · Primitive restart in indexed draws
+
+NV4097_SET_RESTART_INDEX_ENABLE and _INDEX were read into the state and passed to the vertex shader, which never used
+them: an indexed draw with restart on was logged as unimplemented, the restart index was read as a vertex (stray
+triangles through vertex 0xFFFF's garbage, or through whatever vertex the restart value names), and it widened the
+vertex range copied for the draw (a 16-bit 0xFFFF restart copied 65,536 vertices' data). Many PS3 games draw triangle
+strips with restart; GTA V does not (the gate has never logged it).
+
+- The index scan that finds the draw's vertex range now also notes where the restart index is (compared with the index
+  as stored, before the base index; a 16-bit index never equals one above 0xFFFF: RPCS3 BufferUtils.cpp
+  upload_untouched), and leaves those out of the range.
+- Indices are read by the vertex shader (vertex pulling), so a range with restarts is drawn through a small index
+  buffer of positions, as RPCS3 uploads it: strips get Metal's own restart index (0xFFFFFFFF, always on for strips)
+  where the game's was; points, lines and triangles drop the restart indices and go on (RPCS3's skip); fans, polygons,
+  quads, quad strips and line loops start again after each one (expand_indexed_triangle_fan, expand_indexed_quads).
+  Ranges without a restart index draw as before.
+- Test: tests/rsx/test_metal.mm draws two quads as one 16-bit strip with a restart between them, the restart index 8 (a
+  real vertex, placed so that read as one it would draw across the middle) and 0xFFFF: both quads, nothing between;
+  with restart off, the strip goes through vertex 8. With restart ignored, the test fails.
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

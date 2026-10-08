@@ -284,6 +284,50 @@ TEST_CASE("lv2 event flag: set satisfies waiters in protocol order, applying eac
     CHECK(results[second] == 0b11);
 }
 
+TEST_CASE("lv2 event flag: one set wakes twenty waiters in protocol order, each seeing the pattern its turn left (D-246)",
+    "[lv2][event_flag]")
+{
+    // More waiters than set() keeps on its stack, and one it leaves queued.
+    const auto protocol = GENERATE(SYS_SYNC_FIFO, SYS_SYNC_PRIORITY);
+    Fixture f;
+    Caller c(*f.kernel, "main");
+    const u32 e = make_flag(f, c, 0, protocol);
+    constexpr int kWaiters = 21;
+    std::atomic<int> done[kWaiters] = {};
+    u64 results[kWaiters] = {};
+    std::vector<std::thread> pool;
+    for (int i = 0; i < kWaiters; i++) {
+        pool.emplace_back([&, i] {
+            Caller me(*f.kernel, "waiter", 1000 - i); // the later, the higher the priority
+            const u32 res = f.alloc(8);
+            const s32 r = me.call(kFlagWait, e, u64{1} << i, SYS_EVENT_FLAG_WAIT_OR | SYS_EVENT_FLAG_WAIT_CLEAR, res, 0);
+            results[i] = f.r64(res);
+            done[i] = r == CELL_OK ? 1 : 2;
+        });
+        REQUIRE(eventually([&] { return queued<EventFlag>(*f.kernel, e) == static_cast<usize>(i + 1); }));
+    }
+    constexpr u64 kAll = (u64{1} << (kWaiters - 1)) - 1; // every bit but the last waiter's
+    REQUIRE(c.call(kFlagSet, e, kAll) == CELL_OK);
+    REQUIRE(eventually([&] {
+        for (int i = 0; i < kWaiters - 1; i++)
+            if (!done[i].load()) return false;
+        return true;
+    }));
+    CHECK(queued<EventFlag>(*f.kernel, e) == 1);
+    for (int i = 0; i < kWaiters - 1; i++) {
+        INFO("waiter " << i);
+        CHECK(done[i].load() == 1);
+        // FIFO tests waiter 0 first; priority the last one first. Each clears its own bit before the next is tested.
+        const u64 seen = protocol == SYS_SYNC_FIFO ? kAll & ~((u64{1} << i) - 1) : kAll & ((u64{1} << (i + 1)) - 1);
+        CHECK(results[i] == seen);
+    }
+    const u32 n = f.alloc(4);
+    REQUIRE(c.call(kFlagCancel, e, n) == CELL_OK);
+    CHECK(f.r32(n) == 1);
+    for (auto& t : pool) t.join();
+    CHECK(done[kWaiters - 1].load() == 2);
+}
+
 TEST_CASE("lv2 event flag: single-waiter flags, timeouts, cancel, destroy", "[lv2][event_flag]")
 {
     Fixture f;

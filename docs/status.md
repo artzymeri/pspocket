@@ -203,6 +203,15 @@ its disc (or saved the first time it loads them), translated at fixed slots at t
 game's "modules library", and run translated once their code is checked; synthetic tests only, as neither local game
 has one (run 220). Next: speed for the iPhone's heavy scenes (a fresh GTA V profile under load).
 
+**GTA V's frame, profiled again (runs 221-245, 2026-10-08).** The RSX thread is the busiest single thread; fragment
+programs found by content (D-240), the host clock in one multiply and idle sleeps by a Mach trap (D-241), texture
+layouts kept and the FIFO translation inline (D-242), write notifications only for watched lines (D-243): the RSX
+thread 1.69 to 1.55 CPU s per 5 s, the main SPU threads 8.8 to 8.3 under load. The kernel calls the firmware's own
+modules make were counted (scripts/firmware-syscalls.py): the six a game can reach through them answered (D-244). Two
+SPU-side tries measured and not kept (D-245 waiters on the line's word, D-247 stops as ways out). Where the SPU time
+goes now: the EDGE geometry job is 35% of the translated SPU time (shufb, quadword loads and fma inside it); calls
+and function entry and exit 18% across all programs, which only registers passed in host registers would cut.
+
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,
 kernel calls, PPU and SPU instructions translated and fuzz-checked, a checklist per area (each item with its decision)

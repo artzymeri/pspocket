@@ -1076,6 +1076,64 @@ TEST_CASE("metal e2e: back-face culling follows the RSX winding")
     CHECK(run(static_cast<u32>(FrontFace::CW), true));
 }
 
+TEST_CASE("metal e2e: an indexed strip restarts at the restart index, which is no vertex (D-249)")
+{
+    REQUIRE_METAL();
+    // Two quads as one triangle strip, 0 1 2 3 R 4 5 6 7: the left and the right quarter of the target. Vertex 8 is a
+    // point near the top middle: read as a vertex, the restart index would draw triangles across the middle.
+    const auto run = [](u32 restart_index, bool enable) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        const float xy[9][2] = {{-1.f, -1.f}, {-1.f, 1.f}, {-0.5f, -1.f}, {-0.5f, 1.f}, {0.5f, -1.f}, {0.5f, 1.f},
+            {1.f, -1.f}, {1.f, 1.f}, {0.f, 0.9f}};
+        for (u32 v = 0; v < 9; v++) {
+            e.put_local_f(kVertexOffset + v * 16 + 0, xy[v][0]);
+            e.put_local_f(kVertexOffset + v * 16 + 4, xy[v][1]);
+            e.put_local_f(kVertexOffset + v * 16 + 8, 0.5f);
+            e.put_local_f(kVertexOffset + v * 16 + 12, 1.f);
+            e.put_local32(kColorOffset + v * 4, 0xff0000ff);
+        }
+        constexpr u32 kIndexOffset = 0x013000;
+        const u16 indices[9] = {0, 1, 2, 3, static_cast<u16>(restart_index), 4, 5, 6, 7};
+        std::vector<u8> be;
+        for (u16 i : indices) be.insert(be.end(), {static_cast<u8>(i >> 8), static_cast<u8>(i)});
+        e.put_local_bytes(kIndexOffset, be);
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_RESTART_INDEX_ENABLE, enable ? 1u : 0u);
+        b.method(m::NV4097_SET_RESTART_INDEX, restart_index);
+        b.method(m::NV4097_SET_INDEX_ARRAY_ADDRESS, {kIndexOffset, loc::kLocal | (1u << 4)}); // 16-bit indices
+        b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::TriangleStrip));
+        b.method(m::NV4097_DRAW_INDEX_ARRAY, (8u << 24) | 0);
+        b.method(m::NV4097_SET_BEGIN_END, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const auto red = [&](u32 x, u32 y) { return guest_pixel(e, kSurfaceOffset, x, y)[1] == 0xff; };
+        // The quads, and the middle near the top and the bottom rows (the stray triangles' side, whichever way up).
+        return std::array<bool, 4>{red(8, 32) && red(56, 32), red(24, 13) || red(24, 51), red(40, 13) || red(40, 51),
+            red(32, 32)};
+    };
+    for (const u32 restart : {8u, 0xffffu}) {
+        INFO("restart index " << restart);
+        const auto drawn = run(restart, true);
+        CHECK(drawn[0]);       // both quads
+        CHECK_FALSE(drawn[1]); // nothing between them
+        CHECK_FALSE(drawn[2]);
+        CHECK_FALSE(drawn[3]);
+    }
+    // Disabled: index 8 is a vertex, and the strip goes through it.
+    const auto through = run(8, false);
+    CHECK(through[0]);
+    CHECK((through[1] || through[2]));
+}
+
 TEST_CASE("metal e2e: textured draw with a swizzled texture and a channel remap")
 {
     REQUIRE_METAL();
