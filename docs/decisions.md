@@ -5940,3 +5940,21 @@ test_spurs_compare.cpp: 292 calls, every answer and byte the same):
   the upper half of eaBinary, flag 4.
 - cellSpursTaskAttributeSetExitCodeContainer and cellSpursTaskExitCodeInitialize.
 - 0xE279681F, an export no SDK names: the word at CellSpurs + 0x10 (named cellSpurs_E279681F).
+
+## D-507 · 2026-10-08 · cellSheap complete: the queries and the key sheap, the same as libsre
+
+cellSheap had initialize, allocate and free (GTA V's); its other 15 functions are pspocket's own now, read from
+libsre.sprx (4.92) and compared with it (tests/hle/test_sheap_compare.cpp: sequences of allocations, frees, queries and
+every key sheap object, each answer and every byte of the heap, its key table and the handles the same):
+- cellSheapQueryFree and QueryMax: under the heap's lock, the free bytes (a preorder walk that adds each free node's
+  span) and the largest free block (the first free node in level order), each returned as the result itself.
+- cellKeySheapInitialize: a table of 256 keys after the header, then a sheap over the rest. A key's entry is a
+  reference count and the object's block: the first thread to take a key makes the object and publishes it, the others
+  wait for it and share it, the last to let go frees it. The entries are updated through the reservation system, as SPU
+  code sharing the heap updates them.
+- cellKeySheap{Buffer,Mutex,Semaphore,Barrier,Rwm,Queue}{New,Delete}: a buffer of a given size, or a cellSync object
+  (made with the host's cellSync functions, as libsre calls its own) in the heap; a failed make gives the key up and
+  frees the block; SHORTAGE without a block. A failing step of a Delete is a libsre assertion (it prints and ends the
+  process): a fatal log here (D-047).
+- cellSheapInitialize is now libsre's two layers: the public checks, then the internal initialize that takes the area
+  apart from the header (the key sheap puts its table between them).

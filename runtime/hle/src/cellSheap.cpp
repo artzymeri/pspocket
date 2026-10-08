@@ -262,20 +262,11 @@ u64 pow2_at_least(u64 v)
     return sh < 32 ? u64{1} << sh : 0;
 }
 
-// cellSheapInitialize(ea, size, dmaTag), as libsre: ea non-null and 128-byte aligned, 2 KB <= size <= 512 GB (size
-// is a 64-bit argument and is rounded down to 128 bytes), a DMA tag 0..31. The 128-byte header goes at ea, the
-// bitmap after it and the blocks after the bitmap; nothing else in the range is touched. Run 008: GTA V initializes
-// one 512 KB heap with tag 0.
-s32 cellSheapInitialize(PPUContext& ctx, u32 ea, u64 size, u32 dma_tag)
+// libsre's internal initialize (0x53B0): the 128-byte header at `ea`, the bitmap at `area` (128-aligned) and the blocks
+// after the bitmap, over `area_size` bytes (a multiple of 128). The bitmap's size is computed for a tree over the whole
+// area, the tree itself over what the bitmap leaves.
+s32 cellSheapInitializeAt(PPUContext& ctx, u32 ea, u32 area, u64 area_size, u32 dma_tag)
 {
-    PS_LOG_INFO(kChan, "cellSheapInitialize(ea {:#x}, size {:#x}, dmaTag {})", ea, size, dma_tag);
-    if (!ea) return error(CELL_SHEAP_ERROR_INVAL);
-    if (ea % kBlock) return error(CELL_SHEAP_ERROR_ALIGN);
-    if (size < 0x800 || size > (u64{0x80} << 32) || dma_tag > kMaxDmaTag) return error(CELL_SHEAP_ERROR_INVAL);
-    const u64 area_size = (size - kHeaderSize) & ~u64{kBlock - 1};
-    const u32 area = ea + kHeaderSize;
-
-    // The bitmap's size is computed for a tree over the whole area, the tree itself over what the bitmap leaves.
     const u64 units = area_size / kBlock;
     const u64 nodes = units + pow2_at_least(units) - 1;
     if (nodes > 0xFFFFFFFF) return error(CELL_SHEAP_ERROR_INVAL);
@@ -283,9 +274,9 @@ s32 cellSheapInitialize(PPUContext& ctx, u32 ea, u64 size, u32 dma_tag)
     const u64 usable = area_size - bitmap_size;
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    if (!range_committed(t, ea, kHeaderSize + bitmap_size)) {
-        log_call_site(ctx, base, std::format("cellSheapInitialize: the heap header or bitmap at {:#x} ({:#x} bytes) is "
-            "not committed guest memory; refused with CELL_SHEAP_ERROR_INVAL", ea, kHeaderSize + bitmap_size));
+    if (!range_committed(t, ea, kHeaderSize) || !range_committed(t, area, bitmap_size)) {
+        log_call_site(ctx, base, std::format("cellSheapInitialize: the heap header at {:#x} or its bitmap at {:#x} ({:#x} "
+            "bytes) is not committed guest memory; refused with CELL_SHEAP_ERROR_INVAL", ea, area, bitmap_size));
         return error(CELL_SHEAP_ERROR_INVAL);
     }
 
@@ -303,6 +294,19 @@ s32 cellSheapInitialize(PPUContext& ctx, u32 ea, u64 size, u32 dma_tag)
     PS_LOG_INFO(kChan, "heap {:#x}: blocks from {:#x}, {:#x} bytes usable (span {:#x}), bitmap {:#x} bytes", ea,
         area + bitmap_size, usable, span, bitmap_size);
     return lv2::CELL_OK;
+}
+
+// cellSheapInitialize(ea, size, dmaTag), as libsre: ea non-null and 128-byte aligned, 2 KB <= size <= 512 GB (size
+// is a 64-bit argument and is rounded down to 128 bytes), a DMA tag 0..31. The 128-byte header goes at ea, the
+// bitmap after it and the blocks after the bitmap; nothing else in the range is touched. Run 008: GTA V initializes
+// one 512 KB heap with tag 0.
+s32 cellSheapInitialize(PPUContext& ctx, u32 ea, u64 size, u32 dma_tag)
+{
+    PS_LOG_INFO(kChan, "cellSheapInitialize(ea {:#x}, size {:#x}, dmaTag {})", ea, size, dma_tag);
+    if (!ea) return error(CELL_SHEAP_ERROR_INVAL);
+    if (ea % kBlock) return error(CELL_SHEAP_ERROR_ALIGN);
+    if (size < 0x800 || size > (u64{0x80} << 32) || dma_tag > kMaxDmaTag) return error(CELL_SHEAP_ERROR_INVAL);
+    return cellSheapInitializeAt(ctx, ea, ea + kHeaderSize, (size - kHeaderSize) & ~u64{kBlock - 1}, dma_tag);
 }
 
 // cellSheapAllocate(heap, size) -> address, as libsre: 0 when the heap is misaligned, the size is larger than the
@@ -355,6 +359,335 @@ s32 cellSheapFree(PPUContext& ctx, u32 heap, u32 ptr)
     return rc;
 }
 
+// The free space under the tree, as libsre adds it up (0x4940): a preorder walk that descends into split nodes and adds
+// each free node's span; a node past the tree ends the walk.
+u64 tree_free_bytes(const Tree& t, u64 span)
+{
+    u64 free = 0, size = span;
+    u32 i = 1;
+    while (i <= t.count) {
+        const u32 st = t.get(i);
+        if (st == NODE_SPLIT) {
+            i *= 2;
+            size >>= 1;
+            continue;
+        }
+        if (st == NODE_FREE) free += size;
+        while (i & 1) { // up while a right child
+            i >>= 1;
+            size <<= 1;
+        }
+        if (i <= 1) break;
+        i++; // the right sibling
+    }
+    return free;
+}
+
+// The largest free block, as libsre finds it (0x48C4): the first free node in level order, its span (0 for none or an
+// empty tree).
+u64 tree_largest_free(const Tree& t, u64 span)
+{
+    for (u32 i = 1; i <= t.count; i++)
+        if (t.get(i) == NODE_FREE) return span >> (31 - std::countl_zero(i));
+    return 0;
+}
+
+// cellSheapQueryFree(heap) and cellSheapQueryMax(heap), as libsre (0x5334, 0x5910): ALIGN for a misaligned heap, then
+// under the heap's lock the free bytes (or the largest free block), returned as the result itself (its low word).
+s32 cellSheapQueryFree(PPUContext& ctx, u32 heap)
+{
+    if (heap % kBlock) return error(CELL_SHEAP_ERROR_ALIGN);
+    if (!heap_readable(ctx, "cellSheapQueryFree", heap)) return error(CELL_SHEAP_ERROR_INVAL);
+    u8* base = guest_base(ctx);
+    lock_heap(base, heap);
+    const u64 free = tree_free_bytes(tree_of(base, heap), ps_read64(base, heap + heap_off::span));
+    unlock_heap(base, heap);
+    return static_cast<s32>(static_cast<u32>(free));
+}
+
+s32 cellSheapQueryMax(PPUContext& ctx, u32 heap)
+{
+    if (heap % kBlock) return error(CELL_SHEAP_ERROR_ALIGN);
+    if (!heap_readable(ctx, "cellSheapQueryMax", heap)) return error(CELL_SHEAP_ERROR_INVAL);
+    u8* base = guest_base(ctx);
+    lock_heap(base, heap);
+    const u64 max = tree_largest_free(tree_of(base, heap), ps_read64(base, heap + heap_off::span));
+    unlock_heap(base, heap);
+    return static_cast<s32>(static_cast<u32>(max));
+}
+
+// ------------------------------------------------------------------------------------------------- key sheap
+//
+// cellKeySheap (libsre 4.92): a sheap whose first 2 KB after the header are a table of 256 keys, objects that the
+// threads sharing the heap find by key. A key's entry is 8 bytes: a reference count, then the index + 1 of the object's
+// first block (0 while it has none). The first thread to take a key (its count 0 -> 1, no block) makes the object and
+// publishes its block; the others spin until it is there, then share it. The last to let go frees the block. The
+// objects are cellSync's (a mutex, a semaphore word, a barrier, a reader-writer lock, a queue) or a plain buffer.
+// cellKeySheapInitialize keeps the table's address at 0x48 (u64) and its size at 0x50.
+
+constexpr u32 kKeys = 256, kKeyTable = kKeys * 8;
+
+u32 key_entry(u8* base, u32 heap, u32 key) { return static_cast<u32>(ps_read64(base, heap + 0x48)) + key * 8; }
+
+// One of the heap's blocks by its index + 1.
+u32 key_block(u8* base, u32 heap, u32 index1)
+{
+    return static_cast<u32>(((index1 - 1u) << 7) + ps_read64(base, heap + heap_off::first_block));
+}
+
+// libsre's key acquire (0x5D44): ALIGN, INVAL past 255; then the count goes up once the entry is consistent (a block
+// with no count is waited for); `ea` is the object's address, 0 for the first.
+s32 key_acquire(u8* base, u32 heap, u32 key, u32& ea)
+{
+    if (heap % kBlock) return error(CELL_SHEAP_ERROR_ALIGN);
+    if (key >= kKeys) return error(CELL_SHEAP_ERROR_INVAL);
+    const u32 e = key_entry(base, heap, key), line = e & ~(PS_RES_LINE_SIZE - 1), off = e - line;
+    u32 index1 = 0;
+    for (u64 spins = 0;; spins++) {
+        // Through the reservation system: SPU code sharing the heap updates the entry with GETLLAR/PUTLLC.
+        const bool taken = reservation_op(base, line, [&](u8* l) {
+            const u32 count = ps_read32(l, off);
+            index1 = ps_read32(l, off + 4);
+            if (count ? index1 == 0 : index1 != 0) return false; // being made, or being given up: wait
+            ps_write32(l, off, count + 1);
+            return true;
+        });
+        if (taken) break;
+        if (spins == (u64{1} << 22)) PS_LOG_WARN(kChan, "key sheap {:#x}: key {} still being made", heap, key);
+        std::this_thread::yield();
+    }
+    ea = index1 ? key_block(base, heap, index1) : 0;
+    return lv2::CELL_OK;
+}
+
+// libsre's key publish (0x5AD4): ALIGN, INVAL past 255; BUSY unless the caller holds the key (a count) and it has no
+// block yet. `ea` 0 gives the key up (its count to 0, after a failed make); else the block, 128-aligned and inside the
+// heap's blocks (INVAL), is published.
+s32 key_set(u8* base, u32 heap, u32 key, u32 ea)
+{
+    if (heap % kBlock) return error(CELL_SHEAP_ERROR_ALIGN);
+    if (key >= kKeys) return error(CELL_SHEAP_ERROR_INVAL);
+    const u32 e = key_entry(base, heap, key);
+    if (!ps_read32(base, e) || ps_read32(base, e + 4)) return error(CELL_SHEAP_ERROR_BUSY);
+    if (!ea) {
+        ps_write32(base, e, 0);
+        return lv2::CELL_OK;
+    }
+    const u64 first = ps_read64(base, heap + heap_off::first_block);
+    if (ea % kBlock || ea < first || u64{ea} >= first + ps_read64(base, heap + heap_off::usable)) {
+        return error(CELL_SHEAP_ERROR_INVAL);
+    }
+    ps_write32(base, e + 4, static_cast<u32>(((ea - first) >> 7) + 1));
+    return lv2::CELL_OK;
+}
+
+// libsre's key release (0x5C88): INVAL (a misaligned heap too) or BUSY (no reference); the count goes down once the
+// block is there; `ea` is the block when that was the last reference (the caller frees it), else 0.
+s32 key_release(u8* base, u32 heap, u32 key, u32& ea)
+{
+    ea = 0;
+    if (heap % kBlock || key >= kKeys) return error(CELL_SHEAP_ERROR_INVAL);
+    const u32 e = key_entry(base, heap, key), line = e & ~(PS_RES_LINE_SIZE - 1), off = e - line;
+    for (;;) {
+        u32 count = 0, index1 = 0;
+        bool busy = false;
+        const bool done = reservation_op(base, line, [&](u8* l) {
+            count = ps_read32(l, off);
+            index1 = ps_read32(l, off + 4);
+            busy = count == 0;
+            if (busy || !index1) return false; // no reference; or being made: wait
+            ps_write32(l, off, count - 1);
+            return true;
+        });
+        if (busy) return error(CELL_SHEAP_ERROR_BUSY);
+        if (done) {
+            if (count == 1) ea = key_block(base, heap, index1);
+            return lv2::CELL_OK;
+        }
+        std::this_thread::yield();
+    }
+}
+
+// libsre's key clear (0x598C): INVAL, BUSY while referenced or without a block; then the block index is cleared.
+s32 key_clear(u8* base, u32 heap, u32 key)
+{
+    if (heap % kBlock || key >= kKeys) return error(CELL_SHEAP_ERROR_INVAL);
+    const u32 e = key_entry(base, heap, key);
+    if (ps_read32(base, e) || !ps_read32(base, e + 4)) return error(CELL_SHEAP_ERROR_BUSY);
+    ps_write32(base, e + 4, 0);
+    return lv2::CELL_OK;
+}
+
+// cellKeySheapInitialize(ea, size, dmaTag), as libsre (0x59F4): ea NULL (INVAL), its 128-byte ALIGN, 2 KB <= size <=
+// 512 GB and the tag at most 31 (INVAL); then the key table after the header (zeroed) and a sheap after the table, of
+// the rest less the table, a multiple of 128 bytes.
+s32 cellKeySheapInitialize(PPUContext& ctx, u32 ea, u64 size, u32 dma_tag)
+{
+    if (!ea) return error(CELL_SHEAP_ERROR_INVAL);
+    if (ea % kBlock) return error(CELL_SHEAP_ERROR_ALIGN);
+    if (size < 0x800 || size > (u64{0x80} << 32) || dma_tag > kMaxDmaTag) return error(CELL_SHEAP_ERROR_INVAL);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!range_committed(t, ea, kHeaderSize + kKeyTable)) {
+        log_call_site(ctx, base, std::format("cellKeySheapInitialize: {:#x} is not guest memory; refused with INVAL", ea));
+        return error(CELL_SHEAP_ERROR_INVAL);
+    }
+    const u32 table = ea + kHeaderSize;
+    ps_write64(base, ea + 0x50, kKeyTable);
+    ps_write64(base, ea + 0x48, table);
+    std::memset(base + table, 0, kKeyTable);
+    // libsre's internal initialize (0x53B0) of the heap that follows: its header stays at ea.
+    return cellSheapInitializeAt(ctx, ea, table + kKeyTable, (size - 0x880) & ~u64{kBlock - 1}, dma_tag);
+}
+
+// The handle every cellKeySheap*New fills: the heap (u64) at 0x00, the key at 0x08, the object (u64) at 0x10; a buffer's
+// size (u64) at 0x18.
+void fill_handle(u8* base, u32 handle, u32 heap, u32 key, u32 ea)
+{
+    ps_write64(base, handle + 0x00, heap);
+    ps_write64(base, handle + 0x10, ea);
+    ps_write32(base, handle + 0x08, key);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+// A cellSync function of the host's (registered in cellSync.cpp), as libsre calls its own.
+s32 call_sync(PPUContext& ctx, u32 nid, std::initializer_list<u64> args)
+{
+    const Function* f = registry().find("cellSync", nid);
+    PS_CHECK(f != nullptr);
+    u32 i = 0;
+    for (const u64 a : args) ctx.gpr[3 + i++] = a;
+    f->fn(ctx, guest_base(ctx));
+    return static_cast<s32>(static_cast<u32>(ctx.gpr[3]));
+}
+
+// The common part of the New functions (libsre 0x5DFC..0x6C24): handle and heap non-null, the key at most 255 (INVAL);
+// acquire the key; the first holder allocates `bytes`, makes the object (`make`, which may fail: the key is given up
+// and the block freed) and publishes it; no block: the key is given up, SHORTAGE.
+template <class Make>
+s32 key_new(PPUContext& ctx, std::string_view what, u32 handle, u32 heap, u32 key, u64 bytes, Make&& make)
+{
+    if (!handle || !heap || key >= kKeys) return error(CELL_SHEAP_ERROR_INVAL);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!heap_readable(ctx, std::string(what).c_str(), heap) || !range_committed(t, handle, 0x20)) {
+        return error(CELL_SHEAP_ERROR_INVAL);
+    }
+    u32 ea = 0;
+    if (const s32 rc = key_acquire(base, heap, key, ea); rc != lv2::CELL_OK) return rc;
+    if (!ea) {
+        ea = cellSheapAllocate(ctx, heap, bytes);
+        if (!ea) {
+            key_set(base, heap, key, 0);
+            return error(CELL_SHEAP_ERROR_SHORTAGE);
+        }
+        if (const s32 rc = make(ea); rc != lv2::CELL_OK) {
+            key_set(base, heap, key, 0);
+            cellSheapFree(ctx, heap, ea);
+            return rc;
+        }
+        if (const s32 rc = key_set(base, heap, key, ea); rc != lv2::CELL_OK) return rc;
+    }
+    fill_handle(base, handle, heap, key, ea);
+    return lv2::CELL_OK;
+}
+
+// The common part of the Delete functions: the handle's key released; the last holder frees the block and clears
+// the key. Each step failing is a libsre assertion (it prints and ends the process).
+s32 key_delete(PPUContext& ctx, std::string_view what, u32 handle)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!range_committed(t, handle, 0x10)) {
+        PS_FATAL(kChan, "{}: handle {:#x} is not guest memory; libsre (fw 4.92) faults here", what, handle);
+    }
+    const u32 heap = static_cast<u32>(ps_read64(base, handle)), key = ps_read32(base, handle + 8);
+    u32 ea = 0;
+    if (const s32 rc = key_release(base, heap, key, ea); rc != lv2::CELL_OK) {
+        PS_FATAL(kChan, "{}: releasing key {} of heap {:#x} failed ({:#x}); libsre (fw 4.92) asserts here and aborts the "
+            "process", what, key, heap, static_cast<u32>(rc));
+    }
+    if (!ea) return lv2::CELL_OK;
+    if (const s32 rc = cellSheapFree(ctx, heap, ea); rc != lv2::CELL_OK) {
+        PS_FATAL(kChan, "{}: freeing {:#x} in heap {:#x} failed ({:#x}); libsre (fw 4.92) asserts here", what, ea, heap,
+            static_cast<u32>(rc));
+    }
+    const s32 rc = key_clear(base, heap, key);
+    if (rc != lv2::CELL_OK) {
+        PS_FATAL(kChan, "{}: clearing key {} of heap {:#x} failed ({:#x}); libsre (fw 4.92) asserts here", what, key, heap,
+            static_cast<u32>(rc));
+    }
+    return rc;
+}
+
+// cellKeySheapBufferNew(buffer, heap, key, size): libsre (0x5DFC) checks the heap's ALIGN first; `size` bytes, no
+// object; the handle also gets the size (0x18).
+s32 cellKeySheapBufferNew(PPUContext& ctx, u32 handle, u32 heap, u32 key, u64 size)
+{
+    if (heap % kBlock) return error(CELL_SHEAP_ERROR_ALIGN);
+    const s32 rc = key_new(ctx, "cellKeySheapBufferNew", handle, heap, key, size, [](u32) { return lv2::CELL_OK; });
+    if (rc == lv2::CELL_OK) ps_write64(guest_base(ctx), handle + 0x18, size);
+    return rc;
+}
+
+s32 cellKeySheapBufferDelete(PPUContext& ctx, u32 handle) { return key_delete(ctx, "cellKeySheapBufferDelete", handle); }
+
+// cellKeySheapMutexNew(mutex, heap, key): a CellSyncMutex (4 bytes; cellSyncMutexInitialize, whose failure libsre asserts).
+s32 cellKeySheapMutexNew(PPUContext& ctx, u32 handle, u32 heap, u32 key)
+{
+    return key_new(ctx, "cellKeySheapMutexNew", handle, heap, key, 4, [&](u32 ea) {
+        if (const s32 rc = call_sync(ctx, 0xA9072DEE, {ea}); rc != lv2::CELL_OK) {
+            PS_FATAL(kChan, "cellKeySheapMutexNew: cellSyncMutexInitialize({:#x}) failed ({:#x}); libsre asserts here",
+                ea, static_cast<u32>(rc));
+        }
+        return lv2::CELL_OK;
+    });
+}
+
+s32 cellKeySheapMutexDelete(PPUContext& ctx, u32 handle) { return key_delete(ctx, "cellKeySheapMutexDelete", handle); }
+
+// cellKeySheapSemaphoreNew(semaphore, heap, key, count): a word holding the count, stored atomically.
+s32 cellKeySheapSemaphoreNew(PPUContext& ctx, u32 handle, u32 heap, u32 key, u32 count)
+{
+    return key_new(ctx, "cellKeySheapSemaphoreNew", handle, heap, key, 4, [&](u32 ea) {
+        reservation_op(guest_base(ctx), ea & ~(PS_RES_LINE_SIZE - 1), [&](u8* l) { // libsre: lwarx/stwcx.
+            ps_write32(l, ea & (PS_RES_LINE_SIZE - 1), count);
+            return true;
+        });
+        return lv2::CELL_OK;
+    });
+}
+
+s32 cellKeySheapSemaphoreDelete(PPUContext& ctx, u32 handle) { return key_delete(ctx, "cellKeySheapSemaphoreDelete", handle); }
+
+// cellKeySheapBarrierNew(barrier, heap, key, total): a CellSyncBarrier (cellSyncBarrierInitialize with the total's low 16
+// bits; its error is returned).
+s32 cellKeySheapBarrierNew(PPUContext& ctx, u32 handle, u32 heap, u32 key, u32 total)
+{
+    return key_new(ctx, "cellKeySheapBarrierNew", handle, heap, key, 4,
+        [&](u32 ea) { return call_sync(ctx, 0x07254FDA, {ea, total & 0xFFFF}); });
+}
+
+s32 cellKeySheapBarrierDelete(PPUContext& ctx, u32 handle) { return key_delete(ctx, "cellKeySheapBarrierDelete", handle); }
+
+// cellKeySheapRwmNew(rwm, heap, key, size): a CellSyncRwm with its buffer of `size` bytes after it (128 + size).
+s32 cellKeySheapRwmNew(PPUContext& ctx, u32 handle, u32 heap, u32 key, u32 size)
+{
+    return key_new(ctx, "cellKeySheapRwmNew", handle, heap, key, u64{size} + 128,
+        [&](u32 ea) { return call_sync(ctx, 0xFC48B03F, {ea, ea + 128, size}); });
+}
+
+s32 cellKeySheapRwmDelete(PPUContext& ctx, u32 handle) { return key_delete(ctx, "cellKeySheapRwmDelete", handle); }
+
+// cellKeySheapQueueNew(queue, heap, key, size, depth): a CellSyncQueue with its depth * size bytes after it.
+s32 cellKeySheapQueueNew(PPUContext& ctx, u32 handle, u32 heap, u32 key, u32 size, u32 depth)
+{
+    return key_new(ctx, "cellKeySheapQueueNew", handle, heap, key, u64{size * depth} + 128,
+        [&](u32 ea) { return call_sync(ctx, 0x3929948D, {ea, ea + 128, size, depth}); });
+}
+
+s32 cellKeySheapQueueDelete(PPUContext& ctx, u32 handle) { return key_delete(ctx, "cellKeySheapQueueDelete", handle); }
+
 } // namespace
 
 void register_cellSheap(Registry& r)
@@ -363,6 +696,21 @@ void register_cellSheap(Registry& r)
         PS_HLE_FUNC(0xBBB47CD8, cellSheapInitialize),
         PS_HLE_FUNC(0x4B1383FB, cellSheapAllocate),
         PS_HLE_FUNC(0x5C5994BD, cellSheapFree),
+        PS_HLE_FUNC(0x7FA23275, cellSheapQueryFree),
+        PS_HLE_FUNC(0x37968718, cellSheapQueryMax),
+        PS_HLE_FUNC(0xA1B25841, cellKeySheapInitialize),
+        PS_HLE_FUNC(0x4A5B9659, cellKeySheapBufferNew),
+        PS_HLE_FUNC(0xE6B37362, cellKeySheapBufferDelete),
+        PS_HLE_FUNC(0x3478E1E6, cellKeySheapMutexNew),
+        PS_HLE_FUNC(0x2452679F, cellKeySheapMutexDelete),
+        PS_HLE_FUNC(0x69A5861D, cellKeySheapSemaphoreNew),
+        PS_HLE_FUNC(0x73A45CF8, cellKeySheapSemaphoreDelete),
+        PS_HLE_FUNC(0xE897C835, cellKeySheapBarrierNew),
+        PS_HLE_FUNC(0xF6F5FBCA, cellKeySheapBarrierDelete),
+        PS_HLE_FUNC(0xF01AC471, cellKeySheapRwmNew),
+        PS_HLE_FUNC(0xED136702, cellKeySheapRwmDelete),
+        PS_HLE_FUNC(0x987E260E, cellKeySheapQueueNew),
+        PS_HLE_FUNC(0x79A6ABD0, cellKeySheapQueueDelete),
     });
 }
 
