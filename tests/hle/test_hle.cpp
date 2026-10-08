@@ -235,7 +235,9 @@ TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import
                                                // cellGcmSetFlipMode and cellGcmGetConfiguration,
                                                // cellSysutil::cellSysutilRegisterCallback, sys_io::cellPadInit,
                                                // cellSpurs::cellSpursInitialize (D-171), sys_libc::memcpy (D-184)
-    CHECK(report.variables_unresolved == 1);
+    // sys_libc::_Ctype is pspocket's own since D-515: its reference is patched with the variable's address.
+    CHECK(report.variables_unresolved == 0);
+    CHECK(ps_read32(p.memory.base(), x.var_ref_target) == p.hle->link_variable("sys_libc", 0xD97B0687));
 
     REQUIRE(p.kernel->wait_for_exit(std::chrono::seconds(10)));
     CHECK(p.kernel->exit_status() == 42);
