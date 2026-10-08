@@ -6003,3 +6003,26 @@ Tests (tests/hle/test_libm.cpp, 8,056 checks): every one-argument function and i
 points (zeros, denormals, infinities, NaN, large and small values) and every two-argument one over a grid, called
 through the guest's registers as the PowerPC ABI passes them, equal to the C99 results; the conventions above; SIMD
 lanes and the denormal flush; complex values; the variables.
+
+## D-511 · 2026-10-08 · The C library under sys_libc and sys_libm, part 1: strings, ctype, stdlib, random numbers
+
+The C half of the list RPCS3 names under both libraries (D-510 has the math), pspocket's own and registered under
+both, each function's NID computed from its name at registration (recomp::nid_of). No firmware module has it, so it is
+written to C99 and Dinkumware's documented choices (the SDK's C library is Dinkumware's), on guest memory checked
+before use (D-042). Shared parts from the library work's drafts: libc_guest.hpp (checked guest access, the PPC64
+variadic arguments, a per-thread block of 256 bytes for errno, conversion states, strtok's place and static results)
+and libc_format.hpp (C99 integer and float parsing, printf and scanf engines for later parts).
+Part 1 (runtime/hle/src/sys_libc.cpp):
+- string.h: the copies, concatenations, searches, strtok (its place per thread) and strtok_r, strerror (its text in the
+  thread's block), strcoll and strxfrm in the "C" locale; comparisons give -1, 0 or +1 (Dinkumware's memcmp.c,
+  strcmp.c), POSIX's strcasecmp the difference; Sony's memcpy16, memset_vmx, _memset_int and the _ascii forms.
+- ctype.h in the "C" locale: ASCII only, nothing past 127 or for EOF.
+- stdlib.h: abs to imaxabs, div to imaxdiv through the caller's buffer in r3 (the 64-bit ABI returns aggregates in
+  memory), strtol to strtoumax (long 32 bits, ERANGE clamping, the end pointer), strtod/strtof/strtold and atof/atoff
+  (the host's correctly rounded parse in the "C" locale), qsort (a stable merge sort through the guest's comparator,
+  one of the orders the standard allows) and bsearch.
+- rand and srand as Dinkumware's rand.c (a linear congruential seed, RAND_MAX 0x7FFF). Sony's TT800 functions:
+  Matsumoto and Kurita's TT800 with mt19937ar's interface (init by seed or array, int32, int31, three reals), the _
+  forms on a state the caller gives, the others on the variable __TT800 (25 words and a position). No reference to
+  compare their seeding with: the public mt19937ar initialization, said so here.
+Tests: tests/hle/test_libc.cpp (6,769 checks: every behaviour above, a guest comparator for qsort and bsearch).
