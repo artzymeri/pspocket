@@ -5885,3 +5885,22 @@ Two things the libraries still to come need (the C and maths libraries above all
   theirs (the PPC64 ELF ABI), and puts a float or double result in f1.
 - The registry's lookup is a hash map now: with thousands of functions its linear scan made registration quadratic.
 Tests: the binding with mixed arguments; a variable laid out once, initialised, linked by address.
+
+## D-504 · 2026-10-08 · cellHttpUtil, the same as libhttp
+
+libhttp.sprx (4.92) exports cellHttpUtil beside cellHttp: 20 functions that parse and build URIs, URI paths, proxies,
+headers, request and status lines, copy them into a caller's pool, merge and sweep paths, escape and unescape, form
+encode and decode, and code base64. All 20 are pspocket's own (runtime/hle/src/cellHttpUtil.cpp), read from libhttp's
+code; RPCS3's cellHttpUtil.cpp gave the structures, error codes and BuildUri's flags (its URI parser is a general URL
+parser, which libhttp's own does not match).
+- The parsers and copies have libhttp's two modes: with a structure and a pool they fill both; with either missing
+  they only add up the pool size into *required.
+- libhttp's surprises, kept: a status line whose code is not followed by a space starts its reason phrase as many bytes
+  after the code as the version took, and copies as many bytes past the phrase as the spaces before it; a header's ':'
+  may lie past NULs within its length, and a value ending exactly at the length needs a NUL after it; MergeUriPath puts
+  its '/' one byte past the path (past the pool when the path fills it). Each is marked in the code.
+- A pointer to memory that is not there, where libhttp would fault, ends the call with NO_BUFFER and logs the call
+  site (D-042).
+- Compared with libhttp call for call (tests/hle/test_httputil.cpp, made-up and random inputs: 157,970 calls, every
+  answer and byte of the structures, pools and their guards the same), plus known answers without the firmware.
+GTA V and Assassin's Creed import none of these.
