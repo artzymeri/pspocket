@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 1807 of 6625 pspocket&#x27;s own (27.3%), 290 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 1810 of 6625 pspocket&#x27;s own (27.3%), 290 answered as RPCS3</text>
 <g><title>sys_libc: 4 own, 0 answered as RPCS3, 1115 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -3718,7 +3718,7 @@
 <rect x="474.6" y="337.2" width="6.8" height="6.4" fill="#8c959f"/>
 <text x="439.9" y="257.1" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sysPrxForUs…</text>
 </g>
-<g><title>cellSpurs: 127 own, 0 answered as RPCS3, 14 not yet, of 141</title>
+<g><title>cellSpurs: 128 own, 0 answered as RPCS3, 13 not yet, of 141</title>
 <rect x="436.9" y="345.2" width="82.9" height="94.8" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="437.9" y="346.2" width="6.8" height="6.5" fill="#2da44e"/>
 <rect x="445.2" y="346.2" width="6.8" height="6.5" fill="#2da44e"/>
@@ -3847,7 +3847,7 @@
 <rect x="459.9" y="424.7" width="6.8" height="6.5" fill="#2da44e"/>
 <rect x="467.3" y="424.7" width="6.8" height="6.5" fill="#2da44e"/>
 <rect x="474.6" y="424.7" width="6.8" height="6.5" fill="#2da44e"/>
-<rect x="482.0" y="424.7" width="6.8" height="6.5" fill="#8c959f"/>
+<rect x="482.0" y="424.7" width="6.8" height="6.5" fill="#2da44e"/>
 <rect x="489.4" y="424.7" width="6.8" height="6.5" fill="#8c959f"/>
 <rect x="496.7" y="424.7" width="6.8" height="6.5" fill="#8c959f"/>
 <rect x="504.1" y="424.7" width="6.8" height="6.5" fill="#8c959f"/>
@@ -7037,10 +7037,10 @@
 <rect x="865.1" y="396.0" width="4.4" height="6.7" fill="#8c959f"/>
 <rect x="870.1" y="396.0" width="4.4" height="6.7" fill="#8c959f"/>
 </g>
-<g><title>cellSpudll: 0 own, 0 answered as RPCS3, 2 not yet, of 2</title>
+<g><title>cellSpudll: 2 own, 0 answered as RPCS3, 0 not yet, of 2</title>
 <rect x="876.1" y="395.0" width="12.0" height="9.3" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="877.1" y="396.0" width="4.4" height="6.7" fill="#8c959f"/>
-<rect x="882.1" y="396.0" width="4.4" height="6.7" fill="#8c959f"/>
+<rect x="877.1" y="396.0" width="4.4" height="6.7" fill="#2da44e"/>
+<rect x="882.1" y="396.0" width="4.4" height="6.7" fill="#2da44e"/>
 </g>
 <g><title>cellTRHDdec: 0 own, 0 answered as RPCS3, 2 not yet, of 2</title>
 <rect x="888.0" y="395.0" width="12.0" height="9.3" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
