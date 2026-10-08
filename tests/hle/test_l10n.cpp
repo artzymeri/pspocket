@@ -681,3 +681,201 @@ TEST_CASE("cellL10n: the HZ converters are libl10n's (D-517)", "[hle][l10n]")
     }
     CHECK(l.mismatches == 0);
 }
+
+TEST_CASE("cellL10n: the ARIB converters are libl10n's (D-517)", "[hle][l10n]")
+{
+    L10n l;
+    if (!l.sony) SKIP("PSPOCKET_TEST_DEV_FLASH is not set");
+    u8* b = l.b;
+    const auto run = [&](const char* fn, const std::vector<u8>& in, u32 n, std::initializer_list<u32> caps) {
+        for (const u32 cap : caps)
+            for (const bool null_dst : {false, true})
+                l.same(fn, [&](u32 base) {
+                    put_bytes(b, base + 0x200, in);
+                    ps_write32(b, base + 0x3F0, n);
+                    ps_write32(b, base + 0x3F4, cap);
+                    return std::vector<u64>{base + 0x200, base + 0x3F0, null_dst ? 0u : base, base + 0x3F4};
+                }, std::format("{} n {} cap {}{}", hex(in), n, cap, null_dst ? " NULL" : ""));
+    };
+    // Every two-byte code in the kanji set (rows 1..94: JIS X 0208, ARIB's rows 1..3, the additional symbols), with
+    // and without the high bits; every byte in each one-byte set (alphanumerics through LS1, hiragana in GR,
+    // katakana after SS3).
+    for (u32 b0 = 0x20; b0 <= 0x7F; b0++)
+        for (u32 b1 = 0x20; b1 <= 0x7F; b1++)
+            for (const char* fn : {"ARIBstoUCS2s", "ARIBstoUTF8s"}) {
+                run(fn, {static_cast<u8>(b0), static_cast<u8>(b1)}, 2, {0x100u});
+                if ((b0 + b1) % 7 == 0) run(fn, {static_cast<u8>(b0 | 0x80), static_cast<u8>(b1)}, 2, {0x100u, 0u});
+            }
+    for (u32 c = 0; c < 256; c++)
+        for (const char* fn : {"ARIBstoUCS2s", "ARIBstoUTF8s"}) {
+            run(fn, {0x0E, static_cast<u8>(c)}, 2, {0x100u, 0u, 1u});
+            run(fn, {static_cast<u8>(c | 0x80)}, 1, {0x100u, 0u});
+            run(fn, {0x1D, static_cast<u8>(c)}, 2, {0x100u, 0u});
+            run(fn, {0x1B, static_cast<u8>(c), 0x41, 0x42}, 4, {0x100u});
+            run(fn, {0x1B, '(', static_cast<u8>(c), 0x41}, 4, {0x100u});
+            run(fn, {0x1B, '$', static_cast<u8>(c), 0x41, 0x42}, 5, {0x100u});
+            run(fn, {0x1B, '$', '+', static_cast<u8>(c), 0x1D, 0x41, 0x42}, 7, {0x100u});
+        }
+    // Random captions: shifts, designations, characters of every set, stray bytes.
+    std::mt19937 rng(71);
+    static const std::vector<std::vector<u8>> kControls = {{0x0E}, {0x0F}, {0x19}, {0x1D}, {0x1B, 'n'}, {0x1B, 'o'},
+        {0x1B, '|'}, {0x1B, '}'}, {0x1B, '~'}, {0x1B}, {0x1B, '$'}, {0x1B, '('}, {0x1B, '$', '*'}};
+    static const u8 kFinals[] = {'0', '1', 'J', 'B', '9', ';', '2', 'I', ' ', 'A', '6'};
+    const auto caption = [&] {
+        std::vector<u8> s;
+        for (u32 i = 0, n = 1 + rng() % 12; i < n; i++) {
+            const u32 r = rng() % 10;
+            if (r < 2) {
+                const auto& c = kControls[rng() % kControls.size()];
+                s.insert(s.end(), c.begin(), c.end());
+            } else if (r < 4) {
+                const u8 f = kFinals[rng() % std::size(kFinals)];
+                switch (rng() % 3) {
+                case 0: s.insert(s.end(), {0x1B, static_cast<u8>('(' + rng() % 4), f}); break;
+                case 1: s.insert(s.end(), {0x1B, '$', f}); break;
+                default: s.insert(s.end(), {0x1B, '$', static_cast<u8>('(' + rng() % 4), f}); break;
+                }
+            } else if (r < 6) {
+                s.push_back(static_cast<u8>(0x21 + rng() % 0x5E));
+            } else if (r < 8) {
+                const u8 row = static_cast<u8>(rng() % 3 ? 0x21 + rng() % 0x5E : 0x75 + rng() % 10);
+                s.push_back(row);
+                s.push_back(static_cast<u8>(0x21 + rng() % 0x5E));
+            } else if (r < 9) {
+                s.push_back(static_cast<u8>(0xA1 + rng() % 0x5E));
+            } else {
+                const auto x = random_bytes(rng, 1);
+                s.insert(s.end(), x.begin(), x.end());
+            }
+        }
+        return s;
+    };
+    for (u32 round = 0; round < 3000; round++) {
+        const std::vector<u8> in = caption();
+        for (const char* fn : {"ARIBstoUCS2s", "ARIBstoUTF8s"}) {
+            run(fn, in, static_cast<u32>(in.size()), {0x100u, 0u, 1u, 2u, 3u, 5u});
+            if (in.size() > 1) run(fn, in, static_cast<u32>(in.size() - 1), {0x100u, 2u});
+        }
+    }
+    // The encoders: every UCS-2 value alone and after alphanumerics; random mixes.
+    for (u32 c = 0; c < 0x10000; c++) {
+        run("UCS2stoARIBs", {static_cast<u8>(c >> 8), static_cast<u8>(c)}, 1, {0x100u});
+        if (c % 5 == 0) run("UCS2stoARIBs", {0, 'A', static_cast<u8>(c >> 8), static_cast<u8>(c)}, 2, {0x100u, 3u, 4u});
+    }
+    static const u32 kChars[] = {0x41, 0x5C, 0x7E, 0xA5, 0x20, 0x3042, 0x3093, 0x30A2, 0x30F6, 0x30FC, 0x3002, 0x309D,
+        0x30FD, 0x4E00, 0x7E6B, 0x3000, 0x0301, 0x20DD, 0xFF21, 0x2460, 0x32D0, 0x337E, 0x26BD, 0xE080, 0xE1A5, 0x2491};
+    for (u32 round = 0; round < 3000; round++) {
+        std::vector<u8> ucs2, utf8;
+        for (u32 i = 0, n = 1 + rng() % 8; i < n; i++) {
+            const u32 c = rng() % 4 ? kChars[rng() % std::size(kChars)] : rng() % 0x10000;
+            ucs2.push_back(static_cast<u8>(c >> 8));
+            ucs2.push_back(static_cast<u8>(c));
+            if (c < 0x80) utf8.push_back(static_cast<u8>(c));
+            else if (c < 0x800) { utf8.push_back(static_cast<u8>(0xC0 | (c >> 6))); utf8.push_back(static_cast<u8>(0x80 | (c & 0x3F))); }
+            else { utf8.push_back(static_cast<u8>(0xE0 | (c >> 12))); utf8.push_back(static_cast<u8>(0x80 | ((c >> 6) & 0x3F))); utf8.push_back(static_cast<u8>(0x80 | (c & 0x3F))); }
+        }
+        if (rng() % 8 == 0) utf8.push_back(static_cast<u8>(0x80 + rng() % 0x80));
+        for (const u32 cap : {0x100u, 0u, 1u, 2u, 4u, 7u}) {
+            run("UCS2stoARIBs", ucs2, static_cast<u32>(ucs2.size() / 2), {cap});
+            run("UTF8stoARIBs", utf8, static_cast<u32>(utf8.size()), {cap});
+        }
+        if (utf8.size() > 1) run("UTF8stoARIBs", utf8, static_cast<u32>(utf8.size() - 1), {0x100u});
+    }
+    CHECK(l.mismatches == 0);
+}
+
+TEST_CASE("cellL10n: jstrchk and jstrnchk are libl10n's (D-517)", "[hle][l10n]")
+{
+    L10n l;
+    if (!l.sony) SKIP("PSPOCKET_TEST_DEV_FLASH is not set");
+    u8* b = l.b;
+    std::mt19937 rng(81);
+    static const std::vector<std::vector<u8>> kPieces = {{0x1B, '(', 'B'}, {0x1B, '(', 'J'}, {0x1B, '(', 'I'},
+        {0x1B, '$', '@'}, {0x1B, '$', 'B'}, {0x1B, '$', '(', 'D'}, {0x1B, '$', 'A'}, {0x1B, '&', '@'}, {0x1B, '&', 'x'},
+        {0x1B, '$', 0x10}, {0x1B, '(', 0x7F}, {0x1B, '$', '(', 0x01}, {0x1B, 'x'}, {0x1B}, {0x0E}, {0x0F},
+        {0xA4, 0xA2}, {0x8E, 0xB1}, {0x8F, 0xB0, 0xA1}, {0x82, 0xA0}, {0x83, 0x7F}, {0xE3, 0x81, 0x82}, {0xC3, 0xA9},
+        {0xC0, 0x80}, {0xF0, 0x9F, 0x98, 0x80}, {'a'}, {'Z', 'q'}, {0x30, 0x21}};
+    for (u32 round = 0; round < 40000; round++) {
+        std::vector<u8> s;
+        for (u32 i = 0, n = 1 + rng() % 8; i < n; i++) {
+            if (rng() % 4) {
+                const auto& p = kPieces[rng() % kPieces.size()];
+                s.insert(s.end(), p.begin(), p.end());
+            } else {
+                const auto x = random_bytes(rng, 1 + rng() % 3);
+                s.insert(s.end(), x.begin(), x.end());
+            }
+        }
+        for (const u32 n : {static_cast<u32>(s.size()), static_cast<u32>(s.size() / 2), 1u, 0u})
+            l.same("jstrnchk", [&](u32 base) { put_bytes(b, base + 0x200, s); return std::vector<u64>{base + 0x200, n}; },
+                std::format("{} n {}", hex(s), n));
+        std::vector<u8> z = s;
+        for (u8& x : z) if (!x) x = 1;
+        z.push_back(0);
+        l.same("jstrchk", [&](u32 base) { put_bytes(b, base + 0x200, z); return std::vector<u64>{base + 0x200}; }, hex(z));
+    }
+    CHECK(l.mismatches == 0);
+}
+
+TEST_CASE("cellL10n: the converter dispatch is libl10n's (D-517)", "[hle][l10n]")
+{
+    L10n l;
+    if (!l.sony) SKIP("PSPOCKET_TEST_DEV_FLASH is not set");
+    u8* b = l.b;
+    // Inputs meaningful in many encodings: ASCII, EUC/SJIS/UTF-8/UCS-2/UTF-32 kana, a lone high byte, a surrogate pair.
+    static const std::vector<std::vector<u8>> kInputs = {{'A', 'B', 0, 0}, {0xA4, 0xA2, 0xA4, 0xA4}, {0x82, 0xA0, 'x', 0},
+        {0xE3, 0x81, 0x82, 'A'}, {0x30, 0x42, 0x00, 0x41}, {0x00, 0x00, 0x30, 0x42}, {0xE9, 0x41, 0, 0},
+        {0xD8, 0x3D, 0xDE, 0x00}, {0x00, 0x5C, 0x00, 0xA5}, {0x1B, '$', 'B', 0x30}, {0x7E, '{', 0x30, 0x21}};
+    std::vector<u32> codes;
+    for (u32 c = 0; c < 54; c++) codes.push_back(c);
+    for (const u32 c : {0x100u, 0x10003u, 0x7FFFFFFFu, 0xFFFFFFFFu}) codes.push_back(c);
+    for (const u32 s : codes) {
+        for (const u32 d : codes) {
+            const std::string what = std::format("{} -> {}", s, d);
+            l.same("l10n_get_converter", [&](u32) { return std::vector<u64>{s, d}; }, what);
+            if (s > 0xFFFF || d > 0xFFFF) continue;
+            const u32 cd = (s << 16) | d;
+            for (usize k = 0; k < kInputs.size(); k++) {
+                const auto& in = kInputs[k];
+                const std::string w = std::format("{} input {}", what, k);
+                for (const bool null_dst : {false, true}) {
+                    l.same("L10nConvert", [&](u32 base) {
+                        put_bytes(b, base + 0x200, in);
+                        ps_write32(b, base + 0x3F4, 0x55);
+                        return std::vector<u64>{s, base + 0x200, d, null_dst ? 0u : base, base + 0x3F4};
+                    }, w + (null_dst ? " NULL" : ""));
+                    l.same("l10n_convert", [&](u32 base) {
+                        put_bytes(b, base + 0x200, in);
+                        ps_write32(b, base + 0x3F4, 0x55);
+                        return std::vector<u64>{cd, base + 0x200, null_dst ? 0u : base, base + 0x3F4};
+                    }, w + (null_dst ? " NULL" : ""));
+                }
+                for (const u32 n : {1u, 2u, 4u}) {
+                    for (const u32 cap : {0x100u, 1u}) {
+                        l.same("L10nConvertStr", [&](u32 base) {
+                            put_bytes(b, base + 0x200, in);
+                            ps_write32(b, base + 0x3F0, n);
+                            ps_write32(b, base + 0x3F4, cap);
+                            return std::vector<u64>{s, base + 0x200, base + 0x3F0, d, base, base + 0x3F4};
+                        }, std::format("{} n {} cap {}", w, n, cap));
+                        l.same("l10n_convert_str", [&](u32 base) {
+                            put_bytes(b, base + 0x200, in);
+                            ps_write32(b, base + 0x3F0, n);
+                            ps_write32(b, base + 0x3F4, cap);
+                            return std::vector<u64>{cd, base + 0x200, base + 0x3F0, base, base + 0x3F4};
+                        }, std::format("{} n {} cap {}", w, n, cap));
+                    }
+                }
+            }
+        }
+    }
+    // Handles with the sign bit set.
+    for (const u32 cd : {0xFFFF0003u, 0x80000000u, 0xFFFFFFFFu, 0x00340003u, 0x00030034u})
+        l.same("l10n_convert_str", [&](u32 base) {
+            put_bytes(b, base + 0x200, kInputs[0]);
+            ps_write32(b, base + 0x3F0, 2);
+            ps_write32(b, base + 0x3F4, 0x100);
+            return std::vector<u64>{cd, base + 0x200, base + 0x3F0, base, base + 0x3F4};
+        }, std::format("cd {:#x}", cd));
+    CHECK(l.mismatches == 0);
+}

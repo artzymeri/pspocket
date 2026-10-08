@@ -15,8 +15,9 @@
 
 #include <array>
 #include <cstring>
-#include <mutex>
 #include <format>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -3237,6 +3238,692 @@ u32 hz_encode(PPUContext& ctx, const char* fn, u32 src, u32 src_len, u32 dst, u3
 u32 UCS2stoHZs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return hz_encode<false>(ctx, "UCS2stoHZs", src, sl, dst, dl); }
 u32 UTF8stoHZs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return hz_encode<true>(ctx, "UTF8stoHZs", src, sl, dst, dl); }
 
+// ------------------------------------------------------------------------------------------------- ARIB STD-B24
+
+// ARIB STD-B24's 8-bit code (Japanese broadcast captions): four graphic sets G0..G3, at first kanji, alphanumerics,
+// hiragana and katakana; GL invokes G0 and GR G2, changed by the locking shifts LS0 (0F), LS1 (0E) and ESC n, o, |,
+// }, ~; the single shifts SS2 (19) and SS3 (1D) take one character from G2 or G3; ESC ( ) * + F designates a
+// one-byte set into G0..G3 and ESC $ F, ESC $ ) * + F a two-byte one. libl10n's set numbers (its designation decoder,
+// 0x1958) are these; the other sets (mosaics, DRCS, the proportional ones) it refuses.
+enum : u32 { kAribAlnum = 1, kAribKanji = 7, kAribJisKanji = 8, kAribHira = 9, kAribKata = 10, kAribSymbols = 11 };
+
+u32 arib_designation(u32 f, u32 bytes)
+{
+    switch (f & 0xFF) {
+    case '0': return bytes == 1 ? kAribHira : 0;
+    case '1': return bytes == 1 ? kAribKata : 0;
+    case 'J': return bytes == 1 ? kAribAlnum : 0;
+    case 'B': return bytes == 2 ? kAribKanji : 0;
+    case '9': return bytes == 2 ? kAribJisKanji : 0;
+    case ';': return bytes == 2 ? kAribSymbols : 0;
+    default: return 0;
+    }
+}
+
+// The hiragana and katakana sets (b 21..7E): the kana in Unicode's order, the iteration marks, then ー 。 「 」 、 ・;
+// FFFF for hiragana's three unassigned cells.
+u16 arib_kana(bool kata, u32 b)
+{
+    static constexpr u16 kMarks[] = {0x30FC, 0x3002, 0x300C, 0x300D, 0x3001, 0x30FB};
+    if (b >= 0x79) return kMarks[b - 0x79];
+    if (b >= 0x77) return static_cast<u16>((kata ? 0x30FD : 0x309D) + (b - 0x77));
+    if (kata) return static_cast<u16>(0x30A1 + (b - 0x21));
+    return b <= 0x73 ? static_cast<u16>(0x3041 + (b - 0x21)) : u16{0xFFFF};
+}
+
+// The decoders (ARIBstoUCS2s 0x1a64, ARIBstoUTF8s 0x2514). A failure's *src_len counts from the first shift or
+// escape since the last character written ("pending" bytes; the ESC before a byte that is not an escape is not one),
+// except where noted. The two forms differ in a few lengths, all kept and commented: the UTF-8 form also reads
+// *src_len again after each character.
+template <bool kUtf8>
+u32 arib_decode(PPUContext& ctx, const char* fn, u32 src, u32 src_len, u32 dst, u32 dst_len)
+{
+    Mem m(ctx, fn);
+    u32 g[4] = {kAribKanji, kAribAlnum, kAribHira, kAribKata};
+    u32 gl = 0, gr = 2;
+    u32 n = m.r32(src_len), i = 0, count = 0, pending = 0;
+    const auto done = [&](u32 r, u32 left, u32 written) {
+        m.w32(src_len, left);
+        m.w32(dst_len, written);
+        return m.ok() ? r : kIllegal;
+    };
+    // Writes v (a unit, or its UTF-8 bytes) when there is room: kOK, or kExhausted with the call finished.
+    const auto put = [&](u16 v) {
+        if constexpr (kUtf8) {
+            u8 bytes[4];
+            const u32 units = ucs2_to_utf8(v, bytes);
+            count += units;
+            if (dst) {
+                if (m.r32(dst_len) < count) return done(kExhausted, m.r32(src_len) - (i - pending), count - units);
+                for (u32 k = 0; k < units; k++) m.w8(dst + k, bytes[k]);
+                dst += units;
+            }
+            n = m.r32(src_len);
+        } else {
+            count++;
+            if (dst) {
+                if (m.r32(dst_len) < count) return done(kExhausted, n - (i - pending), count - 1);
+                m.w16(dst, v);
+                dst += 2;
+            }
+        }
+        return kOK;
+    };
+    while (i < n) {
+        if (!m.ok()) return kIllegal;
+        const u8 b = m.r8(src + i);
+        u32 set = 0;
+        if (b == 0x0E || b == 0x0F) {
+            i++;
+            pending++;
+            gl = b == 0x0E ? 1 : 0;
+            continue;
+        }
+        if (b == 0x19 || b == 0x1D) {
+            i++;
+            if (i == n) continue;
+            pending++;
+            set = g[b == 0x19 ? 2 : 3];
+        } else if (b == 0x1B) {
+            i++;
+            if (i == n) continue;
+            const u8 b2 = m.r8(src + i);
+            if (b2 == 'n' || b2 == 'o') {
+                i++;
+                pending += 2;
+                gl = b2 == 'n' ? 2 : 3;
+                continue;
+            }
+            if (b2 == '|' || b2 == '}' || b2 == '~') {
+                i++;
+                pending += 2;
+                gr = 0x7Fu - b2;
+                continue;
+            }
+            if (b2 >= '(' && b2 <= '+') {
+                i++;
+                if (i >= n) {
+                    pending += 3;
+                    continue;
+                }
+                const u32 s = arib_designation(m.r8(src + i), 1);
+                if (!s) return done(kIllegal, n - i + 2, count);
+                g[b2 - '('] = s;
+                i++;
+                pending += 3;
+                continue;
+            }
+            if (b2 == '$') {
+                i++;
+                if (i == n) continue;
+                const u8 b3 = m.r8(src + i);
+                if (b3 == ')' || b3 == '*' || b3 == '+') {
+                    i++;
+                    if (i >= n) {
+                        pending += 4;
+                        continue;
+                    }
+                    const u32 s = arib_designation(m.r8(src + i), 2);
+                    if (!s) return done(kIllegal, n - i + 3, count);
+                    g[b3 - '('] = s;
+                    i++;
+                    pending += 4;
+                    continue;
+                }
+                const u32 s = arib_designation(b3, 2); // ESC $ ( F is not one
+                if (!s) return done(kIllegal, n - i + 2, count);
+                g[0] = s;
+                i++;
+                pending += 3;
+                continue;
+            }
+            set = g[b2 >= 0x80 ? gr : gl];
+        } else {
+            set = g[b >= 0x80 ? gr : gl];
+        }
+        // The character at i, in `set`; the bytes' high bits do not matter.
+        const u32 b0 = m.r8(src + i) & 0x7F;
+        if (set == kAribKanji && b0 > 0x74) set = kAribSymbols; // rows 85..94 of the kanji set
+        if (set == kAribKanji || set == kAribJisKanji || set == kAribSymbols) {
+            if (i + 2 > n || !jis_byte(b0)) return done(kIllegal, n - (i - pending), count);
+            const u32 b1 = m.r8(src + i + 1) & 0x7F;
+            if (!jis_byte(b1)) return done(kIllegal, n - (i - pending), count);
+            if (set == kAribSymbols) {
+                // Rows 85, 86 and 90..94.
+                const u32 code = (b0 << 8) | b1;
+                if (((code - 0x7521) & 0xFFFF) > 0x95D || ((code - 0x7721) & 0xFFFF) <= 0x2FF)
+                    return done(kIllegal, n - (i - pending), count);
+                const u16 v = table(kAribadd)[b0 * 94 + b1 - (b0 > 0x79 ? 11313 : 11031)];
+                if constexpr (kUtf8) {
+                    if (const u32 r = put(v); r != kOK) return r;
+                } else {
+                    if (v == 0xFFFF) return done(kIllegal, n - (i - pending), count);
+                    // The UCS-2 form checks the room before counting the symbol: one unit more fits than
+                    // *dst_len says, and a full destination reports one less.
+                    if (dst) {
+                        if (m.r32(dst_len) < count) return done(kExhausted, n - (i - pending), count - 1);
+                        m.w16(dst, v);
+                        dst += 2;
+                    }
+                    count++;
+                }
+                i += 2;
+                pending = 0;
+                continue;
+            }
+            // Rows 1..84 without 9..15: rows 1..3 ARIB's own (its non-spacing marks), the rest JIS X 0208.
+            const u32 rel = ((0x8080 | (b0 << 8) | b1) - 0xA1A1) & 0xFFFF;
+            u16 v;
+            if (rel <= 601) {
+                v = table(kArib13)[b0 * 94 + b1 - 3135];
+            } else {
+                if (rel > 0x5305 || ((rel - 0x800) & 0xFFFF) <= 0x6FF) return done(kIllegal, n - (i - pending), count);
+                v = table(kJis0208)[b0 * 94 + b1 - (b0 > 0x2F ? 3793 : 3135)];
+            }
+            if constexpr (kUtf8) {
+                u8 bytes[4];
+                if (!ucs2_to_utf8(v, bytes) || v == 0xFFFF)
+                    return done(kIllegal, m.r32(src_len) - (i - pending), count);
+            } else {
+                // The UCS-2 form leaves the pending bytes out here.
+                if (v == 0xFFFF) return done(kIllegal, n - i, count);
+            }
+            if (const u32 r = put(v); r != kOK) return r;
+            i += 2;
+            pending = 0;
+            continue;
+        }
+        // One-byte sets; the UTF-8 form reports one unit less on a byte outside them.
+        const u32 bad_written = kUtf8 ? count - 1 : count;
+        u16 v;
+        if (set == kAribAlnum) {
+            if (!jis_byte(b0) && b0 != 0x20) return done(kIllegal, n - (i - pending), bad_written);
+            v = b0 == 0x5C ? u16{0xA5} : static_cast<u16>(b0); // the yen sign
+        } else {
+            if (!jis_byte(b0)) return done(kIllegal, n - (i - pending), bad_written);
+            v = arib_kana(set == kAribKata, b0);
+            if (set == kAribHira && v == 0xFFFF)
+                return done(kIllegal, (kUtf8 ? m.r32(src_len) : n) - (i - pending), count);
+        }
+        if (const u32 r = put(v); r != kOK) return r;
+        i++;
+        pending = 0;
+    }
+    m.w32(dst_len, count);
+    return m.ok() ? kOK : kIllegal;
+}
+
+u32 ARIBstoUCS2s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return arib_decode<false>(ctx, "ARIBstoUCS2s", src, sl, dst, dl); }
+u32 ARIBstoUTF8s(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return arib_decode<true>(ctx, "ARIBstoUTF8s", src, sl, dst, dl); }
+
+// 0xb510: the set a UCS-2 value goes in and its code there (alphanumerics: the byte; hiragana: its GR byte; katakana:
+// SS3 and the byte; kanji and additional symbols: the 7-bit pair), or 0. The sets are searched in libl10n's order,
+// the first match winning: hiragana, katakana, ARIB rows 1..3, JIS X 0208 from row 6, the additional symbols.
+u32 ucs2_to_arib(u32 c, u32* code)
+{
+    c &= 0xFFFF;
+    if (c > 0xFFFD) return 0;
+    if (c == 0xA5) {
+        *code = 0x5C;
+        return kAribAlnum;
+    }
+    if (((c - 0x20) & 0xFFFF) <= 94 && c != 0x5C) {
+        *code = c;
+        return kAribAlnum;
+    }
+    for (u32 b = 0x21; b <= 0x7E; b++) {
+        if (arib_kana(false, b) == c) {
+            *code = b + 0x80;
+            return kAribHira;
+        }
+    }
+    for (u32 b = 0x21; b <= 0x7E; b++) {
+        if (arib_kana(true, b) == c) {
+            *code = 0x1D00 | b;
+            return kAribKata;
+        }
+    }
+    const auto& a13 = table(kArib13);
+    for (u32 k = 0; k < a13.size(); k++) {
+        if (a13[k] == c) {
+            *code = ((k / 94) << 8) + (k % 94) + 0x2121;
+            return kAribKanji;
+        }
+    }
+    const auto& j0208 = table(kJis0208);
+    for (u32 k = 5 * 94; k < j0208.size(); k++) {
+        if (j0208[k] == c) {
+            u32 e = ((k / 94) << 8) + (k % 94) + 0x2121;
+            if ((e & 0xFFFF) > 0x28FF) e += 0x700;
+            *code = e & 0xFFFF;
+            return kAribKanji;
+        }
+    }
+    const auto& add = table(kAribadd);
+    for (u32 k = 0; k < add.size(); k++) {
+        if (add[k] == c) {
+            u32 e = ((k / 94) << 8) + (k % 94) + 0x7521;
+            if ((e & 0xFFFF) > 0x76FF) e += 0x300;
+            *code = e & 0xFFFF;
+            return kAribSymbols;
+        }
+    }
+    return 0;
+}
+
+// The encoders (UCS2stoARIBs 0x94f8, UTF8stoARIBs 0xdea8): kanji and symbols through G0 (ESC $ B or ESC $ ; when
+// G0 holds the other, LS0 after alphanumerics), alphanumerics through LS1 (G1), hiragana as GR bytes (G2) and
+// katakana after SS3 (G3), as a decoder starts.
+template <bool kUtf8>
+u32 arib_encode(PPUContext& ctx, const char* fn, u32 src, u32 src_len, u32 dst, u32 dst_len)
+{
+    Mem m(ctx, fn);
+    if (!m.r32(src_len)) {
+        m.w32(dst_len, 0);
+        return m.ok() ? kOK : kIllegal;
+    }
+    u32 consumed = 0, count = 0, g0 = kAribKanji;
+    bool shifted = false; // LS1 in effect
+    const auto done = [&](u32 r, u32 written) {
+        m.w32(src_len, m.r32(src_len) - consumed);
+        m.w32(dst_len, written);
+        return m.ok() ? r : kIllegal;
+    };
+    for (;;) {
+        u32 c = 0, took = 1;
+        if constexpr (kUtf8) {
+            took = utf8_decode([&](u32 k) { return m.r8(src + consumed + k); }, &c, false);
+            if (!took || m.r32(src_len) < consumed + took) return done(kIllegal, count);
+        } else {
+            c = m.r16(src + 2 * consumed);
+        }
+        if (!m.ok()) return kIllegal;
+        u32 code = 0;
+        const u32 set = ucs2_to_arib(c, &code);
+        u32 size = 0;
+        switch (set) {
+        case kAribAlnum: size = shifted ? 1 : 2; break;
+        case kAribHira: size = 1; break;
+        case kAribKata: size = 2; break;
+        case kAribKanji:
+        case kAribSymbols: size = 2 + (set != g0 ? 3 : 0) + (shifted ? 1 : 0); break;
+        default: return done(kIllegal, count);
+        }
+        count += size;
+        if (dst) {
+            if (m.r32(dst_len) < count) return done(kExhausted, count - size);
+            if (set == kAribAlnum) {
+                if (!shifted) m.w8(dst++, 0x0E);
+                m.w8(dst++, static_cast<u8>(code));
+            } else if (set == kAribHira) {
+                m.w8(dst++, static_cast<u8>(code));
+            } else if (set == kAribKata) {
+                m.w8(dst++, static_cast<u8>(code >> 8));
+                m.w8(dst++, static_cast<u8>(code));
+            } else {
+                if (set != g0) {
+                    m.w8(dst++, 0x1B);
+                    m.w8(dst++, '$');
+                    m.w8(dst++, set == kAribKanji ? 'B' : ';');
+                }
+                if (shifted) m.w8(dst++, 0x0F);
+                m.w8(dst++, static_cast<u8>(code >> 8));
+                m.w8(dst++, static_cast<u8>(code & 0x7F));
+            }
+        }
+        if (set == kAribAlnum) {
+            shifted = true;
+        } else if (set == kAribKanji || set == kAribSymbols) {
+            g0 = set;
+            shifted = false;
+        }
+        consumed += took;
+        if (m.r32(src_len) <= consumed) {
+            m.w32(dst_len, count);
+            return m.ok() ? kOK : kIllegal;
+        }
+    }
+}
+
+u32 UCS2stoARIBs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return arib_encode<false>(ctx, "UCS2stoARIBs", src, sl, dst, dl); }
+u32 UTF8stoARIBs(PPUContext& ctx, u32 src, u32 sl, u32 dst, u32 dl) { return arib_encode<true>(ctx, "UTF8stoARIBs", src, sl, dst, dl); }
+
+// ------------------------------------------------------------------------------------------------- jstrchk
+
+// jstrnchk (0x11f8): the Japanese encodings the len bytes at src could be in, or'd: L10N_STR_ASCII (2), _JIS (4),
+// _EUCJP (8), _SJIS (16), _UTF8 (32); L10N_STR_UNKNOWN (1) when none is left or an escape is malformed. Seven-bit
+// text is read as ISO-2022-JP (its escapes and shifts mark JIS; ESC $ @ and ESC $ B rule the others out); the first
+// byte with the high bit set starts three machines (Shift_JIS, EUC-JP, UTF-8) over the rest, each ruling its
+// encoding out at a byte that cannot follow, until all three have.
+s32 jstr_check(Mem& m, u32 p, u32 left)
+{
+    enum : u32 { kUnknown = 1, kAscii = 2, kJis = 4, kEucJp = 8, kSjis = 16, kUtf8 = 32 };
+    u32 flags = kAscii | kEucJp | kSjis | kUtf8;
+    u32 bad = 0;       // after a malformed designation: 2, less one at each later designation
+    u32 set = 1;       // ISO-2022-JP: 1 ASCII, 2 JIS X 0201 katakana, 3 JIS X 0208, 4 another two-byte set
+    bool out = false;  // shifted out (SO)
+    const auto take = [&](u8* b) {
+        if (!left) return false;
+        left--;
+        *b = m.r8(p++);
+        return true;
+    };
+    // A designation's final byte F (ESC ( F, ESC $ F, ESC $ ( F).
+    const auto designate = [&](u8 f, bool two) {
+        if (bad) bad--;
+        const bool valid = ((f - 0x30) & 0xFF) <= 78;
+        if (!valid) {
+            flags &= ~kJis;
+            bad = 2;
+        }
+        if (!two) {
+            set = 1;
+            if (f == 'I') {
+                flags |= kJis;
+                set = 2;
+            }
+        } else if (valid && (f == '@' || f == 'B')) {
+            flags = (flags | kJis) & ~(kAscii | kEucJp | kSjis | kUtf8);
+            set = 3;
+        } else {
+            set = 4;
+        }
+    };
+    u8 b = 0;
+    while (take(&b)) {
+        if (!m.ok()) return kUnknown;
+        if (b == 0x0F || b == 0x0E) {
+            flags |= kJis;
+            out = b == 0x0E;
+            continue;
+        }
+        if (b == 0x1B) {
+            u8 b2 = 0, f = 0;
+            if (!take(&b2)) break;
+            if (b2 == '&') {
+                // ESC & @ (JIS X 0208's 1990 announcement); anything else after ESC & is unknown.
+                if (!left) break;
+                left--;
+                if (m.r8(p) != '@') return kUnknown;
+                p++;
+                flags |= kJis;
+            } else if (b2 == '(') {
+                if (!take(&f)) break;
+                designate(f, false);
+            } else if (b2 == '$') {
+                if (!take(&f)) break;
+                if (f == '(' && !take(&f)) break;
+                designate(f, true);
+            }
+            continue;
+        }
+        if (b < 0x80) {
+            if (out && jis_byte(b)) continue;
+            if (bad) flags &= ~kJis;
+            if (set == 1 || !jis_byte(b) || bad) continue;
+            if (set == 3 || set == 4) {
+                // The second byte of a two-byte character.
+                if (!left) return (flags & 0x3E) ? static_cast<s32>(flags) : kUnknown;
+                left--;
+                p++;
+            }
+            continue;
+        }
+        // The machines, from this byte to the end or until all have failed.
+        flags &= ~kAscii;
+        u32 sjis = 1, euc = 1, utf8 = 1;
+        for (;;) {
+            if (sjis == 1) {
+                if (((b - 0x81) & 0xFF) <= 30 || ((b - 0xE0) & 0xFF) <= 28) sjis = 3;
+                else if (b >= 0x80 && ((b - 0xA1) & 0xFF) > 62) sjis = 0;
+            } else if (sjis == 3) {
+                sjis = ((b - 0x40) & 0xFF) <= 188 && b != 0x7F ? 1 : 0;
+            }
+            if (!sjis) flags &= ~kSjis;
+            if (euc == 1) {
+                if (((b - 0xA1) & 0xFF) <= 93) euc = 3;
+                else if (b == 0x8E) euc = 2;
+                else if (b == 0x8F) euc = 4;
+                else if (b >= 0x80) euc = 0;
+            } else if (euc == 2) {
+                euc = ((b - 0xA1) & 0xFF) <= 62 ? 1 : 0;
+            } else if (euc == 3) {
+                euc = ((b - 0xA1) & 0xFF) <= 93 ? 1 : 0;
+            } else if (euc == 4) {
+                euc = ((b - 0xA1) & 0xFF) <= 93 ? 3 : 0;
+            }
+            if (!euc) flags &= ~kEucJp;
+            if (utf8 == 5) {
+                utf8 = (b & 0xC0) == 0x80 ? 1 : 0;
+            } else if (utf8 == 6) {
+                utf8 = (b & 0xC0) == 0x80 ? 5 : 0;
+            } else if (utf8 == 1) {
+                if ((b & 0xF0) == 0xE0) utf8 = 6;
+                else if ((b & 0xE0) == 0xC0) utf8 = b > 0xC1 ? 5 : 0;
+                else if (b >= 0x80) utf8 = 0;
+            }
+            if (!utf8) flags &= ~kUtf8;
+            if (!(sjis | euc | utf8) || !take(&b)) break;
+            if (!m.ok()) return kUnknown;
+        }
+        if (sjis | euc | utf8) break;
+    }
+    if (!m.ok() || bad || !(flags & 0x3E)) return kUnknown;
+    return static_cast<s32>(flags);
+}
+
+s32 jstrnchk(PPUContext& ctx, u32 src, u32 len)
+{
+    Mem m(ctx, "jstrnchk");
+    return jstr_check(m, src, len);
+}
+
+s32 jstrchk(PPUContext& ctx, u32 src)
+{
+    Mem m(ctx, "jstrchk");
+    u32 len = 0;
+    while (m.r8(src + len) && m.ok()) len++;
+    if (!m.ok()) return 1;
+    return jstr_check(m, src, len);
+}
+
+// ------------------------------------------------------------------------------------------------- converters
+
+// libl10n's code numbers (L10N_UTF8 0 .. L10N_CODEPAGE_869 51; the single-byte code pages are sbcs_page's).
+namespace code {
+enum : u32 { UTF8 = 0, UTF16 = 1, UTF32 = 2, UCS2 = 3, SJIS = 24, GBK = 25, UHC = 26, BIG5 = 27, EUCCN = 30,
+    EUCJP = 31, EUCKR = 32, JIS = 33, ARIB = 34, HZ = 35, GB18030 = 36, MSJIS = 37, kCount = 52 };
+}
+
+// Whether libl10n converts from code s to code d (its converter table, 0x12d60): every encoding to and from UCS-2 and
+// UTF-8 (the Unicode forms among themselves; UCS-4 not at all), and the Japanese and Korean encodings among
+// themselves (EUC-JP, Shift_JIS and ISO-2022-JP; EUC-KR and UHC).
+bool converts(u32 s, u32 d)
+{
+    using namespace code;
+    if (s >= kCount || d >= kCount) return false;
+    if (sbcs_page(s)) return d == UCS2 || d == UTF8;
+    if (sbcs_page(d)) return s == UCS2 || s == UTF8;
+    switch (s) {
+    case UTF8:
+    case UCS2: return (d <= UCS2 && d != s) || (d >= SJIS && d <= MSJIS);
+    case UTF16: return d == UCS2 || d == UTF8 || d == UTF32;
+    case UTF32: return d == UCS2 || d == UTF8 || d == UTF16;
+    case EUCJP: return d == UCS2 || d == UTF8 || d == SJIS || d == JIS;
+    case SJIS: return d == UCS2 || d == UTF8 || d == EUCJP || d == JIS;
+    case JIS: return d == UCS2 || d == UTF8 || d == EUCJP || d == SJIS;
+    case EUCKR: return d == UCS2 || d == UTF8 || d == UHC;
+    case UHC: return d == UCS2 || d == UTF8 || d == EUCKR;
+    case GBK:
+    case BIG5:
+    case EUCCN:
+    case ARIB:
+    case HZ:
+    case GB18030:
+    case MSJIS: return d == UCS2 || d == UTF8;
+    default: return false;
+    }
+}
+
+// l10n_get_converter(src_code, dst_code): a converter handle ((src << 16) | dst), or -1.
+s32 l10n_get_converter(PPUContext&, u32 s, u32 d) { return converts(s, d) ? static_cast<s32>((s << 16) | d) : -1; }
+
+// l10n_convert_str(cd, src, *src_len, dst, *dst_len): the string function for cd's pair, or 3 (ConverterUnknown).
+u32 l10n_convert_str(PPUContext& ctx, u32 cd, u32 src, u32 sl, u32 dst, u32 dl)
+{
+    using namespace code;
+    const u32 s = static_cast<u32>(static_cast<s32>(cd) >> 16), d = cd & 0xFFFF;
+    if (!converts(s, d)) return kUnknownCode;
+    if (sbcs_page(s)) return d == UCS2 ? SBCSstoUCS2s(ctx, src, sl, dst, dl, s) : SBCSstoUTF8s(ctx, src, sl, dst, dl, s);
+    if (sbcs_page(d)) return s == UCS2 ? UCS2stoSBCSs(ctx, src, sl, dst, dl, d) : UTF8stoSBCSs(ctx, src, sl, dst, dl, d);
+    using Fn = u32 (*)(PPUContext&, u32, u32, u32, u32);
+    struct Pair {
+        u32 s, d;
+        Fn fn;
+    };
+    static constexpr Pair kPairs[] = {{ARIB, UCS2, ARIBstoUCS2s}, {ARIB, UTF8, ARIBstoUTF8s},
+        {BIG5, UCS2, BIG5stoUCS2s}, {BIG5, UTF8, BIG5stoUTF8s}, {EUCCN, UCS2, EUCCNstoUCS2s},
+        {EUCCN, UTF8, EUCCNstoUTF8s}, {EUCJP, JIS, EUCJPstoJISs}, {EUCJP, SJIS, EUCJPstoSJISs},
+        {EUCJP, UCS2, EUCJPstoUCS2s}, {EUCJP, UTF8, EUCJPstoUTF8s}, {EUCKR, UHC, EUCKRstoUHCs},
+        {EUCKR, UCS2, EUCKRstoUCS2s}, {EUCKR, UTF8, EUCKRstoUTF8s}, {GB18030, UCS2, GB18030stoUCS2s},
+        {GB18030, UTF8, GB18030stoUTF8s}, {GBK, UCS2, GBKstoUCS2s}, {GBK, UTF8, GBKstoUTF8s},
+        {HZ, UCS2, HZstoUCS2s}, {HZ, UTF8, HZstoUTF8s}, {JIS, EUCJP, JISstoEUCJPs}, {JIS, SJIS, JISstoSJISs},
+        {JIS, UCS2, JISstoUCS2s}, {JIS, UTF8, JISstoUTF8s}, {MSJIS, UCS2, MSJISstoUCS2s},
+        {MSJIS, UTF8, MSJISstoUTF8s}, {SJIS, EUCJP, SJISstoEUCJPs}, {SJIS, JIS, SJISstoJISs},
+        {SJIS, UCS2, SJISstoUCS2s}, {SJIS, UTF8, SJISstoUTF8s}, {UHC, EUCKR, UHCstoEUCKRs},
+        {UHC, UCS2, UHCstoUCS2s}, {UHC, UTF8, UHCstoUTF8s}, {UCS2, ARIB, UCS2stoARIBs},
+        {UCS2, BIG5, UCS2stoBIG5s}, {UCS2, GB18030, UCS2stoGB18030s}, {UCS2, GBK, UCS2stoGBKs},
+        {UCS2, EUCCN, UCS2stoEUCCNs}, {UCS2, EUCJP, UCS2stoEUCJPs}, {UCS2, EUCKR, UCS2stoEUCKRs},
+        {UCS2, HZ, UCS2stoHZs}, {UCS2, JIS, UCS2stoJISs}, {UCS2, MSJIS, UCS2stoMSJISs}, {UCS2, SJIS, UCS2stoSJISs},
+        {UCS2, UHC, UCS2stoUHCs}, {UCS2, UTF8, UCS2stoUTF8s}, {UCS2, UTF16, UCS2stoUTF16s},
+        {UCS2, UTF32, UCS2stoUTF32s}, {UTF8, ARIB, UTF8stoARIBs}, {UTF8, BIG5, UTF8stoBIG5s},
+        {UTF8, EUCCN, UTF8stoEUCCNs}, {UTF8, EUCJP, UTF8stoEUCJPs}, {UTF8, EUCKR, UTF8stoEUCKRs},
+        {UTF8, GB18030, UTF8stoGB18030s}, {UTF8, GBK, UTF8stoGBKs}, {UTF8, JIS, UTF8stoJISs}, {UTF8, HZ, UTF8stoHZs},
+        {UTF8, MSJIS, UTF8stoMSJISs}, {UTF8, SJIS, UTF8stoSJISs}, {UTF8, UHC, UTF8stoUHCs},
+        {UTF8, UCS2, UTF8stoUCS2s}, {UTF8, UTF16, UTF8stoUTF16s}, {UTF8, UTF32, UTF8stoUTF32s},
+        {UTF16, UCS2, UTF16stoUCS2s}, {UTF16, UTF8, UTF16stoUTF8s}, {UTF16, UTF32, UTF16stoUTF32s},
+        {UTF32, UCS2, UTF32stoUCS2s}, {UTF32, UTF8, UTF32stoUTF8s}, {UTF32, UTF16, UTF32stoUTF16s}};
+    for (const Pair& p : kPairs)
+        if (p.s == s && p.d == d) return p.fn(ctx, src, sl, dst, dl);
+    return kUnknownCode;
+}
+
+// l10n_convert(cd, src, dst, *dst_len): one character with cd's character function, its answer passed on and
+// *dst_len set the way that function's kind needs (below); -1 for no converter, or for a pair without a character
+// function (ARIB, HZ and ISO-2022-JP). A NULL dst converts into scratch space.
+s32 l10n_convert(PPUContext& ctx, u32 cd, u32 src, u32 dst, u32 dst_len)
+{
+    using namespace code;
+    const u32 s = static_cast<u32>(static_cast<s32>(cd) >> 16), d = cd & 0xFFFF;
+    if (!converts(s, d) || s == ARIB || s == HZ || s == JIS || d == ARIB || d == HZ || d == JIS) return -1;
+    std::optional<StackVar> scratch;
+    if (!dst) {
+        scratch.emplace(ctx, guest_base(ctx), 32);
+        dst = scratch->addr();
+    }
+    Mem m(ctx, "l10n_convert");
+    // The source as a value, for the functions taking one: a single byte, a UCS-2 or MSJIS unit, a UTF-32 unit.
+    u32 v = 0;
+    if (sbcs_page(s)) v = m.r8(src);
+    else if (s == UCS2 || s == MSJIS) v = m.r16(src);
+    else if (s == UTF32) v = m.r32(src);
+    if (!m.ok()) return 0;
+    // The kinds: the answer and *dst_len (answer != 0); *dst_len the answer and (answer != 0); the answer, the function
+    // setting *dst_len itself.
+    const auto nonzero = [&](u32 r) {
+        m.w32(dst_len, r != 0 ? 1 : 0);
+        return static_cast<s32>(r);
+    };
+    const auto length = [&](u32 r) {
+        m.w32(dst_len, r);
+        return r != 0 ? s32{1} : s32{0};
+    };
+    const auto own = [](u32 r) { return static_cast<s32>(r); };
+    if (sbcs_page(s)) {
+        if (d == UCS2) return nonzero(SBCStoUCS2(ctx, v, dst, s));
+        const s32 r = static_cast<s32>(SBCStoUTF8(ctx, v, dst, s));
+        m.w32(dst_len, r > 0 ? 1 : 0);
+        return r;
+    }
+    if (sbcs_page(d)) {
+        if (s == UTF8) return nonzero(UTF8toSBCS(ctx, src, dst, d));
+        const s32 r = static_cast<s32>(UCS2toSBCS(ctx, v, dst, d));
+        m.w32(dst_len, static_cast<u32>(r < 0 ? 0 : r));
+        return r;
+    }
+    switch (s) {
+    case BIG5: return d == UCS2 ? nonzero(BIG5toUCS2(ctx, src, dst)) : own(BIG5toUTF8(ctx, src, dst, dst_len));
+    case EUCCN: return d == UCS2 ? nonzero(EUCCNtoUCS2(ctx, src, dst)) : own(EUCCNtoUTF8(ctx, src, dst, dst_len));
+    case GBK: return d == UCS2 ? nonzero(GBKtoUCS2(ctx, src, dst)) : own(GBKtoUTF8(ctx, src, dst, dst_len));
+    case GB18030:
+        return d == UCS2 ? nonzero(GB18030toUCS2(ctx, src, dst)) : own(GB18030toUTF8(ctx, src, dst, dst_len));
+    case EUCJP:
+        if (d == UCS2) return nonzero(EUCJPtoUCS2(ctx, src, dst));
+        return own(d == UTF8 ? EUCJPtoUTF8(ctx, src, dst, dst_len) : EUCJPtoSJIS(ctx, src, dst, dst_len));
+    case SJIS:
+        if (d == UCS2) return nonzero(SJIStoUCS2(ctx, src, dst));
+        return own(d == UTF8 ? SJIStoUTF8(ctx, src, dst, dst_len) : SJIStoEUCJP(ctx, src, dst, dst_len));
+    case EUCKR:
+        if (d == UCS2) return nonzero(EUCKRtoUCS2(ctx, src, dst));
+        return own(d == UTF8 ? EUCKRtoUTF8(ctx, src, dst, dst_len) : EUCKRtoUHC(ctx, src, dst, dst_len));
+    case UHC:
+        if (d == UCS2) return nonzero(UHCtoUCS2(ctx, src, dst));
+        return own(d == UTF8 ? UHCtoUTF8(ctx, src, dst, dst_len) : UHCtoEUCKR(ctx, src, dst, dst_len));
+    case MSJIS: return d == UCS2 ? nonzero(MSJIStoUCS2(ctx, v, dst)) : length(MSJIStoUTF8(ctx, v, dst));
+    case UTF16:
+        if (d == UCS2) return nonzero(UTF16toUCS2(ctx, src, dst));
+        return d == UTF32 ? nonzero(UTF16toUTF32(ctx, src, dst)) : own(UTF16toUTF8(ctx, src, dst, dst_len));
+    case UTF32:
+        if (d == UCS2) return nonzero(UTF32toUCS2(ctx, v, dst));
+        return length(d == UTF8 ? UTF32toUTF8(ctx, v, dst) : UTF32toUTF16(ctx, v, dst));
+    case UCS2:
+        switch (d) {
+        case UTF8: return length(UCS2toUTF8(ctx, v, dst));
+        case UTF16: return length(UCS2toUTF16(ctx, v, dst));
+        case UTF32: return length(UCS2toUTF32(ctx, v, dst));
+        case BIG5: return length(UCS2toBIG5(ctx, v, dst));
+        case GB18030: return length(UCS2toGB18030(ctx, v, dst));
+        case GBK: return length(UCS2toGBK(ctx, v, dst));
+        case EUCCN: return length(UCS2toEUCCN(ctx, v, dst));
+        case EUCJP: return length(UCS2toEUCJP(ctx, v, dst));
+        case EUCKR: return length(UCS2toEUCKR(ctx, v, dst));
+        case MSJIS: return length(UCS2toMSJIS(ctx, v, dst));
+        case SJIS: return length(UCS2toSJIS(ctx, v, dst));
+        case UHC: return length(UCS2toUHC(ctx, v, dst));
+        default: return -1;
+        }
+    case UTF8:
+        switch (d) {
+        case UCS2: return nonzero(UTF8toUCS2(ctx, src, dst));
+        case UTF32: return nonzero(UTF8toUTF32(ctx, src, dst));
+        case MSJIS: return nonzero(UTF8toMSJIS(ctx, src, dst));
+        case UTF16: return own(UTF8toUTF16(ctx, src, dst, dst_len));
+        case BIG5: return own(UTF8toBIG5(ctx, src, dst, dst_len));
+        case EUCCN: return own(UTF8toEUCCN(ctx, src, dst, dst_len));
+        case EUCJP: return own(UTF8toEUCJP(ctx, src, dst, dst_len));
+        case EUCKR: return own(UTF8toEUCKR(ctx, src, dst, dst_len));
+        case GB18030: return own(UTF8toGB18030(ctx, src, dst, dst_len));
+        case GBK: return own(UTF8toGBK(ctx, src, dst, dst_len));
+        case SJIS: return own(UTF8toSJIS(ctx, src, dst, dst_len));
+        case UHC: return own(UTF8toUHC(ctx, src, dst, dst_len));
+        default: return -1;
+        }
+    default: return -1;
+    }
+}
+
+s32 L10nConvert(PPUContext& ctx, u32 src_code, u32 src, u32 dst_code, u32 dst, u32 dst_len)
+{
+    const s32 cd = l10n_get_converter(ctx, src_code, dst_code);
+    return cd == -1 ? -1 : l10n_convert(ctx, static_cast<u32>(cd), src, dst, dst_len);
+}
+
+u32 L10nConvertStr(PPUContext& ctx, u32 src_code, u32 src, u32 sl, u32 dst_code, u32 dst, u32 dl)
+{
+    const s32 cd = l10n_get_converter(ctx, src_code, dst_code);
+    return cd == -1 ? kUnknownCode : l10n_convert_str(ctx, static_cast<u32>(cd), src, sl, dst, dl);
+}
+
 } // namespace
 
 void register_cellL10n(Registry& r)
@@ -3321,6 +4008,12 @@ void register_cellL10n(Registry& r)
         f("UTF8toBIG5", &thunk<&UTF8toBIG5>), f("BIG5stoUCS2s", &thunk<&BIG5stoUCS2s>),
         f("BIG5stoUTF8s", &thunk<&BIG5stoUTF8s>), f("UCS2stoBIG5s", &thunk<&UCS2stoBIG5s>),
         f("UTF8stoBIG5s", &thunk<&UTF8stoBIG5s>),
+        f("ARIBstoUCS2s", &thunk<&ARIBstoUCS2s>), f("ARIBstoUTF8s", &thunk<&ARIBstoUTF8s>),
+        f("UCS2stoARIBs", &thunk<&UCS2stoARIBs>), f("UTF8stoARIBs", &thunk<&UTF8stoARIBs>),
+        f("jstrnchk", &thunk<&jstrnchk>), f("jstrchk", &thunk<&jstrchk>),
+        f("l10n_get_converter", &thunk<&l10n_get_converter>), f("l10n_convert", &thunk<&l10n_convert>),
+        f("l10n_convert_str", &thunk<&l10n_convert_str>), f("L10nConvert", &thunk<&L10nConvert>),
+        f("L10nConvertStr", &thunk<&L10nConvertStr>),
     });
 }
 

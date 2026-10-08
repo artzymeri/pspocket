@@ -6189,3 +6189,25 @@ Guest pointers are checked (D-042): libl10n would fault where pspocket refuses a
 - Part 2: Korean (20: EUC-KR and cp949's UHC, KS X 1001 then cp949's extension, UHC's extension cells read without an
   FFFF check as libl10n does) and Chinese (32: EUC-CN, GBK with the euro sign at 80, GB18030 with its own rows, A8-A9,
   D7 and FE cells and CJK Extension A's four-byte cells, Big5). Two million comparisons more, none differing.
+- Part 3: the Japanese text tools (18): half- and full-width forms both ways (Sony's full-width backslash is A1C0),
+  isEucJpKigou and isSjisKigou, hiragana and katakana, upper and lower case, and the voiced marks: a kana followed by
+  a half-width voiced or semi-voiced mark is written as the one full-width kana (ｳﾞ as ヴ), split back the other way.
+- Part 4: ISO-2022-JP (8: to and from EUC-JP, Shift-JIS, UCS-2 and UTF-8; ESC ( B, ( J, $ @, $ B and $ ( D, JIS X
+  0212 read as libl10n reads it) and HZ (4: RFC 1843, "~\n" a newline; the UCS-2 and UTF-8 forms' differing lengths
+  kept).
+- Part 5: ARIB STD-B24, the Japanese caption code (4): four graphic sets G0..G3 (kanji, alphanumerics, hiragana,
+  katakana), the locking and single shifts, the designations libl10n knows (kanji, JIS kanji plane 1, the additional
+  symbols, alphanumerics, hiragana, katakana; the others refused); kanji rows 1..3 ARIB's own (its non-spacing marks as
+  combining characters), the additional symbols from the public table; the encoders write alphanumerics after LS1,
+  hiragana in GR, katakana after SS3, kanji and symbols after ESC $ B or ESC $ ; as needed. jstrchk and jstrnchk (2):
+  which Japanese encodings a string could be in (ASCII 2, JIS 4, EUC-JP 8, Shift-JIS 16, UTF-8 32, unknown 1): 7-bit
+  text read as ISO-2022-JP, then from the first 8-bit byte three machines for Shift-JIS, EUC-JP and UTF-8 each ruling
+  its encoding out. The converter dispatch (5: L10nConvert, L10nConvertStr, l10n_get_converter, l10n_convert,
+  l10n_convert_str): libl10n's 52 x 52 converter table written as its rule (every encoding to and from UCS-2 and UTF-8,
+  the Unicode forms among themselves, EUC-JP, Shift-JIS and ISO-2022-JP among themselves, EUC-KR and UHC; nothing for
+  UCS-4), the character form's *dst_len per function kind, no character form for ARIB, HZ and ISO-2022-JP (-1).
+  Quirks kept: ARIBstoUCS2s checks the room for an additional symbol before counting it (one unit past *dst_len is
+  written, a full destination reports one less), ARIBstoUTF8s reports one unit less at an invalid one-byte character,
+  and the two report a different *src_len at an unassigned kanji.
+- All 165 of libl10n's functions are pspocket's own; the comparison makes about 10.9 million checks (5.4 million calls
+  on each side, 2.5 minutes), none differing, and a deliberately wrong converter table fails it.

@@ -26,14 +26,6 @@ jis0208 = [cp932_cell(r, c) for r in JIS_ROWS for c in range(1, 95)][:7150]
 row13 = [cp932_cell(13, c) for c in range(1, 95)]
 necsel = [cp932_cell(r, c) for r in range(89, 93) for c in range(1, 95)]                      # 376
 ibmext = [cp932_cell(r, c) for r in range(115, 120) for c in range(1, 95)][:388]                # FA40..FC4B
-# An IBM extension character's JIS code (SJIStoEUCJP, SJISstoJISs): the same character's NEC row 13 cell, else its
-# NEC-selected cell, else its JIS X 0208 cell (Sony's order, found by comparison: ¬ and ∵ take the NEC cells).
-first = {}
-for code, u in ([(0x2D21 + i, u) for i, u in enumerate(row13)] +
-                [(((89 + i // 94 + 0x20) << 8) | (i % 94 + 0x21), u) for i, u in enumerate(necsel)] +
-                [(((JIS_ROWS[i // 94] + 0x20) << 8) | (i % 94 + 0x21), u) for i, u in enumerate(jis0208)]):
-    if u != 0xFFFF and u not in first: first[u] = code
-ibm2jis = [first.get(u, 0) for u in ibmext]
 # JIS X 0212 (EUC-JP 8F xx xx): rows 2, 6, 7, 9, 10, 11, 16-77 to EDE3 (6365 cells), as euc_jp reads it, with two
 # cells as Sony reads them: 2-23 (A2B7) FULLWIDTH TILDE and 2-35 (A2C3) FULLWIDTH BROKEN BAR (Microsoft's EUC-JP).
 X0212_ROWS = [2, 6, 7, 9, 10, 11] + list(range(16, 78))
