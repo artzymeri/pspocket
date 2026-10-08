@@ -306,6 +306,13 @@ class FormatSource {
 public:
     virtual ~FormatSource() = default;
     virtual u64 next() = 0; // the next argument's 64-bit slot (an int is its low word, a double its bits)
+    // The next integer or pointer argument of `bits` (32 or 64), in the low bits: a source that keeps a 32-bit value
+    // elsewhere than a 64-bit one (an SPU's quadwords) needs to know which; the PPU's slots do not.
+    virtual u64 next_int(u32 bits)
+    {
+        (void)bits;
+        return next();
+    }
     virtual double next_double() { return std::bit_cast<double>(next()); }
     // The string at `addr`: up to its NUL, at most `max` bytes (wide: characters).
     virtual std::optional<std::string> string(u32 addr, u64 max) = 0;
@@ -490,7 +497,7 @@ FormatResult<C> format(std::basic_string_view<C> fmt, FormatSource& src)
         }
         if (at(i) == '*') {
             i++;
-            const s32 w = static_cast<s32>(src.next());
+            const s32 w = static_cast<s32>(src.next_int(32));
             if (w < 0) s.minus = true;
             s.width = std::min<u64>(w < 0 ? 0 - static_cast<u64>(static_cast<s64>(w)) : static_cast<u64>(w), kMaxWidth);
         } else {
@@ -500,7 +507,7 @@ FormatResult<C> format(std::basic_string_view<C> fmt, FormatSource& src)
             i++;
             if (at(i) == '*') {
                 i++;
-                const s32 p = static_cast<s32>(src.next());
+                const s32 p = static_cast<s32>(src.next_int(32));
                 s.prec = p < 0 ? -1 : p;
             } else {
                 u64 p = 0;
@@ -528,19 +535,19 @@ FormatResult<C> format(std::basic_string_view<C> fmt, FormatSource& src)
         const s64 conv = at(i++);
         switch (conv) {
         case 'd': case 'i': case 'u': case 'o': case 'x': case 'X':
-            put_integer(out, s, static_cast<char>(conv), src.next());
+            put_integer(out, s, static_cast<char>(conv), src.next_int(int_bits(s.len) > 32 ? 64 : 32));
             break;
         case 'p': {
             Spec p = s;
             p.len = Len::None;
-            put_integer(out, p, 'p', src.next());
+            put_integer(out, p, 'p', src.next_int(32));
             break;
         }
         case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
             put_double(out, s, static_cast<char>(conv), src.next_double());
             break;
         case 'c': {
-            const u64 v = src.next();
+            const u64 v = src.next_int(32);
             std::basic_string<C> body;
             if constexpr (sizeof(C) == 1) {
                 if (s.len == Len::l) { // a wint_t converted as by wcrtomb
@@ -561,7 +568,7 @@ FormatResult<C> format(std::basic_string_view<C> fmt, FormatSource& src)
             break;
         }
         case 's': {
-            const u32 addr = static_cast<u32>(src.next());
+            const u32 addr = static_cast<u32>(src.next_int(32));
             std::basic_string<C> body;
             const u64 max = s.prec >= 0 ? static_cast<u64>(s.prec) : ~u64{0};
             if (!addr) {
@@ -591,7 +598,7 @@ FormatResult<C> format(std::basic_string_view<C> fmt, FormatSource& src)
             break;
         }
         case 'n': {
-            const u32 addr = static_cast<u32>(src.next());
+            const u32 addr = static_cast<u32>(src.next_int(32));
             const u32 bytes = s.len == Len::hh ? 1 : s.len == Len::h ? 2 : int_bits(s.len) == 64 ? 8 : 4;
             if (!src.store(addr, out.size(), bytes))
                 src.problems.push_back(std::format("the %n argument {:#x} is not memory (nothing stored)", addr));

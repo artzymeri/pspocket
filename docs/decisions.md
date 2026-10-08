@@ -6129,3 +6129,39 @@ Part 5a of D-511 (runtime/hle/src/sys_libc_time.cpp), under sys_libc and sys_lib
   locale objects (_Locale, _Clocale, _Loctab, _Defloc, _Findloc, _Getloc, _Makeloc, _Setloc and their kin), _Stoflt,
   _Stopfx, _Stoxflt and their wide forms (Dinkumware's digit-array parsing steps).
 Tests: tests/hle/test_libc.cpp, two cases more.
+
+## D-516 · 2026-10-08 · The C library, part 5b: exit and atexit, assertions, locks, SPU printf, _Printf and _Scanf
+
+Part 5b of D-511 (runtime/hle/src/sys_libc_process.cpp), under sys_libc and sys_libm.
+- exit runs the functions atexit, __cxa_atexit (with its argument) and Dinkumware's _Atexit registered, last first
+  (one registered meanwhile runs too; Sony's __call_functions_registered_with_atexit runs them alone), flushes stdio and
+  ends the process through liblv2's sys_process_exit (its own exit list, then lv2). _Exit and abort end it at once
+  (abort with EXIT_FAILURE, its call site logged); exitspawn and _Exitspawn are exit's and _Exit's way into
+  sys_game_process_exitspawn. environ is an empty list.
+- _Assert prints Dinkumware's "<message> -- assertion failed" on stderr and ends the program; _Nonfatal_Assert prints
+  it and returns; Sony's _SCE_Assert prints the strings among its first four arguments and ends the program.
+- The library's locks: Dinkumware's _Mtxinit/_Mtxdst/_Mtxlock/_Mtxunlock as host recursive mutexes keyed by the guest
+  object's address (nothing written into it, whatever its size), _Locksyslock/_Unlocksyslock (eight numbered locks),
+  _Initlocks and _Clearlocks (nothing to set up), _Once on Dinkumware's flag word (0, 1 while running, 2 done). The
+  variables _Mutex_attr and tls_mutex_attr: sys_mutex_attribute_t for a recursive priority-ordered mutex.
+- SPU printf with the SDK's protocol (Newcastle University's PS3 SPU tutorial shows the official server: SPU port 1, a
+  user event whose data3 is the arguments' LS address, spu_thread_printf(spu, data3), the result back through
+  sys_spu_thread_write_spu_mb): spu_printf_initialize(prio, handler) makes the queue (127, FIFO) and an lv2 thread
+  running the library's server (an internal function), and registers the attach and detach callbacks with liblv2's
+  _sys_spu_printf_initialize (internal descriptors); attach_group connects port 1 of every thread
+  (connect_event_all_threads with only port 1 allowed), attach_thread connects it; finalize destroys the queue, which
+  ends the server, and joins it. A handler, when given, gets each text instead of the TTY.
+- spu_thread_printf/sprintf/snprintf and raw_spu_printf, spu_raw_sprintf/snprintf: the arguments are quadwords in the
+  SPU's local store, the format's LS address in the first one's preferred word, then one argument per quadword (word 0
+  for 32 bits, doubleword 0 for 64-bit integers and doubles), as the SPU ABI keeps variadic arguments: an assumption
+  of the layout, the SDK's spu_printf not being available to read. An SPU thread's store is read through
+  sys_spu_thread_read_ls, a raw SPU's at 0xE0000000 + 0x100000 * id. %n is not written into an SPU's memory. The
+  printf engine gained FormatSource::next_int(bits) for such sources, where a 32-bit value is not in a 64-bit slot's
+  low word.
+- _Printf, _WPrintf, _Scanf and _WScanf: the engines with the caller's pfn (output pieces of up to 512 characters,
+  each call returning the next arg, NULL stopping it; input as pfn(arg, 0, 1) to get and pfn(arg, c, 0) to push back).
+- Not done (signatures not known): the TLS functions (TlsGetValue, TlsSetValue, _Tlsalloc, _Tlsfree, _Tlsget, _Tlsset,
+  _Destroytls), _Once_ctor/_Once_dtor, _Atrealloc, setjmp and longjmp (an engine question: lifted code's native frames
+  would have to unwind), the raw_spu_/spu_thread_ read and write families and the __*_printf/putfld/puttxt internals.
+Tests: tests/hle/test_libc_process.cpp (exit's order, assertions, locks, _Once, _Printf/_Scanf through guest code, an
+SPU program's spu_printf through the server and spu_thread_snprintf on its store).
