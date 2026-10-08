@@ -219,12 +219,23 @@ VideoToolbox (D-254: the same pictures, 77% less CPU). Measured and not kept: ev
 (D-246), corner copies at the end of a pass (D-248), a one-instruction byte reversal (D-253). A booted iOS Simulator
 had been skewing GPU and fps numbers; shut down.
 
+**No PPU code interpreted, and the RSX state games set now used (D-255 to D-267, runs 259-268).** A non-local jump
+(Assassin's Creed's fiber switches) lands in translated code: the interpreter notes the landings and the return
+sites above them, the next preparation translates them as continuations, and Assassin's Creed's walk interprets
+nothing (7 continuations, from 1.5 million instructions a walk). A census of the registers the RSX stored without a
+use found 7 that change what a game sees; all done: the fog factor in FOGC (D-256), two-sided lighting (D-257), the
+clip range and depth clamp (D-258), user clip planes (D-259), constants and vertex bases written inside a draw
+(D-260), the depth bounds test (D-261); then point sprites, polygon stipple, the alpha reference on float targets,
+the window offset and the vertex output mask (D-262 to D-267). kTranslationVersion 4: shader caches are made again
+once.
+
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,
 kernel calls, PPU and SPU instructions translated and fuzz-checked, a checklist per area (each item with its decision)
 and the games against the Flawless bar.
 
-Next: the other audio codec cores on FFmpeg
+Next: SPU registers passed in host registers between translated functions (docs/improve.md, the biggest cost in
+play); vertex textures in 3D and cube; the other audio codec cores on FFmpeg
 (MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
 docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
 with games nobody has analysed (each run's log names what is still missing).

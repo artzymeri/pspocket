@@ -151,6 +151,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Multisampling:** done (D-250): multisampled targets are drawn one texel per sample, as the RSX lays them out, and
   the gate's last RSX failure is gone. Left: WPOS in such a target counts samples (logged per program).
 - **Blending:** ADD_SIGNED (0xf006) draws as ADD, as RPCS3 does (VKGSRender.cpp): only the log line says otherwise.
+- **State the RSX keeps that the backend ignored (census, 2026-10-08):** of 32 registers stored without a use, 7 change
+  what a game sees. Done: the fog factor in FOGC (D-256), two-sided lighting (D-257), the clip range and depth clamp
+  (D-258), user clip planes (D-259), constants and vertex bases written inside a draw (D-260), the depth bounds test
+  (D-261); then the rest of the list: point sizes and sprites (D-262), polygon stipple (D-263), the alpha reference on
+  float targets (D-264), the window offset (D-265), an exported depth's clamp (D-266: Metal already did it), the vertex
+  output mask (D-267). Left: vertex textures in 3D and cube (2D only, D-093), points on multisampled targets (drawn a
+  sample per texel, smaller).
 - **State:** open.
 
 ## Shaders
@@ -263,6 +270,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   (lifted PPU functions load every register they use at their top, so a `goto` after them works), the stack pointer
   the function's return checks against (the resume point's r1 plus the frame its prologue made: 160 here), and the
   callers' return points as continuations too, or the interpreter takes over again one frame up.
+  **Done (D-255, runs 259-268):** landings and the return sites above them are learned by the interpreter (pspocket-boot
+  `--ppu-landings`, the app every 60 s) and translated as continuations by the next preparation; Assassin's Creed's
+  walk interprets no PPU instruction now (7 continuations). Left: a landing in a function without an ABI frame is
+  refused (none so far); on the phone each new set of landings costs one more preparation of the game.
 - **Modules (D-159):** a game's own PRX modules ran interpreted. **Done (D-237 to D-239):** they are translated at
   fixed slots at the top of the PRX region, found on the disc before the first session or saved when the game loads
   them, checked before linking, and run translated (synthetic tests; no local game has modules: run 220).

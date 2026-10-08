@@ -5456,6 +5456,161 @@ a core the game needs. Apple's devices decode H.264 in hardware.
 - Measured (that test, the M4): the decoding thread's CPU for the 59 pictures 114.8 ms in software, 26.1 ms on
   VideoToolbox (-77%: 1.95 to 0.44 ms a picture). Neither local game decodes H.264 through cellVdec (both play Bink
   movies on their SPUs), so no game run shows it yet.
+## D-255 · 2026-10-08 · A non-local jump lands in translated code: continuations, learned from the interpreter
+
+After a longjmp or a fiber switch, the code at the jump's landing (a setjmp's return) and the frames above it ran in
+the interpreter until they returned (D-161, D-213). Assassin's Creed switches fibers thousands of times a second: run
+258 interpreted 18.4 million instructions in 600 s at one landing (0.1% of a core), and every 150 s training walk
+since about 1.5 million. Small, but the goal is no interpreting.
+- The lifter takes continuations (LiftOptions::continuations; ppu-lift `--continuation ADDR`, `--continuations-file`;
+  pspocket-prepare `--ppu-continuations FILE`). A function that holds one becomes a body that takes where it resumes
+  (0: at its entry) and jumps to that label; the function and a `c_ADDR` wrapper per continuation call it, and the
+  wrappers are registered in the dispatch table after the functions. A lifted function loads every register it uses
+  from the context at its top, so going on at a label is exact.
+- Its returns check r1 and LR against their values at its entry (D-161). On a resume they come from the frame: the
+  continuation is taken only in a function whose prologue makes an ABI frame (`stdu r1,-N(r1)` with LR saved in the
+  caller's slot by `mflr r0`, `std r0`), whose back chain at r1 is its r1 at entry, however its body moved r1 since (an
+  alloca's `stdux` keeps the chain too), with its return address 16 bytes above that. Other owners are refused and
+  counted (a function the analyzer also started inside another is passed over for one that has the frame).
+- The landings are learned where the game runs. The interpreter notes where it was entered and ran code (its sites),
+  and every return it made into code with no translation (the frames above a landing, as it climbs back), but not
+  where its run was meant to stop. pspocket-boot `--ppu-landings FILE` and the iPhone app (every 60 s, the game's
+  coverage folder) merge them into a file that only grows. The next preparation translates them; a library is out of
+  date when the file is newer than its manifest. The kernel's resume after a non-local jump runs a continuation at
+  the landing first (RunOptions::lifted_first); the fallbacks' interpreting never does (it would call itself).
+- Checked: a synthetic setjmp/longjmp three frames deep lands in its continuation with no instruction interpreted
+  (tests/ppu jmp_test); one without a continuation is interpreted and leaves both its landing and the return site one
+  frame up in the file (jmp_wrap).
+- Measured (Assassin's Creed, the 150 s training walk): before, 1.57 million instructions interpreted at
+  0xcf6d90 (run 259). With the landings each round learned (one frame a round then, before the return sites were
+  noted) the landing moved up the chain, 1.44 to 1.64 million a run (runs 260 to 265); then none in runs 266 and 267:
+  7 continuations, none refused, nothing interpreted. GTA V interprets nothing either way.
+
+## D-256 · 2026-10-08 · FOGC carries the fog factor of NV4097_SET_FOG_MODE
+
+A fragment program that read FOGC got the vertex program's o5.x in every component. The RSX gives the fog
+coordinate in x and the fog factor from NV4097_SET_FOG_MODE and _FOG_PARAMS in y, clamped to [0, 1] (RPCS3
+RSXFragmentPrologue.glsl fetch_fog_value: linear p1·c + (p0 − 1); exp e^(11.084(p1·c + p0 − 1.5)); exp2
+e^(−(4.709(p1·c + p0 − 1.5))²); and the three again on |c|, modes 0x2601 and 0x800 to 0x804); a game that fogs reads y.
+- The fragment parameters carry the mode and the two parameters (MslFsParams, 16 bytes more); the translated program
+  computes FOGC once at its top when it reads it. kTranslationVersion 4 (with D-257 to D-263): the shader caches are
+  made again.
+- Checked on the GPU (tests/rsx): every mode, both clamps, and the coordinate itself in x.
+
+## D-257 · 2026-10-08 · Two-sided lighting: back faces take the back colours
+
+NV4097_SET_TWO_SIDE_LIGHT_EN was stored and not used: back faces took the front colours. With it on, COL0 and COL1
+are the vertex program's back colours (o3, o4) on back faces (RPCS3 VKFragmentProgram.cpp two_sided_lighting). The
+vertex shader put them out already; the fragment program picks by [[front_facing]], whose winding follows
+NV4097_SET_FRONT_FACE. The option is part of the fragment program's key.
+- Checked on the GPU: front and back faces, one-sided and two-sided, and a clockwise front face.
+
+## D-258 · 2026-10-08 · Window z is clipped to NV4097_SET_CLIP_MIN/MAX, or clamped there
+
+Metal clipped window z to [0, 1] whatever the game set. The RSX clips it to [clip min, clip max] and stores it as it
+is, or clamps it there when NV4097_SET_ZMIN_MAX_CONTROL says so (RPCS3 VKGSRender.cpp set_viewport with an
+unrestricted depth range and apply_zclip_xform; clamp when its bits 4-7 are set or its clip bits 0-3 are not).
+- The vertex shader's z row maps [min, max] to [0, 1], where Metal clips, and the viewport's depth range maps it back,
+  so the stored depth is the window z. No shader change: the row is computed per draw. Metal's depth range stays
+  inside [0, 1]; the ends are taken in order; an empty range stores its near end, as RPCS3 does.
+- setDepthClipMode clamps instead of clipping when the register asks.
+- Checked on the GPU (a Z16 buffer): the reset range, a range that holds the triangle (stored as it is, either way
+  round), one that clips it at either end, and clamping to the far end.
+
+## D-259 · 2026-10-08 · User clip planes
+
+NV4097_SET_USER_CLIP_PLANE_CONTROL was stored and not used. Each of its six planes (4 bits each: 0 off, 1 keep what
+is below zero, 2 keep what is at or above it) clips by a vertex program output: o5.y, o5.z, o5.w, o6.y, o6.z, o6.w
+(RPCS3 VKVertexProgram.cpp reg_table, RSXDrawCommands.cpp fill_user_clip_data), when the output mask
+(NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK bits 6-11) puts it out.
+- The vertex shader puts out Metal clip distances for the planes that are on, negated for "below zero"; a program
+  with planes is a variant of its own (its key holds them), the usual two variants stay where they were.
+- Checked on the GPU: each side, a plane whose output is masked off, a second plane, both together.
+
+## D-260 · 2026-10-08 · A constant or vertex base written between BEGIN and END splits the draw
+
+A vertex constant, the constants' load slot, NV4097_SET_VERTEX_DATA_BASE_OFFSET or _BASE_INDEX written between two
+DRAW_ARRAYS (or DRAW_INDEX_ARRAY) of one BEGIN/END took effect for the whole draw. RPCS3 defers those writes as
+barriers in the draw clause, so the ranges before them draw with the state they saw (common.cpp
+push_draw_parameter_change, nv4097.cpp set_transform_constant).
+- The FIFO: such a write while a clause has ranges, when it changes the value, sends the ranges so far as a draw and
+  goes on with the same primitive. A write of the value already there changes nothing and splits nothing. Inline
+  arrays and immediate vertices are not split (RPCS3 only splits ranges).
+- The RSX status line counts the splits.
+- Checked on the GPU: a colour constant between two triangles (two draws, each its colour), the same value written
+  again (one draw), a vertex base moved by three vertices between two ranges.
+## D-261 · 2026-10-08 · The depth bounds test, from a copy of the depth buffer
+
+NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE was stored and not used: a fragment whose pixel's stored depth lies outside
+NV4097_SET_DEPTH_BOUNDS_MIN/MAX was drawn. Games use it to keep light volumes and full-screen passes off the pixels
+they do not touch (the sky). RPCS3 sets the host's depth bounds (VKDraw.cpp) and skips the test where the host has
+none, as on MoltenVK; Metal has none.
+- A draw with the test on, and bounds that can leave something out, reads the depth buffer in its fragment program
+  (texture 16, `depth2d`, read at the pixel) and discards outside the bounds, before anything else. What it reads is
+  a copy of the depth buffer made before the draw and again only after depth was written since (D-148's copies; a
+  stencil written since does not matter), so a run of such draws shares one copy and keeps its render pass. The
+  option is part of the fragment program's key.
+- Counted: BackendStats::depth_bounds_draws, per frame in the backend's status line. GTA V's walk: 38 to 91 draws a
+  frame in play (its lights), one more depth copy and render pass a frame, GPU time within noise.
+- Checked on the GPU (Z16): off; bounds that pass the triangle's depth and not the cleared one, the other way round,
+  both, neither; the whole range, which needs no copy. The copy follows a draw that wrote depth just before.
+
+## D-262 · 2026-10-08 · Points take the size register; point sprites replace texture coordinates
+
+A point's size was always the vertex program's o6.x, 0 when the program does not write o6, and
+NV4097_SET_POINT_SPRITE_CONTROL was stored and not used.
+- The size (RPCS3 VKVertexProgram.cpp insertMainEnd): the program's o6.x when it writes o6 and
+  NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK bit 5 is set, else NV4097_SET_POINT_SIZE. The register goes in the vertex
+  parameters, negated when the mask bit is set, so the program's two point variants stay as they were.
+- Sprites (RPCS3 RSXThread.cpp, FragmentProgramDecompiler.cpp texcoord_is_point_coord): on a point draw with the
+  control's bit 0 set, each texture coordinate in its bits 8-17 is the fragment's place in its point,
+  `[[point_coord]]`: (x, y, 1, 0), or (x, y, 0, 1/w) when the coordinate is 2D; not perspective-corrected. The mask is
+  part of the fragment program's key.
+- Not done: a multisampled target draws a point one texel per sample (D-250), so its point is smaller there.
+- Checked on the GPU: the register's size, the program's, the program's with its mask bit clear; a sprite's
+  coordinates at three corners; the control off, and on for another coordinate.
+
+## D-263 · 2026-10-08 · Polygon stipple
+
+NV4097_SET_POLYGON_STIPPLE and its 32-word pattern were stored and not used. On a polygon draw (triangles and up) a
+fragment is discarded where the pattern's bit is clear: row y % 32, bit x % 32 (RPCS3 RSXROPPrologue.glsl). The
+pattern goes to the fragment program as 128 bytes of its own, only with the option on; the option is part of the
+fragment program's key. Checked on the GPU: a checkerboard, on and off.
+
+## D-264 · 2026-10-08 · The alpha test's reference as the target's format reads it
+
+The alpha reference was always the register's low byte as unorm. On a 16-bit float target it is the register's low
+half as a half float, on a 32-bit float target the register as a float (RPCS3 rsx_methods.h alpha_ref). Checked on
+the GPU: a reference above and below the fragment's alpha on each of the three formats (the low byte of the half
+0.75 is 0, which passed everything before).
+
+## D-265 · 2026-10-08 · NV4097_SET_WINDOW_OFFSET moves where the targets start
+
+It was reported as unsupported and ignored. RPCS3 (RSXThread.cpp get_framebuffer_layout: "Window offset is what
+affects the raster position", found with Turbo: Super Stunt Squad, which declares its framebuffers so) adds
+pitch × y + bytes per pixel × x to every target's address, the depth buffer's too; so does pspocket now. Checked on
+the GPU: a clear with the offset lands at it, nothing around it.
+
+## D-266 · 2026-10-08 · A fragment program's exported depth stays in [0, 1]: checked, Metal does it
+
+RPCS3 clamps exported depth to [0, 1], float depth buffers too, from tests on the hardware (VKFragmentProgram.cpp).
+pspocket wrote it unclamped; the test written for the clamp (a float depth buffer, 1.5 then 1 with less, -0.5 then
+0 with greater) passes with and without it: Metal clamps a fragment's depth to the viewport's depth range. Nothing
+changed but the test, which stays.
+
+## D-267 · 2026-10-08 · An output the vertex output mask leaves out reaches the fragment program as (0, 0, 0, 1)
+
+NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK says which vertex outputs go on to the fragment program. pspocket sent all of
+them. RPCS3 (VKVertexProgram.cpp reg_table) puts out (0, 0, 0, 1) for one the mask leaves out: the colours (o1, o3
+with either diffuse bit, o2, o4 with either specular bit), the fog (o5), the texture coordinates (o7-o14 TEX0-7,
+o15 TEX8, o6 TEX9). The point size (D-262) and the clip planes (D-259) had their bits already.
+- Only an output the program writes, the mask leaves out and the draw's fragment program reads changes anything, so
+  the vertex program has a variant only then (its key holds those outputs). The draw now picks its fragment program
+  before its vertex program. GTA V writes outputs its mask leaves out in 19 vertex programs (counted by a first
+  version that made a variant for each): unread, they cost compiles in play (23 in the gate's walk) and changed
+  nothing.
+- Checked on the GPU: COL0 with both diffuse bits, one, neither; TEX0 with its bit and without; a mask of TEX0 alone.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
