@@ -257,6 +257,12 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   back by _longjmp: the process a quarter less CPU in the crowd (run 129). Left: the few instructions after each
   setjmp, interpreted. Better: translate the code after a setjmp's return as a continuation the dispatcher can enter (a
   setjmp return address as a seed), so a jump lands in translated code.
+  **Measured (run 258, 600 s training walk, 2026-10-08):** 18.4 million instructions from 3.5 million landings at
+  0xcf6d90, about 5 a landing (0.1% of a core). The code there tests a flag, then calls the fiber switch again or
+  returns to its caller, which the interpreter runs until its next call. A continuation entry needs, besides the label
+  (lifted PPU functions load every register they use at their top, so a `goto` after them works), the stack pointer
+  the function's return checks against (the resume point's r1 plus the frame its prologue made: 160 here), and the
+  callers' return points as continuations too, or the interpreter takes over again one frame up.
 - **Modules (D-159):** a game's own PRX modules ran interpreted. **Done (D-237 to D-239):** they are translated at
   fixed slots at the top of the PRX region, found on the disc before the first session or saved when the game loads
   them, checked before linking, and run translated (synthetic tests; no local game has modules: run 220).
