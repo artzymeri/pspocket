@@ -5611,6 +5611,49 @@ o15 TEX8, o6 TEX9). The point size (D-262) and the clip planes (D-259) had their
   nothing.
 - Checked on the GPU: COL0 with both diffuse bits, one, neither; TEX0 with its bit and without; a mask of TEX0 alone.
 
+## D-268 · 2026-10-08 · Vertices and indices loaded in whole words: measured, not kept
+
+The vertex shader reads each attribute of each vertex byte by byte from the game's big-endian data (rsx_fetch: four
+byte loads and three shifts a float, D-068) and each index the same way. Tried: a flag per attribute whose offset and
+stride are multiples of 4 (or 2), set on the CPU, for one word (or half) load and a byte reversal; each copied span
+started at the 16 bytes its first attribute is in, so attributes keep their guest alignment; indices whole when their
+offset is aligned. The fetch test passed both ways.
+- Measured (GTA V's walk, alternating, runs 274-277, own shader caches): GPU time a frame in play 14.45 and 14.56 ms
+  with it, 14.23 and 14.77 ms without: no difference. The vertex stage is not where GTA V's GPU time goes (D-269).
+  Not kept (rule 8).
+
+## D-269 · 2026-10-08 · A vertex program puts out only what its fragment program reads
+
+Every translated vertex program wrote all fifteen of its outputs (two colours each side, the fog, ten texture
+coordinates: 256 bytes a vertex with the position), whatever the draw's fragment program read. On Apple's tile GPUs a
+vertex's outputs go to memory between the vertex and fragment stages, and GTA V's fragment programs read three to six
+of them. Measured first (D-270): in GTA V's frame the vertex stage of its geometry passes takes about 3.5 ms of the
+GPU's 17, the G-buffer pass alone 1.7 ms of its 2.7.
+- The draw picks its fragment program first (D-267), and its vertex program puts out only the outputs that fragment
+  program reads (VpOptions::read_outputs, in o[] registers; the colours of both sides with two-sided lighting); the
+  position, point size and clip distances as before. The decoded program keeps its last eight variants by what tells
+  them apart (point size, clip planes, masked outputs, outputs read), so a draw finds its own without building a key.
+- Variants: one per vertex program and set of outputs read; GTA V's walk compiles as many in play as before (2-4
+  programs and pipelines in the first window, none after). kTranslationVersion 5.
+- Measured (GTA V's walk, three alternating pairs, the same five windows in play): GPU time a frame 16.20 ms against
+  16.52 (-2%), lower in each pair; per-pass timing (D-270): the G-buffer pass's vertex stage about 15% less a draw. On
+  the M4 the bandwidth it saves is plentiful; on the iPhone it is what the GPU is short of.
+
+## D-270 · 2026-10-08 · GPU time by render pass, vertex and fragment apart (PSPOCKET_GPU_PASS_TIMES)
+
+GPU time came only as a whole frame (the command buffers' times, D-148), and Instruments' Metal System Trace,
+attached to pspocket-boot, records no GPU timeline. With PSPOCKET_GPU_PASS_TIMES=1 the backend puts each render pass
+in a command buffer of its own and waits for it (command buffers overlap on the GPU otherwise, and their times do not
+add up), puts what was recorded between two passes (conversions, copies) in one of its own too, and samples Metal's
+stage boundary timestamps at the start and end of each pass's vertex and fragment stages. Every 300 frames it logs the
+frame's passes by their place in the frame, the costliest first: GPU time, vertex and fragment time, the time between
+it and the pass before, draws, targets and the last fragment program's hash. It is a measuring aid: the frame rate
+falls to about 20.
+- GTA V's walk (runs 272, 278): 17-18 ms in about 89 passes, 1-1.3 ms between them. The G-buffer pass (four
+  1280x720 colour targets and depth, 130-250 draws) 2.7-4.2 ms, its vertex stage most of it; a 1280x720 pass with
+  60-100 draws 1.1-1.6 ms; the lighting passes 0.6-0.8 ms; a 64x32 pass of one draw 0.7-0.8 ms of fragment time (its
+  fragment program is next); the post-processing chain 0.3 ms a pass.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
