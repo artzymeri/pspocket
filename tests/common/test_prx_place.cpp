@@ -7,7 +7,9 @@
 #include "pspocket/core/be.h"
 #include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/firmware.hpp"
+#include "pspocket/core/memory_map.h"
 #include "pspocket/recomp/prx_place.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
 #include "synthetic.hpp"
 
 using namespace pspocket;
@@ -54,6 +56,72 @@ TEST_CASE("PRX placement: the fixed layout, and a module relocated at its fixed 
     CHECK(elsewhere->segments[0].bytes != placed->segments[0].bytes);
     CHECK_FALSE(place_prx(*elf, x.bytes, std::vector<u32>{0x30000000}));     // an address per PT_LOAD
     CHECK_FALSE(place_prx(*elf, x.bytes, std::vector<u32>{0, 0x30010000}));   // the first one has none
+}
+
+TEST_CASE("game modules: an identity that follows the module, not the file around it (D-238)")
+{
+    const auto x = test::build_ppu_prx();
+    auto elf = ElfFile::parse(x.bytes);
+    REQUIRE(elf);
+    const std::string id = prx_identity(*elf);
+    CHECK(id.size() == 64);
+    // Read by offset from an archive: the bytes after it are not the module's.
+    std::vector<u8> archived = x.bytes;
+    archived.insert(archived.end(), 4096, 0xAB);
+    auto in_archive = ElfFile::parse(archived);
+    REQUIRE(in_archive);
+    CHECK(prx_identity(*in_archive) == id);
+    // The same module from its debug SELF.
+    const std::vector<u8> self = test::wrap_in_self(x.bytes, {.debug = true, .npdrm = false, .self_type = 4});
+    auto decrypted = decrypt_self(self, {});
+    REQUIRE(decrypted);
+    auto from_self = ElfFile::parse(*decrypted);
+    REQUIRE(from_self);
+    CHECK(prx_identity(*from_self) == id);
+    // One code byte changed: another module.
+    std::vector<u8> changed = x.bytes;
+    changed[elf->segments()[0].offset + 0x40] ^= 1;
+    auto other = ElfFile::parse(changed);
+    REQUIRE(other);
+    CHECK(prx_identity(*other) != id);
+}
+
+TEST_CASE("game modules: slots from the top of the PRX region down, never moved, never below the floor (D-238)")
+{
+    constexpr u32 kTop = PS_MEM_PRX_BASE + PS_MEM_PRX_SIZE, kFloor = 0x3F000000;
+    const std::vector<std::vector<u32>> first = {{0x700, 0x300}, {0x20000, 0, 0x100}};
+    const auto a = game_module_layout(first, kTop, kFloor);
+    REQUIRE(a.size() == 2);
+    CHECK(a[0] == std::vector<u32>{0x3FFE0000, 0x3FFF0000}); // two 64 KB blocks under the top
+    CHECK(a[1] == std::vector<u32>{0x3FFB0000, 0, 0x3FFD0000});
+    CHECK(game_module_layout(first, kTop, kFloor) == a); // the same every time
+
+    // The next preparation appends below the lowest slot: the earlier ones keep theirs.
+    GameModuleLayout layout{"ab", kFloor, {{std::string(64, '1'), a[0], "/dev_bdvd/PS3_GAME/USRDIR/a.sprx"},
+                                              {std::string(64, '2'), a[1], "/dev_bdvd/PS3_GAME/USRDIR/my mod.sprx"}}};
+    CHECK(layout.lowest() == 0x3FFB0000);
+    // A module too big for what is left gets nothing; the one after it still gets a slot.
+    const std::vector<std::vector<u32>> more = {{0x2000000}, {0x100}};
+    const auto b = game_module_layout(more, layout.lowest(), kFloor);
+    REQUIRE(b.size() == 2);
+    CHECK(b[0].empty());
+    CHECK(b[1] == std::vector<u32>{0x3FFA0000});
+    for (const auto& m : {a[0], a[1], b[1]})
+        for (const u32 addr : m) CHECK((addr == 0 || (addr >= kFloor && addr < kTop && (addr & 0xFFFF) == 0)));
+
+    // As text and back.
+    const std::string text = game_module_layout_text(layout);
+    auto parsed = parse_game_module_layout(text);
+    REQUIRE(parsed);
+    CHECK(parsed->executable_sha256 == "ab");
+    CHECK(parsed->floor == kFloor);
+    REQUIRE(parsed->modules.size() == 2);
+    CHECK(parsed->modules[1].addrs == a[1]);
+    CHECK(parsed->modules[1].source == "/dev_bdvd/PS3_GAME/USRDIR/my mod.sprx");
+    REQUIRE(parsed->find(std::string(64, '2')));
+    CHECK(parsed->find(std::string(64, '3')) == nullptr);
+    CHECK_FALSE(parse_game_module_layout("X 1\n"));
+    CHECK_FALSE(parse_game_module_layout("G short 1 30000000 a\n"));
 }
 
 TEST_CASE("firmware modules: which pspocket serves itself, which are translated, the identity line (D-178)")

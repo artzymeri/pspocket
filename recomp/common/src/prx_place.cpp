@@ -5,9 +5,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <format>
 
 #include "pspocket/core/be.h"
+#include "pspocket/core/memory_map.h"
+#include "pspocket/recomp/hash.hpp"
 
 namespace pspocket::recomp {
 namespace {
@@ -44,6 +47,130 @@ std::vector<std::vector<u32>> prx_fixed_layout(std::span<const std::vector<u32>>
             addrs.push_back(static_cast<u32>(addr));
         }
         out.push_back(std::move(addrs));
+    }
+    return out;
+}
+
+std::string prx_identity(const ElfFile& elf)
+{
+    const std::span<const u8> data = elf.data();
+    const ElfHeader& h = elf.header();
+    Sha256 sha;
+    const auto add = [&](u64 offset, u64 size) {
+        if (offset <= data.size()) sha.update(data.subspan(static_cast<usize>(offset),
+                                       static_cast<usize>(std::min<u64>(size, data.size() - offset))));
+    };
+    add(0, h.ehsize ? h.ehsize : h.header_size());
+    add(h.phoff, u64{h.phnum} * h.phentsize);
+    for (const ProgramHeader& ph : elf.segments())
+        if (ph.data_in_file) add(ph.offset, ph.filesz);
+    return to_hex(sha.finish());
+}
+
+std::vector<std::vector<u32>> game_module_layout(std::span<const std::vector<u32>> sizes, u32 below, u32 floor)
+{
+    std::vector<std::vector<u32>> out;
+    out.reserve(sizes.size());
+    u64 top = below;
+    for (const std::vector<u32>& module : sizes) {
+        // The module's own layout from 0, then the block put as high as it fits.
+        std::vector<u64> offsets;
+        u64 cursor = 0;
+        for (const u32 memsz : module) {
+            if (!memsz) {
+                offsets.push_back(~0ull);
+                continue;
+            }
+            const u64 at = align_up(cursor, 0x10000);
+            offsets.push_back(at);
+            cursor = at + memsz;
+        }
+        const u64 block = align_up(cursor, 0x10000);
+        if (!block || block > top || top - block < floor) {
+            out.emplace_back(); // no slot: main memory
+            continue;
+        }
+        const u64 base = top - block;
+        std::vector<u32> addrs;
+        for (const u64 off : offsets) addrs.push_back(off == ~0ull ? 0 : static_cast<u32>(base + off));
+        out.push_back(std::move(addrs));
+        top = base;
+    }
+    return out;
+}
+
+u32 GameModuleLayout::lowest() const
+{
+    u32 low = PS_MEM_PRX_BASE + PS_MEM_PRX_SIZE;
+    for (const Module& m : modules)
+        for (const u32 a : m.addrs)
+            if (a) low = std::min(low, a & ~0xFFFFu);
+    return low;
+}
+
+const GameModuleLayout::Module* GameModuleLayout::find(std::string_view identity) const
+{
+    for (const Module& m : modules)
+        if (m.identity == identity) return &m;
+    return nullptr;
+}
+
+std::string game_module_layout_text(const GameModuleLayout& layout)
+{
+    std::string out = std::format("E {}\nF {:x}\n", layout.executable_sha256, layout.floor);
+    for (const GameModuleLayout::Module& m : layout.modules) {
+        out += std::format("G {} {}", m.identity, m.addrs.size());
+        for (const u32 a : m.addrs) out += std::format(" {:x}", a);
+        out += " " + m.source + "\n";
+    }
+    return out;
+}
+
+Result<GameModuleLayout> parse_game_module_layout(std::string_view text)
+{
+    GameModuleLayout out;
+    usize line_no = 0;
+    while (!text.empty()) {
+        const usize nl = text.find('\n');
+        std::string_view line = text.substr(0, nl);
+        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        line_no++;
+        if (line.empty()) continue;
+        const auto word = [&]() -> std::string_view {
+            while (!line.empty() && line.front() == ' ') line.remove_prefix(1);
+            const usize sp = line.find(' ');
+            const std::string_view w = line.substr(0, sp);
+            line = sp == std::string_view::npos ? std::string_view{} : line.substr(sp + 1);
+            return w;
+        };
+        const auto number = [&](int base, u64& v) {
+            const std::string w(word());
+            if (w.empty()) return false;
+            char* end = nullptr;
+            v = std::strtoull(w.c_str(), &end, base);
+            return end && *end == 0;
+        };
+        const std::string_view kind = word();
+        u64 v = 0;
+        if (kind == "E") {
+            out.executable_sha256 = std::string(word());
+        } else if (kind == "F") {
+            if (!number(16, v)) return make_error("line {}: the floor", line_no);
+            out.floor = static_cast<u32>(v);
+        } else if (kind == "G") {
+            GameModuleLayout::Module m;
+            m.identity = std::string(word());
+            u64 count = 0;
+            if (m.identity.size() != 64 || !number(10, count) || count > 64) return make_error("line {}: a module", line_no);
+            for (u64 i = 0; i < count; i++) {
+                if (!number(16, v)) return make_error("line {}: an address", line_no);
+                m.addrs.push_back(static_cast<u32>(v));
+            }
+            m.source = std::string(line);
+            out.modules.push_back(std::move(m));
+        } else {
+            return make_error("line {}: unknown \"{}\"", line_no, kind);
+        }
     }
     return out;
 }
