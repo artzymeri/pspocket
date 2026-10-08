@@ -28,6 +28,7 @@
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/reservation.h"
+#include "pspocket/core/timebase.h"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/spu/fp.h"
@@ -220,23 +221,22 @@ void Worker::body()
     // set the host's FP control register and restore it, thousands of times a second (run 050: about 3.5% of the
     // workers' time). The scheduler and policies around the SPU code do no floating point.
     const u64 fp_env = ps_spu_fpenv_enter();
-    using Clock = std::chrono::steady_clock;
-    const auto ns = [](Clock::duration d) { return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count()); };
+    // The host clock of one multiply (D-241): steady_clock's reads were 2% of the workers' busy time (run 221).
     while (!sched.stopping.load(std::memory_order_acquire)) {
         // The version is read before selecting, so a change made while selecting ends the wait at once.
         const u64 version = ps_res_version(sched.spurs);
         const Selection sel = select(false);
-        if (spu_num == 0) sched.report_time(ns(Clock::now().time_since_epoch()));
+        if (spu_num == 0) sched.report_time(ps_host_now_ns());
         if (sel.wid >= CELL_SPURS_MAX_WORKLOAD2) {
-            const auto t0 = Clock::now();
+            const u64 t0 = ps_host_now_ns();
             ps_res_wait_change(sched.spurs, version, kIdleWaitNs);
-            const u64 waited = ns(Clock::now() - t0);
+            const u64 waited = ps_host_now_ns() - t0;
             ns_wait += waited;
             sched.wait_ns.fetch_add(waited, std::memory_order_relaxed);
             continue;
         }
         const u64 writes = ctx.mem_writes;
-        const auto t0 = Clock::now();
+        const u64 t0 = ps_host_now_ns();
         // The selection read the workload's state before its update of the line: a shutdown and a join may have come
         // in between, and the game may be freeing the workload. The worker counts itself inside, then reads the state
         // again (both sequentially consistent, as the join's read of the state and then of the count): either it sees
@@ -250,7 +250,7 @@ void Worker::body()
         ps_spu_set_dma_tag(0xFF00000000000000ull | (u64{sel.wid} << 48) | sched.spurs);
         const bool custom = run_workload(sel);
         sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst);
-        const u64 dt = ns(Clock::now() - t0);
+        const u64 dt = ps_host_now_ns() - t0;
         if (custom && ctx.mem_writes == writes) {
             sched.idle_poll_ns.fetch_add(dt, std::memory_order_relaxed);
             ns_idle_polls += dt;
@@ -261,9 +261,9 @@ void Worker::body()
             // polls to change woke it at once: the other SPUs take jobs from the same queue.
             if (++idle_streak >= kIdleStreak) {
                 backoff_ns = backoff_ns ? std::min(backoff_ns * 2, kMaxBackoffNs) : kMinBackoffNs;
-                const auto w0 = Clock::now();
-                std::this_thread::sleep_for(std::chrono::nanoseconds(backoff_ns));
-                const u64 slept = ns(Clock::now() - w0);
+                const u64 w0 = ps_host_now_ns();
+                ps_host_sleep_ns(backoff_ns);
+                const u64 slept = ps_host_now_ns() - w0;
                 ns_wait += slept;
                 sched.wait_ns.fetch_add(slept, std::memory_order_relaxed);
             }

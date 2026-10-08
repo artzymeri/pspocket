@@ -5244,6 +5244,17 @@ by every field that shapes them (format byte, width, height, depth, mip count, d
 most 4,096, all forgotten past that), and IoMap::io_to_ea is inline. Measured with D-241 (runs 226-229): the RSX thread 1.68, 1.49 to
 1.57, 1.47 CPU s per 5 s.
 
+## D-241 · 2026-10-08 · The host clock in one multiply; idle SPURS workers sleep by a Mach trap
+
+Run 221's profile of GTA V under load: of the main SPU threads' busy time, about 7% was the clock and the sleep around
+idle polls. An idle worker running a game's policy module that finds nothing backs off with short sleeps (D-076,
+run 074), and std::this_thread::sleep_for on Apple platforms asks the clock service for the time by a Mach message
+before it sleeps (mach_msg2_trap, 3.3%); each poll read steady_clock four times (2.3%), and every SPU PUT read it once
+more for the DMA log (D-138). ps_host_now_ns is now one multiply of mach_absolute_time (as the timebase, D-128), and
+ps_host_sleep_ns sleeps by mach_wait_until; the workers, the DMA log and ps_res_wait_change's spins use them. Measured with D-242 (runs 226-229, before and after alternating; the idle Mac, the load meant
+for them having failed to start): the main SPU threads 7.54, 6.65 to 7.23, 6.45 CPU s per 5 s, the process 12.59,
+11.26 to 11.99, 11.03; fps the same.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

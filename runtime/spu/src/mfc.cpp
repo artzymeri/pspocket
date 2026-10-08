@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "internal.hpp"
+#include "pspocket/core/timebase.h"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
@@ -209,8 +210,7 @@ void log_write(u32 cmd, u32 pc, u32 ea, u32 size)
 {
     DmaWriteRing& r = dma_ring();
     const u32 i = r.next.load(std::memory_order_relaxed);
-    const u64 now = static_cast<u64>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const u64 now = ps_host_now_ns(); // one multiply (D-241): every SPU PUT comes here
     r.e[i % r.e.size()] = ps_spu_dma_write{ea, size, r.tag, now, pc, cmd};
     r.next.store(i + 1, std::memory_order_release);
 }

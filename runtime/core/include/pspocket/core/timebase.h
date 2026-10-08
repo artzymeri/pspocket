@@ -16,8 +16,11 @@ extern "C" {
 /* Timebase ticks since the runtime first asked for the time. Monotonic, thread-safe. */
 uint64_t ps_timebase_now(void);
 
-/* Host monotonic nanoseconds (for profiling and frame pacing, not for the guest). */
+/* Host monotonic nanoseconds (for profiling and frame pacing, not for the guest). One multiply on Apple platforms. */
 uint64_t ps_host_now_ns(void);
+
+/* Sleeps about `ns` nanoseconds (a short idle wait: a Mach trap on Apple platforms, D-241). */
+void ps_host_sleep_ns(uint64_t ns);
 
 #ifdef __cplusplus
 }

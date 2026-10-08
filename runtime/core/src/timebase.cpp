@@ -1,6 +1,7 @@
 #include "pspocket/core/timebase.h"
 
 #include <chrono>
+#include <thread>
 
 #include "pspocket/core/types.hpp"
 
@@ -20,17 +21,18 @@ struct HostClock {
     mach_timebase_info_data_t info{};
     uint64_t start = 0;
     uint64_t tb_per_tick = 0; // timebase ticks per host tick, 32.32 fixed point
+    uint64_t ns_per_tick = 0; // nanoseconds per host tick, 32.32 fixed point (41.67 on Apple silicon)
     HostClock()
     {
         mach_timebase_info(&info);
         start = mach_absolute_time();
         tb_per_tick = static_cast<uint64_t>((u128{info.numer} * PS_TIMEBASE_HZ << 32) / (u128{info.denom} * 1'000'000'000ull));
+        ns_per_tick = static_cast<uint64_t>((u128{info.numer} << 32) / info.denom);
     }
-    uint64_t ns() const
-    {
-        const u128 t = mach_absolute_time();
-        return static_cast<uint64_t>(t * info.numer / info.denom);
-    }
+    // One multiply, as the timebase (D-128): the SPURS workers and the SPU DMA log read it millions of times a second
+    // (D-241).
+    uint64_t ns() const { return static_cast<uint64_t>(u128{mach_absolute_time()} * ns_per_tick >> 32); }
+    uint64_t ticks_for_ns(uint64_t ns) const { return static_cast<uint64_t>((u128{ns} << 32) / ns_per_tick); }
     uint64_t elapsed_ns() const
     {
         const u128 t = mach_absolute_time() - start;
@@ -73,3 +75,15 @@ extern "C" uint64_t ps_timebase_now(void)
 }
 
 extern "C" uint64_t ps_host_now_ns(void) { return host_clock().ns(); }
+
+extern "C" void ps_host_sleep_ns(uint64_t ns)
+{
+#if defined(__APPLE__)
+    // A Mach trap: nanosleep (std::this_thread::sleep_for) asks the clock service for the time by a Mach message first,
+    // which was most of what an idle SPURS worker's short sleeps cost (D-241, run 221).
+    const HostClock& c = host_clock();
+    mach_wait_until(mach_absolute_time() + c.ticks_for_ns(ns));
+#else
+    std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+#endif
+}
