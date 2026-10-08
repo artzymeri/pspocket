@@ -305,6 +305,10 @@ targets:
       - sdk: AVFoundation.framework
       # Signing on the device: the identity and its key (runtime/codesign, D-150).
       - sdk: Security.framework
+      # H.264 on the media engine: FFmpeg's VideoToolbox hwaccel in cellVdec (D-254).
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
     settings:
       base:
         PRODUCT_NAME: PSPocket

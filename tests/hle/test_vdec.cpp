@@ -16,6 +16,7 @@
 
 #include "firmware_compare.hpp"
 #include "h264_writer.hpp"
+#include "vdec_hw.hpp"
 #include "hle_test_util.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/ppu/asm.hpp"
@@ -394,6 +395,65 @@ TEST_CASE("cellVdec: the same as Sony's libvdec (the user's firmware): sizes, an
 }
 
 #if PSPOCKET_HAVE_FFMPEG
+TEST_CASE("cellVdec: H.264 on VideoToolbox gives the software decoder's pictures, in its order (D-254)", "[hle][vdec]")
+{
+    // The same stream through FFmpeg's software decoder and through its VideoToolbox hwaccel (cellVdec's helper):
+    // the same pictures, sample for sample, in the same order, each with the access unit it came from.
+    const auto decode = [](bool hardware, std::vector<std::vector<uint8_t>>& out, std::vector<int64_t>& from) {
+        const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+        AVCodecContext* ctx = avcodec_alloc_context3(codec);
+        ctx->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+        ctx->thread_count = 1;
+        const bool attached = hardware && pspocket::hle::vdec_hw::attach(ctx);
+        REQUIRE(avcodec_open2(ctx, codec, nullptr) == 0);
+        AVPacket* pkt = av_packet_alloc();
+        AVFrame* frame = av_frame_alloc();
+        bool on_hardware = false;
+        const auto drain = [&] {
+            while (avcodec_receive_frame(ctx, frame) == 0) {
+                on_hardware |= pspocket::hle::vdec_hw::is_hardware(frame);
+                std::vector<uint8_t> y, u, v;
+                REQUIRE(pspocket::hle::vdec_hw::planes(frame, 320, 240, y, u, v));
+                y.insert(y.end(), u.begin(), u.end());
+                y.insert(y.end(), v.begin(), v.end());
+                out.push_back(std::move(y));
+                from.push_back(static_cast<int64_t>(reinterpret_cast<intptr_t>(frame->opaque)));
+                av_frame_unref(frame);
+            }
+        };
+        for (int i = 0; i < 6; i++) {
+            const h::Picture pic = h::pattern(320, 240, i);
+            std::vector<uint8_t> au = h::access_unit(pic, static_cast<uint32_t>(i & 1));
+            pkt->data = au.data();
+            pkt->size = static_cast<int>(au.size());
+            pkt->opaque = reinterpret_cast<void*>(static_cast<intptr_t>(100 + i));
+            REQUIRE(avcodec_send_packet(ctx, pkt) == 0);
+            drain();
+        }
+        REQUIRE(avcodec_send_packet(ctx, nullptr) == 0);
+        drain();
+        av_frame_free(&frame);
+        av_packet_free(&pkt);
+        avcodec_free_context(&ctx);
+        return attached && on_hardware;
+    };
+    std::vector<std::vector<uint8_t>> software, hardware;
+    std::vector<int64_t> software_from, hardware_from;
+    decode(false, software, software_from);
+    const bool on_hardware = decode(true, hardware, hardware_from);
+    REQUIRE(software.size() == 6);
+    if (!on_hardware) {
+        WARN("VideoToolbox did not decode here: only the software path was checked");
+        return;
+    }
+    REQUIRE(hardware.size() == software.size());
+    for (usize i = 0; i < software.size(); i++) {
+        INFO("picture " << i);
+        CHECK(hardware[i] == software[i]);
+        CHECK(hardware_from[i] == software_from[i]);
+    }
+}
+
 TEST_CASE("cellVdec tests: the synthetic H.264 decodes to its own samples (FFmpeg)", "[hle][vdec]")
 {
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);

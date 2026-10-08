@@ -22,6 +22,11 @@ if(pspocket_ffmpeg_dir AND EXISTS ${pspocket_ffmpeg_dir}/lib/libavcodec.a)
         ${pspocket_ffmpeg_dir}/lib/libswscale.a ${pspocket_ffmpeg_dir}/lib/libswresample.a
         ${pspocket_ffmpeg_dir}/lib/libavutil.a)
     target_compile_definitions(pspocket_ffmpeg INTERFACE PSPOCKET_HAVE_FFMPEG=1)
+    # H.264 on the media engine (D-254): FFmpeg's VideoToolbox hwaccel needs Apple's frameworks.
+    if(APPLE AND EXISTS ${pspocket_ffmpeg_dir}/include/libavutil/hwcontext_videotoolbox.h)
+        target_link_libraries(pspocket_ffmpeg INTERFACE "-framework VideoToolbox" "-framework CoreMedia"
+            "-framework CoreVideo" "-framework CoreFoundation")
+    endif()
     add_library(pspocket::ffmpeg ALIAS pspocket_ffmpeg)
     message(STATUS "FFmpeg decoders: ${pspocket_ffmpeg_dir}")
 else()

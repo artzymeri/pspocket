@@ -49,6 +49,7 @@ add_library(pspocket_hle STATIC
     src/cellJpgDec.cpp
     src/jpeg_decoder.cpp
     src/cellVdec.cpp
+    src/vdec_hw.cpp
     src/cellDmuxPamf.cpp
     src/dmux_pamf.cpp
     src/sceNpTrophy.cpp

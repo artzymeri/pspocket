@@ -322,6 +322,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   index past the table. Ext functions still Sony's.
 - **State:** open; the other audio cores when a game's log shows one.
 
+- **Done (D-254):** H.264 decodes on VideoToolbox through FFmpeg's hwaccel: the same pictures as the software decoder,
+  the decoding thread 77% less CPU (0.44 instead of 1.95 ms a 720p picture on the M4). **Try:** a game that plays
+  PAMF movies (neither local game does: both play Bink on their SPUs) for numbers in play, and the phone.
+
 ## The gate (D-149)
 
 - **Seen (2026-10-07 14:14):** test_lv2 failed once in a `ctest -j8` run (LastTestsFailed.log; its output was

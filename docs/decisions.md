@@ -5435,6 +5435,27 @@ table lookup (vqtbl1q_u8 with a constant index vector, kept in a register throug
 - No test and no walk had shown it. scripts/gate.sh all now runs spu-check over the game's SPU programs between the
   tests and the walk (about 90 s, every entry, four trials each; `gate.sh spu` alone as before), so a change to the
   SPU lifter, its header or the host compiler that builds translated code wrong fails the gate.
+## D-254 · 2026-10-08 · H.264 video on the media engine (VideoToolbox)
+
+cellVdec decoded H.264 with FFmpeg's software decoder on the game's decoder thread (D-195). Most PS3 games play their
+movies as H.264 in PAMF, and on the iPhone's efficiency cores a 720p picture in software costs several milliseconds of
+a core the game needs. Apple's devices decode H.264 in hardware.
+
+- FFmpeg (scripts/build-ffmpeg.sh, macOS and iOS) is configured with VideoToolbox and its h264_videotoolbox hwaccel
+  (part of libavcodec, LGPL as the rest); whatever links it links VideoToolbox, CoreMedia, CoreVideo and
+  CoreFoundation (third_party/CMakeLists.txt, app/ios/project.yml).
+- cellVdec asks for the hwaccel on every H.264 decoder it opens (runtime/hle/src/vdec_hw.cpp): FFmpeg still parses the
+  stream, orders the pictures and carries each access unit's tag; the hardware decodes the slices. Its pictures come
+  back as pixel buffers, copied out as NV12 and split into cellVdec's three 4:2:0 planes. When VideoToolbox cannot
+  take a stream, FFmpeg's format choice falls back to software; PSPOCKET_VDEC_SOFTWARE=1 forces software. MPEG-2 and
+  MPEG-4 part 2 stay in software.
+- Checked: real H.264 made by the Mac's own encoder (1280x720, High profile, CABAC, P and B pictures, a moving pattern;
+  tests/hle/test_vdec_vt.cpp): all 59 pictures the same sample for sample as the software decoder's, in the same
+  order; the synthetic I_PCM stream through cellVdec's helper the same as well, with each picture's access unit;
+  every cellVdec test (Sony's libvdec comparisons included) passes with it on.
+- Measured (that test, the M4): the decoding thread's CPU for the 59 pictures 114.8 ms in software, 26.1 ms on
+  VideoToolbox (-77%: 1.95 to 0.44 ms a picture). Neither local game decodes H.264 through cellVdec (both play Bink
+  movies on their SPUs), so no game run shows it yet.
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

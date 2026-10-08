@@ -52,6 +52,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 }
+#include "vdec_hw.hpp"
 #endif
 
 namespace pspocket::hle {
@@ -679,18 +680,12 @@ void receive_pictures(Vdec& v, std::map<u64, AuMeta>& in_flight, u64 seq)
         p.width = static_cast<u32>(f->width);
         p.height = static_cast<u32>(f->height);
         p.pict_type = f->pict_type;
-        if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P) {
-            PS_LOG_ERROR(kChan, "decoder {:#x}: a picture in pixel format {} (not 4:2:0) is not supported", v.handle, f->format);
+        // 4:2:0 from FFmpeg's software decoder, or from the media engine's pixel buffer (D-254).
+        if (!vdec_hw::planes(f, p.width, p.height, p.y, p.u, p.v)) {
+            PS_LOG_ERROR(kChan, "decoder {:#x}: a picture in pixel format {} (not 8-bit 4:2:0) is not supported", v.handle,
+                f->format);
             av_frame_unref(f);
             continue;
-        }
-        p.y.resize(p.width * p.height);
-        p.u.resize(p.width * p.height / 4);
-        p.v.resize(p.width * p.height / 4);
-        for (u32 r = 0; r < p.height; r++) std::memcpy(&p.y[r * p.width], f->data[0] + r * f->linesize[0], p.width);
-        for (u32 r = 0; r < p.height / 2; r++) {
-            std::memcpy(&p.u[r * p.width / 2], f->data[1] + r * f->linesize[1], p.width / 2);
-            std::memcpy(&p.v[r * p.width / 2], f->data[2] + r * f->linesize[2], p.width / 2);
         }
         v.held.push_back(std::move(p));
         av_frame_unref(f);
@@ -875,10 +870,12 @@ s32 open(PPUContext& ctx, u32 type, u32 spec, u32 res, u32 cb, u32 handle_out, c
     v->av->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
     v->av->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
     v->av->thread_count = 1; // pictures out as soon as decoded: Sony's lag is added in announce()
+    const bool hardware = vdec_hw::attach(v->av); // H.264 on the media engine (D-254)
     if (avcodec_open2(v->av, dec, nullptr) < 0) {
         PS_LOG_ERROR(kChan, "{}: FFmpeg's decoder for codec {} did not open", call, codec);
         return error(CELL_VDEC_ERROR_FATAL);
     }
+    PS_LOG_INFO(kChan, "{}: codec {} decodes {}", call, codec, hardware ? "on VideoToolbox" : "in software");
 #else
     PS_LOG_ERROR(kChan, "{}: pspocket was built without FFmpeg: no video decoding", call);
     return error(CELL_VDEC_ERROR_FATAL);

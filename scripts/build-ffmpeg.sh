@@ -53,7 +53,11 @@ COMMON=(--disable-everything --disable-programs --disable-doc --disable-network 
     --disable-gpl --disable-nonfree --disable-version3 --disable-avformat --disable-avdevice --disable-avfilter
     --disable-postproc --enable-avcodec --enable-avutil --enable-swscale --enable-swresample
     --enable-static --disable-shared --enable-pic --disable-debug
-    "--enable-decoder=$DECODERS" "--enable-parser=$PARSERS")
+    "--enable-decoder=$DECODERS" "--enable-parser=$PARSERS"
+    --enable-videotoolbox --enable-hwaccel=h264_videotoolbox)
+# H.264 on the media engine through VideoToolbox (D-254): FFmpeg still parses and orders the pictures, the hardware
+# decodes the slices. Apple's frameworks, linked by whatever links these libraries: VideoToolbox, CoreMedia, CoreVideo
+# and CoreFoundation.
 
 build() { # name sdk cflags...
     local name="$1" sdk="$2"

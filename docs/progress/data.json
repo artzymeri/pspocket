@@ -286,9 +286,9 @@
           "ref": "D-199, D-200, D-202"
         },
         {
-          "name": "Hardware video decoding (VideoToolbox)",
-          "state": "todo",
-          "ref": "docs/firmware.md"
+          "name": "Hardware video decoding (VideoToolbox, H.264)",
+          "state": "done",
+          "ref": "D-254"
         }
       ]
     },
