@@ -5958,3 +5958,12 @@ every key sheap object, each answer and every byte of the heap, its key table an
   process): a fatal log here (D-047).
 - cellSheapInitialize is now libsre's two layers: the public checks, then the internal initialize that takes the area
   apart from the header (the key sheap puts its table between them).
+
+## D-508 · 2026-10-08 · cellSpudll, the same as libsre
+
+The two PPU functions of SPU shared objects (libsre 4.92; RPCS3 has a TODO for one), pspocket's own
+(runtime/hle/src/cellSpudll.cpp) and compared with libsre over thirteen shapes of SPU .so (tests/hle/
+test_spurs_compare.cpp): cellSpudllHandleConfigSetDefaultValues (every field 0 but the two maximum counts, 16) and
+cellSpudllGetImageSize (an ELF32 big-endian ET_DYN SPU object with 32-byte program headers, at most four loadable
+segments and a dynamic one at a non-zero address; its span from the lowest loadable address, which starts at 0x40000,
+plus the tables of referred and depended-on objects, each part rounded up to 128 bytes; INVAL otherwise).

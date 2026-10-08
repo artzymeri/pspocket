@@ -451,3 +451,115 @@ TEST_CASE("cellSpursSetPreemptionVictimHints needs the system workload; jobbin2 
     CHECK(ps_read16(b, kOut + 8) == (0x3400 + 0x140 - 0x3000 - 0x40) / 16);
     CHECK(b[kOut + 44] == 4);
 }
+
+TEST_CASE("cellSpudll against libsre (D-508)", "[hle][lle][spurs]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    FirmwareLibrary sony(f, t, *flash, "cellSpudll", false);
+    u8* b = f.base();
+    // An SPU shared object: its header, then program headers of the types given (vaddr 0x100 * i, memsz 0x180).
+    const auto so = [&](u16 type, u8 cls, u8 data, u16 machine, u16 phentsize, std::vector<u32> types, u32 vbase) {
+        std::memset(b + kElf, 0, 0x400);
+        ps_write32(b, kElf, 0x7F454C46);
+        b[kElf + 4] = cls;
+        b[kElf + 5] = data;
+        ps_write16(b, kElf + 16, type);
+        ps_write16(b, kElf + 18, machine);
+        ps_write32(b, kElf + 28, 0x40);
+        ps_write16(b, kElf + 42, phentsize);
+        ps_write16(b, kElf + 44, static_cast<u16>(types.size()));
+        for (u32 i = 0; i < types.size(); i++) {
+            ps_write32(b, kElf + 0x40 + 32 * i, types[i]);
+            ps_write32(b, kElf + 0x40 + 32 * i + 8, vbase + 0x100 * i);
+            ps_write32(b, kElf + 0x40 + 32 * i + 20, 0x180);
+        }
+    };
+    struct Shape {
+        u16 type = 3;
+        u8 cls = 1, data = 2;
+        u16 machine = 23, phentsize = 32;
+        std::vector<u32> types{1, 1, 2};
+        u32 vbase = 0x80;
+    };
+    std::vector<std::pair<Shape, std::string>> shapes = {{Shape{}, "good"}};
+    Shape s;
+    s.type = 2;
+    shapes.push_back({s, "ET_EXEC"});
+    s = Shape{};
+    s.cls = 2;
+    shapes.push_back({s, "ELF64"});
+    s = Shape{};
+    s.data = 1;
+    shapes.push_back({s, "little endian"});
+    s = Shape{};
+    s.machine = 21;
+    shapes.push_back({s, "PPU"});
+    s = Shape{};
+    s.phentsize = 56;
+    shapes.push_back({s, "phentsize"});
+    s = Shape{};
+    s.types = {1, 1};
+    shapes.push_back({s, "no dynamic"});
+    s = Shape{};
+    s.types = {1, 1, 1, 1, 2};
+    shapes.push_back({s, "four loads"});
+    s = Shape{};
+    s.types = {1, 1, 1, 1, 1, 2};
+    shapes.push_back({s, "five loads"});
+    s = Shape{};
+    s.types = {2, 6, 1};
+    s.vbase = 0x3FF00;
+    shapes.push_back({s, "high"});
+    s = Shape{};
+    s.types = {2};
+    shapes.push_back({s, "dynamic only"});
+    s = Shape{};
+    s.types = {};
+    shapes.push_back({s, "no headers"});
+    s = Shape{};
+    s.vbase = 0;
+    s.types = {2, 1};
+    shapes.push_back({s, "dynamic at 0"});
+    std::vector<Call> calls;
+    for (const auto& [shape, what] : shapes) {
+        const auto setup = [&, shape](u8* bb) {
+            so(shape.type, shape.cls, shape.data, shape.machine, shape.phentsize, shape.types, shape.vbase);
+            for (u32 i = 0; i < 64; i += 4) ps_write32(bb, kOut + 0x40 + i, 0);
+            ps_write32(bb, kOut + 0x48, 5);
+            ps_write32(bb, kOut + 0x4C, 33);
+        };
+        calls.push_back({"cellSpudllGetImageSize", {kOut, kElf, 0}, setup, what + ", default config"});
+        calls.push_back({"cellSpudllGetImageSize", {kOut, kElf, kOut + 0x40}, setup, what + ", a config"});
+    }
+    calls.push_back({"cellSpudllGetImageSize", {0, kElf, 0}, nullptr, "no size"});
+    calls.push_back({"cellSpudllGetImageSize", {kOut, 0, 0}, nullptr, "no ELF"});
+    calls.push_back({"cellSpudllHandleConfigSetDefaultValues", {kOut}, nullptr, "defaults"});
+    calls.push_back({"cellSpudllHandleConfigSetDefaultValues", {0}, nullptr, "NULL"});
+    usize differ = 0;
+    for (const Call& c : calls) {
+        const auto call = [&](bool theirs_side) {
+            std::memset(b + kArea, kFill, kAreaSize);
+            if (c.setup) c.setup(b);
+            u32 r3 = 0;
+            if (theirs_side) {
+                const auto it = sony.module->functions.find({"cellSpudll", recomp::nid_of(c.fn)});
+                REQUIRE(it != sony.module->functions.end());
+                std::array<u64, 3> a{};
+                std::copy(c.args.begin(), c.args.end(), a.begin());
+                r3 = static_cast<u32>(call_guest(t.ctx, it->second, {a[0], a[1], a[2]}));
+            } else {
+                r3 = ours(t, c.fn, c.args);
+            }
+            return std::pair{r3, std::vector<u8>(b + kArea, b + kArea + kAreaSize)};
+        };
+        const auto o = call(false), sy = call(true);
+        if (o != sy) {
+            ++differ;
+            UNSCOPED_INFO(std::format("{} {}: {:#x} vs {:#x} (Sony)", c.fn, c.what, o.first, sy.first));
+        }
+    }
+    CHECK(differ == 0);
+}

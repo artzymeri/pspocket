@@ -14,6 +14,7 @@ void register_cellResc(Registry& r);
 void register_cellRtc(Registry& r);
 void register_cellSaveData(Registry& r);
 void register_cellSheap(Registry& r);
+void register_cellSpudll(Registry& r);
 void register_cellSpurs(Registry& r);
 void register_cellSpursQueue(Registry& r);
 void register_cellSpursSemaphore(Registry& r);
@@ -98,6 +99,7 @@ void register_all_modules(Registry& r)
     register_cellRtc(r);
     register_cellSaveData(r);
     register_cellSheap(r);
+    register_cellSpudll(r);
     register_cellSpurs(r);
     register_cellSpursQueue(r);
     register_cellSpursSemaphore(r);

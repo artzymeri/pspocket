@@ -13,6 +13,7 @@ add_library(pspocket_hle STATIC
     src/cellRtc.cpp
     src/cellSaveData.cpp
     src/cellSheap.cpp
+    src/cellSpudll.cpp
     src/cellSpurs.cpp
     src/cellSpursQueue.cpp
     src/cellSpursSemaphore.cpp
