@@ -405,6 +405,7 @@ struct MetalBackend::Impl {
     TransientAllocator transient;
     TransientAllocator::Allocation consts_upload{}; // the transform constants as last uploaded (D-129)
     u64 consts_generation = ~0ull;                   // the transient generation they were uploaded in
+    u16 consts_lo = 0xffff, consts_hi = 0;           // the constants that upload holds (D-278)
 
     // Command buffers: uploads (texture decode) go to their own buffer, committed before the render buffer.
     id<MTLCommandBuffer> upload_cb = nil;
@@ -456,10 +457,13 @@ struct MetalBackend::Impl {
     // PSPOCKET_GPU_AB=N (a measuring aid, D-272): a change under test, written to apply only where ab_on(), is on in
     // every other run of N frames, and the GPU time of each half is summed apart, so both see the same scenes (each
     // command buffer's span, which overlap: compare the halves, not with other runs). ab_frames counts each half's
-    // frames. Nothing calls ab_on() between experiments.
+    // frames; ab_cpu_ns sums the RSX thread's CPU time of each half's frames (D-278). Nothing calls ab_on() between
+    // experiments.
     u32 ab_period = 0;
     std::shared_ptr<std::array<std::atomic<u64>, 2>> ab_ns = std::make_shared<std::array<std::atomic<u64>, 2>>();
     std::array<u64, 2> ab_frames{};
+    std::array<u64, 2> ab_cpu_ns{}; // the RSX thread's CPU time of each half's frames (D-278)
+    u64 ab_cpu_last = 0;
     bool ab_on() const { return !ab_period || (stats.flips / ab_period) % 2 == 1; } // the change applies
     // Why render passes ended (a started pass only), for the same report: the pass loads and stores its targets. The
     // copies between targets are told apart (D-148): an NV0039 copy on the GPU, a target sampled while drawn to, a
@@ -578,6 +582,9 @@ struct MetalBackend::Impl {
         std::vector<u32> words;                         // its instructions' words, from its start to its end
         std::vector<std::pair<u64, const CompiledProgram*>> compiled; // its variants compiled, by what tells them apart (D-109, D-269)
         u8 texture_units = 0; // the vertex texture units its TXL instructions sample (D-274)
+        // The transform constants it reads, c[const_lo] to c[const_hi] (all of them when it indexes them by the
+        // address register); none when const_lo > const_hi (D-278).
+        u16 const_lo = 0xffff, const_hi = 0;
     };
     static constexpr usize kDecodedVertexPrograms = 16;
     std::vector<DecodedVertexProgram> vertex_programs;

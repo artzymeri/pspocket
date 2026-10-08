@@ -5741,6 +5741,37 @@ Creed's training, two programs, run 310). The RSX shades each pixel once and giv
 - kTranslationVersion 9. The log line and the failure go.
 - Checked on the GPU: on a two-by-two target, every sample of a pixel gets that pixel's WPOS.
 
+## D-277 · 2026-10-08 · A FIFO error in a method's handler leaves the reader at put
+
+A handler that finds a bad argument (a report, notify or semaphore offset that maps nowhere, D-118's malformed words
+aside) recovers as RPCS3's recover_fifo does: get to put, the packet dropped. The reader then overwrote that get with
+the next word's address and counted the packet's arguments down from 0, so every later word was taken for an argument
+of the registers after the method's. It now goes on from where the recovery left it.
+- Test: a semaphore release with an unaligned offset and a second argument, then two methods: one failure, neither
+  method applied, get at put; the next submission runs as usual.
+- Tried again, measured, not kept (as D-229): reading headers and arguments in stretches, put, a reset and the words'
+  address checked once a stretch and get published at its end. tests/rsx/bench_fifo.cpp (new, `[.bench]`): 5.3 to 4.4
+  ns a word, and 17-18 to 4.3-7.6 with another thread polling get and writing put (their shared cache line no longer
+  moves for every word). GTA V's walk (runs 317-322, three binaries in rotation): RSX thread 1.338 to 1.341 s per
+  5 s; GTA V does not poll get that hard. The first try read a stretch's last word twice and broke GTA V (runs 314,
+  316): it parks the reader on a jump to itself and overwrites that word with its next command, so the second read saw
+  a header where the first saw the jump. Any reader reads a word once.
+
+## D-278 · 2026-10-08 · Only the transform constants a vertex program reads are uploaded
+
+The constants were uploaded whole (468, 7.5 KB) after any write to one (D-129); Assassin's Creed writes one between
+nearly every two of its 2,000 draws a frame in its training, and the copy was 2.7% of the RSX thread there (run 312,
+`sample`: metal_backend.mm's memcpy of the constants, beside the vertex data's 1.8%).
+- Each decoded vertex program records the lowest and highest constant it reads (all of them when it indexes them by
+  the address register). An upload copies that range to its place in a block as large as before, so the program reads
+  c[n] at n * 16 unchanged (no shader change); a later program whose range the upload holds uses it until a constant
+  is written. A program that reads none uploads nothing.
+- The in-run A/B (PSPOCKET_GPU_AB, D-272) now also sums the RSX thread's CPU time of each half's frames.
+- Measured in one run (run 323, Assassin's Creed's 600 s walk, the change alternating every 10 frames): in all nine
+  windows of the training's heaviest minute the RSX thread took less CPU with it, 13.5-16.1 ms a frame by 0.01-0.35
+  (1.2% on average); GPU time the same. GTA V's walk (runs 317-322): 1.341 to 1.317 s per 5 s, within its noise.
+- Test: three draws reading c[40], c[5], then c[40] changed: 16 bytes uploaded each, each draw its colour.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

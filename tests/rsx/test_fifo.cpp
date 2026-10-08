@@ -430,6 +430,57 @@ TEST_CASE("an unaligned NV4097 semaphore offset is a FIFO error")
     CHECK(f.failures[0].kind == FailKind::FifoError);
 }
 
+TEST_CASE("a FIFO error in a method's handler drops the commands after it up to put")
+{
+    // Recovery sets get to put (RPCS3 recover_fifo); the reader used to overwrite that with the next word's address and
+    // count the packet's arguments down past zero, taking every later word for an argument (D-277).
+    Fixture f;
+    auto b = f.at(0);
+    b.method(m::NV4097_SET_SEMAPHORE_OFFSET, 0x14);
+    b.method(m::NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE, {1, 2}); // the second argument goes with the first
+    b.method(m::NV4097_SET_BLEND_ENABLE, 1);
+    b.method(m::NV4097_SET_ALPHA_REF, 0x55);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    REQUIRE(f.failures.size() == 1);
+    CHECK(f.failures[0].kind == FailKind::FifoError);
+    CHECK(f.state().reg(m::NV4097_SET_BLEND_ENABLE) == 0);
+    CHECK(f.state().reg(m::NV4097_SET_ALPHA_REF) == 0);
+    CHECK(f.rsx->get() == b.offset());
+    CHECK(f.get_register() == b.offset());
+
+    // The reader goes on with what comes next.
+    auto c = f.at(b.offset());
+    c.method(m::NV4097_SET_ALPHA_REF, 0x66);
+    REQUIRE(f.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(f.state().reg(m::NV4097_SET_ALPHA_REF) == 0x66);
+    CHECK(f.failures.size() == 1);
+}
+
+TEST_CASE("get and the get register stop on a blocking acquire's own word, after a hundred methods")
+{
+    // D-277 (a reader that published get once a stretch was tried and not kept): whatever the reader's shape, the
+    // guest sees get on the acquire's word while it blocks, and at put once it has passed.
+    Fixture f;
+    const u32 sem = f.layout().label_addr(3);
+    f.write32(sem, 0);
+    auto b = f.at(0);
+    for (u32 i = 0; i < 100; i++) b.method(m::NV4097_SET_ALPHA_REF, i);
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 3 * 0x10);
+    const u32 acquire_at = b.offset() + 4; // its argument's word
+    b.method(m::NV406E_SEMAPHORE_ACQUIRE, 1);
+    b.method(m::NV4097_SET_ALPHA_REF, 0x1234);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Blocked);
+    CHECK(f.state().reg(m::NV4097_SET_ALPHA_REF) == 99);
+    CHECK(f.rsx->get() == acquire_at);
+    CHECK(f.get_register() == acquire_at);
+    f.write32(sem, 1);
+    REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+    CHECK(f.state().reg(m::NV4097_SET_ALPHA_REF) == 0x1234);
+    CHECK(f.get_register() == b.offset());
+    CHECK(f.failures.empty());
+}
+
 TEST_CASE("the RSX thread consumes the FIFO and sleeps on semaphores")
 {
     Fixture f;

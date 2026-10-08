@@ -1422,12 +1422,25 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     if (!index_data.buffer) index_data = vertex_data; // bound but unused
 
     // The transform constants, uploaded again only after a write to one or a new command buffer (D-129): copying all
-    // 7.5 KB for every draw was the RSX thread's biggest copy on the iPhone (1,000 and more draws a frame).
-    if ((state.dirty_bits & dirty::kVertexConstants) || consts_generation != transient.generation()) {
-        consts_upload = transient.alloc(kTransformConstantCount * 16, 16);
-        std::memcpy(consts_upload.data, state.transform_constants.data(), kTransformConstantCount * 16);
-        consts_generation = transient.generation();
-        state.dirty_bits &= ~dirty::kVertexConstants;
+    // 7.5 KB for every draw was the RSX thread's biggest copy on the iPhone (1,000 and more draws a frame). Only those
+    // the vertex program reads are copied (D-278): Assassin's Creed writes one between nearly every two draws. The
+    // upload keeps their places (c[n] at n * 16), so the program reads them as before; the rest of it is not written.
+    {
+        const DecodedVertexProgram& decoded = vertex_programs.front(); // the program vertex_program_for found
+        const u16 lo = decoded.const_lo, hi = decoded.const_hi;
+        const bool reads = lo <= hi;
+        if (!consts_upload.buffer || consts_generation != transient.generation() ||
+            (reads && ((state.dirty_bits & dirty::kVertexConstants) || lo < consts_lo || hi > consts_hi))) {
+            const u16 copy_lo = reads ? lo : 0, copy_hi = reads ? hi : 0;
+            consts_upload = transient.alloc((copy_hi + 1u) * 16u, 16);
+            std::memcpy(consts_upload.data + copy_lo * 16u, state.transform_constants.data() + copy_lo,
+                (copy_hi - copy_lo + 1u) * 16u);
+            stats.vertex_constant_bytes_copied += (copy_hi - copy_lo + 1u) * 16u;
+            consts_generation = transient.generation();
+            consts_lo = copy_lo;
+            consts_hi = copy_hi;
+            state.dirty_bits &= ~dirty::kVertexConstants;
+        }
     }
     const TransientAllocator::Allocation& consts = consts_upload;
 
@@ -1598,6 +1611,13 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
 {
     tick++;
     end_pass_for(kEndFlip);
+    if (ab_period) {
+        // The RSX thread's CPU time of the frame that ends here, to the half its draws were in (D-278): with GPU time
+        // alone a change on the CPU side could not be told within one run.
+        const u64 now = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+        if (ab_cpu_last) ab_cpu_ns[ab_on() ? 1 : 0] += now - ab_cpu_last;
+        ab_cpu_last = now;
+    }
     stats.flips++;
     if (pass_times) {
         pass_place = 0;
@@ -1607,10 +1627,14 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
         ab_frames[ab_on() ? 1 : 0]++; // the frame that ends here (D-272)
         if (stats.flips % (ab_period * 20) == 0) {
             const double off = static_cast<double>((*ab_ns)[0].exchange(0)), on = static_cast<double>((*ab_ns)[1].exchange(0));
-            PS_LOG_INFO(kChan, "GPU A/B (PSPOCKET_GPU_AB): change off {:.3f} ms a frame ({} frames), on {:.3f} ms ({} frames)",
+            PS_LOG_INFO(kChan, "GPU A/B (PSPOCKET_GPU_AB): change off {:.3f} ms a frame ({} frames), on {:.3f} ms ({} frames); "
+                "RSX thread CPU off {:.3f} ms a frame, on {:.3f} ms",
                 ab_frames[0] ? off / 1e6 / static_cast<double>(ab_frames[0]) : 0.0, ab_frames[0],
-                ab_frames[1] ? on / 1e6 / static_cast<double>(ab_frames[1]) : 0.0, ab_frames[1]);
+                ab_frames[1] ? on / 1e6 / static_cast<double>(ab_frames[1]) : 0.0, ab_frames[1],
+                ab_frames[0] ? static_cast<double>(ab_cpu_ns[0]) / 1e6 / static_cast<double>(ab_frames[0]) : 0.0,
+                ab_frames[1] ? static_cast<double>(ab_cpu_ns[1]) / 1e6 / static_cast<double>(ab_frames[1]) : 0.0);
             ab_frames = {};
+            ab_cpu_ns = {};
         }
     }
     compile_wait_left_ns = static_cast<s64>(config.compile_wait_ms * 1e6); // each frame's budget (D-158)

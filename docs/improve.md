@@ -137,6 +137,15 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   the transform constants copied whole (7.5 KB) after any write.
 - **Try:** read the FIFO in runs of words within one IO page (one lookup, one put read a run); the constants copied
   from the lowest written to the highest used register; textures that change every frame hashed instead of watched.
+  **Done (D-278, run 323):** only the constants the vertex program reads: 1.2% less RSX thread CPU in the training's
+  heaviest minute. **Tried again (D-277, runs 313-322), not kept:** the FIFO in stretches: 4x faster in a benchmark
+  against a guest polling get (tests/rsx/bench_fifo.cpp), nothing in GTA V; worth trying again on the iPhone, where the
+  get register's cache line may cost more between clusters.
+- **Seen (run 312, the training's heaviest minute, 2,000 draws a frame):** the RSX thread 13.5-16 ms of CPU a frame:
+  the FIFO reader 19%, draws 47% (texture binds 5.1%, the fragment program's lookup 4.6%, Metal's draw call 4.7%,
+  copies 5.1%), no single cost above a few percent. What would cut it as a whole: fewer state checks per draw (most
+  draws change one or two registers), encoder state set only when it changed (the viewport, cull and depth bias are
+  set on every draw), and the fragment program lookup kept while its registers and bytes are unchanged.
 
 - **Seen:** 25 ms of GPU time per frame at 1,504 draws and 83 render passes (55 ended by a target change, 19 by a
   target copy) in the heaviest stretch; 17 to 21 ms in most of play. The GPU is close to its budget too.

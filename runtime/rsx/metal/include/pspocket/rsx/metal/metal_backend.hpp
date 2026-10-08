@@ -127,6 +127,7 @@ struct MetalBackendConfig {
 struct BackendStats {
     u64 draws = 0;
     u64 vertex_bytes_copied = 0; // vertex array bytes copied from guest memory, overlapping attributes once (D-211)
+    u64 vertex_constant_bytes_copied = 0; // transform constant bytes uploaded, those the programs read (D-278)
     u64 draws_skipped = 0;
     u64 draws_compiling = 0;  // of those, skipped while their program or pipeline compiled in the background (D-158)
     u64 compile_wait_ns = 0;  // the RSX thread's waits for background compiles, within the frame's budget

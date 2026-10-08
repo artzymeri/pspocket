@@ -240,6 +240,11 @@ points and WPOS on multisampled targets in pixels (D-275, D-276): a 600 s traini
 and no RSX failure (38 continuations). Its last minute is its heaviest, 31-43 flips a second on the M4 with the RSX
 thread the busiest at 60% of a core: next to cut. kTranslationVersion 9.
 
+**The RSX thread in that minute (D-277, D-278, runs 312-323).** Its time is spread thin (FIFO reading 19%, draws
+47%); uploading only the constants a vertex program reads took 1.2% (an in-run A/B that now sums the RSX thread's CPU
+per half). Reading the FIFO in stretches did nothing in GTA V (not kept, as D-229); a FIFO error inside a method's
+handler now leaves the reader at put instead of taking every later word for an argument.
+
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,
 kernel calls, PPU and SPU instructions translated and fuzz-checked, a checklist per area (each item with its decision)

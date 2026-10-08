@@ -2694,6 +2694,63 @@ TEST_CASE("metal e2e: vertex programs uploaded again before each draw are found 
     }
 }
 
+TEST_CASE("metal e2e: only the transform constants a vertex program reads are uploaded (D-278)")
+{
+    // A program reading c[40], one reading c[5], the first again after c[40] changed: each upload copies the one
+    // constant its program reads, at its own place, and each draw gets its colour.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    const auto program = [](u32 constant) {
+        VpInst colour; // MOV o[1], c[constant]
+        colour.vec_op = 1;
+        colour.src[0] = vp_const();
+        colour.constant = constant;
+        colour.out = 1;
+        colour.vec_mask = 0xf;
+        VpInst pos; // MOV o[0], v[0] END
+        pos.vec_op = 1;
+        pos.src[0] = vp_in();
+        pos.out = 0;
+        pos.vec_mask = 0xf;
+        pos.end = true;
+        return assemble_vp({colour, pos});
+    };
+    auto b = e.at(0);
+    const auto constant = [&](u32 slot, float r, float g, float bl) {
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, slot);
+        b.method(m::NV4097_SET_TRANSFORM_CONSTANT, {f2u(r), f2u(g), f2u(bl), f2u(1.f)});
+    };
+    constant(40, 1.f, 0.f, 0.f);
+    constant(5, 0.f, 1.f, 0.f);
+    const u32 reads[] = {40, 5, 40};
+    for (u32 i = 0; i < 3; i++) {
+        if (i == 2) constant(40, 0.f, 0.f, 1.f);
+        setup_surface(b, kSurfaceOffset + i * 0x100000);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM, program(reads[i]));
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, 1u << 0);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+    }
+    const u64 before = e.backend->stats().vertex_constant_bytes_copied;
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().vertex_constant_bytes_copied - before == 3 * 16);
+    const std::array<u8, 4> expected[] = {{0xff, 0xff, 0x00, 0x00}, {0xff, 0x00, 0xff, 0x00}, {0xff, 0x00, 0x00, 0xff}};
+    for (u32 i = 0; i < 3; i++) {
+        INFO("draw " << i);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + i * 0x100000, kW * kH * 4));
+        CHECK(guest_pixel(e, kSurfaceOffset + i * 0x100000, 32, 48) == expected[i]);
+    }
+}
+
 TEST_CASE("metal e2e: interleaved vertex attributes are copied once and read right (D-211)")
 {
     // Position (four floats) and colour (four bytes) in one 20-byte vertex: the two attributes' ranges overlap, and

@@ -189,6 +189,16 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
                 d.words.insert(d.words.end(), in.words.begin(), in.words.end());
                 if (static_cast<shader::VpVecOp>(in.vec_op) == shader::VpVecOp::TXL)
                     d.texture_units = static_cast<u8>(d.texture_units | (1u << (in.tex_num & 3)));
+                // The constants it reads (D-278): one per instruction (D1.const_src), or any of them by the address
+                // register.
+                const bool reads_constant = std::any_of(in.src.begin(), in.src.end(),
+                    [](const shader::VpSource& s) { return s.type == shader::VpRegType::Constant; });
+                if (!reads_constant) continue;
+                const u16 lo = in.constant_relative ? 0 : in.constant;
+                const u16 hi = in.constant_relative ? static_cast<u16>(kTransformConstantCount - 1)
+                                                    : std::min<u16>(in.constant, kTransformConstantCount - 1);
+                d.const_lo = std::min(d.const_lo, lo);
+                d.const_hi = std::max(d.const_hi, hi);
             }
             d.program = std::move(*vp);
             if (vertex_programs.size() == kDecodedVertexPrograms) vertex_programs.pop_back();

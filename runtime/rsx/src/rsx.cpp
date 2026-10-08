@@ -491,6 +491,9 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
             // Method argument
             if (dispatch(packet_reg_, word) == Dispatch::Blocked) return RunStatus::Blocked;
             words_.fetch_add(1, std::memory_order_relaxed);
+            // A FIFO error in the method's handler recovered to put (fifo_error): the reader goes on from there, not
+            // from the next word with the packet's count run past zero (D-277).
+            if (get_.load(std::memory_order_relaxed) != get) continue;
             get_.store(get + 4, std::memory_order_release);
             packet_reg_ = (packet_reg_ + packet_inc_) & (m::kMethodCount - 1);
             packet_remaining_--;
