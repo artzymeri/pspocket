@@ -2136,6 +2136,68 @@ std::array<u8, 4> guest_pixel_pitch(E2E& e, u32 surface_offset, u32 pitch, u32 x
     return {p[0], p[1], p[2], p[3]};
 }
 
+TEST_CASE("metal e2e: a multisampled target is drawn one texel per sample, its samples side by side in memory (D-250)")
+{
+    REQUIRE_METAL();
+    // A kW x kH target in AA mode 3 (two samples across) or 4 (two by two): memory holds 2 kW x kH or 2 kW x 2 kH
+    // texels with the pitch of the wider row. The usual triangle, red, the scissor the whole target or its left half.
+    const auto run = [](u32 mode, bool left_half) {
+        const u32 sx = 2, sy = mode == 4 ? 2 : 1, pitch = kW * sx * 4;
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        auto b = e.at(0);
+        setup_surface_sized(b, kSurfaceOffset, kW, kH, pitch);
+        b.method(m::NV4097_SET_SURFACE_FORMAT,
+            static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (1u << 8) | (mode << 12));
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        if (left_half) b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(kW / 2) << 16, kH << 16});
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, pitch * kH * sy));
+        std::vector<std::vector<bool>> red(kH * sy, std::vector<bool>(kW * sx));
+        for (u32 y = 0; y < kH * sy; y++)
+            for (u32 x = 0; x < kW * sx; x++) red[y][x] = guest_pixel_pitch(e, kSurfaceOffset, pitch, x, y)[1] == 0xff;
+        return red;
+    };
+    for (const u32 mode : {3u, 4u}) {
+        INFO("AA mode " << mode);
+        const u32 sx = 2, sy = mode == 4 ? 2 : 1;
+        const auto red = run(mode, false);
+        u32 total = 0, mixed = 0;
+        for (const auto& row : red)
+            for (bool r : row) total += r;
+        for (u32 y = 0; y < kH; y++) {
+            for (u32 x = 0; x < kW; x++) {
+                u32 n = 0;
+                for (u32 j = 0; j < sy; j++)
+                    for (u32 i = 0; i < sx; i++) n += red[y * sy + j][x * sx + i];
+                mixed += n != 0 && n != sx * sy;
+            }
+        }
+        const u32 texels = kW * sx * kH * sy;
+        CHECK(total > texels * 4 / 10); // about half: the triangle fills the target's lower half's width
+        CHECK(total < texels * 6 / 10);
+        CHECK(mixed > 0); // an edge falls between a pixel's samples: each sample is covered on its own
+        CHECK(red[kH * sy * 3 / 4][kW * sx / 2]);      // inside, near the base's middle
+        CHECK_FALSE(red[kH * sy / 8][kW * sx / 16]);   // the top-left corner stays clear
+        // The scissor is in pixels: its left half is the samples' left half.
+        const auto half = run(mode, true);
+        bool right = false, left = false;
+        for (u32 y = 0; y < kH * sy; y++) {
+            for (u32 x = 0; x < kW * sx; x++) (x < kW * sx / 2 ? left : right) |= half[y][x];
+        }
+        CHECK(left);
+        CHECK_FALSE(right);
+    }
+}
+
 TEST_CASE("metal e2e: a target narrower than the one at its address is its left part, and the rest stays (D-120)")
 {
     // GTA V clears the right half of a 2560x512 target for its characters, then draws into the left half as a

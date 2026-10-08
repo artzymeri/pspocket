@@ -146,8 +146,8 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   repeat); on a tile GPU every pass end writes its targets to memory: load and store actions that skip what the next
   pass does not read, memoryless depth where it is never sampled. Metal System Trace on the phone (needs the user)
   to see where the 25 ms go.
-- **Multisampling:** surfaces with AA modes 3 and 5 render with one sample (logged): edges alias. Metal has
-  multisample textures; resolve where the game reads them.
+- **Multisampling:** done (D-250): multisampled targets are drawn one texel per sample, as the RSX lays them out, and
+  the gate's last RSX failure is gone. Left: WPOS in such a target counts samples (logged per program).
 - **Blending:** ADD_SIGNED (0xf006) draws as ADD, as RPCS3 does (VKGSRender.cpp): only the log line says otherwise.
 - **State:** open.
 

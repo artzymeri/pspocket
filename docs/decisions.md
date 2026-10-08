@@ -5375,6 +5375,27 @@ strips with restart; GTA V does not (the gate has never logged it).
 - Test: tests/rsx/test_metal.mm draws two quads as one 16-bit strip with a restart between them, the restart index 8 (a
   real vertex, placed so that read as one it would draw across the middle) and 0xFFFF: both quads, nothing between;
   with restart off, the strip goes through vertex 8. With restart ignored, the test fails.
+## D-250 · 2026-10-08 · Multisampled render targets drawn one texel per sample
+
+The RSX keeps a multisampled target's samples side by side in memory: AA mode 3 (diagonal centred) two across, modes
+4 and 5 (square centred, square rotated) two across and two down, the pitch that of the wider row (RPCS3 RSXThread.cpp
+aa_factor_u/v, surface_utils.h samples_x/y). Games resolve such targets themselves, by sampling that memory as a
+texture twice as wide (or wide and tall). pspocket drew them with one sample at the pixel size and logged it (the
+gate's one RSX failure: GTA V's 128x128 AA mode 3 target), so a resolve read a stretched image.
+
+- Now such a target is drawn at its sample size, one texel per sample: its colour and depth surfaces are made that
+  size, the pass covers it, and draws and clears scale their scissor (in pixels) by the samples across and down; the
+  viewport transform stays in pixels, since normalized device coordinates cover the target whatever its size. The
+  memory image, a texture over it and a write-back need no conversion. RPCS3 draws into multisampled Vulkan images
+  and converts at reads instead; the samples here sit at the texel centres (a quarter and three quarters of the
+  pixel), close to the RSX's positions.
+- Not scaled: WPOS (a fragment program's window position counts samples there; logged per program, as the generated
+  shaders have no scale for it), and point sizes. AA mode values the RSX does not define are drawn with one sample and
+  logged.
+- Test: tests/rsx/test_metal.mm draws a triangle into AA mode 3 and mode 4 targets: memory holds the sample-sized image
+  (about half covered), some pixels have samples on both sides of an edge (per-sample coverage, not doubled pixels),
+  and a scissor over the left half of the pixels covers the left half of the samples. With mode 3 drawn with one
+  sample, the test fails.
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

@@ -216,9 +216,14 @@
           "ref": "D-210, D-211, D-214"
         },
         {
-          "name": "Multisampled render targets (drawn with one sample)",
-          "state": "todo",
-          "ref": "improve.md RSX"
+          "name": "Primitive restart in indexed draws",
+          "state": "done",
+          "ref": "D-249"
+        },
+        {
+          "name": "Multisampled render targets (one texel per sample)",
+          "state": "done",
+          "ref": "D-250"
         },
         {
           "name": "Draws while a shader compiles (a shader interpreter)",

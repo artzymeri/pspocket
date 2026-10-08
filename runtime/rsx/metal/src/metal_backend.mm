@@ -323,19 +323,18 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
     const SurfaceInfo si = state.surface();
     out = {};
     draw_targets = {};
-    u32 width = si.clip_width, height = si.clip_height;
-    if (width == 0 || height == 0) return false;
-    if (si.antialias != 0) {
-        // Rendered with one sample at the clip size. A resolve that reads the target at its sample layout (twice as wide
-        // for AA mode 3, GTA V's 128x128 one) samples it stretched, and gets the pixel itself. Reported once per target,
-        // not on every draw (run 072: 360,000 failures in 170 s).
-        static std::unordered_set<u64> seen;
-        const u64 key = (u64{si.color[0].offset} << 8) | si.antialias;
-        if (seen.size() < 64 && seen.insert(key).second) {
-            unsupported(std::format("multisampled surface (AA mode {}) at colour offset {:#x}, {}x{}, renders with one "
-                                    "sample", si.antialias, si.color[0].offset, si.clip_width, si.clip_height));
-        }
+    // Multisampled targets (D-250): the RSX keeps a pixel's samples side by side in memory, two across for AA modes 3 to
+    // 5 and two down too for 4 and 5 (RPCS3 RSXThread.cpp aa_factor_u/v, surface_utils.h samples_x/y). Such a target is
+    // drawn at that size, one texel per sample: its memory image, a texture over it (the game's own resolve reads it
+    // at its sample layout) and a write-back need no conversion. Draws scale their scissor (do_draw, clear).
+    const AaFactors aa = aa_factors(si.antialias);
+    if (aa.unknown) {
+        static std::unordered_set<u32> seen;
+        if (seen.size() < 16 && seen.insert(si.antialias).second)
+            unsupported(std::format("surface AA mode {} is not one the RSX defines: drawn with one sample", si.antialias));
     }
+    u32 width = si.clip_width * aa.x, height = si.clip_height * aa.y;
+    if (width == 0 || height == 0) return false;
     if (si.window_offset_x || si.window_offset_y) unsupported("NV4097_SET_WINDOW_OFFSET is ignored");
     const bool swizzled = si.type == 2;
 
@@ -616,8 +615,10 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
 
     const SurfaceInfo si = state.surface();
     const ScissorInfo sc = state.scissor();
-    const u32 x0 = std::min<u32>(sc.x, pass_width), y0 = std::min<u32>(sc.y, pass_height);
-    const u32 x1 = std::min<u32>(u32{sc.x} + sc.width, pass_width), y1 = std::min<u32>(u32{sc.y} + sc.height, pass_height);
+    const AaFactors aa = aa_factors(si.antialias); // the scissor is in pixels, the pass in samples (D-250)
+    const u32 x0 = std::min<u32>(sc.x * aa.x, pass_width), y0 = std::min<u32>(sc.y * aa.y, pass_height);
+    const u32 x1 = std::min<u32>((u32{sc.x} + sc.width) * aa.x, pass_width);
+    const u32 y1 = std::min<u32>((u32{sc.y} + sc.height) * aa.y, pass_height);
     if (x1 <= x0 || y1 <= y0) return;
     const bool full = x0 == 0 && y0 == 0 && x1 == pass_width && y1 == pass_height;
 
@@ -887,11 +888,21 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         surf_w = std::min(surf_w, targets.depth->width);
         surf_h = std::min(surf_h, targets.depth->height);
     }
+    // A multisampled target is drawn in samples (D-250): the scissor and the viewport are in pixels.
+    const AaFactors aa = aa_factors(state.surface().antialias);
+    if ((aa.x > 1 || aa.y > 1) && (fprog->input_mask & (1u << static_cast<u32>(shader::FpInput::WPOS)))) {
+        // WPOS counts samples there, not pixels (the generated shaders have no scale for it).
+        static std::unordered_set<u64> seen;
+        if (seen.size() < 16 && seen.insert(fprog->hash).second)
+            unsupported(std::format("fragment program {:#018x} reads WPOS in a multisampled target: it gets samples, not "
+                                    "pixels", fprog->hash));
+    }
+    const u32 pix_w = surf_w / aa.x, pix_h = surf_h / aa.y;
     const ScissorInfo sc = state.scissor();
     const ViewportInfo vpi = state.viewport();
     const u32 sx0 = std::max<u32>(sc.x, vpi.x), sy0 = std::max<u32>(sc.y, vpi.y);
-    const u32 sx1 = std::min({u32{sc.x} + sc.width, u32{vpi.x} + vpi.width, surf_w});
-    const u32 sy1 = std::min({u32{sc.y} + sc.height, u32{vpi.y} + vpi.height, surf_h});
+    const u32 sx1 = std::min({u32{sc.x} + sc.width, u32{vpi.x} + vpi.width, pix_w});
+    const u32 sy1 = std::min({u32{sc.y} + sc.height, u32{vpi.y} + vpi.height, pix_h});
     skip_reason = "empty scissor or viewport";
     if (sx1 <= sx0 || sy1 <= sy0) return skip("");
     if (raster.cull_enable && static_cast<CullFace>(raster.cull_face) == CullFace::FrontAndBack &&
@@ -997,7 +1008,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // ---- vertex parameters: viewport transform into Metal NDC for this surface
     // (RPCS3 RSXDrawCommands.cpp fill_scale_offset_data, y flipped for Metal's y-up NDC) ----
     shader::MslVsParams vs{};
-    const float cw = static_cast<float>(surf_w) / 2.f, ch = static_cast<float>(surf_h) / 2.f;
+    // In pixels: normalized device coordinates cover the target whatever its samples (D-250).
+    const float cw = static_cast<float>(pix_w) / 2.f, ch = static_cast<float>(pix_h) / 2.f;
     vs.pos_x[0] = vpi.scale[0] / cw;
     vs.pos_x[3] = (vpi.offset[0] - cw) / cw;
     vs.pos_y[1] = -vpi.scale[1] / ch;
@@ -1244,7 +1256,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const DepthStencilInfo ds = state.depth_stencil();
     [enc setStencilFrontReferenceValue:ds.front.ref backReferenceValue:ds.back.ref];
     [enc setViewport:MTLViewport{0, 0, static_cast<double>(surf_w), static_cast<double>(surf_h), 0, 1}];
-    [enc setScissorRect:MTLScissorRect{sx0, sy0, sx1 - sx0, sy1 - sy0}];
+    [enc setScissorRect:MTLScissorRect{sx0 * aa.x, sy0 * aa.y, (sx1 - sx0) * aa.x, (sy1 - sy0) * aa.y}];
     if (raster.cull_enable) {
         [enc setCullMode:static_cast<CullFace>(raster.cull_face) == CullFace::Front ? MTLCullModeFront : MTLCullModeBack];
     } else {

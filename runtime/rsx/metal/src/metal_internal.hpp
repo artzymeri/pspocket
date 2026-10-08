@@ -168,6 +168,24 @@ struct PipelineParams {
 };
 
 
+// Samples per pixel across and down of a surface AA mode (NV4097_SET_SURFACE_FORMAT bits 12-15): 0 one sample, 3
+// two across (diagonal centred), 4 and 5 two by two (square centred, square rotated); RPCS3 RSXThread.cpp aa_factor_u/v.
+// Anything else is no RSX mode: one sample, `unknown` (D-250).
+struct AaFactors {
+    u32 x = 1, y = 1;
+    bool unknown = false;
+};
+inline AaFactors aa_factors(u32 antialias)
+{
+    switch (antialias) {
+    case 0: return {1, 1, false};
+    case 3: return {2, 1, false};
+    case 4:
+    case 5: return {2, 2, false};
+    default: return {1, 1, true};
+    }
+}
+
 struct PipelineKey {
     u64 vp = 0, fp = 0;
     std::array<u32, 4> color_formats{};

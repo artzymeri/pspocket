@@ -5,7 +5,7 @@
   "frame_from": 2150,
   "checks": {
     "exit": "timeout",
-    "rsx_failures_max": 1,
+    "rsx_failures_max": 0,
     "fps_skip_windows": 2,
     "fps_median_min": 28,
     "fps_floor": 24,
