@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 1757 of 6625 pspocket&#x27;s own (26.5%), 290 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 1777 of 6625 pspocket&#x27;s own (26.8%), 290 answered as RPCS3</text>
 <g><title>sys_libc: 4 own, 0 answered as RPCS3, 1115 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -6257,28 +6257,28 @@
 <rect x="771.0" y="272.5" width="7.0" height="5.1" fill="#8c959f"/>
 <rect x="748.2" y="278.2" width="7.0" height="5.1" fill="#8c959f"/>
 </g>
-<g><title>cellHttpUtil: 0 own, 0 answered as RPCS3, 20 not yet, of 20</title>
+<g><title>cellHttpUtil: 20 own, 0 answered as RPCS3, 0 not yet, of 20</title>
 <rect x="779.6" y="248.8" width="30.9" height="36.1" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="780.6" y="249.8" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="787.8" y="249.8" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="795.0" y="249.8" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="802.2" y="249.8" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="780.6" y="256.6" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="787.8" y="256.6" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="795.0" y="256.6" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="802.2" y="256.6" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="780.6" y="263.4" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="787.8" y="263.4" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="795.0" y="263.4" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="802.2" y="263.4" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="780.6" y="270.2" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="787.8" y="270.2" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="795.0" y="270.2" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="802.2" y="270.2" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="780.6" y="277.0" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="787.8" y="277.0" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="795.0" y="277.0" width="6.6" height="6.2" fill="#8c959f"/>
-<rect x="802.2" y="277.0" width="6.6" height="6.2" fill="#8c959f"/>
+<rect x="780.6" y="249.8" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="787.8" y="249.8" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="795.0" y="249.8" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="802.2" y="249.8" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="780.6" y="256.6" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="787.8" y="256.6" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="795.0" y="256.6" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="802.2" y="256.6" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="780.6" y="263.4" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="787.8" y="263.4" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="795.0" y="263.4" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="802.2" y="263.4" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="780.6" y="270.2" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="787.8" y="270.2" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="795.0" y="270.2" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="802.2" y="270.2" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="780.6" y="277.0" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="787.8" y="277.0" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="795.0" y="277.0" width="6.6" height="6.2" fill="#2da44e"/>
+<rect x="802.2" y="277.0" width="6.6" height="6.2" fill="#2da44e"/>
 </g>
 <g><title>cellMusicDecodeUtility: 20 own, 0 answered as RPCS3, 0 not yet, of 20</title>
 <rect x="810.5" y="248.8" width="30.9" height="36.1" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
