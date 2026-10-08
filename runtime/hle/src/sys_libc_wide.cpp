@@ -22,12 +22,6 @@ using namespace libc;
 
 u8* gb(PPUContext& ctx) { return guest_base(ctx); }
 
-bool range_ok(PPUContext& ctx, const char* fn, u32 addr, u64 size)
-{
-    if (guest_range(thread_of(ctx), addr, size)) return true;
-    refuse(ctx, std::format("{}: [{:#x}, +{:#x}) is not guest memory", fn, addr, size));
-    return false;
-}
 
 std::optional<std::u32string> wstr(PPUContext& ctx, const char* fn, u32 s, u64 max = kMaxString / 4)
 {

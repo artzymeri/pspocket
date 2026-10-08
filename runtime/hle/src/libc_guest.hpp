@@ -23,6 +23,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/lv2/syscalls.hpp"
 
 namespace pspocket::hle::libc {
 
@@ -154,6 +155,34 @@ inline bool write_wstring(lv2::PpuThread& t, u32 addr, std::u32string_view s, bo
 
 // A call refused because a pointer does not lead to guest memory (D-042): logged with its call site.
 inline void refuse(PPUContext& ctx, std::string_view why) { log_call_site(ctx, guest_base(ctx), why); }
+
+// Whether [addr, addr + size) is guest memory; refused (logged) for `fn` when it is not.
+inline bool range_ok(PPUContext& ctx, std::string_view fn, u32 addr, u64 size)
+{
+    if (guest_range(thread_of(ctx), addr, size)) return true;
+    refuse(ctx, std::format("{}: [{:#x}, +{:#x}) is not guest memory", fn, addr, size));
+    return false;
+}
+
+// Text to the TTY's channel 0 through sys_tty_write, as liblv2's printf writes (sysPrxForUser_libc.cpp tty_print):
+// in pieces of up to 1 KB on the caller's stack, each ending after a line where one ends in it.
+inline void tty_out(PPUContext& ctx, std::string_view text)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    constexpr usize kPiece = 0x400;
+    std::string_view rest = text;
+    while (!rest.empty()) {
+        usize n = std::min(rest.size(), kPiece);
+        if (n < rest.size()) {
+            if (const usize nl = rest.rfind('\n', n - 1); nl != std::string_view::npos) n = nl + 1;
+        }
+        StackVar piece(ctx, base, kPiece + 8);
+        std::memcpy(base + piece.addr(), rest.data(), n);
+        lv2::sys_tty_write(t, 0, piece.addr(), static_cast<u32>(n), piece.addr() + kPiece);
+        rest.remove_prefix(n);
+    }
+}
 
 // The variadic arguments of a call after its `fixed` named ones, as the PPC64 ELF ABI passes them (RPCS3
 // ps3_fmt_src): one 64-bit slot each, argument n in r(3 + n) for n < 8, else in the caller's parameter save area at

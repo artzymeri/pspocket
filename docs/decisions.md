@@ -6047,3 +6047,27 @@ Part 2 of D-511 (runtime/hle/src/sys_libc_wide.cpp), under sys_libc and sys_libm
   _Getpwctrtab with their variables _Wctype and _Wctrans ({name, value} tables, the names after them).
 - memcpy, memset, memmove and memcmp under sys_libm too, and _memset_vmx (memset).
 Tests: tests/hle/test_libc.cpp, two cases more (wide strings; wide numbers, conversions and classes).
+
+## D-513 · 2026-10-08 · The C library, part 3: malloc and its family, the mspaces, strdup
+
+Part 3 of D-511 (runtime/hle/src/sys_libc_malloc.cpp) on libc_malloc.hpp (the library work's draft: malloc's heap a
+pool of liblv2-style dlmalloc 2.8.3 mspaces, lv2_heap.hpp, D-502), under sys_libc and sys_libm.
+- malloc, free, calloc (an overflowing product fails, ENOMEM), realloc (NULL: malloc; 0 bytes: a smallest block, as
+  dlmalloc without REALLOC_ZERO_BYTES_FREES; a block that still fits and wastes at most half or 256 bytes stays),
+  memalign (a boundary that is not a power of two rounds up, as internal_memalign), Sony's reallocalign(ptr, size,
+  boundary), valloc and pvalloc (4 KB pages), malloc_usable_size; requests of MAX_REQUEST (0xFFFFFFC0) or more fail
+  first. errno is lv2's CELL_ENOMEM.
+- mallinfo through the caller's buffer in r3 (an aggregate in the 64-bit ABI), malloc_stats printing dlmalloc's three
+  lines to the TTY, malloc_footprint, malloc_trim (the empty mspaces after the first back to lv2), mallopt
+  (M_TRIM_THRESHOLD and M_MMAP_THRESHOLD accepted with nothing to act on, M_GRANULARITY a power of two of a page at
+  least, the pool's growth step), independent_calloc and independent_comalloc (each element a block of its own).
+- mspace_create(base, capacity) in the caller's memory or, with no base, in memory from lv2 (64 KB rounded), not
+  growing; mspace_destroy (the bytes given back to lv2), mspace_malloc, calloc, memalign, realloc, reallocalign, free
+  (the mspace from the block's footer), malloc_usable_size, malloc_stats, Sony's mspace_is_heap_empty.
+- The start-up functions the library's crt calls: _malloc_init (makes the heap early), _malloc_finalize (gives it
+  back), their _lv2 forms (the same), _init_malloc_lock and _init_malloc_lock0 (nothing: the lock is a host mutex),
+  _allocate_mapped_pages (pages from lv2, MFAIL when none: an assumption, its signature is not known beyond its name).
+  The variable _malloc_limit (0: no cap) caps malloc's pool.
+- strdup.
+Shared: range_ok and a TTY writer (tty_out) moved into libc_guest.hpp.
+Tests: tests/hle/test_libc.cpp, two cases more (malloc's family; mspaces in the caller's and in lv2's memory).

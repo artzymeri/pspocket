@@ -389,3 +389,117 @@ TEST_CASE("sys_libc: wide numbers, multibyte conversions and wide classes", "[hl
     CHECK(t.call("iswctype", 'A', ps_read32(b, tab + 4)) == 1); // the first entry's class
     CHECK(t.call("iswctype", '!', ps_read32(b, tab + 4)) == 0);
 }
+
+TEST_CASE("sys_libc: malloc and its family on dlmalloc", "[hle][libc]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const auto err = [&] { return ps_read32(b, static_cast<u32>(t.call("_Geterrno"))); };
+    // malloc: 16-byte aligned blocks of at least the size asked.
+    const u32 p = static_cast<u32>(t.call("malloc", 100));
+    REQUIRE(p != 0);
+    CHECK((p & 15) == 0);
+    CHECK(t.call("malloc_usable_size", p) >= 100);
+    std::memset(b + p, 0xAB, 100);
+    // calloc clears; an overflowing product fails with ENOMEM.
+    const u32 c = static_cast<u32>(t.call("calloc", 10, 10));
+    REQUIRE(c != 0);
+    CHECK(std::all_of(b + c, b + c + 100, [](u8 x) { return x == 0; }));
+    CHECK(t.call("calloc", 0x10000, 0x10000) == 0);
+    CHECK(err() == 0x80010004u); // ENOMEM (lv2's)
+    // realloc keeps the contents; realloc(NULL, n) is malloc.
+    const u32 q = static_cast<u32>(t.call("realloc", p, 5000));
+    REQUIRE(q != 0);
+    CHECK(b[q + 99] == 0xAB);
+    CHECK(t.call("realloc", q, 4000) == q); // shrinking a little keeps the block
+    CHECK(t.call("realloc", 0, 10) != 0);
+    // memalign (a boundary that is not a power of two rounds up), valloc, pvalloc, reallocalign.
+    const u32 a = static_cast<u32>(t.call("memalign", 256, 10));
+    CHECK((a & 255) == 0);
+    CHECK((t.call("memalign", 48, 10) & 63) == 0);
+    CHECK((t.call("valloc", 10) & 0xFFF) == 0);
+    const u32 pv = static_cast<u32>(t.call("pvalloc", 10));
+    CHECK((pv & 0xFFF) == 0);
+    CHECK(t.call("malloc_usable_size", pv) >= 0x1000);
+    b[a] = 0x5A;
+    const u32 ra = static_cast<u32>(t.call("reallocalign", a, 1000, 1024));
+    CHECK((ra & 1023) == 0);
+    CHECK(b[ra] == 0x5A);
+    // A request larger than the first 1 MB adds an mspace; mallinfo and malloc_footprint count it, malloc_trim gives
+    // it back once it is empty.
+    const u32 big = static_cast<u32>(t.call("malloc", 3u << 20));
+    REQUIRE(big != 0);
+    CHECK(t.call("malloc_footprint") >= (4u << 20));
+    t.call("mallinfo", kOut);
+    CHECK(ps_read32(b, kOut + 28) >= (3u << 20)); // uordblks
+    CHECK(ps_read32(b, kOut + 20) >= (4u << 20)); // usmblks: the most the heap has had
+    t.call("free", big);
+    CHECK(t.call("malloc_trim", 0) == 1);
+    CHECK(t.call("malloc_footprint") == (1u << 20));
+    t.call("malloc_stats");
+    // independent_comalloc: blocks of their own, their pointers in the caller's array.
+    const u32 sizes[] = {8, 100, 3000};
+    for (u32 i = 0; i < 3; i++) ps_write32(b, kA + 4 * i, sizes[i]);
+    CHECK(t.call("independent_comalloc", 3, kA, kB) == kB);
+    for (u32 i = 0; i < 3; i++) {
+        CHECK(t.call("malloc_usable_size", ps_read32(b, kB + 4 * i)) >= sizes[i]);
+        t.call("free", ps_read32(b, kB + 4 * i));
+    }
+    const u32 arr = static_cast<u32>(t.call("independent_calloc", 4, 32, 0));
+    REQUIRE(arr != 0);
+    CHECK(std::all_of(b + ps_read32(b, arr + 12), b + ps_read32(b, arr + 12) + 32, [](u8 x) { return x == 0; }));
+    // strdup.
+    put(b, kA, "duplicate me");
+    const u32 d = static_cast<u32>(t.call("strdup", kA));
+    REQUIRE(d != 0);
+    CHECK(cstr(b, d) == "duplicate me");
+    // mallopt: the granularity must be a power of two of a page at least; unknown parameters are refused.
+    CHECK(t.call("mallopt", static_cast<u64>(-2), 0x200000) == 1);
+    CHECK(t.call("mallopt", static_cast<u64>(-2), 0x1234) == 0);
+    CHECK(t.call("mallopt", 7, 1) == 0);
+    // Freeing what is not a block of the library's heaps is refused (logged), nothing changes.
+    t.call("free", kA + 16);
+    // _malloc_limit caps the heap: the request that would pass it fails.
+    const u32 limit = HleProcess::current()->link_variable("sys_libc", 0x0B2E15ED);
+    REQUIRE(limit != 0);
+    ps_write32(b, limit, 0x300000);
+    CHECK(t.call("malloc", 3u << 20) == 0);
+    CHECK(t.call("malloc", 0x100000) != 0);
+}
+
+TEST_CASE("sys_libc: mspaces in the caller's memory and in lv2's", "[hle][libc]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    constexpr u32 kSpace = kData + 0x100000;
+    const u32 msp = static_cast<u32>(t.call("mspace_create", kSpace, 0x10000));
+    REQUIRE(msp != 0);
+    CHECK(t.call("mspace_is_heap_empty", msp) == 1);
+    const u32 m1 = static_cast<u32>(t.call("mspace_malloc", msp, 100));
+    CHECK((m1 >= kSpace && m1 < kSpace + 0x10000));
+    CHECK(t.call("mspace_is_heap_empty", msp) == 0);
+    CHECK(t.call("mspace_malloc", msp, 0x20000) == 0); // it does not grow
+    const u32 m2 = static_cast<u32>(t.call("mspace_calloc", msp, 4, 8));
+    CHECK(std::all_of(b + m2, b + m2 + 32, [](u8 x) { return x == 0; }));
+    const u32 m3 = static_cast<u32>(t.call("mspace_memalign", msp, 512, 8));
+    CHECK((m3 & 511) == 0);
+    b[m1] = 0x11;
+    const u32 m4 = static_cast<u32>(t.call("mspace_realloc", msp, m1, 2000));
+    CHECK((m4 >= kSpace && m4 < kSpace + 0x10000));
+    CHECK(b[m4] == 0x11);
+    CHECK(t.call("mspace_malloc_usable_size", m4) >= 2000);
+    t.call("mspace_malloc_stats", msp);
+    for (const u32 m : {m2, m3, m4}) t.call("mspace_free", msp, m);
+    CHECK(t.call("mspace_is_heap_empty", msp) == 1);
+    CHECK(t.call("mspace_destroy", msp) == 0); // the caller's memory: nothing to give back
+    CHECK(t.call("mspace_malloc", msp, 8) == 0);  // gone (refused, logged)
+    // With no base the mspace takes its memory from lv2, and destroy gives it back.
+    const u32 lv2 = static_cast<u32>(t.call("mspace_create", 0, 0x20000));
+    REQUIRE(lv2 != 0);
+    CHECK(t.call("mspace_malloc", lv2, 0x10000) != 0);
+    CHECK(t.call("mspace_destroy", lv2) == 0x20000);
+    // Too small a memory for an mspace.
+    CHECK(t.call("mspace_create", kSpace, 64) == 0);
+}
