@@ -458,6 +458,24 @@ Result sys_ppu_thread_rename(PpuThread& t, u32 thread_id, u32 name)
     return CELL_OK;
 }
 
+// sys_ppu_thread_recover_page_fault(thread_id) and sys_ppu_thread_get_page_fault_context(thread_id, ctxt) (57, 58):
+// wake a thread lv2 suspended at a page fault in an area with page fault notification, or read its registers. pspocket
+// raises no page faults (memory.cpp, sys_mmapper_enable_page_fault_notification), so no thread is ever suspended at
+// one: the answer is RPCS3's for a thread that isn't (EINVAL), after ESRCH for an unknown one. RPCS3:
+// Emu/Cell/lv2/sys_ppu_thread.cpp, sys_mmapper.cpp (mmapper_thread_recover_page_fault). The firmware's media decoders
+// (libat3dec, libatxdec, libmp3dec, libavcdec, libaacenc_spurs) issue both.
+Result sys_ppu_thread_recover_page_fault(PpuThread& t, u32 thread_id)
+{
+    if (thread_id != t.id && !t.kernel.impl().threads.get<PpuThread>(thread_id)) return err(CELL_ESRCH);
+    return err(CELL_EINVAL);
+}
+
+Result sys_ppu_thread_get_page_fault_context(PpuThread& t, u32 thread_id, u32)
+{
+    if (thread_id != t.id && !t.kernel.impl().threads.get<PpuThread>(thread_id)) return err(CELL_ESRCH);
+    return err(CELL_EINVAL);
+}
+
 u32 sys_ppu_thread_get_id(PpuThread& t) { return t.id; }
 
 void register_thread_syscalls(SyscallTable& table)
@@ -475,6 +493,8 @@ void register_thread_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 52, _sys_ppu_thread_create);
     PS_LV2_BIND(table, 53, sys_ppu_thread_start);
     PS_LV2_BIND(table, 56, sys_ppu_thread_rename);
+    PS_LV2_BIND(table, 57, sys_ppu_thread_recover_page_fault);
+    PS_LV2_BIND(table, 58, sys_ppu_thread_get_page_fault_context);
 }
 
 } // namespace pspocket::lv2

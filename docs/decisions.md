@@ -5268,6 +5268,29 @@ alternating): the main SPU threads 8.82, 8.77 to 8.53, 8.09 CPU s per 5 s, the p
 the same. (ps_res_wait_change also takes its spin deadline from the one-multiply clock, D-241.) Tests: tests/core/test_reservation.cpp (waiters
 racing DMA-style writes on fresh lines are always woken; with every bump skipped the tests fail).
 
+## D-244 · 2026-10-08 · The syscalls the firmware's own modules issue, counted and answered
+
+Since D-157 the firmware's modules run as the game's code, so a syscall one of them issues is one a game reaches through
+it, and the user's firmware is inventory (rule 4). scripts/firmware-syscalls.py finds every `sc` with a `li r11, N`
+before it in the decrypted modules (476 numbers; 337 `sc` load r11 some other way) and sets them against pspocket's
+handlers: 197 answered by pspocket, 164 as RPCS3 answers them (null or stub), and 18 missing from modules that run
+translated (modules pspocket serves itself, recomp::firmware_module_native, never run and are left out). Answered now,
+as RPCS3 answers them:
+- sys_ppu_thread_recover_page_fault, sys_ppu_thread_get_page_fault_context (57, 58; the media decoders libat3dec,
+  libatxdec, libmp3dec, libavcdec, libaacenc_spurs) and sys_spu_thread_recover_page_fault (198; libaacenc, libat3enc,
+  libatxenc): lv2 suspends a thread at a page fault in an area with notification, and these wake it or read its
+  registers. pspocket raises no page faults (D-184), so no thread is ever suspended at one: EINVAL for a live thread,
+  ESRCH for an unknown one, RPCS3's answers for a thread not suspended.
+- sys_mmapper_allocate_shared_memory_ext and _from_container_ext (339, 328; libatxenc): the plain forms with up to 16
+  entries whose type must be 0, 1 or 3 (5 is for debug or root processes, which a game is not), page-size flags only,
+  and always a new process-shared object.
+- sys_memory_container_destroy_parent_with_childs (345; libatxenc): child containers belong to other processes, so the
+  parent alone is destroyed.
+Left unanswered, logged as unimplemented: the interrupt-thread and isolated-SPU calls (81, 84, 88, 230-240) of
+internal/libchnnlsv, the PSP save-data library, which is not in cellSysmodule's table, so no game can load it; and 347
+in libatxenc, an unnamed number RPCS3 treats as unused, sitting in a table of one-call syscall wrappers. Tests:
+tests/lv2/test_memory.cpp, tests/hle/test_spu_threads.cpp.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

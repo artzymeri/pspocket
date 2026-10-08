@@ -193,6 +193,9 @@ TEST_CASE("SPU thread groups: arguments, thread exit status, restart, images, de
     CHECK(thread == (group & 0xFFFFFF));
     CHECK(lv2::sys_spu_thread_get_exit_status(s.t, thread, kValue) == lv2::err(lv2::CELL_ESTAT));
     CHECK(lv2::sys_spu_thread_initialize(s.t, kThread, group, 1, kImg, kThreadAttr, kArgs) == lv2::err(lv2::CELL_EBUSY));
+    // No SPU thread is ever suspended at a page fault (D-244): a live one is EINVAL, an unknown one ESRCH.
+    CHECK(lv2::sys_spu_thread_recover_page_fault(s.t, thread) == lv2::err(lv2::CELL_EINVAL));
+    CHECK(lv2::sys_spu_thread_recover_page_fault(s.t, thread + 1) == lv2::err(lv2::CELL_ESRCH));
     for (int run = 0; run < 2; run++) {
         INFO("run " << run);
         std::memset(s.b + kOut, 0, 0x50);

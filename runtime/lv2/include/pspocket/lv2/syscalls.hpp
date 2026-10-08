@@ -41,6 +41,8 @@ Result _sys_ppu_thread_create(PpuThread& t, u32 thread_id, u32 param, u64 arg, u
     u64 flags, u32 threadname);
 Result sys_ppu_thread_start(PpuThread& t, u32 thread_id);
 Result sys_ppu_thread_rename(PpuThread& t, u32 thread_id, u32 name);
+Result sys_ppu_thread_recover_page_fault(PpuThread& t, u32 thread_id);
+Result sys_ppu_thread_get_page_fault_context(PpuThread& t, u32 thread_id, u32 ctxt);
 // sysPrxForUser's sys_ppu_thread_get_id has no syscall; HLE uses this.
 u32 sys_ppu_thread_get_id(PpuThread& t);
 
@@ -140,6 +142,7 @@ Result sys_event_port_connect_ipc(PpuThread& t, u32 eport_id, u64 ipc_key);
 Result sys_memory_container_create(PpuThread& t, u32 cid, u64 size);
 Result sys_memory_container_destroy(PpuThread& t, u32 cid);
 Result sys_memory_container_get_size(PpuThread& t, u32 mem_info, u32 cid);
+Result sys_memory_container_destroy_parent_with_childs(PpuThread& t, u32 cid, u32 must_0, u32 mc_child);
 Result sys_mmapper_enable_page_fault_notification(PpuThread& t, u32 start_addr, u32 event_queue_id);
 Result sys_memory_allocate(PpuThread& t, u64 size, u64 flags, u32 alloc_addr);
 Result sys_memory_free(PpuThread& t, u32 start_addr);
@@ -156,6 +159,10 @@ Result sys_mmapper_unmap_shared_memory(PpuThread& t, u32 addr, u32 mem_id);
 Result sys_mmapper_search_and_map(PpuThread& t, u32 start_addr, u32 mem_id, u64 flags, u32 alloc_addr);
 Result sys_mmapper_allocate_shared_memory_from_container(PpuThread& t, u64 ipc_key, u64 size, u32 cid, u64 flags,
     u32 mem_id);
+Result sys_mmapper_allocate_shared_memory_ext(PpuThread& t, u64 ipc_key, u64 size, u32 flags, u32 entries,
+    s32 entry_count, u32 mem_id);
+Result sys_mmapper_allocate_shared_memory_from_container_ext(PpuThread& t, u64 ipc_key, u64 size, u64 flags, u32 cid,
+    u32 entries, s32 entry_count, u32 mem_id);
 
 // ---- filesystem (sys_fs.cpp)
 enum : s32 {
@@ -253,6 +260,7 @@ Result sys_spu_thread_group_destroy(PpuThread& t, u32 id);
 Result sys_spu_thread_initialize(PpuThread& t, u32 thread, u32 group, u32 spu_num, u32 img, u32 attr, u32 arg);
 Result sys_spu_thread_set_argument(PpuThread& t, u32 id, u32 arg);
 Result sys_spu_thread_get_exit_status(PpuThread& t, u32 id, u32 status);
+Result sys_spu_thread_recover_page_fault(PpuThread& t, u32 id);
 Result sys_spu_thread_group_start(PpuThread& t, u32 id);
 Result sys_spu_thread_group_suspend(PpuThread& t, u32 id);
 Result sys_spu_thread_group_resume(PpuThread& t, u32 id);

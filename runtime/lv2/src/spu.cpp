@@ -957,6 +957,15 @@ Result sys_spu_thread_get_exit_status(PpuThread& t, u32 id, u32 status)
     return CELL_OK;
 }
 
+// sys_spu_thread_recover_page_fault(id) (198): as sys_ppu_thread_recover_page_fault (thread.cpp): no SPU thread is
+// ever suspended at a page fault here, so a live one answers EINVAL. RPCS3: Emu/Cell/lv2/sys_spu.cpp. The firmware's
+// AAC and ATRAC encoders issue it.
+Result sys_spu_thread_recover_page_fault(PpuThread& t, u32 id)
+{
+    if (!get_thread(t.kernel.impl(), id).second) return err(CELL_ESRCH);
+    return err(CELL_EINVAL);
+}
+
 Result sys_spu_thread_group_start(PpuThread& t, u32 id)
 {
     Kernel::Impl& s = t.kernel.impl();
@@ -1435,6 +1444,7 @@ void register_spu_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 192, sys_spu_thread_disconnect_event);
     PS_LV2_BIND(table, 193, sys_spu_thread_bind_queue);
     PS_LV2_BIND(table, 194, sys_spu_thread_unbind_queue);
+    PS_LV2_BIND(table, 198, sys_spu_thread_recover_page_fault);
     PS_LV2_BIND(table, 250, sys_spu_thread_group_set_cooperative_victims);
     PS_LV2_BIND(table, 251, sys_spu_thread_group_connect_event_all_threads);
     PS_LV2_BIND(table, 252, sys_spu_thread_group_disconnect_event_all_threads);

@@ -436,6 +436,14 @@ Result sys_memory_container_destroy(PpuThread& t, u32 cid)
     return CELL_OK;
 }
 
+// sys_memory_container_destroy_parent_with_childs(cid, must_0, mc_child) (345): child containers belong to other
+// processes, and a game has none, so this destroys the parent alone (RPCS3 Emu/Cell/lv2/sys_memory.cpp does the same).
+Result sys_memory_container_destroy_parent_with_childs(PpuThread& t, u32 cid, u32 must_0, u32)
+{
+    if (must_0) return err(CELL_EINVAL);
+    return sys_memory_container_destroy(t, cid);
+}
+
 Result sys_memory_container_get_size(PpuThread& t, u32 mem_info, u32 cid)
 {
     Kernel::Impl& s = t.kernel.impl();
@@ -623,6 +631,56 @@ Result sys_mmapper_allocate_shared_memory_from_container(PpuThread& t, u64 ipc_k
         SYS_SYNC_NEWLY_CREATED, ct, mem_id);
 }
 
+namespace {
+
+// The _ext forms (328, 339) take up to 16 entries of 24 bytes (RPCS3 mmapper_unk_entry_struct0: four words of unknown
+// use, then a 64-bit type). Types 0, 1 and 3 are accepted; 5 only for a debug or root process with 64 KB pages, which
+// a game is not; any other type is EPERM. RPCS3: Emu/Cell/lv2/sys_mmapper.cpp.
+Result check_ext_entries(PpuThread& t, u32 entries, s32 entry_count)
+{
+    if (entry_count <= 0 || entry_count > 0x10) return err(CELL_EINVAL);
+    const Guest& guest = t.kernel.impl().guest;
+    if (!guest.valid(entries, static_cast<u32>(entry_count) * 0x18)) return err(CELL_EFAULT);
+    for (s32 i = 0; i < entry_count; i++) {
+        switch (guest.r64(entries + static_cast<u32>(i) * 0x18 + 0x10)) {
+        case 0:
+        case 1:
+        case 3: break;
+        default: return err(CELL_EPERM); // 5 included: a game process is neither debug nor root
+        }
+    }
+    return CELL_OK;
+}
+
+} // namespace
+
+// sys_mmapper_allocate_shared_memory_ext(ipc_key, size, flags, entries, entry_count, mem_id) and
+// sys_mmapper_allocate_shared_memory_from_container_ext(ipc_key, size, flags, cid, entries, entry_count, mem_id)
+// (339, 328): as the plain forms, with entries (check_ext_entries), flags of the page size only, and always a new
+// process-shared object (RPCS3 create_lv2_shm<true>: exclusive, keyed even by SYS_MMAPPER_NO_SHM_KEY). The firmware's
+// ATRAC encoder (libatxenc) issues both.
+Result sys_mmapper_allocate_shared_memory_ext(PpuThread& t, u64 ipc_key, u64 size, u32 flags, u32 entries,
+    s32 entry_count, u32 mem_id)
+{
+    if (const Result r = check_granularity(size, flags); r != CELL_OK) return r;
+    if (flags & ~SYS_MEMORY_GRANULARITY_MASK) return err(CELL_EINVAL);
+    if (const Result r = check_ext_entries(t, entries, entry_count); r != CELL_OK) return r;
+    const u32 align = (flags & SYS_MEMORY_PAGE_SIZE_64K) ? 0x10000 : 0x100000;
+    return create_shared_memory(t, true, ipc_key, size, align, flags, SYS_SYNC_NEWLY_CREATED, nullptr, mem_id);
+}
+
+Result sys_mmapper_allocate_shared_memory_from_container_ext(PpuThread& t, u64 ipc_key, u64 size, u64 flags, u32 cid,
+    u32 entries, s32 entry_count, u32 mem_id)
+{
+    if (const Result r = check_granularity(size, flags); r != CELL_OK) return r;
+    if (flags & ~SYS_MEMORY_GRANULARITY_MASK) return err(CELL_EINVAL);
+    if (const Result r = check_ext_entries(t, entries, entry_count); r != CELL_OK) return r;
+    const auto ct = t.kernel.impl().containers.get<MemoryContainer>(cid);
+    if (!ct) return err(CELL_ESRCH);
+    const u32 align = (flags & SYS_MEMORY_PAGE_SIZE_64K) ? 0x10000 : 0x100000;
+    return create_shared_memory(t, true, ipc_key, size, align, flags, SYS_SYNC_NEWLY_CREATED, ct, mem_id);
+}
+
 Result sys_mmapper_free_shared_memory(PpuThread& t, u32 mem_id)
 {
     Kernel::Impl& s = t.kernel.impl();
@@ -713,6 +771,7 @@ void register_memory_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 324, sys_memory_container_create);
     PS_LV2_BIND(table, 325, sys_memory_container_destroy);
     PS_LV2_BIND(table, 326, sys_mmapper_allocate_fixed_address);
+    PS_LV2_BIND(table, 328, sys_mmapper_allocate_shared_memory_from_container_ext);
     PS_LV2_BIND(table, 329, sys_mmapper_free_shared_memory);
     PS_LV2_BIND(table, 330, sys_mmapper_allocate_address);
     PS_LV2_BIND(table, 331, sys_mmapper_free_address);
@@ -720,9 +779,11 @@ void register_memory_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 334, sys_mmapper_map_shared_memory);
     PS_LV2_BIND(table, 335, sys_mmapper_unmap_shared_memory);
     PS_LV2_BIND(table, 337, sys_mmapper_search_and_map);
+    PS_LV2_BIND(table, 339, sys_mmapper_allocate_shared_memory_ext);
     PS_LV2_BIND(table, 341, sys_memory_container_create);
     PS_LV2_BIND(table, 342, sys_memory_container_destroy);
     PS_LV2_BIND(table, 343, sys_memory_container_get_size);
+    PS_LV2_BIND(table, 345, sys_memory_container_destroy_parent_with_childs);
     PS_LV2_BIND(table, 348, sys_memory_allocate);
     PS_LV2_BIND(table, 349, sys_memory_free);
     PS_LV2_BIND(table, 350, sys_memory_allocate_from_container);

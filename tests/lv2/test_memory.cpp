@@ -307,3 +307,73 @@ TEST_CASE("lv2 mmapper: page fault notification, registered with RPCS3's checks 
     REQUIRE(c.call(kGetNumberOfObject, 0x0E, n) == CELL_OK);
     CHECK(f.r32(n) == 1); // the port lv2 made for it
 }
+
+TEST_CASE("lv2 mmapper: the _ext shared memory calls check their entries, then make a new shared object (D-244)",
+    "[lv2][mmapper]")
+{
+    Fixture f;
+    Caller c(*f.kernel);
+    const u32 out = f.alloc(4);
+    const u32 entries = f.alloc(0x18 * 17);
+    auto entry = [&](u32 i, u64 type) { f.w64(entries + i * 0x18 + 0x10, type); };
+    for (u32 i = 0; i < 17; i++) entry(i, 1);
+    const u64 key = 0x5678;
+    CHECK(c.call(339, key, 0, k1M, entries, 1, out) == rc(CELL_EALIGN));
+    CHECK(c.call(339, key, 0x180000, k1M, entries, 1, out) == rc(CELL_EALIGN));
+    CHECK(c.call(339, key, 0x100000, 0x800, entries, 1, out) == rc(CELL_EINVAL));        // no such page size
+    CHECK(c.call(339, key, 0x100000, k1M | 0xC000, entries, 1, out) == rc(CELL_EINVAL)); // page size bits only
+    CHECK(c.call(339, key, 0x100000, k1M, entries, 0, out) == rc(CELL_EINVAL));
+    CHECK(c.call(339, key, 0x100000, k1M, entries, 17, out) == rc(CELL_EINVAL));
+    CHECK(c.call(339, key, 0x100000, k1M, 0xFFFFFF00u, 1, out) == rc(CELL_EFAULT));
+    entry(1, 5); // root or debug processes only
+    CHECK(c.call(339, key, 0x10000, k64K, entries, 2, out) == rc(CELL_EPERM));
+    entry(1, 2);
+    CHECK(c.call(339, key, 0x100000, k1M, entries, 2, out) == rc(CELL_EPERM));
+    entry(0, 0);
+    entry(1, 3);
+    const UserSize before = user_size(f, c);
+    REQUIRE(c.call(339, key, 0x100000, k1M, entries, 2, out) == CELL_OK);
+    const u32 mem = f.r32(out);
+    CHECK(user_size(f, c).available == before.available - 0x100000);
+    CHECK(c.call(339, key, 0x100000, k1M, entries, 2, out) == rc(CELL_EEXIST)); // always a new object
+    CHECK(c.call(kMmAllocateShm, key, 0x100000, k1M, out) == rc(CELL_EEXIST));  // and one the key opens
+    REQUIRE(c.call(kMmAllocateAddress, 0x10000000, k1M, 0x10000000, out) == CELL_OK);
+    const u32 area = f.r32(out);
+    REQUIRE(c.call(kMmMap, area, mem, 0) == CELL_OK);
+    f.w32(area, 0xC0FFEE);
+    CHECK(f.r32(area) == 0xC0FFEE);
+    REQUIRE(c.call(kMmUnmap, area, out) == CELL_OK);
+    REQUIRE(c.call(kMmFreeShm, mem) == CELL_OK);
+    CHECK(user_size(f, c).available == before.available);
+
+    // From a container: charged to it; an unknown container is ESRCH after the other checks.
+    REQUIRE(c.call(kContainerCreate, out, 0x200000) == CELL_OK);
+    const u32 cid = f.r32(out);
+    CHECK(c.call(328, key, 0x100000, k1M, 0x3F00000F, entries, 2, out) == rc(CELL_ESRCH));
+    CHECK(c.call(328, key, 0x100000, k1M, cid, entries, 0, out) == rc(CELL_EINVAL));
+    REQUIRE(c.call(328, key, 0x100000, k1M, cid, entries, 2, out) == CELL_OK);
+    const u32 from_container = f.r32(out);
+    const u32 info = f.alloc(8);
+    REQUIRE(c.call(kContainerGetSize, info, cid) == CELL_OK);
+    CHECK(f.r32(info + 4) == 0x100000);
+    CHECK(c.call(kContainerDestroy, cid) == rc(CELL_EBUSY));
+    REQUIRE(c.call(kMmFreeShm, from_container) == CELL_OK);
+
+    // sys_memory_container_destroy_parent_with_childs: the parent alone (a game has no child containers).
+    CHECK(c.call(345, cid, 1, 0) == rc(CELL_EINVAL));
+    REQUIRE(c.call(345, cid, 0, 0) == CELL_OK);
+    CHECK(c.call(345, cid, 0, 0) == rc(CELL_ESRCH));
+}
+
+TEST_CASE("lv2 mmapper: no thread is ever suspended at a page fault, so none is recovered (D-244)", "[lv2][memory]")
+{
+    Fixture f;
+    Caller c(*f.kernel);
+    Caller other(*f.kernel, "other");
+    const u32 ctxt = f.alloc(0x100);
+    CHECK(c.call(57, 0x01FFFFFF) == rc(CELL_ESRCH));
+    CHECK(c.call(58, 0x01FFFFFF, ctxt) == rc(CELL_ESRCH));
+    CHECK(c.call(57, c.id()) == rc(CELL_EINVAL));
+    CHECK(c.call(57, other.id()) == rc(CELL_EINVAL));
+    CHECK(c.call(58, other.id(), ctxt) == rc(CELL_EINVAL));
+}
