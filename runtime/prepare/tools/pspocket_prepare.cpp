@@ -8,7 +8,12 @@
 //                    [--quiet]
 //   pspocket-prepare --system DEV_FLASH --game-dir DIR [--for EBOOT.elf]... [--spu-modules all|KEY,...] [-j N]
 //                    [--memory MB] [--keep-sources] [--quiet]
+//   pspocket-prepare ... --modules DIR [--flash DEV_FLASH] [--disc IMAGE.iso]
 //
+// --modules DIR (with a game) also makes the game's modules library (D-238) in DIR's game folder's "modules": the
+// game's own PRX modules pspocket-boot --prx-dump (or the app) saved in DIR, translated at slots 128 MB into the PRX
+// region and up (above the firmware's modules of --flash, if they ever reach that far). --disc also takes the disc's
+// own PRX modules and SPU ELFs (D-239), saved into the game folder's disc-prx and disc-spu, as the app does.
 // --system makes the system library (D-178): the firmware's modules in DEV_FLASH translated once, into DIR (by
 // convention the folder "system" beside DEV_FLASH, where pspocket-boot and the app look for it), with the SPU programs
 // of the modules the games given with --for link (D-191), as the phone adds them before a game, or of the modules
@@ -30,10 +35,13 @@
 #include <string>
 #include <vector>
 
+#include "pspocket/disc/modules.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
+#include "pspocket/prepare/modules.hpp"
 #include "pspocket/prepare/prepare.hpp"
 #include "pspocket/prepare/spu.hpp"
+#include "pspocket/recomp/hash.hpp"
 #include "pspocket/prepare/system.hpp"
 
 namespace fs = std::filesystem;
@@ -65,7 +73,9 @@ std::string clock_text(double s)
 int main(int argc, char** argv)
 {
     prepare::Options o;
-    std::string events_path, system_flash;
+    std::string events_path, system_flash, modules_flash;
+    std::vector<std::string> modules_inputs;
+    std::string disc_image;
     std::vector<std::string> system_for;
     std::set<std::string> spu_modules;
     bool quiet = false, lift_spu_only = false, discover_spu = false;
@@ -93,6 +103,9 @@ int main(int argc, char** argv)
         else if (a == "--spu-arg") o.extra_spu_args.emplace_back(v);
         else if (a == "--mllvm") o.llvm_options.emplace_back(v);
         else if (a == "--events") events_path = v;
+        else if (a == "--modules") modules_inputs.emplace_back(v);
+        else if (a == "--flash") modules_flash = v;
+        else if (a == "--disc") disc_image = v;
         else if (a == "--for") system_for.emplace_back(v);
         else if (a == "--spu-modules") {
             std::string list = v;
@@ -192,7 +205,44 @@ int main(int argc, char** argv)
         }
         r = prepare::prepare_system(s);
     } else {
+        if (!disc_image.empty()) { // the disc's own executable files (D-239)
+            const fs::path prx = fs::path(o.game_dir) / "disc-prx", spu = fs::path(o.game_dir) / "disc-spu";
+            disc::DiscModules found;
+            std::string why;
+            if (!disc::save_disc_modules(disc_image, prx.string(), spu.string(), &found, &why)) {
+                std::fprintf(stderr, "pspocket-prepare: %s: %s\n", disc_image.c_str(), why.c_str());
+                return 1;
+            }
+            std::printf("the disc: %zu PRX modules, %zu SPU programs (%zu need a licence)\n", found.prx, found.spu,
+                found.npdrm);
+            if (found.prx) modules_inputs.push_back(prx.string());
+            if (found.spu) o.spu_elf_dirs.push_back(spu.string());
+        }
         r = prepare::prepare_game(o);
+        if (r.ok && !modules_inputs.empty()) { // the game's own modules (D-238)
+            prepare::ModulesOptions m;
+            m.inputs = modules_inputs;
+            m.title_id = o.title_id;
+            m.executable_sha256 = prepare::file_sha256(o.executable);
+            if (!modules_flash.empty()) { // above the firmware's modules, however far they reach
+                loader::LleModules lle(modules_flash);
+                if (lle.index()) m.floor = std::max(m.floor, lle.layout_end());
+            }
+            m.dir = (fs::path(o.game_dir) / "modules").string();
+            m.toolchain = o.toolchain;
+            m.workers = o.workers;
+            m.memory_mb = o.memory_mb;
+            m.keep_sources = o.keep_sources;
+            m.progress = o.progress;
+            const prepare::ModulesResult mr = prepare::prepare_game_modules(m);
+            if (!mr.library.ok) {
+                std::fprintf(stderr, "pspocket-prepare: its modules: %s\n", mr.library.error.c_str());
+                return 1;
+            }
+            std::printf("%s\n", mr.none ? "the game's modules: none saved" : std::format("the game's modules: {} "
+                "translated into {} ({} without a slot, {} unreadable)", mr.modules, m.dir, mr.without_slot,
+                mr.unreadable).c_str());
+        }
     }
     if (!r.ok) {
         std::fprintf(stderr, "pspocket-prepare: %s\n", r.error.c_str());

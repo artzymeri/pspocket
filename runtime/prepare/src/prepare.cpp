@@ -280,6 +280,20 @@ Result prepare_game(const Options& o)
             const std::vector<SpuSegment> segments = executable_segments(*elf);
             save_spu_images(segments, "the executable", statics, so, found);
         }
+        // The disc's own SPU ELFs (D-239): each file one segment, scanned as the executable's.
+        for (const std::string& elf_dir : o.spu_elf_dirs) {
+            for (const auto& e : fs::directory_iterator(elf_dir, ec)) {
+                if (e.path().extension() != ".elf") continue;
+                std::string bytes;
+                if (!read_bytes(e.path(), bytes)) continue;
+                const std::vector<SpuSegment> file = {{0x10000000u, std::span<const u8>(
+                    reinterpret_cast<const u8*>(bytes.data()), bytes.size())}}; // an address for the log only
+                SpuStaticOptions so;
+                so.low_entry_relocatable = true;
+                so.who = o.title_id;
+                save_spu_images(file, e.path().filename().string(), statics, so, found);
+            }
+        }
         if (found.programs) {
             inputs.push_back(statics.string());
             images += found.programs;

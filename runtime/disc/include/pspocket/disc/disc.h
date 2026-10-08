@@ -33,6 +33,14 @@ int ps_disc_extract_executables(const char* image_path, const char* out_dir, ps_
  */
 int ps_disc_decrypt_executable(const char* image_path, const char* elf_path, char* error, size_t error_size);
 
+/*
+ * Saves the disc's own PRX modules (decrypted, as <identity>.elf) into prx_dir and its standalone SPU ELFs into
+ * spu_dir, for the preparation to translate before the game loads them (D-239). Returns how many files it saved (or
+ * found saved), or -1 with the reason in error.
+ */
+int ps_disc_save_modules(const char* image_path, const char* prx_dir, const char* spu_dir, char* error,
+    size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif

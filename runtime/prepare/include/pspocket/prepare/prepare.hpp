@@ -49,6 +49,8 @@ struct Options {
     // keeps their entries as seeds for the next time (D-155), and included. Used when spu_dir is empty.
     std::string spu_images_dir;
     std::vector<std::string> spu_logs; // runs' logs: where execution left lifted SPU code, more seeds
+    // Folders of SPU ELFs from the disc (disc::save_disc_modules, D-239): translated as the executable's are (D-226).
+    std::vector<std::string> spu_elf_dirs;
     bool discover_spu = true;          // also lift SPU code only registers reach (recomp::spu discover, D-155)
     Toolchain toolchain;
     unsigned workers = 0;     // 0: one per core

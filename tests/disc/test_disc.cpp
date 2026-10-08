@@ -13,6 +13,10 @@
 #include "pspocket/disc/disc.h"
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/disc/iso9660.hpp"
+#include "pspocket/disc/modules.hpp"
+#include "pspocket/recomp/elf.hpp"
+#include "pspocket/recomp/prx_place.hpp"
+#include "synthetic.hpp"
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/lv2/kernel.hpp"
 
@@ -491,5 +495,65 @@ TEST_CASE("The disc image as a VFS image: lookups ignore case, reads cross exten
     write_file(dir / "junk.iso", pattern(64 * kSectorSize, 9));
     CHECK_FALSE(pspocket::loader::open_disc_image((dir / "junk.iso").string(), nullptr, &error));
     CHECK_FALSE(pspocket::loader::open_disc_image((dir / "missing.iso").string(), nullptr, &error));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("A disc's own PRX modules and SPU programs are saved for the preparation, data files never read (D-239)")
+{
+    // USRDIR: LIB/GAME.SPRX a real module (a debug SELF), SPU/TASK.ELF an SPU program, LIB/NP.SPRX a SELF that does not
+    // decrypt (as an NPDRM module without its licence), DATA/LEVEL.BIN data with an executable's name.
+    const auto prx = test::build_ppu_prx();
+    const std::vector<u8> module = test::wrap_in_self(prx.bytes, {.debug = true, .npdrm = false, .self_type = 4});
+    std::vector<u8> spu(0x100, 0);
+    const u8 ident[16] = {0x7F, 'E', 'L', 'F', 1, 2, 1, 0};
+    std::memcpy(spu.data(), ident, 16);
+    spu[0x11] = 2;  // ET_EXEC
+    spu[0x13] = 23; // EM_SPU
+    std::vector<u8> np = pattern(3000, 7);
+    std::memcpy(np.data(), "SCE\0", 4);
+    const std::vector<u8> level = pattern(5000, 8);
+    IsoBuilder iso;
+    iso.write_records(18, {dir_record(std::string(1, '\0'), 18, kSectorSize, 2), dir_record(std::string(1, '\1'), 18, kSectorSize, 2),
+                              dir_record("PS3_GAME", 19, kSectorSize, 2)});
+    iso.write_records(19, {dir_record(std::string(1, '\0'), 19, kSectorSize, 2), dir_record(std::string(1, '\1'), 18, kSectorSize, 2),
+                              dir_record("USRDIR", 20, kSectorSize, 2)});
+    iso.write_records(20, {dir_record(std::string(1, '\0'), 20, kSectorSize, 2), dir_record(std::string(1, '\1'), 19, kSectorSize, 2),
+                              dir_record("DATA", 23, kSectorSize, 2), dir_record("LIB", 21, kSectorSize, 2),
+                              dir_record("SPU", 22, kSectorSize, 2)});
+    iso.write_records(21, {dir_record(std::string(1, '\0'), 21, kSectorSize, 2), dir_record(std::string(1, '\1'), 20, kSectorSize, 2),
+                              dir_record("GAME.SPRX;1", 40, static_cast<u32>(module.size()), 0),
+                              dir_record("NP.SPRX;1", 80, static_cast<u32>(np.size()), 0)});
+    iso.write_records(22, {dir_record(std::string(1, '\0'), 22, kSectorSize, 2), dir_record(std::string(1, '\1'), 20, kSectorSize, 2),
+                              dir_record("TASK.ELF;1", 90, static_cast<u32>(spu.size()), 0)});
+    iso.write_records(23, {dir_record(std::string(1, '\0'), 23, kSectorSize, 2), dir_record(std::string(1, '\1'), 20, kSectorSize, 2),
+                              dir_record("LEVEL.BIN;1", 100, static_cast<u32>(level.size()), 0)});
+    iso.file(40, module);
+    iso.file(80, np);
+    iso.file(90, spu);
+    iso.file(100, level);
+    iso.pvd(18, kSectorSize, "PS3VOLUME");
+    const fs::path dir = temp_dir("disc-modules");
+    write_file(dir / "game.iso", iso.image);
+
+    DiscModules found;
+    std::string error;
+    REQUIRE(save_disc_modules((dir / "game.iso").string(), (dir / "prx").string(), (dir / "spu").string(), &found, &error));
+    CHECK(found.files == 4);
+    CHECK(found.prx == 1);
+    CHECK(found.spu == 1);
+    CHECK(found.npdrm == 1);
+    // Under the identity the loader computes when it loads the module (the plain ELF's).
+    auto elf = recomp::ElfFile::parse(prx.bytes);
+    REQUIRE(elf);
+    const fs::path saved = dir / "prx" / (recomp::prx_identity(*elf) + ".elf");
+    REQUIRE(fs::exists(saved));
+    CHECK(slurp(saved) == prx.bytes);
+    CHECK(slurp(dir / "prx" / (recomp::prx_identity(*elf) + ".txt")).size() > 0);
+    // A second scan saves nothing new.
+    REQUIRE(save_disc_modules((dir / "game.iso").string(), (dir / "prx").string(), (dir / "spu").string(), &found, &error));
+    CHECK(found.prx == 1);
+    size_t files = 0;
+    for ([[maybe_unused]] const auto& e : fs::directory_iterator(dir / "prx")) files++;
+    CHECK(files == 2);
     fs::remove_all(dir);
 }

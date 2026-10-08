@@ -5207,6 +5207,21 @@ room, and ran under the interpreter in every session: translated code is tied to
   program translated with the interpreter's result; loaded twice, the second copy interpreted; a changed byte, another
   module, saved; prepared again, the first module's slot kept).
 
+## D-239 · 2026-10-08 · A disc's own modules and SPU programs are found before the first session
+
+What a game loads from its own disc files ran interpreted in its first session: modules were saved only when loaded
+(D-238), SPU thread images only when met (D-076). disc::save_disc_modules walks PS3_GAME/USRDIR for files named as
+executables (.sprx .prx .self .elf .bin, up to 256 MB), reads only those whose first bytes say SELF or ELF, decrypts
+them with the build's keys, and saves PPU PRX modules as the loader saves them (so prepare_game_modules translates
+them before the game loads them) and SPU ELFs for the preparation's SPU scan (Options::spu_elf_dirs, as the
+executable's, D-226). NPDRM files are counted, not decrypted (a PSN game's licence). The app scans a disc once, before
+its first preparation check (pspocket-games/<TITLE>/disc-prx, disc-spu); ps3disc --modules and pspocket-prepare --disc
+do it on the Mac. GTA V's and Assassin's Creed's discs hold no such file (GTA V's code is all in its executable, its
+data in archives; Assassin's Creed's one .bin is data): their preparation is unchanged. Test: tests/disc/test_disc.cpp
+(a synthetic disc: a debug-SELF module saved under the identity the loader computes, an SPU ELF saved, a SELF that does
+not decrypt counted, a data file with an executable's name never read past its first bytes, a second scan saves
+nothing new).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
