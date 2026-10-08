@@ -28,8 +28,8 @@ namespace pspocket::rsx::shader {
 // (metal/src/shader_cache.mm) loads only the records of this version: a record of another one holds MSL of the old
 // translation under a key the new one also uses. 2: D-174. 4: D-256 to D-263 (FOGC's fog factor, two-sided
 // lighting, user clip planes, the depth bounds test, point sizes and sprites, polygon stipple); 3 was a step on the
-// way that never left the Mac.
-inline constexpr u32 kTranslationVersion = 4;
+// way that never left the Mac. 5: D-269 (a vertex program puts out only what its fragment program reads).
+inline constexpr u32 kTranslationVersion = 5;
 
 // Argument table slots shared by the translator and the Metal backend.
 namespace slot {
@@ -112,6 +112,9 @@ struct VpOptions {
     // o[] registers NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK leaves out (bit n: o[n]): they reach the fragment program as
     // (0, 0, 0, 1) whatever the program wrote (RPCS3 VKVertexProgram.cpp reg_table, D-267).
     u16 masked_outputs = 0;
+    // o[] registers (bit n: o[n], 1-15) the fragment program reads: the only outputs put out besides the position, so
+    // a vertex writes no more than the draw needs (D-269). 0xfffe: all of them.
+    u16 read_outputs = 0xfffe;
 };
 
 // Shadow2D: a depth texture sampled with a depth comparison (RPCS3 shadow_textures: a depth format and a compare

@@ -462,12 +462,20 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
                "    default: break;\n    }\n    break;\n    }\n";
     }
 
+    // The outputs: o0 the position, o1/o2 front colours, o3/o4 back colours, o5.x fog, o6.x point size (o6 also TEX9),
+    // o7-o14 TEX0-TEX7, o15 TEX8 (RPCS3 GL/GLVertexProgram.cpp register table); of those, only what the fragment
+    // program reads (D-269).
+    struct Varying {
+        const char* name;
+        u32 reg;
+    };
+    static constexpr Varying kVaryings[] = {{"col0", 1}, {"col1", 2}, {"bfc0", 3}, {"bfc1", 4}, {"fogc", 5}, {"tc0", 7},
+        {"tc1", 8}, {"tc2", 9}, {"tc3", 10}, {"tc4", 11}, {"tc5", 12}, {"tc6", 13}, {"tc7", 14}, {"tc8", 15}, {"tc9", 6}};
+    const auto sent = [&](const Varying& v) { return (options.read_outputs & (1u << v.reg)) != 0; };
     std::string src = msl_prologue();
     src += "\nstruct rsx_vs_out {\n    float4 position [[position]];\n";
-    src += "    float4 col0 [[user(col0)]];\n    float4 col1 [[user(col1)]];\n";
-    src += "    float4 bfc0 [[user(bfc0)]];\n    float4 bfc1 [[user(bfc1)]];\n";
-    src += "    float4 fogc [[user(fogc)]];\n";
-    for (u32 i = 0; i < 10; i++) src += std::format("    float4 tc{} [[user(tc{})]];\n", i, i);
+    for (const Varying& v : kVaryings)
+        if (sent(v)) src += std::format("    float4 {0} [[user({0})]];\n", v.name);
     if (options.point_size) src += "    float point_size [[point_size]];\n";
     // User clip planes (D-259): only the planes that are on, as Metal clip distances (kept at or above zero).
     std::vector<std::string> clip;
@@ -508,18 +516,15 @@ TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOption
         src += "    int4 a0 = int4(0), a1 = int4(0); // address registers A0, A1\n    (void)a0; (void)a1;\n";
     for (u32 i = 0; i < 16; i++) src += std::format("    float4 o{} = float4(0.0, 0.0, 0.0, 1.0);\n", i);
     src += body;
-    // Outputs: o0 position, o1/o2 front colours, o3/o4 back colours, o5.x fog, o6.x point size (o6 also TEX9),
-    // o7-o14 TEX0-TEX7, o15 TEX8 (RPCS3 GL/GLVertexProgram.cpp register table).
     src += "    rsx_vs_out out;\n";
     src += "    out.position = float4(dot(p.pos_x, o0), dot(p.pos_y, o0), dot(p.pos_z, o0), o0.w);\n";
     // An output the output mask leaves out is (0, 0, 0, 1) (D-267).
-    const auto o = [&](u32 n) {
-        return (options.masked_outputs & (1u << n)) ? std::string("float4(0.0, 0.0, 0.0, 1.0)") : std::format("o{}", n);
-    };
-    src += std::format("    out.col0 = {};\n    out.col1 = {};\n    out.bfc0 = {};\n    out.bfc1 = {};\n", o(1), o(2), o(3), o(4));
-    src += (options.masked_outputs & (1u << 5)) ? "    out.fogc = float4(0.0, 0.0, 0.0, 1.0);\n" : "    out.fogc = o5.xxxx;\n";
-    for (u32 i = 0; i < 8; i++) src += std::format("    out.tc{} = {};\n", i, o(7 + i));
-    src += std::format("    out.tc8 = {};\n    out.tc9 = {};\n", o(15), o(6));
+    for (const Varying& v : kVaryings) {
+        if (!sent(v)) continue;
+        const bool masked = (options.masked_outputs & (1u << v.reg)) != 0;
+        src += masked ? std::format("    out.{} = float4(0.0, 0.0, 0.0, 1.0);\n", v.name)
+                      : std::format("    out.{} = o{}{};\n", v.name, v.reg, v.reg == 5 ? ".xxxx" : "");
+    }
     if (options.point_size) {
         // The program's o6.x when the output mask says so and it writes o6, else the register (RPCS3
         // VKVertexProgram.cpp insertMainEnd, D-262).

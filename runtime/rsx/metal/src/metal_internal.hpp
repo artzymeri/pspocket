@@ -567,7 +567,7 @@ struct MetalBackend::Impl {
     struct DecodedVertexProgram {
         shader::VertexProgram program;
         std::vector<u32> words;                         // its instructions' words, from its start to its end
-        std::array<const CompiledProgram*, 2> compiled{}; // it compiled, without and with point size (D-109)
+        std::vector<std::pair<u64, const CompiledProgram*>> compiled; // its variants compiled, by what tells them apart (D-109, D-269)
     };
     static constexpr usize kDecodedVertexPrograms = 16;
     std::vector<DecodedVertexProgram> vertex_programs;
@@ -656,6 +656,28 @@ struct MetalBackend::Impl {
     // last written back; a texture sampled from a surface whose memory changed since (a CPU or SPU write the backend
     // was not told of) is logged.
     bool check_surfaces = false;
+    // PSPOCKET_GPU_PASS_TIMES (a measuring aid): each render pass goes to the GPU in a command buffer of its own, which
+    // the RSX thread waits for (the GPU overlaps command buffers otherwise), and its GPU time is summed by its place in
+    // the frame; the passes that took most are logged every 300 frames. Much slower than usual: for finding where GPU
+    // time goes, not for frame rates.
+    struct PassTimes {
+        struct Entry {
+            u64 ns = 0, frames = 0, draws = 0;
+            u64 vertex_ns = 0, fragment_ns = 0; // the pass's stages, from stage boundary timestamps when the GPU has them
+            u64 before_ns = 0; // the command buffer of what was recorded between the pass before and this one
+            std::string targets;
+        };
+        std::mutex mutex;
+        std::map<u32, Entry> by_place;
+        id<MTLCounterSet> timestamps = nil; // nil: the GPU has no stage boundary timestamps
+        double gpu_tick_ns = 1.0;
+    };
+    std::shared_ptr<PassTimes> pass_times;
+    u32 pass_place = 0;       // the pass's place in this frame
+    id<MTLCounterSampleBuffer> pass_samples = nil; // the timed pass's four stage boundary timestamps
+    u64 pass_draws_start = 0; // stats.draws when the pass started
+    u64 pass_last_fp = 0;     // the hash of the last fragment program the pass drew with
+    bool pass_times_submitting = false;
     void note_guest(Surface& s);
     void check_guest(const Surface& s, const TextureInfo& t, u32 unit);
     void upload_surface_from_guest(Surface& s);
@@ -665,6 +687,7 @@ struct MetalBackend::Impl {
     void remove_surface(Surface* s);
     // D-148; `depth_only`: a stencil written since does not matter (the depth bounds test reads the depth, D-261).
     id<MTLTexture> feedback_copy(Surface& s, bool depth_only = false);
+    void log_pass_times();
     // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the
     // buffer was drawn to since; nil when it cannot be.
     Surface::Conversion* depth_as_texture(Surface& d, u32 mode);

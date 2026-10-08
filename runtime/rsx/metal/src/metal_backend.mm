@@ -6,10 +6,12 @@
 #include <cstdlib>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <format>
 
+#include <thread>
 #include <unordered_set>
 
 #include "kernels.hpp"
@@ -210,6 +212,24 @@ bool MetalBackend::Impl::init()
         outputs.push_back(t);
     }
     check_surfaces = std::getenv("PSPOCKET_RSX_CHECK_SURFACES") != nullptr;
+    if (std::getenv("PSPOCKET_GPU_PASS_TIMES")) {
+        pass_times = std::make_shared<PassTimes>();
+        if ([device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            for (id<MTLCounterSet> set in device.counterSets)
+                if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) pass_times->timestamps = set;
+        }
+        // GPU ticks in nanoseconds: two GPU timestamps 20 ms apart by the host clock.
+        MTLTimestamp c0 = 0, g0 = 0, c1 = 0, g1 = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        [device sampleTimestamps:&c0 gpuTimestamp:&g0];
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        [device sampleTimestamps:&c1 gpuTimestamp:&g1];
+        const double wall_ns = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        if (g1 > g0) pass_times->gpu_tick_ns = wall_ns / static_cast<double>(g1 - g0);
+        PS_LOG_INFO(kChan, "GPU pass times on: stage timestamps {}, a GPU tick {:.3f} ns",
+            pass_times->timestamps ? "yes" : "no", pass_times->gpu_tick_ns);
+    }
     if (std::getenv("PSPOCKET_RSX_WRITE_BACK_TARGETS")) config.overlay_targets = false; // D-137's comparison
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
         shader_cache = std::make_unique<ShaderCache>(device, config.shader_cache, config.shader_seeds,
@@ -456,6 +476,39 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
 {
     if (!pass_open) return nil;
     if (!pass_started) {
+        if (pass_times && !pass_times_submitting) {
+            // What was recorded since the last pass (conversions, copies) in a command buffer of its own, timed
+            // apart from the pass (PSPOCKET_GPU_PASS_TIMES).
+            if (render_cb) {
+                auto times = pass_times;
+                const u32 place = pass_place;
+                [render_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                    const double s = cb.GPUEndTime - cb.GPUStartTime;
+                    std::lock_guard lock(times->mutex);
+                    times->by_place[place].before_ns += s > 0 ? static_cast<u64>(s * 1e9) : 0;
+                }];
+                pass_times_submitting = true;
+                const bool was_open = pass_open;
+                pass_open = false; // submit() must not end the pass being started
+                submit(true);
+                pass_open = was_open;
+                pass_times_submitting = false;
+            }
+            pass_samples = nil;
+            if (pass_times->timestamps) {
+                MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
+                sd.counterSet = pass_times->timestamps;
+                sd.storageMode = MTLStorageModeShared;
+                sd.sampleCount = 4;
+                pass_samples = [device newCounterSampleBufferWithDescriptor:sd error:nil];
+            }
+            MTLRenderPassSampleBufferAttachmentDescriptor* at = pass_desc.sampleBufferAttachments[0];
+            at.sampleBuffer = pass_samples;
+            at.startOfVertexSampleIndex = pass_samples ? 0 : MTLCounterDontSample;
+            at.endOfVertexSampleIndex = pass_samples ? 1 : MTLCounterDontSample;
+            at.startOfFragmentSampleIndex = pass_samples ? 2 : MTLCounterDontSample;
+            at.endOfFragmentSampleIndex = pass_samples ? 3 : MTLCounterDontSample;
+        }
         id<MTLCommandBuffer> cb = render_buffer();
         pass_desc.visibilityResultBuffer = visibility;
         pass_zpass_slot = -1;
@@ -464,6 +517,7 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
         encoder.label = @"rsx pass";
         pass_started = true;
         stats.render_passes++;
+        pass_draws_start = stats.draws;
         // A surface's generation counts the passes and draws that write it, not the passes it is attached to (D-105):
         // GTA V's lighting pass samples the depth buffer it tests against without writing it, and every conversion
         // of it ended the pass, which the next draw restarted, which made the depth buffer new again (30 passes a
@@ -501,13 +555,85 @@ void MetalBackend::Impl::end_pass()
         if (pass.depth) clears |= pass_desc.depthAttachment.loadAction == MTLLoadActionClear && pass.depth->initialized;
         if (clears) start_encoder();
     }
+    const bool timed = pass_times && encoder && !pass_times_submitting;
     if (encoder) {
         [encoder endEncoding];
         encoder = nil;
     }
     pass_open = false;
     pass_started = false;
+    if (timed) {
+        // The pass alone in a command buffer, timed (PSPOCKET_GPU_PASS_TIMES).
+        auto times = pass_times;
+        const u32 place = pass_place++;
+        const u64 draws = stats.draws - pass_draws_start;
+        std::string targets = describe_targets(pass) + std::format("; last fp {:016x}", pass_last_fp);
+        id<MTLCounterSampleBuffer> samples = pass_samples;
+        pass_samples = nil;
+        [render_buffer() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            const double s = cb.GPUEndTime - cb.GPUStartTime;
+            u64 stage[4] = {};
+            if (samples) {
+                NSData* data = [samples resolveCounterRange:NSMakeRange(0, 4)];
+                if (data.length >= sizeof(stage)) std::memcpy(stage, data.bytes, sizeof(stage));
+            }
+            std::lock_guard lock(times->mutex);
+            PassTimes::Entry& e = times->by_place[place];
+            e.ns += s > 0 ? static_cast<u64>(s * 1e9) : 0;
+            const auto span = [&](u64 a, u64 b) {
+                return b > a && a != MTLCounterErrorValue && b != MTLCounterErrorValue
+                    ? static_cast<u64>(static_cast<double>(b - a) * times->gpu_tick_ns) : 0;
+            };
+            e.vertex_ns += span(stage[0], stage[1]);
+            e.fragment_ns += span(stage[2], stage[3]);
+            e.frames++;
+            e.draws += draws;
+            if (e.targets.empty()) e.targets = targets;
+        }];
+        pass = {};
+        pass_times_submitting = true;
+        submit(true); // finished before the next one starts: the GPU overlaps command buffers otherwise
+        pass_times_submitting = false;
+        return;
+    }
     pass = {};
+}
+
+// The passes that took most GPU time (PSPOCKET_GPU_PASS_TIMES): by their place in the frame, since the game draws its
+// frames the same way each time.
+void MetalBackend::Impl::log_pass_times()
+{
+    struct Row {
+        u32 place;
+        double ms, draws, vertex_ms, fragment_ms, before_ms;
+        std::string targets;
+    };
+    std::vector<Row> rows;
+    double passes_ms = 0, before_ms = 0;
+    u64 frames = 0;
+    {
+        std::lock_guard lock(pass_times->mutex);
+        for (const auto& [place, e] : pass_times->by_place) {
+            if (!e.frames) continue;
+            const double n = static_cast<double>(e.frames);
+            rows.push_back({place, static_cast<double>(e.ns) / 1e6 / n, static_cast<double>(e.draws) / n,
+                static_cast<double>(e.vertex_ns) / 1e6 / n, static_cast<double>(e.fragment_ns) / 1e6 / n,
+                static_cast<double>(e.before_ns) / 1e6 / n, e.targets});
+            passes_ms += rows.back().ms;
+            before_ms += rows.back().before_ms;
+            frames = std::max(frames, e.frames);
+        }
+        pass_times->by_place.clear();
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ms > b.ms; });
+    PS_LOG_INFO(kChan, "GPU time by pass (last {} frames): {:.2f} ms a frame in {} passes, {:.2f} ms between them", frames,
+        passes_ms, rows.size(), before_ms);
+    for (usize i = 0; i < rows.size() && i < 24; i++) {
+        PS_LOG_INFO(kChan, "  pass {:3}: {:6.3f} ms ({:4.1f}%; vertex {:.3f}, fragment {:.3f}; before it {:.3f}), "
+                           "{:5.1f} draws ->{}", rows[i].place, rows[i].ms,
+            passes_ms > 0 ? 100.0 * rows[i].ms / passes_ms : 0.0, rows[i].vertex_ms, rows[i].fragment_ms,
+            rows[i].before_ms, rows[i].draws, rows[i].targets);
+    }
 }
 
 // ---- clears -----------------------------------------------------------------------------------------------------
@@ -896,6 +1022,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (compile_pending) stats.draws_compiling++;
         return skip("");
     }
+    if (pass_times && fprog) pass_last_fp = fprog->hash;
     // The vertex program after the fragment program: an output the output mask leaves out matters only when the
     // fragment program reads it (D-267).
     const CompiledProgram* vp = vertex_program_for(state, points, fp->shader.input_mask, fo.two_sided_lighting);
@@ -1410,6 +1537,10 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     tick++;
     end_pass_for(kEndFlip);
     stats.flips++;
+    if (pass_times) {
+        pass_place = 0;
+        if (stats.flips % 300 == 0) log_pass_times();
+    }
     compile_wait_left_ns = static_cast<s64>(config.compile_wait_ms * 1e6); // each frame's budget (D-158)
     if (stats.flips % std::clamp<u64>(config.evict_after_flips / 2, 1, 150) == 0) evict_unused(config.evict_after_flips); // D-116
     if (trim_requested.exchange(false, std::memory_order_acq_rel)) trim();

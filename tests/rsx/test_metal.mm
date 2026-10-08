@@ -2133,13 +2133,14 @@ TEST_CASE("metal e2e: draws reuse a fragment program's compile until the program
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // red
 
-    // The CPU writes another program at the same address: the next batch decodes and compiles it.
+    // The CPU writes another program at the same address: the next batch decodes and compiles it, and the vertex
+    // program again to put out what it reads (TEX0, not COL0, D-269).
     e.put_local_bytes(kFpOffset, fp_texture());
     auto c = e.at(b.offset());
     draw_triangle(c);
     REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
     CHECK(e.failures.empty());
-    CHECK(e.backend->stats().programs_compiled == compiled + 1);
+    CHECK(e.backend->stats().programs_compiled == compiled + 2);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the texture's blue
 }

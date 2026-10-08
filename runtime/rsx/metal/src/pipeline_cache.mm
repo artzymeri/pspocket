@@ -210,8 +210,8 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     // VKVertexProgram.cpp reg_table: the colours go with either side's bit).
     const shader::VertexProgram& vp = current.program;
     u16 masked = 0;
+    u16 read = 0; // the outputs the fragment program's inputs come from
     {
-        u16 read = 0; // the outputs the fragment program's inputs come from
         if (fp_inputs & (1u << 1)) read |= static_cast<u16>((1u << 1) | (two_sided ? 1u << 3 : 0u)); // COL0
         if (fp_inputs & (1u << 2)) read |= static_cast<u16>((1u << 2) | (two_sided ? 1u << 4 : 0u)); // COL1
         if (fp_inputs & (1u << 3)) read |= 1u << 5;                                                    // FOGC
@@ -230,24 +230,27 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
             if (off(1u << (14 + t))) masked |= static_cast<u16>(1u << (7 + t)); // TEX0-7: o7-o14
         masked &= vp.output_mask & read;
     }
-    // The usual variants stay with the decoded program; one with clip planes or masked outputs is found by its key.
-    const bool usual = !user_clip && !masked;
+    // The variants made of this program stay with it, by what tells them apart (D-109): point size, clip planes,
+    // masked outputs, and the outputs the fragment program reads, the only ones it puts out (D-269).
+    const u64 variant = (points ? 1ull : 0ull) | (u64{user_clip} << 1) | (u64{masked} << 25) | (u64{read} << 41);
     const auto remember = [&](const CompiledProgram* c) {
-        if (usual) vertex_compiled[points ? 1 : 0] = c;
+        if (vertex_compiled.size() >= 8) vertex_compiled.erase(vertex_compiled.begin());
+        vertex_compiled.emplace_back(variant, c);
         return c;
     };
-    if (usual) {
-        if (const CompiledProgram* c = vertex_compiled[points ? 1 : 0]) return c;
-    }
+    for (const auto& [v, c] : vertex_compiled)
+        if (v == variant) return c;
     const std::vector<u32>& ucode = current.words;
     std::string key = std::format("vp:{:016x}:{}", vp.hash, (points ? 1u : 0u) | (user_clip << 1));
     if (masked) key += std::format(":m{:x}", masked);
+    key += std::format(":r{:x}", read);
     if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) return remember(&it->second);
 
     shader::VpOptions options;
     options.point_size = points;
     options.user_clip = user_clip;
     options.masked_outputs = masked;
+    options.read_outputs = read;
     if (async) {
         // Compiled in the background; this draw waits for it within the frame's budget, or goes without (D-158).
         if (async_failed_programs.contains(key)) return nullptr;
@@ -454,7 +457,7 @@ void MetalBackend::Impl::forget_program_lookups()
 {
     for (auto& [hash, list] : fragment_program_bodies)
         for (auto& e : list) e->compiled.clear();
-    for (auto& d : vertex_programs) d.compiled = {};
+    for (auto& d : vertex_programs) d.compiled.clear();
 }
 
 PipelineKey pipeline_key(const PipelineParams& p, id<MTLFunction> vp, id<MTLFunction> fp)
