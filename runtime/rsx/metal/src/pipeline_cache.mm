@@ -264,50 +264,77 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
 
     take_shader_cache(); // D-114
     take_async();        // D-158
-    FragmentProgramEntry& entry = fragment_programs[*ea];
+    FragmentProgramSlot& slot = fragment_programs[*ea];
     // A deferred copy to the program (or its constants, read every draw) lands first (D-107). A program not seen yet:
     // its first instruction (a copy that writes a program writes its start).
-    before_access(*ea, entry.program.ucode_length ? entry.program.ucode_length : 16, false);
+    before_access(*ea, slot.entry ? slot.entry->program.ucode_length : 16, false);
     const u64 epoch = check_epoch();
-    // Decoded again when its instructions changed: checked once per epoch, and whenever the program is set again (a game
-    // that writes a new program over the old one between draws of one batch sets it again). GTA V sets one nearly every
-    // draw: decoding it each time, and looking its compile up again, was most of what the RSX thread spent on programs
-    // (D-109). The check compares its bytes with the ones it was decoded from, embedded constants left out (they are
-    // read every draw): no page protection, so a game writing its constants in place before each draw takes no write
-    // fault, and the RSX thread no mprotect (D-211; Assassin's Creed's crowd: 170 to 210 faults a frame).
-    bool redecode = entry.program.instructions.empty() || entry.code.size() != entry.program.ucode_length ||
-        entry.program.ucode_length > max_len;
-    if (!redecode && ((state.dirty_bits & dirty::kFragmentProgram) || entry.checked != epoch)) {
+    // Looked up again when its instructions changed: checked once per epoch, and whenever the program is set again (a
+    // game that writes a new program over the old one between draws of one batch sets it again). GTA V sets one nearly
+    // every draw (D-109). The check compares its bytes with the ones it was decoded from, embedded constants left out
+    // (they are read every draw): no page protection, so a game writing its constants in place before each draw takes
+    // no write fault, and the RSX thread no mprotect (D-211; Assassin's Creed's crowd: 170 to 210 faults a frame).
+    const auto same_code = [&](const FragmentProgramEntry& e, const std::vector<u32>& constants) {
         const u8* now = mem.host(*ea);
         u32 at = 0;
-        for (const u32 c : entry.program.constant_offsets) {
-            if (c > at && std::memcmp(now + at, entry.code.data() + at, c - at) != 0) {
-                redecode = true;
-                break;
-            }
+        for (const u32 c : constants) {
+            if (c > at && std::memcmp(now + at, e.code.data() + at, c - at) != 0) return false;
             at = std::max(at, c + 16);
         }
-        if (!redecode && at < entry.program.ucode_length)
-            redecode = std::memcmp(now + at, entry.code.data() + at, entry.program.ucode_length - at) != 0;
-    }
-    entry.checked = epoch;
+        return at >= e.program.ucode_length ||
+            std::memcmp(now + at, e.code.data() + at, e.program.ucode_length - at) == 0;
+    };
+    FragmentProgramEntry* found = slot.entry;
+    if (found && found->program.ucode_length > max_len) found = nullptr;
+    if (found && ((state.dirty_bits & dirty::kFragmentProgram) || slot.checked != epoch) &&
+        !same_code(*found, found->program.constant_offsets))
+        found = nullptr;
+    slot.checked = epoch;
     state.dirty_bits &= ~dirty::kFragmentProgram;
-    if (redecode) {
-        std::string why;
-        auto fp = shader::decode_fragment_program(mem.host(*ea), max_len, &why);
-        if (!fp) {
+    if (!found) {
+        // Another program at this address: one decoded before, wherever it was, is that one with its compiles (D-240:
+        // GTA V's programs come and go through memory it reuses, and decoding each again, and looking its compiles up,
+        // was a fifth of the RSX thread's work, run 221).
+        if (!shader::scan_fragment_program(mem.host(*ea), max_len, fp_scan)) {
             fragment_programs.erase(*ea);
-            unsupported(std::format("fragment program at {:#010x}: {}", *ea, why));
+            unsupported(std::format("fragment program at {:#010x}: no end instruction within {} bytes", *ea, max_len));
             return nullptr;
         }
-        entry.address = *ea;
-        entry.program = std::move(*fp);
-        entry.compiled.clear();
-        const u8* bytes = mem.host(*ea);
-        entry.code.assign(bytes, bytes + entry.program.ucode_length);
-        for (const u32 c : entry.program.constant_offsets)
-            if (c + 16 <= entry.code.size()) std::memset(entry.code.data() + c, 0, 16);
+        auto& same_hash = fragment_program_bodies[fp_scan.hash];
+        for (const auto& e : same_hash)
+            if (e->program.ucode_length == fp_scan.ucode_length && same_code(*e, fp_scan.constant_offsets)) {
+                found = e.get();
+                stats.fragment_programs_found_again++;
+                break;
+            }
+        if (!found) {
+            if (fragment_program_count >= kMaxFragmentPrograms) { // a bound on what is kept: all decoded again
+                fragment_programs.clear();
+                fragment_program_bodies.clear();
+                fragment_program_count = 0;
+            }
+            std::string why;
+            auto fp = shader::decode_fragment_program(mem.host(*ea), max_len, &why);
+            if (!fp) {
+                fragment_programs.erase(*ea);
+                unsupported(std::format("fragment program at {:#010x}: {}", *ea, why));
+                return nullptr;
+            }
+            auto e = std::make_unique<FragmentProgramEntry>();
+            e->address = *ea;
+            e->program = std::move(*fp);
+            const u8* bytes = mem.host(*ea);
+            e->code.assign(bytes, bytes + e->program.ucode_length);
+            for (const u32 c : e->program.constant_offsets)
+                if (c + 16 <= e->code.size()) std::memset(e->code.data() + c, 0, 16);
+            found = e.get();
+            stats.fragment_programs_decoded++;
+            fragment_program_bodies[fp_scan.hash].push_back(std::move(e)); // the slot map may have been cleared
+            fragment_program_count++;
+        }
+        fragment_programs[*ea] = {found, epoch};
     }
+    FragmentProgramEntry& entry = *found;
     const shader::FragmentProgram& fp = entry.program;
     *program_out = &fp;
     program_ea = *ea;
@@ -377,7 +404,8 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
 
 void MetalBackend::Impl::forget_program_lookups()
 {
-    for (auto& [ea, e] : fragment_programs) e.compiled.clear();
+    for (auto& [hash, list] : fragment_program_bodies)
+        for (auto& e : list) e->compiled.clear();
     for (auto& d : vertex_programs) d.compiled = {};
 }
 

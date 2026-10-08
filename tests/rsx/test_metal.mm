@@ -1411,6 +1411,48 @@ TEST_CASE("metal e2e: draws reuse a fragment program's compile until the program
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the texture's blue
 }
 
+TEST_CASE("metal e2e: a fragment program written again where another was is the one decoded before (D-240)")
+{
+    // GTA V writes its programs into memory it reuses: a program found again at an address is not decoded again, and
+    // keeps its compile (run 221: decoding them again was a fifth of the RSX thread's work).
+    REQUIRE_METAL();
+    E2E e;
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+    for (u32 i = 0; i < kW * kH; i++) e.put_local32(kTexOffset + i * 4, 0xff0000ffu); // blue texels
+    const auto draw = [&](const std::vector<u8>& program, u32 at) {
+        e.put_local_bytes(kFpOffset, program);
+        auto b = e.at(at);
+        if (at == 0) {
+            setup_surface(b, kSurfaceOffset);
+            upload_vertex_program(b);
+            bind_vertex_arrays(b);
+            bind_linear_texture(b, kTexOffset, tex::A8R8G8B8, kW * 4);
+        }
+        set_fragment_program(b, kFpOffset, 0x40);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        CHECK(e.failures.empty());
+        return b.offset();
+    };
+    u32 at = draw(fp_color(false), 0);
+    at = draw(fp_texture(), at);
+    const u64 decoded = e.backend->stats().fragment_programs_decoded;
+    const u64 compiled = e.backend->stats().programs_compiled;
+    CHECK(decoded == 2);
+    // The first program back at the same address: found, not decoded or compiled again, and it draws.
+    at = draw(fp_color(false), at);
+    CHECK(e.backend->stats().fragment_programs_decoded == decoded);
+    CHECK(e.backend->stats().fragment_programs_found_again == 1);
+    CHECK(e.backend->stats().programs_compiled == compiled);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // red
+    // And the textured one again: blue.
+    draw(fp_texture(), at);
+    CHECK(e.backend->stats().fragment_programs_decoded == decoded);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});
+}
+
 TEST_CASE("metal e2e: a fragment program rewritten between two draws of one batch, then set again, is decoded again (D-109)")
 {
     // Setting the program again no longer decodes it again by itself, only when its bytes changed.

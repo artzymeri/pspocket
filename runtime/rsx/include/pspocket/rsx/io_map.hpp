@@ -33,7 +33,15 @@ public:
     void clear();
 
     // IO offset -> guest EA, or nullopt when the page is unmapped.
-    std::optional<u32> io_to_ea(u32 io) const;
+    // Inline: the FIFO reader translates every command word's address (3% of the RSX thread out of line, run 221).
+    std::optional<u32> io_to_ea(u32 io) const
+    {
+        const u32 page = io >> kPageShift;
+        if (page >= kIoPages) return std::nullopt;
+        const u32 ea = io_to_ea_[page].load(std::memory_order_acquire);
+        if (ea == kUnmapped) return std::nullopt;
+        return ea | (io & (kPageSize - 1));
+    }
     // Guest EA -> IO offset, or nullopt.
     std::optional<u32> ea_to_io(u32 ea) const;
 

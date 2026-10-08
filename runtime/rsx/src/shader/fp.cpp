@@ -173,6 +173,26 @@ std::optional<FragmentProgram> decode_fragment_program(const u8* data, u32 max_l
     return std::nullopt;
 }
 
+bool scan_fragment_program(const u8* data, u32 max_length, FpScan& out)
+{
+    out.constant_offsets.clear();
+    u64 h = 0x66726167ull; // as decode_fragment_program
+    u32 offset = 0;
+    while (offset + 16 <= max_length) {
+        const FpInstruction in = decode_fp_instruction(data, offset);
+        if (in.has_constant && offset + 32 > max_length) break;
+        h = hash_words(in.words.data(), 4, h);
+        offset += in.has_constant ? 32 : 16;
+        if (in.has_constant) out.constant_offsets.push_back(in.constant_offset);
+        if (in.end) {
+            out.ucode_length = offset;
+            out.hash = h ^ (u64{offset} << 32);
+            return true;
+        }
+    }
+    return false;
+}
+
 namespace {
 
 std::string fp_mask_str(u8 mask)

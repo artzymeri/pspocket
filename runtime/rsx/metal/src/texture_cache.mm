@@ -184,6 +184,24 @@ void MetalBackend::Impl::encode_overlay(Surface& s, const TransientAllocator::Al
     stats.texture_overlays++;
 }
 
+const TextureLayout* MetalBackend::Impl::layout_for(const TextureInfo& t)
+{
+    if (t.mipmaps > 0x1F) { // outside the key's bits (the hardware has 4): computed every time
+        scratch_layout = compute_texture_layout(t);
+        return scratch_layout ? &*scratch_layout : nullptr;
+    }
+    // Every field compute_texture_layout reads, each in its own bits.
+    const TextureLayoutKey key{(u64{t.format & 0xFF} << 56) | (u64{t.width} << 40) | (u64{t.height} << 24) |
+            (u64{t.depth} << 8) | (u64{t.mipmaps} << 3) | (u64{t.dimension & 3} << 1) | (t.cubemap ? 1u : 0u),
+        u64{t.pitch} | (u64{t.border_type ? 1u : 0u} << 32)};
+    auto it = texture_layouts.find(key);
+    if (it == texture_layouts.end()) {
+        if (texture_layouts.size() > 4096) texture_layouts.clear(); // a bound: they come again as games use them
+        it = texture_layouts.emplace(key, compute_texture_layout(t)).first;
+    }
+    return it->second ? &*it->second : nullptr;
+}
+
 CachedTexture* MetalBackend::Impl::decode_texture(const TextureInfo& t, u32 ea, bool force_compute_dxt, std::string* error,
     const std::vector<Surface*>& overlays)
 {
@@ -451,7 +469,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     bind_source = "memory";
     if (!deferred.empty()) {
         // A deferred copy to this texture lands first (D-107).
-        if (const auto layout = compute_texture_layout(t)) before_access(*ea, layout->total_size, false);
+        if (const TextureLayout* layout = layout_for(t)) before_access(*ea, layout->total_size, false);
     }
 
     // A render target at this address: sample the GPU copy (plan section 7: "bind the Metal texture directly") when
@@ -619,7 +637,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     // over several targets side by side (Assassin's Creed's 4096x1024 over four 1024x1024 depth buffers) read the
     // others' stale memory.
     std::vector<Surface*> lays;
-    const auto layout = compute_texture_layout(t);
+    const TextureLayout* layout = layout_for(t);
     if (layout && !layout->swizzled && layout->format->block_texels == 1 && !layout->volume && !layout->cubemap)
         lays = overlays_for(*ea, layout->total_size, layout->levels[0].pitch, overlay);
     else if (overlay) lays.push_back(overlay);

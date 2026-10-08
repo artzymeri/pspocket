@@ -319,16 +319,23 @@ private:
 
 struct CompiledProgram;
 
+// A fragment program, by its content (D-240): decoded once, whatever address it is found at.
 struct FragmentProgramEntry {
-    u32 address = 0;
+    u32 address = 0; // where it was first found
     shader::FragmentProgram program;
-    u64 checked = ~0ull; // as CachedTexture::checked
-    // What the program compiled to with these options, until it is decoded again (D-109): the lookup by hash and
-    // ucode is not repeated every draw.
+    // What the program compiled to with these options (D-109): the lookup by hash and ucode is not repeated every
+    // draw.
     std::vector<std::pair<shader::FpOptions, const CompiledProgram*>> compiled;
-    // The program's bytes as decoded, its embedded constants zeroed: what tells whether it changed since (D-210,
-    // D-211). Written again with the same instructions (new constants, or the same program again), it is not decoded.
+    // The program's bytes as decoded, its embedded constants zeroed: what tells whether one found again is this one
+    // (D-210, D-211).
     std::vector<u8> code;
+};
+
+// The program found last at a guest address (D-240): GTA V writes its programs into memory it reuses, so one address
+// holds program after program; each found again, at any address, is the one decoded then.
+struct FragmentProgramSlot {
+    FragmentProgramEntry* entry = nullptr;
+    u64 checked = ~0ull; // as CachedTexture::checked
 };
 
 // ---- the backend --------------------------------------------------------------------------------------------------
@@ -517,7 +524,24 @@ struct MetalBackend::Impl {
     std::unordered_map<u64, id<MTLSamplerState>> samplers;
     std::unordered_map<u64, id<MTLRenderPipelineState>> clear_pipelines;
     std::unordered_map<u32, id<MTLRenderPipelineState>> blit_pipelines; // by destination MTLPixelFormat
-    std::unordered_map<u32, FragmentProgramEntry> fragment_programs; // by guest EA
+    std::unordered_map<u32, FragmentProgramSlot> fragment_programs; // by guest EA
+    // Texture layouts by shape (layout_for): format, width, height, depth, mipmaps, dimension, cubemap; pitch, border.
+    struct TextureLayoutKey {
+        u64 shape = 0;
+        u64 pitch = 0; // and the border flag above it
+        bool operator==(const TextureLayoutKey&) const = default;
+    };
+    struct TextureLayoutKeyHash {
+        size_t operator()(const TextureLayoutKey& k) const { return std::hash<u64>()(k.shape * 0x9E3779B97F4A7C15ull ^ k.pitch); }
+    };
+    std::unordered_map<TextureLayoutKey, std::optional<TextureLayout>, TextureLayoutKeyHash> texture_layouts;
+    std::optional<TextureLayout> scratch_layout; // layout_for's answer for a shape the key cannot hold
+    // Every fragment program decoded, by hash (more than one only when two programs' hashes are equal); kept while
+    // the slots point into them, and all forgotten past kMaxFragmentPrograms (decoded again as they come).
+    std::unordered_map<u64, std::vector<std::unique_ptr<FragmentProgramEntry>>> fragment_program_bodies;
+    size_t fragment_program_count = 0;
+    static constexpr size_t kMaxFragmentPrograms = 8192;
+    shader::FpScan fp_scan; // reused (the RSX thread's)
     // Vertex programs decoded lately, the current one first (D-210). A game that uploads its programs again before
     // nearly every draw (Assassin's Creed's crowds: 2,150 draws a frame) finds the one it uploads here by its words
     // instead of decoding it again: decoding was 7% of the RSX thread.
@@ -632,6 +656,9 @@ struct MetalBackend::Impl {
 
     // ---- textures (texture_cache.mm) ----
     id<MTLTexture> bind_texture(const TextureInfo& t, u32 unit, bool& ok);
+    // compute_texture_layout's answer for a texture of this shape, kept (D-242): every bind asked twice, each time
+    // building its levels' vector (run 221). Null when the layout is refused.
+    const TextureLayout* layout_for(const TextureInfo& t);
     // `overlay`: a GPU-newer target over the texture's memory whose pixels go into the decode on the GPU (D-137).
     CachedTexture* decode_texture(const TextureInfo& t, u32 ea, bool force_compute_dxt, std::string* error,
         const std::vector<Surface*>& overlays = {});

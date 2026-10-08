@@ -5222,6 +5222,28 @@ data in archives; Assassin's Creed's one .bin is data): their preparation is unc
 not decrypt counted, a data file with an executable's name never read past its first bytes, a second scan saves
 nothing new).
 
+## D-240 · 2026-10-08 · Fragment programs are known by their content, wherever they are found
+
+The RSX thread is the busiest single thread in GTA V's frame (run 221, under load: 42% of a core busy), and a fifth of
+its work was fragment programs: GTA V writes its programs into memory it reuses, so one address holds program after
+program, and the cache by address (D-109, D-210) decoded each again when it came back, rebuilt its compile key and
+looked the compile up again. Now a decoded program is kept by its content (the hash of its instruction words and its
+length, its bytes with the embedded constants zeroed compared to be sure), and an address only points at the program
+found there last: when another program appears at an address, a scan of its words (length, constants, hash, no
+allocation) finds it decoded before, with its compiles; only a program never seen is decoded. At most 8,192 kept (all
+forgotten past that, decoded again as they come). Measured (runs 222-225, GTA V's walk, the 60-90 s windows): the RSX
+thread 1.71, 1.67 to 1.65, 1.64 CPU s per 5 s (-2.7%). Test: tests/rsx/test_metal.mm (a program written again where
+another was: not decoded or compiled again, and both draw right).
+
+## D-242 · 2026-10-08 · Texture layouts are kept by shape; the FIFO's address translation is inline
+
+Two more of the RSX thread's small costs in run 221: every texture bind computed the texture's layout twice, each
+time building its levels' vector (compute_texture_layout, about 2% of the thread's busy time with its allocations),
+and the FIFO reader called the IO address translation out of line for every command word (3%). Layouts are now kept
+by every field that shapes them (format byte, width, height, depth, mip count, dimension, cube map, pitch, border; at
+most 4,096, all forgotten past that), and IoMap::io_to_ea is inline. Measured with D-241 (runs 226-229): the RSX thread 1.68, 1.49 to
+1.57, 1.47 CPU s per 5 s.
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

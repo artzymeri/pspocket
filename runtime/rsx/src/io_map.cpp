@@ -46,15 +46,6 @@ bool IoMap::unmap(u32 io, u32 size)
     return true;
 }
 
-std::optional<u32> IoMap::io_to_ea(u32 io) const
-{
-    const u32 page = io >> kPageShift;
-    if (page >= kIoPages) return std::nullopt;
-    const u32 ea = io_to_ea_[page].load(std::memory_order_acquire);
-    if (ea == kUnmapped) return std::nullopt;
-    return ea | (io & (kPageSize - 1));
-}
-
 std::optional<u32> IoMap::ea_to_io(u32 ea) const
 {
     const u32 io = ea_to_io_[ea >> kPageShift].load(std::memory_order_acquire);

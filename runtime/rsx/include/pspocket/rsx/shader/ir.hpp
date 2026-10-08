@@ -181,6 +181,15 @@ struct FragmentProgram {
 // Decodes a fragment program from guest memory (data = host pointer to the program's first byte, big-endian
 // words). Stops after the instruction with the end bit; fails if max_length bytes contain none.
 std::optional<FragmentProgram> decode_fragment_program(const u8* data, u32 max_length, std::string* error = nullptr);
+// What tells a fragment program from another, without decoding it (D-240): its length, its hash (as
+// FragmentProgram::hash) and where its embedded constants are. False when no end instruction comes within max_length.
+// `constant_offsets` is reused (no allocation once it has grown).
+struct FpScan {
+    u32 ucode_length = 0;
+    u64 hash = 0;
+    std::vector<u32> constant_offsets;
+};
+bool scan_fragment_program(const u8* data, u32 max_length, FpScan& out);
 FpInstruction decode_fp_instruction(const u8* data, u32 offset);
 // The half-word shuffle of FP words: big-endian word -> instruction word (RPCS3 OPDEST::from_be32).
 constexpr u32 fp_word(u32 be_word) { return (be_word << 16) | (be_word >> 16); }
