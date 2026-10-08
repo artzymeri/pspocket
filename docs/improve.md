@@ -153,10 +153,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Blending:** ADD_SIGNED (0xf006) draws as ADD, as RPCS3 does (VKGSRender.cpp): only the log line says otherwise.
 - **Where the GPU time goes (D-270, runs 272-279):** PSPOCKET_GPU_PASS_TIMES=1 times each render pass, vertex and
   fragment apart. GTA V: 17-18 ms in 89 passes; the G-buffer pass 2.7-4.2 ms, mostly its vertex stage; the geometry
-  passes' vertex stages about 3.5 ms a frame. Done: vertex outputs only as read (D-269, -2%). Tried: whole-word vertex
-  loads (D-268, no gain). Next: the 64x32 pass of one draw (0.7-0.8 ms of fragment time for 2,048 pixels), the
-  post-processing chain (0.3 ms a pass on 160x90 to 640x360 targets), and what else the vertex stage spends (the
-  vertex programs themselves, tiling).
+  passes' vertex stages about 3.5 ms a frame. Done: vertex outputs only as read (D-269, -2%); indexed draws run by
+  Metal over the game's indices, shared vertices once (D-271: -8 to -15% GPU time a frame, the G-buffer pass's vertex
+  stage -58%). Tried: whole-word vertex loads (D-268, no gain). Measure GPU changes with PSPOCKET_GPU_AB (D-272):
+  between runs the walk's GPU time swings by 2 ms. Next: fans, quads and polygons the same way (their converted
+  lists still pull indices), the post-processing chain (0.3 ms a pass on 160x90 to 640x360 targets), the 64x32 pass
+  (0.8 ms in the timing mode, 2 microseconds alone: likely the timing mode's), the fragment stage of the G-buffer
+  and lighting passes.
 - **State the RSX keeps that the backend ignored (census, 2026-10-08):** of 32 registers stored without a use, 7 change
   what a game sees. Done: the fog factor in FOGC (D-256), two-sided lighting (D-257), the clip range and depth clamp
   (D-258), user clip planes (D-259), constants and vertex bases written inside a draw (D-260), the depth bounds test

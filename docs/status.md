@@ -229,6 +229,12 @@ clip range and depth clamp (D-258), user clip planes (D-259), constants and vert
 the window offset and the vertex output mask (D-262 to D-267). kTranslationVersion 4: shader caches are made again
 once.
 
+**Where GTA V's GPU time goes (D-268 to D-272, runs 269-303).** Each render pass timed, vertex and fragment apart
+(PSPOCKET_GPU_PASS_TIMES): the geometry passes' vertex stages were the biggest part. Vertex programs put out only what
+the fragment program reads (D-269, -2%) and indexed draws run by Metal over the game's own indices, so a shared vertex
+runs once (D-271: -8 to -15% GPU time a frame in play). GPU changes are measured within one run (PSPOCKET_GPU_AB), and
+the shader cache checks a fingerprint of the translation (D-272).
+
 **Progress, counted (docs/progress, scripts/progress.py, regenerated before every push).** The README's Status section
 shows how far each part is: system library functions pspocket implements itself against every one RPCS3 registers,
 kernel calls, PPU and SPU instructions translated and fuzz-checked, a checklist per area (each item with its decision)

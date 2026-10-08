@@ -5654,6 +5654,43 @@ falls to about 20.
   60-100 draws 1.1-1.6 ms; the lighting passes 0.6-0.8 ms; a 64x32 pass of one draw 0.7-0.8 ms of fragment time (its
   fragment program is next); the post-processing chain 0.3 ms a pass.
 
+## D-271 · 2026-10-08 · Indexed draws run by Metal over the game's own indices
+
+An indexed RSX draw went to Metal as a plain draw of as many vertices as it has indices, the vertex shader reading
+its index from the game's index data (index pulling, D-068). The vertex shader then ran once per index, three times
+a triangle, with none of the GPU's reuse of a vertex that several triangles share; the vertex stages of GTA V's
+geometry passes took about 3.5 ms of its 17 ms frame (D-270).
+- Points, lines, line strips, triangles and triangle strips with indices now go to Metal as indexed draws, over the
+  very bytes copied from the game: big-endian. Metal reads each index little-endian, so the vertex shader's vertex_id
+  is the index byte-reversed, which it reverses back (index modes 4 and 5); a vertex Metal has already run under that
+  id is reused all the same. No conversion on the CPU, which already looks at every index (the vertex range, the
+  restart indices). Each range of indices is copied 4-byte aligned, as Metal wants an index buffer offset.
+- Not so: a range with restart indices (D-249's lists), one holding an index of all ones (Metal would restart a strip
+  there where the RSX draws vertex 0xFFFF), and the primitives Metal has not (D-068's lists).
+- Found on the way: a change to the vertex shader's text under an unchanged kTranslationVersion left GTA V's shader
+  cache serving the old index code for the new modes, and the walk drew broken geometry while every test, which
+  compiles afresh, passed. kTranslationVersion 6, and D-272 so that it cannot happen again.
+- Checked on the GPU: 16-bit and 32-bit indices, two ranges with an odd start and a base index; a mesh of 400
+  vertices drawn the same through both widths; D-249's strip with restart off.
+- Measured (GTA V's walk, D-272's in-run A/B, the change on every other 30 frames): GPU time a frame in play 13.23 to
+  12.03, 16.49 to 14.10, 9.11 to 8.38 ms (-8 to -15%); the G-buffer pass's vertex stage at 254 draws 2.98 to
+  1.26 ms (-58%), the other geometry passes' about halved.
+
+## D-272 · 2026-10-08 · An A/B within one run, and a fingerprint of the translation for the shader cache
+
+Two measuring aids and a guard, after D-269 to D-271 showed that GTA V's walk does not draw the same scenes from run
+to run: GPU time a frame in the same window differs by 2 ms between runs of one binary, and once by 10.
+- PSPOCKET_GPU_AB=N: a change under test is written to apply only where the backend's ab_on() says so; it is then on
+  in every other run of N frames, and the GPU time of each half is summed apart and logged every 20 runs, so both
+  halves see the same scenes. With PSPOCKET_GPU_PASS_TIMES each pass is also timed apart by half (places 1000 and
+  up). The sums are of command buffers' spans, which overlap, so the halves compare with each other only.
+- The shader cache's records start with the translation's version and now a fingerprint of the translation itself:
+  the version, the shared prologue and the MSL of two built-in programs translated with no option and with every
+  option (shader::translation_fingerprint). A record of another fingerprint is skipped, so a translator change that
+  forgets kTranslationVersion still cannot serve stale programs (D-271's broken frames). It is computed on first use,
+  in microseconds, on the Mac and on the phone alike.
+- PSPOCKET_SKIP_FP=HASH skips the draws of one fragment program (what one costs).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.
