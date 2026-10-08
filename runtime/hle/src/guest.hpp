@@ -52,6 +52,21 @@ private:
     u32 addr_ = 0;
 };
 
+// lv2's answer to system call `number` with these arguments (a library's `sc`), through the kernel's own dispatcher:
+// r3. The caller's r3..r12 are as they were afterwards (an HLE function may still read its arguments).
+inline u64 lv2_syscall(PPUContext& ctx, u32 number, std::initializer_list<u64> args)
+{
+    u64 saved[10];
+    for (u32 k = 0; k < 10; k++) saved[k] = ctx.gpr[3 + k];
+    u32 i = 0;
+    for (const u64 a : args) ctx.gpr[3 + i++] = a;
+    ctx.gpr[11] = number;
+    thread_of(ctx).kernel.syscall(ctx);
+    const u64 r = ctx.gpr[3];
+    for (u32 k = 0; k < 10; k++) ctx.gpr[3 + k] = saved[k];
+    return r;
+}
+
 // Calls the guest function whose descriptor (OPD: entry, TOC) is at `opd` on the calling thread, with its arguments in
 // r3..r10 and the ninth and later in the parameter save area (r1 + 0x70 + 8 * (i - 8), the PPC64 ELF ABI: a codec
 // core's open takes ten, D-197), and returns r3: what RPCS3 does with ppu_execute and its callback calls

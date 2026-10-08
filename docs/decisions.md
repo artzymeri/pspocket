@@ -6071,3 +6071,34 @@ pool of liblv2-style dlmalloc 2.8.3 mspaces, lv2_heap.hpp, D-502), under sys_lib
 - strdup.
 Shared: range_ok and a TTY writer (tty_out) moved into libc_guest.hpp.
 Tests: tests/hle/test_libc.cpp, two cases more (malloc's family; mspaces in the caller's and in lv2's memory).
+
+## D-514 · 2026-10-08 · The C library, part 4: stdio and the POSIX file functions
+
+Part 4 of D-511 (runtime/hle/src/sys_libc_stdio.cpp), under sys_libc and sys_libm, over lv2's file system and TTY.
+- A FILE is 128 bytes of guest memory, cleared but for its first word, which holds its own address: the getc/putc
+  macros of Dinkumware's headers compare buffer pointers in it and so always call the functions, and code that takes
+  the variables _Stdin, _Stdout and _Stderr for FILE pointers rather than FILEs (Dinkumware's newer headers declare
+  them as FILEs, `#define stdin (&_Stdin)`) still finds the stream. The rest of a stream lives on the host; data moves
+  through a 4 KB staging buffer of the stream's in guest memory (lv2 reads and writes guest memory), large freads and
+  fwrites go straight between lv2 and the caller's memory.
+- The console: descriptors 0..2 (lv2's own start at 3). stdout to the TTY line buffered, stderr unbuffered; lv2's TTY
+  gives no input (sys_tty_read fails), so stdin is at its end at once (read(0) returns 0).
+- C99's choices where the library has one: a sticky end-of-file indicator, any number of bytes pushed back, no seek
+  needed between reading and writing (the library repositions itself), fgets with n of 1 or less NULL (Dinkumware's
+  fgets.c), fpos_t Dinkumware's (64-bit offset, 8-byte state), setvbuf's buffer unused (the mode kept), tmpnam's names
+  "/dev_hdd1/tNNNN" (short enough for any L_tmpnam), tmpfile's file removed at fclose, remove choosing rmdir for a
+  directory, freopen with no path keeping the file when the new mode asks for no access it lacks.
+- printf, scanf and their f, s, sn, v and wide forms on libc_format.hpp's engines; a wide stream's characters are the
+  "C" locale's bytes (EILSEQ past 255). swprintf is negative when the text does not fit (C99).
+- POSIX: open (lv2's O_* values), close, read, write, lseek (32-bit off_t, EOVERFLOW) and lseek64, stat and fstat
+  (lv2's CellFsStat), unlink, mkdir, rmdir, chmod, truncate(64), ftruncate(64), fsync, utime (NULL: now), link
+  (lv2's syscall 810 as it answers), fcntl (F_GETFD/SETFD/GETFL/SETFL), getpid, kill (no signals in lv2: ENOSYS),
+  opendir/readdir/closedir (a DIR holds the descriptor and a CellFsDirent), _wremove, _wrename, __rename.
+- Dinkumware's and Sony's stdio internals with their known signatures: _Fofind, _Fopen (its _M bits), _Foprep,
+  _Frprep, _Fwprep and the wide forms, _Fgpos, _Fspos, _Lockfilelock/_Unlockfilelock (the stream's recursive lock),
+  _fs_initialize, _fs_finalize, _close_all_FILE, _filep_close_it, _Vacopy; the variable _FILE_P_Head (an empty list).
+  Not done: _get_fd and _put_fd (nothing known of them but the names), and the formatter internals that take
+  Dinkumware's _Pft/_Sft structures (_Putfld, _Getfld and their kin), whose layouts are not known.
+- Fixed on the way: guest_strnlen with a limit of "no limit" (the %s of printf without a precision) overflowed its end
+  address and claimed a string of 2^64 bytes.
+Tests: tests/hle/test_libc_stdio.cpp (streams on mounted host directories, the TTY, the string forms, POSIX).

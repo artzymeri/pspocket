@@ -671,16 +671,6 @@ s32 cellSpurs_B55782F9(PPUContext& ctx, u32 attr, u32 a, u32 b)
     return lv2::CELL_OK;
 }
 
-// lv2's answer to `number` with these arguments (libsre's `sc`), through the kernel's own dispatcher.
-u64 lv2_syscall(PPUContext& ctx, u32 number, std::initializer_list<u64> args)
-{
-    u32 i = 0;
-    for (const u64 a : args) ctx.gpr[3 + i++] = a;
-    ctx.gpr[11] = number;
-    thread_of(ctx).kernel.syscall(ctx);
-    return ctx.gpr[3];
-}
-
 // cellSpurs 0xBAC24478 (libsre 0x108A8) and 0x7025A5EC (0x10970), which no SDK names: NULL, ALIGN, PERM unless the
 // instance shares its SPUs (0x00800000 or 0x01000000); then lv2 system calls 248 and 249 on its SPU thread group, two
 // calls RPCS3 does not name either (root only). Their EAGAIN becomes INVAL, their EBUSY STAT, anything else is

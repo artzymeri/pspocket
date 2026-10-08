@@ -255,30 +255,6 @@ u32 strtok_r_(PPUContext& ctx, u32 s, u32 delim, u32 savep)
     return r;
 }
 
-// The messages of strerror (Dinkumware's _Strerror, for the C library's errno codes, which are lv2's).
-std::string_view error_text(u32 code)
-{
-    switch (code) {
-    case 0: return "no error";
-    case kEDOM: return "domain error";
-    case kERANGE: return "range error";
-    case kEILSEQ: return "invalid multibyte sequence";
-    case kEFPOS: return "invalid file position";
-    case kEINVAL: return "invalid argument";
-    case kENOMEM: return "not enough memory";
-    case kEBADF: return "bad file descriptor";
-    case kEFAULT: return "bad address";
-    case kENOSYS: return "function not implemented";
-    case kEOVERFLOW: return "value too large";
-    case kESPIPE: return "invalid seek";
-    case kEMFILE: return "too many open files";
-    case kENOTSUP: return "not supported";
-    case kEIO: return "input/output error";
-    case kEEXIST: return "file exists";
-    default: return "unknown error";
-    }
-}
-
 // strerror(code): the message in the thread's block (80 bytes).
 u32 strerror_(PPUContext& ctx, u32 code)
 {

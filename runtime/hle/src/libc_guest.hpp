@@ -60,13 +60,18 @@ inline std::optional<u64> guest_strnlen(lv2::PpuThread& t, u32 addr, u64 max)
 {
     u8* base = t.kernel.base();
     const u64 page = host_page();
-    const u64 end = u64{addr} + max;
+    // `max` may be any size ("no limit"): the search stops at the end of guest memory, a string that runs into it
+    // being no string.
+    const u64 room = GuestMemory::kGuestSize - addr;
+    const bool capped = max <= room;
+    const u64 end = u64{addr} + (capped ? max : room);
     for (u64 a = addr; a < end;) {
-        if (a >= GuestMemory::kGuestSize || !t.kernel.memory().is_committed(static_cast<u32>(a))) return std::nullopt;
+        if (!t.kernel.memory().is_committed(static_cast<u32>(a))) return std::nullopt;
         const u64 stop = std::min(end, (a & ~(page - 1)) + page);
         if (const void* nul = std::memchr(base + a, 0, stop - a)) return static_cast<const u8*>(nul) - (base + addr);
         a = stop;
     }
+    if (!capped) return std::nullopt;
     return max;
 }
 
@@ -155,6 +160,54 @@ inline bool write_wstring(lv2::PpuThread& t, u32 addr, std::u32string_view s, bo
 
 // A call refused because a pointer does not lead to guest memory (D-042): logged with its call site.
 inline void refuse(PPUContext& ctx, std::string_view why) { log_call_site(ctx, guest_base(ctx), why); }
+
+// The messages of strerror and perror (Dinkumware's _Strerror) for the C library's errno codes, which are lv2's: its
+// own (EDOM, ERANGE, EILSEQ, EFPOS) and those the file functions leave from lv2.
+inline std::string_view error_text(u32 code)
+{
+    switch (code) {
+    case 0: return "no error";
+    case lv2::CELL_EDOM: return "domain error";
+    case lv2::CELL_ERANGE: return "range error";
+    case lv2::CELL_EILSEQ: return "invalid multibyte sequence";
+    case lv2::CELL_EFPOS: return "invalid file position";
+    case lv2::CELL_EAGAIN: return "resource temporarily unavailable";
+    case lv2::CELL_EINVAL: return "invalid argument";
+    case lv2::CELL_ENOSYS: return "function not implemented";
+    case lv2::CELL_ENOMEM: return "not enough memory";
+    case lv2::CELL_ESRCH: return "no such object";
+    case lv2::CELL_ENOENT: return "no such file or directory";
+    case lv2::CELL_ENOEXEC: return "exec format error";
+    case lv2::CELL_EDEADLK: return "resource deadlock avoided";
+    case lv2::CELL_EPERM: return "operation not permitted";
+    case lv2::CELL_EBUSY: return "device or resource busy";
+    case lv2::CELL_ETIMEDOUT: return "timed out";
+    case lv2::CELL_EFAULT: return "bad address";
+    case lv2::CELL_EISDIR: return "is a directory";
+    case lv2::CELL_EEXIST: return "file exists";
+    case lv2::CELL_EINTR: return "interrupted";
+    case lv2::CELL_EFBIG: return "file too large";
+    case lv2::CELL_ENFILE: return "too many open files in the system";
+    case lv2::CELL_ENOSPC: return "no space left on device";
+    case lv2::CELL_ENOTTY: return "not a terminal";
+    case lv2::CELL_EPIPE: return "broken pipe";
+    case lv2::CELL_EROFS: return "read-only file system";
+    case lv2::CELL_ESPIPE: return "invalid seek";
+    case lv2::CELL_EACCES: return "permission denied";
+    case lv2::CELL_EBADF: return "bad file descriptor";
+    case lv2::CELL_EIO: return "input/output error";
+    case lv2::CELL_EMFILE: return "too many open files";
+    case lv2::CELL_ENODEV: return "no such device";
+    case lv2::CELL_ENOTDIR: return "not a directory";
+    case lv2::CELL_EXDEV: return "cross-device link";
+    case lv2::CELL_ENAMETOOLONG: return "file name too long";
+    case lv2::CELL_ENOTEMPTY: return "directory not empty";
+    case lv2::CELL_ENOTSUP: return "not supported";
+    case lv2::CELL_EOVERFLOW: return "value too large";
+    case lv2::CELL_ENOTMOUNTED: return "file system not mounted";
+    default: return "unknown error";
+    }
+}
 
 // Whether [addr, addr + size) is guest memory; refused (logged) for `fn` when it is not.
 inline bool range_ok(PPUContext& ctx, std::string_view fn, u32 addr, u64 size)
@@ -290,6 +343,9 @@ inline u32 get_errno(PPUContext& ctx)
     const u32 b = thread_block(ctx);
     return b ? ps_read32(guest_base(ctx), b + tb::kErrno) : 0;
 }
+
+// Every output stream of stdio flushed (sys_libc_stdio.cpp; exit's last step before lv2 ends the process).
+void stdio_flush_all(PPUContext& ctx);
 
 // The guest address of a host variable of sys_libc (laid out the first time, D-503).
 inline u32 variable(u32 nid) { return HleProcess::current()->link_variable("sys_libc", nid); }
