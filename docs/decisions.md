@@ -5982,3 +5982,24 @@ Five functions for SPURS instances that share their SPUs with the system, read f
 - 0xBAC24478 and 0x7025A5EC: PERM unless those flags are set, then lv2 system calls 248 and 249 on the instance's SPU
   thread group, root-only calls RPCS3 does not name; their EAGAIN and EBUSY become INVAL and STAT, the rest is lv2's
   answer (pspocket's lv2 answers both with CELL_OK and a warning, as RPCS3's null_func).
+
+## D-510 · 2026-10-08 · The C99 math library, under sys_libm and sys_libc
+
+RPCS3 names nearly the same list under sys_libm and sys_libc (1,071 names shared) and implements neither; no firmware
+module has them (a game links its C library into itself), so there is no Sony code to compare with. The math half is
+pspocket's own now (runtime/hle/src/sys_libm.cpp, from the library work's draft): 522 functions registered under both
+libraries and the 38 variables of Dinkumware's math (_Inf, _Nan, _Eps, _Flt, _Dbl, ... in sys_libc; _Erf_one,
+_Gamma_big, _Fenv0, ... in sys_libm). Each is the C99 function (Annex F's special values, Annex G's complex ones)
+computed by the host's libm, with the PS3 SDK's conventions where they differ from the host's:
+- long double is double on the PPU (every `l` form is the double one); long is 32 bits (lrint, lround, scalbln).
+- FP_ILOGB0 is INT_MIN and FP_ILOGBNAN INT_MAX (Dinkumware's math.h); an infinity's ilogb is INT_MAX.
+- lrint, lround and their long long forms convert as fctiw/fctid: saturated, a NaN to the minimum; rint, nearbyint,
+  lrint and llrint round as the guest's FPSCR[RN] says; the fenv functions keep FPSCR as the architecture has it.
+- The SIMD functions (vector float in v2, v3) work lane by lane and flush denormals as VMX does with VSCR[NJ] set;
+  complex values are two FPRs, the real part first; the fast float forms give the precise results.
+- Dinkumware's internals (_Dtest, _Exp, _Sin, _Atan, ...) as its xmath.h uses them; four whose signatures are unknown
+  (_Eadd, _Emul, _Esub, _Etentox) log the call and answer an error.
+Tests (tests/hle/test_libm.cpp, 8,056 checks): every one-argument function and its float and long double forms at 23
+points (zeros, denormals, infinities, NaN, large and small values) and every two-argument one over a grid, called
+through the guest's registers as the PowerPC ABI passes them, equal to the C99 results; the conventions above; SIMD
+lanes and the denormal flush; complex values; the variables.
