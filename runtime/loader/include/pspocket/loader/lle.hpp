@@ -43,6 +43,7 @@ struct PrxModule {
     u32 toc = 0;
     std::vector<std::pair<u32, u32>> segments;             // where its segments went: (address, size)
     std::vector<u64> segment_filesz;                       // each placed segment's file size, as `segments`
+    std::vector<bool> segment_executable;                  // each placed segment's PF_X, as `segments`
     u16 attributes = 0;                                    // the module info's (sys_prx_get_module_info)
     std::array<u8, 2> version{};
     std::pair<u32, u32> exports{}, imports{};               // the module info's ranges (start, end)
@@ -52,6 +53,22 @@ struct PrxModule {
     u32 relocations = 0;                                  // applied
     u32 relocation_errors = 0;                            // out of their segments, or of a type RPCS3 lacks too
     u32 variables_linked = 0;                             // its imported variables found in other modules
+    std::string identity; // a game's module: recomp::prx_identity (D-238); empty for a firmware module
+    bool code_patched = false; // linking wrote into one of its executable segments (reference tables)
+};
+
+// A game's own modules translated ahead of time (D-238): what RuntimeModules asks of them (loader::GameModules).
+class GameModuleTranslations {
+public:
+    virtual ~GameModuleTranslations() = default;
+    // The module's slot (an address per PT_LOAD) when it was translated there; empty otherwise.
+    virtual std::vector<u32> slot(std::string_view identity) const = 0;
+    // Placed at its slot, before its imports are linked: whether its code is the code translated.
+    virtual bool matches(std::string_view identity, const PrxModule& placed) const = 0;
+    // Linked without a write into its code: its translation runs from now on (for good: a range is never turned off).
+    virtual void enable(std::string_view identity, const PrxModule& module) = 0;
+    // Whether enable() ran for it.
+    virtual bool enabled(std::string_view identity) const = 0;
 };
 
 class LleModules {
@@ -116,6 +133,9 @@ public:
     // The firmware's modules have fixed addresses in the PRX region, the same for every game (D-178): `file`'s, per
     // PT_LOAD (empty when it is not indexed or the layout did not fit).
     std::span<const u32> fixed_addresses(std::string_view file) const;
+    // Where the firmware's layout ends (the PRX region's base when there is none): a game's own modules go above
+    // (D-238).
+    u32 layout_end() const;
     // What a system library is made from (D-178): one line per module in key order (its key, its file's SHA-256, its
     // fixed addresses). A system library holds this text's SHA-256.
     std::string identity_text() const;
@@ -207,6 +227,13 @@ public:
     // The module behind `id` (null for an empty one or an unknown ID).
     const PrxModule* module(u32 id);
 
+    // A game's modules translated ahead of time (D-238): one with a slot is placed there and runs translated if its
+    // code is the code translated. Set before the game runs.
+    void set_game_translations(GameModuleTranslations* translations) { translations_ = translations; }
+    // A game's module with no translation is saved into `dir` once (<identity>.elf, the decrypted ELF without what
+    // follows it, and <identity>.txt: where it came from), for the next preparation.
+    void set_capture_dir(std::string dir) { capture_dir_ = std::move(dir); }
+
 private:
     enum class State { Loaded, Started, Stopped, Unloaded };
     struct Entry {
@@ -220,9 +247,15 @@ private:
     u32 link_function(std::string_view library, u32 nid, std::string_view who);
     u32 link_variable(std::string_view library, u32 nid, std::string_view who);
 
+    // Why a translated module cannot go to its slot (empty: it can).
+    std::string slot_refused(const std::vector<u32>& slot, const std::vector<u32>& sizes);
+    void capture(const std::string& identity, std::span<const u8> elf, std::string_view path, u64 offset);
+
     hle::HleProcess& hle_;
     std::shared_ptr<const Executable> exe_;
     LleModules* lle_;
+    GameModuleTranslations* translations_ = nullptr;
+    std::string capture_dir_;
     std::recursive_mutex mutex_;
     std::vector<std::unique_ptr<Entry>> entries_;
     u32 next_id_ = 0x23000001; // RPCS3's lv2_prx IDs start at 0x23000000
@@ -232,8 +265,11 @@ private:
 // header's entries, RPCS3's types 1, 4, 5, 6, 10, 11, 38, 44, 57), exports, and its imports through `link` (library,
 // NID -> descriptor; 0 leaves the slot as it is, with an error logged) and `link_variable` (library, NID -> the
 // variable's address, whose references are then patched; none: variables stay unlinked, logged).
+// `fixed`: an address per PT_LOAD (a game module's slot, D-238), else main memory. `placed` runs between placing and
+// linking.
 bool load_prx(std::span<const u8> elf, hle::HleProcess& hle,
     const std::function<u32(std::string_view library, u32 nid)>& link, PrxModule* out, std::string* error,
-    const std::function<u32(std::string_view library, u32 nid)>& link_variable = {});
+    const std::function<u32(std::string_view library, u32 nid)>& link_variable = {}, std::span<const u32> fixed = {},
+    const std::function<void(const PrxModule&)>& placed = {});
 
 } // namespace pspocket::loader

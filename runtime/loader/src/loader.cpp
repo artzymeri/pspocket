@@ -28,6 +28,13 @@ constexpr u64 align_down(u64 v, u64 a) { return v & ~(a - 1); }
 
 } // namespace
 
+namespace {
+thread_local std::vector<u32>* t_watched_refs = nullptr; // WatchRefs
+} // namespace
+
+WatchRefs::WatchRefs(std::vector<u32>* out) : previous_(t_watched_refs) { t_watched_refs = out; }
+WatchRefs::~WatchRefs() { t_watched_refs = previous_; }
+
 // RPCS3 ppu_patch_refs: a reference table of {type, addr, addend} entries ending with type 0.
 void patch_refs(GuestMemory& mem, u32 table, u32 value, std::string_view what)
 {
@@ -47,6 +54,7 @@ void patch_refs(GuestMemory& mem, u32 table, u32 value, std::string_view what)
             PS_LOG_ERROR(kChan, "{}: REF({}) target {:#010x} is unmapped", what, type, addr);
             continue;
         }
+        if (t_watched_refs) t_watched_refs->push_back(addr);
         switch (type) {
         case 1: ps_write32(base, addr, data); break;                                                    // ADDR32
         case 4: ps_write16(base, addr, static_cast<u16>(data)); break;                                  // ADDR16_LO

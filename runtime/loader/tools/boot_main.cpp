@@ -7,6 +7,7 @@
 //                 [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]
 //                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]... [--audio]
 //                 [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--spu-translate DIR]
+//                 [--prx-dump DIR] [--modules-library DIR|none]
 //   pspocket-boot --probe-disc IMAGE.iso
 //   pspocket-boot --hle-list
 //
@@ -49,6 +50,9 @@
 // executable it was made from only; a library made for another runtime or executable stops the run. With
 // --builtin-spu the SPU programs built into this program run too, registered first (the app's way, D-155); without it
 // the library runs alone.
+// --prx-dump DIR saves each of the game's own PRX modules that has no translation (D-238): pspocket-prepare --modules
+// DIR translates them. --modules-library DIR loads the game's modules library (default: "modules" beside
+// --game-library's file): its modules go to their slots and run translated; none: not even looked for.
 // --spu-translate DIR translates the SPU programs the game meets without a translation while it runs (D-236): saved
 // into DIR/images, lifted, compiled, signed and loaded in DIR/work on one background thread, each running translated
 // from its next taken branch (D-233). Both folders are emptied at the start; PSPOCKET_SPU_TRANSLATE=0 turns it off
@@ -110,7 +114,9 @@
 #include "pspocket/core/png.hpp"
 #include "pspocket/core/thread_report.hpp"
 #include "pspocket/game/host.hpp"
+#include "pspocket/loader/game_modules.hpp"
 #include "pspocket/loader/lle.hpp"
+#include "pspocket/recomp/hash.hpp"
 #if defined(PSPOCKET_HAVE_SESSION_TRANSLATOR)
 #include <sys/qos.h>
 
@@ -147,7 +153,7 @@ int usage()
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
         "                     [--async-shaders MS] [--watch ADDR] [--system-library DIR|none]\n"
-        "                     [--spu-translate DIR]\n"
+        "                     [--spu-translate DIR] [--prx-dump DIR] [--modules-library DIR|none]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n"
         "       pspocket-boot --hle-list\n");
     return 64;
@@ -844,6 +850,7 @@ int main(int argc, char** argv)
     std::string spu_dump;
     std::string game_library; // --game-library (D-152)
     std::string spu_translate; // --spu-translate (D-236)
+    std::string prx_dump, modules_library; // --prx-dump, --modules-library (D-238)
     std::string system_dir;   // --system-library DIR|none (D-178); empty: beside --flash
     [[maybe_unused]] bool builtin_spu = false; // --builtin-spu: with a game library, the built-in SPU programs too (the
                                                // app's way); only a build with them uses it
@@ -952,6 +959,8 @@ int main(int argc, char** argv)
         else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
         else if (a == "--game-library") { const char* v = value(); if (!v) return usage(); game_library = v; }
         else if (a == "--spu-translate") { const char* v = value(); if (!v) return usage(); spu_translate = v; }
+        else if (a == "--prx-dump") { const char* v = value(); if (!v) return usage(); prx_dump = v; }
+        else if (a == "--modules-library") { const char* v = value(); if (!v) return usage(); modules_library = v; }
         else if (a == "--system-library") { const char* v = value(); if (!v) return usage(); system_dir = v; }
         else if (a == "--builtin-spu") builtin_spu = true;
         else if (a == "--stop-at-first") stop_at_first = true;
@@ -978,6 +987,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "pspocket-boot: %s is a SELF; decrypt it to an ELF first (docs/phase0.md)\n", elf_path);
         return 65;
     }
+    const std::string exe_sha256 = recomp::to_hex(recomp::Sha256::hash(std::span<const u8>(bytes)));
     auto exe = loader::Executable::parse(std::move(bytes));
     if (!exe) {
         std::fprintf(stderr, "pspocket-boot: %s: %s\n", elf_path, exe.error().message.c_str());
@@ -1184,6 +1194,16 @@ int main(int argc, char** argv)
         hle::HleProcess& hle;
         ~ForgetModules() { hle.set_module_loader(nullptr); }
     } forget_modules{hle};
+    // The game's own modules: translated ones to their slots (D-238), the others saved for the next preparation.
+    if (!prx_dump.empty()) runtime_modules.set_capture_dir(prx_dump);
+    std::unique_ptr<loader::GameModules> game_modules;
+    if (modules_library.empty() && !game_library.empty())
+        modules_library = (std::filesystem::path(game_library).parent_path() / "modules").string();
+    if (!modules_library.empty() && modules_library != "none") {
+        std::string why;
+        game_modules = loader::GameModules::load(modules_library, exe_sha256, runtime_modules, lle.get(), memory, &why);
+        if (!game_modules && why != "none") PS_LOG_INFO("boot", "the game's modules library: {}", why);
+    }
     if (lle) {
         state.module_starts = lle->take_starts();
         for (const auto& m : lle->loaded())
@@ -1441,6 +1461,9 @@ int main(int argc, char** argv)
         std::printf("SPU image interpreted: %llu instructions in spu_%016llx_%05x\n",
             static_cast<unsigned long long>(im.steps), static_cast<unsigned long long>(im.hash), im.ls_start);
     }
+    if (game_modules)
+        std::printf("the game's modules: %zu translated in its modules library, %zu loaded and run translated\n",
+            game_modules->modules(), game_modules->modules_translated());
     if (const u64 adopted = spu::pending_homes_adopted())
         std::printf("SPU contexts switched to a program registered while they ran: %llu\n",
             static_cast<unsigned long long>(adopted));
@@ -1451,12 +1474,15 @@ int main(int argc, char** argv)
         const auto owner = [&](u32 pc) -> std::string {
             for (const recomp::ProgramHeader& ph : (*exe)->elf().segments())
                 if (ph.type == 1 && pc >= ph.vaddr && pc < ph.vaddr + ph.memsz) return "the executable";
-            if (pc - PS_MEM_PRX_BASE < PS_MEM_PRX_SIZE) return "a firmware module";
+            // The firmware's fixed layout first; a game's own modules sit above it in the PRX region (D-238).
+            const u32 firmware_end = lle ? lle->layout_end() : PS_MEM_PRX_BASE + PS_MEM_PRX_SIZE;
+            if (pc >= PS_MEM_PRX_BASE && pc < firmware_end) return "a firmware module";
             if (const u32 id = runtime_modules.id_by_address(pc)) {
                 hle::ModuleInfo info;
                 if (runtime_modules.info(id, info)) return "the game's module " + info.name;
                 return "a module the game loaded";
             }
+            if (pc - PS_MEM_PRX_BASE < PS_MEM_PRX_SIZE) return "the PRX region";
             return "other code";
         };
         std::vector<ps_ppu_interp_site> all(4096);

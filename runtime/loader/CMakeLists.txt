@@ -1,6 +1,6 @@
 # Process loader: ELF executable -> lv2 process with HLE-linked imports. Uses the toolchain's ELF and module parsers
 # (recomp/common), which are portable C++.
-add_library(pspocket_loader STATIC src/loader.cpp src/disc.cpp src/lle.cpp src/system.cpp)
+add_library(pspocket_loader STATIC src/loader.cpp src/disc.cpp src/game_modules.cpp src/lle.cpp src/system.cpp)
 target_include_directories(pspocket_loader PUBLIC include)
 target_link_libraries(pspocket_loader PUBLIC pspocket::hle pspocket::lv2 pspocket::recomp_common
     PRIVATE pspocket::disc pspocket::game)

@@ -154,6 +154,7 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
             }
         }
         out->segment_filesz.push_back(filesz);
+        out->segment_executable.push_back(seg.executable);
     }
     for (const std::string& e : placed->errors) PS_LOG_ERROR(kChan, "{}", e);
     out->relocations = placed->relocations;
@@ -404,6 +405,15 @@ std::string LleModules::identity_text() const
     std::string text;
     for (const auto& [key, info] : files_) text += recomp::firmware_identity_line(key, info.sha256, info.addrs);
     return text;
+}
+
+u32 LleModules::layout_end() const
+{
+    u64 end = PS_MEM_PRX_BASE;
+    for (const auto& [key, info] : files_)
+        for (usize i = 0; i < info.addrs.size() && i < info.load_sizes.size(); i++)
+            if (info.addrs[i]) end = std::max<u64>(end, u64{info.addrs[i]} + info.load_sizes[i]);
+    return static_cast<u32>(std::min<u64>(end, PS_MEM_PRX_BASE + u64{PS_MEM_PRX_SIZE}));
 }
 
 std::span<const u32> LleModules::fixed_addresses(std::string_view file) const
@@ -880,27 +890,74 @@ u32 RuntimeModules::load_at(std::string_view path, u64 offset, u32* id)
             }
             elf = std::move(*decrypted);
         }
-        // The firmware modules its imports need, chosen as for the game's (D-175).
+        // The firmware modules its imports need, chosen as for the game's (D-175); its identity and, if it was
+        // translated, its slot (D-238).
         std::vector<LleModules::LibraryNeeds> needs;
-        if (lle_ && lle_->decided())
-            if (const auto parsed = recomp::ElfFile::parse(elf))
+        std::string identity;
+        std::vector<u32> slot, sizes;
+        if (const auto parsed = recomp::ElfFile::parse(elf)) {
+            identity = recomp::prx_identity(*parsed);
+            sizes = recomp::prx_load_sizes(*parsed);
+            if (translations_) slot = translations_->slot(identity);
+            if (lle_ && lle_->decided())
                 if (const auto info = recomp::analyze_ppu_module(*parsed)) {
                     needs = LleModules::needs_of(*info);
                     lle_->extend(path, needs, {}, syscall_bound);
                 }
+        }
+        if (!slot.empty()) {
+            if (const std::string refused = slot_refused(slot, sizes); !refused.empty()) {
+                PS_LOG_WARN(kChan, "{}: not at its slot ({}): it runs under the interpreter, from main memory", path,
+                    refused);
+                slot.clear();
+            }
+        }
         e->owned = std::make_unique<PrxModule>();
         e->owned->file = file;
+        e->owned->identity = identity;
         std::string why;
         const std::string who(path);
+        bool matches = false;
         if (!load_prx(
                 elf, hle_, [&](std::string_view library, u32 nid) { return link_function(library, nid, who); },
                 e->owned.get(), &why,
-                [&](std::string_view library, u32 nid) { return link_variable(library, nid, who); })) {
+                [&](std::string_view library, u32 nid) { return link_variable(library, nid, who); }, slot,
+                [&](const PrxModule& placed) {
+                    if (!slot.empty()) matches = translations_->matches(identity, placed);
+                })) {
             PS_LOG_ERROR(kChan, "{}: {}", path, why);
             return kPrxErrorIllegalLibrary;
         }
+        if (!slot.empty() && !(matches && !e->owned->code_patched) && translations_->enabled(identity)) {
+            // Its translation runs at the slot since an earlier load (a range is never turned off), and this copy is
+            // not what it was made from (linking now patches its code): this one goes to main memory instead.
+            PS_LOG_WARN(kChan, "{}: {}, and its translation runs at its slot since an earlier load: this copy goes to "
+                               "main memory, under the interpreter", path,
+                matches ? "linking wrote into its code" : "its code is not the code translated");
+            auto fresh = std::make_unique<PrxModule>();
+            fresh->file = file;
+            fresh->identity = identity;
+            if (!load_prx(
+                    elf, hle_, [&](std::string_view library, u32 nid) { return link_function(library, nid, who); },
+                    fresh.get(), &why,
+                    [&](std::string_view library, u32 nid) { return link_variable(library, nid, who); })) {
+                PS_LOG_ERROR(kChan, "{}: {}", path, why);
+                return kPrxErrorIllegalLibrary;
+            }
+            e->owned = std::move(fresh);
+            slot.clear();
+            matches = false;
+        }
         e->module = e->owned.get();
         if (lle_) lle_->link_host_imports(needs, hle_);
+        if (!slot.empty() && matches && !e->owned->code_patched) {
+            translations_->enable(identity, *e->owned);
+        } else if (!slot.empty()) {
+            PS_LOG_WARN(kChan, "{}: {}: it runs under the interpreter", path,
+                matches ? "linking wrote into its code" : "its code is not the code translated");
+        } else if (!capture_dir_.empty() && !(translations_ && !translations_->slot(identity).empty())) {
+            capture(identity, elf, path, offset); // not translated yet (one with a slot was, and is in its library)
+        }
         PS_LOG_INFO(kChan, "{} ({}): {} segments at {:#x}, {} relocations ({} bad), {} functions exported", path,
             e->module->name, e->module->segments.size(), e->module->segments.empty() ? 0 : e->module->segments[0].first,
             e->module->relocations, e->module->relocation_errors, e->module->functions.size());
@@ -1042,7 +1099,8 @@ u32 RuntimeModules::id_by_name(std::string_view name)
 }
 
 bool load_prx(std::span<const u8> elf_bytes, hle::HleProcess& hle, const std::function<u32(std::string_view, u32)>& link,
-    PrxModule* out, std::string* error, const std::function<u32(std::string_view, u32)>& link_variable)
+    PrxModule* out, std::string* error, const std::function<u32(std::string_view, u32)>& link_variable,
+    std::span<const u32> fixed, const std::function<void(const PrxModule&)>& placed)
 {
     auto elf = recomp::ElfFile::parse(elf_bytes);
     if (!elf) {
@@ -1051,12 +1109,62 @@ bool load_prx(std::span<const u8> elf_bytes, hle::HleProcess& hle, const std::fu
     }
     std::pair<u32, u32> imports;
     std::string why;
-    if (!place(*elf, elf_bytes, hle, out, &imports, &why)) {
+    if (!place(*elf, elf_bytes, hle, out, &imports, &why, fixed)) {
         if (error) *error = why;
         return false;
     }
-    link_imports(imports, hle, *out, link, link_variable);
+    if (placed) placed(*out);
+    // Reference tables patch instructions (lis/addi pairs): a translation of the code as placed would keep the
+    // immediates it had (D-238).
+    std::vector<u32> written;
+    {
+        const WatchRefs watch(&written);
+        link_imports(imports, hle, *out, link, link_variable);
+    }
+    for (const u32 addr : written)
+        for (usize i = 0; i < out->segments.size(); i++)
+            if (out->segment_executable[i] && addr - out->segments[i].first < out->segments[i].second)
+                out->code_patched = true;
     return true;
+}
+
+std::string RuntimeModules::slot_refused(const std::vector<u32>& slot, const std::vector<u32>& sizes)
+{
+    u32 low = ~0u;
+    for (const u32 a : slot)
+        if (a) low = std::min(low, a);
+    if (lle_ && low < lle_->layout_end())
+        return std::format("the firmware's modules now reach its slot ({:#010x} under {:#010x})", low, lle_->layout_end());
+    for (const auto& other : entries_) {
+        if (other->state == State::Unloaded || !other->module) continue;
+        for (usize i = 0; i < slot.size() && i < sizes.size(); i++) {
+            if (!slot[i] || !sizes[i]) continue;
+            for (const auto& [base, size] : other->module->segments)
+                if (size && slot[i] < base + size && base < slot[i] + sizes[i])
+                    return std::format("{} is loaded there", other->path);
+        }
+    }
+    return {};
+}
+
+void RuntimeModules::capture(const std::string& identity, std::span<const u8> elf, std::string_view path, u64 offset)
+{
+    const fs::path dir(capture_dir_);
+    std::error_code ec;
+    if (identity.empty() || fs::exists(dir / (identity + ".elf"), ec)) return; // saved before
+    fs::create_directories(dir, ec);
+    // The ELF without what followed it in an archive: to the furthest of its segments' and section table's ends.
+    usize size = elf.size();
+    if (auto parsed = recomp::ElfFile::parse(elf, {.symbols = false})) size = static_cast<usize>(parsed->extent());
+    const fs::path tmp = dir / (identity + ".elf.tmp");
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(size));
+        if (!out) return;
+    }
+    fs::rename(tmp, dir / (identity + ".elf"), ec);
+    std::ofstream(dir / (identity + ".txt")) << std::format("path {}\noffset {:#x}\n", path, offset);
+    PS_LOG_INFO(kChan, "{}: not translated yet: saved for the next preparation ({})", path, identity.substr(0, 16));
 }
 
 } // namespace pspocket::loader
