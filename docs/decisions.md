@@ -6026,3 +6026,24 @@ Part 1 (runtime/hle/src/sys_libc.cpp):
   forms on a state the caller gives, the others on the variable __TT800 (25 words and a position). No reference to
   compare their seeding with: the public mt19937ar initialization, said so here.
 Tests: tests/hle/test_libc.cpp (6,769 checks: every behaviour above, a guest comparator for qsort and bsearch).
+
+## D-512 · 2026-10-08 · The C library, part 2: wide strings, multibyte conversions, wide classes
+
+Part 2 of D-511 (runtime/hle/src/sys_libc_wide.cpp), under sys_libc and sys_libm as before. A guest wchar_t is a
+32-bit big-endian word, compared unsigned.
+- wchar.h's strings: wcslen to wcsstr, wcstok (C99's, its place in the caller's pointer), wmem*, wcscoll and wcsxfrm in
+  the "C" locale (code order); comparisons -1, 0 or +1 like the narrow ones.
+- Wide numbers: wcstol to wcstoumax and wcstod/wcstof/wcstold, the narrow parsers over wide characters, one past 127
+  ending the number (no wide character past ASCII is a digit, sign or space in the "C" locale).
+- Multibyte in the "C" locale: a byte is the wide character of its value (MB_CUR_MAX 1, no shift states), a wide
+  character past 255 has no byte (EILSEQ, which like the other libc codes is lv2's: CELL_EILSEQ). mbrtowc, mbrlen,
+  mbtowc, mblen, wcrtomb, wctomb, mbstowcs, mbsrtowcs and wcsrtombs (the source pointer moved as C99 says), wcstombs,
+  mbsinit, btowc, wctob.
+- wctype.h: the twelve classes ASCII's, wctype's descriptors Dinkumware's order from 1 (0 none), towlower and
+  towupper, wctrans (1 tolower, 2 toupper) and towctrans.
+- Dinkumware's internals the headers' macros call: _Mbtowc(x), _Wctomb(x), _Btowc, _Wctob, _Iswctype, _Geterrno
+  (errno.h's `#define errno (*_Geterrno())`: the thread's errno word), _Getpmbstate, _Getpwcstate, _Getpcostate,
+  _Getpwcostate (the thread's states in its block), _Getmbcurmax and the char variable _Mbcurmax (1), _Getpwctytab and
+  _Getpwctrtab with their variables _Wctype and _Wctrans ({name, value} tables, the names after them).
+- memcpy, memset, memmove and memcmp under sys_libm too, and _memset_vmx (memset).
+Tests: tests/hle/test_libc.cpp, two cases more (wide strings; wide numbers, conversions and classes).

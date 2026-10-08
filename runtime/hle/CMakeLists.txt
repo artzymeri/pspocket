@@ -67,6 +67,7 @@ add_library(pspocket_hle STATIC
     src/sysPrxForUser_libc.cpp
     src/sysPrxForUser_sys.cpp
     src/sys_libc.cpp
+    src/sys_libc_wide.cpp
     src/sys_libm.cpp
     src/cellFont.cpp
     src/cellFontFT.cpp

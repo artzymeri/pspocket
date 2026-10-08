@@ -6,6 +6,7 @@
 
 #include "hle_test_util.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -1209,14 +1210,19 @@ TEST_CASE("sys_game_process_exitspawn2: RPCS3's flags, and the atexitspawn or at
     }
 }
 
-TEST_CASE("sys_libc: memcpy, memset, memmove and memcmp under their C names (RPCS3, D-184)", "[hle][libc]")
+TEST_CASE("sys_libc: memcpy, memset, memmove and memcmp under their C names (RPCS3, D-184, D-512)", "[hle][libc]")
 {
     Fixture f;
     GuestThread g(f, 0, "libc");
     u8* b = f.base();
-    for (const char* name : {"memcpy", "memset", "memmove", "memcmp"}) {
+    // Under sys_libm too, as RPCS3 lists the C library (D-512).
+    for (const char* name : {"memcpy", "memset", "memmove", "memcmp", "_memset_vmx"}) {
         INFO(name);
-        CHECK(GuestThread::find(name).module == "sys_libc");
+        std::vector<std::string> libs;
+        for (const hle::Function& x : hle::registry().functions())
+            if (x.name == name) libs.emplace_back(x.module);
+        CHECK(std::ranges::count(libs, "sys_libc") == 1);
+        CHECK(std::ranges::count(libs, "sys_libm") == 1);
     }
     const u32 a = kData + 0x100, c = kData + 0x200;
     std::memcpy(b + a, "abcdefgh", 8);

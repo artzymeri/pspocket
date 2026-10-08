@@ -29,6 +29,7 @@
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -1128,13 +1129,17 @@ void register_sysPrxForUser_libc(Registry& r)
     });
     // sys_libc (RPCS3 sys_libc.cpp, REG_FNID by the C names): the same memory functions under libc's names. The
     // firmware has the library in a module of its own that games don't load (docs/firmware.md), but RPCS3 serves it.
+    // RPCS3 lists the C library under sys_libm too (D-511); _memset_vmx is memset.
     using detail::thunk;
-    r.add("sys_libc", {
-        Function{{}, "memcpy", 0x831D70A5, &thunk<&sys_libc_memcpy>, false},
-        Function{{}, "memset", 0x5909E3C4, &thunk<&sys_libc_memset>, false},
-        Function{{}, "memmove", 0x5B162B7F, &thunk<&sys_libc_memmove>, false},
-        Function{{}, "memcmp", 0xC3E14CBE, &thunk<&sys_libc_memcmp>, false},
-    });
+    for (const std::string_view lib : {std::string_view("sys_libc"), std::string_view("sys_libm")}) {
+        r.add(lib, {
+            Function{{}, "memcpy", 0x831D70A5, &thunk<&sys_libc_memcpy>, false},
+            Function{{}, "memset", 0x5909E3C4, &thunk<&sys_libc_memset>, false},
+            Function{{}, "memmove", 0x5B162B7F, &thunk<&sys_libc_memmove>, false},
+            Function{{}, "memcmp", 0xC3E14CBE, &thunk<&sys_libc_memcmp>, false},
+            Function{{}, "_memset_vmx", recomp::nid_of("_memset_vmx"), &thunk<&sys_libc_memset>, false},
+        });
+    }
 }
 
 } // namespace pspocket::hle

@@ -210,3 +210,182 @@ TEST_CASE("sys_libc: stdlib.h numbers, sorting and random numbers", "[hle][libc]
     t.call("_init_by_array_TT800", kArr, kOut, 4);
     CHECK(t.call("_rand_int32_TT800", kArr) == a1);
 }
+
+namespace {
+
+void wput(u8* b, u32 at, std::u32string_view s)
+{
+    for (usize i = 0; i < s.size(); i++) ps_write32(b, at + 4 * static_cast<u32>(i), static_cast<u32>(s[i]));
+    ps_write32(b, at + 4 * static_cast<u32>(s.size()), 0);
+}
+
+std::u32string wstr(u8* b, u32 at)
+{
+    std::u32string s;
+    while (const u32 c = ps_read32(b, at + 4 * static_cast<u32>(s.size()))) s += static_cast<char32_t>(c);
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("sys_libc: wide strings in the C locale", "[hle][libc]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    wput(b, kA, U"hello world");
+    CHECK(t.call("wcslen", kA) == 11);
+    CHECK(t.call("wcscpy", kOut, kA) == kOut);
+    CHECK(wstr(b, kOut) == U"hello world");
+    // wcsncpy pads with NULs to n and leaves the string unterminated when it fills n.
+    std::memset(b + kOut, 0x7E, 64);
+    t.call("wcsncpy", kOut, kA, 13);
+    CHECK(wstr(b, kOut) == U"hello world");
+    CHECK(ps_read32(b, kOut + 4 * 12) == 0);
+    CHECK(ps_read32(b, kOut + 4 * 13) == 0x7E7E7E7Eu);
+    // Comparisons give -1, 0 or +1, wide characters as unsigned.
+    wput(b, kB, U"hello\U0010FFFF");
+    CHECK(i32(t.call("wcscmp", kA, kA)) == 0);
+    CHECK(i32(t.call("wcscmp", kA, kB)) == -1);
+    CHECK(i32(t.call("wcscmp", kB, kA)) == 1);
+    CHECK(i32(t.call("wcsncmp", kA, kB, 5)) == 0);
+    ps_write32(b, kB, 0x80000000u);
+    CHECK(i32(t.call("wcscmp", kB, kA)) == 1); // unsigned: 0x80000000 > 'h'
+    CHECK(i32(t.call("wmemcmp", kB, kA, 1)) == 1);
+    // Searches.
+    wput(b, kA, U"hello world");
+    CHECK(t.call("wcschr", kA, 'o') == kA + 4 * 4);
+    CHECK(t.call("wcsrchr", kA, 'o') == kA + 4 * 7);
+    CHECK(t.call("wcschr", kA, 0) == kA + 4 * 11);
+    CHECK(t.call("wcschr", kA, 'z') == 0);
+    CHECK(t.call("wmemchr", kA, 'w', 11) == kA + 4 * 6);
+    wput(b, kB, U"wor");
+    CHECK(t.call("wcsstr", kA, kB) == kA + 4 * 6);
+    wput(b, kB, U"leh");
+    CHECK(t.call("wcsspn", kA, kB) == 4);
+    wput(b, kB, U"wol");
+    CHECK(t.call("wcscspn", kA, kB) == 2);
+    CHECK(t.call("wcspbrk", kA, kB) == kA + 4 * 2);
+    // wcscat, wcsncat, wcsxfrm (the C locale's collation is the code order).
+    wput(b, kOut, U"ab");
+    wput(b, kB, U"cdef");
+    t.call("wcscat", kOut, kB);
+    CHECK(wstr(b, kOut) == U"abcdef");
+    t.call("wcsncat", kOut, kB, 2);
+    CHECK(wstr(b, kOut) == U"abcdefcd");
+    CHECK(t.call("wcsxfrm", kOut, kB, 10) == 4);
+    CHECK(wstr(b, kOut) == U"cdef");
+    CHECK(t.call("wcsxfrm", kOut, kB, 4) == 4); // too small: not written
+    CHECK(i32(t.call("wcscoll", kA, kB)) == 1);
+    // wcstok keeps its place in the caller's pointer.
+    wput(b, kA, U"  a,b,,c  ");
+    wput(b, kB, U" ,");
+    CHECK(wstr(b, static_cast<u32>(t.call("wcstok", kA, kB, kArr))) == U"a");
+    CHECK(wstr(b, static_cast<u32>(t.call("wcstok", 0, kB, kArr))) == U"b");
+    CHECK(wstr(b, static_cast<u32>(t.call("wcstok", 0, kB, kArr))) == U"c");
+    CHECK(t.call("wcstok", 0, kB, kArr) == 0);
+    // wmemset, wmemcpy, wmemmove (overlapping).
+    t.call("wmemset", kOut, 0x12345678u, 4);
+    CHECK(ps_read32(b, kOut + 12) == 0x12345678u);
+    wput(b, kA, U"abcdef");
+    t.call("wmemmove", kA + 4, kA, 5);
+    CHECK(wstr(b, kA) == U"aabcde");
+    t.call("wmemcpy", kOut, kA, 7);
+    CHECK(wstr(b, kOut) == U"aabcde");
+}
+
+TEST_CASE("sys_libc: wide numbers, multibyte conversions and wide classes", "[hle][libc]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const auto err = [&] { return ps_read32(b, static_cast<u32>(t.call("_Geterrno"))); };
+    // wcstol: the narrow forms' rules over wide characters; one past 127 ends the number.
+    wput(b, kA, U"  -0x1fz");
+    CHECK(i32(t.call("wcstol", kA, kOut, 0)) == -31);
+    CHECK(ps_read32(b, kOut) == kA + 4 * 7);
+    wput(b, kA, U"12٣");
+    CHECK(t.call("wcstoul", kA, kOut, 10) == 12);
+    CHECK(ps_read32(b, kOut) == kA + 8);
+    wput(b, kA, U"99999999999");
+    CHECK(i32(t.call("wcstol", kA, 0, 10)) == INT_MAX);
+    CHECK(err() == 0x8001001Cu); // ERANGE (lv2's code)
+    CHECK(t.call("wcstoll", kA, 0, 10) == 99999999999ull);
+    wput(b, kA, U"xyz");
+    CHECK(t.call("wcstol", kA, kOut, 10) == 0);
+    CHECK(ps_read32(b, kOut) == kA);
+    wput(b, kA, U"  -1.5e3xyz");
+    t.call("wcstod", kA, kOut);
+    CHECK(t.ctx.fpr[1] == -1500.0);
+    CHECK(ps_read32(b, kOut) == kA + 4 * 8);
+    wput(b, kA, U"0x1p-2");
+    t.call("wcstof", kA, 0);
+    CHECK(t.ctx.fpr[1] == 0.25);
+    // The C locale's multibyte characters are bytes, each the wide character of its value.
+    b[kA] = 0xC0;
+    b[kA + 1] = 0;
+    CHECK(t.call("mbrtowc", kOut, kA, 4, 0) == 1);
+    CHECK(ps_read32(b, kOut) == 0xC0);
+    CHECK(t.call("mbrtowc", kOut, kA + 1, 4, 0) == 0);
+    CHECK(static_cast<u32>(t.call("mbrtowc", kOut, kA, 0, 0)) == 0xFFFFFFFEu); // (size_t)-2
+    CHECK(i32(t.call("mblen", kA, 1)) == 1);
+    CHECK(i32(t.call("mbtowc", 0, 0, 0)) == 0); // no shift states
+    CHECK(t.call("wcrtomb", kOut, 0xE9, 0) == 1);
+    CHECK(b[kOut] == 0xE9);
+    CHECK(static_cast<u32>(t.call("wcrtomb", kOut, 0x100, 0)) == 0xFFFFFFFFu);
+    CHECK(err() == 0x8001001Du); // EILSEQ
+    CHECK(i32(t.call("wctomb", kOut, 0x41)) == 1);
+    CHECK(i32(t.call("btowc", static_cast<u64>(-1))) == -1);
+    CHECK(t.call("btowc", 0xFF) == 0xFF);
+    CHECK(i32(t.call("wctob", 0x100)) == -1);
+    CHECK(t.call("mbsinit", 0) == 1);
+    put(b, kA, "h\xE9llo");
+    CHECK(t.call("mbstowcs", 0, kA, 0) == 5);
+    CHECK(t.call("mbstowcs", kOut, kA, 16) == 5);
+    CHECK(wstr(b, kOut) == U"héllo");
+    // mbsrtowcs moves the source pointer past what it converted, or to NULL after the NUL.
+    ps_write32(b, kArr, kA);
+    CHECK(t.call("mbsrtowcs", kOut, kArr, 2, 0) == 2);
+    CHECK(ps_read32(b, kArr) == kA + 2);
+    CHECK(t.call("mbsrtowcs", kOut, kArr, 16, 0) == 3);
+    CHECK(ps_read32(b, kArr) == 0);
+    wput(b, kA, U"wide");
+    CHECK(t.call("wcstombs", kOut, kA, 16) == 4);
+    CHECK(cstr(b, kOut) == "wide");
+    CHECK(t.call("wcstombs", 0, kA, 0) == 4);
+    wput(b, kA, U"aĀ");
+    CHECK(static_cast<u32>(t.call("wcstombs", kOut, kA, 16)) == 0xFFFFFFFFu);
+    ps_write32(b, kArr, kA);
+    wput(b, kA, U"abc");
+    CHECK(t.call("wcsrtombs", kOut, kArr, 2, 0) == 2);
+    CHECK(ps_read32(b, kArr) == kA + 8);
+    CHECK(t.call("_Getmbcurmax") == 1);
+    // The classes are ASCII's; nothing past 127 is in one.
+    for (u32 c = 0; c < 300; c++) {
+        INFO(c);
+        const bool ascii = c < 128;
+        CHECK((t.call("iswalpha", c) != 0) == (ascii && std::isalpha(static_cast<int>(c))));
+        CHECK((t.call("iswdigit", c) != 0) == (ascii && std::isdigit(static_cast<int>(c))));
+        CHECK((t.call("iswspace", c) != 0) == (ascii && std::isspace(static_cast<int>(c))));
+        CHECK((t.call("iswpunct", c) != 0) == (ascii && std::ispunct(static_cast<int>(c))));
+        CHECK((t.call("iswcntrl", c) != 0) == (ascii && std::iscntrl(static_cast<int>(c))));
+        CHECK((t.call("iswprint", c) != 0) == (ascii && std::isprint(static_cast<int>(c))));
+        CHECK((t.call("iswblank", c) != 0) == (c == ' ' || c == '\t'));
+        CHECK(t.call("towupper", c) == (c >= 'a' && c <= 'z' ? c - 32 : c));
+    }
+    put(b, kA, "xdigit");
+    const u64 xdigit = t.call("wctype", kA);
+    CHECK(xdigit != 0);
+    CHECK(t.call("iswctype", 'f', xdigit) == 1);
+    CHECK(t.call("iswctype", 'g', xdigit) == 0);
+    put(b, kA, "bogus");
+    CHECK(t.call("wctype", kA) == 0);
+    put(b, kA, "toupper");
+    CHECK(t.call("towctrans", 'q', t.call("wctrans", kA)) == 'Q');
+    // Dinkumware's table of the class names, as wctype reads it.
+    const u32 tab = static_cast<u32>(t.call("_Getpwctytab"));
+    REQUIRE(tab != 0);
+    CHECK(cstr(b, ps_read32(b, tab)) == "alnum");
+    CHECK(t.call("iswctype", 'A', ps_read32(b, tab + 4)) == 1); // the first entry's class
+    CHECK(t.call("iswctype", '!', ps_read32(b, tab + 4)) == 0);
+}
