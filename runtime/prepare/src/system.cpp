@@ -26,6 +26,7 @@
 #include "pspocket/recomp/spu/image.hpp"
 #include "pspocket/recomp/spu_scan.hpp"
 #include "pspocket/prepare/spu_static.hpp"
+#include "module_translate.hpp"
 
 namespace pspocket::prepare {
 namespace {
@@ -145,51 +146,8 @@ size_t translate_system(const std::string& dev_flash, const std::string& dir, st
         identity += recomp::firmware_identity_line(key, m.sha256, addrs);
         if (!recomp::firmware_module_translated(key)) continue;
         const auto elf = recomp::ElfFile::parse(m.elf_bytes);
-        auto info = recomp::analyze_ppu_module(*elf);
-        auto placed = recomp::place_prx(*elf, m.elf_bytes, addrs);
-        if (!placed) {
-            PS_LOG_WARN(kChan, "{}: {}: not translated", key, placed.error().message);
-            continue;
-        }
-        // An address of the analysis (each PT_LOAD at its p_vaddr, recomp::GuestImage) at its fixed place. A module's
-        // first PT_LOAD often reserves more than its file part, over the second's vaddr (libpngdec: 0x50000 from 0,
-        // the data at 0x40a00): the later segment is the one there, as in the analysis image.
-        std::vector<std::pair<u64, u64>> vranges; // per PT_LOAD: vaddr, memsz
-        for (const recomp::ProgramHeader& ph : elf->segments())
-            if (ph.type == 1) vranges.emplace_back(ph.vaddr, ph.memsz);
-        const auto place_of = [&](u32 a) -> std::optional<u32> {
-            for (usize i = std::min(vranges.size(), addrs.size()); i-- > 0;)
-                if (addrs[i] && a >= vranges[i].first && a - vranges[i].first < vranges[i].second)
-                    return static_cast<u32>(addrs[i] + (a - vranges[i].first));
-            return std::nullopt;
-        };
-        for (const recomp::PlacedSegment& seg : placed->segments) {
-            if (!seg.addr) continue;
-            image.add_segment({seg.addr, std::vector<u8>(seg.bytes.begin(), seg.bytes.begin() + seg.memsz), seg.executable});
-            if (seg.executable)
-                checks += std::format("M {} {:x} {:x} {}\n", key, seg.addr, seg.memsz,
-                    recomp::to_hex(recomp::Sha256::hash(std::span<const u8>(seg.bytes.data(), seg.memsz))));
-        }
-        // Seeds: every exported function's descriptor (module_start and the rest too), read where the loader puts it,
-        // relocated; and the module's descriptor table.
-        const auto descriptor = [&](u32 at) -> std::optional<std::pair<u32, u32>> {
-            const auto p = place_of(at);
-            if (!p) return std::nullopt;
-            for (const recomp::PlacedSegment& seg : placed->segments)
-                if (seg.addr && *p >= seg.addr && *p + 8 <= seg.addr + seg.memsz)
-                    return std::pair{ps_ld32(seg.bytes.data() + (*p - seg.addr)), ps_ld32(seg.bytes.data() + (*p - seg.addr) + 4)};
-            return std::nullopt;
-        };
-        for (const recomp::ExportedLibrary& lib : info->exports) {
-            if (lib.skipped) continue;
-            for (const recomp::ExportedFunction& f : lib.functions)
-                if (const auto d = descriptor(f.descriptor))
-                    seeds.push_back({d->first, d->second, std::format("{}:{}::{:08x}", key, lib.name, f.nid)});
-        }
-        if (info->opd.size >= 8)
-            if (const auto start = place_of(info->opd.start))
-                for (const recomp::ppu::Seed& s : recomp::ppu::seeds_from_opd(image, *start, info->opd.size))
-                    seeds.push_back(s);
+        const auto placed = detail::add_placed_module(key, *elf, m.elf_bytes, addrs, image, seeds, checks);
+        if (!placed) continue;
         const bool save = spu_modules.contains(kAllModules) || spu_modules.contains(key);
         if (save_spu_images(*placed, key, spu_images, save, spu)) {
             carriers.insert(key);

@@ -5169,6 +5169,44 @@ ppu::prx_dispatch_enable appended a range each time, and a full range table stop
 unloaded and loaded again at its slot (D-238) would have filled it. A range inside one enabled already is now left as
 it is. Test: tests/ppu/test_dispatch.cpp (2,000 enables of one range and one of its parts: one range).
 
+## D-238 · 2026-10-08 · A game's own PRX modules are translated at fixed slots
+
+A game's own modules (the PRX files it loads with sys_prx_load_module, D-159) went to main memory, wherever there was
+room, and ran under the interpreter in every session: translated code is tied to the addresses it was lifted at. Now
+(docs/plan-game-modules.md, commits 6 to 10, from a design workflow):
+
+- **Identity:** recomp::prx_identity, the SHA-256 of a module's ELF header, program header table and each program
+  header's file bytes: the same for the module from its debug SELF or read by offset from an archive (what follows it
+  is not hashed), different for any changed code or data byte.
+- **Slots:** recomp::game_module_layout gives each module one block (its PT_LOADs at 64 KB boundaries) from the top of
+  the PRX region (0x40000000) down, never below a floor (prepare::kGameModuleFloor, 128 MB into the region: the
+  firmware's layout ends near 46 MB) and never moved once given: a later preparation appends below. A module that does
+  not fit gets no slot and runs from main memory, interpreted.
+- **At run time** (RuntimeModules, loader::GameModules): a module whose identity has a slot in the game's modules
+  library is placed there; between placing and linking its code segments are compared with what was translated
+  (modules.txt); its translation is enabled only on a match with no instruction patched by linking (reference
+  tables, now watched: WatchRefs). Refused when the slot is taken (the same module loaded twice), when the firmware's
+  layout has grown into it, or for any mismatch: logged, interpreted. A module with no translation is saved once into
+  a capture folder (<identity>.elf, the decrypted ELF without what followed it, and where it came from).
+- **Preparing** (prepare::prepare_game_modules): the saved modules laid out (an earlier layout for the same executable
+  kept), placed, translated together as the system library's modules are (their exports and descriptor tables as
+  seeds; the placing and seeding code now shared with the system library: detail::add_placed_module, its output
+  unchanged), their SPU programs found in their segments (D-191), and made into game_dir/modules/game.dylib by
+  prepare_game's compile, link and sign steps; identity.txt (the layout: executable, floor, each module's identity,
+  slot and source) is what the library holds the SHA-256 of. game_modules_are_current: made for this executable, slots
+  above the floor, every saved module in it ("none" when the game saved none).
+- **Wiring:** pspocket-boot --prx-dump DIR and --modules-library DIR|none (default: beside --game-library);
+  pspocket-prepare --modules DIR [--flash DEV_FLASH]; the app saves modules into the game's coverage folder, prepares
+  them after the game's library, and loads the modules library before the game runs.
+- Not yet: a module whose reference tables patch its code stays interpreted (no local game needs it: GTA V's and
+  Assassin's Creed's imports have none, docs/plan-game-modules.md fact 7); a newly saved module recompiles every module
+  of the game (modules are few and small); NPDRM modules need a PSN game's licence. GTA V and Assassin's Creed load no
+  module of their own: unchanged (the gate passes).
+- Tests: tests/common/test_prx_place.cpp (identity, layout, text); tests/game/test_system_library.cpp (a synthetic game
+  module saved in a first session, interpreted; prepared; at its slot in the next session, module_start and its SPU
+  program translated with the interpreter's result; loaded twice, the second copy interpreted; a changed byte, another
+  module, saved; prepared again, the first module's slot kept).
+
 ## Open decisions (plan section 14)
 
 - [x] Licence → D-001.

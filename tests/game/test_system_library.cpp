@@ -21,11 +21,15 @@
 
 #include "hle_test_util.hpp"
 #include "pspocket/core/be.h"
+#include "pspocket/core/memory_map.h"
+#include "pspocket/loader/game_modules.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/system.hpp"
 #include "pspocket/ppu/prx_dispatch.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/prepare/modules.hpp"
 #include "pspocket/prepare/system.hpp"
+#include "pspocket/recomp/prx_place.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 #include "pspocket/recomp/spu/asm.hpp"
 #include "pspocket/spu/context.h"
@@ -251,5 +255,273 @@ TEST_CASE("system library: a firmware module translated once runs translated whe
     CHECK_FALSE(prepare::system_library_is_current(dir.string(), lle.identity_text(), &why));
     CHECK(why.find("preparing it again") != std::string::npos);
     ps_ppu_dispatch_clear();
+    fs::remove_all(root);
+}
+
+namespace {
+
+prepare::Toolchain mac_toolchain()
+{
+    prepare::Toolchain t;
+    t.resource_dir = PSPOCKET_CODEGEN_RESOURCE_DIR;
+    t.sysroot = PSPOCKET_CODEGEN_SYSROOT;
+    t.include_dirs = {PSPOCKET_SOURCE_DIR "/runtime/ppu/include", PSPOCKET_SOURCE_DIR "/runtime/spu/include",
+        PSPOCKET_SOURCE_DIR "/runtime/core/include", PSPOCKET_SOURCE_DIR "/runtime/game/include"};
+    t.entry_source = PSPOCKET_GAME_LIBRARY_ENTRY_SOURCE;
+    t.target = "arm64-apple-macos13.0";
+    t.cpu = "native";
+    t.platform = "macos";
+    t.min_os = "13.0";
+    return t;
+}
+
+// The game's module loaded from /app_home as sys_prx_load_module loads it: the module, or null.
+const loader::PrxModule* load_game_module(loader::RuntimeModules& modules, std::string_view path)
+{
+    u32 id = 0;
+    if (modules.load(path, &id) != 0) return nullptr;
+    return modules.module(id);
+}
+
+// Its module_start called: whether any call went to the interpreter, and its marker.
+bool start_runs_translated(hle::test::Fixture& f, const loader::PrxModule& m)
+{
+    u8* base = f.base();
+    ps_write32(base, kMarker, 0);
+    PPUContext ctx;
+    ps_ppu_context_init(&ctx);
+    ctx.gpr[1] = hle::test::kStacks + 0x10000 - 0x100;
+    ctx.gpr[2] = ps_read32(base, m.start + 4);
+    ctx.lr = 0x00000100;
+    const u64 misses = ps_ppu_dispatch_miss_count();
+    ps_ppu_call_indirect(&ctx, base, ps_read32(base, m.start));
+    CHECK(ps_read32(base, kMarker) == 0x77); // as the interpreter runs it (CLAUDE.md rule 3)
+    return ps_ppu_dispatch_miss_count() == misses;
+}
+
+} // namespace
+
+TEST_CASE("game modules: a module the game loads is saved, translated at its slot, and runs translated next time "
+          "(D-238)")
+{
+    const fs::path root = fs::temp_directory_path() / std::format("pspocket-game-modules-{}", getpid());
+    fs::remove_all(root);
+    const fs::path usrdir = root / "usrdir", saved = root / "prx", dir = root / "modules";
+    fs::create_directories(usrdir);
+    const std::vector<u8> self = module_bytes("synthLib", 0xDEADBEEF, kMarker);
+    std::ofstream(usrdir / "libgame.sprx", std::ios::binary)
+        .write(reinterpret_cast<const char*>(self.data()), static_cast<std::streamsize>(self.size()));
+    const std::string exe_sha(64, 'e');
+    const std::string path = "/app_home/libgame.sprx";
+    ps_ppu_dispatch_clear();
+    const ps_ppu_miss_policy policy = ps_ppu_get_miss_policy();
+    ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
+
+    // Session 1: nothing translated. The module goes to main memory, runs under the interpreter and is saved once.
+    {
+        hle::test::Fixture f;
+        REQUIRE(f.kernel->vfs_mount("/app_home", usrdir.string(), true));
+        loader::RuntimeModules modules(*f.hle, nullptr, nullptr);
+        modules.set_capture_dir(saved.string());
+        const loader::PrxModule* m = load_game_module(modules, path);
+        REQUIRE(m);
+        CHECK_FALSE(ppu::in_prx_region(m->segments[0].first));
+        CHECK(m->identity.size() == 64);
+        CHECK(fs::exists(saved / (m->identity + ".elf")));
+        CHECK_FALSE(start_runs_translated(f, *m));
+        REQUIRE(load_game_module(modules, path));
+        size_t files = 0;
+        for ([[maybe_unused]] const auto& e : fs::directory_iterator(saved)) files++;
+        CHECK(files == 2); // its .elf and .txt, once
+    }
+    std::string why;
+    CHECK_FALSE(prepare::game_modules_are_current(dir.string(), exe_sha, {saved.string()}, PS_MEM_PRX_BASE, &why));
+
+    // Prepared: a slot at the top of the PRX region, its code and its SPU program translated.
+    prepare::ModulesOptions o;
+    o.inputs = {saved.string()};
+    o.title_id = "TEST00000";
+    o.executable_sha256 = exe_sha;
+    o.floor = PS_MEM_PRX_BASE;
+    o.dir = dir.string();
+    o.toolchain = mac_toolchain();
+    const prepare::ModulesResult r = prepare::prepare_game_modules(o);
+    INFO(r.library.error);
+    REQUIRE(r.library.ok);
+    CHECK(r.modules == 1);
+    CHECK(r.without_slot == 0);
+    CHECK(prepare::game_modules_are_current(dir.string(), exe_sha, {saved.string()}, PS_MEM_PRX_BASE, &why));
+    CHECK_FALSE(prepare::game_modules_are_current(dir.string(), std::string(64, 'f'), {saved.string()}, PS_MEM_PRX_BASE,
+        &why)); // another executable
+    CHECK_FALSE(prepare::game_modules_are_current(dir.string(), exe_sha, {saved.string()}, 0x3FFF0000, &why));
+
+    // Session 2: placed at its slot, checked before linking, its module_start and its SPU program run translated.
+    {
+        hle::test::Fixture f;
+        REQUIRE(f.kernel->vfs_mount("/app_home", usrdir.string(), true));
+        loader::RuntimeModules modules(*f.hle, nullptr, nullptr);
+        modules.set_capture_dir(saved.string());
+        auto library = loader::GameModules::load(dir.string(), exe_sha, modules, nullptr, f.mem, &why);
+        INFO(why);
+        REQUIRE(library);
+        CHECK(loader::GameModules::load(dir.string(), std::string(64, 'f'), modules, nullptr, f.mem, &why) == nullptr);
+        modules.set_game_translations(library.get());
+        const loader::PrxModule* m = load_game_module(modules, path);
+        REQUIRE(m);
+        CHECK(ppu::in_prx_region(m->segments[0].first));
+        CHECK(m->segments[0].first >= 0x3FF00000);
+        CHECK(library->modules_translated() == 1);
+        CHECK(start_runs_translated(f, *m));
+        const u32 elf = m->segments[1].first + test::kPrxExtraData;
+        const SpuRun main = run_spu(f.base(), elf + kSpuMain, 0x3100);
+        REQUIRE(main.program);
+        CHECK(main.no_miss);
+        CHECK(main.r3 == 6);
+
+        // Loaded again while it is still loaded: not at its slot (taken), interpreted.
+        const loader::PrxModule* again = load_game_module(modules, path);
+        REQUIRE(again);
+        CHECK_FALSE(ppu::in_prx_region(again->segments[0].first));
+        CHECK(library->modules_translated() == 1);
+    }
+
+    // A module with one changed byte is another module: main memory, interpreted, saved for the next preparation.
+    {
+        std::vector<u8> changed = self;
+        changed[changed.size() - 1] ^= 1; // its data (the SPU program's last word)
+        std::ofstream(usrdir / "libgame2.sprx", std::ios::binary)
+            .write(reinterpret_cast<const char*>(changed.data()), static_cast<std::streamsize>(changed.size()));
+        hle::test::Fixture f;
+        REQUIRE(f.kernel->vfs_mount("/app_home", usrdir.string(), true));
+        loader::RuntimeModules modules(*f.hle, nullptr, nullptr);
+        modules.set_capture_dir(saved.string());
+        auto library = loader::GameModules::load(dir.string(), exe_sha, modules, nullptr, f.mem, &why);
+        REQUIRE(library);
+        const loader::PrxModule* m = load_game_module(modules, "/app_home/libgame2.sprx");
+        REQUIRE(m);
+        CHECK_FALSE(ppu::in_prx_region(m->segments[0].first));
+        CHECK(library->modules_translated() == 0);
+        CHECK(fs::exists(saved / (m->identity + ".elf")));
+        CHECK_FALSE(prepare::game_modules_are_current(dir.string(), exe_sha, {saved.string()}, PS_MEM_PRX_BASE, &why));
+        CHECK(why.find("1 of its modules to translate") != std::string::npos);
+    }
+    // Prepared again: the first module keeps its slot, the second gets one below it.
+    const std::string before = [&] {
+        std::ifstream in(dir / "identity.txt");
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }();
+    const auto first = recomp::parse_game_module_layout(before);
+    REQUIRE(first);
+    REQUIRE(first->modules.size() == 1);
+    const prepare::ModulesResult again = prepare::prepare_game_modules(o);
+    REQUIRE(again.library.ok);
+    CHECK(again.modules == 2);
+    std::ifstream in(dir / "identity.txt");
+    const auto second = recomp::parse_game_module_layout(
+        std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()));
+    REQUIRE(second);
+    REQUIRE(second->modules.size() == 2);
+    REQUIRE(second->find(first->modules[0].identity));
+    CHECK(second->find(first->modules[0].identity)->addrs == first->modules[0].addrs);
+    CHECK(second->lowest() < first->lowest());
+
+    ps_ppu_set_miss_policy(policy);
+    ps_ppu_dispatch_clear();
+    fs::remove_all(root);
+}
+
+namespace {
+
+// A modules library as RuntimeModules sees it: one slot for every module, and the answers the test sets.
+struct StandIn final : loader::GameModuleTranslations {
+    std::vector<u32> addrs;
+    bool code_matches = true;
+    std::set<std::string, std::less<>> on;
+    std::vector<u32> slot(std::string_view) const override { return addrs; }
+    bool matches(std::string_view, const loader::PrxModule&) const override { return code_matches; }
+    void enable(std::string_view identity, const loader::PrxModule&) override { on.emplace(identity); }
+    bool enabled(std::string_view identity) const override { return on.contains(identity); }
+};
+
+} // namespace
+
+TEST_CASE("game modules: a copy that is not what runs translated at its slot goes to main memory (D-238)")
+{
+    // Review finding: an enabled range is never turned off, so a later copy at the slot that linking patched (or that
+    // differs) would have run the earlier copy's translation.
+    const fs::path root = fs::temp_directory_path() / std::format("pspocket-game-modules-reload-{}", getpid());
+    fs::remove_all(root);
+    fs::create_directories(root / "usrdir");
+    const std::vector<u8> self = module_bytes("synthLib", 0xDEADBEEF, kMarker);
+    std::ofstream(root / "usrdir" / "libgame.sprx", std::ios::binary)
+        .write(reinterpret_cast<const char*>(self.data()), static_cast<std::streamsize>(self.size()));
+    hle::test::Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/app_home", (root / "usrdir").string(), true));
+    loader::RuntimeModules modules(*f.hle, nullptr, nullptr);
+    StandIn translations;
+    translations.addrs = {0x3FFE0000, 0x3FFF0000};
+    modules.set_game_translations(&translations);
+    u32 id = 0;
+    REQUIRE(modules.load("/app_home/libgame.sprx", &id) == 0);
+    const loader::PrxModule* first = modules.module(id);
+    REQUIRE(first);
+    CHECK(first->segments[0].first == 0x3FFE0000);
+    CHECK(translations.on.size() == 1);
+    REQUIRE(modules.unload(id) == 0);
+    // Loaded again, and this time its code is not the translation's: not at the slot.
+    translations.code_matches = false;
+    REQUIRE(modules.load("/app_home/libgame.sprx", &id) == 0);
+    const loader::PrxModule* second = modules.module(id);
+    REQUIRE(second);
+    CHECK_FALSE(ppu::in_prx_region(second->segments[0].first));
+    // A module whose translation never ran stays at its slot, interpreted (nothing of it is enabled).
+    translations.on.clear();
+    REQUIRE(modules.unload(id) == 0);
+    REQUIRE(modules.load("/app_home/libgame.sprx", &id) == 0);
+    CHECK(modules.module(id)->segments[0].first == 0x3FFE0000);
+    modules.set_game_translations(nullptr);
+    fs::remove_all(root);
+}
+
+TEST_CASE("game modules: a failed preparation leaves them interpreted without preparing the game on every start "
+          "(D-238)")
+{
+    // Review finding: the app's check asked for the modules library every time, so a preparation that kept failing
+    // made every start prepare the whole game again.
+    const fs::path root = fs::temp_directory_path() / std::format("pspocket-game-modules-failed-{}", getpid());
+    fs::remove_all(root);
+    const fs::path saved = root / "prx", dir = root / "modules";
+    fs::create_directories(saved);
+    // A saved module whose code segment claims more bytes in the file than in memory: it cannot be placed.
+    const auto prx = test::build_ppu_prx();
+    std::vector<u8> bad = prx.bytes;
+    auto elf = recomp::ElfFile::parse(bad);
+    REQUIRE(elf);
+    const u64 phoff = elf->header().phoff;
+    ps_st64(bad.data() + phoff + 0x20, ps_ld64(bad.data() + phoff + 0x28) + 0x1000); // p_filesz > p_memsz
+    auto parsed = recomp::ElfFile::parse(bad);
+    REQUIRE(parsed);
+    const std::string identity = recomp::prx_identity(*parsed);
+    std::ofstream(saved / (identity + ".elf"), std::ios::binary)
+        .write(reinterpret_cast<const char*>(bad.data()), static_cast<std::streamsize>(bad.size()));
+    const std::string exe_sha(64, 'e');
+    std::string why;
+    CHECK_FALSE(prepare::game_modules_are_current(dir.string(), exe_sha, {saved.string()}, prepare::kGameModuleFloor,
+        &why));
+    prepare::ModulesOptions o;
+    o.inputs = {saved.string()};
+    o.title_id = "TEST00000";
+    o.executable_sha256 = exe_sha;
+    o.dir = dir.string();
+    o.toolchain = mac_toolchain();
+    CHECK_FALSE(prepare::prepare_game_modules(o).library.ok);
+    CHECK(prepare::game_modules_are_current(dir.string(), exe_sha, {saved.string()}, prepare::kGameModuleFloor, &why));
+    CHECK(why.find("stay interpreted") != std::string::npos);
+    // Another executable, or another module saved since: tried again.
+    CHECK_FALSE(prepare::game_modules_are_current(dir.string(), std::string(64, 'f'), {saved.string()},
+        prepare::kGameModuleFloor, &why));
+    std::ofstream(saved / (std::string(64, 'a') + ".elf")) << "x";
+    CHECK_FALSE(prepare::game_modules_are_current(dir.string(), exe_sha, {saved.string()}, prepare::kGameModuleFloor,
+        &why));
     fs::remove_all(root);
 }

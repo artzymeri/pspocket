@@ -3,7 +3,8 @@
 if(NOT TARGET pspocket_codegen)
     return()
 endif()
-add_library(pspocket_prepare STATIC src/prepare.cpp src/jobs.cpp src/session.cpp src/spu.cpp src/spu_static.cpp src/system.cpp)
+add_library(pspocket_prepare STATIC src/prepare.cpp src/jobs.cpp src/modules.cpp src/module_translate.cpp src/session.cpp src/spu.cpp
+    src/spu_static.cpp src/system.cpp)
 target_include_directories(pspocket_prepare PUBLIC include)
 target_link_libraries(pspocket_prepare PUBLIC pspocket::codesign
     PRIVATE pspocket::codegen pspocket::game pspocket::recomp_ppu pspocket::recomp_spu pspocket::recomp_common)
@@ -15,7 +16,8 @@ add_library(pspocket::prepare ALIAS pspocket_prepare)
 if(NOT IOS)
     add_executable(pspocket-prepare tools/pspocket_prepare.cpp)
     # The loader: which firmware modules a game links (--for, D-191).
-    target_link_libraries(pspocket-prepare PRIVATE pspocket::prepare pspocket::codegen pspocket::game pspocket::loader)
+    target_link_libraries(pspocket-prepare PRIVATE pspocket::prepare pspocket::codegen pspocket::game pspocket::loader
+        pspocket::disc)
     target_compile_definitions(pspocket-prepare PRIVATE PSPOCKET_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     # CMake repeats static libraries that other static libraries need; Apple's linker warns about the repeats.
     target_link_options(pspocket-prepare PRIVATE -Wl,-no_warn_duplicate_libraries)
