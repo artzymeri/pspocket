@@ -5,6 +5,8 @@
 
 #include "hle_test_util.hpp"
 
+#include "guest.hpp"
+
 #include <atomic>
 #include <cstring>
 #include <initializer_list>
@@ -286,10 +288,11 @@ TEST_CASE("cellFiber: autoCheckFlags; a waiting fiber keeps the scheduler busy; 
     const u32 flag = out(10);
     ps_write32(e.b, flag, 0);
     REQUIRE(e.create(kSched, 0, e.script({{CALL, wait_flag, flag, 1}, {LOG, 0x41}, {END, 0}}), 0) == 0);
-    // With autoCheckFlags, RunFibers waits for the flag (set from another host thread here).
+    // With autoCheckFlags, RunFibers waits for the flag (set from another host thread here, atomically as a PPU word
+    // store is: a ThreadSanitizer build checks that the scheduler's reads are too, D-571).
     std::thread setter([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        ps_write32(e.b, flag, 1);
+        hle::atomic_store_be32(e.b, flag, 1);
     });
     REQUIRE(e.g.call("cellFiberPpuRunFibers", kSched) == 0);
     setter.join();

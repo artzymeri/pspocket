@@ -294,13 +294,14 @@ bool has_ready(const Scheduler& s)
     return false;
 }
 
-// The fibers waiting on a flag whose flag has the value they wait for become ready. Under lib.m.
+// The fibers waiting on a flag whose flag has the value they wait for become ready. Under lib.m. Other PPU threads
+// or SPUs set the flags without the lock, so the words are read atomically (D-571).
 u32 check_flags(Lib& l, Scheduler& s)
 {
     u32 woken = 0;
     for (Coroutine* f : s.fibers) {
         if (f->state != State::WaitFlag) continue;
-        if ((ps_read32(l.base, f->flag_addr) != 0) == f->flag_value) {
+        if ((atomic_load_be32(l.base, f->flag_addr) != 0) == f->flag_value) {
             make_ready(*f);
             woken++;
         }
@@ -758,7 +759,7 @@ s32 cellFiberPpuWaitFlag(PPUContext& ctx, u32 flag, u32 value)
     Coroutine* f = current_fiber();
     if (!f) return error(CELL_FIBER_ERROR_PERM);
     const bool want = (value & 0xFF) != 0;
-    if ((ps_read32(guest_base(ctx), flag) != 0) == want) return lv2::CELL_OK;
+    if ((atomic_load_be32(guest_base(ctx), flag) != 0) == want) return lv2::CELL_OK;
     f->state = State::WaitFlag;
     f->flag_addr = flag;
     f->flag_value = want;
