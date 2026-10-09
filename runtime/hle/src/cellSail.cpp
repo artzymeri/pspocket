@@ -455,12 +455,14 @@ u64 sail_minus_one(PPUContext&) { return ~u64{0}; }
 void register_cellSailPlayer(Registry& r);
 void register_cellSailDescriptor(Registry& r);
 void register_cellSailAdapters(Registry& r);
+void register_cellSailControl(Registry& r);
 
 void register_cellSail(Registry& r)
 {
     register_cellSailPlayer(r);
     register_cellSailDescriptor(r);
     register_cellSailAdapters(r);
+    register_cellSailControl(r);
 #define SAIL(f) ::pspocket::hle::Function{{}, #f, recomp::nid_of(#f), &detail::thunk<&f>, false}
 #define SAIL_MINUS_ONE(nid) ::pspocket::hle::Function{{}, "cellSail_" #nid, 0x##nid, &detail::thunk<&sail_minus_one>, false}
     r.add("cellSail", {

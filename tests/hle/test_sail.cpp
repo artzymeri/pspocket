@@ -8,9 +8,14 @@
 #include <cstring>
 #include <array>
 #include <format>
+#include <algorithm>
+#include <chrono>
 #include <functional>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "firmware_compare.hpp"
@@ -41,8 +46,12 @@ void callback_code(u8* b, u32 at)
     ps_write32(b, at + 0xF4, 0);
 }
 
+// The lv2 calls of the script's thread in order; each other thread's (the player's control thread, SPURS's) apart.
 struct Trace {
+    std::mutex m;
+    std::thread::id main;
     std::vector<std::string> calls;
+    std::map<u32, std::vector<std::string>> others; // by lv2 thread ID (host threads are reused)
 };
 
 // libsail's mutex and condition calls with their arguments (the attributes by their words, not their stack address).
@@ -62,7 +71,11 @@ void observe(void* user, u32 n, const u64* a)
     case 101: case 104: case 106: case 108: s = std::format("{}({:#x})", n, a[0]); break;
     default: return;
     }
-    static_cast<Trace*>(user)->calls.push_back(s);
+    Trace& tr = *static_cast<Trace*>(user);
+    const std::lock_guard lock(tr.m);
+    if (std::this_thread::get_id() == tr.main) tr.calls.push_back(s);
+    else if (const lv2::PpuThread* th = lv2::current_thread()) tr.others[th->id].push_back(s);
+    else tr.others[0].push_back(s);
 }
 
 struct Run {
@@ -77,6 +90,7 @@ void part2(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part3(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part4(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part5(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part6(u8* b, const Call& call, u32 cb, GuestThread& t);
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
 Run run(const std::string& flash, bool sony, int part)
@@ -92,6 +106,7 @@ Run run(const std::string& flash, bool sony, int part)
     Run r;
     Trace tr;
     g_base = b;
+    tr.main = std::this_thread::get_id();
     f.kernel->set_syscall_observer(&observe, &tr);
     const auto call = [&](const char* name, std::initializer_list<u64> args, bool is_void = false) {
         u64 v;
@@ -121,11 +136,21 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 2) part2(b, call, cb, t);
     else if (part == 3) part3(b, call, cb, t);
     else if (part == 4) part4(b, call, cb, t);
-    else part5(b, call, cb, t);
+    else if (part == 5) part5(b, call, cb, t);
+    else part6(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
     r.calls = tr.calls;
+    // The other threads' calls, each thread's in order, the threads in no order.
+    std::vector<std::string> others;
+    for (const auto& [id, calls] : tr.others) {
+        std::string all = "thread:";
+        for (const std::string& c : calls) all += " " + c;
+        others.push_back(all);
+    }
+    std::sort(others.begin(), others.end());
+    r.calls.insert(r.calls.end(), others.begin(), others.end());
     return r;
 }
 
@@ -648,6 +673,70 @@ void compare_lines(const char* what, const std::vector<std::string>& mine, const
     CHECK(differ == 0);
 }
 
+// Boot and Finalize of a player without streams: the control thread's set-up (SPURS of its own, or the game's), its
+// events, its message loop and its end.
+void part6(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kAttr2 = kArea + 0x1340, kRes = kArea + 0x1380,
+                  kKeep = kArea + 0x1900;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    const auto mask_player = [&](u32 p) {
+        const u32 src = ps_read32(b, p + 0x3B0);
+        if (src >= kArea && src < kArea + 0x3000) {
+            g_mask.push_back({src + 0x48, 0x38});
+            g_mask.push_back({src + 0x100, 0x38});
+        }
+        g_mask.push_back({p + 0x3C8, 16}); // the control thread's stack: its frame, and the deepest its handler went
+    };
+    // Waits until the handler has recorded `n` calls (the control thread makes them).
+    const auto wait_records = [&](u32 n) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (ps_read32(b, kRecords) < n && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(ps_read32(b, kRecords) == n);
+    };
+
+    // A stream without its renderer: Boot refuses.
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x11, 1, 0, 0, 0});
+    call("cellSailPlayerBoot", {kP, 0x1234});
+    call("cellSailPlayerFinalize", {kP});
+    call("cellSailPlayerBoot", {kP, 0x1234});
+
+    // No streams: the player's own SPURS. The events of a state change (3) and a call completed (2) subscribed to.
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 0, 0, 0, 0});
+    call("cellSailPlayerSubscribeEvent", {kP, 3, 0});
+    call("cellSailPlayerSubscribeEvent", {kP, 2, 0});
+    call("cellSailPlayerBoot", {kP, 0x123456789ull});
+    wait_records(2);
+    for (u32 i = 0; i < 2; i++) g_mask.push_back({kRecords + 16 + 48 * i + 32, 8}); // r7: past the handler's 4 arguments
+    call("cellSailPlayerBoot", {kP, 1});
+    call("cellSailPlayerGetDescriptorCount", {kP});
+    call("cellSailPlayerFinalize", {kP});
+    mask_player(kP);
+    std::memcpy(b + kKeep, b + kP, 0x400);
+    g_mask.push_back({kKeep + 0x3C8, 16});
+
+    // The game's SPURS (never used without streams), and no events subscribed to.
+    ps_write32(b, kRes, 0x00ABCDEF);
+    for (u32 i = 1; i < 4; i++) ps_write32(b, kRes + 4 * i, 0);
+    for (u32 i = 0; i < 8; i++) ps_write32(b, kAttr2 + 4 * i, 0);
+    ps_write32(b, kAttr2, 3);
+    ps_write32(b, kAttr2 + 16, 4);
+    call("cellSailPlayerInitialize2", {kP, kMem, cb, 0x33, kAttr2, kRes});
+    call("cellSailPlayerBoot", {kP, 0x55});
+    // Nothing to wait for: the state is 2 once the thread has set up.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (b[kP + 0x163] != 2 && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(b[kP + 0x163] == 2);
+    call("cellSailPlayerFinalize", {kP});
+    mask_player(kP);
+}
+
 } // namespace
 
 void compare_runs(int part)
@@ -674,3 +763,8 @@ TEST_CASE("cellSail against libsail: descriptors' fields and capabilities", "[hl
 TEST_CASE("cellSail against libsail: the adapters' set-up, formats and AV sync", "[hle][lle][sail]") { compare_runs(4); }
 
 TEST_CASE("cellSail against libsail: every player parameter set and read", "[hle][lle][sail]") { compare_runs(5); }
+
+TEST_CASE("cellSail against libsail: Boot and Finalize of a player without streams", "[hle][lle][sail]")
+{
+    compare_runs(6);
+}

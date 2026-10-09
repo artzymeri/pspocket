@@ -7143,6 +7143,24 @@ structure of two bounded fields or clears the stream's settings), and parameter 
 set with six values and read back at three indices: 2596 checks over the five scripts, 0 differences (parameter
 33's copy of libsail's own calls masked: each side's code).
 
+Part 6, Boot and the control thread (runtime/hle/src/cellSailControl.cpp): Boot (state 0, every stream with its
+renderer, adapter or AU receiver, else INVALID_STATE) keeps the game's argument, sets state 1 and starts
+"_libsail-control" with the player's priority and stack. The thread records its frame (+0x3C8), marks Boot running
+(+0x250), takes the player's lock, makes SPURS of its own when the game gave none (4 KB from the game's allocator,
+revision 2, SDK 0x330000, the player's SPU count, priorities and exit flag, "_libsail" its prefix), sets up the dmux
+pipeline (+0x300), sets state 2 and sends the events libsail sends (state changed to 2 when subscribed; Boot
+completed with its argument when subscribed), signals +0x24C and releases the lock, then runs the message loop:
++0x19C 200 while it waits, the queue taken under its mutex with 3 s waits on its condition, the message dispatched by
+its code's low 16 bits (a completion, code 0, by its handle's). Stop (0xD1, Finalize's) ends the loop; the thread takes
+the lock again, puts the player's descriptors back to open, closes the dmux pipeline (state 0xC), releases the lock,
+finalizes and frees its own SPURS, sets state 10 and exits. A failure in set-up sends state 9 and Boot completed with
+the error. The event handler gets a stack depth record (+0x3D0) as libsail keeps it. Players with streams, descriptors
+and every other message stop the process with what was asked (later parts). Compared with libsail: a stream without
+its renderer refused, a player without streams booted on its own SPURS with events subscribed, booted again (refused),
+finalized; one on the game's SPURS without events: the answers, both control threads' lv2 calls (each thread's in
+order, keyed by lv2 thread ID: the host reuses threads), the handler's records and the players, 0 differences over 2629
+checks in the six scripts (+0x3C8/+0x3D0 masked: stack addresses; the handler's r7: past its four arguments).
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)
