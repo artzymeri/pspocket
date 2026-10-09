@@ -8437,3 +8437,13 @@ Two lv2 findings of the ThreadSanitizer sweep (D-585).
 Test: tests/lv2/test_threads.cpp, "a thread's stack is released before a join can return" (200 workers, each joined
 the moment it is marked finished: with the old order 194 to 198 of them returned with the stack committed);
 tests/lv2/test_rsxaudio.cpp under ThreadSanitizer.
+
+## D-587 · 2026-10-09 · The words the RSX and the native SPURS kernel share with other threads, atomic and ordered
+
+What the ThreadSanitizer sweep (D-585) found where two of pspocket's own host paths share guest words.
+- The RSX wrote the words a CPU waits on with plain stores: labels and semaphores (NV406E and NV4097 releases), the
+  ref register and get. A CPU that sees a label then reads what the RSX wrote before it (a report, a copy's or a
+  writeback's bytes), and ARM keeps two stores in order only for a release. They are now release stores
+  (Rsx::write32_release; the offsets are checked aligned), the writing side of D-077's acquire loads of put and the FIFO.
+  cellGcmSys already published put with release order and read get with acquire order; with get a release store its
+  wait for the RSX to leave a segment orders what it overwrites after what the RSX read.

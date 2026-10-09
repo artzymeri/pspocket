@@ -225,6 +225,12 @@ private:
         return ps_bswap32(__atomic_load_n(reinterpret_cast<const u32*>(mem_.base() + ea), __ATOMIC_ACQUIRE));
     }
     void write32(u32 ea, u32 v) { ps_write32(mem_.base(), ea, v); }
+    // A word the CPU waits on (a label or semaphore, ref, get; aligned): a release store, so a CPU that sees it also
+    // sees what the RSX wrote before it, a report or a copy (D-587; the reading side of D-077).
+    void write32_release(u32 ea, u32 v)
+    {
+        __atomic_store_n(reinterpret_cast<u32*>(mem_.base() + ea), ps_bswap32(v), __ATOMIC_RELEASE);
+    }
     // The RSX's own label writes queued behind a deferred readback (D-107), oldest first: its semaphore acquires see
     // them at once, as its pipeline would (the CPU sees them land in order).
     std::deque<std::pair<u32, u32>> queued_labels_;

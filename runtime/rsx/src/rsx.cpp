@@ -215,7 +215,7 @@ void Rsx::set_fifo_pointers(u32 get, u32 put)
         get_.load(std::memory_order_relaxed), read_put());
     pending_get_put_.store((u64{put} << 32) | get, std::memory_order_release);
     fifo_reset_.store(true, std::memory_order_release);
-    ps_write32(mem_.base(), config_.layout.get_addr(), get);
+    write32_release(config_.layout.get_addr(), get);
     __atomic_store_n(reinterpret_cast<u32*>(mem_.base() + config_.layout.put_addr()), ps_bswap32(put), __ATOMIC_RELEASE);
     if (thread_.joinable() && std::this_thread::get_id() != thread_.get_id()) {
         notify();
@@ -303,7 +303,7 @@ u32 Rsx::read_put() const
     return ps_bswap32(raw) & ~3u;
 }
 
-void Rsx::publish_get() { ps_write32(mem_.base(), config_.layout.get_addr(), get_.load(std::memory_order_relaxed)); }
+void Rsx::publish_get() { write32_release(config_.layout.get_addr(), get_.load(std::memory_order_relaxed)); }
 
 Rsx::Status Rsx::status() const
 {
