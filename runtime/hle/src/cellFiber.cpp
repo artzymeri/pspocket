@@ -359,6 +359,7 @@ void release(Lib& l, Coroutine& f)
     if (f.state != State::Exited || f.joiners || !f.host_done) return;
     auto& v = f.sched->fibers;
     v.erase(std::remove(v.begin(), v.end(), &f), v.end());
+    for (auto& q : f.sched->ready) q.erase(std::remove(q.begin(), q.end(), &f), q.end());
     l.coroutines.erase(f.addr);
 }
 
@@ -576,6 +577,7 @@ s32 create_fiber(PPUContext& ctx, Lib& l, Scheduler& s, u32 fiber, u32 entry, u6
             return error(CELL_FIBER_ERROR_BUSY);
         auto& v = old.sched->fibers;
         v.erase(std::remove(v.begin(), v.end(), &old), v.end());
+        for (auto& q : old.sched->ready) q.erase(std::remove(q.begin(), q.end(), &old), q.end());
         l.coroutines.erase(it);
     }
     auto f = std::make_unique<Coroutine>();
