@@ -309,7 +309,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-09: 5,627 of 6,625, 84.9%):
+firmware module. Done so far (2026-10-09: 5,641 of 6,625, 85.1%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -327,6 +327,7 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
 - **The C++ library, sys_libstdcxx, all 556 functions**: the foundation and the streams (D-560) and the facets (D-561:
   ctype, codecvt, collate, messages, numpunct, num_get/num_put, moneypunct, money_get/money_put, time_get/time_put),
   Dinkumware's of VC8's generation in the "C" locale. No Sony module to compare with (games link it into themselves).
+  The C library's thread-local storage too (D-570).
 - **Firmware first (D-563)**: libraries made from RPCS3 without Sony's module at hand are marked so that a game still
   gets Sony's module where the system software is installed, and pspocket's where it is not, until each is compared on
   the Mac: libmixer (the surround mixer over pspocket's cellAudio), cellVpost (D-564: YUV pictures scaled and converted
@@ -334,7 +335,7 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   cellFiber (D-568: fibers and contexts, each on a host thread that runs as its PPU thread while it holds the
   thread's baton).
 - cellGame's and cellPhotoImportUtil's working structures as their variables under RPCS3's names (D-567).
-Left (998, 2026-10-09): sys_libc and sys_libm's internals (278: Dinkumware's formatter and locale internals, TLS,
+Left (984, 2026-10-09): sys_libc and sys_libm's internals (264: Dinkumware's formatter and locale internals,
 setjmp/longjmp, the raw SPU printf family), cellSpursJq (63), cellSailRec (58), libsnd3 (50), cellRudp
 (31), the codec cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec, libdivx*,
 cell*dec's core ops), cellSail's playback (19), the encoders (cellJpgEnc, cellCelp*Enc), and the 188
