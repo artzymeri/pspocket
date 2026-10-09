@@ -590,34 +590,74 @@ void _pspocket_cellSail_control(PPUContext& ctx, u64 player)
             failed = false;
         }
         if (!failed) {
-            if (r32(ctx, p + pl::kAudioCount) || r32(ctx, p + pl::kVideoCount) || r32(ctx, p + pl::kUserCount)) {
-                log_call_site(ctx, gb(ctx), "cellSail: a player with streams: libsail's pipelines are a later part");
-                PS_FATAL(kChan, "libsail's stream pipelines are a later part of D-562");
-            }
+            const u32 na = r32(ctx, p + pl::kAudioCount), nv = r32(ctx, p + pl::kVideoCount),
+                      nu = r32(ctx, p + pl::kUserCount);
+            const auto audio = [&](u32 i) { return r32(ctx, p + pl::kAudio) + i * pl::kAudioStride; };
+            const auto video = [&](u32 i) { return r32(ctx, p + pl::kVideo) + i * pl::kVideoStride; };
+            const auto user = [&](u32 i) { return r32(ctx, p + pl::kUser) + i * pl::kUserStride; };
+            // The pipelines, then the renderers and the AU receivers: what failed undone, as libsail's set-up.
             dmux_init(ctx, p + pl::kDmux, p);
-            w8(ctx, p + pl::kState, 2);
-            notify_event(ctx, p, 3, 2, 0);
-            notify_completed(ctx, p, 1, 0);
-            sc(ctx, 108, {r32(ctx, p + pl::kLock + 4)});
-            unlock(ctx, p);
-            message_loop(ctx, p);
-            lock(ctx, p);
-            // The descriptors the player holds back to their open state, then freed.
-            for (const u32 at : {p + pl::kCurrentDescriptor, p + kNextDescriptor}) {
-                if (const u32 d = r32(ctx, at)) {
-                    const u8 st = r8(ctx, d + 0x38);
-                    if (st == 2) w8(ctx, d + 0x38, 0);
-                    else if (st >= 3 && st <= 5) w8(ctx, d + 0x38, 1);
+            u32 ia = 0, iv = 0;
+            r = lv2::CELL_OK;
+            while (r >= 0 && ia < na)
+                if ((r = audio_pipeline_init(ctx, audio(ia) + 0x80, p)) >= 0) ia++;
+            while (r >= 0 && iv < nv)
+                if ((r = video_pipeline_init(ctx, video(iv) + 0x80, p)) >= 0) iv++;
+            if (r < 0) {
+                for (u32 i = 0; i < iv; i++) video_pipeline_fini(ctx, video(i) + 0x80);
+                for (u32 i = 0; i < ia; i++) audio_pipeline_fini(ctx, audio(i) + 0x80);
+                dmux_fini(ctx, p + pl::kDmux);
+                failed = true;
+            } else {
+                u32 ra = 0, rv = 0, ru = 0;
+                while (r >= 0 && ra < na) {
+                    // A renderer of a stream in mode 1 is told so (+0x34 = 4) first.
+                    const u32 rd = r32(ctx, audio(ra) + 0x150);
+                    if (ps_read16(gb(ctx), audio(ra) + 0x156) == 1) w32(ctx, rd + 0x34, 4);
+                    if ((r = renderer_makeup(ctx, rd)) >= 0) ra++;
                 }
+                while (r >= 0 && rv < nv) {
+                    const u32 rd = r32(ctx, video(rv) + 0x180);
+                    if (ps_read16(gb(ctx), video(rv) + 0x186) == 1) w32(ctx, rd + 0x34, 4);
+                    if ((r = renderer_makeup(ctx, rd)) >= 0) rv++;
+                }
+                while (r >= 0 && ru < nu)
+                    if ((r = receiver_makeup(ctx, r32(ctx, user(ru) + 0x80), p, p + pl::kSync, ru)) >= 0) ru++;
+                if (r >= 0) {
+                    w8(ctx, p + pl::kState, 2);
+                    notify_event(ctx, p, 3, 2, 0);
+                    notify_completed(ctx, p, 1, 0);
+                    sc(ctx, 108, {r32(ctx, p + pl::kLock + 4)});
+                    unlock(ctx, p);
+                    message_loop(ctx, p);
+                    lock(ctx, p);
+                    for (u32 i = 0; i < rv; i++) video_pipeline_stop(ctx, video(i) + 0x80);
+                    for (u32 i = 0; i < ra; i++) audio_pipeline_stop(ctx, audio(i) + 0x80);
+                    // The descriptors the player holds back to their open state.
+                    for (const u32 at : {p + pl::kCurrentDescriptor, p + kNextDescriptor}) {
+                        if (const u32 d = r32(ctx, at)) {
+                            const u8 st = r8(ctx, d + 0x38);
+                            if (st == 2) w8(ctx, d + 0x38, 0);
+                            else if (st >= 3 && st <= 5) w8(ctx, d + 0x38, 1);
+                        }
+                    }
+                    w32(ctx, p + pl::kDescriptorCount, 0);
+                } else {
+                    failed = true;
+                }
+                for (u32 i = 0; i < ru; i++) receiver_cleanup(ctx, r32(ctx, user(i) + 0x80));
+                for (u32 i = 0; i < rv; i++) renderer_cleanup(ctx, r32(ctx, video(i) + 0x180));
+                for (u32 i = 0; i < ra; i++) renderer_cleanup(ctx, r32(ctx, audio(i) + 0x150));
+                for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) audio_pipeline_fini(ctx, audio(i) + 0x80);
+                for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) video_pipeline_fini(ctx, video(i) + 0x80);
+                dmux_fini(ctx, p + pl::kDmux);
+                for (u32 d = r32(ctx, p + kDescriptors); d;) {
+                    const u32 next = r32(ctx, d + ds::kNext);
+                    free_descriptor(ctx, p, d);
+                    d = next;
+                }
+                w32(ctx, p + kDescriptors, 0);
             }
-            w32(ctx, p + pl::kDescriptorCount, 0);
-            dmux_fini(ctx, p + pl::kDmux);
-            for (u32 d = r32(ctx, p + kDescriptors); d;) {
-                const u32 next = r32(ctx, d + ds::kNext);
-                free_descriptor(ctx, p, d);
-                d = next;
-            }
-            w32(ctx, p + kDescriptors, 0);
         }
         unlock(ctx, p);
         if (owned) {

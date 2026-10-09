@@ -98,6 +98,7 @@ void part5(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part6(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part7(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part8(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part9(u8* b, const Call& call, u32 cb, GuestThread& t);
 constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00;
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
@@ -147,7 +148,8 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 5) part5(b, call, cb, t);
     else if (part == 6) part6(b, call, cb, t);
     else if (part == 7) part7(b, call, cb, t);
-    else part8(b, call, cb, t);
+    else if (part == 8) part8(b, call, cb, t);
+    else part9(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
@@ -156,8 +158,15 @@ Run run(const std::string& flash, bool sony, int part)
     // The other threads' calls, each thread's in order, the threads in no order.
     std::vector<std::string> others;
     for (const auto& [id, calls] : tr.others) {
+        // A wait for work and the signal after it (other threads' only) depend on when the work came: left out.
         std::string all = "thread:";
-        for (const std::string& c : calls) all += " " + c;
+        for (usize i = 0; i < calls.size(); i++) {
+            if (calls[i].starts_with("107(")) {
+                if (i + 1 < calls.size() && calls[i + 1].starts_with("108(")) i++;
+                continue;
+            }
+            all += " " + calls[i];
+        }
         others.push_back(all);
     }
     std::sort(others.begin(), others.end());
@@ -975,6 +984,86 @@ void part8(u8* b, const Call& call_, u32 cb, GuestThread&)
     }
 }
 
+// Boot and Finalize of players with streams: the audio and video pipelines (their pairs, lwmutexes and copy threads),
+// the renderers' makeup and cleanup (a game's renderer, the adapters, an AU receiver), and a Boot whose video renderer's
+// makeup fails.
+void part9(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kLog = kArea + 0x1B00, kSrcCode = kArea + 0x1C00,
+                  kRend = kArea + 0x2400, kGad = kArea + 0x2500, kAuR = kArea + 0x2600, kSad = kArea + 0x2800,
+                  kRend2 = kArea + 0x2900, kAuR2 = kArea + 0x2A00, kRF = kArea + 0x2E00, kGF = kArea + 0x2E40,
+                  kRFfail = kArea + 0x2E80;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    const u32 fail = kSrcCode + 0xC8; // returns -1
+    // A renderer's callbacks: makeup, cleanup and close recorded; the others never called here.
+    for (u32 i = 0; i < 9; i++) {
+        ps_write32(b, kRF + 4 * i, 0);
+        ps_write32(b, kRFfail + 4 * i, 0);
+    }
+    ps_write32(b, kRF, cb);
+    ps_write32(b, kRF + 4, cb);
+    ps_write32(b, kRF + 12, cb);
+    ps_write32(b, kRFfail, fail);
+    ps_write32(b, kRFfail + 4, cb);
+    for (u32 i = 0; i < 5; i++) ps_write32(b, kGF + 4 * i, i < 2 ? cb : 0); // the adapters' makeup and cleanup
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+    };
+    const auto mask_objects = [&] {
+        g_mask.push_back({kGad, 4}); // each side's adapter callback table
+        g_mask.push_back({kSad, 4});
+        g_mask.push_back({kAuR + 0x20, 0x24}); // each side's receiver callbacks
+        g_mask.push_back({kAuR2 + 0x20, 0x24});
+    };
+
+    // Mode 0: the game's audio renderer, a graphics adapter, an AU receiver.
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 1, 1, 1, 0});
+    mask_player_source(b, kP);
+    call("cellSailRendererAudioInitialize", {kRend, kRF, 0x31, 0});
+    call("cellSailGraphicsAdapterInitialize", {kGad, kGF, 0x66});
+    call("cellSailAuReceiverInitialize", {kAuR, 0, 0, 0x77});
+    call("cellSailPlayerSetRendererAudio", {kP, 0, kRend});
+    call("cellSailPlayerSetGraphicsAdapter", {kP, 0, kGad});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR});
+    call("cellSailPlayerBoot", {kP, 0x99});
+    until([&] { return b[kP + 0x163] == 2; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the copy threads waiting for work
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    std::vector<u8> first(b + kP, b + kP + 0x400);
+
+    // Mode 1: a sound adapter, the game's video renderer whose makeup fails, an AU receiver: Boot fails, all undone.
+    call("cellSailPlayerInitialize", {kP, 1, kMem, cb, 0x22, 1, 1, 1, 0});
+    mask_player_source(b, kP);
+    call("cellSailSoundAdapterInitialize", {kSad, kGF, 0x55});
+    call("cellSailRendererVideoInitialize", {kRend2, kRFfail, 0x32, 0});
+    call("cellSailAuReceiverInitialize", {kAuR2, 0, 0, 0x78});
+    call("cellSailPlayerSetSoundAdapter", {kP, 0, kSad});
+    call("cellSailPlayerSetRendererVideo", {kP, 0, kRend2});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR2});
+    call("cellSailPlayerBoot", {kP, 0x9A});
+    until([&] { return b[kP + 0x163] == 10; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    std::memcpy(b + kArea + 0x600, first.data(), 0x200); // the first player's first half kept for the comparison
+    mask_objects();
+    // The records: the event handler's r7 (past its four arguments), the renderers' r4..r7 (past their one).
+    for (u32 i = 0; i < ps_read32(b, kRecords); i++) {
+        const u32 r = kRecords + 16 + 48 * i;
+        if (ps_read64(b, r) == 0x22) g_mask.push_back({r + 32, 8});
+        else g_mask.push_back({r + 8, 32});
+    }
+}
+
 } // namespace
 
 void compare_runs(int part)
@@ -1033,4 +1122,10 @@ TEST_CASE("cellSail against libsail: descriptors created, added, removed and des
 TEST_CASE("cellSail against libsail: descriptors opened and closed through a game's source", "[hle][lle][sail]")
 {
     compare_runs(8);
+}
+
+
+TEST_CASE("cellSail against libsail: Boot and Finalize of players with streams", "[hle][lle][sail]")
+{
+    compare_runs(9);
 }

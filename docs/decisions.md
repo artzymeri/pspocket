@@ -7198,6 +7198,26 @@ the script posts). Compared with libsail: a game's source in guest code serving 
 shared source), closes from the game (refused while held), unknown protocols and a URI without one, a source whose
 ReadSync fails, destroy and the player's end closing open descriptors: 0 differences over 2737 checks in eight scripts.
 
+Part 9, Boot and Finalize of players with streams (runtime/hle/src/cellSailPipelines.cpp): after the dmux pipeline the
+control thread sets up each audio stream's pipeline (0xD0 bytes at the slot's +0x80: the player at +0xA4, alive +0x4C,
+a pair "_saiad0" +0x78, an lwmutex "_saiad1" +0x80, the thread "_libsail-adec_copy" at priority 450 with 4 KB of stack,
++0x70) and each video stream's (0x100 bytes: player +0x70, alive +0xC, pair "_saivd0" +0x40, lwmutex "_saivd1" +0x48,
+command +0x60 idle at -1, "_libsail-vdec_copy" at 550, +0x38), then makes up each audio and video renderer (a stream in
+mode 1 tells its renderer first, +0x34 = 4; makeup through the renderer's callback table with its argument, state +0x1C
+0) and each user stream's AU receiver (the player, its clock and the index kept, makeup through its copied callbacks).
+A failure undoes what was made, in libsail's order (receivers, video renderers, audio renderers, every pipeline, the
+dmux pipeline, the descriptors), and Boot fails (state 10, events 9 and Boot completed with the error). At the end the
+video threads are told 2 and the audio threads 5 (under their pairs, once the last command is taken) and joined, then
+receivers, renderers (closed first unless only made up, then cleanup, state 9 or 8) and pipelines are taken down. The
+copy threads take commands (audio: and decoded-frame counts) under their pair, waiting while there are none: this part
+handles their end only; any other command, an open decoder or a module to unload stops the process (later parts). The
+sound and graphics adapters' makeup and cleanup call the game's own callbacks (makeup also clears the adapter's play
+state), their cancel does nothing; the AU receiver's call the game's callbacks (none in fw 4.92). libsail's pair and
+lwmutex helpers are now shared (cellSail.hpp). The comparison's traces leave out other threads' waits for work and the
+signal after each (their number depends on when the work came). Compared with libsail: a mode-0 player with a game's
+audio renderer, a graphics adapter and an AU receiver booted and finalized, a mode-1 player with a sound adapter whose
+video renderer's makeup fails: 0 differences over 2776 checks in nine scripts, five runs.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)
