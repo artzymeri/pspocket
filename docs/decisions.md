@@ -7638,3 +7638,23 @@ Tests: tests/hle/test_vpost.cpp, 6 cases, 284 checks: the five functions and the
 their errors; 17 flat colours (black, white and the three primaries in both matrices and ranges) against their
 standard YCbCr values, with the alpha; a picture enlarged 2x and reduced 2x against hand-worked values, the windows and
 the picture information; YUV out (a same-size copy, both chroma types, and a flat picture enlarged); Exec's checks.
+
+## D-565 · 2026-10-09 · cellKey2char pspocket's own, firmware first
+
+libkey2char turns keyboard key codes into the characters they type (for games with text input). RPCS3's
+(rpcs3/Emu/Cell/Modules/cellKey2char.cpp) has the error codes, the modes, the 128-byte handle the game owns and what was
+read of it (byte 8: opened; byte 0: 255 when broken; byte 1: the keyboard arrangement) and each call's checks, but
+converts nothing. No Sony module was at hand: firmware first (D-563). pspocket's:
+- Open takes the arrangement of the system settings (cellSysutil's keyboard type, 101 by default), English mode (kept in
+  byte 2); Close clears byte 8. SetMode takes 0 to 2 (a negative mode too is INVALID_PARAMETER, where RPCS3's signed
+  check lets it through); SetArrangement 0 to 24 (CELL_KB_MAPPING_101 to TURKISH_TURKEY).
+- GetChar types a key as cellKbCnvRawCode does in the handle's arrangement (sys_io: RPCS3's tables for the 101, 106 and
+  German layouts, shift, caps lock, the keypad with num lock), in UTF-16: the five characters that table gives in code
+  page 850 past ASCII (yen, sharp s, acute accent, section sign, degree sign) become their Unicode code points. The
+  character is kept in the handle from byte 0x40 and *charCode points at it; *charNum is 1 and *processed true, or 0
+  and false for a key that types nothing (Escape, the keypad without num lock). charNum and processed may be null.
+- The native modes (kana, Hangul, Cyrillic, Bopomofo, Cangjie) are accepted and type as the English one, logged once:
+  their composition is not known without Sony's module.
+Tests: tests/hle/test_key2char.cpp, 3 cases: the five functions and the marker; open, close, modes, arrangements and
+every check (a broken handle answers OTHER); letters, shift and caps lock, digits, Enter, Backspace, Space,
+punctuation, the keypad with and without num lock, Escape, and the 106 and German layouts' own characters.
