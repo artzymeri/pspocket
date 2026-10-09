@@ -76,6 +76,8 @@ constexpr u32 kTagGetifaddrs = kCtxSize + 8; // "getifaddrs.c"
 constexpr u32 kTagNetset = kCtxSize + 24;    // "netset.c"
 constexpr u32 kStrLo0 = kCtxSize + 40;       // "lo0", "127.0.0.1", "255.0.0.0", "pppoe0": netset.c's constants
 constexpr u32 kStrLoopback = kCtxSize + 48, kStrLoopMask = kCtxSize + 64, kStrPppoe = kCtxSize + 80;
+constexpr u32 kTagGethnamaddr = kCtxSize + 96, kTagResQuery = kCtxSize + 112, kTagResComp = kCtxSize + 128;
+constexpr u32 kHostsText = kCtxSize + 144; // libnet's /etc/hosts
 
 // ------------------------------------------------------------------------------------------------- libnet's state
 
@@ -131,6 +133,10 @@ u32 data(PPUContext& ctx)
         std::memcpy(gb(ctx) + n.data + kStrLoopback, "127.0.0.1", 10);
         std::memcpy(gb(ctx) + n.data + kStrLoopMask, "255.0.0.0", 10);
         std::memcpy(gb(ctx) + n.data + kStrPppoe, "pppoe0", 7);
+        std::memcpy(gb(ctx) + n.data + kTagGethnamaddr, "gethnamaddr.c", 14);
+        std::memcpy(gb(ctx) + n.data + kTagResQuery, "res_query.c", 12);
+        std::memcpy(gb(ctx) + n.data + kTagResComp, "res_comp.c", 11);
+        std::memcpy(gb(ctx) + n.data + kHostsText, "127.0.0.1 localhost localhost.\n", 32);
     }
     return n.data;
 }
@@ -1301,154 +1307,6 @@ u32 inet_ntoa(PPUContext& ctx, u32 in)
     const std::string text = ntop4(bytes);
     std::memcpy(b + buf, text.c_str(), text.size() + 1);
     return buf;
-}
-
-
-// ------------------------------------------------------------------------------------------------- the resolver
-
-// The hostent libnet keeps in the thread's context: struct hostent at +192 {h_name, h_aliases, h_addrtype, h_length,
-// h_addr_list}, the aliases at +212, the address pointers at +48, the name buffer at +352 (1025 bytes), the address
-// at +2400.
-constexpr u32 kHost = 192, kHostAliases = 212, kHostAddrPtrs = 48, kHostBuf = 352, kHostAddr = 2400;
-constexpr s32 NETDB_INTERNAL = -1, NETDB_SUCCESS = 0, HOST_NOT_FOUND = 1, TRY_AGAIN = 2;
-constexpr u32 SYS_NET_ENOBUFS = 55;
-
-void set_h_errno(PPUContext& ctx, s32 e) { w32(gb(ctx), context(ctx) + kCtxHErrno, static_cast<u32>(e)); }
-
-// A hostent for a name that is an address itself (gethnamaddr.c's "fake up a hostent").
-u32 literal_hostent(PPUContext& ctx, std::string_view name, s32 af, const u8* addr, u32 size)
-{
-    u8* b = gb(ctx);
-    const u32 c = context(ctx);
-    const usize n = std::min<usize>(name.size(), 1025);
-    std::memset(b + c + kHostBuf, 0, 1026);
-    std::memcpy(b + c + kHostBuf, name.data(), n);
-    std::memcpy(b + c + kHostAddr, addr, size);
-    w32(b, c + kHost, c + kHostBuf);
-    w32(b, c + kHost + 4, c + kHostAliases);
-    w32(b, c + kHostAliases, 0);
-    w32(b, c + kHost + 8, static_cast<u32>(af));
-    w32(b, c + kHost + 12, size);
-    w32(b, c + kHostAddrPtrs, c + kHostAddr);
-    w32(b, c + kHostAddrPtrs + 4, 0);
-    w32(b, c + kHost + 16, c + kHostAddrPtrs);
-    set_h_errno(ctx, NETDB_SUCCESS);
-    return c + kHost;
-}
-
-// gethostbyname(name), interim (D-523): libnet's answers for a name that is an address (a hostent for it, or
-// HOST_NOT_FOUND) and for the names of its /etc/hosts ("127.0.0.1 localhost localhost."); any other name needs a name
-// server, and with none (offline) libnet's lookup fails: NULL, TRY_AGAIN. libnet's resolver itself (its hosts file
-// reads, res_init, the DNS query and its pool allocations) is the next step.
-u32 gethostbyname(PPUContext& ctx, u32 name)
-{
-    u8* b = gb(ctx);
-    if (!name) {
-        set_errno(ctx, SYS_NET_EINVAL);
-        set_h_errno(ctx, NETDB_INTERNAL);
-        return 0;
-    }
-    if (r32(b, context(ctx) + kCtxAborted)) {
-        set_errno(ctx, SYS_NET_ENOBUFS);
-        set_h_errno(ctx, NETDB_INTERNAL);
-        return 0;
-    }
-    const auto text = guest_str(ctx, name, "gethostbyname: name");
-    if (!text) {
-        set_h_errno(ctx, NETDB_INTERNAL);
-        return 0;
-    }
-    const std::string& n = *text;
-    const auto literal = [&](bool v6) -> std::optional<u32> {
-        if (n.empty() || n.back() == '.') return std::nullopt;
-        for (const char ch : n) {
-            const u8 c = static_cast<u8>(ch);
-            if (v6 ? !(is_xdigit(c) || c == ':' || c == '.') : !(is_digit(c) || c == '.')) return std::nullopt;
-        }
-        const auto a = parse_aton(n, true);
-        if (!a) {
-            set_h_errno(ctx, HOST_NOT_FOUND);
-            return 0u;
-        }
-        const u8 bytes[4] = {static_cast<u8>(*a >> 24), static_cast<u8>(*a >> 16), static_cast<u8>(*a >> 8),
-            static_cast<u8>(*a)};
-        return literal_hostent(ctx, n, SYS_NET_AF_INET, bytes, 4);
-    };
-    if (!n.empty() && is_digit(static_cast<u8>(n[0]))) {
-        if (const auto r = literal(false)) return *r;
-    }
-    if ((!n.empty() && is_xdigit(static_cast<u8>(n[0])) && n.find(':') != std::string::npos) || (!n.empty() && n[0] == ':')) {
-        if (const auto r = literal(true)) return *r;
-    }
-    if (n == "localhost" || n == "localhost.") {
-        const u32 c = context(ctx);
-        const u8 loop[4] = {127, 0, 0, 1};
-        const u32 h = literal_hostent(ctx, "localhost", SYS_NET_AF_INET, loop, 4);
-        std::memcpy(b + c + kHostBuf + 10, "localhost.", 11);
-        w32(b, c + kHostAliases, c + kHostBuf + 10);
-        w32(b, c + kHostAliases + 4, 0);
-        return h;
-    }
-    PS_LOG_INFO(kChan, "gethostbyname(\"{}\"): no name server (no network); NULL, h_errno TRY_AGAIN", n);
-    set_h_errno(ctx, TRY_AGAIN);
-    return 0;
-}
-
-
-// gethostbyaddr(addr, len, type), interim as gethostbyname (D-569): NetBSD gethnamaddr.c's checks (an IPv6 link- or
-// site-local address: HOST_NOT_FOUND; a v4-mapped or v4-compatible one looked up as its IPv4 address; a family other
-// than INET and INET6: errno EAFNOSUPPORT; a length not the family's: errno EINVAL; both NETDB_INTERNAL), then the
-// hosts file (127.0.0.1 is localhost, alias "localhost."), then a name server, of which there is none offline: NULL,
-// TRY_AGAIN.
-u32 gethostbyaddr(PPUContext& ctx, u32 addr, u32 len, s32 type)
-{
-    u8* b = gb(ctx);
-    if (r32(b, context(ctx) + kCtxAborted)) {
-        set_errno(ctx, SYS_NET_ENOBUFS);
-        set_h_errno(ctx, NETDB_INTERNAL);
-        return 0;
-    }
-    if (!addr || len > 16 || !usable(ctx, addr, std::max(len, 1u), "gethostbyaddr: addr")) {
-        if (!addr || len > 16) set_errno(ctx, SYS_NET_EINVAL);
-        set_h_errno(ctx, NETDB_INTERNAL);
-        return 0;
-    }
-    std::array<u8, 16> a{};
-    std::memcpy(a.data(), b + addr, len);
-    const auto all_zero = [&](u32 from, u32 to) {
-        return std::all_of(a.begin() + from, a.begin() + to, [](u8 c) { return c == 0; });
-    };
-    if (type == SYS_NET_AF_INET6 && len == 16) {
-        if (a[0] == 0xFE && ((a[1] & 0xC0) == 0x80 || (a[1] & 0xC0) == 0xC0)) {
-            set_h_errno(ctx, HOST_NOT_FOUND);
-            return 0;
-        }
-        const bool mapped = all_zero(0, 10) && a[10] == 0xFF && a[11] == 0xFF;
-        const bool compat = all_zero(0, 12) && !all_zero(12, 16) && !(all_zero(12, 15) && a[15] == 1);
-        if (mapped || compat) {
-            std::memmove(a.data(), a.data() + 12, 4);
-            type = SYS_NET_AF_INET;
-            len = 4;
-        }
-    }
-    const u32 size = type == SYS_NET_AF_INET ? 4 : type == SYS_NET_AF_INET6 ? 16 : 0;
-    if (!size || size != len) {
-        set_errno(ctx, size ? SYS_NET_EINVAL : SYS_NET_EAFNOSUPPORT);
-        set_h_errno(ctx, NETDB_INTERNAL);
-        return 0;
-    }
-    if (type == SYS_NET_AF_INET && a[0] == 127 && a[1] == 0 && a[2] == 0 && a[3] == 1) {
-        const u32 c = context(ctx);
-        const u32 h = literal_hostent(ctx, "localhost", SYS_NET_AF_INET, a.data(), 4);
-        std::memcpy(b + c + kHostBuf + 10, "localhost.", 11);
-        w32(b, c + kHostAliases, c + kHostBuf + 10);
-        w32(b, c + kHostAliases + 4, 0);
-        return h;
-    }
-    PS_LOG_INFO(kChan, "gethostbyaddr({} bytes, family {}): no name server (no network); NULL, h_errno TRY_AGAIN",
-        len, type);
-    set_h_errno(ctx, TRY_AGAIN);
-    return 0;
 }
 
 
@@ -3061,6 +2919,936 @@ s32 sys_netset_if_down(PPUContext& ctx, s32 id, s32, s32)
         w32(b, set + ns::state, 0);
         return errno_negated(ctx);
     });
+}
+
+// ------------------------------------------------------------------------------------------------- the resolver
+// libnet's resolver (D-539, part 4): FreeBSD's gethnamaddr.c and nsdispatch over BIND 8's res_query.c,
+// res_mkquery.c, res_comp.c and res_send.c, as Sony built them, their statics in the thread's context. A name is looked
+// up in libnet's built-in /etc/hosts and then asked of the context's name servers. Offline lv2 gives no resolver
+// configuration (an empty text, D-523), so res_init never runs and the one name server has no address: its socket is
+// refused, nothing is sent, and the lookup ends in TRY_AGAIN.
+
+// The hostent libnet keeps in the thread's context (gethnamaddr.c's statics): struct hostent at +0xC0 {h_name,
+// h_aliases, h_addrtype, h_length, h_addr_list}, the address pointers at +0x30, the alias pointers at +0xD4 (35), the
+// text buffer at +0x160 (0x800 bytes), the address at +0x960, the hosts file (libnet's FILE) at +0x970 and whether to
+// keep it open at +0x974.
+constexpr u32 kHostAddrPtrs = 0x30, kHost = 0xC0, kHostAliases = 0xD4, kHostAliasesEnd = 0x15C, kHostBuf = 0x160;
+constexpr u32 kHostBufSize = 0x800, kHostAddr = 0x960, kHostFile = 0x970, kHostStayOpen = 0x974;
+constexpr u32 kHostName = kHost, kHostAliasList = kHost + 4, kHostType = kHost + 8, kHostLength = kHost + 12;
+constexpr u32 kHostAddrList = kHost + 16;
+
+// The resolver's state (BIND's struct __res_state) from +0x988: the first timeout (seconds), the number of tries, the
+// options, the name servers (their count, then 16-byte addresses), the last query's ID, the search list (char*[7]),
+// ndots (the high nibble of +0xAEC); res_send's socket at +0xB44, whether it is connected, whether it is a stream
+// socket, its family.
+constexpr u32 kResTries = kCtxResolverRetrans, kResOptions = kCtx2448, kResNsCount = kCtx2452, kResNsAddr = 2456;
+constexpr u32 kResId = 0x9C8, kResSearch = 0x9CC, kResNdots = 0xAEC;
+constexpr u32 kResSock = kCtx2884, kResConnected = 2888, kResStream = 2892, kResFamily = 2896;
+constexpr u32 RES_INIT = 0x1, RES_USEVC = 0x8, RES_RECURSE = 0x40, RES_DEFNAMES = 0x80, RES_DNSRCH = 0x200;
+constexpr u32 RES_USE_INET6 = 0x2000, RES_USE_EDNS0 = 0x40000000;
+
+constexpr s32 NETDB_INTERNAL = -1, NETDB_SUCCESS = 0, HOST_NOT_FOUND = 1, TRY_AGAIN = 2, NO_RECOVERY = 3, NO_DATA = 4;
+constexpr u32 SYS_NET_EINTR = 4, SYS_NET_EMSGSIZE = 40, SYS_NET_ENOBUFS = 55, SYS_NET_ETIMEDOUT = 60;
+constexpr u32 SYS_NET_ECONNREFUSED = 61;
+// nsdispatch's answers.
+constexpr s32 NS_SUCCESS = 1, NS_UNAVAIL = 2, NS_NOTFOUND = 4;
+// DNS classes and types.
+constexpr u16 C_IN = 1, T_A = 1, T_PTR = 12, T_AAAA = 28, T_OPT = 41;
+
+void set_h_errno(PPUContext& ctx, s32 e) { w32(gb(ctx), context(ctx) + kCtxHErrno, static_cast<u32>(e)); }
+s32 h_errno_now(PPUContext& ctx) { return static_cast<s32>(r32(gb(ctx), context(ctx) + kCtxHErrno)); }
+u32 errno_now(PPUContext& ctx) { return r32(gb(ctx), context(ctx) + kCtxErrno); }
+u32 res_options(PPUContext& ctx) { return r32(gb(ctx), context(ctx) + kResOptions); }
+
+u32 g_strlen(const u8* b, u32 s)
+{
+    u32 n = 0;
+    while (b[s + n]) n++;
+    return n;
+}
+
+// strpbrk on guest memory: the first byte of s that is one of `set`, or 0.
+u32 g_strpbrk(const u8* b, u32 s, std::string_view set)
+{
+    for (; b[s]; s++) {
+        if (set.find(static_cast<char>(b[s])) != std::string_view::npos) return s;
+    }
+    return 0;
+}
+
+// strcasecmp(a, b) == 0 in the C locale (libnet f_ed54 compares through its tolower table).
+bool g_equal_nocase(const u8* b, u32 x, u32 y)
+{
+    const auto lower = [](u8 c) { return c >= 'A' && c <= 'Z' ? static_cast<u8>(c + 32) : c; };
+    for (;; x++, y++) {
+        if (lower(b[x]) != lower(b[y])) return false;
+        if (!b[x]) return true;
+    }
+}
+
+// The check each resolver step makes first while RES_INIT is unset (always: libnet never sets it), libnet f_e4ac:
+// lv2's resolver configuration read again (f_125c4); when it changed, the resolver would be set up from it (res_init,
+// f_7a34: its "nameserver", "domain", "search" and "options" lines). lv2 has none to give offline, so that is reached
+// only after _sce_net_set_name_server gave it one, and a name server it names cannot be reached anyway.
+void res_ready(PPUContext& ctx)
+{
+    if (res_options(ctx) & RES_INIT) return;
+    bool changed = false;
+    const u32 conf = resolv_conf(ctx, &changed);
+    if (!conf) {
+        // libnet then reads a stack word it never set
+        PS_LOG_ERROR(kChan, "the resolver: lv2 refused its configuration (sys_net_infoctl 9); taken as unchanged");
+        return;
+    }
+    if (changed) {
+        PS_FATAL(kChan,
+            "the resolver: lv2's configuration is now \"{}\": libnet's res_init, which reads it, is not pspocket's own "
+            "(no name server can be reached offline, D-539)",
+            guest_str(ctx, conf, "resolv.conf").value_or(""));
+    }
+}
+
+// ---- the hosts file
+
+// libnet's FILE (88 bytes from the pool, "netset.c" 1698) over a text of its own: +0 the read position, +12 (16
+// bits) the flags (0x40 at the end), +28 the text.
+constexpr u32 kFileSize = 88, kFilePos = 0, kFileFlags = 12, kFileText = 28;
+constexpr u16 kFileEnd = 0x40;
+
+// fopen("/etc/hosts", "r") (libnet f_e45c over f_1a2b4): libnet's built-in hosts text. 0 (errno ENOENT) when the pool
+// refuses.
+u32 hosts_open(PPUContext& ctx)
+{
+    const u32 text = data(ctx) + kHostsText;
+    const u32 f = netset_malloc(ctx, kFileSize, 1698);
+    if (!f) {
+        set_errno(ctx, SYS_NET_ENOENT);
+        return 0;
+    }
+    u8* b = gb(ctx);
+    std::memset(b + f, 0, kFileSize);
+    w32(b, f + kFileText, text);
+    w32(b, f + kFilePos, text);
+    return f;
+}
+
+void file_mark_end(u8* b, u32 f) { ps_write16(b, f + kFileFlags, static_cast<u16>(ps_read16(b, f + kFileFlags) | kFileEnd)); }
+
+// fgets (libnet f_e378 over f_17000): a line (at most n - 1 bytes, its newline kept) into buf, NUL-ended; at the end of
+// the text nothing is read, the end flag is set and errno is EBADF.
+u32 file_gets(PPUContext& ctx, u32 buf, s32 n, u32 f)
+{
+    u8* b = gb(ctx);
+    if (f) {
+        u32 pos = r32(b, f + kFilePos);
+        if (pos && b[pos]) {
+            u32 out = buf;
+            if (n > 1) {
+                const u8 first = b[pos++];
+                b[out++] = first;
+                if (first != '\n') {
+                    for (s32 left = n - 2; left > 0; left--) {
+                        const u8 c = b[pos];
+                        b[out] = c;
+                        if (!c) break;
+                        pos++;
+                        out++;
+                        if (c == '\n') break;
+                    }
+                }
+            }
+            b[out] = 0;
+            w32(b, f + kFilePos, pos);
+            return buf;
+        }
+        file_mark_end(b, f);
+    }
+    set_errno(ctx, SYS_NET_EBADF);
+    return 0;
+}
+
+// fclose (libnet f_e404): the FILE back to the pool.
+void file_close(PPUContext& ctx, u32 f)
+{
+    if (f) net_free(ctx, f);
+    else set_errno(ctx, SYS_NET_EBADF);
+}
+
+// map_v4v6_address (f_239c): an IPv4 address (4 bytes at src) as ::ffff:a.b.c.d (16 at dst).
+void map_v4v6_address(u8* b, u32 src, u32 dst)
+{
+    u8 v4[4];
+    std::memcpy(v4, b + src, 4);
+    std::memset(b + dst, 0, 10);
+    b[dst + 10] = 0xFF;
+    b[dst + 11] = 0xFF;
+    std::memcpy(b + dst + 12, v4, 4);
+}
+
+// _gethtent (f_3358): the next entry of the hosts file (opened at first use) whose address has the type and length
+// the hostent asks for (0: any), parsed into the context's hostent; 0 at the end (HOST_NOT_FOUND) or when the file
+// cannot be opened (NETDB_INTERNAL).
+u32 gethtent(PPUContext& ctx)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    if (!r32(b, c + kHostFile)) {
+        const u32 f = hosts_open(ctx);
+        w32(b, c + kHostFile, f);
+        if (!f) {
+            set_h_errno(ctx, NETDB_INTERNAL);
+            return 0;
+        }
+    }
+    for (;;) {
+        const u32 p = file_gets(ctx, c + kHostBuf, kHostBufSize, r32(b, c + kHostFile));
+        if (!p) {
+            set_h_errno(ctx, HOST_NOT_FOUND);
+            return 0;
+        }
+        if (b[p] == '#') continue;
+        u32 cp = g_strpbrk(b, p, "#\n");
+        if (!cp) continue;
+        b[cp] = 0;
+        cp = g_strpbrk(b, p, " \t");
+        if (!cp) continue;
+        b[cp] = 0;
+        s32 af = SYS_NET_AF_INET6;
+        u32 len = 16;
+        if (inet_pton(ctx, SYS_NET_AF_INET6, p, c + kHostAddr) <= 0) {
+            if (inet_pton(ctx, SYS_NET_AF_INET, p, c + kHostAddr) <= 0) continue;
+            af = SYS_NET_AF_INET;
+            len = 4;
+            if (res_options(ctx) & RES_USE_INET6) {
+                map_v4v6_address(b, c + kHostAddr, c + kHostAddr);
+                af = SYS_NET_AF_INET6;
+                len = 16;
+            }
+        }
+        const s32 want_af = static_cast<s32>(r32(b, c + kHostType));
+        const u32 want_len = r32(b, c + kHostLength);
+        if ((want_af && want_af != af) || (want_len && want_len != len)) continue;
+        w32(b, c + kHostAddrPtrs, c + kHostAddr);
+        w32(b, c + kHostAddrPtrs + 4, 0);
+        w32(b, c + kHostAddrList, c + kHostAddrPtrs);
+        w32(b, c + kHostLength, len);
+        w32(b, c + kHostType, static_cast<u32>(af));
+        do cp++;
+        while (b[cp] == ' ' || b[cp] == '\t');
+        w32(b, c + kHostName, cp);
+        u32 q = c + kHostAliases;
+        w32(b, c + kHostAliasList, q);
+        cp = g_strpbrk(b, cp, " \t");
+        if (cp) {
+            b[cp] = 0;
+            for (;;) {
+                bool end = false;
+                do {
+                    cp++;
+                    if (!b[cp]) {
+                        end = true;
+                        break;
+                    }
+                } while (b[cp] == ' ' || b[cp] == '\t');
+                if (end) break;
+                if (q < c + kHostAliasesEnd) {
+                    w32(b, q, cp);
+                    q += 4;
+                }
+                cp = g_strpbrk(b, cp, " \t");
+                if (!cp) break;
+                b[cp] = 0;
+            }
+        }
+        w32(b, q, 0);
+        set_h_errno(ctx, NETDB_SUCCESS);
+        return c + kHost;
+    }
+}
+
+// _sethtent (f_37ec): the hosts file opened, or, already open, marked at its end (libnet's rewind does no more); whether
+// to keep it open.
+void sethtent(PPUContext& ctx, u32 stayopen)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    if (const u32 f = r32(b, c + kHostFile)) file_mark_end(b, f);
+    else w32(b, c + kHostFile, hosts_open(ctx));
+    w32(b, c + kHostStayOpen, stayopen);
+}
+
+// _endhtent (f_376c): the hosts file closed unless it is to stay open.
+void endhtent(PPUContext& ctx)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    const u32 f = r32(b, c + kHostFile);
+    if (!f || r32(b, c + kHostStayOpen)) return;
+    file_close(ctx, f);
+    w32(b, c + kHostFile, 0);
+}
+
+// _gethtbyname2 (f_39ac), the hosts source of gethostbyname: every entry of the family whose name or an alias is the
+// name (case ignored), up to 35, gathered in one block from the pool ("gethnamaddr.c" 0x3DB: the names, then the
+// addresses 4-aligned) and copied into the text buffer. NS_NOTFOUND (HOST_NOT_FOUND) when there is none.
+s32 files_byname(PPUContext& ctx, u32 name, s32 af, u32* result)
+{
+    u8* b = gb(ctx);
+    sethtent(ctx, r32(b, context(ctx) + kHostStayOpen));
+    u32 buf = 0, bp = 0, num = 0;
+    u32 p = gethtent(ctx);
+    for (;;) {
+        if (!p) {
+            endhtent(ctx);
+            if (!num) {
+                *result = 0;
+                set_h_errno(ctx, HOST_NOT_FOUND);
+                return NS_NOTFOUND;
+            }
+            break;
+        }
+        if (num > 34) {
+            endhtent(ctx);
+            break;
+        }
+        bool match = static_cast<s32>(r32(b, p + 8)) == af;
+        if (match && !g_equal_nocase(b, r32(b, p), name)) {
+            match = false;
+            for (u32 a = r32(b, p + 4); r32(b, a); a += 4) {
+                if (g_equal_nocase(b, r32(b, a), name)) {
+                    match = true;
+                    break;
+                }
+            }
+        }
+        if (!match) {
+            p = gethtent(ctx);
+            continue;
+        }
+        const u32 length = r32(b, p + 12);
+        if (!num) {
+            u32 size = g_strlen(b, r32(b, p)) + length * 35 + 5;
+            for (u32 a = r32(b, p + 4); r32(b, a); a += 4) size += g_strlen(b, r32(b, a)) + 1;
+            buf = net_malloc(ctx, size, data(ctx) + kTagGethnamaddr, 0x3DB);
+            if (!buf) {
+                // the hosts file stays open
+                *result = 0;
+                set_h_errno(ctx, NETDB_INTERNAL);
+                return NS_NOTFOUND;
+            }
+            u32 out = buf;
+            const auto copy = [&](u32 s) {
+                const u32 n = g_strlen(b, s) + 1;
+                std::memmove(b + out, b + s, n);
+                out += n;
+            };
+            copy(r32(b, p));
+            for (u32 a = r32(b, p + 4); r32(b, a); a += 4) copy(r32(b, a));
+            bp = (out + 4) & ~3u;
+            b[out] = 0;
+        }
+        num++;
+        std::memmove(b + bp, b + r32(b, r32(b, p + 16)), length);
+        bp += length;
+        p = gethtent(ctx);
+    }
+    if (bp - buf > 0x7FD) {
+        net_free(ctx, buf);
+        set_errno(ctx, SYS_NET_ENOSPC);
+        set_h_errno(ctx, NETDB_INTERNAL);
+        *result = 0;
+        set_h_errno(ctx, HOST_NOT_FOUND);
+        return NS_NOTFOUND;
+    }
+    const u32 c = context(ctx);
+    const u32 dst = (c + kHostBuf + 3) & ~3u;
+    std::memmove(b + dst, b + buf, bp - buf);
+    net_free(ctx, buf);
+    w32(b, c + kHostName, dst);
+    u32 cp = dst + g_strlen(b, dst) + 1;
+    u32 q = c + kHostAliases;
+    while (b[cp]) {
+        w32(b, q, cp);
+        q += 4;
+        cp += g_strlen(b, cp) + 1;
+    }
+    w32(b, q, 0);
+    u32 ptrs = c + kHostAddrPtrs;
+    for (u32 i = 0, a = (cp + 4) & ~3u; i < num; i++, ptrs += 4) {
+        w32(b, ptrs, a);
+        a += r32(b, c + kHostLength);
+    }
+    w32(b, ptrs, 0);
+    *result = c + kHost;
+    return NS_SUCCESS;
+}
+
+// _gethtbyaddr (f_3894), the hosts source of gethostbyaddr: the first entry with this address.
+s32 files_byaddr(PPUContext& ctx, u32 addr, u32 len, s32 af, u32* result)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    w32(b, c + kHostLength, len);
+    w32(b, c + kHostType, static_cast<u32>(af));
+    sethtent(ctx, r32(b, c + kHostStayOpen));
+    for (;;) {
+        const u32 p = gethtent(ctx);
+        if (!p) {
+            endhtent(ctx);
+            *result = 0;
+            set_h_errno(ctx, HOST_NOT_FOUND);
+            return NS_NOTFOUND;
+        }
+        if (static_cast<s32>(r32(b, p + 8)) == af && std::memcmp(b + r32(b, r32(b, p + 16)), b + addr, len) == 0) {
+            endhtent(ctx);
+            *result = p;
+            return NS_SUCCESS;
+        }
+    }
+}
+
+// ---- the name servers
+
+// res_close (f_9550): res_send's socket closed.
+void res_close(PPUContext& ctx)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    if (static_cast<s32>(r32(b, c + kResSock)) < 0) return;
+    socketclose(ctx, static_cast<s32>(r32(b, c + kResSock)));
+    w32(b, c + kResSock, 0xFFFFFFFF);
+    w32(b, c + kResConnected, 0);
+    w32(b, c + kResStream, 0);
+    w32(b, c + kResFamily, 0);
+}
+
+// res_send (f_997c): each try asks each name server not yet found bad, through libnet's DNS cache (its hooks, f_adcc
+// and f_b168, act on AF_INET servers only) and a socket of the server's family kept in the context (a stream socket
+// for a query over 512 bytes or with RES_USEVC, which is then made once). Offline the one name server has no family:
+// lv2 refuses its socket, which marks it bad, and nothing is sent: -1, errno ECONNREFUSED (for a stream, the socket's
+// errno). A server lv2 could reach needs res_init (above), so the cache and the exchange are not pspocket's own.
+s32 res_send(PPUContext& ctx, s32 buflen, s32 anssiz)
+{
+    u8* b = gb(ctx);
+    res_ready(ctx);
+    if (anssiz < 12) {
+        set_errno(ctx, SYS_NET_EINVAL);
+        return -1;
+    }
+    const bool stream = (res_options(ctx) & RES_USEVC) || buflen > 512;
+    u32 terrno = SYS_NET_ETIMEDOUT, badns = 0;
+    for (s32 attempt = 0; attempt < static_cast<s32>(r32(b, context(ctx) + kResTries)); attempt++) {
+        for (u32 ns = 0; static_cast<s32>(ns) < static_cast<s32>(r32(b, context(ctx) + kResNsCount)); ns++) {
+            const u32 c = context(ctx);
+            const u32 nsap = c + kResNsAddr + 16 * ns;
+            const u32 bit = ns < 32 ? 1u << ns : 0;
+            if (badns & bit) {
+                res_close(ctx);
+                continue;
+            }
+            const u8 family = b[nsap + 1];
+            if (family == SYS_NET_AF_INET) {
+                PS_FATAL(kChan,
+                    "res_send: name server {}.{}.{}.{}: libnet's DNS cache and its query over the network are not "
+                    "pspocket's own (offline, D-539)",
+                    b[nsap + 4], b[nsap + 5], b[nsap + 6], b[nsap + 7]);
+            }
+            if (stream) attempt = static_cast<s32>(r32(b, c + kResTries));
+            const s32 sock = static_cast<s32>(r32(b, c + kResSock));
+            const bool reuse = stream ? r32(b, c + kResStream) != 0 : r32(b, c + kResStream) == 0;
+            if (sock < 0 || !reuse || r32(b, c + kResFamily) != family) {
+                if (stream ? sock >= 0 : r32(b, c + kResStream) != 0) res_close(ctx);
+                w32(b, context(ctx) + kResFamily, family);
+                const s32 s = socket(ctx, family, stream ? 1 : 2, 0);
+                w32(b, context(ctx) + kResSock, static_cast<u32>(s));
+                if (s < 0) {
+                    terrno = errno_now(ctx);
+                    badns |= bit;
+                    res_close(ctx);
+                    continue;
+                }
+            }
+            PS_FATAL(kChan, "res_send: lv2 gave a socket of family {} for a name server: its exchange is not "
+                            "pspocket's own (offline, D-539)", family);
+        }
+    }
+    res_close(ctx);
+    set_errno(ctx, stream ? terrno : SYS_NET_ECONNREFUSED);
+    return -1;
+}
+
+// dn_comp (res_comp.c, f_6d58) for a query's name: ns_name_pton into a block from the pool ("res_comp.c" 0x345), then
+// ns_name_pack into dst (dstsiz bytes). libnet's queries pass a list with no names in it yet, so nothing is
+// compressed, but each label is looked up first (errno ENOENT). The length written, or -1 (errno EMSGSIZE).
+s32 dn_comp(PPUContext& ctx, u32 src, u32 dst, s32 dstsiz)
+{
+    u8* b = gb(ctx);
+    const u32 tmp = net_malloc(ctx, 0xFF, data(ctx) + kTagResComp, 0x345);
+    if (!tmp) return -1;
+    const auto fail = [&]() {
+        set_errno(ctx, SYS_NET_EMSGSIZE);
+        net_free(ctx, tmp);
+        return -1;
+    };
+    // ns_name_pton (without its check for an empty label inside the name: "a..b" fails, "a.." is "a.")
+    const u32 eom = tmp + 0xFF;
+    u32 label = tmp, bp = tmp + 1, s = src;
+    bool escaped = false, absolute = false;
+    for (u8 ch; (ch = b[s]) != 0;) {
+        s++;
+        u32 v = ch;
+        if (escaped) {
+            if (is_digit(ch)) {
+                const u8 d2 = b[s], d3 = d2 ? b[s + 1] : 0;
+                if (!d2 || !is_digit(d2) || !d3 || !is_digit(d3)) return fail();
+                v = (ch - '0') * 100u + (d2 - '0') * 10u + (d3 - '0');
+                if (v > 255) return fail();
+                s += 2;
+            }
+        } else if (ch == '\\') {
+            escaped = true;
+            continue;
+        } else if (ch == '.') {
+            const u32 len = bp - label - 1;
+            if ((len & 0xC0) || label >= eom) return fail();
+            b[label] = static_cast<u8>(len);
+            if (!b[s]) {
+                if (len) {
+                    if (bp >= eom) return fail();
+                    b[bp++] = 0;
+                }
+                if (bp - tmp > 0xFF) return fail();
+                absolute = true;
+                break;
+            }
+            if (!len) return fail();
+            label = bp++;
+            continue;
+        }
+        if (bp >= eom) return fail();
+        b[bp++] = static_cast<u8>(v);
+        escaped = false;
+    }
+    if (!absolute) {
+        const u32 len = bp - label - 1;
+        if ((len & 0xC0) || label >= eom) return fail();
+        b[label] = static_cast<u8>(len);
+        if (len) {
+            if (bp >= eom) return fail();
+            b[bp++] = 0;
+        }
+        if (bp - tmp > 0xFF) return fail();
+    }
+    // ns_name_pack
+    for (u32 p = tmp, total = 0;;) {
+        const u8 n = b[p];
+        total += n + 1u;
+        p += n + 1u;
+        if ((n & 0xC0) || total > 0xFF) return fail();
+        if (!n) break;
+    }
+    for (u32 sp = tmp, dp = dst;;) {
+        const u8 n = b[sp];
+        if (n) set_errno(ctx, SYS_NET_ENOENT); // not among the earlier names (there are none)
+        if (dp + n + 1 >= dst + static_cast<u32>(dstsiz)) return fail();
+        std::memmove(b + dp, b + sp, n + 1u);
+        if (!n) {
+            net_free(ctx, tmp);
+            return static_cast<s32>(dp + 1 - dst);
+        }
+        sp += n + 1u;
+        dp += n + 1u;
+    }
+}
+
+// res_mkquery (f_87dc) for a standard query (the only kind libnet's resolver makes): the header (a random ID, also
+// kept in the context; RD from RES_RECURSE), the name, its type and class. Its length, or -1.
+s32 res_mkquery(PPUContext& ctx, u32 dname, u16 cls, u16 type, u32 buf, s32 buflen)
+{
+    u8* b = gb(ctx);
+    res_ready(ctx);
+    if (!buf || buflen < 12) return -1;
+    std::memset(b + buf, 0, 12);
+    const u32 c = context(ctx);
+    const u16 id = static_cast<u16>(_sys_net_lib_rand(ctx));
+    ps_write16(b, buf, id);
+    ps_write16(b, c + kResId, id);
+    w32(b, buf, r32(b, buf) & 0xFFFF87FF); // opcode QUERY
+    w32(b, buf, (r32(b, buf) & 0xFFFFFEF0) | ((res_options(ctx) & RES_RECURSE) ? 0x100 : 0));
+    const s32 room = buflen - 12;
+    if (room <= 3) return -1;
+    const s32 n = dn_comp(ctx, dname, buf + 12, room - 4);
+    if (n < 0) return -1;
+    const u32 cp = buf + 12 + static_cast<u32>(n);
+    ps_write16(b, cp, type);
+    ps_write16(b, cp + 2, cls);
+    ps_write16(b, buf + 4, 1); // qdcount
+    return static_cast<s32>(cp + 4 - buf);
+}
+
+// res_opt (f_86bc): the EDNS0 OPT record appended (an UDP payload of anslen, at most 0xFFFF). The new length, or -1.
+s32 res_opt(PPUContext& ctx, s32 n, u32 buf, s32 buflen, s32 anslen)
+{
+    u8* b = gb(ctx);
+    if (buflen - n < 11) return -1;
+    const u32 cp = buf + static_cast<u32>(n);
+    b[cp] = 0;
+    ps_write16(b, cp + 1, T_OPT);
+    ps_write16(b, cp + 3, static_cast<u16>(std::min(anslen, 0xFFFF)));
+    b[cp + 5] = 0;
+    b[cp + 6] = 0;
+    ps_write16(b, cp + 7, 0);
+    ps_write16(b, cp + 9, 0);
+    ps_write16(b, buf + 10, static_cast<u16>(ps_read16(b, buf + 10) + 1));
+    return n + 11;
+}
+
+// res_query (f_8b30): the query made (in a block from the pool, "res_query.c" 0x91) and sent; on failure h_errno
+// TRY_AGAIN (NETDB_INTERNAL when interrupted), NO_RECOVERY when no query could be made.
+s32 res_query(PPUContext& ctx, u32 name, u16 cls, u16 type, u32 answer, s32 anslen)
+{
+    u8* b = gb(ctx);
+    w32(b, answer, r32(b, answer) & ~0xFu); // the answer's rcode NOERROR
+    res_ready(ctx);
+    const u32 buf = net_malloc(ctx, 0x400, data(ctx) + kTagResQuery, 0x91);
+    if (!buf) {
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return -1;
+    }
+    s32 n = res_mkquery(ctx, name, cls, type, buf, 0x400);
+    if (n > 0 && (res_options(ctx) & RES_USE_EDNS0)) n = res_opt(ctx, n, buf, 0x400, anslen);
+    if (n <= 0) {
+        set_h_errno(ctx, NO_RECOVERY);
+        net_free(ctx, buf);
+        return n;
+    }
+    n = res_send(ctx, n, anslen); // (nothing to send it to)
+    PS_CHECK(n < 0); // res_send never has an answer offline
+    set_h_errno(ctx, errno_now(ctx) == SYS_NET_EINTR ? NETDB_INTERNAL : TRY_AGAIN);
+    net_free(ctx, buf);
+    return n;
+}
+
+// res_querydomain (f_8e24): name.domain asked (made in a block from the pool, "res_query.c" 0x1A4), or with no domain
+// the name without its trailing dot.
+s32 res_querydomain(PPUContext& ctx, u32 name, u32 domain, u16 cls, u16 type, u32 answer, s32 anslen)
+{
+    u8* b = gb(ctx);
+    res_ready(ctx);
+    const u32 nbuf = net_malloc(ctx, 0x401, data(ctx) + kTagResQuery, 0x1A4);
+    if (!nbuf) {
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return -1;
+    }
+    u32 longname = name;
+    const u32 n = g_strlen(b, name);
+    if (!domain) {
+        if (n + 1 > 0x401) {
+            set_h_errno(ctx, NO_RECOVERY);
+            net_free(ctx, nbuf);
+            return -1;
+        }
+        if (n && b[name + n - 1] == '.') {
+            std::memmove(b + nbuf, b + name, n - 1);
+            b[nbuf + n - 1] = 0;
+            longname = nbuf;
+        }
+    } else {
+        const u32 d = g_strlen(b, domain);
+        if (n + d + 2 > 0x401) {
+            set_h_errno(ctx, NO_RECOVERY);
+            net_free(ctx, nbuf);
+            return -1;
+        }
+        const std::string text = std::string(reinterpret_cast<const char*>(b + name), n) + "." +
+                                 std::string(reinterpret_cast<const char*>(b + domain), d);
+        std::memcpy(b + nbuf, text.c_str(), text.size() + 1);
+        longname = nbuf;
+    }
+    const s32 r = res_query(ctx, longname, cls, type, answer, anslen);
+    net_free(ctx, nbuf);
+    return r;
+}
+
+// res_search (f_9040): the name as it is when it has ndots dots or more, then with each domain of the search list
+// (with no dots: RES_DEFNAMES; with dots and no trailing one: RES_DNSRCH), then as it is if not tried yet; h_errno
+// from the most telling failure. Offline ndots is 0 and the search list empty: res_init never ran.
+s32 res_search(PPUContext& ctx, u32 name, u16 cls, u16 type, u32 answer, s32 anslen)
+{
+    u8* b = gb(ctx);
+    res_ready(ctx);
+    set_errno(ctx, 0);
+    set_h_errno(ctx, HOST_NOT_FOUND);
+    u32 dots = 0, n = 0;
+    for (; b[name + n]; n++) dots += b[name + n] == '.';
+    const bool trailing = n && b[name + n - 1] == '.';
+    // (a name with no dots could be a user's alias: libnet's hostalias has none)
+    s32 saved = -1;
+    bool tried = false;
+    u32 got_nodata = 0, got_servfail = 0;
+    if (dots >= static_cast<u32>(b[context(ctx) + kResNdots] >> 4)) {
+        const s32 r = res_querydomain(ctx, name, 0, cls, type, answer, anslen);
+        if (r > 0) return r;
+        saved = h_errno_now(ctx);
+        tried = true;
+    }
+    const u32 opts = res_options(ctx);
+    if ((!dots && (opts & RES_DEFNAMES)) || (dots && !trailing && (opts & RES_DNSRCH))) {
+        for (u32 d = context(ctx) + kResSearch; r32(b, d); d += 4) {
+            const u32 domain = r32(b, d);
+            u32 done = 0;
+            if (b[domain]) {
+                const s32 r = res_querydomain(ctx, name, domain, cls, type, answer, anslen);
+                if (r > 0) return r;
+                if (errno_now(ctx) == SYS_NET_ECONNREFUSED) {
+                    set_h_errno(ctx, TRY_AGAIN);
+                    return -1;
+                }
+                if (errno_now(ctx) == SYS_NET_EINTR) {
+                    set_h_errno(ctx, NETDB_INTERNAL);
+                    return -1;
+                }
+                switch (h_errno_now(ctx)) {
+                case NO_DATA: got_nodata++; break;
+                case HOST_NOT_FOUND: break;
+                case TRY_AGAIN:
+                    if ((r32(b, answer) & 0xF) == 2) { // SERVFAIL
+                        got_servfail++;
+                        break;
+                    }
+                    done = 1;
+                    break;
+                default: done = 1;
+                }
+                done += (res_options(ctx) & RES_DNSRCH) ? 0 : 1;
+            }
+            if (done) break;
+        }
+    }
+    if (!tried) {
+        const s32 r = res_querydomain(ctx, name, 0, cls, type, answer, anslen);
+        if (r > 0) return r;
+    }
+    if (saved != -1) set_h_errno(ctx, saved);
+    else if (got_nodata) set_h_errno(ctx, NO_DATA);
+    else if (got_servfail) set_h_errno(ctx, TRY_AGAIN);
+    return -1;
+}
+
+// _dns_gethtbyname (f_31f4), the DNS source of gethostbyname: an A or AAAA query for the name (the answer in a block
+// from the pool, "gethnamaddr.c" 0x4BF). Offline it never has an answer: NS_NOTFOUND.
+s32 dns_byname(PPUContext& ctx, u32 name, s32 af)
+{
+    u16 type = 0;
+    if (af == SYS_NET_AF_INET) type = T_A;
+    else if (af == SYS_NET_AF_INET6) type = T_AAAA;
+    else return NS_UNAVAIL;
+    const u32 buf = net_malloc(ctx, 0x800, data(ctx) + kTagGethnamaddr, 0x4BF);
+    if (!buf) {
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return NS_NOTFOUND;
+    }
+    const s32 n = res_search(ctx, name, C_IN, type, buf, 0x800);
+    PS_CHECK(n < 0); // no name server answers offline
+    net_free(ctx, buf);
+    return NS_NOTFOUND;
+}
+
+// _dns_gethtbyaddr (f_2e34), the DNS source of gethostbyaddr: a PTR query for the address's in-addr.arpa or ip6.arpa
+// name (made in a block from the pool, "gethnamaddr.c" 0x4F3; the answer in another, 0x529). Offline: NS_NOTFOUND.
+s32 dns_byaddr(PPUContext& ctx, u32 addr, s32 af)
+{
+    u8* b = gb(ctx);
+    const u32 qbuf = net_malloc(ctx, 0x402, data(ctx) + kTagGethnamaddr, 0x4F3);
+    if (!qbuf) {
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return NS_NOTFOUND;
+    }
+    std::string q;
+    if (af == SYS_NET_AF_INET) {
+        q = std::format("{}.{}.{}.{}.in-addr.arpa", b[addr + 3], b[addr + 2], b[addr + 1], b[addr]);
+    } else {
+        for (s32 i = 15; i >= 0; i--) q += std::format("{:x}.{:x}.", b[addr + i] & 0xF, b[addr + i] >> 4);
+        q += "ip6.arpa";
+    }
+    std::memcpy(b + qbuf, q.c_str(), q.size() + 1);
+    const u32 buf = net_malloc(ctx, 0x800, data(ctx) + kTagGethnamaddr, 0x529);
+    if (!buf) {
+        set_h_errno(ctx, NETDB_INTERNAL);
+        net_free(ctx, qbuf);
+        return NS_NOTFOUND;
+    }
+    const s32 n = res_query(ctx, qbuf, C_IN, T_PTR, buf, 0x800);
+    PS_CHECK(n < 0); // no name server answers offline
+    net_free(ctx, buf);
+    net_free(ctx, qbuf);
+    return NS_NOTFOUND;
+}
+
+// nsdispatch (f_65d4) with no nsswitch configuration (f_659c finds none): the default sources, the hosts file and then
+// the name servers, until one answers NS_SUCCESS; the last answer.
+template <typename Files, typename Dns>
+s32 nsdispatch(Files&& files, Dns&& dns)
+{
+    if (const s32 r = files(); r & NS_SUCCESS) return r;
+    const s32 r = dns();
+    return r ? r : NS_NOTFOUND;
+}
+
+// The hostent for a name that is an address (gethnamaddr.c's "fake up a hostent"): the name copied into the text
+// buffer (strncpy, 0x401 bytes), no aliases, the address inet_pton left at +0x960.
+u32 address_hostent(PPUContext& ctx, u32 name)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    const u32 n = std::min<u32>(g_strlen(b, name), 0x401);
+    const std::string text(reinterpret_cast<const char*>(b + name), n);
+    std::memcpy(b + c + kHostBuf, text.data(), n);
+    std::memset(b + c + kHostBuf + n, 0, 0x402 - n);
+    w32(b, c + kHostName, c + kHostBuf);
+    w32(b, c + kHostAliasList, c + kHostAliases);
+    w32(b, c + kHostAliases, 0);
+    w32(b, c + kHostAddrPtrs, c + kHostAddr);
+    w32(b, c + kHostAddrPtrs + 4, 0);
+    w32(b, c + kHostAddrList, c + kHostAddrPtrs);
+    return c + kHost;
+}
+
+// gethostbyname2 (f_3fdc): a name that is an address of the family (digits and dots; or hex digits, colons and dots
+// with a colon) gives a hostent of its own (or HOST_NOT_FOUND when it is not one), unless it ends with a dot; any other
+// name is looked up in the hosts file and then asked of the name servers.
+u32 gethostbyname2(PPUContext& ctx, u32 name, s32 af)
+{
+    u8* b = gb(ctx);
+    u32 size = 0;
+    if (af == SYS_NET_AF_INET) size = 4;
+    else if (af == SYS_NET_AF_INET6) size = 16;
+    else {
+        set_h_errno(ctx, NETDB_INTERNAL);
+        set_errno(ctx, SYS_NET_EAFNOSUPPORT);
+        return 0;
+    }
+    w32(b, context(ctx) + kHostType, static_cast<u32>(af));
+    w32(b, context(ctx) + kHostLength, size);
+    // (a name with no dot could be a user's alias: libnet's hostalias has none)
+    const u8 first = b[name];
+    const auto address = [&](bool v4) -> u32 {
+        if (inet_pton(ctx, af, name, context(ctx) + kHostAddr) <= 0) {
+            set_h_errno(ctx, HOST_NOT_FOUND);
+            return 0;
+        }
+        const u32 hp = address_hostent(ctx, name);
+        if (v4 && (res_options(ctx) & RES_USE_INET6)) {
+            PS_FATAL(kChan, "gethostbyname2: RES_USE_INET6 (set only by res_init) is not pspocket's own");
+        }
+        set_h_errno(ctx, NETDB_SUCCESS);
+        return hp;
+    };
+    bool numeric = is_digit(first);
+    if (numeric) {
+        u32 i = 1;
+        for (; b[name + i]; i++) {
+            if (!is_digit(b[name + i]) && b[name + i] != '.') {
+                numeric = false;
+                break;
+            }
+        }
+        if (numeric && b[name + i - 1] != '.') return address(true);
+    }
+    const bool colon = (is_xdigit(first) && g_strpbrk(b, name, ":")) || first == ':';
+    if (colon) {
+        u32 i = 0;
+        bool ok = true;
+        for (; b[name + i]; i++) {
+            const u8 ch = b[name + i];
+            if (!is_xdigit(ch) && ch != ':' && ch != '.') {
+                ok = false;
+                break;
+            }
+        }
+        if (ok && b[name + i - 1] != '.') return address(false);
+    }
+    set_h_errno(ctx, NETDB_INTERNAL);
+    u32 hp = 0;
+    const s32 r = nsdispatch([&] { return files_byname(ctx, name, af, &hp); }, [&] { return dns_byname(ctx, name, af); });
+    if (r != NS_SUCCESS) return 0;
+    set_h_errno(ctx, NETDB_SUCCESS);
+    return hp;
+}
+
+// gethostbyname(name): the context's hostent for the name (IPv6 first with RES_USE_INET6), or NULL with h_errno; a
+// null name EINVAL, an aborted context ENOBUFS (both NETDB_INTERNAL).
+u32 gethostbyname(PPUContext& ctx, u32 name)
+{
+    u8* b = gb(ctx);
+    if (!name) {
+        set_errno(ctx, SYS_NET_EINVAL);
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return 0;
+    }
+    if (r32(b, context(ctx) + kCtxAborted)) {
+        set_errno(ctx, SYS_NET_ENOBUFS);
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return 0;
+    }
+    if (!guest_str(ctx, name, "gethostbyname: name")) {
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return 0;
+    }
+    res_ready(ctx);
+    if (res_options(ctx) & RES_USE_INET6) {
+        if (const u32 hp = gethostbyname2(ctx, name, SYS_NET_AF_INET6)) return hp;
+    }
+    return gethostbyname2(ctx, name, SYS_NET_AF_INET);
+}
+
+// gethostbyaddr(addr, len, type): the context's hostent for an address (an IPv4-mapped or -compatible IPv6 address as
+// its IPv4 one; a link- or site-local one is never found), or NULL with h_errno; a null address or a length not the
+// type's EINVAL, another type EAFNOSUPPORT, an aborted context ENOBUFS (NETDB_INTERNAL).
+u32 gethostbyaddr(PPUContext& ctx, u32 addr, u32 len, s32 type)
+{
+    u8* b = gb(ctx);
+    const auto fail = [&](u32 e) {
+        set_errno(ctx, e);
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return 0u;
+    };
+    if (!addr) return fail(SYS_NET_EINVAL);
+    if (r32(b, context(ctx) + kCtxAborted)) return fail(SYS_NET_ENOBUFS);
+    if (type == SYS_NET_AF_INET6 && len == 16) {
+        if (!usable(ctx, addr, 16, "gethostbyaddr: addr")) {
+            set_h_errno(ctx, NETDB_INTERNAL);
+            return 0;
+        }
+        const u8 scope = b[addr + 1] & 0xC0;
+        if (b[addr] == 0xFE && (scope == 0x80 || scope == 0xC0)) {
+            set_h_errno(ctx, HOST_NOT_FOUND);
+            return 0;
+        }
+        const u32 w2 = r32(b, addr + 8), w3 = r32(b, addr + 12);
+        if (!r32(b, addr) && !r32(b, addr + 4) && (w2 == 0xFFFF || (!w2 && w3 != 0 && w3 != 1))) {
+            addr += 12;
+            len = 4;
+            type = SYS_NET_AF_INET;
+        }
+    }
+    if (type == SYS_NET_AF_INET6) {
+        if (len != 16) return fail(SYS_NET_EINVAL);
+    } else if (type == SYS_NET_AF_INET) {
+        if (len != 4) return fail(SYS_NET_EINVAL);
+        if (!usable(ctx, addr, 4, "gethostbyaddr: addr")) {
+            set_h_errno(ctx, NETDB_INTERNAL);
+            return 0;
+        }
+    } else {
+        return fail(SYS_NET_EAFNOSUPPORT);
+    }
+    set_h_errno(ctx, NETDB_INTERNAL);
+    u32 hp = 0;
+    const s32 r = nsdispatch([&] { return files_byaddr(ctx, addr, len, type, &hp); }, [&] { return dns_byaddr(ctx, addr, type); });
+    if (r != NS_SUCCESS) return 0;
+    set_h_errno(ctx, NETDB_SUCCESS);
+    return hp;
 }
 
 } // namespace

@@ -2,8 +2,9 @@
 // fresh processes, one calling pspocket's functions and one Sony's module; every answer, every byte written (the
 // scripts' memory and libnet's pool) and the lv2 network calls made the same. What differs between the two by
 // construction is masked: the allocation tags in the pool's block headers (pointers to each module's own file names),
-// lv2 object IDs, the random generator's state (seeded from the clock) and its numbers, the clock itself. Skipped
-// without the firmware (PSPOCKET_TEST_DEV_FLASH); no game data.
+// pointers into each module's hosts text, lv2 object IDs, the random generator's state (seeded from the clock; the
+// resolver's script sets it the same in both) and its numbers, the clock itself. Skipped without the firmware
+// (PSPOCKET_TEST_DEV_FLASH); no game data.
 
 #include <catch_amalgamated.hpp>
 
@@ -127,6 +128,21 @@ std::vector<u8> pool_bytes(const GuestMemory& mem, u8* b, u32 start)
             std::memset(out.data() + off, 0, 4);
         }
     }
+    // The resolver's hosts file (a FILE from the pool) points into each module's own hosts text: at its start and
+    // where it has been read to, which stays behind in a later block (res_query clears its low 4 bits).
+    static constexpr std::string_view hosts = "127.0.0.1 localhost localhost.\n";
+    for (u32 off = 0; off + 4 <= kPoolSize; off += 4) {
+        const u32 w = ps_read32(b, kPool + off);
+        if (w < 0x10000 || w >= 0xF0000000 || !mem.is_committed(w) || !mem.is_committed(w - 31) ||
+            !mem.is_committed(w + 32))
+            continue;
+        for (u32 k = 0; k <= hosts.size(); k++) {
+            if (b[w - k] == '1' && std::memcmp(b + w - k, hosts.data(), hosts.size() + 1) == 0) {
+                std::memset(out.data() + off, 0, 4);
+                break;
+            }
+        }
+    }
     for (u32 at = start, guard = 0; guard < 4096 && at + 20 <= kPool + kPoolSize; guard++) {
         const u32 size = ps_read32(b, at + 16);
         if (size == 0 || size > kPoolSize) break;
@@ -177,6 +193,21 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
         if (name == "=" || name == "~") {
             const u32 at = static_cast<u32>(op.args[0]);
             ps_write32(b, at, name == "=" ? static_cast<u32>(op.args[1]) : ps_read32(b, at) != 0);
+            r.answers.push_back(0);
+            continue;
+        }
+        if (name == "rand") { // the generator's state (seeded from the clock) set the same in both runs
+            bool found = false;
+            for (u32 at = kPool, guard = 0; guard < 4096 && at + 20 <= kPool + kPoolSize; guard++) {
+                const u32 size = ps_read32(b, at + 16);
+                if (size == 0 || size > kPoolSize) break;
+                if (size == 2084) {
+                    for (u32 i = 0; i < 521; i++) ps_write32(b, at + 20 + 4 * i, 0x9E3779B9u * (i + 1) ^ (i << 11));
+                    found = true;
+                }
+                at += 20 + size;
+            }
+            REQUIRE(found);
             r.answers.push_back(0);
             continue;
         }
@@ -249,8 +280,14 @@ void compare(const std::string& flash, const std::vector<Op>& ops, const std::st
     REQUIRE(mine.pools.size() == sonys.pools.size());
     for (usize k = 0; k < mine.pools.size(); k++) {
         const usize at = first_diff(mine.pools[k], sonys.pools[k]);
-        INFO(std::format("{}: pool {} differs first at +{:#x} (ours {:#04x}, Sony's {:#04x})", what, k, at,
-            at < mine.pools[k].size() ? mine.pools[k][at] : 0, at < sonys.pools[k].size() ? sonys.pools[k][at] : 0));
+        const auto bytes = [&](const std::vector<u8>& v) {
+            std::string h;
+            for (usize i = at & ~usize{15}; i < std::min(v.size(), (at & ~usize{15}) + 48); i++) h += std::format("{:02x}", v[i]);
+            return h;
+        };
+        INFO(std::format("{}: pool {} differs first at +{:#x} (ours {:#04x}, Sony's {:#04x}); from +{:#x} ours {}, Sony's {}",
+            what, k, at, at < mine.pools[k].size() ? mine.pools[k][at] : 0,
+            at < sonys.pools[k].size() ? sonys.pools[k][at] : 0, at & ~usize{15}, bytes(mine.pools[k]), bytes(sonys.pools[k])));
         CHECK(at == mine.pools[k].size());
     }
     CHECK(mine.tty == sonys.tty);
@@ -515,47 +552,6 @@ std::vector<Op> interface_script()
 }
 
 // The resolver: names libnet knows (its /etc/hosts, numbers), and names it would ask a name server for.
-std::vector<Op> resolver_script()
-{
-    std::vector<Op> s;
-    init_param(s, kPool, kPoolSize, 0);
-    s.push_back({"sys_net_initialize_network_ex", {kParam}});
-    s.push_back({"=", {kOut + 0x7000, 0x6C6F6361}}); // "localhost"
-    s.push_back({"=", {kOut + 0x7004, 0x6C686F73}});
-    s.push_back({"=", {kOut + 0x7008, 0x74000000}});
-    s.push_back({"gethostbyname", {kOut + 0x7000}, kSign});
-    s.push_back({"_sys_net_h_errno_loc", {}, kSign, kOut + 0x7100});
-    s.push_back({"gethostbyname", {str(0)}, kSign});
-    s.push_back({"gethostbyname", {str(5)}, kSign});
-    s.push_back({"=", {kOut + 0x7010, 0x6578616D}}); // "example.com"
-    s.push_back({"=", {kOut + 0x7014, 0x706C652E}});
-    s.push_back({"=", {kOut + 0x7018, 0x636F6D00}});
-    s.push_back({"gethostbyname", {kOut + 0x7010}, kSign});
-    s.push_back({"gethostbyname", {0}, kSign});
-    // gethostbyaddr.
-    s.push_back({"=", {kOut + 0xF00, 0x7F000001}});
-    s.push_back({"=", {kOut + 0xF10, 0xFE800000}});
-    s.push_back({"=", {kOut + 0xF20, 0}});
-    s.push_back({"=", {kOut + 0xF24, 0}});
-    s.push_back({"=", {kOut + 0xF28, 0xFFFF}});
-    s.push_back({"=", {kOut + 0xF2C, 0x7F000001}});
-    s.push_back({"gethostbyaddr", {0, 4, 2}, kSign});
-    s.push_back({"_sys_net_h_errno_loc", {}, kSign, kOut + 0xF80});
-    s.push_back({"gethostbyaddr", {kOut + 0xF00, 3, 2}, kSign});
-    s.push_back({"gethostbyaddr", {kOut + 0xF00, 4, 7}, kSign});
-    s.push_back({"gethostbyaddr", {kOut + 0xF10, 16, 24}, kSign});
-    s.push_back({"gethostbyaddr", {kOut + 0xF00, 4, 2}, kSign});
-    s.push_back({"gethostbyaddr", {kOut + 0xF20, 16, 24}, kSign});
-    s.push_back({"=", {kOut + 0xF40, 0x08080808}});
-    s.push_back({"gethostbyaddr", {kOut + 0xF40, 4, 2}, kSign});
-    s.push_back({"_sys_net_h_errno_loc", {}, kSign, kOut + 0xF84});
-    s.push_back({"=", {kOut + 0xF44, 0x7F000002}});
-    s.push_back({"gethostbyaddr", {kOut + 0xF44, 4, 2}, kSign});
-    s.push_back({"pool", {}});
-    s.push_back({"sys_net_finalize_network", {}});
-    return s;
-}
-
 // A string written with 32-bit stores (its NUL included).
 void put_str(std::vector<Op>& s, u32 at, std::string_view text)
 {
@@ -567,6 +563,79 @@ void put_str(std::vector<Op>& s, u32 at, std::string_view text)
                       u32{static_cast<u8>(t[i + 2])} << 8 | static_cast<u8>(t[i + 3]);
         s.push_back({"=", {at + i, w}});
     }
+}
+
+// libnet's resolver (D-539, part 4): names that are addresses, the built-in hosts file, and the name server it cannot
+// reach offline (its query is still made: the generator's state is set the same in both processes first). The pool
+// (the thread's context with errno, h_errno, the hostent and the resolver's state) compared after every lookup.
+std::vector<Op> resolver_script()
+{
+    std::vector<Op> s;
+    init_param(s, kPool, kPoolSize, 0);
+    s.push_back({"sys_net_initialize_network_ex", {kParam}});
+    s.push_back({"rand", {}});
+    const auto name = [&](u32 i, std::string_view text) {
+        put_str(s, kOut + 0x2000 + 0x100 * i, text);
+        return u64{kOut + 0x2000 + 0x100 * i};
+    };
+    const auto by_name = [&](u64 n, u32 flags = 0) {
+        s.push_back({"gethostbyname", {n}, flags});
+        s.push_back({"pool", {}});
+    };
+    const std::vector<std::string> names = {
+        "localhost", "LOCALHOST", "localhost.", "LocalHost.", "localhost..", "127.0.0.1", "1.2.3.4", "1.2.3",
+        "1.2.3.4.", "01.2.3.4", "0x7f.1", "::1", "fe80::1", "::ffff:1.2.3.4", "abc", "deadbeef", "example.com",
+        "example.com.", "www.example.co.uk", "a..b", "a.", ".", "..", "", "\\065bc", "a\\.b", "a\\", "\\999", "\\06",
+        std::string(63, 'a'), std::string(64, 'b'),
+        std::string(63, 'a') + "." + std::string(63, 'b') + "." + std::string(63, 'c') + "." + std::string(63, 'd'),
+        "local host", "#x", "1:2", ":", "a:b.c", "1::2::3",
+    };
+    for (u32 i = 0; i < names.size(); i++) by_name(name(i, names[i]));
+    put_str(s, kOut + 0x6000, std::string(300, 'x'));
+    by_name(kOut + 0x6000);
+    std::string dotted;
+    for (u32 i = 0; i < 550; i++) dotted += "a.";
+    put_str(s, kOut + 0x6200, dotted); // 1100 bytes: too long for res_querydomain
+    by_name(kOut + 0x6200);
+    by_name(0);
+    // Another thread: a context of its own.
+    by_name(name(0, "localhost"), kSecond);
+    by_name(name(16, "example.com"), kSecond);
+    // The resolver's tries and timeout.
+    s.push_back({"sys_net_set_resolver_configurations", {3, 2, 0}});
+    by_name(name(16, "example.com"));
+    s.push_back({"sys_net_set_resolver_configurations", {0, 0, 0}});
+    // gethostbyaddr.
+    const auto address = [&](u32 i, std::initializer_list<u32> words) {
+        u32 k = 0;
+        for (const u32 w : words) s.push_back({"=", {kOut + 0x1000 + 0x20 * i + 4 * k++, w}});
+        return u64{kOut + 0x1000 + 0x20 * i};
+    };
+    const auto by_addr = [&](u64 a, u32 len, u32 type) {
+        s.push_back({"gethostbyaddr", {a, len, type}});
+        s.push_back({"pool", {}});
+    };
+    const u64 lo = address(0, {0x7F000001});
+    by_addr(0, 4, 2);
+    by_addr(lo, 3, 2);
+    by_addr(lo, 4, 7);
+    by_addr(lo, 16, 2);
+    by_addr(lo, 4, 24);
+    by_addr(address(1, {0xFE800000, 0, 0, 1}), 16, 24);
+    by_addr(address(2, {0xFEC00000, 0, 0, 1}), 16, 24);
+    by_addr(address(3, {0xFE400000, 0, 0, 1}), 16, 24);
+    by_addr(lo, 4, 2);
+    by_addr(address(4, {0, 0, 0xFFFF, 0x7F000001}), 16, 24);
+    by_addr(address(5, {0, 0, 0, 0x7F000001}), 16, 24);
+    by_addr(address(6, {0, 0, 0, 1}), 16, 24);
+    by_addr(address(7, {0, 0, 0, 0}), 16, 24);
+    by_addr(address(8, {0x08080808}), 4, 2);
+    by_addr(address(9, {0x7F000002}), 4, 2);
+    by_addr(address(10, {0x20010DB8, 0, 0, 1}), 16, 24);
+    s.push_back({"gethostbyaddr", {lo, 4, 2}, kSecond});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_net_finalize_network", {}});
+    return s;
 }
 
 // libnet's configuration functions (D-539): ioctl and control, the dumps, the test parameters, the name servers.
@@ -857,7 +926,7 @@ TEST_CASE("sys_net against libnet: interfaces", "[hle][lle][net]")
 
 // Hidden until libnet's resolver itself is pspocket's (its answers match already; its hosts-file reads, res_init and the
 // DNS attempt make pool allocations and an lv2 infoctl the interim gethostbyname leaves out).
-TEST_CASE("sys_net against libnet: the resolver", "[.][hle][lle][net]")
+TEST_CASE("sys_net against libnet: the resolver", "[hle][lle][net]")
 {
     const std::optional<std::string> flash = test_dev_flash();
     if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");

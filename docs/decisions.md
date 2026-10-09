@@ -7002,7 +7002,7 @@ waits on a pre-sent event, ring wrap-around, failing signals; the interlock with
 with two SPU threads of a group made in the test (ports taken); and a thread probing while another releases. About
 6,500 lines of answers, bytes and callback arguments, and every lv2 call with its arguments, the same.
 
-## D-539 · 2026-10-09 · sys_net, part 2: libnet's configuration calls, routes, interfaces and netsets
+## D-539 · 2026-10-09 · sys_net, part 2: libnet's configuration calls, routes, interfaces, netsets and resolver
 
 D-523 made libnet's core pspocket's own; this is the rest of what libnet.sprx exports but the resolver (part 4 below).
 All in runtime/hle/src/sys_net.cpp, read from libnet's code and compared with it running on pspocket's lv2
@@ -7044,6 +7044,38 @@ TTY the same).
   interface's index, finds none.
 - Deviations: sys_net_get_lib_name_server writes 0 for a server the library does not have (libnet copies its stack's
   leftovers); bad guest pointers are refused with errno EFAULT and the call site logged.
+
+Part 4, **the resolver** (gethostbyname, now libnet's own, and gethostbyaddr, replacing D-569's interim one): FreeBSD's
+gethnamaddr.c and nsdispatch over BIND 8's res_query, res_mkquery, res_comp and res_send, as Sony built them, their
+statics in the thread's context (the hostent at +0xC0 with its address and alias pointers, text buffer and address;
+BIND's __res_state from +0x988; res_send's socket at +0xB44). Compared with libnet in the "resolver" script: 44 lookups
+by name (41 names) and 18 by address on two threads, the pool after each (with the DNS query each builds: the
+generator's state is set the same in both processes first, which also checks _sys_net_lib_rand against libnet's) and
+every lv2 call: 0 differences.
+- Every step first reads lv2's resolver configuration again (infoctl 9: libnet never sets RES_INIT) and would run
+  res_init when it changed; lv2 has none offline (D-523), so one gethostbyname makes up to six of these calls.
+- A name that is an address gives a hostent of its own (digits and dots, or hex digits, colons and dots with a colon;
+  not when it ends with a dot; HOST_NOT_FOUND when inet_pton refuses it). Any other name goes to the hosts source and
+  then the DNS source (nsdispatch with no nsswitch configuration: the defaults).
+- The hosts file is libnet's built-in "127.0.0.1 localhost localhost.\n", read through libnet's own FILE (88 bytes from
+  the pool, "netset.c" 1698; at its end fgets sets errno EBADF; its rewind only marks the end). By name, every entry of
+  the family whose name or an alias matches (case ignored) is gathered in a block from the pool ("gethnamaddr.c" 0x3DB)
+  and copied back into the text buffer; by address, the first entry with the address.
+- gethostbyaddr: link- and site-local IPv6 addresses are HOST_NOT_FOUND at once, IPv4-mapped and -compatible ones are
+  looked up as IPv4; a length not the type's is EINVAL, another type EAFNOSUPPORT. Its DNS query is the address's
+  in-addr.arpa or ip6.arpa name.
+- DNS: res_search (ndots is 0 and the search list empty, since res_init never ran: every name is tried as it is),
+  res_querydomain (a trailing dot dropped), res_query, res_mkquery (an ID from libnet's generator, also kept at +0x9C8;
+  RD set), dn_comp (ns_name_pton into a 255-byte block from the pool, "res_comp.c" 0x345 — Sony's has no check for an
+  empty label before the end, so "a.." is "a." —; each label looked up among the earlier names: errno ENOENT) and
+  res_send. The context's one name server has no family: the DNS cache's hooks act on AF_INET servers only, lv2
+  refuses socket(0, SOCK_DGRAM), the server is marked bad and the tries end: errno ECONNREFUSED, h_errno TRY_AGAIN
+  (NO_RECOVERY when no query can be made: a name too long, a label over 63 bytes, a bad escape).
+- Not pspocket's own, with a fatal log: res_init (reached only after _sce_net_set_name_server gave lv2 a
+  configuration), RES_USE_INET6's mapped hostents (set only by res_init), the DNS cache and the exchange with a name
+  server lv2 gives a socket for, and an answer's parsing (none comes offline).
+- The comparison now also masks pointers into each module's hosts text, which stay behind in the pool (one with its
+  low 4 bits cleared by res_query).
 
 ## D-562 · 2026-10-09 · cellSail pspocket's own, from libsail (part 1: the objects the game hands the player)
 
