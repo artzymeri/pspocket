@@ -602,6 +602,207 @@ s32 cellSailPlayerSetAuReceiver(PPUContext& ctx, u32 p, u32 index, u32 receiver)
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------------------------- parameters
+
+// SetParameter(player, parameter, a, b): before boot only. Player-wide parameters take `a`; per-stream ones take the
+// stream's index in `a` and the value in `b`; unknown ones below 36 are accepted and ignored, like libsail's table.
+s32 set_audio_parameter(PPUContext& ctx, u32 slot, u32 param, u64 v)
+{
+    switch (param) {
+    case 12: w32(ctx, slot + 0x164, static_cast<u32>(v)); break;
+    case 14: w32(ctx, slot + 0x178, static_cast<u32>(v)); break;
+    case 15: w64(ctx, slot + 0x170, v); break;
+    case 26:
+        if (v != 0) return error(CELL_SAIL_ERROR_INVALID_ARG);
+        ps_write16(gb(ctx), slot + 0x156, static_cast<u16>((ps_read16(gb(ctx), slot + 0x156) & 0xFE) | 1));
+        break;
+    case 32:
+        if (v > 1) return error(CELL_SAIL_ERROR_INVALID_ARG);
+        w8(ctx, slot + 0x158, static_cast<u8>(v));
+        break;
+    default: break;
+    }
+    return lv2::CELL_OK;
+}
+
+s32 set_video_parameter(PPUContext& ctx, u32 slot, u32 param, u64 v)
+{
+    u8* b = gb(ctx);
+    switch (param) {
+    case 0:
+        if (v == 0) {
+            std::memset(b + slot + 0x21C, 0, 24);
+            std::memset(b + slot + 0x190, 0, 96);
+            w8(ctx, slot + 0x18D, 0);
+            break;
+        }
+        w64(ctx, slot + 0x228, 0x0101010101010101ull);
+        w32(ctx, slot + 0x230, 1);
+        std::memset(b + slot + 0x190, 0, 96);
+        {
+            const u32 at = static_cast<u32>(v), kind = r32(ctx, at + 4), mode = r32(ctx, at + 8);
+            if (kind > 3 || mode > 2) return error(CELL_SAIL_ERROR_INVALID_ARG);
+            w32(ctx, slot + 0x190 + 8, mode);
+            w32(ctx, slot + 0x190 + 4, kind);
+            w8(ctx, slot + 0x18D, 1);
+        }
+        break;
+    case 16: w32(ctx, slot + 0x1F8, static_cast<u32>(v)); break;
+    case 18: w8(ctx, slot + 0x18B, static_cast<u8>(v)); break;
+    case 19: w8(ctx, slot + 0x18C, static_cast<u8>(v)); break;
+    case 20: w64(ctx, slot + 0x210, v); break;
+    case 23: w32(ctx, slot + 0x230, static_cast<u32>(v)); break;
+    case 24: w64(ctx, slot + 0x228, v); break;
+    case 25:
+        if (static_cast<u32>(v) - 1 > 2) return error(CELL_SAIL_ERROR_INVALID_ARG);
+        w8(ctx, slot + 0x188, static_cast<u8>(v));
+        break;
+    case 27:
+        if (v > 1) return error(CELL_SAIL_ERROR_INVALID_ARG);
+        ps_write16(b, slot + 0x186, static_cast<u16>((ps_read16(b, slot + 0x186) & 0xFE) | (v == 0 ? 1 : 0)));
+        break;
+    case 30:
+    case 31:
+        if (static_cast<s32>(v) <= 0) return error(CELL_SAIL_ERROR_INVALID_ARG);
+        w8(ctx, slot + (param == 30 ? 0x189 : 0x18A), static_cast<u8>(v));
+        break;
+    case 35:
+        if (v > 1) return error(CELL_SAIL_ERROR_INVALID_ARG);
+        w8(ctx, slot + 0x18E, static_cast<u8>(v));
+        break;
+    default: break;
+    }
+    return lv2::CELL_OK;
+}
+
+s32 set_file_calls(PPUContext& ctx, u32 source, u32 calls);
+
+s32 cellSailPlayerSetParameter(PPUContext& ctx, u32 p, u32 param, u64 a, u64 v)
+{
+    if (r8(ctx, p + pl::kState) != pl::kInitialized) return error(CELL_SAIL_ERROR_INVALID_STATE);
+    if (param > 35) return error(CELL_SAIL_ERROR_INVALID_ARG);
+    const u32 a32 = static_cast<u32>(a);
+    switch (param) {
+    case 1: return error(CELL_SAIL_ERROR_INVALID_ARG);
+    case 2: w32(ctx, p + pl::kThreadPrio, a32); break;
+    case 3: w32(ctx, p + pl::kSpursSpus, a32); break;
+    case 4: w32(ctx, p + pl::kSpursSpuPrio, a32); break;
+    case 5: w32(ctx, p + pl::kSpursPpuPrio, a32); break;
+    case 6: w8(ctx, p + pl::kSpursExit, a != 0 ? 1 : 0); break;
+    case 7: w32(ctx, p + 0x3A8, a32); break; // the file source thread's priority
+    case 8: w32(ctx, p + 0x360, a32); break;
+    case 10: w32(ctx, p + 0x374, a32); break;
+    case 11: w64(ctx, p + 0x36C, a); break;
+    case 29: w32(ctx, p + pl::kThreadStack, a32); break;
+    case 33:
+        if ((a || v) && (!a || v != 0x28)) return error(CELL_SAIL_ERROR_INVALID_ARG);
+        return set_file_calls(ctx, r32(ctx, p + pl::kSource), a32);
+    case 34: w32(ctx, p + 0x3AC, a32); break; // the file source thread's stack
+    case 12: case 13: case 14: case 15: case 26: case 32:
+        if (a32 >= r32(ctx, p + pl::kAudioCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+        return set_audio_parameter(ctx, r32(ctx, p + pl::kAudio) + a32 * pl::kAudioStride, param, v);
+    case 0: case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 24: case 25: case 27: case 30:
+    case 31: case 35:
+        if (a32 >= r32(ctx, p + pl::kVideoCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+        return set_video_parameter(ctx, r32(ctx, p + pl::kVideo) + a32 * pl::kVideoStride, param, v);
+    default: break; // 9, 28: accepted
+    }
+    return lv2::CELL_OK;
+}
+
+// The built-in source's file calls replaced by the game's (parameter 33): NULL puts libsail's back; else the game's
+// structure {0, open, ?, close, fstat, read, lseek, ...} with every call present, its first 0x28 bytes copied.
+s32 set_file_calls(PPUContext& ctx, u32 source, u32 calls)
+{
+    u8* b = gb(ctx);
+    if (!calls) {
+        const u32 own[14] = {0xFFFFFFFF, internal("_pspocket_cellSail_fsOpen"), 0, internal("_pspocket_cellSail_fsClose"),
+            internal("_pspocket_cellSail_fsRead"), internal("_pspocket_cellSail_fsLseek"),
+            internal("_pspocket_cellSail_fsFstat"), internal("_pspocket_cellSail_fsCancel"), 0, 0, 0, 0, 0, 0};
+        for (u32 i = 0; i < 14; i++) ps_write32(b, source + fs::kCalls + 4 * i, own[i]);
+        return lv2::CELL_OK;
+    }
+    if (r32(ctx, calls) != 0 || !r32(ctx, calls + 4) || !r32(ctx, calls + 12) || !r32(ctx, calls + 16) ||
+        !r32(ctx, calls + 20) || !r32(ctx, calls + 24) || !r32(ctx, calls + 28))
+        return error(CELL_SAIL_ERROR_INVALID_ARG);
+    std::memmove(b + source + fs::kCalls, b + calls, 0x28);
+    return lv2::CELL_OK;
+}
+
+// GetParameter(player, parameter, u64* a, u64* b): player-wide values into *a; per-stream ones by the index in *a into
+// *b. Unknown ones read 0 or are INVALID_ARG as in libsail's tables.
+s32 cellSailPlayerGetParameter(PPUContext& ctx, u32 p, u32 param, u32 a, u32 b)
+{
+    const s32 bad = error(CELL_SAIL_ERROR_INVALID_ARG);
+    if (param == 0) {
+        if (!a || !b) return bad;
+        const u32 index = static_cast<u32>(r64(ctx, a));
+        if (index >= r32(ctx, p + pl::kVideoCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+        w64(ctx, b, r8(ctx, r32(ctx, p + pl::kVideo) + index * pl::kVideoStride + 0x18D));
+        return lv2::CELL_OK;
+    }
+    if (!a) return bad;
+    const auto s32_of = [&](u32 at) { return static_cast<u64>(static_cast<s64>(static_cast<s32>(r32(ctx, at)))); };
+    switch (param) {
+    case 1: w64(ctx, a, static_cast<u32>(r32(ctx, p + pl::kQueue) - 50)); return lv2::CELL_OK;
+    case 2: w64(ctx, a, s32_of(p + pl::kThreadPrio)); return lv2::CELL_OK;
+    case 3: w64(ctx, a, s32_of(p + pl::kSpursSpus)); return lv2::CELL_OK;
+    case 4: w64(ctx, a, s32_of(p + pl::kSpursSpuPrio)); return lv2::CELL_OK;
+    case 5: w64(ctx, a, s32_of(p + pl::kSpursPpuPrio)); return lv2::CELL_OK;
+    case 6: w64(ctx, a, r8(ctx, p + pl::kSpursExit)); return lv2::CELL_OK;
+    case 7: w64(ctx, a, r32(ctx, p + 0x3A8) ? s32_of(p + 0x3A8) : 0x4B0); return lv2::CELL_OK;
+    case 8: w64(ctx, a, r32(ctx, p + 0x360)); return lv2::CELL_OK;
+    case 9: return lv2::CELL_OK;
+    case 10: w64(ctx, a, r32(ctx, p + 0x374)); return lv2::CELL_OK;
+    case 11: w64(ctx, a, r64(ctx, p + 0x36C)); return lv2::CELL_OK;
+    case 29: w64(ctx, a, r32(ctx, p + pl::kThreadStack)); return lv2::CELL_OK;
+    case 33:
+        if (!b || r64(ctx, b) != 0x28) return bad;
+        std::memmove(gb(ctx) + a, gb(ctx) + r32(ctx, p + pl::kSource) + fs::kCalls, 0x28);
+        return lv2::CELL_OK;
+    case 34: w64(ctx, a, r32(ctx, p + 0x3AC) ? r32(ctx, p + 0x3AC) : 0x1000); return lv2::CELL_OK;
+    default: break;
+    }
+    // The per-stream parameters (12-28, 30-32, 35).
+    if (!b || param > 35) return bad;
+    const u64 bit = u64{1} << param;
+    const u32 index = static_cast<u32>(r64(ctx, a));
+    u64 v = 0;
+    if (bit & 0x8CBFF0000ull) {
+        if (index >= r32(ctx, p + pl::kVideoCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+        const u32 slot = r32(ctx, p + pl::kVideo) + index * pl::kVideoStride;
+        switch (param) {
+        case 16: v = s32_of(slot + 0x1F8); break;
+        case 18: v = r8(ctx, slot + 0x18B); break;
+        case 19: v = r8(ctx, slot + 0x18C); break;
+        case 20: v = r64(ctx, slot + 0x210); break;
+        case 23: v = r32(ctx, slot + 0x230); break;
+        case 24: v = r64(ctx, slot + 0x228); break;
+        case 25: v = r8(ctx, slot + 0x188); break;
+        case 27: v = (ps_read16(gb(ctx), slot + 0x186) ^ 1) & 1; break;
+        case 30: v = r8(ctx, slot + 0x189); break;
+        case 31: v = r8(ctx, slot + 0x18A); break;
+        case 35: v = static_cast<u64>(static_cast<s64>(static_cast<s8>(r8(ctx, slot + 0x18E)))); break;
+        default: break;
+        }
+    } else if (bit & 0x10400F000ull) {
+        if (index >= r32(ctx, p + pl::kAudioCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+        const u32 slot = r32(ctx, p + pl::kAudio) + index * pl::kAudioStride;
+        switch (param) {
+        case 12: v = r32(ctx, slot + 0x164); break;
+        case 14: v = r32(ctx, slot + 0x178); break;
+        case 15: v = r64(ctx, slot + 0x170); break;
+        case 26: v = (ps_read16(gb(ctx), slot + 0x156) ^ 1) & 1; break;
+        case 32: v = r8(ctx, slot + 0x158); break;
+        default: break;
+        }
+    } else if (!(bit & 0x10000000ull)) {
+        return bad;
+    }
+    w64(ctx, b, v);
+    return lv2::CELL_OK;
+}
+
 #define SAIL_INTERNAL(n)                                                                                               \
     ::pspocket::hle::Function{{}, "_pspocket_cellSail_" #n, recomp::nid_of("_pspocket_cellSail_" #n),                  \
         &detail::thunk<&_pspocket_cellSail_##n>, true}
@@ -632,6 +833,8 @@ void register_cellSailPlayer(Registry& r)
         SAIL(cellSailPlayerSetRendererVideo),
         SAIL(cellSailPlayerSetGraphicsAdapter),
         SAIL(cellSailPlayerSetAuReceiver),
+        SAIL(cellSailPlayerSetParameter),
+        SAIL(cellSailPlayerGetParameter),
         SAIL_INTERNAL(fsOpen),
         SAIL_INTERNAL(fsClose),
         SAIL_INTERNAL(fsRead),

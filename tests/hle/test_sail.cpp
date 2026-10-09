@@ -76,6 +76,7 @@ void part1(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part2(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part3(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part4(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part5(u8* b, const Call& call, u32 cb, GuestThread& t);
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
 Run run(const std::string& flash, bool sony, int part)
@@ -119,7 +120,8 @@ Run run(const std::string& flash, bool sony, int part)
     if (part == 1) part1(b, call, cb, t);
     else if (part == 2) part2(b, call, cb, t);
     else if (part == 3) part3(b, call, cb, t);
-    else part4(b, call, cb, t);
+    else if (part == 4) part4(b, call, cb, t);
+    else part5(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
@@ -554,10 +556,85 @@ void part4(u8* b, const Call& call_, u32 cb, GuestThread&)
             call("cellSailGraphicsAdapterUpdateAvSync", {kGa, r.frame, r.time}, true);
         }
         std::memcpy(b + kOut + 0x100, b + kP + 8, 200); // the clock after
+        // An AU receiver: refused with any callbacks, made without; its callback copy is each side's own code.
+        constexpr u32 kAu = kArea + 0x2400;
+        std::memset(b + kAu, 0xEE, 0x200);
+        call("cellSailAuReceiverInitialize", {kAu, 1, 0, 0x77});
+        call("cellSailAuReceiverInitialize", {kAu, 0, 1, 0x77});
+        call("cellSailAuReceiverInitialize", {kAu, 0, 0, 0x77});
+        std::memcpy(b + kOut + 0x200, b + kAu, 0x20);
+        std::memcpy(b + kOut + 0x220, b + kAu + 0x44, 0x1BC);
+        call("cellSailAuReceiverFinalize", {kAu});
         call("cellSailSoundAdapterFinalize", {kSa});
         call("cellSailGraphicsAdapterFinalize", {kGa});
         call("cellSailPlayerFinalize", {kP});
     }
+}
+
+// Every parameter set and read on a player of two audio and two video streams: each value, the per-stream ones by
+// index (in range and not), video parameter 0's structure, the file calls (parameter 33).
+void part5(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kS = kArea + 0x1A00,
+                  kCalls = kArea + 0x1A80;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 1, 2, 2, 0, 0});
+    const u32 src = ps_read32(b, kP + 0x3B0);
+    if (src >= kArea && src < kArea + 0x3000) {
+        g_mask.push_back({src + 0x48, 0x38});
+        g_mask.push_back({src + 0x100, 0x38});
+    }
+    const auto get_all = [&] {
+        for (u32 param = 0; param < 38; param++) {
+            for (u64 index : {0ull, 1ull, 2ull}) {
+                ps_write64(b, kOut, index);
+                ps_write64(b, kOut + 8, 0xEEEEEEEEEEEEEEEEull);
+                call("cellSailPlayerGetParameter", {kP, param, kOut, kOut + 8});
+                call("cellSailPlayerGetParameter", {kP, param, kOut, 0});
+            }
+            call("cellSailPlayerGetParameter", {kP, param, 0, kOut + 8});
+        }
+        ps_write64(b, kOut + 8, 0x28);
+        call("cellSailPlayerGetParameter", {kP, 33, kOut + 0x40, kOut + 8});
+        ps_write64(b, kOut + 8, 0x20);
+        call("cellSailPlayerGetParameter", {kP, 33, kOut + 0x40, kOut + 8});
+    };
+    get_all();
+    // Values for every parameter, player-wide in `a`, per stream (index 1, then 5) in `b`.
+    static const u64 kValues[] = {0, 1, 2, 3, 0xFFFFFFFF, 0x123456789ull};
+    for (u32 param = 0; param < 37; param++) {
+        if (param == 0 || param == 33) continue;
+        for (const u64 v : kValues) {
+            call("cellSailPlayerSetParameter", {kP, param, v, v});
+            call("cellSailPlayerSetParameter", {kP, param, 1, v});
+            call("cellSailPlayerSetParameter", {kP, param, 5, v});
+        }
+    }
+    // Video parameter 0: off, then a structure (its two fields in and out of range).
+    call("cellSailPlayerSetParameter", {kP, 0, 1, 0});
+    for (const auto& f : std::vector<std::array<u32, 2>>{{0, 0}, {3, 2}, {4, 0}, {0, 3}, {1, 1}}) {
+        ps_write32(b, kS + 4, f[0]);
+        ps_write32(b, kS + 8, f[1]);
+        call("cellSailPlayerSetParameter", {kP, 0, 1, kS});
+    }
+    // The file calls: refused shapes, the game's, back to libsail's.
+    for (u32 i = 0; i < 10; i++) ps_write32(b, kCalls + 4 * i, i == 0 ? 0 : 0x50000000 + i);
+    call("cellSailPlayerSetParameter", {kP, 33, kCalls, 0x20});
+    call("cellSailPlayerSetParameter", {kP, 33, 0, 0x28});
+    ps_write32(b, kCalls + 12, 0);
+    call("cellSailPlayerSetParameter", {kP, 33, kCalls, 0x28});
+    ps_write32(b, kCalls + 12, 0x5000000C);
+    call("cellSailPlayerSetParameter", {kP, 33, kCalls, 0x28});
+    get_all();
+    call("cellSailPlayerSetParameter", {kP, 33, 0, 0});
+    get_all();
+    call("cellSailPlayerFinalize", {kP});
+    call("cellSailPlayerSetParameter", {kP, 2, 5, 0});
+    g_mask.push_back({kOut + 0x40, 0x28}); // parameter 33's copy of libsail's own file calls (each side's code)
 }
 
 void compare_lines(const char* what, const std::vector<std::string>& mine, const std::vector<std::string>& sony)
@@ -595,3 +672,5 @@ TEST_CASE("cellSail against libsail: the player's life before it plays", "[hle][
 TEST_CASE("cellSail against libsail: descriptors' fields and capabilities", "[hle][lle][sail]") { compare_runs(3); }
 
 TEST_CASE("cellSail against libsail: the adapters' set-up, formats and AV sync", "[hle][lle][sail]") { compare_runs(4); }
+
+TEST_CASE("cellSail against libsail: every player parameter set and read", "[hle][lle][sail]") { compare_runs(5); }

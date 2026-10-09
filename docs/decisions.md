@@ -7131,6 +7131,18 @@ first after 100 ms, then kept within a quarter of the last and smoothed by a qua
 kept from 15001 to 149999 us; each with the record's frame mark giving the next frame's time. Compared on players of
 modes 0 and 7: 107 checks (answers, the adapters' and the clock's bytes): 0 differences.
 
+Part 5, the AU receiver's set-up and the player's parameters: AuReceiverInitialize takes no game callbacks in fw 4.92
+(both optional arguments must be NULL, else INVALID_ARG): an lwmutex "_saiau0", libsail's 9 stream callbacks copied
+in, state 1; Finalize marks its stream 8, destroys the lwmutex and clears the 0x200 bytes. SetParameter (before boot
+only; 36 parameters, unknown ones accepted) and GetParameter as libsail's three jump tables: player-wide values
+(control thread priority and stack, SPURS SPUs, priorities and exit flag, the file source thread's priority and stack
+(read back as 0x4B0 and 0x1000 when 0), the queue's length less 50, two buffer settings), per-stream values by index
+(audio 12, 14, 15, 26, 32; video 0, 16, 18-20, 23-25, 27, 30, 31, 35, with their range checks; video 0 takes a
+structure of two bounded fields or clears the stream's settings), and parameter 33, the built-in source's file calls
+(the game's structure of 0x28 bytes with every call present, or NULL for libsail's own). Compared: every parameter
+set with six values and read back at three indices: 2596 checks over the five scripts, 0 differences (parameter
+33's copy of libsail's own calls masked: each side's code).
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)

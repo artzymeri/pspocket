@@ -66,6 +66,15 @@ SAIL_ADAPTER_STUB(gaStop)
 SAIL_ADAPTER_STUB(gaCancel)
 SAIL_ADAPTER_STUB(gaCheckout)
 SAIL_ADAPTER_STUB(gaCheckin)
+SAIL_ADAPTER_STUB(auMakeup)
+SAIL_ADAPTER_STUB(auCleanup)
+SAIL_ADAPTER_STUB(auOpen)
+SAIL_ADAPTER_STUB(auClose)
+SAIL_ADAPTER_STUB(auStart)
+SAIL_ADAPTER_STUB(auStop)
+SAIL_ADAPTER_STUB(auCancel)
+SAIL_ADAPTER_STUB(auCheckout)
+SAIL_ADAPTER_STUB(auCheckin)
 #undef SAIL_ADAPTER_STUB
 
 u32 internal(std::string_view name) { return HleProcess::current()->link_function("cellSail", recomp::nid_of(name), name); }
@@ -86,6 +95,16 @@ void init_graphics_table(u8* b, u32 at)
         "_pspocket_cellSail_gaOpen", "_pspocket_cellSail_gaClose", "_pspocket_cellSail_gaStart",
         "_pspocket_cellSail_gaStop", "_pspocket_cellSail_gaCancel", "_pspocket_cellSail_gaCheckout",
         "_pspocket_cellSail_gaCheckin"};
+    for (u32 i = 0; i < 9; i++) ps_write32(b, at + 4 * i, internal(kNames[i]));
+}
+
+// The AU receiver's (9 descriptors, copied into each receiver).
+void init_receiver_table(u8* b, u32 at)
+{
+    static constexpr std::string_view kNames[9] = {"_pspocket_cellSail_auMakeup", "_pspocket_cellSail_auCleanup",
+        "_pspocket_cellSail_auOpen", "_pspocket_cellSail_auClose", "_pspocket_cellSail_auStart",
+        "_pspocket_cellSail_auStop", "_pspocket_cellSail_auCancel", "_pspocket_cellSail_auCheckout",
+        "_pspocket_cellSail_auCheckin"};
     for (u32 i = 0; i < 9; i++) ps_write32(b, at + 4 * i, internal(kNames[i]));
 }
 
@@ -331,6 +350,33 @@ void cellSailGraphicsAdapterUpdateAvSync(PPUContext& ctx, u32 a, u32 frame, u64 
     avsync_video(ctx, r32(ctx, a + 0x10), frame, time, a + ga::kSync, r32(ctx, a + 8));
 }
 
+// ------------------------------------------------------------------------------------------------- AU receiver
+
+// The AU receiver (0x200 bytes): +0 its state (1 initialized), +4 the argument, +8 an lwmutex "_saiau0", +0x20 its
+// stream callbacks (libsail's 9, copied) and +0x44 itself, +0xE8 the second argument. Both of libsail's optional
+// arguments must be NULL: fw 4.92 takes no game callbacks here.
+s32 cellSailAuReceiverInitialize(PPUContext& ctx, u32 a, u32 funcs, u32 funcs_arg, u32 arg)
+{
+    std::memset(gb(ctx) + a, 0, 0x200);
+    if (funcs | funcs_arg) return error(CELL_SAIL_ERROR_INVALID_ARG);
+    const s32 r = lwmutex_create(ctx, a + 8, "_saiau0");
+    if (r < 0) return r;
+    std::memmove(gb(ctx) + a + 0x20, gb(ctx) + table("_pspocket_cellSailAuReceiverFuncs"), 0x24);
+    w32(ctx, a + 0x44, a);
+    w32(ctx, a, 1);
+    w32(ctx, a + 0xE8, funcs_arg);
+    w32(ctx, a + 4, arg);
+    return lv2::CELL_OK;
+}
+
+s32 cellSailAuReceiverFinalize(PPUContext& ctx, u32 a)
+{
+    w32(ctx, a + 0x20 + 0x38, 8);
+    lwmutex_destroy(ctx, a + 8);
+    std::memset(gb(ctx) + a, 0, 0x200);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_cellSailAdapters(Registry& r)
@@ -352,6 +398,17 @@ void register_cellSailAdapters(Registry& r)
         SAIL(cellSailGraphicsAdapterSetPreferredFormat),
         SAIL(cellSailGraphicsAdapterPtsToTimePosition),
         SAIL(cellSailGraphicsAdapterUpdateAvSync),
+        SAIL(cellSailAuReceiverInitialize),
+        SAIL(cellSailAuReceiverFinalize),
+        SAIL_INTERNAL(auMakeup),
+        SAIL_INTERNAL(auCleanup),
+        SAIL_INTERNAL(auOpen),
+        SAIL_INTERNAL(auClose),
+        SAIL_INTERNAL(auStart),
+        SAIL_INTERNAL(auStop),
+        SAIL_INTERNAL(auCancel),
+        SAIL_INTERNAL(auCheckout),
+        SAIL_INTERNAL(auCheckin),
         SAIL_INTERNAL(saMakeup),
         SAIL_INTERNAL(saCleanup),
         SAIL_INTERNAL(saOpen),
@@ -376,6 +433,8 @@ void register_cellSailAdapters(Registry& r)
             recomp::nid_of("_pspocket_cellSailSoundAdapterRendererFuncs"), 36, 4, &init_sound_table},
         ::pspocket::hle::Variable{{}, "_pspocket_cellSailGraphicsAdapterRendererFuncs",
             recomp::nid_of("_pspocket_cellSailGraphicsAdapterRendererFuncs"), 36, 4, &init_graphics_table},
+        ::pspocket::hle::Variable{{}, "_pspocket_cellSailAuReceiverFuncs",
+            recomp::nid_of("_pspocket_cellSailAuReceiverFuncs"), 36, 4, &init_receiver_table},
     });
 #undef SAIL_INTERNAL
 #undef SAIL
