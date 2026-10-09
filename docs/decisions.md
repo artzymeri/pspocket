@@ -7861,3 +7861,10 @@ the sample-player test failing under a loaded full test run (a one-shot sound is
   latency, up to 64 ms) rather than leaving out blocks to bring it back (gaps).
 Test: tests/hle/test_libmixer.cpp, a callback that sleeps about five periods at block 3 (lv2's sys_timer_usleep) and
 gives each block its own data: the speakers hear blocks 0 to 23 in order (with the old placement, 7 came after 2).
+
+## D-574 · 2026-10-09 · sceNp2's sceNpMatching2Term, Term2's older name
+
+sceNpMatching2Term (0x2FE0DA7D) had been left out of sceNp2 while sceNpMatching2Term2 was there: RPCS3 registers both
+and has the first call the second ("> SDK 2.4.0", sceNp2.cpp), so a game built with an older SDK imports the first.
+It is now the same call. Test: tests/hle/test_np2.cpp (matching 2 taken down by either name, then NOT_INITIALIZED by
+either).

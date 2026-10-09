@@ -168,6 +168,9 @@ s32 sceNpMatching2Term2(PPUContext&)
     return lv2::CELL_OK;
 }
 
+// RPCS3 sceNpMatching2Term: the name before SDK 2.4.0 of sceNpMatching2Term2, which it calls (D-574).
+s32 sceNpMatching2Term(PPUContext& ctx) { return sceNpMatching2Term2(ctx); }
+
 // RPCS3 sceNpMatching2CreateContext: every pointer is needed, then a signed-in user (get_psn_status() is ONLINE):
 // offline SCE_NP_MATCHING2_ERROR_NOT_NP_SIGN_IN, and no context ID is written.
 s32 sceNpMatching2CreateContext(PPUContext& ctx, u32 np_id, u32 comm_id, u32 pass_phrase, u32 ctx_id, s32 option)
@@ -725,6 +728,7 @@ void register_sceNp2(Registry& r)
         PS_HLE_FUNC(0xAADB7C12, sceNp2Term),
         PS_HLE_FUNC(0xF4BABD3F, sceNpMatching2Init2),
         PS_HLE_FUNC(0x23009D07, sceNpMatching2Term2),
+        PS_HLE_FUNC(0x2FE0DA7D, sceNpMatching2Term),
         PS_HLE_FUNC(0x9CBCE3F2, sceNpMatching2CreateContext),
         PS_HLE_FUNC(0x01379FD7, sceNpMatching2DestroyContext),
         PS_HLE_FUNC(0x6BA4C668, sceNpMatching2ContextStartAsync),

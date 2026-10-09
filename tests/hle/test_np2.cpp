@@ -209,8 +209,13 @@ TEST_CASE("sceNpMatching2: up and down with NP 2; no context offline, so nothing
     CHECK(b[kBuf] == 0xAA);
     CHECK(g.call("sceNpMatching2ClearEventData", 1, 1) == 0);
 
-    // Matching 2 down and up again, then NP 2's term takes matching 2 down with it.
+    // Matching 2 down and up again (sceNpMatching2Term is Term2's older name), then NP 2's term takes matching 2 down
+    // with it.
     REQUIRE(g.call("sceNpMatching2Term2") == 0);
+    CHECK(g.call("sceNpMatching2Term2") == kM2NotInit);
+    CHECK(g.call("sceNpMatching2Term") == kM2NotInit);
+    REQUIRE(g.call("sceNpMatching2Init2", 0x4000, 1000, 0) == 0);
+    REQUIRE(g.call("sceNpMatching2Term") == 0);
     CHECK(g.call("sceNpMatching2Term2") == kM2NotInit);
     CHECK(g.call("sceNpMatching2GetEventData", 1, 1, kBuf, 16) == kM2NotInit);
     REQUIRE(g.call("sceNpMatching2Init2", 0x4000, 1000, 0) == 0);
