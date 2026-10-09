@@ -1,4 +1,7 @@
-/* pspocket: FreeType 2.2.1 options for cellFont (D-500); the defaults until made the same as Sony libfreetype's. */
+/* pspocket: FreeType 2.2.1's options as Sony's libfreetype.sprx (4.92) has them (D-525): FreeType's defaults with
+   FT_CONFIG_OPTION_FORCE_INT64 (Sony's FT_MulFix, FT_MulDiv and FT_DivFix multiply in 64 bits) and without
+   FT_CONFIG_OPTION_USE_ZLIB (its FT_Stream_OpenGzip answers FT_Err_Unimplemented_Feature); its structures' sizes agree
+   with the defaults. */
 /***************************************************************************/
 /*                                                                         */
 /*  ftoption.h                                                             */
@@ -93,7 +96,7 @@ FT_BEGIN_HEADER
   /*         file `ftconfig.h' either statically or through the            */
   /*         `configure' script on supported platforms.                    */
   /*                                                                       */
-#undef  FT_CONFIG_OPTION_FORCE_INT64
+#define FT_CONFIG_OPTION_FORCE_INT64
 
 
   /*************************************************************************/
@@ -123,7 +126,7 @@ FT_BEGIN_HEADER
   /*   Define this macro if you want to enable this `feature'.  See also   */
   /*   the macro FT_CONFIG_OPTION_SYSTEM_ZLIB below.                       */
   /*                                                                       */
-#define FT_CONFIG_OPTION_USE_ZLIB
+#undef  FT_CONFIG_OPTION_USE_ZLIB /* pspocket: Sony's libfreetype has no zlib (FT_Stream_OpenGzip answers 7) */
 
 
   /*************************************************************************/

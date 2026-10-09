@@ -6641,3 +6641,64 @@ Tests: a 890-step one-thread script (attributes, every size range edge, each arg
 NOMEM, AGAIN, STAT, BUSY, every object's bytes and buffers after each step) the same as libsync2's; objects made by
 one implementation and used by the other, both ways, the same as all-Sony; four threads contending a mutex, waiters on
 a condition, acquirers on a semaphore, two producers and two consumers on a queue, on each implementation.
+
+## D-525 · 2026-10-09 · cell_FreeType2 pspocket's own: FreeType 2.2.1 on the host, shown to the guest as libfreetype
+
+Sony's libfreetype.sprx (library cell_FreeType2_2_1) is FreeType 2.2.1 built for the PPU. All 155 functions of the
+count, the two unnamed exports libfontFT imports, and FreeType itself now run natively; the firmware module is no longer
+needed for a game that imports cell_FreeType2.
+
+- **Sony's build, read from the module and its answers.** FreeType's default options (the structures' 32-bit sizes
+  agree: FT_LibraryRec 0xC4, TT_FaceRec 0x334, TT_DriverRec 0x4C) with FT_CONFIG_OPTION_FORCE_INT64 (its FT_MulFix,
+  FT_MulDiv and FT_DivFix multiply in 64 bits) and without zlib (FT_Stream_OpenGzip answers 7); FreeType's default module
+  list without the PCF and BDF drivers (16 modules, no bytecode interpreter, so TrueType glyphs are autohinted); a
+  system layer with no allocator (FT_New_Memory answers NULL, so FT_Init_FreeType answers FT_Err_Unimplemented_Feature
+  and games make libraries with FT_New_Library and an FT_Memory of their own) and files read through cellFsOpen,
+  cellFsLseek and cellFsRead (a CELL_EIO or CELL_EFSSPECIFIC calls the handler set with cell_FreeType2_904CA41F).
+  pspocket's FreeType (third_party/CMakeLists.txt, external/freetype-2.2.1) is built the same: runtime/hle/src/freetype
+  holds the options, the module list and pspocket's own system layer (pspocket_ftsystem.c: FT_Stream_Open through the
+  guest's cellFs calls, as Sony's makes them, on the calling thread).
+- **Sony's own additions.** cellFreeType2Ex hands the system its fonts: for a CELL_FONT_TYPE_* in its list it writes
+  a path FT_New_Face opens ("/:dev_font:/RD-R-LATIN.ttf", its NUL, 0xDE, then /dev_flash/data/font/SCE-PS3-....TTF
+  XORed with 0xF2), one static buffer per font, NULL for others, 0x805400F2 for a bad argument. FT_Stream_Open opens such
+  a path ("/:dev_font", one character other than ':' or none, ":/") by the hidden real path, any other path as it is,
+  at most 1087 characters. cell_FreeType2_211248E7 writes the version (0x02020128) as a 64-bit word.
+- **The guest's view (runtime/hle/src/freetype_bridge.*).** FreeType's objects stay the host's, in host memory; every
+  object the public API shows gets a mirror in the game's FT_Memory, in FreeType 2.2.1's 32-bit big-endian layout
+  (computed from FreeType's headers with clang -target powerpc): the library and its modules (with their classes as
+  process-wide records), faces (names, fixed sizes, charmaps, the stream, the sizes list), sizes, the glyph slot (metrics,
+  bitmap, outline, subglyphs), sfnt tables (the hhea/vhea metrics arrays too), glyph images, strokers and the cache's
+  managers, caches, nodes, glyphs and small bitmaps. A mirror is rewritten after each call that changes its object (the
+  `generic` fields stay the guest's: FreeType's finalizers call the guest's with the guest object); the guest's changes
+  to a slot's outline are read back before FT_Render_Glyph. When the host frees an object, its memory manager releases
+  the mirrors inside the freed block, so FT_Done_Face, FT_Done_Library and the cache's flushes take theirs with them.
+  What the guest owns outright is worked on in its own memory as FreeType does, with the same FT_Memory calls: outlines
+  (ftoutln.c ported; FT_Outline_New allocates twice the points, as 2.2.1), glyph images (ftglyph.c ported, a slot's
+  bitmap going to FT_Get_Glyph's glyph), bitmaps (ftbitmap.c run over the guest's buffer with the game's memory behind
+  it), lists, FT_Alloc/FT_Realloc/FT_Free. The fixed-point and trigonometric exports are FreeType's code for a 32-bit
+  FT_Long as Sony's compiled it (64-bit products; fttrigon.c's 16-bit-halves downscale).
+- **Compared** in tests/hle/test_freetype_compare.cpp (harness: tests/hle/freetype_compare.hpp): 12 scripts in two
+  fresh processes, Sony's libfreetype and pspocket's, with guest callbacks written by the PPU assembler (a logging bump
+  allocator as FT_Memory, logging callbacks for lists, decomposition, spans and finalizers, a face requester calling the
+  library's FT_New_Face, a stream reader): fixed point and trigonometry over 120 values, lists and the old memory calls,
+  libraries and modules, six fonts' faces and tables, sizes and glyph loading in every load flag and render mode (Latin,
+  Japanese and Korean fonts, embedded bitmaps), outlines, bitmaps and glyph images, the stroker, memory faces, guest
+  streams and LZW, the cache, Windows FNT and Type 1 faces the test writes (with an AFM attached), cellFreeType2Ex and
+  its paths. 18,945 observations, the same: answers, every field and pixel, outlines point by point, and for what the
+  guest owns the FT_Memory calls. Found on the way: Sony's trigonometry downscales in 16-bit halves (fttrigon.c never
+  sees FT_CONFIG_HAS_INT64), FT_CONFIG_OPTION_FORCE_INT64, no zlib, FreeType's reserved WinFNT bytes copied raw.
+- **What differs by construction.** FreeType's own working memory is the host's: Sony's goes through the game's
+  FT_Memory (a game sees fewer and smaller allocations; the stroker's arrays and a load's hint tables do not reach it),
+  and the cache weighs its nodes with 64-bit sizes, so it flushes somewhat earlier for the same max_bytes. A file
+  stream's `base` keeps the last frame FreeType extracted in Sony's (a FreeType quirk), 0 in pspocket's. FreeType 2.2.1
+  writes the count of a Type 1 font's StdHW/StdVW/MinFeature over PS_PrivateRec's first byte: unique_id's high byte on
+  the PPU, its low byte on the host. A face's slot is not rewritten after the cache loads glyphs through it.
+- **Refused where Sony's would run the game's code or crash.** A module class or glyph class of the game's own
+  (FT_Add_Module after FreeType's version checks, FT_Glyph_To_Bitmap): FT_Err_Unimplemented_Feature, logged. Calls that
+  dereference a null or unknown handle in Sony's code (FT_Outline_Translate(NULL), FT_Bitmap_Copy(NULL library), a
+  null cache) answer FreeType's error for a bad handle instead; FT_Get_Glyph_Name of glyph num_glyphs on a PostScript
+  face (2.2.1 reads past its name table) is FT_Err_Invalid_Argument. The guest closing an open face's stream is logged
+  and not done.
+- **The firmware's modules.** libfontFT imports internals of libfreetype (FT_GlyphLoader_*, FT_Stream_*) that are not
+  in the count; the loader keeps choosing libfreetype.sprx for libfontFT while libfontFT runs as Sony's (D-175), unless
+  the game imports cell_FreeType2 itself, which now binds that library to the host: cellFontFT is next (D-526).

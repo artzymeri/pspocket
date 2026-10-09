@@ -83,6 +83,9 @@ add_library(pspocket_hle STATIC
     src/cellFont.cpp
     src/cellFontFT.cpp
     src/cell_FreeType2.cpp
+    src/freetype_bridge.cpp
+    src/freetype_glyph.cpp
+    src/freetype_cache.cpp
     src/cellSail.cpp
     src/cellSailRec.cpp
     src/cellSpursJq.cpp
