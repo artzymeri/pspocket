@@ -473,6 +473,9 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **The network (D-523).** lv2 has no interface but loopback and lists none to libnet (sysctl's routing tables are
   empty); a real console without a cable would still list lo0. libnet's per-thread contexts take 3192 bytes of the
   game's pool each, as on a PS3. gethostbyname gives libnet's answers without its resolver's work yet (part 2).
+- **cellHttp past a connection (D-524).** Connecting, sending, receiving and parsing, chunks, gzip, redirects,
+  authentication and cookies from responses, pipelining: written once libnet's resolver is pspocket's (D-523 part 2),
+  compared against a loopback server. The disk cache's 12 unnamed exports are not registered. HTTPS waits on cellSsl.
 - **Kernel calls (D-527, D-528).** Every named slot is bound: 560 own, 74 answered as RPCS3's null or stub slots (the
   debugger's sys_dbg family, the crypto engine, colored memory, whose arguments nothing documents; studying
   liblv2coredump and libatxenc would give their signatures). sys_rsxaudio plays nothing: pspocket's console has no AV
