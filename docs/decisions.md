@@ -7293,6 +7293,30 @@ libsail: a booted player with three streams and two held descriptors dumped at 7
 0x1A7B-byte image into an unaligned buffer and once aligned (each side's code addresses and the control thread's stack
 words set alike while dumping): 0 differences over 3712 checks in twelve scripts.
 
+Part 13, OpenStream and CloseStream of players without streams: libsail's playback machinery is a message-driven
+continuation engine: each asynchronous step carries a handle (the message its completion becomes, << 32, and a record
+{flags: 0x20 in use, 1 failed; the steps still out; the handle of the step it belongs to}) and posts {0, result,
+handle} when done (the loop dispatches a completion by its handle's code). OpenStream (message 0x4C, the game's u64 kept
+for the completion event) needs a booted player with nothing running (+0x250) and a descriptor held (EMPTY without):
+state 3 and its event, then the current descriptor made ready (0x4E: an opened one, 3, has its streams chosen and is in
+use, 5; one only added is a later part), then the stream's steps on record +0xE0 (handle 0x4D): the source told to open
+(state 2; its Open callback gets the stream type, media info, URI and a profile {2 items, the mux rate bound, the
+duration, the size}; the source's NotifyCallCompleted becomes message 0x29, which completes it with 0x4F), the dmux
+pipeline opened (0x50: cellDmuxPamf loaded, cellDmuxQueryAttr, its memory from the player's allocator, cellDmuxOpenExt
+on the player's SPURS with the player's dmux resource at +0x358 and libsail's callback: demux done is a later part, a
+fatal error becomes message 0xD2), the chosen elementary streams (later parts), the AV clock reset. Each step's
+completion counts down (0x4F-0x53); when none is out the stream is open (+0x160 2, event 4 with the descriptor) and
+0x4D sets state 4 (2 on failure) with its event and the call's completion event. A failed step marks the record and,
+when all are in, the stream is closed again (0x5C), the open completing with CANCEL. CloseStream (0x5D) needs state 4:
+state 8 and its event, then the source told to close (state 7, 0x5F), the elementary streams (later parts) and the dmux
+pipeline closed (0x60: cellDmuxClose retried 10 times 500 us apart while busy, memory and module released); when both
+are in the descriptor leaves the player (5 back to 1, else 0; the next becomes current), the play flags and the AV
+clock stop, event 5, and 0x5E sets state 2 with the call's completion event. (pspocket's cellDmuxPamf now links its demuxer thread
+when the game does not import cellDmux, D-592.) Compared with
+libsail: the refusals, an open and a close through a game's source whose callbacks call NotifyCallCompleted (each
+side's own export), an open whose source fails: 0 differences over 3759 checks in thirteen scripts (cellDmux's copy
+of each side's callback masked).
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)

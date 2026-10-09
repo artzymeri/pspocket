@@ -125,6 +125,20 @@ u64 module_call(PPUContext& ctx, std::string_view module, std::string_view name,
     return r;
 }
 
+s32 post_message(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c)
+{
+    const u32 qa = player + pl::kQueue;
+    const s32 r = sc(ctx, 102, {r32(ctx, qa + q::kMutex), 0});
+    if (r < 0) return r;
+    const u32 at = queue_tail(ctx, qa);
+    w32(ctx, at, code);
+    w32(ctx, at + 12, c);
+    w32(ctx, at + 4, a);
+    w32(ctx, at + 8, b);
+    queue_advance_tail(ctx, qa);
+    return queue_commit(ctx, qa);
+}
+
 s32 post_completion(PPUContext& ctx, u32 player, s32 result, u64 handle)
 {
     if (!handle) return static_cast<s32>(player);
