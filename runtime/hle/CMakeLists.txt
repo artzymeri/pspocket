@@ -38,6 +38,7 @@ add_library(pspocket_hle STATIC
     src/cellSysutilWebBrowser.cpp
     src/cellVoice.cpp
     src/modules.cpp
+    src/npdrm.cpp
     src/pad_script.cpp
     src/process.cpp
     src/psf.cpp

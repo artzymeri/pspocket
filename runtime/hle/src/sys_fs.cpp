@@ -7,7 +7,8 @@
 //
 // Encrypted SDATA files (cellFsSdataOpen, and sys_fs_open's SDATA type argument) are decrypted by the kernel through
 // the NPD opener this module installs in every process (install_npd_opener, D-165): recomp::NpdFile with the build's
-// keys, as RPCS3's lv2 sys_fs_open wraps them in an EDATADecrypter.
+// keys, as RPCS3's lv2 sys_fs_open wraps them in an EDATADecrypter. EDATA files (sys_fs_open's EDATA type argument)
+// open the same way with the licence keys the game has shown (D-581).
 //
 // cellFsSdataOpenByFd opens an SDATA file inside an open file (an MSELF archive) the same way, through sys_fs_fcntl
 // 0x80000009. Stream reads (cellFsSt*) are pspocket's own: RPCS3 leaves them to Sony's libfs (see "stream reads").
@@ -29,6 +30,7 @@
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
+#include "pspocket/hle/npdrm.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/kernel.hpp"
@@ -1301,24 +1303,59 @@ s32 fs_utility_init_6B5896B0(PPUContext& ctx, u32 dest)
 
 } // namespace
 
+// The NPD opener (D-165, D-581), as RPCS3's lv2_file::open_raw wraps an "NPD\0" file opened as SDATA or EDATA:
+// - An SDATA file opens with its own key, whichever type the game asked for (RPCS3 refuses one asked for as EDATA
+//   while the game has shown no key; pspocket opens it, logged).
+// - An EDATA file opens with the keys the game has shown with sceNpDrmIsAvailable (NpdrmKeyRing, D-581), tried
+//   quietly from the newest; none that opens it, or the file asked for as SDATA (RPCS3 opens it without a key, which
+//   decrypts nothing), is an error.
 void install_npd_opener(lv2::Kernel& kernel)
 {
     kernel.set_npd_opener([](std::shared_ptr<const lv2::VfsImage::File> encrypted, bool edata,
                               std::string& error) -> std::shared_ptr<const lv2::VfsImage::File> {
         const u64 size = encrypted->size();
-        auto npd = recomp::NpdFile::open(
-            [encrypted](u64 offset, void* dst, usize n) { return encrypted->read(offset, dst, n); }, size,
-            recomp::builtin_npd_keys());
-        if (!npd) {
-            error = npd.error().message;
-            return nullptr;
+        const recomp::NpdFile::ReadAt source = [encrypted](u64 offset, void* dst, usize n) {
+            return encrypted->read(offset, dst, n);
+        };
+        u8 head[recomp::kNpdHeaderBytes]{};
+        const std::optional<recomp::NpdHeader> header = size >= sizeof(head) && source(0, head, sizeof(head))
+            ? recomp::parse_npd_header(head)
+            : std::nullopt;
+        std::unique_ptr<recomp::NpdFile> npd;
+        if (header && !(header->flags & recomp::kNpdSdatFlag)) {
+            if (!edata) {
+                error = std::format("an EDATA file (content {}) opened as SDATA, which has no key for it",
+                    header->content_id);
+                return nullptr;
+            }
+            const NpdrmKeyRing* ring = npdrm_key_ring();
+            const std::vector<recomp::Key128> keys = ring ? ring->newest_first() : std::vector<recomp::Key128>{};
+            for (const recomp::Key128& key : keys) {
+                auto opened = recomp::NpdFile::open(source, size, recomp::builtin_npd_keys(), key);
+                if (opened) {
+                    npd = std::move(*opened);
+                    break;
+                }
+            }
+            if (!npd) {
+                error = std::format("none of the {} licence keys the game has shown (sceNpDrmIsAvailable) opens this "
+                                    "EDATA file (content {}, licence type {})", keys.size(), header->content_id,
+                    header->license);
+                return nullptr;
+            }
+        } else {
+            auto opened = recomp::NpdFile::open(source, size, recomp::builtin_npd_keys());
+            if (!opened) {
+                error = opened.error().message;
+                return nullptr;
+            }
+            npd = std::move(*opened);
+            if (edata) PS_LOG_WARN(kChan, "an SDATA file opened as EDATA: opened with its own key");
         }
-        if (edata != !((*npd)->header().flags & recomp::kNpdSdatFlag)) {
-            PS_LOG_WARN(kChan, "an {} file opened as {}", edata ? "SDATA" : "EDATA", edata ? "EDATA" : "SDATA");
-        }
-        PS_LOG_INFO(kChan, "encrypted file: NPD version {}, flags {:#x}, {:#x}-byte blocks, {} bytes", (*npd)->header().version,
-            (*npd)->header().flags, (*npd)->header().block_size, (*npd)->size());
-        return std::make_shared<NpdPlainFile>(std::move(*npd));
+        PS_LOG_INFO(kChan, "encrypted file ({}, content {}): NPD version {}, flags {:#x}, {:#x}-byte blocks, {} bytes",
+            npd->header().flags & recomp::kNpdSdatFlag ? "SDATA" : "EDATA", npd->header().content_id,
+            npd->header().version, npd->header().flags, npd->header().block_size, npd->size());
+        return std::make_shared<NpdPlainFile>(std::move(npd));
     });
 }
 

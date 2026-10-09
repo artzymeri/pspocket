@@ -20,9 +20,13 @@
 #include <utility>
 #include <vector>
 
+#include "pspocket/hle/npdrm.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/npd.hpp"
+#include "pspocket/recomp/npdrm.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
+#include "synthetic.hpp"
 
 using namespace pspocket;
 using namespace pspocket::hle::test;
@@ -834,7 +838,7 @@ TEST_CASE("sceNpSignalingActivateConnection: RPCS3's checks, then no connection 
     CHECK(g.call("sceNpSignalingGetConnectionStatus", 0x6001, 1, kStatus, 0, 0) == kSigConnNotFound);
 }
 
-TEST_CASE("sceNpDrmIsAvailable: the file at the path as RPCS3 checks it; content that needs a key isn't available",
+TEST_CASE("sceNpDrmIsAvailable: the file at the path as RPCS3 checks it, and the key of content that is available",
     "[hle][np]")
 {
     DrmDirs dirs;
@@ -843,25 +847,46 @@ TEST_CASE("sceNpDrmIsAvailable: the file at the path as RPCS3 checks it; content
     DrmDirs::write(dirs.bdvd / "PS3_GAME" / "USRDIR" / "plain.dat", {1, 2, 3, 4, 5});
     DrmDirs::write(dirs.bdvd / "PS3_GAME" / "USRDIR" / "empty.dat", {});
     DrmDirs::write(dirs.bdvd / "PS3_GAME" / "USRDIR" / "sce3", {'S', 'C', 'E'});
-    DrmDirs::write(usrdir / "dlc.edat", npd_file(2, id, 0));
-    DrmDirs::write(usrdir / "network.edat", npd_file(1, "UP0001-BLES01807_00-PSPOCKETTEST0002", 0));
-    DrmDirs::write(usrdir / "free.edat", npd_file(3, id, 0));
     DrmDirs::write(usrdir / "data.sdat", npd_file(0, id, 0x01000000));
-    DrmDirs::write(usrdir / "badid.edat", npd_file(2, "../x", 0));
     DrmDirs::write(usrdir / "short.edat", {'N', 'P', 'D', 0, 0, 0});
     std::vector<u8> sce(0x200, 0);
     std::memcpy(sce.data(), "SCE", 4);
     DrmDirs::write(usrdir / "module.sprx", sce);
+    // EDATs with the hashes RPCS3 checks, made with the build's keys (in memory and the test's folders only).
+    const recomp::NpdKeys& npd_keys = recomp::builtin_npd_keys();
+    const recomp::NpdrmKeys& keys = recomp::builtin_npdrm_keys();
+    recomp::Key128 klicensee{}, rap{};
+    klicensee.fill(0x11);
+    rap.fill(0x22);
+    const auto edat = [&](s32 license, std::string_view content_id, std::string_view name, const recomp::Key128& key) {
+        test::NpdOptions o{.version = 3, .extra_flags = 0, .block_size = 0x400};
+        o.edata = true;
+        o.license = license;
+        o.content_id = std::string(content_id);
+        o.file_name = std::string(name);
+        o.key = key;
+        o.npdrm = &keys;
+        return test::build_npd(std::vector<u8>(3000, 0x5A), npd_keys, o);
+    };
+    if (keys.present) {
+        const std::vector<u8> dlc = edat(2, id, "dlc.edat", recomp::rap_to_rif(rap, keys));
+        DrmDirs::write(usrdir / "dlc.edat", dlc);
+        DrmDirs::write(usrdir / "renamed.edat", dlc);
+        DrmDirs::write(usrdir / "network.edat", edat(1, "UP0001-BLES01807_00-PSPOCKETTEST0002", "network.edat", rap));
+        DrmDirs::write(usrdir / "free.edat", edat(3, id, "free.edat", klicensee));
+        DrmDirs::write(usrdir / "badid.edat", edat(2, "../x", "badid.edat", rap));
+    }
 
     Fixture f;
     dirs.mount(f);
     GuestThread g(f, 0, "drm");
     u8* b = f.base();
-    constexpr u32 kKlicensee = kData + 0x100, kPath = kData + 0x1000;
-    std::memset(b + kKlicensee, 0x11, 16);
-    const auto check = [&](std::string_view path, u32 klicensee = kKlicensee) {
+    constexpr u32 kKlicensee = kData + 0x100, kOtherKlicensee = kData + 0x110, kPath = kData + 0x1000;
+    std::memcpy(b + kKlicensee, klicensee.data(), 16);
+    std::memset(b + kOtherKlicensee, 0x12, 16);
+    const auto check = [&](std::string_view path, u32 klicensee_addr = kKlicensee) {
         put(b, kPath, path);
-        return g.call("sceNpDrmIsAvailable", klicensee, kPath);
+        return g.call("sceNpDrmIsAvailable", klicensee_addr, kPath);
     };
     const std::string game = "/dev_hdd0/game/BLES01807/USRDIR/";
 
@@ -884,22 +909,8 @@ TEST_CASE("sceNpDrmIsAvailable: the file at the path as RPCS3 checks it; content
     CHECK(check("/dev_bdvd/PS3_GAME/USRDIR/empty.dat") == 0);
     CHECK(check("/dev_bdvd/PS3_GAME/USRDIR/sce3") == 0); // too short for a magic
 
-    // EDATs. An SDAT: RPCS3's EDAT check refuses it. One that needs a licence (types 1 and 2) the disc game doesn't
-    // have: no RAP in the user's exdata (none looked for when the content ID isn't valid).
+    // An SDAT: RPCS3's EDAT check refuses it. A SELF must open with the build's keys: this one is no SELF.
     CHECK(check(game + "data.sdat") == kDrmNoEntitlement);
-    CHECK(check(game + "dlc.edat") == kDrmLicenseNotFound);
-    CHECK(check(game + "network.edat") == kDrmLicenseNotFound);
-    CHECK(check(game + "badid.edat") == kDrmLicenseNotFound);
-    CHECK(check(game + "short.edat") == kDrmLicenseNotFound); // read as zeros past its end
-    // A RAP under 16 bytes is a bad format.
-    const fsys::path rap = dirs.hdd0 / "home" / "00000001" / "exdata" / (id + ".rap");
-    DrmDirs::write(rap, std::vector<u8>(8, 0x22));
-    CHECK(check(game + "dlc.edat") == kDrmBadFormat);
-    // Content RPCS3 would open with a key (the RAP's, the klicensee's) can't be decrypted here: not available.
-    DrmDirs::write(rap, std::vector<u8>(16, 0x22));
-    CHECK(check(game + "dlc.edat") == kDrmNoEntitlement);
-    CHECK(check(game + "free.edat") == kDrmNoEntitlement);
-    // A SELF must open with the build's keys: this one is no SELF.
     CHECK(check(game + "module.sprx") == kDrmNoEntitlement);
 
     // At most 0x100 characters of the path are read.
@@ -907,6 +918,173 @@ TEST_CASE("sceNpDrmIsAvailable: the file at the path as RPCS3 checks it; content
     DrmDirs::write(dirs.hdd0 / name, {1});
     CHECK(check("/dev_hdd0/" + name + "xyz") == 0);
     CHECK(check("/dev_hdd0/" + name.substr(1) + "xyz") == r3_of(lv2::CELL_ENOENT));
+
+    if (!keys.present) SKIP("this build has no NPDRM keys: EDATs are not checked");
+    hle::NpdrmKeyRing* ring = hle::npdrm_key_ring();
+    REQUIRE(ring);
+    REQUIRE_FALSE(ring->newest()); // nothing above installed a key
+
+    // EDATs. The header checks first (RPCS3 VerifyEDATHeaderWithKLicense): one renamed since it was made, or too
+    // short to have its hashes, is no entitlement.
+    CHECK(check(game + "renamed.edat") == kDrmNoEntitlement);
+    CHECK(check(game + "short.edat") == kDrmNoEntitlement);
+    // One that needs a licence (types 1 and 2) the player hasn't put in exdata (none looked for when the content ID
+    // isn't valid).
+    CHECK(check(game + "dlc.edat") == kDrmLicenseNotFound);
+    CHECK(check(game + "network.edat") == kDrmLicenseNotFound);
+    CHECK(check(game + "badid.edat") == kDrmLicenseNotFound);
+    // A RAP under 16 bytes is a bad format; with the player's RAP, available, and its RIF key installed.
+    const fsys::path rap_file = dirs.hdd0 / "home" / "00000001" / "exdata" / (id + ".rap");
+    DrmDirs::write(rap_file, std::vector<u8>(8, 0x22));
+    CHECK(check(game + "dlc.edat") == kDrmBadFormat);
+    DrmDirs::write(rap_file, std::vector<u8>(rap.begin(), rap.end()));
+    CHECK(check(game + "dlc.edat") == 0);
+    REQUIRE(ring->newest());
+    CHECK(*ring->newest() == recomp::rap_to_rif(rap, keys));
+    // Free content: its dev hash must match the klicensee the game gives (none is zeros).
+    CHECK(check(game + "free.edat", kOtherKlicensee) == kDrmNoEntitlement);
+    CHECK(check(game + "free.edat", 0) == kDrmNoEntitlement);
+    CHECK(check(game + "free.edat") == 0);
+    CHECK(*ring->newest() == klicensee);
+    CHECK(ring->newest_first().size() == 2);
+}
+
+TEST_CASE("EDATA files: lv2 opens them with the keys sceNpDrmIsAvailable installed, newest first (D-581)",
+    "[hle][np][fs]")
+{
+    const recomp::NpdKeys& npd_keys = recomp::builtin_npd_keys();
+    const recomp::NpdrmKeys& keys = recomp::builtin_npdrm_keys();
+    if (!keys.present || !npd_keys.present) SKIP("this build has no NPD keys");
+    DrmDirs dirs;
+    const std::string id = "UP0001-NPXX00000_00-PSPOCKETTEST0001";
+    const fsys::path usrdir = dirs.hdd0 / "game" / "NPXX00000" / "USRDIR";
+    std::vector<u8> plain(70000);
+    for (usize i = 0; i < plain.size(); i++) plain[i] = static_cast<u8>(i * 13 + (i >> 8));
+    recomp::Key128 klicensee{}, other{}, rap{};
+    klicensee.fill(0x31);
+    other.fill(0x32);
+    rap.fill(0x41);
+    const auto edat = [&](s32 license, std::string_view name, const recomp::Key128& key, u32 flags) {
+        test::NpdOptions o{.version = 4, .extra_flags = flags, .block_size = 0x4000};
+        o.edata = true;
+        o.license = license;
+        o.content_id = id;
+        o.file_name = std::string(name);
+        o.key = key;
+        o.npdrm = &keys;
+        DrmDirs::write(usrdir / std::string(name), test::build_npd(plain, npd_keys, o));
+    };
+    edat(3, "free.edat", klicensee, recomp::kNpdEncryptedKeyFlag | recomp::kNpdFlag10);
+    edat(2, "local.edat", recomp::rap_to_rif(rap, keys), recomp::kNpdCompressedFlag);
+    edat(3, "other.edat", other, 0);
+    DrmDirs::write(dirs.hdd0 / "home" / "00000001" / "exdata" / (id + ".rap"), std::vector<u8>(rap.begin(), rap.end()));
+
+    Fixture f;
+    dirs.mount(f);
+    GuestThread g(f, 0, "edat");
+    u8* b = f.base();
+    constexpr u32 kKlicensee = kData + 0x100, kArg = kData + 0x200, kFd = kData + 0x300, kNread = kData + 0x308,
+                  kStat = kData + 0x400, kPath = kData + 0x1000, kBuf = kData + 0x10000;
+    std::memcpy(b + kKlicensee, klicensee.data(), 16);
+    ps_write64(b, kArg, 2); // sys_fs_open's type argument: EDATA
+    const std::string game = "/dev_hdd0/game/NPXX00000/USRDIR/";
+    const auto open_edata = [&](const std::string& name) {
+        put(b, kPath, game + name);
+        return g.call("cellFsOpen", kPath, 0, kFd, kArg, 8);
+    };
+    const auto read_all = [&](const std::string& name) {
+        REQUIRE(open_edata(name) == 0);
+        const u32 fd = ps_read32(b, kFd);
+        REQUIRE(g.call("cellFsFstat", fd, kStat) == 0);
+        CHECK(ps_read64(b, kStat + 36) == plain.size()); // the plain size
+        REQUIRE(g.call("cellFsRead", fd, kBuf, 0x20000, kNread) == 0);
+        CHECK(ps_read64(b, kNread) == plain.size());
+        CHECK(std::memcmp(b + kBuf, plain.data(), plain.size()) == 0);
+        CHECK(g.call("cellFsClose", fd) == 0);
+    };
+
+    // Before the game shows a key, nothing opens it (RPCS3: none of the 0 keys); as SDATA it never does.
+    CHECK(open_edata("free.edat") == r3_of(lv2::CELL_EFSSPECIFIC));
+    put(b, kPath, game + "free.edat");
+    CHECK(g.call("cellFsSdataOpen", kPath, 0, kFd, 0, 0) == r3_of(lv2::CELL_EFSSPECIFIC));
+
+    // The free file with the game's klicensee, the local one with the player's RAP; each key stays for the other.
+    put(b, kPath, game + "free.edat");
+    REQUIRE(g.call("sceNpDrmIsAvailable", kKlicensee, kPath) == 0);
+    read_all("free.edat");
+    put(b, kPath, game + "local.edat");
+    REQUIRE(g.call("sceNpDrmIsAvailable2", 0, kPath) == 0);
+    read_all("local.edat");
+    read_all("free.edat");
+    // One whose klicensee the game never showed still does not open.
+    CHECK(open_edata("other.edat") == r3_of(lv2::CELL_EFSSPECIFIC));
+}
+
+TEST_CASE("sceNpDrmVerifyUpgradeLicense: an unlock licence RPCS3's checks accept makes the trial the full game (D-581)",
+    "[hle][np]")
+{
+    const recomp::NpdKeys& npd_keys = recomp::builtin_npd_keys();
+    const recomp::NpdrmKeys& keys = recomp::builtin_npdrm_keys();
+    if (!keys.present || !npd_keys.present) SKIP("this build has no NPD keys");
+    DrmDirs dirs;
+    const fsys::path exdata = dirs.hdd0 / "home" / "00000001" / "exdata";
+    // An unlock licence (RPCS3 verify_c00_unlock_edat): a free EDAT made with NP_KLIC_FREE and named after its
+    // content ID, holding "GOMA" and the content ID at 0x10.
+    const auto unlock = [&](const std::string& id, std::string_view magic, const std::string& inner_id) {
+        std::vector<u8> plain(0x100, 0);
+        std::memcpy(plain.data(), magic.data(), 4);
+        std::memcpy(plain.data() + 0x10, inner_id.data(), std::min<usize>(inner_id.size(), 0x30));
+        test::NpdOptions o{.version = 3, .extra_flags = 0, .block_size = 0x400};
+        o.edata = true;
+        o.license = 3;
+        o.content_id = id;
+        o.file_name = id + ".edat";
+        o.key = keys.klic_free;
+        o.npdrm = &keys;
+        DrmDirs::write(exdata / (id + ".edat"), test::build_npd(plain, npd_keys, o));
+    };
+    const std::string full = "UP0001-NPXX00000_00-FULLGAME00000001";
+    const std::string wrong_magic = "UP0001-NPXX00000_00-FULLGAME00000002";
+    const std::string wrong_inner = "UP0001-NPXX00000_00-FULLGAME00000003";
+    unlock(full, "GOMA", full);
+    unlock(wrong_magic, "GOMB", wrong_magic);
+    unlock(wrong_inner, "GOMA", full);
+
+    Fixture f;
+    dirs.mount(f);
+    GuestThread g(f, 0, "upgrade");
+    u8* b = f.base();
+    constexpr u32 kId = kData + 0x100;
+    for (const char* name : {"sceNpDrmVerifyUpgradeLicense", "sceNpDrmVerifyUpgradeLicense2"}) {
+        INFO(name);
+        put(b, kId, full);
+        CHECK(g.call(name, kId) == 0);
+        put(b, kId, wrong_magic);
+        CHECK(g.call(name, kId) == kDrmLicenseNotFound);
+        put(b, kId, wrong_inner);
+        CHECK(g.call(name, kId) == kDrmLicenseNotFound);
+    }
+    // A licence copied under another content's name fails RPCS3's header checks.
+    fsys::copy_file(exdata / (full + ".edat"), exdata / "UP0001-NPXX00000_00-FULLGAME00000004.edat");
+    put(b, kId, "UP0001-NPXX00000_00-FULLGAME00000004");
+    CHECK(g.call("sceNpDrmVerifyUpgradeLicense", kId) == kDrmLicenseNotFound);
+}
+
+TEST_CASE("NpdrmKeyRing: sixteen keys, the newest first, the oldest given up (RPCS3 loaded_npdrm_keys)", "[hle][np]")
+{
+    hle::NpdrmKeyRing ring;
+    CHECK_FALSE(ring.newest());
+    CHECK(ring.newest_first().empty());
+    for (u8 i = 0; i < 20; i++) {
+        recomp::Key128 k{};
+        k.fill(i);
+        ring.install(k);
+    }
+    const auto keys = ring.newest_first();
+    REQUIRE(keys.size() == 16);
+    CHECK(keys.front()[0] == 19);
+    CHECK(keys.back()[0] == 4);
+    CHECK((*ring.newest())[0] == 19);
 }
 
 namespace {
@@ -1355,8 +1533,11 @@ TEST_CASE("sceNpDrm: time limits from EDAT and SELF headers, exitspawn's check, 
     CHECK(g.call("sceNpDrmProcessExitSpawn", 0, kPath, 0, 0, 0, 0, 1001, 0) == r3_of(lv2::CELL_ENOENT));
     CHECK(g.call("sceNpDrmProcessExitSpawn2", 0, kPath, 0, 0, 0, 0, 1001, 0) == r3_of(lv2::CELL_ENOENT));
     CHECK(g.call("sceNpDrmProcessExitSpawn", 0, 0, 0, 0, 0, 0, 1001, 0) == kDrmInvalParam);
+    // (This EDAT has no hashes: RPCS3's header check refuses it, where the build has the keys to make that check;
+    // without them, the licence it needs is missing.)
     put(b, kPath, game + "endless.edat");
-    CHECK(g.call("sceNpDrmProcessExitSpawn", 0, kPath, 0, 0, 0, 0, 1001, 0) == kDrmLicenseNotFound);
+    CHECK(g.call("sceNpDrmProcessExitSpawn", 0, kPath, 0, 0, 0, 0, 1001, 0) ==
+        (recomp::builtin_npdrm_keys().present ? kDrmNoEntitlement : kDrmLicenseNotFound));
 
     // The upgrade licence: the user's unlock EDAT, which can't be verified here.
     const auto upgrade = [&](const char* name, std::string_view content_id) {
