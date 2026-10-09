@@ -10,6 +10,8 @@
 //   address, nothing written into the guest's object), _Locksyslock/_Unlocksyslock (its numbered system locks),
 //   _Initlocks/_Clearlocks (nothing to set up), _Once (Dinkumware's flag word: 0, 1 while the function runs, 2 after).
 //   The variables _Mutex_attr and tls_mutex_attr: a sys_mutex_attribute_t for a recursive, priority-ordered mutex.
+// - Thread-local storage (D-570): Dinkumware's _Tlsalloc/_Tlsfree/_Tlsset/_Tlsget/_Destroytls and the Win32 names
+//   TlsGetValue/TlsSetValue over the same keys.
 // - SPU printf (the protocol of Sony's SDK: an SPU's spu_printf sends a user event on SPU port 1 whose data is the LS
 //   address of its arguments, then waits in its inbound mailbox for printf's result): spu_printf_initialize makes the
 //   event queue and the server thread (an lv2 thread running this library's server) and registers the attach and
@@ -234,6 +236,101 @@ void _Once_(PPUContext& ctx, u32 flag, u32 fn)
         return;
     }
     while (atomic_load_be32(b, flag) != 2) std::this_thread::yield();
+}
+
+// ------------------------------------------------------------------------------------------------- thread-local storage
+
+// Dinkumware's thread-local storage (xtls.h in its Win32 model, which the PS3's library follows: TlsGetValue and
+// TlsSetValue beside the _Tls functions, D-570): 64 keys (Win32's TLS_MINIMUM_AVAILABLE), each with a destructor, and a
+// value per key and thread (the lv2 thread's ID), 0 until set; a key made again starts at 0 in every thread.
+struct Tls {
+    static constexpr u32 kKeys = 64;
+    std::mutex mutex;
+    std::array<bool, kKeys> used{};
+    std::array<u32, kKeys> destructor{};
+    std::map<u32, std::array<u32, kKeys>> values; // by lv2 thread ID
+};
+
+Tls& tls() { return HleProcess::current()->state<Tls>(); }
+
+// int _Tlsalloc(_Tlskey_t *key, void (*destructor)(void *)): the first free key; 0, or -1 when none is free.
+s32 _Tlsalloc_(PPUContext& ctx, u32 key, u32 destructor)
+{
+    if (!range_ok(ctx, "_Tlsalloc", key, 4)) return -1;
+    Tls& t = tls();
+    std::lock_guard lock(t.mutex);
+    for (u32 k = 0; k < Tls::kKeys; k++) {
+        if (t.used[k]) continue;
+        t.used[k] = true;
+        t.destructor[k] = destructor;
+        for (auto& [id, v] : t.values) v[k] = 0;
+        ps_write32(gb(ctx), key, k);
+        return 0;
+    }
+    return -1;
+}
+
+// int _Tlsfree(_Tlskey_t key): 0, or -1 for a key not in use.
+s32 _Tlsfree_(PPUContext&, u32 key)
+{
+    Tls& t = tls();
+    std::lock_guard lock(t.mutex);
+    if (key >= Tls::kKeys || !t.used[key]) return -1;
+    t.used[key] = false;
+    t.destructor[key] = 0;
+    return 0;
+}
+
+// int _Tlsset(_Tlskey_t key, void *value): the calling thread's value; 0, or -1 for a key not in use.
+s32 _Tlsset_(PPUContext& ctx, u32 key, u32 value)
+{
+    Tls& t = tls();
+    std::lock_guard lock(t.mutex);
+    if (key >= Tls::kKeys || !t.used[key]) return -1;
+    t.values[thread_of(ctx).id][key] = value;
+    return 0;
+}
+
+// void *_Tlsget(_Tlskey_t key): the calling thread's value, 0 when unset or for a key not in use.
+u32 _Tlsget_(PPUContext& ctx, u32 key)
+{
+    Tls& t = tls();
+    std::lock_guard lock(t.mutex);
+    if (key >= Tls::kKeys || !t.used[key]) return 0;
+    const auto it = t.values.find(thread_of(ctx).id);
+    return it == t.values.end() ? 0 : it->second[key];
+}
+
+u32 TlsGetValue_(PPUContext& ctx, u32 index) { return _Tlsget_(ctx, index); }
+
+// BOOL TlsSetValue(DWORD index, void *value): non-zero on success.
+s32 TlsSetValue_(PPUContext& ctx, u32 index, u32 value) { return _Tlsset_(ctx, index, value) == 0 ? 1 : 0; }
+
+// void _Destroytls(void): the calling thread's values end: each non-zero one with a destructor is cleared and given
+// to it, in rounds while destructors set values again (four at most, POSIX's PTHREAD_DESTRUCTOR_ITERATIONS); then the
+// thread has none.
+void _Destroytls_(PPUContext& ctx)
+{
+    Tls& t = tls();
+    const u32 id = thread_of(ctx).id;
+    for (u32 round = 0; round < 4; round++) {
+        std::vector<std::pair<u32, u32>> calls; // destructor, value
+        {
+            std::lock_guard lock(t.mutex);
+            const auto it = t.values.find(id);
+            if (it == t.values.end()) return;
+            for (u32 k = 0; k < Tls::kKeys; k++) {
+                if (t.used[k] && t.destructor[k] && it->second[k]) {
+                    calls.emplace_back(t.destructor[k], it->second[k]);
+                    it->second[k] = 0;
+                }
+            }
+        }
+        if (calls.empty()) break;
+        for (const auto& [fn, value] : calls) call_guest(ctx, fn, {value});
+    }
+    std::lock_guard lock(t.mutex);
+    t.values.erase(id);
 }
 
 // sys_mutex_attribute_t: protocol SYS_SYNC_PRIORITY, SYS_SYNC_RECURSIVE, not process-shared, not adaptive, its name.
@@ -684,7 +781,8 @@ void register_sys_libc_process(Registry& r)
             LIBC(raw_spu_printf), LIBC(spu_raw_sprintf), LIBC(spu_raw_snprintf), LIBC(spu_printf_initialize),
             LIBC(spu_printf_finalize), LIBC(spu_printf_attach_group), LIBC(spu_printf_detach_group),
             LIBC(spu_printf_attach_thread), LIBC(spu_printf_detach_thread), LIBC(_Printf), LIBC(_WPrintf),
-            LIBC(_Scanf), LIBC(_WScanf),
+            LIBC(_Scanf), LIBC(_WScanf), LIBC(_Tlsalloc), LIBC(_Tlsfree), LIBC(_Tlsset), LIBC(_Tlsget),
+            LIBC(TlsGetValue), LIBC(TlsSetValue), LIBC(_Destroytls),
         });
     }
     // The server's body and the callbacks liblv2's sys_spu_printf_attach_* call: internal (linked when the game

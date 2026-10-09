@@ -170,6 +170,59 @@ TEST_CASE("sys_libc: assertions, environ, _Once and the library's locks", "[hle]
     CHECK_THROWS_AS(t.call("_Assert", kStr, 0), lv2::ThreadExit);
 }
 
+TEST_CASE("sys_libc: Dinkumware's thread-local storage and its Win32 names (D-570)", "[hle][libc]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    Code c{b};
+    const u32 destructor = recorder(c, -1); // counter = counter * 10 + its argument
+    ps_write32(b, kCounter, 0);
+    REQUIRE(i32(t.call("_Tlsalloc", kA, destructor)) == 0);
+    const u32 k1 = ps_read32(b, kA);
+    REQUIRE(i32(t.call("_Tlsalloc", kA, 0)) == 0);
+    const u32 k2 = ps_read32(b, kA);
+    CHECK(k1 != k2);
+    CHECK(t.call("_Tlsget", k1) == 0); // 0 until set
+    CHECK(i32(t.call("_Tlsset", k1, 3)) == 0);
+    CHECK(t.call("TlsSetValue", k2, 0x1234) == 1);
+    CHECK(t.call("_Tlsget", k1) == 3);
+    CHECK(t.call("TlsGetValue", k2) == 0x1234);
+
+    // Another thread has values of its own; its _Destroytls gives its value to the destructor.
+    u64 before = 1, after = 1, set = 1, destroyed = 1;
+    std::thread other([&] {
+        GuestThread o(f, 1, "other");
+        before = o.call("_Tlsget", k1);
+        set = o.call("_Tlsset", k1, 4);
+        after = o.call("_Tlsget", k1);
+        o.call("_Destroytls");
+        destroyed = o.call("_Tlsget", k1);
+    });
+    other.join();
+    CHECK(before == 0);
+    CHECK(i32(set) == 0);
+    CHECK(after == 4);
+    CHECK(destroyed == 0);
+    CHECK(ps_read32(b, kCounter) == 4);
+    CHECK(t.call("_Tlsget", k1) == 3);
+    t.call("_Destroytls");
+    CHECK(ps_read32(b, kCounter) == 43); // key 2 has no destructor
+    CHECK(t.call("_Tlsget", k1) == 0);
+    CHECK(t.call("TlsGetValue", k2) == 0);
+
+    // A freed key is refused; 64 keys in all.
+    CHECK(i32(t.call("_Tlsset", k2, 9)) == 0);
+    CHECK(i32(t.call("_Tlsfree", k2)) == 0);
+    CHECK(i32(t.call("_Tlsfree", k2)) == -1);
+    CHECK(i32(t.call("_Tlsset", k2, 9)) == -1);
+    CHECK(t.call("TlsSetValue", k2, 9) == 0);
+    CHECK(t.call("_Tlsget", 999) == 0);
+    u32 made = 0;
+    while (i32(t.call("_Tlsalloc", kA, 0)) == 0 && made < 100) made++;
+    CHECK(made == 63);
+}
+
 TEST_CASE("sys_libc: _Printf and _Scanf through the caller's functions", "[hle][libc]")
 {
     Fixture f;

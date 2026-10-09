@@ -7781,3 +7781,18 @@ length not the family's errno EINVAL, both h_errno NETDB_INTERNAL; 127.0.0.1 is 
 none offline: NULL, h_errno TRY_AGAIN. A resolver aborted by sys_net_abort_resolver answers ENOBUFS, an address that is
 not guest memory EFAULT (D-042). Test: tests/hle/test_net.cpp, gethostbyaddr's hosts file, mapped address, name server,
 local addresses and checks.
+
+## D-570 · 2026-10-09 · sys_libc's thread-local storage: Dinkumware's _Tls functions and the Win32 names
+
+Seven of the C library's internals (under sys_libc and sys_libm, as the rest, D-510): Dinkumware's thread-local
+storage of xtls.h in its Win32 model, which the PS3's library follows (it exports TlsGetValue and TlsSetValue beside
+the _Tls functions, and has a "_TlsMtx" mutex attribute, D-516). 64 keys (Win32's TLS_MINIMUM_AVAILABLE), each with a
+destructor, a value per key and thread (the lv2 thread's ID), 0 until set; a key made again starts at 0 in every
+thread. int _Tlsalloc(_Tlskey_t *key, void (*destructor)(void *)): the first free key, 0, else -1; int _Tlsfree(key)
+and int _Tlsset(key, value): 0, or -1 for a key not in use; void *_Tlsget(key): the calling thread's value, 0 for a key
+not in use; TlsGetValue(index) is _Tlsget, BOOL TlsSetValue(index, value) non-zero on success; void _Destroytls(void):
+the calling thread's non-zero values with a destructor are cleared and given to it, in rounds while destructors set
+values again (four at most, POSIX's PTHREAD_DESTRUCTOR_ITERATIONS), then the thread has none. The signatures are
+Dinkumware's; without Sony's library to read they are the assumption here (no firmware module exports sys_libc, so a
+game's own copy of the library is where they would be checked). Test: tests/hle/test_libc_process.cpp (two threads'
+values, the destructors at _Destroytls, freed keys, 64 keys).
