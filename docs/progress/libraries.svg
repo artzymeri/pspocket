@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 5626 of 6625 pspocket&#x27;s own (84.9%), 188 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 5627 of 6625 pspocket&#x27;s own (84.9%), 188 answered as RPCS3</text>
 <g><title>sys_libc: 978 own, 0 answered as RPCS3, 141 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -4325,7 +4325,7 @@
 <rect x="824.7" y="101.2" width="6.9" height="6.4" fill="#2da44e"/>
 <text x="766.6" y="42.0" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">cellSsl</text>
 </g>
-<g><title>sys_net: 94 own, 0 answered as RPCS3, 1 not yet, of 95</title>
+<g><title>sys_net: 95 own, 0 answered as RPCS3, 0 not yet, of 95</title>
 <rect x="833.2" y="30.0" width="66.8" height="79.2" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="834.2" y="31.0" width="6.6" height="6.4" fill="#2da44e"/>
 <rect x="841.4" y="31.0" width="6.6" height="6.4" fill="#2da44e"/>
@@ -4421,7 +4421,7 @@
 <rect x="841.4" y="101.2" width="6.6" height="6.4" fill="#2da44e"/>
 <rect x="848.6" y="101.2" width="6.6" height="6.4" fill="#2da44e"/>
 <rect x="855.8" y="101.2" width="6.6" height="6.4" fill="#2da44e"/>
-<rect x="863.0" y="101.2" width="6.6" height="6.4" fill="#8c959f"/>
+<rect x="863.0" y="101.2" width="6.6" height="6.4" fill="#2da44e"/>
 <text x="836.2" y="42.0" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_net</text>
 </g>
 <g><title>cellFont: 85 own, 0 answered as RPCS3, 0 not yet, of 85</title>
