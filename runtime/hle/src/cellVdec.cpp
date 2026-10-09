@@ -753,12 +753,12 @@ void run(PPUContext& ctx, Vdec& v)
         }
         case Command::au:
         case Command::drain: {
+#if PSPOCKET_HAVE_FFMPEG
             u64 seq = 0;
             {
                 std::lock_guard lk(v.m);
                 seq = v.seq;
             }
-#if PSPOCKET_HAVE_FFMPEG
             if (c.seq == seq && v.av) {
                 if (c.type == Command::au) {
                     AVPacket* pkt = av_packet_alloc();

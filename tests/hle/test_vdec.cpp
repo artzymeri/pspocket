@@ -269,14 +269,14 @@ Call hle_calls(Fixture& f, GuestThread& t)
     };
 }
 
-std::string all_lines(const std::vector<std::string>& lines)
+[[maybe_unused]] std::string all_lines(const std::vector<std::string>& lines)
 {
     std::string s;
     for (const std::string& l : lines) s += l + "\n";
     return s;
 }
 
-const std::string* find_line(const std::vector<std::string>& lines, std::string_view prefix)
+[[maybe_unused]] const std::string* find_line(const std::vector<std::string>& lines, std::string_view prefix)
 {
     for (const std::string& l : lines)
         if (l.starts_with(prefix)) return &l;

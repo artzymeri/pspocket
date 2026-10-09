@@ -362,9 +362,9 @@ std::vector<Op> pspcm_script()
     const auto arg = [](s64 v) { return u64{static_cast<u32>(v)}; };
     std::vector<Op> s;
     const auto field = [&](u32 offset, u64 value) { s.push_back({p, "=", {param + offset, value}}); };
-    for (const auto& [offset, value] : {std::pair{0u, 32ull}, std::pair{4u, 2ull}, std::pair{8u, 3ull},
-             std::pair{12u, pool}, std::pair{16u, u64{pool_size}}, std::pair{20u, 1000ull}, std::pair{24u, 0x4000ull},
-             std::pair{28u, 0ull}}) {
+    for (const auto& [offset, value] : {std::pair<u32, u64>{0u, 32}, std::pair<u32, u64>{4u, 2},
+             std::pair<u32, u64>{8u, 3}, std::pair<u32, u64>{12u, pool}, std::pair<u32, u64>{16u, pool_size},
+             std::pair<u32, u64>{20u, 1000}, std::pair<u32, u64>{24u, 0x4000}, std::pair<u32, u64>{28u, 0}}) {
         field(offset, value);
     }
     s.push_back({u, "=", {ops, kStr + 0x60}});
@@ -373,9 +373,9 @@ std::vector<Op> pspcm_script()
     // The pool's size, and the parameters it checks.
     s.push_back({p, "cellUsbPspcmCalcPoolSize", {0}});
     s.push_back({p, "cellUsbPspcmCalcPoolSize", {param}});
-    for (const auto& [offset, value, back] : {std::tuple{0u, 31ull, 32ull}, std::tuple{4u, 0ull, 2ull},
-             std::tuple{4u, 17ull, 2ull}, std::tuple{4u, 16ull, 2ull}, std::tuple{4u, arg(-1), 2ull},
-             std::tuple{8u, 0ull, 3ull}, std::tuple{8u, arg(-3), 3ull}, std::tuple{8u, 0x100000ull, 3ull}}) {
+    using Row = std::tuple<u32, u64, u64>;
+    for (const auto& [offset, value, back] : {Row{0u, 31, 32}, Row{4u, 0, 2}, Row{4u, 17, 2}, Row{4u, 16, 2},
+             Row{4u, arg(-1), 2}, Row{8u, 0, 3}, Row{8u, arg(-3), 3}, Row{8u, 0x100000, 3}}) {
         field(offset, value);
         s.push_back({p, "cellUsbPspcmCalcPoolSize", {param}});
         s.push_back({p, "cellUsbPspcmInit", {param}});
