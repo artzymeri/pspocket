@@ -6932,3 +6932,32 @@ start cellFontExtend gives) now run natively (runtime/hle/src/cellFont.cpp), ove
   and relocated; composite codes from a ".ccd" made in the test beside a copy of a firmware font in a temporary
   directory (removed after). 1,432 observations, the same. How often the game's allocator is called is not compared
   (FreeType's own objects are the host's, D-525). The tests' font heap grew to 64 MB.
+
+## D-535 · 2026-10-09 · cellAtracMulti pspocket's own: libatrac3multi as cellAtrac's code on its own layout
+
+cellAtracMulti's 25 functions (RPCS3: answers without decoding) are now libatrac3multi.sprx's logic, compared with it
+running on pspocket (tests/hle/test_atrac_multi.cpp). Read side by side, libatrac3multi is libatrac3plus's ATRAC3 path
+(D-532) with four differences, so runtime/hle/src/cellAtrac.cpp now serves both modules: each export is a thin wrapper
+over one body that takes a `Layout`.
+- The handle (512 bytes) is laid out 0x14 bytes lower: the stream state from +0x5C (libatrac3plus +0x70), the work
+  memory at +0x58 (+0x6C), the buffer for the frame cellAdec gets at +0x54, the track count at +0x40 and the file's
+  channels at +0x50; the sync objects are named "_a3mpm0" and "_a3mpc0". Its errors are libatrac3plus's plus 0x800
+  (0x80610Bxx), and every export first refuses a NULL handle or a NULL pointer it takes with 0x80610B91, before any
+  other check (so does a track count outside 1..8 in SetDataAndGetMemSize).
+- ATRAC3 only: the header parser is libatrac3plus's ATRAC3 branch plus one check, joint stereo must be 0; an ATRAC3plus
+  (WAVE_FORMAT_EXTENSIBLE) header is refused as an unknown format.
+- Output tracks: SetDataAndGetMemSize takes the track count and an array naming, for each output track, the file
+  channel it plays (NULL: the file's channels in order). Before each frame goes to cellAdec, libatrac3multi copies each
+  track's block (the frame's bytes / the file's channels) from the named channel into its frame buffer, or a silent
+  block (zeros, 0xA2 first: a sound unit with no spectrum) for an entry that names no channel of the file;
+  ResetPlayPosition takes a new array. cellAdec's type is 31 (ATRAC3 multichannel), the firmware's core when the user's
+  system software is installed.
+- GetTrackArray is new (the count and the array back); the memory asked for counts the output tracks' PCM.
+Tests: ATRAC3 files of four channels built in the test (silent frames whose blocks carry a per-channel, per-frame byte,
+so a block shuffled wrong shows in the frame cellAdec gets) played whole, half loaded, streamed and run dry, with
+fact chunks of both sizes, looped at the end and inside with a second buffer, with 1, 2, 3, 4 and 8 tracks (picked
+channels, silent entries, repeats), 0 and 9 tracks, joint stereo, an ATRAC3plus tag, 32 kHz, a read larger than the
+buffer, a 12-byte header, and calls on a handle never set and with NULLs: every answer, output, the handle's bytes
+(but the lv2 IDs, cellAdec's handle and the callback's descriptor), the shuffled frame and the PCM the same as
+libatrac3multi's over the firmware's ATRAC3 multichannel core (2,517 checks, over 150 decodes). A test without the
+firmware plays pspocket's side alone. cellAtrac's own comparison (D-532) still passes after the split into bodies.

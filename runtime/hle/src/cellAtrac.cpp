@@ -12,6 +12,11 @@
 // frame (cellAdecDecodeAu), waits for the callback's PCM-out, takes the PCM (cellAdecGetPcm) into the game's buffer, or
 // into the work memory and copies the part the play range keeps, and moves the stream's positions.
 //
+// cellAtracMulti (D-535) is Sony's libatrac3multi.sprx: the same stream code on a handle laid out 0x14 bytes lower
+// (Layout), ATRAC3 only (no joint stereo), with output tracks: the game names a file channel for each (the track
+// array), and each frame's channels are shuffled into the tracks before cellAdec's ATRAC3 multichannel decoder (type
+// 31) gets it. Its calls refuse NULL pointers first (0x80610B91), and its errors are libatrac3plus's at 0x80610Bxx.
+//
 // Deviations: none in behaviour. Memory that is not the guest's is refused with CELL_ATRAC_ERROR_API_FAIL and the call
 // site logged, where libatrac3plus would fault.
 
@@ -68,7 +73,7 @@ constexpr u16 kAt3Plus = 0x1000, kAt3 = 0x1001;
 // +0x50 CellAdecParamAtracX | +0x6C work memory (0: no decoder) | +0x70 the stream state S.
 namespace hd {
 constexpr u32 kMutex = 0, kCond = 4, kError = 8, kFlags = 0xC, kType = 0x10, kAttr = 0x14, kCb = 0x20, kResource = 0x28,
-              kAdec = 0x3C, kAt3Param = 0x40, kAtxParam = 0x50, kWork = 0x6C, kS = 0x70;
+              kAdec = 0x3C, kAt3Param = 0x40, kAtxParam = 0x50;
 constexpr u32 kWaiting = 0x10000000, kEarly = 0x20000000;
 }
 // The stream state, from the handle's +0x70: +0 magic | +4 next sample | +8 last sample | +0xC loop start | +0x10 loop
@@ -87,11 +92,30 @@ constexpr u32 kSample = 4, kEnd = 8, kLoopStart = 0xC, kLoopEnd = 0x10, kOffset 
               kBuffer = 0x40, kSecond = 0x44, kBufferSize = 0x48, kSecondSize = 0x4C;
 }
 
+// Which module's handle: libatrac3plus's, or libatrac3multi's (cellAtracMulti, D-535), whose stream state is the same
+// from +0x5C, its work memory at +0x58 (the frame's tracks shuffled into the buffer at +0x54), its codec parameters at
+// +0x40, its errors 0x80610Bxx where libatrac3plus's are 0x806103xx.
+struct Layout {
+    u32 s, work;
+    bool multi;
+};
+constexpr Layout kPlus{0x70, 0x6C, false}, kMulti{0x5C, 0x58, true};
+constexpr u32 kMultiAuBuffer = 0x54, kMultiTracks = 0x40, kMultiFileChannels = 0x50;
+// libatrac3multi's stream state past libatrac3plus's: +0x50 the file's channels, +0x54 the track array (the file
+// channel each output track takes, -1 or past the file's for silence; eight at most).
+namespace mst {
+constexpr u32 kFileChannels = 0x50, kTracks = 0x54;
+}
+
 // A view of one handle in guest memory.
 struct Atrac {
     u8* b;
     u32 h;
-    u32 s() const { return h + hd::kS; }
+    const Layout* L = &kPlus;
+    u32 s() const { return h + L->s; }
+    u32 work() const { return ps_read32(b, h + L->work); }
+    void set_work(u32 v) const { ps_write32(b, h + L->work, v); }
+    s32 e(u32 code) const { return static_cast<s32>(L->multi ? code + 0x800 : code); }
     u32 r32(u32 off) const { return ps_read32(b, h + off); }
     void w32(u32 off, u32 v) const { ps_write32(b, h + off, v); }
     u32 sr(u32 off) const { return ps_read32(b, s() + off); }
@@ -111,15 +135,15 @@ struct Atrac {
 // libatrac3plus's common checks: the data set (the magic), then a decoder made.
 s32 check(const Atrac& a)
 {
-    if (!a.ready()) return error(CELL_ATRAC_ERROR_UNSET_DATA);
-    if (!a.r32(hd::kWork)) return error(CELL_ATRAC_ERROR_NO_DECODER);
+    if (!a.ready()) return a.e(CELL_ATRAC_ERROR_UNSET_DATA);
+    if (!a.work()) return a.e(CELL_ATRAC_ERROR_NO_DECODER);
     return lv2::CELL_OK;
 }
 
-s32 not_guest(PPUContext& ctx, std::string_view fn, std::string_view what, u32 addr)
+s32 not_guest(PPUContext& ctx, const Layout& L, std::string_view fn, std::string_view what, u32 addr)
 {
     log_call_site(ctx, guest_base(ctx), std::format("{}: the {} at {:#x} is not guest memory", fn, what, addr));
-    return error(CELL_ATRAC_ERROR_API_FAIL);
+    return Atrac{nullptr, 0, &L}.e(CELL_ATRAC_ERROR_API_FAIL);
 }
 
 // The handle (512 bytes) as guest memory.
@@ -373,7 +397,7 @@ s32 reset(const Atrac& a, u32 sample, u32 bytes)
 {
     u32 info[4];
     reset_info(a, sample, info);
-    if (bytes < info[2] || info[1] < bytes) return error(CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE);
+    if (bytes < info[2] || info[1] < bytes) return a.e(CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE);
     a.sw(st::kSample, sample);
     a.s8w(st::kSkip, frames_before(a, sample));
     a.sw(st::kLoops, 0);
@@ -422,7 +446,8 @@ u64 adec(PPUContext& ctx, std::string_view name, std::initializer_list<u64> args
 s32 lock(PPUContext& ctx, const Atrac& a) { return static_cast<s32>(lv2_syscall(ctx, 102, {a.r32(hd::kMutex), 0})); }
 s32 unlock(PPUContext& ctx, const Atrac& a) { return static_cast<s32>(lv2_syscall(ctx, 104, {a.r32(hd::kMutex)})); }
 
-// The handle's mutex (priority, not recursive, "_a3pm00") and condition ("_a3pc00").
+// The handle's mutex (priority, not recursive, "_a3pm00"; libatrac3multi's "_a3mpm0") and condition ("_a3pc00",
+// "_a3mpc0").
 s32 make_sync(PPUContext& ctx, const Atrac& a)
 {
     u8* b = a.b;
@@ -435,11 +460,11 @@ s32 make_sync(PPUContext& ctx, const Atrac& a)
     ps_write32(b, mattr + 12, 0x2000);
     ps_write64(b, mattr + 16, 0);
     ps_write32(b, mattr + 24, 0);
-    std::memcpy(b + mattr + 32, "_a3pm00", 8);
+    std::memcpy(b + mattr + 32, a.L->multi ? "_a3mpm0" : "_a3pm00", 8);
     ps_write32(b, cattr, 0x200);
     ps_write32(b, cattr + 4, 0);
     ps_write64(b, cattr + 8, 0);
-    std::memcpy(b + cattr + 16, "_a3pc00", 8);
+    std::memcpy(b + cattr + 16, a.L->multi ? "_a3mpc0" : "_a3pc00", 8);
     s32 r = static_cast<s32>(lv2_syscall(ctx, 100, {a.h + hd::kMutex, mattr}));
     if (r >= 0) {
         a.w32(hd::kFlags, a.r32(hd::kFlags) | 1);
@@ -510,6 +535,28 @@ void wait_pcm(PPUContext& ctx, const Atrac& a)
 
 // ------------------------------------------------------------------------------------------------ one frame
 
+// libatrac3multi's frame for cellAdec: for each output track, the block of the file channel its track array entry names
+// (the frame's bytes / the file's channels each), or a silent block (zeros, 0xA2 first) for an entry that names none,
+// into the buffer at +0x54. cellAdec gets that buffer with the frame's size.
+u32 shuffle_tracks(const Atrac& a, u32 src)
+{
+    const s32 tracks = static_cast<s32>(a.r32(kMultiTracks));
+    if (tracks <= 0) return src;
+    const s32 file_channels = static_cast<s32>(a.r32(kMultiFileChannels));
+    const u32 block = file_channels ? static_cast<u32>(static_cast<s32>(a.r32(hd::kAt3Param + 8)) / file_channels) : 0;
+    u32 dst = a.r32(kMultiAuBuffer);
+    for (s32 i = 0; i < tracks; i++, dst += block) {
+        const s32 t = static_cast<s32>(a.sr(mst::kTracks + 4 * static_cast<u32>(i)));
+        if (t >= 0 && t < file_channels) {
+            for (u32 k = 0; k < block; k++) a.b[dst + k] = a.b[src + block * static_cast<u32>(t) + k];
+        } else {
+            std::memset(a.b + dst, 0, block);
+            a.b[dst] = 0xA2;
+        }
+    }
+    return a.r32(kMultiAuBuffer);
+}
+
 // libatrac3plus's frame step: one frame decoded; its samples (*samples) and whether the play range ended (*finish);
 // the PCM into `out` (when not 0 and frames to skip are done). Then the positions, loops and the ring move on.
 s32 decode_frame(PPUContext& ctx, const Atrac& a, u32 out, u32* samples, u32* finish)
@@ -519,17 +566,17 @@ s32 decode_frame(PPUContext& ctx, const Atrac& a, u32 out, u32* samples, u32* fi
     const u32 frame = a.frame();
     if (a.sr(st::kDataEnd) < a.sr(st::kRead) + frame || a.sr(st::kSample) > a.sr(st::kEnd)) {
         *finish = 1;
-        return error(CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED);
+        return a.e(CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED);
     }
     const u8 hold = a.s8(st::kHold);
     const bool streamed = hold & 4;
     if ((streamed && a.sr(st::kBytes) < frame) ||
         (hold == 3 && a.sr(st::kDataStart) + a.sr(st::kBytes) < a.sr(st::kRead) + frame)) {
         *finish = 0;
-        return error(CELL_ATRAC_ERROR_NODATA_IN_BUFFER);
+        return a.e(CELL_ATRAC_ERROR_NODATA_IN_BUFFER);
     }
     const bool whole = a.frame_samples() == next;
-    u32 pcm = a.r32(hd::kWork);
+    u32 pcm = a.work();
     if (whole && out) pcm = out;
     u32 au_start;
     if (streamed) {
@@ -538,6 +585,7 @@ s32 decode_frame(PPUContext& ctx, const Atrac& a, u32 out, u32* samples, u32* fi
     } else {
         au_start = a.sr(st::kRead) + a.sr(st::kBuffer);
     }
+    if (a.L->multi) au_start = shuffle_tracks(a, au_start);
     StackVar au(ctx, b, 0x18);
     ps_write32(b, au.addr(), au_start);
     ps_write32(b, au.addr() + 4, a.r32(a.codec() == kAt3 ? hd::kAt3Param + 8 : hd::kAtxParam + 0xC));
@@ -546,19 +594,19 @@ s32 decode_frame(PPUContext& ctx, const Atrac& a, u32 out, u32* samples, u32* fi
     ps_write64(b, au.addr() + 16, 0);
     if (lock(ctx, a) < 0) {
         *finish = 0;
-        return error(CELL_ATRAC_ERROR_API_FAIL);
+        return a.e(CELL_ATRAC_ERROR_API_FAIL);
     }
     s32 r = static_cast<s32>(adec(ctx, "cellAdecDecodeAu", {a.r32(hd::kAdec), au.addr()}));
     if (r >= 0) {
         wait_pcm(ctx, a);
         if (a.r32(hd::kError) != 0) {
-            r = error(CELL_ATRAC_ERROR_API_FAIL);
+            r = a.e(CELL_ATRAC_ERROR_API_FAIL);
         } else {
             const s32 got = static_cast<s32>(adec(ctx, "cellAdecGetPcm", {a.r32(hd::kAdec), pcm}));
             const s32 u = unlock(ctx, a);
             if (got < 0 || u < 0) {
                 *finish = 0;
-                return error(CELL_ATRAC_ERROR_API_FAIL);
+                return a.e(CELL_ATRAC_ERROR_API_FAIL);
             }
             r = u;
             goto decoded;
@@ -566,7 +614,7 @@ s32 decode_frame(PPUContext& ctx, const Atrac& a, u32 out, u32* samples, u32* fi
     }
     unlock(ctx, a);
     *finish = 0;
-    return error(CELL_ATRAC_ERROR_API_FAIL);
+    return a.e(CELL_ATRAC_ERROR_API_FAIL);
 decoded:
     *samples = next;
     *finish = a.sr(st::kSample) + next > a.sr(st::kEnd) ? (a.sr(st::kLoops) == 0 ? 1u : 0u) : 0u;
@@ -658,7 +706,7 @@ bool rate_ok(u32 rate) { return rate == 44100 || rate == 48000; }
 // +0x2C eight more; +0x34 the data's offset, +0x38 the samples (fact), +0x3C the data's size, +0x40 the first sample's
 // offset, +0x44/+0x48 the loop (smpl)), and the codec (0x1000/0x1001) or an error. A chunk is read field by field from
 // its start, the rest of it (its size rounded to even) skipped.
-u32 parse_header(const u8* p, u32 size, u8* info)
+u32 parse_header(const u8* p, u32 size, u8* info, bool multi = false)
 {
     const auto put16 = [&](u32 off, u32 v) { ps_st16(info + off, static_cast<u16>(v)); };
     const auto put32 = [&](u32 off, u32 v) { ps_st32(info + off, v); };
@@ -720,12 +768,13 @@ u32 parse_header(const u8* p, u32 size, u8* info)
                 rd(4);
                 const u32 js = rd(2);
                 put32(0x14, js);
+                if (multi && js != 0) return CELL_ATRAC_ERROR_UNKNOWN_FORMAT; // libatrac3multi: no joint stereo
                 if (rd(2) != js) return CELL_ATRAC_ERROR_UNKNOWN_FORMAT;
                 if (rd(2) != 1) return CELL_ATRAC_ERROR_UNKNOWN_FORMAT;
                 if (rd(2) != 0) return CELL_ATRAC_ERROR_UNKNOWN_FORMAT;
                 codec = kAt3;
                 left -= 0x20;
-            } else if (tag == 0xFFFE) {
+            } else if (tag == 0xFFFE && !multi) {
                 if (left <= 0x33) return codec;
                 put16(0, kAt3Plus);
                 put16(2, rd(2));
@@ -793,12 +842,20 @@ u32 parse_header(const u8* p, u32 size, u8* info)
 
 // The stream state from the header (libatrac3plus's): play range, loop, frames before the first sample, how the data
 // is held.
-u32 set_stream(const Atrac& a, u32 buffer, u32 read, u32 buffer_size, const u8* info)
+u32 set_stream(const Atrac& a, u32 buffer, u32 read, u32 buffer_size, const u8* info, u32 tracks = 0,
+    u32 track_array = 0)
 {
     const u16 codec = a.codec();
     const u32 delay = codec == kAt3 ? 0x45 : 0xB8;
     a.sw(st::kOffset, ps_ld32(info + 0x40) + delay);
-    a.s8w(st::kChannels, static_cast<u8>(ps_ld16(info + 2)));
+    if (a.L->multi) { // the output tracks: the game's array, or the file's channels in order
+        for (u32 i = 0; i < tracks; i++)
+            a.sw(mst::kTracks + 4 * i, track_array ? ps_read32(a.b, track_array + 4 * i) : i);
+        a.s8w(st::kChannels, static_cast<u8>(tracks));
+        a.sw(mst::kFileChannels, ps_ld16(info + 2));
+    } else {
+        a.s8w(st::kChannels, static_cast<u8>(ps_ld16(info + 2)));
+    }
     ps_write16(a.b, a.s() + st::kFrame, ps_ld16(info + 0xC));
     a.sw(st::kRate, ps_ld32(info + 4));
     const u32 frame = a.frame();
@@ -865,15 +922,15 @@ constexpr std::array<Bitrate, 8> kBitrates = {{{kAt3, 44100, 0x130, 105}, {kAt3P
     {kAt3Plus, 48000, 0x2B0, 128}, {kAt3Plus, 48000, 0x6B0, 320}, {kAt3Plus, 48000, 0xAB0, 512}}};
 
 // The handle and the pointers a call writes, as guest memory.
-bool args_ok(PPUContext& ctx, std::string_view fn, u32 h, std::initializer_list<u32> outs, s32& r)
+bool args_ok(PPUContext& ctx, const Layout& L, std::string_view fn, u32 h, std::initializer_list<u32> outs, s32& r)
 {
     if (!handle_ok(ctx, h)) {
-        r = not_guest(ctx, fn, "handle", h);
+        r = not_guest(ctx, L, fn, "handle", h);
         return false;
     }
     for (const u32 o : outs) {
         if (!guest_readable(thread_of(ctx), o, 4)) {
-            r = not_guest(ctx, fn, "result", o);
+            r = not_guest(ctx, L, fn, "result", o);
             return false;
         }
     }
@@ -882,21 +939,21 @@ bool args_ok(PPUContext& ctx, std::string_view fn, u32 h, std::initializer_list<
 
 #define ATRAC_ARGS(h, ...)                                                                   \
     s32 bad_ = 0;                                                                            \
-    if (!args_ok(ctx, __func__, h, {__VA_ARGS__}, bad_)) return bad_;                        \
-    const Atrac a{guest_base(ctx), h}
+    if (!args_ok(ctx, L, __func__, h, {__VA_ARGS__}, bad_)) return bad_;                     \
+    const Atrac a{guest_base(ctx), h, &L}
 
-s32 cellAtracSetDataAndGetMemSize(PPUContext& ctx, u32 h, u32 buffer, u32 read, u32 buffer_size, u32 mem_size)
+s32 cellAtracSetDataAndGetMemSize_impl(PPUContext& ctx, const Layout& L, u32 h, u32 buffer, u32 read, u32 buffer_size, u32 mem_size)
 {
     ATRAC_ARGS(h, mem_size);
-    if (read > buffer_size) return error(CELL_ATRAC_ERROR_READSIZE_OVER_BUFFER);
-    if (!guest_readable(thread_of(ctx), buffer, std::max<u32>(read, 1))) return not_guest(ctx, __func__, "buffer", buffer);
+    if (read > buffer_size) return a.e(CELL_ATRAC_ERROR_READSIZE_OVER_BUFFER);
+    if (!guest_readable(thread_of(ctx), buffer, std::max<u32>(read, 1))) return not_guest(ctx, L, __func__, "buffer", buffer);
     u8* b = a.b;
     std::memset(b + h, 0, 0x200);
     a.w32(hd::kResource + 4, 0);
-    a.w32(hd::kWork, 0);
+    a.set_work(0);
     u8 info[0x50];
     const u32 codec = parse_header(b + buffer, read, info);
-    if (static_cast<s32>(codec) < 0) return error(codec);
+    if (static_cast<s32>(codec) < 0) return a.e(codec);
     ps_write16(b, a.s() + st::kCodec, static_cast<u16>(codec));
     if (codec == kAt3) {
         a.w32(hd::kType, 5); // CELL_ADEC_TYPE_ATRAC3
@@ -920,9 +977,9 @@ s32 cellAtracSetDataAndGetMemSize(PPUContext& ctx, u32 h, u32 buffer, u32 read, 
         b[h + p + 0x19] = 0;
         b[h + p + 0x18] = 0;
         a.w32(p + 0x14, 0x84);
-        if (r >= 5) return error(CELL_ATRAC_ERROR_ILLEGAL_SAMPLING_RATE);
+        if (r >= 5) return a.e(CELL_ATRAC_ERROR_ILLEGAL_SAMPLING_RATE);
     }
-    if (const u32 e = set_stream(a, buffer, read, buffer_size, info); e) return error(e);
+    if (const u32 e = set_stream(a, buffer, read, buffer_size, info); e) return a.e(e);
     ps_write32(b, mem_size, 0);
     const s32 r = static_cast<s32>(adec(ctx, "cellAdecQueryAttr", {h + hd::kType, h + hd::kAttr}));
     if (r < 0) return r;
@@ -941,7 +998,7 @@ s32 delete_decoder(PPUContext& ctx, const Atrac& a)
         a.s8w(st::kHold, 0);
         a.sw(0, 0);
         a.w32(hd::kResource + 4, 0);
-        a.w32(hd::kWork, 0);
+        a.set_work(0);
     }
     return r;
 }
@@ -953,7 +1010,7 @@ s32 create(PPUContext& ctx, const Atrac& a, u32 work, Open&& open)
 {
     s32 r = make_sync(ctx, a);
     if (r >= 0) {
-        a.w32(hd::kWork, work);
+        a.set_work(work);
         r = open();
         if (r < 0) {
             destroy_sync(ctx, a);
@@ -968,72 +1025,86 @@ s32 create(PPUContext& ctx, const Atrac& a, u32 work, Open&& open)
         const s32 n = static_cast<s32>(a.sr(st::kRing) + a.sr(st::kBytes) - from);
         if (n > 0) std::memmove(a.b + a.sr(st::kBuffer), a.b + a.sr(st::kBuffer) + from, static_cast<u32>(n));
     }
-    if (r < 0 && r != error(CELL_ATRAC_ERROR_DECODER_WAS_CREATED)) delete_decoder(ctx, a);
+    if (r < 0 && r != a.e(CELL_ATRAC_ERROR_DECODER_WAS_CREATED)) delete_decoder(ctx, a);
     return r;
 }
 
-u32 callback_descriptor()
+// Where cellAdec's memory starts in the work memory: after the PCM of a frame. libatrac3multi first places the frame's
+// buffer for the shuffled tracks there (the tracks' 256 bytes each), then starts cellAdec's memory after the PCM's size
+// twice and that buffer: past what SetDataAndGetMemSize asked for by the PCM's size less 0x400, as Sony's module does.
+u32 cellAdec_memory(const Atrac& a, u32 work, u32 pcm)
 {
+    if (!a.L->multi) return work + pcm;
+    a.w32(kMultiAuBuffer, work + pcm);
+    return work + pcm + pcm + ((u32{a.s8(st::kChannels)} & 0xFFFFFFu) << 8);
+}
+
+u32 callback_descriptor(const Layout& L)
+{
+    if (L.multi) {
+        return HleProcess::current()->link_function("cellAtracMulti",
+            recomp::nid_of("_pspocket_cellAtracMultiAdecCallback"), "_pspocket_cellAtracMultiAdecCallback");
+    }
     return HleProcess::current()->link_function("cellAtrac", recomp::nid_of("_pspocket_cellAtracAdecCallback"),
         "_pspocket_cellAtracAdecCallback");
 }
 
-s32 cellAtracCreateDecoder(PPUContext& ctx, u32 h, u32 work, u32 ppu_priority, u32 spu_priority)
+s32 cellAtracCreateDecoder_impl(PPUContext& ctx, const Layout& L, u32 h, u32 work, u32 ppu_priority, u32 spu_priority)
 {
     ATRAC_ARGS(h);
-    if (!a.ready()) return error(CELL_ATRAC_ERROR_UNSET_DATA);
-    if (a.r32(hd::kWork)) return error(CELL_ATRAC_ERROR_DECODER_WAS_CREATED);
-    if (ppu_priority > 3071) return error(CELL_ATRAC_ERROR_ILLEGAL_PPU_THREAD_PRIORITY);
-    if (spu_priority > 255) return error(CELL_ATRAC_ERROR_ILLEGAL_SPU_THREAD_PRIORITY);
+    if (!a.ready()) return a.e(CELL_ATRAC_ERROR_UNSET_DATA);
+    if (a.work()) return a.e(CELL_ATRAC_ERROR_DECODER_WAS_CREATED);
+    if (ppu_priority > 3071) return a.e(CELL_ATRAC_ERROR_ILLEGAL_PPU_THREAD_PRIORITY);
+    if (spu_priority > 255) return a.e(CELL_ATRAC_ERROR_ILLEGAL_SPU_THREAD_PRIORITY);
     return create(ctx, a, work, [&] {
         const u32 pcm = pcm_bytes(a.codec(), a.s8(st::kChannels));
         a.w32(hd::kResource, a.r32(hd::kAttr));
-        a.w32(hd::kResource + 4, work + pcm);
+        a.w32(hd::kResource + 4, cellAdec_memory(a, work, pcm));
         a.w32(hd::kResource + 8, ppu_priority);
         a.w32(hd::kResource + 0xC, spu_priority);
         a.w32(hd::kResource + 0x10, 0x4000);
-        a.w32(hd::kCb, callback_descriptor());
+        a.w32(hd::kCb, callback_descriptor(L));
         a.w32(hd::kCb + 4, h);
         return static_cast<s32>(
             adec(ctx, "cellAdecOpen", {h + hd::kType, h + hd::kResource, h + hd::kCb, h + hd::kAdec}));
     });
 }
 
-s32 cellAtracCreateDecoderExt(PPUContext& ctx, u32 h, u32 work, u32 ppu_priority, u32 ext)
+s32 cellAtracCreateDecoderExt_impl(PPUContext& ctx, const Layout& L, u32 h, u32 work, u32 ppu_priority, u32 ext)
 {
     ATRAC_ARGS(h);
-    if (!a.ready()) return error(CELL_ATRAC_ERROR_UNSET_DATA);
-    if (a.r32(hd::kWork)) return error(CELL_ATRAC_ERROR_DECODER_WAS_CREATED);
-    if (ppu_priority > 3071) return error(CELL_ATRAC_ERROR_ILLEGAL_PPU_THREAD_PRIORITY);
-    if (!guest_readable(thread_of(ctx), ext, 12)) return not_guest(ctx, __func__, "resource", ext);
+    if (!a.ready()) return a.e(CELL_ATRAC_ERROR_UNSET_DATA);
+    if (a.work()) return a.e(CELL_ATRAC_ERROR_DECODER_WAS_CREATED);
+    if (ppu_priority > 3071) return a.e(CELL_ATRAC_ERROR_ILLEGAL_PPU_THREAD_PRIORITY);
+    if (!guest_readable(thread_of(ctx), ext, 12)) return not_guest(ctx, L, __func__, "resource", ext);
     return create(ctx, a, work, [&] {
         u8* b = a.b;
         StackVar res(ctx, b, 0x20);
         ps_write32(b, res.addr(), a.r32(hd::kAttr));
-        ps_write32(b, res.addr() + 4, work + pcm_bytes(a.codec(), a.s8(st::kChannels)));
+        ps_write32(b, res.addr() + 4, cellAdec_memory(a, work, pcm_bytes(a.codec(), a.s8(st::kChannels))));
         ps_write32(b, res.addr() + 8, ppu_priority);
         ps_write32(b, res.addr() + 0xC, 0x4000);
         ps_write32(b, res.addr() + 0x10, ps_read32(b, ext));
         std::memcpy(b + res.addr() + 0x14, b + ext + 4, 8);
-        a.w32(hd::kCb, callback_descriptor());
+        a.w32(hd::kCb, callback_descriptor(L));
         a.w32(hd::kCb + 4, h);
         ps_write32(b, res.addr() + 0x1C, 1);
         return static_cast<s32>(adec(ctx, "cellAdecOpenExt", {h + hd::kType, res.addr(), h + hd::kCb, h + hd::kAdec}));
     });
 }
 
-s32 cellAtracDeleteDecoder(PPUContext& ctx, u32 h)
+s32 cellAtracDeleteDecoder_impl(PPUContext& ctx, const Layout& L, u32 h)
 {
     ATRAC_ARGS(h);
     return delete_decoder(ctx, a);
 }
 
-s32 cellAtracDecode(PPUContext& ctx, u32 h, u32 out, u32 samples, u32 finish, u32 remain_out)
+s32 cellAtracDecode_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out, u32 samples, u32 finish, u32 remain_out)
 {
     ATRAC_ARGS(h, samples, finish, remain_out);
     if (const s32 e = check(a); e) return e;
-    if (out & 3) return error(CELL_ATRAC_ERROR_NOT_ALIGNED_OUT_BUFFER);
-    if (a.s8(st::kHold) == 6 && !a.sr(st::kSecondSize)) return error(CELL_ATRAC_ERROR_NEED_SECOND_BUFFER);
+    if (out & 3) return a.e(CELL_ATRAC_ERROR_NOT_ALIGNED_OUT_BUFFER);
+    if (a.s8(st::kHold) == 6 && !a.sr(st::kSecondSize)) return a.e(CELL_ATRAC_ERROR_NEED_SECOND_BUFFER);
     s32 r = 0;
     for (s32 n = -static_cast<s8>(a.s8(st::kSkip)); n <= 0; n++) {
         u32 got = 0, done = 0;
@@ -1049,7 +1120,7 @@ s32 cellAtracDecode(PPUContext& ctx, u32 h, u32 out, u32 samples, u32 finish, u3
     return r;
 }
 
-s32 cellAtracGetStreamDataInfo(PPUContext& ctx, u32 h, u32 write_at, u32 size, u32 read_at)
+s32 cellAtracGetStreamDataInfo_impl(PPUContext& ctx, const Layout& L, u32 h, u32 write_at, u32 size, u32 read_at)
 {
     ATRAC_ARGS(h, write_at, size, read_at);
     if (const s32 e = check(a); e) return e;
@@ -1072,13 +1143,13 @@ s32 cellAtracGetStreamDataInfo(PPUContext& ctx, u32 h, u32 write_at, u32 size, u
     return lv2::CELL_OK;
 }
 
-s32 cellAtracAddStreamData(PPUContext& ctx, u32 h, u32 bytes)
+s32 cellAtracAddStreamData_impl(PPUContext& ctx, const Layout& L, u32 h, u32 bytes)
 {
     ATRAC_ARGS(h);
-    if (!a.ready()) return error(CELL_ATRAC_ERROR_UNSET_DATA);
-    if (!a.r32(hd::kWork)) return error(CELL_ATRAC_ERROR_NO_DECODER);
+    if (!a.ready()) return a.e(CELL_ATRAC_ERROR_UNSET_DATA);
+    if (!a.work()) return a.e(CELL_ATRAC_ERROR_NO_DECODER);
     const u8 hold = a.s8(st::kHold);
-    if (hold == 2) return error(CELL_ATRAC_ERROR_ALLDATA_IS_ONMEMORY);
+    if (hold == 2) return a.e(CELL_ATRAC_ERROR_ALLDATA_IS_ONMEMORY);
     u32 limit;
     if (hold == 3) {
         limit = a.sr(st::kDataEnd) - a.sr(st::kDataStart) - a.sr(st::kBytes);
@@ -1090,12 +1161,12 @@ s32 cellAtracAddStreamData(PPUContext& ctx, u32 h, u32 bytes)
     } else {
         limit = writable(a);
     }
-    if (limit < bytes) return error(CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG);
+    if (limit < bytes) return a.e(CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG);
     a.sw(st::kBytes, bytes + a.sr(st::kBytes));
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetRemainFrame(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetRemainFrame_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
@@ -1103,7 +1174,7 @@ s32 cellAtracGetRemainFrame(PPUContext& ctx, u32 h, u32 out)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetVacantSize(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetVacantSize_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
@@ -1111,21 +1182,21 @@ s32 cellAtracGetVacantSize(PPUContext& ctx, u32 h, u32 out)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracIsSecondBufferNeeded(PPUContext& ctx, u32 h)
+s32 cellAtracIsSecondBufferNeeded_impl(PPUContext& ctx, const Layout& L, u32 h)
 {
     ATRAC_ARGS(h);
     if (const s32 e = check(a); e) return e;
     return a.s8(st::kHold) == 6 ? 1 : 0;
 }
 
-s32 cellAtracGetSecondBufferInfo(PPUContext& ctx, u32 h, u32 at, u32 size)
+s32 cellAtracGetSecondBufferInfo_impl(PPUContext& ctx, const Layout& L, u32 h, u32 at, u32 size)
 {
     ATRAC_ARGS(h, at, size);
     if (const s32 e = check(a); e) return e;
     if (a.s8(st::kHold) != 6) {
         ps_write32(a.b, at, 0);
         ps_write32(a.b, size, 0);
-        return error(CELL_ATRAC_ERROR_NONEED_SECOND_BUFFER);
+        return a.e(CELL_ATRAC_ERROR_NONEED_SECOND_BUFFER);
     }
     const u32 from = frame_last_byte(a, a.sr(st::kLoopEnd)) + 1;
     ps_write32(a.b, at, from);
@@ -1133,20 +1204,20 @@ s32 cellAtracGetSecondBufferInfo(PPUContext& ctx, u32 h, u32 at, u32 size)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracSetSecondBuffer(PPUContext& ctx, u32 h, u32 buffer, u32 size)
+s32 cellAtracSetSecondBuffer_impl(PPUContext& ctx, const Layout& L, u32 h, u32 buffer, u32 size)
 {
     ATRAC_ARGS(h);
     if (const s32 e = check(a); e) return e;
     const u32 last = frame_last_byte(a, a.sr(st::kLoopEnd));
-    if (!(a.frame() * 3 <= size || a.sr(st::kDataEnd) - last - 1 <= size)) return error(CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
-    if (a.s8(st::kHold) != 6) return error(CELL_ATRAC_ERROR_NONEED_SECOND_BUFFER);
+    if (!(a.frame() * 3 <= size || a.sr(st::kDataEnd) - last - 1 <= size)) return a.e(CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+    if (a.s8(st::kHold) != 6) return a.e(CELL_ATRAC_ERROR_NONEED_SECOND_BUFFER);
     a.sw(st::kSecondPos, 0);
     a.sw(st::kSecond, buffer);
     a.sw(st::kSecondSize, size);
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetChannel(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetChannel_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
@@ -1154,7 +1225,7 @@ s32 cellAtracGetChannel(PPUContext& ctx, u32 h, u32 out)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetMaxSample(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetMaxSample_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
@@ -1162,7 +1233,7 @@ s32 cellAtracGetMaxSample(PPUContext& ctx, u32 h, u32 out)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetNextSample(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetNextSample_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
@@ -1170,7 +1241,7 @@ s32 cellAtracGetNextSample(PPUContext& ctx, u32 h, u32 out)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetSoundInfo(PPUContext& ctx, u32 h, u32 end, u32 loop_start, u32 loop_end)
+s32 cellAtracGetSoundInfo_impl(PPUContext& ctx, const Layout& L, u32 h, u32 end, u32 loop_start, u32 loop_end)
 {
     ATRAC_ARGS(h, end, loop_start, loop_end);
     if (const s32 e = check(a); e) return e;
@@ -1186,17 +1257,17 @@ s32 cellAtracGetSoundInfo(PPUContext& ctx, u32 h, u32 end, u32 loop_start, u32 l
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetNextDecodePosition(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetNextDecodePosition_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
     if (a.frame() > a.sr(st::kDataEnd) - a.sr(st::kRead) || a.sr(st::kSample) > a.sr(st::kEnd))
-        return error(CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED);
+        return a.e(CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED);
     ps_write32(a.b, out, a.sr(st::kSample) - a.sr(st::kOffset));
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetSamplingRate(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetSamplingRate_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
@@ -1204,7 +1275,7 @@ s32 cellAtracGetSamplingRate(PPUContext& ctx, u32 h, u32 out)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetBitrate(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetBitrate_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
@@ -1223,7 +1294,7 @@ s32 cellAtracGetBitrate(PPUContext& ctx, u32 h, u32 out)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetLoopInfo(PPUContext& ctx, u32 h, u32 loops, u32 status)
+s32 cellAtracGetLoopInfo_impl(PPUContext& ctx, const Layout& L, u32 h, u32 loops, u32 status)
 {
     ATRAC_ARGS(h, loops, status);
     if (const s32 e = check(a); e) return e;
@@ -1234,17 +1305,17 @@ s32 cellAtracGetLoopInfo(PPUContext& ctx, u32 h, u32 loops, u32 status)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracSetLoopNum(PPUContext& ctx, u32 h, s32 loops)
+s32 cellAtracSetLoopNum_impl(PPUContext& ctx, const Layout& L, u32 h, s32 loops)
 {
     ATRAC_ARGS(h);
     if (const s32 e = check(a); e) return e;
     if (!a.sr(st::kLoopEnd) || (a.sr(st::kLoops) == 0 && a.sr(st::kSample) > a.sr(st::kLoopEnd)))
-        return error(CELL_ATRAC_ERROR_UNSET_LOOP_NUM);
+        return a.e(CELL_ATRAC_ERROR_UNSET_LOOP_NUM);
     a.sw(st::kLoops, static_cast<u32>(loops));
     return lv2::CELL_OK;
 }
 
-s32 cellAtracGetInternalErrorInfo(PPUContext& ctx, u32 h, u32 out)
+s32 cellAtracGetInternalErrorInfo_impl(PPUContext& ctx, const Layout& L, u32 h, u32 out)
 {
     ATRAC_ARGS(h, out);
     if (const s32 e = check(a); e) return e;
@@ -1252,31 +1323,341 @@ s32 cellAtracGetInternalErrorInfo(PPUContext& ctx, u32 h, u32 out)
     return lv2::CELL_OK;
 }
 
-s32 cellAtracResetPlayPosition(PPUContext& ctx, u32 h, u32 sample, u32 bytes)
+s32 cellAtracResetPlayPosition_impl(PPUContext& ctx, const Layout& L, u32 h, u32 sample, u32 bytes, u32 tracks = 0)
 {
     ATRAC_ARGS(h);
     if (const s32 e = check(a); e) return e;
-    if (a.s8(st::kHold) == 6 && !a.sr(st::kSecondSize)) return error(CELL_ATRAC_ERROR_NEED_SECOND_BUFFER);
+    if (a.s8(st::kHold) == 6 && !a.sr(st::kSecondSize)) return a.e(CELL_ATRAC_ERROR_NEED_SECOND_BUFFER);
     const u32 s = sample + a.sr(st::kOffset);
-    if (s > a.sr(st::kEnd)) return error(CELL_ATRAC_ERROR_ILLEGAL_SAMPLE);
+    if (s > a.sr(st::kEnd)) return a.e(CELL_ATRAC_ERROR_ILLEGAL_SAMPLE);
+    if (tracks && a.s8(st::kChannels)) { // libatrac3multi: a new track array
+        const u32 n = a.s8(st::kChannels);
+        if (!guest_readable(thread_of(ctx), tracks, 4 * n)) return not_guest(ctx, L, __func__, "track array", tracks);
+        for (u32 i = 0; i < n; i++) a.sw(mst::kTracks + 4 * i, ps_read32(a.b, tracks + 4 * i));
+    }
     if (const s32 r = reset(a, s, bytes); r < 0) return r;
     return preroll(ctx, a);
 }
 
-s32 cellAtracGetBufferInfoForResetting(PPUContext& ctx, u32 h, u32 sample, u32 out)
+s32 cellAtracGetBufferInfoForResetting_impl(PPUContext& ctx, const Layout& L, u32 h, u32 sample, u32 out)
 {
     ATRAC_ARGS(h);
     if (const s32 e = check(a); e) return e;
-    if (a.s8(st::kHold) == 6 && !a.sr(st::kSecondSize)) return error(CELL_ATRAC_ERROR_NEED_SECOND_BUFFER);
+    if (a.s8(st::kHold) == 6 && !a.sr(st::kSecondSize)) return a.e(CELL_ATRAC_ERROR_NEED_SECOND_BUFFER);
     const u32 s = sample + a.sr(st::kOffset);
-    if (s > a.sr(st::kEnd)) return error(CELL_ATRAC_ERROR_ILLEGAL_SAMPLE);
-    if (!guest_readable(thread_of(ctx), out, 16)) return not_guest(ctx, __func__, "buffer information", out);
+    if (s > a.sr(st::kEnd)) return a.e(CELL_ATRAC_ERROR_ILLEGAL_SAMPLE);
+    if (!guest_readable(thread_of(ctx), out, 16)) return not_guest(ctx, L, __func__, "buffer information", out);
     u32 info[4];
     reset_info(a, s, info);
     for (u32 i = 0; i < 4; i++) ps_write32(a.b, out + 4 * i, info[i]);
     return preroll(ctx, a);
 }
 
+// libatrac3plus's exports.
+s32 cellAtracSetDataAndGetMemSize(PPUContext& ctx, u32 h, u32 buffer, u32 read, u32 buffer_size, u32 mem_size)
+{
+    return cellAtracSetDataAndGetMemSize_impl(ctx, kPlus, h, buffer, read, buffer_size, mem_size);
+}
+s32 cellAtracCreateDecoder(PPUContext& ctx, u32 h, u32 work, u32 ppu_priority, u32 spu_priority)
+{
+    return cellAtracCreateDecoder_impl(ctx, kPlus, h, work, ppu_priority, spu_priority);
+}
+s32 cellAtracCreateDecoderExt(PPUContext& ctx, u32 h, u32 work, u32 ppu_priority, u32 ext)
+{
+    return cellAtracCreateDecoderExt_impl(ctx, kPlus, h, work, ppu_priority, ext);
+}
+s32 cellAtracDeleteDecoder(PPUContext& ctx, u32 h)
+{
+    return cellAtracDeleteDecoder_impl(ctx, kPlus, h);
+}
+s32 cellAtracDecode(PPUContext& ctx, u32 h, u32 out, u32 samples, u32 finish, u32 remain_out)
+{
+    return cellAtracDecode_impl(ctx, kPlus, h, out, samples, finish, remain_out);
+}
+s32 cellAtracGetStreamDataInfo(PPUContext& ctx, u32 h, u32 write_at, u32 size, u32 read_at)
+{
+    return cellAtracGetStreamDataInfo_impl(ctx, kPlus, h, write_at, size, read_at);
+}
+s32 cellAtracAddStreamData(PPUContext& ctx, u32 h, u32 bytes)
+{
+    return cellAtracAddStreamData_impl(ctx, kPlus, h, bytes);
+}
+s32 cellAtracGetRemainFrame(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetRemainFrame_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracGetVacantSize(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetVacantSize_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracIsSecondBufferNeeded(PPUContext& ctx, u32 h)
+{
+    return cellAtracIsSecondBufferNeeded_impl(ctx, kPlus, h);
+}
+s32 cellAtracGetSecondBufferInfo(PPUContext& ctx, u32 h, u32 at, u32 size)
+{
+    return cellAtracGetSecondBufferInfo_impl(ctx, kPlus, h, at, size);
+}
+s32 cellAtracSetSecondBuffer(PPUContext& ctx, u32 h, u32 buffer, u32 size)
+{
+    return cellAtracSetSecondBuffer_impl(ctx, kPlus, h, buffer, size);
+}
+s32 cellAtracGetChannel(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetChannel_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracGetMaxSample(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetMaxSample_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracGetNextSample(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetNextSample_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracGetSoundInfo(PPUContext& ctx, u32 h, u32 end, u32 loop_start, u32 loop_end)
+{
+    return cellAtracGetSoundInfo_impl(ctx, kPlus, h, end, loop_start, loop_end);
+}
+s32 cellAtracGetNextDecodePosition(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetNextDecodePosition_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracGetSamplingRate(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetSamplingRate_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracGetBitrate(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetBitrate_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracGetLoopInfo(PPUContext& ctx, u32 h, u32 loops, u32 status)
+{
+    return cellAtracGetLoopInfo_impl(ctx, kPlus, h, loops, status);
+}
+s32 cellAtracSetLoopNum(PPUContext& ctx, u32 h, s32 loops)
+{
+    return cellAtracSetLoopNum_impl(ctx, kPlus, h, loops);
+}
+s32 cellAtracGetInternalErrorInfo(PPUContext& ctx, u32 h, u32 out)
+{
+    return cellAtracGetInternalErrorInfo_impl(ctx, kPlus, h, out);
+}
+s32 cellAtracResetPlayPosition(PPUContext& ctx, u32 h, u32 sample, u32 bytes)
+{
+    return cellAtracResetPlayPosition_impl(ctx, kPlus, h, sample, bytes);
+}
+s32 cellAtracGetBufferInfoForResetting(PPUContext& ctx, u32 h, u32 sample, u32 out)
+{
+    return cellAtracGetBufferInfoForResetting_impl(ctx, kPlus, h, sample, out);
+}
+
+// libatrac3multi's exports (cellAtracMulti, D-535): a NULL handle or pointer the call takes is 0x80610B91 before
+// anything else; then libatrac3plus's bodies on libatrac3multi's layout, ATRAC3 only, with the output tracks.
+constexpr u32 kMultiNull = 0x80610B91;
+#define MULTI_NULL(...)                                                                    \
+    for (const u32 p_ : {__VA_ARGS__})                                                     \
+        if (!p_) return error(kMultiNull)
+
+s32 cellAtracMultiSetDataAndGetMemSize(PPUContext& ctx, u32 h, u32 buffer, u32 read, u32 buffer_size, u32 tracks,
+    u32 track_array, u32 mem_size)
+{
+    MULTI_NULL(h, buffer, mem_size);
+    if (tracks - 1 > 7) return error(kMultiNull);
+    const Layout& L = kMulti;
+    ATRAC_ARGS(h, mem_size);
+    if (read > buffer_size) return a.e(CELL_ATRAC_ERROR_READSIZE_OVER_BUFFER);
+    if (!guest_readable(thread_of(ctx), buffer, std::max<u32>(read, 1))) return not_guest(ctx, L, __func__, "buffer", buffer);
+    if (track_array && !guest_readable(thread_of(ctx), track_array, 4 * tracks))
+        return not_guest(ctx, L, __func__, "track array", track_array);
+    u8* b = a.b;
+    std::memset(b + h, 0, 0x200);
+    a.set_work(0);
+    a.w32(hd::kResource + 4, 0);
+    u8 info[0x50];
+    const u32 codec = parse_header(b + buffer, read, info, true);
+    if (static_cast<s32>(codec) < 0) return a.e(codec);
+    a.w32(hd::kType, 0x1F); // CELL_ADEC_TYPE_ATRAC3MULTI
+    ps_write16(b, a.s() + st::kCodec, static_cast<u16>(codec));
+    a.w32(hd::kAt3Param + 4, ps_ld32(info + 0x14));
+    a.w32(hd::kAt3Param, tracks);
+    a.w32(hd::kAt3Param + 8, ps_ld16(info + 0xC));
+    a.w32(hd::kAt3Param + 0xC, 0x84);
+    a.w32(hd::kAt3Param + 0x10, ps_ld16(info + 2));
+    if (const u32 e = set_stream(a, buffer, read, buffer_size, info, tracks, track_array); e) return a.e(e);
+    ps_write32(b, mem_size, 0);
+    const s32 r = static_cast<s32>(adec(ctx, "cellAdecQueryAttr", {h + hd::kType, h + hd::kAttr}));
+    if (r < 0) return r;
+    const u32 ch = a.s8(st::kChannels);
+    ps_write32(b, mem_size, ((ch & 0xFFFFFu) << 12) + ((ch & 0xFFFFFFu) << 8) + a.r32(hd::kAttr) + 0x400);
+    return r;
+}
+
+s32 cellAtracMultiCreateDecoder(PPUContext& ctx, u32 h, u32 work, u32 ppu_priority, u32 spu_priority)
+{
+    MULTI_NULL(h, work);
+    return cellAtracCreateDecoder_impl(ctx, kMulti, h, work, ppu_priority, spu_priority);
+}
+
+s32 cellAtracMultiCreateDecoderExt(PPUContext& ctx, u32 h, u32 work, u32 ppu_priority, u32 ext)
+{
+    MULTI_NULL(h, work, ext);
+    return cellAtracCreateDecoderExt_impl(ctx, kMulti, h, work, ppu_priority, ext);
+}
+
+s32 cellAtracMultiDeleteDecoder(PPUContext& ctx, u32 h)
+{
+    MULTI_NULL(h);
+    return cellAtracDeleteDecoder_impl(ctx, kMulti, h);
+}
+
+s32 cellAtracMultiDecode(PPUContext& ctx, u32 h, u32 out, u32 samples, u32 finish, u32 remain_out)
+{
+    MULTI_NULL(h, out, samples, finish, remain_out);
+    return cellAtracDecode_impl(ctx, kMulti, h, out, samples, finish, remain_out);
+}
+
+s32 cellAtracMultiGetStreamDataInfo(PPUContext& ctx, u32 h, u32 write_at, u32 size, u32 read_at)
+{
+    MULTI_NULL(h, write_at, size, read_at);
+    return cellAtracGetStreamDataInfo_impl(ctx, kMulti, h, write_at, size, read_at);
+}
+
+s32 cellAtracMultiAddStreamData(PPUContext& ctx, u32 h, u32 bytes)
+{
+    MULTI_NULL(h);
+    return cellAtracAddStreamData_impl(ctx, kMulti, h, bytes);
+}
+
+s32 cellAtracMultiGetRemainFrame(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetRemainFrame_impl(ctx, kMulti, h, out);
+}
+
+s32 cellAtracMultiGetVacantSize(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetVacantSize_impl(ctx, kMulti, h, out);
+}
+
+s32 cellAtracMultiIsSecondBufferNeeded(PPUContext& ctx, u32 h)
+{
+    MULTI_NULL(h);
+    return cellAtracIsSecondBufferNeeded_impl(ctx, kMulti, h);
+}
+
+s32 cellAtracMultiGetSecondBufferInfo(PPUContext& ctx, u32 h, u32 at, u32 size)
+{
+    MULTI_NULL(h, at, size);
+    return cellAtracGetSecondBufferInfo_impl(ctx, kMulti, h, at, size);
+}
+
+s32 cellAtracMultiSetSecondBuffer(PPUContext& ctx, u32 h, u32 buffer, u32 size)
+{
+    MULTI_NULL(h, buffer);
+    return cellAtracSetSecondBuffer_impl(ctx, kMulti, h, buffer, size);
+}
+
+s32 cellAtracMultiGetChannel(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetChannel_impl(ctx, kMulti, h, out);
+}
+
+s32 cellAtracMultiGetMaxSample(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetMaxSample_impl(ctx, kMulti, h, out);
+}
+
+s32 cellAtracMultiGetNextSample(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetNextSample_impl(ctx, kMulti, h, out);
+}
+
+s32 cellAtracMultiGetSoundInfo(PPUContext& ctx, u32 h, u32 end, u32 loop_start, u32 loop_end)
+{
+    MULTI_NULL(h, end, loop_start, loop_end);
+    return cellAtracGetSoundInfo_impl(ctx, kMulti, h, end, loop_start, loop_end);
+}
+
+s32 cellAtracMultiGetNextDecodePosition(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetNextDecodePosition_impl(ctx, kMulti, h, out);
+}
+
+s32 cellAtracMultiGetSamplingRate(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetSamplingRate_impl(ctx, kMulti, h, out);
+}
+
+// The bit rate: libatrac3plus's formula (no table) for the file, per file channel, times the output tracks.
+s32 cellAtracMultiGetBitrate(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    const Layout& L = kMulti;
+    ATRAC_ARGS(h, out);
+    if (const s32 e = check(a); e) return e;
+    const u32 file = static_cast<u32>(static_cast<u32>(a.frame() * (a.sr(st::kRate) << 3)) / 1000) >>
+        (a.frame_shift() & 0x3F);
+    const u32 per = a.sr(mst::kFileChannels) ? file / a.sr(mst::kFileChannels) : 0;
+    ps_write32(a.b, out, per * a.s8(st::kChannels));
+    return lv2::CELL_OK;
+}
+
+s32 cellAtracMultiGetLoopInfo(PPUContext& ctx, u32 h, u32 loops, u32 status)
+{
+    MULTI_NULL(h, loops, status);
+    return cellAtracGetLoopInfo_impl(ctx, kMulti, h, loops, status);
+}
+
+s32 cellAtracMultiSetLoopNum(PPUContext& ctx, u32 h, s32 loops)
+{
+    MULTI_NULL(h);
+    return cellAtracSetLoopNum_impl(ctx, kMulti, h, loops);
+}
+
+s32 cellAtracMultiGetInternalErrorInfo(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetInternalErrorInfo_impl(ctx, kMulti, h, out);
+}
+
+// cellAtracMultiResetPlayPosition(handle, sample, bytes, tracks): a new track array when `tracks` is not NULL.
+s32 cellAtracMultiResetPlayPosition(PPUContext& ctx, u32 h, u32 sample, u32 bytes, u32 tracks)
+{
+    MULTI_NULL(h);
+    return cellAtracResetPlayPosition_impl(ctx, kMulti, h, sample, bytes, tracks);
+}
+
+s32 cellAtracMultiGetBufferInfoForResetting(PPUContext& ctx, u32 h, u32 sample, u32 out)
+{
+    MULTI_NULL(h, out);
+    return cellAtracGetBufferInfoForResetting_impl(ctx, kMulti, h, sample, out);
+}
+
+// The track array: one file channel per output track (the data set is all it needs, no decoder).
+s32 cellAtracMultiGetTrackArray(PPUContext& ctx, u32 h, u32 out)
+{
+    MULTI_NULL(h, out);
+    const Layout& L = kMulti;
+    ATRAC_ARGS(h);
+    if (!a.ready()) return a.e(CELL_ATRAC_ERROR_UNSET_DATA);
+    const u32 n = a.s8(st::kChannels);
+    if (n && !guest_readable(thread_of(ctx), out, 4 * n)) return not_guest(ctx, L, __func__, "track array", out);
+    for (u32 i = 0; i < n; i++) ps_write32(a.b, out + 4 * i, a.sr(mst::kTracks + 4 * i));
+    return lv2::CELL_OK;
+}
+
+s32 _pspocket_cellAtracMultiAdecCallback(PPUContext& ctx, u32 adec_handle, s32 type, s32 data, u32 handle)
+{
+    return _pspocket_cellAtracAdecCallback(ctx, adec_handle, type, data, handle);
+}
+
+#undef MULTI_NULL
 #undef ATRAC_ARGS
 
 constexpr HostImport kImports[] = {
@@ -1287,6 +1668,16 @@ constexpr HostImport kImports[] = {
     {"cellAtrac", "cellAdec", 0x487B613E, false}, // cellAdecStartSeq
     {"cellAtrac", "cellAdec", 0x1529E506, false}, // cellAdecDecodeAu
     {"cellAtrac", "cellAdec", 0x97FF2AF1, false}, // cellAdecGetPcm
+};
+
+constexpr HostImport kMultiImports[] = {
+    {"cellAtracMulti", "cellAdec", 0x7E4A4A49, false}, // cellAdecQueryAttr
+    {"cellAtracMulti", "cellAdec", 0xD00A6988, false}, // cellAdecOpen
+    {"cellAtracMulti", "cellAdec", 0x8B5551A4, false}, // cellAdecOpenExt
+    {"cellAtracMulti", "cellAdec", 0x847D2380, false}, // cellAdecClose
+    {"cellAtracMulti", "cellAdec", 0x487B613E, false}, // cellAdecStartSeq
+    {"cellAtracMulti", "cellAdec", 0x1529E506, false}, // cellAdecDecodeAu
+    {"cellAtracMulti", "cellAdec", 0x97FF2AF1, false}, // cellAdecGetPcm
 };
 
 } // namespace
@@ -1322,6 +1713,37 @@ void register_cellAtrac(Registry& r)
         ::pspocket::hle::Function{{}, "_pspocket_cellAtracAdecCallback",
             recomp::nid_of("_pspocket_cellAtracAdecCallback"),
             &detail::thunk<&_pspocket_cellAtracAdecCallback>, true},
+    });
+    r.add_imports("cellAtracMulti", kMultiImports);
+    r.add("cellAtracMulti", {
+        PS_HLE_FUNC(0x0FFB4665, cellAtracMultiCreateDecoder),
+        PS_HLE_FUNC(0x1AE28192, cellAtracMultiAddStreamData),
+        PS_HLE_FUNC(0x489E22F1, cellAtracMultiGetNextDecodePosition),
+        PS_HLE_FUNC(0x59431D1B, cellAtracMultiGetRemainFrame),
+        PS_HLE_FUNC(0x5B6CCF5A, cellAtracMultiGetTrackArray),
+        PS_HLE_FUNC(0x60B2101D, cellAtracMultiGetVacantSize),
+        PS_HLE_FUNC(0x659775FB, cellAtracMultiSetSecondBuffer),
+        PS_HLE_FUNC(0x670B2721, cellAtracMultiGetStreamDataInfo),
+        PS_HLE_FUNC(0x6CFF1D7F, cellAtracMultiGetBitrate),
+        PS_HLE_FUNC(0x77BD901A, cellAtracMultiGetNextSample),
+        PS_HLE_FUNC(0x780A18BB, cellAtracMultiDeleteDecoder),
+        PS_HLE_FUNC(0x81B22CA8, cellAtracMultiSetDataAndGetMemSize),
+        PS_HLE_FUNC(0x9119CFD1, cellAtracMultiResetPlayPosition),
+        PS_HLE_FUNC(0x92D48677, cellAtracMultiGetInternalErrorInfo),
+        PS_HLE_FUNC(0xB23F070A, cellAtracMultiCreateDecoderExt),
+        PS_HLE_FUNC(0xB91967BC, cellAtracMultiGetLoopInfo),
+        PS_HLE_FUNC(0xC5C5EED3, cellAtracMultiGetSoundInfo),
+        PS_HLE_FUNC(0xD85F2D10, cellAtracMultiGetMaxSample),
+        PS_HLE_FUNC(0xD86ACB12, cellAtracMultiDecode),
+        PS_HLE_FUNC(0xDA43F526, cellAtracMultiSetLoopNum),
+        PS_HLE_FUNC(0xDE9B7905, cellAtracMultiGetBufferInfoForResetting),
+        PS_HLE_FUNC(0xED30F1FA, cellAtracMultiGetSecondBufferInfo),
+        PS_HLE_FUNC(0xF11B8DD5, cellAtracMultiGetChannel),
+        PS_HLE_FUNC(0xF197CCAA, cellAtracMultiGetSamplingRate),
+        PS_HLE_FUNC(0xF8B1AB0C, cellAtracMultiIsSecondBufferNeeded),
+        ::pspocket::hle::Function{{}, "_pspocket_cellAtracMultiAdecCallback",
+            recomp::nid_of("_pspocket_cellAtracMultiAdecCallback"),
+            &detail::thunk<&_pspocket_cellAtracMultiAdecCallback>, true},
     });
 }
 
