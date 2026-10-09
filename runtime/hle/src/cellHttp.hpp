@@ -173,7 +173,7 @@ inline constexpr u32 kTransactionTable = 0x7D0;
 // The caches (cellHttpInitCache's and the external one) and the disk cache.
 inline constexpr u32 kCache = 0x800, kExtCache = 0x880, kDiskCache = 0x900;
 // Strings libhttp hands to other libraries (heap names).
-inline constexpr u32 kStrHeap = 0xC00, kStrCookieHeap = 0xC20;
+inline constexpr u32 kStrHeap = 0xC00, kStrCookieHeap = 0xC20, kStrSlash = 0xC40, kStrEquals = 0xC44, kStrSemi = 0xC48;
 inline constexpr u32 kDataSize = 0x1000;
 
 bool initialized(PPUContext& ctx);
@@ -234,6 +234,7 @@ s32 proxy_prepare(PPUContext& ctx, u32 proxy, u32 uri, u32& pool, u32& parse_poo
 void register_core(Registry& r);
 void register_clients(Registry& r);
 void register_cookies(Registry& r);
+void register_auth(Registry& r);
 void register_https(Registry& r);
 
 // A connection (cellHttpConnection.cpp).
@@ -252,8 +253,9 @@ s32 manager_destroy(PPUContext& ctx, u32 m);
 s32 manager_close_all(PPUContext& ctx, u32 m);
 s32 manager_ssl_version(PPUContext& ctx, u32 m, u32 out);
 
-// Cookies (cellHttpCookie.cpp): the client's session cookies flushed when it is destroyed.
+// Cookies (cellHttpCookie.cpp): the client's session cookies flushed when it is destroyed; a Set-Cookie value parsed.
 s32 session_cookie_flush(PPUContext& ctx, u32 client);
+s32 cookie_parse(PPUContext& ctx, u32 str, u32 host, u32 path, u32 out_list, u32 out_count, u32 out_size, u32 client);
 // HTTPS (cellHttps.cpp): a client's SSL record made and freed with the client, a socket's SSL object closed.
 s32 client_ssl_create(PPUContext& ctx, u32 client);
 s32 client_ssl_destroy(PPUContext& ctx, u32 client);

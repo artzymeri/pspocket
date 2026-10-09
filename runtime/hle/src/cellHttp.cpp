@@ -275,6 +275,9 @@ u32 data(PPUContext& ctx)
         zero(ctx, l.data, kDataSize);
         std::memcpy(gb(ctx) + l.data + kStrHeap, "cellHttp_Library", 17);
         std::memcpy(gb(ctx) + l.data + kStrCookieHeap, "cellHttpCookie_Library", 23);
+        std::memcpy(gb(ctx) + l.data + kStrSlash, "/", 2);
+        std::memcpy(gb(ctx) + l.data + kStrEquals, "=", 2);
+        std::memcpy(gb(ctx) + l.data + kStrSemi, "; ", 3);
     }
     return l.data;
 }
@@ -479,13 +482,13 @@ void auth_end(PPUContext& ctx)
 {
     const u32 a = data(ctx) + kAuth;
     if (!r8(ctx, a + 40)) return;
-    // Each entry: next +628, previous +632, two blocks at +96 and +64.
+    // Each entry: previous +628, next +632, two blocks at +96 and +64 (cellHttpAuth.cpp). Freed whoever uses them.
     for (u32 e = r32(ctx, a + 32); e;) {
-        const u32 next = r32(ctx, e + 628), prev = r32(ctx, e + 632);
-        if (next) w32(ctx, next + 632, prev);
-        else w32(ctx, a + 36, prev);
-        if (prev) w32(ctx, prev + 628, next);
+        const u32 prev = r32(ctx, e + 628), next = r32(ctx, e + 632);
+        if (prev) w32(ctx, prev + 632, next);
         else w32(ctx, a + 32, next);
+        if (next) w32(ctx, next + 628, prev);
+        else w32(ctx, a + 36, prev);
         for (const u32 field : {96u, 64u}) {
             if (const u32 p = r32(ctx, e + field)) {
                 hfree(ctx, p);
@@ -661,6 +664,7 @@ void register_cellHttp(Registry& r)
     http::register_core(r);
     http::register_clients(r);
     http::register_cookies(r);
+    http::register_auth(r);
     http::register_https(r);
 }
 

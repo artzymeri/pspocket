@@ -32,8 +32,9 @@ using namespace pspocket::hle::test;
 namespace {
 
 constexpr u32 kOut = kData + 0x10000, kOutSize = 0x10000;    // the scripts' memory
-constexpr u32 kStr = kData + 0x30000, kStrSize = 0x10000;    // strings and structures the scripts use
-constexpr u32 kPool = kData + 0x100000, kPoolSize = 0x40000; // cellHttpInit's pool
+constexpr u32 kStr = kData + 0x30000, kStrSize = 0x40000;    // strings and structures the scripts use
+constexpr u32 kPool = kData + 0x100000, kPoolSize = 0x40000;         // cellHttpInit's pool
+constexpr u32 kCookiePool = kData + 0x180000, kCookiePoolSize = 0x30000; // cellHttpInitCookie's
 constexpr u8 kFill = 0xA5;
 
 // Script flags.
@@ -127,12 +128,119 @@ const std::vector<std::string>& strings()
         "Missing",                            // 15
         "bad host:99999",                     // 16
         std::string(300, 'u'),                // 17
+        "www.example.com",                    // 18
+        "/dir/page.html",                     // 19
+        "https",                              // 20
+        "a=b",                                // 21
+        "c=d; path=/; domain=.example.com",   // 22
+        "e=f; secure",                        // 23
+        "g=h; expires=2037-10-21T07:28:00Z",  // 24
+        "  name =  value  ; Path=/dir ;  DOMAIN=example.com", // 25
+        "bare",                               // 26
+        "=onlyvalue",                         // 27
+        "x=y; domain=com",                    // 28
+        "x=y; domain=other.org",              // 29
+        "   ",                                // 30
+        "secure",                             // 31
+        "a=b2; secure; httponly; max-age=10; expires=1999-01-01T00:00:00Z", // 32
+        "192.168.1.1",                        // 33
+        "ip=1; domain=192.168.1.1",           // 34
+        "q=\x81\xfe; path=/\xc3",          // 35
+        "sess=1",                             // 36
+        "long=1; expires=2099-12-31T23:59:59Z; path=/dir/", // 37
+        "k1=v1; expires=2090-01-01T00:00:00Z", // 38
+        "k2=v2; expires=2090-01-01T00:00:00Z; domain=.example.com; path=/", // 39
+        "www.example.co.jp",                  // 40
+        "j=1; domain=.co.jp",                 // 41
+        "j=2; domain=example.co.jp; expires=2090-01-01T00:00:00Z", // 42
+        "/",                                  // 43
+        "nopath",                             // 44
+        "z=; path=",                          // 45
+        "w=1;secure;path=/dir",               // 46
+        "",                                   // 47
+        "big=" + std::string(5000, 'v'),      // 48
+        "mid=" + std::string(1500, 'm') + "; expires=2090-01-01T00:00:00Z", // 49
     };
     return s;
 }
 
-// A string's address in the strings area (0x200 apart).
-u64 str(u32 i) { return kStr + 0x200 * u64{i}; }
+// An authentication cache entry in libhttp's export format.
+std::vector<u8> auth_entry(const std::string& user, const std::string& pass, u8 scheme, u32 word32,
+    const std::vector<std::string>& strs, const std::string& uri_text, u8 m2 = 2, u8 m6 = 6, u8 mend = 0xFF)
+{
+    std::vector<u8> v(561, 0);
+    v[0] = m2;
+    for (u32 i = 0; i < 16; i++) v[1 + i] = static_cast<u8>(0x10 + i);
+    v[17] = 3;
+    std::memcpy(v.data() + 18, user.data(), user.size());
+    v[274] = 4;
+    std::memcpy(v.data() + 275, pass.data(), pass.size());
+    v[531] = 5;
+    v[532] = scheme;
+    const auto be = [&](u32 at, u32 w) {
+        for (u32 k = 0; k < 4; k++) v[at + k] = static_cast<u8>(w >> (24 - 8 * k));
+    };
+    be(533, word32);
+    for (u32 i = 0; i < 6; i++) be(537 + 4 * i, i < strs.size() ? static_cast<u32>(strs[i].size()) : 0);
+    for (const std::string& t : strs) v.insert(v.end(), t.begin(), t.end());
+    v.push_back(m6);
+    v.insert(v.end(), uri_text.begin(), uri_text.end());
+    v.push_back(0);
+    v.push_back(mend);
+    return v;
+}
+
+// Byte blocks the scripts put into memory (by index).
+const std::vector<std::vector<u8>>& blobs()
+{
+    static const std::vector<std::vector<u8>> b = [] {
+        const std::vector<u8> head = {1, 0, 0, 0, 4, 0, 0, 0, 0};
+        const auto e1 = auth_entry("alice", "secret", 1, 0x12345678, {"realm", "", "abc", "", "dgst", "xy"},
+            "http://www.example.com/private/");
+        const auto e2 = auth_entry("bob", "pw", 0, 7, {"r2"}, "https://user@host.example.net:8443/a?b");
+        const auto bad_marker = auth_entry("x", "y", 1, 0, {}, "http://h/", 2, 7);
+        const auto bad_end = auth_entry("x", "y", 1, 0, {}, "http://h/", 2, 6, 0xFE);
+        const auto bad_uri = auth_entry("x", "y", 2, 0, {"q"}, "");
+        std::vector<std::vector<u8>> v;
+        const auto join = [&](std::initializer_list<const std::vector<u8>*> parts) {
+            std::vector<u8> out;
+            for (const auto* p : parts) out.insert(out.end(), p->begin(), p->end());
+            return out;
+        };
+        v.push_back(join({&head, &e1}));                    // 0
+        v.push_back(join({&head, &e1, &e2}));               // 1
+        v.push_back(join({&head, &bad_marker}));            // 2
+        v.push_back(join({&head, &bad_end}));               // 3
+        v.push_back(join({&head, &bad_uri}));               // 4
+        std::vector<u8> wrong_head = join({&head, &e2});
+        wrong_head[0] = 2;
+        v.push_back(wrong_head);                            // 5
+        v.push_back(join({&head, &e2, &e1, &e2}));          // 6
+        return v;
+    }();
+    return b;
+}
+
+// Hosts "h000.example.com" .. for the cookie limits (strings from index 100).
+constexpr u32 kHostBase = 100, kHosts = 320;
+const std::vector<std::string>& all_strings()
+{
+    static const std::vector<std::string> s = [] {
+        std::vector<std::string> v = strings();
+        v.resize(kHostBase);
+        for (u32 i = 0; i < kHosts; i++) v.push_back(std::format("h{:03}.example.com", i));
+        return v;
+    }();
+    return s;
+}
+
+// A string's address in the strings area (0x200 apart; the two long ones at the end).
+u64 str(u32 i)
+{
+    if (i == 48) return kStr + 0x200 * 420;
+    if (i == 49) return kStr + 0x200 * 420 + 0x1400;
+    return kStr + 0x200 * u64{i};
+}
 
 Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
 {
@@ -154,13 +262,20 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
     u8* b = f.base();
     std::memset(b + kOut, kFill, kOutSize);
     std::memset(b + kPool, kFill, kPoolSize);
+    std::memset(b + kCookiePool, kFill, kCookiePoolSize);
     std::memset(b + kStr, 0, kStrSize);
-    for (u32 i = 0; i < strings().size(); i++) std::memcpy(b + str(i), strings()[i].c_str(), strings()[i].size() + 1);
+    for (u32 i = 0; i < all_strings().size(); i++) {
+        const std::string& text = all_strings()[i];
+        REQUIRE((text.size() < 0x200 || i == 48 || i == 49));
+        std::memcpy(b + str(i), text.c_str(), text.size() + 1);
+    }
     Calls calls;
     calls.thread = std::this_thread::get_id();
     f.kernel->set_syscall_observer(&observe, &calls);
     Run r;
+    usize step = 0;
     for (const Op& op : ops) {
+        step++;
         const std::string_view name = op.fn;
         if (name == "=") {
             ps_write32(b, static_cast<u32>(op.args[0]), static_cast<u32>(op.args[1]));
@@ -173,6 +288,12 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
             r.answers.push_back(0);
             continue;
         }
+        if (name == "b") { // a byte block (args: address, index into blobs())
+            const std::vector<u8>& blob = blobs()[op.args[1]];
+            std::memcpy(b + op.args[0], blob.data(), blob.size());
+            r.answers.push_back(0);
+            continue;
+        }
         if (name == "~") { // an address the run chose, made comparable: its offset into the pool, or 1
             const u32 at = static_cast<u32>(op.args[0]);
             const u32 v = ps_read32(b, at);
@@ -180,8 +301,10 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
             r.answers.push_back(0);
             continue;
         }
-        if (name == "pool") {
-            r.pools.emplace_back(b + kPool, b + kPool + kPoolSize);
+        if (name == "pool") { // the pool at args[0] (cellHttpInit's when none), args[1] bytes
+            const u32 at = op.args.empty() ? kPool : static_cast<u32>(op.args[0]);
+            const u32 size = op.args.size() < 2 ? kPoolSize : static_cast<u32>(op.args[1]);
+            r.pools.emplace_back(b + at, b + at + size);
             r.answers.push_back(0);
             continue;
         }
@@ -216,7 +339,7 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
             r3 = static_cast<u32>(t.ctx.gpr[3]);
         }
         if (std::getenv("PSPOCKET_HTTP_PROBE")) {
-            std::fprintf(stderr, "PROBE %s %s(%s) -> %#x\n", sony ? "sony" : "ours", fn.c_str(),
+            std::fprintf(stderr, "PROBE %zu %s %s(%s) -> %#x\n", step - 1, sony ? "sony" : "ours", fn.c_str(),
                 op.args.empty() ? "" : std::format("{:#x}", op.args[0]).c_str(), r3);
         }
         if (op.store) ps_write32(b, op.store, r3);
@@ -284,8 +407,28 @@ void dump(const char* who, const Run& r)
     }
 }
 
-void compare(const std::string& flash, const std::vector<Op>& ops, const std::string& what)
+void compare(const std::string& flash, const std::vector<Op>& all_ops, const std::string& what)
 {
+    // Probing: PSPOCKET_HTTP_ONLY="from-to" runs those steps of a script only (and every store before them).
+    std::vector<Op> ops = all_ops;
+    if (const char* only = std::getenv("PSPOCKET_HTTP_ONLY")) { // "a-b,c-d": those steps, and every store
+        std::vector<std::pair<usize, usize>> ranges;
+        for (const char* p = only; *p;) {
+            char* end = nullptr;
+            const usize from = std::strtoul(p, &end, 10);
+            const usize to = std::strtoul(end + 1, &end, 10);
+            ranges.emplace_back(from, to);
+            p = *end == ',' ? end + 1 : end;
+        }
+        std::vector<Op> kept;
+        for (usize i = 0; i < all_ops.size(); i++) {
+            const std::string_view n = all_ops[i].fn;
+            bool in_range = n == "=" || n == "s" || n == "b";
+            for (const auto& [a, z] : ranges) in_range = in_range || (i >= a && i <= z);
+            if (in_range) kept.push_back(all_ops[i]);
+        }
+        ops = kept;
+    }
     const Run sonys = run(flash, ops, true);
     if (std::getenv("PSPOCKET_HTTP_PROBE")) {
         dump("sony", sonys);
@@ -333,9 +476,30 @@ void compare(const std::string& flash, const std::vector<Op>& ops, const std::st
     }
 }
 
+void uri(std::vector<Op>& s, u64 at, u32 scheme, u32 host, u32 user, u32 pass, u32 path, u32 port);
+
 std::vector<Op> probe_script()
 {
     std::vector<Op> s;
+    if (const char* list = std::getenv("PSPOCKET_HTTP_COOKIES")) { // a cookie probe: indices into strings()
+        uri(s, kOut + 0x40, 10, 18, 0, 0, 19, 80);
+        s.push_back({"cellHttpInitCookie", {kCookiePool, kCookiePoolSize}});
+        uri(s, kOut + 0x80, 10, 33, 0, 0, 19, 80);
+        uri(s, kOut + 0xA0, 10, 40, 0, 0, 43, 80);
+        for (const char* p = list; *p;) {
+            u64 at = kOut + 0x40;
+            if (*p == 'i') at = kOut + 0x80, p++;
+            if (*p == 'j') at = kOut + 0xA0, p++;
+            const u32 i = static_cast<u32>(std::strtoul(p, const_cast<char**>(&p), 10));
+            if (*p == ',') p++;
+            s.push_back({"cellHttpAddCookieWithClientId", {at, str(i), i % 2 + 1}});
+        }
+        if (std::getenv("PSPOCKET_HTTP_GET")) s.push_back({"cellHttpGetCookie", {kOut + 0x40, kOut + 0x1000, 0x100, kOut}});
+        s.push_back({"cellHttpSessionCookieFlush", {1}});
+        if (std::getenv("PSPOCKET_HTTP_GET2")) s.push_back({"cellHttpGetCookie", {kOut + 0x40, kOut + 0x1000, 0x100, kOut}});
+        s.push_back({"cellHttpCookieFlush", {}});
+        return s;
+    }
     const u64 o = kOut;
     s.push_back({"cellHttpInit", {kPool, kPoolSize}});
     s.push_back({"cellHttpGetMemoryInfo", {o, o + 4, o + 8}});
@@ -601,6 +765,204 @@ TEST_CASE("cellHttp: set-up and a client as libhttp", "[hle][http]")
     CHECK(g.call("cellHttpInitCookie", kCookies, 0x1000) == kAlready);
     CHECK(g.call("cellHttpEndCookie") == 0);
     CHECK(g.call("cellHttpEndCookie") == kNotInit);
+}
+
+// The cookie store: Set-Cookie values of every shape, the Cookie header for URIs, export and import, the flushes, the
+// limits (50 cookies a domain, 300 in all, 4096-byte values).
+std::vector<Op> cookie_script()
+{
+    std::vector<Op> s;
+    const u64 o = kOut;
+    const u64 u = o + 0x40, u2 = o + 0x60, u3 = o + 0x80, u4 = o + 0xA0, u5 = o + 0xC0;
+    const u64 req = o + 0x100;
+    uri(s, u, 10, 18, 0, 0, 19, 80);   // http://www.example.com/dir/page.html
+    uri(s, u2, 20, 18, 0, 0, 43, 443); // https://www.example.com/
+    uri(s, u3, 10, 33, 0, 0, 19, 80);  // http://192.168.1.1/dir/page.html
+    uri(s, u4, 10, 40, 0, 0, 43, 80);  // http://www.example.co.jp/
+    uri(s, u5, 10, 18, 0, 0, 0, 80);   // no path
+    u64 out = o + 0x1000;
+    const auto get = [&](u64 at_uri, u32 size) {
+        s.push_back({"cellHttpGetCookie", {at_uri, out, size, req}});
+        s.push_back({"cellHttpGetCookie", {at_uri, 0, 0, req + 4}});
+        out += 0x100;
+    };
+    // Before cellHttpInitCookie.
+    s.push_back({"cellHttpAddCookieWithClientId", {u, str(21), 1}});
+    s.push_back({"cellHttpGetCookie", {u, out, 0x100, req}});
+    s.push_back({"cellHttpCookieExport", {o + 0x2000, 0x1000, req}});
+    s.push_back({"cellHttpCookieExportWithClientId", {o + 0x2000, 0x1000, req, 1}});
+    s.push_back({"cellHttpCookieImport", {o + 0x2000, 0x1000}});
+    s.push_back({"cellHttpCookieFlush", {}});
+    s.push_back({"cellHttpSessionCookieFlush", {1}});
+    s.push_back({"cellHttpEndCookie", {}});
+    s.push_back({"cellHttpInitCookie", {kCookiePool, kCookiePoolSize}});
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    // Arguments.
+    s.push_back({"cellHttpAddCookieWithClientId", {0, str(21), 1}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u, 0, 1}});
+    s.push_back({"cellHttpGetCookie", {0, out, 0x100, req}});
+    // Cookies of every shape, for client 1 and 2.
+    for (const u32 i : {21u, 22u, 23u, 24u, 25u, 26u, 27u, 28u, 29u, 30u, 31u, 32u, 35u, 36u, 37u, 38u, 39u, 45u, 46u, 47u})
+        s.push_back({"cellHttpAddCookieWithClientId", {u, str(i), i % 2 + 1}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u3, str(34), 1}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u3, str(21), 1}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u4, str(41), 1}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u4, str(42), 1}});
+    // (A URI without a host or path is left out: libhttp then frees whatever its stack holds as a cookie list.)
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    for (const u64 at : {u, u2, u3, u4, u5}) get(at, 0x100);
+    get(u, 4);
+    get(u, 20);
+    // Export: the size, then into a buffer, per client, too small.
+    s.push_back({"cellHttpCookieExport", {0, 0, req + 8}});
+    s.push_back({"cellHttpCookieExport", {o + 0x2000, 19, req + 12}});
+    s.push_back({"cellHttpCookieExport", {o + 0x2000, 0x1000, req + 16}});
+    s.push_back({"cellHttpCookieExportWithClientId", {o + 0x3000, 0x1000, req + 20, 1}});
+    s.push_back({"cellHttpCookieExportWithClientId", {o + 0x3400, 0x1000, req + 24, 2}});
+    s.push_back({"cellHttpCookieExport", {o + 0x3800, 0x60, req + 28}});
+    // Session cookies of client 1 flushed; everything flushed; re-imported.
+    s.push_back({"cellHttpSessionCookieFlush", {1}});
+    get(u, 0x100);
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    s.push_back({"cellHttpCookieFlush", {}});
+    get(u, 0x100);
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    s.push_back({"cellHttpCookieImportWithClientId", {o + 0x2000, 0x1000, 7}});
+    get(u, 0x100);
+    get(u4, 0x100);
+    s.push_back({"cellHttpCookieImport", {o + 0x3000, 0x1000}});
+    get(u, 0x100);
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    // A broken export: a byte changed (the MD5 doesn't hold), a length past the size.
+    s.push_back({"=", {o + 0x2018, 0x12345678}});
+    s.push_back({"cellHttpCookieImportWithClientId", {o + 0x2000, 0x1000, 3}});
+    s.push_back({"cellHttpCookieImportWithClientId", {o + 0x3000, 8, 3}});
+    // Replacing a cookie of the same name; 60 cookies on one domain; 310 in all; a value too long.
+    s.push_back({"cellHttpAddCookieWithClientId", {u, str(21), 1}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u, str(21), 1}});
+    get(u, 0x100);
+    for (u32 i = 0; i < 60; i++) {
+        const u64 text = o + 0x4000 + 0x20 * i;
+        s.push_back({"=", {text, 0x6E3D0000 | ((0x30 + i / 10) << 8) | (0x30 + i % 10)}}); // "n=" and two digits
+        s.push_back({"=", {text + 4, 0}});
+        s.push_back({"cellHttpAddCookieWithClientId", {u, text, 1}});
+    }
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    get(u, 0x1000);
+    s.push_back({"cellHttpAddCookieWithClientId", {u, str(17), 1}});
+    s.push_back({"cellHttpEndCookie", {}});
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    s.push_back({"cellHttpEndCookie", {}});
+    return s;
+}
+
+// The store's limits: 320 hosts' cookies (more than 300), large values (80 KB in all), a value past 4096 bytes.
+std::vector<Op> cookie_limits_script()
+{
+    std::vector<Op> s;
+    const u64 o = kOut;
+    s.push_back({"cellHttpInitCookie", {kCookiePool, kCookiePoolSize}});
+    for (u32 i = 0; i < kHosts; i++) {
+        const u64 u = o + 0x40;
+        uri(s, u, 10, kHostBase + i, 0, 0, 19, 80);
+        s.push_back({"cellHttpAddCookieWithClientId", {u, str(i % 3 == 0 ? 38 : i % 3 == 1 ? 21 : 49), i % 4}});
+        if (i % 40 == 39) s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+        if (i % 16 == 5) {
+            uri(s, o + 0x80, 10, kHostBase + i / 2, 0, 0, 19, 80);
+            s.push_back({"cellHttpGetCookie", {o + 0x80, o + 0x1000 + 0x40 * (i / 16), 0x40, o + 0x800 + 4 * (i / 16)}});
+        }
+    }
+    s.push_back({"cellHttpCookieExport", {0, 0, o + 0x900}});
+    s.push_back({"cellHttpCookieExport", {o + 0x2000, 0x8000, o + 0x904}});
+    s.push_back({"cellHttpAddCookieWithClientId", {o + 0x40, str(48), 1}});
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    s.push_back({"cellHttpCookieImport", {o + 0x2000, 0x8000}});
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    s.push_back({"cellHttpEndCookie", {}});
+    return s;
+}
+
+// The authentication cache: its maximum, exports of an empty and an imported cache, imports of every shape.
+std::vector<Op> auth_script()
+{
+    std::vector<Op> s;
+    const u64 o = kOut;
+    const u64 in = o + 0x4000, ex = o + 0x8000;
+    s.push_back({"cellHttpAuthCacheGetEntryMax", {o}});
+    s.push_back({"cellHttpAuthCacheSetEntryMax", {3}});
+    s.push_back({"cellHttpAuthCacheFlush", {}});
+    s.push_back({"cellHttpAuthCacheExport", {ex, 0x1000, o + 4}});
+    s.push_back({"cellHttpAuthCacheImport", {in, 0x1000}});
+    s.push_back({"cellHttpInit", {kPool, kPoolSize}});
+    s.push_back({"cellHttpAuthCacheGetEntryMax", {0}});
+    s.push_back({"cellHttpAuthCacheGetEntryMax", {o + 8}});
+    s.push_back({"cellHttpAuthCacheExport", {0, 0, 0}});
+    s.push_back({"cellHttpAuthCacheExport", {0, 0, o + 12}});
+    s.push_back({"cellHttpAuthCacheExport", {ex, 8, o + 16}});
+    s.push_back({"cellHttpAuthCacheExport", {ex, 9, o + 20}});
+    s.push_back({"pool", {}});
+    s.push_back({"b", {in, 0}});
+    s.push_back({"cellHttpAuthCacheImport", {0, 0x1000}});
+    s.push_back({"cellHttpAuthCacheImport", {in, 0}});
+    s.push_back({"cellHttpAuthCacheImport", {in, 8}});
+    s.push_back({"cellHttpAuthCacheImport", {in, 9}});
+    s.push_back({"cellHttpAuthCacheImport", {in, 560}});
+    s.push_back({"cellHttpAuthCacheImport", {in, static_cast<u64>(blobs()[0].size())}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpAuthCacheExport", {0, 0, o + 24}});
+    s.push_back({"cellHttpAuthCacheExport", {ex, 0x1000, o + 28}});
+    s.push_back({"cellHttpAuthCacheExport", {ex + 0x1000, 600, o + 32}});
+    s.push_back({"cellHttpAuthCacheExport", {ex + 0x1400, 0x250, o + 36}});
+    s.push_back({"b", {in, 1}});
+    s.push_back({"cellHttpAuthCacheImport", {in, static_cast<u64>(blobs()[1].size())}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpAuthCacheExport", {ex + 0x2000, 0x1000, o + 40}});
+    for (u32 i : {2u, 3u, 4u, 5u}) {
+        s.push_back({"b", {in, i}});
+        s.push_back({"cellHttpAuthCacheImport", {in, static_cast<u64>(blobs()[i].size())}});
+        s.push_back({"pool", {}});
+    }
+    s.push_back({"b", {in, 6}});
+    s.push_back({"cellHttpAuthCacheImport", {in, static_cast<u64>(blobs()[6].size())}});
+    s.push_back({"cellHttpAuthCacheSetEntryMax", {10}});
+    s.push_back({"cellHttpAuthCacheImport", {in, static_cast<u64>(blobs()[6].size())}});
+    s.push_back({"cellHttpAuthCacheGetEntryMax", {o + 44}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpAuthCacheExport", {ex + 0x3000, 0x1000, o + 48}});
+    s.push_back({"cellHttpAuthCacheFlush", {}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpAuthCacheExport", {ex + 0x4000, 0x1000, o + 52}});
+    s.push_back({"b", {in, 1}});
+    s.push_back({"cellHttpAuthCacheImport", {in, static_cast<u64>(blobs()[1].size())}});
+    s.push_back({"cellHttpEnd", {}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpAuthCacheExport", {ex, 0x1000, o + 56}});
+    s.push_back({"cellHttpInit", {kPool, kPoolSize}});
+    s.push_back({"cellHttpAuthCacheGetEntryMax", {o + 60}});
+    s.push_back({"cellHttpAuthCacheExport", {ex + 0x5000, 0x1000, o + 64}});
+    s.push_back({"cellHttpEnd", {}});
+    return s;
+}
+
+TEST_CASE("cellHttp against libhttp: the authentication cache", "[hle][lle][http]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, auth_script(), "auth");
+}
+
+TEST_CASE("cellHttp against libhttp: cookie limits", "[hle][lle][http]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, cookie_limits_script(), "cookie limits");
+}
+
+TEST_CASE("cellHttp against libhttp: cookies", "[hle][lle][http]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, cookie_script(), "cookies");
 }
 
 TEST_CASE("cellHttp against libhttp: clients", "[hle][lle][http]")

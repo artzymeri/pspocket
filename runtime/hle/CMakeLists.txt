@@ -4,6 +4,7 @@ add_library(pspocket_hle STATIC
     src/cellGame.cpp
     src/cellGcmSys.cpp
     src/cellHttp.cpp
+    src/cellHttpAuth.cpp
     src/cellHttpClient.cpp
     src/cellHttpConnection.cpp
     src/cellHttpCookie.cpp
