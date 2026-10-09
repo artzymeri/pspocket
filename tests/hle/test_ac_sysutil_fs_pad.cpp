@@ -28,6 +28,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 
 using namespace pspocket;
@@ -458,6 +459,14 @@ TEST_CASE("cellHddGameCheck: RPCS3's checks, funcStat's structures and its answe
     CHECK(all_bytes(base + file_param, kParamSize, 0));
     CHECK(ps_read32(base, stat_result(base)) == 0);
     CHECK_FALSE(fsys::exists(dir));
+    // The structures are cellGame's variables under RPCS3's names for them (D-567).
+    const auto var = [&](std::string_view name) {
+        return f.hle->link_variable("cellGame", recomp::nid_of(name));
+    };
+    CHECK(get == var("g_stat_get"));
+    CHECK(set == var("g_stat_set"));
+    CHECK(stat_result(base) == var("g_cb_result"));
+    CHECK(file_param == var("g_file_param"));
 
     // New data that funcStat answers OK without a setParam: CELL_GAMEDATA_ERROR_PARAM (RPCS3's code). OK_CANCEL is
     // CELL_OK, an error result CELL_HDDGAME_ERROR_CBRESULT; the error dialog errDialog asks for is logged.

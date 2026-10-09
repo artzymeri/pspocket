@@ -7691,3 +7691,16 @@ OpenEx's and Close's checks; RGBA with padded rows, ARGB to RGBA and RGB, RGB to
 alpha and back, 4-bit gray unpacked and packed, 1-bit gray, a palette with its PLTE and tRNS (and without its PLTE);
 text, time, gamma and physical size chunks (and an sPLT left out); the queue (four, BUSY, EMPTY, oldest first, Reset)
 and an overflowing buffer; a file on /dev_hdd0 and one that cannot be made; EncodePicture's checks.
+
+## D-567 · 2026-10-09 · cellGame's and cellPhotoImportUtil's working structures as their variables, under RPCS3's names
+
+As D-520 did for liblv2: RPCS3 keeps the structures cellHddGameCheck and cellGameDataCheckCreate2 hand the game's
+funcStat (g_stat_get, g_stat_set, g_cb_result, g_file_param) and the file data cellPhotoImport hands its finish
+callback (g_filedata, g_filedata_sub) in guest variables of their modules (vm::gvar), and the chart counts them.
+pspocket kept the same structures in one guest block per process; they are now the modules' variables under those
+names, laid out by the HLE process at first use (cellGame: 0x1448, 8, 16 and 0xB9C bytes; cellPhotoImportUtil: 1608 and
+16), and the state lives in them. Nothing else changes: the checks clear them as before, and the cancelled import still
+answers with its file data cleared. cellSysmodule's s_sysmodule_context is not one of them: pspocket's module states are
+the host's, in another shape.
+Tests: the HDD game check's structures are at the four variables' addresses (tests/hle/test_ac_sysutil_fs_pad.cpp); the
+cancelled import's file data is g_filedata, with g_filedata_sub, both cleared (tests/hle/test_media.cpp).

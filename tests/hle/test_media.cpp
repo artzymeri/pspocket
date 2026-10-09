@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "hle_test_util.hpp"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/ppu/asm.hpp"
 
@@ -680,7 +681,12 @@ TEST_CASE("cellPhotoImport is cancelled at once; cellPhotoDecode checks its file
     CHECK(e[0].r3 == 1); // CELL_CANCEL
     CHECK(e[0].r4 != 0);
     CHECK(e[0].r5 == kUser);
-    CHECK(all_bytes(base + e[0].r4, 1608 + 16, 0)); // the file data, cleared
+    // The file data, cleared: cellPhotoImportUtil's variables under RPCS3's names (D-567).
+    const u32 file_data = f.hle->link_variable("cellPhotoImportUtil", recomp::nid_of("g_filedata"));
+    const u32 file_data_sub = f.hle->link_variable("cellPhotoImportUtil", recomp::nid_of("g_filedata_sub"));
+    CHECK(e[0].r4 == file_data);
+    CHECK(all_bytes(base + file_data, 1608, 0));
+    CHECK(all_bytes(base + file_data_sub, 16, 0));
     put(base, kDst, "/dev_usb000/photos");
     CHECK(a.call("cellPhotoImport2", 0, kDst, kSet, kOpd, kUser) == kImportAccess);
     put(base, kDst, "/dev_hdd0/nothere");
