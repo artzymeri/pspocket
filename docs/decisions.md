@@ -9030,3 +9030,55 @@ The count: 5,686 of 6,625 library functions pspocket's own before, 5,691 after.
 Tests: tests/hle/test_rudp.cpp (Init with either allocator, End, the handler, every error, a process each, the rest
 left to Sony's) and tests/hle/test_crashdump.cpp (set and get at both ends of the range, an entry replaced, an index
 never set, each EINVAL with nothing written).
+
+## D-537 · 2026-10-09 · cellSpursJq and cellFiber pspocket's own (part 1: cellSpursJq, libspurs_jq's PPU side)
+
+cellSpursJq had no implementation (RPCS3's cellSpursJq.cpp registers todo stubs; libspurs_jq.sprx ran LLE). All 63
+functions are now pspocket's own (runtime/hle/src/cellSpursJq.cpp), read from libspurs_jq (fw 4.92) and compared with it
+running on pspocket (tests/hle/test_spurs_jq_compare.cpp).
+- The SPU half stays Sony's SPU code: a job queue is a SPURS workload whose policy module (libspurs_jq's SPU program:
+  it pops the commands, runs the jobs, gives descriptors back, releases semaphores, wakes waiters) runs on pspocket's
+  native SPURS as any game's own policy module does (spurs_custom.cpp), unchanged. pspocket reads it at the first queue
+  of a process from the user's /dev_flash/sys/external/libspurs_jq.sprx (decrypted like any firmware module) and finds
+  it by shape: the module's table of contents (module info + 0x20) holds the image's size and address; the image is at
+  a 128-byte boundary of the text and starts with an SPU GUID (four `ila $2`). Nothing of the module is in the
+  repository. Without the system software, queue creation undoes its work and answers CELL_SPURS_JOB_ERROR_STAT (the
+  call fails, nothing runs half-made).
+- The queue (4 KB) is laid out where libspurs_jq lays it out: the command ring header and its waiting ring header, the
+  policy module's bytes, the handle bitmap, the two "_sreJQ" event flags (128 waiter bits), the lightweight mutexes and
+  condition, the descriptor pool's eight classes (free lists through the descriptors' first word, a 1 KB waiting ring
+  each), the exception handler. Every update is the lwarx/ldarx-stwcx./stdcx. pair libspurs_jq makes, through the
+  reservation system (the class Reserve of D-531), so the policy module's GETLLAR/PUTLLC and other PPU threads contend
+  with it as on the hardware. Both pushers are libspurs_jq's: the default one (pushers in flight count themselves in
+  the header, claim the next entry of their lap with a conditional store, the last one moves the write index) and the
+  "submit with entry lock" one. A full ring or an empty pool class puts the caller in the waiting ring (a PPU thread on
+  an event flag bit, a fiber through cellFiberPpuWaitSignal); the policy module wakes it, and a wake-up that comes first
+  leaves the entry marked so nobody sleeps.
+- Semaphores (a 29-bit count and one waiter), SendSignal, ports (one and several threads, with descriptor buffers) and
+  port2s (copies into the pool), the exception handler setters and GetSuspendedJobSize (the job runtime's "JOBCRT Ver"
+  header read from the job's binary) are libspurs_jq's to the instruction. cellSpurs, cellFiber and sysPrxForUser
+  calls go to the firmware module when the process has it in place of pspocket's, else to pspocket's own.
+- libspurs_jq's slips are kept, each marked in the code: creation does not clean up after a failed
+  cellSpursSetExceptionEventHandler; a semaphore acquire that took event flag bit 0 never gives it back; an old-SDK
+  (< 0x300000) port sync stores one word of its doubleword with stwcx.; a single-thread port sync writes the caller's r31
+  low byte to the port's byte 0x17; a port initialized when Open fails keeps the handle its stack held;
+  cellSpursJobQueueSetExceptionEventHandler2 is the same code as the first.
+Surprises, decided as libspurs_jq does: the flags tests are rotate pairs that read as `flags & ~4` (allocate, port2 sync
+and flush), `& ~7` (PushJob2, PushAndRelease, port2 push), `& ~5` (port2 job list), `& ~3` (port2 copy); SendSignal on a
+waiting job also clears bit 23 with the signal count; the policy module reads the waiting ring after the command list in
+whole 128-byte lines, so a depth that is not a multiple of 16 loses waiters (a test with depth 4 hung on Sony's code too:
+the tests use 16).
+Deviations: libspurs_jq's assertions are fatal logs with its text; objects that are not guest memory are refused with
+CELL_SPURS_JOB_ERROR_INVAL and the call site logged (libspurs_jq would fault); the list of ten titles that get policy
+module workarounds (the queue's +0xA0) is the module's data and is not reproduced (the PARAM.SFO read is made, no title
+matches); the workload's exception handler, which libspurs_jq fills from the faulting SPU's local store, logs the queue
+and calls the game's handler with the job information zeroed (pspocket's SPURS has no SPU threads and stops on a policy
+module fault, so it is not reached).
+Tests: a 1219-call one-thread script with SPURS workers off (every function, every argument's errors and alignments,
+attributes, both pushers into full rings, pool classes, semaphores, signals, ports and port2s; 23 byte checkpoints of
+the whole data area, 4.9 million bytes, and the 25 lv2 calls in order) the same as libspurs_jq's; 43 jobs (single
+pushes beyond a full ring of 16, a job list, SYNC/FLUSH, port and port2 pushes and copies, blocking pool allocations
+given back by the policy module, semaphores) through libspurs_jq's policy module on one SPU, 122 steps, each answer,
+job output and the queue at rest the same with either PPU side, for the default pusher, the entry lock one and busy
+waiting; firmware-free tests of attributes, creation without dev_flash, both pushers' ring encodings, semaphores,
+signals, a port and GetSuspendedJobSize. A push costs 329 ns against libspurs_jq's 1532 ns interpreted (20000 pushes).
