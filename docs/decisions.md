@@ -7769,3 +7769,15 @@ calls; autoCheckFlags with the flag set from another thread, a kept signal, BUSY
 the thread with causes and fiberFrom, an entry's return, Finalize of a parked context; RunScheduler and EnterScheduler;
 six fibers on two worker threads joined from a third, Shutdown and Finalize; the argument checks and the trace's
 states; a thread exit inside a fiber unwinding the thread. Repeated 25 times and 6 at once without a failure.
+
+## D-569 · 2026-10-09 · sys_net gethostbyaddr, interim as gethostbyname
+
+sys_net's last function. As D-523's gethostbyname, until libnet's resolver is pspocket's: NetBSD gethnamaddr.c's
+gethostbyaddr (the file gethostbyname's literal hostents follow) over libnet's hosts file and no name server. An IPv6
+link-local (fe80::/10) or site-local (fec0::/10) address is HOST_NOT_FOUND without a lookup; a v4-mapped or
+v4-compatible one is looked up as its IPv4 address; a family other than INET and INET6 is errno EAFNOSUPPORT and a
+length not the family's errno EINVAL, both h_errno NETDB_INTERNAL; 127.0.0.1 is the hosts file's localhost (alias
+"localhost.") in the thread's hostent, as gethostbyname gives it; any other address needs a name server and there is
+none offline: NULL, h_errno TRY_AGAIN. A resolver aborted by sys_net_abort_resolver answers ENOBUFS, an address that is
+not guest memory EFAULT (D-042). Test: tests/hle/test_net.cpp, gethostbyaddr's hosts file, mapped address, name server,
+local addresses and checks.

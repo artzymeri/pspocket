@@ -1395,6 +1395,63 @@ u32 gethostbyname(PPUContext& ctx, u32 name)
 }
 
 
+// gethostbyaddr(addr, len, type), interim as gethostbyname (D-569): NetBSD gethnamaddr.c's checks (an IPv6 link- or
+// site-local address: HOST_NOT_FOUND; a v4-mapped or v4-compatible one looked up as its IPv4 address; a family other
+// than INET and INET6: errno EAFNOSUPPORT; a length not the family's: errno EINVAL; both NETDB_INTERNAL), then the
+// hosts file (127.0.0.1 is localhost, alias "localhost."), then a name server, of which there is none offline: NULL,
+// TRY_AGAIN.
+u32 gethostbyaddr(PPUContext& ctx, u32 addr, u32 len, s32 type)
+{
+    u8* b = gb(ctx);
+    if (r32(b, context(ctx) + kCtxAborted)) {
+        set_errno(ctx, SYS_NET_ENOBUFS);
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return 0;
+    }
+    if (!addr || len > 16 || !usable(ctx, addr, std::max(len, 1u), "gethostbyaddr: addr")) {
+        if (!addr || len > 16) set_errno(ctx, SYS_NET_EINVAL);
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return 0;
+    }
+    std::array<u8, 16> a{};
+    std::memcpy(a.data(), b + addr, len);
+    const auto all_zero = [&](u32 from, u32 to) {
+        return std::all_of(a.begin() + from, a.begin() + to, [](u8 c) { return c == 0; });
+    };
+    if (type == SYS_NET_AF_INET6 && len == 16) {
+        if (a[0] == 0xFE && ((a[1] & 0xC0) == 0x80 || (a[1] & 0xC0) == 0xC0)) {
+            set_h_errno(ctx, HOST_NOT_FOUND);
+            return 0;
+        }
+        const bool mapped = all_zero(0, 10) && a[10] == 0xFF && a[11] == 0xFF;
+        const bool compat = all_zero(0, 12) && !all_zero(12, 16) && !(all_zero(12, 15) && a[15] == 1);
+        if (mapped || compat) {
+            std::memmove(a.data(), a.data() + 12, 4);
+            type = SYS_NET_AF_INET;
+            len = 4;
+        }
+    }
+    const u32 size = type == SYS_NET_AF_INET ? 4 : type == SYS_NET_AF_INET6 ? 16 : 0;
+    if (!size || size != len) {
+        set_errno(ctx, size ? SYS_NET_EINVAL : SYS_NET_EAFNOSUPPORT);
+        set_h_errno(ctx, NETDB_INTERNAL);
+        return 0;
+    }
+    if (type == SYS_NET_AF_INET && a[0] == 127 && a[1] == 0 && a[2] == 0 && a[3] == 1) {
+        const u32 c = context(ctx);
+        const u32 h = literal_hostent(ctx, "localhost", SYS_NET_AF_INET, a.data(), 4);
+        std::memcpy(b + c + kHostBuf + 10, "localhost.", 11);
+        w32(b, c + kHostAliases, c + kHostBuf + 10);
+        w32(b, c + kHostAliases + 4, 0);
+        return h;
+    }
+    PS_LOG_INFO(kChan, "gethostbyaddr({} bytes, family {}): no name server (no network); NULL, h_errno TRY_AGAIN",
+        len, type);
+    set_h_errno(ctx, TRY_AGAIN);
+    return 0;
+}
+
+
 // ------------------------------------------------------------------------------------------------- interfaces
 
 // liblv2's printf output (sys_tty_write on channel 0), as libnet's _sys_printf calls make it.
@@ -3070,6 +3127,7 @@ void register_sys_net(Registry& r)
         f("inet_ntop", &thunk<&inet_ntop>),
         f("inet_ntoa", &thunk<&inet_ntoa>),
         f("gethostbyname", &thunk<&gethostbyname>),
+        f("gethostbyaddr", &thunk<&gethostbyaddr>),
         f("_sys_net_lib_sysctl", &thunk<&_sys_net_lib_sysctl>),
         f("sys_net_get_if_list", &thunk<&sys_net_get_if_list>),
         f("sys_net_show_ifconfig", &thunk<&sys_net_show_ifconfig>),

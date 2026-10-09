@@ -1298,6 +1298,64 @@ TEST_CASE("sys_net gethostbyname without a name server: TRY_AGAIN, libnet's host
     CHECK(n.err() == SYS_NET_EFAULT);
 }
 
+// D-569: gethostbyaddr as NetBSD's gethnamaddr.c with libnet's hosts file, no name server.
+TEST_CASE("sys_net gethostbyaddr without a name server: the hosts file's localhost, TRY_AGAIN, the checks",
+    "[hle][net]")
+{
+    Fixture f;
+    u8* b = f.base();
+    GuestThread g(f, 0, "net");
+    Net n(g, 0);
+    const u32 h_errno_loc = static_cast<u32>(g.call("_sys_net_h_errno_loc"));
+    const auto h_errno_value = [&] { return static_cast<s32>(ps_read32(b, h_errno_loc)); };
+    const u32 a = n.text;
+    const auto put = [&](std::initializer_list<u8> bytes) {
+        u32 i = 0;
+        for (const u8 v : bytes) ps_write8(b, a + i++, v);
+    };
+
+    // 127.0.0.1 from the hosts file: localhost, alias "localhost.".
+    put({127, 0, 0, 1});
+    const u32 h = static_cast<u32>(g.call("gethostbyaddr", a, 4, kAfInet));
+    REQUIRE(h != 0);
+    CHECK(h_errno_value() == 0);
+    CHECK(std::string(reinterpret_cast<const char*>(b + ps_read32(b, h))) == "localhost");
+    CHECK(std::string(reinterpret_cast<const char*>(b + ps_read32(b, ps_read32(b, h + 4)))) == "localhost.");
+    CHECK(ps_read32(b, h + 8) == static_cast<u32>(kAfInet));
+    CHECK(ps_read32(b, h + 12) == 4);
+    CHECK(ps_read32(b, ps_read32(b, ps_read32(b, h + 16))) == kLoopback);
+    // ::ffff:127.0.0.1 is looked up as 127.0.0.1.
+    put({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 127, 0, 0, 1});
+    const u32 m = static_cast<u32>(g.call("gethostbyaddr", a, 16, kAfInet6));
+    REQUIRE(m != 0);
+    CHECK(ps_read32(b, m + 8) == static_cast<u32>(kAfInet));
+    // Anything else needs a name server: none offline.
+    put({8, 8, 8, 8});
+    CHECK(g.call("gethostbyaddr", a, 4, kAfInet) == 0);
+    CHECK(h_errno_value() == 2); // TRY_AGAIN
+    put({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}); // ::1, not in the hosts file
+    CHECK(g.call("gethostbyaddr", a, 16, kAfInet6) == 0);
+    CHECK(h_errno_value() == 2);
+    // IPv6 link-local and site-local addresses: HOST_NOT_FOUND without a lookup.
+    put({0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
+    CHECK(g.call("gethostbyaddr", a, 16, kAfInet6) == 0);
+    CHECK(h_errno_value() == 1);
+    put({0xFE, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
+    CHECK(g.call("gethostbyaddr", a, 16, kAfInet6) == 0);
+    CHECK(h_errno_value() == 1);
+    // A family other than INET and INET6, or a length not the family's: NETDB_INTERNAL with errno.
+    put({127, 0, 0, 1});
+    CHECK(g.call("gethostbyaddr", a, 4, 1) == 0);
+    CHECK(h_errno_value() == -1);
+    CHECK(n.err() == SYS_NET_EAFNOSUPPORT);
+    CHECK(g.call("gethostbyaddr", a, 16, kAfInet) == 0);
+    CHECK(h_errno_value() == -1);
+    CHECK(n.err() == SYS_NET_EINVAL);
+    CHECK(g.call("gethostbyaddr", kUnmapped, 4, kAfInet) == 0);
+    CHECK(h_errno_value() == -1);
+    CHECK(n.err() == SYS_NET_EFAULT);
+}
+
 TEST_CASE("sys_net setup: the pool's checks, a second initialisation", "[hle][net]")
 {
     Fixture f;
