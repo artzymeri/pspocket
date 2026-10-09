@@ -304,7 +304,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
     patched words (needs a game that has them, rule 4).
   - A newly found module recompiles all of the game's modules: per-module lift folders, as plan-game-modules commit 8
     describes, if a game has many.
-  - NPDRM modules need the game's klicensee (a PSN game).
+  - **PSN games (D-580 to D-582): done on the engine side.** A PSN game's NPDRM EBOOT.BIN, SPRX modules and SPU
+    images decrypt with its licence, and its EDATA files open through lv2 with the keys the game shows with
+    sceNpDrmIsAvailable, all with RPCS3's checks (tested against RPCS3's own code where the build has its source).
+    The player's licence is their <CONTENT_ID>.rap, in /dev_hdd0/home/00000001/exdata (Documents/hdd0/home/00000001/
+    exdata on the phone, --hdd0's on the Mac); free content needs none. Left: the app's side, a library of installed
+    PSN games (dev_hdd0/game/<TITLE_ID>) that calls ps_psn_decrypt_executable and offers ps_psn_install_rap for the
+    player's .rap files; scripts/translate-game.sh still takes a disc image only. No PSN game has been tried yet.
   - Sniper: Ghost Warrior's engine_jobs.sprx (seen on the phone, D-159) is the first real check, when its disc is
     here.
 

@@ -8170,3 +8170,38 @@ validate_dev_klic and validate_npd_hashes on 200 random headers and ten names ea
 (sceNpDrmIsAvailable's answers and the keys it installs; cellFsOpen of EDATA files before and after the game shows
 their keys, an SDATA open of one, a klicensee never shown; the ring's sixteen; an unlock licence verified and three
 refused).
+
+## D-582 · 2026-10-09 · NPDRM SELFs: a PSN game's EBOOT.BIN and modules decrypt with its licence
+
+- **The layer** (recomp::decrypt_self; RPCS3 Crypto/unself.cpp SELFDecrypter::DecryptNPDRM and LoadMetadata). A SELF
+  with an NPDRM control header (supplemental header type 3: the NPD header with the content ID and the licence type,
+  recomp::parse_self's NpdrmInfo) has an AES-128-CBC layer with a zero IV over its 0x40-byte metadata info, outside
+  the usual AES-256-CBC with the NPDRM SELF key of its key revision. The layer's key is the content key (D-580: the
+  klicensee for licence type 3, NP_KLIC_FREE when none is given; the RIF key of the player's RAP for the SELF's content
+  ID for types 1 and 2; any other type refused) decrypted with NP_KLIC_KEY (AES-128-ECB). decrypt_self takes the
+  licence as an NpdrmLicence; without one a PSN executable is refused as before. A licence that does not open it (a RAP
+  for other content, the wrong klicensee) is told apart from a missing one, which names where it was looked for.
+- **The executable.** pspocket-boot takes a SELF as RPCS3 boots EBOOT.BIN with no klicensee (KeyVault's default,
+  NP_KLIC_FREE): a disc's decrypts with the build's keys, a PSN game's with NP_KLIC_FREE or the player's RAP under
+  --hdd0. ps3disc --decrypt takes a disc image, an EBOOT.BIN or SPRX, or a game folder (USRDIR/EBOOT.BIN, or
+  PS3_GAME/USRDIR/EBOOT.BIN), with --hdd0 DIR or else the dev_hdd0 folder the input lies in. ps_psn_decrypt_executable
+  (pspocket/disc/psn.h) does the same for the app: once the app lists installed PSN games, its preparation decrypts a
+  PSN game's EBOOT.BIN with it as it decrypts a disc's with ps_disc_decrypt_executable.
+- **Modules and SPU images.** sys_prx_load_module of an NPDRM SPRX and sys_spu_image_open of an NPDRM SPU SELF take the
+  newest key the game has shown (D-581's ring) as their klicensee, as RPCS3's sys_prx and sys_spu take last_key();
+  with none shown, NP_KLIC_FREE, where RPCS3's zero key opens nothing. Content of types 1 and 2 opens with the
+  player's RAP whatever the game showed. A disc game's own free NPDRM modules now decrypt when they are saved for
+  preparation (D-239: NP_KLIC_FREE only); the others are saved when the game loads them.
+- **sceNpDrmIsAvailable** checks a PSN SELF with the game's klicensee (NP_KLIC_FREE without one) or the player's RAP,
+  and installs the klicensee, as RPCS3's verify_npdrm_self_headers.
+
+Test: tests/common/test_self_decrypt.cpp (synthetic PSN executables of licence types 1, 2 and 3 come back as their
+ELF with a klicensee, NP_KLIC_FREE or a RAP; another RAP, the default klicensee for another's, no RAP, no licence,
+licence type 4, no NPDRM keys and no NPDRM SELF key each refused with its reason; against RPCS3's own DecryptNPDRM on
+300 random metadata infos, licence types 0 to 4, with and without a RAP), tests/disc/test_psn.cpp (a PSN EBOOT.BIN in a
+game folder refused without the player's RAP, decrypted once ps_psn_install_rap put it in place; free content without
+licences; a plain ELF copied; encrypted with the build's keys in a temporary folder), tests/hle/test_lle.cpp (a free
+NPDRM module refused until the game shows its klicensee with sceNpDrmIsAvailable, a local one loaded with the
+player's RAP). By hand: pspocket-boot on a synthetic PSN EBOOT.BIN (the fault test program as licence type 2) with
+--hdd0 holding its RAP decrypts it and runs it to its expected fault report; without --hdd0 it names the licence it
+needs; ps3disc --decrypt on its game folder likewise.
