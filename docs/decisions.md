@@ -6289,3 +6289,21 @@ sorting the IO mappings, immediate flips, flip command 2 and the flip ring.
   Assassin's Creed run on it). A full flip ring drops its oldest slot instead of failing. Head 0 never flips here.
 - GTA V's prologue gate passes unchanged (29.8 fps median, no new messages). cellGcmSys is 100% pspocket's own; 6
   more kernel calls are bound.
+
+## D-520 · 2026-10-09 · liblv2's internal variables under RPCS3's names, holding pspocket's state
+
+RPCS3 registers eight hidden variables in sysPrxForUser (sys_ppu_thread_.cpp, sysPrxForUser.cpp, sys_mmapper_.cpp)
+for liblv2's own data, and the chart counts them. They are now pspocket's host variables (guest memory laid out by the
+HLE process), and the state lives in them: g_ppu_atexit (the eight thread atexit functions) under the recursive
+"atexit!" lwmutex g_ppu_atexit_lwm (an lv2 mutex before), g_ppu_once_mutex ("_lv2ppu", sys_ppu_thread_once),
+g_ppu_exit_mutex (liblv2's "exitprc", sys_process_exit), g_ppu_prx_lwm ("_lv2prx", which RPCS3 makes and nothing
+locks), g_ppu_atexitspawn and g_ppu_at_Exitspawn (the exitspawn handlers), s_shared_memory_area (0: nothing here asks
+for the shared memory area). As RPCS3, sys_initialize_tls makes the four objects; a call before it (tests) makes them
+at first use. sys_raw_spu_load and sys_raw_spu_image_load wait for lv2's raw SPUs (kernel work).
+
+## D-521 · 2026-10-09 · sys_lv2dbg as a retail system's liblv2dbg
+
+A retail system's debugger library is liblv2dbg_for_cex.sprx, which denies everything: all 35 functions answer
+CELL_LV2DBG_ERROR_DEOPERATIONDENIED (0x8001042C), and sys_dbg_vm_get_page_information first clears the page
+information entries it was given. pspocket's sys_lv2dbg is that (runtime/hle/src/sys_lv2dbg.cpp), compared with the
+module call for call (tests/hle/test_lv2dbg.cpp). RPCS3 answers CELL_OK with a todo for each (a debug kernel's answer).

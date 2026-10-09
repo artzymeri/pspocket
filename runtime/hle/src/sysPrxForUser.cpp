@@ -33,16 +33,18 @@
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/object.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle {
 namespace {
 
 constexpr std::string_view kChan = "sysPrxForUser";
 
+void init_lv2_objects(PPUContext& ctx);
+
 // RPCS3 sys_ppu_thread_.cpp sys_initialize_tls. The loader calls it before the executable's entry with the
-// executable's PT_TLS segment (RPCS3 ppu_load_exec queues the same HLE call). Deviation: RPCS3 also creates the
-// "atexit!" lwmutex and the "_lv2ppu" mutex here; here they are made at their first use
-// (sys_ppu_thread_register_atexit, sys_ppu_thread_once).
+// executable's PT_TLS segment (RPCS3 ppu_load_exec queues the same HLE call); then, as RPCS3, the library's lv2
+// objects (init_lv2_objects).
 void sys_initialize_tls(PPUContext& ctx, u64 main_thread_id, u32 tls_seg_addr, u32 tls_seg_size, u32 tls_mem_size)
 {
     PS_LOG_INFO(kChan, "sys_initialize_tls(thread {:#x}, image {:#010x}, size {:#x}, mem_size {:#x})", main_thread_id,
@@ -62,6 +64,7 @@ void sys_initialize_tls(PPUContext& ctx, u64 main_thread_id, u32 tls_seg_addr, u
     const u32 block = p->alloc_tls();
     if (!block) PS_FATAL(kChan, "sys_initialize_tls: no memory for the main thread's TLS");
     ctx.gpr[13] = u64{block} + kTlsR13Offset;
+    init_lv2_objects(ctx);
 }
 
 // ------------------------------------------------------------------------------------------------- threads, process
@@ -99,34 +102,49 @@ s32 sys_ppu_thread_create(PPUContext& ctx, u32 thread_id, u32 entry, u64 arg, s3
     return lv2::sys_ppu_thread_start(t, static_cast<u32>(ps_read64(base, thread_id)));
 }
 
+// liblv2's internal variables, by the names and NIDs RPCS3 gives them (hidden variables of its sysPrxForUser, D-520):
+// the state below lives in them, in guest memory.
+u32 prx_variable(std::string_view name)
+{
+    return HleProcess::current()->link_variable("sysPrxForUser", recomp::nid_of(name));
+}
+
+s32 sys_lwmutex_create(PPUContext& ctx, u32 lwmutex, u32 attr);
+s32 sys_lwmutex_lock(PPUContext& ctx, u32 lwmutex, u64 timeout);
+s32 sys_lwmutex_unlock(PPUContext& ctx, u32 lwmutex);
+
+// A recursive, priority-ordered lwmutex named `name` in the variable `var` (RPCS3 sys_initialize_tls's lwa).
+void create_lwmutex(PPUContext& ctx, std::string_view var, const char (&name)[8])
+{
+    u8* base = guest_base(ctx);
+    StackVar attr(ctx, base, 0x10); // sys_lwmutex_attribute_t: protocol, recursive, name
+    ps_write32(base, attr.addr() + 0, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, attr.addr() + 4, lv2::SYS_SYNC_RECURSIVE);
+    std::memcpy(base + attr.addr() + 8, name, 8);
+    if (const s32 r = sys_lwmutex_create(ctx, prx_variable(var), attr.addr()); r != lv2::CELL_OK)
+        PS_FATAL(kChan, "the {} lwmutex: {}", name, lv2::error_name(r));
+}
+
 // RPCS3 sys_ppu_thread_.cpp g_ppu_atexit: up to eight functions (descriptors) for the whole process, which every
-// sys_ppu_thread_exit calls, in slot order on the exiting thread, under the recursive "atexit!" lwmutex RPCS3's
-// sys_initialize_tls creates. Deviation: a recursive lv2 mutex of that name in its place (it needs no guest memory),
-// made at the first registration; an exit before that has nothing to call.
+// sys_ppu_thread_exit calls, in slot order on the exiting thread, under the recursive "atexit!" lwmutex
+// g_ppu_atexit_lwm. RPCS3 creates it in sys_initialize_tls; so does this, or at the first registration when the
+// process had no TLS set up (an exit before then has nothing to call).
 struct AtexitState {
-    std::mutex create; // the lv2 mutex's creation
-    std::atomic<u32> lv2_mutex{0};
-    std::array<u32, 8> funcs{}; // guarded by the lv2 mutex
+    std::mutex create;
+    std::atomic<bool> ready{false};
 };
 
-u32 atexit_mutex(PPUContext& ctx, AtexitState& s)
+u32 atexit_lwmutex(PPUContext& ctx)
 {
-    if (const u32 m = s.lv2_mutex.load(std::memory_order_acquire)) return m;
-    std::lock_guard lock(s.create);
-    if (const u32 m = s.lv2_mutex.load(std::memory_order_acquire)) return m;
-    lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    StackVar v(ctx, base, 0x30); // the ID, then sys_mutex_attribute_t
-    const u32 id = v.addr(), attr = v.addr() + 8;
-    ps_write32(base, attr + 0x00, lv2::SYS_SYNC_PRIORITY);
-    ps_write32(base, attr + 0x04, lv2::SYS_SYNC_RECURSIVE);
-    ps_write32(base, attr + 0x08, lv2::SYS_SYNC_NOT_PROCESS_SHARED);
-    ps_write32(base, attr + 0x0C, lv2::SYS_SYNC_NOT_ADAPTIVE);
-    std::memcpy(base + attr + 0x20, "atexit!", 8);
-    if (const s32 r = lv2::sys_mutex_create(t, id, attr); r != lv2::CELL_OK)
-        PS_FATAL(kChan, "the atexit! mutex: {}", lv2::error_name(r));
-    s.lv2_mutex.store(ps_read32(base, id), std::memory_order_release);
-    return ps_read32(base, id);
+    AtexitState& s = HleProcess::current()->state<AtexitState>();
+    if (!s.ready.load(std::memory_order_acquire)) {
+        std::lock_guard lock(s.create);
+        if (!s.ready.load(std::memory_order_acquire)) {
+            create_lwmutex(ctx, "g_ppu_atexit_lwm", "atexit!");
+            s.ready.store(true, std::memory_order_release);
+        }
+    }
+    return prx_variable("g_ppu_atexit_lwm");
 }
 
 // RPCS3: CELL_EPERM when `func` is in the list already (a null one matches a free slot), CELL_ENOMEM when the eight
@@ -134,18 +152,26 @@ u32 atexit_mutex(PPUContext& ctx, AtexitState& s)
 s32 sys_ppu_thread_register_atexit(PPUContext& ctx, u32 func)
 {
     PS_LOG_DEBUG(kChan, "sys_ppu_thread_register_atexit({:#x})", func);
-    lv2::PpuThread& t = thread_of(ctx);
-    AtexitState& s = HleProcess::current()->state<AtexitState>();
-    const u32 m = atexit_mutex(ctx, s);
-    lv2::sys_mutex_lock(t, m, 0);
+    const u32 lwm = atexit_lwmutex(ctx);
+    u8* base = guest_base(ctx);
+    const u32 list = prx_variable("g_ppu_atexit");
+    sys_lwmutex_lock(ctx, lwm, 0);
     s32 r = lv2::err(lv2::CELL_ENOMEM);
-    if (std::find(s.funcs.begin(), s.funcs.end(), func) != s.funcs.end()) {
-        r = lv2::err(lv2::CELL_EPERM);
-    } else if (const auto slot = std::find(s.funcs.begin(), s.funcs.end(), 0u); slot != s.funcs.end()) {
-        *slot = func;
+    s32 free = -1;
+    for (u32 i = 0; i < 8; i++) {
+        const u32 f = ps_read32(base, list + 4 * i);
+        if (f == func) {
+            r = lv2::err(lv2::CELL_EPERM);
+            free = -1;
+            break;
+        }
+        if (!f && free < 0) free = static_cast<s32>(i);
+    }
+    if (free >= 0) {
+        ps_write32(base, list + 4 * static_cast<u32>(free), func);
         r = lv2::CELL_OK;
     }
-    lv2::sys_mutex_unlock(t, m);
+    sys_lwmutex_unlock(ctx, lwm);
     return r;
 }
 
@@ -153,16 +179,19 @@ s32 sys_ppu_thread_register_atexit(PPUContext& ctx, u32 func)
 s32 sys_ppu_thread_unregister_atexit(PPUContext& ctx, u32 func)
 {
     PS_LOG_DEBUG(kChan, "sys_ppu_thread_unregister_atexit({:#x})", func);
-    lv2::PpuThread& t = thread_of(ctx);
-    AtexitState& s = HleProcess::current()->state<AtexitState>();
-    const u32 m = atexit_mutex(ctx, s);
-    lv2::sys_mutex_lock(t, m, 0);
+    const u32 lwm = atexit_lwmutex(ctx);
+    u8* base = guest_base(ctx);
+    const u32 list = prx_variable("g_ppu_atexit");
+    sys_lwmutex_lock(ctx, lwm, 0);
     s32 r = lv2::err(lv2::CELL_ESRCH);
-    if (const auto slot = std::find(s.funcs.begin(), s.funcs.end(), func); slot != s.funcs.end()) {
-        *slot = 0;
-        r = lv2::CELL_OK;
+    for (u32 i = 0; i < 8; i++) {
+        if (ps_read32(base, list + 4 * i) == func) {
+            ps_write32(base, list + 4 * i, 0);
+            r = lv2::CELL_OK;
+            break;
+        }
     }
-    lv2::sys_mutex_unlock(t, m);
+    sys_lwmutex_unlock(ctx, lwm);
     return r;
 }
 
@@ -172,11 +201,11 @@ void sys_ppu_thread_exit(PPUContext& ctx, u64 val)
 {
     lv2::PpuThread& t = thread_of(ctx);
     if (HleProcess* p = HleProcess::current()) {
-        AtexitState& s = p->state<AtexitState>();
-        if (const u32 m = s.lv2_mutex.load(std::memory_order_acquire)) {
-            lv2::sys_mutex_lock(t, m, 0);
-            for (usize i = 0; i < s.funcs.size(); i++) {
-                const u32 func = s.funcs[i];
+        if (p->state<AtexitState>().ready.load(std::memory_order_acquire)) {
+            const u32 lwm = prx_variable("g_ppu_atexit_lwm"), list = prx_variable("g_ppu_atexit");
+            sys_lwmutex_lock(ctx, lwm, 0);
+            for (u32 i = 0; i < 8; i++) {
+                const u32 func = ps_read32(t.kernel.base(), list + 4 * i);
                 if (!func) continue;
                 if (guest_readable(t, func, 8)) {
                     call_guest(ctx, func, {});
@@ -185,7 +214,7 @@ void sys_ppu_thread_exit(PPUContext& ctx, u64 val)
                                                                     "not guest memory; skipped", func));
                 }
             }
-            lv2::sys_mutex_unlock(t, m);
+            sys_lwmutex_unlock(ctx, lwm);
         }
         if (ctx.gpr[13] >= kTlsR13Offset) p->free_tls(static_cast<u32>(ctx.gpr[13]) - kTlsR13Offset);
     }
@@ -193,13 +222,30 @@ void sys_ppu_thread_exit(PPUContext& ctx, u64 val)
 }
 
 // sys_ppu_thread_once(once_ctrl, init), as RPCS3 (sys_ppu_thread_.cpp): under the process's "_lv2ppu" lv2 mutex
-// (priority order, not recursive; RPCS3 creates it with the TLS, here at the first call), a control word still
-// SYS_PPU_THREAD_ONCE_INIT (0) runs init (a function descriptor) on the calling thread, then becomes
+// (priority order, not recursive; its ID in g_ppu_once_mutex; made with the TLS, as RPCS3, or at the first call), a
+// control word still SYS_PPU_THREAD_ONCE_INIT (0) runs init (a function descriptor) on the calling thread, then becomes
 // SYS_PPU_THREAD_DONE_INIT (1). Other threads asking meanwhile wait on the mutex until it has run.
 struct OnceState {
     std::mutex mutex; // the lv2 mutex's creation
-    u32 lv2_mutex = 0;
 };
+
+// A priority-ordered lv2 mutex named `name`, its ID written to `id_addr`.
+void create_mutex(PPUContext& ctx, u32 id_addr, u32 recursive, const char (&name)[8])
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar v(ctx, base, 0x30); // the ID, then sys_mutex_attribute_t
+    const u32 id = v.addr(), attr = v.addr() + 8;
+    std::memset(base + attr, 0, 0x28);
+    ps_write32(base, attr + 0x00, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, attr + 0x04, recursive);
+    ps_write32(base, attr + 0x08, lv2::SYS_SYNC_NOT_PROCESS_SHARED);
+    ps_write32(base, attr + 0x0C, lv2::SYS_SYNC_NOT_ADAPTIVE);
+    std::memcpy(base + attr + 0x20, name, 8);
+    if (const s32 r = lv2::sys_mutex_create(t, id, attr); r != lv2::CELL_OK)
+        PS_FATAL(kChan, "the {} mutex: {}", name, lv2::error_name(r));
+    atomic_store_be32(base, id_addr, ps_read32(base, id));
+}
 
 void sys_ppu_thread_once(PPUContext& ctx, u32 once_ctrl, u32 init)
 {
@@ -210,23 +256,12 @@ void sys_ppu_thread_once(PPUContext& ctx, u32 once_ctrl, u32 init)
         return;
     }
     OnceState& s = HleProcess::current()->state<OnceState>();
-    u32 m = 0;
-    {
+    const u32 var = prx_variable("g_ppu_once_mutex");
+    u32 m = atomic_load_be32(base, var);
+    if (!m) {
         std::lock_guard lock(s.mutex);
-        if (!s.lv2_mutex) {
-            StackVar v(ctx, base, 0x30); // the ID, then sys_mutex_attribute_t
-            const u32 id = v.addr(), attr = v.addr() + 8;
-            std::memset(base + attr, 0, 0x28);
-            ps_write32(base, attr + 0x00, lv2::SYS_SYNC_PRIORITY);
-            ps_write32(base, attr + 0x04, lv2::SYS_SYNC_NOT_RECURSIVE);
-            ps_write32(base, attr + 0x08, lv2::SYS_SYNC_NOT_PROCESS_SHARED);
-            ps_write32(base, attr + 0x0C, lv2::SYS_SYNC_NOT_ADAPTIVE);
-            std::memcpy(base + attr + 0x20, "_lv2ppu", 8);
-            if (const s32 r = lv2::sys_mutex_create(t, id, attr); r != lv2::CELL_OK)
-                PS_FATAL(kChan, "sys_ppu_thread_once: the _lv2ppu mutex: {}", lv2::error_name(r));
-            s.lv2_mutex = ps_read32(base, id);
-        }
-        m = s.lv2_mutex;
+        if (!atomic_load_be32(base, var)) create_mutex(ctx, var, lv2::SYS_SYNC_NOT_RECURSIVE, "_lv2ppu");
+        m = atomic_load_be32(base, var);
     }
     if (const s32 r = lv2::sys_mutex_lock(t, m, 0); r != lv2::CELL_OK)
         PS_FATAL(kChan, "sys_ppu_thread_once({:#x}, {:#x}): locking _lv2ppu: {} (init called itself?)", once_ctrl, init,
@@ -239,24 +274,17 @@ void sys_ppu_thread_once(PPUContext& ctx, u32 once_ctrl, u32 init)
     lv2::sys_mutex_unlock(t, m);
 }
 
-// RPCS3 sysPrxForUser.cpp _sys_process_atexitspawn / _sys_process_at_Exitspawn: remember the first function given.
-// They would run around an exitspawn (launching another executable), which pspocket does not do (D-031).
-struct ExitspawnState {
-    std::atomic<u32> atexitspawn{0};
-    std::atomic<u32> at_exitspawn{0};
-};
-
-void _sys_process_atexitspawn(PPUContext&, u32 func)
+// RPCS3 sysPrxForUser.cpp _sys_process_atexitspawn / _sys_process_at_Exitspawn: remember the first function given, in
+// g_ppu_atexitspawn and g_ppu_at_Exitspawn. They run before an exitspawn (sys_game_process_exitspawn).
+void _sys_process_atexitspawn(PPUContext& ctx, u32 func)
 {
-    u32 none = 0;
-    HleProcess::current()->state<ExitspawnState>().atexitspawn.compare_exchange_strong(none, func);
+    atomic_cas_be32(guest_base(ctx), prx_variable("g_ppu_atexitspawn"), 0, func);
     PS_LOG_DEBUG(kChan, "_sys_process_atexitspawn({:#x})", func);
 }
 
-void _sys_process_at_Exitspawn(PPUContext&, u32 func)
+void _sys_process_at_Exitspawn(PPUContext& ctx, u32 func)
 {
-    u32 none = 0;
-    HleProcess::current()->state<ExitspawnState>().at_exitspawn.compare_exchange_strong(none, func);
+    atomic_cas_be32(guest_base(ctx), prx_variable("g_ppu_at_Exitspawn"), 0, func);
     PS_LOG_DEBUG(kChan, "_sys_process_at_Exitspawn({:#x})", func);
 }
 
@@ -268,7 +296,7 @@ void _sys_process_at_Exitspawn(PPUContext&, u32 func)
 // mutexes are made at their first use (liblv2 makes them as it starts).
 struct ProcessAtexitState {
     std::mutex create; // the lv2 mutexes' creation
-    std::atomic<u32> list_mutex{0}, exit_mutex{0};
+    std::atomic<u32> list_mutex{0};
     std::vector<u32> funcs; // guarded by list_mutex
 };
 
@@ -292,6 +320,18 @@ u32 process_mutex(PPUContext& ctx, ProcessAtexitState& s, std::atomic<u32>& slot
     return ps_read32(base, id);
 }
 
+// liblv2's exit mutex ("exitprc", recursive), whose ID RPCS3 names g_ppu_exit_mutex: made with the TLS or at first use.
+u32 exit_mutex(PPUContext& ctx)
+{
+    u8* base = guest_base(ctx);
+    const u32 var = prx_variable("g_ppu_exit_mutex");
+    if (const u32 m = atomic_load_be32(base, var)) return m;
+    ProcessAtexitState& s = HleProcess::current()->state<ProcessAtexitState>();
+    std::lock_guard lock(s.create);
+    if (!atomic_load_be32(base, var)) create_mutex(ctx, var, lv2::SYS_SYNC_RECURSIVE, "exitprc");
+    return atomic_load_be32(base, var);
+}
+
 s32 sys_process_atexit(PPUContext& ctx, u32 func)
 {
     PS_LOG_DEBUG(kChan, "sys_process_atexit({:#x})", func);
@@ -311,7 +351,7 @@ void sys_process_exit(PPUContext& ctx, s32 status)
     PS_LOG_INFO(kChan, "sys_process_exit({})", status);
     lv2::PpuThread& t = thread_of(ctx);
     ProcessAtexitState& s = HleProcess::current()->state<ProcessAtexitState>();
-    lv2::sys_mutex_lock(t, process_mutex(ctx, s, s.exit_mutex, "exitprc"), 0);
+    lv2::sys_mutex_lock(t, exit_mutex(ctx), 0);
     if (const u32 m = s.list_mutex.load(std::memory_order_acquire)) {
         lv2::sys_mutex_lock(t, m, 0);
         while (!s.funcs.empty()) {
@@ -1361,9 +1401,10 @@ void exitspawn(PPUContext& ctx, std::string_view what, u32 path, u32 argv, u32 e
     ps_write64(base, block + 0x18, static_cast<u64>(static_cast<s64>(prio)));
     ps_write64(base, block + 0x20, spawn_flags);
     ps_write64(base, block + 0x28, block + 0x30);
-    const ExitspawnState& handlers = HleProcess::current()->state<ExitspawnState>();
     const u64 kind = spawn_flags >> 62;
-    if (const u32 handler = kind == 0 ? handlers.atexitspawn.load() : kind == 1 ? handlers.at_exitspawn.load() : 0) {
+    const u32 handler = kind == 0 ? atomic_load_be32(base, prx_variable("g_ppu_atexitspawn"))
+                        : kind == 1 ? atomic_load_be32(base, prx_variable("g_ppu_at_Exitspawn")) : 0;
+    if (handler) {
         PS_LOG_INFO(kChan, "{}: the {} handler {:#x} runs", what, kind == 0 ? "atexitspawn" : "at_Exitspawn", handler);
         if (guest_readable(t, handler, 8)) call_guest(ctx, handler, {});
         else PS_LOG_ERROR(kChan, "{}: the handler {:#x} is not guest memory; skipped", what, handler);
@@ -1388,6 +1429,21 @@ void sys_game_process_exitspawn2(PPUContext& ctx, u32 path, u32 argv, u32 envp, 
         (flags >> 62) >= 2 ? flags & 0xF0 : flags & 0xC0000000000000F0ull);
 }
 
+// RPCS3 sys_initialize_tls: the library's lv2 objects, made with the TLS: the "atexit!" lwmutex (g_ppu_atexit_lwm),
+// the "_lv2ppu" once mutex (g_ppu_once_mutex), the exit mutex (g_ppu_exit_mutex; liblv2's name "exitprc", RPCS3's
+// "_lv2tls") and the "_lv2prx" lwmutex (g_ppu_prx_lwm, which RPCS3 makes and nothing locks).
+void init_lv2_objects(PPUContext& ctx)
+{
+    if (!ctx.runtime) return; // a context without an lv2 thread (tests): made at their first use instead
+    atexit_lwmutex(ctx);
+    u8* base = guest_base(ctx);
+    if (const u32 var = prx_variable("g_ppu_once_mutex"); !atomic_load_be32(base, var)) {
+        create_mutex(ctx, var, lv2::SYS_SYNC_NOT_RECURSIVE, "_lv2ppu");
+    }
+    exit_mutex(ctx);
+    create_lwmutex(ctx, "g_ppu_prx_lwm", "_lv2prx");
+}
+
 } // namespace
 
 void game_process_exitspawn(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,
@@ -1404,6 +1460,13 @@ void game_process_exitspawn2(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 
 
 void register_sysPrxForUser(Registry& r)
 {
+    // liblv2's internal state under RPCS3's names for it (D-520): the TLS initialisation fills them.
+    const auto var = [](std::string_view name, u32 size, u32 align) {
+        return Variable{{}, name, recomp::nid_of(name), size, align, nullptr};
+    };
+    r.add_variables("sysPrxForUser", {var("g_ppu_atexit", 32, 4), var("g_ppu_atexit_lwm", 24, 8),
+        var("g_ppu_exit_mutex", 4, 4), var("g_ppu_once_mutex", 4, 4), var("g_ppu_prx_lwm", 24, 8),
+        var("g_ppu_atexitspawn", 4, 4), var("g_ppu_at_Exitspawn", 4, 4), var("s_shared_memory_area", 4, 4)});
     r.add("sysPrxForUser", {
         PS_HLE_FUNC(0x744680A2, sys_initialize_tls),
         PS_HLE_FUNC(0x350D454E, sys_ppu_thread_get_id),

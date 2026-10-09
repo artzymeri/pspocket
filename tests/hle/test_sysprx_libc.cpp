@@ -5,6 +5,7 @@
 // guest code is a few PPU instructions written here and run on the interpreter.
 
 #include "hle_test_util.hpp"
+#include "pspocket/recomp/nid.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1070,6 +1071,15 @@ TEST_CASE("sys_ppu_thread_register_atexit: eight slots, RPCS3's errors, run by e
     CHECK(a.call("sys_ppu_thread_register_atexit", kOpd2) == r3_of(lv2::CELL_ENOMEM));
     for (u32 i = 2; i < 8; i++) REQUIRE(a.call("sys_ppu_thread_unregister_atexit", kUnmapped + 8 * i) == 0);
     REQUIRE(a.call("sys_ppu_thread_register_atexit", kOpd2) == 0);
+    // The list and its "atexit!" lwmutex are liblv2's variables g_ppu_atexit and g_ppu_atexit_lwm (D-520).
+    const u32 list = f.hle->link_variable("sysPrxForUser", recomp::nid_of("g_ppu_atexit"));
+    const u32 lwm = f.hle->link_variable("sysPrxForUser", recomp::nid_of("g_ppu_atexit_lwm"));
+    REQUIRE(list != 0);
+    REQUIRE(lwm != 0);
+    CHECK(ps_read32(b, list) == kOpd);
+    CHECK(ps_read32(b, list + 4) == kUnmapped + 8);
+    CHECK(ps_read32(b, list + 8) == kOpd2);
+    CHECK(ps_read32(b, lwm + 16) != 0); // the lwmutex's lv2 sleep queue
 
     // An exiting thread runs them, skipping one that is not guest memory (logged).
     {
