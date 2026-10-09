@@ -320,7 +320,8 @@ firmware module. Done so far (2026-10-09: 3,927 of 6,625):
 console with no USB device (D-522), lv2's network calls and libnet's own layer over them (D-523, part 1), cellHttp
 (D-524: all 123 functions, libhttp's objects where libhttp lays them; past a connection blocked on libnet's resolver),
 sysPrxForUser's raw SPU loaders (D-529, which also fixed sys_spu_segment's address offset), cell_FreeType2 (D-525,
-FreeType 2.2.1 on the host), cellFontFT (D-526 part 1), cellSync2 (D-531, libsync2's objects bit for bit).
+FreeType 2.2.1 on the host), cellFontFT (D-526 part 1), cellSync2 (D-531, libsync2's objects bit for bit), cellAtrac (D-532, libatrac3plus over
+pspocket's cellAdec).
 Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,
 services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
 interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
