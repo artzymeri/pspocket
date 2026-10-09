@@ -1549,7 +1549,7 @@ std::string_view drm_file_name(std::string_view path)
 // game's licence keys, where lv2's file system finds it when the game opens the content (D-581). A file that is
 // neither a SELF ("SCE\0") nor an EDAT/SDAT ("NPD\0") is taken as unencrypted (disc files): available.
 // - A SELF is available when it decrypts (recomp::decrypt_self, as the loader does, where RPCS3 opens its metadata
-//   with its key vault); its klicensee is installed.
+//   with its key vault); a PSN executable with the klicensee or the player's RAP (D-582). Its klicensee is installed.
 // - An SDAT is refused as RPCS3's EDAT check refuses it (NO_ENTITLEMENT). An EDAT must pass RPCS3's header checks
 //   (VerifyEDATHeaderWithKLicense: the title hash over its content ID and the name in the path, and for free content
 //   the dev hash keyed with the klicensee; recomp::npd_hashes_valid), else NO_ENTITLEMENT. Free content (licence 3)
@@ -1578,15 +1578,20 @@ s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile&
                 path, lv2::error_name(whole.result), whole.bytes.size());
             return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
         }
-        const recomp::Result<std::vector<u8>> elf = recomp::decrypt_self(whole.bytes, recomp::builtin_self_keys());
+        // RPCS3 verify_npdrm_self_headers: a PSN executable's licence is the game's klicensee (else the default one)
+        // or the player's RAP for its content ID (D-582).
+        const recomp::Key128 klic = klicensee.value_or(keys.klic_free);
+        const recomp::NpdrmLicence licence = process_licence(thread_of(ctx).kernel, klic);
+        const recomp::Result<std::vector<u8>> elf =
+            recomp::decrypt_self(whole.bytes, recomp::builtin_self_keys(), &licence);
         if (!elf) {
             PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that doesn't open ({}): no entitlement", path,
                 elf.error().message);
             return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
         }
-        // RPCS3 installs the klicensee it checked with: the game's, else the default one.
-        drm_install_key(klicensee.value_or(keys.klic_free));
-        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that opens with the build's keys: available", path);
+        // RPCS3 installs the klicensee it checked with.
+        drm_install_key(klic);
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that opens: available", path);
         return lv2::CELL_OK;
     }
     if (!magic_is("NPD")) {

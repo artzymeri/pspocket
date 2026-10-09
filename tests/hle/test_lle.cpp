@@ -15,8 +15,11 @@
 #include "pspocket/core/memory_map.h"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
+#include "pspocket/recomp/crypto.hpp"
 #include "pspocket/recomp/nid.hpp"
+#include "pspocket/recomp/npdrm.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
 #include "hle_test_util.hpp"
 #include "synthetic.hpp"
 
@@ -67,6 +70,32 @@ std::vector<u8> debug_self(const std::vector<u8>& elf)
     o.debug = true;
     o.npdrm = false;
     return test::wrap_in_self(elf, o);
+}
+
+// The build's first NPDRM SELF key, or nullptr in a build without keys.
+const recomp::SelfKey* npdrm_self_key()
+{
+    for (const recomp::SelfKey& k : recomp::builtin_self_keys())
+        if (k.type == 8) return &k;
+    return nullptr;
+}
+
+// `elf` as a PSN game's module (an NPDRM SELF of this licence type opened by `content_key`), encrypted with the
+// build's keys, in the test's folders only.
+std::vector<u8> npdrm_self(const std::vector<u8>& elf, s32 license, const recomp::Key128& content_key)
+{
+    const recomp::SelfKey* key = npdrm_self_key();
+    REQUIRE(key);
+    test::SelfEncryption e;
+    e.key = *key;
+    e.revision = static_cast<u16>(key->revision);
+    e.npdrm = true;
+    e.npdrm_license = license;
+    REQUIRE(recomp::crypto::aes_ecb_decrypt(recomp::builtin_npdrm_keys().klic_key, content_key.data(), 16,
+        e.npdrm_layer_key.data()));
+    std::vector<u8> self = test::encrypt_self(elf, e);
+    REQUIRE_FALSE(self.empty());
+    return self;
 }
 
 } // namespace
@@ -379,6 +408,53 @@ TEST_CASE("Run-time modules: a game's own PRX loaded by path, started (its expor
     CHECK(t.call("sys_prx_stop_module", id, 0, 0, result, 0, 0) == lv2::CELL_OK);
     CHECK(t.call("sys_prx_unload_module", id, 0, 0) == lv2::CELL_OK);
     CHECK(t.call("sys_prx_get_module_id_by_name", name, 0, 0) == hle::test::r3_of_code(0x8001112E));
+    f.hle->set_module_loader(nullptr);
+    fs::remove_all(root);
+}
+
+TEST_CASE("Run-time modules: a PSN game's NPDRM modules open with the klicensee it showed, or the player's RAP (D-582)",
+    "[hle][lle][prx][npdrm]")
+{
+    if (!recomp::builtin_npdrm_keys().present || !npdrm_self_key()) SKIP("this build has no NPDRM keys");
+    const fs::path root = fresh_flash("pspocket-test-prx-npdrm");
+    const auto prx = test::build_ppu_prx();
+    const std::vector<u8> module = prx_exporting(prx, "synthLib", 0xDEADBEEF);
+    recomp::Key128 klicensee{}, rap{};
+    klicensee.fill(0x66);
+    rap.fill(0x67);
+    fs::create_directories(root / "usrdir");
+    write(root / "usrdir" / "free.sprx", npdrm_self(module, 3, klicensee));
+    write(root / "usrdir" / "local.sprx", npdrm_self(module, 2, recomp::rap_to_rif(rap, recomp::builtin_npdrm_keys())));
+    fs::create_directories(root / "hdd0" / "home" / "00000001" / "exdata");
+    write(root / "hdd0" / "home" / "00000001" / "exdata" / (std::string(test::kSelfContentId) + ".rap"),
+        std::vector<u8>(rap.begin(), rap.end()));
+
+    const auto x = test::build_ppu_exec();
+    auto exe = loader::Executable::parse(x.bytes);
+    REQUIRE(exe);
+    hle::test::Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/app_home", (root / "usrdir").string(), true));
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+    REQUIRE(loader::load(**exe, *f.kernel, *f.hle) == lv2::CELL_OK);
+    loader::RuntimeModules modules(*f.hle, *exe, nullptr);
+    f.hle->set_module_loader(&modules);
+    u8* base = f.base();
+    hle::test::GuestThread t(f, 0, "main");
+    const u32 free_path = hle::test::kData, local_path = hle::test::kData + 0x100, klic = hle::test::kData + 0x200;
+    const std::string fp = "/app_home/free.sprx", lp = "/app_home/local.sprx";
+    std::memcpy(base + free_path, fp.c_str(), fp.size() + 1);
+    std::memcpy(base + local_path, lp.c_str(), lp.size() + 1);
+    std::memcpy(base + klic, klicensee.data(), 16);
+
+    // The free module needs the game's klicensee, which the game shows with sceNpDrmIsAvailable first (RPCS3's
+    // sys_prx takes the last key shown); the local one opens with the player's RAP whatever the game showed.
+    CHECK(static_cast<s32>(t.call("sys_prx_load_module", free_path, 0, 0)) < 0);
+    const u64 local = t.call("sys_prx_load_module", local_path, 0, 0);
+    CHECK(static_cast<s32>(local) > 0);
+    REQUIRE(t.call("sceNpDrmIsAvailable", klic, free_path) == 0);
+    const u64 free_id = t.call("sys_prx_load_module", free_path, 0, 0);
+    CHECK(static_cast<s32>(free_id) > 0);
+    CHECK(modules.module(static_cast<u32>(free_id)) != nullptr);
     f.hle->set_module_loader(nullptr);
     fs::remove_all(root);
 }

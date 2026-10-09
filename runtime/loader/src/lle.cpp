@@ -17,6 +17,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/hle/hle.hpp"
+#include "pspocket/hle/npdrm.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/recomp/elf.hpp"
@@ -894,9 +895,11 @@ u32 RuntimeModules::load_at(std::string_view path, u64 offset, u32* id)
         if (bytes.size() >= 4 && bytes[0] == 0x7F && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F') {
             elf = std::move(bytes);
         } else {
-            auto decrypted = recomp::decrypt_self(bytes, recomp::builtin_self_keys());
+            // A PSN game's NPDRM module opens with its licence (D-582): the newest licence key the game has shown, as
+            // RPCS3's sys_prx takes last_key(), or the player's RAP.
+            const recomp::NpdrmLicence licence = hle::module_licence(hle_.kernel());
+            auto decrypted = recomp::decrypt_self(bytes, recomp::builtin_self_keys(), &licence);
             if (!decrypted) {
-                // An NPDRM module needs the game's licence key (klicensee), which only a PSN game has.
                 PS_LOG_ERROR(kChan, "{}: cannot decrypt: {}", path, decrypted.error().message);
                 return kPrxErrorUnsupportedType;
             }
