@@ -79,6 +79,7 @@ void register_cellPngEnc(Registry& r);
 void register_libsnd3(Registry& r);
 void register_libsynth2(Registry& r);
 void register_libmixer(Registry& r);
+void register_codec_cores(Registry& r);
 void register_cellCelpEnc(Registry& r);
 void register_cellRudp(Registry& r);
 void register_cellNetAoi(Registry& r);
@@ -169,6 +170,7 @@ void register_all_modules(Registry& r)
     register_libsnd3(r);
     register_libsynth2(r);
     register_libmixer(r);
+    register_codec_cores(r);
     register_cellCelpEnc(r);
     register_cellRudp(r);
     register_cellNetAoi(r);

@@ -309,7 +309,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-09: 5,646 of 6,625, 85.2%):
+firmware module. Done so far (2026-10-09: 5,654 of 6,625, 85.3%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -333,15 +333,15 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   the Mac: libmixer (the surround mixer over pspocket's cellAudio), cellVpost (D-564: YUV pictures scaled and converted
   to RGBA), cellKey2char (D-565: key codes to characters), cellPngEnc (D-566: PNG files from pictures, on libpng),
   cellFiber (D-568: fibers and contexts, each on a host thread that runs as its PPU thread while it holds the
-  thread's baton).
+  thread's baton), the video codec cores' version queries (D-575).
 - cellGame's and cellPhotoImportUtil's working structures as their variables under RPCS3's names (D-567).
 - The threaded libraries checked for data races in a ThreadSanitizer build (D-571, -DPSPOCKET_TSAN=ON): cellFiber,
   libmixer, the C library's threads, cellPngEnc.
-Left (979, 2026-10-09). What each part needs (a session without the firmware could not make these faithfully):
+Left (971, 2026-10-09). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSpursJq (63, libspurs_jq), cellSailRec (58)
   and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (31, its wire protocol), the codec
-  cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec, libdivx*, libvdec's 9, and the audio cores'
-  operation tables and PTS functions, about 170 in all), cellJpgEnc (10, its structures), cellCelpEnc and
+  cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 9, and
+  the audio cores' operation tables and PTS functions, about 160 in all), cellJpgEnc (10, its structures), cellCelpEnc and
   cellCelp8Enc (19), the image decoders' Ext functions (15), cellNetAoi, libmedi, libad_core/async (32), cellSpurs' 13
   and cellSync's 6 (libsre: Task2, the LF queues' second forms), and the small ones (sys_crashdump, sysConsoleId,
   sysBdMediaId, sysPs2Disc, sys_lv2coredump, cellLibprof, cellSysconfPs1emu, cellGamePs1Emu, cellSysmodule's two,
@@ -352,11 +352,11 @@ Left (979, 2026-10-09). What each part needs (a session without the firmware cou
   helpers' read and write families): no firmware module has them; their arguments are to be read in a game's own copy
   of the C library.
 - To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
-  cellFiber.
+  cellFiber, the codec cores' version queries.
 Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,
 services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
 interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
 as RPCS3's null or stub slots (debugger, crypto engine, colored memory: signatures not known).
-Next (on the Mac, with the firmware): compare the five firmware-first libraries with Sony's modules and drop their
+Next (on the Mac, with the firmware): compare the firmware-first libraries with Sony's modules and drop their
 markers; then libsre's last functions (cellSpurs' Task2 and LF queues, cellSync's), libnet's resolver (behind
 gethostbyname and gethostbyaddr, D-569), and the firmware-backed libraries above one by one.

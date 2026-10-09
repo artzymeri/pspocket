@@ -7868,3 +7868,15 @@ sceNpMatching2Term (0x2FE0DA7D) had been left out of sceNp2 while sceNpMatching2
 and has the first call the second ("> SDK 2.4.0", sceNp2.cpp), so a game built with an older SDK imports the first.
 It is now the same call. Test: tests/hle/test_np2.cpp (matching 2 taken down by either name, then NOT_INITIALIZED by
 either).
+
+## D-575 · 2026-10-09 · The video codec cores' version queries, firmware first
+
+libavcdec, libmvcdec, libsjvtd, libsmvd2, libsmvd4 and libsvc1d are the decoders Sony's libvdec loads; pspocket's
+libvdec decodes by itself and never calls them, and games do not import them. RPCS3 knows of each its version
+(avcDecGetVersion 0x11300 and mvcDecGetVersion 0x10804, both answering nothing; sjvtd 0x1050000, smvd2 0x1030000,
+smvd4 0x1080000, svc1d 0x1090000 through GetVersionNumber, with each library's ARG error for no pointer) and, for the
+AVC and MVC cores, QueryCharacteristics' two words (the command queue's depth, 5, then 20 or 36). Those eight are now
+pspocket's (runtime/hle/src/codec_cores.cpp), and the six libraries are firmware-first (D-563): their decoding calls
+need Sony's modules, so a module that imports any of them gets Sony's where the system software is installed. A
+pointer that is not guest memory gets the ARG error, where RPCS3 checks only for null. Test:
+tests/hle/test_codec_cores.cpp.
