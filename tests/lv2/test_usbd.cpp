@@ -96,12 +96,12 @@ TEST_CASE("sys_usbd: a console with no USB device", "[lv2][usbd]")
         Caller me(*f.kernel, "callback");
         const u32 e = f.alloc(24);
         waiter = me.thread;
-        REQUIRE(me.call(kReceiveEvent, handle, e, e + 8, e + 16) == CELL_OK);
-        CHECK(f.r64(e) == 2);
+        THREAD_REQUIRE(me.call(kReceiveEvent, handle, e, e + 8, e + 16) == CELL_OK);
+        THREAD_CHECK(f.r64(e) == 2);
         received = 1;
-        REQUIRE(me.call(kReceiveEvent, handle, e, e + 8, e + 16) == CELL_OK);
-        CHECK(f.r64(e) == 4);
-        CHECK(f.r64(e + 8) == 0);
+        THREAD_REQUIRE(me.call(kReceiveEvent, handle, e, e + 8, e + 16) == CELL_OK);
+        THREAD_CHECK(f.r64(e) == 4);
+        THREAD_CHECK(f.r64(e + 8) == 0);
         received = 2;
     });
     const auto waiting = [&] {

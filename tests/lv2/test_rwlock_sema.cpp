@@ -48,9 +48,9 @@ TEST_CASE("lv2 rwlock: single-thread semantics and errors", "[lv2][rwlock]")
     CHECK(c.call(kRwTryRLock, rw) == rc(CELL_EBUSY));
     std::thread([&] {
         Caller other(*f.kernel, "other");
-        CHECK(other.call(kRwWUnlock, rw) == rc(CELL_EPERM));
-        CHECK(other.call(kRwRLock, rw, 10000) == rc(CELL_ETIMEDOUT));
-        CHECK(other.call(kRwWLock, rw, 10000) == rc(CELL_ETIMEDOUT));
+        THREAD_CHECK(other.call(kRwWUnlock, rw) == rc(CELL_EPERM));
+        THREAD_CHECK(other.call(kRwRLock, rw, 10000) == rc(CELL_ETIMEDOUT));
+        THREAD_CHECK(other.call(kRwWLock, rw, 10000) == rc(CELL_ETIMEDOUT));
     }).join();
     CHECK(c.call(kRwWUnlock, rw) == CELL_OK);
     CHECK(c.call(kRwDestroy, rw) == CELL_OK);
@@ -70,10 +70,10 @@ TEST_CASE("lv2 rwlock: readers share, writers are preferred", "[lv2][rwlock]")
     for (int i = 0; i < 4; i++) {
         readers.emplace_back([&] {
             Caller me(*f.kernel, "reader");
-            REQUIRE(me.call(kRwRLock, rw, 0) == CELL_OK);
+            THREAD_REQUIRE(me.call(kRwRLock, rw, 0) == CELL_OK);
             inside++;
             while (!leave.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            REQUIRE(me.call(kRwRUnlock, rw) == CELL_OK);
+            THREAD_REQUIRE(me.call(kRwRUnlock, rw) == CELL_OK);
         });
     }
     CHECK(eventually([&] { return inside.load() == 4; }));
@@ -83,23 +83,23 @@ TEST_CASE("lv2 rwlock: readers share, writers are preferred", "[lv2][rwlock]")
     std::mutex order_mutex;
     std::thread writer([&] {
         Caller me(*f.kernel, "writer");
-        REQUIRE(me.call(kRwWLock, rw, 0) == CELL_OK);
+        THREAD_REQUIRE(me.call(kRwWLock, rw, 0) == CELL_OK);
         {
             std::lock_guard lock(order_mutex);
             order.push_back("writer");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        REQUIRE(me.call(kRwWUnlock, rw) == CELL_OK);
+        THREAD_REQUIRE(me.call(kRwWUnlock, rw) == CELL_OK);
     });
     REQUIRE(eventually([&] { return queued<RwLock>(*f.kernel, rw) == 1; }));
     std::thread late([&] {
         Caller me(*f.kernel, "late reader");
-        REQUIRE(me.call(kRwRLock, rw, 0) == CELL_OK);
+        THREAD_REQUIRE(me.call(kRwRLock, rw, 0) == CELL_OK);
         {
             std::lock_guard lock(order_mutex);
             order.push_back("reader");
         }
-        REQUIRE(me.call(kRwRUnlock, rw) == CELL_OK);
+        THREAD_REQUIRE(me.call(kRwRUnlock, rw) == CELL_OK);
     });
     REQUIRE(eventually([&] { return queued<RwLock>(*f.kernel, rw) == 2; }));
     CHECK(c.call(kRwTryRLock, rw) == rc(CELL_EBUSY)); // a writer is waiting
@@ -119,14 +119,14 @@ TEST_CASE("lv2 rwlock: a timed-out writer lets queued readers in", "[lv2][rwlock
     std::atomic<bool> reader_in{false};
     std::thread writer([&] {
         Caller me(*f.kernel, "writer");
-        CHECK(me.call(kRwWLock, rw, 50000) == rc(CELL_ETIMEDOUT));
+        THREAD_CHECK(me.call(kRwWLock, rw, 50000) == rc(CELL_ETIMEDOUT));
     });
     REQUIRE(eventually([&] { return queued<RwLock>(*f.kernel, rw) == 1; }));
     std::thread reader([&] {
         Caller me(*f.kernel, "reader");
-        REQUIRE(me.call(kRwRLock, rw, 0) == CELL_OK); // behind the writer until it gives up
+        THREAD_REQUIRE(me.call(kRwRLock, rw, 0) == CELL_OK); // behind the writer until it gives up
         reader_in = true;
-        REQUIRE(me.call(kRwRUnlock, rw) == CELL_OK);
+        THREAD_REQUIRE(me.call(kRwRUnlock, rw) == CELL_OK);
     });
     writer.join();
     reader.join();
@@ -149,15 +149,15 @@ TEST_CASE("lv2 rwlock: readers never see a half-done write", "[lv2][rwlock][stre
             Caller me(*f.kernel, i < 2 ? "writer" : "reader");
             for (int k = 0; k < 1500; k++) {
                 if (i < 2) {
-                    REQUIRE(me.call(kRwWLock, rw, 0) == CELL_OK);
+                    THREAD_REQUIRE(me.call(kRwWLock, rw, 0) == CELL_OK);
                     f.w64(data, f.r64(data) + 1);
                     f.w64(data + 8, f.r64(data + 8) + 1);
                     writes++;
-                    REQUIRE(me.call(kRwWUnlock, rw) == CELL_OK);
+                    THREAD_REQUIRE(me.call(kRwWUnlock, rw) == CELL_OK);
                 } else {
-                    REQUIRE(me.call(kRwRLock, rw, 0) == CELL_OK);
+                    THREAD_REQUIRE(me.call(kRwRLock, rw, 0) == CELL_OK);
                     if (f.r64(data) != f.r64(data + 8)) violations++;
-                    REQUIRE(me.call(kRwRUnlock, rw) == CELL_OK);
+                    THREAD_REQUIRE(me.call(kRwRUnlock, rw) == CELL_OK);
                 }
             }
         });
@@ -210,7 +210,7 @@ TEST_CASE("lv2 semaphore: blocking waits, multi-wake posts and timeouts", "[lv2]
     for (int i = 0; i < 3; i++) {
         pool.emplace_back([&] {
             Caller me(*f.kernel, "waiter");
-            REQUIRE(me.call(kSemWait, s, 0) == CELL_OK);
+            THREAD_REQUIRE(me.call(kSemWait, s, 0) == CELL_OK);
             passed++;
         });
     }
@@ -239,11 +239,11 @@ TEST_CASE("lv2 semaphore: posts and waits balance under contention", "[lv2][sema
     for (int i = 0; i < 4; i++) {
         pool.emplace_back([&] {
             Caller me(*f.kernel, "producer");
-            for (int k = 0; k < kPerThread; k++) REQUIRE(me.call(kSemPost, s, 1) == CELL_OK);
+            for (int k = 0; k < kPerThread; k++) THREAD_REQUIRE(me.call(kSemPost, s, 1) == CELL_OK);
         });
         pool.emplace_back([&] {
             Caller me(*f.kernel, "consumer");
-            for (int k = 0; k < kPerThread; k++) REQUIRE(me.call(kSemWait, s, 0) == CELL_OK);
+            for (int k = 0; k < kPerThread; k++) THREAD_REQUIRE(me.call(kSemWait, s, 0) == CELL_OK);
         });
     }
     for (auto& t : pool) t.join();

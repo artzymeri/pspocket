@@ -83,7 +83,7 @@ s32 lwmutex_lock(Caller& c, const LwMutexUser& m, u64 timeout)
     m.add_all(-1);
     if (res == CELL_OK) {
         const u32 prev = m.exchange_owner(tid);
-        REQUIRE(prev == kReserved);
+        THREAD_REQUIRE(prev == kReserved);
     }
     return res;
 }
@@ -101,7 +101,7 @@ s32 lwmutex_trylock(Caller& c, const LwMutexUser& m)
     if (old == kDead) return rc(CELL_EINVAL);
     if (old == kReserved) {
         const s32 res = c.call(kLwMutexTryLock, m.sleep_queue());
-        if (res == CELL_OK) REQUIRE(m.exchange_owner(tid) == kReserved);
+        if (res == CELL_OK) THREAD_REQUIRE(m.exchange_owner(tid) == kReserved);
         return res;
     }
     return rc(CELL_EBUSY);
@@ -151,17 +151,18 @@ s32 lwcond_wait(Caller& c, const LwCondUser& cv, u64 timeout)
     if (res == CELL_OK) {
         m.add_all(-1);
         const u32 prev = m.exchange_owner(tid);
-        REQUIRE(prev != kFree);
-        REQUIRE(prev != kDead);
+        THREAD_REQUIRE(prev != kFree);
+        THREAD_REQUIRE(prev != kDead);
         m.set_recursive_count(recursive);
         return CELL_OK;
     }
     if (res == rc(CELL_EBUSY) || res == rc(CELL_ETIMEDOUT)) {
-        REQUIRE(lwmutex_lock(c, m, 0) == CELL_OK);
+        THREAD_REQUIRE(lwmutex_lock(c, m, 0) == CELL_OK);
         m.set_recursive_count(recursive);
         return res == rc(CELL_EBUSY) ? CELL_OK : res;
     }
-    FAIL("unexpected _sys_lwcond_queue_wait result " << res);
+    // Any other answer is unexpected (called on the tests' own threads too, so not FAIL).
+    THREAD_REQUIRE((res == CELL_OK || res == rc(CELL_EBUSY) || res == rc(CELL_ETIMEDOUT)));
     return res;
 }
 
@@ -185,7 +186,7 @@ s32 lwcond_signal(Caller& c, const LwCondUser& cv)
     if (res != CELL_OK) {
         m.add_all(-1);
         m.set_owner(c.id());
-        REQUIRE(lwmutex_unlock(c, m) == CELL_OK);
+        THREAD_REQUIRE(lwmutex_unlock(c, m) == CELL_OK);
         if (res != rc(CELL_ENOENT)) return res;
     }
     return CELL_OK;
@@ -206,7 +207,7 @@ s32 lwcond_signal_all(Caller& c, const LwCondUser& cv)
         m.add_all(res);
         res = CELL_OK;
     }
-    REQUIRE(lwmutex_unlock(c, m) == CELL_OK);
+    THREAD_REQUIRE(lwmutex_unlock(c, m) == CELL_OK);
     return res;
 }
 
@@ -271,12 +272,12 @@ TEST_CASE("lv2 lwmutex: mutual exclusion through the user-space protocol", "[lv2
         pool.emplace_back([&, i] {
             Caller me(*f.kernel, "worker", 900 + i * 50);
             for (int k = 0; k < kIters; k++) {
-                REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
+                THREAD_REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
                 if (++inside != 1) violations++;
                 f.w64(counter, f.r64(counter) + 1);
                 if ((k & 63) == 0) std::this_thread::yield(); // let others pile up in the kernel
                 inside--;
-                REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
+                THREAD_REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
             }
         });
     }
@@ -311,9 +312,9 @@ TEST_CASE("lv2 lwcond: kernel signal modes and errors", "[lv2][lwcond]")
     // A waiter blocks destruction.
     std::thread waiter([&] {
         Caller me(*f.kernel, "waiter");
-        REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
-        REQUIRE(lwcond_wait(me, cv, 0) == CELL_OK);
-        REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
+        THREAD_REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
+        THREAD_REQUIRE(lwcond_wait(me, cv, 0) == CELL_OK);
+        THREAD_REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
     });
     REQUIRE(lwmutex_unlock(c, m) == CELL_OK);
     REQUIRE(eventually([&] { return queued<LwCond>(*f.kernel, cv.queue()) == 1; }));
@@ -339,13 +340,13 @@ TEST_CASE("lv2 lwcond: producer/consumer and signal_all through the user-space p
         pool.emplace_back([&, p] {
             Caller me(*f.kernel, "producer");
             for (int i = 0; i < kItems; i++) {
-                REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
-                REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK); // recursion survives the waits
-                while (buffer.size() >= kCapacity) REQUIRE(lwcond_wait(me, not_full, 0) == CELL_OK);
+                THREAD_REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
+                THREAD_REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK); // recursion survives the waits
+                while (buffer.size() >= kCapacity) THREAD_REQUIRE(lwcond_wait(me, not_full, 0) == CELL_OK);
                 buffer.push_back(static_cast<u64>(p) * kItems + i + 1);
-                REQUIRE(lwcond_signal(me, not_empty) == CELL_OK);
-                REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
-                REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
+                THREAD_REQUIRE(lwcond_signal(me, not_empty) == CELL_OK);
+                THREAD_REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
+                THREAD_REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
             }
         });
     }
@@ -353,13 +354,13 @@ TEST_CASE("lv2 lwcond: producer/consumer and signal_all through the user-space p
         pool.emplace_back([&] {
             Caller me(*f.kernel, "consumer");
             for (int i = 0; i < kItems * kProducers / kConsumers; i++) {
-                REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
-                while (buffer.empty()) REQUIRE(lwcond_wait(me, not_empty, 0) == CELL_OK);
+                THREAD_REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
+                while (buffer.empty()) THREAD_REQUIRE(lwcond_wait(me, not_empty, 0) == CELL_OK);
                 sum += buffer.back();
                 count++;
                 buffer.pop_back();
-                REQUIRE(lwcond_signal(me, not_full) == CELL_OK);
-                REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
+                THREAD_REQUIRE(lwcond_signal(me, not_full) == CELL_OK);
+                THREAD_REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
             }
         });
     }
@@ -374,10 +375,10 @@ TEST_CASE("lv2 lwcond: producer/consumer and signal_all through the user-space p
     for (int i = 0; i < 4; i++) {
         waiters.emplace_back([&] {
             Caller me(*f.kernel, "waiter");
-            REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
-            REQUIRE(lwcond_wait(me, not_empty, 0) == CELL_OK);
+            THREAD_REQUIRE(lwmutex_lock(me, m, 0) == CELL_OK);
+            THREAD_REQUIRE(lwcond_wait(me, not_empty, 0) == CELL_OK);
             woke++;
-            REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
+            THREAD_REQUIRE(lwmutex_unlock(me, m) == CELL_OK);
         });
         REQUIRE(eventually([&] { return queued<LwCond>(*f.kernel, not_empty.queue()) == static_cast<usize>(i + 1); }));
     }

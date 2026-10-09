@@ -79,7 +79,7 @@ TEST_CASE("thread report: a receiver blocked on an event queue names the syscall
     std::thread receiver([&] {
         Caller me(*t.f.kernel, "receiver", 700);
         receiver_id = me.id();
-        CHECK(me.call(kQueueReceive, q, 0, 0) == CELL_OK);
+        THREAD_CHECK(me.call(kQueueReceive, q, 0, 0) == CELL_OK);
     });
     REQUIRE(eventually([&] { return receiver_id != 0; }));
     REQUIRE(t.parked(receiver_id, WaitKind::EventQueue));
@@ -130,8 +130,8 @@ TEST_CASE("thread report: an event flag waiter shows the bits it wants against t
         Caller me(*t.f.kernel, "flag waiter");
         waiter_id = me.id();
         const u32 result = t.f.alloc(8);
-        CHECK(me.call(kFlagWait, flag, 0x5, SYS_EVENT_FLAG_WAIT_AND | SYS_EVENT_FLAG_WAIT_CLEAR, result, 10'000'000) ==
-            CELL_OK);
+        THREAD_CHECK(me.call(kFlagWait, flag, 0x5, SYS_EVENT_FLAG_WAIT_AND | SYS_EVENT_FLAG_WAIT_CLEAR, result,
+                         10'000'000) == CELL_OK);
     });
     REQUIRE(eventually([&] { return waiter_id != 0; }));
     REQUIRE(t.parked(waiter_id, WaitKind::EventFlag));
@@ -163,7 +163,7 @@ TEST_CASE("thread report: an lwmutex sleeper shows the guest's sys_lwmutex_t own
     std::thread sleeper([&] {
         Caller me(*t.f.kernel, "sleeper");
         sleeper_id = me.id();
-        CHECK(me.call(kLwMutexLock, lw, 0) == CELL_OK);
+        THREAD_CHECK(me.call(kLwMutexLock, lw, 0) == CELL_OK);
     });
     REQUIRE(eventually([&] { return sleeper_id != 0; }));
     REQUIRE(t.parked(sleeper_id, WaitKind::LwMutex));
@@ -199,8 +199,8 @@ TEST_CASE("thread report: mutex owners, and a signalled cond waiter re-taking it
     std::thread locker([&] {
         Caller me(*t.f.kernel, "locker");
         locker_id = me.id();
-        CHECK(me.call(kMutexLock, mutex, 0) == CELL_OK);
-        CHECK(me.call(kMutexUnlock, mutex) == CELL_OK);
+        THREAD_CHECK(me.call(kMutexLock, mutex, 0) == CELL_OK);
+        THREAD_CHECK(me.call(kMutexUnlock, mutex) == CELL_OK);
     });
     REQUIRE(eventually([&] { return locker_id != 0; }));
     REQUIRE(t.parked(locker_id, WaitKind::Mutex));
@@ -214,9 +214,9 @@ TEST_CASE("thread report: mutex owners, and a signalled cond waiter re-taking it
     std::thread waiter([&] {
         Caller me(*t.f.kernel, "cond waiter");
         waiter_id = me.id();
-        REQUIRE(me.call(kMutexLock, mutex, 0) == CELL_OK);
-        CHECK(me.call(kCondWait, cond, 0) == CELL_OK);
-        CHECK(me.call(kMutexUnlock, mutex) == CELL_OK);
+        THREAD_REQUIRE(me.call(kMutexLock, mutex, 0) == CELL_OK);
+        THREAD_CHECK(me.call(kCondWait, cond, 0) == CELL_OK);
+        THREAD_CHECK(me.call(kMutexUnlock, mutex) == CELL_OK);
     });
     REQUIRE(eventually([&] { return waiter_id != 0; }));
     REQUIRE(t.parked(waiter_id, WaitKind::Cond));
@@ -242,7 +242,7 @@ TEST_CASE("thread report: sleeping threads, joiners, threads not started and exi
     std::thread sleeper([&] {
         Caller me(*t.f.kernel, "sleeper");
         sleeper_id = me.id();
-        CHECK(me.call(kUsleep, 300'000) == CELL_OK);
+        THREAD_CHECK(me.call(kUsleep, 300'000) == CELL_OK);
     });
     REQUIRE(eventually([&] { return sleeper_id != 0; }));
     REQUIRE(t.parked(sleeper_id, WaitKind::Sleep));
@@ -270,8 +270,8 @@ TEST_CASE("thread report: sleeping threads, joiners, threads not started and exi
         Caller me(*t.f.kernel, "joiner");
         joiner_id = me.id();
         const u32 status = t.f.alloc(8);
-        CHECK(me.call(kThreadJoin, worker, status) == CELL_OK);
-        CHECK(t.f.r64(status) == 7);
+        THREAD_CHECK(me.call(kThreadJoin, worker, status) == CELL_OK);
+        THREAD_CHECK(t.f.r64(status) == 7);
     });
     REQUIRE(eventually([&] { return joiner_id != 0; }));
     REQUIRE(t.parked(joiner_id, WaitKind::Join));

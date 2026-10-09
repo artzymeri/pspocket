@@ -2,7 +2,9 @@
 
 // Shared helpers for the lv2 tests: a kernel over fresh guest memory, host threads with lv2 identities that make
 // syscalls through the real PPU `sc` hook (ps_ppu_syscall -> ps_lv2_syscall -> dispatcher), a guest scratch
-// allocator, a host-function executor for kernel-created threads, and a log capture.
+// allocator, a host-function executor for kernel-created threads, and a log capture. Code that runs on a kernel thread
+// or a test's own std::thread checks with THREAD_CHECK / THREAD_REQUIRE (thread_check.hpp, D-585), never with Catch2's
+// CHECK and REQUIRE, which are not thread-safe.
 
 #include <catch_amalgamated.hpp>
 
@@ -25,6 +27,7 @@
 #include "pspocket/ppu/runtime.h"
 
 #include "internal.hpp" // white-box access (wait-queue lengths) for ordering tests
+#include "thread_check.hpp"
 
 namespace pspocket::lv2::test {
 
@@ -179,7 +182,11 @@ struct Fixture {
         kernel = std::make_unique<Kernel>(mem, std::move(config));
         kernel->install();
     }
-    ~Fixture() { kernel.reset(); }
+    ~Fixture()
+    {
+        kernel.reset();
+        pspocket::test::report_thread_checks(); // what failed on the kernel's threads and the test's own
+    }
 
     u8* base() const { return mem.base(); }
 
@@ -189,7 +196,7 @@ struct Fixture {
         for (;;) {
             const u32 a = (cur + align - 1) & ~(align - 1);
             if (next.compare_exchange_weak(cur, a + size)) {
-                REQUIRE(a + size <= kScratch + kScratchSize);
+                THREAD_REQUIRE(a + size <= kScratch + kScratchSize);
                 std::memset(base() + a, 0, size);
                 return a;
             }
@@ -258,7 +265,7 @@ struct HostEntries {
         {
             std::lock_guard lock(self->mutex);
             const auto it = self->fns.find(entry);
-            REQUIRE(it != self->fns.end());
+            THREAD_REQUIRE(it != self->fns.end()); // on the kernel's thread
             fn = it->second;
         }
         fn(ctx);
@@ -366,7 +373,7 @@ template <class T>
 usize queued(Kernel& k, u32 id)
 {
     const auto obj = k.impl().objects.get<T>(id);
-    REQUIRE(obj);
+    THREAD_REQUIRE(obj);
     if constexpr (std::is_same_v<T, Cond>) {
         std::lock_guard lock(obj->mutex->lock);
         return obj->waiters.size();

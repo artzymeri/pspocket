@@ -141,8 +141,8 @@ TEST_CASE("lv2 raw SPU: problem state, mailboxes, MFC proxy and an interrupt thr
         got = f.r32(hbuf);
         syscall(ctx, kSetStat, id, 2, 1);
         calls++;
-        syscall(ctx, kEoi); // back to the wait: does not return
-        FAIL("sys_interrupt_thread_eoi returned");
+        syscall(ctx, kEoi);  // back to the wait: does not return
+        THREAD_CHECK(false); // sys_interrupt_thread_eoi returned
     });
     const u32 opd = f.alloc(8), param = f.alloc(8), tid = f.alloc(8), name = f.cstr("intr");
     f.w32(opd, 0x5000);

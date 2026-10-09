@@ -123,7 +123,7 @@ TEST_CASE("lv2 threads: stack information, guard page and stack release", "[lv2]
     bool committed = false, guard = true;
     t.entries.add(0x20000, [&](PPUContext& ctx) {
         const u32 sp = t.f.alloc(8);
-        REQUIRE(static_cast<s32>(syscall(ctx, kThreadGetStackInfo, sp)) == CELL_OK);
+        THREAD_REQUIRE(static_cast<s32>(syscall(ctx, kThreadGetStackInfo, sp)) == CELL_OK);
         stack_addr = t.f.r32(sp);
         stack_size = t.f.r32(sp + 4);
         committed = t.f.mem.is_committed(stack_addr) && t.f.mem.is_committed(stack_addr + stack_size - 1);
@@ -206,8 +206,8 @@ TEST_CASE("lv2 threads: join and detach states", "[lv2][thread]")
         std::thread joiner([&] {
             Caller other(*t.f.kernel, "joiner");
             const u32 out = t.f.alloc(8);
-            CHECK(other.call(kThreadJoin, id, out) == CELL_OK);
-            CHECK(t.f.r64(out) == 5);
+            THREAD_CHECK(other.call(kThreadJoin, id, out) == CELL_OK);
+            THREAD_CHECK(t.f.r64(out) == 5);
         });
         CHECK(eventually([&] {
             std::lock_guard lock(t.f.kernel->impl().join_mutex);
@@ -227,7 +227,7 @@ TEST_CASE("lv2 threads: priorities, names, join state and creation errors", "[lv
     s32 join_state = -1;
     t.entries.add(0x50000, [&](PPUContext& ctx) {
         const u32 p = t.f.alloc(4);
-        REQUIRE(static_cast<s32>(syscall(ctx, kThreadGetJoinState, p)) == CELL_OK);
+        THREAD_REQUIRE(static_cast<s32>(syscall(ctx, kThreadGetJoinState, p)) == CELL_OK);
         join_state = static_cast<s32>(t.f.r32(p));
         syscall(ctx, kThreadExit, 0);
     });
