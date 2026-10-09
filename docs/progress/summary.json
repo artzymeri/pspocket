@@ -1,13 +1,13 @@
 {
-  "engine_percent": 82.6,
+  "engine_percent": 83.0,
   "libraries": {
     "own": 4092,
     "answered_as_rpcs3": 290,
     "known": 6625
   },
   "kernel": {
-    "own": 523,
-    "answered_as_rpcs3": 75,
+    "own": 560,
+    "answered_as_rpcs3": 74,
     "known": 634
   },
   "ppu_instructions": {
