@@ -75,6 +75,7 @@
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -1104,7 +1105,8 @@ s32 savedata_op(PPUContext& ctx, const OpArgs& a)
     SaveDataState& s = save_state();
     BusyGuard busy(s.busy);
     if (!busy.owned()) return error(CELL_SAVEDATA_ERROR_BUSY);
-    if (!s.context) s.context = s.process.main_memory().alloc(context::kSize, 0x100);
+    // The block is cellSysutil's variable g_savedata_context (RPCS3's name, D-534), laid out at its first use.
+    if (!s.context) s.context = s.process.link_variable("cellSysutil", recomp::nid_of("g_savedata_context"));
     if (!s.context) {
         PS_LOG_ERROR(kChan, "no main-area memory for the callbacks' structures");
         return error(CELL_SAVEDATA_ERROR_INTERNAL);

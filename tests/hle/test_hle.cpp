@@ -142,8 +142,9 @@ TEST_CASE("Linked stubs: descriptor layout, implemented and unimplemented calls"
 
 TEST_CASE("RPCS3 stubs: their NIDs, the answer, and an implementation taking precedence (D-182)", "[hle]")
 {
-    // Each NID is its name's, or a REG_FNID's own number, which then ends the generated name.
-    REQUIRE(hle::rpcs3_stubs().size() > 200);
+    // Each NID is its name's, or a REG_FNID's own number, which then ends the generated name. (Fewer of them as each
+    // library becomes pspocket's own.)
+    REQUIRE(!hle::rpcs3_stubs().empty());
     for (const hle::StubFunction& s : hle::rpcs3_stubs()) {
         INFO(s.module << "::" << s.name);
         CHECK((s.nid == recomp::nid_of(s.name) || s.name.ends_with(std::format("{:08X}", s.nid))));

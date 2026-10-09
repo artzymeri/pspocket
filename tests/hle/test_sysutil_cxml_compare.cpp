@@ -178,6 +178,29 @@ void build_writer(u8* b)
     ps_write32(b, kWriterDesc + 4, 0);
 }
 
+// A callback that records its call: a tag and its first `args` arguments' low words, 16 bytes per call from
+// kRecords + 16 (the count at kRecords), returning 0. Its descriptor at `desc`.
+constexpr u32 kRecords = kData + 0x1800;
+void build_recorder(u8* b, u32 at, u32 desc, u32 tag, u32 args)
+{
+    Asm a{at, {}};
+    a.emit(15u << 26 | 11u << 21 | (kRecords >> 16));            // lis r11, hi
+    a.emit(24u << 26 | 11u << 21 | 11u << 16 | (kRecords & 0xFFFF)); // ori r11, r11, lo
+    a.lwz(12, 0, 11);
+    a.slwi(9, 12, 4);
+    a.add(9, 9, 11);
+    a.li(0, static_cast<s32>(tag));
+    a.stw(0, 16, 9);
+    for (u32 i = 0; i < args; i++) a.stw(3 + i, 20 + 4 * static_cast<s32>(i), 9);
+    a.addi(12, 12, 1);
+    a.stw(12, 0, 11);
+    a.li(3, 0);
+    a.blr();
+    a.put(b);
+    ps_write32(b, desc, at);
+    ps_write32(b, desc + 4, 0);
+}
+
 // ------------------------------------------------------------------------------------------------- the runs
 
 u64 fnv(const u8* p, usize n)
@@ -272,6 +295,7 @@ public:
         const auto& segs = lib_->module->segments;
         REQUIRE(segs.size() >= 2);
         text_ = segs[0].first;
+        sony_data_ = segs[1].first;
         sony_globals_ = segs[1].first + (0x1F898 - 0x1EE60);
         // What either run makes in the main area, made in both before anything else so their layouts agree.
         f_.hle->link_variable("sysPrxForUser", recomp::nid_of("s_shared_memory_area"));
@@ -312,6 +336,7 @@ public:
         if (v >= g && v < g + 0x60) return 0xFE000000 | (v - g);
         if (v == fixed_allocate()) return 0xFD000001;
         if (v == packet_writer_write()) return 0xFD000002;
+        if (on_stack(v)) return 0xFC000000; // where each run's stack variables are
         return v;
     }
 
@@ -338,6 +363,13 @@ public:
         step("start");
     }
 
+    // libsysutil's internal function at `offset`, called in both runs (its module is loaded in both), as a step.
+    void internal_step(u32 offset, std::initializer_list<u64> args)
+    {
+        const u32 v = internal(offset, args);
+        step(std::format("libsysutil's {:#x} -> {:#x}", offset, v));
+    }
+
     // libsysutil's internal function at `offset` in its code (its TOC), as the module calls it.
     u32 internal(u32 offset, std::initializer_list<u64> args)
     {
@@ -355,7 +387,11 @@ public:
         if (sony_) {
             std::array<u64, 8> a{};
             std::copy(args.begin(), args.end(), a.begin());
-            v = lib_->call(t_, recomp::nid_of(name), {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]});
+            // A function known only by its NID is named after it ("cellSysutil_987D910E").
+            const u32 nid = name.starts_with("cellSysutil_") && name.size() == 20
+                ? static_cast<u32>(std::stoul(std::string(name.substr(12)), nullptr, 16))
+                : recomp::nid_of(name);
+            v = lib_->call(t_, nid, {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]});
         } else {
             const Function& fn = GuestThread::find(name);
             for (usize i = 0; i < args.size(); i++) t_.ctx.gpr[3 + i] = args[i];
@@ -371,6 +407,53 @@ public:
         return v;
     }
 
+    // A call whose r3 libsysutil leaves holding what its code last had there (a void function's): not compared.
+    void call_void(std::string_view name, std::vector<u64> args, double f = 0)
+    {
+        call(name, std::move(args), f);
+        Step& last = run_.steps.back();
+        last.call = last.call.substr(0, last.call.rfind(" -> ")) + " -> (void)";
+    }
+
+    // libsysutil's dispatcher for the system's web browser events (its code at 0x177BC; pspocket's internal function).
+    u32 web_event(u64 event, u32 param)
+    {
+        u32 v = 0;
+        ps_write32(b_, kInternal, text_ + 0x177BC); // as Sony's run leaves it, in both runs
+        ps_write32(b_, kInternal + 4, lib_->module->toc);
+        if (sony_) {
+            v = internal(0x177BC, {event, param});
+        } else {
+            const Function& fn = GuestThread::find("cellSysutil_WebBrowserSystemEvent");
+            t_.ctx.gpr[3] = event;
+            t_.ctx.gpr[4] = param;
+            fn.fn(t_.ctx, b_);
+            v = static_cast<u32>(t_.ctx.gpr[3]);
+        }
+        step(std::format("web browser event({:#x}, {:#x}) -> {:#x}", event, param, v));
+        return v;
+    }
+
+    // The AV chat loaded for `media`: libsysutil's state set to "loaded" (2) in Sony's run; pspocket's
+    // cellSysutilAvcLoadAsync (its own, not libsysutil's: it answers at once) in the other.
+    void avc_loaded(u32 media)
+    {
+        if (sony_) {
+            ps_write32(b_, sony_data_ + (0x1F6FC - 0x1EE60), 2);
+            ps_write32(b_, sony_data_ + (0x1EEA8 - 0x1EE60), media);
+        } else {
+            const Function& fn = GuestThread::find("cellSysutilAvcLoadAsync");
+            const u64 args[] = {kAllocDesc, 0, 0xFFFFFFFF, media, 1, 1, kData + kRegion};
+            for (u32 i = 0; i < 7; i++) t_.ctx.gpr[3 + i] = args[i];
+            fn.fn(t_.ctx, b_);
+            CHECK(t_.ctx.gpr[3] == 0);
+        }
+        step(std::format("the AV chat loaded for media {}", media));
+    }
+
+    // libsysutil's data at its address `sony_addr` (Sony's run) or pspocket's block at `offset`.
+    u32 data(u32 sony_addr, u32 offset) const { return sony_ ? sony_data_ + (sony_addr - 0x1EE60) : my_globals_ + offset; }
+
     // The state after a step.
     void step(std::string text)
     {
@@ -384,7 +467,19 @@ public:
         s.region = fnv(b_ + kSmall, kRegion - (kSmall - kData));
         const u32 g = globals();
         s.fixed.assign(b_ + g + sysutil::glob::fixed, b_ + g + sysutil::glob::kSize);
+        // libsysutil's globals: the channels', the output callbacks, the web browser's; the title ID string the
+        // browser is told.
         s.globals.assign(b_ + g, b_ + g + 0x54);
+        s.globals.insert(s.globals.end(), b_ + g + sysutil::glob::audio_out_cb, b_ + g + sysutil::glob::audio_out_cb + 16);
+        s.globals.insert(s.globals.end(), b_ + g + sysutil::glob::web_container, b_ + g + sysutil::glob::web_busy_icon + 1);
+        // The save data's state and the FixedMemory its packet took (an address: as an offset).
+        for (const u32 at : {sysutil::glob::savedata_state, sysutil::glob::savedata_memory}) {
+            u8 word[4];
+            ps_write32(word, 0, norm(ps_read32(b_, g + at)));
+            s.globals.insert(s.globals.end(), word, word + 4);
+        }
+        const u32 hinban = ps_read32(b_, sony_ ? sony_data_ + (0x1EEBC - 0x1EE60) : g + sysutil::glob::hinban);
+        for (u32 i = 0; i < 64 && b_[hinban + i]; i++) s.globals.push_back(b_[hinban + i]);
         if (const u32 shm = ps_read32(b_, g)) s.shm = fnv(b_ + shm, 0x10000);
         {
             std::lock_guard lock(tr_.m);
@@ -417,7 +512,7 @@ private:
     GuestThread t_;
     std::optional<FirmwareLibrary> lib_;
     u8* b_ = nullptr;
-    u32 text_ = 0, sony_globals_ = 0, my_globals_ = 0, my_fixed_alloc_ = 0, my_packet_writer_ = 0;
+    u32 text_ = 0, sony_data_ = 0, sony_globals_ = 0, my_globals_ = 0, my_fixed_alloc_ = 0, my_packet_writer_ = 0;
     Trace tr_;
     Run run_;
 };
@@ -497,6 +592,8 @@ void compare_script(const char* what, const Body& body)
     }
     INFO(std::format("{}: {} calls, {} lv2 calls", what, sony.steps.size(), lv2_calls(sony)));
     compare(mine, sony);
+    WARN(std::format("compared with Sony's libsysutil: {}: {} calls, {} lv2 calls", what, sony.steps.size(),
+        lv2_calls(sony)));
 }
 
 // ------------------------------------------------------------------------------------------------- the scripts
@@ -979,7 +1076,297 @@ void script_shared_memory(Script& s)
     s.call(free, {0, s.r32(obj(10)), 0x400});
 }
 
+// The web browser's configs, estimates and the functions that send nothing.
+void script_web_configs(Script& s)
+{
+    strings(s);
+    const char* cfg2 = "cellWebBrowserConfig2";
+    const u32 c = obj(0), c2 = obj(8); // two CellWebBrowserConfig2 (0x44 bytes)
+    for (u32 i = 0; i < 0x80; i++) s.base()[c + i] = static_cast<u8>(0x11 * (i % 15));
+    s.call(cfg2, {0, 0x20000});
+    s.call(cfg2, {c, 0x10000});
+    s.call(cfg2, {c, 0x20000});
+    s.call("cellWebBrowserConfigSetFullVersion2", {0});
+    s.call("cellWebBrowserConfigSetFullVersion2", {c2});
+    s.call("cellWebBrowserConfigSetFullVersion2", {c});
+    const char* hooks[] = {"cellWebBrowserConfigSetUnknownMIMETypeHook2", "cellWebBrowserConfigSetErrorHook2",
+        "cellWebBrowserConfigSetStatusHook2", "cellWebBrowserConfigSetNotifyHook2", "cellWebBrowserConfigSetRequestHook2"};
+    for (u32 i = 0; i < 5; i++) {
+        s.call(hooks[i], {0, 0x1000 + i, 0x2000 + i});
+        s.call(hooks[i], {c2, 0x1000 + i, 0x2000 + i});
+        s.call(hooks[i], {c, 0x1000 + i, 0x2000 + i});
+    }
+    s.call("cellWebBrowserConfigSetFunction2", {c, 0x1028});
+    s.call("cellWebBrowserConfigSetFunction2", {c2, 0x1028});
+    s.call("cellWebBrowserConfigSetViewCondition2", {c, 9});
+    for (const u64 v : {0x1FFFFFull, 0x200000ull, 0x80000000ull, 0x4000000ull}) s.call("cellWebBrowserConfigSetHeapSize2", {c, v});
+    s.call("cellWebBrowserConfigGetHeapSize2", {c, obj(16)});
+    s.call("cellWebBrowserConfigGetHeapSize2", {c, 0});
+    s.call("cellWebBrowserConfigGetHeapSize2", {c2, obj(16)});
+    for (const u64 v : {0ull, 1ull, 6ull, 7ull, 0xFFFFFFFFull, 3ull}) s.call("cellWebBrowserConfigSetTabCount2", {c, v});
+    for (const u64 v : {0ull, 1ull, 2ull}) s.call("cellWebBrowserConfigSetFullScreen2", {c, v});
+    // Estimates: by tabs, view conditions, the function bit 12, then a rect at resolutions.
+    const auto estimate = [&] { s.call("cellWebBrowserEstimate2", {c, obj(17)}); };
+    s.call("cellWebBrowserEstimate2", {0, obj(17)});
+    s.call("cellWebBrowserEstimate2", {c2, obj(17)});
+    s.call("cellWebBrowserEstimate2", {c, 0});
+    for (const u64 cond : {0ull, 1ull, 8ull, 9ull, 0x10ull}) {
+        s.call("cellWebBrowserConfigSetViewCondition2", {c, cond});
+        estimate();
+    }
+    s.call("cellWebBrowserConfigSetFunction2", {c, 0x28});
+    estimate();
+    const auto rect = [&](s32 x, s32 y, s32 w, s32 h, float res) {
+        s.call("cellWebBrowserConfigSetViewRect2",
+            {c, u64{static_cast<u32>(x)} << 32 | static_cast<u32>(y), u64{static_cast<u32>(w)} << 32 | static_cast<u32>(h)},
+            static_cast<double>(res));
+        estimate();
+    };
+    rect(0, 0, 0, 0, 1.0f);
+    rect(10, 20, 640, 480, 1.0f);
+    rect(-5, 7, 1280, 720, 0.5f);
+    rect(0, 0, 1280, -720, 1.0f);
+    rect(0, 0, 33333, 44444, 3.25f); // past an int: saturated
+    rect(0, 0, 3, 3, -2.0f);
+    rect(0, 0, 1920, 1080, 1.1f);
+    s.call("cellWebBrowserConfigSetViewRect2", {c2, 0, 0}, 1.0);
+    s.call("cellWebBrowserConfigSetViewRect2", {0, 0, 0}, 1.0);
+    // A NaN resolution.
+    s.w32(c + 60, 0x7FC00000);
+    estimate();
+    // The first config.
+    const u32 v1 = obj(24);
+    s.call("cellWebBrowserConfig", {0});
+    s.call("cellWebBrowserConfig", {v1});
+    s.call("cellWebBrowserConfigWithVer", {0, 7});
+    s.call("cellWebBrowserConfigWithVer", {v1, 0x10001});
+    s.call("cellWebBrowserConfigSetVersion", {0, 3});
+    s.call("cellWebBrowserConfigSetVersion", {v1, 0x10000});
+    s.call("cellWebBrowserConfigSetMimeSet", {v1, obj(30), 2});
+    s.call("cellWebBrowserConfigSetFunction", {0, 5});
+    s.call("cellWebBrowserConfigSetFunction", {v1, 0x1038});
+    for (const u64 v : {0ull, 1ull, 2ull, 5ull, 0xFFFFFFFDull}) s.call("cellWebBrowserConfigSetDisableTabs", {v1, v});
+    s.call("cellWebBrowserConfigSetDisableTabs", {0, 3});
+    s.call("cellWebBrowserConfigSetCustomExit", {v1, 0x1234});
+    s.call("cellWebBrowserConfigSetCustomExit", {0, 0x1234});
+    s.call("cellWebBrowserConfigSetHeapSize", {v1, 0x2000000});
+    s.call("cellWebBrowserConfigSetHeapSize", {0, 0x2000000});
+    s.call("cellWebBrowserConfigGetHeapSize", {v1});
+    s.call("cellWebBrowserConfigGetHeapSize", {0});
+    s.call("cellWebBrowserEstimate", {0});
+    s.call("cellWebBrowserEstimate", {v1});
+    s.call("cellWebBrowserConfigSetDisableTabs", {v1, 0x40});
+    s.call("cellWebBrowserEstimate", {v1});
+    s.call("cellWebBrowserConfigSetFunction", {v1, 0});
+    s.call("cellWebBrowserEstimate", {v1});
+    s.call("cellWebBrowserSetSystemCallbackUsrdata", {0x5555});
+    s.call("cellWebBrowserSetLocalContentsAdditionalTitleID", {0});
+    s.str(S(20), "NPWR00001");
+    s.call("cellWebBrowserSetLocalContentsAdditionalTitleID", {S(20)});
+    s.call("cellWebComponentCreate", {1, 2});
+    s.call("cellWebComponentCreateAsync", {1, 2});
+    s.call("cellWebComponentDestroy", {0x77});
+}
+
+// The web browser's requests to the system software (all refused there: its channels are closed), the memory checks
+// of the creates against a container, and the system's events through libsysutil's dispatcher.
+void script_web_requests(Script& s)
+{
+    strings(s);
+    s.start_channels();
+    const u32 status_cb = kDescs + 0x20, mime_cb = kDescs + 0x28, two_cb = kDescs + 0x30, one_cb = kDescs + 0x38;
+    build_recorder(s.base(), kCode + 0x200, status_cb, 1, 2);
+    build_recorder(s.base(), kCode + 0x280, mime_cb, 2, 3);
+    build_recorder(s.base(), kCode + 0x300, two_cb, 3, 2);
+    build_recorder(s.base(), kCode + 0x380, one_cb, 4, 1);
+    s.syscall(341, {obj(60), 0x8000000});  // a container for the browser
+    s.syscall(341, {obj(61), 0x200000});   // one too small
+    const u32 big = s.r32(obj(60)), small = s.r32(obj(61));
+    s.str(S(20), "http://www.example.com/");
+    const u32 url = S(20);
+    // Requests before the browser is set up.
+    s.call_void("cellWebBrowserDestroy", {}); // none made: r3 is libsysutil's stack
+    s.call("cellWebBrowserDestroy2", {});
+    s.call("cellWebBrowserShutdown", {});
+    s.call("cellWebBrowserActivate", {});
+    s.call("cellWebBrowserDeactivate", {}, 0.5);
+    s.call("cellWebBrowserNavigate2", {0});
+    s.call("cellWebBrowserNavigate2", {url});
+    s.call("cellWebBrowserUpdatePointerDisplayPos2", {u64{100} << 32 | 200});
+    s.call("cellWebBrowserWakeupWithGameExit", {0, 5});
+    s.call("cellWebBrowserWakeupWithGameExit", {url, 0xFFFFFFFF});
+    s.call("cellWebBrowserGetUsrdataOnGameExit", {0});
+    s.call("cellWebBrowserGetUsrdataOnGameExit", {one_cb});
+    // Set up, and the creates.
+    s.call("cellWebBrowserInitialize", {status_cb, small});
+    s.call("cellWebBrowserInitialize", {status_cb, 0xFFFFFFFF}); // the container kept
+    s.call("cellWebBrowserCreate", {url});                        // too little memory
+    s.call("cellWebBrowserCreate", {0});
+    const u32 v1 = obj(24), c = obj(0);
+    s.call_void("cellWebBrowserConfig", {v1});
+    s.call("cellWebBrowserCreateWithConfig", {url, v1});
+    s.call("cellWebBrowserCreateWithConfigFull", {0, v1});
+    s.call("cellWebBrowserCreateWithConfigFull", {url, 0});
+    s.call("cellWebBrowserConfig2", {c, 0x20000});
+    s.call("cellWebBrowserCreate2", {c, url});
+    s.call("cellWebBrowserCreate2", {c, 0});
+    s.call("cellWebBrowserCreate2", {obj(30), url}); // no version
+    s.w32(c + 64, 0x12345678);
+    s.call("cellWebBrowserCreate2", {c, url});       // no magic
+    s.call("cellWebBrowserConfig2", {c, 0x20000});
+    s.call("cellWebBrowserCreateRender2", {c, url, 1, 0});
+    s.call("cellWebBrowserInitialize", {status_cb, big});
+    s.call("cellWebBrowserConfigSetUnknownMIMETypeHook2", {c, mime_cb, 0x31});
+    s.call("cellWebBrowserConfigSetErrorHook2", {c, two_cb, 0x32});
+    s.call("cellWebBrowserConfigSetNotifyHook2", {c, two_cb, 0x34});
+    s.call("cellWebBrowserConfigSetViewCondition2", {c, 0x1E});
+    s.call("cellWebBrowserCreate2", {c, url}); // made (and refused by the system)
+    s.call("cellWebBrowserCreate2", {c, url}); // a second: busy
+    s.call("cellWebBrowserCreate", {url});
+    s.call("cellWebBrowserCreateWithRect2", {c, url, 0, 1, u64{5} << 32 | 6, u64{320} << 32 | 240}, 0.75);
+    s.call("cellWebBrowserDestroy", {}); // made: "destroyFullBrowser" sent
+    s.call("cellWebBrowserDestroy2", {});
+    // The system's events: "unloaded" clears the made flag.
+    s.web_event(1, 0x41);
+    s.call("cellWebBrowserSetSystemCallbackUsrdata", {0x42});
+    s.web_event(3, 0x43);
+    s.web_event(7, 0x44);
+    s.call("cellWebBrowserCreateWithRect2", {c, url, 1, 0, u64{5} << 32 | 6, u64{320} << 32 | 240}, 0.75);
+    s.web_event(7, 0x45);
+    s.call("cellWebBrowserCreateRenderWithRect2", {c, url, 1, 1, u64{1} << 32 | 2, u64{640} << 32 | 360}, 1.5);
+    s.web_event(7, 0x46);
+    s.call("cellWebBrowserConfigSetViewRect2", {c, u64{8} << 32 | 9, u64{800} << 32 | 600}, 0.5);
+    s.call("cellWebBrowserConfigSetViewCondition2", {c, 6});
+    s.call("cellWebBrowserCreate2", {c, url});
+    s.web_event(7, 0x47);
+    s.call("cellWebBrowserSetLocalContentsAdditionalTitleID", {S(21)});
+    s.call("cellWebBrowserCreateWithConfigFull", {url, v1});
+    s.web_event(7, 0x48);
+    s.call("cellWebBrowserCreate", {url}); // every hook cleared first
+    // The hooks' events read their data from the system: refused, nothing called.
+    s.call("cellWebBrowserConfigSetUnknownMIMETypeHook2", {c, mime_cb, 0x31});
+    s.call("cellWebBrowserConfigSetErrorHook2", {c, two_cb, 0x32});
+    s.call("cellWebBrowserConfigSetStatusHook2", {c, two_cb, 0x33});
+    s.call("cellWebBrowserConfigSetNotifyHook2", {c, two_cb, 0x34});
+    s.call("cellWebBrowserConfigSetRequestHook2", {c, mime_cb, 0x35});
+    for (const u64 kind : {1ull, 2ull, 3ull, 4ull, 5ull})
+        s.web_event(kind << 32 | 9, 0x50);
+    // Another kind calls its hook (6: none set; then one).
+    s.web_event(u64{6} << 32, 0x51);
+    s.w32(s.data(0x1FB54 + 8 * 6, sysutil::glob::web_hooks + 8 * 6), mime_cb);
+    s.w32(s.data(0x1FB54 + 8 * 6 + 4, sysutil::glob::web_hooks + 8 * 6 + 4), 0x66);
+    s.web_event(u64{6} << 32 | 2, 0x52);
+    s.web_event(u64{10} << 32, 0x53); // the usrdata on exit: the hook goes, the dispatcher too
+    s.web_event(u64{10} << 32, 0x54);
+    s.call("cellWebBrowserGetUsrdataOnGameExit", {one_cb});
+    s.web_event(4, 0x55); // shut down: the dispatcher, the hooks and the callback go
+    s.web_event(1, 0x56);
+    s.call("cellWebBrowserShutdown", {});
+    s.call("cellWebBrowserInitialize", {0, 0xFFFFFFFF});
+    s.web_event(1, 0x57); // no system callback
+}
+
+// libsysutil's other requests to the system software, and the output callbacks.
+void script_system(Script& s)
+{
+    strings(s);
+    s.start_channels();
+    for (u32 i = 0; i < 0x120; i++) s.base()[kFiles + i] = static_cast<u8>(i ^ 0x5A);
+    s.call("_cellSysutilGetSystemParamInt", {0x111, 0});
+    s.call("cellSysutilNotification", {kFiles});
+    s.call("cellSysutilNotification", {kFiles + 0x10});
+    s.call("cellSysutilGameDataAssignVmc", {2, 0});
+    s.call("cellSysutilGameDataAssignVmc", {0, 0});
+    s.call("cellSysutilGameDataAssignVmc", {1, S(14)});
+    std::memset(s.base() + obj(10), 'v', 127);
+    s.base()[obj(10) + 127] = 0;
+    s.call("cellSysutilGameDataAssignVmc", {1, obj(10)});
+    s.base()[obj(10) + 127] = 'v';
+    s.base()[obj(10) + 128] = 0;
+    s.call("cellSysutilGameDataAssignVmc", {0, obj(10)});
+    s.call("cellSysconfAbort", {});
+    s.call("cellSysconfAbort", {});
+    s.call("cellVideoOutDebugSetMonitorType", {1, 2});
+    s.call("cellVideoOutDebugSetMonitorType", {0xFFFFFFFF, 0});
+    // The AV chat, not loaded.
+    s.call("cellSysutilAvcShowPanel", {});
+    s.call("cellSysutilAvcHidePanel", {});
+    s.call("cellSysutilAvcSetVoiceMuting", {1});
+    s.call("cellSysutilAvcSetVideoMuting", {0});
+    // Loaded for video: the panel and the muting go to the system.
+    s.avc_loaded(2);
+    s.call("cellSysutilAvcShowPanel", {});
+    s.call("cellSysutilAvcHidePanel", {});
+    s.call("cellSysutilAvcSetVoiceMuting", {0x101});
+    s.call("cellSysutilAvcSetVideoMuting", {0});
+    // The outputs' callbacks.
+    s.call("cellVideoOutRegisterCallback", {0, 0x1111, 0x2222});
+    s.call("cellAudioOutRegisterCallback", {3, 0x3333, 0x4444});
+    s.call("cellVideoOutUnregisterCallback", {0});
+    s.call("cellVideoOutRegisterCallback", {5, 0x5555, 0x6666});
+    s.call("cellAudioOutUnregisterCallback", {9});
+    // libsysutil's unnamed exports: the AV chat's panel with a transition.
+    for (const u64 t : {5ull, 4ull, 0ull, 0xFFFFFFFFull}) s.call("cellSysutil_44F288A7", {t, 1});
+    // Base64, both ways.
+    const u32 text = kData + 0x1C00, back = kData + 0x1E00;
+    for (const u32 n : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 56u, 57u, 58u, 59u, 60u, 61u, 100u}) {
+        std::memset(s.base() + text, 0xCC, 0x200);
+        s.call("cellSysutil_987D910E", {kFiles, n, text});
+        std::memset(s.base() + back, 0xCC, 0x100);
+        s.call("cellSysutil_1D58430F", {text, 0x200, back});
+    }
+    s.str(text, "QUJD\r\nREVG");
+    s.call("cellSysutil_1D58430F", {text, 0x100, back});
+    s.call("cellSysutil_1D58430F", {text, 3, back}); // stops past `max` characters
+    s.str(text, "QU*D");
+    s.call("cellSysutil_1D58430F", {text, 0x100, back});
+    s.str(text, "=QUJD");
+    s.call("cellSysutil_1D58430F", {text, 0x100, back});
+    s.base()[text] = 0xC3;
+    s.call("cellSysutil_1D58430F", {text, 0x100, back});
+    // The save data's: its state (its lock made as the save data module's load makes it, libsysutil's code at 0x7E10,
+    // in both runs) and its packet.
+    s.internal_step(0x7E10, {1, 0xFFFF});
+    s.call("cellSysutil_340F280B", {});
+    s.call("cellSysutil_ADEF7C02", {1});
+    s.call("cellSysutil_ADEF7C02", {0});
+    s.call("cellSysutil_ADEF7C02", {0}); // FixedMemory 1 is taken now
+    s.call("cellSysutil_ADEF7C02", {1});
+}
+
+// The AV chat loaded for voice: its panel and video are refused, its voice's muting goes to the system.
+void script_avc_voice(Script& s)
+{
+    s.start_channels();
+    s.avc_loaded(1);
+    s.call("cellSysutilAvcShowPanel", {});
+    s.call("cellSysutilAvcHidePanel", {});
+    s.call("cellSysutilAvcSetVoiceMuting", {1});
+    s.call("cellSysutilAvcSetVideoMuting", {1});
+}
+
 } // namespace
+
+TEST_CASE("cellSysutil: the AV chat's requests for voice against libsysutil", "[hle][lle][sysutil]")
+{
+    compare_script("AV chat for voice", script_avc_voice);
+}
+
+TEST_CASE("cellSysutil web browser: configs and estimates against libsysutil", "[hle][lle][sysutil]")
+{
+    compare_script("web browser configs", script_web_configs);
+}
+
+TEST_CASE("cellSysutil web browser: requests and system events against libsysutil", "[hle][lle][sysutil]")
+{
+    compare_script("web browser requests", script_web_requests);
+}
+
+TEST_CASE("cellSysutil: requests to the system software and the output callbacks against libsysutil",
+    "[hle][lle][sysutil]")
+{
+    compare_script("system requests", script_system);
+}
 
 TEST_CASE("cellSysutil cxml: documents and their elements against libsysutil", "[hle][lle][sysutil]")
 {
@@ -1059,4 +1446,23 @@ TEST_CASE("cellSysutil: closed channels and a document round trip", "[hle][sysut
     CHECK(t.call(kFixedBegin, 0) == 0);
     t.call(kFixedEnd, 0);
     CHECK(t.call(kFixedBegin, 0) == m0);
+    t.call(kFixedEnd, 0);
+
+    // The system parameters pspocket's console has, through libsysutil's request function.
+    CHECK(t.call("_cellSysutilGetSystemParamInt", 0x111, kObj + 0x40) == 0);
+    CHECK(ps_read32(b, kObj + 0x40) == 1); // English (US)
+    CHECK(static_cast<u32>(t.call("_cellSysutilGetSystemParamInt", 0x113, kObj + 0x40)) == 0x8002b102);
+    CHECK(static_cast<u32>(t.call("_cellSysutilGetSystemParamInt", 0x1001, kObj + 0x40)) == 0x8002b102);
+    CHECK(static_cast<u32>(t.call("_cellSysutilGetSystemParamInt", 0x111, 0)) == 0x8002b102);
+    // The web browser: its config and estimate are libsysutil's; the system refuses the rest.
+    CHECK(t.call("cellWebBrowserConfig2", kObj + 0x80, 0x20000) == 0);
+    CHECK(ps_read32(b, kObj + 0x80 + 64) == 0xDEADBEEF);
+    CHECK(t.call("cellWebBrowserEstimate2", kObj + 0x80, kObj + 0x40) == 0);
+    CHECK(ps_read32(b, kObj + 0x40) == 0x5C00000); // 4 tabs of 4508877, 8 MB, 48 MB of heap, 19 MB: 92 MB
+    CHECK(static_cast<u32>(t.call("cellWebBrowserInitialize", 0, 0xFFFFFFFF)) == 0x8002b007);
+    CHECK(static_cast<u32>(t.call("cellWebBrowserCreate2", kObj + 0x80, kStr)) == 0x8002b901); // no container
+    CHECK(static_cast<u32>(t.call("cellWebBrowserNavigate2", kStr)) == 0x8002b007);
+    // The AV chat's panel needs it loaded.
+    CHECK(static_cast<u32>(t.call("cellSysutilAvcShowPanel")) == 0x8002b70a);
+    CHECK(static_cast<u32>(t.call("cellSysutilNotification", kFiles)) == 0x8002b007);
 }

@@ -1907,6 +1907,14 @@ void close_timed_msg_dialog()
 
 } // namespace
 
+bool sysutil_system_param_int(s32 id, s32& value)
+{
+    const IntParam* p = int_param(id);
+    if (!p) return false;
+    value = p->value;
+    return true;
+}
+
 s32 sysutil_send_event(u64 status, u64 param)
 {
     HleProcess* p = HleProcess::current();
@@ -1969,6 +1977,8 @@ void register_cellSysutil(Registry& r)
 {
     sysutil::register_cxml(r);
     sysutil::register_packets(r);
+    sysutil::register_web_browser(r);
+    sysutil::register_system(r);
     r.add("cellSysutil", {
         PS_HLE_FUNC(0x9D98AFA0, cellSysutilRegisterCallback),
         PS_HLE_FUNC(0x02FF3C1B, cellSysutilUnregisterCallback),

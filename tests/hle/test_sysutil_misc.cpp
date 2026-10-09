@@ -172,16 +172,13 @@ TEST_CASE("cellScreenShot, storage, sysconf, web browser, licence area, access p
     CHECK(e[1].r4 == 0x52);
     CHECK(a.call("cellSysconfBtGetDeviceList", 0) == r3_of_code(0x8002bb01));
 
-    // The web browser: 1 MB, INITIALIZING_FINISHED then SHUTDOWN_FINISHED to its system callback.
-    REQUIRE(a.call("cellWebBrowserEstimate2", 0, kOut) == 0);
-    CHECK(ps_read32(base, kOut) == 1024 * 1024);
-    CHECK(a.call("cellWebBrowserInitialize", kOpd, 0) == 0);
-    a.call("cellWebBrowserShutdown");
+    // The web browser is the system software's: libsysutil's requests to it answer as its closed channels do (D-534),
+    // and no system callback comes.
+    CHECK(a.call("cellWebBrowserEstimate2", 0, kOut) == r3_of_code(0x8002b902));
+    CHECK(a.call("cellWebBrowserInitialize", kOpd, 0) == r3_of_code(0x8002b007));
+    CHECK(a.call("cellWebBrowserShutdown") == r3_of_code(0x8002b007));
     check();
-    e = logged(base);
-    REQUIRE(e.size() == 4);
-    CHECK(e[2].r3 == 1);
-    CHECK(e[3].r3 == 4);
+    CHECK(logged(base).size() == 2);
 
     CHECK(a.call("cellSysutilGetLicenseArea") == 1); // A, RPCS3's default
     CHECK(a.call("cellSysutilApGetRequiredMemSize") == 1024 * 1024);

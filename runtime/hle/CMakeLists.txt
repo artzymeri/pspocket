@@ -34,6 +34,8 @@ add_library(pspocket_hle STATIC
     src/cellSysutil.cpp
     src/cellSysutilCxml.cpp
     src/cellSysutilPacket.cpp
+    src/cellSysutilSystem.cpp
+    src/cellSysutilWebBrowser.cpp
     src/cellVoice.cpp
     src/modules.cpp
     src/pad_script.cpp

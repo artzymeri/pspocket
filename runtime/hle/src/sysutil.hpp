@@ -46,4 +46,13 @@ enum class MsgDialogSource : u8 { CellMsgDialog, CellSaveData, CellGame, SceNp, 
 // cellMsgDialogAbort closes one. (cellMsgDialogOpen2's own dialogs are answered at once: cellSysutil.cpp.)
 s32 open_msg_dialog(MsgDialogSource source, u32 type, std::string_view message, u32 callback, u32 userdata);
 
+// Whether the AV chat is loaded (cellSysutilAvcLoadAsync, until its unload), and the media it was loaded for (1 voice,
+// 2 video; 1 before any load, as libsysutil starts): for libsysutil's panel and muting requests (D-534). In
+// sysutil_misc.cpp.
+bool sysutil_avc_loaded(u32& media);
+
+// pspocket's console's answer to an integer system parameter (cellSysutilGetSystemParamInt's table): false when it
+// has none. In cellSysutil.cpp.
+bool sysutil_system_param_int(s32 id, s32& value);
+
 } // namespace pspocket::hle

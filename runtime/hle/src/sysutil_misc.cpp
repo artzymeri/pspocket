@@ -1,8 +1,8 @@
 // The small sysutil libraries, as RPCS3 has them with no device, service or overlay behind them (D-183): user info,
-// screenshots, storage data, system settings, the web browser's setup, AV chat (cellSysutilAvc), the licence area,
+// screenshots, storage data, system settings, AV chat (cellSysutilAvc), the licence area,
 // the NP EULA, the access point, remote play, video upload, printing, the auth dialog, the cross controller and
 // cellGameExec. Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellUserInfo.cpp, cellScreenshot.cpp, cellStorage.cpp,
-// cellSysconf.cpp, cellWebBrowser.cpp, cellSysutilAvc.cpp, cellSysutilMisc.cpp, cellSysutilNpEula.cpp,
+// cellSysconf.cpp, cellSysutilAvc.cpp, cellSysutilMisc.cpp, cellSysutilNpEula.cpp,
 // cellSysutilAp.cpp, cellRemotePlay.cpp, cellVideoUpload.cpp, cellPrint.cpp, cellAuthDialog.cpp,
 // cellCrossController.cpp, cellGameExec.cpp. The functions RPCS3 leaves as stubs there are answered from
 // rpcs3_stubs.inc (D-182).
@@ -349,42 +349,6 @@ s32 cellSysconfBtGetDeviceList(PPUContext&, u32 device_list)
     return logged("cellSysconf", lv2::CELL_OK, call);
 }
 
-// ------------------------------------------------------------------------------------- cellSysutil: web browser
-
-// RPCS3's setup of the web browser (the browser itself is a stub there): 1 MB of memory, and the system callback
-// (status, userdata) hears INITIALIZING_FINISHED (1) and SHUTDOWN_FINISHED (4).
-struct BrowserState {
-    std::mutex mutex;
-    u32 system_cb = 0;
-};
-
-s32 cellWebBrowserEstimate2(PPUContext& ctx, u32 config, u32 mem_size)
-{
-    const std::string call = std::format("cellWebBrowserEstimate2({:#x}, {:#x})", config, mem_size);
-    if (mem_size) ps_write32(guest_base(ctx), mem_size, 1024 * 1024);
-    return logged(kSysutilChan, lv2::CELL_OK, call);
-}
-
-s32 cellWebBrowserInitialize(PPUContext&, u32 system_cb, u32 container)
-{
-    const std::string call = std::format("cellWebBrowserInitialize({:#x}, container {:#x})", system_cb, container);
-    BrowserState& b = state<BrowserState>();
-    {
-        std::lock_guard lock(b.mutex);
-        b.system_cb = system_cb;
-    }
-    if (system_cb) queue_callback(system_cb, {1, 0});
-    return logged(kSysutilChan, lv2::CELL_OK, call);
-}
-
-void cellWebBrowserShutdown(PPUContext&)
-{
-    BrowserState& b = state<BrowserState>();
-    std::lock_guard lock(b.mutex);
-    if (b.system_cb) queue_callback(b.system_cb, {4, 0});
-    PS_LOG_INFO(kSysutilChan, "cellWebBrowserShutdown()");
-}
-
 // ------------------------------------------------------------------------------------- cellSysutil: AV chat
 
 // RPCS3 avc_settings: one loaded AV chat, its callback(requestId, eventId, eventParam, userdata) told each request
@@ -400,6 +364,7 @@ struct AvcState {
     std::mutex mutex;
     u32 callback = 0, userdata = 0;
     u32 next_request = 0;
+    u32 media = 1; // the media of the last load (libsysutil's starts as voice, 1); its panel and video need video (2)
 };
 
 // A request: its ID written, the event to the callback at the next check (RPCS3 register_cb_call); the unload's event
@@ -444,6 +409,7 @@ s32 cellSysutilAvcLoadAsync(PPUContext& ctx, u32 func, u32 userdata, u32 contain
         if (a.callback) return logged(kSysutilChan, error(CELL_AVC_ERROR_ALREADY_INITIALIZED), call);
         a.callback = func;
         a.userdata = userdata;
+        a.media = media;
     }
     return avc_request(ctx, call, request_id, CELL_AVC_EVENT_LOAD_SUCCEEDED);
 }
@@ -1070,6 +1036,14 @@ s32 cellGameGetHomeLaunchOptionPath(PPUContext&, u32 common, u32 personal)
 
 } // namespace
 
+bool sysutil_avc_loaded(u32& media)
+{
+    AvcState& a = state<AvcState>();
+    std::lock_guard lock(a.mutex);
+    media = a.media;
+    return a.callback != 0;
+}
+
 void register_sysutil_misc(Registry& r)
 {
     r.add("cellUserInfo", {
@@ -1161,9 +1135,6 @@ void register_sysutil_misc(Registry& r)
         PS_HLE_FUNC(0x918288FB, cellStorageDataImport),
         PS_HLE_FUNC(0xABC3CD2C, cellStorageDataExport),
         PS_HLE_FUNC(0xB2B6CDD0, cellSysconfOpen),
-        PS_HLE_FUNC(0x6D087930, cellWebBrowserEstimate2),
-        PS_HLE_FUNC(0x749C9B5F, cellWebBrowserInitialize),
-        PS_HLE_FUNC(0x93CED48D, cellWebBrowserShutdown),
         PS_HLE_FUNC(0x15DF71ED, cellSysutilAvcLoadAsync),
         PS_HLE_FUNC(0x6C673F78, cellSysutilAvcUnloadAsync),
         PS_HLE_FUNC(0x17DBE8B3, cellSysutilAvcJoinRequest),

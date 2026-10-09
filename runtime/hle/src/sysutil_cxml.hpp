@@ -85,6 +85,8 @@ enum : u32 {
     channel = 0x00, // channel n's record at 24 * n: mutex at +4, conditions at +8..+20, the packet's ID at +24
     area_64k = 0x44, // the shared memory area of 64 KB pages and the count of shared memories in it
     area_1m = 0x4C,  // the same for 1 MB pages
+    savedata_state = 0xD4,  // libsysutil's save data state (0x1F96C)
+    savedata_memory = 0xD8, // the FixedMemory its save data's packet took (0x1F970)
     audio_out_cb = 0xE0, // cellAudioOutRegisterCallback's function and userdata (0x1F978)
     video_out_cb = 0xE8, // cellVideoOutRegisterCallback's (0x1F980)
     // The web browser's (0x1FB50): the memory container, eleven hooks {callback, userdata} (1 unknown MIME type, 2
