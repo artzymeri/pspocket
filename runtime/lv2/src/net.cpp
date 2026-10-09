@@ -2145,7 +2145,10 @@ s32 bnet_infoctl(PpuThread& t, s32 cmd, u32 arg)
 constexpr u32 kIoctlGetTestParam = 0xC210698E, kIoctlSetTestParam = 0x8210698F;
 constexpr u32 kIoctlGetUdpP2p = 0xC01050CE, kIoctlSetUdpP2p = 0x801050CD;
 
-// sys_net_bnet_ioctl: the test parameters; anything else is RPCS3's stub (CELL_OK, logged).
+// sys_net_bnet_ioctl: the test parameters; an interface's ioctls (BSD's group 'i': addresses, flags, media...) find no
+// interface, as there is none with no link (D-539): ENXIO, as BSD answers for a name it does not know (RPCS3 answers
+// CELL_OK and writes nothing, so a caller reads back whatever its buffer held); anything else is RPCS3's stub
+// (CELL_OK, logged).
 s32 bnet_ioctl(PpuThread& t, s32 s, u32 cmd, u32 arg)
 {
     const s32 r = [&]() -> s32 {
@@ -2154,6 +2157,11 @@ s32 bnet_ioctl(PpuThread& t, s32 s, u32 cmd, u32 arg)
         std::lock_guard lock(st.m);
         const bool test = cmd == kIoctlGetTestParam || cmd == kIoctlSetTestParam;
         const bool udp = cmd == kIoctlGetUdpP2p || cmd == kIoctlSetUdpP2p;
+        if (!test && ((cmd >> 8) & 0xFF) == 'i') {
+            if (!lookup(st, s)) return -SYS_NET_EBADF;
+            PS_LOG_INFO(kNetChan, "sys_net_bnet_ioctl(s {}, cmd {:#x}): no interface (no link): ENXIO", s, cmd);
+            return -SYS_NET_ENXIO;
+        }
         if (!test && !udp) {
             PS_LOG_INFO(kNetChan, "sys_net_bnet_ioctl(s {}, cmd {:#x}, arg {:#x}): CELL_OK (RPCS3's stub)", s, cmd, arg);
             return 0;

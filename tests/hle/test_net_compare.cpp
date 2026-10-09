@@ -532,6 +532,25 @@ std::vector<Op> resolver_script()
     s.push_back({"=", {kOut + 0x7018, 0x636F6D00}});
     s.push_back({"gethostbyname", {kOut + 0x7010}, kSign});
     s.push_back({"gethostbyname", {0}, kSign});
+    // gethostbyaddr.
+    s.push_back({"=", {kOut + 0xF00, 0x7F000001}});
+    s.push_back({"=", {kOut + 0xF10, 0xFE800000}});
+    s.push_back({"=", {kOut + 0xF20, 0}});
+    s.push_back({"=", {kOut + 0xF24, 0}});
+    s.push_back({"=", {kOut + 0xF28, 0xFFFF}});
+    s.push_back({"=", {kOut + 0xF2C, 0x7F000001}});
+    s.push_back({"gethostbyaddr", {0, 4, 2}, kSign});
+    s.push_back({"_sys_net_h_errno_loc", {}, kSign, kOut + 0xF80});
+    s.push_back({"gethostbyaddr", {kOut + 0xF00, 3, 2}, kSign});
+    s.push_back({"gethostbyaddr", {kOut + 0xF00, 4, 7}, kSign});
+    s.push_back({"gethostbyaddr", {kOut + 0xF10, 16, 24}, kSign});
+    s.push_back({"gethostbyaddr", {kOut + 0xF00, 4, 2}, kSign});
+    s.push_back({"gethostbyaddr", {kOut + 0xF20, 16, 24}, kSign});
+    s.push_back({"=", {kOut + 0xF40, 0x08080808}});
+    s.push_back({"gethostbyaddr", {kOut + 0xF40, 4, 2}, kSign});
+    s.push_back({"_sys_net_h_errno_loc", {}, kSign, kOut + 0xF84});
+    s.push_back({"=", {kOut + 0xF44, 0x7F000002}});
+    s.push_back({"gethostbyaddr", {kOut + 0xF44, 4, 2}, kSign});
     s.push_back({"pool", {}});
     s.push_back({"sys_net_finalize_network", {}});
     return s;
@@ -685,7 +704,69 @@ std::vector<Op> routes_script()
     return s;
 }
 
-// The netset calls and gethostbyaddr (D-539).
+// netset.c's configuration parser over many texts (D-539): every escape, quotes, comments, carriage returns, long
+// lines, a last line with no newline, each error, the keys and their values, the key values a close leaves.
+std::vector<Op> netset_parse_script()
+{
+    std::vector<Op> s;
+    init_param(s, kPool, kPoolSize, 0);
+    s.push_back({"sys_net_initialize_network_ex", {kParam}});
+    const u32 txt = kOut + 0x4000; // texts, 0x200 apart
+    const u32 ids = kOut + 0x7800;  // the IDs the opens answer
+    const std::vector<std::string> texts = {
+        "type nic\nmy_name pspocket\naddress 10.0.0.2\nnetmask 255.0.0.0\n",
+        "ssid \"my net\"\nhttp_proxy proxy:8080\nop_mode infra\nchannel 6\n",
+        "bssid \\(0011aabbccdd\\)\nscan_channel_list \\x01\\x02\\x0b\ncap_info \\101\\102\\7\\777\n",
+        "auth_wlan wpa key\\tvalue\\n end\nauth_8021x peap user pass extra\nsupported_rate \\(8284\\)8b\n",
+        "  # a comment\n\t\nkey value\r\nunknown_key x y z\n-dhcp\ndhcp\npppoe\n-pppoe\nmtu 1454\nmtu abc\nmtu\n-mtu\n",
+        "want.dns1_nego\nwant.dns2_nego\n-want.dns2_nego\ndhcp_host_name_null_terminated\ndhcp_host_name host\n",
+        "nameserver add 10.1.1.1\nnameserver 10.1.1.2\nsearch example.com other.org\nnameserver add 10.1.1.3\n",
+        "route add default gw 10.0.0.1\nroute add -net 10.2.0.0 netmask 255.255.0.0 gw 10.0.0.9 extra words\n",
+        "a b c d e f g\nvendor \\a\\b\\f\\n\\r\\t\\v\\q\\\\\\\"\nproduct \"quoted \\\"inner\\\" text\"\n",
+        "ipv6.addr fe80::1 64\nipversion 4\n-ipversion\n-route\nallow.auth pap\nlast_line_without_newline 1",
+        "phy_config auto\rmore\ndevice_type 1\nauth_name n\nauth_key k\n-ssid\nssid \"\"\npppoe_service_name s\npppoe_ac_name a\n",
+        "bssid \\(zz\\)\n",
+        "ssid \"unterminated\n",
+        "ssid \\(41\n",
+        "ssid \\)\n",
+        "ssid \\(41\\(42\\)\\)\n",
+        "ssid " + std::string(300, 'x') + "\n",
+        "\\101\\x41\\(41\\) 1\n",
+        "",
+    };
+    for (usize i = 0; i < texts.size(); i++) {
+        const u64 at = txt + 0x200 * static_cast<u64>(i);
+        put_str(s, static_cast<u32>(at), texts[i]);
+        s.push_back({"sys_netset_open", {at, 0, 0}, 0, ids + 4 * static_cast<u32>(i)});
+        s.push_back({"sys_netset_get_status", {(ids + 4 * static_cast<u32>(i)) | kDeref, kOut + 0x7A00}});
+        s.push_back({"pool", {}});
+    }
+    s.push_back({"sys_netset_open", {0, 0, 0}});
+    s.push_back({"sys_netset_get_status", {0, kOut + 0x7A80}});
+    // Closing the first leaves the second as the first netset: its key values are the ones get_key_value reads.
+    const u32 key = kOut + 0x7B00;
+    for (const char* k : {"http_proxy", "ssid", "bssid", "scan_channel_list", "supported_rate", "cap_info", "op_mode",
+             "channel", "auth_wlan_type", "auth_wlan_key", "auth_8021x_type", "auth_8021x_user", "auth_8021x_pass"}) {
+        put_str(s, key, k);
+        s.push_back({"sys_netset_get_key_value", {0, key, kOut + 0x7C00, 64, 1}});
+    }
+    s.push_back({"sys_netset_close", {ids | kDeref}});
+    for (const char* k : {"http_proxy", "ssid", "bssid", "op_mode", "channel"}) {
+        put_str(s, key, k);
+        s.push_back({"sys_netset_get_key_value", {0, key, kOut + 0x7C00, 64, 1}});
+        s.push_back({"sys_netset_get_key_value", {0, key, 0, 64, 1}});
+        s.push_back({"sys_netset_get_key_value", {0, key, kOut + 0x7C40, 4, 1}});
+        s.push_back({"sys_netset_get_key_value", {0, key, kOut + 0x7C80, 64, 0}});
+    }
+    s.push_back({"pool", {}});
+    for (u32 i = 1; i < texts.size(); i++) s.push_back({"sys_netset_close", {(ids + 4 * i) | kDeref}});
+    s.push_back({"sys_netset_get_status", {0, kOut + 0x7A80}});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_net_finalize_network", {}});
+    return s;
+}
+
+// The netset calls (D-539).
 std::vector<Op> netset_script()
 {
     std::vector<Op> s;
@@ -721,20 +802,17 @@ std::vector<Op> netset_script()
     s.push_back({"sys_netset_get_if_id", {(kOut + 0xDF0) | kDeref, 0, 1}});
     s.push_back({"sys_netset_close", {(kOut + 0xDF0) | kDeref}});
     s.push_back({"pool", {}});
-    // gethostbyaddr.
-    s.push_back({"=", {kOut + 0xF00, 0x7F000001}});
-    s.push_back({"=", {kOut + 0xF10, 0xFE800000}});
-    s.push_back({"=", {kOut + 0xF20, 0}});
-    s.push_back({"=", {kOut + 0xF24, 0}});
-    s.push_back({"=", {kOut + 0xF28, 0xFFFF}});
-    s.push_back({"=", {kOut + 0xF2C, 0x7F000001}});
-    s.push_back({"gethostbyaddr", {0, 4, 2}, kSign});
-    s.push_back({"_sys_net_h_errno_loc", {}, kSign, kOut + 0xF80});
-    s.push_back({"gethostbyaddr", {kOut + 0xF00, 3, 2}, kSign});
-    s.push_back({"gethostbyaddr", {kOut + 0xF00, 4, 7}, kSign});
-    s.push_back({"gethostbyaddr", {kOut + 0xF10, 16, 24}, kSign});
-    s.push_back({"gethostbyaddr", {kOut + 0xF00, 4, 2}, kSign});
-    s.push_back({"gethostbyaddr", {kOut + 0xF20, 16, 24}, kSign});
+    const u64 up = text(9, "type nic\naddress 192.168.1.5\nnetmask 255.255.255.0\nroute add default gw 192.168.1.1\n"
+                           "nameserver add 192.168.1.1\n");
+    s.push_back({"sys_netset_open", {up, 0, 0}, kSign, kOut + 0xDF0});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_netset_if_up", {(kOut + 0xDF0) | kDeref, 0x1234, 0}});
+    s.push_back({"sys_netset_get_status", {(kOut + 0xDF0) | kDeref, kOut + 0xD00}});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_netset_if_down", {(kOut + 0xDF0) | kDeref, 0, 0}});
+    s.push_back({"sys_netset_get_status", {(kOut + 0xDF0) | kDeref, kOut + 0xD80}});
+    s.push_back({"sys_netset_close", {(kOut + 0xDF0) | kDeref}});
+    s.push_back({"pool", {}});
     s.push_back({"pool", {}});
     s.push_back({"sys_net_finalize_network", {}});
     return s;
@@ -756,7 +834,14 @@ TEST_CASE("sys_net against libnet: routes and interfaces", "[hle][lle][net]")
     compare(*flash, routes_script(), "routes");
 }
 
-TEST_CASE("sys_net against libnet: netsets and gethostbyaddr", "[.][hle][lle][net]")
+TEST_CASE("sys_net against libnet: netset configurations", "[hle][lle][net]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, netset_parse_script(), "netset parser");
+}
+
+TEST_CASE("sys_net against libnet: netsets", "[hle][lle][net]")
 {
     const std::optional<std::string> flash = test_dev_flash();
     if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");

@@ -74,6 +74,8 @@ constexpr u32 kDataSize = 0x1000;
 constexpr u32 kTagMisc = kCtxSize;           // "misc.c"
 constexpr u32 kTagGetifaddrs = kCtxSize + 8; // "getifaddrs.c"
 constexpr u32 kTagNetset = kCtxSize + 24;    // "netset.c"
+constexpr u32 kStrLo0 = kCtxSize + 40;       // "lo0", "127.0.0.1", "255.0.0.0", "pppoe0": netset.c's constants
+constexpr u32 kStrLoopback = kCtxSize + 48, kStrLoopMask = kCtxSize + 64, kStrPppoe = kCtxSize + 80;
 
 // ------------------------------------------------------------------------------------------------- libnet's state
 
@@ -91,6 +93,10 @@ struct Libnet {
     // sys_net_set_lib_name_server), the routing messages' sequence number.
     u32 lib_name_servers = 0;
     u32 route_seq = 0;
+    // The netsets (sys_netset_open), most recent last, the next ID; how many are up (if_up), PPPoE links, whether lo0
+    // was set up; the configuration values sys_netset_get_key_value reads (the first netset's).
+    u32 sets_head = 0, sets_tail = 0, next_set = 1, sets_up = 0, pppoe_up = 0, loopback_up = 0;
+    std::array<u32, 13> keys{};
 };
 
 Libnet& libnet() { return HleProcess::current()->state<Libnet>(); }
@@ -121,6 +127,10 @@ u32 data(PPUContext& ctx)
         std::memcpy(gb(ctx) + n.data + kTagMisc, "misc.c", 7);
         std::memcpy(gb(ctx) + n.data + kTagGetifaddrs, "getifaddrs.c", 13);
         std::memcpy(gb(ctx) + n.data + kTagNetset, "netset.c", 9);
+        std::memcpy(gb(ctx) + n.data + kStrLo0, "lo0", 4);
+        std::memcpy(gb(ctx) + n.data + kStrLoopback, "127.0.0.1", 10);
+        std::memcpy(gb(ctx) + n.data + kStrLoopMask, "255.0.0.0", 10);
+        std::memcpy(gb(ctx) + n.data + kStrPppoe, "pppoe0", 7);
     }
     return n.data;
 }
@@ -2412,6 +2422,590 @@ s32 sys_net_if_ctl(PPUContext& ctx, s32 index, s32 cmd, u32 buf, s32 len)
     return einval(); // (none listed: getifaddrs stops on one)
 }
 
+// ------------------------------------------------------------------------------------------------- netsets
+
+// A netset (netset.c, 244 bytes in the pool): +0 next, +4 previous, +8 its ID, +0xC if_up's timeout (ms), +0x10 busy
+// in if_up, +0x14 state, +0x18 status, then its configuration: strings in the pool at the offsets of libnet's key table
+// (kNetsetKeys), the flags dhcp (+0x50), dhcp_host_name_null_terminated (+0x51), want.dns1_nego (+0x70),
+// want.dns2_nego (+0x71) and pppoe (+0x74), mtu (+0x80), and binary copies of escaped values with their lengths (bssid
+// +0xA4/+0xA8, scan_channel_list +0xB0/+0xB4, supported_rate +0xBC/+0xC0, cap_info +0xC8/+0xCC, auth_wlan's key
+// +0xE0/+0xE4).
+namespace ns {
+constexpr u32 next = 0, prev = 4, id = 8, timeout = 0xC, busy = 0x10, state = 0x14, status = 0x18, type = 0x20,
+              resolv = 0x2C, ifname = 0x3C, dhcp = 0x50, pppoe = 0x74, size = 244;
+}
+
+// libnet's key table: each configuration key's place in a netset (also the order netset.c frees them in).
+constexpr std::pair<u32, std::string_view> kNetsetKeys[] = {
+    {0x1C, "my_name"}, {0x20, "type"}, {0x24, "address"}, {0x28, "netmask"}, {0x30, "search"},
+    {0x34, "nameserver"}, {0x2C, "resolv_conf"}, {0x38, "route"}, {0x40, "vendor"}, {0x44, "product"},
+    {0x48, "phy_config"}, {0x4C, "dhcp_host_name"}, {0x54, "http_proxy"}, {0x58, "device_type"}, {0x5C, "auth_name"},
+    {0x60, "auth_key"}, {0x64, "allow.auth"}, {0x78, "pppoe_service_name"}, {0x7C, "pppoe_ac_name"},
+    {0x84, "ipversion"}, {0x88, "ipv6.addr"}, {0x8C, "ssid"}, {0xA0, "bssid"}, {0xAC, "scan_channel_list"},
+    {0xB8, "supported_rate"}, {0xC4, "cap_info"}, {0xD0, "op_mode"}, {0xD4, "channel"}, {0xD8, "auth_wlan_type"},
+    {0xDC, "auth_wlan_key"}, {0xE8, "auth_8021x_type"}, {0xEC, "auth_8021x_user"}, {0xF0, "auth_8021x_pass"}};
+
+// The values sys_netset_get_key_value answers (netset.c's statics: the first netset's, copied when one closes or comes
+// up), and where each comes from in a netset.
+constexpr std::array<std::string_view, 13> kKeyNames = {"http_proxy", "ssid", "bssid", "scan_channel_list",
+    "supported_rate", "cap_info", "op_mode", "channel", "auth_wlan_type", "auth_wlan_key", "auth_8021x_type",
+    "auth_8021x_user", "auth_8021x_pass"};
+constexpr std::array<u32, 13> kKeyFields = {0x54, 0x8C, 0xA0, 0xAC, 0xB8, 0xC4, 0xD0, 0xD4, 0xD8, 0xDC, 0xE8, 0xEC, 0xF0};
+
+// libnet's strdup (misc.c: the pool, line 362): 0 when the pool refuses.
+u32 net_strdup(PPUContext& ctx, u32 text)
+{
+    u8* b = gb(ctx);
+    const std::string t = guest_str(ctx, text, "strdup").value_or("");
+    const u32 p = net_malloc(ctx, static_cast<u32>(t.size()) + 1, data(ctx) + kTagMisc, 362);
+    if (p) std::memcpy(b + p, t.c_str(), t.size() + 1);
+    return p;
+}
+
+// netset.c's value replacement (libnet f_1cab0): the old string freed, a copy of the new one (none: 0).
+u32 replace_value(PPUContext& ctx, u32 old, u32 text)
+{
+    if (old) net_free(ctx, old);
+    return text ? net_strdup(ctx, text) : 0;
+}
+
+// ... and of a binary value (f_1cb0c): `len` bytes copied (netset.c, line 836); with no data or length, a string.
+u32 replace_bytes(PPUContext& ctx, u32 old, u32 bytes, s32 len)
+{
+    if (!len || !bytes) return replace_value(ctx, old, bytes);
+    if (old) net_free(ctx, old);
+    const u32 p = net_malloc(ctx, static_cast<u32>(len), data(ctx) + kTagNetset, 836);
+    if (p) std::memmove(gb(ctx) + p, gb(ctx) + bytes, static_cast<u32>(len));
+    return p;
+}
+
+// A netset freed (f_171b0): its values in the key table's order, then itself (the binary copies are not freed: libnet
+// leaks them).
+void free_netset(PPUContext& ctx, u32 set)
+{
+    u8* b = gb(ctx);
+    for (const auto& [off, name] : kNetsetKeys) net_free(ctx, r32(b, set + off));
+    net_free(ctx, set);
+}
+
+// The netset with this ID (f_17580), or 0 (noted: 5, line 1084; errno EINVAL).
+u32 find_netset(PPUContext& ctx, u32 id)
+{
+    u8* b = gb(ctx);
+    for (u32 set = libnet().sets_head; set; set = r32(b, set + ns::next))
+        if (r32(b, set + ns::id) == id) return set;
+    set_report(ctx, 5, 1084);
+    set_errno(ctx, SYS_NET_EINVAL);
+    return 0;
+}
+
+s32 errno_negated(PPUContext& ctx) { return -static_cast<s32>(r32(gb(ctx), context(ctx) + kCtxErrno)); }
+
+// libnet's sscanf(text, "%d", out) (f_dc2c): the value written as the digits come (decimal; 0 with none, no sign).
+void scan_decimal(PPUContext& ctx, u32 text, u32 out)
+{
+    u8* b = gb(ctx);
+    w32(b, out, 0);
+    const std::string t = guest_str(ctx, text, "sscanf").value_or("");
+    for (const char ch : t) {
+        if (!is_digit(static_cast<u8>(ch))) break;
+        w32(b, out, r32(b, out) * 10 + static_cast<u32>(ch - '0'));
+    }
+}
+
+// The hex digit at c (libnet's ctype: digits, a-f, A-F), or -1.
+s32 hex_digit(u8 c)
+{
+    if (is_digit(c)) return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 87;
+    if (c >= 'A' && c <= 'F') return c - 55;
+    return -1;
+}
+
+// sys_netset_open's parser (f_1cbc8): the text's lines, each up to five tokens (white space between them; '#' or '\r'
+// where a token would start ends the line; a line the text's end cuts is dropped). A token takes "quoted" spans, and
+// escapes: \ooo (octal, up to three digits), \xHH, \a \b \f \n \r \t \v, \( ... \) (hex byte pairs), any other
+// character as itself; bytes from escapes are counted per token (the length of a binary value). Its 264-byte state in
+// the pool (+0 the cursor, +4 the tokens, +260 where the next byte goes) holds at most 256 bytes of a line's tokens.
+// Each line's first token names a key ('-' first: clear it): dhcp, dhcp_host_name_null_terminated, pppoe,
+// want.dns1_nego, want.dns2_nego (flags), mtu (a number), op_mode, channel (strings), auth_wlan (type, key and its
+// bytes), bssid, scan_channel_list, supported_rate, cap_info (a string and its bytes), auth_8021x (type, user,
+// password), or a key of the table: search and nameserver lines go into the resolver text (+0x2C), route and ipv6.addr
+// lines into their own text, others take their first argument. Unknown keys are skipped. The new netset's ID, or
+// -errno.
+s32 netset_parse(PPUContext& ctx, u32 text)
+{
+    u8* b = gb(ctx);
+    Libnet& n = libnet();
+    const u32 st = netset_malloc(ctx, 264, 1048);
+    if (!st) return errno_negated(ctx);
+    w32(b, st, text);
+    if (!text) {
+        set_report(ctx, 26, 901);
+        set_errno(ctx, SYS_NET_EINVAL);
+        const s32 r = errno_negated(ctx);
+        net_free(ctx, st);
+        return r;
+    }
+    const u32 set = netset_malloc(ctx, ns::size, 905);
+    if (!set) {
+        const s32 r = errno_negated(ctx);
+        net_free(ctx, st);
+        return r;
+    }
+    std::memset(b + set, 0, ns::size);
+    const auto t = guest_str(ctx, text, "sys_netset_open: text");
+    const u32 text_end = text + static_cast<u32>(t ? t->size() : 0); // the NUL
+    const auto ch = [&](u32 a) -> u8 { return a <= text_end ? b[a] : u8{0}; };
+    u32 cur = text;
+    const u32 buf = st + 4, buf_end = st + 260;
+    u32 wp = buf;
+    const auto save = [&]() {
+        w32(b, st, cur);
+        w32(b, st + 260, wp);
+    };
+    const auto fail = [&](u32 error, u32 line) {
+        save();
+        set_report(ctx, error, line);
+        set_errno(ctx, SYS_NET_EINVAL);
+        free_netset(ctx, set);
+        const s32 r = errno_negated(ctx);
+        net_free(ctx, st);
+        return r;
+    };
+    std::array<u32, 5> tok{};
+    std::array<s32, 5> counts{};
+    for (;;) { // a line
+        wp = buf;
+        u32 count = 0;
+        counts = {};
+        bool line_done = false; // the line's tokens are complete: process them
+        while (!line_done) {    // a token
+            tok[count] = wp;
+            counts[count] = 0;
+            u8 c = ch(cur);
+            if (c == 0) { // the text's end: the netset is made (this line's tokens are dropped)
+                save();
+                w32(b, set + ns::id, n.next_set++);
+                w32(b, set + ns::prev, n.sets_tail);
+                if (n.sets_tail) w32(b, n.sets_tail + ns::next, set);
+                else n.sets_head = set;
+                w32(b, set + ns::next, 0);
+                n.sets_tail = set;
+                const s32 id = static_cast<s32>(r32(b, set + ns::id));
+                net_free(ctx, st);
+                return id;
+            }
+            const auto skip_line = [&]() { // from the character at cur
+                for (;;) {
+                    cur++;
+                    const u8 d = ch(cur);
+                    if (d == 0) return;
+                    if (d == '\n') {
+                        cur++;
+                        return;
+                    }
+                }
+            };
+            bool start = false;
+            if (c == '\n') {
+                cur++;
+            } else if (c == '#') {
+                skip_line();
+            } else if (is_space(c)) {
+                if (c == '\r') {
+                    skip_line();
+                } else {
+                    for (;;) {
+                        cur++;
+                        const u8 d = ch(cur);
+                        if (d == '#' || d == '\r') {
+                            skip_line();
+                            break;
+                        }
+                        if (d == 0 || !is_space(d)) {
+                            start = true;
+                            break;
+                        }
+                        if (d == '\n') {
+                            cur++;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                start = true;
+            }
+            if (!start) { // the line ended: its tokens, if any
+                if (count >= 1) line_done = true;
+                else {
+                    wp = buf;
+                    counts = {};
+                }
+                if (!line_done) continue;
+                break;
+            }
+            // A token from cur.
+            bool quote = false, hex = false;
+            u8 last = 0;
+            const auto store = [&](u8 v) -> bool {
+                if (wp >= buf_end) return false;
+                b[wp++] = v;
+                return true;
+            };
+            const auto hex_pair = [&]() { // up to two hex digits at cur
+                u32 v = 0;
+                for (u32 k = 0; k < 2; k++) {
+                    const s32 d = hex_digit(ch(cur));
+                    if (d < 0) break;
+                    v = v * 16 + static_cast<u32>(d);
+                    cur++;
+                }
+                return static_cast<u8>(v);
+            };
+            for (;;) {
+                c = ch(cur);
+                cur++;
+                last = c;
+                if (c == 0 || c == '\n') break;
+                if (!quote && is_space(c)) break;
+                if (c == '"') {
+                    quote = !quote;
+                    continue;
+                }
+                if (c == '\r') continue;
+                u8 v = c;
+                bool escaped = false;
+                if (c == '\\') {
+                    const u8 e = ch(cur);
+                    if (static_cast<u8>(e - '0') <= 7) {
+                        u32 o = static_cast<u32>(e - '0');
+                        cur++;
+                        for (u32 k = 0; k < 2 && static_cast<u8>(ch(cur) - '0') <= 7; k++) o = o * 8 + static_cast<u32>(ch(cur++) - '0');
+                        v = static_cast<u8>(o);
+                    } else if (e == 'x' || e == 'X') {
+                        cur++;
+                        v = hex_pair();
+                    } else {
+                        cur++;
+                        if (e == '(') {
+                            if (hex) return fail(28, 780);
+                            hex = true;
+                            continue;
+                        }
+                        if (e == ')') {
+                            if (!hex) return fail(28, 787);
+                            hex = false;
+                            continue;
+                        }
+                        switch (e) {
+                        case 'a': v = 7; break;
+                        case 'b': v = 8; break;
+                        case 'f': v = 12; break;
+                        case 'n': v = 10; break;
+                        case 'r': v = 13; break;
+                        case 't': v = 9; break;
+                        case 'v': v = 11; break;
+                        default: v = e; break;
+                        }
+                    }
+                    escaped = true;
+                } else if (hex) {
+                    cur--;
+                    v = hex_pair();
+                    escaped = true;
+                }
+                if (escaped) counts[count]++;
+                if (!store(v)) return fail(20, 750);
+            }
+            if ((last == 0 || last == '\n') && quote) return fail(21, 799);
+            if (hex) return fail(28, 803);
+            if (!store(0)) return fail(20, 809);
+            if (last == 0 || last == '\n') cur--;
+            if (count == 4) {
+                count = 5;
+                line_done = true;
+            } else {
+                count++;
+            }
+        }
+        // The line's key.
+        std::array<std::string, 5> words;
+        for (u32 i = 0; i < count; i++) words[i] = guest_str(ctx, tok[i], "netset token").value_or("");
+        const bool neg = !words[0].empty() && words[0][0] == '-';
+        const std::string key = neg ? words[0].substr(1) : words[0];
+        const auto flag = [&](u32 off) { b[set + off] = neg ? 0 : 1; };
+        const auto field = [&](u32 off) { return r32(b, set + off); };
+        const auto put = [&](u32 off, u32 v) { w32(b, set + off, v); };
+        const u32 arg1 = (neg || count == 1) ? 0 : tok[1];
+        const auto bytes_value = [&](u32 off) { // a string, its bytes (+4) and their count (+8)
+            put(off, replace_value(ctx, field(off), arg1));
+            put(off + 4, replace_bytes(ctx, field(off + 4), arg1, counts[1]));
+            put(off + 8, static_cast<u32>(counts[1]));
+        };
+        if (key == "dhcp") flag(0x50);
+        else if (key == "dhcp_host_name_null_terminated") flag(0x51);
+        else if (key == "pppoe") flag(0x74);
+        else if (key == "mtu") {
+            if (neg) put(0x80, 0);
+            else if (count != 1) scan_decimal(ctx, tok[1], set + 0x80);
+        } else if (key == "want.dns1_nego") flag(0x70);
+        else if (key == "want.dns2_nego") flag(0x71);
+        else if (key == "op_mode") put(0xD0, replace_value(ctx, field(0xD0), arg1));
+        else if (key == "channel") put(0xD4, replace_value(ctx, field(0xD4), arg1));
+        else if (key == "auth_wlan") {
+            put(0xD8, replace_value(ctx, field(0xD8), arg1));
+            const u32 arg2 = (neg || count <= 2) ? 0 : tok[2];
+            put(0xDC, replace_value(ctx, field(0xDC), arg2));
+            put(0xE0, replace_bytes(ctx, field(0xE0), arg2, counts[2]));
+            put(0xE4, static_cast<u32>(counts[2]));
+        } else if (key == "bssid") bytes_value(0xA0);
+        else if (key == "scan_channel_list") bytes_value(0xAC);
+        else if (key == "supported_rate") bytes_value(0xB8);
+        else if (key == "cap_info") bytes_value(0xC4);
+        else if (key == "auth_8021x") {
+            put(0xE8, replace_value(ctx, field(0xE8), arg1));
+            put(0xEC, replace_value(ctx, field(0xEC), (neg || count <= 2) ? 0 : tok[2]));
+            put(0xF0, replace_value(ctx, field(0xF0), (neg || count <= 3) ? 0 : tok[3]));
+        } else {
+            for (const auto& [off, name] : kNetsetKeys) {
+                if (name != key) continue;
+                std::vector<std::string> line(words.begin(), words.begin() + count);
+                if (neg) put(off, replace_value(ctx, field(off), 0));
+                else if (key == "search" || key == "nameserver") put(ns::resolv, add_line(ctx, field(ns::resolv), line));
+                else if (key == "route" || key == "ipv6.addr") put(off, add_line(ctx, field(off), line));
+                else if (count != 1) put(off, replace_value(ctx, field(off), tok[1]));
+                break;
+            }
+        }
+    }
+}
+
+// libnet's sys_netset_* wrappers: the call inside the thread's context (an aborted one answers its error), a negative
+// result's errno kept and returned as SYS_NET_ERROR_*.
+template <class F>
+s32 netset_call(PPUContext& ctx, F&& inner)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    if (r32(b, c + kCtxAborted)) {
+        const s32 r = -static_cast<s32>(r32(b, c + kCtxErrno));
+        return r >= 0 ? r : failure(ctx, r);
+    }
+    w32(b, c + kCtxInCall, 1);
+    const s32 r = inner();
+    w32(b, c + kCtxInCall, 0);
+    return r >= 0 ? r : failure(ctx, r);
+}
+
+s32 sys_netset_open(PPUContext& ctx, u32 text, u32, u32)
+{
+    return netset_call(ctx, [&] { return netset_parse(ctx, text); });
+}
+
+// sys_netset_close(id): the netset unlinked and freed; with none left lv2's resolver configuration is cleared and the
+// key values with it, else the key values are the first netset's.
+s32 sys_netset_close(PPUContext& ctx, s32 id)
+{
+    return netset_call(ctx, [&]() -> s32 {
+        u8* b = gb(ctx);
+        Libnet& n = libnet();
+        const u32 set = find_netset(ctx, static_cast<u32>(id));
+        if (!set) return errno_negated(ctx);
+        const u32 next = r32(b, set + ns::next), prev = r32(b, set + ns::prev);
+        if (next) w32(b, next + ns::prev, prev);
+        else n.sets_tail = prev;
+        if (prev) w32(b, prev + ns::next, next);
+        else n.sets_head = next;
+        free_netset(ctx, set);
+        if (!n.sets_head) {
+            set_resolv_conf(ctx, 0);
+            n.keys = {};
+            return 0;
+        }
+        for (usize k = 0; k < n.keys.size(); k++) n.keys[k] = r32(b, n.sets_head + kKeyFields[k]);
+        return 0;
+    });
+}
+
+// sys_netset_abort(id): if_up's wait cut short (its timeout 0), then a wait (100 ms at a time) until it has returned.
+s32 sys_netset_abort(PPUContext& ctx, s32 id, s32)
+{
+    return netset_call(ctx, [&]() -> s32 {
+        u8* b = gb(ctx);
+        const u32 set = find_netset(ctx, static_cast<u32>(id));
+        if (!set) return errno_negated(ctx);
+        u32 busy = r32(b, set + ns::busy);
+        w32(b, set + ns::timeout, 0);
+        while (busy) {
+            _sys_net_lib_usleep(ctx, 100000);
+            busy = r32(b, set + ns::busy);
+        }
+        return 0;
+    });
+}
+
+// sys_netset_get_status(id, out): the thread's last netset.c failure (what, line, its three arguments) in a 0x5C-byte
+// report, and with an ID that netset's state (+0x34) and status (+0x38).
+s32 sys_netset_get_status(PPUContext& ctx, s32 id, u32 out)
+{
+    return netset_call(ctx, [&]() -> s32 {
+        u8* b = gb(ctx);
+        if (!usable(ctx, out, 0x5C, "sys_netset_get_status: out")) return errno_negated(ctx);
+        const u32 c = context(ctx);
+        std::memset(b + out, 0, 0x5C);
+        w32(b, out, r32(b, c + kCtxSetError));
+        w32(b, out + 8, r32(b, c + kCtxSetArg1));
+        w32(b, out + 12, r32(b, c + kCtxSetArg2));
+        w32(b, out + 16, r32(b, c + kCtxSetArg3));
+        w32(b, out + 4, r32(b, c + kCtxSetLine));
+        if (!id) return 0;
+        const u32 set = find_netset(ctx, static_cast<u32>(id));
+        if (!set) return errno_negated(ctx);
+        w32(b, out + 0x34, r32(b, set + ns::state));
+        w32(b, out + 0x38, r32(b, set + ns::status));
+        return 0;
+    });
+}
+
+// sys_netset_get_key_value(0, key, out, size, n): a configuration value (kKeyNames) copied out (1) when there is one
+// and it fits (else EINVAL), 0 without one (or n below 1); with no out, whether there is one. Only ID 0 (EINVAL, noted
+// 5 line 2497, otherwise; an unknown key: 2, line 2527).
+s32 sys_netset_get_key_value(PPUContext& ctx, s32 id, u32 key, u32 out, u32 size, s32 count)
+{
+    return netset_call(ctx, [&]() -> s32 {
+        u8* b = gb(ctx);
+        const auto einval = [&](u32 error, u32 line) {
+            if (error) set_report(ctx, error, line);
+            set_errno(ctx, SYS_NET_EINVAL);
+            return errno_negated(ctx);
+        };
+        if (id) return einval(5, 2497);
+        const std::string k = guest_str(ctx, key, "sys_netset_get_key_value: key").value_or("");
+        usize i = 0;
+        while (i < kKeyNames.size() && kKeyNames[i] != k) i++;
+        if (i == kKeyNames.size()) return einval(2, 2527);
+        const u32 v = libnet().keys[i];
+        if (!out) return v != 0 ? 1 : 0;
+        if (count < 1 || !v) return 0;
+        const std::string value = guest_str(ctx, v, "key value").value_or("");
+        if (size < value.size() + 1) return einval(0, 0);
+        if (!usable(ctx, out, static_cast<u32>(value.size()) + 1, "sys_netset_get_key_value: out")) return errno_negated(ctx);
+        std::memcpy(b + out, value.c_str(), value.size() + 1);
+        return 1;
+    });
+}
+
+// sys_netset_get_if_id(id, name, flags): the index of the interface (among those with an IPv4 address) a netset's
+// interface (flags 1) and the name (flags 2) agree on; with no link lv2 lists none: EINVAL.
+s32 sys_netset_get_if_id(PPUContext& ctx, s32 id, u32, u32 flags)
+{
+    return netset_call(ctx, [&]() -> s32 {
+        if ((flags & 1) && !find_netset(ctx, static_cast<u32>(id))) return errno_negated(ctx);
+        StackVar ifap(ctx, gb(ctx), 8);
+        if (interfaces(ctx, ifap.addr()) == 0) set_errno(ctx, SYS_NET_EINVAL); // (getifaddrs stops on any interface)
+        return errno_negated(ctx);
+    });
+}
+
+// What lv2 would have to answer for these paths to go on: with no link it has no interface (D-539).
+[[noreturn]] void interface_answered(std::string_view fn, std::string_view name)
+{
+    PS_FATAL(kChan, "{}: lv2 answered an ioctl on {}; with no link it has no interface (D-523, D-539)", fn, name);
+}
+
+// libnet f_19a60: an interface's flags read and changed (up, or with -1 down) through ioctls; -1 with no name (noted
+// 25, line 556; EINVAL) or when lv2 refuses (with no link: ENXIO).
+s32 interface_flags(PPUContext& ctx, u32 name, std::string_view fn)
+{
+    u8* b = gb(ctx);
+    if (!name) {
+        set_report(ctx, 25, 556);
+        set_errno(ctx, SYS_NET_EINVAL);
+        return -1;
+    }
+    StackVar ifr(ctx, b, 40);
+    const std::string n = guest_str(ctx, name, "interface name").value_or("");
+    std::memcpy(b + ifr.addr(), n.c_str(), std::min<usize>(n.size(), 39));
+    const s32 so = netset_socket(ctx, 2, 2, 0);
+    if (so < 0) return -1;
+    if (netset_ioctl(ctx, so, 0xC0206911, ifr.addr()) >= 0) interface_answered(fn, n);
+    socketclose(ctx, so);
+    return -1;
+}
+
+// The DHCP client's stop for an interface (f_152dc): pspocket's never starts (its first step, the interface's index,
+// finds none with no link): not found (noted 25, line 11238; EINVAL), -1.
+s32 dhcp_stop(PPUContext& ctx)
+{
+    set_report(ctx, 25, 11238);
+    set_errno(ctx, SYS_NET_EINVAL);
+    return -1;
+}
+
+// The wireless link's teardown (f_c168): the chip told (lv2's eurus command 4151, 13 bytes); 0 or -70.
+s32 wireless_down(PPUContext& ctx)
+{
+    StackVar block(ctx, gb(ctx), 16);
+    return net_call(ctx, 726, {4151, block.addr(), 13}) >= 0 ? 0 : -70;
+}
+
+// sys_netset_if_up(id, timeout_ms): a netset's interface brought up (netset.c f_1bb8c): the first one sets lo0 up
+// (127.0.0.1/8) before anything else, which lv2 with no link refuses (ENXIO): the netset's state goes back to 0,
+// status 9, and that error (the wireless link told when its type is wlan).
+s32 sys_netset_if_up(PPUContext& ctx, s32 id, s32 timeout, s32)
+{
+    return netset_call(ctx, [&]() -> s32 {
+        u8* b = gb(ctx);
+        Libnet& n = libnet();
+        const u32 set = find_netset(ctx, static_cast<u32>(id));
+        if (!set) return errno_negated(ctx);
+        if (r32(b, set + ns::state)) return 0;
+        w32(b, set + ns::status, 3);
+        w32(b, set + ns::state, 2);
+        w32(b, set + ns::timeout, static_cast<u32>(timeout));
+        w32(b, set + ns::busy, 1);
+        if (++n.sets_up != 1 || n.loopback_up) interface_answered("sys_netset_if_up", "lo0");
+        const u32 d = data(ctx);
+        if (interface_address(ctx, d + kStrLo0, d + kStrLoopback, d + kStrLoopMask, 0) >= 0)
+            interface_answered("sys_netset_if_up", "lo0");
+        if (const u32 type = r32(b, set + ns::type); type && guest_str(ctx, type, "netset type").value_or("") == "wlan")
+            wireless_down(ctx);
+        const s32 r = errno_negated(ctx);
+        if (r < 0) {
+            n.sets_up--;
+            w32(b, set + ns::status, 9);
+            w32(b, set + ns::state, 0);
+            w32(b, set + ns::busy, 0);
+            return r;
+        }
+        w32(b, set + ns::busy, 0);
+        w32(b, set + ns::status, 6);
+        w32(b, set + ns::state, 5);
+        return r;
+    });
+}
+
+// sys_netset_if_down(id): nothing for a netset that is not up; else (only while if_up still runs, on another thread)
+// its DHCP client stopped, its PPPoE link and interface taken down, which lv2 refuses with no link: state 0, status 9.
+s32 sys_netset_if_down(PPUContext& ctx, s32 id, s32, s32)
+{
+    return netset_call(ctx, [&]() -> s32 {
+        u8* b = gb(ctx);
+        const u32 set = find_netset(ctx, static_cast<u32>(id));
+        if (!set) return errno_negated(ctx);
+        if (!r32(b, set + ns::state)) return 0;
+        w32(b, set + ns::status, 7);
+        w32(b, set + ns::state, 6);
+        if (b[set + ns::dhcp]) dhcp_stop(ctx);
+        if (b[set + ns::pppoe]) interface_flags(ctx, data(ctx) + kStrPppoe, "sys_netset_if_down");
+        else interface_flags(ctx, r32(b, set + ns::ifname), "sys_netset_if_down");
+        w32(b, set + ns::status, 9);
+        w32(b, set + ns::state, 0);
+        return errno_negated(ctx);
+    });
+}
+
 } // namespace
 
 void register_sys_net(Registry& r)
@@ -2505,6 +3099,14 @@ void register_sys_net(Registry& r)
         f("_sce_net_set_ip_and_mask", &thunk<&_sce_net_set_ip_and_mask>),
         f("_sys_net_lib_if_nametoindex", &thunk<&_sys_net_lib_if_nametoindex>),
         f("sys_net_if_ctl", &thunk<&sys_net_if_ctl>),
+        f("sys_netset_open", &thunk<&sys_netset_open>),
+        f("sys_netset_close", &thunk<&sys_netset_close>),
+        f("sys_netset_abort", &thunk<&sys_netset_abort>),
+        f("sys_netset_get_status", &thunk<&sys_netset_get_status>),
+        f("sys_netset_get_key_value", &thunk<&sys_netset_get_key_value>),
+        f("sys_netset_get_if_id", &thunk<&sys_netset_get_if_id>),
+        f("sys_netset_if_up", &thunk<&sys_netset_if_up>),
+        f("sys_netset_if_down", &thunk<&sys_netset_if_down>),
         PS_HLE_INTERNAL(0x66AFE280, _pspocket_net_thread_atexit),
     });
 }
