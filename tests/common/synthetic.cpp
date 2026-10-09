@@ -882,14 +882,21 @@ std::vector<u8> wrap_in_self(std::span<const u8> elf, const SelfOptions& o)
 
 } // namespace pspocket::test
 
-// ---- SDATA file ----
+// ---- NPD files: SDATA and EDATA ----
 
 namespace pspocket::test {
 
-std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const SdataOptions& options)
+std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options)
+{
+    NpdOptions sdata = options;
+    sdata.edata = false;
+    return build_npd(plain, keys, sdata);
+}
+
+std::vector<u8> build_npd(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options)
 {
     using namespace recomp;
-    const u32 flags = kNpdSdatFlag | options.extra_flags;
+    const u32 flags = (options.edata ? 0 : kNpdSdatFlag) | options.extra_flags;
     const u32 bs = options.block_size;
     const bool compressed = flags & kNpdCompressedFlag;
     const bool flag20 = flags & kNpdFlag20;
@@ -901,9 +908,10 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
     Buffer b;
     b.put(0, std::span<const u8>(reinterpret_cast<const u8*>("NPD\0"), 4));
     b.put32(4, static_cast<u32>(options.version));
-    b.put32(8, 3);  // licence
-    b.put32(12, 0); // type
-    b.put_str(0x10, kSelfContentId);
+    b.put32(8, static_cast<u32>(options.edata ? options.license : 3)); // licence
+    b.put32(12, 0);                                                     // type
+    b.reserve_to(0x40);
+    b.put_str(0x10, options.content_id.substr(0, 0x30));
     u8 digest[16], title_hash[16], dev_hash[16];
     for (int i = 0; i < 16; i++) {
         digest[i] = static_cast<u8>(0x11 * i + 5);
@@ -911,7 +919,19 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
         dev_hash[i] = static_cast<u8>(0x35 * i + 9);
     }
     b.put(0x40, digest);
+    if (options.edata && options.npdrm) {
+        // RPCS3 validate_npd_hashes in reverse: the title hash over the content ID's 0x30 bytes and the file name.
+        std::vector<u8> title(b.bytes.begin() + 0x10, b.bytes.begin() + 0x40);
+        title.insert(title.end(), options.file_name.begin(), options.file_name.end());
+        crypto::aes_cmac(options.npdrm->omac_key3, title.data(), title.size(), title_hash);
+    }
     b.put(0x50, title_hash);
+    if (options.edata && options.npdrm && (options.license & 3) == 3) {
+        // validate_dev_klic in reverse: over the first 0x60 bytes, keyed with the klicensee (a free file's key).
+        Key128 dev_key{};
+        for (int i = 0; i < 16; i++) dev_key[i] = static_cast<u8>(options.key[i] ^ options.npdrm->omac_key2[i]);
+        crypto::aes_cmac(dev_key, b.bytes.data(), 0x60, dev_hash);
+    }
     b.put(0x60, dev_hash);
     b.put32(0x80, flags);
     b.put32(0x84, bs);
@@ -919,7 +939,7 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
     b.reserve_to(0x100);
 
     u8 key[16];
-    for (int i = 0; i < 16; i++) key[i] = static_cast<u8>(dev_hash[i] ^ keys.sdat[i]);
+    for (int i = 0; i < 16; i++) key[i] = options.edata ? options.key[i] : static_cast<u8>(dev_hash[i] ^ keys.sdat[i]);
     auto ecb = [](const u8* k, const u8* in, u8* out) { crypto::aes_ecb_encrypt(std::span<const u8>(k, 16), in, 16, out); };
     enum Op { kEncrypt, kDecrypt };
     auto cbc = [](Op op, const u8* k, const u8* iv, const u8* in, usize n, u8* out) {

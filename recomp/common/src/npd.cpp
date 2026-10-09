@@ -298,15 +298,11 @@ int npd_decompress(u8* out, const u8* in_bytes, usize in_size, u32 size)
     }
 }
 
-Result<std::unique_ptr<NpdFile>> NpdFile::open(ReadAt source, u64 source_size, const NpdKeys& keys)
+std::optional<NpdHeader> parse_npd_header(std::span<const u8> bytes)
 {
-    u8 h[0x90]{};
-    if (source_size < kHeaderSize) return make_error("{} bytes: too small for an NPD file", source_size);
-    if (!source(0, h, sizeof(h))) return make_error("reading the header failed");
-    if (std::memcmp(h, "NPD\0", 4) != 0) return make_error("not an NPD file");
-
-    std::unique_ptr<NpdFile> f(new NpdFile);
-    NpdHeader& n = f->header_;
+    if (bytes.size() < kNpdHeaderBytes || std::memcmp(bytes.data(), "NPD\0", 4) != 0) return std::nullopt;
+    const u8* h = bytes.data();
+    NpdHeader n;
     n.version = static_cast<s32>(ps_ld32(h + 4));
     n.license = static_cast<s32>(ps_ld32(h + 8));
     n.type = static_cast<s32>(ps_ld32(h + 12));
@@ -314,21 +310,96 @@ Result<std::unique_ptr<NpdFile>> NpdFile::open(ReadAt source, u64 source_size, c
     std::memcpy(n.digest.data(), h + 0x40, 16);
     std::memcpy(n.title_hash.data(), h + 0x50, 16);
     std::memcpy(n.dev_hash.data(), h + 0x60, 16);
+    n.activate_time = static_cast<s64>(ps_ld64(h + 0x70));
+    n.expire_time = static_cast<s64>(ps_ld64(h + 0x78));
     n.flags = ps_ld32(h + 0x80);
     n.block_size = ps_ld32(h + 0x84);
     n.file_size = ps_ld64(h + 0x88);
+    return n;
+}
 
-    if (!(n.flags & kNpdSdatFlag))
-        return make_error("an EDATA file (content {}, licence {}): it needs the game's licence key, which pspocket does "
-                          "not keep yet", n.content_id, n.license);
-    if (!keys.present) return make_error("an SDATA file, and this build has no NPD keys (built without RPCS3's source)");
+bool npd_klicensee_matches(std::span<const u8> bytes, const Key128& klicensee, const NpdrmKeys& keys)
+{
+    // RPCS3 validate_dev_klic: the header's first 0x60 bytes as the file has them (its integers big-endian).
+    if (bytes.size() < 0x70) return false;
+    if ((static_cast<s32>(ps_ld32(bytes.data() + 8)) & 3) != 3) return true;
+    Key128 key{};
+    for (usize i = 0; i < key.size(); i++) key[i] = static_cast<u8>(klicensee[i] ^ keys.omac_key2[i]);
+    u8 mac[16]{};
+    return crypto::aes_cmac(key, bytes.data(), 0x60, mac) && std::memcmp(mac, bytes.data() + 0x60, 16) == 0;
+}
+
+bool npd_hashes_valid(std::span<const u8> bytes, std::string_view file_name, const Key128& klicensee,
+    const NpdrmKeys& keys)
+{
+    if (bytes.size() < kNpdHeaderBytes) return false;
+    if (ps_ld32(bytes.data() + 0x80) & kNpdDebugDataFlag) return true; // RPCS3: no header checks for debug data
+    if (!npd_klicensee_matches(bytes, klicensee, keys)) return false;
+    if (file_name.empty()) return true;
+    // The content ID's 0x30 bytes and the name; the extension (from the name's last '.', or the content ID's last
+    // byte when there is none, as RPCS3's search stops there) lowered and raised for the two other tries.
+    std::vector<u8> as_is(0x30 + file_name.size());
+    std::memcpy(as_is.data(), bytes.data() + 0x10, 0x30);
+    std::memcpy(as_is.data() + 0x30, file_name.data(), file_name.size());
+    usize from = 0x2F;
+    for (usize i = as_is.size(); i > 0x30; i--) {
+        if (as_is[i - 1] == '.') {
+            from = i - 1;
+            break;
+        }
+    }
+    std::vector<u8> lower = as_is, upper = as_is;
+    for (usize i = from; i < as_is.size(); i++) {
+        const u8 c = as_is[i];
+        lower[i] = c >= 'A' && c <= 'Z' ? static_cast<u8>(c + 32) : c;
+        upper[i] = c >= 'a' && c <= 'z' ? static_cast<u8>(c - 32) : c;
+    }
+    const auto title_hash_of = [&](const std::vector<u8>& v) {
+        u8 mac[16]{};
+        return crypto::aes_cmac(keys.omac_key3, v.data(), v.size(), mac) &&
+            std::memcmp(mac, bytes.data() + 0x50, 16) == 0;
+    };
+    return title_hash_of(as_is) || title_hash_of(lower) || title_hash_of(upper);
+}
+
+Result<std::unique_ptr<NpdFile>> NpdFile::open(ReadAt source, u64 source_size, const NpdKeys& keys,
+    const std::optional<Key128>& edata_key, const NpdrmKeys& npdrm)
+{
+    u8 h[kNpdHeaderBytes]{};
+    if (source_size < kHeaderSize) return make_error("{} bytes: too small for an NPD file", source_size);
+    if (!source(0, h, sizeof(h))) return make_error("reading the header failed");
+    const std::optional<NpdHeader> header = parse_npd_header(h);
+    if (!header) return make_error("not an NPD file");
+
+    std::unique_ptr<NpdFile> f(new NpdFile);
+    NpdHeader& n = f->header_;
+    n = *header;
+    const bool sdat = n.flags & kNpdSdatFlag;
+    if (!sdat && !edata_key) {
+        return make_error("an EDATA file (content {}, licence {}): it opens with the game's licence key, and none was "
+                          "given", n.content_id, n.license);
+    }
+    if (!keys.present) {
+        return make_error("an {} file, and this build has no NPD keys (built without RPCS3's source)",
+            sdat ? "SDATA" : "EDATA");
+    }
+    if (!sdat && !(n.flags & kNpdDebugDataFlag) && (n.license & 3) == 3) {
+        // RPCS3 ReadHeader: a klicensee that does not match the header decrypts nothing.
+        if (!npdrm.present) return make_error("a free EDATA file, and this build has no NPDRM keys to check its klicensee");
+        if (!npd_klicensee_matches(h, *edata_key, npdrm))
+            return make_error("the klicensee is not the one this EDATA file (content {}) was made with", n.content_id);
+    }
     if (n.file_size && (n.block_size == 0 || n.block_size > (16u << 20)))
         return make_error("block size {:#x} for {} bytes", n.block_size, n.file_size);
 
     f->source_ = std::move(source);
     f->source_size_ = source_size;
     f->keys_ = keys;
-    for (int i = 0; i < 16; i++) f->key_[i] = static_cast<u8>(n.dev_hash[i] ^ keys.sdat[i]); // RPCS3 ReadHeader
+    if (sdat) {
+        for (int i = 0; i < 16; i++) f->key_[i] = static_cast<u8>(n.dev_hash[i] ^ keys.sdat[i]); // RPCS3 ReadHeader
+    } else {
+        f->key_ = *edata_key;
+    }
     const u64 blocks = n.block_size ? (n.file_size + n.block_size - 1) / n.block_size : 0;
     if (blocks > 0xFFFFFFFFull) return make_error("{} blocks", blocks);
     f->total_blocks_ = static_cast<u32>(blocks);

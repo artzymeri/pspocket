@@ -143,18 +143,31 @@ std::vector<u8> wrap_in_self(std::span<const u8> elf, const SelfOptions& options
 
 inline constexpr std::string_view kSelfContentId = "XX0000-TEST00000_00-0000000000000000";
 
-// ---- SDATA file (D-165) ----
+// ---- NPD files: SDATA (D-165) and EDATA (D-581) ----
 
-struct SdataOptions {
+struct NpdOptions {
     s32 version = 3;          // NPD version: 0 and 1 have no IV and keep compressed blocks' metadata plain; 4 uses
                               // EDAT_KEY_1 for an encrypted key
     u32 extra_flags = 0;      // recomp::kNpd*Flag besides the SDAT flag
     u32 block_size = 0x400;
+    // An EDATA file (no SDAT flag) instead, encrypted with `key`, its content key (a free file's klicensee, else the
+    // RIF key of the player's RAP), of this licence type and content ID. With `npdrm`, the header carries the hashes
+    // RPCS3 checks: the title hash over the content ID and `file_name`, and a free file's dev hash keyed with `key`;
+    // without it, made-up bytes.
+    bool edata = false;
+    s32 license = 3;
+    std::string content_id = std::string(kSelfContentId);
+    std::string file_name{};
+    recomp::Key128 key{};
+    const recomp::NpdrmKeys* npdrm = nullptr;
 };
+using SdataOptions = NpdOptions;
 
-// `plain` as an SDATA file, encrypted, hashed and laid out the way recomp::NpdFile reads Sony's (RPCS3 unedat.cpp
-// in reverse), with `keys`. A compressed file (kNpdCompressedFlag) holds its blocks in the decoder's plain form (a
-// byte above 0x80, the length, the bytes), every other block marked compressed.
-std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const SdataOptions& options = {});
+// `plain` as an NPD file, encrypted, hashed and laid out the way recomp::NpdFile reads Sony's (RPCS3 unedat.cpp in
+// reverse), with `keys`. A compressed file (kNpdCompressedFlag) holds its blocks in the decoder's plain form (a byte
+// above 0x80, the length, the bytes), every other block marked compressed. build_sdata makes an SDATA file whatever
+// `options.edata` says.
+std::vector<u8> build_npd(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options = {});
+std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options = {});
 
 } // namespace pspocket::test
