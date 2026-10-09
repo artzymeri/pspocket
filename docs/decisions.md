@@ -6307,3 +6307,50 @@ A retail system's debugger library is liblv2dbg_for_cex.sprx, which denies every
 CELL_LV2DBG_ERROR_DEOPERATIONDENIED (0x8001042C), and sys_dbg_vm_get_page_information first clears the page
 information entries it was given. pspocket's sys_lv2dbg is that (runtime/hle/src/sys_lv2dbg.cpp), compared with the
 module call for call (tests/hle/test_lv2dbg.cpp). RPCS3 answers CELL_OK with a todo for each (a debug kernel's answer).
+
+## D-522 · 2026-10-09 · USB as a console with no device: lv2's sys_usbd, libusbd and libusbpspcm pspocket's own
+
+pspocket runs where no USB device reaches the game (an iPhone), so the model is a PS3 with nothing plugged in, built
+from the bottom and compared with Sony's modules on it.
+
+- **lv2 (runtime/lv2/src/usbd.cpp, tests/lv2/test_usbd.cpp).** Every named sys_usbd call is bound (530..551, 556, 558,
+  559). sys_usbd_initialize gives RPCS3's handle; the device list is empty, and every call that names a device or a
+  pipe (descriptors, pipes, transfers and their status, location, speed, attach, send_event, which libusbd's
+  cellUsbdResetDevice calls) is CELL_EINVAL, as RPCS3 answers an unknown one. Drivers are kept by product name (a
+  second registration CELL_EEXIST, unregistering an unknown one CELL_ESRCH; the names RPCS3 knows get their device
+  IDs). sys_usbd_receive_event waits for the library's own events (sys_usbd_event_port_send) and finalisation wakes it
+  with RPCS3's termination (4, 0, 0). Memory for transfers (sys_usbd_allocate_memory, RPCS3 todo) is user memory in
+  64 KB pages the kernel keeps until sys_usbd_free_memory or finalisation. The unnamed calls libusbd also makes (552,
+  563 for composite drivers, 565 memory from a container, 567..569 shared memory) stay RPCS3's CELL_OK with nothing
+  written: the name table has no entry to bind them to.
+- **cellUsbd (runtime/hle/src/usbd.cpp), 29 functions, as libusbd.sprx.** cellUsbdInit makes libusbd's event queue
+  "_ubdorg" with a local port and its two threads (libusbd_callback_thread in sys_usbd_receive_event forwarding device
+  events, libusbd_usbd_thread on the queue; priority 500, 4 KB stacks), lists the devices (none) and is the only call
+  before which the others are not CELL_USBD_ERROR_NOT_INITIALIZED; cellUsbdEnd sends both threads event 4, joins them,
+  destroys the objects and finalises. Thread priorities (type 0 kept for drivers, 1 and 2 the threads', lv2's errors
+  as they are; SetThreadPriority2 needs ldd < usbd < callback and puts the usbd thread's back when the callback
+  thread's fails). Drivers: the four CellUsbdLddOps pointers set, a name registered compared as the strings read now,
+  unregistering by the four pointers as they are now (plain and extra by cellUsbdUnregisterLdd and
+  cellUsbdUnregisterExtraLdd, which is the same function, composite by cellUsbdUnregisterCompositeLdd, which calls
+  536). Devices and pipes are never found (DEVICE_NOT_FOUND, PIPE_NOT_FOUND, a null pointer for GetPrivateData and
+  ScanStaticDescriptor) after libusbd's own argument checks. Memory: lv2's errors raw for AllocateMemory and
+  AllocateSharedMemory, FATAL for FromContainer and FreeMemory, a null address FATAL.
+- **cellUsbPspcm, 27 functions, as libusbpspcm.sprx.** CalcPoolSize is 8268·devices·connections + 128·devices +
+  144·connections (32-bit); Init checks the parameters (size 32, 1..16 devices, connections > 0, a name of at most 63
+  characters, the pool's size), starts the library's thread "cellUsbPspcm_Library" (the parameters' priority and stack
+  plus 4 KB; lv2's error as it is) and registers its driver "cellUsbPspcm" with cellUsbd (its error as it is, so
+  CELL_USBD_ERROR_NOT_INITIALIZED before cellUsbdInit); the pool's address is the initialised flag, as libusbpspcm's.
+  With no PSP no device slot binds (CLOSED), no connection opens (CLOSED for transfers, resets and data waits,
+  ALREADY for a close) and nothing is pending (INVALID for the polls, waits and cancels). The pool is the library's
+  own memory: pspocket keeps its state on the host and leaves the pool alone.
+- **Compared** in tests/hle/test_usb_compare.cpp: scripts of every function with good and bad arguments in two fresh
+  processes, Sony's modules (libusbpspcm on libusbd) and pspocket's: the answers, the bytes written outside the pool,
+  and the lv2 calls the script's thread makes (the libraries' own `sc`: sys_usbd with its arguments and drivers'
+  names, threads, events) all the same. Two things are not compared because libusbd answers from leftovers: an
+  AllocateMemoryFromContainer past its checks (565 writes nothing, so libusbd reads its stack) and
+  cellUsbdUnregisterLdd of a composite driver (it compares an entry's bytes its allocator reused).
+- **Left out.** libusbd's seven exports with no known name (a Bluetooth helper among them) and its answer for ten titles
+  that takes lv2 refusing a product registration as CELL_OK (pspocket's lv2 never refuses one libusbd lets through).
+  A device arriving, a transfer completing or the driver being probed stops a dev build (rule 5): with a device model
+  (an emulated portal or guitar, a PSP over the network) the attach and transfer paths are to be written and compared
+  with libusbd on it.

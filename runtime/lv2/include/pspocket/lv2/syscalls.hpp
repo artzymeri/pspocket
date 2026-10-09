@@ -298,6 +298,33 @@ Result sys_spu_thread_group_disconnect_event_all_threads(PpuThread& t, u32 id, u
 Result sys_spu_thread_group_set_cooperative_victims(PpuThread& t, u32 id, u32 threads_mask);
 Result sys_spu_thread_group_syscall_253(PpuThread& t, u32 id, u32 info);
 
+// ---- USB (usbd.cpp): no device attached (D-522).
+Result sys_usbd_initialize(PpuThread& t, u32 handle);
+Result sys_usbd_finalize(PpuThread& t, u32 handle);
+Result sys_usbd_get_device_list(PpuThread& t, u32 handle, u32 list, u32 max);
+Result sys_usbd_register_extra_ldd(PpuThread& t, u32 handle, u32 name, u32 len, u32 vendor, u32 pmin, u32 pmax);
+Result sys_usbd_unregister_extra_ldd(PpuThread& t, u32 handle, u32 name, u32 len);
+Result sys_usbd_register_ldd(PpuThread& t, u32 handle, u32 name, u32 len);
+Result sys_usbd_unregister_ldd(PpuThread& t, u32 handle, u32 name, u32 len);
+Result sys_usbd_get_descriptor_size(PpuThread& t, u32 handle, u32 device);
+Result sys_usbd_get_descriptor(PpuThread& t, u32 handle, u32 device, u32 descriptor, u32 size);
+Result sys_usbd_open_pipe(PpuThread& t, u32 handle, u32 device, u32 unk1, u64 unk2, u64 unk3, u32 endpoint, u64 attr);
+Result sys_usbd_open_default_pipe(PpuThread& t, u32 handle, u32 device);
+Result sys_usbd_close_pipe(PpuThread& t, u32 handle, u32 pipe);
+Result sys_usbd_receive_event(PpuThread& t, u32 handle, u32 arg1, u32 arg2, u32 arg3);
+Result sys_usbd_event_port_send(PpuThread& t, u32 handle, u64 arg1, u64 arg2, u64 arg3);
+Result sys_usbd_transfer_data(PpuThread& t, u32 handle, u32 pipe, u32 buf, u32 size, u32 request, u32 type);
+Result sys_usbd_isochronous_transfer_data(PpuThread& t, u32 handle, u32 pipe, u32 request);
+Result sys_usbd_get_transfer_status(PpuThread& t, u32 handle, u32 transfer, u32 unk1, u32 result, u32 count);
+Result sys_usbd_get_isochronous_transfer_status(PpuThread& t, u32 handle, u32 transfer, u32 unk1, u32 req, u32 result);
+Result sys_usbd_get_device_location(PpuThread& t, u32 handle, u32 device, u32 location);
+Result sys_usbd_get_device_speed(PpuThread& t, u32 handle, u32 device, u32 speed);
+Result sys_usbd_detect_event(PpuThread& t);
+Result sys_usbd_attach(PpuThread& t, u32 handle, u32 ldd, u32 device_high, u32 device_low);
+Result sys_usbd_send_event(PpuThread& t, u32 handle, u32 device);
+Result sys_usbd_allocate_memory(PpuThread& t, u32 handle, u32 addr, u64 size);
+Result sys_usbd_free_memory(PpuThread& t, u32 handle, u32 addr);
+
 // ---- RSX (rsx.cpp). Called by HLE cellGcmSys, and by number (668, 670, 672-675, D-519).
 Result sys_rsx_memory_allocate(PpuThread& t, u32 mem_handle, u32 mem_addr, u64 size, u64 flags, u64 a5, u64 a6, u64 a7);
 Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_control, u32 lpar_driver_info,

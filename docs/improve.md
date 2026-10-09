@@ -465,5 +465,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   once, buffer id returned); libgcm_sys queues with GCM_DRIVER_QUEUE, flips from its interrupt handler through lv2's
   0x102 and returns the ring slot. Moving to libgcm_sys's path would let the comparison cover cellGcmSetFlip too; it
   needs lv2's queue and flip events (RPCS3 send_event) and a vblank-timed flip.
+- **USB (D-522).** No device ever attaches, so cellUsbd's attach, probe and transfer paths and cellUsbPspcm's
+  binding and PSP protocol are not written (a dev build stops if one is reached). A device model (an emulated
+  Skylanders/Infinity portal, a guitar, a PSP over the network) is where they would come from, each compared with
+  libusbd/libusbpspcm running on it. lv2's unnamed USB calls (563 composite drivers, 565 memory from a container,
+  567..569 shared memory) answer as RPCS3 (CELL_OK, nothing written): binding them needs names in the syscall table.
 - **Kernel gaps behind liblv2's wrappers.** sys_rsxaudio (650-658), interrupt threads (84, 89) and process spawning
   (21) answer CELL_ENOSYS in lv2; RPCS3 implements sys_rsxaudio.

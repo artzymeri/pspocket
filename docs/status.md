@@ -316,6 +316,7 @@ firmware module. Done so far (2026-10-09: 3,927 of 6,625):
 - cellHttpUtil (D-504), cellSpurs' accessors, exception handlers and SPU sharing (D-505, D-506, D-509), cellSheap
   (D-507), cellSpudll (D-508), the C library and C99 maths under sys_libc and sys_libm (D-510 to D-516), cellL10n
   (D-517), sys_fs with the kernel calls behind it (D-518), cellGcmSys compared with libgcm_sys running on pspocket's lv2
-  (D-519), liblv2's internal variables (D-520), sys_lv2dbg (D-521).
-Next: the rest of the libraries pspocket always serves (cellUsbd and cellUsbPspcm with lv2's sys_usbd, sys_net
-with lv2's bnet calls, cellSpurs' Task2 and LF queues, cellSync's ANY2ANY queues, the raw SPU loaders), then the firmware-backed libraries one by one.
+  (D-519), liblv2's internal variables (D-520), sys_lv2dbg (D-521), cellUsbd and cellUsbPspcm with lv2's sys_usbd as a
+console with no USB device (D-522).
+Next: the rest of the libraries pspocket always serves (sys_net with lv2's bnet calls, cellSpurs' Task2 and LF queues,
+cellSync's ANY2ANY queues, the raw SPU loaders), then the firmware-backed libraries one by one.

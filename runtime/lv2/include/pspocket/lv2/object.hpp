@@ -124,6 +124,7 @@ enum class WaitKind : u8 {
     LwCond,      // the kernel side of sys_lwcond, also once signalled onto its lwmutex's sleep queue
     Join,        // sys_ppu_thread_join; the ID is the joined thread's
     Sleep,       // sys_timer_usleep / sys_timer_sleep; no ID
+    Usbd,        // sys_usbd_receive_event; the ID is the usbd handle
 };
 const char* wait_kind_name(WaitKind kind);
 

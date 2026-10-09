@@ -175,6 +175,7 @@ std::string describe_wait(Kernel::Impl& s, const Waiter& w, WaitOn on, const Thr
             c->control, c->lwmutex_id, count(waiters, "waiter"), woken(queued));
     }
     case WaitKind::Join: return std::format("thread {} to exit", thread(on.id));
+    case WaitKind::Usbd: return std::format("USB events (usbd handle {:#x}; no device is attached)", on.id);
     }
     return {};
 }
