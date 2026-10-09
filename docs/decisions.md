@@ -6748,3 +6748,32 @@ that table. All 43 functions of the count, the table and the callbacks libfontFT
   passes no stream where Sony's passes an unset one; the vertical glyph environment's shift words are 0 where Sony's
   reads them unset (shift type 0). libfontFT's unnamed exports that no game imports (other renderer and buffer entry
   points) are internal functions only.
+
+## D-532 · 2026-10-09 · cellAtrac pspocket's own, libatrac3plus over pspocket's cellAdec
+
+cellAtrac's 24 functions (RPCS3: answers without decoding) are now libatrac3plus.sprx's logic, read from its code and
+compared with it running on pspocket (tests/hle/test_atrac.cpp). The handle (512 bytes, the game's) is laid out as
+libatrac3plus's: a mutex and condition ("_a3pm00", "_a3pc00") around cellAdec's callback, cellAdec's type, attributes,
+callback, resource and handle, the ATRAC3 and ATRAC3plus parameters, the work memory, and the stream state (play
+range, loop, encoder delay, frames to decode before PCM is kept, how the file is held: whole, half loaded, streamed
+through a ring, streamed with a loop, streamed with a second buffer for the loop's tail).
+- SetDataAndGetMemSize reads the RIFF WAVE header as libatrac3plus does: fmt for ATRAC3 (0x270) or ATRAC3plus
+  (WAVE_FORMAT_EXTENSIBLE with its subformat GUID, config bytes giving the rate, channel configuration and frame size),
+  fact (samples, first sample offset; a 4-byte offset adds the 184-sample delay later), smpl (the first loop), data;
+  44.1 and 48 kHz only. The default first offset is 0x800 for ATRAC3plus, 0x400 for ATRAC3 (libatrac3plus computes it
+  with a rotate, which a first version took for a shift: caught by the comparison). The memory it asks for is a
+  frame's PCM (8 KB per channel for 1, 2, 6 or 8 channels; 4 KB per channel for ATRAC3) + cellAdec's + 1 KB.
+- CreateDecoder/Ext open cellAdec (Open or OpenExt with the SPURS resource), start the sequence and decode the frames
+  before the first kept sample; a failure deletes the decoder through DeleteDecoder as libatrac3plus does (its sync
+  objects destroyed a second time, so that delete fails and the handle stays set, as on a PS3). Decode feeds one frame
+  per call (cellAdecDecodeAu), waits for the callback's PCM-out on the condition, takes the PCM into the game's buffer
+  or (a partial frame) into the work memory and copies the kept part, then moves the positions: loops back to the
+  loop start, the ring, the switch to the second buffer past the loop's tail (the end of its last frame copied to the
+  ring's front). GetBufferInfoForResetting decodes the pre-roll frames too, as libatrac3plus does.
+- Remain-frame counts, vacant size, writable size and the read position of the stream are libatrac3plus's per state
+  (-1 all in memory, -2 the rest of a stream without a loop, -3 of a looped one).
+Tests: AT3+ files built here (silent frames that decode through pspocket's FFmpeg-based ATRAC3plus core) played whole,
+half loaded, streamed (topped up and left to run dry), looped at the end and inside with a second buffer, reset, with
+Create and CreateExt, fact chunks of both sizes, an odd unknown chunk, 44.1/32 kHz, a wrong GUID, a PCM tag, a read
+larger than the buffer, a 12-byte header: every answer, output, the handle's bytes and the PCM the same as
+libatrac3plus's (5,000-line log), over 150 decodes.
