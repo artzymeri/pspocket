@@ -229,6 +229,24 @@ const std::vector<TypeDef>& type_defs()
     return defs;
 }
 
+// ------------------------------------------------------------------------------------------------- for the facets
+
+// The services the facets part calls here directly (stdcxx.hpp). `type` must be one of the library's constant type
+// names (use_facet keeps its lazy facets by it).
+u32 use_facet_of(PPUContext& ctx, u32 loc, std::string_view type) { return use_facet(ctx, loc, type); }
+s32 streambuf_sgetc(PPUContext& ctx, u32 sb, u32 elem_size)
+{
+    return elem_size == 1 ? sgetc<1>(ctx, sb) : sgetc<4>(ctx, sb);
+}
+s32 streambuf_sbumpc(PPUContext& ctx, u32 sb, u32 elem_size)
+{
+    return elem_size == 1 ? sbumpc<1>(ctx, sb) : sbumpc<4>(ctx, sb);
+}
+s32 streambuf_sputc(PPUContext& ctx, u32 sb, u32 elem_size, u32 ch)
+{
+    return elem_size == 1 ? sputc<1>(ctx, sb, ch & 0xFF) : sputc<4>(ctx, sb, ch);
+}
+
 } // namespace stdcxx
 
 using namespace stdcxx;

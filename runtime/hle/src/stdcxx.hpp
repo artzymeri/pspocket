@@ -267,6 +267,25 @@ struct TypeDef {
 
 const std::vector<VtableDef>& vtable_defs();   // stdcxx_streams.cpp: every class pspocket makes objects of
 const std::vector<TypeDef>& type_defs();
+const std::vector<VtableDef>& facet_vtable_defs(); // stdcxx_facets.cpp: the facets'
+const std::vector<TypeDef>& facet_type_defs();
+
+// The definition of a class's vtable or type_info in either part's list (null when neither has it).
+inline const VtableDef* find_vtable_def(std::string_view cls)
+{
+    for (const auto* defs : {&vtable_defs(), &facet_vtable_defs()})
+        for (const VtableDef& d : *defs)
+            if (d.cls == cls) return &d;
+    return nullptr;
+}
+
+inline const TypeDef* find_type_def(std::string_view type)
+{
+    for (const auto* defs : {&type_defs(), &facet_type_defs()})
+        for (const TypeDef& d : *defs)
+            if (d.name == type) return &d;
+    return nullptr;
+}
 
 // Guest memory for the library's own data (vtables, type_info, constant strings, its static objects): 64 KB blocks of
 // the main area, handed out under the model's lock.
@@ -336,9 +355,8 @@ inline u32 descriptor(std::string_view name)
 inline u32 type_info_locked(PPUContext& ctx, Model& m, std::string_view type)
 {
     if (const auto it = m.types.find(type); it != m.types.end()) return it->second;
-    const auto& defs = type_defs();
-    const auto def = std::find_if(defs.begin(), defs.end(), [&](const TypeDef& d) { return d.name == type; });
-    if (def == defs.end()) PS_FATAL(kChan, "no type_info for {}", type);
+    const TypeDef* def = find_type_def(type);
+    if (!def) PS_FATAL(kChan, "no type_info for {}", type);
     const u32 size = def->kind == TypeDef::Kind::Class ? 8
         : def->kind == TypeDef::Kind::Si               ? 12
                                                        : 16 + 8 * static_cast<u32>(def->bases.size());
@@ -374,9 +392,8 @@ inline u32 vtable(PPUContext& ctx, std::string_view cls, u32 point = 0)
     Model& m = model();
     std::lock_guard lock(m.mutex);
     if (const auto it = m.vtables.find(cls); it != m.vtables.end()) return it->second.at(point);
-    const auto& defs = vtable_defs();
-    const auto def = std::find_if(defs.begin(), defs.end(), [&](const VtableDef& d) { return d.cls == cls; });
-    if (def == defs.end()) PS_FATAL(kChan, "no vtable for {}", cls);
+    const VtableDef* def = find_vtable_def(cls);
+    if (!def) PS_FATAL(kChan, "no vtable for {}", cls);
     const u32 a = m.alloc(4 * static_cast<u32>(def->words.size()), 8);
     u8* b = guest_base(ctx);
     for (usize i = 0; i < def->words.size(); i++) {
@@ -642,5 +659,32 @@ private:
 // A temporary exception of one of the library's classes (by its mangled type name, a string message for logic_error
 // and runtime_error kinds) raised from the guest stack.
 [[noreturn]] void raise_new(PPUContext& ctx, std::string_view cls, std::string_view message = {});
+
+// ------------------------------------------------------------------------------------------------- ios_base
+
+// ios_base (40 bytes): vptr, size_t _Stdstr (+4), iostate _Mystate (+8), _Except (+12), fmtflags _Fmtfl (+16),
+// streamsize _Prec (+20), _Wide (+24), _Iosarray *_Arr (+28), _Fnarray *_Calls (+32), locale *_Ploc (+36); basic_ios
+// adds the stream buffer (+40), the tie (+44) and the fill (+48). Its states and format flags are Dinkumware's _Iosb
+// values (_IOSskipws ... _IOSboolalpha).
+inline constexpr u32 kIosStdstr = 4, kIosState = 8, kIosExcept = 12, kIosFmtfl = 16, kIosPrec = 20, kIosWide = 24,
+                     kIosArr = 28, kIosCalls = 32, kIosPloc = 36, kIosBaseBytes = 40;
+inline constexpr u32 kIosSb = 40, kIosTie = 44, kIosFill = 48, kBasicIosBytes = 52;
+inline constexpr u32 kGoodbit = 0, kEofbit = 1, kFailbit = 2, kBadbit = 4, kStatmask = 0x17;
+inline constexpr u32 kSkipws = 0x1, kUnitbuf = 0x2, kUppercase = 0x4, kShowbase = 0x8, kShowpoint = 0x10,
+                     kShowpos = 0x20, kLeft = 0x40, kRight = 0x80, kInternal = 0x100, kDec = 0x200, kOct = 0x400,
+                     kHex = 0x800, kScientific = 0x1000, kFixed = 0x2000, kBoolalpha = 0x4000, kAdjustfield = 0x1C0,
+                     kBasefield = 0xE00, kFloatfield = 0x3000, kFmtmask = 0xFFFF;
+inline constexpr s32 kEof = -1;
+
+// ------------------------------------------------------------------------------------------------- between the parts
+
+// What the facets part (stdcxx_facets.cpp) calls in the streams part (stdcxx_streams.cpp) directly, both being this
+// library's own code (the facets part's vtables and type_info reach the model through find_vtable_def above): use_facet
+// <F>(loc) by F's mangled type name (bad_cast when no facet can be made), and a stream buffer's sgetc, sbumpc and sputc
+// as the header's inline members do them.
+u32 use_facet_of(PPUContext& ctx, u32 loc, std::string_view type);
+s32 streambuf_sgetc(PPUContext& ctx, u32 sb, u32 elem_size);
+s32 streambuf_sbumpc(PPUContext& ctx, u32 sb, u32 elem_size);
+s32 streambuf_sputc(PPUContext& ctx, u32 sb, u32 elem_size, u32 ch);
 
 } // namespace pspocket::hle::stdcxx

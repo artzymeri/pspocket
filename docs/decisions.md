@@ -7456,3 +7456,89 @@ codecvt; the manipulators. Guest facets stand in for the other part's where a st
 that part (skipped without it; with a stand-in of that part's _Getcat, not committed, all 25 cases pass). A test
 running the game's own copy was not made: its build differs (exceptions on, a 16-bit wchar_t, malloc the game's own
 allocator, which needs the game's set-up), so it would compare another configuration.
+
+## D-561 · 2026-10-09 · sys_libstdcxx pspocket's own, part 2: the facets
+
+The other part of D-560: the facets of the SDK's C++ library, pspocket's native code. 261 functions, which with D-560's
+295 are all 556 names RPCS3 gives sys_libstdcxx (runtime/hle/src/stdcxx_facets.cpp with stdcxx_facets.hpp and its
+families _ctype, _num, _money, _time). For char and wchar_t: ctype, codecvt, collate, messages, numpunct, num_get,
+num_put, _Mpunct and the four moneypuncts, money_get, money_put, time_get, time_put; the bases' destructors (ctype_base,
+codecvt_base, messages_base, money_base, time_base); each type's _Getcat (the four the export list doesn't name,
+codecvt<char, char>, numpunct<char>, num_get<char> and num_put<char>, as internal functions the streams part finds by
+name); _Getloctxt, _Maklocstr, _Maklocchr and _Maklocbyte for wchar_t, _Getctyptab.
+
+**Where it comes from.** This session ran in the cloud, without the Mac's games or firmware, so nothing of a game's own
+copy was read this time (D-560 read Assassin's Creed's). The facets are Dinkumware's of VC8's generation as its headers
+have them (xlocale, xlocnum, xlocmon, xloctime, xlocmes), fitted to what the export list shows of this build: a class
+exports a member only where it defines one, which gives each class's members and overrides (num_get, num_put,
+money_get, money_put and time_put export no _Init, so they keep nothing; codecvt<char, char> uses codecvt_base's three
+virtual functions; time_put has no names of its own and formats with the C library's strftime) and the signatures
+(VC8's _Getffld and _Getifld; _Fput with the zeros before and after the point and trailing; _Getmfld returning its
+string; _Putmfld taking a string by value, by reference to a copy in the ABI). The vtables follow each class's
+declaration order in those headers; the slots D-560 found in the game (ctype's do_widen at 6 and 10, codecvt's do_in,
+do_out and do_unshift at 5 to 7) agree.
+
+**Layouts** (after locale::facet {vptr, _Refs}): ctype<char> {_Ctypevec at +8} (24 bytes; the header's inline is(),
+scan_is(), scan_not() and table() read _Table there), ctype<wchar_t> adds _Cvtvec (+24, 32 bytes); codecvt<wchar_t,
+char> {_Cvtvec} (16); collate {_Collvec} (16); numpunct {_Grouping, _Dp, _Kseparator, _Falsename, _Truename} (24 for
+char, 28 for wchar_t); _Mpunct {_Grouping, _Decimalpoint, _Kseparator, _Currencysign, _Plussign, _Minussign,
+_Fracdigits, _International, _Plusformat, _Minusformat} (44, 48); time_get {_Days, _Months, _Dateorder} (20); the rest
+8 bytes. Only ctype<char>'s is read by a game's inline code; the others are read by this library alone.
+
+**Behaviour in the "C" locale**, the only one there is: each _Getcat makes `new F` from a default _Locinfo (which holds
+the locale lock while it lives), _Refs 0.
+- ctype: the C library's tables (_Ctype, _Tolotab, _Touptab, D-515); a wide character past 255 has no class or case;
+  widen is a byte's value, narrow a character up to 255 (else the default); a table the facet owns (_Delfl) is freed
+  by free (> 0) or delete[] (< 0).
+- codecvt<wchar_t, char>: a byte for each character up to 255 (one past it is an error, the pointers at it), with
+  Dinkumware's answers: do_in and do_out ok once anything is converted even if input remains, partial only when
+  nothing fits; do_unshift ok with nothing to write; do_encoding 0, do_max_length _MBMAX (8), do_always_noconv false.
+  codecvt<char, char>: noconv.
+- collate: the elements' order (unsigned), -1, 0 or +1; do_transform the elements; do_hash Dinkumware's rotate-and-add.
+  messages: no catalogs (do_open -1, do_get the default).
+- numpunct: '.', no separator, no grouping, "false" and "true" (new[] copies the destructor frees).
+- moneypunct: no symbol, decimal point or separator, signs "" and "-", no fraction digits, patterns "$+xv" (Dinkumware's
+  money_base parts are the characters '$' '+' ' ' 'v' 'x'). _Makpat's table for valid lconv values is C99's
+  arrangement; the "C" locale never reaches it.
+- num_get: Dinkumware's _Getifld (a sign, "0x" for base 16 or 0, a leading 0 meaning octal in base 0, leading zeros
+  dropped, 31 characters, the numpunct's grouping checked when it has one) and _Getffld (36 significant digits, the rest
+  a power of ten, leading fraction zeros counted, 8 exponent digits), converted by the C library's _Stolx, _Stoulx,
+  _Stollx, _Stoullx, _Stofx, _Stodx and _Stoldx through the registry; unsigned short and int negate a '-' field; bool
+  0 or 1, or with boolalpha the names by _Getloctxt (the longest match; -1 once a longer one was followed); void * in
+  hex. Failbit leaves the value alone; eofbit at the end.
+- num_put: the C library's printf text (libc_format.hpp, %p as "0x" and the digits) under _Ifmt's format
+  (%[+][#]{l,ll}{d,u,o,x,X}) or _Ffmt's (%[+][#].*{f,e,E,g,G}, precision 6 when 0 and not fixed), widened by the
+  stream's ctype, grouped and pointed by its numpunct, padded (internal after a sign or "0x"), the width set to 0.
+  Past 36 digits the precision becomes trailing zeros (before an exponent); a fixed value from 1e35 up is divided in
+  1e10 steps with the zeros put before the point, one at most 1e-35 multiplied with them after it: Dinkumware's _Fput,
+  quirks kept (an uppercase exponent's zeros go at the end; scaling zeros are lost when there is no point).
+- money_get reads by neg_format(): the symbol (required with showbase, else only where the input has it and it is not
+  last), the sign (the first character of positive_sign or negative_sign, the rest after the value; with no sign seen,
+  negative only when the negative sign is the empty one), white space (one at least for space, any for none, nothing at
+  the end), the value (grouping checked, frac_digits digits after the point, else zeros); the result is the digits,
+  '-' first when negative. money_put: "%.0Lf" of the value (or the digits given), the pattern's parts, the sign's
+  first character at its place and its rest at the end, the decimal point before frac_digits digits, fill for the
+  width (internal: at space or none).
+- time_get: the day and month names of the _Locinfo's _Tinfo (":Sun:Sunday:..."), the date order from its date format
+  (mdy for "%m/%d/%y"); _Getloctxt's longest match; _Getint (a sign, leading zeros, the range); hh:mm:ss; a date's
+  three fields in that order with spaces and one of ':' ',' '/' between, a month by name or number; years 0-68 are
+  2000-2068, 69-99 1969-1999, 100-9999 as they are. time_put: strftime (wcsftime) of "!%<modifier><specifier>" in a
+  buffer doubled until it fits, and what follows the '!'.
+
+**Between the parts.** The facets call the streams part's use_facet and its stream buffer sgetc, sbumpc and sputc
+directly (declared in stdcxx.hpp, with ios_base's layout and flags, now shared); their vtables and type_info join the
+model's (find_vtable_def). The streams part still reaches the facets through the registry (_Getcat by name).
+
+**Found on the way.** sys_libc's localeconv gave 127 for the "C" locale's "not available" chars; a guest char is
+unsigned, so C99's CHAR_MAX there is 255, which moneypunct compares frac_digits with: fixed (and its test).
+
+Tests: tests/hle/test_libstdcxx_facets.cpp, 15 cases, 12,271 checks: every name registered and the vtables' slots and
+type_info chains; each type's _Getcat (category, facet, deletion) and the bases' destructors; ctype and codecvt for both
+element types; collate and messages; numpunct and moneypunct (with _Mpunct's constructors and _Init); num_put against
+printf's text for every base, sign, showbase, uppercase, width and adjustment of 7 longs and 5 long longs, and 10
+doubles under 8 float formats, 4 precisions and 2 widths, plus the 36-digit, 1e35 and internal cases; num_put and
+num_get with a numpunct grouping by three; num_get's fields and conversions (bases, ranges, bool by number and name,
+pointers, floats with 50 digits and 57 leading zeros, range errors) and its exported _Getifld/_Getffld; money_get and
+money_put; time_get and time_put; the _Makloc* functions; basic_ios::init's fill and locale("C")'s 26 facets made by
+_Getcat. With the facets the streams part's named-locale test runs too (D-560's 25 cases pass). No Sony module to
+compare with (games link the library into themselves, D-500).
