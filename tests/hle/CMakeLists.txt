@@ -10,6 +10,10 @@ target_include_directories(test_hle PRIVATE ${PROJECT_SOURCE_DIR}/runtime/hle/sr
 if(TARGET pspocket::ffmpeg)
     target_link_libraries(test_hle PRIVATE pspocket::ffmpeg)
 endif()
+# libpng's reader, to check what cellPngEnc writes with a decoder of its own (D-566).
+if(TARGET pspocket::libpng)
+    target_link_libraries(test_hle PRIVATE pspocket::libpng)
+endif()
 
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.

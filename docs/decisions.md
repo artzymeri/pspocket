@@ -7658,3 +7658,36 @@ converts nothing. No Sony module was at hand: firmware first (D-563). pspocket's
 Tests: tests/hle/test_key2char.cpp, 3 cases: the five functions and the marker; open, close, modes, arrangements and
 every check (a broken handle answers OTHER); letters, shift and caps lock, digits, Enter, Backspace, Space,
 punctuation, the keypad with and without num lock, Escape, and the 106 and German layouts' own characters.
+
+## D-566 · 2026-10-09 · cellPngEnc pspocket's own on libpng, firmware first
+
+libpngenc writes PNG files or buffers from pictures in memory (screenshots, photos). RPCS3's
+(rpcs3/Emu/Cell/Modules/cellPngEnc.cpp/.h, cellPng.h) has the structures, the error codes and the checks of the
+configuration, the resources and the picture, with the memory libpngenc asks for (0x47A00, or 0x78200 with SPUs, plus
+7 x maxWidth x maxBitDepth / 2, plus addMemSize, plus 0x1780), its command queue depth (4) and version (0x270000); it
+encodes nothing. No Sony module was at hand: firmware first (D-563). pspocket's, on the libpng the build has for
+cellPngDec (without libpng, games get Sony's libpngenc):
+- The handle is the work memory the game gives Open (resource.memAddr), where libpngenc keeps itself (nothing is
+  written there); memory already open, too little of it or priorities out of range: ARG (RPCS3's checks; its SPU
+  priority check, which tests the PPU priority again, tests the SPU one).
+- EncodePicture encodes on the calling thread and queues the result; at most 4 wait (then BUSY). WaitForInput: room,
+  waiting for it when told to block, else BUSY. WaitForOutput: the number waiting, waiting for one when told to block
+  (RESET if the encoder is reset meanwhile), else 0 and EMPTY. GetStreamInfo: the oldest {state, location, file name,
+  address, limit, size, processed lines, userData}, else EMPTY. Reset drops them. Blocking waits sleep a millisecond at
+  a time through lv2, so the process's end still stops the thread.
+- The picture becomes a PNG of the encode colour space: the same, or with the alpha dropped (RGBA or ARGB to RGB, gray
+  and alpha to gray), or added opaque (RGB to RGBA, gray to gray and alpha); ARGB is written as RGBA (PNG has no ARGB).
+  Gray, then colour to gray or to a palette, is refused (ARG). Bit depths as PNG has them; below 8 bits one sample a
+  byte unless packedPixel; 16-bit samples big-endian; rows pitchWidth bytes apart. compressionLevel is zlib's (0-9),
+  filterType libpng's filter set (none when 0); not interlaced.
+- Ancillary chunks with their cellPng.h structures (those pspocket's cellPngDec answers with, measured against Sony's
+  libpngdec): PLTE, tRNS, cHRM, gAMA, iCCP, sBIT, sRGB, tEXt/zTXt/iTXt, bKGD, hIST, pHYs, tIME, oFFs and sCAL. sPLT,
+  pCAL and unknown chunks are left out (logged once). A palette picture without its PLTE: STREAM_ABORT.
+- Output to a buffer (what fits is written; a stream past limitSize is STREAM_OVERFLOW) or to a file made or emptied
+  through lv2's file calls (STREAM_FILE_OPEN when it cannot be; lv2 lets no file be made in /dev_hdd0 itself).
+Tests: tests/hle/test_imgenc.cpp, 7 cases, 698 checks, each picture read back with libpng's own decoder (the test
+binary now links libpng when the build has it): the nine functions and the marker; QueryAttr's memory and Open's,
+OpenEx's and Close's checks; RGBA with padded rows, ARGB to RGBA and RGB, RGB to RGBA, 16-bit RGBA, gray to gray and
+alpha and back, 4-bit gray unpacked and packed, 1-bit gray, a palette with its PLTE and tRNS (and without its PLTE);
+text, time, gamma and physical size chunks (and an sPLT left out); the queue (four, BUSY, EMPTY, oldest first, Reset)
+and an overflowing buffer; a file on /dev_hdd0 and one that cannot be made; EncodePicture's checks.
