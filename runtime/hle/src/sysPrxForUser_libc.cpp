@@ -1077,6 +1077,15 @@ void _sys_qsort(PPUContext& ctx, u32 base_addr, u32 nelem, u32 size, u32 cmp)
 
 } // namespace
 
+// liblv2's _sys_snprintf on a call's variadic arguments after its `fixed` named ones, for the libraries whose own
+// snprintf calls _sys_vsnprintf (cellDaisy's cell::Daisy::_snprintf, D-538).
+s32 liblv2_snprintf_call(PPUContext& ctx, std::string_view what, u32 dst, u32 count, u32 fmt, u32 fixed)
+{
+    std::string text;
+    if (!format_call(ctx, what, fmt, fixed, text)) return err(lv2::CELL_EFAULT);
+    return put_snprintf(ctx, what, dst, count, text);
+}
+
 // For sysPrxForUser_sys.cpp and sys_spu_.cpp: liblv2's own _sys_malloc, _sys_memalign and _sys_free, and _sys_panic's
 // end.
 u32 lv2_malloc(PPUContext& ctx, u32 size) { return _sys_malloc(ctx, size); }

@@ -6961,3 +6961,43 @@ buffer, a 12-byte header, and calls on a handle never set and with NULLs: every 
 (but the lv2 IDs, cellAdec's handle and the callback's descriptor), the shuffled frame and the PCM the same as
 libatrac3multi's over the firmware's ATRAC3 multichannel core (2,517 checks, over 150 decodes). A test without the
 firmware plays pspocket's side alone. cellAtrac's own comparison (D-532) still passes after the split into bodies.
+
+## D-538 · 2026-10-09 · cellDaisy pspocket's own: libsre's cell::Daisy, both names of each
+
+cellDaisy is the out-of-line part of the SDK's Daisy library (cell/daisy: pipes between PPU threads and SPU programs,
+whose templates the game compiles in). libsre.sprx exports 26 functions, each under a _QN and a _ZN name (52 in the
+count; RPCS3 has todo stubs). runtime/hle/src/cellDaisy.cpp is libsre's code, read from it (D-046):
+- **Lock** (0x20 bytes: head and tail as u16 with a bitmap of completions past each, the next pointers to hand out,
+  depth, state, open producers and consumers): initialize (depth below 0x8000; a second call with the same depth is
+  fine), push/pop open and close (the last consumer closes it), the next head/tail pointer (DAISY_PTR_UNAVAILABLE when
+  empty and producers may still come, full, or 16 under way; DAISY_PTR_TERMINATED when drained and the producers are
+  gone; the pointer handed back is the moved one), and completions (with more than one open on that side, a bitmap of
+  out-of-order completions, the end moving past every completion in a row). Plain loads and stores, as libsre's.
+- **LFQueue2**: a cellSync LFQueue whose m_v1 counts open pushers and poppers, grown to 0x100 bytes by Daisy's fields
+  (open pushers, state, close waiters with their IDs, pop waiters with their IDs and the pointers they wait for).
+  GetPopPointer (SPU2PPU only; blocking needs an attached event queue; a closed queue with no pusher answers 3; a
+  marked wait, m_h3, makes the call sleep on the lv2 event queue, clear the mark and take another pointer, which
+  libsre really does), CompletePopPointer (cellSync's _cellSyncLFQueueCompletePopPointer, pspocket's own, then the first
+  pop waiter whose pointer is in reach is signalled; cellSync's AGAIN/INVAL/BUSY become Daisy's 0x8041051x),
+  PushOpen/PushClose (the last pusher signals every SPU waiter in the push side's ring), PopOpen/PopClose (the last
+  popper closes the queue and signals the close waiters until a signal fails), HasUnfinishedConsumer.
+- **ScatterGatherInterlock** over an AtomicInterlock (count, a waiting flag or the callback's argument + 1, an lv2
+  event queue, an SPU port): the constructor with SPU threads makes the "_daiSGI" event queue and connects each SPU
+  thread as a user event on the first port from the one given that the first thread accepts (one in use: the next);
+  the callback constructor; proceedSequenceNumber; probe (waiting marks the flag and sleeps on the queue); release (to a
+  waiting probe through an event port made and connected at the first such release; to the callback with its
+  argument); the destructor undoes either.
+- _snprintf is liblv2's _sys_snprintf on the variadic arguments (sysPrxForUser_libc.cpp's liblv2_snprintf_call).
+Every lwarx/ldarx and stwcx./stdcx. pair of libsre's is a snapshot of the line through the shared reservation system
+and a conditional store (as cellSync2's Reserve); lv2 calls are libsre's, with its arguments, the addresses in its
+stack frames included. Deviations: libsre's assertions are fatal logs with their text; objects that are not guest memory
+are refused with CELL_DAISY_ERROR_INVAL and the call site logged, where libsre would fault; release's "sreEventPortCreate
+time out" (1,000 EAGAINs) is a log line.
+
+Tests: tests/hle/test_daisy.cpp runs one script in two processes with libsre loaded, one calling libsre's exports and
+one pspocket's: Lock initialize checks and 3,200 random operations at depths 1 to 0x7FFF; _snprintf with arguments in
+registers and on the stack and four buffer sizes; LFQueue2 on SPU2PPU and PPU2SPU queues (each process's own cellSync
+sets them up and completes pops, so cellSync's completion with an SPU waiter to signal is compared with libsre's too),
+waits on a pre-sent event, ring wrap-around, failing signals; the interlock with a callback, with an event port, and
+with two SPU threads of a group made in the test (ports taken); and a thread probing while another releases. About
+6,500 lines of answers, bytes and callback arguments, and every lv2 call with its arguments, the same.

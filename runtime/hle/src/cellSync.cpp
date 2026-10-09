@@ -1253,6 +1253,12 @@ s32 sync_lfqueue_initialize(PPUContext& ctx, u32 queue, u32 buffer, u32 size, u3
 {
     return cellSyncLFQueueInitialize(ctx, queue, buffer, size, depth, direction, ea_signal);
 }
+
+// For cellDaisy's LFQueue2CompletePopPointer, which calls libsre's own (cellDaisy.cpp, D-538).
+s32 sync_lfqueue_complete_pop_pointer(PPUContext& ctx, u32 queue, s32 pointer, u32 signal_fn, u32 no_queue_full)
+{
+    return _cellSyncLFQueueCompletePopPointer(ctx, queue, pointer, signal_fn, no_queue_full);
+}
 } // namespace spurs
 
 void register_cellSync(Registry& r)

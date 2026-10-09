@@ -328,4 +328,8 @@ void wake_workers(u32 spurs);
 // _cellSpursLFQueueInitialize: CELL_OK or a CELL_SYNC_ERROR_*.
 s32 sync_lfqueue_initialize(PPUContext& ctx, u32 queue, u32 buffer, u32 size, u32 depth, u32 direction, u32 ea_signal);
 
+// _cellSyncLFQueueCompletePopPointer(queue, pointer, fpSendSignal, noQueueFull) (cellSync.cpp), for cellDaisy's
+// LFQueue2CompletePopPointer: CELL_OK, a CELL_SYNC_ERROR_* or the signal function's result.
+s32 sync_lfqueue_complete_pop_pointer(PPUContext& ctx, u32 queue, s32 pointer, u32 signal_fn, u32 no_queue_full);
+
 } // namespace pspocket::hle::spurs
