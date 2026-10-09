@@ -56,6 +56,7 @@
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "sysutil.hpp"
+#include "sysutil_cxml.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -1966,6 +1967,8 @@ s32 open_msg_dialog(MsgDialogSource source, u32 type, std::string_view message, 
 
 void register_cellSysutil(Registry& r)
 {
+    sysutil::register_cxml(r);
+    sysutil::register_packets(r);
     r.add("cellSysutil", {
         PS_HLE_FUNC(0x9D98AFA0, cellSysutilRegisterCallback),
         PS_HLE_FUNC(0x02FF3C1B, cellSysutilUnregisterCallback),

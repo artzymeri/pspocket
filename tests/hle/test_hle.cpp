@@ -157,20 +157,25 @@ TEST_CASE("RPCS3 stubs: their NIDs, the answer, and an implementation taking pre
     Process p(**exe);
     u8* base = p.memory.base();
 
-    // cellSysutil::cellSysutilPacketBegin is a stub in RPCS3: CELL_OK, counted apart from the gaps.
-    const u32 packet = recomp::nid_of("cellSysutilPacketBegin");
-    REQUIRE(hle::registry().find("cellSysutil", packet) == nullptr);
-    REQUIRE(hle::find_rpcs3_stub("cellSysutil", packet) != nullptr);
-    const u32 stub = p.hle->link_function("cellSysutil", packet, "cellSysutilPacketBegin");
-    REQUIRE(stub != 0);
-    CHECK(p.hle->linked_at(stub + 4)->stub != nullptr);
+    // A function RPCS3 leaves a stub answering CELL_OK, which pspocket has not made its own yet (the first of them; the
+    // libraries are being made pspocket's own one by one, D-500): CELL_OK, counted apart from the gaps.
     PPUContext ctx;
     ps_ppu_context_init(&ctx);
-    ctx.gpr[3] = 0x1234;
-    ps_ppu_call_indirect(&ctx, base, stub + 4);
-    CHECK(ctx.gpr[3] == 0);
-    CHECK(p.hle->stub_calls() == 1);
-    CHECK(p.hle->unimplemented_calls() == 0);
+    const hle::StubFunction* ok_stub = nullptr;
+    for (const hle::StubFunction& s : hle::rpcs3_stubs())
+        if (!ok_stub && s.sets_r3 && s.r3 == 0 && !hle::registry().find(s.module, s.nid)) ok_stub = &s;
+    if (ok_stub) {
+        INFO(ok_stub->module << "::" << ok_stub->name);
+        REQUIRE(hle::find_rpcs3_stub(ok_stub->module, ok_stub->nid) == ok_stub);
+        const u32 stub = p.hle->link_function(ok_stub->module, ok_stub->nid, ok_stub->name);
+        REQUIRE(stub != 0);
+        CHECK(p.hle->linked_at(stub + 4)->stub != nullptr);
+        ctx.gpr[3] = 0x1234;
+        ps_ppu_call_indirect(&ctx, base, stub + 4);
+        CHECK(ctx.gpr[3] == 0);
+        CHECK(p.hle->stub_calls() == 1);
+        CHECK(p.hle->unimplemented_calls() == 0);
+    }
 
     // cellMic::cellMicIsAttached answers 1 there.
     const u32 attached = p.hle->link_function("cellMic", recomp::nid_of("cellMicIsAttached"), "cellMicIsAttached");

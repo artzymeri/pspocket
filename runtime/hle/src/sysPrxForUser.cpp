@@ -946,6 +946,32 @@ s32 sys_mmapper_free_memory(PPUContext& ctx, u32 mem_id)
     return lv2::sys_mmapper_free_shared_memory(thread_of(ctx), mem_id);
 }
 
+// liblv2's export 0xB5D5F64E, which libsysutil imports (RPCS3 sys_mmapper_.cpp names it
+// sys_mmapper_get_shared_memory_area): the process's shared memory area, a 256 MB range of 64 KB pages that liblv2
+// takes with sys_mmapper_allocate_address (330: 0x10000000, flags 0x20F, alignment 0x10000000) the first time and
+// keeps in s_shared_memory_area (D-520). Flags other than 64 KB pages with access 0 or 0xF: CELL_EINVAL. Read from
+// liblv2.sprx (4.92): its lightweight mutex around it is the process's own (uncontended, it makes no lv2 call), here a
+// host one (D-534).
+std::mutex g_shared_memory_area_mutex;
+
+s32 sysPrxForUser_B5D5F64E(PPUContext& ctx, u64 flags, u32 address)
+{
+    if ((flags & 0xF00) != 0x200 || ((flags & 0xFF) != 0 && (flags & 0xFF) != 0xF)) return lv2::err(lv2::CELL_EINVAL);
+    std::lock_guard lock(g_shared_memory_area_mutex);
+    const u32 area = prx_variable("s_shared_memory_area");
+    u8* base = guest_base(ctx);
+    if (!ps_read32(base, area)) {
+        const s32 r = static_cast<s32>(static_cast<u32>(lv2_syscall(ctx, 330, {0x10000000, 0x20F, 0x10000000, area})));
+        if (r != 0) return r;
+    }
+    if (!guest_readable(thread_of(ctx), address, 4)) {
+        log_call_site(ctx, base, "sysPrxForUser_B5D5F64E: the address's word is not guest memory (liblv2 faults)");
+        return lv2::err(lv2::CELL_EFAULT);
+    }
+    ps_write32(base, address, ps_read32(base, area));
+    return lv2::CELL_OK;
+}
+
 // ------------------------------------------------------------------------------------------------- SFO, random, TTY
 
 // RPCS3 sysPrxForUser.cpp: the syscall _sys_process_get_paramsfo (0x40 bytes, the title ID at +1; CELL_ENOENT when the
@@ -1502,6 +1528,7 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0xDC578057, sys_mmapper_map_memory),
         PS_HLE_FUNC(0x4643BA6E, sys_mmapper_unmap_memory),
         PS_HLE_FUNC(0x409AD939, sys_mmapper_free_memory),
+        PS_HLE_FUNC(0xB5D5F64E, sysPrxForUser_B5D5F64E),
         PS_HLE_FUNC(0xE75C40F2, sys_process_get_paramsfo),
         PS_HLE_FUNC(0x71A8472A, sys_get_random_number),
         PS_HLE_FUNC(0xE66BAC36, console_putc),

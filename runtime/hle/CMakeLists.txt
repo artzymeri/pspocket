@@ -32,6 +32,8 @@ add_library(pspocket_hle STATIC
     src/sys_spu_.cpp
     src/cellSysmodule.cpp
     src/cellSysutil.cpp
+    src/cellSysutilCxml.cpp
+    src/cellSysutilPacket.cpp
     src/cellVoice.cpp
     src/modules.cpp
     src/pad_script.cpp
