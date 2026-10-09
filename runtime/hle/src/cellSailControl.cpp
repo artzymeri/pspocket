@@ -44,20 +44,6 @@ void dealloc(PPUContext& ctx, u32 p, u32 boundary, u32 ptr)
     call_guest(ctx, r32(ctx, p + pl::kFree), {r32(ctx, p + pl::kAllocArg), boundary, ptr});
 }
 
-u64 module_call(PPUContext& ctx, std::string_view module, std::string_view name, std::initializer_list<u64> args)
-{
-    const Function* f = registry().find(module, recomp::nid_of(name));
-    if (!f) PS_FATAL(kChan, "{}::{}, which libsail imports, is not pspocket's", module, name);
-    u64 saved[8];
-    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
-    u32 i = 3;
-    for (const u64 a : args) ctx.gpr[i++] = a;
-    f->fn(ctx, gb(ctx));
-    const u64 r = ctx.gpr[3];
-    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
-    return r;
-}
-
 // ------------------------------------------------------------------------------------------------- events
 
 // The game's handler(arg, event, a, b), the event (major << 32 | minor); the depth of the control thread's stack at
@@ -395,16 +381,15 @@ s32 close_stream(PPUContext& ctx, u32 d)
     return lv2::CELL_OK;
 }
 
-// The elementary streams chosen when the descriptor opens, unless the game turned auto selection off.
+// The elementary streams chosen when the descriptor opens (each kind's first ones, in order), unless the game turned
+// auto selection off; what each answers is not looked at.
 void select_streams(PPUContext& ctx, u32 d)
 {
     if (r8(ctx, d + ds::kNoAuto)) return;
     const u32 p = r32(ctx, d + ds::kPlayer);
-    if (r32(ctx, p + pl::kAudioCount) || r32(ctx, p + pl::kVideoCount) || r32(ctx, p + pl::kUserCount)) {
-        log_call_site(ctx, gb(ctx), "cellSail: a descriptor opened for a player with streams: libsail's stream "
-            "selection is a later part");
-        PS_FATAL(kChan, "libsail's elementary stream selection is a later part of D-562");
-    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) select_es(ctx, d, 0, i, 0);
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) select_es(ctx, d, 1, i, 0);
+    for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) select_es(ctx, d, 2, i, 0);
 }
 
 // Close (libsail's): an open descriptor back to created, a held one (from the control thread only) back to added; the

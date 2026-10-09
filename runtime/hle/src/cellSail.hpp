@@ -73,6 +73,14 @@ void destroy_pair(PPUContext& ctx, u32 at);
 s32 make_lwmutex(PPUContext& ctx, u32 at, const char* name);
 s32 destroy_lwmutex(PPUContext& ctx, u32 at);
 
+// A pspocket module's function by name (as libsail imports it): its answer; the registers past the call kept.
+u64 module_call(PPUContext& ctx, std::string_view module, std::string_view name, std::initializer_list<u64> args);
+
+// The elementary stream `index` of `kind` (0 audio, 1 video, 2 user) chosen in an open descriptor (cellSailDescriptor.cpp):
+// through `es` (for PAMF, a reader set to the stream) or, without, the descriptor's reader set to the kind's `index`-th
+// stream. 1 when the stream's format changed, 0 when not, or the error.
+s32 select_es(PPUContext& ctx, u32 d, s32 kind, u32 index, u32 es);
+
 // The per-stream pipelines (cellSailPipelines.cpp): the audio one at an audio slot's +0x80, the video one at a video
 // slot's +0x80; the renderers' and AU receivers' makeup and cleanup through their callbacks.
 s32 audio_pipeline_init(PPUContext& ctx, u32 a, u32 p);

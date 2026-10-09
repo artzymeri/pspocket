@@ -99,6 +99,7 @@ void part6(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part7(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part8(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part9(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part10(u8* b, const Call& call, u32 cb, GuestThread& t);
 constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00;
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
@@ -149,7 +150,8 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 6) part6(b, call, cb, t);
     else if (part == 7) part7(b, call, cb, t);
     else if (part == 8) part8(b, call, cb, t);
-    else part9(b, call, cb, t);
+    else if (part == 9) part9(b, call, cb, t);
+    else part10(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
@@ -1064,6 +1066,154 @@ void part9(u8* b, const Call& call_, u32 cb, GuestThread&)
     }
 }
 
+// The header's two streams replaced: stream 0 (video: coding type 0x1B AVC or 0x02 MPEG-2, its 26 info bytes) and
+// stream 1 (audio: 0xDC ATRAC3plus, 0x80 LPCM or 0x81 AC3, its private stream ID and info bytes).
+void set_pamf_streams(u8* b, u8 video_coding, const std::array<u8, 26>& video_info, u8 audio_coding, u8 audio_private,
+    const std::array<u8, 6>& audio_info)
+{
+    const u32 v = kPamf + 0x88, a = kPamf + 0xB8;
+    ps_write8(b, v, video_coding);
+    std::memset(b + v + 16, 0, 32);
+    std::memcpy(b + v + 16, video_info.data(), video_info.size());
+    ps_write8(b, a, audio_coding);
+    ps_write8(b, a + 5, audio_private);
+    std::memset(b + a + 16, 0, 32);
+    std::memcpy(b + a + 16, audio_info.data(), audio_info.size());
+}
+
+// The elementary streams chosen as descriptors open on a player with an audio, a video and a user stream, over AVC and
+// MPEG-2 pictures (progressive and interlaced, 720-wide aspect cases, frame rates libsail refuses) and ATRAC3plus, LPCM
+// and AC3 sound (channel counts and sample sizes, refused ones); then SetEs and CreateDatabase on an open descriptor.
+void part10(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    write_sail_pamf(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kSrcCode = kArea + 0x1C00, kRend = kArea + 0x2400, kRend2 = kArea + 0x2500,
+                  kAuR = kArea + 0x2600, kRF = kArea + 0x2E00, kDb = kArea + 0x600;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    ps_write32(b, kFuncs, cb);
+    ps_write32(b, kFuncs + 4, kSrcCode + 0xB0);
+    ps_write32(b, kFuncs + 44, kSrcCode + 0x78);
+    for (u32 i = 0; i < 9; i++) ps_write32(b, kRF + 4 * i, 0);
+    ps_write32(b, kRF, cb);
+    ps_write32(b, kRF + 4, cb);
+    ps_write32(b, kRF + 12, cb);
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 1, 1, 1, 0});
+    mask_player_source(b, kP);
+    call("cellSailSourceInitialize", {kSource, kFuncs, 0x77});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailRendererAudioInitialize", {kRend, kRF, 0x31, 0});
+    call("cellSailRendererVideoInitialize", {kRend2, kRF, 0x32, 0});
+    call("cellSailAuReceiverInitialize", {kAuR, 0, 0, 0x78});
+    call("cellSailPlayerSetRendererAudio", {kP, 0, kRend});
+    call("cellSailPlayerSetRendererVideo", {kP, 0, kRend2});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR});
+    call("cellSailPlayerBoot", {kP, 0});
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (b[kP + 0x163] != 2 && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(b[kP + 0x163] == 2);
+
+    const u32 uri = str(kUri, "x-test://movie.pam");
+    // AVC: profile, level, flags (frame MBs only 0x80, signal 0x40, frame rate + 1), aspect, SAR, 0, w/16, 0, h/16,
+    // crops (left, right, top, bottom: u16), then flags with deblocking 0x40 at +24.
+    const std::array<u8, 26> avc720 = {100, 41, 0xC4, 0xff, 0, 16, 0, 9, 0, 80, 0, 45, 0, 0, 0, 0, 0, 0, 0, 8, 0xB0, 1,
+        1, 1, 0xE2, 0x30};
+    const std::array<u8, 26> avc576i = {77, 30, 0x03, 1, 0, 0, 0, 0, 0, 45, 0, 18, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0,
+        0x80, 0};
+    const std::array<u8, 26> avc480 = {77, 31, 0x87, 1, 0, 0, 0, 0, 0, 45, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x40, 0};
+    const std::array<u8, 26> avc_bad = {100, 41, 0x82, 2, 0, 0, 0, 0, 0, 40, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0};
+    // MPEG-2: profile and level (0x48 main, 0x44 high), flags (progressive 0x80, frame rate), aspect, SAR, 0, w/16, 0,
+    // h/16, display width, display height (u16).
+    const std::array<u8, 26> m2v480 = {0x48, 0, 0x84, 1, 0, 0, 0, 0, 0, 45, 0, 30, 0x02, 0xD0, 0x01, 0xE0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0};
+    const std::array<u8, 26> m2v720 = {0x44, 0, 0x87, 3, 0, 0, 0, 0, 0, 80, 0, 45, 0x05, 0x00, 0x02, 0xD0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0};
+    const std::array<u8, 26> m2v_bad = {0x42, 0, 0x05, 2, 0, 0, 0, 0, 0, 45, 0, 36, 0x02, 0xD0, 0x02, 0x40, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0};
+    struct Variant {
+        u8 video;
+        std::array<u8, 26> vinfo;
+        u8 audio, priv;
+        std::array<u8, 6> ainfo; // +2 channels, +3 frequency, +4 LPCM sample size << 6
+    };
+    const Variant variants[] = {
+        {0x1b, avc720, 0xdc, 0x00, {0, 0, 2, 1, 0, 0}},     // ATRAC3plus stereo
+        {0x1b, avc576i, 0xdc, 0x01, {0, 0, 6, 1, 0, 0}},    // 6 channels
+        {0x1b, avc480, 0xdc, 0x00, {0, 0, 8, 1, 0, 0}},     // 8 channels
+        {0x02, m2v480, 0x80, 0x40, {0, 0, 2, 1, 0x40, 0}},  // LPCM stereo, 16 bits
+        {0x02, m2v720, 0x80, 0x41, {0, 0, 8, 1, 0xC0, 0}},  // LPCM 8 channels, 24 bits
+        {0x02, m2v480, 0x80, 0x40, {0, 0, 1, 1, 0x80, 0}},  // LPCM, a sample size refused
+        {0x1b, avc720, 0x81, 0x30, {0, 0, 6, 1, 0, 0}},     // AC3 5.1
+        {0x1b, avc480, 0x81, 0x30, {0, 0, 1, 1, 0, 0}},     // AC3 mono
+        {0x1b, avc_bad, 0x81, 0x30, {0, 0, 3, 1, 0, 0}},    // a frame rate and a channel count refused
+        {0x02, m2v_bad, 0xdc, 0x00, {0, 0, 2, 2, 0, 0}},    // the same, and 44.1 kHz
+    };
+    u32 opened = 0;
+    for (u32 i = 0; i < std::size(variants); i++) {
+        const Variant& v = variants[i];
+        set_pamf_streams(b, v.video, v.vinfo, v.audio, v.priv, v.ainfo);
+        call("cellSailPlayerCreateDescriptor", {kP, 0, 0, uri, kOut + 4 * i});
+        const u32 d = ps_read32(b, kOut + 4 * i);
+        call("cellSailDescriptorOpen", {d});
+        if (i == 0) opened = d;
+        // Each descriptor's choices kept for the comparison (the descriptors themselves are compared too).
+        std::memcpy(b + kArea + 0x700 + 0x20 * i, b + d + 0x100, 4);
+        if (std::getenv("SAIL_DIFF")) {
+            const u32 a = ps_read32(b, d + 0x28), vv = ps_read32(b, d + 0x2C);
+            std::fprintf(stderr, "ES %u audio sel %u type %u codec %u ch %u layout %u frame %u | video sel %u type %u "
+                "kind %u w %u h %u il %u aspect %u rate %u\n", i, b[a], b[a + 2], ps_read32(b, a + 0x28), b[a + 0x61],
+                ps_read32(b, a + 0x68), ps_read16(b, a + 0x62), b[vv], b[vv + 2], ps_read32(b, vv + 0x24),
+                ps_read16(b, vv + 0x3C), ps_read16(b, vv + 0x3E), b[vv + 0x39], b[vv + 0x49], b[vv + 0x3B]);
+        }
+    }
+    // SetEs and CreateDatabase on the first.
+    const u32 d = opened;
+    call("cellSailDescriptorSetEs", {d, 0, 0, 0, d + 0x40});
+    call("cellSailDescriptorSetEs", {d, 0, 0, 1, d + 0x40});
+    call("cellSailDescriptorSetEs", {d, 3, 0, 1, d + 0x40});
+    call("cellSailDescriptorSetEs", {d, 1, 1, 1, d + 0x40});
+    call("cellSailDescriptorCreateDatabase", {d, kDb, 0x7F, 0});
+    call("cellSailDescriptorCreateDatabase", {d, kDb, 0x80, 0});
+    call("cellSailDescriptorClearEs", {d, 1, 0});
+    call("cellSailDescriptorSetEs", {d, 1, 0, 1, kDb});
+    call("cellSailDescriptorClearEs", {d, 0, 0});
+    call("cellSailDescriptorSetEs", {d, 0, 0, 1, kDb});
+    call("cellSailDescriptorClearEs", {d, 2, 0});
+    call("cellSailDescriptorSetEs", {d, 2, 0, 1, kDb});
+    call("cellSailDescriptorSetEs", {d, 2, 0, 1, kDb});
+    call("cellSailDescriptorClose", {d});
+    call("cellSailDescriptorSetEs", {d, 0, 0, 1, kDb});
+    call("cellSailDescriptorCreateDatabase", {d, kDb, 0x80, 0});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    g_mask.push_back({kAuR + 0x20, 0x24});
+    for (u32 i = 0; i < ps_read32(b, kRecords); i++) {
+        const u32 r = kRecords + 16 + 48 * i;
+        const u64 arg = ps_read64(b, r);
+        if (arg == 0x22) g_mask.push_back({r + 32, 8});
+        else if (arg == 0x77) g_mask.push_back({r + 16, 24});
+        else g_mask.push_back({r + 8, 32});
+    }
+    const u32 ring = ps_read32(b, kP + 0x178);
+    for (u32 i = 0; i < ps_read32(b, kP + 0x170); i++) {
+        const u32 e = ring + 16 * i;
+        if (ps_read32(b, e) == 0x40 || ps_read32(b, e) == 0x3C) g_mask.push_back({e + 8, 4});
+        g_mask.push_back({e + 12, 4});
+    }
+}
+
 } // namespace
 
 void compare_runs(int part)
@@ -1128,4 +1278,10 @@ TEST_CASE("cellSail against libsail: descriptors opened and closed through a gam
 TEST_CASE("cellSail against libsail: Boot and Finalize of players with streams", "[hle][lle][sail]")
 {
     compare_runs(9);
+}
+
+
+TEST_CASE("cellSail against libsail: the elementary streams chosen, SetEs and CreateDatabase", "[hle][lle][sail]")
+{
+    compare_runs(10);
 }

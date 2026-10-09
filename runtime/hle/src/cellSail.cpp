@@ -111,6 +111,20 @@ s32 post_urgent(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c)
     return queue_commit(ctx, qa);
 }
 
+u64 module_call(PPUContext& ctx, std::string_view module, std::string_view name, std::initializer_list<u64> args)
+{
+    const Function* f = registry().find(module, recomp::nid_of(name));
+    if (!f) PS_FATAL(kChan, "{}::{}, which libsail imports, is not pspocket's", module, name);
+    u64 saved[8];
+    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
+    u32 i = 3;
+    for (const u64 a : args) ctx.gpr[i++] = a;
+    f->fn(ctx, gb(ctx));
+    const u64 r = ctx.gpr[3];
+    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
+    return r;
+}
+
 s32 post_completion(PPUContext& ctx, u32 player, s32 result, u64 handle)
 {
     if (!handle) return static_cast<s32>(player);

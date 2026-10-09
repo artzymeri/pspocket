@@ -7218,6 +7218,25 @@ signal after each (their number depends on when the work came). Compared with li
 audio renderer, a graphics adapter and an AU receiver booted and finalized, a mode-1 player with a sound adapter whose
 video renderer's makeup fails: 0 differences over 2776 checks in nine scripts, five runs.
 
+Part 10, the elementary streams chosen, SetEs and CreateDatabase (cellSailDescriptor.cpp): when a PAMF descriptor opens
+with auto selection on, each stream of the player takes the kind's same-numbered stream (the descriptor's reader set to
+it: type 21 audio, 20 video, 5 user), its answer ignored. libsail's selection (`select_es`): audio ATRAC3plus, LPCM or
+AC3 only (UNSUPPORTED otherwise), 48 kHz only; the entry keeps the PAMF type, the reader's stream index and the filter
+ID, then the codec (ATRAC3plus 13/14/15 for up to 2/6/8 channels with layouts 2/9/11 and 2048 samples a frame; LPCM 1,
+16 or 24 bits, 1/2/6/8 channels with layouts 1/2/8/11, 240 samples, its own 48000/channels/bits and frame bytes; AC3 2,
+1/2/6 channels, 1536 samples) and the channels; video AVC (the level; the picture less twice its bottom crop for
+fields) or MPEG-2 (profile kind 1 for 0x48, else 3; profile number capped at 3, 2 for 1280x720 at rate code 7; the
+display size), the picture {3, interlaced, 8, rate code, width, height, ...} with a 720-wide progressive picture of
+aspect 1 coded 5 (480 lines), 4 (576) or 1, and the frame rate's code (AVC 0/2/3/5/6, MPEG-2 1/3/4/6/7, others
+UNSUPPORTED after the picture is written); user streams keep the type and filter ID. A stream is marked chosen and the
+answer is 1 when its format changed from what the entry held. SetEs (open descriptors, a fourth argument that must be
+given, the stream not chosen yet: USING) chooses through the game's reader; CreateDatabase copies the reader (0x80 bytes
+at least) set to the first video stream. MP4 and AVI stop the process (a later part). module_call is shared now
+(cellSail.cpp). Compared with libsail on a booted player with an audio, a video and a user stream: ten headers (AVC 720p,
+576i and 480p, MPEG-2 480p and 720p and refused ones; ATRAC3plus 2/6/8 channels, LPCM 2 and 8 channels at 16 and 24
+bits and a refused size, AC3 5.1 and mono, refused channel counts, 44.1 kHz), SetEs's refusals and choices, CreateDatabase:
+0 differences over 2842 checks in ten scripts.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)
