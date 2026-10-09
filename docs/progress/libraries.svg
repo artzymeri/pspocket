@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 4684 of 6625 pspocket&#x27;s own (70.7%), 283 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 4736 of 6625 pspocket&#x27;s own (71.5%), 283 answered as RPCS3</text>
 <g><title>sys_libc: 978 own, 0 answered as RPCS3, 141 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -4936,60 +4936,60 @@
 <rect x="671.0" y="157.3" width="6.8" height="6.1" fill="#9be9a8"/>
 <text x="643.3" y="121.2" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">cellSys…</text>
 </g>
-<g><title>cellDaisy: 0 own, 0 answered as RPCS3, 52 not yet, of 52</title>
+<g><title>cellDaisy: 52 own, 0 answered as RPCS3, 0 not yet, of 52</title>
 <rect x="694.3" y="109.2" width="51.9" height="55.8" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="695.3" y="110.2" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="702.4" y="110.2" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="709.5" y="110.2" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="716.7" y="110.2" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="723.8" y="110.2" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="730.9" y="110.2" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="738.1" y="110.2" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="695.3" y="117.0" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="702.4" y="117.0" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="709.5" y="117.0" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="716.7" y="117.0" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="723.8" y="117.0" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="730.9" y="117.0" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="738.1" y="117.0" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="695.3" y="123.7" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="702.4" y="123.7" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="709.5" y="123.7" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="716.7" y="123.7" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="723.8" y="123.7" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="730.9" y="123.7" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="738.1" y="123.7" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="695.3" y="130.4" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="702.4" y="130.4" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="709.5" y="130.4" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="716.7" y="130.4" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="723.8" y="130.4" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="730.9" y="130.4" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="738.1" y="130.4" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="695.3" y="137.1" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="702.4" y="137.1" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="709.5" y="137.1" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="716.7" y="137.1" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="723.8" y="137.1" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="730.9" y="137.1" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="738.1" y="137.1" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="695.3" y="143.9" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="702.4" y="143.9" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="709.5" y="143.9" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="716.7" y="143.9" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="723.8" y="143.9" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="730.9" y="143.9" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="738.1" y="143.9" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="695.3" y="150.6" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="702.4" y="150.6" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="709.5" y="150.6" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="716.7" y="150.6" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="723.8" y="150.6" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="730.9" y="150.6" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="738.1" y="150.6" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="695.3" y="157.3" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="702.4" y="157.3" width="6.5" height="6.1" fill="#8c959f"/>
-<rect x="709.5" y="157.3" width="6.5" height="6.1" fill="#8c959f"/>
+<rect x="695.3" y="110.2" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="702.4" y="110.2" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="709.5" y="110.2" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="716.7" y="110.2" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="723.8" y="110.2" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="730.9" y="110.2" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="738.1" y="110.2" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="695.3" y="117.0" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="702.4" y="117.0" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="709.5" y="117.0" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="716.7" y="117.0" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="723.8" y="117.0" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="730.9" y="117.0" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="738.1" y="117.0" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="695.3" y="123.7" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="702.4" y="123.7" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="709.5" y="123.7" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="716.7" y="123.7" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="723.8" y="123.7" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="730.9" y="123.7" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="738.1" y="123.7" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="695.3" y="130.4" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="702.4" y="130.4" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="709.5" y="130.4" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="716.7" y="130.4" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="723.8" y="130.4" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="730.9" y="130.4" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="738.1" y="130.4" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="695.3" y="137.1" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="702.4" y="137.1" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="709.5" y="137.1" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="716.7" y="137.1" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="723.8" y="137.1" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="730.9" y="137.1" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="738.1" y="137.1" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="695.3" y="143.9" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="702.4" y="143.9" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="709.5" y="143.9" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="716.7" y="143.9" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="723.8" y="143.9" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="730.9" y="143.9" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="738.1" y="143.9" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="695.3" y="150.6" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="702.4" y="150.6" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="709.5" y="150.6" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="716.7" y="150.6" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="723.8" y="150.6" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="730.9" y="150.6" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="738.1" y="150.6" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="695.3" y="157.3" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="702.4" y="157.3" width="6.5" height="6.1" fill="#2da44e"/>
+<rect x="709.5" y="157.3" width="6.5" height="6.1" fill="#2da44e"/>
 <text x="697.3" y="121.2" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">cellDa…</text>
 </g>
 <g><title>sceNpCommerce2: 51 own, 1 answered as RPCS3, 0 not yet, of 52</title>
