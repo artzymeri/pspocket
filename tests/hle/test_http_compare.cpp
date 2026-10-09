@@ -858,7 +858,7 @@ std::vector<Op> transaction_script()
     header(s, o + 0x230, 58, 15); // Connection: Missing
     s.push_back({"cellHttpClientAddHeader", {C, o + 0x200}});
     s.push_back({"cellHttpClientAddHeader", {C, o + 0x208}});
-    s.push_back({"cellHttpClientSetTransactionStateCallback", {C, str(91), o + 0x80}});
+    s.push_back({"cellHttpClientSetTransactionStateCallback", {C, str(91), o + 0x3C0}}); // records at +0x3C0
     s.push_back({"pool", {}});
     // Creation's checks.
     s.push_back({"cellHttpCreateTransaction", {tid(0), 0x1234, str(50), u_http}});
