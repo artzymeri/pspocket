@@ -106,7 +106,6 @@ u32 fn(PPUContext& ctx, Fn f);
 // A string of libssl's in the block (the same address for the same text).
 u32 lit(PPUContext& ctx, std::string_view text);
 // A zeroed object of libssl's data in the block, known by name (an EVP_MD, an EVP_CIPHER, a method table).
-u32 object(PPUContext& ctx, std::string_view name, u32 size);
 
 struct Lib {
     u32 block = 0, block_used = 0;
@@ -191,6 +190,8 @@ s32 rand_seed(PPUContext& ctx, u32 buf, u32 size);
 
 // Registration of each file's functions.
 void register_lib(Registry& r);
+void register_conn(Registry& r);
+u32 heap_name(PPUContext& ctx);
 
 } // namespace ssl
 

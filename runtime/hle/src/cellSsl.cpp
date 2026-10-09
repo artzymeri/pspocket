@@ -24,8 +24,6 @@ bool ssl_initialized() { return ssl::lib().initialized; }
 
 namespace ssl {
 
-u32 heap_name(PPUContext& ctx); // cellSslLib.cpp
-
 namespace {
 
 // cellSslInit(pool, size): a heap "cellSsl_Library" over the pool (liblv2's, on the caller's memory), the lock
@@ -158,6 +156,7 @@ void register_cellSsl(Registry& r)
         PS_HLE_FUNC(0x571AFACA, cellSslCertificateLoader),
     });
     register_lib(r);
+    register_conn(r);
 }
 
 } // namespace pspocket::hle

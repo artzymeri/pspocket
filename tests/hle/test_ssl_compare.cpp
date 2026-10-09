@@ -42,6 +42,7 @@ constexpr u8 kFill = 0xA5;
 // Script flags.
 constexpr u32 kMaskAnswer = 1; // the answer depends on the run
 constexpr u32 kSign = 2;       // compared only as negative, 0 or positive
+constexpr u32 kStoreStr = 4;   // the answer is a string pointer: its text is copied to `store`, the pointer masked
 
 // An argument read when the call is made: the 32-bit word at the address.
 constexpr u64 kDeref = u64{1} << 63;
@@ -118,18 +119,125 @@ std::string flash_file(const std::string& flash, const std::string& path)
     return s.str();
 }
 
-// Inputs the scripts put into memory (by index): strings and byte blocks.
+// Made-up certificates and keys (512-bit RSA, made with OpenSSL for these tests): a CA (SHA-1, its own issuer, basic
+// constraints, key usage, key identifiers) and a server certificate it signed (MD5, a GeneralizedTime notAfter, a
+// subject alternative name, an extended key usage); their keys as PKCS #1 and PKCS #8.
+constexpr std::string_view kCaPem = R"(-----BEGIN CERTIFICATE-----
+MIIClDCCAj6gAwIBAgIFEjRWeJAwDQYJKoZIhvcNAQEFBQAwgZ0xCzAJBgNVBAYT
+AlVTMRMwEQYDVQQIDApUZXN0IFN0YXRlMRIwEAYDVQQHDAlUZXN0IENpdHkxFjAU
+BgNVBAoMDXBzcG9ja2V0IHRlc3QxEzARBgNVBAsMCnVuaXQgdGVzdHMxGTAXBgNV
+BAMMEHBzcG9ja2V0IHRlc3QgQ0ExHTAbBgkqhkiG9w0BCQEWDmNhQGV4YW1wbGUu
+Y29tMB4XDTI2MTAwOTEyMDgxNloXDTM2MTAwNjEyMDgxNlowgZ0xCzAJBgNVBAYT
+AlVTMRMwEQYDVQQIDApUZXN0IFN0YXRlMRIwEAYDVQQHDAlUZXN0IENpdHkxFjAU
+BgNVBAoMDXBzcG9ja2V0IHRlc3QxEzARBgNVBAsMCnVuaXQgdGVzdHMxGTAXBgNV
+BAMMEHBzcG9ja2V0IHRlc3QgQ0ExHTAbBgkqhkiG9w0BCQEWDmNhQGV4YW1wbGUu
+Y29tMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALydtSrZT/Q/Bw6XPm7xS2MglnVT
+z8vam5oRU+fudRWvfq9onX/Xph4v/K010AaSMnW0ok/8o9cLj8WqC164sl8CAwEA
+AaNjMGEwHQYDVR0OBBYEFA0IX/iZbmIiNdxoAnpoESYgIU48MB8GA1UdIwQYMBaA
+FA0IX/iZbmIiNdxoAnpoESYgIU48MBIGA1UdEwEB/wQIMAYBAf8CAQIwCwYDVR0P
+BAQDAgEGMA0GCSqGSIb3DQEBBQUAA0EAlHDRamH4COTwl9E5agJdl1lbSBkbtfxP
+aHQmPFRLZJHOpRTqgIzRTp1J90WLweMzHdjHVunQBsK8VEPNEx2NXA==
+-----END CERTIFICATE-----
+)";
+constexpr std::string_view kLeafPem = R"(-----BEGIN CERTIFICATE-----
+MIICXDCCAgagAwIBAgIBBzANBgkqhkiG9w0BAQQFADCBnTELMAkGA1UEBhMCVVMx
+EzARBgNVBAgMClRlc3QgU3RhdGUxEjAQBgNVBAcMCVRlc3QgQ2l0eTEWMBQGA1UE
+CgwNcHNwb2NrZXQgdGVzdDETMBEGA1UECwwKdW5pdCB0ZXN0czEZMBcGA1UEAwwQ
+cHNwb2NrZXQgdGVzdCBDQTEdMBsGCSqGSIb3DQEJARYOY2FAZXhhbXBsZS5jb20w
+IBcNMjAwMTAyMDMwNDA1WhgPMjA1MTAxMDEwMDAwMDBaMD4xCzAJBgNVBAYTAkpQ
+MRUwEwYDVQQKDAxFeGFtcGxlIExlYWYxGDAWBgNVBAMMD3d3dy5leGFtcGxlLmNv
+bTBcMA0GCSqGSIb3DQEBAQUAA0sAMEgCQQCl2r9AeXpLDAKuVjIH2tOvlziY7O0r
+/n/LV6k24qcSr4SmpkSNWTLn5y2raCFGIEOi6CzvwuF8Pk1ArNbty4otAgMBAAGj
+gYwwgYkwJwYDVR0RBCAwHoIPd3d3LmV4YW1wbGUuY29tggtleGFtcGxlLmNvbTAT
+BgNVHSUEDDAKBggrBgEFBQcDATAJBgNVHRMEAjAAMB0GA1UdDgQWBBSUKJwrwka6
+r6wcctqs3RfcdmkIsjAfBgNVHSMEGDAWgBQNCF/4mW5iIjXcaAJ6aBEmICFOPDAN
+BgkqhkiG9w0BAQQFAANBAI0oC0f3yXdc7k6LoODFOnECg3v6oLzzyD5GUAqaMrFs
+6oLwTPCg7To9eyDtAFF6BLWFTMs+bth/plZ0ro5vwT4=
+-----END CERTIFICATE-----
+)";
+constexpr std::string_view kCaKey = R"(-----BEGIN RSA PRIVATE KEY-----
+MIIBOQIBAAJBALydtSrZT/Q/Bw6XPm7xS2MglnVTz8vam5oRU+fudRWvfq9onX/X
+ph4v/K010AaSMnW0ok/8o9cLj8WqC164sl8CAwEAAQJABQH66WRTpxx1R4HkenWV
+ltAqrnrHLZZkQzbqj2HZYfX3JlHHB6DqR1cGBU/r3Y6fgC0kugbG5Ep4TVVmDhmA
+AQIhAO4p227s4sLWgfPP1zi+0YAMfdfUX3BFcs3xrQrrFkJfAiEAyr3pYPqKrRmV
+tKi07ZK3IAy5Tm4mxtUTFD9vQwbTkAECIDGsb0UaiU1D+kTE88m1GvMPJ+wtMl6z
+TXeg0Yu2bqUXAiB4bCtGFiruvGamoxqsjlvFZqlew6C2s3McsL0Wk+RwAQIgM/LJ
+3pLdx64gt2QlRKdOu0ODjXmbFXUtHmZTWhymzDE=
+-----END RSA PRIVATE KEY-----
+)";
+constexpr std::string_view kLeafKey = R"(-----BEGIN RSA PRIVATE KEY-----
+MIIBOQIBAAJBAKXav0B5eksMAq5WMgfa06+XOJjs7Sv+f8tXqTbipxKvhKamRI1Z
+MufnLatoIUYgQ6LoLO/C4Xw+TUCs1u3Lii0CAwEAAQJAYCQrlU5Vy8cMjs68db0t
+1K2OS2ecHFKM9ey81GoSe0uARw3E0ukfZml4+i9+gyhj2HWhaY6jI3If/H+0CZE6
+gQIhANWnU1QcZZtIZ37ZwxTSPnVl7KWIu1cCR22S6EEqff5dAiEAxroeOwh59Ur9
+mtIuPf2WGOV3BYqVAbjvWANFAYSt3hECIFblgjfAgPbiQO3P5c8vH6Yh+VjuPrvJ
+uoFvcbUnci0lAiAux3METGuA/UUTY7R07TOe6q0IxeVrgV/95M8im1veMQIgbBrR
+gFBK4hVKaibOqHDyiGttW1JWrcJvmr+xHEx8lS4=
+-----END RSA PRIVATE KEY-----
+)";
+constexpr std::string_view kLeafKey8 = R"(-----BEGIN PRIVATE KEY-----
+MIIBUwIBADANBgkqhkiG9w0BAQEFAASCAT0wggE5AgEAAkEApdq/QHl6SwwCrlYy
+B9rTr5c4mOztK/5/y1epNuKnEq+EpqZEjVky5+ctq2ghRiBDougs78LhfD5NQKzW
+7cuKLQIDAQABAkBgJCuVTlXLxwyOzrx1vS3UrY5LZ5wcUoz17LzUahJ7S4BHDcTS
+6R9maXj6L36DKGPYdaFpjqMjch/8f7QJkTqBAiEA1adTVBxlm0hnftnDFNI+dWXs
+pYi7VwJHbZLoQSp9/l0CIQDGuh47CHn1Sv2a0i49/ZYY5XcFipUBuO9YA0UBhK3e
+EQIgVuWCN8CA9uJA7c/lzy8fpiH5WO4+u8m6gW9xtSdyLSUCIC7HcwRMa4D9RRNj
+tHTtM57qrQjF5WuBX/3kzyKbW94xAiBsGtGAUEriFUpqJs6ocPKIa21bUlatwm+a
+v7EcTHyVLg==
+-----END PRIVATE KEY-----
+)";
+
+// The DER inside a PEM block (base64 between the BEGIN and END lines).
+std::string pem_der(std::string_view pem)
+{
+    const usize begin = pem.find('\n', pem.find("-----BEGIN"));
+    const usize end = pem.find("-----END");
+    std::string out;
+    u32 acc = 0, bits = 0;
+    for (usize i = begin; i < end; i++) {
+        const char c = pem[i];
+        int v = -1;
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '+') v = 62;
+        else if (c == '/') v = 63;
+        if (v < 0) continue;
+        acc = acc << 6 | static_cast<u32>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += static_cast<char>((acc >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+
+// Inputs the scripts put into memory (by index): strings and byte blocks. The console's certificates come from the
+// installed firmware.
 std::vector<std::string> inputs(const std::string& flash)
 {
+    const std::string ca01 = flash_file(flash, "/data/cert/CA01.cer");
     std::vector<std::string> v = {
-        "",                                      // 0
-        flash_file(flash, "/data/cert/CA01.cer"), // 1
+        "",                       // 0
+        ca01,                     // 1 a console certificate (PEM)
+        std::string(kCaPem),      // 2
+        std::string(kLeafPem),    // 3
+        std::string(kCaKey),      // 4
+        std::string(kLeafKey),    // 5
+        std::string(kLeafKey8),   // 6
+        pem_der(kCaPem),          // 7 DER
+        pem_der(kLeafPem),        // 8
+        pem_der(ca01),            // 9
+        pem_der(kLeafKey),        // 10
     };
     return v;
 }
 
 // An input's address (0x1000 apart for the small ones; certificates have room).
 u64 in(u32 i) { return kIn + 0x2000 * u64{i}; }
+// An input's size.
+u32 in_size(const std::string& flash, u32 i) { return static_cast<u32>(inputs(flash)[i].size()); }
 
 // ------------------------------------------------------------------------------------------------- tracing
 
@@ -222,6 +330,7 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
         tracer.hi = tracer.lo + static_cast<u32>(ssl->segments[0].second);
         tracer.out = std::fopen(trace_path, "w");
         REQUIRE(tracer.out);
+        std::setvbuf(tracer.out, nullptr, _IOLBF, 0);
         if (const char* stubs = std::getenv("PSPOCKET_SSL_STUBS")) {
             std::ifstream sf(stubs);
             std::string line;
@@ -324,7 +433,20 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
             std::fprintf(stderr, "PROBE %zu %s %s(%s) -> %#x\n", step - 1, sony ? "sony" : "ours", fn.c_str(),
                 op.args.empty() ? "" : std::format("{:#x}", op.args[0]).c_str(), r3);
         }
-        if (op.store) ps_write32(b, op.store, r3);
+        if (op.flags & kStoreStr) {
+            // The returned string (both runs point into their own globals): its bytes go to `store` for comparison.
+            // A null return (0) stores nothing; the read stops at memory the run never committed.
+            char buf[128] = {0};
+            buf[0] = r3 ? '\x01' : '\0'; // whether the pointer is null is itself compared
+            for (u32 i = 0; r3 && i < sizeof(buf) - 2 && f.kernel->memory().is_committed(r3 + i); i++) {
+                const char c = static_cast<char>(ps_read8(b, r3 + i));
+                buf[i + 1] = c;
+                if (!c) break;
+            }
+            std::memcpy(b + op.store, buf, sizeof(buf));
+            r3 = 0;
+        }
+        if (op.store && !(op.flags & kStoreStr)) ps_write32(b, op.store, r3);
         if (op.flags & kMaskAnswer) r3 = 0;
         if (op.flags & kSign) r3 = static_cast<s32>(r3) < 0 ? 0xFFFFFFFF : r3 ? 1 : 0;
         r.answers.push_back(r3);
@@ -457,11 +579,87 @@ std::vector<Op> setup_script()
     return s;
 }
 
-std::vector<Op> probe_script()
+// The self-contained functions a game reaches without a certificate or connection: the version and cipher-id
+// conversions, the alert strings, the cipher accessors (null, as there is no handshake), the BIO callback accessors
+// (null), the title flag and the OID-to-string table.
+std::vector<Op> strings_script()
 {
     std::vector<Op> s;
+    const u64 o = kOut;
+    // The conversions (they write their result to a pointer).
+    for (u32 v : {0x300u, 0x301u, 0x302u, 0u}) s.push_back({"_cellSslConvertSslVersion", {v, o + 0x10}, 0, static_cast<u32>(o + 0x10)});
+    for (u32 v : {3u, 4u, 5u, 6u, 8u, 10u, 0x62u, 100u, 0u, 7u, 9u, 200u})
+        s.push_back({"_cellSslConvertCipherId", {v, o + 0x14}, 0, static_cast<u32>(o + 0x14)});
+    // The alert strings (the answer is a pointer; its text is compared).
+    u32 at = o + 0x100;
+    for (u32 v : {0x100u, 0x200u, 0x300u}) { s.push_back({"SSL_alert_type_string_long", {v}, kStoreStr, at}); at += 0x40; }
+    for (u32 v : {0u, 10u, 0x14u, 0x1Eu, 0x28u, 0x29u, 0x2Au, 0x2Bu, 0x2Cu, 0x2Du, 0x2Eu, 0x2Fu, 0x33u})
+        { s.push_back({"SSL_alert_desc_string_long", {v}, kStoreStr, at}); at += 0x40; }
+    // The cipher accessors with no cipher (0): the defaults.
+    s.push_back({"SSL_CIPHER_get_id", {0}});
+    s.push_back({"SSL_CIPHER_get_name", {0}, kStoreStr, at}); at += 0x40;
+    s.push_back({"SSL_CIPHER_get_version", {0}, kStoreStr, at}); at += 0x40;
+    s.push_back({"SSL_CIPHER_get_bits", {0, o + 0x18}, 0, static_cast<u32>(o + 0x18)});
+    // The BIO callback accessors with no BIO (0).
+    s.push_back({"BIO_get_cb_arg", {0}});
+    s.push_back({"BIO_set_cb_arg", {0, 0x1234}});
+    // The title flag and the OID table need libssl initialised.
     s.push_back({"cellSslInit", {kPool, kPoolSize}});
-    s.push_back({"in", {in(1), 1}});
+    s.push_back({"cellSsl_CC6A0CB5", {o + 0x200}, 0, static_cast<u32>(o + 0x208)});
+    s.push_back({"cellSsl_404136C1", {0}});
+    // SSLCERT_OID_to_string on the standard attribute OIDs {2,5,4,n}, short and long names.
+    for (u32 n : {3u, 4u, 5u, 6u, 7u, 8u, 10u, 11u, 12u, 13u, 0x2Au, 0x2Bu, 0x2Du, 99u}) {
+        s.push_back({"=", {o + 0x300, 0x55040000u | (n << 8)}});
+        s.push_back({"SSLCERT_OID_to_string", {o + 0x300, 3, 0}, kStoreStr, at}); at += 0x40;
+        s.push_back({"SSLCERT_OID_to_string", {o + 0x300, 3, 1}, kStoreStr, at}); at += 0x40;
+    }
+    s.push_back({"cellSslEnd", {}});
+    return s;
+}
+
+// Discovery (PSPOCKET_SSL_PROBE, Sony's side traced): the certificate functions on the made-up certificates.
+std::vector<Op> probe_script(const std::string& flash)
+{
+    std::vector<Op> s;
+    const u64 o = kOut;
+    s.push_back({"cellSslInit", {kPool, kPoolSize}});
+    for (u32 i = 1; i <= 10; i++) s.push_back({"in", {in(i), i}});
+    const u64 cert = o + 0x200, cert2 = o + 0x204;
+    s.push_back({"=", {o + 0x100, in(7)}});
+    s.push_back({"SSLCERT_from_binary", {0, o + 0x100, in_size(flash, 7)}, 0, static_cast<u32>(cert)});
+    s.push_back({"pool", {}});
+    s.push_back({"=", {o + 0x104, in(8)}});
+    s.push_back({"SSLCERT_from_binary", {0, o + 0x104, in_size(flash, 8)}, 0, static_cast<u32>(cert2)});
+    s.push_back({"SSLCERT_get_subject_name", {cert | kDeref}, 0, static_cast<u32>(o + 0x208)});
+    s.push_back({"SSLCERT_get_issuer_name", {cert2 | kDeref}, 0, static_cast<u32>(o + 0x20C)});
+    s.push_back({"SSLCERT_NAME_get_entry_count", {(o + 0x208) | kDeref}});
+    s.push_back({"SSLCERT_NAME_get_entry", {(o + 0x208) | kDeref, 1}, 0, static_cast<u32>(o + 0x210)});
+    s.push_back({"SSLCERT_NAME_ENTRY_get_info", {(o + 0x210) | kDeref, o + 0x300, o + 0x310}});
+    s.push_back({"SSLCERT_NAME_oneline", {(o + 0x208) | kDeref, o + 0x400, 0x100}});
+    s.push_back({"SSLCERT_NAME_oneline", {(o + 0x208) | kDeref, 0, 0}});
+    s.push_back({"SSLCERT_NAME_cmp", {(o + 0x208) | kDeref, (o + 0x20C) | kDeref}});
+    s.push_back({"SSLCERT_get_notBefore", {cert | kDeref, o + 0x320, o + 0x324, o + 0x328}});
+    s.push_back({"SSLCERT_get_notAfter", {cert2 | kDeref, o + 0x330, o + 0x334, o + 0x338}});
+    s.push_back({"SSLCERT_get_pubkey", {cert | kDeref}, 0, static_cast<u32>(o + 0x214)});
+    s.push_back({"cellSsl_62236E88", {(o + 0x208) | kDeref}});
+    s.push_back({"cellSslCertGetSerialNumber", {cert | kDeref, o + 0x340, o + 0x344}});
+    s.push_back({"cellSslCertGetPublicKey", {cert | kDeref, o + 0x348, o + 0x34C}});
+    s.push_back({"cellSslCertGetRsaPublicKeyModulus", {cert | kDeref, o + 0x350, o + 0x354}});
+    s.push_back({"cellSslCertGetRsaPublicKeyExponent", {cert | kDeref, o + 0x358, o + 0x35C}});
+    s.push_back({"cellSslCertGetMd5Fingerprint", {cert | kDeref, o + 0x360, o + 0x378}});
+    s.push_back({"cellSslCertGetNotBefore", {cert | kDeref, o + 0x380}});
+    s.push_back({"cellSslCertGetNotAfter", {cert2 | kDeref, o + 0x388}});
+    s.push_back({"cellSslCertGetSubjectName", {cert | kDeref, o + 0x390}});
+    s.push_back({"cellSslCertGetIssuerName", {cert2 | kDeref, o + 0x394}});
+    s.push_back({"cellSslCertGetNameEntryCount", {(o + 0x208) | kDeref, o + 0x398}});
+    s.push_back({"cellSslCertGetNameEntryInfo", {(o + 0x208) | kDeref, 0, o + 0x3A0, o + 0x3A4, o + 0x3A8, 0}});
+    s.push_back({"cellSsl_2E8CC56D", {cert | kDeref}});
+    s.push_back({"SSLCERT_verify", {cert2 | kDeref, (o + 0x214) | kDeref}});
+    s.push_back({"SSLCERT_get_basic_constraints_int", {cert | kDeref, 0, o + 0x3B0, o + 0x3B4}});
+    s.push_back({"cellSsl_C132E990", {cert | kDeref}});
+    s.push_back({"pool", {}});
+    s.push_back({"SSLCERT_free", {cert | kDeref}});
+    s.push_back({"SSLCERT_free", {cert2 | kDeref}});
     s.push_back({"pool", {}});
     s.push_back({"cellSslEnd", {}});
     return s;
@@ -476,9 +674,16 @@ TEST_CASE("cellSsl against libssl: set-up", "[hle][lle][ssl]")
     compare(*flash, setup_script(), "set-up");
 }
 
+TEST_CASE("cellSsl against libssl: conversions and names", "[hle][lle][ssl]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, strings_script(), "strings");
+}
+
 TEST_CASE("cellSsl against libssl: probe", "[.][hle][lle][ssl]")
 {
     const std::optional<std::string> flash = test_dev_flash();
     if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
-    compare(*flash, probe_script(), "probe");
+    compare(*flash, probe_script(*flash), "probe");
 }

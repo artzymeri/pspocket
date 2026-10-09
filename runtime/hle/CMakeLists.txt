@@ -26,6 +26,7 @@ add_library(pspocket_hle STATIC
     src/cellSpursSemaphore.cpp
     src/cellSsl.cpp
     src/cellSslLib.cpp
+    src/cellSslConn.cpp
     src/cellSync.cpp
     src/sys_prx.cpp
     src/sys_spu_.cpp

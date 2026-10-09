@@ -1333,9 +1333,13 @@ TEST_CASE("cellSsl: init and end, no firmware certificates", "[hle][net]")
     constexpr u32 kBuf = kData + 0x1000, kRequired = kData + 0x100;
     const u64 kNotInit = r3_of_code(0x80740001), kAlready = r3_of_code(0x80740002), kNoBuffer = r3_of_code(0x80740004);
 
+    // libssl makes a heap over the pool it is given, so a null pool or size is CELL_SSL_ERROR_NO_BUFFER (D-530;
+    // compared with Sony's module in test_ssl_compare.cpp). The whole set-up runs without firmware.
     CHECK(g.call("cellSslEnd") == kNotInit);
-    CHECK(g.call("cellSslInit", 0, 0) == 0); // the pool is libssl's own: not checked (RPCS3)
-    CHECK(g.call("cellSslInit", kData, 0x10000) == kAlready);
+    CHECK(g.call("cellSslInit", 0, 0x10000) == kNoBuffer);
+    CHECK(g.call("cellSslInit", kData, 0) == kNoBuffer);
+    CHECK(g.call("cellSslInit", kData, 0x10000) == 0);
+    CHECK(g.call("cellSslInit", 0, 0) == kAlready);
     CHECK(g.call("cellSslEnd") == 0);
     CHECK(g.call("cellSslEnd") == kNotInit);
 
