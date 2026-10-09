@@ -6777,3 +6777,61 @@ half loaded, streamed (topped up and left to run dry), looped at the end and ins
 Create and CreateExt, fact chunks of both sizes, an odd unknown chunk, 44.1/32 kHz, a wrong GUID, a PCM tag, a read
 larger than the buffer, a 12-byte header: every answer, output, the handle's bytes and the PCM the same as
 libatrac3plus's (5,000-line log), over 150 decodes.
+## D-530 · 2026-10-09 · cellSsl pspocket's own: libssl's set-up and the crypto library under it, as far as offline reaches
+
+cellSsl had three functions after RPCS3's (cellSslInit/End, which only flipped a flag, and the certificate loader,
+which cleared a buffer). It is now libssl.sprx's own logic, read from its code and compared with the module running
+on pspocket's lv2: all 114 of libssl's exports are registered and native (runtime/hle/src/cellSsl.cpp, cellSslLib.cpp,
+cellSslConn.cpp), the offline-reachable ones pspocket's own and the cryptographic core answering as libssl does where
+it cannot run without a connection.
+
+- **What libssl is.** RSA's SSL-C, an SSLeay/OpenSSL-0.9 descendant: the same LHASH, OBJ_NAME table, ERR queue, BIO,
+  ASN.1/X509 objects and SSL state machine, over RSA's own crypto library (the "R_" functions and a context of
+  resources). It keeps everything in a liblv2 heap made over the pool cellSslInit is given and its globals in its data
+  segment. pspocket does the same (cellSslLib.cpp): every object is a heap block of libssl's size made at the same
+  moment, its fields at libssl's offsets, so the pool's bytes are libssl's. What the pool points at that is not an
+  object — the strings a function returns by value, the EVP method tables, the function ids an object names — lives in
+  a guest block of pspocket's (ssl.hpp Lib::block), where a function libssl names by descriptor is an address of its
+  own.
+- **Set-up.** cellSslInit makes the heap "cellSsl_Library" over the caller's pool (liblv2's, D-502), the lightweight
+  mutex "_sslsys" (recursive), installs SSL-C's memory functions and lock callback, builds the library context, seeds
+  the random generator with 64 bytes from sys_get_random_number, and installs the time callback; it answers
+  CELL_SSL_ERROR_NO_BUFFER for a null pool or size (RPCS3 checked neither), NO_MEMORY when the heap can't be made, and
+  INITIALIZATION_FAILED on a later step. cellSslEnd frees the library context (OBJ_NAME_cleanup over the table, the
+  error states and strings), deletes the heap and destroys the mutex. cellSslGetMemoryInfo reports the heap's free
+  size and liblv2's mallinfo; it checks nothing (RPCS3: UNIMPLEMENTED), so with no heap it is liblv2's answer for heap
+  0. The library context's resource list is libssl's: the digest and cipher aliases, then four ciphers and nine
+  digests registered into OBJ_NAME in libssl's order, each OBJ name an object of standard names (PKCS #1, RFC 3279,
+  NIST), the LHASH grown before it inserts and freed bucket by bucket as libssl's.
+- **The error queue (ERR).** Each thread's ERR_STATE (a 332-byte ring of sixteen) is made at its first error and kept
+  in an LHASH keyed by the thread id, which is always 0 (no id callback is set). ERR_get_error / ERR_peek_error read
+  the ring; ERR_error_string formats "error:%08lX::lib(n) :func(n) :reason(n)" by number (liblv2's _sys_vsprintf),
+  because libssl loads no error strings, so ERR_func_error_string and the string table are empty.
+- **Conversions and names.** _cellSslConvertSslVersion, _cellSslConvertCipherId, SSL_alert_type_string_long,
+  SSL_alert_desc_string_long and SSLCERT_OID_to_string are pspocket's own tables; the cipher and BIO accessors answer
+  as libssl does for the null cipher or BIO a game has without a handshake. cellSsl_CC6A0CB5 (libhttp asks for a
+  title's extra verification flag) reads the running title's PARAM.SFO as libssl does and returns the default: the
+  list of titles libssl gives other flags is its data and is not reproduced (CLAUDE.md rule 1), so no title matches.
+- **Surprises.** libssl's realloc takes the old size (it copies the smaller of the two). Its LHASH grows a bucket
+  before it splits, and shrinks only past sixteen nodes. ERR_put_error writes only the code, file, line and data of a
+  slot and leaves the rest of the slot's bytes as the ring held them. R_time_new always answers 0: it allocates a
+  time object, asks the installed callback to fill it, and the callback fills nothing, so it frees the object and
+  returns 0. cellSslInit seeds the generator and installs the X509 and time method tables through a resource list
+  whose cleanups run in order at cellSslEnd.
+- **Left out (the next part).** The X509/ASN.1/RSA certificate parser (SSLCERT_from_binary and the method table it
+  installs, the cellSslCert* queries, BER_read_item, EVP_PKEY_free, the PEM readers) and the TLS state machine
+  (SSL_CTX_new, SSL_new, the handshake, read/write, the BIO memory and socket subsystem) are reached only around a
+  TLS handshake, which pspocket's offline console can't complete (the boundary D-524 drew for cellHttp). Each is
+  registered and native: it logs the call site and answers as libssl does with no certificate or connection (0, or
+  the public cellSslCert* functions make libssl's init and pointer checks first, then UNRETRIEVABLE). It is the next
+  part, compared against a loopback once the handshake is pspocket's. Because of this, libhttp's cellHttpsInit still
+  loads no CA certificates (its loader calls cellSsl_9447404F, the PEM parser) and cellHttpClientSetSslClientCertificate
+  still answers INTERNAL, as D-524 left them.
+- **Compared** in tests/hle/test_ssl_compare.cpp (D-193's method, `[ssl]`): scripts in two fresh processes, Sony's
+  libssl and pspocket's, with every answer, the scripts' memory, libssl's pool (its heap, the same blocks at the same
+  places, lv2 IDs and pointers to each side's globals set aside) and the lv2 calls the thread makes the same. Scripts:
+  the set-up (init on a null and a small pool, the memory report and callback, re-init on a used pool), and the
+  conversions, alert strings, cipher and BIO null answers, the title flag and the OID names (507 comparisons over the
+  two, 0 differences). A test without the firmware keeps libssl's set-up answers. The certificate functions are driven
+  by a hidden probe (made-up certificates from OpenSSL) that traces Sony's module to map the parser, not compared,
+  since the parser is the next part. The old RPCS3 cellSsl check in tests/hle/test_net.cpp now expects Sony's set-up.
