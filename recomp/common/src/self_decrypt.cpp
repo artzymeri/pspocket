@@ -72,7 +72,18 @@ const SelfKey* find_self_key(std::span<const SelfKey> keys, u32 type, u32 revisi
     return nullptr;
 }
 
-Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const SelfKey> keys)
+Result<Key128> npdrm_metadata_key(const NpdrmInfo& npd, const NpdrmLicence& licence)
+{
+    const Result<Key128> content = npdrm_content_key(NpdrmContent::self, npd.license, npd.content_id, licence);
+    if (!content) return content.error();
+    Key128 key{};
+    if (!crypto::aes_ecb_decrypt(licence.npdrm_keys().klic_key, content->data(), 16, key.data()))
+        return make_error("AES-128-ECB failed");
+    return key;
+}
+
+Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const SelfKey> keys,
+    const NpdrmLicence* licence)
 {
     auto parsed = parse_self(self);
     if (!parsed) return parsed.error();
@@ -85,9 +96,18 @@ Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const S
     if (info.sce.type != 1 || !info.ext || !info.app || !info.elf) {
         return make_error("not a SELF executable{}", info.warnings.empty() ? "" : ": " + info.warnings.front());
     }
-    if (const NpdrmInfo* npd = info.npdrm()) {
-        return make_error("a PSN executable ({}, {}): it needs its licence, which disc games do not",
-            npd->content_id, npdrm_license_name(npd->license));
+    // A PSN executable's content key (RPCS3 DecryptNPDRM): from the licence the caller gives.
+    const NpdrmInfo* npd = info.npdrm();
+    std::optional<Key128> npdrm_key;
+    if (npd) {
+        if (!licence) {
+            return make_error("a PSN executable ({}, {}): it needs its licence, which was not given", npd->content_id,
+                npdrm_license_name(npd->license));
+        }
+        Result<Key128> k = npdrm_metadata_key(*npd, *licence);
+        if (!k) return make_error("a PSN executable ({}, {}): {}", npd->content_id, npdrm_license_name(npd->license),
+            k.error().message);
+        npdrm_key = *k;
     }
     const SelfKey* key = find_self_key(keys, info.app->self_type, info.sce.key_revision, info.app->version);
     if (!key) {
@@ -95,20 +115,34 @@ Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const S
         return make_error("no key for a {} executable of key revision {:#x}", self_type_name(info.app->self_type),
             info.sce.key_revision);
     }
-    // Metadata info, right after the SCE header at the metadata offset: AES-256-CBC with the key (LoadMetadata).
+    // Metadata info, right after the SCE header at the metadata offset: a PSN executable's AES-128-CBC layer with its
+    // content key and a zero IV first (DecryptNPDRM), then AES-256-CBC with the key (LoadMetadata).
     const ByteReader r(self);
     const u64 info_offset = u64{info.sce.metadata_offset} + 0x20;
     if (!r.in_bounds(info_offset, kMetadataInfoSize) || info.sce.header_size < info_offset + kMetadataInfoSize ||
         info.sce.header_size > self.size()) {
         return make_error("metadata outside the file");
     }
+    std::array<u8, kMetadataInfoSize> layer{};
+    std::copy_n(self.data() + info_offset, kMetadataInfoSize, layer.begin());
+    if (npdrm_key) {
+        const u8 zero_iv[16]{};
+        std::array<u8, kMetadataInfoSize> outer{};
+        if (!crypto::aes_cbc_decrypt(*npdrm_key, zero_iv, layer.data(), layer.size(), outer.data()))
+            return make_error("AES-128-CBC failed");
+        layer = outer;
+    }
     std::array<u8, kMetadataInfoSize> meta_info{};
-    if (!aes256_cbc_decrypt(key->erk.data(), key->riv.data(), self.data() + info_offset, kMetadataInfoSize,
-            meta_info.data())) {
+    if (!aes256_cbc_decrypt(key->erk.data(), key->riv.data(), layer.data(), kMetadataInfoSize, meta_info.data())) {
         return make_error("AES-256-CBC failed");
     }
     // A wrong key leaves the pads non-zero (RPCS3 LoadMetadata's check).
     if (meta_info[0x10] != 0 || meta_info[0x30] != 0) {
+        if (npd) {
+            return make_error("a PSN executable ({}, {}): its licence does not open it (a licence for other content, "
+                              "the wrong klicensee, or a damaged file)", npd->content_id,
+                npdrm_license_name(npd->license));
+        }
         return make_error("the {} key for revision {:#x} does not open the metadata (a damaged file?)",
             self_type_name(info.app->self_type), info.sce.key_revision);
     }
