@@ -309,7 +309,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-09: 3,927 of 6,625):
+firmware module. Done so far (2026-10-09: 5,527 of 6,625, 83.4%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -321,7 +321,17 @@ console with no USB device (D-522), lv2's network calls and libnet's own layer o
 (D-524: all 123 functions, libhttp's objects where libhttp lays them; past a connection blocked on libnet's resolver),
 sysPrxForUser's raw SPU loaders (D-529, which also fixed sys_spu_segment's address offset), cell_FreeType2 (D-525,
 FreeType 2.2.1 on the host), cellFontFT (D-526 part 1), cellSync2 (D-531, libsync2's objects bit for bit), cellAtrac (D-532, libatrac3plus over
-pspocket's cellAdec).
+pspocket's cellAdec), cellSsl (D-530), sys_io's config service (D-533), cellSysutil complete (D-534), cellAtracMulti
+(D-535), cellFont (D-526 part 2), cellDaisy (D-538), sys_net part 2 (D-539), cellSail parts 1-12 (D-562: everything up
+to playing; Start, Stop and the other playback calls are its next part, read from libsail on the Mac).
+- **The C++ library, sys_libstdcxx, all 556 functions**: the foundation and the streams (D-560) and the facets (D-561:
+  ctype, codecvt, collate, messages, numpunct, num_get/num_put, moneypunct, money_get/money_put, time_get/time_put),
+  Dinkumware's of VC8's generation in the "C" locale. No Sony module to compare with (games link it into themselves).
+Left (1,098, 2026-10-09): sys_libc and sys_libm's internals (278: Dinkumware's formatter and locale internals, TLS,
+setjmp/longjmp, the raw SPU printf family), cellSpursJq (63), cellSailRec (58), libsnd3 (50), cellFiber (47), cellRudp
+(31), libmixer (27), the codec cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec, libdivx*,
+cell*dec's core ops), cellSail's playback (19), the encoders (cellJpgEnc, cellPngEnc, cellCelp*Enc), and the 188
+functions still answered as RPCS3's stubs.
 Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,
 services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
 interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
