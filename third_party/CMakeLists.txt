@@ -7,13 +7,19 @@ if(PSPOCKET_BUILD_TESTS)
     add_library(pspocket::catch2 ALIAS pspocket_catch2)
 endif()
 
-# FFmpeg 7.1.1's LGPL decoders (D-181), built by scripts/build-ffmpeg.sh into build/ffmpeg/{macos,ios}: pspocket's own
-# media libraries (cellVdec, cellAdec, cellAtrac, cellDmux) decode with them as RPCS3's do. Optional: without them
+# FFmpeg 7.1.1's LGPL decoders (D-181), built by scripts/build-ffmpeg.sh into build/ffmpeg/{macos,ios,linux}: pspocket's
+# own media libraries (cellVdec, cellAdec, cellAtrac, cellDmux) decode with them as RPCS3's do. Optional: without them
 # those libraries build without their decoders (code under #if PSPOCKET_HAVE_FFMPEG), and decoding fails, logged.
-set(PSPOCKET_FFMPEG_DIR "" CACHE PATH "FFmpeg prefix (include/, lib/); default: build/ffmpeg/macos when it exists")
+set(PSPOCKET_FFMPEG_DIR "" CACHE PATH
+    "FFmpeg prefix (include/, lib/); default: build/ffmpeg/macos on the Mac, build/ffmpeg/linux on Linux, when it exists")
 set(pspocket_ffmpeg_dir "${PSPOCKET_FFMPEG_DIR}")
 if(NOT pspocket_ffmpeg_dir AND APPLE AND NOT IOS AND EXISTS ${PROJECT_SOURCE_DIR}/build/ffmpeg/macos/lib/libavcodec.a)
     set(pspocket_ffmpeg_dir ${PROJECT_SOURCE_DIR}/build/ffmpeg/macos)
+endif()
+# A Linux host's own build (D-576), for the host's architecture: not for a cross build (the AArch64 qemu tree).
+if(NOT pspocket_ffmpeg_dir AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING
+        AND EXISTS ${PROJECT_SOURCE_DIR}/build/ffmpeg/linux/lib/libavcodec.a)
+    set(pspocket_ffmpeg_dir ${PROJECT_SOURCE_DIR}/build/ffmpeg/linux)
 endif()
 if(pspocket_ffmpeg_dir AND EXISTS ${pspocket_ffmpeg_dir}/lib/libavcodec.a)
     add_library(pspocket_ffmpeg INTERFACE)
@@ -26,6 +32,11 @@ if(pspocket_ffmpeg_dir AND EXISTS ${pspocket_ffmpeg_dir}/lib/libavcodec.a)
     if(APPLE AND EXISTS ${pspocket_ffmpeg_dir}/include/libavutil/hwcontext_videotoolbox.h)
         target_link_libraries(pspocket_ffmpeg INTERFACE "-framework VideoToolbox" "-framework CoreMedia"
             "-framework CoreVideo" "-framework CoreFoundation")
+    endif()
+    # Elsewhere the static libraries need threads and the C maths library (their .pc files: -pthread -lm).
+    if(NOT APPLE)
+        find_package(Threads REQUIRED)
+        target_link_libraries(pspocket_ffmpeg INTERFACE Threads::Threads m)
     endif()
     add_library(pspocket::ffmpeg ALIAS pspocket_ffmpeg)
     message(STATUS "FFmpeg decoders: ${pspocket_ffmpeg_dir}")

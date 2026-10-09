@@ -3,11 +3,14 @@
 # cellDmux decode as RPCS3's do (rpcs3/Emu/Cell/Modules/cellVdec.cpp, cellAtracXdec.cpp: libavcodec and libswscale),
 # so a game needs none of the PS3 firmware's decoder modules.
 #
-#   scripts/build-ffmpeg.sh [--tarball PATH] [macos|ios|all]
+#   scripts/build-ffmpeg.sh [--tarball PATH] [macos|ios|all|linux]
 #
 # Builds build/ffmpeg/macos (arm64, macOS 13: the Mac's tests and pspocket-boot) and build/ffmpeg/ios (arm64, iOS 17:
-# the app), each with include/ and lib/ (libavcodec, libavutil, libswscale, libswresample). The CMake build finds
-# build/ffmpeg/macos (or -DPSPOCKET_FFMPEG_DIR=...); scripts/ios.sh links build/ffmpeg/ios into the app.
+# the app), each with include/ and lib/ (libavcodec, libavutil, libswscale, libswresample); "all" is both. On a Linux
+# host, "linux" (the default there) builds build/ffmpeg/linux for the host's own architecture with the host's clang
+# (D-576: the media tests on a Linux machine), the same decoders without VideoToolbox. The CMake build finds
+# build/ffmpeg/macos on the Mac and build/ffmpeg/linux on Linux (or -DPSPOCKET_FFMPEG_DIR=...); scripts/ios.sh links
+# build/ffmpeg/ios into the app. JOBS=N sets make's parallel jobs (default: every core).
 #
 # Licence: configured --disable-gpl --disable-nonfree --disable-version3, then only LGPL-2.1-or-later decoders,
 # parsers and libraries, which combine with pspocket's GPLv2 (D-001). No GPL, version3 or nonfree component here.
@@ -23,16 +26,20 @@ SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
 OUT="$ROOT/build/ffmpeg"
 TARBALL="$OUT/src/ffmpeg-$VERSION.tar.xz"
 TARGETS=all
+[ "$(uname -s)" = Linux ] && TARGETS=linux
 while [ $# -gt 0 ]; do
     case "$1" in
         --tarball) TARBALL="$2"; shift 2 ;;
-        macos|ios|all) TARGETS="$1"; shift ;;
-        *) echo "usage: scripts/build-ffmpeg.sh [--tarball PATH] [macos|ios|all]" >&2; exit 64 ;;
+        macos|ios|all|linux) TARGETS="$1"; shift ;;
+        *) echo "usage: scripts/build-ffmpeg.sh [--tarball PATH] [macos|ios|all|linux]" >&2; exit 64 ;;
     esac
 done
 say() { echo "==> $*" >&2; }
+JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)}"
 [ -f "$TARBALL" ] || { echo "build-ffmpeg: no $TARBALL (download ffmpeg-$VERSION.tar.xz from ffmpeg.org, or --tarball)" >&2; exit 1; }
-actual="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
+# shasum (the Mac's, Perl's) where there is one, else coreutils' sha256sum (a Linux without Perl's tools).
+sha256() { if command -v shasum > /dev/null; then shasum -a 256 "$1"; else sha256sum "$1"; fi; }
+actual="$(sha256 "$TARBALL" | cut -d' ' -f1)"
 [ "$actual" = "$SHA256" ] || { echo "build-ffmpeg: $TARBALL has SHA-256 $actual, not $SHA256" >&2; exit 1; }
 mkdir -p "$OUT/src"
 [ "$(cd "$(dirname "$TARBALL")" && pwd)/$(basename "$TARBALL")" = "$OUT/src/ffmpeg-$VERSION.tar.xz" ] || cp "$TARBALL" "$OUT/src/"
@@ -53,40 +60,59 @@ COMMON=(--disable-everything --disable-programs --disable-doc --disable-network 
     --disable-gpl --disable-nonfree --disable-version3 --disable-avformat --disable-avdevice --disable-avfilter
     --disable-postproc --enable-avcodec --enable-avutil --enable-swscale --enable-swresample
     --enable-static --disable-shared --enable-pic --disable-debug
-    "--enable-decoder=$DECODERS" "--enable-parser=$PARSERS"
-    --enable-videotoolbox --enable-hwaccel=h264_videotoolbox)
+    "--enable-decoder=$DECODERS" "--enable-parser=$PARSERS")
 # H.264 on the media engine through VideoToolbox (D-254): FFmpeg still parses and orders the pictures, the hardware
 # decodes the slices. Apple's frameworks, linked by whatever links these libraries: VideoToolbox, CoreMedia, CoreVideo
-# and CoreFoundation.
+# and CoreFoundation. The Apple builds only.
+APPLE_HW=(--enable-videotoolbox --enable-hwaccel=h264_videotoolbox)
+
+# Configures (again only when the arguments change), builds and installs one target: name, then configure's arguments.
+make_target() {
+    local name="$1"
+    shift
+    local prefix="$OUT/$name" work="$OUT/work-$name"
+    local stamp="$work/configured-with"
+    mkdir -p "$work"
+    if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$*" ]; then
+        say "configuring FFmpeg for $name"
+        (cd "$work" && "$SRC/configure" "$@" > configure.log 2>&1) || { tail -30 "$work/configure.log" >&2; exit 1; }
+        echo "$*" > "$stamp"
+    fi
+    say "building FFmpeg for $name"
+    make -C "$work" -j"$JOBS" > "$work/make.log" 2>&1 || { tail -30 "$work/make.log" >&2; exit 1; }
+    make -C "$work" install > "$work/install.log" 2>&1
+    say "$prefix: $(ls "$prefix"/lib/*.a | xargs -n1 basename | tr '\n' ' ')"
+}
 
 build() { # name sdk cflags...
     local name="$1" sdk="$2"
     shift 2
-    local prefix="$OUT/$name" work="$OUT/work-$name"
+    local prefix="$OUT/$name"
     local sysroot cc
     sysroot="$(xcrun --sdk "$sdk" --show-sdk-path)"
     cc="$(xcrun --sdk "$sdk" -f clang)"
     # The tools configure builds and runs here are the Mac's: its own compiler and SDK.
     local host_sdk
     host_sdk="$(xcrun --sdk macosx --show-sdk-path)"
-    local args=("${COMMON[@]}" --prefix="$prefix" --cc="$cc" --sysroot="$sysroot" --arch=aarch64
+    local args=("${COMMON[@]}" "${APPLE_HW[@]}" --prefix="$prefix" --cc="$cc" --sysroot="$sysroot" --arch=aarch64
         --host-cc="$(xcrun --sdk macosx -f clang)" --host-cflags="-isysroot $host_sdk" --host-ldflags="-isysroot $host_sdk"
         --extra-cflags="$*" --extra-ldflags="$*")
     [ "$name" = ios ] && args+=(--enable-cross-compile --target-os=darwin)
-    local stamp="$work/configured-with"
-    mkdir -p "$work"
-    if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "${args[*]}" ]; then
-        say "configuring FFmpeg for $name"
-        (cd "$work" && "$SRC/configure" "${args[@]}" > configure.log 2>&1) || { tail -30 "$work/configure.log" >&2; exit 1; }
-        echo "${args[*]}" > "$stamp"
-    fi
-    say "building FFmpeg for $name"
-    make -C "$work" -j"$(sysctl -n hw.ncpu)" > "$work/make.log" 2>&1 || { tail -30 "$work/make.log" >&2; exit 1; }
-    make -C "$work" install > "$work/install.log" 2>&1
-    say "$prefix: $(ls "$prefix"/lib/*.a | xargs -n1 basename | tr '\n' ' ')"
+    make_target "$name" "${args[@]}"
+}
+
+# A Linux host (D-576): its own architecture, its clang (CC overrides), no VideoToolbox. FFmpeg's x86 assembly needs
+# nasm; without it the same decoders build from their C code.
+build_linux() {
+    local args=("${COMMON[@]}" --prefix="$OUT/linux" --cc="${CC:-clang}")
+    case "$(uname -m)" in
+        x86_64|i?86) command -v nasm > /dev/null || { say "no nasm: FFmpeg's C code only"; args+=(--disable-x86asm); } ;;
+    esac
+    make_target linux "${args[@]}"
 }
 
 case "$TARGETS" in
+    linux) build_linux ;;
     macos) build macos macosx -arch arm64 -mmacosx-version-min=13.0 ;;
     ios) build ios iphoneos -arch arm64 -mios-version-min=17.0 ;;
     all)

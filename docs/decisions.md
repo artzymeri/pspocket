@@ -7880,3 +7880,25 @@ pspocket's (runtime/hle/src/codec_cores.cpp), and the six libraries are firmware
 need Sony's modules, so a module that imports any of them gets Sony's where the system software is installed. A
 pointer that is not guest memory gets the ARG error, where RPCS3 checks only for null. Test:
 tests/hle/test_codec_cores.cpp.
+
+## D-576 · 2026-10-09 · FFmpeg on Linux: the media libraries decode and their tests run on a Linux host
+
+scripts/build-ffmpeg.sh built FFmpeg 7.1.1's LGPL decoders (D-181) for the Mac and the iPhone only, so on a Linux
+machine pspocket's media libraries built without decoding and their tests failed (cellAdec's ATRAC3plus, cellAtrac's
+AT3+ files). It now has a `linux` target, the default on Linux: the same configure flags and decoders without
+VideoToolbox, for the host's own architecture with the host's clang (CC overrides it), FFmpeg's x86 assembly through
+nasm where there is one (its C code otherwise), into build/ffmpeg/linux. The release tarball's SHA-256 is checked with
+shasum, or sha256sum where Perl's tools are missing; JOBS=N limits make's jobs. third_party/CMakeLists.txt finds
+build/ffmpeg/linux on a Linux host (not in a cross build such as the AArch64 qemu tree) as it finds build/ffmpeg/macos
+on the Mac, and links what the static libraries need there (threads and libm; libatomic was not needed). The unmodified
+tarball (https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz) stays outside git in build/ffmpeg/src.
+
+One portability bug, fixed: vdec_hw.cpp compiled its VideoToolbox helpers (the hardware format pick, the
+PSPOCKET_VDEC_SOFTWARE switch, its log channel) for any FFmpeg build but used them only on Apple's, so with FFmpeg on
+Linux they were unused and -Werror stopped the build. They are under __APPLE__ now, as their one caller is. Nothing
+else differed: every media test passes unchanged.
+
+Test: on this Linux host (x86-64, clang 18), build/host/tests/hle/test_hle "[adec],[atrac],[vdec],[dmux],[pamf]":
+26 cases, 24 pass and 2 skip (the comparisons with Sony's modules need the firmware), 3,572 checks. The whole ctest
+run fails only where it did before: test_spu_fuzz (x86 floating point), test_la_noire's SDATA case, sys_libm's
+fmax/fmin signed zeros on glibc.
