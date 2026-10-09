@@ -102,6 +102,12 @@ public:
     // from host code (HLE cellGcmFlush, sys_rsx, SPU DMA completion). Guest stores are found by polling anyway.
     void notify();
 
+    // A flip lv2 asks for outside the command buffer (sys_rsx_context_attribute 0x102: cellGcmSetFlipImmediate): the
+    // RSX thread runs it at its next step as a GCM_FLIP_HEAD with `value` (RPCS3 request_emu_flip). D-519.
+    void request_flip(u32 head, u32 value);
+    // A buffer lv2 queued on a head (0x103), for a later flip of "the last queued" (GCM_FLIP_HEAD's 0xf).
+    void note_queued(u32 head, u32 buffer_id) { last_queued_[head & 7].store(buffer_id, std::memory_order_relaxed); }
+
     // Callbacks into HLE, run on the RSX thread. Set them before start().
     std::function<void(u32 buffer_id)> on_flip;            // after the backend presented the buffer
     // GCM_DRIVER_QUEUE (lv1 driver flip queue), and the HLE GCM_FLIP_COMMAND, which queues on head 1 before it flips
@@ -315,7 +321,10 @@ private:
     // Display buffers and flip queue
     mutable std::mutex display_mutex_;
     std::array<std::optional<DisplayBuffer>, 8> display_buffers_{};
-    std::array<u32, 8> last_queued_{};
+    std::array<std::atomic<u32>, 8> last_queued_{};
+    std::mutex flip_requests_mutex_;
+    std::vector<std::pair<u32, u32>> flip_requests_; // request_flip: (head, value)
+    std::atomic<bool> flip_requested_{false};
 
     // Thread
     std::thread thread_;

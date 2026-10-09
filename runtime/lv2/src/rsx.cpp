@@ -3,8 +3,8 @@
 // (runtime/rsx), whose thread starts when the context is allocated. Reference: RPCS3 rpcs3/Emu/Cell/lv2/sys_rsx.cpp
 // and sys_rsx.h (structure layouts), RSXThread.cpp thread::init.
 //
-// These are called by the HLE libgcm_sys (cellGcmSys), as RPCS3's HLE does. They are not bound to syscall numbers
-// 666-677 yet: no game has called them directly (CLAUDE.md rule 4).
+// These are called by the HLE libgcm_sys (cellGcmSys), as RPCS3's HLE does, and by number from Sony's libgcm_sys
+// (668, 670, 672-675 are bound, D-519: tests/hle/test_gcm_compare.cpp runs Sony's module on them).
 //
 // Layout: local memory at 0xC0000000. The rsx_context area takes the first free 256 MB slot (as RPCS3's
 // vm::reserve_map(vm::rsx_context, ...)); sys_rsx_device_map takes its first 1 MB and sys_rsx_context_allocate the
@@ -15,16 +15,17 @@
 // - One context per process (RPCS3 aborts on a second one too); context free and device unmap are not implemented.
 // - The driver information's handler event queue and port are not created: the HLE interrupt handlers do not go
 //   through lv2 event queues.
-// - Display flip (0x102), display queue (0x103), and RPCS3's flip-event (0xFEC) and user-command (0xFEF) hacks are
-//   not packages here (the HLE flip goes through the FIFO: GCM_FLIP_COMMAND; the RSX's on_flip does what 0xFEC does
-//   and its on_queue, for GCM_DRIVER_QUEUE and the HLE flip, what 0x103 does); they log and return CELL_EINVAL until a
-//   game needs them. The vblank hack (0xFED) counts vblanks for the HLE GCM interrupt thread. Flip status (0x10a) is
-//   RPCS3's: cellGcmResetFlipStatus and cellGcmSetFlipStatus change head 1's flip flags through it.
+// - Display flip (0x102) goes to the RSX thread as a GCM_FLIP_HEAD would (Rsx::request_flip); display queue (0x103)
+//   updates the head and calls the queue listener at once, as RPCS3 (D-519). RPCS3's flip-event (0xFEC) and
+//   user-command (0xFEF) hacks are not packages here: the RSX's on_flip does what 0xFEC does. The vblank hack (0xFED)
+//   counts vblanks for the HLE GCM interrupt thread. Flip status (0x10a) is RPCS3's: cellGcmResetFlipStatus and
+//   cellGcmSetFlipStatus change head 1's flip flags through it.
 
 #include <format>
 
 #include "internal.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/core/timebase.h"
 #include "pspocket/rsx/context.hpp"
 #include "pspocket/rsx/null_backend.hpp"
 #include "pspocket/rsx/rsx.hpp"
@@ -49,7 +50,7 @@ constexpr u32 version_driver = 0x0, version_gpu = 0x4, memory_size = 0x8, hardwa
               reportsReportOffset = 0x34, systemModeFlags = 0x54, head = 0x10B8, head_size = 0x40, size = 0x12F8;
 // RsxDriverInfo::Head
 constexpr u32 h_lastFlipTime = 0x0, h_flipFlags = 0x8, h_flipBufferId = 0x10, h_lastQueuedBufferId = 0x14,
-              h_lastVTimeLow = 0x1C, h_vBlankCount = 0x30, h_lastVTimeHigh = 0x3C;
+              h_lastVTimeLow = 0x1C, h_lastSecondVTime = 0x20, h_vBlankCount = 0x30, h_lastVTimeHigh = 0x3C;
 // flipFlags: bit 31 a flip ran (0xFEC; cleared by 0x10a), bit 30 a buffer was queued, bit n buffer n was queued (0x103)
 constexpr u32 kFlipDone = 0x80000000, kQueued = 0x40000000;
 } // namespace di
@@ -201,7 +202,7 @@ Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_contr
     d.rsx->on_flip = [&s, info](u32 buffer_id) {
         // RPCS3 sys_rsx_context_attribute 0xFEC (what RSXThread's flip calls): head 1 records the flip.
         const u32 head = info + di::head + 1 * di::head_size;
-        s.guest.w64(head + di::h_lastFlipTime, rsx::Rsx::timestamp_ns());
+        s.guest.w64(head + di::h_lastFlipTime, ps_timebase_now()); // timebase ticks, as lv2 (RPCS3 rsx_timeStamp)
         s.guest.w32(head + di::h_flipBufferId, buffer_id);
         update_flip_flags(s.guest, head + di::h_flipFlags, [](u32 f) { return f | di::kFlipDone; });
         RsxDevice& dv = s.rsx;
@@ -325,6 +326,62 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
             [a4, a5](u32 f) { return (f & static_cast<u32>(a4)) | static_cast<u32>(a5); });
         return CELL_OK;
     }
+    case 0x102: { // display flip (cellGcmSetFlipImmediate): RPCS3 request_emu_flip, on the RSX thread here
+        if ((a4 & 0x80000000) && a3 >= 2) {
+            PS_LOG_ERROR(kRsxChan, "display flip of a queued buffer on head {} (only heads 0 and 1 exist) -> CELL_EINVAL",
+                a3);
+            return err(CELL_EINVAL);
+        }
+        d.rsx->request_flip(static_cast<u32>(a3), static_cast<u32>(a4));
+        return CELL_OK;
+    }
+    case 0x103: { // display queue (RPCS3): the head notes the buffer, then the queue listener (HLE: the queue handler)
+        if (a3 >= 2) {
+            PS_LOG_ERROR(kRsxChan, "display queue on head {} (only heads 0 and 1 exist; RPCS3 aborts) -> CELL_EINVAL", a3);
+            return err(CELL_EINVAL);
+        }
+        Guest& gm = t.kernel.impl().guest;
+        const u32 h = d.driver_info + di::head + static_cast<u32>(a3) * di::head_size;
+        const u32 id = static_cast<u32>(a4);
+        gm.w32(h + di::h_lastQueuedBufferId, id);
+        update_flip_flags(gm, h + di::h_flipFlags, [id](u32 f) { return f | di::kQueued | (id < 32 ? 1u << id : 0u); });
+        d.rsx->note_queued(static_cast<u32>(a3), id);
+        std::function<void(u32, u32)> listener;
+        {
+            std::lock_guard l(d.listener_mutex);
+            listener = d.on_queue;
+        }
+        if (listener) listener(static_cast<u32>(a3), id);
+        return CELL_OK;
+    }
+    case 0x108: // vblank frequency (cellGcmSetVBlankFrequency: a5 1) and the second vblank's (a5 2), as RPCS3
+        if (a5 == 1) {
+            d.vsync = true; // RPCS3: "this function resets vsync state to enabled"
+            return CELL_OK;
+        }
+        if (a5 == 2) {
+            d.second_vhandler = a4 != 4; // CELL_GCM_DISPLAY_FREQUENCY_DISABLE
+            return CELL_OK;
+        }
+        PS_LOG_ERROR(kRsxChan, "sys_rsx_context_attribute 0x108: unknown handler {} (RPCS3 aborts) -> CELL_EINVAL", a5);
+        return err(CELL_EINVAL);
+    case 0x10B: // cursor: a4 3 position (a5, a6), 2 image offset (a5), 4 mode (a5)
+        if (a4 == 3) {
+            d.cursor.x = static_cast<s32>(a5);
+            d.cursor.y = static_cast<s32>(a6);
+        } else if (a4 == 2) {
+            d.cursor.offset = static_cast<u32>(a5);
+        } else if (a4 == 4) {
+            d.cursor.mode = static_cast<u32>(a5);
+        } else {
+            PS_LOG_ERROR(kRsxChan, "sys_rsx_context_attribute 0x10B: unknown cursor subfunction {} (as RPCS3: ignored)",
+                a4);
+        }
+        return CELL_OK;
+    case 0x10C: // cursor: a4 1 enable, 2 disable
+        if (a4 == 1 || a4 == 2) d.cursor.enabled = a4 == 1;
+        else PS_LOG_ERROR(kRsxChan, "sys_rsx_context_attribute 0x10C: unknown cursor subfunction {} (as RPCS3: ignored)", a4);
+        return CELL_OK;
     case 0x105: // destroy buffer? (no-op in RPCS3)
     case 0x106: // cellGcmInitPerfMon
     case 0x10D: // cellGcmInitCursor
@@ -382,9 +439,12 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
         if (a3 >= 2) return err(CELL_EINVAL);
         const u32 head = d.driver_info + di::head + static_cast<u32>(a3) * di::head_size;
         Guest& gm = t.kernel.impl().guest;
-        const u64 now = rsx::Rsx::timestamp_ns();
+        // In timebase ticks, as lv2 (RPCS3 rsx_timeStamp): the vblank's time, and the second vblank's time point from
+        // a4 (later than the last one), D-519.
+        const u64 now = ps_timebase_now();
         gm.w32(head + di::h_lastVTimeLow, static_cast<u32>(now));
         gm.w32(head + di::h_lastVTimeHigh, static_cast<u32>(now >> 32));
+        gm.w64(head + di::h_lastSecondVTime, std::max<u64>(a4, gm.r64(head + di::h_lastSecondVTime) + 1));
         gm.w64(head + di::h_vBlankCount, gm.r64(head + di::h_vBlankCount) + 1);
         return CELL_OK;
     }
@@ -394,6 +454,16 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
             package_id, a3, a4, a5, a6);
         return err(CELL_EINVAL);
     }
+}
+
+void register_rsx_syscalls(SyscallTable& table)
+{
+    PS_LV2_BIND(table, 668, sys_rsx_memory_allocate);
+    PS_LV2_BIND(table, 670, sys_rsx_context_allocate);
+    PS_LV2_BIND(table, 672, sys_rsx_context_iomap);
+    PS_LV2_BIND(table, 673, sys_rsx_context_iounmap);
+    PS_LV2_BIND(table, 674, sys_rsx_context_attribute);
+    PS_LV2_BIND(table, 675, sys_rsx_device_map);
 }
 
 } // namespace pspocket::lv2

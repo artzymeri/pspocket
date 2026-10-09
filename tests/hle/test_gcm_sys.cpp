@@ -228,8 +228,7 @@ TEST_CASE("cellGcmSys: before cellGcmInit, as RPCS3; cellGcmMapLocalMemory maps 
     g.call("cellGcmSetDefaultCommandBuffer");
     CHECK(ps_read32(b, kCtxPtr) == 0x12345678);
     CHECK(logs.count(log::Level::Error, "cellGcmSys", "cellGcmSetDefaultCommandBuffer before cellGcmInit") == 1);
-    g.call("cellGcmResetFlipStatus");
-    CHECK(logs.count(log::Level::Error, "cellGcmSys", "cellGcmResetFlipStatus: lv2 refused") == 1);
+    g.call("cellGcmResetFlipStatus"); // libgcm_sys sends nothing without the driver information (D-519)
     CHECK(g.call("cellGcmGetFlipStatus") == 0);
     CHECK(g.call("cellGcmBindZcull", 0, 0x300000, 1280, 720, 0, 2, 0, 0, 1, 0, 0x80, 0xff) == kEinval);
     CHECK(g.call("cellGcmUnbindZcull", 8) == r3_of_code(CELL_GCM_ERROR_INVALID_VALUE));
@@ -450,10 +449,12 @@ TEST_CASE("sys_rsx: flip status (0x10a), a buffer queued on a head (0x103's driv
     const u32 control = static_cast<u32>(g.call("cellGcmGetControlRegister"));
     const u32 info = control - 0x40 + 0x100000;
 
-    // 0x10a: flipFlags = (flipFlags & a4) | a5, heads 0 and 1 only.
+    // 0x10a: flipFlags = (flipFlags & a4) | a5, heads 0 and 1 only. cellGcmInit left both heads' flip-done bit set, as
+    // libgcm_sys (D-519).
+    CHECK(ps_read32(b, info + kHead0 + kFlipFlags) == 0x80000000);
     CHECK(lv2::sys_rsx_context_attribute(t, 0x55555555, 0x10a, 8, 0, 0, 0) == -17);
     CHECK(lv2::sys_rsx_context_attribute(t, 0x55555555, 0x10a, 2, 0, 0, 0) == lv2::err(lv2::CELL_EINVAL));
-    REQUIRE(lv2::sys_rsx_context_attribute(t, 0x55555555, 0x10a, 0, 0xFFFFFFFF, 0x1200, 0) == lv2::CELL_OK);
+    REQUIRE(lv2::sys_rsx_context_attribute(t, 0x55555555, 0x10a, 0, 0x7FFFFFFF, 0x1200, 0) == lv2::CELL_OK);
     CHECK(ps_read32(b, info + kHead0 + kFlipFlags) == 0x1200);
     REQUIRE(lv2::sys_rsx_context_attribute(t, 0x55555555, 0x10a, 0, 0xFFFFF0FF, 0x34, 0) == lv2::CELL_OK);
     CHECK(ps_read32(b, info + kHead0 + kFlipFlags) == 0x1034);
@@ -637,11 +638,9 @@ TEST_CASE("cellGcmSys: the default command buffer's word sizes and cellGcmSetDef
 
     CHECK(g.call("cellGcmGetDefaultCommandWordSize") == 0x400);
     CHECK(g.call("cellGcmGetDefaultSegmentWordSize") == 0x100);
-    // Only while put and get are both 0x1000, the default buffer's first command: not yet (both 0 after cellGcmInit).
-    CHECK(set_sizes(0x800, 0x400) == kFailure);
-    ps_write32(b, control, 0x1000);
-    rsx->notify();
-    REQUIRE(rsx->wait_idle(2 * kSecond));
+    // Only while put and get are both 0x1000, the default buffer's first command: cellGcmInit sets both there, as
+    // libgcm_sys does (D-519).
+    REQUIRE(ps_read32(b, control) == 0x1000);
     REQUIRE(ps_read32(b, control + 4) == 0x1000);
     CHECK(set_sizes(0x7FF, 0x400) == kFailure);        // less than two segments
     CHECK(set_sizes(0xFFFFFFFF, 0x80000000) == kFailure); // a segment of 2^31 words
@@ -744,13 +743,10 @@ TEST_CASE("cellGcmSys: _cellGcmFunc12, debug level, second V frequency, immediat
     LogLines logs;
     GcmFixture f;
     GuestThread g(f, 0, "gcm");
+    u8* b = f.base();
     REQUIRE(g.call("_cellGcmInitBody", kCtxPtr, kCmdSize, 0x100000, kIo) == 0);
     rsx::Rsx* rsx = f.kernel->rsx();
     lv2::RsxDevice& dev = f.kernel->impl().rsx;
-    const auto vsync = [&] {
-        std::lock_guard lock(dev.mutex);
-        return dev.vsync;
-    };
 
     // _cellGcmFunc12: the local report area.
     CHECK(g.call("_cellGcmFunc12") == g.call("cellGcmGetLabelAddress", 0) + 0x1400);
@@ -763,24 +759,39 @@ TEST_CASE("cellGcmSys: _cellGcmFunc12, debug level, second V frequency, immediat
     g.call("cellGcmSetDebugOutputLevel", 4);
     CHECK(logs.count(log::Level::Warn, "cellGcmSys", "not a debug level, ignored") == 2);
 
-    // cellGcmSetSecondVFrequency: 59.94 Hz taken; scanout and disabled logged (RPCS3 TODOs); anything else an error.
+    // cellGcmSetSecondVFrequency, as libgcm_sys (D-519): lv2's 0x108 for the second vblank, which 59.94 Hz and the
+    // scanout's frequency turn on and anything else off.
+    const auto second_v = [&] {
+        std::lock_guard lock(dev.mutex);
+        return dev.second_vhandler;
+    };
     g.call("cellGcmSetSecondVFrequency", 1);
-    CHECK(logs.count(log::Level::Warn, "cellGcmSys", "cellGcmSetSecondVFrequency") == 0);
-    g.call("cellGcmSetSecondVFrequency", 2);
-    CHECK(logs.count(log::Level::Warn, "cellGcmSys", "the scanout frequency is not implemented") == 1);
+    CHECK(second_v());
     g.call("cellGcmSetSecondVFrequency", 3);
-    CHECK(logs.count(log::Level::Warn, "cellGcmSys", "disabling it is not implemented") == 1);
+    CHECK_FALSE(second_v());
+    g.call("cellGcmSetSecondVFrequency", 2);
+    CHECK(second_v());
     g.call("cellGcmSetSecondVFrequency", 4);
-    CHECK(logs.count(log::Level::Error, "cellGcmSys", "4 is not a display frequency") == 1);
+    CHECK_FALSE(second_v());
 
-    // cellGcmSetFlipImmediate: a buffer id past 7 is CELL_GCM_ERROR_FAILURE; otherwise nothing changes, logged once
-    // (RPCS3 would set the flip mode to the id: vsync for 2).
+    // cellGcmSetFlipImmediate(index), as libgcm_sys (D-519): the buffer at `index` of the flip ring, flipped through
+    // lv2's 0x102; an index the ring does not hold is CELL_GCM_ERROR_FAILURE. A flip prepared in a context of the
+    // game's own (not run by the RSX) stays in the ring.
     CHECK(g.call("cellGcmSetFlipImmediate", 8) == kFailure);
-    CHECK(g.call("cellGcmSetFlipImmediate", 2) == 0);
-    CHECK_FALSE(vsync());
-    CHECK(rsx->flip_count() == 0);
+    CHECK(g.call("cellGcmSetFlipImmediate", 2) == kFailure);
+    constexpr u32 kOwnCtx = kData + 0x800, kOwnBuf = kData + 0x900;
+    ps_write32(b, kOwnCtx, kOwnBuf);
+    ps_write32(b, kOwnCtx + 4, kOwnBuf + 0x100);
+    ps_write32(b, kOwnCtx + 8, kOwnBuf);
+    ps_write32(b, kOwnCtx + 12, 0);
+    REQUIRE(g.call("cellGcmSetPrepareFlip", kOwnCtx, 3) == 3);
+    CHECK(g.call("cellGcmGetDisplayBufferByFlipIndex", 1) == 3);
+    CHECK(g.call("cellGcmGetDisplayBufferByFlipIndex", 2) == 0xFFFFFFFFFFFFFFFFull);
+    const u64 flips = rsx->flip_count();
     CHECK(g.call("cellGcmSetFlipImmediate", 1) == 0);
-    CHECK(logs.count(log::Level::Error, "cellGcmSys", "cellGcmSetFlipImmediate(") == 1);
+    for (int i = 0; i < 2000 && rsx->flip_count() == flips; i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(rsx->flip_count() == flips + 1);
+    CHECK(g.call("cellGcmGetDisplayBufferByFlipIndex", 1) == 0xFFFFFFFFFFFFFFFFull); // flipped: no longer queued
 
     // RPCS3's plain CELL_OKs.
     CHECK(g.call("cellGcmInitDefaultFifoMode", 0) == 0);

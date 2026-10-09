@@ -315,6 +315,7 @@ firmware module. Done so far (2026-10-09: 3,927 of 6,625):
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
 - cellHttpUtil (D-504), cellSpurs' accessors, exception handlers and SPU sharing (D-505, D-506, D-509), cellSheap
   (D-507), cellSpudll (D-508), the C library and C99 maths under sys_libc and sys_libm (D-510 to D-516), cellL10n
-  (D-517), sys_fs with the kernel calls behind it (D-518).
-Next: the rest of the libraries pspocket always serves (cellGcmSys, sys_net, cellSpurs, sysPrxForUser's variables,
+  (D-517), sys_fs with the kernel calls behind it (D-518), cellGcmSys compared with libgcm_sys running on pspocket's lv2
+  (D-519).
+Next: the rest of the libraries pspocket always serves (sys_net, cellSpurs, sysPrxForUser's variables,
 cellSync, sys_lv2dbg, cellUsbd, cellUsbPspcm), then the firmware-backed libraries one by one.

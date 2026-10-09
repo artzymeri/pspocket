@@ -692,7 +692,7 @@ void Rsx::m_driver_flip(u32 reg, u32 value)
     u32 id = 0;
     if (value & 0x80000000) {
         id = value & 0xf;
-        if (id > 7) id = last_queued_[head];
+        if (id > 7) id = last_queued_[head].load(std::memory_order_relaxed);
     } else {
         bool found = false;
         for (u32 i = 0; i < 8 && !found; i++) {
@@ -712,7 +712,7 @@ void Rsx::m_driver_queue(u32 reg, u32 value)
 {
     // RPCS3 sys_rsx.cpp attribute 0x103 (display queue): remember the buffer, let HLE update the driver info.
     const u32 head = reg - m::GCM_DRIVER_QUEUE;
-    last_queued_[head] = value;
+    last_queued_[head].store(value, std::memory_order_relaxed);
     if (on_queue) on_queue(head, value);
 }
 

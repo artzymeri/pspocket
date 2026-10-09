@@ -145,6 +145,7 @@ void register_fs_syscalls(SyscallTable& table);
 void register_vm_syscalls(SyscallTable& table);
 void register_spu_syscalls(SyscallTable& table);
 void register_system_syscalls(SyscallTable& table);
+void register_rsx_syscalls(SyscallTable& table);
 
 // The whole of the open file `fd` (a host file or one on an image), without moving its position (fs.cpp; for
 // sys_spu_image_open_by_fd). CELL_EBADF when fd is not an open file.
@@ -323,6 +324,13 @@ struct RsxDevice {
     u32 reports = 0;
     u32 main_mem_size = 0; // IO address space
     bool vsync = false;    // display sync (cellGcmSetFlipMode)
+    bool second_vhandler = false; // 0x108 for the second vblank (RPCS3 enable_second_vhandler)
+    // The hardware cursor (0x10B, 0x10C, 0x10D), kept for an overlay to draw: 64x64 from `offset` in local memory.
+    struct Cursor {
+        bool enabled = false;
+        s32 x = 0, y = 0;
+        u32 offset = 0, mode = 0;
+    } cursor;
     struct Tile {
         u32 location = 0, offset = 0, size = 0, pitch = 0, comp = 0, base = 0;
         bool bound = false;
@@ -496,6 +504,8 @@ struct Kernel::Impl {
     std::mutex tty_mutex;
 
     SyscallTable table;
+    std::atomic<Kernel::SyscallObserver> syscall_observer{nullptr}; // Kernel::set_syscall_observer (tests)
+    void* syscall_observer_user = nullptr;
     std::atomic<u64> unimplemented{0};
     std::array<std::atomic<u32>, kSyscallCount> unimplemented_by_number{};
 

@@ -298,7 +298,7 @@ Result sys_spu_thread_group_disconnect_event_all_threads(PpuThread& t, u32 id, u
 Result sys_spu_thread_group_set_cooperative_victims(PpuThread& t, u32 id, u32 threads_mask);
 Result sys_spu_thread_group_syscall_253(PpuThread& t, u32 id, u32 info);
 
-// ---- RSX (sys_rsx.cpp; rsx.cpp). Called by HLE cellGcmSys; not bound to syscall numbers yet.
+// ---- RSX (rsx.cpp). Called by HLE cellGcmSys, and by number (668, 670, 672-675, D-519).
 Result sys_rsx_memory_allocate(PpuThread& t, u32 mem_handle, u32 mem_addr, u64 size, u64 flags, u64 a5, u64 a6, u64 a7);
 Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_control, u32 lpar_driver_info,
     u32 lpar_reports, u64 mem_ctx, u64 system_mode);

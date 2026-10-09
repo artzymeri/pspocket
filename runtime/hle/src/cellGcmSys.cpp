@@ -30,6 +30,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <format>
 #include <mutex>
 #include <optional>
@@ -40,11 +41,13 @@
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/core/timebase.h"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/rsx/gcm.hpp"
 #include "pspocket/rsx/rsx.hpp"
 
@@ -68,8 +71,7 @@ constexpr u32 CELL_GCM_LOCATION_LOCAL = 0, CELL_GCM_LOCATION_MAIN = 1; // anythi
 constexpr u32 CELL_GCM_IOMAP_FLAG_STRICT_ORDERING = 1 << 1;
 constexpr u32 CELL_GCM_DISPLAY_FLIP_STATUS_DONE = 0, CELL_GCM_DISPLAY_FLIP_STATUS_WAITING = 1;
 constexpr s32 CELL_GCM_DEBUG_LEVEL0 = 1, CELL_GCM_DEBUG_LEVEL2 = 3;
-constexpr u32 CELL_GCM_DISPLAY_FREQUENCY_59_94HZ = 1, CELL_GCM_DISPLAY_FREQUENCY_SCANOUT = 2,
-              CELL_GCM_DISPLAY_FREQUENCY_DISABLE = 3;
+constexpr u32 CELL_GCM_DISPLAY_FREQUENCY_59_94HZ = 1, CELL_GCM_DISPLAY_FREQUENCY_SCANOUT = 2;
 constexpr u32 kContextId = 0x55555555;
 constexpr u32 kLocalSize = 0x0F900000; // 249 MB: RPCS3's fixed value (its TODO: by SDK version, gcmGetLocalMemorySize)
 constexpr u32 kTilesCount = 15, kZcullsCount = 8;
@@ -125,15 +127,54 @@ struct GcmState {
     std::atomic<u32> user_handler{0};
     std::atomic<u32> queue_handler{0};
     std::atomic<u64> vblanks{0};
-    std::atomic<bool> flip_immediate_logged{false};
     struct Tile {
         u32 location = 0, offset = 0, size = 0, pitch = 0, comp = 0, base = 0, bank = 0;
     };
     std::array<Tile, kTilesCount> tile{};
     std::array<std::array<u32, 6>, kZcullsCount> zcull{}; // each region's packed CellGcmZcullInfo, as lv2 last took it
+    // libgcm_sys's own state the D-519 functions keep (Sony's names in its comments): the tile words
+    // cellGcmSetInvalidateTile sends (cellGcmSetTile's tile word without its location bits), the ring of buffers
+    // cellGcmSetPrepareFlip queued (read and write indices, 8 entries), head 0's flip and queue handlers and the
+    // second vblank handlers, and the hardware cursor.
+    std::array<u32, kTilesCount> invalidate_tile{};
+    std::mutex ring_mutex; // the ring is changed on PPU threads and, by flips, on the RSX thread; never held across lv2
+    s32 ring_read = 0, ring_write = 0;
+    std::array<u8, 8> ring{};
+    std::atomic<u32> flip_handler_head0{0}, second_vhandler[2] = {0, 0};
+    std::atomic<bool> second_v_enabled{false};
+    struct Cursor {
+        bool initialized = false, enabled = false, enable_dirty = false, image_dirty = false, mode_dirty = false;
+        u32 offset = 0, x = 0, y = 1, mode = 1;
+    } cursor; // under mutex
 };
 
 GcmState& gcm() { return HleProcess::current()->state<GcmState>(); }
+
+// The events lv2 sends libgcm_sys (RsxDriverInfo::handlers, SYS_RSX_EVENT_*): a handler setter sets or clears its bit
+// as libgcm_sys does (vblank 1/2, flip 8/0x10, queue 0x20/0x40, user 0x80, second vblank 0x400/0x800 for heads 0/1).
+void set_event_mask(PPUContext& ctx, u32 bit, bool on)
+{
+    const u32 di = gcm().driver_info;
+    if (!di) return; // libgcm_sys writes through a null driver information pointer here
+    u8* base = guest_base(ctx);
+    const u32 mask = ps_read32(base, di + 0x12C0); // RsxDriverInfo::handlers
+    ps_write32(base, di + 0x12C0, on ? mask | bit : mask & ~bit);
+}
+
+// libgcm_sys's conversion of timebase ticks to microseconds, in two parts past 2^64 / 10^6 ticks.
+u64 ticks_to_us(u64 ticks)
+{
+    constexpr u64 kSplit = 0x10C6F7A0B5EDull; // 2^64 / 10^6, rounded down
+    const u64 freq = PS_TIMEBASE_HZ;
+    u64 whole = 0;
+    if (ticks > kSplit) {
+        const u64 q = ticks / kSplit;
+        whole = q * ((kSplit * 1'000'000ull) / freq);
+        ticks -= q * kSplit;
+    }
+    return whole + ticks * 1'000'000ull / freq;
+}
+
 
 // The IO page of a main-memory MB (0xFFFF: not mapped). The table covers EAs below RSX local memory (3072 MB).
 u32 io_address_entry(u8* base, const GcmState& g, u32 ea_mb)
@@ -174,8 +215,8 @@ s32 map_ea_io(PPUContext& ctx, GcmState& g, u32 ea, u32 io, u32 size, bool stric
     }
     if (!g.offset_table) return lv2::err(lv2::CELL_EINVAL);
     lv2::PpuThread& t = thread_of(ctx);
-    if (const s32 r = lv2::sys_rsx_context_iomap(t, kContextId, io, ea, size,
-            0xe000000000000800ull | (u64{strict} << 60));
+    if (const s32 r = static_cast<s32>(
+            lv2_syscall(ctx, 672, {kContextId, io, ea, size, 0xe000000000000800ull | (u64{strict} << 60)}));
         r != lv2::CELL_OK) {
         return r;
     }
@@ -203,7 +244,7 @@ s32 unmap_io(PPUContext& ctx, GcmState& g, u32 io)
     if (ea_mb >= kIoAddressEntries) return error(CELL_GCM_ERROR_FAILURE); // 0xFFFF: not mapped
     const u32 count = g.io_map_size[ea_mb];
     if (!count || io_mb + count > kEaAddressEntries) return error(CELL_GCM_ERROR_FAILURE);
-    if (const s32 r = lv2::sys_rsx_context_iounmap(t, kContextId, u64{io_mb} << 20, u64{count} << 20);
+    if (const s32 r = static_cast<s32>(lv2_syscall(ctx, 673, {kContextId, u64{io_mb} << 20, u64{count} << 20}));
         r != lv2::CELL_OK) {
         return r;
     }
@@ -316,7 +357,7 @@ void _pspocket_gcm_interrupt_thread(PPUContext& ctx, u64)
         if (const auto now = std::chrono::steady_clock::now(); now - next > std::chrono::milliseconds(100)) {
             next = now; // fell far behind (a debugger, a stalled host): no burst of vblanks
         }
-        lv2::sys_rsx_context_attribute(t, kContextId, 0xFED, 1, 0, 0, 0);
+        lv2::sys_rsx_context_attribute(t, kContextId, 0xFED, 1, ps_timebase_now(), 0, 0);
         g.vblanks.fetch_add(1, std::memory_order_relaxed);
         if (const u32 handler = g.vblank_handler.load(std::memory_order_acquire)) {
             if (!logged) {
@@ -324,6 +365,9 @@ void _pspocket_gcm_interrupt_thread(PPUContext& ctx, u64)
                 logged = true;
             }
             call_guest(ctx, handler, {1});
+        }
+        if (g.second_v_enabled.load(std::memory_order_acquire)) {
+            if (const u32 handler = g.second_vhandler[1].load(std::memory_order_acquire)) call_guest(ctx, handler, {1});
         }
     }
 }
@@ -390,10 +434,6 @@ s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u3
     const u32 dma_control = static_cast<u32>(ps_read64(base, v + 0x20));
     g.driver_info = static_cast<u32>(ps_read64(base, v + 0x28));
     const u32 reports = static_cast<u32>(ps_read64(base, v + 0x30));
-    // RPCS3 rsx::thread::init, which its sys_rsx_context_allocate runs: the flip status starts DONE.
-    if (const s32 r = lv2::sys_rsx_context_attribute(t, kContextId, 0x10a, 1, ~0u, kFlipDone, 0); r != lv2::CELL_OK) {
-        PS_LOG_ERROR(kChan, "_cellGcmInitBody: the flip status: {}", lv2::error_name(r));
-    }
 
     // InitOffsetTable, and the arrays cellGcmSys keeps for the game (RPCS3 vm::alloc in vm::main).
     MainMemory& mm = p.main_memory();
@@ -411,6 +451,11 @@ s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u3
             io_address, lv2::error_name(r));
         return error(CELL_GCM_ERROR_FAILURE);
     }
+    // As libgcm_sys (D-519): the FIFO at the command buffer's start (IO offset 0x1000), both heads' flip status DONE
+    // (0x10a), and the head-1 vblank event on.
+    lv2_syscall(ctx, 674, {kContextId, 0x001, 0x1000, 0x1000, 0, 0});
+    for (const u64 head : {0, 1}) lv2_syscall(ctx, 674, {kContextId, 0x10a, head, 0, kFlipDone, 0});
+    ps_write32(base, g.driver_info + 0x12C0, ps_read32(base, g.driver_info + 0x12C0) | 4);
     g.io_address = io_address;
     g.io_size = io_size;
     g.cmd_begin = io_address;
@@ -456,7 +501,18 @@ s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u3
                         handler_name(source));
             }
         };
-        k.set_rsx_flip_listener([&g, post](u32) {
+        k.set_rsx_flip_listener([&g, post](u32 buffer) {
+            {
+                // A flip of a queued buffer makes its slot the last flipped one (libgcm_sys's flip handling).
+                std::lock_guard rl(g.ring_mutex);
+                for (s32 at = g.ring_read; at != g.ring_write;) {
+                    at = (at + 1) % 8;
+                    if (g.ring[static_cast<u32>(at)] == buffer) {
+                        g.ring_read = at;
+                        break;
+                    }
+                }
+            }
             if (g.flip_handler.load(std::memory_order_acquire)) post(kIntrFlip, 1);
         });
         k.set_rsx_user_command_listener([&g, post](u32 arg) {
@@ -800,8 +856,8 @@ s32 cellGcmSetDisplayBuffer(PPUContext& ctx, u8 id, u32 offset, u32 pitch, u32 w
     ps_write32(base, g.display_info + 16 * id + 0x8, width);
     ps_write32(base, g.display_info + 16 * id + 0xC, height);
     // RPCS3's HLE writes the renderer's display buffers directly; the firmware does it through lv2 (0x104).
-    return lv2::sys_rsx_context_attribute(t, kContextId, 0x104, id, (u64{width} << 32) | height,
-        (u64{pitch} << 32) | offset, 0);
+    return static_cast<s32>(lv2_syscall(ctx, 674, {kContextId, 0x104, id, (u64{width} << 32) | height,
+        (u64{pitch} << 32) | offset, 0}));
 }
 
 // RPCS3 cellGcmGetDisplayInfo, cellGcmGetTileInfo and cellGcmGetZcullInfo: the arrays cellGcmSys keeps for the game
@@ -825,21 +881,18 @@ u32 cellGcmGetFlipStatus(PPUContext& ctx)
                                                                                  : CELL_GCM_DISPLAY_FLIP_STATUS_WAITING;
 }
 
-// cellGcmResetFlipStatus and cellGcmSetFlipStatus: RPCS3 sets its renderer's flip status to WAITING or DONE; here
-// head 1's flip-done bit changes through lv2's 0x10a (flipFlags = (flipFlags & a4) | a5), the package RPCS3's lv2
-// takes from the firmware's. Before cellGcmInit lv2 has no context: logged.
-void set_flip_status(PPUContext& ctx, std::string_view what, u32 keep, u32 set)
+// cellGcmResetFlipStatus and cellGcmSetFlipStatus, as libgcm_sys: head 1's flip flags through lv2's 0x10a
+// (flipFlags = (flipFlags & a4) | a5): reset keeps all but the flip-done bit; set leaves only that bit (D-519). Before
+// cellGcmInit there is no driver information and nothing is sent.
+void set_flip_status(PPUContext& ctx, u32 head, u32 keep, u32 set)
 {
-    if (const s32 r = lv2::sys_rsx_context_attribute(thread_of(ctx), kContextId, 0x10a, 1, keep, set, 0);
-        r != lv2::CELL_OK) {
-        PS_LOG_ERROR(kChan, "{}: lv2 refused the flip status ({}); called before cellGcmInit?", what,
-            lv2::error_name(r));
-    }
+    if (!gcm().driver_info) return;
+    lv2_syscall(ctx, 674, {kContextId, 0x10a, head, keep, set, 0});
 }
 
-void cellGcmResetFlipStatus(PPUContext& ctx) { set_flip_status(ctx, "cellGcmResetFlipStatus", ~kFlipDone, 0); }
+void cellGcmResetFlipStatus(PPUContext& ctx) { set_flip_status(ctx, 1, ~kFlipDone, 0); }
 
-void cellGcmSetFlipStatus(PPUContext& ctx) { set_flip_status(ctx, "cellGcmSetFlipStatus", ~0u, kFlipDone); }
+void cellGcmSetFlipStatus(PPUContext& ctx) { set_flip_status(ctx, 1, 0, kFlipDone); }
 
 // RPCS3 cellGcmGetCurrentDisplayBufferId(id): the buffer of the last flip (0 before one), written as a byte.
 s32 cellGcmGetCurrentDisplayBufferId(PPUContext& ctx, u32 id)
@@ -851,14 +904,14 @@ s32 cellGcmGetCurrentDisplayBufferId(PPUContext& ctx, u32 id)
     return lv2::CELL_OK;
 }
 
-// cellGcmGetLastFlipTime: the last flip's time in microseconds on the guest's system-time clock
-// (sys_time_get_system_time), from head 1's lastFlipTime, which lv2 writes in nanoseconds of the same timebase; 0
-// before the first flip. RPCS3 returns its host clock less one second (from the RSX's start until the first flip
-// too), which matches no guest clock.
+// cellGcmGetLastFlipTime: the last flip's time in microseconds of the timebase (the clock of
+// sys_time_get_system_time), from head 1's lastFlipTime, which lv2 writes in timebase ticks; converted as libgcm_sys
+// converts it (D-519); 0 before the first flip. RPCS3 returns its host clock less one second (from the RSX's start
+// until the first flip too), which matches no guest clock.
 u64 cellGcmGetLastFlipTime(PPUContext& ctx)
 {
     const u32 head = head1(gcm());
-    return head ? ps_read64(guest_base(ctx), head + head_lastFlipTime) / 1000 : 0;
+    return head ? ticks_to_us(ps_read64(guest_base(ctx), head + head_lastFlipTime)) : 0;
 }
 
 // RPCS3 cellGcmGetVBlankCount: the vblanks since cellGcmInit, which the interrupt thread counts (RPCS3's vblank thread
@@ -927,19 +980,13 @@ s32 make_room(PPUContext& ctx, u8* base, u32 context)
     return static_cast<s32>(call_guest(ctx, callback, {context, 8}));
 }
 
-// RPCS3 cellGcmSetFlipMode: the renderer's requested vsync becomes mode == CELL_GCM_DISPLAY_VSYNC (2; 1 is HSYNC). The
-// firmware sets it through lv2's display sync attribute (0x101 with the mode in a4, as RPCS3's lv2 reads it), and so
-// does this, for head 1, the head the HLE GCM drives (lv2 ignores the head, as RPCS3's). Before cellGcmInit there is no
-// RSX context to take it: logged.
+// cellGcmSetFlipMode(mode): head 1's display sync, as libgcm_sys sets it (set_flip_mode, D-519); lv2 takes vsync from
+// it (CELL_GCM_DISPLAY_VSYNC, 2, reaches lv2 as 2 or 3).
+void set_flip_mode(PPUContext& ctx, u32 mode, u32 head);
 void cellGcmSetFlipMode(PPUContext& ctx, u32 mode)
 {
     PS_LOG_INFO(kChan, "cellGcmSetFlipMode({})", mode);
-    if (const s32 r = lv2::sys_rsx_context_attribute(thread_of(ctx), kContextId, 0x101, 1, mode, 0, 0);
-        r != lv2::CELL_OK) {
-        PS_LOG_ERROR(kChan,
-            "cellGcmSetFlipMode({}): lv2 refused the display sync setting ({}); called before cellGcmInit?", mode,
-            lv2::error_name(r));
-    }
+    set_flip_mode(ctx, mode, 1);
 }
 
 // RPCS3 gcmSetPrepareFlip (the checked API, under cellGcmSetPrepareFlip and cellGcmSetFlip): a buffer id past 7 is
@@ -959,6 +1006,18 @@ s32 set_prepare_flip(PPUContext& ctx, u32 context, u32 id, std::string_view what
     }
     prepare_flip(base, context, id);
     GcmState& g = gcm();
+    {
+        // libgcm_sys's ring of queued buffers (D-519): the next slot takes the id. libgcm_sys refuses a full ring
+        // (CELL_GCM_ERROR_FAILURE); here the flip command is written already, so the oldest slot is dropped instead.
+        std::lock_guard rl(g.ring_mutex);
+        const s32 next = (g.ring_write + 1) % 8;
+        if (next == g.ring_read) {
+            PS_LOG_WARN(kChan, "{}: eight flips queued; the oldest leaves libgcm_sys's flip ring", what);
+            g.ring_read = (g.ring_read + 1) % 8;
+        }
+        g.ring_write = next;
+        g.ring[static_cast<u32>(next)] = static_cast<u8>(id);
+    }
     if (context == g.context_addr) {
         for (u32 put = atomic_load_be32(base, g.control_addr);;) {
             const u32 seen = atomic_cas_be32(base, g.control_addr, put, put + 8);
@@ -1031,34 +1090,32 @@ void cellGcmSetUserCommand(PPUContext& ctx, u32 context, u32 cause)
     ps_write32(base, context + ctx_current, current + 8);
 }
 
-// cellGcmSetFlipImmediate(id): a buffer id past 7 is CELL_GCM_ERROR_FAILURE, as RPCS3. RPCS3's is a TODO that passes
-// the id to cellGcmSetFlipMode as the mode (vsync for id 2), which is not what the call means: here nothing changes,
-// and the first call is logged, since no buffer is shown outside the command buffer yet.
-s32 cellGcmSetFlipImmediate(PPUContext&, u8 id)
+s32 ring_lookup(GcmState& g, u32 index, bool advance);
+s32 flip_immediate(PPUContext& ctx, u32 index, u32 head);
+
+// cellGcmSetFlipImmediate(index), as libgcm_sys (D-519): the buffer at `index` of the flip ring, which becomes the last
+// flipped slot, is flipped on head 1 at once (lv2's 0x102); CELL_GCM_ERROR_FAILURE when the ring does not hold it.
+s32 cellGcmSetFlipImmediate(PPUContext& ctx, u8 index)
 {
-    if (id > 7) return error(CELL_GCM_ERROR_FAILURE);
-    if (!gcm().flip_immediate_logged.exchange(true)) {
-        PS_LOG_ERROR(kChan, "cellGcmSetFlipImmediate({}): an immediate flip is not implemented (a TODO in RPCS3); "
-                            "nothing is flipped",
-            id);
+    s32 id = 0;
+    {
+        GcmState& g = gcm();
+        std::lock_guard rl(g.ring_mutex);
+        id = ring_lookup(g, index, true);
     }
-    return lv2::CELL_OK;
+    if (id < 0) return error(CELL_GCM_ERROR_FAILURE);
+    return flip_immediate(ctx, static_cast<u32>(id) & 0xFF, 1);
 }
 
-// RPCS3 cellGcmSetSecondVFrequency(freq): 59.94 Hz is what every vblank here runs at; scanout and disabled are TODOs
-// in RPCS3, logged; anything else is logged as an error. RPCS3's HLE does not reach lv2 (0x108) and neither does this.
-void cellGcmSetSecondVFrequency(PPUContext&, u32 freq)
+// cellGcmSetSecondVFrequency(freq), as libgcm_sys: lv2's 0x108 for the second vblank (handler 2) of head 1, 59.94 Hz
+// as 3, the scanout's as 2, anything else (CELL_GCM_DISPLAY_FREQUENCY_DISABLE) as 4, which turns it off. While it is
+// on, the interrupt thread calls the second vblank handler with each vblank (every vblank here is 59.94 Hz).
+void cellGcmSetSecondVFrequency(PPUContext& ctx, u32 freq)
 {
     PS_LOG_INFO(kChan, "cellGcmSetSecondVFrequency({})", freq);
-    switch (freq) {
-    case CELL_GCM_DISPLAY_FREQUENCY_59_94HZ: break;
-    case CELL_GCM_DISPLAY_FREQUENCY_SCANOUT:
-        PS_LOG_WARN(kChan, "cellGcmSetSecondVFrequency: the scanout frequency is not implemented (as RPCS3)");
-        break;
-    case CELL_GCM_DISPLAY_FREQUENCY_DISABLE:
-        PS_LOG_WARN(kChan, "cellGcmSetSecondVFrequency: disabling it is not implemented (as RPCS3)");
-        break;
-    default: PS_LOG_ERROR(kChan, "cellGcmSetSecondVFrequency: {} is not a display frequency", freq); break;
+    const u32 sel = freq == CELL_GCM_DISPLAY_FREQUENCY_59_94HZ ? 3 : freq == CELL_GCM_DISPLAY_FREQUENCY_SCANOUT ? 2 : 4; // 4: DISABLE (3) or any other
+    if (lv2_syscall(ctx, 674, {kContextId, 0x108, 1, sel, 2, 0}) == lv2::CELL_OK) {
+        gcm().second_v_enabled.store(sel != 4, std::memory_order_release);
     }
 }
 
@@ -1089,7 +1146,7 @@ void cellGcmSetGraphicsHandler(PPUContext&, u32 handler)
     PS_LOG_INFO(kChan, "cellGcmSetGraphicsHandler({:#x}): kept by nothing, as RPCS3", handler);
 }
 
-void cellGcmSetVBlankHandler(PPUContext&, u32 handler)
+void cellGcmSetVBlankHandler(PPUContext& ctx, u32 handler)
 {
     GcmState& g = gcm();
     if (!g.initialized) {
@@ -1097,12 +1154,13 @@ void cellGcmSetVBlankHandler(PPUContext&, u32 handler)
         return;
     }
     g.vblank_handler.store(handler, std::memory_order_release);
+    set_event_mask(ctx, 2, handler != 0);
     PS_LOG_INFO(kChan, "cellGcmSetVBlankHandler({:#x})", handler);
 }
 
 // cellGcmSetFlipHandler(handler), as RPCS3: once the RSX is initialized, called on the interrupt thread with head 1
 // after each flip.
-void cellGcmSetFlipHandler(PPUContext&, u32 handler)
+void cellGcmSetFlipHandler(PPUContext& ctx, u32 handler)
 {
     GcmState& g = gcm();
     if (!g.initialized) {
@@ -1110,12 +1168,13 @@ void cellGcmSetFlipHandler(PPUContext&, u32 handler)
         return;
     }
     g.flip_handler.store(handler, std::memory_order_release);
+    set_event_mask(ctx, 0x10, handler != 0);
     PS_LOG_INFO(kChan, "cellGcmSetFlipHandler({:#x})", handler);
 }
 
 // cellGcmSetUserHandler(handler), as RPCS3: once the RSX is initialized, called on the interrupt thread with the
 // argument of each GCM_SET_USER_COMMAND the RSX runs.
-void cellGcmSetUserHandler(PPUContext&, u32 handler)
+void cellGcmSetUserHandler(PPUContext& ctx, u32 handler)
 {
     GcmState& g = gcm();
     if (!g.initialized) {
@@ -1123,13 +1182,14 @@ void cellGcmSetUserHandler(PPUContext&, u32 handler)
         return;
     }
     g.user_handler.store(handler, std::memory_order_release);
+    set_event_mask(ctx, 0x80, handler != 0);
     PS_LOG_INFO(kChan, "cellGcmSetUserHandler({:#x})", handler);
 }
 
 // cellGcmSetQueueHandler(handler), as RPCS3: once the RSX is initialized, called on the interrupt thread with the head
 // whenever the RSX queues a buffer: head 1 before the flip of each flip command (RPCS3 flip_command), and a
 // GCM_DRIVER_QUEUE method's head (lv1's queue event, which the firmware's interrupt thread answers).
-void cellGcmSetQueueHandler(PPUContext&, u32 handler)
+void cellGcmSetQueueHandler(PPUContext& ctx, u32 handler)
 {
     GcmState& g = gcm();
     if (!g.initialized) {
@@ -1137,6 +1197,7 @@ void cellGcmSetQueueHandler(PPUContext&, u32 handler)
         return;
     }
     g.queue_handler.store(handler, std::memory_order_release);
+    set_event_mask(ctx, 0x40, handler != 0);
     PS_LOG_INFO(kChan, "cellGcmSetQueueHandler({:#x})", handler);
 }
 
@@ -1193,8 +1254,8 @@ s32 set_tile_binding(PPUContext& ctx, u8 index, bool bound)
 {
     if (index >= kTilesCount) return error(CELL_GCM_ERROR_INVALID_VALUE);
     const auto p = pack_tile(gcm().tile[index]);
-    return lv2::sys_rsx_context_attribute(thread_of(ctx), kContextId, 0x300, index,
-        bound ? (u64{p[0]} << 32) | p[1] : 0, bound ? (u64{p[2]} << 32) | p[3] : 0, 0);
+    return static_cast<s32>(lv2_syscall(ctx, 674, {kContextId, 0x300, index,
+        bound ? (u64{p[0]} << 32) | p[1] : 0, bound ? (u64{p[2]} << 32) | p[3] : 0, 0}));
 }
 
 s32 cellGcmBindTile(PPUContext& ctx, u8 index) { return set_tile_binding(ctx, index, true); }
@@ -1210,6 +1271,9 @@ s32 cellGcmSetTile(PPUContext& ctx, u8 index, u8 location, u32 offset, u32 size,
         r != lv2::CELL_OK) {
         return r;
     }
+    // What cellGcmSetInvalidateTile sends for it later: the tile word without its location bits (libgcm_sys, D-519).
+    GcmState& g = gcm();
+    g.invalidate_tile[index] = pack_tile(g.tile[index])[0] & ~3u;
     return set_tile_binding(ctx, index, pitch > 0);
 }
 
@@ -1232,8 +1296,8 @@ s32 bind_zcull(PPUContext& ctx, std::string_view what, u8 index, u32 offset, u32
     };
     GcmState& g = gcm();
     std::lock_guard lock(g.mutex);
-    if (const s32 r = lv2::sys_rsx_context_attribute(thread_of(ctx), kContextId, 0x301, index,
-            (u64{words[0]} << 32) | words[1], (u64{words[2]} << 32) | words[3], (u64{words[4]} << 32) | words[5]);
+    if (const s32 r = static_cast<s32>(lv2_syscall(ctx, 674, {kContextId, 0x301, index,
+            (u64{words[0]} << 32) | words[1], (u64{words[2]} << 32) | words[3], (u64{words[4]} << 32) | words[5]}));
         r != lv2::CELL_OK) {
         return r;
     }
@@ -1272,8 +1336,8 @@ s32 cellGcmUnbindZcull(PPUContext& ctx, u8 index)
     GcmState& g = gcm();
     std::lock_guard lock(g.mutex);
     const std::array<u32, 6>& w = g.zcull[index];
-    return lv2::sys_rsx_context_attribute(thread_of(ctx), kContextId, 0x301, index, (u64{w[0]} << 32) | w[1],
-        (u64{w[2]} << 32) | w[3], u64{w[4]} << 32);
+    return static_cast<s32>(lv2_syscall(ctx, 674, {kContextId, 0x301, index, (u64{w[0]} << 32) | w[1],
+        (u64{w[2]} << 32) | w[3], u64{w[4]} << 32, 0}));
 }
 
 u32 cellGcmGetTiledPitchSize(PPUContext&, u32 size)
@@ -1282,6 +1346,399 @@ u32 cellGcmGetTiledPitchSize(PPUContext&, u32 size)
         if (kTiledPitches[i] < size && size <= kTiledPitches[i + 1]) return kTiledPitches[i + 1];
     }
     return 0;
+}
+
+
+// ------------------------------------------------------------------------------------------------- D-519
+//
+// The functions RPCS3 leaves as stubs, each as libgcm_sys.sprx (4.92) does it (tests/hle/test_gcm_compare.cpp runs
+// Sony's module beside these on the same lv2). libgcm_sys reads lv2's driver information (RsxDriverInfo, the layout
+// sys_rsx keeps here) and sends sys_rsx packages; these do the same through lv2's syscall table (lv2_syscall), so a
+// test sees the same calls. "Head 1" is the head libgcm_sys drives by default (its setting is 1 unless changed, and
+// nothing here changes it); the "2" variants are head 0's.
+
+constexpr u32 kScRsxContextAttribute = 674, kScRsxAttribute = 677;
+constexpr u32 kDriverHeads = 0x10B8;     // RsxDriverInfo::head[8], 0x40 each
+constexpr u32 head_vblank_count = 0x30, head_last_vtime_low = 0x1C, head_last_vtime_high = 0x3C,
+              head_last_second_vtime = 0x20, head_field = 0x38;
+
+// libgcm_sys's context ID (0 before cellGcmInit) and lv2's driver information.
+u32 context_id() { return gcm().driver_info ? kContextId : 0; }
+u32 driver_info() { return gcm().driver_info; }
+
+s32 rsx_attribute_call(PPUContext& ctx, std::initializer_list<u64> args)
+{
+    return static_cast<s32>(lv2_syscall(ctx, kScRsxContextAttribute, args));
+}
+
+// _cellGcmFunc1: the GPU version in the driver information. _cellGcmFunc2: libgcm_sys's first word, 0 once
+// initialised. _cellGcmFunc13: the notify area (reports + reportsNotifyOffset). _cellGcmFunc38(u32* out): the driver
+// information's last words (+0x12F0); CELL_GCM_ERROR_FAILURE before cellGcmInit. libgcm_sys reads address 4 before
+// cellGcmInit (it faults): 0 here.
+u32 _cellGcmFunc1(PPUContext& ctx)
+{
+    const u32 di = driver_info();
+    return di ? ps_read32(guest_base(ctx), di + 4) : 0;
+}
+u32 _cellGcmFunc2(PPUContext&) { return 0; }
+u32 _cellGcmFunc13(PPUContext& ctx)
+{
+    const u32 di = driver_info();
+    return di ? gcm().label_addr + ps_read32(guest_base(ctx), di + 0x2C) : 0;
+}
+s32 _cellGcmFunc38(PPUContext& ctx, u32 out)
+{
+    const u32 di = driver_info();
+    if (!di) return error(CELL_GCM_ERROR_FAILURE);
+    if (!out_pointer_ok(ctx, out, 4, "_cellGcmFunc38")) return error(CELL_GCM_ERROR_FAILURE);
+    ps_write32(guest_base(ctx), out, di + 0x12F0);
+    return lv2::CELL_OK;
+}
+
+// _cellGcmFunc3(code): libgcm_sys's table of magic numbers (codes and the answers it gives), 0 for any other.
+u32 _cellGcmFunc3(PPUContext&, u32 code)
+{
+    switch (code) {
+    case 0xBBBB0000: return 0x31337303;
+    case 0xBBBB0001: return 0x3137C0DE;
+    case 0xBBBB1000: return 0x31337808;
+    case 0xBBBB1001: return 0x3137AF00;
+    case 0xBBBB2000: return 0x313371C3;
+    case 0xBBBB2001: return 0x31337A73;
+    case 0xBEEF2000: return 0x66604200;
+    case 0xBEEF2002: return 0xFEED0000;
+    case 0xBEEF2004: return 0x66626660;
+    case 0xBEEF2005: return 0xFEED0001;
+    case 0xBEEF2006: return 0x66606660;
+    case 0xBEEF2007: return 0x66616661;
+    case 0xBEEF2008: return 0x56616660;
+    case 0xBEEF2009: return 0x56616661;
+    case 0xBEEF4097: return 0x31337000;
+    case 0xCCCC0001: return 0xCAFEBABE;
+    default: return 0;
+    }
+}
+
+// _cellGcmFunc4: package 0x106 (performance monitor) with 1. libgcm_sys sends it with whatever context it has.
+s32 _cellGcmFunc4(PPUContext& ctx) { return rsx_attribute_call(ctx, {context_id(), 0x106, 1, 0, 0, 0}); }
+
+// A head's fields of the driver information (0 before cellGcmInit).
+u32 head_word(PPUContext& ctx, u32 head, u32 field)
+{
+    const u32 di = driver_info();
+    return di ? ps_read32(guest_base(ctx), di + kDriverHeads + 0x40 * head + field) : 0;
+}
+u64 head_dword(PPUContext& ctx, u32 head, u32 field)
+{
+    const u32 di = driver_info();
+    return di ? ps_read64(guest_base(ctx), di + kDriverHeads + 0x40 * head + field) : 0;
+}
+
+u32 cellGcmGetCurrentField(PPUContext& ctx) { return head_word(ctx, 1, head_field); }
+
+// The flip status of head 0: 1 (waiting) until its flip-done bit is set.
+u32 cellGcmGetFlipStatus2(PPUContext& ctx)
+{
+    const u32 di = driver_info();
+    if (!di) return 0;
+    return (atomic_load_be32(guest_base(ctx), di + kDriverHeads + head_flipFlags) >> 31) ^ 1;
+}
+
+u64 cellGcmGetVBlankCount2(PPUContext& ctx) { return head_dword(ctx, 0, head_vblank_count); }
+
+// The second vblank's last time (head 1, timebase ticks) in microseconds.
+u64 cellGcmGetLastSecondVTime(PPUContext& ctx)
+{
+    return driver_info() ? ticks_to_us(head_dword(ctx, 1, head_last_second_vtime)) : 0;
+}
+
+// The last vblank's time on head 1, as lv2 keeps it (two words, timebase ticks; not converted).
+u64 cellGcmSysGetLastVBlankTime(PPUContext& ctx)
+{
+    return (u64{head_word(ctx, 1, head_last_vtime_high)} << 32) | head_word(ctx, 1, head_last_vtime_low);
+}
+
+// Head 0's last flip time in microseconds (lv2 keeps timebase ticks).
+u64 cellGcmGetLastFlipTime2(PPUContext& ctx) { return driver_info() ? ticks_to_us(head_dword(ctx, 0, head_lastFlipTime)) : 0; }
+
+// Flip status of head 0 through lv2's 0x10a: set (flipFlags | 0x80000000) or reset (flipFlags & 0x7FFFFFFF).
+void cellGcmSetFlipStatus2(PPUContext& ctx) { set_flip_status(ctx, 0, 0, kFlipDone); }
+void cellGcmResetFlipStatus2(PPUContext& ctx) { set_flip_status(ctx, 0, ~kFlipDone, 0); }
+
+// libgcm_sys's display sync for a head: CELL_GCM_DISPLAY_HSYNC (1) and HSYNC_WITH_NOISE (3) are lv2's 1; VSYNC (2) is
+// 3 when lv2 reports the display at 59.94 Hz (sys_rsx_attribute 0x202 answers 1), else 2. lv2's display attribute
+// (sys_rsx_attribute 2) first, then 0x101.
+s32 display_frequency(PPUContext& ctx, u32 head)
+{
+    const s32 r = static_cast<s32>(lv2_syscall(ctx, kScRsxAttribute, {0x202, head, 1, 0, 0}));
+    return r == 2 ? 2 : r == 3 ? 1 : -1;
+}
+void set_flip_mode(PPUContext& ctx, u32 mode, u32 head)
+{
+    u32 attr = 0, sync = 0;
+    if (mode == 1) {
+        attr = 1;
+        sync = 1;
+    } else if (mode == 3) {
+        attr = 0;
+        sync = 1;
+    } else {
+        const s32 f = display_frequency(ctx, head);
+        attr = f == 1 ? 1 : 0;
+        sync = f == 1 ? 3 : 2;
+    }
+    lv2_syscall(ctx, kScRsxAttribute, {2, head, attr, 0, 0});
+    rsx_attribute_call(ctx, {context_id(), 0x101, head, sync, 0, 0});
+}
+void cellGcmSetFlipMode2(PPUContext& ctx, u32 mode) { set_flip_mode(ctx, mode, 0); }
+
+// cellGcmSetVBlankFrequency(freq): package 0x108 for the head's vblank (handler 1): CELL_GCM_DISPLAY_FREQUENCY_59_94HZ
+// (1) is lv2's 3, SCANOUT (2) its 2, anything else 4; then the head's display sync becomes VSYNC.
+void cellGcmSetVBlankFrequency(PPUContext& ctx, u32 freq)
+{
+    constexpr u32 head = 1;
+    rsx_attribute_call(ctx, {context_id(), 0x108, head, freq == 1 ? 3u : freq == 2 ? 2u : 4u, 1, 0});
+    set_flip_mode(ctx, 2, head);
+}
+
+
+// The ring of buffers cellGcmSetPrepareFlip queued: from the slot after `ring_read` up to `ring_write`, the slot
+// whose index is `index` gives its buffer (libgcm_sys's lookup); -1 when it is not there. `advance` makes it the last
+// flipped one (cellGcmSetFlipImmediate).
+s32 ring_lookup(GcmState& g, u32 index, bool advance)
+{
+    if (index > 7) return -1;
+    s32 at = g.ring_read;
+    if (at == g.ring_write) return -1;
+    for (;;) {
+        at = (at + 1) % 8;
+        if (static_cast<u32>(at) == index) {
+            const s32 id = g.ring[static_cast<u32>(at)];
+            if (advance) g.ring_read = at;
+            return id;
+        }
+        if (at == g.ring_write) return -1;
+    }
+}
+
+s32 cellGcmGetDisplayBufferByFlipIndex(PPUContext&, u32 index)
+{
+    GcmState& g = gcm();
+    std::lock_guard rl(g.ring_mutex);
+    return ring_lookup(g, index & 0xFF, false);
+}
+
+// libgcm_sys's immediate flip: label 0 or 1 set to 0xFFFFFFFF, then lv2's display flip (0x102) of the head's queued
+// buffer `index` with the hardware channel (driver information +0xC) in bits 8..15; CELL_GCM_ERROR_FAILURE before
+// cellGcmInit or when lv2 refuses it.
+s32 flip_immediate(PPUContext& ctx, u32 index, u32 head)
+{
+    u8* base = guest_base(ctx);
+    GcmState& g = gcm();
+    if (g.label_addr) ps_write32(base, g.label_addr + 0x10 * head, 0xFFFFFFFF);
+    const u32 di = g.driver_info;
+    if (!di) return error(CELL_GCM_ERROR_FAILURE);
+    const u64 value = 0x80000000u | (ps_read32(base, di + 0xC) << 8) | (index & 7);
+    if (rsx_attribute_call(ctx, {context_id(), 0x102, head, value, 0, 0}) != lv2::CELL_OK) {
+        return error(CELL_GCM_ERROR_FAILURE);
+    }
+    return lv2::CELL_OK;
+}
+
+// cellGcmSetFlipImmediate2(index): head 0's queued buffer `index` (0..7).
+s32 cellGcmSetFlipImmediate2(PPUContext& ctx, u32 index)
+{
+    if (index > 7) return error(CELL_GCM_ERROR_FAILURE);
+    return flip_immediate(ctx, index & 0xFF, 0);
+}
+
+// The flip handler of head 0 (lv2's event 8). Head 0 never flips here (the RSX flips head 1), so it is kept, with its
+// event bit, and not called.
+void cellGcmSetFlipHandler2(PPUContext& ctx, u32 handler)
+{
+    gcm().flip_handler_head0.store(handler, std::memory_order_release);
+    set_event_mask(ctx, 8, handler != 0);
+}
+
+// cellGcmSetSecondVHandler(handler): head 1's second vblank handler (lv2's event 0x800), called on the interrupt
+// thread at each vblank once cellGcmSetSecondVFrequency enabled the second vblank.
+void cellGcmSetSecondVHandler(PPUContext& ctx, u32 handler)
+{
+    gcm().second_vhandler[1].store(handler, std::memory_order_release);
+    set_event_mask(ctx, 0x800, handler != 0);
+}
+
+// _cellGcmSetFlipCommand2(context, id): label 0 set to 0xFFFFFFFF by the RSX (two words of nothing, then
+// NV406E_SEMAPHORE_OFFSET 0 and NV406E_SEMAPHORE_RELEASE 0xFFFFFFFF, written without a room check), then
+// GCM_FLIP_HEAD for head 0 with id | 0x80000100 (a queued buffer), with libgcm_sys's room check of 16 bytes.
+void _cellGcmSetFlipCommand2(PPUContext& ctx, u32 context, u32 id)
+{
+    if (!context_readable(ctx, context, "_cellGcmSetFlipCommand2")) return;
+    u8* base = guest_base(ctx);
+    u32 current = ps_read32(base, context + ctx_current);
+    const u32 words[6] = {0, 0, 0x00040064, 0, 0x0004006C, 0xFFFFFFFF};
+    for (u32 i = 0; i < 6; i++) ps_write32(base, current + 4 * i, words[i]);
+    current += 24;
+    ps_write32(base, context + ctx_current, current);
+    if (current + 16 > ps_read32(base, context + ctx_end)) {
+        if (make_room(ctx, base, context) != 0) return;
+        current = ps_read32(base, context + ctx_current);
+    }
+    ps_write32(base, current, rsx::cmd::method_header(rsx::m::GCM_FLIP_HEAD, 1));
+    ps_write32(base, current + 4, id | 0x80000100);
+    ps_write32(base, context + ctx_current, current + 8);
+}
+
+// cellGcmSetInvalidateTile(index): lv2's tile package (0x300) with the tile word cellGcmSetTile last sent for it
+// without its location bits (so lv2 unbinds it), then the tile's CellGcmTileInfo cleared. libgcm_sys checks no index
+// (it reads and clears past its arrays); an index past 14 reaches lv2 here and clears nothing.
+void cellGcmSetInvalidateTile(PPUContext& ctx, u8 index)
+{
+    GcmState& g = gcm();
+    const u32 word = index < kTilesCount ? g.invalidate_tile[index] : 0;
+    rsx_attribute_call(ctx, {context_id(), 0x300, index, u64{word} << 32, 0, 0});
+    if (index < kTilesCount && g.tiles) std::memset(guest_base(ctx) + g.tiles + 16 * index, 0, 16);
+}
+
+// cellGcmDumpGraphicsError: libgcm_sys has nothing to dump (CELL_OK).
+s32 cellGcmDumpGraphicsError(PPUContext&) { return lv2::CELL_OK; }
+
+// The hardware cursor, as libgcm_sys keeps it: cellGcmInitCursor (lv2 0x10D), then enable, disable, position (0..4095
+// each; a y of 0 is kept as 1), image offset and mode only change what cellGcmUpdateCursor sends lv2: the mode
+// (0x10B, 4), the image (0x10B, 2) and the position (0x10B, 3), with the cursor disabled around a change of its
+// enabling or mode (0x10C 2, then 1). Before cellGcmInitCursor each is CELL_GCM_ERROR_FAILURE.
+s32 cellGcmInitCursor(PPUContext& ctx)
+{
+    GcmState& g = gcm();
+    std::lock_guard lock(g.mutex);
+    if (g.cursor.initialized) return error(CELL_GCM_ERROR_FAILURE);
+    const u32 id = context_id();
+    if (!id) return error(CELL_GCM_ERROR_FAILURE);
+    g.cursor = {};
+    if (const s32 r = rsx_attribute_call(ctx, {id, 0x10D, 1, 1, 0, 0}); r != lv2::CELL_OK) return r;
+    g.cursor.initialized = true;
+    return lv2::CELL_OK;
+}
+
+s32 set_cursor_enabled(bool on)
+{
+    GcmState& g = gcm();
+    std::lock_guard lock(g.mutex);
+    if (!g.cursor.initialized) return error(CELL_GCM_ERROR_FAILURE);
+    g.cursor.enable_dirty = true;
+    g.cursor.enabled = on;
+    return lv2::CELL_OK;
+}
+s32 cellGcmSetCursorEnable(PPUContext&) { return set_cursor_enabled(true); }
+s32 cellGcmSetCursorDisable(PPUContext&) { return set_cursor_enabled(false); }
+
+s32 cellGcmSetCursorPosition(PPUContext&, s32 x, s32 y)
+{
+    GcmState& g = gcm();
+    std::lock_guard lock(g.mutex);
+    if (!g.cursor.initialized) return error(CELL_GCM_ERROR_FAILURE);
+    if (x > 4095 || y > 4095 || x < 0 || y < 0) return error(CELL_GCM_ERROR_INVALID_VALUE);
+    g.cursor.x = static_cast<u32>(x);
+    g.cursor.y = y ? static_cast<u32>(y) : 1;
+    return lv2::CELL_OK;
+}
+
+s32 cellGcmSetCursorImageOffset(PPUContext&, u32 offset)
+{
+    GcmState& g = gcm();
+    std::lock_guard lock(g.mutex);
+    if (!g.cursor.initialized || !g.driver_info) return error(CELL_GCM_ERROR_FAILURE);
+    g.cursor.offset = offset;
+    g.cursor.image_dirty = true;
+    return lv2::CELL_OK;
+}
+
+s32 cellGcmUpdateCursor(PPUContext& ctx)
+{
+    GcmState& g = gcm();
+    std::lock_guard lock(g.mutex);
+    if (!g.cursor.initialized) return error(CELL_GCM_ERROR_FAILURE);
+    const u32 id = context_id();
+    if (!id) return error(CELL_GCM_ERROR_FAILURE);
+    GcmState::Cursor& c = g.cursor;
+    const auto send = [&](std::initializer_list<u64> a) { return rsx_attribute_call(ctx, a) == lv2::CELL_OK; };
+    if (c.enable_dirty || c.mode_dirty) {
+        if (!send({id, 0x10C, 1, 2, 0, 0})) return error(CELL_GCM_ERROR_INVALID_VALUE);
+        if (c.mode_dirty) {
+            c.mode_dirty = false;
+            if (!send({id, 0x10B, 1, 4, static_cast<u64>(static_cast<s64>(static_cast<s32>(c.mode))), 0})) {
+                return error(CELL_GCM_ERROR_INVALID_VALUE);
+            }
+        }
+    }
+    if (c.image_dirty) {
+        c.image_dirty = false;
+        if (!send({id, 0x10B, 1, 2, c.offset, 0})) return error(CELL_GCM_ERROR_INVALID_VALUE);
+    }
+    if (!send({id, 0x10B, 1, 3, c.x, c.y})) return error(CELL_GCM_ERROR_INVALID_VALUE);
+    if (!c.enable_dirty) return lv2::CELL_OK;
+    c.enable_dirty = false;
+    if (!c.enabled) return lv2::CELL_OK;
+    return send({id, 0x10C, 1, 1, 0, 0}) ? lv2::CELL_OK : error(CELL_GCM_ERROR_INVALID_VALUE);
+}
+
+// GPAD, Sony's GPU capture tool, which a retail system has no part of (libgcm_sys has none of these): no capture is
+// running (status 0), and the surface and snapshot requests have nothing to capture them (CELL_OK, as RPCS3).
+s32 cellGcmGpadGetStatus(PPUContext& ctx, u32 status)
+{
+    if (!out_pointer_ok(ctx, status, 4, "cellGcmGpadGetStatus")) return error(CELL_GCM_ERROR_FAILURE);
+    ps_write32(guest_base(ctx), status, 0);
+    return lv2::CELL_OK;
+}
+s32 cellGcmGpadNotifyCaptureSurface(PPUContext&, u32) { return lv2::CELL_OK; }
+s32 cellGcmGpadCaptureSnapshot(PPUContext&, u32) { return lv2::CELL_OK; }
+
+
+// cellGcmSortRemapEaIoAddress: libgcm_sys packs the IO mappings together, keeping IO MB 0 (the command buffer) where it
+// is: every mapping past it is unmapped in lv2, the offset table's entries are moved down one MB at a time into the
+// holes (in IO order, so mappings stay whole), and each mapping is mapped again at its new IO offset (flags
+// 0xE000000000000800, as libgcm_sys). The IO space it walks is cellGcmGetMaxIoMapSize's. lv2's error, if one, is the
+// answer, the mappings left as they are by then.
+s32 cellGcmSortRemapEaIoAddress(PPUContext& ctx)
+{
+    GcmState& g = gcm();
+    std::lock_guard lock(g.mutex);
+    const u32 n = max_io_map_size(g) >> 20;
+    if (!g.offset_table || !n) return lv2::CELL_OK;
+    const u32 id = context_id();
+    u8* base = guest_base(ctx);
+    const auto ea_at = [&](u32 io) { return u32{ps_read16(base, g.offset_table + 2 * (kIoAddressEntries + io))}; };
+    const auto size_at = [&](u32 io) {
+        const u32 ea = ea_at(io);
+        return ea < kIoAddressEntries ? u32{g.io_map_size[ea]} : 0u;
+    };
+    for (u32 io = 1; io < n; io++) {
+        if (ea_at(io) == 0xFFFF || !size_at(io)) continue;
+        if (const s32 r = static_cast<s32>(lv2_syscall(ctx, 673, {id, u64{io} << 20, u64{size_at(io)} << 20}))) return r;
+    }
+    for (u32 io = 1; io + 1 < n;) {
+        if (ea_at(io) != 0xFFFF) {
+            io++;
+            continue;
+        }
+        u32 from = io + 1;
+        while (from < n && ea_at(from) == 0xFFFF) from++;
+        if (from < n) {
+            const u32 ea = ea_at(from);
+            ps_write16(base, g.offset_table + 2 * ea, static_cast<u16>(io));
+            ps_write16(base, g.offset_table + 2 * (kIoAddressEntries + from), 0xFFFF);
+            ps_write16(base, g.offset_table + 2 * (kIoAddressEntries + io), static_cast<u16>(ea));
+        }
+        io++;
+    }
+    for (u32 io = 1; io < n; io++) {
+        if (ea_at(io) == 0xFFFF || !size_at(io)) continue;
+        if (const s32 r = static_cast<s32>(lv2_syscall(ctx, 672,
+                {id, u64{io} << 20, u64{ea_at(io)} << 20, u64{size_at(io)} << 20, 0xE000000000000800ull}))) {
+            return r;
+        }
+    }
+    return lv2::CELL_OK;
 }
 
 } // namespace
@@ -1374,6 +1831,40 @@ void register_cellGcmSys(Registry& r)
         PS_HLE_FUNC(0x055BD74D, cellGcmGetTiledPitchSize),
         PS_HLE_INTERNAL(NID_cellGcmCallback, cellGcmCallback),
         PS_HLE_INTERNAL(NID_interrupt_thread, _pspocket_gcm_interrupt_thread),
+    });
+    using detail::thunk;
+    const auto f = [](std::string_view name, HleFn fn) { return Function{{}, name, recomp::nid_of(name), fn, false}; };
+    r.add(kModule, {
+        f("_cellGcmFunc1", &thunk<&_cellGcmFunc1>), f("_cellGcmFunc2", &thunk<&_cellGcmFunc2>),
+        f("_cellGcmFunc3", &thunk<&_cellGcmFunc3>), f("_cellGcmFunc4", &thunk<&_cellGcmFunc4>),
+        f("_cellGcmFunc13", &thunk<&_cellGcmFunc13>), f("_cellGcmFunc38", &thunk<&_cellGcmFunc38>),
+        f("_cellGcmSetFlipCommand2", &thunk<&_cellGcmSetFlipCommand2>),
+        f("cellGcmDumpGraphicsError", &thunk<&cellGcmDumpGraphicsError>),
+        f("cellGcmGetCurrentField", &thunk<&cellGcmGetCurrentField>),
+        f("cellGcmGetDisplayBufferByFlipIndex", &thunk<&cellGcmGetDisplayBufferByFlipIndex>),
+        f("cellGcmGetFlipStatus2", &thunk<&cellGcmGetFlipStatus2>),
+        f("cellGcmGetLastFlipTime2", &thunk<&cellGcmGetLastFlipTime2>),
+        f("cellGcmGetLastSecondVTime", &thunk<&cellGcmGetLastSecondVTime>),
+        f("cellGcmGetVBlankCount2", &thunk<&cellGcmGetVBlankCount2>),
+        f("cellGcmGpadCaptureSnapshot", &thunk<&cellGcmGpadCaptureSnapshot>),
+        f("cellGcmGpadGetStatus", &thunk<&cellGcmGpadGetStatus>),
+        f("cellGcmGpadNotifyCaptureSurface", &thunk<&cellGcmGpadNotifyCaptureSurface>),
+        f("cellGcmInitCursor", &thunk<&cellGcmInitCursor>),
+        f("cellGcmResetFlipStatus2", &thunk<&cellGcmResetFlipStatus2>),
+        f("cellGcmSetCursorDisable", &thunk<&cellGcmSetCursorDisable>),
+        f("cellGcmSetCursorEnable", &thunk<&cellGcmSetCursorEnable>),
+        f("cellGcmSetCursorImageOffset", &thunk<&cellGcmSetCursorImageOffset>),
+        f("cellGcmSetCursorPosition", &thunk<&cellGcmSetCursorPosition>),
+        f("cellGcmSetFlipHandler2", &thunk<&cellGcmSetFlipHandler2>),
+        f("cellGcmSetFlipImmediate2", &thunk<&cellGcmSetFlipImmediate2>),
+        f("cellGcmSetFlipMode2", &thunk<&cellGcmSetFlipMode2>),
+        f("cellGcmSetFlipStatus2", &thunk<&cellGcmSetFlipStatus2>),
+        f("cellGcmSetInvalidateTile", &thunk<&cellGcmSetInvalidateTile>),
+        f("cellGcmSetSecondVHandler", &thunk<&cellGcmSetSecondVHandler>),
+        f("cellGcmSetVBlankFrequency", &thunk<&cellGcmSetVBlankFrequency>),
+        f("cellGcmSysGetLastVBlankTime", &thunk<&cellGcmSysGetLastVBlankTime>),
+        f("cellGcmUpdateCursor", &thunk<&cellGcmUpdateCursor>),
+        f("cellGcmSortRemapEaIoAddress", &thunk<&cellGcmSortRemapEaIoAddress>),
     });
 }
 

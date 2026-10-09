@@ -178,6 +178,16 @@ void Rsx::notify()
     wake_cv_.notify_one();
 }
 
+void Rsx::request_flip(u32 head, u32 value)
+{
+    {
+        std::lock_guard lock(flip_requests_mutex_);
+        flip_requests_.emplace_back(head, value);
+    }
+    flip_requested_.store(true, std::memory_order_release);
+    notify();
+}
+
 u64 Rsx::timestamp_ns()
 {
     const unsigned __int128 tb = ps_timebase_now();
@@ -457,6 +467,14 @@ Rsx::RunStatus Rsx::step(u64 max_words)
 
 Rsx::RunStatus Rsx::step_commands(u64 max_words)
 {
+    if (flip_requested_.exchange(false, std::memory_order_acquire)) {
+        std::vector<std::pair<u32, u32>> requests;
+        {
+            std::lock_guard lock(flip_requests_mutex_);
+            requests.swap(flip_requests_);
+        }
+        for (const auto& [head, value] : requests) m_driver_flip(m::GCM_FLIP_HEAD + (head & 1), value);
+    }
     if (fifo_reset_.load(std::memory_order_acquire)) {
         const u64 gp = pending_get_put_.load(std::memory_order_acquire);
         get_.store(static_cast<u32>(gp), std::memory_order_release);
@@ -643,6 +661,7 @@ bool Rsx::semaphore_acquire_satisfied(u32 value)
 bool Rsx::blocked_condition_cleared()
 {
     if (fifo_reset_.load(std::memory_order_acquire) || stop_requested_.load(std::memory_order_acquire)) return true;
+    if (flip_requested_.load(std::memory_order_acquire)) return true; // lv2's flips run even while the FIFO waits
     switch (block_reason_.load()) {
     case BlockReason::Semaphore: return semaphore_acquire_satisfied(block_value_);
     case BlockReason::JumpToSelf: {

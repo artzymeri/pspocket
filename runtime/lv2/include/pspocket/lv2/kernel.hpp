@@ -287,6 +287,11 @@ public:
     // the few syscalls that return more).
     void syscall(PPUContext& ctx);
 
+    // Tests: called before every dispatched syscall with its number and r3..r10 (comparing a library with Sony's
+    // module: the same calls into lv2, D-519). Null removes it; set it while no guest thread runs.
+    using SyscallObserver = void (*)(void* user, u32 number, const u64* args);
+    void set_syscall_observer(SyscallObserver fn, void* user);
+
     // Process state.
     bool exited() const;
     s32 exit_status() const;

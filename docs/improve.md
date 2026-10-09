@@ -461,5 +461,9 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   own sectors and report no CD-DA areas; a game that reads a disc by absolute sector would need the image's extents.
   Names are never converted (fcntl 0xC0000006 answers CELL_ENOTSUP for every mount), as RPCS3: right for host file
   systems, which keep long names.
+- **cellGcmSys's flip path (D-519).** pspocket's cellGcmSetFlip writes RPCS3's GCM_FLIP_COMMAND (queue and flip at
+  once, buffer id returned); libgcm_sys queues with GCM_DRIVER_QUEUE, flips from its interrupt handler through lv2's
+  0x102 and returns the ring slot. Moving to libgcm_sys's path would let the comparison cover cellGcmSetFlip too; it
+  needs lv2's queue and flip events (RPCS3 send_event) and a vblank-timed flip.
 - **Kernel gaps behind liblv2's wrappers.** sys_rsxaudio (650-658), interrupt threads (84, 89) and process spawning
   (21) answer CELL_ENOSYS in lv2; RPCS3 implements sys_rsxaudio.

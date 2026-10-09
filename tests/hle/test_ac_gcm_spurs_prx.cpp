@@ -182,9 +182,9 @@ TEST_CASE("cellGcmSys (AC): flip mode through lv2, time stamps and reports in lo
         return dev.tiles[i];
     };
 
-    // Before cellGcmInit there is no RSX context to take the flip mode: logged.
+    // Before cellGcmInit libgcm_sys sends the flip mode with no context, which lv2 refuses (D-519).
     g.call("cellGcmSetFlipMode", 2);
-    CHECK(logs.count(log::Level::Error, "cellGcmSys", "cellGcmSetFlipMode(2): lv2 refused") == 1);
+    CHECK_FALSE(vsync());
 
     // Flip mode: lv2's display sync (0x101) takes it, vsync for CELL_GCM_DISPLAY_VSYNC (2) only, as RPCS3.
     REQUIRE(g.call("_cellGcmInitBody", kCtxPtr, kCmdSize, 0x100000, kIo) == 0);

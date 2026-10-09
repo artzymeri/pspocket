@@ -6248,3 +6248,44 @@ same, 4,907 checks). RPCS3 implements none of them.
   0xC000001A, 0xE0000016, 0xE0000018 and 0xE0000025. tests/lv2/test_fs.cpp checks each. The kernel's error names now
   cover every CELL_E code.
 - sys_fs is 100% pspocket's own (82 of 82); 12 more kernel calls are pspocket's own.
+
+## D-519 · 2026-10-09 · cellGcmSys complete, compared with libgcm_sys running on pspocket's lv2
+
+The 33 cellGcmSys functions pspocket lacked are its own (runtime/hle/src/cellGcmSys.cpp, the D-519 section), each read
+in libgcm_sys.sprx (4.92); RPCS3 leaves them as stubs. The comparison (tests/hle/test_gcm_compare.cpp) runs Sony's
+module for real: lv2's RSX calls 668, 670 and 672 to 675 are now bound to their numbers (they were called only by
+pspocket's own cellGcmSys), so libgcm_sys's _cellGcmInitBody initialises on pspocket's kernel, and every script runs in
+two fresh processes, one initialised by each side. Answers, the bytes written, lv2's driver information (heads and the
+event mask) and every RSX call into lv2 with its arguments (a new test hook, Kernel::set_syscall_observer) are the same,
+over seven scenarios: the getters, flip status, flip mode, vblank frequencies and handlers, the hardware cursor, tiles,
+sorting the IO mappings, immediate flips, flip command 2 and the flip ring.
+- **What libgcm_sys keeps.** A context record (memory handle, local memory, context ID, DMA control, driver
+  information, reports), head 1 as the head it drives, the handlers with their bits in the driver information's event
+  mask (vblank 1/2, flip 8/0x10, queue 0x20/0x40, user 0x80, second vblank 0x400/0x800), the ring of 8 buffers
+  cellGcmSetPrepareFlip queued (cellGcmGetDisplayBufferByFlipIndex, cellGcmSetFlipImmediate), the tile word each
+  cellGcmSetTile sent (cellGcmSetInvalidateTile sends it without its location bits), the cursor state.
+- **The new functions.** _cellGcmFunc1 (GPU version), 2 (0), 3 (a table of 16 magic numbers), 4 (package 0x106), 13
+  (the notify area), 38 (driver information + 0x12F0); the head-0 ("2") variants of flip status, flip mode, vblank
+  count, last flip time, flip handler, flip immediate and flip command; cellGcmGetCurrentField, GetLastSecondVTime,
+  SysGetLastVBlankTime (lv2's words as they are), SetVBlankFrequency (0x108 then VSYNC), SetSecondVHandler (called
+  with the vblank once cellGcmSetSecondVFrequency enabled it), SetInvalidateTile, DumpGraphicsError (CELL_OK),
+  SortRemapEaIoAddress (unmap all past IO MB 0, pack the offset table's entries into the holes, map again), the cursor
+  (InitCursor, Enable, Disable, Position, ImageOffset, Update: libgcm_sys's dirty flags and lv2 packages 0x10B/0x10C/
+  0x10D). The three GPAD functions are in no retail module (Sony's GPU capture tool): no capture, CELL_OK.
+- **Existing functions made libgcm_sys's.** _cellGcmInitBody now sets the FIFO at 0x1000 (package 0x001), both heads'
+  flip status done and the head-1 vblank bit, as libgcm_sys; cellGcmSetFlipStatus leaves only the flip-done bit
+  (libgcm_sys's 0x10a with a4 0); cellGcmSetFlipMode goes through sys_rsx_attribute 2 and 0x101 as libgcm_sys (VSYNC is
+  lv2's 2 unless the display reports 59.94 Hz); cellGcmSetSecondVFrequency sends 0x108; cellGcmSetFlipImmediate flips
+  the ring's buffer through lv2's 0x102 (before, nothing); the handler setters set their event bits; the RSX calls go
+  through lv2's syscall table.
+- **The kernel side.** sys_rsx packages 0x102 (display flip: the RSX thread runs it as a GCM_FLIP_HEAD,
+  Rsx::request_flip, even while its FIFO waits), 0x103 (display queue), 0x108 (vblank frequencies), 0x10B/0x10C (the
+  cursor, kept for an overlay). Flip and vblank times in the driver information are timebase ticks, as lv2's (they were
+  nanoseconds); cellGcmGetLastFlipTime converts them as libgcm_sys does (the same microseconds as before). 0xFED also
+  keeps the second vblank's time.
+- **Left as they were (deviations kept).** pspocket's cellGcmSetFlip and SetPrepareFlip still write RPCS3's
+  GCM_FLIP_COMMAND (queue and flip at once) and return the buffer id, where libgcm_sys writes GCM_DRIVER_QUEUE, flips
+  from its interrupt handler and returns the ring slot; changing the flip path is engine work of its own (GTA V and
+  Assassin's Creed run on it). A full flip ring drops its oldest slot instead of failing. Head 0 never flips here.
+- GTA V's prologue gate passes unchanged (29.8 fps median, no new messages). cellGcmSys is 100% pspocket's own; 6
+  more kernel calls are bound.

@@ -531,6 +531,7 @@ Kernel::Impl::Impl(Kernel& k)
     register_vm_syscalls(table);
     register_spu_syscalls(table);
     register_system_syscalls(table);
+    register_rsx_syscalls(table);
     // Every other slot RPCS3 answers with null_func (a log, then CELL_OK) is answered so too (D-166): a game calling
     // one goes on instead of meeting ENOSYS. GTA V's CRT, for one, registers a debug exception handler (988).
     static constexpr struct {
@@ -793,6 +794,12 @@ void Kernel::set_rsx_queue_listener(std::function<void(u32 head, u32 buffer_id)>
     impl_->rsx.on_queue = std::move(fn);
 }
 
+void Kernel::set_syscall_observer(SyscallObserver fn, void* user)
+{
+    impl_->syscall_observer_user = user;
+    impl_->syscall_observer.store(fn, std::memory_order_release);
+}
+
 void Kernel::syscall(PPUContext& ctx)
 {
     auto* t = static_cast<PpuThread*>(ctx.runtime);
@@ -804,6 +811,9 @@ void Kernel::syscall(PPUContext& ctx)
         throw NonLocalJump{};
     }
     const u64 number = ctx.gpr[11];
+    if (const auto observer = impl_->syscall_observer.load(std::memory_order_relaxed)) [[unlikely]] {
+        observer(impl_->syscall_observer_user, static_cast<u32>(number), &ctx.gpr[3]);
+    }
     if (number < kSyscallCount) {
         const SyscallEntry& entry = impl_->table[static_cast<u32>(number)];
         if (entry.fn) {
