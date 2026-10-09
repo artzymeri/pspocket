@@ -429,9 +429,40 @@ int spu_intr_mbox(SPUContext* ctx, uint32_t value)
     return 0;
 }
 
-constexpr ps_spu_hooks kHooks{spu_stop, spu_intr_mbox};
+constexpr ps_spu_hooks kHooks{spu_stop, spu_intr_mbox, 0, nullptr};
 
 } // namespace
+
+Result decrypt_spu_self(Kernel::Impl& s, std::vector<u8>& bytes, std::string_view what)
+{
+    return decrypt_if_self(s, bytes, what);
+}
+
+std::optional<u32> spu_elf_entry(std::span<const u8> file)
+{
+    const auto elf = parse_spu_elf(file);
+    if (!elf || count_segments(elf->second) <= 0) return std::nullopt;
+    for (const ElfPhdr& p : elf->second) {
+        if (p.type == 1 && (p.offset > file.size() || p.filesz > file.size() - p.offset)) return std::nullopt;
+    }
+    return elf->first;
+}
+
+// RPCS3 sys_spu_image::load + deploy for one local store: each PT_LOAD's file bytes, then zeros to its memory size.
+bool load_spu_elf(std::span<const u8> file, u8* ls, u32& entry)
+{
+    const auto e = spu_elf_entry(file);
+    if (!e) return false;
+    for (const ElfPhdr& p : parse_spu_elf(file)->second) {
+        if (p.type != 1) continue;
+        const u32 at = p.vaddr % kLsSize;
+        const u32 copy = std::min<u32>(kLsSize - at, p.filesz);
+        std::memcpy(ls + at, file.data() + p.offset, copy);
+        if (p.memsz > p.filesz) std::memset(ls + at + copy, 0, std::min<u32>(kLsSize - at - copy, p.memsz - p.filesz));
+    }
+    entry = *e;
+    return true;
+}
 
 // ------------------------------------------------------------------------------------------------- SpuThread
 

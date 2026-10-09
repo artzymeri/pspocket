@@ -37,6 +37,7 @@
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/core/mmio.hpp"
 #include "pspocket/core/thread_report.hpp"
 #include "pspocket/game/host.hpp"
 #include "pspocket/hle/audio.hpp"
@@ -138,10 +139,12 @@ void on_log(void*, ps_ios_log_level level, const char* channel, const char* mess
 
 // ---- faults: one line in the log, then the default action (the system's crash report) ----
 
-void on_fault(int sig, siginfo_t* info, void*)
+void on_fault(int sig, siginfo_t* info, void* uctx)
 {
     // A store to a page the texture cache's write tracker made read-only (D-134): resolved, the store runs again.
     if (ps_rsx_handle_write_fault(info->si_addr)) return;
+    // A raw SPU's problem-state register (D-528): the load or store is performed on it, the thread goes on.
+    if (pspocket::mmio_handle_fault(info->si_addr, uctx)) return;
     char buf[320];
     const auto addr = reinterpret_cast<uintptr_t>(info->si_addr);
     const auto base = g_session && g_session->memory ? reinterpret_cast<uintptr_t>(g_session->memory->base()) : 0;

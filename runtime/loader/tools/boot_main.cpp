@@ -103,6 +103,7 @@
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/core/mmio.hpp"
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/hle/input.hpp"
@@ -449,6 +450,8 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
     if (ps_rsx_handle_write_fault(info->si_addr)) return;
 #endif
     if (handle_watch_fault(reinterpret_cast<uintptr_t>(info->si_addr), uctx)) return;
+    // A raw SPU's problem-state register (D-528): the load or store is performed on it, the thread goes on.
+    if (mmio_handle_fault(info->si_addr, uctx)) return;
     const auto addr = reinterpret_cast<uintptr_t>(info->si_addr);
     const auto base = reinterpret_cast<uintptr_t>(g_guest_base);
     const lv2::PpuThread* t = lv2::current_thread();

@@ -353,7 +353,7 @@ TEST_CASE("program-level fuzz: a lifted program agrees with the interpreter wher
 
         // Stop 0x12 is answered and the code goes on (no register touched: the runtime's handlers use the channels);
         // the others leave (D-247).
-        const ps_spu_hooks answers{[](SPUContext*, u32 code) { return code == 0x12 ? 1 : 0; }, nullptr};
+        const ps_spu_hooks answers{[](SPUContext*, u32 code) { return code == 0x12 ? 1 : 0; }, nullptr, 0, nullptr};
         interp.hooks = lifted.hooks = &answers;
         for (const u32 code : {0x10u, 0x13u, 0x11u}) { // runs to each stop that leaves, then resumes after it
             REQUIRE(ps_spu_interpret(&interp, 0) == PS_SPU_STOP_SIGNAL);

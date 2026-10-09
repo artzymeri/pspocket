@@ -77,16 +77,18 @@ TEST_CASE("lv2: unimplemented syscalls log their number and name and return CELL
     LogCapture log;
     const u64 before = f.kernel->unimplemented_count();
 
-    // sys_raw_spu_create: named, implemented by RPCS3, not here.
-    CHECK(c.call64(160, 1, 2, 3) == to_r3(err(CELL_ENOSYS)));
-    CHECK(c.call64(160, 1, 2, 3) == 0xFFFFFFFF80010003ull); // sign-extended, as RPCS3's error_code
-    CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 160 (sys_raw_spu_create)"));
-    // An unnamed slot and an out-of-range number.
+    // Every named slot is bound (D-528): an unnamed slot and an out-of-range number.
+    CHECK(c.call64(6, 1, 2, 3) == to_r3(err(CELL_ENOSYS)));
+    CHECK(c.call64(6, 1, 2, 3) == 0xFFFFFFFF80010003ull); // sign-extended, as RPCS3's error_code
     CHECK(c.call(6) == rc(CELL_ENOSYS));
     CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 6 (unnamed)"));
     CHECK(c.call(5000) == rc(CELL_ENOSYS));
     CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 5000 (invalid)"));
     CHECK(f.kernel->unimplemented_count() == before + 4);
+    for (u32 n = 0; n < 1024; n++) {
+        INFO("syscall " << n);
+        if (syscall_name(n)) CHECK(f.kernel->syscall_bound(n));
+    }
 }
 
 TEST_CASE("lv2: arguments take the low word, results are sign-extended", "[lv2][dispatch]")

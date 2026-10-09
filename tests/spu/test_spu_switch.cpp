@@ -45,7 +45,7 @@ constexpr u32 kAt = PS_SPU_FUZZ_PROGRAM_BASE + 0x2340; // relocated, as a job bi
 constexpr u32 kIlR21 = 0x40802A95u;                    // il r21, 0x55: run after the first stop
 
 // The program's stop 0x12 is answered and goes on; 0x10, 0x13 and 0x11 leave (D-247).
-const ps_spu_hooks kAnswers{[](SPUContext*, u32 code) { return code == 0x12 ? 1 : 0; }, nullptr};
+const ps_spu_hooks kAnswers{[](SPUContext*, u32 code) { return code == 0x12 ? 1 : 0; }, nullptr, 0, nullptr};
 
 // Two contexts over the same local store contents: the interpreter's, and one that starts with no program.
 struct Pair {

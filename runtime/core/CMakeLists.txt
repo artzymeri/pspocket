@@ -1,5 +1,6 @@
 add_library(pspocket_core STATIC
     src/guest_memory.cpp
+    src/mmio.cpp
     src/log.cpp
     src/png.cpp
     src/reservation.cpp

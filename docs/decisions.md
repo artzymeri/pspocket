@@ -6487,3 +6487,40 @@ console has no AV manager to enable an output (part 3's UART), so the samples ar
 lv1 left disabled; the page has no protection to lock and unlock. Test: tests/lv2/test_rsxaudio.cpp (the context, the
 queues, the DMA addresses, the start event and two notifications for three entries retired on schedule, stop,
 finalize and a new context).
+
+## D-528: Raw and isolated SPUs, interrupt threads, guest MMIO through faults (2026-10-09)
+
+The last kernel calls without an answer: raw SPUs (150-154, 160, 161, 163, 196, 197, 199), isolated SPUs (230-240)
+and interrupt threads (80, 81, 84, 88, 89). RPCS3 references: lv2/sys_spu.cpp, RawSPUThread.cpp, lv2/sys_interrupt.cpp,
+SPUThread.h.
+
+- Guest MMIO (runtime/core/mmio.hpp): guest code reaches guest memory directly, so a raw SPU's problem-state registers
+  (0x40000 above its local store, 0xE0000000 + 0x100000 * index) are left without host pages; the platform's
+  SIGSEGV/SIGBUS handler (pspocket-boot, the iOS app) calls mmio_handle_fault, which decodes the faulting AArch64 load
+  or store (LDR/STR in their unsigned, unscaled, pre/post-indexed and register-offset forms, sign-extending loads,
+  LDP/STP/LDPSW, SIMD and FP registers of 8 to 128 bits, PRFM skipped), performs it on the range's device with the
+  guest's big-endian values and resumes after the instruction. Apple AArch64 only (iOS, Apple-silicon macOS); elsewhere
+  sys_raw_spu_create answers CELL_EAGAIN, as when the share is used up. Exclusive and atomic accesses stay faults.
+- A raw SPU (raw_spu.cpp) is an SPUContext on its own host thread with its local store in committed guest memory (the
+  PPU reads and writes it directly) and the plain one-entry interrupt mailbox (new hooks member plain_intr_mbox; each
+  write raises class 2's mailbox bit through intr_mbox_written). SPU_RunCntl 1 runs from SPU_NPC (bit 0: interrupts
+  on) and reads as running at once (RPCS3 try_start); 0 stops it and returns once it has. Every stop code stops it
+  (stop-and-signal interrupt), as does a halt (halt interrupt); an exception logs and raises class 0's error bit. The
+  MFC proxy runs a GET, PUT, SNDSIG or SDCRZ when the command status is read after its five writes (else
+  MFC_PPU_DMA_CMD_SEQUENCE_ERROR), the S forms starting the SPU (ps_spu_proxy_dma); the mailbox status, the signal
+  registers and the queue status are RPCS3's.
+- Interrupt threads: a tag per raw SPU and class (0 or 2; IDs 0x0A000000), a service per establish (0x0B000000) whose
+  host thread waits until class 2's status (with the mailbox bit set while the interrupt mailbox holds a value, as
+  RPCS3's loop sets it) meets its mask, then runs the thread's entry with (arg1, arg2) from the top of its stack until
+  sys_interrupt_thread_eoi; disestablish ends it and gives back its r13 (also for a thread never established, as
+  RPCS3). Any thread not yet started may be established (RPCS3); it is then an interrupt thread.
+- Isolated SPUs: the module image (a SELF through the process's decrypter, then an SPU ELF; else CELL_EAUTHFAIL) in a
+  raw SPU's local store, r3..r6 the arguments in the preferred doublewords, the status marked isolated, started by
+  sys_isolated_spu_start. RPCS3's table marks these root's but lets a game use them; so does pspocket.
+- Process exit stops the raw SPUs and ends the interrupt threads (abort_all_waits); destroy ends a raw SPU's services,
+  removes its tags, stops its host thread, unmaps its registers and decommits its local store.
+Every named syscall slot now has a binding (test_dispatch checks it). Tests: tests/core/test_mmio.cpp (each decoded
+form against a recording device with a real fault handler), tests/lv2/test_raw_spu.cpp (a synthetic SPU program
+through the registers: mailboxes, status and NPC after a stop, interrupt status, a mailbox interrupt served by an
+interrupt thread, a stop request on a spinning SPU, the MFC proxy both ways and its sequence error, destroy and a new
+one; the errors). Kernel calls: 560 own, 74 answered as RPCS3's null or stub, of 634.

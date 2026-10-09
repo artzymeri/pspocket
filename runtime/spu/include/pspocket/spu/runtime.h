@@ -195,6 +195,10 @@ void ps_spu_set_intr_mbox_handler(ps_spu_intr_mbox_handler handler);
 typedef struct ps_spu_hooks {
     ps_spu_stop_handler stop;
     ps_spu_intr_mbox_handler intr_mbox;
+    /* Raw SPUs (D-528): non-zero makes interrupt-mailbox writes the plain one-entry mailbox even with a process-wide
+     * handler, and intr_mbox_written (when set) is called after each, without the context's lock. */
+    int plain_intr_mbox;
+    void (*intr_mbox_written)(SPUContext* ctx);
 } ps_spu_hooks;
 
 /* Decrementer and event timing. NULL restores ps_timebase_now (pspocket/core/timebase.h); tests install a clock. */
@@ -260,6 +264,11 @@ void ps_spu_set_signal_or_mode(SPUContext* ctx, uint32_t which, int or_mode);
 void ps_spu_request_stop(SPUContext* ctx);
 /* Clears a previous stop request (before running the context again). */
 void ps_spu_clear_stop(SPUContext* ctx);
+
+/* A command the PPU queued through a raw SPU's MFC proxy registers (D-528; RPCS3 spu_thread::read_reg's
+ * MFC_CMDStatus): the GET, PUT and SDCRZ families run at once between the local store and guest memory (an EA in the
+ * raw SPU or SPU thread areas is not copied: -1). 0 when done, -1 for a command or address the proxy does not take. */
+int ps_spu_proxy_dma(SPUContext* ctx, uint32_t cmd, uint32_t lsa, uint32_t eal, uint32_t size);
 
 /* SPU status register: PS_SPU_STATUS_* bits, stop-and-signal code in bits 16-31 after a stop. */
 uint32_t ps_spu_status(SPUContext* ctx);

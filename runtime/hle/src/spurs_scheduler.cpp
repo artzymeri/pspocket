@@ -130,7 +130,7 @@ int worker_intr_mbox(SPUContext* ctx, uint32_t value)
     return 0;
 }
 
-constexpr ps_spu_hooks kWorkerHooks{worker_stop, worker_intr_mbox};
+constexpr ps_spu_hooks kWorkerHooks{worker_stop, worker_intr_mbox, 0, nullptr};
 
 } // namespace
 

@@ -6,6 +6,8 @@
 #include <array>
 #include <condition_variable>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -173,5 +175,14 @@ public:
 
 // Process exit / shutdown: every SPU thread is asked to stop, its waits aborted, its host thread to end.
 void abort_spu_threads(Kernel::Impl& s);
+
+// For raw and isolated SPUs (raw_spu.cpp): a SELF decrypted in place (else the bytes are left as they are; an error
+// when it does not decrypt), an SPU ELF's entry (none when it is not one), and its PT_LOAD segments put in a local
+// store.
+Result decrypt_spu_self(Kernel::Impl& s, std::vector<u8>& bytes, std::string_view what);
+std::optional<u32> spu_elf_entry(std::span<const u8> file);
+bool load_spu_elf(std::span<const u8> file, u8* ls, u32& entry);
+// Process exit / shutdown: raw SPUs are asked to stop, interrupt threads to end.
+void abort_raw_spus(Kernel::Impl& s);
 
 } // namespace pspocket::lv2

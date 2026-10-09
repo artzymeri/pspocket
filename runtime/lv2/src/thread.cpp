@@ -7,8 +7,8 @@
 //   a higher-priority thread to run first; sys_ppu_thread_yield is a host yield and returns CELL_OK).
 // - A thread whose entry function returns (instead of calling sys_ppu_thread_exit) exits with r3 as its status
 //   and an error is logged; RPCS3 logs the same error and leaves the thread asleep forever.
-// - Interrupt threads (SYS_PPU_THREAD_CREATE_INTERRUPT) are created, but nothing establishes them yet
-//   (sys_interrupt_thread_establish is not implemented).
+// - Interrupt threads (SYS_PPU_THREAD_CREATE_INTERRUPT) run only once established on a raw SPU's interrupt tag
+//   (raw_spu.cpp, D-528).
 
 #include <pthread.h>
 

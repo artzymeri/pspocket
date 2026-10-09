@@ -574,3 +574,30 @@ extern "C" uint32_t ps_spu_dma_writes_over(uint32_t ea, uint32_t size, ps_spu_dm
     std::copy_n(found.begin(), count, out);
     return count;
 }
+
+// A raw SPU's MFC proxy command from the PPU (D-528; RPCS3 spu_thread::read_reg, MFC_CMDStatus): run at once.
+extern "C" int ps_spu_proxy_dma(SPUContext* ctx, uint32_t cmd, uint32_t lsa, uint32_t eal, uint32_t size)
+{
+    using namespace pspocket::spu::detail;
+    const u32 c = cmd & 0xFF;
+    const bool get = (c & 0xF0) == 0x40 && (c & 0x0F) <= 0x0A;
+    const bool put = ((c & 0xF0) == 0x20 && (c & 0x0F) <= 0x0A) || (c >= 0x30 && c <= 0x32) ||
+                     (c >= 0xA0 && c <= 0xA2 && size == 4);
+    const bool zero = c == PS_MFC_SDCRZ;
+    if (!get && !put && !zero) return -1;
+    if (size == 0) return 0;
+    if (eal >= PS_SPU_RAW_BASE || u64{eal} + size > 0x100000000ull) return -1;
+    u8* mem = ctx->membase + eal;
+    if (zero) {
+        std::memset(mem, 0, size);
+    } else if (put) {
+        std::atomic_thread_fence(std::memory_order_release);
+        ls_copy(ctx->ls, lsa, mem, size, false);
+    } else {
+        ls_copy(ctx->ls, lsa, mem, size, true);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        // Code it overwrote no longer matches what was lifted; the SPU is not running (the proxy loads programs).
+        if (!(ps_spu_status(ctx) & PS_SPU_STATUS_RUNNING)) drop_overwritten_programs(ctx, lsa, size);
+    }
+    return 0;
+}

@@ -541,6 +541,7 @@ Kernel::Impl::Impl(Kernel& k)
     register_misc_syscalls(table);
     register_prx_syscalls(table);
     register_rsxaudio_syscalls(table);
+    register_raw_spu_syscalls(table);
     // Every other slot RPCS3 answers with null_func (a log, then CELL_OK) is answered so too (D-166): a game calling
     // one goes on instead of meeting ENOSYS. GTA V's CRT, for one, registers a debug exception handler (988).
     static constexpr struct {
@@ -569,6 +570,7 @@ void Kernel::Impl::abort_all_waits()
 {
     for (const auto& [id, obj] : threads.list(PpuThread::kIdBase)) abort_wait(static_cast<PpuThread&>(*obj).waiter);
     abort_spu_threads(*this);
+    abort_raw_spus(*this);
 }
 
 void Kernel::Impl::process_exit(s32 status)

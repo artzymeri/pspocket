@@ -191,7 +191,7 @@ TEST_CASE("per-context hooks take a context's stop codes before the process-wide
     Machine m;
     CHECK(m.exec(as::stop(0x2102), 0x200)); // no hooks: the process-wide handler continues it
     CHECK(g_global_stops == 1);
-    const ps_spu_hooks hooks{count_own_stop, nullptr};
+    const ps_spu_hooks hooks{count_own_stop, nullptr, 0, nullptr};
     m.ctx.hooks = &hooks;
     CHECK(m.exec(as::stop(0x111), 0x200)); // the context's handler continues it
     CHECK_FALSE(m.exec(as::stop(0x222), 0x200)); // ... or stops it
@@ -199,7 +199,7 @@ TEST_CASE("per-context hooks take a context's stop codes before the process-wide
     CHECK(m.ctx.stop_code == 0x222u);
     CHECK(g_own_stops == 2);
     CHECK(g_global_stops == 1); // never consulted for this context
-    const ps_spu_hooks no_stop{nullptr, nullptr};
+    const ps_spu_hooks no_stop{nullptr, nullptr, 0, nullptr};
     m.ctx.hooks = &no_stop;
     CHECK(m.exec(as::stop(0x2102), 0x200)); // a NULL member falls back to the process-wide handler
     CHECK(g_global_stops == 2);
@@ -238,7 +238,7 @@ TEST_CASE("run loop: ps_spu_current is the running context, and null outside a r
     a.emit(as::stop(0x20));
     Machine m;
     m.load(0x100, a.finish());
-    const ps_spu_hooks hooks{note_current, nullptr};
+    const ps_spu_hooks hooks{note_current, nullptr, 0, nullptr};
     m.ctx.hooks = &hooks;
     m.ctx.pc = 0x100;
     CHECK(ps_spu_current() == nullptr);

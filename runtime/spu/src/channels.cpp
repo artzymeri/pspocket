@@ -500,7 +500,8 @@ int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
         return 0;
     case PS_SPU_WrOutIntrMbox: {
         const ps_spu_intr_mbox_handler own = ctx->hooks ? ctx->hooks->intr_mbox : nullptr;
-        if (const ps_spu_intr_mbox_handler handler = own ? own : g_intr_handler.load()) {
+        const bool plain = ctx->hooks && ctx->hooks->plain_intr_mbox;
+        if (const ps_spu_intr_mbox_handler handler = own ? own : plain ? nullptr : g_intr_handler.load()) {
             lock.unlock();
             HostFpScope fp;
             if (handler(ctx, value)) return requested_stop(ctx, pc);
@@ -510,6 +511,11 @@ int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
         ch.out_intr_mbox = value;
         ch.out_intr_mbox_count = 1;
         notify(ctx);
+        if (ctx->hooks && ctx->hooks->intr_mbox_written) {
+            lock.unlock();
+            HostFpScope fp;
+            ctx->hooks->intr_mbox_written(ctx);
+        }
         return 0;
     }
     case PS_SPU_Set_Bkmk_Tag:
