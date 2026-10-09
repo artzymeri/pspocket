@@ -18,6 +18,7 @@
 // offset without moving the file position, then calls the game's callback with the result, on itself.
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <deque>
 #include <format>
@@ -33,6 +34,7 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/npd.hpp"
 
 namespace pspocket::hle {
@@ -307,14 +309,6 @@ s32 cellFsSdataOpenByFd(PPUContext& ctx, u32 mself_fd, s32 flags, u32 sdata_fd, 
     return lv2::CELL_OK;
 }
 
-// cellFsSetIoBufferFromDefaultContainer(fd, buffer_size, page_type): an open file is enough (RPCS3; there is no I/O
-// buffer to size here).
-s32 cellFsSetIoBufferFromDefaultContainer(PPUContext& ctx, u32 fd, u32, u32)
-{
-    lv2::PpuThread& t = thread_of(ctx);
-    StackVar sb(ctx, t.kernel.base(), lv2::kCellFsStatSize);
-    return lv2::sys_fs_fstat(t, fd, sb.addr()) == error(lv2::CELL_EBADF) ? error(lv2::CELL_EBADF) : lv2::CELL_OK;
-}
 
 // ------------------------------------------------------------------------------------------------- stream reads
 //
@@ -888,6 +882,409 @@ private:
     std::unique_ptr<recomp::NpdFile> npd_;
 };
 
+
+// ------------------------------------------------------------------------------------------------- D-518
+//
+// The rest of libfs, each as libfs.sprx (4.92) does it; tests/hle/test_fs_compare.cpp sends the same calls to Sony's
+// module and these, on the same lv2. libfs first passes a path through its name conversion layer: it asks lv2
+// (sys_fs_fcntl 0xC0000006) whether the path's file system wants names converted (FAT long names to and from a code
+// page registered with cellFsRegisterConversionCallback) and then sends the call as an fcntl with the converted name.
+// pspocket's lv2 answers that no file system does (as RPCS3), so these take libfs's direct way: the system call with
+// the path as it is. The calls libfs always sends as an fcntl with a path block build the block libfs builds.
+// Where libfs would fault on a bad pointer these refuse with CELL_EFAULT (D-042).
+
+constexpr u32 kScFcntl = 817;
+constexpr u32 kFcntlPathBlock = 0x10; // a path block's header: size, 0x10, out_code's offset, name_size, name, -
+
+s32 sc(PPUContext& ctx, u32 number, std::initializer_list<u64> args)
+{
+    return static_cast<s32>(lv2_syscall(ctx, number, args));
+}
+
+// Whether [addr, addr + size) is committed guest memory, page by page.
+bool guest_range(lv2::PpuThread& t, u32 addr, u64 size)
+{
+    if (!size) return true;
+    if (u64{addr} + size > GuestMemory::kGuestSize) return false;
+    const u64 page = GuestMemory::host_page_size();
+    for (u64 a = addr & ~(page - 1); a < u64{addr} + size; a += page)
+        if (!t.kernel.memory().is_committed(static_cast<u32>(std::max<u64>(a, addr)))) return false;
+    return true;
+}
+
+// The name length libfs gives lv2 with a path: up to the NUL, at most 1055 characters.
+u32 name_size(lv2::PpuThread& t, u32 path)
+{
+    u32 n = 0;
+    while (n < 1055 && guest_readable(t, path + n, 1) && ps_read8(t.kernel.base(), path + n)) n++;
+    return n;
+}
+
+// sys_fs_fcntl(-1, op, block, size) with a path block of `size` bytes whose out_code is at `out_at` (initialised to
+// CELL_ENOSYS, as libfs does); `fill` writes the operation's own fields. The answer is the system call's, else
+// out_code. `done` sees the block afterwards.
+template <typename Fill, typename Done = void (*)(u8*, u32, s32)>
+s32 fcntl_path(PPUContext& ctx, u32 op, u32 path, u32 size, u32 out_at, Fill fill, Done done = [](u8*, u32, s32) {})
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar block(ctx, base, size);
+    const u32 b = block.addr();
+    ps_write32(base, b + 0x00, size);
+    ps_write32(base, b + 0x04, kFcntlPathBlock);
+    ps_write32(base, b + 0x08, out_at);
+    ps_write32(base, b + 0x0C, path ? name_size(t, path) : 0);
+    ps_write32(base, b + 0x10, path);
+    ps_write32(base, b + out_at, static_cast<u32>(error(lv2::CELL_ENOSYS)));
+    fill(base, b);
+    s32 r = sc(ctx, kScFcntl, {0xFFFFFFFFFFFFFFFFull, op, b, size});
+    if (r == lv2::CELL_OK) r = static_cast<s32>(ps_read32(base, b + out_at));
+    done(base, b, r);
+    return r;
+}
+
+// sys_fs_fcntl(fd, op, &size, 8): the by-fd size calls.
+s32 fcntl_size(PPUContext& ctx, u64 fd, u32 op, u64 size)
+{
+    StackVar v(ctx, guest_base(ctx), 8);
+    ps_write64(guest_base(ctx), v.addr(), size);
+    return sc(ctx, kScFcntl, {fd, op, v.addr(), 8});
+}
+
+// The plain system calls.
+s32 cellFsFcntl(PPUContext& ctx, u64 fd, u64 op, u64 arg, u64 size) { return sc(ctx, kScFcntl, {fd, op, arg, size}); }
+s32 cellFsAccess(PPUContext& ctx, u64 path, u64 mode) { return sc(ctx, 816, {path, static_cast<u64>(static_cast<s64>(static_cast<s32>(mode)))}); }
+s32 cellFsAclWrite(PPUContext& ctx, u64 path, u64 acl) { return sc(ctx, 824, {path, acl}); }
+s32 cellFsLink(PPUContext& ctx, u64 from, u64 to) { return sc(ctx, 810, {from, to}); }
+s32 cellFsSymbolicLink(PPUContext& ctx, u64 target, u64 link) { return sc(ctx, 833, {target, link}); }
+s32 cellFsTruncate2(PPUContext& ctx, u64 fd, u64 size) { return sc(ctx, 847, {fd, size}); }
+s32 cellFsLsnGetCDASize(PPUContext& ctx, u64 fd, u64 ptr) { return sc(ctx, 825, {fd, ptr}); }
+s32 cellFsLsnGetCDA(PPUContext& ctx, u64 fd, u64 buf, u64 size, u64 count) { return sc(ctx, 826, {fd, buf, size, count}); }
+s32 cellFsLsnLock(PPUContext& ctx, u64 fd) { return sc(ctx, 827, {fd}); }
+s32 cellFsLsnUnlock(PPUContext& ctx, u64 fd) { return sc(ctx, 828, {fd}); }
+
+s32 cellFsChown(PPUContext& ctx, u64 path, s32 uid, s32 gid)
+{
+    return sc(ctx, 835, {path, static_cast<u64>(static_cast<s64>(uid)), static_cast<u64>(static_cast<s64>(gid))});
+}
+
+// cellFsAclRead(path, acl): lv2 writes a 4-byte word on libfs's stack, copied out when the call succeeds.
+s32 cellFsAclRead(PPUContext& ctx, u32 path, u32 acl)
+{
+    if (!acl) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    StackVar v(ctx, t.kernel.base(), 4);
+    const s32 r = sc(ctx, 823, {path, v.addr()});
+    if (r == lv2::CELL_OK) {
+        if (!guest_readable(t, acl, 4)) return error(lv2::CELL_EFAULT);
+        ps_write32(t.kernel.base(), acl, ps_read32(t.kernel.base(), v.addr()));
+    }
+    return r;
+}
+
+// cellFsFGetBlockSize2(fd, sector_size, block_size, arg4, flags): three pointers checked, then sys_fs_fget_block_size.
+s32 cellFsFGetBlockSize2(PPUContext& ctx, u64 fd, u32 sector_size, u32 block_size, u32 arg4, u32 flags)
+{
+    if (!sector_size || !block_size || !arg4) return error(lv2::CELL_EFAULT);
+    return sc(ctx, 821, {fd, sector_size, block_size, arg4, flags});
+}
+
+// cellFsGetBlockSize2(path, sector_size, block_size, arg4): sys_fs_get_block_size into libfs's stack, then the three
+// copied out whatever it answered (libfs copies its uninitialised stack after a failure; here zeros).
+s32 cellFsGetBlockSize2(PPUContext& ctx, u32 path, u32 sector_size, u32 block_size, u32 arg4)
+{
+    if (!path || !sector_size || !block_size || !arg4) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, sector_size, 8) || !guest_readable(t, block_size, 8) || !guest_readable(t, arg4, 8)) {
+        return error(lv2::CELL_EFAULT);
+    }
+    StackVar v(ctx, base, 24);
+    const s32 r = sc(ctx, 822, {path, v.addr(), v.addr() + 8, v.addr() + 16});
+    ps_write64(base, sector_size, ps_read64(base, v.addr()));
+    ps_write64(base, block_size, ps_read64(base, v.addr() + 8));
+    ps_write64(base, arg4, ps_read64(base, v.addr() + 16));
+    return r;
+}
+
+// cellFsGetDirent(path, ..., u64* count) and cellFsGetDirentCount(path, u64* count): libfs does not have them; the
+// count is 0 and the answer CELL_ENOSYS.
+s32 no_dirent(PPUContext& ctx, u64 count)
+{
+    if (!count) return error(lv2::CELL_EFAULT);
+    if (!guest_readable(thread_of(ctx), static_cast<u32>(count), 8)) return error(lv2::CELL_EFAULT);
+    ps_write64(guest_base(ctx), static_cast<u32>(count), 0);
+    return error(lv2::CELL_ENOSYS);
+}
+s32 cellFsGetDirent(PPUContext& ctx, u32, u32, u32, u64 count) { return no_dirent(ctx, count); }
+s32 cellFsGetDirentCount(PPUContext& ctx, u32, u64 count) { return no_dirent(ctx, count); }
+
+// The by-fd size calls: fcntl 0x80000006..8 with the size.
+s32 cellFsAllocateFileAreaByFdWithInitialData(PPUContext& ctx, u64 fd, u64 size)
+{
+    return fcntl_size(ctx, fd, 0x80000006, size);
+}
+s32 cellFsAllocateFileAreaByFdWithoutZeroFill(PPUContext& ctx, u64 fd, u64 size)
+{
+    return fcntl_size(ctx, fd, 0x80000007, size);
+}
+s32 cellFsChangeFileSizeByFdWithoutAllocation(PPUContext& ctx, u64 fd, u64 size)
+{
+    return fcntl_size(ctx, fd, 0x80000008, size);
+}
+
+// The by-path size calls: a 0x28-byte path block (the size at +0x18, out_code at +0x20), as 0xE0000017's.
+s32 path_size(PPUContext& ctx, u32 op, u32 path, u64 size)
+{
+    if (!path) return error(lv2::CELL_EFAULT);
+    return fcntl_path(ctx, op, path, 0x28, 0x20, [&](u8* base, u32 b) { ps_write64(base, b + 0x18, size); });
+}
+s32 cellFsAllocateFileAreaWithInitialData(PPUContext& ctx, u32 path, u64 size)
+{
+    return path_size(ctx, 0xE0000016, path, size);
+}
+s32 cellFsChangeFileSizeWithoutAllocation(PPUContext& ctx, u32 path, u64 size)
+{
+    return path_size(ctx, 0xE0000018, path, size);
+}
+
+// cellFsLsnRead(fd, ctrl, buf): ctrl {u64 lsn, u64 offset, u64 size}. libfs maps a buffer for the sectors
+// (sys_fs_mapped_allocate, offset + size rounded up to 4 KB), reads them into it (sys_fs_lsn_read), copies size bytes
+// from offset to buf and frees the buffer. cellFsLsnRead2 reads straight into buf.
+s32 cellFsLsnRead(PPUContext& ctx, u64 fd, u32 ctrl, u32 buf)
+{
+    if (!ctrl || !buf) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, ctrl, 24)) return error(lv2::CELL_EFAULT);
+    const u64 offset = ps_read64(base, ctrl + 8), size = ps_read64(base, ctrl + 16);
+    StackVar mapped(ctx, base, 4);
+    const u64 fd64 = static_cast<u64>(static_cast<s64>(static_cast<s32>(fd)));
+    if (const s32 r = sc(ctx, 845, {fd64, (size + offset + 4095) & ~u64{4095}, mapped.addr()}); r != lv2::CELL_OK) {
+        return r;
+    }
+    const u32 ptr = ps_read32(base, mapped.addr());
+    s32 r = sc(ctx, 829, {fd64, ctrl, ptr, 0});
+    if (r == lv2::CELL_OK) {
+        const u32 from = ptr + static_cast<u32>(offset), n = static_cast<u32>(size);
+        if (guest_range(t, from, n) && guest_range(t, buf, n)) std::memmove(base + buf, base + from, n);
+        else r = error(lv2::CELL_EFAULT);
+    }
+    sc(ctx, 846, {fd64, ptr});
+    return r;
+}
+
+s32 cellFsLsnRead2(PPUContext& ctx, u64 fd, u32 ctrl, u32 buf)
+{
+    if (!ctrl || !buf) return error(lv2::CELL_EFAULT);
+    return sc(ctx, 829, {static_cast<u64>(static_cast<s64>(static_cast<s32>(fd))), ctrl, buf, 0});
+}
+
+// cellFsMappedAllocate(fd, size, u32* ptr): whole 4 KB pages. cellFsMappedFree(fd, ptr).
+s32 cellFsMappedAllocate(PPUContext& ctx, u64 fd, u64 size, u32 ptr)
+{
+    if (!ptr) return error(lv2::CELL_EFAULT);
+    return sc(ctx, 845, {static_cast<u64>(static_cast<s64>(static_cast<s32>(fd))), (size + 4095) & ~u64{4095}, ptr});
+}
+s32 cellFsMappedFree(PPUContext& ctx, u64 fd, u32 ptr)
+{
+    if (!ptr) return error(lv2::CELL_EFAULT);
+    return sc(ctx, 846, {static_cast<u64>(static_cast<s64>(static_cast<s32>(fd))), ptr});
+}
+
+// cellFsOpen2(path, flags, u32* fd, mode, arg, size): cellFsOpen with the mode given; -1 is cellFsOpen's (0600 when
+// creating, else 0). *fd is written only when the file opens.
+s32 cellFsOpen2(PPUContext& ctx, u32 path, s32 flags, u64 fd, s32 mode, u32 arg, u64 size)
+{
+    if (!fd) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (mode == -1) mode = (flags & CELL_FS_O_CREAT) ? CELL_FS_S_IRUSR | CELL_FS_S_IWUSR : 0;
+    StackVar v(ctx, base, 4);
+    const s32 r = lv2::sys_fs_open(t, path, flags, v.addr(), mode, arg, size);
+    log_result(ctx, "cellFsOpen2", path, r);
+    if (r == lv2::CELL_OK) {
+        if (!guest_readable(t, static_cast<u32>(fd), 4)) return error(lv2::CELL_EFAULT);
+        ps_write32(base, static_cast<u32>(fd), ps_read32(base, v.addr()));
+    }
+    return r;
+}
+
+// cellFsSdataOpenWithVersion(path, flags, u32* fd, version, ...): always an fcntl, 0xE0000025, whose block points at
+// libfs's SDATA argument {0x180, 0x10, 4, &version}. Flags other than read-only are CELL_EINVAL.
+s32 cellFsSdataOpenWithVersion(PPUContext& ctx, u32 path, s32 flags, u32 fd, u32 version)
+{
+    if (flags != 0) return error(lv2::CELL_EINVAL);
+    if (!fd) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    StackVar sdata(ctx, base, 0x14);
+    const u32 a = sdata.addr();
+    ps_write32(base, a + 0x00, 0x180);
+    ps_write32(base, a + 0x04, 0x10);
+    ps_write32(base, a + 0x08, 4);
+    ps_write32(base, a + 0x0C, a + 0x10);
+    ps_write32(base, a + 0x10, version);
+    const s32 r = fcntl_path(
+        ctx, 0xE0000025, path, 0x30, 0x28,
+        [&](u8* b8, u32 b) {
+            ps_write32(b8, b + 0x20, 0x10);
+            ps_write32(b8, b + 0x24, a);
+            ps_write32(b8, b + 0x2C, 0xFFFFFFFF);
+        },
+        [&](u8* b8, u32 b, s32 result) {
+            if (result == lv2::CELL_OK && guest_readable(t, fd, 4)) ps_write32(b8, fd, ps_read32(b8, b + 0x2C));
+        });
+    log_result(ctx, "cellFsSdataOpenWithVersion", path, r);
+    return r;
+}
+
+// cellFsSetAttribute(path, CellFsStat* attr): on /dev_hdd0 (libfs compares the first nine characters) the file, or
+// else the directory, is opened and given the attributes with fcntl 1; elsewhere only a converted name could take
+// them, so CELL_ENOTSUP.
+s32 cellFsSetAttribute(PPUContext& ctx, u32 path, u32 attr)
+{
+    if (!path) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const GuestString prefix = read_cstr(t, path, 9);
+    if (prefix.text != "/dev_hdd0") {
+        if (!attr) return error(lv2::CELL_EFAULT);
+        return error(lv2::CELL_ENOTSUP);
+    }
+    StackVar fd(ctx, base, 4);
+    bool dir = false;
+    s32 r = lv2::sys_fs_open(t, path, lv2::CELL_FS_O_RDWR, fd.addr(), 0, 0, 0);
+    if (r == error(lv2::CELL_EISDIR)) {
+        dir = true;
+        r = lv2::sys_fs_opendir(t, path, fd.addr());
+    }
+    if (r != lv2::CELL_OK) return r;
+    const u32 f = ps_read32(base, fd.addr());
+    r = sc(ctx, kScFcntl, {f, 1, attr, lv2::kCellFsStatSize});
+    const s32 c = dir ? lv2::sys_fs_closedir(t, f) : lv2::sys_fs_close(t, f);
+    return r != lv2::CELL_OK ? r : c;
+}
+
+// The I/O buffer calls: fcntl 0xC0000008 with lv2_file_c0000008 (container id as a u64 at +0x10, the size at +0x18,
+// the page type at +0x1C with 0x4000 set, out_code at +0x20); the answer is the system call's, else out_code.
+s32 io_buffer(PPUContext& ctx, u64 fd, u64 container, u32 size, u32 page_type)
+{
+    u8* base = guest_base(ctx);
+    StackVar block(ctx, base, 0x28);
+    const u32 b = block.addr();
+    ps_write32(base, b + 0x04, 0xC0000008);
+    ps_write64(base, b + 0x10, container);
+    ps_write32(base, b + 0x18, size);
+    ps_write32(base, b + 0x1C, page_type | 0x4000);
+    ps_write32(base, b + 0x20, static_cast<u32>(error(lv2::CELL_ENOSYS)));
+    if (const s32 r = sc(ctx, kScFcntl, {fd, 0xC0000008, b, 0x28}); r != lv2::CELL_OK) return r;
+    return static_cast<s32>(ps_read32(base, b + 0x20));
+}
+
+// The page types libfs takes: 0, 1, 2 (64 KB) and 4 (1 MB) in the low four bits.
+bool page_type_ok(u32 page_type) { return (page_type & 0xF) <= 4 && ((1u << (page_type & 0xF)) & 23); }
+
+s32 cellFsSetDefaultContainer(PPUContext& ctx, u64 id, u32 total_limit)
+{
+    return io_buffer(ctx, 0xFFFFFFFFFFFFFFFFull, id, total_limit, 0);
+}
+
+// cellFsSetIoBuffer(fd, buffer_size_limit, page_type, container): fd 3..255; a buffer needs a container other than -1.
+s32 cellFsSetIoBuffer(PPUContext& ctx, u32 fd, u32 size, u32 page_type, u32 container)
+{
+    if (fd - 3 > 252) return error(lv2::CELL_EBADF);
+    if (size && container == 0xFFFFFFFF) return error(lv2::CELL_EINVAL);
+    if (!page_type_ok(page_type)) return error(lv2::CELL_EINVAL);
+    return io_buffer(ctx, static_cast<u64>(static_cast<s64>(static_cast<s32>(fd))), container, size, page_type);
+}
+
+// cellFsSetIoBufferFromDefaultContainer(fd, buffer_size, page_type): the same from the default container (-1).
+s32 cellFsSetIoBufferFromDefaultContainer(PPUContext& ctx, u32 fd, u32 size, u32 page_type)
+{
+    if (fd - 3 > 252) return error(lv2::CELL_EBADF);
+    if (!page_type_ok(page_type)) return error(lv2::CELL_EINVAL);
+    return io_buffer(ctx, static_cast<u64>(static_cast<s64>(static_cast<s32>(fd))), 0xFFFFFFFF, size, page_type);
+}
+
+// cellFsSetDiscReadRetrySetting(type): CELL_FS_DISC_READ_RETRY_NONE (0) or _DEFAULT (1, 99 retries), as
+// lv2_file_c000001a {retries, 0, 100000, 0, 0, 0} through fcntl 0xC000001A.
+s32 cellFsSetDiscReadRetrySetting(PPUContext& ctx, u32 type)
+{
+    if (type > 1) return error(lv2::CELL_EINVAL);
+    u8* base = guest_base(ctx);
+    StackVar block(ctx, base, 0x18);
+    ps_write32(base, block.addr(), type ? 99 : 0);
+    ps_write32(base, block.addr() + 8, 100000);
+    return sc(ctx, kScFcntl, {0xFFFFFFFFFFFFFFFFull, 0xC000001A, block.addr(), 0x18});
+}
+
+// cellFsArcadeHddSerialNumber(char buf[62]): the arcade HDD's model (41 bytes) and serial (21) through fcntl
+// 0xC0000007, after clearing buf.
+s32 cellFsArcadeHddSerialNumber(PPUContext& ctx, u32 buf)
+{
+    if (!buf) return error(lv2::CELL_EFAULT);
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    if (!guest_readable(t, buf, 62)) return error(lv2::CELL_EFAULT);
+    std::memset(base + buf, 0, 62);
+    static constexpr char kDevice[] = "CELL_FS_IOS:ATA_HDD";
+    StackVar device(ctx, base, sizeof(kDevice));
+    std::memcpy(base + device.addr(), kDevice, sizeof(kDevice));
+    StackVar block(ctx, base, 0x1C);
+    const u32 b = block.addr();
+    ps_write32(base, b + 0x04, device.addr());
+    ps_write32(base, b + 0x08, sizeof(kDevice));
+    ps_write32(base, b + 0x0C, buf);
+    ps_write32(base, b + 0x10, 41);
+    ps_write32(base, b + 0x14, buf + 41);
+    ps_write32(base, b + 0x18, 21);
+    if (const s32 r = sc(ctx, kScFcntl, {0xFFFFFFFFFFFFFFFFull, 0xC0000007, b, 0x1C}); r != lv2::CELL_OK) return r;
+    return static_cast<s32>(ps_read32(base, b));
+}
+
+// The name conversion callbacks libfs would use for a converting file system: 32 slots {to, from, code page}.
+// cellFsRegisterConversionCallback(code_page, to, from) keeps a code page's first registration (CELL_EAGAIN when the
+// table is full; libfs takes the last free slot); cellFsUnregisterL10nCallbacks removes code pages 437, 850, 866, 932,
+// 948, 950 and 936. Nothing calls them here (no file system converts names).
+struct ConversionCallbacks {
+    std::mutex mutex;
+    struct Slot {
+        u32 to = 0, from = 0, code_page = 0;
+    };
+    std::array<Slot, 32> slots{};
+};
+ConversionCallbacks& conversions() { return HleProcess::current()->state<ConversionCallbacks>(); }
+
+s32 cellFsRegisterConversionCallback(PPUContext&, u32 code_page, u32 to, u32 from)
+{
+    ConversionCallbacks& c = conversions();
+    std::lock_guard lock(c.mutex);
+    ConversionCallbacks::Slot* free = nullptr;
+    for (ConversionCallbacks::Slot& s : c.slots) {
+        if (s.code_page == code_page) return lv2::CELL_OK;
+        if (!s.code_page) free = &s;
+    }
+    if (!free) return error(lv2::CELL_EAGAIN);
+    *free = {to, from, code_page};
+    return lv2::CELL_OK;
+}
+
+s32 cellFsUnregisterL10nCallbacks(PPUContext&)
+{
+    ConversionCallbacks& c = conversions();
+    std::lock_guard lock(c.mutex);
+    for (const u32 cp : {437u, 850u, 866u, 932u, 948u, 950u, 936u}) {
+        for (ConversionCallbacks::Slot& s : c.slots) {
+            if (s.code_page == cp) {
+                s = {};
+                break;
+            }
+        }
+    }
+    return lv2::CELL_OK;
+}
+
 // RPCS3 libfs_utility_init.cpp fs_utility_init_6B5896B0(u64* dest): the number of partitions, 2. The library's other
 // functions are RPCS3's stubs (rpcs3_stubs.inc).
 s32 fs_utility_init_6B5896B0(PPUContext& ctx, u32 dest)
@@ -977,6 +1374,34 @@ void register_sys_fs(Registry& r)
         PS_HLE_FUNC(0x866F6AEC, cellFsStReadWaitCallback),
         PS_HLE_FUNC(0x4CEF342E, cellFsAioWrite),
         PS_HLE_FUNC(0x6D3BB15B, cellFsSdataOpenByFd),
+    });
+    using detail::thunk;
+    const auto f = [](std::string_view name, HleFn fn) { return Function{{}, name, recomp::nid_of(name), fn, false}; };
+    r.add("sys_fs", {
+        f("cellFsAccess", &thunk<&cellFsAccess>), f("cellFsAclRead", &thunk<&cellFsAclRead>),
+        f("cellFsAclWrite", &thunk<&cellFsAclWrite>),
+        f("cellFsAllocateFileAreaByFdWithInitialData", &thunk<&cellFsAllocateFileAreaByFdWithInitialData>),
+        f("cellFsAllocateFileAreaByFdWithoutZeroFill", &thunk<&cellFsAllocateFileAreaByFdWithoutZeroFill>),
+        f("cellFsAllocateFileAreaWithInitialData", &thunk<&cellFsAllocateFileAreaWithInitialData>),
+        f("cellFsArcadeHddSerialNumber", &thunk<&cellFsArcadeHddSerialNumber>),
+        f("cellFsChangeFileSizeByFdWithoutAllocation", &thunk<&cellFsChangeFileSizeByFdWithoutAllocation>),
+        f("cellFsChangeFileSizeWithoutAllocation", &thunk<&cellFsChangeFileSizeWithoutAllocation>),
+        f("cellFsChown", &thunk<&cellFsChown>), f("cellFsFGetBlockSize2", &thunk<&cellFsFGetBlockSize2>),
+        f("cellFsFcntl", &thunk<&cellFsFcntl>), f("cellFsGetBlockSize2", &thunk<&cellFsGetBlockSize2>),
+        f("cellFsGetDirent", &thunk<&cellFsGetDirent>), f("cellFsGetDirentCount", &thunk<&cellFsGetDirentCount>),
+        f("cellFsLink", &thunk<&cellFsLink>), f("cellFsLsnGetCDA", &thunk<&cellFsLsnGetCDA>),
+        f("cellFsLsnGetCDASize", &thunk<&cellFsLsnGetCDASize>), f("cellFsLsnLock", &thunk<&cellFsLsnLock>),
+        f("cellFsLsnRead", &thunk<&cellFsLsnRead>), f("cellFsLsnRead2", &thunk<&cellFsLsnRead2>),
+        f("cellFsLsnUnlock", &thunk<&cellFsLsnUnlock>), f("cellFsMappedAllocate", &thunk<&cellFsMappedAllocate>),
+        f("cellFsMappedFree", &thunk<&cellFsMappedFree>), f("cellFsOpen2", &thunk<&cellFsOpen2>),
+        f("cellFsRegisterConversionCallback", &thunk<&cellFsRegisterConversionCallback>),
+        f("cellFsSdataOpenWithVersion", &thunk<&cellFsSdataOpenWithVersion>),
+        f("cellFsSetAttribute", &thunk<&cellFsSetAttribute>),
+        f("cellFsSetDefaultContainer", &thunk<&cellFsSetDefaultContainer>),
+        f("cellFsSetDiscReadRetrySetting", &thunk<&cellFsSetDiscReadRetrySetting>),
+        f("cellFsSetIoBuffer", &thunk<&cellFsSetIoBuffer>), f("cellFsSymbolicLink", &thunk<&cellFsSymbolicLink>),
+        f("cellFsTruncate2", &thunk<&cellFsTruncate2>),
+        f("cellFsUnregisterL10nCallbacks", &thunk<&cellFsUnregisterL10nCallbacks>),
     });
     r.add("fs_utility_init", {
         PS_HLE_FUNC(0x6B5896B0, fs_utility_init_6B5896B0),

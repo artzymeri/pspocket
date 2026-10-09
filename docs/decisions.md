@@ -6211,3 +6211,40 @@ Guest pointers are checked (D-042): libl10n would fault where pspocket refuses a
   and the two report a different *src_len at an unassigned kanji.
 - All 165 of libl10n's functions are pspocket's own; the comparison makes about 10.9 million checks (5.4 million calls
   on each side, 2.5 minutes), none differing, and a deliberately wrong converter table fails it.
+
+## D-518 · 2026-10-09 · sys_fs complete: libfs's other 34 functions, and the kernel calls behind them
+
+The 34 sys_fs functions pspocket lacked are its own (runtime/hle/src/sys_fs.cpp), each read in libfs.sprx (4.92) and
+compared with it (tests/hle/test_fs_compare.cpp: the same scripts in two fresh processes over the same file tree, one
+calling pspocket's functions and one Sony's module; every answer, every byte written and the file tree afterwards the
+same, 4,907 checks). RPCS3 implements none of them.
+- **libfs's path layer.** libfs asks lv2 (sys_fs_fcntl 0xC0000006) whether a path's file system wants its names
+  converted (FAT long names to and from a code page registered with cellFsRegisterConversionCallback) and then sends
+  the call as an fcntl with the converted name. lv2 here answers that none does (CELL_ENOTSUP, as RPCS3), so the
+  functions take libfs's direct way: the system call with the path as it is. The conversion table itself is kept as
+  libfs keeps it (32 slots, a code page's first registration wins, CELL_EAGAIN when full; cellFsUnregisterL10nCallbacks
+  removes code pages 437, 850, 866, 932, 948, 950 and 936).
+- **What libfs does with each.** Plain system calls: cellFsAccess (816), AclWrite (824), Link (810), SymbolicLink (833),
+  Chown (835), Fcntl (817), Truncate2 (847), LsnGetCDASize/GetCDA/Lock/Unlock (825-828). With checks: AclRead copies
+  4 bytes from its stack on success; FGetBlockSize2 and GetBlockSize2 check three pointers (GetBlockSize2 copies its
+  stack out even after a failure: uninitialised there, zeros here); MappedAllocate rounds to 4 KB pages; LsnRead maps a
+  buffer for offset + size, reads the sectors into it and copies size bytes from offset; LsnRead2 reads straight in.
+  Fcntl blocks: the by-fd size calls (0x80000006..8 with the size), the by-path ones (0xE0000016 and 0xE0000018, a
+  0x28-byte path block like 0xE0000017's), cellFsSdataOpenWithVersion (0xE0000025), the I/O buffer calls (0xC0000008:
+  SetDefaultContainer, SetIoBuffer, and SetIoBufferFromDefaultContainer, which before answered CELL_OK for any open
+  file), SetDiscReadRetrySetting (0xC000001A: none or 99 retries), ArcadeHddSerialNumber (0xC0000007). cellFsOpen2 is
+  cellFsOpen with the mode given (-1 is cellFsOpen's: 0600 when creating). cellFsSetAttribute opens a /dev_hdd0 path
+  (or its directory) and sends fcntl 1 with the CellFsStat; elsewhere it is CELL_ENOTSUP. cellFsGetDirent and
+  cellFsGetDirentCount are not in libfs: the count 0, CELL_ENOSYS.
+- **The kernel side.** lv2's calls behind them were RPCS3's stubs answering CELL_OK; they are pspocket's own now, with
+  readings of their own where nothing documents them: sys_fs_link (a hard link on one writable mount; FAT has none),
+  sys_fs_access (exists; W_OK needs a writable file system), sys_fs_acl_read/write (a 4-byte word per path, 0 until
+  written, kept for the process), sys_fs_symbolic_link (the target a guest path, relative ones from the link's
+  directory, stored as the host path so a link never leads out of the mounts), sys_fs_chown (as sys_fs_chmod: checked,
+  nothing changes), sys_fs_lsn_get_cda (no areas), sys_fs_lsn_read/write ({lsn, offset, size}: the file's sectors of the
+  mount's sector size from lsn, offset + size bytes), sys_fs_mapped_allocate/free (kernel-kept user memory per file,
+  freed at close), sys_fs_truncate2 (ftruncate's). fcntl gains 1, 0x80000004 (RPCS3's), 0x80000006..8, 0xC0000006,
+  0xC0000007, 0xC0000008 (RPCS3's container accounting: a file's buffer taken from a container and given back at close),
+  0xC000001A, 0xE0000016, 0xE0000018 and 0xE0000025. tests/lv2/test_fs.cpp checks each. The kernel's error names now
+  cover every CELL_E code.
+- sys_fs is 100% pspocket's own (82 of 82); 12 more kernel calls are pspocket's own.

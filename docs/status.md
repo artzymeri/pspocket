@@ -307,11 +307,14 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 ## System libraries (D-500 on)
 
-A session of its own makes every system library function pspocket's own native code (D-500): the chart in the README
-at 100%, each library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed
-already need no firmware module. Done so far:
+Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
+library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
+firmware module. Done so far (2026-10-09: 3,927 of 6,625):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
-Next: the rest of the functions Sony's modules call in the libraries pspocket always serves (cellSpurs' Task2 and
-exit codes, sys_net, cellUsbd, cellGcmSys, cellSysutil), then the firmware-backed libraries one by one.
+- cellHttpUtil (D-504), cellSpurs' accessors, exception handlers and SPU sharing (D-505, D-506, D-509), cellSheap
+  (D-507), cellSpudll (D-508), the C library and C99 maths under sys_libc and sys_libm (D-510 to D-516), cellL10n
+  (D-517), sys_fs with the kernel calls behind it (D-518).
+Next: the rest of the libraries pspocket always serves (cellGcmSys, sys_net, cellSpurs, sysPrxForUser's variables,
+cellSync, sys_lv2dbg, cellUsbd, cellUsbPspcm), then the firmware-backed libraries one by one.

@@ -649,9 +649,10 @@ TEST_CASE("lv2 fs: directory entries, a descriptor's path, block sizes, free spa
           rc(CELL_ENOTSUP));
     CHECK(t.c.call(838, t.f.cstr("/dev_hdd1"), 0, 0) == rc(CELL_EPERM));
 
-    // RPCS3's stub syscalls answer its constant: sys_fs_chown and sys_fs_truncate2 succeed, doing nothing.
+    // sys_fs_chown checks the path and changes nothing; sys_fs_truncate2 is ftruncate's, and this file is read-only
+    // (D-518).
     CHECK(t.c.call(835, t.f.cstr("/dev_hdd0/game/TEST00000/a.bin"), 0, 0) == CELL_OK);
-    CHECK(t.c.call(847, fd, 0) == CELL_OK);
+    CHECK(t.c.call(847, fd, 0) == rc(CELL_EBADF));
     CHECK(t.host_file(t.root / "hdd0" / "game" / "TEST00000" / "a.bin") == "12345");
 }
 
@@ -702,4 +703,163 @@ TEST_CASE("lv2 fs: an SDATA file inside an open file (fcntl 0x80000009, cellFsSd
     t.f.w64(ctrl + 0x18, 0); // not an SDATA file there
     CHECK(t.c.call(817, fd, 0x80000009, ctrl, 0x40) == rc(CELL_EFSSPECIFIC));
     CHECK(t.c.call(817, fd, 0x80000009, ctrl, 0x20) == rc(CELL_EINVAL));
+}
+
+// D-518: the file system calls libfs makes that RPCS3 leaves as stubs.
+TEST_CASE("sys_fs: link, symbolic_link, access, chown and ACLs", "[lv2][fs]")
+{
+    FsFixture t;
+    const fs::path dir = t.root / "hdd0" / "game" / "TEST00000";
+    std::ofstream(dir / "a.txt") << "hello";
+    const u32 a = t.f.cstr("/dev_hdd0/game/TEST00000/a.txt"), b = t.f.cstr("/dev_hdd0/game/TEST00000/b.txt");
+    const u32 s = t.f.cstr("/dev_hdd0/game/TEST00000/s.txt");
+    const u32 disc = t.f.cstr("/dev_bdvd/PS3_GAME/data.bin"), missing = t.f.cstr("/dev_hdd0/none");
+    // A hard link reads the same file; a second is EEXIST; the disc is read-only; mounts differ.
+    REQUIRE(t.c.call(810, a, b) == CELL_OK);
+    CHECK(t.host_file(dir / "b.txt") == "hello");
+    CHECK(t.c.call(810, a, t.f.cstr("/dev_hdd0/top.txt")) == rc(CELL_EACCES)); // not directly in /dev_hdd0
+    CHECK(t.c.call(810, a, b) == rc(CELL_EEXIST));
+    CHECK(t.c.call(810, disc, t.f.cstr("/dev_bdvd/x")) == rc(CELL_EROFS));
+    CHECK(t.c.call(810, a, t.f.cstr("/dev_hdd1/x")) == rc(CELL_EXDEV));
+    CHECK(t.c.call(810, missing, t.f.cstr("/dev_hdd0/game/y")) == rc(CELL_ENOENT));
+    CHECK(t.c.call(810, t.f.cstr("/dev_hdd0/game"), t.f.cstr("/dev_hdd0/game/g2")) == rc(CELL_EISDIR));
+    // A symbolic link, relative to its directory, followed by open; it never names a host path outside the mounts.
+    REQUIRE(t.c.call(833, t.f.cstr("a.txt"), s) == CELL_OK);
+    CHECK(fs::read_symlink(dir / "s.txt") == dir / "a.txt");
+    std::string got;
+    const u32 fd = t.open_ok("/dev_hdd0/game/TEST00000/s.txt", CELL_FS_O_RDONLY);
+    REQUIRE(t.read(fd, 10, got) == CELL_OK);
+    CHECK(got == "hello");
+    CHECK(t.c.call(kFsClose, fd) == CELL_OK);
+    const u32 up = t.f.cstr("/dev_hdd0/game/TEST00000/up.txt");
+    CHECK(t.c.call(833, t.f.cstr("../../../../../etc/hosts"), up) == rc(CELL_EXDEV));
+    CHECK(!fs::exists(fs::symlink_status(dir / "up.txt")));
+    CHECK(t.c.call(833, a, s) == rc(CELL_EEXIST));
+    CHECK(t.c.call(833, disc, up) == CELL_OK); // to a read-only mount of host files
+    // access: existence, then for W_OK a writable file system.
+    CHECK(t.c.call(816, a, 4) == CELL_OK);
+    CHECK(t.c.call(816, a, 6) == CELL_OK);
+    CHECK(t.c.call(816, missing, 0) == rc(CELL_ENOENT));
+    CHECK(t.c.call(816, disc, 4) == CELL_OK);
+    CHECK(t.c.call(816, disc, 2) == rc(CELL_EROFS));
+    CHECK(t.c.call(816, a, 8) == rc(CELL_EINVAL));
+    CHECK(t.c.call(816, t.f.cstr("/dev_none/x"), 0) == rc(CELL_ENOTMOUNTED));
+    // chown: checks the path, changes nothing.
+    CHECK(t.c.call(835, a, 1, 2) == CELL_OK);
+    CHECK(t.c.call(835, missing, 1, 2) == rc(CELL_ENOENT));
+    CHECK(t.c.call(835, disc, 1, 2) == rc(CELL_EROFS));
+    // ACLs: 0 until written, then what was written.
+    const u32 acl = t.f.alloc(4);
+    t.f.w32(acl, 0xFFFFFFFF);
+    REQUIRE(t.c.call(823, a, acl) == CELL_OK);
+    CHECK(t.f.r32(acl) == 0);
+    t.f.w32(acl, 0x1234);
+    CHECK(t.c.call(824, a, acl) == CELL_OK);
+    t.f.w32(acl, 0);
+    REQUIRE(t.c.call(823, t.f.cstr("/dev_hdd0/game/../game/TEST00000/a.txt"), acl) == CELL_OK);
+    CHECK(t.f.r32(acl) == 0x1234);
+    CHECK(t.c.call(824, disc, acl) == rc(CELL_EROFS));
+    CHECK(t.c.call(823, missing, acl) == rc(CELL_ENOENT));
+}
+
+TEST_CASE("sys_fs: LSN reads and writes, mapped buffers, truncate2", "[lv2][fs]")
+{
+    FsFixture t;
+    {
+        std::ofstream out(t.root / "hdd1" / "sectors.bin", std::ios::binary);
+        for (u32 i = 0; i < 4096; i++) out.put(static_cast<char>(i / 512 + i % 7));
+    }
+    const u32 fd = t.open_ok("/dev_hdd1/sectors.bin", CELL_FS_O_RDWR);
+    const u32 ctrl = t.f.alloc(24), buf = t.f.alloc(0x2000), count = t.f.alloc(8);
+    // No CDA areas; the LSN read: sectors of the mount's size (512 on hdd1) from the file's start.
+    t.f.w64(count, 99);
+    CHECK(t.c.call(826, fd, buf, 4, count) == CELL_OK);
+    CHECK(t.f.r64(count) == 0);
+    t.f.w64(ctrl, 2);
+    t.f.w64(ctrl + 8, 10);
+    t.f.w64(ctrl + 16, 20);
+    REQUIRE(t.c.call(829, fd, ctrl, buf, 0) == CELL_OK);
+    for (u32 i = 0; i < 30; i++) CHECK(t.f.base()[buf + i] == static_cast<u8>((1024 + i) / 512 + (1024 + i) % 7));
+    // An LSN write puts the bytes back at the same place.
+    std::memset(t.f.base() + buf, 0xEE, 30);
+    REQUIRE(t.c.call(830, fd, ctrl, buf, 0) == CELL_OK);
+    CHECK(t.host_file(t.root / "hdd1" / "sectors.bin").substr(1024, 30) == std::string(30, '\xEE'));
+    t.f.w64(ctrl, 1ull << 40);
+    CHECK(t.c.call(829, fd, ctrl, buf, 0) == rc(CELL_EINVAL));
+    CHECK(t.c.call(829, 99, ctrl, buf, 0) == rc(CELL_EBADF));
+    // Mapped buffers: allocated per file, freed once, and by close.
+    const u32 ptr = t.f.alloc(4);
+    REQUIRE(t.c.call(845, fd, 0x1000, ptr) == CELL_OK);
+    const u32 mapped = t.f.r32(ptr);
+    CHECK(mapped != 0);
+    t.f.base()[mapped] = 1; // committed, writable
+    CHECK(t.c.call(846, fd, mapped + 4) == rc(CELL_EINVAL));
+    CHECK(t.c.call(846, fd, mapped) == CELL_OK);
+    CHECK(t.c.call(846, fd, mapped) == rc(CELL_EINVAL));
+    CHECK(t.c.call(845, fd, 0, ptr) == rc(CELL_EINVAL));
+    REQUIRE(t.c.call(845, fd, 0x1000, ptr) == CELL_OK);
+    // truncate2: the open file's size.
+    CHECK(t.c.call(847, fd, 100) == CELL_OK);
+    CHECK(fs::file_size(t.root / "hdd1" / "sectors.bin") == 100);
+    CHECK(t.c.call(kFsClose, fd) == CELL_OK);
+    CHECK(t.c.call(846, fd, t.f.r32(ptr)) == rc(CELL_EBADF));
+}
+
+TEST_CASE("sys_fs_fcntl: libfs's size, I/O buffer, retry and SDATA operations", "[lv2][fs]")
+{
+    FsFixture t;
+    std::ofstream(t.root / "hdd1" / "f.bin") << "0123456789";
+    const u32 fd = t.open_ok("/dev_hdd1/f.bin", CELL_FS_O_RDWR);
+    const u32 arg = t.f.alloc(0x60);
+    // 0x80000006..8: the open file's size.
+    for (const u32 op : {0x80000006u, 0x80000007u, 0x80000008u}) {
+        t.f.w64(arg, 4 + (op & 0xF));
+        REQUIRE(t.c.call(817, fd, op, arg, 8) == CELL_OK);
+        CHECK(fs::file_size(t.root / "hdd1" / "f.bin") == 4 + (op & 0xF));
+    }
+    // 0xC0000006: no file system converts names.
+    const u32 name = t.f.cstr("/dev_usb000/x");
+    t.f.w32(arg, 0x20);
+    t.f.w32(arg + 4, 0x10);
+    t.f.w32(arg + 8, 0x18);
+    t.f.w32(arg + 0xC, 13);
+    t.f.w32(arg + 0x10, name);
+    REQUIRE(t.c.call(817, 0xFFFFFFFF, 0xC0000006, arg, 0x20) == CELL_OK);
+    CHECK(t.f.r32(arg + 0x18) == static_cast<u32>(CELL_ENOTSUP));
+    // 0xC0000008: the default container, then a file's buffer taken from it and given back at close.
+    const u32 cid = t.f.alloc(4);
+    REQUIRE(t.c.call(324, cid, 0x100000) == CELL_OK);
+    std::memset(t.f.base() + arg, 0, 0x28);
+    t.f.w64(arg + 0x10, t.f.r32(cid));
+    t.f.w32(arg + 0x18, 0x20000);
+    REQUIRE(t.c.call(817, 0xFFFFFFFF, 0xC0000008, arg, 0x28) == CELL_OK);
+    t.f.w64(arg + 0x10, 0xFFFFFFFF);
+    t.f.w32(arg + 0x18, 0x30000);
+    t.f.w32(arg + 0x1C, 0x4002);
+    CHECK(t.c.call(817, fd, 0xC0000008, arg, 0x28) == rc(CELL_ENOMEM)); // over the default's limit
+    t.f.w32(arg + 0x18, 0x18000); // rounds down to 64 KB
+    REQUIRE(t.c.call(817, fd, 0xC0000008, arg, 0x28) == CELL_OK);
+    const u32 info = t.f.alloc(16);
+    REQUIRE(t.c.call(343, info, t.f.r32(cid)) == CELL_OK); // sys_memory_container_get_size
+    CHECK(t.f.r32(info + 4) == 0x100000 - 0x10000);
+    // 0xC000001A and 0xE0000025.
+    std::memset(t.f.base() + arg, 0, 0x30);
+    CHECK(t.c.call(817, 0xFFFFFFFF, 0xC000001A, arg, 0x18) == CELL_OK);
+    CHECK(t.c.call(kFsClose, fd) == CELL_OK);
+    REQUIRE(t.c.call(343, info, t.f.r32(cid)) == CELL_OK);
+    CHECK(t.f.r32(info + 4) == 0x100000);
+    const u32 path = t.f.cstr("/dev_hdd1/f.bin");
+    t.f.w32(arg, 0x30);
+    t.f.w32(arg + 4, 0x10);
+    t.f.w32(arg + 8, 0x28);
+    t.f.w32(arg + 0xC, 15);
+    t.f.w32(arg + 0x10, path);
+    t.f.w32(arg + 0x2C, 0xFFFFFFFF);
+    REQUIRE(t.c.call(817, 0xFFFFFFFF, 0xE0000025, arg, 0x30) == CELL_OK);
+    CHECK(t.f.r32(arg + 0x28) == 0);
+    const u32 sdata = t.f.r32(arg + 0x2C);
+    std::string got;
+    REQUIRE(t.read(sdata, 100, got) == CELL_OK);
+    CHECK(got == std::string("0123456789") + std::string(2, '\0')); // 0x80000008 left it 12 bytes
+    CHECK(t.c.call(kFsClose, sdata) == CELL_OK);
 }

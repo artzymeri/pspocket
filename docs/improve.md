@@ -456,5 +456,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   not an improvement to make.
 - **liblv2's heap (D-502).** One host mutex for every heap (liblv2 locks each heap's own); if heap calls ever show in a
   profile, a mutex per heap.
+- **sys_fs's kernel calls (D-518).** sys_fs_link, access, ACLs, LSN reads, symbolic links, chown and the mapped
+  buffers are pspocket's readings (nothing documents them; libfs only shows the arguments). The LSN calls read a file's
+  own sectors and report no CD-DA areas; a game that reads a disc by absolute sector would need the image's extents.
+  Names are never converted (fcntl 0xC0000006 answers CELL_ENOTSUP for every mount), as RPCS3: right for host file
+  systems, which keep long names.
 - **Kernel gaps behind liblv2's wrappers.** sys_rsxaudio (650-658), interrupt threads (84, 89) and process spawning
   (21) answer CELL_ENOSYS in lv2; RPCS3 implements sys_rsxaudio.

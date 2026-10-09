@@ -434,6 +434,15 @@ struct HostThreads {
     u32 live = 0;
 };
 
+// sys_fs's process-wide settings (fs.cpp, D-518), under Kernel::Impl::fs_mutex: the default container I/O buffers
+// come from (sys_fs_fcntl 0xC0000008 with fd -1, as RPCS3's default_sys_fs_container), the disc read retry setting
+// (0xC000001A) and the ACLs sys_fs_acl_write set, by host path.
+struct FsState {
+    u32 default_container = 0, default_cap = 0, default_used = 0;
+    u32 disc_retry[6] = {0x63, 0, 0x186A0, 0, 0, 0}; // CELL_FS_DISC_READ_RETRY_DEFAULT
+    std::map<std::string, u32> acls;
+};
+
 struct Kernel::Impl {
     explicit Impl(Kernel& k);
     ~Impl();
@@ -470,6 +479,8 @@ struct Kernel::Impl {
 
     MemoryManager memory;
     Vfs vfs;
+    std::mutex fs_mutex;
+    FsState fs; // under fs_mutex
     // sys_game's and sys_ss's state (system.cpp), made at first use under system_mutex.
     std::mutex system_mutex;
     std::shared_ptr<void> system_state;

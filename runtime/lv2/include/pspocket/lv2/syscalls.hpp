@@ -225,6 +225,18 @@ Result sys_fs_get_mount_info(PpuThread& t, u32 info, u64 len, u32 out_len);
 Result sys_fs_lsn_get_cda_size(PpuThread& t, u32 fd, u32 ptr);
 Result sys_fs_lsn_lock(PpuThread& t, u32 fd);
 Result sys_fs_lsn_unlock(PpuThread& t, u32 fd);
+Result sys_fs_link(PpuThread& t, u32 from, u32 to);
+Result sys_fs_access(PpuThread& t, u32 path, s32 mode);
+Result sys_fs_acl_read(PpuThread& t, u32 path, u32 acl);
+Result sys_fs_acl_write(PpuThread& t, u32 path, u32 acl);
+Result sys_fs_lsn_get_cda(PpuThread& t, u32 fd, u32 buf, u64 size, u32 count);
+Result sys_fs_lsn_read(PpuThread& t, u32 fd, u32 ctrl, u32 buf, u64 unk);
+Result sys_fs_lsn_write(PpuThread& t, u32 fd, u32 ctrl, u32 buf, u64 unk);
+Result sys_fs_symbolic_link(PpuThread& t, u32 target, u32 link);
+Result sys_fs_chown(PpuThread& t, u32 path, s32 uid, s32 gid);
+Result sys_fs_mapped_allocate(PpuThread& t, u32 fd, u64 size, u32 out);
+Result sys_fs_mapped_free(PpuThread& t, u32 fd, u32 ptr);
+Result sys_fs_truncate2(PpuThread& t, u32 fd, u64 size);
 Result sys_fs_newfs(PpuThread& t, u32 dev_name, u32 file_system, s32 unk1, u32 str1);
 Result sys_fs_mount(PpuThread& t, u32 dev_name, u32 file_system, u32 path, s32 unk1, s32 prot, s32 unk2, u32 str1,
     u32 str_len);
