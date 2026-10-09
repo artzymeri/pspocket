@@ -6354,3 +6354,46 @@ from the bottom and compared with Sony's modules on it.
   A device arriving, a transfer completing or the driver being probed stops a dev build (rule 5): with a device model
   (an emulated portal or guitar, a PSP over the network) the attach and transfer paths are to be written and compared
   with libusbd on it.
+
+## D-523 · 2026-10-09 · lv2's network calls in the kernel, libnet's own layer over them (sys_net, part 1)
+
+sys_net was one HLE file that answered the sockets itself (RPCS3's lv2 behaviour, no lv2 call) and returned -1 with
+errno in the thread's TLS (RPCS3's convention). It is now two layers, as on a PS3:
+
+- **lv2 (runtime/lv2/src/net.cpp).** All 27 network calls are bound (700..726): the offline socket model that was in
+  the HLE (sockets numbered from 24 as RPCS3's IDs, the loopback interface the only one, loopback UDP and TCP between
+  the game's own sockets, connect/sendto elsewhere EADDRNOTAVAIL, blocking calls waiting for loopback data, a close,
+  sys_net_abort or their timeout, select/poll, the socket information) with getsockopt, getpeername, recvmsg, sendmsg,
+  poll, sys_net_abort (a socket's waiters EINTR, "all" closes every socket) and infoctl (6/11 the socket lists, 9/52
+  the resolver configuration, empty with no link, 53 a thread's sync object) added; sysctl answers the routing
+  socket's tables as empty (no interface, no route); the dumps, sys_net_control and eurus answer as RPCS3's stubs;
+  ioctl keeps the test parameters. Each call answers a value or -SYS_NET_E*. A blocked call shows as a network wait.
+- **libnet (runtime/hle/src/sys_net.cpp), Sony's libnet.sprx's logic.** sys_net_initialize_network_ex takes the
+  game's memory pool (memory set, at least 8 KB, flags 0 or 1; a second call CELL_OK, or EBUSY with flag 1) and
+  libnet's allocator runs over it exactly (first fit, 20-byte headers {next, prev, tag, line, size}, free and used
+  lists in address order, neighbours merged; the lists survive a finalisation): __sys_net_lib_malloc, _free, _calloc,
+  _realloc. Each thread gets a 3192-byte context in the pool at its first call (errno at +2928, h_errno at +2900, its
+  sync object: an lv2 mutex and condition "_netsyc", told to lv2 with infoctl 53), freed at the thread's exit (an
+  atexit function registered with sysPrxForUser) or by sys_net_free_thread_context (its flags as libnet's).
+  Before initialisation (and when a context can't be made) the calls use libnet's static context, marked aborted with
+  EBUSY (ENOMEM): SYS_NET_ERROR_EBUSY without reaching lv2. Every lv2 call goes through the context: a failure
+  keeps the errno there and answers SYS_NET_ERROR_* (0x80010200 | errno), not -1, as libnet does. libnet's random
+  generator (521-word lagged XOR, seeded from the clock), its sync objects (_sys_net_lib_sync_*), threads, usleep,
+  system time, the socket list (TCP states mapped to SYS_NET_STATE_* in a list), the libnetctl queue calls, the
+  resolver configuration (sys_net_set_resolver_configurations), the address conversions (libnet's own: inet_aton is
+  BIND's with 32-bit parts, inet_pton for IPv4 is inet_aton in strict mode, so "0x" is 0 and white space ends an
+  address; inet_pton6 is BIND 8's; inet_ntoa writes into the context), getifaddrs, sys_net_get_if_list and
+  sys_net_show_ifconfig (which GTA V calls at start: "No interface found.", lv2's and libnet's memory, the packets and
+  the thread contexts on the TTY).
+- **Compared** in tests/hle/test_net_compare.cpp with Sony's libnet running on pspocket's lv2: set-up, the pool and
+  thread contexts (the pool's bytes block by block), the text conversions over 65 strings and 10 addresses, sockets
+  and helpers, the interface report (its TTY text too); answers, memory, pool and lv2 calls the same, masking only
+  what differs by construction (each module's own file-name pointers in block headers, lv2 IDs, the clock-seeded
+  generator). The old HLE tests (tests/hle/test_net.cpp) now run on this kernel and libnet's conventions;
+  tests/lv2 keeps sys_raw_spu_create as the unimplemented example (700 is bound now).
+- **Not yet libnet's own (part 2).** gethostbyname is interim: it gives libnet's answers (a hostent in the context for
+  an address or for libnet's /etc/hosts "127.0.0.1 localhost localhost.", HOST_NOT_FOUND, TRY_AGAIN otherwise) but not
+  libnet's resolver work behind them (its hosts-file reads, res_init over lv2's resolv.conf, the DNS attempt, which
+  offline opens a socket of family 0 and fails, and their pool allocations); its comparison waits, hidden. Still
+  missing: gethostbyaddr, if_nametoindex, sys_net_if_ctl, the name-server, routing, netset, test-parameter, dump,
+  ioctl/control wrappers and show_nameserver/show_route.

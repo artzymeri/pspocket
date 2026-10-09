@@ -576,7 +576,10 @@ TEST_CASE("cellSpurs event flags and taskset shutdown; sys_net, sys_spu_initiali
     CHECK(ps_read8(base, kSpurs + 0x80) == 2); // RUNNABLE
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 
-    CHECK(a.call("sys_net_initialize_network_ex", kData) == 0);
+    ps_write32(base, kData + 0x100, kData + 0x1F0000); // sys_net_initialize_parameter_t {memory, size, flags}
+    ps_write32(base, kData + 0x104, 0x10000);
+    ps_write32(base, kData + 0x108, 0);
+    CHECK(a.call("sys_net_initialize_network_ex", kData + 0x100) == 0);
     a.call("_sys_process_atexitspawn", 0x10000);
     a.call("_sys_process_at_Exitspawn", 0x10008);
 
@@ -689,7 +692,6 @@ TEST_CASE("cellSpurs job chains: 14-argument attribute (stack arguments), creati
     ps_write32(base, kJc + 0x74, 32); // workload ID past 31: INVAL
     CHECK(a.call("cellSpursRunJobChain", kJc) == kJobInval);
     ps_write32(base, kJc + 0x74, 0);
-    CHECK(a.call("sys_net_show_ifconfig") == 0);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
 }
 

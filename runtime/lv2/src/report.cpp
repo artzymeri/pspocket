@@ -176,6 +176,7 @@ std::string describe_wait(Kernel::Impl& s, const Waiter& w, WaitOn on, const Thr
     }
     case WaitKind::Join: return std::format("thread {} to exit", thread(on.id));
     case WaitKind::Usbd: return std::format("USB events (usbd handle {:#x}; no device is attached)", on.id);
+    case WaitKind::Net: return "the network (no link: loopback data, a close, an abort or a timeout)";
     }
     return {};
 }

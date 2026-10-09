@@ -349,6 +349,7 @@ const char* wait_kind_name(WaitKind kind)
     case WaitKind::Join: return "thread join";
     case WaitKind::Sleep: return "sleep";
     case WaitKind::Usbd: return "USB events";
+    case WaitKind::Net: return "network";
     }
     return "?";
 }
@@ -534,6 +535,7 @@ Kernel::Impl::Impl(Kernel& k)
     register_system_syscalls(table);
     register_rsx_syscalls(table);
     register_usbd_syscalls(table);
+    register_net_syscalls(table);
     // Every other slot RPCS3 answers with null_func (a log, then CELL_OK) is answered so too (D-166): a game calling
     // one goes on instead of meeting ENOSYS. GTA V's CRT, for one, registers a debug exception handler (988).
     static constexpr struct {

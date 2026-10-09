@@ -77,10 +77,10 @@ TEST_CASE("lv2: unimplemented syscalls log their number and name and return CELL
     LogCapture log;
     const u64 before = f.kernel->unimplemented_count();
 
-    // sys_net_bnet_accept: named, implemented by RPCS3, not here.
-    CHECK(c.call64(700, 1, 2, 3) == to_r3(err(CELL_ENOSYS)));
-    CHECK(c.call64(700, 1, 2, 3) == 0xFFFFFFFF80010003ull); // sign-extended, as RPCS3's error_code
-    CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 700 (sys_net_bnet_accept)"));
+    // sys_raw_spu_create: named, implemented by RPCS3, not here.
+    CHECK(c.call64(160, 1, 2, 3) == to_r3(err(CELL_ENOSYS)));
+    CHECK(c.call64(160, 1, 2, 3) == 0xFFFFFFFF80010003ull); // sign-extended, as RPCS3's error_code
+    CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 160 (sys_raw_spu_create)"));
     // An unnamed slot and an out-of-range number.
     CHECK(c.call(6) == rc(CELL_ENOSYS));
     CHECK(log.contains("lv2", "UNIMPLEMENTED syscall 6 (unnamed)"));

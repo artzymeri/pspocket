@@ -125,6 +125,7 @@ enum class WaitKind : u8 {
     Join,        // sys_ppu_thread_join; the ID is the joined thread's
     Sleep,       // sys_timer_usleep / sys_timer_sleep; no ID
     Usbd,        // sys_usbd_receive_event; the ID is the usbd handle
+    Net,         // a network call (sys_net_bnet_recvfrom, accept, select, poll...); no ID
 };
 const char* wait_kind_name(WaitKind kind);
 

@@ -470,5 +470,8 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   Skylanders/Infinity portal, a guitar, a PSP over the network) is where they would come from, each compared with
   libusbd/libusbpspcm running on it. lv2's unnamed USB calls (563 composite drivers, 565 memory from a container,
   567..569 shared memory) answer as RPCS3 (CELL_OK, nothing written): binding them needs names in the syscall table.
+- **The network (D-523).** lv2 has no interface but loopback and lists none to libnet (sysctl's routing tables are
+  empty); a real console without a cable would still list lo0. libnet's per-thread contexts take 3192 bytes of the
+  game's pool each, as on a PS3. gethostbyname gives libnet's answers without its resolver's work yet (part 2).
 - **Kernel gaps behind liblv2's wrappers.** sys_rsxaudio (650-658), interrupt threads (84, 89) and process spawning
   (21) answer CELL_ENOSYS in lv2; RPCS3 implements sys_rsxaudio.

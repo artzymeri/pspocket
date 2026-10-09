@@ -1,5 +1,6 @@
-// sys_net (libnet) on a console without a network, cellHttp and cellSsl (synthetic: no game data): descriptors as lv2
-// numbers them, errno through _sys_net_errno_loc, bind/listen/getsockname/setsockopt with RPCS3's checks, connect and
+// sys_net (libnet over lv2's network calls, D-523) on a console without a network, cellHttp and cellSsl (synthetic: no
+// game data): descriptors as lv2 numbers them, libnet's SYS_NET_ERROR_* answers and errno in the thread's context,
+// bind/listen/getsockname/setsockopt with RPCS3's checks, connect and
 // sendto failing as with the cable unplugged, would-block and timeouts, loopback UDP and TCP between the game's own
 // sockets, socketselect, socket info, the address conversions, gethostbyname without a name server, and the cellHttp
 // and cellSsl state machines.
@@ -28,6 +29,7 @@ using namespace std::chrono_literals;
 namespace {
 
 constexpr u32 kUnmapped = 0x0FFF0000; // in the main area, never committed by these tests
+constexpr u32 kNetPool = kData + 0x200000; // libnet's memory pool
 
 // RPCS3 lv2/sys_net.h.
 constexpr s32 SYS_NET_EINTR = 4, SYS_NET_EBADF = 9, SYS_NET_EACCES = 13, SYS_NET_EFAULT = 14, SYS_NET_EINVAL = 22,
@@ -72,6 +74,14 @@ struct Net {
 
     Net(GuestThread& t, u32 index) : g(t), b(t.f.base())
     {
+        if (index == 0) { // libnet over a 512 KB pool (sys_net_initialize_network_ex {memory, size, flags})
+            REQUIRE(t.f.hle->link_internal_functions({"sys_net"}));
+            const u32 param = kData + 0x1FF000;
+            ps_write32(b, param, kNetPool);
+            ps_write32(b, param + 4, 0x80000);
+            ps_write32(b, param + 8, 0);
+            REQUIRE(t.call("sys_net_initialize_network_ex", param) == 0);
+        }
         const u32 s = kData + 0x20000 * index;
         addr = s;
         addr2 = s + 0x20;
@@ -90,11 +100,15 @@ struct Net {
 
     s32 err() { return static_cast<s32>(ps_read32(b, static_cast<u32>(g.call("_sys_net_errno_loc")))); }
 
+    // libnet answers a failure with SYS_NET_ERROR_* (0x80010200 | errno) and keeps the errno: as {-1, errno}.
     template <class... A>
     Outcome call(std::string_view name, A... args)
     {
         const s32 v = static_cast<s32>(g.call(name, args...));
-        return {v, v == -1 ? err() : 0};
+        if ((static_cast<u32>(v) & 0xFFFFFF00) != 0x80010200) return {v, v == -1 ? err() : 0};
+        const s32 e = err();
+        CHECK(e == (v & 0xFF));
+        return {-1, e};
     }
 
     s32 socket(s32 type, s32 protocol = 0)
@@ -213,7 +227,7 @@ bool wait_parked(const std::atomic<lv2::PpuThread*>& t)
 {
     const auto until = std::chrono::steady_clock::now() + 10s;
     while (std::chrono::steady_clock::now() < until) {
-        if (lv2::PpuThread* p = t.load(); p && p->waiter.waiting_on().kind == lv2::WaitKind::Sleep) return true;
+        if (lv2::PpuThread* p = t.load(); p && p->waiter.waiting_on().kind == lv2::WaitKind::Net) return true;
         std::this_thread::sleep_for(1ms);
     }
     return false;
@@ -290,8 +304,8 @@ TEST_CASE("sys_net sockets: descriptors from 24 in order, the type checks, socke
     CHECK(n.call("socketclose", 25) == fail(SYS_NET_EBADF));
     CHECK(n.call("socket", kAfInet, kDgram, 0) == ok(27)); // the next one, not the freed 25 (RPCS3's IdManager)
 
-    // A failure returns -1 (sign-extended in r3) and leaves the code in sys_net_errno.
-    CHECK(g.call("socket", kAfInet, 4, 0) == ~u64{0});
+    // A failure returns SYS_NET_ERROR_* (sign-extended in r3) and leaves the code in sys_net_errno.
+    CHECK(g.call("socket", kAfInet, 4, 0) == r3_of_code(0x8001022B));
     CHECK(n.call("socket", kAfInet, 4, 0) == fail(SYS_NET_EPROTONOSUPPORT)); // the type first
     CHECK(n.call("socket", kAfInet6, 4, 0) == fail(SYS_NET_EPROTONOSUPPORT));
     CHECK(n.call("socket", kAfInet, kStream, kIpprotoUdp) == fail(SYS_NET_EPROTONOSUPPORT));
@@ -316,30 +330,43 @@ TEST_CASE("sys_net sockets: descriptors from 24 in order, the type checks, socke
     CHECK(n.call("socket", kAfInet, kStream, 0) == fail(SYS_NET_EMFILE));
 }
 
-TEST_CASE("sys_net_errno: in the thread's TLS system area as RPCS3 keeps it, set only by a failing call", "[hle][net]")
+TEST_CASE("sys_net_errno: in the thread's context in libnet's pool, set only by a failing call", "[hle][net]")
 {
     Fixture f;
     u8* b = f.base();
     GuestThread g(f, 0, "net");
-    Net n(g, 0);
-    CHECK(g.call("_sys_net_errno_loc") == n.tls + 0x2c);   // r13 - 0x7030 + 0x2c
-    CHECK(g.call("_sys_net_h_errno_loc") == n.tls + 0x28); // r13 - 0x7030 + 0x28
+
+    // Before sys_net_initialize_network_ex: libnet's static context, aborted with EBUSY; lv2 is not asked.
+    REQUIRE(f.hle->link_internal_functions({"sys_net"}));
+    CHECK(g.call("socket", kAfInet, kDgram, 0) == r3_of_code(0x80010210));
+    const u32 static_errno = static_cast<u32>(g.call("_sys_net_errno_loc"));
+    CHECK(ps_read32(b, static_errno) == 16);
+
+    Net n(g, 0); // initialises libnet
+    const u32 loc = static_cast<u32>(g.call("_sys_net_errno_loc"));
+    CHECK(loc >= kNetPool);
+    CHECK(loc < kNetPool + 0x80000);
+    CHECK(g.call("_sys_net_h_errno_loc") == loc - 28);
     CHECK(n.call("socketclose", 77) == fail(SYS_NET_EBADF));
-    CHECK(ps_read32(b, n.tls + 0x2c) == SYS_NET_EBADF);
+    CHECK(g.call("socketclose", 77) == r3_of_code(0x80010209)); // SYS_NET_ERROR_EBADF, not -1
+    CHECK(ps_read32(b, loc) == SYS_NET_EBADF);
     CHECK(n.call("socket", kAfInet, kDgram, 0) == ok(24));
-    CHECK(ps_read32(b, n.tls + 0x2c) == SYS_NET_EBADF); // a success leaves it alone
+    CHECK(ps_read32(b, loc) == SYS_NET_EBADF); // a success leaves it alone
     CHECK(n.call("listen", 24, 0) == fail(SYS_NET_EINVAL));
 
-    // Threads without TLS (r13 0): a stand-in word each, in guest memory, the same on every call.
-    GuestThread h(f, 1, "no tls"), k(f, 2, "no tls 2");
-    const u64 loc = h.call("_sys_net_errno_loc");
-    REQUIRE(loc != 0);
-    CHECK(f.mem.is_committed(static_cast<u32>(loc)));
-    CHECK(h.call("_sys_net_errno_loc") == loc);
-    CHECK(k.call("_sys_net_errno_loc") != loc);
-    CHECK(static_cast<s32>(h.call("socketclose", 99)) == -1);
-    CHECK(ps_read32(b, static_cast<u32>(loc)) == SYS_NET_EBADF);
-    CHECK(ps_read32(b, n.tls + 0x2c) == SYS_NET_EINVAL); // each thread its own
+    // Each thread its own context.
+    GuestThread h(f, 1, "second");
+    const u64 hloc = h.call("_sys_net_errno_loc");
+    CHECK(hloc != loc);
+    CHECK(h.call("_sys_net_errno_loc") == hloc);
+    CHECK(h.call("socketclose", 99) == r3_of_code(0x80010209));
+    CHECK(ps_read32(b, static_cast<u32>(hloc)) == SYS_NET_EBADF);
+    CHECK(ps_read32(b, loc) == SYS_NET_EINVAL);
+
+    // sys_net_free_thread_context(0, 1) frees the caller's; its next call makes a new one.
+    CHECK(h.call("sys_net_free_thread_context", 0, 1) == 1);
+    CHECK(g.call("sys_net_finalize_network") == 0);
+    CHECK(g.call("socket", kAfInet, kDgram, 0) == r3_of_code(0x80010210));
 }
 
 TEST_CASE("sys_net bind, listen, getsockname: RPCS3's checks, the loopback interface the only one", "[hle][net]")
@@ -1065,7 +1092,7 @@ TEST_CASE("sys_net_get_sockinfo(_ex): RPCS3's infoctl answers", "[hle][net]")
     CHECK(n.call("sys_net_get_sockinfo", -1, n.info, 2) == ok(2));
     // sys_net_sockinfo_t: s, proto, recv_queue_length, send_queue_length, local_adr, local_port, remote_adr,
     // remote_port, state.
-    const std::array<u32, 9> unbound_udp = {24, 17, 0, 0, 0, 0, 0, 0, 2}; // CREATED
+    const std::array<u32, 9> unbound_udp = {24, 17, 0, 0, 0, 0, 0, 0, 3}; // listed: not TCP, so OPENED
     const std::array<u32, 9> listening = {25, 6, 0, 0, kLoopback, 7300, 0, 0, 4}; // LISTEN
     for (u32 i = 0; i < 9; i++) {
         INFO("word " << i);
@@ -1130,8 +1157,9 @@ TEST_CASE("sys_net inet_addr, inet_pton, inet_ntop: BSD's conversions", "[hle][n
     CHECK(addr("0") == 0u);
     CHECK(addr("1.2.3.4 and more") == 0x01020304u); // white space ends it
     CHECK(addr("1.2.3.4\n") == 0x01020304u);
+    CHECK(addr("0x") == 0u); // libnet's parser takes a bare "0x" as 0 (BSD's refuses it)
     for (const std::string_view bad : {"", " 1.2.3.4", "1.2.3.4x", "1.2.3.256", "256.1.1.1", "1.2.3.4.5", "08.1.1.1",
-             "0x", "1..2.3", "1.2.3.", ".1.2.3", "1.16777216", "1.2.65536", "a.b.c.d", "4294967296x"}) {
+             "1..2.3", "1.2.3.", ".1.2.3", "1.16777216", "1.2.65536", "a.b.c.d", "4294967296x"}) {
         INFO("\"" << bad << "\"");
         CHECK(addr(bad) == 0xFFFFFFFFu);
     }
@@ -1148,7 +1176,8 @@ TEST_CASE("sys_net inet_addr, inet_pton, inet_ntop: BSD's conversions", "[hle][n
     CHECK(pton(kAfInet, "0.0.0.0") == ok(1));
     CHECK(out_bytes(4) == std::vector<u8>{0, 0, 0, 0});
     // Decimal dotted quads only: no leading zeros, no shorthand, nothing after it.
-    for (const std::string_view bad : {"01.2.3.4", "1.2.3", "1.2.3.4.", "1.2.3.4 ", "256.0.0.1", "0x1.2.3.4", "",
+    CHECK(pton(kAfInet, "1.2.3.4 ") == ok(1)); // libnet's inet_pton is inet_aton's parser: white space ends it
+    for (const std::string_view bad : {"01.2.3.4", "1.2.3", "1.2.3.4.", "256.0.0.1", "0x1.2.3.4", "",
              "1..2.3", "1.2.3.4.5", "-1.2.3.4"}) {
         INFO("\"" << bad << "\"");
         CHECK(pton(kAfInet, bad) == ok(0));
@@ -1225,20 +1254,25 @@ TEST_CASE("sys_net inet_addr, inet_pton, inet_ntop: BSD's conversions", "[hle][n
     CHECK(n.err() == SYS_NET_ENOSPC);
 }
 
-TEST_CASE("sys_net gethostbyname without a name server: TRY_AGAIN, a numeric name without a lookup", "[hle][net]")
+TEST_CASE("sys_net gethostbyname without a name server: TRY_AGAIN, libnet's hosts, a numeric name", "[hle][net]")
 {
     Fixture f;
     u8* b = f.base();
     GuestThread g(f, 0, "net");
     Net n(g, 0);
-    const auto h_errno_value = [&] { return static_cast<s32>(ps_read32(b, n.tls + 0x28)); }; // RPCS3's place
+    const u32 h_errno_loc = static_cast<u32>(g.call("_sys_net_h_errno_loc"));
+    const auto h_errno_value = [&] { return static_cast<s32>(ps_read32(b, h_errno_loc)); };
 
     n.put_text("prod.ros.rockstargames.com");
     CHECK(g.call("gethostbyname", n.text) == 0);
     CHECK(h_errno_value() == 2); // TRY_AGAIN
-    n.put_text("localhost");
-    CHECK(g.call("gethostbyname", n.text) == 0);
-    CHECK(h_errno_value() == 2);
+    n.put_text("localhost"); // libnet's /etc/hosts: 127.0.0.1 localhost localhost.
+    const u32 lh = static_cast<u32>(g.call("gethostbyname", n.text));
+    REQUIRE(lh != 0);
+    CHECK(h_errno_value() == 0);
+    CHECK(std::string(reinterpret_cast<const char*>(b + ps_read32(b, lh))) == "localhost");
+    CHECK(std::string(reinterpret_cast<const char*>(b + ps_read32(b, ps_read32(b, lh + 4)))) == "localhost.");
+    CHECK(ps_read32(b, ps_read32(b, ps_read32(b, lh + 16))) == kLoopback);
     n.put_text("1.2.3.4."); // ends in a dot: a name
     CHECK(g.call("gethostbyname", n.text) == 0);
     CHECK(h_errno_value() == 2);
@@ -1264,11 +1298,30 @@ TEST_CASE("sys_net gethostbyname without a name server: TRY_AGAIN, a numeric nam
     CHECK(n.err() == SYS_NET_EFAULT);
 }
 
-TEST_CASE("sys_net setup calls: RPCS3's CELL_OK", "[hle][net]")
+TEST_CASE("sys_net setup: the pool's checks, a second initialisation", "[hle][net]")
 {
     Fixture f;
+    u8* b = f.base();
+    REQUIRE(f.hle->link_internal_functions({"sys_net"}));
     GuestThread g(f, 0, "net");
-    CHECK(g.call("sys_net_set_resolver_configurations", 1, 2, 3) == 0);
+    const u32 param = kData + 0x1FF000;
+    const auto init = [&](u32 memory, u32 size, u32 flags) {
+        ps_write32(b, param, memory);
+        ps_write32(b, param + 4, size);
+        ps_write32(b, param + 8, flags);
+        return g.call("sys_net_initialize_network_ex", param);
+    };
+    const u64 einval = r3_of_code(0x80010216);
+    CHECK(g.call("sys_net_initialize_network_ex", 0) == einval);
+    CHECK(init(0, 0x10000, 0) == einval);
+    CHECK(init(kNetPool, 0x1FFF, 0) == einval);
+    CHECK(init(kNetPool, 0x10000, 2) == einval);
+    CHECK(init(kNetPool, 0x10000, 0) == 0);
+    CHECK(init(kNetPool, 0x10000, 0) == 0);
+    CHECK(init(kNetPool, 0x10000, 1) == r3_of_code(0x80010210)); // flag 1: EBUSY when already initialised
+    CHECK(g.call("sys_net_set_resolver_configurations", 1, 2, 3) == r3_of_code(0x80010201));
+    CHECK(g.call("sys_net_set_resolver_configurations", 1, 2, 0) == 0);
+    CHECK(g.call("sys_net_finalize_network") == 0);
     CHECK(g.call("sys_net_finalize_network") == 0);
 }
 

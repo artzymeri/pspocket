@@ -317,6 +317,7 @@ firmware module. Done so far (2026-10-09: 3,927 of 6,625):
   (D-507), cellSpudll (D-508), the C library and C99 maths under sys_libc and sys_libm (D-510 to D-516), cellL10n
   (D-517), sys_fs with the kernel calls behind it (D-518), cellGcmSys compared with libgcm_sys running on pspocket's lv2
   (D-519), liblv2's internal variables (D-520), sys_lv2dbg (D-521), cellUsbd and cellUsbPspcm with lv2's sys_usbd as a
-console with no USB device (D-522).
-Next: the rest of the libraries pspocket always serves (sys_net with lv2's bnet calls, cellSpurs' Task2 and LF queues,
-cellSync's ANY2ANY queues, the raw SPU loaders), then the firmware-backed libraries one by one.
+console with no USB device (D-522), lv2's network calls and libnet's own layer over them (D-523, part 1).
+Next: sys_net part 2 (libnet's resolver behind gethostbyname/gethostbyaddr, if_ctl, name servers, routing, netset,
+dumps), then cellSpurs' Task2 and LF queues, cellSync's ANY2ANY queues, the raw SPU loaders, then the firmware-backed
+libraries one by one.
