@@ -335,15 +335,26 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   cellFiber (D-568: fibers and contexts, each on a host thread that runs as its PPU thread while it holds the
   thread's baton).
 - cellGame's and cellPhotoImportUtil's working structures as their variables under RPCS3's names (D-567).
-Left (984, 2026-10-09): sys_libc and sys_libm's internals (264: Dinkumware's formatter and locale internals,
-setjmp/longjmp, the raw SPU printf family), cellSpursJq (63), cellSailRec (58), libsnd3 (50), cellRudp
-(31), the codec cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec, libdivx*,
-cell*dec's core ops), cellSail's playback (19), the encoders (cellJpgEnc, cellCelp*Enc), and the 188
-functions still answered as RPCS3's stubs.
+Left (984, 2026-10-09). What each part needs (a session without the firmware could not make these faithfully):
+- Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSpursJq (63, libspurs_jq), cellSailRec (58)
+  and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (31, its wire protocol), the codec
+  cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec, libdivx*, libvdec's 9, and the audio cores'
+  operation tables and PTS functions, about 170 in all), cellJpgEnc (10, its structures), cellCelpEnc and
+  cellCelp8Enc (19), the image decoders' Ext functions (15), cellNetAoi, libmedi, libad_core/async (32), cellSpurs' 13
+  and cellSync's 6 (libsre: Task2, the LF queues' second forms), and the small ones (sys_crashdump, sysConsoleId,
+  sysBdMediaId, sysPs2Disc, sys_lv2coredump, cellLibprof, cellSysconfPs1emu, cellGamePs1Emu, cellSysmodule's two,
+  module management's six).
+- The 188 functions answered as RPCS3's stubs, in libraries pspocket always serves: their arguments and answers from
+  the libraries' modules.
+- sys_libc and sys_libm's internals (264: Dinkumware's formatter, scanner and locale internals, setjmp/longjmp, the
+  SPU printf helpers' read and write families): no firmware module has them; their arguments are to be read in a
+  game's own copy of the C library.
+- To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
+  cellFiber.
 Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,
 services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
 interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
 as RPCS3's null or stub slots (debugger, crypto engine, colored memory: signatures not known).
-Next: sys_net part 2 (libnet's resolver behind gethostbyname/gethostbyaddr, if_ctl, name servers, routing, netset,
-dumps), then cellSpurs' Task2 and LF queues, cellSync's ANY2ANY queues, the raw SPU loaders, then the firmware-backed
-libraries one by one.
+Next (on the Mac, with the firmware): compare the five firmware-first libraries with Sony's modules and drop their
+markers; then libsre's last functions (cellSpurs' Task2 and LF queues, cellSync's), libnet's resolver (behind
+gethostbyname and gethostbyaddr, D-569), and the firmware-backed libraries above one by one.
