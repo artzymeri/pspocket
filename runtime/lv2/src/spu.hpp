@@ -102,6 +102,12 @@ public:
     u8* ls = nullptr;
     SPUContext ctx{};
     Waiter waiter; // sys_spu_thread_receive_event
+    // Held while lv2 answers a call the SPU made in its inbound mailbox (send_event and event_flag_set_bit from the
+    // check of the mailbox to the answer, receive_event's four words), and by sys_spu_thread_write_spu_mb. A PPU's word
+    // lands before or after an answer, never inside it, and a reply to the event the call sent never ahead of the call's
+    // own answer: the receiver runs as soon as the event is queued (D-584). RPCS3 SPUThread.cpp set_ch_value reserves the
+    // answer's place in the mailbox, under the group's mutex, before it sends.
+    std::mutex answer_mutex;
 
     // Guarded by group.lock.
     std::array<std::shared_ptr<EventQueue>, 64> ports;                // sys_spu_thread_connect_event (spup)

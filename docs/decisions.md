@@ -8394,3 +8394,26 @@ view's done with no picture, the base view's pictures with their own PTS.
 To compare with Sony's libvdec on the Mac: what libmvcdec gives for an MVC access unit (one picture or two, and where
 the second view goes), CellVdecMvcInfo's layout, the lag and the frame buffers for MVC, an access unit of the second
 view alone.
+
+## D-584 · 2026-10-09 · lv2 answers an SPU's call in its inbound mailbox before anyone can reply to it
+
+Found by the ThreadSanitizer sweep (D-585), though not as a race report: the SPU printf test failed once in the loaded
+sweep with printf's result 0 where 27 was due. sys_spu_thread_send_event from SPU code (code 0..63 in the interrupt
+mailbox) queued the event, then wrote the call's answer (CELL_OK, EBUSY, ENOTCONN) into the SPU's inbound mailbox. The
+event's receiver runs as soon as the event is queued; spu_printf's server prints and writes printf's result with
+sys_spu_thread_write_spu_mb, and when it got there first the SPU read the result as send_event's status and the status
+as the result. Any game whose PPU answers an SPU's event through the mailbox (spu_printf, any SPU-to-PPU call that
+waits there for its reply) could see the same, more often on a busy phone. event_flag_set_bit (code 128) answered
+after setting the flag, so a PPU thread woken by the bit could do the same.
+- Each SPU thread has an answer mutex (spu.hpp). send_event holds it from the check that the mailbox is empty to the
+  answer, event_flag_set_bit across the set and its answer, receive_event across its four answer words, and
+  sys_spu_thread_write_spu_mb while it writes: a PPU's word lands before or after an answer, never inside it or ahead of
+  it. RPCS3 SPUThread.cpp set_ch_value gets the same by reserving the answer's place in the mailbox, under the group's
+  mutex, before it sends. The warnings for a failed send are now logged after the answer.
+- Lock order: the answer mutex, then the group's lock (the port), the queue's and the waiter's; nothing takes the answer
+  mutex while holding any of those. SPURS's workers (spurs_scheduler.cpp) answer the same way but are not lv2 SPU
+  threads: no PPU writes their mailboxes.
+Test: tests/hle/test_spu_threads.cpp, "a reply to a sent event comes after send_event's own answer": the second of
+two sends finds the one-event queue full, and a log sink holds the SPU's thread at its warning while the test receives
+the first event and replies. The SPU reads EBUSY, then the reply; with the old order it read the reply, then EBUSY
+(every run).

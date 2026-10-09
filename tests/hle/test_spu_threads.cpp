@@ -8,9 +8,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <string_view>
 #include <thread>
 #include <vector>
 
+#include "pspocket/core/log.hpp"
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/spu/asm.hpp"
@@ -410,6 +412,73 @@ TEST_CASE("SPU thread groups: inbound mailbox, send_event to a PPU queue, receiv
     CHECK(ps_read32(s.b, kOut + 0x20) == 0x101);
     CHECK(ps_read32(s.b, kOut + 0x30) == 0x202);
     CHECK(ps_read32(s.b, kOut + 0x40) == 0x303);
+}
+
+// D-584: the event send_event queues may be answered before lv2 has answered the call (spu_printf's server, under
+// load: the SPU took the server's reply for send_event's status and the status for the reply). The second send here
+// finds the one-event queue full; the warning that logs holds the SPU's thread while the PPU receives the first event
+// and replies at once. The reply comes after the second send's answer.
+TEST_CASE("SPU thread groups: a reply to a sent event comes after send_event's own answer", "[hle][spu-threads]")
+{
+    SpuFixture s;
+    Program p;
+    // send_event(port 5, data0 = 1 + i, data1 = 0xA + i) twice, each answer to $13 + i; then the reply to $15.
+    for (u32 i = 0; i < 2; i++) {
+        p.emit(as::il(11, static_cast<s32>(0xA + i)));
+        p.emit(as::wrch(PS_SPU_WrOutMbox, 11));
+        p.load32(12, 0x05000001 + i);
+        p.emit(as::wrch(PS_SPU_WrOutIntrMbox, 12));
+        p.emit(as::rdch(13 + i, PS_SPU_RdInMbox));
+    }
+    p.emit(as::rdch(15, PS_SPU_RdInMbox));
+    p.put(13, kOut, 0x00);
+    p.put(14, kOut, 0x10);
+    p.put(15, kOut, 0x20);
+    p.thread_exit(0);
+    write_elf(s.b, kElf, p);
+    s.import_image(kImg, kElf, 0x100 + static_cast<u32>(p.code.size() * 4));
+    const u32 group = s.create_group(1);
+    const u32 thread = s.init_thread(group, 0, kImg);
+    ps_write32(s.b, kQueueAttr, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(s.b, kQueueAttr + 4, 1); // SYS_PPU_QUEUE
+    ps_write64(s.b, kQueueAttr + 8, 0);
+    REQUIRE(lv2::sys_event_queue_create(s.t, kQueue, kQueueAttr, 0, 1) == lv2::CELL_OK); // room for one event
+    const u32 queue = ps_read32(s.b, kQueue);
+    REQUIRE(lv2::sys_spu_thread_connect_event(s.t, thread, queue, SYS_SPU_THREAD_EVENT_USER, 5) == lv2::CELL_OK);
+
+    // The SPU thread's warning about the full queue: the test thread hears of it and has up to 300 ms to reply. The
+    // sink only waits on atomics (it runs on the SPU's thread, where Catch2's checks are not allowed, D-571).
+    struct Hold {
+        std::atomic<bool> warned{false}, replied{false};
+    } hold;
+    log::set_sink(
+        [](void* user, log::Level, std::string_view channel, std::string_view message) {
+            auto* h = static_cast<Hold*>(user);
+            if (channel != "spu" || message.find("send event on port 5:") == std::string_view::npos) return;
+            h->warned = true;
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+            while (!h->replied && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        },
+        &hold);
+    REQUIRE(lv2::sys_spu_thread_group_start(s.t, group) == lv2::CELL_OK);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!hold.warned && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool warned = hold.warned;
+    const lv2::Result received = warned ? lv2::sys_event_queue_receive(s.t, queue, 0, 2'000'000) : lv2::CELL_OK;
+    const u64 data = s.g.ctx.gpr[7];
+    const lv2::Result replied = warned ? lv2::sys_spu_thread_write_spu_mb(s.t, thread, 0x1234) : lv2::CELL_OK;
+    hold.replied = true;
+    s.join(group);
+    log::set_sink(nullptr, nullptr);
+    REQUIRE(warned);
+    CHECK(received == lv2::CELL_OK);
+    CHECK(data == 0xA); // the first event
+    CHECK(replied == lv2::CELL_OK);
+    CHECK(ps_read32(s.b, kOut + 0x00) == 0);                                           // the first send: CELL_OK
+    CHECK(ps_read32(s.b, kOut + 0x10) == static_cast<u32>(lv2::err(lv2::CELL_EBUSY))); // the second: the queue is full
+    CHECK(ps_read32(s.b, kOut + 0x20) == 0x1234);                                      // then the reply
 }
 
 TEST_CASE("SPU thread groups: event flag bits, signal notification OR mode, local store access, the run event",
