@@ -154,8 +154,7 @@ struct SdataOptions {
 
 // `plain` as an SDATA file, encrypted, hashed and laid out the way recomp::NpdFile reads Sony's (RPCS3 unedat.cpp
 // in reverse), with `keys`. A compressed file (kNpdCompressedFlag) holds its blocks in the decoder's plain form (a
-// byte above 0x80, the length, the bytes), every other block marked compressed. Empty on platforms without
-// CommonCrypto.
+// byte above 0x80, the length, the bytes), every other block marked compressed.
 std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const SdataOptions& options = {});
 
 } // namespace pspocket::test

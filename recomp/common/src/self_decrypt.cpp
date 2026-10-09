@@ -4,11 +4,9 @@
 #include <cstring>
 
 #include "pspocket/recomp/bytes.hpp"
+#include "pspocket/recomp/crypto.hpp"
 #include "pspocket/recomp/sce.hpp"
 
-#if defined(__APPLE__)
-#include <CommonCrypto/CommonCryptor.h>
-#endif
 #if __has_include(<zlib.h>)
 #define PSPOCKET_SELF_ZLIB 1
 #include <zlib.h>
@@ -18,10 +16,9 @@ namespace pspocket::recomp {
 
 namespace {
 
-// Used only where CommonCrypto decrypts (Apple platforms).
-[[maybe_unused]] constexpr usize kMetadataInfoSize = 0x40; // key, key pad, IV, IV pad
-[[maybe_unused]] constexpr usize kMetadataHeaderSize = 0x20;
-[[maybe_unused]] constexpr usize kMetadataSectionSize = 0x30;
+constexpr usize kMetadataInfoSize = 0x40; // key, key pad, IV, IV pad
+constexpr usize kMetadataHeaderSize = 0x20;
+constexpr usize kMetadataSectionSize = 0x30;
 
 struct MetadataSection {
     u64 offset = 0;
@@ -34,30 +31,18 @@ struct MetadataSection {
     u32 compressed = 0;  // 2: zlib
 };
 
-#if defined(__APPLE__)
 bool aes256_cbc_decrypt(const u8* key, const u8* iv, const u8* in, usize size, u8* out)
 {
-    usize moved = 0;
-    return CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, key, 32, iv, in, size, out, size, &moved) == kCCSuccess &&
-        moved == size;
+    return crypto::aes_cbc_decrypt(std::span<const u8>(key, 32), iv, in, size, out);
 }
 
 // The 128-bit counter counts big-endian (mbedtls aes_crypt_ctr, as RPCS3 uses it).
 bool aes128_ctr(const u8* key, const u8* iv, const u8* in, usize size, u8* out)
 {
-    CCCryptorRef c = nullptr;
-    if (CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR, kCCAlgorithmAES, ccNoPadding, iv, key, 16, nullptr, 0, 0,
-            kCCModeOptionCTR_BE, &c) != kCCSuccess) {
-        return false;
-    }
-    usize moved = 0;
-    const bool ok = CCCryptorUpdate(c, in, size, out, size, &moved) == kCCSuccess && moved == size;
-    CCCryptorRelease(c);
-    return ok;
+    return crypto::aes_ctr(std::span<const u8>(key, 16), iv, in, size, out);
 }
-#endif
 
-[[maybe_unused]] void put(std::vector<u8>& out, u64 offset, std::span<const u8> bytes)
+void put(std::vector<u8>& out, u64 offset, std::span<const u8> bytes)
 {
     if (out.size() < offset + bytes.size()) out.resize(static_cast<usize>(offset + bytes.size()));
     std::copy(bytes.begin(), bytes.end(), out.begin() + static_cast<std::ptrdiff_t>(offset));
@@ -110,9 +95,6 @@ Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const S
         return make_error("no key for a {} executable of key revision {:#x}", self_type_name(info.app->self_type),
             info.sce.key_revision);
     }
-#if !defined(__APPLE__)
-    return make_error("decrypting needs CommonCrypto (Apple platforms only)");
-#else
     // Metadata info, right after the SCE header at the metadata offset: AES-256-CBC with the key (LoadMetadata).
     const ByteReader r(self);
     const u64 info_offset = u64{info.sce.metadata_offset} + 0x20;
@@ -207,7 +189,6 @@ Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const S
         put(elf, eh.shoff, self.subspan(static_cast<usize>(info.ext->shdr_offset), static_cast<usize>(size)));
     }
     return elf;
-#endif
 }
 
 Result<std::vector<std::vector<u8>>> decrypt_sce_package(std::span<const u8> package, const PackageKey& key)
@@ -215,9 +196,6 @@ Result<std::vector<std::vector<u8>>> decrypt_sce_package(std::span<const u8> pac
     const ByteReader r(package);
     if (!r.in_bounds(0, 0x20) || *r.be32(0) != 0x53434500u) return make_error("not an SCE package");
     if (!key.present) return make_error("this build carries no package key (scripts/self-keys.py had no RPCS3 source)");
-#if !defined(__APPLE__)
-    return make_error("decrypting needs CommonCrypto (Apple platforms only)");
-#else
     const u16 flags = *r.be16(0x08);
     const u32 metadata_offset = *r.be32(0x0C);
     const u64 header_size = *r.be64(0x10);
@@ -295,7 +273,6 @@ Result<std::vector<std::vector<u8>>> decrypt_sce_package(std::span<const u8> pac
         }
     }
     return out;
-#endif
 }
 
 } // namespace pspocket::recomp

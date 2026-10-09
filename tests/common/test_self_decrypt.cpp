@@ -5,12 +5,12 @@
 #include <catch_amalgamated.hpp>
 
 #include "pspocket/core/be.h"
+#include "pspocket/recomp/crypto.hpp"
 #include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 #include "synthetic.hpp"
 
-#if defined(__APPLE__) && __has_include(<zlib.h>)
-#include <CommonCrypto/CommonCryptor.h>
+#if __has_include(<zlib.h>)
 #include <zlib.h>
 
 using namespace pspocket;
@@ -29,12 +29,7 @@ std::array<u8, N> made_up(u8 seed)
 
 void aes128_ctr(const u8* key, const u8* iv, u8* data, usize size)
 {
-    CCCryptorRef c = nullptr;
-    REQUIRE(CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR, kCCAlgorithmAES, ccNoPadding, iv, key, 16, nullptr, 0, 0,
-                kCCModeOptionCTR_BE, &c) == kCCSuccess);
-    usize moved = 0;
-    REQUIRE(CCCryptorUpdate(c, data, size, data, size, &moved) == kCCSuccess);
-    CCCryptorRelease(c);
+    REQUIRE(crypto::aes_ctr(std::span<const u8>(key, 16), iv, data, size, data));
 }
 
 void put32(std::vector<u8>& b, usize at, u32 v) { ps_st32(b.data() + at, v); }
@@ -75,9 +70,7 @@ Encrypted encrypted_self(const SelfKey& key, u16 revision)
     const auto meta_key = made_up<16>(0x51), meta_iv = made_up<16>(0x62);
     std::copy(meta_key.begin(), meta_key.end(), s.begin() + static_cast<std::ptrdiff_t>(meta));
     std::copy(meta_iv.begin(), meta_iv.end(), s.begin() + static_cast<std::ptrdiff_t>(meta + 0x20));
-    usize moved = 0;
-    REQUIRE(CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0, key.erk.data(), 32, key.riv.data(), s.data() + meta, 0x40,
-                s.data() + meta, 0x40, &moved) == kCCSuccess);
+    REQUIRE(crypto::aes_cbc_encrypt(key.erk, key.riv.data(), s.data() + meta, 0x40, s.data() + meta));
 
     // Metadata header, section headers, data keys; then each segment, compressed and encrypted.
     const usize head = meta + 0x40;

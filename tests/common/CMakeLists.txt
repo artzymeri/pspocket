@@ -8,6 +8,7 @@ pspocket_set_warnings(pspocket_test_synthetic)
 
 pspocket_add_test(test_recomp_common
     SOURCES
+        test_crypto.cpp
         test_hash.cpp
         test_nid.cpp
         test_toml_manifest.cpp

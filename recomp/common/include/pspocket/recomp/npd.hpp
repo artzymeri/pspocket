@@ -97,8 +97,8 @@ private:
     mutable std::vector<u8> cached_;
 };
 
-// AES-CMAC (RFC 4493), as RPCS3 aes.cpp aes_cmac: the hash of the blocks of files without flag 0x10. False when the
-// platform has no AES (only Apple's CommonCrypto is used).
+// AES-CMAC (RFC 4493), as RPCS3 aes.cpp aes_cmac: the hash of the blocks of files without flag 0x10
+// (crypto::aes_cmac with a 16-byte key).
 bool npd_aes_cmac(const u8* key, const u8* in, usize size, u8* out);
 
 // RPCS3 lz.cpp decompress: one compressed block (`in`, `in_size` bytes) into at most `size` bytes of `out`. The

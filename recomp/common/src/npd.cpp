@@ -4,11 +4,7 @@
 #include <cstring>
 
 #include "pspocket/core/be.h"
-
-#if defined(__APPLE__)
-#include <CommonCrypto/CommonCryptor.h>
-#include <CommonCrypto/CommonHMAC.h>
-#endif
+#include "pspocket/recomp/crypto.hpp"
 
 namespace pspocket::recomp {
 
@@ -17,76 +13,16 @@ namespace {
 constexpr u64 kHeaderSize = 0x100;   // NPD header, EDAT header, the header's own hashes
 constexpr u64 kMetadataOffset = 0x100;
 
-#if defined(__APPLE__)
-
-bool aes128_ecb_encrypt(const u8* key, const u8* in, u8* out)
-{
-    usize moved = 0;
-    return CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode, key, 16, nullptr, in, 16, out, 16, &moved) ==
-               kCCSuccess &&
-        moved == 16;
-}
-
-bool aes128_cbc(CCOperation op, const u8* key, const u8* iv, const u8* in, usize size, u8* out)
-{
-    usize moved = 0;
-    return CCCrypt(op, kCCAlgorithmAES, 0, key, 16, iv, in, size, out, size, &moved) == kCCSuccess && moved == size;
-}
-
-// RPCS3 aes.cpp aes_cmac (RFC 4493). The chain over all but the last block is one CBC encryption.
-bool aes_cmac(const u8* key, const u8* in, usize size, u8* out)
-{
-    u8 l[16]{}, k1[16], k2[16];
-    const u8 zero[16]{};
-    if (!aes128_ecb_encrypt(key, zero, l)) return false;
-    auto shift = [](const u8* from, u8* to) {
-        for (int i = 0; i < 16; i++) to[i] = static_cast<u8>((from[i] << 1) | (i < 15 ? from[i + 1] >> 7 : 0));
-        if (from[0] & 0x80) to[15] ^= 0x87;
-    };
-    shift(l, k1);
-    shift(k1, k2);
-    usize n = (size + 15) / 16;
-    bool whole = false;
-    if (n == 0) n = 1;
-    else whole = size % 16 == 0;
-    u8 last[16]{};
-    const u8* tail = in + 16 * (n - 1);
-    if (whole) {
-        for (int i = 0; i < 16; i++) last[i] = static_cast<u8>(tail[i] ^ k1[i]);
-    } else {
-        const usize rest = size % 16;
-        for (usize i = 0; i < 16; i++) last[i] = static_cast<u8>((i < rest ? tail[i] : i == rest ? 0x80 : 0) ^ k2[i]);
-    }
-    u8 x[16]{};
-    if (n > 1) {
-        std::vector<u8> chain(16 * (n - 1));
-        if (!aes128_cbc(kCCEncrypt, key, zero, in, chain.size(), chain.data())) return false;
-        std::memcpy(x, chain.data() + chain.size() - 16, 16);
-    }
-    for (int i = 0; i < 16; i++) x[i] ^= last[i];
-    return aes128_ecb_encrypt(key, x, out);
-}
-
-void hmac_sha1(const u8* key, usize key_size, const u8* in, usize size, u8 (&out)[CC_SHA1_DIGEST_LENGTH])
-{
-    CCHmac(kCCHmacAlgSHA1, key, key_size, in, size, out);
-}
-
-#endif
+std::span<const u8> key16(const u8* key) { return std::span<const u8>(key, 16); }
 
 // RPCS3 generate_key / generate_hash: the mode's top nibble says whether the block's key (or hash key) is used as
 // it is (0), decrypted with EDAT_KEY and EDAT_IV (1), or replaced by EDAT_KEY/EDAT_IV (EDAT_HASH) (2).
-[[maybe_unused]] bool final_key(
-    const NpdKeys& k, u32 mode, bool v4, const u8* key, const u8* iv, u8* key_out, u8* iv_out)
+bool final_key(const NpdKeys& k, u32 mode, bool v4, const u8* key, const u8* iv, u8* key_out, u8* iv_out)
 {
     const u8* edat_key = v4 ? k.edat_key1.data() : k.edat_key0.data();
     switch (mode & 0xF0000000u) {
     case 0x10000000u:
-#if defined(__APPLE__)
-        if (!aes128_cbc(kCCDecrypt, edat_key, k.edat_iv.data(), key, 16, key_out)) return false;
-#else
-        return false;
-#endif
+        if (!crypto::aes_cbc_decrypt(key16(edat_key), k.edat_iv.data(), key, 16, key_out)) return false;
         std::memcpy(iv_out, iv, 16);
         return true;
     case 0x20000000u:
@@ -100,15 +36,12 @@ void hmac_sha1(const u8* key, usize key_size, const u8* in, usize size, u8 (&out
     }
 }
 
-[[maybe_unused]] bool final_hash(const NpdKeys& k, u32 mode, bool v4, const u8* hash, u8* out)
+bool final_hash(const NpdKeys& k, u32 mode, bool v4, const u8* hash, u8* out)
 {
     switch (mode & 0xF0000000u) {
     case 0x10000000u:
-#if defined(__APPLE__)
-        return aes128_cbc(kCCDecrypt, v4 ? k.edat_key1.data() : k.edat_key0.data(), k.edat_iv.data(), hash, 16, out);
-#else
-        return false;
-#endif
+        return crypto::aes_cbc_decrypt(key16(v4 ? k.edat_key1.data() : k.edat_key0.data()), k.edat_iv.data(), hash,
+            16, out);
     case 0x20000000u: std::memcpy(out, v4 ? k.edat_hash1.data() : k.edat_hash0.data(), 16); return true;
     default: std::memcpy(out, hash, 16); return true;
     }
@@ -119,7 +52,6 @@ void hmac_sha1(const u8* key, usize key_size, const u8* in, usize size, u8 (&out
 bool decrypt(const NpdKeys& k, u32 hash_mode, u32 crypto_mode, bool v4, const u8* in, u8* out, usize size,
     const u8* key, const u8* iv, const u8* hash, const u8* expected, std::string& error)
 {
-#if defined(__APPLE__)
     u8 key_final[16]{}, iv_final[16]{}, hash_final[0x14]{};
     if (!final_key(k, crypto_mode, v4, key, iv, key_final, iv_final) || !final_hash(k, hash_mode, v4, hash, hash_final)) {
         error = "decrypting the block's key failed";
@@ -128,7 +60,7 @@ bool decrypt(const NpdKeys& k, u32 hash_mode, u32 crypto_mode, bool v4, const u8
     switch (crypto_mode & 0xFF) {
     case 1: std::memcpy(out, in, size); break;
     case 2:
-        if (!aes128_cbc(kCCDecrypt, key_final, iv_final, in, size, out)) {
+        if (!crypto::aes_cbc_decrypt(key16(key_final), iv_final, in, size, out)) {
             error = "AES-128-CBC failed";
             return false;
         }
@@ -137,14 +69,14 @@ bool decrypt(const NpdKeys& k, u32 hash_mode, u32 crypto_mode, bool v4, const u8
     }
     switch (hash_mode & 0xFF) {
     case 1: {
-        u8 mac[CC_SHA1_DIGEST_LENGTH];
-        hmac_sha1(hash_final, 0x14, in, size, mac);
+        u8 mac[20];
+        crypto::hmac_sha1(std::span<const u8>(hash_final, 0x14), in, size, mac);
         if (std::memcmp(mac, expected, 0x14) == 0) return true;
         break;
     }
     case 2: {
         u8 mac[16];
-        if (!aes_cmac(hash_final, in, size, mac)) {
+        if (!crypto::aes_cmac(key16(hash_final), in, size, mac)) {
             error = "AES-CMAC failed";
             return false;
         }
@@ -152,8 +84,8 @@ bool decrypt(const NpdKeys& k, u32 hash_mode, u32 crypto_mode, bool v4, const u8
         break;
     }
     case 4: {
-        u8 mac[CC_SHA1_DIGEST_LENGTH];
-        hmac_sha1(hash_final, 0x10, in, size, mac);
+        u8 mac[20];
+        crypto::hmac_sha1(std::span<const u8>(hash_final, 0x10), in, size, mac);
         if (std::memcmp(mac, expected, 0x10) == 0) return true;
         break;
     }
@@ -161,12 +93,6 @@ bool decrypt(const NpdKeys& k, u32 hash_mode, u32 crypto_mode, bool v4, const u8
     }
     error = "the block's hash does not match (wrong keys, or a damaged file)";
     return false;
-#else
-    (void)k, (void)hash_mode, (void)crypto_mode, (void)v4, (void)in, (void)out, (void)size, (void)key, (void)iv,
-        (void)hash, (void)expected;
-    error = "NPD files are only decrypted on Apple platforms (CommonCrypto)";
-    return false;
-#endif
 }
 
 // RPCS3 dec_section: a compressed block's metadata (NPD version 2 and later) hides its offset, length and
@@ -278,12 +204,7 @@ u32 decode_word(u8* ptr, int index, int* bit_flag, u32* range, u32* code, LzInpu
 
 bool npd_aes_cmac(const u8* key, const u8* in, usize size, u8* out)
 {
-#if defined(__APPLE__)
-    return aes_cmac(key, in, size, out);
-#else
-    (void)key, (void)in, (void)size, (void)out;
-    return false;
-#endif
+    return crypto::aes_cmac(key16(key), in, size, out);
 }
 
 int npd_decompress(u8* out, const u8* in_bytes, usize in_size, u32 size)
@@ -487,16 +408,11 @@ s64 NpdFile::decrypt_block(u32 block, std::vector<u8>& out, std::string& error) 
     if (n.version > 1) std::memcpy(block_key, n.dev_hash.data(), 12);
     ps_st32(block_key + 12, block);
     u8 key_result[16]{}, hash_key[16]{};
-#if defined(__APPLE__)
-    if (!aes128_ecb_encrypt(key_.data(), block_key, key_result) ||
-        ((n.flags & kNpdFlag10) && !aes128_ecb_encrypt(key_.data(), key_result, hash_key))) {
+    if (!crypto::aes_ecb_encrypt(key_, block_key, 16, key_result) ||
+        ((n.flags & kNpdFlag10) && !crypto::aes_ecb_encrypt(key_, key_result, 16, hash_key))) {
         error = "AES-128-ECB failed";
         return -1;
     }
-#else
-    error = "NPD files are only decrypted on Apple platforms (CommonCrypto)";
-    return -1;
-#endif
     if (!(n.flags & kNpdFlag10)) std::memcpy(hash_key, key_result, 16);
 
     u32 crypto_mode = (n.flags & kNpdFlag02) == 0 ? 0x2 : 0x1;

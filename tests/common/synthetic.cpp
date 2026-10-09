@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "pspocket/core/be.h"
+#include "pspocket/recomp/crypto.hpp"
 #include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::test {
@@ -883,16 +884,10 @@ std::vector<u8> wrap_in_self(std::span<const u8> elf, const SelfOptions& o)
 
 // ---- SDATA file ----
 
-#if defined(__APPLE__)
-#include <CommonCrypto/CommonCryptor.h>
-#include <CommonCrypto/CommonHMAC.h>
-#endif
-
 namespace pspocket::test {
 
 std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const SdataOptions& options)
 {
-#if defined(__APPLE__)
     using namespace recomp;
     const u32 flags = kNpdSdatFlag | options.extra_flags;
     const u32 bs = options.block_size;
@@ -925,13 +920,11 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
 
     u8 key[16];
     for (int i = 0; i < 16; i++) key[i] = static_cast<u8>(dev_hash[i] ^ keys.sdat[i]);
-    auto ecb = [](const u8* k, const u8* in, u8* out) {
-        usize moved = 0;
-        CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode, k, 16, nullptr, in, 16, out, 16, &moved);
-    };
-    auto cbc = [](CCOperation op, const u8* k, const u8* iv, const u8* in, usize n, u8* out) {
-        usize moved = 0;
-        CCCrypt(op, kCCAlgorithmAES, 0, k, 16, iv, in, n, out, n, &moved);
+    auto ecb = [](const u8* k, const u8* in, u8* out) { crypto::aes_ecb_encrypt(std::span<const u8>(k, 16), in, 16, out); };
+    enum Op { kEncrypt, kDecrypt };
+    auto cbc = [](Op op, const u8* k, const u8* iv, const u8* in, usize n, u8* out) {
+        if (op == kEncrypt) crypto::aes_cbc_encrypt(std::span<const u8>(k, 16), iv, in, n, out);
+        else crypto::aes_cbc_decrypt(std::span<const u8>(k, 16), iv, in, n, out);
     };
     const u8 zero_iv[16]{};
     const u8* iv = options.version <= 1 ? zero_iv : digest;
@@ -963,22 +956,22 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
         else std::copy(key_result, key_result + 16, hash_key);
         u8 key_final[16], hash_final[0x14]{};
         if (flags & kNpdEncryptedKeyFlag) {
-            cbc(kCCDecrypt, edat_key, keys.edat_iv.data(), key_result, 16, key_final);
-            cbc(kCCDecrypt, edat_key, keys.edat_iv.data(), hash_key, 16, hash_final);
+            cbc(kDecrypt, edat_key, keys.edat_iv.data(), key_result, 16, key_final);
+            cbc(kDecrypt, edat_key, keys.edat_iv.data(), hash_key, 16, hash_final);
         } else {
             std::copy(key_result, key_result + 16, key_final);
             std::copy(hash_key, hash_key + 16, hash_final);
         }
         std::vector<u8> enc(payload.size());
         if ((flags & kNpdDebugDataFlag) || (flags & kNpdFlag02)) enc = payload;
-        else cbc(kCCEncrypt, key_final, iv, payload.data(), payload.size(), enc.data());
+        else cbc(kEncrypt, key_final, iv, payload.data(), payload.size(), enc.data());
         u8 hash[0x14]{};
         if (!(flags & kNpdDebugDataFlag)) {
             if (!flag10) {
                 npd_aes_cmac(hash_final, enc.data(), enc.size(), hash);
             } else {
-                u8 mac[CC_SHA1_DIGEST_LENGTH];
-                CCHmac(kCCHmacAlgSHA1, hash_final, flag20 ? 0x14 : 0x10, enc.data(), enc.size(), mac);
+                u8 mac[20];
+                crypto::hmac_sha1(std::span<const u8>(hash_final, flag20 ? 0x14 : 0x10), enc.data(), enc.size(), mac);
                 std::copy(mac, mac + (flag20 ? 0x14 : 0x10), hash);
             }
         }
@@ -1017,10 +1010,6 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
         }
     }
     return std::move(b.bytes);
-#else
-    (void)plain, (void)keys, (void)options;
-    return {};
-#endif
 }
 
 } // namespace pspocket::test

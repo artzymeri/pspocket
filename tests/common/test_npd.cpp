@@ -10,8 +10,6 @@
 #include "pspocket/recomp/npd.hpp"
 #include "synthetic.hpp"
 
-#if defined(__APPLE__)
-
 using namespace pspocket;
 using namespace pspocket::recomp;
 
@@ -220,5 +218,3 @@ TEST_CASE("npd_decompress: the plain form, and damaged input never writes past i
         CHECK(std::all_of(buffer.begin() + 256, buffer.end(), [](u8 b) { return b == 0xEE; }));
     }
 }
-
-#endif

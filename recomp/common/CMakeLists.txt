@@ -42,6 +42,7 @@ find_package(ZLIB)
 
 add_library(pspocket_recomp_common STATIC
     src/bytes.cpp
+    src/crypto.cpp
     src/elf.cpp
     src/guest_image.cpp
     src/hash.cpp
