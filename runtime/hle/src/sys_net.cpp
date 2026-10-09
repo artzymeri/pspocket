@@ -1507,7 +1507,7 @@ s32 sys_net_show_ifconfig(PPUContext& ctx)
 
 // The context's report of netset.c's last failure (sys_netset_get_status reads it): +2904 what failed, +2908..+2916 its
 // arguments, +2920 libnet's source line.
-constexpr u32 kCtxSetError = 2904, kCtxSetArg1 = 2908, kCtxSetLine = 2920;
+constexpr u32 kCtxSetError = 2904, kCtxSetArg1 = 2908, kCtxSetArg2 = 2912, kCtxSetArg3 = 2916, kCtxSetLine = 2920;
 
 void set_report(PPUContext& ctx, u32 error, u32 line)
 {
@@ -1840,6 +1840,578 @@ s32 sys_net_show_nameserver(PPUContext& ctx)
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------- routes
+
+// netset.c's helpers around libnet's own calls, each noting its failure in the context.
+
+// libnet f_17d38: socket(), a failure noted (45, line 82, the arguments).
+s32 netset_socket(PPUContext& ctx, s32 family, s32 type, s32 protocol)
+{
+    const s32 so = socket(ctx, family, type, protocol);
+    if (so < 0) {
+        u8* b = gb(ctx);
+        set_report(ctx, 45, 82);
+        w32(b, context(ctx) + kCtxSetArg1, static_cast<u32>(family));
+        w32(b, context(ctx) + kCtxSetArg2, static_cast<u32>(type));
+        w32(b, context(ctx) + kCtxSetArg3, static_cast<u32>(protocol));
+    }
+    return so;
+}
+
+// libnet f_17e00: _sys_net_lib_sysctl(mib, 6, old, oldlenp, 0, 0), a failure noted (46, line 129, mib[0], mib[1],
+// mib[4]).
+s32 netset_sysctl(PPUContext& ctx, u32 mib, u32 old, u32 oldlenp)
+{
+    const s32 r = _sys_net_lib_sysctl(ctx, mib, 6, old, oldlenp, 0, 0);
+    if (r < 0) {
+        u8* b = gb(ctx);
+        set_report(ctx, 46, 129);
+        w32(b, context(ctx) + kCtxSetArg1, r32(b, mib));
+        w32(b, context(ctx) + kCtxSetArg2, r32(b, mib + 4));
+        w32(b, context(ctx) + kCtxSetArg3, r32(b, mib + 16));
+    }
+    return r;
+}
+
+// libnet f_199b0: _sys_net_lib_ioctl, a failure noted (42, line 94, the command and its high half).
+s32 netset_ioctl(PPUContext& ctx, s32 so, u32 cmd, u32 arg)
+{
+    const s32 r = _sys_net_lib_ioctl(ctx, so, cmd, arg);
+    if (r < 0) {
+        u8* b = gb(ctx);
+        set_report(ctx, 42, 94);
+        w32(b, context(ctx) + kCtxSetArg1, cmd);
+        w32(b, context(ctx) + kCtxSetArg2, cmd >> 16);
+    }
+    return r;
+}
+
+// The routing table's dump request: {CTL_NET, PF_ROUTE, 0, 0, NET_RT_DUMP, 0}, its length word before it.
+struct RouteDump {
+    StackVar v;
+    u32 len, mib;
+    RouteDump(PPUContext& ctx, u8* b) : v(ctx, b, 0x20), len(v.addr()), mib(v.addr() + 4)
+    {
+        const u32 words[6] = {4, 17, 0, 0, 1, 0};
+        for (u32 i = 0; i < 6; i++) w32(b, mib + 4 * i, words[i]);
+    }
+};
+
+// What lv2 would have to list for these paths to go on: with no link it has no route (D-523).
+[[noreturn]] void routes_listed(std::string_view fn)
+{
+    PS_FATAL(kChan, "{}: lv2 listed routes; with no link it has none (D-523, D-539)", fn);
+}
+
+// libnet f_17eb4: every route deleted: each message of the routing table's dump sent back on a routing socket as
+// RTM_DELETE with the next sequence number. 0, or -1 (the socket, lv2's dump or the pool refused; the length sent when
+// a send falls short).
+s32 flush_routes(PPUContext& ctx)
+{
+    u8* b = gb(ctx);
+    const s32 fd = netset_socket(ctx, 17, 3, 0);
+    if (fd < 0) return -1;
+    RouteDump d(ctx, b);
+    if (netset_sysctl(ctx, d.mib, 0, d.len) < 0) {
+        socketclose(ctx, fd);
+        return -1;
+    }
+    const u32 buf = netset_malloc(ctx, r32(b, d.len), 0x181);
+    if (!buf) {
+        socketclose(ctx, fd);
+        return -1;
+    }
+    s32 r = -1;
+    if (netset_sysctl(ctx, d.mib, buf, d.len) >= 0) {
+        r = 0;
+        const u32 end = buf + r32(b, d.len);
+        for (u32 m = buf; m < end;) {
+            const u32 size = ps_read16(b, m);
+            if (!size) routes_listed("_sce_net_flush_route");
+            b[m + 3] = 2; // RTM_DELETE
+            w32(b, m + 20, ++libnet().route_seq);
+            const s32 sent = send(ctx, fd, m, size, 0);
+            if (sent < static_cast<s32>(size)) {
+                r = sent;
+                break;
+            }
+            m += size;
+        }
+    }
+    net_free(ctx, buf);
+    socketclose(ctx, fd);
+    return r;
+}
+
+s32 _sce_net_flush_route(PPUContext& ctx)
+{
+    flush_routes(ctx);
+    return 0;
+}
+
+// sys_net_get_routing_table_af(af, sys_net_route_t* out, n): the routes of family af (0: all), up to n written (212
+// bytes each) or, with no out, counted; -errno when lv2's dump or the pool refuses (libnet keeps the buffer when the
+// second dump fails). With no link lv2 lists none: 0.
+s32 sys_net_get_routing_table_af(PPUContext& ctx, s32, u32, s32)
+{
+    u8* b = gb(ctx);
+    RouteDump d(ctx, b);
+    const auto fail = [&]() { return -static_cast<s32>(r32(b, context(ctx) + kCtxErrno)); };
+    if (netset_sysctl(ctx, d.mib, 0, d.len) < 0) return fail();
+    const u32 buf = netset_malloc(ctx, r32(b, d.len), 2303);
+    if (!buf) return fail();
+    if (netset_sysctl(ctx, d.mib, buf, d.len) < 0) return fail();
+    if (r32(b, d.len)) routes_listed("sys_net_get_routing_table_af");
+    net_free(ctx, buf);
+    return 0;
+}
+
+// sys_net_show_route(): the IPv4 routes (up to 10) on the TTY; with none, the count.
+s32 sys_net_show_route(PPUContext& ctx)
+{
+    StackVar table(ctx, gb(ctx), 2128);
+    const s32 count = sys_net_get_routing_table_af(ctx, 2, table.addr(), 10);
+    if (count < 1) {
+        tty_print(ctx, std::format("route: No routing table ({})\n", count));
+        return 0;
+    }
+    routes_listed("sys_net_show_route");
+}
+
+// libnet f_181d8: a sockaddr_in (16 bytes) for the address text at `text` (guest): "default" 0.0.0.0,
+// "255.255.255.255" and "0xffffffff" all ones, else inet_addr's; 0.0.0.1 stands for the address text at `extra` (when
+// given). -1 (noted: 1, line 217; errno EINVAL) for a text that is no address.
+s32 route_address(PPUContext& ctx, u32 sa, u32 text, u32 extra)
+{
+    u8* b = gb(ctx);
+    std::memset(b + sa, 0, 16);
+    b[sa] = 16;
+    b[sa + 1] = 2;
+    const std::string t = guest_str(ctx, text, "route address").value_or("");
+    if (t == "default") return 0;
+    if (t == "255.255.255.255" || t == "0xffffffff") {
+        w32(b, sa + 4, 0xFFFFFFFF);
+        return 0;
+    }
+    u32 a = inet_addr(ctx, text);
+    w32(b, sa + 4, a);
+    if (a == 1) {
+        if (!extra) return 0;
+        a = inet_addr(ctx, extra);
+        w32(b, sa + 4, a);
+    }
+    if (r32(b, sa + 4) != 0xFFFFFFFF) return 0;
+    set_report(ctx, 1, 217);
+    set_errno(ctx, SYS_NET_EINVAL);
+    return -1;
+}
+
+// libnet f_18364: the word at t[at] (up to 100 characters, ended by white space) as an IPv4 address into `sa`, through a
+// 100-byte pool buffer: the characters taken (the word and the space after it), or -1 (a word the end of the text
+// ends, an address it is not, or a word longer than 100 characters: noted 1, line 237, errno EINVAL).
+s32 route_word(PPUContext& ctx, u32 sa, const std::string& t, usize at, u32 extra)
+{
+    u8* b = gb(ctx);
+    const u32 word = netset_malloc(ctx, 100, 0xE6);
+    if (!word) return -1;
+    const auto ch = [&](usize i) { return i < t.size() ? static_cast<u8>(t[i]) : u8{0}; };
+    u32 n = 0;
+    u8 next = 0;
+    bool space = false;
+    for (; n < 100; n++) {
+        const u8 c = ch(at + n);
+        if (c == 0) break;
+        if (is_space(c)) {
+            space = true;
+            break;
+        }
+        b[word + n] = c;
+    }
+    if (!space && n == 100) {
+        next = ch(at + 100);
+        space = is_space(next);
+    }
+    if (!space) {
+        if (next != 0) {
+            set_report(ctx, 1, 0xED);
+            set_errno(ctx, SYS_NET_EINVAL);
+        }
+        net_free(ctx, word);
+        return -1;
+    }
+    b[word + n] = 0; // (at n == 100, one byte past libnet's buffer, as libnet writes it)
+    const s32 r = route_address(ctx, sa, word, extra);
+    net_free(ctx, word);
+    return r < 0 ? -1 : static_cast<s32>(n) + 1;
+}
+
+// netset.c's route command interpreter (libnet f_19010): each "route ..." line of `text` (other lines are skipped):
+// "route add ...", "route del ...", "route flushall" (flush_routes), or "route ..." (an add). Its words, in any order:
+// "-net " (not a host route), "-host ", "-inet ", "gw <address>", "netmask <address>", "-prefixlen <bits>" (0..32), and
+// addresses taken as the destination, the gateway and the netmask in that order (no netmask: 0.0.0.0). Then a routing
+// message (version 3, RTM_ADD or RTM_DELETE, flags UP|STATIC, REJECT with `reject`, HOST, GATEWAY with a gateway, the
+// next sequence number, the destination, gateway and netmask it has, each rounded to 8 bytes) goes to a routing socket.
+// A word it cannot take abandons the line. The three addresses live in an 84-byte pool area for the whole text. 0, or -1
+// when the pool refuses that area.
+s32 route_command(PPUContext& ctx, u32 text, s32 reject, u32 extra)
+{
+    u8* b = gb(ctx);
+    const u32 work = netset_malloc(ctx, 84, 418);
+    if (!work) return -1;
+    const u32 dst = work, gw = work + 28, mask = work + 56;
+    const std::string t = text ? guest_str(ctx, text, "route command").value_or("") : std::string();
+    usize p = 0;
+    const auto at = [&](usize i) { return i < t.size() ? static_cast<u8>(t[i]) : u8{0}; };
+    const auto starts = [&](usize i, std::string_view w) { return i <= t.size() && t.compare(i, w.size(), w) == 0; };
+    const auto skip_line = [&]() {
+        while (at(p) != 0 && at(p) != '\n') p++;
+        if (at(p) == '\n') p++;
+    };
+    while (at(p) != 0) {
+        if (!starts(p, "route ")) {
+            skip_line();
+            continue;
+        }
+        p += 6;
+        u32 flags = 0; // bit 0 delete, 1 host, 2 destination, 3 gateway, 4 netmask
+        if (starts(p, "add ")) {
+            p += 4;
+        } else if (starts(p, "del ")) {
+            p += 4;
+            flags = 1;
+        } else if (starts(p, "flushall")) {
+            flush_routes(ctx);
+            skip_line();
+            continue;
+        }
+        bool build = false;
+        for (;;) {
+            if (starts(p, "-net ")) {
+                while (starts(p, "-net ")) {
+                    p += 5;
+                    flags &= ~2u;
+                }
+                continue;
+            }
+            if (starts(p, "-host ")) {
+                p += 6;
+                flags |= 2;
+                continue;
+            }
+            if (starts(p, "-inet ")) {
+                p += 6;
+                continue;
+            }
+            if (starts(p, "gw ")) {
+                p += 3;
+                const s32 r = route_word(ctx, gw, t, p, extra);
+                if (r < 1) break;
+                p += static_cast<usize>(r);
+                flags |= 8;
+                continue;
+            }
+            if (starts(p, "netmask ")) {
+                p += 8;
+                const s32 r = route_word(ctx, mask, t, p, extra);
+                if (r < 1) break;
+                p += static_cast<usize>(r);
+                flags |= 0x10;
+                continue;
+            }
+            if (starts(p, "-prefixlen ")) {
+                const usize q = p + 11;
+                usize k = 0;
+                u32 bits = 0;
+                u8 c = at(q);
+                while (c != 0 && is_digit(c)) {
+                    bits = bits * 10 + c - '0';
+                    c = at(q + ++k);
+                }
+                if (!is_space(c)) {
+                    set_report(ctx, 3, 265);
+                    set_errno(ctx, SYS_NET_EINVAL);
+                    p = q;
+                    break;
+                }
+                std::memset(b + mask, 0, 28);
+                b[mask + 1] = 2;
+                b[mask] = 16;
+                p = q + k + 1;
+                s32 left = static_cast<s32>(bits);
+                if (left > 32) {
+                    set_report(ctx, 4, 284);
+                    set_errno(ctx, SYS_NET_EINVAL);
+                    break;
+                }
+                u32 m = mask + 4;
+                while (left > 7) {
+                    b[m++] = 0xFF;
+                    left -= 8;
+                }
+                if (left > 0) b[m] = static_cast<u8>(0xFF << (8 - left));
+                flags |= 0x10;
+                continue;
+            }
+            // An address: the destination, the gateway, the netmask, whichever is still missing.
+            if (!(flags & 4)) {
+                if (const s32 r = route_word(ctx, dst, t, p, extra); r > 0) {
+                    p += static_cast<usize>(r);
+                    flags |= 4;
+                    continue;
+                }
+            }
+            if (!(flags & 8)) {
+                if (const s32 r = route_word(ctx, gw, t, p, extra); r > 0) {
+                    p += static_cast<usize>(r);
+                    flags |= 8;
+                    continue;
+                }
+            }
+            if (!(flags & 0x10)) {
+                if (const s32 r = route_word(ctx, mask, t, p, extra); r > 0) {
+                    p += static_cast<usize>(r);
+                    flags |= 0x10;
+                    continue;
+                }
+                flags |= 0x10;
+                std::memset(b + mask, 0, 16);
+                b[mask] = 16;
+                b[mask + 1] = 2;
+            }
+            build = true;
+            break;
+        }
+        if (build) {
+            u32 rtflags = reject ? 0x809 : 0x801;
+            if (flags & 2) rtflags |= 4;
+            u32 addrs = (flags & 4) ? 1 : 0;
+            if (flags & 8) {
+                rtflags |= 2;
+                addrs |= 2;
+            }
+            if (flags & 0x10) addrs |= 4;
+            const s32 so = netset_socket(ctx, 17, 3, 0);
+            if (so >= 0) {
+                const u32 msg = netset_malloc(ctx, 632, 333);
+                if (msg) {
+                    std::memset(b + msg, 0, 632);
+                    b[msg + 2] = 3;
+                    b[msg + 3] = (flags & 1) ? 2 : 1;
+                    w32(b, msg + 8, rtflags);
+                    w32(b, msg + 20, ++libnet().route_seq);
+                    w32(b, msg + 12, addrs);
+                    u32 q = msg + 120;
+                    for (const auto& [bit, sa] : {std::pair{1u, dst}, std::pair{2u, gw}, std::pair{4u, mask}}) {
+                        if (!(addrs & bit)) continue;
+                        const u32 len = b[sa];
+                        const u32 size = len ? ((len - 1) | 7) + 1 : 8;
+                        std::memmove(b + q, b + sa, size);
+                        q += size;
+                    }
+                    const u32 total = q - msg;
+                    ps_write16(b, msg, static_cast<u16>(total));
+                    if (send(ctx, so, msg, total, 0) < 0) set_report(ctx, 44, 360);
+                }
+                net_free(ctx, msg);
+                socketclose(ctx, so);
+            }
+        }
+        skip_line();
+    }
+    net_free(ctx, work);
+    return 0;
+}
+
+// _sce_net_set_default_gateway(ifname, in_addr gateway, pppoe): "route add default gw <gateway>" (the interface is not
+// used; libnet names pppoe0 for a PPPoE link). Always 0.
+s32 _sce_net_set_default_gateway(PPUContext& ctx, u32, u32 gateway, s32 pppoe)
+{
+    const u32 text = add_line(ctx, 0, {"route", "add", "default", "gw", dotted(ctx, gateway)});
+    if (!text) log_call_site(ctx, gb(ctx), "_sce_net_set_default_gateway: no text (the pool refused it); libnet reads "
+                                           "address 0 here");
+    else route_command(ctx, text, 0, static_cast<u32>(pppoe));
+    net_free(ctx, text);
+    return 0;
+}
+
+// libnet f_19c38: an interface's address, netmask and broadcast or destination address ("255." and on: broadcast) set
+// with ioctls on a UDP socket, each from its text (guest strings; none: left alone). 0, or -1.
+s32 interface_address(PPUContext& ctx, u32 ifname, u32 address, u32 netmask, u32 other)
+{
+    u8* b = gb(ctx);
+    if (!ifname) {
+        set_errno(ctx, SYS_NET_EINVAL);
+        return -1;
+    }
+    const s32 so = netset_socket(ctx, 2, 2, 0);
+    if (so < 0) return -1;
+    StackVar ifr(ctx, b, 32); // the name (16 bytes), then a sockaddr_in
+    const std::string name = guest_str(ctx, ifname, "interface name").value_or("");
+    if (name.size() > 31) log_call_site(ctx, b, "interface name over 31 characters: libnet's strcpy runs past its stack");
+    std::memcpy(b + ifr.addr(), name.c_str(), std::min<usize>(name.size(), 31));
+    const u32 sa = ifr.addr() + 16;
+    const auto apply = [&](u32 text, u32 cmd) { return route_address(ctx, sa, text, 0) >= 0 && netset_ioctl(ctx, so, cmd, ifr.addr()) >= 0; };
+    bool ok = true;
+    if (address) ok = apply(address, 0x8020690C);
+    if (ok && netmask) ok = apply(netmask, 0x80206916);
+    if (ok && other) {
+        const std::string t = guest_str(ctx, other, "interface address").value_or("");
+        ok = apply(other, t.compare(0, 4, "255.") == 0 ? 0x80206913 : 0x8020690E);
+    }
+    socketclose(ctx, so);
+    return ok ? 0 : -1;
+}
+
+// _sce_net_set_ip_and_mask(ifname, in_addr address, in_addr netmask): the interface's address and netmask.
+s32 _sce_net_set_ip_and_mask(PPUContext& ctx, u32 ifname, u32 address, u32 netmask)
+{
+    u8* b = gb(ctx);
+    StackVar text(ctx, b, 32);
+    const std::string a = dotted(ctx, address), m = dotted(ctx, netmask);
+    std::memcpy(b + text.addr(), a.c_str(), a.size() + 1);
+    std::memcpy(b + text.addr() + 16, m.c_str(), m.size() + 1);
+    return interface_address(ctx, ifname, text.addr(), text.addr() + 16, 0);
+}
+
+// ------------------------------------------------------------------------------------------------- interfaces
+
+// _sys_net_lib_if_nametoindex(name): the interface's index; with no link lv2 lists none: 0, errno ENXIO.
+u32 _sys_net_lib_if_nametoindex(PPUContext& ctx, u32)
+{
+    StackVar ifap(ctx, gb(ctx), 8);
+    if (getifaddrs(ctx, ifap.addr()) < 0) return 0;
+    set_errno(ctx, 6); // ENXIO
+    return 0;
+}
+
+// libnet's resolver cache flush (f_a9a4, sys_net_if_ctl 656): every cached answer dropped. pspocket's resolver keeps
+// no cache yet (D-539): nothing to drop.
+void resolver_cache_flush(PPUContext&) {}
+
+// sys_net_if_ctl(index, cmd, buf, len) (D-539): libnet's interface and system reports. Index 0 with a 4-byte buf:
+// 640/641 lv2's free and lowest free memory (infoctl 8), 642/643 libnet's pool (free, lowest free), 644 lv2's packet
+// count (infoctl 10); 656 (no buf, index or len) flushes the resolver cache; 768 and 769 ask the wireless chip (lv2's
+// eurus command -1, 16 bytes: a word back; 153, 62 bytes: the text from its first digit up to a '(' back, NUL-ended,
+// len above 49); 16 (len above 19) looks for a route to the address in buf and, with none (ENOENT) and bit 0 of buf+4
+// clear, pings it (an ICMP echo on a raw socket; bit 0 of buf+8 set when that fails); a negative command at index 0 is
+// sys_net_control (buf cleared first unless the command has 0x81000000 set). Anything else names an interface by its
+// index among those with an IPv4 address: with no link lv2 lists none, EINVAL. Errors are errno | 0x80010200.
+s32 sys_net_if_ctl(PPUContext& ctx, s32 index, s32 cmd, u32 buf, s32 len)
+{
+    u8* b = gb(ctx);
+    const auto coded_errno = [&]() { return static_cast<s32>(r32(b, context(ctx) + kCtxErrno) | SYS_NET_ERROR); };
+    const auto einval = [&]() {
+        set_errno(ctx, SYS_NET_EINVAL);
+        return coded_errno();
+    };
+    const auto put4 = [&](u32 v) {
+        if (!usable(ctx, buf, 4, "sys_net_if_ctl: buf")) return coded_errno();
+        w32(b, buf, v);
+        return 0;
+    };
+    const bool report4 = buf && len == 4 && index == 0;
+    if (cmd > 643) {
+        if (cmd == 656) {
+            if (buf || index || len) return einval();
+            resolver_cache_flush(ctx);
+            return 0;
+        }
+        if (cmd == 768) {
+            if (!report4) return einval();
+            StackVar block(ctx, b, 16);
+            const s32 r = net_call(ctx, 726, {u64(s64{-1}), block.addr(), 16});
+            if (!usable(ctx, buf, 4, "sys_net_if_ctl: buf")) return coded_errno();
+            w32(b, buf, r32(b, block.addr() + 12));
+            return r;
+        }
+        if (cmd == 769) {
+            if (!buf || static_cast<u32>(len) <= 49 || index) return einval();
+            StackVar block(ctx, b, 64);
+            const s32 r = net_call(ctx, 726, {153, block.addr(), 62});
+            if (r < 0) return r;
+            const u32 text = block.addr() + 12;
+            u32 start = 0, count = 0;
+            bool found = false;
+            for (u32 i = 0; i < 50; i++) {
+                const u8 c = b[text + i];
+                if (!found) {
+                    if (is_digit(c)) {
+                        found = true;
+                        start = i;
+                        count = 1;
+                    }
+                } else {
+                    if (c == '(') break;
+                    count++;
+                }
+            }
+            if (!usable(ctx, buf, count + 1, "sys_net_if_ctl: buf")) return coded_errno();
+            if (found) std::memmove(b + buf, b + text + start, count);
+            b[buf + count] = 0;
+            return r;
+        }
+        if (cmd == 644) {
+            if (!report4) return einval();
+            return put4(static_cast<u32>(infoctl(ctx, 10, {}, {})));
+        }
+    } else if (cmd >= 642) {
+        if (!report4) return einval();
+        const Libnet& n = libnet();
+        return put4(cmd == 642 ? n.free : n.min_free);
+    } else if (cmd == 16) {
+        if (!buf || static_cast<u32>(len) <= 19 || index) return einval();
+        if (!usable(ctx, buf, 20, "sys_net_if_ctl: buf")) return coded_errno();
+        w32(b, buf + 8, r32(b, buf + 4));
+        if (sys_net_get_routing_table_af(ctx, 2, 0, 0) > 0) routes_listed("sys_net_if_ctl");
+        set_errno(ctx, 2); // ENOENT: no route
+        if (r32(b, buf + 4) & 1) return coded_errno();
+        // A ping: an ICMP echo (type 8, id and sequence 12345) on a raw socket.
+        const s32 so = socket(ctx, 2, 3, 1);
+        if (so < 0) {
+            w32(b, buf + 8, r32(b, buf + 8) | 1);
+            return coded_errno();
+        }
+        const u32 echo = net_malloc(ctx, 9, data(ctx) + kTagNetset, 1796);
+        bool failed = true;
+        if (echo) {
+            std::memset(b + echo, 0, 9);
+            StackVar sa(ctx, b, 16);
+            b[sa.addr() + 1] = 2;
+            w32(b, sa.addr() + 4, r32(b, buf));
+            b[echo] = 8;
+            b[echo + 1] = static_cast<u8>(r32(b, buf + 4) & 1);
+            ps_write16(b, echo + 6, 12345);
+            ps_write16(b, echo + 4, 12345);
+            u32 sum = 0;
+            for (u32 k = 0; k < 8; k += 2) sum += ps_read16(b, echo + k);
+            s32 v = static_cast<s32>((u32{b[echo + 8]} << 8) + sum);
+            v = (v >> 16) + (v & 0xFFFF);
+            v += v >> 16;
+            ps_write16(b, echo + 2, static_cast<u16>(~v));
+            failed = sendto(ctx, so, echo, 9, 0, sa.addr(), 16) < 0;
+        }
+        net_free(ctx, echo);
+        socketclose(ctx, so);
+        if (failed) w32(b, buf + 8, r32(b, buf + 8) | 1);
+        return coded_errno();
+    } else if (cmd >= 640) {
+        if (!report4) return einval();
+        return put4(static_cast<u32>(infoctl(ctx, 8, {{0, u32(cmd - 640)}}, {})));
+    }
+    // An interface by its index.
+    if (index == 0 && cmd < 0) {
+        if ((static_cast<u32>(cmd) & 0x81000000) != 0x81000000 && buf) {
+            if (!usable(ctx, buf, static_cast<u32>(len), "sys_net_if_ctl: buf")) return coded_errno();
+            std::memset(b + buf, 0, static_cast<u32>(len));
+        }
+        const s32 r = _sys_net_lib_bnet_control(ctx, 0, cmd, buf, len);
+        return r < 0 ? coded_errno() : r;
+    }
+    StackVar ifap(ctx, b, 8);
+    if (interfaces(ctx, ifap.addr()) != 0) return coded_errno();
+    return einval(); // (none listed: getifaddrs stops on one)
+}
+
 } // namespace
 
 void register_sys_net(Registry& r)
@@ -1926,6 +2498,13 @@ void register_sys_net(Registry& r)
         f("sys_net_set_lib_name_server", &thunk<&sys_net_set_lib_name_server>),
         f("sys_net_get_lib_name_server", &thunk<&sys_net_get_lib_name_server>),
         f("sys_net_show_nameserver", &thunk<&sys_net_show_nameserver>),
+        f("_sce_net_flush_route", &thunk<&_sce_net_flush_route>),
+        f("sys_net_get_routing_table_af", &thunk<&sys_net_get_routing_table_af>),
+        f("sys_net_show_route", &thunk<&sys_net_show_route>),
+        f("_sce_net_set_default_gateway", &thunk<&_sce_net_set_default_gateway>),
+        f("_sce_net_set_ip_and_mask", &thunk<&_sce_net_set_ip_and_mask>),
+        f("_sys_net_lib_if_nametoindex", &thunk<&_sys_net_lib_if_nametoindex>),
+        f("sys_net_if_ctl", &thunk<&sys_net_if_ctl>),
         PS_HLE_INTERNAL(0x66AFE280, _pspocket_net_thread_atexit),
     });
 }

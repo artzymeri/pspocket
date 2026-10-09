@@ -652,8 +652,7 @@ std::vector<Op> routes_script()
         put_str(s, txt + 0x40 * i, t);
         return u64{txt + 0x40 * i};
     };
-    const u64 eth0 = text(0, "eth0"), lo0 = text(1, "lo0"), proxy = text(2, "http_proxy");
-    const u64 ssid = text(6, "ssid"), bad = text(7, "bogus");
+    const u64 eth0 = text(0, "eth0"), lo0 = text(1, "lo0");
     // Routes.
     s.push_back({"_sce_net_flush_route", {}});
     s.push_back({"sys_net_get_routing_table_af", {0, 0, 0}});
@@ -681,6 +680,23 @@ std::vector<Op> routes_script()
     // Interfaces by name.
     s.push_back({"_sys_net_lib_if_nametoindex", {eth0}});
     s.push_back({"_sys_net_lib_if_nametoindex", {lo0}});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_net_finalize_network", {}});
+    return s;
+}
+
+// The netset calls and gethostbyaddr (D-539).
+std::vector<Op> netset_script()
+{
+    std::vector<Op> s;
+    init_param(s, kPool, kPoolSize, 0);
+    s.push_back({"sys_net_initialize_network_ex", {kParam}});
+    const u32 txt = kOut + 0x6000; // strings, 0x40 apart
+    const auto text = [&](u32 i, std::string_view t) {
+        put_str(s, txt + 0x40 * i, t);
+        return u64{txt + 0x40 * i};
+    };
+    const u64 eth0 = text(0, "eth0"), proxy = text(2, "http_proxy"), ssid = text(6, "ssid"), bad = text(7, "bogus");
     // netset without one open.
     s.push_back({"sys_netset_get_status", {0, kOut + 0xD00}});
     s.push_back({"sys_netset_get_status", {5, kOut + 0xD80}});
@@ -733,11 +749,18 @@ TEST_CASE("sys_net against libnet: configuration", "[hle][lle][net]")
     compare(*flash, config_script(), "configuration");
 }
 
-TEST_CASE("sys_net against libnet: routes, interfaces, netsets and gethostbyaddr", "[.][hle][lle][net]")
+TEST_CASE("sys_net against libnet: routes and interfaces", "[hle][lle][net]")
 {
     const std::optional<std::string> flash = test_dev_flash();
     if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
     compare(*flash, routes_script(), "routes");
+}
+
+TEST_CASE("sys_net against libnet: netsets and gethostbyaddr", "[.][hle][lle][net]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, netset_script(), "netset");
 }
 
 TEST_CASE("sys_net against libnet: interfaces", "[hle][lle][net]")
