@@ -7161,6 +7161,24 @@ finalized; one on the game's SPURS without events: the answers, both control thr
 order, keyed by lv2 thread ID: the host reuses threads), the handler's records and the players, 0 differences over 2629
 checks in the six scripts (+0x3C8/+0x3D0 masked: stack addresses; the handler's r7: past its four arguments).
 
+Part 7, descriptors made and held by the control thread: the game's commands (Create, Add, Remove) go through libsail's
+command protocol: under the player's lock a reply record {the answer's address, the calling thread's ID} is posted at the
+queue's head with the command, the caller waits once on the player's condition (+0x24C), and the control thread, under
+the lock, stores the answer and wakes that thread with sys_cond_signal_to (a failed signal is an error event and a fatal
+one, the lock kept, as libsail does). Create makes 0x100 bytes plus 0xC0 per stream (the audio, video and user tables:
+0x90, 0x78 and 0x4C bytes per entry, each holding its index and the descriptor) from the player's allocator, takes
+types 0 to 2 only (an unknown type's memory is kept: libsail checks after allocating), heads it {1|0x81|0x82, 0, 0},
+puts it first on the player's list (+0x3BC, linked through +0x34) and gives it to the game. Add makes it the current
+(+0x22C) or the next (+0x228) descriptor (not the current one twice; FULLED past two), created ones becoming 2 and open
+ones 3, and answers the count; Remove takes the last added back (USING while it plays, state 5), 2 back to created and
+others to open, and answers the count left; Destroy is posted without waiting (INVALID_STATE before Boot) and frees a
+descriptor of the player's list (an open one would be closed first: a later part). Errors reach the game as event 1
+after libsail's "error 0x%X" print. At the player's end the descriptors it holds go back to created or open and every
+descriptor on its list is freed (state 6). Compared with libsail on a booted player without streams: every refusal,
+add, remove and destroy above, and the allocator's memory (the player's block with its queue, the descriptors) now
+compared too for parts 6 and 7 (the built-in source's function words, the queue ring's stack addresses and the
+handler's r7 masked): 0 differences over 2689 checks.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)

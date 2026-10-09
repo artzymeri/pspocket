@@ -28,6 +28,8 @@ using namespace sail;
 constexpr u32 kStackStat = 0x3D0; // the deepest the event handler's stack went (u64), libsail's
 constexpr u32 kMessage = 0x19C;   // the message being handled (200 while waiting)
 constexpr u32 kBootRunning = 0x250;
+constexpr u32 kCond = pl::kLock + 4; // the condition the game's thread waits on for a command's answer
+constexpr u32 kNextDescriptor = 0x228, kDescriptors = 0x3BC;
 
 s32 lock(PPUContext& ctx, u32 p) { return sc(ctx, 102, {r32(ctx, p + pl::kLock), 0}); }
 s32 unlock(PPUContext& ctx, u32 p) { return sc(ctx, 104, {r32(ctx, p + pl::kLock)}); }
@@ -84,6 +86,166 @@ void notify_completed(PPUContext& ctx, u32 p, u32 command, s32 result)
     w64(ctx, p + pl::kBootArg, 0);
     if (!(r64(ctx, p + pl::kEventMask) & 4)) return;
     notify(ctx, p, u64{2} << 32 | command, static_cast<u64>(static_cast<s64>(result)), arg);
+}
+
+// An error (major 1) when the game subscribed to errors: "error 0x%X" printed first, as libsail does.
+void notify_error(PPUContext& ctx, u32 p, s32 err)
+{
+    if (!(r64(ctx, p + pl::kEventMask) & 2)) return;
+    StackVar text(ctx, gb(ctx), 16);
+    std::memcpy(gb(ctx) + text.addr(), "error 0x%X\n", 11);
+    lv2_lib(ctx, "_sys_printf", {text.addr(), static_cast<u64>(static_cast<s64>(err))});
+    notify(ctx, p, u64{1} << 32, static_cast<u64>(static_cast<s64>(err)), 0);
+}
+
+// ------------------------------------------------------------------------------------------------- commands
+
+// The game's side of a command (libsail's): under the player's lock, a reply record {the answer's address, the calling
+// thread} posted at the queue's head with the command, then one wait on the player's condition, which the control
+// thread signals to this thread once it has answered. The lock's error, or 0 with the answer at `reply`.
+s32 command(PPUContext& ctx, u32 p, u32 code, u32 arg, u32 reply)
+{
+    const s32 r = lock(ctx, p);
+    if (r < 0) return r;
+    StackVar record(ctx, gb(ctx), 16);
+    w32(ctx, record.addr(), reply);
+    lv2_lib(ctx, "sys_ppu_thread_get_id", {record.addr() + 8});
+    post_urgent(ctx, p, code, 0, arg, record.addr());
+    sc(ctx, 107, {r32(ctx, p + kCond), 0});
+    unlock(ctx, p);
+    return 0;
+}
+
+// A command and its answer: the command's error, or the answer.
+s32 command_answer(PPUContext& ctx, u32 p, u32 code, u32 arg)
+{
+    StackVar reply(ctx, gb(ctx), 16);
+    const s32 r = command(ctx, p, code, arg, reply.addr());
+    return r < 0 ? r : static_cast<s32>(r32(ctx, reply.addr()));
+}
+
+// The control thread's side: the answer stored, the waiting thread signalled (sys_cond_signal_to), the lock released.
+// A failed signal is an error and a fatal error, the lock kept (libsail's).
+void answer(PPUContext& ctx, u32 p, u32 record, s32 result)
+{
+    w32(ctx, r32(ctx, record), static_cast<u32>(result));
+    const s32 r = sc(ctx, 110, {r32(ctx, p + kCond), r64(ctx, record + 8)});
+    if (r < 0) {
+        notify_error(ctx, p, r);
+        notify_error(ctx, p, error(CELL_SAIL_ERROR_FATAL));
+        return;
+    }
+    unlock(ctx, p);
+}
+
+// ------------------------------------------------------------------------------------------------- descriptors
+
+namespace ds {
+constexpr u32 kType = 0, kHeader = 4, kUri = 0x10, kMediaInfo = 0x14, kPlayer = 0x1C, kAudio = 0x28, kVideo = 0x2C,
+              kUser = 0x30, kNext = 0x34, kState = 0x38;
+constexpr u32 kAudioStride = 0x90, kVideoStride = 0x78, kUserStride = 0x4C;
+} // namespace ds
+
+// Create {stream type, media info, URI, the game's pointer}: 0x100 bytes and the elementary stream tables (each entry
+// its index and the descriptor), from the player's allocator; types 0 (PAMF), 1 (MP4) and 2 (AVI) only, the memory kept
+// when the type is unknown (libsail checks after allocating). The descriptor goes first on the player's list.
+s32 create_descriptor(PPUContext& ctx, u32 p, u32 args)
+{
+    if (r8(ctx, p + pl::kState) == 0) return error(CELL_SAIL_ERROR_INVALID_STATE);
+    const u32 type = r32(ctx, args), media = r32(ctx, args + 4), uri = r32(ctx, args + 8), out = r32(ctx, args + 12);
+    const u32 na = r32(ctx, p + pl::kAudioCount), nv = r32(ctx, p + pl::kVideoCount), nu = r32(ctx, p + pl::kUserCount);
+    const u32 size = (na + nv + nu) * 0xC0 + 0x100;
+    const u32 d = alloc(ctx, p, 8, size);
+    if (!d) return error(CELL_SAIL_ERROR_MEMORY);
+    std::memset(gb(ctx) + d, 0, size);
+    u32 es = d + 0x100;
+    const auto table = [&](u32 count, u32 slot, u32 stride) {
+        if (!count) return;
+        w32(ctx, d + slot, es);
+        for (u32 i = 0; i < count; i++) {
+            w8(ctx, es + i * stride + 1, static_cast<u8>(i));
+            w32(ctx, es + i * stride + 8, d);
+        }
+        es += count * stride;
+    };
+    table(na, ds::kAudio, ds::kAudioStride);
+    table(nv, ds::kVideo, ds::kVideoStride);
+    table(nu, ds::kUser, ds::kUserStride);
+    if (type > 2) return error(CELL_SAIL_ERROR_UNSUPPORTED_STREAM);
+    w32(ctx, d + ds::kHeader, type == 0 ? 1 : 0x80 + type);
+    w32(ctx, d + ds::kNext, r32(ctx, p + kDescriptors));
+    w32(ctx, d + ds::kType, type);
+    w32(ctx, p + kDescriptors, d);
+    w32(ctx, d + ds::kUri, uri);
+    w32(ctx, d + ds::kMediaInfo, media);
+    w32(ctx, out, d);
+    w32(ctx, d + ds::kPlayer, p);
+    return lv2::CELL_OK;
+}
+
+// A descriptor freed (libsail's): an open one closed first, then state 6 and back to the allocator.
+s32 free_descriptor(PPUContext& ctx, u32 p, u32 d)
+{
+    const u8 st = r8(ctx, d + ds::kState);
+    if (st == 1 || st == 3) {
+        log_call_site(ctx, gb(ctx), "cellSail: an open descriptor destroyed: its close is not pspocket's yet");
+        PS_FATAL(kChan, "libsail's descriptor close is a later part of D-562");
+    }
+    w8(ctx, d + ds::kState, 6);
+    dealloc(ctx, p, 8, d);
+    return lv2::CELL_OK;
+}
+
+// Add: the first descriptor becomes the current one, the second the next (not the current one again); more are refused.
+// Created ones become 2, open ones 3. The count of descriptors held.
+s32 add_descriptor(PPUContext& ctx, u32 p, u32 d)
+{
+    const u32 count = r32(ctx, p + pl::kDescriptorCount);
+    s32 r;
+    if (count == 0) {
+        w32(ctx, p + pl::kCurrentDescriptor, d);
+        w32(ctx, p + pl::kDescriptorCount, 1);
+        r = 1;
+    } else if (count == 1) {
+        if (r32(ctx, p + pl::kCurrentDescriptor) == d) return error(CELL_SAIL_ERROR_INVALID_ARG);
+        w32(ctx, p + kNextDescriptor, d);
+        w32(ctx, p + pl::kDescriptorCount, 2);
+        r = 2;
+    } else {
+        return error(CELL_SAIL_ERROR_FULLED);
+    }
+    const u8 st = r8(ctx, d + ds::kState);
+    if (st == 0) w8(ctx, d + ds::kState, 2);
+    else if (st == 1) w8(ctx, d + ds::kState, 3);
+    return r;
+}
+
+// Remove: the last one added (not while in use, state 5) back to created (from 2) or open, given to the game. The count
+// left.
+s32 remove_descriptor(PPUContext& ctx, u32 p, u32 out)
+{
+    const u32 count = r32(ctx, p + pl::kDescriptorCount);
+    if (count == 0) return error(CELL_SAIL_ERROR_EMPTY);
+    if (count > 2) return error(CELL_SAIL_ERROR_FATAL);
+    const u32 slot = count == 1 ? pl::kCurrentDescriptor : kNextDescriptor;
+    const u32 d = r32(ctx, p + slot);
+    if (r8(ctx, d + ds::kState) == 5) return error(CELL_SAIL_ERROR_USING);
+    w32(ctx, p + slot, 0);
+    w32(ctx, p + pl::kDescriptorCount, count - 1);
+    w8(ctx, d + ds::kState, r8(ctx, d + ds::kState) == 2 ? 0 : 1);
+    if (out) w32(ctx, out, d);
+    return static_cast<s32>(count - 1);
+}
+
+// Destroy: off the player's list and freed when it is there; a failure is an error event.
+void destroy_descriptor(PPUContext& ctx, u32 p, u32 d)
+{
+    for (u32 link = p + kDescriptors, cur; (cur = r32(ctx, link)) != 0; link = cur + ds::kNext) {
+        if (cur != d) continue;
+        w32(ctx, link, r32(ctx, d + ds::kNext));
+        if (const s32 r = free_descriptor(ctx, p, d); r < 0) notify_error(ctx, p, r);
+        return;
+    }
 }
 
 // ------------------------------------------------------------------------------------------------- the dmux pipeline
@@ -145,6 +307,22 @@ void message_loop(PPUContext& ctx, u32 p)
             // A call's completion {0, result, handle}: handled as the call its handle names.
             code = m.b & 0xFFFF;
             last = code;
+        }
+        if (code >= 0x40 && code <= 0x43) {
+            // Descriptor commands, under the player's lock; a failed lock is an error and a fatal error.
+            if (const s32 r = lock(ctx, p); r < 0) {
+                notify_error(ctx, p, r);
+                notify_error(ctx, p, error(CELL_SAIL_ERROR_FATAL));
+                continue;
+            }
+            if (code == 0x40) answer(ctx, p, m.c, create_descriptor(ctx, p, m.b));
+            else if (code == 0x42) answer(ctx, p, m.c, add_descriptor(ctx, p, m.b));
+            else if (code == 0x43) answer(ctx, p, m.c, remove_descriptor(ctx, p, m.b));
+            else {
+                destroy_descriptor(ctx, p, m.b);
+                unlock(ctx, p);
+            }
+            continue;
         }
         switch (code) {
         case 0xD1: return; // stop
@@ -213,7 +391,7 @@ void _pspocket_cellSail_control(PPUContext& ctx, u64 player)
             message_loop(ctx, p);
             lock(ctx, p);
             // The descriptors the player holds back to their open state, then freed.
-            for (const u32 at : {p + pl::kCurrentDescriptor, p + 0x228u}) {
+            for (const u32 at : {p + pl::kCurrentDescriptor, p + kNextDescriptor}) {
                 if (const u32 d = r32(ctx, at)) {
                     const u8 st = r8(ctx, d + 0x38);
                     if (st == 2) w8(ctx, d + 0x38, 0);
@@ -222,11 +400,12 @@ void _pspocket_cellSail_control(PPUContext& ctx, u64 player)
             }
             w32(ctx, p + pl::kDescriptorCount, 0);
             dmux_fini(ctx, p + pl::kDmux);
-            if (r32(ctx, p + 0x3BC)) {
-                log_call_site(ctx, gb(ctx), "cellSail: descriptors at the player's end: not pspocket's yet");
-                PS_FATAL(kChan, "libsail's descriptor teardown is a later part of D-562");
+            for (u32 d = r32(ctx, p + kDescriptors); d;) {
+                const u32 next = r32(ctx, d + ds::kNext);
+                free_descriptor(ctx, p, d);
+                d = next;
             }
-            w32(ctx, p + 0x3BC, 0);
+            w32(ctx, p + kDescriptors, 0);
         }
         unlock(ctx, p);
         if (owned) {
@@ -274,6 +453,36 @@ s32 cellSailPlayerBoot(PPUContext& ctx, u32 p, u64 arg)
     return r;
 }
 
+// ------------------------------------------------------------------------------------------------- the game's calls
+
+s32 cellSailPlayerCreateDescriptor(PPUContext& ctx, u32 p, u32 type, u32 media_info, u32 uri, u32 out)
+{
+    if (!out) return error(CELL_SAIL_ERROR_INVALID_ARG);
+    StackVar args(ctx, gb(ctx), 16);
+    w32(ctx, args.addr(), type);
+    w32(ctx, args.addr() + 4, media_info);
+    w32(ctx, args.addr() + 8, uri);
+    w32(ctx, args.addr() + 12, out);
+    return command_answer(ctx, p, 0x40, args.addr());
+}
+
+s32 cellSailPlayerAddDescriptor(PPUContext& ctx, u32 p, u32 d)
+{
+    if (!d) return error(CELL_SAIL_ERROR_INVALID_ARG);
+    return command_answer(ctx, p, 0x42, d);
+}
+
+s32 cellSailPlayerRemoveDescriptor(PPUContext& ctx, u32 p, u32 out) { return command_answer(ctx, p, 0x43, out); }
+
+// Destroy is posted, not waited for.
+s32 cellSailPlayerDestroyDescriptor(PPUContext& ctx, u32 p, u32 d)
+{
+    if (!d) return error(CELL_SAIL_ERROR_INVALID_ARG);
+    if (r8(ctx, p + pl::kState) == pl::kInitialized) return error(CELL_SAIL_ERROR_INVALID_STATE);
+    post_urgent(ctx, p, 0x41, 0, d, 0);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_cellSailControl(Registry& r)
@@ -281,6 +490,14 @@ void register_cellSailControl(Registry& r)
     r.add("cellSail", {
         ::pspocket::hle::Function{{}, "cellSailPlayerBoot", recomp::nid_of("cellSailPlayerBoot"),
             &detail::thunk<&cellSailPlayerBoot>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerCreateDescriptor", recomp::nid_of("cellSailPlayerCreateDescriptor"),
+            &detail::thunk<&cellSailPlayerCreateDescriptor>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerAddDescriptor", recomp::nid_of("cellSailPlayerAddDescriptor"),
+            &detail::thunk<&cellSailPlayerAddDescriptor>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerRemoveDescriptor", recomp::nid_of("cellSailPlayerRemoveDescriptor"),
+            &detail::thunk<&cellSailPlayerRemoveDescriptor>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerDestroyDescriptor",
+            recomp::nid_of("cellSailPlayerDestroyDescriptor"), &detail::thunk<&cellSailPlayerDestroyDescriptor>, false},
         ::pspocket::hle::Function{{}, "_pspocket_cellSail_control", recomp::nid_of("_pspocket_cellSail_control"),
             &detail::thunk<&_pspocket_cellSail_control>, true},
     });

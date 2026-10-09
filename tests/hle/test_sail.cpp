@@ -80,7 +80,7 @@ void observe(void* user, u32 n, const u64* a)
 
 struct Run {
     std::vector<std::string> lines;
-    std::vector<u8> mem;
+    std::vector<u8> mem, heap; // the script's area; what the player's allocator gave out (parts 6 on)
     std::vector<std::string> calls;
 };
 
@@ -91,6 +91,8 @@ void part3(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part4(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part5(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part6(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part7(u8* b, const Call& call, u32 cb, GuestThread& t);
+constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00;
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
 Run run(const std::string& flash, bool sony, int part)
@@ -137,10 +139,12 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 3) part3(b, call, cb, t);
     else if (part == 4) part4(b, call, cb, t);
     else if (part == 5) part5(b, call, cb, t);
-    else part6(b, call, cb, t);
+    else if (part == 6) part6(b, call, cb, t);
+    else part7(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
+    if (part >= 6) r.heap.assign(b + kHeap, b + ps_read32(b, kHeapPtr));
     r.calls = tr.calls;
     // The other threads' calls, each thread's in order, the threads in no order.
     std::vector<std::string> others;
@@ -268,7 +272,7 @@ void part1(u8* b, const Call& call_, u32 cb, GuestThread& t)
 
 // A bump allocator for the player (alloc(arg, boundary, size) from kHeap upward; free does nothing) and a second event
 // handler, both guest code.
-constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00, kAllocCode = kArea + 0x1100, kFreeCode = kArea + 0x1180;
+constexpr u32 kAllocCode = kArea + 0x1100, kFreeCode = kArea + 0x1180;
 void allocator_code(u8* b)
 {
     // lis/ori r11 = &heap pointer; lwz r3; addi r0,r4,-1; add r3,r3,r0; andc r3,r3,r0; add r12,r3,r5; stw r12; blr
@@ -673,6 +677,19 @@ void compare_lines(const char* what, const std::vector<std::string>& mine, const
     CHECK(differ == 0);
 }
 
+// The built-in source's function words (each side's own code) and the event handler's r7 (past its four arguments).
+void mask_player_source(u8* b, u32 p)
+{
+    const u32 src = ps_read32(b, p + 0x3B0);
+    if (!src) return;
+    g_mask.push_back({src + 0x48, 0x38});
+    g_mask.push_back({src + 0x100, 0x38});
+}
+void mask_handler_r7(u8* b)
+{
+    for (u32 i = 0; i < ps_read32(b, kRecords); i++) g_mask.push_back({kRecords + 16 + 48 * i + 32, 8});
+}
+
 // Boot and Finalize of a player without streams: the control thread's set-up (SPURS of its own, or the game's), its
 // events, its message loop and its end.
 void part6(u8* b, const Call& call_, u32 cb, GuestThread&)
@@ -685,11 +702,6 @@ void part6(u8* b, const Call& call_, u32 cb, GuestThread&)
     ps_write32(b, kMem + 4, kFreeCode + 0x70);
     ps_write32(b, kMem + 8, 0x4321);
     const auto mask_player = [&](u32 p) {
-        const u32 src = ps_read32(b, p + 0x3B0);
-        if (src >= kArea && src < kArea + 0x3000) {
-            g_mask.push_back({src + 0x48, 0x38});
-            g_mask.push_back({src + 0x100, 0x38});
-        }
         g_mask.push_back({p + 0x3C8, 16}); // the control thread's stack: its frame, and the deepest its handler went
     };
     // Waits until the handler has recorded `n` calls (the control thread makes them).
@@ -702,17 +714,18 @@ void part6(u8* b, const Call& call_, u32 cb, GuestThread&)
 
     // A stream without its renderer: Boot refuses.
     call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x11, 1, 0, 0, 0});
+    mask_player_source(b, kP);
     call("cellSailPlayerBoot", {kP, 0x1234});
     call("cellSailPlayerFinalize", {kP});
     call("cellSailPlayerBoot", {kP, 0x1234});
 
     // No streams: the player's own SPURS. The events of a state change (3) and a call completed (2) subscribed to.
     call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 0, 0, 0, 0});
+    mask_player_source(b, kP);
     call("cellSailPlayerSubscribeEvent", {kP, 3, 0});
     call("cellSailPlayerSubscribeEvent", {kP, 2, 0});
     call("cellSailPlayerBoot", {kP, 0x123456789ull});
     wait_records(2);
-    for (u32 i = 0; i < 2; i++) g_mask.push_back({kRecords + 16 + 48 * i + 32, 8}); // r7: past the handler's 4 arguments
     call("cellSailPlayerBoot", {kP, 1});
     call("cellSailPlayerGetDescriptorCount", {kP});
     call("cellSailPlayerFinalize", {kP});
@@ -727,6 +740,7 @@ void part6(u8* b, const Call& call_, u32 cb, GuestThread&)
     ps_write32(b, kAttr2, 3);
     ps_write32(b, kAttr2 + 16, 4);
     call("cellSailPlayerInitialize2", {kP, kMem, cb, 0x33, kAttr2, kRes});
+    mask_player_source(b, kP);
     call("cellSailPlayerBoot", {kP, 0x55});
     // Nothing to wait for: the state is 2 once the thread has set up.
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -735,6 +749,68 @@ void part6(u8* b, const Call& call_, u32 cb, GuestThread&)
     CHECK(b[kP + 0x163] == 2);
     call("cellSailPlayerFinalize", {kP});
     mask_player(kP);
+    mask_handler_r7(b);
+}
+
+// Descriptors on a booted player: created, added, removed and destroyed by the control thread; the ones left freed at
+// its end.
+void part7(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    std::memcpy(b + kUri, "x-cell-fs:/app_home/movie.pam", 30);
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+    };
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 0, 0, 0, 0});
+    mask_player_source(b, kP);
+    call("cellSailPlayerDestroyDescriptor", {kP, kOut});
+    call("cellSailPlayerDestroyDescriptor", {kP, 0});
+    call("cellSailPlayerSubscribeEvent", {kP, 1, 0});
+    call("cellSailPlayerBoot", {kP, 0});
+    until([&] { return b[kP + 0x163] == 2; });
+
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x40, kUri, 0});
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x40, kUri, kOut});
+    call("cellSailPlayerCreateDescriptor", {kP, 1, kUri + 0x44, kUri, kOut + 4});
+    call("cellSailPlayerCreateDescriptor", {kP, 2, 0, 0, kOut + 8});
+    call("cellSailPlayerCreateDescriptor", {kP, 3, 0, 0, kOut + 12});
+    const u32 d0 = ps_read32(b, kOut), d1 = ps_read32(b, kOut + 4), d2 = ps_read32(b, kOut + 8);
+    call("cellSailPlayerAddDescriptor", {kP, 0});
+    call("cellSailPlayerAddDescriptor", {kP, d0});
+    call("cellSailPlayerAddDescriptor", {kP, d0});
+    call("cellSailPlayerAddDescriptor", {kP, d1});
+    call("cellSailPlayerAddDescriptor", {kP, d2});
+    call("cellSailPlayerGetDescriptorCount", {kP});
+    call("cellSailPlayerGetCurrentDescriptor", {kP});
+    call("cellSailPlayerRemoveDescriptor", {kP, kOut + 16});
+    call("cellSailPlayerRemoveDescriptor", {kP, 0});
+    call("cellSailPlayerRemoveDescriptor", {kP, kOut + 20});
+    call("cellSailPlayerAddDescriptor", {kP, d2});
+    call("cellSailPlayerAddDescriptor", {kP, d0});
+    call("cellSailPlayerDestroyDescriptor", {kP, d1});
+    until([&] { return b[d1 + 0x38] == 6; });
+    call("cellSailPlayerDestroyDescriptor", {kP, kOut + 0x40}); // not the player's: nothing
+    call("cellSailPlayerCreateDescriptor", {kP, 0, 0, kUri, kOut + 24});
+    call("cellSailPlayerGetDescriptorCount", {kP});
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    mask_handler_r7(b);
+    // The commands left in the queue's ring: their reply records and Create's arguments are on the caller's stack.
+    const u32 ring = ps_read32(b, kP + 0x178);
+    for (u32 i = 0; i < ps_read32(b, kP + 0x170); i++) {
+        const u32 e = ring + 16 * i;
+        if (ps_read32(b, e) == 0x40) g_mask.push_back({e + 8, 4});
+        g_mask.push_back({e + 12, 4});
+    }
 }
 
 } // namespace
@@ -752,6 +828,20 @@ void compare_runs(int part)
     INFO(std::format("memory differs first at {:#x} (pspocket {:#04x}, libsail {:#04x})", kArea + first,
         first < mine.mem.size() ? mine.mem[first] : 0, first < sony.mem.size() ? sony.mem[first] : 0));
     CHECK(first == mine.mem.size());
+    if (std::getenv("SAIL_DIFF")) {
+        const auto dump = [](const char* what, u32 base, const std::vector<u8>& a, const std::vector<u8>& c) {
+            for (usize i = 0; i < std::min(a.size(), c.size()); i++)
+                if (a[i] != c[i]) std::fprintf(stderr, "%s %#zx: pspocket %02x libsail %02x\n", what, base + i, a[i], c[i]);
+        };
+        dump("area", kArea, mine.mem, sony.mem);
+        dump("heap", kHeap, mine.heap, sony.heap);
+    }
+    CHECK(mine.heap.size() == sony.heap.size());
+    usize h = 0;
+    while (h < mine.heap.size() && h < sony.heap.size() && mine.heap[h] == sony.heap[h]) h++;
+    INFO(std::format("the allocator's memory differs first at {:#x} (pspocket {:#04x}, libsail {:#04x})", kHeap + h,
+        h < mine.heap.size() ? mine.heap[h] : 0, h < sony.heap.size() ? sony.heap[h] : 0));
+    CHECK(h == std::min(mine.heap.size(), sony.heap.size()));
 }
 
 TEST_CASE("cellSail against libsail: allocator, future, source, renderers", "[hle][lle][sail]") { compare_runs(1); }
@@ -767,4 +857,9 @@ TEST_CASE("cellSail against libsail: every player parameter set and read", "[hle
 TEST_CASE("cellSail against libsail: Boot and Finalize of a player without streams", "[hle][lle][sail]")
 {
     compare_runs(6);
+}
+
+TEST_CASE("cellSail against libsail: descriptors created, added, removed and destroyed", "[hle][lle][sail]")
+{
+    compare_runs(7);
 }
