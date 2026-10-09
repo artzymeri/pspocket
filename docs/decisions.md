@@ -7247,6 +7247,20 @@ answer that bit as it reads afterwards. Compared with libsail on a booted player
 stream: pauses with and without changes and with event 7 unsubscribed, every repeat mode, mutes with odd values and
 out of range: 0 differences over 2895 checks in eleven scripts.
 
+Part 12, DumpImage: libsail's image of a player for Sony's tools, each block at the next 64-byte boundary: the version
+(u64 0x492000), libsail's "modules are the process's" flag (u32: 1 for system software, from syscall 871 as its module
+start reads it), the player's first 0x3D8 bytes, its audio, video and user slots, the current and next descriptors
+(0xE0 bytes each, the URI's length with its NUL as a u32 and the text right after, then the descriptor's audio, video and
+user entries), the first registered source (0x80 bytes) and its argument's 0x138 bytes (the built-in source's state),
+the dmux pipeline (0x58), each slot's stream state (0x70 bytes from +0x10), then per audio stream its pipeline (0xD0),
+renderer (0x50), a u64 0x100 and 0x100 bytes of the renderer's argument, per video stream the same with 0x100 and 0x60,
+per user stream the AU receiver's callback block (0x50) and the receiver (0x1C0). It answers the bytes written with the
+padding; a block that does not fit ends the image (its padding counted), padding that does not fit prints "not enougth
+buffer" and is not counted. A NULL object libsail would read stops the process with the call site. Compared with
+libsail: a booted player with three streams and two held descriptors dumped at 768 sizes from 0 past the whole
+0x1A7B-byte image into an unaligned buffer and once aligned (each side's code addresses and the control thread's stack
+words set alike while dumping): 0 differences over 3712 checks in twelve scripts.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)

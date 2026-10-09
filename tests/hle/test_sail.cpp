@@ -86,6 +86,7 @@ void observe(void* user, u32 n, const u64* a)
 struct Run {
     std::vector<std::string> lines;
     std::vector<u8> mem, heap; // the script's area; what the player's allocator gave out (parts 6 on)
+    std::vector<u8> dump;      // part 12's image
     std::vector<std::string> calls;
 };
 
@@ -101,7 +102,8 @@ void part8(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part9(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part10(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part11(u8* b, const Call& call, u32 cb, GuestThread& t);
-constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00;
+void part12(u8* b, const Call& call, u32 cb, GuestThread& t);
+constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00, kDump = kData + 0x100000, kDumpSize = 0x8000;
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
 Run run(const std::string& flash, bool sony, int part)
@@ -153,11 +155,13 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 8) part8(b, call, cb, t);
     else if (part == 9) part9(b, call, cb, t);
     else if (part == 10) part10(b, call, cb, t);
-    else part11(b, call, cb, t);
+    else if (part == 11) part11(b, call, cb, t);
+    else part12(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
     if (part >= 6) r.heap.assign(b + kHeap, b + ps_read32(b, kHeapPtr));
+    if (part == 12) r.dump.assign(b + kDump, b + kDump + kDumpSize);
     r.calls = tr.calls;
     // The other threads' calls, each thread's in order, the threads in no order.
     std::vector<std::string> others;
@@ -1289,6 +1293,93 @@ void part11(u8* b, const Call& call_, u32 cb, GuestThread&)
     }
 }
 
+// DumpImage of a booted player with an audio, a video and a user stream and two descriptors held (one open, with a
+// URI), at many sizes and an unaligned buffer: every place the image can stop, and the whole image. Each side's own code
+// addresses in the player (the built-in source's callbacks and file calls, the adapter's and the AU receiver's tables)
+// and the control thread's stack words are set to the same values on both sides while dumping.
+void part12(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    write_sail_pamf(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kSrcCode = kArea + 0x1C00, kRend = kArea + 0x2400, kGad = kArea + 0x2500,
+                  kAuR = kArea + 0x2600, kRF = kArea + 0x2E00, kGF = kArea + 0x2E40, kArg = kArea + 0x2900;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    ps_write32(b, kFuncs, cb);
+    ps_write32(b, kFuncs + 4, kSrcCode + 0xB0);
+    ps_write32(b, kFuncs + 44, kSrcCode + 0x78);
+    for (u32 i = 0; i < 9; i++) ps_write32(b, kRF + 4 * i, 0);
+    ps_write32(b, kRF, cb);
+    ps_write32(b, kRF + 4, cb);
+    ps_write32(b, kRF + 12, cb);
+    for (u32 i = 0; i < 5; i++) ps_write32(b, kGF + 4 * i, i < 2 ? cb : 0);
+    for (u32 i = 0; i < 0x100; i++) b[kArg + i] = static_cast<u8>(i * 7);
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 1, 1, 1, 0});
+    call("cellSailSourceInitialize", {kSource, kFuncs, 0x77});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailRendererAudioInitialize", {kRend, kRF, kArg, 0});
+    call("cellSailGraphicsAdapterInitialize", {kGad, kGF, 0x66});
+    call("cellSailAuReceiverInitialize", {kAuR, 0, 0, 0x78});
+    call("cellSailPlayerSetRendererAudio", {kP, 0, kRend});
+    call("cellSailPlayerSetGraphicsAdapter", {kP, 0, kGad});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR});
+    call("cellSailPlayerBoot", {kP, 0});
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (b[kP + 0x163] != 2 && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(b[kP + 0x163] == 2);
+    call("cellSailPlayerCreateDescriptor", {kP, 0, 0, str(kUri, "x-test://a-movie-with-a-long-name.pam"), kOut});
+    call("cellSailDescriptorOpen", {ps_read32(b, kOut)});
+    call("cellSailPlayerAddDescriptor", {kP, ps_read32(b, kOut)});
+    call("cellSailPlayerCreateDescriptor", {kP, 0, 0, 0, kOut + 4});
+    call("cellSailPlayerAddDescriptor", {kP, ps_read32(b, kOut + 4)});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // The same values on both sides while dumping, put back after.
+    const u32 src = ps_read32(b, kP + 0x2E8), fsb = ps_read32(b, src + 4);
+    const std::pair<u32, u32> own[] = {{kP + 0x3C8, 16}, {src + 8, 0x38}, {fsb + 0x100, 0x38}, {kGad, 4},
+        {kAuR + 0x20, 0x24}};
+    std::vector<std::vector<u8>> saved;
+    for (const auto& [at, n] : own) {
+        saved.emplace_back(b + at, b + at + n);
+        std::memset(b + at, 0x5A, n);
+    }
+    std::memset(b + kDump, 0xEE, kDumpSize);
+    const u64 total = call("cellSailPlayerDumpImage", {kP, kDump + 5, kDumpSize - 5});
+    std::vector<u8> image(b + kDump, b + kDump + kDumpSize);
+    for (u32 size = 0; size < static_cast<u32>(total) + 0x80; size += size < 0x100 ? 1 : 13)
+        call("cellSailPlayerDumpImage", {kP, kDump + 5, size});
+    call("cellSailPlayerDumpImage", {kP, kDump, 0x7FFF});
+    std::memcpy(b + kDump, image.data(), image.size());
+    for (usize i = 0; i < std::size(own); i++) std::memcpy(b + own[i].first, saved[i].data(), own[i].second);
+
+    call("cellSailPlayerFinalize", {kP});
+    mask_player_source(b, kP);
+    g_mask.push_back({kP + 0x3C8, 16});
+    g_mask.push_back({kGad, 4});
+    g_mask.push_back({kAuR + 0x20, 0x24});
+    for (u32 i = 0; i < ps_read32(b, kRecords); i++) {
+        const u32 r = kRecords + 16 + 48 * i;
+        const u64 arg = ps_read64(b, r);
+        if (arg == 0x22) g_mask.push_back({r + 32, 8});
+        else if (arg == 0x77) g_mask.push_back({r + 16, 24});
+        else g_mask.push_back({r + 8, 32});
+    }
+    const u32 ring = ps_read32(b, kP + 0x178);
+    for (u32 i = 0; i < ps_read32(b, kP + 0x170); i++) {
+        const u32 e = ring + 16 * i;
+        if (ps_read32(b, e) == 0x40 || ps_read32(b, e) == 0x3C) g_mask.push_back({e + 8, 4});
+        g_mask.push_back({e + 12, 4});
+    }
+}
+
 } // namespace
 
 void compare_runs(int part)
@@ -1316,6 +1407,10 @@ void compare_runs(int part)
                 std::fprintf(stderr, "%s %s\n", r == &mine ? "CALLS-MINE" : "CALLS-SONY", c.c_str());
         dump("heap", kHeap, mine.heap, sony.heap);
     }
+    usize dd = 0;
+    while (dd < mine.dump.size() && mine.dump[dd] == sony.dump[dd]) dd++;
+    INFO(std::format("the image differs first at {:#x}", kDump + dd));
+    CHECK(dd == mine.dump.size());
     CHECK(mine.heap.size() == sony.heap.size());
     usize h = 0;
     while (h < mine.heap.size() && h < sony.heap.size() && mine.heap[h] == sony.heap[h]) h++;
@@ -1365,4 +1460,10 @@ TEST_CASE("cellSail against libsail: the elementary streams chosen, SetEs and Cr
 TEST_CASE("cellSail against libsail: pause, repeat mode and the streams' mute switches", "[hle][lle][sail]")
 {
     compare_runs(11);
+}
+
+
+TEST_CASE("cellSail against libsail: DumpImage at every size", "[hle][lle][sail]")
+{
+    compare_runs(12);
 }

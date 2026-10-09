@@ -838,6 +838,114 @@ s32 cellSailDescriptorOpen(PPUContext& ctx, u32 d)
 
 s32 cellSailDescriptorClose(PPUContext& ctx, u32 d) { return close_descriptor(ctx, d, true); }
 
+// DumpImage(player, buffer, size): the player's state as libsail writes it for Sony's tools, each block at the next
+// 64-byte boundary: the image's version (u64 0x492000), whether libsail leaves module loading to the process (u32), the
+// player's 0x3D8 bytes, its audio, video and user slots, each held descriptor (0xE0 bytes, its URI's length (u32) and
+// text, its elementary stream entries), the built-in source and its state, the dmux pipeline, each slot's stream state
+// (0x70 bytes from +0x10), then each audio pipeline (0xD0) with its renderer (0x50), a u64 0x100 and 0x100 bytes of the
+// renderer's argument, each video pipeline (0x100) with its renderer (0x60) and the same, each AU receiver's callbacks
+// (0x50) and the receiver (0x1C0). The bytes it wrote, with the padding: a block that does not fit ends the image there
+// (its padding counted); padding that does not fit also prints "not enougth buffer".
+u32 cellSailPlayerDumpImage(PPUContext& ctx, u32 p, u32 buf, u32 size)
+{
+    u8* b = gb(ctx);
+    u32 cursor = buf, left = size, count = 0;
+    bool full = false;
+    const auto short_of_room = [&] {
+        StackVar text(ctx, b, 32);
+        std::memcpy(b + text.addr(), "not enougth buffer\n", 20);
+        lv2_lib(ctx, "_sys_printf", {text.addr()});
+        full = true;
+    };
+    // A block at the next 64-byte boundary (or right here): false once the buffer is full.
+    const auto put = [&](const u8* from, u32 n, bool align = true) {
+        if (full) return false;
+        const u32 pad = align ? ((cursor + 63) & ~63u) - cursor : 0;
+        if (left < pad) {
+            short_of_room();
+            return false;
+        }
+        left -= pad;
+        count += pad;
+        cursor += pad;
+        if (left < n) {
+            full = true;
+            return false;
+        }
+        std::memmove(b + cursor, from, n);
+        left -= n;
+        count += n;
+        cursor += n;
+        return true;
+    };
+    const auto put_guest = [&](u32 at, u32 n) {
+        if (!at) {
+            log_call_site(ctx, b, "cellSailPlayerDumpImage: a NULL object in the player (libsail reads address 0)");
+            PS_FATAL(kChan, "cellSailPlayerDumpImage of a player without its objects");
+        }
+        return put(b + at, n);
+    };
+    u8 word[8];
+    ps_write64(word, 0, 0x492000);
+    if (!put(word, 8)) return count;
+    ps_write32(word, 0, loads_modules(ctx) ? 0 : 1);
+    if (!put(word, 4)) return count;
+    if (!put_guest(p, 0x3D8)) return count;
+    const u32 na = r32(ctx, p + pl::kAudioCount), nv = r32(ctx, p + pl::kVideoCount), nu = r32(ctx, p + pl::kUserCount);
+    for (u32 i = 0; i < na; i++)
+        if (!put_guest(audio_slot(ctx, p, i), pl::kAudioStride)) return count;
+    for (u32 i = 0; i < nv; i++)
+        if (!put_guest(video_slot(ctx, p, i), pl::kVideoStride)) return count;
+    for (u32 i = 0; i < nu; i++)
+        if (!put_guest(user_slot(ctx, p, i), pl::kUserStride)) return count;
+    for (const u32 at : {p + pl::kCurrentDescriptor, p + kNextDescriptor}) {
+        const u32 d = r32(ctx, at);
+        if (!d) continue;
+        if (!put_guest(d, 0xE0)) return count;
+        if (const u32 uri = r32(ctx, d + ds::kUri)) {
+            const u32 n = static_cast<u32>(std::strlen(reinterpret_cast<const char*>(b + uri))) + 1;
+            ps_write32(word, 0, n);
+            if (!put(word, 4)) return count;
+            if (!put(b + uri, n, false)) return count;
+        }
+        for (u32 i = 0; i < na; i++)
+            if (!put_guest(r32(ctx, d + ds::kAudio) + i * ds::kAudioStride, ds::kAudioStride)) return count;
+        for (u32 i = 0; i < nv; i++)
+            if (!put_guest(r32(ctx, d + ds::kVideo) + i * ds::kVideoStride, ds::kVideoStride)) return count;
+        for (u32 i = 0; i < nu; i++)
+            if (!put_guest(r32(ctx, d + ds::kUser) + i * ds::kUserStride, ds::kUserStride)) return count;
+    }
+    if (const u32 source = r32(ctx, p + pl::kProtocolSources)) {
+        if (!put_guest(source, 0x80)) return count;
+        if (!put_guest(r32(ctx, source + src::kArg), 0x138)) return count;
+    }
+    if (!put_guest(p + pl::kDmux, 0x58)) return count;
+    for (u32 i = 0; i < na; i++)
+        if (!put_guest(audio_slot(ctx, p, i) + 0x10, 0x70)) return count;
+    for (u32 i = 0; i < nv; i++)
+        if (!put_guest(video_slot(ctx, p, i) + 0x10, 0x70)) return count;
+    for (u32 i = 0; i < nu; i++)
+        if (!put_guest(user_slot(ctx, p, i) + 0x10, 0x70)) return count;
+    ps_write64(word, 0, 0x100);
+    for (u32 i = 0; i < na; i++) {
+        const u32 slot = audio_slot(ctx, p, i), renderer = r32(ctx, slot + 0x150);
+        if (!put_guest(slot + 0x80, 0xD0) || !put_guest(renderer, 0x50) || !put(word, 8) ||
+            !put_guest(r32(ctx, renderer + 4), 0x100))
+            return count;
+    }
+    for (u32 i = 0; i < nv; i++) {
+        const u32 slot = video_slot(ctx, p, i), renderer = r32(ctx, slot + 0x180);
+        if (!put_guest(slot + 0x80, 0x100) || !put_guest(renderer, 0x60) || !put(word, 8) ||
+            !put_guest(r32(ctx, renderer + 4), 0x100))
+            return count;
+    }
+    for (u32 i = 0; i < nu; i++) {
+        const u32 t = r32(ctx, user_slot(ctx, p, i) + 0x80);
+        if (!put_guest(t, 0x50) || !put_guest(r32(ctx, t + 0x24), 0x1C0)) return count;
+    }
+    return count;
+}
+
 // SetPaused(player, paused): the paused state now.
 s32 cellSailPlayerSetPaused(PPUContext& ctx, u32 p, u32 paused) { return command_answer(ctx, p, 0x44, paused); }
 
@@ -916,6 +1024,8 @@ void register_cellSailControl(Registry& r)
             &detail::thunk<&cellSailDescriptorClose>, false},
         ::pspocket::hle::Function{{}, "cellSailPlayerSetPaused", recomp::nid_of("cellSailPlayerSetPaused"),
             &detail::thunk<&cellSailPlayerSetPaused>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerDumpImage", recomp::nid_of("cellSailPlayerDumpImage"),
+            &detail::thunk<&cellSailPlayerDumpImage>, false},
         ::pspocket::hle::Function{{}, "cellSailPlayerSetRepeatMode", recomp::nid_of("cellSailPlayerSetRepeatMode"),
             &detail::thunk<&cellSailPlayerSetRepeatMode>, false},
         ::pspocket::hle::Function{{}, "cellSailPlayerSetEsAudioMuted", recomp::nid_of("cellSailPlayerSetEsAudioMuted"),
