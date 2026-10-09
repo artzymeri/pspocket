@@ -8130,3 +8130,43 @@ the portable one on random input), tests/common/test_npdrm.cpp (content IDs, the
 and long, the key of each licence type for a SELF and an EDAT, no licences, no keys; against RPCS3: the build's keys
 are key_vault.h's, rap_to_rif on 2,000 random RAPs, AES, CMAC and HMAC on random input), tests/disc/test_psn.cpp
 (installing a licence, and the files refused). The SELF, SCE package, SDATA and firmware tests run on Linux now.
+
+## D-581 · 2026-10-09 · EDATA files: decrypted with the game's licence keys, with RPCS3's header checks
+
+A PSN game's EDATA files (NPD files without the SDAT flag) open with their content key: the klicensee for free content
+(licence type 3), the RIF key of the player's RAP otherwise (D-580). As RPCS3 (Crypto/unedat.cpp, Emu/Cell/Modules/
+sceNp.cpp npDrmIsAvailable, Emu/Cell/lv2/sys_fs.cpp lv2_file::open_raw, Crypto/unedat.h loaded_npdrm_keys):
+
+- **The file** (recomp::NpdFile): an EDATA file opens with a given content key, as EDATADecrypter with a final key: a
+  free file's dev hash must match the klicensee (validate_dev_klic: the AES-CMAC of the header's first 0x60 bytes keyed
+  with the klicensee XOR NP_OMAC_KEY_2), debug data excepted; then its first block must decrypt. The blocks are the
+  SDATA reader's (D-165), with the content key in place of the dev hash XOR SDAT_KEY. npd_hashes_valid is
+  validate_npd_hashes: the dev hash, and the title hash, the AES-CMAC with NP_OMAC_KEY_3 of the content ID's 0x30 bytes
+  and the file's name, the name as it is or with its extension in lower or upper case (from its last '.'; a name
+  without one is lowered or raised whole, as RPCS3's search stops at the content ID's last byte).
+- **The game's keys** (hle::NpdrmKeyRing, per process): sceNpDrmIsAvailable, sceNpDrmIsAvailable2 and the two
+  exitspawns check the content at the path and install the key that opens it. An SDAT is refused (NO_ENTITLEMENT), an
+  EDAT that fails the header checks for the name in the path too (a renamed file: RPCS3's answer). Free content
+  installs the klicensee the game passed (zeros when it passed none); other content needs the player's RAP
+  (LICENSE_NOT_FOUND without it or for an invalid content ID, BAD_FORMAT under 16 bytes) and installs its RIF key. A
+  SELF that opens installs the klicensee (the game's, else NP_KLIC_FREE). Sixteen keys are kept, the oldest given up,
+  as RPCS3's ring.
+- **lv2's file system**: sys_fs_open with the EDATA type argument (2) on an "NPD\0" file tries the game's keys, newest
+  first, quietly, and fails with CELL_EFSSPECIFIC when none opens it (logged once with the count), as RPCS3; so a game
+  that opens an EDAT before showing its key gets what it gets on RPCS3. An EDATA file opened as SDATA is refused (RPCS3
+  opens it with no key, which decrypts nothing). An SDATA file opened as EDATA still opens with its own key, logged
+  (RPCS3 refuses it while the game has shown no key).
+- **sceNpDrmVerifyUpgradeLicense** (and ...2) now verifies a trial game's unlock licence as RPCS3's
+  verify_c00_unlock_edat: /dev_hdd0/home/00000001/exdata/<content ID>.edat must pass the header checks with
+  NP_KLIC_FREE, carry that content ID, decrypt with its licence's key, and hold "GOMA" and the content ID at 0x10;
+  before, every licence was reported missing.
+- A build without the NPDRM keys cannot check an EDAT's hashes or make its key: the licence is still looked for, and
+  content that would need the keys is NO_ENTITLEMENT, logged.
+
+Test: tests/common/test_npd.cpp (EDATA files in seven layouts with a klicensee or a RIF key, the wrong key refused by
+the dev hash or the first block, no key, debug data; the header checks for names, extensions in either case, other
+licence types, debug data; against RPCS3's own decrypt_block every block of twelve SDATA and EDATA layouts, and
+validate_dev_klic and validate_npd_hashes on 200 random headers and ten names each), tests/hle/test_np.cpp
+(sceNpDrmIsAvailable's answers and the keys it installs; cellFsOpen of EDATA files before and after the game shows
+their keys, an SDATA open of one, a klicensee never shown; the ring's sixteen; an unlock licence verified and three
+refused).
