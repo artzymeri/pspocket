@@ -476,6 +476,9 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **cellHttp past a connection (D-524).** Connecting, sending, receiving and parsing, chunks, gzip, redirects,
   authentication and cookies from responses, pipelining: written once libnet's resolver is pspocket's (D-523 part 2),
   compared against a loopback server. The disk cache's 12 unnamed exports are not registered. HTTPS waits on cellSsl.
+- **cellSync2 (D-531).** A PPU thread's receivers are 128 bits of two event flags, as libsync2's: a game with more
+  than 128 threads blocked on cellSync2 objects at once gets CELL_SYNC2_ERROR_AGAIN, as on a PS3. The queue's pop
+  spins (yielding after 64 looks) while a counted element's pusher has not linked it yet, as libsync2 spins.
 - **Kernel calls (D-527, D-528).** Every named slot is bound: 560 own, 74 answered as RPCS3's null or stub slots (the
   debugger's sys_dbg family, the crypto engine, colored memory, whose arguments nothing documents; studying
   liblv2coredump and libatxenc would give their signatures). sys_rsxaudio plays nothing: pspocket's console has no AV
