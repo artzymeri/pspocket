@@ -8086,3 +8086,47 @@ libatxdec's, the tones at 2164 and 1303 Hz, the information block, PTS corrected
 sound unit of the wrong ID and a cut frame refused (AT3_ERROR), the next frame decoding; four parameter sets StartSeq
 refuses and joint stereo of two channels taken. cellAtrac with an ATRAC3 file of those frames and no firmware: it
 creates its decoder on pspocket's core and decodes 15,291 samples of the tones.
+## D-580 · 2026-10-09 · PSN licences: a player's RAP to the content key, where pspocket looks for it; AES on every host
+
+The engine checklist's "PSN/NPDRM content" item. A game bought on PSN has its EBOOT.BIN and SPRX modules as NPDRM SELFs
+and many data files as EDATA files; both open with the player's licence for the content or, for free content, with a
+klicensee the game holds. Four steps: the licence (this), EDATA files (D-581), NPDRM SELFs (D-582), installing a .pkg
+(D-583).
+
+- **The licence** (recomp/common npdrm.hpp; RPCS3 Crypto/key_vault.cpp rap_to_rif, unself.cpp DecryptNPDRM and
+  GetKeyFromRap, unedat.cpp EDATADecrypter::ReadHeader, Emu/system_utils.cpp is_valid_content_id). The player's
+  licence is a RAP file, 16 bytes named <CONTENT_ID>.rap (what the dumping tools give); rap_to_rif makes it the
+  content's RIF key. Content of licence type 1 (network) or 2 (local) takes the RIF key of the player's RAP for its
+  content ID; type 3 (free) the klicensee the game shows, NP_KLIC_FREE when it shows none. A SELF of another type is
+  refused (RPCS3 "Invalid NPDRM license type"); an EDAT takes the klicensee when its type's low two bits are 3 and the
+  RAP otherwise, as ReadHeader does. A RAP shorter than 16 bytes is refused with its path (RPCS3: "exists but is
+  invalid"); a longer one gives its first 16 bytes.
+- **Where**: /dev_hdd0/home/00000001/exdata/<CONTENT_ID>.rap, the folder RPCS3 reads (RPCS3 looks in every user's
+  folder; pspocket has the one user). On the Mac that is <--hdd0 DIR>/home/00000001/exdata; on the phone
+  Documents/hdd0/home/00000001/exdata. pspocket/disc/psn.h gives the app ps_psn_rap_path and ps_psn_install_rap, which
+  copies a picked <CONTENT_ID>.rap there after checking its name, content ID and size, for when it offers to take the
+  player's licences.
+- **Keys**: scripts/self-keys.py also writes key_vault.h's RAP_KEY, RAP_PBOX, RAP_E1, RAP_E2, NP_KLIC_FREE, NP_KLIC_KEY,
+  NP_OMAC_KEY_2 and NP_OMAC_KEY_3 into the build directory's self_keys.cpp (recomp::builtin_npdrm_keys), never into
+  git; a build without RPCS3's source has none and says so.
+- **AES on every host** (recomp/common crypto.hpp). The SELF, SCE package and NPD decrypters only worked through Apple's
+  CommonCrypto: on Linux they refused everything and their tests were compiled out, which is also why test_la_noire's
+  SDATA case failed on Linux hosts. They now go through one layer: AES with 128-, 192- and 256-bit keys in ECB, CBC and
+  CTR (the big-endian 128-bit counter), AES-CMAC, and HMAC-SHA1 over pspocket's SHA-1. CommonCrypto still does the AES
+  on Apple platforms (the same calls as before); elsewhere a portable AES does it, PolarSSL's table-driven AES as RPCS3
+  carries it in Crypto/aes.cpp, its tables generated at compile time. The portable one is built on every platform, so
+  a test on the Mac sets the two against each other.
+- **Tests against RPCS3's own code.** These formats can only be checked against RPCS3, so where the build has RPCS3's
+  source a test-only library (tests/common/rpcs3_ref) compiles RPCS3's PolarSSL AES and SHA-1 files as they are, and
+  the functions scripts/rpcs3-extract.py copies out of its key_vault.cpp, utils.cpp, unedat.cpp and unself.cpp (into
+  the build directory only) around small stand-ins for the RPCS3 types they use (be_t, fs::file over memory, the log
+  channels, a SELFDecrypter with only what DecryptNPDRM touches). pspocket's results are compared with RPCS3's on
+  random input. Two of RPCS3's helpers are written there instead of copied: mbedtls_zeroize, and hmac_hash_compare,
+  whose RPCS3 form gives sha1_hmac's 20 bytes a buffer of the key's length (16 for an EDAT's hash mode 4: four bytes
+  past its end).
+
+Test: tests/common/test_crypto.cpp (FIPS-197, SP 800-38A, RFC 2202 and RFC 4493 examples; the platform's AES against
+the portable one on random input), tests/common/test_npdrm.cpp (content IDs, the RAP path, RAP files missing, short
+and long, the key of each licence type for a SELF and an EDAT, no licences, no keys; against RPCS3: the build's keys
+are key_vault.h's, rap_to_rif on 2,000 random RAPs, AES, CMAC and HMAC on random input), tests/disc/test_psn.cpp
+(installing a licence, and the files refused). The SELF, SCE package, SDATA and firmware tests run on Linux now.
