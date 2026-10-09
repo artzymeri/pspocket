@@ -94,6 +94,7 @@ add_library(pspocket_hle STATIC
     src/freetype_cache.cpp
     src/cellSail.cpp
     src/cellSailPlayer.cpp
+    src/cellSailDescriptor.cpp
     src/cellSailRec.cpp
     src/cellSpursJq.cpp
     src/cellFiber.cpp

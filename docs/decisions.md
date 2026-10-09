@@ -7107,6 +7107,19 @@ Part 2, the player's life before it plays (runtime/hle/src/cellSailPlayer.cpp, c
 Compared: 2 scripts, 179 checks: answers, the player's bytes after Initialize, Initialize2 and every mode (each
 side's own code addresses in the built-in source masked), the allocator's heap, and the lv2 calls: 0 differences.
 
+Part 3, descriptors' fields and capabilities (runtime/hle/src/cellSailDescriptor.cpp): a descriptor (the player makes
+it) holds the stream type (0 PAMF, 1 MP4, 2 AVI), URI, media info, flags, player, source, the audio, video and user
+elementary stream tables (0x90, 0x78, 0x4C bytes each, a state byte first), a state byte and the stream's size.
+GetStreamType/GetUri/GetMediaInfo read them; SetParameter (1 with 0 or 8: flag bit 0) and SetAutoSelection only while
+the descriptor is new (INVALID_STATE after); ClearEs takes an elementary stream from state 1 back to 0 (the descriptor
+open at most; INDEX_OUT_OF_RANGE by the player's stream counts); DestroyDatabase answers UNSUPPORTED_STREAM past type
+2. The capability bits: MP4 0xF0, AVI 0x70 with flag bit 0 else 0xF0, PAMF the source's GetCapabilities answer (asked
+with the descriptor's type by GetCapabilities, with 0 by InquireCapability, which adds 0x80 when flag bit 0 is clear).
+GetCapabilities turns them into the kind (1, or 0x75 without flag bit 0), start and seek flags and terminus (0xE with
+bit 0x10, else 8); InquireCapability checks an inquiry (start, seek and terminus types, flags, count, positions)
+against them and the stream's size, with libsail's whole decision tree, and on SDKs after 0x21FFF only for an open
+descriptor (state 1, 3 or 5). Compared: 839 checks (700 inquiries from a fixed pseudo-random spread): 0 differences.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)

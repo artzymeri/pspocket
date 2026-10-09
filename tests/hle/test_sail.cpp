@@ -6,6 +6,7 @@
 #include <catch_amalgamated.hpp>
 
 #include <cstring>
+#include <array>
 #include <format>
 #include <functional>
 #include <optional>
@@ -73,6 +74,7 @@ struct Run {
 using Call = std::function<u64(const char*, std::initializer_list<u64>, bool)>;
 void part1(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part2(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part3(u8* b, const Call& call, u32 cb, GuestThread& t);
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
 Run run(const std::string& flash, bool sony, int part)
@@ -114,7 +116,8 @@ Run run(const std::string& flash, bool sony, int part)
     };
     g_mask.clear();
     if (part == 1) part1(b, call, cb, t);
-    else part2(b, call, cb, t);
+    else if (part == 2) part2(b, call, cb, t);
+    else part3(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
@@ -379,6 +382,110 @@ void part2(u8* b, const Call& call_, u32 cb, GuestThread&)
     }
 }
 
+// Descriptors the script lays out itself (the player makes them; their fields are what the calls read): a stand-in
+// player for the stream counts, a source whose GetCapabilities callback answers the u64 at kCaps (and records the
+// stream type it was asked for after it).
+void part3(u8* b, const Call& call_, u32, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    constexpr u32 kD = kArea + 0x1400, kSrc = kArea + 0x1600, kCaps = kArea + 0x1700, kGetCaps = kArea + 0x1800,
+                  kOut = kArea + 0x1900, kQ = kArea + 0x1A00, kEs = kArea + 0x1B00;
+    // lis/ori r11 = kCaps; ld r0,0(r11); std r0,0(r7); std r4,8(r11); li r3,0; blr
+    const u32 code[] = {0x3D600000u | (kCaps >> 16), 0x616B0000u | (kCaps & 0xFFFF), 0xE80B0000u, 0xF8070000u,
+        0xF88B0008u, 0x38600000u, 0x4E800020u};
+    for (u32 i = 0; i < std::size(code); i++) ps_write32(b, kGetCaps + 4 * i, code[i]);
+    ps_write32(b, kGetCaps + 0x70, kGetCaps);
+    ps_write32(b, kSrc + 4, 0x5151);
+    ps_write32(b, kSrc + 8 + 12 * 4, kGetCaps + 0x70);
+    ps_write32(b, kPlayer + 0x378, 2);
+    ps_write32(b, kPlayer + 0x37C, 1);
+    ps_write32(b, kPlayer + 0x380, 3);
+    const auto desc = [&](u32 type, u32 flags, u8 state, u64 size) {
+        std::memset(b + kD, 0, 0x100);
+        ps_write32(b, kD, type);
+        ps_write32(b, kD + 0x10, kArea + 0x1F00); // the URI
+        ps_write32(b, kD + 0x14, 0x7777);
+        ps_write32(b, kD + 0x18, flags);
+        ps_write32(b, kD + 0x1C, kPlayer);
+        ps_write32(b, kD + 0x24, kSrc);
+        ps_write32(b, kD + 0x28, kEs);
+        ps_write32(b, kD + 0x2C, kEs + 0x200);
+        ps_write32(b, kD + 0x30, kEs + 0x300);
+        b[kD + 0x38] = state;
+        ps_write64(b, kD + 0xD0, size);
+    };
+    desc(0, 0, 0, 0x100000);
+    call("cellSailDescriptorGetStreamType", {kD});
+    call("cellSailDescriptorGetUri", {kD});
+    call("cellSailDescriptorGetMediaInfo", {kD});
+    for (const auto& a : std::vector<std::array<u64, 3>>{{1, 0, 0}, {1, 8, 0}, {1, 8, 1}, {2, 0, 0}, {1, 4, 0}, {1, 0, 0}})
+        call("cellSailDescriptorSetParameter", {kD, a[0], a[1], a[2]});
+    call("cellSailDescriptorSetAutoSelection", {kD, 0});
+    call("cellSailDescriptorIsAutoSelection", {kD});
+    call("cellSailDescriptorSetAutoSelection", {kD, 1});
+    call("cellSailDescriptorIsAutoSelection", {kD});
+    b[kD + 0x38] = 2;
+    call("cellSailDescriptorSetParameter", {kD, 1, 8, 0});
+    call("cellSailDescriptorSetAutoSelection", {kD, 0});
+    // Elementary streams cleared.
+    for (u8 state : {0, 1, 2}) {
+        b[kD + 0x38] = state;
+        for (u32 kind = 0; kind < 4; kind++) {
+            for (u32 index = 0; index < 4; index++) {
+                b[kEs + 0x90 * index] = 1;
+                b[kEs + 0x200 + 0x78 * index] = static_cast<u8>(index & 1);
+                b[kEs + 0x300 + 0x4C * index] = 1;
+                call("cellSailDescriptorClearEs", {kD, kind, index});
+            }
+        }
+    }
+    for (u32 type = 0; type < 4; type++) {
+        ps_write32(b, kD, type);
+        call("cellSailDescriptorDestroyDatabase", {kD});
+    }
+    // Capabilities.
+    for (u32 type : {0u, 1u, 2u, 5u}) {
+        for (u32 flags : {0u, 1u}) {
+            for (u64 caps : {0x0ull, 0x1ull, 0x11ull, 0x41ull, 0x80ull, 0xD1ull, 0xFFull}) {
+                desc(type, flags, 1, 0x100000);
+                ps_write64(b, kCaps, caps);
+                std::memset(b + kOut, 0xEE, 0x10);
+                call("cellSailDescriptorGetCapabilities", {kD, kOut, kOut + 4, kOut + 8, kOut + 12});
+            }
+        }
+    }
+    ps_write32(b, kD + 0x10, 0);
+    call("cellSailDescriptorGetCapabilities", {kD, kOut, kOut + 4, kOut + 8, kOut + 12});
+    // InquireCapability over a spread of inquiries (a fixed pseudo-random walk).
+    u32 seed = 12345;
+    const auto rnd = [&](u32 n) {
+        seed = seed * 1103515245u + 12345u;
+        return (seed >> 16) % n;
+    };
+    static const u32 kStarts[] = {0, 1, 2, 4, 0x10, 0x20, 0x40, 7};
+    static const u32 kSeeks[] = {0, 1, 0x10, 0x40, 5};
+    static const u32 kTerms[] = {0, 1, 2, 0x20, 9};
+    static const u32 kHows[] = {0, 1, 2, 8, 0x10, 0x20, 0x40};
+    static const s32 kCounts[] = {0, 1, -1, 2};
+    static const u64 kPos[] = {0, 0x100, 0x80000, 0x100000, 0x200000};
+    static const u64 kCapsSet[] = {0x00, 0x11, 0x51, 0xD1, 0xFF, 0x10, 0x01};
+    for (u32 i = 0; i < 700; i++) {
+        const u32 type = rnd(4) == 3 ? 3 : rnd(3);
+        desc(type, rnd(2), static_cast<u8>(rnd(6)), 0x100000);
+        ps_write64(b, kCaps, kCapsSet[rnd(7)]);
+        std::memset(b + kQ, 0, 0x30);
+        ps_write32(b, kQ, kStarts[rnd(8)]);
+        ps_write32(b, kQ + 4, kSeeks[rnd(5)]);
+        ps_write32(b, kQ + 8, kTerms[rnd(5)]);
+        ps_write32(b, kQ + 12, kHows[rnd(7)]);
+        ps_write32(b, kQ + 16, static_cast<u32>(kCounts[rnd(4)]));
+        if (rnd(10) == 0) ps_write32(b, kQ + 20, 1);
+        ps_write64(b, kQ + 0x18, kPos[rnd(5)]);
+        ps_write64(b, kQ + 0x20, kPos[rnd(5)]);
+        call("cellSailDescriptorInquireCapability", {kD, rnd(20) == 0 ? 0u : kQ});
+    }
+}
+
 void compare_lines(const char* what, const std::vector<std::string>& mine, const std::vector<std::string>& sony)
 {
     usize differ = 0;
@@ -410,3 +517,5 @@ void compare_runs(int part)
 TEST_CASE("cellSail against libsail: allocator, future, source, renderers", "[hle][lle][sail]") { compare_runs(1); }
 
 TEST_CASE("cellSail against libsail: the player's life before it plays", "[hle][lle][sail]") { compare_runs(2); }
+
+TEST_CASE("cellSail against libsail: descriptors' fields and capabilities", "[hle][lle][sail]") { compare_runs(3); }
