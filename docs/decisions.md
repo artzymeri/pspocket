@@ -7607,3 +7607,34 @@ player and a removed one; a stereo player at double speed and a looped one, fram
 the utilities. tests/hle/test_lle.cpp: a firmware-first library goes to its module when one is installed (for the game
 and for a module importing it) and to the host when not. To do on the Mac: compare libmixer with libmixer.sprx
 (firmware_compare.hpp), then drop its marker.
+
+## D-564 · 2026-10-09 · cellVpost pspocket's own, from RPCS3, firmware first
+
+libvpost scales a decoded YUV 4:2:0 picture and converts it to RGBA (games use it on the pictures cellVdec gives them).
+Made from RPCS3 rpcs3/Emu/Cell/Modules/cellVpost.cpp and cellVpost.h: the structures, the error codes, the handles
+(idm IDs from 1, not reused at once), QueryAttr's answers (4 MB, delay 0, RPCS3's version words), the picture
+information Exec writes, the input layout (Y, then U, then V, each with its width's stride) and the output (RGBA bytes,
+the alpha outAlpha). No Sony module was at hand: firmware first (D-563). Where RPCS3 leaves things out (libswscale's
+bilinear scaler, its default BT.601 broadcast conversion, every window and type ignored), pspocket follows what the
+structures ask for:
+- The input's colour matrix (BT.601 or BT.709) and range (full, or broadcast: Y 16-235, C 16-240) convert it.
+- inWindow is the part of the input scaled, outWindow where it goes; a window without width or height is the whole
+  picture, one past the picture's edge is cut to it (logged once); output pixels outside outWindow stay as they were.
+- outPicFmt YUV420_PLANAR gives the scaled planes, without conversion (RPCS3 always writes RGBA).
+- Chroma positions: type A has a chroma sample at every second luma column (MPEG-2's siting), type B between two
+  (MPEG-1's); vertically both are between two lines. An assumption about the SDK's two types, a quarter of a pixel of
+  chroma at most.
+- The scaler: a tent filter as wide as the scaling, centre to centre (bilinear interpolation when enlarging, an average
+  of what each output pixel covers when reducing), as libswscale's bilinear; the other scaler types and the field
+  conversions run the same way on the whole frame (as RPCS3), logged once; the picture information reports the exec
+  type's structures and scan types.
+- Checks as the error codes name them: null pointers, a configuration with formats libvpost has not or no sizes, sizes
+  past the handle's maxima or an exec type past the eight, buffers outside guest memory. The resource (memory, threads,
+  SPUs or SPURS) is only checked for being there: the work runs on the calling thread.
+Speed (this container, x86, -O2): 1280x720 in, 15.6 ms to 1280x720 RGBA, 35 ms to 1920x1080, 4.7 ms to 640x360. To
+measure on the iPhone with a game's video before anything is optimized (rule 8).
+
+Tests: tests/hle/test_vpost.cpp, 6 cases, 284 checks: the five functions and the marker; QueryAttr and the handles with
+their errors; 17 flat colours (black, white and the three primaries in both matrices and ranges) against their
+standard YCbCr values, with the alpha; a picture enlarged 2x and reduced 2x against hand-worked values, the windows and
+the picture information; YUV out (a same-size copy, both chroma types, and a flat picture enlarged); Exec's checks.
