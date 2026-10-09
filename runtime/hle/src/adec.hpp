@@ -5,7 +5,8 @@
 // table of operations (CellAdecCoreOps); the cores report back through four notification functions. pspocket's front
 // end (cellAdec.cpp) keeps the same context, laid out as Sony's, and calls a core through AdecCore: its own (LPCM,
 // adec_lpcm.cpp; ATRAC3plus, adec_atracx.cpp) directly, or Sony's core module through its operation table, as RPCS3's
-// cellAdec calls the LLE cores.
+// cellAdec calls the LLE cores. For MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3 and ATRAC3 the firmware's core
+// serves first and pspocket's own core on FFmpeg (adec_ffmpeg.hpp) where no firmware module gives one (D-577).
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h.
 
 #include <memory>
@@ -27,7 +28,12 @@ constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
 enum : s32 {
     CELL_ADEC_TYPE_LPCM_PAMF = 1,
+    CELL_ADEC_TYPE_AC3 = 2,
     CELL_ADEC_TYPE_ATRACX = 3,
+    CELL_ADEC_TYPE_MP3 = 4,
+    CELL_ADEC_TYPE_ATRAC3 = 5,
+    CELL_ADEC_TYPE_MPEG_L2 = 6,
+    CELL_ADEC_TYPE_M2AAC = 7,
     CELL_ADEC_TYPE_LPCM_BLURAY = 12,
     CELL_ADEC_TYPE_ATRACX_2CH = 13,
     CELL_ADEC_TYPE_ATRACX_6CH = 14,
@@ -35,7 +41,14 @@ enum : s32 {
     CELL_ADEC_TYPE_M4AAC = 16,
     CELL_ADEC_TYPE_LPCM_DVD = 17,
     CELL_ADEC_TYPE_M4AAC_2CH = 20,
+    CELL_ADEC_TYPE_MPEG_L1 = 22,
     CELL_ADEC_TYPE_M4AAC_2CH_MOD = 24,
+};
+
+// The output channel layouts (RPCS3 CellAdecChannel), as LPCM's parameters and information name them.
+enum : u32 {
+    CELL_ADEC_CH_MONO = 1, CELL_ADEC_CH_STEREO = 3, CELL_ADEC_CH_3_0 = 4, CELL_ADEC_CH_2_1 = 5, CELL_ADEC_CH_3_1 = 6,
+    CELL_ADEC_CH_2_2 = 7, CELL_ADEC_CH_3_2 = 8, CELL_ADEC_CH_3_2_LFE = 9, CELL_ADEC_CH_3_4 = 10, CELL_ADEC_CH_3_4_LFE = 11,
 };
 constexpr bool is_lpcm(s32 type)
 {
@@ -43,8 +56,12 @@ constexpr bool is_lpcm(s32 type)
 }
 
 // How the front end corrects the PTS of an access unit the game gave none (RPCS3 AdecCorrectPtsValueType): a fixed step
-// after the previous one for these; the others call the core module's _SceAdecCorrectPtsValue_*.
+// after the previous one for these; the others call the core module's _SceAdecCorrectPtsValue_* (or, for pspocket's own
+// core of such a codec, AdecCore::correct_pts).
 constexpr s8 CORRECT_PTS_LPCM_HDMV = 0;
+constexpr s8 CORRECT_PTS_AC3 = 5, CORRECT_PTS_ATRAC3 = 6, CORRECT_PTS_MP3_48000 = 7, CORRECT_PTS_MP3_44100 = 8,
+             CORRECT_PTS_MP3_32000 = 9, CORRECT_PTS_MPEG_L2 = 26, CORRECT_PTS_M4AAC = 29, CORRECT_PTS_MPEG_L1 = 32;
+constexpr u32 CODEC_TS_INVALID = 0xFFFFFFFF;
 
 // AdecContext (0x530, the CellAdecHandle): its fields' offsets. res is CellAdecResource (totalMemSize, startAddr,
 // ppuThreadPriority, spuThreadPriority, ppuThreadStackSize), cb CellAdecCb (cbFunc, cbArg), previous_pts a
@@ -84,6 +101,10 @@ public:
     virtual s32 decode_au(PPUContext& ctx, u32 core_handle, s32 pcm_handle, u32 au_info) = 0;
     virtual s32 realign(PPUContext& ctx, u32 core_handle, u32 out_buffer, u32 pcm_start) = 0;
     virtual s32 release_pcm(PPUContext& ctx, u32 core_handle, s32 pcm_handle, u32 out_buffer) = 0;
+    // The PTS of an access unit the game gave none, for the codecs whose core module corrects it with a function of its
+    // own (_SceAdecCorrectPtsValue_*, called with the core's handle and the frame's CellCodecTimeStamp): pspocket's own
+    // cores of those codecs answer here; CELL_OK or an error (the front end makes it FATAL). The others never get it.
+    virtual s32 correct_pts(PPUContext& ctx, u32 core_handle, u32 au_pts);
 };
 
 // pspocket's LPCM core (adec_lpcm.cpp), for the three LPCM types.
@@ -91,6 +112,9 @@ std::unique_ptr<AdecCore> make_lpcm_core();
 // pspocket's ATRAC3plus core on FFmpeg (adec_atracx.cpp), for up to `max_channels` channels (its memory size); none in a
 // build without FFmpeg.
 std::unique_ptr<AdecCore> make_atracx_core(u32 max_channels);
+// pspocket's own core on FFmpeg for a codec whose firmware core serves first (adec_ffmpeg.cpp, D-577): MP3, MPEG audio
+// layers I and II, MPEG-4 AAC (the three types), AC-3 and ATRAC3. None for another type or in a build without FFmpeg.
+std::unique_ptr<AdecCore> make_ffmpeg_core(s32 type);
 
 // What the front end sets in the LPCM core's context (RPCS3 adecOpen, adecSetLpcmBlurayParams, adecSetLpcmDvdParams,
 // cellAdecGetPcm): the DVD packing before it opens, the Blu-ray and DVD forms' parameters from each access unit's user
@@ -111,7 +135,8 @@ s32 notify_seq_done(PPUContext& ctx, u32 context);
 // The four notifications as guest functions, for Sony's cores (internal functions of cellAdec, linked with it), and
 // the LPCM core's thread. pspocket's own NIDs: nid_of of each name.
 constexpr u32 NID_notify_au_done = 0x22351FEC, NID_notify_pcm_out = 0xAF08E5A0, NID_notify_error = 0xF1642C29,
-              NID_notify_seq_done = 0xD2B167B0, NID_lpcm_dec_thread = 0x4ED4A064, NID_atracx_dec_thread = 0x346C0076;
+              NID_notify_seq_done = 0xD2B167B0, NID_lpcm_dec_thread = 0x4ED4A064, NID_atracx_dec_thread = 0x346C0076,
+              NID_ffmpeg_dec_thread = 0x01A3568A;
 s32 _pspocket_adec_notify_au_done(PPUContext& ctx, s32 pcm_handle, u32 context);
 s32 _pspocket_adec_notify_pcm_out(PPUContext& ctx, s32 pcm_handle, u32 pcm_addr, u32 pcm_size, u32 context,
     u32 bsi_info_ptr, u8 correct_pts_type, s32 error_code);
@@ -119,5 +144,6 @@ s32 _pspocket_adec_notify_error(PPUContext& ctx, s32 error_code, u32 context);
 s32 _pspocket_adec_notify_seq_done(PPUContext& ctx, u32 context);
 void _pspocket_lpcm_dec_thread(PPUContext& ctx, u64 core_handle);
 void _pspocket_atracx_dec_thread(PPUContext& ctx, u64 core_handle);
+void _pspocket_adec_ffmpeg_dec_thread(PPUContext& ctx, u64 core_handle);
 
 } // namespace pspocket::hle::adec

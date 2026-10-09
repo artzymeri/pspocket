@@ -2,10 +2,11 @@
 // context in the memory the game gives (AdecContext, its frames and bitstream information blocks, then the core's
 // memory) and decodes through a core: pspocket's own for the three LPCM types (adec_lpcm.cpp) and ATRAC3plus
 // (adec_atracx.cpp, on FFmpeg, D-198); for every other codec, the firmware's core module (MP3, AC-3, AAC, ...) through
-// the operation table it exports, as
-// Sony's libadec and RPCS3's cellAdec call it. The core modules are the host's imports of cellAdec
-// (Registry::add_imports): the loader chooses and links them for a game importing cellAdec, as it would for libadec.
-// pspocket's own cores on FFmpeg replace them one codec at a time.
+// the operation table it exports, as Sony's libadec and RPCS3's cellAdec call it. The core modules are the host's
+// imports of cellAdec (Registry::add_imports): the loader chooses and links them for a game importing cellAdec, as it
+// would for libadec. Where no firmware module gives one, pspocket's own core on FFmpeg serves the codecs it has one of
+// (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3; adec_ffmpeg.hpp): firmware first, as D-563 does
+// for whole libraries, until each is compared with Sony's core on the Mac.
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h (get_core_ops, AdecContext, the notifications, the API).
 
 //
@@ -13,7 +14,7 @@
 // - cellAdecQueryAttr's adecVerUpper is 0x492000, Sony's (4.92); RPCS3 has 0x491000.
 // - A codec whose core no firmware module gives (DTS, DTS-HD core, WMA Pro, WMA Lossless; or no firmware installed) is
 //   logged and refused with CELL_ADEC_ERROR_FATAL: Sony's libadec calls through the empty table and crashes, RPCS3
-//   aborts.
+//   aborts. Unless pspocket has a core of its own for it (D-577), which then serves.
 // - Pointers RPCS3 dereferences without a check (LLE would fault) are checked; one that is not guest memory is logged
 //   and refused with CELL_ADEC_ERROR_ARG (D-042). A PCM handle out of range is FATAL (LLE reads past the frames).
 
@@ -206,8 +207,33 @@ private:
     u32 ops_;
 };
 
-// pspocket's own core for a codec type, or none.
-std::unique_ptr<AdecCore> own_core(s32 type)
+// What a decoder whose core is gone answers (a handle whose type has no core: logged, FATAL).
+class NoCore final : public AdecCore {
+public:
+    explicit NoCore(s32 type) : type_(type) {}
+    u32 mem_size(PPUContext&) override { return fail(), 0; }
+    s32 pcm_handle_num(PPUContext&) override { return fail(); }
+    u32 bsi_info_size(PPUContext&) override { return fail(), 0; }
+    u32 version(PPUContext&) override { return fail(), 0; }
+    s32 open(PPUContext&, u32, u32, u32, u32) override { return fail(); }
+    s32 close(PPUContext&, u32) override { return fail(); }
+    s32 start_seq(PPUContext&, u32, u32) override { return fail(); }
+    s32 end_seq(PPUContext&, u32) override { return fail(); }
+    s32 decode_au(PPUContext&, u32, s32, u32) override { return fail(); }
+    s32 realign(PPUContext&, u32, u32, u32) override { return fail(); }
+    s32 release_pcm(PPUContext&, u32, s32, u32) override { return fail(); }
+
+private:
+    s32 fail() const
+    {
+        PS_LOG_ERROR(kChan, "a decoder of codec type {} with no core (not opened on one)", type_);
+        return error(CELL_ADEC_ERROR_FATAL);
+    }
+    s32 type_;
+};
+
+// pspocket's own core that serves a type before any firmware module's: LPCM (D-197) and ATRAC3plus on FFmpeg (D-198).
+std::unique_ptr<AdecCore> own_first_core(s32 type)
 {
     if (is_lpcm(type)) return make_lpcm_core();
     switch (type) {
@@ -219,30 +245,47 @@ std::unique_ptr<AdecCore> own_core(s32 type)
     }
 }
 
-// The core for a codec type: pspocket's, else the core module's table the loader linked; none (logged) when no
-// firmware module gives it.
+// The core for a codec type (D-577): pspocket's own first for LPCM and ATRAC3plus; else the core module's table the
+// loader linked (Sony's serves first where the installed system software has it); else pspocket's own core on FFmpeg
+// for the codecs it has one of; else none (logged). *ops_out: the table chosen, 0 for pspocket's own (open keeps it in
+// the context, so the decoder stays on what it was opened on).
 std::unique_ptr<AdecCore> core_for(s32 type, u32* ops_out = nullptr)
 {
     if (ops_out) *ops_out = 0;
-    if (std::unique_ptr<AdecCore> own = own_core(type)) return own;
+    if (std::unique_ptr<AdecCore> own = own_first_core(type)) return own;
     const CoreOps& c = kCoreOps[static_cast<usize>(type)];
     const u32 ops = c.library.empty() ? 0 : HleProcess::current()->imported(c.library, c.nid);
-    if (!ops) {
-        PS_LOG_ERROR(kChan, "codec type {}: no core ({}): pspocket has none of its own and no firmware module gave {}",
-            type, c.library.empty() ? "a reserved type" : "not in the firmware, or none installed",
-            c.library.empty() ? "one" : std::format("{} ({:#010x})", c.library, c.nid));
-        return nullptr;
+    if (ops) {
+        if (ops_out) *ops_out = ops;
+        return std::make_unique<GuestCore>(ops);
     }
-    if (ops_out) *ops_out = ops;
-    return std::make_unique<GuestCore>(ops);
+    if (std::unique_ptr<AdecCore> own = make_ffmpeg_core(type)) {
+        if (ops_out)
+            PS_LOG_INFO(kChan, "codec type {}: no firmware module gave {} ({:#010x}): pspocket's own core (D-577)", type,
+                c.library, c.nid);
+        return own;
+    }
+    PS_LOG_ERROR(kChan, "codec type {}: no core ({}): pspocket has none of its own and no firmware module gave {}", type,
+        c.library.empty() ? "a reserved type" : "not in the firmware, or none installed",
+        c.library.empty() ? "one" : std::format("{} ({:#010x})", c.library, c.nid));
+    return nullptr;
 }
 
-// The core of an open decoder (its type, or the table it was opened with).
+// The core of an open decoder: what open chose (D-577): pspocket's own first-served core, else the table it was opened
+// on, else pspocket's own core of its codec.
 std::unique_ptr<AdecCore> core_of(u8* base, u32 h)
 {
     const s32 type = static_cast<s32>(ps_read32(base, h + ctx_off::type));
-    if (std::unique_ptr<AdecCore> own = own_core(type)) return own;
-    return std::make_unique<GuestCore>(ps_read32(base, h + ctx_off::core_ops));
+    if (std::unique_ptr<AdecCore> own = own_first_core(type)) return own;
+    if (const u32 ops = ps_read32(base, h + ctx_off::core_ops)) return std::make_unique<GuestCore>(ops);
+    if (std::unique_ptr<AdecCore> own = make_ffmpeg_core(type)) return own;
+    return std::make_unique<NoCore>(type);
+}
+
+// Whether an open decoder runs on pspocket's own core of a codec the firmware serves first (D-577).
+bool on_own_fallback_core(u8* base, u32 h)
+{
+    return !ps_read32(base, h + ctx_off::core_ops) && !own_first_core(static_cast<s32>(ps_read32(base, h + ctx_off::type)));
 }
 
 u32 core_handle(u8* base, u32 h) { return ps_read32(base, h + ctx_off::core_handle); }
@@ -517,7 +560,6 @@ constexpr PtsFunction kPtsFunctions[] = {
     {35, "cellWMAPROdec", 0x8D45F21A}, {36, "cellWMALSLdec", 0xF2F9C183}, {37, "cellDTSHDCOREdec", 0xD4C180D4},
     {38, "cellDTSHDCOREdec", 0xD4C180D4},
 };
-constexpr s8 CORRECT_PTS_M4AAC = 29;
 
 s32 call_pts_function(PPUContext& ctx, u32 h, std::string_view library, u32 nid, u32 au_pts)
 {
@@ -530,15 +572,25 @@ s32 call_pts_function(PPUContext& ctx, u32 h, std::string_view library, u32 nid,
     return r != lv2::CELL_OK ? error(CELL_ADEC_ERROR_FATAL) : lv2::CELL_OK;
 }
 
+// pspocket's own core of a codec whose core module corrects PTS with a function of its own (D-577): its own correction.
+s32 own_pts_function(PPUContext& ctx, u32 h, u32 au_pts)
+{
+    u8* base = guest_base(ctx);
+    return core_of(base, h)->correct_pts(ctx, core_handle(base, h), au_pts) != lv2::CELL_OK ? error(CELL_ADEC_ERROR_FATAL)
+                                                                                         : lv2::CELL_OK;
+}
+
 // RPCS3 AdecContext::correct_pts_value: a PTS the game did not give follows the previous one by the core's step.
 s32 correct_pts_value(PPUContext& ctx, u32 h, s32 pcm_handle, s8 type)
 {
     u8* base = guest_base(ctx);
     if (verify_pcm_handle(base, h, pcm_handle) != lv2::CELL_OK) return error(CELL_ADEC_ERROR_FATAL);
     const u32 pts = frame_at(base, h, pcm_handle) + frame_off::au_info + 8;
+    const bool own = on_own_fallback_core(base, h);
     for (const PtsFunction& f : kPtsFunctions)
-        if (f.type == type) return call_pts_function(ctx, h, f.library, f.nid, pts);
+        if (f.type == type) return own ? own_pts_function(ctx, h, pts) : call_pts_function(ctx, h, f.library, f.nid, pts);
     if (type == CORRECT_PTS_M4AAC) {
+        if (own) return own_pts_function(ctx, h, pts);
         switch (static_cast<s32>(ps_read32(base, h + ctx_off::type))) {
         case CELL_ADEC_TYPE_M4AAC: return call_pts_function(ctx, h, "cellM4AacDec", 0x431A1DCA, pts);
         case CELL_ADEC_TYPE_M4AAC_2CH: return call_pts_function(ctx, h, "cellM4AacDec2ch", 0x869E328D, pts);
@@ -913,6 +965,7 @@ void register_cellAdec(Registry& r)
     using adec::_pspocket_adec_notify_error;
     using adec::_pspocket_adec_notify_pcm_out;
     using adec::_pspocket_adec_notify_seq_done;
+    using adec::_pspocket_adec_ffmpeg_dec_thread;
     using adec::_pspocket_atracx_dec_thread;
     using adec::_pspocket_lpcm_dec_thread;
     r.add("cellAdec", {
@@ -932,6 +985,7 @@ void register_cellAdec(Registry& r)
         PS_HLE_INTERNAL(adec::NID_notify_seq_done, _pspocket_adec_notify_seq_done),
         PS_HLE_INTERNAL(adec::NID_lpcm_dec_thread, _pspocket_lpcm_dec_thread),
         PS_HLE_INTERNAL(adec::NID_atracx_dec_thread, _pspocket_atracx_dec_thread),
+        PS_HLE_INTERNAL(adec::NID_ffmpeg_dec_thread, _pspocket_adec_ffmpeg_dec_thread),
     });
     r.add_imports("cellAdec", kImports);
 }

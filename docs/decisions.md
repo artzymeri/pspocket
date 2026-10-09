@@ -7902,3 +7902,54 @@ Test: on this Linux host (x86-64, clang 18), build/host/tests/hle/test_hle "[ade
 26 cases, 24 pass and 2 skip (the comparisons with Sony's modules need the firmware), 3,572 checks. The whole ctest
 run fails only where it did before: test_spu_fuzz (x86 floating point), test_la_noire's SDATA case, sys_libm's
 fmax/fmin signed zeros on glibc.
+
+## D-577 · 2026-10-09 · cellAdec's other codecs: the firmware's core first, pspocket's own on FFmpeg where none (part 1: the rule, the common core, MP3)
+
+D-197 left every codec but LPCM and ATRAC3plus to the firmware's core module, so without the PS3 system software a game
+decoding MP3, MPEG audio, AAC, AC-3 or ATRAC3 through cellAdec got CELL_ADEC_ERROR_FATAL. pspocket now has cores of its
+own for them on FFmpeg's LGPL decoders. None is compared with Sony's core yet (that needs the firmware, on the Mac), so
+they serve as D-563's firmware-first libraries do: only where Sony's is missing.
+
+**The rule** (cellAdec.cpp). core_for: LPCM and ATRAC3plus are pspocket's first, as before; for the other types the
+table the loader linked from the firmware's module (Sony's core) serves; where none was linked, pspocket's own core of
+the codec (make_ffmpeg_core); else, as before, a logged FATAL. Open keeps the table it chose in the context (core_ops,
+0 for pspocket's own), and core_of follows it, so a decoder opened on Sony's table stays on it and one opened on
+pspocket's core stays on that. A context whose type has no core any more answers FATAL, logged (NoCore). The cores
+whose module corrects PTS with a function of its own (_SceAdecCorrectPtsValue_*: MPEG audio, AAC) have no such module
+here: the front end asks pspocket's core (AdecCore::correct_pts) instead. cellAdec's imports of the core modules are
+unchanged, so the loader still links Sony's where the system software has them.
+
+**The common part** (adec_ffmpeg.cpp/.hpp), shaped as adec_atracx.cpp (RPCS3's port of libatxdec's PPU side,
+cellAtracXdec.cpp): a context in the game's memory at the core's handle (pspocket's layout, 0x200 bytes: Sony's is not
+known), a command queue of four (a start carries its parameters, copied), lv2 mutexes and conditions, and a PPU thread
+of the decoder's ("HLE MP3 decoder", ...) that decodes one access unit at a time once the game took the previous PCM;
+after every decode AUDONE, then PCMOUT with the information block, an error first notified (ERROR) and then given with
+PCMOUT and no PCM. Three PCM handles (libatxdec's number); the memory is the context, one access unit's PCM and room for
+the front end's alignment. FFmpeg's float decoders are opened by name for each sequence; their planar floats become
+big-endian interleaved PCM converted as libatxdec's (floats held below 1, integers floored and held in range). Each
+codec's file gives its parameters' check (on the game's thread: cellAdecStartSeq answers the codec's error), its
+decoding and its information block, from RPCS3's structures (rpcs3/Emu/Cell/Modules/cellAdec.h); the cores' versions
+are pspocket's word (0x01000000), Sony's not being known. The PTS correction of the cores that have their own: the
+front end's rule with the core's own last PTS plus that frame's length (rounded 90 kHz ticks, as the front end's fixed
+steps are rounded).
+
+**MP3** (adec_mp3.cpp, for cellMP3dec): CellAdecParamMP3's bw_pcm 16-bit (3) or float (4), another refused (ARG); one
+MPEG-1 or MPEG-2 layer III frame per access unit, decoded by mp3float; the PCM the stream's 1 or 2 channels. Header
+errors as the codes name them: no sync LOST_SYNC, layer I or II NOT_L3, MPEG-2.5 or the reserved version BAD_VERSION
+(the front end's PTS steps name only MPEG-1's rates and their halves), free format or index 15 BAD_BITRATE, the
+reserved rate BAD_SFREQ and emphasis BAD_EMPHASIS, a switched window of block type 0 BAD_BLKTYPE, a unit shorter than
+its frame or refused by FFmpeg MP3_ERROR. CellAdecMP3Info: the header word; the side information's main_data_begin;
+the main data bytes in the frame (now) and what remains of the bit reservoir after it (main_data_begin + now less the
+frame's part2_3_length in whole bytes); uc_crc the protection bit; the header's mode, extension, copyright, original and
+emphasis; uc_crc_error_flag from the CRC over the header's second half and the side information (the frame still
+decodes: the codes have no CRC error); i_error_code. PTS: the front end's types 7, 8, 9 (MPEG-2's 576-sample frames at
+half the rates last as long), also for a frame refused past its header.
+
+Test: tests/hle/test_adec_cores.cpp (helpers shared with test_adec.cpp in tests/hle/adec_test_util.hpp). The rule: with
+no firmware module, QueryAttr gives pspocket's MP3 sizes; with a firmware table linked (a fake one in guest code), its
+sizes and version, and a decoder opened on it reaches its open, startSeq, decodeAu, endSeq and close. MP3, frames built
+in the test (one spectral line per granule and channel in the count1 region, table B): eight stereo 48 kHz frames,
+float and 16-bit, the PCM byte for byte FFmpeg's own decoding of them, each channel's tone where its line puts it, the
+items' sizes, PTS (a missing one corrected by 2160) and user data, the information blocks, a layer II header refused
+in the middle (ERROR, AUDONE, PCMOUT with NOT_L3 and no PCM); mono at 44.1 kHz and MPEG-2 at 22.05 kHz (steps of 2351);
+a CRC mismatch flagged and decoded; every header error above; a word size refused by StartSeq.
