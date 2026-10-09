@@ -97,7 +97,7 @@ chat (D-187); the Japanese IME (D-188); recording, the sub display (D-189). The 
 as RPCS3's do (D-182), and the kernel's gaps are filled (D-184). That is 1,536 host functions in 58 modules, plus 296
 stub answers. Left out on purpose:
 
-- raw SPUs and interrupt threads, which few retail games use (D-184);
+- (raw SPUs, isolated SPUs and interrupt threads came later: D-528, through guest MMIO faults);
 - cellMicStopEx, fatal in RPCS3 too;
 - cellSysmodule's OpenPSID decryption, which needs a key (D-184).
 
@@ -318,6 +318,10 @@ firmware module. Done so far (2026-10-09: 3,927 of 6,625):
   (D-517), sys_fs with the kernel calls behind it (D-518), cellGcmSys compared with libgcm_sys running on pspocket's lv2
   (D-519), liblv2's internal variables (D-520), sys_lv2dbg (D-521), cellUsbd and cellUsbPspcm with lv2's sys_usbd as a
 console with no USB device (D-522), lv2's network calls and libnet's own layer over them (D-523, part 1).
+Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,
+services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
+interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
+as RPCS3's null or stub slots (debugger, crypto engine, colored memory: signatures not known).
 Next: sys_net part 2 (libnet's resolver behind gethostbyname/gethostbyaddr, if_ctl, name servers, routing, netset,
 dumps), then cellSpurs' Task2 and LF queues, cellSync's ANY2ANY queues, the raw SPU loaders, then the firmware-backed
 libraries one by one.

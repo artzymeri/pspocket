@@ -473,5 +473,13 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **The network (D-523).** lv2 has no interface but loopback and lists none to libnet (sysctl's routing tables are
   empty); a real console without a cable would still list lo0. libnet's per-thread contexts take 3192 bytes of the
   game's pool each, as on a PS3. gethostbyname gives libnet's answers without its resolver's work yet (part 2).
-- **Kernel gaps behind liblv2's wrappers.** sys_rsxaudio (650-658), interrupt threads (84, 89) and process spawning
-  (21) answer CELL_ENOSYS in lv2; RPCS3 implements sys_rsxaudio.
+- **Kernel calls (D-527, D-528).** Every named slot is bound: 560 own, 74 answered as RPCS3's null or stub slots (the
+  debugger's sys_dbg family, the crypto engine, colored memory, whose arguments nothing documents; studying
+  liblv2coredump and libatxenc would give their signatures). sys_rsxaudio plays nothing: pspocket's console has no AV
+  manager enabling an output (D-527 part 4); a game that feeds audio through it would need the samples routed to the
+  host audio unit. Process spawning (21) stays CELL_ENOSYS for a game (RPCS3 too).
+- **Raw SPU registers through faults (D-528).** Each register access costs a signal (a few microseconds); a game
+  polling SPU_Status in a tight loop would spend its time in the handler. If one shows in a profile: let lifted PPU
+  code call the device for the 0xE0040000 window instead of faulting (the lifter knows constant addresses). Exclusive
+  and atomic accesses to the window stay faults (fatal), and only Apple AArch64 decodes faults: an x86 or Linux host
+  answers sys_raw_spu_create with CELL_EAGAIN. SPU DMA to another raw SPU's local store raises a DMA exception.
