@@ -113,9 +113,20 @@ void observe(void* user, u32 number, const u64* a)
 
 // The pool, with what differs by construction cleared: each block header's tag, the lv2 IDs of a thread context's
 // sync object (a 3192-byte block, at +16), the generator's state (2084 bytes).
-std::vector<u8> pool_bytes(u8* b, u32 start)
+std::vector<u8> pool_bytes(const GuestMemory& mem, u8* b, u32 start)
 {
     std::vector<u8> out(b + kPool, b + kPool + kPoolSize);
+    // A block's tag also stays behind in a header that a merge swallowed: any word pointing at a source file's name
+    // ("....c") is a tag.
+    for (u32 off = 0; off + 4 <= kPoolSize; off += 4) {
+        const u32 w = ps_read32(b, kPool + off);
+        if (w < 0x10000 || w >= 0xF0000000 || !mem.is_committed(w) || !mem.is_committed(w + 31)) continue;
+        u32 len = 0;
+        while (len < 32 && b[w + len] >= 0x20 && b[w + len] < 0x7F) len++;
+        if (len >= 3 && len < 32 && b[w + len] == 0 && b[w + len - 2] == '.' && b[w + len - 1] == 'c') {
+            std::memset(out.data() + off, 0, 4);
+        }
+    }
     for (u32 at = start, guard = 0; guard < 4096 && at + 20 <= kPool + kPoolSize; guard++) {
         const u32 size = ps_read32(b, at + 16);
         if (size == 0 || size > kPoolSize) break;
@@ -170,7 +181,7 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
             continue;
         }
         if (name == "pool") {
-            r.pools.push_back(pool_bytes(b, op.args.empty() ? kPool : static_cast<u32>(op.args[0])));
+            r.pools.push_back(pool_bytes(f.mem, b, op.args.empty() ? kPool : static_cast<u32>(op.args[0])));
             r.answers.push_back(0);
             continue;
         }
@@ -216,7 +227,11 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
 void compare(const std::string& flash, const std::vector<Op>& ops, const std::string& what)
 {
     const Run sonys = run(flash, ops, true);
-    if (std::getenv("PSPOCKET_NET_PROBE")) return;
+    if (std::getenv("PSPOCKET_NET_PROBE")) {
+        for (const std::string& c : sonys.calls) std::fprintf(stderr, "CALL %s\n", c.c_str());
+        std::fprintf(stderr, "TTY %s\n", sonys.tty.c_str());
+        return;
+    }
     const Run mine = run(flash, ops, false);
     for (usize i = 0; i < ops.size(); i++) {
         INFO(std::format("{}: step {} {}({:#x}) -> ours {:#x}, Sony's {:#x}", what, i, ops[i].fn,
@@ -522,7 +537,208 @@ std::vector<Op> resolver_script()
     return s;
 }
 
+// A string written with 32-bit stores (its NUL included).
+void put_str(std::vector<Op>& s, u32 at, std::string_view text)
+{
+    std::string t(text);
+    t.push_back('\0');
+    while (t.size() % 4) t.push_back('\0');
+    for (usize i = 0; i < t.size(); i += 4) {
+        const u32 w = u32{static_cast<u8>(t[i])} << 24 | u32{static_cast<u8>(t[i + 1])} << 16 |
+                      u32{static_cast<u8>(t[i + 2])} << 8 | static_cast<u8>(t[i + 3]);
+        s.push_back({"=", {at + i, w}});
+    }
+}
+
+// libnet's configuration functions (D-539): ioctl and control, the dumps, the test parameters, the name servers.
+std::vector<Op> config_script()
+{
+    std::vector<Op> s;
+    init_param(s, kPool, kPoolSize, 0);
+    s.push_back({"sys_net_initialize_network_ex", {kParam}});
+    const u32 txt = kOut + 0x6000; // strings, 0x40 apart
+    const auto text = [&](u32 i, std::string_view t) {
+        put_str(s, txt + 0x40 * i, t);
+        return u64{txt + 0x40 * i};
+    };
+    const u64 ip = text(3, "1.2.3.4"), zero = text(4, "0.0.0.0"), none = text(5, "");
+    // ioctl and control.
+    s.push_back({"socket", {2, 2, 0}});
+    s.push_back({"_sys_net_lib_ioctl", {24, 0xC0000000, 0}});
+    s.push_back({"_sys_net_lib_ioctl", {24, 0x12345678, kOut + 0x100}});
+    for (const u32 cmd : {0x8040691Au, 0x80206913u, 0x80146980u, 0x80146981u, 0x80146982u, 0x800250CFu, 0x801050CDu,
+             0x200050C8u, 0x8020690Eu, 0x80206910u, 0x8020690Cu, 0x8020697Fu, 0x80206919u, 0x80206916u, 0x80206979u,
+             0x8020697Au, 0x8020697Bu, 0x802450C9u, 0x8020698Du, 0x802450CBu, 0x802450CCu, 0x802450CDu, 0xC0186983u,
+             0xC01050CEu, 0x80506979u, 0x8040696Eu, 0x8210698Fu, 0xC00250D0u, 0xC014697Cu, 0xC0146974u, 0xC0146988u,
+             0xC018697Fu, 0xC020697Eu, 0xC0206911u, 0xC0206921u, 0xC0206923u, 0xC0206924u, 0xC0206925u, 0xC02450CAu,
+             0xC020698Cu, 0xC1146975u, 0xC210698Eu, 0x20000000u, 0x00000001u}) {
+        for (u32 k = 0; k < 0x60; k += 4) s.push_back({"=", {kOut + 0x100 + k, 0x11111111u * (k / 4 + 1)}});
+        s.push_back({"_sys_net_lib_ioctl", {24, cmd, kOut + 0x100}});
+        s.push_back({"_sys_net_lib_ioctl", {99, cmd, kOut + 0x100}});
+    }
+    s.push_back({"_sys_net_lib_bnet_control", {1, arg(-2), 3, arg(-4)}});
+    s.push_back({"sys_net_open_dump", {100, 1}});
+    s.push_back({"sys_net_read_dump", {1, kOut + 0x300, 64, kOut + 0x340}});
+    s.push_back({"sys_net_close_dump", {1, kOut + 0x344}});
+    // Test parameters.
+    const u32 tp = kOut + 0x400;
+    s.push_back({"sys_net_get_test_param", {0}});
+    for (const u32 flags : {0x10001u, 0u, 2u, 1u}) {
+        s.push_back({"=", {tp + 8, flags}});
+        s.push_back({"sys_net_get_test_param", {tp}});
+        s.push_back({"=", {tp + 8, flags}});
+        s.push_back({"sys_net_set_test_param", {tp}});
+    }
+    s.push_back({"sys_net_get_netemu_test_param", {0}});
+    s.push_back({"sys_net_get_netemu_test_param", {tp}});
+    s.push_back({"sys_net_set_netemu_test_param", {0}});
+    s.push_back({"=", {tp, 0x00010000}});
+    s.push_back({"sys_net_set_netemu_test_param", {tp}});
+    s.push_back({"=", {tp, 0x12340000}});
+    s.push_back({"=", {tp + 0x20, 0xABCDEF01}});
+    s.push_back({"sys_net_set_netemu_test_param", {tp}});
+    s.push_back({"=", {tp + 0x20, 0}});
+    s.push_back({"sys_net_get_test_param", {tp}});
+    s.push_back({"sys_net_get_udpp2p_test_param", {0}});
+    s.push_back({"sys_net_set_udpp2p_test_param", {0}});
+    s.push_back({"=", {kOut + 0x700, 0x01020304}});
+    s.push_back({"sys_net_set_udpp2p_test_param", {kOut + 0x700}});
+    s.push_back({"sys_net_get_udpp2p_test_param", {kOut + 0x740}});
+    // Name servers.
+    s.push_back({"sys_net_get_name_server", {kOut + 0x800, 3}});
+    s.push_back({"sys_net_get_lib_name_server", {0, 0}});
+    s.push_back({"sys_net_show_nameserver", {}});
+    s.push_back({"=", {kOut + 0x900, 0x01020304}});
+    s.push_back({"=", {kOut + 0x904, 0x05060708}});
+    s.push_back({"sys_net_set_lib_name_server", {kOut + 0x900, kOut + 0x904}});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_net_get_name_server", {kOut + 0x800, 3}});
+    s.push_back({"sys_net_get_name_server", {0, 3}});
+    s.push_back({"sys_net_get_name_server", {kOut + 0x80C, 1}});
+    s.push_back({"sys_net_get_lib_name_server", {kOut + 0x810, kOut + 0x814}});
+    s.push_back({"sys_net_get_lib_name_server", {0, 0}});
+    s.push_back({"sys_net_show_nameserver", {}});
+    s.push_back({"sys_net_set_lib_name_server", {0, kOut + 0x904}});
+    s.push_back({"sys_net_get_lib_name_server", {kOut + 0x818, 0}}); // (libnet copies stack bytes for a missing one)
+    s.push_back({"sys_net_set_lib_name_server", {0, 0}});
+    s.push_back({"pool", {}});
+    s.push_back({"_sce_net_add_name_server", {0, 0x0A000001, 0}, kSign, kOut + 0xA00});
+    s.push_back({"_sce_net_add_name_server", {0, 0x0A000002, (kOut + 0xA00) | kDeref}, kSign, kOut + 0xA04});
+    s.push_back({"_sce_net_add_name_server", {0, 0x0A000003, (kOut + 0xA04) | kDeref}, kSign, kOut + 0xA08});
+    s.push_back({"_sce_net_add_name_server_with_char", {0, ip, 0}, kSign, kOut + 0xA0C});
+    s.push_back({"_sce_net_add_name_server_with_char", {0, 0, 0}, kSign});
+    s.push_back({"_sce_net_add_name_server_with_char", {0, zero, 0}, kSign});
+    s.push_back({"_sce_net_add_name_server_with_char", {0, none, (kOut + 0xA0C) | kDeref}, kSign, kOut + 0xA10});
+    s.push_back({"pool", {}});
+    s.push_back({"_sce_net_set_name_server", {(kOut + 0xA08) | kDeref}});
+    s.push_back({"sys_net_get_name_server", {kOut + 0x820, 3}});
+    s.push_back({"_sce_net_get_name_server", {kOut + 0x830, 1}});
+    s.push_back({"sys_net_show_nameserver", {}});
+    s.push_back({"_sce_net_set_name_server", {(kOut + 0xA10) | kDeref}});
+    s.push_back({"sys_net_show_nameserver", {}});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_net_finalize_network", {}});
+    return s;
+}
+
+// Routes, interfaces, sys_net_if_ctl, the netset calls and gethostbyaddr (D-539), on a console with no link.
+std::vector<Op> routes_script()
+{
+    std::vector<Op> s;
+    init_param(s, kPool, kPoolSize, 0);
+    s.push_back({"sys_net_initialize_network_ex", {kParam}});
+    const u32 txt = kOut + 0x6000; // strings, 0x40 apart
+    const auto text = [&](u32 i, std::string_view t) {
+        put_str(s, txt + 0x40 * i, t);
+        return u64{txt + 0x40 * i};
+    };
+    const u64 eth0 = text(0, "eth0"), lo0 = text(1, "lo0"), proxy = text(2, "http_proxy");
+    const u64 ssid = text(6, "ssid"), bad = text(7, "bogus");
+    // Routes.
+    s.push_back({"_sce_net_flush_route", {}});
+    s.push_back({"sys_net_get_routing_table_af", {0, 0, 0}});
+    s.push_back({"sys_net_get_routing_table_af", {2, kOut + 0xC00, 4}});
+    s.push_back({"sys_net_show_route", {}});
+    s.push_back({"pool", {}});
+    s.push_back({"_sce_net_set_default_gateway", {eth0, 0xC0A80001, 0}});
+    s.push_back({"pool", {}});
+    s.push_back({"_sce_net_set_default_gateway", {eth0, 0xC0A80001, 1}});
+    s.push_back({"pool", {}});
+    s.push_back({"_sce_net_set_ip_and_mask", {eth0, 0xC0A80002, 0xFFFFFF00}});
+    s.push_back({"pool", {}});
+    // sys_net_if_ctl.
+    for (const auto& [index, cmd, len] : {std::tuple{0u, 640u, 4u}, std::tuple{0u, 641u, 4u}, std::tuple{0u, 642u, 4u},
+             std::tuple{0u, 643u, 4u}, std::tuple{0u, 644u, 4u}, std::tuple{1u, 640u, 4u}, std::tuple{0u, 640u, 8u},
+             std::tuple{0u, 656u, 0u}, std::tuple{0u, 768u, 4u}, std::tuple{0u, 769u, 50u}, std::tuple{0u, 769u, 62u},
+             std::tuple{0u, 16u, 20u}, std::tuple{0u, 16u, 19u}, std::tuple{1u, 645u, 4u}, std::tuple{0u, 1u, 4u},
+             std::tuple{2u, 3u, 16u}, std::tuple{0u, 0x81000001u, 16u}, std::tuple{0u, 0x80000001u, 16u},
+             std::tuple{0u, 0xFFFFFFFFu, 0u}, std::tuple{0u, 700u, 4u}, std::tuple{0u, 770u, 4u}}) {
+        for (u32 k = 0; k < 0x40; k += 4) s.push_back({"=", {kOut + 0xB00 + k, 0x22222222}});
+        s.push_back({"sys_net_if_ctl", {index, cmd, cmd == 656 ? 0u : kOut + 0xB00, len}});
+    }
+    s.push_back({"sys_net_if_ctl", {0, 640, 0, 4}});
+    s.push_back({"pool", {}});
+    // Interfaces by name.
+    s.push_back({"_sys_net_lib_if_nametoindex", {eth0}});
+    s.push_back({"_sys_net_lib_if_nametoindex", {lo0}});
+    // netset without one open.
+    s.push_back({"sys_netset_get_status", {0, kOut + 0xD00}});
+    s.push_back({"sys_netset_get_status", {5, kOut + 0xD80}});
+    s.push_back({"sys_netset_get_key_value", {0, proxy, kOut + 0xE00, 64, 1}});
+    s.push_back({"sys_netset_get_key_value", {0, proxy, 0, 64, 1}});
+    s.push_back({"sys_netset_get_key_value", {0, ssid, kOut + 0xE00, 64, 1}});
+    s.push_back({"sys_netset_get_key_value", {0, bad, kOut + 0xE00, 64, 1}});
+    s.push_back({"sys_netset_get_key_value", {3, proxy, kOut + 0xE00, 64, 1}});
+    s.push_back({"sys_netset_get_if_id", {eth0, eth0, 3}});
+    s.push_back({"sys_netset_get_if_id", {eth0, 0, 0}});
+    s.push_back({"sys_netset_close", {5}});
+    s.push_back({"sys_netset_abort", {5, 0}});
+    s.push_back({"sys_netset_if_up", {5, 0, 0}});
+    s.push_back({"sys_netset_if_down", {5, 0, 0}});
+    s.push_back({"sys_netset_get_status", {0, kOut + 0xD00}});
+    const u64 conf = text(8, "ssid foo\nhttp_proxy \"a b\"\n# c\n");
+    s.push_back({"sys_netset_open", {conf, 0, 0}, kSign, kOut + 0xDF0});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_netset_get_status", {(kOut + 0xDF0) | kDeref, kOut + 0xD00}});
+    s.push_back({"sys_netset_get_key_value", {0, proxy, kOut + 0xE00, 64, 1}});
+    s.push_back({"sys_netset_get_key_value", {0, ssid, kOut + 0xE40, 64, 1}});
+    s.push_back({"sys_netset_get_if_id", {(kOut + 0xDF0) | kDeref, 0, 1}});
+    s.push_back({"sys_netset_close", {(kOut + 0xDF0) | kDeref}});
+    s.push_back({"pool", {}});
+    // gethostbyaddr.
+    s.push_back({"=", {kOut + 0xF00, 0x7F000001}});
+    s.push_back({"=", {kOut + 0xF10, 0xFE800000}});
+    s.push_back({"=", {kOut + 0xF20, 0}});
+    s.push_back({"=", {kOut + 0xF24, 0}});
+    s.push_back({"=", {kOut + 0xF28, 0xFFFF}});
+    s.push_back({"=", {kOut + 0xF2C, 0x7F000001}});
+    s.push_back({"gethostbyaddr", {0, 4, 2}, kSign});
+    s.push_back({"_sys_net_h_errno_loc", {}, kSign, kOut + 0xF80});
+    s.push_back({"gethostbyaddr", {kOut + 0xF00, 3, 2}, kSign});
+    s.push_back({"gethostbyaddr", {kOut + 0xF00, 4, 7}, kSign});
+    s.push_back({"gethostbyaddr", {kOut + 0xF10, 16, 24}, kSign});
+    s.push_back({"gethostbyaddr", {kOut + 0xF00, 4, 2}, kSign});
+    s.push_back({"gethostbyaddr", {kOut + 0xF20, 16, 24}, kSign});
+    s.push_back({"pool", {}});
+    s.push_back({"sys_net_finalize_network", {}});
+    return s;
+}
+
 } // namespace
+
+TEST_CASE("sys_net against libnet: configuration", "[hle][lle][net]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, config_script(), "configuration");
+}
+
+TEST_CASE("sys_net against libnet: routes, interfaces, netsets and gethostbyaddr", "[.][hle][lle][net]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, routes_script(), "routes");
+}
 
 TEST_CASE("sys_net against libnet: interfaces", "[hle][lle][net]")
 {

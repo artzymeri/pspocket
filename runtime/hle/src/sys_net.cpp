@@ -73,6 +73,7 @@ constexpr u32 kRandWords = 521, kRandSize = 4 * kRandWords;
 constexpr u32 kDataSize = 0x1000;
 constexpr u32 kTagMisc = kCtxSize;           // "misc.c"
 constexpr u32 kTagGetifaddrs = kCtxSize + 8; // "getifaddrs.c"
+constexpr u32 kTagNetset = kCtxSize + 24;    // "netset.c"
 
 // ------------------------------------------------------------------------------------------------- libnet's state
 
@@ -86,6 +87,10 @@ struct Libnet {
     u32 ctx_head = 0, ctx_tail = 0;
     u32 rand_state = 0, rand_index = 0;
     u32 data = 0; // libnet's own guest data (kDataSize)
+    // netset.c's statics (D-539): the library's name servers (a resolv.conf text in the pool, set with
+    // sys_net_set_lib_name_server), the routing messages' sequence number.
+    u32 lib_name_servers = 0;
+    u32 route_seq = 0;
 };
 
 Libnet& libnet() { return HleProcess::current()->state<Libnet>(); }
@@ -115,6 +120,7 @@ u32 data(PPUContext& ctx)
         if (!n.data) PS_FATAL(kChan, "no guest memory for libnet's data");
         std::memcpy(gb(ctx) + n.data + kTagMisc, "misc.c", 7);
         std::memcpy(gb(ctx) + n.data + kTagGetifaddrs, "getifaddrs.c", 13);
+        std::memcpy(gb(ctx) + n.data + kTagNetset, "netset.c", 9);
     }
     return n.data;
 }
@@ -1495,6 +1501,345 @@ s32 sys_net_show_ifconfig(PPUContext& ctx)
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------- configuration
+
+// D-539: libnet's configuration calls: ioctl and control, the dumps, the test parameters, the name servers.
+
+// The context's report of netset.c's last failure (sys_netset_get_status reads it): +2904 what failed, +2908..+2916 its
+// arguments, +2920 libnet's source line.
+constexpr u32 kCtxSetError = 2904, kCtxSetArg1 = 2908, kCtxSetLine = 2920;
+
+void set_report(PPUContext& ctx, u32 error, u32 line)
+{
+    u8* b = gb(ctx);
+    w32(b, context(ctx) + kCtxSetError, error);
+    w32(b, context(ctx) + kCtxSetLine, line);
+}
+
+// libnet's refusal of an argument inside a call that goes through the context (errno EINVAL), or the aborted
+// context's error.
+s32 refuse_einval(PPUContext& ctx)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    if (r32(b, c + kCtxAborted)) {
+        const s32 r = -static_cast<s32>(r32(b, c + kCtxErrno));
+        return r >= 0 ? r : failure(ctx, r);
+    }
+    w32(b, c + kCtxInCall, 0);
+    w32(b, context(ctx) + kCtxErrno, SYS_NET_EINVAL);
+    return static_cast<s32>(SYS_NET_ERROR | SYS_NET_EINVAL);
+}
+
+// The commands libnet's _sys_net_lib_ioctl passes to lv2 (any other is EINVAL).
+bool ioctl_known(u32 cmd)
+{
+    switch (cmd) {
+    case 0x200050C8: case 0x800250CF: case 0x801050CD: case 0x80146980: case 0x80146981: case 0x8020690C:
+    case 0x8020690E: case 0x80206910: case 0x80206913: case 0x80206916: case 0x80206919: case 0x80206979:
+    case 0x8020697A: case 0x8020697F: case 0x8020698D: case 0x802450C9: case 0x802450CB: case 0x802450CC:
+    case 0x8040691A: case 0x8040696E: case 0x80506979: case 0x8210698F: case 0xC00250D0: case 0xC01050CE:
+    case 0xC0146974: case 0xC014697C: case 0xC0146988: case 0xC0186983: case 0xC018697F: case 0xC0206911:
+    case 0xC0206921: case 0xC0206922: case 0xC0206923: case 0xC0206925: case 0xC020697E: case 0xC020698C:
+    case 0xC02450CA: case 0xC1146975: case 0xC210698E: return true;
+    default: return false;
+    }
+}
+
+// _sys_net_lib_ioctl(s, cmd, arg): lv2's ioctl (724) for the commands libnet knows, an argument required for those
+// that carry one (EINVAL otherwise); two clear parts of their argument first (0x80506979: +0x30, +0x38, +0x40, +0x48;
+// 0x8040696E: +0x20, +0x30).
+s32 _sys_net_lib_ioctl(PPUContext& ctx, s32 s, u32 cmd, u32 arg)
+{
+    if (((cmd & 0xC0000000) && !arg) || !ioctl_known(cmd)) return refuse_einval(ctx);
+    u8* b = gb(ctx);
+    if (cmd == 0x80506979 || cmd == 0x8040696E) {
+        if (!usable(ctx, arg, cmd == 0x80506979 ? 0x4C : 0x34, "_sys_net_lib_ioctl: arg"))
+            return static_cast<s32>(SYS_NET_ERROR | SYS_NET_EFAULT);
+        if (cmd == 0x80506979) {
+            for (const u32 off : {0x48u, 0x30u, 0x38u, 0x40u}) w32(b, arg + off, 0);
+        } else {
+            w32(b, arg + 0x30, 0);
+            w32(b, arg + 0x20, 0);
+        }
+    }
+    return net_call(ctx, 724, {u64(s64{s}), cmd, arg});
+}
+
+// _sys_net_lib_bnet_control(a, b, c, d): sys_net_control (723).
+s32 _sys_net_lib_bnet_control(PPUContext& ctx, u32 a, s32 bb, u32 c, s32 d)
+{
+    return net_call(ctx, 723, {a, u64(s64{bb}), c, u64(s64{d})});
+}
+
+// The packet dumps: lv2's 717..719.
+s32 sys_net_open_dump(PPUContext& ctx, s32 len, s32 flags) { return net_call(ctx, 717, {u64(s64{len}), u64(s64{flags})}); }
+s32 sys_net_read_dump(PPUContext& ctx, s32 id, u32 buf, s32 len, u32 pflags)
+{
+    return net_call(ctx, 718, {u64(s64{id}), buf, u64(s64{len}), pflags});
+}
+s32 sys_net_close_dump(PPUContext& ctx, s32 id, u32 pflags) { return net_call(ctx, 719, {u64(s64{id}), pflags}); }
+
+// The test parameters (512 bytes, flags at +8: bit 0 set and nothing in the high half, else EINVAL without errno): lv2
+// keeps them on the interface ("eth0"), through ioctl on a UDP socket made for the call with a 528-byte block (the
+// name, then the parameters).
+constexpr s32 kEinval = static_cast<s32>(SYS_NET_ERROR | SYS_NET_EINVAL);
+
+s32 test_param(PPUContext& ctx, u32 p, bool set)
+{
+    if (!p) return kEinval;
+    if (!usable(ctx, p, 0x200, "sys_net_*_test_param: param")) return kEinval;
+    u8* b = gb(ctx);
+    const u32 flags = r32(b, p + 8);
+    if ((flags & 0xFFFF0000) || !(flags & 1)) return kEinval;
+    StackVar block(ctx, b, 0x210);
+    std::memset(b + block.addr(), 0, 0x210);
+    std::memcpy(b + block.addr(), "eth0", 4);
+    if (set) std::memcpy(b + block.addr() + 16, b + p, 0x200);
+    const s32 so = socket(ctx, 2, 2, 0);
+    if (so < 0) return so;
+    const s32 r = _sys_net_lib_ioctl(ctx, so, set ? 0x8210698F : 0xC210698E, block.addr());
+    if (!set && r >= 0) std::memcpy(b + p, b + block.addr() + 16, 0x200);
+    socketclose(ctx, so);
+    return r;
+}
+
+s32 sys_net_get_test_param(PPUContext& ctx, u32 p) { return test_param(ctx, p, false); }
+s32 sys_net_set_test_param(PPUContext& ctx, u32 p) { return test_param(ctx, p, true); }
+
+// The network emulation's parameters are the test parameters with flags 1 (and, set, version 0x101 at +0; +2 must be 0).
+s32 sys_net_get_netemu_test_param(PPUContext& ctx, u32 p)
+{
+    if (!p) return kEinval;
+    if (!usable(ctx, p, 12, "sys_net_get_netemu_test_param: param")) return kEinval;
+    w32(gb(ctx), p + 8, 1);
+    return test_param(ctx, p, false);
+}
+
+s32 sys_net_set_netemu_test_param(PPUContext& ctx, u32 p)
+{
+    if (!p) return kEinval;
+    if (!usable(ctx, p, 12, "sys_net_set_netemu_test_param: param")) return kEinval;
+    u8* b = gb(ctx);
+    if (ps_read16(b, p + 2) != 0) return kEinval;
+    ps_write16(b, p, 0x101);
+    w32(b, p + 8, 1);
+    return test_param(ctx, p, true);
+}
+
+// The UDP-P2P test parameters (16 bytes): ioctl on a UDP-P2P socket made for the call.
+s32 udpp2p_param(PPUContext& ctx, u32 p, u32 cmd)
+{
+    if (!p) return kEinval;
+    const s32 so = socket(ctx, 2, 6, 0);
+    if (so < 0) return so;
+    const s32 r = _sys_net_lib_ioctl(ctx, so, cmd, p);
+    socketclose(ctx, so);
+    return r;
+}
+
+s32 sys_net_get_udpp2p_test_param(PPUContext& ctx, u32 p) { return udpp2p_param(ctx, p, 0xC01050CE); }
+s32 sys_net_set_udpp2p_test_param(PPUContext& ctx, u32 p) { return udpp2p_param(ctx, p, 0x801050CD); }
+
+// ----------------------------------------------------------------------------------------------- name servers
+
+// netset.c's allocation (libnet f_177bc): a failure noted in the context (+2904 43, +2920 107, +2908 the size) with
+// errno ENOMEM.
+u32 netset_malloc(PPUContext& ctx, u32 size, u32 line)
+{
+    const u32 p = net_malloc(ctx, size, data(ctx) + kTagNetset, line);
+    if (p) return p;
+    set_report(ctx, 43, 107);
+    w32(gb(ctx), context(ctx) + kCtxSetArg1, size);
+    set_errno(ctx, SYS_NET_ENOMEM);
+    return 0;
+}
+
+// netset.c's command text builder (libnet f_17860): one line of `words` (separated by spaces, ended by a newline)
+// appended to `text` (a string in the pool, freed; 0 for none) in a new string, which is returned (0 when the pool
+// refuses). "nameserver add X..." appends "nameserver X...", and nothing (the same text back) to a text of two lines
+// or more, or with fewer than three words; "nameserver" with another second word appends nothing.
+u32 add_line(PPUContext& ctx, u32 text, std::vector<std::string> words)
+{
+    u8* b = gb(ctx);
+    if (!words.empty() && words[0] == "nameserver") {
+        if (words.size() < 3 || words[1] != "add") return text;
+        words.erase(words.begin() + 1);
+    }
+    const std::string old = text ? guest_str(ctx, text, "netset text").value_or("") : std::string();
+    if (!old.empty() && 2 - static_cast<s32>(std::count(old.begin(), old.end(), '\n')) < 1) return text;
+    u32 size = static_cast<u32>(old.size());
+    for (const std::string& w : words) size += static_cast<u32>(w.size()) + 1;
+    const u32 p = netset_malloc(ctx, size + 1, 0x360);
+    if (!p) {
+        net_free(ctx, text);
+        return 0;
+    }
+    std::string line = old;
+    for (usize i = 0; i < words.size(); i++) {
+        line += words[i];
+        line.push_back(i + 1 < words.size() ? ' ' : '\n');
+    }
+    net_free(ctx, text);
+    std::memcpy(b + p, line.c_str(), line.size() + 1);
+    return p;
+}
+
+// The dotted text of a network-order address, as libnet's inet_ntoa writes it (into the context).
+std::string dotted(PPUContext& ctx, u32 in)
+{
+    return guest_str(ctx, inet_ntoa(ctx, in), "inet_ntoa").value_or("");
+}
+
+// _sce_net_add_name_server(unused, in_addr, text): "nameserver <address>" added to the text (above).
+u32 _sce_net_add_name_server(PPUContext& ctx, u32, u32 in, u32 text)
+{
+    return add_line(ctx, text, {"nameserver", "add", dotted(ctx, in)});
+}
+
+// _sce_net_add_name_server_with_char(unused, name, text): the same with the address as text; a null or empty name adds
+// nothing.
+u32 _sce_net_add_name_server_with_char(PPUContext& ctx, u32, u32 name, u32 text)
+{
+    if (!name) return text;
+    const auto n = guest_str(ctx, name, "_sce_net_add_name_server_with_char: name");
+    if (!n || n->empty()) return text;
+    return add_line(ctx, text, {"nameserver", "add", *n});
+}
+
+// lv2's resolver configuration set (infoctl 52) through the context (libnet f_11eec).
+s32 set_resolv_conf(PPUContext& ctx, u32 text) { return infoctl(ctx, 52, {{4, text}}, {}); }
+
+// _sce_net_set_name_server(text): the text is lv2's resolver configuration from now on; freed. Always 0.
+s32 _sce_net_set_name_server(PPUContext& ctx, u32 text)
+{
+    set_resolv_conf(ctx, text);
+    net_free(ctx, text);
+    return 0;
+}
+
+// lv2's resolver configuration (infoctl 9) into the context's buffer (+2932, 128 bytes; +3060 the previous one, for
+// `changed`): its address, or 0 when lv2 refuses (libnet f_125c4).
+constexpr u32 kCtxResolvConf = 2932, kCtxResolvConfOld = 3060;
+
+u32 resolv_conf(PPUContext& ctx, bool* changed)
+{
+    u8* b = gb(ctx);
+    const u32 c = context(ctx);
+    const u32 buf = c + kCtxResolvConf;
+    { // libnet's f_11950 directly: no context around the call
+        StackVar block(ctx, b, 32);
+        w32(b, block.addr() + 4, buf);
+        w32(b, block.addr() + 8, 0x80);
+        if (lv2_syscall(ctx, 722, {9, block.addr()}) != 0) return 0;
+    }
+    if (changed) {
+        *changed = std::memcmp(b + c + kCtxResolvConfOld, b + buf, 0x80) != 0;
+        if (*changed) std::memcpy(b + c + kCtxResolvConfOld, b + buf, 0x80);
+    }
+    return buf;
+}
+
+// The addresses of the "nameserver " lines of the library's text and then (with `system`) lv2's: written to out (up to
+// n of them, 4 bytes each) or, with no out, counted (libnet f_1a018). An address is the dots and digits after
+// "nameserver ", taken by inet_aton.
+s32 name_servers(PPUContext& ctx, u32 out, s32 n, bool system)
+{
+    u8* b = gb(ctx);
+    Libnet& net = libnet();
+    s32 count = 0;
+    if (out && n > 0 && !usable(ctx, out, 4 * static_cast<u32>(n), "name servers: out")) return -1;
+    const auto scan = [&](u32 text) {
+        if (!text) return;
+        const std::string t = guest_str(ctx, text, "name servers").value_or("");
+        usize at = 0;
+        while (at < t.size()) {
+            if (t.compare(at, 11, "nameserver ") == 0) {
+                at += 11;
+                std::string addr;
+                while (at < t.size() && (t[at] == '.' || is_digit(static_cast<u8>(t[at])))) addr.push_back(t[at++]);
+                const auto a = parse_aton(addr, false);
+                if (!out) {
+                    if (a) count++;
+                } else if (count < n && a) {
+                    w32(b, out, *a);
+                    out += 4;
+                    count++;
+                }
+            }
+            while (at < t.size() && t[at] != '\n') at++;
+            if (at < t.size()) at++;
+        }
+    };
+    if (!system && !net.lib_name_servers) return 0;
+    scan(net.lib_name_servers);
+    if (system) scan(resolv_conf(ctx, nullptr));
+    return count;
+}
+
+// sys_net_get_name_server(in_addr* out, n) and _sce_net_get_name_server: the library's name servers, then lv2's.
+s32 sys_net_get_name_server(PPUContext& ctx, u32 out, s32 n) { return name_servers(ctx, out, n, true); }
+s32 _sce_net_get_name_server(PPUContext& ctx, u32 out, s32 n) { return name_servers(ctx, out, n, true); }
+
+// sys_net_set_lib_name_server(primary, secondary): the library's own name servers (4-byte addresses; none: cleared).
+s32 sys_net_set_lib_name_server(PPUContext& ctx, u32 primary, u32 secondary)
+{
+    Libnet& n = libnet();
+    u8* b = gb(ctx);
+    if (n.lib_name_servers) {
+        net_free(ctx, n.lib_name_servers);
+        n.lib_name_servers = 0;
+    }
+    if (!primary && !secondary) return 0;
+    if ((primary && !usable(ctx, primary, 4, "sys_net_set_lib_name_server: primary")) ||
+        (secondary && !usable(ctx, secondary, 4, "sys_net_set_lib_name_server: secondary")))
+        return -1;
+    u32 text = 0;
+    if (primary) text = _sce_net_add_name_server(ctx, 0, r32(b, primary), 0);
+    if (secondary) text = _sce_net_add_name_server(ctx, 0, r32(b, secondary), text);
+    n.lib_name_servers = text;
+    return 0;
+}
+
+// sys_net_get_lib_name_server(primary, secondary): the library's own name servers' count, the first two written where
+// asked (libnet copies its stack's bytes for one it does not have: here 0).
+s32 sys_net_get_lib_name_server(PPUContext& ctx, u32 primary, u32 secondary)
+{
+    u8* b = gb(ctx);
+    StackVar found(ctx, b, 8);
+    const s32 r = name_servers(ctx, found.addr(), 2, false);
+    if ((primary && !usable(ctx, primary, 4, "sys_net_get_lib_name_server: primary")) ||
+        (secondary && !usable(ctx, secondary, 4, "sys_net_get_lib_name_server: secondary")))
+        return -1;
+    if (primary) w32(b, primary, r32(b, found.addr()));
+    if (secondary) w32(b, secondary, r32(b, found.addr() + 4));
+    return r;
+}
+
+// sys_net_show_nameserver(): the name servers on the TTY, the library's marked.
+s32 sys_net_show_nameserver(PPUContext& ctx)
+{
+    u8* b = gb(ctx);
+    StackVar addrs(ctx, b, 16);
+    const s32 count = sys_net_get_name_server(ctx, addrs.addr(), 3);
+    if (count < 1) {
+        tty_print(ctx, std::format("nameserver: No name server ({})\n", count));
+        return 0;
+    }
+    s32 lib = sys_net_get_lib_name_server(ctx, 0, 0);
+    for (s32 i = 0; i < count; i++) {
+        const u8* a = b + addrs.addr() + 4 * static_cast<u32>(i);
+        const std::string text = ntop4(a);
+        if (lib > 0) {
+            lib--;
+            tty_print(ctx, std::format("nameserver: {:<16} (lib)\n", text));
+        } else {
+            tty_print(ctx, std::format("nameserver: {:<16}\n", text));
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 void register_sys_net(Registry& r)
@@ -1562,6 +1907,25 @@ void register_sys_net(Registry& r)
         f("_sys_net_lib_sysctl", &thunk<&_sys_net_lib_sysctl>),
         f("sys_net_get_if_list", &thunk<&sys_net_get_if_list>),
         f("sys_net_show_ifconfig", &thunk<&sys_net_show_ifconfig>),
+        f("_sys_net_lib_ioctl", &thunk<&_sys_net_lib_ioctl>),
+        f("_sys_net_lib_bnet_control", &thunk<&_sys_net_lib_bnet_control>),
+        f("sys_net_open_dump", &thunk<&sys_net_open_dump>),
+        f("sys_net_read_dump", &thunk<&sys_net_read_dump>),
+        f("sys_net_close_dump", &thunk<&sys_net_close_dump>),
+        f("sys_net_get_test_param", &thunk<&sys_net_get_test_param>),
+        f("sys_net_set_test_param", &thunk<&sys_net_set_test_param>),
+        f("sys_net_get_netemu_test_param", &thunk<&sys_net_get_netemu_test_param>),
+        f("sys_net_set_netemu_test_param", &thunk<&sys_net_set_netemu_test_param>),
+        f("sys_net_get_udpp2p_test_param", &thunk<&sys_net_get_udpp2p_test_param>),
+        f("sys_net_set_udpp2p_test_param", &thunk<&sys_net_set_udpp2p_test_param>),
+        f("_sce_net_add_name_server", &thunk<&_sce_net_add_name_server>),
+        f("_sce_net_add_name_server_with_char", &thunk<&_sce_net_add_name_server_with_char>),
+        f("_sce_net_set_name_server", &thunk<&_sce_net_set_name_server>),
+        f("_sce_net_get_name_server", &thunk<&_sce_net_get_name_server>),
+        f("sys_net_get_name_server", &thunk<&sys_net_get_name_server>),
+        f("sys_net_set_lib_name_server", &thunk<&sys_net_set_lib_name_server>),
+        f("sys_net_get_lib_name_server", &thunk<&sys_net_get_lib_name_server>),
+        f("sys_net_show_nameserver", &thunk<&sys_net_show_nameserver>),
         PS_HLE_INTERNAL(0x66AFE280, _pspocket_net_thread_atexit),
     });
 }
