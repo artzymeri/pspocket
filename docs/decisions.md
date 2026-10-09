@@ -6473,3 +6473,17 @@ Part 3 (runtime/lv2/src/prx.cpp, misc.cpp; 40 calls):
   applicable version) and a UART with no AV manager behind it (sends taken, nothing received).
 Tests: tests/hle/test_lle.cpp (a module through the raw PRX calls: both start commands, list, info, lookups, stop,
 unload, registration, overlays), tests/lv2/test_misc_calls.cpp. Kernel calls own: 523 of 634.
+
+Part 4 (runtime/lv2/src/rsxaudio.cpp; 10 calls): sys_rsxaudio, the RSX's audio DMA as lv2 gives it to the system's
+audio service, as RPCS3 has it: one context at a time (IDs from 0x60000000) with its 128 KB shared page (DMA regions
+for the serial and two S/PDIF ports, a silence block, the control area: three ring buffers of 16 entries, the
+client's three event queue IDs); create_connection takes the queues (all three must exist) and points the entries at
+lv1's IO addresses (0x30000000 for the page); prepare makes the context the hardware's (-1 when another is); start
+clears the active ring buffers, turns their DMA on and tells each queue (port name, port, 0, 0); stop turns it off;
+get_dma_param gives the IO base (0) or ID (1). The hardware is a host thread that, once per block period (128 frames:
+2.67 ms serial at 48 kHz, 2.90 ms S/PDIF at 44.1 kHz), stamps the entry playing and with DMA on retires a valid one,
+telling the port's queue (port name, port, block index, timestamp) at each notify step by RPCS3's rule. pspocket's
+console has no AV manager to enable an output (part 3's UART), so the samples are not played, as RPCS3 mutes a port
+lv1 left disabled; the page has no protection to lock and unlock. Test: tests/lv2/test_rsxaudio.cpp (the context, the
+queues, the DMA addresses, the start event and two notifications for three entries retired on schedule, stop,
+finalize and a new context).

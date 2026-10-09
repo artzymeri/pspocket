@@ -153,6 +153,7 @@ void register_device_syscalls(SyscallTable& table);
 void register_service_syscalls(SyscallTable& table);
 void register_misc_syscalls(SyscallTable& table);
 void register_prx_syscalls(SyscallTable& table);
+void register_rsxaudio_syscalls(SyscallTable& table);
 // The path an open file was opened with (loads by descriptor); none for an unknown or closed descriptor.
 std::optional<std::string> fs_file_path(Kernel& k, s32 fd);
 
@@ -507,6 +508,7 @@ struct Kernel::Impl {
     std::shared_ptr<void> services_state; // HID manager, sys_config, storage (services.cpp), likewise
     std::shared_ptr<void> root_managers_state; // update manager, UART (misc.cpp), likewise
     std::atomic<ModuleHost*> module_host{nullptr}; // Kernel::set_module_host (prx.cpp)
+    std::shared_ptr<void> rsxaudio_state; // sys_rsxaudio (rsxaudio.cpp): its hardware thread stops with it
     std::mutex npd_mutex;
     Kernel::NpdOpener npd_opener; // Kernel::set_npd_opener (D-165), under npd_mutex
     // SPU thread groups (D-167): their IDs, and what the HLE layer adds (under spu_hooks_mutex).

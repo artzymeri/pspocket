@@ -540,6 +540,7 @@ Kernel::Impl::Impl(Kernel& k)
     register_service_syscalls(table);
     register_misc_syscalls(table);
     register_prx_syscalls(table);
+    register_rsxaudio_syscalls(table);
     // Every other slot RPCS3 answers with null_func (a log, then CELL_OK) is answered so too (D-166): a game calling
     // one goes on instead of meeting ENOSYS. GTA V's CRT, for one, registers a debug exception handler (988).
     static constexpr struct {
