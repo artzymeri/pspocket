@@ -6,8 +6,11 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <atomic>
+#include <exception>
 #include <memory>
 #include <string_view>
+#include <thread>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/guest_memory.hpp"
@@ -29,6 +32,10 @@ struct Fixture {
     GuestMemory mem;
     std::unique_ptr<lv2::Kernel> kernel;
     std::unique_ptr<HleProcess> hle;
+    // Catch2's assertions are not thread-safe (D-571): checks that fail on a test's own std::threads are counted here,
+    // and the count is checked on the test's thread when the fixture goes away.
+    std::thread::id test_thread = std::this_thread::get_id();
+    std::atomic<u32> off_thread_failures{0};
 
     explicit Fixture(ProcessConfig config = {}, lv2::Config kconfig = {})
     {
@@ -45,8 +52,14 @@ struct Fixture {
         kernel->shutdown();
         hle.reset();
         kernel.reset();
+        if (std::uncaught_exceptions() != 0) return;
+        try { // a destructor must not throw: Catch2 throws even from CHECK once --abort is stopping the run
+            CHECK(off_thread_failures == 0);
+        } catch (...) {
+        }
     }
     u8* base() { return mem.base(); }
+    bool on_test_thread() const { return std::this_thread::get_id() == test_thread; }
 };
 
 // A host thread with an lv2 identity (attach_thread) that calls HLE functions as guest code would.
@@ -63,27 +76,41 @@ struct GuestThread {
     }
     ~GuestThread() { f.kernel->detach_thread(t); }
 
-    static const Function& find(std::string_view name)
+    static const Function* lookup(std::string_view name)
     {
         const Function* fn = nullptr;
         for (const Function& x : registry().functions())
             if (x.name == name) fn = &x;
+        return fn;
+    }
+
+    static const Function& find(std::string_view name)
+    {
+        const Function* fn = lookup(name);
         REQUIRE(fn != nullptr);
         return *fn;
     }
 
+    // Callable from a test's own std::threads too: there a failed check is counted in the fixture (see Fixture).
     template <class... A>
     u64 call(std::string_view name, A... args)
     {
-        const Function& fn = find(name);
+        const bool here = f.on_test_thread();
+        const Function* fn = lookup(name);
+        if (here) REQUIRE(fn != nullptr);
+        if (!fn) {
+            f.off_thread_failures++;
+            return ~u64{0};
+        }
         const u64 v[] = {0, static_cast<u64>(args)...}; // leading 0: no zero-length array for calls without arguments
         for (usize i = 0; i < sizeof...(A); i++) {
             if (i < 8) ctx.gpr[3 + i] = v[i + 1];
             else ps_write64(f.base(), static_cast<u32>(ctx.gpr[1]) + 0x70 + 8 * static_cast<u32>(i - 8), v[i + 1]);
         }
         const u64 sp = ctx.gpr[1];
-        fn.fn(ctx, f.base());
-        CHECK(ctx.gpr[1] == sp); // stack variables released
+        fn->fn(ctx, f.base());
+        if (here) CHECK(ctx.gpr[1] == sp); // stack variables released
+        else if (ctx.gpr[1] != sp) f.off_thread_failures++;
         return ctx.gpr[3];
     }
 };

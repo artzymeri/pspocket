@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "guest.hpp"
 #include "hle_test_util.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/lv2/kernel.hpp"
@@ -391,10 +392,11 @@ TEST_CASE("sys_libc: an SPU's spu_printf through the server, and spu_thread_snpr
     ps_write32(b, kOut, 0xFFFFFFFF);
     REQUIRE(lv2::sys_spu_thread_group_start(t, group) == lv2::CELL_OK);
     const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (ps_read32(b, kOut) == 0xFFFFFFFF && std::chrono::steady_clock::now() < end)
+    // The SPU's PUT stores atomically, with release order: the test reads the word the same way (D-571).
+    while (hle::atomic_load_be32(b, kOut) == 0xFFFFFFFF && std::chrono::steady_clock::now() < end)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     const std::string text = "spu -5:word:123456789a:0.5\n";
-    CHECK(ps_read32(b, kOut) == text.size());
+    CHECK(hle::atomic_load_be32(b, kOut) == text.size());
     CHECK(tty.get().find(text.substr(0, text.size() - 1)) != std::string::npos);
     // spu_thread_snprintf reads the same arguments from the spinning thread's local store.
     CHECK(i32(g.call("spu_thread_snprintf", kBuf, 9, spu, kArgs)) == static_cast<s32>(text.size()));

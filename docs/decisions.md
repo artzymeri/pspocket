@@ -7796,3 +7796,28 @@ values again (four at most, POSIX's PTHREAD_DESTRUCTOR_ITERATIONS), then the thr
 Dinkumware's; without Sony's library to read they are the assumption here (no firmware module exports sys_libc, so a
 game's own copy of the library is where they would be checked). Test: tests/hle/test_libc_process.cpp (two threads'
 values, the destructors at _Destroytls, freed keys, 64 keys).
+
+## D-571 · 2026-10-09 · ThreadSanitizer over the threaded libraries: fiber flags, the mixer's start, the test helper
+
+A ThreadSanitizer build (new option -DPSPOCKET_TSAN=ON, not together with PSPOCKET_SANITIZE) of the HLE tests for
+this round's threaded libraries: cellFiber (D-568), libmixer (D-563), the C library's thread-local storage (D-570) and
+cellPngEnc (D-566). Its findings, fixed:
+
+- cellFiber read a fiber's wait flag (cellFiberPpuWaitFlag, and the scheduler's flag checks) with a plain load while
+  another thread sets it: in a game another PPU thread or an SPU, without the library's lock. It is now read with
+  atomic_load_be32, as other HLE code reads guest words other threads write.
+- libmixer marked the mixer started before it started the audio port, and starting the port clears the port's ring
+  (D-074), so a block the mixer's thread mixed in between was wiped: a period of silence at the start and at every
+  resume after a pause. The port now starts first, then the mixer mixes (cellSurMixerStart and cellSurMixerPause(0)).
+- tests/hle/hle_test_util.hpp ran Catch2 assertions in GuestThread::call on the tests' own std::threads, and Catch2's
+  assertions are not thread-safe. There a failed check is now counted in the fixture, which checks the count on the
+  test's thread when it goes away (a test thread that cannot find its function gets all ones back).
+- Tests that watched guest memory while another thread wrote it now synchronize as a game would: the fiber test sets
+  its flag atomically, the SPU printf test polls the SPU's PUT (an atomic store with release order) atomically, and
+  the mixer tests wait for blocks with cellSurMixerGetCurrentBlockTag (under the mixer's lock) instead of the
+  callback's own count, read that count only after cellSurMixerFinalize has joined the thread, and look at the port's
+  ring while the mixer is paused.
+
+The [fiber], [libmixer], [libc] and [pngenc] tests run clean under it. A race does not show up in an ordinary build, so
+this build is their regression check: `CC=clang CXX=clang++ cmake -S . -B build/tsan -G Ninja -DPSPOCKET_TSAN=ON`,
+`ninja -C build/tsan tests/hle/test_hle`, then `build/tsan/tests/hle/test_hle "[fiber],[libmixer],[libc],[pngenc]"`.
