@@ -124,6 +124,15 @@ u32 port_status(GuestThread& g, u32 port)
     return ps_read32(g.f.base(), kAudioConfig + 4);
 }
 
+// The blocks mixed so far, read under the mixer's lock, so the callback's records for those blocks are complete and
+// visible here. The callback writes its count on the mixer's thread: the tests read that only once the thread has
+// ended (a ThreadSanitizer build checks this, D-571).
+u64 block_tag(GuestThread& g)
+{
+    REQUIRE(g.call("cellSurMixerGetCurrentBlockTag", kTag) == 0);
+    return ps_read64(g.f.base(), kTag);
+}
+
 // cellSurMixerChStripSetParameter(type, index, {param, 0, dBSwitch, floatVal, intVal}).
 u64 strip_param(GuestThread& g, u32 type, u32 index, u32 param, bool db, f32 fv, s32 iv)
 {
@@ -194,16 +203,14 @@ TEST_CASE("libmixer: create, the AAN's handle and port numbers, the notify callb
     REQUIRE(g.call("cellSurMixerStart") == 0);
     CHECK(g.call("cellSurMixerStart") == 0);
     CHECK(port_status(g, 0) == kStatusRun);
-    REQUIRE(wait_for([&] { return records(b) >= 6; }));
-    const u32 n = std::min(records(b), 64u);
+    REQUIRE(wait_for([&] { return block_tag(g) >= 6; }));
+    const u32 n = static_cast<u32>(std::min<u64>(block_tag(g), 64));
     for (u32 i = 0; i < n; i++) {
         INFO("block " << i);
         CHECK(record(b, i).arg == 0xC0FFEE);
         CHECK(record(b, i).counter == i);
         CHECK(record(b, i).samples == 256);
     }
-    REQUIRE(g.call("cellSurMixerGetCurrentBlockTag", kTag) == 0);
-    CHECK(ps_read64(b, kTag) >= 6);
     // Timestamps: a period (256 samples at 48 kHz) a block from the start.
     REQUIRE(g.call("cellSurMixerGetTimestamp", 0, kStamp) == 0);
     const u64 t0 = ps_read64(b, kStamp);
@@ -218,17 +225,18 @@ TEST_CASE("libmixer: create, the AAN's handle and port numbers, the notify callb
     REQUIRE(g.call("cellSurMixerPause", 1) == 0);
     CHECK(port_status(g, 0) == kStatusReady);
     std::this_thread::sleep_for(10ms); // a block being mixed when the pause came
-    const u32 paused = records(b);
+    const u64 paused = block_tag(g);
     std::this_thread::sleep_for(30ms);
-    CHECK(records(b) == paused);
+    CHECK(block_tag(g) == paused);
     REQUIRE(g.call("cellSurMixerPause", 0) == 0);
     CHECK(port_status(g, 0) == kStatusRun);
-    CHECK(wait_for([&] { return records(b) >= paused + 3; }));
-    CHECK(record(b, paused).counter == paused); // the tags go on from where they stopped
+    CHECK(wait_for([&] { return block_tag(g) >= paused + 3; }));
+    CHECK(record(b, static_cast<u32>(paused)).counter == paused); // the tags go on from where they stopped
 
-    // Finalized: the mixer's thread ends, its port closes; a new mixer can be made.
+    // Finalized: the mixer's thread ends, its port closes; a new mixer can be made. A callback for every block.
     REQUIRE(g.call("cellSurMixerFinalize") == 0);
     const u32 done = records(b);
+    CHECK(done >= paused + 3);
     std::this_thread::sleep_for(20ms);
     CHECK(records(b) == done);
     CHECK(port_status(g, 0) == kStatusClose);
@@ -352,11 +360,15 @@ TEST_CASE("libmixer: a block's mix: the strips with their levels and mutes, a sp
 
     // At the speakers, the port's front left and right; every sample of a block alike.
     CHECK(wait_for([&] { return heard_since(0, {want[0], want[1]}) >= 4; }));
-    // In the port's ring, all eight channels of a block the mixer wrote (two periods ahead of the read index).
+    // In the port's ring, all eight channels of a block the mixer wrote (two periods ahead of the read index). Read
+    // while paused: the port stops, its blocks stay, and neither the mixer's thread nor cellAudio's writes them (D-571).
     const u32 ring = [&] {
         REQUIRE(g.call("cellAudioGetPortConfig", 0, kAudioConfig) == 0);
         return ps_read32(b, kAudioConfig + 0x1C);
     }();
+    REQUIRE(g.call("cellSurMixerPause", 1) == 0);
+    std::this_thread::sleep_for(10ms); // a block being mixed when the pause came
+    block_tag(g);                      // the mixer's lock, after that block
     const auto ring_has_block = [&] {
         for (u32 block = 0; block < 16; block++) {
             const u32 at = ring + block * 8 * 256 * 4;
@@ -367,7 +379,8 @@ TEST_CASE("libmixer: a block's mix: the strips with their levels and mutes, a sp
         }
         return false;
     };
-    CHECK(wait_for(ring_has_block));
+    CHECK(ring_has_block());
+    REQUIRE(g.call("cellSurMixerPause", 0) == 0);
 
     // The total mute silences it; off again, it is back.
     usize from = heard_count();

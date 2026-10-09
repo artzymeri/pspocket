@@ -328,6 +328,17 @@ s32 cellSurMixerCreate(PPUContext& ctx, u32 config)
     return lv2::CELL_OK;
 }
 
+// The port starts before the mixer's thread may mix into it: starting it clears its ring, which would wipe a block
+// mixed just before (D-571).
+void start_mixing(PPUContext& ctx, Mixer& m, u32 port)
+{
+    audio_call(ctx, "cellAudioPortStart", {port});
+    std::lock_guard lock(m.mutex);
+    if (!m.created) return; // finalized meanwhile
+    m.started = true;
+    if (!m.start_time) m.start_time = lv2::guest_system_time_us();
+}
+
 s32 cellSurMixerStart(PPUContext& ctx)
 {
     Mixer& m = mixer();
@@ -337,10 +348,8 @@ s32 cellSurMixerStart(PPUContext& ctx)
         if (!m.created) return error(CELL_LIBMIXER_ERROR_NOT_INITIALIZED);
         if (m.started) return lv2::CELL_OK;
         port = m.port;
-        m.started = true;
-        if (!m.start_time) m.start_time = lv2::guest_system_time_us();
     }
-    audio_call(ctx, "cellAudioPortStart", {port});
+    start_mixing(ctx, m, port);
     return lv2::CELL_OK;
 }
 
@@ -358,9 +367,10 @@ s32 cellSurMixerPause(PPUContext& ctx, u32 type)
         port = m.port;
         start = type == 0;
         if (start == m.started) return lv2::CELL_OK;
-        m.started = start;
+        if (!start) m.started = false; // no block from here on, then the port stops
     }
-    audio_call(ctx, start ? "cellAudioPortStart" : "cellAudioPortStop", {port});
+    if (start) start_mixing(ctx, m, port);
+    else audio_call(ctx, "cellAudioPortStop", {port});
     return lv2::CELL_OK;
 }
 
