@@ -7,6 +7,8 @@
 
 #include "cellHttp.hpp"
 
+#include <format>
+
 #include "pspocket/core/log.hpp"
 #include "ssl.hpp"
 
@@ -128,9 +130,36 @@ s32 cellHttpsInit(PPUContext& ctx, u32 count, u32 list)
         w32(ctx, slot, 0);
         return r;
     }
+    // The certificates (libssl parses them; not pspocket's): none are loaded, which only matters to an SSL handshake,
+    // which pspocket's network can't reach (D-523).
+    if (count && list) {
+        log_call_site(ctx, gb(ctx), std::format("cellHttpsInit: {} CA certificates at {:#x} not loaded (libssl parses "
+                                                "them, and libssl is not pspocket's)", count, list));
+    }
+    // Then libssl's verification flags for the title (cellSsl_CC6A0CB5): it reads the title's PARAM.SFO
+    // (_sys_process_get_paramsfo) and gives a few titles of its own list other flags (+32); that list is libssl's
+    // data, not reproduced, so every title gets the default ones.
+    {
+        StackVar sfo(ctx, gb(ctx), 0x40);
+        sc(ctx, 30, {sfo.addr()});
+    }
     PS_LOG_INFO(kChan, "cellHttpsInit: {} CA certificates at {:#x}", count, list);
     w8(ctx, hctx + kCtxInit, 1);
     return kOk;
+}
+
+// cellHttpClientSetSslClientCertificate(clientId, const CellHttpsData* cert, const CellHttpsData* privKey): with HTTPS
+// set up, a certificate needs its key and a key its certificate; loading them is libssl's (not pspocket's).
+s32 cellHttpClientSetSslClientCertificate(PPUContext& ctx, u32 client, u32 cert, u32 key)
+{
+    if (!initialized(ctx)) return err(CELL_HTTP_ERROR_NOT_INITIALIZED);
+    if (!valid(ctx, client, client::kSelf)) return err(CELL_HTTP_ERROR_BAD_CLIENT);
+    if (!https_initialized(ctx)) return err(CELL_HTTP_ERROR_NOT_INITIALIZED);
+    if (!cert && key) return err(CELL_HTTPS_ERROR_KEY_NEEDS_CERT);
+    if (cert && !key) return err(CELL_HTTPS_ERROR_CERT_NEEDS_KEY);
+    log_call_site(ctx, gb(ctx), "cellHttpClientSetSslClientCertificate: the client's SSL context and certificate are "
+                                "libssl's, which is not pspocket's: CELL_HTTP_ERROR_INTERNAL");
+    return err(CELL_HTTP_ERROR_INTERNAL);
 }
 
 s32 cellHttpsEnd(PPUContext& ctx)
@@ -155,6 +184,7 @@ void register_https(Registry& r)
     r.add("cellHttp", {
         PS_HLE_FUNC(0x522180BC, cellHttpsInit),
         PS_HLE_FUNC(0xE6D4202F, cellHttpsEnd),
+        PS_HLE_FUNC(0xD8352A40, cellHttpClientSetSslClientCertificate),
     });
 }
 

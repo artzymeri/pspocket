@@ -1007,6 +1007,8 @@ s32 cellHttpClientGetProxy(PPUContext& ctx, u32 cl, u32 proxy, u32 pool, u32 siz
 
 } // namespace
 
+s32 client_ssl_version(PPUContext& ctx, u32 client, u32 out) { return cellHttpClientGetSslVersion(ctx, client, out); }
+
 void register_clients(Registry& r)
 {
     r.add("cellHttp", {

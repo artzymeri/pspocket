@@ -84,7 +84,7 @@ u32 arg_count(u32 number)
 {
     switch (number) {
     case 1: return 0;
-    case 101: case 106: case 141: case 714: return 1;
+    case 30: case 101: case 106: case 141: case 714: return 1;
     case 25: case 100: case 351: case 706: case 712: case 722: return 2;
     case 105: case 700: case 701: case 702: case 703: case 704: case 708: case 709: case 713: case 715: case 721: return 3;
     case 705: case 711: case 716: return 5;
@@ -160,6 +160,27 @@ const std::vector<std::string>& strings()
         "",                                   // 47
         "big=" + std::string(5000, 'v'),      // 48
         "mid=" + std::string(1500, 'm') + "; expires=2090-01-01T00:00:00Z", // 49
+        "GET",                                // 50
+        "POST",                               // 51
+        "HEAD",                               // 52
+        "get",                                // 53
+        "PUT",                                // 54
+        "OPTIONS",                            // 55
+        "Host",                               // 56
+        "User-Agent",                         // 57
+        "Connection",                         // 58
+        "Cookie",                             // 59
+        "Content-Length",                     // 60
+        "Accept-Encoding",                    // 61
+        "Transfer-Encoding",                  // 62
+        "HOST",                               // 63
+        "ftp",                                // 64
+        "127.0.0.1",                          // 65
+        "DELETE",                             // 66
+        "TRACE",                              // 67
+        "CONNECT",                            // 68
+        "HTTPS",                              // 69
+        "Proxy-Connection",                   // 70
     };
     return s;
 }
@@ -316,7 +337,9 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
         std::string fn(name);
         if (name.starts_with("ssl:")) library = "cellSsl", fn = name.substr(4);
         if (name.starts_with("net:")) library = "sys_net", fn = name.substr(4);
-        const u32 nid = recomp::nid_of(fn);
+        // An export known only by its NID: "cellHttp_" and the NID.
+        const bool unnamed = fn.size() == 17 && fn.starts_with("cellHttp_");
+        const u32 nid = unnamed ? static_cast<u32>(std::stoul(fn.substr(9), nullptr, 16)) : recomp::nid_of(fn);
         u32 r3 = 0;
         const loader::PrxModule* m = library == "cellSsl" ? ssl : library == "cellHttp" ? http : nullptr;
         if (sony && m) {
@@ -712,6 +735,345 @@ std::vector<Op> client_script()
     return s;
 }
 
+// A guest function for callbacks at str(90), its descriptor at str(91): it stores its second argument and its first at
+// its third (stw r4,0(r5); stw r3,4(r5); li r3,0; blr).
+void callback_code(std::vector<Op>& s)
+{
+    u64 at = str(90);
+    for (const u32 w : {0x90850000u, 0x90650004u, 0x38600000u, 0x4E800020u}) {
+        s.push_back({"=", {at, w}});
+        at += 4;
+    }
+}
+
+// Every transaction function: before cellHttpInit; creation's checks; on transactions that are not; URIs, the method,
+// credentials; the request's headers (the game's and libhttp's, Host, User-Agent, Connection, Content-Length,
+// Transfer-Encoding, Cookie, Accept-Encoding); content length and chunks; the response's getters and the connection's
+// calls in state 0; the SSL getters; sending (offline: the connection's resolver fails); polling and closing the
+// client's connections; HTTPS transactions; destruction.
+std::vector<Op> transaction_script()
+{
+    std::vector<Op> s;
+    const u64 o = kOut;
+    const u64 cl = o + 0x40, cl2 = o + 0x44;
+    const u64 C = cl | kDeref, C2 = cl2 | kDeref;
+    const auto tid = [&](u32 i) { return o + 0x50 + 4 * u64{i}; };
+    const auto T = [&](u32 i) { return tid(i) | kDeref; };
+    const u64 u_http = o + 0x100, u_https = o + 0x120, u_nohost = o + 0x140, u_empty = o + 0x160, u_port = o + 0x180,
+              u_user = o + 0x1A0, u_noscheme = o + 0x1C0, u_other = o + 0x1E0, u_ip = o + 0x2E0, u_scheme0 = o + 0x300,
+              px = o + 0x320;
+    uri(s, u_http, 10, 18, 0, 0, 19, 80);      // http://www.example.com/dir/page.html
+    uri(s, u_https, 20, 18, 0, 0, 43, 443);    // https://www.example.com/
+    uri(s, u_nohost, 10, 0, 0, 0, 19, 80);
+    uri(s, u_empty, 10, 47, 0, 0, 19, 80);
+    uri(s, u_port, 10, 18, 0, 0, 13, 8080);    // http://www.example.com:8080/path
+    uri(s, u_user, 10, 18, 11, 12, 13, 80);    // http://user:secret@www.example.com/path
+    uri(s, u_noscheme, 0, 40, 0, 0, 43, 443);  // www.example.co.jp:443/
+    uri(s, u_other, 64, 33, 0, 0, 0, 21);      // ftp://192.168.1.1:21
+    uri(s, u_ip, 10, 65, 0, 0, 43, 80);        // http://127.0.0.1/
+    uri(s, u_scheme0, 47, 18, 0, 0, 43, 81);   // "" scheme, port 81
+    uri(s, px, 10, 9, 11, 12, 13, 8080);       // a proxy
+    callback_code(s);
+    s.push_back({"=", {str(91), str(90)}});
+    s.push_back({"=", {str(91) + 4, 0}});
+
+    u64 slot = o + 0x400; // results
+    const auto next = [&](u64 n = 4) {
+        const u64 at = slot;
+        slot += n;
+        return at;
+    };
+    u64 pools = o + 0x4000; // copies
+    const auto pool_at = [&](u64 n) {
+        const u64 at = pools;
+        pools += n;
+        return at;
+    };
+    // Every transaction function once on `t`, with arguments that work on a good one.
+    const auto every = [&](u64 t) {
+        s.push_back({"cellHttpTransactionGetUri", {t, next(28), pool_at(0x80), 0x80, next()}});
+        s.push_back({"cellHttpTransactionSetUri", {t, u_http}});
+        s.push_back({"cellHttp_DAC62AB6", {t, next(16), 16, next()}});
+        s.push_back({"cellHttp_15C1FD80", {t, pool_at(0x100), pool_at(0x100)}});
+        s.push_back({"cellHttpRequestAddHeader", {t, o + 0x200}});
+        s.push_back({"cellHttpRequestSetHeader", {t, o + 0x200}});
+        s.push_back({"cellHttp_313D80D5", {t, o + 0x200}});
+        s.push_back({"cellHttpRequestDeleteHeader", {t, str(3)}});
+        s.push_back({"cellHttpRequestGetHeader", {t, next(8), str(56), pool_at(0x80), 0x80, next()}});
+        s.push_back({"cellHttpRequestGetAllHeaders", {t, next(), next(), pool_at(0x200), 0x200, next()}});
+        s.push_back({"cellHttpRequestSetContentLength", {t, 10}});
+        s.push_back({"cellHttpRequestGetContentLength", {t, next(8)}});
+        s.push_back({"cellHttpRequestSetChunkedTransferStatus", {t, 0}});
+        s.push_back({"cellHttpRequestGetChunkedTransferStatus", {t, next()}});
+        s.push_back({"cellHttpResponseGetStatusLine", {t, next(20), pool_at(0x80), 0x80, next()}});
+        s.push_back({"cellHttpResponseGetAllHeaders", {t, next(), next(), pool_at(0x80), 0x80, next()}});
+        s.push_back({"cellHttpResponseGetHeader", {t, next(8), str(56), pool_at(0x80), 0x80, next()}});
+        s.push_back({"cellHttpResponseGetStatusCode", {t, next()}});
+        s.push_back({"cellHttpResponseGetContentLength", {t, next(8)}});
+        s.push_back({"cellHttp_E0CAF386", {t, next()}});
+        s.push_back({"cellHttpRecvResponse", {t, pool_at(0x40), 0x40, next()}});
+        s.push_back({"cellHttpTransactionGetSslId", {t, next()}});
+        s.push_back({"cellHttpTransactionGetSslVersion", {t, next()}});
+        s.push_back({"cellHttpTransactionGetSslCipherString", {t, pool_at(0x40), 0x40}});
+        s.push_back({"cellHttpTransactionGetSslCipherBits", {t, next(), next()}});
+        s.push_back({"cellHttpTransactionGetSslCipherVersion", {t, pool_at(0x40), 0x40, next()}});
+        s.push_back({"cellHttpTransactionGetSslCipherId", {t, next()}});
+        s.push_back({"cellHttpTransactionGetSslCipherName", {t, pool_at(0x40), 0x40, next()}});
+        s.push_back({"cellHttpTransactionCloseConnection", {t}});
+        s.push_back({"cellHttp_3E30440C", {t}});
+        s.push_back({"cellHttpTransactionReleaseConnection", {t, next()}});
+        s.push_back({"cellHttp_8633468C", {t, next()}});
+        s.push_back({"cellHttpTransactionAbortConnection", {t}});
+        s.push_back({"cellHttpSendRequest", {t, 0, 0, next()}});
+        s.push_back({"cellHttp_DCD9D484", {t, 0, 0, next()}});
+    };
+    const auto headers_of = [&](u64 t) {
+        for (const u32 name : {56u, 57u, 58u, 59u, 60u, 61u, 62u, 63u, 3u, 7u, 15u}) {
+            s.push_back({"cellHttpRequestGetHeader", {t, next(8), str(name), pool_at(0x80), 0x80, next()}});
+        }
+        s.push_back({"cellHttpRequestGetHeader", {t, 0, str(57), 0, 0, next()}});
+        s.push_back({"cellHttpRequestGetHeader", {t, next(8), str(57), pool_at(8), 8, next()}});
+        s.push_back({"cellHttpRequestGetAllHeaders", {t, next(), next(), pool_at(0x400), 0x400, next()}});
+        s.push_back({"cellHttpRequestGetAllHeaders", {t, 0, next(), 0, 0, next()}});
+        s.push_back({"cellHttpRequestGetAllHeaders", {t, next(), next(), pool_at(0x400), 0, next()}});
+        s.push_back({"cellHttpRequestGetAllHeaders", {t, next(), next(), pool_at(0x20), 0x20, next()}});
+        s.push_back({"cellHttpRequestGetAllHeaders", {t, next(), next(), pool_at(0xC0), 0xC0, next()}});
+    };
+
+    // Before cellHttpInit.
+    s.push_back({"cellHttpCreateTransaction", {tid(0), 0x1000, str(50), u_http}});
+    every(0);
+    s.push_back({"cellHttpDestroyTransaction", {0}});
+    s.push_back({"cellHttpClientPollConnections", {0, next(), 0}});
+    s.push_back({"cellHttpClientCloseConnections", {0, u_http}});
+    s.push_back({"cellHttpClientCloseAllConnections", {0}});
+    s.push_back({"cellHttpInit", {kPool, kPoolSize}});
+    s.push_back({"cellHttpCreateClient", {cl}});
+    header(s, o + 0x200, 3, 4);   // X-Test: value one
+    header(s, o + 0x208, 7, 8);   // Accept: */*
+    header(s, o + 0x210, 5, 6);   // x-test: value two, longer than the first
+    header(s, o + 0x218, 15, 4);  // Missing: value one
+    header(s, o + 0x220, 56, 2);  // Host: My Agent/1.0
+    header(s, o + 0x228, 0, 4);   // no name
+    header(s, o + 0x230, 58, 15); // Connection: Missing
+    s.push_back({"cellHttpClientAddHeader", {C, o + 0x200}});
+    s.push_back({"cellHttpClientAddHeader", {C, o + 0x208}});
+    s.push_back({"cellHttpClientSetTransactionStateCallback", {C, str(91), o + 0x80}});
+    s.push_back({"pool", {}});
+    // Creation's checks.
+    s.push_back({"cellHttpCreateTransaction", {tid(0), 0x1234, str(50), u_http}});
+    s.push_back({"cellHttpCreateTransaction", {tid(0), str(1), str(50), u_http}});
+    s.push_back({"cellHttpCreateTransaction", {0, C, str(50), u_http}});
+    s.push_back({"cellHttpCreateTransaction", {tid(0), C, str(50), 0}});
+    s.push_back({"cellHttpCreateTransaction", {tid(0), C, str(50), u_nohost}});
+    s.push_back({"cellHttpCreateTransaction", {tid(0), C, str(50), u_empty}});
+    s.push_back({"cellHttpCreateTransaction", {tid(0), C, str(50), u_https}});
+    s.push_back({"cellHttpCreateTransaction", {tid(0), C, 0, u_http}});
+    s.push_back({"cellHttpCreateTransaction", {tid(0), C, str(0), u_http}});
+    s.push_back({"pool", {}});
+    // Transactions.
+    s.push_back({"cellHttpCreateTransaction", {tid(0), C, str(50), u_http}});
+    s.push_back({"cellHttpCreateTransaction", {tid(1), C, str(51), u_port}});
+    s.push_back({"cellHttpCreateTransaction", {tid(2), C, str(52), u_user}});
+    s.push_back({"cellHttpCreateTransaction", {tid(3), C, str(53), u_noscheme}});
+    s.push_back({"cellHttpCreateTransaction", {tid(4), C, str(55), u_other}});
+    s.push_back({"cellHttpCreateTransaction", {tid(5), C, str(54), u_ip}});
+    s.push_back({"cellHttpCreateTransaction", {tid(6), C, str(66), u_scheme0}});
+    s.push_back({"cellHttpCreateTransaction", {tid(7), C, str(67), u_http}});
+    s.push_back({"cellHttpCreateTransaction", {tid(8), C, str(68), u_http}});
+    s.push_back({"pool", {}});
+    // Not transactions.
+    for (const u64 bad : {u64{0}, u64{0x1234}, u64{0xC0000000}, str(1), C}) {
+        every(bad);
+        s.push_back({"cellHttpDestroyTransaction", {bad}});
+    }
+    s.push_back({"pool", {}});
+    // URIs, the method, credentials.
+    s.push_back({"cellHttpTransactionGetUri", {T(0), next(28), pool_at(0x100), 0x100, next()}});
+    s.push_back({"cellHttpTransactionGetUri", {T(0), 0, 0, 0, next()}});
+    s.push_back({"cellHttpTransactionGetUri", {T(0), next(28), pool_at(8), 8, next()}});
+    s.push_back({"cellHttpTransactionGetUri", {T(2), next(28), pool_at(0x100), 0x100, next()}});
+    for (const u64 bad : {u64{0}, u_nohost, u_empty, u_https}) s.push_back({"cellHttpTransactionSetUri", {T(1), bad}});
+    s.push_back({"cellHttpTransactionSetUri", {T(1), u_http}});
+    s.push_back({"cellHttpTransactionGetUri", {T(1), next(28), pool_at(0x100), 0x100, next()}});
+    s.push_back({"cellHttpTransactionSetUri", {T(1), u_port}});
+    s.push_back({"pool", {}});
+    for (u32 i = 0; i < 9; i++) {
+        s.push_back({"cellHttp_DAC62AB6", {T(i), next(16), 16, next()}});
+        s.push_back({"cellHttp_15C1FD80", {T(i), pool_at(0x100), pool_at(0x100)}});
+    }
+    s.push_back({"cellHttp_DAC62AB6", {T(1), 0, 0, next()}});
+    s.push_back({"cellHttp_DAC62AB6", {T(1), 0, 0, 0}});
+    s.push_back({"cellHttp_DAC62AB6", {T(1), next(8), 4, next()}});
+    s.push_back({"cellHttp_DAC62AB6", {T(1), next(8), 5, 0}});
+    s.push_back({"cellHttp_15C1FD80", {T(2), 0, pool_at(0x10)}});
+    s.push_back({"cellHttp_15C1FD80", {T(2), pool_at(0x10), 0}});
+    // The request's headers.
+    s.push_back({"cellHttpRequestAddHeader", {T(0), 0}});
+    s.push_back({"cellHttpRequestAddHeader", {T(0), o + 0x218}});
+    s.push_back({"cellHttpRequestAddHeader", {T(0), o + 0x228}});
+    s.push_back({"cellHttpRequestSetHeader", {T(0), 0}});
+    s.push_back({"cellHttpRequestSetHeader", {T(0), o + 0x210}});
+    s.push_back({"cellHttpRequestSetHeader", {T(0), o + 0x220}});
+    s.push_back({"cellHttpRequestSetHeader", {T(0), o + 0x230}});
+    s.push_back({"cellHttp_313D80D5", {T(1), o + 0x218}});
+    s.push_back({"cellHttp_313D80D5", {T(1), o + 0x218}});
+    s.push_back({"cellHttp_313D80D5", {T(1), 0}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpRequestDeleteHeader", {T(0), 0}});
+    s.push_back({"cellHttpRequestDeleteHeader", {T(0), str(15)}});
+    s.push_back({"cellHttpRequestDeleteHeader", {T(0), str(15)}});
+    s.push_back({"cellHttpRequestDeleteHeader", {T(0), str(7)}});
+    s.push_back({"cellHttpRequestDeleteHeader", {T(2), str(5)}});
+    s.push_back({"cellHttpRequestDeleteHeader", {T(2), str(7)}});
+    s.push_back({"cellHttpRequestDeleteHeader", {T(2), str(7)}});
+    s.push_back({"pool", {}});
+    // Content length and chunks.
+    s.push_back({"cellHttpRequestGetContentLength", {T(1), next(8)}});
+    s.push_back({"cellHttpRequestGetContentLength", {T(1), 0}});
+    s.push_back({"cellHttpRequestSetContentLength", {T(1), 1234}});
+    s.push_back({"cellHttpRequestGetContentLength", {T(1), next(8)}});
+    s.push_back({"cellHttpRequestSetChunkedTransferStatus", {T(1), 1}});
+    s.push_back({"cellHttpRequestGetChunkedTransferStatus", {T(1), next()}});
+    s.push_back({"cellHttpRequestGetChunkedTransferStatus", {T(1), 0}});
+    s.push_back({"cellHttpRequestSetChunkedTransferStatus", {T(2), 1}});
+    s.push_back({"cellHttpRequestSetContentLength", {T(2), 5}});
+    s.push_back({"cellHttpRequestGetChunkedTransferStatus", {T(2), next()}});
+    s.push_back({"cellHttpRequestSetChunkedTransferStatus", {T(4), 0x100}});
+    s.push_back({"cellHttpRequestGetChunkedTransferStatus", {T(4), next()}});
+    s.push_back({"cellHttpRequestSetContentLength", {T(3), 0x123456789}});
+    s.push_back({"cellHttpRequestGetContentLength", {T(3), next(8)}});
+    // libhttp's headers and the game's, every transaction.
+    for (u32 i = 0; i < 9; i++) headers_of(T(i));
+    s.push_back({"cellHttpRequestGetHeader", {T(0), next(8), 0, pool_at(0x10), 0x10, next()}});
+    s.push_back({"cellHttpRequestGetAllHeaders", {T(0), 0, 0, 0, 0, 0}});
+    s.push_back({"cellHttpRequestGetAllHeaders", {T(0), next(), 0, pool_at(0x400), 0x400, 0}});
+    s.push_back({"pool", {}});
+    // The response and the connection in state 0.
+    every(T(6));
+    s.push_back({"cellHttpResponseGetAllHeaders", {T(0), 0, 0, 0, 0, 0}});
+    s.push_back({"cellHttpResponseGetAllHeaders", {T(0), 0, 0, 0, 0, next()}});
+    s.push_back({"cellHttpResponseGetHeader", {T(0), next(8), 0, 0, 0, 0}});
+    s.push_back({"cellHttpResponseGetStatusCode", {T(0), 0}});
+    s.push_back({"cellHttpResponseGetContentLength", {T(0), 0}});
+    s.push_back({"cellHttp_E0CAF386", {T(0), 0}});
+    s.push_back({"cellHttpTransactionReleaseConnection", {T(0), 0}});
+    s.push_back({"cellHttp_8633468C", {T(0), 0}});
+    s.push_back({"pool", {}});
+    // Sending: the state callback, the redirection records, the manager's host records, a socket, the resolver.
+    s.push_back({"cellHttpSendRequest", {T(0), 0, 0, next()}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpSendRequest", {T(0), str(1), 10, 0}});
+    s.push_back({"cellHttpSendRequest", {T(1), 0, 0, next()}});
+    s.push_back({"cellHttp_DCD9D484", {T(3), 0, 0, next()}});
+    s.push_back({"cellHttpSendRequest", {T(4), 0, 0, next()}});
+    s.push_back({"cellHttpSendRequest", {T(5), 0, 0, next()}});
+    s.push_back({"cellHttpSendRequest", {T(6), 0, 0, next()}});
+    s.push_back({"pool", {}});
+    // The same with libnet set up: the socket is made, then the resolver isn't (offline).
+    s.push_back({"=", {o + 0x3F0, kData + 0x140000}});
+    s.push_back({"=", {o + 0x3F4, 0x40000}});
+    s.push_back({"=", {o + 0x3F8, 0}});
+    s.push_back({"net:sys_net_initialize_network_ex", {o + 0x3F0}});
+    s.push_back({"cellHttpSendRequest", {T(0), 0, 0, next()}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpSendRequest", {T(0), str(1), 10, 0}});
+    s.push_back({"cellHttpSendRequest", {T(1), 0, 0, next()}});
+    s.push_back({"cellHttp_DCD9D484", {T(3), 0, 0, next()}});
+    s.push_back({"cellHttpSendRequest", {T(4), 0, 0, next()}});
+    s.push_back({"cellHttpSendRequest", {T(5), 0, 0, next()}});
+    s.push_back({"cellHttpSendRequest", {T(6), 0, 0, next()}});
+    s.push_back({"cellHttpSendRequest", {T(7), 0, 0, next()}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpClientSetAutoRedirect", {C, 0}});
+    s.push_back({"cellHttpClientSetKeepAlive", {C, 0}});
+    s.push_back({"cellHttpCreateTransaction", {tid(9), C, str(50), u_port}});
+    s.push_back({"cellHttpSendRequest", {T(9), 0, 0, next()}});
+    headers_of(T(9));
+    s.push_back({"cellHttpClientSetTotalPoolSize", {C, 0}});
+    s.push_back({"cellHttpSendRequest", {T(9), 0, 0, next()}});
+    s.push_back({"cellHttpClientSetTotalPoolSize", {C, 8}});
+    s.push_back({"cellHttpClientSetKeepAlive", {C, 1}});
+    s.push_back({"cellHttpSendRequest", {T(9), 0, 0, next()}});
+    s.push_back({"pool", {}});
+    // The client's connections.
+    s.push_back({"cellHttpClientPollConnections", {C, next(), 1000}});
+    s.push_back({"cellHttpClientPollConnections", {C, 0, 1000}});
+    s.push_back({"cellHttpClientPollConnections", {0x1234, next(), 1000}});
+    s.push_back({"cellHttpClientCloseConnections", {C, u_http}});
+    s.push_back({"cellHttpClientCloseConnections", {C, u_ip}});
+    s.push_back({"cellHttpClientCloseConnections", {0x1234, u_ip}});
+    s.push_back({"cellHttpClientCloseAllConnections", {C}});
+    s.push_back({"cellHttpClientCloseAllConnections", {0x1234}});
+    s.push_back({"pool", {}});
+    // Aborted.
+    s.push_back({"cellHttpTransactionAbortConnection", {T(5)}});
+    s.push_back({"cellHttpTransactionAbortConnection", {T(5)}});
+    every(T(5));
+    s.push_back({"pool", {}});
+    // Cookies: the store's for the client's transactions made with cookies on.
+    s.push_back({"cellHttpInitCookie", {kCookiePool, kCookiePoolSize}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u_http, str(21), 0}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u_http, str(22), 0}});
+    s.push_back({"cellHttpAddCookieWithClientId", {u_http, str(23), 0}});
+    s.push_back({"cellHttpCreateTransaction", {tid(10), C, str(50), u_http}});
+    s.push_back({"cellHttpClientSetCookieStatus", {C, 1}});
+    s.push_back({"cellHttpCreateTransaction", {tid(11), C, str(50), u_http}});
+    s.push_back({"cellHttpCreateTransaction", {tid(12), C, str(50), u_ip}});
+    headers_of(T(10));
+    headers_of(T(11));
+    headers_of(T(12));
+    s.push_back({"pool", {}});
+    s.push_back({"pool", {kCookiePool, kCookiePoolSize}});
+    s.push_back({"cellHttpEndCookie", {}});
+    headers_of(T(11));
+    // A client with a proxy.
+    s.push_back({"cellHttpCreateClient", {cl2}});
+    s.push_back({"cellHttpClientSetProxy", {C2, px}});
+    s.push_back({"cellHttpCreateTransaction", {tid(13), C2, str(50), u_http}});
+    headers_of(T(13));
+    s.push_back({"cellHttpSendRequest", {T(13), 0, 0, next()}});
+    s.push_back({"pool", {}});
+    // HTTPS.
+    s.push_back({"cellHttpClientSetSslClientCertificate", {C, 0, 0}});
+    s.push_back({"cellHttpClientSetSslClientCertificate", {0x1234, 0, 0}});
+    s.push_back({"ssl:cellSslInit", {kData + 0x1B0000, 0x40000}});
+    s.push_back({"cellHttpsInit", {0, 0}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpClientSetSslClientCertificate", {C, 0, str(1)}});
+    s.push_back({"cellHttpClientSetSslClientCertificate", {C, str(1), 0}});
+    s.push_back({"cellHttpCreateTransaction", {tid(14), C, str(50), u_https}});
+    s.push_back({"cellHttpCreateTransaction", {tid(15), C, str(50), u_http}});
+    s.push_back({"cellHttpTransactionSetUri", {T(15), u_https}});
+    s.push_back({"cellHttpTransactionGetSslId", {T(14), next()}});
+    s.push_back({"cellHttpTransactionGetSslVersion", {T(14), next()}});
+    s.push_back({"cellHttpTransactionGetSslCipherString", {T(14), pool_at(0x40), 0x40}});
+    s.push_back({"cellHttpTransactionGetSslCipherBits", {T(14), next(), next()}});
+    s.push_back({"cellHttpTransactionGetSslCipherVersion", {T(14), pool_at(0x40), 0x40, next()}});
+    s.push_back({"cellHttpTransactionGetSslCipherId", {T(14), next()}});
+    s.push_back({"cellHttpTransactionGetSslCipherName", {T(14), pool_at(0x40), 0x40, next()}});
+    s.push_back({"cellHttpSendRequest", {T(14), 0, 0, next()}});
+    headers_of(T(14));
+    every(T(14));
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpsEnd", {}});
+    s.push_back({"ssl:cellSslEnd", {}});
+    s.push_back({"cellHttpSendRequest", {T(15), 0, 0, next()}});
+    // Destruction.
+    for (u32 i = 0; i < 16; i++) s.push_back({"cellHttpDestroyTransaction", {T(i)}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpDestroyTransaction", {T(0)}});
+    every(T(0));
+    s.push_back({"cellHttpDestroyClient", {C}});
+    s.push_back({"cellHttpDestroyClient", {C2}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpEnd", {}});
+    for (u32 i = 0; i < 16; i++) s.push_back({"~", {tid(i)}});
+    s.push_back({"~", {cl}});
+    s.push_back({"~", {cl2}});
+    return s;
+}
+
 } // namespace
 
 // Without the firmware: libhttp's answers for the set-up and a client, as the comparisons found them.
@@ -970,6 +1332,13 @@ TEST_CASE("cellHttp against libhttp: clients", "[hle][lle][http]")
     const std::optional<std::string> flash = test_dev_flash();
     if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
     compare(*flash, client_script(), "clients");
+}
+
+TEST_CASE("cellHttp against libhttp: transactions", "[hle][lle][http]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, transaction_script(), "transactions");
 }
 
 TEST_CASE("cellHttp against libhttp: probe", "[.][hle][lle][http]")

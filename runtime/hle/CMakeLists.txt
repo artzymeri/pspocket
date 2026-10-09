@@ -9,6 +9,7 @@ add_library(pspocket_hle STATIC
     src/cellHttpConnection.cpp
     src/cellHttpCookie.cpp
     src/cellHttps.cpp
+    src/cellHttpTransaction.cpp
     src/cellHttpUtil.cpp
     src/cellKey2char.cpp
     src/cellL10n.cpp

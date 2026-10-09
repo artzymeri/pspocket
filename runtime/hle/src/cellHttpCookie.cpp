@@ -1327,6 +1327,29 @@ s32 cellHttpCookieImport(PPUContext& ctx, u32 buf, u32 size)
 
 } // namespace
 
+// The Cookie header libhttp adds to a request: no cookies is no header; a block it can't get is no header either.
+s32 cookie_request_value(PPUContext& ctx, u32 host, u32 path, u32 scheme, u32& value)
+{
+    value = 0;
+    StackVar v(ctx, gb(ctx), 16); // the first block, the records, the size
+    const u32 first = v.addr(), records = v.addr() + 4, size = v.addr() + 8;
+    w32(ctx, first, 0);
+    w32(ctx, records, 0);
+    s32 r = cookies_find(ctx, first, host, path, scheme, records);
+    if (r >= 0) r = cookies_header(ctx, 0, r32(ctx, first), size, 0);
+    if (r >= 0) {
+        if (const u32 buf = hmalloc(ctx, r32(ctx, size))) {
+            r = cookies_header(ctx, buf, r32(ctx, first), 0, r32(ctx, size));
+            if (r < 0) hfree(ctx, buf);
+            else value = buf;
+        }
+    } else if (r == err(CELL_HTTP_ERROR_COOKIE_NOT_FOUND)) {
+        r = kOk;
+    }
+    if (const u32 f = r32(ctx, first)) cookies_found_free(ctx, f, r32(ctx, records));
+    return r;
+}
+
 // cellHttpSessionCookieFlush(clientId): the client's session cookies (no expiry, or marked so) deleted. Without the
 // store, CELL_OK.
 s32 session_cookie_flush(PPUContext& ctx, u32 client)

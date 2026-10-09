@@ -101,6 +101,9 @@ std::string str(PPUContext& ctx, u32 s);
 // liblv2's _sys_strncasecmp and _sys_strncmp over guest strings.
 s32 str_ncasecmp(PPUContext& ctx, u32 a, u32 b, u32 n);
 s32 str_ncmp(PPUContext& ctx, u32 a, u32 b, u32 n);
+// Whether a guest string is `word`: _sys_strncasecmp (any case) or _sys_strncmp over the word and its NUL.
+bool str_is(PPUContext& ctx, u32 s, std::string_view word);
+bool str_is_exact(PPUContext& ctx, u32 s, std::string_view word);
 
 // MD5 (RFC 1321), which libhttp uses to file cookies and records.
 void md5(const u8* data, usize len, u8 out[16]);
@@ -172,8 +175,13 @@ inline constexpr u32 kHttps = 0x7C0;
 inline constexpr u32 kTransactionTable = 0x7D0;
 // The caches (cellHttpInitCache's and the external one) and the disk cache.
 inline constexpr u32 kCache = 0x800, kExtCache = 0x880, kDiskCache = 0x900;
-// Strings libhttp hands to other libraries (heap names).
+// Strings libhttp hands to other libraries (heap names, the headers it adds to a request).
 inline constexpr u32 kStrHeap = 0xC00, kStrCookieHeap = 0xC20, kStrSlash = 0xC40, kStrEquals = 0xC44, kStrSemi = 0xC48;
+inline constexpr u32 kStrHost = 0xC50, kStrUserAgent = 0xC58, kStrConnection = 0xC68, kStrProxyConnection = 0xC78,
+                     kStrKeepAlive = 0xC90, kStrClose = 0xCA0, kStrContentLength = 0xCA8, kStrTransferEncoding = 0xCB8,
+                     kStrChunked = 0xCD0, kStrAuthorization = 0xCD8, kStrProxyAuthorization = 0xCE8,
+                     kStrCookie = 0xD00, kStrAcceptEncoding = 0xD08, kStrGzip = 0xD18, kStrIdentity = 0xD20,
+                     kStrIfModifiedSince = 0xD30, kStrRange = 0xD48, kStrContentRange = 0xD50;
 inline constexpr u32 kDataSize = 0x1000;
 
 bool initialized(PPUContext& ctx);
@@ -230,17 +238,55 @@ s32 headers_copy_all(PPUContext& ctx, u32 first, u32 headers, u32 pool, u32 size
 // to free once the copy is stored.
 s32 proxy_prepare(PPUContext& ctx, u32 proxy, u32 uri, u32& pool, u32& parse_pool);
 
+// A transaction (488 bytes, cellHttpTransaction.cpp): the request's content length (u64) +0 and the bytes of it sent
+// +8; the URI (a CellHttpUri) +16 and its pool +44; the request line {method, path, protocol, major, minor} +48 and the
+// blocks its strings are in (+68 the protocol, +72 the method, +76 the path); the client's user agent +80 (its size
+// +84), headers +88 (their count +92) and settings copied at creation (+112, +132, +138..+145, +153..+156, +160, +260,
+// +456); the credentials +96/+100, the authentication cache entries +104/+116 and the Authorization and
+// Proxy-Authorization values +108/+120; the switches set by cellHttpRequestSetContentLength (+136) and
+// cellHttpRequestSetChunkedTransferStatus (+137); +146/+148 whether it goes through a proxy (and tunnels); +151 an
+// idempotent method; the response's status line +328 (its pool +352), headers +356 (count +360) and flags
+// +364..+370; its own address +376, the client +380, the connection +384/+388, the locks "_htttrn" +392 and
+// "_htttna" +416, +440/+448, the state +452, the SSL version +456, HTTPS +460, aborted +461; the cache's entries
+// +468/+472/+476 and the disk cache's +480.
+namespace trans {
+inline constexpr u32 kSize = 488;
+inline constexpr u32 kContentLength = 0, kSent = 8, kUri = 16, kUriScheme = 16, kUriHost = 20, kUriUser = 24,
+                     kUriPass = 28, kUriPath = 32, kUriPort = 36, kUriPool = 44, kMethod = 48, kPath = 52,
+                     kProtocol = 56, kMajor = 60, kMinor = 64, kProtocolBlock = 68, kMethodBlock = 72, kPathBlock = 76,
+                     kUa = 80, kUaSize = 84, kHeaders = 88, kHeaderCount = 92, kUser = 96, kPass = 100, kAuth = 104,
+                     kAuthorization = 108, k112 = 112, kProxyAuth = 116, kProxyAuthorization = 120, k124 = 124,
+                     k128 = 128, k132 = 132, kHasLength = 136, kChunked = 137, kKeepAlive = 138, kAutoRedirect = 139,
+                     kAutoAuth = 140, kAuthCache = 141, k142 = 142, k143 = 143, kPipeline = 144, kCookie = 145,
+                     kProxied = 146, kTunnel = 148, k149 = 149, kIdempotent = 151, kCache = 153, kExtCache = 154,
+                     kDiskCache = 155, k156 = 156, k160 = 160, kResponseLength = 168, kInflate = 200, k256 = 256,
+                     kResponseBufferMax = 260, k264 = 264, kStatusLine = 328, kStatusCode = 344, kStatusPool = 352,
+                     kResponseHeaders = 356, kResponseHeaderCount = 360, kHasResponseLength = 364, k366 = 366,
+                     k367 = 367, k368 = 368, k370 = 370, kSelf = 376, kClient = 380, kConn = 384, kConn2 = 388,
+                     kLock = 392, kAbortLock = 416, k440 = 440, k448 = 448, kState = 452, kSslVersion = 456,
+                     kHttps = 460, kAborted = 461, kCacheEntry = 468, k472 = 472, k476 = 476, kDiskEntry = 480;
+} // namespace trans
+
 // Registration of each file's functions.
 void register_core(Registry& r);
 void register_clients(Registry& r);
 void register_cookies(Registry& r);
 void register_auth(Registry& r);
 void register_https(Registry& r);
+void register_transactions(Registry& r);
+void register_connections(Registry& r);
 
 // A connection (cellHttpConnection.cpp).
 namespace conn {
 inline constexpr u32 kSocket = 40, kSelf = 148;
 } // namespace conn
+// A connection for a request (libhttp's): the client's proxy, the manager's host lists and limits, a new connection
+// and its socket and resolver. `uri` is the transaction's; `out_conn` its connection word, `proxied` and `flag` bytes.
+s32 connection_acquire(PPUContext& ctx, u32 client, u32 uri, u32 out_conn, u32 proxied, u8 keep_alive, u8 https,
+    u32 flag, u32 t);
+// What a part of libhttp past a made connection would do, which pspocket can't reach yet (libnet's resolver functions
+// are not pspocket's, D-523): logged, CELL_HTTP_ERROR_INTERNAL.
+s32 unreachable(PPUContext& ctx, std::string_view what);
 bool connection_valid(PPUContext& ctx, u32 conn);
 bool connection_flag140(PPUContext& ctx, u32 conn);
 bool connection_flag141(PPUContext& ctx, u32 conn);
@@ -252,10 +298,17 @@ s32 manager_create(PPUContext& ctx, u32 out, u32 total, u32 per_host, u32 keep_a
 s32 manager_destroy(PPUContext& ctx, u32 m);
 s32 manager_close_all(PPUContext& ctx, u32 m);
 s32 manager_ssl_version(PPUContext& ctx, u32 m, u32 out);
+// cellHttpClientGetSslVersion, as libhttp's transactions ask it.
+s32 client_ssl_version(PPUContext& ctx, u32 client, u32 out);
 
 // Cookies (cellHttpCookie.cpp): the client's session cookies flushed when it is destroyed; a Set-Cookie value parsed.
 s32 session_cookie_flush(PPUContext& ctx, u32 client);
 s32 cookie_parse(PPUContext& ctx, u32 str, u32 host, u32 path, u32 out_list, u32 out_count, u32 out_size, u32 client);
+// The Cookie header a request carries (its value in a block of libhttp's heap at *value, 0 for none): the store's
+// cookies for the host, path and scheme.
+s32 cookie_request_value(PPUContext& ctx, u32 host, u32 path, u32 scheme, u32& value);
+// The redirection records (cellHttp.cpp): the one for a URI string and method (0 for none).
+u32 records_find(PPUContext& ctx, u32 uri_string, u32 method);
 // HTTPS (cellHttps.cpp): a client's SSL record made and freed with the client, a socket's SSL object closed.
 s32 client_ssl_create(PPUContext& ctx, u32 client);
 s32 client_ssl_destroy(PPUContext& ctx, u32 client);

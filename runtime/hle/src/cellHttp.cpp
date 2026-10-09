@@ -78,6 +78,26 @@ s32 str_ncmp(PPUContext& ctx, u32 a, u32 b, u32 n)
     return 0;
 }
 
+bool str_is(PPUContext& ctx, u32 s, std::string_view word)
+{
+    for (u32 i = 0; i <= word.size(); i++) {
+        const int c = lower(r8(ctx, s + i)), w = i < word.size() ? lower(static_cast<u8>(word[i])) : 0;
+        if (c != w) return false;
+        if (!c) break;
+    }
+    return true;
+}
+
+bool str_is_exact(PPUContext& ctx, u32 s, std::string_view word)
+{
+    for (u32 i = 0; i <= word.size(); i++) {
+        const u8 c = r8(ctx, s + i), w = i < word.size() ? static_cast<u8>(word[i]) : 0;
+        if (c != w) return false;
+        if (!c) break;
+    }
+    return true;
+}
+
 void md5(const u8* data, usize len, u8 out[16])
 {
     static constexpr u32 kK[64] = {0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
@@ -278,6 +298,14 @@ u32 data(PPUContext& ctx)
         std::memcpy(gb(ctx) + l.data + kStrSlash, "/", 2);
         std::memcpy(gb(ctx) + l.data + kStrEquals, "=", 2);
         std::memcpy(gb(ctx) + l.data + kStrSemi, "; ", 3);
+        static constexpr std::pair<u32, std::string_view> kStrings[] = {{kStrHost, "Host"},
+            {kStrUserAgent, "User-Agent"}, {kStrConnection, "Connection"}, {kStrProxyConnection, "Proxy-Connection"},
+            {kStrKeepAlive, "Keep-Alive"}, {kStrClose, "close"}, {kStrContentLength, "Content-Length"},
+            {kStrTransferEncoding, "Transfer-Encoding"}, {kStrChunked, "chunked"}, {kStrAuthorization, "Authorization"},
+            {kStrProxyAuthorization, "Proxy-Authorization"}, {kStrCookie, "Cookie"},
+            {kStrAcceptEncoding, "Accept-Encoding"}, {kStrGzip, "gzip"}, {kStrIdentity, "identity"},
+            {kStrIfModifiedSince, "If-Modified-Since"}, {kStrRange, "Range"}, {kStrContentRange, "Content-Range"}};
+        for (const auto& [at, text] : kStrings) std::memcpy(gb(ctx) + l.data + at, text.data(), text.size()); // NULs: zeroed
     }
     return l.data;
 }
@@ -644,6 +672,45 @@ s32 cellHttpSetProxy(PPUContext& ctx, u32 proxy)
 
 } // namespace
 
+u32 records_find(PPUContext& ctx, u32 uri_string, u32 method)
+{
+    const u32 base = data(ctx) + kRec;
+    u8 digest[16];
+    const u32 n = str_len(ctx, uri_string);
+    md5(gb(ctx) + uri_string, n, digest);
+    for (u32 rec = r32(ctx, base + 1564); rec; rec = r32(ctx, rec + 84)) {
+        if (std::memcmp(gb(ctx) + rec + 8, digest, 16) != 0) continue;
+        const u32 a = r32(ctx, rec + 24), m = r32(ctx, rec + 28);
+        if (str_ncmp(ctx, a, uri_string, str_len(ctx, a) + 1) != 0) continue;
+        if (str_ncmp(ctx, m, method, str_len(ctx, m) + 1) != 0) continue;
+        if (r8(ctx, rec + 92)) continue;
+        // Used: counted, and moved to the front of the list.
+        w32(ctx, rec + 4, r32(ctx, rec + 4) + 1);
+        w32(ctx, rec, r32(ctx, rec) + 1);
+        const u32 prev = r32(ctx, rec + 80), next = r32(ctx, rec + 84);
+        if (prev) w32(ctx, prev + 84, next);
+        else w32(ctx, base + 1564, next);
+        if (next) w32(ctx, next + 80, prev);
+        else w32(ctx, base + 1568, prev);
+        w32(ctx, rec + 80, 0);
+        const u32 head = r32(ctx, base + 1564);
+        w32(ctx, rec + 84, head);
+        if (head) w32(ctx, head + 80, rec);
+        else w32(ctx, base + 1568, rec);
+        w32(ctx, base + 1564, rec);
+        return rec;
+    }
+    return 0;
+}
+
+s32 unreachable(PPUContext& ctx, std::string_view what)
+{
+    log_call_site(ctx, gb(ctx), std::format("cellHttp: {}: libhttp's code past a made connection, which pspocket can't "
+                                            "reach (libnet's resolver functions are not its own, D-523), is not "
+                                            "pspocket's: CELL_HTTP_ERROR_INTERNAL", what));
+    return err(CELL_HTTP_ERROR_INTERNAL);
+}
+
 void register_core(Registry& r)
 {
     r.add("cellHttp", {
@@ -666,6 +733,8 @@ void register_cellHttp(Registry& r)
     http::register_cookies(r);
     http::register_auth(r);
     http::register_https(r);
+    http::register_transactions(r);
+    http::register_connections(r);
 }
 
 } // namespace pspocket::hle
