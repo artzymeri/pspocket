@@ -395,6 +395,13 @@ s32 cellSysmoduleFinalize(PPUContext&)
     return lv2::CELL_OK;
 }
 
+// libsysmodule's internal mode switch: it takes the mode and does nothing with it (fw 4.92's answers CELL_OK).
+s32 cellSysmoduleSetInternalmode(PPUContext&, u32 mode)
+{
+    PS_LOG_DEBUG(kChan, "cellSysmoduleSetInternalmode({:#x})", mode);
+    return lv2::CELL_OK;
+}
+
 s32 cellSysmoduleLoadModule(PPUContext&, u16 id)
 {
     PS_LOG_INFO(kChan, "cellSysmoduleLoadModule({:#06x} {})", id, name_of(id));
@@ -634,6 +641,7 @@ void register_cellSysmodule(Registry& r)
         PS_HLE_FUNC(0x03D90241, cellSysmoduleSetDebugmode),
         PS_HLE_FUNC(0x1EF115EF, cellSysmoduleGetImagesize),
         PS_HLE_FUNC(0x3C92BE09, cellSysmoduleFetchImage),
+        PS_HLE_FUNC(0x002CD0BF, cellSysmoduleSetInternalmode),
     });
 }
 

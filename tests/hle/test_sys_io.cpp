@@ -315,7 +315,5 @@ TEST_CASE("cellMouse: initialized with no mouse connected; sys_config", "[hle][i
     CHECK(g.call("cellMouseSetTabletMode", 127, 1) == kInval);
     REQUIRE(g.call("cellMouseEnd") == 0);
 
-    CHECK(g.call("sys_config_start") == 0);
-    CHECK(g.call("sys_config_stop") == 0);
-    CHECK(g.call("sys_config_stop") == 0); // RPCS3: an unbalanced stop is accepted
+    // sys_config_* are libio's config service agent (D-533): tests/hle/test_config_compare.cpp.
 }

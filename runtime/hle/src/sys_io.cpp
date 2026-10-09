@@ -6,9 +6,9 @@
 // device type; PS3 conformity, press mode, sensor mode, high-precision sticks, actuator). The host feeds it with
 // set_pad_input (pspocket/hle/input.hpp); at rest it reports no buttons and centred sticks. A game may add custom
 // controllers of its own (cellPadLdd*: ports 1 to 6, fed by the game). No keyboard and no mouse are connected, as with
-// RPCS3's default null handlers; cellKbCnvRawCode converts key codes all the same. RPCS3's sys_config machinery (the
-// event thread that delivers connect events) is not reproduced: the controller is reported connected, with the
-// assignment-changed flag, from cellPadInit.
+// RPCS3's default null handlers; cellKbCnvRawCode converts key codes all the same. The controller is reported
+// connected, with the assignment-changed flag, from cellPadInit. sys_config_* are libio's own config service agent
+// over lv2's sys_config (D-533, below).
 //
 // cellPadGetData reports changes only, as RPCS3 does: the first read after init or cellPadClearBuf, and any read where
 // the controller's state differs from the last one reported, returns data; otherwise CELL_PAD_LEN_NO_CHANGE. With
@@ -18,11 +18,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
@@ -30,6 +32,7 @@
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -824,28 +827,519 @@ s32 cellMouseSetTabletMode(PPUContext&, u32 port, u32)
 }
 
 // --------------------------------------------------------------------------------------------------- sys_config
-// RPCS3 sys_io_.cpp starts an event thread here that delivers controller connect events; pspocket's controller is
-// connected from cellPadInit and never changes, so only the start count is kept.
+// libio's config service agent (sys_io.sprx, fw 4.92), as libio has it (D-533). One agent object on liblv2's heap
+// (_sys_malloc), made at the first call under a spin guard that waits with sys_timer_usleep(1000): its recursive
+// lwmutex ("_io_mtx") at +0, the event queue at +0x18, lv2's sys_config handle at +0x1C (-1 until opened) and the I/O
+// error handler at +0x20. The first sys_config_start makes the queue ("_io_eq_", priority order, 32 deep), opens
+// sys_config on it and starts the "_cfg_ev_hndlr" thread (priority 512, 8 KB stack, joinable), which receives the
+// queue's events while the start count is not zero: a service event (source 1) is read with
+// sys_config_get_service_event into a buffer from the heap and handed to its listener's callbacks (a registered
+// service: (service ID, user ID, verbosity, its data or NULL, the data's size); an unregistered one: (service ID, user
+// ID)); an I/O error event (source 2) is read with sys_config_get_io_event and handed to the handler (its first word,
+// the rest, the rest's size). Listeners are 20-byte nodes on the heap (next, previous, lv2's listener ID, the two
+// callbacks' descriptors) in libio's list, oldest first. The callbacks run under the lwmutex, which every call takes
+// with a 4-second timeout and goes on without when that fails, as libio does. libio's diagnostics go out through
+// _sys_printf with libio's text. The last sys_config_stop frees the listeners, destroys the queue (forcing the thread
+// out), closes the handle, joins the thread, then deletes the agent.
+
+constexpr std::string_view kCfgChan = "sys_config";
+
+namespace cfg {
+constexpr u32 queue = 0x18, handle = 0x1C, io_handler = 0x20, size = 0x28; // the lwmutex at +0
+constexpr u32 next = 0, prev = 4, listener = 8, on_registered = 12, on_unregistered = 16, node_size = 20;
+constexpr u32 CELL_ENOMEM = 0x80010004, CELL_EINVAL = 0x80010002, CELL_EABORT = 0x8001000C,
+              CELL_ECANCELED = 0x80010013, CELL_EEXIST = 0x80010014;
+constexpr u32 kLockTimeout = 4000000; // microseconds
+} // namespace cfg
 
 struct ConfigState {
-    std::mutex mutex;
-    s32 init_ctr = 0;
+    std::atomic<u32> guard{0};   // libio's spin guard around making and deleting the agent
+    std::atomic<u32> agent{0};   // the agent on liblv2's heap, or 0
+    std::atomic<s32> started{0}; // sys_config_start's count (the event thread reads it unlocked)
+    u64 thread = 0;              // the event thread
+    u32 head = 0, tail = 0;      // the listeners, oldest first
 };
 
-s32 sys_config_start(PPUContext&)
+ConfigState& config_state() { return HleProcess::current()->state<ConfigState>(); }
+
+// liblv2's export `name`, which libio imports: pspocket's own sysPrxForUser.
+u64 lv2_lib(PPUContext& ctx, std::string_view name, std::span<const u64> args)
 {
-    ConfigState& c = HleProcess::current()->state<ConfigState>();
-    std::lock_guard lock(c.mutex);
-    ++c.init_ctr;
+    const Function* f = registry().find("sysPrxForUser", recomp::nid_of(name));
+    if (!f) PS_FATAL(kCfgChan, "sysPrxForUser::{}, which libio imports, is not pspocket's", name);
+    std::array<u64, 8> saved{};
+    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
+    for (u32 i = 0; i < args.size() && i < 8; i++) ctx.gpr[3 + i] = args[i];
+    f->fn(ctx, guest_base(ctx));
+    const u64 r = ctx.gpr[3];
+    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
+    return r;
+}
+
+u64 lv2_lib(PPUContext& ctx, std::string_view name, std::initializer_list<u64> args)
+{
+    return lv2_lib(ctx, name, std::span<const u64>(args.begin(), args.size()));
+}
+
+u32 io_malloc(PPUContext& ctx, u32 size) { return static_cast<u32>(lv2_lib(ctx, "_sys_malloc", {size})); }
+void io_free(PPUContext& ctx, u32 addr) { lv2_lib(ctx, "_sys_free", {addr}); }
+
+// _sys_printf(fmt, [str,] args...), the format and the string on the caller's stack.
+void io_printf(PPUContext& ctx, std::string_view fmt, std::initializer_list<u64> args, std::string_view str = {})
+{
+    u8* b = guest_base(ctx);
+    StackVar text(ctx, b, static_cast<u32>(fmt.size() + str.size() + 2));
+    std::memcpy(b + text.addr(), fmt.data(), fmt.size());
+    const u32 at = text.addr() + static_cast<u32>(fmt.size()) + 1;
+    std::memcpy(b + at, str.data(), str.size());
+    std::vector<u64> a{text.addr()};
+    if (!str.empty()) a.push_back(at);
+    a.insert(a.end(), args.begin(), args.end());
+    lv2_lib(ctx, "_sys_printf", a);
+}
+
+void cfg_lock(PPUContext& ctx, u32 a)
+{
+    if (const s32 r = static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_lock", {a, cfg::kLockTimeout})); r != lv2::CELL_OK)
+        io_printf(ctx, "config_service_agent::lock() failed. [%x]\n", {static_cast<u64>(static_cast<s64>(r))});
+}
+
+void cfg_unlock(PPUContext& ctx, u32 a)
+{
+    if (const s32 r = static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_unlock", {a})); r != lv2::CELL_OK)
+        io_printf(ctx, "config_service_agent::unlock() failed. [%x]\n", {static_cast<u64>(static_cast<s64>(r))});
+}
+
+void cfg_guard(PPUContext& ctx, ConfigState& c)
+{
+    while (c.guard.fetch_add(1) != 0) {
+        c.guard.fetch_sub(1);
+        lv2_syscall(ctx, 141, {1000}); // sys_timer_usleep
+    }
+}
+
+// The agent, made at the first call (libio's config_service_agent::instance).
+u32 cfg_agent(PPUContext& ctx)
+{
+    ConfigState& c = config_state();
+    u8* b = guest_base(ctx);
+    cfg_guard(ctx, c);
+    if (const u32 a = c.agent) {
+        c.guard.fetch_sub(1);
+        return a;
+    }
+    const u32 a = io_malloc(ctx, cfg::size);
+    if (!a) {
+        io_printf(ctx, "config_service_agent::initialize() %d Can't allocate memory.\n", {50});
+        PS_FATAL(kCfgChan, "libio's config service agent: liblv2's heap has no {} bytes (libio goes on with NULL "
+            "and faults)", cfg::size);
+    }
+    {
+        StackVar attr(ctx, b, 16); // sys_lwmutex_attribute_t {protocol, recursive, name[8]}
+        ps_write32(b, attr.addr(), 2);        // SYS_SYNC_PRIORITY
+        ps_write32(b, attr.addr() + 4, 0x10); // SYS_SYNC_RECURSIVE
+        std::memcpy(b + attr.addr() + 8, "_io_mtx", 7);
+        if (const s32 r = static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_create", {a, attr.addr()})); r != lv2::CELL_OK)
+            io_printf(ctx, "%s %d sys_lwmutex_create() failed. [%d]\n", {312, static_cast<u64>(static_cast<s64>(r))},
+                "mutex");
+    }
+    ps_write32(b, a + cfg::handle, 0xFFFFFFFF);
+    ps_write32(b, a + cfg::io_handler, 0);
+    ps_write32(b, a + cfg::queue, 0);
+    c.agent = a;
+    c.guard.fetch_sub(1);
+    return a;
+}
+
+// The listener node with lv2's ID `id`, or 0.
+u32 cfg_find(u8* b, const ConfigState& c, u32 id)
+{
+    for (u32 n = c.head; n; n = ps_read32(b, n + cfg::next))
+        if (ps_read32(b, n + cfg::listener) == id) return n;
+    return 0;
+}
+
+void cfg_append(u8* b, ConfigState& c, u32 n)
+{
+    if (c.tail) {
+        ps_write32(b, c.tail + cfg::next, n);
+        ps_write32(b, n + cfg::prev, c.tail);
+        c.tail = n;
+        return;
+    }
+    c.head = c.tail = n;
+    ps_write32(b, n + cfg::prev, 0);
+    ps_write32(b, n + cfg::next, 0);
+}
+
+// Takes the node with lv2's ID `id` out of the list: the node, or 0.
+u32 cfg_unlink(u8* b, ConfigState& c, u32 id)
+{
+    const u32 n = cfg_find(b, c, id);
+    if (!n) return 0;
+    const u32 prev = ps_read32(b, n + cfg::prev), next = ps_read32(b, n + cfg::next);
+    if (prev) {
+        ps_write32(b, prev + cfg::next, next);
+        if (next) ps_write32(b, next + cfg::prev, prev);
+        else c.tail = prev;
+    } else if (next) {
+        c.head = next;
+        ps_write32(b, next + cfg::prev, 0);
+    } else {
+        c.head = c.tail = 0;
+    }
+    return n;
+}
+
+// A callback of the game's, through its descriptor; libio calls whatever the word holds.
+void cfg_callback(PPUContext& ctx, u32 opd, std::string_view what, std::initializer_list<u64> args)
+{
+    if (opd && guest_readable(thread_of(ctx), opd, 8)) {
+        call_guest(ctx, opd, args);
+        return;
+    }
+    log_call_site(ctx, guest_base(ctx), std::format("sys_config: the listener's {} callback is {:#x}, not a function "
+        "descriptor (libio calls it and faults); not called", what, opd));
+}
+
+// A service event read into `buf` (sys_config_service_event_t): its listener's callback, under the lock.
+void cfg_deliver(PPUContext& ctx, u32 a, u32 buf, bool registered, u32 data, u32 size)
+{
+    ConfigState& c = config_state();
+    u8* b = guest_base(ctx);
+    cfg_lock(ctx, a);
+    if (c.started != 0 && buf) {
+        if (const u32 n = cfg_find(b, c, ps_read32(b, buf))) {
+            const u64 sid = ps_read64(b, buf + 8), uid = ps_read64(b, buf + 16);
+            if (registered)
+                cfg_callback(ctx, ps_read32(b, n + cfg::on_registered), "registered",
+                    {sid, uid, ps_read64(b, buf + 24), data, size});
+            else
+                cfg_callback(ctx, ps_read32(b, n + cfg::on_unregistered), "unregistered", {sid, uid});
+        }
+    }
+    cfg_unlock(ctx, a);
+}
+
+// Event source 1: (handle, registered << 32 | event ID, size).
+s32 cfg_service_event(PPUContext& ctx, u32 a, u64 d1, u64 d2, u64 d3)
+{
+    u8* b = guest_base(ctx);
+    const u32 size = static_cast<u32>(d3), handle = ps_read32(b, a + cfg::handle);
+    if (static_cast<u32>(d1) != handle) {
+        io_printf(ctx, "config_service_agent::handle_service_event() : Invalid config_customer_id. [%lx:%lx]\n",
+            {handle, static_cast<u32>(d1)});
+    }
+    u32 buf = 0, have = 0;
+    if (size) {
+        buf = io_malloc(ctx, size);
+        if (!buf) return error(cfg::CELL_ENOMEM);
+        have = size;
+    }
+    if (const s32 r = static_cast<s32>(lv2_syscall(ctx, 518, {handle, static_cast<u32>(d2), buf, have}));
+        r != lv2::CELL_OK) {
+        io_printf(ctx, "config_service_agent::handle_service_event() : sys_config_get_service_event() failed. [%d]\n",
+            {static_cast<u64>(static_cast<s64>(r))});
+        return r; // libio keeps the buffer
+    }
+    switch (d2 >> 32) {
+    case 0:
+        cfg_deliver(ctx, a, buf, false, 0, 0);
+        if (buf) io_free(ctx, buf);
+        return lv2::CELL_OK;
+    case 1: {
+        const u32 n = buf ? ps_read32(b, buf + 32) : 0;
+        cfg_deliver(ctx, a, buf, true, n ? buf + 40 : 0, n);
+        io_free(ctx, buf);
+        return lv2::CELL_OK;
+    }
+    default:
+        io_printf(ctx, "config_service_agent::event_handler() : invalid event.\n", {});
+        return error(cfg::CELL_EABORT); // libio keeps the buffer
+    }
+}
+
+// Event source 2: (handle, event ID, size); the handler gets the event's first word, the rest and its size.
+s32 cfg_io_event(PPUContext& ctx, u32 a, u64 d2, u64 d3)
+{
+    u8* b = guest_base(ctx);
+    cfg_lock(ctx, a);
+    s32 r = lv2::CELL_OK;
+    if (ps_read32(b, a + cfg::io_handler)) {
+        const u32 size = static_cast<u32>(d3);
+        u32 buf = 0, have = 0;
+        if (size) {
+            buf = io_malloc(ctx, size);
+            if (!buf) {
+                cfg_unlock(ctx, a);
+                return error(cfg::CELL_ENOMEM);
+            }
+            have = size;
+        }
+        r = static_cast<s32>(lv2_syscall(ctx, 523, {ps_read32(b, a + cfg::handle), static_cast<u32>(d2), buf, have}));
+        if (r == lv2::CELL_OK) {
+            const u32 handler = ps_read32(b, a + cfg::io_handler);
+            const u32 first = buf && guest_readable(thread_of(ctx), buf, 4) ? ps_read32(b, buf) : 0;
+            if (handler) {
+                call_guest(ctx, handler, {static_cast<u64>(static_cast<s64>(static_cast<s32>(first))), buf + 4u,
+                    size - 4u});
+            } else {
+                r = error(cfg::CELL_EABORT);
+            }
+            io_free(ctx, buf);
+        } else if (buf) {
+            io_free(ctx, buf);
+        }
+    }
+    cfg_unlock(ctx, a);
+    return r;
+}
+
+// The event thread's loop (libio's config_service_agent::event_handler).
+void cfg_event_loop(PPUContext& ctx, u32 a)
+{
+    ConfigState& c = config_state();
+    u8* b = guest_base(ctx);
+    StackVar event(ctx, b, 32); // sys_event_t, which lv2 answers in r4..r7
+    while (c.started != 0) {
+        u64 saved[10];
+        for (u32 k = 0; k < 10; k++) saved[k] = ctx.gpr[3 + k];
+        ctx.gpr[3] = ps_read32(b, a + cfg::queue);
+        ctx.gpr[4] = event.addr();
+        ctx.gpr[5] = 0;
+        ctx.gpr[11] = 130; // sys_event_queue_receive
+        thread_of(ctx).kernel.syscall(ctx);
+        const s32 r = static_cast<s32>(ctx.gpr[3]);
+        const u64 source = ctx.gpr[4], d1 = ctx.gpr[5], d2 = ctx.gpr[6], d3 = ctx.gpr[7];
+        for (u32 k = 0; k < 10; k++) ctx.gpr[3 + k] = saved[k];
+        if (r != lv2::CELL_OK) {
+            if (static_cast<u32>(r) == cfg::CELL_ECANCELED && c.started != 0)
+                io_printf(ctx, "%s %d m_ref_count_ != 0. [%d]\n", {400, static_cast<u64>(c.started.load())},
+                    "event_handler");
+            return;
+        }
+        ps_write64(b, event.addr(), source);
+        ps_write64(b, event.addr() + 8, d1);
+        ps_write64(b, event.addr() + 16, d2);
+        ps_write64(b, event.addr() + 24, d3);
+        if (source == 1) {
+            if (const s32 e = cfg_service_event(ctx, a, d1, d2, d3); e != lv2::CELL_OK)
+                io_printf(ctx, "config_service_agent::event_handler() : handle_service_event() failed. [%d]\n",
+                    {static_cast<u64>(static_cast<s64>(e))});
+        } else if (source == 2) {
+            if (const s32 e = cfg_io_event(ctx, a, d2, d3); e != lv2::CELL_OK)
+                io_printf(ctx, "config_service_agent::event_handler() : handle_io_error_event() failed. [%d]\n",
+                    {static_cast<u64>(static_cast<s64>(e))});
+        } else {
+            io_printf(ctx, "config_service_agent::event_handler() : Invalid config_event_type [%d]\n", {d1});
+        }
+    }
+}
+
+// The "_cfg_ev_hndlr" thread's entry.
+void _pspocket_sys_config_event_thread(PPUContext& ctx, u64)
+{
+    cfg_event_loop(ctx, cfg_agent(ctx));
+    lv2_lib(ctx, "sys_ppu_thread_exit", {0});
+}
+
+s32 sys_config_start(PPUContext& ctx)
+{
+    ConfigState& c = config_state();
+    u8* b = guest_base(ctx);
+    const u32 a = cfg_agent(ctx);
+    cfg_lock(ctx, a);
+    if (++c.started != 1) {
+        cfg_unlock(ctx, a);
+        return lv2::CELL_OK;
+    }
+    s32 r;
+    {
+        StackVar attr(ctx, b, 16); // sys_event_queue_attribute_t {protocol, type, name[8]}
+        ps_write32(b, attr.addr(), 2); // SYS_SYNC_PRIORITY
+        ps_write32(b, attr.addr() + 4, 1); // SYS_PPU_QUEUE
+        std::memcpy(b + attr.addr() + 8, "_io_eq_", 7);
+        r = static_cast<s32>(lv2_syscall(ctx, 128, {a + cfg::queue, attr.addr(), 0, 32})); // sys_event_queue_create
+    }
+    if (r == lv2::CELL_OK) {
+        r = static_cast<s32>(lv2_syscall(ctx, 516, {ps_read32(b, a + cfg::queue), a + cfg::handle})); // sys_config_open
+        if (r == lv2::CELL_OK) {
+            StackVar v(ctx, b, 32); // the thread's ID, then its name
+            std::memcpy(b + v.addr() + 8, "_cfg_ev_hndlr", 13);
+            const u32 entry = HleProcess::current()->link_function("sys_io",
+                recomp::nid_of("_pspocket_sys_config_event_thread"), "_pspocket_sys_config_event_thread");
+            r = static_cast<s32>(lv2_lib(ctx, "sys_ppu_thread_create", {v.addr(), entry, 0, 512, 0x2000, 1,
+                v.addr() + 8}));
+            if (r == lv2::CELL_OK) {
+                c.thread = ps_read64(b, v.addr());
+                cfg_unlock(ctx, a);
+                return lv2::CELL_OK;
+            }
+            lv2_syscall(ctx, 517, {ps_read32(b, a + cfg::handle)}); // sys_config_close
+        }
+        lv2_syscall(ctx, 129, {ps_read32(b, a + cfg::queue), 0}); // sys_event_queue_destroy
+    }
+    cfg_unlock(ctx, a); // the count stays raised, as libio leaves it
+    return r;
+}
+
+// libio's config_service_agent::stop.
+s32 cfg_stop(PPUContext& ctx, u32 a)
+{
+    ConfigState& c = config_state();
+    u8* b = guest_base(ctx);
+    cfg_lock(ctx, a);
+    if (c.started == 0) {
+        io_printf(ctx, "config_service_agent::stop() %d m_ref_count_ = %d\n", {114, 0});
+        cfg_unlock(ctx, a);
+        return error(cfg::CELL_EABORT);
+    }
+    if (--c.started == 0) {
+        while (const u32 n = c.head) {
+            const u32 next = ps_read32(b, n + cfg::next);
+            if (next) {
+                ps_write32(b, next + cfg::prev, 0);
+                c.head = next;
+            } else {
+                c.head = c.tail = 0;
+            }
+            io_free(ctx, n);
+        }
+        s32 r = static_cast<s32>(lv2_syscall(ctx, 129, {ps_read32(b, a + cfg::queue), 1})); // destroy, forced
+        if (r != lv2::CELL_OK) {
+            io_printf(ctx, "config_service_agent::finalize() %d sys_event_queue_destroy() failed. [%d]\n",
+                {136, static_cast<u64>(static_cast<s64>(r))});
+            cfg_unlock(ctx, a);
+            return r;
+        }
+        ps_write32(b, a + cfg::queue, 0);
+        r = static_cast<s32>(lv2_syscall(ctx, 517, {ps_read32(b, a + cfg::handle)}));
+        if (r != lv2::CELL_OK) {
+            io_printf(ctx, "config_service_agent::finalize() %d sys_config_close() failed. [%d]\n",
+                {145, static_cast<u64>(static_cast<s64>(r))});
+            cfg_unlock(ctx, a);
+            return r;
+        }
+        StackVar status(ctx, b, 8);
+        r = static_cast<s32>(lv2_syscall(ctx, 44, {c.thread, status.addr()})); // sys_ppu_thread_join
+        if (r != lv2::CELL_OK) {
+            io_printf(ctx, "config_service_agent::stop() %d sys_ppu_thread_join() failed. [%d]\n",
+                {155, static_cast<u64>(static_cast<s64>(r))});
+        }
+    }
+    cfg_unlock(ctx, a);
     return lv2::CELL_OK;
 }
 
-s32 sys_config_stop(PPUContext&)
+s32 sys_config_stop(PPUContext& ctx)
 {
-    ConfigState& c = HleProcess::current()->state<ConfigState>();
-    std::lock_guard lock(c.mutex);
-    if (c.init_ctr) --c.init_ctr;
-    return lv2::CELL_OK;
+    ConfigState& c = config_state();
+    const s32 r = cfg_stop(ctx, cfg_agent(ctx));
+    cfg_guard(ctx, c);
+    if (c.started == 0) {
+        if (const u32 a = c.agent) {
+            if (const s32 e = static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_destroy", {a})); e != lv2::CELL_OK)
+                io_printf(ctx, "%s %d sys_lwmutex_destroy() failed. [%d]\n", {321, static_cast<u64>(static_cast<s64>(e))},
+                    "~mutex");
+            io_free(ctx, a);
+            c.agent = 0;
+        }
+    }
+    c.guard.fetch_sub(1);
+    return r;
+}
+
+// sys_config_add_service_listener(service_id, min_verbosity, in, size, callbacks[2], type, u32* listener): lv2's
+// listener, then libio's node with the two callbacks (registered, unregistered).
+s32 sys_config_add_service_listener(PPUContext& ctx, s64 service_id, u64 min_verbosity, u32 in, u32 size,
+    u32 callbacks, u32 type, u32 out)
+{
+    if (service_id < 0 && (in || size)) return error(cfg::CELL_EINVAL);
+    ConfigState& c = config_state();
+    u8* b = guest_base(ctx);
+    const u32 a = cfg_agent(ctx);
+    cfg_lock(ctx, a);
+    const s32 r = static_cast<s32>(lv2_syscall(ctx, 519, {ps_read32(b, a + cfg::handle),
+        static_cast<u64>(service_id), min_verbosity, in, size, type, out}));
+    if (r == lv2::CELL_OK) {
+        const u32 n = io_malloc(ctx, cfg::node_size);
+        if (!n) {
+            // libio fills the node before it looks at the pointer: a fault at NULL + 12 on a console without memory.
+            lv2_syscall(ctx, 520, {ps_read32(b, a + cfg::handle), ps_read32(b, out)});
+            cfg_unlock(ctx, a);
+            return error(cfg::CELL_ENOMEM);
+        }
+        ps_write32(b, n + cfg::on_registered, ps_read32(b, callbacks));
+        ps_write32(b, n + cfg::listener, ps_read32(b, out));
+        ps_write32(b, n + cfg::prev, 0);
+        ps_write32(b, n + cfg::on_unregistered, ps_read32(b, callbacks + 4));
+        ps_write32(b, n + cfg::next, 0);
+        cfg_append(b, c, n);
+    }
+    cfg_unlock(ctx, a);
+    return r;
+}
+
+s32 sys_config_remove_service_listener(PPUContext& ctx, u32 listener)
+{
+    ConfigState& c = config_state();
+    u8* b = guest_base(ctx);
+    const u32 a = cfg_agent(ctx);
+    cfg_lock(ctx, a);
+    const u32 n = cfg_unlink(b, c, listener);
+    const s32 r = static_cast<s32>(lv2_syscall(ctx, 520, {ps_read32(b, a + cfg::handle), listener}));
+    cfg_unlock(ctx, a);
+    if (n) io_free(ctx, n);
+    return r;
+}
+
+// sys_config_register_service(service_id, user_id, verbosity, data, size, u32* service).
+s32 sys_config_register_service(PPUContext& ctx, u64 service_id, u64 user_id, u64 verbosity, u32 data, u32 size,
+    u32 out)
+{
+    u8* b = guest_base(ctx);
+    const u32 a = cfg_agent(ctx);
+    cfg_lock(ctx, a);
+    const s32 r = static_cast<s32>(lv2_syscall(ctx, 521, {ps_read32(b, a + cfg::handle), service_id, user_id,
+        verbosity, data, size, out}));
+    cfg_unlock(ctx, a);
+    return r;
+}
+
+s32 sys_config_unregister_service(PPUContext& ctx, u32 service)
+{
+    u8* b = guest_base(ctx);
+    const u32 a = cfg_agent(ctx);
+    cfg_lock(ctx, a);
+    const s32 r = static_cast<s32>(lv2_syscall(ctx, 522, {ps_read32(b, a + cfg::handle), service}));
+    cfg_unlock(ctx, a);
+    return r;
+}
+
+// sys_config_register_io_error_handler(handler): one handler at a time.
+s32 sys_config_register_io_error_handler(PPUContext& ctx, u32 handler)
+{
+    u8* b = guest_base(ctx);
+    const u32 a = cfg_agent(ctx);
+    cfg_lock(ctx, a);
+    s32 r = error(cfg::CELL_EEXIST);
+    if (!ps_read32(b, a + cfg::io_handler)) {
+        r = static_cast<s32>(lv2_syscall(ctx, 524, {ps_read32(b, a + cfg::handle)}));
+        if (r == lv2::CELL_OK) ps_write32(b, a + cfg::io_handler, handler);
+    }
+    cfg_unlock(ctx, a);
+    return r;
+}
+
+s32 sys_config_unregister_io_error_handler(PPUContext& ctx)
+{
+    u8* b = guest_base(ctx);
+    const u32 a = cfg_agent(ctx);
+    cfg_lock(ctx, a);
+    const s32 r = static_cast<s32>(lv2_syscall(ctx, 525, {ps_read32(b, a + cfg::handle)}));
+    if (r == lv2::CELL_OK) ps_write32(b, a + cfg::io_handler, 0);
+    cfg_unlock(ctx, a);
+    return r;
 }
 
 } // namespace
@@ -906,6 +1400,15 @@ void register_sys_io(Registry& r)
         PS_HLE_FUNC(0x2D16DA4F, cellMouseSetTabletMode),
         PS_HLE_FUNC(0x068FCBC6, sys_config_start),
         PS_HLE_FUNC(0x6D367953, sys_config_stop),
+        PS_HLE_FUNC(0x6AE10596, sys_config_add_service_listener),
+        PS_HLE_FUNC(0xF5D9D571, sys_config_remove_service_listener),
+        PS_HLE_FUNC(0x78F058A2, sys_config_register_service),
+        PS_HLE_FUNC(0x5F81900C, sys_config_unregister_service),
+        PS_HLE_FUNC(0x662BB2AD, sys_config_register_io_error_handler),
+        PS_HLE_FUNC(0x8E06D13B, sys_config_unregister_io_error_handler),
+        ::pspocket::hle::Function{{}, "_pspocket_sys_config_event_thread",
+            recomp::nid_of("_pspocket_sys_config_event_thread"),
+            &::pspocket::hle::detail::thunk<&_pspocket_sys_config_event_thread>, true},
     });
 }
 

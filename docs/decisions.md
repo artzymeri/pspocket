@@ -6835,3 +6835,45 @@ it cannot run without a connection.
   two, 0 differences). A test without the firmware keeps libssl's set-up answers. The certificate functions are driven
   by a hidden probe (made-up certificates from OpenSSL) that traces Sony's module to map the parser, not compared,
   since the parser is the next part. The old RPCS3 cellSsl check in tests/hle/test_net.cpp now expects Sony's set-up.
+
+## D-533 · 2026-10-09 · sys_io's sys_config_* as libio's config service agent
+
+sys_io's eight sys_config functions are pspocket's own, read from libio (sys_io.sprx, fw 4.92) and compared with it.
+Before, sys_config_start/stop only kept a count and the other six were RPCS3's stubs; now all eight do what libio's
+`config_service_agent` does over pspocket's lv2 sys_config (D-527).
+
+- **The agent.** One 0x28-byte object on liblv2's heap (_sys_malloc), made at the first sys_config call under a spin
+  guard (an atomic count; a second comer backs off with sys_timer_usleep(1000)): a recursive lwmutex "_io_mtx" at +0,
+  the event queue at +0x18, lv2's sys_config handle at +0x1C (-1 until opened) and the I/O error handler at +0x20.
+  Every call takes the lwmutex with a 4-second timeout and, as libio does, goes on without it when that fails (a
+  diagnostic through _sys_printf). The last sys_config_stop deletes it (destroying the lwmutex) under the same guard,
+  so sys_config_stop before any start makes and deletes an agent and answers CELL_EABORT.
+- **Start and stop** count. The first start creates the queue ("_io_eq_", priority order, 32 deep), opens sys_config on
+  it and starts "_cfg_ev_hndlr" (priority 512, 8 KB stack, joinable) through liblv2's sys_ppu_thread_create; on a
+  failure it closes and destroys what it made and returns the error, leaving the count raised (libio does). The last
+  stop frees every listener node, destroys the queue with the force flag (which wakes the thread with ECANCELED),
+  closes the handle and joins the thread; a failure of any of these is printed and returned (the join's: printed,
+  then 0). The thread's entry is an internal function, `_pspocket_sys_config_event_thread`.
+- **Events.** The thread receives while the count is not zero. A service event (source 1: handle, registered << 32 |
+  event ID, size) is read with sys_config_get_service_event into a buffer from the heap; its listener's callbacks
+  get (service ID, user ID, verbosity, the data or NULL, its size) for a registered service and (service ID, user ID)
+  for an unregistered one, under the lwmutex. An I/O error event (source 2) is read with sys_config_get_io_event and
+  the handler gets (the first word, the rest, the rest's size). An event for another handle is printed and handled
+  anyway; a failed read is printed and its buffer kept (libio leaks it); an unknown source is printed with the
+  event's first datum. libio's diagnostics go out through _sys_printf with libio's text, as sys_net does with libnet's.
+- **Listeners.** sys_config_add_service_listener(service ID, minimum verbosity, data, size, callbacks[2], type, u32*
+  listener) refuses data with a negative service ID (CELL_EINVAL), makes lv2's listener, then a 20-byte node (next,
+  previous, lv2's ID, the registered and unregistered callbacks) appended to libio's list; with no memory it removes
+  lv2's listener and answers CELL_ENOMEM. Removing unlinks the node, removes lv2's listener (its answer is the call's)
+  and frees the node after the lock. Register and unregister service pass straight to lv2 under the lock. The I/O
+  error handler is one at a time (CELL_EEXIST), registered with lv2 first.
+- **Surprise.** The callbacks' order in sys_config_add_service_listener comes before the listener type (r7, then r8),
+  the reverse of lv2's call (type, then the listener's address).
+- **Compared** in tests/hle/test_config_compare.cpp: one script in two fresh processes (libio loaded in both), one
+  calling libio's exports and one pspocket's: starts and stops (nested, before any start, again after the last), every
+  listener case (bad data, the pad manager lv2 registers, the ONCE type, verbosity below the minimum, removal twice),
+  services registered and unregistered, the I/O error handler twice, and events sent to the agent's queue through
+  ports (I/O errors, a service event for another handle with no such event, an unknown source). The answers, the
+  callbacks' arguments, the outputs and the lv2 calls of both threads (with their arguments, heap addresses kept) are
+  the same; only the registers past a callback's arguments, which hold what each caller left there, are not
+  compared. A test without the firmware runs pspocket's agent alone.
