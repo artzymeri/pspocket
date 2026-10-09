@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="300" viewBox="0 0 900 300" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="300" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">Kernel calls: 483 own, 92 answered as RPCS3 answers them, of 634 (90.7%)</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">Kernel calls: 523 own, 75 answered as RPCS3 answers them, of 634 (94.3%)</text>
 <g><title>sys_dbg: 2 own, 62 answered as RPCS3, 0 not yet, of 64</title>
 <rect x="0.0" y="30.0" width="159.0" height="154.3" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="19.0" height="18.4" fill="#2da44e"/>
@@ -199,34 +199,34 @@
 <rect x="179.5" y="282.0" width="18.9" height="16.4" fill="#2da44e"/>
 <text x="162.0" y="207.9" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_net</text>
 </g>
-<g><title>sys_prx: 0 own, 11 answered as RPCS3, 15 not yet, of 26</title>
+<g><title>sys_prx: 26 own, 0 answered as RPCS3, 0 not yet, of 26</title>
 <rect x="258.4" y="30.0" width="103.6" height="96.2" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="259.4" y="31.0" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="279.7" y="31.0" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="300.0" y="31.0" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="320.3" y="31.0" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="340.7" y="31.0" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="259.4" y="46.7" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="279.7" y="46.7" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="300.0" y="46.7" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="320.3" y="46.7" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="340.7" y="46.7" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="259.4" y="62.4" width="19.7" height="15.1" fill="#9be9a8"/>
-<rect x="279.7" y="62.4" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="300.0" y="62.4" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="320.3" y="62.4" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="340.7" y="62.4" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="259.4" y="78.1" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="279.7" y="78.1" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="300.0" y="78.1" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="320.3" y="78.1" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="340.7" y="78.1" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="259.4" y="93.8" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="279.7" y="93.8" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="300.0" y="93.8" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="320.3" y="93.8" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="340.7" y="93.8" width="19.7" height="15.1" fill="#8c959f"/>
-<rect x="259.4" y="109.5" width="19.7" height="15.1" fill="#8c959f"/>
+<rect x="259.4" y="31.0" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="279.7" y="31.0" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="300.0" y="31.0" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="320.3" y="31.0" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="340.7" y="31.0" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="259.4" y="46.7" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="279.7" y="46.7" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="300.0" y="46.7" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="320.3" y="46.7" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="340.7" y="46.7" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="259.4" y="62.4" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="279.7" y="62.4" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="300.0" y="62.4" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="320.3" y="62.4" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="340.7" y="62.4" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="259.4" y="78.1" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="279.7" y="78.1" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="300.0" y="78.1" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="320.3" y="78.1" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="340.7" y="78.1" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="259.4" y="93.8" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="279.7" y="93.8" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="300.0" y="93.8" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="320.3" y="93.8" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="340.7" y="93.8" width="19.7" height="15.1" fill="#2da44e"/>
+<rect x="259.4" y="109.5" width="19.7" height="15.1" fill="#2da44e"/>
 <text x="261.4" y="42.0" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_prx</text>
 </g>
 <g><title>sys_usbd: 25 own, 0 answered as RPCS3, 0 not yet, of 25</title>
@@ -357,7 +357,7 @@
 <rect x="405.3" y="282.6" width="20.5" height="15.8" fill="#2da44e"/>
 <text x="365.0" y="227.9" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_event</text>
 </g>
-<g><title>sys_ss: 18 own, 0 answered as RPCS3, 1 not yet, of 19</title>
+<g><title>sys_ss: 19 own, 0 answered as RPCS3, 0 not yet, of 19</title>
 <rect x="448.6" y="30.0" width="90.9" height="80.2" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="449.6" y="31.0" width="17.2" height="18.9" fill="#2da44e"/>
 <rect x="467.4" y="31.0" width="17.2" height="18.9" fill="#2da44e"/>
@@ -377,7 +377,7 @@
 <rect x="449.6" y="89.6" width="17.2" height="18.9" fill="#2da44e"/>
 <rect x="467.4" y="89.6" width="17.2" height="18.9" fill="#2da44e"/>
 <rect x="485.1" y="89.6" width="17.2" height="18.9" fill="#2da44e"/>
-<rect x="502.9" y="89.6" width="17.2" height="18.9" fill="#8c959f"/>
+<rect x="502.9" y="89.6" width="17.2" height="18.9" fill="#2da44e"/>
 <text x="451.6" y="42.0" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_ss</text>
 </g>
 <g><title>sys_ppu: 15 own, 0 answered as RPCS3, 0 not yet, of 15</title>
@@ -641,17 +641,17 @@
 <rect x="722.5" y="143.2" width="15.9" height="21.1" fill="#2da44e"/>
 <text x="691.5" y="110.9" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_ga…</text>
 </g>
-<g><title>sys_overlay: 0 own, 6 answered as RPCS3, 3 not yet, of 9</title>
+<g><title>sys_overlay: 9 own, 0 answered as RPCS3, 0 not yet, of 9</title>
 <rect x="688.5" y="165.9" width="51.4" height="67.0" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="689.5" y="166.9" width="15.9" height="21.1" fill="#9be9a8"/>
-<rect x="706.0" y="166.9" width="15.9" height="21.1" fill="#9be9a8"/>
-<rect x="722.5" y="166.9" width="15.9" height="21.1" fill="#9be9a8"/>
-<rect x="689.5" y="188.6" width="15.9" height="21.1" fill="#9be9a8"/>
-<rect x="706.0" y="188.6" width="15.9" height="21.1" fill="#9be9a8"/>
-<rect x="722.5" y="188.6" width="15.9" height="21.1" fill="#9be9a8"/>
-<rect x="689.5" y="210.3" width="15.9" height="21.1" fill="#8c959f"/>
-<rect x="706.0" y="210.3" width="15.9" height="21.1" fill="#8c959f"/>
-<rect x="722.5" y="210.3" width="15.9" height="21.1" fill="#8c959f"/>
+<rect x="689.5" y="166.9" width="15.9" height="21.1" fill="#2da44e"/>
+<rect x="706.0" y="166.9" width="15.9" height="21.1" fill="#2da44e"/>
+<rect x="722.5" y="166.9" width="15.9" height="21.1" fill="#2da44e"/>
+<rect x="689.5" y="188.6" width="15.9" height="21.1" fill="#2da44e"/>
+<rect x="706.0" y="188.6" width="15.9" height="21.1" fill="#2da44e"/>
+<rect x="722.5" y="188.6" width="15.9" height="21.1" fill="#2da44e"/>
+<rect x="689.5" y="210.3" width="15.9" height="21.1" fill="#2da44e"/>
+<rect x="706.0" y="210.3" width="15.9" height="21.1" fill="#2da44e"/>
+<rect x="722.5" y="210.3" width="15.9" height="21.1" fill="#2da44e"/>
 <text x="691.5" y="177.9" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_ov…</text>
 </g>
 <g><title>sys_crypto: 0 own, 9 answered as RPCS3, 0 not yet, of 9</title>
@@ -766,12 +766,12 @@
 <rect x="802.5" y="218.8" width="15.2" height="17.7" fill="#2da44e"/>
 <text x="788.7" y="211.4" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_lv1</text>
 </g>
-<g><title>sys_uart: 0 own, 0 answered as RPCS3, 4 not yet, of 4</title>
+<g><title>sys_uart: 4 own, 0 answered as RPCS3, 0 not yet, of 4</title>
 <rect x="785.7" y="238.1" width="49.5" height="30.9" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="786.7" y="239.1" width="15.2" height="13.9" fill="#8c959f"/>
-<rect x="802.5" y="239.1" width="15.2" height="13.9" fill="#8c959f"/>
-<rect x="818.4" y="239.1" width="15.2" height="13.9" fill="#8c959f"/>
-<rect x="786.7" y="253.6" width="15.2" height="13.9" fill="#8c959f"/>
+<rect x="786.7" y="239.1" width="15.2" height="13.9" fill="#2da44e"/>
+<rect x="802.5" y="239.1" width="15.2" height="13.9" fill="#2da44e"/>
+<rect x="818.4" y="239.1" width="15.2" height="13.9" fill="#2da44e"/>
+<rect x="786.7" y="253.6" width="15.2" height="13.9" fill="#2da44e"/>
 <text x="788.7" y="250.1" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">sys_ua…</text>
 </g>
 <g><title>sys_io: 4 own, 0 answered as RPCS3, 0 not yet, of 4</title>
