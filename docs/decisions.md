@@ -7044,3 +7044,36 @@ TTY the same).
   interface's index, finds none.
 - Deviations: sys_net_get_lib_name_server writes 0 for a server the library does not have (libnet copies its stack's
   leftovers); bad guest pointers are refused with errno EFAULT and the call site logged.
+
+## D-562 · 2026-10-09 · cellSail pspocket's own, from libsail (part 1: the objects the game hands the player)
+
+cellSail is Sony's media player framework, libsail.sprx (fw 4.92): 137 exports over a player that runs its own thread
+and drives the PAMF reader, cellDmux, cellVdec, cellAdec, cellVpost and a SPURS instance, with the firmware's MP4 and
+AVI libraries for those files. It is made pspocket's own part by part, read from libsail's code and compared with it
+running on pspocket (tests/hle/test_sail.cpp: one script in two fresh processes, libsail loaded in both).
+
+Part 1, the objects a game fills in and their calls into the player:
+- **CellSailMemAllocator**: the two callbacks copied, the argument after them; any NULL is INVALID_ARG.
+- **CellSailFuture** (0x18 bytes): an lv2 mutex and condition (priority, not recursive; both "_saifu0"), the state
+  word (bit 31 the result is set, below it the waiters) and the result. Set twice is INVALID_STATE; Get counts itself
+  a waiter, waits (the game's timeout) until the result is set and passes the wake-up on to the next waiter; Reset
+  without waiting is INVALID_STATE while someone waits, else waits in 100 ms slices; IsDone answers 1 or 0.
+- **CellSailSource** (0x80 bytes): the player, the argument, the 14 callbacks, 1 while initialized, a pending call's
+  handle, a diagnostic handler. Its notifications go to the diagnostic handler (argument, kind 0-4, two values) when
+  one is set, else as messages to the player's queue (codes 0x01 stream out, 0x17 input EOS, 0x20 session error with
+  bit 31 cleared when terminated, 0x29 call completed, 0x2D media state); a call completed with a pending handle
+  posts {0, result, handle} instead. NotifyStreamOut with any count but 1 is libsail's assertion: it stores to NULL
+  (pspocket logs the call site and stops).
+- **CellSailRendererAudio/Video**: the callbacks and argument, the wanted format copied from the attribute (version 8,
+  else INVALID_ARG) or all 0xFF (video: its first byte 0); Finalize sets the state 9; the notifications are messages
+  (audio 0x11, 0x12 frame done, 0x1D EOS, 0x33 completed; video 0x13, 0x14, 0x1E, 0x34). Two of them are exports
+  RPCS3 does not name (cellSail_C00A450C, cellSail_3E9B9F80).
+- **The player's queue** (at its +0x170): capacity, count, a ring of 16-byte messages, the write index, an lv2 mutex
+  and condition; a post waits while the ring is full and wakes the player.
+- **MP4 and AVI**: the calls go through the function tables libsail fetches from the firmware's MP4 library (internal
+  module 0xF031, cellMp4) and AVI library (0xF039, cellSailAvi) when the player first opens such a file; before that
+  libsail calls through NULL (pspocket logs and answers INVALID_STATE).
+- Sixteen exports with no name answer -1. RPCS3 names five source notifications fw 4.92's libsail does not export
+  (Open/Start/Stop/Read/CloseCompleted): they log and answer NOT_AVAILABLE.
+Compared: 46 calls, the memory they touch (objects, the queue's ring, the callbacks' records) and every mutex and
+condition call with its attributes: 0 differences.
