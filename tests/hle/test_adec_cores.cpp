@@ -617,3 +617,303 @@ TEST_CASE("cellAdec: MP3 on FFmpeg, mono and the lower rates, CRC errors, refuse
 }
 
 #endif
+
+// ---- MPEG audio layers I and II
+
+namespace {
+
+constexpr u32 kTypeMpegL1 = 22, kTypeMpegL2 = 6;
+
+// An MPEG-1 layer I frame at 48 kHz, 384 kbit/s (384 bytes), stereo or mono: in subband bands[ch] of each channel a
+// sinusoid at a quarter of the subband rate (0.9, 0, -0.9, 0 over the frame's 12 samples, 15-bit samples, scale factor
+// 6: 0.5), every other subband silent. Its sound is a tone at (band + 0.5) * 750 Hz (in an odd band too: the filter
+// bank turns odd bands over, and a quarter is their middle).
+std::vector<u8> layer1_tone(u32 channels, std::array<u32, 2> bands)
+{
+    BitWriter w;
+    w.put(0x7FF, 11);                // sync
+    w.put(3, 2);                     // MPEG-1
+    w.put(3, 2);                     // layer I
+    w.put(1, 1);                     // no CRC
+    w.put(12, 4);                    // 384 kbit/s
+    w.put(1, 2);                     // 48 kHz
+    w.put(0, 2);                     // padding, private
+    w.put(channels == 1 ? 3 : 0, 2); // mono or stereo
+    w.put(0, 4);                     // mode extension, copyright, original
+    w.put(0, 2);                     // emphasis
+    const auto alloc = [&](u32 sb, u32 ch) { return sb == bands[ch] ? 14u : 0u; };
+    for (u32 sb = 0; sb < 32; sb++)
+        for (u32 ch = 0; ch < channels; ch++) w.put(alloc(sb, ch), 4);
+    for (u32 sb = 0; sb < 32; sb++)
+        for (u32 ch = 0; ch < channels; ch++)
+            if (alloc(sb, ch)) w.put(6, 6);
+    for (u32 j = 0; j < 12; j++) {
+        const s32 x = j % 4 == 0 ? 14745 : j % 4 == 2 ? -14745 : 0; // 0.9 of 16383
+        for (u32 sb = 0; sb < 32; sb++)
+            for (u32 ch = 0; ch < channels; ch++)
+                if (alloc(sb, ch)) w.put(static_cast<u32>(x + 16383), 15);
+    }
+    std::vector<u8> f = w.bytes;
+    f.resize(384, 0);
+    return f;
+}
+
+std::vector<u8> mpmc_param(u32 channel_number) { return be32s({channel_number, 0, 0}); }
+
+// An MPEG audio header's fields the information block repeats.
+struct MpegFields {
+    u32 crc, bitrate_index, mode;
+};
+MpegFields mpeg_fields(u32 word) { return {((word >> 16) & 1) ? 0u : 1u, (word >> 12) & 15, (word >> 6) & 3}; }
+
+#if PSPOCKET_HAVE_FFMPEG
+
+// Interleaved 16-bit test signal at `rate`, `samples` per channel: in channel c a sine at freqs[c] Hz of amps[c].
+std::vector<s16> sines(u32 rate, u32 samples, const std::vector<double>& freqs, const std::vector<double>& amps)
+{
+    std::vector<s16> v;
+    for (u32 i = 0; i < samples; i++)
+        for (usize c = 0; c < freqs.size(); c++)
+            v.push_back(static_cast<s16>(std::lround(32767.0 * amps[c] *
+                std::sin(2 * std::numbers::pi * freqs[c] * static_cast<double>(i) / rate))));
+    return v;
+}
+
+// What FFmpeg's encoder `name` made of interleaved 16-bit input (given as planar floats to an encoder that takes only
+// those): its packets and its configuration (extradata).
+struct Encoded {
+    std::vector<std::vector<u8>> packets;
+    std::vector<u8> extradata;
+    u32 frame_size = 0;
+};
+
+Encoded ffmpeg_encode(const char* name, u32 rate, u32 channels, s64 bit_rate, const std::vector<s16>& pcm,
+    const std::function<void(AVCodecContext*)>& setup = {})
+{
+    Encoded e;
+    const AVCodec* codec = avcodec_find_encoder_by_name(name);
+    if (!codec) return e;
+    AVCodecContext* av = avcodec_alloc_context3(codec);
+    av->sample_rate = static_cast<int>(rate);
+    av_channel_layout_default(&av->ch_layout, static_cast<int>(channels));
+    av->bit_rate = bit_rate;
+    const void* formats = nullptr;
+    int count = 0;
+    REQUIRE(avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &formats, &count) >= 0);
+    bool planar_float = true;
+    for (int i = 0; i < count; i++)
+        if (static_cast<const AVSampleFormat*>(formats)[i] == AV_SAMPLE_FMT_S16) planar_float = false;
+    av->sample_fmt = planar_float ? AV_SAMPLE_FMT_FLTP : AV_SAMPLE_FMT_S16;
+    if (setup) setup(av);
+    REQUIRE(avcodec_open2(av, codec, nullptr) == 0);
+    e.extradata.assign(av->extradata, av->extradata + av->extradata_size);
+    e.frame_size = static_cast<u32>(av->frame_size);
+    AVFrame* frame = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    const u32 total = static_cast<u32>(pcm.size() / channels);
+    const auto drain = [&] {
+        while (avcodec_receive_packet(av, pkt) == 0) {
+            e.packets.emplace_back(pkt->data, pkt->data + pkt->size);
+            av_packet_unref(pkt);
+        }
+    };
+    for (u32 at = 0; at + e.frame_size <= total; at += e.frame_size) {
+        frame->nb_samples = static_cast<int>(e.frame_size);
+        frame->format = av->sample_fmt;
+        frame->sample_rate = av->sample_rate;
+        REQUIRE(av_channel_layout_copy(&frame->ch_layout, &av->ch_layout) == 0);
+        REQUIRE(av_frame_get_buffer(frame, 0) == 0);
+        for (u32 i = 0; i < e.frame_size; i++)
+            for (u32 c = 0; c < channels; c++) {
+                const s16 s = pcm[(at + i) * channels + c];
+                if (planar_float) reinterpret_cast<float*>(frame->data[c])[i] = static_cast<float>(s) / 32768.f;
+                else reinterpret_cast<s16*>(frame->data[0])[i * channels + c] = s;
+            }
+        REQUIRE(avcodec_send_frame(av, frame) == 0);
+        av_frame_unref(frame);
+        drain();
+    }
+    avcodec_send_frame(av, nullptr);
+    drain();
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&av);
+    return e;
+}
+
+// How close `out` (a decoded channel) comes to `in` (the channel put in) once the codec's delay (found by correlation,
+// up to `max_delay` samples) is taken out: the signal-to-noise ratio in dB, away from both ends.
+double snr_db(const std::vector<float>& in, const std::vector<float>& out, u32 max_delay, u32* delay_out = nullptr)
+{
+    const usize n = std::min(in.size(), out.size());
+    if (n < 2 * static_cast<usize>(max_delay) + 4096) return -999;
+    u32 best = 0;
+    double best_corr = -1e300;
+    for (u32 d = 0; d <= max_delay; d++) {
+        double c = 0;
+        for (usize i = max_delay; i < max_delay + 4096; i++)
+            c += static_cast<double>(in[i]) * static_cast<double>(out[i + d]);
+        if (c > best_corr) {
+            best_corr = c;
+            best = d;
+        }
+    }
+    if (delay_out) *delay_out = best;
+    double signal = 0, noise = 0;
+    for (usize i = max_delay; i + best + max_delay < n; i++) {
+        const double a = static_cast<double>(in[i]), b = static_cast<double>(out[i + best]);
+        signal += a * a;
+        noise += (a - b) * (a - b);
+    }
+    return noise > 0 ? 10 * std::log10(signal / noise) : 999;
+}
+
+std::vector<float> floats_of(const std::vector<s16>& pcm, u32 channels, u32 c)
+{
+    std::vector<float> v;
+    for (usize i = c; i < pcm.size(); i += channels) v.push_back(static_cast<float>(pcm[i]) / 32768.f);
+    return v;
+}
+
+// One channel of every PCM out of a run, in order.
+std::vector<float> joined(const CoreRun& run, u32 channels, u32 c, bool sixteen = false)
+{
+    std::vector<float> v;
+    for (const Out& o : run.outs) {
+        const auto x = channel_of(o.pcm, channels, c, sixteen);
+        v.insert(v.end(), x.begin(), x.end());
+    }
+    return v;
+}
+
+#endif
+
+} // namespace
+
+#if PSPOCKET_HAVE_FFMPEG
+
+TEST_CASE("cellAdec: MPEG layer I on FFmpeg, frames built here: tones, information, PTS, channels (D-577)", "[hle][adec]")
+{
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    // Six stereo frames, tones in subbands 4 and 9 (3375 and 7125 Hz), two without a PTS (the core's own correction:
+    // 384 samples at 48 kHz, 720 ticks), the stream's channels kept (channelNumber 0).
+    Feed feed;
+    feed.bsi_size = 0x40;
+    feed.step = 720;
+    for (u32 k = 0; k < 6; k++) feed.aus.push_back(layer1_tone(2, {4, 9}));
+    feed.missing = {0, 3};
+    const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeMpegL1, mpmc_param(0), feed);
+    INFO(all(run));
+    REQUIRE(run.outs.size() == 6);
+    CHECK(flow_ok(run, 6, {}));
+    const auto ref = ffmpeg_decode("mp1float", feed.aus);
+    for (u32 k = 0; k < 6; k++) {
+        INFO("access unit " << k);
+        const Out& o = run.outs[k];
+        CHECK(o.size == 384 * 2 * 4);
+        CHECK(o.pcm == expected_pcm(ref[k], false));
+        // The first has no PTS and none before it: none; the fourth follows the third by 720.
+        CHECK(o.pts_upper == (k == 0 ? kTsInvalid : 0));
+        CHECK(o.pts_lower == (k == 0 ? kTsInvalid : 0x1000 + 720 * k));
+        CHECK(be32(o.bsi, 0x00) == 3);   // channelNumber: CELL_ADEC_CH_STEREO
+        CHECK(be32(o.bsi, 0x04) == 1);   // sampleFreq: 48 kHz
+        CHECK(be32(o.bsi, 0x08) == 0);   // no CRC
+        CHECK(be32(o.bsi, 0x0C) == 12);  // bit rate index
+        CHECK(be32(o.bsi, 0x10) == 0);   // stereo
+        CHECK(be32(o.bsi, 0x30) == 384); // outputFrameSize
+        CHECK(be32(o.bsi, 0x3C) == 2);   // L_R
+    }
+    std::vector<u8> pcm;
+    for (u32 k = 2; k < 6; k++) pcm.insert(pcm.end(), run.outs[k].pcm.begin(), run.outs[k].pcm.end());
+    CHECK(energy_near(channel_of(pcm, 2, 0, false), 48000, 3375, 200) > 0.9);
+    CHECK(energy_near(channel_of(pcm, 2, 1, false), 48000, 7125, 200) > 0.9);
+    // channelNumber MONO: the two averaged; STEREO from a mono stream: the one in both.
+    Feed mono;
+    mono.bsi_size = 0x40;
+    for (u32 k = 0; k < 3; k++) mono.aus.push_back(layer1_tone(2, {4, 9}));
+    const CoreRun down = run_core(f.base(), hle_calls(f, t), kTypeMpegL1, mpmc_param(1), mono);
+    REQUIRE(down.outs.size() == 3);
+    const auto ref3 = ffmpeg_decode("mp1float", mono.aus);
+    for (u32 k = 0; k < 3; k++) {
+        CHECK(down.outs[k].size == 384 * 4);
+        CHECK(be32(down.outs[k].bsi, 0) == 1);
+        std::vector<std::vector<float>> avg(1);
+        for (usize i = 0; i < ref3[k][0].size(); i++) avg[0].push_back((ref3[k][0][i] + ref3[k][1][i]) * 0.5f);
+        CHECK(down.outs[k].pcm == expected_pcm(avg, false));
+    }
+    Feed one;
+    one.bsi_size = 0x40;
+    for (u32 k = 0; k < 3; k++) one.aus.push_back(layer1_tone(1, {6, 0}));
+    const CoreRun up = run_core(f.base(), hle_calls(f, t), kTypeMpegL1, mpmc_param(3), one);
+    REQUIRE(up.outs.size() == 3);
+    const auto ref1 = ffmpeg_decode("mp1float", one.aus);
+    for (u32 k = 0; k < 3; k++) {
+        CHECK(up.outs[k].size == 384 * 2 * 4);
+        CHECK(be32(up.outs[k].bsi, 0x3C) == 0); // MONO
+        CHECK(up.outs[k].pcm == expected_pcm({ref1[k][0], ref1[k][0]}, false));
+    }
+}
+
+TEST_CASE("cellAdec: MPEG layer II on FFmpeg, a stream FFmpeg's encoder wrote: the signal, information, errors (D-577)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_encoder_by_name("mp2")) SKIP("this FFmpeg has no mp2 encoder (the tests' build: build-ffmpeg.sh)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    // Two seconds of 1 kHz (left, 0.5) and 2.5 kHz (right, 0.3) at 48 kHz, 384 kbit/s (layer II's most).
+    const std::vector<s16> input = sines(48000, 96000, {1000, 2500}, {0.5, 0.3});
+    const Encoded enc = ffmpeg_encode("mp2", 48000, 2, 384000, input);
+    REQUIRE(enc.packets.size() > 60);
+    Feed feed;
+    feed.bsi_size = 0x40;
+    feed.aus = enc.packets;
+    feed.missing = {5, 6};
+    const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeMpegL2, mpmc_param(0), feed);
+    INFO(all(run));
+    REQUIRE(run.outs.size() == enc.packets.size());
+    CHECK(flow_ok(run, static_cast<u32>(enc.packets.size()), {}));
+    const MpegFields h = mpeg_fields(be32(enc.packets[0], 0));
+    for (u32 k = 0; k < run.outs.size(); k++) {
+        INFO("access unit " << k);
+        const Out& o = run.outs[k];
+        CHECK(o.size == 1152 * 2 * 4);
+        CHECK(o.pts_lower == 0x1000 + 2160 * k); // the sixth and seventh corrected by 1152 samples at 48 kHz
+        CHECK(be32(o.bsi, 0x04) == 1);
+        CHECK(be32(o.bsi, 0x08) == h.crc);
+        CHECK(be32(o.bsi, 0x0C) == h.bitrate_index);
+        CHECK(be32(o.bsi, 0x10) == h.mode);
+        CHECK(be32(o.bsi, 0x30) == 1152);
+    }
+    u32 delay = 0;
+    const double left = snr_db(floats_of(input, 2, 0), joined(run, 2, 0), 2000, &delay);
+    const double right = snr_db(floats_of(input, 2, 1), joined(run, 2, 1), 2000);
+    INFO(std::format("SNR {:.1f} and {:.1f} dB, delay {} samples", left, right, delay));
+    CHECK(left > 30);
+    CHECK(right > 30);
+    // Frames refused: a layer III frame (LAYER), one cut short (OPENBS), free format (UNSUPPORT), MPEG-2.5's sync
+    // (SYNCF); the frame after them decodes.
+    Feed bad;
+    bad.bsi_size = 0x40;
+    bad.aus.push_back(mp3_frame({}));
+    bad.aus.emplace_back(enc.packets[10].begin(), enc.packets[10].begin() + 300);
+    std::vector<u8> free_format = enc.packets[11];
+    free_format[2] &= 0x0F;
+    bad.aus.push_back(free_format);
+    std::vector<u8> lsf25 = enc.packets[12];
+    lsf25[1] = static_cast<u8>(lsf25[1] & ~0x18);
+    bad.aus.push_back(lsf25);
+    bad.aus.push_back(enc.packets[13]);
+    const CoreRun refused = run_core(f.base(), hle_calls(f, t), kTypeMpegL2, mpmc_param(0), bad);
+    INFO(all(refused));
+    REQUIRE(refused.outs.size() == 5);
+    CHECK(flow_ok(refused, 5, {{0, 0x80612B12}, {1, 0x80612B36}, {2, 0x80612B17}, {3, 0x80612B11}}));
+    CHECK(refused.outs[4].size == 1152 * 2 * 4);
+    // StartSeq refuses a layout past the CellAdecChannel values.
+    const CoreRun arg = run_core(f.base(), hle_calls(f, t), kTypeMpegL2, mpmc_param(12), Feed{});
+    CHECK(arg.lines[2] == "cellAdecStartSeq -> 0x80612b03");
+}
+
+#endif

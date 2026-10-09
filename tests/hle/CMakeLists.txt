@@ -6,9 +6,11 @@ pspocket_add_test(test_hle
 # HLE modules' internal headers (sysutil.hpp: the event queue other modules use), and lv2's (internal.hpp: the RSX
 # device's flip mode and tiles, which cellGcmSys sets through lv2, white-box).
 target_include_directories(test_hle PRIVATE ${PROJECT_SOURCE_DIR}/runtime/hle/src ${PROJECT_SOURCE_DIR}/runtime/lv2/src)
-# FFmpeg, to check the synthetic H.264 the cellVdec tests write (h264_writer.hpp) with a decoder of its own.
+# FFmpeg, to check the synthetic H.264 the cellVdec tests write (h264_writer.hpp) with a decoder of its own; the tests'
+# own build of it where there is one, whose encoders write the cellAdec cores' streams (D-577).
 if(TARGET pspocket::ffmpeg)
     target_link_libraries(test_hle PRIVATE pspocket::ffmpeg)
+    set_target_properties(test_hle PROPERTIES PSPOCKET_FFMPEG_ENCODERS ON)
 endif()
 # libpng's reader, to check what cellPngEnc writes with a decoder of its own (D-566).
 if(TARGET pspocket::libpng)

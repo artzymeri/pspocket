@@ -12,6 +12,10 @@
 # build/ffmpeg/macos on the Mac and build/ffmpeg/linux on Linux (or -DPSPOCKET_FFMPEG_DIR=...); scripts/ios.sh links
 # build/ffmpeg/ios into the app. JOBS=N sets make's parallel jobs (default: every core).
 #
+# The hosts that run the tests (macos, linux) also get <target>-tests (D-577): the same decoders and the LGPL encoders
+# the tests write their streams with (MPEG audio layer II, AC-3, AAC). Only the test programs link those libraries, in
+# place of the decoders' own (third_party/CMakeLists.txt), so nothing the app or pspocket-boot links changes.
+#
 # Licence: configured --disable-gpl --disable-nonfree --disable-version3, then only LGPL-2.1-or-later decoders,
 # parsers and libraries, which combine with pspocket's GPLv2 (D-001). No GPL, version3 or nonfree component here.
 #
@@ -65,6 +69,9 @@ COMMON=(--disable-everything --disable-programs --disable-doc --disable-network 
 # decodes the slices. Apple's frameworks, linked by whatever links these libraries: VideoToolbox, CoreMedia, CoreVideo
 # and CoreFoundation. The Apple builds only.
 APPLE_HW=(--enable-videotoolbox --enable-hwaccel=h264_videotoolbox)
+# The tests' encoders (D-577), for the <target>-tests builds only; set per build in EXTRA.
+TEST_ENCODERS=mp2,ac3,aac
+EXTRA=()
 
 # Configures (again only when the arguments change), builds and installs one target: name, then configure's arguments.
 make_target() {
@@ -94,8 +101,8 @@ build() { # name sdk cflags...
     # The tools configure builds and runs here are the Mac's: its own compiler and SDK.
     local host_sdk
     host_sdk="$(xcrun --sdk macosx --show-sdk-path)"
-    local args=("${COMMON[@]}" "${APPLE_HW[@]}" --prefix="$prefix" --cc="$cc" --sysroot="$sysroot" --arch=aarch64
-        --host-cc="$(xcrun --sdk macosx -f clang)" --host-cflags="-isysroot $host_sdk" --host-ldflags="-isysroot $host_sdk"
+    local args=("${COMMON[@]}" "${APPLE_HW[@]}" "${EXTRA[@]}" --prefix="$prefix" --cc="$cc" --sysroot="$sysroot"
+        --arch=aarch64 --host-cc="$(xcrun --sdk macosx -f clang)" --host-cflags="-isysroot $host_sdk" --host-ldflags="-isysroot $host_sdk"
         --extra-cflags="$*" --extra-ldflags="$*")
     [ "$name" = ios ] && args+=(--enable-cross-compile --target-os=darwin)
     make_target "$name" "${args[@]}"
@@ -103,20 +110,37 @@ build() { # name sdk cflags...
 
 # A Linux host (D-576): its own architecture, its clang (CC overrides), no VideoToolbox. FFmpeg's x86 assembly needs
 # nasm; without it the same decoders build from their C code.
-build_linux() {
-    local args=("${COMMON[@]}" --prefix="$OUT/linux" --cc="${CC:-clang}")
+build_linux() { # name
+    local name="$1"
+    local args=("${COMMON[@]}" "${EXTRA[@]}" --prefix="$OUT/$name" --cc="${CC:-clang}")
     case "$(uname -m)" in
         x86_64|i?86) command -v nasm > /dev/null || { say "no nasm: FFmpeg's C code only"; args+=(--disable-x86asm); } ;;
     esac
-    make_target linux "${args[@]}"
+    make_target "$name" "${args[@]}"
+}
+
+# A host's builds: its decoders, then the tests' with the encoders.
+build_mac() {
+    EXTRA=()
+    build macos macosx -arch arm64 -mmacosx-version-min=13.0
+    EXTRA=("--enable-encoder=$TEST_ENCODERS")
+    build macos-tests macosx -arch arm64 -mmacosx-version-min=13.0
+    EXTRA=()
+}
+build_host_linux() {
+    EXTRA=()
+    build_linux linux
+    EXTRA=("--enable-encoder=$TEST_ENCODERS")
+    build_linux linux-tests
+    EXTRA=()
 }
 
 case "$TARGETS" in
-    linux) build_linux ;;
-    macos) build macos macosx -arch arm64 -mmacosx-version-min=13.0 ;;
+    linux) build_host_linux ;;
+    macos) build_mac ;;
     ios) build ios iphoneos -arch arm64 -mios-version-min=17.0 ;;
     all)
-        build macos macosx -arch arm64 -mmacosx-version-min=13.0
+        build_mac
         build ios iphoneos -arch arm64 -mios-version-min=17.0
         ;;
 esac

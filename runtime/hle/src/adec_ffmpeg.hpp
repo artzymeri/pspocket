@@ -83,7 +83,7 @@ struct Spec {
 #if PSPOCKET_HAVE_FFMPEG
 
 // Each codec file's Spec.
-extern const Spec kMp3;
+extern const Spec kMp3, kMpegL1, kMpegL2;
 
 // The Spec of a cellAdec type, or null.
 const Spec* spec_of(s32 type);

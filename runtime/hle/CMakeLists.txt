@@ -63,6 +63,7 @@ add_library(pspocket_hle STATIC
     src/adec_atracx.cpp
     src/adec_ffmpeg.cpp
     src/adec_mp3.cpp
+    src/adec_mpeg.cpp
     src/cellPngDec.cpp
     src/cellGifDec.cpp
     src/cellJpgDec.cpp

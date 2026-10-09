@@ -24,9 +24,21 @@ endif()
 if(pspocket_ffmpeg_dir AND EXISTS ${pspocket_ffmpeg_dir}/lib/libavcodec.a)
     add_library(pspocket_ffmpeg INTERFACE)
     target_include_directories(pspocket_ffmpeg SYSTEM INTERFACE ${pspocket_ffmpeg_dir}/include)
-    target_link_libraries(pspocket_ffmpeg INTERFACE ${pspocket_ffmpeg_dir}/lib/libavcodec.a
-        ${pspocket_ffmpeg_dir}/lib/libswscale.a ${pspocket_ffmpeg_dir}/lib/libswresample.a
-        ${pspocket_ffmpeg_dir}/lib/libavutil.a)
+    # The tests' own build beside it (D-577, scripts/build-ffmpeg.sh: <dir>-tests): the same decoders and the LGPL
+    # encoders the tests write their streams with. A target whose PSPOCKET_FFMPEG_ENCODERS property is set (the test
+    # programs) links those libraries in place of these, so what the app and pspocket-boot link does not change.
+    set(pspocket_ffmpeg_tests_dir "${pspocket_ffmpeg_dir}-tests")
+    foreach(lib avcodec swscale swresample avutil)
+        if(EXISTS ${pspocket_ffmpeg_tests_dir}/lib/libavcodec.a)
+            target_link_libraries(pspocket_ffmpeg INTERFACE "$<IF:$<BOOL:$<TARGET_PROPERTY:PSPOCKET_FFMPEG_ENCODERS>>,\
+${pspocket_ffmpeg_tests_dir}/lib/lib${lib}.a,${pspocket_ffmpeg_dir}/lib/lib${lib}.a>")
+        else()
+            target_link_libraries(pspocket_ffmpeg INTERFACE ${pspocket_ffmpeg_dir}/lib/lib${lib}.a)
+        endif()
+    endforeach()
+    if(EXISTS ${pspocket_ffmpeg_tests_dir}/lib/libavcodec.a)
+        message(STATUS "FFmpeg with the tests' encoders: ${pspocket_ffmpeg_tests_dir}")
+    endif()
     target_compile_definitions(pspocket_ffmpeg INTERFACE PSPOCKET_HAVE_FFMPEG=1)
     # H.264 on the media engine (D-254): FFmpeg's VideoToolbox hwaccel needs Apple's frameworks.
     if(APPLE AND EXISTS ${pspocket_ffmpeg_dir}/include/libavutil/hwcontext_videotoolbox.h)

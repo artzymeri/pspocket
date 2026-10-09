@@ -7953,3 +7953,34 @@ float and 16-bit, the PCM byte for byte FFmpeg's own decoding of them, each chan
 items' sizes, PTS (a missing one corrected by 2160) and user data, the information blocks, a layer II header refused
 in the middle (ERROR, AUDONE, PCMOUT with NOT_L3 and no PCM); mono at 44.1 kHz and MPEG-2 at 22.05 kHz (steps of 2351);
 a CRC mismatch flagged and decoded; every header error above; a word size refused by StartSeq.
+
+## D-577 (part 2) · 2026-10-09 · cellAdec's MPEG audio layers I and II on FFmpeg; the tests' own FFmpeg with encoders
+
+**MPEG audio** (adec_mpeg.cpp, for cellMPL1dec, layer I, and cellM2BCdec, layer II): CellAdecParamMpmc and
+CellAdecMpmcInfo from RPCS3's cellAdec.h, the M2BC error codes for both. One frame of the core's layer per access unit,
+MPEG-1 or MPEG-2 at its lower rates, decoded by mp1float or mp2float into big-endian floats (the structures name no word
+size). channelNumber is read as the CellAdecChannel layouts LPCM's parameters use (libadec's own naming): MONO gives one
+channel (a stereo frame's two averaged), STEREO two (a mono frame in both), anything else the stream's own. MPEG-2's
+multichannel extension is not decoded, its stereo base is (the multichannel's downmix by design): the information says
+2 channels with no surround, centre or LFE (logged once when a layout past stereo is asked). Errors: no 12-bit sync
+(MPEG-2.5's included) SYNCF, the other layer LAYER, the reserved version VERSION, bit rate 15 BITRATE, free format
+UNSUPPORT (FFmpeg decodes it only from a stream), the reserved rate SAMPLEFREQ, a unit shorter than its frame OPENBS, one
+FFmpeg refuses SAMPLE; the CRC is not checked (FFmpeg does not either). CellAdecMpmcInfo: the output's channelNumber
+(MONO or STEREO), the header's rate index, protection, bit rate index, mode, extension, emphasis, copyright and
+original, outputFrameSize the samples per channel (384 or 1152), channelConfiguration MONO, DUAL or L_R. PTS: the
+core's own correction (types 32 and 26 call module functions on a PS3).
+
+**The tests' FFmpeg.** FFmpeg's LGPL encoders write the tests' MPEG layer II, AC-3 and AAC streams. They are in a
+build of their own, build/ffmpeg/<host>-tests (scripts/build-ffmpeg.sh makes it beside the macOS and Linux builds; not
+for iOS): the same decoders plus the mp2, ac3 and aac encoders. third_party/CMakeLists.txt links it, in place of the
+decoders' build, only into targets whose PSPOCKET_FFMPEG_ENCODERS property is set (test_hle), through a generator
+expression on the consuming target, so the app and pspocket-boot link exactly what they did (no encoder in
+pspocket-boot, checked with nm). A test whose encoder is missing skips.
+
+Test: tests/hle/test_adec_cores.cpp. Layer I, frames built in the test (a sinusoid at a quarter of the subband rate in
+one subband per channel): the PCM byte for byte FFmpeg's own decoding, the tones at 3375 and 7125 Hz, the information
+block, PTS (none before the first, one corrected by 720); channelNumber MONO (the average) and STEREO from a mono
+stream. Layer II, two seconds of 1 and 2.5 kHz written by FFmpeg's mp2 encoder at 384 kbit/s: 83 frames, the decoded
+signal 44.5 and 38.5 dB above its difference from the input (30 required), PTS corrected by 2160; a layer III frame
+(LAYER), a cut frame (OPENBS), free format (UNSUPPORT) and MPEG-2.5's sync (SYNCF) refused, the next frame decoding; a
+layout past the enum refused by StartSeq (ARG).
