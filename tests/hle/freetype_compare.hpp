@@ -46,7 +46,7 @@ inline constexpr u32 kRet = kData + 0x58000;      // what the logging callbacks 
 inline constexpr u32 kScratch = kData + 0x60000;  // the scripts' own memory, to kData + 0x300000
 inline constexpr u32 kHeap = 0x01000000, kHeapSize = 0x03000000; // the FT_Memory's blocks
 inline constexpr u32 kBlobs = 0x04000000, kBlobsSize = 0x02000000; // font files in memory
-inline constexpr u32 kFontHeap = 0x06000000, kFontHeapSize = 0x02000000; // a CellFontMemoryInterface's blocks
+inline constexpr u32 kFontHeap = 0x06000000, kFontHeapSize = 0x04000000; // a CellFontMemoryInterface's blocks
 inline constexpr u32 kFontHeapCtl = kData + 0x2C000; // its {next, mallocs, frees}; the interface at +0x10
 
 inline std::string hex(const u8* p, usize n)

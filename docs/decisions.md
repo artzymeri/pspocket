@@ -6877,3 +6877,58 @@ Before, sys_config_start/stop only kept a count and the other six were RPCS3's s
   callbacks' arguments, the outputs and the lv2 calls of both threads (with their arguments, heap addresses kept) are
   the same; only the registers past a callback's arguments, which hold what each caller left there, are not
   compared. A test without the firmware runs pspocket's agent alone.
+
+## D-526 (part 2) · 2026-10-09 · cellFont pspocket's own: libfont's code, its data read from the firmware's libfont
+
+Sony's libfont.sprx is the PS3's font API. All 88 exports (the 85 of the count, cellFont_57E03823 (the initialization
+without the system tables' set-up), cellFont_8D5094C4 and cellFont_47B70477 (a draw context's flags)) and the
+callbacks libfont hands out (the file cache's lock and unlock to libfontFT, the composite-code lookup, the graphics
+start cellFontExtend gives) now run natively (runtime/hle/src/cellFont.cpp), over pspocket's cellFontFT (part 1).
+
+- **The code is pspocket's, the data the firmware's.** libfont's tables are data, not code: the system fonts (each
+  font ID's file, cache size, scale, shift and weight factors), each fontset's fonts and its map of which font draws
+  which code (range lists over trees of bitmaps, sorted code lists and code pairs), the per-code adjustments of the
+  "capie" sets, the vertical forms, and the fonts' paths (XOR-encoded). They are not copied into the source: at the
+  first call the module is read from dev_flash (/dev_flash/sys/external/libfont.sprx, decrypted with the build's SELF
+  keys as the loader decrypts modules), its two segments placed and relocated in the main area (recomp::place_prx),
+  and libfont's code ported to read them there. libfont's static records (its state and lock word, the revision, the
+  system and user font tables, the library slots, the file cache's settings, the patch-works bits, the usleep and
+  file-error slots) live in that data segment at libfont's own offsets, so libfontFT, which reads them through
+  cellFontStatic, sees what it sees in Sony's. Only the libfont whose identity (recomp::prx_identity) is firmware
+  4.92's is placed; another logs and the API answers as uninitialized.
+- **Ported from Sony's code**: the locks (a word's top bit with a 1 ms nap through the game's usleep or
+  sys_timer_usleep; bit 30 "open", the low bits the users, counted without the lock while others use an entry), the
+  initialization and the file cache's layout, the fontsets' opening (the type's old and new Japanese names, every font
+  of the set opened once in the system table, its path built as libfont builds it: the font server's hidden
+  "/:dev_font:/" path or the game's font directory (cellFontControl 0x540000), the ".ccd" composite-code file beside
+  it, the glyph buffer's expansion, on memory through the font library's file loader), file and memory fonts in the
+  user table (one face per unique ID and library, E(0xd) when full), instances, closing with the last user's face
+  closed and its buffers freed, the code-to-font walk with its fontset adjustments, metrics, kerning, layouts (the
+  widest and deepest over a set's fonts), character images in three directions, generated glyphs and the vertical
+  shift types, the renderers, draw contexts, scissors, cellFontDelete's dispatch on the record's magic, the
+  extension queries, the patch works, and the outline walk of cellFontGlyphGetOutlineVertexes (moves, lines, conics
+  and cubics halved until within the control distance, an S-shaped cubic halved at least once, 32 halvings at most,
+  closes) with vertexes glyphs' headers and relocation. Single-precision steps as Sony's, fused only where its code
+  has fmadds/fmsubs (no contraction in the file); libfont's float constants read from its data.
+- **A fix in the FreeType bridge found here** (freetype_bridge.cpp): FreeType's reads of a guest stream and of a file
+  went to the guest in 4 KB pieces; Sony's libfreetype reads a frame with one call (FT_Stream_Read; fread with one
+  cellFsRead, libfreetype 0x14e64). With libfontFT's cache under the stream the pieces went through the game's cache
+  slots one by one where Sony's reads a large frame straight from the file, leaving other blocks in the slots. One
+  read now, into the buffer when it is guest memory, else through the guest stack (4 KB or less) or a block of the
+  main area of its own (no allocation the game sees). The settings test compares the cache's slots.
+- **Not made**: libfont's module_start (a cellSysutil call for SDKs before 1.40; pspocket's modules have no start), its
+  dead code (a reserved-font list no export can set, file helpers nothing calls; cellFontPatchWorks' bit 4 that no
+  function checks is set all the same). Paths over libfont's 1 KB buffers, which libfont overruns, are cut. The font
+  library's functions libfont never calls (set_scale_point_dpi, setup_render_scale_dpi, alloc_memory, em_center: for
+  the graphics libraries) are still not compared through libfont.
+- **Compared** in tests/hle/test_font.cpp with Sony's libfont, libfontFT and libfreetype against pspocket's three
+  (the libfont script of part 1, now in tests/hle/font_scripts.hpp, runs over both): initialization and its errors,
+  settings and controls, 18 fontset kinds by Unicode and by type, a fontset's open mode, fontsets on memory, instances,
+  a game font directory, file fonts with shared entries and the full table, scaling, DPI, scales and effects with their
+  clamps, null arguments, ending; draw contexts, the extension queries and the functions they give (a graphics start
+  and end, cellFontEndGraphics, cellFontDelete of every kind), renderers bound to a font, the patch works turning
+  functions off one by one; outline vertexes of made outlines (lines, conics, cubics, degenerate and malformed
+  contours; three control distances) and of the fonts' glyphs (two), vertexes glyphs in enough and too little memory
+  and relocated; composite codes from a ".ccd" made in the test beside a copy of a firmware font in a temporary
+  directory (removed after). 1,432 observations, the same. How often the game's allocator is called is not compared
+  (FreeType's own objects are the host's, D-525). The tests' font heap grew to 64 MB.

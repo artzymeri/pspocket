@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <format>
+#include <optional>
 
 #include "freetype/pspocket_ftsystem.h"
 #include "guest.hpp"
@@ -1112,12 +1113,68 @@ s32 fs_tell(u32 fd)
     return -1;
 }
 
-// fread(buffer, 1, count, fd) into host memory, through the guest's stack in 4 KB pieces.
+// Whether [p, p + n) is guest memory.
+bool guest_span(const unsigned char* p, unsigned long n, const u8* base)
+{
+    return p >= base && static_cast<u64>(p - base) + n <= 0x100000000ull;
+}
+
+// Guest memory a read of FreeType's goes through (FreeType's buffers are the host's): the guest's stack for 4 KB or
+// less, else a block of the main area of its own (no allocation the game sees), so one read takes the whole frame as
+// in Sony's libfreetype. 0 when the main area has no room.
+class Bounce {
+public:
+    Bounce(PPUContext& ctx, u8* base, unsigned long count)
+    {
+        if (count <= kSmall) {
+            stack_.emplace(ctx, base, kSmall);
+            addr_ = stack_->addr();
+        } else if (count < 0x10000000ul) {
+            addr_ = heap_ = HleProcess::current()->main_memory().alloc(static_cast<u32>(count), 0x10);
+        }
+    }
+    ~Bounce()
+    {
+        if (heap_) HleProcess::current()->main_memory().free(heap_);
+    }
+    Bounce(const Bounce&) = delete;
+    Bounce& operator=(const Bounce&) = delete;
+    u32 addr() const { return addr_; }
+
+    static constexpr unsigned long kSmall = 0x1000;
+
+private:
+    std::optional<StackVar> stack_;
+    u32 addr_ = 0, heap_ = 0;
+};
+
+// fread(buffer, 1, count, fd), one cellFsRead as Sony's libfreetype makes it (libfreetype 0x14e64): into the buffer
+// when it is guest memory, else through a Bounce (in 4 KB pieces only when the main area has no room).
 unsigned long fs_read(u32 fd, unsigned char* buffer, unsigned long count)
 {
     if (!buffer || !count) return 0;
     PPUContext& ctx = *t_cur.ctx;
     u8* base = guest_base(ctx);
+    if (guest_span(buffer, count, base)) {
+        StackVar n(ctx, base, 8);
+        const s32 r = fs_call("cellFsRead", {fd, static_cast<u64>(buffer - base), count, n.addr()});
+        if (r != 0) {
+            fs_error(r);
+            return 0;
+        }
+        return static_cast<unsigned long>(std::min<u64>(ps_read64(base, n.addr()), count));
+    }
+    if (const Bounce b(ctx, base, count); b.addr()) {
+        StackVar n(ctx, base, 8);
+        const s32 r = fs_call("cellFsRead", {fd, b.addr(), count, n.addr()});
+        if (r != 0) {
+            fs_error(r);
+            return 0;
+        }
+        const u64 got = std::min<u64>(ps_read64(base, n.addr()), count);
+        std::memcpy(buffer, base + b.addr(), static_cast<usize>(got));
+        return static_cast<unsigned long>(got);
+    }
     constexpr u32 kChunk = 0x1000;
     StackVar chunk(ctx, base, kChunk);
     StackVar nread(ctx, base, 8);
@@ -1254,6 +1311,15 @@ unsigned long guest_stream_io(FT_Stream stream, unsigned long offset, unsigned c
     PPUContext& ctx = *t_cur.ctx;
     u8* base = guest_base(ctx);
     if (!count) return static_cast<unsigned long>(call_guest_fn(s->g_read, {s->guest, offset, 0, 0}) & 0xFFFFFFFF);
+    // one read of the whole frame, as FT_Stream_Read makes it
+    if (guest_span(buffer, count, base))
+        return static_cast<unsigned long>(
+            call_guest_fn(s->g_read, {s->guest, offset, static_cast<u64>(buffer - base), count}) & 0xFFFFFFFF);
+    if (const Bounce b(ctx, base, count); b.addr()) {
+        const u32 got = static_cast<u32>(call_guest_fn(s->g_read, {s->guest, offset, b.addr(), count}));
+        std::memcpy(buffer, base + b.addr(), std::min<unsigned long>(got, count));
+        return std::min<unsigned long>(got, count);
+    }
     constexpr u32 kChunk = 0x1000;
     StackVar chunk(ctx, base, kChunk);
     unsigned long done = 0;
