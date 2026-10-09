@@ -538,7 +538,6 @@ struct Kernel::Impl {
 void thread_finish(PpuThread& t, u64 status);
 // Ends the process (sys_process_exit*): the exit list, then the calling thread unwinds (ThreadExit).
 [[noreturn]] void exit_process(PpuThread& t, s32 status);
-void set_current_thread(PpuThread* t);
 
 // ---------------------------------------------------------------------------------------------------- templates
 

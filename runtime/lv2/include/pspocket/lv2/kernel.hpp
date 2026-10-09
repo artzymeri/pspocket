@@ -165,6 +165,9 @@ private:
 
 // The lv2 thread running on the calling host thread, or nullptr.
 PpuThread* current_thread();
+// Makes `t` the lv2 thread of the calling host thread (nullptr: none): a PPU thread's host thread at its start, and the
+// host thread of one of its fibers while that runs as the PPU thread (cellFiber, D-568).
+void set_current_thread(PpuThread* t);
 
 // The process's module loader as lv2's PRX calls (460..499) reach it (D-527): the HLE layer gives one with its
 // hle::ModuleLoader (HleProcess::set_module_loader); a kernel without one answers those calls
