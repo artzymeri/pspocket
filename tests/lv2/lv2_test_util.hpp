@@ -205,6 +205,7 @@ struct Fixture {
     }
 
     u32 r32(u32 a) const { return ps_read32(base(), a); }
+    u16 r16(u32 a) const { return ps_read16(base(), a); }
     u64 r64(u32 a) const { return ps_read64(base(), a); }
     void w32(u32 a, u32 v) const { ps_write32(base(), a, v); }
     void w64(u32 a, u64 v) const { ps_write64(base(), a, v); }

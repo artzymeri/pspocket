@@ -148,6 +148,8 @@ void register_system_syscalls(SyscallTable& table);
 void register_rsx_syscalls(SyscallTable& table);
 void register_usbd_syscalls(SyscallTable& table);
 void register_net_syscalls(SyscallTable& table);
+void register_device_syscalls(SyscallTable& table);
+void register_service_syscalls(SyscallTable& table);
 
 // The whole of the open file `fd` (a host file or one on an image), without moving its position (fs.cpp; for
 // sys_spu_image_open_by_fd). CELL_EBADF when fd is not an open file.
@@ -496,6 +498,8 @@ struct Kernel::Impl {
     std::shared_ptr<void> system_state;
     std::shared_ptr<void> usbd_state; // sys_usbd (usbd.cpp), made at first use under system_mutex
     std::shared_ptr<void> net_state;  // the network calls (net.cpp), made at first use under system_mutex
+    std::shared_ptr<void> devices_state; // GPIO, I/O buffers (devices.cpp), made at first use under system_mutex
+    std::shared_ptr<void> services_state; // HID manager, sys_config, storage (services.cpp), likewise
     std::mutex npd_mutex;
     Kernel::NpdOpener npd_opener; // Kernel::set_npd_opener (D-165), under npd_mutex
     // SPU thread groups (D-167): their IDs, and what the HLE layer adds (under spu_hooks_mutex).
@@ -521,6 +525,8 @@ struct Kernel::Impl {
 
 // Thread internals (thread.cpp).
 void thread_finish(PpuThread& t, u64 status);
+// Ends the process (sys_process_exit*): the exit list, then the calling thread unwinds (ThreadExit).
+[[noreturn]] void exit_process(PpuThread& t, s32 status);
 void set_current_thread(PpuThread* t);
 
 // ---------------------------------------------------------------------------------------------------- templates

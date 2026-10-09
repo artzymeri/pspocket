@@ -6397,3 +6397,34 @@ errno in the thread's TLS (RPCS3's convention). It is now two layers, as on a PS
   offline opens a socket of family 0 and fails, and their pool allocations); its comparison waits, hidden. Still
   missing: gethostbyaddr, if_nametoindex, sys_net_if_ctl, the name-server, routing, netset, test-parameter, dump,
   ioctl/control wrappers and show_nameserver/show_route.
+
+## D-527 · 2026-10-09 · Kernel calls as a retail console running a game: devices, system manager, services (part 1)
+
+The kernel-calls chart counts 634 named lv2 calls; 339 were not pspocket's own (95 missing, 244 answered as RPCS3's
+null or stub slots answer them, D-166/D-184). This decision makes them pspocket's own group by group, each from
+RPCS3's lv2 code where it has one (cited in each file) and its syscall table's permission column (lv2.cpp: ROOT,
+DBG, PM): those calls belong to system processes, so a game (Config::root false) gets CELL_ENOSYS, as pspocket's
+sys_ss already answers its root-only packages and RPCS3's sys_sm_shutdown answers a game; a root process gets RPCS3's
+answers. Which retail modules issue which calls was checked with scripts/firmware-syscalls.py: liblv2coredump (the
+retail crash-dump library) uses the sys_dbg, crypto-engine and PRX-query calls, so those get real behaviour over the
+process's own state in a later part, not a refusal.
+
+Part 1 (runtime/lv2/src/devices.cpp, services.cpp; 78 calls):
+- sys_gpio: no LEDs or DIP switches on a retail console: both read 0, the LEDs take a set, the switches refuse it.
+- sys_io buffers: IDs from 0x44000000; each allocation is block_count * block_size bytes of user memory lv2 keeps in
+  64 KB pages, freed with its buffer; freeing another address frees nothing (RPCS3's vm::dealloc fails quietly).
+- sys_sm (377-397, 408, 409): all ROOT, DBG or PM. For a root process: no event (CELL_EAGAIN, outputs 0), RPCS3's
+  parameters (0, 0, 0x200, 7), shutdown and reboot end the process (pspocket cannot start the system software
+  again), the LPAR operations ENOTSUP; the services RPCS3 leaves as null_func answer CELL_OK with nothing written.
+- sys_dbg_read/write_process_memory (904, 905): the process's own memory (pid 1); a write into the executable's area
+  is logged, as code translated ahead of time does not change with it (RPCS3 recompiles the function there).
+- HID manager (500-514): handles from 0x100; the ioctl's DualShock 3 descriptor and IDs RPCS3 recorded on real
+  hardware; the focus is the game's. lv2 keeps no input state (pspocket's libio is native), so a root process reading
+  it gets nothing.
+- sys_config (516-525): the service registry, events to the handle's event queue as (1, handle, registered << 32 |
+  event ID, size); the pad manager (0x11, 0x12) registered with one controller at the first open; a listener of 0x11
+  hears of it only when its data starts with 1; ONCE listeners one event; no I/O error events.
+- Raw storage (600-623): opening a device and the device queries are root-only; for root, RPCS3's 17 devices and
+  their sizes, reads of zeros (no device contents), writes taken, asynchronous commands answered at once on the
+  configured queue; the emulated speed is a debug kernel's (ENOSYS).
+Tests: tests/lv2/test_devices.cpp, test_services.cpp (both permission sides, every answer above).

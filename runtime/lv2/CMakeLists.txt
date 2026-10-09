@@ -17,6 +17,8 @@ add_library(pspocket_lv2 STATIC
     src/time.cpp
     src/usbd.cpp
     src/net.cpp
+    src/devices.cpp
+    src/services.cpp
     src/vm.cpp)
 target_include_directories(pspocket_lv2 PUBLIC include PRIVATE src)
 target_link_libraries(pspocket_lv2 PUBLIC pspocket::core pspocket::ppu pspocket::rsx pspocket::spu)

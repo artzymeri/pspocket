@@ -43,14 +43,14 @@ enum : u32 {
     SYS_RSXAUDIO_OBJECT = 0x60,
 };
 
+} // namespace
+
 [[noreturn]] void exit_process(PpuThread& t, s32 status)
 {
     t.kernel.impl().process_exit(status);
     thread_finish(t, 0);
     throw ThreadExit{};
 }
-
-} // namespace
 
 s32 sys_process_getpid(PpuThread&) { return 1; } // RPCS3 process_getpid
 
