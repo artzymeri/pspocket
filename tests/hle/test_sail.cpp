@@ -75,6 +75,7 @@ using Call = std::function<u64(const char*, std::initializer_list<u64>, bool)>;
 void part1(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part2(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part3(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part4(u8* b, const Call& call, u32 cb, GuestThread& t);
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
 Run run(const std::string& flash, bool sony, int part)
@@ -117,7 +118,8 @@ Run run(const std::string& flash, bool sony, int part)
     g_mask.clear();
     if (part == 1) part1(b, call, cb, t);
     else if (part == 2) part2(b, call, cb, t);
-    else part3(b, call, cb, t);
+    else if (part == 3) part3(b, call, cb, t);
+    else part4(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
@@ -486,6 +488,78 @@ void part3(u8* b, const Call& call_, u32, GuestThread&)
     }
 }
 
+// The adapters on a player of each clock kind (mode 0: latencies set; mode 7: none, so the clock measures them): their
+// set-up, formats, PTS to time and the AV-sync reports a game sends.
+void part4(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kSa = kArea + 0x1800, kGa = kArea + 0x1900,
+                  kFuncs2 = kArea + 0x1A00, kFmt = kArea + 0x1A40, kOut = kArea + 0x1A80;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    for (u32 i = 0; i < 5; i++) ps_write32(b, kFuncs2 + 4 * i, 0x40000000 + i);
+    for (u32 i = 0; i < 0x20; i++) b[kFmt + i] = static_cast<u8>(0x60 + i);
+    // Each side's renderer callback table lives in its own data: its address is not compared.
+    g_mask.push_back({kSa, 4});
+    g_mask.push_back({kGa, 4});
+    for (u32 mode : {0u, 7u}) {
+        call("cellSailPlayerInitialize", {kP, mode, kMem, cb, 1, 1, 1, 0, 0});
+        const u32 src = ps_read32(b, kP + 0x3B0);
+        if (src >= kArea && src < kArea + 0x3000) {
+            g_mask.push_back({src + 0x48, 0x38});
+            g_mask.push_back({src + 0x100, 0x38});
+        }
+        std::memset(b + kSa, 0xEE, 0x100);
+        std::memset(b + kGa, 0xEE, 0x100);
+        call("cellSailSoundAdapterInitialize", {kSa, kFuncs2, 0x55});
+        call("cellSailGraphicsAdapterInitialize", {kGa, kFuncs2, 0x66});
+        call("cellSailPlayerSetSoundAdapter", {kP, 0, kSa});
+        call("cellSailPlayerSetGraphicsAdapter", {kP, 0, kGa});
+        for (u32 i = 0; i < 0x20; i++) {
+            b[kSa + 0x90 + (i % 0x18)] = static_cast<u8>(0x10 + i);
+            b[kGa + 0xA8 + i] = static_cast<u8>(0x30 + i);
+        }
+        call("cellSailSoundAdapterGetFormat", {kSa, kOut});
+        call("cellSailGraphicsAdapterGetFormat", {kGa, kOut + 0x20});
+        call("cellSailSoundAdapterSetPreferredFormat", {kSa, 0});
+        call("cellSailSoundAdapterSetPreferredFormat", {kSa, kFmt});
+        call("cellSailGraphicsAdapterSetPreferredFormat", {kGa, 0});
+        call("cellSailGraphicsAdapterSetPreferredFormat", {kGa, kFmt});
+        call("cellSailSoundAdapterPtsToTimePosition", {kSa, 91000, kOut + 0x40});
+        call("cellSailGraphicsAdapterPtsToTimePosition", {kGa, 91000, kOut + 0x40});
+        ps_write64(b, kSa + 0xD0, 1000);
+        ps_write64(b, kGa + 0x98, 5000);
+        for (const s64 pts : {91000ll, 1000ll, 0ll, -9000ll, 0x7FFFFFFFFFFFll}) {
+            call("cellSailSoundAdapterPtsToTimePosition", {kSa, static_cast<u64>(pts), kOut + 0x48});
+            call("cellSailGraphicsAdapterPtsToTimePosition", {kGa, static_cast<u64>(pts), kOut + 0x50});
+        }
+        // AV sync: (frame, time) reports, steady then jumping, the records' frame marks set between.
+        struct Report {
+            u32 frame;
+            u64 time;
+            u32 mark;
+        };
+        const Report audio[] = {{0, 5, 0}, {1, 1000, 0}, {5, 50000, 0}, {10, 213000, 3}, {12, 255000, 0}, {20, 426000, 30},
+            {21, 900000, 0}, {30, 1000000, 5}, {31, 1021333, 7}, {40, 1213330, 0}};
+        for (const Report& r : audio) {
+            ps_write32(b, kSa + 0xC0, r.mark);
+            call("cellSailSoundAdapterUpdateAvSync", {kSa, r.frame, r.time}, true);
+        }
+        const Report video[] = {{0, 5, 0}, {1, 1000, 0}, {5, 66000, 0}, {9, 134000, 3}, {10, 150000, 0}, {20, 317000, 30},
+            {21, 1317000, 0}, {30, 1467000, 5}, {31, 1467100, 7}, {60, 1967000, 0}};
+        for (const Report& r : video) {
+            ps_write32(b, kGa + 0xDC, r.mark);
+            call("cellSailGraphicsAdapterUpdateAvSync", {kGa, r.frame, r.time}, true);
+        }
+        std::memcpy(b + kOut + 0x100, b + kP + 8, 200); // the clock after
+        call("cellSailSoundAdapterFinalize", {kSa});
+        call("cellSailGraphicsAdapterFinalize", {kGa});
+        call("cellSailPlayerFinalize", {kP});
+    }
+}
+
 void compare_lines(const char* what, const std::vector<std::string>& mine, const std::vector<std::string>& sony)
 {
     usize differ = 0;
@@ -519,3 +593,5 @@ TEST_CASE("cellSail against libsail: allocator, future, source, renderers", "[hl
 TEST_CASE("cellSail against libsail: the player's life before it plays", "[hle][lle][sail]") { compare_runs(2); }
 
 TEST_CASE("cellSail against libsail: descriptors' fields and capabilities", "[hle][lle][sail]") { compare_runs(3); }
+
+TEST_CASE("cellSail against libsail: the adapters' set-up, formats and AV sync", "[hle][lle][sail]") { compare_runs(4); }

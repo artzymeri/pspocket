@@ -7120,6 +7120,17 @@ bit 0x10, else 8); InquireCapability checks an inquiry (start, seek and terminus
 against them and the stream's size, with libsail's whole decision tree, and on SDKs after 0x21FFF only for an open
 descriptor (state 1, 3 or 5). Compared: 839 checks (700 inquiries from a fixed pseudo-random spread): 0 differences.
 
+Part 4, the adapters' set-up, formats and AV sync (runtime/hle/src/cellSailAdapters.cpp): the sound adapter (0xD8
+bytes) and graphics adapter (0x100) are libsail's own renderers (their renderer callback tables libsail's, here hidden
+variables of internal functions that fail loudly until a later part plays) with the game's callbacks (3 and 5) and
+argument, an lwmutex ("_saisa0", "_saiga0"), a state (7, 6 finalized; Finalize destroys the lwmutex again every 5 ms
+while busy, ten times at most), the format they deliver (GetFormat: the sound one's +2 is 0x100) and the one the game
+prefers, the first PTS (PtsToTimePosition: milliseconds from it, INVALID_STATE before one). UpdateAvSync feeds the
+player's clock from the game's (frame, time) reports: audio's time per frame (in 1/256 when the clock has a latency)
+first after 100 ms, then kept within a quarter of the last and smoothed by a quarter; video's after 8 frames, then
+kept from 15001 to 149999 us; each with the record's frame mark giving the next frame's time. Compared on players of
+modes 0 and 7: 107 checks (answers, the adapters' and the clock's bytes): 0 differences.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)
