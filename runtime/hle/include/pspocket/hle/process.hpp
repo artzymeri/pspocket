@@ -218,6 +218,7 @@ private:
     std::map<std::pair<std::string, u32>, u32> imports_; // under link_mutex_
     std::map<std::pair<std::string, u32>, u32> variables_; // host variables linked, under link_mutex_
     u32 variable_block_ = 0, variable_used_ = 0;           // where they are laid out, under link_mutex_
+    u32 place_variable(const Variable& v);                 // its address in those blocks, under link_mutex_
     std::atomic<u64> unimplemented_calls_{0};
     std::atomic<u64> stub_calls_{0};
 

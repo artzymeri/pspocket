@@ -6604,3 +6604,40 @@ authentication cache, caches, HTTPS).
   response files through cellFs): not registered, so a game importing one gets the loader's CELL_ENOSYS; clients can't
   switch it on (DCACHE_NOT_INITIALIZED). cellHttp_F799F3EF with certificate 0 of none (libhttp faults) answers
   INVALID_VALUE.
+
+## D-531 · 2026-10-09 · cellSync2 pspocket's own, libsync2's objects bit for bit
+
+cellSync2 had no implementation (RPCS3's are todo stubs; libsync2.sprx ran LLE). All 32 functions and its 6 variables
+are now pspocket's own (runtime/hle/src/cellSync2.cpp), read from libsync2 (fw 4.92) and compared with it running on
+pspocket (tests/hle/test_sync2.cpp).
+- The objects (mutex, condition, semaphore, queue: 128 bytes, 128-aligned) are shared with the library's SPU side
+  (SPURS tasks and jobs update them with GETLLAR/PUTLLC), so the layout is libsync2's to the bit and every update is the
+  one libsync2 makes with the same lwarx/ldarx and stwcx./stdcx. pairs, through the reservation system as the PPU
+  interpreter and lifted code make them (ps_res_acquire + ps_res_store_conditional): a store by any processor in
+  between fails it, as on the hardware.
+- Waiting goes through the caller's thread type, a table of callbacks (self, allocate a signal receiver, wait, free),
+  and waking through the notifier of the waiter's thread type. The library's tables are its exported variables
+  (gCellSync2CallerThreadTypePpuThread/PpuFiber, gCellSync2Notifier*), laid out as libsync2's with descriptors of
+  internal functions: a PPU thread's receiver is a bit of one of two lv2 event flags (priority, several waiters, waited
+  AND|CLEAR), a fiber's goes through cellFiber, a SPURS task's through _cellSpursSendSignal, a job queue job's through
+  cellSpursJobQueueSendSignal (host imports, D-197, when the firmware's module gives them; pspocket's own otherwise).
+  A call without a configuration takes the fiber caller when the object allows fibers and cellFiberPpuSelf() is not 0.
+- Blocked callers wait in libsync2's waiter queue: a ring of 8-byte entries in the caller's buffer where waiters and
+  wakers each claim the next entry of their own round (round bits in the header and in each entry), and a waker that
+  comes first leaves a signal in the entry so the waiter does not sleep. The mutex is a hand-over lock (an unlock with
+  waiters left keeps it locked and wakes the next waiter, who takes ownership) spinning spinWaitNanoSec first; the
+  condition releases the whole recursive mutex while it waits; the semaphore with one waiter keeps the waiter's need
+  in the object (its waiter entries inside the object at +0x48); the queue is a linked queue over depth + 1 entries
+  (bitmap, next array, dummy head, counters of free entries and elements that reserve before taking, multiple-element
+  TryPush).
+- The tail of the queue moves one entry per call, as libsync2's (a first version walked it to the end: caught by the
+  comparison).
+- HleProcess::link_variable now runs a variable's initializer after its lock is released, so an initializer can link
+  the module's internal functions (the callback tables).
+Deviations: libsync2's assertions are fatal logs with its text; memory that is not the guest's is refused with
+CELL_SYNC2_ERROR_INVAL and the call site logged (libsync2 would fault); the event flags are made at the first PPU
+thread receiver instead of at module start, and a host mutex guards their bitmaps (libsync2: a lightweight mutex).
+Tests: a 890-step one-thread script (attributes, every size range edge, each argument's errors, recursion, DEADLK,
+NOMEM, AGAIN, STAT, BUSY, every object's bytes and buffers after each step) the same as libsync2's; objects made by
+one implementation and used by the other, both ways, the same as all-Sony; four threads contending a mutex, waiters on
+a condition, acquirers on a semaphore, two producers and two consumers on a queue, on each implementation.

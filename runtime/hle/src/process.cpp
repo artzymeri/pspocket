@@ -306,29 +306,41 @@ u32 HleProcess::link_variable(std::string_view module, u32 nid)
 {
     const Variable* v = registry().find_variable(module, nid);
     if (!v) return 0;
-    std::lock_guard lock(link_mutex_);
-    if (const auto it = variables_.find({std::string(module), nid}); it != variables_.end()) return it->second;
-    // Laid out one after another in blocks of 64 KB of the main area (a larger one gets a block of its own).
+    u32 at = 0;
+    {
+        std::lock_guard lock(link_mutex_);
+        if (const auto it = variables_.find({std::string(module), nid}); it != variables_.end()) return it->second;
+        at = place_variable(*v);
+        if (!at) return 0;
+        variables_[{std::string(module), nid}] = at;
+    }
+    // Laid out after the lock is released: an initializer may link functions (a table of the module's callbacks, D-531).
+    u8* base = kernel_.memory().base();
+    std::memset(base + at, 0, v->size);
+    if (v->init) v->init(base, at);
+    PS_LOG_DEBUG(kChan, "variable {}::{} ({:#010x}) at {:#010x}", module, v->name, nid, at);
+    return at;
+}
+
+u32 HleProcess::place_variable(const Variable& v)
+{
+    // Laid out one after another in blocks of 64 KB of the main area (a larger one gets a block of its own). Under
+    // link_mutex_.
     constexpr u32 kBlock = 0x10000;
-    const u32 align = std::max<u32>(v->align, 1);
+    const u32 align = std::max<u32>(v.align, 1);
     u32 at = variable_block_ ? (variable_block_ + variable_used_ + align - 1) & ~(align - 1) : 0;
-    if (!variable_block_ || at + v->size > variable_block_ + kBlock) {
-        const u32 size = std::max<u32>(kBlock, (v->size + 0xFFFF) & ~0xFFFFu);
+    if (!variable_block_ || at + v.size > variable_block_ + kBlock) {
+        const u32 size = std::max<u32>(kBlock, (v.size + 0xFFFF) & ~0xFFFFu);
         const u32 block = main_.alloc(size, kBlock);
         if (!block) {
-            PS_LOG_ERROR(kChan, "no main-area memory for the host variable {}::{}", module, v->name);
+            PS_LOG_ERROR(kChan, "no main-area memory for the host variable {}::{}", v.module, v.name);
             return 0;
         }
         variable_block_ = block;
         variable_used_ = 0;
         at = block;
     }
-    variable_used_ = at + v->size - variable_block_;
-    u8* base = kernel_.memory().base();
-    std::memset(base + at, 0, v->size);
-    if (v->init) v->init(base, at);
-    variables_[{std::string(module), nid}] = at;
-    PS_LOG_DEBUG(kChan, "variable {}::{} ({:#010x}) at {:#010x}", module, v->name, nid, at);
+    variable_used_ = at + v.size - variable_block_;
     return at;
 }
 
