@@ -349,6 +349,7 @@ void FT_Add_Default_Modules(PPUContext& ctx, u32 library)
     if (!l) return;
     LibLock lk = lock(l);
     ::FT_Add_Default_Modules(l->ft);
+    patch_sfnt(l->ft);
     sync_library(l);
 }
 
@@ -362,6 +363,7 @@ s32 FT_Add_Module(PPUContext& ctx, u32 library, u32 clazz)
     if (const FT_Module_Class* c = class_of(clazz)) {
         // a class of FreeType's own (as FT_Get_Module(...)->clazz gave it)
         const FT_Error e = ::FT_Add_Module(l->ft, c);
+        patch_sfnt(l->ft);
         const FT_Error s = sync_library(l);
         return e ? e : s;
     }

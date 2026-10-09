@@ -46,6 +46,8 @@ inline constexpr u32 kRet = kData + 0x58000;      // what the logging callbacks 
 inline constexpr u32 kScratch = kData + 0x60000;  // the scripts' own memory, to kData + 0x300000
 inline constexpr u32 kHeap = 0x01000000, kHeapSize = 0x03000000; // the FT_Memory's blocks
 inline constexpr u32 kBlobs = 0x04000000, kBlobsSize = 0x02000000; // font files in memory
+inline constexpr u32 kFontHeap = 0x06000000, kFontHeapSize = 0x02000000; // a CellFontMemoryInterface's blocks
+inline constexpr u32 kFontHeapCtl = kData + 0x2C000; // its {next, mallocs, frees}; the interface at +0x10
 
 inline std::string hex(const u8* p, usize n)
 {
@@ -64,30 +66,51 @@ inline std::vector<u8> read_file(const std::string& path)
 
 class Run {
 public:
-    Run(const std::string& flash, bool sony_, const std::vector<std::string>& libraries) : sony(sony_), t(f, 0, "ppu")
+    Run(const std::string& flash, bool sony_, const std::vector<std::string>& libraries)
+        : Run(flash, sony_ ? libraries : std::vector<std::string>{}, sony_ ? std::vector<std::string>{} : libraries)
+    {
+    }
+
+    // A run with the libraries `firmware` as Sony's modules and `host` as pspocket's (a host module's imports from the
+    // firmware's linked as the loader links them).
+    Run(const std::string& flash, const std::vector<std::string>& firmware, const std::vector<std::string>& host)
+        : sony(host.empty()), t(f, 0, "ppu")
     {
         REQUIRE(f.hle->main_memory().reserve(kHeap, kHeapSize));
         REQUIRE(f.mem.commit(kHeap, kHeapSize));
         REQUIRE(f.hle->main_memory().reserve(kBlobs, kBlobsSize));
         REQUIRE(f.mem.commit(kBlobs, kBlobsSize));
+        REQUIRE(f.hle->main_memory().reserve(kFontHeap, kFontHeapSize));
+        REQUIRE(f.mem.commit(kFontHeap, kFontHeapSize));
         REQUIRE(f.kernel->vfs_mount("/dev_flash", flash, true));
         REQUIRE(f.hle->initialize_tls({0, 0, 0x100}));
         b = f.base();
-        if (sony) {
+        if (!firmware.empty()) {
             lle = std::make_unique<loader::LleModules>(flash);
             REQUIRE(lle->index());
-            for (const std::string& l : libraries) lle->force(l);
-            for (const std::string& l : libraries) {
+            for (const std::string& l : firmware) lle->force(l);
+            for (const std::string& l : firmware) {
                 std::string why;
                 const loader::PrxModule* m = lle->load(l, *f.hle, &why);
                 INFO(why);
                 REQUIRE(m);
                 modules[l] = m;
             }
-            for (const u32 s : lle->take_starts()) call_guest(t.ctx, s, {0, 0});
-        } else {
-            REQUIRE(f.hle->link_internal_functions(libraries));
         }
+        if (!host.empty()) {
+            REQUIRE(f.hle->link_internal_functions(host));
+            for (const HostImport& i : registry().imports()) {
+                if (std::find(host.begin(), host.end(), i.module) == host.end() || !modules.contains(std::string(i.library)))
+                    continue;
+                const loader::PrxModule* m = modules.at(std::string(i.library));
+                const auto& exports = i.variable ? m->variables : m->functions;
+                const auto it = exports.find({std::string(i.library), i.nid});
+                REQUIRE(it != exports.end());
+                f.hle->link_import(i.library, i.nid, it->second);
+            }
+        }
+        if (lle)
+            for (const u32 s : lle->take_starts()) call_guest(t.ctx, s, {0, 0});
         write_code();
         std::memset(b + kHeap, 0xCD, 0x200000);
         scratch_ = kScratch;
@@ -112,10 +135,11 @@ public:
         }
         return recomp::nid_of(name);
     }
+    bool firmware(const std::string& library) const { return modules.contains(library); }
     u32 opd(const std::string& library, const char* name)
     {
         const u32 nid = nid_of_name(name);
-        if (sony) {
+        if (firmware(library)) {
             const loader::PrxModule* m = modules.at(library);
             const auto it = m->functions.find({library, nid});
             REQUIRE(it != m->functions.end());
@@ -128,7 +152,7 @@ public:
     u64 call64(const std::string& library, const char* name, std::initializer_list<u64> args)
     {
         if (std::getenv("PSPOCKET_FT_TRACE")) std::fprintf(stderr, "CALL %s %s\n", sony ? "sony" : "ours", name);
-        if (sony) return call_guest(t.ctx, opd(library, name), args);
+        if (firmware(library)) return call_guest(t.ctx, opd(library, name), args);
         const Function& fn = GuestThread::find(name);
         u32 i = 0;
         for (const u64 a : args) {
@@ -143,6 +167,15 @@ public:
     u32 call(const std::string& library, const char* name, std::initializer_list<u64> args)
     {
         return static_cast<u32>(call64(library, name, args));
+    }
+    // A call with floating-point arguments too (f1.. in order), through the function's descriptor either way.
+    u32 callf(const std::string& library, const char* name, std::initializer_list<u64> args,
+        std::initializer_list<double> fargs)
+    {
+        if (std::getenv("PSPOCKET_FT_TRACE")) std::fprintf(stderr, "CALL %s %s\n", sony ? "sony" : "ours", name);
+        u32 i = 1;
+        for (const double v : fargs) t.ctx.fpr[i++] = v;
+        return static_cast<u32>(call_guest(t.ctx, opd(library, name), args));
     }
     // A call to cell_FreeType2 whose answer is kept.
     u32 ft(const char* name, std::initializer_list<u64> args)
@@ -246,6 +279,12 @@ public:
     u32 requester() { return requester_; }
     // An FT_StreamRec read function over memory: the stream's descriptor is the data's address; logs nothing.
     u32 stream_read() { return stream_read_; }
+
+    // A CellFontMemoryInterface {arg, malloc, free, realloc, calloc}: a bump allocator over kFontHeap (each block after
+    // a 16-byte header holding its size; frees counted, nothing reused). arg = {next, mallocs, frees}.
+    u32 font_memory();
+    u32 font_mallocs() const { return r32(kFontHeapCtl + 4); }
+    u32 font_frees() const { return r32(kFontHeapCtl + 8); }
 
 private:
     u32 make_logger(u32 tag, u32 ptrs, u32 scalars, bool spans);
@@ -394,6 +433,90 @@ inline void Run::write_code()
     clear_log();
 }
 
+inline u32 Run::font_memory()
+{
+    const u32 iface = kFontHeapCtl + 0x10;
+    if (r32(iface + 4)) return iface;
+    as::Assembler a(code_);
+    // malloc(arg r3, size r4): r5 = next, block r6 = r5 + 16, next = (r6 + size + 15) & ~15
+    const auto bump = [&] {
+        a.emit(as::lwz(5, 0, 3));
+        a.emit(as::addi(6, 5, 16));
+        a.emit(as::add(7, 6, 4));
+        a.emit(as::addi(7, 7, 15));
+        a.emit(as::rlwinm(7, 7, 0, 0, 27));
+        a.emit(as::stw(7, 0, 3));
+        a.emit(as::stw(4, 0, 5));
+        a.emit(as::lwz(8, 4, 3));
+        a.emit(as::addi(8, 8, 1));
+        a.emit(as::stw(8, 4, 3));
+    };
+    const u32 malloc_at = a.pc();
+    bump();
+    a.emit(as::mr(3, 6));
+    a.emit(as::blr());
+    const u32 free_at = a.pc();
+    a.emit(as::lwz(8, 8, 3));
+    a.emit(as::addi(8, 8, 1));
+    a.emit(as::stw(8, 8, 3));
+    a.emit(as::blr());
+    const u32 realloc_at = a.pc();
+    {
+        // realloc(arg r3, p r4, size r5): a new block, min(old, size) bytes copied
+        a.emit(as::mr(12, 4));
+        a.emit(as::mr(4, 5));
+        bump();
+        auto copied = a.new_label();
+        a.emit(as::cmpwi(0, 12, 0));
+        a.beq(0, copied);
+        a.emit(as::lwz(7, -16, 12));
+        a.emit(as::cmplw(0, 7, 4));
+        auto keep = a.new_label();
+        a.ble(0, keep);
+        a.emit(as::mr(7, 4));
+        a.bind(keep);
+        a.emit(as::li(8, 0));
+        auto loop = a.here();
+        a.emit(as::cmplw(0, 8, 7));
+        a.bge(0, copied);
+        a.emit(as::lbzx(9, 12, 8));
+        a.emit(as::stbx(9, 6, 8));
+        a.emit(as::addi(8, 8, 1));
+        a.b(loop);
+        a.bind(copied);
+        a.emit(as::mr(3, 6));
+        a.emit(as::blr());
+    }
+    const u32 calloc_at = a.pc();
+    {
+        // calloc(arg r3, n r4, size r5): n * size zeroed bytes
+        a.emit(as::mullw(4, 4, 5));
+        bump();
+        a.emit(as::li(8, 0));
+        a.emit(as::li(9, 0));
+        auto loop = a.here();
+        auto done = a.new_label();
+        a.emit(as::cmplw(0, 8, 4));
+        a.bge(0, done);
+        a.emit(as::stbx(9, 6, 8));
+        a.emit(as::addi(8, 8, 1));
+        a.b(loop);
+        a.bind(done);
+        a.emit(as::mr(3, 6));
+        a.emit(as::blr());
+    }
+    put_code(a);
+    w32(kFontHeapCtl, kFontHeap);
+    w32(kFontHeapCtl + 4, 0);
+    w32(kFontHeapCtl + 8, 0);
+    w32(iface, kFontHeapCtl);
+    w32(iface + 4, put_opd(malloc_at));
+    w32(iface + 8, put_opd(free_at));
+    w32(iface + 12, put_opd(realloc_at));
+    w32(iface + 16, put_opd(calloc_at));
+    return iface;
+}
+
 inline u32 Run::make_logger(u32 tag, u32 ptrs, u32 scalars, bool spans)
 {
     as::Assembler a(code_);
@@ -458,18 +581,21 @@ inline u32 Run::make_logger(u32 tag, u32 ptrs, u32 scalars, bool spans)
     return put_opd(at);
 }
 
-// Runs `script` on Sony's modules and on pspocket's and compares what each kept.
-inline void compare(const std::string& flash, const std::vector<std::string>& libraries,
-    const std::function<void(Run&)>& script, const std::string& what)
+// Runs `script` on Sony's modules (`firmware`) and on pspocket's (`host`, over `under`, Sony's modules the host's run
+// on: libfont under pspocket's cellFontFT) and compares what each kept.
+inline void compare(const std::string& flash, const std::vector<std::string>& under,
+    const std::vector<std::string>& host, const std::function<void(Run&)>& script, const std::string& what)
 {
     std::vector<std::string> sonys, mine;
     {
-        Run r(flash, true, libraries);
+        std::vector<std::string> all = under;
+        all.insert(all.end(), host.begin(), host.end());
+        Run r(flash, all, {});
         script(r);
         sonys = std::move(r.out);
     }
     {
-        Run r(flash, false, libraries);
+        Run r(flash, under, host);
         script(r);
         mine = std::move(r.out);
     }
@@ -492,6 +618,13 @@ inline void compare(const std::string& flash, const std::vector<std::string>& li
     }
     INFO(std::format("{}: {} observations, {} differ", what, sonys.size(), differ));
     CHECK(differ == 0);
+}
+
+// Runs `script` on Sony's modules and on pspocket's and compares what each kept.
+inline void compare(const std::string& flash, const std::vector<std::string>& libraries,
+    const std::function<void(Run&)>& script, const std::string& what)
+{
+    compare(flash, {}, libraries, script, what);
 }
 
 } // namespace pspocket::hle::test::ft

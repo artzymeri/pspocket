@@ -325,6 +325,13 @@ u32 compressed_guest_stream(FT_Stream s);
 FT_Stream host_stream_for(u32 guest_stream);
 // The handler Sony's file layer calls when a read fails with CELL_EIO or CELL_EFSSPECIFIC (cell_FreeType2_904CA41F).
 void set_file_handler(u32 fn, u32 arg);
+// Sony's FT_Stream_Open file layer for libfontFT's own streams (cellFontFT.cpp): the guest path opened as
+// FT_Stream_Open opens it (cellFreeType2Ex's hidden paths too), an fd's reads (seek, then read) and its close.
+FT_Error file_open(u32 path, u32* fd, u32* size);
+unsigned long file_read(u32 fd, unsigned long offset, unsigned char* buffer, unsigned long count);
+void file_close(u32 fd);
+// Sony's change to sfnt_load_face (CELL_FONT_OPEN_MODE_IGNORE_VERTICAL_METRICS) on a library's sfnt module.
+void patch_sfnt(FT_Library library);
 
 // ---------------------------------------------------------------------------------------------------- calls
 // An HLE function of another module (sys_fs's cellFs functions), called as the guest would: r3.

@@ -5,6 +5,7 @@
 #include FT_INTERNAL_OBJECTS_H
 #include FT_INTERNAL_STREAM_H
 #include FT_INTERNAL_GLYPH_LOADER_H
+#include FT_INTERNAL_SFNT_H
 
 #include <algorithm>
 #include <cstdlib>
@@ -1305,6 +1306,85 @@ u32 guest_stream_of(FT_Stream s)
 {
     if (s && s->close == guest_stream_close) return static_cast<GuestStream*>(s)->guest;
     return compressed_guest_stream(s);
+}
+
+FT_Error file_open(u32 path, u32* fd, u32* size)
+{
+    FT_StreamRec s{};
+    const FT_Error e = stream_open(&s, reinterpret_cast<const char*>(hp(path)));
+    if (e) return e;
+    *fd = static_cast<u32>(s.descriptor.value);
+    *size = static_cast<u32>(s.size);
+    return FT_Err_Ok;
+}
+
+unsigned long file_read(u32 fd, unsigned long offset, unsigned char* buffer, unsigned long count)
+{
+    FT_StreamRec s{};
+    s.descriptor.value = static_cast<long>(fd);
+    return file_stream_io(&s, offset, buffer, count);
+}
+
+void file_close(u32 fd)
+{
+    FT_StreamRec s{};
+    s.descriptor.value = static_cast<long>(fd);
+    file_stream_close(&s);
+}
+
+// ------------------------------------------------------------------------------------------------- Sony's sfnt
+// Sony's sfnt_load_face (libfreetype 0x3f9c0): when the library's debug_hooks[3] has 0x01000000 (libfontFT's
+// FTManager_SetFontOpenMode, CELL_FONT_OPEN_MODE_IGNORE_VERTICAL_METRICS), a face whose vhea loads gets the face flag
+// 0x01000000 and its vmtx is not loaded (no vertical metrics, no FT_FACE_FLAG_VERTICAL). pspocket's FreeType is
+// FreeType 2.2.1 as it is: the sfnt module's interface is wrapped instead (its class replaced by a copy pointing to
+// the wrapped interface), the flag read from the guest's FT_LibraryRec, where libfontFT writes it.
+
+namespace {
+
+constexpr FT_Long kIgnoreVerticalMetrics = 0x01000000;
+
+SFNT_Interface g_sfnt{};
+FT_Module_Class g_sfnt_class{};
+TT_Load_Metrics_Func g_load_hhea = nullptr, g_load_hmtx = nullptr;
+
+bool ignores_vertical_metrics(TT_Face face)
+{
+    if (!t_cur.ctx || !face->root.driver) return false;
+    const u32 g = guest_of(face->root.driver->root.library);
+    return g && (rd32(g + lay::lib_debug_hooks + 12) & kIgnoreVerticalMetrics);
+}
+
+FT_Error sony_load_hhea(TT_Face face, FT_Stream stream, FT_Bool vertical)
+{
+    const FT_Error e = g_load_hhea(face, stream, vertical);
+    if (!e && vertical && ignores_vertical_metrics(face)) face->root.face_flags |= kIgnoreVerticalMetrics;
+    return e;
+}
+
+FT_Error sony_load_hmtx(TT_Face face, FT_Stream stream, FT_Bool vertical)
+{
+    // missing as far as sfnt_load_face cares: vertical_info stays 0 and the load goes on
+    if (vertical && (face->root.face_flags & kIgnoreVerticalMetrics)) return FT_Err_Table_Missing;
+    return g_load_hmtx(face, stream, vertical);
+}
+
+} // namespace
+
+void patch_sfnt(FT_Library library)
+{
+    FT_Module m = FT_Get_Module(library, "sfnt");
+    if (!m || m->clazz == &g_sfnt_class) return;
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        g_sfnt_class = *m->clazz;
+        g_sfnt = *static_cast<const SFNT_Interface*>(m->clazz->module_interface);
+        g_load_hhea = g_sfnt.load_hhea;
+        g_load_hmtx = g_sfnt.load_hmtx;
+        g_sfnt.load_hhea = sony_load_hhea;
+        g_sfnt.load_hmtx = sony_load_hmtx;
+        g_sfnt_class.module_interface = &g_sfnt;
+    });
+    m->clazz = &g_sfnt_class;
 }
 
 } // namespace pspocket::hle::ftb

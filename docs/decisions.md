@@ -6702,3 +6702,49 @@ needed for a game that imports cell_FreeType2.
 - **The firmware's modules.** libfontFT imports internals of libfreetype (FT_GlyphLoader_*, FT_Stream_*) that are not
   in the count; the loader keeps choosing libfreetype.sprx for libfontFT while libfontFT runs as Sony's (D-175), unless
   the game imports cell_FreeType2 itself, which now binds that library to the host: cellFontFT is next (D-526).
+
+## D-526 · 2026-10-09 · cellFontFT and cellFont pspocket's own (part 1: cellFontFT, libfontFT over pspocket's FreeType)
+
+Sony's libfontFT.sprx is the font library of libfont's FreeType type. cellFontInitLibraryFreeType hands libfont a
+CellFontLibrary that is libfontFT's own static record (type 0xCFF00002, version 0x02020100 from FreeType's, a lock word
+counting its users, a table of 34 functions libfont calls for everything it does with a font, the memory interface it
+was given, a manager of one FT_Library); the FTManager_*, FTFaceH_* and FTCacheStream_* exports are the layer under
+that table. All 43 functions of the count, the table and the callbacks libfontFT hands out now run natively
+(runtime/hle/src/cellFontFT.cpp); libfont runs over it as Sony's until part 2.
+
+- **On pspocket's cell_FreeType2, through its guest API.** libfontFT is C over libfreetype's API; pspocket's calls
+  pspocket's cell_FreeType2 (D-525) the same way, with its records in guest memory in Sony's layout, allocated with
+  the same FT_Alloc/FT_Free calls: the library record and the shared library record, face handles (256 bytes: the
+  FT_Face, its FT_Open_Args, scale, DPI, effect weight and slant, the last code and composite codes, the last metrics),
+  renderers (128 bytes: buffer, image place, sizes), cache streams (an FT_StreamRec, then owner, cache, block index,
+  the file's own read, the lock interface). FreeType's objects are read where libfontFT reads them, in the guest
+  mirrors (face, size, glyph slot, outline); where it reaches into FreeType's internals the host's objects are used:
+  the slot's glyph loader (FT_GlyphLoader_Reset/CheckPoints/CheckSubGlyphs for cellFontAdjustGlyphExpandBuffer and
+  its counts), the face's transform flags (cleared after an image, as libfontFT does instead of FT_Set_Transform),
+  TrueType's maximum profile. libfont's own functions libfontFT imports (cellFontStatic, cellFontsetUSleep,
+  cellFontGetRevisionFlags, cellFontControl) are host imports (D-197): the firmware's libfont's while it runs as it is.
+- **Sony's arithmetic.** The getters' and the layouts' 32/64-bit steps (truncating shifts, sign and zero extensions:
+  the em scale is used zero-extended, as libfontFT's lwz leaves it), the render buffer's sizing (bounding box, weight's
+  widening, slant's lean, 4-byte rows, the margins), the vertical-writing shifts (the shift type's three fields), the
+  glyph image's adjustments (em-box vertical metrics, weight, slant; composite codes' union) and the vertexes-glyph
+  renderer's single-precision float steps, with fused multiply-adds only where Sony's code has fmadds/fmsubs (the file
+  is compiled without contraction) and the weight's clamp constants bit for bit ((0.93f - 1) * 65536 and
+  (1.04f - 1) * 65536). The file cache's 8 KB slots, round robin and eviction as libfontFT's cached read does them.
+- **Sony's change to FreeType.** CELL_FONT_OPEN_MODE_IGNORE_VERTICAL_METRICS: libfontFT writes 0x01000000 into the
+  FT_Library's debug_hooks[3], and Sony's sfnt_load_face then skips a face's vmtx after its vhea and sets face flag
+  0x01000000 (no FT_FACE_FLAG_VERTICAL). pspocket's FreeType 2.2.1 stays as it is: the sfnt module's interface is
+  wrapped (its class replaced by a copy, freetype_bridge.cpp patch_sfnt) and the flag read from the guest's record.
+- **Compared** in tests/hle/test_fontft_compare.cpp with Sony's libfontFT and libfreetype, both under Sony's libfont
+  (the harness now runs a mix of the firmware's modules and pspocket's, linking host imports as the loader does): the
+  FT layer called directly (managers and the shared library, memory, file and stream faces, every getter over three
+  scales and twenty effect settings, metrics, images at three subpixel positions with effects and composite codes,
+  kerning, a cache stream through six slots with its eviction, the open mode, closing) and libfont's API over it
+  (libraries, fontsets, file and memory fonts, layouts, metrics and kerning, renderers with scissors and a small
+  buffer, character images in all three directions, generated outlines with their environments and vertexes images
+  in four styles, the open mode, closing, ending): 1,003 observations, the same (answers, metrics, image places and
+  pixels, outline points).
+- **Refused where Sony's would read through a null pointer**: closing a null face handle, an effect weight on a handle
+  without a face, an image without a CellFontImageTransInfo (logged). An empty font file opened through the cache
+  passes no stream where Sony's passes an unset one; the vertical glyph environment's shift words are 0 where Sony's
+  reads them unset (shift type 0). libfontFT's unnamed exports that no game imports (other renderer and buffer entry
+  points) are internal functions only.
