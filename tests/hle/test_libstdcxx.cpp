@@ -958,8 +958,8 @@ TEST_CASE("sys_libstdcxx: basic_filebuf over sys_libc's FILEs, _Fiopen", "[hle][
         CHECK(t.call("_ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi", kStr, 0x4 /*ate alone*/, 0) == 0);
         const u32 fp = static_cast<u32>(t.call("_ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi", kStr, 0x2, 0));
         REQUIRE(fp != 0);
-        // _Noreplace on an existing file fails.
-        CHECK(t.call("_ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi", kStr, 0x82, 0) == 0);
+        // _Noreplace on an existing file fails (the SDK tests it when the mode reads too).
+        CHECK(t.call("_ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi", kStr, 0x83, 0) == 0);
         const u32 fb = kObj;
         std::memset(b + fb, 0, 84);
         ps_write32(b, fb, vt);

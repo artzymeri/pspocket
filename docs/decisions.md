@@ -7259,3 +7259,97 @@ cellSysutilPacket.cpp, cellSysutilWebBrowser.cpp, cellSysutilSystem.cpp, sysutil
   sysPrxForUser.cpp (0xB5D5F64E), sysutil_misc.cpp (the browser's RPCS3 functions gone; the AV chat's media),
   cellSaveData.cpp (its block in g_savedata_context), test_hle.cpp (the RPCS3 stub test takes any stub still left) and
   test_sysutil_misc.cpp (the browser's expectations).
+
+## D-560 · 2026-10-09 · sys_libstdcxx pspocket's own, part 1: the foundation and the streams
+
+sys_libstdcxx is the SDK's C++ library, which a game links into itself (no firmware module has it, D-500); RPCS3 only
+names its 556 exports. This part makes 295 of them pspocket's native code (runtime/hle/src/stdcxx.hpp, stdcxx_core.hpp,
+stdcxx_locale.hpp, stdcxx_ios.hpp, registered in stdcxx_streams.cpp): operator new/delete in every form, the exception
+classes, terminate/unexpected and the handlers' setters, _Debug_message, _Mutex, the strings' out-of-line members, the
+locale (locale, _Locimp, facet, id, _Locinfo, use_facet, the lazy facets), ios_base with Init and _Winit, basic_ios,
+basic_streambuf, basic_filebuf and _Fiopen, the istream/ostream/iostream destructors and thunks, strstreambuf and its
+three streams, the stream buffer iterators and the manipulators. The facets are the other part's (D-561).
+
+**What the library is.** Dinkumware's library of VC8's generation ("Copyright (c) 1992-2003 by P.J. Plauger") built
+by ppu-lv2-gcc. Its export list is the no-exception configuration: exception::_Raise calls the raise handler, the
+object's virtual _Doraise, then _Throw, which prints "exception: <what()>" on stderr and aborts. pspocket does that
+(sys_libc's abort ends the process); an exception cannot be thrown into guest code, and the library has nothing to
+throw it with. Read for its layouts in a game that links it (Assassin's Creed's executable, its RTTI names leading to
+type_info, vtables and code; nothing of it in the repository, D-046):
+- Itanium ABI as GCC builds it for lv2: ILP32 on 64-bit registers, big-endian; a vtable's entries are 4-byte pointers
+  to function descriptors, offset-to-top and type_info before the address point, a class with a virtual base has its
+  virtual base offset before those, and its basic_ios-in-X group has the destructor's vcall offset at -12 (what the
+  `_ZTv0_n12_` thunks read). An aggregate result (locale, pos_type, _Cvtvec, _Smanip) goes through r3 with `this` in
+  r4; pos_type as an argument is three doublewords.
+- Objects: exception, bad_alloc, bad_cast {vptr}; logic_error and runtime_error kinds {vptr, string} (32 bytes);
+  their vtables [~D1, ~D0, what, _Doraise]. string: 28 bytes, the allocator's byte, _Bx (16), _Mysize (+20), _Myres
+  (+24); VC8's _Copy (round up to _ALLOC_MASK 15 for char and 3 for wchar_t, half again when larger), _Grow, _Tidy.
+  _Mutex {40-byte block from operator new made a lock by the C library's _Mtxinit}. locale {_Locimp *}; facet {vptr,
+  _Refs}; _Locimp 52 bytes {facet, _Facetvec (malloc, at least 40 entries), _Facetcount, _Catmask, _Xparent, string
+  _Name}; _Locinfo 144 bytes {its lock's kind, the "C" locale's 21 time-name pointers (Dinkumware's _Tinfo), string
+  _Oldlocname, string _Newlocname}; _Ctypevec {_Ctype, _Tolotab, _Touptab, 0}, _Cvtvec {_Getpmbstate(),
+  _Getpwcstate()}, _Collvec {_Getpcostate(), _Getpwcostate()}. ios_base 40 bytes {vptr, _Stdstr, _Mystate, _Except,
+  _Fmtfl, _Prec, _Wide, _Arr, _Calls, locale *_Ploc}; basic_ios adds the stream buffer, the tie and the fill (52).
+  basic_streambuf 60 bytes with Dinkumware's end pointers (egptr() is *_IGend, not VC8's counts) and a locale *;
+  basic_filebuf adds {_Pcvt, _Mychar, _Wrotesome, _State (8), _Closef, _Myfile}: 84 bytes for char, 88 for wchar_t.
+  pos_type 24 bytes {streamoff, fpos_t {long, _Mbstatet} (12), _Mbstatet}. istream {vptr, _Chcount, basic_ios} 60,
+  ostream 56, iostream 64, istrstream 144, ostrstream 140, strstream 148; strstreambuf VC8's 84 bytes (the game read
+  has no strstream to compare with).
+- Vtables pspocket makes, in the SDK's slot order with its own descriptors (a call whose descriptor is pspocket's runs
+  natively, any other through call_guest): the exception classes, facet, _Locimp, ios_base, basic_ios, the stream
+  buffers [~D1, ~D0, _Lock, _Unlock, overflow, pbackfail, showmanyc, underflow, uflow, xsgetn, xsputn, seekoff,
+  seekpos, setbuf, sync, imbue] and the streams with their thunk groups. type_info objects have GCC's shapes
+  (class, si, vmi with the virtual base's flags) with a null vptr: typeid's name works, dynamic_cast on these objects
+  does not (pspocket has no libsupc++ type_info classes).
+
+**Choices the SDK's code shows.** operator new is malloc with the new handler, then bad_alloc (sys_libc's malloc and
+memalign here; Sony's aligned forms memalign's); exception::what() answers ""; bad_alloc's and bad_cast's what are
+their own. The global locale is a thread-local pointer: each thread's first locale::_Init makes a "C" _Locimp for it
+and makes that the classic one (_Clocptr and classic()'s object), as the SDK's does. The C++ library has its own
+setlocale, which knows "C" only (a name or a query): `locale("")` is a bad locale name. _Addcats with categories asks
+for the whole locale by the name afterwards, so a bad name is "*" whatever the categories. _Getfacet looks in the global
+locale for a transparent one; _Locimp's copy of the classic locale makes every standard facet (_Makeloc); _Register
+takes no lock and registers _Fac_tidy with _Atexit. ios_base::_Init leaves _Stdstr alone; _Findarr of a negative index
+sets badbit and answers a static stub element; _Addstd takes slots 1 to 8. _Fiopen tests _Noreplace with VC8's
+`mode & (out || app)`, that is `mode & in`.
+
+**The streams over sys_libc.** basic_filebuf works on sys_libc's FILEs through its functions (fgetc/fputc/ungetc or
+the wide forms, fwrite, fflush, setvbuf, fseek, ftell, _Lockfilelock); it does not share the FILE's buffer pointers
+as Dinkumware's char filebuf may (sys_libc's FILE keeps none, D-514), so every element goes through the virtual
+functions. seekoff and seekpos take positions from ftell (the SDK's fpos_t is 12 bytes {long, _Mbstatet}; sys_libc's
+fgetpos writes D-514's 16-byte one, so it is not used). ios_base::Init and _Winit make cin, cout, cerr, clog and the
+wide ones as the SDK does (filebufs over _Stdin/_Stdout/_Stderr, cin and cerr and clog tied to cout, cerr unit-buffered)
+in host variables of sys_libstdcxx under their mangled names (8 variables; `--hle-list` lists them with the
+functions); the last ~Init flushes. Base-object constructors and destructors given a VTT (ostrstream/strstream C2,
+the D2s) construct or destroy the members and leave the vptrs to the derived class: nothing virtual runs in them.
+
+**Calls to the facets part (D-561), by mangled name through the registry.** A missing one is logged with its name and
+raises bad_cast, as use_facet does when it cannot make a facet:
+- `F::_Getcat(const locale::facet **)` for the 26 standard facet types (ctype, num_get, num_put, numpunct, collate,
+  messages, money_get, money_put, moneypunct<false/true>, time_get, time_put, codecvt; char and wchar_t), including the
+  five the export list doesn't name (numpunct<char>, num_get<char>, num_put<char>, codecvt<char,char,_Mbstatet>,
+  ctype<char>'s is named): with a null pointer it answers the facet's category (_X_CTYPE...), with a pointer to null
+  it stores `new F(_Locinfo("C"))` with a count of 0. _Makeloc and use_facet make facets this way ("C" being the
+  only locale, the facet is the one `new F(lobj)` would give).
+- `F::id`: when that part exports `_ZNSt<type>2idE` as a variable, the locale uses it; otherwise this part keeps an id
+  object per type. The ids themselves are this part's locale::id::operator size_t.
+- ctype's do_widen(char) (slot 6 for char, 10 for wchar_t: basic_ios::init's fill) and codecvt's do_always_noconv
+  (2), do_in (5), do_out (6), do_unshift (7) through the facets' vtables (basic_filebuf).
+
+**Left out.** dynamic_cast across pspocket's objects (null type_info vptrs); a game that replaces operator new or
+malloc is not seen by this library (its strings use pspocket's operator new); _Debug_message's text is "<file>:
+<message>" (the SDK's format is not in the game read).
+
+Surprises: the game read was built with exceptions on and a 16-bit wchar_t (-fshort-wchar: its filebuf<wchar_t> is
+84 bytes, its wstring buffer 8 elements), so its wide layouts are not the SDK's default; pspocket keeps the 32-bit
+wchar_t of sys_libc (D-512). Its exception classes have no _Doraise slot; pspocket's have one (the export list has
+_Doraise for every class), which code built for either never calls past what.
+
+Tests: tests/hle/test_libstdcxx.cpp, 23 cases, 1,025 checks: every function registered; vtables and type_info as
+laid out; new/delete and the new handler; _Raise, _Throw, terminate and _Debug_message ending the program with their
+text; the strings' capacities (VC8's growth) and members for char and wchar_t; _Mutex; the locale's counts, copy on
+write, transparent locales, ids, lazy facets, the global locale per thread, _Locinfo; ios_base's format, arrays,
+callbacks, copyfmt, imbue, _Addstd and failure; stream buffers through their vtables with guest overrides;
+strstreambuf dynamic and static; basic_filebuf and _Fiopen on host files; cout and wcout to the TTY; ostrstream and
+strstream destroyed through their thunks; the manipulators. Guest facets stand in for the other part's where a stream
+needs one; named locales wait for that part (skipped without it).

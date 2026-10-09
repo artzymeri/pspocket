@@ -473,12 +473,14 @@ inline void ios_setstate(PPUContext& ctx, u32 self, u32 bits)
     ios_clear(ctx, self, g.r32(self + kIosState) | bits, false);
 }
 
-// _Init(): the default format (skipws | dec, precision 6, width 0), no state, a new locale (the global one).
+// _Init(): a new locale (the global one), the default format (skipws | dec, precision 6, width 0), no arrays or
+// callbacks, no state. _Stdstr is left as it is (the SDK's; basic_ios::init sets it).
 inline void ios_init(PPUContext& ctx, u32 self)
 {
     G g(ctx);
-    g.w32(self + kIosPloc, 0);
-    g.w32(self + kIosStdstr, 0);
+    const u32 loc = op_new(ctx, 4);
+    locale_default(ctx, loc);
+    g.w32(self + kIosPloc, loc);
     g.w32(self + kIosExcept, kGoodbit);
     g.w32(self + kIosFmtfl, kSkipws | kDec);
     g.w32(self + kIosPrec, 6);
@@ -486,9 +488,6 @@ inline void ios_init(PPUContext& ctx, u32 self)
     g.w32(self + kIosArr, 0);
     g.w32(self + kIosCalls, 0);
     ios_clear(ctx, self, kGoodbit, false);
-    const u32 loc = op_new(ctx, 4);
-    locale_default(ctx, loc);
-    g.w32(self + kIosPloc, loc);
 }
 
 void ios_init_(PPUContext& ctx, u32 self)
@@ -525,10 +524,15 @@ void ios_register_callback_(PPUContext& ctx, u32 self, u32 fn, s32 index)
     g.w32(self + kIosCalls, node);
 }
 
-// _Findarr(int): the element for the index (or a recycled empty one, or a new one in front).
+// _Findarr(int): the element for the index (or a recycled empty one, or a new one in front); for a negative index,
+// badbit and the library's stub element.
 inline u32 ios_findarr(PPUContext& ctx, u32 self, s32 index)
 {
     G g(ctx);
+    if (index < 0) {
+        ios_setstate(ctx, self, kBadbit);
+        return static_object("ios_base::_Findarr _Stub", 16);
+    }
     u32 q = 0;
     for (u32 p = g.r32(self + kIosArr); p; p = g.r32(p)) {
         if (!g.need("ios_base::_Findarr", p, 16)) return 0;
@@ -1091,7 +1095,7 @@ u32 filebuf_endwrite_(PPUContext& ctx, u32 self)
 }
 
 // _Fiopen(const char *, openmode, int): the mode checked against the valid combinations and opened with fopen;
-// _Noreplace fails on an existing file, ate seeks to the end.
+// _Noreplace fails on an existing file (when reading too, as the SDK's), ate seeks to the end.
 inline u32 fiopen(PPUContext& ctx, u32 path, u32 mode)
 {
     static constexpr std::pair<u32, std::string_view> kValid[] = {{kIn, "r"}, {kOut, "w"}, {kOut | kTrunc, "w"},
@@ -1104,7 +1108,8 @@ inline u32 fiopen(PPUContext& ctx, u32 path, u32 mode)
     mode &= ~(kAte | kNocreate | kNoreplace);
     const auto it = std::find_if(std::begin(kValid), std::end(kValid), [&](const auto& v) { return v.first == mode; });
     if (it == std::end(kValid)) return 0;
-    if (norep && (mode & (kOut | kApp))) {
+    // _Noreplace: the SDK tests `mode & (out || app)`, which is `mode & in`; so does this library.
+    if (norep && (mode & kIn)) {
         if (const u32 fp = static_cast<u32>(libc_fn::fopen(ctx, {path, cstring(ctx, "r")}))) {
             libc_fn::fclose(ctx, {fp});
             return 0;
