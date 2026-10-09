@@ -7821,3 +7821,27 @@ cellPngEnc (D-566). Its findings, fixed:
 The [fiber], [libmixer], [libc] and [pngenc] tests run clean under it. A race does not show up in an ordinary build, so
 this build is their regression check: `CC=clang CXX=clang++ cmake -S . -B build/tsan -G Ninja -DPSPOCKET_TSAN=ON`,
 `ninja -C build/tsan tests/hle/test_hle`, then `build/tsan/tests/hle/test_hle "[fiber],[libmixer],[libc],[pngenc]"`.
+
+## D-572 · 2026-10-09 · sys_libc's setjmp and longjmp, over the engine's non-local jump
+
+The C library's setjmp and longjmp, under sys_libc and sys_libm as the rest (D-510). D-516 left them as an engine
+question; the engine has the answer since D-161 and D-213, for a game's own longjmp in translated code. Without them a
+game that imports setjmp (libpng's and libjpeg's error handling, Lua's errors) got the unimplemented answer, a
+non-zero r3, which setjmp's caller takes for a longjmp having come back.
+- int setjmp(jmp_buf env) saves the registers a call keeps, the ones Sony's setjmp saves (read in Assassin's Creed's
+  own copy for D-161): r1, r2, LR (the return address into the caller), CR (packed as mfcr reads it), r13-r31,
+  f14-f31 and v20-v31 (in guest byte order, as stvx stores them, D-004), and answers 0. Where each goes in the buffer is
+  pspocket's (a jmp_buf is opaque to the game): 520 bytes, which Sony's buffer holds, as it keeps the same registers.
+  Translated code spills every register it wrote before a call, so the context holds them at the call.
+- void longjmp(jmp_buf env, int val) restores them, sets r3 to val (1 for 0) and makes the jump as the lifter's marker
+  does: lv2::non_local_jump (new) goes to the thread's innermost run_guest with _longjmp, which resumes at LR, in the
+  landing's continuation or interpreted (D-255; the interpreter learns HLE landings as any other). Between longjmp and
+  run_guest are only translated or interpreted frames, the HLE stub's and thunk's, which own nothing, and longjmp's,
+  which owns nothing when it jumps.
+- A buffer that names no running frame of that guest code is fatal (rule 5): r1 below the caller's (setjmp's caller
+  returned), above where the innermost run_guest began (guest code that called host code, which cannot be resumed:
+  lv2::innermost_guest_entry_sp, new), misaligned, or no LR. setjmp on memory that is not the guest's logs and saves
+  nothing.
+Test: tests/hle/test_setjmp.cpp (guest code sets its registers and CR, calls setjmp, changes them all and longjmps from
+two frames down: setjmp answers again with the value, 1 for 0, -7 as -7, at the same r1, with the registers and CR as
+they were; the vector registers in the buffer in guest order and restored from it; a thousand longjmps to one setjmp).

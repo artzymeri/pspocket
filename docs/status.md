@@ -309,7 +309,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-09: 5,641 of 6,625, 85.1%):
+firmware module. Done so far (2026-10-09: 5,645 of 6,625, 85.2%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -327,7 +327,7 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
 - **The C++ library, sys_libstdcxx, all 556 functions**: the foundation and the streams (D-560) and the facets (D-561:
   ctype, codecvt, collate, messages, numpunct, num_get/num_put, moneypunct, money_get/money_put, time_get/time_put),
   Dinkumware's of VC8's generation in the "C" locale. No Sony module to compare with (games link it into themselves).
-  The C library's thread-local storage too (D-570).
+  The C library's thread-local storage (D-570) and setjmp/longjmp (D-572) too.
 - **Firmware first (D-563)**: libraries made from RPCS3 without Sony's module at hand are marked so that a game still
   gets Sony's module where the system software is installed, and pspocket's where it is not, until each is compared on
   the Mac: libmixer (the surround mixer over pspocket's cellAudio), cellVpost (D-564: YUV pictures scaled and converted
@@ -335,7 +335,9 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   cellFiber (D-568: fibers and contexts, each on a host thread that runs as its PPU thread while it holds the
   thread's baton).
 - cellGame's and cellPhotoImportUtil's working structures as their variables under RPCS3's names (D-567).
-Left (984, 2026-10-09). What each part needs (a session without the firmware could not make these faithfully):
+- The threaded libraries checked for data races in a ThreadSanitizer build (D-571, -DPSPOCKET_TSAN=ON): cellFiber,
+  libmixer, the C library's threads, cellPngEnc.
+Left (980, 2026-10-09). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSpursJq (63, libspurs_jq), cellSailRec (58)
   and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (31, its wire protocol), the codec
   cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec, libdivx*, libvdec's 9, and the audio cores'
@@ -346,9 +348,9 @@ Left (984, 2026-10-09). What each part needs (a session without the firmware cou
   module management's six).
 - The 188 functions answered as RPCS3's stubs, in libraries pspocket always serves: their arguments and answers from
   the libraries' modules.
-- sys_libc and sys_libm's internals (264: Dinkumware's formatter, scanner and locale internals, setjmp/longjmp, the
-  SPU printf helpers' read and write families): no firmware module has them; their arguments are to be read in a
-  game's own copy of the C library.
+- sys_libc and sys_libm's internals (260: Dinkumware's formatter, scanner and locale internals, the SPU printf
+  helpers' read and write families): no firmware module has them; their arguments are to be read in a game's own copy
+  of the C library.
 - To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
   cellFiber.
 Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,

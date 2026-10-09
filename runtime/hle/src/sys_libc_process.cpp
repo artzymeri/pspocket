@@ -12,6 +12,8 @@
 //   The variables _Mutex_attr and tls_mutex_attr: a sys_mutex_attribute_t for a recursive, priority-ordered mutex.
 // - Thread-local storage (D-570): Dinkumware's _Tlsalloc/_Tlsfree/_Tlsset/_Tlsget/_Destroytls and the Win32 names
 //   TlsGetValue/TlsSetValue over the same keys.
+// - setjmp and longjmp (D-572): the registers a call keeps, in the game's jmp_buf; longjmp goes back the way a longjmp
+//   in translated code does (D-161, D-213).
 // - SPU printf (the protocol of Sony's SDK: an SPU's spu_printf sends a user event on SPU port 1 whose data is the LS
 //   address of its arguments, then waits in its inbound mailbox for printf's result): spu_printf_initialize makes the
 //   event queue and the server thread (an lv2 thread running this library's server) and registers the attach and
@@ -24,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <format>
 #include <functional>
@@ -331,6 +334,76 @@ void _Destroytls_(PPUContext& ctx)
     }
     std::lock_guard lock(t.mutex);
     t.values.erase(id);
+}
+
+// ------------------------------------------------------------------------------------------------- setjmp, longjmp
+
+// The registers a call keeps (the PPC64 ELF ABI's non-volatile ones), the ones Sony's setjmp saves too (the game's own
+// copy, read for D-161: r1, r2, r13-r31, LR, CR, the FPRs and the VRs). Where they go in the buffer is pspocket's (a
+// jmp_buf is opaque to the game): 520 bytes, which Sony's buffer holds, as it keeps the same registers.
+constexpr u32 kJbR1 = 0x00, kJbR2 = 0x08, kJbLr = 0x10, kJbCr = 0x18, kJbGpr = 0x20, kJbFpr = 0xB8, kJbVr = 0x148,
+              kJbSize = 0x208;
+constexpr u32 kJbFirstGpr = 13, kJbFirstFpr = 14, kJbFirstVr = 20;
+static_assert(kJbGpr + 8 * (32 - kJbFirstGpr) == kJbFpr && kJbFpr + 8 * (32 - kJbFirstFpr) == kJbVr &&
+              kJbVr + 16 * (32 - kJbFirstVr) == kJbSize);
+
+// int setjmp(jmp_buf env): the caller's registers as they are at the call (its r1 and TOC, the return address in LR)
+// go into env; 0. A longjmp on env makes this call return again.
+s32 setjmp_(PPUContext& ctx, u32 env)
+{
+    u8* b = gb(ctx);
+    if (!guest_readable(thread_of(ctx), env, kJbSize)) {
+        log_call_site(ctx, b, std::format("setjmp({:#x}): not guest memory, nothing saved", env));
+        return 0;
+    }
+    u32 cr = 0; // as mfcr reads it: the context keeps a byte per bit, IBM bit 0 the word's most significant
+    for (u32 i = 0; i < 32; i++) cr |= u32{ctx.cr[i]} << (31 - i);
+    ps_write64(b, env + kJbR1, ctx.gpr[1]);
+    ps_write64(b, env + kJbR2, ctx.gpr[2]);
+    ps_write64(b, env + kJbLr, ctx.lr);
+    ps_write64(b, env + kJbCr, cr);
+    for (u32 r = kJbFirstGpr; r < 32; r++) ps_write64(b, env + kJbGpr + 8 * (r - kJbFirstGpr), ctx.gpr[r]);
+    for (u32 r = kJbFirstFpr; r < 32; r++)
+        ps_write64(b, env + kJbFpr + 8 * (r - kJbFirstFpr), std::bit_cast<u64>(ctx.fpr[r]));
+    for (u32 r = kJbFirstVr; r < 32; r++) { // in guest byte order, as stvx stores (D-004)
+        for (u32 i = 0; i < 16; i++) ps_write8(b, env + kJbVr + 16 * (r - kJbFirstVr) + i, ctx.vr[r].u8[15 - i]);
+    }
+    return 0;
+}
+
+// void longjmp(jmp_buf env, int val): back to the setjmp that filled env, with the registers it saved, its call now
+// answering val (1 for 0); the frames between are left behind. It goes on as a longjmp in translated code does (D-161,
+// D-213): the thread's innermost run_guest resumes at the landing, in its continuation or interpreted (D-255). A
+// buffer that names no live frame of that guest code is fatal: there is nothing right to go on with.
+void longjmp_(PPUContext& ctx, u32 env, s32 val)
+{
+    u8* b = gb(ctx);
+    if (!guest_readable(thread_of(ctx), env, kJbSize)) {
+        PS_FATAL(kChan, "longjmp({:#x}, {}) from {:#010x}: not guest memory", env, val, static_cast<u32>(ctx.lr) - 4);
+    }
+    const u64 r1 = ps_read64(b, env + kJbR1), lr = ps_read64(b, env + kJbLr);
+    // setjmp's caller is still running: its frame at or above this caller's (the stack grows down), and below where the
+    // guest code the innermost run_guest runs began (above it are host frames, which cannot be resumed).
+    const u64 entry_sp = lv2::innermost_guest_entry_sp();
+    if (r1 < ctx.gpr[1] || r1 > entry_sp || (r1 & 15) || !lr || (lr & 3) || lr > 0xFFFFFFFFu) {
+        PS_FATAL(kChan,
+            "longjmp({:#x}, {}) from {:#010x}: no setjmp of a running frame (r1 {:#x}, LR {:#x}; the caller's r1 {:#x}, "
+            "the guest code's from {:#x})",
+            env, val, static_cast<u32>(ctx.lr) - 4, r1, lr, ctx.gpr[1], entry_sp);
+    }
+    const u32 cr = static_cast<u32>(ps_read64(b, env + kJbCr));
+    for (u32 i = 0; i < 32; i++) ctx.cr[i] = static_cast<u8>((cr >> (31 - i)) & 1);
+    ctx.gpr[1] = r1;
+    ctx.gpr[2] = ps_read64(b, env + kJbR2);
+    ctx.lr = lr;
+    for (u32 r = kJbFirstGpr; r < 32; r++) ctx.gpr[r] = ps_read64(b, env + kJbGpr + 8 * (r - kJbFirstGpr));
+    for (u32 r = kJbFirstFpr; r < 32; r++)
+        ctx.fpr[r] = std::bit_cast<double>(ps_read64(b, env + kJbFpr + 8 * (r - kJbFirstFpr)));
+    for (u32 r = kJbFirstVr; r < 32; r++) {
+        for (u32 i = 0; i < 16; i++) ctx.vr[r].u8[15 - i] = ps_read8(b, env + kJbVr + 16 * (r - kJbFirstVr) + i);
+    }
+    ctx.gpr[3] = static_cast<u64>(static_cast<s64>(val ? val : 1));
+    lv2::non_local_jump(); // this frame, the thunk's and the stub's hold nothing to destroy
 }
 
 // sys_mutex_attribute_t: protocol SYS_SYNC_PRIORITY, SYS_SYNC_RECURSIVE, not process-shared, not adaptive, its name.
@@ -782,7 +855,7 @@ void register_sys_libc_process(Registry& r)
             LIBC(spu_printf_finalize), LIBC(spu_printf_attach_group), LIBC(spu_printf_detach_group),
             LIBC(spu_printf_attach_thread), LIBC(spu_printf_detach_thread), LIBC(_Printf), LIBC(_WPrintf),
             LIBC(_Scanf), LIBC(_WScanf), LIBC(_Tlsalloc), LIBC(_Tlsfree), LIBC(_Tlsset), LIBC(_Tlsget),
-            LIBC(TlsGetValue), LIBC(TlsSetValue), LIBC(_Destroytls),
+            LIBC(TlsGetValue), LIBC(TlsSetValue), LIBC(_Destroytls), LIBC(setjmp), LIBC(longjmp),
         });
     }
     // The server's body and the callbacks liblv2's sys_spu_printf_attach_* call: internal (linked when the game

@@ -23,6 +23,7 @@ namespace pspocket::lv2 {
 struct NonLocalTarget {
     jmp_buf buf;
     NonLocalTarget* outer = nullptr;
+    u64 entry_sp = 0; // r1 when run_guest was entered (innermost_guest_entry_sp)
 };
 thread_local NonLocalTarget* t_nonlocal = nullptr;
 
@@ -863,6 +864,14 @@ void Kernel::syscall(PPUContext& ctx)
     ctx.gpr[3] = to_r3(err(CELL_ENOSYS));
 }
 
+void non_local_jump()
+{
+    if (t_nonlocal) _longjmp(t_nonlocal->buf, 1); // D-213: the caller promises nothing to destroy on the way
+    throw NonLocalJump{};
+}
+
+u64 innermost_guest_entry_sp() { return t_nonlocal ? t_nonlocal->entry_sp : 0; }
+
 void default_executor(void*, PPUContext& ctx, u8* base, u32 entry) { ps_ppu_call_indirect(&ctx, base, entry); }
 
 void run_guest(Kernel& k, PPUContext& ctx, u8* base, u32 entry, bool thread_top)
@@ -872,6 +881,7 @@ void run_guest(Kernel& k, PPUContext& ctx, u8* base, u32 entry, bool thread_top)
     // a C++ exception (ThreadExit) leaves.
     NonLocalTarget target;
     target.outer = t_nonlocal;
+    target.entry_sp = stop_sp;
     t_nonlocal = &target;
     const struct Pop {
         NonLocalTarget* outer;

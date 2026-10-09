@@ -83,6 +83,16 @@ struct ThreadExit {};
 struct NonLocalJump {};
 inline constexpr u32 kNonLocalReturnCia = 0xFFFFFFF0; // recomp/ppu lifter.cpp emits it
 
+// The same jump made by host code: the C library's longjmp (D-572), with the context already holding the registers it
+// restores and LR the landing. It goes to the thread's innermost run_guest as the lifter's does, so the caller and every
+// frame between must hold nothing to destroy: an HLE function's stub and thunk qualify, and the function must not own
+// anything (a lock, a string) when it calls this.
+[[noreturn]] void non_local_jump();
+
+// The r1 the thread's innermost run_guest was entered with, 0 with none. A non-local jump lands in the frames that
+// run_guest runs, at or below it; a landing above is in guest code that called host code, which cannot be resumed.
+u64 innermost_guest_entry_sp();
+
 // Runs the guest function at `entry` on the calling host thread until it returns. `ctx` already holds the entry
 // state: r1 (stack), r2 (TOC), r3.. (arguments), r13 (TLS) and LR = kThreadReturnAddress.
 using Executor = void (*)(void* user, PPUContext& ctx, u8* base, u32 entry);
