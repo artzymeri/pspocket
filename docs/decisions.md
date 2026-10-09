@@ -7364,10 +7364,10 @@ the D2s) construct or destroy the members and leave the vptrs to the derived cla
 raises bad_cast, as use_facet does when it cannot make a facet:
 - `F::_Getcat(const locale::facet **)` for the 26 standard facet types (ctype, num_get, num_put, numpunct, collate,
   messages, money_get, money_put, moneypunct<false/true>, time_get, time_put, codecvt; char and wchar_t), including the
-  five the export list doesn't name (numpunct<char>, num_get<char>, num_put<char>, codecvt<char,char,_Mbstatet>,
-  ctype<char>'s is named): with a null pointer it answers the facet's category (_X_CTYPE...), with a pointer to null
-  it stores `new F(_Locinfo("C"))` with a count of 0. _Makeloc and use_facet make facets this way ("C" being the
-  only locale, the facet is the one `new F(lobj)` would give).
+  four the export list doesn't name (num_get<char>, num_put<char>, numpunct<char>, codecvt<char, char, _Mbstatet>,
+  which that part has to register too, as internal functions): with a null pointer it answers the facet's category
+  (_X_CTYPE...), with a pointer to null it stores `new F(_Locinfo("C"))` with a count of 0. _Makeloc and use_facet
+  make facets this way ("C" being the only locale, the facet is the one `new F(lobj)` would give).
 - `F::id`: when that part exports `_ZNSt<type>2idE` as a variable, the locale uses it; otherwise this part keeps an id
   object per type. The ids themselves are this part's locale::id::operator size_t.
 - ctype's do_widen(char) (slot 6 for char, 10 for wchar_t: basic_ios::init's fill) and codecvt's do_always_noconv
@@ -7382,11 +7382,14 @@ Surprises: the game read was built with exceptions on and a 16-bit wchar_t (-fsh
 wchar_t of sys_libc (D-512). Its exception classes have no _Doraise slot; pspocket's have one (the export list has
 _Doraise for every class), which code built for either never calls past what.
 
-Tests: tests/hle/test_libstdcxx.cpp, 23 cases, 1,025 checks: every function registered; vtables and type_info as
+Tests: tests/hle/test_libstdcxx.cpp, 25 cases, 1,147 checks: every function registered; vtables and type_info as
 laid out; new/delete and the new handler; _Raise, _Throw, terminate and _Debug_message ending the program with their
 text; the strings' capacities (VC8's growth) and members for char and wchar_t; _Mutex; the locale's counts, copy on
 write, transparent locales, ids, lazy facets, the global locale per thread, _Locinfo; ios_base's format, arrays,
 callbacks, copyfmt, imbue, _Addstd and failure; stream buffers through their vtables with guest overrides;
 strstreambuf dynamic and static; basic_filebuf and _Fiopen on host files; cout and wcout to the TTY; ostrstream and
-strstream destroyed through their thunks; the manipulators. Guest facets stand in for the other part's where a stream
-needs one; named locales wait for that part (skipped without it).
+strstream destroyed through their thunks, their base-object forms with a VTT; basic_filebuf<wchar_t> through a guest
+codecvt; the manipulators. Guest facets stand in for the other part's where a stream needs one; named locales wait for
+that part (skipped without it; with a stand-in of that part's _Getcat, not committed, all 25 cases pass). A test
+running the game's own copy was not made: its build differs (exceptions on, a 16-bit wchar_t, malloc the game's own
+allocator, which needs the game's set-up), so it would compare another configuration.
