@@ -606,3 +606,108 @@ TEST_CASE("Run-time modules: the firmware modules a game's PRX needs join, and s
     f.hle->set_module_loader(nullptr);
     fs::remove_all(root);
 }
+
+TEST_CASE("Run-time modules through lv2's PRX calls: load, start in two commands, info, list, stop, unload (D-527)",
+    "[hle][lle][prx]")
+{
+    const fs::path root = fresh_flash("pspocket-test-prx-syscalls");
+    constexpr u32 kMarker = 0x21100;
+    const auto prx = test::build_ppu_prx();
+    std::vector<u8> module = prx_exporting(prx, "synthLib", 0xDEADBEEF);
+    mark_module_start(module, kMarker);
+    fs::create_directories(root / "usrdir");
+    write(root / "usrdir" / "libsynth.sprx", debug_self(module));
+
+    const auto x = test::build_ppu_exec();
+    auto exe = loader::Executable::parse(x.bytes);
+    REQUIRE(exe);
+    hle::test::Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/app_home", (root / "usrdir").string(), true));
+    REQUIRE(loader::load(**exe, *f.kernel, *f.hle) == lv2::CELL_OK);
+    hle::test::GuestThread t(f, 0, "main");
+    u8* base = f.base();
+    const auto sc = [&](u32 number, std::initializer_list<u64> args) {
+        u32 i = 0;
+        for (const u64 a : args) t.ctx.gpr[3 + i++] = a;
+        t.ctx.gpr[11] = number;
+        ps_lv2_syscall(&t.ctx, base);
+        return static_cast<s32>(t.ctx.gpr[3]);
+    };
+    const u32 path = hle::test::kData, opt = hle::test::kData + 0x100, list = hle::test::kData + 0x200,
+              ids = hle::test::kData + 0x240, info = hle::test::kData + 0x300, iopt = hle::test::kData + 0x380,
+              name = hle::test::kData + 0x400;
+    std::memcpy(base + path, "/app_home/libsynth.sprx", 24);
+    std::memcpy(base + name, "synthetic_prx", 14);
+
+    CHECK(sc(480, {path, 0, 0}) == static_cast<s32>(0x80011881)); // no loader in the process yet
+    loader::RuntimeModules modules(*f.hle, *exe, nullptr);
+    f.hle->set_module_loader(&modules);
+    CHECK(sc(480, {path, 2, 0}) == static_cast<s32>(lv2::CELL_EINVAL));
+    CHECK(sc(480, {path, 1, 0}) == static_cast<s32>(lv2::CELL_ENOSYS)); // a fixed address: not an overlay process
+    const s32 id = sc(480, {path, 0, 0});
+    REQUIRE(id > 0);
+    CHECK(sc(496, {name, 0, 0}) == id);
+
+    // Start: command 1 links it and gives module_start; the caller runs it; command 2 hands its result back.
+    std::memset(base + opt, 0, 0x28);
+    ps_write64(base, opt, 0x28);
+    ps_write64(base, opt + 8, 1);
+    CHECK(sc(481, {0, 0, opt}) == static_cast<s32>(lv2::CELL_EINVAL));
+    CHECK(sc(481, {0x23FFFF00, 0, opt}) == static_cast<s32>(lv2::CELL_ESRCH));
+    REQUIRE(sc(481, {static_cast<u32>(id), 0, opt}) == lv2::CELL_OK);
+    const u64 entry = ps_read64(base, opt + 16);
+    CHECK(entry != ~u64{0});
+    CHECK(ps_read64(base, opt + 32) == ~u64{0}); // no prologue
+    const loader::PrxModule* loaded = modules.module(static_cast<u32>(id));
+    REQUIRE(loaded != nullptr);
+    CHECK(ps_read32(base, x.first_stub_slot + 12 * 4) == loaded->functions.at({"synthLib", 0xDEADBEEF}));
+    ps_write64(base, opt + 8, 2);
+    ps_write64(base, opt + 24, 0); // resident
+    CHECK(sc(481, {static_cast<u32>(id), 0, opt}) == lv2::CELL_OK);
+    ps_write64(base, opt + 8, 1);
+    CHECK(sc(481, {static_cast<u32>(id), 0, opt}) == static_cast<s32>(0x80011001)); // already started
+
+    // List (flags bit 1) and info through the option block.
+    std::memset(base + list, 0, 0x20);
+    ps_write64(base, list, 0x20);
+    ps_write32(base, list + 12, 4);
+    ps_write32(base, list + 20, ids);
+    REQUIRE(sc(494, {2, list}) == lv2::CELL_OK);
+    CHECK(ps_read32(base, list + 16) == 1);
+    CHECK(ps_read32(base, ids) == static_cast<u32>(id));
+    std::memset(base + info, 0, 0x58);
+    ps_write64(base, info, 0x48);
+    ps_write64(base, iopt, 0x10);
+    ps_write32(base, iopt + 8, info);
+    REQUIRE(sc(495, {static_cast<u32>(id), 0, iopt}) == lv2::CELL_OK);
+    CHECK(std::string(reinterpret_cast<const char*>(base + info + 8)) == loaded->name);
+    ps_write64(base, iopt, 0x18);
+    CHECK(sc(495, {static_cast<u32>(id), 0, iopt}) == static_cast<s32>(lv2::CELL_EINVAL));
+    CHECK(sc(461, {loaded->segments[0].first + 4}) == id);
+    CHECK(sc(461, {0x00010000}) == static_cast<s32>(0x8001112E));
+
+    // Stop: command 1 gives module_stop, command 2 with 0 stops it; then unload.
+    CHECK(sc(483, {static_cast<u32>(id), 0, 0}) == static_cast<s32>(0x80011138)); // started: not removable
+    ps_write64(base, opt + 8, 1);
+    REQUIRE(sc(482, {static_cast<u32>(id), 0, opt}) == lv2::CELL_OK);
+    ps_write64(base, opt + 8, 2);
+    ps_write64(base, opt + 24, 1);
+    CHECK(sc(482, {static_cast<u32>(id), 0, opt}) == static_cast<s32>(0x80011136)); // can not stop
+    ps_write64(base, opt + 24, 0);
+    REQUIRE(sc(482, {static_cast<u32>(id), 0, opt}) == lv2::CELL_OK);
+    CHECK(sc(483, {static_cast<u32>(id), 0, 0}) == lv2::CELL_OK);
+    CHECK(sc(496, {name, 0, 0}) == static_cast<s32>(0x8001112E));
+
+    // The rest: registration and queries, the debugger's lists (root's), overlays (no ppc_seg).
+    ps_write64(base, opt, 0x30);
+    ps_write64(base, opt + 8, 1);
+    CHECK(sc(484, {name, opt}) == static_cast<s32>(0x80011910));
+    CHECK(sc(484, {name, 0}) == static_cast<s32>(lv2::CELL_EINVAL));
+    CHECK(sc(486, {opt}) == lv2::CELL_OK);
+    CHECK(sc(460, {}) == static_cast<s32>(lv2::CELL_ENOSYS));
+    CHECK(sc(450, {opt, path, 0, opt}) == static_cast<s32>(lv2::CELL_ENOSYS));
+    CHECK(sc(451, {1}) == static_cast<s32>(lv2::CELL_ENOSYS));
+    f.hle->set_module_loader(nullptr);
+    CHECK(f.kernel->module_host() == nullptr);
+    fs::remove_all(root);
+}

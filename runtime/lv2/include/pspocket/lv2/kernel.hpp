@@ -166,6 +166,31 @@ private:
 // The lv2 thread running on the calling host thread, or nullptr.
 PpuThread* current_thread();
 
+// The process's module loader as lv2's PRX calls (460..499) reach it (D-527): the HLE layer gives one with its
+// hle::ModuleLoader (HleProcess::set_module_loader); a kernel without one answers those calls
+// CELL_PRX_ERROR_NO_LIBLV2. IDs and error codes are the loader's.
+class ModuleHost {
+public:
+    virtual ~ModuleHost() = default;
+    // Places and links the module at `path` (`offset` bytes into the file); its ID in *id.
+    virtual u32 load(std::string_view path, u64 offset, u32* id) = 0;
+    // Links its exports and starts the firmware modules loaded for it (on the calling thread `t`); *entry its
+    // module_start descriptor (0: none).
+    virtual u32 start(PpuThread& t, u32 id, u32* entry) = 0;
+    virtual void started(u32 id, s32 result) = 0;
+    virtual u32 stop(u32 id, u32* entry) = 0;
+    virtual void stopped(u32 id, s32 result) = 0;
+    virtual u32 unload(u32 id) = 0;
+    virtual u32 id_by_name(std::string_view name) = 0;
+    virtual u32 id_by_address(u32 addr) = 0;
+    virtual std::vector<u32> list() = 0;
+    // The module's sys_prx_module_info_t at `info` (its size, 0x48 or 0x58, read there), as liblv2's
+    // sys_prx_get_module_info writes it; CELL_OK or an error.
+    virtual s32 write_info(PpuThread& t, u32 id, u32 info) = 0;
+    // The module's start and stop descriptors (0: none); false for an unknown ID.
+    virtual bool entries(u32 id, u32* start, u32* stop) = 0;
+};
+
 struct Config {
     // From the executable's sys_process_param (RPCS3 PPUModule.cpp). Selects the default user memory size.
     u32 sdk_version = 0x00360001;
@@ -177,6 +202,9 @@ struct Config {
     std::string title_id;
     // Debug/root process permissions (allows negative thread priorities and root-only syscalls).
     bool root = false;
+    // The executable's sys_process_param ppc_seg: a process that may load overlay modules (RPCS3
+    // g_ps3_process_info.ppc_seg); sys_overlay's calls are CELL_ENOSYS without it.
+    u32 ppc_seg = 0;
     // The console's OpenPSID (sys_ss_get_open_psid). RPCS3 makes a random one per installation; pspocket's default is
     // a fixed value a host can replace with one of its own.
     u64 console_psid_high = 0x50535047'4F434B45ull, console_psid_low = 0x54000000'00000001ull;
@@ -311,6 +339,9 @@ public:
     rsx::Rsx* rsx();
     // Called on the RSX thread after each flip (HLE cellGcmSys: the game's flip handler). Replaces the previous one.
     void set_rsx_flip_listener(std::function<void(u32 buffer_id)> fn);
+    // The module loader lv2's PRX calls use (null: none); the caller keeps it alive while it is set.
+    void set_module_host(ModuleHost* host);
+    ModuleHost* module_host() const;
     // Called on the RSX thread when it runs GCM_SET_USER_COMMAND, after the drain it makes (HLE cellGcmSys: the
     // game's user handler, with the command's argument). Replaces the previous one.
     void set_rsx_user_command_listener(std::function<void(u32 arg)> fn);

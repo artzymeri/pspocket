@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -151,6 +152,9 @@ void register_net_syscalls(SyscallTable& table);
 void register_device_syscalls(SyscallTable& table);
 void register_service_syscalls(SyscallTable& table);
 void register_misc_syscalls(SyscallTable& table);
+void register_prx_syscalls(SyscallTable& table);
+// The path an open file was opened with (loads by descriptor); none for an unknown or closed descriptor.
+std::optional<std::string> fs_file_path(Kernel& k, s32 fd);
 
 // The whole of the open file `fd` (a host file or one on an image), without moving its position (fs.cpp; for
 // sys_spu_image_open_by_fd). CELL_EBADF when fd is not an open file.
@@ -501,6 +505,8 @@ struct Kernel::Impl {
     std::shared_ptr<void> net_state;  // the network calls (net.cpp), made at first use under system_mutex
     std::shared_ptr<void> devices_state; // GPIO, I/O buffers (devices.cpp), made at first use under system_mutex
     std::shared_ptr<void> services_state; // HID manager, sys_config, storage (services.cpp), likewise
+    std::shared_ptr<void> root_managers_state; // update manager, UART (misc.cpp), likewise
+    std::atomic<ModuleHost*> module_host{nullptr}; // Kernel::set_module_host (prx.cpp)
     std::mutex npd_mutex;
     Kernel::NpdOpener npd_opener; // Kernel::set_npd_opener (D-165), under npd_mutex
     // SPU thread groups (D-167): their IDs, and what the HLE layer adds (under spu_hooks_mutex).

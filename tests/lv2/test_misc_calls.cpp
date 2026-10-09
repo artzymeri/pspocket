@@ -113,3 +113,47 @@ TEST_CASE("lv2 RSX: device open and close, freeing memory and the context", "[lv
     CHECK(c.call(669, f.r32(handle)) == rc(CELL_ENOMEM));
     REQUIRE(c.call(668, handle, addr, 0x1000000, 0, 0, 0, 0) == CELL_OK); // allocatable again
 }
+
+TEST_CASE("lv2 root's update manager and the AV manager's UART", "[lv2][misc]")
+{
+    {
+        Fixture f;
+        Caller c(*f.kernel, "game");
+        for (const u32 n : {863u, 367u, 368u, 369u, 370u}) CHECK(c.call(n, 0x6003, 0, 0) == rc(CELL_ENOSYS));
+    }
+    Fixture f(root_config());
+    Caller c(*f.kernel, "root");
+    const u32 out = f.alloc(16);
+    REQUIRE(c.call(863, 0x6003, 0, out) == CELL_OK);
+    CHECK(f.r64(out) == u64{0x492} << 40); // 4.92, Config's default
+    REQUIRE(c.call(863, 0x600B, 0x48C1B, out) == CELL_OK);
+    CHECK(f.base()[out] == 0x01);
+    REQUIRE(c.call(863, 0x600B, 0x1234, out) == CELL_OK);
+    CHECK(f.base()[out] == 0xFF);
+    REQUIRE(c.call(863, 0x600C, 0x1234, 0x42) == CELL_OK);
+    REQUIRE(c.call(863, 0x600B, 0x1234, out) == CELL_OK);
+    CHECK(f.base()[out] == 0x42);
+    REQUIRE(c.call(863, 0x600C, 0x1234, 0xFF) == CELL_OK);
+    REQUIRE(c.call(863, 0x600B, 0x1234, out) == CELL_OK);
+    CHECK(f.base()[out] == 0xFF);
+    REQUIRE(c.call(863, 0x600E, 0x2000, out) == CELL_OK);
+    const u32 buf = f.r32(out);
+    CHECK(f.mem.is_committed(buf));
+    CHECK(c.call(863, 0x600F, buf) == CELL_OK);
+    CHECK(!f.mem.is_committed(buf));
+    CHECK(c.call(863, 0x600F, buf) == rc(CELL_ENOMEM));
+    REQUIRE(c.call(863, 0x6011, 0, out) == CELL_OK);
+    CHECK(f.r64(out) == u64{0x30040} << 32);
+    CHECK(c.call(863, 0x6099, 0, out) == rc(CELL_EINVAL));
+
+    CHECK(c.call(370, out) == rc(CELL_ESRCH)); // not initialized
+    REQUIRE(c.call(367) == CELL_OK);
+    CHECK(c.call(367) == rc(CELL_EPERM));
+    REQUIRE(c.call(370, out) == CELL_OK);
+    CHECK(f.r64(out) == 0x800);
+    CHECK(f.r64(out + 8) == 0x800);
+    CHECK(c.call(369, out, 16, 0) == 16);
+    CHECK(c.call(369, out, 16, 7) == rc(CELL_EINVAL));
+    CHECK(c.call(368, out, 16, 0) == 0); // nothing comes back
+    CHECK(c.call(368, out, 0, 0) == CELL_OK);
+}

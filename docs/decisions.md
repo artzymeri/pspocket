@@ -6451,3 +6451,25 @@ modules make (libatxenc's SPU group switching, 244-247) must work for a game, lv
 Tests: tests/lv2/test_misc_calls.cpp (every call above on both sides), tests/hle/test_gcm.cpp (context and memory
 freed, then allocated again with a new RSX thread); Sony's libgcm_sys still compares the same (test_gcm_compare).
 Kernel calls own: 483 of 634.
+
+Part 3 (runtime/lv2/src/prx.cpp, misc.cpp; 40 calls):
+- The PRX calls (460-499) reach pspocket's module loader through lv2::ModuleHost, which HleProcess::set_module_loader
+  gives the kernel (the same loader, lock and steps as liblv2's native sys_prx_* functions; firmware modules loaded
+  for a module start in its start command, D-175). RPCS3's contract: _sys_prx_start_module's command 1 links the
+  module and gives module_start (~0 none; no prologue), command 2 takes its result (0 resident; another value in its
+  low word unloads it and is returned); _sys_prx_stop_module likewise (command 2: 0 stops, 1 CAN_NOT_STOP; 4 gives the
+  entries, 8 is taken); loads by path, by descriptor (the file's path, `offset` in), on a memory container (none for
+  modules) and by list (64-bit path pointers; a failure unloads the ones loaded and fills the list with -1); the list
+  (only with flags bit 1, size 0x20) and the info (an option block of size 0x10 holding the info of size 0x48 or
+  0x58); _sys_prx_register_module refuses a game the system software's stub registration
+  (CELL_PRX_ERROR_ELF_IS_REGISTERED, not an error); the library todos answer CELL_OK; the debugger's lists are root's;
+  without a loader the calls answer CELL_PRX_ERROR_NO_LIBLV2.
+- Overlays (450-458): a process whose executable's ppc_seg is 0 (every game pspocket has seen) gets CELL_ENOSYS, as
+  RPCS3; an overlay-enabled one would need its overlay placed at a fixed address in the 0x30000000 segment, which the
+  loader does not do: logged, CELL_ENOEXEC. No overlay is ever loaded, so their queries find none (CELL_OK).
+  lv2::Config::ppc_seg comes from the executable's sys_process_param.
+- sys_ss_update_manager (863) and the AV manager's UART (367-370): root's (RPCS3 checks too); for root, RPCS3's update
+  manager (the installed version as 0x492 << 40 for 4.92, its preset EEPROM cells, buffers of user memory, 3.40 as the
+  applicable version) and a UART with no AV manager behind it (sends taken, nothing received).
+Tests: tests/hle/test_lle.cpp (a module through the raw PRX calls: both start commands, list, info, lookups, stop,
+unload, registration, overlays), tests/lv2/test_misc_calls.cpp. Kernel calls own: 523 of 634.

@@ -20,8 +20,13 @@
 //   libmedi), the file-system watch events (liblv2coredump: none happen), the YCON gamepad interface (libgem, libio:
 //   no such devices) and the LDD pad calls (libio, which pspocket serves itself): CELL_OK.
 // - sys_console_write2 prints to the log as a TTY write does; sys_console_write is root's.
+// - The update manager (sys_ss 863) and the AV manager's UART (367-370) are root's (RPCS3 checks it too). For root:
+//   RPCS3's update manager (the installed version, the EEPROM cells it presets, buffers from user memory, version
+//   3.40 as the applicable one); the UART with no AV manager behind it: what is sent is taken, nothing comes back
+//   (pspocket's video and audio output settings are its own cellVideoOut and cellAudioOut).
 
 #include <map>
+#include <set>
 #include <string>
 
 #include "internal.hpp"
@@ -128,6 +133,153 @@ Result sys_time_get_rtc(PpuThread& t, u32 rtc)
     s64 sec = 0, nsec = 0;
     host_current_time(sec, nsec);
     if (!t.kernel.impl().guest.put64(rtc, static_cast<u64>(sec))) return err(CELL_EFAULT);
+    return CELL_OK;
+}
+
+// ------------------------------------------------------------------------------------------------- root's managers
+
+namespace {
+
+struct RootManagers {
+    std::mutex lock;
+    std::map<u32, u8> eeprom{{0x48C18, 0x00}, {0x48C19, 0x00}, {0x48C1A, 0x00}, {0x48C1B, 0x01}, {0x48C1C, 0x00},
+        {0x48C1D, 0x00}, {0x48C1E, 0x00}, {0x48C1F, 0x00}}; // RPCS3's: the system language, the VSH target
+    std::map<u32, u64> buffers;                              // update-manager buffers: address -> bytes
+    bool uart_initialized = false;
+};
+
+RootManagers& root_managers(Kernel& k)
+{
+    Kernel::Impl& s = k.impl();
+    std::lock_guard lock(s.system_mutex);
+    if (!s.root_managers_state) s.root_managers_state = std::make_shared<RootManagers>();
+    return *static_cast<RootManagers*>(s.root_managers_state.get());
+}
+
+// The installed system software as RPCS3's update manager reports it: 4.92 is 0x492 << 40.
+u64 update_manager_version(PpuThread& t)
+{
+    const u64 v = t.kernel.config().system_sw_version / 100; // 49200 -> 492
+    const u64 bcd = ((v / 100) << 8) | (((v / 10) % 10) << 4) | (v % 10);
+    return bcd << 40;
+}
+
+} // namespace
+
+// sys_ss_update_manager(packet, a1..a6): root.
+Result sys_ss_update_manager(PpuThread& t, u64 packet, u64 a1, u64 a2, u64 a3, u64, u64, u64)
+{
+    if (!is_root(t)) return system_only(t, "sys_ss_update_manager");
+    Kernel::Impl& s = t.kernel.impl();
+    RootManagers& m = root_managers(t.kernel);
+    std::lock_guard lock(m.lock);
+    const auto allocate = [&](u64 size, u32 out) -> Result {
+        if (!out) return err(CELL_EFAULT);
+        const u64 bytes = (size + 0xFFFF) & ~u64{0xFFFF};
+        u32 addr = 0;
+        {
+            std::lock_guard ml(s.memory.mutex);
+            addr = bytes && bytes <= 0x10000000 ? s.memory.allocate_kernel(bytes) : 0;
+        }
+        if (!addr) return err(CELL_ENOMEM);
+        if (!s.guest.put32(out, addr)) {
+            std::lock_guard ml(s.memory.mutex);
+            s.memory.free_kernel(addr);
+            return err(CELL_EFAULT);
+        }
+        m.buffers[addr] = bytes;
+        return CELL_OK;
+    };
+    switch (packet) {
+    case 0x6001: case 0x6002: case 0x6004: case 0x6005: case 0x6006: case 0x6007: case 0x6008: case 0x6009:
+    case 0x600A: case 0x600D: case 0x6010: case 0x6013:
+        return CELL_OK; // asynchronous operations and flags with nothing to do (RPCS3)
+    case 0x6003: // the installed package's version
+        if (!a2) return err(CELL_EFAULT);
+        if (!s.guest.put64(static_cast<u32>(a2), update_manager_version(t))) return err(CELL_EFAULT);
+        return CELL_OK;
+    case 0x600B: { // read an EEPROM cell (0xFF when unset)
+        if (!a2) return err(CELL_EFAULT);
+        const auto it = m.eeprom.find(static_cast<u32>(a1));
+        if (!s.guest.valid(static_cast<u32>(a2), 1)) return err(CELL_EFAULT);
+        s.guest.w8(static_cast<u32>(a2), it == m.eeprom.end() ? 0xFF : it->second);
+        return CELL_OK;
+    }
+    case 0x600C: // write an EEPROM cell (0xFF unsets it)
+        if (static_cast<u8>(a2) != 0xFF) m.eeprom[static_cast<u32>(a1)] = static_cast<u8>(a2);
+        else m.eeprom.erase(static_cast<u32>(a1));
+        return CELL_OK;
+    case 0x600E: return allocate(static_cast<u32>(a1), static_cast<u32>(a2));
+    case 0x600F: { // release a buffer
+        const auto it = m.buffers.find(static_cast<u32>(a1));
+        if (it == m.buffers.end()) return err(CELL_ENOMEM);
+        {
+            std::lock_guard ml(s.memory.mutex);
+            s.memory.free_kernel(it->first);
+        }
+        m.buffers.erase(it);
+        return CELL_OK;
+    }
+    case 0x6011: // the applicable version: 3.40
+        if (!a2) return err(CELL_EFAULT);
+        if (!s.guest.put64(static_cast<u32>(a2), u64{0x30040} << 32)) return err(CELL_EFAULT);
+        return CELL_OK;
+    case 0x6012: return allocate(static_cast<u32>(a2), static_cast<u32>(a3)); // from a memory container
+    default: PS_LOG_ERROR(kMiscChan, "sys_ss_update_manager: unknown packet {:#x}", packet); return err(CELL_EINVAL);
+    }
+}
+
+// The AV manager's UART: root (see the top).
+constexpr u32 NOT_BLOCKING_BIG_OP = 0, BLOCKING_BIG_OP = 1, NOT_BLOCKING_OP = 2;
+
+Result sys_uart_initialize(PpuThread& t)
+{
+    if (!is_root(t)) return system_only(t, "sys_uart_initialize");
+    RootManagers& m = root_managers(t.kernel);
+    std::lock_guard lock(m.lock);
+    if (m.uart_initialized) return err(CELL_EPERM);
+    m.uart_initialized = true;
+    return CELL_OK;
+}
+
+Result sys_uart_receive(PpuThread& t, u32, u64 size, u32 mode)
+{
+    if (!is_root(t)) return system_only(t, "sys_uart_receive");
+    if (!size) return CELL_OK;
+    if (mode & ~(BLOCKING_BIG_OP | NOT_BLOCKING_BIG_OP)) return err(CELL_EINVAL);
+    RootManagers& m = root_managers(t.kernel);
+    std::lock_guard lock(m.lock);
+    if (!m.uart_initialized) return err(CELL_ESRCH);
+    if (size > 0x20000) return err(CELL_EINVAL); // RPCS3 aborts ("buffer is too big")
+    if (mode & BLOCKING_BIG_OP) PS_LOG_WARN(kMiscChan, "sys_uart_receive: no AV manager answers; nothing read");
+    return 0;
+}
+
+Result sys_uart_send(PpuThread& t, u32 buffer, u64 size, u32 mode)
+{
+    if (!is_root(t)) return system_only(t, "sys_uart_send");
+    if (!size) return CELL_OK;
+    if (mode & ~(BLOCKING_BIG_OP | NOT_BLOCKING_OP | NOT_BLOCKING_BIG_OP)) return err(CELL_EINVAL);
+    RootManagers& m = root_managers(t.kernel);
+    std::lock_guard lock(m.lock);
+    if (!m.uart_initialized) return err(CELL_ESRCH);
+    if (size > 0x20000) return err(CELL_EINVAL);
+    if (!t.kernel.impl().guest.valid(buffer, size)) return err(CELL_EFAULT);
+    if ((mode & NOT_BLOCKING_OP) && size > 0x800) return err(CELL_EAGAIN); // more than the transmit buffer holds
+    return static_cast<Result>(size);
+}
+
+// sys_uart_get_params(vuart_params* buffer): the receive and transmit buffers' sizes (0x800 each).
+Result sys_uart_get_params(PpuThread& t, u32 buffer)
+{
+    if (!is_root(t)) return system_only(t, "sys_uart_get_params");
+    RootManagers& m = root_managers(t.kernel);
+    std::lock_guard lock(m.lock);
+    if (!m.uart_initialized) return err(CELL_ESRCH);
+    const Guest& g = t.kernel.impl().guest;
+    if (!g.valid(buffer, 16)) return err(CELL_EFAULT);
+    g.w64(buffer, 0x800);
+    g.w64(buffer + 8, 0x800);
     return CELL_OK;
 }
 
@@ -403,6 +555,11 @@ void register_misc_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 839, sys_fs_sync);
     PS_LV2_BIND(table, 843, sys_fs_get_fs_info_size);
     PS_LV2_BIND(table, 844, sys_fs_get_fs_info);
+    PS_LV2_BIND(table, 863, sys_ss_update_manager);
+    PS_LV2_BIND(table, 367, sys_uart_initialize);
+    PS_LV2_BIND(table, 368, sys_uart_receive);
+    PS_LV2_BIND(table, 369, sys_uart_send);
+    PS_LV2_BIND(table, 370, sys_uart_get_params);
 }
 
 } // namespace pspocket::lv2

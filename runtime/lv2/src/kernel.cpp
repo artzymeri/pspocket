@@ -539,6 +539,7 @@ Kernel::Impl::Impl(Kernel& k)
     register_device_syscalls(table);
     register_service_syscalls(table);
     register_misc_syscalls(table);
+    register_prx_syscalls(table);
     // Every other slot RPCS3 answers with null_func (a log, then CELL_OK) is answered so too (D-166): a game calling
     // one goes on instead of meeting ENOSYS. GTA V's CRT, for one, registers a debug exception handler (988).
     static constexpr struct {
@@ -782,6 +783,10 @@ rsx::Rsx* Kernel::rsx()
     std::lock_guard lock(impl_->rsx.mutex);
     return impl_->rsx.rsx.get();
 }
+
+void Kernel::set_module_host(ModuleHost* host) { impl_->module_host.store(host, std::memory_order_release); }
+
+ModuleHost* Kernel::module_host() const { return impl_->module_host.load(std::memory_order_acquire); }
 
 void Kernel::set_rsx_flip_listener(std::function<void(u32 buffer_id)> fn)
 {

@@ -217,6 +217,7 @@ u32 Executable::malloc_pagesize() const
 lv2::Config Executable::kernel_config(lv2::Config base) const
 {
     base.sdk_version = sdk_version();
+    if (module_.process_param && module_.process_param->magic_ok()) base.ppc_seg = module_.process_param->ppc_seg;
     base.main_area_end = sdk_version() < 0x200000 ? 0x20000000u : 0x10000000u; // RPCS3 is_vm_main_512
     return base;
 }

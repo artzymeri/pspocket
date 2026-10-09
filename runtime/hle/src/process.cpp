@@ -10,6 +10,7 @@
 #include <string>
 
 #include "guest.hpp"
+#include "prx.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/lv2/errors.hpp"
@@ -214,6 +215,7 @@ HleProcess::HleProcess(lv2::Kernel& kernel, u32 main_begin, u32 main_end, Proces
 
 HleProcess::~HleProcess()
 {
+    if (kernel_modules_ && kernel_.module_host() == kernel_modules_.get()) kernel_.set_module_host(nullptr);
     HleProcess* self = this;
     g_current.compare_exchange_strong(self, nullptr);
     for (const auto& f : linked_)
@@ -221,6 +223,14 @@ HleProcess::~HleProcess()
 }
 
 void HleProcess::install() { g_current.store(this); }
+
+void HleProcess::set_module_loader(ModuleLoader* loader)
+{
+    module_loader_ = loader;
+    if (kernel_modules_ && kernel_.module_host() == kernel_modules_.get()) kernel_.set_module_host(nullptr);
+    kernel_modules_ = loader ? make_kernel_module_host(*this) : nullptr;
+    if (kernel_modules_) kernel_.set_module_host(kernel_modules_.get());
+}
 
 HleProcess* HleProcess::current() { return g_current.load(); }
 

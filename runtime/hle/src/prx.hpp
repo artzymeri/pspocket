@@ -4,7 +4,11 @@
 
 #pragma once
 
+#include <memory>
+
 #include "pspocket/hle/hle.hpp"
+#include "pspocket/hle/process.hpp"
+#include "pspocket/lv2/kernel.hpp"
 
 namespace pspocket::hle {
 
@@ -14,6 +18,9 @@ s32 prx_load_module(PPUContext& ctx, u32 path, u64 flags);
 s32 prx_start_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result);
 s32 prx_stop_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result);
 s32 prx_unload_module(PPUContext& ctx, u32 id);
+
+// The process's module loader as lv2's PRX calls reach it (lv2::Kernel::set_module_host, D-527).
+std::unique_ptr<lv2::ModuleHost> make_kernel_module_host(HleProcess& process);
 
 // sys_game_process_exitspawn and sys_game_process_exitspawn2: the game ends and doesn't come back.
 void game_process_exitspawn(PPUContext& ctx, u32 path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio,

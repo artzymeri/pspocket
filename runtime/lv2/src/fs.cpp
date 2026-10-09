@@ -1413,6 +1413,15 @@ Result sys_fs_fcntl(PpuThread& t, u32 fd, u32 op, u32 arg, u32 size)
 
 // ------------------------------------------------------------------------------------------------- D-184
 
+std::optional<std::string> fs_file_path(Kernel& k, s32 fd)
+{
+    const auto file = std::dynamic_pointer_cast<FsFile>(k.impl().fds.find(FsObject::kIdBase, static_cast<u32>(fd)));
+    if (!file) return std::nullopt;
+    std::lock_guard lock(file->lock);
+    if (!file->is_open()) return std::nullopt;
+    return file->vpath;
+}
+
 // sys_fs_test(6, 0, u32* fd, 4, buf, buf_size): the path an open file or directory was opened with (cellFsGetPath).
 // RPCS3 accepts other arguments with a log.
 Result sys_fs_test(PpuThread& t, u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 buf, u32 buf_size)

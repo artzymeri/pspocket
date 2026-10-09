@@ -290,6 +290,97 @@ s32 sys_prx_unregister_library(PPUContext&, u32 lib_entry)
 
 } // namespace
 
+namespace {
+
+// The loader seen from lv2's PRX calls: the same loader, lock and steps as the sysPrxForUser functions above.
+class KernelModules final : public lv2::ModuleHost {
+public:
+    explicit KernelModules(HleProcess& p) : p_(p) {}
+
+    u32 load(std::string_view path, u64 offset, u32* id) override
+    {
+        ModuleLoader* l = p_.module_loader();
+        if (!l) return kPrxNoLoader;
+        std::lock_guard lock(p_.state<PrxCalls>().mutex);
+        return offset ? l->load_at(path, offset, id) : l->load(path, id);
+    }
+    u32 start(lv2::PpuThread& t, u32 id, u32* entry) override
+    {
+        ModuleLoader* l = p_.module_loader();
+        if (!l) return kPrxNoLoader;
+        std::lock_guard lock(p_.state<PrxCalls>().mutex);
+        if (const u32 r = l->start(id, entry); r != lv2::CELL_OK) return r;
+        for (const u32 dep : l->take_dependency_starts()) {
+            const u32 r = static_cast<u32>(call_guest(*t.ctx, dep, {0, 0}));
+            PS_LOG_INFO(kChan, "_sys_prx_start_module({:#x}): firmware module_start {:#x} returned {:#x}", id, dep, r);
+        }
+        return lv2::CELL_OK;
+    }
+    void started(u32 id, s32 result) override
+    {
+        if (ModuleLoader* l = p_.module_loader()) {
+            std::lock_guard lock(p_.state<PrxCalls>().mutex);
+            l->started(id, result);
+        }
+    }
+    u32 stop(u32 id, u32* entry) override
+    {
+        ModuleLoader* l = p_.module_loader();
+        if (!l) return kPrxNoLoader;
+        std::lock_guard lock(p_.state<PrxCalls>().mutex);
+        return l->stop(id, entry);
+    }
+    void stopped(u32 id, s32 result) override
+    {
+        if (ModuleLoader* l = p_.module_loader()) {
+            std::lock_guard lock(p_.state<PrxCalls>().mutex);
+            l->stopped(id, result);
+        }
+    }
+    u32 unload(u32 id) override
+    {
+        ModuleLoader* l = p_.module_loader();
+        if (!l) return kPrxNoLoader;
+        std::lock_guard lock(p_.state<PrxCalls>().mutex);
+        return l->unload(id);
+    }
+    u32 id_by_name(std::string_view name) override
+    {
+        ModuleLoader* l = p_.module_loader();
+        return l ? l->id_by_name(name) : 0;
+    }
+    u32 id_by_address(u32 addr) override
+    {
+        ModuleLoader* l = p_.module_loader();
+        return l ? l->id_by_address(addr) : 0;
+    }
+    std::vector<u32> list() override
+    {
+        ModuleLoader* l = p_.module_loader();
+        return l ? l->list() : std::vector<u32>{};
+    }
+    s32 write_info(lv2::PpuThread& t, u32 id, u32 info) override { return sys_prx_get_module_info(*t.ctx, id, 0, info); }
+    bool entries(u32 id, u32* start, u32* stop) override
+    {
+        ModuleLoader* l = p_.module_loader();
+        ModuleInfo m;
+        if (!l || !l->info(id, m)) return false;
+        *start = m.start;
+        *stop = m.stop;
+        return true;
+    }
+
+private:
+    HleProcess& p_;
+};
+
+} // namespace
+
+std::unique_ptr<lv2::ModuleHost> make_kernel_module_host(HleProcess& process)
+{
+    return std::make_unique<KernelModules>(process);
+}
+
 s32 prx_load_module(PPUContext& ctx, u32 path, u64 flags) { return sys_prx_load_module(ctx, path, flags, 0); }
 
 s32 prx_start_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result)

@@ -22,6 +22,7 @@
 
 namespace pspocket::lv2 {
 class Kernel;
+class ModuleHost;
 }
 
 namespace pspocket::hle {
@@ -158,7 +159,8 @@ public:
     // The linked function whose stub is at code address `cia` (descriptor + 4), or nullptr.
     LinkedFunction* linked_at(u32 cia);
     // Modules loaded at run time (D-159); null when nothing installed one.
-    void set_module_loader(ModuleLoader* loader) { module_loader_ = loader; }
+    // The kernel's PRX calls (lv2 Kernel::module_host) reach the same loader (D-527).
+    void set_module_loader(ModuleLoader* loader);
     ModuleLoader* module_loader() const { return module_loader_; }
     std::vector<const LinkedFunction*> linked() const;
     // Calls that reached a function without a host implementation (and no RPCS3 stub, D-182).
@@ -212,6 +214,7 @@ private:
     std::vector<Chunk> chunks_;
     std::vector<std::unique_ptr<LinkedFunction>> linked_; // index = chunk * kEntriesPerChunk + entry
     ModuleLoader* module_loader_ = nullptr;
+    std::unique_ptr<lv2::ModuleHost> kernel_modules_; // the loader as lv2's PRX calls see it
     std::map<std::pair<std::string, u32>, u32> imports_; // under link_mutex_
     std::map<std::pair<std::string, u32>, u32> variables_; // host variables linked, under link_mutex_
     u32 variable_block_ = 0, variable_used_ = 0;           // where they are laid out, under link_mutex_
