@@ -98,6 +98,8 @@ s32 receiver_cleanup(PPUContext& ctx, u32 t);
 s32 post(PPUContext& ctx, u32 player, u32 code, u32 object, u32 arg);
 // Posts {code, a, b, c} at the queue's head (libsail's urgent post).
 s32 post_urgent(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c);
+// Posts {code, a, b, c} at the queue's tail.
+s32 post_message(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c);
 // Posts a call's completion {0, result, handle} (nothing when the handle is 0).
 s32 post_completion(PPUContext& ctx, u32 player, s32 result, u64 handle);
 

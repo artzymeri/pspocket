@@ -103,7 +103,9 @@ void part9(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part10(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part11(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part12(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part13(u8* b, const Call& call, u32 cb, GuestThread& t);
 constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00, kDump = kData + 0x100000, kDumpSize = 0x8000;
+std::function<u32(const char*)> g_export; // a cellSail export's descriptor on the side running (Sony's or pspocket's)
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
 Run run(const std::string& flash, bool sony, int part)
@@ -145,6 +147,10 @@ Run run(const std::string& flash, bool sony, int part)
         return v;
     };
     g_mask.clear();
+    g_export = [&](const char* name) -> u32 {
+        const u32 nid = recomp::nid_of(name);
+        return sony ? sail.module->functions.at({"cellSail", nid}) : f.hle->link_function("cellSail", nid, name);
+    };
     if (part == 1) part1(b, call, cb, t);
     else if (part == 2) part2(b, call, cb, t);
     else if (part == 3) part3(b, call, cb, t);
@@ -156,8 +162,16 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 9) part9(b, call, cb, t);
     else if (part == 10) part10(b, call, cb, t);
     else if (part == 11) part11(b, call, cb, t);
-    else part12(b, call, cb, t);
+    else if (part == 12) part12(b, call, cb, t);
+    else part13(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
+    if (std::getenv("SAIL_RECORDS"))
+        for (u32 i = 0; i < ps_read32(b, kRecords); i++) {
+            const u32 rec = kRecords + 16 + 48 * i;
+            std::fprintf(stderr, "RECORD %s %u: %llx %llx %llx %llx\n", sony ? "sony" : "mine", i,
+                (unsigned long long)ps_read64(b, rec), (unsigned long long)ps_read64(b, rec + 8),
+                (unsigned long long)ps_read64(b, rec + 16), (unsigned long long)ps_read64(b, rec + 24));
+        }
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
     if (part >= 6) r.heap.assign(b + kHeap, b + ps_read32(b, kHeapPtr));
@@ -1380,6 +1394,109 @@ void part12(u8* b, const Call& call_, u32 cb, GuestThread&)
     }
 }
 
+// A source callback in guest code that tells the player its call completed: NotifyCallCompleted(its argument (the
+// source), the result at table+4) through the export's descriptor at table+0, counting its calls at table+8.
+void notify_code(u8* b, u32 at, u32 table)
+{
+    const u32 code[] = {0x7C0802A6u, 0xF8010010u, 0xF821FF81u, 0xF8410028u, 0x3D600000u | (table >> 16),
+        0x616B0000u | (table & 0xFFFF), 0x818B0000u, 0x808B0004u, 0x814B0008u, 0x394A0001u, 0x914B0008u, 0x800C0000u,
+        0x804C0004u, 0x7C0903A6u, 0x4E800421u, 0xE8410028u, 0x38210080u, 0xE8010010u, 0x7C0803A6u, 0x38600000u,
+        0x4E800020u};
+    for (u32 i = 0; i < std::size(code); i++) ps_write32(b, at + 4 * i, code[i]);
+    ps_write32(b, at + 0x58, at);
+    ps_write32(b, at + 0x5C, 0);
+}
+
+// OpenStream and CloseStream of a player without streams through a game's source: refusals, an open and a close (the
+// source told to open and close, the dmux pipeline opened and closed, the events), and an open whose source fails
+// (everything closed again, the call completed with CANCEL).
+void part13(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    write_sail_pamf(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kSrcCode = kArea + 0x1C00, kOpenCode = kArea + 0x2400,
+                  kCloseCode = kArea + 0x2480, kTables = kArea + 0x2500;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    notify_code(b, kOpenCode, kTables);
+    notify_code(b, kCloseCode, kTables + 0x10);
+    ps_write32(b, kTables, g_export("cellSailSourceNotifyCallCompleted"));
+    ps_write32(b, kTables + 0x10, g_export("cellSailSourceNotifyCallCompleted"));
+    g_mask.push_back({kTables, 4});
+    g_mask.push_back({kTables + 0x10, 4});
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    ps_write32(b, kFuncs, cb);
+    ps_write32(b, kFuncs + 4, kSrcCode + 0xB0);
+    ps_write32(b, kFuncs + 8, kOpenCode + 0x58);
+    ps_write32(b, kFuncs + 12, kCloseCode + 0x58);
+    ps_write32(b, kFuncs + 44, kSrcCode + 0x78);
+    const auto until_state = [&](u8 st) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (b[kP + 0x163] != st && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(b[kP + 0x163] == st);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the call's completion event after it
+    };
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 0, 0, 0, 0});
+    mask_player_source(b, kP);
+    call("cellSailSourceInitialize", {kSource, kFuncs, kSource});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailPlayerBoot", {kP, 0});
+    until_state(2);
+    call("cellSailPlayerOpenStream", {kP, 0x111});
+    call("cellSailPlayerCloseStream", {kP, 0x222});
+
+    const u32 uri = str(kUri, "x-test://movie.pam");
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, uri, kOut});
+    const u32 d0 = ps_read32(b, kOut);
+    call("cellSailDescriptorOpen", {d0});
+    call("cellSailPlayerAddDescriptor", {kP, d0});
+    // cellDmux keeps the pipeline's callback (each side's own code) at +0x1C of its memory, the first the open takes.
+    const auto mask_dmux_callback = [&] { g_mask.push_back({((ps_read32(b, kHeapPtr) + 0x7F) & ~0x7Fu) + 0x1C, 4}); };
+    mask_dmux_callback();
+    call("cellSailPlayerOpenStream", {kP, 0x123456789ull});
+    until_state(4);
+    call("cellSailPlayerOpenStream", {kP, 1});
+    call("cellSailPlayerGetDescriptorCount", {kP});
+    call("cellSailPlayerCloseStream", {kP, 0x987654321ull});
+    until_state(2);
+    call("cellSailPlayerGetDescriptorCount", {kP});
+    call("cellSailPlayerGetCurrentDescriptor", {kP});
+
+    // The source fails to open.
+    ps_write32(b, kTables + 4, 0x80610A01);
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, uri, kOut + 4});
+    const u32 d1 = ps_read32(b, kOut + 4);
+    call("cellSailDescriptorOpen", {d1});
+    call("cellSailPlayerAddDescriptor", {kP, d1});
+    mask_dmux_callback();
+    call("cellSailPlayerOpenStream", {kP, 0xBAD});
+    until_state(2);
+    call("cellSailPlayerGetDescriptorCount", {kP});
+    call("cellSailPlayerFinalize", {kP});
+
+    g_mask.push_back({kP + 0x3C8, 16});
+    for (u32 i = 0; i < ps_read32(b, kRecords); i++) {
+        const u32 r = kRecords + 16 + 48 * i;
+        const u64 arg = ps_read64(b, r);
+        if (arg == 0x22) g_mask.push_back({r + 32, 8});
+        else g_mask.push_back({r + 16, 24});
+    }
+    const u32 ring = ps_read32(b, kP + 0x178);
+    for (u32 i = 0; i < ps_read32(b, kP + 0x170); i++) {
+        const u32 e = ring + 16 * i;
+        const u32 c = ps_read32(b, e);
+        if (c == 0x40 || c == 0x3C || c == 0x4C || c == 0x5D) g_mask.push_back({e + 8, 4});
+        if (c != 0) g_mask.push_back({e + 12, 4});
+    }
+}
+
 } // namespace
 
 void compare_runs(int part)
@@ -1466,4 +1583,10 @@ TEST_CASE("cellSail against libsail: pause, repeat mode and the streams' mute sw
 TEST_CASE("cellSail against libsail: DumpImage at every size", "[hle][lle][sail]")
 {
     compare_runs(12);
+}
+
+
+TEST_CASE("cellSail against libsail: OpenStream and CloseStream of a player without streams", "[hle][lle][sail]")
+{
+    compare_runs(13);
 }
