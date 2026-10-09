@@ -8,7 +8,8 @@
 // port of 16 blocks and a notify event queue, and starts the mixer's PPU thread at the game's priority. For every
 // period cellAudio plays the thread mixes one block of 256 samples: the game's notify callback first (where it feeds
 // the strips and buses for that block), then the sample players connected to the mixer, the channel strips' levels and
-// mutes, the total level; the block goes two periods ahead of the port's read index. Its tag counts the blocks mixed.
+// mutes, the total level; the block goes two periods ahead of the port's read index, and a late mixer's blocks go on in
+// order after the last (D-573). Its tag counts the blocks mixed.
 // Not emulated, as in RPCS3: reverb (the reverb buses and send levels are accepted and dropped), the strips' and
 // players' positions (a mono strip or player goes to left and right alike), the attack modes, the beep.
 
@@ -58,6 +59,9 @@ s32 error(u32 code) { return static_cast<s32>(code); }
 constexpr u32 kType1 = 1, kType2 = 2, kType8 = 4;
 constexpr u32 kChannelsOf[5] = {0, 1, 2, 6, 8};
 constexpr u32 kBuses = 8, kReverbBuses = 4, kSamples = 256, kPortBlocks = 16, kLead = 2;
+// How far ahead of the read index the blocks may run after the mixer fell behind and caught up (D-573): a burst of the
+// notify queue's 8 events after a late start, with room left so a block is never written over one not yet played.
+constexpr u64 kMaxLead = 12;
 constexpr u32 kAanHandle = 0x11111111; // RPCS3's
 constexpr u32 kAudioNotInit = 0x80310703; // CELL_AUDIO_ERROR_NOT_INIT: cellAudioInit not called
 
@@ -99,6 +103,11 @@ struct Mixer {
     u32 cb = 0, cb_arg = 0;
     std::array<f32, kBuses * kSamples> mix{};
     u64 mixcount = 0;
+    // Where the blocks go (D-573): the read index as a running count (reader), the count of the block written next
+    // (next), both from the start; `placed` false until the first block after a start or resume.
+    u64 reader = 0, next = 0;
+    bool placed = false;
+    u64 dropped = 0;
     u64 start_time = 0; // guest system time (us) at the first start
     f32 total_level = 1.0f, reverb_level = 1.0f;
     bool total_mute = false;
@@ -197,7 +206,28 @@ void mix_player(u8* base, Mixer& m, Player& p)
     }
 }
 
-// One block: the callback, the players, the total level, written two periods ahead of the read index.
+// The ring block for this mix (D-573), or kPortBlocks to leave it out. Two periods ahead of the read index on time;
+// the blocks then go on in order, so a mixer that was late and catches up in a burst writes each in its own block
+// instead of all into the same one; one that fell behind the reader starts two ahead again. Under m.mutex.
+u32 place_block(Mixer& m, u32 read)
+{
+    if (!m.placed) {
+        m.reader = read;
+        m.next = read + kLead;
+        m.placed = true;
+    }
+    m.reader += (read + kPortBlocks - m.reader % kPortBlocks) % kPortBlocks; // the reader moves on, fewer than 16 a time
+    if (m.next <= m.reader) m.next = m.reader + kLead;
+    if (m.next - m.reader > kMaxLead) {
+        if (m.dropped++ % 64 == 0)
+            PS_LOG_WARN(kChan, "a block left out: {} ahead of the read index (block tag {}; {} left out)",
+                m.next - m.reader, m.mixcount, m.dropped);
+        return kPortBlocks;
+    }
+    return static_cast<u32>(m.next++ % kPortBlocks);
+}
+
+// One block: the callback, the players, the total level, written into the ring (place_block).
 void mix_block(PPUContext& ctx, Mixer& m)
 {
     u8* base = gb(ctx);
@@ -217,9 +247,11 @@ void mix_block(PPUContext& ctx, Mixer& m)
     const f32 gain = m.total_mute ? 0.0f : m.total_level;
     // The port's read index, published by cellAudio's thread with release order after it cleared the block it played.
     const u64 read = ps_bswap64(__atomic_load_n(host_u64(base, m.read_index_addr), __ATOMIC_ACQUIRE));
-    const u32 block = static_cast<u32>((read + kLead) % kPortBlocks);
-    const u32 dst = m.port_addr + block * kBuses * kSamples * 4;
-    for (u32 i = 0; i < kBuses * kSamples; i++) ps_writef32(base, dst + 4 * i, m.mix[i] * gain);
+    const u32 block = place_block(m, static_cast<u32>(read % kPortBlocks));
+    if (block < kPortBlocks) {
+        const u32 dst = m.port_addr + block * kBuses * kSamples * 4;
+        for (u32 i = 0; i < kBuses * kSamples; i++) ps_writef32(base, dst + 4 * i, m.mix[i] * gain);
+    }
     m.mixcount++;
 }
 
@@ -336,6 +368,7 @@ void start_mixing(PPUContext& ctx, Mixer& m, u32 port)
     std::lock_guard lock(m.mutex);
     if (!m.created) return; // finalized meanwhile
     m.started = true;
+    m.placed = false; // two ahead of wherever the reader is now
     if (!m.start_time) m.start_time = lv2::guest_system_time_us();
 }
 

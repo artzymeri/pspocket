@@ -57,7 +57,7 @@
 //   (RPCS3's mix<STEREO, ...>) runs only while a host sink is attached, and buffering only while the sink has a
 //   buffer query (pspocket/hle/audio.hpp).
 // - RPCS3's short sleeps for the VSH (200 us in open, 30 us in start, 20 us in set) are left out, as cellGame's are
-//   (D-044). So is its wait for libmixer's _mxr000 queue: there is no libmixer here.
+//   (D-044). So is its wait for libmixer's _mxr000 queue: pspocket's libmixer (D-563) has none.
 // - cellAudioSetPortLevel moves the level over 624 samples, as RPCS3's comment says; RPCS3's step has the wrong sign,
 //   so there the level jumps at once.
 // - Pointers are checked before use (D-042): a bad one gives CELL_AUDIO_ERROR_PARAM and the call site in the log.

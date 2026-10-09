@@ -7845,3 +7845,19 @@ non-zero r3, which setjmp's caller takes for a longjmp having come back.
 Test: tests/hle/test_setjmp.cpp (guest code sets its registers and CR, calls setjmp, changes them all and longjmps from
 two frames down: setjmp answers again with the value, 1 for 0, -7 as -7, at the same r1, with the registers and CR as
 they were; the vector registers in the buffer in guest order and restored from it; a thousand longjmps to one setjmp).
+
+## D-573 · 2026-10-09 · libmixer: a late mixer's blocks go on in order, none over another
+
+libmixer's thread (D-563) wrote every block two periods ahead of the read index as it found it. When the thread ran
+late (a stalled callback, a busy host) the notify events queued up, and it then mixed them in a burst while the read
+index stood still: every block of the burst went into the same ring block, each over the one before, and all but the
+last were never heard. cellAudio's own thread runs late periods back to back too, so the reader also jumps. Found by
+the sample-player test failing under a loaded full test run (a one-shot sound is one block).
+- The mixer now counts where it is: the read index as a running count (each look adds how far it moved, fewer than 16
+  blocks) and the count of the block it writes next. On time that is two ahead, as before. After a late block the
+  next ones go on in order; one that would land at or behind the reader starts two ahead of it again; one that would
+  be more than 12 ahead is left out (logged), so a block not yet played is never written over: a burst of the notify
+  queue's 8 events fits. Each start and resume begins two ahead of the reader. The lead a burst leaves stays (more
+  latency, up to 64 ms) rather than leaving out blocks to bring it back (gaps).
+Test: tests/hle/test_libmixer.cpp, a callback that sleeps about five periods at block 3 (lv2's sys_timer_usleep) and
+gives each block its own data: the speakers hear blocks 0 to 23 in order (with the old placement, 7 came after 2).

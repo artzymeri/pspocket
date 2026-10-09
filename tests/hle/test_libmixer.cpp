@@ -29,7 +29,8 @@ constexpr u32 kConfig = kData + 0x100, kOut = kData + 0x140, kStrip = kData + 0x
               kStamp = kData + 0x1C8, kInfo = kData + 0x200, kWave = kData + 0x240, kCommon = kData + 0x260,
               kPlayerConfig = kData + 0x270, kAudioConfig = kData + 0x280, kRecords = kData + 0x400,
               kCode = kData + 0x1000, kCallback = kData + 0x1F00, kMono = kData + 0x2000, kStereo = kData + 0x2400,
-              kSur6 = kData + 0x2C00, kSur8 = kData + 0x4400, kBus = kData + 0x6400, kPcm = kData + 0x6800;
+              kSur6 = kData + 0x2C00, kSur8 = kData + 0x4400, kBus = kData + 0x6400, kPcm = kData + 0x6800,
+              kBufs = kData + 0x8000;
 const u64 kNotInitialized = r3_of_code(0x80310002), kInvalid = r3_of_code(0x80310003),
           kAlreadyExist = r3_of_code(0x80310006), kNotExist = r3_of_code(0x80310008);
 constexpr u32 kAan = 0x11111111;
@@ -90,6 +91,57 @@ void write_callback(Fixture& f, bool feed)
     ps_write32(b, kCallback, kCode);
     ps_write32(b, kCallback + 4, 0);
     ps_write32(b, kRecords, 0);
+}
+
+// A notify callback (guest code) that adds block `counter`'s data on bus 0 (the front left): the 256 floats at
+// kBufs + 1024 * (counter % 8). At block `stall_at` it first sleeps `stall_us` in lv2's sys_timer_usleep, so the
+// mixer's thread is late there and catches up in a burst of the notify events that came meanwhile.
+void write_stalling_callback(Fixture& f, u32 stall_at, u32 stall_us)
+{
+    u8* b = f.base();
+    const u32 bus = f.hle->link_function("libmixer", recomp::nid_of("cellSurMixerSurBusAddData"),
+        "cellSurMixerSurBusAddData");
+    REQUIRE(bus);
+    std::vector<u32> c;
+    const auto load = [&](u32 reg, u32 value) {
+        c.push_back(as::lis(reg, static_cast<s32>(value >> 16)));
+        c.push_back(as::ori(reg, reg, value & 0xFFFF));
+    };
+    c.push_back(as::mflr(0));
+    c.push_back(as::std_(0, 16, 1));
+    c.push_back(as::stdu(1, -0x80, 1));
+    c.push_back(as::std_(31, 0x70, 1));
+    c.push_back(as::mr(31, 4));
+    c.push_back(as::cmpwi(0, 31, static_cast<s32>(stall_at)));
+    const usize to_add = c.size();
+    c.push_back(0); // bne add
+    load(3, stall_us);
+    c.push_back(as::li(11, 141)); // sys_timer_usleep
+    c.push_back(as::sc());
+    const usize add = c.size();
+    c.push_back(as::andi_(6, 31, 7));
+    c.push_back(as::slwi(6, 6, 10));
+    load(5, kBufs);
+    c.push_back(as::add(5, 5, 6));
+    c.push_back(as::li(3, 0));
+    c.push_back(as::li(4, 0));
+    c.push_back(as::li(6, 256));
+    load(12, bus);
+    c.push_back(as::lwz(0, 0, 12));
+    c.push_back(as::lwz(2, 4, 12));
+    c.push_back(as::mtctr(0));
+    c.push_back(as::bctrl());
+    c.push_back(as::ld(31, 0x70, 1));
+    c.push_back(as::addi(1, 1, 0x80));
+    c.push_back(as::ld(0, 16, 1));
+    c.push_back(as::mtlr(0));
+    c.push_back(as::li(3, 0));
+    c.push_back(as::blr());
+    c[to_add] = as::bc_rel(4, 2, static_cast<s32>(4 * (add - to_add)));
+    REQUIRE(4 * c.size() <= kCallback - kCode);
+    for (u32 i = 0; i < c.size(); i++) ps_write32(b, kCode + 4 * i, c[i]);
+    ps_write32(b, kCallback, kCode);
+    ps_write32(b, kCallback + 4, 0);
 }
 
 struct Record {
@@ -514,6 +566,48 @@ TEST_CASE("libmixer: a sample player's speed, loop modes and stereo waves", "[hl
     REQUIRE(g.call("cellSurMixerFinalize") == 0);
     hle::set_audio_sink(*f.hle, {});
     REQUIRE(g.call("cellAudioQuit") == 0);
+}
+
+TEST_CASE("libmixer: a mixer that ran late catches up block by block, none written over another", "[hle][libmixer]")
+{
+    Fixture f;
+    REQUIRE(f.hle->initialize_tls({0, 0, 0x100}));
+    GuestThread g(f, 0, "game");
+    ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
+    u8* b = f.base();
+    write_config(b, 100, {0, 0, 0, 0});
+    for (u32 n = 0; n < 8; n++) // block n's data: (n % 8 + 1) / 16 throughout
+        for (u32 i = 0; i < 256; i++) ps_writef32(b, kBufs + 1024 * n + 4 * i, static_cast<f32>(n + 1) / 16.0f);
+    write_stalling_callback(f, 3, 25000); // about five periods late at block 3
+    std::mutex mutex;
+    std::vector<f32> heard; // each period's first left sample at the speakers
+    hle::set_audio_sink(*f.hle, [&](const f32* samples, u32) {
+        std::lock_guard lock(mutex);
+        heard.push_back(samples[0]);
+    });
+    // The blocks heard, by their data (silence where the late mixer left a block unwritten).
+    const auto blocks = [&] {
+        std::lock_guard lock(mutex);
+        std::vector<u32> v;
+        for (const f32 x : heard)
+            if (x != 0.0f) v.push_back(static_cast<u32>(x * 16.0f) - 1);
+        return v;
+    };
+    REQUIRE(g.call("cellAudioInit") == 0);
+    REQUIRE(g.call("cellSurMixerCreate", kConfig) == 0);
+    REQUIRE(g.call("cellSurMixerSetNotifyCallback", kCallback, 0) == 0);
+    REQUIRE(g.call("cellSurMixerStart") == 0);
+    CHECK(wait_for([&] { return blocks().size() >= 24; }));
+    REQUIRE(g.call("cellSurMixerFinalize") == 0);
+    REQUIRE(g.call("cellAudioQuit") == 0);
+    // Every block in order, the ones mixed in the burst after the late one too (each was written into the same ring
+    // block, over the one before, D-573).
+    const std::vector<u32> v = blocks();
+    REQUIRE(v.size() >= 24);
+    for (u32 i = 0; i < 24; i++) {
+        INFO("block " << i);
+        CHECK(v[i] == i % 8);
+    }
 }
 
 TEST_CASE("libmixer: the utilities: levels from decibels, note ratios", "[hle][libmixer]")
