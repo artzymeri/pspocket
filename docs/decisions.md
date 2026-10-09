@@ -7704,3 +7704,68 @@ answers with its file data cleared. cellSysmodule's s_sysmodule_context is not o
 the host's, in another shape.
 Tests: the HDD game check's structures are at the four variables' addresses (tests/hle/test_ac_sysutil_fs_pad.cpp); the
 cancelled import's file data is g_filedata, with g_filedata_sub, both cleared (tests/hle/test_media.cpp).
+
+## D-568 · 2026-10-09 · cellFiber pspocket's own: guest fibers on host threads passing a baton, firmware first
+
+libfiber runs cooperative fibers inside PPU threads: schedulers with fibers by priority, the lower-level contexts a game
+switches between itself, a worker control that runs one scheduler's fibers on several PPU threads, and a scheduler
+trace. RPCS3's (rpcs3/Emu/Cell/Modules/cellFiber.cpp/.h) has the signatures, the structures' sizes and alignments, the
+error codes and the argument checks it makes (null pointers, alignments, priorities above 3), and runs no fiber. No
+Sony module was at hand: firmware first (D-563). The rest is libfiber's documented model; where the documentation does
+not settle a detail, pspocket's choice is written here.
+
+**How a fiber runs.** Each fiber or context gets a host thread of its own when it first runs (the kernel's host stack
+size), with its own registers and its guest stack. A baton passes between the PPU thread's own host thread (in
+RunFibers, ContextRun, ContextRunScheduler or a worker's RunFibers) and its fibers' and contexts' host threads; only the
+holder runs guest code, the others wait on a condition variable. The holder runs as the PPU thread: it is the lv2
+thread of its host thread (lv2::set_current_thread, now public), the thread's ctx points at its registers, and its r13
+is the thread's (a worker control's fiber thus runs as whichever worker picked it). Its lv2 calls are the thread's, and
+block the thread as on a PS3. A fiber's or context's first registers are the thread's, with r1 at its stack's top less
+0x70 (a zero back chain there), r2 from its entry's descriptor, r3 its argument, r4 the context that switched to it,
+and LR at the thread return address. Its end (the entry's return, or cellFiberPpuExit, which unwinds its host thread)
+passes the baton back to the thread side running it. If the PPU thread exits inside a fiber or context, that host
+thread unwinds and hands the baton back marked so, and the thread's own host thread unwinds after it. Finalizing a
+parked context, or the process's end, unwinds its host thread (ThreadExit through the guest frames above it). A switch
+costs two condition-variable hand-overs (no speed measured yet: the firmware's libfiber still serves games where it is
+installed).
+
+**Schedulers and fibers.** _cellFiberPpuInitialize first (else NOSYSINIT for the schedulers, contexts and worker
+controls made). A fiber is made ready at the end of its priority's queue; priorities 0 (first) to 3. RunFibers, from a
+PPU thread (PERM from a fiber, BUSY while another thread runs the scheduler), runs the first ready fiber of the most
+urgent priority until it yields (back to its queue's end), waits or ends, and returns when none is ready; with
+autoCheckFlags it first checks the flag waiters' flags every autoCheckFlagsIntervalUsec while there are any. WaitSignal
+consumes a signal sent before it, else waits for SendSignal; WaitFlag waits until its word is non-zero (true) or zero
+(false), as CheckFlags (or autoCheckFlags) finds it; JoinFiber waits for the fiber's end and gives its status (from the
+thread only once it has ended, else PERM; itself: DEADLK); the last joiner releases the fiber, and an ended fiber's
+memory may make a new one. Exit and an entry's return call the fiber's onExitCallback(arg, status) on the fiber first.
+SetPriority applies at the fiber's next queueing. CheckStackLimit: r1 within the stack with the ABI's 288-byte red zone
+below it, else STAT. Fiber-only calls from a thread: PERM. A stack must be 16-byte aligned and at least 0x200 bytes.
+STAT for a scheduler, fiber or context not made (or a fiber ended, to SendSignal); BUSY to make a fiber or context
+over a live one, or to finalize a scheduler with a fiber not ended or a thread running it.
+
+**Contexts.** ContextRun (from a thread) runs a context until a context returns to the thread: *cause is
+ReturnToThread's cause and *fiberFrom the context that returned (a context whose entry returns comes back with cause 0
+and has ended: STAT to run again). ContextSwitch (from a context) runs another; when something switches back, its
+*fiberFrom is the context that did, or 0 for the thread. Running a context that runs is BUSY. ContextRunScheduler calls
+the callback (arg0, arg1) on the thread for the context to run (none: it returns at once, cause 0);
+ContextEnterScheduler calls it on the context and switches to its choice (itself: it goes on; none: back to the
+thread with cause 0). ContextSelf is the running context (a fiber: its own address), else 0. ContextFinalize: BUSY for
+the running context; a parked one's host thread unwinds first. The execution options are not read.
+
+**The worker control.** A scheduler that several PPU threads run at once: each worker's RunFibers runs ready fibers
+and, with none, waits (its polling timeout in microseconds, else 1 ms; new fibers, signals, Wakeup and Shutdown wake it
+at once) until Shutdown, then returns. JoinFiber from a non-worker thread waits for the fiber's end as that thread;
+SendSignal's *numWorker is 1 when an idle worker is there to take the fiber; CheckFlags wakes the workers with
+wakingUp. Finalize: BUSY while a worker runs or a fiber has not ended. ConnectEventQueueToSpurs and DisconnectEventQueue
+are not made: their arguments are unknown (RPCS3 has none); they log the call and answer PERM.
+
+**The trace.** Initialize (a 16-byte aligned buffer of some size), Start, Stop and Finalize each in its turn (STAT out
+of turn); no record is written (the format is the debugger's; logged once).
+
+Tests: tests/hle/test_fiber.cpp, 9 cases, 565 checks, with fibers and contexts running a guest routine that follows a
+script (log, call and log the answer, end with a status): the 47 functions and the marker; priorities, yields, Self,
+joins and a memory reused; signals, a join between fibers, a flag, the exit callback, Exit, DEADLK and the fiber-only
+calls; autoCheckFlags with the flag set from another thread, a kept signal, BUSY; contexts switching and returning to
+the thread with causes and fiberFrom, an entry's return, Finalize of a parked context; RunScheduler and EnterScheduler;
+six fibers on two worker threads joined from a third, Shutdown and Finalize; the argument checks and the trace's
+states; a thread exit inside a fiber unwinding the thread. Repeated 25 times and 6 at once without a failure.
