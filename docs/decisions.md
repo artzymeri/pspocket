@@ -7077,3 +7077,102 @@ Part 1, the objects a game fills in and their calls into the player:
   (Open/Start/Stop/Read/CloseCompleted): they log and answer NOT_AVAILABLE.
 Compared: 46 calls, the memory they touch (objects, the queue's ring, the callbacks' records) and every mutex and
 condition call with its attributes: 0 differences.
+
+## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
+
+cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)
+are pspocket's own, read from libsysutil.sprx (4.92) and compared with it running on pspocket's lv2: all 221 names
+RPCS3 registers, and libsysutil's five unnamed exports with them (runtime/hle/src/cellSysutilCxml.cpp,
+cellSysutilPacket.cpp, cellSysutilWebBrowser.cpp, cellSysutilSystem.cpp, sysutil_cxml.hpp).
+
+- **cxml.** libsysutil's binary XML. A document is a 0x74-byte object: a mode word, the 0x38-byte header it writes out
+  first (magic, version 0x110, the offset and size of six tables), each table's pointer and capacity, and the
+  allocator (a function descriptor and its argument). The tables: the element tree (0x1C bytes an element, 16 an
+  attribute; elements linked by offset: parent, siblings, first and last child), IDs, strings (each once), ints,
+  floats, files (each padded to 16 bytes). Document::Write lays the offsets out (the first table at 0x40, each 16-byte
+  aligned) and writes the header, its padding and each table through the writer; CreateFromBuffer reads a document
+  over the buffer (mode 2, read-only) or copies its tables through the allocator (types 0 to 5 get or grow a table, 6
+  to 11 free one). cxmlutil sets and gets attributes by name; a new name takes the first attribute slot with no type.
+  Elements, attributes and files are value objects the game keeps where it likes; pspocket's own requests keep them on
+  the host and build their documents in guest memory as libsysutil does, every table byte for byte libsysutil's.
+- **FixedMemory and PacketWriter.** libsysutil's allocator for its requests: two instances in its data, each six 4 KB
+  blocks (one per table type, given once; a table never grows past it) and an in-use byte. PacketWriter writes a
+  document into a packet, its last write ending the packet. pspocket keeps libsysutil's globals in a block laid out as
+  libsysutil's data from 0x1F898: the channels' lv2 objects, the shared memory areas, the save data's state, the
+  outputs' callbacks, the web browser's state, FixedMemory.
+- **The channels.** libsysutil talks to the system software through two channels in a 64 KB shared memory lv2 keeps
+  for it (key 0x8006010000000010): 32 KB each, a 32-byte header and a ring the system lays out at 0x400, an lv2 mutex
+  and four condition variables (IPC-keyed: "_s__shm", "_s__nem", "_s__nfl", "_s__stf", "_s__ctf"). One side is the
+  system's (packet ID 0), the other a request's (its ID); a packet goes one way at a time; on a closed channel every
+  wait answers 0x8002b007. pspocket's console has no system software. Decided: libsysutil's start for its channels is
+  done as the system side does it (the shared memory created and mapped into liblv2's shared memory area, the lv2
+  objects created), no rings are laid out (nothing would read or answer them), and both channels are closed as
+  libsysutil closes them when it stops. A request then runs libsysutil's code to its handover and gets libsysutil's
+  answer to a closed channel there, the same every time: its first send finds no room and answers 0x8002b007 (logged
+  once per kind of request, with the call site), and nothing waits for a reply or for a callback the system would send.
+  (A ring with no reader would take one request's packet and refuse every send after it; a system that read and
+  dropped packets would make cellWebBrowserInitialize answer OK and its INITIALIZING_FINISHED never come.)
+- **Shared memories.** cellSysutilSharedMemoryAlloc/Free: an IPC-keyed shared memory created (the system's side, 0xC000
+  in the flags) or found (any other side, retried every 100 ms while lv2 has none of that key), or made from a memory
+  container (with entries: the _ext call); mapped into the area of its page size (64 KB pages: liblv2's shared memory
+  area, sysPrxForUser's export 0xB5D5F64E, now pspocket's too; 1 MB pages: a 256 MB range of its own), counted so the
+  last one gives its range back.
+- **The web browser.** libsysutil fills the game's configs (CellWebBrowserConfig; CellWebBrowserConfig2 with its magic
+  0xDEADBEEF), estimates the memory (per tab 4508877 bytes, plus 8 MB without the view restriction's bit 0, or 8 MB in
+  all with its bit 3; a rect's pixels at its resolution factor, both sides, four bytes each; the heap; 8 MB more with
+  function bit 12; 19 MB; rounded down to 1 MB; in single precision with a fused multiply-add, saturating), keeps the
+  hooks (eleven {callback, userdata} pairs) and the memory container cellWebBrowserInitialize gives, checks the
+  container before a create (the estimate in all and all but 3 MB of it free, read with sys_memory_container_get_size,
+  whose answer it does not look at), and sends its requests on channel 0 (packet 0x10E, magic "WBRW": initialize with
+  the container, finalize, createFullBrowser with 21 attributes, destroyFullBrowser, activate, deactivate with its
+  alpha, navigateBrowser, pointer, wakeupWithGameExit, GetUsrdataOnGameExit), printing its errors through liblv2's
+  printf ("ERROR: send : sysutil_webbrowser.cpp - 147", then the function's own line). The system's events come back
+  through the callback dispatcher libsysutil registers for 0x112 (a status goes to the system callback; a hook's call
+  reads its data on channel 1): pspocket's console sends none, and the dispatcher, pspocket's internal function, is
+  compared by calling it directly. RPCS3's Estimate2 (1 MB), Initialize and Shutdown (their events sent at once) went
+  from sysutil_misc.cpp with this.
+- **The other requests.** cellSysutilNotification (0x110 bytes as a file in libsysutil's generic command, channel 0,
+  magic "CMND"), cellSysutilGameDataAssignVmc (a PS1/PS2 virtual memory card: port 0 or 1, a name of at most 127 bytes;
+  channel 1, "GDAT"), cellSysconfAbort ("SYSC"), the AV chat's panel and muting (channel 0, packet 0x10B, "AVCH"; for a
+  loaded AV chat, the panel and video for one loaded for video: pspocket's AV chat, sysutil_misc.cpp, now remembers its
+  media; a refused request is CELL_AVC_ERROR_UNKNOWN) and cellVideoOutDebugSetMonitorType (system parameter 0x4B09 set
+  with a 12-byte payload, "PARA") are libsysutil's and refused by the system. Decided: two answer from pspocket's
+  console where libsysutil reads the system's answer: _cellSysutilGetSystemParamInt (libsysutil's
+  cellSysutilGetSystemParamInt calls it; pspocket answers its configured parameters, as its own
+  cellSysutilGetSystemParamInt does, after libsysutil's checks), and cellOskDialogLoadAsyncExt (libsysutil's
+  cellOskDialogLoadAsync with the system's load mode; pspocket's on-screen keyboard, cellOskDialog.cpp, is the same
+  either way). The outputs' callbacks are kept for the system's output events (none come). g_savedata_context is now
+  the block pspocket's cellSaveData keeps its callbacks' structures in (as RPCS3 uses it). The unnamed exports: base64
+  both ways and the AV chat panel's show state (for the AV chat's library), and two for the save data's (its packet
+  begun on channel 1 with FixedMemory 1; its state, which pspocket's save data never sets, so it stays 0).
+- **Speed.** pspocket's own requests call no guest code: a document holding the FixedMemory allocator's or
+  PacketWriter's descriptor has them run natively, so a request costs host work and the lv2 calls libsysutil makes.
+- **Surprises.** libsysutil's slips are kept: CreateElement grows the tree before adding the name; SetString marks the
+  attribute a string before its value; Clear on a document made over a buffer leaves its pointers; requests end
+  FixedMemory before destroying their documents (Clear then frees into a released instance); a failed browser create
+  leaves the browser marked made (only the system's "unloaded" event clears it), so the next create answers BUSY;
+  cellWebBrowserCreate clears every hook first; the request hook gets the document the event was read into, cleared
+  as soon as it returns; base64 pads to a multiple of four characters counted with its line breaks, so a whole last
+  group still gets "====". Void functions leave r3 as their code last had it (the Document constructor the header's
+  address, the PacketWriter constructor the document's size, FixedMemory::End the in-use byte's offset, the first
+  config's functions the config): pspocket leaves the same. CreateFromBuffer takes the mode from the copy flag's low
+  byte and the copying from the whole word. PacketWrite answers 0 for a zero size before it looks at the channel.
+  FixedMemory::Begin does not check its index (past the two instances it reads its other data): pspocket logs such an
+  index and answers 0, none free.
+- **Left out.** Of the 96, nothing. libsysutil's start beyond its channels (its system callback queue, the requests
+  announcing the process to the system) is not run: pspocket's sysutil callbacks are its own (cellSysutil.cpp).
+  Reading a reply is libsysutil's code too, but on pspocket's console none comes.
+- **Compared** in tests/hle/test_sysutil_cxml_compare.cpp (D-193's method, `[sysutil]`): eight scripts, each in two
+  fresh processes with libsysutil loaded, one calling its exports and one pspocket's: every answer, the scripts' memory
+  (documents, element, attribute and file objects, a test allocator's arena and log of calls, a test writer's output,
+  callbacks' records, base64 text), libsysutil's globals and FixedMemory (addresses into them as offsets), the channels'
+  shared memory and the lv2 calls the thread makes with their arguments (TTY text included), after every call: 613
+  calls, 602 lv2 calls, 0 differences. Scripts: documents (elements, attributes, files, the tree, the writer failing and
+  short, documents over and copied from buffers, malformed buffers, an allocator running out), FixedMemory and documents
+  in it, packets (closed, then through a laid-out ring both ways and round it), shared memories, the web browser's
+  configs and estimates, its requests, creates and the system's events, the other requests (the AV chat loaded for video
+  among them) with the unnamed exports, the AV chat loaded for voice. A test without the firmware checks the channels, a
+  document round trip, FixedMemory, the system parameters and the browser's set-up. Outside cellSysutil:
+  sysPrxForUser.cpp (0xB5D5F64E), sysutil_misc.cpp (the browser's RPCS3 functions gone; the AV chat's media),
+  cellSaveData.cpp (its block in g_savedata_context), test_hle.cpp (the RPCS3 stub test takes any stub still left) and
+  test_sysutil_misc.cpp (the browser's expectations).
