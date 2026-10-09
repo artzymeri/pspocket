@@ -215,7 +215,8 @@ void mix_block(PPUContext& ctx, Mixer& m)
     for (Player& p : m.players)
         if (p.created && p.active && p.addr) mix_player(base, m, p);
     const f32 gain = m.total_mute ? 0.0f : m.total_level;
-    const u64 read = ps_read64(base, m.read_index_addr);
+    // The port's read index, published by cellAudio's thread with release order after it cleared the block it played.
+    const u64 read = ps_bswap64(__atomic_load_n(host_u64(base, m.read_index_addr), __ATOMIC_ACQUIRE));
     const u32 block = static_cast<u32>((read + kLead) % kPortBlocks);
     const u32 dst = m.port_addr + block * kBuses * kSamples * 4;
     for (u32 i = 0; i < kBuses * kSamples; i++) ps_writef32(base, dst + 4 * i, m.mix[i] * gain);
