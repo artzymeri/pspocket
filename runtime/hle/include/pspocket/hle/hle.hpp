@@ -19,6 +19,7 @@
 #include <array>
 #include <bit>
 #include <initializer_list>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -83,11 +84,17 @@ public:
     // Adds what `module` imports from firmware modules (their `module` field is set to `module`).
     void add_imports(std::string_view module, std::span<const HostImport> list);
     std::span<const HostImport> imports() const { return imports_; }
+    // Marks a library whose host implementation was made without Sony's module to compare it with (D-563): the
+    // loader gives a game the firmware's module for it when the installed system software has one (as it would for a
+    // library the host lacks), and the host's when there is none.
+    void firmware_first(std::string_view library) { firmware_first_.emplace(library); }
+    bool is_firmware_first(std::string_view library) const { return firmware_first_.contains(library); }
 
 private:
     std::vector<Function> functions_;
     std::vector<Variable> variables_;
     std::vector<HostImport> imports_;
+    std::set<std::string, std::less<>> firmware_first_;
     std::unordered_map<std::string, usize> index_; // "module:NID" -> functions_ (or variables_ with a 'v' prefix)
 };
 

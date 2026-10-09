@@ -429,9 +429,14 @@ std::optional<std::string> LleModules::file_for(std::string_view library) const
     return it->second;
 }
 
+// A library forced to its module: by the caller (force), or one the host made without Sony's module to compare with
+// (D-563, Registry::firmware_first), which goes to the firmware's module when one is installed.
 bool LleModules::forced(std::string_view library) const
 {
-    return std::find(forced_.begin(), forced_.end(), library) != forced_.end();
+    if (std::find(forced_.begin(), forced_.end(), library) != forced_.end()) return true;
+    if (!hle::registry().is_firmware_first(library)) return false;
+    const auto file = file_for(library);
+    return file && !always_native(*file);
 }
 
 bool LleModules::chooses(std::string_view library) const
@@ -593,7 +598,9 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
                             gap.push_back(std::format("{}::{:#010x} (not exported by {})", library, nid, *dep));
                         continue;
                     }
-                    if (on_host(library, nid)) continue;
+                    // A forced library's module joins rather than the host serving it (D-563).
+                    const bool to_module = dep && can_join(*dep) && forced(library);
+                    if (!to_module && on_host(library, nid)) continue;
                     if (dep && can_join(*dep)) {
                         joins.push_back(*dep);
                         continue;

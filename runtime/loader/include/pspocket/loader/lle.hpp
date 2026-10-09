@@ -84,7 +84,8 @@ public:
 
     // Whether a game's import library goes to its firmware module: after decide(), when that module was chosen for
     // the game; before, when the host implements none of the module's libraries. `forced` libraries (PSPOCKET_LLE,
-    // tests) go to their firmware module whatever the host has.
+    // tests, and the ones the host marks firmware-first, D-563) go to their firmware module whatever the host has, for
+    // the game and for the modules that import them.
     bool chooses(std::string_view library) const;
     void force(std::string library) { forced_.push_back(std::move(library)); }
 
