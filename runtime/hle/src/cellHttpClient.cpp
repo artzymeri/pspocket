@@ -1005,6 +1005,17 @@ s32 cellHttpClientGetProxy(PPUContext& ctx, u32 cl, u32 proxy, u32 pool, u32 siz
     return r;
 }
 
+// Two words of the client's (+132, +144) set together (cellHttp_39108256(clientId, a, b)).
+s32 cellHttp_39108256(PPUContext& ctx, u32 cl, u32 a, u32 b)
+{
+    if (const s32 r = check_client(ctx, cl); r < 0) return r;
+    if (const s32 r = lw_lock(ctx, cl + c::kLock); r < 0) return r;
+    w32(ctx, cl + 144, b);
+    w32(ctx, cl + 132, a);
+    lw_unlock(ctx, cl + c::kLock);
+    return kOk;
+}
+
 } // namespace
 
 s32 client_ssl_version(PPUContext& ctx, u32 client, u32 out) { return cellHttpClientGetSslVersion(ctx, client, out); }
@@ -1012,6 +1023,7 @@ s32 client_ssl_version(PPUContext& ctx, u32 client, u32 out) { return cellHttpCl
 void register_clients(Registry& r)
 {
     r.add("cellHttp", {
+        PS_HLE_FUNC(0x39108256, cellHttp_39108256),
         PS_HLE_FUNC(0x4E4EE53A, cellHttpCreateClient),
         PS_HLE_FUNC(0x980855AC, cellHttpDestroyClient),
         PS_HLE_FUNC(0x6884CDB7, cellHttpClientGetResponseBufferMax),

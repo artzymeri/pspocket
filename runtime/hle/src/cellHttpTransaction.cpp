@@ -151,8 +151,11 @@ void cache_entries_free(PPUContext& ctx, u32 tr)
         unreachable(ctx, "a transaction's cache entries");
 }
 
+} // namespace
+
 // ------------------------------------------------------------------------------------------------- the URI as a string
 
+namespace {
 // The digits of a number (libhttp's: at least one).
 u32 digits(u32 n)
 {
@@ -164,8 +167,10 @@ u32 digits(u32 n)
     return k;
 }
 
-// A CellHttpUri as text in a block of libhttp's heap: the scheme (http or https by the port when there is none),
-// "://", the host, ":port" unless it is the scheme's own, the path.
+} // namespace
+
+// The scheme (http or https by the port when there is none), "://", the host, ":port" unless it is the scheme's own,
+// the path.
 s32 uri_text(PPUContext& ctx, u32 uri, u32& out)
 {
     out = 0;
@@ -212,6 +217,8 @@ s32 uri_text(PPUContext& ctx, u32 uri, u32& out)
     out = buf;
     return kOk;
 }
+
+namespace {
 
 // The redirection record for the transaction's URI and method (libhttp keeps those of permanent redirections; offline
 // nothing makes one).
@@ -417,8 +424,9 @@ s32 cellHttpCreateTransaction(PPUContext& ctx, u32 out, u32 client, u32 method, 
     if (!pool) return fail(err(CELL_HTTP_ERROR_NO_MEMORY));
     if (const s32 r = util(ctx, "cellHttpUtilCopyUri", {tr + t::kUri, uri, pool, r32(ctx, need.addr()), 0}); r < 0)
         return fail(r);
-    if (r8(ctx, tr + t::kCache) || r8(ctx, tr + t::kExtCache))
-        return fail(unreachable(ctx, "a transaction's entry in cellHttpInitCache's cache"));
+    if (r8(ctx, tr + t::kCache) || r8(ctx, tr + t::kExtCache)) {
+        if (const s32 r = cache_find(ctx, tr, tr + t::kCacheEntry); r < 0) return fail(r);
+    }
     w32(ctx, tr + t::kDiskEntry, 0);
     w32(ctx, tr + t::kDiskEntry + 4, 0);
     if (r8(ctx, tr + t::kDiskCache)) return fail(unreachable(ctx, "a transaction's entry in the disk cache"));

@@ -162,6 +162,47 @@ s32 cellHttpClientSetSslClientCertificate(PPUContext& ctx, u32 client, u32 cert,
     return err(CELL_HTTP_ERROR_INTERNAL);
 }
 
+// The CA certificates cellHttpsInit loaded: their count (cellHttp_0E65DDD5(u32* count)), and one of them given to a
+// function of the game's (cellHttp_F799F3EF(index, func, arg)). pspocket loads none (libssl parses them).
+s32 https_ready(PPUContext& ctx)
+{
+    if (!https_initialized(ctx)) return err(CELL_HTTP_ERROR_NOT_INITIALIZED);
+    if (!initialized(ctx)) return err(CELL_HTTP_ERROR_NOT_INITIALIZED);
+    if (!ssl_initialized()) return err(CELL_HTTPS_ERROR_NO_SSL);
+    return kOk;
+}
+
+u32 certificates(PPUContext& ctx)
+{
+    u32 n = 0;
+    for (u32 c = r32(ctx, r32(ctx, data(ctx) + kHttps) + kCtxCerts); c; c = r32(ctx, c)) n++;
+    return n;
+}
+
+s32 cellHttp_0E65DDD5(PPUContext& ctx, u32 out)
+{
+    if (const s32 r = https_ready(ctx); r < 0) return r;
+    if (!out) return err(CELL_HTTP_ERROR_NO_BUFFER);
+    if (usable(ctx, out, 4, "cellHttp_0E65DDD5")) w32(ctx, out, certificates(ctx));
+    return kOk;
+}
+
+s32 cellHttp_F799F3EF(PPUContext& ctx, u32 index, u32 func, u32 arg)
+{
+    (void)func, (void)arg;
+    if (const s32 r = https_ready(ctx); r < 0) return r;
+    const u32 n = certificates(ctx);
+    if (index > n || (index == n && n != 0)) return err(CELL_HTTP_ERROR_INVALID_VALUE);
+    if (n == 0) {
+        log_call_site(ctx, gb(ctx), "cellHttp_F799F3EF: no CA certificates (libhttp reads the empty list's first "
+                                    "entry and faults): CELL_HTTP_ERROR_INVALID_VALUE");
+        return err(CELL_HTTP_ERROR_INVALID_VALUE);
+    }
+    log_call_site(ctx, gb(ctx), "cellHttp_F799F3EF: a CA certificate (libssl's) given to a function, which pspocket "
+                                "can't do: CELL_HTTP_ERROR_INTERNAL");
+    return err(CELL_HTTP_ERROR_INTERNAL);
+}
+
 s32 cellHttpsEnd(PPUContext& ctx)
 {
     const u32 slot = data(ctx) + kHttps;
@@ -185,6 +226,8 @@ void register_https(Registry& r)
         PS_HLE_FUNC(0x522180BC, cellHttpsInit),
         PS_HLE_FUNC(0xE6D4202F, cellHttpsEnd),
         PS_HLE_FUNC(0xD8352A40, cellHttpClientSetSslClientCertificate),
+        PS_HLE_FUNC(0x0E65DDD5, cellHttp_0E65DDD5),
+        PS_HLE_FUNC(0xF799F3EF, cellHttp_F799F3EF),
     });
 }
 

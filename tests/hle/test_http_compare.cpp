@@ -1074,6 +1074,95 @@ std::vector<Op> transaction_script()
     return s;
 }
 
+// The caches (cellHttpInitCache's and the external one in a buffer of the script's), a transaction's lookup of its URI,
+// the connections' buffer size, two words of a client's, the CA certificates' count.
+std::vector<Op> cache_script()
+{
+    std::vector<Op> s;
+    const u64 o = kOut;
+    const u64 cl = o + 0x40, C = cl | kDeref, t0 = o + 0x50, t1 = o + 0x54, t2 = o + 0x58;
+    const u64 u_http = o + 0x100, u_port = o + 0x120;
+    uri(s, u_http, 10, 18, 0, 0, 19, 80);
+    uri(s, u_port, 0, 18, 0, 0, 13, 8080);
+    callback_code(s);
+    s.push_back({"=", {str(91), str(90)}});
+    s.push_back({"=", {str(91) + 4, 0}});
+    const auto both = [&](u64 at) {
+        s.push_back({"cellHttpGetCacheInfo", {at}});
+        s.push_back({"cellHttpFlushCache", {}});
+        s.push_back({"cellHttp_003F88AE", {str(91), o + 0x80}});
+        s.push_back({"cellHttp_6C89A986", {at + 8}});
+        s.push_back({"cellHttp_8DC2D51D", {}});
+        s.push_back({"cellHttp_9BF4365D", {str(91), o + 0x88}});
+    };
+    // Before anything: then cellHttpInitCache without cellHttpInit.
+    both(o + 0x200);
+    s.push_back({"cellHttpEndCache", {}});
+    s.push_back({"cellHttpEndExternalCache", {}});
+    s.push_back({"cellHttp_DE6475BF", {0x1234}});
+    s.push_back({"cellHttp_F1374828", {o + 0x210}});
+    s.push_back({"cellHttp_0E65DDD5", {o + 0x214}});
+    s.push_back({"cellHttp_F799F3EF", {1, str(91), 0}});
+    s.push_back({"cellHttp_39108256", {0, 1, 2}});
+    s.push_back({"cellHttpInitCache", {0x10000}});
+    s.push_back({"cellHttpInitCache", {0x20000}});
+    both(o + 0x220);
+    s.push_back({"cellHttpEndCache", {}});
+    s.push_back({"cellHttpEndCache", {}});
+    s.push_back({"cellHttpInit", {kPool, kPoolSize}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpInitCache", {0x8000}});
+    s.push_back({"cellHttp_009E4B77", {o + 0x2000, 0x1180}});
+    s.push_back({"cellHttp_009E4B77", {o + 0x4000, 0x1000}});
+    both(o + 0x240);
+    s.push_back({"cellHttpEndExternalCache", {}});
+    s.push_back({"cellHttpEndExternalCache", {}});
+    s.push_back({"cellHttp_009E4B77", {o + 0x4000, 0x1FF}});
+    both(o + 0x260);
+    s.push_back({"cellHttpEndExternalCache", {}});
+    s.push_back({"cellHttp_009E4B77", {o + 0x5000, 0x1000}});
+    // Clients with the caches on: a transaction looks its URI up.
+    s.push_back({"cellHttpCreateClient", {cl}});
+    s.push_back({"cellHttp_39108256", {C, 0x11111111, 0x22222222}});
+    s.push_back({"cellHttp_39108256", {0x1234, 1, 2}});
+    s.push_back({"cellHttpClientSetCacheStatus", {C, 1}});
+    s.push_back({"cellHttpCreateTransaction", {t0, C, str(50), u_http}});
+    s.push_back({"cellHttpCreateTransaction", {t1, C, str(51), u_port}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttp_BB2B5341", {C, 1}});
+    s.push_back({"cellHttpCreateTransaction", {t2, C, str(50), u_port}});
+    s.push_back({"cellHttpRequestGetAllHeaders", {t0 | kDeref, o + 0x300, o + 0x304, o + 0x6000, 0x400, o + 0x308}});
+    s.push_back({"cellHttpRequestGetAllHeaders", {t2 | kDeref, o + 0x310, o + 0x314, o + 0x6400, 0x400, o + 0x318}});
+    s.push_back({"cellHttpSendRequest", {t0 | kDeref, 0, 0, o + 0x320}});
+    s.push_back({"cellHttp_DCD9D484", {t2 | kDeref, 0, 0, o + 0x324}});
+    s.push_back({"pool", {}});
+    // The connections' buffer size.
+    s.push_back({"cellHttp_DE6475BF", {0x4000}});
+    s.push_back({"cellHttp_F1374828", {o + 0x330}});
+    s.push_back({"cellHttp_F1374828", {0}});
+    // The CA certificates (none).
+    s.push_back({"cellHttp_0E65DDD5", {o + 0x340}});
+    s.push_back({"ssl:cellSslInit", {kData + 0x1B0000, 0x40000}});
+    s.push_back({"cellHttp_0E65DDD5", {o + 0x344}});
+    s.push_back({"cellHttpsInit", {0, 0}});
+    s.push_back({"cellHttp_0E65DDD5", {o + 0x348}});
+    s.push_back({"cellHttp_0E65DDD5", {0}});
+    s.push_back({"cellHttp_F799F3EF", {1, str(91), o + 0x90}});
+    s.push_back({"cellHttp_F799F3EF", {7, str(91), o + 0x90}});
+    s.push_back({"cellHttpsEnd", {}});
+    s.push_back({"ssl:cellSslEnd", {}});
+    // Destroyed with their entries; the caches ended.
+    for (const u64 t : {t0, t1, t2}) s.push_back({"cellHttpDestroyTransaction", {t | kDeref}});
+    s.push_back({"cellHttpDestroyClient", {C}});
+    both(o + 0x280);
+    s.push_back({"cellHttpEndCache", {}});
+    s.push_back({"cellHttpEndExternalCache", {}});
+    s.push_back({"pool", {}});
+    s.push_back({"cellHttpEnd", {}});
+    for (const u64 at : {cl, t0, t1, t2}) s.push_back({"~", {at}});
+    return s;
+}
+
 } // namespace
 
 // Without the firmware: libhttp's answers for the set-up and a client, as the comparisons found them.
@@ -1339,6 +1428,13 @@ TEST_CASE("cellHttp against libhttp: transactions", "[hle][lle][http]")
     const std::optional<std::string> flash = test_dev_flash();
     if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
     compare(*flash, transaction_script(), "transactions");
+}
+
+TEST_CASE("cellHttp against libhttp: caches", "[hle][lle][http]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    compare(*flash, cache_script(), "caches");
 }
 
 TEST_CASE("cellHttp against libhttp: probe", "[.][hle][lle][http]")

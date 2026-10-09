@@ -670,6 +670,30 @@ s32 cellHttpSetProxy(PPUContext& ctx, u32 proxy)
     return r;
 }
 
+// The buffer size new connections get (cellHttp_DE6475BF(size), read back with cellHttp_F1374828(u32* size)).
+s32 cellHttp_DE6475BF(PPUContext& ctx, u32 size)
+{
+    if (!initialized(ctx)) return err(CELL_HTTP_ERROR_NOT_INITIALIZED);
+    const u32 sys = data(ctx) + kSys;
+    const s32 r = lw_lock(ctx, sys + kSysLock);
+    if (r < 0) return r;
+    w32(ctx, sys + kSysBufSize, size);
+    lw_unlock(ctx, sys + kSysLock);
+    return r;
+}
+
+s32 cellHttp_F1374828(PPUContext& ctx, u32 out)
+{
+    if (!initialized(ctx)) return err(CELL_HTTP_ERROR_NOT_INITIALIZED);
+    if (!out) return err(CELL_HTTP_ERROR_NO_BUFFER);
+    const u32 sys = data(ctx) + kSys;
+    const s32 r = lw_lock(ctx, sys + kSysLock);
+    if (r < 0) return r;
+    if (usable(ctx, out, 4, "cellHttp_F1374828")) w32(ctx, out, r32(ctx, sys + kSysBufSize));
+    lw_unlock(ctx, sys + kSysLock);
+    return r;
+}
+
 } // namespace
 
 u32 records_find(PPUContext& ctx, u32 uri_string, u32 method)
@@ -719,6 +743,8 @@ void register_core(Registry& r)
         PS_HLE_FUNC(0xE95BFC2C, cellHttpGetMemoryInfo),
         PS_HLE_FUNC(0x2A87603A, cellHttpGetProxy),
         PS_HLE_FUNC(0x0D896B97, cellHttpSetProxy),
+        PS_HLE_FUNC(0xDE6475BF, cellHttp_DE6475BF),
+        PS_HLE_FUNC(0xF1374828, cellHttp_F1374828),
     });
 }
 
@@ -735,6 +761,7 @@ void register_cellHttp(Registry& r)
     http::register_https(r);
     http::register_transactions(r);
     http::register_connections(r);
+    http::register_caches(r);
 }
 
 } // namespace pspocket::hle

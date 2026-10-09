@@ -6549,3 +6549,58 @@ file over two GETs with bss, a missing file, a file that is not an SPU program, 
 in the SDK's layout, an unknown image type, a kernel image: answers, the whole local store, NPC and the entry the
 same); tests/hle/test_spu_threads.cpp (lv2's table layout, and a user image whose table the test wrote run in an SPU
 thread group).
+
+## D-524 · 2026-10-09 · cellHttp pspocket's own: libhttp's objects, laid out where libhttp lays them
+
+cellHttp had six functions after RPCS3's (the set-up's and the cookie store's checks; online play was a non-goal,
+D-024). It is now libhttp.sprx's logic, read from its code and compared with the module running on pspocket's lv2:
+all 123 named functions and 46 of its 58 unnamed exports
+(runtime/hle/src/cellHttp*.cpp, one file per part: set-up, clients, connections, transactions, cookies,
+authentication cache, caches, HTTPS).
+
+- **Laid out as libhttp's.** libhttp keeps every object in liblv2 heaps made over the game's pools (cellHttpInit's;
+  cellHttpInitCookie's, a heap of its own) and its globals in its data. pspocket makes the same heap blocks, of the
+  same sizes, in the same order, with the fields at libhttp's offsets (cellHttp.hpp: the client 224 bytes, its
+  connection manager 168, a transaction 488, a connection 152 with its socket at +40, host records 64, header nodes
+  20, cookies 64 and domain records 36, authentication entries 644, redirection records 96), so the IDs a game holds
+  are the blocks' addresses and the pools' bytes are libhttp's; the globals are a block of pspocket's. Every ID is
+  checked as libhttp checks it: sys_memory_get_page_attribute (351) on the address, then the object's pointer to
+  itself. Locks are liblv2 lightweight mutexes with libhttp's names (_httsys, _httcln, _httcla, _httcmg, _htttrn,
+  _htttna, _httrec, _httauc, _httcok, _httssl, _httvfy, _httcac, _httxca); a host record has an lv2 mutex and condition
+  "_httsyn". libhttp's MD5 files cookies, redirection records and cache entries; the SDK version (syscalls 1, 25)
+  picks limits and the default SSL version. Other libraries are called through the registry, as libhttp imports them
+  (cellHttpUtil, sysPrxForUser, sys_net, cellRtc); the transaction state callback is called on the game's thread.
+- **Offline.** A request goes as far as an offline console's: the state callback (1), the redirection records, the
+  manager's host record (made), its limits, a connection with its socket, then libnet's resolver, which isn't
+  pspocket's (D-523 part 2) and fails: CELL_HTTP_ERROR_NET_RESOLVER and h_errno, the connection destroyed (before
+  sys_net_initialize_network the socket fails: 0x80710410). A transaction stays in state 0, so the response getters
+  answer NO_REQUEST_SENT, the connection calls TRANS_NO_CONNECTION, polling NO_CONNECTION, as libhttp does there.
+  libhttp's code past a made connection (connecting, sending, receiving and parsing, chunks, gzip, redirections,
+  authentication, cookies and cache entries from responses, pipelines, waiting for a connection) is not pspocket's:
+  where it would run, `unreachable()` logs the call site and answers CELL_HTTP_ERROR_INTERNAL. It is the next part,
+  once the resolver is pspocket's, compared with libhttp against a loopback server.
+- **HTTPS.** libssl is not pspocket's: cellHttpsInit loads no CA certificates (logged when given some) and then does
+  what libssl's cellSsl_CC6A0CB5 does for libhttp, reading the title's PARAM.SFO (_sys_process_get_paramsfo); libssl's
+  list of titles that get other verification flags is its data and isn't reproduced. cellHttpClientSetSslClientCertificate
+  makes its checks, then answers CELL_HTTP_ERROR_INTERNAL; the SSL getters answer as libhttp does without a
+  connection (UNAVAILABLE for HTTP, BAD_CONN for HTTPS).
+- **Caches.** cellHttpInitCache's and the external one (cellHttp_009E4B77, 512-byte blocks in the game's buffer) are
+  libhttp's, with their statistics, flushes and walks, and a transaction looks its URI up at creation; their entries
+  come from responses, so offline they stay empty.
+- **Where libhttp faults** (a pointer it dereferences unchecked: a URI, a header's name, an output), pspocket logs the
+  call site and answers CELL_HTTP_ERROR_NO_BUFFER (D-042). libhttp's own slips are kept where they show: a failed
+  transaction leaves its header copies, cellHttpTransactionSetUri its block on a failed copy, a failed creation
+  unlocks a client lock it doesn't hold, cellHttpDestroyTransaction keeps the client's lock when its second check
+  fails, cellHttpRequestGetAllHeaders counts 20 bytes for each header it adds.
+- **Compared** in tests/hle/test_http_compare.cpp (D-193's method, `[http]`): scripts in two fresh processes, Sony's
+  libhttp (with libssl) and pspocket's: every answer, the scripts' memory, libhttp's pools (heap magic and footers,
+  lv2 IDs and pointers to each side's globals set aside) and the lv2 calls the thread makes with their arguments, the
+  same. Scripts: the authentication cache, the cookie store and its limits, clients, transactions (creation, every
+  function on IDs that are not, headers both ways, sending with and without libnet set up, a proxy, HTTPS, cookies in
+  requests), caches. A test without the firmware keeps libhttp's answers for the set-up and a client. The old RPCS3
+  check of cellHttpInit/End in tests/hle/test_net.cpp went with this.
+- **Left out.** libhttp's disk cache, twelve unnamed exports (0xE55FE254, 0xABC0EB57, 0x419C41D2, 0x4558639F,
+  0xEBF753AB, 0xB6D70A87, 0xA01CC407, 0x17EDB7D0, 0xE9BE8A88, 0xA3981634, 0x03F1AEF6, 0x08924181: an index and
+  response files through cellFs): not registered, so a game importing one gets the loader's CELL_ENOSYS; clients can't
+  switch it on (DCACHE_NOT_INITIALIZED). cellHttp_F799F3EF with certificate 0 of none (libhttp faults) answers
+  INVALID_VALUE.

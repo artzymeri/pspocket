@@ -173,8 +173,11 @@ inline constexpr u32 kRec = 0x180;
 inline constexpr u32 kHttps = 0x7C0;
 // The table of transaction functions a manager is given (libhttp's: abort and release).
 inline constexpr u32 kTransactionTable = 0x7D0;
-// The caches (cellHttpInitCache's and the external one) and the disk cache.
-inline constexpr u32 kCache = 0x800, kExtCache = 0x880, kDiskCache = 0x900;
+// The caches: cellHttpInitCache's (its lock "_httcac", initialised +24, the size +28 and the bytes used +32, the
+// entries +36, +40, and 256 buckets at +48) and the external one in a buffer of the game's (cellHttp_009E4B77: its lock
+// "_httxca", initialised +24, the buffer +28 and its size +32, the 512-byte blocks used +36 and free +40, the
+// entries +44, +48; its buckets at kExtTable); the disk cache (its object +0, initialised +16).
+inline constexpr u32 kCache = 0x1000, kExtCache = 0x1440, kExtTable = 0x1480, kDiskCache = 0x1900;
 // Strings libhttp hands to other libraries (heap names, the headers it adds to a request).
 inline constexpr u32 kStrHeap = 0xC00, kStrCookieHeap = 0xC20, kStrSlash = 0xC40, kStrEquals = 0xC44, kStrSemi = 0xC48;
 inline constexpr u32 kStrHost = 0xC50, kStrUserAgent = 0xC58, kStrConnection = 0xC68, kStrProxyConnection = 0xC78,
@@ -182,7 +185,7 @@ inline constexpr u32 kStrHost = 0xC50, kStrUserAgent = 0xC58, kStrConnection = 0
                      kStrChunked = 0xCD0, kStrAuthorization = 0xCD8, kStrProxyAuthorization = 0xCE8,
                      kStrCookie = 0xD00, kStrAcceptEncoding = 0xD08, kStrGzip = 0xD18, kStrIdentity = 0xD20,
                      kStrIfModifiedSince = 0xD30, kStrRange = 0xD48, kStrContentRange = 0xD50;
-inline constexpr u32 kDataSize = 0x1000;
+inline constexpr u32 kDataSize = 0x2000;
 
 bool initialized(PPUContext& ctx);
 bool https_initialized(PPUContext& ctx);
@@ -275,6 +278,12 @@ void register_auth(Registry& r);
 void register_https(Registry& r);
 void register_transactions(Registry& r);
 void register_connections(Registry& r);
+void register_caches(Registry& r);
+
+// A CellHttpUri as text ("scheme://host[:port]path") in a block of libhttp's heap (cellHttpTransaction.cpp).
+s32 uri_text(PPUContext& ctx, u32 uri, u32& out);
+// A transaction's entry in the cache its client uses (cellHttpCache.cpp): the one for its URI, 0 for none.
+s32 cache_find(PPUContext& ctx, u32 t, u32 out);
 
 // A connection (cellHttpConnection.cpp).
 namespace conn {
