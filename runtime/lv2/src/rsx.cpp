@@ -12,7 +12,11 @@
 // 0x40000000, which is rsx::ContextLayout::rpcs3_default().
 //
 // Deviations:
-// - One context per process (RPCS3 aborts on a second one too); context free and device unmap are not implemented.
+// - One context at a time (RPCS3 aborts on a second one too). sys_rsx_context_free stops the RSX thread and forgets
+//   the context (a new one can be allocated); the device stays mapped for the process (sys_rsx_device_unmap is
+//   CELL_OK, RPCS3's todo). sys_rsx_memory_free with a context still allocated is refused (CELL_EBUSY): RPCS3 aborts.
+// - sys_rsx_device_open/close and sys_rsx_attribute: lv1's device needs nothing more here (CELL_OK, as RPCS3);
+//   sys_rsx_trace_ioctl is a debug kernel's RSX trace: CELL_ENOSYS on a retail console (D-527).
 // - The driver information's handler event queue and port are not created: the HLE interrupt handlers do not go
 //   through lv2 event queues.
 // - Display flip (0x102) goes to the RSX thread as a GCM_FLIP_HEAD would (Rsx::request_flip); display queue (0x103)
@@ -254,6 +258,58 @@ Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_contr
     return CELL_OK;
 }
 
+// sys_rsx_device_open() / sys_rsx_device_close(): nothing to open (see the top).
+Result sys_rsx_device_open(PpuThread&) { return CELL_OK; }
+Result sys_rsx_device_close(PpuThread&) { return CELL_OK; }
+
+// sys_rsx_memory_free(mem_handle): the local memory goes; none: CELL_ENOMEM (RPCS3).
+Result sys_rsx_memory_free(PpuThread& t, u32)
+{
+    RsxDevice& d = dev(t);
+    std::lock_guard lock(d.mutex);
+    if (!d.local_size) return err(CELL_ENOMEM);
+    if (d.dma_control) {
+        PS_LOG_ERROR(kRsxChan, "sys_rsx_memory_free with the RSX context still allocated (RPCS3 aborts): refused");
+        return err(CELL_EBUSY);
+    }
+    t.kernel.memory().decommit(PS_MEM_RSX_LOCAL_BASE, d.local_size);
+    d.local_size = 0;
+    return CELL_OK;
+}
+
+// sys_rsx_context_free(context_id): the RSX thread stops and the context is forgotten (RPCS3: its event queue and
+// port go too; pspocket made none, see the top).
+Result sys_rsx_context_free(PpuThread& t, u32 context_id)
+{
+    RsxDevice& d = dev(t);
+    std::unique_ptr<rsx::Rsx> gpu;
+    std::unique_ptr<rsx::Backend> backend;
+    {
+        std::lock_guard lock(d.mutex);
+        if (context_id != kContextId || !d.dma_control) return err(CELL_EINVAL);
+        gpu = std::move(d.rsx);
+        backend = std::move(d.backend);
+        d.dma_control = 0;
+        d.driver_info = 0;
+        d.reports = 0;
+        d.main_mem_size = 0;
+    }
+    if (gpu) gpu->stop();
+    gpu.reset();
+    backend.reset();
+    PS_LOG_INFO(kRsxChan, "sys_rsx_context_free: RSX thread stopped, context freed");
+    return CELL_OK;
+}
+
+// sys_rsx_device_unmap(dev_id): the mapping stays the process's (see the top).
+Result sys_rsx_device_unmap(PpuThread&, u32) { return CELL_OK; }
+
+// sys_rsx_attribute(package, a2, a3, a4, a5): CELL_OK (RPCS3).
+Result sys_rsx_attribute(PpuThread&, u32, u32, u32, u32, u32) { return CELL_OK; }
+
+// sys_rsx_trace_ioctl: a debug kernel's (see the top).
+Result sys_rsx_trace_ioctl(PpuThread&) { return err(CELL_ENOSYS); }
+
 Result sys_rsx_context_iomap(PpuThread& t, u32 context_id, u64 io, u64 ea, u64 size, u64 flags)
 {
     PS_LOG_DEBUG(kRsxChan, "sys_rsx_context_iomap(io {:#x}, ea {:#x}, size {:#x}, flags {:#x})", io, ea, size, flags);
@@ -464,6 +520,13 @@ void register_rsx_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 673, sys_rsx_context_iounmap);
     PS_LV2_BIND(table, 674, sys_rsx_context_attribute);
     PS_LV2_BIND(table, 675, sys_rsx_device_map);
+    PS_LV2_BIND(table, 666, sys_rsx_device_open);
+    PS_LV2_BIND(table, 667, sys_rsx_device_close);
+    PS_LV2_BIND(table, 669, sys_rsx_memory_free);
+    PS_LV2_BIND(table, 671, sys_rsx_context_free);
+    PS_LV2_BIND(table, 676, sys_rsx_device_unmap);
+    PS_LV2_BIND(table, 677, sys_rsx_attribute);
+    PS_LV2_BIND(table, 968, sys_rsx_trace_ioctl);
 }
 
 } // namespace pspocket::lv2

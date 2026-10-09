@@ -6428,3 +6428,26 @@ Part 1 (runtime/lv2/src/devices.cpp, services.cpp; 78 calls):
   their sizes, reads of zeros (no device contents), writes taken, asynchronous commands answered at once on the
   configured queue; the emulated speed is a debug kernel's (ENOSYS).
 Tests: tests/lv2/test_devices.cpp, test_services.cpp (both permission sides, every answer above).
+
+Part 2 (runtime/lv2/src/misc.cpp, rsx.cpp; 110 calls). RPCS3 answers these with todos or null slots; pspocket's
+answers follow its console, and one correction to part 1's rule: a call RPCS3 marks ROOT that Sony's game-loadable
+modules make (libatxenc's SPU group switching, 244-247) must work for a game, lv2 letting those modules run in it.
+- Debug and test kernels' facilities: the lv1 trace (60-69, 77), the performance monitor and PC trace (960-967),
+  DECI3 (880-899), the Blu-ray disc emulator (699), the RSX trace (968), and the USB/Bluetooth audio calls RPCS3 marks
+  deprecated (640-647): CELL_ENOSYS, as RPCS3 answers the trace calls.
+- The system software's: the Bluetooth module (583-597), its settings (635), the NP DRM key cache (470, 471), sys_ss's
+  sunset flag, protected file database, virtual TRM and factory data (860-862, 869), the process calls RPCS3 marks
+  ROOT or DBG (2, 4, 5, 21, 23, 27, 28), the RTC (119) and sys_console_write (398): CELL_ENOSYS for a game; for root
+  no children (ESRCH), no spawning (ENOTSUP), the object count as sys_process_get_number_of_object, the RTC as the
+  wall clock's seconds, the console text logged, CELL_OK otherwise.
+- One process: sys_process_kill finds no child (ESRCH).
+- Calls Sony's game-loadable modules make: CELL_OK with nothing to do here (group switching and start-on-exit, the
+  shared-memory flag, attribute and access rights, the budget, the security framework, disc access control, media ID
+  and ad signature, the file-system watch, the YCON gamepad interface and the LDD pads, which pspocket's libio serves).
+  sys_bluetooth's 579 keeps RPCS3's checks. sys_console_write2 logs its text; sys_fs_sync has nothing to flush.
+- sys_rsx: the device open and close, the attribute and the unmap answer CELL_OK; sys_rsx_context_free stops the RSX
+  thread and forgets the context, after which a new one can be allocated; sys_rsx_memory_free gives the local memory
+  back (with the context still allocated it is refused, CELL_EBUSY, where RPCS3 aborts).
+Tests: tests/lv2/test_misc_calls.cpp (every call above on both sides), tests/hle/test_gcm.cpp (context and memory
+freed, then allocated again with a new RSX thread); Sony's libgcm_sys still compares the same (test_gcm_compare).
+Kernel calls own: 483 of 634.

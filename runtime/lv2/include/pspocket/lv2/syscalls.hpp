@@ -333,5 +333,7 @@ Result sys_rsx_context_iomap(PpuThread& t, u32 context_id, u64 io, u64 ea, u64 s
 Result sys_rsx_context_iounmap(PpuThread& t, u32 context_id, u64 io, u64 size);
 Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u64 a3, u64 a4, u64 a5, u64 a6);
 Result sys_rsx_device_map(PpuThread& t, u32 dev_addr, u32 a2, u32 dev_id);
+Result sys_rsx_memory_free(PpuThread& t, u32 mem_handle);
+Result sys_rsx_context_free(PpuThread& t, u32 context_id);
 
 } // namespace pspocket::lv2

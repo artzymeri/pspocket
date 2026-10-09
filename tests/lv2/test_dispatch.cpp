@@ -156,8 +156,8 @@ TEST_CASE("lv2: RPCS3's null_func syscalls return CELL_OK", "[lv2][dispatch]")
     Caller c(*f.kernel);
     LogCapture log;
     const u64 before = f.kernel->unimplemented_count();
-    CHECK(c.call(167, 1, 2) == CELL_OK); // sys_spu_thread_group_start_on_exit
-    CHECK(log.contains("lv2", "syscall 167 (sys_spu_thread_group_start_on_exit) is not implemented; returns CELL_OK"));
+    CHECK(c.call(215, 1, 2) == CELL_OK); // sys_dbg_mat_set_condition, still answered as RPCS3 does
+    CHECK(log.contains("lv2", "syscall 215 (sys_dbg_mat_set_condition) is not implemented; returns CELL_OK"));
     CHECK(c.call(988) == CELL_OK); // a debug exception handler, as GTA V's CRT registers
     CHECK(c.call(54) == CELL_OK);  // an unnamed null_func slot (ROOT)
     CHECK(f.kernel->unimplemented_count() == before);

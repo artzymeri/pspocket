@@ -305,3 +305,28 @@ TEST_CASE("cellGcmSys: the interrupt thread counts vblanks and calls the game's 
     }
     ps_ppu_set_miss_policy(policy);
 }
+
+TEST_CASE("sys_rsx: freeing the context and the local memory, then allocating again", "[hle][gcm]")
+{
+    Fixture f({}, rsx_test_config());
+    GuestThread g(f, 0, "rsx");
+    u8* b = f.base();
+    lv2::PpuThread& t = *g.t;
+    REQUIRE(lv2::sys_rsx_memory_allocate(t, kOut, kOut + 8, 0x0F900000, 0, 0, 0, 0) == lv2::CELL_OK);
+    REQUIRE(lv2::sys_rsx_device_map(t, kOut + 0x10, 0, 8) == lv2::CELL_OK);
+    REQUIRE(lv2::sys_rsx_context_allocate(t, kOut + 0x18, kOut + 0x20, kOut + 0x28, kOut + 0x30, 0, 0) == lv2::CELL_OK);
+    REQUIRE(f.kernel->rsx() != nullptr);
+    CHECK(lv2::sys_rsx_memory_free(t, ps_read32(b, kOut)) == lv2::err(lv2::CELL_EBUSY)); // the context still uses it
+    CHECK(lv2::sys_rsx_context_free(t, 0x1234) == lv2::err(lv2::CELL_EINVAL));
+    REQUIRE(lv2::sys_rsx_context_free(t, 0x55555555) == lv2::CELL_OK);
+    CHECK(f.kernel->rsx() == nullptr);
+    CHECK(lv2::sys_rsx_context_free(t, 0x55555555) == lv2::err(lv2::CELL_EINVAL));
+    CHECK(lv2::sys_rsx_context_iomap(t, 0x55555555, 0x00300000, kIo, 0x100000, 0) == lv2::err(lv2::CELL_EINVAL));
+    REQUIRE(lv2::sys_rsx_memory_free(t, ps_read32(b, kOut)) == lv2::CELL_OK);
+    CHECK(!f.mem.is_committed(PS_MEM_RSX_LOCAL_BASE));
+    // Both again: a new context with its RSX thread.
+    REQUIRE(lv2::sys_rsx_memory_allocate(t, kOut, kOut + 8, 0x0F900000, 0, 0, 0, 0) == lv2::CELL_OK);
+    REQUIRE(lv2::sys_rsx_context_allocate(t, kOut + 0x18, kOut + 0x20, kOut + 0x28, kOut + 0x30, 0, 0) == lv2::CELL_OK);
+    CHECK(f.kernel->rsx() != nullptr);
+    CHECK(ps_read32(b, kOut + 0x18) == 0x55555555);
+}

@@ -150,6 +150,7 @@ void register_usbd_syscalls(SyscallTable& table);
 void register_net_syscalls(SyscallTable& table);
 void register_device_syscalls(SyscallTable& table);
 void register_service_syscalls(SyscallTable& table);
+void register_misc_syscalls(SyscallTable& table);
 
 // The whole of the open file `fd` (a host file or one on an image), without moving its position (fs.cpp; for
 // sys_spu_image_open_by_fd). CELL_EBADF when fd is not an open file.
