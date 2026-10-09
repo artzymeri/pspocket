@@ -554,7 +554,8 @@ u32 setlocale_(PPUContext& ctx, s32 category, u32 name)
 }
 
 // localeconv: the "C" locale's struct lconv, Dinkumware's C99 layout: seven monetary strings, fourteen chars
-// (CHAR_MAX), then decimal_point (+44), grouping, thousands_sep and Dinkumware's five more strings.
+// (CHAR_MAX, 255: a guest char is unsigned), then decimal_point (+44), grouping, thousands_sep and Dinkumware's five
+// more strings.
 u32 localeconv_(PPUContext& ctx)
 {
     LocaleState& s = HleProcess::current()->state<LocaleState>();
@@ -567,7 +568,7 @@ u32 localeconv_(PPUContext& ctx)
         u8* b = gb(ctx);
         std::memset(b + s.lconv, 0, 80);
         for (u32 i = 0; i < 7; i++) ps_write32(b, s.lconv + 4 * i, strings + 2);
-        for (u32 i = 0; i < 14; i++) b[s.lconv + 28 + i] = 0x7F;
+        for (u32 i = 0; i < 14; i++) b[s.lconv + 28 + i] = 0xFF;
         ps_write32(b, s.lconv + 44, strings + 4);
         for (u32 i = 1; i < 9; i++) ps_write32(b, s.lconv + 44 + 4 * i, strings + 2);
     }
