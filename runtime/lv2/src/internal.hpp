@@ -51,6 +51,17 @@ public:
     void w16(u32 a, u16 v) const { ps_write16(base_, a, v); }
     void w32(u32 a, u32 v) const { ps_write32(base_, a, v); }
     void w64(u32 a, u64 v) const { ps_write64(base_, a, v); }
+    // Aligned words lv2's own threads share with the guest while it runs (rsxaudio's ring buffers): a flag the guest
+    // sets after the data it announces is read with acquire order, and an index that hands entries back is written with
+    // release order after what was done with them (D-586).
+    u32 r32_acquire(u32 a) const
+    {
+        return ps_bswap32(__atomic_load_n(reinterpret_cast<const u32*>(base_ + a), __ATOMIC_ACQUIRE));
+    }
+    void w32_release(u32 a, u32 v) const
+    {
+        __atomic_store_n(reinterpret_cast<u32*>(base_ + a), ps_bswap32(v), __ATOMIC_RELEASE);
+    }
 
     // Checked single writes: false (and nothing written) when the pointer is invalid.
     bool put32(u32 a, u32 v) const;

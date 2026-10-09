@@ -142,6 +142,30 @@ TEST_CASE("lv2 threads: stack information, guard page and stack release", "[lv2]
     CHECK_FALSE(t.f.mem.is_committed(stack_addr)); // released at exit
 }
 
+// D-586: an exiting thread became a zombie and only then gave its stack back, so a join in between returned at once
+// with the stack still committed and its memory not yet back in the container (the test above, one run in three under
+// ThreadSanitizer). Here each worker is joined the moment it is marked finished.
+TEST_CASE("lv2 threads: a thread's stack is released before a join can return", "[lv2][thread]")
+{
+    ThreadFixture t;
+    std::atomic<u32> stack_addr{0};
+    t.entries.add(0x21000, [&](PPUContext& ctx) {
+        const u32 sp = t.f.alloc(8);
+        syscall(ctx, kThreadGetStackInfo, sp);
+        stack_addr = t.f.r32(sp);
+        syscall(ctx, kThreadExit, 0);
+    });
+    u32 committed = 0;
+    for (u32 i = 0; i < 200; i++) {
+        const u32 id = t.spawn(0x21000);
+        while (!t.finished(id)) std::this_thread::yield();
+        u64 status = 0;
+        REQUIRE(t.join(id, status) == CELL_OK);
+        if (t.f.mem.is_committed(stack_addr)) committed++;
+    }
+    CHECK(committed == 0);
+}
+
 TEST_CASE("lv2 threads: returning from the entry function exits with r3", "[lv2][thread]")
 {
     ThreadFixture t;

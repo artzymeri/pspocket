@@ -216,6 +216,11 @@ struct Fixture {
     u64 r64(u32 a) const { return ps_read64(base(), a); }
     void w32(u32 a, u32 v) const { ps_write32(base(), a, v); }
     void w64(u32 a, u64 v) const { ps_write64(base(), a, v); }
+    // A PPU store after its sync (lwsync, then stw): a flag a running lv2 thread reads, set after the data it announces.
+    void w32_release(u32 a, u32 v) const
+    {
+        __atomic_store_n(reinterpret_cast<u32*>(base() + a), ps_bswap32(v), __ATOMIC_RELEASE);
+    }
 };
 
 // A host thread with an lv2 identity (Kernel::attach_thread). Construct it on the thread that uses it.

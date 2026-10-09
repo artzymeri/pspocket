@@ -8417,3 +8417,23 @@ Test: tests/hle/test_spu_threads.cpp, "a reply to a sent event comes after send_
 two sends finds the one-event queue full, and a log sink holds the SPU's thread at its warning while the test receives
 the first event and replies. The SPU reads EBUSY, then the reply; with the old order it read the reply, then EBUSY
 (every run).
+
+## D-586 · 2026-10-09 · lv2: a thread's stack goes back before a join can return; rsxaudio's ring words ordered
+
+Two lv2 findings of the ThreadSanitizer sweep (D-585).
+- A PPU thread that exited before anyone joined it became a zombie (thread_finish, under the join lock) and only then
+  gave its stack back. A join in between returned at once with the stack still committed and its memory not yet back
+  in the default container, so a game that joins a worker and starts another with a large stack could get ENOMEM.
+  "stack information, guard page and stack release" failed one run in three under the sweep. The stack is now released
+  first: only the thread's own host thread (or, for an interrupt thread never established, the call that ends it)
+  runs thread_finish, so nothing else releases it, and a second call finds it gone.
+- sys_rsxaudio's hardware thread read an entry's valid flag with a plain load while the client fills the entry, and
+  wrote read_idx with a plain store after clearing valid. The flag is now read with acquire order (the entry's block
+  index the event reports is the client's, written before it) and read_idx written with release order (the client
+  refills only what read_idx hands back, so valid's clear must reach it first: ARM keeps two stores in order only so).
+  Guest::r32_acquire and w32_release (internal.hpp) for lv2 code sharing guest words with the guest while it runs.
+  The test filled its entries valid first and then the block index; it now writes valid last, with release order, as a
+  client after its sync.
+Test: tests/lv2/test_threads.cpp, "a thread's stack is released before a join can return" (200 workers, each joined
+the moment it is marked finished: with the old order 194 to 198 of them returned with the stack committed);
+tests/lv2/test_rsxaudio.cpp under ThreadSanitizer.

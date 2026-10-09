@@ -130,13 +130,14 @@ void play_block(const Guest& g, RsxAudio& a, RsxAudioObject& o, u32 port)
     g.w64(entry(rb, static_cast<u32>(stamp_idx)) + e_timestamp, ps_timebase_now());
     if (!a.dma_en[port]) return;
     const s32 r = clamp_entry(read);
-    if ((g.r32(entry(rb, static_cast<u32>(r)) + e_valid) & 1) == 0) return;
+    // The client sets valid after it fills the entry; read_idx hands the entry back, after valid is cleared (D-586).
+    if ((g.r32_acquire(entry(rb, static_cast<u32>(r)) + e_valid) & 1) == 0) return;
     const s32 report = clamp_entry((read + rw_max - (rw_max > 2)) % rw_max);
     const s32 step = static_cast<s32>(g.r32(rb + rb_queue_notify_step));
     g.w32(entry(rb, static_cast<u32>(r)) + e_valid, 0);
     const s32 notify = step > 0 ? (static_cast<s32>(g.r32(rb + rb_queue_notify_idx)) + 1) % step : 0;
     g.w32(rb + rb_queue_notify_idx, static_cast<u32>(notify));
-    g.w32(rb + rb_read_idx, static_cast<u32>((read + 1) % rw_max));
+    g.w32_release(rb + rb_read_idx, static_cast<u32>((read + 1) % rw_max));
     if (((rw_max > 2) ^ notify) == 0 && o.queues[port]) {
         o.queues[port]->send(Event{kEventPortName[port], port,
             g.r64(entry(rb, static_cast<u32>(report)) + e_audio_blk_idx),
