@@ -7965,7 +7965,8 @@ multichannel extension is not decoded, its stereo base is (the multichannel's do
 2 channels with no surround, centre or LFE (logged once when a layout past stereo is asked). Errors: no 12-bit sync
 (MPEG-2.5's included) SYNCF, the other layer LAYER, the reserved version VERSION, bit rate 15 BITRATE, free format
 UNSUPPORT (FFmpeg decodes it only from a stream), the reserved rate SAMPLEFREQ, a unit shorter than its frame OPENBS, one
-FFmpeg refuses SAMPLE; the CRC is not checked (FFmpeg does not either). CellAdecMpmcInfo: the output's channelNumber
+FFmpeg refuses SAMPLE; a CRC mismatch is no error (FFmpeg logs it and decodes the frame; the information has no field
+for it). CellAdecMpmcInfo: the output's channelNumber
 (MONO or STEREO), the header's rate index, protection, bit rate index, mode, extension, emphasis, copyright and
 original, outputFrameSize the samples per channel (384 or 1152), channelConfiguration MONO, DUAL or L_R. PTS: the
 core's own correction (types 32 and 26 call module functions on a PS3).
@@ -8024,3 +8025,43 @@ raw data blocks and as ADIF (a header built in the test), the same PCM and ADIF'
 each channel: six channels out, 33 to 64 dB each (20 required), the channel counts; the two-channel cores and
 enableDownmix give the downmix of that output within 1e-6. Refused: no sync, layer 1, rate index 13, SSR, a cut frame,
 a header that is not ADIF, a program the header has not, and four parameter sets StartSeq refuses (ARG).
+
+## D-579 · 2026-10-09 · cellAdec's AC-3 and ATRAC3 cores on FFmpeg, firmware first (part 1: AC-3)
+
+AC-3 (CELL_ADEC_TYPE_AC3, for cell_libac3dec) gets pspocket's own core where no firmware module gives one, by D-577's
+rule (adec_ac3.cpp). From RPCS3's cellAdec.h: CellAdecParamAc3 with its byte-wide enums, CellAdecBsiAc3 (0x44 bytes)
+and the AC3 error codes; the front end's fixed PTS step (type 5). The parameters are Dolby's decoder's: its channels
+are numbered L 0, C 1, R 2, Ls 3, Rs 4, LFE 5 (RPCS3's AC3_InputChannel names them L, C, R, l, r, s, the s being the
+subwoofer). FFmpeg's float AC-3 decoder decodes every channel; the rest is pspocket's reading, to compare with
+libac3dec on the Mac:
+- The output: numberOfChannels interleaved slots; decoded channel K goes to slot channelPointerK (-1: not out), the
+  slots nothing points at silent. The channels are outputMode's (Dolby's 1/0 to 3/2; a mono surround in Ls's place),
+  with the LFE when outLfeOn; 16-bit or float, big-endian, times pcmScaleFactor. StartSeq refuses (AC3_PARAM) a field
+  past its enum, a slot count past 6, a pointer past the slots or two at one, a scale factor out of 0 to 1.
+- The downmix, after ATSC A/52 7.8: the centre into the front pair at cmixlev's level when the output has no centre,
+  the surrounds into it at surmixlev's (a mono surround at 0.7071 of that to each side) when the output has none, a
+  pair of surrounds to one at 0.7071 each and one to a pair at 0.7071, the LFE never mixed. 2/0 is Lt/Rt (the centre
+  and the surrounds at -3 dB, the surrounds subtracted on the left) or Lo/Ro as stereoMode says, its auto taking the
+  stream's preferred mode (annex D's dmixmod) and Lo/Ro when it names none (FFmpeg's default); annex D's own mix levels
+  for each where the stream has them. 1/0 is the Lo/Ro pair's sum at 0.7071. Each output channel is then divided by
+  its coefficients' sum where that passes 1, so a full-scale input cannot clip. Dual mono: stereo puts Ch1 left and
+  Ch2 right; left, right and mixed mono give Ch1, Ch2 or their mean, to the centre or at 0.7071 to each side.
+- Dynamic range: FFmpeg's drc_scale is drcCutScaleFactor for the custom and line modes (FFmpeg scales cut and boost
+  alike: a boost factor of its own is logged once), heavy compression for RF remodulation; dialogue normalisation is
+  not applied (as FFmpeg); karaoke streams' vocal modes are not reproduced (logged once).
+- One syncframe per unit: no sync word, the reserved rate or a frame size code past 37, a bsid past 10 (E-AC-3 belongs
+  to cellDDPdec, which stays Sony's: RPCS3 has no structures for it), a unit shorter than its frame, or one FFmpeg
+  refuses: AC3_FRAME. A CRC mismatch is flagged, and the frame concealed as FFmpeg conceals it by default (the last
+  block repeated), not an error.
+- CellAdecBsiAc3: codecType 0, versionInfo the core's version, totalCallNum the frames decoded in the sequence, the bit
+  rate in kbit/s, pcmSize, esSizeBit, errorCode, validity, the stream's channels with its LFE, fscod, the word size,
+  the slot count, monoFlag for a 1/0 output, the 64 bits from bsid on, frmsizecod and the BSI's and annex D's fields,
+  karaokeMode for a karaoke stream, crcErrorFlag, execDmixType 0 without a downmix, 1 Lt/Rt, 2 another.
+
+Test: tests/hle/test_adec_cores.cpp, streams written by FFmpeg's AC-3 encoder (the tests' FFmpeg, D-577). 5.1 at 48 kHz
+and 448 kbit/s, a tone in each channel, routed to WAV's order: FFmpeg's own samples exactly, 82 to 90 dB from the
+input in the full-band channels and 36 dB in the LFE (20 required), the information block, PTS corrected by 2880; the
+pointers turned round with 16-bit PCM at half scale. The downmixes against that output within 1e-5: Lo/Ro, Lt/Rt,
+auto (Lo/Ro), 1/0, 3/0 with the LFE, 2/1; a stereo stream into 3/2 with the LFE (two slots sound, four silent). Refused:
+no sync, the reserved rate, E-AC-3's bsid, a cut frame; a CRC mismatch flagged and concealed; eight parameter sets
+StartSeq refuses.

@@ -1163,3 +1163,227 @@ TEST_CASE("cellAdec: MPEG-4 AAC on FFmpeg, 5.1 out, downmixed by the two-channel
 }
 
 #endif
+
+// ---- AC-3
+
+namespace {
+
+constexpr u32 kTypeAc3 = 2;
+
+// CellAdecParamAc3 (RPCS3's layout: byte-wide enums). The pointers give each of Dolby's channels (L, C, R, Ls, Rs,
+// LFE) its output slot: by default WAV's order (L, R, C, LFE, Ls, Rs), as FFmpeg's.
+struct Ac3Param {
+    u8 word = 1, mode = 7, lfe = 1, compression = 2, channels = 6, stereo = 0, dualmono = 0, karaoke = 3;
+    float cut = 1, boost = 1, scale = 1;
+    std::array<s32, 6> pointers = {0, 2, 1, 4, 5, 3};
+};
+
+std::vector<u8> ac3_param(const Ac3Param& a)
+{
+    std::vector<u8> v(0x30, 0);
+    v[0] = a.word;
+    v[1] = a.mode;
+    v[2] = a.lfe;
+    const auto f32 = [&](usize at, float x) {
+        u32 bits;
+        std::memcpy(&bits, &x, 4);
+        for (u32 k = 0; k < 4; k++) v[at + k] = static_cast<u8>(bits >> (24 - 8 * k));
+    };
+    f32(4, a.cut);
+    f32(8, a.boost);
+    v[0xC] = a.compression;
+    v[0xD] = a.channels;
+    v[0xE] = a.stereo;
+    v[0xF] = a.dualmono;
+    v[0x10] = a.karaoke;
+    f32(0x14, a.scale);
+    for (u32 k = 0; k < 6; k++)
+        for (u32 b = 0; b < 4; b++) v[0x18 + 4 * k + b] = static_cast<u8>(static_cast<u32>(a.pointers[k]) >> (24 - 8 * b));
+    return v;
+}
+
+} // namespace
+
+#if PSPOCKET_HAVE_FFMPEG
+
+TEST_CASE("cellAdec: AC-3 on FFmpeg, 5.1 that FFmpeg's encoder wrote: every channel routed, the information (D-579)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_encoder_by_name("ac3")) SKIP("this FFmpeg has no ac3 encoder (the tests' build: build-ffmpeg.sh)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    // 5.1 at 48 kHz, 448 kbit/s (FFmpeg's order: front left, right, centre, LFE, side left, right), a tone in each.
+    const std::vector<double> freqs = {500, 800, 1200, 60, 1700, 2300};
+    const std::vector<s16> input = sines(48000, 96000, freqs, {0.3, 0.3, 0.3, 0.3, 0.3, 0.3});
+    const Encoded enc = ffmpeg_encode("ac3", 48000, 6, 448000, input);
+    REQUIRE(enc.packets.size() > 50);
+    Feed feed;
+    feed.bsi_size = 0x44;
+    feed.step = 2880;
+    feed.aus = enc.packets;
+    feed.missing = {2, 3};
+    const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param({}), feed);
+    INFO(all(run));
+    REQUIRE(run.outs.size() == feed.aus.size());
+    CHECK(flow_ok(run, static_cast<u32>(feed.aus.size()), {}));
+    const auto ref = ffmpeg_decode("ac3", feed.aus);
+    for (u32 k = 0; k < run.outs.size(); k++) {
+        INFO("access unit " << k);
+        const Out& o = run.outs[k];
+        CHECK(o.size == 1536 * 6 * 4);
+        CHECK(o.pcm == expected_pcm(ref[k], false)); // 3/2 with the LFE: no downmix, FFmpeg's samples in WAV's order
+        CHECK(o.pts_lower == 0x1000 + 2880 * k);
+        CHECK(be32(o.bsi, 0x04) == 0x01000000);
+        CHECK(be32(o.bsi, 0x0C) == k + 1);          // totalCallNum
+        CHECK(be32(o.bsi, 0x10) == 448);            // kbit/s
+        CHECK(be32(o.bsi, 0x14) == o.size);         // pcmSize
+        CHECK(be32(o.bsi, 0x18) == 8 * 1792);       // esSizeBit
+        CHECK(be32(o.bsi, 0x1C) == 0);
+        CHECK(o.bsi[0x21] == 1);                    // validity
+        CHECK(o.bsi[0x22] == 6);                    // channels with the LFE
+        CHECK(o.bsi[0x23] == 0);                    // 48 kHz
+        CHECK(o.bsi[0x24] == 1);                    // float
+        CHECK(o.bsi[0x25] == 6);
+        CHECK(o.bsi[0x32] == 7);                    // acmod 3/2
+        CHECK(o.bsi[0x33] == 1);                    // LFE
+        CHECK(o.bsi[0x3B] == feed.aus[k][5] >> 3);  // bsid
+        CHECK(o.bsi[0x42] == 0);                    // the CRC matched
+        CHECK(o.bsi[0x43] == 0);                    // no downmix
+    }
+    for (u32 c = 0; c < 6; c++) {
+        const double snr = snr_db(floats_of(input, 6, c), joined(run, 6, c), 3000);
+        INFO(std::format("channel {}: SNR {:.1f} dB", c, snr));
+        CHECK(snr > 20);
+    }
+    // The pointers turned round (L to the last slot ... LFE to the first) and the PCM scaled by 0.5 in 16 bits.
+    const CoreRun turned = run_core(f.base(), hle_calls(f, t), kTypeAc3,
+        ac3_param({.word = 0, .scale = 0.5f, .pointers = {5, 3, 4, 1, 0, 2}}), feed);
+    REQUIRE(turned.outs.size() == run.outs.size());
+    // Slot s of the turned output against WAV's channel w of the first: L 5 <- 0, C 3 <- 2, R 4 <- 1, Ls 1 <- 4,
+    // Rs 0 <- 5, LFE 2 <- 3.
+    const std::array<u32, 6> from = {5, 4, 3, 2, 1, 0};
+    double worst = 0;
+    for (u32 k = 0; k < run.outs.size(); k++) {
+        CHECK(turned.outs[k].size == 1536 * 6 * 2);
+        for (u32 s = 0; s < 6; s++) {
+            const auto got = channel_of(turned.outs[k].pcm, 6, s, true), want = channel_of(run.outs[k].pcm, 6, from[s], false);
+            for (usize i = 0; i < got.size(); i++)
+                worst = std::max(worst, static_cast<double>(std::abs(got[i] - 0.5f * want[i])));
+        }
+    }
+    CHECK(worst < 1.0 / 32768 + 1e-9); // the 16-bit floor
+}
+
+TEST_CASE("cellAdec: AC-3 on FFmpeg, downmixed: Lo/Ro, Lt/Rt, mono, 3/0, 2/1; stereo out wide; refusals (D-579)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_encoder_by_name("ac3")) SKIP("this FFmpeg has no ac3 encoder (the tests' build: build-ffmpeg.sh)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    const std::vector<s16> input = sines(48000, 48000, {500, 800, 1200, 60, 1700, 2300}, {0.3, 0.3, 0.3, 0.3, 0.3, 0.3});
+    const Encoded enc = ffmpeg_encode("ac3", 48000, 6, 448000, input);
+    REQUIRE(enc.packets.size() > 20);
+    Feed feed;
+    feed.bsi_size = 0x44;
+    feed.aus = enc.packets;
+    const CoreRun full = run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param({}), feed);
+    REQUIRE(full.outs.size() == feed.aus.size());
+    const u8 cmix = full.outs[0].bsi[0x35], smix = full.outs[0].bsi[0x36];
+    const float clev = std::array{0.70710678f, 0.59460356f, 0.5f, 0.59460356f}[cmix];
+    const float slev = std::array{0.70710678f, 0.5f, 0.0f, 0.5f}[smix];
+    const float k3 = 0.70710678f;
+    // A downmix of the full output (WAV's order: L, R, C, LFE, Ls, Rs), each row over its sum when that passes 1.
+    using Row = std::array<float, 6>;
+    const auto check_downmix = [&](const Ac3Param& p, const std::vector<Row>& rows, u8 dmix_type) {
+        const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param(p), feed);
+        REQUIRE(run.outs.size() == full.outs.size());
+        double worst = 0;
+        for (u32 k = 0; k < run.outs.size(); k++) {
+            CHECK(run.outs[k].size == 1536 * rows.size() * 4);
+            CHECK(run.outs[k].bsi[0x43] == dmix_type);
+            for (u32 o = 0; o < rows.size(); o++) {
+                float sum = 0;
+                for (const float c : rows[o]) sum += std::abs(c);
+                const float norm = std::max(sum, 1.0f);
+                const auto got = channel_of(run.outs[k].pcm, static_cast<u32>(rows.size()), o, false);
+                for (usize i = 0; i < got.size(); i++) {
+                    double want = 0;
+                    for (u32 w = 0; w < 6; w++) {
+                        if (rows[o][w] == 0) continue;
+                        want += static_cast<double>(rows[o][w] / norm) *
+                            static_cast<double>(channel_of(full.outs[k].pcm, 6, w, false)[i]);
+                    }
+                    worst = std::max(worst, std::abs(static_cast<double>(got[i]) - want));
+                }
+            }
+        }
+        CHECK(worst < 1e-5);
+    };
+    const std::array<s32, 6> lr = {0, -1, 1, -1, -1, -1};
+    // 2/0 Lo/Ro: L + clev C + slev Ls; Lt/Rt: L + 0.7071 C - 0.7071 (Ls + Rs), R + 0.7071 C + 0.7071 (Ls + Rs).
+    check_downmix({.mode = 2, .lfe = 0, .channels = 2, .stereo = 2, .pointers = lr},
+        {Row{1, 0, clev, 0, slev, 0}, Row{0, 1, clev, 0, 0, slev}}, 2);
+    check_downmix({.mode = 2, .lfe = 0, .channels = 2, .stereo = 1, .pointers = lr},
+        {Row{1, 0, k3, 0, -k3, -k3}, Row{0, 1, k3, 0, k3, k3}}, 1);
+    // Auto: the stream names no preferred mode, so Lo/Ro.
+    check_downmix({.mode = 2, .lfe = 0, .channels = 2, .stereo = 0, .pointers = lr},
+        {Row{1, 0, clev, 0, slev, 0}, Row{0, 1, clev, 0, 0, slev}}, 2);
+    // 1/0: the Lo/Ro pair's sum at 0.7071, to the one slot the centre points at.
+    check_downmix({.mode = 1, .lfe = 0, .channels = 1, .pointers = {-1, 0, -1, -1, -1, -1}},
+        {Row{k3, k3, 2 * k3 * clev, 0, k3 * slev, k3 * slev}}, 2);
+    // 3/0 with the LFE: the surrounds into the fronts; 2/1: the centre into the fronts, the surrounds to one.
+    check_downmix({.mode = 3, .lfe = 1, .channels = 4, .pointers = {0, 2, 1, -1, -1, 3}},
+        {Row{1, 0, 0, 0, slev, 0}, Row{0, 1, 0, 0, 0, slev}, Row{0, 0, 1, 0, 0, 0}, Row{0, 0, 0, 1, 0, 0}}, 2);
+    check_downmix({.mode = 4, .lfe = 0, .channels = 3, .pointers = {0, -1, 1, 2, -1, -1}},
+        {Row{1, 0, clev, 0, 0, 0}, Row{0, 1, clev, 0, 0, 0}, Row{0, 0, 0, 0, k3, k3}}, 2);
+    // A stereo stream into 3/2 with the LFE: L and R, the other slots silent.
+    const std::vector<s16> two = sines(48000, 24000, {700, 1300}, {0.4, 0.4});
+    const Encoded stereo = ffmpeg_encode("ac3", 48000, 2, 192000, two);
+    Feed st;
+    st.bsi_size = 0x44;
+    st.aus = stereo.packets;
+    const CoreRun wide = run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param({}), st);
+    const auto ref = ffmpeg_decode("ac3", st.aus);
+    REQUIRE(wide.outs.size() == st.aus.size());
+    for (u32 k = 0; k < wide.outs.size(); k++) {
+        CHECK(wide.outs[k].size == 1536 * 6 * 4);
+        CHECK(wide.outs[k].bsi[0x32] == 2); // acmod 2/0
+        std::vector<std::vector<float>> want(6, std::vector<float>(1536, 0.0f));
+        want[0] = ref[k][0];
+        want[1] = ref[k][1];
+        CHECK(wide.outs[k].pcm == expected_pcm(want, false));
+    }
+    // After a good frame, refused ones: no sync, the reserved rate, E-AC-3's bsid, one cut short; then a CRC mismatch,
+    // flagged and concealed (FFmpeg repeats the last block), and a good frame.
+    const std::vector<u8> good = enc.packets[5];
+    const auto with = [&](u32 byte, u8 mask, u8 value) {
+        std::vector<u8> au = good;
+        au[byte] = static_cast<u8>((au[byte] & ~mask) | value);
+        return au;
+    };
+    Feed bad;
+    bad.bsi_size = 0x44;
+    std::vector<u8> crc = good;
+    crc[100] ^= 0x10;
+    bad.aus = {enc.packets[4], with(0, 0xFF, 0x0A), with(4, 0xC0, 0xC0), with(5, 0xF8, 0x80),
+        std::vector<u8>(good.begin(), good.begin() + 900), crc, good};
+    const CoreRun refused = run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param({}), bad);
+    INFO(all(refused));
+    REQUIRE(refused.outs.size() == 7);
+    CHECK(flow_ok(refused, 7, {{1, 0x80612503}, {2, 0x80612503}, {3, 0x80612503}, {4, 0x80612503}}));
+    CHECK(refused.outs[5].size == 1536 * 6 * 4);
+    CHECK(refused.outs[5].bsi[0x42] == 1); // crcErrorFlag
+    CHECK(refused.outs[6].bsi[0x42] == 0);
+    CHECK(refused.outs[6].size == 1536 * 6 * 4);
+    // StartSeq's checks: a word size, an output mode, a channel count, a pointer past the slots, two at one slot, a
+    // scale factor past 1.
+    for (const Ac3Param& p : {Ac3Param{.word = 2}, Ac3Param{.mode = 0}, Ac3Param{.mode = 8}, Ac3Param{.channels = 0},
+             Ac3Param{.channels = 7}, Ac3Param{.channels = 5}, Ac3Param{.pointers = {0, 0, 1, 2, 3, 4}},
+             Ac3Param{.scale = 1.5f}})
+        CHECK(run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param(p), Feed{}).lines[2] ==
+            "cellAdecStartSeq -> 0x80612502");
+}
+
+#endif

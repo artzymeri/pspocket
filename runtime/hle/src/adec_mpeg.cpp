@@ -11,7 +11,8 @@
 // - One frame per access unit, of the core's layer: MPEG-1, or MPEG-2 at its lower rates (ISO/IEC 13818-3). No 12-bit
 //   sync (MPEG-2.5's 11 bits included) is SYNCF; the other layer LAYER; the reserved version VERSION; bit rate 15
 //   BITRATE; free format UNSUPPORT (FFmpeg decodes it only from a stream); the reserved rate SAMPLEFREQ; a unit
-//   shorter than its frame OPENBS; one FFmpeg refuses SAMPLE. The CRC is not checked (FFmpeg does not either).
+//   shorter than its frame OPENBS; one FFmpeg refuses SAMPLE. A CRC mismatch is no error (FFmpeg logs it and decodes
+//   the frame; CellAdecMpmcInfo has no field for it).
 // - MPEG-2's multichannel extension (in a layer II frame's ancillary data) is not decoded: its stereo base is, which is
 //   the multichannel's downmix by design, and the information's multichannel fields say 2 channels (logged once when a
 //   layout past stereo is asked for).
