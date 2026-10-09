@@ -7001,3 +7001,46 @@ sets them up and completes pops, so cellSync's completion with an SPU waiter to 
 waits on a pre-sent event, ring wrap-around, failing signals; the interlock with a callback, with an event port, and
 with two SPU threads of a group made in the test (ports taken); and a thread probing while another releases. About
 6,500 lines of answers, bytes and callback arguments, and every lv2 call with its arguments, the same.
+
+## D-539 · 2026-10-09 · sys_net, part 2: libnet's configuration calls, routes, interfaces and netsets
+
+D-523 made libnet's core pspocket's own; this is the rest of what libnet.sprx exports but the resolver (part 4 below).
+All in runtime/hle/src/sys_net.cpp, read from libnet's code and compared with it running on pspocket's lv2
+(tests/hle/test_net_compare.cpp: the "configuration", "routes and interfaces", "netsets" and "netset configurations"
+scripts; answers, the scripts' memory, libnet's pool byte for byte, every lv2 network call with its arguments and the
+TTY the same).
+- **Wrappers**: _sys_net_lib_ioctl (the 39 commands libnet passes to lv2, EINVAL for others and for a missing argument;
+  two of them clear parts of their argument first), _sys_net_lib_bnet_control (sys_net_control), the packet dumps
+  (lv2's 717..719).
+- **Test parameters**: get/set, netemu (flags 1, version 0x101) and UDP-P2P, each an ioctl on a socket made for the
+  call (a 528-byte block naming eth0), EINVAL without errno for a bad argument.
+- **Name servers**: netset.c's resolv.conf text in the pool ("nameserver X" lines added with "nameserver add X", two
+  lines at most), the library's own set (sys_net_set/get_lib_name_server), lv2's through infoctl 9 (read into the
+  thread's context, outside the context's call wrapper) and 52, sys_net_show_nameserver's report.
+- **Routes**: netset.c's route command interpreter ("route add|del|flushall" lines with -net, -host, -inet, gw,
+  netmask, -prefixlen and up to three addresses; 0.0.0.1 stands for a caller's address), building version-3 routing
+  messages (UP|STATIC, REJECT, HOST, GATEWAY; the next sequence number; sockaddrs rounded to 8 bytes) sent on a routing
+  socket: _sce_net_set_default_gateway sends a 168-byte RTM_ADD; _sce_net_flush_route deletes what the routing table's
+  dump lists; sys_net_get_routing_table_af and sys_net_show_route ("route: No routing table (0)").
+- **Interfaces**: _sce_net_set_ip_and_mask (address, netmask, broadcast or destination ioctls),
+  _sys_net_lib_if_nametoindex, and sys_net_if_ctl: lv2's memory (infoctl 8) and the pool's, the packet count
+  (infoctl 10), the resolver cache flush (656), the wireless chip's two queries (eurus commands -1 and 153; the second's
+  text from its first digit to a '('), route lookup 16 with its ICMP echo when no route is found, sys_net_control for a
+  negative command, interfaces by index.
+- **Netsets**: sys_netset_open's parser (up to five tokens a line; quotes; \ooo, \xHH, \a..\v and \( \) hex byte
+  groups, their bytes counted for binary values; '#' and '\r' end a line; a last line without a newline is dropped;
+  256 bytes of tokens a line), its keys (flags, mtu through libnet's own sscanf, strings, binary values, the resolver
+  and route texts, the key table's values), close (the first netset's values become the key values; the last one
+  clears lv2's resolver configuration), abort, get_status (the thread's last netset.c failure: what, line, arguments),
+  get_key_value, get_if_id, if_up, if_down. Every netset.c failure is noted in the thread's context (+2904..+2920) as
+  libnet notes it.
+- **lv2 change**: an interface's ioctls (BSD's group 'i', but the test parameters) now answer ENXIO: pspocket's console
+  has no interface with no link (D-523), and a missing interface's ioctls fail so on BSD. RPCS3's stub answered
+  CELL_OK and wrote nothing, so libnet's if_up read its own stack's leftovers as interface flags. With it, if_up's
+  first step (lo0 up, 127.0.0.1/8) fails; the netset goes back to state 0, status 9.
+- Not reachable offline, so they stop with a fatal log naming what lv2 would have to have answered (as getifaddrs
+  does, D-523): routing tables or interfaces lv2 lists, an interface ioctl lv2 accepts (if_up past lo0, DHCP, PPPoE
+  and wireless set-ups, if_down of an interface that came up). The DHCP client is not needed: its first step, the
+  interface's index, finds none.
+- Deviations: sys_net_get_lib_name_server writes 0 for a server the library does not have (libnet copies its stack's
+  leftovers); bad guest pointers are refused with errno EFAULT and the call site logged.
