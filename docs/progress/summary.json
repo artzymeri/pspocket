@@ -1,5 +1,5 @@
 {
-  "engine_percent": 84.7,
+  "engine_percent": 86.5,
   "libraries": {
     "own": 5654,
     "answered_as_rpcs3": 188,
@@ -23,7 +23,7 @@
     "Translating on the iPhone (route B)": 89,
     "PPU code (the main processor)": 100,
     "SPU code (the six co-processors)": 86,
-    "SPURS and the kernel": 75,
+    "SPURS and the kernel": 100,
     "Graphics (RSX to Metal)": 77,
     "Sound": 50,
     "Video and images": 80,

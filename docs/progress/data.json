@@ -172,8 +172,8 @@
         },
         {
           "name": "Raw SPUs and interrupt threads",
-          "state": "todo",
-          "ref": "D-184"
+          "state": "done",
+          "ref": "D-528, D-529"
         },
         {
           "name": "GTA V's EDGE job chain never stops on a reused descriptor",
