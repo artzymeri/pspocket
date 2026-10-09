@@ -26,6 +26,7 @@
 #include <format>
 #include <string_view>
 
+#include "cellSail.hpp"
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
@@ -34,23 +35,101 @@
 #include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle {
+namespace sail {
+
+u64 lv2_lib(PPUContext& ctx, std::string_view name, std::initializer_list<u64> args)
+{
+    const Function* f = registry().find("sysPrxForUser", recomp::nid_of(name));
+    if (!f) PS_FATAL(kChan, "sysPrxForUser::{}, which libsail imports, is not pspocket's", name);
+    u64 saved[8];
+    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
+    u32 i = 3;
+    for (const u64 a : args) ctx.gpr[i++] = a;
+    f->fn(ctx, gb(ctx));
+    const u64 r = ctx.gpr[3];
+    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
+    return r;
+}
+
+// ------------------------------------------------------------------------------------------------- the player's queue
+
+// Waits for room in the queue (the mutex held).
+void queue_wait_room(PPUContext& ctx, u32 qa)
+{
+    while (r32(ctx, qa + q::kCapacity) <= r32(ctx, qa + q::kCount)) sc(ctx, 107, {r32(ctx, qa + q::kCond), 0});
+}
+
+// The message written: the count raised, the player woken, the mutex released (its answer returned).
+s32 queue_commit(PPUContext& ctx, u32 qa)
+{
+    w32(ctx, qa + q::kCount, r32(ctx, qa + q::kCount) + 1);
+    sc(ctx, 108, {r32(ctx, qa + q::kCond)});
+    return sc(ctx, 104, {r32(ctx, qa + q::kMutex)});
+}
+
+// The next message at the tail; the write index moved on.
+u32 queue_tail(PPUContext& ctx, u32 qa)
+{
+    queue_wait_room(ctx, qa);
+    const u32 at = r32(ctx, qa + q::kRing) + 16 * r32(ctx, qa + q::kWrite);
+    return at;
+}
+
+void queue_advance_tail(PPUContext& ctx, u32 qa)
+{
+    const u32 cap = r32(ctx, qa + q::kCapacity), next = r32(ctx, qa + q::kWrite) + 1;
+    w32(ctx, qa + q::kWrite, cap ? next % cap : 0);
+}
+
+s32 post(PPUContext& ctx, u32 player, u32 code, u32 object, u32 arg)
+{
+    const u32 qa = player + pl::kQueue;
+    const s32 r = sc(ctx, 102, {r32(ctx, qa + q::kMutex), 0});
+    if (r < 0) return r;
+    const u32 at = queue_tail(ctx, qa);
+    w32(ctx, at + 4, 0);
+    w32(ctx, at + 12, arg);
+    w32(ctx, at, code);
+    w32(ctx, at + 8, object);
+    queue_advance_tail(ctx, qa);
+    return queue_commit(ctx, qa);
+}
+
+s32 post_urgent(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c)
+{
+    const u32 qa = player + pl::kQueue;
+    const s32 r = sc(ctx, 102, {r32(ctx, qa + q::kMutex), 0});
+    if (r < 0) return r;
+    queue_wait_room(ctx, qa);
+    const u32 cap = r32(ctx, qa + q::kCapacity), prev = cap + r32(ctx, qa + q::kRead) - 1;
+    w32(ctx, qa + q::kRead, cap ? prev % cap : 0);
+    const u32 at = r32(ctx, qa + q::kRing) + 16 * r32(ctx, qa + q::kRead);
+    w32(ctx, at + 12, c);
+    w32(ctx, at, code);
+    w32(ctx, at + 4, a);
+    w32(ctx, at + 8, b);
+    return queue_commit(ctx, qa);
+}
+
+s32 post_completion(PPUContext& ctx, u32 player, s32 result, u64 handle)
+{
+    if (!handle) return static_cast<s32>(player);
+    const u32 qa = player + pl::kQueue;
+    const s32 r = sc(ctx, 102, {r32(ctx, qa + q::kMutex), 0});
+    if (r < 0) return r;
+    const u32 at = queue_tail(ctx, qa);
+    w32(ctx, at, 0);
+    w64(ctx, at + 8, handle);
+    w32(ctx, at + 4, static_cast<u32>(result));
+    queue_advance_tail(ctx, qa);
+    return queue_commit(ctx, qa);
+}
+
+} // namespace sail
+
 namespace {
 
-constexpr std::string_view kChan = "cellSail";
-
-enum : u32 {
-    CELL_SAIL_ERROR_INVALID_ARG = 0x80610701,
-    CELL_SAIL_ERROR_INVALID_STATE = 0x80610702,
-    CELL_SAIL_ERROR_NOT_AVAILABLE = 0x80610708,
-};
-s32 error(u32 code) { return static_cast<s32>(code); }
-
-u8* gb(PPUContext& ctx) { return guest_base(ctx); }
-u32 r32(PPUContext& ctx, u32 a) { return ps_read32(gb(ctx), a); }
-void w32(PPUContext& ctx, u32 a, u32 v) { ps_write32(gb(ctx), a, v); }
-
-// The calls libsail makes to lv2 for its sync objects.
-s32 sc(PPUContext& ctx, u32 n, std::initializer_list<u64> args) { return static_cast<s32>(lv2_syscall(ctx, n, args)); }
+using namespace sail;
 
 // ------------------------------------------------------------------------------------------------- allocator
 
@@ -164,57 +243,6 @@ s32 cellSailFutureIsDone(PPUContext& ctx, u32 f, u32 result)
     sc(ctx, 104, {r32(ctx, f + fut::kMutex)});
     if (done && result) w32(ctx, result, r32(ctx, f + fut::kResult));
     return static_cast<s32>(done);
-}
-
-// ------------------------------------------------------------------------------------------------- the player's queue
-
-namespace q {
-constexpr u32 kAt = 0x170, kCapacity = 0, kCount = 4, kRing = 8, kWrite = 0xC, kMutex = 0x14, kCond = 0x18;
-}
-
-// Waits for room in the queue (the mutex held) and returns the next message's address.
-u32 queue_slot(PPUContext& ctx, u32 qa)
-{
-    while (r32(ctx, qa + q::kCapacity) <= r32(ctx, qa + q::kCount)) sc(ctx, 107, {r32(ctx, qa + q::kCond), 0});
-    return r32(ctx, qa + q::kRing) + 16 * r32(ctx, qa + q::kWrite);
-}
-
-// The message written: the ring moves on, the player is woken, the mutex released (its answer returned).
-s32 queue_commit(PPUContext& ctx, u32 qa)
-{
-    const u32 cap = r32(ctx, qa + q::kCapacity), next = r32(ctx, qa + q::kWrite) + 1;
-    w32(ctx, qa + q::kWrite, cap ? next % cap : 0);
-    w32(ctx, qa + q::kCount, r32(ctx, qa + q::kCount) + 1);
-    sc(ctx, 108, {r32(ctx, qa + q::kCond)});
-    return sc(ctx, 104, {r32(ctx, qa + q::kMutex)});
-}
-
-// Posts {code, 0, object, arg} to the player's queue (libsail's post): the unlock's answer, or the lock's error.
-s32 post(PPUContext& ctx, u32 player, u32 code, u32 object, u32 arg)
-{
-    const u32 qa = player + q::kAt;
-    const s32 r = sc(ctx, 102, {r32(ctx, qa + q::kMutex), 0});
-    if (r < 0) return r;
-    const u32 at = queue_slot(ctx, qa);
-    w32(ctx, at + 4, 0);
-    w32(ctx, at + 12, arg);
-    w32(ctx, at, code);
-    w32(ctx, at + 8, object);
-    return queue_commit(ctx, qa);
-}
-
-// Posts a call's completion {0, result, handle} (libsail's: nothing when the handle is 0).
-s32 post_completion(PPUContext& ctx, u32 player, s32 result, u64 handle)
-{
-    if (!handle) return static_cast<s32>(player);
-    const u32 qa = player + q::kAt;
-    const s32 r = sc(ctx, 102, {r32(ctx, qa + q::kMutex), 0});
-    if (r < 0) return r;
-    const u32 at = queue_slot(ctx, qa);
-    w32(ctx, at, 0);
-    ps_write64(gb(ctx), at + 8, handle);
-    w32(ctx, at + 4, static_cast<u32>(result));
-    return queue_commit(ctx, qa);
 }
 
 // ------------------------------------------------------------------------------------------------- source
@@ -424,8 +452,11 @@ u64 sail_minus_one(PPUContext&) { return ~u64{0}; }
 
 } // namespace
 
+void register_cellSailPlayer(Registry& r);
+
 void register_cellSail(Registry& r)
 {
+    register_cellSailPlayer(r);
 #define SAIL(f) ::pspocket::hle::Function{{}, #f, recomp::nid_of(#f), &detail::thunk<&f>, false}
 #define SAIL_MINUS_ONE(nid) ::pspocket::hle::Function{{}, "cellSail_" #nid, 0x##nid, &detail::thunk<&sail_minus_one>, false}
     r.add("cellSail", {

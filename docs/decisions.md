@@ -7078,6 +7078,35 @@ Part 1, the objects a game fills in and their calls into the player:
 Compared: 46 calls, the memory they touch (objects, the queue's ring, the callbacks' records) and every mutex and
 condition call with its attributes: 0 differences.
 
+Part 2, the player's life before it plays (runtime/hle/src/cellSailPlayer.cpp, cellSail.hpp):
+- **Initialize** (player, mode, allocator, handler, handler argument, audio, video and user streams, messages: the
+  first form builds the attribute from its arguments; it checks only the player and the allocator) and
+  **Initialize2** (attribute and resource {SPURS, 0, 0, 0}: the attribute's +0x14/+0x18 and the resource's other words
+  must be 0). The player (0x400 bytes): the version word 0x492000, the game's allocator copied, every event subscribed,
+  one block from the allocator (boundary 8) for the audio, video and user slots (0x180, 0x238 and 0x88 bytes), the
+  built-in source (0x138) and the message ring (16 bytes a message; 50 per stream and 50 when the game gives 0); the
+  queue's and the player's lv2 mutex and condition pairs ("_saiqu0", "_saict0"); the AV-sync clock at +8 (200 bytes,
+  lwmutex "_saiav0"; latencies 5333 us and, by mode, 16683 (0, 2), 33367 (3), 20000 (4), 40000 (5) or none; mode 7
+  none at all); the built-in "x-cell-fs" source registered; the defaults (stream slots' indices and buffers, control
+  thread priority 900 with 0x3000 bytes of stack, SPURS of 4 SPUs at priority 100 and PPU priority 300). Refused:
+  mode 8 and up, no handler, no allocator, 16 audio or 4 video streams with an SDK of 4.0 or later.
+- **Finalize**: INVALID_STATE once finalized; a booted player is told to stop (message 0xD1) and its control thread
+  joined; then the source, the clock (its lwmutex destroyed, retried ten times 1 ms apart while busy), the pairs, the
+  block.
+- **Sources**: four protocols at most (FULLED), a name twice or NULL is INVALID_ARG. UnregisterSource never succeeds:
+  libsail's test is inverted (index above the count), so it answers NOT_FOUND (0x80610710) every time.
+- **Events and getters**: the event mask (types below 12, a parameter must be 0), ReplaceEventHandler (callable from
+  inside the handler: the lock's EDEADLK is taken as held), descriptor count, current descriptor, paused, repeat mode
+  (its 0x28-byte info when set), each stream's mute bit, under the player's lock.
+- **Per-stream objects**: the audio renderer or sound adapter (one call in libsail), the video renderer or graphics
+  adapter, the AU receiver: only before boot, index and NULL checks, USING when the slot has one; the object learns
+  its index, the player and the clock.
+- The built-in source's callbacks and file calls are internal functions that fail loudly until the player plays
+  (part 3). Partly native cellSail does not mix with Sony's: a game importing any cellSail function pspocket lacks
+  gets libsail whole (the loader chooses by library).
+Compared: 2 scripts, 179 checks: answers, the player's bytes after Initialize, Initialize2 and every mode (each
+side's own code addresses in the built-in source masked), the allocator's heap, and the lv2 calls: 0 differences.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)

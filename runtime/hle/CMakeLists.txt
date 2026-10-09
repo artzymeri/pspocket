@@ -93,6 +93,7 @@ add_library(pspocket_hle STATIC
     src/freetype_glyph.cpp
     src/freetype_cache.cpp
     src/cellSail.cpp
+    src/cellSailPlayer.cpp
     src/cellSailRec.cpp
     src/cellSpursJq.cpp
     src/cellFiber.cpp
