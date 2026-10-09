@@ -383,6 +383,9 @@ const Spec* spec_of(s32 type)
     case CELL_ADEC_TYPE_MP3: return &kMp3;
     case CELL_ADEC_TYPE_MPEG_L1: return &kMpegL1;
     case CELL_ADEC_TYPE_MPEG_L2: return &kMpegL2;
+    case CELL_ADEC_TYPE_M4AAC: return &kM4Aac;
+    case CELL_ADEC_TYPE_M4AAC_2CH: return &kM4Aac2ch;
+    case CELL_ADEC_TYPE_M4AAC_2CH_MOD: return &kM4Aac2chMod;
     default: return nullptr;
     }
 }

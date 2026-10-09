@@ -917,3 +917,249 @@ TEST_CASE("cellAdec: MPEG layer II on FFmpeg, a stream FFmpeg's encoder wrote: t
 }
 
 #endif
+
+// ---- MPEG-4 AAC
+
+namespace {
+
+constexpr u32 kTypeM4Aac = 16, kTypeM4Aac2ch = 20, kTypeM4Aac2chMod = 24;
+
+// CellAdecParamM4Aac: configNumber (0 ADIF, 1 ADTS, 2 raw data blocks), the program or the rate index, the profile,
+// enableDownmix.
+std::vector<u8> m4aac_param(u32 config, u32 a = 0, u32 profile = 0, u32 downmix = 0)
+{
+    return be32s({config, a, profile, downmix});
+}
+
+// An ADTS frame (MPEG-4, no CRC) around a raw AAC frame, with the object type, rate index and channel configuration of
+// the AudioSpecificConfig `asc`.
+std::vector<u8> adts(const std::vector<u8>& asc, const std::vector<u8>& raw)
+{
+    const u32 aot = asc[0] >> 3, sfi = (asc[0] & 7u) << 1 | asc[1] >> 7, channels = (asc[1] >> 3) & 15u;
+    BitWriter w;
+    w.put(0xFFF, 12);
+    w.put(0, 1); // MPEG-4
+    w.put(0, 2); // layer
+    w.put(1, 1); // no CRC
+    w.put(aot - 1, 2);
+    w.put(sfi, 4);
+    w.put(0, 1);
+    w.put(channels, 3);
+    w.put(0, 4); // original, home, copyright bits
+    w.put(static_cast<u32>(raw.size()) + 7, 13);
+    w.put(0x7FF, 11);
+    w.put(0, 2);
+    std::vector<u8> f = w.bytes;
+    f.insert(f.end(), raw.begin(), raw.end());
+    return f;
+}
+
+// An ADIF header for one program of one front element (a pair, or a single channel): "ADIF", no copyright ID, an
+// original, a variable rate of `bitrate` bit/s, one program config element (tag `tag`, LC, rate index `sfi`), aligned,
+// no comment.
+std::vector<u8> adif_header(u32 sfi, bool pair, u32 bitrate, u32 tag = 0)
+{
+    BitWriter w;
+    w.put(0x41444946, 32);
+    w.put(0, 1);         // copyright_id_present
+    w.put(1, 1);         // original_copy
+    w.put(0, 1);         // home
+    w.put(1, 1);         // bitstream_type: variable (no buffer fullness)
+    w.put(bitrate, 23);
+    w.put(0, 4);         // one PCE
+    w.put(tag, 4);       // element_instance_tag
+    w.put(1, 2);         // LC
+    w.put(sfi, 4);
+    w.put(1, 4);         // one front element
+    w.put(0, 4 + 4 + 2 + 3 + 4);
+    w.put(0, 3);         // no mono, stereo or matrix mixdown
+    w.put(pair, 1);
+    w.put(0, 4);         // its tag
+    w.put(0, (8 - w.bit % 8) % 8);
+    w.put(0, 8);         // comment
+    return w.bytes;
+}
+
+#if PSPOCKET_HAVE_FFMPEG
+
+// AAC LC written by FFmpeg's encoder: `channels` channels (5.1 with the back pair for 6) of `freqs`.
+Encoded aac_encode(const std::vector<s16>& input, u32 channels, u32 rate, s64 bit_rate)
+{
+    return ffmpeg_encode("aac", rate, channels, bit_rate, input, [&](AVCodecContext* av) {
+        if (channels == 6) {
+            av_channel_layout_uninit(&av->ch_layout);
+            av_channel_layout_from_mask(&av->ch_layout, AV_CH_LAYOUT_5POINT1_BACK);
+        }
+    });
+}
+
+#endif
+
+} // namespace
+
+#if PSPOCKET_HAVE_FFMPEG
+
+TEST_CASE("cellAdec: MPEG-4 AAC on FFmpeg, ADTS, raw data blocks and ADIF that FFmpeg's encoder wrote (D-578)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_encoder_by_name("aac")) SKIP("this FFmpeg has no aac encoder (the tests' build: build-ffmpeg.sh)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    // Two seconds of 1 kHz (left, 0.5) and 2.5 kHz (right, 0.3) at 48 kHz, LC at 128 kbit/s.
+    const std::vector<s16> input = sines(48000, 96000, {1000, 2500}, {0.5, 0.3});
+    const Encoded enc = aac_encode(input, 2, 48000, 128000);
+    REQUIRE(enc.extradata.size() >= 2);
+    REQUIRE(enc.packets.size() > 80);
+    // ADTS: every unit a frame; two without a PTS (1024 samples at 48 kHz: 1920 ticks).
+    Feed feed;
+    feed.bsi_size = 0x80;
+    feed.step = 1920;
+    for (const auto& p : enc.packets) feed.aus.push_back(adts(enc.extradata, p));
+    feed.missing = {3, 4};
+    const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeM4Aac, m4aac_param(1), feed);
+    INFO(all(run));
+    REQUIRE(run.outs.size() == enc.packets.size());
+    CHECK(flow_ok(run, static_cast<u32>(enc.packets.size()), {}));
+    for (u32 k = 0; k < run.outs.size(); k++) {
+        INFO("access unit " << k);
+        const Out& o = run.outs[k];
+        CHECK(o.size == 1024 * 2 * 4);
+        CHECK(o.pts_lower == 0x1000 + 1920 * k);
+        const std::vector<u32> head = {48000, 2, 2, 0, 0, 0, 0, 0, 1, 1, 1}; // rate, channels by place, no SBR, valid, ADTS
+        for (u32 i = 0; i < head.size(); i++) CHECK(be32(o.bsi, 4 * i) == head[i]);
+        // The ADTS header: MPEG-4, layer 0, no CRC, LC, 48 kHz, private 0, two channels, ..., its length.
+        const std::vector<u32> adts_fields = {0, 0, 1, 1, 3, 0, 2, 0, 0, 0, 0, static_cast<u32>(feed.aus[k].size()), 0x7FF,
+            0, 0};
+        for (u32 i = 0; i < adts_fields.size(); i++) CHECK(be32(o.bsi, 0x2C + 4 * i) == adts_fields[i]);
+    }
+    const double left = snr_db(floats_of(input, 2, 0), joined(run, 2, 0), 3000);
+    const double right = snr_db(floats_of(input, 2, 1), joined(run, 2, 1), 3000);
+    INFO(std::format("SNR {:.1f} and {:.1f} dB", left, right));
+    CHECK(left > 25);
+    CHECK(right > 25);
+    // Raw data blocks with the rate index and profile in the parameters: the same PCM.
+    Feed raw;
+    raw.bsi_size = 0x80;
+    raw.aus = enc.packets;
+    const CoreRun raw_run = run_core(f.base(), hle_calls(f, t), kTypeM4Aac, m4aac_param(2, 3, 1), raw);
+    REQUIRE(raw_run.outs.size() == run.outs.size());
+    CHECK(flow_ok(raw_run, static_cast<u32>(raw.aus.size()), {}));
+    for (u32 k = 0; k < raw_run.outs.size(); k++) {
+        CHECK(raw_run.outs[k].pcm == run.outs[k].pcm);
+        CHECK(be32(raw_run.outs[k].bsi, 0) == 48000);
+        CHECK(be32(raw_run.outs[k].bsi, 0x28) == 2);
+    }
+    // ADIF: the header before the first block, its program 0 a stereo pair; the same PCM, the header's fields kept.
+    Feed adif;
+    adif.bsi_size = 0x80;
+    adif.aus = enc.packets;
+    const std::vector<u8> header = adif_header(3, true, 128000);
+    adif.aus[0].insert(adif.aus[0].begin(), header.begin(), header.end());
+    const CoreRun adif_run = run_core(f.base(), hle_calls(f, t), kTypeM4Aac, m4aac_param(0, 0), adif);
+    INFO(all(adif_run));
+    REQUIRE(adif_run.outs.size() == run.outs.size());
+    CHECK(flow_ok(adif_run, static_cast<u32>(adif.aus.size()), {}));
+    for (u32 k = 0; k < adif_run.outs.size(); k++) {
+        INFO("ADIF access unit " << k);
+        const Out& o = adif_run.outs[k];
+        CHECK(o.pcm == run.outs[k].pcm);
+        CHECK(be32(o.bsi, 0x28) == 0);         // configNumber: ADIF
+        CHECK(be32(o.bsi, 0x2C) == 0);         // no copyright ID
+        CHECK(be32(o.bsi, 0x3C) == 1);         // original
+        CHECK(be32(o.bsi, 0x44) == 1);         // variable rate
+        CHECK(be32(o.bsi, 0x48) == 128000);    // bit rate
+        CHECK(be32(o.bsi, 0x4C) == 0);         // one PCE
+    }
+}
+
+TEST_CASE("cellAdec: MPEG-4 AAC on FFmpeg, 5.1 out, downmixed by the two-channel cores, and refused units (D-578)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_encoder_by_name("aac")) SKIP("this FFmpeg has no aac encoder (the tests' build: build-ffmpeg.sh)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    // 5.1 (FFmpeg's order: front left, right, centre, LFE, back left, right), a tone in each, at 48 kHz.
+    const std::vector<double> freqs = {500, 800, 1200, 60, 1700, 2300};
+    const std::vector<s16> input = sines(48000, 96000, freqs, {0.3, 0.3, 0.3, 0.3, 0.3, 0.3});
+    const Encoded enc = aac_encode(input, 6, 48000, 384000);
+    REQUIRE(enc.packets.size() > 80);
+    Feed feed;
+    feed.bsi_size = 0x80;
+    for (const auto& p : enc.packets) feed.aus.push_back(adts(enc.extradata, p));
+    const CoreRun full = run_core(f.base(), hle_calls(f, t), kTypeM4Aac, m4aac_param(1), feed);
+    INFO(all(full));
+    REQUIRE(full.outs.size() == feed.aus.size());
+    for (const Out& o : full.outs) {
+        CHECK(o.size == 1024 * 6 * 4);
+        const std::vector<u32> head = {48000, 6, 3, 1, 0, 2, 1}; // rate; channels, front, front centre, side, back, LFE
+        for (u32 i = 0; i < head.size(); i++) CHECK(be32(o.bsi, 4 * i) == head[i]);
+    }
+    for (u32 c = 0; c < 6; c++) {
+        const double snr = snr_db(floats_of(input, 6, c), joined(full, 6, c), 3000);
+        INFO(std::format("channel {}: SNR {:.1f} dB", c, snr));
+        CHECK(snr > 20);
+    }
+    // The two-channel cores, and enableDownmix: each side its front, the centre and its back at 0.7071, the LFE out,
+    // over the sum of those (2.414).
+    const auto expected_stereo = [&](u32 k) {
+        std::vector<std::vector<float>> s(2);
+        const auto ch = [&](u32 c) { return channel_of(full.outs[k].pcm, 6, c, false); };
+        const auto fl = ch(0), fr = ch(1), fc = ch(2), bl = ch(4), br = ch(5);
+        const float k7 = 0.70710678f, norm = 1.0f + 2 * k7;
+        for (usize i = 0; i < fl.size(); i++) {
+            s[0].push_back(fl[i] / norm + fc[i] * (k7 / norm) + bl[i] * (k7 / norm));
+            s[1].push_back(fr[i] / norm + fc[i] * (k7 / norm) + br[i] * (k7 / norm));
+        }
+        return s;
+    };
+    for (const auto& [type, downmix] : {std::pair{kTypeM4Aac2ch, 0u}, {kTypeM4Aac2chMod, 0u}, {kTypeM4Aac, 1u}}) {
+        INFO("type " << type << " downmix " << downmix);
+        const CoreRun two = run_core(f.base(), hle_calls(f, t), type, m4aac_param(1, 0, 0, downmix), feed);
+        REQUIRE(two.outs.size() == feed.aus.size());
+        double worst = 0;
+        for (u32 k = 0; k < two.outs.size(); k++) {
+            CHECK(two.outs[k].size == 1024 * 2 * 4);
+            CHECK(be32(two.outs[k].bsi, 4) == 6); // the stream's channels
+            const auto want = expected_stereo(k);
+            for (u32 c = 0; c < 2; c++) {
+                const auto got = channel_of(two.outs[k].pcm, 2, c, false);
+                for (usize i = 0; i < got.size(); i++)
+                    worst = std::max(worst, static_cast<double>(std::abs(got[i] - want[c][i])));
+            }
+        }
+        CHECK(worst < 1e-6);
+    }
+    // Units refused: ADTS without its sync, of layer 1, of rate index 13, of the SSR profile, one longer than its unit;
+    // the frame after them decodes.
+    std::vector<u8> good = feed.aus[10];
+    const auto with = [&](u32 byte, u8 mask, u8 value) {
+        std::vector<u8> au = good;
+        au[byte] = static_cast<u8>((au[byte] & ~mask) | value);
+        return au;
+    };
+    Feed bad;
+    bad.bsi_size = 0x80;
+    bad.aus = {with(1, 0xF0, 0x70), with(1, 0x06, 0x02), with(2, 0x3C, 0x34), with(2, 0xC0, 0x80),
+        std::vector<u8>(good.begin(), good.begin() + 100), good};
+    const CoreRun refused = run_core(f.base(), hle_calls(f, t), kTypeM4Aac, m4aac_param(1), bad);
+    INFO(all(refused));
+    REQUIRE(refused.outs.size() == 6);
+    CHECK(flow_ok(refused, 6, {{0, 0x80612415}, {1, 0x80612414}, {2, 0x80612428}, {3, 0x80612426}, {4, 0x80612407}}));
+    CHECK(refused.outs[5].size == 1024 * 6 * 4);
+    // ADIF: a header that is not one, and a program the header has not.
+    Feed no_adif;
+    no_adif.bsi_size = 0x80;
+    no_adif.aus = {enc.packets[0]};
+    CHECK(flow_ok(run_core(f.base(), hle_calls(f, t), kTypeM4Aac, m4aac_param(0), no_adif), 1, {{0, 0x80612425}}));
+    Feed other;
+    other.bsi_size = 0x80;
+    other.aus = {adif_header(3, true, 1000)};
+    CHECK(flow_ok(run_core(f.base(), hle_calls(f, t), kTypeM4Aac, m4aac_param(0, 5), other), 1, {{0, 0x80612427}}));
+    // StartSeq's checks: an unknown configuration, a raw rate index past 8 kHz, the SSR profile.
+    for (const auto& p : {m4aac_param(3), m4aac_param(2, 12, 1), m4aac_param(2, 3, 2), m4aac_param(1, 0, 0, 2)})
+        CHECK(run_core(f.base(), hle_calls(f, t), kTypeM4Aac, p, Feed{}).lines[2] == "cellAdecStartSeq -> 0x80612403");
+}
+
+#endif

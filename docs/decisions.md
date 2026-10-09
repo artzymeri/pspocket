@@ -7984,3 +7984,43 @@ stream. Layer II, two seconds of 1 and 2.5 kHz written by FFmpeg's mp2 encoder a
 signal 44.5 and 38.5 dB above its difference from the input (30 required), PTS corrected by 2160; a layer III frame
 (LAYER), a cut frame (OPENBS), free format (UNSUPPORT) and MPEG-2.5's sync (SYNCF) refused, the next frame decoding; a
 layout past the enum refused by StartSeq (ARG).
+
+## D-578 · 2026-10-09 · cellAdec's MPEG-4 AAC cores on FFmpeg, firmware first
+
+The three MPEG-4 AAC types (CELL_ADEC_TYPE_M4AAC and its two-channel forms M4AAC_2CH and M4AAC_2CH_MOD, for
+cellM4AacDec, cellM4AacDec2ch and cellM4AacDec2chmod) get pspocket's own core where no firmware module gives one, by
+D-577's rule (adec_aac.cpp, on FFmpeg's float AAC decoder: LC, Main, LTP, and HE-AAC's SBR and PS). From RPCS3's
+cellAdec.h: CellAdecParamM4Aac (configNumber ADIF, ADTS or raw data blocks; the ADIF program or the raw blocks' rate
+index and profile; enableDownmix), CellAdecM4AacInfo (0x80 bytes with its 16-byte alignment) and the M4AAC error codes.
+MPEG-2 AAC (CELL_ADEC_TYPE_M2AAC, cellM2AACdec) stays Sony's only: RPCS3 has no structures for it.
+- ADTS: one frame per access unit, its header read here: no sync ADTS_SYNCWORD_ERROR, a layer not 0 INVALID_LAYER_ID,
+  a rate index past 8 kHz INVALID_SAMP_RATE_INDEX, SSR (which FFmpeg lacks) NOT_SUPPORTED_PROFILE, a frame longer than
+  its unit END_OF_BITSTREAM. MPEG-2's ID decodes as MPEG-4's.
+- Raw data blocks: the parameters give the rate index and the profile (the object type less one, as ADTS codes it; the
+  structure's comment says LC is 1) but no channel configuration, and FFmpeg needs a whole AudioSpecificConfig: the
+  first block's first element (data and fill elements passed over) gives it, a single channel element mono, a pair
+  stereo, a PCE itself. FFmpeg also takes a pair after a mono configuration and two single elements after a stereo one;
+  more channels need the PCE.
+- ADIF: the header at the sequence's first unit ("ADIF", else INVALID_ADIF_HEADER_ID); the program whose
+  element_instance_tag is programNumber (else the programNumber-th; neither PROG_NUMBER_NOT_FOUND) becomes FFmpeg's
+  configuration, its PCE written again with its byte alignment counted from the configuration's start, as FFmpeg reads
+  it; raw data blocks follow the header and fill the later units.
+- A unit FFmpeg refuses: M4AAC_FATAL (FFmpeg does not say which syntax error it met).
+- The PCM: big-endian floats (no word size in the structures), interleaved in FFmpeg's channel order (WAV's: front
+  left, right, centre, LFE, then the back and side pairs, as cellAudio's eight channels). Past two channels with
+  enableDownmix, and always in the two-channel cores (the "2ch mod" one taken as the two-channel one: what it changes
+  is not known), a stereo downmix: each side its front at 1, the centre and its surround at 0.7071 (a back centre 0.5),
+  the LFE left out, over the coefficients' sum so a full-scale input cannot clip.
+- CellAdecM4AacInfo: samplingFreq the rate coded (SBR doubles it: enableSBR 1 and SBRUpsamplingFactor 2, else 0 and 1),
+  the stream's channels and how many are front, front centre, side, back and LFE (from the layout FFmpeg decoded),
+  isBsiValid 1 for a decoded unit, configNumber the sequence's, the ADTS or ADIF header's fields (ADIF's kept for the
+  later units), a PCE's matrix mixdown index and pseudo surround flag.
+- PTS: the core's own correction (all three call module functions on a PS3: type 29).
+
+Test: tests/hle/test_adec_cores.cpp, streams written by FFmpeg's AAC encoder (the tests' FFmpeg, D-577). Stereo LC at
+48 kHz, 128 kbit/s, two seconds of 1 and 2.5 kHz: as ADTS, the decoded signal 32.1 and 31.0 dB above its difference
+from the input (25 required), the information (rate, channels, the ADTS header's 15 fields), PTS corrected by 1920; as
+raw data blocks and as ADIF (a header built in the test), the same PCM and ADIF's fields. 5.1 at 384 kbit/s, a tone in
+each channel: six channels out, 33 to 64 dB each (20 required), the channel counts; the two-channel cores and
+enableDownmix give the downmix of that output within 1e-6. Refused: no sync, layer 1, rate index 13, SSR, a cut frame,
+a header that is not ADIF, a program the header has not, and four parameter sets StartSeq refuses (ARG).
