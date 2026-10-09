@@ -7542,3 +7542,68 @@ pointers, floats with 50 digits and 57 leading zeros, range errors) and its expo
 money_put; time_get and time_put; the _Makloc* functions; basic_ios::init's fill and locale("C")'s 26 facets made by
 _Getcat. With the facets the streams part's named-locale test runs too (D-560's 25 cases pass). No Sony module to
 compare with (games link the library into themselves, D-500).
+
+## D-563 · 2026-10-09 · Firmware first for a library made without Sony's module; libmixer pspocket's own, from RPCS3
+
+D-500 makes each library Sony's modules serve by comparing it call for call with the module, on the Mac with the
+user's installed system software. Where that is not at hand (a session without firmware), a library can still be made
+from RPCS3's code and the SDK's documented behaviour, but it must not replace a Sony module that works today: a game
+that runs would risk new faults.
+
+**The switch.** `Registry::firmware_first(library)` marks a library the host made without that comparison. The loader
+(LleModules::forced) treats a marked library as one forced with `--lle`: when the module index has a module for it
+(one not on the native list), the game's imports of it go to that module, though the host implements all of it; with
+no system software, or none with that module, the host's serves it. A forced library's module now also serves the
+modules that import it (decide: it joins rather than the host serving that import), so one implementation serves the
+whole process. Once a marked library has been compared with Sony's module on the Mac and matches, its marker goes
+(with a decision of its own). Only libraries no other host module calls are marked: a host module calling one through
+the registry would reach pspocket's while the game had Sony's.
+
+**libmixer** (27 functions, marked firmware-first): the surround mixer (cellSurMixer), its channel strips fed through
+the AAN (cellAANAddData) and its sample players (cellSSPlayer). From RPCS3 rpcs3/Emu/Cell/Modules/libmixer.cpp and
+libmixer.h: the structures, error codes, AAN handle (0x11111111) and port numbers ((type << 16) | index), the upmix of
+each strip type, the speaker buses, and the players' mixing. RPCS3 never starts its mixer thread (the line is commented
+out), so its libmixer mixes nothing; pspocket's is a client of pspocket's cellAudio, as libmixer is of libaudio:
+- cellSurMixerCreate opens an 8-channel port of 16 blocks (level 1) and a notify event queue, and starts the mixer's PPU
+  thread at the game's priority (sysPrxForUser's sys_ppu_thread_create, an internal function as its entry). Before
+  cellAudioInit it is NOT_INITIALIZED, with every port taken FULL; a queue or thread that cannot be made gives
+  NO_MEMORY, with what was made released. Again while it exists: ALREADY_EXIST.
+- The thread mixes one block of 256 samples for each period cellAudio announces, while started: the game's notify
+  callback first (arg, the block's tag, 256), where it feeds the strips and buses; then the connected players; then the
+  total level or mute; written two blocks past the port's read index (cellAudio publishes it, pointing at the block it
+  plays next, before the event), so a block is about 10.7 ms ahead of being played and the first two are silent. The
+  tag counts blocks mixed.
+- cellAANAddData: RPCS3's checks (the handle, a strip that exists, a whole block at offset 0) and upmix (mono to left
+  and right, stereo, 5.1 to the first six buses, 7.1 to all eight), times the strip's level and expression, nothing
+  when it is muted.
+- cellSurMixerChStripSetParameter (RPCS3 ignores it): the level and expression level (in dB with dBSwitch) and the mute
+  (intVal) act on what the strip adds; center and reverb send levels and positions are accepted, not mixed; a parameter
+  past the strip type's (0-6 for mono and stereo, 0-4 for 5.1 and 7.1), an unknown type or an index past the strips
+  made: INVALID_PARAMATER.
+- cellSurMixerSetParameter (RPCS3 ignores it): the total level (linear, or 40 in dB), the total mute; the reverb level
+  is kept (reverb is not mixed); anything else INVALID_PARAMATER.
+- cellSurMixerSurBusAddData: buses 0-7 added; the reverb buses (8-11) and partial blocks accepted, not mixed (RPCS3).
+- cellSurMixerPause: 0 (PAUSE_OFF) plays again, 1 and 2 pause (the port stops, the thread mixes nothing), more is
+  INVALID_PARAMATER (RPCS3 pauses for any value). cellSurMixerFinalize stops the thread (its queue removed from
+  cellAudio and destroyed, the thread joined) and stops and closes the port (RPCS3 only marks an unstarted port
+  closed). A second notify callback is ALREADY_EXIST and removing one not set NOT_EXIST where RPCS3 stops the
+  emulator; a null one INVALID_PARAMATER.
+- cellSurMixerGetTimestamp: the mixer's first start plus a period (256 / 48000 s) per tag (RPCS3 counts from
+  cellAudio's start). cellSurMixerBeep: logged once, nothing played.
+- Sample players: RPCS3's mixing (16-bit little-endian waves, mono to both sides; its rough speed change, where a slower
+  player repeats frames and a faster one adds two frames into one sample; LOOP_ON back to the loop start, ONESHOT_CONT
+  holding the last frame, a one-shot stopping), positions not mixed. Beyond RPCS3: a wave outside guest memory is
+  refused, and a position past the wave's end stops the player instead of reading past it.
+- The utilities (RPCS3 leaves them unimplemented): cellSurMixerUtilGetLevelFromDB 10^(dB/20); NoteToRatio
+  2^((note - refNote) / 12); GetLevelFromDBIndex takes the index as whole decibels, an assumption (the SDK's table is not
+  at hand) and the first thing to check against Sony's module.
+
+Tests: tests/hle/test_libmixer.cpp, 4 cases, 370 checks: the mixer's life (the errors before cellAudioInit and before
+creation, the port it opens, the handle and port numbers, the callback's errors and its calls with consecutive tags,
+timestamps, pause and play again, finalize and a new mixer); a block's mix from a guest-code callback feeding four
+strips and a bus, with levels, an expression in dB, a muted strip, a looped player and the total level, checked at the
+speakers (every sample of every block) and in the port's ring (all eight channels), then the total mute, a stopped
+player and a removed one; a stereo player at double speed and a looped one, frame by frame against RPCS3's algorithm;
+the utilities. tests/hle/test_lle.cpp: a firmware-first library goes to its module when one is installed (for the game
+and for a module importing it) and to the host when not. To do on the Mac: compare libmixer with libmixer.sprx
+(firmware_compare.hpp), then drop its marker.

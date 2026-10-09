@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
 
@@ -178,6 +179,58 @@ TEST_CASE("LLE: the firmware's modules indexed; a library goes LLE only when the
     std::string error;
     CHECK_FALSE(none.index(&error));
     CHECK_FALSE(error.empty());
+    fs::remove_all(root);
+}
+
+// D-563: a library the host made without Sony's module to compare with (libmixer) is firmware-first: the firmware's
+// module serves it when one is installed, for the game and for a module importing it, though the host implements all
+// of it; with no module, the host's serves it.
+TEST_CASE("LLE: a firmware-first library goes to its module when one is installed, to the host when not", "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    const u32 create = recomp::nid_of("cellSurMixerCreate"), start = recomp::nid_of("cellSurMixerStart");
+    REQUIRE(hle::registry().find("libmixer", create));
+    REQUIRE(hle::registry().find("libmixer", start));
+    REQUIRE(hle::registry().is_firmware_first("libmixer"));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellGcmSys"));
+
+    const fs::path root = fresh_flash("pspocket-test-lle-first");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    const auto plain = test::build_ppu_prx();
+    write(external / "libmixer.sprx", debug_self(prx_exporting(plain, "libmixer", create)));
+    // A module exporting synthMixUser that imports libmixer's two functions (its sysPrxForUser import renamed).
+    std::vector<u8> user = prx_exporting(plain, "synthMixUser", 0x66666666);
+    std::fill(user.begin() + 0x310, user.begin() + 0x320, u8{0});
+    std::memcpy(user.data() + 0x310, "libmixer", 8);
+    ps_st32(user.data() + 0x410, create);
+    ps_st32(user.data() + 0x414, start);
+    write(external / "libuser.sprx", debug_self(user));
+    const auto bound = [](u32) { return true; };
+
+    loader::LleModules lle((root / "dev_flash").string());
+    REQUIRE(lle.index());
+    CHECK(lle.chooses("libmixer")); // before the per-game choice too
+    lle.decide({Needs{"libmixer", {create, start}, {}}}, bound);
+    CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libmixer.sprx"});
+    CHECK(lle.chooses("libmixer"));
+    lle.decide({Needs{"synthMixUser", {0x66666666}, {}}}, bound);
+    CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libmixer.sprx", "libuser.sprx"});
+    // Both imports went to the module, which exports only cellSurMixerCreate: cellSurMixerStart is a gap though the
+    // host has it.
+    REQUIRE(lle.gaps().contains("libuser.sprx"));
+    CHECK(lle.gaps().at("libuser.sprx") ==
+        std::vector<std::string>{std::format("libmixer::{:#010x} (not exported by libmixer.sprx)", start)});
+
+    fs::remove(external / "libmixer.sprx");
+    fs::remove(root / "lle-index.txt");
+    loader::LleModules without((root / "dev_flash").string());
+    REQUIRE(without.index());
+    CHECK_FALSE(without.chooses("libmixer"));
+    without.decide({Needs{"libmixer", {create, start}, {}}}, bound);
+    CHECK(without.chosen_files().empty());
+    without.decide({Needs{"synthMixUser", {0x66666666}, {}}}, bound);
+    CHECK(without.chosen_files() == std::set<std::string, std::less<>>{"libuser.sprx"});
+    CHECK_FALSE(without.gaps().contains("libuser.sprx")); // libmixer's functions from the host
     fs::remove_all(root);
 }
 
