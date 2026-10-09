@@ -141,10 +141,14 @@ void answer(PPUContext& ctx, u32 p, u32 record, s32 result)
 // ------------------------------------------------------------------------------------------------- descriptors
 
 namespace ds {
-constexpr u32 kType = 0, kHeader = 4, kUri = 0x10, kMediaInfo = 0x14, kPlayer = 0x1C, kAudio = 0x28, kVideo = 0x2C,
-              kUser = 0x30, kNext = 0x34, kState = 0x38;
+constexpr u32 kType = 0, kHeader = 4, kUri = 0x10, kMediaInfo = 0x14, kPlayer = 0x1C, kProtocol = 0x20,
+              kSource = 0x24, kAudio = 0x28, kVideo = 0x2C, kUser = 0x30, kNext = 0x34, kState = 0x38, kNoAuto = 0x39,
+              kReader = 0x40, kMuxRate = 0xC4, kModule = 0xC0, kBuffer = 0xC8, kHeaderSize = 0xCC, kStreamSize = 0xD0,
+              kDuration = 0xD8;
 constexpr u32 kAudioStride = 0x90, kVideoStride = 0x78, kUserStride = 0x4C;
 } // namespace ds
+
+s32 close_descriptor(PPUContext& ctx, u32 d, bool from_game);
 
 // Create {stream type, media info, URI, the game's pointer}: 0x100 bytes and the elementary stream tables (each entry
 // its index and the descriptor), from the player's allocator; types 0 (PAMF), 1 (MP4) and 2 (AVI) only, the memory kept
@@ -187,10 +191,7 @@ s32 create_descriptor(PPUContext& ctx, u32 p, u32 args)
 s32 free_descriptor(PPUContext& ctx, u32 p, u32 d)
 {
     const u8 st = r8(ctx, d + ds::kState);
-    if (st == 1 || st == 3) {
-        log_call_site(ctx, gb(ctx), "cellSail: an open descriptor destroyed: its close is not pspocket's yet");
-        PS_FATAL(kChan, "libsail's descriptor close is a later part of D-562");
-    }
+    if (st == 1 || st == 3) close_descriptor(ctx, d, false);
     w8(ctx, d + ds::kState, 6);
     dealloc(ctx, p, 8, d);
     return lv2::CELL_OK;
@@ -246,6 +247,198 @@ void destroy_descriptor(PPUContext& ctx, u32 p, u32 d)
         if (const s32 r = free_descriptor(ctx, p, d); r < 0) notify_error(ctx, p, r);
         return;
     }
+}
+
+// ------------------------------------------------------------------------------------------------- system modules
+
+// Whether libsail loads the modules it needs: its module_start asks lv2 for the process's authority (system software,
+// program types 1 and 2, has them loaded already).
+bool loads_modules(PPUContext& ctx)
+{
+    const u32 pid = static_cast<u32>(sc(ctx, 1, {}));
+    StackVar v(ctx, gb(ctx), 8);
+    if (sc(ctx, 871, {1, pid, v.addr()}) != 0) return true;
+    return (r64(ctx, v.addr()) & 0xFFFFFF) - 1 > 1;
+}
+
+// cellSysmodule's (internal ones from 0xF000), when libsail loads modules.
+s32 load_module(PPUContext& ctx, u32 id)
+{
+    if (!loads_modules(ctx)) return lv2::CELL_OK;
+    return static_cast<s32>(module_call(ctx, "cellSysmodule",
+        id > 0xEFFF ? "cellSysmoduleLoadModuleInternal" : "cellSysmoduleLoadModule", {id & 0xFFFF}));
+}
+
+s32 unload_module(PPUContext& ctx, u32 id)
+{
+    if (!loads_modules(ctx)) return lv2::CELL_OK;
+    return static_cast<s32>(module_call(ctx, "cellSysmodule",
+        id > 0xEFFF ? "cellSysmoduleUnloadModuleInternal" : "cellSysmoduleUnloadModule", {id & 0xFFFF}));
+}
+
+// ------------------------------------------------------------------------------------------------- sources
+
+// A source (CellSailSource): +0 the player using it, +4 its argument, +8 its 14 callbacks, +0x70 the descriptors
+// open through it.
+namespace src {
+constexpr u32 kPlayer = 0, kArg = 4, kFuncs = 8, kUsers = 0x70;
+constexpr u32 kMakeup = 0, kCleanup = 1, kReadSync = 11;
+} // namespace src
+
+u32 source_func(PPUContext& ctx, u32 source, u32 index) { return r32(ctx, source + src::kFuncs + 4 * index); }
+
+// Makeup(arg, protocol) when the source has one, the player kept first.
+s32 source_makeup(PPUContext& ctx, u32 source, u32 protocol, u32 p)
+{
+    w32(ctx, source + src::kPlayer, p);
+    const u32 f = source_func(ctx, source, src::kMakeup);
+    return f ? static_cast<s32>(call_guest(ctx, f, {r32(ctx, source + src::kArg), protocol})) : 0;
+}
+
+s32 source_cleanup(PPUContext& ctx, u32 source)
+{
+    const u32 f = source_func(ctx, source, src::kCleanup);
+    return f ? static_cast<s32>(call_guest(ctx, f, {r32(ctx, source + src::kArg)})) : 0;
+}
+
+// ReadSync(arg, stream type, media info, URI, offset, buffer, size, u64* total size).
+s32 source_read_sync(PPUContext& ctx, u32 source, s32 type, u32 media, u32 uri, u64 offset, u32 buf, u32 size,
+    u32 total)
+{
+    return static_cast<s32>(call_guest(ctx, source_func(ctx, source, src::kReadSync),
+        {r32(ctx, source + src::kArg), static_cast<u64>(static_cast<s64>(type)), media, uri, offset, buf, size, total}));
+}
+
+// ------------------------------------------------------------------------------------------------- descriptors' streams
+
+// The player's memory through its thread (messages 0x3C and 0x3D), as libsail asks for it from the game's thread.
+u32 alloc_through_thread(PPUContext& ctx, u32 p, u32 boundary, u32 size)
+{
+    StackVar args(ctx, gb(ctx), 16);
+    w32(ctx, args.addr(), boundary);
+    w32(ctx, args.addr() + 4, size);
+    StackVar reply(ctx, gb(ctx), 16);
+    if (command(ctx, p, 0x3C, args.addr(), reply.addr()) < 0) return 0;
+    if (static_cast<s32>(r32(ctx, reply.addr())) < 0) return 0;
+    return r32(ctx, args.addr() + 8);
+}
+
+void free_through_thread(PPUContext& ctx, u32 p, u32 boundary, u32 ptr) { post_urgent(ctx, p, 0x3D, 0, boundary, ptr); }
+
+void unsupported_container(PPUContext& ctx, u32 d)
+{
+    log_call_site(ctx, gb(ctx), std::format("cellSail: descriptor {:#x} of stream type {} (MP4 or AVI): the firmware "
+        "libraries' part is not pspocket's yet", d, r32(ctx, d + ds::kType)));
+    PS_FATAL(kChan, "libsail's MP4 and AVI descriptors are a later part of D-562");
+}
+
+// Message 0x3E, the control thread's side of Open: a PAMF descriptor's URI ("protocol://...") finds its registered
+// source by the protocol's name (compared over the URI's protocol's length, as libsail does); the source's first user
+// makes it up. libpamf loaded for the descriptor (module 0x12, unloaded again on failure).
+s32 open_stream(PPUContext& ctx, u32 d)
+{
+    const u32 p = r32(ctx, d + ds::kPlayer);
+    if (r32(ctx, d + ds::kType) != 0) unsupported_container(ctx, d);
+    if (const s32 r = load_module(ctx, 0x12); r < 0) return r;
+    const u8* b = gb(ctx);
+    const u32 uri = r32(ctx, d + ds::kUri);
+    u32 colon = 0;
+    if (uri)
+        for (u32 at = uri; b[at]; at++)
+            if (b[at] == ':') {
+                colon = at;
+                break;
+            }
+    if (colon && b[colon + 1] == '/' && b[colon + 2] == '/') {
+        const u32 n = colon - uri;
+        for (u32 i = 0; i < r32(ctx, p + pl::kProtocolCount); i++) {
+            const u32 name = p + pl::kProtocols + 0x20 * i;
+            u32 k = 0;
+            while (k < n && b[name + k] == b[uri + k] && b[name + k]) k++;
+            if (k != n && b[name + k] != b[uri + k]) continue;
+            const u32 source = r32(ctx, p + pl::kProtocolSources + 4 * i);
+            const u32 users = r32(ctx, source + src::kUsers) + 1;
+            w32(ctx, source + src::kUsers, users);
+            if (users == 1) {
+                if (const s32 r = source_makeup(ctx, source, name, p); r < 0) {
+                    w32(ctx, source + src::kUsers, 0);
+                    unload_module(ctx, 0x12);
+                    return r;
+                }
+            }
+            w32(ctx, d + ds::kProtocol, name);
+            w32(ctx, d + ds::kModule, 0x12);
+            w32(ctx, d + ds::kSource, source);
+            return lv2::CELL_OK;
+        }
+    }
+    unload_module(ctx, 0x12);
+    return error(CELL_SAIL_ERROR_UNSUPPORTED_STREAM);
+}
+
+// Message 0x3F (or the control thread itself): the source's last user cleans it up; the descriptor's module unloaded.
+s32 close_stream(PPUContext& ctx, u32 d)
+{
+    if (r32(ctx, d + ds::kType) != 0) unsupported_container(ctx, d);
+    const u32 source = r32(ctx, d + ds::kSource);
+    PS_CHECK(source != 0);
+    const s32 users = static_cast<s32>(r32(ctx, source + src::kUsers));
+    if (users > 0) {
+        w32(ctx, source + src::kUsers, static_cast<u32>(users - 1));
+        if (users == 1) source_cleanup(ctx, source);
+    }
+    const u32 module = r32(ctx, d + ds::kModule);
+    w32(ctx, d + ds::kModule, 0);
+    w32(ctx, d + ds::kSource, 0);
+    w32(ctx, d + ds::kProtocol, 0);
+    if (module) unload_module(ctx, module & 0xFFFF);
+    return lv2::CELL_OK;
+}
+
+// The elementary streams chosen when the descriptor opens, unless the game turned auto selection off.
+void select_streams(PPUContext& ctx, u32 d)
+{
+    if (r8(ctx, d + ds::kNoAuto)) return;
+    const u32 p = r32(ctx, d + ds::kPlayer);
+    if (r32(ctx, p + pl::kAudioCount) || r32(ctx, p + pl::kVideoCount) || r32(ctx, p + pl::kUserCount)) {
+        log_call_site(ctx, gb(ctx), "cellSail: a descriptor opened for a player with streams: libsail's stream "
+            "selection is a later part");
+        PS_FATAL(kChan, "libsail's elementary stream selection is a later part of D-562");
+    }
+}
+
+// Close (libsail's): an open descriptor back to created, a held one (from the control thread only) back to added; the
+// stream closed on the control thread (a command from any other) and the header's buffer freed.
+s32 close_descriptor(PPUContext& ctx, u32 d, bool from_game)
+{
+    const u8 st = r8(ctx, d + ds::kState);
+    if (st == 1) {
+        w8(ctx, d + ds::kState, 0);
+    } else if (st == 0) {
+        return error(CELL_SAIL_ERROR_INVALID_STATE);
+    } else if (st < 6) {
+        if (from_game) return error(CELL_SAIL_ERROR_INVALID_STATE);
+        w8(ctx, d + ds::kState, 2);
+    }
+    const u32 type = r32(ctx, d + ds::kType), p = r32(ctx, d + ds::kPlayer);
+    if ((type == 1 || type == 2) && r32(ctx, d + ds::kSource)) unsupported_container(ctx, d);
+    const u32 lib = r32(ctx, d + ds::kSource), buf = r32(ctx, d + ds::kBuffer);
+    w32(ctx, d + ds::kHeaderSize, 0);
+    w32(ctx, d + ds::kBuffer, 0);
+    if (lib) {
+        StackVar tid(ctx, gb(ctx), 8);
+        const s32 r = static_cast<s32>(lv2_lib(ctx, "sys_ppu_thread_get_id", {tid.addr()}));
+        if ((r < 0 || r64(ctx, p + pl::kThread) != r64(ctx, tid.addr())) && from_game) {
+            if (const s32 c = command_answer(ctx, p, 0x3F, d); c < 0) return c;
+        } else {
+            if (const s32 c = close_stream(ctx, d); c < 0) return c;
+            from_game = false;
+        }
+    }
+    if (!buf) return lv2::CELL_OK;
+    if (from_game) free_through_thread(ctx, p, 0x80, buf);
+    else dealloc(ctx, p, 0x80, buf);
+    return lv2::CELL_OK;
 }
 
 // ------------------------------------------------------------------------------------------------- the dmux pipeline
@@ -307,6 +500,25 @@ void message_loop(PPUContext& ctx, u32 p)
             // A call's completion {0, result, handle}: handled as the call its handle names.
             code = m.b & 0xFFFF;
             last = code;
+        }
+        if (code == 0x3D) {
+            dealloc(ctx, p, m.b, m.c); // memory freed for the game's thread
+            continue;
+        }
+        if (code == 0x3C || code == 0x3E || code == 0x3F) {
+            if (const s32 r = lock(ctx, p); r < 0) {
+                notify_error(ctx, p, r);
+                notify_error(ctx, p, error(CELL_SAIL_ERROR_FATAL));
+                continue;
+            }
+            if (code == 0x3C) {
+                // Memory for the game's thread: {boundary, size, the memory}.
+                w32(ctx, m.b + 8, alloc(ctx, p, r32(ctx, m.b), r32(ctx, m.b + 4)));
+                answer(ctx, p, m.c, 0);
+            } else {
+                answer(ctx, p, m.c, code == 0x3E ? open_stream(ctx, m.b) : close_stream(ctx, m.b));
+            }
+            continue;
         }
         if (code >= 0x40 && code <= 0x43) {
             // Descriptor commands, under the player's lock; a failed lock is an error and a fatal error.
@@ -455,6 +667,83 @@ s32 cellSailPlayerBoot(PPUContext& ctx, u32 p, u64 arg)
 
 // ------------------------------------------------------------------------------------------------- the game's calls
 
+// Open: a created descriptor (or 4) opened; open ones answer 0. The stream found through its source on the control
+// thread, then, for PAMF, the header read through the source's ReadSync into memory from the control thread (2 KB
+// first, then the header's own size), libpamf's reader made over it (verified), the mux rate (x400), the stream's size
+// and its duration (the presentation end less the start) kept, the elementary streams chosen, state 1. A failure frees
+// the buffer and closes the stream again.
+s32 cellSailDescriptorOpen(PPUContext& ctx, u32 d)
+{
+    const u8 st = r8(ctx, d + ds::kState);
+    if (st == 1 || st == 3 || st == 5) return lv2::CELL_OK;
+    if (st != 0 && st != 4) return error(CELL_SAIL_ERROR_INVALID_STATE);
+    const u32 p = r32(ctx, d + ds::kPlayer);
+    s32 r = command_answer(ctx, p, 0x3E, d);
+    if (r < 0) return r;
+    const u32 type = r32(ctx, d + ds::kType);
+    if (type == 1 || type == 2) unsupported_container(ctx, d);
+    bool opened = false;
+    u32 buf = 0;
+    if (type != 0) {
+        r = error(CELL_SAIL_ERROR_UNSUPPORTED_STREAM);
+    } else {
+        const u32 old = r32(ctx, d + ds::kBuffer);
+        w32(ctx, d + ds::kBuffer, 0);
+        if (old) free_through_thread(ctx, p, 0x80, old);
+        StackVar out(ctx, gb(ctx), 0x30); // total size, header offset, stream size, start and end times
+        const u32 total = out.addr(), offset = out.addr() + 8, size = out.addr() + 16, start = out.addr() + 24,
+                  end = out.addr() + 32;
+        u32 want = 0x800;
+        for (;;) {
+            buf = alloc_through_thread(ctx, p, 0x80, want);
+            if (!buf) {
+                r = error(CELL_SAIL_ERROR_MEMORY);
+                break;
+            }
+            r = source_read_sync(ctx, r32(ctx, d + ds::kSource), static_cast<s32>(type), r32(ctx, d + ds::kMediaInfo),
+                r32(ctx, d + ds::kUri), 0, buf, want, total);
+            if (r >= 0)
+                r = static_cast<s32>(module_call(ctx, "cellPamf", "cellPamfGetStreamOffsetAndSize", {buf, 0, offset, size}));
+            if (r < 0) {
+                free_through_thread(ctx, p, 0x80, buf);
+                break;
+            }
+            const u64 header = r64(ctx, offset);
+            if (want >= header) {
+                w32(ctx, d + ds::kHeaderSize, static_cast<u32>(header));
+                w32(ctx, d + ds::kBuffer, buf);
+                w64(ctx, d + ds::kStreamSize, r64(ctx, size));
+                const u32 rd = d + ds::kReader;
+                r = static_cast<s32>(module_call(ctx, "cellPamf", "cellPamfReaderInitialize", {rd, buf, 0, 1}));
+                if (r < 0) {
+                    free_through_thread(ctx, p, 0x80, buf);
+                    break;
+                }
+                const u32 mux = static_cast<u32>(module_call(ctx, "cellPamf", "cellPamfReaderGetMuxRateBound", {rd}));
+                w32(ctx, d + ds::kMuxRate, mux * 400);
+                module_call(ctx, "cellPamf", "cellPamfReaderGetPresentationStartTime", {rd, start});
+                module_call(ctx, "cellPamf", "cellPamfReaderGetPresentationEndTime", {rd, end});
+                w64(ctx, d + ds::kDuration, u64{r32(ctx, end) - r32(ctx, start)} << 32 |
+                    (r32(ctx, end + 4) - r32(ctx, start + 4)));
+                opened = true;
+                break;
+            }
+            free_through_thread(ctx, p, 0x80, buf);
+            want = static_cast<u32>(header);
+        }
+    }
+    if (!opened) {
+        command_answer(ctx, p, 0x3F, d);
+        return r;
+    }
+    select_streams(ctx, d);
+    w8(ctx, d + ds::kState, 1);
+    return lv2::CELL_OK;
+}
+
+s32 cellSailDescriptorClose(PPUContext& ctx, u32 d) { return close_descriptor(ctx, d, true); }
+
+
 s32 cellSailPlayerCreateDescriptor(PPUContext& ctx, u32 p, u32 type, u32 media_info, u32 uri, u32 out)
 {
     if (!out) return error(CELL_SAIL_ERROR_INVALID_ARG);
@@ -498,6 +787,10 @@ void register_cellSailControl(Registry& r)
             &detail::thunk<&cellSailPlayerRemoveDescriptor>, false},
         ::pspocket::hle::Function{{}, "cellSailPlayerDestroyDescriptor",
             recomp::nid_of("cellSailPlayerDestroyDescriptor"), &detail::thunk<&cellSailPlayerDestroyDescriptor>, false},
+        ::pspocket::hle::Function{{}, "cellSailDescriptorOpen", recomp::nid_of("cellSailDescriptorOpen"),
+            &detail::thunk<&cellSailDescriptorOpen>, false},
+        ::pspocket::hle::Function{{}, "cellSailDescriptorClose", recomp::nid_of("cellSailDescriptorClose"),
+            &detail::thunk<&cellSailDescriptorClose>, false},
         ::pspocket::hle::Function{{}, "_pspocket_cellSail_control", recomp::nid_of("_pspocket_cellSail_control"),
             &detail::thunk<&_pspocket_cellSail_control>, true},
     });

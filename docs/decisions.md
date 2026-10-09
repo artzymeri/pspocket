@@ -7179,6 +7179,25 @@ add, remove and destroy above, and the allocator's memory (the player's block wi
 compared too for parts 6 and 7 (the built-in source's function words, the queue ring's stack addresses and the
 handler's r7 masked): 0 differences over 2689 checks.
 
+Part 8, descriptors opened and closed (PAMF through a source): DescriptorOpen (created descriptors, or 4; open ones answer
+0) asks the control thread (message 0x3E) to find the stream: libpamf loaded (cellSysmodule 0x12, unless the process is
+system software: libsail's module_start asks lv2's access control engine, syscall 871, and so does pspocket's on use),
+the URI's "protocol://" matched against the registered protocols over the protocol's length, the source's first user
+making it up (its player kept at +0), the protocol, module and source kept in the descriptor (+0x20, +0xC0, +0x24).
+Then, on the game's thread, the header is read through the source's ReadSync into memory the control thread allocates
+(message 0x3C; freed through it with 0x3D): 2 KB first, again at the header's own size when larger;
+cellPamfGetStreamOffsetAndSize, the reader (cellPamfReaderInitialize at +0x40, verified), the mux rate bound x400
+(+0xC4), the header's buffer and size (+0xC8, +0xCC), the stream's size (+0xD0) and duration (+0xD8, the presentation end
+less the start, each 32-bit half) kept, the elementary streams chosen (later part, none without streams), state 1. A
+failure frees the buffer and closes the stream (message 0x3F: the source's last user cleans it up, the module unloaded).
+DescriptorClose (open descriptors; held ones only from the control thread, back to 2) closes the stream on the control
+thread or through it and frees the header's buffer; Destroy and the player's end close open descriptors on the control
+thread. MP4 and AVI descriptors (the firmware's cellMp4 and cellSailAvi) stop the process with what was asked (a later
+part). The comparison's trace now leaves out the control thread's 3 s waits for a message (their number depends on when
+the script posts). Compared with libsail: a game's source in guest code serving a two-unit PAMF header, opens (twice,
+shared source), closes from the game (refused while held), unknown protocols and a URI without one, a source whose
+ReadSync fails, destroy and the player's end closing open descriptors: 0 differences over 2737 checks in eight scripts.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)

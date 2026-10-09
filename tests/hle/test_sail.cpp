@@ -67,7 +67,12 @@ void observe(void* user, u32 n, const u64* a)
     switch (n) {
     case 100: s = std::format("mutex_create({:#x},{})", a[0], attr(a[1], 10)); break;
     case 105: s = std::format("cond_create({:#x}, {:#x},{})", a[0], a[1], attr(a[2], 6)); break;
-    case 102: case 107: s = std::format("{}({:#x}, {})", n, a[0], a[1]); break;
+    case 107:
+        // The control thread's 3 s waits for a message: how many there are depends on when the script posts.
+        if (a[1] == 3000000) return;
+        s = std::format("{}({:#x}, {})", n, a[0], a[1]);
+        break;
+    case 102: s = std::format("{}({:#x}, {})", n, a[0], a[1]); break;
     case 101: case 104: case 106: case 108: s = std::format("{}({:#x})", n, a[0]); break;
     default: return;
     }
@@ -92,6 +97,7 @@ void part4(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part5(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part6(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part7(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part8(u8* b, const Call& call, u32 cb, GuestThread& t);
 constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00;
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
@@ -140,7 +146,8 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 4) part4(b, call, cb, t);
     else if (part == 5) part5(b, call, cb, t);
     else if (part == 6) part6(b, call, cb, t);
-    else part7(b, call, cb, t);
+    else if (part == 7) part7(b, call, cb, t);
+    else part8(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
@@ -813,6 +820,161 @@ void part7(u8* b, const Call& call_, u32 cb, GuestThread&)
     }
 }
 
+// A PAMF header of two 2 KB units (so libsail reads it twice) with one AVC and one ATRAC3plus stream, after
+// test_pamf.cpp's.
+constexpr u32 kPamf = kData + 0x30000, kPamfLen = 0x1000, kPamfFile = 0x123000;
+void write_sail_pamf(u8* b)
+{
+    const u32 h = kPamf;
+    std::memset(b + h, 0, kPamfLen);
+    std::memcpy(b + h, "PAMF0041", 8);
+    ps_write32(b, h + 0x08, 2);
+    ps_write32(b, h + 0x0C, 0x10);
+    const u32 seq = h + 0x50;
+    ps_write32(b, seq, 0x94);
+    ps_write32(b, seq + 0x08, 0x1000);
+    ps_write32(b, seq + 0x0E, 0x100000);
+    ps_write32(b, seq + 0x12, 0xFF123456);
+    ps_write32(b, seq + 0x1A, 2);
+    ps_write8(b, seq + 0x1F, 1);
+    const u32 gp = h + 0x70;
+    ps_write32(b, gp, 0x74);
+    ps_write32(b, gp + 0x06, 0x1000);
+    ps_write32(b, gp + 0x0C, 0x100000);
+    ps_write8(b, gp + 0x11, 1);
+    const u32 group = h + 0x82;
+    ps_write32(b, group, 0x62);
+    ps_write8(b, group + 5, 2);
+    const u32 avc = h + 0x88;
+    ps_write8(b, avc + 0, 0x1b);
+    ps_write8(b, avc + 4, 0xe0);
+    ps_write32(b, avc + 8, 0xE8);
+    ps_write32(b, avc + 12, 3);
+    const u8 avc_info[26] = {100, 41, 0xC4, 0xff, 0, 16, 0, 9, 0, 80, 0, 45, 0, 0, 0, 0, 0, 0, 0, 8, 0xB0, 1, 1, 1,
+        0xE2, 0x30};
+    std::memcpy(b + avc + 16, avc_info, sizeof avc_info);
+    const u32 at3 = h + 0xB8;
+    ps_write8(b, at3 + 0, 0xdc);
+    ps_write8(b, at3 + 4, 0xbd);
+    ps_write32(b, at3 + 8, 0x10C);
+    ps_write32(b, at3 + 12, 1);
+    ps_write8(b, at3 + 16 + 2, 2);
+    ps_write8(b, at3 + 16 + 3, 1);
+    const u32 eps[3][3] = {{(1u << 14) | 5, 0x1000, 0}, {(1u << 14) | 6, 0x5000, 4}, {(2u << 14) | 7, 0x9000, 8}};
+    for (u32 i = 0; i < 3; i++) {
+        ps_write16(b, h + 0xE8 + 12 * i, static_cast<u16>(eps[i][0]));
+        ps_write32(b, h + 0xE8 + 12 * i + 4, eps[i][1]);
+        ps_write32(b, h + 0xE8 + 12 * i + 8, eps[i][2]);
+    }
+    ps_write32(b, h + 0x10C + 4, 0x1000);
+}
+
+// A game's source in guest code: ReadSync copies the header (up to the size asked) and logs its last call {count, size,
+// buffer, u64 offset, type, URI, arg} at `log`; Cleanup counts at log+0x40 {count, arg}; a second ReadSync fails (-1).
+void source_code(u8* b, u32 at, u32 log)
+{
+    const auto hi = [](u32 v) { return v >> 16; };
+    const auto lo = [](u32 v) { return v & 0xFFFF; };
+    const u32 read[] = {0x3D600000u | hi(log), 0x616B0000u | lo(log), 0x818B0000u, 0x398C0001u, 0x918B0000u,
+        0x912B0004u, 0x910B0008u, 0xF8EB0010u, 0x908B0018u, 0x90CB001Cu, 0x906B0020u, 0x3D600000u | hi(kPamf),
+        0x616B0000u | lo(kPamf), 0x39800000u | kPamfLen, 0x7F896040u, 0x409C0008u, 0x7D2C4B78u, 0x7D8903A6u,
+        0x396BFFFFu, 0x3908FFFFu, 0x8C0B0001u, 0x9C080001u, 0x4200FFF8u, 0x3C000000u | hi(kPamfFile),
+        0x60000000u | lo(kPamfFile), 0xF80A0000u, 0x38600000u, 0x4E800020u};
+    for (u32 i = 0; i < std::size(read); i++) ps_write32(b, at + 4 * i, read[i]);
+    ps_write32(b, at + 0x78, at);
+    ps_write32(b, at + 0x7C, 0);
+    const u32 cleanup[] = {0x3D600000u | hi(log), 0x616B0000u | lo(log), 0x818B0040u, 0x398C0001u, 0x918B0040u,
+        0x906B0044u, 0x38600000u, 0x4E800020u};
+    for (u32 i = 0; i < std::size(cleanup); i++) ps_write32(b, at + 0x80 + 4 * i, cleanup[i]);
+    ps_write32(b, at + 0xB0, at + 0x80);
+    ps_write32(b, at + 0xB4, 0);
+    ps_write32(b, at + 0xC0, 0x3860FFFFu);
+    ps_write32(b, at + 0xC4, 0x4E800020u);
+    ps_write32(b, at + 0xC8, at + 0xC0);
+    ps_write32(b, at + 0xCC, 0);
+}
+
+// Descriptors opened and closed: PAMF through a game's source (its makeup on first use, cleanup on last), the header
+// read twice (2 KB, then its size), a source whose ReadSync fails, unknown protocols, closes from the game and from the
+// control thread (destroy, the player's end).
+void part8(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    write_sail_pamf(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kSrcCode = kArea + 0x1C00, kSource2 = kSource + 0x80, kFuncs2 = kFuncs + 0x80;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) {
+        ps_write32(b, kFuncs + 4 * i, 0);
+        ps_write32(b, kFuncs2 + 4 * i, 0);
+    }
+    ps_write32(b, kFuncs, cb);                       // makeup: recorded
+    ps_write32(b, kFuncs + 4, kSrcCode + 0xB0);      // cleanup: counted
+    ps_write32(b, kFuncs + 44, kSrcCode + 0x78);     // readSync: the header
+    ps_write32(b, kFuncs2, cb);
+    ps_write32(b, kFuncs2 + 4, kSrcCode + 0xB0);
+    ps_write32(b, kFuncs2 + 44, kSrcCode + 0xC8);    // readSync: fails
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+    };
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 0, 0, 0, 0});
+    mask_player_source(b, kP);
+    call("cellSailSourceInitialize", {kSource, kFuncs, 0x77});
+    call("cellSailSourceInitialize", {kSource2, kFuncs2, 0x88});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x120, "x-bad"), kSource2});
+    call("cellSailPlayerBoot", {kP, 0});
+    until([&] { return b[kP + 0x163] == 2; });
+
+    const u32 good = str(kUri, "x-test://movie.pam");
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, good, kOut});
+    const u32 d0 = ps_read32(b, kOut);
+    call("cellSailDescriptorOpen", {d0});
+    call("cellSailDescriptorOpen", {d0});
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, good, kOut + 4});
+    const u32 d1 = ps_read32(b, kOut + 4);
+    call("cellSailDescriptorOpen", {d1});
+    call("cellSailDescriptorClose", {d1});
+    call("cellSailDescriptorClose", {d1});
+    call("cellSailPlayerCreateDescriptor", {kP, 0, 0, str(kUri + 0x40, "x-none://a"), kOut + 8});
+    call("cellSailDescriptorOpen", {ps_read32(b, kOut + 8)});
+    call("cellSailPlayerCreateDescriptor", {kP, 0, 0, str(kUri + 0x60, "plain"), kOut + 12});
+    call("cellSailDescriptorOpen", {ps_read32(b, kOut + 12)});
+    call("cellSailPlayerCreateDescriptor", {kP, 0, 0, str(kUri + 0xC0, "x-bad://b"), kOut + 16});
+    call("cellSailDescriptorOpen", {ps_read32(b, kOut + 16)});
+    call("cellSailPlayerAddDescriptor", {kP, d0});
+    call("cellSailDescriptorClose", {d0});
+    call("cellSailDescriptorOpen", {d1});
+    call("cellSailPlayerDestroyDescriptor", {kP, d1});
+    until([&] { return b[d1 + 0x38] == 6; });
+    call("cellSailPlayerRemoveDescriptor", {kP, kOut + 20});
+    call("cellSailDescriptorClose", {d0});
+    call("cellSailDescriptorOpen", {d0});
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    mask_handler_r7(b);
+    // The sources' makeup records: past its two arguments.
+    for (u32 i = 0; i < ps_read32(b, kRecords); i++) {
+        const u32 r = kRecords + 16 + 48 * i;
+        if (ps_read64(b, r) == 0x77 || ps_read64(b, r) == 0x88) g_mask.push_back({r + 16, 24});
+    }
+    const u32 ring = ps_read32(b, kP + 0x178);
+    for (u32 i = 0; i < ps_read32(b, kP + 0x170); i++) {
+        const u32 e = ring + 16 * i;
+        if (ps_read32(b, e) == 0x40 || ps_read32(b, e) == 0x3C) g_mask.push_back({e + 8, 4});
+        g_mask.push_back({e + 12, 4});
+    }
+}
+
 } // namespace
 
 void compare_runs(int part)
@@ -834,6 +996,10 @@ void compare_runs(int part)
                 if (a[i] != c[i]) std::fprintf(stderr, "%s %#zx: pspocket %02x libsail %02x\n", what, base + i, a[i], c[i]);
         };
         dump("area", kArea, mine.mem, sony.mem);
+        for (const std::string& l : mine.lines) std::fprintf(stderr, "ANSWER %s\n", l.c_str());
+        for (const auto* r : {&mine, &sony})
+            for (const std::string& c : r->calls)
+                std::fprintf(stderr, "%s %s\n", r == &mine ? "CALLS-MINE" : "CALLS-SONY", c.c_str());
         dump("heap", kHeap, mine.heap, sony.heap);
     }
     CHECK(mine.heap.size() == sony.heap.size());
@@ -862,4 +1028,9 @@ TEST_CASE("cellSail against libsail: Boot and Finalize of a player without strea
 TEST_CASE("cellSail against libsail: descriptors created, added, removed and destroyed", "[hle][lle][sail]")
 {
     compare_runs(7);
+}
+
+TEST_CASE("cellSail against libsail: descriptors opened and closed through a game's source", "[hle][lle][sail]")
+{
+    compare_runs(8);
 }
