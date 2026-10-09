@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 5559 of 6625 pspocket&#x27;s own (83.9%), 188 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 5564 of 6625 pspocket&#x27;s own (84.0%), 188 answered as RPCS3</text>
 <g><title>sys_libc: 978 own, 0 answered as RPCS3, 141 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -6841,13 +6841,13 @@
 <rect x="887.0" y="347.0" width="5.4" height="6.7" fill="#8c959f"/>
 <rect x="893.0" y="347.0" width="5.4" height="6.7" fill="#8c959f"/>
 </g>
-<g><title>cellKey2char: 0 own, 0 answered as RPCS3, 5 not yet, of 5</title>
+<g><title>cellKey2char: 5 own, 0 answered as RPCS3, 0 not yet, of 5</title>
 <rect x="816.5" y="355.3" width="16.7" height="16.7" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="817.5" y="356.3" width="6.8" height="4.3" fill="#8c959f"/>
-<rect x="824.8" y="356.3" width="6.8" height="4.3" fill="#8c959f"/>
-<rect x="817.5" y="361.2" width="6.8" height="4.3" fill="#8c959f"/>
-<rect x="824.8" y="361.2" width="6.8" height="4.3" fill="#8c959f"/>
-<rect x="817.5" y="366.1" width="6.8" height="4.3" fill="#8c959f"/>
+<rect x="817.5" y="356.3" width="6.8" height="4.3" fill="#2da44e"/>
+<rect x="824.8" y="356.3" width="6.8" height="4.3" fill="#2da44e"/>
+<rect x="817.5" y="361.2" width="6.8" height="4.3" fill="#2da44e"/>
+<rect x="824.8" y="361.2" width="6.8" height="4.3" fill="#2da44e"/>
+<rect x="817.5" y="366.1" width="6.8" height="4.3" fill="#2da44e"/>
 </g>
 <g><title>cellMusicExportUtility: 5 own, 0 answered as RPCS3, 0 not yet, of 5</title>
 <rect x="833.2" y="355.3" width="16.7" height="16.7" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
