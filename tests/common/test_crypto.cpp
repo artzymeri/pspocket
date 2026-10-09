@@ -153,14 +153,14 @@ TEST_CASE("AES: the platform's library and the portable one agree on random inpu
         std::vector<u8> a(plain.size()), b(plain.size());
         REQUIRE(crypto::aes_ecb_encrypt(key, plain.data(), plain.size(), a.data()));
         REQUIRE(crypto::soft::aes_ecb_encrypt(key, plain.data(), plain.size(), b.data()));
-        CHECK(a == b);
+        CHECK((a == b)); // unexpanded: Catch2 throws printing byte vectors this long (-s)
         REQUIRE(crypto::aes_ecb_decrypt(key, a.data(), a.size(), b.data()));
-        CHECK(b == plain);
+        CHECK((b == plain));
         REQUIRE(crypto::aes_cbc_encrypt(key, iv.data(), plain.data(), plain.size(), a.data()));
         REQUIRE(crypto::soft::aes_cbc_encrypt(key, iv.data(), plain.data(), plain.size(), b.data()));
-        CHECK(a == b);
+        CHECK((a == b));
         REQUIRE(crypto::aes_cbc_decrypt(key, iv.data(), a.data(), a.size(), b.data()));
-        CHECK(b == plain);
+        CHECK((b == plain));
         const usize odd = plain.size() - static_cast<usize>(rng() % 16);
         REQUIRE(crypto::aes_ctr(key, iv.data(), plain.data(), odd, a.data()));
         REQUIRE(crypto::soft::aes_ctr(key, iv.data(), plain.data(), odd, b.data()));
