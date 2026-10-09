@@ -1,13 +1,14 @@
-// cellSysutil's cxml, cxmlutil, sysutil_cxmlutil, packets and shared memories (D-534) against libsysutil, Sony's own
-// module, from the user's installed system software (D-193's method): the same script runs in two fresh processes,
-// both with libsysutil loaded (so their memory is laid out alike), one calling libsysutil's exports and one pspocket's.
-// After every call the answer, the script's memory (documents, element, attribute and file objects, strings, the test
-// allocator's arena and its log of calls, the test writer's output), libsysutil's globals and FixedMemory blocks (at
-// libsysutil's data in one run, pspocket's block in the other: addresses into them are compared as offsets), the
-// channels' shared memory and the lv2 calls the thread made, with their arguments, must be the same. Both runs start
-// libsysutil's channels as pspocket's console has them (sysutil_cxml.hpp packets_start): Sony's module through its own
-// code for the system side and for closing them. The allocator and the writer documents are given are PPC code built
-// here. Skipped without the firmware (PSPOCKET_TEST_DEV_FLASH, firmware_compare.hpp); no game data.
+// cellSysutil's cxml, cxmlutil, sysutil_cxmlutil, packets, shared memories, web browser, other requests to the system
+// software and unnamed exports (D-534) against libsysutil, Sony's own module, from the user's installed system software
+// (D-193's method): the same script runs in two fresh processes, both with libsysutil loaded (so their memory is laid
+// out alike), one calling libsysutil's exports and one pspocket's. After every call the answer, the script's memory
+// (documents, element, attribute and file objects, strings, the test allocator's arena and its log of calls, the test
+// writer's output), libsysutil's globals and FixedMemory blocks (at libsysutil's data in one run, pspocket's block in
+// the other: addresses into them are compared as offsets), the channels' shared memory and the lv2 calls the thread
+// made, with their arguments, must be the same. Both runs start libsysutil's channels as pspocket's console has them
+// (sysutil_cxml.hpp packets_start): Sony's module through its own code for the system side and for closing them. The
+// allocator and the writer documents are given are PPC code built here. Skipped without the firmware
+// (PSPOCKET_TEST_DEV_FLASH, firmware_compare.hpp); no game data.
 
 #include <catch_amalgamated.hpp>
 
