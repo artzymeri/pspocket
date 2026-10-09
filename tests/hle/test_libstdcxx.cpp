@@ -1214,3 +1214,113 @@ TEST_CASE("sys_libstdcxx: named locales and copies of the classic one get the fa
     t.call("_ZNSt6localeD1Ev", kObj2);
     t.call("_ZNSt6localeD1Ev", kObj);
 }
+
+TEST_CASE("sys_libstdcxx: basic_filebuf<wchar_t> through a converting codecvt", "[hle][libstdcxx]")
+{
+    const fsys::path root = temp_root();
+    {
+        Fixture f;
+        GuestThread t(f, 0, "ppu");
+        u8* b = f.base();
+        Code c{b};
+        REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+        stream_facets(t, c);
+        // A guest codecvt<wchar_t, char>: one element to one byte (its low byte) and back; unshift has nothing to do.
+        const u32 nop = c.add({kBlr}), no = c.add({li3(0), kBlr});
+        const u32 out = c.add({lwz(11, 5, 0), 0x99680000u /*stb r11,0(r8)*/, addi(5, 5, 4), stw(5, 7, 0),
+            addi(8, 8, 1), stw(8, 10, 0), li3(0), kBlr});
+        const u32 in = c.add({0x89650000u /*lbz r11,0(r5)*/, stw(11, 8, 0), addi(5, 5, 1), stw(5, 7, 0),
+            addi(8, 8, 4), stw(8, 10, 0), li3(0), kBlr});
+        const u32 unshift = c.add({stw(5, 7, 0), li3(0), kBlr});
+        const u32 cvt_vt = kVt + 0x400;
+        const u32 slots[] = {nop, nop, no, nop, nop, in, out, unshift, nop};
+        for (u32 i = 0; i < 9; i++) ps_write32(b, cvt_vt + 8 + 4 * i, slots[i]);
+        const u32 cvt = kObj3 + 0x900;
+        ps_write32(b, cvt, cvt_vt + 8);
+        ps_write32(b, cvt + 4, 1);
+        // A locale with it: an empty() one (transparent) with the codecvt added under codecvt<wchar_t>'s id.
+        t.call("_ZNSt6locale5emptyEv", kObj2);
+        t.call("_ZNSt6locale7_AddfacEPNS_5facetEjj", kObj2, cvt, facet_id(t, "St7codecvtIwcSt9_MbstatetE"), 0);
+        put(b, kStr, "/dev_hdd0/d/c.txt");
+        const u32 fp = static_cast<u32>(t.call("_ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi", kStr, 0x3 | 0x10, 0));
+        REQUIRE(fp != 0);
+        const u32 wvt = lib_vtable(b, kVt,
+            {"_ZNSt13basic_filebufIwSt11char_traitsIwEED1Ev", "_ZNSt13basic_filebufIwSt11char_traitsIwEED0Ev",
+                "_ZNSt13basic_filebufIwSt11char_traitsIwEE5_LockEv",
+                "_ZNSt13basic_filebufIwSt11char_traitsIwEE7_UnlockEv",
+                "_ZNSt13basic_filebufIwSt11char_traitsIwEE8overflowEi",
+                "_ZNSt13basic_filebufIwSt11char_traitsIwEE9pbackfailEi",
+                "_ZNSt15basic_streambufIwSt11char_traitsIwEE9showmanycEv",
+                "_ZNSt13basic_filebufIwSt11char_traitsIwEE9underflowEv",
+                "_ZNSt13basic_filebufIwSt11char_traitsIwEE5uflowEv",
+                "_ZNSt15basic_streambufIwSt11char_traitsIwEE6xsgetnEPwi",
+                "_ZNSt15basic_streambufIwSt11char_traitsIwEE6xsputnEPKwi"});
+        const u32 fb = kObj;
+        std::memset(b + fb, 0, 88);
+        ps_write32(b, fb, wvt);
+        t.call("_ZNSt13basic_filebufIwSt11char_traitsIwEE5_InitEPSt6_FiletNS2_7_InitflE", fb, fp, 1);
+        t.call("_ZNSt13basic_filebufIwSt11char_traitsIwEE5imbueERKSt6locale", fb, kObj2);
+        CHECK(ps_read32(b, fb + 60) == cvt);
+        for (u32 i = 0; i < 5; i++) ps_write32(b, kBuf + 4 * i, U"codec"[i]);
+        CHECK(t.call("_ZNSt15basic_streambufIwSt11char_traitsIwEE6xsputnEPKwi", fb, kBuf, 5) == 5);
+        CHECK(b[fb + 68] == 1); // _Wrotesome
+        CHECK(t.call("_ZNSt13basic_filebufIwSt11char_traitsIwEE9_EndwriteEv", fb) == 1);
+        CHECK(b[fb + 68] == 0);
+        CHECK(t.call("_ZNSt13basic_filebufIwSt11char_traitsIwEE4syncEv", fb) == 0);
+        CHECK(slurp(root / "hdd0" / "d" / "c.txt") == "codec");
+        // Back to the start; the elements come back through do_in.
+        t.call("_ZNSt13basic_filebufIwSt11char_traitsIwEE7seekoffElNSt5_IosbIiE8_SeekdirENS4_9_OpenmodeE", kOut, fb,
+            0, 0, 3);
+        CHECK(ps_read32(b, kOut + 4) == 0);
+        std::memset(b + kOut + 32, 0, 32);
+        CHECK(t.call("_ZNSt15basic_streambufIwSt11char_traitsIwEE6xsgetnEPwi", fb, kOut + 32, 8) == 5);
+        CHECK(ps_read32(b, kOut + 32) == 'c');
+        CHECK(ps_read32(b, kOut + 32 + 16) == 'c');
+        // A putback with a codecvt goes into _Mychar.
+        CHECK(i32(t.call("_ZNSt13basic_filebufIwSt11char_traitsIwEE9pbackfailEi", fb, 'Z')) == 'Z');
+        CHECK(ps_read32(b, ps_read32(b, fb + 32)) == fb + 64); // gptr() is &_Mychar
+        CHECK(ps_read32(b, fb + 64) == 'Z');
+        CHECK(i32(t.call("_ZNSt13basic_filebufIwSt11char_traitsIwEE5uflowEv", fb)) == 'Z');
+        t.call("_ZNSt13basic_filebufIwSt11char_traitsIwEED1Ev", fb);
+        t.call("_ZNSt6localeD1Ev", kObj2);
+    }
+    fsys::remove_all(root);
+}
+
+TEST_CASE("sys_libstdcxx: the strstreams' base-object constructors and destructors take the VTT", "[hle][libstdcxx]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    Code c{b};
+    stream_facets(t, c);
+    // A derived class's construction vtable for ostrstream-in-it: its virtual base offset (at -12) puts basic_ios at
+    // +200; the VTT's first entry points at it.
+    ps_write32(b, kVt, 200);
+    ps_write32(b, kVt + 4, 0);
+    ps_write32(b, kVt + 8, 0);
+    ps_write32(b, kVt + 0x40, kVt + 12);
+    std::memset(b + kObj, 0, 260);
+    put(b, kBuf, "xy");
+    t.call("_ZNSt10ostrstreamC2EPciNSt5_IosbIiE9_OpenmodeE", kObj, kVt + 0x40, kBuf, 8, 0x2 | 0x8);
+    CHECK(ps_read32(b, kObj + 200 + 40) == kObj + 4); // the virtual base's stream buffer: the member
+    CHECK(type_name(b, kObj + 4) == "St12strstreambuf");
+    CHECK(ps_read32(b, kObj + 4 + 28) == kBuf + 2); // writing after the string (app)
+    CHECK(ps_read32(b, kObj) == 0);                  // the vptrs are the derived class's to set
+    t.call("_ZNSt10ostrstreamD2Ev", kObj, kVt + 0x40);
+    CHECK(type_name(b, kObj + 4) == "St15basic_streambufIcSt11char_traitsIcEE"); // the member destroyed
+    // strstream's: the istream part's _Chcount cleared, the member at +12.
+    ps_write32(b, kVt, 300);
+    std::memset(b + kObj, 0xEE, 360);
+    std::memset(b + kObj + 300, 0, 52);
+    t.call("_ZNSt9strstreamC2EPciNSt5_IosbIiE9_OpenmodeE", kObj, kVt + 0x40, kBuf, 8, 0x3);
+    CHECK(ps_read32(b, kObj + 4) == 0);
+    CHECK(ps_read32(b, kObj + 300 + 40) == kObj + 12);
+    t.call("_ZNSt9strstreamD2Ev", kObj, kVt + 0x40);
+    t.call("_ZNSt8ios_baseD1Ev", kObj + 300);
+    // istrstream's D2: the member at +8 only.
+    std::memset(b + kObj, 0, 100);
+    ps_write32(b, kObj + 8, lib_vtable(b, kVt + 0x80, {"_ZNSt12strstreambufD1Ev"}));
+    t.call("_ZNSt12strstreambuf5_InitEiPcS0_i", kObj + 8, 2, kBuf, 0, 2);
+    t.call("_ZNSt10istrstreamD2Ev", kObj, kVt + 0x40);
+}
