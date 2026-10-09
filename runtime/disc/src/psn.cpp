@@ -17,6 +17,7 @@
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/recomp/npdrm.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
 
 namespace {
 
@@ -106,5 +107,47 @@ extern "C" int ps_psn_install_rap(const char* hdd0_dir, const char* rap_path, ch
     }
     std::string why;
     if (!write_whole(recomp::rap_host_path(hdd0_dir, content_id), bytes, why)) return fail(error, error_size, why);
+    return 0;
+}
+
+extern "C" int ps_psn_decrypt_executable(const char* self_path, const char* hdd0_dir, const char* elf_path,
+    char* error, size_t error_size)
+{
+    using namespace pspocket;
+    if (!self_path || !elf_path) return fail(error, error_size, "missing paths");
+    // A game's folder: its executable.
+    fs::path source(self_path);
+    std::error_code ec;
+    if (fs::is_directory(source, ec)) {
+        const fs::path psn = source / "USRDIR" / "EBOOT.BIN", disc = source / "PS3_GAME" / "USRDIR" / "EBOOT.BIN";
+        if (fs::is_regular_file(psn, ec)) source = psn;
+        else if (fs::is_regular_file(disc, ec)) source = disc;
+        else return fail(error, error_size, source.string() + " holds no USRDIR/EBOOT.BIN");
+    }
+    constexpr std::uintmax_t kMax = 256u << 20;
+    const std::uintmax_t size = fs::file_size(source, ec);
+    if (ec) return fail(error, error_size, "cannot read " + source.string() + ": " + ec.message());
+    if (size > kMax) return fail(error, error_size, source.string() + " is larger than any PS3 executable");
+    std::ifstream in(source, std::ios::binary);
+    std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (!in.is_open() || bytes.size() != size) return fail(error, error_size, "cannot read " + source.string());
+    std::vector<u8> elf;
+    if (bytes.size() >= 4 && bytes[0] == 0x7F && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F') {
+        elf = std::move(bytes); // already plain
+    } else {
+        const recomp::NpdrmLicence licence = hdd0_dir && *hdd0_dir
+            ? recomp::hdd0_licence(hdd0_dir)
+            : recomp::NpdrmLicence{.klicensee = std::nullopt,
+                  .rap = [](std::string_view content_id) -> recomp::Result<recomp::Key128> {
+                      return recomp::make_error("no /dev_hdd0 folder was given to look for the licence {}.rap in",
+                          content_id);
+                  },
+                  .keys = nullptr};
+        auto decrypted = recomp::decrypt_self(bytes, recomp::builtin_self_keys(), &licence);
+        if (!decrypted) return fail(error, error_size, source.filename().string() + ": " + decrypted.error().message);
+        elf = std::move(*decrypted);
+    }
+    std::string why;
+    if (!write_whole(elf_path, elf, why)) return fail(error, error_size, why);
     return 0;
 }

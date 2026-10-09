@@ -14,6 +14,11 @@
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/disc/psn.h"
+#include "pspocket/recomp/crypto.hpp"
+#include "pspocket/recomp/elf.hpp"
+#include "pspocket/recomp/npdrm.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
+#include "synthetic.hpp"
 
 using namespace pspocket;
 namespace fs = std::filesystem;
@@ -90,5 +95,81 @@ TEST_CASE("ps_psn_install_rap: a player's .rap goes where pspocket looks for it;
         std::string::npos);
     CHECK(ps_psn_install_rap(hdd0.c_str(), (picked / "missing.rap").c_str(), error, sizeof error) == 1);
     CHECK(std::string(error).find("cannot read") != std::string::npos);
+    fs::remove_all(root);
+}
+
+namespace {
+
+// Every byte the original ELF's header and segments put in the file came back.
+void check_same_elf(const std::vector<u8>& want, const std::vector<u8>& got)
+{
+    auto header = recomp::parse_elf_header(want);
+    REQUIRE(header);
+    REQUIRE(got.size() >= 0x40);
+    CHECK(std::equal(want.begin(), want.begin() + 0x40, got.begin()));
+    auto phdrs = recomp::parse_program_headers(want, *header, header->phoff, 0);
+    REQUIRE(phdrs);
+    for (const recomp::ProgramHeader& ph : *phdrs) {
+        if (!ph.filesz) continue;
+        REQUIRE(got.size() >= ph.offset + ph.filesz);
+        CHECK(std::equal(want.begin() + static_cast<std::ptrdiff_t>(ph.offset),
+            want.begin() + static_cast<std::ptrdiff_t>(ph.offset + ph.filesz),
+            got.begin() + static_cast<std::ptrdiff_t>(ph.offset)));
+    }
+}
+
+} // namespace
+
+TEST_CASE("ps_psn_decrypt_executable: a PSN game's EBOOT.BIN with the player's licence, or free (D-582)", "[disc][psn]")
+{
+    const recomp::NpdrmKeys& keys = recomp::builtin_npdrm_keys();
+    const recomp::SelfKey* npdrm_key = nullptr;
+    for (const recomp::SelfKey& k : recomp::builtin_self_keys())
+        if (k.type == 8 && !npdrm_key) npdrm_key = &k;
+    if (!keys.present || !npdrm_key) SKIP("this build has no NPDRM keys");
+    // Synthetic PSN executables encrypted here with the build's keys (in memory and a temporary folder only).
+    const std::vector<u8> elf = test::build_ppu_exec().bytes;
+    const auto psn_self = [&](s32 license, const recomp::Key128& content_key) {
+        test::SelfEncryption e;
+        e.key = *npdrm_key;
+        e.revision = static_cast<u16>(npdrm_key->revision);
+        e.npdrm = true;
+        e.npdrm_license = license;
+        recomp::crypto::aes_ecb_decrypt(keys.klic_key, content_key.data(), 16, e.npdrm_layer_key.data());
+        return test::encrypt_self(elf, e);
+    };
+    const fs::path root = temp_dir("eboot");
+    const fs::path hdd0 = root / "dev_hdd0", game = hdd0 / "game" / "NPXX00000";
+    recomp::Key128 rap{};
+    rap.fill(0x5C);
+    write_file(game / "USRDIR" / "EBOOT.BIN", psn_self(2, recomp::rap_to_rif(rap, keys)));
+    char error[512] = {};
+    const fs::path out = root / "out" / "EBOOT.elf";
+
+    // Without the player's licence: refused, naming where it was looked for; then with it, from the game's folder.
+    REQUIRE(ps_psn_decrypt_executable(game.c_str(), hdd0.c_str(), out.c_str(), error, sizeof error) == 1);
+    CHECK(std::string(error).find(std::string(test::kSelfContentId) + ".rap") != std::string::npos);
+    CHECK_FALSE(fs::exists(out));
+    write_file(root / (std::string(test::kSelfContentId) + ".rap"), std::vector<u8>(rap.begin(), rap.end()));
+    REQUIRE(ps_psn_install_rap(hdd0.c_str(), (root / (std::string(test::kSelfContentId) + ".rap")).c_str(), error,
+                sizeof error) == 0);
+    REQUIRE(ps_psn_decrypt_executable(game.c_str(), hdd0.c_str(), out.c_str(), error, sizeof error) == 0);
+    check_same_elf(elf, read_file(out));
+    // No hdd0 folder: the licence cannot be looked for.
+    CHECK(ps_psn_decrypt_executable(game.c_str(), nullptr, out.c_str(), error, sizeof error) == 1);
+    CHECK(std::string(error).find("no /dev_hdd0 folder") != std::string::npos);
+
+    // Free content opens with NP_KLIC_FREE, without licences; a plain ELF is copied; a folder without an EBOOT.BIN
+    // is refused.
+    write_file(root / "free" / "EBOOT.BIN", psn_self(3, keys.klic_free));
+    REQUIRE(ps_psn_decrypt_executable((root / "free" / "EBOOT.BIN").c_str(), nullptr, (root / "free.elf").c_str(), error,
+                sizeof error) == 0);
+    check_same_elf(elf, read_file(root / "free.elf"));
+    write_file(root / "plain" / "EBOOT.BIN", elf);
+    REQUIRE(ps_psn_decrypt_executable((root / "plain").c_str(), nullptr, (root / "plain.elf").c_str(), error,
+                sizeof error) == 1); // a folder needs USRDIR/EBOOT.BIN or PS3_GAME/USRDIR/EBOOT.BIN
+    REQUIRE(ps_psn_decrypt_executable((root / "plain" / "EBOOT.BIN").c_str(), nullptr, (root / "plain.elf").c_str(),
+                error, sizeof error) == 0);
+    CHECK(read_file(root / "plain.elf") == elf);
     fs::remove_all(root);
 }

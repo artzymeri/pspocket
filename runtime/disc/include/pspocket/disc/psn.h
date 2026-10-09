@@ -28,6 +28,18 @@ int ps_psn_rap_path(const char* hdd0_dir, const char* content_id, char* out, siz
  */
 int ps_psn_install_rap(const char* hdd0_dir, const char* rap_path, char* error, size_t error_size);
 
+/*
+ * Decrypts a PSN game's executable into the ELF it carries at elf_path (its folder is made), as the disc's is
+ * (ps_disc_decrypt_executable) but with its licence (D-582): free content opens with NP_KLIC_FREE, other content with
+ * the player's .rap for its content ID under hdd0_dir (ps_psn_rap_path; hdd0_dir may be NULL when there are none).
+ * self_path is the executable (EBOOT.BIN, or an SPRX module) or a game's folder (/dev_hdd0/game/<TITLE_ID>, whose
+ * USRDIR/EBOOT.BIN is taken, or a disc's folder with PS3_GAME/USRDIR/EBOOT.BIN). A disc SELF and a debug SELF decrypt
+ * too; a plain ELF is copied. Returns 0 on success; otherwise 1 and the reason in error (a missing licence names the
+ * file it was looked for in).
+ */
+int ps_psn_decrypt_executable(const char* self_path, const char* hdd0_dir, const char* elf_path, char* error,
+    size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif

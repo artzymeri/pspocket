@@ -65,9 +65,11 @@ void look_at(Walk& w, const std::string& path, const Entry& e)
     if (looks_like_elf(head)) {
         elf_bytes = *raw;
     } else {
-        auto decrypted = recomp::decrypt_self(*raw, recomp::builtin_self_keys());
+        // A free NPDRM module opens with NP_KLIC_FREE (D-582); one that needs a licence (a RAP) or the game's own
+        // klicensee is counted: it is saved when the game loads it.
+        const recomp::NpdrmLicence free_only;
+        auto decrypted = recomp::decrypt_self(*raw, recomp::builtin_self_keys(), &free_only);
         if (!decrypted) {
-            // An NPDRM file needs the game's licence key (klicensee), which only a PSN game has.
             w.out.npdrm++;
             PS_LOG_INFO(kChan, "{}: not decrypted ({})", path, decrypted.error().message);
             return;
