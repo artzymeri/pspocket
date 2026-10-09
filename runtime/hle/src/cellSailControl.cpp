@@ -112,16 +112,17 @@ s32 command_answer(PPUContext& ctx, u32 p, u32 code, u32 arg)
 
 // The control thread's side: the answer stored, the waiting thread signalled (sys_cond_signal_to), the lock released.
 // A failed signal is an error and a fatal error, the lock kept (libsail's).
-void answer(PPUContext& ctx, u32 p, u32 record, s32 result)
+bool answer(PPUContext& ctx, u32 p, u32 record, s32 result)
 {
     w32(ctx, r32(ctx, record), static_cast<u32>(result));
     const s32 r = sc(ctx, 110, {r32(ctx, p + kCond), r64(ctx, record + 8)});
     if (r < 0) {
         notify_error(ctx, p, r);
         notify_error(ctx, p, error(CELL_SAIL_ERROR_FATAL));
-        return;
+        return false;
     }
     unlock(ctx, p);
+    return true;
 }
 
 // ------------------------------------------------------------------------------------------------- descriptors
@@ -426,6 +427,55 @@ s32 close_descriptor(PPUContext& ctx, u32 d, bool from_game)
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------------------------- play settings
+
+constexpr u32 kPausedNow = 0x1C9, kPauseShown = 0x166;
+
+u32 audio_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kAudio) + i * pl::kAudioStride; }
+u32 video_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kVideo) + i * pl::kVideoStride; }
+u32 user_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kUser) + i * pl::kUserStride; }
+
+// Message 0x44: paused (any nonzero) kept; unpausing also clears +0x166. A change tells every renderer (bit 3 of its
+// +0x34) and AU receiver (+0x48 of its callbacks' block). The answer is the paused state; `changed` for event 7.
+s32 set_paused(PPUContext& ctx, u32 p, u32 arg, bool& changed)
+{
+    const u8 paused = arg != 0 ? 1 : 0;
+    changed = paused != r8(ctx, p + kPausedNow);
+    w8(ctx, p + kPausedNow, paused);
+    if (!paused) w8(ctx, p + kPauseShown, 0);
+    s32 result = paused;
+    if (!changed) return result;
+    const auto flag = [&](u32 r) { w32(ctx, r + 0x34, (paused ? 8u : 0u) | (r32(ctx, r + 0x34) & ~8u)); };
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) flag(r32(ctx, audio_slot(ctx, p, i) + 0x150));
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) flag(r32(ctx, video_slot(ctx, p, i) + 0x180));
+    if (const u32 nu = r32(ctx, p + pl::kUserCount)) {
+        for (u32 i = 0; i < nu; i++) w8(ctx, r32(ctx, user_slot(ctx, p, i) + 0x80) + 0x48, paused);
+        result = r8(ctx, p + kPausedNow);
+    }
+    return result;
+}
+
+// Message 0x45 {mode, info}: modes 0-2, the 0x28 bytes of info kept when given (+0x1C8 says so).
+s32 set_repeat_mode(PPUContext& ctx, u32 p, u32 args)
+{
+    const u32 mode = r32(ctx, args), info = r32(ctx, args + 4);
+    if (mode >= 3) return error(CELL_SAIL_ERROR_INVALID_ARG);
+    if (info) {
+        w8(ctx, p + pl::kRepeatSet, 1);
+        std::memmove(gb(ctx) + p + pl::kRepeatInfo, gb(ctx) + info, 0x28);
+    } else {
+        w8(ctx, p + pl::kRepeatSet, 0);
+    }
+    w32(ctx, p + pl::kRepeatMode, mode);
+    return static_cast<s32>(mode);
+}
+
+// Messages 0x46 and 0x47 {index, muted}: bit 0 of the stream's renderer's +0x34.
+void set_muted(PPUContext& ctx, u32 renderer, u8 muted)
+{
+    w32(ctx, renderer + 0x34, (r32(ctx, renderer + 0x34) & ~1u) | muted);
+}
+
 // ------------------------------------------------------------------------------------------------- the dmux pipeline
 
 namespace dmx {
@@ -502,6 +552,26 @@ void message_loop(PPUContext& ctx, u32 p)
                 answer(ctx, p, m.c, 0);
             } else {
                 answer(ctx, p, m.c, code == 0x3E ? open_stream(ctx, m.b) : close_stream(ctx, m.b));
+            }
+            continue;
+        }
+        if (code >= 0x44 && code <= 0x47) {
+            if (const s32 r = lock(ctx, p); r < 0) {
+                notify_error(ctx, p, r);
+                notify_error(ctx, p, error(CELL_SAIL_ERROR_FATAL));
+                continue;
+            }
+            if (code == 0x44) {
+                bool changed = false;
+                const s32 paused = set_paused(ctx, p, m.b, changed);
+                if (answer(ctx, p, m.c, paused) && changed) notify_event(ctx, p, 7, static_cast<u32>(paused), 0);
+            } else if (code == 0x45) {
+                answer(ctx, p, m.c, set_repeat_mode(ctx, p, m.b));
+            } else {
+                const u32 index = r32(ctx, m.b);
+                set_muted(ctx, r32(ctx, code == 0x46 ? audio_slot(ctx, p, index) + 0x150 : video_slot(ctx, p, index) + 0x180),
+                    r8(ctx, m.b + 4));
+                answer(ctx, p, m.c, 0);
             }
             continue;
         }
@@ -768,6 +838,34 @@ s32 cellSailDescriptorOpen(PPUContext& ctx, u32 d)
 
 s32 cellSailDescriptorClose(PPUContext& ctx, u32 d) { return close_descriptor(ctx, d, true); }
 
+// SetPaused(player, paused): the paused state now.
+s32 cellSailPlayerSetPaused(PPUContext& ctx, u32 p, u32 paused) { return command_answer(ctx, p, 0x44, paused); }
+
+// SetRepeatMode(player, mode, info): the mode.
+s32 cellSailPlayerSetRepeatMode(PPUContext& ctx, u32 p, u32 mode, u32 info)
+{
+    StackVar args(ctx, gb(ctx), 16);
+    w32(ctx, args.addr(), mode);
+    w32(ctx, args.addr() + 4, info);
+    return command_answer(ctx, p, 0x45, args.addr());
+}
+
+// SetEsAudioMuted / SetEsVideoMuted(player, index, muted): the stream's muted bit afterwards.
+s32 set_es_muted(PPUContext& ctx, u32 p, u32 index, u32 muted, bool video)
+{
+    if (index >= r32(ctx, p + (video ? pl::kVideoCount : pl::kAudioCount))) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+    StackVar args(ctx, gb(ctx), 16);
+    w32(ctx, args.addr(), index);
+    w8(ctx, args.addr() + 4, static_cast<u8>(muted));
+    StackVar reply(ctx, gb(ctx), 16);
+    if (const s32 r = command(ctx, p, video ? 0x47 : 0x46, args.addr(), reply.addr()); r < 0) return r;
+    const u32 renderer = r32(ctx, video ? video_slot(ctx, p, index) + 0x180 : audio_slot(ctx, p, index) + 0x150);
+    return static_cast<s32>(r32(ctx, renderer + 0x34) & 1);
+}
+
+s32 cellSailPlayerSetEsAudioMuted(PPUContext& ctx, u32 p, u32 index, u32 muted) { return set_es_muted(ctx, p, index, muted, false); }
+s32 cellSailPlayerSetEsVideoMuted(PPUContext& ctx, u32 p, u32 index, u32 muted) { return set_es_muted(ctx, p, index, muted, true); }
+
 
 s32 cellSailPlayerCreateDescriptor(PPUContext& ctx, u32 p, u32 type, u32 media_info, u32 uri, u32 out)
 {
@@ -816,6 +914,14 @@ void register_cellSailControl(Registry& r)
             &detail::thunk<&cellSailDescriptorOpen>, false},
         ::pspocket::hle::Function{{}, "cellSailDescriptorClose", recomp::nid_of("cellSailDescriptorClose"),
             &detail::thunk<&cellSailDescriptorClose>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerSetPaused", recomp::nid_of("cellSailPlayerSetPaused"),
+            &detail::thunk<&cellSailPlayerSetPaused>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerSetRepeatMode", recomp::nid_of("cellSailPlayerSetRepeatMode"),
+            &detail::thunk<&cellSailPlayerSetRepeatMode>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerSetEsAudioMuted", recomp::nid_of("cellSailPlayerSetEsAudioMuted"),
+            &detail::thunk<&cellSailPlayerSetEsAudioMuted>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerSetEsVideoMuted", recomp::nid_of("cellSailPlayerSetEsVideoMuted"),
+            &detail::thunk<&cellSailPlayerSetEsVideoMuted>, false},
         ::pspocket::hle::Function{{}, "_pspocket_cellSail_control", recomp::nid_of("_pspocket_cellSail_control"),
             &detail::thunk<&_pspocket_cellSail_control>, true},
     });

@@ -100,6 +100,7 @@ void part7(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part8(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part9(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part10(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part11(u8* b, const Call& call, u32 cb, GuestThread& t);
 constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00;
 std::vector<std::pair<u32, u32>> g_mask; // ranges of memory each side fills with its own code addresses
 
@@ -151,7 +152,8 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 7) part7(b, call, cb, t);
     else if (part == 8) part8(b, call, cb, t);
     else if (part == 9) part9(b, call, cb, t);
-    else part10(b, call, cb, t);
+    else if (part == 10) part10(b, call, cb, t);
+    else part11(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     for (const auto& [at, n] : g_mask) std::memset(b + at, 0x5A, n);
     r.mem.assign(b + kArea, b + kArea + kAreaSize);
@@ -1214,6 +1216,79 @@ void part10(u8* b, const Call& call_, u32 cb, GuestThread&)
     }
 }
 
+// Pause (its event), the repeat mode and the streams' mute switches on a booted player with an audio, a video and a
+// user stream.
+void part11(u8* b, const Call& call_, u32 cb, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kRend = kArea + 0x2400, kGad = kArea + 0x2500,
+                  kAuR = kArea + 0x2600, kRF = kArea + 0x2E00, kGF = kArea + 0x2E40, kInfo = kArea + 0x600,
+                  kOut = kArea + 0x680;
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    for (u32 i = 0; i < 9; i++) ps_write32(b, kRF + 4 * i, 0);
+    ps_write32(b, kRF, cb);
+    ps_write32(b, kRF + 4, cb);
+    ps_write32(b, kRF + 12, cb);
+    for (u32 i = 0; i < 5; i++) ps_write32(b, kGF + 4 * i, i < 2 ? cb : 0);
+    for (u32 i = 0; i < 0x28; i++) b[kInfo + i] = static_cast<u8>(0x90 + i);
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, cb, 0x22, 1, 1, 1, 0});
+    mask_player_source(b, kP);
+    call("cellSailRendererAudioInitialize", {kRend, kRF, 0x31, 0});
+    call("cellSailGraphicsAdapterInitialize", {kGad, kGF, 0x66});
+    call("cellSailAuReceiverInitialize", {kAuR, 0, 0, 0x78});
+    call("cellSailPlayerSetRendererAudio", {kP, 0, kRend});
+    call("cellSailPlayerSetGraphicsAdapter", {kP, 0, kGad});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR});
+    call("cellSailPlayerBoot", {kP, 0});
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (b[kP + 0x163] != 2 && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(b[kP + 0x163] == 2);
+
+    call("cellSailPlayerIsPaused", {kP});
+    call("cellSailPlayerSetPaused", {kP, 1});
+    call("cellSailPlayerSetPaused", {kP, 0x80000000});
+    call("cellSailPlayerIsPaused", {kP});
+    call("cellSailPlayerSetPaused", {kP, 0});
+    call("cellSailPlayerSetPaused", {kP, 0});
+    call("cellSailPlayerSetPaused", {kP, 7});
+    call("cellSailPlayerUnsubscribeEvent", {kP, 7});
+    call("cellSailPlayerSetPaused", {kP, 0});
+    for (u32 mode = 0; mode < 4; mode++) {
+        call("cellSailPlayerSetRepeatMode", {kP, mode, mode == 1 ? kInfo : 0});
+        call("cellSailPlayerGetRepeatMode", {kP, kOut + 0x30 * mode});
+    }
+    call("cellSailPlayerSetEsAudioMuted", {kP, 0, 1});
+    call("cellSailPlayerIsEsAudioMuted", {kP, 0});
+    call("cellSailPlayerSetEsAudioMuted", {kP, 0, 0x100});
+    call("cellSailPlayerSetEsAudioMuted", {kP, 1, 1});
+    call("cellSailPlayerSetEsVideoMuted", {kP, 0, 1});
+    call("cellSailPlayerIsEsVideoMuted", {kP, 0});
+    call("cellSailPlayerSetEsVideoMuted", {kP, 0, 2});
+    call("cellSailPlayerSetEsVideoMuted", {kP, 5, 1});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    g_mask.push_back({kGad, 4});
+    g_mask.push_back({kAuR + 0x20, 0x24});
+    for (u32 i = 0; i < ps_read32(b, kRecords); i++) {
+        const u32 r = kRecords + 16 + 48 * i;
+        if (ps_read64(b, r) == 0x22) g_mask.push_back({r + 32, 8});
+        else g_mask.push_back({r + 8, 32});
+    }
+    const u32 ring = ps_read32(b, kP + 0x178);
+    for (u32 i = 0; i < ps_read32(b, kP + 0x170); i++) {
+        const u32 e = ring + 16 * i;
+        const u32 code = ps_read32(b, e);
+        if (code == 0x45 || code == 0x46 || code == 0x47) g_mask.push_back({e + 8, 4});
+        g_mask.push_back({e + 12, 4});
+    }
+}
+
 } // namespace
 
 void compare_runs(int part)
@@ -1284,4 +1359,10 @@ TEST_CASE("cellSail against libsail: Boot and Finalize of players with streams",
 TEST_CASE("cellSail against libsail: the elementary streams chosen, SetEs and CreateDatabase", "[hle][lle][sail]")
 {
     compare_runs(10);
+}
+
+
+TEST_CASE("cellSail against libsail: pause, repeat mode and the streams' mute switches", "[hle][lle][sail]")
+{
+    compare_runs(11);
 }

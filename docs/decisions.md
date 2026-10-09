@@ -7237,6 +7237,16 @@ at least) set to the first video stream. MP4 and AVI stop the process (a later p
 bits and a refused size, AC3 5.1 and mono, refused channel counts, 44.1 kHz), SetEs's refusals and choices, CreateDatabase:
 0 differences over 2842 checks in ten scripts.
 
+Part 11, pause, repeat mode and the streams' mute switches (messages 0x44-0x47 on the control thread): SetPaused keeps
+any nonzero as paused (+0x1C9; unpausing clears +0x166); a change sets or clears bit 3 of every renderer's +0x34 and
+each AU receiver's pause byte (+0x48 of its callbacks' block), the answer is the paused state, and after the lock is
+released a change is event 7 with it. SetRepeatMode takes modes 0-2 (INVALID_ARG past them) with their 0x28 bytes of
+information when given (+0x1A0, +0x1C8 set) and answers the mode. SetEsAudioMuted/SetEsVideoMuted check the stream's
+index on the game's thread, set bit 0 of the stream's renderer's +0x34 to the low byte given on the control thread and
+answer that bit as it reads afterwards. Compared with libsail on a booted player with an audio, a video and a user
+stream: pauses with and without changes and with event 7 unsubscribed, every repeat mode, mutes with odd values and
+out of range: 0 differences over 2895 checks in eleven scripts.
+
 ## D-534 · 2026-10-09 · cellSysutil complete: libsysutil's documents, its channels to the system, the web browser
 
 cellSysutil's other 96 functions (95 of them RPCS3's stubs, the 96th g_savedata_context, a variable RPCS3 keeps hidden)
