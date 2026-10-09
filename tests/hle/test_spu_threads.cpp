@@ -88,6 +88,13 @@ struct Program {
     void spin() { emit(as::br(0)); }
 };
 
+// $7 = the quadword at LS 0x2000.
+void emit_store_ls(Program& p)
+{
+    p.emit(as::il(8, 0x2000));
+    p.emit(as::lqd(7, 0, 8));
+}
+
 // The program as a 32-bit big-endian SPU ELF: one PT_LOAD at LS 0 (0x100 bytes of bss after it) and a PT_NOTE.
 void write_elf(u8* b, u32 ea, const Program& p)
 {
@@ -220,6 +227,51 @@ TEST_CASE("SPU thread groups: arguments, thread exit status, restart, images, de
     CHECK(lv2::_sys_spu_image_close(s.t, kImg) == lv2::err(lv2::CELL_ESRCH));
 }
 
+// D-529: sys_spu_segment keeps its address or fill value at +0x10 (a doubleword-aligned union, as the SDK and RPCS3
+// lay it out); lv2 read and wrote it at +0xC. A game's own segment table was loaded from the wrong addresses.
+TEST_CASE("SPU thread groups: segment tables with the address at +0x10, both ways", "[hle][spu-threads]")
+{
+    SpuFixture s;
+    Program p;
+    p.load32(3, 0);
+    emit_store_ls(p);
+    p.put(7, kOut, 0x00); // $7: the FILL's word, loaded from LS 0x2000 below
+    p.thread_exit(0x55);
+    write_elf(s.b, kElf, p);
+    const u32 code = static_cast<u32>(p.code.size() * 4);
+
+    // lv2's table for a kernel image: +0xC is padding, the address at +0x10 (the COPY from the image's own copy).
+    s.import_image(kImg, kElf, 0x100 + code);
+    REQUIRE(lv2::_sys_spu_image_get_segments(s.t, kImg, kOut + 0x800, 3) == lv2::CELL_OK);
+    CHECK(ps_read32(s.b, kOut + 0x800 + 12) == 0);
+    const u32 copy_from = ps_read32(s.b, kOut + 0x800 + 16);
+    CHECK(std::memcmp(s.b + copy_from, s.b + kElf + 0x100, code) == 0);
+    CHECK(ps_read32(s.b, kOut + 0x818 + 16) == 0); // the FILL's value
+
+    // A user image whose table the game wrote: the program's COPY and a FILL of 0x5A5AA5A5 at LS 0x2000.
+    const u32 segs = kOut + 0x900;
+    std::memset(s.b + segs, 0, 0x30);
+    ps_write32(s.b, segs, 1);
+    ps_write32(s.b, segs + 8, (code + 15) & ~15u); // user segments are whole quadwords
+    ps_write32(s.b, segs + 16, kElf + 0x100);
+    ps_write32(s.b, segs + 24, 2);
+    ps_write32(s.b, segs + 24 + 4, 0x2000);
+    ps_write32(s.b, segs + 24 + 8, 0x10);
+    ps_write32(s.b, segs + 24 + 16, 0x5A5AA5A5);
+    ps_write32(s.b, kImg2, 0); // USER
+    ps_write32(s.b, kImg2 + 4, 0);
+    ps_write32(s.b, kImg2 + 8, segs);
+    ps_write32(s.b, kImg2 + 12, 2);
+    const u32 group = s.create_group(1);
+    s.init_thread(group, 0, kImg2);
+    std::memset(s.b + kOut, 0, 0x10);
+    REQUIRE(lv2::sys_spu_thread_group_start(s.t, group) == lv2::CELL_OK);
+    const auto [cause, status] = s.join(group);
+    CHECK(cause == 2);
+    CHECK(ps_read32(s.b, kOut) == 0x5A5AA5A5);
+    REQUIRE(lv2::sys_spu_thread_group_destroy(s.t, group) == lv2::CELL_OK);
+}
+
 TEST_CASE("SPU thread groups: create and initialize refuse what RPCS3 refuses", "[hle][spu-threads]")
 {
     SpuFixture s;
@@ -259,7 +311,7 @@ TEST_CASE("SPU thread groups: create and initialize refuse what RPCS3 refuses", 
     ps_write32(s.b, kOut, 1);       // COPY
     ps_write32(s.b, kOut + 4, 0x8); // ls
     ps_write32(s.b, kOut + 8, 0x10);
-    ps_write32(s.b, kOut + 12, kElf);
+    ps_write32(s.b, kOut + 16, kElf); // the address, at +0x10 (D-529)
     CHECK(lv2::sys_spu_thread_initialize(s.t, kThread, g2, 0, kImg2, kThreadAttr, kArgs) == lv2::err(lv2::CELL_EINVAL));
     CHECK(lv2::sys_spu_thread_write_ls(s.t, 0x01000100, 0, 0, 3) == lv2::err(lv2::CELL_EINVAL)); // type 3
 }

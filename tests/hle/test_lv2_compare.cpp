@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <csignal>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <format>
 #include <functional>
 #include <optional>
@@ -16,6 +19,8 @@
 
 #include "firmware_compare.hpp"
 #include "pspocket/core/log.hpp"
+#include "pspocket/core/mmio.hpp"
+#include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/nid.hpp"
 
 using namespace pspocket;
@@ -454,4 +459,197 @@ TEST_CASE("liblv2's heaps against liblv2", "[hle][lle][lv2]")
         ps_write32(b, attr, 8);
     }
     compare_logs(mine_log, sony_log);
+}
+
+// ------------------------------------------------------------------------------------- raw SPU loaders (D-529)
+
+namespace {
+
+struct sigaction g_old_segv, g_old_bus;
+
+void on_mmio_fault(int sig, siginfo_t* info, void* uctx)
+{
+    if (mmio_handle_fault(info->si_addr, uctx)) return;
+    sigaction(sig, sig == SIGBUS ? &g_old_bus : &g_old_segv, nullptr);
+    raise(sig);
+}
+
+// The raw SPU's problem-state registers answer guest loads and stores through faults while it lives.
+struct MmioFaults {
+    MmioFaults()
+    {
+        struct sigaction sa{};
+        sa.sa_sigaction = on_mmio_fault;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &g_old_segv);
+        sigaction(SIGBUS, &sa, &g_old_bus);
+    }
+    ~MmioFaults()
+    {
+        sigaction(SIGSEGV, &g_old_segv, nullptr);
+        sigaction(SIGBUS, &g_old_bus, nullptr);
+    }
+};
+
+// A made-up SPU ELF: a PT_LOAD of 0x5010 bytes (more than one 16 KB GET) at LS 0x100 with 0x400 bytes of bss, a
+// PT_LOAD of 0x44 bytes at LS 0x9000, a PT_NOTE. Its bytes are a pattern, not code: the SPU never runs.
+std::vector<u8> raw_elf()
+{
+    constexpr u32 kLoad1 = 0x200, kSize1 = 0x5010, kLoad2 = kLoad1 + kSize1, kSize2 = 0x44, kNote = kLoad2 + kSize2;
+    std::vector<u8> e(kNote + 0x20, 0);
+    static constexpr u8 kIdent[16] = {0x7F, 'E', 'L', 'F', 1, 2, 1, 0};
+    std::memcpy(e.data(), kIdent, 16);
+    u8* p = e.data();
+    ps_write16(p, 0x10, 2);
+    ps_write16(p, 0x12, 0x17); // EM_SPU
+    ps_write32(p, 0x14, 1);
+    ps_write32(p, 0x18, 0x120); // entry
+    ps_write32(p, 0x1C, 0x34);
+    ps_write16(p, 0x28, 0x34);
+    ps_write16(p, 0x2A, 0x20);
+    ps_write16(p, 0x2C, 3);
+    const auto ph = [&](u32 i, u32 type, u32 off, u32 vaddr, u32 filesz, u32 memsz) {
+        const u32 at = 0x34 + 0x20 * i;
+        ps_write32(p, at, type);
+        ps_write32(p, at + 4, off);
+        ps_write32(p, at + 8, vaddr);
+        ps_write32(p, at + 12, vaddr);
+        ps_write32(p, at + 16, filesz);
+        ps_write32(p, at + 20, memsz);
+        ps_write32(p, at + 24, 7);
+    };
+    ph(0, 1, kLoad1, 0x100, kSize1, kSize1 + 0x400);
+    ph(1, 1, kLoad2, 0x9000, kSize2, kSize2);
+    ph(2, 4, kNote, 0, 0x20, 0);
+    for (u32 i = kLoad1; i < kNote; i++) p[i] = static_cast<u8>(i * 7 + (i >> 8));
+    return e;
+}
+
+} // namespace
+
+TEST_CASE("sysPrxForUser's raw SPU loaders against liblv2", "[hle][lle][lv2]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
+    if (!mmio_supported()) SKIP("raw SPU registers need fault emulation (Apple AArch64)");
+    MmioFaults faults;
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "pspocket-rawspu";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const std::vector<u8> elf = raw_elf();
+    {
+        std::ofstream(root / "spu.elf", std::ios::binary).write(reinterpret_cast<const char*>(elf.data()), elf.size());
+        std::ofstream(root / "text.bin", std::ios::binary) << "not an SPU program at all, just text";
+    }
+    Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", root.string(), false));
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    FirmwareLibrary sony(f, t, *flash, "sysPrxForUser", false);
+    t.call("sys_initialize_tls", 0, 0, 0, 0); // liblv2's heap locks read the thread's TLS
+    // liblv2's default heap, which its module_start makes (not run here): one made with Sony's _sys_heap_create_heap,
+    // its handle in the word _sys_malloc reads it from (through liblv2's TOC slot at -0x7E58).
+    {
+        const u32 opd = sony.module->functions.at({"sysPrxForUser", recomp::nid_of("_sys_malloc")});
+        const u32 slot = ps_read32(b, ps_read32(b, opd + 4) - 0x7E58);
+        put_cstr(b, kText, "liblv2's default heap");
+        const u32 heap = theirs(t, sony, "_sys_heap_create_heap", {kText, 0x100000, 0, 0});
+        REQUIRE(heap != 0);
+        ps_write32(b, slot, heap);
+    }
+    REQUIRE(lv2::sys_spu_initialize(*t.t, 6, 1) == lv2::CELL_OK);
+    constexpr u32 kId = kData + 0x7400, kEntry = kData + 0x7404, kImg = kData + 0x7410, kSegs = kData + 0x7500,
+                  kElf = kData + 0x10000;
+    REQUIRE(lv2::sys_raw_spu_create(*t.t, kId, 0) == lv2::CELL_OK);
+    const u32 id = ps_read32(b, kId);
+    const u32 ls = 0xE0000000 + (id << 20), npc = ls + 0x40000 + 0x4034;
+    std::memcpy(b + kElf, elf.data(), elf.size());
+
+    // A user image whose segment table the test wrote with the SDK's layout (the address at +0x10): a COPY over two
+    // GETs, a FILL, an INFO, an empty COPY, a type no one knows.
+    const auto user_image = [&] {
+        struct S {
+            u32 type, ls, size, addr;
+        };
+        const S segs[] = {{1, 0x400, 0x4810, kElf + 0x200}, {2, 0x8000, 0x40, 0xA5A55A5A}, {4, 0, 0x20, kElf + 0x5254},
+                          {1, 0x9800, 0, kElf}, {3, 0xA000, 0x40, kElf}, {2, 0xB000, 0x6, 0x01020304}};
+        for (u32 i = 0; i < 6; i++) {
+            const u32 at = kSegs + 24 * i;
+            ps_write32(b, at, segs[i].type);
+            ps_write32(b, at + 4, segs[i].ls);
+            ps_write32(b, at + 8, segs[i].size);
+            ps_write32(b, at + 12, 0);
+            ps_write32(b, at + 16, segs[i].addr);
+            ps_write32(b, at + 20, 0);
+        }
+        ps_write32(b, kImg, 0); // SYS_SPU_IMAGE_TYPE_USER
+        ps_write32(b, kImg + 4, 0x3A0);
+        ps_write32(b, kImg + 8, kSegs);
+        ps_write32(b, kImg + 12, 6);
+    };
+
+    struct Snapshot {
+        std::string call;
+        u32 r3 = 0, npc = 0, entry = 0;
+        std::vector<u8> ls;
+    };
+    const auto run = [&](bool mine, const char* name, std::vector<u64> args, const std::function<void()>& prepare) {
+        std::memset(b + ls, 0xCC, 0x40000);
+        ps_write32(b, npc, 0x40);
+        ps_write32(b, kEntry, 0xEEEEEEEE);
+        prepare();
+        Snapshot s;
+        s.call = std::format("{}({})", name, args.size() > 1 ? args[1] : 0);
+        s.r3 = mine ? ours(t, name, args) : theirs(t, sony, name, args);
+        s.npc = ps_read32(b, npc);
+        s.entry = ps_read32(b, kEntry);
+        s.ls.assign(b + ls, b + ls + 0x40000);
+        return s;
+    };
+    const auto path = [&](std::string_view p) { return [&b, p] { put_cstr(b, kText, p); }; };
+    std::vector<Snapshot> mine, sonys;
+    const auto both = [&](const char* name, std::vector<u64> args, const std::function<void()>& prepare) {
+        mine.push_back(run(true, name, args, prepare));
+        sonys.push_back(run(false, name, args, prepare));
+    };
+    both("sys_raw_spu_load", {id, kText, kEntry}, path("/dev_hdd0/spu.elf"));
+    both("sys_raw_spu_load", {id, kText, kEntry}, path("/dev_hdd0/missing.elf"));
+    both("sys_raw_spu_load", {id, kText, kEntry}, path("/dev_hdd0/text.bin"));
+    both("sys_raw_spu_image_load", {id, kImg}, user_image);
+    both("sys_raw_spu_image_load", {id, kImg}, [&] {
+        user_image();
+        ps_write32(b, kImg, 7);
+    });
+    // A kernel image: lv2's copy of the file and its segment table, read through 155 and 159.
+    ps_write32(b, kImg, 0);
+    REQUIRE(lv2::_sys_spu_image_import(*t.t, kImg + 0x40, kElf, static_cast<u32>(elf.size()), 0) == lv2::CELL_OK);
+    both("sys_raw_spu_image_load", {id, kImg + 0x40}, [] {});
+
+    REQUIRE(mine.size() == sonys.size());
+    usize differ = 0;
+    for (usize i = 0; i < mine.size(); i++) {
+        const Snapshot& o = mine[i];
+        const Snapshot& s = sonys[i];
+        if (o.r3 == s.r3 && o.npc == s.npc && o.entry == s.entry && o.ls == s.ls) continue;
+        usize at = 0;
+        while (at < o.ls.size() && o.ls[at] == s.ls[at]) at++;
+        differ++;
+        UNSCOPED_INFO(std::format("call {} {}: r3 {:#x} vs {:#x}, NPC {:#x} vs {:#x}, entry {:#x} vs {:#x}{}", i, o.call,
+            o.r3, s.r3, o.npc, s.npc, o.entry, s.entry,
+            at < o.ls.size() ? std::format("; LS differs first at {:#x} ({:#04x} vs {:#04x})", at, o.ls[at], s.ls[at])
+                             : std::string()));
+    }
+    CHECK(differ == 0);
+    // And they did load: the program's bytes in the local store, its entry given.
+    CHECK(mine[0].r3 == 0);
+    CHECK(mine[0].entry == 0x120);
+    CHECK(std::memcmp(mine[0].ls.data() + 0x100, elf.data() + 0x200, 0x5010) == 0);
+    CHECK(mine[0].ls[0x100 + 0x5010] == 0);   // the bss
+    CHECK(mine[0].ls[0x100 + 0x5410] == 0xCC); // and no further
+    CHECK(mine[3].npc == 0x3A0);
+    CHECK(ps_read32(mine[3].ls.data(), 0x8000) == 0xA5A55A5A);
+    CHECK(mine[5].npc == 0x120);
+    REQUIRE(lv2::sys_raw_spu_destroy(*t.t, id) == lv2::CELL_OK);
+    std::filesystem::remove_all(root);
 }

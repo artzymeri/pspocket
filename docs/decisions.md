@@ -6524,3 +6524,28 @@ form against a recording device with a real fault handler), tests/lv2/test_raw_s
 through the registers: mailboxes, status and NPC after a stop, interrupt status, a mailbox interrupt served by an
 interrupt thread, a stop request on a spinning SPU, the MFC proxy both ways and its sequence error, destroy and a new
 one; the errors). Kernel calls: 560 own, 74 answered as RPCS3's null or stub, of 634.
+
+## D-529: sysPrxForUser's raw SPU loaders; sys_spu_segment's address at +0x10 (2026-10-09)
+
+- sys_raw_spu_load and sys_raw_spu_image_load are pspocket's own (runtime/hle/src/sys_spu_.cpp), read from liblv2: the
+  local store is filled through the raw SPU's MFC proxy registers as liblv2 fills it (each COPY segment as GETs of up to
+  16 KB on tag 0, its five registers written again until the command status takes it; each FILL segment a word at a
+  time straight into the local store; other types skipped; then the tag query for tag 0, polled until it completes),
+  the registers being guest MMIO answered by lv2's raw SPU (D-528). sys_raw_spu_load reads the file whole into
+  liblv2's heap through sys_fs (open, fstat, read, close; a short read is CELL_ENOENT), gives the entry through
+  sys_spu_elf_get_information and deploys sys_spu_elf_get_segments' table; sys_raw_spu_image_load takes a user
+  image's table as it is or a kernel image's through lv2 (155, 159), then writes SPU_NPC (CELL_EINVAL for another
+  image type). One deviation: a raw SPU that does not exist is CELL_ESRCH with an error logged (liblv2 would fault on
+  its local store).
+- Bug fixed: sys_spu_segment keeps its address or fill value as the first word of a doubleword-aligned union at +0x10
+  (RPCS3 sys_spu.h; liblv2's loaders and libsre's cellOvis read it there); lv2 (spu.cpp) and sysPrxForUser's
+  sys_spu_elf_get_segments wrote and read it at +0xC. The two agreed with each other, so the images pspocket made
+  loaded, but a segment table a game wrote itself (a user image's own FILL for its bss, say) was loaded from the wrong
+  addresses, and a table lv2 gave out was wrong for anything else that read it.
+- A raw SPU's MFC proxy command whose EA is not guest memory is taken and copies nothing, with an error logged (the
+  MFC would fault on it later; copying from there would fault inside the fault handler, which hangs).
+Tests: tests/hle/test_lv2_compare.cpp "raw SPU loaders" (both functions against liblv2 on the same raw SPU: a program
+file over two GETs with bss, a missing file, a file that is not an SPU program, a user image with every segment type
+in the SDK's layout, an unknown image type, a kernel image: answers, the whole local store, NPC and the entry the
+same); tests/hle/test_spu_threads.cpp (lv2's table layout, and a user image whose table the test wrote run in an SPU
+thread group).

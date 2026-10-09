@@ -79,19 +79,21 @@ s32 count_segments(const std::vector<ElfPhdr>& ph)
     return n;
 }
 
+// sys_spu_segment: the address or fill value is the first word of a doubleword-aligned union at +0x10 (RPCS3
+// sys_spu.h; liblv2's raw SPU loader and libsre's cellOvis read it there), +0xC is padding.
 void write_segment(Guest& g, u32 at, const SpuSegment& s)
 {
     g.w32(at, static_cast<u32>(s.type));
     g.w32(at + 4, s.ls);
     g.w32(at + 8, s.size);
-    g.w32(at + 12, s.addr);
-    g.w32(at + 16, 0);
+    g.w32(at + 12, 0);
+    g.w32(at + 16, s.addr);
     g.w32(at + 20, 0);
 }
 
 SpuSegment read_segment(const Guest& g, u32 at)
 {
-    return {static_cast<s32>(g.r32(at)), g.r32(at + 4), g.r32(at + 8), g.r32(at + 12)};
+    return {static_cast<s32>(g.r32(at)), g.r32(at + 4), g.r32(at + 8), g.r32(at + 16)};
 }
 
 // RPCS3 sys_spu_image::fill.

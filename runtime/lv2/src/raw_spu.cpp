@@ -383,6 +383,13 @@ u32 RawSpu::read_reg(u32 offset)
             return MFC_PPU_DMA_CMD_ENQUEUE_SUCCESSFUL;
         }
         if (c == 0x8B || c == 0x8D) return MFC_PPU_DMA_CMD_ENQUEUE_SUCCESSFUL; // cache-line hints (SDCRT, SDCRTST)
+        if (size && !s.guest.valid(ea, size)) {
+            // The MFC takes the command and faults on the address afterwards (a page fault lv2 would end the process
+            // for); here nothing is copied. Logged: a copy from there would fault inside this fault handler.
+            PS_LOG_ERROR(kRawChan, "raw SPU {}: MFC proxy command {:#x} with EA {:#x} ({:#x} bytes) outside guest memory",
+                index, c, ea, size);
+            return MFC_PPU_DMA_CMD_ENQUEUE_SUCCESSFUL;
+        }
         if (ps_spu_proxy_dma(&ctx, c, lsa, ea, size) != 0) {
             PS_LOG_ERROR(kRawChan, "raw SPU {}: MFC proxy command {:#x} (LSA {:#x}, EA {:#x}, size {:#x}) not taken",
                 index, c, lsa, ea, size);

@@ -59,7 +59,8 @@ enum class SpuGroupState : u32 {
     Destroyed,
 };
 
-// sys_spu_segment (0x18 bytes in guest memory: type, ls, size, addr or fill value, pad).
+// sys_spu_segment (0x18 bytes in guest memory: type, ls, size, padding, then the address or fill value as the first
+// word of a doubleword at +0x10).
 struct SpuSegment {
     s32 type = 0;
     u32 ls = 0;

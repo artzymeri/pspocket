@@ -1077,8 +1077,10 @@ void _sys_qsort(PPUContext& ctx, u32 base_addr, u32 nelem, u32 size, u32 cmp)
 
 } // namespace
 
-// For sysPrxForUser_sys.cpp: liblv2's own _sys_malloc and _sys_free, and _sys_panic's end.
+// For sysPrxForUser_sys.cpp and sys_spu_.cpp: liblv2's own _sys_malloc, _sys_memalign and _sys_free, and _sys_panic's
+// end.
 u32 lv2_malloc(PPUContext& ctx, u32 size) { return _sys_malloc(ctx, size); }
+u32 lv2_memalign(PPUContext& ctx, u32 align, u32 size) { return _sys_memalign(ctx, align, size); }
 void lv2_free(PPUContext& ctx, u32 addr) { _sys_free(ctx, addr); }
 [[noreturn]] void lv2_panic(PPUContext& ctx, std::string_view text) { panic_exit(ctx, text); }
 

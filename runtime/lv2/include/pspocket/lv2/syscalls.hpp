@@ -258,6 +258,10 @@ Result sys_vm_sync(PpuThread& t, u32 addr, u32 size);
 Result sys_vm_test(PpuThread& t, u32 addr, u32 size, u32 result);
 Result sys_vm_get_statistics(PpuThread& t, u32 addr, u32 stat);
 
+// ---- raw SPUs (raw_spu.cpp, D-528)
+Result sys_raw_spu_create(PpuThread& t, u32 id, u32 attr);
+Result sys_raw_spu_destroy(PpuThread& t, u32 id);
+
 // ---- SPU (sys_spu.cpp)
 Result sys_spu_initialize(PpuThread& t, u32 max_usable_spu, u32 max_raw_spu);
 Result sys_spu_thread_group_log(PpuThread& t, s32 command, u32 stat);
