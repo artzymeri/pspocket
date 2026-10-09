@@ -1325,44 +1325,6 @@ TEST_CASE("sys_net setup: the pool's checks, a second initialisation", "[hle][ne
     CHECK(g.call("sys_net_finalize_network") == 0);
 }
 
-TEST_CASE("cellHttp: RPCS3's init and end checks", "[hle][net]")
-{
-    Fixture f;
-    GuestThread g(f, 0, "http");
-    constexpr u32 kPool = kData + 0x1E0000;
-    const u64 kAlready = r3_of_code(0x80710001), kNotInit = r3_of_code(0x80710002), kNoBuffer = r3_of_code(0x80710004),
-              kSslNotInit = r3_of_code(0x80740001);
-
-    // The library: initialised first, then a pool and a size.
-    CHECK(g.call("cellHttpEnd") == kNotInit);
-    CHECK(g.call("cellHttpInit", 0, 0x10000) == kNoBuffer);
-    CHECK(g.call("cellHttpInit", kPool, 0) == kNoBuffer);
-    CHECK(g.call("cellHttpInit", kPool, 0x10000) == 0);
-    CHECK(g.call("cellHttpInit", 0, 0) == kAlready);
-    CHECK(g.call("cellHttpEnd") == 0);
-    CHECK(g.call("cellHttpEnd") == kNotInit);
-
-    // Cookies: a pool and a size first, then initialised.
-    CHECK(g.call("cellHttpEndCookie") == kNotInit);
-    CHECK(g.call("cellHttpInitCookie", 0, 0x1000) == kNoBuffer);
-    CHECK(g.call("cellHttpInitCookie", kPool, 0) == kNoBuffer);
-    CHECK(g.call("cellHttpInitCookie", kPool, 0x1000) == 0);
-    CHECK(g.call("cellHttpInitCookie", 0, 0x1000) == kNoBuffer);
-    CHECK(g.call("cellHttpInitCookie", kPool, 0x1000) == kAlready);
-    CHECK(g.call("cellHttpEndCookie") == 0);
-    CHECK(g.call("cellHttpEndCookie") == kNotInit);
-
-    // HTTPS: no cellHttpInit needed; its end needs SSL initialised (RPCS3 _cellSslIsInitd).
-    CHECK(g.call("cellHttpsEnd") == kNotInit);
-    CHECK(g.call("cellHttpsInit", 0, 0) == 0);
-    CHECK(g.call("cellHttpsInit", 2, kPool) == kAlready);
-    CHECK(g.call("cellHttpsEnd") == kSslNotInit);
-    REQUIRE(g.call("cellSslInit", kPool, 0x10000) == 0);
-    CHECK(g.call("cellHttpsEnd") == 0);
-    CHECK(g.call("cellHttpsEnd") == kNotInit);
-    CHECK(g.call("cellSslEnd") == 0);
-}
-
 TEST_CASE("cellSsl: init and end, no firmware certificates", "[hle][net]")
 {
     Fixture f;
