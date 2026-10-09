@@ -38,14 +38,6 @@ std::array<u8, N> made_up(u8 seed)
     return a;
 }
 
-void aes128_ctr(const u8* key, const u8* iv, u8* data, usize size)
-{
-    REQUIRE(crypto::aes_ctr(std::span<const u8>(key, 16), iv, data, size, data));
-}
-
-void put32(std::vector<u8>& b, usize at, u32 v) { ps_st32(b.data() + at, v); }
-void put64(std::vector<u8>& b, usize at, u64 v) { ps_st64(b.data() + at, v); }
-
 struct Encrypted {
     std::vector<u8> self;
     std::vector<u8> elf;
@@ -58,79 +50,22 @@ struct NpdrmLayer {
     Key128 metadata_key{};
 };
 
-// The synthetic executable as a retail SELF: wrap_in_self's headers, then real metadata (one section per segment
-// with bytes, each with its own key and counter) and the segments compressed and encrypted. With `npdrm`, a PSN
-// executable: an NPDRM control header (wrap_in_self's content ID) and the layer over the metadata info.
+// The synthetic executable as a retail SELF (test::encrypt_self: real metadata, the segments compressed and
+// encrypted); with `npdrm`, a PSN executable with the layer over its metadata info.
 Encrypted encrypted_self(const SelfKey& key, u16 revision, const std::optional<NpdrmLayer>& npdrm = std::nullopt)
 {
     Encrypted out;
     out.elf = test::build_ppu_exec().bytes;
-    out.self = test::wrap_in_self(out.elf, {.debug = false, .npdrm = npdrm.has_value(),
-                                               .npdrm_license = npdrm ? npdrm->license : 3,
-                                               .self_type = npdrm ? 8u : 4u});
-    std::vector<u8>& s = out.self;
-    auto elf = parse_elf_header(out.elf);
-    REQUIRE(elf);
-    auto phdrs = parse_program_headers(out.elf, *elf, elf->phoff, 0);
-    REQUIRE(phdrs);
-    std::vector<u32> with_bytes;
-    for (u32 i = 0; i < phdrs->size(); i++) {
-        if ((*phdrs)[i].filesz) with_bytes.push_back(i);
-    }
-    const u32 n = static_cast<u32>(with_bytes.size());
-    REQUIRE(n > 0);
-
-    const usize meta = ps_ld32(s.data() + 0x0C) + 0x20; // the metadata info
-    const usize header_size = (meta + 0x40 + 0x20 + n * 0x30 + 2 * n * 16 + 0xF) & ~usize{0xF};
-    s.resize(header_size);
-    std::fill(s.begin() + static_cast<std::ptrdiff_t>(meta), s.end(), u8{0});
-    ps_st16(s.data() + 0x08, revision);
-    put64(s, 0x10, header_size);
-
-    // Metadata info: the key and counter for the rest, then AES-256-CBC with the SELF key.
-    const auto meta_key = made_up<16>(0x51), meta_iv = made_up<16>(0x62);
-    std::copy(meta_key.begin(), meta_key.end(), s.begin() + static_cast<std::ptrdiff_t>(meta));
-    std::copy(meta_iv.begin(), meta_iv.end(), s.begin() + static_cast<std::ptrdiff_t>(meta + 0x20));
-    REQUIRE(crypto::aes_cbc_encrypt(key.erk, key.riv.data(), s.data() + meta, 0x40, s.data() + meta));
+    test::SelfEncryption e;
+    e.key = key;
+    e.revision = revision;
     if (npdrm) {
-        const u8 zero_iv[16]{};
-        REQUIRE(crypto::aes_cbc_encrypt(npdrm->metadata_key, zero_iv, s.data() + meta, 0x40, s.data() + meta));
+        e.npdrm = true;
+        e.npdrm_license = npdrm->license;
+        e.npdrm_layer_key = npdrm->metadata_key;
     }
-
-    // Metadata header, section headers, data keys; then each segment, compressed and encrypted.
-    const usize head = meta + 0x40;
-    put64(s, head + 0x00, header_size);
-    put32(s, head + 0x08, 1);
-    put32(s, head + 0x0C, n);
-    put32(s, head + 0x10, 2 * n);
-    for (u32 k = 0; k < n; k++) {
-        const ProgramHeader& ph = (*phdrs)[with_bytes[k]];
-        std::vector<u8> data(compressBound(static_cast<uLong>(ph.filesz)));
-        uLongf size = static_cast<uLongf>(data.size());
-        REQUIRE(compress2(data.data(), &size, out.elf.data() + ph.offset, static_cast<uLong>(ph.filesz), 9) == Z_OK);
-        data.resize(size);
-        const auto seg_key = made_up<16>(static_cast<u8>(0x10 + 2 * k)), seg_iv = made_up<16>(static_cast<u8>(0x90 + 2 * k));
-        aes128_ctr(seg_key.data(), seg_iv.data(), data.data(), data.size());
-        const usize at = (s.size() + 0xF) & ~usize{0xF};
-        s.resize(at);
-        s.insert(s.end(), data.begin(), data.end());
-
-        const usize sh = head + 0x20 + k * 0x30;
-        put64(s, sh + 0x00, at);
-        put64(s, sh + 0x08, data.size());
-        put32(s, sh + 0x10, 2);            // a segment
-        put32(s, sh + 0x14, with_bytes[k]);
-        put32(s, sh + 0x18, 2);
-        put32(s, sh + 0x20, 3);            // encrypted
-        put32(s, sh + 0x24, 2 * k);        // key
-        put32(s, sh + 0x28, 2 * k + 1);    // counter
-        put32(s, sh + 0x2C, 2);            // zlib
-        const usize keys = head + 0x20 + n * 0x30 + 2 * k * 16;
-        std::copy(seg_key.begin(), seg_key.end(), s.begin() + static_cast<std::ptrdiff_t>(keys));
-        std::copy(seg_iv.begin(), seg_iv.end(), s.begin() + static_cast<std::ptrdiff_t>(keys + 16));
-    }
-    aes128_ctr(meta_key.data(), meta_iv.data(), s.data() + head, header_size - head);
-    put64(s, 0x18, s.size() - header_size);
+    out.self = test::encrypt_self(out.elf, e);
+    REQUIRE_FALSE(out.self.empty());
     return out;
 }
 

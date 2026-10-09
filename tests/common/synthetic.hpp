@@ -10,6 +10,7 @@
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/recomp/npd.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
 
 namespace pspocket::test {
 
@@ -142,6 +143,23 @@ struct SelfOptions {
 std::vector<u8> wrap_in_self(std::span<const u8> elf, const SelfOptions& options = {});
 
 inline constexpr std::string_view kSelfContentId = "XX0000-TEST00000_00-0000000000000000";
+
+// ---- encrypted SELF (D-121, D-582) ----
+
+struct SelfEncryption {
+    recomp::SelfKey key{};    // the SELF key the metadata info is encrypted with
+    u16 revision = 0;         // the SCE header's key revision (the key's)
+    // A PSN executable: an NPDRM control header of this licence type (wrap_in_self's content ID), and the AES-128-CBC
+    // layer over the metadata info keyed with `npdrm_layer_key` (its content key decrypted with NP_KLIC_KEY).
+    bool npdrm = false;
+    s32 npdrm_license = 3;
+    recomp::Key128 npdrm_layer_key{};
+};
+
+// `elf` as a retail SELF, as Sony makes them and recomp::decrypt_self reads them: wrap_in_self's headers (an APP
+// executable, or an NPDRM one), real metadata (one section per segment with bytes, each with its own made-up key and
+// counter), and the segments compressed (zlib) and encrypted. Empty in a build without zlib.
+std::vector<u8> encrypt_self(std::span<const u8> elf, const SelfEncryption& encryption);
 
 // ---- NPD files: SDATA (D-165) and EDATA (D-581) ----
 

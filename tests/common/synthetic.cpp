@@ -1033,3 +1033,93 @@ std::vector<u8> build_npd(std::span<const u8> plain, const recomp::NpdKeys& keys
 }
 
 } // namespace pspocket::test
+
+// ---- encrypted SELF ----
+
+#if __has_include(<zlib.h>)
+#include <zlib.h>
+#define PSPOCKET_SYNTHETIC_ZLIB 1
+#endif
+
+namespace pspocket::test {
+
+std::vector<u8> encrypt_self(std::span<const u8> elf, const SelfEncryption& e)
+{
+#if defined(PSPOCKET_SYNTHETIC_ZLIB)
+    using namespace recomp;
+    // Made-up keys for the metadata and the segments, from counters: nothing real.
+    const auto made_up = [](u8 seed) {
+        Key128 a{};
+        for (usize i = 0; i < a.size(); i++) a[i] = static_cast<u8>(seed + i * 37);
+        return a;
+    };
+    std::vector<u8> s = wrap_in_self(elf, {.debug = false, .npdrm = e.npdrm, .npdrm_license = e.npdrm_license,
+                                              .self_type = e.npdrm ? 8u : 4u});
+    auto header = parse_elf_header(elf);
+    if (!header) return {};
+    auto phdrs = parse_program_headers(elf, *header, header->phoff, 0);
+    if (!phdrs) return {};
+    std::vector<u32> with_bytes;
+    for (u32 i = 0; i < phdrs->size(); i++)
+        if ((*phdrs)[i].filesz) with_bytes.push_back(i);
+    const u32 n = static_cast<u32>(with_bytes.size());
+
+    const usize meta = ps_ld32(s.data() + 0x0C) + 0x20; // the metadata info
+    const usize header_size = (meta + 0x40 + 0x20 + n * 0x30 + 2 * n * 16 + 0xF) & ~usize{0xF};
+    s.resize(header_size);
+    std::fill(s.begin() + static_cast<std::ptrdiff_t>(meta), s.end(), u8{0});
+    ps_st16(s.data() + 0x08, e.revision);
+    ps_st64(s.data() + 0x10, header_size);
+
+    // Metadata info: the key and counter for the rest, AES-256-CBC with the SELF key, then a PSN executable's layer.
+    const Key128 meta_key = made_up(0x51), meta_iv = made_up(0x62);
+    std::copy(meta_key.begin(), meta_key.end(), s.begin() + static_cast<std::ptrdiff_t>(meta));
+    std::copy(meta_iv.begin(), meta_iv.end(), s.begin() + static_cast<std::ptrdiff_t>(meta + 0x20));
+    crypto::aes_cbc_encrypt(e.key.erk, e.key.riv.data(), s.data() + meta, 0x40, s.data() + meta);
+    if (e.npdrm) {
+        const u8 zero_iv[16]{};
+        crypto::aes_cbc_encrypt(e.npdrm_layer_key, zero_iv, s.data() + meta, 0x40, s.data() + meta);
+    }
+
+    // Metadata header, section headers, data keys; then each segment, compressed and encrypted.
+    const usize head = meta + 0x40;
+    ps_st64(s.data() + head, header_size);
+    ps_st32(s.data() + head + 0x08, 1);
+    ps_st32(s.data() + head + 0x0C, n);
+    ps_st32(s.data() + head + 0x10, 2 * n);
+    for (u32 k = 0; k < n; k++) {
+        const ProgramHeader& ph = (*phdrs)[with_bytes[k]];
+        std::vector<u8> data(compressBound(static_cast<uLong>(ph.filesz)));
+        uLongf size = static_cast<uLongf>(data.size());
+        if (compress2(data.data(), &size, elf.data() + ph.offset, static_cast<uLong>(ph.filesz), 9) != Z_OK) return {};
+        data.resize(size);
+        const Key128 seg_key = made_up(static_cast<u8>(0x10 + 2 * k)), seg_iv = made_up(static_cast<u8>(0x90 + 2 * k));
+        crypto::aes_ctr(seg_key, seg_iv.data(), data.data(), data.size(), data.data());
+        const usize at = (s.size() + 0xF) & ~usize{0xF};
+        s.resize(at);
+        s.insert(s.end(), data.begin(), data.end());
+
+        const usize sh = head + 0x20 + k * 0x30;
+        ps_st64(s.data() + sh + 0x00, at);
+        ps_st64(s.data() + sh + 0x08, data.size());
+        ps_st32(s.data() + sh + 0x10, 2); // a segment
+        ps_st32(s.data() + sh + 0x14, with_bytes[k]);
+        ps_st32(s.data() + sh + 0x18, 2);
+        ps_st32(s.data() + sh + 0x20, 3);         // encrypted
+        ps_st32(s.data() + sh + 0x24, 2 * k);     // key
+        ps_st32(s.data() + sh + 0x28, 2 * k + 1); // counter
+        ps_st32(s.data() + sh + 0x2C, 2);         // zlib
+        const usize keys_at = head + 0x20 + n * 0x30 + 2 * k * 16;
+        std::copy(seg_key.begin(), seg_key.end(), s.begin() + static_cast<std::ptrdiff_t>(keys_at));
+        std::copy(seg_iv.begin(), seg_iv.end(), s.begin() + static_cast<std::ptrdiff_t>(keys_at + 16));
+    }
+    crypto::aes_ctr(meta_key, meta_iv.data(), s.data() + head, header_size - head, s.data() + head);
+    ps_st64(s.data() + 0x18, s.size() - header_size);
+    return s;
+#else
+    (void)elf, (void)e;
+    return {};
+#endif
+}
+
+} // namespace pspocket::test
