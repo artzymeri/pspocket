@@ -9311,3 +9311,11 @@ counter with its high half incremented and its low half 0; the portable AES was 
 platform-against-portable rounds add a counter whose low half wraps within the data (the all-ones case there now passes
 on Apple platforms too); test_pkg's game package compares canonical paths, as test_psn does (b6ff761), since macOS's
 temporary folders are reached through /var -> /private/var.
+
+## D-909 · 2026-10-10 · scripts/build-ffmpeg.sh runs under macOS's bash 3.2
+
+D-576 and D-577 added the EXTRA array to build-ffmpeg.sh, empty for the decoders' builds; under `set -u` bash before 4.4
+calls an empty array's "${EXTRA[@]}" an unbound variable, so on the Mac (bash 3.2) the script stopped before configuring
+and build/ffmpeg/macos kept the decoders of 2026-10-08, without D-588's VC-1 and DivX 3.11: cellVdec refused those
+codecs (CELL_VDEC_ERROR_ARG) and test_fuzz_media's VC-1 case failed on the Mac only. The script expands it as
+${EXTRA[@]+"${EXTRA[@]}"}, which every bash takes; the Mac's macos, macos-tests and ios builds were made again with it.
