@@ -123,6 +123,7 @@ add_library(pspocket_hle STATIC
     src/cellPngEnc.cpp
     src/libsnd3.cpp
     src/libsynth2.cpp
+    src/spu2.cpp
     src/libmixer.cpp
     src/codec_cores.cpp
     src/cellCelpEnc.cpp
