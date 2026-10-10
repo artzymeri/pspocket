@@ -10,12 +10,15 @@
 #include <format>
 #include <fstream>
 #include <map>
+#include <string>
+#include <utility>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/recomp/crypto.hpp"
+#include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/npdrm.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
@@ -177,6 +180,73 @@ TEST_CASE("LLE: a module's variables: exported, and imported through their refer
     CHECK(asked.count({"synthVarLib", test::kPrxVariableNid}) == 1);
     CHECK(m.variables_linked == 1);
     CHECK(ps_read32(base, seg1 + 0xC0) == 0x00DEF000u); // the reference got the variable's address
+}
+
+TEST_CASE("LLE: a PRX whose module information or tables lie outside its memory is refused, or those imports left "
+          "unlinked (D-605)", "[hle][lle]")
+{
+    // The module information's place and the tables' addresses come from the module's own data, so a damaged module's
+    // can point anywhere in the guest's 4 GB: the loader read there (and wrote the import slots) before, ending the
+    // app on memory nothing maps. The parser fuzzing found it (D-603).
+    const auto x = test::build_ppu_prx();
+    auto elf = recomp::ElfFile::parse(x.bytes);
+    REQUIRE(elf);
+    u64 relocations = 0;
+    for (const recomp::ProgramHeader& ph : elf->segments())
+        if (ph.type == 0x700000A4) relocations = ph.offset;
+    REQUIRE(relocations);
+    // Relocation i (synthetic.cpp's order: 1 and 2 the exports' start and end, 3 and 4 the imports', 8 the second
+    // export entry's NIDs, 11 the import entry's NIDs) made to write `value` itself.
+    const auto absolute = [&](std::vector<u8>& b, u32 i, u32 value) {
+        b[relocations + 24 * i + 10] = 0xFF;
+        ps_st64(b.data() + relocations + 24 * i + 16, value);
+    };
+    struct Loaded {
+        bool ok = false;
+        std::string error;
+        usize linked = 0;
+    };
+    const auto load = [](const std::vector<u8>& bytes) {
+        hle::test::Fixture f;
+        loader::PrxModule m;
+        Loaded l;
+        const auto link = [&](std::string_view, u32) {
+            l.linked++;
+            return 0x00ABC000u;
+        };
+        l.ok = loader::load_prx(bytes, *f.hle, link, &m, &l.error);
+        return l;
+    };
+    REQUIRE(load(x.bytes).linked == 2);
+
+    std::vector<u8> info = x.bytes; // the first PT_LOAD's p_paddr: the module information 2 GB past the segment
+    ps_st64(info.data() + elf->header().phoff + 24, 0x100 + 0x7FFF0000ull);
+    Loaded l = load(info);
+    CHECK_FALSE(l.ok);
+    CHECK(l.error.find("module information") != std::string::npos);
+
+    std::vector<u8> exports = x.bytes;
+    absolute(exports, 1, 0xF0000000);
+    absolute(exports, 2, 0xF0000100);
+    l = load(exports);
+    CHECK_FALSE(l.ok);
+    CHECK(l.error.find("export table's entry at 0xf0000000") != std::string::npos);
+
+    std::vector<u8> nids = x.bytes;
+    absolute(nids, 8, 0xFFFFFFF0);
+    l = load(nids);
+    CHECK_FALSE(l.ok);
+    CHECK(l.error.find("NIDs or addresses") != std::string::npos);
+
+    for (const auto& [first, value] : {std::pair{3u, 0xF0000000u}, std::pair{11u, 0xFFFFFFFCu}}) {
+        std::vector<u8> imports = x.bytes;
+        absolute(imports, first, value);
+        if (first == 3) absolute(imports, 4, 0xF0000100);
+        l = load(imports);
+        INFO(l.error);
+        CHECK(l.ok); // the module loads; the walk of its imports ends there, logged
+        CHECK(l.linked == 0);
+    }
 }
 
 TEST_CASE("LLE: the firmware's modules indexed; a library goes LLE only when the host has nothing of its module",

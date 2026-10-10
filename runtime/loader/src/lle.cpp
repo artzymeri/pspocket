@@ -46,11 +46,23 @@ bool read_file(const fs::path& p, std::vector<u8>& out)
     return true;
 }
 
-std::string guest_string(u8* base, u32 addr, u32 max = 128)
+// Whether [addr, addr + size) is committed guest memory, every page of it. A module's tables come from its file, and a
+// damaged one's addresses may point anywhere: what is not committed is not read or written (D-605).
+bool committed(const GuestMemory& mem, u32 addr, u64 size)
+{
+    if (!size) return true;
+    if (u64{addr} + size > GuestMemory::kGuestSize) return false;
+    for (u64 page = addr & ~u64{0xFFF}; page < u64{addr} + size; page += 0x1000) // 4 KB steps: no host page is smaller
+        if (!mem.is_committed(static_cast<u32>(page))) return false;
+    return true;
+}
+
+// A NUL-terminated guest string, at most `max` bytes, up to the first byte that is not committed.
+std::string guest_string(const GuestMemory& mem, u32 addr, u32 max = 128)
 {
     std::string s;
-    for (u32 i = 0; i < max; i++) {
-        const char c = static_cast<char>(ps_read8(base, addr + i));
+    for (u32 i = 0; i < max && committed(mem, addr + i, 1); i++) {
+        const char c = static_cast<char>(ps_read8(mem.base(), addr + i));
         if (!c) break;
         s += c;
     }
@@ -169,7 +181,11 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
     // The module info (ppu_prx_library_info: attributes, version, name[28], toc, exports and imports ranges) sits in
     // the first segment at the first program header's p_paddr - p_offset.
     const u32 info = placed->segments[0].addr + static_cast<u32>(first->paddr - first->offset);
-    out->name = guest_string(base, info + 4, 28);
+    if (!committed(mem, info, 0x34)) {
+        *error = std::format("its module information at {:#010x} lies outside its memory", info);
+        return false;
+    }
+    out->name = guest_string(mem, info + 4, 28);
     out->attributes = ps_read16(base, info);
     out->version = {ps_read8(base, info + 2), ps_read8(base, info + 3)};
     out->toc = ps_read32(base, info + 0x20);
@@ -181,10 +197,19 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
     // num_tlsvar, u8, u8, u8[2], name, nids, addrs, ...). Attribute 0x0001: a library; 0x8000 alone: the nameless
     // management library (module_start, module_stop); neither: ignored.
     for (u32 at = exports_start; at < exports_end;) {
+        if (!committed(mem, at, 0x1C)) {
+            *error = std::format("its export table's entry at {:#010x} lies outside its memory", at);
+            return false;
+        }
         const u8 size = ps_read8(base, at);
         const u16 attributes = ps_read16(base, at + 4);
         const u16 num_func = ps_read16(base, at + 6), num_var = ps_read16(base, at + 8);
         const u32 name = ps_read32(base, at + 0x10), nids = ps_read32(base, at + 0x14), addrs = ps_read32(base, at + 0x18);
+        const u64 table = 4 * (u64{num_func} + num_var);
+        if (!committed(mem, nids, table) || !committed(mem, addrs, table)) {
+            *error = std::format("the export table's entry at {:#010x} has its NIDs or addresses outside its memory", at);
+            return false;
+        }
         at += size ? size : kLibraryEntrySize;
         const bool library = attributes & 0x0001, management = !library && (attributes & 0x8000);
         if (management) {
@@ -195,7 +220,7 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
             }
         }
         if (!library) continue;
-        const std::string lib = guest_string(base, name);
+        const std::string lib = guest_string(mem, name);
         for (u32 i = 0; i < num_func; i++)
             out->functions[{lib, ps_read32(base, nids + 4 * i)}] = ps_read32(base, addrs + 4 * i);
         for (u32 i = num_func; i < u32{num_func} + num_var; i++)
@@ -206,19 +231,30 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
 
 // Imports (ppu_load_imports: the same entries, nids and addrs the functions' NIDs and stub slots, vnids and vstubs the
 // variables' NIDs and reference tables): each slot gets the linked descriptor; with attribute 0x2000 a function's own
-// reference table follows its NIDs; each variable's references get its address.
+// reference table follows its NIDs; each variable's references get its address. An entry, or a table of it, outside
+// committed memory ends the walk, logged, as a reference table that runs into it does (patch_refs).
 void link_imports(std::pair<u32, u32> imports, hle::HleProcess& hle, PrxModule& module, const Linker& link,
     const Linker& link_variable)
 {
     GuestMemory& mem = hle.kernel().memory();
     u8* base = mem.base();
     for (u32 at = imports.first; at < imports.second;) {
+        if (!committed(mem, at, 0x24)) {
+            PS_LOG_ERROR(kChan, "{}: its import table's entry at {:#010x} lies outside its memory", module.name, at);
+            return;
+        }
         const u8 size = ps_read8(base, at);
         const u16 attributes = ps_read16(base, at + 4);
         const u16 num_func = ps_read16(base, at + 6), num_var = ps_read16(base, at + 8);
-        const std::string library = guest_string(base, ps_read32(base, at + 0x10));
+        const std::string library = guest_string(mem, ps_read32(base, at + 0x10));
         const u32 nids = ps_read32(base, at + 0x14), slots = ps_read32(base, at + 0x18);
         const u32 vnids = ps_read32(base, at + 0x1C), vstubs = ps_read32(base, at + 0x20);
+        if (!committed(mem, nids, (attributes & 0x2000 ? 8 : 4) * u64{num_func}) || !committed(mem, slots, 4 * u64{num_func}) ||
+            !committed(mem, vnids, 4 * u64{num_var}) || !committed(mem, vstubs, 4 * u64{num_var})) {
+            PS_LOG_ERROR(kChan, "{}: its import table's entry at {:#010x} ({}) has a table outside its memory",
+                module.name, at, library);
+            return;
+        }
         for (u32 i = 0; i < num_func; i++) {
             const u32 nid = ps_read32(base, nids + 4 * i);
             const u32 descriptor = link(library, nid);

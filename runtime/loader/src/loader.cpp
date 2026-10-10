@@ -50,7 +50,7 @@ void patch_refs(GuestMemory& mem, u32 table, u32 value, std::string_view what)
         const u32 addend = ps_read32(base, at + 8);
         const u32 data = value + addend;
         if (addend) PS_LOG_WARN(kChan, "{}: REF({}) at {:#010x} has addend {:#x}", what, type, addr, addend);
-        if (!mem.is_committed(addr)) {
+        if (!mem.is_committed(addr) || !mem.is_committed(addr + (type == 1 ? 3 : 1))) { // its last byte too (D-605)
             PS_LOG_ERROR(kChan, "{}: REF({}) target {:#010x} is unmapped", what, type, addr);
             continue;
         }
