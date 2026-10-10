@@ -204,10 +204,12 @@ Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_contr
     if (!d.backend) d.backend = std::make_unique<rsx::NullBackend>();
     d.rsx = std::make_unique<rsx::Rsx>(t.kernel.memory(), *d.backend, config);
     d.rsx->on_flip = [&s, info](u32 buffer_id) {
-        // RPCS3 sys_rsx_context_attribute 0xFEC (what RSXThread's flip calls): head 1 records the flip.
+        // RPCS3 sys_rsx_context_attribute 0xFEC (what RSXThread's flip calls): head 1 records the flip. The PPU reads
+        // the head's words at any moment (cellGcmGetLastFlipTime, cellGcmGetCurrentDisplayBufferId): stored whole, with
+        // release order (D-587).
         const u32 head = info + di::head + 1 * di::head_size;
-        s.guest.w64(head + di::h_lastFlipTime, ps_timebase_now()); // timebase ticks, as lv2 (RPCS3 rsx_timeStamp)
-        s.guest.w32(head + di::h_flipBufferId, buffer_id);
+        s.guest.w64_release(head + di::h_lastFlipTime, ps_timebase_now()); // timebase ticks, as lv2 (rsx_timeStamp)
+        s.guest.w32_release(head + di::h_flipBufferId, buffer_id);
         update_flip_flags(s.guest, head + di::h_flipFlags, [](u32 f) { return f | di::kFlipDone; });
         RsxDevice& dv = s.rsx;
         dv.flips.fetch_add(1, std::memory_order_relaxed);
@@ -236,7 +238,7 @@ Result sys_rsx_context_allocate(PpuThread& t, u32 context_id, u32 lpar_dma_contr
             return;
         }
         const u32 h = info + di::head + head * di::head_size;
-        s.guest.w32(h + di::h_lastQueuedBufferId, buffer_id);
+        s.guest.w32_release(h + di::h_lastQueuedBufferId, buffer_id);
         update_flip_flags(s.guest, h + di::h_flipFlags,
             [buffer_id](u32 f) { return f | di::kQueued | (buffer_id < 32 ? 1u << buffer_id : 0u); });
         std::function<void(u32, u32)> listener;
@@ -399,7 +401,7 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
         Guest& gm = t.kernel.impl().guest;
         const u32 h = d.driver_info + di::head + static_cast<u32>(a3) * di::head_size;
         const u32 id = static_cast<u32>(a4);
-        gm.w32(h + di::h_lastQueuedBufferId, id);
+        gm.w32_release(h + di::h_lastQueuedBufferId, id);
         update_flip_flags(gm, h + di::h_flipFlags, [id](u32 f) { return f | di::kQueued | (id < 32 ? 1u << id : 0u); });
         d.rsx->note_queued(static_cast<u32>(a3), id);
         std::function<void(u32, u32)> listener;
@@ -497,11 +499,13 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
         Guest& gm = t.kernel.impl().guest;
         // In timebase ticks, as lv2 (RPCS3 rsx_timeStamp): the vblank's time, and the second vblank's time point from
         // a4 (later than the last one), D-519.
+        // The PPU reads them at any moment (cellGcmGetVBlankCount2, cellGcmSysGetLastVBlankTime): each stored whole,
+        // with release order; this thread alone writes them (D-587).
         const u64 now = ps_timebase_now();
-        gm.w32(head + di::h_lastVTimeLow, static_cast<u32>(now));
-        gm.w32(head + di::h_lastVTimeHigh, static_cast<u32>(now >> 32));
-        gm.w64(head + di::h_lastSecondVTime, std::max<u64>(a4, gm.r64(head + di::h_lastSecondVTime) + 1));
-        gm.w64(head + di::h_vBlankCount, gm.r64(head + di::h_vBlankCount) + 1);
+        gm.w32_release(head + di::h_lastVTimeLow, static_cast<u32>(now));
+        gm.w32_release(head + di::h_lastVTimeHigh, static_cast<u32>(now >> 32));
+        gm.w64_release(head + di::h_lastSecondVTime, std::max<u64>(a4, gm.r64(head + di::h_lastSecondVTime) + 1));
+        gm.w64_release(head + di::h_vBlankCount, gm.r64(head + di::h_vBlankCount) + 1);
         return CELL_OK;
     }
     default:
