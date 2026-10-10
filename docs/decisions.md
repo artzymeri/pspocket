@@ -9328,3 +9328,159 @@ from the SPU as they end, in whatever order the policy module finishes them, so 
 runs (class 7: head 0x110380 or 0x110000, two blocks free either way) and the test failed about one run in three with
 either PPU side. It now compares each free list as its count, wake-ups and waiters and the set of its blocks; six runs in
 a row agree.
+
+## D-635 · 2026-10-10 · cellNetAoi as a console with no ad hoc wireless: the link never up, the peers kept, firmware-first
+
+cellNetAoi links a PS3 game with PSP peers: a PSP in ad hoc mode, reached through the PS3's wireless LAN. RPCS3
+registers its nine names with no arguments (rpcs3/Emu/Cell/Modules/cellNetAoi.cpp: todos answering CELL_OK) and nothing
+public describes the library, so pspocket's (runtime/hle/src/cellNetAoi.cpp) is the smallest model the names describe,
+for a console whose network is disconnected (cellNetCtl, D-024) and which has no ad hoc link to a PSP (an iPhone has
+none). Firmware-first (D-563): where the system software has the library's module, a game gets Sony's.
+- **The library.** Init and Term bracket it, a process each: any other call before Init or after Term is
+  NOT_INITIALIZED, a second Init NOT_TERMINATED; Term forgets the peers. Init's and Start's arguments are not read.
+- **The link never comes up.** Start answers NOT_CONNECTED, and so does Stop (nothing was started). What the link
+  would tell, this station's information (GetLocalInfo), a peer's (GetRemotePeerInfo, for a peer the game added) and the
+  title ID of the game the PSP on it plays (GetPspTitleId: a PSP's ad hoc network is named after its game), answers
+  NOT_CONNECTED once the pointers are checked, and nothing is written. GetPspTitleId is read as the PSP's game, not as
+  a value the game gave at Init: a getter of an Init argument would read a structure nobody has described, and could
+  hand back bytes that are not a title ID.
+- **Peers.** AddPeer and DeletePeer keep the set of peers by their 6-byte MAC address (a station's identity in a PSP's
+  ad hoc mode), read through the pointer the call takes: 16 at most (a PSP ad hoc group), the 17th HANDLER_MAX; adding
+  one already kept answers CELL_OK and changes nothing; deleting, or asking after, one not kept is ID_NOT_FOUND. They
+  are kept with or without the link: adding a peer needs nothing from it.
+- **Error codes.** The library's own are not known; these are cellNetCtl's (rpcs3/Emu/Cell/Modules/cellNetCtl.h), the
+  network facility's documented codes, each for its own meaning: NOT_INITIALIZED 0x80130101, NOT_TERMINATED
+  0x80130102, HANDLER_MAX 0x80130103, ID_NOT_FOUND 0x80130104, INVALID_ADDR 0x80130107 (a null pointer, or one that is
+  not guest memory, logged with the call site), NOT_CONNECTED 0x80130108. The library's state is checked first, then
+  the pointers, then the peer.
+To check on the Mac, against Sony's module (first which module exports cellNetAoi: if it is one pspocket always serves,
+the marker changes nothing): the nine signatures (what Init and Start take; whether a peer is a MAC address, an IP
+address or an NP ID; GetRemotePeerInfo's argument order; what GetPspTitleId writes), the error codes and the order of
+the checks, what Start answers on a PS3 that is not connected or whose wireless is in use, whether AddPeer needs the
+link, the peer limit.
+Tests: tests/hle/test_netaoi.cpp (every function before Init and after Term; Start, Stop and the three getters with
+nothing written; sixteen peers and the seventeenth, a peer given from another buffer, one added twice, Term forgetting
+them; a process each).
+
+## D-636 · 2026-10-10 · libmedi as a console with no PSN: the mediator's contexts kept, all else offline, firmware-first
+
+libmedi (cellMediator, 10 functions) is Sony's mediator service: through it a game's reports go to a provider on PSN,
+signed by the console. RPCS3 registers the ten names with no arguments (rpcs3/Emu/Cell/Modules/libmedi.cpp: todos
+answering CELL_OK) and nothing public describes the library. What is known: it depends on libnet and NP (RPCS3
+cellSysmodule.cpp DEPENDENCIES_MEDI) and signs with the console's own key through lv2's sys_ss_ad_sign (D-527, read
+from the firmware's modules). pspocket's (runtime/hle/src/libmedi.cpp) is that library on a console that never reaches
+PSN; firmware-first (D-563).
+- **Contexts** are the library's own bookkeeping: CreateContext makes one, at most 32 (as NP's title contexts, RPCS3
+  SCE_NP_LOOKUP_MAX_CTX_NUM), and answers its ID, 1 to 32 (the lowest free), as NP's title context creators answer
+  theirs (sceNpLookupCreateTitleCtx); the 33rd is ID_NO_SPACE. Its arguments (what the mediator would be told) are not
+  read and nothing is written: an ID written through a pointer guessed wrong would land in the game's own data.
+  CloseContext forgets one; an ID not open is ID_NOT_FOUND for every call.
+- **Everything a context does needs the mediator on PSN**: its status, the provider's URL, the user's information,
+  posting reports (PostReports, ReliablePostReports) and sending the reports kept for later (FlushCache) answer
+  SCE_NP_ERROR_OFFLINE, after the context ID and the pointer the call fills or reads (its second argument) are checked;
+  nothing is written. GetStatus gives the context's state as that answer rather than as a status word: the status
+  values are not known, and a value made up here would read as Sony's.
+- **The signature is the console's**, made by the PS3's security service with keys only a PS3 holds (sys_ss_ad_sign):
+  Sign and GetSignatureLength answer CELL_ENOTSUP, lv2's "not supported", after the same checks. pspocket's lv2 answers
+  sys_ss_ad_sign itself with CELL_OK and no signature, for Sony's modules (D-527); this library does not call it, so it
+  never hands out a signature it did not make. The length is not answered either: Sony's is not known, and no
+  signature of any length can be made here.
+- **Error codes.** The library's own are not known; these are NP's (rpcs3/Emu/Cell/Modules/sceNp.h), the closest
+  documented ones: INVALID_ARGUMENT 0x8002aa03 (a null pointer or one that is not guest memory, logged with the call
+  site), ID_NO_SPACE 0x8002aa05, ID_NOT_FOUND 0x8002aa06, OFFLINE 0x8002aa0c; and lv2's CELL_ENOTSUP 0x80010037.
+To check on the Mac, against libmedi.sprx: the signatures (CreateContext's parameters and where the ID goes; which
+argument each call fills), the error codes and the order of the checks, whether a context can be made offline at all
+and what GetStatus reports for it, the signature's length and whether Sign works on a PS3 that is offline (it needs no
+network), whether ReliablePostReports keeps reports while offline, the context limit.
+Tests: tests/hle/test_medi.cpp (contexts 1 to 32 and the 33rd, the lowest free ID again, IDs never open; each call's
+answer, its pointer's checks, the context before them, nothing written; a closed context gone for every call; a
+process each).
+
+## D-637 · 2026-10-10 · libad_core and libad_async as a console never online: contexts shared, never connected, firmware-first
+
+libad_core (7 functions) and libad_async (6) are Sony's in-game advertising: contexts connected to the ad server on
+PSN, the ad spaces a game shows and their assets, the reports of what was shown. RPCS3 registers their thirteen names
+with no arguments (rpcs3/Emu/Cell/Modules/libad_core.cpp, libad_async.cpp: todos answering CELL_OK) and nothing public
+describes them. Known: libad_core depends on libfs, libnet and NP, libad_async on libad_core (RPCS3 cellSysmodule.cpp
+DEPENDENCIES_AD_CORE, DEPENDENCIES_AD_ASYNC), and libad_core signs with the console's key (sys_ss_ad_sign, D-527).
+pspocket's (runtime/hle/src/libad.cpp) are those libraries on a console that never reaches PSN and has never been online
+(no ads kept on its disk); both firmware-first (D-563).
+- **Contexts**: sceAdOpenContext and sceAdAsyncOpenContext make one (at most 32, as NP's title contexts) and answer its
+  ID, 1 to 32, as D-636's; their arguments are not read, nothing is written. libad_async being a layer over libad_core,
+  the two share their contexts: sceAdCloseContext and sceAdAsyncCloseContext forget one, whichever opened it.
+- **Never connected**: sceAdConnectContext and sceAdAsyncConnectContext answer SCE_NP_ERROR_OFFLINE (the asynchronous
+  one at once: there is nothing to wait for, and how its completion would be told is not known), and so does
+  everything a connection gives: the connection's information (sceAdGetConnectionInfo, its pointer checked), an ad
+  space's and an asset's (sceAdGetSpaceInfo, sceAdGetAssetInfo), opening an ad space (sceAdAsyncSpaceOpen), sending the
+  reports (sceAdFlushReports, sceAdAsyncFlushReports). Each after the context ID is checked; nothing is written. No
+  space is ever open, so sceAdAsyncSpaceClose finds none (ID_NOT_FOUND) once the context is found.
+- **Error codes**: NP's, as D-636's: INVALID_ARGUMENT, ID_NO_SPACE, ID_NOT_FOUND (a context or a space not open),
+  OFFLINE.
+To check on the Mac, against libad_core.sprx and libad_async.sprx: the signatures (OpenContext's parameters and where
+the ID goes; a space's identity; how the asynchronous calls tell their completion: a callback or a state to poll), the
+error codes and the order of the checks, whether the two libraries' contexts are one set, whether a space opens without
+a connection (from ads kept on disk), the context limit.
+Tests: tests/hle/test_ad.cpp (contexts 1 to 32 from either library and the 33rd, either library closing either's; every
+call's answer on contexts of both, an ID not open, the connection information's pointer, a space never open, nothing
+written; a closed context gone for every call; a process each).
+
+## D-638 · 2026-10-10 · cellLibprof: user trace registrations kept, no profiler attached, firmware-first
+
+cellLibprof (cellUserTraceInit, Register, Unregister, Terminate) is the user trace of Sony's profiler (libprof.sprx),
+through which a game marks its own events for the performance tools. The module belongs to the development tools, not
+to a retail system's software, so on a retail PS3 these imports never resolve (docs/firmware.md) and a game that runs
+there does not depend on them. RPCS3 registers the four names with no arguments (rpcs3/Emu/Cell/Modules/cellLibprof.cpp:
+todos answering CELL_OK; its cellSysmodule.cpp lists external/libprof.sprx). pspocket's
+(runtime/hle/src/cellLibprof.cpp) keeps what the game registers and does nothing else: no profiler is attached to read
+the traces. Firmware-first (D-563), though no retail system software has the module.
+- Init and Terminate bracket the library, a process each: any other call before Init or after Terminate, and a second
+  Init, answer CELL_ESTAT. Init's arguments are not read.
+- Register keeps a registration under its first argument (what the game names its trace by: an ID or the address of
+  its description, as sys_ppu_thread_register_atexit and cellSysutilRegisterCallback key theirs), its next two arguments
+  as given; at most 64. A registration under 0 is CELL_EINVAL, one already kept CELL_EEXIST, the 65th CELL_EAGAIN.
+  Unregister forgets one (CELL_ESRCH for one not kept); Terminate forgets them all.
+- Error codes: the library's own are not known; these are lv2's (sys/return_code.h, rpcs3/Emu/Cell/ErrorCodes.h), which
+  the system libraries share.
+To check on the Mac, where a development system's software is at hand (a retail one has no libprof): the signatures
+(what Init takes; whether Register answers an ID or keys on what it is given), the error codes, the registration limit.
+Tests: tests/hle/test_libprof.cpp (every call before Init and after Terminate, a second Init; a registration kept,
+refused twice, forgotten and made again; 64 and the 65th; Terminate forgetting them; a process each).
+
+## D-639 · 2026-10-10 · cellSysmodule's export 0x59521326 as RPCS3 makes it, its key from RPCS3 at build time; s_sysmodule_context
+
+The last two of cellSysmodule's names in the chart (D-184 left the first out: its key is RPCS3's):
+- **cellSysmodule_0x59521326(u8 output[16])**, libsysmodule's export of that NID (its name is not known), as RPCS3
+  makes it (rpcs3/Emu/Cell/Modules/cellSysmodule.cpp): the console's OpenPSID from lv2's sys_ss_get_open_psid
+  (pspocket's lv2: Config::console_psid_*), its two 64-bit halves swapped, decrypted with AES-128-CBC under
+  libsysmodule's key (RPCS3's KEY_UNK), the swapped OpenPSID being the IV as well, into the caller's 16 bytes. -22,
+  RPCS3's answer, for no output or a failed sys_ss_get_open_psid, and here also for an output that is not guest memory
+  (RPCS3 ensure()s; logged with the call site).
+- **The key** comes from RPCS3's source at build time into the build directory only, as the SELF keys do (D-121):
+  scripts/self-keys.py reads the sixteen constants of KEY_UNK in rpcs3/Emu/Cell/Modules/cellSysmodule.cpp into the
+  generated self_keys.cpp (recomp::builtin_sysmodule_key, pspocket/recomp/sysmodule_key.hpp), which the iOS app compiles
+  from the host build as it does the other keys. Nothing of the key is in the repository; the tests compute what they
+  expect from the build's key. A build without RPCS3's source (or whose cellSysmodule.cpp lacks the array) has no key
+  and leaves the export unimplemented: it is not registered, so a call logs and fails (rule 4).
+- It is unverified (D-594): made from RPCS3, not compared with libsysmodule. cellSysmodule is a library pspocket always
+  serves (libsysmodule.sprx is on the native list), so the marker only records that.
+- **s_sysmodule_context** is RPCS3's variable (cellSysmodule.cpp sysmodule_context): its copy of libsysmodule's own
+  data in guest memory, registered hidden (MFF_HIDDEN), so no game or module imports it: only RPCS3's own cellSysmodule
+  functions read it. pspocket exports it as a host variable (PS_HLE_VAR, D-503) with RPCS3's layout: the lwmutex (24
+  bytes; none is made, pspocket's lock being the host's), unk_addr at 0x18 (0: no memory is taken at module start),
+  mem_container_id at 0x1C, use_mem_container at 0x20, the 189 module states at 0x24 (load count and PRX ID, big-endian
+  as a PS3's would be, where RPCS3 leaves those two fields in the host's byte order), the base path at 0x60C and its
+  size at 0x61C; 0x620 bytes, aligned to 8. It is laid out when something links it, as RPCS3's init leaves it (every
+  PRX ID -1, pspocket's modules having no PRX; the retail modules' path), then holds pspocket's state as it stands and
+  is kept in step with it from then on: each load count (the 93 public modules and the 87 internal ones; the retail
+  variants RPCS3 keeps beside GCM_SYS, FS and LV2DBG, libgcm_sys, libfs and liblv2dbg_for_cex, in step with them), the
+  container in use (the last one taken stays when none is used, as RPCS3 keeps it), the debug mode's path (written over
+  the retail one as RPCS3 copies it). pspocket's module states stay the host's (D-567): nothing changes for a game.
+The count: 5,904 of 6,625 library functions pspocket's own before D-635, 5,942 after (cellNetAoi 9, libmedi 10,
+libad_core 7, libad_async 6, cellLibprof 4, cellSysmodule 2: every cell of the six).
+To check on the Mac, against libsysmodule.sprx: 0x59521326's answer for the installed console's OpenPSID, and its
+errors (RPCS3's -22).
+Tests: tests/hle/test_sysmodule.cpp (the export against the AES block functions over the swapped OpenPSID, encrypted
+back, the same each time, two other consoles giving other answers, no output and one outside guest memory; without the
+key, the export absent; the variable's size and alignment, its layout when linked after a load, loads and unloads with
+their dependencies and variants, an internal module, the debug path and back, the container taken, given up and
+refused); tests/hle/test_hle.cpp's NID check takes RPCS3's "_0x" name.
