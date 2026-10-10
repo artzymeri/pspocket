@@ -314,7 +314,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-10: 5,976 of 6,625, 90.2%):
+firmware module. Done so far (2026-10-10: 5,993 of 6,625, 90.5%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -381,9 +381,13 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   structures inferred from libpngenc's; a comparison with libjpgenc ready for the Mac, D-618) and cellJpgDec's Ext
   functions, unverified (D-617). Fixed on the way: the JPEG decoder allocated what a damaged header claimed (up to
   13 GB) before decoding; it now takes the memory only to decode (D-619).
-Left (649, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
+- libsynth2, the PS2's sound chip as a PS3 library, firmware-first (D-610 to D-614): an SPU2 of pspocket's own
+  (two cores of 24 voices over 2 MB of sound memory: VAG ADPCM, pitch and its modulation, ADSR, noise, the voice mixes
+  and each core's reverb), behind libsd's calls and register numbers. A comparison with Sony's libsynth2 is ready for
+  the Mac ("[compare][synth2]"); the first thing to check is what Generate puts in the surround outputs.
+Left (632, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSailRec (58)
-  and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (28, its wire protocol), the codec
+  and cellSail's playback (19, libsail), libsnd3 (50), cellRudp (28, its wire protocol), the codec
   cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 6, and
   the audio cores' operation tables and PTS functions, about 160 in all), cellCelpEnc and
   cellCelp8Enc (19), and the small ones
