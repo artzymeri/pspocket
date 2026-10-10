@@ -891,7 +891,7 @@ void io_printf(PPUContext& ctx, std::string_view fmt, std::initializer_list<u64>
     StackVar text(ctx, b, static_cast<u32>(fmt.size() + str.size() + 2));
     std::memcpy(b + text.addr(), fmt.data(), fmt.size());
     const u32 at = text.addr() + static_cast<u32>(fmt.size()) + 1;
-    std::memcpy(b + at, str.data(), str.size());
+    if (!str.empty()) std::memcpy(b + at, str.data(), str.size()); // an empty view's data() may be null (D-605)
     std::vector<u64> a{text.addr()};
     if (!str.empty()) a.push_back(at);
     a.insert(a.end(), args.begin(), args.end());
