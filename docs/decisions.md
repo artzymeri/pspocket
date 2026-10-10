@@ -8998,3 +8998,21 @@ The count: 5,686 of 6,625 library functions pspocket's own before, 5,691 after.
 Tests: tests/hle/test_rudp.cpp (Init with either allocator, End, the handler, every error, a process each, the rest
 left to Sony's) and tests/hle/test_crashdump.cpp (set and get at both ends of the range, an entry replaced, an index
 never set, each EINVAL with nothing written).
+
+## D-606 · 2026-10-10 · The tree builds and tests cleanly without FFmpeg
+
+FFmpeg is optional (D-181, D-576): without build/ffmpeg/<host> the media libraries build without decoding, under
+PSPOCKET_HAVE_FFMPEG. A fresh checkout before scripts/build-ffmpeg.sh has run (the Mac's first build, a cloud
+session's) must still build with -DPSPOCKET_WERROR=ON and pass its tests, the decoding cases skipping. It did not:
+- tests/hle/test_adec_cores.cpp did not compile under -Werror: some twenty helpers of the FFmpeg-only tests (bit
+  writers, tone and energy measures, each codec's frame builders and parameter writers) sat outside the FFmpeg guards
+  and went unused. Each codec's section now has its helpers and its tests under one guard; only the rule's test (the
+  firmware's core first, pspocket's where none is linked) runs without FFmpeg.
+- Four tests that need a decoder FFmpeg gives were not guarded and failed without it. They now SKIP with the reason:
+  test_adec.cpp's ATRAC3plus flow and its comparison with Sony's core, and test_atrac.cpp's AT3+ files and its
+  comparison with libatrac3plus (pspocket's ATRAC3plus core is on FFmpeg), and test_vdec.cpp's comparison with Sony's
+  libvdec (pspocket's cellVdec decodes no picture without it). With FFmpeg each runs as before.
+Checked with a build configured with -DPSPOCKET_FFMPEG_DIR=/nonexistent (the configure step reports no FFmpeg) and
+-DPSPOCKET_WERROR=ON: it builds, and its ctest has only the two failures every Linux build has (test_spu_fuzz's x86
+floating point, test_libm's fmax/fmin signed zeros on glibc); test_hle 620 cases, 91 of them skipped. The build with
+FFmpeg is unchanged.
