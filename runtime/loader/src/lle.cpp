@@ -580,10 +580,11 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
     candidates.insert(roots.begin(), roots.end());
     // What each candidate needs, as RPCS3 links a module (PPUModule.cpp ppu_load_imports): a function from a candidate,
     // else the host, else a module that can join the candidates; one with none of these links to the host's
-    // unimplemented stub (logged when called) and is listed here, as is a syscall lv2 lacks. A variable comes from a
-    // candidate or a module that can join (the host exports none); one no module exports stays unlinked, as lv2 leaves
-    // it on a PS3 (libadec's DTS and WMA Pro cores are in no retail firmware, D-177), and is listed too. Only a module
-    // missing from the index is refused.
+    // unimplemented stub (logged when called) and is listed here, as is a syscall lv2 lacks. A variable likewise: from
+    // a candidate, else the host when it exports it (D-503, D-593: a codec core's operation table, say), else a module
+    // that can join; one nothing exports stays unlinked, as lv2 leaves it on a PS3 (libadec's DTS and WMA Pro cores are
+    // in no retail firmware, D-177), and is listed too. A forced library's module serves both rather than the host
+    // (D-563). Only a module missing from the index is refused.
     std::map<std::string, std::vector<std::string>, std::less<>> gaps;
     for (bool changed = true; changed;) {
         changed = false;
@@ -621,11 +622,14 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
                                                                       : info->second.import_variables) {
                 const auto dep = file_for(library);
                 for (const u32 nid : nids) {
+                    const bool to_module = dep && can_join(*dep) && forced(library);
                     if (dep && candidates.contains(*dep)) {
                         const auto& exported = files_[*dep].export_variables;
                         const auto e = exported.find(library);
                         if (e == exported.end() || !e->second.contains(nid))
                             gap.push_back(std::format("variable {}::{:#010x} (not exported by {})", library, nid, *dep));
+                    } else if (!to_module && hle::registry().find_variable(library, nid)) {
+                        // the host's (load_file links it)
                     } else if (dep && can_join(*dep)) {
                         joins.push_back(*dep);
                     } else {
@@ -673,8 +677,10 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
     for (const LibraryNeeds& need : imports)
         if (const auto file = file_for(need.library); !file || !chosen_.contains(*file)) host_linked_.insert(need.library);
     for (const std::string& f : added)
-        for (const auto& entry : files_[f].import_functions)
-            if (const auto file = file_for(entry.first); !file || !chosen_.contains(*file)) host_linked_.insert(entry.first);
+        for (const auto* table : {&files_[f].import_functions, &files_[f].import_variables})
+            for (const auto& entry : *table)
+                if (const auto file = file_for(entry.first); !file || !chosen_.contains(*file))
+                    host_linked_.insert(entry.first);
     // Libraries of refused modules stay on the host: what is imported from them that the host lacks is listed too.
     for (const LibraryNeeds& need : imports) {
         const auto file = file_for(need.library);

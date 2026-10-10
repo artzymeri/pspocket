@@ -758,6 +758,114 @@ TEST_CASE("LLE: the host's own imports (cellAdec's codec cores) chosen with the 
     fs::remove_all(root);
 }
 
+// D-591, D-593: the codec cores' operation tables are exports of the host now. A firmware module importing one (a
+// synthetic one whose imported variable is renamed to the table) gets pspocket's table where no module has the core;
+// where one does, Sony's for a core not compared yet (its library firmware-first, D-563) and still pspocket's for a
+// compared one (LPCM here), as a game importing the table directly does. pspocket's own cellAdec never gets its own
+// cores' tables through its imports (the loader links firmware modules' exports there only), so it calls them directly.
+TEST_CASE("LLE: a codec core's operation table goes to pspocket's, or to the firmware's where the core is "
+          "firmware-first (D-591, D-593)",
+    "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    using Files = std::set<std::string, std::less<>>;
+    constexpr u32 kLpcmOps = 0x369D9D3A, kMp3Ops = 0x84276A23, kAtracXOps = 0x4944AF9A;
+    REQUIRE(hle::registry().find_variable("cellAdec", kLpcmOps) != nullptr);
+    const bool ffmpeg = hle::registry().find_variable("cellMP3dec", kMp3Ops) != nullptr; // the cores on FFmpeg
+    for (const char* lib : {"cellMP3dec", "cellMPL1dec", "cellM2BCdec", "cellM4AacDec", "cellM4AacDec2ch",
+             "cellM4AacDec2chmod", "cell_libac3dec", "cellAtrac3dec"})
+        CHECK(hle::registry().is_firmware_first(lib) == ffmpeg);
+    for (const char* lib : {"cellAdec", "cellAtracXdec", "cellDmux", "cellDmuxPamf"})
+        CHECK_FALSE(hle::registry().is_firmware_first(lib));
+
+    const fs::path root = fresh_flash("pspocket-test-lle-core-tables");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    test::PrxOptions o;
+    o.variables = true;
+    const auto x = test::build_ppu_prx(o);
+    const auto renamed_variable = [&](std::vector<u8> m, std::string_view library, u32 nid) {
+        std::fill(m.begin() + 0x320, m.begin() + 0x330, u8{0});
+        std::memcpy(m.data() + 0x320, library.data(), library.size());
+        ps_st32(m.data() + 0x418, nid);
+        return m;
+    };
+    // A module exporting a library of its own that imports `library`'s table; a core module exporting the table (and
+    // importing it, its own).
+    const auto user = [&](std::string_view exported, u32 fn, std::string_view library, u32 nid) {
+        return renamed_variable(prx_exporting(x, exported, fn), library, nid);
+    };
+    const auto core = [&](std::string_view library, u32 nid) {
+        std::vector<u8> m = renamed_variable(prx_exporting(x, library, 0x12340001), library, nid);
+        ps_st32(m.data() + 0x40C, nid);
+        return m;
+    };
+    write(external / "libuser_lpcm.sprx", debug_self(user("synthLpcmUser", 0x66660001, "cellAdec", kLpcmOps)));
+    if (ffmpeg)
+        write(external / "libuser_mp3.sprx", debug_self(user("synthMp3User", 0x66660002, "cellMP3dec", kMp3Ops)));
+    const auto bound = [](u32) { return true; };
+    const std::vector<Needs> game = {Needs{"cellAdec", {recomp::nid_of("cellAdecQueryAttr")}, {}}};
+    for (int installed = 0; installed < 2; installed++) {
+        if (installed) { // the cores' own modules, as the firmware has them
+            write(external / "libadec_core.sprx", debug_self(core("cellAdec", kLpcmOps)));
+            if (ffmpeg) write(external / "libmp3dec.sprx", debug_self(core("cellMP3dec", kMp3Ops)));
+            write(external / "libatxdec.sprx", debug_self(core("cellAtracXdec", kAtracXOps)));
+            fs::remove(root / "lle-index.txt");
+        }
+        INFO("the cores' modules installed: " << installed);
+        hle::test::Fixture f;
+        u8* base = f.base();
+        loader::LleModules lle((root / "dev_flash").string());
+        REQUIRE(lle.index());
+        std::string why;
+        // The compared LPCM core: pspocket's table for the module (D-593) and for a game, the core's module or not.
+        lle.decide({Needs{"synthLpcmUser", {0x66660001}, {}}}, bound);
+        CHECK(lle.chosen_files() == Files{"libuser_lpcm.sprx"});
+        CHECK_FALSE(lle.gaps().contains("libuser_lpcm.sprx"));
+        const loader::PrxModule* m = lle.load("synthLpcmUser", *f.hle, &why);
+        INFO(why);
+        REQUIRE(m != nullptr);
+        const u32 own_lpcm = f.hle->link_variable("cellAdec", kLpcmOps);
+        CHECK(ps_read32(base, m->segments[1].first + 0xC0) == own_lpcm);
+        CHECK(ps_read32(base, own_lpcm + 4) ==
+            f.hle->descriptor_of("cellAdec", recomp::nid_of("_CellAdecCoreOpOpen_lpcm")));
+        // A game importing the table: cellAdec stays on the host, table and all, never the LPCM core's module (what
+        // cellAdec imports itself joins, as for any game importing cellAdec, D-197: MP3's module, firmware-first, or,
+        // in a build without FFmpeg, ATRAC3plus's).
+        lle.decide({Needs{"cellAdec", {}, {kLpcmOps}}}, bound);
+        CHECK_FALSE(lle.chosen_files().contains("libadec_core.sprx"));
+        const Files cores = !installed ? Files{} : ffmpeg ? Files{"libmp3dec.sprx"} : Files{"libatxdec.sprx"};
+        CHECK(lle.chosen_files() == cores);
+        if (ffmpeg) {
+            // MP3, firmware-first: the module joins for the module importing the table and for a game, where there is
+            // one; pspocket's table where there is not.
+            lle.decide({Needs{"synthMp3User", {0x66660002}, {}}}, bound);
+            CHECK(lle.chosen_files() ==
+                (installed ? Files{"libmp3dec.sprx", "libuser_mp3.sprx"} : Files{"libuser_mp3.sprx"}));
+            CHECK_FALSE(lle.gaps().contains("libuser_mp3.sprx"));
+            const loader::PrxModule* u = lle.load("synthMp3User", *f.hle, &why);
+            REQUIRE(u != nullptr);
+            const loader::PrxModule* mp3 = installed ? lle.load("cellMP3dec", *f.hle, &why) : nullptr;
+            const u32 want =
+                mp3 ? mp3->variables.at({"cellMP3dec", kMp3Ops}) : f.hle->link_variable("cellMP3dec", kMp3Ops);
+            CHECK(ps_read32(base, u->segments[1].first + 0xC0) == want);
+            lle.decide({Needs{"cellMP3dec", {}, {kMp3Ops}}}, bound);
+            CHECK(lle.chosen_files() == (installed ? Files{"libmp3dec.sprx"} : Files{}));
+        }
+        // pspocket's cellAdec: a firmware-first core's table from its module when there is one, else nothing (its own
+        // core, called directly); never pspocket's own tables.
+        lle.decide(game, bound);
+        lle.link_host_imports(game, *f.hle);
+        if (ffmpeg) {
+            const loader::PrxModule* mp3 = installed ? lle.load("cellMP3dec", *f.hle, &why) : nullptr;
+            CHECK(f.hle->imported("cellMP3dec", kMp3Ops) == (mp3 ? mp3->variables.at({"cellMP3dec", kMp3Ops}) : 0u));
+            CHECK(f.hle->imported("cellMP3dec", kMp3Ops) != f.hle->link_variable("cellMP3dec", kMp3Ops));
+        }
+        CHECK(f.hle->imported("cellAdec", kLpcmOps) == 0);
+        if (ffmpeg) CHECK(f.hle->imported("cellAtracXdec", kAtracXOps) == 0); // not imported with FFmpeg (D-198)
+    }
+    fs::remove_all(root);
+}
+
 // D-175: a game's own PRX loaded while it runs needs a firmware module the boot did not choose: the module joins, is
 // loaded for it, and its module_start runs before the PRX's own (on the thread that starts the PRX).
 TEST_CASE("Run-time modules: the firmware modules a game's PRX needs join, and start before it", "[hle][lle][prx]")
