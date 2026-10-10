@@ -67,6 +67,20 @@ namespace q {
 constexpr u32 kCapacity = 0, kCount = 4, kRing = 8, kWrite = 0xC, kRead = 0x10, kMutex = 0x14, kCond = 0x18;
 }
 
+// The built-in "x-cell-fs" file source (0x138 bytes in the player's block; cellSailFileSource.cpp, D-564): +0x40 the
+// CellSailSource it registers, +0x100 its file calls (14 words).
+namespace fsrc {
+constexpr u32 kSource = 0x40, kCalls = 0x100, kSize = 0x138;
+}
+// Lays the source out at `s` with libsail's file calls and initializes its CellSailSource (cellSailSourceInitialize's
+// answer).
+s32 builtin_source_init(PPUContext& ctx, u32 s);
+// cellSailSourceFinalize of its CellSailSource.
+void builtin_source_fini(PPUContext& ctx, u32 s);
+// Player parameter 33: the game's file calls (0x28 bytes: 0, open, a call after open or 0, close, fstat, read, lseek,
+// cancel, two more words; INVALID_ARG unless all are there), or libsail's own back for NULL.
+s32 builtin_source_set_file_calls(PPUContext& ctx, u32 s, u32 calls);
+
 // Posts {code, 0, object, arg} at the queue's tail (libsail's post): the unlock's answer, or the lock's error.
 s32 post(PPUContext& ctx, u32 player, u32 code, u32 object, u32 arg);
 // Posts {code, a, b, c} at the queue's head (libsail's urgent post).
