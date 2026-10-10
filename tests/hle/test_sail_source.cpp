@@ -1,11 +1,12 @@
-// cellSail's built-in "x-cell-fs" file source (D-564) against libsail's own, from the user's installed system software
+// cellSail's built-in "x-cell-fs" file source (D-901) against libsail's own, from the user's installed system software
 // (firmware_compare.hpp; skipped without it): the same script in two fresh processes (libsail loaded in both), one
 // calling libsail's exports and one pspocket's. The source's callbacks are called through the descriptors the source
 // itself holds, so one side calls libsail's code and the other pspocket's. The file read is synthetic, in a temporary
 // /dev_hdd0: a PAMF header followed by 2.5 MB of a pattern. Compared: the answers, the script's memory (the player and
 // its source, the game's file calls' log, the messages the source posted, the data its items delivered), what the
 // player's allocator gave out (its block, the read-ahead buffers with what was read into them) and the lv2 calls each
-// thread makes in order. No game data.
+// thread makes in order. One test runs without the firmware: pspocket's reader alone, checked against the file. No game
+// data.
 
 #include <catch_amalgamated.hpp>
 
@@ -25,7 +26,9 @@
 #include <vector>
 
 #include "firmware_compare.hpp"
+#include "guest.hpp" // runtime/hle/src (internal): atomic_load_u8
 #include "hle_test_util.hpp"
+#include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/nid.hpp"
 
 using namespace pspocket;
@@ -282,21 +285,31 @@ struct Script {
     }
 
     // Waits until the player's queue holds `n` messages, logs them at kMsgLog (a count, then 16 bytes each from +16)
-    // and empties it (no one else reads the queue of a player that has not booted).
+    // and empties it (no one else reads the queue of a player that has not booted), under the queue's mutex as a reader
+    // of it would (lv2's own call, so the trace does not see it).
     void messages(u32 n)
     {
+        const u32 mutex = ps_read32(b, kP + 0x184);
+        const auto count = [&] {
+            lv2::sys_mutex_lock(*t->t, mutex, 0);
+            const u32 c = ps_read32(b, kP + 0x174);
+            lv2::sys_mutex_unlock(*t->t, mutex);
+            return c;
+        };
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (ps_read32(b, kP + 0x174) < n && std::chrono::steady_clock::now() < end)
+        while (count() < n && std::chrono::steady_clock::now() < end)
             std::this_thread::sleep_for(std::chrono::microseconds(200));
+        lv2::sys_mutex_lock(*t->t, mutex, 0);
         const u32 have = ps_read32(b, kP + 0x174);
-        CHECK(have == n);
         const u32 cap = ps_read32(b, kP + 0x170), ring = ps_read32(b, kP + 0x178), w = ps_read32(b, kP + 0x17C);
         for (u32 i = 0; i < have; i++) {
-            const u32 count = ps_read32(b, kMsgLog);
-            std::memcpy(b + kMsgLog + 16 + 16 * count, b + ring + 16 * ((w + cap - have + i) % cap), 16);
-            ps_write32(b, kMsgLog, count + 1);
+            const u32 logged = ps_read32(b, kMsgLog);
+            std::memcpy(b + kMsgLog + 16 + 16 * logged, b + ring + 16 * ((w + cap - have + i) % cap), 16);
+            ps_write32(b, kMsgLog, logged + 1);
         }
         ps_write32(b, kP + 0x174, 0);
+        lv2::sys_mutex_unlock(*t->t, mutex);
+        CHECK(have == n);
         lines->push_back(std::format("messages {}", have));
     }
 
@@ -346,9 +359,9 @@ struct Script {
         for (u32 i = 0; i < ps_read32(b, kRecords); i++) mask.push_back({kRecords + 16 + 48 * i + 32, 8});
         const u32 ring = ps_read32(b, kP + 0x178);
         for (u32 i = 0; i < ps_read32(b, kP + 0x170); i++) {
-            const u32 e = ring + 16 * i;
-            if (ps_read32(b, e) == 0x40 || ps_read32(b, e) == 0x3C) mask.push_back({e + 8, 4});
-            mask.push_back({e + 12, 4});
+            const u32 e = ring + 16 * i, c = ps_read32(b, e);
+            if (c == 0x40 || c == 0x3C || c == 0x4C || c == 0x5D) mask.push_back({e + 8, 4});
+            if (c != 0) mask.push_back({e + 12, 4}); // a completion's handle is the player's
         }
     }
 };
@@ -357,8 +370,10 @@ void script_open(Script& sc, bool games_calls);
 void script_reader(Script& sc);
 void script_reader_games_calls(Script& sc);
 void script_reader_failures(Script& sc);
+void script_stream(Script& sc, bool games_calls);
 
-Run run(const std::string& flash, const Tree& tree, bool sony, int script)
+// `flash` empty: pspocket's side alone, without libsail loaded (the test without firmware).
+Run run(const std::optional<std::string>& flash, const Tree& tree, bool sony, int script)
 {
     Fixture f;
     REQUIRE(f.hle->main_memory().reserve(kHeap, kHeapSize));
@@ -366,7 +381,8 @@ Run run(const std::string& flash, const Tree& tree, bool sony, int script)
     REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (tree.root / "hdd0").string(), false));
     REQUIRE(f.hle->initialize_tls({0, 0, 0x100}));
     GuestThread t(f, 0, "ppu");
-    FirmwareLibrary sail(f, t, flash, "cellSail");
+    std::optional<FirmwareLibrary> sail;
+    if (flash) sail.emplace(f, t, *flash, "cellSail");
     u8* b = f.base();
     std::memset(b + kArea, 0, kAreaSize);
     write_code(b);
@@ -382,7 +398,7 @@ Run run(const std::string& flash, const Tree& tree, bool sony, int script)
         const u32 nid = n.starts_with("cellSail_") ? static_cast<u32>(std::stoul(std::string(n.substr(9)), nullptr, 16))
                                                    : recomp::nid_of(name);
         if (sony) {
-            v = call_guest(t.ctx, sail.module->functions.at({"cellSail", nid}), args);
+            v = call_guest(t.ctx, sail->module->functions.at({"cellSail", nid}), args);
         } else {
             const Function* fn = registry().find("cellSail", nid);
             REQUIRE(fn);
@@ -402,7 +418,8 @@ Run run(const std::string& flash, const Tree& tree, bool sony, int script)
     else if (script == 2) script_open(sc, true);
     else if (script == 3) script_reader(sc);
     else if (script == 4) script_reader_games_calls(sc);
-    else script_reader_failures(sc);
+    else if (script == 5) script_reader_failures(sc);
+    else script_stream(sc, script == 7);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     // The game's file calls' log: the registers past a call's arguments hold what the caller's code last left there.
     for (u32 i = 0; i < ps_read32(b, kFileLog); i++) {
@@ -447,7 +464,7 @@ void script_open(Script& sc, bool games_calls)
         call("cellSailPlayerGetParameter", {kP, 33, kOut + 0xC0, kOut + 0xF8});
     }
     call("cellSailPlayerBoot", {kP, 0x55});
-    sc.until([&] { return b[kP + 0x163] == 2; });
+    sc.until([&] { return atomic_load_u8(b, kP + 0x163) == 2; });
 
     // The file is not there: makeup, ReadSync's error, cleanup.
     call("cellSailPlayerCreateDescriptor", {kP, 0, kMedia, kUriNone, kOut});
@@ -730,6 +747,66 @@ void script_reader_failures(Script& sc)
     sc.mask_source(false);
 }
 
+// OpenStream and CloseStream (D-562 part 13) of a player without streams through the built-in source: the control
+// thread tells it to open (the reader opens the file and answers, message 0x29 completing the step) and to close.
+// `games_calls`: through the game's file calls, whose open fails once the descriptor is open, so the stream does not
+// open (CANCEL).
+void script_stream(Script& sc, bool games_calls)
+{
+    u8* b = sc.b;
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return sc.call(n, a, v); };
+    const auto until_state = [&](u8 st) {
+        sc.until([&] { return atomic_load_u8(b, kP + 0x163) == st; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the call's completion event after it
+    };
+    // cellDmux keeps the pipeline's callback (each side's own code) at +0x1C of its memory, the first the open takes.
+    const auto mask_dmux_callback = [&] { sc.mask.push_back({((ps_read32(b, kHeapPtr) + 0x7F) & ~0x7Fu) + 0x1C, 4}); };
+    g_caller_stacks_differ = games_calls;
+    call("cellSailPlayerInitialize", {kP, 0, kMem, opd(kHandler), 0x22, 0, 0, 0, 0});
+    if (games_calls) call("cellSailPlayerSetParameter", {kP, 33, kCalls, 0x28});
+    call("cellSailPlayerBoot", {kP, 0});
+    until_state(2);
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kMedia, kUriMovie, kOut});
+    const u32 d0 = ps_read32(b, kOut);
+    call("cellSailDescriptorOpen", {d0});
+    call("cellSailPlayerAddDescriptor", {kP, d0});
+    if (games_calls) answer(b, 1, 0x80010006); // the file gone by the time the stream opens
+    mask_dmux_callback();
+    call("cellSailPlayerOpenStream", {kP, 0x123456789ull});
+    if (games_calls) {
+        until_state(2);
+        answer(b, 1, 0);
+    } else {
+        until_state(4);
+        call("cellSailPlayerCloseStream", {kP, 0x987654321ull});
+        until_state(2);
+        // Again: the reader keeps the file it closed closed, opens it again.
+        call("cellSailPlayerCreateDescriptor", {kP, 0, kMedia, kUriMovie, kOut + 4});
+        const u32 d1 = ps_read32(b, kOut + 4);
+        call("cellSailDescriptorOpen", {d1});
+        call("cellSailPlayerAddDescriptor", {kP, d1});
+        mask_dmux_callback();
+        call("cellSailPlayerOpenStream", {kP, 0x55});
+        until_state(4);
+        call("cellSailPlayerCloseStream", {kP, 0x66});
+        until_state(2);
+    }
+    call("cellSailPlayerGetDescriptorCount", {kP});
+    call("cellSailPlayerFinalize", {kP});
+    g_caller_stacks_differ = false;
+    sc.mask_source(!games_calls);
+    sc.mask_booted();
+    if (games_calls) {
+        for (u32 i = 0; i < ps_read32(b, kFileLog); i++) {
+            const u32 e = kFileLog + 16 + 48 * i;
+            const u32 id = static_cast<u32>(ps_read64(b, e));
+            if (id == 1) sc.mask.push_back({e + 24, 8});
+            if (id == 4) sc.mask.push_back({e + 16, 8});
+            if (id == 5 || id == 6) sc.mask.push_back({e + 32, 8});
+        }
+    }
+}
+
 void compare_lines(const char* what, const std::vector<std::string>& mine, const std::vector<std::string>& sony)
 {
     usize differ = 0;
@@ -746,8 +823,8 @@ void compare_runs(int script)
     const std::optional<std::string> flash = test_dev_flash();
     if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
     const Tree tree;
-    const Run mine = run(*flash, tree, false, script);
-    const Run sony = run(*flash, tree, true, script);
+    const Run mine = run(flash, tree, false, script);
+    const Run sony = run(flash, tree, true, script);
     compare_lines("answer", mine.lines, sony.lines);
     compare_lines("lv2 call", mine.calls, sony.calls);
     if (std::getenv("SAIL_DIFF")) {
@@ -797,6 +874,59 @@ void compare_runs(int script)
 
 } // namespace
 
+// Without the firmware: the reader called directly (script 3) on pspocket's side alone, its messages and the data its
+// items delivered checked against the file itself (libsail's answers, which the comparison found).
+TEST_CASE("cellSail's file source: the reader called directly, without the firmware", "[hle][sail]")
+{
+    const Tree tree;
+    const Run r = run(std::nullopt, tree, false, 3);
+    const auto w = [&](u32 at) { return ps_read32(const_cast<u8*>(r.mem.data()), at - kArea); };
+    const auto w64 = [&](u32 at) { return ps_read64(const_cast<u8*>(r.mem.data()), at - kArea); };
+    const auto answer_of = [&](usize i) { return i < r.lines.size() ? r.lines[i] : std::string(); };
+    CHECK(answer_of(3) == "InquireCapability -> 0x80610701"); // start flags 1, the only start Start takes
+    CHECK(answer_of(4) == "InquireCapability -> 0x0");
+    CHECK(answer_of(10) == "ReadSync -> 0x80010006");
+    CHECK(answer_of(13) == "Checkout -> 0x806107ff");
+    CHECK(w(kOut) == 0);
+    CHECK(w64(kOut) == 0x71);
+    CHECK(w64(kOut + 0x10) == kMovieSize);
+    CHECK(w64(kOut + 0x18) == kSmallSize);
+    const std::vector<u8> movie = movie_bytes();
+    CHECK(std::memcmp(r.mem.data() + (kBuf - kArea), movie.data(), 0x800) == 0);
+    CHECK(std::memcmp(r.mem.data() + (kBuf + 0x800 - kArea), movie.data() + 0x1000, 0x100) == 0);
+    CHECK(std::memcmp(r.mem.data() + (kBuf + 0x1200 - kArea), movie.data() + 0x10, 0x80) == 0);
+    // The messages: {code, argument} (0x29 call completed, 0x01 stream out, 0x17 input EOS).
+    const std::vector<std::pair<u32, u32>> expected = {{0x29, 0}, {0x29, 0}, {0x29, 0}, {1, 1}, {1, 1}, {1, 1},
+        {0x17, 0}, {0x29, 1}, {0x29, 0}, {1, 1}, {0x17, 0}, {0x29, 0}, {0x29, 0x80010006}, {0x29, 0x80610701},
+        {0x29, 0}, {1, 1}, {1, 1}, {0x29, 0}, {0x29, 0}, {0x29, 0}, {0x29, 0}, {0x29, 1}, {0x29, 1},
+        {0x29, 0x80010006}, {0x29, 1}, {0x29, 0x806107F0}, {0x29, 0}, {0x29, 0}, {1, 1}, {1, 1}, {0x29, 0}, {0x29, 0}};
+    REQUIRE(w(kMsgLog) == expected.size());
+    for (u32 i = 0; i < expected.size(); i++) {
+        INFO(std::format("message {}", i));
+        CHECK(w(kMsgLog + 16 + 16 * i) == expected[i].first);
+        CHECK(w(kMsgLog + 28 + 16 * i) == expected[i].second);
+    }
+    // The items checked out: from 0x90 (Start from 0x80 after a Read of 0x80 bytes at 0x10, which the reader takes
+    // for its position), the second megabyte, the first again, the second again, then the range at 0x1000.
+    const auto fnv = [&](u32 from, u32 n) {
+        u32 h = 2166136261u;
+        for (u32 i = 0; i < n; i++) h = (h ^ movie[from + i]) * 16777619u;
+        return h;
+    };
+    const u32 sums[5][3] = {{0x100000, 0x55, fnv(0x90, 0x100000)}, {0x100000, 0x55, fnv(0x100090, 0x100000)},
+        {0x100000, 0x55, fnv(0x90, 0x100000)}, {0x100000, 0x55, fnv(0x100090, 0x100000)},
+        {0x1800, 0x66, fnv(0x1000, 0x1800)}};
+    REQUIRE(w(kSums) == 5);
+    for (u32 i = 0; i < 5; i++) {
+        INFO(std::format("item {}", i));
+        CHECK(w(kSums + 20 + 16 * i) == sums[i][0]);
+        CHECK(w(kSums + 24 + 16 * i) == sums[i][1]);
+        CHECK(w(kSums + 28 + 16 * i) == sums[i][2]);
+    }
+    // The buffers freed: four read-ahead buffers (Close, Close, Cleanup, Cleanup), then the player's block.
+    CHECK(w(kFreeLog) == 5);
+}
+
 TEST_CASE("cellSail's file source against libsail: descriptors opened through it", "[hle][lle][sail]")
 {
     compare_runs(1);
@@ -817,4 +947,15 @@ TEST_CASE("cellSail's file source against libsail: the reader through the game's
 TEST_CASE("cellSail's file source against libsail: the reader's failures and timeouts", "[hle][lle][sail]")
 {
     compare_runs(5);
+}
+
+TEST_CASE("cellSail's file source against libsail: OpenStream and CloseStream through it", "[hle][lle][sail]")
+{
+    compare_runs(6);
+}
+
+TEST_CASE("cellSail's file source against libsail: OpenStream through the game's file calls, the file gone",
+    "[hle][lle][sail]")
+{
+    compare_runs(7);
 }

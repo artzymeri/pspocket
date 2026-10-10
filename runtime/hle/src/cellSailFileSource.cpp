@@ -1,4 +1,4 @@
-// cellSail's built-in file source (D-564): the source libsail (fw 4.92) registers for the "x-cell-fs" protocol in every
+// cellSail's built-in file source (D-901): the source libsail (fw 4.92) registers for the "x-cell-fs" protocol in every
 // player, read from libsail's code and compared with it running on pspocket (tests/hle/test_sail_source.cpp).
 //
 // The source is 0x138 bytes in the player's block: its reader's state, the CellSailSource it registers (+0x40, its
@@ -42,6 +42,8 @@ constexpr u32 kCommand = 0, kReady = 1, kTake = 2, kFill = 3, kState = 4, kFd = 
               kLength = 0xE8, kStart = 0xF0, kSession = 0xF8, kReadArgs = 0xFC, kCalls = fsrc::kCalls;
 constexpr u32 kItemSize = 16, kBufferSize = 0x200000, kChunkSize = 0x100000;
 } // namespace fs
+// The reader writes the items ready, the descriptor and (Clear) the next item out without the lock, and reads the items'
+// buffers without it, as libsail does; pspocket makes those accesses atomic on both sides (D-585).
 
 // The file calls, by their word in the source's +0x100.
 enum FileCall : u32 { kOpen = 1, kAfterOpen = 2, kClose = 3, kFstat = 4, kRead = 5, kLseek = 6, kCancel = 7 };
@@ -59,21 +61,6 @@ constexpr u64 kSecond = 1000000;
 
 // The internal functions libsail hands out by descriptor.
 u32 internal(std::string_view name) { return HleProcess::current()->link_function("cellSail", recomp::nid_of(name), name); }
-
-// A function of pspocket's own `module`, called as libsail calls its import.
-u64 native(PPUContext& ctx, std::string_view module, std::string_view name, std::initializer_list<u64> args)
-{
-    const Function* f = registry().find(module, recomp::nid_of(name));
-    if (!f) PS_FATAL(kChan, "{}::{}, which libsail calls, is not pspocket's", module, name);
-    u64 saved[8];
-    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
-    u32 i = 3;
-    for (const u64 a : args) ctx.gpr[i++] = a;
-    f->fn(ctx, gb(ctx));
-    const u64 r = ctx.gpr[3];
-    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
-    return r;
-}
 
 u64 sx(s32 v) { return static_cast<u64>(static_cast<s64>(v)); }
 
@@ -121,13 +108,13 @@ bool loads_modules(PPUContext& ctx)
 s32 load_module(PPUContext& ctx, u32 id)
 {
     if (!loads_modules(ctx)) return lv2::CELL_OK;
-    return static_cast<s32>(native(ctx, "cellSysmodule", "cellSysmoduleLoadModule", {id}));
+    return static_cast<s32>(module_call(ctx, "cellSysmodule", "cellSysmoduleLoadModule", {id}));
 }
 
 s32 unload_module(PPUContext& ctx, u32 id)
 {
     if (!loads_modules(ctx)) return lv2::CELL_OK;
-    return static_cast<s32>(native(ctx, "cellSysmodule", "cellSysmoduleUnloadModule", {id}));
+    return static_cast<s32>(module_call(ctx, "cellSysmodule", "cellSysmoduleUnloadModule", {id}));
 }
 
 // The source's lwmutex and lwcond (sysPrxForUser's).
@@ -166,37 +153,30 @@ s32 file_call(PPUContext& ctx, u32 s, FileCall which, std::initializer_list<u64>
 }
 
 // The notifications, the CellSailSource's (cellSail.cpp's).
-void notify(PPUContext& ctx, u32 s, std::string_view name, std::initializer_list<u64> args)
+void completed(PPUContext& ctx, u32 s, s32 r)
 {
-    const Function* f = registry().find("cellSail", recomp::nid_of(name));
-    PS_CHECK(f != nullptr);
-    u64 saved[8];
-    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
-    ctx.gpr[3] = s + fs::kSource;
-    u32 i = 4;
-    for (const u64 a : args) ctx.gpr[i++] = a;
-    f->fn(ctx, gb(ctx));
-    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
+    module_call(ctx, "cellSail", "cellSailSourceNotifyCallCompleted", {s + fs::kSource, sx(r)});
 }
-void completed(PPUContext& ctx, u32 s, s32 r) { notify(ctx, s, "cellSailSourceNotifyCallCompleted", {sx(r)}); }
 void session_error(PPUContext& ctx, u32 s, s32 r, u8 terminated)
 {
-    notify(ctx, s, "cellSailSourceNotifySessionError", {sx(r), terminated});
+    module_call(ctx, "cellSail", "cellSailSourceNotifySessionError", {s + fs::kSource, sx(r), terminated});
 }
 void media_state(PPUContext& ctx, u32 s, s32 state)
 {
-    notify(ctx, s, "cellSailSourceNotifyMediaStateChanged", {sx(state)});
+    module_call(ctx, "cellSail", "cellSailSourceNotifyMediaStateChanged", {s + fs::kSource, sx(state)});
 }
+void stream_out(PPUContext& ctx, u32 s) { module_call(ctx, "cellSail", "cellSailSourceNotifyStreamOut", {s + fs::kSource, 1}); }
+void input_eos(PPUContext& ctx, u32 s) { module_call(ctx, "cellSail", "cellSailSourceNotifyInputEos", {s + fs::kSource}); }
 
 // The read-ahead buffer back to the player's allocator (free(arg, 0x80, buffer)).
 void free_buffer(PPUContext& ctx, u32 s)
 {
-    if (const u32 buf = r32(ctx, s + fs::kItems)) {
+    if (const u32 buf = atomic_load_be32(gb(ctx), s + fs::kItems)) {
         const u32 p = r32(ctx, s + fs::kSource);
         call_guest(ctx, r32(ctx, p + pl::kFree), {r32(ctx, p + pl::kAllocArg), 0x80, buf});
     }
-    w32(ctx, s + fs::kItems + fs::kItemSize, 0);
-    w32(ctx, s + fs::kItems, 0);
+    atomic_store_be32(gb(ctx), s + fs::kItems + fs::kItemSize, 0);
+    atomic_store_be32(gb(ctx), s + fs::kItems, 0);
 }
 
 // Opens `path` read-only through the open call ({path, 0, &fd, 0, 0}), then the call after it when there is one
@@ -216,7 +196,7 @@ s32 open_file(PPUContext& ctx, u32 s, u32 path, u32 out)
         if (r < 0) return r;
         fd = r32(ctx, fdv);
     }
-    w32(ctx, out, fd);
+    atomic_store_be32(gb(ctx), out, fd);
     return r;
 }
 
@@ -259,11 +239,11 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
     w32(ctx, s + fs::kState, kClosed);
     w32(ctx, s + fs::kPath, path);
     w8(ctx, s + fs::kCommand, 0xFF);
-    const auto fd = [&] { return r32(ctx, s + fs::kFd); };
+    const auto fd = [&] { return atomic_load_be32(gb(ctx), s + fs::kFd); };
     const auto fdx = [&] { return sx(static_cast<s32>(fd())); };
     const auto close_fd = [&] {
         const s32 r = file_call(ctx, s, kClose, {fdx()});
-        w32(ctx, s + fs::kFd, 0);
+        atomic_store_be32(gb(ctx), s + fs::kFd, 0);
         return r;
     };
     u64 timeout = 0, remaining = 0, position = 0, start = 0;
@@ -278,7 +258,7 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
             if (r < 0) break;
             s32 cmd = static_cast<s8>(r8(ctx, s + fs::kCommand));
             if (cmd == kNone) {
-                if (state == kStarted && timeout == 0 && static_cast<s8>(r8(ctx, s + fs::kReady)) <= 1) {
+                if (state == kStarted && timeout == 0 && static_cast<s8>(atomic_load_u8(gb(ctx), s + fs::kReady)) <= 1) {
                     cmd = kCmdFill;
                 } else {
                     for (;;) {
@@ -331,12 +311,12 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
                 break;
             }
             if (cmd == kCmdClear) {
-                w8(ctx, s + fs::kTake, 0);
+                atomic_store_u8(gb(ctx), s + fs::kTake, 0);
                 w8(ctx, s + fs::kFill, 0);
-                w8(ctx, s + fs::kReady, 0);
+                atomic_store_u8(gb(ctx), s + fs::kReady, 0);
                 continue;
             }
-            if (cmd == kCmdCheckin) w8(ctx, s + fs::kReady, static_cast<u8>(r8(ctx, s + fs::kReady) - 1));
+            if (cmd == kCmdCheckin) atomic_store_u8(gb(ctx), s + fs::kReady, static_cast<u8>(atomic_load_u8(gb(ctx), s + fs::kReady) - 1));
             if (cmd == kCmdRead) {
                 // In the closed state the file read stays open for an Open of the same path (the position after it:
                 // the size read, not the offset and the size).
@@ -349,7 +329,7 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
                 if (got >= 0 && keep) {
                     lv2_lib(ctx, "_sys_strncpy", {path, uri + 12, 287});
                     w8(ctx, path + 286, 0);
-                    w32(ctx, s + fs::kFd, static_cast<u32>(got));
+                    atomic_store_be32(gb(ctx), s + fs::kFd, static_cast<u32>(got));
                     answer = 0;
                     position = size;
                 }
@@ -367,7 +347,7 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
                             break;
                         }
                         file_call(ctx, s, kClose, {fdx(), 0});
-                        w32(ctx, s + fs::kFd, 0);
+                        atomic_store_be32(gb(ctx), s + fs::kFd, 0);
                     }
                     position = 0;
                     completed(ctx, s, open_file(ctx, s, path, s + fs::kFd));
@@ -422,7 +402,7 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
                     if (!fd() || r8(ctx, s + fs::kPathChanged) != 0) {
                         if (fd()) {
                             file_call(ctx, s, kClose, {fdx(), 0});
-                            w32(ctx, s + fs::kFd, 0);
+                            atomic_store_be32(gb(ctx), s + fs::kFd, 0);
                         }
                         position = 0;
                         opened = open_file(ctx, s, path, s + fs::kFd);
@@ -452,7 +432,7 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
             case kCmdReopen: {
                 const s32 e = open_file(ctx, s, r32(ctx, s + fs::kPath), s + fs::kFd);
                 if (static_cast<u32>(e) == lv2::CELL_ENOTMOUNTED) {
-                    w32(ctx, s + fs::kFd, 0);
+                    atomic_store_be32(gb(ctx), s + fs::kFd, 0);
                 } else if (e < 0) {
                     session_error(ctx, s, e, 1);
                     timeout = 0;
@@ -474,14 +454,14 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
             }
             default: {
                 // Fill the next item while one is free.
-                if (static_cast<s8>(r8(ctx, s + fs::kReady)) > 1) break;
+                if (static_cast<s8>(atomic_load_u8(gb(ctx), s + fs::kReady)) > 1) break;
                 const u64 chunk = r32(ctx, s + fs::kChunk);
                 const u64 n = remaining <= chunk ? remaining : chunk;
                 u64 got = 0;
                 if (n) {
                     w64(ctx, var, 0);
                     const u32 item = s + fs::kItems + fs::kItemSize * static_cast<s8>(r8(ctx, s + fs::kFill));
-                    const s32 e = file_call(ctx, s, kRead, {fdx(), r32(ctx, item), n, var});
+                    const s32 e = file_call(ctx, s, kRead, {fdx(), atomic_load_be32(gb(ctx), item), n, var});
                     if (e < 0) {
                         if (static_cast<u32>(e) == lv2::CELL_EIO &&
                             static_cast<u32>(file_call(ctx, s, kFstat, {fdx(), stat})) == lv2::CELL_EBADF) {
@@ -502,14 +482,14 @@ void _pspocket_cellSail_srcThread(PPUContext& ctx, u64 arg)
                         w32(ctx, item + 4, static_cast<u32>(got));
                         w32(ctx, item + 8, session);
                         w8(ctx, s + fs::kFill, static_cast<u8>((static_cast<s8>(r8(ctx, s + fs::kFill)) + 1) % 2));
-                        w8(ctx, s + fs::kReady, static_cast<u8>(r8(ctx, s + fs::kReady) + 1));
-                        notify(ctx, s, "cellSailSourceNotifyStreamOut", {1});
+                        atomic_store_u8(gb(ctx), s + fs::kReady, static_cast<u8>(atomic_load_u8(gb(ctx), s + fs::kReady) + 1));
+                        stream_out(ctx, s);
                         break;
                     }
                 }
                 // The length read, or the file's end.
                 timeout = kSecond;
-                notify(ctx, s, "cellSailSourceNotifyInputEos", {});
+                input_eos(ctx, s);
                 w32(ctx, s + fs::kState, kOpened);
                 break;
             }
@@ -532,15 +512,11 @@ s32 _pspocket_cellSail_srcMakeup(PPUContext& ctx, u32 s, u32 /*protocol*/)
 {
     s32 r = load_module(ctx, 0xE);
     if (r < 0) return r;
-    Frame f(ctx, 192);
-    const u32 mattr = f.at(120), cattr = f.at(112);
-    w32(ctx, mattr, 2);    // SYS_SYNC_PRIORITY
-    w32(ctx, mattr + 4, 0x20); // not recursive
-    std::memcpy(gb(ctx) + mattr + 8, "_saifs0", 8);
-    r = static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_create", {s + fs::kMutex, mattr}));
+    r = make_lwmutex(ctx, s + fs::kMutex, "_saifs0");
     if (r >= 0) {
-        std::memcpy(gb(ctx) + cattr, "_saifs0", 8);
-        r = static_cast<s32>(lv2_lib(ctx, "sys_lwcond_create", {s + fs::kCond, s + fs::kMutex, cattr}));
+        StackVar cattr(ctx, gb(ctx), 16); // sys_lwcond_attribute_t: the name
+        std::memcpy(gb(ctx) + cattr.addr(), "_saifs0", 8);
+        r = static_cast<s32>(lv2_lib(ctx, "sys_lwcond_create", {s + fs::kCond, s + fs::kMutex, cattr.addr()}));
         if (r >= 0) {
             r = lock(ctx, s);
             if (r >= 0) {
@@ -560,7 +536,7 @@ s32 _pspocket_cellSail_srcMakeup(PPUContext& ctx, u32 s, u32 /*protocol*/)
             }
             lv2_lib(ctx, "sys_lwcond_destroy", {s + fs::kCond});
         }
-        lv2_lib(ctx, "sys_lwmutex_destroy", {s + fs::kMutex});
+        destroy_lwmutex(ctx, s + fs::kMutex);
     }
     unload_module(ctx, 0xE);
     return r;
@@ -573,13 +549,13 @@ s32 _pspocket_cellSail_srcCleanup(PPUContext& ctx, u32 s)
 {
     Frame f(ctx, 176);
     lock(ctx, s);
-    if (const u32 fd = r32(ctx, s + fs::kFd)) file_call(ctx, s, kCancel, {sx(static_cast<s32>(fd))});
+    if (const u32 fd = atomic_load_be32(gb(ctx), s + fs::kFd)) file_call(ctx, s, kCancel, {sx(static_cast<s32>(fd))});
     const s32 r = post_command(ctx, s, kCmdEnd);
     unlock(ctx, s);
     if (r >= 0) sc(ctx, 44, {r64(ctx, s + fs::kThread), f.at(112)}); // sys_ppu_thread_join
     free_buffer(ctx, s);
     lv2_lib(ctx, "sys_lwcond_destroy", {s + fs::kCond});
-    lv2_lib(ctx, "sys_lwmutex_destroy", {s + fs::kMutex});
+    destroy_lwmutex(ctx, s + fs::kMutex);
     unload_module(ctx, 0xE);
     w32(ctx, s + fs::kPath, 0);
     w32(ctx, s + fs::kState, kEnded);
@@ -608,7 +584,7 @@ void _pspocket_cellSail_srcOpen(PPUContext& ctx, u32 s, s32 /*type*/, u32 /*medi
                 w8(ctx, s + fs::kPathChanged, 1);
             }
             r = 0;
-            if (!r32(ctx, s + fs::kItems)) {
+            if (!atomic_load_be32(gb(ctx), s + fs::kItems)) {
                 const u32 p = r32(ctx, s + fs::kSource);
                 const u32 buf = static_cast<u32>(call_guest(ctx, r32(ctx, p + pl::kAlloc),
                     {r32(ctx, p + pl::kAllocArg), 0x80, fs::kBufferSize}));
@@ -617,9 +593,9 @@ void _pspocket_cellSail_srcOpen(PPUContext& ctx, u32 s, s32 /*type*/, u32 /*medi
                     w8(ctx, s + fs::kPathChanged, 1);
                     r = error(CELL_SAIL_ERROR_MEMORY);
                 }
-                w32(ctx, s + fs::kItems + fs::kItemSize, buf + fs::kChunkSize);
+                atomic_store_be32(gb(ctx), s + fs::kItems + fs::kItemSize, buf + fs::kChunkSize);
                 w32(ctx, s + fs::kChunk, fs::kChunkSize);
-                w32(ctx, s + fs::kItems, buf);
+                atomic_store_be32(gb(ctx), s + fs::kItems, buf);
             }
             signal(ctx, s);
         }
@@ -633,7 +609,7 @@ void _pspocket_cellSail_srcClose(PPUContext& ctx, u32 s)
 {
     s32 r = lock(ctx, s);
     if (r >= 0) {
-        if (const u32 fd = r32(ctx, s + fs::kFd)) file_call(ctx, s, kCancel, {sx(static_cast<s32>(fd))});
+        if (const u32 fd = atomic_load_be32(gb(ctx), s + fs::kFd)) file_call(ctx, s, kCancel, {sx(static_cast<s32>(fd))});
         r = post_command(ctx, s, kCmdClose);
         if (r > 0) r = 0;
         unlock(ctx, s);
@@ -677,7 +653,7 @@ void _pspocket_cellSail_srcStart(PPUContext& ctx, u32 s, u32 command, u32 sessio
 void _pspocket_cellSail_srcStop(PPUContext& ctx, u32 s)
 {
     s32 r = lock(ctx, s);
-    if (const u32 fd = r32(ctx, s + fs::kFd)) file_call(ctx, s, kCancel, {sx(static_cast<s32>(fd))});
+    if (const u32 fd = atomic_load_be32(gb(ctx), s + fs::kFd)) file_call(ctx, s, kCancel, {sx(static_cast<s32>(fd))});
     const s32 posted = post_command(ctx, s, kCmdStop);
     if (posted < 0) r = posted;
     else if (r > 0) r = 0;
@@ -694,14 +670,14 @@ s32 _pspocket_cellSail_srcCheckout(PPUContext& ctx, u32 s, u32 item)
 {
     s32 r = lock(ctx, s);
     if (r < 0) return r;
-    if (static_cast<s8>(r8(ctx, s + fs::kReady)) <= 0) {
+    if (static_cast<s8>(atomic_load_u8(gb(ctx), s + fs::kReady)) <= 0) {
         r = error(CELL_SAIL_ERROR_FATAL);
     } else if (!usable(ctx, item, 4, "item pointer")) {
         r = error(CELL_SAIL_ERROR_INVALID_ARG);
     } else {
-        const s32 take = static_cast<s8>(r8(ctx, s + fs::kTake));
+        const s32 take = static_cast<s8>(atomic_load_u8(gb(ctx), s + fs::kTake));
         w32(ctx, item, s + fs::kItems + fs::kItemSize * static_cast<u32>(take));
-        w8(ctx, s + fs::kTake, static_cast<u8>((take + 1) % 2));
+        atomic_store_u8(gb(ctx), s + fs::kTake, static_cast<u8>((take + 1) % 2));
     }
     unlock(ctx, s);
     return r;
@@ -779,7 +755,7 @@ s32 _pspocket_cellSail_srcInquireCapability(PPUContext& ctx, u32, s32, u32, u32,
 // libsail's own file calls: cellFs's, the registers passed on as they are.
 s32 fs_call(PPUContext& ctx, std::string_view name)
 {
-    return static_cast<s32>(native(ctx, "sys_fs", name,
+    return static_cast<s32>(module_call(ctx, "sys_fs", name,
         {ctx.gpr[3], ctx.gpr[4], ctx.gpr[5], ctx.gpr[6], ctx.gpr[7], ctx.gpr[8], ctx.gpr[9], ctx.gpr[10]}));
 }
 s32 _pspocket_cellSail_fsOpen(PPUContext& ctx) { return fs_call(ctx, "cellFsOpen"); }
@@ -814,12 +790,12 @@ s32 builtin_source_init(PPUContext& ctx, u32 s)
     // CellSailSourceFuncs, on the stack where libsail's is its data (cellSailSourceInitialize copies it).
     StackVar funcs(ctx, b, 0x38);
     for (u32 i = 0; i < 14; i++) w32(ctx, funcs.addr() + 4 * i, internal(kFuncs[i]));
-    return static_cast<s32>(native(ctx, "cellSail", "cellSailSourceInitialize", {s + fsrc::kSource, funcs.addr(), s}));
+    return static_cast<s32>(module_call(ctx, "cellSail", "cellSailSourceInitialize", {s + fsrc::kSource, funcs.addr(), s}));
 }
 
 void builtin_source_fini(PPUContext& ctx, u32 s)
 {
-    native(ctx, "cellSail", "cellSailSourceFinalize", {s + fsrc::kSource});
+    module_call(ctx, "cellSail", "cellSailSourceFinalize", {s + fsrc::kSource});
 }
 
 s32 builtin_source_set_file_calls(PPUContext& ctx, u32 s, u32 calls)
