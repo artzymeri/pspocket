@@ -345,12 +345,23 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   demuxer's lv2 thread; the SPU side's host thread sleeps 1.5 ms after each new stream (RPCS3's delay for White Knight
   Chronicles II). The raw elementary stream core (g_cell_dmux_core_ops_raw_es, which other firmware modules use) is
   not pspocket's: only libdmux's PAMF core is.
-- **cellVdec (D-196):** Sony's item and information rings are 16 long in pspocket (Sony's length not known: decode
-  more than 16 pictures in the probe to find it); the frame buffers' place and count are pspocket's; Sony's RGB rounding
-  (9% of values one step off) could come from libvdec's conversion code; the H.264 information's fields past RPCS3's
-  structure are inferred from two streams (try a stream with picture order count type 0, cropping, no VUI); VC-1,
-  DivX 3.11 and MVC need FFmpeg decoders (vc1, msmpeg4v3: LGPL) and a comparison; MPEG-2 needs a synthetic writer to be
-  compared. Speed on a real movie: FFmpeg on one thread, then VideoToolbox for H.264.
+- **cellVdec (D-196, D-588 to D-590):** Sony's item and information rings are 16 long in pspocket (Sony's length not
+  known: decode more than 16 pictures in the probe to find it; the memory size formula, RPCS3's and Sony's, counts 48
+  item and information pairs for H.264 and MVC and 32 for the others, a hint); the frame buffers' place and count are
+  pspocket's; Sony's RGB rounding (9% of values one step off) could come from libvdec's conversion code; the H.264
+  information's fields past RPCS3's structure are inferred from two streams (try a stream with picture order count
+  type 0, cropping, no VUI); MPEG-2 needs a synthetic writer to be compared. DivX 3.11 (FFmpeg's msmpeg4v3, its frame
+  size from the codec specific information), VC-1's advanced profile (vc1, its sequence header and entry point as the
+  decoder's configuration, range mapping applied) and MVC's base view (H.264 without the other views' NAL units)
+  decode now, none compared with Sony's yet. **Try (on the Mac, with the firmware; build-ffmpeg.sh run again first,
+  for the new decoders):** test_vdec_codecs.cpp's streams (DivX 3.11 and MPEG-4 from FFmpeg's encoders in
+  build/ffmpeg/<host>-tests, VC-1 from vc1_writer.hpp, two-view MVC from h264_writer.hpp) through Sony's libvdec as
+  test_vdec.cpp's comparison runs: the information blocks (CellVdecDivxInfo's fields, CellVdecVc1Info's layout, which
+  is pspocket's own, CellVdecMvcInfo, written as H.264's), where libdivx311dec takes DivX 3.11's frame size from,
+  whether libsvc1d applies VC-1's range mapping, what libmvcdec gives of the second view, VC-1 access units before a
+  sequence header; then the framing of VC-1's simple and main profiles (refused now). Still not decoded: MVC's second
+  view (no MVC decoder in FFmpeg). Speed on a real movie: FFmpeg on one thread, then VideoToolbox for H.264 and MVC's
+  base view.
 - **cellAdec (D-197, D-198, D-577 to D-579):** the LPCM and ATRAC3plus decoders run on a PPU thread of their own per
   decoder (libadec and libatxdec use SPURS tasks); the LPCM conversion is scalar (RPCS3's is SIMD: measure on a real
   Blu-ray LPCM stream before changing). ATRAC3plus decodes 12.9 s of sound in 0.79 s on the M4 including the test's
