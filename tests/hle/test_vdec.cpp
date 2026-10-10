@@ -16,6 +16,7 @@
 
 #include "firmware_compare.hpp"
 #include "h264_writer.hpp"
+#include "pspocket/recomp/nid.hpp"
 #include "vdec_hw.hpp"
 #include "vdec_test_util.hpp"
 
@@ -383,6 +384,184 @@ TEST_CASE("cellVdec tests: the synthetic H.264 decodes to its own samples (FFmpe
     av_frame_free(&frame);
     av_packet_free(&pkt);
     avcodec_free_context(&ctx);
+}
+
+// ---- cellVdecOpenExt, cellVdecSetPts, cellVdecDecodeAuEx2 (D-596): RPCS3's, unverified (D-594).
+
+namespace {
+
+// A decoder's life over four 64x64 H.264 access units, opened by Open and fed by DecodeAu, or opened by OpenExt on its
+// CellVdecResourceExt and fed by DecodeAuEx2 (the two words RPCS3 does not know set on odd access units): what it
+// shows, as vdec_test::decode_stream records it.
+Decoded ext_life(u8* b, const Call& call, bool ext)
+{
+    Decoded d;
+    const auto r = [&](const char* name, u32 nid, std::initializer_list<u64> args) {
+        const u32 v = call(name, nid, args);
+        d.lines.push_back(std::format("{} -> {:#x}", name, v));
+        return v;
+    };
+    write_callback(b);
+    std::memset(b + kArgs, 0, 0x200);
+    ps_write32(b, kType, 1);      // H.264
+    ps_write32(b, kType + 4, 21); // level 2.1
+    REQUIRE(call("cellVdecQueryAttr", 0xFF6F6EBE, {kType, kAttr}) == 0);
+    const u32 mem_size = ps_read32(b, kAttr);
+    ps_write32(b, kCb, kOpd);
+    ps_write32(b, kCb + 4, kLog);
+    if (ext) {
+        // CellVdecResourceExt: memAddr, memSize, ppuThreadPriority, ppuThreadStackSize, 12 bytes, numOfSpus.
+        const u32 res[4] = {kDecoderMem, mem_size, 1000, 0x4000};
+        for (u32 i = 0; i < 4; i++) ps_write32(b, kRes + 4 * i, res[i]);
+        std::memset(b + kRes + 16, 0xAB, 12);
+        ps_write32(b, kRes + 0x1C, 1);
+        d.open = r("cellVdecOpenExt", 0xEF4D8AD7, {kType, kRes, kCb, kHandle});
+    } else {
+        const u32 res[6] = {kDecoderMem, mem_size, 1000, 0x4000, 200, 1};
+        for (u32 i = 0; i < 6; i++) ps_write32(b, kRes + 4 * i, res[i]);
+        d.open = r("cellVdecOpen", 0xB6BBCD5D, {kType, kRes, kCb, kHandle});
+    }
+    if (d.open) return d;
+    const u32 handle = ps_read32(b, kHandle);
+    CHECK(handle == kDecoderMem);
+    REQUIRE(r("cellVdecStartSeq", 0xC757C2AA, {handle}) == 0);
+    for (u32 i = 0; i < 4; i++) {
+        const std::vector<u8> au = h::access_unit(h::pattern(kWidth, kHeight, static_cast<int>(i)), i & 1);
+        const u32 at = kStream + 0x10000 * i, size = static_cast<u32>(au.size());
+        std::memcpy(b + at, au.data(), au.size());
+        const u32 pts = 0x1000 + 3003 * i, dts = 0x800 + 3003 * i;
+        if (ext) {
+            // CellVdecAuInfoEx2: startAddr, a word, size, a word, pts, dts, userData, codecSpecificData.
+            const u32 words[8] = {at, (i & 1) ? 0x11111111u : 0, size, (i & 1) ? 0x22222222u : 0, 0, pts, 0, dts};
+            for (u32 k = 0; k < 8; k++) ps_write32(b, kAu + 4 * k, words[k]);
+            ps_write64(b, kAu + 0x20, 0xABCD0000 + u64{i});
+            ps_write64(b, kAu + 0x28, 0);
+            r("cellVdecDecodeAuEx2", 0x1533C6A9, {handle, 0, kAu});
+        } else {
+            const u32 words[6] = {at, size, 0, pts, 0, dts};
+            for (u32 k = 0; k < 6; k++) ps_write32(b, kAu + 4 * k, words[k]);
+            ps_write64(b, kAu + 0x18, 0xABCD0000 + u64{i});
+            ps_write64(b, kAu + 0x20, 0);
+            r("cellVdecDecodeAu", 0x2BF4DDD2, {handle, 0, kAu});
+        }
+        if (!wait_until([&] { return count_of(b, 0) >= i + 1; })) d.lines.push_back("no AUDONE");
+    }
+    u32 seen = count_of(b, 1);
+    for (int quiet = 0; quiet < 20; quiet++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const u32 now = count_of(b, 1);
+        if (now != seen) quiet = 0;
+        seen = now;
+    }
+    d.pictures_after_aus = seen;
+    r("cellVdecEndSeq", 0x824433F0, {handle});
+    if (!wait_until([&] { return count_of(b, 2) >= 1; })) d.lines.push_back("no SEQDONE");
+    for (;;) {
+        ps_write32(b, kItemOut, 0);
+        if (call("cellVdecGetPicItem", 0x17C702B9, {handle, kItemOut}) != 0) break;
+        const u32 item = ps_read32(b, kItemOut), info = ps_read32(b, item + 0x48), size = ps_read32(b, item + 8);
+        d.items.emplace_back(b + item, b + item + 0x4C);
+        d.infos.emplace_back(b + info, b + info + 0x244);
+        ps_write32(b, kFormat, 3); // YUV 4:2:0 planar
+        ps_write32(b, kFormat + 4, 0);
+        ps_write8(b, kFormat + 8, 0);
+        std::memset(b + kPicture, 0xCC, size + 0x100);
+        if (r("cellVdecGetPicture", 0x807C861A, {handle, kFormat, kPicture}) != 0) break;
+        d.pictures.emplace_back(b + kPicture, b + kPicture + size);
+    }
+    d.audone = count_of(b, 0);
+    d.picout = count_of(b, 1);
+    d.seqdone = count_of(b, 2);
+    r("cellVdecClose", 0x16698E83, {handle});
+    return d;
+}
+
+} // namespace
+
+TEST_CASE("cellVdec: OpenExt opens on its resource, SetPts' answers, DecodeAuEx2 decodes as DecodeAu does (D-596)",
+    "[hle][vdec]")
+{
+    const std::pair<const char*, u32> kExtFunctions[] = {{"cellVdecOpenExt", 0xEF4D8AD7}, {"cellVdecSetPts", 0x3CE2E4F8},
+        {"cellVdecDecodeAuEx2", 0x1533C6A9}};
+    for (const auto& [name, nid] : kExtFunctions) {
+        CHECK(recomp::nid_of(name) == nid);
+        CHECK(hle::registry().is_unverified("libvdec", nid));
+    }
+    for (const u32 nid : {0xB6BBCD5Du, 0x0053E2D8u, 0x2BF4DDD2u, 0x807C861Au, 0x17C702B9u, 0xE13EF6FCu})
+        CHECK_FALSE(hle::registry().is_unverified("libvdec", nid));
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const Call call = hle_calls(f, t);
+    constexpr u32 kArg = 0x80610101, kSeq = 0x80610102;
+
+    // The same decoder life both ways: every callback, item, information block and picture the same.
+    const Decoded want = ext_life(b, call, false);
+    const Decoded got = ext_life(b, call, true);
+    INFO(all_lines(got.lines));
+    REQUIRE(want.open == 0);
+    REQUIRE(got.open == 0);
+    CHECK(want.pictures.size() == 4);
+    CHECK(got.audone == want.audone);
+    CHECK(got.picout == want.picout);
+    CHECK(got.seqdone == want.seqdone);
+    CHECK(got.pictures_after_aus == want.pictures_after_aus);
+    CHECK(got.items == want.items);
+    CHECK(got.infos == want.infos);
+    CHECK(got.pictures == want.pictures);
+    REQUIRE(got.lines.size() == want.lines.size());
+    for (usize i = 0; i < got.lines.size(); i++) // the answers, the calls' names apart
+        CHECK(got.lines[i].substr(got.lines[i].find(" -> ")) == want.lines[i].substr(want.lines[i].find(" -> ")));
+
+    // OpenExt's refusals: no resource, one that is not guest memory, then Open's own checks on what it holds.
+    write_callback(b);
+    ps_write32(b, kType, 1);
+    ps_write32(b, kType + 4, 21);
+    REQUIRE(call("cellVdecQueryAttr", 0xFF6F6EBE, {kType, kAttr}) == 0);
+    const u32 res[8] = {kDecoderMem, ps_read32(b, kAttr), 1000, 0x4000, 0, 0, 0, 1};
+    const auto open_ext = [&](u32 type, u32 at) { return call("cellVdecOpenExt", 0xEF4D8AD7, {type, at, kCb, kHandle}); };
+    for (u32 i = 0; i < 8; i++) ps_write32(b, kRes + 4 * i, res[i]);
+    CHECK(open_ext(kType, 0) == kArg);
+    CHECK(open_ext(kType, 0xF0000000) == kArg);
+    CHECK(open_ext(0, kRes) == kArg);
+    ps_write32(b, kRes + 12, 0x800); // a stack under 4096 bytes
+    CHECK(open_ext(kType, kRes) == kArg);
+    ps_write32(b, kRes + 12, 0x4000);
+    ps_write32(b, kRes + 8, 3072); // a PPU priority past 3071
+    CHECK(open_ext(kType, kRes) == kArg);
+    ps_write32(b, kRes + 8, 1000);
+    REQUIRE(open_ext(kType, kRes) == 0);
+    const u32 handle = ps_read32(b, kHandle);
+
+    // SetPts: no decoder or no pointer ARG; an open decoder, in a sequence or not, CELL_OK; a closed one SEQ.
+    const auto set_pts = [&](u32 h, u32 p) { return call("cellVdecSetPts", 0x3CE2E4F8, {h, p}); };
+    CHECK(set_pts(handle + 0x100, kSpec) == kArg);
+    CHECK(set_pts(handle, 0) == kArg);
+    CHECK(set_pts(handle, kSpec) == 0);
+    // DecodeAuEx2: DecodeAu's answers (no information, no size or start, the decode modes, before a sequence).
+    const auto decode_ex2 = [&](u32 mode, u32 info) { return call("cellVdecDecodeAuEx2", 0x1533C6A9, {handle, mode, info}); };
+    const std::vector<u8> au = h::access_unit(h::pattern(kWidth, kHeight, 0), 0);
+    std::memcpy(b + kStream, au.data(), au.size());
+    std::memset(b + kAu, 0, 0x30);
+    ps_write32(b, kAu + 0, kStream);
+    ps_write32(b, kAu + 8, static_cast<u32>(au.size()));
+    CHECK(decode_ex2(0, kAu) == kSeq); // no sequence yet
+    REQUIRE(call("cellVdecStartSeq", 0xC757C2AA, {handle}) == 0);
+    CHECK(set_pts(handle, kSpec) == 0);
+    CHECK(decode_ex2(0, 0) == kArg);
+    CHECK(decode_ex2(0, 0xF0000000) == kArg);
+    CHECK(decode_ex2(3, kAu) == kArg); // B and PB skipping together: VC-1's only
+    CHECK(decode_ex2(5, kAu) == kArg);
+    ps_write32(b, kAu + 8, 0);
+    CHECK(decode_ex2(0, kAu) == kArg); // no size
+    ps_write32(b, kAu + 8, static_cast<u32>(au.size()));
+    ps_write32(b, kAu + 0, 0);
+    CHECK(decode_ex2(0, kAu) == kArg); // no start
+    REQUIRE(call("cellVdecClose", 0x16698E83, {handle}) == 0);
+    CHECK(set_pts(handle, kSpec) == kSeq);
+    ps_write32(b, kAu + 0, kStream);
+    CHECK(decode_ex2(0, kAu) == kSeq);
 }
 #endif
 

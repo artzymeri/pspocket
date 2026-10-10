@@ -263,6 +263,77 @@ TEST_CASE("LLE: a firmware-first library goes to its module when one is installe
     fs::remove_all(root);
 }
 
+// D-594: a function the host made from RPCS3 without Sony's module to compare it with (libvdec's cellVdecSetPts) is
+// unverified in a library whose other functions were compared (cellVdecOpen, cellVdecClose): an import of it goes to
+// the library's module when one is installed, for the game and for a module importing it, as an import of a function
+// the host lacks would; with no module, the host's serves it. Imports of only verified functions stay on the host
+// either way.
+TEST_CASE("LLE: an unverified function's import goes to its library's module when one is installed, to the host when "
+          "not", "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    const u32 open = recomp::nid_of("cellVdecOpen"), close = recomp::nid_of("cellVdecClose"),
+              set_pts = recomp::nid_of("cellVdecSetPts");
+    REQUIRE(hle::registry().find("libvdec", open));
+    REQUIRE(hle::registry().find("libvdec", close));
+    REQUIRE(hle::registry().find("libvdec", set_pts));
+    REQUIRE(hle::registry().is_unverified("libvdec", set_pts));
+    CHECK_FALSE(hle::registry().is_unverified("libvdec", open));
+    CHECK_FALSE(hle::registry().is_unverified("libvdec", close));
+    CHECK_FALSE(hle::registry().is_firmware_first("libvdec"));
+
+    const fs::path root = fresh_flash("pspocket-test-lle-unverified");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    const auto plain = test::build_ppu_prx();
+    write(external / "libvdec.sprx", debug_self(prx_exporting(plain, "libvdec", open)));
+    // Two modules importing two of libvdec's functions (their sysPrxForUser import renamed): one an unverified one.
+    const auto user = [&](std::string_view library, u32 exported, u32 first, u32 second) {
+        std::vector<u8> m = prx_exporting(plain, library, exported);
+        std::fill(m.begin() + 0x310, m.begin() + 0x320, u8{0});
+        std::memcpy(m.data() + 0x310, "libvdec", 7);
+        ps_st32(m.data() + 0x410, first);
+        ps_st32(m.data() + 0x414, second);
+        return m;
+    };
+    write(external / "libuser.sprx", debug_self(user("synthVdecUser", 0x66666666, open, set_pts)));
+    write(external / "libuser2.sprx", debug_self(user("synthVdecUser2", 0x77777777, open, close)));
+    const auto bound = [](u32) { return true; };
+    using Files = std::set<std::string, std::less<>>;
+
+    loader::LleModules lle((root / "dev_flash").string());
+    REQUIRE(lle.index());
+    CHECK_FALSE(lle.chooses("libvdec")); // before the per-game choice: the host has the library
+    lle.decide({Needs{"libvdec", {open, close}, {}}}, bound);
+    CHECK(lle.chosen_files().empty()); // verified functions only: the host's
+    CHECK_FALSE(lle.chooses("libvdec"));
+    lle.decide({Needs{"libvdec", {open, set_pts}, {}}}, bound);
+    CHECK(lle.chosen_files() == Files{"libvdec.sprx"}); // Sony's module, as when the host lacked cellVdecSetPts
+    CHECK(lle.chooses("libvdec"));
+    lle.decide({Needs{"synthVdecUser2", {0x77777777}, {}}}, bound);
+    CHECK(lle.chosen_files() == Files{"libuser2.sprx"}); // its libvdec imports from the host
+    CHECK_FALSE(lle.gaps().contains("libuser2.sprx"));
+    lle.decide({Needs{"synthVdecUser", {0x66666666}, {}}}, bound);
+    CHECK(lle.chosen_files() == Files{"libuser.sprx", "libvdec.sprx"});
+    // Both imports went to the module, which exports only cellVdecOpen: cellVdecSetPts is a gap though the host has it.
+    REQUIRE(lle.gaps().contains("libuser.sprx"));
+    CHECK(lle.gaps().at("libuser.sprx") ==
+        std::vector<std::string>{std::format("libvdec::{:#010x} (not exported by libvdec.sprx)", set_pts)});
+
+    fs::remove(external / "libvdec.sprx");
+    fs::remove(root / "lle-index.txt");
+    loader::LleModules without((root / "dev_flash").string());
+    REQUIRE(without.index());
+    without.decide({Needs{"libvdec", {open, set_pts}, {}}}, bound);
+    CHECK(without.chosen_files().empty()); // the host's, the unverified function included
+    CHECK_FALSE(without.chooses("libvdec"));
+    without.decide({Needs{"libvdec", {open, close}, {}}}, bound);
+    CHECK(without.chosen_files().empty());
+    without.decide({Needs{"synthVdecUser", {0x66666666}, {}}}, bound);
+    CHECK(without.chosen_files() == Files{"libuser.sprx"});
+    CHECK_FALSE(without.gaps().contains("libuser.sprx")); // libvdec's functions from the host
+    fs::remove_all(root);
+}
+
 TEST_CASE("LLE: a module's imported variable comes from the module that exports it, loaded for it", "[hle][lle]")
 {
     const fs::path root = fresh_flash("pspocket-test-lle-variables");

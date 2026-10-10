@@ -19,6 +19,10 @@
 // - Pictures to RGBA and ARGB use the colour matrix asked for (BT.601 or BT.709, limited range; RPCS3: a TODO), with
 //   the exact coefficients, truncated: within one step of Sony's values. UYVY repeats each chroma row, as Sony's.
 //
+// cellVdecOpenExt, cellVdecSetPts and cellVdecDecodeAuEx2 are RPCS3's (D-596) on this decoder, without Sony's module to
+// compare them with: they are unverified (D-594), so a game importing one still gets Sony's whole libvdec where the
+// system software is installed.
+//
 // Not yet (each fails loudly): VC-1's simple and main profiles (their sequence header travels outside the stream, and
 // how libsvc1d is given it is not known: open fails, logged), MVC's views past the base one (FFmpeg has no MVC
 // decoder: their NAL units are left out, logged once), the codec specific information of codecs other than H.264 in
@@ -826,6 +830,8 @@ struct Vdec {
     bool vc1_skip_logged = false;  // the decoder's thread
     bool vc1_other_logged = false; // under m
     bool mvc_logged = false;       // under m
+    bool set_pts_logged = false;   // under m (D-596)
+    bool au_ex2_logged = false;    // under m (D-596)
 #if PSPOCKET_HAVE_FFMPEG
     AVCodecContext* av = nullptr;
 #endif
@@ -1607,9 +1613,9 @@ s32 cellVdecEndSeq(PPUContext& ctx, u32 handle)
     return finish(lv2::CELL_OK, call);
 }
 
-s32 cellVdecDecodeAu(PPUContext& ctx, u32 handle, s32 mode, u32 au_info)
+// DecodeAu, and DecodeAuEx2 with its access unit information as a CellVdecAuInfo (D-596).
+s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::string& call)
 {
-    const std::string call = std::format("cellVdecDecodeAu({:#x}, {}, {:#x})", handle, mode, au_info);
     const std::shared_ptr<Vdec> v = live(ctx, handle);
     u8* base = guest_base(ctx);
     if (!v || !au_info || !usable(ctx, au_info, 0x28, call) || !ps_read32(base, au_info + 4) || !ps_read32(base, au_info))
@@ -1665,6 +1671,71 @@ s32 cellVdecDecodeAu(PPUContext& ctx, u32 handle, s32 mode, u32 au_info)
     v->pending_aus++;
     push_command(*v, std::move(c));
     return lv2::CELL_OK;
+}
+
+s32 cellVdecDecodeAu(PPUContext& ctx, u32 handle, s32 mode, u32 au_info)
+{
+    const std::string call = std::format("cellVdecDecodeAu({:#x}, {}, {:#x})", handle, mode, au_info);
+    return decode_au(ctx, handle, mode, au_info, call);
+}
+
+// ---- RPCS3's, unverified (D-594, D-596): rpcs3/Emu/Cell/Modules/cellVdec.cpp cellVdecOpenExt, cellVdecSetPts,
+// cellVdecDecodeAuEx2 and the structures RPCS3 calls speculative (cellVdec.h CellVdecResourceExt, CellVdecAuInfoEx2).
+
+// Open on CellVdecResourceExt: memAddr, memSize, ppuThreadPriority, ppuThreadStackSize, 12 bytes RPCS3 does not know,
+// numOfSpus (at 0x1C). RPCS3 opens with a CellVdecResource of those and an SPU priority of 0 (pspocket's decoder runs
+// on its PPU thread whatever the SPUs); no resource is ARG. The codec type is CellVdecType's, with no specific
+// information (Open's).
+s32 cellVdecOpenExt(PPUContext& ctx, u32 type, u32 res, u32 cb, u32 handle)
+{
+    const std::string call = std::format("cellVdecOpenExt({:#x}, {:#x}, {:#x}, {:#x})", type, res, cb, handle);
+    if (!res || !usable(ctx, res, 0x20, call)) return finish(error(CELL_VDEC_ERROR_ARG), call);
+    u8* base = guest_base(ctx);
+    StackVar resource(ctx, base, 0x18);
+    for (u32 i = 0; i < 4; i++) ps_write32(base, resource.addr() + 4 * i, ps_read32(base, res + 4 * i));
+    ps_write32(base, resource.addr() + 16, 0);
+    ps_write32(base, resource.addr() + 20, ps_read32(base, res + 0x1C));
+    return finish(open(ctx, type, 0, resource.addr(), cb, handle, call), call);
+}
+
+// RPCS3's checks and answers: no decoder or no pointer ARG, a closed decoder SEQ, else CELL_OK. What the PTS it is
+// given sets is not known (RPCS3 reads nothing of it and logs the call as an error): nothing is done with it, logged
+// once a decoder.
+s32 cellVdecSetPts(PPUContext& ctx, u32 handle, u32 pts)
+{
+    const std::string call = std::format("cellVdecSetPts({:#x}, {:#x})", handle, pts);
+    const std::shared_ptr<Vdec> v = live(ctx, handle);
+    if (!v || !pts) return finish(error(CELL_VDEC_ERROR_ARG), call);
+    std::lock_guard lk(v->m);
+    if (v->state == Seq::closed) return finish(error(CELL_VDEC_ERROR_SEQ), call);
+    if (!v->set_pts_logged)
+        PS_LOG_WARN(kChan, "{}: what it sets is not known (RPCS3 answers it and does nothing): ignored (logged once a "
+                           "decoder)", call);
+    v->set_pts_logged = true;
+    return finish(lv2::CELL_OK, call);
+}
+
+// DecodeAu on CellVdecAuInfoEx2: startAddr, a word RPCS3 does not know, size, another, pts, dts, userData,
+// codecSpecificData (0x30 bytes): RPCS3 decodes it as the CellVdecAuInfo of those (and so does pspocket, with
+// DecodeAu's checks and answers); the two unknown words are logged once a decoder when they are not 0.
+s32 cellVdecDecodeAuEx2(PPUContext& ctx, u32 handle, s32 mode, u32 au_info)
+{
+    const std::string call = std::format("cellVdecDecodeAuEx2({:#x}, {}, {:#x})", handle, mode, au_info);
+    if (!au_info || !usable(ctx, au_info, 0x30, call)) return finish(error(CELL_VDEC_ERROR_ARG), call);
+    u8* base = guest_base(ctx);
+    const u32 unknown[2] = {ps_read32(base, au_info + 4), ps_read32(base, au_info + 12)};
+    if (const std::shared_ptr<Vdec> v = live(ctx, handle); v && (unknown[0] || unknown[1])) {
+        std::lock_guard lk(v->m);
+        if (!v->au_ex2_logged)
+            PS_LOG_WARN(kChan, "{}: the words RPCS3 does not know are {:#x} and {:#x}: not used (logged once a decoder)",
+                call, unknown[0], unknown[1]);
+        v->au_ex2_logged = true;
+    }
+    StackVar info(ctx, base, 0x28);
+    ps_write32(base, info.addr() + 0, ps_read32(base, au_info + 0));
+    ps_write32(base, info.addr() + 4, ps_read32(base, au_info + 8));
+    for (u32 at = 0; at < 0x20; at += 4) ps_write32(base, info.addr() + 8 + at, ps_read32(base, au_info + 0x10 + at));
+    return decode_au(ctx, handle, mode, info.addr(), call);
 }
 
 s32 cellVdecGetPicItem(PPUContext& ctx, u32 handle, u32 item_out)
@@ -1754,6 +1825,10 @@ void register_libvdec(Registry& r)
         PS_HLE_FUNC(0xA21AA896, cellVdecGetPictureExt),
         PS_HLE_FUNC(0x17C702B9, cellVdecGetPicItem),
         PS_HLE_FUNC(0xE13EF6FC, cellVdecSetFrameRate),
+        // Made from RPCS3, not compared with Sony's libvdec (D-594, D-596).
+        PS_HLE_UNVERIFIED(0xEF4D8AD7, cellVdecOpenExt),
+        PS_HLE_UNVERIFIED(0x3CE2E4F8, cellVdecSetPts),
+        PS_HLE_UNVERIFIED(0x1533C6A9, cellVdecDecodeAuEx2),
         PS_HLE_INTERNAL(NID_vdec_thread, _pspocket_vdec_thread),
     });
 }
