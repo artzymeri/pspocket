@@ -221,7 +221,8 @@ void build_row(const u8* in, const Picture& p, u32 space, std::vector<u8>& out)
             else std::memset(dst + slot * bps, opaque, bps);
         };
         switch (space) {
-        case GRAYSCALE: put(0, comp[0]); break;
+        case GRAYSCALE:
+        case PALETTE: put(0, comp[0]); break; // an 8-bit index: one component (D-605: it fell to RGBA's four)
         case GRAYSCALE_ALPHA:
             put(0, comp[0]);
             put(1, p.space == GRAYSCALE_ALPHA ? comp[1] : nullptr);
