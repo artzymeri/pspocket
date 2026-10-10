@@ -8086,6 +8086,7 @@ libatxdec's, the tones at 2164 and 1303 Hz, the information block, PTS corrected
 sound unit of the wrong ID and a cut frame refused (AT3_ERROR), the next frame decoding; four parameter sets StartSeq
 refuses and joint stereo of two channels taken. cellAtrac with an ATRAC3 file of those frames and no firmware: it
 creates its decoder on pspocket's core and decodes 15,291 samples of the tones.
+
 ## D-580 · 2026-10-09 · PSN licences: a player's RAP to the content key, where pspocket looks for it; AES on every host
 
 The engine checklist's "PSN/NPDRM content" item. A game bought on PSN has its EBOOT.BIN and SPRX modules as NPDRM SELFs
