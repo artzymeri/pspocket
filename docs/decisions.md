@@ -9319,3 +9319,12 @@ calls an empty array's "${EXTRA[@]}" an unbound variable, so on the Mac (bash 3.
 and build/ffmpeg/macos kept the decoders of 2026-10-08, without D-588's VC-1 and DivX 3.11: cellVdec refused those
 codecs (CELL_VDEC_ERROR_ARG) and test_fuzz_media's VC-1 case failed on the Mac only. The script expands it as
 ${EXTRA[@]+"${EXTRA[@]}"}, which every bash takes; the Mac's macos, macos-tests and ios builds were made again with it.
+
+## D-910 · 2026-10-10 · cellSpursJq's comparison reads the pool's free lists as sets
+
+D-537's job comparison ends with the queue at rest, each descriptor class's record among its answers. A class's free
+list is a stack of blocks linked through their first words; jobs pushed with PushAndRelease give their descriptors back
+from the SPU as they end, in whatever order the policy module finishes them, so which block is on top varied between
+runs (class 7: head 0x110380 or 0x110000, two blocks free either way) and the test failed about one run in three with
+either PPU side. It now compares each free list as its count, wake-ups and waiters and the set of its blocks; six runs in
+a row agree.
