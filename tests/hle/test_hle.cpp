@@ -74,8 +74,10 @@ TEST_CASE("HLE NIDs match their names", "[hle]")
 {
     for (const hle::Function& f : hle::registry().functions()) {
         INFO(f.module << "::" << f.name);
-        // A function known only by its NID is named after it (RPCS3's REG_FNID names, e.g. cellSysutil_E1EC7B6A).
-        CHECK((f.nid == recomp::nid_of(f.name) || f.name.ends_with(std::format("_{:08X}", f.nid))));
+        // A function known only by its NID is named after it (RPCS3's REG_FNID names, e.g. cellSysutil_E1EC7B6A, and
+        // cellSysmodule_0x59521326).
+        CHECK((f.nid == recomp::nid_of(f.name) || f.name.ends_with(std::format("_{:08X}", f.nid)) ||
+            f.name.ends_with(std::format("_0x{:08X}", f.nid))));
     }
     CHECK(hle::registry().find("sysPrxForUser", recomp::nid_of("sys_initialize_tls")) != nullptr);
     // A variable's NID is its name's, or the one RPCS3 registers it under (REG_VNID: the codec cores' operation tables,

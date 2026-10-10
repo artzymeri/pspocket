@@ -26,8 +26,10 @@ set(PSPOCKET_RPCS3_DIR "${PSPOCKET_RPCS3_DIR_DEFAULT}" CACHE PATH "RPCS3 source 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(self_keys_output ${CMAKE_CURRENT_BINARY_DIR}/generated/self_keys.cpp)
 set(self_keys_depends ${CMAKE_SOURCE_DIR}/scripts/self-keys.py)
+# Also libsysmodule's key for its export 0x59521326 (D-639), from RPCS3's cellSysmodule.cpp.
 foreach(vault ${PSPOCKET_RPCS3_DIR}/rpcs3/Crypto/key_vault.cpp ${PSPOCKET_RPCS3_DIR}/Crypto/key_vault.cpp
-        ${PSPOCKET_RPCS3_DIR}/rpcs3/Crypto/key_vault.h ${PSPOCKET_RPCS3_DIR}/Crypto/key_vault.h)
+        ${PSPOCKET_RPCS3_DIR}/rpcs3/Crypto/key_vault.h ${PSPOCKET_RPCS3_DIR}/Crypto/key_vault.h
+        ${PSPOCKET_RPCS3_DIR}/rpcs3/Emu/Cell/Modules/cellSysmodule.cpp ${PSPOCKET_RPCS3_DIR}/Emu/Cell/Modules/cellSysmodule.cpp)
     if(PSPOCKET_RPCS3_DIR AND EXISTS ${vault})
         list(APPEND self_keys_depends ${vault})
     endif()

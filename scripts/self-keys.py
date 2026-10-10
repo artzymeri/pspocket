@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Writes the SELF key table the build carries (D-121) from RPCS3's Crypto/key_vault.cpp, and the firmware update
 packages' key (D-156), the NPD files' keys (D-165), the PSN licence keys (D-580) and the PS3 packages' keys (D-583)
-from key_vault.h.
+from key_vault.h, and libsysmodule's key for its export 0x59521326 (D-639) from Emu/Cell/Modules/cellSysmodule.cpp.
 
 usage: self-keys.py RPCS3_DIR OUT.cpp
 
@@ -37,6 +37,35 @@ def find_key_vault(root: pathlib.Path):
     return None
 
 
+def sysmodule_key(root: pathlib.Path) -> bytes:
+    """cellSysmodule.cpp's KEY_UNK (sixteen character or number constants), the key cellSysmodule_0x59521326 decrypts
+    the OpenPSID with (D-639); b"" when the file or the array is not there or is not sixteen bytes."""
+    for candidate in (root / "rpcs3" / "Emu" / "Cell" / "Modules" / "cellSysmodule.cpp",
+                      root / "Emu" / "Cell" / "Modules" / "cellSysmodule.cpp"):
+        if not candidate.is_file():
+            continue
+        m = re.search(r"\bKEY_UNK\s*\{([^}]*)\}", candidate.read_text(encoding="utf-8", errors="replace"))
+        if not m:
+            return b""
+        data = bytearray()
+        for item in (t.strip() for t in m.group(1).split(",")):
+            if not item:
+                continue
+            char = re.fullmatch(r"'([ -&(-\[\]-~])'", item)  # a printable character but ' and \
+            hex_number = re.fullmatch(r"0[xX]([0-9A-Fa-f]{1,2})", item)
+            decimal = re.fullmatch(r"[0-9]{1,3}", item)
+            if char:
+                data.append(ord(char.group(1)))
+            elif hex_number:
+                data.append(int(hex_number.group(1), 16))
+            elif decimal and int(item, 10) < 256:
+                data.append(int(item, 10))
+            else:
+                return b""
+        return bytes(data) if len(data) == 16 else b""
+    return b""
+
+
 def c_bytes(hex_text: str, size: int) -> str:
     data = bytes.fromhex(hex_text).ljust(size, b"\0")[:size]
     return "{" + ", ".join(f"0x{b:02x}" for b in data) + "}"
@@ -67,6 +96,7 @@ def main() -> int:
              "#include \"pspocket/recomp/npdrm.hpp\"",
              "#include \"pspocket/recomp/pkg.hpp\"",
              "#include \"pspocket/recomp/self_decrypt.hpp\"",
+             "#include \"pspocket/recomp/sysmodule_key.hpp\"",
              "",
              "namespace pspocket::recomp {",
              "namespace {",
@@ -101,16 +131,21 @@ def main() -> int:
     npd = sixteen_byte_arrays(text_h, NPD_KEYS)
     npdrm = sixteen_byte_arrays(text_h, NPDRM_KEYS)
     pkg = sixteen_byte_arrays(text_h, PKG_KEYS)
+    # libsysmodule's key for its export 0x59521326 (cellSysmodule.cpp KEY_UNK), for cellSysmodule_0x59521326 (D-639).
+    sysmodule = sysmodule_key(root) if sys.argv[1] else b""
     lines += ["};", f"constexpr PackageKey kPackageKey = {{{package}}};" if package else "constexpr PackageKey kPackageKey{};",
               f"constexpr NpdKeys kNpdKeys = {{{npd}}};" if npd else "constexpr NpdKeys kNpdKeys{};",
               f"constexpr NpdrmKeys kNpdrmKeys = {{{npdrm}}};" if npdrm else "constexpr NpdrmKeys kNpdrmKeys{};",
               f"constexpr PkgKeys kPkgKeys = {{{pkg}}};" if pkg else "constexpr PkgKeys kPkgKeys{};",
+              f"constexpr SysmoduleKey kSysmoduleKey = {{{c_bytes(sysmodule.hex(), 16)}, true}};" if sysmodule
+              else "constexpr SysmoduleKey kSysmoduleKey{};",
               "} // namespace", "",
               "std::span<const SelfKey> builtin_self_keys() { return std::span<const SelfKey>(kKeys).subspan(1); }",
               "const PackageKey& builtin_package_key() { return kPackageKey; }",
               "const NpdKeys& builtin_npd_keys() { return kNpdKeys; }",
               "const NpdrmKeys& builtin_npdrm_keys() { return kNpdrmKeys; }",
-              "const PkgKeys& builtin_pkg_keys() { return kPkgKeys; }", "",
+              "const PkgKeys& builtin_pkg_keys() { return kPkgKeys; }",
+              "const SysmoduleKey& builtin_sysmodule_key() { return kSysmoduleKey; }", "",
               "} // namespace pspocket::recomp"]
     out.parent.mkdir(parents=True, exist_ok=True)
     text = "\n".join(lines) + "\n"
@@ -118,7 +153,8 @@ def main() -> int:
         out.write_text(text)
     where = f"from {vault}" if vault else f"none: no Crypto/key_vault.cpp under {root}"
     print(f"self-keys: {count} SELF keys, {'the' if package else 'no'} package key, {'the' if npd else 'no'} NPD keys, "
-          f"{'the' if npdrm else 'no'} NPDRM keys and {'the' if pkg else 'no'} PKG keys {where}")
+          f"{'the' if npdrm else 'no'} NPDRM keys, {'the' if pkg else 'no'} PKG keys {where}, and "
+          f"{'the' if sysmodule else 'no'} sysmodule key")
     return 0
 
 
