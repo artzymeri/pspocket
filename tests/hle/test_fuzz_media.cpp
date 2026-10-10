@@ -219,6 +219,9 @@ std::vector<fuzz::Field> riff_fields(const std::vector<u8>& d)
 
 TEST_CASE("fuzz: cellAtrac over damaged AT3+ files, each file flush against unmapped memory", "[hle][fuzz]")
 {
+#if !PSPOCKET_HAVE_FFMPEG
+    SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): pspocket's cellAdec has no ATRAC3plus core (D-606)");
+#endif
     namespace at3 = pspocket::hle::test::atrac;
     InterpretMisses interpret; // cellAdec's callbacks
     Fixture f;
