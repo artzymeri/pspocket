@@ -39,7 +39,8 @@ target_sources(test_hle PRIVATE
 
 # Libraries made as a console with no PSN, no PSP peer and no profiler attached (D-635 to D-639).
 target_sources(test_hle PRIVATE
-    test_netaoi.cpp)
+    test_netaoi.cpp
+    test_medi.cpp)
 
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.
