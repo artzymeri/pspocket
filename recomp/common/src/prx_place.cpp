@@ -23,9 +23,10 @@ u64 align_up(u64 v, u64 a) { return (v + a - 1) & ~(a - 1); }
 
 std::vector<u32> prx_load_sizes(const ElfFile& elf)
 {
+    // A size past 32 bits (a damaged header's) stays too large for any layout, not cut to its low word (D-605).
     std::vector<u32> out;
     for (const ProgramHeader& ph : elf.segments())
-        if (ph.type == 1) out.push_back(static_cast<u32>(ph.memsz));
+        if (ph.type == 1) out.push_back(static_cast<u32>(std::min<u64>(ph.memsz, 0xFFFFFFFF)));
     return out;
 }
 
@@ -188,6 +189,9 @@ Result<PlacedPrx> place_prx(const ElfFile& elf, std::span<const u8> bytes, std::
         if (ph.memsz) {
             if (ph.filesz > ph.memsz || (ph.filesz && !ph.data_in_file))
                 return make_error("segment {} lies outside the file", index);
+            // The guest's address space is 32 bits: a larger segment is a damaged header's, refused before its bytes
+            // are allocated (D-605).
+            if (ph.memsz > 0xFFFFFFFF) return make_error("segment {} of {:#x} bytes", index, ph.memsz);
             if (!addrs[index]) return make_error("segment {} has no address", index);
             seg.addr = addrs[index];
             seg.bytes.assign(static_cast<usize>(align_up(ph.memsz, 0x100)) + 8, 0); // + a relocation's width

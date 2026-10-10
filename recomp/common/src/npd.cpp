@@ -513,7 +513,13 @@ s64 NpdFile::decrypt_block(u32 block, std::vector<u8>& out, std::string& error) 
         }
         return res;
     }
-    std::memcpy(out.data(), dec.data(), pad_length);
+    // A compressed file's block that is not compressed after all (its compression end 0) may say it is longer than a
+    // block: RPCS3 stops there (its ensure that the output holds it); pspocket refuses the block (D-605).
+    if (pad_length > out.size()) {
+        error = std::format("block {} at {:#x}: {:#x} bytes, more than a block", block, offset, pad_length);
+        return -1;
+    }
+    if (pad_length) std::memcpy(out.data(), dec.data(), pad_length);
     return static_cast<s64>(pad_length);
 }
 

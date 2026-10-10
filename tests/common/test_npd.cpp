@@ -224,6 +224,25 @@ TEST_CASE("NpdFile: a damaged block, wrong keys, EDATA and other files are refus
     }
 }
 
+TEST_CASE("NpdFile: a compressed file's block stored whole but longer than a block is refused (D-605)", "[npd]")
+{
+    // A compressed file keeps each block's length in its metadata (plain in NPD version 1), and a block whose
+    // compression end is 0 is copied out as it is. A length past the block (up to twice it, which the check before
+    // allows) was copied whole into the block's buffer: RPCS3 stops there (its ensure), pspocket refuses the block.
+    const NpdKeys keys = made_up_keys();
+    const std::vector<u8> plain = pattern(5000);
+    const std::vector<u8> file = test::build_sdata(plain, keys,
+        {.version = 1, .extra_flags = kNpdCompressedFlag | kNpdDebugDataFlag, .block_size = 0x400});
+    REQUIRE(open_bytes(file, keys));
+    std::vector<u8> bad = file;
+    const usize metadata = 0x100; // block 0's: hash, offset, length, compression end
+    ps_st32(bad.data() + metadata + 0x18, 2 * 0x400 + 0x40);
+    ps_st32(bad.data() + metadata + 0x1C, 0);
+    auto f = open_bytes(bad, keys);
+    REQUIRE_FALSE(f);
+    CHECK(f.error().message.find("more than a block") != std::string::npos);
+}
+
 TEST_CASE("npd_decompress: the plain form, and damaged input never writes past its buffers", "[npd]")
 {
     u8 in[5 + 10] = {0x81, 0, 0, 0, 10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};

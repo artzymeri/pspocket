@@ -42,10 +42,18 @@ bool aes128_ctr(const u8* key, const u8* iv, const u8* in, usize size, u8* out)
     return crypto::aes_ctr(std::span<const u8>(key, 16), iv, in, size, out);
 }
 
-void put(std::vector<u8>& out, u64 offset, std::span<const u8> bytes)
+// The largest ELF a SELF is made into: a PS3 executable's segments fit the 256 MB of main memory, its headers and
+// section headers next to them. The ELF's offsets and sizes come from the file, so a damaged one ends in an error here,
+// not in an allocation that throws or an offset that wraps (D-605).
+constexpr u64 kMaxElfBytes = u64{1} << 30;
+
+// `bytes` at `offset` of the ELF being made, which grows to hold them; false past kMaxElfBytes.
+bool put(std::vector<u8>& out, u64 offset, std::span<const u8> bytes)
 {
+    if (offset > kMaxElfBytes || bytes.size() > kMaxElfBytes - offset) return false;
     if (out.size() < offset + bytes.size()) out.resize(static_cast<usize>(offset + bytes.size()));
     std::copy(bytes.begin(), bytes.end(), out.begin() + static_cast<std::ptrdiff_t>(offset));
+    return true;
 }
 
 } // namespace
@@ -186,7 +194,8 @@ Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const S
     std::vector<u8> elf;
     put(elf, 0, self.subspan(static_cast<usize>(info.ext->elf_offset), eh.header_size()));
     if (!r.in_bounds(info.ext->phdr_offset, u64{eh.phnum} * eh.phdr_size())) return make_error("program headers outside the file");
-    put(elf, eh.phoff, self.subspan(static_cast<usize>(info.ext->phdr_offset), usize{eh.phnum} * eh.phdr_size()));
+    if (!put(elf, eh.phoff, self.subspan(static_cast<usize>(info.ext->phdr_offset), usize{eh.phnum} * eh.phdr_size())))
+        return make_error("program headers at {:#x}, past the largest ELF", eh.phoff);
     std::vector<u8> plain;
     for (const MetadataSection& s : sections) {
         if (s.type != 2) continue; // the section headers and the version come from the plain copies
@@ -204,23 +213,29 @@ Result<std::vector<u8>> decrypt_self(std::span<const u8> self, std::span<const S
         const ProgramHeader& ph = info.phdrs[s.program_index];
         if (s.compressed == 2) {
 #if defined(PSPOCKET_SELF_ZLIB)
+            // Deflate makes at most 1032 bytes of each byte it reads: a larger size is the header's damage, refused
+            // before it is allocated.
+            if (ph.filesz > kMaxElfBytes || ph.filesz > u64{plain.size()} * 1032)
+                return make_error("segment {} cannot inflate to its {:#x} bytes", s.program_index, ph.filesz);
             std::vector<u8> inflated(static_cast<usize>(ph.filesz));
             uLongf size = static_cast<uLongf>(inflated.size());
             if (uncompress(inflated.data(), &size, plain.data(), static_cast<uLong>(plain.size())) != Z_OK || size != ph.filesz) {
                 return make_error("segment {} does not inflate to its {:#x} bytes", s.program_index, ph.filesz);
             }
-            put(elf, ph.offset, inflated);
+            if (!put(elf, ph.offset, inflated))
+                return make_error("segment {} at {:#x}, past the largest ELF", s.program_index, ph.offset);
 #else
             return make_error("segment {} is compressed and this build has no zlib", s.program_index);
 #endif
-        } else {
-            put(elf, ph.offset, plain);
+        } else if (!put(elf, ph.offset, plain)) {
+            return make_error("segment {} at {:#x}, past the largest ELF", s.program_index, ph.offset);
         }
     }
     if (info.ext->shdr_offset != 0 && eh.shnum != 0) {
         const u64 size = u64{eh.shnum} * eh.shentsize;
         if (!r.in_bounds(info.ext->shdr_offset, size)) return make_error("section headers outside the file");
-        put(elf, eh.shoff, self.subspan(static_cast<usize>(info.ext->shdr_offset), static_cast<usize>(size)));
+        if (!put(elf, eh.shoff, self.subspan(static_cast<usize>(info.ext->shdr_offset), static_cast<usize>(size))))
+            return make_error("section headers at {:#x}, past the largest ELF", eh.shoff);
     }
     return elf;
 }

@@ -196,6 +196,42 @@ TEST_CASE("the SELF key for an executable is the first that fits its type, revis
     CHECK(find_self_key(keys, 8, 0x1C, 0) == nullptr);
 }
 
+TEST_CASE("a SELF whose program headers put a segment past any ELF is refused, not followed (D-605)")
+{
+    // The ELF's program headers come from the SELF's plain copy of them. A damaged one's segment size went to an
+    // allocation (a std::bad_alloc, which ends the app), and an offset near 2^64 wrapped the end of the ELF being made
+    // and wrote the segment outside it.
+    const SelfKey key = app_key(0x0A);
+    const Encrypted e = encrypted_self(key, 0x0A);
+    const std::vector<SelfKey> keys{key};
+    auto info = parse_self(e.self);
+    REQUIRE(info);
+    REQUIRE(info->ext);
+    usize index = 0;
+    while (index < info->phdrs.size() && !info->phdrs[index].filesz) index++;
+    REQUIRE(index < info->phdrs.size());
+    const usize phdr = static_cast<usize>(info->ext->phdr_offset) + 56 * index;
+    const struct {
+        usize field;
+        u64 value;
+        const char* why;
+    } cases[] = {
+        {32, 0x00FFFFFFFFFFFFFFull, "cannot inflate to its"},      // p_filesz: the inflated size
+        {32, u64{1} << 31, "cannot inflate to its"},              // more than 1032 bytes for each compressed one
+        {8, 0xFFFFFFFFFFFFFF00ull, "past the largest ELF"},       // p_offset: its end wraps
+        {8, u64{1} << 40, "past the largest ELF"},                // far past any ELF
+    };
+    for (const auto& c : cases) {
+        INFO(c.why << " at " << c.field);
+        std::vector<u8> self = e.self;
+        ps_st64(self.data() + phdr + c.field, c.value);
+        auto elf = decrypt_self(self, keys);
+        REQUIRE_FALSE(elf);
+        CHECK(elf.error().message.find(c.why) != std::string::npos);
+    }
+    CHECK(decrypt_self(e.self, keys)); // the file itself still decrypts
+}
+
 TEST_CASE("a debug SELF gives its plain ELF back without a key")
 {
     const auto elf = test::build_ppu_exec().bytes;

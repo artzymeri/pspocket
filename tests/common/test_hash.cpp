@@ -99,6 +99,21 @@ TEST_CASE("byte-at-a-time updates and reset() reuse")
     CHECK(to_hex(s.finish()) == "a9993e364706816aba3e25717850c26c9cd0d89d");
 }
 
+TEST_CASE("an empty update changes nothing, its data null and bytes waiting in the block (D-605)")
+{
+    // A span of no bytes may have a null data(), which memcpy must not be given, even for no bytes (UBSan's
+    // nonnull-attribute): the sweep found it from the inventory's hashing of an empty segment.
+    Sha1 s;
+    s.update("ab");
+    s.update(std::span<const u8>());
+    s.update("c");
+    CHECK(to_hex(s.finish()) == "a9993e364706816aba3e25717850c26c9cd0d89d");
+    Sha256 h;
+    h.update("abc");
+    h.update(std::span<const u8>());
+    CHECK(to_hex(h.finish()) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
 TEST_CASE("hex helpers")
 {
     const std::vector<u8> bytes{0x00, 0x7F, 0xAB, 0xFF};

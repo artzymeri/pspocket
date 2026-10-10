@@ -58,6 +58,25 @@ TEST_CASE("PRX placement: the fixed layout, and a module relocated at its fixed 
     CHECK_FALSE(place_prx(*elf, x.bytes, std::vector<u32>{0, 0x30010000}));   // the first one has none
 }
 
+TEST_CASE("PRX placement: a segment past the 32-bit address space is refused, not allocated (D-605)")
+{
+    // A damaged module's PT_LOAD of 4 GB and more: its size was cut to 32 bits for the layout while place_prx
+    // allocated the whole of it (a std::bad_alloc that ends the app). The layout now sees all ones and place_prx
+    // refuses the segment.
+    auto x = test::build_ppu_prx();
+    auto parsed = ElfFile::parse(x.bytes);
+    REQUIRE(parsed);
+    const u64 phoff = parsed->header().phoff;
+    ps_st64(x.bytes.data() + phoff + 40, 0x1'0000'0700ull); // the first PT_LOAD's p_memsz
+    auto elf = ElfFile::parse(x.bytes);
+    REQUIRE(elf);
+    CHECK(prx_load_sizes(*elf) == std::vector<u32>{0xFFFFFFFF, 0x300});
+    CHECK(prx_fixed_layout(std::vector<std::vector<u32>>{prx_load_sizes(*elf)}, 0x30000000, 0x10000000).empty());
+    auto placed = place_prx(*elf, x.bytes, std::vector<u32>{0x30000000, 0x30010000});
+    REQUIRE_FALSE(placed);
+    CHECK(placed.error().message.find("segment 0 of 0x100000700 bytes") != std::string::npos);
+}
+
 TEST_CASE("game modules: an identity that follows the module, not the file around it (D-238)")
 {
     const auto x = test::build_ppu_prx();

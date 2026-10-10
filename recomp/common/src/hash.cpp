@@ -19,6 +19,7 @@ u32 load_be32(const u8* p) { return ps_ld32(p); }
 template <class Hasher>
 void feed(const Hasher& h, std::array<u8, 64>& buffer, usize& buffered, u64& total, std::span<const u8> data)
 {
+    if (data.empty()) return; // its data() may be null, which memcpy may not be given even for no bytes
     total += data.size();
     const u8* p = data.data();
     usize n = data.size();
