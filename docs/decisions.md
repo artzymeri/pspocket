@@ -9055,3 +9055,71 @@ it out (a spurious INVAL), found by ThreadSanitizer. Each linked variable now ha
 out, any other waits for that before it gets the address. The initializers link no variable that links them back, so
 no layout waits on itself. Test: tests/hle/test_hle.cpp, eight threads linking libsync2's notifier table at once in a
 fresh process, twenty rounds, each reading its four notifiers the moment it has the table.
+
+## D-603 · 2026-10-10 · Mutation fuzzing of pspocket's parsers of game data
+
+A game's files are untrusted input to pspocket's own parsers: a damaged disc, a cut download, a save another version
+wrote, a header a game filled wrong. Each must end in an error or a valid result, never a crash, a hang or a write
+past a buffer. tests/common/mutation_fuzz.hpp takes valid inputs the tests' own writers build (synthetic, rule 1),
+corrupts copies of them deterministically (one to four mutations each: bits flipped, bytes set, a run of random
+bytes, the input cut or extended, a part copied over another, bytes put in or taken out, or a length, count or offset
+field set to an edge value: 0, 1, all ones, the sign bit, the input's size give or take a little, its own value give
+or take one, doubled) and hands each to the parser. The targets:
+- test_recomp_common (test_fuzz_formats.cpp): ELF executables, PRX modules and SPU programs with their tables and
+  relocations; SELF headers and SELFs decrypted with made-up keys; NPD files (SDATA, EDATA, every block layout) and
+  their LZ decoder; packages installed into a temporary dev_hdd0.
+- test_disc (test_fuzz_disc.cpp): ISO 9660 and Joliet discs walked and read; PARAM.SFO; a disc image as the game's
+  file system with the scan of its modules.
+- test_hle (test_fuzz_files.cpp, test_fuzz_images.cpp, test_fuzz_media.cpp): trophy packs, their configuration and
+  TROPUSR.DAT; cellL10n's converters; fonts; the PNG, JPEG and GIF decoders; PAMF and the demuxer; the audio cores
+  (MP3, MPEG layers I and II, AAC, AC-3, ATRAC3plus); the loader's executables and modules.
+The writers the fuzzing shares with the ordinary tests moved to headers of their own (tests/disc/disc_writer.hpp,
+tests/hle/atrac_writer.hpp, pamf_writer.hpp); tests/hle/ttf_writer.hpp writes the TrueType fonts the font fuzzing
+starts from. In ctest each target runs its default number of inputs
+(a few hundred to a few thousand; test_hle takes about five seconds longer) and prints one line: inputs, accepted,
+refused. "[fuzz]" runs them alone; PSPOCKET_FUZZ_ITERS=<n> runs n times as many, PSPOCKET_FUZZ_SEED=<n> another
+sequence (the same seed gives the same inputs), PSPOCKET_FUZZ_TRACE=1 names each input before it runs and
+PSPOCKET_FUZZ_DUMP=FILE writes it, to find the one a crash came from. Run under scripts/asan.sh (D-604) as well, where
+a read or write past a buffer is a report even when it does not crash. What they found is fixed in D-605.
+
+## D-604 · 2026-10-10 · scripts/asan.sh: the memory safety sweep
+
+As scripts/tsan.sh does for data races (D-585), scripts/asan.sh [GROUP...] [--no-build] [--no-fuzz] builds build/asan
+(-DPSPOCKET_SANITIZE=ON: AddressSanitizer with LeakSanitizer, and UBSan), runs each group's tests (core, common, ppu,
+spu, lv2, rsx, hle, disc, game, codesign, codegen, boot; test_hle once per test file, so a file's crash stays its own)
+with every check reporting, the fuzzing included, and prints one line per group: its reports, their distinct places
+(scripts/asan_report.py) and how its tests ended. Logs in build/asan-logs/<group>/. Suppressions, each with its reason:
+scripts/asan.supp (LeakSanitizer: the lifted SPU programs' dispatch tables, kept for the process's life on purpose,
+D-231) and scripts/ubsan.supp (FreeType 2.2.1, third party and built as it is: its function pointer casts, shifts of
+negative values and empty-array arithmetic). Undefined behaviour in pspocket's own code is fixed, not suppressed.
+The first sweep (before D-605's fixes): core, common, ppu, lv2, rsx, disc, codesign and boot no report; spu 9 (its
+interpreter's address overflow, and the SPU programs' tables); hle 84 at 62 places (FreeType's, the tables again, a
+null pointer to memcpy in sys_io, cellPngEnc's palette rows read past the picture). After D-605 and the suppressions
+the sweep is to be run again in full (`scripts/asan.sh`), the second time with PSPOCKET_FUZZ_ITERS raised, and what it
+reports fixed the same way: that run was cut short with the session.
+
+## D-605 · 2026-10-10 · What the fuzzing and the sweep found, fixed
+
+Each with a test that shows it (rule 7):
+- **SELF** (recomp/common/src/self_decrypt.cpp): an ELF's offsets and sizes come from the file; one that puts a segment
+  past 1 GB, or claims to inflate past what deflate can make of its bytes (1032 to 1), is refused before the ELF is
+  allocated, where it threw or wrapped. **NPD** (npd.cpp): a compressed file's block stored whole but longer than a
+  block is refused (RPCS3 stops there too), where it wrote past the block. **PRX placement** (prx_place.cpp): a
+  segment past the 32-bit address space is refused, not cut to its low word. **Hashes** (hash.cpp): an empty update
+  passes memcpy no null pointer. Tests in tests/common.
+- **The loader** (runtime/loader/src/lle.cpp, loader.cpp): a PRX's module information, its export entries with their
+  NID and address tables, and its import entries and tables are read only where guest memory is committed (a load
+  refused, or the walk of the imports ended, logged); a REF's target is checked to its last byte. Test: test_lle.
+- **The SPU interpreter** (runtime/spu/src/interpreter.cpp): LQD and STQD's address was a signed sum that overflows
+  for a base past the largest int; it wraps now, as the SPU's adder and the lifter do. Test: test_interp_branch_mem.
+- **The JPEG decoder** (runtime/hle/src/jpeg_decoder.cpp): a scan naming a Huffman table past the four, a progressive
+  band past the block or an approximation out of range, and a table whose counts overflow their code lengths are
+  refused as libjpeg refuses them (jdhuff.c, jdphuff.c), where they indexed past the decoder's tables. Test:
+  test_jpgdec.
+- **cellAdec's AC-3 core** (adec_ac3.cpp): the information block's raw header bytes (8 from byte 5) were copied from a
+  unit of any size, past the end of a short one; the bytes it lacks are zeros now. Test: test_adec_cores, a unit
+  ending where guest memory does.
+- **cellPngEnc** (cellPngEnc.cpp): a palette picture's rows fell to RGBA's four components, reading four bytes of the
+  picture for each one-byte index, past its end on the last row. Shown by test_imgenc's palette pictures under
+  scripts/asan.sh.
+- **sys_io** (sys_io.cpp): io_printf with no string passed memcpy a null pointer.
