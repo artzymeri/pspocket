@@ -165,6 +165,14 @@ TEST_CASE("AES: the platform's library and the portable one agree on random inpu
         REQUIRE(crypto::aes_ctr(key, iv.data(), plain.data(), odd, a.data()));
         REQUIRE(crypto::soft::aes_ctr(key, iv.data(), plain.data(), odd, b.data()));
         CHECK(std::equal(a.begin(), a.begin() + static_cast<std::ptrdiff_t>(odd), b.begin()));
+        // A counter whose low half wraps within the data carries into its high half (D-908: CommonCrypto's alone
+        // would not).
+        std::vector<u8> near = iv;
+        for (usize i = 8; i < 16; i++) near[i] = 0xFF;
+        near[15] = static_cast<u8>(0xFF - rng() % 4);
+        REQUIRE(crypto::aes_ctr(key, near.data(), plain.data(), odd, a.data()));
+        REQUIRE(crypto::soft::aes_ctr(key, near.data(), plain.data(), odd, b.data()));
+        CHECK(std::equal(a.begin(), a.begin() + static_cast<std::ptrdiff_t>(odd), b.begin()));
     }
     const std::vector<u8> key = bytes(16), bad_key = bytes(20), iv = bytes(16), data = bytes(32);
     std::vector<u8> out(32);

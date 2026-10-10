@@ -9298,3 +9298,16 @@ executable (by its strings, its TOC slots and its calls); nothing of it is in th
   executable links them and nothing describes them; they log the call and answer an error, as D-510's _Eadd and kin.
 Tests: tests/hle/test_libc_spu.cpp (both families on an SPU thread and a raw SPU, the slots, _Getmem, the unknown
 names), tests/hle/test_libc_spu_game.cpp (the comparisons); the SPU program builder moved to tests/hle/spu_program.hpp.
+
+## D-908 · 2026-10-10 · AES-CTR on Apple platforms carries the counter over all 128 bits
+
+CommonCrypto's CTR mode with kCCModeOptionCTR_BE counts in the counter's low 64 bits only and wraps there without a carry
+into the high half; PolarSSL's aes_crypt_ctr (RPCS3's, and what the PS3 formats expect) counts over all 128 bits. So on
+the Mac and the iPhone, where crypto.hpp's AES goes through CommonCrypto (D-580), any CTR data whose counter crosses a
+64-bit boundary decrypted wrongly from that block on: PS3 packages with such an IV installed garbage names and contents
+(the PKG tests failed on macOS from D-583 on, never on Linux, whose portable AES is PolarSSL's), and SP 800-38A-style
+counters of all ones rolled over wrongly. aes_ctr now cuts the data where the low half would wrap and goes on from the
+counter with its high half incremented and its low half 0; the portable AES was right. Tests: test_crypto's
+platform-against-portable rounds add a counter whose low half wraps within the data (the all-ones case there now passes
+on Apple platforms too); test_pkg's game package compares canonical paths, as test_psn does (b6ff761), since macOS's
+temporary folders are reached through /var -> /private/var.
