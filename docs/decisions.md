@@ -9016,3 +9016,42 @@ Checked with a build configured with -DPSPOCKET_FFMPEG_DIR=/nonexistent (the con
 -DPSPOCKET_WERROR=ON: it builds, and its ctest has only the two failures every Linux build has (test_spu_fuzz's x86
 floating point, test_libm's fmax/fmin signed zeros on glibc); test_hle 620 cases, 91 of them skipped. The build with
 FFmpeg is unchanged.
+
+## D-600 · 2026-10-10 · ThreadSanitizer over the day's new code: the decoders, the video codecs, PSN, the comparisons
+
+D-584 to D-587 left the runtime with no race reports (scripts/tsan.sh). The code added since (pspocket's own audio
+cores and their operation tables, D-576 to D-579 and D-591; DivX 3.11, VC-1 and MVC in cellVdec, D-588 to D-590; PSN
+content, D-580 to D-583; the unverified Ext functions, D-594 to D-596) was swept the same way: every group of
+scripts/tsan.sh (core, ppu, spu, lv2, rsx, hle once per test file, boot) built with -DPSPOCKET_TSAN=ON and run with
+scripts/tsan.supp. Three races were real and are fixed (D-601, D-602), each with a test that shows it under
+ThreadSanitizer. What is left is one report in test_audio.cpp, the test's own: the test thread writes a port's guest
+word with a plain store while cellAudio's thread reads it atomically, where a game's code would make that store (and
+its own accesses are suppressed as the guest's, D-585). It does no harm and changes nothing in the runtime; the test
+can write the word atomically when it is next changed.
+
+## D-601 · 2026-10-10 · cellSync2's queue links and entries shared atomically; cellVdec's frame rate under its mutex
+
+- **cellSync2's queue** (runtime/hle/src/cellSync2.cpp): a popper reads its head's link and copies the next entry out
+  before its stwcx. of the head. When another popper took that head meanwhile, freed it and a pusher took it again, the
+  pusher writes the link and the entry as the first reads them; the stwcx. then fails and the popper reads again, as
+  libsync2's lock-free queue does on the hardware. Those were plain host loads and stores racing each other. The links
+  (qu::link, qu::set_link) and the entries' words (copy_in, copy_out) are now relaxed atomics, the PPU's aligned loads
+  and stores they stand for, as the mutex's owner fields are (D-587, whose helpers they now share: shared_load and
+  shared_store). What orders them is libsync2's own lwarx/stwcx. and lwsync. Test: tests/hle/test_sync2.cpp, four
+  pushers and four poppers on a queue two entries deep (entries freed and taken again all the time): every element
+  popped once and whole, each pusher's in order; under ThreadSanitizer no report.
+- **cellVdec's frame rate** (runtime/hle/src/cellVdec.cpp): the decoder's thread stored a SetFrameRate command's rate
+  without the decoder's mutex, while cellVdecGetPicItem reads it under the mutex on the game's thread (the information
+  block's frame rate code for MPEG-4, DivX and H.264). It is stored under the mutex now, as the rest of what GetPicItem
+  reads. Found reading the decoder's thread; no test shows it (the tests take their pictures long after the command).
+
+## D-602 · 2026-10-10 · A host variable is handed out only once it is laid out
+
+HleProcess::link_variable placed a variable under the link mutex, recorded its address, and laid it out (zeroed, then
+its initializer) after releasing the lock, since an initializer may link functions and other variables (D-531). A
+second thread linking the same variable meanwhile found the address and returned it at once, so it could read the
+variable unwritten: a libsync2 queue's first push read the default notifier table as zeros while the first pop laid
+it out (a spurious INVAL), found by ThreadSanitizer. Each linked variable now has a once flag: the first thread lays it
+out, any other waits for that before it gets the address. The initializers link no variable that links them back, so
+no layout waits on itself. Test: tests/hle/test_hle.cpp, eight threads linking libsync2's notifier table at once in a
+fresh process, twenty rounds, each reading its four notifiers the moment it has the table.
