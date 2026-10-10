@@ -540,6 +540,9 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
 {
     const std::vector<LibraryNeeds> imports = with_host_imports(game_imports);
     const auto on_host = [](std::string_view library, u32 nid) { return hle::registry().find(library, nid) != nullptr; };
+    // A function the host made without Sony's module to compare it with (D-594) counts as one it lacks wherever the
+    // library's module can serve instead: adding one never changes what a system with the firmware gets.
+    const auto unverified = [](std::string_view library, u32 nid) { return hle::registry().is_unverified(library, nid); };
     // A file whose libraries something already linked to the host stays there (a library has one implementation).
     const auto host_bound = [&](std::string_view file) {
         const auto it = file_libraries_.find(file);
@@ -562,11 +565,15 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
             continue;
         }
         std::vector<u32> missing;
-        for (const u32 nid : need.functions)
+        bool unverified_import = false;
+        for (const u32 nid : need.functions) {
             if (!on_host(need.library, nid)) missing.push_back(nid);
+            else if (unverified(need.library, nid)) unverified_import = true;
+        }
         const bool variables_on_host = std::all_of(need.variables.begin(), need.variables.end(),
             [&](u32 nid) { return hle::registry().find_variable(need.library, nid) != nullptr; });
-        if (missing.empty() && variables_on_host) continue;
+        // An unverified function goes to the module as a missing one would; where none can serve, the host's does.
+        if (missing.empty() && variables_on_host && !(file && unverified_import)) continue;
         if (file && (chosen_.contains(*file) || can_join(*file))) roots.insert(*file);
         else if (!missing.empty()) lacking[need.library] = std::move(missing);
     }
@@ -599,8 +606,9 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
                             gap.push_back(std::format("{}::{:#010x} (not exported by {})", library, nid, *dep));
                         continue;
                     }
-                    // A forced library's module joins rather than the host serving it (D-563).
-                    const bool to_module = dep && can_join(*dep) && forced(library);
+                    // A forced library's module joins rather than the host serving it (D-563), and so does the module
+                    // of a function the host has unverified (D-594).
+                    const bool to_module = dep && can_join(*dep) && (forced(library) || unverified(library, nid));
                     if (!to_module && on_host(library, nid)) continue;
                     if (dep && can_join(*dep)) {
                         joins.push_back(*dep);
