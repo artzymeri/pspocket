@@ -109,6 +109,27 @@ private:
 // hardware; waiters on the line are told at once.
 void stored(u32 addr, u32 size) { ps_res_notify_write(addr, size); }
 
+// The PPU's plain loads and stores of an aligned guest word that libsync2 reads on one thread while another writes it,
+// with no lock between them: a mutex's owner fields (D-587), a queue's links and entries, which a popper reads ahead
+// of its stwcx. while a pusher refills an entry freed meanwhile (D-601). Relaxed atomics here, the same instructions,
+// so the host's accesses are defined too; what orders them is libsync2's own (its lwarx/stwcx. and lwsync).
+template <class T>
+T shared_load(u8* base, u32 addr)
+{
+    const T v = __atomic_load_n(reinterpret_cast<T*>(base + addr), __ATOMIC_RELAXED);
+    if constexpr (sizeof(T) == 2) return ps_bswap16(v);
+    else if constexpr (sizeof(T) == 4) return ps_bswap32(v);
+    else return ps_bswap64(v);
+}
+template <class T>
+void shared_store(u8* base, u32 addr, T v)
+{
+    if constexpr (sizeof(T) == 2) v = ps_bswap16(v);
+    else if constexpr (sizeof(T) == 4) v = ps_bswap32(v);
+    else v = ps_bswap64(v);
+    __atomic_store_n(reinterpret_cast<T*>(base + addr), v, __ATOMIC_RELAXED);
+}
+
 // mftb, read until its low word is not zero (libsync2's loops).
 u64 timebase()
 {
@@ -660,30 +681,13 @@ constexpr u32 kOwnerType = 0x10, kCount = 0x14, kOwner = 0x18, kC = 0x20, kSdk =
               kMaxWaiters = 0x32, kName = 0x34;
 
 // The owner's fields: libsync2 reads them while their owner changes them (a locker checks whether it is the recursive
-// owner, an unlock whether it is the owner), the PPU's plain loads and stores of aligned words. Relaxed atomics here,
-// the same instructions, so the host's accesses are defined too (D-587).
-template <class T>
-T load(u8* base, u32 addr)
-{
-    const T v = __atomic_load_n(reinterpret_cast<T*>(base + addr), __ATOMIC_RELAXED);
-    if constexpr (sizeof(T) == 2) return ps_bswap16(v);
-    else if constexpr (sizeof(T) == 4) return ps_bswap32(v);
-    else return ps_bswap64(v);
-}
-template <class T>
-void store(u8* base, u32 addr, T v)
-{
-    if constexpr (sizeof(T) == 2) v = ps_bswap16(v);
-    else if constexpr (sizeof(T) == 4) v = ps_bswap32(v);
-    else v = ps_bswap64(v);
-    __atomic_store_n(reinterpret_cast<T*>(base + addr), v, __ATOMIC_RELAXED);
-}
-u16 owner_type(u8* base, u32 m) { return load<u16>(base, m + kOwnerType); }
-u32 count(u8* base, u32 m) { return load<u32>(base, m + kCount); }
-u64 owner(u8* base, u32 m) { return load<u64>(base, m + kOwner); }
-void set_owner_type(u8* base, u32 m, u16 v) { store<u16>(base, m + kOwnerType, v); }
-void set_count(u8* base, u32 m, u32 v) { store<u32>(base, m + kCount, v); }
-void set_owner(u8* base, u32 m, u64 v) { store<u64>(base, m + kOwner, v); }
+// owner, an unlock whether it is the owner): shared_load and shared_store (D-587).
+u16 owner_type(u8* base, u32 m) { return shared_load<u16>(base, m + kOwnerType); }
+u32 count(u8* base, u32 m) { return shared_load<u32>(base, m + kCount); }
+u64 owner(u8* base, u32 m) { return shared_load<u64>(base, m + kOwner); }
+void set_owner_type(u8* base, u32 m, u16 v) { shared_store<u16>(base, m + kOwnerType, v); }
+void set_count(u8* base, u32 m, u32 v) { shared_store<u32>(base, m + kCount, v); }
+void set_owner(u8* base, u32 m, u64 v) { shared_store<u64>(base, m + kOwner, v); }
 } // namespace mx
 
 // Spinning before a waiter sleeps (libsync2's priority hints): a yield here.
@@ -1309,7 +1313,14 @@ namespace qu {
 constexpr u32 kPushWq = 0, kPopWq = 0x10, kP = 0x20, kHead = 0x28, kTail = 0x2C, kF = 0x30, kCursor = 0x38,
               kBitmap = 0x3C, kNext = 0x40, kEntries = 0x44, kElementSize = 0x48, kSlots = 0x4C, kSdk = 0x50,
               kTypes = 0x54, kMaxPush = 0x56, kMaxPop = 0x58, kName = 0x5C;
-}
+
+// An entry's link in the next array. A popper reads its head's link before its stwcx. (advance_tail its tail's), and
+// when that head was popped by another thread meanwhile, freed and taken again, the pusher that took it is writing
+// the link as it reads: the stwcx. fails and the popper reads again. shared_load and shared_store (D-601).
+u32 link_at(u8* base, u32 q, u32 index) { return ps_read32(base, q + kNext) + index * 4; }
+u32 link(u8* base, u32 q, u32 index) { return shared_load<u32>(base, link_at(base, q, index)); }
+void set_link(u8* base, u32 q, u32 index, u32 next) { shared_store<u32>(base, link_at(base, q, index), next); }
+} // namespace qu
 
 s32 queue_attr_check(u8* base, u32 attr)
 {
@@ -1417,7 +1428,7 @@ void advance_tail(u8* base, u32 q)
     Reserve r;
     for (;;) {
         const u32 tail = r.lwarx(base, q + qu::kTail);
-        const u32 next = ps_read32(base, ps_read32(base, q + qu::kNext) + tail * 4);
+        const u32 next = qu::link(base, q, tail);
         if (next == 0xFFFFFFFF || r.stwcx(base, next)) return;
     }
 }
@@ -1573,10 +1584,16 @@ s32 cellSync2QueueGetSize(PPUContext& ctx, u32 q, u32 size)
     return lv2::CELL_OK;
 }
 
-// An element's bytes into an entry, or out of it: elementSize / 4 words.
-void copy_words(u8* base, u32 to, u32 from, u32 size)
+// An element's bytes into an entry, or out of it: elementSize / 4 words. A popper copies its head's next entry out
+// before its stwcx., so a stale one reads an entry that another popper freed and a pusher is filling again (the stwcx.
+// fails and it copies again): the entry's words are shared_load and shared_store (D-601).
+void copy_in(u8* base, u32 entry, u32 from, u32 size)
 {
-    for (u32 i = 0; i + 4 <= size; i += 4) ps_write32(base, to + i, ps_read32(base, from + i));
+    for (u32 i = 0; i + 4 <= size; i += 4) shared_store<u32>(base, entry + i, ps_read32(base, from + i));
+}
+void copy_out(u8* base, u32 to, u32 entry, u32 size)
+{
+    for (u32 i = 0; i + 4 <= size; i += 4) ps_write32(base, to + i, shared_load<u32>(base, entry + i));
 }
 
 s32 cellSync2QueuePush(PPUContext& ctx, u32 q, u32 data, u32 cfg)
@@ -1594,8 +1611,8 @@ s32 cellSync2QueuePush(PPUContext& ctx, u32 q, u32 data, u32 cfg)
     if (!guest_range(thread_of(ctx), data, element)) return not_guest(ctx, fn, "element", data);
     u32 index = 0;
     if (const s32 e = allocate_entry(ctx, q, index, &c, true); e != lv2::CELL_OK) return e;
-    ps_write32(base, ps_read32(base, q + qu::kNext) + index * 4, 0xFFFFFFFF);
-    copy_words(base, ps_read32(base, q + qu::kEntries) + element * index, data, element);
+    qu::set_link(base, q, index, 0xFFFFFFFF);
+    copy_in(base, ps_read32(base, q + qu::kEntries) + element * index, data, element);
     link_at_tail(base, q, index);
     count_pushed(ctx, q, 1, config.table, config.count);
     return lv2::CELL_OK;
@@ -1654,10 +1671,10 @@ s32 cellSync2QueueTryPush(PPUContext& ctx, u32 q, u32 data, u32 n, u32 cfg)
         for (u32 b = 0; b < 64; b++)
             if (take & (kBit63 >> b)) taken.push_back((first & ~63u) + b);
     }
-    const u32 next = ps_read32(base, q + qu::kNext), entries = ps_read32(base, q + qu::kEntries);
+    const u32 entries = ps_read32(base, q + qu::kEntries);
     for (u32 i = 0; i < n; i++) {
-        ps_write32(base, next + taken[i] * 4, i + 1 < n ? taken[i + 1] : 0xFFFFFFFF);
-        copy_words(base, entries + element * taken[i], ps_read32(base, data + 4 * i), element);
+        qu::set_link(base, q, taken[i], i + 1 < n ? taken[i + 1] : 0xFFFFFFFF);
+        copy_in(base, entries + element * taken[i], ps_read32(base, data + 4 * i), element);
     }
     link_at_tail(base, q, taken[0]);
     count_pushed(ctx, q, n, config.table, config.count);
@@ -1716,7 +1733,7 @@ s32 queue_pop(PPUContext& ctx, std::string_view fn, u32 q, u32 out, u32 cfg, boo
     u32 head;
     for (u32 spins = 0;; spins++) {
         head = r.lwarx(base, q + qu::kHead);
-        const u32 next = ps_read32(base, ps_read32(base, q + qu::kNext) + head * 4);
+        const u32 next = qu::link(base, q, head);
         if (next == 0xFFFFFFFF) { // counted, but its pusher has not linked it yet
             if (spins > 64) std::this_thread::yield();
             continue;
@@ -1726,7 +1743,7 @@ s32 queue_pop(PPUContext& ctx, std::string_view fn, u32 q, u32 out, u32 cfg, boo
             advance_tail(base, q);
             continue;
         }
-        copy_words(base, out, ps_read32(base, q + qu::kEntries) + element * next, element);
+        copy_out(base, out, ps_read32(base, q + qu::kEntries) + element * next, element);
         if (r.stwcx(base, next)) break;
     }
     free_entry(ctx, q, head, config.table, config.count);

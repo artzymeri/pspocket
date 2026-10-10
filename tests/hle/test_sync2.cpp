@@ -414,6 +414,76 @@ TEST_CASE("cellSync2: one thread's script, and threads blocking on each object (
     blocking(f, t, Side{f, nullptr});
 }
 
+// D-601: a popper reads its head's link and copies the next entry out before its stwcx.; when another popper took that
+// head meanwhile and a pusher took the entry it freed, the pusher writes them as the first reads them (the stwcx. then
+// fails and the popper reads again). Those words are shared atomically. Under ThreadSanitizer (scripts/tsan.sh) this
+// is the check: four pushers and four poppers on a queue two entries deep, so entries are freed and taken again all the
+// time (two of each on a deeper queue showed it in one run of three). Here: every element arrives once and whole, and
+// each popper gets each pusher's elements in their order.
+TEST_CASE("cellSync2: a queue's poppers read entries its pushers fill again; each element popped once, whole (D-601)",
+    "[hle][sync2]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    std::memset(b + kData, 0, 0xB000);
+    const Call call = mine(t);
+    REQUIRE(call("_cellSync2QueueAttributeInitialize", {kAttr, 0x330000}) == 0);
+    attr(b, {{8, 0x10}, {0xC, 2}}, {{0x10, 4}, {0x12, 4}});
+    REQUIRE(call("cellSync2QueueInitialize", {kQueue, kQueueBuf, kAttr}) == 0);
+    constexpr u32 kSides = 4, kEach = 3000;
+    const Side side{f, nullptr};
+    std::atomic<u32> failures{0};
+    std::array<std::vector<u32>, kSides> popped;
+    {
+        std::vector<std::thread> threads;
+        for (u32 i = 0; i < kSides; i++) {
+            threads.emplace_back([&, i] {
+                GuestThread g(f, 1 + i, "producer");
+                const u32 elem = kElems + 0x100 * i;
+                for (u32 k = 0; k < kEach; k++) {
+                    for (u32 w = 0; w < 4; w++) ps_write32(b, elem + 4 * w, (i << 16) | k);
+                    if (side.call(g, "cellSync2QueuePush", {kQueue, elem, 0}) != 0) failures++;
+                }
+            });
+            threads.emplace_back([&, i] {
+                GuestThread g(f, 1 + kSides + i, "consumer");
+                const u32 out = kPopped + 0x100 * i;
+                for (u32 k = 0; k < kEach; k++) {
+                    if (side.call(g, "cellSync2QueuePop", {kQueue, out, 0}) != 0) failures++;
+                    const u32 v = ps_read32(b, out);
+                    for (u32 w = 1; w < 4; w++)
+                        if (ps_read32(b, out + 4 * w) != v) failures++; // a torn element
+                    popped[i].push_back(v);
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+    }
+    CHECK(failures == 0);
+    std::vector<u32> all;
+    u32 out_of_order = 0;
+    for (const std::vector<u32>& p : popped) {
+        std::array<s64, kSides> last;
+        last.fill(-1);
+        for (const u32 v : p) {
+            if (v >> 16 >= kSides) continue; // not a pusher's: the sort below finds it
+            if (static_cast<s64>(v & 0xFFFF) <= last[v >> 16]) out_of_order++;
+            last[v >> 16] = v & 0xFFFF;
+        }
+        all.insert(all.end(), p.begin(), p.end());
+    }
+    CHECK(out_of_order == 0);
+    std::sort(all.begin(), all.end());
+    std::vector<u32> expected;
+    for (u32 i = 0; i < kSides; i++)
+        for (u32 k = 0; k < kEach; k++) expected.push_back((i << 16) | k);
+    CHECK(all == expected);
+    REQUIRE(call("cellSync2QueueGetSize", {kQueue, kOut}) == 0);
+    CHECK(ps_read32(b, kOut) == 0);
+    CHECK(call("cellSync2QueueFinalize", {kQueue}) == 0);
+}
+
 TEST_CASE("cellSync2 against libsync2: answers and bytes, objects across implementations, blocking", "[hle][lle][sync2]")
 {
     const std::optional<std::string> flash = test_dev_flash();
