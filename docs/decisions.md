@@ -9650,3 +9650,42 @@ task waiting for room signalled, a blocked pop let go by a push; ANY2ANY both wa
 cellSpursSendWorkloadSignal (its workload's signal bit), one that does not exist (SRCH); the attach and detach (the
 queue, its port in the instance's map and not in spuPortBits, a PPU thread in GetPushPointer with the event queue woken
 by an SPU event on that port, BUSY while one waits, all of it gone after the detach, an IWL ANY2ANY queue).
+
+## D-629 · 2026-10-10 · cellSpurs: the job pipeline's answer and the system workload given up; D-625 to D-629 against libsre
+
+The last two of cellSpurs' grey functions, unverified (D-594; RPCS3: UNIMPLEMENTED stubs answering CELL_OK, and no
+structures; libsre was not read), in runtime/hle/src/cellSpurs.cpp:
+- **cellSpursGetJobPipelineInfo(spurs, wid, info)**: what each SPU's job chain policy module has in its pipeline (the
+  jobs it fetched, loads, runs and writes back). libsre can only take that from SPUs a job stopped on an exception: it is
+  what a job chain's exception handler asks for. A native SPURS has no such pipeline (its job chain policy runs one job
+  at a time to its end, D-055) and stops the process when a job faults (CLAUDE.md rule 5), so no chain is ever stopped in
+  one: after its checks the call answers CELL_SPURS_JOB_ERROR_STAT and writes nothing (CellSpursJobPipelineInfo's layout
+  is not known either), logged once. Checks: NULL (spurs, info), ALIGN, memory (FAULT), a workload ID past the
+  instance's (INVAL), one not registered (SRCH), one that is not a job chain (INVAL).
+- **cellSpursRemoveSystemWorkloadForUtility(spurs)**: an instance made with the system workload
+  (cellSpursAttributeEnableSystemWorkload: SPUs lent to the system's own work) gives it up, so that a system utility a
+  game starts can have them. A native SPURS lends none (its system workload does not run, as RPCS3's, D-171): the
+  removal takes SAF_SYSTEM_WORKLOAD_ENABLED away, so what needs the system workload (cellSpursSetPreemptionVictimHints)
+  is PERM afterwards, as for an instance made without one. Checks as the victim hints' (libsre's, D-506): NULL, ALIGN,
+  memory (NULL_POINTER), an instance in exception state STAT, one without the system workload (or that gave it up) PERM.
+To compare on the Mac: GetJobPipelineInfo's signature ((spurs, wid, info) is the most plausible; a game passing a job
+chain gets INVAL) and whether libsre answers outside an exception at all, and with what; for the second, what libsre does
+with the system workload's slot and whether it waits for its shutdown.
+
+**The comparison** (tests/hle/test_spurs_compare.cpp, hidden while it is expected to differ, D-597): what the thirteen of
+D-626 to D-629 show without a running SPURS kernel, against libsre: TryGet in ten states of the container's status word
+and Get where the code is stored; the refusals of the five Task2 functions on made-up tasksets of both sizes (whose
+event flag IDs nothing has, so a call that gets further fails at lv2 instead of waiting); the LF queue's Try bodies in
+every direction, around empty and full, rings empty; the lv2 event queue's refusals; the job pipeline over made-up
+instances and workload IDs 0..33 (libsre's answer and what it writes into the info area); the system workload's
+refusals. Left out: calls that would start a task, wait, or give up a system workload on a made-up instance (libsre would
+act on them): those answers are for a test with an instance libsre itself initialized. On the Mac:
+`PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare][spurs-task2]"`
+(PSPOCKET_COMPARE_TRACE=1 names each call first); PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice without the
+firmware (the halves agree on all 212 calls). cellSync's six (D-625) are not in it: its second forms and the attach need
+an ANY2ANY queue's SPU side and SPU threads libsre's own code would drive.
+
+libsre is always native (firmware_module_native: the loader never gives a game Sony's libsre), so the D-594 markers on
+these thirteen and cellSync's six change nothing a game gets, with the system software installed or not: they record
+that the functions wait for this comparison. With them cellSpurs (141 of 141) and cellSync (42 of 42) are pspocket's own:
+5,923 of 6,625 library functions (5,904 before).

@@ -5,11 +5,16 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <functional>
+#include <initializer_list>
+#include <optional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "firmware_compare.hpp"
@@ -608,4 +613,220 @@ TEST_CASE("cellSpurs' SPU sharing functions against libsre (D-509)", "[hle][lle]
     calls.push_back({"cellSpursInitializeForSpuSharing", {0, 1, 100, 1000, 0, 1, 1}, nullptr, "NULL"});
     calls.push_back({"cellSpursInitializeForSpuSharing", {kSpurs + 0x40, 1, 100, 1000, 0, 1, 1}, nullptr, "misaligned"});
     compare(t, sony, calls);
+}
+
+// ------------------------------------------------------------------------- D-626 to D-629: for the Mac
+
+namespace {
+
+constexpr u32 kContainer = kArea + 0x1800, kLfq2 = kArea + 0xD00, kLfqBuf = kArea + 0xE000, kSrc = kArea + 0xF000,
+              kDst = kArea + 0xF100, kBin = kArea + 0xF200, kAttr2 = kArea + 0xF300;
+
+// compare(), with pspocket's half a second time in Sony's place when there is no firmware (PSPOCKET_COMPARE_SELF=1, as
+// compare_util.hpp's comparisons run, D-597): the calls then only show they repeat themselves and do not crash.
+void compare_or_self(GuestThread& t, const FirmwareLibrary* sony, const std::vector<Call>& calls)
+{
+    u8* b = t.f.base();
+    usize differ = 0;
+    for (const Call& c : calls) {
+        if (std::getenv("PSPOCKET_COMPARE_TRACE")) std::fprintf(stderr, "[compare] %s %s\n", c.fn, c.what.c_str());
+        const Answer o = run(b, c, [&](const char* n, const std::vector<u64>& a) { return ours(t, n, a); });
+        const Answer s = run(b, c, [&](const char* n, const std::vector<u64>& a) {
+            return sony ? theirs(t, *sony, n, a) : ours(t, n, a);
+        });
+        if (o.r3 == s.r3 && o.area == s.area) continue;
+        usize at = 0;
+        while (at < o.area.size() && o.area[at] == s.area[at]) at++;
+        if (++differ <= 80)
+            UNSCOPED_INFO(std::format("{} {}: {:#x} (pspocket) vs {:#x} (Sony){}", c.fn, c.what, o.r3, s.r3,
+                at < o.area.size() ? std::format("; area differs first at +{:#x} ({:#04x} vs {:#04x})", at, o.area[at],
+                                         s.area[at])
+                                   : std::string()));
+    }
+    INFO(std::format("{} of {} calls differ", differ, calls.size()));
+    CHECK(differ == 0);
+}
+
+// An LF queue's line as cellSyncLFQueueInitialize leaves it (size 16, `depth` entries at kLfqBuf), with the pop and
+// push counters given (h1 = h4 = pops, h5 = h8 = pushes: nothing handed out), its rings empty.
+void put_lfqueue(u8* b, u32 q, u32 direction, u32 depth, u32 pops, u32 pushes, u32 signal)
+{
+    std::memset(b + q, 0, 128);
+    ps_write16(b, q + 0x00, static_cast<u16>(pops));
+    ps_write16(b, q + 0x06, static_cast<u16>(pops));
+    ps_write16(b, q + 0x08, static_cast<u16>(pushes));
+    ps_write16(b, q + 0x0E, static_cast<u16>(pushes));
+    ps_write32(b, q + 0x10, 16);
+    ps_write32(b, q + 0x14, depth);
+    ps_write64(b, q + 0x18, kLfqBuf | (direction == 3 ? 1 : 0));
+    ps_write32(b, q + 0x20, direction == 3 ? 0xFFFF0000u : 0xFFFFFFFFu);
+    ps_write32(b, q + 0x24, direction);
+    ps_write32(b, q + 0x28, direction == 3 ? 0xFFFFFFFFu : 0);
+    ps_write32(b, q + 0x2C, 2);
+    ps_write16(b, q + 0x30, direction == 3 ? 0xFFFF : 0);
+    ps_write16(b, q + 0x50, direction == 3 ? 0xFFFF : 0);
+    ps_write64(b, q + 0x70, signal);
+    for (u32 i = 0; i < depth; i++) ps_write32(b, kLfqBuf + 16 * i, 0xE0 + i);
+}
+
+// A made-up CellSpursTaskset2 at kTaskset: zeros, then its SPURS, workload ID, size and event flag IDs as given.
+void put_taskset2(u8* b, u32 size, u32 flag1, u32 flag2)
+{
+    std::memset(b + kTaskset, 0, 10496);
+    ps_write64(b, kTaskset + 0x60, kSpurs);
+    ps_write32(b, kTaskset + 0x74, 1);
+    ps_write32(b, kTaskset + 0x1890, size);
+    ps_write32(b, kTaskset + 0x1898, flag1);
+    ps_write32(b, kTaskset + 0x189C, flag2);
+}
+
+} // namespace
+
+// The functions D-626 to D-629 made without libsre, against it, on what a call shows without a running SPURS kernel
+// (nothing that would start a task, wait, or ask a made-up SPU thread group for something): every argument check in
+// the order the module makes them; the exit code containers in each state of their status word (Get only where the
+// code is stored, so neither half waits); the LF queue's Try bodies on queues empty, full and in between, each
+// direction, rings empty (no signal); the lv2 event queue's refusals; the job pipeline over made-up instances (what
+// libsre answers, and writes into the info area, for each workload ID); the system workload given up or refused.
+// Hidden while they are expected to differ (D-597): "[compare][spurs-task2]" on the Mac;
+// PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice without the firmware.
+TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system workload functions against libsre "
+          "(D-626 to D-629)", "[.][hle][lle][compare][spurs][spurs-task2]")
+{
+    const std::optional<std::string> flash = test_dev_flash();
+    const char* self = std::getenv("PSPOCKET_COMPARE_SELF");
+    if (!flash && !(self && *self && *self != '0'))
+        SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with (PSPOCKET_COMPARE_SELF=1 runs pspocket's "
+             "half twice)");
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    std::optional<FirmwareLibrary> sony;
+    if (flash) sony.emplace(f, t, *flash, "cellSpurs", false);
+    std::mt19937 rng(20261011);
+    std::vector<Call> calls;
+
+    // Exit code containers: TryGet in every state, Get where the code is there; the pointers' checks.
+    for (const u32 status : {0u, 1u, 4u, 5u, 0x10001u, 0x20001u, 0x10005u, 0x20005u, 0xFFFFFFFBu, 0xFFFFFFFFu}) {
+        const auto setup = [status](u8* b) {
+            std::memset(b + kContainer, 0, 128);
+            ps_write32(b, kContainer + 0x20, status);
+            ps_write32(b, kContainer + 0x28, 0x12345678);
+            ps_write64(b, kContainer + 0x30, kTaskset);
+            b[kContainer + 0x38] = 3;
+        };
+        const std::string what = std::format("status {:#x}", status);
+        calls.push_back({"cellSpursTaskExitCodeTryGet", {kContainer, kOut}, setup, what});
+        if ((status & 5) == 5) calls.push_back({"cellSpursTaskExitCodeGet", {kContainer, kOut}, setup, what});
+    }
+    const auto unbound = [](u8* b) { std::memset(b + kContainer, 0, 128); };
+    for (const char* fn : {"cellSpursTaskExitCodeTryGet", "cellSpursTaskExitCodeGet"}) {
+        for (const u32 c : {0u, kContainer + 0x40u, kContainer + 8u})
+            calls.push_back({fn, {c, kOut}, unbound, std::format("container {:#x}", c)});
+        calls.push_back({fn, {kContainer, 0}, unbound, "no exit code pointer, nothing bound"});
+    }
+
+    // CellSpursTaskset2's tasks: the refusals any order of checks makes before a task is touched (pointers NULL or
+    // misaligned, a task ID out of range), on made-up tasksets of both sizes with event flag IDs nothing has (a call
+    // that got past its checks then fails at lv2 instead of waiting). A call that would create a task or wait is left
+    // to the Mac session's own tests: libsre would start it on a made-up instance.
+    for (const u32 size : {10496u, 6400u}) {
+        const auto setup = [size](u8* b) {
+            put_taskset2(b, size, 0x98FFFF01u, 0x98FFFF02u);
+            std::memset(b + kElf, 0, 0x100);
+            std::memset(b + kBin, 0, 32);
+            ps_write64(b, kBin, kElf + 8);
+            std::memset(b + kAttr2, 0, 0x100);
+        };
+        const std::string what = std::format("size {}", size);
+        calls.push_back({"cellSpursCreateTask2", {kTaskset, 0, kElf, 0, 0}, setup, what + " no id"});
+        calls.push_back({"cellSpursCreateTask2", {0, kOut, kElf, 0, 0}, setup, what + " no taskset"});
+        calls.push_back({"cellSpursCreateTask2", {kTaskset + 0x40, kOut, kElf, 0, 0}, setup, what + " misaligned"});
+        calls.push_back({"cellSpursCreateTask2", {kTaskset, kOut, 0, 0, kAttr2}, setup, what + " no ELF"});
+        calls.push_back({"cellSpursCreateTask2", {kTaskset, kOut, kElf + 8, 0, kAttr2}, setup, what + " ELF + 8"});
+        calls.push_back({"cellSpursCreateTask2WithBinInfo", {kTaskset, 0, kBin, 0, 0, 0, 0}, setup, what + " no id"});
+        calls.push_back({"cellSpursCreateTask2WithBinInfo", {0, kOut, kBin, 0, 0, 0, 0}, setup, what + " no taskset"});
+        calls.push_back({"cellSpursCreateTask2WithBinInfo", {kTaskset, kOut, 0, 0, 0, 0, 0}, setup, what + " no bin"});
+        calls.push_back(
+            {"cellSpursCreateTask2WithBinInfo", {kTaskset + 0x20, kOut, kBin, 0, 0, 0, 0}, setup, what + " misaligned"});
+        calls.push_back({"cellSpursCreateTask2WithBinInfo", {kTaskset, kOut, kBin, 0, 0, 0, 0}, setup, what + " ELF + 8"});
+        for (const char* fn : {"cellSpursJoinTask2", "cellSpursTryJoinTask2"}) {
+            calls.push_back({fn, {0, 1, kOut}, setup, what + " no taskset"});
+            calls.push_back({fn, {kTaskset + 0x10, 1, kOut}, setup, what + " misaligned"});
+            calls.push_back({fn, {kTaskset, 128, kOut}, setup, what + " task 128"});
+            calls.push_back({fn, {kTaskset, 0xFFFFFFFF, kOut}, setup, what + " task -1"});
+        }
+        calls.push_back({"cellSpursDestroyTaskset2", {0}, setup, what + " no taskset"});
+        calls.push_back({"cellSpursDestroyTaskset2", {kTaskset + 0x40}, setup, what + " misaligned"});
+    }
+
+    // The LF queue's Try bodies (isBlocking 0, nothing to wait for), every direction, around empty and full.
+    for (const u32 direction : {0u, 1u, 2u, 3u}) {
+        for (const auto& [pops, pushes] : std::initializer_list<std::pair<u32, u32>>{{0, 0}, {0, 2}, {0, 4}, {3, 7},
+                 {6, 1}, {7, 7}}) {
+            for (const u32 signal : {kTaskset, kSpurs | 1}) {
+                const auto setup = [=](u8* b) {
+                    put_lfqueue(b, kLfq, direction, 4, pops, pushes, signal);
+                    for (u32 i = 0; i < 16; i += 4) ps_write32(b, kSrc + i, 0x5A5A0000 + i);
+                };
+                const std::string what = std::format("direction {} pops {} pushes {} signal {:#x}", direction, pops,
+                    pushes, signal);
+                calls.push_back({"_cellSpursLFQueuePushBody", {kLfq, kSrc, 0}, setup, what});
+                calls.push_back({"_cellSpursLFQueuePopBody", {kLfq, kDst, 0}, setup, what});
+            }
+        }
+    }
+    for (const char* fn : {"_cellSpursLFQueuePushBody", "_cellSpursLFQueuePopBody"}) {
+        const auto setup = [](u8* b) { put_lfqueue(b, kLfq, 2, 4, 0, 0, kTaskset); };
+        calls.push_back({fn, {0, kSrc, 0}, setup, "no queue"});
+        calls.push_back({fn, {kLfq, 0, 0}, setup, "no buffer"});
+        calls.push_back({fn, {kLfq + 0x40, kSrc, 0}, setup, "misaligned queue"});
+        calls.push_back({fn, {kLfq, kSrc + 8, 0}, setup, "misaligned buffer"});
+    }
+    // The lv2 event queue's refusals: none to detach; an SPU2SPU queue; bad pointers.
+    for (const u32 direction : {0u, 1u, 2u, 3u}) {
+        const auto setup = [direction](u8* b) { put_lfqueue(b, kLfq2, direction, 4, 0, 0, kTaskset); };
+        calls.push_back({"cellSpursLFQueueDetachLv2EventQueue", {kLfq2}, setup, std::format("direction {}", direction)});
+        if (direction == 0)
+            calls.push_back({"cellSpursLFQueueAttachLv2EventQueue", {kLfq2}, setup, "SPU2SPU"});
+    }
+    for (const char* fn : {"cellSpursLFQueueAttachLv2EventQueue", "cellSpursLFQueueDetachLv2EventQueue"}) {
+        calls.push_back({fn, {0}, nullptr, "no queue"});
+        calls.push_back({fn, {kLfq2 + 0x40}, nullptr, "misaligned"});
+    }
+
+    // The job pipeline over made-up instances: what libsre answers and writes for each workload ID.
+    for (u32 round = 0; round < 4; round++) {
+        const u32 seed = static_cast<u32>(rng());
+        const bool second = round % 2;
+        const auto setup = [=](u8* b) {
+            std::mt19937 r(seed);
+            put_spurs(b, r, second, round < 2 ? 0xFFFFFFFFu : 0x0000FFFFu);
+            ps_write32(b, kSpurs + 0xD6C, 0); // no exception
+        };
+        for (const u32 wid : {0u, 1u, 15u, 16u, 31u, 32u, 33u})
+            calls.push_back({"cellSpursGetJobPipelineInfo", {kSpurs, wid, kInfo}, setup,
+                std::format("wid {} second {} round {}", wid, second, round)});
+    }
+    calls.push_back({"cellSpursGetJobPipelineInfo", {0, 1, kInfo}, nullptr, "no instance"});
+    calls.push_back({"cellSpursGetJobPipelineInfo", {kSpurs, 1, 0}, nullptr, "no info"});
+    calls.push_back({"cellSpursGetJobPipelineInfo", {kSpurs + 0x40, 1, kInfo}, nullptr, "misaligned"});
+
+    // The system workload's refusals: an instance without it, one in exception state, bad pointers. (Giving it up on a
+    // made-up instance could make libsre wait for a workload's shutdown: the Mac session's own test, with a SPURS
+    // libsre initialized, is where that answer is read.)
+    for (const auto& [flags, exception] : std::initializer_list<std::pair<u32, u32>>{{0, 0}, {0, 1}, {0x02000000u, 1},
+             {0x10000004u, 0}}) {
+        const auto setup = [=](u8* b) {
+            std::memset(b + kSpurs, 0, 0x1000);
+            ps_write32(b, kSpurs + 0xD80, flags);
+            ps_write32(b, kSpurs + 0xD6C, exception);
+            b[kSpurs + 0x76] = 2;
+        };
+        calls.push_back({"cellSpursRemoveSystemWorkloadForUtility", {kSpurs}, setup,
+            std::format("flags {:#x} exception {}", flags, exception)});
+    }
+    calls.push_back({"cellSpursRemoveSystemWorkloadForUtility", {0}, nullptr, "no instance"});
+    calls.push_back({"cellSpursRemoveSystemWorkloadForUtility", {kSpurs + 0x40}, nullptr, "misaligned"});
+
+    compare_or_self(t, sony ? &*sony : nullptr, calls);
 }

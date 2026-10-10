@@ -608,6 +608,35 @@ s32 cellSpursSetPreemptionVictimHints(PPUContext& ctx, u32 spurs, u32 is_preempt
     return lv2::CELL_OK;
 }
 
+// cellSpursRemoveSystemWorkloadForUtility(spurs) (D-629, unverified: RPCS3 has an UNIMPLEMENTED stub answering
+// CELL_OK; libsre was not read): an instance made with the system workload (cellSpursAttributeEnableSystemWorkload,
+// which lends some of its SPUs to the system's own SPU work) gives it up, so that a system utility a game starts can
+// have those SPUs. A native SPURS lends no SPU (it has no system workload running, as RPCS3's, D-171): the removal
+// only takes the instance's SAF_SYSTEM_WORKLOAD_ENABLED flag away, so that what needs the system workload
+// (cellSpursSetPreemptionVictimHints) is PERM afterwards, as for an instance made without one. Checks, as the victim
+// hints' (libsre's): NULL, ALIGN, memory (NULL_POINTER, as that function's, D-042); an instance in exception state
+// STAT; one without the system workload (or that gave it up already) PERM.
+s32 cellSpursRemoveSystemWorkloadForUtility(PPUContext& ctx, u32 spurs)
+{
+    constexpr std::string_view fn = "cellSpursRemoveSystemWorkloadForUtility";
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "SPURS instance", spurs, CELL_SPURS_SIZE, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    for (u32 flags = atomic_load_be32(base, spurs + spurs_off::flags);;) {
+        if (!(flags & SAF_SYSTEM_WORKLOAD_ENABLED)) return error(CELL_SPURS_CORE_ERROR_PERM);
+        const u32 seen = atomic_cas_be32(base, spurs + spurs_off::flags, flags, flags & ~SAF_SYSTEM_WORKLOAD_ENABLED);
+        if (seen == flags) break;
+        flags = seen;
+    }
+    PS_LOG_INFO(kChan, "{}(SPURS {:#x}): the system workload is given up (it lent no SPU natively)", fn, spurs);
+    return lv2::CELL_OK;
+}
+
 // cellSpurs 0xE279681F, a libsre export no SDK names (0xF664): NULL (both), ALIGN, then the word at CellSpurs + 0x10
 // (the first four idle SPU counts, or SPURS2's ready counts of workloads 16..19).
 s32 cellSpurs_E279681F(PPUContext& ctx, u32 spurs, u32 out)
@@ -4266,6 +4295,45 @@ s32 cellSpursJobChainGetError(PPUContext& ctx, u32 job_chain, u32 cause)
     return chain_error;
 }
 
+// cellSpursGetJobPipelineInfo(spurs, wid, info) (D-629, unverified: RPCS3 has an UNIMPLEMENTED stub answering CELL_OK
+// and no structure; libsre was not read): what each SPU's job chain policy module has in its pipeline (the jobs it
+// fetched, is loading, runs and is writing back), which libsre can only read from SPUs a job stopped on an exception
+// (the job chain's exception event handler is where such information is asked for). A native SPURS has no such
+// pipeline (its job chain policy runs one job at a time to its end, D-055) and stops the process when a job faults
+// (CLAUDE.md rule 5), so no job chain is ever stopped in one: after its checks the call answers JOB_ERROR_STAT and
+// writes nothing (CellSpursJobPipelineInfo's layout is not known, so nothing could be written faithfully either).
+// Checks: NULL (spurs, info), the instance's 128-byte ALIGN, memory (FAULT, D-042), a workload ID past the instance's
+// (INVAL), one not registered (SRCH), one that is not a job chain (INVAL).
+s32 cellSpursGetJobPipelineInfo(PPUContext& ctx, u32 spurs, u32 wid, u32 info)
+{
+    constexpr std::string_view fn = "cellSpursGetJobPipelineInfo";
+    if (!spurs || !info) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "SPURS instance", spurs, CELL_SPURS_SIZE, CELL_SPURS_JOB_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_JOB_ERROR_SRCH);
+    bool job_chain = false;
+    {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.instances.find(spurs); it != h.instances.end()) {
+            const auto w = it->second.workloads.find(wid);
+            job_chain = w != it->second.workloads.end() && w->second.kind == Workload::Kind::JobChain;
+        }
+    }
+    if (!job_chain) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        PS_LOG_WARN(kChan, "{}(SPURS {:#x}, workload {}): no job chain of a native SPURS stops in a job, so there is no "
+            "pipeline to report: CELL_SPURS_JOB_ERROR_STAT (D-629)", fn, spurs, wid);
+    }
+    return error(CELL_SPURS_JOB_ERROR_STAT);
+}
+
 // cellSpursJobChainGetSpursAddress(jobChain, spurs), as libsre: NULL (both), ALIGN, INVAL for a workload ID past 31 (RPCS3
 // does not check it); then the chain's CellSpurs (u32).
 s32 cellSpursJobChainGetSpursAddress(PPUContext& ctx, u32 job_chain, u32 spurs)
@@ -4675,7 +4743,7 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xE7B0E69A, cellSpursJobSetMaxGrab),
         PS_HLE_INTERNAL(NID_event_helper, _pspocket_spurs_event_helper),
         // Made without libsre to compare with (D-594): CellSpursTaskset2's tasks (D-626), the exit code containers
-        // (D-627), the LF queue's bodies and lv2 event queue (D-628).
+        // (D-627), the LF queue's bodies and lv2 event queue (D-628), the job pipeline and the system workload (D-629).
         PS_HLE_UNVERIFIED(0xE14CA62D, cellSpursCreateTask2),
         PS_HLE_UNVERIFIED(0xE4944A1C, cellSpursCreateTask2WithBinInfo),
         PS_HLE_UNVERIFIED(0xA7A94892, cellSpursJoinTask2),
@@ -4687,6 +4755,8 @@ void register_cellSpurs(Registry& r)
         PS_HLE_UNVERIFIED(0x35DAE22B, _cellSpursLFQueuePopBody),
         PS_HLE_UNVERIFIED(0x1656D49F, cellSpursLFQueueAttachLv2EventQueue),
         PS_HLE_UNVERIFIED(0x73E06F91, cellSpursLFQueueDetachLv2EventQueue),
+        PS_HLE_UNVERIFIED(0xD86380D8, cellSpursGetJobPipelineInfo),
+        PS_HLE_UNVERIFIED(0x31F5196B, cellSpursRemoveSystemWorkloadForUtility),
     });
 }
 

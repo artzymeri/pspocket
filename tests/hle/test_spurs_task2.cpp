@@ -1,7 +1,8 @@
 // cellSpurs' last functions on the native SPURS, made without libsre to compare with (unverified, D-594), with
 // synthetic SPU tasks (assembled here: no game data): CellSpursTaskset2's own tasks, created, run and joined with their
 // exit codes (D-626); task exit code containers (D-627); the LF queue's bodies and lv2 event queue through SPURS, with
-// PPU threads on one side and SPU code (the host on its behalf, or a waiting task) on the other (D-628).
+// PPU threads on one side and SPU code (the host on its behalf, or a waiting task) on the other (D-628); the job
+// pipeline's answer and the system workload given up (D-629).
 
 #include "hle_test_util.hpp"
 
@@ -42,10 +43,11 @@ constexpr u32 kCtx = kData + 0x20000;  // context save areas: 1 KB + one LS bloc
 constexpr u32 kElf = kData + 0x30000;  // task ELFs, 0x1000 apart
 constexpr u32 kLfq = kData + 0x40000, kLfqBuf = kData + 0x41000, kSrc = kData + 0x42000, kDst = kData + 0x42100,
               kOutWord = kData + 0x42200, kLfq2 = kData + 0x42400;
+constexpr u32 kChain = kData + 0x50000, kCmds = kData + 0x50200;
 constexpr u32 kUnmapped = 0x0FFF0000;
 constexpr u32 kBuf = 0x3800; // the tasks' LS buffer for DMA
 
-constexpr u32 TASK = 0x80410900, POLICY = 0x80410800;
+constexpr u32 TASK = 0x80410900, CORE = 0x80410700, JOB = 0x80410A00, POLICY = 0x80410800;
 constexpr u32 kAgain = 0x01, kInval = 0x02, kSrch = 0x05, kNoexec = 0x07, kPerm = 0x09, kBusy = 0x0A, kFault = 0x0D,
               kStat = 0x0F, kAlign = 0x10, kNull = 0x11, kShutdown = 0x20;
 u64 code(u32 c) { return r3_of_code(c); }
@@ -302,7 +304,8 @@ TEST_CASE("cellSpurs: the functions made without libsre to compare with, under t
     for (const char* name : {"cellSpursCreateTask2", "cellSpursCreateTask2WithBinInfo", "cellSpursJoinTask2",
              "cellSpursTryJoinTask2", "cellSpursDestroyTaskset2", "cellSpursTaskExitCodeGet",
              "cellSpursTaskExitCodeTryGet", "_cellSpursLFQueuePushBody", "_cellSpursLFQueuePopBody",
-             "cellSpursLFQueueAttachLv2EventQueue", "cellSpursLFQueueDetachLv2EventQueue"}) {
+             "cellSpursLFQueueAttachLv2EventQueue", "cellSpursLFQueueDetachLv2EventQueue", "cellSpursGetJobPipelineInfo",
+             "cellSpursRemoveSystemWorkloadForUtility"}) {
         INFO(name);
         const hle::Function* fn = hle::registry().find("cellSpurs", recomp::nid_of(name));
         REQUIRE(fn != nullptr);
@@ -918,4 +921,60 @@ TEST_CASE("cellSpursLFQueueAttachLv2EventQueue and Detach: an lv2 queue on a dyn
     REQUIRE(s.a.call("cellSpursLFQueueDetachLv2EventQueue", kLfq2) == 0);
     CHECK(ps_read32(b, kLfq2 + kBs) == 0xFFFF0000);
     CHECK(line_half(b, kLfq2 + kH3) == 0);
+}
+
+// ------------------------------------------------------------------------------------------------- D-629
+
+TEST_CASE("cellSpursGetJobPipelineInfo: its checks, then STAT: no job chain of a native SPURS stops in a job (D-629)",
+    "[hle][spurs][spurs-task2]")
+{
+    Task2Fixture s(false);
+    u8* b = s.b;
+    std::memset(b + kPrio, 0, 8);
+    ps_write64(b, kCmds, 0x7F); // END
+    REQUIRE(s.a.call("cellSpursCreateJobChain", kSpurs, kChain, kCmds, 0x80, 4, kPrio, 1, 1, 4, 5) == 0);
+    const u32 jwid = ps_read32(b, kChain + 0x74);
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", 0, jwid, kOutWord) == code(JOB | kNull));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, jwid, 0) == code(JOB | kNull));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs + 0x40, jwid, kOutWord) == code(JOB | kAlign));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kUnmapped, jwid, kOutWord) == code(JOB | kFault));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, 16, kOutWord) == code(JOB | kInval)); // SPURS1: 16
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, 15, kOutWord) == code(JOB | kSrch));  // no workload 15
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, s.wid, kOutWord) == code(JOB | kInval)); // a taskset
+    ps_write32(b, kOutWord, 0x5A5A5A5A);
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, jwid, kOutWord) == code(JOB | kStat));
+    CHECK(ps_read32(b, kOutWord) == 0x5A5A5A5A); // nothing written
+    REQUIRE(s.a.call("cellSpursShutdownJobChain", kChain) == 0);
+    REQUIRE(s.a.call("cellSpursJoinJobChain", kChain) == 0);
+}
+
+TEST_CASE("cellSpursRemoveSystemWorkloadForUtility: an instance made with the system workload gives it up; PERM for "
+          "one without (D-629)", "[hle][spurs][spurs-task2]")
+{
+    constexpr u32 kSwlPrio = kData + 0x15500, kPreempt = kData + 0x15510, kPlain = kData + 0x18000;
+    Fixture f(config(false));
+    GuestThread a(f, 0, "ppu");
+    u8* b = f.base();
+    const u8 swl_prio[8] = {0, 1, 0, 0, 0, 0, 0, 0}, preempt[8] = {1, 1, 0, 0, 0, 0, 0, 0};
+    std::memcpy(b + kSwlPrio, swl_prio, 8);
+    std::memcpy(b + kPreempt, preempt, 8);
+    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 2, 200, 2016, 0) == 0);
+    REQUIRE(a.call("cellSpursAttributeEnableSystemWorkload", kSpursAttr, kSwlPrio, 1, kPreempt) == 0);
+    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
+    CHECK(a.call("cellSpursSetPreemptionVictimHints", kSpurs, kPreempt) == 0);
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", 0) == code(CORE | kNull));
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kSpurs + 0x40) == code(CORE | kAlign));
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kUnmapped) == code(CORE | kNull));
+    ps_write32(b, kSpurs + 0xD6C, 1); // an exception
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kSpurs) == code(CORE | kStat));
+    ps_write32(b, kSpurs + 0xD6C, 0);
+    REQUIRE(a.call("cellSpursRemoveSystemWorkloadForUtility", kSpurs) == 0);
+    CHECK((ps_read32(b, kSpurs + 0xD80) & 0x02000000u) == 0);
+    CHECK(a.call("cellSpursSetPreemptionVictimHints", kSpurs, kPreempt) == code(CORE | kPerm));
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kSpurs) == code(CORE | kPerm)); // given up already
+    CHECK(a.call("cellSpursFinalize", kSpurs) == 0);
+    // One made without it.
+    REQUIRE(a.call("cellSpursInitialize", kPlain, 1, 200, 2016, 0) == 0);
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kPlain) == code(CORE | kPerm));
+    CHECK(a.call("cellSpursFinalize", kPlain) == 0);
 }
