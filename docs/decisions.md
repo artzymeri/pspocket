@@ -8966,3 +8966,35 @@ picture with more than one text chunk aborted (STREAM_ABORT). The unit test had 
 pspocket half, with tEXt, zTXt and iTXt in one picture, found it (D-597). The strings are in a deque now, which never
 moves a string it holds. Test: tests/hle/test_imgenc.cpp, three text chunks with short keywords and texts in one
 picture, read back with libpng (before the fix the stream aborted).
+
+## D-607 · 2026-10-10 · cellRudp's life and sys_crashdump's log areas, firmware-first; RPCS3 has nothing more to port
+
+A scan of the grey cells (scripts/progress.py's missing functions, 751 on 2026-10-10 with D-591 to D-596 in) against
+RPCS3's bodies (runtime/hle/scripts/gen_rpcs3_stubs.py's test of a stub, over every module of
+rpcs3/Emu/Cell/Modules) found five functions RPCS3 implements that pspocket did not. They are now pspocket's, and their
+two libraries firmware-first (D-563), no Sony module having been at hand:
+- **cellRudp** (runtime/hle/src/cellRudp.cpp): Init (a second one ALREADY_INITIALIZED; CellRudpAllocator's two
+  descriptors kept, or the library's own allocator without one), End and SetEventHandler (NOT_INITIALIZED before Init;
+  End forgets the allocator and the handler), RPCS3's checks and error codes; per process. An allocator that is not
+  guest memory is INVALID_ARGUMENT, where RPCS3 reads it unchecked. Nothing calls the allocator or the handler yet: the
+  library's other 28 functions (contexts, bind, listen, read and write, polling) are bare stubs in RPCS3 and need
+  Sony's librudp read or compared on the Mac; until then they log and fail, and where the system software is
+  installed a game gets Sony's librudp whole.
+- **sys_crashdump** (runtime/hle/src/sys_crashdump.cpp): sys_crash_dump_set_user_log_area and
+  sys_crash_dump_get_user_log_area, the memory areas a game names for a crash dump (a 16-byte label, an address, a size:
+  24 bytes), indices 0 to 127, EINVAL past 127 or with no entry, as RPCS3 has them. RPCS3 keeps nothing and its get
+  writes nothing; here set keeps the 24 bytes as given and get writes them back, an index never set reading as zeros.
+  pspocket makes no crash dumps. An entry that is not guest memory is EINVAL. To compare on the Mac: what Sony's get
+  answers for an index never set, and whether set checks the area.
+What the scan found of the other 746: 446 are stubs in RPCS3 (a log, then a constant); 283 are names RPCS3 has no
+body for (sys_libc's and sys_libm's internals and the module entry points, which only PPUFunction.cpp names; the
+codec cores' operation tables and the other variables); 13 are the audio cores' PTS functions for codecs pspocket has
+no core for (one-line stubs in cellAdec.cpp); two are fatal in RPCS3 (cellMicStopEx, sys_lv2coredump's one); and two
+have bodies D-596 already left out on purpose (cellSailSoundAdapterGetFrame gives no frame; cellSysmodule_0x59521326
+needs the OpenPSID's key, D-184). So nothing else can be made from RPCS3: the remaining functions need Sony's modules
+(on the Mac, with the firmware) or, for sys_libc's and sys_libm's internals, a game's own copy of the C library to
+read their arguments in.
+The count: 5,686 of 6,625 library functions pspocket's own before, 5,691 after.
+Tests: tests/hle/test_rudp.cpp (Init with either allocator, End, the handler, every error, a process each, the rest
+left to Sony's) and tests/hle/test_crashdump.cpp (set and get at both ends of the range, an entry replaced, an index
+never set, each EINVAL with nothing written).
