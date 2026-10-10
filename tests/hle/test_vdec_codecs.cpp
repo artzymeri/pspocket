@@ -36,6 +36,8 @@ namespace {
 constexpr u32 CODEC_AVC = 1, CODEC_MPEG4 = 2, CODEC_VC1 = 3, CODEC_DIVX = 5, CODEC_DIVX3_11 = 9, CODEC_MVC = 11,
               CODEC_MVC2 = 13;
 constexpr u32 CELL_VDEC_ERROR_ARG = 0x80610101, CELL_VDEC_ERROR_FATAL = 0x80610180;
+// A build of FFmpeg from before D-588 (the Mac's until build-ffmpeg.sh runs again) has no VC-1 decoder.
+constexpr const char* kNoVc1 = "this FFmpeg has no VC-1 decoder (build-ffmpeg.sh again)";
 
 // A picture in YUV 4:2:0 planes without padding, as cellVdec's GetPicture gives it.
 struct Yuv {
@@ -483,6 +485,7 @@ TEST_CASE("cellVdec: CellVdecDivxInfo laid out as RPCS3's for DivX and MPEG-4: t
 TEST_CASE("cellVdec: VC-1's advanced profile on FFmpeg: a stream written here, its pictures, items and information "
           "(D-589)", "[hle][vdec]")
 {
+    if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
     // A sequence header with its display extension (an extended pixel aspect ratio, 25 frames a second, a colour
     // description), an entry point, then I, skipped P, I, skipped P (each I with the headers again, as streams repeat
     // them).
@@ -553,6 +556,7 @@ TEST_CASE("cellVdec: VC-1's advanced profile on FFmpeg: a stream written here, i
 
 TEST_CASE("cellVdec: VC-1's range mapping applied to the pictures, pulldown in the information (D-589)", "[hle][vdec]")
 {
+    if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
     v1::Sequence seq;
     seq.pulldown = true;
     seq.tfcntrflag = true;
@@ -596,6 +600,7 @@ TEST_CASE("cellVdec: VC-1's range mapping applied to the pictures, pulldown in t
 TEST_CASE("cellVdec: VC-1 before its sequence header, a new sequence header, the simple and main profiles refused, "
           "the decode modes (D-589)", "[hle][vdec]")
 {
+    if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
     v1::Sequence seq;
     v1::Sequence small;
     small.width = small.height = 32;

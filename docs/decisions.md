@@ -8356,6 +8356,8 @@ skipped, I, skipped at 64x48 with a display extension: the pictures exactly, AUD
 late, the items, every field of the information block; range mapping (luma by 16/8, chroma by 10/8) applied, pulldown's
 repeat count; access units before the headers skipped (the later pictures with their own PTS); a 32x32 sequence header
 after a 64x48 one, both pictures; levels 0 to 4 FATAL, 10 ARG; mode 3 taken (the picture marked skipped), mode 2 ARG.
+They skip where FFmpeg has no VC-1 decoder (the Mac's build until build-ffmpeg.sh runs again, so its gate still
+passes), as the DivX ones do without their encoders.
 
 To compare with Sony's libvdec on the Mac, over the same streams: CellVdecVc1Info (its layout, picture types and what
 it reports of the headers), whether libsvc1d applies range mapping, the pictures sample for sample, access units before
