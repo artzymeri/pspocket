@@ -7903,7 +7903,7 @@ Test: on this Linux host (x86-64, clang 18), build/host/tests/hle/test_hle "[ade
 run fails only where it did before: test_spu_fuzz (x86 floating point), test_la_noire's SDATA case, sys_libm's
 fmax/fmin signed zeros on glibc.
 
-## D-577 · 2026-10-09 · cellAdec's other codecs: the firmware's core first, pspocket's own on FFmpeg where none (part 1: the rule, the common core, MP3)
+## D-577 · 2026-10-09 · cellAdec's other codecs: firmware first, pspocket's own on FFmpeg (part 1: the rule, MP3)
 
 D-197 left every codec but LPCM and ATRAC3plus to the firmware's core module, so without the PS3 system software a game
 decoding MP3, MPEG audio, AAC, AC-3 or ATRAC3 through cellAdec got CELL_ADEC_ERROR_FATAL. pspocket now has cores of its
@@ -7961,15 +7961,14 @@ CellAdecMpmcInfo from RPCS3's cellAdec.h, the M2BC error codes for both. One fra
 MPEG-1 or MPEG-2 at its lower rates, decoded by mp1float or mp2float into big-endian floats (the structures name no word
 size). channelNumber is read as the CellAdecChannel layouts LPCM's parameters use (libadec's own naming): MONO gives one
 channel (a stereo frame's two averaged), STEREO two (a mono frame in both), anything else the stream's own. MPEG-2's
-multichannel extension is not decoded, its stereo base is (the multichannel's downmix by design): the information says
-2 channels with no surround, centre or LFE (logged once when a layout past stereo is asked). Errors: no 12-bit sync
+multichannel extension is not decoded, its stereo base is (the multichannel's downmix by design): the information says 2
+channels with no surround, centre or LFE (logged once when a layout past stereo is asked). Errors: no 12-bit sync
 (MPEG-2.5's included) SYNCF, the other layer LAYER, the reserved version VERSION, bit rate 15 BITRATE, free format
-UNSUPPORT (FFmpeg decodes it only from a stream), the reserved rate SAMPLEFREQ, a unit shorter than its frame OPENBS, one
-FFmpeg refuses SAMPLE; a CRC mismatch is no error (FFmpeg logs it and decodes the frame; the information has no field
-for it). CellAdecMpmcInfo: the output's channelNumber
-(MONO or STEREO), the header's rate index, protection, bit rate index, mode, extension, emphasis, copyright and
-original, outputFrameSize the samples per channel (384 or 1152), channelConfiguration MONO, DUAL or L_R. PTS: the
-core's own correction (types 32 and 26 call module functions on a PS3).
+UNSUPPORT (FFmpeg decodes it only from a stream), the reserved rate SAMPLEFREQ, a unit shorter than its frame OPENBS,
+one FFmpeg refuses SAMPLE; a CRC mismatch is no error (FFmpeg logs it and decodes the frame; the information has no
+field for it). CellAdecMpmcInfo: the output's channelNumber (MONO or STEREO), the header's rate index, protection, bit
+rate index, mode, extension, emphasis, copyright and original, outputFrameSize the samples per channel (384 or 1152),
+channelConfiguration MONO, DUAL or L_R. PTS: the core's own correction (types 32 and 26 call module functions on a PS3).
 
 **The tests' FFmpeg.** FFmpeg's LGPL encoders write the tests' MPEG layer II, AC-3 and AAC streams. They are in a
 build of their own, build/ffmpeg/<host>-tests (scripts/build-ffmpeg.sh makes it beside the macOS and Linux builds; not

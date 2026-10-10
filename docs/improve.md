@@ -342,14 +342,23 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   structure are inferred from two streams (try a stream with picture order count type 0, cropping, no VUI); VC-1,
   DivX 3.11 and MVC need FFmpeg decoders (vc1, msmpeg4v3: LGPL) and a comparison; MPEG-2 needs a synthetic writer to be
   compared. Speed on a real movie: FFmpeg on one thread, then VideoToolbox for H.264.
-- **cellAdec (D-197, D-198):** the LPCM and ATRAC3plus decoders run on a PPU thread of their own per decoder (libadec
-  and libatxdec use SPURS tasks); the LPCM conversion is scalar (RPCS3's is SIMD: measure on a real Blu-ray LPCM
-  stream before changing). ATRAC3plus decodes 12.9 s of sound in 0.79 s on the M4 including the test's waits (run
-  105): measure on the phone in a game that plays it. Its errors for bad frames are FFmpeg's generic one except a set
-  start bit (Sony's codes per syntax error are not known). The other codecs are still Sony's cores (translated, SPU
-  code on pspocket's SPURS): MP3, AC-3, AAC, ATRAC3 and MPEG audio next on FFmpeg, each compared with Sony's core. No
-  synthetic writer for those yet: MP2, AC-3 and AAC could use FFmpeg's encoders in a test-only build; layer I frames
-  are written in the test; a game's stream can be given to a probe locally (as SND0.AT3 in run 105).
+- **cellAdec (D-197, D-198, D-577 to D-579):** the LPCM and ATRAC3plus decoders run on a PPU thread of their own per
+  decoder (libadec and libatxdec use SPURS tasks); the LPCM conversion is scalar (RPCS3's is SIMD: measure on a real
+  Blu-ray LPCM stream before changing). ATRAC3plus decodes 12.9 s of sound in 0.79 s on the M4 including the test's
+  waits (run 105): measure on the phone in a game that plays it. Its errors for bad frames are FFmpeg's generic one
+  except a set start bit (Sony's codes per syntax error are not known). MP3, MPEG audio layers I and II, MPEG-4 AAC,
+  AC-3 and ATRAC3 have pspocket's own cores on FFmpeg too (adec_ffmpeg.cpp and a file each), which serve only where no
+  firmware module gives Sony's core (firmware first, as D-563 for libraries): their parameters, information blocks and
+  errors are RPCS3's structures read by their names, not yet compared with Sony's. **Try (on the Mac, with the
+  firmware):** each core against Sony's through test_adec.cpp's core_run, as the MPEG layer I comparison runs, on the
+  tests' streams (test_adec_cores.cpp: hand-built MP3, layer I and ATRAC3 frames; layer II, AAC and AC-3 from FFmpeg's
+  encoders in build/ffmpeg/<host>-tests): the sizes (memory, PCM handles, information blocks, versions: pspocket's own
+  numbers now), the PCM's format and channel order (AAC's past stereo, AC-3's channel pointers and downmixes, the MPEG
+  cores' channelNumber), the information blocks' fields (MP3's reservoir sizes, AC-3's counters, AAC's SBR fields), a
+  sequence's first frame (libatxdec gives silence there; FFmpeg's cores give the frame), the errors' codes, and the
+  PTS of the cores whose module corrects it; then drop the firmware-first rule codec by codec. A game's stream can be
+  given to a probe locally (as SND0.AT3 in run 105). Still Sony's only: MPEG-2 AAC, E-AC-3, MP3 surround, ATRAC3
+  multichannel, TrueHD, DTS and WMA (RPCS3's cellAdec.h has no structures for them), and CELP (FFmpeg has no decoder).
 - **cellPngDec (D-199):** decodes the whole image into a host buffer, then copies rows (and converts colour to gray)
   into the game's: one extra copy per image; measure on a game's loading screens before changing. The Ext functions
   (partial decoding with display callbacks, stream callbacks) are Sony's still: write them when a game imports one.
@@ -364,7 +373,7 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   (as libgifdec's output is). The LZW decoder follows giflib's line by line: fine for a game's few small GIFs; measure
   before changing. Not reproduced: the bytes past an extension in libgifdec's buffer (its own state) and a background
   index past the table. Ext functions still Sony's.
-- **State:** open; the other audio cores when a game's log shows one.
+- **State:** open; the audio cores' comparison with Sony's (above), and the rest when a game's log shows one.
 
 - **Done (D-254):** H.264 decodes on VideoToolbox through FFmpeg's hwaccel: the same pictures as the software decoder,
   the decoding thread 77% less CPU (0.44 instead of 1.95 ms a 720p picture on the M4). **Try:** a game that plays
