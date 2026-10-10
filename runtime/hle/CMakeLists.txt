@@ -129,6 +129,7 @@ add_library(pspocket_hle STATIC
     src/cellNetAoi.cpp
     src/libad.cpp
     src/libmedi.cpp
+    src/cellLibprof.cpp
     src/sys_libstdcxx.cpp
     src/stdcxx_streams.cpp
     src/stdcxx_facets.cpp
