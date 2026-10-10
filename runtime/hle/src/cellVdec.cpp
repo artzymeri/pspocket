@@ -1,7 +1,8 @@
 // cellVdec: the video decoder (libvdec), pspocket's own on FFmpeg (D-181, D-195). H.264 (and the JVT form of it),
 // MPEG-2 and MPEG-4 part 2 (as in DivX) decode with FFmpeg as in RPCS3 (rpcs3/Emu/Cell/Modules/cellVdec.cpp: the
-// sequence states, the commands, the checks of each call, the picture formats). What a game sees follows Sony's
-// libvdec 4.92 as it ran over synthetic H.264 in tests/hle/test_vdec.cpp (D-195), where it differs from RPCS3's:
+// sequence states, the commands, the checks of each call, the picture formats). DivX 3.11 (D-588), which RPCS3 does not
+// decode, goes the same way. What a game sees follows Sony's libvdec 4.92 as it ran over synthetic H.264 in
+// tests/hle/test_vdec.cpp (D-195), where it differs from RPCS3's:
 //
 // - Sizes: cellVdecQueryAttr gives Sony's. For H.264 the decoder's memory comes from libavcdec's avcDecQueryMemory,
 //   reconstructed (avc_memory below: Sony's answers in every case tried); for the other codecs, Sony's answers for each
@@ -18,8 +19,9 @@
 // - Pictures to RGBA and ARGB use the colour matrix asked for (BT.601 or BT.709, limited range; RPCS3: a TODO), with
 //   the exact coefficients, truncated: within one step of Sony's values. UYVY repeats each chroma row, as Sony's.
 //
-// Not yet (each fails loudly): VC-1, DivX 3.11 and MVC decoding (no FFmpeg decoder in pspocket's build), the codec
-// specific information of codecs other than H.264 in the sizes (Sony's answer without it is given, and logged).
+// Not yet (each fails loudly): VC-1 and MVC decoding (open fails, logged), the codec specific information of codecs
+// other than H.264 in the sizes (Sony's answer without it is given, and logged; DivX 3.11's is checked and gives the
+// frame size).
 
 #include <algorithm>
 #include <array>
@@ -89,6 +91,10 @@ constexpr s32 DEC_MODE_NORMAL = 0, DEC_MODE_B_SKIP = 1, DEC_MODE_PB_SKIP = 2;
 constexpr u32 PICFMT_RGBA32 = 1, PICFMT_UYVY422 = 2, PICFMT_YUV420_PLANAR = 3;
 constexpr u32 AVC_LEVEL_UNK = 1042; // 4.2 with the deblocking filter off
 constexpr u32 kVersionUpper = 0x4920000;
+// DivX 3.11's frames carry no size (an AVI file's header does): RPCS3's default for its decoder (query_attr_divx,
+// DivxDecParams), the largest it takes through CellVdecDivxSpecificInfo2, and that structure's size (D-588).
+constexpr u32 kDivx311Width = 720, kDivx311Height = 576, kDivx311MaxWidth = 1920, kDivx311MaxHeight = 1088;
+constexpr u32 kDivxSpecificInfo2Size = 12;
 
 // ---- sizes
 
@@ -253,6 +259,14 @@ s32 query_attr(PPUContext& ctx, u32 codec, u32 level, u32 spec, Attr& out)
         return (s.codec == codec || (codec == CODEC_MVC2 && s.codec == CODEC_MVC)) && s.level == level;
     });
     if (it == std::end(kLevelSizes)) return error(CELL_VDEC_ERROR_ARG);
+    if (spec && codec == CODEC_DIVX3_11) {
+        // CellVdecDivxSpecificInfo2 (RPCS3 cellVdec.h: thisSize, maxDecodedFrameWidth, maxDecodedFrameHeight,
+        // numberOfDecodedFrameBuffer), the only form DivX 3.11 takes, checked as RPCS3's query_attr_divx checks it.
+        if (!guest_readable(thread_of(ctx), spec, 10) || ps_read32(base, spec) != kDivxSpecificInfo2Size ||
+            ps_read16(base, spec + 4) > kDivx311MaxWidth || ps_read16(base, spec + 6) > kDivx311MaxHeight ||
+            (ps_read16(base, spec + 8) != 0 && ps_read16(base, spec + 8) != 2))
+            return error(CELL_VDEC_ERROR_ARG);
+    }
     if (spec)
         PS_LOG_WARN(kChan, "cellVdecQueryAttr: codec {} specific information ({:#x}) is not reproduced; Sony's size "
                            "without it is given", codec, spec);
@@ -496,11 +510,10 @@ void scan_avc_au(std::span<const u8> au, AvcAuInfo& info, AvcSps& sps)
     }
 }
 
-// CELL_VDEC_AVC_FRC_* from the VUI timing (two ticks a frame), 0xFF when it names none.
-u8 avc_frame_rate_code(const AvcSps& s)
+// The index of a frame rate among the eight the codecs name (CELL_VDEC_FRC_* less 0x80, CELL_VDEC_AVC_FRC_*):
+// 24000/1001, 24, 25, 30000/1001, 30, 50, 60000/1001, 60; 0xFF for another.
+u8 frame_rate_index(double fps)
 {
-    if (!s.timing || !s.units_in_tick) return 0xFF;
-    const double fps = static_cast<double>(s.time_scale) / (2.0 * s.units_in_tick);
     const struct {
         double fps;
         u8 code;
@@ -508,6 +521,13 @@ u8 avc_frame_rate_code(const AvcSps& s)
     for (const auto& c : codes)
         if (std::abs(fps - c.fps) < 0.002) return c.code;
     return 0xFF;
+}
+
+// CELL_VDEC_AVC_FRC_* from the VUI timing (two ticks a frame), 0xFF when it names none.
+u8 avc_frame_rate_code(const AvcSps& s)
+{
+    if (!s.timing || !s.units_in_tick) return 0xFF;
+    return frame_rate_index(static_cast<double>(s.time_scale) / (2.0 * s.units_in_tick));
 }
 
 // ---- the decoder
@@ -538,6 +558,12 @@ struct Picture {
     std::vector<u8> y, u, v; // planar 4:2:0, no padding
     AuMeta meta;
     bool item_taken = false;
+    // What FFmpeg reports of the stream with the picture (CellVdecDivxInfo): the pixel aspect ratio (0/0: none), the
+    // colour description (ISO/IEC 23001-8 codes, as MPEG-4's; 2: unspecified), the field order and the frame rate.
+    s32 sar_num = 0, sar_den = 0;
+    u8 primaries = 2, transfer = 2, matrix = 2;
+    bool interlaced = false, top_field_first = false;
+    double fps = 0;
 };
 
 struct Command {
@@ -565,6 +591,7 @@ struct Vdec {
     u64 thread_id = 0;
     u32 tls = 0;
     AvcSps sps;
+    u32 divx_width = kDivx311Width, divx_height = kDivx311Height; // DivX 3.11's frame size (the stream has none)
 #if PSPOCKET_HAVE_FFMPEG
     AVCodecContext* av = nullptr;
 #endif
@@ -664,8 +691,36 @@ const AVCodec* decoder_for(u32 codec)
     case CODEC_MPEG2: return avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
     case CODEC_MPEG4:
     case CODEC_DIVX: return avcodec_find_decoder(AV_CODEC_ID_MPEG4);
+    case CODEC_DIVX3_11: return avcodec_find_decoder(AV_CODEC_ID_MSMPEG4V3); // Microsoft's MPEG-4 version 3 (D-588)
     default: return nullptr;
     }
+}
+
+// Opens FFmpeg's decoder for the decoder's codec, with the frame size DivX 3.11's frames do not carry. False when
+// FFmpeg has no decoder for it or refuses it (logged).
+bool open_ffmpeg(Vdec& v, std::string_view call)
+{
+    const AVCodec* dec = decoder_for(v.codec);
+    if (!dec) {
+        PS_LOG_ERROR(kChan, "{}: codec {} is not decoded by pspocket (no decoder in its FFmpeg)", call, v.codec);
+        return false;
+    }
+    v.av = avcodec_alloc_context3(dec);
+    v.av->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+    v.av->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
+    v.av->thread_count = 1; // pictures out as soon as decoded: Sony's lag is added in announce()
+    if (v.codec == CODEC_DIVX3_11) {
+        v.av->width = v.av->coded_width = static_cast<int>(v.divx_width);
+        v.av->height = v.av->coded_height = static_cast<int>(v.divx_height);
+    }
+    const bool hardware = vdec_hw::attach(v.av); // H.264 on the media engine (D-254)
+    if (avcodec_open2(v.av, dec, nullptr) < 0) {
+        PS_LOG_ERROR(kChan, "{}: FFmpeg's decoder for codec {} did not open", call, v.codec);
+        avcodec_free_context(&v.av);
+        return false;
+    }
+    PS_LOG_INFO(kChan, "{}: codec {} decodes {}", call, v.codec, hardware ? "on VideoToolbox" : "in software");
+    return true;
 }
 
 // The pictures the decoder has ready, with the access units they came from.
@@ -680,6 +735,14 @@ void receive_pictures(Vdec& v, std::map<u64, AuMeta>& in_flight, u64 seq)
         p.width = static_cast<u32>(f->width);
         p.height = static_cast<u32>(f->height);
         p.pict_type = f->pict_type;
+        p.sar_num = f->sample_aspect_ratio.num;
+        p.sar_den = f->sample_aspect_ratio.den;
+        p.primaries = static_cast<u8>(f->color_primaries);
+        p.transfer = static_cast<u8>(f->color_trc);
+        p.matrix = static_cast<u8>(f->colorspace);
+        p.interlaced = (f->flags & AV_FRAME_FLAG_INTERLACED) != 0;
+        p.top_field_first = (f->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0;
+        if (v.av->framerate.num > 0 && v.av->framerate.den > 0) p.fps = av_q2d(v.av->framerate);
         // 4:2:0 from FFmpeg's software decoder, or from the media engine's pixel buffer (D-254).
         if (!vdec_hw::planes(f, p.width, p.height, p.y, p.u, p.v)) {
             PS_LOG_ERROR(kChan, "decoder {:#x}: a picture in pixel format {} (not 8-bit 4:2:0) is not supported", v.handle,
@@ -860,22 +923,19 @@ s32 open(PPUContext& ctx, u32 type, u32 spec, u32 res, u32 cb, u32 handle_out, c
     v->level = level;
     v->cb_func = ps_read32(base, cb);
     v->cb_arg = ps_read32(base, cb + 4);
+    if (codec == CODEC_DIVX3_11) {
+        // DivX 3.11's frame size (D-588): the stream has none, so the codec specific information's largest frame
+        // (query_attr checked it) is the picture's, else RPCS3's default for the decoder.
+        if (spec && ps_read16(base, spec + 4) && ps_read16(base, spec + 6)) {
+            v->divx_width = ps_read16(base, spec + 4);
+            v->divx_height = ps_read16(base, spec + 6);
+        } else {
+            PS_LOG_WARN(kChan, "{}: DivX 3.11 without its frame size (CellVdecDivxSpecificInfo2): {}x{} assumed", call,
+                kDivx311Width, kDivx311Height);
+        }
+    }
 #if PSPOCKET_HAVE_FFMPEG
-    const AVCodec* dec = decoder_for(codec);
-    if (!dec) {
-        PS_LOG_ERROR(kChan, "{}: codec {} is not decoded by pspocket (no decoder in its FFmpeg)", call, codec);
-        return error(CELL_VDEC_ERROR_FATAL);
-    }
-    v->av = avcodec_alloc_context3(dec);
-    v->av->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
-    v->av->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
-    v->av->thread_count = 1; // pictures out as soon as decoded: Sony's lag is added in announce()
-    const bool hardware = vdec_hw::attach(v->av); // H.264 on the media engine (D-254)
-    if (avcodec_open2(v->av, dec, nullptr) < 0) {
-        PS_LOG_ERROR(kChan, "{}: FFmpeg's decoder for codec {} did not open", call, codec);
-        return error(CELL_VDEC_ERROR_FATAL);
-    }
-    PS_LOG_INFO(kChan, "{}: codec {} decodes {}", call, codec, hardware ? "on VideoToolbox" : "in software");
+    if (!open_ffmpeg(*v, call)) return error(CELL_VDEC_ERROR_FATAL);
 #else
     PS_LOG_ERROR(kChan, "{}: pspocket was built without FFmpeg: no video decoding", call);
     return error(CELL_VDEC_ERROR_FATAL);
@@ -919,6 +979,52 @@ s32 open(PPUContext& ctx, u32 type, u32 spec, u32 res, u32 cb, u32 handle_out, c
 // The decoder at `handle`, open or closed: a closed one stays known (Sony's context stays in its memory), so a call on
 // it is SEQ, not ARG.
 std::shared_ptr<Vdec> live(PPUContext&, u32 handle) { return vdec_of(handle); }
+
+// CellVdecDivxInfo, RPCS3's structure (rpcs3/Emu/Cell/Modules/cellVdec.h), which RPCS3 writes for MPEG-4 and DivX
+// (D-588): pictureType (u8), horizontalSize and verticalSize (u16 at 2 and 4), pixelAspectRatio, parWidth, parHeight,
+// colourDescription, colourPrimaries, transferCharacteristics, matrixCoefficients and pictureStruct (u8 at 6 to 13),
+// frameRateCode (u16 at 14). From the stream where it says (MPEG-4's VOL through FFmpeg), else RPCS3's values: a
+// square pixel, no colour description with BT.709's codes, a frame. The frame rate is SetFrameRate's, else the
+// stream's, else CELL_VDEC_DIVX_FRC_UNDEFINED (RPCS3 gives 30, a guess; DivX 3.11's stream names none).
+void write_divx_info(u8* base, u32 info, const Vdec& v, const Picture& p)
+{
+#if PSPOCKET_HAVE_FFMPEG
+    const u8 type = p.pict_type == AV_PICTURE_TYPE_B ? 2 : p.pict_type == AV_PICTURE_TYPE_I ? 0 : 1; // P, S (sprite)
+#else
+    const u8 type = 0;
+#endif
+    ps_write8(base, info + 0x00, type);
+    ps_write16(base, info + 0x02, static_cast<u16>(p.width));
+    ps_write16(base, info + 0x04, static_cast<u16>(p.height));
+    // CELL_VDEC_DIVX_ARI_PAR_*: MPEG-4's aspect_ratio_info, 15 with the ratio itself for another.
+    u8 par = 1, par_width = 0, par_height = 0;
+    if (p.sar_num > 0 && p.sar_den > 0) {
+        const struct {
+            s32 num, den;
+            u8 code;
+        } pars[] = {{1, 1, 1}, {12, 11, 2}, {10, 11, 3}, {16, 11, 4}, {40, 33, 5}};
+        par = 15;
+        par_width = static_cast<u8>(std::min(p.sar_num, 255));
+        par_height = static_cast<u8>(std::min(p.sar_den, 255));
+        for (const auto& k : pars)
+            if (s64{p.sar_num} * k.den == s64{p.sar_den} * k.num) {
+                par = k.code;
+                par_width = par_height = 0;
+            }
+    }
+    ps_write8(base, info + 0x06, par);
+    ps_write8(base, info + 0x07, par_width);
+    ps_write8(base, info + 0x08, par_height);
+    const bool colour = p.primaries != 2 || p.transfer != 2 || p.matrix != 2;
+    ps_write8(base, info + 0x09, colour);
+    ps_write8(base, info + 0x0A, colour ? p.primaries : 1);
+    ps_write8(base, info + 0x0B, colour ? p.transfer : 1);
+    ps_write8(base, info + 0x0C, colour ? p.matrix : 1);
+    ps_write8(base, info + 0x0D, !p.interlaced ? 0 : p.top_field_first ? 1 : 2); // FRAME, TOP_BTM, BTM_TOP
+    // CELL_VDEC_DIVX_FRC_*: 0 undefined, then the eight rates from 24000/1001.
+    const u8 index = v.frame_rate ? static_cast<u8>(v.frame_rate & 7) : frame_rate_index(p.fps);
+    ps_write16(base, info + 0x0E, index == 0xFF ? 0 : static_cast<u16>(index + 1));
+}
 
 // CellVdecPicItem and the codec's information for the picture at the front of the game's queue whose item is not
 // taken yet, in the rings (see the top).
@@ -983,8 +1089,7 @@ void write_item(u8* base, const Vdec& v, const Picture& p, u32 item, u32 info)
         ps_write16(base, info + 0x00, static_cast<u16>(p.width));
         ps_write16(base, info + 0x02, static_cast<u16>(p.height));
     } else {
-        ps_write16(base, info + 0x00, static_cast<u16>(p.width)); // CellVdecDivxInfo, as RPCS3's
-        ps_write16(base, info + 0x02, static_cast<u16>(p.height));
+        write_divx_info(base, info, v, p); // MPEG-4, DivX, DivX 3.11
     }
 }
 

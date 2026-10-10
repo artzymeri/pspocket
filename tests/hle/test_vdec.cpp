@@ -17,10 +17,7 @@
 #include "firmware_compare.hpp"
 #include "h264_writer.hpp"
 #include "vdec_hw.hpp"
-#include "hle_test_util.hpp"
-#include "pspocket/ppu/runtime.h"
-#include "pspocket/recomp/ppu/asm.hpp"
-#include "pspocket/spu/runtime.h"
+#include "vdec_test_util.hpp"
 
 #if PSPOCKET_HAVE_FFMPEG
 extern "C" {
@@ -30,84 +27,12 @@ extern "C" {
 
 using namespace pspocket;
 using namespace pspocket::hle::test;
-namespace as = pspocket::recomp::ppu::as;
+using namespace pspocket::hle::test::vdec_test;
 namespace h = pspocket::hle::test::h264;
 
 namespace {
 
-struct InterpretMisses {
-    const ps_ppu_miss_policy ppu = ps_ppu_get_miss_policy();
-    const ps_spu_miss_policy spu = ps_spu_get_miss_policy();
-    InterpretMisses()
-    {
-        ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
-        ps_spu_set_miss_policy(PS_SPU_MISS_INTERPRET);
-    }
-    ~InterpretMisses()
-    {
-        ps_ppu_set_miss_policy(ppu);
-        ps_spu_set_miss_policy(spu);
-    }
-    InterpretMisses(const InterpretMisses&) = delete;
-    InterpretMisses& operator=(const InterpretMisses&) = delete;
-};
-
-// Guest memory: the scratch area for the callback, its log and the arguments; a larger area for the decoder.
-constexpr u32 kCode = kData, kOpd = kData + 0x400, kLog = kData + 0x1000;
-constexpr u32 kArgs = kData + 0x4000, kType = kArgs, kAttr = kArgs + 0x20, kRes = kArgs + 0x40, kCb = kArgs + 0x60,
-              kHandle = kArgs + 0x70, kSpec = kArgs + 0x80, kAu = kArgs + 0xA0, kFormat = kArgs + 0xD0,
-              kItemOut = kArgs + 0xF0;
-constexpr u32 kStream = kData + 0x10000;   // the access units, 0x10000 bytes each
-constexpr u32 kPicture = kData + 0x100000; // GetPicture's output
-constexpr u32 kDecoderMem = 0x01000000, kDecoderMemSize = 0x01000000;
-constexpr int kWidth = 64, kHeight = 64, kPictures = 3;
-
-// The callback (handle r3, msgType r4, msgData r5, cbArg r6) appends (type, data, handle) to the log at cbArg: a
-// count, then 16-byte entries from +16.
-void write_callback(u8* b)
-{
-    const std::vector<u32> code = {
-        as::lwz(9, 0, 6), as::slwi(10, 9, 4), as::add(10, 10, 6), as::stw(4, 16, 10), as::stw(5, 20, 10),
-        as::stw(3, 24, 10), as::lwsync(), as::addi(9, 9, 1), as::stw(9, 0, 6), as::li(3, 0), as::blr(),
-    };
-    for (usize i = 0; i < code.size(); i++) ps_write32(b, kCode + 4 * static_cast<u32>(i), code[i]);
-    ps_write32(b, kOpd, kCode);
-    ps_write32(b, kOpd + 4, 0);
-    std::memset(b + kLog, 0, 0x1000);
-}
-
-u32 log_count(u8* b)
-{
-    const u32 n = ps_read32(b, kLog);
-    std::atomic_thread_fence(std::memory_order_acquire);
-    return n;
-}
-
-u32 count_of(u8* b, u32 type)
-{
-    u32 n = 0;
-    for (u32 i = 0; i < log_count(b); i++) n += ps_read32(b, kLog + 16 + 16 * i) == type;
-    return n;
-}
-
-bool wait_until(const std::function<bool()>& done, std::chrono::seconds timeout = std::chrono::seconds(60))
-{
-    const auto until = std::chrono::steady_clock::now() + timeout;
-    while (!done()) {
-        if (std::chrono::steady_clock::now() > until) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    return true;
-}
-
-using Call = std::function<u32(const char* name, u32 nid, std::initializer_list<u64> args)>;
-
-std::string hex(const u8* p, u32 n)
-{
-    std::string s;
-    for (u32 i = 0; i < n; i++) s += std::format("{:02x}", p[i]);
-    return s;
-}
+constexpr int kWidth = 64, kHeight = 64, kPictures = 3; // the access units are 0x10000 bytes apart from kStream
 
 // Whether `out` holds picture `seed` as YUV 4:2:0 planar (Y, then U, then V, no padding).
 bool is_yuv420(const u8* out, int seed)
@@ -247,40 +172,6 @@ Observed vdec_run(u8* b, const Call& call)
     r("cellVdecClose", 0x16698E83, {handle});
     r("cellVdecClose", 0x16698E83, {handle}); // closed
     return o;
-}
-
-struct BigFixture : Fixture {
-    BigFixture()
-    {
-        REQUIRE(hle->link_internal_functions({"libvdec"}));
-        REQUIRE(hle->main_memory().reserve(kDecoderMem, kDecoderMemSize));
-        REQUIRE(mem.commit(kDecoderMem, kDecoderMemSize));
-        REQUIRE(hle->initialize_tls({0, 0, 0x100}));
-    }
-};
-
-// pspocket's libvdec, linked as a game's imports would be.
-Call hle_calls(Fixture& f, GuestThread& t)
-{
-    return [&f, &t](const char* name, u32 nid, std::initializer_list<u64> args) {
-        const u32 descriptor = f.hle->link_function("libvdec", nid, name);
-        REQUIRE(descriptor != 0);
-        return static_cast<u32>(hle::call_guest(t.ctx, descriptor, args));
-    };
-}
-
-[[maybe_unused]] std::string all_lines(const std::vector<std::string>& lines)
-{
-    std::string s;
-    for (const std::string& l : lines) s += l + "\n";
-    return s;
-}
-
-[[maybe_unused]] const std::string* find_line(const std::vector<std::string>& lines, std::string_view prefix)
-{
-    for (const std::string& l : lines)
-        if (l.starts_with(prefix)) return &l;
-    return nullptr;
 }
 
 } // namespace

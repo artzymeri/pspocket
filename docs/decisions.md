@@ -8270,3 +8270,46 @@ and its EBOOT.BIN decrypted). By hand: ps3disc --install-pkg on a synthetic pack
 a licence type 2 EBOOT.BIN (the build's keys, in a temporary folder) reports the licence missing; ps3disc --decrypt
 and pspocket-boot name it; after ps3disc --install-rap, pspocket-boot runs the installed game to its expected fault
 report.
+
+## D-588 · 2026-10-10 · cellVdec: DivX 3.11 on FFmpeg, CellVdecDivxInfo as RPCS3's; FFmpeg's VC-1 and DivX 3.11 decoders
+
+cellVdec (D-196) refused VC-1, DivX 3.11 and MVC at open (CELL_VDEC_ERROR_FATAL, logged): pspocket's FFmpeg had no
+decoder for them. This is the first part of closing that (the engine checklist's "VC-1, DivX 3.11, MVC video"); VC-1 is
+D-589, MVC D-590.
+
+- **FFmpeg** (scripts/build-ffmpeg.sh): the vc1 decoder and parser and the msmpeg4v3 decoder (DivX 3.11 is Microsoft's
+  MPEG-4 version 3, which FFmpeg decodes under that name) join the decoder list every target shares, LGPL like the rest
+  (vc1dec.c, msmpeg4dec.c and what they select: the H.263 decoder base, intrax8, vc1dsp). On Linux libavcodec.a grew
+  from 4.28 to 4.88 MB. The tests' build gets the mpeg4 and msmpeg4v3 encoders (their source files also carry FFmpeg's
+  h263, h263p, msmpeg4v2 and wmv1 encoders; nothing but test_hle links them). Rebuilt here for Linux; **the Mac must run
+  `scripts/build-ffmpeg.sh` again** (all: macos, macos-tests, ios) before the Mac's and the iPhone's builds decode these
+  codecs; until then they refuse them at open as before ("no decoder in its FFmpeg").
+- **DivX 3.11** (codec 9): FFmpeg's msmpeg4v3 decoder. Its frames carry no size (an AVI file's header does), so the size
+  comes from the codec specific information, CellVdecDivxSpecificInfo2's maxDecodedFrameWidth and maxDecodedFrameHeight,
+  checked as RPCS3's query_attr_divx<true> checks them, in QueryAttrEx and OpenEx (thisSize 12, at most 1920x1088, 0 or
+  2 frame buffers, else ARG); without it, 720x576, RPCS3's default for the decoder (DivxDecParams), logged. The rest is
+  as for the other codecs: Sony's size per level (level 15 only), the pictures one access unit late, Sony's frame buffer
+  layout, the output formats.
+- **CellVdecDivxInfo**, which RPCS3 writes for MPEG-4 and DivX, now has RPCS3's layout (rpcs3/Emu/Cell/Modules/
+  cellVdec.h) for MPEG-4, DivX and DivX 3.11: pictureType (u8 at 0), horizontalSize and verticalSize (u16 at 2 and 4),
+  pixelAspectRatio, parWidth, parHeight, colourDescription, colourPrimaries, transferCharacteristics,
+  matrixCoefficients, pictureStruct (u8 at 6 to 13), frameRateCode (u16 at 14). A bug fixed: pspocket had written the
+  width and height at 0 and 2 (the H.264 and MPEG-2 blocks' places) under a comment calling it RPCS3's. The fields come
+  from the stream where FFmpeg reports them (MPEG-4's VOL: the aspect ratio's code, or 15 with the ratio; the colour
+  description; the field order; the frame rate), else RPCS3's values (a square pixel, no colour description with
+  BT.709's codes, a frame). The picture type: I 0, P (and an MPEG-4 sprite) 1, B 2. frameRateCode: SetFrameRate's, else
+  the stream's, else UNDEFINED where RPCS3 gives 30 by a guess (DivX 3.11's stream names none).
+
+Tests: tests/hle/test_vdec_codecs.cpp (the cellVdec tests' helpers now shared in tests/hle/vdec_test_util.hpp), streams
+written by FFmpeg's encoders: six 96x64 DivX 3.11 pictures (I P P I P P) decoded through cellVdec exactly as FFmpeg
+decodes the same packets (each over 35 dB from its input), the answers and callbacks (AUDONE for each, PICOUT one access
+unit late, SEQDONE), every item (codec, size, PTS, DTS, user data) and information block, with and without
+SetFrameRate; the codec specific information's checks, and a 720x576 picture decoded without it; MPEG-4 part 2 with
+12:11 and 8:9 pixels, as DivX and as MPEG-4: the information block's aspect ratio and the VOL's 25 frames a second.
+
+To compare with Sony's libvdec on the Mac (firmware_compare.hpp, as test_vdec.cpp's comparison runs): DivX 3.11's size
+with codec specific information (pspocket gives Sony's size without it) and where libdivx311dec takes the frame size
+from (that information, or the access unit's codecSpecificData); a stream larger or smaller than the size given;
+CellVdecDivxInfo's fields (Sony's block is 0x20 bytes for DivX and 0x18 for DivX 3.11 by RPCS3's attributes, both more
+than RPCS3's 16-byte structure) and MPEG-4's (0x38 bytes there: likely a structure of its own); the frame rate code of
+a stream that names none; the pictures, sample for sample.
