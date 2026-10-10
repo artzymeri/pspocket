@@ -10,13 +10,17 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/recomp/npdrm.hpp"
+#include "pspocket/recomp/pkg.hpp"
+#include "pspocket/recomp/sce.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 
 namespace {
@@ -74,6 +78,44 @@ bool write_whole(const fs::path& out, const std::vector<u8>& bytes, std::string&
 }
 
 } // namespace
+
+extern "C" int ps_psn_install_pkg(const char* pkg_path, const char* hdd0_dir, ps_disc_callback callback, void* user,
+    char* error, size_t error_size)
+{
+    using namespace pspocket;
+    if (!pkg_path || !hdd0_dir || !*hdd0_dir) return fail(error, error_size, "no package, or no /dev_hdd0 folder, given");
+    const auto report = [&](std::string_view line) {
+        if (callback) callback(user, std::string(line).c_str());
+    };
+    auto installed = recomp::install_pkg(pkg_path, hdd0_dir, report);
+    if (!installed) return fail(error, error_size, installed.error().message);
+    const recomp::PkgInstalled& r = *installed;
+    report(std::format("installed {} files ({} bytes) and {} folders into {}{}", r.files, r.bytes, r.folders,
+        r.install_path, r.kept ? std::format("; {} files already there kept", r.kept) : std::string()));
+    if (r.eboot.empty()) return 0;
+    // A game: which licence its executable needs (its NPD header), and whether the player's is in place.
+    std::ifstream in(r.eboot, std::ios::binary);
+    std::vector<u8> head(64u << 10);
+    in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
+    head.resize(static_cast<usize>(in.gcount()));
+    const auto self = recomp::parse_self(head);
+    const recomp::NpdrmInfo* npd = self ? self->npdrm() : nullptr;
+    if (!npd) {
+        report("the game's executable: " + r.eboot);
+        return 0;
+    }
+    if (npd->license == recomp::kNpdrmLicenseFree) {
+        report("the game's executable: " + r.eboot + " (free content: it needs no licence)");
+        return 0;
+    }
+    const std::string rap = recomp::rap_host_path(hdd0_dir, npd->content_id);
+    std::error_code ec;
+    report("the game's executable: " + r.eboot + "; it needs the player's licence " + npd->content_id + ".rap, " +
+        (rap.empty() ? std::string("which has no valid content ID") :
+                       fs::is_regular_file(rap, ec) ? "which is in place (" + rap + ")" :
+                                                      "which is not there yet (" + rap + ")"));
+    return 0;
+}
 
 extern "C" int ps_psn_rap_path(const char* hdd0_dir, const char* content_id, char* out, size_t out_size)
 {

@@ -1,9 +1,11 @@
-// PSN games through the app's C API (pspocket/disc/psn.h, D-580 to D-583). Made-up licences only.
+// PSN games through the app's C API (pspocket/disc/psn.h, D-580 to D-583): packages, licences, executables. Made-up
+// licences and synthetic packages only.
 
 #include <catch_amalgamated.hpp>
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -17,6 +19,7 @@
 #include "pspocket/recomp/crypto.hpp"
 #include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/npdrm.hpp"
+#include "pspocket/recomp/pkg.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 #include "synthetic.hpp"
 
@@ -171,5 +174,132 @@ TEST_CASE("ps_psn_decrypt_executable: a PSN game's EBOOT.BIN with the player's l
     REQUIRE(ps_psn_decrypt_executable((root / "plain" / "EBOOT.BIN").c_str(), nullptr, (root / "plain.elf").c_str(),
                 error, sizeof error) == 0);
     CHECK(read_file(root / "plain.elf") == elf);
+    fs::remove_all(root);
+}
+
+namespace {
+
+const recomp::SelfKey* build_npdrm_self_key()
+{
+    for (const recomp::SelfKey& k : recomp::builtin_self_keys())
+        if (k.type == 8) return &k;
+    return nullptr;
+}
+
+// `elf` as a PSN executable of this licence type, encrypted with the build's keys (in memory only).
+std::vector<u8> psn_self(const std::vector<u8>& elf, s32 license, const recomp::Key128& content_key)
+{
+    const recomp::SelfKey* key = build_npdrm_self_key();
+    test::SelfEncryption e;
+    e.key = *key;
+    e.revision = static_cast<u16>(key->revision);
+    e.npdrm = true;
+    e.npdrm_license = license;
+    recomp::crypto::aes_ecb_decrypt(recomp::builtin_npdrm_keys().klic_key, content_key.data(), 16,
+        e.npdrm_layer_key.data());
+    return test::encrypt_self(elf, e);
+}
+
+test::PkgSpec game_package(std::vector<u8> eboot, std::string_view app_ver)
+{
+    test::PkgSpec spec;
+    spec.content_id = kContent;
+    spec.counter = {0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0, 0, 0, 0, 0, 0, 0, 1};
+    spec.qa_digest = {0xC0, 0xFF, 0xEE, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+    spec.items = {
+        {"PARAM.SFO", recomp::kPkgEntryRegular | recomp::kPkgEntryOverwrite,
+            test::build_param_sfo({{"CATEGORY", "HG"}, {"TITLE_ID", "NPXX00000"}, {"APP_VER", std::string(app_ver)}})},
+        {"USRDIR", recomp::kPkgEntryFolder, {}},
+        {"USRDIR/EBOOT.BIN", recomp::kPkgEntryNpdrm | recomp::kPkgEntryOverwrite, std::move(eboot)},
+        {"USRDIR/DATA.BIN", recomp::kPkgEntryRegular, std::vector<u8>(5000, 0x42)}};
+    return spec;
+}
+
+void collect(void* user, const char* line) { static_cast<std::vector<std::string>*>(user)->emplace_back(line); }
+
+bool has_line(const std::vector<std::string>& lines, std::string_view text)
+{
+    return std::any_of(lines.begin(), lines.end(), [&](const std::string& l) { return l.find(text) != std::string::npos; });
+}
+
+} // namespace
+
+TEST_CASE("ps_psn_install_pkg: a game's package into dev_hdd0, what it reports, and what it refuses (D-583)",
+    "[disc][psn]")
+{
+    // A debug package needs no keys: a plain ELF as its executable.
+    const std::vector<u8> elf = test::build_ppu_exec().bytes;
+    test::PkgSpec spec = game_package(elf, "01.00");
+    spec.retail = false;
+    const fs::path root = temp_dir("pkg");
+    const fs::path hdd0 = root / "dev_hdd0", game = hdd0 / "game" / "NPXX00000";
+    write_file(root / "game.pkg", test::build_pkg(spec));
+    std::vector<std::string> lines;
+    char error[512] = {};
+    REQUIRE(ps_psn_install_pkg((root / "game.pkg").c_str(), hdd0.c_str(), collect, &lines, error, sizeof error) == 0);
+    CHECK(read_file(game / "USRDIR" / "EBOOT.BIN") == elf);
+    CHECK(read_file(game / "USRDIR" / "DATA.BIN") == std::vector<u8>(5000, 0x42));
+    CHECK(has_line(lines, std::format("installed 3 files ({} bytes) and 1 folders into {}",
+                              spec.items[0].bytes.size() + elf.size() + 5000, game.string())));
+    CHECK(has_line(lines, "the game's executable: " + (game / "USRDIR" / "EBOOT.BIN").string()));
+    const fs::path out = root / "out" / "EBOOT.elf";
+    REQUIRE(ps_psn_decrypt_executable(game.c_str(), hdd0.c_str(), out.c_str(), error, sizeof error) == 0);
+    CHECK(read_file(out) == elf);
+
+    // Again: the files not marked to overwrite are kept, and said to be.
+    lines.clear();
+    REQUIRE(ps_psn_install_pkg((root / "game.pkg").c_str(), hdd0.c_str(), collect, &lines, error, sizeof error) == 0);
+    CHECK(has_line(lines, "; 1 files already there kept"));
+
+    // Refused, each with its reason: no package, no hdd0 folder, a retail package without keys or another version's
+    // update.
+    CHECK(ps_psn_install_pkg((root / "missing.pkg").c_str(), hdd0.c_str(), nullptr, nullptr, error, sizeof error) == 1);
+    CHECK(std::string(error).find("cannot read") != std::string::npos);
+    CHECK(ps_psn_install_pkg((root / "game.pkg").c_str(), nullptr, nullptr, nullptr, error, sizeof error) == 1);
+    CHECK(std::string(error).find("no /dev_hdd0 folder") != std::string::npos);
+    test::PkgSpec update = game_package(elf, "01.02");
+    update.retail = false;
+    update.content_type = recomp::kPkgContentGameData;
+    update.package_flags = recomp::kPkgFlagPatch;
+    update.items[0].bytes = test::build_param_sfo(
+        {{"CATEGORY", "GD"}, {"TITLE_ID", "NPXX00000"}, {"APP_VER", "01.02"}, {"TARGET_APP_VER", "01.01"}});
+    write_file(root / "update.pkg", test::build_pkg(update));
+    CHECK(ps_psn_install_pkg((root / "update.pkg").c_str(), hdd0.c_str(), nullptr, nullptr, error, sizeof error) == 1);
+    CHECK(std::string(error).find("for version 01.01, and version 01.00 is installed") != std::string::npos);
+    fs::remove_all(root);
+}
+
+TEST_CASE("A PSN game from its package and the player's licence to its ELF (the build's keys)", "[disc][psn]")
+{
+    const recomp::NpdrmKeys& keys = recomp::builtin_npdrm_keys();
+    if (!keys.present || !build_npdrm_self_key() || !recomp::builtin_pkg_keys().present)
+        SKIP("this build has no NPDRM or package keys");
+    // A game of licence type 2 (the player's licence needed), packaged with the build's PKG_AES_KEY (in a temporary
+    // folder only).
+    const std::vector<u8> elf = test::build_ppu_exec().bytes;
+    recomp::Key128 rap{};
+    rap.fill(0xA7);
+    test::PkgSpec spec = game_package(psn_self(elf, 2, recomp::rap_to_rif(rap, keys)), "01.00");
+    spec.key = recomp::builtin_pkg_keys().ps3;
+    const fs::path root = temp_dir("pkg-psn");
+    const fs::path hdd0 = root / "dev_hdd0", game = hdd0 / "game" / "NPXX00000";
+    write_file(root / "game.pkg", test::build_pkg(spec));
+    std::vector<std::string> lines;
+    char error[512] = {};
+    REQUIRE(ps_psn_install_pkg((root / "game.pkg").c_str(), hdd0.c_str(), collect, &lines, error, sizeof error) == 0);
+    const std::string rap_name = std::string(test::kSelfContentId) + ".rap";
+    CHECK(has_line(lines, "it needs the player's licence " + rap_name + ", which is not there yet"));
+
+    // The executable does not open without the licence; with it (put in place as the app would), it does.
+    const fs::path out = root / "EBOOT.elf";
+    REQUIRE(ps_psn_decrypt_executable(game.c_str(), hdd0.c_str(), out.c_str(), error, sizeof error) == 1);
+    CHECK(std::string(error).find(rap_name) != std::string::npos);
+    write_file(root / rap_name, std::vector<u8>(rap.begin(), rap.end()));
+    REQUIRE(ps_psn_install_rap(hdd0.c_str(), (root / rap_name).c_str(), error, sizeof error) == 0);
+    REQUIRE(ps_psn_decrypt_executable(game.c_str(), hdd0.c_str(), out.c_str(), error, sizeof error) == 0);
+    check_same_elf(elf, read_file(out));
+    lines.clear();
+    REQUIRE(ps_psn_install_pkg((root / "game.pkg").c_str(), hdd0.c_str(), collect, &lines, error, sizeof error) == 0);
+    CHECK(has_line(lines, ", which is in place ("));
     fs::remove_all(root);
 }

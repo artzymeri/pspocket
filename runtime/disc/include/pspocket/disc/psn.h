@@ -1,17 +1,32 @@
 /*
- * PSN games for the app shell (Swift) and command-line tools (D-580 to D-583): the player's licences, and a PSN
- * game's executable. A PSN game lives in /dev_hdd0/game/<TITLE_ID>/ (installed from its .pkg); its executable and
- * modules are NPDRM SELFs and some of its data files EDATA files, opened with the player's licence for the game (a
- * .rap file) or, for free content, the klicensee the game holds.
+ * PSN games for the app shell (Swift) and command-line tools (D-580 to D-583): installing a game's package, the
+ * player's licences, and a PSN game's executable. A PSN game lives in /dev_hdd0/game/<TITLE_ID>/ (installed from its
+ * .pkg); its executable and modules are NPDRM SELFs and some of its data files EDATA files, opened with the player's
+ * licence for the game (a .rap file) or, for free content, the klicensee the game holds.
  */
 #ifndef PSPOCKET_DISC_PSN_H
 #define PSPOCKET_DISC_PSN_H
 
 #include <stddef.h>
 
+#include "pspocket/disc/disc.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*
+ * Installs a PS3 package (.pkg: a PSN game, its update or add-on, or a licence package) under hdd0_dir, the folder
+ * that is /dev_hdd0 (the app's Documents/hdd0, pspocket-boot's --hdd0), as RPCS3 installs it (D-583): a game, update
+ * or add-on into game/<TITLE_ID>/, a licence package into home/00000001/exdata/. A package split into parts is given
+ * by its first, NAME_00.pkg. The game's executable, modules and EDATA files are written as they are, for the runtime
+ * to open with the player's licence (ps_psn_install_rap); SDATA files are written decrypted. An update that does not
+ * suit the version of the game installed is refused, as RPCS3 refuses it, so a game's packages go in order: the game,
+ * then its updates. callback (may be NULL) hears a line for the package, for each folder and file, a summary, and, for
+ * a game, which licence its executable needs and whether it is in place. Returns 0, or 1 with the reason in error.
+ */
+int ps_psn_install_pkg(const char* pkg_path, const char* hdd0_dir, ps_disc_callback callback, void* user, char* error,
+    size_t error_size);
 
 /*
  * Where pspocket looks for the player's licence of a piece of PSN content (D-580), as RPCS3 does:
