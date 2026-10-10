@@ -341,7 +341,10 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   thread's baton), the video codec cores' version queries (D-575).
 - cellGame's and cellPhotoImportUtil's working structures as their variables under RPCS3's names (D-567).
 - The threaded libraries checked for data races in a ThreadSanitizer build (D-571, -DPSPOCKET_TSAN=ON): cellFiber,
-  libmixer, the C library's threads, cellPngEnc.
+  libmixer, the C library's threads, cellPngEnc; then the whole runtime (D-584 to D-587, scripts/tsan.sh: 1,063
+  reports to none, the guest code's own accesses suppressed with reasons). Fixed on the way: an SPU's call answered
+  after a reply could land, a thread's stack freed after its join returned, RSX labels and FIFO pointers without
+  ordering (a FIFO reset could lose a frame's commands), SPURS, libsync2 and the media threads' shared words.
 Left (971, 2026-10-09). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSpursJq (63, libspurs_jq), cellSailRec (58)
   and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (31, its wire protocol), the codec

@@ -83,6 +83,8 @@ ctest --test-dir build/host --output-on-failure
   App Store Connect for TestFlight (internal testers). It sends the app, with the game's translated code, to Apple:
   only with the user's OK, each time.
 - Use your own build directory (`build/<name>`) when several builds run at once.
+- Data races: `scripts/tsan.sh [groups] [--no-build]` builds `build/tsan` with ThreadSanitizer and runs the threaded
+  test groups with `scripts/tsan.supp` (D-571, D-585); every group should report none.
 
 ## Layout
 

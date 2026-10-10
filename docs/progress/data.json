@@ -353,7 +353,7 @@
         {
           "name": "An hour without a crash",
           "state": "partial",
-          "ref": "D-225 fixed the EDGE stop; an hour on the phone not yet tried"
+          "ref": "D-225 fixed the EDGE stop; D-584 to D-587 the data races; an hour on the phone not yet tried"
         }
       ]
     }
