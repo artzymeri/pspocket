@@ -1,8 +1,10 @@
-// RPCS3's own NPDRM functions, compiled for differential tests (D-580). See rpcs3_ref.hpp.
+// RPCS3's own NPDRM and package functions, compiled for differential tests (D-580, D-583). See rpcs3_ref.hpp.
 //
 // The functions scripts/rpcs3-extract.py copies out of RPCS3 (rpcs3_ref_extracted.inc, in the build directory) are
-// compiled in namespace rpcs3x around stand-ins for the RPCS3 utilities they use: be_t, read_from_ptr, utils::align,
-// ensure, the log channels, fs::file (over bytes in memory), and a SELFDecrypter with only what DecryptNPDRM touches.
+// compiled in namespace rpcs3x around stand-ins for the RPCS3 utilities they use: be_t and le_t, read_from_ptr and
+// write_to_ptr, utils::align and aligned_div, umax, ensure, the log channels, fs::file (over bytes in memory), a
+// SELFDecrypter with only what DecryptNPDRM touches, and a package_reader with only what decrypt, read_entries and
+// archive_read_block touch.
 // Two of RPCS3's helpers are written here instead of copied: mbedtls_zeroize (sha1.cpp links to the global one) and
 // hmac_hash_compare, whose RPCS3 form allocates key_len bytes for sha1_hmac's 20 (a 16-byte key overruns it).
 
@@ -44,12 +46,37 @@ T swap_bytes(T v)
 }
 
 // A value kept big-endian (RPCS3 util/endian.hpp be_t), as far as the functions use it: stored as read from memory,
-// read as a host value.
+// read as a host value, made from one (package_reader::decrypt's counter block and key stream input).
 template <typename T>
 struct be_t {
     T raw;
+    be_t() = default;
+    be_t(T v) : raw(swap_bytes(v)) {}
     operator T() const { return swap_bytes(raw); }
+    T value() const { return swap_bytes(raw); }
+    be_t operator++(int)
+    {
+        const be_t old = *this;
+        *this = be_t(value() + 1);
+        return old;
+    }
 };
+
+// A value kept little-endian (RPCS3 le_t) on a little-endian host.
+template <typename T>
+struct le_t {
+    T raw;
+    operator T() const { return raw; }
+};
+
+using uchar = unsigned char;
+constexpr usz umax = ~usz{0};
+
+template <typename T, typename To>
+void write_to_ptr(To&& dst, usz pos, const T& value)
+{
+    std::memcpy(reinterpret_cast<u8*>(std::data(dst)) + pos, &value, sizeof(T));
+}
 
 template <typename To, typename From>
 To read_from_ptr(const From& src, usz pos = 0)
@@ -64,6 +91,11 @@ template <typename T, typename U>
 constexpr T align(T value, U alignment)
 {
     return static_cast<T>((value + (alignment - 1)) & ~static_cast<T>(alignment - 1));
+}
+template <typename T, typename U>
+constexpr T aligned_div(T value, U divisor)
+{
+    return static_cast<T>((value + divisor - 1) / divisor);
 }
 inline int toupper(u8 c) { return std::toupper(c); }
 inline int tolower(u8 c) { return std::tolower(c); }
@@ -82,13 +114,14 @@ struct LogChannel {
     template <typename... A> void success(A&&...) const {}
     template <typename... A> void fatal(A&&...) const {}
 };
-inline const LogChannel edat_log{}, self_log{};
+inline const LogChannel edat_log{}, self_log{}, pkg_log{};
 
 namespace fs {
 struct file {
     std::span<const u8> bytes;
     u64 position = 0;
     u64 pos() const { return position; }
+    u64 size() const { return bytes.size(); }
     u64 read_at(u64 offset, void* dst, u64 size) const
     {
         if (offset >= bytes.size()) return 0;
@@ -100,6 +133,26 @@ struct file {
 } // namespace fs
 
 struct NPD_HEADER;
+struct PKGHeader;
+struct PKGEntry;
+
+// RPCS3 unpkg.h package_reader, with what decrypt, read_entries and archive_read_block use: the package's bytes, its
+// header, and the data's key.
+class package_reader {
+public:
+    package_reader(const PKGHeader& header, std::span<const u8> bytes) : m_header(header), m_file{bytes, 0} {}
+
+    bool read_entries(std::vector<PKGEntry>& entries);
+    std::span<const char> archive_read_block(u64 offset, std::span<u8> dst, u64 num_bytes);
+    usz decrypt(u64 offset, u64 size, const uchar* key, std::span<u8> local_buf);
+
+    static constexpr usz BUF_SIZE = 8192 * 1024;
+    static constexpr usz BUF_PADDING = 32;
+    bool m_is_valid = true;
+    const PKGHeader& m_header;
+    fs::file m_file;
+    std::array<uchar, 16> m_dec_key{};
+};
 
 struct KeyVaultStandIn {
     u8 klicensee_key[16]{};
@@ -252,5 +305,45 @@ void hmac_sha1(std::span<const u8> key, const u8* in, usize size, u8* out)
 {
     sha1_hmac(key.data(), key.size(), in, size, out);
 }
+
+namespace {
+
+rpcs3x::PKGHeader pkg_header(std::span<const u8> package)
+{
+    static_assert(sizeof(rpcs3x::PKGHeader) == 0x80 && sizeof(rpcs3x::PKGEntry) == 0x20);
+    rpcs3x::PKGHeader header{};
+    std::memcpy(&header, package.data(), std::min<usz>(package.size(), sizeof header));
+    return header;
+}
+
+} // namespace
+
+bool same_pkg_keys(const recomp::PkgKeys& keys)
+{
+    return keys.present && same(keys.ps3, PKG_AES_KEY) && same(keys.idu, PKG_AES_KEY_IDU);
+}
+
+std::optional<std::vector<u8>> pkg_decrypt(std::span<const u8> package, u64 offset, u64 size, const Key& key)
+{
+    const rpcs3x::PKGHeader header = pkg_header(package);
+    rpcs3x::package_reader reader(header, package);
+    // As RPCS3's callers: a buffer with BUF_PADDING bytes to spare.
+    std::vector<u8> out(static_cast<usz>(size) + rpcs3x::package_reader::BUF_PADDING);
+    const usz n = reader.decrypt(offset, size, key.data(), out);
+    if (n < size) return std::nullopt;
+    out.resize(static_cast<usz>(size));
+    return out;
+}
+
+bool pkg_table_sound(std::span<const u8> package, const Key& key)
+{
+    const rpcs3x::PKGHeader header = pkg_header(package);
+    rpcs3x::package_reader reader(header, package);
+    std::memcpy(reader.m_dec_key.data(), key.data(), 16);
+    std::vector<rpcs3x::PKGEntry> entries;
+    return reader.read_entries(entries);
+}
+
+bool pkg_leaves_directory(std::string_view name) { return rpcs3x::leaves_directory(name); }
 
 } // namespace pspocket::test::rpcs3_ref

@@ -18,6 +18,7 @@ pspocket_add_test(test_recomp_common
         test_firmware.cpp
         test_npd.cpp
         test_npdrm.cpp
+        test_pkg.cpp
         test_prx_place.cpp
     LIBS pspocket_test_synthetic pspocket::recomp_common)
 find_package(ZLIB)
@@ -25,10 +26,10 @@ if(ZLIB_FOUND)
     target_link_libraries(test_recomp_common PRIVATE ZLIB::ZLIB) # the SELF test compresses its segments
 endif()
 
-# RPCS3's own NPDRM code for the differential tests (D-580, rpcs3_ref/rpcs3_ref.hpp), from the RPCS3 tree the build
-# reads its keys from (PSPOCKET_RPCS3_DIR): its PolarSSL AES and SHA-1 as they are, and the functions
-# scripts/rpcs3-extract.py copies out of its key_vault.cpp, utils.cpp, unedat.cpp and unself.cpp. All of it in the
-# build directory; without RPCS3's source the tests have nothing of RPCS3's to compare with.
+# RPCS3's own NPDRM and package code for the differential tests (D-580, D-583, rpcs3_ref/rpcs3_ref.hpp), from the
+# RPCS3 tree the build reads its keys from (PSPOCKET_RPCS3_DIR): its PolarSSL AES and SHA-1 as they are, and the
+# functions scripts/rpcs3-extract.py copies out of its key_vault.cpp, utils.cpp, unedat.cpp, unself.cpp and unpkg.cpp.
+# All of it in the build directory; without RPCS3's source the tests have nothing of RPCS3's to compare with.
 set(rpcs3_crypto "")
 foreach(dir "${PSPOCKET_RPCS3_DIR}/rpcs3/Crypto" "${PSPOCKET_RPCS3_DIR}/Crypto")
     if(PSPOCKET_RPCS3_DIR AND NOT rpcs3_crypto AND EXISTS "${dir}/unedat.cpp" AND EXISTS "${dir}/aes.cpp")
@@ -43,7 +44,8 @@ if(rpcs3_crypto)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/rpcs3-extract.py ${rpcs3_crypto} ${rpcs3_extracted}
         DEPENDS ${PROJECT_SOURCE_DIR}/scripts/rpcs3-extract.py ${rpcs3_crypto}/key_vault.cpp ${rpcs3_crypto}/utils.cpp
                 ${rpcs3_crypto}/unedat.cpp ${rpcs3_crypto}/unedat.h ${rpcs3_crypto}/unself.cpp
-        COMMENT "RPCS3's NPDRM functions for the tests (scripts/rpcs3-extract.py)"
+                ${rpcs3_crypto}/unpkg.cpp ${rpcs3_crypto}/unpkg.h
+        COMMENT "RPCS3's NPDRM and package functions for the tests (scripts/rpcs3-extract.py)"
         VERBATIM)
     add_library(pspocket_rpcs3_ref STATIC rpcs3_ref/rpcs3_ref.cpp ${rpcs3_extracted}
         ${rpcs3_crypto}/aes.cpp ${rpcs3_crypto}/aesni.cpp ${rpcs3_crypto}/sha1.cpp ${rpcs3_crypto}/lz.cpp)

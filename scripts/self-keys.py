@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Writes the SELF key table the build carries (D-121) from RPCS3's Crypto/key_vault.cpp, and the firmware update
-packages' key (D-156), the NPD files' keys (D-165) and the PSN licence keys (D-580) from key_vault.h.
+packages' key (D-156), the NPD files' keys (D-165), the PSN licence keys (D-580) and the PS3 packages' keys (D-583)
+from key_vault.h.
 
 usage: self-keys.py RPCS3_DIR OUT.cpp
 
@@ -17,6 +18,8 @@ import sys
 NPD_KEYS = ("SDAT_KEY", "EDAT_KEY_0", "EDAT_KEY_1", "EDAT_HASH_0", "EDAT_HASH_1", "EDAT_IV")
 # recomp::NpdrmKeys' order (pspocket/recomp/npdrm.hpp).
 NPDRM_KEYS = ("RAP_KEY", "RAP_PBOX", "RAP_E1", "RAP_E2", "NP_KLIC_FREE", "NP_KLIC_KEY", "NP_OMAC_KEY_2", "NP_OMAC_KEY_3")
+# recomp::PkgKeys' order (pspocket/recomp/pkg.hpp).
+PKG_KEYS = ("PKG_AES_KEY", "PKG_AES_KEY_IDU")
 
 KEY_TYPES = {"KEY_LV0": 1, "KEY_LV1": 2, "KEY_LV2": 3, "KEY_APP": 4, "KEY_ISO": 5, "KEY_LDR": 6, "KEY_UNK7": 7,
              "KEY_NPDRM": 8}
@@ -62,6 +65,7 @@ def main() -> int:
              "// (CLAUDE.md rule 1).",
              "#include \"pspocket/recomp/npd.hpp\"",
              "#include \"pspocket/recomp/npdrm.hpp\"",
+             "#include \"pspocket/recomp/pkg.hpp\"",
              "#include \"pspocket/recomp/self_decrypt.hpp\"",
              "",
              "namespace pspocket::recomp {",
@@ -92,25 +96,29 @@ def main() -> int:
         if len(arrays.get("SCEPKG_ERK", b"")) == 32 and len(arrays.get("SCEPKG_RIV", b"")) == 16:
             package = f"{c_bytes(arrays['SCEPKG_ERK'].hex(), 32)}, {c_bytes(arrays['SCEPKG_RIV'].hex(), 16)}, true"
     # The NPD files' keys (key_vault.h SDAT_KEY, EDAT_KEY_0/1, EDAT_HASH_0/1, EDAT_IV), for a game's SDATA files
-    # (D-165), in recomp::NpdKeys' order; and the PSN licence keys (D-580), in recomp::NpdrmKeys' order.
+    # (D-165), in recomp::NpdKeys' order; the PSN licence keys (D-580), in recomp::NpdrmKeys' order; and the PS3
+    # packages' keys (D-583), in recomp::PkgKeys' order.
     npd = sixteen_byte_arrays(text_h, NPD_KEYS)
     npdrm = sixteen_byte_arrays(text_h, NPDRM_KEYS)
+    pkg = sixteen_byte_arrays(text_h, PKG_KEYS)
     lines += ["};", f"constexpr PackageKey kPackageKey = {{{package}}};" if package else "constexpr PackageKey kPackageKey{};",
               f"constexpr NpdKeys kNpdKeys = {{{npd}}};" if npd else "constexpr NpdKeys kNpdKeys{};",
               f"constexpr NpdrmKeys kNpdrmKeys = {{{npdrm}}};" if npdrm else "constexpr NpdrmKeys kNpdrmKeys{};",
+              f"constexpr PkgKeys kPkgKeys = {{{pkg}}};" if pkg else "constexpr PkgKeys kPkgKeys{};",
               "} // namespace", "",
               "std::span<const SelfKey> builtin_self_keys() { return std::span<const SelfKey>(kKeys).subspan(1); }",
               "const PackageKey& builtin_package_key() { return kPackageKey; }",
               "const NpdKeys& builtin_npd_keys() { return kNpdKeys; }",
-              "const NpdrmKeys& builtin_npdrm_keys() { return kNpdrmKeys; }", "",
+              "const NpdrmKeys& builtin_npdrm_keys() { return kNpdrmKeys; }",
+              "const PkgKeys& builtin_pkg_keys() { return kPkgKeys; }", "",
               "} // namespace pspocket::recomp"]
     out.parent.mkdir(parents=True, exist_ok=True)
     text = "\n".join(lines) + "\n"
     if not out.exists() or out.read_text() != text:
         out.write_text(text)
     where = f"from {vault}" if vault else f"none: no Crypto/key_vault.cpp under {root}"
-    print(f"self-keys: {count} SELF keys, {'the' if package else 'no'} package key, {'the' if npd else 'no'} NPD keys "
-          f"and {'the' if npdrm else 'no'} NPDRM keys {where}")
+    print(f"self-keys: {count} SELF keys, {'the' if package else 'no'} package key, {'the' if npd else 'no'} NPD keys, "
+          f"{'the' if npdrm else 'no'} NPDRM keys and {'the' if pkg else 'no'} PKG keys {where}")
     return 0
 
 

@@ -10,6 +10,7 @@
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/recomp/npd.hpp"
+#include "pspocket/recomp/pkg.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 
 namespace pspocket::test {
@@ -187,5 +188,40 @@ using SdataOptions = NpdOptions;
 // `options.edata` says.
 std::vector<u8> build_npd(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options = {});
 std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options = {});
+
+// ---- PARAM.SFO ----
+
+// A PARAM.SFO (PSF 1.1) of string entries (key, value), the keys sorted as the PS3 keeps them, each value in a field
+// of its length rounded up to 4 with a NUL.
+std::vector<u8> build_param_sfo(const std::vector<std::pair<std::string, std::string>>& strings);
+
+// ---- PS3 packages (D-583) ----
+
+struct PkgItem {
+    std::string name;                   // in the install folder: "USRDIR/EBOOT.BIN"
+    u32 type = recomp::kPkgEntryRegular; // an entry type, with kPkgEntryOverwrite and the like
+    std::vector<u8> bytes;              // a file's (a folder has none)
+};
+
+struct PkgSpec {
+    std::string content_id = "UP0001-NPXX00000_00-0000000000000001";
+    bool retail = true;                   // false: a debug package
+    u16 platform = 1;                     // 1: PS3; 2: PSP or PS Vita
+    recomp::Key128 key{};                 // a retail package's: PKG_AES_KEY, PKG_AES_KEY_IDU or made up
+    std::array<u8, 16> counter{};         // the data's first counter block
+    std::array<u8, 16> qa_digest{};       // a debug package's key stream comes from it
+    u32 content_type = recomp::kPkgContentGameExec; // 0: no metadata packet 2
+    u32 drm_type = 3;
+    u32 package_flags = 0;
+    std::string install_dir;              // an add-on's own folder (metadata packet 0xA), when not empty
+    std::vector<PkgItem> items;
+    usize align = 16;                     // where names and files start (a power of 2): Sony's packages, 16
+};
+
+// `spec` as a PS3 package, as RPCS3's package_reader reads them (rpcs3/Crypto/unpkg.cpp in reverse): the 0xC0-byte
+// header, metadata packets (1, 2, 3 and 0xA as asked, and two RPCS3 passes over), the data (the entry table, then
+// each name and file on an `align`-byte boundary) encrypted as the spec says, and 0x60 made-up bytes where Sony's
+// digests are. Nothing of Sony's: the test gives the key.
+std::vector<u8> build_pkg(const PkgSpec& spec);
 
 } // namespace pspocket::test

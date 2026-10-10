@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Copies RPCS3's own NPDRM functions out of its source, for pspocket's differential tests (D-580).
+"""Copies RPCS3's own NPDRM and package functions out of its source, for pspocket's differential tests (D-580,
+D-583).
 
 usage: rpcs3-extract.py RPCS3_CRYPTO_DIR OUT.inc
 
@@ -17,7 +18,8 @@ import re
 import sys
 
 # (file, kind, name): kind "function" copies a definition (a free function, or Class::method), "struct" a structure,
-# "lines" every line that matches the regular expression `name`.
+# "enum" the enumeration that holds the enumerator `name`, "lines" every line that matches the regular expression
+# `name`.
 WANTED = [
     ("unedat.h", "lines", r"^constexpr u32 (SDAT_FLAG|EDAT_\w+)\s*=.*;"),
     ("unedat.h", "struct", "NPD_HEADER"),
@@ -39,6 +41,14 @@ WANTED = [
     ("unedat.cpp", "function", "validate_npd_hashes"),
     ("unedat.cpp", "function", "read_npd_edat_header"),
     ("unself.cpp", "function", "SELFDecrypter::DecryptNPDRM"),
+    ("unpkg.h", "enum", "PKG_MAX_FILENAME_SIZE"),
+    ("unpkg.h", "enum", "PKG_RELEASE_TYPE_RELEASE"),
+    ("unpkg.h", "struct", "PKGHeader"),
+    ("unpkg.h", "struct", "PKGEntry"),
+    ("unpkg.cpp", "function", "leaves_directory"),
+    ("unpkg.cpp", "function", "package_reader::read_entries"),
+    ("unpkg.cpp", "function", "package_reader::archive_read_block"),
+    ("unpkg.cpp", "function", "package_reader::decrypt"),
 ]
 
 
@@ -75,6 +85,9 @@ def find(text: str, kind: str, name: str):
     if kind == "lines":
         found = list(re.finditer(name, text, re.M))
         return [(m.start(), m.group(0)) for m in found] or None
+    if kind == "enum":
+        m = re.search(r"^enum\b[^;{]*\{[^}]*\b" + re.escape(name) + r"\b[^}]*\};", text, re.M)
+        return [(m.start(), m.group(0))] if m else None
     if kind == "struct":
         m = re.search(r"^struct\s+" + re.escape(name) + r"\b[^;{]*\{", text, re.M)
         if not m:
