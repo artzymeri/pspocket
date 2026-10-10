@@ -2,7 +2,8 @@
 
 // A minimal H.264 writer for tests (synthetic video, no game data): Baseline profile, every picture an IDR whose
 // macroblocks are all I_PCM, so the samples are stored as they are and any conforming decoder must give them back
-// exactly. Annex B byte stream, each access unit an access unit delimiter, the SPS and PPS, then one slice.
+// exactly. Annex B byte stream, each access unit an access unit delimiter, the SPS and PPS, then one slice; for MVC,
+// a second view's NAL units in the same access unit (D-590).
 
 #include <cstdint>
 #include <vector>
@@ -86,20 +87,21 @@ struct Options {
     uint32_t units_in_tick = 1001, time_scale = 60000;
 };
 
-// One access unit: AUD, SPS, PPS, an IDR slice of I_PCM macroblocks.
-inline std::vector<uint8_t> access_unit(const Picture& p, uint32_t idr_pic_id, const Options& o = {})
+// seq_parameter_set_data(): Baseline (66), or Stereo High (128) for MVC's subset SPS, the level, POC type 2 (output
+// order is decoding order), one reference frame.
+inline void sps_data(BitWriter& w, const Picture& p, const Options& o, uint8_t profile = 66)
 {
-    std::vector<uint8_t> out;
-    BitWriter w;
-    w.bits(0, 3); // primary_pic_type 0: I slices only
-    w.trailing();
-    put_nal(out, 0x09, w.take());
-
-    // SPS: Baseline, the level, POC type 2 (output order is decoding order), one reference frame.
-    w.byte(66);
-    w.byte(0xC0); // constraint_set0 and 1
+    w.byte(profile);
+    w.byte(profile == 66 ? 0xC0 : 0x00); // constraint_set0 and 1 for Baseline
     w.byte(o.level_idc);
     w.ue(0);      // seq_parameter_set_id
+    if (profile != 66) {
+        w.ue(1);  // chroma_format_idc: 4:2:0
+        w.ue(0);  // bit_depth_luma_minus8
+        w.ue(0);  // bit_depth_chroma_minus8
+        w.bit(0); // qpprime_y_zero_transform_bypass_flag
+        w.bit(0); // seq_scaling_matrix_present_flag
+    }
     w.ue(0);      // log2_max_frame_num_minus4
     w.ue(2);      // pic_order_cnt_type
     w.ue(1);      // max_num_ref_frames
@@ -124,10 +126,12 @@ inline std::vector<uint8_t> access_unit(const Picture& p, uint32_t idr_pic_id, c
         w.bit(0); // pic_struct_present_flag
         w.bit(0); // bitstream_restriction_flag
     }
-    w.trailing();
-    put_nal(out, 0x67, w.take());
+}
 
-    // PPS: CAVLC, one slice group, deblocking control present.
+// The PPS: CAVLC, one slice group, deblocking control present.
+inline std::vector<uint8_t> pps_rbsp()
+{
+    BitWriter w;
     w.ue(0); // pic_parameter_set_id
     w.ue(0); // seq_parameter_set_id
     w.bit(0); // entropy_coding_mode_flag
@@ -144,9 +148,13 @@ inline std::vector<uint8_t> access_unit(const Picture& p, uint32_t idr_pic_id, c
     w.bit(0); // constrained_intra_pred_flag
     w.bit(0); // redundant_pic_cnt_present_flag
     w.trailing();
-    put_nal(out, 0x68, w.take());
+    return w.take();
+}
 
-    // The IDR slice: every macroblock I_PCM (mb_type 25 in an I slice).
+// An IDR slice of `p`: every macroblock I_PCM (mb_type 25 in an I slice).
+inline std::vector<uint8_t> idr_slice_rbsp(const Picture& p, uint32_t idr_pic_id)
+{
+    BitWriter w;
     w.ue(0);  // first_mb_in_slice
     w.ue(7);  // slice_type: I, all slices of the picture
     w.ue(0);  // pic_parameter_set_id
@@ -169,7 +177,103 @@ inline std::vector<uint8_t> access_unit(const Picture& p, uint32_t idr_pic_id, c
         }
     }
     w.trailing();
-    put_nal(out, 0x65, w.take());
+    return w.take();
+}
+
+inline std::vector<uint8_t> aud_rbsp()
+{
+    BitWriter w;
+    w.bits(0, 3); // primary_pic_type 0: I slices only
+    w.trailing();
+    return w.take();
+}
+
+inline std::vector<uint8_t> sps_rbsp(const Picture& p, const Options& o)
+{
+    BitWriter w;
+    sps_data(w, p, o);
+    w.trailing();
+    return w.take();
+}
+
+// One access unit: AUD, SPS, PPS, an IDR slice of I_PCM macroblocks.
+inline std::vector<uint8_t> access_unit(const Picture& p, uint32_t idr_pic_id, const Options& o = {})
+{
+    std::vector<uint8_t> out;
+    put_nal(out, 0x09, aud_rbsp());
+    put_nal(out, 0x67, sps_rbsp(p, o));
+    put_nal(out, 0x68, pps_rbsp());
+    put_nal(out, 0x65, idr_slice_rbsp(p, idr_pic_id));
+    return out;
+}
+
+// ---- MVC (H.264 Annex H, D-590): a second view in the same access unit.
+
+// A NAL unit with the three bytes of nal_unit_header_mvc_extension() after its first: svc_extension_flag 0,
+// non_idr_flag 0 (an IDR access unit), priority_id 0, view_id, temporal_id 0, anchor_pic_flag 1, inter_view_flag,
+// reserved_one_bit. The emulation prevention bytes go into the payload only, as the header is not escaped.
+inline void put_mvc_nal(std::vector<uint8_t>& out, uint8_t header, uint32_t view_id, bool inter_view,
+    const std::vector<uint8_t>& rbsp)
+{
+    out.insert(out.end(), {0x00, 0x00, 0x00, 0x01, header, 0x00, static_cast<uint8_t>(view_id >> 2),
+        static_cast<uint8_t>((view_id & 3) << 6 | 1 << 2 | (inter_view ? 1 : 0) << 1 | 1)});
+    std::vector<uint8_t> nal;
+    put_nal(nal, 0, rbsp);
+    out.insert(out.end(), nal.begin() + 5, nal.end()); // without put_nal's start code and header byte
+}
+
+// The subset SPS (NAL unit 15) of two views: Stereo High, view 1 predicted from view 0, one level for both.
+inline std::vector<uint8_t> subset_sps_rbsp(const Picture& p, const Options& o)
+{
+    BitWriter w;
+    sps_data(w, p, o, 128);
+    w.bit(1); // bit_equal_to_one
+    // seq_parameter_set_mvc_extension()
+    w.ue(1); // num_views_minus1
+    w.ue(0); // view_id[0]
+    w.ue(1); // view_id[1]
+    w.ue(1); // num_anchor_refs_l0[1]
+    w.ue(0); // anchor_ref_l0[1][0]: view 0
+    w.ue(0); // num_anchor_refs_l1[1]
+    w.ue(1); // num_non_anchor_refs_l0[1]
+    w.ue(0); // non_anchor_ref_l0[1][0]
+    w.ue(0); // num_non_anchor_refs_l1[1]
+    w.ue(0); // num_level_values_signalled_minus1
+    w.byte(o.level_idc);
+    w.ue(0);      // num_applicable_ops_minus1[0]
+    w.bits(0, 3); // applicable_op_temporal_id
+    w.ue(1);      // applicable_op_num_target_views_minus1: both
+    w.ue(0);      // applicable_op_target_view_id: 0, 1
+    w.ue(1);
+    w.ue(1);      // applicable_op_num_views_minus1
+    w.bit(0);     // mvc_vui_parameters_present_flag
+    w.bit(0);     // additional_extension2_flag
+    w.trailing();
+    return w.take();
+}
+
+// An MVC access unit of two views: the base view's access unit (access_unit()'s NAL units, in its order) with a subset
+// SPS after the SPS, a prefix NAL unit (14) before the base view's slice and the second view's slice after it as a
+// coded slice extension (20). Without the units 14, 15 and 20 it is access_unit(base, ...) byte for byte.
+inline std::vector<uint8_t> mvc_access_unit(const Picture& base, const Picture& second, uint32_t idr_pic_id,
+    const Options& o = {})
+{
+    std::vector<uint8_t> out;
+    put_nal(out, 0x09, aud_rbsp());
+    put_nal(out, 0x67, sps_rbsp(base, o));
+    put_nal(out, 0x6F, subset_sps_rbsp(base, o));
+    put_nal(out, 0x68, pps_rbsp());
+    put_mvc_nal(out, 0x6E, 0, true, {}); // the prefix NAL unit: no payload in MVC
+    put_nal(out, 0x65, idr_slice_rbsp(base, idr_pic_id));
+    put_mvc_nal(out, 0x74, 1, false, idr_slice_rbsp(second, idr_pic_id));
+    return out;
+}
+
+// The second view's slice alone, as an access unit of a stream that sends the views apart: nothing of the base view.
+inline std::vector<uint8_t> second_view_only(const Picture& second, uint32_t idr_pic_id)
+{
+    std::vector<uint8_t> out;
+    put_mvc_nal(out, 0x74, 1, false, idr_slice_rbsp(second, idr_pic_id));
     return out;
 }
 

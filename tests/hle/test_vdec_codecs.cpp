@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "h264_writer.hpp"
 #include "vc1_writer.hpp"
 #include "vdec_test_util.hpp"
 
@@ -27,11 +28,13 @@ using namespace pspocket;
 using namespace pspocket::hle::test;
 using namespace pspocket::hle::test::vdec_test;
 namespace v1 = pspocket::hle::test::vc1;
+namespace h = pspocket::hle::test::h264;
 
 #if PSPOCKET_HAVE_FFMPEG
 namespace {
 
-constexpr u32 CODEC_MPEG4 = 2, CODEC_VC1 = 3, CODEC_DIVX = 5, CODEC_DIVX3_11 = 9;
+constexpr u32 CODEC_AVC = 1, CODEC_MPEG4 = 2, CODEC_VC1 = 3, CODEC_DIVX = 5, CODEC_DIVX3_11 = 9, CODEC_MVC = 11,
+              CODEC_MVC2 = 13;
 constexpr u32 CELL_VDEC_ERROR_ARG = 0x80610101, CELL_VDEC_ERROR_FATAL = 0x80610180;
 
 // A picture in YUV 4:2:0 planes without padding, as cellVdec's GetPicture gives it.
@@ -273,6 +276,12 @@ std::vector<u8> range_mapped(std::vector<u8> yuv, int width, int height, int ry,
         yuv[k] = static_cast<u8>(std::clamp((((yuv[k] - 128) * (r + 9) + 4) >> 3) + 128, 0, 255));
     }
     return yuv;
+}
+
+// The samples of an I_PCM picture of the H.264 writer as GetPicture gives them in YUV 4:2:0.
+std::vector<u8> samples_of(const h::Picture& p)
+{
+    return concat({p.y, p.cb, p.cr});
 }
 
 // CellVdecVc1Info's fields (pspocket's layout, D-589), the rest of the block zero.
@@ -671,6 +680,76 @@ TEST_CASE("cellVdec: VC-1 before its sequence header, a new sequence header, the
         CHECK(e.audone == 0);
         CHECK(e.pictures.empty());
         CHECK(std::count(e.lines.begin(), e.lines.end(), "cellVdecDecodeAu -> 0x80610101") == 1);
+    }
+}
+
+TEST_CASE("cellVdec: MVC's base view decoded as the same stream without its second view would be as H.264 (D-590)",
+    "[hle][vdec]")
+{
+    // Two views in each access unit (a subset SPS, a prefix NAL unit, the second view's coded slice extension): the
+    // base view's pictures, items and information are those of the H.264 stream without them, and the second view's
+    // samples (another picture) show nowhere.
+    constexpr int kW = 64, kH = 64, kAus = 4;
+    std::vector<std::vector<u8>> mvc, avc;
+    for (int i = 0; i < kAus; i++) {
+        mvc.push_back(h::mvc_access_unit(h::pattern(kW, kH, i), h::pattern(kW, kH, 10 + i), static_cast<u32>(i & 1)));
+        avc.push_back(h::access_unit(h::pattern(kW, kH, i), static_cast<u32>(i & 1)));
+    }
+    InterpretMisses interpret;
+    const auto run = [&](u32 codec, const std::vector<std::vector<u8>>& aus) {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        Stream s;
+        s.codec = codec;
+        s.level = 21;
+        s.aus = aus;
+        return decode_stream(f.base(), hle_calls(f, t), s);
+    };
+    const Decoded as_avc = run(CODEC_AVC, avc);
+    REQUIRE(as_avc.pictures.size() == kAus);
+    for (const u32 codec : {CODEC_MVC, CODEC_MVC2}) {
+        INFO("codec " << codec);
+        const Decoded d = run(codec, mvc);
+        INFO(all_lines(d.lines));
+        REQUIRE(d.open == 0);
+        CHECK(d.audone == kAus);
+        CHECK(d.pictures_after_aus == kAus - 1); // one access unit late, as H.264's
+        CHECK(d.picout == kAus);
+        CHECK(d.seqdone == 1);
+        REQUIRE(d.pictures.size() == kAus);
+        for (usize i = 0; i < kAus; i++) {
+            INFO("picture " << i);
+            CHECK(d.pictures[i] == samples_of(h::pattern(kW, kH, static_cast<int>(i)))); // the base view's, exactly
+            CHECK(d.pictures[i] == as_avc.pictures[i]);
+            CHECK(d.infos[i] == as_avc.infos[i]); // CellVdecAvcInfo from the base view's SPS, PPS and NAL units
+            CHECK(be32(d.items[i], 0) == codec);
+            CHECK(std::equal(d.items[i].begin() + 4, d.items[i].end(), as_avc.items[i].begin() + 4));
+        }
+    }
+}
+
+TEST_CASE("cellVdec: MVC with its views in access units apart: the second view's give no picture (D-590)",
+    "[hle][vdec]")
+{
+    constexpr int kW = 64, kH = 64;
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    Stream s;
+    s.codec = CODEC_MVC;
+    s.level = 21;
+    for (int i = 0; i < 2; i++) {
+        s.aus.push_back(h::access_unit(h::pattern(kW, kH, i), static_cast<u32>(i)));
+        s.aus.push_back(h::second_view_only(h::pattern(kW, kH, 10 + i), static_cast<u32>(i)));
+    }
+    const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
+    INFO(all_lines(d.lines));
+    CHECK(d.audone == 4); // each access unit done, the second view's with nothing decoded
+    REQUIRE(d.pictures.size() == 2);
+    for (usize i = 0; i < 2; i++) {
+        INFO("picture " << i);
+        CHECK(d.pictures[i] == samples_of(h::pattern(kW, kH, static_cast<int>(i))));
+        CHECK(be32(d.items[i], 0x14) == 0x1000 + 3003 * 2 * i); // the PTS of access units 0 and 2
     }
 }
 #endif

@@ -1,8 +1,8 @@
 // cellVdec: the video decoder (libvdec), pspocket's own on FFmpeg (D-181, D-195). H.264 (and the JVT form of it),
 // MPEG-2 and MPEG-4 part 2 (as in DivX) decode with FFmpeg as in RPCS3 (rpcs3/Emu/Cell/Modules/cellVdec.cpp: the
-// sequence states, the commands, the checks of each call, the picture formats). DivX 3.11 (D-588) and VC-1's advanced
-// profile (D-589), which RPCS3 does not decode, go the same way. What a game sees follows Sony's libvdec 4.92 as it ran
-// over synthetic H.264 in tests/hle/test_vdec.cpp (D-195), where it differs from RPCS3's:
+// sequence states, the commands, the checks of each call, the picture formats). DivX 3.11 (D-588), VC-1's advanced
+// profile (D-589) and MVC's base view (D-590), which RPCS3 does not decode, go the same way. What a game sees follows
+// Sony's libvdec 4.92 as it ran over synthetic H.264 in tests/hle/test_vdec.cpp (D-195), where it differs from RPCS3's:
 //
 // - Sizes: cellVdecQueryAttr gives Sony's. For H.264 the decoder's memory comes from libavcdec's avcDecQueryMemory,
 //   reconstructed (avc_memory below: Sony's answers in every case tried); for the other codecs, Sony's answers for each
@@ -20,9 +20,9 @@
 //   the exact coefficients, truncated: within one step of Sony's values. UYVY repeats each chroma row, as Sony's.
 //
 // Not yet (each fails loudly): VC-1's simple and main profiles (their sequence header travels outside the stream, and
-// how libsvc1d is given it is not known: open fails, logged), MVC decoding (open fails, logged), the codec specific
-// information of codecs other than H.264 in the sizes (Sony's answer without it is given, and logged; DivX 3.11's is
-// checked and gives the frame size).
+// how libsvc1d is given it is not known: open fails, logged), MVC's views past the base one (FFmpeg has no MVC
+// decoder: their NAL units are left out, logged once), the codec specific information of codecs other than H.264 in
+// the sizes (Sony's answer without it is given, and logged; DivX 3.11's is checked and gives the frame size).
 
 #include <algorithm>
 #include <array>
@@ -540,6 +540,34 @@ usize next_start_code(std::span<const u8> d, usize from)
     return d.size();
 }
 
+// ---- MVC (H.264 Annex H, D-590): FFmpeg has no MVC decoder, so its H.264 decoder gets the base view alone
+
+// An MVC access unit without the NAL units of the views past the base one: prefix NAL units (14), subset sequence
+// parameter sets (15) and coded slice extensions (20). Each NAL unit runs from its start code (with the zero byte of a
+// four-byte one) to the next one's, and the rest stays as it was; whether any was left out.
+bool mvc_base_view(std::span<const u8> au, std::vector<u8>& out)
+{
+    std::vector<usize> codes; // where each start code begins
+    for (usize i = next_start_code(au, 0); i < au.size(); i = next_start_code(au, i + 3)) codes.push_back(i);
+    const auto begin_of = [&](usize k) {
+        const usize floor = k ? codes[k - 1] + 4 : 0; // not into the start code and header before
+        return codes[k] > floor && au[codes[k] - 1] == 0 ? codes[k] - 1 : codes[k];
+    };
+    const auto keep = [&](usize begin, usize end) {
+        const std::span<const u8> part = au.subspan(begin, end - begin);
+        out.insert(out.end(), part.begin(), part.end());
+    };
+    out.clear();
+    keep(0, codes.empty() ? au.size() : begin_of(0));
+    bool left_out = false;
+    for (usize k = 0; k < codes.size(); k++) {
+        const u8 type = codes[k] + 3 < au.size() ? au[codes[k] + 3] & 0x1F : 0;
+        if (type == 14 || type == 15 || type == 20) left_out = true;
+        else keep(begin_of(k), k + 1 < codes.size() ? begin_of(k + 1) : au.size());
+    }
+    return left_out;
+}
+
 // ---- VC-1 (SMPTE 421M), the advanced profile in its start code framing (D-589): FFmpeg's configuration and what
 // CellVdecVc1Info reports, from the access unit's bitstream data units (BDUs)
 
@@ -766,7 +794,17 @@ struct Command {
     u32 au_addr = 0, au_size = 0;
     AuMeta meta;
     u32 frame_rate = 0;
+    // What the decoder is given when it is not the game's access unit as it is (MVC's base view, D-590): au_size
+    // bytes, then FFmpeg's zero padding. Empty with own_data: nothing to decode.
+    std::vector<u8> data;
+    bool own_data = false;
 };
+
+// The zero bytes FFmpeg reads past a packet's end (AV_INPUT_BUFFER_PADDING_SIZE).
+constexpr usize kPacketPadding = 64;
+#if PSPOCKET_HAVE_FFMPEG
+static_assert(kPacketPadding >= AV_INPUT_BUFFER_PADDING_SIZE);
+#endif
 
 struct Vdec {
     u32 handle = 0, mem_size = 0, codec = 0, level = 0, cb_func = 0, cb_arg = 0;
@@ -787,6 +825,7 @@ struct Vdec {
     std::vector<u8> vc1_opened;    // the sequence header FFmpeg's decoder was opened with (the decoder's thread)
     bool vc1_skip_logged = false;  // the decoder's thread
     bool vc1_other_logged = false; // under m
+    bool mvc_logged = false;       // under m
 #if PSPOCKET_HAVE_FFMPEG
     AVCodecContext* av = nullptr;
 #endif
@@ -882,7 +921,9 @@ const AVCodec* decoder_for(u32 codec)
 {
     switch (codec) {
     case CODEC_AVC:
-    case CODEC_JVT: return avcodec_find_decoder(AV_CODEC_ID_H264);
+    case CODEC_JVT:
+    case CODEC_MVC:
+    case CODEC_MVC2: return avcodec_find_decoder(AV_CODEC_ID_H264); // MVC: its base view (D-590)
     case CODEC_MPEG2: return avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
     case CODEC_MPEG4:
     case CODEC_DIVX: return avcodec_find_decoder(AV_CODEC_ID_MPEG4);
@@ -1067,10 +1108,13 @@ void run(PPUContext& ctx, Vdec& v)
                 seq = v.seq;
             }
             if (c.seq == seq && c.type == Command::au && v.codec == CODEC_VC1) vc1_open(v, c.meta.vc1, in_flight, seq);
-            if (c.seq == seq && v.av) {
+            // An access unit of the views past MVC's base one alone has nothing to decode (an empty packet would end
+            // the stream).
+            const bool nothing = c.type == Command::au && c.own_data && c.au_size == 0;
+            if (c.seq == seq && v.av && !nothing) {
                 if (c.type == Command::au) {
                     AVPacket* pkt = av_packet_alloc();
-                    pkt->data = guest_base(ctx) + c.au_addr;
+                    pkt->data = c.own_data ? c.data.data() : guest_base(ctx) + c.au_addr;
                     pkt->size = static_cast<int>(c.au_size);
                     pkt->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(c.meta.index));
                     v.av->skip_frame = c.mode == DEC_MODE_NORMAL ? AVDISCARD_DEFAULT
@@ -1361,7 +1405,9 @@ void write_item(u8* base, const Vdec& v, const Picture& p, u32 item, u32 info)
     ps_write32(base, item + 0x44, static_cast<u32>(p.meta.attr));
     ps_write32(base, item + 0x48, info);
     std::memset(base + info, 0, kInfoStride);
-    if (v.codec == CODEC_AVC || v.codec == CODEC_JVT) {
+    if (v.codec == CODEC_AVC || v.codec == CODEC_JVT || v.codec == CODEC_MVC || v.codec == CODEC_MVC2) {
+        // H.264's, and MVC's base view's as H.264's (D-590: Sony's CellVdecMvcInfo, 0x214 bytes by RPCS3's
+        // attributes, is not known).
         const AvcSps& s = p.meta.sps;
         ps_write16(base, info + 0x00, static_cast<u16>(p.width));
         ps_write16(base, info + 0x02, static_cast<u16>(p.height));
@@ -1590,8 +1636,21 @@ s32 cellVdecDecodeAu(PPUContext& ctx, u32 handle, s32 mode, u32 au_info)
     c.meta.dts_lower = ps_read32(base, au_info + 20);
     c.meta.user_data = ps_read64(base, au_info + 24);
     c.meta.attr = mode == DEC_MODE_NORMAL ? 0 : 1;
-    if (v->codec == CODEC_AVC || v->codec == CODEC_JVT) scan_avc_au({base + c.au_addr, c.au_size}, c.meta.avc, v->sps);
+    const bool mvc = v->codec == CODEC_MVC || v->codec == CODEC_MVC2;
+    if (v->codec == CODEC_AVC || v->codec == CODEC_JVT || mvc)
+        scan_avc_au({base + c.au_addr, c.au_size}, c.meta.avc, v->sps); // MVC: the base view's (D-590)
     c.meta.sps = v->sps;
+    if (mvc) {
+        // MVC (D-590): the decoder is given the base view, a copy made now (the game may reuse its buffer).
+        if (mvc_base_view({base + c.au_addr, c.au_size}, c.data) && !v->mvc_logged) {
+            PS_LOG_WARN(kChan, "decoder {:#x}: MVC's views past the base one (NAL units 14, 15, 20) are not decoded: "
+                               "the base view's pictures only (2D)", v->handle);
+            v->mvc_logged = true;
+        }
+        c.own_data = true;
+        c.au_size = static_cast<u32>(c.data.size());
+        c.data.resize(c.data.size() + kPacketPadding, 0);
+    }
     if (v->codec == CODEC_VC1) {
         Vc1Picture pic;
         bool other_profile = false;

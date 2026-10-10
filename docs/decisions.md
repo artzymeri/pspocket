@@ -8361,3 +8361,34 @@ To compare with Sony's libvdec on the Mac, over the same streams: CellVdecVc1Inf
 it reports of the headers), whether libsvc1d applies range mapping, the pictures sample for sample, access units before
 a sequence header (skipped, or an error), the frame buffers and the one-access-unit lag for VC-1, the simple and main
 profiles' framing (what their access units carry) and the sizes with codec specific information.
+
+## D-590 · 2026-10-10 · cellVdec: MVC's base view as H.264, its other view's NAL units left out
+
+MVC (CELL_VDEC_CODEC_TYPE_MVC 11, and MVC2 13, which RPCS3 notes "seems the same") is H.264 with more views (Annex
+H), as on 3D Blu-ray and in stereoscopic games' movies. RPCS3 does not decode it (its vdec_context throws for the
+type); FFmpeg has no MVC decoder, but its H.264 decoder decodes an MVC stream's base view as plain H.264.
+
+- cellVdec opens FFmpeg's H.264 decoder for MVC (on VideoToolbox on Apple's devices, as D-254's H.264) and gives it
+  each access unit without the NAL units of the other views: prefix NAL units (14), subset sequence parameter sets (15)
+  and coded slice extensions (20), each from its start code (with the zero byte of a four-byte one) to the next one's;
+  the rest byte for byte, copied at DecodeAu. The first access unit that has any is logged (once a decoder). One with
+  nothing else (a stream that sends the views apart) is done (AUDONE) with nothing decoded: an empty packet would end
+  FFmpeg's stream.
+- So MVC gives its base view's pictures (2D) exactly as the same stream without its other views would as H.264: the
+  same one-access-unit lag, frame buffers, items (the codec type apart) and information, CellVdecAvcInfo from the base
+  view's SPS, PPS and NAL units (the subset SPS is not read). Sony's own CellVdecMvcInfo (0x214 bytes by RPCS3's
+  attributes for libmvcdec, 0x30 less than H.264's 0x244) is not known: pspocket writes H.264's there.
+- **Known limit:** the second view (a 3D movie's right eye) is not decoded. A game that shows MVC in 3D gets the left
+  eye's picture alone, and one that expects two pictures for an access unit (if Sony's gives them so) gets one.
+  Decoding it would take an MVC decoder of pspocket's own (FFmpeg's H.264 decoder lacks inter-view prediction).
+
+Tests: tests/hle/h264_writer.hpp writes MVC access units (its access_unit() now built from its NAL units, byte for byte
+as before): a subset SPS (Stereo High, two views), a prefix NAL unit and the second view's I_PCM slice as a coded
+slice extension. tests/hle/test_vdec_codecs.cpp: four two-view access units as MVC and as MVC2: the base view's
+samples exactly, and every picture, information block and item (the codec type apart) the same as the H.264 stream
+without the second view gives, none of the second view's samples anywhere; the views in access units apart: the second
+view's done with no picture, the base view's pictures with their own PTS.
+
+To compare with Sony's libvdec on the Mac: what libmvcdec gives for an MVC access unit (one picture or two, and where
+the second view goes), CellVdecMvcInfo's layout, the lag and the frame buffers for MVC, an access unit of the second
+view alone.
