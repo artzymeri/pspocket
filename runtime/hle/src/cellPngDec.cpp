@@ -16,8 +16,11 @@
 // - The chunk queries answer from libpng's information; the doubles (gAMA, cHRM) at libpng 1.2.8's float precision.
 // pspocket's guest memory use differs from libpngdec's: the handle (0x450 and 0xA80 bytes, Sony's sizes), the stream
 // (0x98) and the chunk queries' answers are the game's memory, libpng's own allocations are the host's (as RPCS3).
-// What is not pspocket's yet: the Ext functions (partial decoding, stream callbacks); a game that imports one gets
-// Sony's whole libpngdec (D-175).
+// The Ext functions (D-595) are made from RPCS3 (pngDecCreate, pngDecOpen, pngDecSetParameter and pngDecodeData with
+// their ext arguments) on this decoder, without Sony's module to compare them with: they are unverified (D-594), so a
+// game importing one still gets Sony's whole libpngdec where the system software is installed. They add stream input
+// (the PNG's next bytes from the game's callback as libpng reads them) and partial output (outputCounts lines at a time
+// to the game's display callback); see ext_open and decode_parts.
 
 #include <array>
 #include <bit>
@@ -60,6 +63,7 @@ enum : u32 {
     CELL_PNGDEC_ERROR_SEQ = 0x80611204,
     CELL_PNGDEC_ERROR_FATAL = 0x80611206,
     CELL_PNGDEC_ERROR_OPEN_FILE = 0x80611207,
+    CELL_PNGDEC_ERROR_CB_PARAM = 0x8061120A,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
@@ -67,15 +71,20 @@ constexpr u32 kCodecVersion = 0x00420000;
 constexpr u32 kHandleMagic = 0xEF58AD41, kStreamMagic = 0xED37BC51; // libpngdec's
 constexpr u32 kHandleSize = 0x450, kHandleExtraSize = 0xA80, kStreamSize = 0x98;
 constexpr u32 kInitSpaceAllocated = 0x4604;
+// The largest interlaced image decode_parts holds whole before its parts go out (D-595): the PS3's main memory.
+constexpr u64 kPartsImageMax = 0x10000000;
 
 // The handle (pspocket's layout but for the magic and the state at +0x18, libpngdec's).
 namespace hd {
 constexpr u32 magic = 0x00, malloc_fn = 0x04, malloc_arg = 0x08, free_fn = 0x0C, free_arg = 0x10, extra = 0x14,
               state = 0x18, busy = 0x1C, stream = 0x20;
 }
-// The stream (the magic, the handle, the state at +0x3C as libpngdec's).
+// The stream (the magic, the handle, the state at +0x3C as libpngdec's). From +0x40, pspocket's: what the Ext functions
+// hand the game's callbacks (D-595): CellPngDecStrmInfo, CellPngDecStrmParam, CellPngDecDispParam (when the game gives
+// none) and CellPngDecDispInfo (0x40 bytes, to the block's end).
 namespace st {
 constexpr u32 magic = 0x00, handle = 0x04, state = 0x3C;
+constexpr u32 strm_info = 0x40, strm_param = 0x48, disp_param = 0x50, disp_info = 0x58;
 }
 enum State : u32 { OPENED = 1, HEADER = 3, PARAMETERS = 4, DECODED = 5, FAILED = 6 };
 
@@ -103,6 +112,16 @@ struct Stream {
     bool trns = false;
     std::vector<u8> trns_alphas;
     png_color_16 trns_color{};
+    // The Ext functions (D-595). Stream input: the game's callback (CellPngDecCbCtrlStrm; 0: the source holds the whole
+    // PNG), the stream's guest block, and while a call that reads runs, the context the callback is called on; ended
+    // once it gives nothing more, with CB_PARAM kept when what it gave was not guest memory.
+    u32 strm_fn = 0, strm_arg = 0, strm_block = 0;
+    PPUContext* strm_ctx = nullptr;
+    bool strm_ended = false;
+    u32 strm_error = 0;
+    // Partial output: the lines a display callback gets at a time (CellPngDecExtInParam's outputCounts; 0: the whole
+    // image into DecodeData's buffer), and what ExtSetParameter was given and answered.
+    u32 output_counts = 0, command = 0, out_components = 0, out_depth = 0;
     ~Stream()
     {
         if (png) png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
@@ -112,6 +131,7 @@ struct Stream {
 struct PngDecs {
     std::mutex m;
     std::map<u32, std::shared_ptr<Stream>> streams;
+    bool select_logged = false, flip_logged = false; // the Ext functions' once-a-process notes (D-595)
 };
 
 PngDecs& decs() { return HleProcess::current()->state<PngDecs>(); }
@@ -164,12 +184,47 @@ void set_state(u8* base, u32 h, u32 s, u32 state)
     ps_write32(base, h + hd::state, state);
 }
 
+// Stream input (cellPngDecExtOpen's CellPngDecCbCtrlStrm, D-595; RPCS3 pngDecodeData's loop over cbCtrlStrmFunc): the
+// game's stream callback asked for the PNG's next bytes until `need` are held, as libpng reads them (the header's
+// chunks at ReadHeader, the rest at DecodeData). The callback gets CellPngDecStrmInfo (decodedStrmSize: the bytes of
+// the stream given so far, all of them read by then) and CellPngDecStrmParam, where it puts the next part (strmPtr,
+// strmSize), copied at once so that it may reuse its buffer. A negative answer or no bytes ends the stream (libpng then
+// says what it lacks: STREAM_FORMAT); bytes that are not guest memory end it too and make the call CB_PARAM. Nothing
+// here lives past the return: read_data may longjmp right after.
+bool stream_more(Stream& s, usize need)
+{
+    if (!s.strm_fn || !s.strm_ctx || s.strm_ended) return false;
+    PPUContext& ctx = *s.strm_ctx;
+    u8* base = guest_base(ctx);
+    const u32 info = s.strm_block + st::strm_info, param = s.strm_block + st::strm_param;
+    while (s.data.size() < need) {
+        ps_write32(base, info, static_cast<u32>(s.data.size()));
+        ps_write32(base, param, 0);
+        ps_write32(base, param + 4, 0);
+        const auto r = static_cast<s32>(static_cast<u32>(call_guest(ctx, s.strm_fn, {info, param, s.strm_arg})));
+        const u32 ptr = ps_read32(base, param), size = ps_read32(base, param + 4);
+        if (r < 0 || !size) {
+            PS_LOG_DEBUG(kChan, "the stream callback ends the stream after {} bytes ({:#x})", s.data.size(), static_cast<u32>(r));
+            s.strm_ended = true;
+            return false;
+        }
+        if (!readable(ctx, ptr, size)) {
+            PS_LOG_WARN(kChan, "the stream callback gave {} bytes at {:#x}, not guest memory", size, ptr);
+            s.strm_error = CELL_PNGDEC_ERROR_CB_PARAM;
+            s.strm_ended = true;
+            return false;
+        }
+        s.data.insert(s.data.end(), base + ptr, base + ptr + size);
+    }
+    return true;
+}
+
 // ---- libpng, each call behind its own setjmp (libpng reports errors by longjmp)
 
 void read_data(png_structp png, png_bytep out, size_t length)
 {
     auto* s = static_cast<Stream*>(png_get_io_ptr(png));
-    if (s->cursor + length > s->data.size()) png_error(png, "the stream ends early");
+    if (s->cursor + length > s->data.size() && !stream_more(*s, s->cursor + length)) png_error(png, "the stream ends early");
     std::memcpy(out, s->data.data() + s->cursor, length);
     s->cursor += length;
 }
@@ -202,6 +257,21 @@ bool read_rows(Stream& s, std::vector<u8>& rows)
     if (setjmp(png_jmpbuf(s.png))) return false;
     for (u32 pass = 0; pass < s.passes; pass++)
         for (u32 y = 0; y < s.height; y++) png_read_row(s.png, rows.data() + y * s.png_row_bytes, nullptr);
+    png_read_end(s.png, s.info);
+    return true;
+}
+
+// The next row of an image that is not interlaced, and what follows the image (the parts of decode_parts, D-595).
+bool read_row(Stream& s, u8* row)
+{
+    if (setjmp(png_jmpbuf(s.png))) return false;
+    png_read_row(s.png, row, nullptr);
+    return true;
+}
+
+bool read_end(Stream& s)
+{
+    if (setjmp(png_jmpbuf(s.png))) return false;
     png_read_end(s.png, s.info);
     return true;
 }
@@ -278,6 +348,36 @@ u32 chunk_information(const Stream& s, bool idat)
         if (png_get_valid(s.png, s.info, flags[i])) bits |= 1u << i;
     return bits | (idat ? 1u << 15 : 0);
 }
+
+// While a call that reads the PNG runs (ReadHeader, DecodeData and their Ext forms): the context a stream opened with a
+// stream callback calls it on (D-595). Nothing for any other stream.
+class Reading {
+public:
+    Reading(PPUContext& ctx, u32 sa) : s_(stream_of(sa))
+    {
+        if (s_ && s_->strm_fn) s_->strm_ctx = &ctx;
+        else s_ = nullptr;
+    }
+    ~Reading()
+    {
+        if (s_) s_->strm_ctx = nullptr;
+    }
+    Reading(const Reading&) = delete;
+    Reading& operator=(const Reading&) = delete;
+    // The first `n` bytes held before the header is looked at (the source's buffer may be shorter than the signature).
+    void need(usize n) const
+    {
+        if (s_ && s_->data.size() < n) stream_more(*s_, n);
+    }
+    // A read cut short by what the stream callback gave answers CB_PARAM.
+    s32 result(s32 r) const
+    {
+        return s_ && s_->strm_error && r == error(CELL_PNGDEC_ERROR_STREAM_FORMAT) ? error(s_->strm_error) : r;
+    }
+
+private:
+    std::shared_ptr<Stream> s_;
+};
 
 // ---- the API
 
@@ -489,10 +589,18 @@ s32 read_header(PPUContext& ctx, u32 h, u32 sa, u32 info)
     return lv2::CELL_OK;
 }
 
+// read_header, with a stream callback asked for the header's bytes as libpng reads them (D-595).
+s32 read_header_streamed(PPUContext& ctx, u32 handle, u32 stream, u32 info)
+{
+    const Reading reading(ctx, stream);
+    reading.need(8);
+    return reading.result(read_header(ctx, handle, stream, info));
+}
+
 s32 cellPngDecReadHeader(PPUContext& ctx, u32 handle, u32 stream, u32 info)
 {
     const std::string call = std::format("cellPngDecReadHeader({:#x}, {:#x}, {:#x})", handle, stream, info);
-    return finish(read_header(ctx, handle, stream, info), call);
+    return finish(read_header_streamed(ctx, handle, stream, info), call);
 }
 
 // libpngdec's transformations for the output asked for (RPCS3 pngDecSetParameter, with libpngdec's refusals).
@@ -635,7 +743,257 @@ s32 cellPngDecDecodeData(PPUContext& ctx, u32 handle, u32 stream, u32 data, u32 
 {
     const std::string call =
         std::format("cellPngDecDecodeData({:#x}, {:#x}, {:#x}, {:#x}, {:#x})", handle, stream, data, ctrl, out);
-    return finish(decode_data(ctx, handle, stream, data, ctrl, out), call);
+    const Reading reading(ctx, stream);
+    return finish(reading.result(decode_data(ctx, handle, stream, data, ctrl, out)), call);
+}
+
+// ---- the Ext functions (D-595): made from RPCS3 rpcs3/Emu/Cell/Modules/cellPngDec.cpp (pngDecCreate, pngDecOpen,
+// cellPngDecExtReadHeader, pngDecSetParameter and pngDecodeData with their ext arguments; the structures from
+// cellPngDec.h) on the decoder above, unverified (D-594): not compared with Sony's libpngdec, which serves a game
+// importing one wherever the system software is installed.
+
+// CellPngDecExtThreadInParam (spurs, priority[8], maxContention) and CellPngDecExtThreadOutParam (reserved) are
+// libpngdec's SPU side on the game's SPURS. pspocket decodes on the calling thread: both are only checked for being
+// guest memory (RPCS3 checks nothing and stops on an extThreadOutParam), and the decoder is Create's, the same memory.
+s32 cellPngDecExtCreate(PPUContext& ctx, u32 handle_out, u32 thread_in, u32 thread_out, u32 ext_in, u32 ext_out)
+{
+    const std::string call = std::format("cellPngDecExtCreate({:#x}, {:#x}, {:#x}, {:#x}, {:#x})", handle_out, thread_in,
+        thread_out, ext_in, ext_out);
+    if ((ext_in && !readable(ctx, ext_in, 16)) || (ext_out && !readable(ctx, ext_out, 4)))
+        return finish(error(CELL_PNGDEC_ERROR_ARG), call);
+    return finish(create(ctx, handle_out, thread_in, thread_out), call);
+}
+
+// Open with stream input: CellPngDecCbCtrlStrm (cbCtrlStrmFunc, cbCtrlStrmArg; a function of 0 is no stream input).
+// The source's buffer is the stream's first part, the rest comes from the callback as libpng reads it (stream_more).
+// Only from a buffer: a stream callback with a file source is STREAM_FORMAT (RPCS3), answered before the handle is
+// taken. CellPngDecOpnParam's selectChunk (RPCS3 stops on one that is not 0) is noted once: every chunk is read and
+// kept, so the chunk queries answer for chunks a game did not select too.
+s32 ext_open(PPUContext& ctx, u32 h, u32 stream_out, u32 src, u32 open_info, u32 cb_strm, u32 opn_param)
+{
+    if (!live_handle(ctx, h)) return error(CELL_PNGDEC_ERROR_ARG);
+    if ((cb_strm && !readable(ctx, cb_strm, 8)) || (opn_param && !readable(ctx, opn_param, 4)))
+        return error(CELL_PNGDEC_ERROR_ARG);
+    u8* base = guest_base(ctx);
+    const u32 strm_fn = cb_strm ? ps_read32(base, cb_strm) : 0, strm_arg = cb_strm ? ps_read32(base, cb_strm + 4) : 0;
+    if (strm_fn && readable(ctx, src, 4) && ps_read32(base, src) != 1) {
+        PS_LOG_WARN(kChan, "cellPngDecExtOpen: a stream callback with a source that is not a buffer");
+        return error(CELL_PNGDEC_ERROR_STREAM_FORMAT);
+    }
+    if (const u32 select = opn_param ? ps_read32(base, opn_param) : 0) {
+        PngDecs& d = decs();
+        std::lock_guard lock(d.m);
+        if (!d.select_logged)
+            PS_LOG_WARN(kChan, "cellPngDecExtOpen: selectChunk {:#x}: every chunk is read and kept (logged once)", select);
+        d.select_logged = true;
+    }
+    if (const s32 r = open(ctx, h, stream_out, src, open_info); r != lv2::CELL_OK || !strm_fn) return r;
+    const u32 sa = ps_read32(base, stream_out);
+    if (const std::shared_ptr<Stream> s = stream_of(sa)) {
+        s->strm_fn = strm_fn;
+        s->strm_arg = strm_arg;
+        s->strm_block = sa;
+    }
+    return lv2::CELL_OK;
+}
+
+s32 cellPngDecExtOpen(PPUContext& ctx, u32 handle, u32 stream_out, u32 src, u32 open_info, u32 cb_strm, u32 opn_param)
+{
+    const std::string call = std::format("cellPngDecExtOpen({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})", handle,
+        stream_out, src, open_info, cb_strm, opn_param);
+    return finish(ext_open(ctx, handle, stream_out, src, open_info, cb_strm, opn_param), call);
+}
+
+// ReadHeader, and CellPngDecExtInfo's reserved word (8 bytes) set to 0 first, when the game gives one (RPCS3).
+s32 cellPngDecExtReadHeader(PPUContext& ctx, u32 handle, u32 stream, u32 info, u32 ext_info)
+{
+    const std::string call = std::format("cellPngDecExtReadHeader({:#x}, {:#x}, {:#x}, {:#x})", handle, stream, info,
+        ext_info);
+    if (ext_info) {
+        std::shared_ptr<Stream> s;
+        if (const s32 r = checked(ctx, handle, stream, OPENED, s); r != lv2::CELL_OK) return finish(r, call);
+        if (!readable(ctx, ext_info, 8)) return finish(error(CELL_PNGDEC_ERROR_ARG), call);
+        ps_write64(guest_base(ctx), ext_info, 0);
+    }
+    return finish(read_header_streamed(ctx, handle, stream, info), call);
+}
+
+// SetParameter, and the parts: CellPngDecExtInParam (bufferMode, outputCounts, spuMode) and CellPngDecExtOutParam
+// (outputWidthByte, 8 bytes; outputHeight), both optional (RPCS3). bufferMode must be CELL_PNGDEC_LINE_MODE (1), else
+// ARG, refused before the output is set (pspocket's way with refused parameters: the stream fails). outputCounts lines
+// go to each display callback, an interlaced image's one at a time (RPCS3); 0 gives the whole image to DecodeData's
+// buffer, interlaced or not. extOutParam: the row and the lines of a part (the image's height for 0). spuMode does
+// nothing here.
+s32 ext_set_parameter(PPUContext& ctx, u32 h, u32 sa, u32 in, u32 out, u32 ext_in, u32 ext_out)
+{
+    std::shared_ptr<Stream> s;
+    if (const s32 r = checked(ctx, h, sa, HEADER, s); r != lv2::CELL_OK) return r;
+    u8* base = guest_base(ctx);
+    if ((ext_in && !readable(ctx, ext_in, 12)) || (ext_out && !readable(ctx, ext_out, 12))) return error(CELL_PNGDEC_ERROR_ARG);
+    if (ext_in && ps_read32(base, ext_in) != 1) {
+        PS_LOG_WARN(kChan, "cellPngDecExtSetParameter: buffer mode {}", ps_read32(base, ext_in));
+        set_state(base, h, sa, FAILED);
+        return error(CELL_PNGDEC_ERROR_ARG);
+    }
+    if (const s32 r = set_parameter(ctx, h, sa, in, out); r != lv2::CELL_OK) return r;
+    s->command = ps_read32(base, in); // CellPngDecInParam's commandPtr: CELL_PNGDEC_STOP stops between parts
+    s->out_components = ps_read32(base, out + 0x10);
+    s->out_depth = ps_read32(base, out + 0x14);
+    s->output_counts = 0;
+    if (ext_in) {
+        // RPCS3 makes an interlaced image's 1 even when 0 was asked, against its own 0 (the whole image, no callbacks):
+        // here 0 stays 0.
+        const u32 counts = ps_read32(base, ext_in + 4);
+        s->output_counts = counts && s->passes > 1 ? 1 : counts;
+        if (ext_out) {
+            ps_write64(base, ext_out, s->row_bytes);
+            ps_write32(base, ext_out + 8, s->output_counts ? std::min(s->output_counts, s->height) : s->height);
+        }
+    }
+    return lv2::CELL_OK;
+}
+
+s32 cellPngDecExtSetParameter(PPUContext& ctx, u32 handle, u32 stream, u32 in_param, u32 out_param, u32 ext_in,
+    u32 ext_out)
+{
+    const std::string call = std::format("cellPngDecExtSetParameter({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})", handle,
+        stream, in_param, out_param, ext_in, ext_out);
+    return finish(ext_set_parameter(ctx, handle, stream, in_param, out_param, ext_in, ext_out), call);
+}
+
+// Partial output (RPCS3 pngDecodeData with cbCtrlDisp and outputCounts, its row callback pngDecRowCallback): the image
+// goes out outputCounts lines at a time, each part written at the frame's line pitch (outputBytesPerLine) from the
+// address CellPngDecDispParam's nextOutputImage gives, then handed to the display callback (CellPngDecCbCtrlDisp:
+// cbCtrlDispFunc, cbCtrlDispArg) with CellPngDecDispInfo, which may point nextOutputImage elsewhere for the next part.
+// What is pspocket's own, where RPCS3 has none or goes wrong:
+// - every part has its callback, the last one too (RPCS3 calls back as the next part starts, so never for the last),
+//   with the part's own height and nextOutputStartY the next part's first line (the image's height after the last);
+// - the callback is given the game's own CellPngDecDispParam when it passes one (RPCS3 a copy), else the stream's,
+//   which starts at `data`; a first nextOutputImage of 0 means `data` too;
+// - a non-interlaced image decodes a row at a time, its stream callback called as libpng reads, so the stream and
+//   display callbacks interleave; an interlaced one decodes whole first (every pass), then goes out a line at a time,
+//   each line once, complete: scanPassCount is 0 throughout (RPCS3 reports libpng's passes);
+// - CELL_PNGDEC_STOP at the parameters' commandPtr after a callback stops the decoding: status STOP, CELL_OK;
+// - a part's place that is not guest memory: ARG for the first, CB_PARAM for one a callback gave; the stream fails;
+// - the row order (outputMode) is top to bottom in parts (RPCS3 too), noted once.
+s32 decode_parts(PPUContext& ctx, u32 h, u32 sa, Stream& s, u32 data, u32 ctrl, u32 out, u32 cb_disp, u32 disp_param)
+{
+    u8* base = guest_base(ctx);
+    if (!readable(ctx, ctrl, 8) || !readable(ctx, out, 0x10) || !readable(ctx, cb_disp, 8) || !ps_read32(base, cb_disp) ||
+        (disp_param && !readable(ctx, disp_param, 4)))
+        return error(CELL_PNGDEC_ERROR_ARG);
+    const u64 pitch = ps_read64(base, ctrl);
+    if (pitch < s.row_bytes) {
+        set_state(base, h, sa, FAILED);
+        return error(CELL_PNGDEC_ERROR_ARG);
+    }
+    const u32 disp_fn = ps_read32(base, cb_disp), disp_arg = ps_read32(base, cb_disp + 4);
+    const u32 param = disp_param ? disp_param : sa + st::disp_param;
+    u32 image = disp_param ? ps_read32(base, disp_param) : 0;
+    if (!image) image = data;
+    if (!disp_param) ps_write32(base, param, image);
+    // A part of n lines at `at`, as guest memory.
+    const auto fits = [&](u32 at, u32 n) {
+        const u64 size = pitch * (n - 1) + s.row_bytes;
+        return size <= 0xFFFFFFFFull && readable(ctx, at, static_cast<u32>(size));
+    };
+    if (s.height && !fits(image, std::min(s.output_counts, s.height))) {
+        log_call_site(ctx, base, std::format("cellPngDecExtDecodeData: the first part's place ({:#x}) is not guest memory", image));
+        set_state(base, h, sa, FAILED);
+        return error(CELL_PNGDEC_ERROR_ARG);
+    }
+    if (s.out_mode == 1) {
+        PngDecs& d = decs();
+        std::lock_guard lock(d.m);
+        if (!d.flip_logged) PS_LOG_WARN(kChan, "cellPngDecExtDecodeData: parts go top to bottom (logged once)");
+        d.flip_logged = true;
+    }
+    const bool interlaced = s.passes > 1;
+    if (interlaced && s.png_row_bytes * s.height > kPartsImageMax) { // DecodeData bounds it by the game's buffer
+        PS_LOG_WARN(kChan, "cellPngDecExtDecodeData: an interlaced {}x{} image in parts", s.width, s.height);
+        set_state(base, h, sa, FAILED);
+        return error(CELL_PNGDEC_ERROR_FATAL);
+    }
+    ps_write32(base, out + 12, 1); // CellPngDecDataOutInfo's status: stopped, until the end
+    std::vector<u8> rows(s.png_row_bytes * (interlaced ? s.height : 1));
+    if (interlaced && !read_rows(s, rows)) {
+        set_state(base, h, sa, FAILED);
+        return error(CELL_PNGDEC_ERROR_STREAM_FORMAT);
+    }
+    const u32 info = sa + st::disp_info;
+    u32 start = 0;
+    for (u32 y = 0; y < s.height; y++) {
+        const u8* in = rows.data();
+        if (interlaced) {
+            in += y * s.png_row_bytes;
+        } else if (!read_row(s, rows.data())) {
+            set_state(base, h, sa, FAILED);
+            return error(CELL_PNGDEC_ERROR_STREAM_FORMAT);
+        }
+        u8* line = base + image + static_cast<u32>((y - start) * pitch);
+        if (s.to_gray) rgb_to_gray_row(s, in, line);
+        else std::memcpy(line, in, s.png_row_bytes);
+        const u32 lines = y + 1 - start;
+        if (lines < s.output_counts && y + 1 < s.height) continue;
+        // CellPngDecDispInfo: outputFrameWidthByte (8 bytes), outputFrameHeight, outputStartXByte (8 bytes at +0x10),
+        // outputStartY, outputWidthByte (8 bytes at +0x20), outputHeight, outputBitDepth, outputComponents,
+        // nextOutputStartY, scanPassCount, outputImage.
+        ps_write64(base, info + 0x00, pitch);
+        ps_write32(base, info + 0x08, s.height);
+        ps_write64(base, info + 0x10, 0);
+        ps_write32(base, info + 0x18, start);
+        ps_write64(base, info + 0x20, s.row_bytes);
+        ps_write32(base, info + 0x28, lines);
+        ps_write32(base, info + 0x2C, s.out_depth);
+        ps_write32(base, info + 0x30, s.out_components);
+        ps_write32(base, info + 0x34, y + 1);
+        ps_write32(base, info + 0x38, 0);
+        ps_write32(base, info + 0x3C, image);
+        call_guest(ctx, disp_fn, {info, param, disp_arg});
+        start = y + 1;
+        if (start == s.height) break;
+        if (s.command && readable(ctx, s.command, 4) && ps_read32(base, s.command) == 1) { // CELL_PNGDEC_STOP
+            set_state(base, h, sa, DECODED);
+            return lv2::CELL_OK;
+        }
+        image = ps_read32(base, param);
+        if (!fits(image, std::min(s.output_counts, s.height - start))) {
+            log_call_site(ctx, base, std::format("cellPngDecExtDecodeData: the display callback's next place ({:#x}) is "
+                                                 "not guest memory", image));
+            set_state(base, h, sa, FAILED);
+            return error(CELL_PNGDEC_ERROR_CB_PARAM);
+        }
+    }
+    if (!interlaced && !read_end(s)) {
+        set_state(base, h, sa, FAILED);
+        return error(CELL_PNGDEC_ERROR_STREAM_FORMAT);
+    }
+    png_unknown_chunkp unknowns = nullptr;
+    ps_write32(base, out + 0, chunk_information(s, true) | (s.trns ? 1u << 4 : 0)); // as decode_data
+    ps_write32(base, out + 4, static_cast<u32>(png_get_text(s.png, s.info, nullptr, nullptr)));
+    ps_write32(base, out + 8, static_cast<u32>(png_get_unknown_chunks(s.png, s.info, &unknowns)));
+    ps_write32(base, out + 12, 0);
+    set_state(base, h, sa, DECODED);
+    return lv2::CELL_OK;
+}
+
+// DecodeData, in parts when there is a display callback and ExtSetParameter set outputCounts (RPCS3), else whole into
+// `data`.
+s32 ext_decode_data(PPUContext& ctx, u32 h, u32 sa, u32 data, u32 ctrl, u32 out, u32 cb_disp, u32 disp_param)
+{
+    std::shared_ptr<Stream> s;
+    if (const s32 r = checked(ctx, h, sa, PARAMETERS, s); r != lv2::CELL_OK) return r;
+    if (!cb_disp || !s->output_counts) return decode_data(ctx, h, sa, data, ctrl, out);
+    return decode_parts(ctx, h, sa, *s, data, ctrl, out, cb_disp, disp_param);
+}
+
+s32 cellPngDecExtDecodeData(PPUContext& ctx, u32 handle, u32 stream, u32 data, u32 ctrl, u32 out, u32 cb_disp,
+    u32 disp_param)
+{
+    const std::string call = std::format("cellPngDecExtDecodeData({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})",
+        handle, stream, data, ctrl, out, cb_disp, disp_param);
+    const Reading reading(ctx, stream);
+    return finish(reading.result(ext_decode_data(ctx, handle, stream, data, ctrl, out, cb_disp, disp_param)), call);
 }
 
 // ---- the chunk queries: after DecodeData only (SEQ); no place for the answer is ARG and a chunk not there SEQ, both
@@ -1000,6 +1358,12 @@ void register_cellPngDec(Registry& r)
         PS_HLE_FUNC(0xA5CDF57E, cellPngDecGetsPLT),
         PS_HLE_FUNC(0xB4FE75E1, cellPngDecGetpCAL),
         PS_HLE_FUNC(0xC41E1198, cellPngDecGetsCAL),
+        // Made from RPCS3, not compared with Sony's libpngdec (D-594, D-595).
+        PS_HLE_UNVERIFIED(0x48436B2D, cellPngDecExtCreate),
+        PS_HLE_UNVERIFIED(0x0C515302, cellPngDecExtOpen),
+        PS_HLE_UNVERIFIED(0x8B33F863, cellPngDecExtReadHeader),
+        PS_HLE_UNVERIFIED(0x9E9D7D42, cellPngDecExtSetParameter),
+        PS_HLE_UNVERIFIED(0x726FC1D0, cellPngDecExtDecodeData),
     });
 }
 

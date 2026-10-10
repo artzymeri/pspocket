@@ -17,8 +17,10 @@
 
 #include "firmware_compare.hpp"
 #include "hle_test_util.hpp"
+#include "imgdec_ext_util.hpp"
 #include "png_writer.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 #include "pspocket/spu/runtime.h"
 
@@ -695,4 +697,419 @@ TEST_CASE("cellPngDec: PNGs built here decoded as Sony's libpngdec decodes them 
             for (u32 c = 0; c < 4; c++)
                 if (rgba[y * 0x50 + 4 * x + c] != im.samples[(y * 13 + x) * 4 + c]) FAIL("pixel " << x << "," << y);
     CHECK(rgba[0x34] == 0xCC); // the padding untouched
+}
+
+// ---- the Ext functions (D-595): made from RPCS3 on pspocket's decoder, unverified (D-594). Every image through them
+// gives what DecodeData gives: whole, in parts handed to the game's display callback, and from a stream the game's
+// stream callback feeds.
+
+namespace {
+
+namespace ext = pspocket::hle::test::imgdec_ext;
+
+constexpr u32 kExtCode = kData + 0x2000, kStrmCtl = kData + 0x2800, kDispCtl = kData + 0x80000;
+constexpr u32 kFrame = kData + 0xA0000, kPart = kData + 0xE0000; // the parts' frame (0x40000), one part's buffer
+constexpr u32 kExt = kArgs + 0x300, kExtThreadIn = kExt, kExtThreadOut = kExt + 0x10, kCbStrm = kExt + 0x20,
+              kOpnParam = kExt + 0x28, kExtInfo = kExt + 0x30, kExtIn = kExt + 0x40, kExtOut = kExt + 0x50,
+              kCbDisp = kExt + 0x60, kDispParam = kExt + 0x68, kCommandWord = kExt + 0x70;
+constexpr u32 kNowhere = 0xF0000000; // not guest memory
+constexpr u32 kArg = 0x80611203, kSeq = 0x80611204, kStreamFormat = 0x80611202, kCbParam = 0x8061120A;
+
+// One Ext decode.
+struct ExtOptions {
+    u32 counts = 3;         // CellPngDecExtInParam's outputCounts
+    u32 mode = 0;           // the display callback's (imgdec_ext::disp)
+    bool display = true;    // a display callback
+    bool game_param = true; // the game's own CellPngDecDispParam
+    u32 first_image = 0;    // the first part's place (0: the frame, or the part's buffer in mode 1)
+    u32 first = 0;          // stream input: the source buffer's bytes (0: the whole file, no stream callback)
+    u32 chunk = 0;          // the stream callback's part
+    u32 stream_size = 0;    // what the stream callback gives in all (0: the file)
+    u32 stream_source = 0;  // where it reads (0: the file)
+    u32 stop_at = 0;        // the display callback asking CELL_PNGDEC_STOP at this call
+    u32 select_chunk = 0;
+};
+
+struct ExtRun {
+    u32 open = 0, header = 0, parameter = 0, decode = 0, decode_again = 0, stream = 0;
+    u64 ext_info = 0, out_width_byte = 0, pitch = 0, row = 0;
+    u32 out_height = 0, height = 0, stream_calls_at_header = 0;
+    std::string info, data_out;
+    std::vector<u8> frame; // pitch x height + 64 bytes at kFrame
+    bool data_untouched = true;
+    std::vector<ext::Part> parts;
+    std::vector<std::pair<u32, u32>> stream_calls;
+};
+
+// png_run's frame: 16 bytes past the row, 16-byte aligned.
+u64 frame_pitch(u64 row) { return (row + 16 + 15) & ~u64{15}; }
+
+void buffer_source(u8* b, const std::vector<u8>& file, u32 bytes)
+{
+    std::memcpy(b + kFile, file.data(), file.size());
+    std::memset(b + kSrc, 0, 0x20);
+    ps_write32(b, kSrc + 0, 1);
+    ps_write32(b, kSrc + 20, kFile);
+    ps_write32(b, kSrc + 24, bytes);
+}
+
+void in_param(u8* b, const Setting& s, u32 command)
+{
+    const u32 in[7] = {command, s.mode, s.space, s.depth, s.pack, s.alpha_select, s.alpha};
+    for (u32 i = 0; i < 7; i++) ps_write32(b, kInParam + 4 * i, in[i]);
+}
+
+// DecodeData's frame for `file` in `s` (the reference), and its CellPngDecDataOutInfo.
+std::vector<u8> plain_decode(u8* b, const Call& call, u32 handle, const std::vector<u8>& file, const Setting& s,
+    std::string* data_out = nullptr, std::string* info = nullptr)
+{
+    buffer_source(b, file, static_cast<u32>(file.size()));
+    REQUIRE(call("cellPngDecOpen", 0xD2BC5BFD, {handle, kStreamOut, kSrc, kOpenInfo}) == 0);
+    const u32 stream = ps_read32(b, kStreamOut);
+    std::memset(b + kInfo, 0xEE, 0x1C);
+    REQUIRE(call("cellPngDecReadHeader", 0x9CCDCC95, {handle, stream, kInfo}) == 0);
+    if (info) *info = hex(b + kInfo, 0x1C);
+    in_param(b, s, 0);
+    REQUIRE(call("cellPngDecSetParameter", 0xE97C9BD4, {handle, stream, kInParam, kOutParam}) == 0);
+    const u64 pitch = frame_pitch(ps_read64(b, kOutParam));
+    const u32 height = ps_read32(b, kOutParam + 12);
+    ps_write64(b, kCtrl, pitch);
+    std::memset(b + kFrame, 0xCC, pitch * height + 64);
+    std::memset(b + kDataOut, 0xEE, 0x10);
+    REQUIRE(call("cellPngDecDecodeData", 0x2310F155, {handle, stream, kFrame, kCtrl, kDataOut}) == 0);
+    if (data_out) *data_out = hex(b + kDataOut, 0x10);
+    std::vector<u8> frame(b + kFrame, b + kFrame + pitch * height + 64);
+    REQUIRE(call("cellPngDecClose", 0x5B3D1FF1, {handle, stream}) == 0);
+    return frame;
+}
+
+ExtRun ext_decode(u8* b, const Call& call, const ext::Callbacks& cbs, u32 handle, const std::vector<u8>& file,
+    const Setting& s, const ExtOptions& e)
+{
+    ExtRun o;
+    buffer_source(b, file, e.first ? e.first : static_cast<u32>(file.size()));
+    std::memset(b + kStrmCtl, 0, 0x1000);
+    ps_write32(b, kStrmCtl + ext::strm::source, e.stream_source ? e.stream_source : kFile);
+    ps_write32(b, kStrmCtl + ext::strm::size, e.stream_size ? e.stream_size : static_cast<u32>(file.size()));
+    ps_write32(b, kStrmCtl + ext::strm::offset, e.first);
+    ps_write32(b, kStrmCtl + ext::strm::chunk, e.chunk);
+    ps_write32(b, kStrmCtl + ext::strm::sample, kDispCtl + ext::disp::count);
+    std::memset(b + kDispCtl, 0, 0x40);
+    ps_write32(b, kCbStrm, cbs.stream_opd);
+    ps_write32(b, kCbStrm + 4, kStrmCtl);
+    ps_write32(b, kOpnParam, e.select_chunk);
+    o.open = call("cellPngDecExtOpen", 0x0C515302, {handle, kStreamOut, kSrc, kOpenInfo, e.first ? kCbStrm : 0, kOpnParam});
+    if (o.open) return o;
+    o.stream = ps_read32(b, kStreamOut);
+    std::memset(b + kExtInfo, 0xEE, 8);
+    std::memset(b + kInfo, 0xEE, 0x1C);
+    o.header = call("cellPngDecExtReadHeader", 0x8B33F863, {handle, o.stream, kInfo, kExtInfo});
+    o.ext_info = ps_read64(b, kExtInfo);
+    o.info = hex(b + kInfo, 0x1C);
+    o.stream_calls_at_header = ps_read32(b, kStrmCtl + ext::strm::calls);
+    if (o.header == 0) {
+        in_param(b, s, kCommandWord);
+        ps_write32(b, kCommandWord, 0);
+        ps_write32(b, kExtIn + 0, 1); // CELL_PNGDEC_LINE_MODE
+        ps_write32(b, kExtIn + 4, e.counts);
+        ps_write32(b, kExtIn + 8, 0);
+        std::memset(b + kExtOut, 0xEE, 16);
+        o.parameter = call("cellPngDecExtSetParameter", 0x9E9D7D42, {handle, o.stream, kInParam, kOutParam, kExtIn, kExtOut});
+    }
+    if (o.header == 0 && o.parameter == 0) {
+        o.out_width_byte = ps_read64(b, kExtOut);
+        o.out_height = ps_read32(b, kExtOut + 8);
+        o.row = ps_read64(b, kOutParam);
+        o.height = ps_read32(b, kOutParam + 12);
+        o.pitch = frame_pitch(o.row);
+        ps_write64(b, kCtrl, o.pitch);
+        std::memset(b + kFrame, 0xCC, o.pitch * o.height + 64);
+        std::memset(b + kPart, 0xCC, 0x10000);
+        std::memset(b + kImage, 0xCC, 0x100);
+        ps_write32(b, kDispCtl + ext::disp::mode, e.mode);
+        ps_write32(b, kDispCtl + ext::disp::frame, kFrame);
+        ps_write32(b, kDispCtl + ext::disp::stop_at, e.stop_at);
+        ps_write32(b, kDispCtl + ext::disp::command, kCommandWord);
+        ps_write32(b, kCbDisp, cbs.display_opd);
+        ps_write32(b, kCbDisp + 4, kDispCtl);
+        const u32 first_image = e.first_image ? e.first_image : e.mode == 1 ? kPart : kFrame;
+        ps_write32(b, kDispParam, first_image);
+        const bool parts = e.display && e.counts;
+        const u32 data = !parts ? kFrame : e.game_param ? kImage : first_image;
+        std::memset(b + kDataOut, 0xEE, 0x10);
+        o.decode = call("cellPngDecExtDecodeData", 0x726FC1D0,
+            {handle, o.stream, data, kCtrl, kDataOut, e.display ? kCbDisp : 0, e.game_param ? kDispParam : 0});
+        o.data_out = hex(b + kDataOut, 0x10);
+        o.frame.assign(b + kFrame, b + kFrame + o.pitch * o.height + 64);
+        for (u32 i = 0; i < 0x100; i++) o.data_untouched &= b[kImage + i] == 0xCC;
+        o.parts = ext::parts(b, kDispCtl);
+        o.decode_again = call("cellPngDecExtDecodeData", 0x726FC1D0, {handle, o.stream, data, kCtrl, kDataOut, kCbDisp, 0});
+    }
+    o.stream_calls = ext::stream_calls(b, kStrmCtl);
+    REQUIRE(call("cellPngDecClose", 0x5B3D1FF1, {handle, o.stream}) == 0);
+    return o;
+}
+
+} // namespace
+
+TEST_CASE("cellPngDec: the Ext functions: whole, in parts to a display callback, from a stream callback (D-595)",
+    "[hle][pngdec]")
+{
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const Call call = hle_calls(f, t);
+    // The five, made from RPCS3 and unverified (D-594); the functions compared with Sony's are not.
+    const std::pair<const char*, u32> kExtFunctions[] = {{"cellPngDecExtCreate", 0x48436B2D},
+        {"cellPngDecExtOpen", 0x0C515302}, {"cellPngDecExtReadHeader", 0x8B33F863},
+        {"cellPngDecExtSetParameter", 0x9E9D7D42}, {"cellPngDecExtDecodeData", 0x726FC1D0}};
+    for (const auto& [name, nid] : kExtFunctions) {
+        CHECK(recomp::nid_of(name) == nid);
+        CHECK(hle::registry().is_unverified("cellPngDec", nid));
+    }
+    for (const u32 nid : {0x157D30C5u, 0xD2BC5BFDu, 0x9CCDCC95u, 0xE97C9BD4u, 0x2310F155u, 0xB40CA175u})
+        CHECK_FALSE(hle::registry().is_unverified("cellPngDec", nid));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellPngDec"));
+
+    write_callbacks(b);
+    const ext::Callbacks cbs = ext::write_callbacks(b, kExtCode, 0x3C);
+    std::memset(b + kArgs, 0, 0x400);
+    const u32 tin[7] = {0, 1000, 200, kMallocOpd, kHeapCtl, kFreeOpd, kHeapCtl};
+    for (u32 i = 0; i < 7; i++) ps_write32(b, kThreadIn + 4 * i, tin[i]);
+    // CellPngDecExtThreadInParam: no SPURS, eight priorities, maxContention.
+    for (u32 i = 0; i < 8; i++) ps_write8(b, kExtThreadIn + 4 + i, 8);
+    ps_write32(b, kExtThreadIn + 12, 1);
+    CHECK(call("cellPngDecExtCreate", 0x48436B2D, {kHandleOut, kThreadIn, kThreadOut, kExtThreadIn, kNowhere}) == kArg);
+    CHECK(call("cellPngDecExtCreate", 0x48436B2D, {kHandleOut, kThreadIn, kThreadOut, kNowhere, kExtThreadOut}) == kArg);
+    REQUIRE(call("cellPngDecExtCreate", 0x48436B2D, {kHandleOut, kThreadIn, kThreadOut, kExtThreadIn, kExtThreadOut}) == 0);
+    CHECK(ps_read32(b, kThreadOut) == 0x420000);
+    const u32 handle = ps_read32(b, kHandleOut);
+    // Create's memory, the same.
+    CHECK(ps_read32(b, kHeapCtl + 4) == 2);
+    CHECK(ps_read32(b, kHeapCtl + 0x10) == 0x450);
+    CHECK(ps_read32(b, kHeapCtl + 0x18) == 0xA80);
+
+    const std::vector<png::Image> images = test_images();
+    const Setting rgba{0, 10, 8, 1, 0, 0}, gray{0, 1, 8, 1, 0, 0}, rgb{0, 2, 8, 1, 0, 0};
+
+    SECTION("whole, without a display callback or with no lines per part: DecodeData's image")
+    {
+        for (const usize n : {usize{0}, usize{5}, usize{13}, usize{15}, usize{17}, usize{20}}) {
+            const Setting& s = images[n].color_type == 6 ? rgba : rgb;
+            std::string data_out, info;
+            const std::vector<u8> want = plain_decode(b, call, handle, png::encode(images[n]), s, &data_out, &info);
+            for (const bool display : {false, true}) {
+                ExtOptions e;
+                e.display = display;
+                e.counts = display ? 0 : 3;
+                const ExtRun o = ext_decode(b, call, cbs, handle, png::encode(images[n]), s, e);
+                INFO("image " << n << ", display callback " << display);
+                REQUIRE(o.open == 0);
+                CHECK(o.header == 0);
+                CHECK(o.ext_info == 0); // CellPngDecExtInfo's reserved word
+                CHECK(o.info == info);
+                CHECK(o.parameter == 0);
+                CHECK(o.out_width_byte == o.row);
+                CHECK(o.out_height == (display ? o.height : (images[n].interlaced ? 1 : std::min(3u, o.height))));
+                CHECK(o.decode == 0);
+                CHECK(o.data_out == data_out);
+                CHECK(o.frame == want);
+                CHECK(o.parts.empty());
+                CHECK(o.decode_again == kSeq);
+            }
+        }
+    }
+
+    SECTION("in parts: outputCounts lines to each display callback, the last part too")
+    {
+        std::string data_out;
+        const std::vector<u8> want = plain_decode(b, call, handle, png::encode(images[13]), rgba, &data_out);
+        for (const bool game_param : {true, false}) {
+            ExtOptions e;
+            e.game_param = game_param;
+            const ExtRun o = ext_decode(b, call, cbs, handle, png::encode(images[13]), rgba, e);
+            INFO("the game's dispParam " << game_param);
+            REQUIRE(o.decode == 0);
+            CHECK(o.out_width_byte == 52); // 13 RGBA pixels
+            CHECK(o.out_height == 3);
+            CHECK(o.data_out == data_out);
+            CHECK(o.frame == want);
+            CHECK(o.data_untouched); // the parts go to nextOutputImage (DecodeData's `data` when the game gives none)
+            REQUIRE(o.parts.size() == 3);
+            const u32 starts[3] = {0, 3, 6}, heights[3] = {3, 3, 1};
+            for (u32 i = 0; i < 3; i++) {
+                const ext::Part& p = o.parts[i];
+                CHECK(p.frame_width_byte == o.pitch);
+                CHECK(p.frame_height == 7);
+                CHECK(p.start_x_byte == 0);
+                CHECK(p.start_y == starts[i]);
+                CHECK(p.width_byte == 52);
+                CHECK(p.height == heights[i]);
+                CHECK(p.bit_depth == 8);
+                CHECK(p.components == 4);
+                CHECK(p.word_34 == starts[i] + heights[i]);       // nextOutputStartY
+                CHECK(p.word_38 == 0);                            // scanPassCount
+                CHECK(p.word_3c == kFrame + starts[i] * o.pitch); // outputImage
+                CHECK(p.param == (game_param ? kDispParam : o.stream + 0x50));
+                CHECK(p.next_image == p.word_3c);
+            }
+            CHECK(o.decode_again == kSeq);
+        }
+    }
+
+    SECTION("in parts into one buffer the callback copies from; colour to gray; an interlaced image a line at a time")
+    {
+        {
+            const std::vector<u8> want = plain_decode(b, call, handle, png::encode(images[5]), gray);
+            ExtOptions e;
+            e.mode = 1;
+            e.counts = 2;
+            const ExtRun o = ext_decode(b, call, cbs, handle, png::encode(images[5]), gray, e);
+            REQUIRE(o.decode == 0);
+            CHECK(o.out_height == 2);
+            CHECK(o.frame == want);
+            REQUIRE(o.parts.size() == 4);
+            for (u32 i = 0; i < 4; i++) {
+                CHECK(o.parts[i].word_3c == kPart);
+                CHECK(o.parts[i].height == (i < 3 ? 2u : 1u));
+                CHECK(o.parts[i].components == 1);
+                CHECK(o.parts[i].width_byte == 13);
+            }
+        }
+        {
+            const std::vector<u8> want = plain_decode(b, call, handle, png::encode(images[15]), rgba);
+            const ExtRun o = ext_decode(b, call, cbs, handle, png::encode(images[15]), rgba, ExtOptions{});
+            REQUIRE(o.decode == 0);
+            CHECK(o.out_height == 1); // interlaced: a line at a time (RPCS3)
+            CHECK(o.frame == want);
+            REQUIRE(o.parts.size() == 11);
+            for (u32 i = 0; i < 11; i++) {
+                CHECK(o.parts[i].start_y == i);
+                CHECK(o.parts[i].height == 1);
+                CHECK(o.parts[i].word_34 == i + 1);
+                CHECK(o.parts[i].word_38 == 0); // each line once, complete
+            }
+        }
+    }
+
+    SECTION("from a stream: the source's first bytes, the rest from the stream callback as libpng reads them")
+    {
+        // The image with every kind of chunk, before and after IDAT: 20 bytes first (the header's chunk cut), then 37
+        // at a time.
+        const std::vector<u8> file = png::encode(images[20]);
+        std::string data_out, info;
+        const std::vector<u8> want = plain_decode(b, call, handle, file, rgba, &data_out, &info);
+        ExtOptions e;
+        e.first = 20;
+        e.chunk = 37;
+        e.counts = 2;
+        const ExtRun o = ext_decode(b, call, cbs, handle, file, rgba, e);
+        REQUIRE(o.header == 0);
+        CHECK(o.info == info);
+        CHECK(o.stream_calls_at_header > 0); // the header's chunks asked for at ReadHeader
+        REQUIRE(o.decode == 0);
+        CHECK(o.frame == want);
+        CHECK(o.data_out == data_out); // the text and unknown chunks after IDAT read too
+        CHECK(o.parts.size() == 4);
+        // Each call told the bytes given so far; every byte given, none asked for past IEND.
+        REQUIRE(o.stream_calls.size() == (file.size() - 20 + 36) / 37);
+        for (usize i = 0; i < o.stream_calls.size(); i++) CHECK(o.stream_calls[i].first == 20 + 37 * i);
+    }
+
+    SECTION("from a stream, the stream and display callbacks interleave as the rows decode")
+    {
+        // 64x64 RGBA: more image data than libpng reads at once, so parts go out before the stream has all of it.
+        const std::vector<u8> file = png::encode(png::pattern(64, 64, 6, 8, 50));
+        const std::vector<u8> want = plain_decode(b, call, handle, file, rgba);
+        ExtOptions e;
+        e.first = 100;
+        e.chunk = 3000;
+        e.counts = 4;
+        const ExtRun o = ext_decode(b, call, cbs, handle, file, rgba, e);
+        REQUIRE(o.decode == 0);
+        CHECK(o.frame == want);
+        CHECK(o.parts.size() == 16);
+        REQUIRE_FALSE(o.stream_calls.empty());
+        CHECK(o.stream_calls.front().second == 0);
+        CHECK(o.stream_calls.back().second > 0); // asked for more after parts went out
+        CHECK(o.stream_calls.back().second < 16);
+    }
+
+    SECTION("CELL_PNGDEC_STOP at commandPtr from a display callback stops the decoding")
+    {
+        const std::vector<u8> want = plain_decode(b, call, handle, png::encode(images[13]), rgba);
+        ExtOptions e;
+        e.counts = 2;
+        e.stop_at = 2;
+        const ExtRun o = ext_decode(b, call, cbs, handle, png::encode(images[13]), rgba, e);
+        CHECK(o.decode == 0);
+        CHECK(o.data_out.ends_with("00000001")); // CELL_PNGDEC_DEC_STATUS_STOP
+        CHECK(o.parts.size() == 2);
+        CHECK(std::equal(o.frame.begin(), o.frame.begin() + static_cast<std::ptrdiff_t>(4 * o.pitch), want.begin()));
+        CHECK(o.frame[4 * o.pitch] == 0xCC); // nothing past the second part
+        CHECK(o.decode_again == kSeq);
+    }
+
+    SECTION("what the Ext functions refuse")
+    {
+        const std::vector<u8> file = png::encode(images[13]);
+        // A buffer mode that is not CELL_PNGDEC_LINE_MODE: ARG, and the stream fails.
+        buffer_source(b, file, static_cast<u32>(file.size()));
+        REQUIRE(call("cellPngDecExtOpen", 0x0C515302, {handle, kStreamOut, kSrc, kOpenInfo, 0, 0}) == 0);
+        const u32 stream = ps_read32(b, kStreamOut);
+        CHECK(call("cellPngDecExtReadHeader", 0x8B33F863, {handle, stream, kInfo, kNowhere}) == kArg);
+        REQUIRE(call("cellPngDecExtReadHeader", 0x8B33F863, {handle, stream, kInfo, 0}) == 0);
+        in_param(b, rgba, 0);
+        ps_write32(b, kExtIn + 0, 2);
+        ps_write32(b, kExtIn + 4, 3);
+        CHECK(call("cellPngDecExtSetParameter", 0x9E9D7D42, {handle, stream, kInParam, kOutParam, kExtIn, kExtOut}) == kArg);
+        ps_write64(b, kCtrl, 0x100);
+        CHECK(call("cellPngDecExtDecodeData", 0x726FC1D0, {handle, stream, kFrame, kCtrl, kDataOut, kCbDisp, 0}) == kSeq);
+        REQUIRE(call("cellPngDecClose", 0x5B3D1FF1, {handle, stream}) == 0);
+        // A stream callback with a file source: STREAM_FORMAT, the handle still free.
+        std::memset(b + kSrc, 0, 0x20);
+        ps_write32(b, kSrc + 4, kSrc + 0x100);
+        std::memcpy(b + kSrc + 0x100, "/app_home/images.png", 21);
+        ps_write32(b, kCbStrm, cbs.stream_opd);
+        ps_write32(b, kCbStrm + 4, kStrmCtl);
+        CHECK(call("cellPngDecExtOpen", 0x0C515302, {handle, kStreamOut, kSrc, kOpenInfo, kCbStrm, 0}) == kStreamFormat);
+        buffer_source(b, file, static_cast<u32>(file.size()));
+        REQUIRE(call("cellPngDecOpen", 0xD2BC5BFD, {handle, kStreamOut, kSrc, kOpenInfo}) == 0);
+        REQUIRE(call("cellPngDecClose", 0x5B3D1FF1, {handle, ps_read32(b, kStreamOut)}) == 0);
+        {
+            ExtOptions e; // the stream callback's bytes are not guest memory
+            e.first = 20;
+            e.chunk = 37;
+            e.stream_source = kNowhere;
+            CHECK(ext_decode(b, call, cbs, handle, file, rgba, e).header == kCbParam);
+        }
+        {
+            ExtOptions e; // the stream ends before IEND
+            e.first = 20;
+            e.chunk = 37;
+            e.stream_size = static_cast<u32>(file.size()) - 30;
+            CHECK(ext_decode(b, call, cbs, handle, file, rgba, e).decode == kStreamFormat);
+        }
+        {
+            ExtOptions e; // the display callback gives no place for the next part
+            e.mode = 2;
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, rgba, e);
+            CHECK(o.decode == kCbParam);
+            CHECK(o.parts.size() == 1);
+        }
+        {
+            ExtOptions e; // the first part's place is not guest memory
+            e.first_image = kNowhere;
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, rgba, e);
+            CHECK(o.decode == kArg);
+            CHECK(o.parts.empty());
+        }
+        {
+            ExtOptions e; // selectChunk: every chunk kept all the same
+            e.select_chunk = 0x3;
+            CHECK(ext_decode(b, call, cbs, handle, file, rgba, e).decode == 0);
+        }
+    }
+    REQUIRE(call("cellPngDecDestroy", 0x820DAE1A, {handle}) == 0);
 }
