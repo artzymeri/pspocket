@@ -73,6 +73,7 @@ add_library(pspocket_hle STATIC
     src/cellGifDec.cpp
     src/cellJpgDec.cpp
     src/jpeg_decoder.cpp
+    src/jpeg_encoder.cpp
     src/cellVdec.cpp
     src/vdec_hw.cpp
     src/cellDmuxPamf.cpp

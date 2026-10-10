@@ -9689,3 +9689,41 @@ libsre is always native (firmware_module_native: the loader never gives a game S
 these thirteen and cellSync's six change nothing a game gets, with the system software installed or not: they record
 that the functions wait for this comparison. With them cellSpurs (141 of 141) and cellSync (42 of 42) are pspocket's own:
 5,923 of 6,625 library functions (5,904 before).
+
+## D-615 · 2026-10-10 · A baseline JPEG encoder of pspocket's own, written from T.81
+
+cellJpgEnc (D-616) needs a JPEG encoder and the build has none: pspocket's JPEG code was its decoder (D-200), FFmpeg's
+builds carry no MJPEG encoder, and no third-party encoder is to be copied. runtime/hle/src/jpeg_encoder.cpp is written
+from ITU-T T.81 (the forward DCT of A.3.3, quantisation, the zigzag order of figure A.6, the Huffman coding of DC
+differences and AC run/size pairs of F.1.2 with the code tables built as annex C builds them, the marker segments of
+annex B, restart intervals) with its annex K tables, and from ITU-T T.871 (JFIF's APP0 segment, YCbCr from RGB):
+- **The stream:** SOI, a JFIF APP0 (version 1.01, no units, a 1:1 aspect, no thumbnail), DQT (8-bit tables in zigzag
+  order), SOF0 (baseline, 8-bit samples), DHT, DRI when restart markers are asked for, one interleaved scan of every
+  component (Ss 0, Se 63, no successive approximation), EOI. A gray JPEG has one component (id 1, 1x1, table 0); a
+  colour one Y, Cb and Cr (ids 1 to 3), the luma at the sampling's factors (4:4:4 1x1, 4:2:2 2x1, 4:2:0 2x2, 4:1:1
+  4x1), the chroma at 1x1 with table 1.
+- **Quality:** annex K's tables (K.1, K.2) scaled as libjpeg scales them, the convention every encoder's "quality 1 to
+  100" follows: 5000 / quality percent below 50, 200 - 2 x quality from 50, each entry rounded and kept within 1-255.
+- **DCT and quantisation:** A.3.3's transform, rows then columns, each 8-point transform split into the sums of
+  mirrored samples (a 4-point DCT gives the even outputs) and their differences (the odd ones); in double precision,
+  or in single precision for cellJpgEnc's fast method. Quantised to the nearest (A.3.4); AC kept within +-1023 and DC
+  within -1024..1023, so that a coefficient takes at most baseline's 10 bits and a DC difference 11.
+- **Edges and chroma:** the picture padded to whole MCUs by repeating its last column and row; a subsampled chroma
+  sample is the mean of the full-size samples it covers, rounded.
+- **Colour:** T.871 section 7 in 16-bit fixed point (the coefficients' sums 65536, or 0 for Cb and Cr), rounded, kept
+  within 0-255.
+- **Entropy coding:** annex K.3's typical tables (libjpeg's default too; optimised tables are not made), ZRL for
+  sixteen zeros and EOB for the rest, a 0 stuffed after each 0xFF, the last byte filled with 1 bits before a marker;
+  restart markers RST0 to RST7 in turn, each resetting the DC predictions.
+Not made (cellJpgEnc asks for none of them): optimised Huffman tables, progressive or arithmetic coding, 12-bit
+samples. Checked during the work against an independent decoder outside the repository (libjpeg-turbo through
+Pillow): every sampling at sizes from 1x1 to 200x150, qualities 10 to 100, restart intervals, both methods: its decodes
+agreed with pspocket's decoder's to 53-61 dB, and the stream sizes and PSNR with libjpeg's own encoder at the same
+quality and sampling within 2%; ffmpeg and ImageMagick read the files without a complaint.
+Tests: tests/hle/test_jpgenc.cpp: the tables at qualities 1, 10, 50, 75 and 100; T.871's white, black, red, green,
+blue and gray; every sampling and gray at seven sizes (1x1 to 100x3, most off the MCU) with both DCTs: the markers in
+order, JFIF's header, what pspocket's decoder reads back (sizes, components, colour space, each component's id and
+sampling, both tables in natural order: the DQT's zigzag order), and the picture within a PSNR 3 dB under the worst
+measured (gray 52 dB, 4:4:4 45.5, 4:2:2 42.3, 4:2:0 40.0, 4:1:1 34.2); restart intervals of 1 to 40 MCUs (the markers'
+count and RST0-7 order, the same decoded image); what cannot be a JPEG (no width, past 65535, a plane too small, two
+components, a restart interval past 65535).
