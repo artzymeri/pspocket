@@ -112,6 +112,7 @@ add_library(pspocket_hle STATIC
     src/cellSync2.cpp
     src/cellDaisy.cpp
     src/sys_lv2dbg.cpp
+    src/sys_crashdump.cpp
     src/usbd.cpp
     src/vdec_cores.cpp
     src/cellVpost.cpp

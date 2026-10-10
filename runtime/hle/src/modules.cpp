@@ -71,6 +71,7 @@ void register_cellFiber(Registry& r);
 void register_cellSync2(Registry& r);
 void register_cellDaisy(Registry& r);
 void register_sys_lv2dbg(Registry& r);
+void register_sys_crashdump(Registry& r);
 void register_usbd(Registry& r);
 void register_vdec_cores(Registry& r);
 void register_cellVpost(Registry& r);
@@ -163,6 +164,7 @@ void register_all_modules(Registry& r)
     register_cellSync2(r);
     register_cellDaisy(r);
     register_sys_lv2dbg(r);
+    register_sys_crashdump(r);
     register_usbd(r);
     register_vdec_cores(r);
     register_cellVpost(r);
