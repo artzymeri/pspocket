@@ -1,5 +1,5 @@
 {
-  "engine_percent": 88.0,
+  "engine_percent": 88.7,
   "libraries": {
     "own": 5654,
     "answered_as_rpcs3": 188,
@@ -26,7 +26,7 @@
     "SPURS and the kernel": 100,
     "Graphics (RSX to Metal)": 77,
     "Sound": 62,
-    "Video and images": 80,
+    "Video and images": 90,
     "System services": 100,
     "Speed and stability on the iPhone": 60
   },

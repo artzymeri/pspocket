@@ -124,7 +124,9 @@ that RPCS3 asks for 0x50 bytes more memory than Sony's libdmux (pspocket follows
 decoder, on FFmpeg (D-195, D-196, run 103): Sony's libvdec now runs in the test too (it needed libsre's overlay tables
 and SPURS task exit callbacks, now pspocket's), and pspocket's matches it: Sony's sizes for every codec and level,
 pictures one access unit late as Sony's, items and H.264 information in Sony's places read from the stream, frame
-buffers in Sony's layout, pictures exact (RGB within one step). VC-1, DivX 3.11 and MVC are not decoded yet.
+buffers in Sony's layout, pictures exact (RGB within one step). DivX 3.11, VC-1's advanced profile and MVC's base
+view decode on FFmpeg too (D-588 to D-590), not compared with Sony's yet; VC-1's simple and main profiles are
+refused (how Sony's decoder gets their sequence header is not known) and MVC's second view is not decoded.
 cellAdec, the audio decoder (D-197, run 104): pspocket's own front end and LPCM decoder, the same as Sony's libadec to
 the byte (221 answers and callbacks, 22 PCM outputs, every LPCM packing); every other codec goes to Sony's codec
 module through pspocket's front end (the loader now links what a pspocket library takes from the firmware's modules),
@@ -360,6 +362,7 @@ Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket
 services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
 interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
 as RPCS3's null or stub slots (debugger, crypto engine, colored memory: signatures not known).
-Next (on the Mac, with the firmware): compare the firmware-first libraries with Sony's modules and drop their
-markers; then libsre's last functions (cellSpurs' Task2 and LF queues, cellSync's), libnet's resolver (behind
+Next (on the Mac, with the firmware): rerun scripts/build-ffmpeg.sh (macos, macos-tests and ios get the new video
+decoders, D-588 to D-590); compare the firmware-first libraries, the new audio decoders (D-577 to D-579) and the new
+video formats with Sony's modules and drop their markers; then libsre's last functions (cellSpurs' Task2 and LF queues, cellSync's), libnet's resolver (behind
 gethostbyname and gethostbyaddr, D-569), and the firmware-backed libraries above one by one.

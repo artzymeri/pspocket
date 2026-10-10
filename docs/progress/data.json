@@ -282,8 +282,8 @@
         },
         {
           "name": "VC-1, DivX 3.11, MVC video",
-          "state": "todo",
-          "ref": "improve.md Media"
+          "state": "partial",
+          "ref": "D-588 to D-590: VC-1 simple/main and MVC's second view left"
         },
         {
           "name": "PNG, JPEG, GIF decoders",
