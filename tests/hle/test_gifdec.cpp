@@ -20,7 +20,9 @@
 #include "firmware_compare.hpp"
 #include "hle_test_util.hpp"
 #include "gif_writer.hpp"
+#include "imgdec_ext_util.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 #include "pspocket/spu/runtime.h"
 
@@ -593,5 +595,381 @@ TEST_CASE("cellGifDec: pspocket's answers and images stay those found identical 
         CHECK(o.images.size() == 85);
         CHECK(h == (spu ? 0xdaef63078b88c4e8ull : 0xb134c4b9baf4316bull));
     }
+}
+
+// ---- the Ext functions (D-595): RPCS3's checks on pspocket's decoder, with stream input and partial output as RPCS3's
+// cellPngDec gives them; unverified (D-594). Every file through them gives the records DecodeData gives: whole, each
+// image's screen in parts handed to the game's display callback, and from a stream the game's stream callback feeds.
+
+namespace {
+
+namespace ext = pspocket::hle::test::imgdec_ext;
+
+constexpr u32 kExtCode = kData + 0x2000, kStrmCtl = kData + 0x2800, kDispCtl = kData + 0xC0000;
+constexpr u32 kFrame = kData + 0xD0000, kPart = kData + 0x150000; // the parts' frame (0x80000), one part's buffer
+constexpr u32 kExt = kArgs + 0x300, kExtThreadIn = kExt, kExtThreadOut = kExt + 0x10, kCbStrm = kExt + 0x20,
+              kExtInfo = kExt + 0x30, kExtIn = kExt + 0x40, kExtOut = kExt + 0x50, kCbDisp = kExt + 0x60,
+              kDispParam = kExt + 0x68, kCommandWord = kExt + 0x70;
+constexpr u32 kNowhere = 0xF0000000; // not guest memory
+constexpr u32 kArg = 0x80611303, kSeq = 0x80611302, kStreamFormat = 0x80611301, kCbParam = 0x80611307;
+
+struct GifExtOptions {
+    bool ext = true;        // the Ext functions (else Open, ReadHeader, SetParameter, DecodeData: the reference)
+    u32 counts = 4;         // CellGifDecExtInParam's outputCounts
+    u32 mode = 0;           // the display callback's (imgdec_ext::disp)
+    bool display = true;    // a display callback
+    bool game_param = true; // the game's own CellGifDecDispParam
+    u32 first_image = 0;    // the first part's place (0: the frame, or the part's buffer in mode 1)
+    u32 first = 0;          // stream input: the source buffer's bytes (0: the whole file, no stream callback)
+    u32 chunk = 0;          // the stream callback's part
+    u32 stream_source = 0;  // where it reads (0: the file)
+    u32 stop_at = 0;        // the display callback asking CELL_GIFDEC_STOP at this call
+};
+
+struct GifExtRun {
+    u32 open = 0, header = 0, parameter = 0, stream = 0, stream_calls_at_header = 0;
+    u64 out_width_byte = 0, pitch = 0;
+    u32 out_height = 0, height = 0;
+    std::string info;
+    std::vector<std::string> records;          // each DecodeData's answer and CellGifDecDataOutInfo
+    std::vector<std::vector<u8>> screens;      // each image record's frame, pitch x height + 64 bytes at kFrame
+    std::vector<std::vector<ext::Part>> parts; // each record's display callbacks
+    std::vector<std::pair<u32, u32>> stream_calls;
+};
+
+// Open (or ExtOpen), the header, RGBA (alpha1 0xFF, alpha2 0x00), then every record to the trailer, on a stream whose
+// allocations start where the heap was after Create (so that the extension buffers are where they were last time).
+GifExtRun gif_ext_run(u8* b, const Call& call, const ext::Callbacks& cbs, u32 handle, const std::vector<u8>& file,
+    const GifExtOptions& e, u32 heap_after_create, u32 mallocs)
+{
+    GifExtRun o;
+    ps_write32(b, kHeapCtl, heap_after_create);
+    ps_write32(b, kHeapCtl + 4, mallocs);
+    ps_write32(b, kHeapCtl + 8, 0);
+    std::memcpy(b + kFile, file.data(), file.size());
+    std::memset(b + kSrc, 0, 0x20);
+    ps_write32(b, kSrc + 0, 1);
+    ps_write32(b, kSrc + 20, kFile);
+    ps_write32(b, kSrc + 24, e.first ? e.first : static_cast<u32>(file.size()));
+    std::memset(b + kStrmCtl, 0, 0x1000);
+    ps_write32(b, kStrmCtl + ext::strm::source, e.stream_source ? e.stream_source : kFile);
+    ps_write32(b, kStrmCtl + ext::strm::size, static_cast<u32>(file.size()));
+    ps_write32(b, kStrmCtl + ext::strm::offset, e.first);
+    ps_write32(b, kStrmCtl + ext::strm::chunk, e.chunk);
+    ps_write32(b, kStrmCtl + ext::strm::sample, kDispCtl + ext::disp::count);
+    std::memset(b + kDispCtl, 0, 0x40);
+    ps_write32(b, kCbStrm, cbs.stream_opd);
+    ps_write32(b, kCbStrm + 4, kStrmCtl);
+    o.open = e.ext ? call("cellGifDecExtOpen", 0x17FB83C1, {handle, kStreamOut, kSrc, kOpenInfo, e.first ? kCbStrm : 0})
+                   : call("cellGifDecOpen", 0x75745079, {handle, kStreamOut, kSrc, kOpenInfo});
+    if (o.open) return o;
+    o.stream = ps_read32(b, kStreamOut);
+    std::memset(b + kInfo, 0xEE, 0x20);
+    std::memset(b + kExtInfo, 0xEE, 8);
+    o.header = e.ext ? call("cellGifDecExtReadHeader", 0xE53F91F2, {handle, o.stream, kInfo, kExtInfo})
+                     : call("cellGifDecReadHeader", 0xF0DA95DE, {handle, o.stream, kInfo});
+    o.info = hex(b + kInfo, 0x20);
+    o.stream_calls_at_header = ps_read32(b, kStrmCtl + ext::strm::calls);
+    if (o.header == 0) {
+        std::memset(b + kInParam, 0, 0x10);
+        ps_write32(b, kInParam, kCommandWord);
+        ps_write32(b, kCommandWord, 0);
+        ps_write32(b, kInParam + 4, 10);
+        ps_write8(b, kInParam + 8, 0xFF);
+        ps_write8(b, kInParam + 9, 0x00);
+        ps_write32(b, kExtIn + 0, 1); // CELL_GIFDEC_LINE_MODE
+        ps_write32(b, kExtIn + 4, e.counts);
+        ps_write32(b, kExtIn + 8, 0);
+        std::memset(b + kExtOut, 0xEE, 16);
+        o.parameter = e.ext ? call("cellGifDecExtSetParameter", 0x95CAE771, {handle, o.stream, kInParam, kOutParam, kExtIn, kExtOut})
+                            : call("cellGifDecSetParameter", 0x41A90DC4, {handle, o.stream, kInParam, kOutParam});
+    }
+    if (o.header == 0 && o.parameter == 0) {
+        o.out_width_byte = ps_read64(b, kExtOut);
+        o.out_height = ps_read32(b, kExtOut + 8);
+        const u64 row = ps_read64(b, kOutParam);
+        o.height = ps_read32(b, kOutParam + 12);
+        o.pitch = (row + 16 + 15) & ~u64{15};
+        ps_write64(b, kCtrl, o.pitch);
+        ps_write32(b, kDispCtl + ext::disp::mode, e.mode);
+        ps_write32(b, kDispCtl + ext::disp::frame, kFrame);
+        ps_write32(b, kDispCtl + ext::disp::stop_at, e.stop_at);
+        ps_write32(b, kDispCtl + ext::disp::command, kCommandWord);
+        ps_write32(b, kCbDisp, cbs.display_opd);
+        ps_write32(b, kCbDisp + 4, kDispCtl);
+        const u32 first_image = e.first_image ? e.first_image : e.mode == 1 ? kPart : kFrame;
+        const bool parts = e.ext && e.display && e.counts;
+        for (int k = 0; k < 12; k++) {
+            std::memset(b + kFrame, 0xCC, o.pitch * o.height + 64);
+            std::memset(b + kPart, 0xCC, 0x10000);
+            ps_write32(b, kDispParam, first_image);
+            const u32 before = ps_read32(b, kDispCtl + ext::disp::count);
+            const u32 data = !parts ? kFrame : e.game_param ? kImage : first_image;
+            std::memset(b + kDataOut, 0xEE, 0x10);
+            const u32 v = e.ext ? call("cellGifDecExtDecodeData", 0x02E7E03E, {handle, o.stream, data, kCtrl, kDataOut,
+                                      e.display ? kCbDisp : 0, e.game_param ? kDispParam : 0})
+                                : call("cellGifDecDecodeData", 0x44B1BC61, {handle, o.stream, data, kCtrl, kDataOut});
+            o.records.push_back(std::format("{:#x} {}", v, hex(b + kDataOut, 0x10)));
+            const std::vector<ext::Part> all = ext::parts(b, kDispCtl);
+            o.parts.emplace_back(all.begin() + before, all.end());
+            if (v != 0) break;
+            const u32 type = ps_read32(b, kDataOut);
+            if (type == 1) o.screens.emplace_back(b + kFrame, b + kFrame + o.pitch * o.height + 64);
+            if (type == 3 || ps_read32(b, kDataOut + 12) == 1) break; // the trailer, or stopped
+        }
+    }
+    o.stream_calls = ext::stream_calls(b, kStrmCtl);
+    REQUIRE(call("cellGifDecClose", 0x116A7DA9, {handle, o.stream}) == 0);
+    return o;
+}
+
+} // namespace
+
+TEST_CASE("cellGifDec: the Ext functions: whole, in parts to a display callback, from a stream callback (D-595)",
+    "[hle][gifdec]")
+{
+    InterpretMisses interpret;
+    BigFixture f;
+    REQUIRE(f.hle->link_internal_functions({"cellGifDec"}));
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const Call call = hle_calls(f, t);
+    const std::pair<const char*, u32> kExtFunctions[] = {{"cellGifDecExtCreate", 0x4711CB7F},
+        {"cellGifDecExtOpen", 0x17FB83C1}, {"cellGifDecExtReadHeader", 0xE53F91F2},
+        {"cellGifDecExtSetParameter", 0x95CAE771}, {"cellGifDecExtDecodeData", 0x02E7E03E}};
+    for (const auto& [name, nid] : kExtFunctions) {
+        CHECK(recomp::nid_of(name) == nid);
+        CHECK(hle::registry().is_unverified("cellGifDec", nid));
+    }
+    for (const u32 nid : {0xB60D42A5u, 0xE74B2CB1u, 0x75745079u, 0x116A7DA9u, 0xF0DA95DEu, 0x41A90DC4u, 0x44B1BC61u})
+        CHECK_FALSE(hle::registry().is_unverified("cellGifDec", nid));
+
+    write_callbacks(b);
+    const ext::Callbacks cbs = ext::write_callbacks(b, kExtCode, 0x38);
+    std::memset(b + kArgs, 0, 0x400);
+    const u32 tin[7] = {0, 1000, 200, kMallocOpd, kHeapCtl, kFreeOpd, kHeapCtl};
+    for (u32 i = 0; i < 7; i++) ps_write32(b, kThreadIn + 4 * i, tin[i]);
+    // CellGifDecExtThreadInParam: SPURS, eight priorities, maxContention; RPCS3's checks.
+    const auto ext_in = [&](u32 spurs, u32 priority, u32 contention) {
+        ps_write32(b, kExtThreadIn, spurs);
+        for (u32 i = 0; i < 8; i++) ps_write8(b, kExtThreadIn + 4 + i, static_cast<u8>(i == 5 ? priority : 3));
+        ps_write32(b, kExtThreadIn + 12, contention);
+    };
+    const auto ext_create = [&](u32 in, u32 out) {
+        return call("cellGifDecExtCreate", 0x4711CB7F, {kHandleOut, kThreadIn, kThreadOut, in, out});
+    };
+    ext_in(0, 15, 7);
+    CHECK(ext_create(0, kExtThreadOut) == kArg);
+    CHECK(ext_create(kExtThreadIn, 0) == kArg);
+    ext_in(0, 15, 0);
+    CHECK(ext_create(kExtThreadIn, kExtThreadOut) == kArg); // maxContention 1 to 7
+    ext_in(0, 15, 8);
+    CHECK(ext_create(kExtThreadIn, kExtThreadOut) == kArg);
+    ext_in(0, 16, 7);
+    CHECK(ext_create(kExtThreadIn, kExtThreadOut) == kArg); // priorities at most 15
+    ext_in(0, 15, 7);
+    ps_write32(b, kThreadIn, 2);
+    CHECK(ext_create(kExtThreadIn, kExtThreadOut) == kArg); // spuThreadEnable 0 or 1
+    ps_write32(b, kThreadIn, 1);
+    CHECK(ext_create(kExtThreadIn, kExtThreadOut) == kArg); // SPU threads without SPURS
+    ext_in(kData + 0x3000, 15, 7);
+    REQUIRE(ext_create(kExtThreadIn, kExtThreadOut) == 0); // with SPURS: Create's memory with SPU threads
+    CHECK(ps_read32(b, kHeapCtl + 0x10) == 0x380);
+    CHECK(ps_read32(b, kHeapCtl + 0x18) == 0x33880);
+    REQUIRE(call("cellGifDecDestroy", 0xE74B2CB1, {ps_read32(b, kHandleOut)}) == 0);
+    ps_write32(b, kThreadIn, 0);
+    write_callbacks(b);
+    std::memset(b + kExtThreadOut, 0xEE, 8);
+    REQUIRE(ext_create(kExtThreadIn, kExtThreadOut) == 0);
+    CHECK(ps_read32(b, kThreadOut) == 0x240000);
+    CHECK(ps_read64(b, kExtThreadOut) == 0xEEEEEEEEEEEEEEEEull); // reserved, left as it is (RPCS3)
+    const u32 handle = ps_read32(b, kHandleOut);
+    const u32 heap_after_create = ps_read32(b, kHeapCtl), mallocs = ps_read32(b, kHeapCtl + 4);
+    CHECK(mallocs == 1);
+
+    const std::vector<gif::File> files = test_files();
+    const auto run = [&](usize n, const GifExtOptions& e) {
+        return gif_ext_run(b, call, cbs, handle, gif::encode(files[n]), e, heap_after_create, mallocs);
+    };
+    GifExtOptions plain;
+    plain.ext = false;
+
+    SECTION("whole, without a display callback or with no lines per part: DecodeData's records")
+    {
+        for (const usize n : {usize{0}, usize{2}, usize{3}, usize{7}, usize{13}, usize{14}}) {
+            const GifExtRun want = run(n, plain);
+            REQUIRE(want.records.size() > 1);
+            for (const bool display : {false, true}) {
+                GifExtOptions e;
+                e.display = display;
+                e.counts = display ? 0 : 4;
+                const GifExtRun o = run(n, e);
+                INFO("file " << n << ", display callback " << display);
+                CHECK(o.header == 0);
+                CHECK(o.info == want.info);
+                CHECK(o.parameter == 0);
+                CHECK(o.out_width_byte == files[n].width * 4);
+                CHECK(o.out_height == (display ? files[n].height : std::min(4u, files[n].height)));
+                CHECK(o.records == want.records);
+                CHECK(o.screens == want.screens);
+                for (const auto& p : o.parts) CHECK(p.empty());
+            }
+        }
+    }
+
+    SECTION("in parts: each image's screen, outputCounts lines to each display callback; extensions have none")
+    {
+        // File 7: an application, a comment and a graphic control extension, an image, another extension and image.
+        const GifExtRun want = run(7, plain);
+        for (const bool game_param : {true, false}) {
+            GifExtOptions e;
+            e.game_param = game_param;
+            const GifExtRun o = run(7, e);
+            INFO("the game's dispParam " << game_param);
+            CHECK(o.records == want.records);
+            CHECK(o.screens == want.screens);
+            REQUIRE(o.records.size() == 7);
+            for (const usize k : {usize{0}, usize{1}, usize{2}, usize{4}, usize{6}}) CHECK(o.parts[k].empty());
+            for (const usize k : {usize{3}, usize{5}}) {
+                REQUIRE(o.parts[k].size() == 3); // 10 lines: 4, 4, 2
+                const u32 starts[3] = {0, 4, 8}, heights[3] = {4, 4, 2};
+                for (u32 i = 0; i < 3; i++) {
+                    const ext::Part& p = o.parts[k][i];
+                    CHECK(p.frame_width_byte == o.pitch);
+                    CHECK(p.frame_height == 10);
+                    CHECK(p.start_x_byte == 0);
+                    CHECK(p.start_y == starts[i]);
+                    CHECK(p.width_byte == 48);
+                    CHECK(p.height == heights[i]);
+                    CHECK(p.bit_depth == 8);
+                    CHECK(p.components == 4);
+                    CHECK(p.word_34 == 0);                            // scanPassCount
+                    CHECK(p.word_38 == kFrame + starts[i] * o.pitch); // outputImage
+                    CHECK(p.word_3c == 0);                            // interlaceFlag
+                    CHECK(p.param == (game_param ? kDispParam : o.stream + 0x50));
+                }
+            }
+        }
+    }
+
+    SECTION("in parts into one buffer the callback copies from: an interlaced image, its rows in order")
+    {
+        const GifExtRun want = run(2, plain);
+        GifExtOptions e;
+        e.mode = 1;
+        e.counts = 5;
+        const GifExtRun o = run(2, e);
+        CHECK(o.records == want.records);
+        CHECK(o.screens == want.screens);
+        REQUIRE(o.parts.size() == 2);
+        REQUIRE(o.parts[0].size() == 4); // 17 lines: 5, 5, 5, 2
+        for (u32 i = 0; i < 4; i++) {
+            CHECK(o.parts[0][i].start_y == 5 * i);
+            CHECK(o.parts[0][i].height == (i < 3 ? 5u : 2u));
+            CHECK(o.parts[0][i].word_38 == kPart);
+        }
+    }
+
+    SECTION("from a stream: each record's bytes from the stream callback as DecodeData reads it")
+    {
+        const std::vector<u8> file = gif::encode(files[7]);
+        const GifExtRun want = run(7, plain);
+        GifExtOptions e;
+        e.first = 10; // less than the screen descriptor
+        e.chunk = 23;
+        const GifExtRun o = run(7, e);
+        CHECK(o.header == 0);
+        CHECK(o.info == want.info);
+        CHECK(o.stream_calls_at_header > 0);
+        CHECK(o.records == want.records);
+        CHECK(o.screens == want.screens);
+        REQUIRE(o.stream_calls.size() == (file.size() - 10 + 22) / 23); // to the trailer, none past it
+        for (usize i = 0; i < o.stream_calls.size(); i++) CHECK(o.stream_calls[i].first == 10 + 23 * i);
+        // The second image's bytes were asked for after the first image's three parts went out.
+        CHECK(o.stream_calls.front().second == 0);
+        bool between = false;
+        for (usize i = 0; i < o.stream_calls.size(); i++) {
+            between |= o.stream_calls[i].second == 3;
+            if (i) CHECK(o.stream_calls[i].second >= o.stream_calls[i - 1].second);
+        }
+        CHECK(between);
+    }
+
+    SECTION("CELL_GIFDEC_STOP at commandPtr from a display callback stops the image's parts")
+    {
+        GifExtOptions e;
+        e.stop_at = 2;
+        const GifExtRun o = run(0, e); // 13x9: parts of 4, 4, 1
+        REQUIRE(o.records.size() == 1);
+        CHECK(o.records[0].starts_with("0x0 00000001")); // the image record
+        CHECK(o.records[0].ends_with("00000001"));      // CELL_GIFDEC_DEC_STATUS_STOP
+        CHECK(o.parts[0].size() == 2);
+    }
+
+    SECTION("what the Ext functions refuse")
+    {
+        const std::vector<u8> file = gif::encode(files[0]);
+        const auto open_ext = [&](u32 cb) {
+            ps_write32(b, kHeapCtl, heap_after_create);
+            ps_write32(b, kHeapCtl + 4, mallocs);
+            std::memcpy(b + kFile, file.data(), file.size());
+            std::memset(b + kSrc, 0, 0x20);
+            ps_write32(b, kSrc + 0, 1);
+            ps_write32(b, kSrc + 20, kFile);
+            ps_write32(b, kSrc + 24, static_cast<u32>(file.size()));
+            REQUIRE(call("cellGifDecExtOpen", 0x17FB83C1, {handle, kStreamOut, kSrc, kOpenInfo, cb}) == 0);
+            return ps_read32(b, kStreamOut);
+        };
+        // No CellGifDecExtInfo: ARG, and the stream fails.
+        u32 stream = open_ext(0);
+        CHECK(call("cellGifDecExtReadHeader", 0xE53F91F2, {handle, stream, kInfo, 0}) == kArg);
+        CHECK(call("cellGifDecReadHeader", 0xF0DA95DE, {handle, stream, kInfo}) == kSeq);
+        REQUIRE(call("cellGifDecClose", 0x116A7DA9, {handle, stream}) == 0);
+        // No extension parameters, or a buffer mode that is not CELL_GIFDEC_LINE_MODE: ARG, and the stream fails.
+        for (const int c : {0, 1, 2}) {
+            stream = open_ext(0);
+            REQUIRE(call("cellGifDecExtReadHeader", 0xE53F91F2, {handle, stream, kInfo, kExtInfo}) == 0);
+            std::memset(b + kInParam, 0, 0x10);
+            ps_write32(b, kInParam + 4, 10);
+            ps_write32(b, kExtIn + 0, c == 2 ? 0 : 1);
+            ps_write32(b, kExtIn + 4, 4);
+            CHECK(call("cellGifDecExtSetParameter", 0x95CAE771,
+                      {handle, stream, kInParam, kOutParam, c == 0 ? 0 : kExtIn, c == 1 ? 0 : kExtOut}) == kArg);
+            CHECK(call("cellGifDecSetParameter", 0x41A90DC4, {handle, stream, kInParam, kOutParam}) == kSeq);
+            REQUIRE(call("cellGifDecClose", 0x116A7DA9, {handle, stream}) == 0);
+        }
+        // A stream callback with a file source: STREAM_FORMAT, the handle still free.
+        std::memset(b + kSrc, 0, 0x20);
+        ps_write32(b, kSrc + 4, kSrc + 0x100);
+        std::memcpy(b + kSrc + 0x100, "/app_home/image.gif", 20);
+        ps_write32(b, kCbStrm, cbs.stream_opd);
+        ps_write32(b, kCbStrm + 4, kStrmCtl);
+        CHECK(call("cellGifDecExtOpen", 0x17FB83C1, {handle, kStreamOut, kSrc, kOpenInfo, kCbStrm}) == kStreamFormat);
+        REQUIRE(call("cellGifDecClose", 0x116A7DA9, {handle, open_ext(0)}) == 0);
+        {
+            GifExtOptions e; // the stream callback's bytes are not guest memory
+            e.first = 10;
+            e.chunk = 23;
+            e.stream_source = kNowhere;
+            CHECK(run(0, e).header == kCbParam);
+        }
+        {
+            GifExtOptions e; // the display callback gives no place for the next part
+            e.mode = 2;
+            const GifExtRun o = run(0, e);
+            REQUIRE(o.records.size() == 1);
+            CHECK(o.records[0].starts_with(std::format("{:#x}", kCbParam)));
+            CHECK(o.parts[0].size() == 1);
+        }
+        {
+            GifExtOptions e; // the first part's place is not guest memory
+            e.first_image = kNowhere;
+            const GifExtRun o = run(0, e);
+            REQUIRE(o.records.size() == 1);
+            CHECK(o.records[0].starts_with(std::format("{:#x}", kArg)));
+            CHECK(o.parts[0].empty());
+        }
+    }
+    REQUIRE(call("cellGifDecDestroy", 0xE74B2CB1, {handle}) == 0);
 }
 
