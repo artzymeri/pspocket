@@ -269,13 +269,15 @@ std::string guest_cstr(PPUContext& ctx, u32 addr, u32 max = 0x10000)
     return read_cstr(thread_of(ctx), addr, max).text;
 }
 
-// What libpng keeps pointers to until the image is written.
+// What libpng keeps pointers to until the image is written. The strings are in a deque, which never moves one that is
+// there: the text chunks' png_text entries point into them until png_set_text copies them all (in a vector, a later
+// text's strings moved the earlier ones, and a short string's characters with them, D-598).
 struct ChunkData {
     std::vector<png_color> palette;
     std::vector<u8> trans_alpha;
     png_color_16 trans_color{}, background{};
     png_color_8 sig_bit{};
-    std::vector<std::string> strings;
+    std::deque<std::string> strings;
     std::vector<png_text> texts;
     std::vector<u8> profile;
     std::vector<png_uint_16> hist;
@@ -339,7 +341,6 @@ void set_chunks(PPUContext& ctx, png_structp png, png_infop info, u32 list, u32 
         case CHUNK_TEXT: {
             // CellPngTextInfo {txtType, keyword, text, textLength, languageTag, translatedKeyword}.
             const s32 kind = static_cast<s32>(ps_read32(base, at));
-            d.strings.reserve(d.strings.size() + 4);
             d.strings.push_back(guest_cstr(ctx, ps_read32(base, at + 4), 80));
             const u32 text = ps_read32(base, at + 8), text_len = ps_read32(base, at + 12);
             d.strings.push_back(text_len && in_guest(ctx, text, text_len)

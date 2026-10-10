@@ -449,6 +449,34 @@ TEST_CASE("cellPngEnc: ancillary chunks: text, time, gamma, physical size", "[hl
     CHECK(g.call("cellPngEncClose", h) == 0);
 }
 
+TEST_CASE("cellPngEnc: three text chunks in one picture, short keywords and texts (D-598)", "[hle][pngenc]")
+{
+    // A later text's strings used to move an earlier one's (short strings keep their characters inside them), and
+    // libpng then refused the keyword it was pointed at: the stream aborted.
+    Fixture f;
+    GuestThread g(f, 0, "game");
+    u8* b = f.base();
+    const u32 h = open(g);
+    std::memset(b + kPixels, 0x40, 64);
+    std::memset(b + kChunkData, 0, 0x400);
+    const char* strings[] = {"Title", "pspocket", "Comment", "a compressed text", "Author", "en", "Auteur", "nobody"};
+    for (u32 i = 0; i < 8; i++) std::memcpy(b + kChunkData + 0x200 + 0x20 * i, strings[i], std::strlen(strings[i]) + 1);
+    const auto s = [](u32 i) { return kChunkData + 0x200 + 0x20 * i; };
+    // CellPngTextInfo {txtType (tEXt 0, zTXt 1, iTXt 2), keyword, text, textLength, languageTag, translatedKeyword}.
+    const u32 texts[3][6] = {{0, s(0), s(1), 0, 0, 0}, {1, s(2), s(3), 0, 0, 0}, {2, s(4), s(7), 0, s(5), s(6)}};
+    for (u32 t = 0; t < 3; t++) {
+        for (u32 k = 0; k < 6; k++) ps_write32(b, kChunkData + 0x18 * t + 4 * k, texts[t][k]);
+        ps_write32(b, kChunks + 8 * t, 7);
+        ps_write32(b, kChunks + 8 * t + 4, kChunkData + 0x18 * t);
+    }
+    const Png png = round_trip(g, h, {4, 4, 4, GRAY, 8}, {GRAY, 6, 0xF8, 3});
+    REQUIRE(png.texts.size() == 3);
+    CHECK(png.texts[0] == std::pair<std::string, std::string>{"Title", "pspocket"});
+    CHECK(png.texts[1] == std::pair<std::string, std::string>{"Comment", "a compressed text"});
+    CHECK(png.texts[2] == std::pair<std::string, std::string>{"Author", "nobody"});
+    CHECK(g.call("cellPngEncClose", h) == 0);
+}
+
 TEST_CASE("cellPngEnc: the result queue: four at most, BUSY, EMPTY, Reset; a buffer too small", "[hle][pngenc]")
 {
     Fixture f;
