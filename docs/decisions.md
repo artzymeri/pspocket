@@ -9902,3 +9902,180 @@ refused for a buffer that cannot hold the image (ARG); a gray one claiming 16384
 the stream failed. The fuzz case: 2,107 damaged inputs a run (855 headers read, 144 decoded, 1,935 parts); with
 PSPOCKET_FUZZ_ITERS=2500, 5,250,007 inputs (2,074,101 headers read, 332,768 decoded, 4,400,740 parts), no fault, the
 process at most 71 MB.
+
+## D-610 · 2026-10-10 · libsynth2 pspocket's own, firmware-first: the PS2's SPU2 in software behind libsd's interface
+
+libsynth2 is the PlayStation 2's sound processor, the SPU2, as a PS3 library for games and ports that drive it the PS2
+way. Its 17 functions are the PS2's libsd under cell names: cellSoundSynth2Init is sceSdInit; SetParam/GetParam,
+SetSwitch/GetSwitch, SetAddr/GetAddr and SetCoreAttr are libsd's register calls with libsd's register numbers;
+SetEffectAttr and SetEffectMode its reverb presets; VoiceTrans and VoiceTransStatus its transfers into the 2 MB sound
+memory; Note2Pitch and Pitch2Note its pitch arithmetic; and Generate(samples, Lout, Rout, Ls, Rs) renders the next
+samples as floats for the game to give cellAudio. RPCS3 (rpcs3/Emu/Cell/Modules/libsynth2.cpp and .h) has the
+signatures, the error codes and CellSoundSynth2EffectAttr; its bodies are stubs (a log, CELL_OK or 0). No Sony module
+was at hand, so all 17 are made from what is public, each rule credited where it is used:
+- psx-spx (the PS1's SPU, one SPU2 core: "the PS2's SPU2 is basically two PS1 SPU cores sharing the same memory"): the
+  ADPCM, the pitch counter, the gaussian interpolation, the envelopes and sweeps, the noise, the reverb's formula,
+  resampling and presets;
+- ps2sdk (Academic Free License, not GPL-compatible: read for facts, nothing copied): libsd-common.h (the register,
+  entry, transfer and effect mode numbers), spu2_mmio_hwport.h and spu2regs.h (the SPU2's registers and its reverb
+  registers' order), and freesd, ps2sdk's libsd (what each call does, the initialisation, the presets and work area
+  sizes, the echo and delay arithmetic, the pitch tables and arithmetic);
+- PCSX2 (GPLv3: no code taken): what its comments and register decoding record of the SPU2 from tests (the written loop
+  address, the effect bit, ENDX writes, MMIX's bits, the IRQ seen by both cores), consulted after the code was written
+  to check its choices.
+The synthesizer is runtime/hle/src/spu2.hpp and spu2.cpp (D-611, D-612), the interface libsynth2.cpp (D-613, D-614).
+The library is firmware-first (D-563): where the system software is installed a game gets Sony's libsynth2 whole,
+pspocket's where it is not. Its only other client is libsnd3 (built on it, not made yet): pspocket's libsnd3 is to call
+it through its exports as Sony's libsnd3 does, and to be firmware-first too, so that a process never pairs Sony's
+libsnd3 with pspocket's libsynth2 or the reverse.
+
+Tests: tests/hle/test_synth2.cpp, 17 cases, about 71,700 checks, every output sample compared with the test's own model
+of the SPU2 (written from psx-spx and libsd's documents, not from spu2.cpp): synthetic VAG sounds (vag_writer.hpp in
+tests/hle, a closed-loop ADPCM encoder: sines, one-shots, silent loops) played by voices keyed on and off at pitches
+0x0800 to 0x1ABC with linear and exponential ADSR, direct and phase-inverted volumes; core 0 through core 1 with the
+voice and core mixes switched; noise; pitch modulation; swept volumes; the reverb off and on (a studio, a hall, an
+echo with its delay and feedback, the work area word for word); ENDX, ENVX, NAX, LSAX and the IRQ flag; Note2Pitch and
+Pitch2Note against values of libsd's arithmetic; every argument check and error. The comparison with Sony's module is
+written for the Mac (tests/hle/test_synth2_compare.cpp in D-597's suite, hidden: test_hle "[compare][synth2]"): the same
+calls and sounds to both halves, 2,950 observations (every answer; the registers after Init and after writes; 1,248
+Note2Pitch and about 1,100 Pitch2Note answers; the transfers; Generate's four outputs within 5 steps of 1/32768 in each
+of the unit tests' scenarios; the reverb's work areas within 0.2%). With PSPOCKET_COMPARE_SELF=1, 0 of 2,950 differ.
+The count: 5,904 of 6,625 library functions pspocket's own before, 5,921 after (libsynth2's 17 of 17).
+Speed: with every voice of both cores playing and both reverbs on, one second of output takes 66 ms of one core of the
+Linux host (6.6%).
+On the Mac: run the comparison, fix what differs (D-611 to D-614 name what to look at first: Generate's Ls and Rs, the
+effect bit, VoiceTrans's and VoiceTransStatus's answers, Config, the hot Init), then drop the firmware-first marker with
+a decision of its own.
+
+## D-611 · 2026-10-10 · libsynth2's SPU2: the voices, sample by sample
+
+runtime/hle/src/spu2.cpp renders one 48 kHz sample at a time, the SPU2's rate (pitch 0x1000 plays one sample a tick).
+Sound memory is 2 MB, byte addressed (libsd's addresses are bytes); a voice's addresses are 16-byte blocks.
+- ADPCM (psx-spx "SPU ADPCM Samples"): a block is a shift/filter byte, a flag byte (bit 0 loop end, bit 1 repeat, bit 2
+  loop start) and 28 nibbles, low first; a sample is the nibble times 2^(12 - shift) plus the prediction, (old * f0 +
+  older * f1 + 32) >> 6 with the filters (0, 0), (60, 0), (115, -52), (98, -55), (122, -60), clamped to 16 bits. Shifts
+  13 to 15 act as 9 (psx-spx's XA note; PCSX2 shifts further; Sony's encoders write 0 to 12). Filters 5 to 7 predict
+  nothing (not documented; PCSX2's table leaves them zero).
+- Blocks: a loop end sets the voice's ENDX bit and goes on at the loop address (LSAX); with the repeat bit clear the
+  envelope goes to zero and the voice stops (end and mute); the repeat bit matters only there (psx-spx's codes 1 and 3;
+  PCSX2's notes from tests). A block with the loop start flag copies its address to LSAX unless the game wrote LSAX
+  since the voice's key on (PCSX2's tests found the SPU2 keeps a written loop address; psx-spx documents the PS1's
+  override). A stopped voice moves on through its blocks without decoding them, as every SPU voice always reads memory,
+  so its ENDX, LSAX and IRQ still come.
+- Key on (psx-spx "SPU Voice Flags"): the voice starts at SSA, the envelope in attack from zero, the decoder's and the
+  interpolation's history zero, ENDX clear; key off sends a playing voice to release. KON and KOFF read back what was
+  last written.
+- Pitch (psx-spx "SPU ADPCM Pitch"): the counter adds the pitch each sample, at most 0x4000 (four samples); with the
+  voice's PMON bit (voices 1 to 23) the pitch, sign-extended, times the previous voice's output plus 0x8000, over
+  0x8000, its low 16 bits. The four latest samples are interpolated with psx-spx's 512-entry gaussian table at the
+  counter's bits 4-11 (the tests check the table by psx-spx's property: each four entries sum to 0x7F7F..0x7F81).
+- Envelopes (psx-spx "Envelope Operation depending on Shift/Step/Mode/Direction"): the step 7 - the step bits (negated
+  to decrease) times 2^(11 - shift) (1 from shift 11 up), a counter growing by 0x8000 >> (shift - 11) (0x8000 below
+  shift 11), at least 1 unless every bit of the rate is set (then it never steps), a step when its bit 15 is set; the
+  exponential increase slower past 0x6000, the exponential decrease the step times the level >> 15. Attack (ADSR1 bit 15
+  the mode, bits 8-14 the rate) to 0x7FFF; decay (bits 4-7 the shift, exponential) to the sustain level ((N + 1) *
+  0x800, N its bits 0-3; none when the attack's peak is not above it, so a level of 15 holds the peak); sustain (ADSR2
+  bit 15 the mode, bit 14 decreasing, bits 6-12 the rate) until key off; release (bit 5 the mode, bits 0-4 the shift) to
+  zero, where the voice stops. Volumes (VOLL, VOLR, MVOLL, MVOLR): bit 15 clear, bits 0-14 times two (a negative volume
+  inverts the phase); set, a sweep from the current level (bit 14 exponential, 13 decreasing, 12 negative phase, bits
+  0-6 the rate) by the same steps.
+- Noise (psx-spx "SPU Noise Generator"): one generator a core, clocked by ATTR bits 8-13 (the shift in the upper four,
+  the step in the lower two); a voice with its NON bit plays it in place of its samples, under its envelope.
+- A voice's sample: the envelope's step, the volumes' steps, the output (the interpolated sample or the noise, times
+  ENVX >> 15: OUTX, which the next voice's PMON takes), times the volumes into the mixes, then the pitch counter.
+Chosen where nothing says, to compare on the Mac: that order; NAX reads the block the voice plays, not the word; an IRQ
+is raised when a voice fetches the block holding a core's IRQ address with that core's IRQ enabled (either core's
+voices, PCSX2's note), and no libsynth2 function reports it (libsd's sceSdSetIRQCallback has no cell form): the flag is
+the engine's own, seen in the tests; writing ENVX sets the level of a voice that plays.
+
+## D-612 · 2026-10-10 · libsynth2's SPU2: the two cores, the reverb and its presets, Generate's output
+
+- Mixes (psx-spx; spu2_mmio_hwport.h; MMIX's bits as PCSX2 decodes them): each voice goes into its core's dry left, dry
+  right, wet left and wet right sums by VMIXL, VMIXR, VMIXEL and VMIXER; MMIX bits 11-8 take those, bits 3-0 the
+  external input the same way, bits 7-4 the memory input (block transfers, which libsynth2 has none of: silent). Core
+  0's output, after its master volume, is core 1's external input times AVOL (freesd: "The external Input is Core 0's
+  output"); core 1's, after its master volume, is the SPU2's. A core's output is dry plus reverb times its current
+  master volume; the sums clamp to 16 bits at each stage.
+- Reverb (psx-spx "SPU Reverb Formula", "Reverb Buffer Resampling"): the wet sum through psx-spx's 39-tap filter to 24
+  kHz; every second sample one step of the formula (the same side and different side reflections, four combs, two
+  all-pass filters) in the core's work area [ESA, EEA] of sound memory (16-bit words in the PPU's byte order), its
+  result times EVOL; back to 48 kHz through the same filter at twice its gain over the zeros between. Addresses and
+  displacements count 8 bytes and are relative to the buffer's address, which moves a word each step within the area and
+  starts again at ESA when ESA is written. With the core's effect bit clear (SetCoreAttr EFFECT_ENABLE 0) the reverb
+  neither writes nor plays and its address still moves on: PCSX2's mixer notes that the SPU2's bit "seems to disable all
+  reverb processing and output, but does not disable the advancing buffers" (psx-spx: the PS1's stops only the writes).
+- Presets (SetEffectAttr; libsd's effect.c): each mode's 32 registers as libsd sets them (off, room, studios small,
+  medium and large, hall, space, echo, delay, pipe: the studios, hall, space and pipe equal psx-spx's PS1 presets, the
+  room, echo and delay differ a little), its work area the mode's size ending at the core's EEA (0x10 to 0x18040 bytes).
+  Echo and delay take the delay ((delay + 1) * 32 into the same side reflection, the first comb and the all-pass
+  filters) and the feedback (feedback * 258 as vWALL), in libsd's 16-bit arithmetic. CLEAR (0x100) zeroes the new area,
+  and the old mode's when the effect was on. SetEffectAttr sets EVOL to the depths; SetEffectMode does the same without
+  the depths (libsd 3.3's sceSdSetEffectMode is documented nowhere public: the most plausible split). A mode past 9
+  (with or without CLEAR), or attributes that are not guest memory: INVALID_PARAMETER, nothing set. The bus is bit 0.
+- The mute bit (SetCoreAttr MUTE_ENABLE, ATTR bit 14) is kept and not applied: libsd's own initialisation sets it on
+  both cores (freesd InitCoreVolume), on the PS1 the bit set means unmuted, and PCSX2 keeps its mute at 0. The S/PDIF
+  mode is kept.
+- Generate: the SPU2's output as floats, a sample over 32768, into Lout and Rout. Ls and Rs (the surround pair) may be
+  NULL; given, they get silence: the SPU2 is stereo, and what Sony's library puts there (core 0 apart, the reverb, an
+  upmix) is not known. Lout or Rout NULL (whatever the count), or a buffer that is not guest memory for the samples:
+  INVALID_PARAMETER, nothing rendered; else no samples is CELL_OK, nothing done.
+To compare on the Mac, first: Ls and Rs; then the effect bit's silence, SetEffectMode against SetEffectAttr, the mute
+bit, and the rounding (EVOL applied at 24 kHz, where the clamps are), which the comparison's tolerance lets through but
+counts.
+
+## D-613 · 2026-10-10 · libsynth2's libsd calls: registers, Init and Exit, transfers, Config, errors
+
+- Registers (libsd-common.h): the parameter in bits 8-15, the core in bit 0, the voice in bits 1-5 (SD_VOICE); bit 7,
+  which the cores' volume parameters carry, is ignored. SetParam/GetParam 0x00-0x07: a voice's VOLL, VOLR, PITCH, ADSR1,
+  ADSR2, ENVX, VOLXL, VOLXR (the last three its current levels); 0x08-0x12: a core's MMIX, MVOLL/R, EVOLL/R, AVOLL/R,
+  BVOLL/R, MVOLXL/R. SetSwitch/GetSwitch 0x13-0x1B: the 24 voice bits of PMON, NON, KON, KOFF, ENDX, VMIXL, VMIXEL,
+  VMIXR, VMIXER. SetAddr/GetAddr 0x1C-0x22: a core's ESA, EEA, TSA, IRQA, a voice's SSA, LSAX, NAX, byte addresses kept
+  as libsd keeps them (freesd sceSdSetAddr, sceSdGetAddr): a 16-byte block's, the low four bits dropped; EEA only its
+  128 KB boundary, read with the low 17 bits set. A write to ENDX clears it, whatever the value (PCSX2: a write clears
+  the half written; libsd writes both). SetParam, SetSwitch and SetCoreAttr are void, as libsd's: an unknown register or
+  a voice past 23 changes nothing and the getters read 0, each logged once. SetAddr, which has an answer in libsynth2
+  (libsd's is void), answers INVALID_PARAMETER for an unknown register, a voice past 23 or an address past the 2 MB.
+- Core, channel and bus arguments take bit 0, as libsd does (core &= 1), a value past 1 logged once.
+- Init (libsd sceSdInit, freesd): ALREADY_INITIALIZED until Exit; flag bit 0 a hot start (other bits logged once).
+  Either way every voice gets volume 0, pitch 0x3FFF, ADSR 0 and libsd's 32 bytes at 0x5000 as its start (a looping
+  block of 0x07 bytes, then zeros), keyed on and off, ENDX cleared (within eight samples every stopped voice has met
+  that block's loop end again: ENDX all set, as on a PS2 after sceSdInit); ATTR on with the mute bit, core 1's external
+  input bit; every voice in every mix; MMIX 0xFF0 and 0xFFC; AVOL 0 and 0x7FFF; BVOL 0. A cold start (flag 0) also keys
+  every voice off, zeroes the master and effect volumes, PMON and NON, and puts each core's effect area at the top of
+  its half of memory (EEA 0x1DFFFF and 0x1FFFFF, the "off" mode's 16 bytes) with the off preset and the effect bit
+  clear; a hot one keeps those and sets the effect bit. Exit ends the library and leaves the synthesizer as it is
+  (libsd's sceSdQuit leaves the SPU2 alone) for a later Init; Exit before Init answers CELL_OK. Before Init every
+  function works on the synthesizer's power-on state (all zero: silence). FATAL is never answered: nothing here fails
+  that way.
+- VoiceTrans(channel, mode, m_addr, s_addr, size): mode bits 0-1 the direction (SD_TRANS_WRITE 0 into sound memory, READ
+  1 back), bit 3 I/O rather than DMA (the same here). The copy is made at once, the channel's TSA becomes s_addr, and
+  the answer is the bytes copied, as libsd's DMA transfer answers. STOP (2) and 3, a range past sound memory, or main
+  memory that is not the guest's: INVALID_PARAMETER, nothing copied. VoiceTransStatus answers 1, the transfer finished
+  (libsd's answer; with flag 1 libsd waits until then).
+- Config(param, value): a setting of the library that libsd has no counterpart of and pspocket's synthesizer none to
+  change: kept, logged once, CELL_OK.
+To compare on the Mac: VoiceTrans's answer (the bytes, or CELL_OK as RPCS3 types it) and VoiceTransStatus's (1, or
+CELL_OK); what Config's parameters are and do; whether Init checks its flag and what a hot start keeps; what the getters
+read for unknown registers and what SetAddr checks; whether Sony's SetParam honours bit 7 (libsd's own register table
+uses it to tell the cores' volume block from the voices').
+
+## D-614 · 2026-10-10 · libsynth2's Note2Pitch and Pitch2Note: libsd's tables and arithmetic
+
+libsd's tables are floor(0x8000 * 2^(n/12)) for the 12 semitones and floor(0x8000 * 2^(n/1536)) for the 128 fine steps
+of a semitone: freesd.c's NotePitchTable holds exactly these values. pspocket computes them; each is at least 0.0024
+from an integer, so double precision floors them alike on every host.
+- Note2Pitch(center_note, center_fine, note, fine): fine + center_fine (1/128 semitones) carried into the note; the
+  offset from the centre as octave and semitone (floors); the semitone and fine factors multiplied and shifted down 16
+  (0x4000 at the centre's octave + 2), then halved with rounding ((p + 2^(k-1)) >> k) for each octave below that. Two
+  octaves up and beyond keep that octave's values (libsd only shifts right): note 96 from 60 is 0x4000, note 127 from 0
+  0x5FE4. A scratch check against a transliteration of freesd's (decompiled) arithmetic over 4.3 million arguments
+  (fines -128 to 127, centre fines 0 to 127) found them equal everywhere. Below -128 (fine + center_fine) libsd's
+  arithmetic leaves the fine negative and reads semitone entries, or memory before its table, as fine steps; pspocket
+  carries the semitones as for any other value.
+- Pitch2Note(center_note, center_fine, pitch): the pitch (at most 0x3FFF) shifted up to its top bit (that bit's place
+  the octave, 12 the centre's), the largest semitone factor not above it, the quotient's largest fine factor not above,
+  the fine plus one and the centre's fine carried into the note: (note << 8) + (fine & 0x7E) in 16 bits (pitches 0 and 1
+  are 144 semitones below the centre).
+Tests: 21 Note2Pitch and 14 Pitch2Note values of libsd's arithmetic; every note from 12 to 83 at every fine step near
+4096 * 2^(offset / 12) (within 1 + 0.06%), rising, and back through Pitch2Note within 5 fine steps (1 from the centre
+up). To compare on the Mac: the comparison's 2,350 answers against Sony's.
