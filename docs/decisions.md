@@ -8865,14 +8865,16 @@ last step on stderr, every minute, so a module stuck on something pspocket's lv2
 library with "[compare][libmixer]", "[compare][vpost]", "[compare][key2char]", "[compare][pngenc]", "[compare][fiber]",
 "[compare][codec-cores]" or "[compare][vdec]" (for the last, scripts/build-ffmpeg.sh first, D-588: without the VC-1
 decoder or the tests' encoders those parts skip). PSPOCKET_COMPARE_PRINT=1 also prints both halves' observations in full
-(to read Sony's answers). The comparisons are hidden ([.]): ctest and the gate, which sets PSPOCKET_TEST_DEV_FLASH, leave
-them out while they are expected to differ, so they hold up no build. When a library matches, its test loses the [.]
-together with the library's firmware-first marker (a decision of its own), and joins the gate as D-193's comparisons
-have. Without the firmware each skips. PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice instead, the second in Sony's
-place, so the whole comparison runs anywhere: the halves must agree (a half that does not repeat itself would show
-differences on the Mac that are not Sony's), and each test checks pspocket's own values against its unit tests' (a few
-dozen checks each). What needs no firmware is checked in every ctest run: each function a comparison calls is in the NID
-database under its library with that name, is pspocket's own, and the library is still firmware-first.
+(to read Sony's answers); PSPOCKET_COMPARE_TRACE=1 prints each call before it is made and each observation as it comes,
+so the last line before a crash (a module faulting) names the call. The comparisons are hidden ([.]): ctest and the
+gate, which sets PSPOCKET_TEST_DEV_FLASH, leave them out while they are expected to differ, so they hold up no build.
+When a library matches, its test loses the [.] together with the library's firmware-first marker (a decision of its
+own), and joins the gate as D-193's comparisons have. Without the firmware each skips. PSPOCKET_COMPARE_SELF=1 runs
+pspocket's half twice instead, the second in Sony's place, so the whole comparison runs anywhere: the halves must agree
+(a half that does not repeat itself would show differences on the Mac that are not Sony's), and each test checks
+pspocket's own values against its unit tests' (a few dozen checks each). What needs no firmware is checked in every
+ctest run: each function a comparison calls is in the NID database under its library with that name, is pspocket's
+own, and the library is still firmware-first.
 
 **What each compares, and what a difference means.**
 - **libmixer** (test_libmixer_compare.cpp; both halves over pspocket's cellAudio): every answer before cellAudioInit and
