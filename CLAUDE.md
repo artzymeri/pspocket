@@ -70,6 +70,9 @@ ctest --test-dir build/host --output-on-failure
 - Disc images: `ps3disc <image.iso> <out-dir>` (host) or the app's `-extract-iso` mode pulls out the executables only;
   `ps3disc --decrypt <image.iso> <out.elf>` decrypts EBOOT.BIN, as the app does on the phone (D-121). The keys come
   from RPCS3's source at build time (`scripts/self-keys.py`, `-DPSPOCKET_RPCS3_DIR`) into the build directory only.
+- PSN games (D-580 to D-583): `ps3disc --install-pkg <hdd0-dir> Game.pkg [Update.pkg ...]` installs into
+  `<hdd0-dir>/game/<TITLE_ID>/`, `ps3disc --install-rap <hdd0-dir> <CONTENT_ID>.rap` puts the player's licence in
+  `home/00000001/exdata/`; then `pspocket-boot <hdd0-dir>/game/<TITLE_ID>/USRDIR/EBOOT.BIN --hdd0 <hdd0-dir>`.
 - One bring-up round on the Mac: `scripts/boot.sh` (pull, build, run the decrypted EBOOT with the disc image read in
   place, print the gaps). It finds the game's .iso (or copies it once from the iPhone app: `scripts/ios.sh pull-iso`).
 - Boot an executable under the interpreter (Phase 2 bring-up, D-033): `pspocket-boot EBOOT.elf [--bdvd DIR|IMAGE.iso]

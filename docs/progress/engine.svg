@@ -3,8 +3,8 @@
 <text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">The engine, part by part (checklist in docs/progress/data.json)</text>
 <text x="4" y="47" font-size="12.5" fill="#24292f">Reading any PS3 disc on the iPhone</text>
 <rect x="300" y="35" width="530" height="16" rx="3" fill="#e6e8eb"/>
-<rect x="300" y="35" width="441.7" height="16" rx="3" fill="#57ab5a"/>
-<text x="838" y="47" font-size="12.5" fill="#24292f">83%  (5/6 done)</text>
+<rect x="300" y="35" width="485.8" height="16" rx="3" fill="#2da44e"/>
+<text x="838" y="47" font-size="12.5" fill="#24292f">92%  (5/6 done)</text>
 <text x="4" y="73" font-size="12.5" fill="#24292f">Translating on the iPhone (route B)</text>
 <rect x="300" y="61" width="530" height="16" rx="3" fill="#e6e8eb"/>
 <rect x="300" y="61" width="471.1" height="16" rx="3" fill="#57ab5a"/>
