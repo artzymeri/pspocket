@@ -8418,6 +8418,59 @@ two sends finds the one-event queue full, and a log sink holds the SPU's thread 
 the first event and replies. The SPU reads EBUSY, then the reply; with the old order it read the reply, then EBUSY
 (every run).
 
+## D-585 · 2026-10-09 · The ThreadSanitizer sweep of the threaded runtime: scripts/tsan.sh, the tests, the suppressions
+
+D-571 ran ThreadSanitizer over four libraries' tests. This sweep runs it over every test of the threaded runtime, and
+makes that one command, the regression check for threaded code (a race does not show in an ordinary build).
+- scripts/tsan.sh configures and builds build/tsan (-DPSPOCKET_TSAN=ON) and runs seven groups: core (the reservation
+  system's litmus tests, guest memory), ppu, spu, lv2, rsx, hle (test_hle once per test file, through Catch2's file
+  tags, so a file's crash or reports stay its own) and boot (pspocket-boot's fault and thread reports, through ctest).
+  One line per group: its reports, their distinct places (scripts/tsan_report.py keys a report on its two accesses'
+  first frames in pspocket's own code) and how its tests ended; the logs, and the first report of each place, are in
+  build/tsan-logs/<group>/. Exit status 0 only with no report and no failed test; --raw leaves the suppressions out.
+- Before, with the tree as the sweep found it and no suppressions: 1,063 reports (lv2 447, hle 564 in 19 of its 91
+  files, boot 32, rsx 19, ppu 1). After, without them: 154 (hle 121 in 13 files, boot 32, ppu 1), each of them with a
+  side the suppressions name; with them, none in any group, in two runs of the sweep. The tests that fail in it fail
+  without ThreadSanitizer too (cellAdec's and cellAtrac's decoding without FFmpeg, test_la_noire's SDATA case, libm's
+  fmin and fmax of signed zeros).
+- Most were the tests':
+  - Catch2's assertions are not thread-safe (D-571): 443 of lv2's 447, and in the HLE tests GuestThread::find, the
+    sys_net helper's errno check and test_sysPrxForUser's own fixture. tests/common/thread_check.hpp: THREAD_CHECK and
+    THREAD_REQUIRE are CHECK and REQUIRE on the test's thread; elsewhere a failure is kept with its text and place and
+    reported on the test's thread when the fixture goes away (a failed THREAD_REQUIRE ends the process, printing it).
+    The lv2 and HLE fixtures use them; the HLE fixture's count of D-571 goes, and a test thread that cannot find its
+    HLE function ends the run with the name where it got all ones back.
+  - Tests that watched guest memory while another thread wrote it now synchronise as the guest would
+    (tests/hle/hle_test_util.hpp): they poll what an SPU writes at the first doubleword of its last PUT with acquire
+    loads (the MFC stores that doubleword last, with release order: D-124, D-225); read the words the SPURS kernel
+    changes through the reservation system (line_copy, as lwarx reads them: the line's version orders what the kernel
+    wrote before the change, a saved context, a halted chain's error); store what another thread polls with release
+    order (put and the labels the RSX waits on, a workload's priority or state a test sets by hand); fill a port's ring
+    with word stores while the mixer reads it; count an AIO callback's completions with lwarx/stwcx. (as
+    cellAtomicIncr32 does); and the SPURS semaphore test's task polls the PPU's control words with GETLLAR, not a plain
+    GET.
+  - test_spurs_run's exit callback test waited for the callback's first PUT and checked its third (under
+    ThreadSanitizer it failed every run, and it could under any load), and its priority test waited for each task's
+    turn and checked the priorities it PUT after it. Both wait for the last PUT.
+- The runtime's own findings are D-584 (an SPU call's answer and a PPU's reply in the inbound mailbox), D-586 (a
+  thread's stack released after its join could return; rsxaudio's ring words) and D-587 (words pspocket's own threads
+  shared without atomics or order). No lock-order inversion was reported (the deadlock detector is on by default).
+- What remains is guest-level, suppressed in scripts/tsan.supp with its reason: the PPU interpreter's guest loads,
+  stores and instruction fetch (guest code racing other guest code, DMA, or a test standing in for a game), the
+  reservation system's line operations (plain stores to a line being reserved are allowed by design and merged
+  around), and pspocket-boot's fault report, which allocates in its SIGSEGV handler before the process ends. With
+  symbolize_inline_frames=0 a race_top entry matches the function an access is made in (the accessors inlined into it
+  count as it) and nothing it calls, so a syscall or HLE function reached from interpreted code is still checked.
+- The reservation system reviewed (D-030, D-130, D-243): the seqlock read (version, the line twice, the version again),
+  the lock that is the version's odd value and fails a stale reservation before it touches memory, the release fence
+  before a store's CASes, the merge around a plain store landing between the compare and the CAS, the seq_cst bump with
+  the waiters' Dekker pairing, the notification's watched slots. No host-level mistake; its tests run clean.
+- ThreadSanitizer does not model fences. pspocket orders the SPU's DMA (D-077, D-130), the HLE libraries' lwsync and
+  the reservation system's stores with them, so a hand-off ordered by a fence alone shows as a race. Where pspocket's
+  own code waits on one, it now reads through what ThreadSanitizer sees, the reservation system's line version
+  (cellSync's waits, D-587); the tests do the same, or poll the MFC's release store. Translated code is not covered:
+  the tests interpret.
+
 ## D-586 · 2026-10-09 · lv2: a thread's stack goes back before a join can return; rsxaudio's ring words ordered
 
 Two lv2 findings of the ThreadSanitizer sweep (D-585).

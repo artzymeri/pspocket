@@ -476,6 +476,19 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **State:** fixed (D-225): 0 stops in 11 loaded walks where 3 in 10 stopped before. Confirm on the iPhone (run 100's
   stop came after 110 s there).
 
+## Stability: data races (ThreadSanitizer, D-585)
+
+- **Done:** `scripts/tsan.sh` builds build/tsan and runs every threaded test under ThreadSanitizer, a line per group.
+  The first sweep found an SPU call's answer overtaken by the PPU's reply (D-584), a thread's stack still committed
+  when its join returned (D-586), words pspocket's own threads shared without order (D-587) and tests that read before
+  what they waited for had landed. What is left is guest-level and suppressed with its reason (scripts/tsan.supp).
+- **Blind spots:** ThreadSanitizer does not model fences, and pspocket orders DMA, lwsync and the reservation system's
+  stores with them: a report whose two sides only a fence orders is not a bug (read it through the reservation
+  system's version, or a release store, to make sure). The tests interpret: translated code is not covered.
+- **Next:** pspocket-boot under ThreadSanitizer for a few minutes of a game, the translated functions' guest accesses
+  suppressed as the interpreter's are; the reports left in pspocket's own code are what an hour without a crash needs.
+  Run the sweep after any change to threaded code.
+
 ## System libraries (D-500)
 
 - **The count.** The chart counts every function RPCS3 registers (6,625). 2,752 of them are sys_libc, sys_libm and
