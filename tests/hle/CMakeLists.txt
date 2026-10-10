@@ -18,8 +18,9 @@ if(TARGET pspocket::libpng)
     target_link_libraries(test_hle PRIVATE pspocket::libpng)
 endif()
 
-# libsynth2, the SPU2 in software (D-610): test_hle "[synth2]".
-target_sources(test_hle PRIVATE test_synth2.cpp)
+# libsynth2, the SPU2 in software (D-610): test_hle "[synth2]"; its comparison with Sony's module (D-597), hidden:
+# test_hle "[compare][synth2]".
+target_sources(test_hle PRIVATE test_synth2.cpp test_synth2_compare.cpp)
 
 # The C library compared with a game's statically linked copy of the SDK's (D-904): test_hle "[gamelibc]", skipped without
 # PSPOCKET_TEST_AC_EBOOT and PSPOCKET_TEST_AC_LIBC_MAP (game_executable.hpp).
