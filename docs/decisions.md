@@ -9727,3 +9727,75 @@ sampling, both tables in natural order: the DQT's zigzag order), and the picture
 measured (gray 52 dB, 4:4:4 45.5, 4:2:2 42.3, 4:2:0 40.0, 4:1:1 34.2); restart intervals of 1 to 40 MCUs (the markers'
 count and RST0-7 order, the same decoded image); what cannot be a JPEG (no width, past 65535, a plane too small, two
 components, a restart interval past 65535).
+
+## D-616 · 2026-10-10 · cellJpgEnc pspocket's own on its encoder, firmware-first; its structures inferred from libpngenc's
+
+libjpgenc writes JPEG files or buffers from pictures in memory (photos, screenshots). RPCS3's
+(rpcs3/Emu/Cell/Modules/cellJpgEnc.cpp/.h) has its error codes and its enums (colour spaces, sampling formats, DCT
+methods, compression modes, locations), stub bodies and no structures. No Sony module was at hand: the library is
+firmware-first (D-563), so where the system software is installed a game still gets Sony's libjpgenc, and pspocket's
+where it is not, on the encoder of D-615. Its ten functions are made as cellPngEnc's nine are (D-566: libpngenc is the
+same SDK family and design): the handle is the work memory the game gives Open (nothing is written there);
+EncodePicture encodes on the calling thread and queues its result, at most 4 waiting (then BUSY); WaitForInput,
+WaitForOutput (RESET when the encoder is reset during a blocking wait), GetStreamInfo (oldest first, EMPTY without
+one) and Reset as there; blocking waits sleep a millisecond at a time through lv2; output to the game's buffer (what
+fits; STREAM_OVERFLOW past limitSize) or to a file made or emptied through lv2's file calls (STREAM_FILE_OPEN when it
+cannot be).
+
+**The structures, inferred** (each from RPCS3 cellPngEnc.h's with what JPEG has in place of what PNG has):
+- CellJpgEncConfig {maxWidth, maxHeight, enableSpu (b8, +8), addMemSize (+12), exParamList, exParamNum} (24 bytes):
+  PNG's but for maxBitDepth (JPEG's samples are 8 bits). Checked as RPCS3 checks PNG's, with JPEG's limit: both sizes
+  1 to 65535 (SOF's 16-bit fields), addMemSize not negative, no extended parameters; else ARG.
+- CellJpgEncAttr {memSize, cmdQueueDepth (u8), versionUpper (+8), versionLower}, CellJpgEncResource {memAddr,
+  memSize, ppuThreadPriority, spuThreadPriority}, CellJpgEncResourceEx {memAddr, memSize, ppuThreadPriority, spurs,
+  priority[8]}, CellJpgEncOutputParam {location, streamFileName, streamAddr, limitSize} and CellJpgEncStreamInfo
+  {state, location, streamFileName, streamAddr, limitSize, streamSize, processedLine, userData (u64, +32)}: PNG's.
+- CellJpgEncPicture {width, height, pitchWidth, colorSpace, pictureAddr (+16), userData (u64, +24)} (32 bytes): PNG's
+  but for bitDepth and packedPixel. The pixels interleaved at full size: gray 1 byte, RGB, YCbCr (Y Cb Cr), RGBA and
+  ARGB (their alpha not encoded); pitchWidth at least a row.
+- CellJpgEncPicture2 (EncodePicture2's) {width, height, pitchWidth, colorSpace, samplingFormat (+16), pictureAddr
+  (+20), userData (+24)}: what the 2 is for is not known; taken as the picture with its sampling, which a YCbCr picture
+  from cellVdec or the camera has: FULL is CellJpgEncPicture's pixels; 4:4:4, 4:2:2, 4:2:0 and 4:1:1 a YCbCr picture's
+  planes one after another as cellVdec's YUV420_PLANAR lays them out (Y, height rows of pitchWidth bytes; then Cb, then
+  Cr, each the height over the vertical subsampling rows of pitchWidth over the horizontal subsampling bytes, both
+  rounded up). Its chroma is repeated over the samples it covers, which the encoder averages back: a JPEG at the
+  picture's own sampling has its chroma exactly.
+- CellJpgEncEncodeParam {enableSpu (b8), encodeColorSpace (+4), samplingFormat (+8), dctMethod (+12),
+  compressionMode (+16), compressionModeParam (+20)} (24 bytes): PNG's first two fields, then the enums in RPCS3's
+  order, each with its parameter. encodeColorSpace GRAYSCALE gives a gray JPEG (a colour picture's luma by T.871), any
+  other colour space a YCbCr one (JFIF), as every decoder reads them; samplingFormat its chroma, FULL (every component
+  at full size) as 4:4:4; dctMethod QUALITY (0) the double-precision DCT, FAST (5) the single-precision one;
+  compressionModeParam the quality, 1 to 100. In the stream size limit mode it is the highest quality: the stream is
+  made at the highest up to it whose stream fits limitSize (the qualities searched by halves, each stream measured),
+  else at quality 1 and cut to limitSize with STREAM_OVERFLOW; limitSize must be given then, for a file too.
+- The enums: RPCS3 writes them as one, so that its values run on from ARGB (20): sampling formats 21 to 25,
+  compression modes 6 and 7, locations 8 and 9. Taken as separate enums from 0, as libpngenc's location is (FILE 0,
+  BUFFER 1 in RPCS3 cellPngEnc.h): sampling formats YCbCr444 0, 422 1, 420 2, 411 3, FULL 4; CONSTANT_QUALITY 0,
+  STREAM_SIZE_LIMIT 1; FILE 0, BUFFER 1. The DCT methods are RPCS3's (QUALITY 0, FAST 5, libjpgdec's two values).
+
+**pspocket's answers where nothing is known:** QueryAttr's memSize is addMemSize + 0x10000 (0x40000 with SPUs) + 64
+bytes a column of maxWidth (the MCU rows a baseline encoder keeps), kept modest so that a game sized by Sony's numbers
+is not refused for memory pspocket does not use; cmdQueueDepth 4 and versionUpper 0x270000, versionLower 0, as
+libpngenc's (D-566). EncodePicture's checks: the handle, every structure in guest memory, width and height at least 1
+and at most the configuration's, a known colour space, a pitch of at least a row, the whole picture in guest memory, a
+known encode colour space, sampling format, DCT method and compression mode, a quality of 1 to 100, a file name for a
+file and an address and limit for a buffer: else ARG and nothing queued. enableSpu is noted once: the picture is
+encoded on the calling thread. SEQ, FATAL and STREAM_SKIP are never answered.
+
+To check on the Mac with Sony's libjpgenc (each guess above): the structures' layouts and sizes, the enums' values,
+QueryAttr's answers, the dimension and quality limits, what encodeColorSpace accepts and whether FULL writes RGB
+components, what the size limit mode limits (limitSize, or compressionModeParam as the limit) and what it does when it
+cannot, what EncodePicture2 takes, the stream's markers (JFIF's version, Sony's tables and their scaling by quality,
+restart intervals, optimised Huffman tables), the queue's depth and order, the stream information after Reset.
+The count: 5,942 of 6,625 library functions pspocket's own before, 5,952 after.
+Tests: tests/hle/test_jpgenc.cpp, 10 cases: the ten functions and the marker; QueryAttr's memory and every check of
+the configuration, Open, OpenEx and Close; RGB, RGBA, ARGB and YCbCr pictures with padded rows at every sampling, the
+same JPEG from each and the encoder's own from T.871's YCbCr, read back by pspocket's decoder within a PSNR (3 dB under
+the measured: 4:4:4 44.2 dB, 4:2:2 41.9, 4:2:0 41.6, 4:1:1 33.3); gray JPEGs from every colour space (the same), a
+gray picture as a YCbCr JPEG (neutral chroma); EncodePicture2's planes at every sampling (the encoder's JPEG of the
+chroma repeated, byte for byte) and at another sampling, FULL as EncodePicture, its refusals; qualities 1 to 100 (the
+tables, sizes and PSNR rising) and the fast method; the size limit mode (the highest quality that fits, the one above
+not; the quality asked for when it fits; a limit nothing fits: quality 1's first bytes, STREAM_OVERFLOW); the queue
+(four, BUSY, EMPTY, oldest first, userData, Reset, a buffer too small); WaitForOutput and WaitForInput blocking until
+another thread encodes or takes a stream, and RESET when it resets the encoder; a file on /dev_hdd0 (whole, and in the
+size limit mode) and one that cannot be made; every argument check of EncodePicture.
