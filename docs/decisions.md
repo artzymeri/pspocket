@@ -8313,3 +8313,51 @@ from (that information, or the access unit's codecSpecificData); a stream larger
 CellVdecDivxInfo's fields (Sony's block is 0x20 bytes for DivX and 0x18 for DivX 3.11 by RPCS3's attributes, both more
 than RPCS3's 16-byte structure) and MPEG-4's (0x38 bytes there: likely a structure of its own); the frame rate code of
 a stream that names none; the pictures, sample for sample.
+
+## D-589 · 2026-10-10 · cellVdec: VC-1's advanced profile on FFmpeg, its headers as the decoder's configuration
+
+VC-1 (codec 3) decodes with FFmpeg's vc1 decoder (D-588's build) at the advanced profile's levels
+(CELL_VDEC_VC1_AP_L0 to L4, 5 to 9), from elementary streams in SMPTE 421M's start code framing: sequence headers
+(0x0F), entry points (0x0E) and frames (0x0D), with fields, slices and user data passed to FFmpeg as they are. That is
+how the advanced profile is always carried (Blu-ray, HD DVD, MPEG-2 transport streams). RPCS3 does not decode VC-1 (its
+vdec_context throws for the type); its sizes and DecodeAu checks (mode 3, B and PB skipping together, VC-1's only) are
+what pspocket already had.
+
+- **Opening.** FFmpeg's VC-1 decoder takes the sequence header and entry point as its configuration (extradata): it
+  will not open without both, and does not read a sequence header in the stream. cellVdecOpen only checks the decoder
+  is there; the decoder's thread opens it at the first access unit for which the stream (it or earlier ones) gave both,
+  with their BDUs as the configuration. Access units before then are skipped (AUDONE, no picture), logged once, as
+  RPCS3 skips MPEG-2 and MPEG-4 access units before a sequence header (au_has_sequence_header). A sequence header that
+  differs from the one it opened with (another size, say) opens it again, after the pictures the old one holds are out;
+  the same header repeated (streams repeat it at every entry point) changes nothing. One FFmpeg refuses is logged and
+  its access units skipped.
+- **The simple and main profiles** (levels 0 to 4): their elementary streams have no start codes and no sequence header
+  (STRUCT_C and the frame size travel in the container: RCV, ASF), and how a game hands them to libsvc1d is not known
+  (RPCS3 has nothing; no such stream to read). cellVdecOpen refuses them, CELL_VDEC_ERROR_FATAL, logged, as it refused
+  all of VC-1 before; a simple or main profile sequence header met in a stream is logged once and not taken.
+- **Range mapping.** The entry point's RANGE_MAPY and RANGE_MAPUV scale the output picture's samples about 128 by
+  (R + 9) / 8 (rounded, held in range), the references staying as decoded. FFmpeg reads them and leaves the mapping out
+  ("expect wrong picture"), so pspocket applies it to the pictures the game gets, as the standard's output does. Sony's
+  svc1d might leave it to the game with the flags in its information block: to see on the Mac.
+- **CellVdecVc1Info.** RPCS3 has no structure for it (its cellVdec.h has the H.264, DivX and MPEG-2 ones); Sony's block
+  is 0x170 bytes by RPCS3's attributes for libsvc1d (VDEC_SCE_DECODER_UNK_MAP). pspocket's layout is its own: the
+  picture's size first (where Sony's blocks for H.264 and MPEG-2 begin), then the picture header's type (both fields'),
+  frame coding mode, field order and repetition, the sequence header's level, interlace, pulldown and sizes, its display
+  extension (display size, aspect ratio, frame rate as coded, colour description), and the entry point's broken link,
+  closed entry and range mapping (the offsets in cellVdec.cpp's write_vc1_info). Picture types I 0, P 1, B 2, BI 3,
+  skipped 4 (pspocket's numbering).
+- The decoder's thread kept an entry for every access unit it decoded (each picture's PTS and information come from
+  it); entries more than 64 access units old now go (FFmpeg gives a picture at most 16 behind its access unit).
+
+Tests: tests/hle/vc1_writer.hpp writes advanced profile streams (FFmpeg has no VC-1 encoder): a sequence header, entry
+points, I pictures whose blocks carry only a DC level (so each block decodes to a known flat value) and skipped P
+pictures. tests/hle/test_vdec_codecs.cpp: FFmpeg's own decoding gives the writer's pictures; through cellVdec, I,
+skipped, I, skipped at 64x48 with a display extension: the pictures exactly, AUDONE for each, PICOUT one access unit
+late, the items, every field of the information block; range mapping (luma by 16/8, chroma by 10/8) applied, pulldown's
+repeat count; access units before the headers skipped (the later pictures with their own PTS); a 32x32 sequence header
+after a 64x48 one, both pictures; levels 0 to 4 FATAL, 10 ARG; mode 3 taken (the picture marked skipped), mode 2 ARG.
+
+To compare with Sony's libvdec on the Mac, over the same streams: CellVdecVc1Info (its layout, picture types and what
+it reports of the headers), whether libsvc1d applies range mapping, the pictures sample for sample, access units before
+a sequence header (skipped, or an error), the frame buffers and the one-access-unit lag for VC-1, the simple and main
+profiles' framing (what their access units carry) and the sizes with codec specific information.

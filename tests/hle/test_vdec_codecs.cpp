@@ -1,9 +1,11 @@
-// cellVdec's codecs past H.264 (D-588): DivX 3.11 and MPEG-4 part 2 streams written by FFmpeg's own encoders (the
-// tests' build of FFmpeg, D-577), each decoded through pspocket's libvdec and compared with FFmpeg's own decoding of
-// the same packets: the answers, callbacks, picture items, information blocks and pixels. No game data.
+// cellVdec's codecs past H.264: DivX 3.11 and MPEG-4 part 2 streams written by FFmpeg's own encoders (the tests'
+// build of FFmpeg, D-577, D-588) and VC-1 written here (vc1_writer.hpp, D-589), each decoded through pspocket's libvdec
+// and compared with FFmpeg's own decoding of the same packets and with the pictures they hold: the answers, callbacks,
+// picture items, information blocks and pixels. No game data.
 
 #include <catch_amalgamated.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -11,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "vc1_writer.hpp"
 #include "vdec_test_util.hpp"
 
 #if PSPOCKET_HAVE_FFMPEG
@@ -23,12 +26,13 @@ extern "C" {
 using namespace pspocket;
 using namespace pspocket::hle::test;
 using namespace pspocket::hle::test::vdec_test;
+namespace v1 = pspocket::hle::test::vc1;
 
 #if PSPOCKET_HAVE_FFMPEG
 namespace {
 
-constexpr u32 CODEC_MPEG4 = 2, CODEC_DIVX = 5, CODEC_DIVX3_11 = 9;
-constexpr u32 CELL_VDEC_ERROR_ARG = 0x80610101;
+constexpr u32 CODEC_MPEG4 = 2, CODEC_VC1 = 3, CODEC_DIVX = 5, CODEC_DIVX3_11 = 9;
+constexpr u32 CELL_VDEC_ERROR_ARG = 0x80610101, CELL_VDEC_ERROR_FATAL = 0x80610180;
 
 // A picture in YUV 4:2:0 planes without padding, as cellVdec's GetPicture gives it.
 struct Yuv {
@@ -123,8 +127,10 @@ std::vector<std::vector<u8>> encode(AVCodecID id, int width, int height, int fra
     return packets;
 }
 
-// FFmpeg's own decoding of `packets` by decoder `id` (the frame size given for a codec whose stream has none).
-std::vector<Yuv> ffmpeg_decode(AVCodecID id, const std::vector<std::vector<u8>>& packets, int width = 0, int height = 0)
+// FFmpeg's own decoding of `packets` by decoder `id` (the frame size given for a codec whose stream has none; the
+// configuration for one that needs it).
+std::vector<Yuv> ffmpeg_decode(AVCodecID id, const std::vector<std::vector<u8>>& packets, int width = 0, int height = 0,
+    const std::vector<u8>& extradata = {})
 {
     std::vector<Yuv> out;
     const AVCodec* codec = avcodec_find_decoder(id);
@@ -133,6 +139,11 @@ std::vector<Yuv> ffmpeg_decode(AVCodecID id, const std::vector<std::vector<u8>>&
     av->width = av->coded_width = width;
     av->height = av->coded_height = height;
     av->thread_count = 1;
+    if (!extradata.empty()) {
+        av->extradata = static_cast<u8*>(av_mallocz(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+        std::memcpy(av->extradata, extradata.data(), extradata.size());
+        av->extradata_size = static_cast<int>(extradata.size());
+    }
     REQUIRE(avcodec_open2(av, codec, nullptr) == 0);
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
@@ -228,6 +239,94 @@ void check_divx_info(const std::vector<u8>& info, const DivxInfo& want)
     CHECK(be16(info, 14) == want.frame_rate);
     bool rest_zero = true;
     for (usize k = 16; k < info.size(); k++) rest_zero &= info[k] == 0;
+    CHECK(rest_zero);
+}
+
+// A picture's DC levels for the VC-1 writer, different for each `seed`: blocks from 83 to 172 (levels -40 to 39).
+v1::DcPicture dc_levels(int width, int height, int seed)
+{
+    v1::DcPicture p(width, height);
+    for (int by = 0; by < height / 8; by++)
+        for (int bx = 0; bx < width / 8; bx++)
+            p.y[static_cast<usize>(by * (width / 8) + bx)] = -40 + (bx * 11 + by * 7 + seed * 23) % 80;
+    for (int my = 0; my < height / 16; my++)
+        for (int mx = 0; mx < width / 16; mx++) {
+            p.cb[static_cast<usize>(my * (width / 16) + mx)] = -20 + (mx * 9 + my * 5 + seed * 13) % 40;
+            p.cr[static_cast<usize>(my * (width / 16) + mx)] = 30 - (mx * 7 + my * 11 + seed * 5) % 50;
+        }
+    return p;
+}
+
+std::vector<u8> concat(std::initializer_list<std::vector<u8>> parts)
+{
+    std::vector<u8> out;
+    for (const std::vector<u8>& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+
+// VC-1's range mapping of YUV 4:2:0 planes (SMPTE 421M's RANGE_MAPY and RANGE_MAPUV): each sample scaled about 128 by
+// (R + 9) / 8.
+std::vector<u8> range_mapped(std::vector<u8> yuv, int width, int height, int ry, int ruv)
+{
+    for (usize k = 0; k < yuv.size(); k++) {
+        const int r = k < static_cast<usize>(width * height) ? ry : ruv;
+        yuv[k] = static_cast<u8>(std::clamp((((yuv[k] - 128) * (r + 9) + 4) >> 3) + 128, 0, 255));
+    }
+    return yuv;
+}
+
+// CellVdecVc1Info's fields (pspocket's layout, D-589), the rest of the block zero.
+struct Vc1Info {
+    u16 width = 0, height = 0;
+    u8 type0 = 0, type1 = 0, fcm = 0, tff = 1, rff = 0, rptfrm = 0, level = 0, interlace = 0, pulldown = 0,
+       display_ext = 0;
+    u16 max_width = 0, max_height = 0, display_width = 0, display_height = 0;
+    u8 aspect = 0, framerate_flag = 0;
+    u16 aspect_width = 0, aspect_height = 0;
+    u8 framerate_ind = 0, framerate_nr = 0, framerate_dr = 0, color_flag = 0;
+    u16 framerate_exp = 0;
+    u8 prim = 0, transfer = 0, matrix = 0, broken_link = 0, closed_entry = 1, mapy_flag = 0, mapy = 0, mapuv_flag = 0,
+       mapuv = 0;
+};
+
+void check_vc1_info(const std::vector<u8>& info, const Vc1Info& w)
+{
+    CHECK(be16(info, 0x00) == w.width);
+    CHECK(be16(info, 0x02) == w.height);
+    CHECK(info[0x04] == w.type0);
+    CHECK(info[0x05] == w.type1);
+    CHECK(info[0x06] == w.fcm);
+    CHECK(info[0x07] == w.tff);
+    CHECK(info[0x08] == w.rff);
+    CHECK(info[0x09] == w.rptfrm);
+    CHECK(info[0x0A] == w.level);
+    CHECK(info[0x0B] == w.interlace);
+    CHECK(info[0x0C] == w.pulldown);
+    CHECK(info[0x0D] == w.display_ext);
+    CHECK(be16(info, 0x0E) == w.max_width);
+    CHECK(be16(info, 0x10) == w.max_height);
+    CHECK(be16(info, 0x12) == w.display_width);
+    CHECK(be16(info, 0x14) == w.display_height);
+    CHECK(info[0x16] == w.aspect);
+    CHECK(info[0x17] == w.framerate_flag);
+    CHECK(be16(info, 0x18) == w.aspect_width);
+    CHECK(be16(info, 0x1A) == w.aspect_height);
+    CHECK(info[0x1C] == w.framerate_ind);
+    CHECK(info[0x1D] == w.framerate_nr);
+    CHECK(info[0x1E] == w.framerate_dr);
+    CHECK(info[0x1F] == w.color_flag);
+    CHECK(be16(info, 0x20) == w.framerate_exp);
+    CHECK(info[0x22] == w.prim);
+    CHECK(info[0x23] == w.transfer);
+    CHECK(info[0x24] == w.matrix);
+    CHECK(info[0x25] == w.broken_link);
+    CHECK(info[0x26] == w.closed_entry);
+    CHECK(info[0x27] == w.mapy_flag);
+    CHECK(info[0x28] == w.mapy);
+    CHECK(info[0x29] == w.mapuv_flag);
+    CHECK(info[0x2A] == w.mapuv);
+    bool rest_zero = true;
+    for (usize k = 0x2B; k < info.size(); k++) rest_zero &= info[k] == 0;
     CHECK(rest_zero);
 }
 
@@ -369,6 +468,209 @@ TEST_CASE("cellVdec: CellVdecDivxInfo laid out as RPCS3's for DivX and MPEG-4: t
                 check_divx_info(d.infos[static_cast<usize>(i)], w);
             }
         }
+    }
+}
+
+TEST_CASE("cellVdec: VC-1's advanced profile on FFmpeg: a stream written here, its pictures, items and information "
+          "(D-589)", "[hle][vdec]")
+{
+    // A sequence header with its display extension (an extended pixel aspect ratio, 25 frames a second, a colour
+    // description), an entry point, then I, skipped P, I, skipped P (each I with the headers again, as streams repeat
+    // them).
+    v1::Sequence seq;
+    seq.display_width = 64;
+    seq.display_height = 48;
+    seq.aspect_ratio = 15;
+    seq.aspect_width = 4;
+    seq.aspect_height = 3;
+    seq.framerate_nr = 2; // 25
+    seq.framerate_dr = 1; // 1000
+    seq.color_prim = 1;
+    seq.transfer_char = 1;
+    seq.matrix_coef = 6;
+    const v1::Entry entry;
+    const v1::DcPicture a = dc_levels(64, 48, 0), b = dc_levels(64, 48, 1);
+    const std::vector<u8> headers = concat({v1::sequence_header(seq), v1::entry_point(entry)});
+    const std::vector<std::vector<u8>> aus = {concat({headers, v1::intra_frame(a, seq)}), v1::skipped_frame(seq),
+        concat({headers, v1::intra_frame(b, seq)}), v1::skipped_frame(seq)};
+    const std::vector<std::vector<u8>> want = {v1::samples(a), v1::samples(a), v1::samples(b), v1::samples(b)};
+    CHECK(v1::block_value(0) == 128);
+    CHECK(v1::block_value(8) == 137);
+    CHECK(v1::block_value(-40) == 83);
+
+    // FFmpeg's own decoding of the stream (its configuration the headers) gives the pictures the writer meant.
+    const std::vector<Yuv> ffmpeg = ffmpeg_decode(AV_CODEC_ID_VC1, aus, 0, 0, headers);
+    REQUIRE(ffmpeg.size() == want.size());
+    for (usize i = 0; i < want.size(); i++) CHECK(ffmpeg[i].data == want[i]);
+
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    Stream s;
+    s.codec = CODEC_VC1;
+    s.level = 6; // CELL_VDEC_VC1_AP_L1
+    s.aus = aus;
+    const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
+    INFO(all_lines(d.lines));
+    REQUIRE(d.open == 0);
+    CHECK(d.audone == 4);
+    CHECK(d.pictures_after_aus == 3); // one access unit late
+    CHECK(d.picout == 4);
+    CHECK(d.seqdone == 1);
+    REQUIRE(d.pictures.size() == want.size());
+    check_items(d, CODEC_VC1, 64, 48);
+    for (usize i = 0; i < want.size(); i++) {
+        INFO("picture " << i);
+        CHECK(d.pictures[i] == want[i]);
+        Vc1Info w;
+        w.width = w.max_width = w.display_width = 64;
+        w.height = w.max_height = w.display_height = 48;
+        w.type0 = w.type1 = i % 2 ? 4 : 0; // skipped, I
+        w.level = 1;
+        w.display_ext = 1;
+        w.aspect = 15;
+        w.aspect_width = 4;
+        w.aspect_height = 3;
+        w.framerate_flag = 1;
+        w.framerate_nr = 2;
+        w.framerate_dr = 1;
+        w.color_flag = 1;
+        w.prim = 1;
+        w.transfer = 1;
+        w.matrix = 6;
+        check_vc1_info(d.infos[i], w);
+    }
+}
+
+TEST_CASE("cellVdec: VC-1's range mapping applied to the pictures, pulldown in the information (D-589)", "[hle][vdec]")
+{
+    v1::Sequence seq;
+    seq.pulldown = true;
+    seq.tfcntrflag = true;
+    v1::Entry entry;
+    entry.range_mapy = 7;  // luma scaled by 16 / 8 about 128
+    entry.range_mapuv = 1; // chroma by 10 / 8
+    const v1::DcPicture a = dc_levels(64, 48, 2);
+    const std::vector<u8> headers = concat({v1::sequence_header(seq), v1::entry_point(entry)});
+    const std::vector<std::vector<u8>> aus = {concat({headers, v1::intra_frame(a, seq, 2)})};
+    // FFmpeg leaves the mapping out: its picture is the coded one.
+    const std::vector<Yuv> ffmpeg = ffmpeg_decode(AV_CODEC_ID_VC1, aus, 0, 0, headers);
+    REQUIRE(ffmpeg.size() == 1);
+    CHECK(ffmpeg[0].data == v1::samples(a));
+    const std::vector<u8> want = range_mapped(v1::samples(a), 64, 48, 7, 1);
+    CHECK(range_mapped({137, 128, 100}, 1, 1, 7, 7) == std::vector<u8>{146, 128, 72}); // by hand
+
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    Stream s;
+    s.codec = CODEC_VC1;
+    s.level = 9; // CELL_VDEC_VC1_AP_L4
+    s.aus = aus;
+    const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
+    INFO(all_lines(d.lines));
+    REQUIRE(d.pictures.size() == 1);
+    CHECK(d.pictures[0] == want);
+    Vc1Info w;
+    w.width = w.max_width = 64;
+    w.height = w.max_height = 48;
+    w.level = 1;
+    w.pulldown = 1;
+    w.rptfrm = 2;
+    w.mapy_flag = 1;
+    w.mapy = 7;
+    w.mapuv_flag = 1;
+    w.mapuv = 1;
+    check_vc1_info(d.infos[0], w);
+}
+
+TEST_CASE("cellVdec: VC-1 before its sequence header, a new sequence header, the simple and main profiles refused, "
+          "the decode modes (D-589)", "[hle][vdec]")
+{
+    v1::Sequence seq;
+    v1::Sequence small;
+    small.width = small.height = 32;
+    const v1::Entry entry;
+    const v1::DcPicture a = dc_levels(64, 48, 3), c = dc_levels(32, 32, 4);
+    const std::vector<u8> headers = concat({v1::sequence_header(seq), v1::entry_point(entry)});
+    InterpretMisses interpret;
+
+    SECTION("access units before the first sequence header and entry point are skipped")
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        Stream s;
+        s.codec = CODEC_VC1;
+        s.level = 5;
+        s.aus = {v1::skipped_frame(seq), concat({headers, v1::intra_frame(a, seq)}), v1::skipped_frame(seq)};
+        const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
+        INFO(all_lines(d.lines));
+        CHECK(d.audone == 3);
+        REQUIRE(d.pictures.size() == 2);
+        for (usize i = 0; i < 2; i++) {
+            INFO("picture " << i);
+            CHECK(d.pictures[i] == v1::samples(a));
+            CHECK(be32(d.items[i], 0x14) == 0x1000 + 3003 * (i + 1)); // the PTS of access units 1 and 2
+        }
+    }
+    SECTION("a different sequence header opens FFmpeg's decoder again, after the pictures it holds")
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        Stream s;
+        s.codec = CODEC_VC1;
+        s.level = 5;
+        s.aus = {concat({headers, v1::intra_frame(a, seq)}),
+            concat({v1::sequence_header(small), v1::entry_point(entry), v1::intra_frame(c, small)})};
+        const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
+        INFO(all_lines(d.lines));
+        CHECK(d.audone == 2);
+        REQUIRE(d.pictures.size() == 2);
+        CHECK(d.pictures[0] == v1::samples(a));
+        CHECK(d.pictures[1] == v1::samples(c));
+        CHECK(be32(d.items[1], 0x08) == 32 * 32 * 3 / 2);
+        CHECK(be16(d.infos[1], 0x00) == 32);
+        CHECK(be16(d.infos[1], 0x0E) == 32); // the new sequence header's
+    }
+    SECTION("the simple and main profiles' levels open FATAL; a level past the advanced profile's is ARG")
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        for (u32 level = 0; level < 5; level++) {
+            INFO("level " << level);
+            Stream s;
+            s.codec = CODEC_VC1;
+            s.level = level;
+            const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
+            CHECK(d.lines.size() == 2); // QueryAttrEx answered, OpenEx refused
+            CHECK(d.open == CELL_VDEC_ERROR_FATAL);
+        }
+        u8* b = f.base();
+        ps_write32(b, kType, CODEC_VC1);
+        ps_write32(b, kType + 4, 10);
+        ps_write32(b, kType + 8, 0);
+        CHECK(hle_calls(f, t)("cellVdecQueryAttrEx", 0xC982A84A, {kType, kAttr}) == CELL_VDEC_ERROR_ARG);
+    }
+    SECTION("B and PB skipping together is VC-1's (the picture marked skipped), PB skipping alone is not")
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        Stream s;
+        s.codec = CODEC_VC1;
+        s.level = 5;
+        s.aus = {concat({headers, v1::intra_frame(a, seq)})};
+        s.mode = 3;
+        const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
+        INFO(all_lines(d.lines));
+        REQUIRE(d.pictures.size() == 1);
+        CHECK(d.pictures[0] == v1::samples(a));
+        CHECK(be32(d.items[0], 0x44) == 1); // CELL_VDEC_PICITEM_ATTR_SKIPPED
+        s.mode = 2;
+        const Decoded e = decode_stream(f.base(), hle_calls(f, t), s);
+        INFO(all_lines(e.lines));
+        CHECK(e.audone == 0);
+        CHECK(e.pictures.empty());
+        CHECK(std::count(e.lines.begin(), e.lines.end(), "cellVdecDecodeAu -> 0x80610101") == 1);
     }
 }
 #endif

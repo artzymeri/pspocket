@@ -171,7 +171,8 @@ inline Decoded decode_stream(u8* b, const Call& call, const Stream& s)
         ps_write32(b, kType + 8, kSpec);
     }
     if (r("cellVdecQueryAttrEx", 0xC982A84A, {kType, kAttr}) != 0) return d;
-    const u32 res[6] = {kDecoderMem, ps_read32(b, kAttr), 1000, 0x4000, 200, 1};
+    // The memory asked for, at most what the fixture has (libvdec opens with less, D-196).
+    const u32 res[6] = {kDecoderMem, std::min(ps_read32(b, kAttr), kDecoderMemSize), 1000, 0x4000, 200, 1};
     for (u32 i = 0; i < 6; i++) ps_write32(b, kRes + 4 * i, res[i]);
     ps_write32(b, kCb, kOpd);
     ps_write32(b, kCb + 4, kLog);
