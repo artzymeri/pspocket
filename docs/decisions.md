@@ -9260,3 +9260,41 @@ hundred stub entries of the 8,192 per chunk) after the imports, so every chain o
 linked, and the on-demand links (cellDmuxPamf's, cellSail's) just find them. Libraries a game gets as Sony's modules
 are unaffected (their internal functions are the module's own). Tests: the loader's boot test checks every registered
 internal function has its descriptor after loading an executable that imports no cellDmux, cellDmux's among them.
+
+## D-904 · 2026-10-10 · sys_libc's last names against a game's copy of the SDK's C library (part 1: SPU, slots)
+
+The 132 names sys_libc and sys_libm still lacked (128 under sys_libm) were left out by D-514..D-516 because nothing
+described their signatures or structures. No firmware module has the C library (one firmware function imports sys_libc:
+memcpy) and no game imports it: a game links it into itself. So a game's copy is the reference: Assassin's Creed's
+EBOOT (BLES00158) holds the whole library of its SDK (Dinkumware's C99 library with Sony's additions: the locale-file
+machinery, the time tables, the SPU threads' local store accessors and their printf). It was read where it lies in the
+executable (by its strings, its TOC slots and its calls); nothing of it is in the repository.
+- The comparison fixture (tests/hle/game_executable.hpp): the executable loaded into a fresh process and never started,
+  its library's functions called by address under the interpreter next to pspocket's functions of the same names in the
+  same process. PSPOCKET_TEST_AC_EBOOT names the executable and PSPOCKET_TEST_AC_LIBC_MAP a file of "name 0xADDR"
+  lines, both game data kept in inventory/; the tests ("[gamelibc]") skip without them. The first comparison, _Printf,
+  already shows the SDK's float conversions rounding half away from zero and printing zeros past the 17th digit where
+  sys_libc prints the exact value (D-905 takes printf, scanf and the parsers; D-906 the locale and time internals).
+- spu_thread_read_* and spu_thread_write_* (30): lv2's sys_spu_thread_read_ls/write_ls a word at a time, as the SDK's
+  library does: a char or short is the byte or halfword of its aligned word, written back by reading, changing and
+  writing that word; an int, long, pointer or float is the word at the address as given (lv2 refuses a misaligned one;
+  the value is then 0 where the SDK's leaves its stack's bytes); a long long or double is that word and the next, high
+  first. A write answers lv2's result (the second word's for 64-bit values); read_mem reads a byte at a time into the
+  caller's memory and leaves r3 as the last read's result (the id when the size is 0); write_mem writes whole words while
+  more than four bytes remain and then merges the last one to four bytes into the word there, reading and writing it
+  back even for none. Compared with the game's on a running SPU thread made in the test: every read at sixteen
+  addresses, eighteen writes and write_mem of twelve lengths, the local store and the answers the same (r3 after a
+  float or double read is what each left there, as the ABI allows).
+- raw_spu_read_* and raw_spu_write_* (30): no executable seen links them, so they follow the SPU threads' ones word for
+  word on a raw SPU's local store, guest memory at 0xE0000000 + 0x100000 * id (D-528), read and written directly; an
+  address outside committed memory reads 0 and writes nothing, answering CELL_EFAULT.
+- _get_fd and _put_fd: Sony's table of 256 descriptor slots, 0..2 holding 0..2 and the rest free (-1), under the
+  library's lock 4: _get_fd(value, extra) takes the first free slot and answers its index, -1 when none is free;
+  _put_fd(index) frees a slot below 256. The SDK's open and close never use it. Compared with the game's table after its
+  start-up fills it.
+- _Getmem(size): Dinkumware's (Plauger's) call for raw memory from the system, here the main-area allocator, never
+  given back; NULL for 0 bytes or none left. The SDK's copies have none of their own (their malloc is dlmalloc, D-502).
+- _Atrealloc, _Once_ctor, _Once_dtor and the _d2rv, _rv2d, _Fd2rv, _Frv2d, _Ld2rv, _Lrv2d conversions: neither game's
+  executable links them and nothing describes them; they log the call and answer an error, as D-510's _Eadd and kin.
+Tests: tests/hle/test_libc_spu.cpp (both families on an SPU thread and a raw SPU, the slots, _Getmem, the unknown
+names), tests/hle/test_libc_spu_game.cpp (the comparisons); the SPU program builder moved to tests/hle/spu_program.hpp.

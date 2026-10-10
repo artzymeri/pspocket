@@ -15,6 +15,7 @@
 
 #include "guest.hpp"
 #include "hle_test_util.hpp"
+#include "spu_program.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/sync.hpp"
@@ -256,72 +257,10 @@ TEST_CASE("sys_libc: _Printf and _Scanf through the caller's functions", "[hle][
     CHECK(ps_read32(b, kCounter) == kStr + 10); // the '!' pushed back
 }
 
-namespace {
-
-// An SPU program at LS 0 with data after it, as a 32-bit big-endian SPU ELF (one PT_LOAD at LS 0, a PT_NOTE).
-struct SpuProgram {
-    std::vector<u32> words;
-    void emit(u32 insn) { words.push_back(insn); }
-    void load32(u32 rt, u32 v)
-    {
-        emit(as::ilhu(rt, static_cast<s32>(v >> 16)));
-        emit(as::iohl(rt, static_cast<s32>(v & 0xFFFF)));
-    }
-    // Bytes at LS `lsa` (the program grows to reach it).
-    void data(u32 lsa, const std::vector<u8>& bytes)
-    {
-        const usize need = (lsa + bytes.size() + 3) / 4;
-        if (words.size() < need) words.resize(need, 0);
-        for (usize i = 0; i < bytes.size(); i++) {
-            u32& w = words[(lsa + i) / 4];
-            const u32 shift = 8 * (3 - ((lsa + static_cast<u32>(i)) & 3));
-            w = (w & ~(0xFFu << shift)) | (u32{bytes[i]} << shift);
-        }
-    }
-    void write_elf(u8* b, u32 ea) const
-    {
-        const u32 size = static_cast<u32>(words.size() * 4);
-        std::memset(b + ea, 0, 0x200 + size);
-        static constexpr u8 kIdent[16] = {0x7F, 'E', 'L', 'F', 1, 2, 1, 0};
-        std::memcpy(b + ea, kIdent, 16);
-        ps_write16(b, ea + 0x10, 2);
-        ps_write16(b, ea + 0x12, 0x17);
-        ps_write32(b, ea + 0x14, 1);
-        ps_write32(b, ea + 0x18, 0);
-        ps_write32(b, ea + 0x1C, 0x34);
-        ps_write16(b, ea + 0x28, 0x34);
-        ps_write16(b, ea + 0x2A, 0x20);
-        ps_write16(b, ea + 0x2C, 2);
-        const u32 ph = ea + 0x34;
-        ps_write32(b, ph + 0x00, 1);
-        ps_write32(b, ph + 0x04, 0x100);
-        ps_write32(b, ph + 0x10, size);
-        ps_write32(b, ph + 0x14, size + 0x100);
-        ps_write32(b, ph + 0x18, 7);
-        ps_write32(b, ph + 0x20, 4);
-        ps_write32(b, ph + 0x24, 0x80);
-        ps_write32(b, ph + 0x30, 0x20);
-        for (usize i = 0; i < words.size(); i++) ps_write32(b, ea + 0x100 + 4 * static_cast<u32>(i), words[i]);
-    }
-};
-
-std::vector<u8> bytes_of(std::string_view s)
-{
-    std::vector<u8> v(s.begin(), s.end());
-    v.push_back(0);
-    return v;
-}
-
-std::vector<u8> quad32(u32 v) { return {u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
-
-std::vector<u8> quad64(u64 v)
-{
-    std::vector<u8> q(16, 0);
-    for (u32 i = 0; i < 8; i++) q[i] = static_cast<u8>(v >> (56 - 8 * i));
-    return q;
-}
-
-} // namespace
+using pspocket::test::bytes_of;
+using pspocket::test::quad32;
+using pspocket::test::quad64;
+using pspocket::test::SpuProgram;
 
 TEST_CASE("sys_libc: an SPU's spu_printf through the server, and spu_thread_snprintf", "[hle][libc][spu-threads]")
 {
