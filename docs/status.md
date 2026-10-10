@@ -314,7 +314,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-10: 5,686 of 6,625, 85.8%):
+firmware module. Done so far (2026-10-10: 5,691 of 6,625, 85.9%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -348,18 +348,21 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   that where the system software has the library's module it still serves the whole library: cellPngDec's and
   cellGifDec's Ext functions (stream input, partial output with display callbacks, D-595), cellVdecOpenExt, SetPts
   and DecodeAuEx2 (D-596).
+- cellRudp's Init, End and event handler, and sys_crashdump's log areas, firmware-first (D-607): the last functions
+  RPCS3 has bodies for. A scan of every grey function against RPCS3 found nothing more to make from it: the rest are
+  stubs or bare names there.
 - The threaded libraries checked for data races in a ThreadSanitizer build (D-571, -DPSPOCKET_TSAN=ON): cellFiber,
   libmixer, the C library's threads, cellPngEnc; then the whole runtime (D-584 to D-587, scripts/tsan.sh: 1,063
   reports to none, the guest code's own accesses suppressed with reasons). Fixed on the way: an SPU's call answered
   after a reply could land, a thread's stack freed after its join returned, RSX labels and FIFO pointers without
   ordering (a FIFO reset could lose a frame's commands), SPURS, libsync2 and the media threads' shared words.
-Left (939, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
+Left (934, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSpursJq (63, libspurs_jq), cellSailRec (58)
-  and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (31, its wire protocol), the codec
+  and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (28, its wire protocol), the codec
   cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 6, and
   the audio cores' operation tables and PTS functions, about 160 in all), cellJpgEnc (10, its structures), cellCelpEnc and
   cellCelp8Enc (19), cellJpgDec's Ext functions (5), cellNetAoi, libmedi, libad_core/async (32), cellSpurs' 13
-  and cellSync's 6 (libsre: Task2, the LF queues' second forms), and the small ones (sys_crashdump, sysConsoleId,
+  and cellSync's 6 (libsre: Task2, the LF queues' second forms), and the small ones (sysConsoleId,
   sysBdMediaId, sysPs2Disc, sys_lv2coredump, cellLibprof, cellSysconfPs1emu, cellGamePs1Emu, cellSysmodule's two,
   module management's six).
 - The 188 functions answered as RPCS3's stubs, in libraries pspocket always serves: their arguments and answers from
