@@ -302,6 +302,17 @@ s32 parse_ats_header(u8* base, u32 h, Decoder& d, u32 au)
 
 void write_float(u8* base, u32 at, f32 v) { ps_write32(base, at, std::bit_cast<u32>(v)); }
 
+// Whether [addr, addr + size) is guest memory, page by page: a frame is copied whole from where its unit starts.
+bool guest_range(lv2::PpuThread& t, u32 addr, u64 size)
+{
+    if (!size) return true;
+    if (u64{addr} + size > GuestMemory::kGuestSize) return false;
+    const u64 page = GuestMemory::host_page_size();
+    for (u64 a = addr & ~(page - 1); a < u64{addr} + size; a += page)
+        if (!t.kernel.memory().is_committed(static_cast<u32>(a))) return false;
+    return true;
+}
+
 // The decoded frame into the output in the PCM format asked for, interleaved in libatxdec's channel order (RPCS3).
 void convert(u8* base, u32 output, const AVFrame* frame, u32 samples, u32 nch_in, u32 bw_pcm, u32 ch_config)
 {
@@ -351,9 +362,17 @@ void decode_au(PPUContext& ctx, u32 h, Decoder& d, const Cmd& cmd)
     }
     u32 output = 0, decoded = 0; // LLE leaves the output address unset when the ATS header is bad
     if (err != error(CELL_ADEC_ERROR_ATX_ATSHDR)) {
+        const u32 frame_at = cmd.au_start + (ats ? 8 : 0), frame_bytes = ps_read32(base, dec + ax::d_nbytes);
         if (!d.config_is_set || !d.av) {
             // libatxdec's SPU program would crash (RPCS3 aborts): logged, reported as a fatal error, nothing out.
             PS_LOG_ERROR(kChan, "ATRAC3plus: a decode without a valid configuration (decoder {:#x})", h);
+            err = error(CELL_ADEC_ERROR_ATX_FATAL);
+            notify.error(err);
+        } else if (!guest_range(thread_of(ctx), frame_at, frame_bytes)) {
+            // The frame is copied whole from the unit's start, past a unit shorter than it; one that runs past guest
+            // memory would fault libatxdec's DMA. Logged, a fatal error, nothing out, as above (D-605).
+            PS_LOG_ERROR(kChan, "ATRAC3plus: a frame of {:#x} bytes at {:#010x} runs past guest memory (decoder {:#x})",
+                frame_bytes, frame_at, h);
             err = error(CELL_ADEC_ERROR_ATX_FATAL);
             notify.error(err);
         } else {
@@ -361,7 +380,7 @@ void decode_au(PPUContext& ctx, u32 h, Decoder& d, const Cmd& cmd)
             const u32 bw_pcm = ps_read32(base, dec + ax::d_bw_pcm), nch_out = ps_read32(base, dec + ax::d_nch_out);
             const u32 work = ps_read32(base, h + ax::work_mem);
             output = work + spurs_mem_size(nch_in);
-            std::memmove(base + work, base + cmd.au_start + (ats ? 8 : 0), nbytes); // as libatxdec copies it
+            std::memmove(base + work, base + frame_at, nbytes); // as libatxdec copies it
             d.packet->data = base + work;
             d.packet->size = static_cast<int>(nbytes);
             if (ps_read8(base, work) & 0x80) {
