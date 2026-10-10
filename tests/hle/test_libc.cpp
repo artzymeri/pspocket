@@ -604,24 +604,32 @@ TEST_CASE("sys_libc: the C locale and Dinkumware's conversion internals", "[hle]
     Fixture f;
     GuestThread t(f, 0, "ppu");
     u8* b = f.base();
+    // The SDK's setlocale knows "C" alone, whatever the category (D-906).
     CHECK(cstr(b, static_cast<u32>(t.call("setlocale", 0, 0))) == "C");
-    put(b, kA, "");
+    put(b, kA, "C");
     CHECK(cstr(b, static_cast<u32>(t.call("setlocale", 2, kA))) == "C");
-    put(b, kA, "fr_FR");
-    CHECK(t.call("setlocale", 0, kA) == 0);
-    CHECK(t.call("setlocale", 99, 0) == 0);
+    CHECK(cstr(b, static_cast<u32>(t.call("setlocale", 99, 0))) == "C");
+    for (const char* name : {"", "POSIX", "fr_FR", "C;collate:C", "c"}) {
+        INFO(name);
+        put(b, kA, name);
+        CHECK(t.call("setlocale", 0, kA) == 0);
+    }
     const u32 lc = static_cast<u32>(t.call("localeconv"));
     REQUIRE(lc != 0);
+    CHECK(lc == HleProcess::current()->link_variable("sys_libc", recomp::nid_of("_Locale")));
     CHECK(cstr(b, ps_read32(b, lc + 44)) == ".");
     CHECK(cstr(b, ps_read32(b, lc)).empty());
-    CHECK(b[lc + 28] == 0xFF); // CHAR_MAX of the PPU's unsigned char
-    CHECK(b[lc + 41] == 0xFF);
+    CHECK(b[lc + 28] == 0x7F); // CHAR_MAX of the SDK's library's signed char
+    CHECK(b[lc + 41] == 0x7F);
+    CHECK(cstr(b, ps_read32(b, lc + 64)) == "false");
+    CHECK(cstr(b, ps_read32(b, lc + 68)) == "true");
     // The class and case tables, entry 0 at the pointer, EOF before it.
     const u32 ct = static_cast<u32>(t.call("_Getpctype"));
     REQUIRE(ct != 0);
     CHECK((ps_read16(b, ct + 2 * 'a') & 0x10) != 0);   // _LO
     CHECK((ps_read16(b, ct + 2 * '7') & 0x20) != 0);   // _DI
-    CHECK((ps_read16(b, ct + 2 * '\t') & 0x400) != 0); // _XB: isblank
+    CHECK(ps_read16(b, ct + 2 * '\t') == 0x4C0); // _XB (isblank), _BB and _CN, as the SDK's table
+    CHECK(ps_read16(b, ct + 2 * '\n') == 0xC0);
     CHECK(ps_read16(b, ct - 2) == 0);                  // EOF
     CHECK(ps_read16(b, ct + 2 * 0xE9) == 0);
     const u32 lo = static_cast<u32>(t.call("_Getptolower"));

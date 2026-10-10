@@ -39,7 +39,6 @@ inline u32 catmask(s32 n) { return n <= 0 || n > 6 ? 0 : (1u << n) >> 1; }
 // The library's locale state, per process.
 struct LocaleState {
     std::mutex mutex;
-    std::unordered_map<u32, u32> global; // lv2 thread -> its global _Locimp (the SDK's thread-local pointer)
     u32 clocptr = 0;                     // _Locimp::_Clocptr
     u32 id_cnt = 0;                      // locale::id::_Id_cnt
     std::vector<u32> lazy;               // _Fac_head: the facets _Register queued, newest last
@@ -152,21 +151,11 @@ u32 id_value_(PPUContext& ctx, u32 self) { return id_value(ctx, self); }
 
 // ------------------------------------------------------------------------------------------------- _Locimp
 
-// The calling thread's global _Locimp (_Getgloballocale), 0 before its first _Init.
-inline u32 global_imp(PPUContext& ctx)
-{
-    LocaleState& s = lstate();
-    std::lock_guard lock(s.mutex);
-    const auto it = s.global.find(thread_of(ctx).id);
-    return it == s.global.end() ? 0 : it->second;
-}
+// The calling thread's global _Locimp, 0 before its first _Init: kept by the C library (its _Getgloballocale and
+// _Setgloballocale, a thread-local pointer in the SDK's, D-906), as the SDK's C++ library keeps it.
+inline u32 global_imp(PPUContext& ctx) { return static_cast<u32>(libc_fn::getgloballocale(ctx, {})); }
 
-inline void set_global_imp(PPUContext& ctx, u32 imp)
-{
-    LocaleState& s = lstate();
-    std::lock_guard lock(s.mutex);
-    s.global[thread_of(ctx).id] = imp;
-}
+inline void set_global_imp(PPUContext& ctx, u32 imp) { libc_fn::setgloballocale(ctx, {imp}); }
 
 // _Locimp(bool _Transparent): facet(1), no facets, no categories, named "*".
 inline void imp_construct(PPUContext& ctx, u32 self, bool transparent)

@@ -166,7 +166,8 @@ inline const Callee malloc{"sys_libc", "malloc"}, free{"sys_libc", "free"}, real
     mtxlock{"sys_libc", "_Mtxlock"}, mtxunlock{"sys_libc", "_Mtxunlock"}, lock{"sys_libc", "_Locksyslock"},
     unlock{"sys_libc", "_Unlocksyslock"}, atexit{"sys_libc", "_Atexit"}, getpmbstate{"sys_libc", "_Getpmbstate"},
     getpwcstate{"sys_libc", "_Getpwcstate"}, getpcostate{"sys_libc", "_Getpcostate"},
-    getpwcostate{"sys_libc", "_Getpwcostate"};
+    getpwcostate{"sys_libc", "_Getpwcostate"}, getgloballocale{"sys_libc", "_Getgloballocale"},
+    setgloballocale{"sys_libc", "_Setgloballocale"};
 } // namespace libc_fn
 
 // The guest address of a host variable of sys_libc (its FILEs, the ctype tables).
