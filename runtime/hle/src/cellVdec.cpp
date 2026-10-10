@@ -820,7 +820,7 @@ struct Vdec {
     lv2::WaitQueue waiters; // the decoder's thread, waiting for a command
     std::deque<Picture> held, out; // decoded but not announced; announced, for the game
     u32 pictures = 0, frames = 0, frame_size = 0, frame_width = 0, frame_height = 0;
-    u32 frame_rate = 0; // cellVdecSetFrameRate
+    u32 frame_rate = 0; // cellVdecSetFrameRate's: set on the decoder's thread, under m
     u64 thread_id = 0;
     u32 tls = 0;
     AvcSps sps;
@@ -1164,7 +1164,11 @@ void run(PPUContext& ctx, Vdec& v)
             callback(ctx, v, MSG_SEQDONE);
             break;
         }
-        case Command::framerate: v.frame_rate = c.frame_rate; break;
+        case Command::framerate: {
+            std::lock_guard lk(v.m); // GetPicItem reads it on the game's thread (D-601)
+            v.frame_rate = c.frame_rate;
+            break;
+        }
         case Command::close: return;
         }
     }
