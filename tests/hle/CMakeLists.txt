@@ -33,6 +33,7 @@ target_sources(test_hle PRIVATE
     test_codec_cores_compare.cpp
     test_vpost_compare.cpp
     test_pngenc_compare.cpp
+    test_jpgenc_compare.cpp
     test_libmixer_compare.cpp
     test_fiber_compare.cpp
     test_vdec_codecs_compare.cpp)

@@ -9853,3 +9853,28 @@ time); from a stream (20 bytes, then 37 at a time: every call's decodedStrmSize,
 ReadHeader), the plain functions on such a stream; the stop between parts; the refusals (a buffer mode, extInfo,
 a file source, the stream's bytes not guest memory, a stream cut in the header and in the scan, no place for the next
 part, the first part's place).
+
+## D-618 · 2026-10-10 · cellJpgEnc's comparison with Sony's libjpgenc, ready for the Mac
+
+cellJpgEnc is firmware-first (D-616) and its structures are guesses, so it gets its comparison as D-597's libraries
+have theirs (tests/hle/test_jpgenc_compare.cpp over compare_util.hpp, hidden: "[compare][jpgenc]"). It is where a
+session on the Mac finds out which guesses hold: one that does not shows as an answer (Sony's ARG where pspocket
+encodes, or the reverse), a frame header of another size or sampling, a stream information laid out otherwise.
+The same calls go to both halves: QueryAttr for twelve configurations (sizes to 65535 and past, SPUs, addMemSize,
+an extended parameter); Open's and OpenEx's checks and the handle; pictures in every colour space at every sampling
+format and as gray, the qualities 1 to 100, the fast method, enableSpu, EncodePicture2 with FULL and with a YCbCr
+picture's 4:2:0 planes; the stream size limit mode (a limit between two qualities' streams, then 300 bytes); the queue
+(four, BUSY, oldest first, Reset); a buffer too small; a file, and one that cannot be made; EncodePicture's checks;
+an encoder opened for SPUs.
+Compared: every answer, attribute and stream information (but its size); each JPEG whole or not, its length as
+streamSize, the 64 bytes past it, its frame header, quantisation tables (Sony's scaling of the quality), Huffman
+tables and scan header; whether pspocket's decoder (which decodes as libjpgdec does, D-200) reads it and what it
+reads: the picture within 10 steps of the other half's at qualities of 85 and up (where only the two encoders' rounding
+should differ), and its PSNR against the picture within 10% at every quality. Notes, not compared: the markers in
+order with their restart markers and the APP0 (Sony may write other APPn or COM segments, another JFIF version or
+density), each stream's size, the quality the size limit mode chose (its luma DC quantiser).
+PSPOCKET_COMPARE_SELF=1 runs it here: 816 observations, the halves agree, and pspocket's own values are checked
+(its memory measure, the handle, the frame headers of 4:2:0, 4:1:1 and gray, the size limit, the queue, the file, the
+refusals). Its function names are checked in every ctest run, with the library still firmware-first. When it matches
+on the Mac (after the fixes it shows), the test loses its [.] with cellJpgEnc's firmware-first marker, in a decision
+of its own.
