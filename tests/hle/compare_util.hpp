@@ -579,11 +579,15 @@ private:
             else if (bad++ == 0) first = i;
         }
         within_ += close;
+        const std::string steps = std::format(" by more than {} step{}", r.steps, r.steps == 1 ? "" : "s");
+        const std::string rule = r.kind != Rule::Kind::Steps ? std::string()
+            : r.exact_stride ? std::format("{} (the byte at +{} of each {} exactly)", steps, r.exact_offset,
+                                   r.exact_stride)
+                             : steps;
         if (bad)
             differ(std::format("{}: {} of {} bytes differ{}, the first at +{:#x}: pspocket {:#04x} | {} {:#04x}; the "
                                "largest difference {}",
-                a.key, bad, a.bytes.size(), r.kind == Rule::Kind::Steps ? std::format(" by more than {}", r.steps) : "",
-                first, a.bytes[first], theirs_name_, b.bytes[first], worst));
+                a.key, bad, a.bytes.size(), rule, first, a.bytes[first], theirs_name_, b.bytes[first], worst));
     }
 
     void compare_data(const std::vector<Data>& a, const std::vector<Data>& b)
