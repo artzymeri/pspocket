@@ -18,6 +18,12 @@ if(TARGET pspocket::libpng)
     target_link_libraries(test_hle PRIVATE pspocket::libpng)
 endif()
 
+# The comparisons with Sony's modules of the firmware-first libraries and of cellVdec's newest codecs (D-597): hidden,
+# run with test_hle "[compare]"; skipped without the firmware (PSPOCKET_TEST_DEV_FLASH), where PSPOCKET_COMPARE_SELF=1
+# runs pspocket's half twice instead.
+target_sources(test_hle PRIVATE
+    test_key2char_compare.cpp)
+
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.
 add_executable(make_boot_programs make_boot_programs.cpp)
