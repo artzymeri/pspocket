@@ -9484,3 +9484,48 @@ back, the same each time, two other consoles giving other answers, no output and
 key, the export absent; the variable's size and alignment, its layout when linked after a load, loads and unloads with
 their dependencies and variants, an internal module, the debug path and back, the container taken, given up and
 refused); tests/hle/test_hle.cpp's NID check takes RPCS3's "_0x" name.
+
+## D-625 · 2026-10-10 · cellSync's LF queue: the second forms for ANY2ANY queues and the lv2 event queue, unverified
+
+The six cellSync functions pspocket lacked (RPCS3's todo stubs answering CELL_OK; no libsre here to read) are
+pspocket's own (runtime/hle/src/cellSync.cpp), unverified (D-594), made from what RPCS3's code shows of them and from
+the queue's own layout:
+- **The second forms** (_cellSyncLFQueueGetPushPointer2, GetPopPointer2, CompletePushPointer2, CompletePopPointer2).
+  RPCS3's PushBody and PopBody call them for a CELL_SYNC_QUEUE_ANY2ANY queue, with the first forms' arguments
+  ("arguments copied from" the first forms; GetPopPointer2 without arg4), and the first forms refuse ANY2ANY (PERM).
+  Initialize sets an ANY2ANY queue up apart (m_buffer's bit 0, m_bs[0..1] 0xFF, m_v1 all ones, push2 and pop2 0xFFFF,
+  m_h3 and m_h7 zeroed), and libsre's cellSyncLFQueueClear (RPCS3's, which libsre agrees with, D-169) reads the waiter
+  rings' heads and tails from m_h7 and m_h3 for ANY2ANY. So the second forms are the first forms' algorithm on both
+  sides from the PPU: the claim against the other side's completed counter, the completion bitmap, the oldest SPU waiter
+  of the side's ring taken and signalled through fpSendSignal (noQueueFull as in the first form), with the rings' packs
+  in m_h7 (pushes) and m_h3 (pops), and no event state. PERM unless the queue is ANY2ANY; the queue's memory and
+  alignment are checked as in the first forms (D-042). A blocked call sleeps until the line changes, whatever
+  useEventQueue says: in ANY2ANY the words the first forms keep the event state in are the rings' packs, so there is no
+  state to sleep on the lv2 queue with, and the event queue's one-pointer-at-a-time BUSY does not apply. PushBody and
+  PopBody take ANY2ANY queues through them (they answered NOSYS).
+- **The lv2 event queue** (_cellSyncLFQueueAttachLv2EventQueue(spus, num, queue) and Detach, RPCS3's arguments): the
+  queue a PPU thread blocked in the pointer functions with useEventQueue receives from (m_eq_id), connected to the SPU
+  threads whose side of the library sends the wake-up. A PPU queue "_sncLFQ" of 127 entries (an SPU never finds it
+  full), connected (sys_spu_thread_connect_event, the user event type) to SPU port p of every thread listed, p the lowest
+  of 0x10..0x3F free on all of them (SPURS' dynamic range, D-040); m_bs = p as one big-endian word (RPCS3 tests m_bs as a
+  word: all ones is "none") and m_eq_id = the queue, in one update of the line. Detach takes the port off every thread,
+  destroys the queue and puts m_bs back as Initialize left it. Checks: the queue and the list NULL, the queue
+  128-aligned, num 0 (INVAL), memory (FAULT); an SPU2SPU queue PERM (it has no PPU side); attaching twice and detaching
+  none STAT; detaching while a PPU thread waits on it (its side's event state set) BUSY; a port free on no thread BUSY;
+  lv2's answers (a thread that does not exist: ESRCH) as they are, with what was connected undone.
+
+To compare with libsre on the Mac (each a guess until then): the second forms' algorithm, above all how SPU code waits
+in ANY2ANY (the rings in m_h7 and m_h3, m_bs[0..1] and m_v1) and how libsre's PPU sleeps there; the event queue's name,
+size, protocol and port; where the port goes (m_bs as a word, or one of its bytes, as the SPU side of the library reads
+it); the attach's checks and errors (num 0, SPU2SPU, a second attach). A game's own SPU code that reads the port
+elsewhere would send its wake-up to the wrong port, and a PPU thread waiting in a pointer function with useEventQueue
+would then wait for ever (the bodies never use the event queue).
+
+Tests: tests/hle/test_sync.cpp: the six under their NIDs and unverified; the second forms' checks and PERM (and the first
+forms' for ANY2ANY), pointers on both sides completed out of order, AGAIN full and empty, the wrap at 2 * depth, the
+rings' packs untouched, a blocked push and pop woken by the other side's completion; SPU waiters in m_h7 and m_h3 taken
+and signalled through a guest function, noQueueFull waiting for the ring, Clear BUSY with a waiter; four PPU threads (two
+pushers, two poppers) through the bodies, 3,000 entries each popped once and each pusher's in order; the attach and
+detach on two SPU threads (a port the game took passed by, the queue and m_bs, a thread that does not exist: ESRCH with
+nothing left connected), an SPU thread's sys_spu_thread_send_event on the port it was given waking a PPU thread blocked
+in GetPushPointer with the event queue, BUSY while one waits, an ANY2ANY queue's m_bs back to 0xFFFF0000.

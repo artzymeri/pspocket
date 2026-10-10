@@ -4,6 +4,7 @@
 // (spurs_scheduler.cpp, spurs_taskset.cpp, spurs_jobchain.cpp, spurs_custom.cpp): error codes, guest structure offsets
 // (RPCS3 cellSpurs.h layouts, checked against libsre where noted, D-047) and the host side of each SPURS instance.
 
+#include <functional>
 #include <map>
 #include <string>
 #include <memory>
@@ -331,5 +332,14 @@ s32 sync_lfqueue_initialize(PPUContext& ctx, u32 queue, u32 buffer, u32 size, u3
 // _cellSyncLFQueueCompletePopPointer(queue, pointer, fpSendSignal, noQueueFull) (cellSync.cpp), for cellDaisy's
 // LFQueue2CompletePopPointer: CELL_OK, a CELL_SYNC_ERROR_* or the signal function's result.
 s32 sync_lfqueue_complete_pop_pointer(PPUContext& ctx, u32 queue, s32 pointer, u32 signal_fn, u32 no_queue_full);
+
+// A signal function on the host for an LF queue's completion: (eaSignal, the waiter's ID) -> what the completion
+// answers (the guest's fpSendSignal is called with the same two arguments).
+using LfSignal = std::function<s32(PPUContext& ctx, u32 ea_signal, u32 waiter)>;
+// _cellSyncLFQueuePushBody or PopBody (cellSync.cpp: `push`, its checks and both directions' forms, ANY2ANY's second
+// ones) with `signal` waking the waiter a completion takes, for cellSpurs' _cellSpursLFQueuePushBody and PopBody
+// (D-628): CELL_OK, a CELL_SYNC_ERROR_* or the signal's result.
+s32 sync_lfqueue_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push,
+    const LfSignal& signal);
 
 } // namespace pspocket::hle::spurs

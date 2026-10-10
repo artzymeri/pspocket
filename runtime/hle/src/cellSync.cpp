@@ -6,12 +6,12 @@
 // differ pspocket follows libsre (each place says so). The mutex is what Assassin's Creed (BLES00158) imports (run 090:
 // its main thread polls cellSyncMutexTryLock, 24.3 million calls in 90 s while it was unimplemented; D-160).
 //
-// Not here: the LFQueue functions RPCS3 leaves as todo stubs returning CELL_OK (_cellSyncLFQueueGetPushPointer2,
-// _cellSyncLFQueueCompletePushPointer2, _cellSyncLFQueueGetPopPointer2, _cellSyncLFQueueCompletePopPointer2,
-// _cellSyncLFQueueAttachLv2EventQueue, _cellSyncLFQueueDetachLv2EventQueue): queues between any processors
-// (CELL_SYNC_QUEUE_ANY2ANY) and attaching the lv2 event queue a blocked PPU call sleeps on. They stay unimplemented
-// (CLAUDE.md rule 4: an error, never a silent success); PushBody and PopBody refuse an ANY2ANY queue with
-// CELL_SYNC_ERROR_NOSYS where RPCS3 copies an entry at a pointer nothing handed out.
+// The LFQueue functions RPCS3 leaves as todo stubs returning CELL_OK are pspocket's own (D-625), made from what RPCS3's
+// code shows of them, unverified (D-594: libsre is to be compared on the Mac): the second forms
+// (_cellSyncLFQueueGetPushPointer2, CompletePushPointer2, GetPopPointer2, CompletePopPointer2) are the pointer
+// functions of a queue between any processors (CELL_SYNC_QUEUE_ANY2ANY), which RPCS3's PushBody and PopBody call for
+// one with the first forms' arguments; and _cellSyncLFQueueAttachLv2EventQueue and DetachLv2EventQueue make and connect
+// the lv2 event queue (m_eq_id) a blocked PPU call of the pointer functions sleeps on, which SPU code sends to.
 //
 // Atomicity. Every structure is shared with SPU code (the SPU side of the library updates them with GETLLAR/PUTLLC) and
 // other PPU threads, and lies in one 128-byte line (mutex and barrier 4 bytes, rwm 16, queue 32, LFQueue 128, each aligned
@@ -43,6 +43,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
@@ -50,6 +51,7 @@
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "spurs.hpp" // spurs::sync_lfqueue_initialize
 
@@ -745,8 +747,16 @@ s32 cellSyncQueueClear(PPUContext& ctx, u32 queue)
 // The whole queue is one line, so each pass of RPCS3's (and libsre's) loops is one update of the line here: what the
 // pass reads comes from one snapshot, and it stores only if nothing in the line changed since, which is what libsre's
 // lwarx/stwcx. on the line give (its reservation granule is the line).
+//
+// ANY2ANY (D-625): Initialize sets such a queue up differently (m_buffer's bit 0, m_bs[0..1] 0xFF, m_v1 all ones, push2
+// and pop2 0xFFFF, m_h3 and m_h7 zeroed), and libsre's (and RPCS3's) cellSyncLFQueueClear reads its waiter rings' heads
+// and tails from m_h7 and m_h3 instead of push2 and pop2: in ANY2ANY those two words of push1 and pop1 are the rings'
+// packs, not the event states. The second forms are therefore the first forms' counters and completion bitmap on both
+// sides of the queue, the rings' packs in m_h7 (pushes) and m_h3 (pops), and no event state: a blocked call sleeps until
+// the line changes, as a first form without the event queue does.
 
-constexpr u32 CELL_SYNC_QUEUE_SPU2PPU = 1, CELL_SYNC_QUEUE_PPU2SPU = 2, CELL_SYNC_QUEUE_ANY2ANY = 3;
+constexpr u32 CELL_SYNC_QUEUE_SPU2SPU = 0, CELL_SYNC_QUEUE_SPU2PPU = 1, CELL_SYNC_QUEUE_PPU2SPU = 2,
+              CELL_SYNC_QUEUE_ANY2ANY = 3;
 
 namespace lfq_off {
 constexpr u32 pop1 = 0x00, push1 = 0x08, size = 0x10, depth = 0x14, buffer = 0x18, bs = 0x20, direction = 0x24,
@@ -759,15 +769,21 @@ namespace lfh {
 constexpr u32 done = 0, bits = 2, event = 4, next = 6;
 }
 
-// The PPU's side of a queue: pushing into PPU2SPU queues, popping from SPU2PPU ones. `own` and `other` are the counters
-// of this side and the opposite one, `pack` and `waiters` this side's waiter ring.
+// The PPU's side of a queue: pushing into PPU2SPU queues, popping from SPU2PPU ones, or either in an ANY2ANY queue (the
+// second forms). `own` and `other` are the counters of this side and the opposite one, `pack` and `waiters` this side's
+// waiter ring (whom its completions wake: SPU code waiting for an entry, or for room).
 struct LfSide {
     bool push;
     u32 direction;
     u32 own, other, pack, waiters;
+    bool any2any = false; // the second forms: no event state (own + lfh::event is the ring's pack)
 };
 constexpr LfSide kPushSide{true, CELL_SYNC_QUEUE_PPU2SPU, lfq_off::push1, lfq_off::pop1, lfq_off::push2, lfq_off::hs1};
 constexpr LfSide kPopSide{false, CELL_SYNC_QUEUE_SPU2PPU, lfq_off::pop1, lfq_off::push1, lfq_off::pop2, lfq_off::hs2};
+constexpr LfSide kPushSide2{true, CELL_SYNC_QUEUE_ANY2ANY, lfq_off::push1, lfq_off::pop1, lfq_off::push1 + 4,
+    lfq_off::hs1, true};
+constexpr LfSide kPopSide2{false, CELL_SYNC_QUEUE_ANY2ANY, lfq_off::pop1, lfq_off::push1, lfq_off::pop1 + 4,
+    lfq_off::hs2, true};
 
 // The queue checks of the functions RPCS3 checks the queue in: NULL_POINTER (the queue or `out`, the address the
 // function writes to; 0 for none), ALIGN (128), then the queue's memory and `out`'s 4 bytes (D-042).
@@ -908,17 +924,22 @@ s32 cellSyncLFQueueInitialize(PPUContext& ctx, u32 queue, u32 buffer, u32 size, 
 // whatever it did. `pointer` (guest address, 0 for none) gets every pointer handed out; `position` the last.
 // `copy`: PushBody's and PopBody's buffer (0 for none), checked with the entry the pointer gives before the pass stores,
 // so a refused call leaves the queue as it was.
+// The second forms (side.any2any, D-625): PERM unless the queue is ANY2ANY; the same claim with no event state (the
+// word is the ring's pack there): without room, AGAIN when not blocking, else the next pass once the line changed,
+// whatever useEventQueue says (it only chooses how libsre's PPU sleeps; here it sleeps on the line either way).
 s32 lf_get_pointer(PPUContext& ctx, std::string_view fn, u32 queue, const LfSide& side, u32 is_blocking, u32 use_event_queue,
     u32 pointer, s32& position, u32 copy)
 {
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
     if (ps_read32(base, queue + lfq_off::direction) != side.direction) {
-        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_PERM, "CELL_SYNC_ERROR_PERM: the queue goes the other way");
+        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_PERM, side.any2any
+            ? "CELL_SYNC_ERROR_PERM: not an ANY2ANY queue" : "CELL_SYNC_ERROR_PERM: the queue goes the other way");
     }
     if (pointer) {
         if (const s32 rc = check_memory(ctx, fn, queue, "pointer", pointer, 4); rc != lv2::CELL_OK) return rc;
     }
+    if (side.any2any) use_event_queue = 0;
     const s32 depth = static_cast<s32>(ps_read32(base, queue + lfq_off::depth));
     bool received = false; // RPCS3 var1
     for (;;) {
@@ -930,7 +951,7 @@ s32 lf_get_pointer(PPUContext& ctx, std::string_view fn, u32 queue, const LfSide
         const u64 version = ps_res_version(queue);
         reservation_op(base, queue, [&](u8* q) {
             claimed = bad_memory = false;
-            u16 event = ps_read16(q, side.own + lfh::event);
+            u16 event = side.any2any ? 0 : ps_read16(q, side.own + lfh::event);
             if (received) event = 0;
             if (is_blocking && use_event_queue && ps_read32(q, lfq_off::bs) == 0xFFFFFFFF) {
                 res = error(CELL_SYNC_ERROR_STAT);
@@ -975,7 +996,7 @@ s32 lf_get_pointer(PPUContext& ctx, std::string_view fn, u32 queue, const LfSide
                     }
                 }
             }
-            ps_write16(q, side.own + lfh::event, event);
+            if (!side.any2any) ps_write16(q, side.own + lfh::event, event); // ANY2ANY: the ring's pack, left alone
             next = !event || res != lv2::CELL_OK ? Next::Return : Next::Receive;
             return true;
         });
@@ -1019,14 +1040,18 @@ s32 lf_get_pointer(PPUContext& ctx, std::string_view fn, u32 queue, const LfSide
 // the completion in between; here both are one update from one snapshot, so that cannot fail. The push side checks
 // var2 + var4 after storing the pack: RPCS3 ensures it is below 16, libsre asserts only above 16 and goes on: as libsre.
 // A signal without a signal function (PushBody and PopBody pass none, in RPCS3 and in libsre) is RPCS3's ensure and
-// libsre's assertion: a fatal log.
+// libsre's assertion: a fatal log. `host_signal`, when given, is the signal function (cellSpurs' bodies, which signal
+// SPURS tasks: D-628) in place of a guest one.
+// The second forms (side.any2any, D-625): PERM unless the queue is ANY2ANY; the same completion, the ring's pack read
+// from and written to m_h7 (pushes) or m_h3 (pops).
 s32 lf_complete_pointer(PPUContext& ctx, std::string_view fn, u32 queue, const LfSide& side, s32 pointer, u32 signal_fn,
-    u32 no_queue_full)
+    u32 no_queue_full, const spurs::LfSignal* host_signal = nullptr)
 {
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
     if (ps_read32(base, queue + lfq_off::direction) != side.direction) {
-        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_PERM, "CELL_SYNC_ERROR_PERM: the queue goes the other way");
+        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_PERM, side.any2any
+            ? "CELL_SYNC_ERROR_PERM: not an ANY2ANY queue" : "CELL_SYNC_ERROR_PERM: the queue goes the other way");
     }
     const s32 depth = static_cast<s32>(ps_read32(base, queue + lfq_off::depth));
     for (;;) {
@@ -1061,12 +1086,12 @@ s32 lf_complete_pointer(PPUContext& ctx, std::string_view fn, u32 queue, const L
                     PS_FATAL(kChan, "{}({:#x}, pointer {}): var9 {}, var8 {}, var2 {}; RPCS3 ensures 16 - var2 <= 1 and libsre "
                         "(fw 4.92) asserts it here", fn, queue, pointer, var9, var8, var2);
                 }
-                if (!signal_fn) {
+                if (!signal_fn && !host_signal) {
                     PS_FATAL(kChan, "{}({:#x}, pointer {}): SPU code waits on this side of the queue and there is no signal "
                         "function to wake it (PushBody and PopBody pass none); RPCS3 ensures and libsre (fw 4.92) asserts "
                         "fpSendSignal here", fn, queue, pointer);
                 }
-                if (!memory_ok(t, signal_fn, 8)) {
+                if (!host_signal && !memory_ok(t, signal_fn, 8)) {
                     next = Next::BadSignal;
                     return false;
                 }
@@ -1093,7 +1118,9 @@ s32 lf_complete_pointer(PPUContext& ctx, std::string_view fn, u32 queue, const L
         });
         switch (next) {
         case Next::Done: return lv2::CELL_OK;
-        case Next::Signal: return static_cast<s32>(call_guest(ctx, signal_fn, {ea_signal, waiter}));
+        case Next::Signal:
+            if (host_signal) return (*host_signal)(ctx, ea_signal, waiter);
+            return static_cast<s32>(call_guest(ctx, signal_fn, {ea_signal, waiter}));
         case Next::BadSignal:
             return refuse(ctx, fn, queue, CELL_SYNC_ERROR_FAULT, std::format("the signal function's descriptor ({:#x}) is "
                 "not guest memory; refused with CELL_SYNC_ERROR_FAULT", signal_fn));
@@ -1133,21 +1160,56 @@ s32 _cellSyncLFQueueCompletePopPointer(PPUContext& ctx, u32 queue, s32 pointer, 
     return lf_complete_pointer(ctx, fn, queue, kPopSide, pointer, signal_fn, no_queue_full);
 }
 
+// The second forms (D-625, unverified: RPCS3's are todo stubs whose arguments are "copied from" the first forms; its
+// PushBody and PopBody call them for ANY2ANY queues with the first forms' arguments, GetPopPointer2 without arg4): the
+// pointer functions of an ANY2ANY queue, either side from the PPU (lf_get_pointer and lf_complete_pointer with
+// kPushSide2 and kPopSide2). The same checks as the first forms (the queue's memory and alignment, D-042), then PERM
+// unless the queue is ANY2ANY.
+s32 _cellSyncLFQueueGetPushPointer2(PPUContext& ctx, u32 queue, u32 pointer, u32 is_blocking, u32 use_event_queue)
+{
+    constexpr std::string_view fn = "_cellSyncLFQueueGetPushPointer2";
+    if (const s32 rc = check_lfqueue_unchecked(ctx, fn, queue); rc != lv2::CELL_OK) return rc;
+    s32 position = 0;
+    return lf_get_pointer(ctx, fn, queue, kPushSide2, is_blocking, use_event_queue, pointer, position, 0);
+}
+
+s32 _cellSyncLFQueueGetPopPointer2(PPUContext& ctx, u32 queue, u32 pointer, u32 is_blocking, u32 use_event_queue)
+{
+    constexpr std::string_view fn = "_cellSyncLFQueueGetPopPointer2";
+    if (const s32 rc = check_lfqueue_unchecked(ctx, fn, queue); rc != lv2::CELL_OK) return rc;
+    s32 position = 0;
+    return lf_get_pointer(ctx, fn, queue, kPopSide2, is_blocking, use_event_queue, pointer, position, 0);
+}
+
+s32 _cellSyncLFQueueCompletePushPointer2(PPUContext& ctx, u32 queue, s32 pointer, u32 signal_fn)
+{
+    constexpr std::string_view fn = "_cellSyncLFQueueCompletePushPointer2";
+    if (const s32 rc = check_lfqueue_unchecked(ctx, fn, queue); rc != lv2::CELL_OK) return rc;
+    return lf_complete_pointer(ctx, fn, queue, kPushSide2, pointer, signal_fn, 0);
+}
+
+s32 _cellSyncLFQueueCompletePopPointer2(PPUContext& ctx, u32 queue, s32 pointer, u32 signal_fn, u32 no_queue_full)
+{
+    constexpr std::string_view fn = "_cellSyncLFQueueCompletePopPointer2";
+    if (const s32 rc = check_lfqueue_unchecked(ctx, fn, queue); rc != lv2::CELL_OK) return rc;
+    return lf_complete_pointer(ctx, fn, queue, kPopSide2, pointer, signal_fn, no_queue_full);
+}
+
 // RPCS3 _cellSyncLFQueuePushBody(queue, buffer, isBlocking) and _cellSyncLFQueuePopBody (cellSyncLFQueuePush and Pop
 // pass 1, the Try forms 0; libsre agrees): NULL_POINTER (queue or buffer), ALIGN (queue 128, buffer 16); a pointer from
 // GetPushPointer (GetPopPointer) without the event queue, the entry copied (in m_buffer with its ANY2ANY bit cleared),
-// then CompletePushPointer (CompletePopPointer, noQueueFull 0) without a signal function. ANY2ANY queues go through
-// RPCS3's *2 functions, todo stubs that return CELL_OK without handing out a pointer: CELL_SYNC_ERROR_NOSYS here.
-s32 lf_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, const LfSide& side)
+// then CompletePushPointer (CompletePopPointer, noQueueFull 0) without a signal function. An ANY2ANY queue goes through
+// the second forms, as RPCS3's bodies call them (D-625). `host_signal`: the signal function cellSpurs' bodies give the
+// completion (D-628); the cellSync bodies have none.
+s32 lf_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push,
+    const spurs::LfSignal* host_signal)
 {
     if (!queue || !buffer) return null_pointer(ctx, fn, queue);
     if (queue % kLfQueueAlign || buffer % 16) return misaligned(ctx, fn, queue);
     if (const s32 rc = check_memory(ctx, fn, queue, "queue", queue, kLfQueueSize); rc != lv2::CELL_OK) return rc;
     u8* base = guest_base(ctx);
-    if (ps_read32(base, queue + lfq_off::direction) == CELL_SYNC_QUEUE_ANY2ANY) {
-        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_NOSYS, "an ANY2ANY queue: RPCS3's _cellSyncLFQueueGet*Pointer2 and "
-            "Complete*Pointer2 are todo stubs and pspocket has no implementation; refused with CELL_SYNC_ERROR_NOSYS");
-    }
+    const bool any2any = ps_read32(base, queue + lfq_off::direction) == CELL_SYNC_QUEUE_ANY2ANY;
+    const LfSide& side = any2any ? (push ? kPushSide2 : kPopSide2) : (push ? kPushSide : kPopSide);
     s32 position = 0;
     if (const s32 rc = lf_get_pointer(ctx, fn, queue, side, is_blocking, 0, 0, position, buffer); rc != lv2::CELL_OK) {
         return rc;
@@ -1158,17 +1220,171 @@ s32 lf_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_
     const u32 entry = static_cast<u32>(ps_read64(base, queue + lfq_off::buffer) & ~1ull) + size * static_cast<u32>(at);
     if (side.push) std::memmove(base + entry, base + buffer, size);
     else std::memmove(base + buffer, base + entry, size);
-    return lf_complete_pointer(ctx, fn, queue, side, position, 0, 0);
+    return lf_complete_pointer(ctx, fn, queue, side, position, 0, 0, host_signal);
 }
 
 s32 _cellSyncLFQueuePushBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_blocking)
 {
-    return lf_body(ctx, "_cellSyncLFQueuePushBody", queue, buffer, is_blocking, kPushSide);
+    return lf_body(ctx, "_cellSyncLFQueuePushBody", queue, buffer, is_blocking, true, nullptr);
 }
 
 s32 _cellSyncLFQueuePopBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_blocking)
 {
-    return lf_body(ctx, "_cellSyncLFQueuePopBody", queue, buffer, is_blocking, kPopSide);
+    return lf_body(ctx, "_cellSyncLFQueuePopBody", queue, buffer, is_blocking, false, nullptr);
+}
+
+// ------------------------------------------------------------------------------------- the lv2 event queue (D-625)
+//
+// _cellSyncLFQueueAttachLv2EventQueue(spus, num, queue) and DetachLv2EventQueue (RPCS3: todos answering CELL_OK; their
+// arguments are RPCS3's): the lv2 event queue a PPU thread blocked in the pointer functions with useEventQueue sleeps
+// on (m_eq_id: RPCS3's GetPushPointer and GetPopPointer receive from it after marking their side's event state 3, and
+// refuse a blocking call with STAT while m_bs is all ones), connected to the SPU threads whose SPU side of the library
+// sends the wake-up. What libsre does is not known in detail; pspocket's, the most plausible reading of the layout:
+// - a PPU queue of 127 entries (lv2's largest, so an SPU never finds it full: a send_event answer of EBUSY could
+//   look like a failure to the SPU side) named "_sncLFQ", local (no key);
+// - connected to SPU port p of every thread in `spus` (sys_spu_thread_connect_event, SYS_SPU_THREAD_EVENT_USER): the
+//   lowest p of 0x10..0x3F (SPURS' dynamic ports, D-040) free on all of them;
+// - m_bs = p (a big-endian word, the SPU side's port; RPCS3 tests the four bytes as one word), m_eq_id = the queue,
+//   stored in one update of the line.
+// Detach takes the port off every thread, destroys the queue and puts m_bs back as Initialize left it (all ones; for
+// ANY2ANY its first two bytes, the rest 0) and m_eq_id to 0.
+// Checks: the queue (and with `num`, `spus`) NULL; the queue 128-aligned; `num` 0 (INVAL); memory (FAULT, D-042). An
+// SPU2SPU queue has no PPU side to wake: PERM. Attaching a queue that has one is STAT, as is detaching one that has
+// none; detaching while a PPU thread waits on it (its side's event state set) is BUSY. lv2's errors (an SPU thread
+// that does not exist: ESRCH) are returned as they are, with what was connected undone; no free port is BUSY.
+
+constexpr u32 kLfPortFirst = 0x10, kLfPortLast = 0x3F;
+constexpr u32 SYS_SPU_THREAD_EVENT_USER = 1;
+constexpr s32 kLfEventQueueSize = 127;
+
+s32 check_lfqueue_spus(PPUContext& ctx, std::string_view fn, u32 spus, u32 num, u32 queue)
+{
+    if (!queue || !spus) return null_pointer(ctx, fn, queue);
+    if (queue % kLfQueueAlign) return misaligned(ctx, fn, queue);
+    if (!num) return invalid(ctx, fn, queue);
+    if (const s32 rc = check_memory(ctx, fn, queue, "queue", queue, kLfQueueSize); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = check_memory(ctx, fn, queue, "SPU thread list", spus, u64{num} * 4); rc != lv2::CELL_OK) return rc;
+    if (ps_read32(guest_base(ctx), queue + lfq_off::direction) == CELL_SYNC_QUEUE_SPU2SPU) {
+        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_PERM, "CELL_SYNC_ERROR_PERM: an SPU2SPU queue has no PPU side");
+    }
+    return lv2::CELL_OK;
+}
+
+// m_bs as cellSyncLFQueueInitialize leaves it (lf_setup), for Detach.
+void lf_detached_bs(u8* q)
+{
+    if (ps_read32(q, lfq_off::direction) == CELL_SYNC_QUEUE_ANY2ANY) ps_write32(q, lfq_off::bs, 0xFFFF0000u);
+    else ps_write32(q, lfq_off::bs, 0xFFFFFFFFu);
+}
+
+s32 _cellSyncLFQueueAttachLv2EventQueue(PPUContext& ctx, u32 spus, u32 num, u32 queue)
+{
+    constexpr std::string_view fn = "_cellSyncLFQueueAttachLv2EventQueue";
+    if (const s32 rc = check_lfqueue_spus(ctx, fn, spus, num, queue); rc != lv2::CELL_OK) return rc;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    u64 version = 0;
+    if (word_and_version(base, queue + lfq_off::eq_id, version)) {
+        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_STAT, "CELL_SYNC_ERROR_STAT: an lv2 event queue is attached already");
+    }
+    std::vector<u32> threads(num);
+    for (u32 i = 0; i < num; i++) threads[i] = ps_read32(base, spus + 4 * i);
+
+    StackVar vars(ctx, base, 0x20); // the queue's ID, sys_event_queue_attribute_t {protocol, type, name[8]}
+    const u32 id_out = vars.addr(), attr = vars.addr() + 0x10;
+    ps_write32(base, attr, lv2::SYS_SYNC_FIFO);
+    ps_write32(base, attr + 4, lv2::SYS_PPU_QUEUE);
+    std::memcpy(base + attr + 8, "_sncLFQ", 8);
+    if (const s32 rc = lv2::sys_event_queue_create(t, id_out, attr, 0, kLfEventQueueSize); rc != lv2::CELL_OK) {
+        PS_LOG_ERROR(kChan, "{}({:#x}): sys_event_queue_create: {}", fn, queue, lv2::error_name(rc));
+        return rc;
+    }
+    const u32 eq = ps_read32(base, id_out);
+    const auto undo = [&](u32 connected, u32 port) {
+        for (u32 i = 0; i < connected; i++)
+            lv2::sys_spu_thread_disconnect_event(t, threads[i], SYS_SPU_THREAD_EVENT_USER, port);
+    };
+    u32 port = kLfPortFirst;
+    s32 rc = lv2::CELL_OK;
+    for (; port <= kLfPortLast; port++) {
+        u32 i = 0;
+        for (; i < num; i++) {
+            rc = lv2::sys_spu_thread_connect_event(t, threads[i], eq, SYS_SPU_THREAD_EVENT_USER, port);
+            if (rc != lv2::CELL_OK) break;
+        }
+        if (i == num) break;
+        undo(i, port);
+        if (rc != lv2::err(lv2::CELL_EISCONN)) break; // not a taken port: that thread's answer
+    }
+    if (rc != lv2::CELL_OK) {
+        lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+        if (rc == lv2::err(lv2::CELL_EISCONN)) {
+            return refuse(ctx, fn, queue, CELL_SYNC_ERROR_BUSY, "CELL_SYNC_ERROR_BUSY: no SPU port of 0x10..0x3F is free "
+                "on every SPU thread");
+        }
+        PS_LOG_ERROR(kChan, "{}({:#x}): connecting SPU thread port {:#x}: {}", fn, queue, port, lv2::error_name(rc));
+        return rc;
+    }
+    bool attached = false;
+    reservation_op(base, queue, [&](u8* q) {
+        attached = ps_read32(q, lfq_off::eq_id) != 0;
+        if (attached) return false;
+        ps_write32(q, lfq_off::bs, port);
+        ps_write32(q, lfq_off::eq_id, eq);
+        return true;
+    });
+    if (attached) { // another thread attached one meanwhile
+        undo(num, port);
+        lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_STAT, "CELL_SYNC_ERROR_STAT: an lv2 event queue is attached already");
+    }
+    PS_LOG_INFO(kChan, "{}({:#x}): lv2 event queue {:#x} on SPU port {:#x} of {} SPU thread(s)", fn, queue, eq, port, num);
+    return lv2::CELL_OK;
+}
+
+s32 _cellSyncLFQueueDetachLv2EventQueue(PPUContext& ctx, u32 spus, u32 num, u32 queue)
+{
+    constexpr std::string_view fn = "_cellSyncLFQueueDetachLv2EventQueue";
+    if (const s32 rc = check_lfqueue_spus(ctx, fn, spus, num, queue); rc != lv2::CELL_OK) return rc;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    u32 eq = 0, port = 0;
+    s32 rc = lv2::CELL_OK;
+    reservation_op(base, queue, [&](u8* q) {
+        eq = ps_read32(q, lfq_off::eq_id);
+        port = ps_read32(q, lfq_off::bs);
+        rc = lv2::CELL_OK;
+        if (!eq) {
+            rc = error(CELL_SYNC_ERROR_STAT);
+            return false;
+        }
+        // A PPU thread receiving from it: its side's event state (the pointer functions' m_h7 or m_h3; ANY2ANY has none).
+        if (ps_read32(q, lfq_off::direction) != CELL_SYNC_QUEUE_ANY2ANY &&
+            (ps_read16(q, lfq_off::push1 + lfh::event) || ps_read16(q, lfq_off::pop1 + lfh::event))) {
+            rc = error(CELL_SYNC_ERROR_BUSY);
+            return false;
+        }
+        lf_detached_bs(q);
+        ps_write32(q, lfq_off::eq_id, 0);
+        return true;
+    });
+    if (rc == error(CELL_SYNC_ERROR_STAT)) {
+        return refuse(ctx, fn, queue, CELL_SYNC_ERROR_STAT, "CELL_SYNC_ERROR_STAT: no lv2 event queue is attached");
+    }
+    if (rc != lv2::CELL_OK) return rc; // BUSY: not logged, a normal answer
+    for (u32 i = 0; i < num; i++) {
+        const u32 thread = ps_read32(base, spus + 4 * i);
+        if (const s32 r = lv2::sys_spu_thread_disconnect_event(t, thread, SYS_SPU_THREAD_EVENT_USER, port & 0x3F);
+            r != lv2::CELL_OK) {
+            PS_LOG_WARN(kChan, "{}({:#x}): disconnecting SPU thread {:#x} port {:#x}: {}", fn, queue, thread, port,
+                lv2::error_name(r));
+        }
+    }
+    if (const s32 r = lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE); r != lv2::CELL_OK) {
+        PS_LOG_WARN(kChan, "{}({:#x}): destroying lv2 event queue {:#x}: {}", fn, queue, eq, lv2::error_name(r));
+    }
+    PS_LOG_INFO(kChan, "{}({:#x}): lv2 event queue {:#x} and SPU port {:#x} gone", fn, queue, eq, port);
+    return lv2::CELL_OK;
 }
 
 // cellSyncLFQueueClear(queue), as RPCS3 (libsre agrees): NULL_POINTER, ALIGN; BUSY (an error, as theirs) while either
@@ -1271,6 +1487,13 @@ s32 sync_lfqueue_complete_pop_pointer(PPUContext& ctx, u32 queue, s32 pointer, u
 {
     return _cellSyncLFQueueCompletePopPointer(ctx, queue, pointer, signal_fn, no_queue_full);
 }
+
+// For cellSpurs' _cellSpursLFQueuePushBody and PopBody (D-628).
+s32 sync_lfqueue_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push,
+    const LfSignal& signal)
+{
+    return lf_body(ctx, fn, queue, buffer, is_blocking, push, &signal);
+}
 } // namespace spurs
 
 void register_cellSync(Registry& r)
@@ -1312,6 +1535,13 @@ void register_cellSync(Registry& r)
         PS_HLE_FUNC(0xBA5961CA, _cellSyncLFQueuePushBody),
         PS_HLE_FUNC(0xE1BC7ADD, _cellSyncLFQueuePopBody),
         PS_HLE_FUNC(0xAFF7627A, _cellSyncLFQueueGetSignalAddress),
+        // D-625: made without libsre to compare with (D-594).
+        PS_HLE_UNVERIFIED(0x6BB4EF9D, _cellSyncLFQueueGetPushPointer2),
+        PS_HLE_UNVERIFIED(0x46356FE0, _cellSyncLFQueueGetPopPointer2),
+        PS_HLE_UNVERIFIED(0x35BBDAD2, _cellSyncLFQueueCompletePushPointer2),
+        PS_HLE_UNVERIFIED(0x7A51DEEE, _cellSyncLFQueueCompletePopPointer2),
+        PS_HLE_UNVERIFIED(0x54FC2032, _cellSyncLFQueueAttachLv2EventQueue),
+        PS_HLE_UNVERIFIED(0x811D148E, _cellSyncLFQueueDetachLv2EventQueue),
     });
 }
 
