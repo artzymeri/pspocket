@@ -8547,3 +8547,151 @@ Tests: the sweep (D-585) is the check for most of these, as the races do not sho
 tests/rsx/test_fifo.cpp, "an unaligned NV406E semaphore acquire offset is a failure, not a load" (it blocked for good
 before, on the x86 host), and "the running RSX thread writes get and put when it takes new FIFO pointers (D-587)" (the
 RSX thread is held in a clear while the syscall waits: with the old order put changed under it, every run).
+
+## D-594 · 2026-10-10 · Unverified functions: a game importing one keeps Sony's module where it is installed
+
+D-563's firmware first marks a whole library made without Sony's module. A library pspocket has compared with Sony's
+can still lack the functions nothing compared: cellPngDec's and cellGifDec's Ext functions and libvdec's extra entry
+points were left out on purpose (D-196, D-199, D-202), so a game importing one got Sony's whole module wherever the
+system software is installed (D-175), and without it a call that fails. Writing them from RPCS3 as ordinary functions
+would change the first case: the game would get pspocket's library, the new functions included, in place of Sony's
+module that serves it today.
+
+**The marker.** hle::Function::unverified (PS_HLE_UNVERIFIED in a module's list, Registry::is_unverified) marks a
+function made from RPCS3 without Sony's module to compare it with. The loader's per-game choice (LleModules::choose)
+treats an import of one as an import of a function the host lacks while the library's firmware module can serve:
+- an import library (the game's, or a PRX's it loads) with an unverified function among its imports goes to its
+  firmware module when the module index has one that can join, as with a missing function. With no system software,
+  no module for it, or one that cannot join (refused, or a library something already linked to the host, D-175), the
+  host serves it, the unverified function included, and nothing is listed as lacking;
+- a firmware module's import of an unverified function brings that library's module in (as a forced library's does,
+  D-563), so the modules a system with the firmware links are the ones it linked before;
+- imports of verified functions only stay on the host either way.
+So writing an unverified function never changes what a game gets where the firmware is installed; it gives the game a
+working call where it is not. (One case gains too: a game PRX importing one from a library the game already linked to
+the host gets pspocket's function instead of the stub that failed.) Before the per-game choice (tests, run-time loads
+without a decision) a module still runs as it is only when the host has none of its libraries (D-157), unchanged. An
+unverified function counts as pspocket's own (pspocket-boot --hle-list, scripts/progress.py), as firmware-first
+libraries do. Once one has been compared with Sony's module on the Mac (firmware_compare.hpp) and matches, its marker
+goes, with a decision of its own. As in D-563, only functions no other host module calls through the registry are
+marked (none of D-595's and D-596's thirteen is called so).
+
+Test: tests/hle/test_lle.cpp, an unverified function's import goes to its library's module when one is installed, to
+the host when not: libvdec's cellVdecSetPts (unverified) beside cellVdecOpen and cellVdecClose (verified), with a
+synthetic libvdec.sprx: the game's imports of the verified two stay on the host; with cellVdecSetPts among them the
+module is chosen; a module importing cellVdecOpen and cellVdecSetPts brings libvdec.sprx in (its missing export a gap,
+though the host has the function), one importing the verified two does not; with no libvdec.sprx, every one of these
+on the host and no gap.
+
+## D-595 · 2026-10-10 · cellPngDec's and cellGifDec's Ext functions from RPCS3, unverified: streams in, parts out
+
+The image decoders' Ext functions are now pspocket's, unverified (D-594): cellPngDecExtCreate, ExtOpen, ExtReadHeader,
+ExtSetParameter, ExtDecodeData, and cellGifDec's five. They are built on pspocket's decoders, whose compared paths
+are unchanged: the existing tests pass untouched, the digest of cellGifDec's 1,131 answers and 85 images included.
+From RPCS3 rpcs3/Emu/Cell/Modules/cellPngDec.cpp (pngDecCreate, pngDecOpen, cellPngDecExtReadHeader,
+pngDecSetParameter and pngDecodeData with their ext arguments, its row callback pngDecRowCallback), cellGifDec.cpp
+(the Ext functions' checks) and the two .h files (the structures). cellJpgDec's Ext functions stay Sony's: RPCS3's are
+bare todos (they log and answer CELL_OK), nothing to make them from.
+
+**cellPngDec.**
+- ExtCreate: Create's decoder and memory. CellPngDecExtThreadInParam (SPURS, priorities, maxContention) and
+  CellPngDecExtThreadOutParam are checked for being guest memory only: pspocket decodes on the calling thread (RPCS3
+  checks nothing and stops on an extThreadOutParam).
+- ExtOpen: Open, with stream input when CellPngDecCbCtrlStrm has a function. The source's buffer is the stream's
+  first part; the rest comes from the game's stream callback as libpng reads it (libpng's read function asks for what
+  it lacks: the header's chunks at ReadHeader, the rest at DecodeData; the plain ReadHeader and DecodeData do the
+  same on such a stream). The callback gets CellPngDecStrmInfo (decodedStrmSize: the bytes given so far) and
+  CellPngDecStrmParam (strmPtr, strmSize, copied at once). A negative answer or no bytes ends the stream
+  (STREAM_FORMAT if the PNG is not whole), bytes that are not guest memory answer CB_PARAM. Only from a buffer: a
+  callback with a file source is STREAM_FORMAT (RPCS3), answered before the handle is taken. CellPngDecOpnParam's
+  selectChunk (RPCS3 stops on one) is noted once: every chunk is read and kept.
+- ExtReadHeader: ReadHeader, CellPngDecExtInfo's reserved word set to 0 (RPCS3).
+- ExtSetParameter: SetParameter, with CellPngDecExtInParam's bufferMode LINE_MODE (else ARG, refused before the
+  output is set, the stream failing as for any refused parameter) and outputCounts, the lines a part, an interlaced
+  image's one (RPCS3; but 0 stays 0, the whole image, where RPCS3 makes an interlaced image's 1 against its own 0);
+  CellPngDecExtOutParam gets the row and a part's lines (the height for 0).
+- ExtDecodeData: with a display callback and outputCounts, the image goes out in parts (RPCS3's partial decoding):
+  each part written at the frame's pitch from CellPngDecDispParam's nextOutputImage, then the display callback with
+  CellPngDecDispInfo, which may point nextOutputImage elsewhere for the next part. pspocket's own where RPCS3 has
+  nothing or goes wrong: every part has its callback, the last too (RPCS3 calls back only as the next part starts),
+  with its own height, and nextOutputStartY the next part's first line; the callback is given the game's own
+  CellPngDecDispParam (RPCS3 a copy), else the stream's, which starts at `data` (as a first nextOutputImage of 0
+  does); a non-interlaced image decodes a row at a time, so stream and display callbacks interleave; an interlaced
+  one decodes whole (every pass) and goes out a line at a time, each line once, complete: scanPassCount 0 (RPCS3
+  reports libpng's passes over a combined row); CELL_PNGDEC_STOP at commandPtr after a callback stops it (status
+  STOP, CELL_OK; RPCS3 ignores commandPtr); a part's place that is not guest memory is ARG for the first, CB_PARAM
+  for one a callback gave; parts go top to bottom whatever outputMode (noted once; RPCS3 the same). The callbacks'
+  structures are in the stream's own guest block from +0x40 (RPCS3 takes four blocks from the game's malloc).
+  Without a display callback or outputCounts: DecodeData.
+
+**cellGifDec.** RPCS3's Ext functions are checks: ExtCreate's (every parameter there, spuThreadEnable 0 or 1, SPURS
+with SPU threads, maxContention 1 to 7, the eight priorities at most 15: else ARG), ExtReadHeader's (CellGifDecExtInfo
+there, else ARG, failing the stream as ReadHeader's refusals do; nothing written), ExtSetParameter's (the extension
+parameters there, LINE_MODE: else ARG); ExtOpen and ExtDecodeData do nothing past Open's checks. Here they are
+Create (its memory; the SPU threads' block too when they are asked for), Open, ReadHeader, SetParameter and
+DecodeData with those checks, and stream input and partial output as cellPngDec's above, libgifdec's structures being
+libpngdec's: before ReadHeader and each DecodeData the bytes they will read (the screen descriptor and its table; the
+next record to its block terminator) are asked of the stream callback, so the compared parser reads the same bytes;
+an image record's logical screen, made whole first (so scanPassCount and interlaceFlag are 0), goes out in parts
+(extOutParam as cellPngDec's); an extension or the trailer has no lines and no callback; a stop between parts writes
+STATUS_STOP. One change inside the compared code: an image's screen is composed through a pointer (the game's buffer,
+or the host's for parts), the same bytes.
+
+To compare with Sony's libpngdec and libgifdec on the Mac: whether the last part has its callback; nextOutputStartY,
+scanPassCount and interlaceFlag (an interlaced image's parts above all); where the first part goes and which
+dispParam the callback gets; the order of stream and display callbacks; selectChunk; the memory the Ext functions
+take (Create, the callbacks' structures); a stream callback with a file source; the stop between parts; ExtCreate's
+checks in libpngdec; an interlaced PNG with outputCounts 0.
+
+Tests: tests/hle/test_pngdec.cpp and test_gifdec.cpp, the guest stream and display callbacks in
+tests/hle/imgdec_ext_util.hpp, every image the same as DecodeData gives it. PNG: six images whole through the Ext path
+(no display callback, or outputCounts 0); a 13x7 RGBA image in parts of 3, 3 and 1 lines, every CellPngDecDispInfo
+field, with the game's dispParam and with none (the first part at `data`); colour to gray in parts of 2 into one
+buffer the callback copies from; an interlaced image a line at a time; a stream of 20 bytes then 37 a call, every
+call's decodedStrmSize, none past IEND, the chunks after IDAT read; a 64x64 image whose stream and display callbacks
+interleave; a stop after two parts; the refusals (buffer mode, a file source with a stream callback, a stream
+callback's bytes not memory, a stream cut before IEND, a callback's next place 0, a first place not memory), and
+selectChunk. GIF: ExtCreate's checks; six files' records whole; an animation's two images in parts of 4, 4 and 2,
+extensions without callbacks; an interlaced image into one buffer; a stream of 10 bytes then 23 a call to the
+trailer, the second image's bytes asked for between the images' parts; a stop; the refusals.
+
+## D-596 · 2026-10-10 · libvdec's OpenExt, SetPts and DecodeAuEx2 from RPCS3, unverified; RPCS3's other bodies
+
+D-196 left to Sony's libvdec the functions its runs had not confirmed. Three have bodies in RPCS3
+(rpcs3/Emu/Cell/Modules/cellVdec.cpp, on structures cellVdec.h calls speculative); they are now pspocket's on its
+decoder, unverified (D-594):
+- cellVdecOpenExt: Open on CellVdecResourceExt (memAddr, memSize, ppuThreadPriority, ppuThreadStackSize, 12 bytes
+  RPCS3 does not know, numOfSpus at 0x1C), as RPCS3 opens with a CellVdecResource of those and an SPU priority of 0;
+  no resource (or one that is not guest memory) ARG, the rest Open's checks.
+- cellVdecSetPts: RPCS3's answers: no decoder or no pointer ARG, a closed decoder SEQ, else CELL_OK. What the PTS it
+  is given sets is not known (RPCS3 reads nothing of it and logs the call as an error): nothing is done with it,
+  logged once a decoder.
+- cellVdecDecodeAuEx2: DecodeAu on CellVdecAuInfoEx2 (startAddr, a word, size, a word, then CellVdecAuInfo's pts,
+  dts, userData and codecSpecificData: 0x30 bytes), read as RPCS3 reads it; the two unknown words are logged once a
+  decoder when they are not 0. DecodeAu's body is shared (decode_au), its answers unchanged.
+To compare with Sony's libvdec on the Mac: CellVdecResourceExt's unknown bytes (SPURS?), what SetPts' structure holds
+and does, CellVdecAuInfoEx2's two words (the high words of 64-bit fields?).
+
+**The other grey functions of the libraries pspocket serves** (scripts/progress.py, 2026-10-10), read in RPCS3: none
+has a body with something to make it from, so none is added.
+- libvdec: StartSeqExt, GetInputStatus, GetPicItemEx, GetPicItemExt and SetFrameRateExt are UNIMPLEMENTED_FUNC;
+  _cell_vdec_prx_ver is a variable RPCS3 registers without a value.
+- cellJpgDec's five Ext functions: bare todos (D-595).
+- cellSail's 19: 17 UNIMPLEMENTED_FUNC (the player's playback: Start, Stop, Next, Cancel, the stream and elementary
+  stream calls, AuReceiverGet); GraphicsAdapterGetFrame and GetFrame2 bare todos; SoundAdapterGetFrame only checks
+  its arguments and gives no frame. All wait for libsail on the Mac (D-562).
+- cellSpurs' 13 (Task2, the LF queues, the job pipeline information, task exit codes, the utility workload) and
+  cellSync's 6 (the LF queues' second forms, their event queues): UNIMPLEMENTED_FUNC or bare todos; libsre has them.
+- The codec cores (libavcdec 8, libmvcdec 7, libsjvtd 18, libsmvd2 20, libsmvd4 17, libsvc1d 21): UNIMPLEMENTED_FUNC,
+  their memory queries bare todos (D-575 has their versions).
+- cellSysmodule: cellSysmodule_0x59521326 decrypts the OpenPSID with a key (left out, D-184); s_sysmodule_context is
+  a variable. cellMic's cellMicStopEx is fatal in RPCS3. cellAdec's g_cell_adec_core_ops_lpcm, a variable, belongs to
+  the work on the codec cores' operation tables.
+- sys_libc's 132 and sys_libm's 128: RPCS3 registers their names only, no body.
+The count: 5,654 of 6,625 library functions pspocket's own before, 5,667 after (D-595's ten and these three).
+
+Test: tests/hle/test_vdec.cpp, OpenExt, SetPts and DecodeAuEx2: a decoder's life over four 64x64 H.264 access units
+opened by OpenExt on its resource and fed by DecodeAuEx2 (the unknown words set on two), against Open and DecodeAu:
+every callback, item, information block and picture the same, every answer; OpenExt's refusals; SetPts' answers
+before and in a sequence and after Close; DecodeAuEx2's refusals (no information, no size or start, the decode modes,
+no sequence, a closed decoder).
