@@ -64,6 +64,7 @@ struct Run : Half<> {
         ps_write32(b, kCharCode, 0);
         ps_write32(b, kCharNum, 0xFFFFFFFF);
         ps_write8(b, kProcessed, 0xEE);
+        trace("calling: " + key);
         const std::optional<u64> v = side.call("cellKey2CharGetChar", {h, kKey, kCharCode, kCharNum, kProcessed});
         if (!v) {
             o.line(key, "(not exported)");

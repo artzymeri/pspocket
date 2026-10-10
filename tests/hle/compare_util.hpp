@@ -18,7 +18,8 @@
 // - Neither: skipped.
 // PSPOCKET_COMPARE_PRINT=1 also prints every observation of both halves (Sony's answers in full).
 // A half that makes no progress for a minute (a module stuck on something pspocket's lv2 lacks) says where it is on
-// stderr, every minute, so a hang on the Mac names its step.
+// stderr, every minute, so a hang on the Mac names its step; PSPOCKET_COMPARE_TRACE=1 prints every step as it is
+// written, so a crash (a module faulting) names its last.
 //
 // No game data: the inputs are built in the tests; Sony's answers are only compared, never saved.
 
@@ -64,6 +65,16 @@ inline bool env_on(const char* name)
 {
     const char* v = std::getenv(name);
     return v && *v && std::string_view(v) != "0";
+}
+
+// PSPOCKET_COMPARE_TRACE=1: each step on stderr as it happens, each call before it is made (so the last line before a
+// crash names the call that crashed).
+inline void trace(const std::string& what)
+{
+    static const bool on = env_on("PSPOCKET_COMPARE_TRACE");
+    if (!on) return;
+    std::fprintf(stderr, "[compare] %s\n", what.c_str());
+    std::fflush(stderr);
 }
 
 // How this run compares; SKIPs the test without the firmware and without PSPOCKET_COMPARE_SELF.
@@ -241,6 +252,7 @@ public:
 private:
     void step(const std::string& what)
     {
+        trace(what);
         {
             std::lock_guard lock(progress->mutex);
             progress->last = what.substr(0, 160);
@@ -399,6 +411,7 @@ struct Half {
             }
             key += ")";
         }
+        trace("calling: " + key);
         const std::optional<u64> v = side.call(function, args);
         o.line(key, v ? answer(*v) : std::string("(not exported)"));
         return v ? *v : ~u64{0};

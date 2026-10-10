@@ -52,6 +52,7 @@ Observed half(const Setup& s, bool sony_half, const Core& core)
         for (const u32 out : {kOut, kOut + 2, 0u}) {
             std::memset(b + kOut - 4, 0xEE, 24);
             const std::string key = std::format("{}({:#x})", fn, out);
+            trace("calling: " + key);
             const std::optional<u64> v = h.side.call(fn, {out});
             if (!v) h.o.line(key, "(not exported)");
             else if (answers) h.o.line(key, answer(*v));
