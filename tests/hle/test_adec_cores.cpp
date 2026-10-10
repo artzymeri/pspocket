@@ -35,6 +35,11 @@ using namespace pspocket::hle::test::adec_test;
 namespace {
 
 constexpr u32 kTypeMp3 = 4;
+
+// Only the rule's test below runs without FFmpeg: the other tests, and their helpers here and in each codec's section,
+// are left out of a build without it (unused helpers would stop its -Werror build, D-606).
+#if PSPOCKET_HAVE_FFMPEG
+
 constexpr u32 kTsInvalid = 0xFFFFFFFF;
 
 // Bits written most significant first.
@@ -202,8 +207,6 @@ double energy_near(const std::vector<float>& x, double rate, double freq, double
     return total > 0 ? near / total : 0;
 }
 
-#if PSPOCKET_HAVE_FFMPEG
-
 // Planar floats from FFmpeg's own decoder (the reference): each unit in order, every channel's samples per unit.
 std::vector<std::vector<std::vector<float>>> ffmpeg_decode(const char* decoder, const std::vector<std::vector<u8>>& aus,
     const std::function<void(AVCodecContext*)>& setup = {})
@@ -264,8 +267,6 @@ std::vector<u8> expected_pcm(const std::vector<std::vector<float>>& unit, bool s
     }
     return v;
 }
-
-#endif
 
 // ---- MP3
 
@@ -380,6 +381,8 @@ std::vector<float> channel_of(const std::vector<u8>& pcm, u32 channels, u32 c, b
     }
     return x;
 }
+
+#endif
 
 } // namespace
 
@@ -620,6 +623,8 @@ TEST_CASE("cellAdec: MP3 on FFmpeg, mono and the lower rates, CRC errors, refuse
 
 // ---- MPEG audio layers I and II
 
+#if PSPOCKET_HAVE_FFMPEG
+
 namespace {
 
 constexpr u32 kTypeMpegL1 = 22, kTypeMpegL2 = 6;
@@ -665,8 +670,6 @@ struct MpegFields {
     u32 crc, bitrate_index, mode;
 };
 MpegFields mpeg_fields(u32 word) { return {((word >> 16) & 1) ? 0u : 1u, (word >> 12) & 15, (word >> 6) & 3}; }
-
-#if PSPOCKET_HAVE_FFMPEG
 
 // Interleaved 16-bit test signal at `rate`, `samples` per channel: in channel c a sine at freqs[c] Hz of amps[c].
 std::vector<s16> sines(u32 rate, u32 samples, const std::vector<double>& freqs, const std::vector<double>& amps)
@@ -786,11 +789,7 @@ std::vector<float> joined(const CoreRun& run, u32 channels, u32 c, bool sixteen 
     return v;
 }
 
-#endif
-
 } // namespace
-
-#if PSPOCKET_HAVE_FFMPEG
 
 TEST_CASE("cellAdec: MPEG layer I on FFmpeg, frames built here: tones, information, PTS, channels (D-577)", "[hle][adec]")
 {
@@ -920,6 +919,8 @@ TEST_CASE("cellAdec: MPEG layer II on FFmpeg, a stream FFmpeg's encoder wrote: t
 
 // ---- MPEG-4 AAC
 
+#if PSPOCKET_HAVE_FFMPEG
+
 namespace {
 
 constexpr u32 kTypeM4Aac = 16, kTypeM4Aac2ch = 20, kTypeM4Aac2chMod = 24;
@@ -980,8 +981,6 @@ std::vector<u8> adif_header(u32 sfi, bool pair, u32 bitrate, u32 tag = 0)
     return w.bytes;
 }
 
-#if PSPOCKET_HAVE_FFMPEG
-
 // AAC LC written by FFmpeg's encoder: `channels` channels (5.1 with the back pair for 6) of `freqs`.
 Encoded aac_encode(const std::vector<s16>& input, u32 channels, u32 rate, s64 bit_rate)
 {
@@ -993,11 +992,7 @@ Encoded aac_encode(const std::vector<s16>& input, u32 channels, u32 rate, s64 bi
     });
 }
 
-#endif
-
 } // namespace
-
-#if PSPOCKET_HAVE_FFMPEG
 
 TEST_CASE("cellAdec: MPEG-4 AAC on FFmpeg, ADTS, raw data blocks and ADIF that FFmpeg's encoder wrote (D-578)",
     "[hle][adec]")
@@ -1166,6 +1161,8 @@ TEST_CASE("cellAdec: MPEG-4 AAC on FFmpeg, 5.1 out, downmixed by the two-channel
 
 // ---- AC-3
 
+#if PSPOCKET_HAVE_FFMPEG
+
 namespace {
 
 constexpr u32 kTypeAc3 = 2;
@@ -1203,8 +1200,6 @@ std::vector<u8> ac3_param(const Ac3Param& a)
 }
 
 } // namespace
-
-#if PSPOCKET_HAVE_FFMPEG
 
 TEST_CASE("cellAdec: AC-3 on FFmpeg, 5.1 that FFmpeg's encoder wrote: every channel routed, the information (D-579)",
     "[hle][adec]")
@@ -1390,6 +1385,8 @@ TEST_CASE("cellAdec: AC-3 on FFmpeg, downmixed: Lo/Ro, Lt/Rt, mono, 3/0, 2/1; st
 
 // ---- ATRAC3
 
+#if PSPOCKET_HAVE_FFMPEG
+
 namespace {
 
 constexpr u32 kTypeAtrac3 = 5;
@@ -1428,8 +1425,6 @@ std::vector<u8> atrac3_frame(u32 channels, std::array<u32, 2> lines, u32 unit = 
 
 std::vector<u8> atrac3_param(u32 nch, u32 joint, u32 nbytes, u32 bw) { return be32s({nch, joint, nbytes, bw}); }
 
-#if PSPOCKET_HAVE_FFMPEG
-
 // FFmpeg's ATRAC3 decoder set up as the core sets it up: a WAV file's 14 extra bytes, the frame size.
 std::function<void(AVCodecContext*)> atrac3_setup(u32 nch, u32 nbytes)
 {
@@ -1466,11 +1461,7 @@ std::vector<u8> expected_words(const std::vector<std::vector<float>>& unit, u32 
     return v;
 }
 
-#endif
-
 } // namespace
-
-#if PSPOCKET_HAVE_FFMPEG
 
 TEST_CASE("cellAdec: ATRAC3 on FFmpeg, frames built here: the four PCM formats, information, PTS, refusals (D-579)",
     "[hle][adec]")
