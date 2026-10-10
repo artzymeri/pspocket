@@ -1,17 +1,20 @@
 // HLE functions on real lv2 threads: sysPrxForUser lwmutex (RPCS3 sys_lwmutex_.cpp semantics, including contention
 // through the kernel's sleep queue), sys_ppu_thread_get_id and sys_time_get_system_time, cellSysmodule's load
-// bookkeeping, and lv2's null_func syscall 988.
+// bookkeeping, lv2's null_func syscall 988, and liblv2's sysPs2Disc, sysBdMediaId and sysConsoleId wrappers.
 
 #include <catch_amalgamated.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 #include <unistd.h>
 
@@ -1581,4 +1584,37 @@ TEST_CASE("cellSysmodule: module files, images and the debug mode (RPCS3)", "[hl
         CHECK(g.call("cellSysmoduleSetDebugmode", 0) == 0);
     }
     fsys::remove_all(root);
+}
+
+TEST_CASE("liblv2's sysPs2Disc, sysBdMediaId and sysConsoleId: liblv2's sys_ss calls", "[hle]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    struct Seen {
+        std::mutex m;
+        std::vector<std::array<u64, 3>> calls;
+    } seen;
+    f.kernel->set_syscall_observer(
+        [](void* user, u32 number, const u64* args) {
+            if (number < 870 || number > 879) return;
+            auto* s = static_cast<Seen*>(user);
+            std::lock_guard lock(s->m);
+            s->calls.push_back({number, args[0], args[1]});
+        },
+        &seen);
+    constexpr u32 kBuf = kData + 0x200;
+    CHECK(a.call("sysPs2Disc_BB7CD1AE", 7) == 0);
+    CHECK(a.call("sysPs2Disc_A84FD3C3") == 0);
+    CHECK(a.call("sys_get_bd_media_id", 0) == r3_of(lv2::CELL_EINVAL));
+    CHECK(a.call("sys_get_bd_media_id", kBuf) == 0);
+    CHECK(a.call("sys_get_console_id", 0) == r3_of(lv2::CELL_EINVAL));
+    CHECK(a.call("sys_get_console_id", kBuf) == r3_of(lv2::CELL_ENOSYS)); // lv2 answers only a root process
+    f.kernel->set_syscall_observer(nullptr, nullptr);
+    // The null buffers never reach lv2.
+    REQUIRE(seen.calls.size() == 4);
+    CHECK(seen.calls[0] == std::array<u64, 3>{876, 0x20000, 7});
+    CHECK(seen.calls[1] == std::array<u64, 3>{876, 0x20001, 1});
+    CHECK(seen.calls[2] == std::array<u64, 3>{879, 0x10001, kBuf});
+    CHECK(seen.calls[3][0] == 870);
+    CHECK(seen.calls[3][1] == kBuf);
 }

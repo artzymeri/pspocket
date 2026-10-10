@@ -9082,3 +9082,13 @@ given back by the policy module, semaphores) through libspurs_jq's policy module
 job output and the queue at rest the same with either PPU side, for the default pusher, the entry lock one and busy
 waiting; firmware-free tests of attributes, creation without dev_flash, both pushers' ring encodings, semaphores,
 signals, a port and GetSuspendedJobSize. A push costs 329 ns against libspurs_jq's 1532 ns interpreted (20000 pushes).
+
+## D-544 · 2026-10-10 · liblv2's sysPs2Disc, sysBdMediaId and sysConsoleId as liblv2 makes them
+
+liblv2.sprx (fw 4.92) exports three small libraries besides sysPrxForUser, each one wrapper over an lv2 sys_ss call;
+they are now pspocket's own, making the same calls with the same arguments: sysPs2Disc_BB7CD1AE(arg) is
+sys_ss_disc_access_control(0x20000, arg) and sysPs2Disc_A84FD3C3() is sys_ss_disc_access_control(0x20001, 1) (876);
+sys_get_bd_media_id(buffer) is sys_ss_media_id(0x10001, buffer) (879) and sys_get_console_id(buffer) is
+sys_ss_get_console_id(buffer) (870), both refusing a null buffer with CELL_EINVAL before the call (lv2 checks the rest:
+a game, not a root process, gets ENOSYS for the console ID, as on a PS3). RPCS3 has them as todos answering CELL_OK.
+Test: tests/hle/test_sysPrxForUser.cpp, the calls lv2 sees and the answers.
