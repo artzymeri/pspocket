@@ -301,11 +301,12 @@ bool execute(SPUContext& ctx, const Inst& inst)
         break;
 
     // ---- loads and stores ----
-    case Op::LQD: ctx.gpr[inst.rt()] = load_ls(ctx, static_cast<u32>(static_cast<s32>(gw(a, 0)) + inst.si10() * 16)); break;
+    // The address adds modulo 2^32, as the SPU's adder (and the lifter's u32 sum) does: an s32 sum overflows (D-605).
+    case Op::LQD: ctx.gpr[inst.rt()] = load_ls(ctx, gw(a, 0) + static_cast<u32>(inst.si10() * 16)); break;
     case Op::LQX: ctx.gpr[inst.rt()] = load_ls(ctx, gw(a, 0) + gw(b, 0)); break;
     case Op::LQA:
     case Op::LQR: ctx.gpr[inst.rt()] = load_ls(ctx, ls_target(inst, pc)); break;
-    case Op::STQD: store_ls(ctx, static_cast<u32>(static_cast<s32>(gw(a, 0)) + inst.si10() * 16), t); break;
+    case Op::STQD: store_ls(ctx, gw(a, 0) + static_cast<u32>(inst.si10() * 16), t); break;
     case Op::STQX: store_ls(ctx, gw(a, 0) + gw(b, 0), t); break;
     case Op::STQA:
     case Op::STQR: store_ls(ctx, ls_target(inst, pc), t); break;

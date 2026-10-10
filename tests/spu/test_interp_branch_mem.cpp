@@ -49,6 +49,22 @@ TEST_CASE("quadword loads: d, x, a, r forms, alignment masking and LS wrap")
     CHECK(gw(m.r(3), 0) == 0x40414243u);
 }
 
+TEST_CASE("d-form loads and stores add their offset modulo 2^32, past the largest int (D-605)")
+{
+    // The register's preferred word plus I10 * 16 wraps as the SPU's adder does: the interpreter added them as s32,
+    // which overflows (undefined behaviour, UBSan's report in the differential fuzzing) for a base near 2^31.
+    Machine m;
+    fill_ls(m, 0x1FE0);
+    m.r(1) = words(0x7FFFFFF0, 0, 0, 0);
+    m.exec(as::lqd(3, 0x1FF0, 1)); // 0x7FFFFFF0 + 0x1FF0 = 0x80001FE0 -> LS 0x1FE0
+    CHECK(gw(m.r(3), 0) == 0x40414243u);
+    m.r(1) = words(0x80000010, 0, 0, 0);
+    m.r(7) = words(0x00112233, 0x44556677, 0x8899AABB, 0xCCDDEEFF);
+    m.exec(as::stqd(7, -0x2000, 1)); // 0x80000010 - 0x2000 = 0x7FFFE010 -> LS 0x3E010
+    CHECK(m.ls.data()[0x3E010] == 0x00);
+    CHECK(m.ls.data()[0x3E01F] == 0xFF);
+}
+
 TEST_CASE("quadword stores write big-endian bytes")
 {
     Machine m;
