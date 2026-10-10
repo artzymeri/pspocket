@@ -9612,3 +9612,41 @@ Tests: tests/hle/test_spurs_task2.cpp: both's checks, STAT unbound; a container 
 ELF word and exit slot), TryGet BUSY before the task ran, a Get that waits for it, the code as often as asked; bound
 again to a task that waits for a signal (the old code forgotten, BUSY until the new one comes); a container that is not
 guest memory FAULT, on a CellSpursTaskset PERM. test_spurs_run.cpp's exit callback and handler tests are unchanged.
+
+## D-628 · 2026-10-10 · cellSpurs: the LF queue's bodies and lv2 event queue through SPURS, unverified
+
+_cellSpursLFQueuePushBody, PopBody, cellSpursLFQueueAttachLv2EventQueue and DetachLv2EventQueue are pspocket's own
+(runtime/hle/src/cellSpurs.cpp, over cellSync.cpp's queue), unverified (D-594; RPCS3: todos answering CELL_OK; libsre
+was not read). A SPURS LF queue is a CellSyncLFQueue whose eaSignal is its taskset, or its CellSpurs with bit 0 set for
+one of the whole instance (cellSpursLFQueueInitializeIWL), as _cellSpursLFQueueInitialize leaves it (D-171); its SPU side
+is task code (or a workload's policy module) that waits in the queue's rings for a signal, which a completion gives with
+fpSendSignal(eaSignal, the waiter's ID).
+- **The bodies** (queue, buffer, isBlocking: cellSpursLFQueuePush, TryPush, Pop and TryPop pass 1 or 0): cellSync's
+  bodies (their checks, the first forms for PPU2SPU and SPU2PPU queues, the second for ANY2ANY, D-625) with a signal
+  where cellSync's pass none, so a task waiting for an entry or for room is woken: _cellSpursSendSignal(taskset, ID) for
+  a taskset's queue, cellSpursSendWorkloadSignal(spurs, ID) for one of the whole instance (its waiters taken to be
+  workloads); their answer is the body's (a waiter that is no task: SRCH, the entry in). cellSync's errors become task
+  errors with their low byte (as _cellSpursLFQueueInitialize's, RPCS3's SyncErrorToSpursError). A blocked body sleeps
+  until the queue's line changes, as cellSync's do: it does not wait on an attached lv2 queue.
+- **The lv2 event queue** (queue), as cellSpursEventFlagAttachLv2EventQueue makes the event flag's: a PPU queue
+  "_spuLFQ" (127 entries, as cellSync's attach, D-625) on a dynamic SPU port of the queue's SPURS instance (the lowest
+  free of 0x10..0x3F, a port SPURS takes for itself, D-040), which SPU tasks throw their wake-up to; m_bs = the port (a
+  word, as cellSync's attach) and m_eq_id = the queue, in one update of the line. The pointer functions with
+  useEventQueue sleep on it (cellSync's, D-169). Checks: NULL, ALIGN, memory (FAULT, the taskset's too), an SPU2SPU
+  queue PERM, one attached already or none to detach STAT, detaching while a PPU thread waits on it (its side's event
+  state) BUSY; the port's errors (an instance in exception state, no free port, not initialized) as task errors, the
+  queue destroyed again. Detach puts m_bs back as Initialize left it, detaches the port and destroys the queue.
+
+To compare on the Mac: whether libsre's bodies sleep on the lv2 queue when one is attached (useEventQueue 1) and which
+signal function they pass (and what an IWL queue's waiters are); the queue's name, size and protocol; where the port
+goes and how the SPU side of the SPURS queue library reads it; the checks and codes. A different place for the port
+would leave a PPU thread in the pointer functions with useEventQueue waiting for a wake-up sent elsewhere; the bodies
+cannot hang so.
+
+Tests: tests/hle/test_spurs_task2.cpp: the bodies' checks as task errors; a PPU2SPU queue pushed until full (AGAIN),
+popped by SPU code (the host on its behalf, GETLLAR/PUTLLC), a blocked push let go by a pop; a task waiting in the push
+ring signalled by the PPU's push and joined, a waiter that is no task (SRCH, the entry in); an SPU2PPU queue popped, a
+task waiting for room signalled, a blocked pop let go by a push; ANY2ANY both ways; an IWL queue's waiter signalled with
+cellSpursSendWorkloadSignal (its workload's signal bit), one that does not exist (SRCH); the attach and detach (the
+queue, its port in the instance's map and not in spuPortBits, a PPU thread in GetPushPointer with the event queue woken
+by an SPU event on that port, BUSY while one waits, all of it gone after the detach, an IWL ANY2ANY queue).

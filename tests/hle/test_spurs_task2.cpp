@@ -1,6 +1,7 @@
 // cellSpurs' last functions on the native SPURS, made without libsre to compare with (unverified, D-594), with
 // synthetic SPU tasks (assembled here: no game data): CellSpursTaskset2's own tasks, created, run and joined with their
-// exit codes (D-626); task exit code containers (D-627).
+// exit codes (D-626); task exit code containers (D-627); the LF queue's bodies and lv2 event queue through SPURS, with
+// PPU threads on one side and SPU code (the host on its behalf, or a waiting task) on the other (D-628).
 
 #include "hle_test_util.hpp"
 
@@ -39,11 +40,13 @@ constexpr u32 kId = kData + 0xF000, kArg = kData + 0xF100, kAttr2 = kData + 0xF4
 constexpr u32 kOut = kData + 0x10000;  // each task's reports, 0x100 apart
 constexpr u32 kCtx = kData + 0x20000;  // context save areas: 1 KB + one LS block, 0x1000 apart
 constexpr u32 kElf = kData + 0x30000;  // task ELFs, 0x1000 apart
+constexpr u32 kLfq = kData + 0x40000, kLfqBuf = kData + 0x41000, kSrc = kData + 0x42000, kDst = kData + 0x42100,
+              kOutWord = kData + 0x42200, kLfq2 = kData + 0x42400;
 constexpr u32 kUnmapped = 0x0FFF0000;
 constexpr u32 kBuf = 0x3800; // the tasks' LS buffer for DMA
 
-constexpr u32 TASK = 0x80410900;
-constexpr u32 kInval = 0x02, kSrch = 0x05, kNoexec = 0x07, kPerm = 0x09, kBusy = 0x0A, kFault = 0x0D,
+constexpr u32 TASK = 0x80410900, POLICY = 0x80410800;
+constexpr u32 kAgain = 0x01, kInval = 0x02, kSrch = 0x05, kNoexec = 0x07, kPerm = 0x09, kBusy = 0x0A, kFault = 0x0D,
               kStat = 0x0F, kAlign = 0x10, kNull = 0x11, kShutdown = 0x20;
 u64 code(u32 c) { return r3_of_code(c); }
 
@@ -298,7 +301,8 @@ TEST_CASE("cellSpurs: the functions made without libsre to compare with, under t
 {
     for (const char* name : {"cellSpursCreateTask2", "cellSpursCreateTask2WithBinInfo", "cellSpursJoinTask2",
              "cellSpursTryJoinTask2", "cellSpursDestroyTaskset2", "cellSpursTaskExitCodeGet",
-             "cellSpursTaskExitCodeTryGet"}) {
+             "cellSpursTaskExitCodeTryGet", "_cellSpursLFQueuePushBody", "_cellSpursLFQueuePopBody",
+             "cellSpursLFQueueAttachLv2EventQueue", "cellSpursLFQueueDetachLv2EventQueue"}) {
         INFO(name);
         const hle::Function* fn = hle::registry().find("cellSpurs", recomp::nid_of(name));
         REQUIRE(fn != nullptr);
@@ -614,4 +618,304 @@ TEST_CASE("cellSpursTaskExitCodeGet and TryGet: their checks; a container cellSp
     REQUIRE(s.a.call("cellSpursCreateTaskset", kSpurs, kTs1, 0, kPrio, 1) == 0);
     ps_write64(b, kTaskAttr + 0x40, kContainer);
     CHECK(s.a.call("cellSpursCreateTaskWithAttribute", kTs1, kId, kTaskAttr) == code(TASK | kPerm));
+}
+
+// ------------------------------------------------------------------------------------------------- D-628
+
+namespace {
+
+// CellSyncLFQueue's fields (RPCS3 cellSync.h).
+constexpr u32 kH1 = 0x00, kH3 = 0x04, kH4 = 0x06, kH5 = 0x08, kH7 = 0x0C, kH8 = 0x0E, kBs = 0x20, kPush2 = 0x30,
+              kHs1 = 0x32, kPop2 = 0x50, kHs2 = 0x52, kEqId = 0x7C;
+constexpr u32 SPU2SPU = 0, SPU2PPU = 1, PPU2SPU = 2, ANY2ANY = 3;
+
+void put_entry(u8* b, u32 addr, u32 v)
+{
+    for (u32 i = 0; i < 16; i += 4) ps_write32(b, addr + i, v);
+}
+
+// An SPU's update of a line: GETLLAR, the change, PUTLLC, again until it lands (test_sync.cpp's).
+template <class Fn>
+bool spu_update(u8* b, u32 addr, Fn fn)
+{
+    alignas(16) u8 line[PS_RES_LINE_SIZE];
+    alignas(16) u8 data[PS_RES_LINE_SIZE];
+    for (;;) {
+        const u64 version = ps_res_acquire(b, addr, line);
+        std::memcpy(data, line, sizeof data);
+        if (!fn(data)) return false;
+        if (ps_res_store_line(b, addr, version, line, data)) return true;
+    }
+}
+
+// SPU code's side of the queue at `q` (entries at `entries`), in order: a pop of a PPU2SPU queue, a push into an
+// SPU2PPU one (test_sync.cpp's). False when there is no entry (no room).
+bool spu_pop(u8* b, u32 q, u32 entries, u32 depth, u32& value)
+{
+    s32 p = -1;
+    spu_update(b, q, [&](u8* l) {
+        const s32 next = static_cast<s16>(ps_read16(l, kH4));
+        s32 avail = ps_read16(l, kH5) - next;
+        if (avail < 0) avail += 2 * static_cast<s32>(depth);
+        if (avail <= 0) return false;
+        p = next;
+        ps_write16(l, kH4, static_cast<u16>(p + 1 >= static_cast<s32>(2 * depth) ? 0 : p + 1));
+        return true;
+    });
+    if (p < 0) return false;
+    value = ps_read32(b, entries + 16 * (static_cast<u32>(p) % depth));
+    spu_update(b, q, [&](u8* l) {
+        ps_write16(l, kH1, static_cast<u16>(p + 1 >= static_cast<s32>(2 * depth) ? 0 : p + 1));
+        return true;
+    });
+    return true;
+}
+
+bool spu_push(u8* b, u32 q, u32 entries, u32 depth, u32 value)
+{
+    s32 p = -1;
+    spu_update(b, q, [&](u8* l) {
+        const s32 next = static_cast<s16>(ps_read16(l, kH8));
+        s32 used = next - ps_read16(l, kH1);
+        if (used < 0) used += 2 * static_cast<s32>(depth);
+        if (used >= static_cast<s32>(depth)) return false;
+        p = next;
+        ps_write16(l, kH8, static_cast<u16>(p + 1 >= static_cast<s32>(2 * depth) ? 0 : p + 1));
+        return true;
+    });
+    if (p < 0) return false;
+    put_entry(b, entries + 16 * (static_cast<u32>(p) % depth), value);
+    spu_update(b, q, [&](u8* l) {
+        ps_write16(l, kH5, static_cast<u16>(p + 1 >= static_cast<s32>(2 * depth) ? 0 : p + 1));
+        return true;
+    });
+    return true;
+}
+
+// SPU code that found the queue empty (or full) and waits: its ID at the tail of the side's ring (the pack's tail moves
+// on), then the wait for a signal (here the task's own syscall).
+void spu_wait_in_ring(u8* b, u32 q, u32 pack, u32 ring, u32 id)
+{
+    spu_update(b, q, [&](u8* l) {
+        const u16 p = ps_read16(l, pack);
+        const u32 tail = p & 0x1F;
+        ps_write16(l, ring + 2 * (tail >= 15 ? tail - 15 : tail), static_cast<u16>(id));
+        ps_write16(l, pack, static_cast<u16>((p & ~0x1Fu) | (tail == 0x1D ? 0 : tail + 1)));
+        return true;
+    });
+}
+
+// sys_spu_thread_throw_event(port, 0, 0) from an SPU of `spurs`, as the native workers deliver it (test_spurs_queue.cpp's).
+void throw_event(Fixture& f, u32 spurs, u32 port)
+{
+    u32 queue_id = 0;
+    {
+        hle::spurs::SpursHost& h = hle::spurs::host();
+        std::lock_guard lock(h.mutex);
+        queue_id = h.instances.at(spurs).spu_ports.at(static_cast<u8>(port));
+    }
+    const auto q = f.kernel->event_queue(queue_id);
+    REQUIRE(q != nullptr);
+    REQUIRE(q->send(lv2::Event{0xFFFFFFFF53505501ull, 0, u64{port} << 32, 0}) == lv2::CELL_OK);
+}
+
+} // namespace
+
+TEST_CASE("_cellSpursLFQueuePushBody and PopBody: a taskset's queues pushed and popped by the PPU against SPU code; a "
+          "waiting task taken from the ring is signalled through _cellSpursSendSignal (D-628)",
+    "[hle][spurs][spurs-task2]")
+{
+    Task2Fixture s;
+    u8* b = s.b;
+    for (const char* fn : {"_cellSpursLFQueuePushBody", "_cellSpursLFQueuePopBody"}) {
+        INFO(fn);
+        CHECK(s.a.call(fn, 0, kSrc, 0) == code(TASK | kNull));
+        CHECK(s.a.call(fn, kLfq, 0, 0) == code(TASK | kNull));
+        CHECK(s.a.call(fn, kLfq + 64, kSrc, 0) == code(TASK | kAlign));
+        CHECK(s.a.call(fn, kLfq, kSrc + 8, 0) == code(TASK | kAlign));
+        CHECK(s.a.call(fn, kUnmapped, kSrc, 0) == code(TASK | kFault));
+    }
+
+    // PPU2SPU: the PPU pushes, SPU code pops.
+    std::memset(b + kLfq, 0, 128);
+    REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kTs2, kLfq, kLfqBuf, 16, 4, PPU2SPU) == 0);
+    for (u32 v = 1; v <= 4; v++) {
+        put_entry(b, kSrc, v);
+        REQUIRE(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, v % 2) == 0);
+        CHECK(ps_read32(b, kLfqBuf + 16 * (v - 1)) == v);
+    }
+    CHECK(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, 0) == code(TASK | kAgain));
+    CHECK(s.a.call("_cellSpursLFQueuePopBody", kLfq, kDst, 0) == code(TASK | kPerm));
+    for (u32 v = 1; v <= 4; v++) {
+        u32 value = 0;
+        REQUIRE(spu_pop(b, kLfq, kLfqBuf, 4, value));
+        CHECK(value == v);
+    }
+    // A blocked push of a full queue goes on when SPU code pops (another thread here).
+    for (u32 v = 5; v <= 8; v++) REQUIRE(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, 0) == 0);
+    {
+        put_entry(b, kSrc + 0x40, 9);
+        Caller push(s.f, 1, "_cellSpursLFQueuePushBody", {kLfq, kSrc + 0x40, 1});
+        CHECK(push.blocked());
+        u32 value = 0;
+        REQUIRE(spu_pop(b, kLfq, kLfqBuf, 4, value));
+        push.join();
+        CHECK(push.result == 0);
+    }
+    for (u32 n = 0; n < 4; n++) {
+        u32 value = 0;
+        REQUIRE(spu_pop(b, kLfq, kLfqBuf, 4, value));
+    }
+    // A task finds the queue empty and waits in the push side's ring; the PPU's push takes it from there and signals it
+    // through _cellSpursSendSignal(taskset, its ID): it resumes and ends.
+    const u32 w = s.create(0, waiting_task(0x31), "popper", true);
+    s.run();
+    REQUIRE(wait_for([&] { return s.report(0) == 1 && s.task_bit(0x50, w); }));
+    spu_wait_in_ring(b, kLfq, kPush2, kHs1, w);
+    put_entry(b, kSrc, 10);
+    REQUIRE(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, 1) == 0);
+    REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, w, kExit) == 0);
+    CHECK(ps_read32(b, kExit) == 0x31);
+    CHECK(s.report(0, 16) == 2);
+    CHECK((line_half(b, kLfq + kPush2) >> 10 & 0x1F) == (line_half(b, kLfq + kPush2) & 0x1F)); // the ring is empty
+    // A waiter that is no task of the taskset: _cellSpursSendSignal's SRCH is the push's answer (the entry is in).
+    spu_wait_in_ring(b, kLfq, kPush2, kHs1, 77);
+    CHECK(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, 1) == code(TASK | kSrch));
+    CHECK(line_half(b, kLfq + kH5) == 3);
+
+    // SPU2PPU: SPU code pushes, the PPU pops; the pop completion wakes a task waiting for room.
+    std::memset(b + kLfq2, 0, 128);
+    REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kTs2, kLfq2, kLfqBuf + 0x100, 16, 2, SPU2PPU) == 0);
+    CHECK(s.a.call("_cellSpursLFQueuePopBody", kLfq2, kDst, 0) == code(TASK | kAgain));
+    CHECK(s.a.call("_cellSpursLFQueuePushBody", kLfq2, kSrc, 0) == code(TASK | kPerm));
+    REQUIRE(spu_push(b, kLfq2, kLfqBuf + 0x100, 2, 21));
+    REQUIRE(spu_push(b, kLfq2, kLfqBuf + 0x100, 2, 22));
+    const u32 w2 = s.create(1, waiting_task(0x32), "pusher", true);
+    REQUIRE(wait_for([&] { return s.report(1) == 1 && s.task_bit(0x50, w2); }));
+    spu_wait_in_ring(b, kLfq2, kPop2, kHs2, w2);
+    REQUIRE(s.a.call("_cellSpursLFQueuePopBody", kLfq2, kDst, 1) == 0);
+    CHECK(ps_read32(b, kDst) == 21);
+    REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, w2, kExit) == 0);
+    CHECK(ps_read32(b, kExit) == 0x32);
+    {
+        Caller pop(s.f, 1, "_cellSpursLFQueuePopBody", {kLfq2, kDst + 0x40, 1});
+        REQUIRE(wait_for([&] { return pop.done(); }));
+        CHECK(pop.result == 0);
+        CHECK(ps_read32(b, kDst + 0x40) == 22);
+    }
+    {
+        Caller pop(s.f, 1, "_cellSpursLFQueuePopBody", {kLfq2, kDst + 0x40, 1});
+        CHECK(pop.blocked()); // empty
+        REQUIRE(spu_push(b, kLfq2, kLfqBuf + 0x100, 2, 23));
+        pop.join();
+        CHECK(pop.result == 0);
+        CHECK(ps_read32(b, kDst + 0x40) == 23);
+    }
+
+    // ANY2ANY: both sides from PPU threads (cellSync's second forms).
+    std::memset(b + kLfq2, 0, 128);
+    REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kTs2, kLfq2, kLfqBuf + 0x100, 16, 2, ANY2ANY) == 0);
+    for (u32 v = 30; v < 36; v++) {
+        put_entry(b, kSrc, v);
+        REQUIRE(s.a.call("_cellSpursLFQueuePushBody", kLfq2, kSrc, 1) == 0);
+        REQUIRE(s.a.call("_cellSpursLFQueuePopBody", kLfq2, kDst, 1) == 0);
+        CHECK(ps_read32(b, kDst) == v);
+    }
+    CHECK(s.a.call("_cellSpursLFQueuePopBody", kLfq2, kDst, 0) == code(TASK | kAgain));
+}
+
+TEST_CASE("_cellSpursLFQueuePushBody: a queue of the whole instance (IWL) wakes the workload waiting in its ring with "
+          "cellSpursSendWorkloadSignal (D-628)", "[hle][spurs][spurs-task2]")
+{
+    Task2Fixture s(false);
+    u8* b = s.b;
+    std::memset(b + kLfq, 0, 128);
+    REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kSpurs | 1, kLfq, kLfqBuf, 16, 2, PPU2SPU) == 0);
+    CHECK(ps_read64(b, kLfq + 0x70) == (kSpurs | 1));
+    CHECK((line_half(b, kSpurs + 0x70) & (0x8000 >> s.wid)) == 0);
+    spu_wait_in_ring(b, kLfq, kPush2, kHs1, s.wid); // the taskset's workload stands for one waiting
+    put_entry(b, kSrc, 1);
+    REQUIRE(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, 0) == 0);
+    CHECK((line_half(b, kSpurs + 0x70) & (0x8000 >> s.wid)) != 0); // its workload signal
+    // A workload that does not exist: cellSpursSendWorkloadSignal's SRCH is the answer.
+    spu_wait_in_ring(b, kLfq, kPush2, kHs1, 9);
+    CHECK(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, 0) == code(POLICY | kSrch));
+}
+
+TEST_CASE("cellSpursLFQueueAttachLv2EventQueue and Detach: an lv2 queue on a dynamic SPU port of the queue's SPURS, "
+          "which wakes a PPU blocked in the pointer functions with useEventQueue (D-628)", "[hle][spurs][spurs-task2]")
+{
+    Task2Fixture s(false);
+    u8* b = s.b;
+    for (const char* fn : {"cellSpursLFQueueAttachLv2EventQueue", "cellSpursLFQueueDetachLv2EventQueue"}) {
+        INFO(fn);
+        CHECK(s.a.call(fn, 0) == code(TASK | kNull));
+        CHECK(s.a.call(fn, kLfq + 0x20) == code(TASK | kAlign));
+        CHECK(s.a.call(fn, kUnmapped) == code(TASK | kFault));
+    }
+    std::memset(b + kLfq2, 0, 128);
+    REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kTs2, kLfq2, kLfqBuf, 16, 2, SPU2SPU) == 0);
+    CHECK(s.a.call("cellSpursLFQueueAttachLv2EventQueue", kLfq2) == code(TASK | kPerm)); // no PPU side
+    std::memset(b + kLfq, 0, 128);
+    REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kTs2, kLfq, kLfqBuf, 16, 2, PPU2SPU) == 0);
+    CHECK(s.a.call("cellSpursLFQueueDetachLv2EventQueue", kLfq) == code(TASK | kStat)); // none attached
+
+    REQUIRE(s.a.call("cellSpursLFQueueAttachLv2EventQueue", kLfq) == 0);
+    const u32 port = ps_read32(b, kLfq + kBs), eq = ps_read32(b, kLfq + kEqId);
+    CHECK(port >= 0x10);
+    CHECK(port <= 0x3F);
+    REQUIRE(s.f.kernel->event_queue(eq) != nullptr);
+    {
+        hle::spurs::SpursHost& h = hle::spurs::host();
+        std::lock_guard lock(h.mutex);
+        CHECK(h.instances.at(kSpurs).spu_ports.at(static_cast<u8>(port)) == eq);
+    }
+    CHECK((ps_read64(b, kSpurs + 0xDA8) >> port & 1) == 0); // a port SPURS took for itself: not in spuPortBits
+    CHECK(s.a.call("cellSpursLFQueueAttachLv2EventQueue", kLfq) == code(TASK | kStat)); // one already
+
+    // Full: a PPU thread's GetPushPointer with the event queue sleeps on it until SPU code pops and throws its event.
+    for (u32 v = 0; v < 2; v++) REQUIRE(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, 0) == 0);
+    {
+        Caller get(s.f, 1, "_cellSyncLFQueueGetPushPointer", {kLfq, kOutWord, 1, 1});
+        REQUIRE(get.parked_on(lv2::WaitKind::EventQueue));
+        u32 value = 0;
+        REQUIRE(spu_pop(b, kLfq, kLfqBuf, 2, value));
+        CHECK(get.blocked());
+        throw_event(s.f, kSpurs, port);
+        get.join();
+        CHECK(get.result == 0);
+        CHECK(ps_read32(b, kOutWord) == 2);
+    }
+    REQUIRE(s.a.call("_cellSyncLFQueueCompletePushPointer", kLfq, 2, 0) == 0);
+    // Detach: BUSY while a PPU thread waits on it (isBlocking 3 marks its side's event state), then gone.
+    {
+        Caller get(s.f, 1, "_cellSyncLFQueueGetPushPointer", {kLfq, kOutWord, 3, 1});
+        REQUIRE(get.parked_on(lv2::WaitKind::EventQueue));
+        CHECK(line_half(b, kLfq + kH7) == 3);
+        CHECK(s.a.call("cellSpursLFQueueDetachLv2EventQueue", kLfq) == code(TASK | kBusy));
+        u32 value = 0;
+        REQUIRE(spu_pop(b, kLfq, kLfqBuf, 2, value));
+        throw_event(s.f, kSpurs, port);
+        get.join();
+        CHECK(get.result == 0);
+    }
+    REQUIRE(s.a.call("cellSpursLFQueueDetachLv2EventQueue", kLfq) == 0);
+    CHECK(ps_read32(b, kLfq + kBs) == 0xFFFFFFFF);
+    CHECK(ps_read32(b, kLfq + kEqId) == 0);
+    CHECK(s.f.kernel->event_queue(eq) == nullptr);
+    {
+        hle::spurs::SpursHost& h = hle::spurs::host();
+        std::lock_guard lock(h.mutex);
+        CHECK_FALSE(h.instances.at(kSpurs).spu_ports.contains(static_cast<u8>(port)));
+    }
+    CHECK(s.a.call("cellSpursLFQueueDetachLv2EventQueue", kLfq) == code(TASK | kStat));
+
+    // A queue of the whole instance (IWL), ANY2ANY: the same, its m_bs back to what Initialize left.
+    std::memset(b + kLfq2, 0, 128);
+    REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kSpurs | 1, kLfq2, kLfqBuf, 16, 2, ANY2ANY) == 0);
+    REQUIRE(s.a.call("cellSpursLFQueueAttachLv2EventQueue", kLfq2) == 0);
+    CHECK(ps_read32(b, kLfq2 + kBs) >= 0x10);
+    REQUIRE(s.a.call("cellSpursLFQueueDetachLv2EventQueue", kLfq2) == 0);
+    CHECK(ps_read32(b, kLfq2 + kBs) == 0xFFFF0000);
+    CHECK(line_half(b, kLfq2 + kH3) == 0);
 }

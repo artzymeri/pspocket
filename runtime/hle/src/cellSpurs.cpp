@@ -3662,6 +3662,170 @@ s32 cellSpursLFQueueGetTasksetAddress(PPUContext& ctx, u32 queue, u32 taskset)
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------- the LF queue's bodies and lv2 queue
+//
+// _cellSpursLFQueuePushBody, PopBody, cellSpursLFQueueAttachLv2EventQueue and DetachLv2EventQueue (D-628, unverified:
+// RPCS3 has todos answering CELL_OK, libsre was not read). A SPURS LF queue is a CellSyncLFQueue whose eaSignal is its
+// taskset, or its CellSpurs with bit 0 set for one of the whole instance (cellSpursLFQueueInitializeIWL), as
+// _cellSpursLFQueueInitialize leaves it. Its SPU side is task code (or a workload's policy module) that waits in the
+// queue's rings for a signal; its PPU side are these.
+
+// CellSyncLFQueue's fields these use (cellSync.cpp's lfq_off; RPCS3 cellSync.h).
+namespace lfq {
+constexpr u32 h3 = 0x04, h7 = 0x0C, bs = 0x20, direction = 0x24, ea_signal = 0x70, eq_id = 0x7C;
+constexpr u32 SPU2SPU = 0, ANY2ANY = 3;
+}
+
+// A cellSync error from the queue's own functions as a task error with the same low byte (RPCS3's
+// SyncErrorToSpursError, as _cellSpursLFQueueInitialize converts them); other answers pass unchanged.
+s32 sync_to_task_error(s32 rc)
+{
+    const u32 u = static_cast<u32>(rc);
+    return (u & 0xFFFFFF00u) == 0x80410100u ? error(0x80410900u | (u & 0xFF)) : rc;
+}
+
+// The signal a completion gives the SPU waiter it took from the ring: _cellSpursSendSignal(taskset, task) for a
+// taskset's queue, cellSpursSendWorkloadSignal(spurs, workload) for one of the whole instance (its waiters are
+// workloads); their answer is the body's.
+s32 lfqueue_signal(PPUContext& ctx, u32 ea_signal, u32 waiter)
+{
+    if (ea_signal & 1) return cellSpursSendWorkloadSignal(ctx, ea_signal & ~1u, waiter);
+    return _cellSpursSendSignal(ctx, ea_signal, waiter);
+}
+
+// _cellSpursLFQueuePushBody(queue, buffer, isBlocking) and _cellSpursLFQueuePopBody (cellSpursLFQueuePush, TryPush,
+// Pop and TryPop pass 1 or 0): cellSync's bodies (their checks, the first forms for PPU2SPU and SPU2PPU queues, the
+// second for ANY2ANY, D-625) with the signal above where cellSync's pass none, so a task waiting for an entry (or for
+// room) is woken; cellSync's errors as task errors. A blocked call sleeps until the queue's line changes, as cellSync's
+// bodies: it does not wait on an attached lv2 queue (which the pointer functions with useEventQueue do).
+s32 spurs_lfqueue_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push)
+{
+    static const LfSignal signal = lfqueue_signal;
+    return sync_to_task_error(sync_lfqueue_body(ctx, fn, queue, buffer, is_blocking, push, signal));
+}
+
+s32 _cellSpursLFQueuePushBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_blocking)
+{
+    return spurs_lfqueue_body(ctx, "_cellSpursLFQueuePushBody", queue, buffer, is_blocking, true);
+}
+
+s32 _cellSpursLFQueuePopBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_blocking)
+{
+    return spurs_lfqueue_body(ctx, "_cellSpursLFQueuePopBody", queue, buffer, is_blocking, false);
+}
+
+// The checks of the attach and detach: NULL, 128-byte ALIGN, memory (FAULT); an SPU2SPU queue has no PPU side to wake
+// (PERM); `spurs` gets the queue's SPURS instance from eaSignal (the taskset's, which must be guest memory).
+s32 check_spurs_lfqueue(PPUContext& ctx, std::string_view fn, u32 queue, u32& spurs)
+{
+    if (!queue) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (queue % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "queue", queue, 128, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, queue + lfq::direction) == lfq::SPU2SPU) return error(CELL_SPURS_TASK_ERROR_PERM);
+    const u32 signal = static_cast<u32>(ps_read64(base, queue + lfq::ea_signal));
+    if (signal & 1) {
+        spurs = signal & ~1u;
+        return lv2::CELL_OK;
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "taskset", signal, ts_off::size, CELL_SPURS_TASK_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    spurs = static_cast<u32>(ps_read64(base, signal + ts_off::spurs));
+    return lv2::CELL_OK;
+}
+
+// cellSpursLFQueueAttachLv2EventQueue(queue): the lv2 event queue a PPU thread blocked in the queue's pointer functions
+// with useEventQueue receives from, as cellSpursEventFlagAttachLv2EventQueue makes the event flag's (RPCS3
+// _spurs::create_lv2_eq): a PPU queue "_spuLFQ" (127 entries, as cellSync's attach, D-625) on a dynamic SPU port of
+// the queue's SPURS instance (attach_lv2_eq: the lowest free of 0x10..0x3F, a port SPURS makes for itself), which SPU
+// tasks send their wake-up to; m_bs = the port (a word, as cellSync's) and m_eq_id = the queue, in one update of the
+// line. The checks above; a queue attached already is STAT; the port's errors (an instance in exception state: STAT,
+// no free port: BUSY, not initialized: ESRCH) as task errors, the lv2 queue destroyed again.
+s32 cellSpursLFQueueAttachLv2EventQueue(PPUContext& ctx, u32 queue)
+{
+    constexpr std::string_view fn = "cellSpursLFQueueAttachLv2EventQueue";
+    u32 spurs = 0;
+    if (const s32 rc = check_spurs_lfqueue(ctx, fn, queue, spurs); rc != lv2::CELL_OK) return rc;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    {
+        alignas(16) u8 line[PS_RES_LINE_SIZE];
+        ps_res_acquire(base, queue, line);
+        if (ps_read32(line, lfq::eq_id)) return error(CELL_SPURS_TASK_ERROR_STAT);
+    }
+    StackVar vars(ctx, base, 0x20); // the queue's ID, sys_event_queue_attribute_t {protocol, type, name[8]}
+    const u32 id_out = vars.addr(), attr = vars.addr() + 0x10;
+    ps_write32(base, attr, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, attr + 4, lv2::SYS_PPU_QUEUE);
+    std::memcpy(base + attr + 8, "_spuLFQ", 8);
+    if (const s32 rc = lv2::sys_event_queue_create(t, id_out, attr, 0, 127); rc != lv2::CELL_OK) return task_error(rc);
+    const u32 eq = ps_read32(base, id_out);
+    u8 port = 0;
+    if (const s32 rc = attach_lv2_eq(ctx, spurs, eq, port, true, true); rc != lv2::CELL_OK) {
+        lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+        return task_error(rc);
+    }
+    bool attached = false;
+    reservation_op(base, queue, [&](u8* q) {
+        attached = ps_read32(q, lfq::eq_id) != 0;
+        if (attached) return false;
+        ps_write32(q, lfq::bs, port);
+        ps_write32(q, lfq::eq_id, eq);
+        return true;
+    });
+    if (attached) { // another thread attached one meanwhile
+        if (detach_lv2_eq(base, spurs, port, true, t.kernel.config().sdk_version) == lv2::CELL_OK) {
+            lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+        }
+        return error(CELL_SPURS_TASK_ERROR_STAT);
+    }
+    PS_LOG_INFO(kChan, "{}({:#x}): lv2 event queue {:#x} on SPU port {:#x} of SPURS {:#x}", fn, queue, eq, port, spurs);
+    return lv2::CELL_OK;
+}
+
+// cellSpursLFQueueDetachLv2EventQueue(queue): the checks above; no queue attached is STAT, a PPU thread waiting on it
+// (its side's event state, m_h7 or m_h3, set) BUSY; then m_bs back as cellSyncLFQueueInitialize left it (all ones, an
+// ANY2ANY queue's first two bytes) and m_eq_id 0 in one update of the line, the SPU port detached and the lv2 queue
+// destroyed.
+s32 cellSpursLFQueueDetachLv2EventQueue(PPUContext& ctx, u32 queue)
+{
+    constexpr std::string_view fn = "cellSpursLFQueueDetachLv2EventQueue";
+    u32 spurs = 0;
+    if (const s32 rc = check_spurs_lfqueue(ctx, fn, queue, spurs); rc != lv2::CELL_OK) return rc;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    u32 eq = 0, port = 0;
+    s32 rc = lv2::CELL_OK;
+    reservation_op(base, queue, [&](u8* q) {
+        eq = ps_read32(q, lfq::eq_id);
+        port = ps_read32(q, lfq::bs);
+        rc = lv2::CELL_OK;
+        if (!eq) {
+            rc = error(CELL_SPURS_TASK_ERROR_STAT);
+            return false;
+        }
+        const bool any2any = ps_read32(q, lfq::direction) == lfq::ANY2ANY;
+        if (!any2any && (ps_read16(q, lfq::h3) || ps_read16(q, lfq::h7))) {
+            rc = error(CELL_SPURS_TASK_ERROR_BUSY);
+            return false;
+        }
+        ps_write32(q, lfq::bs, any2any ? 0xFFFF0000u : 0xFFFFFFFFu);
+        ps_write32(q, lfq::eq_id, 0);
+        return true;
+    });
+    if (rc != lv2::CELL_OK) return rc;
+    if (const s32 r = detach_lv2_eq(base, spurs, static_cast<u8>(port & 0x3F), true, t.kernel.config().sdk_version);
+        r != lv2::CELL_OK) {
+        PS_LOG_WARN(kChan, "{}({:#x}): detaching SPU port {:#x} of SPURS {:#x}: {:#x}", fn, queue, port, spurs,
+            static_cast<u32>(r));
+    }
+    lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+    PS_LOG_INFO(kChan, "{}({:#x}): lv2 event queue {:#x} and SPU port {:#x} gone", fn, queue, eq, port);
+    return lv2::CELL_OK;
+}
+
 // ------------------------------------------------------------------------------------------------- barriers
 
 // RPCS3 cellSpursBarrierInitialize. CellSpursBarrier (128 bytes, 128-aligned): zero, remained (u32), taskset at 0x34.
@@ -4511,7 +4675,7 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xE7B0E69A, cellSpursJobSetMaxGrab),
         PS_HLE_INTERNAL(NID_event_helper, _pspocket_spurs_event_helper),
         // Made without libsre to compare with (D-594): CellSpursTaskset2's tasks (D-626), the exit code containers
-        // (D-627).
+        // (D-627), the LF queue's bodies and lv2 event queue (D-628).
         PS_HLE_UNVERIFIED(0xE14CA62D, cellSpursCreateTask2),
         PS_HLE_UNVERIFIED(0xE4944A1C, cellSpursCreateTask2WithBinInfo),
         PS_HLE_UNVERIFIED(0xA7A94892, cellSpursJoinTask2),
@@ -4519,6 +4683,10 @@ void register_cellSpurs(Registry& r)
         PS_HLE_UNVERIFIED(0x1EBCF459, cellSpursDestroyTaskset2),
         PS_HLE_UNVERIFIED(0x13AE18F3, cellSpursTaskExitCodeGet),
         PS_HLE_UNVERIFIED(0xE717AC73, cellSpursTaskExitCodeTryGet),
+        PS_HLE_UNVERIFIED(0x8A85674D, _cellSpursLFQueuePushBody),
+        PS_HLE_UNVERIFIED(0x35DAE22B, _cellSpursLFQueuePopBody),
+        PS_HLE_UNVERIFIED(0x1656D49F, cellSpursLFQueueAttachLv2EventQueue),
+        PS_HLE_UNVERIFIED(0x73E06F91, cellSpursLFQueueDetachLv2EventQueue),
     });
 }
 
