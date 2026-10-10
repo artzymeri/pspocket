@@ -9799,3 +9799,57 @@ not; the quality asked for when it fits; a limit nothing fits: quality 1's first
 (four, BUSY, EMPTY, oldest first, userData, Reset, a buffer too small); WaitForOutput and WaitForInput blocking until
 another thread encodes or takes a stream, and RESET when it resets the encoder; a file on /dev_hdd0 (whole, and in the
 size limit mode) and one that cannot be made; every argument check of EncodePicture.
+
+## D-617 · 2026-10-10 · cellJpgDec's Ext functions on pspocket's decoder, unverified: streams in, parts out
+
+cellJpgDec's five Ext functions were Sony's (D-595: RPCS3's are bare todos that log and answer CELL_OK; only
+cellJpgDecExtCreate has its arguments there, and cellJpgDec.h none of their structures). They are now pspocket's,
+made on its decoder (D-200) as cellPngDec's and cellGifDec's are (D-595), libjpgdec being their sibling, with
+libpngdec's structures (RPCS3 cellPngDec.h) inferred for libjpgdec's; unverified (D-594): cellJpgDec is a compared
+library, so where the system software is installed a game importing one still gets Sony's whole libjpgdec. The
+compared paths are unchanged: DecodeData's row writing is shared with the parts now (the same code), and the digest of
+D-200's 1,848 answers and 149 images, found identical to Sony's, is the same.
+- ExtCreate(handle, threadInParam, threadOutParam, extThreadInParam, extThreadOutParam): CellJpgDecExtThreadInParam
+  {spurs, priority[8], maxContention} and CellJpgDecExtThreadOutParam {reserved} are checked for being guest memory
+  when given (ARG): pspocket decodes on the calling thread. Then Create, its memory the same.
+- ExtOpen(handle, stream, src, openInfo, cbCtrlStrm): Open, with stream input when CellJpgDecCbCtrlStrm
+  {cbCtrlStrmFunc, cbCtrlStrmArg} has a function: the source's buffer is the stream's first part; a stream callback
+  with a file source is STREAM_FORMAT, answered before the handle is taken (as cellPngDec's). A sixth argument
+  (libpngdec's CellPngDecOpnParam) is not read: a JPEG has no chunks to select.
+- Stream input: before ReadHeader the marker segments up to the first scan's header are asked of the callback, before
+  DecodeData the rest to EOI (through each scan's entropy-coded data: stuffed bytes, restart markers, fill bytes, and the
+  segments between a progressive file's scans), never a byte past EOI; then the decoder reads the header again over the
+  bytes now held. CellJpgDecStrmInfo {decodedStrmSize} and CellJpgDecStrmParam {strmPtr, strmSize} are in the stream's
+  guest block from +0x40; what the callback gives is copied at once. A negative answer or no bytes ends the stream (a
+  JPEG cut short: STREAM_FORMAT, or HEADER without its SOI); bytes that are not guest memory answer CB_PARAM; no stream
+  is taken past 256 MB. The plain ReadHeader and DecodeData do the same on such a stream.
+- ExtReadHeader(…, info, extInfo): ReadHeader; CellJpgDecExtInfo's reserved 8 bytes set to 0 when given (else ARG).
+- ExtSetParameter(…, inParam, outParam, extInParam, extOutParam): SetParameter; CellJpgDecExtInParam {bufferMode,
+  outputCounts, spuMode} and CellJpgDecExtOutParam {outputWidthByte (8 bytes), outputHeight}, both optional;
+  bufferMode CELL_JPGDEC_LINE_MODE (1), else ARG with the stream failed; outputCounts the lines a part (0: the whole
+  image to DecodeData's buffer); extOutParam the row and a part's lines (the height for 0).
+- ExtDecodeData(…, data, dataCtrlParam, dataOutInfo, cbCtrlDisp, dispParam): with a display callback and outputCounts
+  the image is decoded whole (the decoder decodes every scan before its output), then goes out outputCounts lines at a
+  time at the frame's pitch from CellJpgDecDispParam's nextOutputImage (the game's dispParam, else the stream's at
+  +0x50, which starts at `data`, as a first nextOutputImage of 0 does), each part followed by the display callback with
+  CellJpgDecDispInfo in CellPngDecDispInfo's layout (frame width bytes, frame height, start x bytes, start y, width
+  bytes, height, bit depth 8, components, nextOutputStartY, scanPassCount 0, outputImage), the last part too, top to
+  bottom whatever outputMode (noted once). CELL_JPGDEC_STOP (1) at commandPtr after a callback stops the rest (status
+  STOP, outputLines the lines given, CELL_OK); the first part's place not guest memory is ARG, a later one a callback
+  gave CB_PARAM, the stream failed; a JPEG that ends early gives its decoded lines in parts, then STREAM_FORMAT, damaged
+  data the whole image, then STREAM_FORMAT, as DecodeData. CellJpgDecDataOutInfo's status is STOP until the end, then
+  the mean, outputLines and FINISH. Without a callback or outputCounts: DecodeData.
+To compare with Sony's libjpgdec on the Mac: the structures (CellJpgDecDispInfo's layout above all, and ExtOpen's
+arguments), whether the last part has its callback, nextOutputStartY, scanPassCount for a progressive JPEG (libjpeg's
+buffered image mode could give each scan), which dispParam the callback gets and where the first part goes, the stop
+between parts, the order of stream and display callbacks, a stream callback with a file source, ExtCreate's checks and
+memory, the stream block's use. The count: 5,952 of 6,625 before, 5,957 after.
+Tests: tests/hle/test_jpgdec.cpp, the Ext functions as test_pngdec.cpp tests cellPngDec's (imgdec_ext_util.hpp's
+callbacks): the five unverified and the seven compared ones not; ExtCreate's checks and memory; whole (4:2:0, gray,
+restart markers, progressive gray and colour; RGB, gray and a downscaled fast ARGB), with and without a display
+callback, every answer, header, parameter and image DecodeData's; in parts (each CellJpgDecDispInfo field, the game's
+dispParam and the stream's), into one buffer the callback copies from (gray, downscaled, progressive, a line at a
+time); from a stream (20 bytes, then 37 at a time: every call's decodedStrmSize, none past EOI, the header's asked at
+ReadHeader), the plain functions on such a stream; the stop between parts; the refusals (a buffer mode, extInfo,
+a file source, the stream's bytes not guest memory, a stream cut in the header and in the scan, no place for the next
+part, the first part's place).
