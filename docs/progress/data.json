@@ -257,8 +257,8 @@
         },
         {
           "name": "MP3, AC-3, AAC, ATRAC3 decoders pspocket's own",
-          "state": "todo",
-          "ref": "improve.md Media"
+          "state": "partial",
+          "ref": "D-576 to D-579: Sony's first until compared on the Mac"
         },
         {
           "name": "Sound at full pace when the iPhone's cores are full",

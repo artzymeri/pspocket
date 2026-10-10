@@ -49,6 +49,8 @@ ctest --test-dir build/host --output-on-failure
 ```
 
 - Clang only (D-026). On Linux, prefix the configure step with `CC=clang CXX=clang++`.
+- FFmpeg's decoders for the media libraries: `scripts/build-ffmpeg.sh [macos|ios|linux]` (the release tarball in
+  `build/ffmpeg/src/`) into `build/ffmpeg/<target>`, found by the configure step (D-181, D-576).
 - AArch64-only paths (lifted VMX, SPU FP) on an x86 Linux host: cross-build and test under qemu with
   `-DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-aarch64-qemu.cmake` into `build/arm64` (D-027).
 

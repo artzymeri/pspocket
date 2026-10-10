@@ -1,5 +1,5 @@
 {
-  "engine_percent": 86.5,
+  "engine_percent": 87.4,
   "libraries": {
     "own": 5654,
     "answered_as_rpcs3": 188,
@@ -25,7 +25,7 @@
     "SPU code (the six co-processors)": 86,
     "SPURS and the kernel": 100,
     "Graphics (RSX to Metal)": 77,
-    "Sound": 50,
+    "Sound": 62,
     "Video and images": 80,
     "System services": 100,
     "Speed and stability on the iPhone": 60

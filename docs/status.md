@@ -130,6 +130,9 @@ the byte (221 answers and callbacks, 22 PCM outputs, every LPCM packing); every 
 module through pspocket's front end (the loader now links what a pspocket library takes from the firmware's modules),
 also the same as through Sony's libadec. ATRAC3plus, the codec games use most, is now pspocket's own on FFmpeg (D-198,
 run 105): on Assassin's Creed's menu music every answer is Sony's and the sound within 0.000001 of Sony's decoder.
+MP3, MPEG audio layers I and II, AAC, AC-3 and ATRAC3 have pspocket's own decoders on FFmpeg too (D-577 to D-579),
+firmware first: Sony's codec module serves where the system software is installed, pspocket's where it is not, until
+each is compared with Sony's on the Mac. FFmpeg also builds on Linux now (D-576), so the media tests run in the cloud.
 
 The image decoders began with cellPngDec (D-199, run 106): pspocket's own on libpng, the same as Sony's libpngdec in
 2,283 answers and 121 decoded images, every colour type, bit depth, output setting and chunk kind (Sony's libpng 1.2.8
@@ -251,8 +254,8 @@ kernel calls, PPU and SPU instructions translated and fuzz-checked, a checklist 
 and the games against the Flawless bar.
 
 Next: SPU registers passed in host registers between translated functions (docs/improve.md, the biggest cost in
-play); vertex textures in 3D and cube; the other audio codec cores on FFmpeg
-(MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
+play); vertex textures in 3D and cube; the new audio decoders (MP3, AAC, AC-3, ATRAC3, MPEG audio) compared with
+Sony's codec modules on the Mac, then served first; then
 docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
 with games nobody has analysed (each run's log names what is still missing).
 
