@@ -107,7 +107,7 @@ struct Net {
         const s32 v = static_cast<s32>(g.call(name, args...));
         if ((static_cast<u32>(v) & 0xFFFFFF00) != 0x80010200) return {v, v == -1 ? err() : 0};
         const s32 e = err();
-        CHECK(e == (v & 0xFF));
+        THREAD_CHECK(e == (v & 0xFF)); // on the tests' own threads too (D-585)
         return {-1, e};
     }
 

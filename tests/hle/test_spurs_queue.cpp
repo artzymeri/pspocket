@@ -92,9 +92,11 @@ struct QueueFixture {
         if (attach) REQUIRE(a.call("cellSpursQueueAttachLv2EventQueue", queue) == 0);
     }
     u32 wid() const { return ps_read32(b, kTs + 0x74); }
+    // The bit sets change with the workers' reservation operations: read through the reservation system, so what the
+    // worker did before (a context saved) is visible with the bit (D-585).
     bool task_bit(u32 set_offset, u32 id) const
     {
-        return ps_read32(b, kTs + set_offset + 4 * (id / 32)) & (0x80000000u >> (id % 32));
+        return line_word(b, kTs + set_offset + 4 * (id / 32)) & (0x80000000u >> (id % 32));
     }
 };
 
@@ -544,7 +546,7 @@ TEST_CASE("SPURS queues: a blocking pop waits for the SPU push's event on the qu
         rc = pop_on(p, pop, kQueue, kOut, 0, 1);
     });
     // The PPU marks the pop index for its whole call and waits on the lv2 queue.
-    REQUIRE(wait_for([&] { return ps_read32(b, kQueue) == ~0u; }));
+    REQUIRE(wait_for([&] { return line_word(b, kQueue) == ~0u; }));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     CHECK(rc.load() == ~0ull);
     CHECK(s.a.call("cellSpursQueuePopBody", kQueue, kOut + 0x100, 0, 0) == kBusy); // one PPU caller at a time
@@ -949,7 +951,7 @@ TEST_CASE("SPURS queues: an SPU task pushes and the PPU pops, each waking the ot
         }
     });
     // Pop 0 finds the queue empty: its index stays marked while it waits for the task's push and the event.
-    REQUIRE(wait_for([&] { return ps_read32(b, kQueue) == ~0u; }));
+    REQUIRE(wait_for([&] { return line_word(b, kQueue) == ~0u; }));
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, kCtx, 0xC00, kPattern, kArg) == 0);
     const u32 id = ps_read32(b, kId);
 
@@ -981,7 +983,7 @@ TEST_CASE("SPURS queues: an SPU task pushes and the PPU pops, each waking the ot
         CHECK(ps_read32(b, kOut + 16 * i) == kFirst + i);
         CHECK(ps_read32(b, kOut + 16 * i + 4) == i);
     }
-    REQUIRE(wait_for([&] { return ps_read32(b, kReport) == kCount; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kReport) == kCount; })); // the report's PUT (D-585)
     // The waits for 103 and 104; a third when the task found the queue full before pop 0 was done (pop 0 woke it).
     const u32 waits = ps_read32(b, kReport + 4);
     CHECK((waits == 2 || waits == 3));
@@ -1087,7 +1089,7 @@ TEST_CASE("SPURS queues: a blocking push waits for the SPU pop's event on the qu
         rc = p.ctx.gpr[3];
     });
     // The PPU marks the push index for its whole call and waits on the lv2 queue.
-    REQUIRE(wait_for([&] { return ps_read32(b, kQueue + 0x04) == ~2u; }));
+    REQUIRE(wait_for([&] { return line_word(b, kQueue + 0x04) == ~2u; }));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     CHECK(rc.load() == ~0ull);
     put_entry(b, kOut, 9, kSize);

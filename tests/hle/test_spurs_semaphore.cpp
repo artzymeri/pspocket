@@ -19,7 +19,7 @@
 #include "pspocket/core/reservation.h"
 #include "pspocket/recomp/spu/asm.hpp"
 #include "pspocket/spu/context.h"
-#include "guest.hpp" // runtime/hle/src: atomic_store_be32
+#include "guest.hpp" // runtime/hle/src: reservation_op
 
 using namespace pspocket;
 using namespace pspocket::hle::test;
@@ -70,6 +70,17 @@ Line snapshot(u8* b, u32 addr)
     return l;
 }
 
+// A control word stored with one reservation operation, as the PPU's stwcx. would: the tasks poll the line with
+// GETLLAR, and the version it moves orders what the test did before (its checks of a saved context) before what the
+// tasks do once they see it (D-585).
+void set_control(u8* b, u32 offset, u32 value)
+{
+    hle::reservation_op(b, kControl, [&](u8* line) {
+        ps_write32(line, offset, value);
+        return true;
+    });
+}
+
 // One SPURS instance with `spus` SPUs and one or two tasksets (priority 1 everywhere, max contention `spus`). The
 // native scheduler's workers run only when asked: the PPU API test needs none.
 struct SemFixture {
@@ -101,9 +112,11 @@ struct SemFixture {
     ~SemFixture() { CHECK(a.call("cellSpursFinalize", kSpurs) == 0); }
 
     u32 wid(u32 taskset) const { return ps_read32(b, taskset + 0x74); }
+    // The bit sets change with the workers' reservation operations: one copy of the line, so a context the worker saved
+    // before a task's waiting bit is visible with the bit (D-585).
     bool task_bit(u32 taskset, u32 set_offset, u32 id) const
     {
-        return ps_read32(b, taskset + set_offset + 4 * (id / 32)) & (0x80000000u >> (id % 32));
+        return line_word(b, taskset + set_offset + 4 * (id / 32)) & (0x80000000u >> (id % 32));
     }
     // Creates a task running the ELF at kElf with {semaphore, iterations, stats, report}; returns its ID.
     u32 create(u32 taskset, u32 semaphore, u32 iterations, u32 report, u32 context)
@@ -219,7 +232,9 @@ std::vector<u8> semaphore_task()
     a.brsl(rLink, enter);
     a.brz(rHold, held);
     a.bind(hold);
-    dma(a, PS_MFC_GET, kBuf, rControl, 16);
+    // The PPU's control words, polled with GETLLAR: a lock-line read, as SPU code waits on a flag a PPU stores, reads
+    // the line atomically, where a plain GET's copy raced with the PPU's store (D-585).
+    getllar(a, rControl, kBuf);
     a.emit(as::lqa(10, kBuf));
     a.brnz(10, held);
     syscall(a, 1);
@@ -283,7 +298,7 @@ std::vector<u8> semaphore_task()
     a.emit(as::stqa(24, kLine + 0x20));
     putllc(a, rSem, kLine, 15);
     a.brnz(15, p_retry);
-    dma(a, PS_MFC_GET, kBuf, rControl, 16);
+    getllar(a, rControl, kBuf); // the control words, as above
     a.emit(as::lqa(10, kBuf));
     a.emit(as::rotqbyi(11, 10, 4));
     a.brz(11, p_sleep);              // no pause
@@ -292,7 +307,7 @@ std::vector<u8> semaphore_task()
     a.emit(as::ai(13, rReport, 16));
     dma(a, PS_MFC_PUT, kBuf, 13, 16);
     a.bind(p_pause);
-    dma(a, PS_MFC_GET, kBuf, rControl, 16);
+    getllar(a, rControl, kBuf); // the control words, as above
     a.emit(as::lqa(10, kBuf));
     a.emit(as::rotqbyi(11, 10, 8));
     a.brz(11, p_pause);
@@ -640,7 +655,7 @@ TEST_CASE("SPURS semaphores: SPU tasks on four SPUs take and give units; waiters
     }
 
     // The gate opens: from here every V hands its unit to the oldest waiter on whatever SPU, until all are done.
-    hle::atomic_store_be32(b, kControl, 1);
+    set_control(b, 0, 1);
     const bool done = wait_for([&] { return snapshot(b, kStats).word(0x0C) == tasks; }, 60000ms);
     if (!done) dump_state(b);
     REQUIRE(done);
@@ -660,7 +675,7 @@ TEST_CASE("SPURS semaphores: SPU tasks on four SPUs take and give units; waiters
         total_waits += ps_read32(b, kReports + 32 * i + 4);
     }
     CHECK(total_waits >= waiters);
-    REQUIRE(wait_for([&] { return ps_read32(b, kTs + 0x30) == 0 && ps_read32(b, kTs2 + 0x30) == 0; })); // all exited
+    REQUIRE(wait_for([&] { return line_word(b, kTs + 0x30) == 0 && line_word(b, kTs2 + 0x30) == 0; })); // all exited
 }
 
 TEST_CASE("SPURS semaphores: a V from another taskset's task wakes a waiter through its workload's signal",
@@ -681,18 +696,18 @@ TEST_CASE("SPURS semaphores: a V from another taskset's task wakes a waiter thro
     const u32 wid = s.wid(kTs);
     REQUIRE(wait_for([&] {
         return snapshot(b, kSem).byte(0x10) == 1 && s.task_bit(kTs, 0x50, tb) && !s.task_bit(kTs, 0x00, tb) &&
-               ps_read8(b, kSpurs + wid) == 0; // switched out, and its taskset's ready count is back to 0
+               line_byte(b, kSpurs + wid) == 0; // switched out, and its taskset's ready count is back to 0
     }));
     CHECK(snapshot(b, kSem).byte(0x11) == tb);
     CHECK(snapshot(b, kSem).byte(0x21) == wid);
     CHECK_FALSE(ps_read16(b, kSpurs + 0x70) & (0x8000u >> wid)); // no workload signal pending
 
-    hle::atomic_store_be32(b, kControl, 1);
+    set_control(b, 0, 1);
     REQUIRE(wait_for([&] { return snapshot(b, kStats).word(0x0C) == 2; }));
     CHECK(ps_read32(b, kReports + 32) == 1);     // B's entry
     CHECK(ps_read32(b, kReports + 32 + 4) == 1); // after its one wait
     CHECK(snapshot(b, kSem).word(0x00) == 1);
-    REQUIRE(wait_for([&] { return ps_read32(b, kTs + 0x30) == 0 && ps_read32(b, kTs2 + 0x30) == 0; }));
+    REQUIRE(wait_for([&] { return line_word(b, kTs + 0x30) == 0 && line_word(b, kTs2 + 0x30) == 0; }));
 }
 
 TEST_CASE("SPURS semaphores: a V's signal that reaches the waiter before its syscall 2 is taken at once",
@@ -712,7 +727,7 @@ TEST_CASE("SPURS semaphores: a V's signal that reaches the waiter before its sys
     // Task B finds no unit: it joins the waiters and stops there, still running on the other SPU.
     std::memset(b + kCtx + kCtxSize, 0xEE, kCtxSize);
     const u32 tb = s.create(kTs, kSem, 1, kReports + 32, kCtx + kCtxSize);
-    REQUIRE(wait_for([&] { return ps_read32(b, kReports + 32 + 16) == 1; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kReports + 32 + 16) == 1; })); // the pause marker's PUT
     {
         const Line sem = snapshot(b, kSem);
         CHECK(sem.word(0x00) == 0);
@@ -725,7 +740,7 @@ TEST_CASE("SPURS semaphores: a V's signal that reaches the waiter before its sys
     CHECK_FALSE(s.task_bit(kTs, 0x40, tb)); // not signalled
 
     // A leaves: its V takes B off the list and signals it while it runs; the unit is B's, not the count's.
-    hle::atomic_store_be32(b, kControl, 1);
+    set_control(b, 0, 1);
     REQUIRE(wait_for([&] { return snapshot(b, kStats).word(0x0C) == 1; }));
     {
         const Line sem = snapshot(b, kSem);
@@ -741,7 +756,7 @@ TEST_CASE("SPURS semaphores: a V's signal that reaches the waiter before its sys
 
     // B goes on: its syscall 2 finds the signal and returns at once, without switching out (its context save area is
     // untouched), and it takes its turn.
-    hle::atomic_store_be32(b, kControl + 8, 1);
+    set_control(b, 8, 1);
     REQUIRE(wait_for([&] { return snapshot(b, kStats).word(0x0C) == 2; }));
     CHECK(ps_read32(b, kReports + 32) == 1);
     CHECK(ps_read32(b, kReports + 32 + 4) == 1);
@@ -753,5 +768,5 @@ TEST_CASE("SPURS semaphores: a V's signal that reaches the waiter before its sys
     bool untouched = true;
     for (u32 i = 0; i < kCtxSize; i++) untouched = untouched && b[kCtx + kCtxSize + i] == 0xEE;
     CHECK(untouched);
-    REQUIRE(wait_for([&] { return ps_read32(b, kTs + 0x30) == 0; })); // both exited
+    REQUIRE(wait_for([&] { return line_word(b, kTs + 0x30) == 0; })); // both exited
 }

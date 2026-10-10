@@ -142,7 +142,12 @@ struct SpursFixture {
     }
     ~SpursFixture() { CHECK(a.call("cellSpursFinalize", kSpurs) == 0); }
 
-    bool task_bit(u32 set_offset, u32 id) { return ps_read32(base, kTs + set_offset + 4 * (id / 32)) & (0x80000000u >> (id % 32)); }
+    // The taskset's bit sets change with the workers' reservation operations: read through the reservation system, so
+    // what the worker did before (a context saved, a task's last PUT) is visible with the bit (D-585).
+    bool task_bit(u32 set_offset, u32 id)
+    {
+        return line_word(base, kTs + set_offset + 4 * (id / 32)) & (0x80000000u >> (id % 32));
+    }
     void set_pattern_top_block() // the stack's block (0x3F800..0x3FFFF) only
     {
         std::memset(base + kPattern, 0, 16);
@@ -196,7 +201,7 @@ TEST_CASE("SPURS workers: a task starts with libsre's registers and local store,
 
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
     const u32 id = ps_read32(b, kId);
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 48) != 0; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut + 48) != 0; })); // the last PUT (D-585)
     CHECK(ps_read32(b, kOut + 0) == kOut);
     CHECK(ps_read32(b, kOut + 4) == 0xCAFEBABE);
     CHECK(ps_read32(b, kOut + 12) == 0x22);
@@ -208,7 +213,7 @@ TEST_CASE("SPURS workers: a task starts with libsre's registers and local store,
     CHECK(ps_read16(b, kOut + 56) == 0x544B); // 'TK'
     // The exit destroys the task: no longer enabled, running or ready, and the ready count is back to 0.
     REQUIRE(wait_for([&] { return !s.task_bit(0x30, id); }));
-    REQUIRE(wait_for([&] { return !s.task_bit(0x00, id) && ps_read8(b, kSpurs + 0x00) == 0; }));
+    REQUIRE(wait_for([&] { return !s.task_bit(0x00, id) && line_byte(b, kSpurs + 0x00) == 0; }));
     CHECK_FALSE(s.task_bit(0x10, id));
 }
 
@@ -223,7 +228,7 @@ TEST_CASE("SPURS workers: a task waits for a signal in its context save area and
     const u32 id = ps_read32(b, kId);
 
     // Phase 1 ran, then the task waits: saved to its context save area, the SPU free.
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut) == 1; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut) == 1; }));
     REQUIRE(wait_for([&] { return s.task_bit(0x50, id) && !s.task_bit(0x00, id); }));
     CHECK_FALSE(s.task_bit(0x10, id));                // no longer ready
     CHECK(ps_read32(b, kCtx + 0x20) == 0x80808080);   // saved $80 (LS 0x2CA0)
@@ -232,7 +237,7 @@ TEST_CASE("SPURS workers: a task waits for a signal in its context save area and
     CHECK(ps_read32(b, kOut + 16) == 0);              // still waiting
 
     REQUIRE(hle::spurs::send_signal(b, kTs, id) == lv2::CELL_OK);
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 32) == 0x80808080; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut + 32) == 0x80808080; }));
     CHECK(ps_read32(b, kOut + 16) == 0); // the syscall's result after a resume
     REQUIRE(wait_for([&] { return !s.task_bit(0x30, id); }));
     CHECK(hle::spurs::send_signal(b, kTs, id) == static_cast<s32>(0x80410905u)); // gone: SRCH
@@ -262,7 +267,7 @@ TEST_CASE("SPURS workers: cellSpursEventFlagSet from the PPU wakes a waiting tas
     CHECK(ps_read16(b, kFlag + 0x30) == 0x0002); // pendingRecvTaskEvents[0]: what the task receives
     CHECK(ps_read16(b, kFlag + 0x02) == 0x8000); // spuTaskPendingRecv
     CHECK(ps_read16(b, kFlag + 0x00) == 0);      // auto clear
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 32) == 0x80808080; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut + 32) == 0x80808080; }));
     REQUIRE(wait_for([&] { return !s.task_bit(0x30, id); }));
 }
 
@@ -332,7 +337,7 @@ TEST_CASE("SPURS workers: SPU code sets lv2 event flag bits through its interrup
     ps_write32(b, kOut + 16, 0xFFFFFFFF);
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
 
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 16) != 0xFFFFFFFF; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut + 16) != 0xFFFFFFFF; }));
     CHECK(s.f.kernel->event_flag(flag)->get() == ((u64{1} << 40) | (u64{1} << 5)));
     CHECK(ps_read32(b, kOut) == 0);                                                // CELL_OK
     CHECK(ps_read32(b, kOut + 16) == static_cast<u32>(lv2::err(lv2::CELL_ESRCH))); // no such flag
@@ -366,9 +371,9 @@ TEST_CASE("SPURS workers: two tasks yield to each other on one SPU", "[hle][spur
     ps_write32(b, kArg2 + 8, 0xA1);
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, kCtx, 0xC00, kPattern, kArg) == 0);
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId + 4, kElf, kCtx2, 0xC00, kPattern, kArg2) == 0);
-    ps_write8(b, kSpurs + 0xB00 + 0x18, 1); // WorkloadInfo.priority[0]
+    store8_release(b, kSpurs + 0xB00 + 0x18, 1); // WorkloadInfo.priority[0], as cellSpursSetPriority stores it
     REQUIRE(s.a.call("cellSpursWakeUp", kSpurs) == 0);
-    const bool done = wait_for([&] { return ps_read32(b, kOut + 16) != 0 && ps_read32(b, kOut2 + 16) != 0; });
+    const bool done = wait_for([&] { return load32_acquire(b, kOut + 16) != 0 && load32_acquire(b, kOut2 + 16) != 0; });
     if (!done) {
         for (u32 off = 0; off < 0x80; off += 0x10) {
             UNSCOPED_INFO(std::format("taskset +{:#04x}: {:08x} {:08x} {:08x} {:08x}", off, ps_read32(b, kTs + off),
@@ -386,7 +391,7 @@ TEST_CASE("SPURS workers: two tasks yield to each other on one SPU", "[hle][spur
     CHECK(ps_read32(b, kOut2) == 0xA1);
     CHECK(ps_read32(b, kOut + 16) == 0xA1); // task 0 saw task 1's marker
     CHECK(ps_read32(b, kOut2 + 16) == 0xA0);
-    REQUIRE(wait_for([&] { return ps_read32(b, kTs + 0x30) == 0; })); // both destroyed
+    REQUIRE(wait_for([&] { return line_word(b, kTs + 0x30) == 0; })); // both destroyed
 }
 
 // Regression (run 031): the kernel weighed the game's priority values themselves, so a workload at 12 won over one at 2
@@ -427,17 +432,18 @@ TEST_CASE("SPURS workers: of two ready workloads, the higher priority (the lower
     REQUIRE(s.a.call("cellSpursCreateTask", kTs2, kId + 4, kElf, 0, 0, 0, kArg2) == 0);
     // Workload 1 gets priority 2 on SPU 0 (first, so a worker that wakes between the two stores picks it too), then
     // workload 0 priority 12.
-    ps_write8(b, kSpurs + 0xB00 + 0x20 + 0x18, 2);
-    ps_write8(b, kSpurs + 0xB00 + 0x18, 12);
+    store8_release(b, kSpurs + 0xB00 + 0x20 + 0x18, 2); // as cellSpursSetPriority stores them
+    store8_release(b, kSpurs + 0xB00 + 0x18, 12);
     REQUIRE(s.a.call("cellSpursWakeUp", kSpurs) == 0);
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut) != 0xFFFFFFFF && ps_read32(b, kOut2) != 0xFFFFFFFF; }));
+    // Each task's last PUT is its priorities, after its turn (D-585).
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut + 16) != ~0u && load32_acquire(b, kOut2 + 16) != ~0u; }));
     CHECK(ps_read32(b, kOut2) == 0); // workload 1 (priority 2) ran first
     CHECK(ps_read32(b, kOut) == 1);
     CHECK(ps_read8(b, kOut2 + 16 + 1) == 14); // 16 - 2
     CHECK(ps_read8(b, kOut + 16) == 4);       // 16 - 12
     CHECK(ps_read8(b, kOut + 16 + 1) == 14);
     CHECK(ps_read8(b, kOut + 16 + 2) == 0); // no workload 2
-    REQUIRE(wait_for([&] { return ps_read32(b, kTs + 0x30) == 0 && ps_read32(b, kTs2 + 0x30) == 0; }));
+    REQUIRE(wait_for([&] { return line_word(b, kTs + 0x30) == 0 && line_word(b, kTs2 + 0x30) == 0; }));
 }
 
 // Regression (found while bringing up the scheduler): the ready-count update kept its running total in a variable the
@@ -470,14 +476,14 @@ TEST_CASE("SPURS workers: ready counts stay right while other writers race for C
     }
     const bool done = wait_for([&] {
         for (u32 i = 0; i < kTasks; i++) {
-            if (ps_read32(b, kOut + 16 * i) != 0x100 + i) return false;
+            if (load32_acquire(b, kOut + 16 * i) != 0x100 + i) return false;
         }
-        return ps_read32(b, kTs + 0x30) == 0; // all destroyed
+        return line_word(b, kTs + 0x30) == 0; // all destroyed
     });
     stop = true;
     racer.join();
     REQUIRE(done);
-    REQUIRE(wait_for([&] { return ps_read8(b, kSpurs + 0x00) == 0; })); // ready count back to 0
+    REQUIRE(wait_for([&] { return line_byte(b, kSpurs + 0x00) == 0; })); // ready count back to 0
 }
 
 // Regression (found with the SPURS semaphores, D-073): an idle worker's own selection stored CellSpurs line 0 even when
@@ -490,7 +496,7 @@ TEST_CASE("SPURS workers: an idle worker sleeps and leaves CellSpurs line 0 alon
     u8* b = s.base;
     // The worker acknowledges the system service message that creating the taskset left (bit 0 of CellSpurs 0x72) the
     // next time it looks at the line, when its idle wait times out at the latest. After that nothing changes.
-    REQUIRE(wait_for([&] { return !(ps_read8(b, kSpurs + 0x72) & 1); }));
+    REQUIRE(wait_for([&] { return !(line_byte(b, kSpurs + 0x72) & 1); }));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const u64 version = ps_res_version(kSpurs);
     std::this_thread::sleep_for(std::chrono::milliseconds(350)); // the idle wait's 100 ms timeout passes three times
@@ -505,7 +511,7 @@ TEST_CASE("SPURS workers: an idle worker sleeps and leaves CellSpurs line 0 alon
     ps_write32(b, kArg, kOut);
     ps_write32(b, kArg + 4, 0x5EE);
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 4) == 0x5EE; }));
+    REQUIRE(wait_for([&] { return (load64_acquire(b, kOut) & 0xFFFFFFFF) == 0x5EE; })); // the PUT's first doubleword
 }
 
 TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entry points", "[hle][spurs][spurs-run]")
@@ -548,7 +554,7 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
     // Work arrives as a ready count: the module runs (again and again while the count stays; the first run records).
     std::memset(b + kOut, 0, 48);
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 1) == 0);
-    REQUIRE(wait_for([&] { return ps_read64(b, kOut + 32) == kPm; })); // the module's last output
+    REQUIRE(wait_for([&] { return load64_acquire(b, kOut + 32) == kPm; })); // the module's last output
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 0) == 0);
     CHECK(ps_read32(b, kOut + 0) == 1);  // entered with poll status 1: ready count
     CHECK(ps_read32(b, kOut + 16) == wid); // the poll keeps this workload
@@ -558,7 +564,7 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
     CHECK(a.call("cellSpursReadyCountStore", kSpurs, wid + 1, 1) == 0xFFFFFFFF80410805ull); // not registered: SRCH
 
     // Work arrives as the workload flag: the receiver runs with poll status 4 and the flag is consumed.
-    REQUIRE(wait_for([&] { return ps_read8(b, kSpurs + 0x20 + wid) == 0; })); // the last ready-count run is over
+    REQUIRE(wait_for([&] { return line_byte(b, kSpurs + 0x20 + wid) == 0; })); // the last ready-count run is over
     REQUIRE(a.call("_cellSpursWorkloadFlagReceiver", kSpurs, wid, 1) == 0);
     CHECK(a.call("_cellSpursWorkloadFlagReceiver", kSpurs, wid, 1) == 0xFFFFFFFF8041080Aull); // already set: BUSY
     CHECK(a.call("_cellSpursWorkloadFlagReceiver", kSpurs, wid + 1, 1) == 0xFFFFFFFF80410805ull); // not registered
@@ -569,7 +575,7 @@ TEST_CASE("SPURS workers: a game's own policy module runs with the kernel's entr
         ps_write32(line, 0x6C, 0);
         return true;
     });
-    REQUIRE(wait_for([&] { return ps_read64(b, kOut + 32) == kPm; }));
+    REQUIRE(wait_for([&] { return load64_acquire(b, kOut + 32) == kPm; }));
     CHECK(ps_read32(b, kOut + 0) == 4); // poll status 4: the workload flag
     CHECK(ps_read32(b, kSpurs + 0x6C) == 0xFFFFFFFFu); // consumed by the selection
     REQUIRE(a.call("_cellSpursWorkloadFlagReceiver", kSpurs, wid, 0) == 0);
@@ -627,11 +633,11 @@ TEST_CASE("SPURS workers: a policy module loaded with no program runs the one re
     g_pm_stepped = 0;
     std::memset(b + kOut, 0, 16);
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 1) == 0);
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut) >= 3; })); // interpreted runs
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut) >= 3; })); // interpreted runs
     CHECK(g_pm_stepped.load() == 0);
     ps_spu_register_program(&program);
-    const u32 runs = ps_read32(b, kOut);
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut) >= runs + 3; }));
+    const u32 runs = load32_acquire(b, kOut);
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut) >= runs + 3; }));
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 0) == 0);
     CHECK(g_pm_stepped.load() > 0);
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
@@ -765,7 +771,7 @@ TEST_CASE("SPURS workers: a policy module added with a workload attribute (L.A. 
     // It runs when work arrives.
     std::memset(b + kOut, 0, 48);
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 1) == 0);
-    REQUIRE(wait_for([&] { return ps_read64(b, kOut + 32) == kPm; }));
+    REQUIRE(wait_for([&] { return load64_acquire(b, kOut + 32) == kPm; }));
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, wid, 0) == 0);
     CHECK(ps_read32(b, kOut + 0) == 1);
     CHECK(ps_read32(b, kOut + 44) == wid);
@@ -834,7 +840,7 @@ TEST_CASE("SPURS workers: a task runs the translated program of the segment hold
     ps_spu_register_program(&program);
     g_entry_segment_runs = 0;
     REQUIRE(s.a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut) == 0x77; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut) == 0x77; }));
     CHECK(g_entry_segment_runs.load() == 1);
     ps_spu_unregister_program(&program);
 }
@@ -914,12 +920,14 @@ TEST_CASE("SPURS workers: an exiting task's exit callback runs with the taskset,
     const u32 id = ps_read32(b, kId);
     s.set_exit_callback(id, kCallback | units, kOut3);
     s.run();
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut3 + 0x40) != 0; }));
+    // The callback's last PUT is the taskset, after the exit code and the ID: waited for (with the first, the checks
+    // below could run before the other two had landed: every run under ThreadSanitizer, D-585).
+    REQUIRE(wait_for([&] { return load64_acquire(b, kOut3 + 0x60) != 0; }));
     CHECK(ps_read32(b, kOut3) == 1);              // the task ran
     CHECK(ps_read32(b, kOut3 + 0x40) == 0x55);    // its exit code
     CHECK(ps_read32(b, kOut3 + 0x50) == id);      // its ID
     CHECK(ps_read64(b, kOut3 + 0x60) == kTs2B);   // the taskset (the preferred doubleword)
-    REQUIRE(wait_for([&] { return ps_read32(b, kTs2B + 0x30) == 0; })); // destroyed
+    REQUIRE(wait_for([&] { return line_word(b, kTs2B + 0x30) == 0; })); // destroyed
 }
 
 TEST_CASE("SPURS workers: libsre's exit code handler stores the code in the container and signals the waiting task "
@@ -945,9 +953,9 @@ TEST_CASE("SPURS workers: libsre's exit code handler stores the code in the cont
     s.set_exit_callback(exiter, ps_read64(b, kTs2B + 0x1900), kContainer); // libsre's handler (its descriptor at 0x1900)
     s.run();
 
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut2) == 1; }));
-    REQUIRE(wait_for([&] { return ps_read32(b, kOut + 32) == 0x80808080; })); // the waiter was signalled and resumed
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut2) == 1; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kOut + 32) == 0x80808080; })); // the waiter was signalled, resumed
     CHECK(ps_read32(b, kContainer + 0x20) == (1u | 4u | (1u << 17)));        // an exit code stored
     CHECK(ps_read32(b, kContainer + 0x28) == 0x77);
-    REQUIRE(wait_for([&] { return ps_read32(b, kTs2B + 0x30) == 0; }));       // both destroyed
+    REQUIRE(wait_for([&] { return line_word(b, kTs2B + 0x30) == 0; }));       // both destroyed
 }

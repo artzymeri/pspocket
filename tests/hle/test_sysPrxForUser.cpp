@@ -24,6 +24,9 @@
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/ppu/runtime.h"
 
+#include "hle_test_util.hpp" // load32_acquire, line_half
+#include "thread_check.hpp"
+
 using namespace pspocket;
 
 namespace {
@@ -53,6 +56,7 @@ struct Fixture {
     {
         hle.reset();
         kernel.reset();
+        pspocket::test::report_thread_checks(); // what failed on the tests' own threads (D-585)
     }
     u8* base() { return mem.base(); }
 };
@@ -77,7 +81,7 @@ struct GuestThread {
         const hle::Function* fn = nullptr;
         for (const hle::Function& x : hle::registry().functions())
             if (x.name == name) fn = &x;
-        REQUIRE(fn != nullptr);
+        THREAD_REQUIRE(fn != nullptr); // called on the tests' own threads too (D-585)
         const u64 v[] = {0, static_cast<u64>(args)...}; // leading 0: no zero-length array for calls without arguments
         for (usize i = 0; i < sizeof...(A); i++) {
             if (i < 8) ctx.gpr[3 + i] = v[i + 1];
@@ -85,7 +89,7 @@ struct GuestThread {
         }
         const u64 sp = ctx.gpr[1];
         fn->fn(ctx, f.base());
-        CHECK(ctx.gpr[1] == sp); // stack variables released
+        THREAD_CHECK(ctx.gpr[1] == sp); // stack variables released
         return ctx.gpr[3];
     }
 };
@@ -99,8 +103,9 @@ void write_attr(u8* base, u32 protocol, u32 recursive)
     std::memcpy(base + kAttr + 8, "testlwm", 8);
 }
 
-u32 owner(u8* base) { return ps_read32(base, kLw); }
-u32 waiters(u8* base) { return ps_read32(base, kLw + 4); }
+// Read while other threads lock and unlock it (atomically): as a PPU reads them, with acquire order (D-585).
+u32 owner(u8* base) { return hle::test::load32_acquire(base, kLw); }
+u32 waiters(u8* base) { return hle::test::load32_acquire(base, kLw + 4); }
 
 } // namespace
 
@@ -756,9 +761,10 @@ TEST_CASE("cellSpurs event flags: lv2 queue attach, PPU set and wait, detach; SP
         b_mask = ps_read16(base, kMaskB);
     });
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (ps_read16(base, kFlag + 0x04) == 0 && std::chrono::steady_clock::now() < deadline)
+    // ppuWaitMask, which b's wait sets with a reservation operation: read through the reservation system (D-585).
+    while (hle::test::line_half(base, kFlag + 0x04) == 0 && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    REQUIRE(ps_read16(base, kFlag + 0x04) == 0x000C); // ppuWaitMask
+    REQUIRE(hle::test::line_half(base, kFlag + 0x04) == 0x000C); // ppuWaitMask
     CHECK(ps_read8(base, kFlag + 0x06) == 0xF1);       // wait slot 15 (no SPU task holds one), mode AND
     CHECK(a.call("cellSpursEventFlagWait", kFlag, kMask, 0) == kTaskBusy); // one PPU waiter at a time
     REQUIRE(a.call("cellSpursEventFlagSet", kFlag, 0x0004) == 0);

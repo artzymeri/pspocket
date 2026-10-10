@@ -645,9 +645,9 @@ TEST_CASE("SPU thread groups: a looping thread switches to the program registere
     const u32 group = s.create_group(1);
     s.init_thread(group, 0, kImg);
     REQUIRE(lv2::sys_spu_thread_group_start(s.t, group) == lv2::CELL_OK);
-    for (int i = 0; i < 5000 && ps_read32(s.b, kOut + 0x10) != 1; i++)
+    for (int i = 0; i < 5000 && load32_acquire(s.b, kOut + 0x10) != 1; i++) // the SPU's PUT, polled (D-585)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    REQUIRE(ps_read32(s.b, kOut + 0x10) == 1);
+    REQUIRE(load32_acquire(s.b, kOut + 0x10) == 1);
     ps_spu_register_program(&program);
     const auto [cause, status] = s.join(group);
     CHECK(cause == 2); // all threads exited

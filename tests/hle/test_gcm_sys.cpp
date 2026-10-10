@@ -104,7 +104,7 @@ void flush_to_current(Fixture& f, GuestThread& g)
 {
     u8* b = f.base();
     const u32 control = static_cast<u32>(g.call("cellGcmGetControlRegister"));
-    ps_write32(b, control, ps_read32(b, ps_read32(b, kCtxPtr) + 0x8) - kIo);
+    store32_release(b, control, ps_read32(b, ps_read32(b, kCtxPtr) + 0x8) - kIo); // after a sync, as the game's (D-585)
     f.kernel->rsx()->notify();
     REQUIRE(f.kernel->rsx()->wait_idle(2 * kSecond));
 }
@@ -464,7 +464,7 @@ TEST_CASE("sys_rsx: flip status (0x10a), a buffer queued on a head (0x103's driv
     ps_write32(b, c, rsx::cmd::method_header(rsx::m::GCM_DRIVER_QUEUE + 0, 1));
     ps_write32(b, c + 4, 2);
     ps_write32(b, ctx + 0x8, c + 8);
-    ps_write32(b, control, c + 8 - kIo);
+    store32_release(b, control, c + 8 - kIo);
     rsx->notify();
     REQUIRE(rsx->wait_idle(2 * kSecond));
     CHECK(ps_read32(b, info + kHead0 + kLastQueuedBufferId) == 2);
@@ -512,7 +512,7 @@ TEST_CASE("cellGcmSys: the queue handler runs on the interrupt thread with the h
     ps_write32(b, c, rsx::cmd::method_header(rsx::m::GCM_DRIVER_QUEUE + 0, 1));
     ps_write32(b, c + 4, 1);
     ps_write32(b, ctx + 0x8, c + 8);
-    ps_write32(b, control, c + 8 - kIo);
+    store32_release(b, control, c + 8 - kIo);
     rsx->notify();
     REQUIRE(wait_for([&] { return seq() == 3; }));
     CHECK(ps_read32(b, kQueueSlot) == 3);
@@ -592,7 +592,7 @@ TEST_CASE("cellGcmSys: cellGcmSetPrepareFlip, cellGcmSetUserCommand and cellGcmS
     CHECK(ps_read32(b, c1 + 4) == 0x77);
     CHECK(current() == c1 + 8);
     CHECK(put() == c0 + 8 - kIo);
-    ps_write32(b, control, current() - kIo);
+    store32_release(b, control, current() - kIo);
     rsx->notify();
     REQUIRE(wait_for([&] { return ps_read32(b, kSeq) == 1; }));
     CHECK(ps_read32(b, kUserSlot + 4) == 0x77);
@@ -648,7 +648,7 @@ TEST_CASE("cellGcmSys: the default command buffer's word sizes and cellGcmSetDef
     CHECK(g.call("cellGcmGetDefaultCommandWordSize") == 0x800);
     CHECK(g.call("cellGcmGetDefaultSegmentWordSize") == 0x400);
     // Once commands ran, no more.
-    ps_write32(b, control, 0x1008);
+    store32_release(b, control, 0x1008);
     rsx->notify();
     REQUIRE(rsx->wait_idle(2 * kSecond));
     CHECK(set_sizes(0x1000, 0x400) == kFailure);
