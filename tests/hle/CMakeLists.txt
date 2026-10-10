@@ -27,7 +27,8 @@ target_sources(test_hle PRIVATE
     test_vpost_compare.cpp
     test_pngenc_compare.cpp
     test_libmixer_compare.cpp
-    test_fiber_compare.cpp)
+    test_fiber_compare.cpp
+    test_vdec_codecs_compare.cpp)
 
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.
