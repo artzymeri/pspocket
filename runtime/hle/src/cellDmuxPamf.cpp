@@ -144,11 +144,13 @@ struct Core { // DmuxPamfContext, its CellDmuxPamfHandle, and the SPU side's que
     u64 thread_id = 0;
     u32 tls = 0;
 
-    // Under `mutex` (the lv2 mutex), as in RPCS3.
+    // Under `mutex` (the lv2 mutex), as in RPCS3. The demuxer's thread also takes a first look at enabled_es_num
+    // without it (RPCS3's, which checks again under the mutex): an atomic (D-587).
     u64 au_released_bitset = 0;
     bool stream_reset_requested = false;
     SequenceState sequence_state = SequenceState::dormant;
-    s32 max_enabled_es_num = DMUX_PAMF_MAX_ENABLED_ES_NUM, enabled_es_num = 0;
+    s32 max_enabled_es_num = DMUX_PAMF_MAX_ENABLED_ES_NUM;
+    std::atomic<s32> enabled_es_num{0};
     std::array<Es*, DMUX_PAMF_MAX_ENABLED_ES_NUM> es{};
     u64 user_data = 0;
     bool is_raw_es = false;
@@ -550,7 +552,8 @@ void exec(PPUContext& ctx, Core& c)
             remaining = c.events.size();
         }
         // The SPU side stops when too many events wait; once two are left, it is told to go on.
-        if (c.enabled_es_num >= 0 && remaining == 2) {
+        // A first look without the mutex, then again under it (RPCS3's).
+        if (c.enabled_es_num.load(std::memory_order_relaxed) >= 0 && remaining == 2) {
             if (!lock(t, c.mutex)) {
                 c.sending_fatal_err = true;
                 continue;

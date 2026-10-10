@@ -359,16 +359,18 @@ Worker::Selection Worker::select2(bool poll)
     std::array<u8, CELL_SPURS_MAX_WORKLOAD2> priority{};
     std::array<u8, CELL_SPURS_MAX_WORKLOAD> packed{}, unique{};
     u32 runnable = 0;
-    const u32 enabled = ps_read32(base, spurs + wkl_off::enabled);
+    // The PPU side changes these while the workers select (add_workload, cellSpursSetPriority, the states through
+    // reservation_op): each is read atomically, a workload's state before the priority it makes valid (D-587).
+    const u32 enabled = atomic_load_be32(base, spurs + wkl_off::enabled);
     const u32 unsupported = sched.unsupported.load(std::memory_order_relaxed);
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD2; i++) {
-        const u8 p = ps_read8(base, wkl_info(spurs, i) + wkl_off::info_priority + spu_num);
-        priority[i] = p ? static_cast<u8>((0x10 - p) & 0x0F) : 0;
-        if (i < CELL_SPURS_MAX_WORKLOAD) unique[i] = ps_read8(base, wkl_info(spurs, i) + wkl_off::info_unique);
-        if ((enabled & (0x80000000u >> i)) && ps_read8(base, spurs + wkl_state(i)) == SPURS_WKL_STATE_RUNNABLE &&
+        if ((enabled & (0x80000000u >> i)) && atomic_load_u8(base, spurs + wkl_state(i)) == SPURS_WKL_STATE_RUNNABLE &&
             !(unsupported & (1u << i))) {
             runnable |= 0x80000000u >> i;
         }
+        const u8 p = atomic_load_u8(base, wkl_info(spurs, i) + wkl_off::info_priority + spu_num);
+        priority[i] = p ? static_cast<u8>((0x10 - p) & 0x0F) : 0;
+        if (i < CELL_SPURS_MAX_WORKLOAD) unique[i] = atomic_load_u8(base, wkl_info(spurs, i) + wkl_off::info_unique);
     }
     for (u32 j = 0; j < CELL_SPURS_MAX_WORKLOAD; j++) packed[j] = static_cast<u8>(priority[j] | (priority[j + 16] << 4));
 
@@ -452,16 +454,17 @@ Worker::Selection Worker::select1(bool poll)
     // RPCS3 spursSysServiceUpdateWorkload).
     std::array<u8, CELL_SPURS_MAX_WORKLOAD> priority{}, unique{};
     u16 runnable = 0;
-    const u32 enabled = ps_read32(base, spurs + wkl_off::enabled);
+    // Read atomically, each state before the priority it makes valid, as in select2 (D-587).
+    const u32 enabled = atomic_load_be32(base, spurs + wkl_off::enabled);
     const u32 unsupported = sched.unsupported.load(std::memory_order_relaxed);
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
-        const u8 p = ps_read8(base, wkl_info(spurs, i) + wkl_off::info_priority + spu_num);
-        priority[i] = p ? static_cast<u8>(0x10 - p) : 0;
-        unique[i] = ps_read8(base, wkl_info(spurs, i) + wkl_off::info_unique);
-        if ((enabled & (0x80000000u >> i)) && ps_read8(base, spurs + wkl_off::state1 + i) == SPURS_WKL_STATE_RUNNABLE &&
-            !(unsupported & (1u << i))) {
+        const bool listed = (enabled & (0x80000000u >> i)) && !(unsupported & (1u << i));
+        if (listed && atomic_load_u8(base, spurs + wkl_off::state1 + i) == SPURS_WKL_STATE_RUNNABLE) {
             runnable |= static_cast<u16>(0x8000u >> i);
         }
+        const u8 p = atomic_load_u8(base, wkl_info(spurs, i) + wkl_off::info_priority + spu_num);
+        priority[i] = p ? static_cast<u8>(0x10 - p) : 0;
+        unique[i] = atomic_load_u8(base, wkl_info(spurs, i) + wkl_off::info_unique);
     }
 
     Selection sel;

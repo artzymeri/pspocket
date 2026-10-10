@@ -142,6 +142,18 @@ void wait_line(lv2::PpuThread& t, u32 addr, u64 version)
     if (lv2::wait_aborted(t.waiter)) throw lv2::ThreadExit{};
 }
 
+// The word at `addr` from a copy of its line through the reservation system, with the copy's version (for wait_line). A
+// wait that reads its word so is ordered after the update that let it go, and after what that thread did before it (a
+// reader's copy out of an rwm's buffer, a holder's critical section), by the line's version (D-587). An atomic load of
+// the word alone was ordered after them only by the fence before the reservation system's 8-byte CAS, which
+// ThreadSanitizer does not model.
+u32 word_and_version(u8* base, u32 addr, u64& version)
+{
+    alignas(16) u8 line[PS_RES_LINE_SIZE];
+    version = ps_res_acquire(base, addr, line);
+    return ps_ld32(line + (addr & (PS_RES_LINE_SIZE - 1)));
+}
+
 // RPCS3's `while (!ctrl.atomic_op(op)) { if (ppu.test_stopped()) return 0; }`: `op(u8* line)` updates the copy of the
 // object's line and returns true, or returns false while the object is busy; then the thread waits for the line to
 // change and tries again.
@@ -208,8 +220,8 @@ s32 cellSyncMutexLock(PPUContext& ctx, u32 mutex)
         return true;
     });
     for (;;) {
-        const u64 version = ps_res_version(mutex);
-        if (static_cast<u16>(atomic_load_be32(base, mutex) >> 16) == ticket) break;
+        u64 version = 0;
+        if (static_cast<u16>(word_and_version(base, mutex, version) >> 16) == ticket) break;
         wait_line(t, mutex, version);
     }
     __atomic_thread_fence(__ATOMIC_ACQ_REL);
@@ -446,9 +458,9 @@ s32 cellSyncRwmWrite(PPUContext& ctx, u32 rwm, u32 buffer)
         ps_write16(line, off + rwm_off::writers, 1);
         return true;
     });
-    for (;;) {
-        const u64 version = ps_res_version(rwm);
-        if ((atomic_load_be32(base, rwm) >> 16) == 0) break;
+    for (;;) { // the readers gone: what they copied out of the buffer is done
+        u64 version = 0;
+        if ((word_and_version(base, rwm, version) >> 16) == 0) break;
         wait_line(t, rwm, version);
     }
     std::memmove(base + data, base + buffer, size);

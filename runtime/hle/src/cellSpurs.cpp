@@ -42,11 +42,13 @@ constexpr std::string_view kModule = "cellSpurs";
 constexpr u32 NID_event_helper = 0x8A1D254E; // nid_of("_pspocket_spurs_event_helper"): pspocket's own
 
 // The instance's SPURS1/SPURS2 workload count, as CellSpurs::max_workloads() (RPCS3): 32 when flags1 says so.
-bool spurs2(u8* base, u32 spurs) { return (ps_read8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0; }
+// flags1 and the enabled mask share their lines' doublewords with what the workers update through reservation_op: read
+// atomically (D-587).
+bool spurs2(u8* base, u32 spurs) { return (atomic_load_u8(base, spurs + spurs_off::flags1) & SF1_32_WORKLOADS) != 0; }
 u32 max_workloads(u8* base, u32 spurs) { return spurs2(base, spurs) ? CELL_SPURS_MAX_WORKLOAD2 : CELL_SPURS_MAX_WORKLOAD; }
 bool workload_enabled(u8* base, u32 spurs, u32 wid)
 {
-    return wid < CELL_SPURS_MAX_WORKLOAD2 && (ps_read32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid));
+    return wid < CELL_SPURS_MAX_WORKLOAD2 && (atomic_load_be32(base, spurs + wkl_off::enabled) & (0x80000000u >> wid));
 }
 
 // A pointer argument that is not guest memory: the call is refused with `code` and the call site logged (D-042), where
@@ -1071,7 +1073,11 @@ s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, 
     ps_write64(base, info + wkl_off::info_addr, pm);
     ps_write64(base, info + wkl_off::info_arg, data);
     ps_write32(base, info + wkl_off::info_size, size);
-    for (u32 i = 0; i < 8; i++) ps_write8(base, info + wkl_off::info_priority + i, priority[i]);
+    // The workers read every slot's priorities and unique ID as they select (spurs_scheduler.cpp): stored atomically,
+    // as cellSpursSetPriorities does (D-587).
+    u64 prio = 0;
+    for (u32 i = 0; i < 8; i++) prio = (prio << 8) | priority[i];
+    __atomic_store_n(host_u64(base, info + wkl_off::info_priority), ps_bswap64(prio), __ATOMIC_RELEASE);
     const u32 names = wkl_h(spurs, wid);
     ps_write64(base, names, name_class);
     ps_write64(base, names + 8, name_instance);
@@ -1110,7 +1116,7 @@ s32 add_workload(u8* base, u32 spurs, u32& wid_out, u32 pm, u32 size, u64 data, 
         used |= 0x80000000u >> (ps_read8(base, other + wkl_off::info_unique) & 31);
         unique = static_cast<u32>(std::countl_one(used));
     }
-    ps_write8(base, info + wkl_off::info_unique, static_cast<u8>(unique));
+    atomic_store_u8(base, info + wkl_off::info_unique, static_cast<u8>(unique));
     reservation_op(base, spurs + kLine1, [&](u8* line) {
         ps_write32(line, wkl_off::mskB - kLine1, (ps_read32(line, wkl_off::mskB - kLine1) & ~(0x80000000u >> wid)) |
             (0x80000000u >> wid));
@@ -1429,7 +1435,9 @@ s32 cellSpursGetWorkloadInfo(PPUContext& ctx, u32 spurs, u32 wid, u32 info)
     }
     const u32 w = wid & 15, winfo = wkl_info(spurs, wid), h = wkl_h(spurs, wid), f = wkl_f(spurs, wid);
     ps_write64(base, info + 0x00, ps_read64(base, winfo + wkl_off::info_arg));
-    std::memcpy(base + info + 0x08, base + winfo + wkl_off::info_priority, 8);
+    // The priorities as one load: cellSpursSetPriority and cellSpursSetPriorities store them atomically (D-587).
+    const u64 priorities = __atomic_load_n(host_u64(base, winfo + wkl_off::info_priority), __ATOMIC_ACQUIRE);
+    ps_write64(base, info + 0x08, ps_bswap64(priorities));
     ps_write32(base, info + 0x10, static_cast<u32>(ps_read64(base, winfo + wkl_off::info_addr)));
     ps_write32(base, info + 0x14, ps_read32(base, winfo + wkl_off::info_size));
     ps_write32(base, info + 0x18, static_cast<u32>(ps_read64(base, h + 0x00))); // name class

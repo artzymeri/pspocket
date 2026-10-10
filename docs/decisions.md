@@ -8461,7 +8461,36 @@ What the ThreadSanitizer sweep (D-585) found where two of pspocket's own host pa
 - lv2's RSX driver information: a flip's time and buffer (on the RSX thread), a queued buffer and the vblank count and
   times (on the vblank thread) were plain stores, which cellGcmSys reads on the game's threads at any moment. They are
   release stores (Guest::w64_release).
-Tests: tests/rsx/test_fifo.cpp, "an unaligned NV406E semaphore acquire offset is a failure, not a load" (it blocked
-for good before, on the x86 host), and "the running RSX thread writes get and put when it takes new FIFO pointers
-(D-587)" (the RSX thread is held in a clear while the syscall waits: with the old order put changed under it, every
-run).
+- cellGcmSys reads those heads with acquire loads (head_word, head_dword, cellGcmGetLastFlipTime,
+  cellGcmGetCurrentDisplayBufferId); the immediate flip's label store is a release store, as the RSX's own.
+- The native SPURS kernel's selection (spurs_scheduler.cpp) read the workloads' enabled mask, states, priorities and
+  unique IDs with plain loads while the PPU side changes them (add_workload, cellSpursSetPriority, the states through
+  reservation_op). Each is read atomically, a workload's state before the priority it makes valid. add_workload stores
+  the priorities as one release store, as cellSpursSetPriorities does, and the unique ID with release order;
+  cellSpursGetWorkloadInfo reads the priorities as one load; spurs2() and workload_enabled() read flags1 and
+  wklEnabled atomically, which share their doublewords with what reservation_op's CASes write.
+- A job chain's error (JobChainPolicy::fail): isHalted was set first and the error and its cause written after it, so a
+  PPU that saw the chain halted (cellSpursGetJobChainInfo reads isHalted, then the error) could find no error. The
+  first SPU to fail now records them first, in one reservation operation on their line (the error word, 0 from
+  cellSpursCreateJobChain on, decides which SPU is first), then sets isHalted.
+- libsync2's mutex (cellSync2.cpp): the owner's type, count and ID were plain loads and stores while other lockers read
+  them (is the caller the recursive owner, or the owner at all?): relaxed atomics, the PPU's aligned loads and stores
+  they stand for.
+- cellSync's mutex lock and rwm write waited for their word with an atomic load of it. They now read it from a copy of
+  its line through the reservation system, which the line's version orders after the update that let them go and what
+  that thread did before it (an rwm reader's copy out of the buffer). On the hardware the fence of the reservation
+  system's store orders it; ThreadSanitizer, which does not model fences, reported the reader's copy against the
+  writer's.
+- cellAudio's mixer reads a port's ring while the game writes it, and clears the block it mixed while the game may
+  already write the next: relaxed atomic word loads and stores (the volatile loads and the memset they replace), as the
+  audio DMA reads and clears guest memory word by word.
+- The PAMF demuxer's thread takes a first look at the enabled stream count without the context's mutex, as RPCS3's does
+  (cellDmuxPamf.cpp), and looks again under it; enabling and disabling a stream change it under the mutex. The count
+  is an atomic, on the host's side of the context.
+- The LPCM decoder's command queue: send_command checks that the queue is not full holding only queue_size_mutex, as
+  RPCS3's LLE-like decoder does (cellAdec.cpp LpcmDecContext::send_command), while the decoder's thread takes a command
+  out and lowers the size under queue_mutex. The size is a relaxed atomic word (a stale one makes one BUSY too many).
+Tests: the sweep (D-585) is the check for most of these, as the races do not show in an ordinary build;
+tests/rsx/test_fifo.cpp, "an unaligned NV406E semaphore acquire offset is a failure, not a load" (it blocked for good
+before, on the x86 host), and "the running RSX thread writes get and put when it takes new FIFO pointers (D-587)" (the
+RSX thread is held in a clear while the syscall waits: with the old order put changed under it, every run).

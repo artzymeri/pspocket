@@ -67,6 +67,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -287,6 +288,19 @@ void store_be64_release(u8* base, u32 addr, u64 value)
     __atomic_store_n(host_u64(base, addr), ps_bswap64(value), __ATOMIC_RELEASE);
 }
 
+// A port's ring as the audio hardware's DMA reads and clears it, word by word: the game writes the ring while the audio
+// thread mixes and clears it (ahead of the read position as it should, or over it when it runs late), so these are
+// atomic and each word is one value or the other; relaxed, as the volatile loads and the memset they replace (D-587).
+f32 ring_sample(u8* base, u32 addr)
+{
+    return std::bit_cast<f32>(ps_bswap32(__atomic_load_n(host_u32(base, addr), __ATOMIC_RELAXED)));
+}
+void clear_ring_block(u8* base, u32 addr, u32 bytes)
+{
+    u32* words = host_u32(base, addr);
+    for (u32 i = 0; i < bytes / 4; i++) __atomic_store_n(words + i, 0u, __ATOMIC_RELAXED);
+}
+
 // ------------------------------------------------------------------------------------------------- the audio thread
 
 struct Notify {
@@ -320,8 +334,8 @@ void mix_ports(AudioState& s, MixBlock& out)
                 }
             }
             const u32 in = block + i * stride;
-            const f32 left = ps_readf32(s.base, in) * port.level;
-            const f32 right = port.num_channels ? ps_readf32(s.base, in + 4) * port.level : left;
+            const f32 left = ring_sample(s.base, in) * port.level;
+            const f32 right = port.num_channels ? ring_sample(s.base, in + 4) * port.level : left;
             out[2 * i] += left;
             out[2 * i + 1] += right;
         }
@@ -336,7 +350,7 @@ void advance(AudioState& s, u64 now, std::vector<Notify>& notify, bool tag)
     for (Port& port : s.ports) {
         if (port.state != PortState::Started) continue;
         const u32 block = port.block_addr(port.cur_pos);
-        std::memset(s.base + block, 0, port.block_bytes());
+        clear_ring_block(s.base, block, port.block_bytes());
         if (tag && port.num_channels) audio_buffering::tag_block(s.base, block, port.num_channels, port.tags);
         s.doubled += port.adds > 1;
         port.adds = 0;

@@ -157,6 +157,19 @@ s32 release_output(PPUContext& ctx, u32 h)
 
 u32 cmd_at(u32 h, u32 index) { return h + lp::kCmdSize * (index & 3); }
 
+// The queue's size: written under queue_mutex, and read without it by send_command's check that the queue is full,
+// which holds queue_size_mutex only (RPCS3 cellAdec.cpp LpcmDecContext::send_command, as LLE: the decoder's thread only
+// takes commands out, so a stale size makes one BUSY too many). Relaxed atomics, the PPU's word loads and stores they
+// stand for (D-587).
+u32 queue_size(u8* base, u32 h)
+{
+    return ps_bswap32(__atomic_load_n(host_u32(base, h + lp::cmd_size), __ATOMIC_RELAXED));
+}
+void set_queue_size(u8* base, u32 h, u32 size)
+{
+    __atomic_store_n(host_u32(base, h + lp::cmd_size), ps_bswap32(size), __ATOMIC_RELAXED);
+}
+
 void write_cmd(u8* base, u32 at, const Cmd& c, bool with_handle)
 {
     if (with_handle) {
@@ -173,7 +186,7 @@ s32 send_command(PPUContext& ctx, u32 h, const Cmd& c, const Param* param)
 {
     u8* base = guest_base(ctx);
     if (const s32 r = lock(ctx, h, lp::queue_size_mutex); r != lv2::CELL_OK) return r;
-    if (static_cast<s32>(ps_read32(base, h + lp::cmd_size)) >= 4) {
+    if (static_cast<s32>(queue_size(base, h)) >= 4) {
         unlock(ctx, h, lp::queue_size_mutex);
         return error(CELL_ADEC_ERROR_BUSY);
     }
@@ -192,7 +205,7 @@ s32 send_command(PPUContext& ctx, u32 h, const Cmd& c, const Param* param)
     }
     write_cmd(base, cmd_at(h, back), c, c.type == DECODE_AU);
     ps_write32(base, h + lp::cmd_back, (back + 1) & 3);
-    ps_write32(base, h + lp::cmd_size, ps_read32(base, h + lp::cmd_size) + 1);
+    set_queue_size(base, h, queue_size(base, h) + 1);
     s32 r = unlock(ctx, h, lp::queue_mutex);
     if (r == lv2::CELL_OK) r = sem_release(ctx, h + lp::cmd_available);
     if (r != lv2::CELL_OK) {
@@ -213,7 +226,7 @@ Cmd pop_command(u8* base, u32 h)
     c.type = ps_read32(base, at + lp::c_type);
     ps_write32(base, at + lp::c_pcm_handle, 0xFF);
     ps_write32(base, h + lp::cmd_front, (front + 1) & 3);
-    ps_write32(base, h + lp::cmd_size, ps_read32(base, h + lp::cmd_size) - 1);
+    set_queue_size(base, h, queue_size(base, h) - 1);
     return c;
 }
 
@@ -511,7 +524,7 @@ public:
         const u32 end_of_context = h + ((lp::size + 0x7F) & ~0x7Fu);
         ps_write32(base, h + lp::cmd_front, 0);
         ps_write32(base, h + lp::cmd_back, 0);
-        ps_write32(base, h + lp::cmd_size, 0);
+        set_queue_size(base, h, 0);
         ps_write32(base, h + lp::run_thread, 1);
         HleProcess& process = *HleProcess::current();
         const u32 fns[4] = {NID_notify_au_done, NID_notify_pcm_out, NID_notify_error, NID_notify_seq_done};
@@ -570,11 +583,11 @@ public:
         lv2::PpuThread& t = thread(ctx);
         if (const s32 r = lock(ctx, h, lp::queue_size_mutex); r != lv2::CELL_OK) return r;
         if (const s32 r = lock(ctx, h, lp::queue_mutex); r != lv2::CELL_OK) return r;
-        if (ps_read32(base, h + lp::cmd_size) == 0) {
+        if (queue_size(base, h) == 0) {
             const u32 back = ps_read32(base, h + lp::cmd_back);
             write_cmd(base, cmd_at(h, back), Cmd{0, 0, 0, CLOSE}, false);
             ps_write32(base, h + lp::cmd_back, (back + 1) & 3);
-            ps_write32(base, h + lp::cmd_size, ps_read32(base, h + lp::cmd_size) + 1);
+            set_queue_size(base, h, queue_size(base, h) + 1);
             if (const s32 r = unlock(ctx, h, lp::queue_mutex); r != lv2::CELL_OK) return r;
             if (const s32 r = sem_release(ctx, h + lp::cmd_available); r != lv2::CELL_OK) {
                 unlock(ctx, h, lp::queue_size_mutex);
