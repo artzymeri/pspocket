@@ -102,14 +102,17 @@ constexpr u32 kTsInvalid = 0xFFFFFFFF; // CODEC_TS_INVALID
 constexpr u32 kFrameSize = frame_off::size;
 
 // Each codec type's core module: its library and operation table (RPCS3 get_core_ops). Types 0, 26 and 27 are
-// invalid; 28 and 29 were never released (WMA Pro or WMA Lossless); the LPCM types have pspocket's core.
+// invalid; 28 and 29 were never released (WMA Pro or WMA Lossless). The LPCM types' table is libadec's own
+// (g_cell_adec_core_ops_lpcm): cellAdec imports none of it, so pspocket's LPCM core serves them, as ATRAC3plus's
+// serves its four types (cellAtracXdec is not imported in a build with FFmpeg, D-198).
 struct CoreOps {
     std::string_view library;
     u32 nid = 0;
 };
+constexpr u32 kLpcmOps = 0x369D9D3A; // g_cell_adec_core_ops_lpcm (nid_of of its name, RPCS3 REG_VAR)
 constexpr std::array<CoreOps, 32> kCoreOps = {{
     {},                                    // 0 invalid
-    {},                                    // 1 LPCM (PAMF)
+    {"cellAdec", kLpcmOps},                // 1 LPCM (PAMF)
     {"cell_libac3dec", 0xC58BB170},        // 2 AC-3
     {"cellAtracXdec", 0x4944AF9A},         // 3 ATRAC3plus
     {"cellMP3dec", 0x84276A23},            // 4 MP3
@@ -120,12 +123,12 @@ constexpr std::array<CoreOps, 32> kCoreOps = {{
     {"cellTRHDdec", 0xE88E381B},           // 9 TrueHD
     {"cellDTSdec", 0x15248EC5},            // 10 DTS
     {"cellCelpDec", 0xFFE42C22},           // 11 CELP
-    {},                                    // 12 LPCM (Blu-ray)
+    {"cellAdec", kLpcmOps},                // 12 LPCM (Blu-ray)
     {"cellAtracXdec", 0x076B33AB},         // 13 ATRAC3plus, 2 channels
     {"cellAtracXdec", 0x1D210EAA},         // 14 ATRAC3plus, 6 channels
     {"cellAtracXdec", 0xE9A86E54},         // 15 ATRAC3plus, 8 channels
     {"cellM4AacDec", 0xAB61278D},          // 16 MPEG-4 AAC
-    {},                                    // 17 LPCM (DVD)
+    {"cellAdec", kLpcmOps},                // 17 LPCM (DVD)
     {"cellWMAdec", 0x88320B10},            // 18 WMA
     {"cellDTSLBRdec", 0x8C50AF52},         // 19 DTS Express
     {"cellM4AacDec2ch", 0xE996C664},       // 20 MPEG-4 AAC, 2 channels
@@ -166,21 +169,18 @@ public:
         call(ctx, 6, {v.addr()});
         return ps_read32(base, v.addr());
     }
-    s32 open(PPUContext& ctx, u32 core_handle, u32 context, u32 res, u32 spurs_res) override
+    // The front end's notifications go to the core as guest functions, whatever `notify` says of calling them.
+    s32 open(PPUContext& ctx, u32 core_handle, const CoreNotify& notify, u32 res, u32 spurs_res) override
     {
-        HleProcess& p = *HleProcess::current();
-        const u32 au_done = p.descriptor_of("cellAdec", NID_notify_au_done),
-                  pcm_out = p.descriptor_of("cellAdec", NID_notify_pcm_out),
-                  err = p.descriptor_of("cellAdec", NID_notify_error),
-                  seq_done = p.descriptor_of("cellAdec", NID_notify_seq_done);
-        if (!au_done || !pcm_out || !err || !seq_done) {
+        const auto& f = notify.fn;
+        const auto& a = notify.arg;
+        if (!f[0] || !f[1] || !f[2] || !f[3]) {
             PS_LOG_ERROR(kChan, "the notifications for the core are not linked (cellAdec was not imported)");
             return error(CELL_ADEC_ERROR_FATAL);
         }
         if (spurs_res)
-            return call(ctx, 11, {core_handle, au_done, context, pcm_out, context, err, context, seq_done, context, res,
-                spurs_res});
-        return call(ctx, 1, {core_handle, au_done, context, pcm_out, context, err, context, seq_done, context, res});
+            return call(ctx, 11, {core_handle, f[0], a[0], f[1], a[1], f[2], a[2], f[3], a[3], res, spurs_res});
+        return call(ctx, 1, {core_handle, f[0], a[0], f[1], a[1], f[2], a[2], f[3], a[3], res});
     }
     s32 close(PPUContext& ctx, u32 core_handle) override { return call(ctx, 2, {core_handle}); }
     s32 start_seq(PPUContext& ctx, u32 core_handle, u32 param) override { return call(ctx, 3, {core_handle, param}); }
@@ -215,7 +215,7 @@ public:
     s32 pcm_handle_num(PPUContext&) override { return fail(); }
     u32 bsi_info_size(PPUContext&) override { return fail(), 0; }
     u32 version(PPUContext&) override { return fail(), 0; }
-    s32 open(PPUContext&, u32, u32, u32, u32) override { return fail(); }
+    s32 open(PPUContext&, u32, const CoreNotify&, u32, u32) override { return fail(); }
     s32 close(PPUContext&, u32) override { return fail(); }
     s32 start_seq(PPUContext&, u32, u32) override { return fail(); }
     s32 end_seq(PPUContext&, u32) override { return fail(); }
@@ -245,20 +245,23 @@ std::unique_ptr<AdecCore> own_first_core(s32 type)
     }
 }
 
-// The core for a codec type (D-577): pspocket's own first for LPCM and ATRAC3plus; else the core module's table the
-// loader linked (Sony's serves first where the installed system software has it); else pspocket's own core on FFmpeg
-// for the codecs it has one of; else none (logged). *ops_out: the table chosen, 0 for pspocket's own (open keeps it in
-// the context, so the decoder stays on what it was opened on).
+// The core for a codec type (D-577): the core module's table the loader linked (Sony's serves first where the installed
+// system software has it); else pspocket's own, first-served for LPCM and ATRAC3plus (whose tables cellAdec does not
+// import: nothing links one but a test driving pspocket's own exported table, D-591), and on FFmpeg for the codecs it
+// has one of; else none (logged). The loader links only firmware modules' exports there
+// (LleModules::link_host_imports), so pspocket's own cores are called directly, never the long way through their
+// exported tables. *ops_out: the table chosen, 0 for pspocket's own (open keeps it in the context, so the decoder stays
+// on what it was opened on).
 std::unique_ptr<AdecCore> core_for(s32 type, u32* ops_out = nullptr)
 {
     if (ops_out) *ops_out = 0;
-    if (std::unique_ptr<AdecCore> own = own_first_core(type)) return own;
     const CoreOps& c = kCoreOps[static_cast<usize>(type)];
     const u32 ops = c.library.empty() ? 0 : HleProcess::current()->imported(c.library, c.nid);
     if (ops) {
         if (ops_out) *ops_out = ops;
         return std::make_unique<GuestCore>(ops);
     }
+    if (std::unique_ptr<AdecCore> own = own_first_core(type)) return own;
     if (std::unique_ptr<AdecCore> own = make_ffmpeg_core(type)) {
         if (ops_out)
             PS_LOG_INFO(kChan, "codec type {}: no firmware module gave {} ({:#010x}): pspocket's own core (D-577)", type,
@@ -271,13 +274,13 @@ std::unique_ptr<AdecCore> core_for(s32 type, u32* ops_out = nullptr)
     return nullptr;
 }
 
-// The core of an open decoder: what open chose (D-577): pspocket's own first-served core, else the table it was opened
-// on, else pspocket's own core of its codec.
+// The core of an open decoder: what open chose (D-577): the table it was opened on, else pspocket's own first-served
+// core, else pspocket's own core of its codec.
 std::unique_ptr<AdecCore> core_of(u8* base, u32 h)
 {
     const s32 type = static_cast<s32>(ps_read32(base, h + ctx_off::type));
-    if (std::unique_ptr<AdecCore> own = own_first_core(type)) return own;
     if (const u32 ops = ps_read32(base, h + ctx_off::core_ops)) return std::make_unique<GuestCore>(ops);
+    if (std::unique_ptr<AdecCore> own = own_first_core(type)) return own;
     if (std::unique_ptr<AdecCore> own = make_ffmpeg_core(type)) return own;
     return std::make_unique<NoCore>(type);
 }
@@ -722,7 +725,7 @@ s32 open(PPUContext& ctx, u32 type_ptr, u32 res, u32 cb, u32 handle_out, u32 spu
     }
     lv2::sys_mutex_create(thread_of(ctx), h + ctx_off::mutex, h + ctx_off::mutex_attribute); // unchecked on LLE
     ps_write32(base, handle_out, h);
-    return core->open(ctx, core_mem, h, res, spurs_res);
+    return core->open(ctx, core_mem, front_end_notify(h), res, spurs_res);
 }
 
 s32 cellAdecQueryAttr(PPUContext& ctx, u32 type, u32 attr)
@@ -956,6 +959,82 @@ s32 _pspocket_adec_notify_error(PPUContext& ctx, s32 error_code, u32 context)
 }
 
 s32 _pspocket_adec_notify_seq_done(PPUContext& ctx, u32 context) { return notify_seq_done(ctx, context); }
+
+// ---- what a core's open is given, and the notifications through it (D-591)
+
+CoreNotify front_end_notify(u32 context)
+{
+    const HleProcess& p = *HleProcess::current();
+    CoreNotify n;
+    const u32 nids[4] = {NID_notify_au_done, NID_notify_pcm_out, NID_notify_error, NID_notify_seq_done};
+    for (u32 i = 0; i < 4; i++) {
+        n.fn[i] = p.descriptor_of("cellAdec", nids[i]);
+        n.arg[i] = context;
+    }
+    n.direct = true;
+    return n;
+}
+
+void store_notify(u8* base, u32 core_handle, NotifySlots slots, const CoreNotify& n)
+{
+    for (u32 i = 0; i < 4; i++) {
+        ps_write32(base, core_handle + slots.pairs + 8 * i, n.fn[i]);
+        ps_write32(base, core_handle + slots.pairs + 8 * i + 4, n.arg[i]);
+    }
+    ps_write32(base, core_handle + slots.flag, n.direct ? 0 : 1);
+}
+
+CoreNotifier::CoreNotifier(PPUContext& ctx, u32 core_handle, NotifySlots slots)
+    : ctx_(ctx), base_(guest_base(ctx)), pairs_(core_handle + slots.pairs),
+      guest_(ps_read32(base_, core_handle + slots.flag) != 0)
+{
+}
+
+u32 CoreNotifier::fn(u32 i) const
+{
+    const u32 f = ps_read32(base_, pairs_ + 8 * i);
+    if (!f) PS_LOG_ERROR(kChan, "a core's notification {} has no function: not called", i);
+    return f;
+}
+
+u32 CoreNotifier::arg(u32 i) const { return ps_read32(base_, pairs_ + 8 * i + 4); }
+
+constexpr u64 sext(s32 v) { return static_cast<u64>(static_cast<s64>(v)); }
+
+void CoreNotifier::au_done(s32 pcm_handle) const
+{
+    if (!guest_) notify_au_done(ctx_, pcm_handle, arg(0));
+    else if (const u32 f = fn(0)) call_guest(ctx_, f, {sext(pcm_handle), arg(0)});
+}
+
+void CoreNotifier::pcm_out(s32 pcm_handle, u32 pcm_addr, u32 pcm_size, u32 bsi_info, s8 correct_pts_type,
+    s32 error_code) const
+{
+    if (!guest_) {
+        notify_pcm_out(ctx_, pcm_handle, pcm_addr, pcm_size, arg(1), bsi_info, correct_pts_type, error_code);
+        return;
+    }
+    const u32 f = fn(1);
+    if (!f) return;
+    StackVar info(ctx_, base_, 4); // vm::cpptr<void> bsiInfo: where the information's address is
+    ps_write32(base_, info.addr(), bsi_info);
+    call_guest(ctx_, f,
+        {sext(pcm_handle), pcm_addr, pcm_size, arg(1), info.addr(), sext(correct_pts_type), sext(error_code)});
+}
+
+void CoreNotifier::error(s32 error_code) const
+{
+    if (!guest_) notify_error(ctx_, error_code, arg(2));
+    else if (const u32 f = fn(2)) call_guest(ctx_, f, {sext(error_code), arg(2)});
+}
+
+void CoreNotifier::seq_done() const
+{
+    if (!guest_) notify_seq_done(ctx_, arg(3));
+    else if (const u32 f = fn(3)) call_guest(ctx_, f, {arg(3)});
+}
+
+u32 core_thread_entry(u32 nid, const char* name) { return HleProcess::current()->link_function("cellAdec", nid, name); }
 
 } // namespace adec
 

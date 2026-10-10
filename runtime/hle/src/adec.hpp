@@ -7,8 +7,11 @@
 // adec_lpcm.cpp; ATRAC3plus, adec_atracx.cpp) directly, or Sony's core module through its operation table, as RPCS3's
 // cellAdec calls the LLE cores. For MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3 and ATRAC3 the firmware's core
 // serves first and pspocket's own core on FFmpeg (adec_ffmpeg.hpp) where no firmware module gives one (D-577).
+// pspocket's own cores are also the firmware modules' exports, operation tables and PTS functions, for Sony's modules
+// and others to call (adec_tables.cpp, D-591).
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h.
 
+#include <array>
 #include <memory>
 
 #include "pspocket/core/types.hpp"
@@ -83,6 +86,46 @@ namespace item_off {
 constexpr u32 pcm_handle = 0x00, status = 0x04, start_addr = 0x08, size = 0x0C, bsi_info = 0x10, au_info = 0x18;
 }
 
+// The four notifications a core's open is given (RPCS3 AdecCb: a function and its argument each), in the order of
+// CellAdecCoreOps's open: AUDONE, PCMOUT, ERROR, SEQDONE. `direct`: they are pspocket's own front end's (cellAdec.cpp,
+// which opened the core itself), and the core calls them as C++ with their argument; otherwise they are guest functions
+// (Sony's libadec, or another module driving the core through its exported table, D-591), called as RPCS3's cores call
+// cbFunc.
+struct CoreNotify {
+    std::array<u32, 4> fn{}, arg{};
+    bool direct = false;
+};
+// The front end's own: its four internal functions (linked with cellAdec), `context` (its AdecContext) the argument of
+// each.
+CoreNotify front_end_notify(u32 context);
+
+// Where a core keeps its notifications in its context: the four (function, argument) pairs from `pairs`, then a word at
+// `flag`, 1 when they are guest functions and 0 when they are the front end's own (RPCS3 keeps the pairs; the flag is
+// pspocket's, in a word its layout leaves unused).
+struct NotifySlots {
+    u32 pairs, flag;
+};
+void store_notify(u8* base, u32 core_handle, NotifySlots slots, const CoreNotify& n);
+
+// A core's notifications through what its open stored (on the core's thread): the front end's own called directly, a
+// guest function through call_guest (PCMOUT's information then passed as RPCS3 passes it, a pointer to its address).
+class CoreNotifier {
+public:
+    CoreNotifier(PPUContext& ctx, u32 core_handle, NotifySlots slots);
+    void au_done(s32 pcm_handle) const;
+    void pcm_out(s32 pcm_handle, u32 pcm_addr, u32 pcm_size, u32 bsi_info, s8 correct_pts_type, s32 error_code) const;
+    void error(s32 error_code) const;
+    void seq_done() const;
+
+private:
+    u32 fn(u32 i) const;
+    u32 arg(u32 i) const;
+    PPUContext& ctx_;
+    u8* base_;
+    u32 pairs_;
+    bool guest_;
+};
+
 // A decoder core. Its own state lives in the game's memory at its handle (the front end's context's core_handle).
 class AdecCore {
 public:
@@ -92,9 +135,10 @@ public:
     virtual s32 pcm_handle_num(PPUContext& ctx) = 0;
     virtual u32 bsi_info_size(PPUContext& ctx) = 0;
     virtual u32 version(PPUContext& ctx) = 0;
-    // `context`: the front end's AdecContext, which the notifications take. `res`: a CellAdecResource; `spurs_res`: a
-    // CellAdecResourceSpurs (cellAdecOpenEx/OpenExt) or 0.
-    virtual s32 open(PPUContext& ctx, u32 core_handle, u32 context, u32 res, u32 spurs_res) = 0;
+    // `notify`: whom the core notifies (front_end_notify from pspocket's front end; open's arguments when it is called
+    // through an operation table). `res`: a CellAdecResource; `spurs_res`: a CellAdecResourceSpurs
+    // (cellAdecOpenEx/OpenExt, openExt) or 0.
+    virtual s32 open(PPUContext& ctx, u32 core_handle, const CoreNotify& notify, u32 res, u32 spurs_res) = 0;
     virtual s32 close(PPUContext& ctx, u32 core_handle) = 0;
     virtual s32 start_seq(PPUContext& ctx, u32 core_handle, u32 param) = 0;
     virtual s32 end_seq(PPUContext& ctx, u32 core_handle) = 0;
@@ -137,6 +181,9 @@ s32 notify_seq_done(PPUContext& ctx, u32 context);
 constexpr u32 NID_notify_au_done = 0x22351FEC, NID_notify_pcm_out = 0xAF08E5A0, NID_notify_error = 0xF1642C29,
               NID_notify_seq_done = 0xD2B167B0, NID_lpcm_dec_thread = 0x4ED4A064, NID_atracx_dec_thread = 0x346C0076,
               NID_ffmpeg_dec_thread = 0x01A3568A;
+// A core's thread function, linked when the core first opens one: a core opened through its exported table (D-591)
+// may be in a process that does not import cellAdec, whose internal functions are then not linked at load.
+u32 core_thread_entry(u32 nid, const char* name);
 s32 _pspocket_adec_notify_au_done(PPUContext& ctx, s32 pcm_handle, u32 context);
 s32 _pspocket_adec_notify_pcm_out(PPUContext& ctx, s32 pcm_handle, u32 pcm_addr, u32 pcm_size, u32 context,
     u32 bsi_info_ptr, u8 correct_pts_type, s32 error_code);

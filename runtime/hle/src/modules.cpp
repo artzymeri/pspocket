@@ -43,6 +43,7 @@ void register_cellDmux(Registry& r);
 void register_cellOvis(Registry& r);
 void register_libvdec(Registry& r);
 void register_cellAdec(Registry& r);
+void register_adec_tables(Registry& r);
 void register_cellPngDec(Registry& r);
 void register_cellJpgDec(Registry& r);
 void register_cellGifDec(Registry& r);
@@ -134,6 +135,7 @@ void register_all_modules(Registry& r)
     register_cellOvis(r);
     register_libvdec(r);
     register_cellAdec(r);
+    register_adec_tables(r);
     register_cellPngDec(r);
     register_cellJpgDec(r);
     register_cellGifDec(r);

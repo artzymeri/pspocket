@@ -21,6 +21,7 @@
 #include "firmware_compare.hpp"
 #include "hle_test_util.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 #include "pspocket/spu/runtime.h"
 
@@ -194,6 +195,34 @@ inline Observed core_run(u8* b, const Call& call, u32 type, std::initializer_lis
     }
     r("cellAdecClose", 0x847D2380, {handle});
     return o;
+}
+
+// pspocket's own exported operation table of a core (D-591), linked for pspocket's cellAdec as the loader links a
+// firmware module's (D-197): the front end then drives pspocket's core through the table, as Sony's libadec would, the
+// long way the loader never takes for it (it links only firmware modules' exports there). The table's address.
+inline u32 link_own_table(Fixture& f, std::string_view library, u32 nid)
+{
+    const u32 table = f.hle->link_variable(library, nid);
+    REQUIRE(table != 0);
+    f.hle->link_import(library, nid, table);
+    return table;
+}
+
+// pspocket's own _SceAdecCorrectPtsValue_* (D-591) linked so: the front end calls it through its descriptor.
+inline u32 link_own_function(Fixture& f, std::string_view library, u32 nid)
+{
+    REQUIRE(hle::registry().find(library, nid) != nullptr);
+    const u32 descriptor = f.hle->link_function(library, nid, {});
+    REQUIRE(descriptor != 0);
+    f.hle->link_import(library, nid, descriptor);
+    return descriptor;
+}
+
+// How many times the guest called the linked function `module`::`name` (0 when it is not linked).
+inline u64 guest_calls(Fixture& f, std::string_view module, std::string_view name)
+{
+    const u32 d = f.hle->descriptor_of(module, recomp::nid_of(name));
+    return d ? f.hle->linked_at(d + 4)->calls.load() : 0;
 }
 
 // The firmware's codec cores linked for pspocket's cellAdec as the loader links them for a game (D-197), started.

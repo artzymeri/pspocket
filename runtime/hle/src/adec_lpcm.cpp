@@ -8,9 +8,9 @@
 //
 // LpcmDecContext (0x1C8): the command queue (4 commands of 0x2C, front, back, size), the thread, the queue size mutex
 // and an unused cond/mutex/cond, run_thread, the four notifications (function, argument), output_locked, the output
-// buffer, the parameters, then (LLE: 36 bytes of SPURS command data; pspocket: the thread's TLS block at +0x110) the
-// output mutex and its "consumed" cond, two semaphores (value, mutex, cond), the queue mutex, error_occurred, SPURS
-// queue mutexes, dvd_packing, output_size.
+// buffer, the parameters, then (LLE: 36 bytes of SPURS command data; pspocket: the thread's TLS block at +0x110 and at
+// +0x114 whether the notifications are guest functions, D-591) the output mutex and its "consumed" cond, two semaphores
+// (value, mutex, cond), the queue mutex, error_occurred, SPURS queue mutexes, dvd_packing, output_size.
 
 #include <algorithm>
 #include <cstring>
@@ -36,10 +36,9 @@ constexpr std::string_view kChan = "cellAdec";
 namespace lp {
 constexpr u32 kCmdSize = 0x2C, cmd_front = 0xB0, cmd_back = 0xB4, cmd_size = 0xB8, thread_id = 0xC0,
               queue_size_mutex = 0xC8, queue_size_cond = 0xCC, unk_mutex = 0xD0, unk_cond = 0xD4, run_thread = 0xD8,
-              notify_au_done = 0xDC, notify_pcm_out = 0xE4, notify_error = 0xEC, notify_seq_done = 0xF4,
-              output_locked = 0xFC, output = 0x100, lpcm_param = 0x104, tls = 0x110,
-              output_mutex = 0x130, output_consumed = 0x134, cmd_available = 0x138, reserved2 = 0x144,
-              queue_mutex = 0x150, error_occurred = 0x154, spurs_queue_pop_mutex = 0x178,
+              notify = 0xDC, output_locked = 0xFC, output = 0x100, lpcm_param = 0x104, tls = 0x110,
+              notify_guest = 0x114, output_mutex = 0x130, output_consumed = 0x134, cmd_available = 0x138,
+              reserved2 = 0x144, queue_mutex = 0x150, error_occurred = 0x154, spurs_queue_pop_mutex = 0x178,
               spurs_queue_push_mutex = 0x17C, dvd_packing = 0x184, output_size = 0x188, size = 0x1C8;
 // LpcmDecCmd: pcm_handle, au_start_addr, au_size, 8 reserved bytes, CellAdecParamLpcm, type, 4 reserved bytes.
 constexpr u32 c_pcm_handle = 0x00, c_au_start = 0x04, c_au_size = 0x08, c_param = 0x14, c_type = 0x24;
@@ -71,6 +70,9 @@ enum : u32 { DVD_CH_MONO = 1, DVD_CH_STEREO = 3, DVD_CH_3_2 = 6, DVD_CH_3_2_LFE 
 enum : u32 { FS_48kHz = 1, FS_96kHz = 3, FS_192kHz = 4 };
 
 lv2::PpuThread& thread(PPUContext& ctx) { return thread_of(ctx); }
+
+// The four notifications (AU done, PCM out, error, sequence done) are (function, argument) pairs from lp::notify.
+constexpr NotifySlots kSlots{lp::notify, lp::notify_guest};
 
 Param read_param(u8* base, u32 at)
 {
@@ -473,14 +475,14 @@ void run(PPUContext& ctx, u32 h)
         lock(ctx, h, lp::queue_mutex);
         const Cmd cmd = pop_command(base, h);
         unlock(ctx, h, lp::queue_mutex);
-        // The context's arguments to the notifications: the front end's context.
-        const u32 context = ps_read32(base, h + lp::notify_au_done + 4);
+        // Whom the notifications go to: what open was given (the front end's own, or a table caller's, D-591).
+        const CoreNotifier notify(ctx, h, kSlots);
         switch (cmd.type) {
         case START_SEQ: // LLE sends it to its SPU task, which does nothing with it
             failed(unlock(ctx, h, lp::output_mutex));
             break;
         case END_SEQ:
-            notify_seq_done(ctx, ps_read32(base, h + lp::notify_seq_done + 4));
+            notify.seq_done();
             failed(unlock(ctx, h, lp::output_mutex));
             break;
         case CLOSE:
@@ -489,8 +491,8 @@ void run(PPUContext& ctx, u32 h)
         case DECODE_AU: {
             const u32 output_size = decode(ctx, h, cmd);
             const bool error_occurred = ps_read32(base, h + lp::error_occurred) != 0;
-            if (error_occurred) notify_error(ctx, error(CELL_ADEC_ERROR_FATAL), ps_read32(base, h + lp::notify_error + 4));
-            notify_au_done(ctx, cmd.pcm_handle, context);
+            if (error_occurred) notify.error(error(CELL_ADEC_ERROR_FATAL));
+            notify.au_done(cmd.pcm_handle);
             ps_write32(base, h + lp::output_locked, 1);
             failed(unlock(ctx, h, lp::output_mutex));
             // CellAdecLpcmInfo: channelNumber, sampleRate, outputDataSize.
@@ -499,9 +501,9 @@ void run(PPUContext& ctx, u32 h)
             ps_write32(base, bsi.addr(), p.channels);
             ps_write32(base, bsi.addr() + 4, p.rate);
             ps_write32(base, bsi.addr() + 8, output_size);
-            notify_pcm_out(ctx, cmd.pcm_handle, ps_read32(base, h + lp::output), output_size,
-                ps_read32(base, h + lp::notify_pcm_out + 4), bsi.addr(), CORRECT_PTS_LPCM_HDMV,
-                ps_read32(base, h + lp::error_occurred) ? error(CELL_ADEC_ERROR_FATAL) : lv2::CELL_OK);
+            const s32 status = ps_read32(base, h + lp::error_occurred) ? error(CELL_ADEC_ERROR_FATAL) : lv2::CELL_OK;
+            notify.pcm_out(cmd.pcm_handle, ps_read32(base, h + lp::output), output_size, bsi.addr(),
+                CORRECT_PTS_LPCM_HDMV, status);
             break;
         }
         default: PS_FATAL(kChan, "LPCM: command type {} in the queue of {:#x}", cmd.type, h);
@@ -518,7 +520,7 @@ public:
 
     // RPCS3 _CellAdecCoreOpOpenExt_lpcm (Open is the same without SPURS: LLE uses the game's SPURS instance or makes
     // one; pspocket uses neither).
-    s32 open(PPUContext& ctx, u32 h, u32 context, u32 res, u32) override
+    s32 open(PPUContext& ctx, u32 h, const CoreNotify& notify, u32 res, u32) override
     {
         u8* base = guest_base(ctx);
         const u32 end_of_context = h + ((lp::size + 0x7F) & ~0x7Fu);
@@ -527,11 +529,7 @@ public:
         set_queue_size(base, h, 0);
         ps_write32(base, h + lp::run_thread, 1);
         HleProcess& process = *HleProcess::current();
-        const u32 fns[4] = {NID_notify_au_done, NID_notify_pcm_out, NID_notify_error, NID_notify_seq_done};
-        for (u32 i = 0; i < 4; i++) {
-            ps_write32(base, h + lp::notify_au_done + 8 * i, process.descriptor_of("cellAdec", fns[i]));
-            ps_write32(base, h + lp::notify_au_done + 8 * i + 4, context);
-        }
+        store_notify(base, h, kSlots, notify);
         ps_write32(base, h + lp::output, end_of_context + 0x180);
         ps_write32(base, h + lp::lpcm_param, end_of_context);
         ps_write32(base, h + lp::error_occurred, 0);
@@ -548,9 +546,9 @@ public:
         if (r != lv2::CELL_OK) return r;
         // The decoder's thread (CellAdecResource: ppuThreadPriority +8, ppuThreadStackSize +16), joinable.
         lv2::PpuThread& t = thread(ctx);
-        const u32 entry = process.descriptor_of("cellAdec", NID_lpcm_dec_thread);
+        const u32 entry = core_thread_entry(NID_lpcm_dec_thread, "_pspocket_lpcm_dec_thread");
         if (!entry) {
-            PS_LOG_ERROR(kChan, "LPCM: the decoder's thread function is not linked (cellAdec was not imported)");
+            PS_LOG_ERROR(kChan, "LPCM: no memory to link the decoder's thread function");
             return error(CELL_ADEC_ERROR_FATAL);
         }
         const u32 tls = process.alloc_tls();

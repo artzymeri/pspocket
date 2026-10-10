@@ -51,6 +51,9 @@ enum CmdType : u32 { INVALID = 0, START_SEQ = 1, DECODE_AU = 2, END_SEQ = 3, CLO
 
 lv2::PpuThread& thread(PPUContext& ctx) { return thread_of(ctx); }
 
+// The four notifications (AU done, PCM out, error, sequence done) are (function, argument) pairs from fx::notify.
+constexpr NotifySlots kSlots{fx::notify, fx::notify_guest};
+
 void put_name(u8* base, u32 at, std::string_view name)
 {
     for (u32 i = 0; i < 8; i++) ps_write8(base, at + i, i < name.size() ? static_cast<u8>(name[i]) : 0);
@@ -156,15 +159,15 @@ void decode_au(PPUContext& ctx, u32 h, const Spec& spec, Codec& codec, const Cmd
         d = codec.decode(base, cmd.au_start, cmd.au_size, output, bsi.addr());
     }
     if (d.size > spec.output_bytes) PS_FATAL(kChan, "{}: {} bytes of PCM for a {}-byte output", spec.name, d.size, spec.output_bytes);
-    if (d.error != lv2::CELL_OK) notify_error(ctx, d.error, ps_read32(base, h + fx::notify_error + 4));
+    const CoreNotifier notify(ctx, h, kSlots); // what open was given (D-591)
+    if (d.error != lv2::CELL_OK) notify.error(d.error);
     // AUDONE and PCMOUT follow every decode, even a failed one, as libatxdec's (adec_atracx.cpp).
-    notify_au_done(ctx, cmd.pcm_handle, ps_read32(base, h + fx::notify_au_done + 4));
+    notify.au_done(cmd.pcm_handle);
     ps_write32(base, h + fx::output_locked, 1);
     unlock(ctx, h, fx::output_mutex);
     ps_write32(base, h + fx::pcm_size, d.size);
     ps_write32(base, h + fx::duration, d.duration);
-    notify_pcm_out(ctx, cmd.pcm_handle, output, d.size, ps_read32(base, h + fx::notify_pcm_out + 4), bsi.addr(),
-        d.pts_type, d.error);
+    notify.pcm_out(cmd.pcm_handle, output, d.size, bsi.addr(), d.pts_type, d.error);
 }
 
 // The decoder's thread (as AtracXdecContext::exec): one command at a time until Close.
@@ -193,7 +196,7 @@ void run(PPUContext& ctx, u32 h)
                 PS_LOG_ERROR(kChan, "{} decoder {:#x}: the sequence's parameters were refused ({:#010x})", spec->name, h,
                     static_cast<u32>(r));
             break;
-        case END_SEQ: notify_seq_done(ctx, ps_read32(base, h + fx::notify_seq_done + 4)); break;
+        case END_SEQ: CoreNotifier(ctx, h, kSlots).seq_done(); break;
         case DECODE_AU:
             lock(ctx, h, fx::output_mutex);
             while (ps_read32(base, h + fx::output_locked)) wait(ctx, h, fx::output_consumed);
@@ -220,16 +223,12 @@ public:
     u32 bsi_info_size(PPUContext&) override { return spec_.bsi_size; }
     u32 version(PPUContext&) override { return spec_.version; }
 
-    s32 open(PPUContext& ctx, u32 h, u32 context, u32 res, u32) override
+    s32 open(PPUContext& ctx, u32 h, const CoreNotify& notify, u32 res, u32) override
     {
         u8* base = guest_base(ctx);
         std::memset(base + h, 0, fx::size);
         HleProcess& process = *HleProcess::current();
-        const u32 fns[4] = {NID_notify_au_done, NID_notify_pcm_out, NID_notify_error, NID_notify_seq_done};
-        for (u32 i = 0; i < 4; i++) {
-            ps_write32(base, h + fx::notify_au_done + 8 * i, process.descriptor_of("cellAdec", fns[i]));
-            ps_write32(base, h + fx::notify_au_done + 8 * i + 4, context);
-        }
+        store_notify(base, h, kSlots, notify);
         ps_write32(base, h + fx::type, static_cast<u32>(spec_.type));
         ps_write32(base, h + fx::output, h + fx::size);
         ps_write32(base, h + fx::run_thread, 1);
@@ -241,9 +240,9 @@ public:
         if (r == lv2::CELL_OK) r = create_mutex(ctx, h + fx::output_mutex, "_adf004");
         if (r == lv2::CELL_OK) r = create_cond(ctx, h + fx::output_consumed, h + fx::output_mutex, "_adf005");
         if (r != lv2::CELL_OK) return r;
-        const u32 entry = process.descriptor_of("cellAdec", NID_ffmpeg_dec_thread);
+        const u32 entry = core_thread_entry(NID_ffmpeg_dec_thread, "_pspocket_adec_ffmpeg_dec_thread");
         if (!entry) {
-            PS_LOG_ERROR(kChan, "{}: the decoder's thread function is not linked (cellAdec was not imported)", spec_.name);
+            PS_LOG_ERROR(kChan, "{}: no memory to link the decoder's thread function", spec_.name);
             return error(CELL_ADEC_ERROR_FATAL);
         }
         // The decoder's thread (CellAdecResource: ppuThreadPriority +8, ppuThreadStackSize +16), joinable.

@@ -17,7 +17,8 @@
 //   cond and output_locked; +0x120 the run_thread mutex and flag; +0x128 the four notifications (function, argument);
 //   +0x148 the thread (u64); +0x150 its TLS block; +0x154 the cellAdec type; +0x158 the output's address; +0x15C the
 //   PCM waiting to be taken (bytes); +0x160 the last PTS out (upper, lower) and its frame's length, +0x16C the length of
-//   the frame being given out (90 kHz ticks, for the cores' own PTS correction); +0x170 the sequence's parameters.
+//   the frame being given out (90 kHz ticks, for the cores' own PTS correction); +0x170 the sequence's parameters;
+//   +0x1A0 whether the notifications are guest functions (opened through the exported table, D-591).
 
 #include <memory>
 #include <span>
@@ -41,9 +42,9 @@ constexpr u32 kCmdSize = 0x40, c_type = 0x00, c_pcm_handle = 0x04, c_au_start = 
               kParamMax = 0x30;
 constexpr u32 cmd_front = 0x100, cmd_back = 0x104, cmd_size = 0x108, queue_mutex = 0x10C, queue_not_empty = 0x110,
               output_mutex = 0x114, output_consumed = 0x118, output_locked = 0x11C, run_thread_mutex = 0x120,
-              run_thread = 0x124, notify_au_done = 0x128, notify_pcm_out = 0x130, notify_error = 0x138,
-              notify_seq_done = 0x140, thread_id = 0x148, tls = 0x150, type = 0x154, output = 0x158, pcm_size = 0x15C,
-              prev_pts = 0x160, prev_duration = 0x168, duration = 0x16C, param = 0x170, size = 0x200;
+              run_thread = 0x124, notify = 0x128, thread_id = 0x148, tls = 0x150, type = 0x154, output = 0x158,
+              pcm_size = 0x15C, prev_pts = 0x160, prev_duration = 0x168, duration = 0x16C, param = 0x170,
+              notify_guest = 0x1A0, size = 0x200;
 } // namespace fx
 
 // What a codec made of one access unit.

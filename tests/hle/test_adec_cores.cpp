@@ -1623,4 +1623,199 @@ TEST_CASE("cellAtrac plays an ATRAC3 file through pspocket's ATRAC3 core where n
     CHECK(call("cellAtracDeleteDecoder", {kAtHandle}) == 0);
 }
 
+// ---- D-591: the cores on FFmpeg through pspocket's own exported operation tables, and their PTS functions
+
+namespace {
+
+// Whether two runs of a decoder showed the same: answers, sizes, version, callbacks and every PCM out.
+bool same_runs(const CoreRun& a, const CoreRun& b)
+{
+    if (a.lines != b.lines || a.mem != b.mem || a.version_upper != b.version_upper ||
+        a.version_lower != b.version_lower || a.callbacks != b.callbacks || a.outs.size() != b.outs.size())
+        return false;
+    for (usize i = 0; i < a.outs.size(); i++) {
+        const Out& x = a.outs[i];
+        const Out& y = b.outs[i];
+        if (x.handle != y.handle || x.status != y.status || x.size != y.size || x.pts_upper != y.pts_upper ||
+            x.pts_lower != y.pts_lower || x.user_data != y.user_data || x.bsi != y.bsi || x.pcm != y.pcm)
+            return false;
+    }
+    return true;
+}
+
+} // namespace
+
+TEST_CASE("cellAdec: each core on FFmpeg through pspocket's own operation table, as a firmware module drives it "
+          "(D-591)",
+    "[hle][adec]")
+{
+    InterpretMisses interpret;
+    // A table, the stream through it (some units without a PTS: the front end's step for MP3, AC-3 and ATRAC3, the
+    // core's PTS function for the others) and its tag (the operations' names end with it).
+    struct Case {
+        const char* library;
+        u32 type, nid;
+        const char* pts_function; // _SceAdecCorrectPtsValue_*, or none
+        u32 pts_nid;
+        std::vector<u8> param;
+        Feed feed;
+        const char* tag;
+    };
+    std::vector<Case> cases;
+    {
+        Feed feed;
+        feed.bsi_size = 0x1C;
+        for (u32 k = 0; k < 4; k++) feed.aus.push_back(mp3_frame({}));
+        feed.missing = {2};
+        cases.push_back({"cellMP3dec", kTypeMp3, 0x84276A23, nullptr, 0, mp3_param(4), feed, "Mp3"});
+    }
+    {
+        Feed feed;
+        feed.bsi_size = 0x40;
+        feed.step = 720;
+        for (u32 k = 0; k < 5; k++) feed.aus.push_back(layer1_tone(2, {4, 9}));
+        feed.missing = {0, 3};
+        cases.push_back({"cellMPL1dec", kTypeMpegL1, 0xBBC70551, "_SceAdecCorrectPtsValue_mpmcl1", 0xA4A9A309,
+            mpmc_param(0), feed, "mpmcl1"});
+    }
+    {
+        Feed feed;
+        feed.bsi_size = 0xC;
+        feed.step = 4180;
+        for (u32 k = 0; k < 4; k++) feed.aus.push_back(atrac3_frame(2, {100, 60}));
+        feed.missing = {2};
+        cases.push_back(
+            {"cellAtrac3dec", kTypeAtrac3, 0x60487D65, nullptr, 0, atrac3_param(2, 0, 384, 0x84), feed, "atrac3"});
+    }
+    const std::vector<s16> input = sines(48000, 24000, {1000, 2500}, {0.5, 0.3});
+    if (avcodec_find_encoder_by_name("mp2")) {
+        const Encoded enc = ffmpeg_encode("mp2", 48000, 2, 384000, input);
+        REQUIRE(enc.packets.size() >= 6);
+        Feed feed;
+        feed.bsi_size = 0x40;
+        feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 6);
+        feed.missing = {2};
+        cases.push_back({"cellM2BCdec", kTypeMpegL2, 0x300AFE4D, "_SceAdecCorrectPtsValue_mpmc", 0xEC7DE355,
+            mpmc_param(0), feed, "mpmc"});
+    }
+    if (avcodec_find_encoder_by_name("aac")) {
+        const Encoded enc = aac_encode(input, 2, 48000, 128000);
+        REQUIRE(enc.packets.size() >= 6);
+        Feed feed;
+        feed.bsi_size = 0x80;
+        feed.step = 1920;
+        for (u32 k = 0; k < 6; k++) feed.aus.push_back(adts(enc.extradata, enc.packets[k]));
+        feed.missing = {3};
+        cases.push_back({"cellM4AacDec", kTypeM4Aac, 0xAB61278D, "_SceAdecCorrectPtsValue_M4Aac", 0x431A1DCA,
+            m4aac_param(1), feed, "M4Aac"});
+        cases.push_back({"cellM4AacDec2ch", kTypeM4Aac2ch, 0xE996C664, "_SceAdecCorrectPtsValue_M4Aac2ch", 0x869E328D,
+            m4aac_param(1), feed, "M4Aac2ch"});
+        cases.push_back({"cellM4AacDec2chmod", kTypeM4Aac2chMod, 0xDBD26836, "_SceAdecCorrectPtsValue_M4Aac2chmod",
+            0x156FE2F0, m4aac_param(1), feed, "M4Aac2chmod"});
+    }
+    if (avcodec_find_encoder_by_name("ac3")) {
+        const Encoded enc = ffmpeg_encode("ac3", 48000, 2, 192000, input);
+        REQUIRE(enc.packets.size() >= 5);
+        Feed feed;
+        feed.bsi_size = 0x44;
+        feed.step = 2880;
+        feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 5);
+        feed.missing = {2};
+        cases.push_back({"cell_libac3dec", kTypeAc3, 0xC58BB170, nullptr, 0, ac3_param({}), feed, "ac3"});
+    }
+    CHECK(cases.size() >= 3);
+    for (const Case& c : cases) {
+        DYNAMIC_SECTION(c.library)
+        {
+            CoreRun direct, tabled;
+            {
+                BigFixture f;
+                GuestThread t(f, 0, "ppu");
+                direct = run_core(f.base(), hle_calls(f, t), c.type, c.param, c.feed);
+                CHECK(ps_read32(f.base(), kDecoderMem + 0x34) == 0); // pspocket's own core, called directly
+                CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_pcm_out") == 0);
+            }
+            {
+                BigFixture f;
+                GuestThread t(f, 0, "ppu");
+                const u32 table = link_own_table(f, c.library, c.nid);
+                if (c.pts_function) link_own_function(f, c.library, c.pts_nid);
+                tabled = run_core(f.base(), hle_calls(f, t), c.type, c.param, c.feed);
+                CHECK(ps_read32(f.base(), kDecoderMem + 0x34) == table);
+                for (const char* op : {"GetMemSize", "Open", "Close", "StartSeq", "EndSeq", "DecodeAu", "GetVersion",
+                         "Realign", "ReleasePcm", "GetPcmHandleNum", "GetBsiInfoSize"}) {
+                    INFO(op);
+                    CHECK(guest_calls(f, "cellAdec", std::format("_CellAdecCoreOp{}_{}", op, c.tag)) > 0);
+                }
+                CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_pcm_out") == c.feed.aus.size());
+                CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_seq_done") == 1);
+                if (c.pts_function) CHECK(guest_calls(f, c.library, c.pts_function) == c.feed.aus.size());
+            }
+            INFO(all(direct));
+            INFO(all(tabled));
+            CHECK(direct.outs.size() == c.feed.aus.size());
+            CHECK(flow_ok(direct, static_cast<u32>(c.feed.aus.size()), {}));
+            CHECK(same_runs(direct, tabled));
+        }
+    }
+}
+
+// D-591: _SceAdecCorrectPtsValue_* on a core context as its open leaves it: a missing PTS follows the core's last one
+// by that frame's length (the front end's rule for its own cores, D-577), a given one is kept; half a timestamp, a core
+// of another codec or a timestamp outside guest memory is FATAL.
+TEST_CASE("cellAdec: the cores' own PTS functions (D-591)", "[hle][adec]")
+{
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    constexpr u32 kCore = kDecoderMem, kPts = kArgs + 0x100;
+    // FfContext (adec_ffmpeg.hpp): the type at +0x154, the last PTS out at +0x160, its frame's length at +0x168, the
+    // length of the frame being given out at +0x16C.
+    const struct {
+        const char* library;
+        const char* name;
+        u32 nid, type;
+    } fns[] = {{"cellMPL1dec", "_SceAdecCorrectPtsValue_mpmcl1", 0xA4A9A309, kTypeMpegL1},
+        {"cellM2BCdec", "_SceAdecCorrectPtsValue_mpmc", 0xEC7DE355, kTypeMpegL2},
+        {"cellM4AacDec", "_SceAdecCorrectPtsValue_M4Aac", 0x431A1DCA, kTypeM4Aac},
+        {"cellM4AacDec2ch", "_SceAdecCorrectPtsValue_M4Aac2ch", 0x869E328D, kTypeM4Aac2ch},
+        {"cellM4AacDec2chmod", "_SceAdecCorrectPtsValue_M4Aac2chmod", 0x156FE2F0, kTypeM4Aac2chMod}};
+    for (const auto& fn : fns) {
+        INFO(fn.name);
+        REQUIRE(fn.nid == recomp::nid_of(fn.name));
+        const u32 d = link_own_function(f, fn.library, fn.nid);
+        const auto correct = [&](u32 upper, u32 lower) {
+            ps_write32(b, kPts, upper);
+            ps_write32(b, kPts + 4, lower);
+            return static_cast<u32>(hle::call_guest(t.ctx, d, {kCore, kPts}));
+        };
+        std::memset(b + kCore, 0, 0x200);
+        ps_write32(b, kCore + 0x154, fn.type);
+        ps_write32(b, kCore + 0x160, kTsInvalid);
+        ps_write32(b, kCore + 0x164, kTsInvalid);
+        ps_write32(b, kCore + 0x16C, 720);
+        CHECK(correct(kTsInvalid, kTsInvalid) == 0); // none before: none
+        CHECK(ps_read32(b, kPts) == kTsInvalid);
+        CHECK(ps_read32(b, kPts + 4) == kTsInvalid);
+        CHECK(correct(0, 0x1000) == 0); // kept, and the last
+        CHECK(ps_read32(b, kPts + 4) == 0x1000);
+        ps_write32(b, kCore + 0x16C, 1152);
+        CHECK(correct(kTsInvalid, kTsInvalid) == 0); // the last plus its frame's 720
+        CHECK(ps_read32(b, kPts) == 0);
+        CHECK(ps_read32(b, kPts + 4) == 0x1000 + 720);
+        CHECK(correct(kTsInvalid, kTsInvalid) == 0); // that one plus its 1152
+        CHECK(ps_read32(b, kPts + 4) == 0x1000 + 720 + 1152);
+        ps_write32(b, kCore + 0x160, 0);
+        ps_write32(b, kCore + 0x164, 0xFFFFFF00); // the lower word wraps: bit 32 goes on
+        CHECK(correct(kTsInvalid, kTsInvalid) == 0);
+        CHECK(ps_read32(b, kPts) == 1);
+        CHECK(ps_read32(b, kPts + 4) == 0xFFFFFF00u + 1152);
+        CHECK(correct(kTsInvalid, 5) == 0x80610001);         // half a timestamp
+        ps_write32(b, kCore + 0x154, kTypeMp3);
+        CHECK(correct(0, 0x2000) == 0x80610001);             // a core of another codec
+        ps_write32(b, kCore + 0x154, fn.type);
+        CHECK(static_cast<u32>(hle::call_guest(t.ctx, d, {kCore, 0x30000000})) == 0x80610001); // not guest memory
+    }
+}
+
 #endif

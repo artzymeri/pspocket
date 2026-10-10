@@ -563,3 +563,109 @@ TEST_CASE("cellAdec: ATRAC3plus on FFmpeg against Sony's core, on frames built h
     INFO(all_lines(theirs.lines));
     CHECK(compare(ours, theirs) == 0);
 }
+
+// D-591: pspocket's LPCM core through its own exported table, g_cell_adec_core_ops_lpcm, the way a firmware module
+// drives a core: pspocket's front end on the table (its twelve entries called as guest code, the notifications back as
+// guest calls) gives every answer, item, information block, callback and PCM of the direct path, which calls neither.
+TEST_CASE("cellAdec: LPCM through pspocket's own operation table, as a firmware module drives it (D-591)",
+    "[hle][adec]")
+{
+    InterpretMisses interpret;
+    constexpr u32 kLpcmOps = 0x369D9D3A;
+    REQUIRE(kLpcmOps == recomp::nid_of("g_cell_adec_core_ops_lpcm"));
+    Observed direct, tabled;
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        direct = adec_run(f.base(), hle_calls(f, t));
+        CHECK(ps_read32(f.base(), kDecoderMem + 0x34) == 0); // the context's core_ops: the core itself
+        CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_pcm_out") == 0);
+        CHECK(guest_calls(f, "cellAdec", "_CellAdecCoreOpOpen_lpcm") == 0);
+    }
+    {
+        BigFixture f;
+        GuestThread t(f, 0, "ppu");
+        const u32 table = link_own_table(f, "cellAdec", kLpcmOps);
+        // The table: twelve descriptors of the core's operations, in CellAdecCoreOps's order.
+        const char* ops[12] = {"GetMemSize", "Open", "Close", "StartSeq", "EndSeq", "DecodeAu", "GetVersion", "Realign",
+            "ReleasePcm", "GetPcmHandleNum", "GetBsiInfoSize", "OpenExt"};
+        for (u32 op = 0; op < 12; op++) {
+            INFO(ops[op]);
+            const std::string name = std::format("_CellAdecCoreOp{}_lpcm", ops[op]);
+            CHECK(ps_read32(f.base(), table + 4 * op) == f.hle->descriptor_of("cellAdec", recomp::nid_of(name)));
+        }
+        tabled = adec_run(f.base(), hle_calls(f, t));
+        u8* b = f.base();
+        CHECK(ps_read32(b, kDecoderMem + 0x34) == table);                   // the last decoder was opened on it
+        CHECK(ps_read32(b, ps_read32(b, kDecoderMem + 0x30) + 0x114) == 1); // and notified as guest calls
+        for (const char* op : {"GetMemSize", "Open", "Close", "StartSeq", "EndSeq", "DecodeAu", "GetVersion", "Realign",
+                 "ReleasePcm", "GetPcmHandleNum", "GetBsiInfoSize"}) {
+            INFO(op);
+            CHECK(guest_calls(f, "cellAdec", std::format("_CellAdecCoreOp{}_lpcm", op)) > 0);
+        }
+        CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_au_done") > 20);
+        CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_pcm_out") > 20);
+        CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_seq_done") == 3);
+    }
+    INFO(all_lines(tabled.lines));
+    CHECK(direct.lines.size() > 200);
+    CHECK(direct.pcm.size() > 20);
+    CHECK(compare(direct, tabled) == 0);
+}
+
+#if PSPOCKET_HAVE_FFMPEG
+
+// D-591: the four ATRAC3plus tables likewise, each for its type; a decoder opened with cellAdecOpenEx reaches the
+// table's openExt.
+TEST_CASE("cellAdec: ATRAC3plus through pspocket's own operation tables, as a firmware module drives them (D-591)",
+    "[hle][adec]")
+{
+    InterpretMisses interpret;
+    const struct {
+        u32 type, nid;
+        const char* tag;
+    } tables[] = {{3, 0x4944AF9A, "atracx"}, {13, 0x076B33AB, "atracx2ch"}, {14, 0x1D210EAA, "atracx6ch"},
+        {15, 0xE9A86E54, "atracx8ch"}};
+    const std::initializer_list<u32> param = {48000, 2, 2, 0x2B0, 0, 0x84, 0};
+    for (const auto& tb : tables) {
+        DYNAMIC_SECTION(tb.tag)
+        {
+            Observed direct, tabled;
+            {
+                BigFixture f;
+                GuestThread t(f, 0, "ppu");
+                direct = core_run(f.base(), hle_calls(f, t), tb.type, param, atrac3plus_frames());
+            }
+            {
+                BigFixture f;
+                GuestThread t(f, 0, "ppu");
+                const u32 table = link_own_table(f, "cellAtracXdec", tb.nid);
+                tabled = core_run(f.base(), hle_calls(f, t), tb.type, param, atrac3plus_frames());
+                u8* b = f.base();
+                CHECK(ps_read32(b, kDecoderMem + 0x34) == table);
+                CHECK(guest_calls(f, "cellAdec", std::format("_CellAdecCoreOpDecodeAu_{}", tb.tag)) == 6);
+                CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_error") == 1); // the frame with its start bit
+                CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_pcm_out") == 6);
+                // CellAdecResourceEx (totalMemSize, startAddr, ppuThreadPriority, ppuThreadStackSize, spurs, priority,
+                // maxContention) through cellAdecOpenEx: the table's openExt opens the core.
+                write_callback(b);
+                ps_write32(b, kType, tb.type);
+                const Call call = hle_calls(f, t);
+                REQUIRE(call("cellAdecQueryAttr", 0x7E4A4A49, {kType, kAttr}) == 0);
+                const u32 res[8] = {
+                    ps_read32(b, kAttr), kDecoderMem, 1000, 0x4000, 0x00ABC000, 0x01010101, 0x01010101, 1};
+                for (u32 i = 0; i < 8; i++) ps_write32(b, kRes + 4 * i, res[i]);
+                ps_write32(b, kCb, kOpd);
+                ps_write32(b, kCb + 4, kLog);
+                CHECK(call("cellAdecOpenEx", 0x8B5551A4, {kType, kRes, kCb, kHandle}) == 0);
+                CHECK(guest_calls(f, "cellAdec", std::format("_CellAdecCoreOpOpenExt_{}", tb.tag)) == 1);
+                CHECK(call("cellAdecClose", 0x847D2380, {ps_read32(b, kHandle)}) == 0);
+            }
+            INFO(all_lines(tabled.lines));
+            CHECK(direct.pcm.size() == 6);
+            CHECK(compare(direct, tabled) == 0);
+        }
+    }
+}
+
+#endif

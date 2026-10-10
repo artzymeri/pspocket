@@ -75,6 +75,13 @@ TEST_CASE("HLE NIDs match their names", "[hle]")
         CHECK((f.nid == recomp::nid_of(f.name) || f.name.ends_with(std::format("_{:08X}", f.nid))));
     }
     CHECK(hle::registry().find("sysPrxForUser", recomp::nid_of("sys_initialize_tls")) != nullptr);
+    // A variable's NID is its name's, or the one RPCS3 registers it under (REG_VNID: the codec cores' operation tables,
+    // D-591), which the NID database holds under that name.
+    for (const hle::Variable& v : hle::registry().variables()) {
+        INFO(v.module << "::" << v.name);
+        const auto known = recomp::NidDb::builtin().find(v.module, v.nid);
+        CHECK((v.nid == recomp::nid_of(v.name) || (known && *known == v.name)));
+    }
 }
 
 TEST_CASE("Main memory allocator: first fit, alignment, reserved ranges", "[hle]")
