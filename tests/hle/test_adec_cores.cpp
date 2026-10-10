@@ -13,6 +13,7 @@
 #include <cstring>
 #include <format>
 #include <functional>
+#include <memory>
 #include <numbers>
 #include <span>
 #include <string>
@@ -22,6 +23,7 @@
 #include "hle_test_util.hpp"
 
 #if PSPOCKET_HAVE_FFMPEG
+#include "adec_ffmpeg.hpp" // runtime/hle/src (internal): the cores' codecs
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
@@ -1200,6 +1202,38 @@ std::vector<u8> ac3_param(const Ac3Param& a)
 }
 
 } // namespace
+
+TEST_CASE("cellAdec: AC-3's core reads a unit too short for its header's raw bytes only as far as it goes (D-605)",
+    "[hle][adec]")
+{
+    // A stereo syncframe's header with no options ends in 8 bytes, but the core copied 8 raw bytes from byte 5 into the
+    // information block: 13 bytes of an 8-byte unit, past the game's buffer. The unit ends here where guest memory
+    // does (the next page reserved and never committed), as the parser fuzzing found it (D-603).
+    Fixture f;
+    u8* b = f.base();
+    constexpr u32 kEnd = 0x00600000, kOut = kData + 0x100000, kBsi = kData + 0x40000;
+    REQUIRE(f.hle->main_memory().reserve(kEnd - 0x10000, 0x20000));
+    REQUIRE(f.mem.commit(kEnd - 0x10000, 0x10000));
+    const hle::adec::ffcore::Spec* spec = hle::adec::ffcore::spec_of(kTypeAc3);
+    REQUIRE(spec);
+    REQUIRE(spec->output_bytes <= 0x100000);
+    std::vector<u8> param = ac3_param({.word = 1, .mode = 2, .lfe = 0, .compression = 2, .channels = 2, .stereo = 0,
+        .dualmono = 0, .karaoke = 3, .cut = 1, .boost = 1, .scale = 1, .pointers = {0, -1, 1, -1, -1, -1}});
+    param.resize(std::max<usize>(param.size(), spec->param_size), 0);
+    REQUIRE(spec->check(param.data()) == lv2::CELL_OK);
+    const std::unique_ptr<hle::adec::ffcore::Codec> codec = spec->make();
+    if (codec->start(param.data()) != lv2::CELL_OK) SKIP("this FFmpeg has no AC-3 decoder");
+    // 0x0B77, CRC, 48 kHz at 64 kbit/s (a 256-byte frame), bsid 8, 2/0, no LFE, dialnorm 27, original.
+    const u8 unit[8] = {0x0B, 0x77, 0x00, 0x00, 0x08, 0x40, 0x43, 0x61};
+    std::memcpy(b + kEnd - 8, unit, 8);
+    std::memset(b + kBsi, 0xEE, spec->bsi_size);
+    const hle::adec::ffcore::Decoded d = codec->decode(b, kEnd - 8, 8, kOut, kBsi);
+    CHECK(d.error != 0); // the frame is not all there
+    CHECK(d.size == 0);
+    CHECK(ps_read32(b, kBsi + 0x28) == 0x40436100u); // the raw bytes from 5 on: the three there are, then zeros
+    CHECK(ps_read32(b, kBsi + 0x2C) == 0u);
+    CHECK(ps_read8(b, kBsi + 0x3B) == 8); // bsid
+}
 
 TEST_CASE("cellAdec: AC-3 on FFmpeg, 5.1 that FFmpeg's encoder wrote: every channel routed, the information (D-579)",
     "[hle][adec]")

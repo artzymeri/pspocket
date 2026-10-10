@@ -209,7 +209,7 @@ public:
         }
         Bsi h;
         if (!read_bsi(base + au, size, h)) return fail(CELL_ADEC_ERROR_AC3_FRAME);
-        write_bsi(base, bsi, base + au, h);
+        write_bsi(base, bsi, base + au, size, h);
         if (h.bsid > 10) {
             log_once("AC-3 E-AC-3", std::format("AC-3: a frame of bsid {} (E-AC-3: cellDDPdec's) to the AC-3 core", h.bsid));
             return fail(CELL_ADEC_ERROR_AC3_FRAME);
@@ -284,8 +284,11 @@ public:
     }
 
 private:
-    void write_bsi(u8* base, u32 bsi, const u8* frame, const Bsi& h)
+    // `frame` has `size` bytes: a unit too short for its header's raw bytes gives zeros for those it lacks (D-605).
+    void write_bsi(u8* base, u32 bsi, const u8* frame, u32 size, const Bsi& h)
     {
+        u8 raw[8]{}; // the bytes from 5 on (the bit stream information's start)
+        if (size > 5) std::memcpy(raw, frame + 5, std::min<u32>(sizeof raw, size - 5));
         ps_write32(base, bsi + info::codec_type, 0);
         ps_write32(base, bsi + info::version_info, 0x01000000);
         ps_write32(base, bsi + info::total_call_carry_run, 0);
@@ -297,8 +300,8 @@ private:
         ps_write8(base, bsi + info::output_quantization, p_[prm::word_size]);
         ps_write8(base, bsi + info::output_channel, p_[prm::number_of_channels]);
         ps_write8(base, bsi + info::mono_flag, p_[prm::output_mode] == 1);
-        ps_write32(base, bsi + info::bsi, ps_ld32(frame + 5));
-        ps_write32(base, bsi + info::bsi + 4, ps_ld32(frame + 9));
+        ps_write32(base, bsi + info::bsi, ps_ld32(raw));
+        ps_write32(base, bsi + info::bsi + 4, ps_ld32(raw + 4));
         ps_write16(base, bsi + info::frm_size_cod, static_cast<u16>(h.frmsizecod));
         const std::pair<u32, u32> fields[] = {{info::acmod, h.acmod}, {info::lfe_on, h.lfeon},
             {info::karaoke_mode, h.bsmod == 7 && h.acmod >= 2}, {info::cmixlev, h.cmixlev}, {info::surmixlev, h.surmixlev},
