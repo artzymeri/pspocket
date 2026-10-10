@@ -8447,6 +8447,21 @@ What the ThreadSanitizer sweep (D-585) found where two of pspocket's own host pa
   (Rsx::write32_release; the offsets are checked aligned), the writing side of D-077's acquire loads of put and the
   FIFO. cellGcmSys already published put with release order and read get with acquire order; with get a release store
   its wait for the RSX to leave a segment orders what it overwrites after what the RSX read.
+- Rsx::status() (the thread report's look at the FIFO, from another thread) read a blocked acquire's offset and
+  context from the FIFO thread's registers, which that thread writes again once it runs on: they are kept as the
+  acquire found them when it blocked, and the guest words status() reads (the jump the guest patches, the semaphore)
+  with acquire loads. An acquire whose offset is not 4-aligned is now a failure and passes, as one that does not
+  translate: its acquire load faults on ARM (seen while checking these loads).
+- set_fifo_pointers (sys_rsx_context_attribute 0x001) flagged the reset, then wrote get and put. The running RSX thread
+  could take the new get in between, read the old put and run from the new get to it through whatever lay between: off
+  the end of the IO map in test_gcm_sys under the sweep ("FIFO offset 0x00100000 is not mapped"), the frame's commands
+  lost. The RSX thread now writes the control registers itself when it takes the pointers, before it reads put again,
+  as RPCS3 does (RSXThread.cpp new_get_put; sys_rsx.cpp set_rsx_dmactl waits for it, as the syscall still does). With
+  no thread running, or from a method on the RSX's own thread, the call writes them, as before (D-123's order).
 - lv2's RSX driver information: a flip's time and buffer (on the RSX thread), a queued buffer and the vblank count and
   times (on the vblank thread) were plain stores, which cellGcmSys reads on the game's threads at any moment. They are
   release stores (Guest::w64_release).
+Tests: tests/rsx/test_fifo.cpp, "an unaligned NV406E semaphore acquire offset is a failure, not a load" (it blocked
+for good before, on the x86 host), and "the running RSX thread writes get and put when it takes new FIFO pointers
+(D-587)" (the RSX thread is held in a clear while the syscall waits: with the old order put changed under it, every
+run).

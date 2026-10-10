@@ -430,6 +430,23 @@ TEST_CASE("an unaligned NV4097 semaphore offset is a FIFO error")
     CHECK(f.failures[0].kind == FailKind::FifoError);
 }
 
+// D-587: the acquire reads its semaphore with an acquire load, which faults on ARM at an unaligned address; such an
+// offset (a desync's word) is a failure and the acquire passes, as for an offset that does not translate.
+TEST_CASE("an unaligned NV406E semaphore acquire offset is a failure, not a load")
+{
+    Fixture f;
+    auto b = f.at(0);
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 3 * 0x10 + 2);
+    b.method(m::NV406E_SEMAPHORE_ACQUIRE, 1);
+    b.method(m::NV4097_SET_ALPHA_REF, 0x55);
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    REQUIRE(f.failures.size() == 1);
+    CHECK(f.failures[0].kind == FailKind::FifoError);
+    CHECK(f.failures[0].method == m::NV406E_SEMAPHORE_ACQUIRE);
+    CHECK(f.state().reg(m::NV4097_SET_ALPHA_REF) == 0x55); // the commands after it run
+}
+
 TEST_CASE("a FIFO error in a method's handler drops the commands after it up to put")
 {
     // Recovery sets get to put (RPCS3 recover_fifo); the reader used to overwrite that with the next word's address and
@@ -532,6 +549,42 @@ TEST_CASE("set_fifo_pointers from another thread is taken by the running RSX thr
     REQUIRE(f.rsx->wait_idle(2'000'000'000ull));
     f.rsx->stop();
     CHECK(f.backend.clears() == std::vector<u32>{9});
+}
+
+TEST_CASE("the running RSX thread writes get and put when it takes new FIFO pointers (D-587)")
+{
+    // set_fifo_pointers wrote put after flagging the reset, while the thread could already have taken the new get: it
+    // then read the old put and ran from the new get through the words between, off the end of the IO map
+    // (test_gcm_sys under ThreadSanitizer: "FIFO offset 0x00100000 is not mapped"). The registers change when the
+    // thread takes the pointers, as on RPCS3 (RSXThread.cpp new_get_put), not while it is still in the old stream.
+    Fixture f;
+    std::atomic<bool> in_clear{false}, go_on{false};
+    f.backend.on_clear = [&](u32 mask) {
+        if (mask != 1) return;
+        in_clear.store(true, std::memory_order_release);
+        while (!go_on.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    };
+    auto old_stream = f.at(0);
+    old_stream.method(m::NV4097_CLEAR_SURFACE, 1).method(m::NV4097_CLEAR_SURFACE, 2);
+    auto fresh = f.at(0x2000);
+    fresh.method(m::NV4097_CLEAR_SURFACE, 9);
+    f.rsx->start();
+    f.set_put(old_stream.offset());
+    while (!in_clear.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    // The game's syscall, which returns once the RSX has taken the pointers; the RSX is in the first clear meanwhile.
+    std::thread game([&] { f.rsx->set_fifo_pointers(0x2000, fresh.offset()); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(f.read32(f.layout().put_addr()) == old_stream.offset());
+    go_on.store(true, std::memory_order_release);
+    game.join();
+    CHECK(f.read32(f.layout().put_addr()) == fresh.offset());
+    REQUIRE(f.rsx->wait_idle(2'000'000'000ull));
+    f.rsx->stop();
+    CHECK(f.get_register() == fresh.offset());
+    // The second clear runs only when the syscall came after the first clear ended (a slow host).
+    const std::vector<u32> clears = f.backend.clears();
+    CHECK((clears == std::vector<u32>{1, 9} || clears == std::vector<u32>{1, 2, 9}));
+    CHECK(f.failures.empty());
 }
 
 TEST_CASE("status() reports where the FIFO is and what it is blocked on")

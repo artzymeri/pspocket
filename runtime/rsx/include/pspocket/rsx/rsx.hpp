@@ -155,7 +155,7 @@ public:
         JumpToSelf, // a jump to its own address: the guest parks the RSX there and patches the word to release it
     };
     // A snapshot of the FIFO for reports (pspocket-boot's thread report), safe to take from any thread while the RSX
-    // thread runs. The semaphore registers are read without synchronisation; they are stable while it is blocked.
+    // thread runs. A blocked semaphore acquire's offset and context are the ones it found when it blocked (D-587).
     struct Status {
         bool running = false; // the RSX thread exists
         bool idle = false;    // the thread parked on an empty FIFO
@@ -321,8 +321,15 @@ private:
     // Written by the thread driving the FIFO; atomic so status() can read them. The value is stored first.
     std::atomic<BlockReason> block_reason_{BlockReason::None};
     std::atomic<u32> block_value_{0}; // semaphore value, or the jump word
+    // The blocked semaphore acquire's offset and DMA context, as it found them: the thread may run commands again while
+    // status() looks (D-587).
+    std::atomic<u32> block_semaphore_offset_{0}, block_semaphore_context_{0};
+    // set_fifo_pointers' reset: the flag publishes the new pointers (put << 32 | get) and whether the RSX thread writes
+    // the control registers when it takes them (D-587).
     std::atomic<bool> fifo_reset_{false};
     std::atomic<u64> pending_get_put_{0};
+    std::atomic<bool> reset_writes_registers_{false};
+    void write_get_put(u64 get_put);
 
     // Display buffers and flip queue
     mutable std::mutex display_mutex_;
