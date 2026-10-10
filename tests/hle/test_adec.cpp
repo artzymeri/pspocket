@@ -522,6 +522,9 @@ std::vector<std::vector<u8>> atrac3plus_frames()
 
 TEST_CASE("cellAdec: ATRAC3plus on FFmpeg, its flow on frames built here (D-198)", "[hle][adec]")
 {
+#if !PSPOCKET_HAVE_FFMPEG
+    SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): pspocket has no ATRAC3plus core");
+#endif
     InterpretMisses interpret;
     BigFixture f;
     GuestThread t(f, 0, "ppu");

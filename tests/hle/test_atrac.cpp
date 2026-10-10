@@ -282,6 +282,9 @@ void compare_logs(const std::vector<std::string>& a, const std::vector<std::stri
 
 TEST_CASE("cellAtrac: AT3+ files built here, whole, streamed and looped (pspocket)", "[hle][atrac]")
 {
+#if !PSPOCKET_HAVE_FFMPEG
+    SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): pspocket's cellAdec has no ATRAC3plus core");
+#endif
     Fixture f;
     REQUIRE(f.hle->link_internal_functions({"cellAdec", "cellAtrac"}));
     GuestThread t(f, 0, "ppu");
