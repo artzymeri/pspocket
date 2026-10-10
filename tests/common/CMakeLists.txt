@@ -25,6 +25,8 @@ find_package(ZLIB)
 if(ZLIB_FOUND)
     target_link_libraries(test_recomp_common PRIVATE ZLIB::ZLIB) # the SELF test compresses its segments
 endif()
+# The parser fuzzing of executables, NPD files and packages (D-603, mutation_fuzz.hpp).
+target_sources(test_recomp_common PRIVATE test_fuzz_formats.cpp)
 
 # RPCS3's own NPDRM and package code for the differential tests (D-580, D-583, rpcs3_ref/rpcs3_ref.hpp), from the
 # RPCS3 tree the build reads its keys from (PSPOCKET_RPCS3_DIR): its PolarSSL AES and SHA-1 as they are, and the

@@ -69,3 +69,7 @@ if(TARGET pspocket-boot)
         " +at 0x00010298 <- 0x00010210  \\(sp 0x")
     set_tests_properties(pspocket_boot_thread_report PROPERTIES PASS_REGULAR_EXPRESSION "${thread_report_block}")
 endif()
+
+# The parser fuzzing of the HLE libraries (D-603, tests/common/mutation_fuzz.hpp): a game's files, its images, its
+# movies and sound. "[fuzz]" runs them alone; PSPOCKET_FUZZ_ITERS=<n> longer.
+target_sources(test_hle PRIVATE test_fuzz_files.cpp test_fuzz_images.cpp test_fuzz_media.cpp)
