@@ -231,7 +231,9 @@ TEST_CASE("ps_psn_install_pkg: a game's package into dev_hdd0, what it reports, 
     const std::vector<u8> elf = test::build_ppu_exec().bytes;
     test::PkgSpec spec = game_package(elf, "01.00");
     spec.retail = false;
-    const fs::path root = temp_dir("pkg");
+    // Canonical, as the installer reports the executable's path (macOS's temporary folders are reached through
+    // /var -> /private/var).
+    const fs::path root = fs::weakly_canonical(temp_dir("pkg"));
     const fs::path hdd0 = root / "dev_hdd0", game = hdd0 / "game" / "NPXX00000";
     write_file(root / "game.pkg", test::build_pkg(spec));
     std::vector<std::string> lines;

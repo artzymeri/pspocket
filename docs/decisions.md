@@ -7002,7 +7002,7 @@ waits on a pre-sent event, ring wrap-around, failing signals; the interlock with
 with two SPU threads of a group made in the test (ports taken); and a thread probing while another releases. About
 6,500 lines of answers, bytes and callback arguments, and every lv2 call with its arguments, the same.
 
-## D-539 · 2026-10-09 · sys_net, part 2: libnet's configuration calls, routes, interfaces and netsets
+## D-539 · 2026-10-09 · sys_net, part 2: libnet's configuration calls, routes, interfaces, netsets and resolver
 
 D-523 made libnet's core pspocket's own; this is the rest of what libnet.sprx exports but the resolver (part 4 below).
 All in runtime/hle/src/sys_net.cpp, read from libnet's code and compared with it running on pspocket's lv2
@@ -7044,6 +7044,38 @@ TTY the same).
   interface's index, finds none.
 - Deviations: sys_net_get_lib_name_server writes 0 for a server the library does not have (libnet copies its stack's
   leftovers); bad guest pointers are refused with errno EFAULT and the call site logged.
+
+Part 4, **the resolver** (gethostbyname, now libnet's own, and gethostbyaddr, replacing D-569's interim one): FreeBSD's
+gethnamaddr.c and nsdispatch over BIND 8's res_query, res_mkquery, res_comp and res_send, as Sony built them, their
+statics in the thread's context (the hostent at +0xC0 with its address and alias pointers, text buffer and address;
+BIND's __res_state from +0x988; res_send's socket at +0xB44). Compared with libnet in the "resolver" script: 44 lookups
+by name (41 names) and 18 by address on two threads, the pool after each (with the DNS query each builds: the
+generator's state is set the same in both processes first, which also checks _sys_net_lib_rand against libnet's) and
+every lv2 call: 0 differences.
+- Every step first reads lv2's resolver configuration again (infoctl 9: libnet never sets RES_INIT) and would run
+  res_init when it changed; lv2 has none offline (D-523), so one gethostbyname makes up to six of these calls.
+- A name that is an address gives a hostent of its own (digits and dots, or hex digits, colons and dots with a colon;
+  not when it ends with a dot; HOST_NOT_FOUND when inet_pton refuses it). Any other name goes to the hosts source and
+  then the DNS source (nsdispatch with no nsswitch configuration: the defaults).
+- The hosts file is libnet's built-in "127.0.0.1 localhost localhost.\n", read through libnet's own FILE (88 bytes from
+  the pool, "netset.c" 1698; at its end fgets sets errno EBADF; its rewind only marks the end). By name, every entry of
+  the family whose name or an alias matches (case ignored) is gathered in a block from the pool ("gethnamaddr.c" 0x3DB)
+  and copied back into the text buffer; by address, the first entry with the address.
+- gethostbyaddr: link- and site-local IPv6 addresses are HOST_NOT_FOUND at once, IPv4-mapped and -compatible ones are
+  looked up as IPv4; a length not the type's is EINVAL, another type EAFNOSUPPORT. Its DNS query is the address's
+  in-addr.arpa or ip6.arpa name.
+- DNS: res_search (ndots is 0 and the search list empty, since res_init never ran: every name is tried as it is),
+  res_querydomain (a trailing dot dropped), res_query, res_mkquery (an ID from libnet's generator, also kept at +0x9C8;
+  RD set), dn_comp (ns_name_pton into a 255-byte block from the pool, "res_comp.c" 0x345 — Sony's has no check for an
+  empty label before the end, so "a.." is "a." —; each label looked up among the earlier names: errno ENOENT) and
+  res_send. The context's one name server has no family: the DNS cache's hooks act on AF_INET servers only, lv2
+  refuses socket(0, SOCK_DGRAM), the server is marked bad and the tries end: errno ECONNREFUSED, h_errno TRY_AGAIN
+  (NO_RECOVERY when no query can be made: a name too long, a label over 63 bytes, a bad escape).
+- Not pspocket's own, with a fatal log: res_init (reached only after _sce_net_set_name_server gave lv2 a
+  configuration), RES_USE_INET6's mapped hostents (set only by res_init), the DNS cache and the exchange with a name
+  server lv2 gives a socket for, and an answer's parsing (none comes offline).
+- The comparison now also masks pointers into each module's hosts text, which stay behind in the pool (one with its
+  low 4 bits cleared by res_query).
 
 ## D-562 · 2026-10-09 · cellSail pspocket's own, from libsail (part 1: the objects the game hands the player)
 
@@ -9127,3 +9159,65 @@ Each with a test that shows it (rule 7):
   it, also when the unit is shorter; a unit at the end of guest memory made the copy read past it, a host crash. Such
   a frame is now an error (ATX_FATAL, logged, nothing out), as a decode without a configuration is. Test: the
   cellAtrac fuzzing target (test_fuzz_media.cpp), which crashed on its 98th input with the default seed.
+
+## D-537 · 2026-10-09 · cellSpursJq and cellFiber pspocket's own (part 1: cellSpursJq, libspurs_jq's PPU side)
+
+cellSpursJq had no implementation (RPCS3's cellSpursJq.cpp registers todo stubs; libspurs_jq.sprx ran LLE). All 63
+functions are now pspocket's own (runtime/hle/src/cellSpursJq.cpp), read from libspurs_jq (fw 4.92) and compared with it
+running on pspocket (tests/hle/test_spurs_jq_compare.cpp).
+- The SPU half stays Sony's SPU code: a job queue is a SPURS workload whose policy module (libspurs_jq's SPU program:
+  it pops the commands, runs the jobs, gives descriptors back, releases semaphores, wakes waiters) runs on pspocket's
+  native SPURS as any game's own policy module does (spurs_custom.cpp), unchanged. pspocket reads it at the first queue
+  of a process from the user's /dev_flash/sys/external/libspurs_jq.sprx (decrypted like any firmware module) and finds
+  it by shape: the module's table of contents (module info + 0x20) holds the image's size and address; the image is at
+  a 128-byte boundary of the text and starts with an SPU GUID (four `ila $2`). Nothing of the module is in the
+  repository. Without the system software, queue creation undoes its work and answers CELL_SPURS_JOB_ERROR_STAT (the
+  call fails, nothing runs half-made).
+- The queue (4 KB) is laid out where libspurs_jq lays it out: the command ring header and its waiting ring header, the
+  policy module's bytes, the handle bitmap, the two "_sreJQ" event flags (128 waiter bits), the lightweight mutexes and
+  condition, the descriptor pool's eight classes (free lists through the descriptors' first word, a 1 KB waiting ring
+  each), the exception handler. Every update is the lwarx/ldarx-stwcx./stdcx. pair libspurs_jq makes, through the
+  reservation system (the class Reserve of D-531), so the policy module's GETLLAR/PUTLLC and other PPU threads contend
+  with it as on the hardware. Both pushers are libspurs_jq's: the default one (pushers in flight count themselves in
+  the header, claim the next entry of their lap with a conditional store, the last one moves the write index) and the
+  "submit with entry lock" one. A full ring or an empty pool class puts the caller in the waiting ring (a PPU thread on
+  an event flag bit, a fiber through cellFiberPpuWaitSignal); the policy module wakes it, and a wake-up that comes first
+  leaves the entry marked so nobody sleeps.
+- Semaphores (a 29-bit count and one waiter), SendSignal, ports (one and several threads, with descriptor buffers) and
+  port2s (copies into the pool), the exception handler setters and GetSuspendedJobSize (the job runtime's "JOBCRT Ver"
+  header read from the job's binary) are libspurs_jq's to the instruction. cellSpurs, cellFiber and sysPrxForUser
+  calls go to the firmware module when the process has it in place of pspocket's, else to pspocket's own.
+- libspurs_jq's slips are kept, each marked in the code: creation does not clean up after a failed
+  cellSpursSetExceptionEventHandler; a semaphore acquire that took event flag bit 0 never gives it back; an old-SDK
+  (< 0x300000) port sync stores one word of its doubleword with stwcx.; a single-thread port sync writes the caller's r31
+  low byte to the port's byte 0x17; a port initialized when Open fails keeps the handle its stack held;
+  cellSpursJobQueueSetExceptionEventHandler2 is the same code as the first.
+Surprises, decided as libspurs_jq does: the flags tests are rotate pairs that read as `flags & ~4` (allocate, port2 sync
+and flush), `& ~7` (PushJob2, PushAndRelease, port2 push), `& ~5` (port2 job list), `& ~3` (port2 copy); SendSignal on a
+waiting job also clears bit 23 with the signal count; the policy module reads the waiting ring after the command list in
+whole 128-byte lines, so a depth that is not a multiple of 16 loses waiters (a test with depth 4 hung on Sony's code too:
+the tests use 16).
+Deviations: libspurs_jq's assertions are fatal logs with its text; objects that are not guest memory are refused with
+CELL_SPURS_JOB_ERROR_INVAL and the call site logged (libspurs_jq would fault); the list of ten titles that get policy
+module workarounds (the queue's +0xA0) is the module's data and is not reproduced (the PARAM.SFO read is made, no title
+matches); the workload's exception handler, which libspurs_jq fills from the faulting SPU's local store, logs the queue
+and calls the game's handler with the job information zeroed (pspocket's SPURS has no SPU threads and stops on a policy
+module fault, so it is not reached).
+Tests: a 1219-call one-thread script with SPURS workers off (every function, every argument's errors and alignments,
+attributes, both pushers into full rings, pool classes, semaphores, signals, ports and port2s; 23 byte checkpoints of
+the whole data area, 4.9 million bytes, and the 25 lv2 calls in order) the same as libspurs_jq's; 43 jobs (single
+pushes beyond a full ring of 16, a job list, SYNC/FLUSH, port and port2 pushes and copies, blocking pool allocations
+given back by the policy module, semaphores) through libspurs_jq's policy module on one SPU, 122 steps, each answer,
+job output and the queue at rest the same with either PPU side, for the default pusher, the entry lock one and busy
+waiting; firmware-free tests of attributes, creation without dev_flash, both pushers' ring encodings, semaphores,
+signals, a port and GetSuspendedJobSize. A push costs 329 ns against libspurs_jq's 1532 ns interpreted (20000 pushes).
+
+## D-544 · 2026-10-10 · liblv2's sysPs2Disc, sysBdMediaId and sysConsoleId as liblv2 makes them
+
+liblv2.sprx (fw 4.92) exports three small libraries besides sysPrxForUser, each one wrapper over an lv2 sys_ss call;
+they are now pspocket's own, making the same calls with the same arguments: sysPs2Disc_BB7CD1AE(arg) is
+sys_ss_disc_access_control(0x20000, arg) and sysPs2Disc_A84FD3C3() is sys_ss_disc_access_control(0x20001, 1) (876);
+sys_get_bd_media_id(buffer) is sys_ss_media_id(0x10001, buffer) (879) and sys_get_console_id(buffer) is
+sys_ss_get_console_id(buffer) (870), both refusing a null buffer with CELL_EINVAL before the call (lv2 checks the rest:
+a game, not a root process, gets ENOSYS for the console ID, as on a PS3). RPCS3 has them as todos answering CELL_OK.
+Test: tests/hle/test_sysPrxForUser.cpp, the calls lv2 sees and the answers.

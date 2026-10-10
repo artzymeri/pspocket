@@ -982,6 +982,25 @@ s32 sys_process_get_paramsfo(PPUContext& ctx, u32 buffer)
     return lv2::_sys_process_get_paramsfo(thread_of(ctx), buffer);
 }
 
+// liblv2's other libraries (fw 4.92), each a wrapper over one of lv2's sys_ss calls, as liblv2's code makes them:
+// sysPs2Disc's two over sys_ss_disc_access_control (876: 0x20000 with the caller's argument; 0x20001 with 1),
+// sysBdMediaId's over sys_ss_media_id (879, 0x10001 and the buffer), sysConsoleId's over sys_ss_get_console_id (870).
+// The last two refuse a null buffer with CELL_EINVAL before the call; lv2 checks the rest.
+s32 sysPs2Disc_BB7CD1AE(PPUContext& ctx, u32 arg) { return static_cast<s32>(lv2_syscall(ctx, 876, {0x20000, arg})); }
+s32 sysPs2Disc_A84FD3C3(PPUContext& ctx) { return static_cast<s32>(lv2_syscall(ctx, 876, {0x20001, 1})); }
+
+s32 sys_get_bd_media_id(PPUContext& ctx, u32 id)
+{
+    if (!id) return err(lv2::CELL_EINVAL);
+    return static_cast<s32>(lv2_syscall(ctx, 879, {0x10001, id}));
+}
+
+s32 sys_get_console_id(PPUContext& ctx, u32 id)
+{
+    if (!id) return err(lv2::CELL_EINVAL);
+    return static_cast<s32>(lv2_syscall(ctx, 870, {id}));
+}
+
 constexpr u64 RANDOM_NUMBER_MAX_SIZE = 4096;
 
 // RPCS3 sysPrxForUser.cpp sys_get_random_number: CELL_EINVAL above 4096 bytes, else lv2's
@@ -1544,6 +1563,12 @@ void register_sysPrxForUser(Registry& r)
         PS_HLE_FUNC(0xE0DA8EFD, sys_spu_image_close),
         PS_HLE_FUNC(0xFC52A7A9, sys_game_process_exitspawn),
     });
+    r.add("sysPs2Disc", {
+        PS_HLE_FUNC(0xBB7CD1AE, sysPs2Disc_BB7CD1AE),
+        PS_HLE_FUNC(0xA84FD3C3, sysPs2Disc_A84FD3C3),
+    });
+    r.add("sysBdMediaId", {PS_HLE_FUNC(0xEF666B52, sys_get_bd_media_id)});
+    r.add("sysConsoleId", {PS_HLE_FUNC(0xF220F751, sys_get_console_id)});
 }
 
 } // namespace pspocket::hle
