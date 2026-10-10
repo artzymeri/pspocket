@@ -27,8 +27,8 @@
         },
         {
           "name": "PSN/NPDRM content (EDAT with the game's licence key)",
-          "state": "todo",
-          "ref": "improve.md Other games"
+          "state": "partial",
+          "ref": "D-580 to D-583: host tools done; the app's screens to come"
         },
         {
           "name": "A game's own PRX modules loaded",
@@ -172,8 +172,8 @@
         },
         {
           "name": "Raw SPUs and interrupt threads",
-          "state": "todo",
-          "ref": "D-184"
+          "state": "done",
+          "ref": "D-528, D-529"
         },
         {
           "name": "GTA V's EDGE job chain never stops on a reused descriptor",
@@ -257,8 +257,8 @@
         },
         {
           "name": "MP3, AC-3, AAC, ATRAC3 decoders pspocket's own",
-          "state": "todo",
-          "ref": "improve.md Media"
+          "state": "partial",
+          "ref": "D-576 to D-579: Sony's first until compared on the Mac"
         },
         {
           "name": "Sound at full pace when the iPhone's cores are full",
@@ -282,8 +282,8 @@
         },
         {
           "name": "VC-1, DivX 3.11, MVC video",
-          "state": "todo",
-          "ref": "improve.md Media"
+          "state": "partial",
+          "ref": "D-588 to D-590: VC-1 simple/main and MVC's second view left"
         },
         {
           "name": "PNG, JPEG, GIF decoders",
@@ -353,7 +353,7 @@
         {
           "name": "An hour without a crash",
           "state": "partial",
-          "ref": "D-225 fixed the EDGE stop; an hour on the phone not yet tried"
+          "ref": "D-225 fixed the EDGE stop; D-584 to D-587 the data races; an hour on the phone not yet tried"
         }
       ]
     }

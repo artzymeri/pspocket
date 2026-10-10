@@ -900,7 +900,8 @@ s32 cellGcmGetCurrentDisplayBufferId(PPUContext& ctx, u32 id)
     if (!out_pointer_ok(ctx, id, 1, "cellGcmGetCurrentDisplayBufferId")) return error(CELL_GCM_ERROR_FAILURE);
     u8* base = guest_base(ctx);
     const u32 head = head1(gcm());
-    ps_write8(base, id, static_cast<u8>(head ? ps_read32(base, head + head_flipBufferId) : 0));
+    // lv2 writes the buffer at a flip, on the RSX thread (D-587).
+    ps_write8(base, id, static_cast<u8>(head ? atomic_load_be32(base, head + head_flipBufferId) : 0));
     return lv2::CELL_OK;
 }
 
@@ -911,7 +912,7 @@ s32 cellGcmGetCurrentDisplayBufferId(PPUContext& ctx, u32 id)
 u64 cellGcmGetLastFlipTime(PPUContext& ctx)
 {
     const u32 head = head1(gcm());
-    return head ? ticks_to_us(ps_read64(guest_base(ctx), head + head_lastFlipTime)) : 0;
+    return head ? ticks_to_us(atomic_load_be64(guest_base(ctx), head + head_lastFlipTime)) : 0; // written at a flip
 }
 
 // RPCS3 cellGcmGetVBlankCount: the vblanks since cellGcmInit, which the interrupt thread counts (RPCS3's vblank thread
@@ -1422,16 +1423,17 @@ u32 _cellGcmFunc3(PPUContext&, u32 code)
 // _cellGcmFunc4: package 0x106 (performance monitor) with 1. libgcm_sys sends it with whatever context it has.
 s32 _cellGcmFunc4(PPUContext& ctx) { return rsx_attribute_call(ctx, {context_id(), 0x106, 1, 0, 0, 0}); }
 
-// A head's fields of the driver information (0 before cellGcmInit).
+// A head's fields of the driver information (0 before cellGcmInit), which lv2 writes at flips, queues and vblanks while
+// the game runs: read whole, with acquire order (D-587).
 u32 head_word(PPUContext& ctx, u32 head, u32 field)
 {
     const u32 di = driver_info();
-    return di ? ps_read32(guest_base(ctx), di + kDriverHeads + 0x40 * head + field) : 0;
+    return di ? atomic_load_be32(guest_base(ctx), di + kDriverHeads + 0x40 * head + field) : 0;
 }
 u64 head_dword(PPUContext& ctx, u32 head, u32 field)
 {
     const u32 di = driver_info();
-    return di ? ps_read64(guest_base(ctx), di + kDriverHeads + 0x40 * head + field) : 0;
+    return di ? atomic_load_be64(guest_base(ctx), di + kDriverHeads + 0x40 * head + field) : 0;
 }
 
 u32 cellGcmGetCurrentField(PPUContext& ctx) { return head_word(ctx, 1, head_field); }
@@ -1535,7 +1537,9 @@ s32 flip_immediate(PPUContext& ctx, u32 index, u32 head)
 {
     u8* base = guest_base(ctx);
     GcmState& g = gcm();
-    if (g.label_addr) ps_write32(base, g.label_addr + 0x10 * head, 0xFFFFFFFF);
+    // The RSX reads and writes the labels on its own thread (acquires, a flip's release of label 1): a release store, as
+    // the RSX's own (D-587).
+    if (g.label_addr) atomic_store_be32(base, g.label_addr + 0x10 * head, 0xFFFFFFFF);
     const u32 di = g.driver_info;
     if (!di) return error(CELL_GCM_ERROR_FAILURE);
     const u64 value = 0x80000000u | (ps_read32(base, di + 0xC) << 8) | (index & 7);

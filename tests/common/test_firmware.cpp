@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "pspocket/core/be.h"
+#include "pspocket/recomp/crypto.hpp"
 #include "pspocket/recomp/firmware.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 
@@ -23,8 +24,7 @@ using namespace pspocket::recomp;
 
 namespace fs = std::filesystem;
 
-#if defined(__APPLE__) && __has_include(<zlib.h>)
-#include <CommonCrypto/CommonCryptor.h>
+#if __has_include(<zlib.h>)
 #include <zlib.h>
 
 namespace {
@@ -39,12 +39,7 @@ std::array<u8, N> made_up(u8 seed)
 
 void aes128_ctr(const u8* key, const u8* iv, u8* data, usize size)
 {
-    CCCryptorRef c = nullptr;
-    REQUIRE(CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR, kCCAlgorithmAES, ccNoPadding, iv, key, 16, nullptr, 0, 0,
-                kCCModeOptionCTR_BE, &c) == kCCSuccess);
-    usize moved = 0;
-    REQUIRE(CCCryptorUpdate(c, data, size, data, size, &moved) == kCCSuccess);
-    CCCryptorRelease(c);
+    REQUIRE(crypto::aes_ctr(std::span<const u8>(key, 16), iv, data, size, data));
 }
 
 // A ustar archive of (name, type, contents).
@@ -99,9 +94,7 @@ std::vector<u8> sce_package(const PackageKey& key, const std::vector<u8>& third)
     const auto meta_key = made_up<16>(0x31), meta_iv = made_up<16>(0x47);
     std::copy(meta_key.begin(), meta_key.end(), s.begin() + static_cast<std::ptrdiff_t>(meta));
     std::copy(meta_iv.begin(), meta_iv.end(), s.begin() + static_cast<std::ptrdiff_t>(meta + 0x20));
-    usize moved = 0;
-    REQUIRE(CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0, key.erk.data(), 32, key.riv.data(), s.data() + meta, 0x40,
-                s.data() + meta, 0x40, &moved) == kCCSuccess);
+    REQUIRE(crypto::aes_cbc_encrypt(key.erk, key.riv.data(), s.data() + meta, 0x40, s.data() + meta));
     ps_st64(s.data() + head, header_size);
     ps_st32(s.data() + head + 0x0C, n);
     ps_st32(s.data() + head + 0x10, 2 * n);

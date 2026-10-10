@@ -4,12 +4,17 @@
 // operations (CellDmuxCoreOps, the variable 0x28b2b7b2), and libdmuxpamf calls back through function pointers. Both are
 // pspocket's own here, so the table and the callbacks are plain C++ calls between cellDmux.cpp and cellDmuxPamf.cpp,
 // with the arguments RPCS3's ops take. The core's answers are CellDmuxPamfError values; cellDmux maps them
-// (RPCS3 get_error).
+// (RPCS3 get_error). The core is also offered as libdmuxpamf offers it, its table a variable of cellDmuxPamf for Sony's
+// modules and others to call (D-592): a demuxer opened through the table notifies the caller's functions.
 
 #include <array>
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/ppu/context.h"
+
+namespace pspocket::hle {
+class Registry;
+}
 
 namespace pspocket::hle::dmux {
 
@@ -50,11 +55,24 @@ struct AuInfo {
     bool is_rap = false;
 };
 
+// A notification a caller of the exported table gives (RPCS3 DmuxCb: a guest function and its argument).
+struct GuestCb {
+    u32 fn = 0, arg = 0;
+};
+struct CoreCallbacks { // _CellDmuxCoreOpOpen's
+    GuestCb demux_done, prog_end_code, fatal_err;
+};
+struct EsCallbacks { // _CellDmuxCoreOpEnableEs's
+    GuestCb au_found, flush_done;
+};
+
 // ---- The core (cellDmuxPamf.cpp): RPCS3's _CellDmuxCoreOp* functions. Addresses are the game's memory; a core
-// handle is its CellDmuxPamfHandle, an ES handle its CellDmuxPamfEsHandle.
+// handle is its CellDmuxPamfHandle, an ES handle its CellDmuxPamfEsHandle. With `guest` (a demuxer or stream opened
+// through the exported table) the core notifies those functions; without, cellDmux's notifications below, with the
+// front end's handles.
 u32 core_query_attr(PPUContext& ctx, u32 pamf_specific_info, PamfAttr& attr);
 u32 core_open(PPUContext& ctx, u32 pamf_specific_info, const CoreResource& res, const CoreResourceSpurs* spurs,
-    u32 dmux_handle, u32& core_handle);
+    u32 dmux_handle, u32& core_handle, const CoreCallbacks* guest = nullptr);
 u32 core_close(PPUContext& ctx, u32 core_handle);
 u32 core_reset_stream(PPUContext& ctx, u32 core_handle);
 u32 core_set_stream(PPUContext& ctx, u32 core_handle, u32 stream_address, u32 stream_size, bool discontinuity,
@@ -62,15 +80,19 @@ u32 core_set_stream(PPUContext& ctx, u32 core_handle, u32 stream_address, u32 st
 u32 core_release_au(PPUContext& ctx, u32 core_es_handle, u32 au_addr, u32 au_size);
 u32 core_query_es_attr(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, PamfEsAttr& attr);
 u32 core_enable_es(PPUContext& ctx, u32 core_handle, u32 es_filter_id, u32 mem_addr, u32 mem_size, u32 es_handle,
-    u32 es_specific_info, u32& core_es_handle);
+    u32 es_specific_info, u32& core_es_handle, const EsCallbacks* guest = nullptr);
 u32 core_disable_es(PPUContext& ctx, u32 core_es_handle);
 u32 core_flush_es(PPUContext& ctx, u32 core_es_handle);
 u32 core_reset_es(PPUContext& ctx, u32 core_es_handle);
 u32 core_reset_stream_and_wait_done(PPUContext& ctx, u32 core_handle);
 
-// The core's PPU thread ("_dmux_pamf_ppu_thread"): an internal function of cellDmux, linked with it.
+// The core's PPU thread ("_dmux_pamf_ppu_thread"): an internal function of cellDmux, linked with it (or when a demuxer
+// first opens, for one opened through the exported table in a process that does not import cellDmux).
 constexpr u32 NID_dmux_pamf_thread = 0x2FF13233; // nid_of("_pspocket_dmux_pamf_thread"): pspocket's own
 void _pspocket_dmux_pamf_thread(PPUContext& ctx, u64 core_handle);
+
+// The exported table, g_cell_dmux_core_ops_pamf, and its operations (internal functions of cellDmux), D-592.
+void register_pamf_table(Registry& r);
 
 // ---- The front end's notifications (cellDmux.cpp), called on the core's PPU thread: RPCS3 notify_*.
 void notify_demux_done(PPUContext& ctx, u32 dmux_handle);

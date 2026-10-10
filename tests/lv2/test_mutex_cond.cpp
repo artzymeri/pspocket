@@ -51,8 +51,8 @@ TEST_CASE("lv2 mutex: attributes, recursion and error codes", "[lv2][mutex]")
     CHECK(c.call(kMutexLock, m, 0) == CELL_OK);
     std::thread([&] {
         Caller other(*f.kernel, "other");
-        CHECK(other.call(kMutexTryLock, m) == rc(CELL_EBUSY));
-        CHECK(other.call(kMutexUnlock, m) == rc(CELL_EPERM));
+        THREAD_CHECK(other.call(kMutexTryLock, m) == rc(CELL_EBUSY));
+        THREAD_CHECK(other.call(kMutexUnlock, m) == rc(CELL_EPERM));
     }).join();
     CHECK(c.call(kMutexUnlock, m) == CELL_OK);
 
@@ -115,12 +115,12 @@ TEST_CASE("lv2 mutex: mutual exclusion under contention", "[lv2][mutex][stress]"
         pool.emplace_back([&, i] {
             Caller me(*f.kernel, "worker", 1000 + i * 10);
             for (int k = 0; k < kIters; k++) {
-                REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
+                THREAD_REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
                 if (++inside != 1) violations++;
                 plain++;
                 f.w64(counter, f.r64(counter) + 1);
                 inside--;
-                REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
+                THREAD_REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
             }
         });
     }
@@ -139,15 +139,15 @@ TEST_CASE("lv2 mutex: lock timeout", "[lv2][mutex]")
     std::thread([&] {
         Caller other(*f.kernel, "other");
         const auto t0 = std::chrono::steady_clock::now();
-        CHECK(other.call(kMutexLock, m, 20000) == rc(CELL_ETIMEDOUT));
-        CHECK(elapsed_ms(t0) >= 19);
+        THREAD_CHECK(other.call(kMutexLock, m, 20000) == rc(CELL_ETIMEDOUT));
+        THREAD_CHECK(elapsed_ms(t0) >= 19);
     }).join();
     CHECK(queued<Mutex>(*f.kernel, m) == 0);
     REQUIRE(c.call(kMutexUnlock, m) == CELL_OK);
     std::thread([&] {
         Caller other(*f.kernel, "other");
-        CHECK(other.call(kMutexLock, m, 20000) == CELL_OK);
-        CHECK(other.call(kMutexUnlock, m) == CELL_OK);
+        THREAD_CHECK(other.call(kMutexLock, m, 20000) == CELL_OK);
+        THREAD_CHECK(other.call(kMutexUnlock, m) == CELL_OK);
     }).join();
 }
 
@@ -165,9 +165,9 @@ TEST_CASE("lv2 mutex: ownership passes in protocol order", "[lv2][mutex]")
     for (int i = 0; i < 4; i++) {
         pool.emplace_back([&, i] {
             Caller me(*f.kernel, "waiter", prios[i]);
-            REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
+            THREAD_REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
             order.push_back(i); // under the mutex
-            REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
+            THREAD_REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
         });
         REQUIRE(eventually([&] { return queued<Mutex>(*f.kernel, m) == static_cast<usize>(i + 1); }));
     }
@@ -200,10 +200,10 @@ TEST_CASE("lv2 cond: errors, signal, signal_all, signal_to", "[lv2][cond]")
         pool.emplace_back([&, i] {
             Caller me(*f.kernel, "waiter");
             ids[i] = me.id();
-            REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
-            REQUIRE(me.call(kCondWait, cv, 0) == CELL_OK);
+            THREAD_REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
+            THREAD_REQUIRE(me.call(kCondWait, cv, 0) == CELL_OK);
             woke++;
-            REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
+            THREAD_REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
         });
         REQUIRE(eventually([&] { return queued<Cond>(*f.kernel, cv) == static_cast<usize>(i + 1); }));
     }
@@ -244,10 +244,10 @@ TEST_CASE("lv2 cond: signaled waiters reacquire the mutex; timeouts keep it", "[
     std::atomic<bool> returned{false};
     std::thread waiter([&] {
         Caller me(*f.kernel, "waiter");
-        REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
-        REQUIRE(me.call(kCondWait, cv, 0) == CELL_OK);
+        THREAD_REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
+        THREAD_REQUIRE(me.call(kCondWait, cv, 0) == CELL_OK);
         returned = true;
-        REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
+        THREAD_REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
     });
     REQUIRE(eventually([&] { return queued<Cond>(*f.kernel, cv) == 1; }));
     REQUIRE(c.call(kMutexLock, m, 0) == CELL_OK);
@@ -275,11 +275,11 @@ TEST_CASE("lv2 cond: producer/consumer on a bounded buffer", "[lv2][cond][stress
         pool.emplace_back([&, p] {
             Caller me(*f.kernel, "producer");
             for (int i = 0; i < kItems; i++) {
-                REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
-                while (buffer.size() >= kCapacity) REQUIRE(me.call(kCondWait, not_full, 0) == CELL_OK);
+                THREAD_REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
+                while (buffer.size() >= kCapacity) THREAD_REQUIRE(me.call(kCondWait, not_full, 0) == CELL_OK);
                 buffer.push_back(static_cast<u64>(p) * kItems + i + 1);
-                REQUIRE(me.call(kCondSignal, not_empty) == CELL_OK);
-                REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
+                THREAD_REQUIRE(me.call(kCondSignal, not_empty) == CELL_OK);
+                THREAD_REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
             }
         });
     }
@@ -287,13 +287,13 @@ TEST_CASE("lv2 cond: producer/consumer on a bounded buffer", "[lv2][cond][stress
         pool.emplace_back([&] {
             Caller me(*f.kernel, "consumer");
             for (int i = 0; i < kItems * kProducers / kConsumers; i++) {
-                REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
-                while (buffer.empty()) REQUIRE(me.call(kCondWait, not_empty, 0) == CELL_OK);
+                THREAD_REQUIRE(me.call(kMutexLock, m, 0) == CELL_OK);
+                while (buffer.empty()) THREAD_REQUIRE(me.call(kCondWait, not_empty, 0) == CELL_OK);
                 consumed_sum += buffer.back();
                 consumed_count++;
                 buffer.pop_back();
-                REQUIRE(me.call(kCondSignal, not_full) == CELL_OK);
-                REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
+                THREAD_REQUIRE(me.call(kCondSignal, not_full) == CELL_OK);
+                THREAD_REQUIRE(me.call(kMutexUnlock, m) == CELL_OK);
             }
         });
     }

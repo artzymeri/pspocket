@@ -10,6 +10,8 @@
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/recomp/npd.hpp"
+#include "pspocket/recomp/pkg.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
 
 namespace pspocket::test {
 
@@ -143,19 +145,83 @@ std::vector<u8> wrap_in_self(std::span<const u8> elf, const SelfOptions& options
 
 inline constexpr std::string_view kSelfContentId = "XX0000-TEST00000_00-0000000000000000";
 
-// ---- SDATA file (D-165) ----
+// ---- encrypted SELF (D-121, D-582) ----
 
-struct SdataOptions {
+struct SelfEncryption {
+    recomp::SelfKey key{};    // the SELF key the metadata info is encrypted with
+    u16 revision = 0;         // the SCE header's key revision (the key's)
+    // A PSN executable: an NPDRM control header of this licence type (wrap_in_self's content ID), and the AES-128-CBC
+    // layer over the metadata info keyed with `npdrm_layer_key` (its content key decrypted with NP_KLIC_KEY).
+    bool npdrm = false;
+    s32 npdrm_license = 3;
+    recomp::Key128 npdrm_layer_key{};
+};
+
+// `elf` as a retail SELF, as Sony makes them and recomp::decrypt_self reads them: wrap_in_self's headers (an APP
+// executable, or an NPDRM one), real metadata (one section per segment with bytes, each with its own made-up key and
+// counter), and the segments compressed (zlib) and encrypted. Empty in a build without zlib.
+std::vector<u8> encrypt_self(std::span<const u8> elf, const SelfEncryption& encryption);
+
+// ---- NPD files: SDATA (D-165) and EDATA (D-581) ----
+
+struct NpdOptions {
     s32 version = 3;          // NPD version: 0 and 1 have no IV and keep compressed blocks' metadata plain; 4 uses
                               // EDAT_KEY_1 for an encrypted key
     u32 extra_flags = 0;      // recomp::kNpd*Flag besides the SDAT flag
     u32 block_size = 0x400;
+    // An EDATA file (no SDAT flag) instead, encrypted with `key`, its content key (a free file's klicensee, else the
+    // RIF key of the player's RAP), of this licence type and content ID. With `npdrm`, the header carries the hashes
+    // RPCS3 checks: the title hash over the content ID and `file_name`, and a free file's dev hash keyed with `key`;
+    // without it, made-up bytes.
+    bool edata = false;
+    s32 license = 3;
+    std::string content_id = std::string(kSelfContentId);
+    std::string file_name{};
+    recomp::Key128 key{};
+    const recomp::NpdrmKeys* npdrm = nullptr;
+};
+using SdataOptions = NpdOptions;
+
+// `plain` as an NPD file, encrypted, hashed and laid out the way recomp::NpdFile reads Sony's (RPCS3 unedat.cpp in
+// reverse), with `keys`. A compressed file (kNpdCompressedFlag) holds its blocks in the decoder's plain form (a byte
+// above 0x80, the length, the bytes), every other block marked compressed. build_sdata makes an SDATA file whatever
+// `options.edata` says.
+std::vector<u8> build_npd(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options = {});
+std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options = {});
+
+// ---- PARAM.SFO ----
+
+// A PARAM.SFO (PSF 1.1) of string entries (key, value), the keys sorted as the PS3 keeps them, each value in a field
+// of its length rounded up to 4 with a NUL.
+std::vector<u8> build_param_sfo(const std::vector<std::pair<std::string, std::string>>& strings);
+
+// ---- PS3 packages (D-583) ----
+
+struct PkgItem {
+    std::string name;                   // in the install folder: "USRDIR/EBOOT.BIN"
+    u32 type = recomp::kPkgEntryRegular; // an entry type, with kPkgEntryOverwrite and the like
+    std::vector<u8> bytes;              // a file's (a folder has none)
 };
 
-// `plain` as an SDATA file, encrypted, hashed and laid out the way recomp::NpdFile reads Sony's (RPCS3 unedat.cpp
-// in reverse), with `keys`. A compressed file (kNpdCompressedFlag) holds its blocks in the decoder's plain form (a
-// byte above 0x80, the length, the bytes), every other block marked compressed. Empty on platforms without
-// CommonCrypto.
-std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const SdataOptions& options = {});
+struct PkgSpec {
+    std::string content_id = "UP0001-NPXX00000_00-0000000000000001";
+    bool retail = true;                   // false: a debug package
+    u16 platform = 1;                     // 1: PS3; 2: PSP or PS Vita
+    recomp::Key128 key{};                 // a retail package's: PKG_AES_KEY, PKG_AES_KEY_IDU or made up
+    std::array<u8, 16> counter{};         // the data's first counter block
+    std::array<u8, 16> qa_digest{};       // a debug package's key stream comes from it
+    u32 content_type = recomp::kPkgContentGameExec; // 0: no metadata packet 2
+    u32 drm_type = 3;
+    u32 package_flags = 0;
+    std::string install_dir;              // an add-on's own folder (metadata packet 0xA), when not empty
+    std::vector<PkgItem> items;
+    usize align = 16;                     // where names and files start (a power of 2): Sony's packages, 16
+};
+
+// `spec` as a PS3 package, as RPCS3's package_reader reads them (rpcs3/Crypto/unpkg.cpp in reverse): the 0xC0-byte
+// header, metadata packets (1, 2, 3 and 0xA as asked, and two RPCS3 passes over), the data (the entry table, then
+// each name and file on an `align`-byte boundary) encrypted as the spec says, and 0x60 made-up bytes where Sony's
+// digests are. Nothing of Sony's: the test gives the key.
+std::vector<u8> build_pkg(const PkgSpec& spec);
 
 } // namespace pspocket::test

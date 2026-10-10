@@ -67,9 +67,9 @@ TEST_CASE("lv2 RSX audio: a context, its connection and the hardware's schedule"
     REQUIRE(c.call(kPrepare, h) == CELL_OK);
     CHECK(c.call(kPrepare, h) == -1); // already the hardware's
     REQUIRE(c.call(kStart, h) == CELL_OK);
-    for (u32 i = 0; i < 3; i++) {
-        f.w32(rb + 48 + 32 * i, 1);           // valid
+    for (u32 i = 0; i < 3; i++) { // as the client fills an entry while the hardware runs: valid last, after a sync
         f.w64(rb + 48 + 32 * i + 8, 100 + i); // audio_blk_idx
+        f.w32_release(rb + 48 + 32 * i, 1);   // valid
     }
     const u32 events = f.alloc(32 * 16), number = f.alloc(4);
     u32 got = 0;

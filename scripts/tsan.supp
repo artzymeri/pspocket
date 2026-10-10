@@ -1,0 +1,33 @@
+# ThreadSanitizer suppressions for scripts/tsan.sh (D-585). Read with symbolize_inline_frames=0, which tsan.sh sets: a
+# race_top entry then matches the function an access is made in, with what is inlined into it (the big-endian
+# accessors), and nothing it calls. A syscall made from interpreted code, or an HLE function a guest thread reaches, is
+# still checked; only the access itself is let go.
+#
+# Each race_top entry is code that performs the guest's own memory operations, or the PS3's: they race on guest memory
+# exactly as the game's threads and the hardware do (a lock-free list's speculative read, a flag polled with a plain
+# load, a structure read while another thread updates the same 128-byte line atomically). pspocket's own host code is
+# not suppressed: where it shares guest words with other threads it reads and writes them atomically, in the order the
+# hand-off needs (D-587), and the tests synchronise as a game would (D-585).
+
+# The PPU interpreter's guest loads and stores (execute, execute_vmx) and its instruction fetch (run, step): guest code
+# racing other guest code, an SPU's DMA, or a test standing in for a game's thread.
+race_top:pspocket::ppu::execute
+race_top:pspocket::ppu::run
+race_top:pspocket::ppu::step
+
+# The reservation system's line operations (D-030, reviewed in D-585): lwarx/stwcx., GETLLAR/PUTLLC/PUTLLUC and
+# the HLE's reservation_op read a 128-byte line with atomic loads and write it with 8-byte CASes while plain loads and
+# stores reach the same line, by design: the conditional store compares the line and merges around them. The plain side
+# is guest code, a test standing in for it, or HLE code doing what the guest library does on its structures with the
+# PPU's plain loads and stores (libsre's, libsync's, libsync2's); a plain access of another byte of a CASed doubleword
+# counts as a race too.
+race_top:ps_res_acquire
+race_top:ps_res_store_line
+race_top:ps_res_store_line_unconditional
+race_top:ps_res_store_conditional
+
+# pspocket-boot's fatal fault report (D-094; spu-check's the same): its SIGSEGV handler formats the guest's registers
+# and the thread report, allocating, then ends the process. The faults it reports are guest accesses, in interpreted or
+# translated code, not inside the allocator; a host fault there could hang the report instead of printing it, which a
+# dev tool accepts (CLAUDE.md rule 5: the report is the point).
+signal:on_fault

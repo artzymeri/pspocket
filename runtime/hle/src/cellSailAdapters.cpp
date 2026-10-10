@@ -48,34 +48,51 @@ void not_yet(PPUContext& ctx, std::string_view name)
         not_yet(ctx, #n);                                                                                              \
         return error(CELL_SAIL_ERROR_FATAL);                                                                           \
     }
-SAIL_ADAPTER_STUB(saMakeup)
-SAIL_ADAPTER_STUB(saCleanup)
 SAIL_ADAPTER_STUB(saOpen)
 SAIL_ADAPTER_STUB(saClose)
 SAIL_ADAPTER_STUB(saStart)
 SAIL_ADAPTER_STUB(saStop)
-SAIL_ADAPTER_STUB(saCancel)
 SAIL_ADAPTER_STUB(saCheckout)
 SAIL_ADAPTER_STUB(saCheckin)
-SAIL_ADAPTER_STUB(gaMakeup)
-SAIL_ADAPTER_STUB(gaCleanup)
 SAIL_ADAPTER_STUB(gaOpen)
 SAIL_ADAPTER_STUB(gaClose)
 SAIL_ADAPTER_STUB(gaStart)
 SAIL_ADAPTER_STUB(gaStop)
-SAIL_ADAPTER_STUB(gaCancel)
 SAIL_ADAPTER_STUB(gaCheckout)
 SAIL_ADAPTER_STUB(gaCheckin)
-SAIL_ADAPTER_STUB(auMakeup)
-SAIL_ADAPTER_STUB(auCleanup)
 SAIL_ADAPTER_STUB(auOpen)
 SAIL_ADAPTER_STUB(auClose)
 SAIL_ADAPTER_STUB(auStart)
 SAIL_ADAPTER_STUB(auStop)
-SAIL_ADAPTER_STUB(auCancel)
 SAIL_ADAPTER_STUB(auCheckout)
 SAIL_ADAPTER_STUB(auCheckin)
 #undef SAIL_ADAPTER_STUB
+
+// The adapters' and the AU receiver's makeup and cleanup: the game's own callback (its funcs, with its argument) when it
+// gave one; makeup also clears the adapter's play state. Cancel: nothing for the adapters, the game's for the receiver.
+s32 call_game(PPUContext& ctx, u32 fn_at, u32 arg_at)
+{
+    const u32 f = r32(ctx, fn_at);
+    return f ? static_cast<s32>(call_guest(ctx, f, {r32(ctx, arg_at)})) : 0;
+}
+
+s32 _pspocket_cellSail_saMakeup(PPUContext& ctx, u32 a)
+{
+    w32(ctx, a + sa::kState, 0);
+    return call_game(ctx, a + sa::kFuncs, a + sa::kArg);
+}
+s32 _pspocket_cellSail_saCleanup(PPUContext& ctx, u32 a) { return call_game(ctx, a + sa::kFuncs + 4, a + sa::kArg); }
+void _pspocket_cellSail_saCancel(PPUContext&) {}
+s32 _pspocket_cellSail_gaMakeup(PPUContext& ctx, u32 a)
+{
+    w32(ctx, a + ga::kState, 0);
+    return call_game(ctx, a + ga::kFuncs, a + ga::kArg);
+}
+s32 _pspocket_cellSail_gaCleanup(PPUContext& ctx, u32 a) { return call_game(ctx, a + ga::kFuncs + 4, a + ga::kArg); }
+void _pspocket_cellSail_gaCancel(PPUContext&) {}
+s32 _pspocket_cellSail_auMakeup(PPUContext& ctx, u32 a) { return call_game(ctx, a + 0xC4, a + 0xE8); }
+s32 _pspocket_cellSail_auCleanup(PPUContext& ctx, u32 a) { return call_game(ctx, a + 0xC8, a + 0xE8); }
+void _pspocket_cellSail_auCancel(PPUContext& ctx, u32 a) { call_game(ctx, a + 0xDC, a + 0xE8); }
 
 u32 internal(std::string_view name) { return HleProcess::current()->link_function("cellSail", recomp::nid_of(name), name); }
 

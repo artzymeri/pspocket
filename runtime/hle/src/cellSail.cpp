@@ -111,6 +111,34 @@ s32 post_urgent(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c)
     return queue_commit(ctx, qa);
 }
 
+u64 module_call(PPUContext& ctx, std::string_view module, std::string_view name, std::initializer_list<u64> args)
+{
+    const Function* f = registry().find(module, recomp::nid_of(name));
+    if (!f) PS_FATAL(kChan, "{}::{}, which libsail imports, is not pspocket's", module, name);
+    u64 saved[8];
+    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
+    u32 i = 3;
+    for (const u64 a : args) ctx.gpr[i++] = a;
+    f->fn(ctx, gb(ctx));
+    const u64 r = ctx.gpr[3];
+    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
+    return r;
+}
+
+s32 post_message(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c)
+{
+    const u32 qa = player + pl::kQueue;
+    const s32 r = sc(ctx, 102, {r32(ctx, qa + q::kMutex), 0});
+    if (r < 0) return r;
+    const u32 at = queue_tail(ctx, qa);
+    w32(ctx, at, code);
+    w32(ctx, at + 12, c);
+    w32(ctx, at + 4, a);
+    w32(ctx, at + 8, b);
+    queue_advance_tail(ctx, qa);
+    return queue_commit(ctx, qa);
+}
+
 s32 post_completion(PPUContext& ctx, u32 player, s32 result, u64 handle)
 {
     if (!handle) return static_cast<s32>(player);
@@ -456,6 +484,7 @@ void register_cellSailPlayer(Registry& r);
 void register_cellSailDescriptor(Registry& r);
 void register_cellSailAdapters(Registry& r);
 void register_cellSailControl(Registry& r);
+void register_cellSailPipelines(Registry& r);
 
 void register_cellSail(Registry& r)
 {
@@ -463,6 +492,7 @@ void register_cellSail(Registry& r)
     register_cellSailDescriptor(r);
     register_cellSailAdapters(r);
     register_cellSailControl(r);
+    register_cellSailPipelines(r);
 #define SAIL(f) ::pspocket::hle::Function{{}, #f, recomp::nid_of(#f), &detail::thunk<&f>, false}
 #define SAIL_MINUS_ONE(nid) ::pspocket::hle::Function{{}, "cellSail_" #nid, 0x##nid, &detail::thunk<&sail_minus_one>, false}
     r.add("cellSail", {

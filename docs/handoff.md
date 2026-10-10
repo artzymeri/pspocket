@@ -34,7 +34,9 @@ emulation, no interpreting". So:
 - "Work on main only: commit to main and run `git push origin main` after each piece, so nothing is lost if the
   session stops. This is my explicit permission to push to main. Keep commits small, one per component (rule 9). No
   pull requests unless I ask."
-- "Don't use sub-agents or multi-agent workflows. Work through things one at a time yourself."
+- Agents (2026-10-09, replacing "don't use sub-agents"): "work with 3 agents now": up to three helper agents at a
+  time, each in its own git worktree and build directory; the main session reviews each one's commits, merges them
+  into main and pushes.
 - Follow `CLAUDE.md`: never commit game data (ISOs, ELFs, firmware, keys, lifted code, logs: all stay in the
   gitignored `inventory/`); tests use synthetic data built in code; cite RPCS3 in a comment wherever behaviour comes
   from it; unimplemented calls log and return an error, never succeed silently; no title checks in the runtime.

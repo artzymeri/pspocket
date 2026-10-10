@@ -262,7 +262,7 @@ TEST_CASE("cellGcmSys (AC): cellGcmSetFlip and cellGcmSetWaitFlip write their co
     const auto current = [&] { return ps_read32(b, ctx + 0x8); };
     const auto put = [&] { return ps_read32(b, control); };
     const auto flush = [&] {
-        ps_write32(b, control, current() - kIo);
+        store32_release(b, control, current() - kIo); // after a sync, as the game's (D-585)
         rsx->notify();
     };
     const auto method = [&](u32 reg, u32 value) { // what libgcm's inline command functions write
@@ -292,8 +292,8 @@ TEST_CASE("cellGcmSys (AC): cellGcmSetFlip and cellGcmSetWaitFlip write their co
     CHECK(put() == c0 + 8 - kIo);
 
     // cellGcmSetWaitFlip: NV406E_SEMAPHORE_OFFSET 0x10, then SEMAPHORE_ACQUIRE 0; put stays (the game flushes).
-    ps_write32(b, label0 + 0x10, 1); // a flip is pending: label 1 is not 0
-    ps_write32(b, label0 + 0x20, 0);
+    store32_release(b, label0 + 0x10, 1); // a flip is pending: label 1 is not 0
+    store32_release(b, label0 + 0x20, 0);
     const u32 c1 = current();
     g.call("cellGcmSetWaitFlip", ctx);
     CHECK(ps_read32(b, c1) == rsx::cmd::method_header(rsx::m::NV406E_SEMAPHORE_OFFSET, 2));
@@ -309,14 +309,14 @@ TEST_CASE("cellGcmSys (AC): cellGcmSetFlip and cellGcmSetWaitFlip write their co
     const rsx::Rsx::Status waiting = rsx->status();
     CHECK(waiting.semaphore_offset == 0x10);
     CHECK(waiting.block_value == 0);
-    CHECK(ps_read32(b, label0 + 0x20) == 0);
-    ps_write32(b, label0 + 0x10, 0);
+    CHECK(load32_acquire(b, label0 + 0x20) == 0);
+    store32_release(b, label0 + 0x10, 0);
     rsx->notify();
     REQUIRE(rsx->wait_idle(2 * kSecond));
-    CHECK(ps_read32(b, label0 + 0x20) == 0xBEEF);
+    CHECK(load32_acquire(b, label0 + 0x20) == 0xBEEF);
 
     // A flip clears label 1, so a wait behind it passes.
-    ps_write32(b, label0 + 0x10, 1);
+    store32_release(b, label0 + 0x10, 1);
     REQUIRE(g.call("cellGcmSetFlip", ctx, 0) == 0);
     g.call("cellGcmSetWaitFlip", ctx);
     method(rsx::m::NV406E_SEMAPHORE_OFFSET, 0x20);
@@ -325,8 +325,8 @@ TEST_CASE("cellGcmSys (AC): cellGcmSetFlip and cellGcmSetWaitFlip write their co
     REQUIRE(rsx->wait_idle(2 * kSecond));
     CHECK(rsx->flip_count() == 2);
     CHECK(flipped == 0);
-    CHECK(ps_read32(b, label0 + 0x10) == 0);
-    CHECK(ps_read32(b, label0 + 0x20) == 0xCAFE);
+    CHECK(load32_acquire(b, label0 + 0x10) == 0);
+    CHECK(load32_acquire(b, label0 + 0x20) == 0xCAFE);
 }
 
 TEST_CASE("cellGcmSys (AC): cellGcmSetFlip and cellGcmSetWaitFlip make room through the context's callback",
@@ -355,7 +355,7 @@ TEST_CASE("cellGcmSys (AC): cellGcmSetFlip and cellGcmSetWaitFlip make room thro
     CHECK(ps_read32(b, kIo + 0x8004) == 2);
     CHECK(ps_read32(b, ctx + 0x8) == kIo + 0x8008);
     CHECK(ps_read32(b, control) == end - kIo + 8);
-    ps_write32(b, control, 0x8008); // the game's next flush
+    store32_release(b, control, 0x8008); // the game's next flush
     rsx->notify();
     REQUIRE(rsx->wait_idle(2 * kSecond));
     CHECK(rsx->flip_count() == 1);
@@ -574,8 +574,8 @@ TEST_CASE("cellSpurs (AC) with workers: a cellSpursCreateTaskset taskset runs a 
     ps_write8(b, kPattern + 15, 1);
     REQUIRE(a.call("cellSpursCreateTask", kTs, kId, kElf, kCtx, 0xC00, kPattern, 0) == 0);
     const u32 id = ps_read32(b, kId);
-    const auto task_bit = [&](u32 bitset) {
-        return (ps_read32(b, kTs + bitset + 4 * (id / 32)) & (0x80000000u >> (id % 32))) != 0;
+    const auto task_bit = [&](u32 bitset) { // through the reservation system, as the workers change it (D-585)
+        return (line_word(b, kTs + bitset + 4 * (id / 32)) & (0x80000000u >> (id % 32))) != 0;
     };
     REQUIRE(wait_for([&] { return task_bit(0x50) && !task_bit(0x00); })); // waiting, its context saved
 
@@ -615,9 +615,10 @@ TEST_CASE("cellSpurs (AC) with workers: the job chain policy runs the urgent cal
     REQUIRE(a.call("cellSpursRunJobChain", kJc) == 0);
 
     // An SPU takes the urgent CALL from slot 0, passes the guard, returns, and leaves at the chain's END.
-    REQUIRE(wait_for([&] {
-        return ps_read32(b, kGuard) == 7 && ps_read64(b, kJc + 0x00) == kCmds && ps_read8(b, kJc + 0x29) == 0 &&
-               ps_read8(b, kSpurs + 0x20 + wid) == 0 && !(ps_read16(b, kSpurs + 0x70) & (0x8000u >> wid));
+    REQUIRE(wait_for([&] { // what the SPU changes with reservation operations, read through them (D-585)
+        const LineCopy jc = line_copy(b, kJc), line0 = line_copy(b, kSpurs);
+        return line_word(b, kGuard) == 7 && jc.dword(0x00) == kCmds && jc.byte(0x29) == 0 &&
+               line0.byte(0x20 + wid) == 0 && !(line0.half(0x70) & (0x8000u >> wid));
     }));
     for (u32 k = 0; k < 4; k++) CHECK(ps_read64(b, kJc + 0x30 + 8 * k) == 0); // the urgent slots
     for (u32 k = 0; k < 3; k++) CHECK(ps_read64(b, kJc + 0x08 + 8 * k) == 0); // the call stack

@@ -149,6 +149,15 @@ inline u32 atomic_load_be32(u8* base, u32 addr)
 {
     return ps_bswap32(__atomic_load_n(host_u32(base, addr), __ATOMIC_ACQUIRE));
 }
+inline u64 atomic_load_be64(u8* base, u32 addr)
+{
+    return ps_bswap64(__atomic_load_n(host_u64(base, addr), __ATOMIC_ACQUIRE));
+}
+
+// A byte another thread stores atomically or with reservation_op (the SPURS kernel's workload states and priorities,
+// D-587), read with acquire order; and such a byte stored with release order.
+inline u8 atomic_load_u8(u8* base, u32 addr) { return __atomic_load_n(base + addr, __ATOMIC_ACQUIRE); }
+inline void atomic_store_u8(u8* base, u32 addr, u8 value) { __atomic_store_n(base + addr, value, __ATOMIC_RELEASE); }
 
 inline void atomic_store_be32(u8* base, u32 addr, u32 value)
 {

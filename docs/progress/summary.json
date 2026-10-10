@@ -1,7 +1,7 @@
 {
-  "engine_percent": 84.3,
+  "engine_percent": 88.7,
   "libraries": {
-    "own": 5259,
+    "own": 5691,
     "answered_as_rpcs3": 188,
     "known": 6625
   },
@@ -19,14 +19,14 @@
     "known": 194
   },
   "checklist": {
-    "Reading any PS3 disc on the iPhone": 83,
+    "Reading any PS3 disc on the iPhone": 92,
     "Translating on the iPhone (route B)": 89,
     "PPU code (the main processor)": 100,
     "SPU code (the six co-processors)": 86,
-    "SPURS and the kernel": 75,
+    "SPURS and the kernel": 100,
     "Graphics (RSX to Metal)": 77,
-    "Sound": 50,
-    "Video and images": 80,
+    "Sound": 62,
+    "Video and images": 90,
     "System services": 100,
     "Speed and stability on the iPhone": 60
   },

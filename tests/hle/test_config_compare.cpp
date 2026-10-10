@@ -32,12 +32,15 @@ constexpr u32 kRecords = kData + 0x4000; // the callbacks' records: a count, the
 constexpr u32 kRecordsSize = 0x2000;
 
 // A callback that records (kind, r3..r7) at kRecords and returns 0: lis/ori r11, lwz r12 (count), mulli/add r9, the
-// stores, lwsync, the count raised, li r3,0, blr.
+// stores, lwsync, the count raised with lwarx/stwcx. (as cellAtomicIncr32 does: the test reads it through the
+// reservation system, so the record and what lv2 wrote for the event before are visible with it, D-585), li r3,0, blr.
 void callback_code(u8* b, u32 at, u32 kind)
 {
     const u32 words[] = {0x3D600000u | (kRecords >> 16), 0x616B0000u | (kRecords & 0xFFFF), 0x818B0000u, 0x1C0C0040u,
         0x7D2B0214u, 0x38000000u | kind, 0xF8090040u, 0xF8690048u, 0xF8890050u, 0xF8A90058u, 0xF8C90060u, 0xF8E90068u,
-        0x7C2004ACu, 0x398C0001u, 0x918B0000u, 0x38600000u, 0x4E800020u};
+        0x7C2004ACu, 0x398C0001u,
+        0x7D405828u, 0x7D80592Du, 0x4082FFF8u, // lwarx r10, 0, r11; stwcx. r12, 0, r11; bne- back to the lwarx
+        0x38600000u, 0x4E800020u};
     for (u32 i = 0; i < std::size(words); i++) ps_write32(b, at + 4 * i, words[i]);
     ps_write32(b, at + 0xF0, at); // the descriptor: entry, TOC
     ps_write32(b, at + 0xF4, 0);
@@ -293,9 +296,9 @@ TEST_CASE("sys_config: libio's config service agent", "[hle][sys_io]")
     std::memcpy(b + kIn, "data", 4);
     const auto wait_records = [&](u32 n) {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (ps_read32(b, kRecords) < n && std::chrono::steady_clock::now() < until)
+        while (line_word(b, kRecords) < n && std::chrono::steady_clock::now() < until)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        REQUIRE(ps_read32(b, kRecords) == n);
+        REQUIRE(line_word(b, kRecords) == n);
     };
     const auto record = [&](u32 i, u32 k) { return ps_read64(b, kRecords + 64 + 64 * i + 8 * k); };
 

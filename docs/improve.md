@@ -304,7 +304,16 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
     patched words (needs a game that has them, rule 4).
   - A newly found module recompiles all of the game's modules: per-module lift folders, as plan-game-modules commit 8
     describes, if a game has many.
-  - NPDRM modules need the game's klicensee (a PSN game).
+  - **PSN games (D-580 to D-583): done on the engine side.** A PSN game's NPDRM EBOOT.BIN, SPRX modules and SPU
+    images decrypt with its licence, and its EDATA files open through lv2 with the keys the game shows with
+    sceNpDrmIsAvailable, all with RPCS3's checks (tested against RPCS3's own code where the build has its source).
+    The player's licence is their <CONTENT_ID>.rap, in /dev_hdd0/home/00000001/exdata (Documents/hdd0/home/00000001/
+    exdata on the phone, --hdd0's on the Mac); free content needs none. The game's .pkg files (the game, then its
+    updates) install into dev_hdd0/game/<TITLE_ID> as RPCS3 installs them (D-583: on the Mac
+    ps3disc --install-pkg, and ps3disc --install-rap for the licence). Left: the app's side, offering
+    ps_psn_install_pkg and ps_psn_install_rap for files the player brings, and a library of installed PSN games that
+    calls ps_psn_decrypt_executable; scripts/translate-game.sh still takes a disc image only. No PSN game has been
+    tried yet.
   - Sniper: Ghost Warrior's engine_jobs.sprx (seen on the phone, D-159) is the first real check, when its disc is
     here.
 
@@ -336,20 +345,40 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   demuxer's lv2 thread; the SPU side's host thread sleeps 1.5 ms after each new stream (RPCS3's delay for White Knight
   Chronicles II). The raw elementary stream core (g_cell_dmux_core_ops_raw_es, which other firmware modules use) is
   not pspocket's: only libdmux's PAMF core is.
-- **cellVdec (D-196):** Sony's item and information rings are 16 long in pspocket (Sony's length not known: decode
-  more than 16 pictures in the probe to find it); the frame buffers' place and count are pspocket's; Sony's RGB rounding
-  (9% of values one step off) could come from libvdec's conversion code; the H.264 information's fields past RPCS3's
-  structure are inferred from two streams (try a stream with picture order count type 0, cropping, no VUI); VC-1,
-  DivX 3.11 and MVC need FFmpeg decoders (vc1, msmpeg4v3: LGPL) and a comparison; MPEG-2 needs a synthetic writer to be
-  compared. Speed on a real movie: FFmpeg on one thread, then VideoToolbox for H.264.
-- **cellAdec (D-197, D-198):** the LPCM and ATRAC3plus decoders run on a PPU thread of their own per decoder (libadec
-  and libatxdec use SPURS tasks); the LPCM conversion is scalar (RPCS3's is SIMD: measure on a real Blu-ray LPCM
-  stream before changing). ATRAC3plus decodes 12.9 s of sound in 0.79 s on the M4 including the test's waits (run
-  105): measure on the phone in a game that plays it. Its errors for bad frames are FFmpeg's generic one except a set
-  start bit (Sony's codes per syntax error are not known). The other codecs are still Sony's cores (translated, SPU
-  code on pspocket's SPURS): MP3, AC-3, AAC, ATRAC3 and MPEG audio next on FFmpeg, each compared with Sony's core. No
-  synthetic writer for those yet: MP2, AC-3 and AAC could use FFmpeg's encoders in a test-only build; layer I frames
-  are written in the test; a game's stream can be given to a probe locally (as SND0.AT3 in run 105).
+- **cellVdec (D-196, D-588 to D-590):** Sony's item and information rings are 16 long in pspocket (Sony's length not
+  known: decode more than 16 pictures in the probe to find it; the memory size formula, RPCS3's and Sony's, counts 48
+  item and information pairs for H.264 and MVC and 32 for the others, a hint); the frame buffers' place and count are
+  pspocket's; Sony's RGB rounding (9% of values one step off) could come from libvdec's conversion code; the H.264
+  information's fields past RPCS3's structure are inferred from two streams (try a stream with picture order count
+  type 0, cropping, no VUI); MPEG-2 needs a synthetic writer to be compared. DivX 3.11 (FFmpeg's msmpeg4v3, its frame
+  size from the codec specific information), VC-1's advanced profile (vc1, its sequence header and entry point as the
+  decoder's configuration, range mapping applied) and MVC's base view (H.264 without the other views' NAL units)
+  decode now, none compared with Sony's yet. **Try (on the Mac, with the firmware; build-ffmpeg.sh run again first,
+  for the new decoders):** test_vdec_codecs.cpp's streams (DivX 3.11 and MPEG-4 from FFmpeg's encoders in
+  build/ffmpeg/<host>-tests, VC-1 from vc1_writer.hpp, two-view MVC from h264_writer.hpp) through Sony's libvdec as
+  test_vdec.cpp's comparison runs: the information blocks (CellVdecDivxInfo's fields, CellVdecVc1Info's layout, which
+  is pspocket's own, CellVdecMvcInfo, written as H.264's), where libdivx311dec takes DivX 3.11's frame size from,
+  whether libsvc1d applies VC-1's range mapping, what libmvcdec gives of the second view, VC-1 access units before a
+  sequence header; then the framing of VC-1's simple and main profiles (refused now). Still not decoded: MVC's second
+  view (no MVC decoder in FFmpeg). Speed on a real movie: FFmpeg on one thread, then VideoToolbox for H.264 and MVC's
+  base view.
+- **cellAdec (D-197, D-198, D-577 to D-579):** the LPCM and ATRAC3plus decoders run on a PPU thread of their own per
+  decoder (libadec and libatxdec use SPURS tasks); the LPCM conversion is scalar (RPCS3's is SIMD: measure on a real
+  Blu-ray LPCM stream before changing). ATRAC3plus decodes 12.9 s of sound in 0.79 s on the M4 including the test's
+  waits (run 105): measure on the phone in a game that plays it. Its errors for bad frames are FFmpeg's generic one
+  except a set start bit (Sony's codes per syntax error are not known). MP3, MPEG audio layers I and II, MPEG-4 AAC,
+  AC-3 and ATRAC3 have pspocket's own cores on FFmpeg too (adec_ffmpeg.cpp and a file each), which serve only where no
+  firmware module gives Sony's core (firmware first, as D-563 for libraries): their parameters, information blocks and
+  errors are RPCS3's structures read by their names, not yet compared with Sony's. **Try (on the Mac, with the
+  firmware):** each core against Sony's through test_adec.cpp's core_run, as the MPEG layer I comparison runs, on the
+  tests' streams (test_adec_cores.cpp: hand-built MP3, layer I and ATRAC3 frames; layer II, AAC and AC-3 from FFmpeg's
+  encoders in build/ffmpeg/<host>-tests): the sizes (memory, PCM handles, information blocks, versions: pspocket's own
+  numbers now), the PCM's format and channel order (AAC's past stereo, AC-3's channel pointers and downmixes, the MPEG
+  cores' channelNumber), the information blocks' fields (MP3's reservoir sizes, AC-3's counters, AAC's SBR fields), a
+  sequence's first frame (libatxdec gives silence there; FFmpeg's cores give the frame), the errors' codes, and the
+  PTS of the cores whose module corrects it; then drop the firmware-first rule codec by codec. A game's stream can be
+  given to a probe locally (as SND0.AT3 in run 105). Still Sony's only: MPEG-2 AAC, E-AC-3, MP3 surround, ATRAC3
+  multichannel, TrueHD, DTS and WMA (RPCS3's cellAdec.h has no structures for them), and CELP (FFmpeg has no decoder).
 - **cellPngDec (D-199):** decodes the whole image into a host buffer, then copies rows (and converts colour to gray)
   into the game's: one extra copy per image; measure on a game's loading screens before changing. The Ext functions
   (partial decoding with display callbacks, stream callbacks) are Sony's still: write them when a game imports one.
@@ -364,7 +393,7 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   (as libgifdec's output is). The LZW decoder follows giflib's line by line: fine for a game's few small GIFs; measure
   before changing. Not reproduced: the bytes past an extension in libgifdec's buffer (its own state) and a background
   index past the table. Ext functions still Sony's.
-- **State:** open; the other audio cores when a game's log shows one.
+- **State:** open; the audio cores' comparison with Sony's (above), and the rest when a game's log shows one.
 
 - **Done (D-254):** H.264 decodes on VideoToolbox through FFmpeg's hwaccel: the same pictures as the software decoder,
   the decoding thread 77% less CPU (0.44 instead of 1.95 ms a 720p picture on the M4). **Try:** a game that plays
@@ -446,6 +475,19 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   word alone, 0x12, a light sync, then the previous lap's commands. A PUT now writes its first eight bytes in one store.
 - **State:** fixed (D-225): 0 stops in 11 loaded walks where 3 in 10 stopped before. Confirm on the iPhone (run 100's
   stop came after 110 s there).
+
+## Stability: data races (ThreadSanitizer, D-585)
+
+- **Done:** `scripts/tsan.sh` builds build/tsan and runs every threaded test under ThreadSanitizer, a line per group.
+  The first sweep found an SPU call's answer overtaken by the PPU's reply (D-584), a thread's stack still committed
+  when its join returned (D-586), words pspocket's own threads shared without order (D-587) and tests that read before
+  what they waited for had landed. What is left is guest-level and suppressed with its reason (scripts/tsan.supp).
+- **Blind spots:** ThreadSanitizer does not model fences, and pspocket orders DMA, lwsync and the reservation system's
+  stores with them: a report whose two sides only a fence orders is not a bug (read it through the reservation
+  system's version, or a release store, to make sure). The tests interpret: translated code is not covered.
+- **Next:** pspocket-boot under ThreadSanitizer for a few minutes of a game, the translated functions' guest accesses
+  suppressed as the interpreter's are; the reports left in pspocket's own code are what an hour without a crash needs.
+  Run the sweep after any change to threaded code.
 
 ## System libraries (D-500)
 

@@ -414,11 +414,11 @@ TEST_CASE("cellSpurs: workload priorities, contention, idle SPU requests, signal
     REQUIRE(a.call("cellSpursReadyCountAdd", kSpurs, wid, kOut, -300) == 0);
     CHECK(ps_read32(b, kOut) == 255);
     CHECK(ps_read8(b, kSpurs + wid) == 0);
-    ps_write8(b, kSpurs + 0x80 + wid, 1); // PREPARING: not runnable
+    store8_release(b, kSpurs + 0x80 + wid, 1); // PREPARING: not runnable (the workers read the states atomically)
     CHECK(a.call("cellSpursReadyCountAdd", kSpurs, wid, kOut, 1) == code(PM | kStat));
     CHECK(a.call("cellSpursReadyCountStore", kSpurs, wid, 1) == code(PM | kStat));
     CHECK(a.call("cellSpursSendWorkloadSignal", kSpurs, wid) == code(PM | kStat));
-    ps_write8(b, kSpurs + 0x80 + wid, 2);
+    store8_release(b, kSpurs + 0x80 + wid, 2);
     // cellSpursReadyCountStore checks the value before the registration, as libsre (this order was SRCH before).
     CHECK(a.call("cellSpursReadyCountStore", kSpurs, 5, 256) == code(PM | kInval));
     REQUIRE(a.call("cellSpursFinalize", kSpurs) == 0);
@@ -515,9 +515,9 @@ TEST_CASE("cellSpurs: shutdown, wait and remove; the shutdown-completion hook ru
     CHECK(a.call("cellSpursWaitForWorkloadShutdown", kSpurs, 9) == code(PM | kSrch));
     CHECK(a.call("cellSpursRemoveWorkload", kSpurs, 9) == code(PM | kSrch));
     CHECK(a.call("cellSpursRemoveWorkload", kSpurs, wid) == code(PM | kStat)); // still runnable
-    ps_write8(b, kSpurs + 0x80 + wid, 3); // SHUTTING_DOWN
+    store8_release(b, kSpurs + 0x80 + wid, 3); // SHUTTING_DOWN
     CHECK(a.call("cellSpursRemoveWorkload", kSpurs, wid) == code(PM | kBusy));
-    ps_write8(b, kSpurs + 0x80 + wid, 2);
+    store8_release(b, kSpurs + 0x80 + wid, 2);
 
     // The shutdown: removable at once (no SPU holds it natively), the completion to the helper, which calls the hook;
     // the wait returns once it ran.
@@ -694,7 +694,7 @@ TEST_CASE("cellSpurs: CellSpursTaskset2 as libsre creates it; its attributes; ta
     ps_write32(b, kArg + 4, 0x7A5C2);
     std::memset(b + kTaskOut, 0, 16);
     REQUIRE(a.call("cellSpursCreateTask", kTs, kId, kElf, 0, 0, 0, kArg) == 0);
-    REQUIRE(wait_for([&] { return ps_read32(b, kTaskOut + 4) == 0x7A5C2; }));
+    REQUIRE(wait_for([&] { return (load64_acquire(b, kTaskOut) & 0xFFFFFFFF) == 0x7A5C2; })); // the PUT's head (D-585)
 
     // With an attribute: its name and a task name buffer, cleared; a misaligned buffer is ALIGN after the creation.
     REQUIRE(a.call("_cellSpursTasksetAttribute2Initialize", kTsAttr, 1) == 0);
@@ -879,8 +879,8 @@ TEST_CASE("cellSpurs: SPURS2 (cellSpursInitializeWithAttribute2): 32 workloads; 
     ps_write32(b, kArg, kTaskOut);
     ps_write32(b, kArg + 4, 0x5B2);
     REQUIRE(a.call("cellSpursCreateTask", kTs2, kId, kElf, 0, 0, 0, kArg) == 0);
-    REQUIRE(wait_for([&] { return ps_read32(b, kTaskOut + 4) == 0x5B2; }));
-    REQUIRE(wait_for([&] { return (ps_read8(b, kSpurs + 0x20) & 0xF0) == 0 && ps_read32(b, kTs2 + 0x30) == 0; }));
+    REQUIRE(wait_for([&] { return (load64_acquire(b, kTaskOut) & 0xFFFFFFFF) == 0x5B2; }));
+    REQUIRE(wait_for([&] { return (line_byte(b, kSpurs + 0x20) & 0xF0) == 0 && line_word(b, kTs2 + 0x30) == 0; }));
 
     // The PPU-side functions on workload 16.
     REQUIRE(a.call("cellSpursGetWorkloadData", kSpurs, kOut, 16) == 0);
@@ -918,8 +918,10 @@ TEST_CASE("cellSpurs: SPURS2 (cellSpursInitializeWithAttribute2): 32 workloads; 
     // Work arrives as its ready count (wklIdleSpuCountOrReadyCount2[1] in SPURS2).
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, 17, 1) == 0);
     CHECK(ps_read8(b, kSpurs + 0x11) == 1);
-    REQUIRE(wait_for([&] { return ps_read32(b, kRecord + 48 + 12) == 17; }));
+    // The record's last PUT, polled at its first doubleword (the MFC stores it last, with release order, D-585).
+    REQUIRE(wait_for([&] { return load64_acquire(b, kRecord + 48) == kModule; }));
     REQUIRE(a.call("cellSpursReadyCountStore", kSpurs, 17, 0) == 0);
+    CHECK(ps_read32(b, kRecord + 48 + 12) == 17); // wklCurrentId
     CHECK(ps_read32(b, kRecord + 0) == 1);         // poll status: ready count
     CHECK(ps_read32(b, kRecord + 16) == 0x838);    // $0
     CHECK(ps_read32(b, kRecord + 32) == 0x838);    // [0x1E0]
@@ -927,9 +929,9 @@ TEST_CASE("cellSpurs: SPURS2 (cellSpursInitializeWithAttribute2): 32 workloads; 
     CHECK(ps_read64(b, kRecord + 48) == kModule);  // wklCurrentAddr
 
     // Its signal: wklSignal2's bit 0x4000.
-    REQUIRE(wait_for([&] { return (ps_read8(b, kSpurs + 0x21) & 0xF0) == 0; }));
-    ps_write8(b, kSpurs + 0x1020 + 0x18, 0); // off SPU 0
-    ps_write8(b, kSpurs + 0x1020 + 0x19, 0); // and SPU 1: the signal stays
+    REQUIRE(wait_for([&] { return (line_byte(b, kSpurs + 0x21) & 0xF0) == 0; }));
+    store8_release(b, kSpurs + 0x1020 + 0x18, 0); // off SPU 0 (as cellSpursSetPriority stores it)
+    store8_release(b, kSpurs + 0x1020 + 0x19, 0); // and SPU 1: the signal stays
     REQUIRE(a.call("cellSpursSendWorkloadSignal", kSpurs, 17) == 0);
     CHECK(ps_read16(b, kSpurs + 0x78) == 0x4000);
     CHECK(ps_read16(b, kSpurs + 0x70) == 0);

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -787,7 +788,10 @@ TEST_CASE("cellAudio: cellAudioSetPortLevel moves the level over 13 ms; accessor
     const u32 port = open_ok(g, 2, 32);
     const PortConfig c = port_config(g, port);
     REQUIRE(g.call("cellAudioPortStart", port) == 0); // clears the ring: filled after
-    for (u32 i = 0; i < 32 * 256 * 2; i++) ps_writef32(b, c.addr + 4 * i, 1.0f);
+    // While the mixer reads it: word stores, as the PPU's, which the mixer's word loads read whole (D-585).
+    const u32 one = ps_bswap32(std::bit_cast<u32>(1.0f));
+    auto* ring = reinterpret_cast<u32*>(b + c.addr);
+    for (u32 i = 0; i < 32 * 256 * 2; i++) __atomic_store_n(ring + i, one, __ATOMIC_RELAXED);
     std::this_thread::sleep_for(15ms);
     g.ctx.fpr[1] = 0.0;
     REQUIRE(g.call("cellAudioSetPortLevel", port) == 0);

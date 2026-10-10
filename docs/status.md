@@ -31,7 +31,7 @@ Mac-translated build keeps working throughout. GTA V (BLES01807) is the driving 
 
 | Area | State |
 |---|---|
-| Toolchain | `ps3inspect` (inventory), ELF/SELF/PRX loader, NID database from RPCS3 (D-019), ISO 9660 disc reader. PPU: interpreter (the oracle, with a decode cache, D-091), analyzer and lifter with differential fuzzing (D-023, D-028), whole-game translation built into the host (D-092 to D-096, D-098), `ppu-dis`. SPU: interpreter, runtime and lifter (D-029), relocatable programs (D-081), `scripts/lift-spu.sh` (D-076, D-099). One PPU/SPU reservation system (D-030, D-066) |
+| Toolchain | `ps3inspect` (inventory), ELF/SELF/PRX loader, NID database from RPCS3 (D-019), ISO 9660 disc reader. PSN games (D-580 to D-583): their packages installed into dev_hdd0, the player's .rap licence, EDATA files and NPDRM executables decrypted with it (host tools; the app's screens for it to come). PPU: interpreter (the oracle, with a decode cache, D-091), analyzer and lifter with differential fuzzing (D-023, D-028), whole-game translation built into the host (D-092 to D-096, D-098), `ppu-dis`. SPU: interpreter, runtime and lifter (D-029), relocatable programs (D-081), `scripts/lift-spu.sh` (D-076, D-099). One PPU/SPU reservation system (D-030, D-066) |
 | lv2 kernel | Host threads, sync objects, memory, `sys_vm`, event queues and ports, timers, filesystem (host directories and disc images read in place, D-043), SPU threads (D-031), the RSX device (`sys_rsx`, D-045), a report of what every thread waits on (D-053) |
 | HLE modules | sysPrxForUser, cellSysmodule, cellSpurs (native, checked against libsre: workloads, tasksets, tasks, job chains, SPURS queues and semaphores, a game's own policy module; the modules programs load themselves, D-079, D-082, D-099, D-136), cellAudio (D-052, D-072 to D-075), cellGcmSys, cellSysutil, sys_io (D-049), sceNp/sceNp2/commerce/SNS (offline, D-139), sceNpTrophy, cellSaveData, cellRtc, cellVoice, cellNetCtl, sys_net (offline loopback, D-141), cellHttp/cellSsl, sys_fs (with AIO), cellGame, cellOskDialog (D-140), cellSync (D-160). All 364 of GTA V's imports and all 140 of Assassin's Creed's (D-160). Every function RPCS3 implements in the libraries pspocket always serves (D-182 to D-189). The PS3's own firmware modules serve libraries the host has nothing of (LLE, D-157), and games load their own PRX modules (sys_prx, D-159) |
 | Loader | `pspocket-boot` runs a decrypted EBOOT on the Mac with the game's translated code built in (`-DPSPOCKET_GAME_PPU`, `-DPSPOCKET_GAME_SPU`; used only for the executable it was translated from, D-098). Crash reports show the guest registers and code, the host frames of translated code (D-094) and every thread. `--bdvd IMAGE.iso`, `--flash DIR`, `--frames DIR`, `--trace-frame N`, `--press`/`--press-file`, `--spu-dump DIR`, `--rsx-recover`, `--frame-jumps`, `--summary FILE.json` (D-149) |
@@ -124,12 +124,17 @@ that RPCS3 asks for 0x50 bytes more memory than Sony's libdmux (pspocket follows
 decoder, on FFmpeg (D-195, D-196, run 103): Sony's libvdec now runs in the test too (it needed libsre's overlay tables
 and SPURS task exit callbacks, now pspocket's), and pspocket's matches it: Sony's sizes for every codec and level,
 pictures one access unit late as Sony's, items and H.264 information in Sony's places read from the stream, frame
-buffers in Sony's layout, pictures exact (RGB within one step). VC-1, DivX 3.11 and MVC are not decoded yet.
+buffers in Sony's layout, pictures exact (RGB within one step). DivX 3.11, VC-1's advanced profile and MVC's base
+view decode on FFmpeg too (D-588 to D-590), not compared with Sony's yet; VC-1's simple and main profiles are
+refused (how Sony's decoder gets their sequence header is not known) and MVC's second view is not decoded.
 cellAdec, the audio decoder (D-197, run 104): pspocket's own front end and LPCM decoder, the same as Sony's libadec to
 the byte (221 answers and callbacks, 22 PCM outputs, every LPCM packing); every other codec goes to Sony's codec
 module through pspocket's front end (the loader now links what a pspocket library takes from the firmware's modules),
 also the same as through Sony's libadec. ATRAC3plus, the codec games use most, is now pspocket's own on FFmpeg (D-198,
 run 105): on Assassin's Creed's menu music every answer is Sony's and the sound within 0.000001 of Sony's decoder.
+MP3, MPEG audio layers I and II, AAC, AC-3 and ATRAC3 have pspocket's own decoders on FFmpeg too (D-577 to D-579),
+firmware first: Sony's codec module serves where the system software is installed, pspocket's where it is not, until
+each is compared with Sony's on the Mac. FFmpeg also builds on Linux now (D-576), so the media tests run in the cloud.
 
 The image decoders began with cellPngDec (D-199, run 106): pspocket's own on libpng, the same as Sony's libpngdec in
 2,283 answers and 121 decoded images, every colour type, bit depth, output setting and chunk kind (Sony's libpng 1.2.8
@@ -251,8 +256,8 @@ kernel calls, PPU and SPU instructions translated and fuzz-checked, a checklist 
 and the games against the Flawless bar.
 
 Next: SPU registers passed in host registers between translated functions (docs/improve.md, the biggest cost in
-play); vertex textures in 3D and cube; the other audio codec cores on FFmpeg
-(MP3, AC-3, AAC, ATRAC3, MPEG audio) when a game's log shows one; then
+play); vertex textures in 3D and cube; the new audio decoders (MP3, AAC, AC-3, ATRAC3, MPEG audio) compared with
+Sony's codec modules on the Mac, then served first; then
 docs/firmware.md's iOS frameworks for the heavy media (ImageIO, VideoToolbox, AudioToolbox), and the phone's stage 6
 with games nobody has analysed (each run's log names what is still missing).
 
@@ -309,7 +314,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-09: 3,927 of 6,625):
+firmware module. Done so far (2026-10-10: 5,691 of 6,625, 85.9%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -321,11 +326,61 @@ console with no USB device (D-522), lv2's network calls and libnet's own layer o
 (D-524: all 123 functions, libhttp's objects where libhttp lays them; past a connection blocked on libnet's resolver),
 sysPrxForUser's raw SPU loaders (D-529, which also fixed sys_spu_segment's address offset), cell_FreeType2 (D-525,
 FreeType 2.2.1 on the host), cellFontFT (D-526 part 1), cellSync2 (D-531, libsync2's objects bit for bit), cellAtrac (D-532, libatrac3plus over
-pspocket's cellAdec).
+pspocket's cellAdec), cellSsl (D-530), sys_io's config service (D-533), cellSysutil complete (D-534), cellAtracMulti
+(D-535), cellFont (D-526 part 2), cellDaisy (D-538), sys_net part 2 (D-539) and gethostbyaddr (D-569), cellSail parts 1-12 (D-562: everything up
+to playing; Start, Stop and the other playback calls are its next part, read from libsail on the Mac).
+- **The C++ library, sys_libstdcxx, all 556 functions**: the foundation and the streams (D-560) and the facets (D-561:
+  ctype, codecvt, collate, messages, numpunct, num_get/num_put, moneypunct, money_get/money_put, time_get/time_put),
+  Dinkumware's of VC8's generation in the "C" locale. No Sony module to compare with (games link it into themselves).
+  The C library's thread-local storage (D-570) and setjmp/longjmp (D-572) too.
+- **Firmware first (D-563)**: libraries made from RPCS3 without Sony's module at hand are marked so that a game still
+  gets Sony's module where the system software is installed, and pspocket's where it is not, until each is compared on
+  the Mac: libmixer (the surround mixer over pspocket's cellAudio), cellVpost (D-564: YUV pictures scaled and converted
+  to RGBA), cellKey2char (D-565: key codes to characters), cellPngEnc (D-566: PNG files from pictures, on libpng),
+  cellFiber (D-568: fibers and contexts, each on a host thread that runs as its PPU thread while it holds the
+  thread's baton), the video codec cores' version queries (D-575).
+- cellGame's and cellPhotoImportUtil's working structures as their variables under RPCS3's names (D-567).
+- The codec cores' operation tables (D-591, D-592): pspocket's own LPCM, ATRAC3plus, MP3, MPEG audio, AAC, AC-3 and
+  ATRAC3 cores and its PAMF demuxer core, offered as the firmware modules' tables (and the MPEG audio and AAC PTS
+  functions) that Sony's libadec and libdmux call; the FFmpeg cores firmware first. A module's imported variable the
+  host exports is the host's (D-593).
+- Unverified functions (D-594): functions made from RPCS3 in libraries pspocket compared with Sony's, marked so
+  that where the system software has the library's module it still serves the whole library: cellPngDec's and
+  cellGifDec's Ext functions (stream input, partial output with display callbacks, D-595), cellVdecOpenExt, SetPts
+  and DecodeAuEx2 (D-596).
+- cellRudp's Init, End and event handler, and sys_crashdump's log areas, firmware-first (D-607): the last functions
+  RPCS3 has bodies for. A scan of every grey function against RPCS3 found nothing more to make from it: the rest are
+  stubs or bare names there.
+- The threaded libraries checked for data races in a ThreadSanitizer build (D-571, -DPSPOCKET_TSAN=ON): cellFiber,
+  libmixer, the C library's threads, cellPngEnc; then the whole runtime (D-584 to D-587, scripts/tsan.sh: 1,063
+  reports to none, the guest code's own accesses suppressed with reasons). Fixed on the way: an SPU's call answered
+  after a reply could land, a thread's stack freed after its join returned, RSX labels and FIFO pointers without
+  ordering (a FIFO reset could lose a frame's commands), SPURS, libsync2 and the media threads' shared words.
+Left (934, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
+- Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSpursJq (63, libspurs_jq), cellSailRec (58)
+  and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (28, its wire protocol), the codec
+  cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 6, and
+  the audio cores' operation tables and PTS functions, about 160 in all), cellJpgEnc (10, its structures), cellCelpEnc and
+  cellCelp8Enc (19), cellJpgDec's Ext functions (5), cellNetAoi, libmedi, libad_core/async (32), cellSpurs' 13
+  and cellSync's 6 (libsre: Task2, the LF queues' second forms), and the small ones (sysConsoleId,
+  sysBdMediaId, sysPs2Disc, sys_lv2coredump, cellLibprof, cellSysconfPs1emu, cellGamePs1Emu, cellSysmodule's two,
+  module management's six).
+- The 188 functions answered as RPCS3's stubs, in libraries pspocket always serves: their arguments and answers from
+  the libraries' modules.
+- sys_libc and sys_libm's internals (260: Dinkumware's formatter, scanner and locale internals, the SPU printf
+  helpers' read and write families): no firmware module has them; their arguments are to be read in a game's own copy
+  of the C library.
+- To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
+  cellFiber, the codec cores' version queries; and cellVdec's DivX 3.11, VC-1 and MVC. The comparisons are written
+  (D-597: tests/hle/test_*_compare.cpp over compare_util.hpp, hidden from ctest until each matches): on the Mac,
+  `PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare]"`
+  prints each library's differences from Sony's module. Writing them found a bug in cellPngEnc: a picture with more
+  than one text chunk aborted its stream (D-598, fixed).
 Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,
 services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
 interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
 as RPCS3's null or stub slots (debugger, crypto engine, colored memory: signatures not known).
-Next: sys_net part 2 (libnet's resolver behind gethostbyname/gethostbyaddr, if_ctl, name servers, routing, netset,
-dumps), then cellSpurs' Task2 and LF queues, cellSync's ANY2ANY queues, the raw SPU loaders, then the firmware-backed
-libraries one by one.
+Next (on the Mac, with the firmware): rerun scripts/build-ffmpeg.sh (macos, macos-tests and ios get the new video
+decoders, D-588 to D-590); compare the firmware-first libraries, the new audio decoders (D-577 to D-579) and the new
+video formats with Sony's modules and drop their markers; then libsre's last functions (cellSpurs' Task2 and LF queues, cellSync's), libnet's resolver (behind
+gethostbyname and gethostbyaddr, D-569), and the firmware-backed libraries above one by one.

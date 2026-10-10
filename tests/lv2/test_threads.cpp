@@ -123,7 +123,7 @@ TEST_CASE("lv2 threads: stack information, guard page and stack release", "[lv2]
     bool committed = false, guard = true;
     t.entries.add(0x20000, [&](PPUContext& ctx) {
         const u32 sp = t.f.alloc(8);
-        REQUIRE(static_cast<s32>(syscall(ctx, kThreadGetStackInfo, sp)) == CELL_OK);
+        THREAD_REQUIRE(static_cast<s32>(syscall(ctx, kThreadGetStackInfo, sp)) == CELL_OK);
         stack_addr = t.f.r32(sp);
         stack_size = t.f.r32(sp + 4);
         committed = t.f.mem.is_committed(stack_addr) && t.f.mem.is_committed(stack_addr + stack_size - 1);
@@ -140,6 +140,30 @@ TEST_CASE("lv2 threads: stack information, guard page and stack release", "[lv2]
     CHECK(committed);
     CHECK_FALSE(guard); // an uncommitted host page below every stack
     CHECK_FALSE(t.f.mem.is_committed(stack_addr)); // released at exit
+}
+
+// D-586: an exiting thread became a zombie and only then gave its stack back, so a join in between returned at once
+// with the stack still committed and its memory not yet back in the container (the test above, one run in three under
+// ThreadSanitizer). Here each worker is joined the moment it is marked finished.
+TEST_CASE("lv2 threads: a thread's stack is released before a join can return", "[lv2][thread]")
+{
+    ThreadFixture t;
+    std::atomic<u32> stack_addr{0};
+    t.entries.add(0x21000, [&](PPUContext& ctx) {
+        const u32 sp = t.f.alloc(8);
+        syscall(ctx, kThreadGetStackInfo, sp);
+        stack_addr = t.f.r32(sp);
+        syscall(ctx, kThreadExit, 0);
+    });
+    u32 committed = 0;
+    for (u32 i = 0; i < 200; i++) {
+        const u32 id = t.spawn(0x21000);
+        while (!t.finished(id)) std::this_thread::yield();
+        u64 status = 0;
+        REQUIRE(t.join(id, status) == CELL_OK);
+        if (t.f.mem.is_committed(stack_addr)) committed++;
+    }
+    CHECK(committed == 0);
 }
 
 TEST_CASE("lv2 threads: returning from the entry function exits with r3", "[lv2][thread]")
@@ -206,8 +230,8 @@ TEST_CASE("lv2 threads: join and detach states", "[lv2][thread]")
         std::thread joiner([&] {
             Caller other(*t.f.kernel, "joiner");
             const u32 out = t.f.alloc(8);
-            CHECK(other.call(kThreadJoin, id, out) == CELL_OK);
-            CHECK(t.f.r64(out) == 5);
+            THREAD_CHECK(other.call(kThreadJoin, id, out) == CELL_OK);
+            THREAD_CHECK(t.f.r64(out) == 5);
         });
         CHECK(eventually([&] {
             std::lock_guard lock(t.f.kernel->impl().join_mutex);
@@ -227,7 +251,7 @@ TEST_CASE("lv2 threads: priorities, names, join state and creation errors", "[lv
     s32 join_state = -1;
     t.entries.add(0x50000, [&](PPUContext& ctx) {
         const u32 p = t.f.alloc(4);
-        REQUIRE(static_cast<s32>(syscall(ctx, kThreadGetJoinState, p)) == CELL_OK);
+        THREAD_REQUIRE(static_cast<s32>(syscall(ctx, kThreadGetJoinState, p)) == CELL_OK);
         join_state = static_cast<s32>(t.f.r32(p));
         syscall(ctx, kThreadExit, 0);
     });

@@ -41,6 +41,7 @@
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/recomp/nid.hpp"
 #include "sysutil.hpp"
 
 namespace pspocket::hle {
@@ -440,14 +441,14 @@ constexpr u32 CELL_PHOTO_IMPORT_ERROR_BUSY = 0x8002C701, CELL_PHOTO_IMPORT_ERROR
 constexpr u32 CELL_CANCEL = 1;
 // CellPhotoImportSetParam {be u32 fileSizeMax, two reserved pointers}; CellPhotoImportFileData: dstFileName[255],
 // photo_title[192], game_title[128], game_comment[1024], a padding byte, then the data_sub and reserved pointers (1608
-// bytes); CellPhotoImportFileDataSub (16 bytes) after it in the same block.
+// bytes); CellPhotoImportFileDataSub (16 bytes).
 constexpr u32 kSetParamSize = 12, kFileDataSize = 1608, kFileDataSubSize = 16;
 
-// RPCS3 photo_import, and its module variables g_filedata and g_filedata_sub (one guest block per process).
+// RPCS3 photo_import; the file data are cellPhotoImportUtil's variables under RPCS3's names for them, g_filedata and
+// g_filedata_sub (D-567).
 struct PhotoImportState {
     std::mutex mutex;
     bool busy = false;
-    u32 file_data = 0;
 };
 
 // RPCS3 cellPhotoImport(2) and select_photo: the arguments, the busy flag, then the destination (on /dev_hdd0 or
@@ -472,12 +473,13 @@ s32 photo_import(PPUContext& ctx, const std::string& call, u32 version, u32 dst,
         !fs::is_directory(host_dir, ec)) {
         return finish(kPhotoImport, error(CELL_PHOTO_IMPORT_ERROR_ACCESS_ERROR), call + std::format(": \"{}\"", *dir));
     }
-    if (!s.file_data) s.file_data = process->main_memory().alloc(kFileDataSize + kFileDataSubSize, 16);
-    if (!s.file_data) PS_FATAL(kPhotoImport, "cellPhotoImport: no main memory for the file data");
+    const u32 file_data = process->link_variable("cellPhotoImportUtil", recomp::nid_of("g_filedata"));
+    const u32 file_data_sub = process->link_variable("cellPhotoImportUtil", recomp::nid_of("g_filedata_sub"));
+    if (!file_data || !file_data_sub) PS_FATAL(kPhotoImport, "cellPhotoImport: no main memory for the file data");
     s.busy = true;
-    const u32 file_data = s.file_data;
-    sysutil_queue_call([func, user_data, file_data](PPUContext& cb) -> s32 {
-        std::memset(guest_base(cb) + file_data, 0, kFileDataSize + kFileDataSubSize);
+    sysutil_queue_call([func, user_data, file_data, file_data_sub](PPUContext& cb) -> s32 {
+        std::memset(guest_base(cb) + file_data, 0, kFileDataSize);
+        std::memset(guest_base(cb) + file_data_sub, 0, kFileDataSubSize);
         PhotoImportState& st = HleProcess::current()->state<PhotoImportState>();
         {
             std::lock_guard l(st.mutex);
@@ -601,6 +603,9 @@ void register_media_export(Registry& r)
         PS_HLE_FUNC(0x81296524, cellVideoExportFromFile),
         PS_HLE_FUNC(0xC15BE817, cellVideoExportFinalize),
     });
+    r.add_variables("cellPhotoImportUtil",
+        {Variable{{}, "g_filedata", recomp::nid_of("g_filedata"), kFileDataSize, 8, nullptr},
+            Variable{{}, "g_filedata_sub", recomp::nid_of("g_filedata_sub"), kFileDataSubSize, 8, nullptr}});
     r.add("cellPhotoImportUtil", {
         PS_HLE_FUNC(0x0783BCE0, cellPhotoImport),
         PS_HLE_FUNC(0x1AB8DF55, cellPhotoImport2),

@@ -83,6 +83,16 @@ struct ThreadExit {};
 struct NonLocalJump {};
 inline constexpr u32 kNonLocalReturnCia = 0xFFFFFFF0; // recomp/ppu lifter.cpp emits it
 
+// The same jump made by host code: the C library's longjmp (D-572), with the context already holding the registers it
+// restores and LR the landing. It goes to the thread's innermost run_guest as the lifter's does, so the caller and every
+// frame between must hold nothing to destroy: an HLE function's stub and thunk qualify, and the function must not own
+// anything (a lock, a string) when it calls this.
+[[noreturn]] void non_local_jump();
+
+// The r1 the thread's innermost run_guest was entered with, 0 with none. A non-local jump lands in the frames that
+// run_guest runs, at or below it; a landing above is in guest code that called host code, which cannot be resumed.
+u64 innermost_guest_entry_sp();
+
 // Runs the guest function at `entry` on the calling host thread until it returns. `ctx` already holds the entry
 // state: r1 (stack), r2 (TOC), r3.. (arguments), r13 (TLS) and LR = kThreadReturnAddress.
 using Executor = void (*)(void* user, PPUContext& ctx, u8* base, u32 entry);
@@ -165,6 +175,9 @@ private:
 
 // The lv2 thread running on the calling host thread, or nullptr.
 PpuThread* current_thread();
+// Makes `t` the lv2 thread of the calling host thread (nullptr: none): a PPU thread's host thread at its start, and the
+// host thread of one of its fibers while that runs as the PPU thread (cellFiber, D-568).
+void set_current_thread(PpuThread* t);
 
 // The process's module loader as lv2's PRX calls (460..499) reach it (D-527): the HLE layer gives one with its
 // hle::ModuleLoader (HleProcess::set_module_loader); a kernel without one answers those calls

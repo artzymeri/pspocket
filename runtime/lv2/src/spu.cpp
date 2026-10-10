@@ -257,6 +257,8 @@ Result check_limits(Kernel::Impl& s, u32 physical, u32 controllable, bool coop)
 
 bool abort_on_failure() { return ps_spu_get_miss_policy() == PS_SPU_MISS_ABORT; }
 
+// An answer in the SPU's inbound mailbox; more than one word, or one that follows an action another thread may answer
+// in turn, with th.answer_mutex held (D-584).
 void put_in_mbox(SpuThread& th, std::initializer_list<u32> values)
 {
     for (const u32 v : values) ps_spu_write_in_mbox(&th.ctx, v);
@@ -298,6 +300,7 @@ int receive_event(SpuThread& th, bool wait)
         if (!alive(q)) {
             put_in_mbox(th, {static_cast<u32>(err(CELL_EINVAL))});
         } else if (q->try_receive(&ev, 1)) {
+            std::lock_guard answer(th.answer_mutex); // the four words as one (RPCS3: ch_in_mbox.set_values(4, ...))
             put_in_mbox(th, {CELL_OK, static_cast<u32>(ev.data1), static_cast<u32>(ev.data2), static_cast<u32>(ev.data3)});
         } else {
             put_in_mbox(th, {static_cast<u32>(err(CELL_EBUSY))});
@@ -321,6 +324,7 @@ int receive_event(SpuThread& th, bool wait)
         g.state_cv.notify_all();
     }
     if (r == CELL_OK) {
+        std::lock_guard answer(th.answer_mutex);
         put_in_mbox(th, {CELL_OK, static_cast<u32>(ev.data1), static_cast<u32>(ev.data2), static_cast<u32>(ev.data3)});
         return 1;
     }
@@ -397,14 +401,19 @@ int spu_intr_mbox(SPUContext* ctx, uint32_t value)
     if (code == 128 || code == 192) {
         const u32 bit = value & 0xFFFFFF;
         Result r = err(CELL_ESRCH);
-        if (bit > 63) {
-            r = err(CELL_EINVAL);
-        } else if (const auto flag = th.s.kernel.event_flag(data)) {
-            flag->set(u64{1} << bit);
-            r = CELL_OK;
+        {
+            // A PPU thread the bit wakes may answer the SPU at once: the answer goes in first (D-584).
+            std::unique_lock answer(th.answer_mutex, std::defer_lock);
+            if (code == 128) answer.lock();
+            if (bit > 63) {
+                r = err(CELL_EINVAL);
+            } else if (const auto flag = th.s.kernel.event_flag(data)) {
+                flag->set(u64{1} << bit);
+                r = CELL_OK;
+            }
+            if (code == 128) put_in_mbox(th, {static_cast<u32>(r)});
         }
         if (r != CELL_OK) PS_LOG_WARN(kSpuChan, "SPU thread {:#x}: event flag {:#x} bit {}: {}", th.id, data, bit, error_name(r));
-        if (code == 128) put_in_mbox(th, {static_cast<u32>(r)});
         return 0;
     }
     if (code >= 128) {
@@ -414,20 +423,28 @@ int spu_intr_mbox(SPUContext* ctx, uint32_t value)
     }
     const bool send = code < 64;
     const u32 port = code & 63;
-    if (send && ps_spu_in_mbox_count(ctx)) {
-        PS_LOG_WARN(kSpuChan, "SPU thread {:#x}: sys_spu_thread_send_event(port {}): the inbound mailbox is not empty", th.id, port);
-        put_in_mbox(th, {static_cast<u32>(err(CELL_EBUSY))});
-        return 0;
-    }
-    std::shared_ptr<EventQueue> q;
-    {
-        std::lock_guard lock(th.group.lock);
-        q = th.ports[port];
-    }
     Result r = err(CELL_ENOTCONN);
-    if (alive(q)) r = q->send(Event{SYS_SPU_THREAD_EVENT_USER_KEY, th.id, (u64{port} << 32) | (value & 0xFFFFFF), data});
+    {
+        // send_event: the receiver may answer the event as soon as it is queued (spu_printf's server does), so the
+        // call's own answer goes in first; a PPU's sys_spu_thread_write_spu_mb waits for it (D-584).
+        std::unique_lock answer(th.answer_mutex, std::defer_lock);
+        if (send) answer.lock();
+        if (send && ps_spu_in_mbox_count(ctx)) {
+            put_in_mbox(th, {static_cast<u32>(err(CELL_EBUSY))});
+            answer.unlock();
+            PS_LOG_WARN(kSpuChan, "SPU thread {:#x}: sys_spu_thread_send_event(port {}): the inbound mailbox is not empty", th.id,
+                port);
+            return 0;
+        }
+        std::shared_ptr<EventQueue> q;
+        {
+            std::lock_guard lock(th.group.lock);
+            q = th.ports[port];
+        }
+        if (alive(q)) r = q->send(Event{SYS_SPU_THREAD_EVENT_USER_KEY, th.id, (u64{port} << 32) | (value & 0xFFFFFF), data});
+        if (send) put_in_mbox(th, {static_cast<u32>(r)});
+    }
     if (r != CELL_OK) PS_LOG_WARN(kSpuChan, "SPU thread {:#x}: {} event on port {}: {}", th.id, send ? "send" : "throw", port, error_name(r));
-    if (send) put_in_mbox(th, {static_cast<u32>(r)});
     return 0;
 }
 
@@ -1240,7 +1257,8 @@ Result sys_spu_thread_write_spu_mb(PpuThread& t, u32 id, u32 value)
 {
     const auto [g, th] = get_thread(t.kernel.impl(), id);
     if (!th) return err(CELL_ESRCH);
-    ps_spu_write_in_mbox(&th->ctx, value); // a full mailbox's newest entry is replaced (RPCS3)
+    std::lock_guard answer(th->answer_mutex); // after an answer lv2 is giving, never inside or ahead of it (D-584)
+    ps_spu_write_in_mbox(&th->ctx, value);    // a full mailbox's newest entry is replaced (RPCS3)
     return CELL_OK;
 }
 

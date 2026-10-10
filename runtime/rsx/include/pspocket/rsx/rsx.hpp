@@ -155,7 +155,7 @@ public:
         JumpToSelf, // a jump to its own address: the guest parks the RSX there and patches the word to release it
     };
     // A snapshot of the FIFO for reports (pspocket-boot's thread report), safe to take from any thread while the RSX
-    // thread runs. The semaphore registers are read without synchronisation; they are stable while it is blocked.
+    // thread runs. A blocked semaphore acquire's offset and context are the ones it found when it blocked (D-587).
     struct Status {
         bool running = false; // the RSX thread exists
         bool idle = false;    // the thread parked on an empty FIFO
@@ -225,6 +225,12 @@ private:
         return ps_bswap32(__atomic_load_n(reinterpret_cast<const u32*>(mem_.base() + ea), __ATOMIC_ACQUIRE));
     }
     void write32(u32 ea, u32 v) { ps_write32(mem_.base(), ea, v); }
+    // A word the CPU waits on (a label or semaphore, ref, get; aligned): a release store, so a CPU that sees it also
+    // sees what the RSX wrote before it, a report or a copy (D-587; the reading side of D-077).
+    void write32_release(u32 ea, u32 v)
+    {
+        __atomic_store_n(reinterpret_cast<u32*>(mem_.base() + ea), ps_bswap32(v), __ATOMIC_RELEASE);
+    }
     // The RSX's own label writes queued behind a deferred readback (D-107), oldest first: its semaphore acquires see
     // them at once, as its pipeline would (the CPU sees them land in order).
     std::deque<std::pair<u32, u32>> queued_labels_;
@@ -315,8 +321,15 @@ private:
     // Written by the thread driving the FIFO; atomic so status() can read them. The value is stored first.
     std::atomic<BlockReason> block_reason_{BlockReason::None};
     std::atomic<u32> block_value_{0}; // semaphore value, or the jump word
+    // The blocked semaphore acquire's offset and DMA context, as it found them: the thread may run commands again while
+    // status() looks (D-587).
+    std::atomic<u32> block_semaphore_offset_{0}, block_semaphore_context_{0};
+    // set_fifo_pointers' reset: the flag publishes the new pointers (put << 32 | get) and whether the RSX thread writes
+    // the control registers when it takes them (D-587).
     std::atomic<bool> fifo_reset_{false};
     std::atomic<u64> pending_get_put_{0};
+    std::atomic<bool> reset_writes_registers_{false};
+    void write_get_put(u64 get_put);
 
     // Display buffers and flip queue
     mutable std::mutex display_mutex_;

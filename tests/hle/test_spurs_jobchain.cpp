@@ -195,15 +195,19 @@ struct ChainFixture {
     ~ChainFixture() { CHECK(a.call("cellSpursFinalize", kSpurs) == 0); }
 
     void run() { REQUIRE(a.call("cellSpursRunJobChain", kJc) == 0); }
-    void cmd(u32 at, u64 v) { ps_write64(base, at, v); }
+    // A command the chain's SPU may be reading: the PPU's store after its lwsync (D-585).
+    void cmd(u32 at, u64 v) { store64_release(base, at, v); }
     u32 wid() { return ps_read32(base, kJc + 0x74); }
-    bool done(u32 i) { return ps_read32(base, out(i) + 0xC0) != 0; }
+    // The done word comes in the job's last PUT, after its record: polled as the PPU polls it, with acquire order.
+    bool done(u32 i) { return load32_acquire(base, out(i) + 0xC0) != 0; }
     bool wait_done(u32 i) { return wait_for([&] { return done(i); }); }
-    // The SPU left the chain: no contention on its workload, and no signal pending.
+    // The SPU left the chain: no contention on its workload, and no signal pending (CellSpurs line 0, which the
+    // workers update with reservation operations: read as one copy of the line).
     bool wait_left()
     {
         return wait_for([&] {
-            return ps_read8(base, kSpurs + 0x20 + wid()) == 0 && !(ps_read16(base, kSpurs + 0x70) & (0x8000u >> wid()));
+            const LineCopy line0 = line_copy(base, kSpurs);
+            return line0.byte(0x20 + wid()) == 0 && !(line0.half(0x70) & (0x8000u >> wid()));
         });
     }
     u32 rec(u32 i, u32 offset) { return ps_read32(base, out(i) + offset); }
@@ -315,7 +319,7 @@ TEST_CASE("job chains: a cached binary loaded with no program takes the one regi
     g_stepped = 0;
     const u64 before = hle::spu_program_stats().reidentified;
     s.run();
-    REQUIRE(wait_for([&] { return ps_read32(b, kStarted) != 0; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kStarted) != 0; }));
     ps_spu_register_program(&program);
     REQUIRE(s.wait_done(0));
     REQUIRE(s.wait_done(1));
@@ -520,7 +524,7 @@ TEST_CASE("job chains: an unknown command halts the chain, records the error and
     s.cmd(kCmds + 0x10, kEnd);
     s.run();
     REQUIRE(s.wait_done(0));
-    REQUIRE(wait_for([&] { return ps_read8(b, kJc + 0x23) == 1; })); // isHalted
+    REQUIRE(wait_for([&] { return line_byte(b, kJc + 0x23) == 1; })); // isHalted
     CHECK(ps_read32(b, kJc + 0x80) == 0x80410A18);                    // CELL_SPURS_JOB_ERROR_UNKNOWN_COMMAND
     CHECK(ps_read64(b, kJc + 0x88) == kCmds + 0x08);                  // the cause: the command's address
     CHECK(ps_read8(b, kSpurs + 0x80 + s.wid()) == 3);                 // SPURS_WKL_STATE_SHUTTING_DOWN
@@ -537,7 +541,7 @@ TEST_CASE("job chains: a chain signalled again while it runs leaves its SPU afte
     s.cmd(kCmds + 0x00, desc(0));
     s.cmd(kCmds + 0x08, kEnd);
     s.run();
-    REQUIRE(wait_for([&] { return ps_read32(b, kStarted) == 0x4940; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kStarted) == 0x4940; }));
     s.run(); // while the job runs
     REQUIRE(s.wait_done(0));
     CHECK(s.wait_left());
@@ -597,7 +601,7 @@ TEST_CASE("job chains: a join waits for the job running when its chain was shut 
     s.cmd(kCmds + 0x00, desc(0));
     s.cmd(kCmds + 0x08, kEnd);
     s.run();
-    REQUIRE(wait_for([&] { return ps_read32(b, kStarted) == 0x4940; }));
+    REQUIRE(wait_for([&] { return load32_acquire(b, kStarted) == 0x4940; }));
     const u32 wid = s.wid();
     REQUIRE(s.a.call("cellSpursShutdownJobChain", kJc) == 0);
     REQUIRE(!s.done(0)); // the job is still in its delay
@@ -618,7 +622,7 @@ TEST_CASE("job chains: a chain halted by an error is joined, and the join return
     s.cmd(kCmds + 0x10, kEnd);
     s.run();
     REQUIRE(s.wait_done(0));
-    REQUIRE(wait_for([&] { return ps_read8(b, kJc + 0x23) == 1; })); // isHalted
+    REQUIRE(wait_for([&] { return line_byte(b, kJc + 0x23) == 1; })); // isHalted
     const u32 wid = s.wid();
     CHECK(s.a.call("cellSpursJoinJobChain", kJc) == 0xFFFFFFFF80410A18ull); // CELL_SPURS_JOB_ERROR_UNKNOWN_COMMAND
     CHECK(ps_read8(b, kSpurs + 0x80 + wid) == 0);
@@ -698,7 +702,10 @@ TEST_CASE("job chains (D-171): cellSpursCreateJobChain, the old API, runs with c
     CHECK(s.rec(0, 0x80) == 1);
     CHECK(s.rec(1, 0x80) == 2);
     const u32 old_wid = ps_read32(b, kOld + 0x74);
-    REQUIRE(wait_for([&] { return ps_read8(b, kSpurs + 0x20 + old_wid) == 0 && ps_read8(b, kSpurs + old_wid) == 0; }));
+    REQUIRE(wait_for([&] {
+        const LineCopy line0 = line_copy(b, kSpurs);
+        return line0.byte(0x20 + old_wid) == 0 && line0.byte(old_wid) == 0;
+    }));
     CHECK(ps_read64(b, kOld + 0x00) == kOldCmds + 0x10); // on its END
 
     // Without autoReadyCount the kick stores the count given (libsre; RPCS3 has the two the other way round).
@@ -706,7 +713,7 @@ TEST_CASE("job chains (D-171): cellSpursCreateJobChain, the old API, runs with c
     s.cmd(kOldCmds + 0x80, kEnd);
     REQUIRE(create_old_chain(s, kOld2, kOldCmds + 0x80, 0) == 0);
     const u32 wid2 = ps_read32(b, kOld2 + 0x74);
-    ps_write8(b, kSpurs + 0xB00 + 0x20 * wid2 + 0x18, 0); // off SPU 0: the count stays as stored
+    store8_release(b, kSpurs + 0xB00 + 0x20 * wid2 + 0x18, 0); // off SPU 0 (as cellSpursSetPriority): the count stays
     REQUIRE(s.a.call("cellSpursKickJobChain", kOld2, 3) == 0);
     CHECK(ps_read8(b, kSpurs + wid2) == 3);
 }
@@ -905,9 +912,12 @@ TEST_CASE("job chains (D-171): guards: initialize, notify runs or kicks the chai
     REQUIRE(s.a.call("cellSpursJobGuardInitialize", kOld, kGuard2, 2, 1, 0) == 0);
     REQUIRE(s.a.call("cellSpursKickJobChain", kOld, 0) == 0);
     REQUIRE(s.wait_done(2));
-    REQUIRE(wait_for([&] { return ps_read32(b, kGuard2 + 0x30) == 1; }));
+    REQUIRE(wait_for([&] { return line_word(b, kGuard2 + 0x30) == 1; }));
     // Blocked on the guard: its ready count 0, and no SPU on it.
-    REQUIRE(wait_for([&] { return ps_read8(b, kSpurs + 0x20 + old_wid) == 0 && ps_read8(b, kSpurs + old_wid) == 0; }));
+    REQUIRE(wait_for([&] {
+        const LineCopy line0 = line_copy(b, kSpurs);
+        return line0.byte(0x20 + old_wid) == 0 && line0.byte(old_wid) == 0;
+    }));
     REQUIRE(s.a.call("cellSpursJobGuardNotify", kGuard2) == 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     CHECK_FALSE(s.done(3)); // one notification left

@@ -1,15 +1,34 @@
 # HLE linkage, sysPrxForUser and the process loader: registry checks, stub calls, lwmutex on real lv2 threads, a
 # synthetic executable booted end to end, and pspocket-boot's fault report.
 pspocket_add_test(test_hle
-    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_audio.cpp test_audio_buffering.cpp test_spu_programs.cpp test_gcm.cpp test_np.cpp test_np2.cpp test_np_tus.cpp test_np_clans.cpp test_commerce2.cpp test_spurs_api.cpp test_spurs_jobchain.cpp test_spurs_queue.cpp test_spurs_run.cpp test_spurs_semaphore.cpp test_sys_io.cpp test_sysutil.cpp test_sysutil_misc.cpp test_media.cpp test_avc.cpp test_imejp.cpp test_rec.cpp test_pamf.cpp test_dmux.cpp test_vdec.cpp test_vdec_vt.cpp test_adec.cpp test_pngdec.cpp test_jpgdec.cpp test_gifdec.cpp test_ovis.cpp test_devices.cpp test_savedata.cpp test_misc_hle.cpp test_pad_script.cpp test_trophy.cpp test_trophy_files.cpp test_voice.cpp test_rtc.cpp test_net.cpp test_lle.cpp test_sync.cpp test_ac_sysutil_fs_pad.cpp test_ac_gcm_spurs_prx.cpp test_la_noire.cpp test_spu_threads.cpp test_gcm_sys.cpp test_sysprx_libc.cpp test_lv2_compare.cpp test_l10n.cpp test_httputil.cpp test_key2char.cpp test_spurs_task2.cpp test_spurs_compare.cpp test_sheap_compare.cpp test_net_compare.cpp test_libm.cpp test_libc.cpp test_libc_stdio.cpp test_libc_process.cpp test_font.cpp test_http_compare.cpp test_sail.cpp test_sail_source.cpp test_spursjq.cpp test_fiber.cpp test_sync2.cpp test_fs_compare.cpp test_gcm_compare.cpp test_lv2dbg.cpp test_usb_compare.cpp test_vpost.cpp test_atrac.cpp test_imgenc.cpp test_snd.cpp test_rudp.cpp test_libstdcxx.cpp test_libstdcxx_facets.cpp test_sysutil_compare.cpp test_sysutil_cxml_compare.cpp test_sysutil_more.cpp test_np_compare.cpp test_freetype_compare.cpp test_fontft_compare.cpp test_ssl_compare.cpp test_config_compare.cpp test_atrac_multi.cpp test_daisy.cpp
+    SOURCES test_hle.cpp test_sysPrxForUser.cpp test_audio.cpp test_audio_buffering.cpp test_spu_programs.cpp test_gcm.cpp test_np.cpp test_np2.cpp test_np_tus.cpp test_np_clans.cpp test_commerce2.cpp test_spurs_api.cpp test_spurs_jobchain.cpp test_spurs_queue.cpp test_spurs_run.cpp test_spurs_semaphore.cpp test_sys_io.cpp test_sysutil.cpp test_sysutil_misc.cpp test_media.cpp test_avc.cpp test_imejp.cpp test_rec.cpp test_pamf.cpp test_dmux.cpp test_vdec.cpp test_vdec_vt.cpp test_vdec_codecs.cpp test_adec.cpp test_adec_cores.cpp test_pngdec.cpp test_jpgdec.cpp test_gifdec.cpp test_ovis.cpp test_devices.cpp test_savedata.cpp test_misc_hle.cpp test_pad_script.cpp test_trophy.cpp test_trophy_files.cpp test_voice.cpp test_rtc.cpp test_net.cpp test_lle.cpp test_sync.cpp test_ac_sysutil_fs_pad.cpp test_ac_gcm_spurs_prx.cpp test_la_noire.cpp test_spu_threads.cpp test_gcm_sys.cpp test_sysprx_libc.cpp test_lv2_compare.cpp test_l10n.cpp test_httputil.cpp test_key2char.cpp test_spurs_task2.cpp test_spurs_compare.cpp test_sheap_compare.cpp test_net_compare.cpp test_libm.cpp test_libc.cpp test_libc_stdio.cpp test_libc_process.cpp test_font.cpp test_http_compare.cpp test_sail.cpp test_sail_source.cpp test_spursjq.cpp test_fiber.cpp test_sync2.cpp test_fs_compare.cpp test_gcm_compare.cpp test_lv2dbg.cpp test_crashdump.cpp test_usb_compare.cpp test_vpost.cpp test_atrac.cpp test_imgenc.cpp test_snd.cpp test_rudp.cpp test_libstdcxx.cpp test_libstdcxx_facets.cpp test_sysutil_compare.cpp test_sysutil_cxml_compare.cpp test_sysutil_more.cpp test_np_compare.cpp test_freetype_compare.cpp test_fontft_compare.cpp test_ssl_compare.cpp test_config_compare.cpp test_atrac_multi.cpp test_daisy.cpp test_libmixer.cpp test_setjmp.cpp test_codec_cores.cpp
     LIBS pspocket::loader pspocket_test_synthetic pspocket::recomp_ppu pspocket::recomp_spu)
 # HLE modules' internal headers (sysutil.hpp: the event queue other modules use), and lv2's (internal.hpp: the RSX
-# device's flip mode and tiles, which cellGcmSys sets through lv2, white-box).
-target_include_directories(test_hle PRIVATE ${PROJECT_SOURCE_DIR}/runtime/hle/src ${PROJECT_SOURCE_DIR}/runtime/lv2/src)
-# FFmpeg, to check the synthetic H.264 the cellVdec tests write (h264_writer.hpp) with a decoder of its own.
+# device's flip mode and tiles, which cellGcmSys sets through lv2, white-box); tests/common: thread_check.hpp (D-585).
+target_include_directories(test_hle PRIVATE ${PROJECT_SOURCE_DIR}/runtime/hle/src ${PROJECT_SOURCE_DIR}/runtime/lv2/src
+    ${PROJECT_SOURCE_DIR}/tests/common)
+# FFmpeg, to check the synthetic H.264 the cellVdec tests write (h264_writer.hpp) with a decoder of its own; the tests'
+# own build of it where there is one, whose encoders write the cellAdec cores' streams (D-577).
 if(TARGET pspocket::ffmpeg)
     target_link_libraries(test_hle PRIVATE pspocket::ffmpeg)
+    set_target_properties(test_hle PROPERTIES PSPOCKET_FFMPEG_ENCODERS ON)
 endif()
+# libpng's reader, to check what cellPngEnc writes with a decoder of its own (D-566).
+if(TARGET pspocket::libpng)
+    target_link_libraries(test_hle PRIVATE pspocket::libpng)
+endif()
+
+# The comparisons with Sony's modules of the firmware-first libraries and of cellVdec's newest codecs (D-597): hidden,
+# run with test_hle "[compare]"; skipped without the firmware (PSPOCKET_TEST_DEV_FLASH), where PSPOCKET_COMPARE_SELF=1
+# runs pspocket's half twice instead.
+target_sources(test_hle PRIVATE
+    test_key2char_compare.cpp
+    test_codec_cores_compare.cpp
+    test_vpost_compare.cpp
+    test_pngenc_compare.cpp
+    test_libmixer_compare.cpp
+    test_fiber_compare.cpp
+    test_vdec_codecs_compare.cpp)
 
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.

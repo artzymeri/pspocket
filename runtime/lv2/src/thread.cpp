@@ -220,6 +220,15 @@ void thread_finish(PpuThread& t, u64 status)
         t.exit_status = status;
         return;
     }
+    // The stack goes back first: a join that finds the thread exited (a zombie's returns at once) finds its stack
+    // released and its memory back in the container (D-586). The thread's own host thread runs this (or the kernel's
+    // teardown, once it has stopped), so nothing else releases it.
+    if (t.stack_addr) {
+        std::lock_guard lock(s.memory.mutex);
+        s.memory.free_stack(t.stack_addr, t.stack_commit);
+        s.memory.default_container.give_back(t.stack_size);
+        t.stack_addr = 0;
+    }
     bool reap = false;
     Waiter* joiner = nullptr;
     {
@@ -231,7 +240,7 @@ void thread_finish(PpuThread& t, u64 status)
         case JoinState::Joinable: t.join = JoinState::Zombie; break;
         case JoinState::Joining:
             // Claim the joiner (the cancel side of its park sees t.joiner cleared and waits for the wake), but wake
-            // it only once the stack is released and the ID is gone, so a join that returned leaves nothing behind.
+            // it only once the ID is gone, so a join that returned leaves nothing behind.
             t.join = JoinState::Exited;
             joiner = t.joiner;
             t.joiner = nullptr;
@@ -244,12 +253,6 @@ void thread_finish(PpuThread& t, u64 status)
         case JoinState::Zombie:
         case JoinState::Exited: break;
         }
-    }
-    if (!t.attached && t.stack_addr) {
-        std::lock_guard lock(s.memory.mutex);
-        s.memory.free_stack(t.stack_addr, t.stack_commit);
-        s.memory.default_container.give_back(t.stack_size);
-        t.stack_addr = 0;
     }
     PS_LOG_DEBUG(kChan, "thread {:#x} exited with {:#x}", t.id, status);
     if (reap) s.threads.remove(PpuThread::kIdBase, t.id); // a joiner holds a reference, so *t outlives this

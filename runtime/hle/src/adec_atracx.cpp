@@ -8,8 +8,9 @@
 //
 // AtracXdecContext (0x268): the thread, the queue mutex and its "not empty" cond, the command queue (4 commands of 0x34,
 // front, back, size), the output mutex, its "consumed" cond and output_locked, the run_thread mutex, cond and flag, the
-// four notifications, the work memory, (pspocket's: the TLS block at +0x128) skip_next_frame +0x165, the sequence's
-// CellAdecParamAtracX +0x1A0, first_decode +0x1BD, then the decoder's state (AtracXdecDecoder) +0x1C0.
+// four notifications, the work memory, (pspocket's: the TLS block at +0x128, whether the notifications are guest
+// functions at +0x12C, D-591) skip_next_frame +0x165, the sequence's CellAdecParamAtracX +0x1A0, first_decode +0x1BD,
+// then the decoder's state (AtracXdecDecoder) +0x1C0.
 
 #include <algorithm>
 #include <bit>
@@ -58,9 +59,9 @@ enum : u32 { WORD_SZ_16BIT = 2, WORD_SZ_24BIT = 3, WORD_SZ_32BIT = 4, WORD_SZ_FL
 namespace ax {
 constexpr u32 thread_id = 0x00, queue_mutex = 0x08, queue_not_empty = 0x0C, kCmdSize = 0x34, cmd_front = 0xE0,
               cmd_back = 0xE4, cmd_size = 0xE8, output_mutex = 0xEC, output_consumed = 0xF0, output_locked = 0xF4,
-              run_thread_mutex = 0xF8, run_thread_cond = 0xFC, run_thread = 0x100, notify_au_done = 0x104,
-              notify_pcm_out = 0x10C, notify_error = 0x114, notify_seq_done = 0x11C, work_mem = 0x124, tls = 0x128,
-              skip_next_frame = 0x165, param = 0x1A0, first_decode = 0x1BD, decoder = 0x1C0, size = 0x268;
+              run_thread_mutex = 0xF8, run_thread_cond = 0xFC, run_thread = 0x100, notify = 0x104, work_mem = 0x124,
+              tls = 0x128, notify_guest = 0x12C, skip_next_frame = 0x165, param = 0x1A0, first_decode = 0x1BD,
+              decoder = 0x1C0, size = 0x268;
 // AtracXdecCmd: type, pcm_handle, au_start_addr, au_size, two unused words, CellAdecParamAtracX.
 constexpr u32 c_type = 0x00, c_pcm_handle = 0x04, c_au_start = 0x08, c_au_size = 0x0C, c_param = 0x18;
 // CellAdecParamAtracX (0x1C): sampling_freq, ch_config_idx, nch_out, nbytes, extra_config_data[4], bw_pcm,
@@ -142,6 +143,9 @@ void forget_decoder(u32 h)
 }
 
 lv2::PpuThread& thread(PPUContext& ctx) { return thread_of(ctx); }
+
+// The four notifications (AU done, PCM out, error, sequence done) are (function, argument) pairs from ax::notify.
+constexpr NotifySlots kSlots{ax::notify, ax::notify_guest};
 
 void put_name(u8* base, u32 at, std::string_view name)
 {
@@ -335,15 +339,15 @@ void decode_au(PPUContext& ctx, u32 h, Decoder& d, const Cmd& cmd)
     u8* base = guest_base(ctx);
     const u32 dec = h + ax::decoder, param = h + ax::param;
     const bool ats = ps_read8(base, param + ax::p_ats) != 0;
-    const u32 context_error = ps_read32(base, h + ax::notify_error + 4);
+    const CoreNotifier notify(ctx, h, kSlots); // what open was given (D-591)
     s32 err = lv2::CELL_OK;
     // Only the first ATS header of a sequence is read.
     if (ps_read8(base, h + ax::first_decode) && ats) {
         if ((err = parse_ats_header(base, h, d, cmd.au_start)) != lv2::CELL_OK)
-            notify_error(ctx, err, context_error);
+            notify.error(err);
         else if (init_decode(base, h, d, ps_read32(base, param + ax::p_bw_pcm), ps_read32(base, param + ax::p_nch_out)) !=
             lv2::CELL_OK)
-            notify_error(ctx, error(CELL_ADEC_ERROR_ATX_FATAL), context_error);
+            notify.error(error(CELL_ADEC_ERROR_ATX_FATAL));
     }
     u32 output = 0, decoded = 0; // LLE leaves the output address unset when the ATS header is bad
     if (err != error(CELL_ADEC_ERROR_ATX_ATSHDR)) {
@@ -351,7 +355,7 @@ void decode_au(PPUContext& ctx, u32 h, Decoder& d, const Cmd& cmd)
             // libatxdec's SPU program would crash (RPCS3 aborts): logged, reported as a fatal error, nothing out.
             PS_LOG_ERROR(kChan, "ATRAC3plus: a decode without a valid configuration (decoder {:#x})", h);
             err = error(CELL_ADEC_ERROR_ATX_FATAL);
-            notify_error(ctx, err, context_error);
+            notify.error(err);
         } else {
             const u32 nch_in = ps_read32(base, dec + ax::d_nch_in), nbytes = ps_read32(base, dec + ax::d_nbytes);
             const u32 bw_pcm = ps_read32(base, dec + ax::d_bw_pcm), nch_out = ps_read32(base, dec + ax::d_nch_out);
@@ -386,12 +390,12 @@ void decode_au(PPUContext& ctx, u32 h, Decoder& d, const Cmd& cmd)
             ps_write8(base, h + ax::first_decode, 0);
             if (err != lv2::CELL_OK) {
                 ps_write8(base, h + ax::skip_next_frame, 1);
-                notify_error(ctx, err, context_error);
+                notify.error(err);
             }
         }
     }
     // AUDONE and PCMOUT follow every decode, even a failed one; the output is to be taken in any case.
-    notify_au_done(ctx, cmd.pcm_handle, ps_read32(base, h + ax::notify_au_done + 4));
+    notify.au_done(cmd.pcm_handle);
     ps_write32(base, h + ax::output_locked, 1);
     unlock(ctx, h, ax::output_mutex);
     const u32 freq = ps_read32(base, dec + ax::d_freq);
@@ -401,8 +405,7 @@ void decode_au(PPUContext& ctx, u32 h, Decoder& d, const Cmd& cmd)
     ps_write32(base, bsi.addr() + 4, ps_read32(base, dec + ax::d_ch_config));
     ps_write32(base, bsi.addr() + 8, ps_read32(base, dec + ax::d_nbytes));
     const s8 pts_type = freq == 32000 ? 4 : freq == 44100 ? 3 : freq == 48000 ? 2 : -1;
-    notify_pcm_out(ctx, cmd.pcm_handle, output, output_size, ps_read32(base, h + ax::notify_pcm_out + 4), bsi.addr(),
-        pts_type, err);
+    notify.pcm_out(cmd.pcm_handle, output, output_size, bsi.addr(), pts_type, err);
 }
 
 // The thread's run_thread check (RPCS3: the decoder stops at the next command once Close cleared it).
@@ -446,7 +449,7 @@ void run(PPUContext& ctx, u32 h)
             std::memcpy(base + h + ax::param, param, sizeof(param));
             break;
         }
-        case END_SEQ: notify_seq_done(ctx, ps_read32(base, h + ax::notify_seq_done + 4)); break;
+        case END_SEQ: CoreNotifier(ctx, h, kSlots).seq_done(); break;
         case DECODE_AU: {
             lock(ctx, h, ax::output_mutex);
             while (ps_read32(base, h + ax::output_locked)) wait(ctx, h, ax::output_consumed);
@@ -478,16 +481,12 @@ public:
     u32 bsi_info_size(PPUContext&) override { return 12; } // CellAdecAtracXInfo
     u32 version(PPUContext&) override { return 0x01020000; }
 
-    s32 open(PPUContext& ctx, u32 h, u32 context, u32 res, u32) override
+    s32 open(PPUContext& ctx, u32 h, const CoreNotify& notify, u32 res, u32) override
     {
         u8* base = guest_base(ctx);
         std::memset(base + h, 0, ax::size);
         HleProcess& process = *HleProcess::current();
-        const u32 fns[4] = {NID_notify_au_done, NID_notify_pcm_out, NID_notify_error, NID_notify_seq_done};
-        for (u32 i = 0; i < 4; i++) {
-            ps_write32(base, h + ax::notify_au_done + 8 * i, process.descriptor_of("cellAdec", fns[i]));
-            ps_write32(base, h + ax::notify_au_done + 8 * i + 4, context);
-        }
+        store_notify(base, h, kSlots, notify);
         const u32 work = h + ((ax::size + 0x7F) & ~0x7Fu) + kSpursStructsSize;
         ps_write32(base, h + ax::work_mem, work);
         ps_write32(base, h + ax::decoder + ax::d_work_mem, work);
@@ -505,9 +504,9 @@ public:
         unlock(ctx, h, ax::output_mutex);
         forget_decoder(h); // a decoder opened again in the same memory starts afresh
         lv2::PpuThread& t = thread(ctx);
-        const u32 entry = process.descriptor_of("cellAdec", NID_atracx_dec_thread);
+        const u32 entry = core_thread_entry(NID_atracx_dec_thread, "_pspocket_atracx_dec_thread");
         if (!entry) {
-            PS_LOG_ERROR(kChan, "ATRAC3plus: the decoder's thread function is not linked (cellAdec was not imported)");
+            PS_LOG_ERROR(kChan, "ATRAC3plus: no memory to link the decoder's thread function");
             return error(CELL_ADEC_ERROR_FATAL);
         }
         const u32 tls = process.alloc_tls();

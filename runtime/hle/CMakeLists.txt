@@ -38,6 +38,7 @@ add_library(pspocket_hle STATIC
     src/cellSysutilWebBrowser.cpp
     src/cellVoice.cpp
     src/modules.cpp
+    src/npdrm.cpp
     src/pad_script.cpp
     src/process.cpp
     src/psf.cpp
@@ -61,6 +62,13 @@ add_library(pspocket_hle STATIC
     src/cellAdec.cpp
     src/adec_lpcm.cpp
     src/adec_atracx.cpp
+    src/adec_ffmpeg.cpp
+    src/adec_mp3.cpp
+    src/adec_mpeg.cpp
+    src/adec_aac.cpp
+    src/adec_ac3.cpp
+    src/adec_atrac3.cpp
+    src/adec_tables.cpp
     src/cellPngDec.cpp
     src/cellGifDec.cpp
     src/cellJpgDec.cpp
@@ -98,12 +106,14 @@ add_library(pspocket_hle STATIC
     src/cellSailAdapters.cpp
     src/cellSailControl.cpp
     src/cellSailFileSource.cpp
+    src/cellSailPipelines.cpp
     src/cellSailRec.cpp
     src/cellSpursJq.cpp
     src/cellFiber.cpp
     src/cellSync2.cpp
     src/cellDaisy.cpp
     src/sys_lv2dbg.cpp
+    src/sys_crashdump.cpp
     src/usbd.cpp
     src/vdec_cores.cpp
     src/cellVpost.cpp
@@ -113,6 +123,7 @@ add_library(pspocket_hle STATIC
     src/libsnd3.cpp
     src/libsynth2.cpp
     src/libmixer.cpp
+    src/codec_cores.cpp
     src/cellCelpEnc.cpp
     src/cellRudp.cpp
     src/cellNetAoi.cpp

@@ -66,3 +66,6 @@ xcuserdata/
 
 # --- Outside sources the build reads (RPCS3, LLVM): kept inside pspocket, never committed ---
 /external/
+
+# Helper agents' git worktrees (docs/handoff.md): their branches are merged into main, the folders never committed.
+.claude/worktrees/

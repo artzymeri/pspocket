@@ -3,6 +3,8 @@
 #include <algorithm>
 
 #include "pspocket/core/be.h"
+#include "pspocket/recomp/crypto.hpp"
+#include "pspocket/recomp/hash.hpp"
 #include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::test {
@@ -881,20 +883,21 @@ std::vector<u8> wrap_in_self(std::span<const u8> elf, const SelfOptions& o)
 
 } // namespace pspocket::test
 
-// ---- SDATA file ----
-
-#if defined(__APPLE__)
-#include <CommonCrypto/CommonCryptor.h>
-#include <CommonCrypto/CommonHMAC.h>
-#endif
+// ---- NPD files: SDATA and EDATA ----
 
 namespace pspocket::test {
 
-std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const SdataOptions& options)
+std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options)
 {
-#if defined(__APPLE__)
+    NpdOptions sdata = options;
+    sdata.edata = false;
+    return build_npd(plain, keys, sdata);
+}
+
+std::vector<u8> build_npd(std::span<const u8> plain, const recomp::NpdKeys& keys, const NpdOptions& options)
+{
     using namespace recomp;
-    const u32 flags = kNpdSdatFlag | options.extra_flags;
+    const u32 flags = (options.edata ? 0 : kNpdSdatFlag) | options.extra_flags;
     const u32 bs = options.block_size;
     const bool compressed = flags & kNpdCompressedFlag;
     const bool flag20 = flags & kNpdFlag20;
@@ -906,9 +909,10 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
     Buffer b;
     b.put(0, std::span<const u8>(reinterpret_cast<const u8*>("NPD\0"), 4));
     b.put32(4, static_cast<u32>(options.version));
-    b.put32(8, 3);  // licence
-    b.put32(12, 0); // type
-    b.put_str(0x10, kSelfContentId);
+    b.put32(8, static_cast<u32>(options.edata ? options.license : 3)); // licence
+    b.put32(12, 0);                                                     // type
+    b.reserve_to(0x40);
+    b.put_str(0x10, options.content_id.substr(0, 0x30));
     u8 digest[16], title_hash[16], dev_hash[16];
     for (int i = 0; i < 16; i++) {
         digest[i] = static_cast<u8>(0x11 * i + 5);
@@ -916,7 +920,19 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
         dev_hash[i] = static_cast<u8>(0x35 * i + 9);
     }
     b.put(0x40, digest);
+    if (options.edata && options.npdrm) {
+        // RPCS3 validate_npd_hashes in reverse: the title hash over the content ID's 0x30 bytes and the file name.
+        std::vector<u8> title(b.bytes.begin() + 0x10, b.bytes.begin() + 0x40);
+        title.insert(title.end(), options.file_name.begin(), options.file_name.end());
+        crypto::aes_cmac(options.npdrm->omac_key3, title.data(), title.size(), title_hash);
+    }
     b.put(0x50, title_hash);
+    if (options.edata && options.npdrm && (options.license & 3) == 3) {
+        // validate_dev_klic in reverse: over the first 0x60 bytes, keyed with the klicensee (a free file's key).
+        Key128 dev_key{};
+        for (int i = 0; i < 16; i++) dev_key[i] = static_cast<u8>(options.key[i] ^ options.npdrm->omac_key2[i]);
+        crypto::aes_cmac(dev_key, b.bytes.data(), 0x60, dev_hash);
+    }
     b.put(0x60, dev_hash);
     b.put32(0x80, flags);
     b.put32(0x84, bs);
@@ -924,14 +940,12 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
     b.reserve_to(0x100);
 
     u8 key[16];
-    for (int i = 0; i < 16; i++) key[i] = static_cast<u8>(dev_hash[i] ^ keys.sdat[i]);
-    auto ecb = [](const u8* k, const u8* in, u8* out) {
-        usize moved = 0;
-        CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode, k, 16, nullptr, in, 16, out, 16, &moved);
-    };
-    auto cbc = [](CCOperation op, const u8* k, const u8* iv, const u8* in, usize n, u8* out) {
-        usize moved = 0;
-        CCCrypt(op, kCCAlgorithmAES, 0, k, 16, iv, in, n, out, n, &moved);
+    for (int i = 0; i < 16; i++) key[i] = options.edata ? options.key[i] : static_cast<u8>(dev_hash[i] ^ keys.sdat[i]);
+    auto ecb = [](const u8* k, const u8* in, u8* out) { crypto::aes_ecb_encrypt(std::span<const u8>(k, 16), in, 16, out); };
+    enum Op { kEncrypt, kDecrypt };
+    auto cbc = [](Op op, const u8* k, const u8* iv, const u8* in, usize n, u8* out) {
+        if (op == kEncrypt) crypto::aes_cbc_encrypt(std::span<const u8>(k, 16), iv, in, n, out);
+        else crypto::aes_cbc_decrypt(std::span<const u8>(k, 16), iv, in, n, out);
     };
     const u8 zero_iv[16]{};
     const u8* iv = options.version <= 1 ? zero_iv : digest;
@@ -963,22 +977,22 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
         else std::copy(key_result, key_result + 16, hash_key);
         u8 key_final[16], hash_final[0x14]{};
         if (flags & kNpdEncryptedKeyFlag) {
-            cbc(kCCDecrypt, edat_key, keys.edat_iv.data(), key_result, 16, key_final);
-            cbc(kCCDecrypt, edat_key, keys.edat_iv.data(), hash_key, 16, hash_final);
+            cbc(kDecrypt, edat_key, keys.edat_iv.data(), key_result, 16, key_final);
+            cbc(kDecrypt, edat_key, keys.edat_iv.data(), hash_key, 16, hash_final);
         } else {
             std::copy(key_result, key_result + 16, key_final);
             std::copy(hash_key, hash_key + 16, hash_final);
         }
         std::vector<u8> enc(payload.size());
         if ((flags & kNpdDebugDataFlag) || (flags & kNpdFlag02)) enc = payload;
-        else cbc(kCCEncrypt, key_final, iv, payload.data(), payload.size(), enc.data());
+        else cbc(kEncrypt, key_final, iv, payload.data(), payload.size(), enc.data());
         u8 hash[0x14]{};
         if (!(flags & kNpdDebugDataFlag)) {
             if (!flag10) {
                 npd_aes_cmac(hash_final, enc.data(), enc.size(), hash);
             } else {
-                u8 mac[CC_SHA1_DIGEST_LENGTH];
-                CCHmac(kCCHmacAlgSHA1, hash_final, flag20 ? 0x14 : 0x10, enc.data(), enc.size(), mac);
+                u8 mac[20];
+                crypto::hmac_sha1(std::span<const u8>(hash_final, flag20 ? 0x14 : 0x10), enc.data(), enc.size(), mac);
                 std::copy(mac, mac + (flag20 ? 0x14 : 0x10), hash);
             }
         }
@@ -1017,10 +1031,238 @@ std::vector<u8> build_sdata(std::span<const u8> plain, const recomp::NpdKeys& ke
         }
     }
     return std::move(b.bytes);
+}
+
+} // namespace pspocket::test
+
+// ---- encrypted SELF ----
+
+#if __has_include(<zlib.h>)
+#include <zlib.h>
+#define PSPOCKET_SYNTHETIC_ZLIB 1
+#endif
+
+namespace pspocket::test {
+
+std::vector<u8> encrypt_self(std::span<const u8> elf, const SelfEncryption& e)
+{
+#if defined(PSPOCKET_SYNTHETIC_ZLIB)
+    using namespace recomp;
+    // Made-up keys for the metadata and the segments, from counters: nothing real.
+    const auto made_up = [](u8 seed) {
+        Key128 a{};
+        for (usize i = 0; i < a.size(); i++) a[i] = static_cast<u8>(seed + i * 37);
+        return a;
+    };
+    std::vector<u8> s = wrap_in_self(elf, {.debug = false, .npdrm = e.npdrm, .npdrm_license = e.npdrm_license,
+                                              .self_type = e.npdrm ? 8u : 4u});
+    auto header = parse_elf_header(elf);
+    if (!header) return {};
+    auto phdrs = parse_program_headers(elf, *header, header->phoff, 0);
+    if (!phdrs) return {};
+    std::vector<u32> with_bytes;
+    for (u32 i = 0; i < phdrs->size(); i++)
+        if ((*phdrs)[i].filesz) with_bytes.push_back(i);
+    const u32 n = static_cast<u32>(with_bytes.size());
+
+    const usize meta = ps_ld32(s.data() + 0x0C) + 0x20; // the metadata info
+    const usize header_size = (meta + 0x40 + 0x20 + n * 0x30 + 2 * n * 16 + 0xF) & ~usize{0xF};
+    s.resize(header_size);
+    std::fill(s.begin() + static_cast<std::ptrdiff_t>(meta), s.end(), u8{0});
+    ps_st16(s.data() + 0x08, e.revision);
+    ps_st64(s.data() + 0x10, header_size);
+
+    // Metadata info: the key and counter for the rest, AES-256-CBC with the SELF key, then a PSN executable's layer.
+    const Key128 meta_key = made_up(0x51), meta_iv = made_up(0x62);
+    std::copy(meta_key.begin(), meta_key.end(), s.begin() + static_cast<std::ptrdiff_t>(meta));
+    std::copy(meta_iv.begin(), meta_iv.end(), s.begin() + static_cast<std::ptrdiff_t>(meta + 0x20));
+    crypto::aes_cbc_encrypt(e.key.erk, e.key.riv.data(), s.data() + meta, 0x40, s.data() + meta);
+    if (e.npdrm) {
+        const u8 zero_iv[16]{};
+        crypto::aes_cbc_encrypt(e.npdrm_layer_key, zero_iv, s.data() + meta, 0x40, s.data() + meta);
+    }
+
+    // Metadata header, section headers, data keys; then each segment, compressed and encrypted.
+    const usize head = meta + 0x40;
+    ps_st64(s.data() + head, header_size);
+    ps_st32(s.data() + head + 0x08, 1);
+    ps_st32(s.data() + head + 0x0C, n);
+    ps_st32(s.data() + head + 0x10, 2 * n);
+    for (u32 k = 0; k < n; k++) {
+        const ProgramHeader& ph = (*phdrs)[with_bytes[k]];
+        std::vector<u8> data(compressBound(static_cast<uLong>(ph.filesz)));
+        uLongf size = static_cast<uLongf>(data.size());
+        if (compress2(data.data(), &size, elf.data() + ph.offset, static_cast<uLong>(ph.filesz), 9) != Z_OK) return {};
+        data.resize(size);
+        const Key128 seg_key = made_up(static_cast<u8>(0x10 + 2 * k)), seg_iv = made_up(static_cast<u8>(0x90 + 2 * k));
+        crypto::aes_ctr(seg_key, seg_iv.data(), data.data(), data.size(), data.data());
+        const usize at = (s.size() + 0xF) & ~usize{0xF};
+        s.resize(at);
+        s.insert(s.end(), data.begin(), data.end());
+
+        const usize sh = head + 0x20 + k * 0x30;
+        ps_st64(s.data() + sh + 0x00, at);
+        ps_st64(s.data() + sh + 0x08, data.size());
+        ps_st32(s.data() + sh + 0x10, 2); // a segment
+        ps_st32(s.data() + sh + 0x14, with_bytes[k]);
+        ps_st32(s.data() + sh + 0x18, 2);
+        ps_st32(s.data() + sh + 0x20, 3);         // encrypted
+        ps_st32(s.data() + sh + 0x24, 2 * k);     // key
+        ps_st32(s.data() + sh + 0x28, 2 * k + 1); // counter
+        ps_st32(s.data() + sh + 0x2C, 2);         // zlib
+        const usize keys_at = head + 0x20 + n * 0x30 + 2 * k * 16;
+        std::copy(seg_key.begin(), seg_key.end(), s.begin() + static_cast<std::ptrdiff_t>(keys_at));
+        std::copy(seg_iv.begin(), seg_iv.end(), s.begin() + static_cast<std::ptrdiff_t>(keys_at + 16));
+    }
+    crypto::aes_ctr(meta_key, meta_iv.data(), s.data() + head, header_size - head, s.data() + head);
+    ps_st64(s.data() + 0x18, s.size() - header_size);
+    return s;
 #else
-    (void)plain, (void)keys, (void)options;
+    (void)elf, (void)e;
     return {};
 #endif
+}
+
+} // namespace pspocket::test
+
+// ---- PARAM.SFO and PS3 packages ----
+
+namespace pspocket::test {
+
+std::vector<u8> build_param_sfo(const std::vector<std::pair<std::string, std::string>>& strings)
+{
+    auto sorted = strings;
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<u8> keys, data, index;
+    const auto le16 = [](std::vector<u8>& v, u32 x) {
+        v.push_back(static_cast<u8>(x));
+        v.push_back(static_cast<u8>(x >> 8));
+    };
+    const auto le32 = [](std::vector<u8>& v, u32 x) {
+        for (int i = 0; i < 4; i++) v.push_back(static_cast<u8>(x >> (8 * i)));
+    };
+    for (const auto& [key, value] : sorted) {
+        const u32 max = static_cast<u32>((value.size() + 1 + 3) & ~usize{3});
+        le16(index, static_cast<u32>(keys.size()));
+        le16(index, 0x0204); // a string
+        le32(index, static_cast<u32>(value.size() + 1));
+        le32(index, max);
+        le32(index, static_cast<u32>(data.size()));
+        keys.insert(keys.end(), key.begin(), key.end());
+        keys.push_back(0);
+        const usize at = data.size();
+        data.insert(data.end(), value.begin(), value.end());
+        data.resize(at + max, 0);
+    }
+    while (keys.size() % 4) keys.push_back(0);
+    std::vector<u8> out;
+    le32(out, 0x46535000); // "\0PSF"
+    le32(out, 0x101);
+    le32(out, static_cast<u32>(20 + index.size()));
+    le32(out, static_cast<u32>(20 + index.size() + keys.size()));
+    le32(out, static_cast<u32>(sorted.size()));
+    out.insert(out.end(), index.begin(), index.end());
+    out.insert(out.end(), keys.begin(), keys.end());
+    out.insert(out.end(), data.begin(), data.end());
+    return out;
+}
+
+std::vector<u8> build_pkg(const PkgSpec& spec)
+{
+    using namespace recomp;
+    // The data: the table, then each name and file aligned (offsets from the data's start).
+    const usize count = spec.items.size();
+    Buffer data;
+    data.reserve_to(count * 0x20);
+    usize at = count * 0x20;
+    for (usize i = 0; i < count; i++) {
+        const PkgItem& item = spec.items[i];
+        const usize name_at = align_up(at, spec.align);
+        data.put(name_at, std::span<const u8>(reinterpret_cast<const u8*>(item.name.data()), item.name.size()));
+        at = name_at + item.name.size();
+        usize file_at = 0;
+        if (!item.bytes.empty()) {
+            file_at = align_up(at, spec.align);
+            data.put(file_at, item.bytes);
+            at = file_at + item.bytes.size();
+        }
+        const usize e = i * 0x20;
+        data.put32(e + 0x00, static_cast<u32>(name_at));
+        data.put32(e + 0x04, static_cast<u32>(item.name.size()));
+        data.put64(e + 0x08, file_at);
+        data.put64(e + 0x10, item.bytes.size());
+        data.put32(e + 0x18, item.type);
+        data.put32(e + 0x1C, 0);
+    }
+    data.reserve_to(align_up(std::max<usize>(at, 16), 16));
+    std::vector<u8>& d = data.bytes;
+    if (spec.retail) {
+        // AES-128-CTR from the counter block, over the whole data (RPCS3 decrypt's PKG_RELEASE_TYPE_RELEASE).
+        crypto::aes_ctr(spec.key, spec.counter.data(), d.data(), d.size(), d.data());
+    } else {
+        // SHA-1 of the QA digest's halves, each twice, and the block's number (PKG_RELEASE_TYPE_DEBUG).
+        u8 input[64]{};
+        std::copy_n(spec.qa_digest.begin(), 8, input);
+        std::copy_n(spec.qa_digest.begin(), 8, input + 8);
+        std::copy_n(spec.qa_digest.begin() + 8, 8, input + 16);
+        std::copy_n(spec.qa_digest.begin() + 8, 8, input + 24);
+        for (usize block = 0; block * 16 < d.size(); block++) {
+            ps_st64(input + 56, block);
+            const Sha1Digest stream = Sha1::hash(std::span<const u8>(input, sizeof input));
+            for (usize i = 0; i < 16; i++) d[block * 16 + i] ^= stream[i];
+        }
+    }
+
+    // The metadata packets: the ones RPCS3 keeps, and two it passes over (4, the package's size; 0xC).
+    Buffer meta;
+    usize m = 0;
+    u32 packets = 0;
+    const auto packet = [&](u32 id, std::span<const u8> bytes) {
+        meta.put32(m, id);
+        meta.put32(m + 4, static_cast<u32>(bytes.size()));
+        meta.put(m + 8, bytes);
+        m += 8 + bytes.size();
+        packets++;
+    };
+    const auto word = [](u32 v) {
+        std::vector<u8> w(4);
+        ps_st32(w.data(), v);
+        return w;
+    };
+    packet(1, word(spec.drm_type));
+    if (spec.content_type) packet(2, word(spec.content_type));
+    packet(3, word(spec.package_flags));
+    packet(4, std::vector<u8>(8, 0x11));
+    if (!spec.install_dir.empty()) {
+        std::vector<u8> dir(8, 0);
+        dir.insert(dir.end(), spec.install_dir.begin(), spec.install_dir.end());
+        dir.resize(align_up(dir.size() + 1, 16), 0);
+        packet(0xA, dir);
+    }
+    packet(0xC, std::vector<u8>(0x14, 0x22));
+
+    Buffer pkg;
+    const usize meta_offset = 0xC0;
+    const usize data_offset = align_up(meta_offset + m, 0x80);
+    pkg.put32(0x00, 0x7F504B47); // "\x7FPKG"
+    pkg.put16(0x04, spec.retail ? 0x8000 : 0x0000);
+    pkg.put16(0x06, spec.platform);
+    pkg.put32(0x08, static_cast<u32>(meta_offset));
+    pkg.put32(0x0C, packets);
+    pkg.put32(0x10, static_cast<u32>(m));
+    pkg.put32(0x14, static_cast<u32>(count));
+    pkg.put64(0x20, data_offset);
+    pkg.put64(0x28, d.size());
+    pkg.put_str(0x30, spec.content_id.substr(0, 0x2F));
+    pkg.put(0x60, spec.qa_digest);
+    pkg.put(0x70, spec.counter);
+    for (usize i = 0x80; i < 0xC0; i++) pkg.put8(i, static_cast<u8>(0xA0 ^ i)); // where a header digest is
+    pkg.put(meta_offset, meta.bytes);
+    pkg.put(data_offset, d);
+    const usize end = data_offset + d.size();
+    for (usize i = 0; i < 0x60; i++) pkg.put8(end + i, static_cast<u8>(0x5A ^ i)); // where the digests are
+    pkg.put64(0x18, pkg.bytes.size());
+    return std::move(pkg.bytes);
 }
 
 } // namespace pspocket::test

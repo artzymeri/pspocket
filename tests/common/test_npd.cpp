@@ -1,19 +1,29 @@
-// NPD files (D-165): synthetic SDATA files, encrypted in the test with made-up keys the way Sony's are, read back by
-// recomp::NpdFile for every layout the reader knows (flags 0x02, 0x08, 0x10, 0x20, compressed, debug data; NPD
-// versions 1 to 4). No real keys and no game data (CLAUDE.md rule 1).
+// NPD files (D-165, D-581): synthetic SDATA and EDATA files, encrypted in the test with made-up keys the way Sony's
+// are, read back by recomp::NpdFile for every layout the reader knows (flags 0x02, 0x08, 0x10, 0x20, compressed, debug
+// data; NPD versions 1 to 4), and an EDATA file's header hashes. Where the build has RPCS3's source, every block and
+// every header check is also set against RPCS3's own code (rpcs3_ref), with the build's keys, in memory only. No real
+// keys and no game data in the tests (CLAUDE.md rule 1).
 
 #include <catch_amalgamated.hpp>
 
 #include <cstring>
 #include <numeric>
+#include <optional>
+#include <random>
+#include <string>
 
+#include "pspocket/core/be.h"
 #include "pspocket/recomp/npd.hpp"
 #include "synthetic.hpp"
 
-#if defined(__APPLE__)
+#if defined(PSPOCKET_HAVE_RPCS3_REF)
+#include "rpcs3_ref/rpcs3_ref.hpp"
+#endif
 
 using namespace pspocket;
 using namespace pspocket::recomp;
+using pspocket::test::build_npd;
+using pspocket::test::NpdOptions;
 
 namespace {
 
@@ -43,7 +53,8 @@ std::vector<u8> pattern(usize size)
     return v;
 }
 
-Result<std::unique_ptr<NpdFile>> open_bytes(const std::vector<u8>& file, const NpdKeys& keys)
+Result<std::unique_ptr<NpdFile>> open_bytes(const std::vector<u8>& file, const NpdKeys& keys,
+    const std::optional<Key128>& edata_key = std::nullopt, const NpdrmKeys& npdrm = builtin_npdrm_keys())
 {
     return NpdFile::open(
         [&file](u64 offset, void* dst, usize size) {
@@ -51,7 +62,26 @@ Result<std::unique_ptr<NpdFile>> open_bytes(const std::vector<u8>& file, const N
             std::memcpy(dst, file.data() + offset, size);
             return true;
         },
-        file.size(), keys);
+        file.size(), keys, edata_key, npdrm);
+}
+
+NpdrmKeys made_up_npdrm_keys()
+{
+    NpdrmKeys k;
+    for (int i = 0; i < 16; i++) {
+        k.omac_key2[i] = static_cast<u8>(0x71 + 3 * i);
+        k.omac_key3[i] = static_cast<u8>(0x82 + 5 * i);
+        k.klic_free[i] = static_cast<u8>(0x93 + 9 * i);
+    }
+    k.present = true;
+    return k;
+}
+
+Key128 key_of(u8 seed)
+{
+    Key128 k{};
+    for (int i = 0; i < 16; i++) k[i] = static_cast<u8>(seed + 29 * i);
+    return k;
 }
 
 // Every byte through one read, then pieces that start and end inside blocks and cross their edges.
@@ -218,6 +248,228 @@ TEST_CASE("npd_decompress: the plain form, and damaged input never writes past i
         const int n = npd_decompress(buffer.data(), noise.data(), noise.size(), 256);
         CHECK(n <= 256);
         CHECK(std::all_of(buffer.begin() + 256, buffer.end(), [](u8 b) { return b == 0xEE; }));
+    }
+}
+
+TEST_CASE("NpdFile: EDATA files open with their content key, in every layout (D-581)", "[npd]")
+{
+    const NpdKeys keys = made_up_keys();
+    const NpdrmKeys npdrm = made_up_npdrm_keys();
+    const struct {
+        const char* what;
+        s32 license;
+        u32 flags;
+        s32 version;
+    } cases[] = {
+        {"free (klicensee), AES-CMAC", 3, 0, 3},
+        {"free, HMAC-SHA1 before each block", 3, kNpdFlag10 | kNpdFlag20, 3},
+        {"free, encrypted key, version 4", 3, kNpdEncryptedKeyFlag | kNpdFlag10, 4},
+        {"free, compressed", 3, kNpdCompressedFlag, 2},
+        {"local (RIF key), AES-CMAC", 2, 0, 3},
+        {"network (RIF key), not encrypted (0x02)", 1, kNpdFlag02, 3},
+        {"local, version 1", 2, 0, 1},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        const Key128 key = key_of(static_cast<u8>(c.license * 40 + c.version));
+        NpdOptions o{.version = c.version, .extra_flags = c.flags, .block_size = 0x400};
+        o.edata = true;
+        o.license = c.license;
+        o.key = key;
+        o.file_name = "DATA.EDAT";
+        o.npdrm = &npdrm;
+        const std::vector<u8> plain = pattern(4321);
+        const std::vector<u8> file = build_npd(plain, keys, o);
+        auto f = open_bytes(file, keys, key, npdrm);
+        if (!f) FAIL(f.error().message);
+        CHECK((*f)->header().flags == c.flags);
+        CHECK((*f)->header().license == c.license);
+        check_reads(**f, plain, 0x400);
+
+        // Another key: a free file says so from its dev hash, any other from its first block.
+        auto wrong = open_bytes(file, keys, key_of(0xEE), npdrm);
+        REQUIRE_FALSE(wrong);
+        if (c.license == 3) CHECK(wrong.error().message.find("klicensee is not the one") != std::string::npos);
+        else CHECK(wrong.error().message.find("the first block") != std::string::npos);
+        // No key at all; no keys in the build.
+        auto none = open_bytes(file, keys, std::nullopt, npdrm);
+        REQUIRE_FALSE(none);
+        CHECK(none.error().message.find("licence key") != std::string::npos);
+        CHECK_FALSE(open_bytes(file, NpdKeys{}, key, npdrm));
+        if (c.license == 3) CHECK_FALSE(open_bytes(file, keys, key, NpdrmKeys{}));
+    }
+
+    // Debug data: no dev hash check, blocks stored plain.
+    NpdOptions o{.version = 3, .extra_flags = kNpdDebugDataFlag, .block_size = 0x200};
+    o.edata = true;
+    o.key = key_of(5);
+    const std::vector<u8> plain = pattern(1000);
+    const std::vector<u8> debug = build_npd(plain, keys, o);
+    auto f = open_bytes(debug, keys, key_of(6), npdrm);
+    REQUIRE(f);
+    check_reads(**f, plain, 0x200);
+}
+
+TEST_CASE("NPD headers: the dev hash and the title hash RPCS3 checks before a game uses an EDAT", "[npd]")
+{
+    const NpdKeys keys = made_up_keys();
+    const NpdrmKeys npdrm = made_up_npdrm_keys();
+    NpdOptions o{.version = 3, .extra_flags = 0, .block_size = 0x400};
+    o.edata = true;
+    o.license = 3;
+    o.key = key_of(1);
+    o.file_name = "Level1.EDAT";
+    o.npdrm = &npdrm;
+    const std::vector<u8> file = build_npd(pattern(100), keys, o);
+    const std::span<const u8> head(file.data(), kNpdHeaderBytes);
+
+    const auto header = parse_npd_header(head);
+    REQUIRE(header);
+    CHECK(header->content_id == test::kSelfContentId);
+    CHECK(header->license == 3);
+    CHECK_FALSE(parse_npd_header(head.first(0x8F)));
+
+    CHECK(npd_klicensee_matches(head, key_of(1), npdrm));
+    CHECK_FALSE(npd_klicensee_matches(head, key_of(2), npdrm));
+    CHECK(npd_hashes_valid(head, "Level1.EDAT", key_of(1), npdrm));
+    CHECK(npd_hashes_valid(head, "", key_of(1), npdrm)); // no name: the dev hash only
+    // The name's extension is tried as it is, in lower and in upper case: a file made as .EDAT passes as .edat or
+    // .Edat; the rest of the name must be the one it was made with.
+    CHECK(npd_hashes_valid(head, "Level1.edat", key_of(1), npdrm));
+    CHECK(npd_hashes_valid(head, "Level1.Edat", key_of(1), npdrm));
+    CHECK_FALSE(npd_hashes_valid(head, "LEVEL1.EDAT", key_of(1), npdrm));
+    CHECK_FALSE(npd_hashes_valid(head, "Level2.EDAT", key_of(1), npdrm));
+    CHECK_FALSE(npd_hashes_valid(head, "Level1.EDAT", key_of(2), npdrm));
+
+    // A file with no extension: the whole name in one case or the other.
+    o.file_name = "readme";
+    const std::vector<u8> plain_name = build_npd(pattern(100), keys, o);
+    CHECK(npd_hashes_valid(std::span<const u8>(plain_name).first(kNpdHeaderBytes), "README", key_of(1), npdrm));
+
+    // A local licence: no dev hash to check, the title hash still is.
+    o.license = 2;
+    o.file_name = "dlc.edat";
+    const std::vector<u8> local = build_npd(pattern(100), keys, o);
+    const std::span<const u8> local_head(local.data(), kNpdHeaderBytes);
+    CHECK(npd_klicensee_matches(local_head, key_of(9), npdrm));
+    CHECK(npd_hashes_valid(local_head, "dlc.edat", key_of(9), npdrm));
+    CHECK_FALSE(npd_hashes_valid(local_head, "other.edat", key_of(9), npdrm));
+
+    // Debug data passes whatever its hashes.
+    std::vector<u8> debug = local;
+    ps_st32(debug.data() + 0x80, kNpdDebugDataFlag);
+    CHECK(npd_hashes_valid(std::span<const u8>(debug).first(kNpdHeaderBytes), "other.edat", key_of(9), npdrm));
+}
+
+#if defined(PSPOCKET_HAVE_RPCS3_REF)
+
+TEST_CASE("NPD files against RPCS3: every block of SDATA and EDATA files as RPCS3's decrypt_block gives it",
+    "[npd][rpcs3]")
+{
+    const NpdKeys& keys = builtin_npd_keys();
+    const NpdrmKeys& npdrm = builtin_npdrm_keys();
+    if (!keys.present || !npdrm.present) SKIP("this build has no NPD keys");
+    const struct {
+        const char* what;
+        bool edata;
+        s32 license;
+        u32 flags;
+        s32 version;
+        u32 block_size;
+    } cases[] = {
+        {"SDATA, AES-CMAC", false, 3, 0, 3, 0x400},
+        {"SDATA, HMAC-SHA1 (0x10)", false, 3, kNpdFlag10, 2, 0x200},
+        {"SDATA, hashes before the blocks (0x10 | 0x20)", false, 3, kNpdFlag10 | kNpdFlag20, 3, 0x400},
+        {"SDATA, encrypted key, version 4", false, 3, kNpdEncryptedKeyFlag, 4, 0x400},
+        {"SDATA, version 1", false, 3, 0, 1, 0x300},
+        {"SDATA, compressed", false, 3, kNpdCompressedFlag, 3, 0x400},
+        {"EDATA, free", true, 3, 0, 3, 0x400},
+        {"EDATA, free, encrypted key and HMAC (0x08 | 0x10)", true, 3, kNpdEncryptedKeyFlag | kNpdFlag10, 4, 0x400},
+        {"EDATA, local, CMAC before each block (0x20)", true, 2, kNpdFlag20, 3, 0x400},
+        {"EDATA, network, not encrypted (0x02)", true, 1, kNpdFlag02, 2, 0x200},
+        {"EDATA, debug data", true, 2, kNpdDebugDataFlag, 3, 0x400},
+        {"EDATA, compressed, metadata plain (version 1)", true, 3, kNpdCompressedFlag, 1, 0x400},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        NpdOptions o{.version = c.version, .extra_flags = c.flags, .block_size = c.block_size};
+        o.edata = c.edata;
+        o.license = c.license;
+        o.key = key_of(static_cast<u8>(c.flags + static_cast<u32>(c.version)));
+        o.file_name = "x.edat";
+        o.npdrm = &npdrm;
+        const std::vector<u8> plain = pattern(3 * c.block_size + 77);
+        const std::vector<u8> file = build_npd(plain, keys, o);
+        const std::optional<Key128> edata_key = c.edata ? std::optional<Key128>(o.key) : std::nullopt;
+        auto ours = open_bytes(file, keys, edata_key, npdrm);
+        if (!ours) FAIL(ours.error().message);
+        // RPCS3's file key: an SDAT file's dev hash XOR SDAT_KEY, an EDATA file's content key.
+        Key128 file_key = o.key;
+        if (!c.edata)
+            for (int i = 0; i < 16; i++) file_key[i] = static_cast<u8>(file[0x60 + i] ^ keys.sdat[i]);
+        const u32 blocks = static_cast<u32>((plain.size() + c.block_size - 1) / c.block_size);
+        for (u32 block = 0; block < blocks; block++) {
+            INFO("block " << block);
+            const auto theirs = test::rpcs3_ref::decrypt_block(file, block, file_key);
+            REQUIRE(theirs);
+            const usize at = usize{block} * c.block_size;
+            std::vector<u8> mine(std::min<usize>(c.block_size, plain.size() - at));
+            REQUIRE((*ours)->read(at, mine.data(), mine.size()));
+            if ((c.flags & kNpdCompressedFlag) && block % 2 == 0) {
+                // A compressed block that holds its bytes plain: RPCS3's decompress answers 0 for it (D-165).
+                CHECK(theirs->empty());
+            } else {
+                CHECK((*theirs == mine)); // unexpanded: Catch2 throws printing byte vectors this long (-s)
+            }
+        }
+        // A damaged last block: neither decrypts it.
+        if (!(c.flags & kNpdDebugDataFlag)) {
+            std::vector<u8> damaged = file;
+            damaged[file.size() - 3] ^= 0x40;
+            CHECK_FALSE(test::rpcs3_ref::decrypt_block(damaged, blocks - 1, file_key));
+            auto f = open_bytes(damaged, keys, edata_key, npdrm);
+            REQUIRE(f);
+            std::vector<u8> last(plain.size() - usize{blocks - 1} * c.block_size);
+            CHECK_FALSE((*f)->read(usize{blocks - 1} * c.block_size, last.data(), last.size()));
+        }
+    }
+}
+
+TEST_CASE("NPD header hashes against RPCS3: validate_dev_klic and validate_npd_hashes on random headers",
+    "[npd][rpcs3]")
+{
+    const NpdKeys& keys = builtin_npd_keys();
+    const NpdrmKeys& npdrm = builtin_npdrm_keys();
+    if (!keys.present || !npdrm.present) SKIP("this build has no NPD keys");
+    std::mt19937 rng(0xED47);
+    const char* names[] = {"data.edat", "DATA.EDAT", "Data.Edat", "noext", "NOEXT", "a.b.c", "a.B.C", ".hidden",
+        "trailing.", "x.EDAT"};
+    const s32 licenses[] = {0, 1, 2, 3, 7};
+    for (int round = 0; round < 200; round++) {
+        NpdOptions o{.version = 1 + static_cast<s32>(rng() % 4), .extra_flags = 0, .block_size = 0x400};
+        o.edata = true;
+        o.license = licenses[rng() % std::size(licenses)];
+        for (u8& b : o.key) b = static_cast<u8>(rng());
+        o.file_name = names[rng() % std::size(names)];
+        o.content_id = "UP" + std::to_string(rng() % 10000) + "-NPXX" + std::to_string(rng() % 100000) + "_00-" +
+            std::to_string(rng());
+        o.npdrm = &npdrm;
+        if (round % 10 == 9) o.extra_flags = kNpdDebugDataFlag;
+        std::vector<u8> file = build_npd(pattern(64), keys, o);
+        if (round % 7 == 6) file[0x55] ^= 1;   // a damaged title hash
+        if (round % 11 == 10) file[0x65] ^= 1; // a damaged dev hash
+        const std::span<const u8> head(file.data(), kNpdHeaderBytes);
+        Key128 other = o.key;
+        other[rng() % 16] ^= 0x10;
+        for (const Key128& klic : {o.key, other}) {
+            CHECK(npd_klicensee_matches(head, klic, npdrm) == test::rpcs3_ref::validate_dev_klic(file, klic));
+            for (const char* name : names) {
+                INFO("made as " << o.file_name << ", checked as " << name << ", licence " << o.license);
+                CHECK(npd_hashes_valid(head, name, klic, npdrm) ==
+                    test::rpcs3_ref::validate_npd_hashes(file, name, klic));
+            }
+            CHECK(npd_hashes_valid(head, "", klic, npdrm) == test::rpcs3_ref::validate_npd_hashes(file, "", klic));
+        }
     }
 }
 

@@ -28,6 +28,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 
 using namespace pspocket;
@@ -458,6 +459,14 @@ TEST_CASE("cellHddGameCheck: RPCS3's checks, funcStat's structures and its answe
     CHECK(all_bytes(base + file_param, kParamSize, 0));
     CHECK(ps_read32(base, stat_result(base)) == 0);
     CHECK_FALSE(fsys::exists(dir));
+    // The structures are cellGame's variables under RPCS3's names for them (D-567).
+    const auto var = [&](std::string_view name) {
+        return f.hle->link_variable("cellGame", recomp::nid_of(name));
+    };
+    CHECK(get == var("g_stat_get"));
+    CHECK(set == var("g_stat_set"));
+    CHECK(stat_result(base) == var("g_cb_result"));
+    CHECK(file_param == var("g_file_param"));
 
     // New data that funcStat answers OK without a setParam: CELL_GAMEDATA_ERROR_PARAM (RPCS3's code). OK_CANCEL is
     // CELL_OK, an error result CELL_HDDGAME_ERROR_CBRESULT; the error dialog errDialog asks for is logged.
@@ -759,12 +768,15 @@ TEST_CASE("cellFsAio: reads complete on the AIO thread, which calls back with th
     constexpr u32 kAio = kOut + 0x100; // CellFsAio blocks, 0x40 apart
     put(base, kMount, "/dev_hdd0");
 
-    // callback(aio, error, xid, size): appends {aio, error, xid, r1, size} (32 bytes) to kAioLog, then counts it.
+    // callback(aio, error, xid, size): appends {aio, error, xid, r1, size} (32 bytes) to kAioLog, then counts it with
+    // lwarx/stwcx., as a game's atomic increment (cellAtomicIncr32): the test reads the count through the reservation
+    // system, so the log entry and the bytes the AIO thread read before are visible with it (D-585).
     write_code(base, kAioCode, {
         as::lis(7, hi(kAioLog)), as::ori(7, 7, lo(kAioLog)),
         as::lwz(8, 0, 7), as::slwi(9, 8, 5), as::addi(9, 9, 32), as::add(9, 9, 7),
         as::stw(3, 0, 9), as::stw(4, 4, 9), as::stw(5, 8, 9), as::stw(1, 12, 9), as::std_(6, 16, 9),
-        as::sync(), as::addi(8, 8, 1), as::stw(8, 0, 7),
+        as::sync(), as::addi(8, 8, 1),
+        as::lwarx(10, 0, 7), as::stwcx_(8, 0, 7), as::bc_rel(4, 2, -8), // bne- back to the lwarx
         as::blr(),
     });
     write_opd(base, kAioOpd, kAioCode);
@@ -780,9 +792,9 @@ TEST_CASE("cellFsAio: reads complete on the AIO thread, which calls back with th
     };
     const auto wait_for = [&](u32 n) {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (hle::atomic_load_be32(base, kAioLog) < n && std::chrono::steady_clock::now() < until)
+        while (line_word(base, kAioLog) < n && std::chrono::steady_clock::now() < until)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        return hle::atomic_load_be32(base, kAioLog) == n;
+        return line_word(base, kAioLog) == n;
     };
     const auto request = [&](u32 slot, u32 fd, u64 offset, u32 buf, u64 size) {
         const u32 aio = kAio + 0x40 * slot;

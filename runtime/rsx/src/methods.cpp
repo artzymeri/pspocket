@@ -55,13 +55,13 @@ void Rsx::write_label(u32 ea, u32 value)
 {
     if (config_.sync_on_label) backend_.sync();
     if (!backend_.deferring()) {
-        write32(ea, value);
+        write32_release(ea, value);
         return;
     }
     // After a deferred readback before it (D-107).
     queued_labels_.emplace_back(ea, value);
     backend_.defer(ea, 4, [this, ea, value] {
-        write32(ea, value);
+        write32_release(ea, value);
         queued_labels_.pop_front();
     });
 }
@@ -71,7 +71,7 @@ void Rsx::m_set_reference(u32, u32 value)
     // RPCS3 nv406e.cpp set_reference: get is written together with ref.
     if (config_.sync_on_label) backend_.sync();
     publish_get();
-    backend_.defer(config_.layout.ref_addr(), 4, [this, value] { write32(config_.layout.ref_addr(), value); });
+    backend_.defer(config_.layout.ref_addr(), 4, [this, value] { write32_release(config_.layout.ref_addr(), value); });
 }
 
 void Rsx::m_semaphore_release(u32 reg, u32 value)

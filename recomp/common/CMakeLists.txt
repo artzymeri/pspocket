@@ -42,6 +42,7 @@ find_package(ZLIB)
 
 add_library(pspocket_recomp_common STATIC
     src/bytes.cpp
+    src/crypto.cpp
     src/elf.cpp
     src/guest_image.cpp
     src/hash.cpp
@@ -50,6 +51,8 @@ add_library(pspocket_recomp_common STATIC
     src/manifest.cpp
     src/nid.cpp
     src/npd.cpp
+    src/npdrm.cpp
+    src/pkg.cpp
     src/ppu_module.cpp
     src/prx_place.cpp
     src/sce.cpp

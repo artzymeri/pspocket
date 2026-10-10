@@ -29,15 +29,9 @@
 
 namespace pspocket::hle::stdcxx {
 
-inline constexpr u32 kIosStdstr = 4, kIosState = 8, kIosExcept = 12, kIosFmtfl = 16, kIosPrec = 20, kIosWide = 24,
-                     kIosArr = 28, kIosCalls = 32, kIosPloc = 36, kIosBaseBytes = 40;
-inline constexpr u32 kIosSb = 40, kIosTie = 44, kIosFill = 48, kBasicIosBytes = 52;
-inline constexpr u32 kGoodbit = 0, kEofbit = 1, kFailbit = 2, kBadbit = 4, kStatmask = 0x17;
-inline constexpr u32 kSkipws = 0x1, kUnitbuf = 0x2, kDec = 0x200, kOct = 0x400, kHex = 0x800, kBasefield = 0xE00,
-                     kFmtmask = 0xFFFF;
+// ios_base's layout, its states and format flags are stdcxx.hpp's (the facets part reads them too).
 inline constexpr u32 kIn = 0x1, kOut = 0x2, kAte = 0x4, kApp = 0x8, kTrunc = 0x10, kBinary = 0x20, kNocreate = 0x40,
                      kNoreplace = 0x80;
-inline constexpr s32 kEof = -1;
 inline constexpr s32 kBadoff = -1;
 
 inline constexpr u32 kSbLock = 4, kSbGfirst = 8, kSbPfirst = 12, kSbIGfirst = 16, kSbIPfirst = 20, kSbGnext = 24,

@@ -29,6 +29,7 @@ endif()
 option(PSPOCKET_BUILD_TESTS "Build the test suites" ON)
 option(PSPOCKET_WERROR "Treat warnings as errors" OFF)
 option(PSPOCKET_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
+option(PSPOCKET_TSAN "Build with ThreadSanitizer (not together with PSPOCKET_SANITIZE)" OFF)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(PSPocketWarnings)
@@ -36,6 +37,14 @@ include(PSPocketWarnings)
 if(PSPOCKET_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address,undefined)
+endif()
+# Data races in the threaded runtime code (D-571): e.g. build/tsan/tests/hle/test_hle "[fiber],[libmixer]".
+if(PSPOCKET_TSAN)
+    if(PSPOCKET_SANITIZE)
+        message(FATAL_ERROR "PSPOCKET_TSAN and PSPOCKET_SANITIZE cannot be combined")
+    endif()
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
 endif()
 
 # Every component directory owns its own CMakeLists.txt. Directories that don't exist yet are skipped,

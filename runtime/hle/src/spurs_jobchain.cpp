@@ -840,12 +840,26 @@ void JobChainPolicy::store_ready_count(const Grab& g)
 // SPU; a lock it holds stays taken (other SPUs leave when they see isHalted).
 void JobChainPolicy::fail(u32 code, u64 cause)
 {
+    // The first SPU to fail records the error and its cause, then halts the chain: a PPU that sees isHalted (a game's
+    // poll, cellSpursGetJobChainInfo, which reads isHalted and then the error) finds the error with it. Both are 0
+    // from cellSpursCreateJobChain on, so the error word decides who is first. Written after isHalted, as they were, a
+    // PPU in between saw the chain halted with no error (D-587).
     bool first = false;
-    reservation_op(base_, jc_, [&](u8* line) {
-        first = !ps_read8(line, jc_off::isHalted);
-        if (first) ps_write8(line, jc_off::isHalted, 1);
-        return first;
+    reservation_op(base_, jc_ + jc_off::error, [&](u8* line) { // the error and its cause share the chain's second line
+        constexpr u32 off = jc_off::error % PS_RES_LINE_SIZE;
+        first = ps_read32(line, off) == 0;
+        if (!first) return false;
+        ps_write32(line, off, code);
+        ps_write32(line, off + 4, 0);
+        ps_write64(line, (jc_off::cause % PS_RES_LINE_SIZE), cause);
+        return true;
     });
+    if (first) {
+        reservation_op(base_, jc_, [&](u8* line) {
+            ps_write8(line, jc_off::isHalted, 1);
+            return true;
+        });
+    }
     const bool halt = (ps_read8(base_, jc_ + jc_off::flags) & jc_off::flagHaltOnError) != 0;
     if (first) {
         if (!halt) {
@@ -862,9 +876,6 @@ void JobChainPolicy::fail(u32 code, u64 cause)
                 return true;
             });
         }
-        ps_write32(base_, jc_ + jc_off::error, code);
-        ps_write32(base_, jc_ + jc_off::error + 4, 0);
-        ps_write64(base_, jc_ + jc_off::cause, cause);
     }
     PS_LOG_ERROR(kJobChan, "SPURS {:#x} SPU {}, job chain {:#x} (workload {}): CELL_SPURS_JOB_ERROR_{} ({:#x}), cause {:#x}; "
         "the chain halts{}", w_.sched.spurs, w_.spu_num, jc_, wid_, job_error_name(code), code, cause,

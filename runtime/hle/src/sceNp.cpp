@@ -36,9 +36,12 @@
 #include "prx.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
+#include "pspocket/hle/npdrm.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/npd.hpp"
+#include "pspocket/recomp/npdrm.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 #include "sysutil.hpp"
 
@@ -1528,26 +1531,36 @@ GuestFile read_guest_file(PPUContext& ctx, std::string_view vpath, u64 limit)
     return out;
 }
 
-// RPCS3 rpcs3::utils::get_rap_file_path's content ID check: 1 to 0x30 characters of A-Z, a-z, 0-9, '-' and '_'.
-bool valid_content_id(std::string_view id)
+// The game's licence keys (D-581): where sceNpDrmIsAvailable installs the key of the content it found usable.
+void drm_install_key(const recomp::Key128& key)
 {
-    return !id.empty() && id.size() <= kNpdContentIdSize && std::all_of(id.begin(), id.end(), [](char c) {
-        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
-    });
+    if (NpdrmKeyRing* ring = npdrm_key_ring()) ring->install(key);
+}
+
+// The name of the file at a guest path (RPCS3 extract_file_name: after the last '/' or '\'), for an EDAT's title hash.
+std::string_view drm_file_name(std::string_view path)
+{
+    const usize slash = path.find_last_of("/\\");
+    return slash == std::string_view::npos ? path : path.substr(slash + 1);
 }
 
 // RPCS3 npDrmIsAvailable, from the file's first bytes on: whether the content at `path` can be used with the
-// klicensee given. A file that is neither a SELF ("SCE\0") nor an EDAT/SDAT ("NPD\0") is taken as unencrypted (disc
-// files): available. Where pspocket differs:
-// - RPCS3 then installs the content's key, which lets lv2 decrypt it when the game opens it. pspocket's file system
-//   reads no encrypted EDAT or SDAT and the loader no PSN executable (D-121), so content that would need a key is
-//   reported as RPCS3 reports content it can't verify: SCE_NP_DRM_ERROR_NO_ENTITLEMENT, with an error log.
-// - An EDAT's NPD hashes (its title hash, and for klicensee content the dev hash) are not checked: they need NP keys
-//   the build doesn't carry. A damaged or renamed EDAT RPCS3 refuses with NO_ENTITLEMENT gets the licence's answer.
-// - A SELF is checked by decrypting it with the build's SELF keys (recomp::decrypt_self, as the loader does), where
-//   RPCS3 opens its metadata with its key vault: a disc executable is available, a PSN one is not (above).
+// klicensee given (none: zeros, or for a SELF NP_KLIC_FREE, as RPCS3), and if so the key that opens it goes to the
+// game's licence keys, where lv2's file system finds it when the game opens the content (D-581). A file that is
+// neither a SELF ("SCE\0") nor an EDAT/SDAT ("NPD\0") is taken as unencrypted (disc files): available.
+// - A SELF is available when it decrypts (recomp::decrypt_self, as the loader does, where RPCS3 opens its metadata
+//   with its key vault); a PSN executable with the klicensee or the player's RAP (D-582). Its klicensee is installed.
+// - An SDAT is refused as RPCS3's EDAT check refuses it (NO_ENTITLEMENT). An EDAT must pass RPCS3's header checks
+//   (VerifyEDATHeaderWithKLicense: the title hash over its content ID and the name in the path, and for free content
+//   the dev hash keyed with the klicensee; recomp::npd_hashes_valid), else NO_ENTITLEMENT. Free content (licence 3)
+//   then installs the klicensee; any other needs the player's licence, /dev_hdd0/home/00000001/exdata/<content
+//   ID>.rap (LICENSE_NOT_FOUND without it or with an invalid content ID, BAD_FORMAT when it is under 16 bytes), and
+//   installs its RIF key (RPCS3 GetEdatRifKeyFromRapFile).
+// - A build without the NPDRM keys cannot check an EDAT's hashes or make its key: the licence is still looked for (and
+//   its absence answered as above), and content that would need the keys is NO_ENTITLEMENT, logged.
 // - RPCS3 searches every user's exdata for a RAP licence; pspocket has the one user, 00000001.
-s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile& head)
+s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile& head,
+    const std::optional<recomp::Key128>& klicensee)
 {
     const std::vector<u8>& b = head.bytes;
     // The first four bytes are `magic` and its terminator ("SCE\0", "NPD\0").
@@ -1556,6 +1569,7 @@ s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile&
         PS_LOG_WARN(kChan, "sceNpDrmIsAvailable(\"{}\"): reading failed after {} bytes ({}); checked as read", path,
             b.size(), lv2::error_name(head.result));
     }
+    const recomp::NpdrmKeys& keys = recomp::builtin_npdrm_keys();
     if (magic_is("SCE")) {
         constexpr u64 kSelfMax = 256ull << 20; // far above any PS3 executable; a bigger file isn't read whole
         const GuestFile whole = read_guest_file(ctx, path, kSelfMax + 1);
@@ -1564,13 +1578,20 @@ s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile&
                 path, lv2::error_name(whole.result), whole.bytes.size());
             return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
         }
-        const recomp::Result<std::vector<u8>> elf = recomp::decrypt_self(whole.bytes, recomp::builtin_self_keys());
+        // RPCS3 verify_npdrm_self_headers: a PSN executable's licence is the game's klicensee (else the default one)
+        // or the player's RAP for its content ID (D-582).
+        const recomp::Key128 klic = klicensee.value_or(keys.klic_free);
+        const recomp::NpdrmLicence licence = process_licence(thread_of(ctx).kernel, klic);
+        const recomp::Result<std::vector<u8>> elf =
+            recomp::decrypt_self(whole.bytes, recomp::builtin_self_keys(), &licence);
         if (!elf) {
             PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that doesn't open ({}): no entitlement", path,
                 elf.error().message);
             return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
         }
-        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that opens with the build's keys: available", path);
+        // RPCS3 installs the klicensee it checked with.
+        drm_install_key(klic);
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): a SELF that opens: available", path);
         return lv2::CELL_OK;
     }
     if (!magic_is("NPD")) {
@@ -1589,18 +1610,34 @@ s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile&
             path, content_id);
         return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
     }
-    if (license == kNpdLicenseFree) {
-        PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}) opened by the klicensee, which pspocket can't "
-                            "verify or decrypt: no entitlement", path, content_id);
+    const recomp::Key128 klic = klicensee.value_or(recomp::Key128{});
+    if (!keys.present) {
+        PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}), and this build has no NPDRM keys to check its "
+                            "header", path, content_id);
+    } else if (!recomp::npd_hashes_valid(h, drm_file_name(path), klic, keys)) {
+        PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}, licence type {}) that fails RPCS3's header checks "
+                            "(its title hash for the name \"{}\"{}): no entitlement", path, content_id, license,
+            drm_file_name(path), (license & 3) == 3 ? ", or its dev hash for the klicensee" : "");
         return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
     }
+    if (license == kNpdLicenseFree) {
+        if (!keys.present) {
+            PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): a free EDAT ({}) pspocket can't verify: no entitlement",
+                path, content_id);
+            return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
+        }
+        drm_install_key(klic);
+        PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): a free EDAT ({}): available with the klicensee", path,
+            content_id);
+        return lv2::CELL_OK;
+    }
     // A licence is needed: the user's RAP file for the content (none for a content ID RPCS3 finds invalid).
-    if (!valid_content_id(content_id)) {
+    const std::string rap = recomp::rap_guest_path(content_id);
+    if (rap.empty()) {
         PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT (licence type {}) whose content ID \"{}\" isn't valid, "
                            "so no licence: licence not found", path, license, content_id);
         return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
     }
-    const std::string rap = "/dev_hdd0/home/00000001/exdata/" + content_id + ".rap";
     const GuestFile key = read_guest_file(ctx, rap, 16);
     if (!key.opened) {
         PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}, licence type {}) without its licence {}: licence "
@@ -1612,9 +1649,17 @@ s32 drm_check_content(PPUContext& ctx, const std::string& path, const GuestFile&
             key.bytes.size());
         return error(SCE_NP_DRM_ERROR_BAD_FORMAT);
     }
-    PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}) with its licence {}, which pspocket can't decrypt: "
-                        "no entitlement", path, content_id, rap);
-    return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
+    if (!keys.present) {
+        PS_LOG_ERROR(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}) with its licence {}, and this build has no NPDRM "
+                            "keys to turn it into the content key: no entitlement", path, content_id, rap);
+        return error(SCE_NP_DRM_ERROR_NO_ENTITLEMENT);
+    }
+    recomp::Key128 rap_bytes{};
+    std::copy(key.bytes.begin(), key.bytes.begin() + 16, rap_bytes.begin());
+    drm_install_key(recomp::rap_to_rif(rap_bytes, keys));
+    PS_LOG_INFO(kChan, "sceNpDrmIsAvailable(\"{}\"): an EDAT ({}, licence type {}) with the player's licence {}: "
+                       "available", path, content_id, license, rap);
+    return lv2::CELL_OK;
 }
 
 // The path (at most `max` characters) of the C string at `addr`, which `name` reads; nullopt when it runs out of guest
@@ -1646,12 +1691,17 @@ s32 drm_is_available(PPUContext& ctx, std::string_view name, u32 k_licensee, u32
     const std::optional<std::string> path = drm_string(ctx, name, "path", drm_path, kDrmPathMax);
     if (!path) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
     PS_LOG_INFO(kChan, "{}(\"{}\", {}): checking", name, *path, k_licensee ? "with a klicensee" : "no klicensee");
+    std::optional<recomp::Key128> klicensee;
+    if (k_licensee) {
+        klicensee.emplace();
+        std::memcpy(klicensee->data(), t.kernel.base() + k_licensee, klicensee->size());
+    }
     const GuestFile head = read_guest_file(ctx, *path, kNpdHeaderSize + kEdatHeaderSize);
     if (!head.opened) {
         PS_LOG_INFO(kChan, "{}(\"{}\"): can't be opened: {}", name, *path, lv2::error_name(head.result));
         return head.result;
     }
-    return drm_check_content(ctx, *path, head);
+    return drm_check_content(ctx, *path, head, klicensee);
 }
 
 // RPCS3 sceNpDrmIsAvailable: the check, then the thread sleeps 5 ms.
@@ -1768,28 +1818,62 @@ s32 sceNpDrmGetTimelimit(PPUContext& ctx, u32 drm_path, u32 time_remain)
     return lv2::CELL_OK;
 }
 
-// RPCS3 sceNpDrmVerifyUpgradeLicense / ...2 (npDrmVerifyUpgradeLicense): whether the user has the unlock licence of a
-// trial game's full version, the EDAT /dev_hdd0/home/<user>/exdata/<content ID>.edat (content ID: at most 0x2F
-// characters). RPCS3 then decrypts it with the free klicensee and checks it holds "GOMA". pspocket can't decrypt it
-// (sceNpDrmIsAvailable's EDAT rule), so a licence that is there is reported as not verified (RPCS3's answer for one
-// that fails its checks), with an error log: the game stays a trial.
+// RPCS3 sceNpDrmVerifyUpgradeLicense / ...2 (npDrmVerifyUpgradeLicense, rpcs3::utils::verify_c00_unlock_edat):
+// whether the user has the unlock licence of a trial game's full version, the EDAT
+// /dev_hdd0/home/00000001/exdata/<content ID>.edat (content ID: at most 0x2F characters). It must pass the EDAT header
+// checks with the free klicensee (NP_KLIC_FREE) for its name, carry that content ID, decrypt (its content key from its
+// licence type, D-580: the free klicensee, or the player's RAP for it) and hold "GOMA" and the content ID at 0x10.
+// Every failure is LICENSE_NOT_FOUND, with a log (the game stays a trial); without the build's NPDRM keys a licence
+// that is there cannot be verified.
 s32 drm_verify_upgrade_license(PPUContext& ctx, std::string_view name, u32 content_id)
 {
     if (!content_id) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
     const std::optional<std::string> id = drm_string(ctx, name, "content ID", content_id, kUpgradeContentIdMax);
     if (!id) return error(SCE_NP_DRM_ERROR_INVALID_PARAM);
-    if (!valid_content_id(*id)) {
+    if (!recomp::valid_content_id(*id)) {
         PS_LOG_INFO(kChan, "{}(\"{}\"): not a valid content ID: licence not found", name, *id);
         return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
     }
-    const std::string edat = "/dev_hdd0/home/00000001/exdata/" + *id + ".edat";
-    if (!read_guest_file(ctx, edat, 0).opened) {
+    const std::string edat = std::string(recomp::kLicenceDir) + "/" + *id + ".edat";
+    constexpr u64 kUnlockMax = 1u << 20; // an unlock licence is a few hundred bytes
+    const GuestFile file = read_guest_file(ctx, edat, kUnlockMax);
+    if (!file.opened) {
         PS_LOG_INFO(kChan, "{}(\"{}\"): no unlock licence {}: licence not found", name, *id, edat);
         return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
     }
-    PS_LOG_ERROR(kChan, "{}(\"{}\"): the unlock licence {} is there, but pspocket can't decrypt it to verify it: licence "
-                        "not found", name, *id, edat);
-    return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
+    const auto not_verified = [&](std::string_view why) {
+        PS_LOG_ERROR(kChan, "{}(\"{}\"): the unlock licence {} {}: licence not found", name, *id, edat, why);
+        return error(SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND);
+    };
+    const recomp::NpdrmKeys& keys = recomp::builtin_npdrm_keys();
+    if (!keys.present) return not_verified("is there, but this build has no NPDRM keys to verify it");
+    const std::vector<u8>& b = file.bytes;
+    const std::optional<recomp::NpdHeader> header = recomp::parse_npd_header(b);
+    if (!header || (header->flags & recomp::kNpdSdatFlag) ||
+        !recomp::npd_hashes_valid(b, drm_file_name(edat), keys.klic_free, keys)) {
+        return not_verified("fails the EDAT header checks");
+    }
+    if (header->content_id != *id) return not_verified("names another content (" + header->content_id + ")");
+    lv2::PpuThread& t = thread_of(ctx);
+    const recomp::Result<recomp::Key128> key = recomp::npdrm_content_key(recomp::NpdrmContent::edat, header->license,
+        header->content_id, process_licence(t.kernel, keys.klic_free));
+    if (!key) return not_verified("has no key: " + key.error().message);
+    auto npd = recomp::NpdFile::open(
+        [&b](u64 offset, void* dst, usize n) {
+            if (offset > b.size() || n > b.size() - offset) return false;
+            std::memcpy(dst, b.data() + offset, n);
+            return true;
+        },
+        b.size(), recomp::builtin_npd_keys(), *key);
+    if (!npd) return not_verified("does not decrypt (" + npd.error().message + ")");
+    u8 plain[0x40]{};
+    if ((*npd)->size() < sizeof(plain) || !(*npd)->read(0, plain, sizeof(plain)))
+        return not_verified("is too short");
+    const std::string_view held(reinterpret_cast<const char*>(plain + 0x10), 0x30);
+    if (std::memcmp(plain, "GOMA", 4) != 0 || held.substr(0, held.find('\0')) != *id)
+        return not_verified("does not hold \"GOMA\" and its content ID");
+    PS_LOG_INFO(kChan, "{}(\"{}\"): the unlock licence {} is verified: the full game", name, *id, edat);
+    return lv2::CELL_OK;
 }
 
 s32 sceNpDrmVerifyUpgradeLicense(PPUContext& ctx, u32 content_id)

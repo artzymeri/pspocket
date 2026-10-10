@@ -112,10 +112,16 @@ struct Fixture {
     // A builder writing at FIFO offset `offset` of the command buffer.
     CommandBuilder at(u32 offset) { return CommandBuilder(mem.base(), kCmdEa + offset, offset); }
 
-    void set_put(u32 offset) { ps_write32(mem.base(), layout().put_addr(), offset); }
-    u32 get_register() const { return ps_read32(mem.base(), layout().get_addr()); }
-    u32 read32(u32 ea) const { return ps_read32(mem.base(), ea); }
-    void write32(u32 ea, u32 v) { ps_write32(mem.base(), ea, v); }
+    // The test stands in for the PPU, whose store after a sync (lwsync, then stw) is a release store and whose load
+    // before one an acquire load: a running RSX thread reads put and the labels the test writes, and the test polls the
+    // labels the RSX releases, ordered as the guest's are (D-585; the RSX's side is D-077 and D-587).
+    void set_put(u32 offset) { write32(layout().put_addr(), offset); }
+    u32 get_register() const { return read32(layout().get_addr()); }
+    u32 read32(u32 ea) const
+    {
+        return ps_bswap32(__atomic_load_n(reinterpret_cast<const u32*>(mem.base() + ea), __ATOMIC_ACQUIRE));
+    }
+    void write32(u32 ea, u32 v) { __atomic_store_n(reinterpret_cast<u32*>(mem.base() + ea), ps_bswap32(v), __ATOMIC_RELEASE); }
 
     // Sets put to the builder's current offset and runs the FIFO on this thread.
     Rsx::RunStatus submit(const CommandBuilder& b)

@@ -270,7 +270,7 @@ TEST_CASE("cellGcmSys: system mode 512 MB IO, flip and user handlers on the inte
         u32 cur = ps_read32(b, ctx + 0x8);
         write(cur);
         ps_write32(b, ctx + 0x8, cur);
-        ps_write32(b, control, cur - kIo); // put
+        store32_release(b, control, cur - kIo); // put, after a sync as the game's (D-585)
         rsx->notify();
         REQUIRE(rsx->wait_idle(2 * kSecond));
     };

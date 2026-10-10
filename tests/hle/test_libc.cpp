@@ -586,7 +586,8 @@ TEST_CASE("sys_libc: the C locale and Dinkumware's conversion internals", "[hle]
     REQUIRE(lc != 0);
     CHECK(cstr(b, ps_read32(b, lc + 44)) == ".");
     CHECK(cstr(b, ps_read32(b, lc)).empty());
-    CHECK(b[lc + 28] == 0x7F);
+    CHECK(b[lc + 28] == 0xFF); // CHAR_MAX of the PPU's unsigned char
+    CHECK(b[lc + 41] == 0xFF);
     // The class and case tables, entry 0 at the pointer, EOF before it.
     const u32 ct = static_cast<u32>(t.call("_Getpctype"));
     REQUIRE(ct != 0);

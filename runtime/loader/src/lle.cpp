@@ -17,6 +17,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/hle/hle.hpp"
+#include "pspocket/hle/npdrm.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/recomp/elf.hpp"
@@ -429,9 +430,14 @@ std::optional<std::string> LleModules::file_for(std::string_view library) const
     return it->second;
 }
 
+// A library forced to its module: by the caller (force), or one the host made without Sony's module to compare with
+// (D-563, Registry::firmware_first), which goes to the firmware's module when one is installed.
 bool LleModules::forced(std::string_view library) const
 {
-    return std::find(forced_.begin(), forced_.end(), library) != forced_.end();
+    if (std::find(forced_.begin(), forced_.end(), library) != forced_.end()) return true;
+    if (!hle::registry().is_firmware_first(library)) return false;
+    const auto file = file_for(library);
+    return file && !always_native(*file);
 }
 
 bool LleModules::chooses(std::string_view library) const
@@ -534,6 +540,9 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
 {
     const std::vector<LibraryNeeds> imports = with_host_imports(game_imports);
     const auto on_host = [](std::string_view library, u32 nid) { return hle::registry().find(library, nid) != nullptr; };
+    // A function the host made without Sony's module to compare it with (D-594) counts as one it lacks wherever the
+    // library's module can serve instead: adding one never changes what a system with the firmware gets.
+    const auto unverified = [](std::string_view library, u32 nid) { return hle::registry().is_unverified(library, nid); };
     // A file whose libraries something already linked to the host stays there (a library has one implementation).
     const auto host_bound = [&](std::string_view file) {
         const auto it = file_libraries_.find(file);
@@ -556,21 +565,26 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
             continue;
         }
         std::vector<u32> missing;
-        for (const u32 nid : need.functions)
+        bool unverified_import = false;
+        for (const u32 nid : need.functions) {
             if (!on_host(need.library, nid)) missing.push_back(nid);
+            else if (unverified(need.library, nid)) unverified_import = true;
+        }
         const bool variables_on_host = std::all_of(need.variables.begin(), need.variables.end(),
             [&](u32 nid) { return hle::registry().find_variable(need.library, nid) != nullptr; });
-        if (missing.empty() && variables_on_host) continue;
+        // An unverified function goes to the module as a missing one would; where none can serve, the host's does.
+        if (missing.empty() && variables_on_host && !(file && unverified_import)) continue;
         if (file && (chosen_.contains(*file) || can_join(*file))) roots.insert(*file);
         else if (!missing.empty()) lacking[need.library] = std::move(missing);
     }
     candidates.insert(roots.begin(), roots.end());
     // What each candidate needs, as RPCS3 links a module (PPUModule.cpp ppu_load_imports): a function from a candidate,
     // else the host, else a module that can join the candidates; one with none of these links to the host's
-    // unimplemented stub (logged when called) and is listed here, as is a syscall lv2 lacks. A variable comes from a
-    // candidate or a module that can join (the host exports none); one no module exports stays unlinked, as lv2 leaves
-    // it on a PS3 (libadec's DTS and WMA Pro cores are in no retail firmware, D-177), and is listed too. Only a module
-    // missing from the index is refused.
+    // unimplemented stub (logged when called) and is listed here, as is a syscall lv2 lacks. A variable likewise: from
+    // a candidate, else the host when it exports it (D-503, D-593: a codec core's operation table, say), else a module
+    // that can join; one nothing exports stays unlinked, as lv2 leaves it on a PS3 (libadec's DTS and WMA Pro cores are
+    // in no retail firmware, D-177), and is listed too. A forced library's module serves both rather than the host
+    // (D-563). Only a module missing from the index is refused.
     std::map<std::string, std::vector<std::string>, std::less<>> gaps;
     for (bool changed = true; changed;) {
         changed = false;
@@ -593,7 +607,10 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
                             gap.push_back(std::format("{}::{:#010x} (not exported by {})", library, nid, *dep));
                         continue;
                     }
-                    if (on_host(library, nid)) continue;
+                    // A forced library's module joins rather than the host serving it (D-563), and so does the module
+                    // of a function the host has unverified (D-594).
+                    const bool to_module = dep && can_join(*dep) && (forced(library) || unverified(library, nid));
+                    if (!to_module && on_host(library, nid)) continue;
                     if (dep && can_join(*dep)) {
                         joins.push_back(*dep);
                         continue;
@@ -605,11 +622,14 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
                                                                       : info->second.import_variables) {
                 const auto dep = file_for(library);
                 for (const u32 nid : nids) {
+                    const bool to_module = dep && can_join(*dep) && forced(library);
                     if (dep && candidates.contains(*dep)) {
                         const auto& exported = files_[*dep].export_variables;
                         const auto e = exported.find(library);
                         if (e == exported.end() || !e->second.contains(nid))
                             gap.push_back(std::format("variable {}::{:#010x} (not exported by {})", library, nid, *dep));
+                    } else if (!to_module && hle::registry().find_variable(library, nid)) {
+                        // the host's (load_file links it)
                     } else if (dep && can_join(*dep)) {
                         joins.push_back(*dep);
                     } else {
@@ -657,8 +677,10 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
     for (const LibraryNeeds& need : imports)
         if (const auto file = file_for(need.library); !file || !chosen_.contains(*file)) host_linked_.insert(need.library);
     for (const std::string& f : added)
-        for (const auto& entry : files_[f].import_functions)
-            if (const auto file = file_for(entry.first); !file || !chosen_.contains(*file)) host_linked_.insert(entry.first);
+        for (const auto* table : {&files_[f].import_functions, &files_[f].import_variables})
+            for (const auto& entry : *table)
+                if (const auto file = file_for(entry.first); !file || !chosen_.contains(*file))
+                    host_linked_.insert(entry.first);
     // Libraries of refused modules stay on the host: what is imported from them that the host lacks is listed too.
     for (const LibraryNeeds& need : imports) {
         const auto file = file_for(need.library);
@@ -887,9 +909,11 @@ u32 RuntimeModules::load_at(std::string_view path, u64 offset, u32* id)
         if (bytes.size() >= 4 && bytes[0] == 0x7F && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F') {
             elf = std::move(bytes);
         } else {
-            auto decrypted = recomp::decrypt_self(bytes, recomp::builtin_self_keys());
+            // A PSN game's NPDRM module opens with its licence (D-582): the newest licence key the game has shown, as
+            // RPCS3's sys_prx takes last_key(), or the player's RAP.
+            const recomp::NpdrmLicence licence = hle::module_licence(hle_.kernel());
+            auto decrypted = recomp::decrypt_self(bytes, recomp::builtin_self_keys(), &licence);
             if (!decrypted) {
-                // An NPDRM module needs the game's licence key (klicensee), which only a PSN game has.
                 PS_LOG_ERROR(kChan, "{}: cannot decrypt: {}", path, decrypted.error().message);
                 return kPrxErrorUnsupportedType;
             }

@@ -25,6 +25,7 @@
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
+#include "pspocket/hle/npdrm.hpp"
 #include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 #include "pspocket/lv2/kernel.hpp"
@@ -675,15 +676,17 @@ void attach_program(SPUContext& ctx, u8* base, const SpuImage& image)
 namespace pspocket::hle {
 
 // lv2's SPU thread groups (D-167): each thread's image gets its lifted program as SPURS's images do, and an SPU SELF
-// opened by sys_spu_image_open decrypts with the build's keys (as the loader's executables do, D-121).
+// opened by sys_spu_image_open decrypts with the build's keys (as the loader's executables do, D-121); a PSN game's
+// with its licence (D-582: the newest key the game has shown, as RPCS3's sys_spu takes last_key(), or the RAP).
 void install_spu_thread_hooks(lv2::Kernel& kernel)
 {
     u8* base = kernel.base();
     kernel.set_spu_program_identifier([base](SPUContext& ctx, u32 guest, u32 ls_start, u32 size, u32 entry) {
         spurs::attach_program(ctx, base, {spurs::ImageKind::Thread, guest, ls_start, size, entry});
     });
-    kernel.set_self_decrypter([](std::vector<u8>& bytes, std::string& error) {
-        auto elf = recomp::decrypt_self(bytes, recomp::builtin_self_keys());
+    kernel.set_self_decrypter([&kernel](std::vector<u8>& bytes, std::string& error) {
+        const recomp::NpdrmLicence licence = module_licence(kernel);
+        auto elf = recomp::decrypt_self(bytes, recomp::builtin_self_keys(), &licence);
         if (!elf) {
             error = elf.error().message;
             return false;

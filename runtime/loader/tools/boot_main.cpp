@@ -2,7 +2,7 @@
 // exits, a timeout passes or (with --stop-at-first) it reaches the first unimplemented syscall or firmware function.
 // This is the Phase 2 bring-up tool (plan section 10): the log names every gap the game hits, in order.
 //
-//   pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]
+//   pspocket-boot <EBOOT.elf|EBOOT.BIN> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]
 //                 [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]
 //                 [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]
 //                 [--frame-every N] [--dump-on-fault FILE] [--press BUTTON@START[+EVERY][:HOLD]]... [--audio]
@@ -11,6 +11,8 @@
 //   pspocket-boot --probe-disc IMAGE.iso
 //   pspocket-boot --hle-list
 //
+// The executable may be a SELF: a disc game's EBOOT.BIN decrypts with the build's keys, a PSN game's (D-582) with its
+// licence, NP_KLIC_FREE for free content or the player's <CONTENT_ID>.rap in --hdd0's home/00000001/exdata.
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
 // /app_home from PS3_GAME/USRDIR unless --app-home says otherwise).
 // --flash mounts DIR read-only as /dev_flash: the system files a game reads itself (GTA V's MultiStream loads its MP3
@@ -120,6 +122,8 @@
 #include "pspocket/loader/game_modules.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/recomp/hash.hpp"
+#include "pspocket/recomp/npdrm.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
 #if defined(PSPOCKET_HAVE_SESSION_TRANSLATOR)
 #include <sys/qos.h>
 
@@ -148,7 +152,7 @@ namespace {
 int usage()
 {
     std::fprintf(stderr,
-        "usage: pspocket-boot <EBOOT.elf> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]\n"
+        "usage: pspocket-boot <EBOOT.elf|EBOOT.BIN> [--bdvd DIR|IMAGE.iso] [--hdd0 DIR] [--flash DIR] [--app-home DIR]\n"
         "                     [--timeout SECONDS] [--report-every SECONDS] [--stop-at-first]\n"
         "                     [--log trace|debug|info|warn|error] [--imports] [--gpu null|metal] [--frames DIR]\n"
         "                     [--frame-every N] [--frame-from N] [--dump-on-fault FILE]\n"
@@ -995,8 +999,23 @@ int main(int argc, char** argv)
         return 66;
     }
     if (bytes.size() >= 4 && bytes[0] == 'S' && bytes[1] == 'C' && bytes[2] == 'E' && bytes[3] == 0) {
-        std::fprintf(stderr, "pspocket-boot: %s is a SELF; decrypt it to an ELF first (docs/phase0.md)\n", elf_path);
-        return 65;
+        // A SELF (a disc game's or a PSN game's EBOOT.BIN): decrypted here as RPCS3 boots it, a PSN executable with
+        // its licence (D-582): NP_KLIC_FREE for free content, else the player's RAP in --hdd0's
+        // home/00000001/exdata.
+        const recomp::NpdrmLicence licence = hdd0.empty()
+            ? recomp::NpdrmLicence{.klicensee = std::nullopt,
+                  .rap = [](std::string_view content_id) -> recomp::Result<recomp::Key128> {
+                      return recomp::make_error("no --hdd0 folder to look for its licence {}.rap in", content_id);
+                  },
+                  .keys = nullptr}
+            : recomp::hdd0_licence(hdd0);
+        auto elf = recomp::decrypt_self(bytes, recomp::builtin_self_keys(), &licence);
+        if (!elf) {
+            std::fprintf(stderr, "pspocket-boot: %s: %s\n", elf_path, elf.error().message.c_str());
+            return 65;
+        }
+        PS_LOG_INFO("boot", "{}: a SELF, decrypted ({} bytes of ELF)", elf_path, elf->size());
+        bytes = std::move(*elf);
     }
     const std::string exe_sha256 = recomp::to_hex(recomp::Sha256::hash(std::span<const u8>(bytes)));
     auto exe = loader::Executable::parse(std::move(bytes));

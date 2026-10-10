@@ -658,7 +658,33 @@ s32 signal(PPUContext& ctx, u32 q, u32 table, u32 count)
 namespace mx {
 constexpr u32 kOwnerType = 0x10, kCount = 0x14, kOwner = 0x18, kC = 0x20, kSdk = 0x28, kFlags = 0x2C, kTypes = 0x30,
               kMaxWaiters = 0x32, kName = 0x34;
+
+// The owner's fields: libsync2 reads them while their owner changes them (a locker checks whether it is the recursive
+// owner, an unlock whether it is the owner), the PPU's plain loads and stores of aligned words. Relaxed atomics here,
+// the same instructions, so the host's accesses are defined too (D-587).
+template <class T>
+T load(u8* base, u32 addr)
+{
+    const T v = __atomic_load_n(reinterpret_cast<T*>(base + addr), __ATOMIC_RELAXED);
+    if constexpr (sizeof(T) == 2) return ps_bswap16(v);
+    else if constexpr (sizeof(T) == 4) return ps_bswap32(v);
+    else return ps_bswap64(v);
 }
+template <class T>
+void store(u8* base, u32 addr, T v)
+{
+    if constexpr (sizeof(T) == 2) v = ps_bswap16(v);
+    else if constexpr (sizeof(T) == 4) v = ps_bswap32(v);
+    else v = ps_bswap64(v);
+    __atomic_store_n(reinterpret_cast<T*>(base + addr), v, __ATOMIC_RELAXED);
+}
+u16 owner_type(u8* base, u32 m) { return load<u16>(base, m + kOwnerType); }
+u32 count(u8* base, u32 m) { return load<u32>(base, m + kCount); }
+u64 owner(u8* base, u32 m) { return load<u64>(base, m + kOwner); }
+void set_owner_type(u8* base, u32 m, u16 v) { store<u16>(base, m + kOwnerType, v); }
+void set_count(u8* base, u32 m, u32 v) { store<u32>(base, m + kCount, v); }
+void set_owner(u8* base, u32 m, u64 v) { store<u64>(base, m + kOwner, v); }
+} // namespace mx
 
 // Spinning before a waiter sleeps (libsync2's priority hints): a yield here.
 void spin_pause() { std::this_thread::yield(); }
@@ -680,9 +706,9 @@ s32 mutex_lock(PPUContext& ctx, u32 m, bool wait, const Caller& c, u32 count)
             v |= kBit63;
         } else {
             const u64 self = caller_self(ctx, c);
-            if (ps_read16(base, m + mx::kOwnerType) == c.type && ps_read64(base, m + mx::kOwner) == self) {
+            if (mx::owner_type(base, m) == c.type && mx::owner(base, m) == self) {
                 if (!(ps_read32(base, m + mx::kFlags) & 1)) return error(CELL_SYNC2_ERROR_DEADLK);
-                const u32 n = ps_read32(base, m + mx::kCount);
+                const u32 n = mx::count(base, m);
                 if (n == 0xFFFFFFFF) return error(CELL_SYNC2_ERROR_AGAIN);
                 count = n + 1;
             } else {
@@ -714,10 +740,10 @@ s32 mutex_lock(PPUContext& ctx, u32 m, bool wait, const Caller& c, u32 count)
             } while (!r.stdcx(base, v));
         }
         if (have_receiver && free_receiver(ctx, c, receiver) != lv2::CELL_OK) sync2_assert("mutex.cpp", 448, "lock");
-        ps_write16(base, m + mx::kOwnerType, c.type);
+        mx::set_owner_type(base, m, c.type);
         const u64 self = caller_self(ctx, c);
-        ps_write32(base, m + mx::kCount, count);
-        ps_write64(base, m + mx::kOwner, self);
+        mx::set_count(base, m, count);
+        mx::set_owner(base, m, self);
         stored(m + mx::kOwnerType, 0x10);
         lwsync();
         return lv2::CELL_OK;
@@ -731,21 +757,21 @@ s32 mutex_unlock(PPUContext& ctx, u32 m, const Caller& c, u32 table, u32 count, 
     u8* base = guest_base(ctx);
     if (static_cast<s64>(ps_read64(base, m + mx::kC)) >= 0) return error(CELL_SYNC2_ERROR_STAT);
     const u64 self = caller_self(ctx, c);
-    if (ps_read16(base, m + mx::kOwnerType) != c.type || ps_read64(base, m + mx::kOwner) != self)
+    if (mx::owner_type(base, m) != c.type || mx::owner(base, m) != self)
         return error(CELL_SYNC2_ERROR_PERM);
     if (!saved) {
         if (ps_read32(base, m + mx::kFlags) & 1) {
-            const u32 n = ps_read32(base, m + mx::kCount) - 1;
-            ps_write32(base, m + mx::kCount, n);
+            const u32 n = mx::count(base, m) - 1;
+            mx::set_count(base, m, n);
             stored(m + mx::kCount, 4);
             if (n) return lv2::CELL_OK;
         }
     } else {
-        *saved = ps_read32(base, m + mx::kCount);
+        *saved = mx::count(base, m);
     }
-    ps_write32(base, m + mx::kCount, 0);
-    ps_write16(base, m + mx::kOwnerType, 0);
-    ps_write64(base, m + mx::kOwner, 0);
+    mx::set_count(base, m, 0);
+    mx::set_owner_type(base, m, 0);
+    mx::set_owner(base, m, 0);
     stored(m + mx::kOwnerType, 0x10);
     lwsync();
     Reserve r;
@@ -1041,7 +1067,7 @@ s32 cellSync2CondWait(PPUContext& ctx, u32 cond, u32 cfg)
     if (!object_ok(ctx, m)) return not_guest(ctx, fn, "mutex", m);
     if (static_cast<s64>(ps_read64(base, m + mx::kC)) >= 0) return error(CELL_SYNC2_ERROR_STAT);
     const u64 self = caller_self(ctx, c);
-    if (ps_read16(base, m + mx::kOwnerType) != c.type || ps_read64(base, m + mx::kOwner) != self)
+    if (mx::owner_type(base, m) != c.type || mx::owner(base, m) != self)
         return error(CELL_SYNC2_ERROR_PERM);
     u64 receiver = 0;
     if (const s32 e = allocate_receiver(ctx, c, kForCond, cond, receiver); e != lv2::CELL_OK) return e;

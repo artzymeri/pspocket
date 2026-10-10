@@ -81,10 +81,39 @@ void builtin_source_fini(PPUContext& ctx, u32 s);
 // cancel, two more words; INVALID_ARG unless all are there), or libsail's own back for NULL.
 s32 builtin_source_set_file_calls(PPUContext& ctx, u32 s, u32 calls);
 
+// libsail's lv2 mutex and condition pair at `at` (priority, not recursive), its lwmutexes (priority, not recursive).
+s32 make_pair(PPUContext& ctx, u32 at, const char* name);
+void destroy_pair(PPUContext& ctx, u32 at);
+s32 make_lwmutex(PPUContext& ctx, u32 at, const char* name);
+s32 destroy_lwmutex(PPUContext& ctx, u32 at);
+
+// A pspocket module's function by name (as libsail imports it): its answer; the registers past the call kept.
+u64 module_call(PPUContext& ctx, std::string_view module, std::string_view name, std::initializer_list<u64> args);
+
+// The elementary stream `index` of `kind` (0 audio, 1 video, 2 user) chosen in an open descriptor (cellSailDescriptor.cpp):
+// through `es` (for PAMF, a reader set to the stream) or, without, the descriptor's reader set to the kind's `index`-th
+// stream. 1 when the stream's format changed, 0 when not, or the error.
+s32 select_es(PPUContext& ctx, u32 d, s32 kind, u32 index, u32 es);
+
+// The per-stream pipelines (cellSailPipelines.cpp): the audio one at an audio slot's +0x80, the video one at a video
+// slot's +0x80; the renderers' and AU receivers' makeup and cleanup through their callbacks.
+s32 audio_pipeline_init(PPUContext& ctx, u32 a, u32 p);
+void audio_pipeline_stop(PPUContext& ctx, u32 a);
+void audio_pipeline_fini(PPUContext& ctx, u32 a);
+s32 video_pipeline_init(PPUContext& ctx, u32 v, u32 p);
+void video_pipeline_stop(PPUContext& ctx, u32 v);
+void video_pipeline_fini(PPUContext& ctx, u32 v);
+s32 renderer_makeup(PPUContext& ctx, u32 r);
+s32 renderer_cleanup(PPUContext& ctx, u32 r);
+s32 receiver_makeup(PPUContext& ctx, u32 t, u32 p, u32 clock, u32 index);
+s32 receiver_cleanup(PPUContext& ctx, u32 t);
+
 // Posts {code, 0, object, arg} at the queue's tail (libsail's post): the unlock's answer, or the lock's error.
 s32 post(PPUContext& ctx, u32 player, u32 code, u32 object, u32 arg);
 // Posts {code, a, b, c} at the queue's head (libsail's urgent post).
 s32 post_urgent(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c);
+// Posts {code, a, b, c} at the queue's tail.
+s32 post_message(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c);
 // Posts a call's completion {0, result, handle} (nothing when the handle is 0).
 s32 post_completion(PPUContext& ctx, u32 player, s32 result, u64 handle);
 

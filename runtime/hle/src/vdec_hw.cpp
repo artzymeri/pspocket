@@ -18,6 +18,8 @@ extern "C" {
 namespace pspocket::hle::vdec_hw {
 namespace {
 
+// The VideoToolbox path's helpers: Apple's builds only (FFmpeg on Linux has no hwaccel, D-576).
+#if defined(__APPLE__)
 constexpr std::string_view kChan = "cellVdec";
 
 // FFmpeg offers the hardware format first when the hwaccel can take the stream; otherwise the software one.
@@ -36,6 +38,7 @@ bool software_only()
     const char* env = std::getenv("PSPOCKET_VDEC_SOFTWARE");
     return env && env[0] && env[0] != '0';
 }
+#endif
 
 } // namespace
 

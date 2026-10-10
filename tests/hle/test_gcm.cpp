@@ -212,24 +212,24 @@ TEST_CASE("cellGcmSys end to end: commands written through the context run on th
     ps_write32(b, ctx + 0x8, cur);
     g.call("_cellGcmSetFlipCommand", ctx, 0);
     CHECK(ps_read32(b, ctx + 0x8) == cur + 8);
-    ps_write32(b, control, ps_read32(b, ctx + 0x8) - kIo); // put = IO offset of current
+    store32_release(b, control, ps_read32(b, ctx + 0x8) - kIo); // put = IO offset of current, after a sync (D-585)
     rsx->notify();
 
     REQUIRE(rsx->wait_idle(2 * kSecond));
-    CHECK(ps_read32(b, control + 8) == 0x1234);                  // ref
-    CHECK(ps_read32(b, label0 + 0x20) == 0xCAFE);                // label 2
-    CHECK(ps_read32(b, control + 4) == ps_read32(b, control));   // get caught up with put
+    CHECK(load32_acquire(b, control + 8) == 0x1234);             // ref
+    CHECK(load32_acquire(b, label0 + 0x20) == 0xCAFE);           // label 2
+    CHECK(load32_acquire(b, control + 4) == ps_read32(b, control)); // get caught up with put
     CHECK(rsx->flip_count() == 1);
     CHECK(flipped == 0);
 
     // A flip that waits for a label: the RSX blocks until the game (here, the test) writes it.
-    ps_write32(b, label0 + 0x40, 0);
+    store32_release(b, label0 + 0x40, 0);
     g.call("_cellGcmSetFlipCommandWithWaitLabel", ctx, 0, 4, 7);
-    ps_write32(b, control, ps_read32(b, ctx + 0x8) - kIo);
+    store32_release(b, control, ps_read32(b, ctx + 0x8) - kIo);
     rsx->notify();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK(rsx->flip_count() == 1);
-    ps_write32(b, label0 + 0x40, 7);
+    store32_release(b, label0 + 0x40, 7);
     rsx->notify();
     REQUIRE(rsx->wait_idle(2 * kSecond));
     CHECK(rsx->flip_count() == 2);
@@ -301,7 +301,7 @@ TEST_CASE("cellGcmSys: the interrupt thread counts vblanks and calls the game's 
         // RsxDriverInfo head 1 counts the vblanks (driver info = DMA control + 1 MB; head[1] at 0x10B8 + 0x40).
         const u32 control = static_cast<u32>(g.call("cellGcmGetControlRegister"));
         const u32 info = control - 0x40 + 0x100000;
-        CHECK(ps_read64(b, info + 0x10B8 + 0x40 + 0x30) >= calls);
+        CHECK(load64_acquire(b, info + 0x10B8 + 0x40 + 0x30) >= calls); // the vblank thread still counts
     }
     ps_ppu_set_miss_policy(policy);
 }

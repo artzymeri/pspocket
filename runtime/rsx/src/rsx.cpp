@@ -208,22 +208,35 @@ void Rsx::set_fifo_pointers(u32 get, u32 put)
         PS_LOG_INFO(kChan, "FIFO set to unmapped IO offset {:#x}: the push buffer is in local memory", get);
     }
 
-    // Both registers are written at once, as RPCS3 does (RSXThread.cpp, new_get_put). The reset is flagged first and
-    // put published after it with release: a reader that sees the new put sees the flag, and stops before it reads a
-    // word at the old get against the new put (D-123: up to a batch of stale words past the old put otherwise).
+    // Both registers at once, as RPCS3 does (RSXThread.cpp new_get_put, sys_rsx.cpp set_rsx_dmactl). A running RSX
+    // thread takes them between two words and writes the control registers itself before it reads put again, so it
+    // sees neither the new put with the old get (D-123) nor the new get with the old put: put written here, after the
+    // flag, could reach it after it had taken the new get, and it ran from there to the old put through whatever lay
+    // between (test_gcm_sys under ThreadSanitizer: off the end of the IO map, D-587). Without a thread to take them,
+    // or from a method on the RSX's own thread, they are written here, after the flag, and the parser resets at the
+    // next step.
     PS_LOG_INFO(kChan, "FIFO set: get {:#x}, put {:#x} (it was at get {:#x}, put {:#x})", get, put,
         get_.load(std::memory_order_relaxed), read_put());
-    pending_get_put_.store((u64{put} << 32) | get, std::memory_order_release);
+    const u64 get_put = (u64{put} << 32) | get;
+    const bool to_thread = thread_.joinable() && std::this_thread::get_id() != thread_.get_id();
+    pending_get_put_.store(get_put, std::memory_order_relaxed);
+    reset_writes_registers_.store(to_thread, std::memory_order_relaxed);
     fifo_reset_.store(true, std::memory_order_release);
-    ps_write32(mem_.base(), config_.layout.get_addr(), get);
-    __atomic_store_n(reinterpret_cast<u32*>(mem_.base() + config_.layout.put_addr()), ps_bswap32(put), __ATOMIC_RELEASE);
-    if (thread_.joinable() && std::this_thread::get_id() != thread_.get_id()) {
-        notify();
-        // The caller (an lv2 syscall) returns once the RSX has taken the new pointers.
-        while (fifo_reset_.load(std::memory_order_acquire) && !stop_requested_.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::microseconds(20));
-        }
+    if (!to_thread) {
+        write_get_put(get_put);
+        return;
     }
+    notify();
+    // The caller (an lv2 syscall) returns once the RSX has taken the new pointers.
+    while (fifo_reset_.load(std::memory_order_acquire) && !stop_requested_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
+void Rsx::write_get_put(u64 get_put)
+{
+    write32_release(config_.layout.get_addr(), static_cast<u32>(get_put));
+    write32_release(config_.layout.put_addr(), static_cast<u32>(get_put >> 32));
 }
 
 void Rsx::set_display_buffer(u32 id, const DisplayBuffer& buffer)
@@ -303,7 +316,7 @@ u32 Rsx::read_put() const
     return ps_bswap32(raw) & ~3u;
 }
 
-void Rsx::publish_get() { ps_write32(mem_.base(), config_.layout.get_addr(), get_.load(std::memory_order_relaxed)); }
+void Rsx::publish_get() { write32_release(config_.layout.get_addr(), get_.load(std::memory_order_relaxed)); }
 
 Rsx::Status Rsx::status() const
 {
@@ -324,14 +337,15 @@ Rsx::Status Rsx::status() const
         // The reason stays set after the guest patches the word, until the FIFO next runs dry: parked only while the
         // word at get is still the jump.
         const auto ea = fifo_address(s.get);
-        if (!ea || read32(*ea) != s.block_value) s.block = BlockReason::None;
+        if (!ea || read32_acquire(*ea) != s.block_value) s.block = BlockReason::None;
     }
     if (s.block == BlockReason::Semaphore) {
-        // The FIFO thread writes these registers only while it runs commands, not while it waits on the acquire.
-        s.semaphore_offset = __atomic_load_n(&state_.regs[m::NV406E_SEMAPHORE_OFFSET], __ATOMIC_RELAXED);
-        s.semaphore_context = __atomic_load_n(&state_.regs[m::NV406E_SET_CONTEXT_DMA_SEMAPHORE], __ATOMIC_RELAXED);
+        // As the acquire found them when it blocked: the registers are the FIFO thread's, which may be running
+        // commands again by now (D-587).
+        s.semaphore_offset = block_semaphore_offset_.load(std::memory_order_relaxed);
+        s.semaphore_context = block_semaphore_context_.load(std::memory_order_relaxed);
         s.semaphore_addr = translate(s.semaphore_offset, s.semaphore_context, 4);
-        if (s.semaphore_addr) s.semaphore_value = read32(*s.semaphore_addr);
+        if (s.semaphore_addr) s.semaphore_value = read32_acquire(*s.semaphore_addr); // the CPU writes it meanwhile
     }
     return s;
 }
@@ -476,7 +490,10 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
         for (const auto& [head, value] : requests) m_driver_flip(m::GCM_FLIP_HEAD + (head & 1), value);
     }
     if (fifo_reset_.load(std::memory_order_acquire)) {
-        const u64 gp = pending_get_put_.load(std::memory_order_acquire);
+        const u64 gp = pending_get_put_.load(std::memory_order_relaxed);
+        // From another thread (set_fifo_pointers): the control registers are this thread's to write, before put is
+        // read against the new get.
+        if (reset_writes_registers_.load(std::memory_order_relaxed)) write_get_put(gp);
         get_.store(static_cast<u32>(gp), std::memory_order_release);
         packet_remaining_ = 0;
         return_stack_.clear();
@@ -597,6 +614,8 @@ Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
         const bool replayed = replay_end_ != 0 && get_.load(std::memory_order_relaxed) < replay_end_;
         if (!replayed && !semaphore_acquire_satisfied(value)) {
             block_value_ = value;
+            block_semaphore_offset_.store(state_.regs[m::NV406E_SEMAPHORE_OFFSET], std::memory_order_relaxed);
+            block_semaphore_context_.store(state_.regs[m::NV406E_SET_CONTEXT_DMA_SEMAPHORE], std::memory_order_relaxed);
             block_reason_ = BlockReason::Semaphore;
             return Dispatch::Blocked;
         }
@@ -644,7 +663,9 @@ bool Rsx::semaphore_acquire_satisfied(u32 value)
     const u32 offset = state_.regs[m::NV406E_SEMAPHORE_OFFSET];
     const u32 dma = state_.regs[m::NV406E_SET_CONTEXT_DMA_SEMAPHORE];
     const auto ea = translate(offset, dma, 4);
-    if (!ea) {
+    // An unaligned offset (a desync's word) passes, as a bad one does: ARM's acquire load faults on an unaligned address
+    // (D-587). The release ignores one the same way (m_semaphore_release).
+    if (!ea || offset % 4) {
         fail(FailKind::FifoError, m::NV406E_SEMAPHORE_ACQUIRE,
             std::format("NV406E_SEMAPHORE_ACQUIRE: bad semaphore offset {:#x} (dma {:#x})", offset, dma));
         return true;

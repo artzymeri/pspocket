@@ -19,6 +19,7 @@
 #include <array>
 #include <bit>
 #include <initializer_list>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -45,6 +46,11 @@ struct Function {
     // cellGcmCallback in the GCM context). The loader links every internal function of each module the game imports,
     // before guest threads run; HLE code finds its descriptor with HleProcess::descriptor_of.
     bool internal = false;
+    // A function made from RPCS3 without Sony's module to compare it with, in a library whose other functions were
+    // compared (D-594; PS_HLE_UNVERIFIED). The loader treats an import of it as one of a function the host lacks:
+    // where the installed system software has the library's module, that module serves the whole library, as it did
+    // before the function was written here; with none, the host's serves it, this function included.
+    bool unverified = false;
 };
 
 // What a host module takes from the firmware's modules, as the firmware's own module of that library imports it
@@ -83,11 +89,24 @@ public:
     // Adds what `module` imports from firmware modules (their `module` field is set to `module`).
     void add_imports(std::string_view module, std::span<const HostImport> list);
     std::span<const HostImport> imports() const { return imports_; }
+    // Marks a library whose host implementation was made without Sony's module to compare it with (D-563): the
+    // loader gives a game the firmware's module for it when the installed system software has one (as it would for a
+    // library the host lacks), and the host's when there is none.
+    void firmware_first(std::string_view library) { firmware_first_.emplace(library); }
+    bool is_firmware_first(std::string_view library) const { return firmware_first_.contains(library); }
+    // The same for one function of a library (Function::unverified, D-594): whether the host has it, made without
+    // Sony's module to compare it with.
+    bool is_unverified(std::string_view module, u32 nid) const
+    {
+        const Function* f = find(module, nid);
+        return f && f->unverified;
+    }
 
 private:
     std::vector<Function> functions_;
     std::vector<Variable> variables_;
     std::vector<HostImport> imports_;
+    std::set<std::string, std::less<>> firmware_first_;
     std::unordered_map<std::string, usize> index_; // "module:NID" -> functions_ (or variables_ with a 'v' prefix)
 };
 
@@ -193,6 +212,9 @@ void thunk(PPUContext& ctx, u8* base)
 #define PS_HLE_FUNC(nid, fn) ::pspocket::hle::Function{{}, #fn, nid, &::pspocket::hle::detail::thunk<&fn>, false}
 // An internal function (Function::internal), with the NID its name hashes to.
 #define PS_HLE_INTERNAL(nid, fn) ::pspocket::hle::Function{{}, #fn, nid, &::pspocket::hle::detail::thunk<&fn>, true}
+// A function made from RPCS3 without Sony's module to compare it with (Function::unverified, D-594).
+#define PS_HLE_UNVERIFIED(nid, fn) \
+    ::pspocket::hle::Function{{}, #fn, nid, &::pspocket::hle::detail::thunk<&fn>, false, true}
 // Registry::add_variables(module, {PS_HLE_VAR(0x12345678, _Stdin, 4, 4, init_stdin), ...})
 #define PS_HLE_VAR(nid, name, size, align, init) ::pspocket::hle::Variable{{}, #name, nid, size, align, init}
 

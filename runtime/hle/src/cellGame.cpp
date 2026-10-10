@@ -39,6 +39,7 @@
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/hash.hpp"
 
@@ -659,28 +660,18 @@ namespace disc_param {
 constexpr u32 titleId = 0x0, parentalLevel = 0xC, kSize = 0x20;
 }
 
-// RPCS3's cellGame globals for funcStat (vm::gvar g_stat_get, g_stat_set, g_file_param, g_cb_result): one guest block
-// per process, in the main area, made at the first check.
-namespace check_vars {
-constexpr u32 stat_get = 0x0, stat_set = 0x1448, cb_result = 0x1450, file_param = 0x1460, kSize = 0x2000;
-}
-static_assert(check_vars::stat_set >= check_vars::stat_get + stat_get::kSize);
-static_assert(check_vars::file_param + sys_param::kSize <= check_vars::kSize);
-
+// RPCS3's cellGame globals for funcStat (vm::gvar g_stat_get, g_stat_set, g_file_param, g_cb_result): cellGame's
+// variables under its names (D-567), laid out in guest memory by the HLE process at the first check.
 struct CheckVars {
-    explicit CheckVars(HleProcess& p) : process(p) {}
-    HleProcess& process;
-    std::mutex mutex;
-    u32 block = 0;
+    u32 get = 0, set = 0, result = 0, file_param = 0; // 0 when the main area is full
+    bool ok() const { return get && set && result && file_param; }
 };
 
-// The block's guest address; 0 when the main area is full.
-u32 check_vars_block()
+CheckVars check_vars()
 {
-    CheckVars& v = HleProcess::current()->state<CheckVars>();
-    std::lock_guard lock(v.mutex);
-    if (!v.block) v.block = v.process.main_memory().alloc(check_vars::kSize, 0x100);
-    return v.block;
+    HleProcess* p = HleProcess::current();
+    const auto var = [&](std::string_view name) { return p->link_variable("cellGame", recomp::nid_of(name)); };
+    return {var("g_stat_get"), var("g_stat_set"), var("g_cb_result"), var("g_file_param")};
 }
 
 // A guest string up to its NUL, `max` bytes at most; nullopt when it runs into memory that is not guest memory first.
@@ -777,12 +768,12 @@ bool sfo_valid(const psf::Registry& sfo)
 
 // What both checks put in funcStat's structures before the call (RPCS3): get, set and the result cleared; then 40 GB
 // free less 256 KB (see kHddFreeSizeKB), the content and USRDIR paths, the size not calculated, the times 0.
-void begin_stat(u8* base, u32 block, const std::string& dir, const std::string& usrdir)
+void begin_stat(u8* base, const CheckVars& v, const std::string& dir, const std::string& usrdir)
 {
-    const u32 get = block + check_vars::stat_get;
+    const u32 get = v.get;
     std::memset(base + get, 0, stat_get::kSize);
-    std::memset(base + block + check_vars::stat_set, 0, kStatSetSize);
-    std::memset(base + block + check_vars::cb_result, 0, cb_result::kSize);
+    std::memset(base + v.set, 0, kStatSetSize);
+    std::memset(base + v.result, 0, cb_result::kSize);
     ps_write32(base, get + stat_get::hddFreeSizeKB, static_cast<u32>(kHddFreeSizeKB));
     put_string(base, get + stat_get::contentInfoPath, CELL_GAMEDATA_PATH_MAX, dir);
     put_string(base, get + stat_get::gameDataPath, CELL_GAMEDATA_PATH_MAX, usrdir);
@@ -907,14 +898,13 @@ s32 cellHddGameCheck(PPUContext& ctx, u32 version, u32 dir_name, u32 err_dialog,
             call, dir, psf::get_string(sfo, "CATEGORY"));
         return error(CELL_GAMEDATA_ERROR_BROKEN);
     }
-    const u32 block = check_vars_block();
-    if (!block) {
+    const CheckVars vars = check_vars();
+    if (!vars.ok()) {
         PS_LOG_ERROR(kChan, "{}: no main-area memory for funcStat's structures", call);
         return error(CELL_HDDGAME_ERROR_INTERNAL);
     }
-    const u32 get = block + check_vars::stat_get, set = block + check_vars::stat_set;
-    const u32 result = block + check_vars::cb_result, file_param = block + check_vars::file_param;
-    begin_stat(base, block, dir, usrdir);
+    const u32 get = vars.get, set = vars.set, result = vars.result, file_param = vars.file_param;
+    begin_stat(base, vars, dir, usrdir);
     std::memset(base + file_param, 0, sys_param::kSize);
     ps_write32(base, set, file_param);
     std::error_code ec;
@@ -988,14 +978,13 @@ s32 cellGameDataCheckCreate2(PPUContext& ctx, u32 version, u32 dir_name, u32 err
             dir, cat);
         return error(CELL_GAMEDATA_ERROR_BROKEN);
     }
-    const u32 block = check_vars_block();
-    if (!block) {
+    const CheckVars vars = check_vars();
+    if (!vars.ok()) {
         PS_LOG_ERROR(kChan, "{}: no main-area memory for funcStat's structures", call);
         return error(CELL_GAMEDATA_ERROR_INTERNAL);
     }
-    const u32 get = block + check_vars::stat_get, set = block + check_vars::stat_set;
-    const u32 result = block + check_vars::cb_result;
-    begin_stat(base, block, dir, usrdir);
+    const u32 get = vars.get, set = vars.set, result = vars.result;
+    begin_stat(base, vars, dir, usrdir);
     ps_write32(base, get + stat_get::isNewData, new_data ? CELL_GAMEDATA_ISNEWDATA_YES : CELL_GAMEDATA_ISNEWDATA_NO);
     const u32 param = get + stat_get::getParam;
     ps_write32(base, param + sys_param::attribute, CELL_GAMEDATA_ATTR_NORMAL);
@@ -1250,6 +1239,12 @@ s32 cellGameDataExitBroken(PPUContext&)
 
 void register_cellGame(Registry& r)
 {
+    // funcStat's structures, RPCS3's gvars (D-567).
+    const auto var = [](std::string_view name, u32 size, u32 align) {
+        return Variable{{}, name, recomp::nid_of(name), size, align, nullptr};
+    };
+    r.add_variables("cellGame", {var("g_stat_get", stat_get::kSize, 8), var("g_stat_set", kStatSetSize, 4),
+        var("g_cb_result", cb_result::kSize, 4), var("g_file_param", sys_param::kSize, 4)});
     r.add("cellGame", {
         PS_HLE_FUNC(0xF52639EA, cellGameBootCheck),
         PS_HLE_FUNC(0xDB9819F3, cellGameDataCheck),

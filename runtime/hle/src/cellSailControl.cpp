@@ -44,20 +44,6 @@ void dealloc(PPUContext& ctx, u32 p, u32 boundary, u32 ptr)
     call_guest(ctx, r32(ctx, p + pl::kFree), {r32(ctx, p + pl::kAllocArg), boundary, ptr});
 }
 
-u64 module_call(PPUContext& ctx, std::string_view module, std::string_view name, std::initializer_list<u64> args)
-{
-    const Function* f = registry().find(module, recomp::nid_of(name));
-    if (!f) PS_FATAL(kChan, "{}::{}, which libsail imports, is not pspocket's", module, name);
-    u64 saved[8];
-    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
-    u32 i = 3;
-    for (const u64 a : args) ctx.gpr[i++] = a;
-    f->fn(ctx, gb(ctx));
-    const u64 r = ctx.gpr[3];
-    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
-    return r;
-}
-
 // ------------------------------------------------------------------------------------------------- events
 
 // The game's handler(arg, event, a, b), the event (major << 32 | minor); the depth of the control thread's stack at
@@ -126,16 +112,17 @@ s32 command_answer(PPUContext& ctx, u32 p, u32 code, u32 arg)
 
 // The control thread's side: the answer stored, the waiting thread signalled (sys_cond_signal_to), the lock released.
 // A failed signal is an error and a fatal error, the lock kept (libsail's).
-void answer(PPUContext& ctx, u32 p, u32 record, s32 result)
+bool answer(PPUContext& ctx, u32 p, u32 record, s32 result)
 {
     w32(ctx, r32(ctx, record), static_cast<u32>(result));
     const s32 r = sc(ctx, 110, {r32(ctx, p + kCond), r64(ctx, record + 8)});
     if (r < 0) {
         notify_error(ctx, p, r);
         notify_error(ctx, p, error(CELL_SAIL_ERROR_FATAL));
-        return;
+        return false;
     }
     unlock(ctx, p);
+    return true;
 }
 
 // ------------------------------------------------------------------------------------------------- descriptors
@@ -281,8 +268,9 @@ s32 unload_module(PPUContext& ctx, u32 id)
 // A source (CellSailSource): +0 the player using it, +4 its argument, +8 its 14 callbacks, +0x70 the descriptors
 // open through it.
 namespace src {
-constexpr u32 kPlayer = 0, kArg = 4, kFuncs = 8, kUsers = 0x70;
-constexpr u32 kMakeup = 0, kCleanup = 1, kReadSync = 11;
+constexpr u32 kPlayer = 0, kArg = 4, kFuncs = 8, kWaiting = 0x44, kState = 0x48, kSession = 0x4C, kResult = 0x50,
+              kHandle = 0x58, kUsers = 0x70;
+constexpr u32 kMakeup = 0, kCleanup = 1, kOpen = 2, kClose = 3, kClear = 9, kReadSync = 11;
 } // namespace src
 
 u32 source_func(PPUContext& ctx, u32 source, u32 index) { return r32(ctx, source + src::kFuncs + 4 * index); }
@@ -395,16 +383,15 @@ s32 close_stream(PPUContext& ctx, u32 d)
     return lv2::CELL_OK;
 }
 
-// The elementary streams chosen when the descriptor opens, unless the game turned auto selection off.
+// The elementary streams chosen when the descriptor opens (each kind's first ones, in order), unless the game turned
+// auto selection off; what each answers is not looked at.
 void select_streams(PPUContext& ctx, u32 d)
 {
     if (r8(ctx, d + ds::kNoAuto)) return;
     const u32 p = r32(ctx, d + ds::kPlayer);
-    if (r32(ctx, p + pl::kAudioCount) || r32(ctx, p + pl::kVideoCount) || r32(ctx, p + pl::kUserCount)) {
-        log_call_site(ctx, gb(ctx), "cellSail: a descriptor opened for a player with streams: libsail's stream "
-            "selection is a later part");
-        PS_FATAL(kChan, "libsail's elementary stream selection is a later part of D-562");
-    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) select_es(ctx, d, 0, i, 0);
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) select_es(ctx, d, 1, i, 0);
+    for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) select_es(ctx, d, 2, i, 0);
 }
 
 // Close (libsail's): an open descriptor back to created, a held one (from the control thread only) back to added; the
@@ -441,10 +428,117 @@ s32 close_descriptor(PPUContext& ctx, u32 d, bool from_game)
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------------------------- play settings
+
+constexpr u32 kPausedNow = 0x1C9, kPauseShown = 0x166;
+
+u32 audio_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kAudio) + i * pl::kAudioStride; }
+u32 video_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kVideo) + i * pl::kVideoStride; }
+u32 user_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kUser) + i * pl::kUserStride; }
+
+// Message 0x44: paused (any nonzero) kept; unpausing also clears +0x166. A change tells every renderer (bit 3 of its
+// +0x34) and AU receiver (+0x48 of its callbacks' block). The answer is the paused state; `changed` for event 7.
+s32 set_paused(PPUContext& ctx, u32 p, u32 arg, bool& changed)
+{
+    const u8 paused = arg != 0 ? 1 : 0;
+    changed = paused != r8(ctx, p + kPausedNow);
+    w8(ctx, p + kPausedNow, paused);
+    if (!paused) w8(ctx, p + kPauseShown, 0);
+    s32 result = paused;
+    if (!changed) return result;
+    const auto flag = [&](u32 r) { w32(ctx, r + 0x34, (paused ? 8u : 0u) | (r32(ctx, r + 0x34) & ~8u)); };
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) flag(r32(ctx, audio_slot(ctx, p, i) + 0x150));
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) flag(r32(ctx, video_slot(ctx, p, i) + 0x180));
+    if (const u32 nu = r32(ctx, p + pl::kUserCount)) {
+        for (u32 i = 0; i < nu; i++) w8(ctx, r32(ctx, user_slot(ctx, p, i) + 0x80) + 0x48, paused);
+        result = r8(ctx, p + kPausedNow);
+    }
+    return result;
+}
+
+// Message 0x45 {mode, info}: modes 0-2, the 0x28 bytes of info kept when given (+0x1C8 says so).
+s32 set_repeat_mode(PPUContext& ctx, u32 p, u32 args)
+{
+    const u32 mode = r32(ctx, args), info = r32(ctx, args + 4);
+    if (mode >= 3) return error(CELL_SAIL_ERROR_INVALID_ARG);
+    if (info) {
+        w8(ctx, p + pl::kRepeatSet, 1);
+        std::memmove(gb(ctx) + p + pl::kRepeatInfo, gb(ctx) + info, 0x28);
+    } else {
+        w8(ctx, p + pl::kRepeatSet, 0);
+    }
+    w32(ctx, p + pl::kRepeatMode, mode);
+    return static_cast<s32>(mode);
+}
+
+// Messages 0x46 and 0x47 {index, muted}: bit 0 of the stream's renderer's +0x34.
+void set_muted(PPUContext& ctx, u32 renderer, u8 muted)
+{
+    w32(ctx, renderer + 0x34, (r32(ctx, renderer + 0x34) & ~1u) | muted);
+}
+
+// ------------------------------------------------------------------------------------------------- source sessions
+
+// Open (libsail's): the source told the stream (type, media info, URI and a profile: 2 items, the mux rate bound, the
+// duration, the size), opening (state 2) until it says the call completed.
+void source_open(PPUContext& ctx, u32 s, u32 d, u64 handle)
+{
+    w64(ctx, s + src::kHandle, handle);
+    w32(ctx, s + src::kSession, 0);
+    StackVar profile(ctx, gb(ctx), 0x20);
+    w32(ctx, profile.addr() + 4, 2);
+    w32(ctx, profile.addr() + 8, r32(ctx, d + ds::kMuxRate));
+    w64(ctx, profile.addr() + 16, r64(ctx, d + ds::kDuration));
+    w64(ctx, profile.addr() + 24, r64(ctx, d + ds::kStreamSize));
+    w32(ctx, s + src::kState, 2);
+    call_guest(ctx, source_func(ctx, s, src::kOpen), {r32(ctx, s + src::kArg),
+        static_cast<u64>(static_cast<s64>(static_cast<s32>(r32(ctx, d + ds::kType)))), r32(ctx, d + ds::kMediaInfo),
+        r32(ctx, d + ds::kUri), profile.addr()});
+}
+
+// Close (libsail's): closing (state 7) until the source says so.
+void source_close(PPUContext& ctx, u32 s, u64 handle)
+{
+    w64(ctx, s + src::kHandle, handle);
+    w32(ctx, s + src::kState, 7);
+    call_guest(ctx, source_func(ctx, s, src::kClose), {r32(ctx, s + src::kArg)});
+}
+
+// Message 0x29 {source, result}: a source's call completed (without a pending read): opening becomes open (3) or closed
+// (1), closing closed, starting (4) started (5) or back to open; open and stopping (6) sources keep the result (+0x50;
+// stopping with no reads out completes, open, and clears the source).
+void source_call_completed(PPUContext& ctx, u32 s, s32 r)
+{
+    const u32 st = r32(ctx, s + src::kState);
+    const u32 p = r32(ctx, s + src::kPlayer);
+    switch (st) {
+    case 2: w32(ctx, s + src::kState, r < 0 ? 1 : 3); break;
+    case 7: w32(ctx, s + src::kState, 1); break;
+    case 4: w32(ctx, s + src::kState, r < 0 ? 3 : 5); break;
+    case 3:
+    case 6:
+        if (st != 6 || r32(ctx, s + src::kWaiting)) {
+            w32(ctx, s + src::kResult, static_cast<u32>(r));
+            if (st == 6) w32(ctx, s + src::kState, 10);
+            return;
+        }
+        w32(ctx, s + src::kState, 3);
+        post_completion(ctx, p, r, r64(ctx, s + src::kHandle));
+        call_guest(ctx, source_func(ctx, s, src::kClear), {r32(ctx, s + src::kArg)});
+        return;
+    default: return;
+    }
+    post_completion(ctx, p, r, r64(ctx, s + src::kHandle));
+}
+
 // ------------------------------------------------------------------------------------------------- the dmux pipeline
 
+// The dmux pipeline (0x58 bytes at the player's +0x300): +0x10 1 when open (0xC at the player's end), +0x1C the module
+// loaded for it, +0x28 its elementary streams' list (+0x2C their count), +0x34 the player, +0x38 the source, +0x3C its
+// memory, +0x44 cellDmux's handle, +0x48 the stream's dmux type (12 bytes: 1 PAMF, 0x81 MP4, 0x82 AVI).
 namespace dmx {
-constexpr u32 kState = 0x10, kPlayer = 0x34, kOpen = 0x48, kSize = 0x58;
+constexpr u32 kState = 0x10, kModule = 0x1C, kEsList = 0x28, kEsCount = 0x2C, kEsMore = 0x30, kPlayer = 0x34,
+              kSource = 0x38, kMemory = 0x3C, kHandle = 0x44, kType = 0x48, kSize = 0x58;
 }
 
 void dmux_init(PPUContext& ctx, u32 d, u32 p)
@@ -454,13 +548,355 @@ void dmux_init(PPUContext& ctx, u32 d, u32 p)
     w32(ctx, d + dmx::kPlayer, p);
 }
 
+void later_part(PPUContext& ctx, std::string_view what)
+{
+    log_call_site(ctx, gb(ctx), std::format("cellSail: {}: not pspocket's yet", what));
+    PS_FATAL(kChan, "libsail's {} is a later part of D-562", what);
+}
+
+// cellDmux's messages to the pipeline (libsail's callback): demux done (0) for the stream's end, a fatal error (1) as
+// message 0xD2 {error, 3, 0}.
+u32 _pspocket_cellSail_dmuxNotify(PPUContext& ctx, u32, u32 msg, u32 d)
+{
+    const u32 type = r32(ctx, msg);
+    if (type == 0) later_part(ctx, "the dmux's end of a stream");
+    if (type == 1) post_message(ctx, r32(ctx, d + dmx::kPlayer), 0xD2, static_cast<u32>(r64(ctx, msg + 8)), 3, 0);
+    return 0;
+}
+
+// Open (libsail's): an open pipeline answers 1; PAMF loads cellDmuxPamf (module 0x2A), asks cellDmux for its memory,
+// takes it from the player's allocator and opens the demuxer on the player's SPURS with the player's dmux resource
+// (+0x358: memory, size, thread priority and stack, SPURS, SPU priorities, contention); the answer completes `handle`.
+void dmux_open(PPUContext& ctx, u32 dm, u32 type, u32 source, u64 handle)
+{
+    const u32 p = r32(ctx, dm + dmx::kPlayer);
+    s32 r = 1;
+    if (r32(ctx, dm + dmx::kState) != 1) {
+        const u32 kind = r32(ctx, type);
+        if (kind == 0x81 || kind == 0x82) later_part(ctx, "MP4 and AVI demuxing (the firmware libraries')");
+        r = error(CELL_SAIL_ERROR_UNSUPPORTED_STREAM);
+        if (kind == 1 && (r = load_module(ctx, 0x2A)) >= 0) {
+            w32(ctx, dm + dmx::kModule, 0x2A);
+            StackVar attr(ctx, gb(ctx), 16);
+            r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxQueryAttr", {type, attr.addr()}));
+            if (r >= 0) {
+                std::memmove(gb(ctx) + dm + dmx::kType, gb(ctx) + type, 12);
+                const u32 size = r32(ctx, attr.addr());
+                const u32 mem = alloc(ctx, p, 0x80, size);
+                r = error(CELL_SAIL_ERROR_MEMORY);
+                if (mem) {
+                    const u32 res = p + pl::kParams;
+                    StackVar cb(ctx, gb(ctx), 16);
+                    w32(ctx, cb.addr(), HleProcess::current()->link_function("cellSail",
+                        recomp::nid_of("_pspocket_cellSail_dmuxNotify"), "_pspocket_cellSail_dmuxNotify"));
+                    w32(ctx, cb.addr() + 4, dm);
+                    w32(ctx, res + 4, size);
+                    w32(ctx, res + 16, r32(ctx, p + pl::kSpurs));
+                    w32(ctx, res, mem);
+                    r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxOpenExt",
+                        {type, res, cb.addr(), dm + dmx::kHandle}));
+                    if (r >= 0) {
+                        r = 0;
+                        w32(ctx, dm + dmx::kMemory, mem);
+                        w32(ctx, dm + dmx::kState, kind);
+                        w32(ctx, dm + dmx::kSource, source);
+                        post_completion(ctx, p, r, handle);
+                        return;
+                    }
+                    dealloc(ctx, p, 0x80, mem);
+                }
+            }
+            if (const u32 m = r32(ctx, dm + dmx::kModule)) {
+                unload_module(ctx, m & 0xFFFF);
+                w32(ctx, dm + dmx::kModule, 0);
+            }
+        }
+    }
+    post_completion(ctx, p, r, handle);
+}
+
+// Close (libsail's): the elementary streams first (later parts), cellDmuxClose (again up to ten times 500 us apart while
+// busy), its memory and module released; the answer completes `handle` (none at the player's end).
+void dmux_close(PPUContext& ctx, u32 dm, u64 handle)
+{
+    const u32 p = r32(ctx, dm + dmx::kPlayer), kind = r32(ctx, dm + dmx::kType);
+    if (kind == 0x81 || kind == 0x82) later_part(ctx, "MP4 and AVI demuxing (the firmware libraries')");
+    if (r32(ctx, dm + dmx::kEsList)) later_part(ctx, "closing the dmux's elementary streams");
+    w32(ctx, dm + dmx::kEsList, 0);
+    s32 result = 0;
+    bool closed = true;
+    if (const u32 h = r32(ctx, dm + dmx::kHandle)) {
+        for (u32 tries = 10;;) {
+            const s32 r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxClose", {h}));
+            if (r >= 0) break;
+            if (static_cast<u32>(r) != 0x80610203) {
+                post_message(ctx, p, 0xD2, static_cast<u32>(r), 3, 0);
+                w32(ctx, dm + dmx::kState, 0xC);
+                result = r;
+                closed = false;
+                break;
+            }
+            sc(ctx, 141, {500});
+            if (--tries == 0) break;
+        }
+    }
+    if (closed) {
+        w32(ctx, dm + dmx::kHandle, 0);
+        w32(ctx, dm + dmx::kEsList, 0);
+        w32(ctx, dm + dmx::kEsCount, 0);
+        w32(ctx, dm + dmx::kEsMore, 0);
+        w32(ctx, dm + dmx::kState, 0);
+    }
+    if (const u32 mem = r32(ctx, dm + dmx::kMemory)) {
+        dealloc(ctx, p, 0x80, mem);
+        w32(ctx, dm + dmx::kMemory, 0);
+    }
+    if (const u32 m = r32(ctx, dm + dmx::kModule)) {
+        if (const s32 r = unload_module(ctx, m & 0xFFFF); r < 0) {
+            post_message(ctx, p, 0xD2, static_cast<u32>(r), 3, 0);
+            result = r;
+        }
+        w32(ctx, dm + dmx::kModule, 0);
+    }
+    post_completion(ctx, p, result, handle);
+}
+
 void dmux_fini(PPUContext& ctx, u32 d)
 {
-    if (r32(ctx, d + dmx::kOpen) == 1) {
-        log_call_site(ctx, gb(ctx), "cellSail: an open dmux at the player's end: not pspocket's yet (D-562)");
-        PS_FATAL(kChan, "libsail's dmux close at the end of play is a later part of D-562");
-    }
+    if (r32(ctx, d + dmx::kType) == 1) dmux_close(ctx, d, 0);
     w32(ctx, d + dmx::kState, 0xC);
+}
+
+// ------------------------------------------------------------------------------------------------- the AV clock
+
+// The clock (200 bytes at the player's +8): a stream opened resets what it measured.
+void clock_reset(PPUContext& ctx, u32 c)
+{
+    w16(ctx, c + 0x8E, 0);
+    w16(ctx, c + 0x88, 0);
+    w16(ctx, c + 0x8A, 0);
+    w32(ctx, c + 0xA0, 0xFFFFFFFF);
+    w64(ctx, c + 0x78, ~u64{0});
+    w32(ctx, c + 0xA4, 0);
+    w32(ctx, c + 0xA8, 0);
+    w32(ctx, c + 0x94, 0xFFFFFFFF);
+    w32(ctx, c + 0x98, 0xFFFFFFFF);
+    w32(ctx, c + 0x9C, 0xFFFFFFFF);
+    w64(ctx, c + 0x70, ~u64{0});
+    w16(ctx, c + 0x8C, 0);
+}
+
+// The clock running or not (+0x90), under its lwmutex; running needs a frame seen (+0x8E) and forgets the last time.
+u32 clock_run(PPUContext& ctx, u32 c, u32 run)
+{
+    lv2_lib(ctx, "sys_lwmutex_lock", {c + 0xB0, 0});
+    u32 now = r32(ctx, c + 0x90);
+    if ((now != 0 ? 1u : 0u) != run) {
+        now = 0;
+        bool set = true;
+        if (run) {
+            if (ps_read16(gb(ctx), c + 0x8E) == 0) set = false;
+            else {
+                now = 1;
+                w32(ctx, c + 0x94, 0xFFFFFFFF);
+                w64(ctx, c + 0x70, ~u64{0});
+            }
+        }
+        if (set) w32(ctx, c + 0x90, now);
+    }
+    lv2_lib(ctx, "sys_lwmutex_unlock", {c + 0xB0});
+    return now;
+}
+
+// ------------------------------------------------------------------------------------------------- streams
+
+// A step's handle: the message its completion becomes (code << 32) and its record. Records: +0 flags (0x20 in use, 1
+// failed), +4 the steps still out, +8 the handle of the step it belongs to.
+u64 step(u32 code, u32 record) { return u64{code} << 32 | record; }
+
+constexpr u32 kStreamPhase = 0x160, kRateShown = 0x162; // 1 opening, 2 open, 7 closing, 0 none
+constexpr u32 kCallRunning = 0x250;
+
+// The current descriptor's stream made ready for OpenStream (libsail's): one opened already (3) has its streams chosen
+// and is in use (5); one only added (2) is opened and its header read first (a later part); others complete at once.
+void stream_prepare(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle)
+{
+    std::memset(gb(ctx) + rec, 0, 0x20);
+    w64(ctx, rec + 8, handle);
+    w32(ctx, rec + 4, d);
+    w32(ctx, rec, r32(ctx, rec) | 0x20);
+    const u8 st = r8(ctx, d + ds::kState);
+    if (st >= 6) {
+        post_completion(ctx, p, error(CELL_SAIL_ERROR_FATAL), handle);
+        return;
+    }
+    if (st == 2) later_part(ctx, "OpenStream of a descriptor not opened (its header read through the source)");
+    if (st == 3) {
+        select_streams(ctx, d);
+        w8(ctx, d + ds::kState, 5);
+    }
+    post_completion(ctx, p, 0, handle);
+}
+
+// The +0x162 switch (libsail's): changing it is a later part's.
+void set_rate_shown(PPUContext& ctx, u32 p, u32 value)
+{
+    if (r8(ctx, p + kRateShown) == value) return;
+    later_part(ctx, "the stream's rate switch (+0x162)");
+}
+
+// The stream taken down (libsail's): its source closed (message 0x5F), its elementary streams (later parts) and the dmux
+// pipeline (0x60), the record counting them.
+void stream_close(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle)
+{
+    std::memset(gb(ctx) + rec, 0, 0x10);
+    w32(ctx, rec, r32(ctx, rec) | 0x20);
+    w64(ctx, rec + 8, handle);
+    w8(ctx, p + kStreamPhase, 7);
+    set_rate_shown(ctx, p, 0);
+    u32 steps = 0;
+    if (const u32 s = r32(ctx, d + ds::kSource)) {
+        const u32 type = r32(ctx, d + ds::kType);
+        if (type == 1 || type == 2) unsupported_container(ctx, d);
+        steps = 1;
+        source_close(ctx, s, step(0x5F, rec));
+    }
+    const auto any_open = [&](u32 table, u32 count, u32 stride) {
+        for (u32 i = 0; i < count; i++)
+            if (r8(ctx, r32(ctx, d + table) + i * stride) == 2) return true;
+        return false;
+    };
+    if (any_open(ds::kAudio, r32(ctx, p + pl::kAudioCount), ds::kAudioStride) ||
+        any_open(ds::kVideo, r32(ctx, p + pl::kVideoCount), ds::kVideoStride) ||
+        any_open(ds::kUser, r32(ctx, p + pl::kUserCount), ds::kUserStride))
+        later_part(ctx, "closing a stream's elementary streams");
+    dmux_close(ctx, p + pl::kDmux, step(0x60, rec));
+    w32(ctx, rec + 4, (steps + 1) & 0xFF);
+}
+
+// Message 0x4E: the descriptor ready, the stream opened: the source (0x4F), the dmux pipeline (0x50) and each chosen
+// elementary stream (later parts), the record counting them, the clock reset. A failure closes it all (0x5C).
+void stream_open_steps(PPUContext& ctx, u32 p, s32 result, u32 rec)
+{
+    const u32 d = r32(ctx, p + pl::kCurrentDescriptor);
+    if (result < 0) {
+        w32(ctx, rec, r32(ctx, rec) | 1);
+        notify_error(ctx, p, result);
+        w8(ctx, d + ds::kState, 2);
+        stream_close(ctx, p, d, rec + 0x10, step(0x5C, rec));
+        close_descriptor(ctx, d, false);
+        return;
+    }
+    w8(ctx, d + ds::kState, 5);
+    w8(ctx, p + kStreamPhase, 1);
+    const u32 type = r32(ctx, d + ds::kType);
+    if (type == 1 || type == 2) unsupported_container(ctx, d);
+    const u32 s = r32(ctx, d + ds::kSource);
+    source_open(ctx, s, d, step(0x4F, rec));
+    dmux_open(ctx, p + pl::kDmux, d + ds::kHeader, s, step(0x50, rec));
+    u32 steps = 2;
+    const auto chosen = [&](u32 table, u32 count, u32 stride) {
+        for (u32 i = 0; i < count; i++)
+            if (r8(ctx, r32(ctx, d + table) + i * stride) == 1) return true;
+        return false;
+    };
+    if (chosen(ds::kAudio, r32(ctx, p + pl::kAudioCount), ds::kAudioStride) ||
+        chosen(ds::kVideo, r32(ctx, p + pl::kVideoCount), ds::kVideoStride) ||
+        chosen(ds::kUser, r32(ctx, p + pl::kUserCount), ds::kUserStride))
+        later_part(ctx, "opening a stream's elementary streams");
+    w32(ctx, rec + 4, steps & 0xFF);
+    clock_reset(ctx, p + pl::kSync);
+}
+
+// Messages 0x4F-0x53: one opening step done. A failure marks the record; when none is out the stream is open (+0x160
+// 2): a failure closes it again (0x5C), else event 4 with the descriptor and the open completes.
+void stream_open_counted(PPUContext& ctx, u32 p, s32 result, u32 rec)
+{
+    if (result < 0) {
+        w32(ctx, rec, r32(ctx, rec) | 1);
+        notify_error(ctx, p, result);
+    }
+    const u32 left = r32(ctx, rec + 4) - 1;
+    w32(ctx, rec + 4, left);
+    if (left) return;
+    w8(ctx, p + kStreamPhase, 2);
+    const u32 d = r32(ctx, p + pl::kCurrentDescriptor);
+    if (r32(ctx, rec) & 1) {
+        stream_close(ctx, p, d, rec + 0x10, step(0x5C, rec));
+        return;
+    }
+    notify_event(ctx, p, 4, d, 0);
+    post_completion(ctx, p, 0, r64(ctx, rec + 8));
+}
+
+// Messages 0x5F-0x63: one closing step done (a failure an error event). When none is out the descriptor leaves the
+// player (in use: back to open; else created), the next becomes current, the play flags and the clock stop, event 5
+// with the descriptor, and the close completes.
+void stream_close_counted(PPUContext& ctx, u32 p, s32 result, u32 rec)
+{
+    if (result < 0) notify_error(ctx, p, result);
+    const u32 left = r32(ctx, rec + 4) - 1;
+    w32(ctx, rec + 4, left);
+    if (left) return;
+    w32(ctx, p + pl::kDescriptorCount, r32(ctx, p + pl::kDescriptorCount) - 1);
+    const u32 d = r32(ctx, p + pl::kCurrentDescriptor);
+    w8(ctx, d + ds::kState, r8(ctx, d + ds::kState) == 5 ? 1 : 0);
+    w32(ctx, p + pl::kCurrentDescriptor, r32(ctx, p + kNextDescriptor));
+    w32(ctx, p + kNextDescriptor, 0);
+    w8(ctx, p + 0x164, 0);
+    w8(ctx, p + 0x1CA, 0);
+    w8(ctx, p + 0x165, 0);
+    w8(ctx, p + 0x1CB, 0);
+    clock_run(ctx, p + pl::kSync, 0);
+    w8(ctx, p + kStreamPhase, 0);
+    notify_event(ctx, p, 5, d, 0);
+    post_completion(ctx, p, 0, r64(ctx, rec + 8));
+}
+
+// A call's completion event (libsail's), under the player's lock.
+void call_completed(PPUContext& ctx, u32 p, u32 call, s32 result)
+{
+    if (const s32 r = lock(ctx, p); r < 0) {
+        notify_error(ctx, p, r);
+        return;
+    }
+    notify_completed(ctx, p, call, result);
+    unlock(ctx, p);
+}
+
+// Message 0x4C {the game's u64 argument}: OpenStream, booted (2) with nothing running and a descriptor held (EMPTY
+// without): state 3 and its event; then the descriptor made ready (0x4E), all of it completing 0x4D.
+s32 open_stream_command(PPUContext& ctx, u32 p, u32 arg)
+{
+    if (r8(ctx, p + pl::kState) != 2 || r32(ctx, p + kCallRunning) != 0) return error(CELL_SAIL_ERROR_INVALID_STATE);
+    if (static_cast<s32>(r32(ctx, p + pl::kDescriptorCount)) <= 0) return error(CELL_SAIL_ERROR_EMPTY);
+    w32(ctx, p + kCallRunning, 2);
+    w64(ctx, p + pl::kBootArg, r64(ctx, arg));
+    w8(ctx, p + pl::kState, 3);
+    notify_event(ctx, p, 3, 3, 0);
+    return lv2::CELL_OK;
+}
+
+void open_stream_start(PPUContext& ctx, u32 p)
+{
+    std::memset(gb(ctx) + p + 0xD0, 0, 0x40);
+    std::memset(gb(ctx) + p + 0xE0, 0, 0x30);
+    w32(ctx, p + 0xE0, r32(ctx, p + 0xE0) | 0x20);
+    w64(ctx, p + 0xE8, step(0x4D, p + 0xD0));
+    w8(ctx, p + kRateShown, 0);
+    stream_prepare(ctx, p, r32(ctx, p + pl::kCurrentDescriptor), p + 0xF0, step(0x4E, p + 0xE0));
+}
+
+// Message 0x5D {the game's u64 argument}: CloseStream, open (4) with nothing running: state 8 and its event; then the
+// stream taken down, completing 0x5E.
+s32 close_stream_command(PPUContext& ctx, u32 p, u32 arg)
+{
+    if (r8(ctx, p + pl::kState) != 4 || r32(ctx, p + kCallRunning) != 0) return error(CELL_SAIL_ERROR_INVALID_STATE);
+    w32(ctx, p + kCallRunning, 3);
+    w64(ctx, p + pl::kBootArg, r64(ctx, arg));
+    w8(ctx, p + pl::kState, 8);
+    notify_event(ctx, p, 3, 8, 0);
+    return lv2::CELL_OK;
 }
 
 // ------------------------------------------------------------------------------------------------- the message loop
@@ -517,6 +953,75 @@ void message_loop(PPUContext& ctx, u32 p)
                 answer(ctx, p, m.c, 0);
             } else {
                 answer(ctx, p, m.c, code == 0x3E ? open_stream(ctx, m.b) : close_stream(ctx, m.b));
+            }
+            continue;
+        }
+        if (code == 0x29) {
+            source_call_completed(ctx, m.b, static_cast<s32>(m.c));
+            continue;
+        }
+        if (code == 0x4C || code == 0x5D) {
+            if (const s32 r = lock(ctx, p); r < 0) {
+                notify_error(ctx, p, r);
+                notify_error(ctx, p, error(CELL_SAIL_ERROR_FATAL));
+                continue;
+            }
+            const s32 r = code == 0x4C ? open_stream_command(ctx, p, m.b) : close_stream_command(ctx, p, m.b);
+            if (!answer(ctx, p, m.c, r) || r < 0) continue;
+            if (code == 0x4C) {
+                open_stream_start(ctx, p);
+            } else {
+                std::memset(gb(ctx) + p + 0xD0, 0, 0x20);
+                stream_close(ctx, p, r32(ctx, p + pl::kCurrentDescriptor), p + 0xE0, step(0x5E, p + 0xD0));
+            }
+            continue;
+        }
+        if (code == 0x4D || code == 0x5E) {
+            // OpenStream / CloseStream done: open (4) or, failed, booted (2), the call's completion event.
+            const s32 result = static_cast<s32>(m.a);
+            if (code == 0x5E && result < 0) {
+                w32(ctx, m.c, r32(ctx, m.c) | 1);
+                notify_error(ctx, p, result);
+            }
+            const u8 st = code == 0x4D && result >= 0 ? 4 : 2;
+            w8(ctx, p + pl::kState, st);
+            notify_event(ctx, p, 3, st, 0);
+            call_completed(ctx, p, code == 0x4D ? 2 : 3, code == 0x4D ? result : 0);
+            continue;
+        }
+        if (code == 0x4E) {
+            stream_open_steps(ctx, p, static_cast<s32>(m.a), m.c);
+            continue;
+        }
+        if (code >= 0x4F && code <= 0x53) {
+            stream_open_counted(ctx, p, static_cast<s32>(m.a), m.c);
+            continue;
+        }
+        if (code == 0x5C) {
+            post_completion(ctx, p, error(CELL_SAIL_ERROR_CANCEL), r64(ctx, m.c + 8));
+            continue;
+        }
+        if (code >= 0x5F && code <= 0x63) {
+            stream_close_counted(ctx, p, static_cast<s32>(m.a), m.c);
+            continue;
+        }
+        if (code >= 0x44 && code <= 0x47) {
+            if (const s32 r = lock(ctx, p); r < 0) {
+                notify_error(ctx, p, r);
+                notify_error(ctx, p, error(CELL_SAIL_ERROR_FATAL));
+                continue;
+            }
+            if (code == 0x44) {
+                bool changed = false;
+                const s32 paused = set_paused(ctx, p, m.b, changed);
+                if (answer(ctx, p, m.c, paused) && changed) notify_event(ctx, p, 7, static_cast<u32>(paused), 0);
+            } else if (code == 0x45) {
+                answer(ctx, p, m.c, set_repeat_mode(ctx, p, m.b));
+            } else {
+                const u32 index = r32(ctx, m.b);
+                set_muted(ctx, r32(ctx, code == 0x46 ? audio_slot(ctx, p, index) + 0x150 : video_slot(ctx, p, index) + 0x180),
+                    r8(ctx, m.b + 4));
+                answer(ctx, p, m.c, 0);
             }
             continue;
         }
@@ -590,34 +1095,74 @@ void _pspocket_cellSail_control(PPUContext& ctx, u64 player)
             failed = false;
         }
         if (!failed) {
-            if (r32(ctx, p + pl::kAudioCount) || r32(ctx, p + pl::kVideoCount) || r32(ctx, p + pl::kUserCount)) {
-                log_call_site(ctx, gb(ctx), "cellSail: a player with streams: libsail's pipelines are a later part");
-                PS_FATAL(kChan, "libsail's stream pipelines are a later part of D-562");
-            }
+            const u32 na = r32(ctx, p + pl::kAudioCount), nv = r32(ctx, p + pl::kVideoCount),
+                      nu = r32(ctx, p + pl::kUserCount);
+            const auto audio = [&](u32 i) { return r32(ctx, p + pl::kAudio) + i * pl::kAudioStride; };
+            const auto video = [&](u32 i) { return r32(ctx, p + pl::kVideo) + i * pl::kVideoStride; };
+            const auto user = [&](u32 i) { return r32(ctx, p + pl::kUser) + i * pl::kUserStride; };
+            // The pipelines, then the renderers and the AU receivers: what failed undone, as libsail's set-up.
             dmux_init(ctx, p + pl::kDmux, p);
-            w8(ctx, p + pl::kState, 2);
-            notify_event(ctx, p, 3, 2, 0);
-            notify_completed(ctx, p, 1, 0);
-            sc(ctx, 108, {r32(ctx, p + pl::kLock + 4)});
-            unlock(ctx, p);
-            message_loop(ctx, p);
-            lock(ctx, p);
-            // The descriptors the player holds back to their open state, then freed.
-            for (const u32 at : {p + pl::kCurrentDescriptor, p + kNextDescriptor}) {
-                if (const u32 d = r32(ctx, at)) {
-                    const u8 st = r8(ctx, d + 0x38);
-                    if (st == 2) w8(ctx, d + 0x38, 0);
-                    else if (st >= 3 && st <= 5) w8(ctx, d + 0x38, 1);
+            u32 ia = 0, iv = 0;
+            r = lv2::CELL_OK;
+            while (r >= 0 && ia < na)
+                if ((r = audio_pipeline_init(ctx, audio(ia) + 0x80, p)) >= 0) ia++;
+            while (r >= 0 && iv < nv)
+                if ((r = video_pipeline_init(ctx, video(iv) + 0x80, p)) >= 0) iv++;
+            if (r < 0) {
+                for (u32 i = 0; i < iv; i++) video_pipeline_fini(ctx, video(i) + 0x80);
+                for (u32 i = 0; i < ia; i++) audio_pipeline_fini(ctx, audio(i) + 0x80);
+                dmux_fini(ctx, p + pl::kDmux);
+                failed = true;
+            } else {
+                u32 ra = 0, rv = 0, ru = 0;
+                while (r >= 0 && ra < na) {
+                    // A renderer of a stream in mode 1 is told so (+0x34 = 4) first.
+                    const u32 rd = r32(ctx, audio(ra) + 0x150);
+                    if (ps_read16(gb(ctx), audio(ra) + 0x156) == 1) w32(ctx, rd + 0x34, 4);
+                    if ((r = renderer_makeup(ctx, rd)) >= 0) ra++;
                 }
+                while (r >= 0 && rv < nv) {
+                    const u32 rd = r32(ctx, video(rv) + 0x180);
+                    if (ps_read16(gb(ctx), video(rv) + 0x186) == 1) w32(ctx, rd + 0x34, 4);
+                    if ((r = renderer_makeup(ctx, rd)) >= 0) rv++;
+                }
+                while (r >= 0 && ru < nu)
+                    if ((r = receiver_makeup(ctx, r32(ctx, user(ru) + 0x80), p, p + pl::kSync, ru)) >= 0) ru++;
+                if (r >= 0) {
+                    w8(ctx, p + pl::kState, 2);
+                    notify_event(ctx, p, 3, 2, 0);
+                    notify_completed(ctx, p, 1, 0);
+                    sc(ctx, 108, {r32(ctx, p + pl::kLock + 4)});
+                    unlock(ctx, p);
+                    message_loop(ctx, p);
+                    lock(ctx, p);
+                    for (u32 i = 0; i < rv; i++) video_pipeline_stop(ctx, video(i) + 0x80);
+                    for (u32 i = 0; i < ra; i++) audio_pipeline_stop(ctx, audio(i) + 0x80);
+                    // The descriptors the player holds back to their open state.
+                    for (const u32 at : {p + pl::kCurrentDescriptor, p + kNextDescriptor}) {
+                        if (const u32 d = r32(ctx, at)) {
+                            const u8 st = r8(ctx, d + 0x38);
+                            if (st == 2) w8(ctx, d + 0x38, 0);
+                            else if (st >= 3 && st <= 5) w8(ctx, d + 0x38, 1);
+                        }
+                    }
+                    w32(ctx, p + pl::kDescriptorCount, 0);
+                } else {
+                    failed = true;
+                }
+                for (u32 i = 0; i < ru; i++) receiver_cleanup(ctx, r32(ctx, user(i) + 0x80));
+                for (u32 i = 0; i < rv; i++) renderer_cleanup(ctx, r32(ctx, video(i) + 0x180));
+                for (u32 i = 0; i < ra; i++) renderer_cleanup(ctx, r32(ctx, audio(i) + 0x150));
+                for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) audio_pipeline_fini(ctx, audio(i) + 0x80);
+                for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) video_pipeline_fini(ctx, video(i) + 0x80);
+                dmux_fini(ctx, p + pl::kDmux);
+                for (u32 d = r32(ctx, p + kDescriptors); d;) {
+                    const u32 next = r32(ctx, d + ds::kNext);
+                    free_descriptor(ctx, p, d);
+                    d = next;
+                }
+                w32(ctx, p + kDescriptors, 0);
             }
-            w32(ctx, p + pl::kDescriptorCount, 0);
-            dmux_fini(ctx, p + pl::kDmux);
-            for (u32 d = r32(ctx, p + kDescriptors); d;) {
-                const u32 next = r32(ctx, d + ds::kNext);
-                free_descriptor(ctx, p, d);
-                d = next;
-            }
-            w32(ctx, p + kDescriptors, 0);
         }
         unlock(ctx, p);
         if (owned) {
@@ -743,6 +1288,157 @@ s32 cellSailDescriptorOpen(PPUContext& ctx, u32 d)
 
 s32 cellSailDescriptorClose(PPUContext& ctx, u32 d) { return close_descriptor(ctx, d, true); }
 
+// DumpImage(player, buffer, size): the player's state as libsail writes it for Sony's tools, each block at the next
+// 64-byte boundary: the image's version (u64 0x492000), whether libsail leaves module loading to the process (u32), the
+// player's 0x3D8 bytes, its audio, video and user slots, each held descriptor (0xE0 bytes, its URI's length (u32) and
+// text, its elementary stream entries), the built-in source and its state, the dmux pipeline, each slot's stream state
+// (0x70 bytes from +0x10), then each audio pipeline (0xD0) with its renderer (0x50), a u64 0x100 and 0x100 bytes of the
+// renderer's argument, each video pipeline (0x100) with its renderer (0x60) and the same, each AU receiver's callbacks
+// (0x50) and the receiver (0x1C0). The bytes it wrote, with the padding: a block that does not fit ends the image there
+// (its padding counted); padding that does not fit also prints "not enougth buffer".
+u32 cellSailPlayerDumpImage(PPUContext& ctx, u32 p, u32 buf, u32 size)
+{
+    u8* b = gb(ctx);
+    u32 cursor = buf, left = size, count = 0;
+    bool full = false;
+    const auto short_of_room = [&] {
+        StackVar text(ctx, b, 32);
+        std::memcpy(b + text.addr(), "not enougth buffer\n", 20);
+        lv2_lib(ctx, "_sys_printf", {text.addr()});
+        full = true;
+    };
+    // A block at the next 64-byte boundary (or right here): false once the buffer is full.
+    const auto put = [&](const u8* from, u32 n, bool align = true) {
+        if (full) return false;
+        const u32 pad = align ? ((cursor + 63) & ~63u) - cursor : 0;
+        if (left < pad) {
+            short_of_room();
+            return false;
+        }
+        left -= pad;
+        count += pad;
+        cursor += pad;
+        if (left < n) {
+            full = true;
+            return false;
+        }
+        std::memmove(b + cursor, from, n);
+        left -= n;
+        count += n;
+        cursor += n;
+        return true;
+    };
+    const auto put_guest = [&](u32 at, u32 n) {
+        if (!at) {
+            log_call_site(ctx, b, "cellSailPlayerDumpImage: a NULL object in the player (libsail reads address 0)");
+            PS_FATAL(kChan, "cellSailPlayerDumpImage of a player without its objects");
+        }
+        return put(b + at, n);
+    };
+    u8 word[8];
+    ps_write64(word, 0, 0x492000);
+    if (!put(word, 8)) return count;
+    ps_write32(word, 0, loads_modules(ctx) ? 0 : 1);
+    if (!put(word, 4)) return count;
+    if (!put_guest(p, 0x3D8)) return count;
+    const u32 na = r32(ctx, p + pl::kAudioCount), nv = r32(ctx, p + pl::kVideoCount), nu = r32(ctx, p + pl::kUserCount);
+    for (u32 i = 0; i < na; i++)
+        if (!put_guest(audio_slot(ctx, p, i), pl::kAudioStride)) return count;
+    for (u32 i = 0; i < nv; i++)
+        if (!put_guest(video_slot(ctx, p, i), pl::kVideoStride)) return count;
+    for (u32 i = 0; i < nu; i++)
+        if (!put_guest(user_slot(ctx, p, i), pl::kUserStride)) return count;
+    for (const u32 at : {p + pl::kCurrentDescriptor, p + kNextDescriptor}) {
+        const u32 d = r32(ctx, at);
+        if (!d) continue;
+        if (!put_guest(d, 0xE0)) return count;
+        if (const u32 uri = r32(ctx, d + ds::kUri)) {
+            const u32 n = static_cast<u32>(std::strlen(reinterpret_cast<const char*>(b + uri))) + 1;
+            ps_write32(word, 0, n);
+            if (!put(word, 4)) return count;
+            if (!put(b + uri, n, false)) return count;
+        }
+        for (u32 i = 0; i < na; i++)
+            if (!put_guest(r32(ctx, d + ds::kAudio) + i * ds::kAudioStride, ds::kAudioStride)) return count;
+        for (u32 i = 0; i < nv; i++)
+            if (!put_guest(r32(ctx, d + ds::kVideo) + i * ds::kVideoStride, ds::kVideoStride)) return count;
+        for (u32 i = 0; i < nu; i++)
+            if (!put_guest(r32(ctx, d + ds::kUser) + i * ds::kUserStride, ds::kUserStride)) return count;
+    }
+    if (const u32 source = r32(ctx, p + pl::kProtocolSources)) {
+        if (!put_guest(source, 0x80)) return count;
+        if (!put_guest(r32(ctx, source + src::kArg), 0x138)) return count;
+    }
+    if (!put_guest(p + pl::kDmux, 0x58)) return count;
+    for (u32 i = 0; i < na; i++)
+        if (!put_guest(audio_slot(ctx, p, i) + 0x10, 0x70)) return count;
+    for (u32 i = 0; i < nv; i++)
+        if (!put_guest(video_slot(ctx, p, i) + 0x10, 0x70)) return count;
+    for (u32 i = 0; i < nu; i++)
+        if (!put_guest(user_slot(ctx, p, i) + 0x10, 0x70)) return count;
+    ps_write64(word, 0, 0x100);
+    for (u32 i = 0; i < na; i++) {
+        const u32 slot = audio_slot(ctx, p, i), renderer = r32(ctx, slot + 0x150);
+        if (!put_guest(slot + 0x80, 0xD0) || !put_guest(renderer, 0x50) || !put(word, 8) ||
+            !put_guest(r32(ctx, renderer + 4), 0x100))
+            return count;
+    }
+    for (u32 i = 0; i < nv; i++) {
+        const u32 slot = video_slot(ctx, p, i), renderer = r32(ctx, slot + 0x180);
+        if (!put_guest(slot + 0x80, 0x100) || !put_guest(renderer, 0x60) || !put(word, 8) ||
+            !put_guest(r32(ctx, renderer + 4), 0x100))
+            return count;
+    }
+    for (u32 i = 0; i < nu; i++) {
+        const u32 t = r32(ctx, user_slot(ctx, p, i) + 0x80);
+        if (!put_guest(t, 0x50) || !put_guest(r32(ctx, t + 0x24), 0x1C0)) return count;
+    }
+    return count;
+}
+
+// OpenStream / CloseStream(player, u64 argument): the command's answer; the call's completion event carries the argument.
+s32 cellSailPlayerOpenStream(PPUContext& ctx, u32 p, u64 arg)
+{
+    StackVar a(ctx, gb(ctx), 8);
+    w64(ctx, a.addr(), arg);
+    return command_answer(ctx, p, 0x4C, a.addr());
+}
+
+s32 cellSailPlayerCloseStream(PPUContext& ctx, u32 p, u64 arg)
+{
+    StackVar a(ctx, gb(ctx), 8);
+    w64(ctx, a.addr(), arg);
+    return command_answer(ctx, p, 0x5D, a.addr());
+}
+
+// SetPaused(player, paused): the paused state now.
+s32 cellSailPlayerSetPaused(PPUContext& ctx, u32 p, u32 paused) { return command_answer(ctx, p, 0x44, paused); }
+
+// SetRepeatMode(player, mode, info): the mode.
+s32 cellSailPlayerSetRepeatMode(PPUContext& ctx, u32 p, u32 mode, u32 info)
+{
+    StackVar args(ctx, gb(ctx), 16);
+    w32(ctx, args.addr(), mode);
+    w32(ctx, args.addr() + 4, info);
+    return command_answer(ctx, p, 0x45, args.addr());
+}
+
+// SetEsAudioMuted / SetEsVideoMuted(player, index, muted): the stream's muted bit afterwards.
+s32 set_es_muted(PPUContext& ctx, u32 p, u32 index, u32 muted, bool video)
+{
+    if (index >= r32(ctx, p + (video ? pl::kVideoCount : pl::kAudioCount))) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+    StackVar args(ctx, gb(ctx), 16);
+    w32(ctx, args.addr(), index);
+    w8(ctx, args.addr() + 4, static_cast<u8>(muted));
+    StackVar reply(ctx, gb(ctx), 16);
+    if (const s32 r = command(ctx, p, video ? 0x47 : 0x46, args.addr(), reply.addr()); r < 0) return r;
+    const u32 renderer = r32(ctx, video ? video_slot(ctx, p, index) + 0x180 : audio_slot(ctx, p, index) + 0x150);
+    return static_cast<s32>(r32(ctx, renderer + 0x34) & 1);
+}
+
+s32 cellSailPlayerSetEsAudioMuted(PPUContext& ctx, u32 p, u32 index, u32 muted) { return set_es_muted(ctx, p, index, muted, false); }
+s32 cellSailPlayerSetEsVideoMuted(PPUContext& ctx, u32 p, u32 index, u32 muted) { return set_es_muted(ctx, p, index, muted, true); }
+
 
 s32 cellSailPlayerCreateDescriptor(PPUContext& ctx, u32 p, u32 type, u32 media_info, u32 uri, u32 out)
 {
@@ -791,6 +1487,22 @@ void register_cellSailControl(Registry& r)
             &detail::thunk<&cellSailDescriptorOpen>, false},
         ::pspocket::hle::Function{{}, "cellSailDescriptorClose", recomp::nid_of("cellSailDescriptorClose"),
             &detail::thunk<&cellSailDescriptorClose>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerSetPaused", recomp::nid_of("cellSailPlayerSetPaused"),
+            &detail::thunk<&cellSailPlayerSetPaused>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerDumpImage", recomp::nid_of("cellSailPlayerDumpImage"),
+            &detail::thunk<&cellSailPlayerDumpImage>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerOpenStream", recomp::nid_of("cellSailPlayerOpenStream"),
+            &detail::thunk<&cellSailPlayerOpenStream>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerCloseStream", recomp::nid_of("cellSailPlayerCloseStream"),
+            &detail::thunk<&cellSailPlayerCloseStream>, false},
+        ::pspocket::hle::Function{{}, "_pspocket_cellSail_dmuxNotify", recomp::nid_of("_pspocket_cellSail_dmuxNotify"),
+            &detail::thunk<&_pspocket_cellSail_dmuxNotify>, true},
+        ::pspocket::hle::Function{{}, "cellSailPlayerSetRepeatMode", recomp::nid_of("cellSailPlayerSetRepeatMode"),
+            &detail::thunk<&cellSailPlayerSetRepeatMode>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerSetEsAudioMuted", recomp::nid_of("cellSailPlayerSetEsAudioMuted"),
+            &detail::thunk<&cellSailPlayerSetEsAudioMuted>, false},
+        ::pspocket::hle::Function{{}, "cellSailPlayerSetEsVideoMuted", recomp::nid_of("cellSailPlayerSetEsVideoMuted"),
+            &detail::thunk<&cellSailPlayerSetEsVideoMuted>, false},
         ::pspocket::hle::Function{{}, "_pspocket_cellSail_control", recomp::nid_of("_pspocket_cellSail_control"),
             &detail::thunk<&_pspocket_cellSail_control>, true},
     });

@@ -109,9 +109,9 @@ TEST_CASE("lv2 event queue: blocked receivers, timeouts, forced destroy, SPU que
     // A blocked receiver gets the event directly.
     std::thread receiver([&] {
         Caller me(*f.kernel, "receiver");
-        REQUIRE(me.call(kQueueReceive, q, 0, 0) == CELL_OK);
-        CHECK(me.ctx.gpr[5] == 0x1111);
-        CHECK(me.ctx.gpr[7] == 0x3333);
+        THREAD_REQUIRE(me.call(kQueueReceive, q, 0, 0) == CELL_OK);
+        THREAD_CHECK(me.ctx.gpr[5] == 0x1111);
+        THREAD_CHECK(me.ctx.gpr[7] == 0x3333);
     });
     REQUIRE(eventually([&] { return queued<EventQueue>(*f.kernel, q) == 1; }));
     REQUIRE(c.call(kPortSend, p, 0x1111, 0x2222, 0x3333) == CELL_OK);
@@ -120,7 +120,7 @@ TEST_CASE("lv2 event queue: blocked receivers, timeouts, forced destroy, SPU que
     // Destroy: EBUSY with a waiter unless forced; forced waiters get ECANCELED.
     std::thread canceled([&] {
         Caller me(*f.kernel, "receiver");
-        CHECK(me.call(kQueueReceive, q, 0, 0) == rc(CELL_ECANCELED));
+        THREAD_CHECK(me.call(kQueueReceive, q, 0, 0) == rc(CELL_ECANCELED));
     });
     REQUIRE(eventually([&] { return queued<EventQueue>(*f.kernel, q) == 1; }));
     CHECK(c.call(kQueueDestroy, q, 2) == rc(CELL_EINVAL));
@@ -181,7 +181,7 @@ TEST_CASE("lv2 event queue: per-sender order holds under concurrent senders", "[
                 if (r == CELL_OK) {
                     n++;
                 } else {
-                    REQUIRE(r == rc(CELL_EBUSY));
+                    THREAD_REQUIRE(r == rc(CELL_EBUSY));
                     std::this_thread::yield();
                 }
             }
@@ -265,7 +265,7 @@ TEST_CASE("lv2 event flag: set satisfies waiters in protocol order, applying eac
         pool.emplace_back([&, i] {
             Caller me(*f.kernel, "waiter", waiters[i].prio);
             const u32 res = f.alloc(8);
-            REQUIRE(me.call(kFlagWait, e, waiters[i].bits, waiters[i].mode, res, 0) == CELL_OK);
+            THREAD_REQUIRE(me.call(kFlagWait, e, waiters[i].bits, waiters[i].mode, res, 0) == CELL_OK);
             results[i] = f.r64(res);
             done[i] = 1;
         });
@@ -335,7 +335,7 @@ TEST_CASE("lv2 event flag: single-waiter flags, timeouts, cancel, destroy", "[lv
     const u32 single = make_flag(f, c, 0, SYS_SYNC_FIFO, SYS_SYNC_WAITER_SINGLE);
     std::thread first([&] {
         Caller me(*f.kernel, "first");
-        CHECK(me.call(kFlagWait, single, 1, SYS_EVENT_FLAG_WAIT_AND, 0, 0) == CELL_OK);
+        THREAD_CHECK(me.call(kFlagWait, single, 1, SYS_EVENT_FLAG_WAIT_AND, 0, 0) == CELL_OK);
     });
     REQUIRE(eventually([&] { return queued<EventFlag>(*f.kernel, single) == 1; }));
     const u32 res = f.alloc(8);
@@ -355,8 +355,8 @@ TEST_CASE("lv2 event flag: single-waiter flags, timeouts, cancel, destroy", "[lv
         pool.emplace_back([&] {
             Caller me(*f.kernel, "waiter");
             const u32 r = f.alloc(8);
-            CHECK(me.call(kFlagWait, e, 0b1000, SYS_EVENT_FLAG_WAIT_OR, r, 0) == rc(CELL_ECANCELED));
-            CHECK(f.r64(r) == 0b100);
+            THREAD_CHECK(me.call(kFlagWait, e, 0b1000, SYS_EVENT_FLAG_WAIT_OR, r, 0) == rc(CELL_ECANCELED));
+            THREAD_CHECK(f.r64(r) == 0b100);
         });
     }
     REQUIRE(eventually([&] { return queued<EventFlag>(*f.kernel, e) == 2; }));
@@ -374,6 +374,7 @@ TEST_CASE("lv2 event flag: handshakes between thread pairs", "[lv2][event_flag][
     const u32 request = make_flag(f, c, 0);
     const u32 reply = make_flag(f, c, 0);
     constexpr int kPairs = 4, kRounds = 1500;
+    constexpr u32 kAndClear = SYS_EVENT_FLAG_WAIT_AND | SYS_EVENT_FLAG_WAIT_CLEAR;
     std::atomic<int> served{0};
     std::vector<std::thread> pool;
     for (int i = 0; i < kPairs; i++) {
@@ -381,16 +382,16 @@ TEST_CASE("lv2 event flag: handshakes between thread pairs", "[lv2][event_flag][
         pool.emplace_back([&, bit] {
             Caller me(*f.kernel, "server");
             for (int r = 0; r < kRounds; r++) {
-                REQUIRE(me.call(kFlagWait, request, bit, SYS_EVENT_FLAG_WAIT_AND | SYS_EVENT_FLAG_WAIT_CLEAR, 0, 0) == CELL_OK);
+                THREAD_REQUIRE(me.call(kFlagWait, request, bit, kAndClear, 0, 0) == CELL_OK);
                 served++;
-                REQUIRE(me.call(kFlagSet, reply, bit) == CELL_OK);
+                THREAD_REQUIRE(me.call(kFlagSet, reply, bit) == CELL_OK);
             }
         });
         pool.emplace_back([&, bit] {
             Caller me(*f.kernel, "client");
             for (int r = 0; r < kRounds; r++) {
-                REQUIRE(me.call(kFlagSet, request, bit) == CELL_OK);
-                REQUIRE(me.call(kFlagWait, reply, bit, SYS_EVENT_FLAG_WAIT_AND | SYS_EVENT_FLAG_WAIT_CLEAR, 0, 0) == CELL_OK);
+                THREAD_REQUIRE(me.call(kFlagSet, request, bit) == CELL_OK);
+                THREAD_REQUIRE(me.call(kFlagWait, reply, bit, kAndClear, 0, 0) == CELL_OK);
             }
         });
     }

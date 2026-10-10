@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
 
@@ -14,8 +15,11 @@
 #include "pspocket/core/memory_map.h"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
+#include "pspocket/recomp/crypto.hpp"
 #include "pspocket/recomp/nid.hpp"
+#include "pspocket/recomp/npdrm.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
+#include "pspocket/recomp/self_decrypt.hpp"
 #include "hle_test_util.hpp"
 #include "synthetic.hpp"
 
@@ -66,6 +70,32 @@ std::vector<u8> debug_self(const std::vector<u8>& elf)
     o.debug = true;
     o.npdrm = false;
     return test::wrap_in_self(elf, o);
+}
+
+// The build's first NPDRM SELF key, or nullptr in a build without keys.
+const recomp::SelfKey* npdrm_self_key()
+{
+    for (const recomp::SelfKey& k : recomp::builtin_self_keys())
+        if (k.type == 8) return &k;
+    return nullptr;
+}
+
+// `elf` as a PSN game's module (an NPDRM SELF of this licence type opened by `content_key`), encrypted with the
+// build's keys, in the test's folders only.
+std::vector<u8> npdrm_self(const std::vector<u8>& elf, s32 license, const recomp::Key128& content_key)
+{
+    const recomp::SelfKey* key = npdrm_self_key();
+    REQUIRE(key);
+    test::SelfEncryption e;
+    e.key = *key;
+    e.revision = static_cast<u16>(key->revision);
+    e.npdrm = true;
+    e.npdrm_license = license;
+    REQUIRE(recomp::crypto::aes_ecb_decrypt(recomp::builtin_npdrm_keys().klic_key, content_key.data(), 16,
+        e.npdrm_layer_key.data()));
+    std::vector<u8> self = test::encrypt_self(elf, e);
+    REQUIRE_FALSE(self.empty());
+    return self;
 }
 
 } // namespace
@@ -178,6 +208,129 @@ TEST_CASE("LLE: the firmware's modules indexed; a library goes LLE only when the
     std::string error;
     CHECK_FALSE(none.index(&error));
     CHECK_FALSE(error.empty());
+    fs::remove_all(root);
+}
+
+// D-563: a library the host made without Sony's module to compare with (libmixer) is firmware-first: the firmware's
+// module serves it when one is installed, for the game and for a module importing it, though the host implements all
+// of it; with no module, the host's serves it.
+TEST_CASE("LLE: a firmware-first library goes to its module when one is installed, to the host when not", "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    const u32 create = recomp::nid_of("cellSurMixerCreate"), start = recomp::nid_of("cellSurMixerStart");
+    REQUIRE(hle::registry().find("libmixer", create));
+    REQUIRE(hle::registry().find("libmixer", start));
+    REQUIRE(hle::registry().is_firmware_first("libmixer"));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellGcmSys"));
+
+    const fs::path root = fresh_flash("pspocket-test-lle-first");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    const auto plain = test::build_ppu_prx();
+    write(external / "libmixer.sprx", debug_self(prx_exporting(plain, "libmixer", create)));
+    // A module exporting synthMixUser that imports libmixer's two functions (its sysPrxForUser import renamed).
+    std::vector<u8> user = prx_exporting(plain, "synthMixUser", 0x66666666);
+    std::fill(user.begin() + 0x310, user.begin() + 0x320, u8{0});
+    std::memcpy(user.data() + 0x310, "libmixer", 8);
+    ps_st32(user.data() + 0x410, create);
+    ps_st32(user.data() + 0x414, start);
+    write(external / "libuser.sprx", debug_self(user));
+    const auto bound = [](u32) { return true; };
+
+    loader::LleModules lle((root / "dev_flash").string());
+    REQUIRE(lle.index());
+    CHECK(lle.chooses("libmixer")); // before the per-game choice too
+    lle.decide({Needs{"libmixer", {create, start}, {}}}, bound);
+    CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libmixer.sprx"});
+    CHECK(lle.chooses("libmixer"));
+    lle.decide({Needs{"synthMixUser", {0x66666666}, {}}}, bound);
+    CHECK(lle.chosen_files() == std::set<std::string, std::less<>>{"libmixer.sprx", "libuser.sprx"});
+    // Both imports went to the module, which exports only cellSurMixerCreate: cellSurMixerStart is a gap though the
+    // host has it.
+    REQUIRE(lle.gaps().contains("libuser.sprx"));
+    CHECK(lle.gaps().at("libuser.sprx") ==
+        std::vector<std::string>{std::format("libmixer::{:#010x} (not exported by libmixer.sprx)", start)});
+
+    fs::remove(external / "libmixer.sprx");
+    fs::remove(root / "lle-index.txt");
+    loader::LleModules without((root / "dev_flash").string());
+    REQUIRE(without.index());
+    CHECK_FALSE(without.chooses("libmixer"));
+    without.decide({Needs{"libmixer", {create, start}, {}}}, bound);
+    CHECK(without.chosen_files().empty());
+    without.decide({Needs{"synthMixUser", {0x66666666}, {}}}, bound);
+    CHECK(without.chosen_files() == std::set<std::string, std::less<>>{"libuser.sprx"});
+    CHECK_FALSE(without.gaps().contains("libuser.sprx")); // libmixer's functions from the host
+    fs::remove_all(root);
+}
+
+// D-594: a function the host made from RPCS3 without Sony's module to compare it with (libvdec's cellVdecSetPts) is
+// unverified in a library whose other functions were compared (cellVdecOpen, cellVdecClose): an import of it goes to
+// the library's module when one is installed, for the game and for a module importing it, as an import of a function
+// the host lacks would; with no module, the host's serves it. Imports of only verified functions stay on the host
+// either way.
+TEST_CASE("LLE: an unverified function's import goes to its library's module when one is installed, to the host when "
+          "not", "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    const u32 open = recomp::nid_of("cellVdecOpen"), close = recomp::nid_of("cellVdecClose"),
+              set_pts = recomp::nid_of("cellVdecSetPts");
+    REQUIRE(hle::registry().find("libvdec", open));
+    REQUIRE(hle::registry().find("libvdec", close));
+    REQUIRE(hle::registry().find("libvdec", set_pts));
+    REQUIRE(hle::registry().is_unverified("libvdec", set_pts));
+    CHECK_FALSE(hle::registry().is_unverified("libvdec", open));
+    CHECK_FALSE(hle::registry().is_unverified("libvdec", close));
+    CHECK_FALSE(hle::registry().is_firmware_first("libvdec"));
+
+    const fs::path root = fresh_flash("pspocket-test-lle-unverified");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    const auto plain = test::build_ppu_prx();
+    write(external / "libvdec.sprx", debug_self(prx_exporting(plain, "libvdec", open)));
+    // Two modules importing two of libvdec's functions (their sysPrxForUser import renamed): one an unverified one.
+    const auto user = [&](std::string_view library, u32 exported, u32 first, u32 second) {
+        std::vector<u8> m = prx_exporting(plain, library, exported);
+        std::fill(m.begin() + 0x310, m.begin() + 0x320, u8{0});
+        std::memcpy(m.data() + 0x310, "libvdec", 7);
+        ps_st32(m.data() + 0x410, first);
+        ps_st32(m.data() + 0x414, second);
+        return m;
+    };
+    write(external / "libuser.sprx", debug_self(user("synthVdecUser", 0x66666666, open, set_pts)));
+    write(external / "libuser2.sprx", debug_self(user("synthVdecUser2", 0x77777777, open, close)));
+    const auto bound = [](u32) { return true; };
+    using Files = std::set<std::string, std::less<>>;
+
+    loader::LleModules lle((root / "dev_flash").string());
+    REQUIRE(lle.index());
+    CHECK_FALSE(lle.chooses("libvdec")); // before the per-game choice: the host has the library
+    lle.decide({Needs{"libvdec", {open, close}, {}}}, bound);
+    CHECK(lle.chosen_files().empty()); // verified functions only: the host's
+    CHECK_FALSE(lle.chooses("libvdec"));
+    lle.decide({Needs{"libvdec", {open, set_pts}, {}}}, bound);
+    CHECK(lle.chosen_files() == Files{"libvdec.sprx"}); // Sony's module, as when the host lacked cellVdecSetPts
+    CHECK(lle.chooses("libvdec"));
+    lle.decide({Needs{"synthVdecUser2", {0x77777777}, {}}}, bound);
+    CHECK(lle.chosen_files() == Files{"libuser2.sprx"}); // its libvdec imports from the host
+    CHECK_FALSE(lle.gaps().contains("libuser2.sprx"));
+    lle.decide({Needs{"synthVdecUser", {0x66666666}, {}}}, bound);
+    CHECK(lle.chosen_files() == Files{"libuser.sprx", "libvdec.sprx"});
+    // Both imports went to the module, which exports only cellVdecOpen: cellVdecSetPts is a gap though the host has it.
+    REQUIRE(lle.gaps().contains("libuser.sprx"));
+    CHECK(lle.gaps().at("libuser.sprx") ==
+        std::vector<std::string>{std::format("libvdec::{:#010x} (not exported by libvdec.sprx)", set_pts)});
+
+    fs::remove(external / "libvdec.sprx");
+    fs::remove(root / "lle-index.txt");
+    loader::LleModules without((root / "dev_flash").string());
+    REQUIRE(without.index());
+    without.decide({Needs{"libvdec", {open, set_pts}, {}}}, bound);
+    CHECK(without.chosen_files().empty()); // the host's, the unverified function included
+    CHECK_FALSE(without.chooses("libvdec"));
+    without.decide({Needs{"libvdec", {open, close}, {}}}, bound);
+    CHECK(without.chosen_files().empty());
+    without.decide({Needs{"synthVdecUser", {0x66666666}, {}}}, bound);
+    CHECK(without.chosen_files() == Files{"libuser.sprx"});
+    CHECK_FALSE(without.gaps().contains("libuser.sprx")); // libvdec's functions from the host
     fs::remove_all(root);
 }
 
@@ -326,6 +479,53 @@ TEST_CASE("Run-time modules: a game's own PRX loaded by path, started (its expor
     CHECK(t.call("sys_prx_stop_module", id, 0, 0, result, 0, 0) == lv2::CELL_OK);
     CHECK(t.call("sys_prx_unload_module", id, 0, 0) == lv2::CELL_OK);
     CHECK(t.call("sys_prx_get_module_id_by_name", name, 0, 0) == hle::test::r3_of_code(0x8001112E));
+    f.hle->set_module_loader(nullptr);
+    fs::remove_all(root);
+}
+
+TEST_CASE("Run-time modules: a PSN game's NPDRM modules open with the klicensee it showed, or the player's RAP (D-582)",
+    "[hle][lle][prx][npdrm]")
+{
+    if (!recomp::builtin_npdrm_keys().present || !npdrm_self_key()) SKIP("this build has no NPDRM keys");
+    const fs::path root = fresh_flash("pspocket-test-prx-npdrm");
+    const auto prx = test::build_ppu_prx();
+    const std::vector<u8> module = prx_exporting(prx, "synthLib", 0xDEADBEEF);
+    recomp::Key128 klicensee{}, rap{};
+    klicensee.fill(0x66);
+    rap.fill(0x67);
+    fs::create_directories(root / "usrdir");
+    write(root / "usrdir" / "free.sprx", npdrm_self(module, 3, klicensee));
+    write(root / "usrdir" / "local.sprx", npdrm_self(module, 2, recomp::rap_to_rif(rap, recomp::builtin_npdrm_keys())));
+    fs::create_directories(root / "hdd0" / "home" / "00000001" / "exdata");
+    write(root / "hdd0" / "home" / "00000001" / "exdata" / (std::string(test::kSelfContentId) + ".rap"),
+        std::vector<u8>(rap.begin(), rap.end()));
+
+    const auto x = test::build_ppu_exec();
+    auto exe = loader::Executable::parse(x.bytes);
+    REQUIRE(exe);
+    hle::test::Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/app_home", (root / "usrdir").string(), true));
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+    REQUIRE(loader::load(**exe, *f.kernel, *f.hle) == lv2::CELL_OK);
+    loader::RuntimeModules modules(*f.hle, *exe, nullptr);
+    f.hle->set_module_loader(&modules);
+    u8* base = f.base();
+    hle::test::GuestThread t(f, 0, "main");
+    const u32 free_path = hle::test::kData, local_path = hle::test::kData + 0x100, klic = hle::test::kData + 0x200;
+    const std::string fp = "/app_home/free.sprx", lp = "/app_home/local.sprx";
+    std::memcpy(base + free_path, fp.c_str(), fp.size() + 1);
+    std::memcpy(base + local_path, lp.c_str(), lp.size() + 1);
+    std::memcpy(base + klic, klicensee.data(), 16);
+
+    // The free module needs the game's klicensee, which the game shows with sceNpDrmIsAvailable first (RPCS3's
+    // sys_prx takes the last key shown); the local one opens with the player's RAP whatever the game showed.
+    CHECK(static_cast<s32>(t.call("sys_prx_load_module", free_path, 0, 0)) < 0);
+    const u64 local = t.call("sys_prx_load_module", local_path, 0, 0);
+    CHECK(static_cast<s32>(local) > 0);
+    REQUIRE(t.call("sceNpDrmIsAvailable", klic, free_path) == 0);
+    const u64 free_id = t.call("sys_prx_load_module", free_path, 0, 0);
+    CHECK(static_cast<s32>(free_id) > 0);
+    CHECK(modules.module(static_cast<u32>(free_id)) != nullptr);
     f.hle->set_module_loader(nullptr);
     fs::remove_all(root);
 }
@@ -554,6 +754,114 @@ TEST_CASE("LLE: the host's own imports (cellAdec's codec cores) chosen with the 
         CHECK(ps_read32(f.base(), exported->second) == test::kPrxVariableValue);
         CHECK(f.hle->imported("cellM2BCdec", 0x300AFE4D) == 0); // no module exports it
         CHECK(lle.take_starts().size() == 1);                   // the core starts before the game
+    }
+    fs::remove_all(root);
+}
+
+// D-591, D-593: the codec cores' operation tables are exports of the host now. A firmware module importing one (a
+// synthetic one whose imported variable is renamed to the table) gets pspocket's table where no module has the core;
+// where one does, Sony's for a core not compared yet (its library firmware-first, D-563) and still pspocket's for a
+// compared one (LPCM here), as a game importing the table directly does. pspocket's own cellAdec never gets its own
+// cores' tables through its imports (the loader links firmware modules' exports there only), so it calls them directly.
+TEST_CASE("LLE: a codec core's operation table goes to pspocket's, or to the firmware's where the core is "
+          "firmware-first (D-591, D-593)",
+    "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    using Files = std::set<std::string, std::less<>>;
+    constexpr u32 kLpcmOps = 0x369D9D3A, kMp3Ops = 0x84276A23, kAtracXOps = 0x4944AF9A;
+    REQUIRE(hle::registry().find_variable("cellAdec", kLpcmOps) != nullptr);
+    const bool ffmpeg = hle::registry().find_variable("cellMP3dec", kMp3Ops) != nullptr; // the cores on FFmpeg
+    for (const char* lib : {"cellMP3dec", "cellMPL1dec", "cellM2BCdec", "cellM4AacDec", "cellM4AacDec2ch",
+             "cellM4AacDec2chmod", "cell_libac3dec", "cellAtrac3dec"})
+        CHECK(hle::registry().is_firmware_first(lib) == ffmpeg);
+    for (const char* lib : {"cellAdec", "cellAtracXdec", "cellDmux", "cellDmuxPamf"})
+        CHECK_FALSE(hle::registry().is_firmware_first(lib));
+
+    const fs::path root = fresh_flash("pspocket-test-lle-core-tables");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    test::PrxOptions o;
+    o.variables = true;
+    const auto x = test::build_ppu_prx(o);
+    const auto renamed_variable = [&](std::vector<u8> m, std::string_view library, u32 nid) {
+        std::fill(m.begin() + 0x320, m.begin() + 0x330, u8{0});
+        std::memcpy(m.data() + 0x320, library.data(), library.size());
+        ps_st32(m.data() + 0x418, nid);
+        return m;
+    };
+    // A module exporting a library of its own that imports `library`'s table; a core module exporting the table (and
+    // importing it, its own).
+    const auto user = [&](std::string_view exported, u32 fn, std::string_view library, u32 nid) {
+        return renamed_variable(prx_exporting(x, exported, fn), library, nid);
+    };
+    const auto core = [&](std::string_view library, u32 nid) {
+        std::vector<u8> m = renamed_variable(prx_exporting(x, library, 0x12340001), library, nid);
+        ps_st32(m.data() + 0x40C, nid);
+        return m;
+    };
+    write(external / "libuser_lpcm.sprx", debug_self(user("synthLpcmUser", 0x66660001, "cellAdec", kLpcmOps)));
+    if (ffmpeg)
+        write(external / "libuser_mp3.sprx", debug_self(user("synthMp3User", 0x66660002, "cellMP3dec", kMp3Ops)));
+    const auto bound = [](u32) { return true; };
+    const std::vector<Needs> game = {Needs{"cellAdec", {recomp::nid_of("cellAdecQueryAttr")}, {}}};
+    for (int installed = 0; installed < 2; installed++) {
+        if (installed) { // the cores' own modules, as the firmware has them
+            write(external / "libadec_core.sprx", debug_self(core("cellAdec", kLpcmOps)));
+            if (ffmpeg) write(external / "libmp3dec.sprx", debug_self(core("cellMP3dec", kMp3Ops)));
+            write(external / "libatxdec.sprx", debug_self(core("cellAtracXdec", kAtracXOps)));
+            fs::remove(root / "lle-index.txt");
+        }
+        INFO("the cores' modules installed: " << installed);
+        hle::test::Fixture f;
+        u8* base = f.base();
+        loader::LleModules lle((root / "dev_flash").string());
+        REQUIRE(lle.index());
+        std::string why;
+        // The compared LPCM core: pspocket's table for the module (D-593) and for a game, the core's module or not.
+        lle.decide({Needs{"synthLpcmUser", {0x66660001}, {}}}, bound);
+        CHECK(lle.chosen_files() == Files{"libuser_lpcm.sprx"});
+        CHECK_FALSE(lle.gaps().contains("libuser_lpcm.sprx"));
+        const loader::PrxModule* m = lle.load("synthLpcmUser", *f.hle, &why);
+        INFO(why);
+        REQUIRE(m != nullptr);
+        const u32 own_lpcm = f.hle->link_variable("cellAdec", kLpcmOps);
+        CHECK(ps_read32(base, m->segments[1].first + 0xC0) == own_lpcm);
+        CHECK(ps_read32(base, own_lpcm + 4) ==
+            f.hle->descriptor_of("cellAdec", recomp::nid_of("_CellAdecCoreOpOpen_lpcm")));
+        // A game importing the table: cellAdec stays on the host, table and all, never the LPCM core's module (what
+        // cellAdec imports itself joins, as for any game importing cellAdec, D-197: MP3's module, firmware-first, or,
+        // in a build without FFmpeg, ATRAC3plus's).
+        lle.decide({Needs{"cellAdec", {}, {kLpcmOps}}}, bound);
+        CHECK_FALSE(lle.chosen_files().contains("libadec_core.sprx"));
+        const Files cores = !installed ? Files{} : ffmpeg ? Files{"libmp3dec.sprx"} : Files{"libatxdec.sprx"};
+        CHECK(lle.chosen_files() == cores);
+        if (ffmpeg) {
+            // MP3, firmware-first: the module joins for the module importing the table and for a game, where there is
+            // one; pspocket's table where there is not.
+            lle.decide({Needs{"synthMp3User", {0x66660002}, {}}}, bound);
+            CHECK(lle.chosen_files() ==
+                (installed ? Files{"libmp3dec.sprx", "libuser_mp3.sprx"} : Files{"libuser_mp3.sprx"}));
+            CHECK_FALSE(lle.gaps().contains("libuser_mp3.sprx"));
+            const loader::PrxModule* u = lle.load("synthMp3User", *f.hle, &why);
+            REQUIRE(u != nullptr);
+            const loader::PrxModule* mp3 = installed ? lle.load("cellMP3dec", *f.hle, &why) : nullptr;
+            const u32 want =
+                mp3 ? mp3->variables.at({"cellMP3dec", kMp3Ops}) : f.hle->link_variable("cellMP3dec", kMp3Ops);
+            CHECK(ps_read32(base, u->segments[1].first + 0xC0) == want);
+            lle.decide({Needs{"cellMP3dec", {}, {kMp3Ops}}}, bound);
+            CHECK(lle.chosen_files() == (installed ? Files{"libmp3dec.sprx"} : Files{}));
+        }
+        // pspocket's cellAdec: a firmware-first core's table from its module when there is one, else nothing (its own
+        // core, called directly); never pspocket's own tables.
+        lle.decide(game, bound);
+        lle.link_host_imports(game, *f.hle);
+        if (ffmpeg) {
+            const loader::PrxModule* mp3 = installed ? lle.load("cellMP3dec", *f.hle, &why) : nullptr;
+            CHECK(f.hle->imported("cellMP3dec", kMp3Ops) == (mp3 ? mp3->variables.at({"cellMP3dec", kMp3Ops}) : 0u));
+            CHECK(f.hle->imported("cellMP3dec", kMp3Ops) != f.hle->link_variable("cellMP3dec", kMp3Ops));
+        }
+        CHECK(f.hle->imported("cellAdec", kLpcmOps) == 0);
+        if (ffmpeg) CHECK(f.hle->imported("cellAtracXdec", kAtracXOps) == 0); // not imported with FFmpeg (D-198)
     }
     fs::remove_all(root);
 }
