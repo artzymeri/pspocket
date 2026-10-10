@@ -368,7 +368,11 @@ Left (939, 2026-10-10). What each part needs (a session without the firmware cou
   helpers' read and write families): no firmware module has them; their arguments are to be read in a game's own copy
   of the C library.
 - To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
-  cellFiber, the codec cores' version queries.
+  cellFiber, the codec cores' version queries; and cellVdec's DivX 3.11, VC-1 and MVC. The comparisons are written
+  (D-597: tests/hle/test_*_compare.cpp over compare_util.hpp, hidden from ctest until each matches): on the Mac,
+  `PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare]"`
+  prints each library's differences from Sony's module. Writing them found a bug in cellPngEnc: a picture with more
+  than one text chunk aborted its stream (D-598, fixed).
 Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,
 services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
 interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
