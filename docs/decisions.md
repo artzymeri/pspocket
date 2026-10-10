@@ -9878,3 +9878,27 @@ PSPOCKET_COMPARE_SELF=1 runs it here: 816 observations, the halves agree, and ps
 refusals). Its function names are checked in every ctest run, with the library still firmware-first. When it matches
 on the Mac (after the fixes it shows), the test loses its [.] with cellJpgEnc's firmware-first marker, in a decision
 of its own.
+
+## D-619 · 2026-10-10 · The JPEG decoder takes an image's memory to decode it; cellJpgDec's Ext functions fuzzed
+
+The parser fuzzing (D-603) now covers cellJpgDec's Ext functions (D-617) too: tests/hle/test_fuzz_images.cpp feeds
+each damaged JPEG through ExtOpen's stream callback (the source's first bytes, then parts of 37, 512 or 4093 bytes
+read where the file lies, flush against unmapped memory) and decodes it with ExtDecodeData in parts to a display
+callback (at most 32 parts, one after another in a frame flush against unmapped memory too), or whole. Run longer
+(PSPOCKET_FUZZ_ITERS=2500), it found two ways a damaged file took the host's memory:
+- **A header alone.** pspocket's JPEG decoder (D-200) made its coefficient buffers when it read the frame header, for
+  the size the header claims: up to 65535 x 65535, some 13 GB at 4:2:0, zeroed at once; the process was killed for its
+  memory. Every ReadHeader of such a file did it (Sony's libjpgdec, libjpeg 6b, reads a header without taking its
+  image's memory). The buffers are now made by decode(), when the image is decoded (DecodeData bounds it by the
+  game's buffer, which must be guest memory); output() before decode() is refused. Nothing a game sees changes: the
+  digest of D-200's answers and images is the same.
+- **Parts of a huge image.** decode_parts (D-617) checked only that the first part's place was guest memory before
+  decoding the image whole; a header claiming a huge picture with one line a part went on to decode all of it. As
+  cellPngDec's and cellGifDec's parts (D-595), the image decoded whole is now at most 256 MB (the PS3's main memory),
+  else FATAL with the stream failed.
+Tests: tests/hle/test_jpgdec.cpp, a 16x16 JPEG whose header claims 8192 x 8192: read with no coefficients made,
+output() before decode() refused, and through cellJpgDec the header and parameters as libjpgdec gives them, DecodeData
+refused for a buffer that cannot hold the image (ARG); a gray one claiming 16384 x 16400 in parts: FATAL, no part out,
+the stream failed. The fuzz case: 2,107 damaged inputs a run (855 headers read, 144 decoded, 1,935 parts); with
+PSPOCKET_FUZZ_ITERS=2500, 5,250,007 inputs (2,074,101 headers read, 332,768 decoded, 4,400,740 parts), no fault, the
+process at most 71 MB.

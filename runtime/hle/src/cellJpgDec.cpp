@@ -799,6 +799,14 @@ s32 decode_parts(PPUContext& ctx, u32 h, u32 sa, Stream& s, u32 data, u32 ctrl, 
         set_state(base, h, sa, FAILED);
         return error(CELL_JPGDEC_ERROR_ARG);
     }
+    // The image is decoded whole before its parts go out (DecodeData bounds it by the game's buffer; parts have none
+    // that holds it): no larger than the PS3's main memory (D-619).
+    constexpr u64 kPartsImageMax = 0x10000000;
+    if (row * s.height > kPartsImageMax) {
+        PS_LOG_WARN(kChan, "cellJpgDecExtDecodeData: a {}x{} image in parts", s.width, s.height);
+        set_state(base, h, sa, FAILED);
+        return error(CELL_JPGDEC_ERROR_FATAL);
+    }
     if (s.mode == 1) {
         JpgDecs& d = decs();
         std::lock_guard lock(d.m);
