@@ -8695,3 +8695,140 @@ opened by OpenExt on its resource and fed by DecodeAuEx2 (the unknown words set 
 every callback, item, information block and picture the same, every answer; OpenExt's refusals; SetPts' answers
 before and in a sequence and after Close; DecodeAuEx2's refusals (no information, no size or start, the decode modes,
 no sequence, a closed decoder).
+
+## D-591 · 2026-10-10 · The codec cores' operation tables and PTS functions, pspocket's own cores behind them
+
+On a PS3 each of cellAdec's codec core modules exports the table Sony's libadec calls it through (CellAdecCoreOps,
+twelve function descriptors) and, where its module corrects a missing PTS itself, a _SceAdecCorrectPtsValue_* function;
+RPCS3 exports both for the cores it has (cellAdec.cpp's LPCM, cellAtracXdec.cpp's four ATRAC3plus tables). pspocket's
+own cores (D-197, D-198, D-577 to D-579) were reachable only from its own front end. Each is now also offered as its
+module's exports (runtime/hle/src/adec_tables.cpp), for Sony's modules and any other caller:
+
+- **The tables**, each a variable of its library (Registry::add_variables, as D-567), 48 bytes laid out when first
+  linked, under RPCS3's names and NIDs: g_cell_adec_core_ops_lpcm (cellAdec, 0x369D9D3A), the four
+  g_cell_adec_core_ops_atracx* (cellAtracXdec), and in a build with FFmpeg (as their cores) _Mp3 (cellMP3dec), _mpmcl1
+  (cellMPL1dec), _mpmc (cellM2BCdec), _M4Aac, _M4Aac2ch and _M4Aac2chmod (cellM4AacDec, cellM4AacDec2ch,
+  cellM4AacDec2chmod), _ac3 (cell_libac3dec) and _atrac3 (cellAtrac3dec). Each entry is the descriptor of an internal
+  function of cellAdec, _CellAdecCoreOp<operation>_<core> (RPCS3's names; its NID nid_of of the name), which calls the
+  core's own code, the AdecCore pspocket's front end calls: nothing is decoded twice. Being internal, they are no
+  functions of the cores' libraries: cellAtracXdec still has none on the host (host_has), so the comparison of
+  ATRAC3plus with Sony's libadec and libatxdec (D-198, D-193's harness) still runs Sony's core.
+- **The ABI** (RPCS3 cellAdec.h). getMemSize writes CellAdecAttr's workMemSize; open and openExt take the core's handle,
+  the four notifications as (function, argument) pairs and the resource (openExt also the SPURS resource); getVersion
+  writes the version and returns nothing; getPcmHandleNum and getBsiInfoSize return their numbers; the others as the
+  front end calls the core. A pointer RPCS3 ensure()s that is not guest memory (the core's handle, for its context's
+  size; the resource, parameters, access unit information, attributes, version) and a notification without a function
+  are logged and refused with CELL_ADEC_ERROR_ARG (D-042).
+- **The notifications.** A core opened through its table notifies the functions its open was given, as guest calls with
+  RPCS3's arguments: AUDONE (PCM handle, argument), PCMOUT (PCM handle, PCM address, size, argument, a pointer to the
+  information block's address, the PTS type, the error), ERROR (error, argument), SEQDONE (argument). pspocket's front
+  end opens its cores with its own four functions marked direct (CoreNotify), and the core calls them as C++, as
+  before. A core keeps the pairs where its context has them and, in a word its layout leaves unused, whether they are
+  guest functions: LPCM at +0x114, ATRAC3plus at +0x12C, the cores on FFmpeg at +0x1A0 (CoreNotifier, store_notify). A
+  core's thread function is linked at its first open, as a process driving a core through its table need not import
+  cellAdec.
+- **The PTS functions**, with FFmpeg: _SceAdecCorrectPtsValue_mpmcl1 (cellMPL1dec), _mpmc (cellM2BCdec), _M4Aac,
+  _M4Aac2ch and _M4Aac2chmod (cellM4AacDec, cellM4AacDec2ch, cellM4AacDec2chmod), RPCS3's NIDs: (core handle,
+  CellCodecTimeStamp*) corrected by the core's own rule (AdecCore::correct_pts, D-577: its last PTS plus that frame's
+  length), CELL_OK. Half a timestamp answers FATAL, as the front end's rule does; a core of another codec or a pointer
+  that is not guest memory is logged and FATAL. MP3, AC-3 and ATRAC3 have none (libadec corrects theirs with its fixed
+  steps).
+- **Which serves (D-563, D-175).** The cores on FFmpeg are not compared with Sony's yet: their eight libraries are
+  firmware-first, so a game or firmware module importing one gets Sony's module where the system software has it, and
+  pspocket's table and PTS function where it does not. The compared cores are not marked: LPCM (cellAdec, D-197) and
+  ATRAC3plus (cellAtracXdec, D-198). What the loader does with an importer of theirs: a game's import of one of their
+  tables is the host's (the host exports it and the library is not forced, D-503), and so is a firmware module's
+  (D-593); libadec.sprx and libatxdec.sprx are not loaded for them. With --lle, Sony's serve, as for any library. In a
+  build without FFmpeg there is no ATRAC3plus table of pspocket's and libatxdec serves as before.
+- **pspocket's own front end** still calls its cores directly. core_for asks first for the table cellAdec's imports
+  linked, and the loader links only firmware modules' exports there (LleModules::link_host_imports): with the system
+  software a firmware-first codec decodes on Sony's core, without it on pspocket's, called directly; pspocket's own
+  tables never come back to it the long way through its imports. LPCM and ATRAC3plus have no imported table (cellAdec
+  imports none, D-198) and stay on pspocket's cores. A test links pspocket's own table as an import to drive a core
+  through it as libadec would; open keeps the table in the context (core_ops), so the decoder stays on it.
+
+Tests: tests/hle/test_adec.cpp (LPCM's table driven as libadec drives a core, its twelve entries called as guest code
+and the notifications coming back as guest calls: every answer, item, information block, callback and PCM output the
+same as through the direct path; the four ATRAC3plus tables likewise, the error frame's notification and cellAdecOpenEx
+reaching openExt), tests/hle/test_adec_cores.cpp (each core on FFmpeg through its table the same as directly: MP3,
+MPEG layer I with its PTS function, ATRAC3, and with the tests' encoders layer II, the three AAC tables and AC-3; the
+PTS functions on a core's context: none before stays none, a given PTS kept, a missing one corrected by 720 and then
+1152 ticks, the 33-bit carry, and the three refusals), tests/hle/test_lle.cpp (the markers; a synthetic firmware module
+importing LPCM's table gets pspocket's with and without the core's module installed, one importing MP3's gets
+pspocket's without and Sony's with, a game likewise; cellAdec's own imports get Sony's MP3 table or nothing, never
+pspocket's, and no LPCM or ATRAC3plus table), tests/hle/test_hle.cpp (the HLE NID check now covers the variables too:
+each NID is nid_of of its name or the NID database's). scripts/progress.py's own library functions: 5,654 before, 5,673
+after (of 6,625): the 13 tables, the 5 PTS functions and D-592's table.
+
+## D-592 · 2026-10-10 · cellDmuxPamf's table on pspocket's PAMF core; the raw elementary stream core stays Sony's
+
+On a PS3 libdmux calls the PAMF core only through the table libdmuxpamf exports, g_cell_dmux_core_ops_pamf
+(CellDmuxCoreOps, fourteen descriptors), as RPCS3 does (cellDmuxPamf.cpp); pspocket's cellDmux calls its core directly
+(D-194). The core is now offered the same way (runtime/hle/src/cellDmuxPamf.cpp, dmux.hpp):
+
+- **The table**: a variable of cellDmuxPamf (0x28B2B7B2, RPCS3's REG_VNID), 56 bytes laid out when first linked, whose
+  entries are descriptors of internal functions of cellDmux under RPCS3's names (_CellDmuxCoreOpQueryAttr to
+  _CellDmuxCoreOpResetStreamAndWaitDone, each NID nid_of of its name): RPCS3's checks of the caller's pointers, then the
+  core_* function pspocket's cellDmux calls itself. QueryAttr writes CellDmuxPamfAttr; QueryEsAttr writes
+  CellDmuxPamfEsAttr whatever its answer, as RPCS3. Being internal, they are no functions of cellDmuxPamf, so the
+  comparison of cellDmux with Sony's libdmux (D-194) still runs Sony's libdmuxpamf.
+- **Open and EnableEs** keep the caller's notifications where libdmuxpamf keeps them: the CellDmuxPamfHandle (0x1C) at
+  the start of the demuxer's memory (its DmuxPamfContext, then demux done, program end code and fatal error; the program
+  end code's function only when the PAMF specific information asks for that callback) and the CellDmuxPamfEsHandle
+  (0x14) at the start of the stream's (its DmuxPamfElementaryStream, then access unit found and flush done). The handle
+  is given back whatever the answer, as RPCS3. A notification RPCS3 requires without a function or an argument, a
+  pointer that is not guest memory, or memory not aligned to 16 bytes or too small for its handle: PAMF's ARG (D-042).
+- **A demuxer opened through the table** notifies those functions, as guest calls on its PPU thread with RPCS3's
+  arguments: demux done and fatal error (the handle, CELL_OK, the argument), program end code (the handle, the
+  argument), flush done (the stream's handle, the argument), and access unit found (the stream's handle, a DmuxAuInfo,
+  the argument). The DmuxAuInfo (0x30 bytes, on the thread's stack) is the CellDmuxAuInfo (address, size, auMaxSize 0,
+  random access, user data, PTS, DTS) and the address and size of the unit's specific information, which is copied
+  into the stream's DmuxPamfElementaryStream (+0x34) as libdmuxpamf does. An answer other than 0 means a full queue: the
+  unit is reported again after a release. pspocket's cellDmux is still notified directly.
+- **createThread and joinThread.** libdmuxpamf's open starts the demuxer's thread, and so do RPCS3's and pspocket's;
+  RPCS3's createThread starts another on the same context, which could only race the first for its events (libdmux
+  never calls it). pspocket keeps the one thread: createThread answers CELL_OK, logged once. joinThread (RPCS3: every
+  stream let go, the SPU side closed, the PPU thread joined) stops it; after it only close is taken (anything else is
+  logged and FATAL: the SPU side is gone and would never answer), a second joinThread is CELL_OK, logged, and close does
+  not join again. The thread's function is linked when the first demuxer opens, as a process driving the core through
+  its table need not import cellDmux.
+- **No firmware-first marker**: the core is compared with libdmuxpamf (D-194). A game or firmware module importing the
+  table gets pspocket's (D-593); libdmuxpamf.sprx is not loaded for it.
+- **The raw elementary stream core** (g_cell_dmux_core_ops_raw_es, 0x9728A0E9, with which libraries other than libdmux
+  demux a bare elementary stream) is left to Sony's module, for two reasons. Its table is cellDmuxPamf's too, and which
+  implementation serves is decided per library: marked firmware-first, as an uncompared core must be (D-563), Sony's
+  module would take the compared PAMF table with it wherever the system software is installed; unmarked, an uncompared
+  raw core of pspocket's would displace Sony's. And pspocket's demultiplexer has RPCS3's raw path only on its SPU side
+  (dmux_pamf.cpp): the PPU side's raw variants (RPCS3's _CellDmuxCoreOpSetStream, QueryEsAttr and EnableEs with raw_es:
+  the filter read as a raw stream's, no specific information, other memory sizes) are not written, and none of it has
+  run or been compared. So a module importing the raw table gets Sony's libdmuxpamf where it is installed, which then
+  serves that module's PAMF table too (one implementation of a library, D-175); without the system software the raw
+  table stays unlinked and is listed. To do, on the Mac: the raw variants, compared with libdmuxpamf's raw core, then
+  the table exported, unmarked.
+
+Tests: tests/hle/test_dmux.cpp (the table driven from guest code as libdmux drives it, in a process that does not import
+cellDmux, with guest notifications that log their arguments: the same access units as cellDmux's own run hands the game,
+to their addresses, sizes, timestamps, random access flags, user data and specific information, each notification with
+RPCS3's arguments; the table's entries, the attributes, both handles and the notifications kept in them; the refusals
+(ARG, UNKNOWN_STREAM); flush, reset, disable and close; createThread and joinThread).
+
+## D-593 · 2026-10-10 · The loader: a module's imported variable the host exports is the host's, as a function is
+
+LleModules::choose took a firmware module's imported variable from a candidate module or from one that could join; its
+comment still said "the host exports none", from before D-503. A function import already went to the host when the
+host has it and its library is not forced, and so did the game's own imported variables (D-503) and load_file's
+linking of a module's (the host's variable when the library's module is not chosen). With the codec cores' tables on
+the host (D-591, D-592), a firmware module importing one would have brought in the core's module although the host
+serves the table, or, where no module exports it or that module could not join, had a gap listed that load_file then
+linked to the host's variable.
+
+- A firmware module's imported variable now comes, as a function does, from a candidate module, else from the host when
+  it exports it and its library is not forced (a forced library's module joins and serves it, D-563), else from a
+  module that can join; one that nothing exports stays unlinked and is listed, as before (D-177).
+- The libraries whose variables the modules chosen link to the host are the host's for the rest of the process, as the
+  libraries of their functions are (host_linked_): a module of one of them can no longer join later, so one
+  implementation serves each library.
+
+Tests: tests/hle/test_lle.cpp (D-591's test: a synthetic module importing LPCM's table is chosen with no gap and gets
+pspocket's table, with and without the core's module installed; one importing MP3's firmware-first table brings in
+Sony's module where it is installed). The other loader tests pass unchanged.
