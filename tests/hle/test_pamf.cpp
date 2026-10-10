@@ -15,6 +15,7 @@
 
 #include "firmware_compare.hpp"
 #include "hle_test_util.hpp"
+#include "pamf_writer.hpp"
 
 using namespace pspocket;
 using namespace pspocket::hle::test;
@@ -30,56 +31,11 @@ constexpr u32 STREAM_NOT_FOUND = 0x80610501, INVALID_PAMF = 0x80610502, INVALID_
               EP_NOT_FOUND = 0x80610507, NOT_AVAILABLE = 0x80610508;
 constexpr u32 TYPE_AVC = 0, TYPE_ATRAC3PLUS = 2, TYPE_LPCM = 3, TYPE_VIDEO = 20, TYPE_AUDIO = 21;
 
-// The header: sequence info at 0x50, its grouping period at 0x70, the group at 0x82, two 48-byte stream headers at
-// 0x88, the entry point tables right after them (0xE8, then 0x10C), as libpamf lays them out.
+// The header (pamf_writer.hpp's), in guest memory at kHdr.
 void write_pamf(u8* b)
 {
-    std::memset(b + kHdr, 0, kHeaderSize);
-    std::memcpy(b + kHdr, "PAMF0041", 8);
-    ps_write32(b, kHdr + 0x08, 1);    // header size, in 2048-byte units
-    ps_write32(b, kHdr + 0x0C, 0x10); // data size
-    const u32 seq = kHdr + 0x50;
-    ps_write32(b, seq, 0x94);                  // size, up to the end of the streams
-    ps_write32(b, seq + 0x08, 0x1000);         // start pts
-    ps_write32(b, seq + 0x0E, 0x100000);       // end pts
-    ps_write32(b, seq + 0x12, 0xFF123456);     // mux rate bound (22 bits used)
-    ps_write32(b, seq + 0x1A, 2);              // total streams
-    ps_write8(b, seq + 0x1F, 1);               // grouping periods
-    const u32 gp = kHdr + 0x70;
-    ps_write32(b, gp, 0x74);
-    ps_write32(b, gp + 0x06, 0x1000);
-    ps_write32(b, gp + 0x0C, 0x100000);
-    ps_write8(b, gp + 0x11, 1); // groups
-    const u32 group = kHdr + 0x82;
-    ps_write32(b, group, 0x62);
-    ps_write8(b, group + 5, 2); // streams
-    // Stream 0: AVC, channel 0, 3 entry points at 0xE8. High profile 4.1, 1280x720, frame-MBs-only, 29.97 fps
-    // (frameRateInfo 3 + 1), SAR given, signal information (format 5, full range, BT.709), CABAC, deblocking.
-    const u32 avc = kHdr + 0x88;
-    ps_write8(b, avc + 0, 0x1b);
-    ps_write8(b, avc + 4, 0xe0);
-    ps_write32(b, avc + 8, 0xE8);
-    ps_write32(b, avc + 12, 3);
-    const u8 avc_info[26] = {100, 41, 0xC4, 0xff, 0, 16, 0, 9, 0, 80, 0, 45, 0, 0, 0, 0, 0, 0, 0, 8, 0xB0, 1, 1, 1,
-        0xE2, 0x30};
-    std::memcpy(b + avc + 16, avc_info, sizeof avc_info);
-    // Stream 1: ATRAC3plus, channel 0, 1 entry point at 0x10C; stereo, 48 kHz.
-    const u32 at3 = kHdr + 0xB8;
-    ps_write8(b, at3 + 0, 0xdc);
-    ps_write8(b, at3 + 4, 0xbd);
-    ps_write8(b, at3 + 5, 0x00);
-    ps_write32(b, at3 + 8, 0x10C);
-    ps_write32(b, at3 + 12, 1);
-    ps_write8(b, at3 + 16 + 2, 2);
-    ps_write8(b, at3 + 16 + 3, 1);
-    // Entry points: value0 (indexN - 1 in the top two bits, the reference picture offset), pts, rpn offset.
-    const u32 eps[3][3] = {{(1u << 14) | 5, 0x1000, 0}, {(1u << 14) | 6, 0x5000, 4}, {(2u << 14) | 7, 0x9000, 8}};
-    for (u32 i = 0; i < 3; i++) {
-        ps_write16(b, kHdr + 0xE8 + 12 * i, static_cast<u16>(eps[i][0]));
-        ps_write32(b, kHdr + 0xE8 + 12 * i + 4, eps[i][1]);
-        ps_write32(b, kHdr + 0xE8 + 12 * i + 8, eps[i][2]);
-    }
-    ps_write32(b, kHdr + 0x10C + 4, 0x1000);
+    const std::vector<u8> header = pspocket::hle::test::pamf::pamf_header();
+    std::memcpy(b + kHdr, header.data(), header.size());
 }
 
 u32 code(u64 r) { return static_cast<u32>(r); }

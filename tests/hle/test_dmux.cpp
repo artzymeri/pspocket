@@ -22,6 +22,7 @@
 #include "dmux_pamf.hpp"
 #include "firmware_compare.hpp"
 #include "hle_test_util.hpp"
+#include "pamf_writer.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
@@ -30,119 +31,11 @@
 using namespace pspocket;
 using namespace pspocket::hle::test;
 namespace as = pspocket::recomp::ppu::as;
+using namespace pspocket::hle::test::pamf;
 
 namespace {
 
-// ---- the stream
-
-constexpr u32 kPack = 0x800;
 constexpr u64 kNoTs = ~0ull;
-
-struct Pes {
-    u8 stream_id = 0;
-    std::vector<u8> data; // after the PES header (private streams: from their private header)
-    std::optional<u64> pts, dts;
-    int rap_channel = -1; // a system header and a private stream 2 naming this video channel come first
-};
-
-void put_ts(std::vector<u8>& out, u8 prefix, u64 ts)
-{
-    out.push_back(static_cast<u8>(prefix << 4 | ((ts >> 29) & 0x0E) | 1));
-    const u16 mid = static_cast<u16>(((ts >> 14) & 0xFFFE) | 1), low = static_cast<u16>(((ts << 1) & 0xFFFE) | 1);
-    out.insert(out.end(), {static_cast<u8>(mid >> 8), static_cast<u8>(mid), static_cast<u8>(low >> 8), static_cast<u8>(low)});
-}
-
-void put_be16(std::vector<u8>& out, usize v) { out.insert(out.end(), {static_cast<u8>(v >> 8), static_cast<u8>(v)}); }
-
-// One pack: header, maybe the system header and private stream 2, the PES packet, padding to 2048 bytes.
-std::vector<u8> pack(const Pes& p)
-{
-    std::vector<u8> out = {0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3, 0xF8};
-    if (p.rap_channel >= 0) {
-        out.insert(out.end(), {0x00, 0x00, 0x01, 0xBB});
-        put_be16(out, 12);
-        out.insert(out.end(), {0x80, 0x04, 0xE1, 0x04, 0xE1, 0xFF, 0xE0, 0xE0, 0x00, 0xBD, 0xE0, 0x00});
-        REQUIRE(out.size() == 32); // the next start code 16-byte aligned, as libdmuxpamf's SPU reads it
-        out.insert(out.end(), {0x00, 0x00, 0x01, 0xBF});
-        put_be16(out, 0x10);
-        out.insert(out.end(), {0x00, static_cast<u8>(p.rap_channel)});
-        out.insert(out.end(), 14, 0xFF);
-    }
-    const u8 flags = static_cast<u8>((p.pts ? 0x80 : 0) | (p.dts ? 0x40 : 0));
-    const u8 header_data_length = static_cast<u8>((p.pts ? 5 : 0) + (p.dts ? 5 : 0));
-    out.insert(out.end(), {0x00, 0x00, 0x01, p.stream_id});
-    put_be16(out, 3 + header_data_length + p.data.size());
-    out.insert(out.end(), {0x81, flags, header_data_length});
-    if (p.pts) put_ts(out, p.dts ? 3 : 2, *p.pts);
-    if (p.dts) put_ts(out, 1, *p.dts);
-    out.insert(out.end(), p.data.begin(), p.data.end());
-    REQUIRE(out.size() + 6 <= kPack);
-    const usize padding = kPack - out.size() - 6;
-    out.insert(out.end(), {0x00, 0x00, 0x01, 0xBE});
-    put_be16(out, padding);
-    out.insert(out.end(), padding, 0xFF);
-    return out;
-}
-
-// Access unit bodies never hold a start code prefix (no 0 or 1 bytes) or an ATRAC3plus sync word (no 0x0F).
-u8 body_byte(u32 seed, u32 i) { return static_cast<u8>(0x20 + (seed * 37 + i * 11) % 0xD0); }
-
-// AVC: four access units, each from an access unit delimiter (00 00 01 09) on.
-constexpr u32 kAvcSizes[4] = {900, 2500, 300, 700};
-std::vector<u8> avc_es()
-{
-    std::vector<u8> es;
-    for (u32 u = 0; u < 4; u++) {
-        es.insert(es.end(), {0x00, 0x00, 0x01, 0x09, 0x10});
-        for (u32 i = 5; i < kAvcSizes[u]; i++) es.push_back(body_byte(u, i));
-    }
-    return es;
-}
-
-// ATRAC3plus: five frames, each a sync word (0x0FD0), the size field ((n + 1) * 8 + 8 bytes with the 8-byte header),
-// then the frame.
-constexpr u32 kAt3Frame = (0x1F + 1) * 8 + 8, kAt3Frames = 5;
-std::vector<u8> at3_es()
-{
-    std::vector<u8> es;
-    for (u32 f = 0; f < kAt3Frames; f++) {
-        es.insert(es.end(), {0x0F, 0xD0, 0x00, 0x1F});
-        for (u32 i = 4; i < kAt3Frame; i++) es.push_back(body_byte(10 + f, i));
-    }
-    return es;
-}
-
-std::vector<u8> slice(const std::vector<u8>& v, usize from, usize to) { return {v.begin() + static_cast<std::ptrdiff_t>(from), v.begin() + static_cast<std::ptrdiff_t>(to)}; }
-
-std::vector<u8> private_stream(u8 id, std::vector<u8> data)
-{
-    data.insert(data.begin(), {id, 0x00, 0x00, 0x00}); // the private header: no extra header bytes
-    return data;
-}
-
-constexpr u64 kPtsHigh = 0x80003000; // bit 31 set: sign-extended from s32 on LLE
-
-// The program stream: video cut inside the second unit, then between 00 00 and 01 09 of the third unit's delimiter;
-// audio cut between 0x0F and 0xD0 of the fourth frame's sync word; a program end code last.
-std::vector<u8> program_stream()
-{
-    const std::vector<u8> v = avc_es(), a = at3_es();
-    const usize v_cut1 = 1500, v_cut2 = 900 + 2500 + 2, a_cut = 3 * kAt3Frame + 1;
-    std::vector<u8> s;
-    const auto add = [&](const Pes& p) {
-        const std::vector<u8> pk = pack(p);
-        s.insert(s.end(), pk.begin(), pk.end());
-    };
-    add({0xE0, slice(v, 0, v_cut1), 0x1000, 0x0F00, 0});
-    add({0xBD, private_stream(0x00, slice(a, 0, a_cut)), 0x1000, std::nullopt});
-    add({0xE0, slice(v, v_cut1, v_cut2), 0x2000, std::nullopt});
-    add({0xBD, private_stream(0x00, slice(a, a_cut, a.size())), 0x5000, std::nullopt});
-    add({0xE0, slice(v, v_cut2, v.size()), kPtsHigh, std::nullopt});
-    std::vector<u8> end(kPack, 0xFF);
-    end[0] = 0x00, end[1] = 0x00, end[2] = 0x01, end[3] = 0xB9;
-    s.insert(s.end(), end.begin(), end.end());
-    return s;
-}
 
 // ---- the demultiplexer alone
 
