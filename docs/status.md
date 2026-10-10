@@ -355,7 +355,15 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   libmixer, the C library's threads, cellPngEnc; then the whole runtime (D-584 to D-587, scripts/tsan.sh: 1,063
   reports to none, the guest code's own accesses suppressed with reasons). Fixed on the way: an SPU's call answered
   after a reply could land, a thread's stack freed after its join returned, RSX labels and FIFO pointers without
-  ordering (a FIFO reset could lose a frame's commands), SPURS, libsync2 and the media threads' shared words.
+  ordering (a FIFO reset could lose a frame's commands), SPURS, libsync2 and the media threads' shared words. The
+  day's new code swept again (D-600 to D-602): libsync2's queue entries, cellVdec's frame rate, and a host variable
+  handed to a second thread before it was laid out, fixed.
+- Memory safety (D-603 to D-605): pspocket's parsers of game data (executables, SELF, NPD, packages, discs,
+  PARAM.SFO, trophies, fonts, images, movies, sound) fuzzed with damaged copies of synthetic inputs in every test run
+  ("[fuzz]"), and scripts/asan.sh runs the tests under AddressSanitizer and UBSan. Fixed: damaged SELFs, NPD blocks,
+  PRX segments and module tables read or written past their buffers; the JPEG decoder's tables; the AC-3 core's short
+  units; cellPngEnc's palette pictures; the SPU interpreter's address overflow. The tree builds and tests without
+  FFmpeg too (D-606).
 Left (934, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSpursJq (63, libspurs_jq), cellSailRec (58)
   and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (28, its wire protocol), the codec

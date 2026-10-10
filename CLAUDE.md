@@ -85,6 +85,9 @@ ctest --test-dir build/host --output-on-failure
 - Use your own build directory (`build/<name>`) when several builds run at once.
 - Data races: `scripts/tsan.sh [groups] [--no-build]` builds `build/tsan` with ThreadSanitizer and runs the threaded
   test groups with `scripts/tsan.supp` (D-571, D-585); every group should report none.
+- Memory safety: `scripts/asan.sh [groups] [--no-build] [--no-fuzz]` builds `build/asan` with AddressSanitizer and
+  UBSan and runs the tests (D-604); the parser fuzzing is the "[fuzz]" tests, longer with
+  `PSPOCKET_FUZZ_ITERS=<n>` (D-603).
 
 ## Layout
 
