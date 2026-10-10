@@ -18,8 +18,10 @@
 // 128-byte units) and argument come from the CellSpursTaskset2's table at 0x1980 when it starts, and when it exits
 // the callback's code is loaded at 0x10000 and run with the taskset, task ID, exit code and argument (RPCS3
 // cellSpursSpu.cpp spursTasksetOnTaskExit, a draft of libsre's; Sony's libvdec chains its H.264 decoder's tasks so).
-// Not implemented (each stops with a fatal log): CellSpursTaskset2 tasks and libsre's own exit code handler, which
-// run more of libsre's SPU code; elf bit 1 (a debugger break) is logged.
+// libsre's own exit code handler is done natively (store_exit_code). A task with bit 2 is a CellSpursTaskset2's own
+// task (cellSpursCreateTask2, D-626): when it exits, libsre's Task2 handler's work is done natively (task2_exit): its
+// exit code into the taskset's exit slot, then its bit of the taskset's lv2 event flag, which cellSpursJoinTask2 waits
+// on. Elf bit 1 (a debugger break) is logged.
 
 #include <atomic>
 #include <bit>
@@ -28,6 +30,7 @@
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
+#include "pspocket/lv2/sync.hpp"
 #include "pspocket/spu/runtime.h"
 #include "spu_programs.hpp"
 #include "spurs_native.hpp"
@@ -99,6 +102,7 @@ private:
     [[noreturn]] void fatal(std::string_view what);
     void run_exit_callback(u32 exit_code);
     void store_exit_code(u32 container, u32 exit_code);
+    void task2_exit(u32 exit_code);
 
     u32 task_id() const { return ps_read32(ls_, ls::ts_task_id); }
     u8* guest(u32 ea) const { return base_ + ea; }
@@ -298,7 +302,8 @@ void Policy::attach_code(u32 elf)
 void Policy::start_task(u32 id, u64 elf)
 {
     const u32 flags = static_cast<u32>(elf & 7);
-    if (flags & 4) fatal("a CellSpursTaskset2 task is not implemented");
+    if ((flags & 4) && ps_read32(base_, taskset_ + ts_off::size) <= 0x28FF)
+        fatal(std::format("task {} is a CellSpursTaskset2 task (ELF word {:#x}) in a taskset that is not one", id, elf));
     if (flags & 2) PS_LOG_WARN(kTaskChan, "task {} of taskset {:#x} asks for a debugger break at dispatch; ignored", id, taskset_);
     u32 entry = 0, lowest = 0;
     ps_write32(ls_, ls::ctx_guid, ls::task_top);
@@ -472,8 +477,9 @@ void Policy::run_exit_callback(u32 exit_code)
 // into the task's exit code container, one 128-byte line: the status word at +0x20 (bit 0 initialized, bit 2 an exit
 // code stored, bit 16 a PPU thread waits, bit 17 an SPU task waits), the exit code at +0x28, a waiting task's taskset
 // (u64) at +0x30 and its ID (a byte) at +0x38. A NULL or misaligned container, or one not initialized, is left alone (libsre's
-// handler returns an error nobody reads). Then the task that waits is signalled; a waiting PPU thread (an event flag
-// at +0x40) is not implemented.
+// handler returns an error nobody reads). Then the task that waits is signalled. A PPU thread waiting in pspocket's
+// cellSpursTaskExitCodeGet sleeps until the container's line changes, which this update does (D-627), and marks
+// nothing; bit 16 (libsre's PPU waiter, with an event flag at +0x40) is set by no native code: it stops loudly.
 void Policy::store_exit_code(u32 container, u32 exit_code)
 {
     if (!container || (container & 0x7F)) {
@@ -508,6 +514,31 @@ void Policy::store_exit_code(u32 container, u32 exit_code)
     if (old & (1u << 16)) fatal(std::format("exit code container {:#x}: a PPU thread waiting on it is not implemented", container));
 }
 
+// libsre's handler for a CellSpursTaskset2's own tasks (the SPU code whose descriptor cellSpursCreateTaskset2 keeps at
+// 0x78; D-626), natively, after the task's destroy request: its exit code into the first word of the task's exit slot
+// in the taskset (0x1980 + 16 * id), in one update of the slot's line, then its bit (id % 64) of the taskset's lv2
+// event flag for its half (0x1898 for tasks 0..63, 0x189C for 64..127), which cellSpursJoinTask2 waits on. The task's
+// ID stays out of reach of new tasks until it is joined (cellSpurs.cpp keeps that). A flag that does not exist (the
+// taskset not made by cellSpursCreateTaskset2, or destroyed) is logged: nobody can join the task then.
+void Policy::task2_exit(u32 exit_code)
+{
+    const u32 id = task_id();
+    const u32 slot = taskset_ + ts_off::exit_slots + 16 * id;
+    reservation_op(base_, slot, [&](u8* line) {
+        ps_write32(line, slot & (PS_RES_LINE_SIZE - 1), exit_code);
+        return true;
+    });
+    const u32 flag_id = ps_read32(base_, taskset_ + task2_flag_offset(id));
+    if (const auto flag = w_.sched.kernel.event_flag(flag_id)) {
+        flag->set(task2_flag_bit(id));
+    } else {
+        PS_LOG_ERROR(kTaskChan, "task {} of CellSpursTaskset2 {:#x} exited ({:#x}), but its lv2 event flag {:#x} does not "
+            "exist: no cellSpursJoinTask2 can take its exit code", id, taskset_, exit_code, flag_id);
+    }
+    PS_LOG_DEBUG(kTaskChan, "task {} of CellSpursTaskset2 {:#x}: exit code {:#x}, event flag {:#x} bit {}", id, taskset_,
+        exit_code, flag_id, id & 63);
+}
+
 // A task gave up the SPU (exit, yield, wait): its GUID in local store is cleared (the saved copy keeps it), then the
 // next task runs unless another workload should have the SPU.
 Next Policy::incident()
@@ -528,10 +559,12 @@ Next Policy::syscall()
     const u32 call = (number & 0x10) ? (number & 0x0F) : number;
     switch (call) {
     case 0: { // exit: the code is at 0x2FD0 (cellSpursTaskExit put it there)
-        const u32 flags = ps_read32(ls_, ls::ctx_flags);
-        if (flags == 4) fatal("a CellSpursTaskset2 task exits through libsre's exit handler (not implemented)");
+        // A CellSpursTaskset2 task by its TaskInfo's ELF word, read before the destroy request frees the ID (the
+        // execution context's flags at 0x2FD4 say the same, but sit in the quadword a task stores its exit code in).
+        const u64 elf = ps_read64(base_, taskset_ + ts_off::task_info + task_id() * ts_off::task_info_stride + ts_off::ti_elf);
         request(Request::Destroy);
-        if (static_cast<u32>(ps_read64(ls_, ls::ctx_exit_cb))) run_exit_callback(ps_read32(ls_, ls::ctx_exit_code));
+        if (elf & 4) task2_exit(ps_read32(ls_, ls::ctx_exit_code));
+        else if (static_cast<u32>(ps_read64(ls_, ls::ctx_exit_cb))) run_exit_callback(ps_read32(ls_, ls::ctx_exit_code));
         PS_LOG_DEBUG(kTaskChan, "SPURS {:#x}: task {} of taskset {:#x} exited ({:#x})", w_.sched.spurs, task_id(), taskset_,
             ps_read32(ls_, ls::ctx_exit_code));
         return incident();

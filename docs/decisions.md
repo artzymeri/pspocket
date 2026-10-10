@@ -9529,3 +9529,86 @@ pushers, two poppers) through the bodies, 3,000 entries each popped once and eac
 detach on two SPU threads (a port the game took passed by, the queue and m_bs, a thread that does not exist: ESRCH with
 nothing left connected), an SPU thread's sys_spu_thread_send_event on the port it was given waking a PPU thread blocked
 in GetPushPointer with the event queue, BUSY while one waits, an ANY2ANY queue's m_bs back to 0xFFFF0000.
+
+## D-626 · 2026-10-10 · cellSpurs: CellSpursTaskset2's own tasks, created, run and joined, unverified
+
+cellSpursCreateTask2, CreateTask2WithBinInfo, JoinTask2, TryJoinTask2 and DestroyTaskset2 are pspocket's own
+(runtime/hle/src/cellSpurs.cpp, spurs_taskset.cpp), unverified (D-594). RPCS3 has UNIMPLEMENTED stubs and declares no
+signatures; libsre was not read. What they are made from: the structures RPCS3 lays out (CellSpursTaskAttribute2
+{revision, sizeContext, eaContext (u64), lsPattern, name}, which _cellSpursTaskAttribute2Initialize fills;
+CellSpursTaskBinInfo {eaElf (u64), sizeContext, reserved, lsPattern}; CellSpursTaskset2's task_exit_code[128] at 0x1980);
+what cellSpursCreateTaskset2 makes for them as libsre does (D-171: the Task2 handler's descriptor at 0x78, two lv2 event
+flags "taskset2" that libsre's JoinTask2 waits on, a task name buffer of 128 names of 32 bytes); and the SDK's signatures
+as far as they are known: CreateTask2(taskset, &id, eaElf, argument, attribute2), CreateTask2WithBinInfo(taskset, &id,
+binInfo, argument, contextBuffer, name, reserved), JoinTask2(taskset, id, &exitCode), TryJoinTask2 the same,
+DestroyTaskset2(taskset). A CellSpursTaskset2 holds 128 tasks, as a CellSpursTaskset: its larger size is the exit slots
+and libsre's own fields.
+- **Creation.** A Task2 task is a task of the taskset (create_task: its checks, the lowest free ID, its TaskInfo, its
+  start) whose ELF word has bit 2, the mark for which the taskset policy runs libsre's Task2 handler at its exit. First the
+  taskset: NULL, 128-byte ALIGN, memory (FAULT); a CellSpursTaskset is PERM (as an exit code container on one is). Then
+  the task's own checks (check_task, as for any task); then the taskset's two event flags must exist (STAT: a
+  CellSpursTaskset2 made through the attribute's size, cellSpursTasksetAttributeSetTasksetSize, has none to be joined
+  with). Before it starts, its name (31 characters, the rest of its 32-byte slot zero) goes to the name buffer when the
+  taskset has one, its exit slot is cleared and its bit of the event flag cleared. CreateTask2's attribute may be NULL (no
+  context, no name); its revision and alignment are not checked. CreateTask2WithBinInfo: a NULL bin info is
+  NULL_POINTER; the ELF, context size and pattern come from it, the context from contextBuffer (a size with no buffer:
+  NULL_POINTER); the last argument is not read.
+- **Exit** (spurs_taskset.cpp task2_exit, libsre's Task2 handler's work natively): after the task's destroy request, its
+  exit code into the first word of its exit slot (0x1980 + 16 * id) in one update of the slot's line, then bit id % 64 of
+  the first event flag (tasks 0..63) or the second (64..127). The policy tells a Task2 task by its TaskInfo's ELF word: the
+  execution context's flags at 0x2FD4 share the quadword task code stores its exit code in (the tests' tasks splat it).
+  Before, such a task stopped with "not implemented" (D-171).
+- **The ID until the join.** A Task2 task's ID stays taken from its creation until JoinTask2 takes its exit code
+  (SpursHost::task2: the IDs created and not joined, by taskset), as a thread's resources stay until pthread_join, so a
+  task created meanwhile cannot take it and overwrite the code; every creation in a CellSpursTaskset2 passes them by.
+  Creating a taskset at the address forgets them.
+- **Join.** The taskset's checks; an ID past 127 INVAL; the exit code's memory (it may be NULL: nothing is written then);
+  a task that is not a Task2 task created and not yet joined SRCH (one of cellSpursCreateTask, one joined already), one
+  another JoinTask2 waits for BUSY. Then the task's bit, AND and CLEAR: sys_event_flag_wait, or for TryJoinTask2
+  sys_event_flag_trywait, whose EBUSY (the task has not exited) is TASK_ERROR_BUSY; the code from the slot; the ID free
+  again. A wait that DestroyTaskset2 ends is TASK_ERROR_SHUTDOWN (cellSpurs.h's 0x80410920, which nothing else uses);
+  another lv2 error becomes the task error with its low byte.
+- **DestroyTaskset2.** The taskset's checks; cellSpursShutdownTaskset and cellSpursJoinTaskset (their errors as they are);
+  then both event flags: their waiters woken (sys_event_flag_cancel), destroyed, their IDs cleared; the unjoined tasks
+  forgotten. Tasks that had not run are abandoned with it, as cellSpursShutdownTaskset leaves them (D-136).
+
+To compare with libsre on the Mac (each a guess until then): the five signatures (the attribute in CreateTask2, WithBinInfo's
+seventh argument); the checks, their order and codes (PERM, STAT, SRCH, BUSY, SHUTDOWN); whether libsre keeps an exited
+task's ID until it is joined; where its Task2 handler puts the exit code (the slot's first word, or elsewhere in
+task_exit_code) and which bit of which event flag it sets; whether JoinTask2 takes a NULL exitCode; what DestroyTaskset2
+does with tasks still running and joins still waiting. The comparison (D-629) holds the refusals of all five.
+
+Tests: tests/hle/test_spurs_task2.cpp (the placeholder): the five under their NIDs and unverified; CreateTask2's checks,
+none taking an ID; three tasks run and joined in another order, each with its code, their names in the buffer (one cut to
+31), TryJoinTask2 BUSY before they ran and SRCH after the join, a task of cellSpursCreateTask SRCH; an exited task's ID
+kept until its join, a join waiting for a task that waits for a signal, a second join BUSY, a NULL exitCode, seventy tasks
+at once (64..69 through the second flag); CreateTask2WithBinInfo's checks and a task with the bin info's context that
+waits and resumes; DestroyTaskset2's checks, a waiting join ended with SHUTDOWN, the flags destroyed, the workload gone, a
+new taskset at the same address.
+
+## D-627 · 2026-10-10 · cellSpurs: task exit code containers, Get and TryGet, and the container at task creation
+
+cellSpursTaskExitCodeGet and TryGet are pspocket's own, unverified (D-594; RPCS3: UNIMPLEMENTED stubs; libsre's PPU side
+was not read), and cellSpursCreateTaskWithAttribute's exit code container, which answered STAT ("not implemented") on a
+CellSpursTaskset2, now does its work (the function's checks, compared with libsre in D-047 and D-506, are unchanged):
+- **Creation with a container**: the task gets an exit callback (the ELF word's bit 0, as D-195's tasks): its exit slot
+  names the taskset's exit code handler (the descriptor a CellSpursTaskset2 keeps at 0x1900) with the container as its
+  argument, so the native taskset policy stores the code there when the task exits (D-195's handler, natively); the
+  container is bound before the task starts: its status word's bit 0, which libsre's handler requires and
+  cellSpursTaskExitCodeInitialize (zeroing, as libsre's) never sets, and a code stored before (bit 2) forgotten. A
+  container that is not guest memory is FAULT.
+- **Get and TryGet** (container, exitCode): NULL either (NULL_POINTER), the container's 128-byte ALIGN, memory (FAULT).
+  From one look at the container's line: not initialized (no task bound to it) STAT; the code stored: written, CELL_OK,
+  as often as asked (it stays until a task is bound again); else TryGet is BUSY (as cellSpursEventFlagTryWait) and Get
+  sleeps until the line changes (the handler's update), as cellSync's blocking calls do (D-169); the process ending
+  unwinds it. pspocket's Get marks nothing: libsre's PPU waiter sets bit 16 and waits on an event flag at +0x40 (D-195),
+  which the native handler has no need of and still stops loudly on (no native code sets it).
+
+To compare on the Mac: TryGet's and Get's answer for each status (the comparison, D-629, gives them for ten states);
+whether either clears anything; what libsre's creation writes into the container and the exit slot; libsre's PPU waiter
+(bit 16, the event flag at +0x40: which one, which bit).
+
+Tests: tests/hle/test_spurs_task2.cpp: both's checks, STAT unbound; a container bound by creation (its status, the task's
+ELF word and exit slot), TryGet BUSY before the task ran, a Get that waits for it, the code as often as asked; bound
+again to a task that waits for a signal (the old code forgotten, BUSY until the new one comes); a container that is not
+guest memory FAULT, on a CellSpursTaskset PERM. test_spurs_run.cpp's exit callback and handler tests are unchanged.

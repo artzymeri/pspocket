@@ -54,6 +54,7 @@ enum : u32 {
     CELL_SPURS_TASK_ERROR_ALIGN = 0x80410910,
     CELL_SPURS_TASK_ERROR_NULL_POINTER = 0x80410911,
     CELL_SPURS_TASK_ERROR_FATAL = 0x80410914,
+    CELL_SPURS_TASK_ERROR_SHUTDOWN = 0x80410920,
     CELL_SPURS_JOB_ERROR_AGAIN = 0x80410A01,
     CELL_SPURS_JOB_ERROR_INVAL = 0x80410A02,
     CELL_SPURS_JOB_ERROR_PERM = 0x80410A09,
@@ -92,7 +93,7 @@ constexpr u32 SPURS_IMG_ADDR_JOB_CHAIN_PM = 0x300;
 // CellSpursTaskset2 keeps at 0x1900: a marker here too (no task of a supported game has such a container).
 constexpr u32 SPURS_IMG_ADDR_TASK_EXIT_CODE_HANDLER = 0x400, kTaskExitCodeHandlerSize = 0x710;
 // libsre's handler for CellSpursTaskset2's own tasks (cellSpursCreateTask2), whose descriptor cellSpursCreateTaskset2
-// keeps at 0x78: a marker as well (those tasks are not implemented natively, D-171).
+// keeps at 0x78: a marker as well (the taskset policy does its work natively when such a task exits, D-626).
 constexpr u32 SPURS_IMG_ADDR_TASK2_HANDLER = 0x500, kTask2HandlerSize = 0x670;
 constexpr u32 CELL_SPURS_JOB_REVISION_0 = 0, CELL_SPURS_JOB_REVISION_1 = 1, CELL_SPURS_JOB_REVISION_2 = 2,
               CELL_SPURS_JOB_REVISION_3 = 3;
@@ -210,9 +211,25 @@ constexpr u32 task_info = 0x80, task_info_stride = 0x30, ti_args = 0x00, ti_elf 
               ti_ls_pattern = 0x20;
 constexpr u32 spurs = 0x60, args = 0x68, enable_clear_ls = 0x70, wkl_flag_wait_task = 0x72, wid = 0x74, x78 = 0x78,
               exception_handler = 0x1880, exception_handler_arg = 0x1888, size = 0x1890;
-// CellSpursTaskset2 only: its two lv2 event flags (task joins), the task name buffer (u64), the exit code handler.
-constexpr u32 event_flag_id1 = 0x1898, event_flag_id2 = 0x189C, task_name_buffer = 0x18A8, exit_code_handler = 0x1900;
+// CellSpursTaskset2 only: its two lv2 event flags (task joins: tasks 0..63 the first, 64..127 the second, bit id % 64),
+// the task name buffer (u64), the exit code handler, and each task's exit slot (16 bytes at exit_slots + 16 * id: an
+// exit callback's descriptor and argument, or a CellSpursTaskset2 task's exit code in its first word, D-626).
+constexpr u32 event_flag_id1 = 0x1898, event_flag_id2 = 0x189C, task_name_buffer = 0x18A8, exit_code_handler = 0x1900,
+              exit_slots = 0x1980;
 }
+// A CellSpursTaskset2 task's lv2 event flag (its ID's offset in the taskset) and bit (D-626).
+constexpr u32 task2_flag_offset(u32 id) { return id < 64 ? ts_off::event_flag_id1 : ts_off::event_flag_id2; }
+constexpr u64 task2_flag_bit(u32 id) { return u64{1} << (id & 63); }
+constexpr u32 CELL_SPURS_MAX_TASK_NAME_LENGTH = 32; // a name in the task name buffer, its NUL included
+
+// CellSpursTaskExitCode (128 bytes, 128-aligned) as libsre's exit code handler uses it (D-195, D-627): the status word
+// (bit 0 initialized: a task created with the container will store its code; bit 2 the code is stored; bit 16 a PPU
+// thread waits, libsre's own PPU side with an event flag at +0x40; bit 17 an SPU task waits), the exit code, and a
+// waiting SPU task's taskset (u64) and ID (a byte).
+namespace exitcode_off {
+constexpr u32 status = 0x20, code = 0x28, waiter_taskset = 0x30, waiter_id = 0x38, size = 0x80;
+}
+constexpr u32 kExitCodeInitialized = 1u, kExitCodeStored = 4u, kExitCodePpuWaits = 1u << 16, kExitCodeSpuWaits = 1u << 17;
 
 // CellSpursJobChainAttribute (8-aligned) and CellSpursJobChain (128-aligned; create clears 0x110 bytes), as libsre
 // lays them out (fw 4.92, D-054). RPCS3's cellSpurs.h swaps the attribute's name and haltOnError, puts maxGrabbedJob
@@ -267,9 +284,17 @@ struct Instance {
     bool helper_failed = false;
 };
 
+// A CellSpursTaskset2's own tasks (cellSpursCreateTask2, D-626), by the taskset's address: the IDs of those created and
+// not yet joined (a task that exited keeps its ID until cellSpursJoinTask2 takes its exit code, so a task created in
+// between cannot take it) and those a JoinTask2 waits for. Bit 127 - id, as the taskset's bit sets.
+struct Task2Ids {
+    u128 unjoined = 0, joining = 0;
+};
+
 struct SpursHost {
     std::mutex mutex;
     std::map<u32, Instance> instances;
+    std::map<u32, Task2Ids> task2;
 };
 
 inline SpursHost& host()
