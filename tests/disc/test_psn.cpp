@@ -239,7 +239,7 @@ TEST_CASE("ps_psn_install_pkg: a game's package into dev_hdd0, what it reports, 
     REQUIRE(ps_psn_install_pkg((root / "game.pkg").c_str(), hdd0.c_str(), collect, &lines, error, sizeof error) == 0);
     CHECK(read_file(game / "USRDIR" / "EBOOT.BIN") == elf);
     CHECK(read_file(game / "USRDIR" / "DATA.BIN") == std::vector<u8>(5000, 0x42));
-    CHECK(has_line(lines, std::format("installed 3 files ({} bytes) and 1 folders into {}",
+    CHECK(has_line(lines, std::format("installed 3 files ({} bytes) and 1 folder into {}",
                               spec.items[0].bytes.size() + elf.size() + 5000, game.string())));
     CHECK(has_line(lines, "the game's executable: " + (game / "USRDIR" / "EBOOT.BIN").string()));
     const fs::path out = root / "out" / "EBOOT.elf";
@@ -249,7 +249,8 @@ TEST_CASE("ps_psn_install_pkg: a game's package into dev_hdd0, what it reports, 
     // Again: the files not marked to overwrite are kept, and said to be.
     lines.clear();
     REQUIRE(ps_psn_install_pkg((root / "game.pkg").c_str(), hdd0.c_str(), collect, &lines, error, sizeof error) == 0);
-    CHECK(has_line(lines, "; 1 files already there kept"));
+    CHECK(has_line(lines, "installed 2 files (" + std::to_string(elf.size() + spec.items[0].bytes.size()) +
+                              " bytes) and 1 folder into " + game.string() + "; 1 file already there kept"));
 
     // Refused, each with its reason: no package, no hdd0 folder, a retail package without keys or another version's
     // update.

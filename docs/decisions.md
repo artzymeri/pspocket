@@ -8235,7 +8235,7 @@ extract_worker, extract_data and decrypt; unpkg.h's structures):
   A name with a leading "/" or a "." or ".." part (leaves_directory), one that reaches outside the install folder
   through a link already on disk (fill_data's canonical paths; a link that stays inside is followed), an entry of a
   type RPCS3 does not install, and a file entry without a name refuse the package. Unlike RPCS3, which checks as it
-  goes, every name and type is checked before anything is written.
+  goes, every name and type is checked before anything is written (links, as the folders are made).
 - **Updates** (check_target_app_version, on read_param_sfo's PARAM.SFO). A package whose PARAM.SFO is an update's
   (CATEGORY GD, with an APP_VER) is checked against the installed game's game/<TITLE_ID>/PARAM.SFO: with a
   TARGET_APP_VER, that must be the installed APP_VER, and the game must be installed; without one, a patch (package

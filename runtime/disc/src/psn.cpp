@@ -90,8 +90,10 @@ extern "C" int ps_psn_install_pkg(const char* pkg_path, const char* hdd0_dir, ps
     auto installed = recomp::install_pkg(pkg_path, hdd0_dir, report);
     if (!installed) return fail(error, error_size, installed.error().message);
     const recomp::PkgInstalled& r = *installed;
-    report(std::format("installed {} files ({} bytes) and {} folders into {}{}", r.files, r.bytes, r.folders,
-        r.install_path, r.kept ? std::format("; {} files already there kept", r.kept) : std::string()));
+    const auto count = [](u64 n, std::string_view what) { return std::format("{} {}{}", n, what, n == 1 ? "" : "s"); };
+    report(std::format("installed {} ({} bytes) and {} into {}{}", count(r.files, "file"), r.bytes,
+        count(r.folders, "folder"), r.install_path,
+        r.kept ? std::format("; {} already there kept", count(r.kept, "file")) : std::string()));
     if (r.eboot.empty()) return 0;
     // A game: which licence its executable needs (its NPD header), and whether the player's is in place.
     std::ifstream in(r.eboot, std::ios::binary);
