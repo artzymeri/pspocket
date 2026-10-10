@@ -67,7 +67,7 @@ namespace q {
 constexpr u32 kCapacity = 0, kCount = 4, kRing = 8, kWrite = 0xC, kRead = 0x10, kMutex = 0x14, kCond = 0x18;
 }
 
-// The built-in "x-cell-fs" file source (0x138 bytes in the player's block; cellSailFileSource.cpp, D-564): +0x40 the
+// The built-in "x-cell-fs" file source (0x138 bytes in the player's block; cellSailFileSource.cpp, D-901): +0x40 the
 // CellSailSource it registers, +0x100 its file calls (14 words).
 namespace fsrc {
 constexpr u32 kSource = 0x40, kCalls = 0x100, kSize = 0x138;
