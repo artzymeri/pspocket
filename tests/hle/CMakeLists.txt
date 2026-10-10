@@ -18,6 +18,12 @@ if(TARGET pspocket::libpng)
     target_link_libraries(test_hle PRIVATE pspocket::libpng)
 endif()
 
+# The C library compared with a game's statically linked copy of the SDK's (D-904): test_hle "[gamelibc]", skipped without
+# PSPOCKET_TEST_AC_EBOOT and PSPOCKET_TEST_AC_LIBC_MAP (game_executable.hpp).
+target_sources(test_hle PRIVATE
+    test_libc_game.cpp
+)
+
 # The comparisons with Sony's modules of the firmware-first libraries and of cellVdec's newest codecs (D-597): hidden,
 # run with test_hle "[compare]"; skipped without the firmware (PSPOCKET_TEST_DEV_FLASH), where PSPOCKET_COMPARE_SELF=1
 # runs pspocket's half twice instead.
