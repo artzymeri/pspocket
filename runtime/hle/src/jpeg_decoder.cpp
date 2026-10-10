@@ -444,6 +444,12 @@ bool Decoder::parse_dht(const u8* p, u32 n, std::string& error)
         int code = 0, k = 0;
         for (int l = 1; l <= 16; l++) {
             h.valoffset[l] = k - code;
+            // A length's codes fit in it with the all-ones code left over, else the table is bad (jdhuff.c
+            // jpeg_make_d_derived_tbl, when a scan uses it): its codes would index past the lookahead table (D-605).
+            if (code + bits[l] >= (1 << l)) {
+                h.bad = true;
+                break;
+            }
             for (int j = 0; j < bits[l]; j++) {
                 if (l <= 8)
                     for (int fill = 0; fill < (1 << (8 - l)); fill++) {
@@ -684,7 +690,17 @@ bool Decoder::decode_scan(const u8* p, u32 n, Input& in, std::string& error)
     scan.se = q[1];
     scan.ah = q[2] >> 4;
     scan.al = q[2] & 15;
-    if (!header_.progressive) {
+    if (header_.progressive) {
+        // jdphuff.c start_pass_phuff_decoder (JERR_BAD_PROGRESSION): a DC band ends at 0; an AC band lies in 1..63 and
+        // has one component; a refinement's Al is Ah - 1; Al is at most 13. The band's end indexes the zigzag order
+        // and the block (D-605).
+        const bool dc_band = scan.ss == 0;
+        if ((dc_band ? scan.se != 0 : scan.ss > scan.se || scan.se > 63 || ns != 1) ||
+            (scan.ah != 0 && scan.al != scan.ah - 1) || scan.al > 13) {
+            error = std::format("a bad progression (Ss {}, Se {}, Ah {}, Al {})", scan.ss, scan.se, scan.ah, scan.al);
+            return false;
+        }
+    } else {
         scan.ss = 0;
         scan.se = 63;
         scan.ah = scan.al = 0;
@@ -693,8 +709,14 @@ bool Decoder::decode_scan(const u8* p, u32 n, Input& in, std::string& error)
     for (const int ci : scan.comps) {
         const ComponentInfo& c = comps_[static_cast<usize>(ci)];
         const bool needs_dc = scan.ss == 0 && scan.ah == 0, needs_ac = scan.se > 0;
-        if ((needs_dc && !dc_[c.td].present) || (needs_ac && !ac_[c.ta].present)) {
+        // A table number past the four is a missing table too (jdhuff.c jpeg_make_d_derived_tbl: JERR_NO_HUFF_TABLE);
+        // the scan header's four bits can name up to 15 (D-605).
+        if ((needs_dc && (c.td > 3 || !dc_[c.td].present)) || (needs_ac && (c.ta > 3 || !ac_[c.ta].present))) {
             error = "a scan without its Huffman table";
+            return false;
+        }
+        if ((needs_dc && dc_[c.td].bad) || (needs_ac && ac_[c.ta].bad)) {
+            error = "a scan with a bad Huffman table";
             return false;
         }
     }

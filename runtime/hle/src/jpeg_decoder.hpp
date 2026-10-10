@@ -72,6 +72,7 @@ public:
 private:
     struct Huffman {
         bool present = false;
+        bool bad = false; // its counts overflow a code length: refused when a scan uses it (JERR_BAD_HUFF_TABLE)
         u8 lookup_length[256]{};
         u8 lookup_value[256]{};
         int maxcode[18]{};

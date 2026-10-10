@@ -458,3 +458,108 @@ TEST_CASE("cellJpgDec: pspocket's answers and images stay those found identical 
     }
 }
 
+
+namespace {
+
+// Where each marker segment of a JPEG starts (its 0xFF), from the first after SOI to the first scan's, then every
+// later scan's (found in the entropy-coded data, where 0xFF is stuffed and so never starts a false SOS).
+std::vector<std::pair<u8, usize>> segments(const std::vector<u8>& d)
+{
+    std::vector<std::pair<u8, usize>> out;
+    usize at = 2;
+    while (at + 4 <= d.size() && d[at] == 0xFF) {
+        out.push_back({d[at + 1], at});
+        if (d[at + 1] == 0xDA) break;
+        at += 2 + (usize{d[at + 2]} << 8 | d[at + 3]);
+    }
+    for (at += 2; at + 1 < d.size(); at++)
+        if (d[at] == 0xFF && d[at + 1] == 0xDA) out.push_back({0xDA, at});
+    return out;
+}
+
+// What pspocket's decoder makes of `file`: its header read, then the whole decode's answer and error.
+struct DecodeOutcome {
+    bool header = false, decoded = false;
+    std::string error;
+};
+DecodeOutcome decode_file(const std::vector<u8>& file)
+{
+    DecodeOutcome o;
+    pspocket::hle::jpeg::Decoder d;
+    o.header = d.read_header(file.data(), file.size(), o.error);
+    if (o.header) o.decoded = d.decode(o.error);
+    return o;
+}
+
+} // namespace
+
+TEST_CASE("pspocket's JPEG decoder: a scan's tables and band, and a table's counts, are checked before use (D-605)",
+    "[hle][jpgdec]")
+{
+    // Damaged headers the parser fuzzing found (D-603): each read past one of the decoder's tables before, where
+    // libjpeg 6b (and libjpgdec) end the decode with an error.
+    jpeg::Image gray = jpeg::pattern(29, 18, true, 1, 1, 3);
+    const std::vector<u8> baseline = jpeg::encode(gray);
+    jpeg::Image colour = jpeg::pattern(29, 18, false, 2, 2, 8);
+    colour.progressive = true;
+    const std::vector<u8> progressive = jpeg::encode(colour);
+    REQUIRE(decode_file(baseline).decoded);
+    REQUIRE(decode_file(progressive).decoded);
+    const auto first = [](const std::vector<u8>& d, u8 marker, usize nth = 0) {
+        for (const auto& [m, at] : segments(d))
+            if (m == marker && nth-- == 0) return at;
+        FAIL("no such marker");
+        return usize{0};
+    };
+
+    SECTION("a scan naming Huffman tables past the four (jdhuff.c: JERR_NO_HUFF_TABLE)")
+    {
+        for (const u8 tables : {u8{0x50}, u8{0x0C}, u8{0xFF}}) {
+            std::vector<u8> d = baseline;
+            d[first(d, 0xDA) + 6] = tables; // the first component's Td and Ta
+            const DecodeOutcome o = decode_file(d);
+            CHECK(o.header);
+            CHECK_FALSE(o.decoded);
+            CHECK(o.error == "a scan without its Huffman table");
+        }
+    }
+    SECTION("a progressive scan's band past the block, or its successive approximation out of range "
+            "(jdphuff.c: JERR_BAD_PROGRESSION)")
+    {
+        const usize ac = first(progressive, 0xDA, 1); // the luma's AC band 1..5: one component
+        REQUIRE(progressive[ac + 4] == 1);
+        const struct {
+            usize at;
+            u8 value;
+        } cases[] = {
+            {ac + 8, 200},                          // Se past 63: the zigzag order and the block
+            {ac + 7, 9},                            // Ss after Se
+            {ac + 9, 0x0E},                         // Al 14
+            {ac + 9, 0x31},                         // a refinement with Al not Ah - 1
+            {first(progressive, 0xDA) + 4 + 1 + 2 * 3 + 1, 5}, // the DC scan's band not ending at 0
+        };
+        for (const auto& c : cases) {
+            std::vector<u8> d = progressive;
+            d[c.at] = c.value;
+            const DecodeOutcome o = decode_file(d);
+            INFO(c.at << " " << int{c.value});
+            CHECK_FALSE(o.decoded);
+            CHECK(o.error.starts_with("a bad progression"));
+        }
+    }
+    SECTION("a DHT whose codes overflow their lengths: read, then refused by the scan that uses it "
+            "(jdhuff.c jpeg_make_d_derived_tbl: JERR_BAD_HUFF_TABLE)")
+    {
+        std::vector<u8> d = baseline;
+        const usize dht = first(d, 0xC4); // the luma's DC table: counts at +5, one per length
+        REQUIRE((d[dht + 4] & 0xF0) == 0);
+        u8* bits = d.data() + dht + 5;
+        REQUIRE(bits[2] >= 2);
+        bits[0] += 2; // two more codes of 1 bit and two fewer of 3: as many values, an impossible tree
+        bits[2] -= 2;
+        const DecodeOutcome o = decode_file(d);
+        CHECK(o.header);
+        CHECK_FALSE(o.decoded);
+        CHECK(o.error == "a scan with a bad Huffman table");
+    }
+}
