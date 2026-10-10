@@ -8205,3 +8205,67 @@ NPDRM module refused until the game shows its klicensee with sceNpDrmIsAvailable
 player's RAP). By hand: pspocket-boot on a synthetic PSN EBOOT.BIN (the fault test program as licence type 2) with
 --hdd0 holding its RAP decrypts it and runs it to its expected fault report; without --hdd0 it names the licence it
 needs; ps3disc --decrypt on its game folder likewise.
+
+## D-583 · 2026-10-10 · PS3 packages: a PSN game, its updates and licences installed into dev_hdd0 as RPCS3 does
+
+The fourth step of the PSN item (D-580): how a PSN game gets onto the Mac or the phone. A game bought on PSN comes as
+a .pkg file, its updates and add-ons as more of them; recomp::install_pkg (recomp/common pkg.hpp) installs one under
+the folder that is /dev_hdd0, as RPCS3's package_reader (rpcs3/Crypto/unpkg.cpp: read_header, read_metadata,
+set_decryption_key, read_entries, read_param_sfo, check_target_app_version, set_install_path, fill_data,
+extract_worker, extract_data and decrypt; unpkg.h's structures):
+
+- **The format.** A header ("\x7FPKG", the release type, the platform, the metadata's and the data's places, the file
+  count, the content ID, the QA digest and the data's counter block), metadata packets (kept: 1 the DRM type, 2 the
+  content type, 3 the package flags, 0xA an add-on's install folder), then the data: a table of 0x20-byte entries, the
+  names and the files. A retail package's data is AES-128 in counter mode from the header's counter block, under
+  PKG_AES_KEY, or PKG_AES_KEY_IDU for an in-store demo unit's, tried when the first key does not give a sound table
+  (RPCS3's test: no name over 256 bytes, names and files inside the files, no file where its name is); a debug
+  package XORs SHA-1 of its QA digest and the block's number, with no key. A package split into NAME_00.pkg,
+  NAME_01.pkg, ... is read across its parts. PSP and PS Vita packages, and PSP entries, are refused: pspocket runs PS3
+  games. The keys come from key_vault.h through scripts/self-keys.py into the build directory (builtin_pkg_keys), never
+  into git; a build without them refuses a retail package and says why, and still installs a debug one.
+- **Where** (set_install_path): game/<install folder>/ for a game, its updates and add-ons (the title ID in the
+  content ID, or the metadata's folder), home/00000001/exdata/ for a licence package, theme/, and widget/,
+  vsh/modules/, home/00000001/psn_avatar/ and tmp/vmc/ with the install folder. An install folder with a "/" in it is
+  refused (RPCS3 takes it as nested folders).
+- **What is written** (fill_data, extract_worker). Folders are made; files are written as they are, but SDATA entries
+  (type 9), which are written decrypted (DecryptEDAT, D-165's reader). A PSN game's EBOOT.BIN, modules and EDATA files
+  stay encrypted, for the runtime to open with the player's licence (D-581, D-582). A file already there is kept unless
+  its entry is marked to overwrite (0x80000000); of two entries for one file, the later one wins only when so marked.
+  A name with a leading "/" or a "." or ".." part (leaves_directory), one that reaches outside the install folder
+  through a link already on disk (fill_data's canonical paths; a link that stays inside is followed), an entry of a
+  type RPCS3 does not install, and a file entry without a name refuse the package. Unlike RPCS3, which checks as it
+  goes, every name and type is checked before anything is written.
+- **Updates** (check_target_app_version, on read_param_sfo's PARAM.SFO). A package whose PARAM.SFO is an update's
+  (CATEGORY GD, with an APP_VER) is checked against the installed game's game/<TITLE_ID>/PARAM.SFO: with a
+  TARGET_APP_VER, that must be the installed APP_VER, and the game must be installed; without one, a patch (package
+  flag 0x10) must not be older than the installed version, and an add-on may be. Nothing is checked when no game of
+  that title ID with an APP_VER is there and no target is named. So a game's packages go in order: the game, then its
+  updates. RPCS3 reads the versions with strtod (whose decimal point is the locale's); pspocket reads digits with one
+  '.', as PARAM.SFO holds them, compares them exactly, and refuses a version that does not read, as RPCS3 refuses one
+  strtod does not read whole. Both PARAM.SFOs are read with RPCS3's PSF checks (Loader/PSF.cpp load: the header, the
+  tables, the entries, no key twice, a known category); one RPCS3 would not load counts as none.
+- **A failed install** removes the install folder when it made it (extract_data's m_was_null); in a folder that was
+  there (an update), what was written stays, as RPCS3. Something there that is not a folder is never replaced.
+- **Kept apart from RPCS3 on purpose**: a read of the data may start anywhere in a block (RPCS3 starts the key stream
+  at the block, which suits Sony's packages, where every entry starts on one); RPCS3 reads metadata on past a short
+  file, here the packets end there; a metadata packet 0xA over 4 KB is passed over. As RPCS3, the package's digests
+  and signatures are not checked.
+- **The tools.** ps_psn_install_pkg (pspocket/disc/psn.h) for the app: it reports each folder and file, a summary,
+  and for a game which licence its executable needs and whether the player's .rap is in place. On the Mac,
+  ps3disc --install-pkg <hdd0-dir> <package.pkg>... installs packages in the order given, and
+  ps3disc --install-rap <hdd0-dir> <CONTENT_ID.rap>... puts the player's licences in place (ps_psn_install_rap).
+  The app does not offer them yet.
+
+Test: tests/common/test_pkg.cpp (synthetic packages made by test::build_pkg with made-up keys: a game installed
+whole, the IDU key, a key that opens nothing, no keys, a debug package; each content type's folder; names and links
+that would leave the install folder; files kept, replaced and written twice; SDATA files decrypted, EDATA files and
+executables as they are, a failed install removed or left; updates for the installed version and for others; split
+packages; packages and entries refused; names and files at any offset; a package made with the build's keys, skipped
+without them; against RPCS3's own package_reader (decrypt, read_entries, leaves_directory) on 60 random retail and
+debug packages and 19 names), tests/disc/test_psn.cpp (ps_psn_install_pkg on a debug package and what it refuses; a
+PSN game of licence type 2 packaged with the build's keys: installed, its licence reported missing, then put in place,
+and its EBOOT.BIN decrypted). By hand: ps3disc --install-pkg on a synthetic package holding the fault test program as
+a licence type 2 EBOOT.BIN (the build's keys, in a temporary folder) reports the licence missing; ps3disc --decrypt
+and pspocket-boot name it; after ps3disc --install-rap, pspocket-boot runs the installed game to its expected fault
+report.
