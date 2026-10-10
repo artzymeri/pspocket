@@ -147,6 +147,11 @@ public:
     // Links every internal function (Function::internal) of the modules in `modules` (the game's imports). Same rule
     // as link_function: before guest threads run. Returns false when the main area is full.
     bool link_internal_functions(const std::vector<std::string>& modules);
+    // Links every internal function of every host module, whatever the game imports: a host module calls into others
+    // the game need not import (cellSail into cellDmux, cellAdec, cellVdec and cellVpost), whose threads and callbacks
+    // need their descriptors (D-903). Same rule as link_function: before guest threads run. Returns false when the main
+    // area is full.
+    bool link_all_internal_functions();
     // The descriptor of an already linked function, or 0. Safe while guest threads run.
     u32 descriptor_of(std::string_view module, u32 nid) const;
 

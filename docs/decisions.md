@@ -9245,3 +9245,18 @@ sys_get_bd_media_id(buffer) is sys_ss_media_id(0x10001, buffer) (879) and sys_ge
 sys_ss_get_console_id(buffer) (870), both refusing a null buffer with CELL_EINVAL before the call (lv2 checks the rest:
 a game, not a root process, gets ENOSYS for the console ID, as on a PS3). RPCS3 has them as todos answering CELL_OK.
 Test: tests/hle/test_sysPrxForUser.cpp, the calls lv2 sees and the answers.
+
+## D-903 · 2026-10-10 · The loader links every host module's internal functions, whatever the game imports
+
+Internal functions (`Function::internal`) are what pspocket's own modules hand out by address: a thread's entry (cellDmux's
+demuxer, the decoders', cellSail's control and copy threads), a callback a library gives another (cellGcmCallback,
+cellDmux's notifications to cellSail). The loader linked them only for the libraries the game imports, before any guest
+thread runs; a function linked later, while guest threads run, is only safe for the first kPreparedChunks stub chunks.
+But one host module calls into others the game need not import: a game that plays a movie through cellSail imports
+cellSail, not cellDmux, cellAdec, cellVdec or cellVpost, and cellDmuxOpenEx then failed (0x80610205) for want of its
+demuxer thread's descriptor (D-562 part 13; D-592 meanwhile made cellDmuxPamf link that one on demand). Now the loader
+links every internal function of every registered host module (`HleProcess::link_all_internal_functions`, a couple of
+hundred stub entries of the 8,192 per chunk) after the imports, so every chain of host modules finds its threads and callbacks
+linked, and the on-demand links (cellDmuxPamf's, cellSail's) just find them. Libraries a game gets as Sony's modules
+are unaffected (their internal functions are the module's own). Tests: the loader's boot test checks every registered
+internal function has its descriptor after loading an executable that imports no cellDmux, cellDmux's among them.

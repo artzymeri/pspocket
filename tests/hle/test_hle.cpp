@@ -254,6 +254,18 @@ TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import
     // sys_libc::_Ctype is pspocket's own since D-515: its reference is patched with the variable's address.
     CHECK(report.variables_unresolved == 0);
     CHECK(ps_read32(p.memory.base(), x.var_ref_target) == p.hle->link_variable("sys_libc", 0xD97B0687));
+    // Every host module's internal functions are linked, imported or not (D-903): cellDmux's demuxer thread among them,
+    // though the executable imports no cellDmux.
+    u32 internals = 0, dmux_internals = 0;
+    for (const hle::Function& fn : hle::registry().functions()) {
+        if (!fn.internal) continue;
+        internals++;
+        if (fn.module == "cellDmux") dmux_internals++;
+        INFO(fn.module << "::" << fn.name);
+        CHECK(p.hle->descriptor_of(fn.module, fn.nid) != 0);
+    }
+    CHECK(internals > 0);
+    CHECK(dmux_internals > 0);
 
     REQUIRE(p.kernel->wait_for_exit(std::chrono::seconds(10)));
     CHECK(p.kernel->exit_status() == 42);

@@ -345,10 +345,10 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
     // What the host's modules for those libraries take from the firmware's (D-197): cellAdec's codec cores.
     if (lle) lle->link_host_imports(LleModules::needs_of(exe->module()), hle);
     if (lle) rep.lle_modules = static_cast<u32>(lle->loaded().size());
-    // Functions the imported modules hand to the game by address (cellGcmCallback), linked while no guest thread runs.
-    std::vector<std::string> modules;
-    for (const auto& lib : exe->module().imports) modules.push_back(lib.name);
-    if (!hle.link_internal_functions(modules)) return err(lv2::CELL_ENOMEM);
+    // Functions the host's modules hand out by address (cellGcmCallback, the demuxer's and decoders' threads), linked
+    // while no guest thread runs: every host module's, as one module the game imports calls into others it need not
+    // (cellSail into cellDmux, cellAdec, cellVdec, cellVpost; D-903).
+    if (!hle.link_all_internal_functions()) return err(lv2::CELL_ENOMEM);
     PS_LOG_INFO(kChan, "{} segments, {} imported functions ({} implemented, {} by {} firmware modules), {} unresolved "
                        "variables", rep.segments, rep.functions_linked, rep.functions_implemented, rep.functions_lle,
         rep.lle_modules, rep.variables_unresolved);

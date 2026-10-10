@@ -290,6 +290,13 @@ bool HleProcess::link_internal_functions(const std::vector<std::string>& modules
     return true;
 }
 
+bool HleProcess::link_all_internal_functions()
+{
+    for (const Function& f : registry().functions())
+        if (f.internal && !link_function(f.module, f.nid, f.name)) return false;
+    return true;
+}
+
 u32 HleProcess::descriptor_of(std::string_view module, u32 nid) const
 {
     std::lock_guard lock(link_mutex_);
