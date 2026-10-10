@@ -306,20 +306,29 @@ u32 HleProcess::link_variable(std::string_view module, u32 nid)
 {
     const Variable* v = registry().find_variable(module, nid);
     if (!v) return 0;
-    u32 at = 0;
+    LinkedVariable* var = nullptr;
     {
         std::lock_guard lock(link_mutex_);
-        if (const auto it = variables_.find({std::string(module), nid}); it != variables_.end()) return it->second;
-        at = place_variable(*v);
-        if (!at) return 0;
-        variables_[{std::string(module), nid}] = at;
+        const auto [it, added] = variables_.try_emplace({std::string(module), nid});
+        if (added) {
+            it->second.at = place_variable(*v);
+            if (!it->second.at) {
+                variables_.erase(it);
+                return 0;
+            }
+        }
+        var = &it->second;
     }
-    // Laid out after the lock is released: an initializer may link functions (a table of the module's callbacks, D-531).
-    u8* base = kernel_.memory().base();
-    std::memset(base + at, 0, v->size);
-    if (v->init) v->init(base, at);
-    PS_LOG_DEBUG(kChan, "variable {}::{} ({:#010x}) at {:#010x}", module, v->name, nid, at);
-    return at;
+    // Laid out after the lock is released: an initializer may link functions (a table of the module's callbacks, D-531)
+    // and other variables (libsync2's notifier table its notifiers). A thread that links the variable while another
+    // lays it out waits for the layout here (D-602): handed the address at once, it read the variable unwritten.
+    std::call_once(var->laid_out, [&] {
+        u8* base = kernel_.memory().base();
+        std::memset(base + var->at, 0, v->size);
+        if (v->init) v->init(base, var->at);
+        PS_LOG_DEBUG(kChan, "variable {}::{} ({:#010x}) at {:#010x}", module, v->name, nid, var->at);
+    });
+    return var->at;
 }
 
 u32 HleProcess::place_variable(const Variable& v)

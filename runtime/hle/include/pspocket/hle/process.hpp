@@ -216,9 +216,14 @@ private:
     ModuleLoader* module_loader_ = nullptr;
     std::unique_ptr<lv2::ModuleHost> kernel_modules_; // the loader as lv2's PRX calls see it
     std::map<std::pair<std::string, u32>, u32> imports_; // under link_mutex_
-    std::map<std::pair<std::string, u32>, u32> variables_; // host variables linked, under link_mutex_
-    u32 variable_block_ = 0, variable_used_ = 0;           // where they are laid out, under link_mutex_
-    u32 place_variable(const Variable& v);                 // its address in those blocks, under link_mutex_
+    // A host variable linked: its address, and its layout (zeroed, then Variable::init), done once (D-602).
+    struct LinkedVariable {
+        u32 at = 0;
+        std::once_flag laid_out;
+    };
+    std::map<std::pair<std::string, u32>, LinkedVariable> variables_; // under link_mutex_ (each laid_out its own)
+    u32 variable_block_ = 0, variable_used_ = 0;                      // where they are laid out, under link_mutex_
+    u32 place_variable(const Variable& v);                            // its address in those blocks, under link_mutex_
     std::atomic<u64> unimplemented_calls_{0};
     std::atomic<u64> stub_calls_{0};
 

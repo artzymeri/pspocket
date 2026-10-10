@@ -4,9 +4,12 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <thread>
+#include <vector>
 
 #include "pspocket/core/be.h"
 #include "pspocket/core/guest_memory.hpp"
@@ -347,4 +350,37 @@ TEST_CASE("Host variables: laid out once and linked by address", "[hle]")
     CHECK(ps_read32(p.memory.base(), a) == 0x00010001);
     CHECK(p.hle->link_variable("sysPrxForUser", 0x7DF066CF) == a);
     CHECK(p.hle->link_variable("sysPrxForUser", 0x12345678) == 0);
+}
+
+// D-602: a host variable that another thread is laying out (its initializer still running) is handed out once it is
+// laid out. link_variable published the address first, so a second thread could read the variable unwritten: a
+// libsync2 queue's first push read the default notifier table as zeros while the first pop laid it out (a spurious
+// INVAL), found by ThreadSanitizer. Eight threads link that table at once, in a fresh process each round, and read its
+// four notifiers the moment they have it.
+TEST_CASE("Host variables: a thread linking one that another is laying out gets it laid out (D-602)", "[hle]")
+{
+    const u32 nid = recomp::nid_of("_pspocket_cellSync2NotifierTable");
+    REQUIRE(hle::registry().find_variable("cellSync2", nid) != nullptr);
+    constexpr u32 kThreads = 8;
+    u32 unwritten = 0;
+    for (int round = 0; round < 20; round++) {
+        hle::test::Fixture f;
+        std::atomic<u32> waiting{0}, zeros{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        for (u32 i = 0; i < kThreads; i++) {
+            threads.emplace_back([&] {
+                waiting++;
+                while (!go.load()) std::this_thread::yield();
+                const u32 table = f.hle->link_variable("cellSync2", nid);
+                for (u32 k = 0; k < 4; k++)
+                    if (!table || ps_read32(f.base(), table + 4 * k) == 0) zeros++;
+            });
+        }
+        while (waiting.load() < kThreads) std::this_thread::yield();
+        go = true;
+        for (std::thread& t : threads) t.join();
+        unwritten += zeros.load();
+    }
+    CHECK(unwritten == 0);
 }
