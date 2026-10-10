@@ -9123,3 +9123,7 @@ Each with a test that shows it (rule 7):
   picture for each one-byte index, past its end on the last row. Shown by test_imgenc's palette pictures under
   scripts/asan.sh.
 - **sys_io** (sys_io.cpp): io_printf with no string passed memcpy a null pointer.
+- **cellAdec's ATRAC3plus core** (adec_atracx.cpp): a frame is copied whole from its unit's start, as libatxdec copies
+  it, also when the unit is shorter; a unit at the end of guest memory made the copy read past it, a host crash. Such
+  a frame is now an error (ATX_FATAL, logged, nothing out), as a decode without a configuration is. Test: the
+  cellAtrac fuzzing target (test_fuzz_media.cpp), which crashed on its 98th input with the default seed.
