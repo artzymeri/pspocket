@@ -8840,13 +8840,14 @@ version queries (D-575) and cellVdec's DivX 3.11, VC-1 and MVC (D-588 to D-590) 
 is to be compared with its module on the Mac before its marker goes. The comparisons are now written, so a session on
 the Mac only has to run them, read the differences and fix them.
 
-**The suite** (tests/hle/compare_util.hpp, over firmware_compare.hpp). Each comparison sends the same calls with the same
-synthetic inputs to pspocket's library and to Sony's module, each half in a fresh process (fixture), reaching the exports
-as a game does: a guest call through the export's descriptor, Sony's module's own in its half, pspocket's linked stub in
-the other. The inputs are the libraries' own tests': the mixer's notify callback and players (test_libmixer.cpp), the
-colours and windows of test_vpost.cpp, test_imgenc.cpp's pictures and chunks, test_fiber.cpp's scripts (their routine now
-in fiber_script.hpp, shared by both tests) and test_vdec_codecs.cpp's streams (vdec_streams.hpp: the same encoders and
-pictures; test_vdec_codecs.cpp keeps its own copies while other work changes cellVdec's tests, and can include it later).
+**The suite** (tests/hle/compare_util.hpp, over firmware_compare.hpp). Each comparison sends the same calls with the
+same synthetic inputs to pspocket's library and to Sony's module, each half in a fresh process (fixture), reaching the
+exports as a game does: a guest call through the export's descriptor, Sony's module's own in its half, pspocket's linked
+stub in the other. The inputs are the libraries' own tests': the mixer's notify callback and players
+(test_libmixer.cpp), the colours and windows of test_vpost.cpp, test_imgenc.cpp's pictures and chunks, test_fiber.cpp's
+scripts (their routine now in fiber_script.hpp, shared by both tests) and test_vdec_codecs.cpp's streams
+(vdec_streams.hpp: the same encoders and pictures; test_vdec_codecs.cpp keeps its own copies while other work changes
+cellVdec's tests, and can include it later).
 What a game can see is written as observations:
 - lines, compared one for one by their key, realigned when one half has a line the other lacks: answers and error codes,
   output words, structures' bytes (as "hex:" values, whose differing bytes the report names);
@@ -8857,8 +8858,8 @@ What a game can see is written as observations:
   opaque objects' bytes, the exports of Sony's module that pspocket lacks).
 The report at the end of each comparison: "N of M observations differ", the first 80 differences, each as "the step:
 pspocket's value | Sony's", the differences counted by group for the large tables, the notes, and the values within the
-tolerance but not equal (as test_vdec.cpp counts RGB one step off). A half that makes no progress for a minute prints its
-last step on stderr, every minute, so a module stuck on something pspocket's lv2 lacks names where.
+tolerance but not equal (as test_vdec.cpp counts RGB one step off). A half that makes no progress for a minute prints
+its last step on stderr, every minute, so a module stuck on something pspocket's lv2 lacks names where.
 
 **Running it on the Mac**, with the system software installed:
 `PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare]"`, or one
@@ -8950,7 +8951,10 @@ Found while writing it: a picture with more than one text chunk aborted cellPngE
 Tests, here (no firmware): the seven name checks pass in ctest; `test_hle "[compare]"` skips all of them;
 PSPOCKET_COMPARE_SELF=1 runs every comparison, both halves agree (key2char 43,641 observations, vpost 536, pngenc 614,
 libmixer 119 and 460, fiber 216 over its eight scenarios, the codec cores 42, vdec 1,127 over its four families) and the
-sanity checks pass.
+sanity checks pass. Under ThreadSanitizer (D-571's build), in that mode, only cellVdec's comparison reports races, the
+ones test_vdec_codecs.cpp has too: vdec_test_util.hpp's waits read the callback log while the decoder thread's guest
+callback writes it with the interpreter's plain stores. They do no harm here (the counts only pace the waits, and the
+log's entries are read after SEQDONE); the cellVdec tests are not in D-571's set.
 
 ## D-598 · 2026-10-10 · cellPngEnc: a picture's text chunks kept where libpng's pointers find them
 
