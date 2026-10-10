@@ -22,7 +22,8 @@ endif()
 # run with test_hle "[compare]"; skipped without the firmware (PSPOCKET_TEST_DEV_FLASH), where PSPOCKET_COMPARE_SELF=1
 # runs pspocket's half twice instead.
 target_sources(test_hle PRIVATE
-    test_key2char_compare.cpp)
+    test_key2char_compare.cpp
+    test_codec_cores_compare.cpp)
 
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.
