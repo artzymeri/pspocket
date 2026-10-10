@@ -282,15 +282,16 @@ private:
 
 // ------------------------------------------------------------------------------------------------- per-thread block
 
-// What the library keeps for each lv2 thread, in guest memory (the C library's per-thread statics): errno, the
-// conversion states the standard functions keep between calls, strtok's position, and the static results of gmtime,
-// localtime, asctime and strerror. 256 bytes, in blocks of 64 KB of the main area.
+// What the library keeps for each lv2 thread, in guest memory (the C library's per-thread statics, thread-local in the
+// SDK's): errno, the conversion states the standard functions keep between calls, strtok's position, the static
+// results of gmtime, localtime, asctime and strerror, the global locale pointer and the four state tables (D-906).
+// 512 bytes, in blocks of 64 KB of the main area.
 namespace tb {
 inline constexpr u32 kErrno = 0;
-inline constexpr u32 kMbState = 8;     // _Getpmbstate: mblen and mbtowc (mbstate_t, 8 bytes)
-inline constexpr u32 kWcState = 16;    // _Getpwcstate: wctomb
-inline constexpr u32 kCoState = 24;    // _Getpcostate: strcoll/strxfrm's state
-inline constexpr u32 kWcoState = 32;   // _Getpwcostate: wcscoll/wcsxfrm's
+inline constexpr u32 kMbState = 8;     // mbtowc's internal state (mbstate_t, 8 bytes)
+inline constexpr u32 kWcState = 16;    // wctomb's
+inline constexpr u32 kCoState = 24;    // mblen's
+inline constexpr u32 kWcoState = 32;   // (spare)
 inline constexpr u32 kMbrlen = 40;     // mbrlen's internal state
 inline constexpr u32 kMbrtowc = 48;    // mbrtowc's
 inline constexpr u32 kWcrtomb = 56;    // wcrtomb's
@@ -298,10 +299,15 @@ inline constexpr u32 kMbsrtowcs = 64;  // mbsrtowcs's
 inline constexpr u32 kWcsrtombs = 72;  // wcsrtombs's
 inline constexpr u32 kStrtok = 80;     // strtok's position (u32)
 inline constexpr u32 kWcstok = 84;     // (spare)
+inline constexpr u32 kGlobalLocale = 88; // _Getgloballocale's pointer (u32)
 inline constexpr u32 kTm = 96;         // struct tm (36 bytes): gmtime, localtime
 inline constexpr u32 kAsctime = 136;   // asctime and ctime: 26 bytes
 inline constexpr u32 kStrerror = 168;  // strerror's message: 80 bytes
-inline constexpr u32 kSize = 256;
+inline constexpr u32 kMbTab = 256;     // _Getpmbstate: the multibyte state tables (_Statab, 64 bytes)
+inline constexpr u32 kWcTab = 320;     // _Getpwcstate: the wide ones
+inline constexpr u32 kCoTab = 384;     // _Getpcostate: the collation ones
+inline constexpr u32 kWcoTab = 448;    // _Getpwcostate: the wide collation ones
+inline constexpr u32 kSize = 512;
 } // namespace tb
 
 struct ThreadBlocks {

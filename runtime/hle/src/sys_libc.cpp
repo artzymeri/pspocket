@@ -146,14 +146,16 @@ s32 casecmp(PPUContext& ctx, const char* fn, u32 a, u32 b, u64 n)
 s32 strcasecmp_(PPUContext& ctx, u32 a, u32 b) { return casecmp(ctx, "strcasecmp", a, b, ~u64{0}); }
 s32 strncasecmp_(PPUContext& ctx, u32 a, u32 b, u32 n) { return casecmp(ctx, "strncasecmp", a, b, n); }
 
-// strcoll and strxfrm in the "C" locale: the bytes' order.
+// strcoll and strxfrm in the "C" locale: the bytes' order; strxfrm writes as much of the string and its NUL as n
+// holds, as the SDK's (D-906), and answers the length.
 s32 strcoll_(PPUContext& ctx, u32 a, u32 b) { return strcmp_(ctx, a, b); }
 
 u32 strxfrm_(PPUContext& ctx, u32 d, u32 s, u32 n)
 {
     const auto t = str_arg(ctx, "strxfrm", s);
     if (!t) return 0;
-    if (t->size() < n && range_ok(ctx, "strxfrm", d, t->size() + 1)) std::memcpy(gb(ctx) + d, t->c_str(), t->size() + 1);
+    const u32 k = std::min<u32>(static_cast<u32>(t->size()) + 1, n);
+    if (k && range_ok(ctx, "strxfrm", d, k)) std::memcpy(gb(ctx) + d, t->c_str(), k);
     return static_cast<u32>(t->size());
 }
 
