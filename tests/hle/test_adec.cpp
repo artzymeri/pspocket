@@ -543,6 +543,9 @@ TEST_CASE("cellAdec: ATRAC3plus on FFmpeg, its flow on frames built here (D-198)
 
 TEST_CASE("cellAdec: ATRAC3plus on FFmpeg against Sony's core, on frames built here", "[hle][adec][firmware]")
 {
+#if !PSPOCKET_HAVE_FFMPEG
+    SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): pspocket has no ATRAC3plus core to compare");
+#endif
     const auto flash = test_dev_flash();
     if (!flash) {
         SUCCEED("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");

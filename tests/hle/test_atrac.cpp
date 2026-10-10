@@ -302,6 +302,9 @@ TEST_CASE("cellAtrac: AT3+ files built here, whole, streamed and looped (pspocke
 
 TEST_CASE("cellAtrac against libatrac3plus: every answer, output and handle byte", "[hle][lle][atrac]")
 {
+#if !PSPOCKET_HAVE_FFMPEG
+    SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): pspocket's cellAdec has no ATRAC3plus core");
+#endif
     const std::optional<std::string> flash = test_dev_flash();
     if (!flash) SKIP("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
     Fixture f;

@@ -206,6 +206,9 @@ TEST_CASE("cellVdec: H.264 decoded as Sony's libvdec does it (D-195)", "[hle][vd
 TEST_CASE("cellVdec: the same as Sony's libvdec (the user's firmware): sizes, answers, items, information, pictures",
     "[hle][vdec][firmware]")
 {
+#if !PSPOCKET_HAVE_FFMPEG
+    SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): pspocket's cellVdec decodes no picture");
+#endif
     const auto flash = test_dev_flash();
     if (!flash) {
         SUCCEED("PSPOCKET_TEST_DEV_FLASH is not set: no firmware to compare with");
