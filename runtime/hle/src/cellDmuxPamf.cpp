@@ -15,8 +15,16 @@
 //   priority the game asked for), whose SPU thread group takes 256 KB of the default memory container and an SPU.
 //   Here an SPU thread group of that name is created and destroyed with the demuxer but never started: it takes the
 //   same from the game and fails where the console's would.
-// - Only the PAMF core (libdmux's), not the raw elementary stream one other libraries use (0x9728a0e9).
+// - Only the PAMF core (libdmux's), not the raw elementary stream one other libraries use (0x9728a0e9): see D-592 for
+//   why that table stays Sony's.
 // - Pointers RPCS3 ensure()s are logged and refused (PAMF_ERROR_ARG, D-042).
+//
+// The core is called two ways. pspocket's cellDmux calls core_* directly and is notified directly (dmux.hpp). Any other
+// module calls it through its exported table, g_cell_dmux_core_ops_pamf (D-592), as libdmux calls libdmuxpamf's: the
+// table's entries are internal functions of cellDmux (RPCS3's _CellDmuxCoreOp* names) over the same core_* functions,
+// and a demuxer opened so notifies the DmuxCb functions it was given, as guest calls, with RPCS3's arguments (the
+// CellDmuxPamfHandle or CellDmuxPamfEsHandle first, a DmuxAuInfo for an access unit), keeping them where libdmuxpamf
+// keeps them in its handles too.
 
 #include <atomic>
 #include <chrono>
@@ -42,6 +50,7 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/object.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle::dmux {
 namespace {
@@ -91,7 +100,8 @@ struct Core;
 struct Es { // DmuxPamfElementaryStream
     Core* core = nullptr;
     u32 handle = 0;    // its CellDmuxPamfEsHandle
-    u32 es_handle = 0; // the front end's DmuxEsContext
+    u32 es_handle = 0; // the front end's DmuxEsContext (0 when enabled through the table)
+    u32 es_struct = 0; // its DmuxPamfElementaryStream in the game's memory
     u8 this_index = 0;
     u16 stream_id = 0, private_stream_id = 0;
     bool is_avc = false;
@@ -99,7 +109,12 @@ struct Es { // DmuxPamfElementaryStream
     std::array<u8, 0x10> au_specific_info{};
     bool reset_next_au = false;
     u32 es_id = 0;
+    std::optional<EsCallbacks> guest; // enabled through the table: whom it notifies
 };
+
+// DmuxPamfElementaryStream's au_specific_info (RPCS3 cellDmuxPamf.h): where an access unit's specific information is
+// for a guest notification.
+constexpr u32 kEsSpecificInfo = 0x34;
 
 // The SPU's part (RPCS3 dmux_pamf_spu_context): commands in, events out, through queues the PPU side shares.
 class SpuSide final : public PamfDemuxer {
@@ -136,7 +151,9 @@ private:
 struct Core { // DmuxPamfContext, its CellDmuxPamfHandle, and the SPU side's queues
     u8* base = nullptr;
     u32 handle = 0, context = 0; // CellDmuxPamfHandle, DmuxPamfContext
-    u32 dmux_handle = 0;         // the front end's DmuxContext
+    u32 dmux_handle = 0;         // the front end's DmuxContext (0 when opened through the table)
+    std::optional<CoreCallbacks> guest; // opened through the table: whom it notifies
+    bool joined = false;         // the table's joinThread stopped its threads before close
     bool prog_end_cb = false;
     CoreResource res;
     u32 spu_group = 0; // libdmuxpamf's SPU thread group, never started; 0 with SPURS
@@ -398,11 +415,71 @@ u32 set_au_reset(lv2::PpuThread& t, Core& c, bool reset)
     return unlock(t, c.mutex) ? PAMF_OK : PAMF_ERROR_FATAL;
 }
 
+// The core's notifications (RPCS3 DmuxPamfContext::callback, through its dmuxPamfNotify* functions): to pspocket's
+// cellDmux directly, or for a demuxer opened through the exported table to the guest functions it was given, with
+// RPCS3's arguments: the CellDmuxPamfHandle (or CellDmuxPamfEsHandle), what is reported, the function's argument.
+void tell_demux_done(PPUContext& ctx, const Core& c)
+{
+    if (!c.guest) return notify_demux_done(ctx, c.dmux_handle);
+    call_guest(ctx, c.guest->demux_done.fn, {c.handle, PAMF_OK, c.guest->demux_done.arg});
+}
+
+void tell_fatal_err(PPUContext& ctx, const Core& c) // LLE passes CELL_OK
+{
+    if (!c.guest) return notify_fatal_err(ctx, PAMF_OK, c.dmux_handle);
+    call_guest(ctx, c.guest->fatal_err.fn, {c.handle, PAMF_OK, c.guest->fatal_err.arg});
+}
+
+void tell_prog_end_code(PPUContext& ctx, const Core& c)
+{
+    if (!c.prog_end_cb) return;
+    if (!c.guest) return notify_prog_end_code(ctx, c.dmux_handle);
+    if (c.guest->prog_end_code.fn) // RPCS3 dmuxPamfNotifyProgEndCode: only when there is one
+        call_guest(ctx, c.guest->prog_end_code.fn, {c.handle, c.guest->prog_end_code.arg});
+}
+
+// An elementary stream's notifications, from what was read of it under the lock.
+struct EsTarget {
+    // The front end's DmuxEsContext, the CellDmuxPamfEsHandle, the DmuxPamfElementaryStream.
+    u32 es_handle = 0, handle = 0, es_struct = 0;
+    std::optional<EsCallbacks> guest;
+};
+EsTarget target_of(const Es& e) { return {e.es_handle, e.handle, e.es_struct, e.guest}; }
+
+// 0, or not 0 when the stream's access unit queue is full (the unit is reported again after a release).
+u32 tell_au_found(PPUContext& ctx, const EsTarget& es, const AuInfo& au)
+{
+    if (!es.guest) return notify_es_au_found(ctx, au, es.es_handle);
+    // RPCS3 dmuxPamfEsNotifyAuFound: a DmuxAuInfo, the CellDmuxAuInfo (auAddr, auSize, auMaxSize left 0, isRap,
+    // userData, pts, dts) then the specific information's address, the stream's au_specific_info, and size.
+    u8* base = guest_base(ctx);
+    for (u32 i = 0; i < au.specific_info_size && i < au.specific_info.size(); i++)
+        ps_write8(base, es.es_struct + kEsSpecificInfo + i, au.specific_info[i]);
+    StackVar info(ctx, base, 0x30);
+    const u32 at = info.addr();
+    ps_write32(base, at + 0x00, au.addr);
+    ps_write32(base, at + 0x04, au.size);
+    ps_write32(base, at + 0x08, 0);
+    ps_write8(base, at + 0x0C, au.is_rap);
+    ps_write64(base, at + 0x10, au.user_data);
+    ps_write64(base, at + 0x18, au.pts);
+    ps_write64(base, at + 0x20, au.dts);
+    ps_write32(base, at + 0x28, es.es_struct + kEsSpecificInfo);
+    ps_write32(base, at + 0x2C, au.specific_info_size);
+    return static_cast<u32>(call_guest(ctx, es.guest->au_found.fn, {es.handle, at, es.guest->au_found.arg}));
+}
+
+void tell_flush_done(PPUContext& ctx, const EsTarget& es)
+{
+    if (!es.guest) return notify_es_flush_done(ctx, es.es_handle);
+    call_guest(ctx, es.guest->flush_done.fn, {es.handle, es.guest->flush_done.arg});
+}
+
 // RPCS3 DmuxPamfContext::exec: the SPU side's events turned into the front end's notifications.
 void exec(PPUContext& ctx, Core& c)
 {
     lv2::PpuThread& t = thread_of(ctx);
-    const auto fatal = [&] { notify_fatal_err(ctx, PAMF_OK, c.dmux_handle); }; // LLE passes CELL_OK
+    const auto fatal = [&] { tell_fatal_err(ctx, c); };
     for (;;) {
         if (c.sending_fatal_err) {
             c.sending_fatal_err = false;
@@ -476,13 +553,13 @@ void exec(PPUContext& ctx, Core& c)
                 es->au_specific_info[2] = event.stream_header_buf[1] >> 6;  // bits per sample
             }
             au.specific_info = es->au_specific_info;
-            const u32 es_handle = es->es_handle;
+            const EsTarget target = target_of(*es);
             const u8 index = es->this_index;
             if (!unlock(t, c.mutex)) {
                 c.sending_fatal_err = true;
                 continue;
             }
-            if (notify_es_au_found(ctx, au, es_handle) != 0) {
+            if (tell_au_found(ctx, target, au) != 0) {
                 // Its access unit queue is full: wait for a release, then report the same unit again.
                 c.au_queue_full_bitset |= 1ull << index;
                 continue;
@@ -497,7 +574,7 @@ void exec(PPUContext& ctx, Core& c)
                     continue;
                 }
             }
-            notify_demux_done(ctx, c.dmux_handle);
+            tell_demux_done(ctx, c);
             if (!lock(t, c.mutex)) {
                 c.sending_fatal_err = true;
                 continue;
@@ -527,17 +604,15 @@ void exec(PPUContext& ctx, Core& c)
             }
             Es* const es = c.find_es(static_cast<u16>(event.stream_id), static_cast<u16>(event.private_stream_id));
             const bool valid = es && es->es_id == event.user_data;
-            const u32 es_handle = valid ? es->es_handle : 0;
+            const EsTarget target = valid ? target_of(*es) : EsTarget{};
             if (!unlock(t, c.mutex)) {
                 c.sending_fatal_err = true;
                 continue;
             }
-            if (valid) notify_es_flush_done(ctx, es_handle);
+            if (valid) tell_flush_done(ctx, target);
             break;
         }
-        case EventType::prog_end_code:
-            if (c.prog_end_cb) notify_prog_end_code(ctx, c.dmux_handle);
-            break;
+        case EventType::prog_end_code: tell_prog_end_code(ctx, c); break;
         case EventType::fatal_error: {
             std::lock_guard lk(c.qm);
             c.events.pop_front();
@@ -705,9 +780,10 @@ u32 create_thread(PPUContext& ctx, Core& c)
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
     HleProcess& p = *HleProcess::current();
-    const u32 entry = p.descriptor_of("cellDmux", NID_dmux_pamf_thread);
+    // Linked now if the game does not import cellDmux (a demuxer opened through the exported table, D-592).
+    const u32 entry = p.link_function("cellDmux", NID_dmux_pamf_thread, "_pspocket_dmux_pamf_thread");
     if (!entry) {
-        PS_LOG_ERROR(kChan, "the demuxer's thread function was not linked (the game does not import cellDmux)");
+        PS_LOG_ERROR(kChan, "no memory to link the demuxer's thread function");
         return PAMF_ERROR_FATAL;
     }
     c.tls = p.alloc_tls();
@@ -782,7 +858,7 @@ u32 core_query_attr(PPUContext& ctx, u32 info, PamfAttr& attr)
 }
 
 u32 core_open(PPUContext& ctx, u32 info, const CoreResource& resource, const CoreResourceSpurs* spurs, u32 dmux_handle,
-    u32& core_handle)
+    u32& core_handle, const CoreCallbacks* guest)
 {
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
@@ -797,6 +873,7 @@ u32 core_open(PPUContext& ctx, u32 info, const CoreResource& resource, const Cor
     c->handle = resource.mem_addr;
     c->dmux_handle = dmux_handle;
     c->prog_end_cb = info && ps_read8(base, info + 4) != 0;
+    if (guest) c->guest = *guest;
     // The core's own resource: its memory after its CellDmuxPamfHandle.
     c->res = resource;
     c->res.mem_addr = resource.mem_addr + kPamfHandleSize;
@@ -869,7 +946,7 @@ u32 core_close(PPUContext& ctx, u32 core_handle)
     Core* c = core_of(core_handle);
     if (!c) return PAMF_ERROR_ARG;
     lv2::PpuThread& t = thread_of(ctx);
-    if (join_thread(ctx, *c) != PAMF_OK) return PAMF_ERROR_FATAL;
+    if (!c->joined && join_thread(ctx, *c) != PAMF_OK) return PAMF_ERROR_FATAL;
     c->stop_spu_side();
     if (c->tls) HleProcess::current()->free_tls(c->tls);
     if (c->spu_group) lv2::sys_spu_thread_group_destroy(t, c->spu_group);
@@ -954,7 +1031,7 @@ u32 core_query_es_attr(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, 
 }
 
 u32 core_enable_es(PPUContext& ctx, u32 core_handle, u32 es_filter_id, u32 mem_addr, u32 mem_size, u32 es_handle,
-    u32 es_specific_info, u32& core_es_handle)
+    u32 es_specific_info, u32& core_es_handle, const EsCallbacks* guest)
 {
     Core* c = core_of(core_handle);
     if (!c || !es_filter_id || !mem_addr || mem_size == 0 || !usable(ctx, es_filter_id, 16, "the ES filter")) return PAMF_ERROR_ARG;
@@ -984,6 +1061,8 @@ u32 core_enable_es(PPUContext& ctx, u32 core_handle, u32 es_filter_id, u32 mem_a
     e->private_stream_id = private_stream_id;
     e->is_avc = is_avc;
     const u32 es_struct = (es_mem + 0xf) & ~0xfu;                         // DmuxPamfElementaryStream
+    e->es_struct = es_struct;
+    if (guest) e->guest = *guest;
     e->au_queue_buffer = (es_struct + kPamfEsSize + 0x7f) & ~0x7fu;       // the access unit queue after it
     e->au_max_size = au_max_size(base, stream_id, private_stream_id, is_avc, es_specific_info);
     e->au_specific_info_size = au_specific_info_size(stream_id, private_stream_id, is_avc);
@@ -1082,5 +1161,270 @@ u32 core_reset_stream_and_wait_done(PPUContext& ctx, u32 core_handle)
     }
     return unlock(t, c->mutex) ? PAMF_OK : PAMF_ERROR_FATAL;
 }
+
+// ---- The exported table, g_cell_dmux_core_ops_pamf (D-592): CellDmuxCoreOps (RPCS3 cellDmux.h), its entries the
+// _CellDmuxCoreOp* functions below (RPCS3 cellDmuxPamf.cpp), each with RPCS3's checks of the caller's pointers, then
+// the core_* function pspocket's cellDmux calls itself.
+
+namespace {
+
+// CellDmuxCoreOps's entries, in order.
+constexpr std::string_view kOpNames[] = {"_CellDmuxCoreOpQueryAttr", "_CellDmuxCoreOpOpen", "_CellDmuxCoreOpClose",
+    "_CellDmuxCoreOpResetStream", "_CellDmuxCoreOpCreateThread", "_CellDmuxCoreOpJoinThread",
+    "_CellDmuxCoreOpSetStream", "_CellDmuxCoreOpReleaseAu", "_CellDmuxCoreOpQueryEsAttr", "_CellDmuxCoreOpEnableEs",
+    "_CellDmuxCoreOpDisableEs", "_CellDmuxCoreOpFlushEs", "_CellDmuxCoreOpResetEs",
+    "_CellDmuxCoreOpResetStreamAndWaitDone"};
+constexpr u32 kOps = sizeof(kOpNames) / sizeof(kOpNames[0]);
+
+// A DmuxCb the caller passes (RPCS3 DmuxCb: cbFunc, cbArg): readable, and with a function and an argument where RPCS3
+// requires them.
+std::optional<GuestCb> read_cb(PPUContext& ctx, u32 at, bool required, std::string_view what)
+{
+    if (!at || !usable(ctx, at, 8, what)) return std::nullopt;
+    const GuestCb cb{ps_read32(guest_base(ctx), at), ps_read32(guest_base(ctx), at + 4)};
+    if (required && (!cb.fn || !cb.arg)) return std::nullopt;
+    return cb;
+}
+
+// A demuxer the table's joinThread stopped takes nothing but close: its SPU side is gone, and a command to it would
+// wait for ever (as libdmuxpamf's and RPCS3's would).
+bool stopped(Core* c, std::string_view op)
+{
+    if (!c || !c->joined) return false;
+    PS_LOG_ERROR(kChan, "{} on demuxer {:#x} after its joinThread: refused", op, c->handle);
+    return true;
+}
+
+u32 _CellDmuxCoreOpQueryAttr(PPUContext& ctx, u32 pamf_specific_info, u32 pamf_attr)
+{
+    if (!pamf_attr || !usable(ctx, pamf_attr, 12, "the attributes")) return PAMF_ERROR_ARG;
+    PamfAttr a;
+    if (const u32 r = core_query_attr(ctx, pamf_specific_info, a); r != PAMF_OK) return r;
+    u8* base = guest_base(ctx);
+    ps_write32(base, pamf_attr, a.max_enabled_es_num); // CellDmuxPamfAttr
+    ps_write32(base, pamf_attr + 4, a.version);
+    ps_write32(base, pamf_attr + 8, a.mem_size);
+    return PAMF_OK;
+}
+
+// RPCS3 _CellDmuxCoreOpOpen: the notifications kept in the CellDmuxPamfHandle at the memory's start (demuxer, then
+// demux done, program end code, fatal error), the program end code's function only when the specific information asks
+// for it; the handle given back whatever the answer.
+u32 _CellDmuxCoreOpOpen(PPUContext& ctx, u32 pamf_specific_info, u32 demuxer_resource, u32 demuxer_resource_spurs,
+    u32 notify_demux_done, u32 notify_prog_end_code, u32 notify_fatal_err, u32 handle_out)
+{
+    u8* base = guest_base(ctx);
+    if (pamf_specific_info && (!usable(ctx, pamf_specific_info, 8, "the PAMF specific information") ||
+        ps_read32(base, pamf_specific_info) != 8))
+        return PAMF_ERROR_ARG;
+    if (!demuxer_resource || !usable(ctx, demuxer_resource, 0x18, "the resource")) return PAMF_ERROR_ARG;
+    if (demuxer_resource_spurs && (!usable(ctx, demuxer_resource_spurs, 0x10, "the SPURS resource") ||
+        !ps_read32(base, demuxer_resource_spurs)))
+        return PAMF_ERROR_ARG;
+    const auto demux_done = read_cb(ctx, notify_demux_done, true, "the demux done notification");
+    const auto prog_end = read_cb(ctx, notify_prog_end_code, false, "the program end code notification");
+    const auto fatal = read_cb(ctx, notify_fatal_err, true, "the fatal error notification");
+    if (!demux_done || !prog_end || !fatal || !handle_out || !usable(ctx, handle_out, 4, "the handle"))
+        return PAMF_ERROR_ARG;
+    const CoreResource res{ps_read32(base, demuxer_resource), ps_read32(base, demuxer_resource + 4),
+        ps_read32(base, demuxer_resource + 8), ps_read32(base, demuxer_resource + 12),
+        ps_read32(base, demuxer_resource + 16), ps_read32(base, demuxer_resource + 20)};
+    // Not checked on LLE (RPCS3 ensure()s it): the memory holds the CellDmuxPamfHandle.
+    if ((res.mem_addr & 0xf) || res.mem_size < kPamfHandleSize ||
+        !usable(ctx, res.mem_addr, std::max<u32>(res.mem_size, kPamfHandleSize), "the demuxer's memory"))
+        return PAMF_ERROR_ARG;
+    const bool prog_end_cb = pamf_specific_info && ps_read8(base, pamf_specific_info + 4) != 0;
+    const CoreCallbacks cbs{*demux_done, {prog_end_cb ? prog_end->fn : 0, prog_end->arg}, *fatal};
+    ps_write32(base, res.mem_addr + 0x04, cbs.demux_done.fn);
+    ps_write32(base, res.mem_addr + 0x08, cbs.demux_done.arg);
+    ps_write32(base, res.mem_addr + 0x0C, cbs.prog_end_code.fn);
+    ps_write32(base, res.mem_addr + 0x10, cbs.prog_end_code.arg);
+    ps_write32(base, res.mem_addr + 0x14, cbs.fatal_err.fn);
+    ps_write32(base, res.mem_addr + 0x18, cbs.fatal_err.arg);
+    CoreResourceSpurs spurs;
+    if (demuxer_resource_spurs) // CellDmuxResourceSpurs: spurs, priority (u64, unaligned), maxContention
+        spurs = {ps_read32(base, demuxer_resource_spurs), ps_read64(base, demuxer_resource_spurs + 4),
+            ps_read32(base, demuxer_resource_spurs + 12)};
+    u32 core_handle = 0;
+    const u32 r =
+        core_open(ctx, pamf_specific_info, res, demuxer_resource_spurs ? &spurs : nullptr, 0, core_handle, &cbs);
+    if (r == PAMF_OK)
+        if (const Core* c = core_of(core_handle)) ps_write32(base, res.mem_addr, c->context); // its DmuxPamfContext
+    ps_write32(base, handle_out, res.mem_addr);
+    return r;
+}
+
+u32 _CellDmuxCoreOpClose(PPUContext& ctx, u32 handle)
+{
+    if (!handle) return PAMF_ERROR_ARG;
+    return core_close(ctx, handle);
+}
+
+u32 _CellDmuxCoreOpResetStream(PPUContext& ctx, u32 handle)
+{
+    if (!handle) return PAMF_ERROR_ARG;
+    if (stopped(core_of(handle), "_CellDmuxCoreOpResetStream")) return PAMF_ERROR_FATAL;
+    return core_reset_stream(ctx, handle);
+}
+
+// RPCS3's open starts the demuxer's PPU thread, and its createThread starts another on the same context, which could
+// only race the first for its events (libdmux never calls it): the thread that runs since open is kept, logged once.
+// After joinThread the demuxer's SPU side is gone and cannot be started again: refused.
+u32 _CellDmuxCoreOpCreateThread(PPUContext&, u32 handle)
+{
+    Core* c = handle ? core_of(handle) : nullptr;
+    if (!c) return PAMF_ERROR_ARG;
+    if (stopped(c, "_CellDmuxCoreOpCreateThread")) return PAMF_ERROR_FATAL;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        PS_LOG_WARN(kChan, "_CellDmuxCoreOpCreateThread({:#x}): its thread runs since open; no second one", handle);
+    return PAMF_OK;
+}
+
+// RPCS3 _CellDmuxCoreOpJoinThread: every stream let go, the SPU side closed, the PPU thread joined; close then destroys
+// the rest. Again: nothing more to stop.
+u32 _CellDmuxCoreOpJoinThread(PPUContext& ctx, u32 handle)
+{
+    Core* c = handle ? core_of(handle) : nullptr;
+    if (!c) return PAMF_ERROR_ARG;
+    if (c->joined) {
+        PS_LOG_WARN(kChan, "_CellDmuxCoreOpJoinThread({:#x}): its threads stopped already", handle);
+        return PAMF_OK;
+    }
+    if (join_thread(ctx, *c) != PAMF_OK) return PAMF_ERROR_FATAL;
+    c->joined = true;
+    return PAMF_OK;
+}
+
+u32 _CellDmuxCoreOpSetStream(PPUContext& ctx, u32 handle, u32 stream_address, u32 stream_size, bool discontinuity,
+    u64 user_data)
+{
+    if (!stream_address || stream_size == 0 || !handle) return PAMF_ERROR_ARG;
+    if (stopped(core_of(handle), "_CellDmuxCoreOpSetStream")) return PAMF_ERROR_FATAL;
+    return core_set_stream(ctx, handle, stream_address, stream_size, discontinuity, user_data);
+}
+
+Core* core_of_es(u32 es_handle)
+{
+    const Es* e = es_handle ? es_of(es_handle) : nullptr;
+    return e ? e->core : nullptr;
+}
+
+u32 _CellDmuxCoreOpReleaseAu(PPUContext& ctx, u32 es_handle, u32 au_addr, u32 au_size)
+{
+    if (!au_addr || au_size == 0 || !es_handle) return PAMF_ERROR_ARG;
+    if (stopped(core_of_es(es_handle), "_CellDmuxCoreOpReleaseAu")) return PAMF_ERROR_FATAL;
+    return core_release_au(ctx, es_handle, au_addr, au_size);
+}
+
+// RPCS3 writes the attributes whatever the answer (the memory size with the CellDmuxPamfEsHandle's).
+u32 _CellDmuxCoreOpQueryEsAttr(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, u32 attr)
+{
+    if (!es_filter_id || !attr || !usable(ctx, attr, 12, "the attributes")) return PAMF_ERROR_ARG;
+    PamfEsAttr a;
+    const u32 r = core_query_es_attr(ctx, es_filter_id, es_specific_info, a);
+    u8* base = guest_base(ctx);
+    ps_write32(base, attr, a.au_queue_max_size); // CellDmuxPamfEsAttr
+    ps_write32(base, attr + 4, a.mem_size);
+    ps_write32(base, attr + 8, a.specific_info_size);
+    return r;
+}
+
+// RPCS3 _CellDmuxCoreOpEnableEs: the notifications kept in the CellDmuxPamfEsHandle at the memory's start (the
+// stream, then the access unit found and flush done notifications), the handle given back whatever the answer.
+u32 _CellDmuxCoreOpEnableEs(PPUContext& ctx, u32 handle, u32 es_filter_id, u32 es_resource, u32 notify_au_found,
+    u32 notify_flush_done, u32 es_specific_info, u32 es_handle_out)
+{
+    u8* base = guest_base(ctx);
+    if (!handle || !es_filter_id || !es_resource || !usable(ctx, es_resource, 8, "the stream's resource"))
+        return PAMF_ERROR_ARG;
+    const u32 mem_addr = ps_read32(base, es_resource), mem_size = ps_read32(base, es_resource + 4);
+    const auto au_found = read_cb(ctx, notify_au_found, true, "the access unit found notification");
+    const auto flush_done = read_cb(ctx, notify_flush_done, true, "the flush done notification");
+    if (!mem_addr || mem_size == 0 || !au_found || !flush_done) return PAMF_ERROR_ARG;
+    // Not checked on LLE (RPCS3 ensure()s it): the memory holds the CellDmuxPamfEsHandle.
+    if (!es_handle_out || !usable(ctx, es_handle_out, 4, "the stream's handle") || (mem_addr & 0xf) ||
+        mem_size < kPamfEsHandleSize || !usable(ctx, mem_addr, mem_size, "the stream's memory"))
+        return PAMF_ERROR_ARG;
+    if (stopped(core_of(handle), "_CellDmuxCoreOpEnableEs")) return PAMF_ERROR_FATAL;
+    const EsCallbacks cbs{*au_found, *flush_done};
+    ps_write32(base, mem_addr + 0x04, cbs.au_found.fn);
+    ps_write32(base, mem_addr + 0x08, cbs.au_found.arg);
+    ps_write32(base, mem_addr + 0x0C, cbs.flush_done.fn);
+    ps_write32(base, mem_addr + 0x10, cbs.flush_done.arg);
+    u32 core_es_handle = 0;
+    const u32 r =
+        core_enable_es(ctx, handle, es_filter_id, mem_addr, mem_size, 0, es_specific_info, core_es_handle, &cbs);
+    if (r == PAMF_OK) // the CellDmuxPamfEsHandle's first word: its DmuxPamfElementaryStream
+        if (const Es* e = es_of(core_es_handle)) ps_write32(base, mem_addr, e->es_struct);
+    ps_write32(base, es_handle_out, mem_addr);
+    return r;
+}
+
+u32 _CellDmuxCoreOpDisableEs(PPUContext& ctx, u32 es_handle)
+{
+    if (!es_handle) return PAMF_ERROR_ARG;
+    if (stopped(core_of_es(es_handle), "_CellDmuxCoreOpDisableEs")) return PAMF_ERROR_FATAL;
+    return core_disable_es(ctx, es_handle);
+}
+
+u32 _CellDmuxCoreOpFlushEs(PPUContext& ctx, u32 es_handle)
+{
+    if (!es_handle) return PAMF_ERROR_ARG;
+    if (stopped(core_of_es(es_handle), "_CellDmuxCoreOpFlushEs")) return PAMF_ERROR_FATAL;
+    return core_flush_es(ctx, es_handle);
+}
+
+u32 _CellDmuxCoreOpResetEs(PPUContext& ctx, u32 es_handle)
+{
+    if (!es_handle) return PAMF_ERROR_ARG;
+    if (stopped(core_of_es(es_handle), "_CellDmuxCoreOpResetEs")) return PAMF_ERROR_FATAL;
+    return core_reset_es(ctx, es_handle);
+}
+
+u32 _CellDmuxCoreOpResetStreamAndWaitDone(PPUContext& ctx, u32 handle)
+{
+    if (!handle) return PAMF_ERROR_ARG;
+    if (stopped(core_of(handle), "_CellDmuxCoreOpResetStreamAndWaitDone")) return PAMF_ERROR_FATAL;
+    return core_reset_stream_and_wait_done(ctx, handle);
+}
+
+// The table, laid out when the variable is first linked: each entry the descriptor of its function.
+void init_table(u8* base, u32 at)
+{
+    HleProcess& p = *HleProcess::current();
+    for (u32 op = 0; op < kOps; op++)
+        ps_write32(base, at + 4 * op, p.link_function("cellDmux", recomp::nid_of(kOpNames[op]), kOpNames[op]));
+}
+
+} // namespace
+
+#define PS_PAMF_OP(fn)                                                                                                 \
+    ::pspocket::hle::Function { {}, #fn, ::pspocket::recomp::nid_of(#fn), &::pspocket::hle::detail::thunk<&fn>, true }
+
+void register_pamf_table(Registry& r)
+{
+    r.add("cellDmux", {
+        PS_PAMF_OP(_CellDmuxCoreOpQueryAttr),
+        PS_PAMF_OP(_CellDmuxCoreOpOpen),
+        PS_PAMF_OP(_CellDmuxCoreOpClose),
+        PS_PAMF_OP(_CellDmuxCoreOpResetStream),
+        PS_PAMF_OP(_CellDmuxCoreOpCreateThread),
+        PS_PAMF_OP(_CellDmuxCoreOpJoinThread),
+        PS_PAMF_OP(_CellDmuxCoreOpSetStream),
+        PS_PAMF_OP(_CellDmuxCoreOpReleaseAu),
+        PS_PAMF_OP(_CellDmuxCoreOpQueryEsAttr),
+        PS_PAMF_OP(_CellDmuxCoreOpEnableEs),
+        PS_PAMF_OP(_CellDmuxCoreOpDisableEs),
+        PS_PAMF_OP(_CellDmuxCoreOpFlushEs),
+        PS_PAMF_OP(_CellDmuxCoreOpResetEs),
+        PS_PAMF_OP(_CellDmuxCoreOpResetStreamAndWaitDone),
+    });
+    // The PAMF core, compared with libdmuxpamf (D-194): no firmware-first marker. 0x28B2B7B2 is RPCS3's REG_VNID.
+    r.add_variables("cellDmuxPamf",
+        {Variable{{}, "g_cell_dmux_core_ops_pamf", 0x28B2B7B2, kOps * 4, 4, &init_table}});
+}
+
+#undef PS_PAMF_OP
 
 } // namespace pspocket::hle::dmux

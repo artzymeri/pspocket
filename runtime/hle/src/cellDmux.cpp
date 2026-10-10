@@ -805,6 +805,7 @@ void register_cellDmux(Registry& r)
         PS_HLE_FUNC(0xEBB3B2BD, cellDmuxFlushEs),
         PS_HLE_INTERNAL(dmux::NID_dmux_pamf_thread, _pspocket_dmux_pamf_thread),
     });
+    dmux::register_pamf_table(r); // the core's own table, for other modules (D-592)
 }
 
 } // namespace pspocket::hle

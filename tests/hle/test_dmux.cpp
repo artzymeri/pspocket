@@ -18,10 +18,12 @@
 #include <thread>
 #include <vector>
 
+#include "dmux.hpp"
 #include "dmux_pamf.hpp"
 #include "firmware_compare.hpp"
 #include "hle_test_util.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 #include "pspocket/spu/runtime.h"
 
@@ -456,7 +458,10 @@ std::vector<std::string> dmux_flow(u8* b, const Call& call)
     ps_write32(b, kType, 1);
     // AVC level 2.1 (CellCodecEsFilterId: stream ID, private stream ID, is AVC), ATRAC3plus with no information.
     const u32 filters[2][4] = {{0xE0, 0, 1, 0}, {0xBD, 0x00, 0, 0}};
-    for (u32 i = 0; i < 4; i++) ps_write32(b, kFilterV + 4 * i, filters[0][i]), ps_write32(b, kFilterA + 4 * i, filters[1][i]);
+    for (u32 i = 0; i < 4; i++) {
+        ps_write32(b, kFilterV + 4 * i, filters[0][i]);
+        ps_write32(b, kFilterA + 4 * i, filters[1][i]);
+    }
     ps_write32(b, kSpecV, 21);
     r("cellDmuxQueryEsAttr", 0x02170D1A, {kType, kFilterV, kSpecV, kEsAttr});
     note(std::format("video es attr {:#x}", ps_read32(b, kEsAttr)));
@@ -639,6 +644,249 @@ TEST_CASE("cellDmux: a demuxer's whole life through the API, the game's callback
     CHECK(at[-1] == std::format("cellDmuxResetStream -> {:#x}", CELL_DMUX_ERROR_SEQ));
     CHECK(at[-2] == std::format("cellDmuxReleaseAu -> {:#x}", CELL_DMUX_ERROR_SEQ));
     CHECK(lines.back() == std::format("cellDmuxDisableEs -> {:#x}", CELL_DMUX_ERROR_ARG));
+}
+
+// ---- D-592: the PAMF core through its own exported table, g_cell_dmux_core_ops_pamf
+
+namespace {
+
+// The table caller's notifications (RPCS3 DmuxNotify*, DmuxEsNotify*) as guest code: each logs an entry of 0x80 bytes
+// at kTableLog + 0x10 + 0x80 * n (its kind, r3, r4, r5; for an access unit its DmuxAuInfo and 16 bytes of its specific
+// information) and answers CELL_OK; the count at kTableLog.
+constexpr u32 kTableCode = kData + 0x600, kTableOpds = kData + 0x900, kTableLog = kData + 0x5000;
+enum : u32 { kDemuxDone = 0, kProgEnd = 1, kFatal = 2, kAuFound = 3, kFlushDone = 4 };
+
+void write_table_notifications(u8* b)
+{
+    std::vector<u32> code;
+    for (u32 kind = 0; kind < 5; kind++) {
+        ps_write32(b, kTableOpds + 8 * kind, kTableCode + 4 * static_cast<u32>(code.size()));
+        ps_write32(b, kTableOpds + 8 * kind + 4, 0);
+        code.insert(code.end(), {as::lis(9, static_cast<s32>(kTableLog >> 16)), as::ori(9, 9, kTableLog & 0xFFFF),
+            as::lwz(10, 0, 9), as::slwi(11, 10, 7), as::add(11, 11, 9), as::li(12, static_cast<s32>(kind)),
+            as::stw(12, 0x10, 11), as::stw(3, 0x14, 11), as::stw(4, 0x18, 11), as::stw(5, 0x1C, 11)});
+        if (kind == kAuFound) {
+            const auto copy = [&](u32 words, u32 from, s32 to) {
+                for (u32 w = 0; w < words; w++) {
+                    const s32 at = static_cast<s32>(4 * w);
+                    code.insert(code.end(), {as::lwz(0, at, from), as::stw(0, to + at, 11)});
+                }
+            };
+            copy(12, 4, 0x20);                    // the DmuxAuInfo
+            code.push_back(as::lwz(12, 0x28, 4)); // its specific information
+            copy(4, 12, 0x50);
+        }
+        code.insert(code.end(), {as::lwsync(), as::addi(10, 10, 1), as::stw(10, 0, 9), as::li(3, 0), as::blr()});
+    }
+    REQUIRE(code.size() * 4 <= kTableOpds - kTableCode);
+    for (usize i = 0; i < code.size(); i++) ps_write32(b, kTableCode + 4 * static_cast<u32>(i), code[i]);
+    std::memset(b + kTableLog, 0, 0x3000);
+}
+
+struct TableEntry {
+    u32 kind, r3, r4, r5, at;
+};
+std::vector<TableEntry> table_log(u8* b)
+{
+    const u32 n = ps_read32(b, kTableLog);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    std::vector<TableEntry> v;
+    for (u32 i = 0; i < n; i++) {
+        const u32 at = kTableLog + 0x10 + 0x80 * i;
+        v.push_back({ps_read32(b, at), ps_read32(b, at + 4), ps_read32(b, at + 8), ps_read32(b, at + 0xC), at});
+    }
+    return v;
+}
+
+// An access unit as the API's lines show it: "addr A size S rap R user U pts P dts D" and its specific bytes.
+std::string au_key(u8* b, const TableEntry& e, u32 n_specific)
+{
+    const u32 i = e.at + 0x10; // the DmuxAuInfo's copy
+    return std::format("addr {:#x} size {:#x} rap {} user {:#x} pts {:#x} dts {:#x} [{}]", ps_read32(b, i),
+        ps_read32(b, i + 4), ps_read8(b, i + 0xC), ps_read64(b, i + 0x10), ps_read64(b, i + 0x18),
+        ps_read64(b, i + 0x20), hex_bytes(b + e.at + 0x40, n_specific));
+}
+
+} // namespace
+
+// The test plays libdmux (RPCS3 cellDmux.cpp): it calls the table's entries as guest code with the memory pspocket's
+// cellDmux gives the core, in a process that does not import cellDmux, and its notifications are guest functions. The
+// access units found are those cellDmux's own run hands the game (the same addresses, sizes, timestamps, random access
+// flags, user data and specific information), each notification with RPCS3's arguments.
+TEST_CASE("cellDmuxPamf: the PAMF core through its own operation table, as a firmware module drives it (D-592)",
+    "[hle][dmux]")
+{
+    InterpretMisses interpret;
+    // What cellDmux's own run (the D-194 flow) hands the game, stream by stream.
+    std::vector<std::string> api[2];
+    {
+        DmuxFixture f;
+        GuestThread t(f, 0, "ppu");
+        for (const std::string& l : dmux_flow(f.base(), hle_calls(f, t))) {
+            const usize at = l.find(" addr "), specific = l.find(" specific "), open = l.find('['), close = l.find(']');
+            if (at == std::string::npos || specific == std::string::npos || open == std::string::npos) continue;
+            const std::string key = l.substr(at + 1, specific - at - 1) + " " + l.substr(open, close - open + 1);
+            if (l.starts_with("video au ")) api[0].push_back(key);
+            else if (l.starts_with("audio au ")) api[1].push_back(key);
+        }
+    }
+    REQUIRE(api[0].size() == 4); // three, then the one the flush gives
+    REQUIRE(api[1].size() == 5);
+
+    Fixture f;
+    REQUIRE(f.hle->initialize_tls({0, 0, 0x100}));
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    CHECK(f.hle->descriptor_of("cellDmux", hle::dmux::NID_dmux_pamf_thread) == 0); // cellDmux is not imported
+    const u32 table = f.hle->link_variable("cellDmuxPamf", 0x28B2B7B2);
+    REQUIRE(table != 0);
+    enum { QueryAttr, Open, Close, ResetStream, CreateThread, JoinThread, SetStream, ReleaseAu, QueryEsAttr, EnableEs,
+        DisableEs, FlushEs, ResetEs, ResetStreamAndWaitDone };
+    const char* names[14] = {"QueryAttr", "Open", "Close", "ResetStream", "CreateThread", "JoinThread", "SetStream",
+        "ReleaseAu", "QueryEsAttr", "EnableEs", "DisableEs", "FlushEs", "ResetEs", "ResetStreamAndWaitDone"};
+    for (u32 i = 0; i < 14; i++) {
+        INFO(names[i]);
+        CHECK(ps_read32(b, table + 4 * i) ==
+            f.hle->descriptor_of("cellDmux", recomp::nid_of(std::format("_CellDmuxCoreOp{}", names[i]))));
+    }
+    const auto op = [&](u32 i, std::initializer_list<u64> args) {
+        return static_cast<u32>(hle::call_guest(t.ctx, ps_read32(b, table + 4 * i), args));
+    };
+    constexpr u32 PAMF_ARG = 2, PAMF_UNKNOWN_STREAM = 3, PAMF_FATAL = 6;
+    write_table_notifications(b);
+    const std::vector<u8> stream = program_stream();
+    std::memcpy(b + kStream, stream.data(), stream.size());
+    std::memset(b + kArgs, 0, 0x200);
+    constexpr u32 kCbDone = kArgs + 0x140, kCbProg = kArgs + 0x148, kCbFatal = kArgs + 0x150, kCbAuV = kArgs + 0x158,
+                  kCbFlushV = kArgs + 0x160, kCbAuA = kArgs + 0x168, kCbFlushA = kArgs + 0x170, kOut = kArgs + 0x180,
+                  kBadFilter = kArgs + 0x190;
+    const auto cb = [&](u32 at, u32 kind, u32 arg) {
+        ps_write32(b, at, kTableOpds + 8 * kind);
+        ps_write32(b, at + 4, arg);
+    };
+    cb(kCbDone, kDemuxDone, 0xD0D0);
+    cb(kCbProg, kProgEnd, 0xE0E0);
+    cb(kCbFatal, kFatal, 0xFA7A);
+    cb(kCbAuV, kAuFound, 0xA0A0);
+    cb(kCbFlushV, kFlushDone, 0xF0F0);
+    cb(kCbAuA, kAuFound, 0xA1A1);
+    cb(kCbFlushA, kFlushDone, 0xF1F1);
+
+    // Sizes: libdmuxpamf's (CellDmuxPamfAttr: streams, version, memory).
+    CHECK(op(QueryAttr, {0, kAttr}) == 0);
+    CHECK(ps_read32(b, kAttr) == 0x40);
+    CHECK(ps_read32(b, kAttr + 4) == 0x280000);
+    CHECK(ps_read32(b, kAttr + 8) == 0x1c + 0x3d880 + 0xe7b);
+    CHECK(op(QueryAttr, {0, 0}) == PAMF_ARG);
+    // Open, in the memory cellDmux gives the core (after its context and the 64 stream handles); the
+    // CellDmuxPamfHandle there keeps the notifications (no program end code callback asked for: none).
+    const u32 core_mem = kDmuxMem + 0x1C0;
+    const u32 res[6] = {core_mem, kDmuxMemSize - 0x1C0, 1000, 0x4000, 200, 1};
+    for (u32 i = 0; i < 6; i++) ps_write32(b, kRes + 4 * i, res[i]);
+    CHECK(op(Open, {0, kRes, 0, 0, kCbProg, kCbFatal, kOut}) == PAMF_ARG); // no demux done notification
+    REQUIRE(op(Open, {0, kRes, 0, kCbDone, kCbProg, kCbFatal, kOut}) == 0);
+    const u32 handle = ps_read32(b, kOut);
+    CHECK(handle == core_mem);
+    CHECK(ps_read32(b, handle) == ((core_mem + 0x1c + 0x7f) & ~0x7fu)); // its DmuxPamfContext
+    CHECK(ps_read32(b, handle + 4) == kTableOpds + 8 * kDemuxDone);
+    CHECK(ps_read32(b, handle + 8) == 0xD0D0);
+    CHECK(ps_read32(b, handle + 0xC) == 0);
+    CHECK(ps_read32(b, handle + 0x14) == kTableOpds + 8 * kFatal);
+    CHECK(f.hle->descriptor_of("cellDmux", hle::dmux::NID_dmux_pamf_thread) != 0); // linked for its thread
+    // The streams, in the memory cellDmux gives them (after each DmuxEsContext and its 65 queue elements).
+    const u32 filters[2][4] = {{0xE0, 0, 1, 0}, {0xBD, 0x00, 0, 0}};
+    for (u32 i = 0; i < 4; i++) {
+        ps_write32(b, kFilterV + 4 * i, filters[0][i]);
+        ps_write32(b, kFilterA + 4 * i, filters[1][i]);
+    }
+    ps_write32(b, kSpecV, 21);
+    CHECK(op(QueryEsAttr, {kFilterV, kSpecV, kEsAttr}) == 0);
+    CHECK(ps_read32(b, kEsAttr) == 0x40);
+    CHECK(ps_read32(b, kEsAttr + 8) == 4);
+    CHECK(op(QueryEsAttr, {kFilterA, 0, kEsAttr}) == 0);
+    CHECK(ps_read32(b, kEsAttr + 8) == 0);
+    const u32 es_mem[2] = {kEsMemV + 0xF90, kEsMemA + 0xE90}, es_size[2] = {kEsMemVSize - 0xF90, kEsMemASize - 0xE90};
+    ps_write32(b, kEsResV, es_mem[0]);
+    ps_write32(b, kEsResV + 4, es_size[0]);
+    ps_write32(b, kEsResA, es_mem[1]);
+    ps_write32(b, kEsResA + 4, es_size[1]);
+    REQUIRE(op(EnableEs, {handle, kFilterV, kEsResV, kCbAuV, kCbFlushV, kSpecV, kEsHandleV}) == 0);
+    REQUIRE(op(EnableEs, {handle, kFilterA, kEsResA, kCbAuA, kCbFlushA, 0, kEsHandleA}) == 0);
+    const u32 es[2] = {ps_read32(b, kEsHandleV), ps_read32(b, kEsHandleA)};
+    CHECK(es[0] == es_mem[0]);
+    CHECK(es[1] == es_mem[1]);
+    CHECK(ps_read32(b, es[0] + 4) == kTableOpds + 8 * kAuFound); // the CellDmuxPamfEsHandle's notifications
+    CHECK(ps_read32(b, es[0] + 0x10) == 0xF0F0);
+    // A stream ID that is no PAMF stream's (the filter's words all 0).
+    CHECK(op(EnableEs, {handle, kBadFilter, kEsResA, kCbAuA, kCbFlushA, 0, kOut}) == PAMF_UNKNOWN_STREAM);
+    CHECK(op(EnableEs, {handle, kFilterA, kEsResA, kCbAuA, 0, 0, kOut}) == PAMF_ARG); // no flush done notification
+
+    // The stream to its end; the access units each released as cellDmux releases them.
+    CHECK(op(SetStream, {0, kStream, stream.size(), 0, kUserData}) == PAMF_ARG);
+    REQUIRE(op(SetStream, {handle, kStream, stream.size(), 0, kUserData}) == 0);
+    const auto wait_for = [&](u32 kind, u32 r3, usize seen) {
+        return wait_until([&] {
+            const auto log = table_log(b);
+            for (usize i = seen; i < log.size(); i++)
+                if (log[i].kind == kind && log[i].r3 == r3) return true;
+            return false;
+        });
+    };
+    REQUIRE(wait_for(kDemuxDone, handle, 0));
+    std::vector<std::string> found[2];
+    usize released = 0;
+    const auto release = [&] {
+        const auto log = table_log(b);
+        for (; released < log.size(); released++) {
+            const TableEntry& e = log[released];
+            if (e.kind != kAuFound) continue;
+            const u32 s = e.r3 == es[0] ? 0 : 1;
+            CHECK(e.r3 == es[s]);
+            CHECK(e.r5 == (s ? 0xA1A1u : 0xA0A0u));
+            CHECK(ps_read32(b, e.at + 0x3C) == (s ? 0u : 4u)); // specific_info_size
+            found[s].push_back(au_key(b, e, s ? 0 : 4));
+            CHECK(op(ReleaseAu, {e.r3, ps_read32(b, e.at + 0x10), ps_read32(b, e.at + 0x14)}) == 0);
+        }
+    };
+    release();
+    CHECK(op(ReleaseAu, {es[0], 0, 0x10}) == PAMF_ARG);
+    for (u32 s = 0; s < 2; s++) {
+        const usize seen = table_log(b).size();
+        REQUIRE(op(FlushEs, {es[s]}) == 0);
+        REQUIRE(wait_for(kFlushDone, es[s], seen));
+        release();
+    }
+    for (u32 s = 0; s < 2; s++) {
+        INFO("stream " << s);
+        CHECK(found[s] == api[s]);
+    }
+    for (const TableEntry& e : table_log(b)) {
+        if (e.kind == kDemuxDone) CHECK((e.r4 == 0 && e.r5 == 0xD0D0));    // (handle, CELL_OK, arg)
+        if (e.kind == kFlushDone) CHECK(e.r4 == (e.r3 == es[0] ? 0xF0F0u : 0xF1F1u)); // (es handle, arg)
+        CHECK(e.kind != kFatal);
+        CHECK(e.kind != kProgEnd);
+    }
+
+    // A second run after a discontinuity, reset while it runs; then the streams and the demuxer let go.
+    CHECK(op(ResetEs, {es[0]}) == 0);
+    REQUIRE(op(SetStream, {handle, kStream, stream.size(), 1, kUserData + 1}) == 0);
+    CHECK(op(ResetStreamAndWaitDone, {handle}) == 0);
+    CHECK(op(ResetStream, {handle}) == 0);
+    CHECK(op(DisableEs, {es[1]}) == 0);
+    CHECK(op(DisableEs, {es[1]}) == PAMF_ARG); // gone
+    CHECK(op(FlushEs, {0}) == PAMF_ARG);
+    CHECK(op(Close, {handle}) == 0);
+    CHECK(op(Close, {handle}) == PAMF_ARG); // gone
+
+    // createThread: the thread runs since open (none started again); joinThread stops it, after which only close
+    // is taken.
+    REQUIRE(op(Open, {0, kRes, 0, kCbDone, kCbProg, kCbFatal, kOut}) == 0);
+    CHECK(op(CreateThread, {handle}) == 0);
+    CHECK(op(JoinThread, {handle}) == 0);
+    CHECK(op(JoinThread, {handle}) == 0);
+    CHECK(op(SetStream, {handle, kStream, stream.size(), 0, kUserData}) == PAMF_FATAL);
+    CHECK(op(CreateThread, {handle}) == PAMF_FATAL);
+    CHECK(op(Close, {handle}) == 0);
 }
 
 TEST_CASE("cellDmux: the same answers, callbacks and access units as Sony's libdmux and libdmuxpamf (the user's "
