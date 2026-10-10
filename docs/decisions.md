@@ -8832,3 +8832,131 @@ linked to the host's variable.
 Tests: tests/hle/test_lle.cpp (D-591's test: a synthetic module importing LPCM's table is chosen with no gap and gets
 pspocket's table, with and without the core's module installed; one importing MP3's firmware-first table brings in
 Sony's module where it is installed). The other loader tests pass unchanged.
+
+## D-597 · 2026-10-10 · The comparisons with Sony's modules, ready for the Mac: the firmware-first libraries, the codec cores, cellVdec's new codecs
+
+The firmware-first libraries (D-563: libmixer, cellVpost, cellKey2char, cellPngEnc, cellFiber), the video codec cores'
+version queries (D-575) and cellVdec's DivX 3.11, VC-1 and MVC (D-588 to D-590) were made without Sony's modules; each
+is to be compared with its module on the Mac before its marker goes. The comparisons are now written, so a session on
+the Mac only has to run them, read the differences and fix them.
+
+**The suite** (tests/hle/compare_util.hpp, over firmware_compare.hpp). Each comparison sends the same calls with the same
+synthetic inputs to pspocket's library and to Sony's module, each half in a fresh process (fixture), reaching the exports
+as a game does: a guest call through the export's descriptor, Sony's module's own in its half, pspocket's linked stub in
+the other. The inputs are the libraries' own tests': the mixer's notify callback and players (test_libmixer.cpp), the
+colours and windows of test_vpost.cpp, test_imgenc.cpp's pictures and chunks, test_fiber.cpp's scripts (their routine now
+in fiber_script.hpp, shared by both tests) and test_vdec_codecs.cpp's streams (vdec_streams.hpp: the same encoders and
+pictures; test_vdec_codecs.cpp keeps its own copies while other work changes cellVdec's tests, and can include it later).
+What a game can see is written as observations:
+- lines, compared one for one by their key, realigned when one half has a line the other lacks: answers and error codes,
+  output words, structures' bytes (as "hex:" values, whose differing bytes the report names);
+- numbers, within a stated tolerance (relative past 1, absolute below);
+- data (pictures, samples, decoded PNG pixels) under a rule: exact; within N steps a byte, with an alpha channel exact;
+  or big-endian floats within a tolerance;
+- notes, listed where the halves differ but not counted, for what may legitimately differ (timing, compressed sizes,
+  opaque objects' bytes, the exports of Sony's module that pspocket lacks).
+The report at the end of each comparison: "N of M observations differ", the first 80 differences, each as "the step:
+pspocket's value | Sony's", the differences counted by group for the large tables, the notes, and the values within the
+tolerance but not equal (as test_vdec.cpp counts RGB one step off). A half that makes no progress for a minute prints its
+last step on stderr, every minute, so a module stuck on something pspocket's lv2 lacks names where.
+
+**Running it on the Mac**, with the system software installed:
+`PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare]"`, or one
+library with "[compare][libmixer]", "[compare][vpost]", "[compare][key2char]", "[compare][pngenc]", "[compare][fiber]",
+"[compare][codec-cores]" or "[compare][vdec]" (for the last, scripts/build-ffmpeg.sh first, D-588: without the VC-1
+decoder or the tests' encoders those parts skip). PSPOCKET_COMPARE_PRINT=1 also prints both halves' observations in full
+(to read Sony's answers). The comparisons are hidden ([.]): ctest and the gate, which sets PSPOCKET_TEST_DEV_FLASH, leave
+them out while they are expected to differ, so they hold up no build. When a library matches, its test loses the [.]
+together with the library's firmware-first marker (a decision of its own), and joins the gate as D-193's comparisons
+have. Without the firmware each skips. PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice instead, the second in Sony's
+place, so the whole comparison runs anywhere: the halves must agree (a half that does not repeat itself would show
+differences on the Mac that are not Sony's), and each test checks pspocket's own values against its unit tests' (a few
+dozen checks each). What needs no firmware is checked in every ctest run: each function a comparison calls is in the NID
+database under its library with that name, is pspocket's own, and the library is still firmware-first.
+
+**What each compares, and what a difference means.**
+- **libmixer** (test_libmixer_compare.cpp; both halves over pspocket's cellAudio): every answer before cellAudioInit and
+  after; the audio port the mixer opens (its number, state, channels, blocks and size); the AAN handle and port numbers;
+  the notify callback's rules and each call's argument, tag and sample count in order; strips with levels, an expression
+  in dB and a mute, a bus and a looped player, heard at the speakers after each change (the total level, the total mute
+  and back, the player stopped) and found in the port's ring with the mixer paused (each distinct block's eight
+  channels); pause and play again; the timestamps after the first (within 0.1%); Finalize and a second mixer. Then the
+  players: a stereo wave once at double speed, looped from frame 90, at half speed, held at its end (ONESHOT_CONT),
+  SetParam while playing, a start past the wave's end, each first block at the speakers frame by frame; and the three
+  utilities over a range of arguments (GetLevelFromDBIndex from -200 to 200, the first thing D-563 named to check).
+  Samples within 1e-6 count as the same: the inputs are exact in binary, but Sony's may sum them in another order or
+  scale them once more. The latency after Start and the callback count are notes (thread timing). A difference is in
+  pspocket's mixing, port or callback (libmixer.cpp): RPCS3's speed change and loop handling are its guess, and so are
+  the parameters RPCS3 ignores.
+- **cellVpost** (test_vpost_compare.cpp): QueryAttr over 17 configurations (its attribute: Sony's memory size, delay and
+  versions, where pspocket has RPCS3's); Open with eight bad resources (pspocket only checks that one is there),
+  OpenEx's refusals, Close; Exec of test_vpost.cpp's 17 flat colours, ramps in each matrix, range and chroma siting,
+  ramps, edges and impulses enlarged and reduced with each scaler type, the tiny cases, windows (inside, outside, past
+  the edge), the eight exec types with the three interpolation types, three alphas, and Exec's checks, with the picture
+  information each time; a YUV handle: copies, a flat picture enlarged, ramps and impulses scaled. Same-size RGBA
+  within one step a sample (the arithmetic is the SPU program's), scaled pictures within two (its filter's taps and
+  rounding are not known), the alpha, YUV copies, untouched pixels outside a window and the bytes past the output
+  exactly. A difference in the scaled pictures means another filter: the impulse pictures show Sony's taps to copy.
+- **cellKey2char** (test_key2char_compare.cpp): Open before and after cellKbInit, on a zeroed handle and on garbage;
+  the mode and arrangement checks; GetChar's checks; every one of 95 key codes in all 25 arrangements and the three
+  modes, with ten modifier and LED combinations (four in the native modes), each opened afresh: GetChar's answer,
+  charNum, processed and characters, where *charCode points (written when it changes), and the 128-byte handle after
+  each call that may change it; a handle marked broken (byte 0 = 255, RPCS3's reading); Close. A difference in the
+  characters is a layout table or the native modes' composition (pspocket types them as the English one, D-565); one in
+  the handle, where Sony's keeps its state; one in *charCode's place, where its buffer is.
+- **cellPngEnc** (test_pngenc_compare.cpp): QueryAttr over twelve configurations; Open's and OpenEx's refusals and the
+  handle; test_imgenc.cpp's pictures in every colour space and depth, palettes with and without PLTE, with hIST and
+  bKGD, the texts (tEXt, zTXt, iTXt), time, gamma, physical size and an sPLT, the colour chunks (cHRM, sRGB, sBIT, bKGD,
+  oFFs, sCAL, tRNS), iCCP, a 64x64 picture under each filter set and level; the queue (four waiting, WaitForInput and a
+  fifth once all four are encoded, oldest first, Reset, EMPTY); a buffer too small; a file and one that cannot be made;
+  EncodePicture's checks; an encoder on the SPUs. Each stream: its information (every field but streamSize exactly, and
+  streamSize its own PNG's length), whether it is a whole PNG with good CRCs, its chunks in order, every chunk but IDAT
+  byte for byte (zTXt's, iTXt's and iCCP's compressed parts as libpng reads them back), the pixels as libpng decodes
+  them, and the bytes past it untouched. The compressed bytes may legitimately differ (zlib's version and settings and
+  libpng's filter choice are the encoder's own; Sony's is libpng 1.2.8 on zlib 1.2.3, D-199) and give the same pixels:
+  the IDAT size, the zlib header and each row's filter are notes, to read Sony's choices off. A difference in the
+  chunks, the pixels or the queue's answers is pspocket's to fix.
+- **cellFiber** (test_fiber_compare.cpp): test_fiber.cpp's eight scenarios, each in its own process, the scripts
+  calling the half's own exports: the log (the order fibers and contexts ran in, with each call's answer made inside
+  them), every answer and output word (statuses, causes, the context that switched, numWorker), and the attribute
+  structures as the four initializers leave them, with the SDK version and without (a game sets fields over them). The
+  schedulers', fibers', contexts', worker controls' and the trace buffer's bytes are notes: the SDK keeps them opaque,
+  and pspocket keeps libfiber's state on the host (D-568). Workers take fibers in their own order: only the joins'
+  statuses are compared there. ConnectEventQueueToSpurs and DisconnectEventQueue are not sent (their arguments are not
+  known: to read in libfiber by hand). A difference in the log is a scheduling rule (D-568 lists each choice made).
+- **The codec cores** (test_codec_cores_compare.cpp): each of the six modules in a process of its own; the version and
+  characteristics queries with a good, a misaligned and a null pointer, and the 24 bytes around the output (filled
+  first). A pointer outside guest memory is not sent to Sony's (it would write there). The exports Sony's module has
+  that pspocket lacks are a note: what is left of these libraries.
+- **cellVdec's new codecs** (test_vdec_codecs_compare.cpp), four families: DivX 3.11 (QueryAttrEx with and without its
+  information and RPCS3's checks, six pictures with and without SetFrameRate, a frame size given smaller and larger than
+  the stream's, 720x576 without the information); MPEG-4 part 2 as DivX and as MPEG-4 with two pixel aspect ratios;
+  VC-1 (QueryAttrEx for levels 0 to 10 and with its information, OpenEx of the simple and main profiles,
+  test_vdec_codecs.cpp's streams: I and skipped pictures, range mapping with pulldown, an access unit before the
+  headers, a new sequence header, the decode modes); MVC and MVC2 (two views in each access unit, the views apart, and
+  the base view alone as H.264, to read MVC's differences against). For each decoder: every answer, the callbacks in
+  order, the pictures announced before EndSeq (the lag), and for each picture its item, the places of the item and its
+  frame buffer, its information block at the codec's size by RPCS3's attributes (DivX 0x20, DivX 3.11 0x18, MPEG-4 0x38,
+  VC-1 0x170, MVC 0x214), its frame buffer (Sony's layout as known from H.264) and its samples. VC-1 and MVC must be
+  exact (VC-1's inverse transform is exact by the standard, the MVC pictures are I_PCM); DivX and MPEG-4 part 2 within
+  one step a sample (the standard lets each decoder round its IDCT, IEEE 1180). The differences answer the questions
+  D-588 to D-590 left: the information blocks' layouts, range mapping, access units before a sequence header, what
+  libmvcdec gives of the second view, the frame buffers and the lag for these codecs.
+
+Found while writing it: a picture with more than one text chunk aborted cellPngEnc's stream (D-598).
+
+Tests, here (no firmware): the seven name checks pass in ctest; `test_hle "[compare]"` skips all of them;
+PSPOCKET_COMPARE_SELF=1 runs every comparison, both halves agree (key2char 43,641 observations, vpost 536, pngenc 614,
+libmixer 119 and 460, fiber 216 over its eight scenarios, the codec cores 42, vdec 1,127 over its four families) and the
+sanity checks pass.
+
+## D-598 · 2026-10-10 · cellPngEnc: a picture's text chunks kept where libpng's pointers find them
+
+cellPngEnc (D-566) kept the strings of a picture's text chunks in a vector and handed libpng pointers into them until
+png_set_text took them all. Each text chunk reserved room for four more strings, which moved the strings already there;
+a short string (a keyword: its characters inside the string object) moved its characters with it, so with a second text
+chunk libpng read the first's keyword from freed memory and refused it ("tEXt: invalid keyword"): the stream of any
+picture with more than one text chunk aborted (STREAM_ABORT). The unit test had one text chunk; the comparison suite's
+pspocket half, with tEXt, zTXt and iTXt in one picture, found it (D-597). The strings are in a deque now, which never
+moves a string it holds. Test: tests/hle/test_imgenc.cpp, three text chunks with short keywords and texts in one
+picture, read back with libpng (before the fix the stream aborted).
