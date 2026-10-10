@@ -1,0 +1,9 @@
+# LeakSanitizer suppressions for scripts/asan.sh (D-604). Each entry names memory pspocket allocates once and keeps
+# for the process's life on purpose, with the reason; a leak in a path that runs again and again is a bug, not an
+# entry here.
+
+# The lifted SPU programs' dispatch tables (runtime/spu/src/runtime.cpp, ps_spu_register_program): one per program,
+# built at its first registration and never freed, a retired one included, as an SPU context may still be running it
+# (D-231). At exit the registry's vectors that point at them are destroyed before LeakSanitizer looks, so every
+# program a test registered shows as a direct leak of its table.
+leak:ps_spu_register_program

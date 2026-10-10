@@ -1,0 +1,13 @@
+# UBSan suppressions for scripts/asan.sh (D-604). Each entry with its reason. Undefined behaviour in pspocket's own
+# code is fixed, not listed.
+
+# FreeType 2.2.1 (PSPOCKET_FREETYPE_DIR, cell_FreeType2's FreeType: the version Sony's libfreetype is, D-525), third
+# party and built as it is. What it does by design, on every input:
+# - its modules', services' and renderers' functions called through FreeType's generic function pointer types
+#   (FT_Module_Constructor, FT_Raster_RenderFunc and the like), which -fsanitize=function checks in C since Clang 17;
+function:*freetype-2.2.1*
+# - left shifts of negative values (FT_GET_SHORT and the stream and cmap readers built on it), and of values into the
+#   sign bit (ftrfork.c's tags);
+shift-base:*freetype-2.2.1*
+# - arithmetic on a null pointer with no elements (the glyph loader's and the autohinter's empty arrays).
+pointer-overflow:*freetype-2.2.1*
