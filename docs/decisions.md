@@ -8065,3 +8065,25 @@ pointers turned round with 16-bit PCM at half scale. The downmixes against that 
 auto (Lo/Ro), 1/0, 3/0 with the LFE, 2/1; a stereo stream into 3/2 with the LFE (two slots sound, four silent). Refused:
 no sync, the reserved rate, E-AC-3's bsid, a cut frame; a CRC mismatch flagged and concealed; eight parameter sets
 StartSeq refuses.
+
+## D-579 (part 2) · 2026-10-09 · cellAdec's ATRAC3 core on FFmpeg, firmware first
+
+ATRAC3 (CELL_ADEC_TYPE_ATRAC3, for cellAtrac3dec) gets pspocket's own core where no firmware module gives one, by
+D-577's rule (adec_atrac3.cpp); through it cellAtrac (D-532) now plays ATRAC3 files without the system software, as it
+plays AT3+ through D-198's core. From RPCS3's cellAdec.h: CellAdecParamAtrac3 (nch, isJoint, nbytes, bw_pcm),
+CellAdecAtrac3Info, the AT3 error codes and the front end's fixed PTS step (type 6). One frame of nbytes per access
+unit, decoded by FFmpeg's ATRAC3 decoder: 1024 samples per channel interleaved in the four formats as libatxdec writes
+them (16, 24 in a word's low three bytes, 32 bits, float). FFmpeg takes the configuration as a WAV file's 14 extra
+bytes (the coding mode: joint stereo or single channels, as libatrac3plus reads it from the file) and frames of 96, 152
+or 192 bytes a channel (ATRAC3's rates), so StartSeq refuses (ARG) another size, as it does channels other than 1 or 2,
+joint stereo of one channel, or a word size ATRAC3_WordSize has not. A unit shorter than its frame, or one FFmpeg
+refuses, is AT3_ERROR; the information block is the sequence's nch, isJoint and nbytes. Joint stereo decodes as FFmpeg
+decodes it; no frame of it is built in the tests (its second sound unit is written backwards with its own
+coefficients). ATRAC3 multichannel (cellAtrac3multidec, cellAtracMulti's) stays Sony's.
+
+Test: tests/hle/test_adec_cores.cpp. Six stereo frames built in the test (one constant-length coded line in each
+channel's lowest QMF band): float, 16-, 24- and 32-bit PCM byte for byte FFmpeg's own decoding converted as
+libatxdec's, the tones at 2164 and 1303 Hz, the information block, PTS corrected by 4180; mono with 152-byte frames; a
+sound unit of the wrong ID and a cut frame refused (AT3_ERROR), the next frame decoding; four parameter sets StartSeq
+refuses and joint stereo of two channels taken. cellAtrac with an ATRAC3 file of those frames and no firmware: it
+creates its decoder on pspocket's core and decodes 15,291 samples of the tones.

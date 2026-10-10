@@ -1387,3 +1387,240 @@ TEST_CASE("cellAdec: AC-3 on FFmpeg, downmixed: Lo/Ro, Lt/Rt, mono, 3/0, 2/1; st
 }
 
 #endif
+
+// ---- ATRAC3
+
+namespace {
+
+constexpr u32 kTypeAtrac3 = 5;
+
+// The spectrum's subbands (FFmpeg's subband_tab, from the ATRAC3 format).
+constexpr u32 kSubbands[33] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320,
+    352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024};
+
+// An ATRAC3 frame of single channels (no joint stereo), `unit` bytes a channel: each channel's sound unit codes its
+// lowest QMF band only, no gain control and no tonal components, its spectrum constant-length coded with one line,
+// lines[ch], at 20 in selector 7 (6-bit values), scale factor index `sf`. Its sound is a tone at (line + 0.5) * rate /
+// 2048 Hz.
+std::vector<u8> atrac3_frame(u32 channels, std::array<u32, 2> lines, u32 unit = 192, u32 sf = 48)
+{
+    std::vector<u8> f;
+    for (u32 ch = 0; ch < channels; ch++) {
+        BitWriter w;
+        w.put(0x28, 6); // the sound unit's ID
+        w.put(0, 2);    // one QMF band
+        w.put(0, 3);    // no gain control points
+        w.put(0, 5);    // no tonal components
+        const u32 line = lines[ch];
+        u32 sb = 0;
+        while (kSubbands[sb + 1] <= line) sb++;
+        w.put(sb, 5); // subbands coded: 0 to sb
+        w.put(1, 1);  // constant length coding
+        for (u32 i = 0; i <= sb; i++) w.put(i == sb ? 7 : 0, 3);
+        w.put(sf, 6);
+        for (u32 j = kSubbands[sb]; j < kSubbands[sb + 1]; j++) w.put(j == line ? 20 : 0, 6);
+        std::vector<u8> u = w.bytes;
+        u.resize(unit, 0);
+        f.insert(f.end(), u.begin(), u.end());
+    }
+    return f;
+}
+
+std::vector<u8> atrac3_param(u32 nch, u32 joint, u32 nbytes, u32 bw) { return be32s({nch, joint, nbytes, bw}); }
+
+#if PSPOCKET_HAVE_FFMPEG
+
+// FFmpeg's ATRAC3 decoder set up as the core sets it up: a WAV file's 14 extra bytes, the frame size.
+std::function<void(AVCodecContext*)> atrac3_setup(u32 nch, u32 nbytes)
+{
+    return [=](AVCodecContext* av) {
+        av_channel_layout_uninit(&av->ch_layout);
+        av_channel_layout_default(&av->ch_layout, static_cast<int>(nch));
+        av->sample_rate = 44100;
+        av->block_align = static_cast<int>(nbytes);
+        static constexpr u8 kExtra[14] = {1, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0};
+        av->extradata = static_cast<u8*>(av_mallocz(sizeof(kExtra) + AV_INPUT_BUFFER_PADDING_SIZE));
+        std::memcpy(av->extradata, kExtra, sizeof(kExtra));
+        av->extradata_size = sizeof(kExtra);
+    };
+}
+
+// The core's 24- and 32-bit words for planar floats (as libatxdec converts: floored, held in range; 24 bits in a
+// word's low three bytes).
+std::vector<u8> expected_words(const std::vector<std::vector<float>>& unit, u32 bits)
+{
+    std::vector<u8> v;
+    for (usize i = 0; i < unit[0].size(); i++) {
+        for (const auto& ch : unit) {
+            const float s = ch[i];
+            u32 w;
+            if (bits == 24)
+                w = s >= 1.f ? 0x007FFFFFu : s <= -1.f ? 0x00800000u :
+                    static_cast<u32>(static_cast<s32>(std::floor(s * 8388608.f))) & 0x00FFFFFFu;
+            else
+                w = s >= 1.f ? 0x7FFFFFFFu : s <= -1.f ? 0x80000000u :
+                    static_cast<u32>(static_cast<s32>(std::floor(static_cast<double>(s) * 2147483648.0)));
+            for (u32 k = 0; k < 4; k++) v.push_back(static_cast<u8>(w >> (24 - 8 * k)));
+        }
+    }
+    return v;
+}
+
+#endif
+
+} // namespace
+
+#if PSPOCKET_HAVE_FFMPEG
+
+TEST_CASE("cellAdec: ATRAC3 on FFmpeg, frames built here: the four PCM formats, information, PTS, refusals (D-579)",
+    "[hle][adec]")
+{
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    // Six stereo frames of 384 bytes (132 kbit/s at 44.1 kHz), lines 100 and 60 (2164 and 1303 Hz), the third
+    // without a PTS (the front end's ATRAC3 step, 4180).
+    Feed feed;
+    feed.bsi_size = 0xC;
+    feed.step = 4180;
+    for (u32 k = 0; k < 6; k++) feed.aus.push_back(atrac3_frame(2, {100, 60}));
+    feed.missing = {2};
+    const auto ref = ffmpeg_decode("atrac3", feed.aus, atrac3_setup(2, 384));
+    for (const u32 bw : {0x84u, 2u, 3u, 4u}) {
+        INFO("bw_pcm " << bw);
+        const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeAtrac3, atrac3_param(2, 0, 384, bw), feed);
+        INFO(all(run));
+        REQUIRE(run.outs.size() == 6);
+        CHECK(flow_ok(run, 6, {}));
+        for (u32 k = 0; k < 6; k++) {
+            const Out& o = run.outs[k];
+            CHECK(o.size == 1024 * 2 * (bw == 2 ? 2 : 4));
+            CHECK(o.pts_lower == 0x1000 + 4180 * k);
+            CHECK(be32(o.bsi, 0) == 2);   // nch
+            CHECK(be32(o.bsi, 4) == 0);   // isJoint
+            CHECK(be32(o.bsi, 8) == 384); // nbytes
+            if (bw == 0x84 || bw == 2) CHECK(o.pcm == expected_pcm(ref[k], bw == 2));
+            else CHECK(o.pcm == expected_words(ref[k], bw == 3 ? 24 : 32));
+        }
+        if (bw == 0x84) {
+            std::vector<u8> pcm;
+            for (u32 k = 2; k < 6; k++) pcm.insert(pcm.end(), run.outs[k].pcm.begin(), run.outs[k].pcm.end());
+            const auto left = channel_of(pcm, 2, 0, false), right = channel_of(pcm, 2, 1, false);
+            CHECK(energy_near(left, 44100, 100.5 * 44100 / 2048, 150) > 0.8);
+            CHECK(energy_near(right, 44100, 60.5 * 44100 / 2048, 150) > 0.8);
+            float peak = 0;
+            for (const float x : left) peak = std::max(peak, std::abs(x));
+            CHECK(peak > 0.001f);
+        }
+    }
+    // Mono, 152-byte frames (105 kbit/s's size for one channel).
+    Feed mono;
+    mono.bsi_size = 0xC;
+    for (u32 k = 0; k < 3; k++) mono.aus.push_back(atrac3_frame(1, {80, 0}, 152));
+    const CoreRun one = run_core(f.base(), hle_calls(f, t), kTypeAtrac3, atrac3_param(1, 0, 152, 0x84), mono);
+    REQUIRE(one.outs.size() == 3);
+    const auto ref1 = ffmpeg_decode("atrac3", mono.aus, atrac3_setup(1, 152));
+    for (u32 k = 0; k < 3; k++) {
+        CHECK(one.outs[k].size == 1024 * 4);
+        CHECK(one.outs[k].pcm == expected_pcm(ref1[k], false));
+    }
+    // Refused units: a sound unit whose ID is wrong (FFmpeg's error), one cut short; the frame after them decodes.
+    Feed bad;
+    bad.bsi_size = 0xC;
+    std::vector<u8> wrong_id = atrac3_frame(2, {100, 60});
+    wrong_id[0] = 0;
+    bad.aus = {atrac3_frame(2, {100, 60}), wrong_id, std::vector<u8>(300, 0xA0), atrac3_frame(2, {100, 60})};
+    const CoreRun refused = run_core(f.base(), hle_calls(f, t), kTypeAtrac3, atrac3_param(2, 0, 384, 0x84), bad);
+    INFO(all(refused));
+    REQUIRE(refused.outs.size() == 4);
+    CHECK(flow_ok(refused, 4, {{1, 0x80612180}, {2, 0x80612180}}));
+    CHECK(refused.outs[3].size == 1024 * 2 * 4);
+    // StartSeq's checks: three channels, joint stereo of one, a frame size FFmpeg has not, a word size; joint stereo of
+    // two is taken.
+    for (const auto& p : {atrac3_param(3, 0, 576, 0x84), atrac3_param(1, 1, 192, 0x84), atrac3_param(2, 0, 400, 0x84),
+             atrac3_param(2, 0, 384, 5)})
+        CHECK(run_core(f.base(), hle_calls(f, t), kTypeAtrac3, p, Feed{}).lines[2] == "cellAdecStartSeq -> 0x80610003");
+    CHECK(run_core(f.base(), hle_calls(f, t), kTypeAtrac3, atrac3_param(2, 1, 192, 0x84), Feed{}).lines[2] ==
+        "cellAdecStartSeq -> 0x0");
+}
+
+TEST_CASE("cellAtrac plays an ATRAC3 file through pspocket's ATRAC3 core where no firmware core is (D-579)",
+    "[hle][adec][atrac]")
+{
+    InterpretMisses interpret;
+    BigFixture f;
+    REQUIRE(f.hle->link_internal_functions({"cellAtrac"}));
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    // A RIFF WAVE ATRAC3 file (fmt 0x270 with its 14 extra bytes), 44.1 kHz stereo, 384-byte frames of the tones.
+    constexpr u32 kAtHandle = kData + 0x8000, kAtOut = kData + 0x8400, kAtFile = kData + 0x60000, kAtWork = kData + 0xB0000,
+                  kAtPcm = kData + 0xE0000;
+    std::vector<u8> file;
+    const auto u16le = [&](u32 v) {
+        file.push_back(static_cast<u8>(v));
+        file.push_back(static_cast<u8>(v >> 8));
+    };
+    const auto u32le = [&](u32 v) {
+        u16le(v & 0xFFFF);
+        u16le(v >> 16);
+    };
+    const auto tag = [&](const char* s) { file.insert(file.end(), s, s + 4); };
+    constexpr u32 kFrames = 16;
+    tag("RIFF");
+    u32le(0);
+    tag("WAVE");
+    tag("fmt ");
+    u32le(0x20);
+    u16le(0x270);
+    u16le(2);
+    u32le(44100);
+    u32le(44100 * 384 / 1024);
+    u16le(384);
+    u16le(0);
+    u16le(14);
+    u16le(1);
+    u32le(0x1000);
+    u16le(0);
+    u16le(0);
+    u16le(1);
+    u16le(0);
+    tag("data");
+    u32le(kFrames * 384);
+    for (u32 k = 0; k < kFrames; k++) {
+        const auto fr = atrac3_frame(2, {100, 60});
+        file.insert(file.end(), fr.begin(), fr.end());
+    }
+    const u32 riff = static_cast<u32>(file.size() - 8);
+    std::memcpy(file.data() + 4, &riff, 4);
+    std::memcpy(b + kAtFile, file.data(), file.size());
+    const auto call = [&](const char* name, std::initializer_list<u64> args) {
+        const hle::Function& fn = GuestThread::find(name);
+        u32 r = 3;
+        for (const u64 a : args) t.ctx.gpr[r++] = a;
+        fn.fn(t.ctx, b);
+        return static_cast<u32>(t.ctx.gpr[3]);
+    };
+    std::memset(b + kAtHandle, 0, 0x200);
+    const u32 size = static_cast<u32>(file.size());
+    REQUIRE(call("cellAtracSetDataAndGetMemSize", {kAtHandle, kAtFile, size, size, kAtOut}) == 0);
+    REQUIRE(ps_read32(b, kAtOut) < 0x30000); // the work memory below the PCM
+    REQUIRE(call("cellAtracCreateDecoder", {kAtHandle, kAtWork, 1000, 100}) == 0);
+    std::vector<u8> pcm;
+    u32 decoded = 0;
+    for (u32 n = 0; n < kFrames + 4; n++) {
+        std::memset(b + kAtPcm, 0xCC, 0x4000);
+        const u32 r = call("cellAtracDecode", {kAtHandle, kAtPcm, kAtOut, kAtOut + 4, kAtOut + 8});
+        if (r != 0) break;
+        const u32 samples = ps_read32(b, kAtOut);
+        decoded += samples;
+        pcm.insert(pcm.end(), b + kAtPcm, b + kAtPcm + samples * 2 * 4);
+        if (ps_read32(b, kAtOut + 4)) break; // finished
+    }
+    INFO("samples decoded: " << decoded);
+    CHECK(decoded >= (kFrames - 2) * 1024);
+    CHECK(energy_near(channel_of(pcm, 2, 0, false), 44100, 100.5 * 44100 / 2048, 150) > 0.8);
+    CHECK(energy_near(channel_of(pcm, 2, 1, false), 44100, 60.5 * 44100 / 2048, 150) > 0.8);
+    CHECK(call("cellAtracDeleteDecoder", {kAtHandle}) == 0);
+}
+
+#endif

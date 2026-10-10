@@ -382,6 +382,7 @@ const Spec* spec_of(s32 type)
     switch (type) {
     case CELL_ADEC_TYPE_AC3: return &kAc3;
     case CELL_ADEC_TYPE_MP3: return &kMp3;
+    case CELL_ADEC_TYPE_ATRAC3: return &kAtrac3;
     case CELL_ADEC_TYPE_MPEG_L1: return &kMpegL1;
     case CELL_ADEC_TYPE_MPEG_L2: return &kMpegL2;
     case CELL_ADEC_TYPE_M4AAC: return &kM4Aac;
