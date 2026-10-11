@@ -314,8 +314,10 @@ struct VdecRun {
     vt::Call call = vt::hle_calls(f, t);
     u32 handle = 0;
     u64 timeouts = 0;
+    bool ex2 = false; // MVC: through DecodeAuEx2, as Sony's libvdec refuses it through DecodeAu (D-912)
 
-    VdecRun(u32 codec, u32 level)
+    // `width` x `height` not 0: the picture size given in the codec specific information (H.264 and MVC's 12 bytes).
+    VdecRun(u32 codec, u32 level, u16 width = 0, u16 height = 0) : ex2(codec == CODEC_MVC)
     {
         add_guarded_areas(f);
         REQUIRE(f.hle->main_memory().reserve(kBigPicture, kBigPictureSize));
@@ -324,6 +326,12 @@ struct VdecRun {
         std::memset(b + vt::kArgs, 0, 0x200);
         ps_write32(b, vt::kType, codec);
         ps_write32(b, vt::kType + 4, level);
+        if (width && height) {
+            ps_write32(b, vt::kType + 8, vt::kSpec);
+            ps_write32(b, vt::kSpec, 12);
+            ps_write16(b, vt::kSpec + 4, width);
+            ps_write16(b, vt::kSpec + 6, height);
+        }
         REQUIRE(call("cellVdecQueryAttrEx", 0xC982A84A, {vt::kType, vt::kAttr}) == 0);
         const u32 res[6] = {vt::kDecoderMem, std::min(ps_read32(b, vt::kAttr), vt::kDecoderMemSize), 1000, 0x4000, 200, 1};
         for (u32 i = 0; i < 6; i++) ps_write32(b, vt::kRes + 4 * i, res[i]);
@@ -359,8 +367,15 @@ struct VdecRun {
             ps_write32(b, vt::kAu + 20, 0x800 + 3003 * static_cast<u32>(i));
             ps_write64(b, vt::kAu + 24, i);
             ps_write64(b, vt::kAu + 32, 0);
+            if (ex2) { // startAddr, a word, size, a word, then CellVdecAuInfo's pts, dts, userData, codecSpecificData
+                std::memmove(b + vt::kAu + 0x10, b + vt::kAu + 8, 0x20);
+                ps_write32(b, vt::kAu + 4, 0);
+                ps_write32(b, vt::kAu + 8, static_cast<u32>(aus[i].size()));
+                ps_write32(b, vt::kAu + 12, 0);
+            }
             const s32 mode = rng.one_in(8) ? static_cast<s32>(rng.below(3)) : 0;
-            if (call("cellVdecDecodeAu", 0x2BF4DDD2, {handle, static_cast<u64>(static_cast<u32>(mode)), vt::kAu}) != 0) {
+            if (call(ex2 ? "cellVdecDecodeAuEx2" : "cellVdecDecodeAu", ex2 ? 0x1533C6A9 : 0x2BF4DDD2,
+                    {handle, static_cast<u64>(static_cast<u32>(mode)), vt::kAu}) != 0) {
                 accepted = false;
                 continue;
             }
@@ -419,10 +434,12 @@ TEST_CASE("fuzz: cellVdec's H.264, MVC and VC-1 stream parsing over damaged acce
         u32 codec, level;
         std::vector<u8> first, sample, last;
     };
+    // MVC's level 2.1 with 64x64 pictures given: the memory it asks for without them is more than the fixture's.
     const std::vector<Target> targets = {{"vdec avc", CODEC_AVC, 21, avc0, avc1, avc0},
         {"vdec mvc", CODEC_MVC, 21, mvc0, mvc1, mvc0}, {"vdec vc-1", CODEC_VC1, 6, vc1_intra, vc1_intra, vc1_skipped}};
     for (const Target& target : targets) {
-        VdecRun run(target.codec, target.level);
+        const u16 side = target.codec == CODEC_MVC ? 64 : 0;
+        VdecRun run(target.codec, target.level, side, side);
         fuzz::Tally tally(target.name);
         fuzz::run(tally, {{target.name, target.sample, {}}}, 150, [&](const std::vector<u8>& input, fuzz::Rng& rng) {
             if (input.empty()) return false; // a size of 0 is refused by DecodeAu's own check

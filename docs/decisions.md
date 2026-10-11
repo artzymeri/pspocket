@@ -10428,3 +10428,12 @@ lag, VC-1 without range mapping and cut to the sequence header, mode 3's ERROR, 
 refused through DecodeAu and decoded through DecodeAuEx2); vdec_test_util.hpp's decode_stream takes the pictures as a
 game does. The four comparisons with the firmware: 0 differences each; test_vdec.cpp's H.264 comparison and the codec
 cores' version queries pass.
+
+## D-912 (part 3) · 2026-10-11 · the stream parsing fuzz test decodes MVC as part 2 lets it
+
+tests/hle/test_fuzz_media.cpp's cellVdec target for MVC opened a level 2.1 decoder in the fixture's 16 MB and decoded
+through cellVdecDecodeAu: since part 2 the open is refused (MVC's level 2.1 asks 0x1433BFD bytes for its codec part, more
+than the memory given, ARG as Sony's) and DecodeAu refuses MVC (FATAL as Sony's). It now gives the 64x64 picture size in
+the codec specific information (what part 2's MVC unit test does) and decodes through cellVdecDecodeAuEx2, so the
+damaged access units still reach the MVC parsing: 151 inputs, 130 accepted, the 21 refused those with the decode mode
+for P and B skipping, which only H.264 takes (as before).
