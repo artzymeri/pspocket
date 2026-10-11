@@ -35,12 +35,12 @@ using namespace pspocket;
 using namespace pspocket::hle::test;
 using namespace pspocket::hle::test::compare;
 
-TEST_CASE("cellJpgEnc's comparison calls Sony's exports by their names; pspocket's library, firmware first",
-    "[hle][jpgenc]")
+TEST_CASE("cellJpgEnc's comparison calls Sony's exports by their names; pspocket's library", "[hle][jpgenc]")
 {
     check_names("cellJpgEnc", {"cellJpgEncQueryAttr", "cellJpgEncOpen", "cellJpgEncOpenEx", "cellJpgEncClose",
                                   "cellJpgEncWaitForInput", "cellJpgEncEncodePicture", "cellJpgEncEncodePicture2",
-                                  "cellJpgEncWaitForOutput", "cellJpgEncGetStreamInfo", "cellJpgEncReset"});
+                                  "cellJpgEncWaitForOutput", "cellJpgEncGetStreamInfo", "cellJpgEncReset"},
+        /*marked=*/false);
 }
 
 namespace {
@@ -612,8 +612,9 @@ Observed half(const Setup& s, bool sony_half)
 
 } // namespace
 
+// It matches (D-913): no longer hidden, it runs wherever the firmware is (the Mac's gate) and skips elsewhere.
 TEST_CASE("cellJpgEnc against Sony's libjpgenc: sizes, handles, the queue, the streams, every JPEG's tables and picture",
-    "[.][hle][lle][compare][jpgenc]")
+    "[hle][lle][compare][jpgenc]")
 {
     const Setup s = setup();
     run(s, "cellJpgEnc against Sony's libjpgenc", [&](bool sony) { return half(s, sony); },

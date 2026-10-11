@@ -1018,7 +1018,7 @@ void register_cellJpgEnc(Registry& r)
         PS_HLE_FUNC(0x4262E880, cellJpgEncGetStreamInfo),
         PS_HLE_FUNC(0x0CF2B78B, cellJpgEncReset),
     });
-    r.firmware_first(kModule);
+    // Compared with libjpgenc and matching it, no longer firmware-first (D-913, D-563): games get pspocket's.
 }
 
 } // namespace pspocket::hle

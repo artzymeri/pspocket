@@ -12369,3 +12369,14 @@ The comparison's SPU pictures are now 32x17 (and 64x48 past 4094 bytes, a buffer
 a longer one): its 33-wide picture showed only the undefined columns. The comparison: 6 of 3,751 to 0 of 3,792.
 Test: test_jpgenc.cpp's SPU case (Y 29 against libjpeg's 28 for RGB 0,0,250; the bytes past EOI, zeros, then a longer
 stream's; no bytes past a long stream; a buffer of 0x1000 overflowing with every row).
+
+## D-913 · 2026-10-11 · cellJpgEnc no longer firmware-first (part 15)
+
+cellJpgEnc matches Sony's libjpgenc call for call (parts 3, 5, 8 and 14: 0 of 3,792 observations differ: every answer,
+both queues, Reset's skips, the size limit mode with libjpgenc's tables, files, every JPEG byte for byte on the PPU and
+on the SPUs), so its firmware-first marker goes (D-563): where the system software is installed, a game importing
+cellJpgEnc now gets pspocket's, not libjpgenc.sprx. The size limit mode reads libjpgenc's tables from that installed
+module (part 8); without it its quality comes from a search, logged. Not reproduced, being undefined: what libjpgenc's
+SPU encoder reads past a picture's right edge when the picture is not a whole number of MCUs wide (part 14). Its
+comparison (test_jpgenc_compare.cpp) loses its [.]: it runs in the Mac's gate with the firmware and skips without it;
+the name check and test_jpgenc.cpp check the library is pspocket's and unmarked.

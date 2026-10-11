@@ -382,7 +382,7 @@ TEST_CASE("pspocket's JPEG encoder: a sink that fills stops it, the rows before 
 
 // ------------------------------------------------------------------------------------------------- the library
 
-TEST_CASE("cellJpgEnc: the ten functions, firmware first", "[hle][jpgenc]")
+TEST_CASE("cellJpgEnc: the ten functions, pspocket's own (no longer firmware-first, D-913)", "[hle][jpgenc]")
 {
     for (const std::string_view name : {"cellJpgEncQueryAttr", "cellJpgEncOpen", "cellJpgEncOpenEx", "cellJpgEncClose",
              "cellJpgEncWaitForInput", "cellJpgEncEncodePicture", "cellJpgEncEncodePicture2", "cellJpgEncWaitForOutput",
@@ -392,7 +392,7 @@ TEST_CASE("cellJpgEnc: the ten functions, firmware first", "[hle][jpgenc]")
         REQUIRE(fn != nullptr);
         CHECK(fn->name == name);
     }
-    CHECK(hle::registry().is_firmware_first("cellJpgEnc"));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellJpgEnc"));
 }
 
 TEST_CASE("cellJpgEnc: QueryAttr's memory and the checks of Open and Close", "[hle][jpgenc]")
