@@ -11844,3 +11844,20 @@ first, and only then are the commands still waiting skipped (before, the Reset t
 its encoder then popped the next picture's command). D-651's tests are rewritten for those queues: eight threads at once
 give four to eight pictures taken (the rest BUSY), each taken picture exactly one stream (its own bytes, or STREAM_SKIP
 after a Reset), nothing left after; D-650's two encoders on two threads stand as they were, on the new structures.
+
+## D-913 · 2026-10-11 · cellVpost's exec types: libvpost's fields and interlace conversion (part 6)
+
+The exec types are libvpost's, found by running its module on noise pictures at every type, interpolation type, size and
+output format (all 144 such probes match but the edge-adaptive type's few pixels):
+- A field picture out (PTOP_ITOP, PBTM_IBTM, ITOP_ITOP, IBTM_IBTM, IFRM_IFRM) is only the output's rows of its parity,
+  luma and chroma alike; the other rows are left as they were (IFRM_IFRM writes the top field's, then the bottom's).
+- A field picture in becomes a frame by the interlace conversion when the output is a frame (ITOP_PFRM, IBTM_PFRM) or
+  when it is scaled (the field types): the field's rows kept, the others' made from them: type 0 repeats the field's row
+  (above for the top field, below for the bottom), type 1 averages the rows above and below as bytes (rounded up), type
+  2 averages along the one of three directions whose three pixels about it differ least (a diagonal only two or more
+  less than straight down; the chroma averaged straight); then the frame is scaled as any frame, and a field out takes
+  its parity's rows of the scaled frame.
+- Kept as a field (the field types at the same size), a row's chroma for RGBA is its field's (rows 2 (y / 4) + parity).
+  A progressive picture out as a field (PTOP_ITOP, PBTM_IBTM) is the frame's conversion, its parity's rows.
+Type 2's direction choice is close to libvpost's (its SPU code compares absolute differences of bytes, some of whose
+rounding is not known): about 1% of the interpolated pixels of noise differ.

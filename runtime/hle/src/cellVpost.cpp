@@ -215,6 +215,75 @@ Matrix matrix_of(u32 matrix, u32 range)
 
 u8 clamp_byte(s64 v) { return static_cast<u8>(std::clamp<s64>(v, 0, 255)); }
 
+// The interlace conversion (libvpost's second stage): the field of `parity` kept, the other's rows made from it. Type 0
+// repeats the field's row (above for the top field, below for the bottom), type 1 averages the rows above and below as
+// bytes (rounded up), type 2 averages them along the direction of three (left, down, right) whose three pixels about it
+// differ least (a diagonal taken only when two or more less than straight down, the left one on a tie); the chroma's
+// rows the field's alike, averaged straight for types 1 and 2. Rows past the picture's edge are the field's nearest.
+void deinterlace_plane(const Plane& in, u32 parity, u32 type, bool luma, Plane& out)
+{
+    out = in;
+    const u32 w = in.w, h = in.h;
+    const auto at = [&](u32 row, s32 x) { return static_cast<s32>(in.at(static_cast<u32>(std::clamp<s32>(x, 0, static_cast<s32>(w) - 1)), row)); };
+    for (u32 r = 0; r < h; r++) {
+        if ((r & 1) == parity) continue;
+        const bool has_up = r >= 1, has_down = r + 1 < h;
+        if (type == 0 || !has_up || !has_down) {
+            const u32 from = type == 0 ? (parity == 0 ? (has_up ? r - 1 : r + 1) : (has_down ? r + 1 : r - 1))
+                                       : (has_up ? r - 1 : r + 1);
+            for (u32 x = 0; x < w; x++) out.at(x, r) = in.at(x, from);
+            continue;
+        }
+        const u32 up = r - 1, down = r + 1;
+        for (u32 x = 0; x < w; x++) {
+            s32 d = 0;
+            if (type == 2 && luma) {
+                const auto cost = [&](s32 dir) {
+                    s32 c = 0;
+                    for (s32 i = -1; i <= 1; i++)
+                        c += std::abs(at(up, static_cast<s32>(x) + dir + i) - at(down, static_cast<s32>(x) - dir + i));
+                    return c;
+                };
+                const s32 c0 = cost(0), cl = cost(-1), cr = cost(1);
+                const s32 dd = cl <= cr ? -1 : 1, cd = cl <= cr ? cl : cr;
+                if (cd + 2 < c0) d = dd;
+            }
+            out.at(x, r) = static_cast<u8>((at(up, static_cast<s32>(x) + d) + at(down, static_cast<s32>(x) - d) + 1) >> 1);
+        }
+    }
+}
+
+Picture deinterlace(const Picture& in, u32 parity, u32 type)
+{
+    Picture out;
+    deinterlace_plane(in.y, parity, type, true, out.y);
+    deinterlace_plane(in.u, parity, type, false, out.u);
+    deinterlace_plane(in.v, parity, type, false, out.v);
+    return out;
+}
+
+// The picture the output is made from: the input as it is (the same size, no window), else black (Y 0, or 16 in
+// broadcast range; chroma 128) with the input's window scaled into the output's.
+Picture frame_of(const Picture& in, bool same, const Window& iw, const Window& ow, u32 out_w, u32 out_h, u32 range,
+    u32 chroma)
+{
+    if (same) return in;
+    Picture out;
+    const u8 black = range == 1 ? 16 : 0;
+    out.y = {out_w, out_h, std::vector<u8>(static_cast<usize>(out_w) * out_h, black)};
+    out.u = {out_w / 2, out_h / 2, std::vector<u8>(static_cast<usize>(out_w / 2) * (out_h / 2), 128)};
+    out.v = out.u;
+    Plane scaled;
+    scale_plane(in.y, iw, ow, false, chroma, scaled);
+    for (u32 y = 0; y < ow.h; y++) std::memcpy(&out.y.at(ow.x, ow.y + y), &scaled.at(0, y), ow.w);
+    const Window ciw{iw.x / 2, iw.y / 2, iw.w / 2, iw.h / 2}, cow{ow.x / 2, ow.y / 2, ow.w / 2, ow.h / 2};
+    for (auto [src, dst] : {std::pair{&in.u, &out.u}, std::pair{&in.v, &out.v}}) {
+        scale_plane(*src, ciw, cow, true, chroma, scaled);
+        for (u32 y = 0; y < cow.h; y++) std::memcpy(&dst->at(cow.x, cow.y + y), &scaled.at(0, y), cow.w);
+    }
+    return out;
+}
+
 // ------------------------------------------------------------------------------------------------- the calls
 
 // cellVpostQueryAttr(cfgParam, attr): CellVpostAttr {memSize, delay (u8), vpostVerUpper (+8), vpostVerLower (+12)}.
@@ -354,11 +423,10 @@ s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic
     {
         State& s = state();
         std::lock_guard lock(s.mutex);
-        if (exec_type != 0 && !s.exec_type_logged) {
+        if (ipc == 2 && (exec_type >= 3) && !s.exec_type_logged) {
             s.exec_type_logged = true;
-            PS_LOG_WARN(kChan, "cellVpostExec: exec type {} (fields): converted as a frame, not as libvpost's interlace "
-                               "conversion (D-913)",
-                exec_type);
+            PS_LOG_INFO(kChan, "cellVpostExec: interlace conversion type 2: libvpost's edge-adaptive average, a few "
+                               "pixels of a picture may differ (D-913)");
         }
         if (scaler != 0 && !s.scaler_logged) {
             s.scaler_logged = true;
@@ -375,41 +443,55 @@ s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic
     in.u = {cw, ch, std::vector<u8>(u_at, u_at + static_cast<usize>(cw) * ch)};
     in.v = {cw, ch, std::vector<u8>(u_at + static_cast<usize>(cw) * ch, u_at + 2 * static_cast<usize>(cw) * ch)};
 
-    // The output's planes: black around the window, the input's window scaled into it.
     const bool same = iw.x == 0 && iw.y == 0 && ow.x == 0 && ow.y == 0 && iw.w == in_w && iw.h == in_h && ow.w == out_w &&
                       ow.h == out_h && iw.w == ow.w && iw.h == ow.h;
-    Picture out;
-    if (same) {
-        out = in;
-    } else {
-        const u8 black = range == 1 ? 16 : 0;
-        out.y = {out_w, out_h, std::vector<u8>(static_cast<usize>(out_w) * out_h, black)};
-        out.u = {out_w / 2, out_h / 2, std::vector<u8>(static_cast<usize>(out_w / 2) * (out_h / 2), 128)};
-        out.v = out.u;
-        Plane scaled;
-        scale_plane(in.y, iw, ow, false, chroma, scaled);
-        for (u32 y = 0; y < ow.h; y++)
-            std::memcpy(&out.y.at(ow.x, ow.y + y), &scaled.at(0, y), ow.w);
-        const Window ciw{iw.x / 2, iw.y / 2, iw.w / 2, iw.h / 2}, cow{ow.x / 2, ow.y / 2, ow.w / 2, ow.h / 2};
-        for (auto [src, dst] : {std::pair{&in.u, &out.u}, std::pair{&in.v, &out.v}}) {
-            scale_plane(*src, ciw, cow, true, chroma, scaled);
-            for (u32 y = 0; y < cow.h; y++)
-                std::memcpy(&dst->at(cow.x, cow.y + y), &scaled.at(0, y), cow.w);
-        }
+    // libvpost's stages per exec type: a field picture in (3 to 7) is made a frame by the interlace conversion when it
+    // becomes one (3, 4) or is scaled (5 to 7); a field picture out (1, 2, 5 to 7) is the output's rows of its parity
+    // only (the others left as they are); IFRM_IFRM is ITOP_ITOP, then IBTM_IBTM.
+    struct Pass {
+        u32 parity;     // the field's (0 top, 1 bottom)
+        bool field_in;  // the input is a field of an interlaced picture
+        bool field_out; // only the output's rows of the parity are written
+    };
+    std::vector<Pass> passes;
+    switch (exec_type) {
+    case 0: passes = {{0, false, false}}; break;
+    case 1: passes = {{0, false, true}}; break;
+    case 2: passes = {{1, false, true}}; break;
+    case 3: passes = {{0, true, false}}; break;
+    case 4: passes = {{1, true, false}}; break;
+    case 5: passes = {{0, true, true}, {1, true, true}}; break;
+    case 6: passes = {{0, true, true}}; break;
+    default: passes = {{1, true, true}}; break;
     }
-
     u8* o = base + out_pic;
-    if (fmt == kOutYuv) {
-        std::memcpy(o, out.y.px.data(), out.y.px.size());
-        std::memcpy(o + out.y.px.size(), out.u.px.data(), out.u.px.size());
-        std::memcpy(o + out.y.px.size() + out.u.px.size(), out.v.px.data(), out.v.px.size());
-    } else {
-        const Matrix m = matrix_of(matrix, range);
-        const u8 alpha = ps_read8(base, ctrl + 72);
-        const u32 ocw = out_w / 2;
-        for (u32 y = 0; y < out_h; y++)
+    const Matrix m = matrix_of(matrix, range);
+    const u8 alpha = ps_read8(base, ctrl + 72);
+    for (const Pass& pass : passes) {
+        const bool interlace = pass.field_in && (!pass.field_out || !same);
+        const Picture src = interlace ? deinterlace(in, pass.parity, ipc) : in;
+        const Picture out = frame_of(src, same, iw, ow, out_w, out_h, range, chroma);
+        // The chroma rows a pixel row takes: the frame's, or (a field kept as one) its field's.
+        const bool field_chroma = pass.field_in && !interlace;
+        const auto wanted = [&](u32 row) { return !pass.field_out || (row & 1) == pass.parity; };
+        if (fmt == kOutYuv) {
+            for (u32 y = 0; y < out_h; y++)
+                if (wanted(y)) std::memcpy(o + static_cast<usize>(y) * out_w, out.y.px.data() + static_cast<usize>(y) * out_w, out_w);
+            u8* ou = o + static_cast<usize>(out_w) * out_h;
+            u8* ov = ou + static_cast<usize>(out_w / 2) * (out_h / 2);
+            for (u32 y = 0; y < out_h / 2; y++)
+                if (wanted(y)) {
+                    std::memcpy(ou + static_cast<usize>(y) * (out_w / 2), out.u.px.data() + static_cast<usize>(y) * (out_w / 2), out_w / 2);
+                    std::memcpy(ov + static_cast<usize>(y) * (out_w / 2), out.v.px.data() + static_cast<usize>(y) * (out_w / 2), out_w / 2);
+                }
+            continue;
+        }
+        const u32 ocw = out_w / 2, och = out_h / 2;
+        for (u32 y = 0; y < out_h; y++) {
+            if (!wanted(y)) continue;
+            const u32 cy = std::min(field_chroma ? 2 * (y >> 2) + pass.parity : y >> 1, och - 1);
             for (u32 x = 0; x < out_w; x++) {
-                const u32 cx = x / 2, cy = y / 2;
+                const u32 cx = x / 2;
                 s64 u = out.u.at(cx, cy), v = out.v.at(cx, cy);
                 if (chroma == 1 && (x & 1)) {
                     const u32 nx = std::min(cx + 1, ocw - 1);
@@ -423,6 +505,7 @@ s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic
                 px[2] = clamp_byte((yy + m.bu * (u - 128)) >> 20);
                 px[3] = alpha;
             }
+        }
     }
 
     // The picture information: what was asked and what the exec type makes of it.
