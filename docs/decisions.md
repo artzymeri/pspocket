@@ -10282,3 +10282,26 @@ the game's; THREAD_IN_USE for a second I/O thread; every call before Init and ev
 the game's allocator, MEMORY and TOO_MANY_CONTEXTS; a socket closed under a bound context (one warning; lv2's polls
 counted in its log over 200 ms of quiet: about 20, all of the two others, where the I/O thread spun 16,866 times
 before), the other connection going on, and the socket's number handed out again with a new connection on it.
+
+## D-633 · 2026-10-10 · cellRudp's comparison with Sony's librudp, ready for the Mac
+
+tests/hle/test_rudp_compare.cpp (D-597's suite) sends the same calls to pspocket's cellRudp and to Sony's librudp, each
+in a fresh process over pspocket's lv2 network, so each half's contexts talk to each other in their own wire format. It
+writes what a game sees: every function's answer before Init; the segment size and the answers to eleven sizes; the
+contexts' IDs relative to the first; every option 0 to 20 read in 4 and 8 bytes, in 1 byte, into nothing, and set to
+bad and good values; the context status of an idle context (its state and parent compared, the 256 bytes a note, what
+is past 48 bytes compared) and the library's status (what is past 400 bytes compared, the 400 a note); Bind to no
+socket, to a TCP socket, in mux mode 2, RAW without a handler, at vport 0, again, to a UDP P2P socket, with the local
+information; Initiate's and the data calls' checks before a connection; then a connection over the internal I/O
+thread and, after End and Init, one driven by ProcessEvents alone: Listen, Initiate, Accept within 5 s, the states,
+the handler's events in order, the remote and local information, messages both ways (a buffer too small, two
+messages, nothing there, the answer) with the read information (its first 6 bytes compared, the sequence number and
+time stamp notes), the sizes, a poll set, the client's end read as such and the events to the end. Every context is
+non-blocking, so no wait depends on Sony's units. A difference answers one of D-630's or D-632's guesses: a signature
+(an answer that makes no sense, a crash: PSPOCKET_COMPARE_TRACE=1 names the call), a structure's layout, an option's
+default or unit, what ProcessEvents reads (the second connection), Listen and Accept.
+Running it: `PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle
+"[compare][rudp]"`; hidden ([.]) until the halves agree, when it loses the [.] together with cellRudp's firmware-first
+marker (a decision of its own). Here, PSPOCKET_COMPARE_SELF=1: 0 of 342 observations differ, and pspocket's half
+answers as test_rudp.cpp; without either it skips. In every ctest run: each of the 31 functions is in the NID database
+under cellRudp, is pspocket's own, and the library is firmware-first.
