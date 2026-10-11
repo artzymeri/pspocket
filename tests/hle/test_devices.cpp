@@ -278,6 +278,82 @@ TEST_CASE("cellMic: initialised with no microphone registered", "[hle][devices]"
     CHECK(ps_read32(b, kOut) == 0xFFFFFFFF);
 }
 
+TEST_CASE("cellMic: the system's sharing, Command and the multi-mic queue with no microphone (D-667)",
+    "[hle][devices][mic]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "mic");
+    const u64 kAlready = r3_of_code(0x80140101), kNotInit = r3_of_code(0x80140103),
+              kQueueError = r3_of_code(0x8014010D), kNotFound = r3_of_code(0x8014010E);
+    const char* const kShared[] = {"cellMicSysShareOpen", "cellMicSysShareStart", "cellMicSysShareStop",
+        "cellMicSysShareClose"};
+
+    // cellMicCommand: a command to a microphone, none registered.
+    CHECK(g.call("cellMicCommand", 0, 8) == kNotInit);
+    CHECK(g.call("cellMicSetMultiMicNotifyEventQueue", 0x8000000000AB0002ull, 0, 0) == kNotInit);
+    REQUIRE(g.call("cellMicInit") == 0);
+    CHECK(g.call("cellMicCommand", 0, 8) == kNotFound);
+    CHECK(g.call("cellMicCommand", 3, 0) == kNotFound);
+
+    // The multi-mic notify queue: it must exist; it gets no event.
+    CHECK(g.call("cellMicSetMultiMicNotifyEventQueue", 0x8000000000AB0002ull, 5, 0) == kQueueError);
+    make_queue(g, 0x8000000000AB0002ull);
+    REQUIRE(g.call("cellMicSetMultiMicNotifyEventQueue", 0x8000000000AB0002ull, 5, 0) == 0);
+    REQUIRE(g.call("cellMicSetNotifyEventQueue", 0x8000000000AB0002ull) == 0);
+    CHECK(queued_events(g) == 0);
+
+    // The system's sharing: bracketed by its own Init and End, cellMicInit or not; no microphone to share in between.
+    for (const char* fn : kShared) {
+        INFO(fn);
+        CHECK(g.call(fn, 0) == kNotInit);
+    }
+    CHECK(g.call("cellMicSysShareEnd") == kNotInit);
+    REQUIRE(g.call("cellMicSysShareInit") == 0);
+    CHECK(g.call("cellMicSysShareInit") == kAlready);
+    for (const char* fn : kShared) {
+        INFO(fn);
+        CHECK(g.call(fn, 0) == kNotFound);
+        CHECK(g.call(fn, 1) == kNotFound);
+    }
+    CHECK(queued_events(g) == 0);
+    REQUIRE(g.call("cellMicEnd") == 0);
+    CHECK(g.call("cellMicSysShareOpen", 0) == kNotFound); // the sharing outlives cellMicEnd
+    CHECK(g.call("cellMicCommand", 0, 8) == kNotInit);
+    CHECK(g.call("cellMicSetMultiMicNotifyEventQueue", 0x8000000000AB0002ull, 5, 0) == kNotInit);
+    REQUIRE(g.call("cellMicSysShareEnd") == 0);
+    CHECK(g.call("cellMicSysShareEnd") == kNotInit);
+    CHECK(g.call("cellMicSysShareStart", 0) == kNotInit);
+
+    // And without cellMicInit at all.
+    REQUIRE(g.call("cellMicSysShareInit") == 0);
+    CHECK(g.call("cellMicSysShareClose", 0) == kNotFound);
+    REQUIRE(g.call("cellMicSysShareEnd") == 0);
+}
+
+TEST_CASE("cellMic: StopEx in StartEx's form, no microphone (D-668)", "[hle][devices][mic]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "mic");
+    const u64 kNotInit = r3_of_code(0x80140103), kParam = r3_of_code(0x80140104), kNotFound = r3_of_code(0x8014010E);
+
+    // A flag outside StartEx's two is PARAM before anything else, as StartEx's.
+    CHECK(g.call("cellMicStopEx", 0, 4) == kParam);
+    CHECK(g.call("cellMicStartEx", 0, 4) == kParam);
+    CHECK(g.call("cellMicStopEx", 0, 0x80000000u) == kParam);
+    CHECK(g.call("cellMicStopEx", 0, 0) == kNotInit);
+    CHECK(g.call("cellMicStopEx", 0, 3) == kNotInit);
+    REQUIRE(g.call("cellMicInit") == 0);
+    for (u32 flags = 0; flags < 4; flags++) {
+        INFO(flags);
+        CHECK(g.call("cellMicStopEx", 0, flags) == kNotFound);
+        CHECK(g.call("cellMicStopEx", 7, flags) == kNotFound);
+    }
+    CHECK(g.call("cellMicStopEx", 0, 8) == kParam);
+    CHECK(g.call("cellMicStop", 0) == kNotFound); // Stop as StopEx(dev_num, 0)
+    REQUIRE(g.call("cellMicEnd") == 0);
+    CHECK(g.call("cellMicStopEx", 0, 1) == kNotInit);
+}
+
 TEST_CASE("libgem: initialised with no Move controller connected", "[hle][devices]")
 {
     Fixture f;

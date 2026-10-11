@@ -13,7 +13,8 @@
 // DEVICE_NOT_FOUND after RPCS3's argument checks. As in RPCS3, cellMicIsAttached answers 1 regardless, cellMicGetType
 // reports a USB microphone for devices 0 to 7 (RPCS3's default type, which Guitar Hero: Warriors of Rock needs) and
 // cellMicGetStatus a closed device with RPCS3's fixed levels. A notify queue must exist (by key); it gets no attach
-// events, since no microphone is registered.
+// events, since no microphone is registered. The system's sharing of a microphone, cellMicCommand and the multi-mic
+// notify queue (D-667) and cellMicStopEx (D-668) likewise.
 //
 // Pointers are checked before use (D-042): where RPCS3 writes through a pointer unchecked, one that is not guest
 // memory is logged with the call site and refused with the library's PARAM error.
@@ -338,6 +339,10 @@ struct MicState {
     bool init = false;
     u64 queue_key = 0; // the notify queue (no events: no microphone is registered)
     u64 queue_source = 0;
+    u64 multi_key = 0; // the multi-mic notify queue (D-667; no events either)
+    u64 multi_source = 0;
+    bool share_init = false;           // the system's sharing of a microphone, between SysShareInit and End (D-667)
+    std::set<std::string_view> logged; // the functions whose "no microphone" answer was logged once
 };
 
 MicState& mic() { return HleProcess::current()->state<MicState>(); }
@@ -366,6 +371,7 @@ s32 cellMicEnd(PPUContext&)
     if (!m.init) return error(CELL_MICIN_ERROR_NOT_INIT);
     m.init = false;
     m.queue_key = m.queue_source = 0;
+    m.multi_key = m.multi_source = 0;
     return lv2::CELL_OK;
 }
 
@@ -394,6 +400,70 @@ s32 cellMicStartEx(PPUContext&, s32, u32 flags)
     if (flags & ~3u) return error(CELL_MICIN_ERROR_PARAM);
     return no_mic();
 }
+
+// A function's answer for want of a microphone, logged the first time each function gives it.
+s32 mic_refused(std::string_view call, s32 r)
+{
+    MicState& m = mic();
+    std::lock_guard lock(m.mutex);
+    if (r == error(CELL_MICIN_ERROR_DEVICE_NOT_FOUND) && m.logged.insert(call).second)
+        PS_LOG_INFO(kMicChan, "{}: no microphone is registered -> DEVICE_NOT_FOUND", call);
+    return r;
+}
+
+// cellMicStopEx(dev_num, iflags) (D-668): RPCS3 registers the name and stops the emulator if it is called ("this
+// function shouldn't exist"); its form is StartEx's, Stop being to StopEx what Start is to StartEx (RPCS3 cellMicStart
+// is cellMicStartEx(dev_num, 0)): a flag outside the two StartEx takes is PARAM before anything else, then as Stop:
+// NOT_INIT, else DEVICE_NOT_FOUND.
+s32 cellMicStopEx(PPUContext&, s32, u32 flags)
+{
+    if (flags & ~3u) return error(CELL_MICIN_ERROR_PARAM);
+    return mic_refused("cellMicStopEx", no_mic());
+}
+
+// cellMicCommand(...) (D-667): RPCS3 registers the name only; its header's CellMicCommand lists the commands (INIT, END,
+// ATTACH, ... the notify events' types). A command for a microphone, of which none is registered: NOT_INIT before Init,
+// else DEVICE_NOT_FOUND, as every call on a device here. Its arguments are not known and not read.
+s32 cellMicCommand(PPUContext&) { return mic_refused("cellMicCommand", no_mic()); }
+
+// The system's sharing of a microphone (D-667): SysShareInit, Open, Start, Stop, Close and End, RPCS3's names only (no
+// arguments). Init and End bracket the sharing, apart from cellMicInit (a second Init is ALREADY_INIT, an End without
+// one NOT_INIT); in between there is no microphone to share: Open, Start, Stop and Close answer DEVICE_NOT_FOUND (and
+// NOT_INIT outside). Their arguments are not known and not read.
+s32 cellMicSysShareInit(PPUContext&)
+{
+    MicState& m = mic();
+    std::lock_guard lock(m.mutex);
+    if (m.share_init) return error(CELL_MICIN_ERROR_ALREADY_INIT);
+    m.share_init = true;
+    PS_LOG_INFO(kMicChan, "cellMicSysShareInit(): no microphone is registered to share");
+    return lv2::CELL_OK;
+}
+
+s32 cellMicSysShareEnd(PPUContext&)
+{
+    MicState& m = mic();
+    std::lock_guard lock(m.mutex);
+    if (!m.share_init) return error(CELL_MICIN_ERROR_NOT_INIT);
+    m.share_init = false;
+    return lv2::CELL_OK;
+}
+
+s32 no_shared_mic(std::string_view call)
+{
+    s32 r = error(CELL_MICIN_ERROR_DEVICE_NOT_FOUND);
+    {
+        MicState& m = mic();
+        std::lock_guard lock(m.mutex);
+        if (!m.share_init) r = error(CELL_MICIN_ERROR_NOT_INIT);
+    }
+    return mic_refused(call, r);
+}
+
+s32 cellMicSysShareOpen(PPUContext&) { return no_shared_mic("cellMicSysShareOpen"); }
+s32 cellMicSysShareStart(PPUContext&) { return no_shared_mic("cellMicSysShareStart"); }
+s32 cellMicSysShareStop(PPUContext&) { return no_shared_mic("cellMicSysShareStop"); }
+s32 cellMicSysShareClose(PPUContext&) { return no_shared_mic("cellMicSysShareClose"); }
 
 s32 cellMicGetDeviceAttr(PPUContext&, s32 dev, u32, u32, u32)
 {
@@ -500,6 +570,23 @@ s32 cellMicRemoveNotifyEventQueue(PPUContext&, u64)
     return lv2::CELL_OK;
 }
 
+// cellMicSetMultiMicNotifyEventQueue(key, source, flag) (D-667): RPCS3 registers the name only; read as
+// SetNotifyEventQueue2's arguments. As that function: NOT_INIT before Init, the queue must exist (by key, else
+// EVENT_QUEUE), and it is kept, apart from the notify queue, until cellMicEnd; no microphone is registered, so it gets no
+// attach (or any) event. The flag is not used, as SetNotifyEventQueue2's is not (RPCS3).
+s32 cellMicSetMultiMicNotifyEventQueue(PPUContext&, u64 key, u64 source, u64 flag)
+{
+    MicState& m = mic();
+    std::lock_guard lock(m.mutex);
+    if (!m.init) return error(CELL_MICIN_ERROR_NOT_INIT);
+    if (!HleProcess::current()->kernel().event_queue_by_key(key)) return error(CELL_MICIN_ERROR_EVENT_QUEUE);
+    m.multi_key = key;
+    m.multi_source = source;
+    PS_LOG_INFO(kMicChan, "cellMicSetMultiMicNotifyEventQueue({:#x}, {:#x}, {:#x}): kept; no microphone to report",
+        key, source, flag);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_devices(Registry& r)
@@ -584,6 +671,16 @@ void register_devices(Registry& r)
         PS_HLE_FUNC(0x7903400E, cellMicSetNotifyEventQueue),
         PS_HLE_FUNC(0x6CC7AE00, cellMicSetNotifyEventQueue2),
         PS_HLE_FUNC(0x65336418, cellMicRemoveNotifyEventQueue),
+        // Made from RPCS3's names without Sony's libmic to compare them with (D-594): D-667, D-668.
+        PS_HLE_UNVERIFIED(0xC461563C, cellMicCommand),
+        PS_HLE_UNVERIFIED(0x891C6291, cellMicSetMultiMicNotifyEventQueue),
+        PS_HLE_UNVERIFIED(0xD127CD3E, cellMicSysShareInit),
+        PS_HLE_UNVERIFIED(0xC3610DBD, cellMicSysShareOpen),
+        PS_HLE_UNVERIFIED(0xCAC7E7D7, cellMicSysShareStart),
+        PS_HLE_UNVERIFIED(0xBDFD51E2, cellMicSysShareStop),
+        PS_HLE_UNVERIFIED(0x3ACE58F3, cellMicSysShareClose),
+        PS_HLE_UNVERIFIED(0xF82BBF7C, cellMicSysShareEnd),
+        PS_HLE_UNVERIFIED(0xE839380F, cellMicStopEx),
     });
 }
 
