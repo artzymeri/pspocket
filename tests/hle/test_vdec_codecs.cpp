@@ -219,32 +219,64 @@ void check_items(const Decoded& d, u32 codec, int width, int height)
     }
 }
 
-// The CellVdecDivxInfo fields (D-588), the rest of the block zero.
-struct DivxInfo {
-    u8 type = 0;
-    u16 width = 0, height = 0;
-    u8 par = 1, par_width = 0, par_height = 0, colour = 0, primaries = 1, transfer = 1, matrix = 1, structure = 0;
-    u16 frame_rate = 0;
-};
-
-void check_divx_info(const std::vector<u8>& info, const DivxInfo& want)
+// CellVdecDivxInfo of DivX 3.11 as Sony's libvdec writes it (D-912): the picture type, the size, the frame rate code,
+// the frame buffer's address (the item's start address), the size again, 0, 0x30, an error word 0; nothing else.
+void check_divx311_info(const std::vector<u8>& info, const std::vector<u8>& item, u8 type, u16 width, u16 height,
+    u16 frame_rate)
 {
-    CHECK(info[0] == want.type);
-    CHECK(info[1] == 0);
-    CHECK(be16(info, 2) == want.width);
-    CHECK(be16(info, 4) == want.height);
-    CHECK(info[6] == want.par);
-    CHECK(info[7] == want.par_width);
-    CHECK(info[8] == want.par_height);
-    CHECK(info[9] == want.colour);
-    CHECK(info[10] == want.primaries);
-    CHECK(info[11] == want.transfer);
-    CHECK(info[12] == want.matrix);
-    CHECK(info[13] == want.structure);
-    CHECK(be16(info, 14) == want.frame_rate);
-    bool rest_zero = true;
-    for (usize k = 16; k < info.size(); k++) rest_zero &= info[k] == 0;
-    CHECK(rest_zero);
+    std::vector<u8> want(info.size(), 0);
+    want[0] = type;
+    want[2] = static_cast<u8>(width >> 8), want[3] = static_cast<u8>(width);
+    want[4] = static_cast<u8>(height >> 8), want[5] = static_cast<u8>(height);
+    want[6] = static_cast<u8>(frame_rate >> 8), want[7] = static_cast<u8>(frame_rate);
+    std::copy(item.begin() + 4, item.begin() + 8, want.begin() + 8);
+    want[0xC] = want[2], want[0xD] = want[3], want[0xE] = want[4], want[0xF] = want[5];
+    want[0x11] = 0x30;
+    CHECK(std::equal(want.begin(), want.begin() + 0x18, info.begin()));
+}
+
+// CellVdecDivxInfo of DivX (D-912): RPCS3's fields (type, size, the VOL's aspect ratio code and pixel sizes, no colour
+// description: 0s, a frame, the frame rate code), the frame buffer's address, the size again, 0, 0x30, 0.
+void check_divx_info(const std::vector<u8>& info, const std::vector<u8>& item, u8 type, u16 width, u16 height, u8 par,
+    u8 par_width, u8 par_height, u16 frame_rate)
+{
+    std::vector<u8> want(0x20, 0);
+    want[0] = type;
+    want[2] = static_cast<u8>(width >> 8), want[3] = static_cast<u8>(width);
+    want[4] = static_cast<u8>(height >> 8), want[5] = static_cast<u8>(height);
+    want[6] = par, want[7] = par_width, want[8] = par_height;
+    want[0xE] = static_cast<u8>(frame_rate >> 8), want[0xF] = static_cast<u8>(frame_rate);
+    std::copy(item.begin() + 4, item.begin() + 8, want.begin() + 0x10);
+    want[0x14] = want[2], want[0x15] = want[3], want[0x16] = want[4], want[0x17] = want[5];
+    want[0x19] = 0x30;
+    CHECK(std::equal(want.begin(), want.end(), info.begin()));
+}
+
+// CellVdecMpeg4Info (D-912): the VOL's aspect ratio code, pixel sizes, time increment resolution, fixed VOP rate and
+// increment, width and height; the VOP type; the picture's luma (the item's start address), Cb and Cr addresses; the
+// size as words; the frame's luma lines; 3 at 0x30.
+void check_mpeg4_info(const std::vector<u8>& info, const std::vector<u8>& item, u8 type, u16 width, u16 height, u8 par,
+    u8 par_width, u8 par_height)
+{
+    CHECK(info[0] == par);
+    CHECK(info[1] == par_width);
+    CHECK(info[2] == par_height);
+    CHECK(be16(info, 4) == 25); // vop_time_increment_resolution
+    CHECK(info[6] == 0);        // fixed_vop_rate
+    CHECK(be16(info, 8) == 0);
+    CHECK(be16(info, 0xA) == width);
+    CHECK(be16(info, 0xC) == height);
+    CHECK(info[0xE] == type);
+    CHECK(be32(info, 0x10) == be32(item, 4));
+    const u32 strips = (width + 15) / 16 + 2, lines = (height + 15) / 16 * 16 + 32;
+    const u32 frame = be32(item, 4) - lines * 16 - 16 * 16;
+    const u32 cb = frame + strips * 16 * lines + (lines / 2) * 16 + 8 * 16;
+    CHECK(be32(info, 0x14) == cb);
+    CHECK(be32(info, 0x18) == cb + 8);
+    CHECK(be32(info, 0x20) == width);
+    CHECK(be32(info, 0x24) == height);
+    CHECK(be32(info, 0x28) == lines);
+    CHECK(info[0x30] == 3);
 }
 
 // A picture's DC levels for the VC-1 writer, different for each `seed`: blocks from 83 to 172 (levels -40 to 39).
@@ -269,76 +301,63 @@ std::vector<u8> concat(std::initializer_list<std::vector<u8>> parts)
     return out;
 }
 
-// VC-1's range mapping of YUV 4:2:0 planes (SMPTE 421M's RANGE_MAPY and RANGE_MAPUV): each sample scaled about 128 by
-// (R + 9) / 8.
-std::vector<u8> range_mapped(std::vector<u8> yuv, int width, int height, int ry, int ruv)
-{
-    for (usize k = 0; k < yuv.size(); k++) {
-        const int r = k < static_cast<usize>(width * height) ? ry : ruv;
-        yuv[k] = static_cast<u8>(std::clamp((((yuv[k] - 128) * (r + 9) + 4) >> 3) + 128, 0, 255));
-    }
-    return yuv;
-}
-
 // The samples of an I_PCM picture of the H.264 writer as GetPicture gives them in YUV 4:2:0.
 std::vector<u8> samples_of(const h::Picture& p)
 {
     return concat({p.y, p.cb, p.cr});
 }
 
-// CellVdecVc1Info's fields (pspocket's layout, D-589), the rest of the block zero.
+// CellVdecVc1Info as Sony's libvdec writes it (D-912), for the writer's streams: the sequence header's coded size,
+// flags, display extension, aspect ratio, frame rate code and colour description, the entry point's broken link and
+// closed entry, the picture's type (libsvc1d's: I 1, skipped 5) and repetition, the headers its access unit carried,
+// what is valid, its addresses, the size again, the frame's lines and the range mapping.
 struct Vc1Info {
-    u16 width = 0, height = 0;
-    u8 type0 = 0, type1 = 0, fcm = 0, tff = 1, rff = 0, rptfrm = 0, level = 0, interlace = 0, pulldown = 0,
-       display_ext = 0;
-    u16 max_width = 0, max_height = 0, display_width = 0, display_height = 0;
-    u8 aspect = 0, framerate_flag = 0;
-    u16 aspect_width = 0, aspect_height = 0;
-    u8 framerate_ind = 0, framerate_nr = 0, framerate_dr = 0, color_flag = 0;
-    u16 framerate_exp = 0;
-    u8 prim = 0, transfer = 0, matrix = 0, broken_link = 0, closed_entry = 1, mapy_flag = 0, mapy = 0, mapuv_flag = 0,
-       mapuv = 0;
+    u32 width = 64, height = 48;
+    u8 pulldown = 0, tfcntrflag = 0, display_ext = 0;
+    u16 display_width = 0, display_height = 0;
+    u8 aspect_flag = 0, aspect = 0, aspect_width = 0, aspect_height = 0;
+    int frame_rate = -1; // none written
+    u8 color_flag = 0, prim = 0, transfer = 0, matrix = 0;
+    u8 type = 1, rptfrm = 0;
+    u32 units = 7;
+    u8 mapy_flag = 0, mapy = 0, mapuv_flag = 0, mapuv = 0;
 };
 
-void check_vc1_info(const std::vector<u8>& info, const Vc1Info& w)
+void check_vc1_info(const std::vector<u8>& info, const std::vector<u8>& item, const Vc1Info& w, u32 picture_height)
 {
-    CHECK(be16(info, 0x00) == w.width);
-    CHECK(be16(info, 0x02) == w.height);
-    CHECK(info[0x04] == w.type0);
-    CHECK(info[0x05] == w.type1);
-    CHECK(info[0x06] == w.fcm);
-    CHECK(info[0x07] == w.tff);
-    CHECK(info[0x08] == w.rff);
-    CHECK(info[0x09] == w.rptfrm);
-    CHECK(info[0x0A] == w.level);
-    CHECK(info[0x0B] == w.interlace);
-    CHECK(info[0x0C] == w.pulldown);
-    CHECK(info[0x0D] == w.display_ext);
-    CHECK(be16(info, 0x0E) == w.max_width);
-    CHECK(be16(info, 0x10) == w.max_height);
-    CHECK(be16(info, 0x12) == w.display_width);
-    CHECK(be16(info, 0x14) == w.display_height);
-    CHECK(info[0x16] == w.aspect);
-    CHECK(info[0x17] == w.framerate_flag);
-    CHECK(be16(info, 0x18) == w.aspect_width);
-    CHECK(be16(info, 0x1A) == w.aspect_height);
-    CHECK(info[0x1C] == w.framerate_ind);
-    CHECK(info[0x1D] == w.framerate_nr);
-    CHECK(info[0x1E] == w.framerate_dr);
-    CHECK(info[0x1F] == w.color_flag);
-    CHECK(be16(info, 0x20) == w.framerate_exp);
-    CHECK(info[0x22] == w.prim);
-    CHECK(info[0x23] == w.transfer);
-    CHECK(info[0x24] == w.matrix);
-    CHECK(info[0x25] == w.broken_link);
-    CHECK(info[0x26] == w.closed_entry);
-    CHECK(info[0x27] == w.mapy_flag);
-    CHECK(info[0x28] == w.mapy);
-    CHECK(info[0x29] == w.mapuv_flag);
-    CHECK(info[0x2A] == w.mapuv);
-    bool rest_zero = true;
-    for (usize k = 0x2B; k < info.size(); k++) rest_zero &= info[k] == 0;
-    CHECK(rest_zero);
+    CHECK(be32(info, 0x00) == w.width);
+    CHECK(be32(info, 0x04) == w.height);
+    CHECK(info[0x08] == w.pulldown);
+    CHECK(info[0x0A] == w.tfcntrflag);
+    CHECK(info[0x0E] == w.display_ext);
+    CHECK(be16(info, 0x10) == (w.display_ext ? w.display_width - 1 : 0));
+    CHECK(be16(info, 0x12) == (w.display_ext ? w.display_height - 1 : 0));
+    CHECK(info[0x14] == w.aspect_flag);
+    CHECK(info[0x15] == w.aspect);
+    CHECK(info[0x16] == (w.aspect_width ? w.aspect_width - 1 : 0));
+    CHECK(info[0x17] == (w.aspect_height ? w.aspect_height - 1 : 0));
+    CHECK(info[0x18] == (w.frame_rate < 0 ? 0 : w.frame_rate)); // not written: the fixture's 0
+    CHECK(info[0x19] == w.color_flag);
+    CHECK(info[0x1A] == w.prim);
+    CHECK(info[0x1B] == w.transfer);
+    CHECK(info[0x1C] == w.matrix);
+    CHECK(info[0x1D] == 0); // broken link
+    CHECK(info[0x1E] == 1); // closed entry
+    CHECK(info[0x1F] == w.type);
+    CHECK(info[0x22] == w.rptfrm);
+    CHECK(info[0x23] == 1); // top field first
+    CHECK(be32(info, 0x2C) == w.units);
+    CHECK(be32(info, 0x30) == 7);
+    CHECK(be32(info, 0x148) == be32(item, 4));
+    CHECK(be32(info, 0x150) == be32(info, 0x14C) + 8);
+    CHECK(be32(info, 0x158) == w.width);
+    CHECK(be32(info, 0x15C) == w.height);
+    CHECK(be32(info, 0x160) == (picture_height + 31) / 32 * 32 + 128);
+    CHECK(info[0x168] == 3);
+    CHECK(info[0x169] == w.mapy_flag);
+    CHECK(info[0x16A] == w.mapuv_flag);
+    CHECK(info[0x16B] == w.mapy);
+    CHECK(info[0x16C] == w.mapuv);
 }
 
 } // namespace
@@ -378,12 +397,9 @@ TEST_CASE("cellVdec: DivX 3.11 on FFmpeg, its frame size from the codec informat
         for (int i = 0; i < kFrames; i++) {
             INFO("picture " << i);
             CHECK(d.pictures[static_cast<usize>(i)] == want[static_cast<usize>(i)].data);
-            DivxInfo w;
-            w.type = i % 3 == 0 ? 0 : 1; // I, P, P
-            w.width = kW;
-            w.height = kH;
-            w.frame_rate = frame_rate ? 3 : 0; // CELL_VDEC_DIVX_FRC_25, else UNDEFINED
-            check_divx_info(d.infos[static_cast<usize>(i)], w);
+            // The frame rate code: 0, SetFrameRate's before StartSeq forgotten by it, as Sony's libdivx311dec does.
+            check_divx311_info(d.infos[static_cast<usize>(i)], d.items[static_cast<usize>(i)], i % 3 == 0 ? 0 : 1, kW,
+                kH, 0);
         }
     }
 }
@@ -433,6 +449,11 @@ TEST_CASE("cellVdec: DivX 3.11's codec information checked as RPCS3 checks it; w
     CHECK(be16(d.infos[0], 2) == 720);
     CHECK(be16(d.infos[0], 4) == 576);
     CHECK(d.pictures[0] == want[0].data);
+    // Sizes as Sony's (D-912): with the information, the frames sized for it.
+    CHECK(query(15, divx_info2(12, 96, 64, 0)) == 0);
+    CHECK(ps_read32(b, kAttr) == 0x9D778);
+    CHECK(query(15, divx_info2(12, 1920, 1088, 2)) == 0);
+    CHECK(ps_read32(b, kAttr) == 0x6D5B78);
 }
 
 TEST_CASE("cellVdec: CellVdecDivxInfo laid out as RPCS3's for DivX and MPEG-4: type, size, aspect ratio, frame rate "
@@ -461,22 +482,19 @@ TEST_CASE("cellVdec: CellVdecDivxInfo laid out as RPCS3's for DivX and MPEG-4: t
             INFO(all_lines(d.lines));
             REQUIRE(d.open == 0);
             CHECK(d.audone == kFrames);
-            CHECK(d.pictures_after_aus == kFrames - 1);
+            // DivX's pictures one access unit late, MPEG-4's at once (Sony's libdivxdec and libsmvd4, D-912).
+            CHECK(d.pictures_after_aus == (codec == CODEC_DIVX ? kFrames - 1 : kFrames));
             REQUIRE(d.pictures.size() == kFrames);
             check_items(d, codec, kW, kH);
+            const u8 par = sar.num == 12 ? 2 : 15, par_width = sar.num == 12 ? 0 : 8, par_height = sar.num == 12 ? 0 : 9;
             for (int i = 0; i < kFrames; i++) {
                 INFO("picture " << i);
-                CHECK(d.pictures[static_cast<usize>(i)] == want[static_cast<usize>(i)].data);
-                CHECK(psnr(want[static_cast<usize>(i)], moving(kW, kH, i)) > 35.0);
-                DivxInfo w;
-                w.type = i % 2 == 0 ? 0 : 1; // I, P
-                w.width = kW;
-                w.height = kH;
-                w.par = sar.num == 12 ? 2 : 15;
-                w.par_width = sar.num == 12 ? 0 : 8;
-                w.par_height = sar.num == 12 ? 0 : 9;
-                w.frame_rate = 3; // 25 a second, from the VOL's time increment resolution
-                check_divx_info(d.infos[static_cast<usize>(i)], w);
+                const usize k = static_cast<usize>(i);
+                CHECK(d.pictures[k] == want[k].data);
+                CHECK(psnr(want[k], moving(kW, kH, i)) > 35.0);
+                const u8 type = i % 2 == 0 ? 0 : 1; // I, P
+                if (codec == CODEC_DIVX) check_divx_info(d.infos[k], d.items[k], type, kW, kH, par, par_width, par_height, 0);
+                else check_mpeg4_info(d.infos[k], d.items[k], type, kW, kH, par, par_width, par_height);
             }
         }
     }
@@ -535,26 +553,26 @@ TEST_CASE("cellVdec: VC-1's advanced profile on FFmpeg: a stream written here, i
         INFO("picture " << i);
         CHECK(d.pictures[i] == want[i]);
         Vc1Info w;
-        w.width = w.max_width = w.display_width = 64;
-        w.height = w.max_height = w.display_height = 48;
-        w.type0 = w.type1 = i % 2 ? 4 : 0; // skipped, I
-        w.level = 1;
         w.display_ext = 1;
+        w.display_width = 64;
+        w.display_height = 48;
+        w.aspect_flag = 1;
         w.aspect = 15;
         w.aspect_width = 4;
         w.aspect_height = 3;
-        w.framerate_flag = 1;
-        w.framerate_nr = 2;
-        w.framerate_dr = 1;
+        w.frame_rate = 3; // 25 a second
         w.color_flag = 1;
         w.prim = 1;
         w.transfer = 1;
         w.matrix = 6;
-        check_vc1_info(d.infos[i], w);
+        w.type = i % 2 ? 5 : 1;   // skipped, I
+        w.units = i % 2 ? 4 : 7; // a frame alone; the headers and a frame
+        check_vc1_info(d.infos[i], d.items[i], w, 48);
     }
 }
 
-TEST_CASE("cellVdec: VC-1's range mapping applied to the pictures, pulldown in the information (D-589)", "[hle][vdec]")
+TEST_CASE("cellVdec: VC-1's range mapping left to the game in the information, as Sony's; pulldown (D-589, D-912)",
+    "[hle][vdec]")
 {
     if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
     v1::Sequence seq;
@@ -566,39 +584,36 @@ TEST_CASE("cellVdec: VC-1's range mapping applied to the pictures, pulldown in t
     const v1::DcPicture a = dc_levels(64, 48, 2);
     const std::vector<u8> headers = concat({v1::sequence_header(seq), v1::entry_point(entry)});
     const std::vector<std::vector<u8>> aus = {concat({headers, v1::intra_frame(a, seq, 2)})};
-    // FFmpeg leaves the mapping out: its picture is the coded one.
+    // FFmpeg leaves the mapping out, and so does Sony's libsvc1d: the picture is the coded one.
     const std::vector<Yuv> ffmpeg = ffmpeg_decode(AV_CODEC_ID_VC1, aus, 0, 0, headers);
     REQUIRE(ffmpeg.size() == 1);
     CHECK(ffmpeg[0].data == v1::samples(a));
-    const std::vector<u8> want = range_mapped(v1::samples(a), 64, 48, 7, 1);
-    CHECK(range_mapped({137, 128, 100}, 1, 1, 7, 7) == std::vector<u8>{146, 128, 72}); // by hand
+    const std::vector<u8> want = v1::samples(a);
 
     InterpretMisses interpret;
     BigFixture f;
     GuestThread t(f, 0, "ppu");
     Stream s;
     s.codec = CODEC_VC1;
-    s.level = 9; // CELL_VDEC_VC1_AP_L4
+    s.level = 6; // CELL_VDEC_VC1_AP_L1 (AP_L4 asks for more memory than the fixture has)
     s.aus = aus;
     const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
     INFO(all_lines(d.lines));
     REQUIRE(d.pictures.size() == 1);
     CHECK(d.pictures[0] == want);
     Vc1Info w;
-    w.width = w.max_width = 64;
-    w.height = w.max_height = 48;
-    w.level = 1;
     w.pulldown = 1;
+    w.tfcntrflag = 1;
     w.rptfrm = 2;
     w.mapy_flag = 1;
     w.mapy = 7;
     w.mapuv_flag = 1;
     w.mapuv = 1;
-    check_vc1_info(d.infos[0], w);
+    check_vc1_info(d.infos[0], d.items[0], w, 48);
 }
 
-TEST_CASE("cellVdec: VC-1 before its sequence header, a new sequence header, the simple and main profiles refused, "
-          "the decode modes (D-589)", "[hle][vdec]")
+TEST_CASE("cellVdec: VC-1 before its sequence header, a new sequence header, the simple and main profiles opened, "
+          "the decode modes (D-589, D-912)", "[hle][vdec]")
 {
     if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
     v1::Sequence seq;
@@ -640,24 +655,32 @@ TEST_CASE("cellVdec: VC-1 before its sequence header, a new sequence header, the
         INFO(all_lines(d.lines));
         CHECK(d.audone == 2);
         REQUIRE(d.pictures.size() == 2);
-        CHECK(d.pictures[0] == v1::samples(a));
+        // Announced after the 32x32 sequence header was read, the 64x48 picture is given at its size, cut (Sony's).
+        const std::vector<u8> full = v1::samples(a);
+        std::vector<u8> cut;
+        for (int r = 0; r < 32; r++) cut.insert(cut.end(), full.begin() + r * 64, full.begin() + r * 64 + 32);
+        for (int r = 0; r < 16; r++)
+            cut.insert(cut.end(), full.begin() + 64 * 48 + r * 32, full.begin() + 64 * 48 + r * 32 + 16);
+        for (int r = 0; r < 16; r++)
+            cut.insert(cut.end(), full.begin() + 64 * 48 * 5 / 4 + r * 32, full.begin() + 64 * 48 * 5 / 4 + r * 32 + 16);
+        CHECK(d.pictures[0] == cut);
+        CHECK(be32(d.items[0], 0x08) == 32 * 32 * 3 / 2);
         CHECK(d.pictures[1] == v1::samples(c));
         CHECK(be32(d.items[1], 0x08) == 32 * 32 * 3 / 2);
-        CHECK(be16(d.infos[1], 0x00) == 32);
-        CHECK(be16(d.infos[1], 0x0E) == 32); // the new sequence header's
+        CHECK(be32(d.infos[1], 0x00) == 32); // the new sequence header's
+        CHECK(be32(d.infos[0], 0x160) == 64 + 128); // the 64x48 picture's frame
     }
-    SECTION("the simple and main profiles' levels open FATAL; a level past the advanced profile's is ARG")
+    SECTION("the simple and main profiles' levels open as Sony's; a level past the advanced profile's is ARG")
     {
         BigFixture f;
         GuestThread t(f, 0, "ppu");
-        for (u32 level = 0; level < 5; level++) {
+        for (u32 level = 0; level < 4; level++) { // level 4 asks for more than the fixture has
             INFO("level " << level);
             Stream s;
             s.codec = CODEC_VC1;
             s.level = level;
             const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
-            CHECK(d.lines.size() == 2); // QueryAttrEx answered, OpenEx refused
-            CHECK(d.open == CELL_VDEC_ERROR_FATAL);
+            CHECK(d.open == 0);
         }
         u8* b = f.base();
         ps_write32(b, kType, CODEC_VC1);
@@ -665,30 +688,41 @@ TEST_CASE("cellVdec: VC-1 before its sequence header, a new sequence header, the
         ps_write32(b, kType + 8, 0);
         CHECK(hle_calls(f, t)("cellVdecQueryAttrEx", 0xC982A84A, {kType, kAttr}) == CELL_VDEC_ERROR_ARG);
     }
-    SECTION("B and PB skipping together is VC-1's (the picture marked skipped), PB skipping alone is not")
+    SECTION("B and PB skipping together: taken, then a fatal error (ERROR) and nothing more; PB skipping alone ARG")
     {
         BigFixture f;
         GuestThread t(f, 0, "ppu");
-        Stream s;
-        s.codec = CODEC_VC1;
-        s.level = 5;
-        s.aus = {concat({headers, v1::intra_frame(a, seq)})};
-        s.mode = 3;
-        const Decoded d = decode_stream(f.base(), hle_calls(f, t), s);
-        INFO(all_lines(d.lines));
-        REQUIRE(d.pictures.size() == 1);
-        CHECK(d.pictures[0] == v1::samples(a));
-        CHECK(be32(d.items[0], 0x44) == 1); // CELL_VDEC_PICITEM_ATTR_SKIPPED
-        s.mode = 2;
-        const Decoded e = decode_stream(f.base(), hle_calls(f, t), s);
-        INFO(all_lines(e.lines));
-        CHECK(e.audone == 0);
-        CHECK(e.pictures.empty());
-        CHECK(std::count(e.lines.begin(), e.lines.end(), "cellVdecDecodeAu -> 0x80610101") == 1);
+        u8* b = f.base();
+        const Call call = hle_calls(f, t);
+        write_callback(b);
+        std::memset(b + kArgs, 0, 0x200);
+        ps_write32(b, kType, CODEC_VC1);
+        ps_write32(b, kType + 4, 5);
+        REQUIRE(call("cellVdecQueryAttrEx", 0xC982A84A, {kType, kAttr}) == 0);
+        const u32 res[6] = {kDecoderMem, ps_read32(b, kAttr), 1000, 0x4000, 200, 1};
+        for (u32 i = 0; i < 6; i++) ps_write32(b, kRes + 4 * i, res[i]);
+        ps_write32(b, kCb, kOpd);
+        ps_write32(b, kCb + 4, kLog);
+        REQUIRE(call("cellVdecOpenEx", 0x0053E2D8, {kType, kRes, kCb, kHandle}) == 0);
+        const u32 handle = ps_read32(b, kHandle);
+        REQUIRE(call("cellVdecStartSeq", 0xC757C2AA, {handle}) == 0);
+        const std::vector<u8> au = concat({headers, v1::intra_frame(a, seq)});
+        std::memcpy(b + kStream, au.data(), au.size());
+        ps_write32(b, kAu + 0, kStream);
+        ps_write32(b, kAu + 4, static_cast<u32>(au.size()));
+        CHECK(call("cellVdecDecodeAu", 0x2BF4DDD2, {handle, 2, kAu}) == CELL_VDEC_ERROR_ARG);
+        CHECK(call("cellVdecDecodeAu", 0x2BF4DDD2, {handle, 3, kAu}) == 0);
+        REQUIRE(wait_until([&] { return count_of(b, 3) >= 1; }));
+        CHECK(ps_read32(b, kLog + 20) == CELL_VDEC_ERROR_FATAL); // the ERROR's data
+        CHECK(call("cellVdecEndSeq", 0x824433F0, {handle}) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        CHECK(log_count(b) == 1); // no AUDONE, no SEQDONE
+        CHECK(call("cellVdecClose", 0x16698E83, {handle}) == 0);
     }
 }
 
-TEST_CASE("cellVdec: MVC's base view decoded as the same stream without its second view would be as H.264 (D-590)",
+TEST_CASE("cellVdec: MVC through DecodeAu refused as Sony's (FATAL); through DecodeAuEx2 its base view decoded as the "
+          "same stream without its second view would be as H.264 (D-590, D-912)",
     "[hle][vdec]")
 {
     // Two views in each access unit (a subset SPS, a prefix NAL unit, the second view's coded slice extension): the
@@ -701,20 +735,26 @@ TEST_CASE("cellVdec: MVC's base view decoded as the same stream without its seco
         avc.push_back(h::access_unit(h::pattern(kW, kH, i), static_cast<u32>(i & 1)));
     }
     InterpretMisses interpret;
-    const auto run = [&](u32 codec, const std::vector<std::vector<u8>>& aus) {
+    const auto run = [&](u32 codec, const std::vector<std::vector<u8>>& aus, bool ex2) {
         BigFixture f;
         GuestThread t(f, 0, "ppu");
         Stream s;
         s.codec = codec;
         s.level = 21;
+        s.spec = {0, 0, 0, 12, 0, kW, 0, kH, 0, 0, 0, 0}; // 64x64: the memory a level 2.1 decoder asks for fits
         s.aus = aus;
+        s.ex2 = ex2;
         return decode_stream(f.base(), hle_calls(f, t), s);
     };
-    const Decoded as_avc = run(CODEC_AVC, avc);
+    const Decoded as_avc = run(CODEC_AVC, avc, false);
     REQUIRE(as_avc.pictures.size() == kAus);
     for (const u32 codec : {CODEC_MVC, CODEC_MVC2}) {
         INFO("codec " << codec);
-        const Decoded d = run(codec, mvc);
+        const Decoded refused = run(codec, mvc, false);
+        CHECK(refused.audone == 0);
+        CHECK(refused.pictures.empty());
+        CHECK(std::count(refused.lines.begin(), refused.lines.end(), "cellVdecDecodeAu -> 0x80610180") == kAus);
+        const Decoded d = run(codec, mvc, true);
         INFO(all_lines(d.lines));
         REQUIRE(d.open == 0);
         CHECK(d.audone == kAus);
@@ -726,9 +766,11 @@ TEST_CASE("cellVdec: MVC's base view decoded as the same stream without its seco
             INFO("picture " << i);
             CHECK(d.pictures[i] == samples_of(h::pattern(kW, kH, static_cast<int>(i)))); // the base view's, exactly
             CHECK(d.pictures[i] == as_avc.pictures[i]);
-            CHECK(d.infos[i] == as_avc.infos[i]); // CellVdecAvcInfo from the base view's SPS, PPS and NAL units
+            // CellVdecAvcInfo from the base view's SPS, PPS and NAL units, in MVC's 0x214 bytes.
+            CHECK(std::equal(d.infos[i].begin(), d.infos[i].begin() + 0x214, as_avc.infos[i].begin()));
             CHECK(be32(d.items[i], 0) == codec);
-            CHECK(std::equal(d.items[i].begin() + 4, d.items[i].end(), as_avc.items[i].begin() + 4));
+            // The rest of the item but its addresses (the frame buffers come after a ring of MVC's blocks).
+            CHECK(std::equal(d.items[i].begin() + 8, d.items[i].begin() + 0x48, as_avc.items[i].begin() + 8));
         }
     }
 }
@@ -743,6 +785,8 @@ TEST_CASE("cellVdec: MVC with its views in access units apart: the second view's
     Stream s;
     s.codec = CODEC_MVC;
     s.level = 21;
+    s.spec = {0, 0, 0, 12, 0, kW, 0, kH, 0, 0, 0, 0};
+    s.ex2 = true; // through DecodeAu Sony's libvdec refuses MVC (D-912)
     for (int i = 0; i < 2; i++) {
         s.aus.push_back(h::access_unit(h::pattern(kW, kH, i), static_cast<u32>(i)));
         s.aus.push_back(h::second_view_only(h::pattern(kW, kH, 10 + i), static_cast<u32>(i)));

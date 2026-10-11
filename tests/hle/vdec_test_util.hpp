@@ -146,6 +146,7 @@ struct Stream {
     std::vector<std::vector<u8>> aus;
     s32 mode = 0;
     u32 frame_rate = 0; // cellVdecSetFrameRate's code before the sequence when not 0
+    bool ex2 = false;   // each access unit by DecodeAuEx2 (RPCS3's CellVdecAuInfoEx2, D-596) instead of DecodeAu
 };
 
 // What the decoder showed: the answers of the calls that can fail, the callbacks counted, each picture's item
@@ -157,8 +158,10 @@ struct Decoded {
     std::vector<std::vector<u8>> items, infos, pictures;
 };
 
-// A decoder's life over `s` (pspocket's or Sony's libvdec through `call`): open, a sequence of the stream's access
-// units each awaited (AUDONE), the end of the sequence (SEQDONE), then every picture's item, information and samples.
+// A decoder's life over `s` (pspocket's or Sony's libvdec through `call`) as a game lives it: open, a sequence of the
+// stream's access units, each awaited (AUDONE) and the pictures announced by then taken at once (Sony's decoders hold
+// an access unit back while they hold their most pictures, D-912), the end of the sequence (SEQDONE) and the last
+// pictures: every picture's item, information and samples.
 inline Decoded decode_stream(u8* b, const Call& call, const Stream& s)
 {
     Decoded d;
@@ -176,7 +179,7 @@ inline Decoded decode_stream(u8* b, const Call& call, const Stream& s)
         ps_write32(b, kType + 8, kSpec);
     }
     if (r("cellVdecQueryAttrEx", 0xC982A84A, {kType, kAttr}) != 0) return d;
-    // The memory asked for, at most what the fixture has (libvdec opens with less, D-196).
+    // The memory asked for, at most what the fixture has (libvdec opens with its codec's part of it, D-912).
     const u32 res[6] = {kDecoderMem, std::min(ps_read32(b, kAttr), kDecoderMemSize), 1000, 0x4000, 200, 1};
     for (u32 i = 0; i < 6; i++) ps_write32(b, kRes + 4 * i, res[i]);
     ps_write32(b, kCb, kOpd);
@@ -186,9 +189,35 @@ inline Decoded decode_stream(u8* b, const Call& call, const Stream& s)
     const u32 handle = ps_read32(b, kHandle);
     if (s.frame_rate) r("cellVdecSetFrameRate", 0xE13EF6FC, {handle, s.frame_rate});
     if (r("cellVdecStartSeq", 0xC757C2AA, {handle}) != 0) return d;
+    // Until the callbacks stop coming (none for 0.1 s): the PICOUTs after an AUDONE.
+    const auto settle = [&] {
+        u32 seen = log_count(b);
+        for (int quiet = 0; quiet < 5; quiet++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const u32 now = log_count(b);
+            if (now != seen) quiet = 0;
+            seen = now;
+        }
+    };
+    const auto take = [&] {
+        for (;;) {
+            ps_write32(b, kItemOut, 0);
+            if (call("cellVdecGetPicItem", 0x17C702B9, {handle, kItemOut}) != 0) return;
+            const u32 item = ps_read32(b, kItemOut), info = ps_read32(b, item + 0x48), size = ps_read32(b, item + 8);
+            d.items.emplace_back(b + item, b + item + 0x4C);
+            d.infos.emplace_back(b + info, b + info + 0x244);
+            ps_write32(b, kFormat, 3); // YUV 4:2:0 planar
+            ps_write32(b, kFormat + 4, 0);
+            ps_write8(b, kFormat + 8, 0);
+            std::memset(b + kPicture, 0xCC, size + 0x100);
+            if (r("cellVdecGetPicture", 0x807C861A, {handle, kFormat, kPicture}) != 0) return;
+            d.pictures.emplace_back(b + kPicture, b + kPicture + size);
+        }
+    };
     u32 at = kStream;
     for (usize i = 0; i < s.aus.size(); i++) {
         const std::vector<u8>& au = s.aus[i];
+        if (at + au.size() > kPicture) at = kStream;
         REQUIRE(at + au.size() <= kPicture);
         std::memcpy(b + at, au.data(), au.size());
         ps_write32(b, kAu + 0, at);
@@ -199,40 +228,31 @@ inline Decoded decode_stream(u8* b, const Call& call, const Stream& s)
         ps_write32(b, kAu + 20, 0x800 + 3003 * static_cast<u32>(i));
         ps_write64(b, kAu + 24, 0xABCD0000 + static_cast<u64>(i));
         ps_write64(b, kAu + 32, 0);
-        at = (at + static_cast<u32>(au.size()) + 15) & ~15u;
-        if (r("cellVdecDecodeAu", 0x2BF4DDD2, {handle, static_cast<u64>(static_cast<u32>(s.mode)), kAu}) != 0) continue;
-        if (!wait_until([&] { return count_of(b, 0) >= static_cast<u32>(i + 1); })) d.lines.push_back("no AUDONE");
-    }
-    // The pictures announced before the end of the sequence (once no more come for 0.4 s): one access unit late, as
-    // Sony's.
-    u32 seen = count_of(b, 1);
-    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    for (int quiet = 0; quiet < 20; quiet++) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        const u32 now = count_of(b, 1);
-        if (now != seen) quiet = 0;
-        seen = now;
-        if (std::chrono::steady_clock::now() > give_up) {
-            d.lines.push_back("pictures still coming after 30 s");
-            break;
+        if (s.ex2) { // startAddr, a word, size, a word, then CellVdecAuInfo's pts, dts, userData, codecSpecificData
+            const u32 start = ps_read32(b, kAu), size = ps_read32(b, kAu + 4);
+            std::memmove(b + kAu + 0x10, b + kAu + 8, 0x20);
+            ps_write32(b, kAu + 0, start);
+            ps_write32(b, kAu + 4, 0);
+            ps_write32(b, kAu + 8, size);
+            ps_write32(b, kAu + 12, 0);
         }
+        at = (at + static_cast<u32>(au.size()) + 15) & ~15u;
+        const u32 mode = static_cast<u32>(s.mode);
+        if ((s.ex2 ? r("cellVdecDecodeAuEx2", 0x1533C6A9, {handle, mode, kAu})
+                   : r("cellVdecDecodeAu", 0x2BF4DDD2, {handle, mode, kAu})) != 0)
+            continue;
+        const u32 done = static_cast<u32>(std::count_if(d.lines.begin(), d.lines.end(), [](const std::string& l) {
+            return l == "cellVdecDecodeAu -> 0x0" || l == "cellVdecDecodeAuEx2 -> 0x0";
+        }));
+        if (!wait_until([&] { return count_of(b, 0) >= done; }, std::chrono::seconds(10))) d.lines.push_back("no AUDONE");
+        settle();
+        take();
     }
-    d.pictures_after_aus = seen;
+    d.pictures_after_aus = count_of(b, 1);
     r("cellVdecEndSeq", 0x824433F0, {handle});
-    if (!wait_until([&] { return count_of(b, 2) >= 1; })) d.lines.push_back("no SEQDONE");
-    for (;;) {
-        ps_write32(b, kItemOut, 0);
-        if (call("cellVdecGetPicItem", 0x17C702B9, {handle, kItemOut}) != 0) break;
-        const u32 item = ps_read32(b, kItemOut), info = ps_read32(b, item + 0x48), size = ps_read32(b, item + 8);
-        d.items.emplace_back(b + item, b + item + 0x4C);
-        d.infos.emplace_back(b + info, b + info + 0x244);
-        ps_write32(b, kFormat, 3); // YUV 4:2:0 planar
-        ps_write32(b, kFormat + 4, 0);
-        ps_write8(b, kFormat + 8, 0);
-        std::memset(b + kPicture, 0xCC, size + 0x100);
-        if (r("cellVdecGetPicture", 0x807C861A, {handle, kFormat, kPicture}) != 0) break;
-        d.pictures.emplace_back(b + kPicture, b + kPicture + size);
-    }
+    if (!wait_until([&] { return count_of(b, 2) >= 1; }, std::chrono::seconds(10))) d.lines.push_back("no SEQDONE");
+    settle();
+    take();
     d.audone = count_of(b, 0);
     d.picout = count_of(b, 1);
     d.seqdone = count_of(b, 2);
