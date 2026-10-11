@@ -10079,3 +10079,206 @@ from an integer, so double precision floors them alike on every host.
 Tests: 21 Note2Pitch and 14 Pitch2Note values of libsd's arithmetic; every note from 12 to 83 at every fine step near
 4096 * 2^(offset / 12) (within 1 + 0.06%), rising, and back through Pitch2Note within 5 fine steps (1 from the centre
 up). To compare on the Mac: the comparison's 2,350 answers against Sony's.
+
+## D-630 · 2026-10-10 · cellRudp pspocket's own: contexts, connections and data (the API as decided without librudp)
+
+cellRudp is Sony's reliable UDP for games' peer-to-peer play (librudp). D-607 made its life pspocket's (Init, End,
+SetEventHandler); its other 28 functions are now pspocket's too (runtime/hle/src/cellRudp.cpp), and the library stays
+firmware-first (D-563): where the system software is installed a game still gets Sony's librudp, until the comparison
+of D-633 has run on the Mac. RPCS3 (cellRudp.cpp, cellRudp.h) gives the error codes, the option numbers, the poll event
+flags, CellRudpAllocator and CellRudpEventHandler's arguments, and nothing else: its other 28 are bare stubs without
+signatures. Sony's library was not at hand, so everything below was decided, from the library's names, its error codes
+and options, and the argument lists its successors (the PS Vita's and PS4's RUDP, the same functions) are recalled to
+have; no document of them was at hand either. Each is the first thing to check on the Mac (D-633). The wire format,
+which a game never sees, is pspocket's own (D-631); the I/O and the threads are D-632.
+
+**Signatures** (int answers; an ID or a count where noted):
+- EnableInternalIOThread(uint32_t stack_size, uint32_t priority); SetMaxSegmentSize(uint16_t mss);
+  GetMaxSegmentSize(uint16_t *mss).
+- CreateContext(CellRudpContextEventHandler handler, void *arg, int *ctx_id), the handler being (int ctx_id, int
+  event_id, int error_code, void *arg); SetOption and GetOption(int ctx_id, int option, [const] void *optval, size_t
+  optlen); GetContextStatus(int ctx_id, CellRudpContextStatus *status, size_t size); GetStatus(CellRudpStatus *status,
+  size_t size); GetLocalInfo(int ctx_id, int *soc, sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport, uint8_t
+  *muxmode); GetRemoteInfo(int ctx_id, sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport) (each output may be
+  NULL; *addrlen is the room in and 16 out).
+- Bind(int ctx_id, int soc, uint16_t vport, uint8_t muxmode); Listen(int ctx_id, int backlog); Accept(int ctx_id),
+  answering the new context's ID; Initiate(int ctx_id, const sys_net_sockaddr *to, socklen_t tolen, uint16_t vport);
+  Activate(int ctx_id, const sys_net_sockaddr *to, socklen_t tolen); Terminate(int ctx_id).
+- Read(int ctx_id, void *data, size_t len, uint8_t flags, CellRudpReadInfo *info) and Write(int ctx_id, const void
+  *data, size_t len, uint8_t flags), answering bytes; GetSizeReadable and GetSizeWritable(int ctx_id), answering bytes;
+  Flush(int ctx_id).
+- PollCreate(size_t size), answering the set's ID; PollDestroy(int poll_id); PollControl(int poll_id, int op, int
+  ctx_id, uint16_t events); PollWait(int poll_id, CellRudpPollEvent *events, size_t event_len, uint64_t timeout),
+  answering how many it wrote; PollCancel(int poll_id).
+- NetReceived(int soc, const uint8_t *data, size_t datalen, const sys_net_sockaddr *addr, socklen_t addrlen);
+  ProcessEvents(uint64_t timeout).
+
+**Numbers.** States: IDLE 0, CLOSED 1, SYN_SENT 2, SYN_RCVD 3, ESTABLISHED 4, CLOSE_WAIT 5 (the peer has ended). The
+context handler's events: CLOSED 1, ESTABLISHED 2, ERROR 3, WRITABLE 4, READABLE 5, FLUSHED 6; the event handler's:
+SEND 1, SOCKET_RELEASED 2. Poll operations ADD 1, MODIFY 2, REMOVE 3. Mux modes NORMAL 0, RAW 1. Read and Write flags:
+DONTWAIT 0x01, LATENCY_CRITICAL 0x08 (sent at once, counted, given to the reader); ALIGN_32 0x10, ALIGN_64 0x20 and
+WITH_TIMESTAMP 0x80 are taken and change nothing (every read information has its time stamp).
+
+**Structures**, all big-endian; Get*Status copy as many bytes as `size` asks for and write zeros past them (up to 256
+and 1024 bytes), so a game's larger structure never gets garbage:
+- CellRudpContextStatus, 48 bytes: state, parentId (the listener of an accepted context, else 0), children (a listener's
+  connections waiting and accepted ones still there), lostPackets, sentPackets, rcvdPackets (u32 each), sentBytes,
+  rcvdBytes (u64), retransmissions, rtt (the smoothed round trip in microseconds).
+- CellRudpStatus, 50 u64 counters: sentUdpBytes, rcvdUdpBytes, sentUdpPackets, rcvdUdpPackets, sentUserBytes,
+  sentUserPackets, sentLatencyCriticalPackets, rcvdUserBytes, rcvdUserPackets, rcvdLatencyCriticalPackets,
+  sent/rcvdSynPackets, sent/rcvdUsrPackets (DATA segments), sent/rcvdPrbPackets (probes), sent/rcvdRstPackets,
+  lostPackets, retransmittedPackets, reorderedPackets, currentContexts, then for quality levels 1 to 4 (delivery and
+  order guaranteed; delivery only; order only; neither) sent bytes, received bytes, sent packets, received packets;
+  allocs, frees, memCurrent, memPeak (the contexts' records and the bytes buffered), establishedConnections,
+  failedConnections and failed by reset, refused, timeout, version, transport type and quality level.
+- CellRudpReadInfo, 12 bytes: size (12), retransmissionCount, retransmissionDelay (u16, 0), retransmissionDelay2 (0),
+  flags (LATENCY_CRITICAL), sequenceNumber (the segment's low 16 bits), timestamp (the sender's guest clock in
+  microseconds when the segment first went).
+- CellRudpPollEvent, 8 bytes: ctx_id, reqEvents, rtnEvents.
+
+**Options** take 1, 2, 4 or 8 bytes (big-endian, unsigned) and GetOption writes in the width asked for
+(BUFFER_TOO_SMALL when the value does not fit; LAST_ERROR sign-extended in 8). Times are microseconds; a timeout of 0
+has no end. Defaults: MAX_PAYLOAD the segment's payload (1368), at most that (PAYLOAD_TOO_LARGE), at least 1; SNDBUF and
+RCVBUF 65,536 (256 to 16 MB); NODELAY 0; DELIVERY_CRITICAL and ORDER_CRITICAL 1; NONBLOCK 0; STREAM 0 (messages; a
+stream always has both guarantees); CONNECTION_TIMEOUT 30 s; CLOSE_WAIT_TIMEOUT 1 s; AGGREGATION_TIMEOUT 10 ms;
+READ_TIMEOUT, WRITE_TIMEOUT and FLUSH_TIMEOUT none; KEEP_ALIVE_INTERVAL 1 s; KEEP_ALIVE_TIMEOUT 10 s; LAST_ERROR the
+error that closed the connection, read only (INVALID_OPTION to set, as 12, 13 and past 19 are). STREAM,
+DELIVERY_CRITICAL and ORDER_CRITICAL are what a connection agrees on: IN_PROGRESS while it is being made,
+ALREADY_ESTABLISHED after; the others change at any time.
+
+**What each call does and answers** (every call NOT_INITIALIZED before Init; an unknown ID INVALID_CONTEXT_ID; a
+pointer that is not guest memory, a size of 0, a bad width INVALID_ARGUMENT, logged where a guest function is involved,
+never a host fault):
+- CreateContext: IDs from 1, never handed out twice in a process (a thread waiting across End and Init sees its ID go);
+  each context takes a 256-byte record from the game's app_malloc (the main area with the library's own allocator),
+  MEMORY when none comes, given back at Terminate or End; TOO_MANY_CONTEXTS past 256 (the game's, a listener's waiting
+  ones, the lingering ones). A NULL handler: no events.
+- Bind: a UDP or UDP P2P socket of the game's (INVALID_SOCKET otherwise, the type read from lv2's socket information);
+  mux mode 0 or 1 and the socket's contexts all in one (INVALID_MUXMODE); RAW needs the event handler
+  (NO_EVENT_HANDLER); ALREADY_BOUND; one context a vport (VPORT_IN_USE), vport 0 the lowest free one (VPORT_EXHAUSTED).
+- Listen(backlog): any peer's SYN at the vport makes a connection of its own, up to `backlog` waiting (8 for 0 or less,
+  64 at most); the listener hears READABLE when one has finished its handshake, and Accept hands it over as a context
+  with the listener's handler, argument and options (WOULDBLOCK when none and non-blocking or past READ_TIMEOUT;
+  NOT_ACCEPTABLE on a context not listening).
+- Initiate(to, vport): SYNs to the peer's vport until an answer or CONNECTION_TIMEOUT. Activate(to): a connection with
+  that peer only, from whichever vport its SYN comes; its own SYNs go to its own vport, so two peers activating each
+  other at one vport meet (D-631). Both: NOT_BOUND before Bind, NOT_ACCEPTABLE on a listener, IN_PROGRESS while
+  connecting, ALREADY_ESTABLISHED after; a peer address under 16 bytes INVALID_ARGUMENT; Initiate to vport 0
+  INVALID_VPORT.
+- Write: a datagram context takes a message whole (MSG_TOO_LARGE past MAX_PAYLOAD or SNDBUF), a stream as many bytes
+  as fit (all of them when blocking); without room WOULDBLOCK (NONBLOCK, DONTWAIT) or a wait up to WRITE_TIMEOUT, and
+  WRITABLE once room comes back. Written while the handshake runs, it goes out once it ends. NOT_BOUND before a
+  connection, END_OF_DATA once the peer has ended, the error after a failure.
+- Read: a whole message (BUFFER_TOO_SMALL, the message kept, when it does not fit) or the stream's bytes up to len, and
+  the read information; nothing there: WOULDBLOCK or a wait up to READ_TIMEOUT; END_OF_DATA once the peer's end is
+  read; NOT_ACCEPTABLE on a listener. GetSizeReadable: every byte waiting; GetSizeWritable: the room left.
+- Flush: what was written goes out now (no aggregation), then the call waits until the peer has acknowledged it all
+  (FLUSH_TIMEOUT); non-blocking it is WOULDBLOCK until then, with FLUSHED when it has.
+- Terminate: the ID goes at once; a connection lingers to send what was written and its end (D-631); one being made is
+  reset; a listener's connections not accepted are reset.
+- The connection's failures: CONN_REFUSED (nothing bound at the vport), CONN_TIMEOUT (the handshake past
+  CONNECTION_TIMEOUT), CONN_RESET (a RST), KEEP_ALIVE_FAILURE (nothing heard for KEEP_ALIVE_TIMEOUT),
+  CONN_VERSION_MISMATCH, CONN_TRANSPORT_TYPE_MISMATCH (a stream meeting messages), QUALITY_LEVEL_MISMATCH (different
+  delivery or order guarantees): the context is CLOSED, what it buffered goes, its handler hears ERROR and then CLOSED
+  with the code, which LAST_ERROR keeps and Read and Write answer.
+- Polls: PollCreate(1 to 1024 contexts; 64 sets, then MEMORY); PollControl ADD (ALREADY_EXISTS twice, MEMORY past the
+  size), MODIFY, REMOVE (INVALID_CONTEXT_ID for one not in the set; events past the four flags INVALID_ARGUMENT);
+  PollWait reports READ (data, the peer's end, a failure, a connection to accept), WRITE (room for a message, or a call
+  that would answer at once), FLUSH (all acknowledged), and ERROR whatever is asked; timeout 0 answers at once, a wait
+  that ends without an event answers 0, PollCancel or PollDestroy end it with CANCELLED; INVALID_POLL_ID.
+- Not used: INTERNAL and ADDR_IN_USE.
+To check on the Mac (D-633), first: every signature above (above all Listen's and Accept's, which the successors lack,
+EnableInternalIOThread's order and GetMaxSegmentSize's pointer), the structures' layouts and the numbers, the options'
+widths, units and defaults, PollWait's timeout 0, and the answers chosen where two would do.
+
+The count: 5,993 of 6,625 library functions pspocket's own before, 6,021 after; cellRudp's grey cells, all 28, green.
+Tests: tests/hle/test_rudp.cpp, 15 cases (D-631 and D-632 list what they cover).
+
+## D-631 · 2026-10-10 · cellRudp's wire format and protocol, pspocket's own; the test hook on the socket path
+
+Sony's wire format is not known, so pspocket's RUDP has its own (runtime/hle/src/rudp.hpp): it talks only to
+pspocket's; a real PS3 needs Sony's format, and PSN play is gone. Each packet is one UDP (or UDP P2P) datagram: a
+32-byte header, big-endian (magic 0x5052, version 1, type, flags, the RST's reason, the segment's retries, the source
+and destination vports, sequence number, acknowledgement, a 32-bit selective acknowledgement, the window in bytes, the
+sender's time stamp), then the payload. Types: SYN, SYN-ACK, ACK, DATA, PROBE, FIN, RST.
+- **Connections.** Each side starts its sequence numbers at random; SYN and SYN-ACK carry the connection's parameters
+  (stream or messages, delivery and order guarantees, the sender's maximum segment size, its receive buffer). The
+  handshake is TCP's: SYN, SYN-ACK, ACK, and two SYNs that cross (two Initiates, or Activates) make a simultaneous
+  open. A SYN at a vport where nothing is bound is refused (RST "refused": CONN_REFUSED); one at a bound context that
+  has not started yet, or has another peer, is dropped and comes again (so two Initiates a moment apart still meet);
+  an Activate's SYN is marked soft and is never refused. The parameters must agree (RST "transport" or "quality": the
+  mismatch errors on both sides); another version gets RST "version". The segment size is the smaller of the two
+  sides' (cellRudpSetMaxSegmentSize: header and payload in one datagram, 1400 by default, 128 to 65507).
+- **Data.** Messages are a segment each (MAX_PAYLOAD at most a segment's payload); a stream's bytes are cut into
+  segments of the payload, a part segment held while others are in flight for up to AGGREGATION_TIMEOUT unless NODELAY,
+  Flush or LATENCY_CRITICAL. The receiver acknowledges every segment (on DATA it sends, or an ACK) with its next
+  expected sequence number, the 32 after it it has, and its window (RCVBUF less what waits to be read); it takes a
+  segment or two past the window rather than drop it. Reliable and ordered: segments ahead are kept until the hole
+  fills; reliable and unordered: each message as it comes, the sequence numbers kept until the earlier ones came;
+  without delivery guarantees nothing is sent again, the receiver acknowledges the highest it has seen, and ordered
+  delivery drops a message older than one already given (so with neither guarantee each message comes once at most).
+- **Flow and congestion.** The sender keeps within the peer's window (one segment past it when nothing is in flight, so
+  a window under a segment never stalls) and within a congestion window (4 segments at first, slow start to 32, then a
+  segment an RTT, at most 128), halved once in a recovery episode. A segment the peer lacks that went before one it
+  has is lost once an RTT and a quarter more (a millisecond at least) has passed (RACK, RFC 8985, simplified) and goes
+  again at once; the retransmission timeout (Jacobson and Karels' RTO, 20 ms to 1 s, 200 ms at first, doubled on each
+  timeout) catches the rest. A shut window is probed (PROBE) every two RTOs, a second at most. Without delivery
+  guarantees a segment not acknowledged within the RTO counts as lost.
+- **Keep-alive and the end.** A connection idle for KEEP_ALIVE_INTERVAL sends a PROBE, which the peer acknowledges;
+  nothing heard for KEEP_ALIVE_TIMEOUT ends it with KEEP_ALIVE_FAILURE. cellRudpTerminate sends a FIN after what was
+  written; the peer goes to CLOSE_WAIT (END_OF_DATA once read, CLOSED with no error to its handler), and its own
+  Terminate sends its FIN; a terminated connection lingers until its FIN is acknowledged and the peer's has come, at
+  most CLOSE_WAIT_TIMEOUT, then sends a RST. A socket whose last context and connection are gone is released (D-632).
+- **The test hook** (rudp::set_send_filter): every packet the library sends goes through the process's filter, outside
+  the library's lock, which sends it, drops it or holds it back behind the next one; the tests make loss and reordering
+  with it.
+Tests (tests/hle/test_rudp.cpp): Listen and Accept, two Initiates (at once, and one 100 ms after the other), Activate
+and Initiate (either first) and two Activates, over UDP and UDP P2P sockets; 200 messages in order with their read
+information; a stream of 100 KB read in pieces of every size; 5,000 small messages in flight at once; every third DATA
+segment lost and every fifth held behind the next, for each pair of guarantees and a stream (every message once, in
+order when ordered, retransmissions and losses counted; without delivery guarantees nothing sent again); a reader that
+does not read stopping the writer at its window and buffer, WRITABLE and FLUSHED; refused, timed out, keep-alive, the
+transport, quality and version mismatches; a crafted RST.
+
+## D-632 · 2026-10-10 · cellRudp's I/O: the internal thread, ProcessEvents and NetReceived, the mux modes, the handlers
+
+pspocket's network is a console without a link (D-523): datagrams go between the game's own sockets, so two contexts of
+one process connect over loopback; two processes cannot (one HLE process runs at a time, and lv2's loopback is a
+process's own). The library is a client of lv2's network calls (sendto, recvfrom, socketpoll, getsockname, the socket
+information), as Sony's is of libnet. How the I/O runs was decided (to check on the Mac, D-633):
+- **CELL_RUDP_MUXMODE_NORMAL**: the library does the socket's I/O. It sends with sendto from the thread that has
+  something to send (a Write sends at once); it reads the socket on the internal I/O thread, or, without one, in
+  cellRudpProcessEvents.
+- **CELL_RUDP_MUXMODE_RAW**: the game does it. Each packet goes to the event handler (CELL_RUDP_EVENT_SEND: the socket,
+  the bytes, the address and its length, the handler's argument; the handler sends it), and what the game receives it
+  gives to cellRudpNetReceived, which takes datagrams for either mode. When a socket's last context and connection are
+  gone, the event handler hears CELL_RUDP_EVENT_SOCKET_RELEASED.
+- **cellRudpEnableInternalIOThread(stack, priority)**: a PPU thread of the game's process (sysPrxForUser's
+  sys_ppu_thread_create, an internal HLE function its entry, "_cellRudpIOThread"; stack 16 KB to 1 MB and priority 0 to
+  3071, clamped with a warning) that reads the NORMAL sockets, waiting in lv2's socketpoll for a datagram or the next
+  timer (10 ms at most), and runs the timers; cellRudpEnd stops and joins it. Its guest buffers come from the main
+  area.
+- **cellRudpProcessEvents(timeout)**: the same on the calling thread, once; with a timeout (microseconds) it first waits
+  up to that long for a datagram or a timer when nothing was there. It works with the I/O thread as well; called from
+  a handler the library's I/O is running it answers THREAD_IN_USE.
+- **The handlers** run on the thread that processed what caused their events (the I/O thread, or the game's in
+  NetReceived or ProcessEvents); the library holds no lock while guest code runs, so a handler may call it. The events
+  and the packets a call makes are gathered under the library's lock and given out after it; a guest function that is
+  not guest memory is logged and not called.
+- **Blocking calls** (Read, Write, Flush, Accept, PollWait) wait as lv2's network calls do: parked on lv2 waiters,
+  shown in the thread report as network waits, woken by every change, ended by the process's end. Without the I/O
+  thread, nothing moves while a game's only thread waits: as on a console, it must call ProcessEvents.
+- **A socket the game closes** under its contexts is no longer read: lv2's socketpoll answers POLLNVAL for it at once
+  (each poll would end at once and the I/O thread spin), so the library marks it closed with one warning and polls the
+  others, whose connections go on. What its own contexts send is lost (sendto fails) until they time out or are
+  terminated. cellRudpBind to a socket number that is open again (lv2 hands closed numbers out anew once all 1,000
+  have been used) reads it again.
+- Packets up to 4 KB are staged in guest memory on the sending thread's stack, larger ones in the main area.
+Tests (tests/hle/test_rudp.cpp): the I/O thread in most cases; the game's own I/O with ProcessEvents (nothing before it
+is called) and with RAW sockets, the handler sending with sendto and the test giving each datagram to NetReceived
+(ProcessEvents leaves RAW sockets alone), SOCKET_RELEASED for both sockets; a blocked Read woken by data, and by End;
+PollWait ended by PollCancel and PollDestroy; a handler calling ProcessEvents (THREAD_IN_USE) on the I/O thread and on
+the game's; THREAD_IN_USE for a second I/O thread; every call before Init and every argument check; the records from
+the game's allocator, MEMORY and TOO_MANY_CONTEXTS; a socket closed under a bound context (one warning; lv2's polls
+counted in its log over 200 ms of quiet: about 20, all of the two others, where the I/O thread spun 16,866 times
+before), the other connection going on, and the socket's number handed out again with a new connection on it.
