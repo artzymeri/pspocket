@@ -7,7 +7,8 @@
 // string itself (RPCS3 has no dictionary: a TODO), and confirming takes the input as typed. The states and their
 // checks are RPCS3's (BEFORE_INPUT, BEFORE_CONVERT, CONVERTING, CANDIDATES...). Extension characters allowed by
 // default depend on the game's SDK version (before 3.6: two sets, after: three). The handle is RPCS3's 0xF0000000;
-// as in RPCS3, no call checks it. cellImeJpOpenExt is an RPCS3 stub (rpcs3_stubs.inc).
+// as in RPCS3, no call checks it. cellImeJpOpenExt (RPCS3: a todo with no arguments) is pspocket's own, unverified
+// (D-674, D-594): Open3's form (container, handle, the list of four dictionaries), its further arguments not read.
 //
 // Difference from RPCS3: pointers are checked before use (D-042): memory that isn't guest memory is logged with the call
 // site and refused with CELL_IMEJP_ERROR_PARAM before anything changes (RPCS3 faults).
@@ -229,6 +230,15 @@ s32 cellImeJpOpen2(PPUContext& ctx, u32 container, u32 handle, u32 dic)
 s32 cellImeJpOpen3(PPUContext& ctx, u32 container, u32 handle, u32 dic)
 {
     return open(ctx, "cellImeJpOpen3", container, handle, dic, true);
+}
+
+// D-674: OpenExt as the newest Open, Open3 (container, handle, four dictionaries): what an extended form of it adds
+// (r6 on) is not known and not read. Should its third argument be one CellImeJpAddDic (Open2's), its path's first
+// bytes read as four pointers are logged as not guest memory and noted as nothing; the container and the handle,
+// the only arguments every Open takes, are as Open's.
+s32 cellImeJpOpenExt(PPUContext& ctx, u32 container, u32 handle, u32 dic)
+{
+    return open(ctx, "cellImeJpOpenExt", container, handle, dic, true);
 }
 
 // The calls on an open IME whose state must satisfy `allowed`: CONTEXT when closed, ERR when the state doesn't fit.
@@ -610,6 +620,7 @@ void register_cellImeJp(Registry& r)
         PS_HLE_FUNC(0x44608862, cellImeJpOpen),
         PS_HLE_FUNC(0x47B43DD4, cellImeJpOpen2),
         PS_HLE_FUNC(0x1B119958, cellImeJpOpen3),
+        PS_HLE_UNVERIFIED(0xCEB2EB36, cellImeJpOpenExt), // D-674
         PS_HLE_FUNC(0x46D1234A, cellImeJpClose),
         PS_HLE_FUNC(0x24E9D8FC, cellImeJpSetKanaInputMode),
         PS_HLE_FUNC(0xF5992EC8, cellImeJpSetInputCharType),
