@@ -314,7 +314,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-10: 5,758 of 6,625, 86.9%):
+firmware module. Done so far (2026-10-10: 5,993 of 6,625, 90.5%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -368,14 +368,30 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   PRX segments and module tables read or written past their buffers; the JPEG decoder's tables; the AC-3 core's short
   units; cellPngEnc's palette pictures; the SPU interpreter's address overflow. The tree builds and tests without
   FFmpeg too (D-606).
-Left (867, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
+- Offline services and small libraries, firmware-first (D-635 to D-639): cellNetAoi (a console with no ad hoc
+  wireless: its peers kept, none reached), libmedi and libad_core/libad_async (their contexts kept, every service
+  call offline, nothing signed with a key only a PS3 holds), cellLibprof (user trace registrations kept, no
+  profiler), cellSysmodule's export 0x59521326 (the OpenPSID decrypted with RPCS3's key, read at build time like the
+  SELF keys) and s_sysmodule_context.
+- libsre's last functions, unverified (D-625 to D-629): cellSpurs' taskset 2 (CreateTask2, CreateTask2WithBinInfo,
+  JoinTask2, TryJoinTask2, DestroyTaskset2), the task exit code containers, the LF queue's bodies and lv2 event queue
+  through SPURS, the job pipeline's information and the utility's system workload; cellSync's LF queue second forms
+  for ANY2ANY queues and its event queue. A comparison with libsre is ready for the Mac ("[compare][spurs-task2]").
+- cellJpgEnc on a baseline JPEG encoder of pspocket's own written from T.81 (D-615, D-616: firmware-first, its
+  structures inferred from libpngenc's; a comparison with libjpgenc ready for the Mac, D-618) and cellJpgDec's Ext
+  functions, unverified (D-617). Fixed on the way: the JPEG decoder allocated what a damaged header claimed (up to
+  13 GB) before decoding; it now takes the memory only to decode (D-619).
+- libsynth2, the PS2's sound chip as a PS3 library, firmware-first (D-610 to D-614): an SPU2 of pspocket's own
+  (two cores of 24 voices over 2 MB of sound memory: VAG ADPCM, pitch and its modulation, ADSR, noise, the voice mixes
+  and each core's reverb), behind libsd's calls and register numbers. A comparison with Sony's libsynth2 is ready for
+  the Mac ("[compare][synth2]"); the first thing to check is what Generate puts in the surround outputs.
+Left (632, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSailRec (58)
-  and cellSail's playback (19, libsail), libsnd3 (50) and libsynth2 (17), cellRudp (28, its wire protocol), the codec
+  and cellSail's playback (19, libsail), libsnd3 (50), cellRudp (28, its wire protocol), the codec
   cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 6, and
-  the audio cores' operation tables and PTS functions, about 160 in all), cellJpgEnc (10, its structures), cellCelpEnc and
-  cellCelp8Enc (19), cellJpgDec's Ext functions (5), cellNetAoi, libmedi, libad_core/async (32), cellSpurs' 13
-  and cellSync's 6 (libsre: Task2, the LF queues' second forms), and the small ones
-  (sys_lv2coredump, cellLibprof, cellSysconfPs1emu, cellGamePs1Emu, cellSysmodule's two,
+  the audio cores' operation tables and PTS functions, about 160 in all), cellCelpEnc and
+  cellCelp8Enc (19), and the small ones
+  (sys_lv2coredump, cellSysconfPs1emu, cellGamePs1Emu,
   module management's six).
 - The 188 functions answered as RPCS3's stubs, in libraries pspocket always serves: their arguments and answers from
   the libraries' modules.

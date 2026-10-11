@@ -608,6 +608,35 @@ s32 cellSpursSetPreemptionVictimHints(PPUContext& ctx, u32 spurs, u32 is_preempt
     return lv2::CELL_OK;
 }
 
+// cellSpursRemoveSystemWorkloadForUtility(spurs) (D-629, unverified: RPCS3 has an UNIMPLEMENTED stub answering
+// CELL_OK; libsre was not read): an instance made with the system workload (cellSpursAttributeEnableSystemWorkload,
+// which lends some of its SPUs to the system's own SPU work) gives it up, so that a system utility a game starts can
+// have those SPUs. A native SPURS lends no SPU (it has no system workload running, as RPCS3's, D-171): the removal
+// only takes the instance's SAF_SYSTEM_WORKLOAD_ENABLED flag away, so that what needs the system workload
+// (cellSpursSetPreemptionVictimHints) is PERM afterwards, as for an instance made without one. Checks, as the victim
+// hints' (libsre's): NULL, ALIGN, memory (NULL_POINTER, as that function's, D-042); an instance in exception state
+// STAT; one without the system workload (or that gave it up already) PERM.
+s32 cellSpursRemoveSystemWorkloadForUtility(PPUContext& ctx, u32 spurs)
+{
+    constexpr std::string_view fn = "cellSpursRemoveSystemWorkloadForUtility";
+    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "SPURS instance", spurs, CELL_SPURS_SIZE, CELL_SPURS_CORE_ERROR_NULL_POINTER);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_CORE_ERROR_STAT);
+    for (u32 flags = atomic_load_be32(base, spurs + spurs_off::flags);;) {
+        if (!(flags & SAF_SYSTEM_WORKLOAD_ENABLED)) return error(CELL_SPURS_CORE_ERROR_PERM);
+        const u32 seen = atomic_cas_be32(base, spurs + spurs_off::flags, flags, flags & ~SAF_SYSTEM_WORKLOAD_ENABLED);
+        if (seen == flags) break;
+        flags = seen;
+    }
+    PS_LOG_INFO(kChan, "{}(SPURS {:#x}): the system workload is given up (it lent no SPU natively)", fn, spurs);
+    return lv2::CELL_OK;
+}
+
 // cellSpurs 0xE279681F, a libsre export no SDK names (0xF664): NULL (both), ALIGN, then the word at CellSpurs + 0x10
 // (the first four idle SPU counts, or SPURS2's ready counts of workloads 16..19).
 s32 cellSpurs_E279681F(PPUContext& ctx, u32 spurs, u32 out)
@@ -1665,6 +1694,11 @@ s32 create_taskset(u8* base, u32 spurs, u32 taskset, u64 args, const u8 (&priori
     ps_write64(base, taskset + ts_off::args, args);
     ps_write8(base, taskset + ts_off::enable_clear_ls, enable_clear_ls > 0 ? 1 : 0);
     ps_write32(base, taskset + ts_off::size, size);
+    {
+        SpursHost& h = host(); // a CellSpursTaskset2 that was here before: its unjoined tasks are gone (D-626)
+        std::lock_guard lock(h.mutex);
+        h.task2.erase(taskset);
+    }
 
     u32 wid = 0;
     if (const s32 r = add_workload(base, spurs, wid, SPURS_IMG_ADDR_TASKSET_PM, kTasksetPmSize, taskset, priority, 8,
@@ -1761,8 +1795,8 @@ s32 _cellSpursTasksetAttribute2Initialize(PPUContext& ctx, u32 attr, u32 revisio
 // event flags "taskset2" (priority protocol, waiters multiple) at 0x1898 and 0x189C, which cellSpursJoinTask2 waits on,
 // and the task name buffer, cleared (4 KB) and kept at 0x18A8. An event flag that cannot be created gives lv2's error
 // (the first one is destroyed when the second fails, as libsre; the workload stays added, as libsre). Tasks created with
-// cellSpursCreateTask run in it as in any taskset; CellSpursTaskset2's own tasks (cellSpursCreateTask2, JoinTask2) are
-// not implemented (D-171).
+// cellSpursCreateTask run in it as in any taskset; its own tasks (cellSpursCreateTask2, JoinTask2) are D-626's. The
+// IDs a previous taskset at the same address left unjoined are forgotten.
 s32 cellSpursCreateTaskset2(PPUContext& ctx, u32 spurs, u32 taskset, u32 attr)
 {
     constexpr std::string_view fn = "cellSpursCreateTaskset2";
@@ -2502,6 +2536,19 @@ struct TaskSpec {
     u32 elf = 0, context = 0, context_size = 0, pattern = 0, args = 0;
 };
 
+// What a CellSpursTaskset2's tasks add: flags for the TaskInfo's ELF word (bit 0 an exit callback, bit 2 a
+// CellSpursTaskset2 task), the exit callback's descriptor and argument for the task's exit slot and the exit code
+// container it binds (cellSpursCreateTaskWithAttribute, D-627), a Task2 task and its name for the task name buffer
+// (cellSpursCreateTask2, D-626).
+struct TaskExtras {
+    u32 elf_flags = 0;
+    bool exit_callback = false;
+    u64 callback = 0, callback_arg = 0;
+    u32 container = 0;
+    bool task2 = false;
+    std::string name;
+};
+
 // libsre's task checks, in its order; _cellSpursTaskAttributeInitialize runs the same ones as task creation. ELF
 // NULL; ELF 16-byte and context 16-byte aligned (128-byte from SDK 0x280000, the process' SDK version); a context of
 // at least 1 KB; the ELF (check_task_elf); with a context and a pattern, a pattern of at most as many blocks as the
@@ -2598,7 +2645,12 @@ s32 _cellSpursSendSignal(PPUContext& ctx, u32 taskset, u32 task_id)
 // argument is zero without one, the pattern without a context or a pattern), then the start: the task's pending-ready
 // bit, cellSpursSendWorkloadSignal (its result ignored, as libsre) and cellSpursWakeUp, whose STAT becomes
 // TASK_ERROR_STAT (libsre asserts on any other error). The ID is written only when all of that succeeded.
-s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id_out, const TaskSpec& s)
+// In a CellSpursTaskset2, the IDs of its own tasks that exited and were not joined are passed by too (D-626), and
+// before the start `x` adds the ELF word's flags, the task's exit slot (an exit callback's descriptor and argument, or
+// a Task2 task's cleared), the exit code container bound to the task (its status word's bit 0, the stored code's bit 2
+// cleared: D-627), and for a Task2 task its name in the task name buffer and its bit of the lv2 event flag cleared.
+s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id_out, const TaskSpec& s,
+    const TaskExtras& x = {})
 {
     if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
     lv2::PpuThread& t = thread_of(ctx);
@@ -2609,19 +2661,26 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
     if (s.args) {
         if (const s32 rc = task_readable(ctx, what, "task argument", s.args, 16); rc != lv2::CELL_OK) return rc;
     }
-    if (const s32 rc = task_readable(ctx, what, "taskset", taskset, ts_off::task_info + CELL_SPURS_MAX_TASK *
-            ts_off::task_info_stride);
-        rc != lv2::CELL_OK) {
-        return rc;
+    if (const s32 rc = task_readable(ctx, what, "taskset", taskset, ts_off::size + 4); rc != lv2::CELL_OK) return rc;
+    const bool second = ps_read32(base, taskset + ts_off::size) >= kTaskset2MinSize;
+    if (second) {
+        if (const s32 rc = task_readable(ctx, what, "taskset", taskset, kTaskset2Size); rc != lv2::CELL_OK) return rc;
+    }
+    u128 unjoined = 0;
+    if (second) {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.task2.find(taskset); it != h.task2.end()) unjoined = it->second.unjoined;
     }
 
     u32 id = CELL_SPURS_MAX_TASK;
-    reservation_op(base, taskset, [&id](u8* line) {
+    reservation_op(base, taskset, [&id, unjoined](u8* line) {
         id = CELL_SPURS_MAX_TASK;
         for (u32 w = 0; w < 4; w++) {
             const u32 enabled = ps_read32(line, ts_off::enabled + 4 * w);
-            if (enabled == 0xFFFFFFFF) continue;
-            const u32 bit = static_cast<u32>(std::countl_one(enabled));
+            const u32 taken = enabled | static_cast<u32>(unjoined >> (96 - 32 * w));
+            if (taken == 0xFFFFFFFF) continue;
+            const u32 bit = static_cast<u32>(std::countl_one(taken));
             id = 32 * w + bit;
             ps_write32(line, ts_off::enabled + 4 * w, enabled | (0x80000000u >> bit));
             return true;
@@ -2629,12 +2688,42 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
         return false;
     });
     if (id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_AGAIN);
+    if (x.task2) {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        h.task2[taskset].unjoined |= u128{1} << (127 - id);
+    }
 
     const u32 info = taskset + ts_off::task_info + id * ts_off::task_info_stride;
-    ps_write64(base, info + ts_off::ti_elf, s.elf);
+    ps_write64(base, info + ts_off::ti_elf, s.elf | x.elf_flags);
     ps_write64(base, info + ts_off::ti_context, u64{s.context | saved_blocks});
     write_ls_pattern(base, info + ts_off::ti_args, s.args ? read_ls_pattern(base, s.args) : 0);
     write_ls_pattern(base, info + ts_off::ti_ls_pattern, s.context && s.pattern ? read_ls_pattern(base, s.pattern) : 0);
+    if (second && (x.exit_callback || x.task2)) {
+        const u32 slot = taskset + ts_off::exit_slots + 16 * id;
+        reservation_op(base, slot, [&x, slot](u8* line) {
+            const u32 off = slot & (PS_RES_LINE_SIZE - 1);
+            ps_write64(line, off, x.exit_callback ? x.callback : 0);
+            ps_write64(line, off + 8, x.exit_callback ? x.callback_arg : 0);
+            return true;
+        });
+    }
+    if (x.container) {
+        reservation_op(base, x.container, [](u8* line) {
+            ps_write32(line, exitcode_off::status, (ps_read32(line, exitcode_off::status) | kExitCodeInitialized) &
+                ~kExitCodeStored);
+            return true;
+        });
+    }
+    if (x.task2) {
+        const u32 names = static_cast<u32>(ps_read64(base, taskset + ts_off::task_name_buffer));
+        const u32 at = names + CELL_SPURS_MAX_TASK_NAME_LENGTH * id;
+        if (names && guest_readable(t, at, CELL_SPURS_MAX_TASK_NAME_LENGTH)) {
+            std::memset(base + at, 0, CELL_SPURS_MAX_TASK_NAME_LENGTH);
+            std::memcpy(base + at, x.name.data(), std::min<usize>(x.name.size(), CELL_SPURS_MAX_TASK_NAME_LENGTH - 1));
+        }
+        lv2::sys_event_flag_clear(t, ps_read32(base, taskset + task2_flag_offset(id)), ~task2_flag_bit(id));
+    }
 
     // Task start.
     reservation_op(base, taskset, [id](u8* line) {
@@ -2767,6 +2856,11 @@ s32 cellSpursTaskExitCodeInitialize(PPUContext& ctx, u32 container)
 // NULL, attr 8-byte aligned, revision 1 (INVAL). An exit code container needs a CellSpursTaskset2 (PERM for a
 // CellSpursTaskset; a misaligned one is a libsre assertion). Then create_task with the attribute's ELF, context and
 // size (the low words of the u64 fields, as libsre) and its pattern and argument, which always exist (zero when unset).
+// With a container (D-627, unverified: libsre's creation was not read past its checks) the task gets an exit callback
+// (the ELF word's bit 0): the taskset's exit code handler (the descriptor CellSpursTaskset2 keeps at 0x1900, run
+// natively by the taskset policy) with the container as its argument in the task's exit slot, and the container is
+// bound (its status' bit 0, "initialized", which libsre's handler requires; a code stored before is forgotten). A
+// container that is not guest memory is TASK_ERROR_FAULT (D-042).
 s32 cellSpursCreateTaskWithAttribute(PPUContext& ctx, u32 taskset, u32 task_id, u32 attr)
 {
     constexpr std::string_view what = "cellSpursCreateTaskWithAttribute";
@@ -2781,6 +2875,7 @@ s32 cellSpursCreateTaskWithAttribute(PPUContext& ctx, u32 taskset, u32 task_id, 
     if (ps_read32(base, attr + taskattr_off::revision) != CELL_SPURS_TASK_ATTRIBUTE_REVISION) {
         return error(CELL_SPURS_TASK_ERROR_INVAL);
     }
+    TaskExtras x;
     if (const u64 container = ps_read64(base, attr + taskattr_off::exit_code_container)) {
         if (container % 128) {
             PS_FATAL(kChan, "{}: exit code container {:#x} is not 128-byte aligned; libsre (fw 4.92) asserts here and "
@@ -2788,13 +2883,275 @@ s32 cellSpursCreateTaskWithAttribute(PPUContext& ctx, u32 taskset, u32 task_id, 
         }
         if (const s32 rc = task_readable(ctx, what, "taskset", taskset, ts_off::size + 4); rc != lv2::CELL_OK) return rc;
         if (ps_read32(base, taskset + ts_off::size) < kTaskset2MinSize) return error(CELL_SPURS_TASK_ERROR_PERM);
-        PS_LOG_ERROR(kChan, "{}: exit code container {:#x} on a CellSpursTaskset2 is not implemented", what, container);
-        return error(CELL_SPURS_TASK_ERROR_STAT);
+        if (const s32 rc = task_readable(ctx, what, "exit code container", static_cast<u32>(container),
+                exitcode_off::size);
+            rc != lv2::CELL_OK) {
+            return rc;
+        }
+        x.elf_flags = 1;
+        x.exit_callback = true;
+        x.callback = ps_read64(base, taskset + ts_off::exit_code_handler);
+        x.callback_arg = container;
+        x.container = static_cast<u32>(container);
     }
     const TaskSpec s{static_cast<u32>(ps_read64(base, attr + taskattr_off::elf)),
         static_cast<u32>(ps_read64(base, attr + taskattr_off::context)), ps_read32(base, attr + taskattr_off::context_size),
         attr + taskattr_off::ls_pattern, attr + taskattr_off::args};
-    return create_task(ctx, what, taskset, task_id, s);
+    return create_task(ctx, what, taskset, task_id, s, x);
+}
+
+s32 task_error(s32 rc); // the event flags' (below)
+
+// How long a blocked exit code Get sleeps on the container's line before it looks again (plain guest stores don't wake
+// it; the process ending is noticed at this rate), as cellSync's blocking calls.
+constexpr u64 kWaitPollNs = 1'000'000;
+
+// cellSpursTaskExitCodeGet(container, exitCode) and cellSpursTaskExitCodeTryGet (D-627, unverified: RPCS3 has
+// UNIMPLEMENTED stubs answering CELL_OK, libsre's PPU side was not read): the exit code of the task bound to an exit
+// code container (cellSpursCreateTaskWithAttribute), which libsre's exit code handler stores when the task exits
+// (natively: spurs_taskset.cpp, D-195). Checks as cellSpursTaskExitCodeInitialize's: NULL (either pointer), the
+// container's 128-byte ALIGN; memory (FAULT, D-042). Then, from one look at the container's line: not initialized (no
+// task was ever bound to it) STAT; the code stored: written to exitCode, CELL_OK (as often as asked: the code stays
+// until a task is bound to the container again); else TryGet answers BUSY (as the SPURS Try functions,
+// cellSpursEventFlagTryWait), and Get sleeps until the line changes (the handler's update) and looks again, as
+// cellSync's blocking calls do (D-169); the process ending unwinds it. pspocket's Get marks nothing in the container
+// (libsre's PPU waiter sets bit 16 and waits on an event flag at +0x40, which the native handler would not need).
+s32 exit_code_get(PPUContext& ctx, std::string_view fn, u32 container, u32 exit_code, bool block)
+{
+    if (!container || !exit_code) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (container % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = task_readable(ctx, fn, "container", container, exitcode_off::size); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = task_readable(ctx, fn, "exit code", exit_code, 4); rc != lv2::CELL_OK) return rc;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    for (;;) {
+        alignas(16) u8 line[PS_RES_LINE_SIZE];
+        const u64 version = ps_res_acquire(base, container, line);
+        const u32 status = ps_read32(line, exitcode_off::status);
+        if (!(status & kExitCodeInitialized)) return error(CELL_SPURS_TASK_ERROR_STAT);
+        if (status & kExitCodeStored) {
+            ps_write32(base, exit_code, ps_read32(line, exitcode_off::code));
+            return lv2::CELL_OK;
+        }
+        if (!block) return error(CELL_SPURS_TASK_ERROR_BUSY);
+        if (lv2::wait_aborted(t.waiter)) throw lv2::ThreadExit{};
+        ps_res_wait_change(container, version, kWaitPollNs);
+        if (lv2::wait_aborted(t.waiter)) throw lv2::ThreadExit{};
+    }
+}
+
+s32 cellSpursTaskExitCodeGet(PPUContext& ctx, u32 container, u32 exit_code)
+{
+    return exit_code_get(ctx, "cellSpursTaskExitCodeGet", container, exit_code, true);
+}
+
+s32 cellSpursTaskExitCodeTryGet(PPUContext& ctx, u32 container, u32 exit_code)
+{
+    return exit_code_get(ctx, "cellSpursTaskExitCodeTryGet", container, exit_code, false);
+}
+
+// ------------------------------------------------------------------------------------------- CellSpursTaskset2's tasks
+//
+// cellSpursCreateTask2, CreateTask2WithBinInfo, JoinTask2, TryJoinTask2 and DestroyTaskset2 (D-626, unverified: RPCS3
+// has UNIMPLEMENTED stubs and declares no signatures; libsre was not read). What they are made from: the structures
+// RPCS3 does lay out (CellSpursTaskAttribute2 {revision, sizeContext, eaContext (u64), lsPattern, name}, which
+// _cellSpursTaskAttribute2Initialize fills; CellSpursTaskBinInfo {eaElf (u64), sizeContext, reserved, lsPattern};
+// CellSpursTaskset2's task_exit_code[128] at 0x1980), what cellSpursCreateTaskset2 makes for them as libsre does (the
+// Task2 handler's descriptor at 0x78, two lv2 event flags "taskset2" that cellSpursJoinTask2 waits on, the task name
+// buffer of 128 names of 32 bytes) and the SDK's signatures as far as they are known:
+//   cellSpursCreateTask2(taskset, &id, eaElf, argument, attribute)
+//   cellSpursCreateTask2WithBinInfo(taskset, &id, binInfo, argument, contextBuffer, name, reserved)
+//   cellSpursJoinTask2(taskset, id, &exitCode), cellSpursTryJoinTask2(...), cellSpursDestroyTaskset2(taskset)
+// A Task2 task is a task of the taskset (create_task: its checks, the lowest free ID, its TaskInfo, its start) whose ELF
+// word has bit 2, which libsre's policy module runs the Task2 handler for at its exit (natively spurs_taskset.cpp
+// task2_exit: the exit code into its exit slot, its bit of the event flag for its half set). Its ID stays taken from
+// its creation until it is joined (SpursHost::task2), as a thread's resources stay until pthread_join: a task created
+// meanwhile cannot take it and overwrite the code. Every function checks the taskset first: NULL, 128-byte ALIGN,
+// memory (FAULT, D-042), a CellSpursTaskset2 (PERM for a CellSpursTaskset, as an exit code container on one is).
+
+s32 check_taskset2(PPUContext& ctx, std::string_view fn, u32 taskset)
+{
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = task_readable(ctx, fn, "taskset", taskset, ts_off::size + 4); rc != lv2::CELL_OK) return rc;
+    if (ps_read32(guest_base(ctx), taskset + ts_off::size) < kTaskset2MinSize) return error(CELL_SPURS_TASK_ERROR_PERM);
+    return task_readable(ctx, fn, "taskset", taskset, kTaskset2Size);
+}
+
+// A Task2 task's creation once the call's own arguments are read: the task's checks (check_task's, as create_task
+// makes them, first), then the taskset's two event flags must exist (STAT: a taskset made without
+// cellSpursCreateTaskset2, through the attribute's size, has none to join on), the name (up to 31 characters, as the
+// 32-byte slots of the name buffer hold) readable (FAULT); then create_task as a Task2 task.
+s32 create_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 task_id, const TaskSpec& s, u32 name)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    u32 saved_blocks = 0;
+    if (const s32 rc = check_task(ctx, fn, s, saved_blocks); rc != lv2::CELL_OK) return rc;
+    for (const u32 off : {ts_off::event_flag_id1, ts_off::event_flag_id2}) {
+        if (!t.kernel.event_flag(ps_read32(base, taskset + off))) {
+            PS_LOG_ERROR(kChan, "{}({:#x}): the taskset has no lv2 event flag at +{:#x} (not made by "
+                "cellSpursCreateTaskset2); refused with CELL_SPURS_TASK_ERROR_STAT", fn, taskset, off);
+            return error(CELL_SPURS_TASK_ERROR_STAT);
+        }
+    }
+    TaskExtras x;
+    x.elf_flags = 4;
+    x.task2 = true;
+    if (name) {
+        const GuestString n = read_cstr(t, name, CELL_SPURS_MAX_TASK_NAME_LENGTH - 1);
+        if (n.faulted) return task_readable(ctx, fn, "task name", name + static_cast<u32>(n.text.size()), 1);
+        x.name = n.text;
+    }
+    const s32 rc = create_task(ctx, fn, taskset, task_id, s, x);
+    if (rc == lv2::CELL_OK) {
+        PS_LOG_DEBUG(kChan, "{}: task {} \"{}\" of CellSpursTaskset2 {:#x}", fn, ps_read32(base, task_id), x.name,
+            taskset);
+    }
+    return rc;
+}
+
+// cellSpursCreateTask2(taskset, id, eaElf, argument, attribute): id and taskset NULL, the taskset's checks; then the
+// attribute (CellSpursTaskAttribute2; NULL: no context, no pattern, no name) gives the context, its size, the LS
+// pattern and the name. Its revision and alignment are not checked (what libsre wants of them is not known; a game's
+// attribute comes from _cellSpursTaskAttribute2Initialize, which takes the revision it is given). create_task checks
+// the ELF, the context and the pattern as for any task.
+s32 cellSpursCreateTask2(PPUContext& ctx, u32 taskset, u32 task_id, u32 elf, u32 argument, u32 attribute)
+{
+    constexpr std::string_view fn = "cellSpursCreateTask2";
+    if (!task_id || !taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
+    TaskSpec s{elf, 0, 0, 0, argument};
+    u32 name = 0;
+    if (attribute) {
+        if (const s32 rc = task_readable(ctx, fn, "attribute", attribute, 0x24); rc != lv2::CELL_OK) return rc;
+        u8* base = guest_base(ctx);
+        s.context_size = ps_read32(base, attribute + 0x04);
+        s.context = static_cast<u32>(ps_read64(base, attribute + 0x08));
+        s.pattern = attribute + 0x10;
+        name = ps_read32(base, attribute + 0x20);
+    }
+    return create_task2(ctx, fn, taskset, task_id, s, name);
+}
+
+// cellSpursCreateTask2WithBinInfo(taskset, id, binInfo, argument, contextBuffer, name, reserved): id, taskset and
+// binInfo NULL, the taskset's checks; then the ELF, the context's size and the LS pattern from the CellSpursTaskBinInfo
+// (what the SDK's tools compute from a task's ELF), the context in the buffer given: a bin info that asks for a context
+// with no buffer is NULL_POINTER. The last argument is not read.
+s32 cellSpursCreateTask2WithBinInfo(PPUContext& ctx, u32 taskset, u32 task_id, u32 bin_info, u32 argument, u32 context,
+    u32 name)
+{
+    constexpr std::string_view fn = "cellSpursCreateTask2WithBinInfo";
+    if (!task_id || !taskset || !bin_info) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = task_readable(ctx, fn, "bin info", bin_info, 0x20); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    const u32 size = ps_read32(base, bin_info + 0x08);
+    if (size && !context) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    const TaskSpec s{static_cast<u32>(ps_read64(base, bin_info + 0x00)), context, size, bin_info + 0x10, argument};
+    return create_task2(ctx, fn, taskset, task_id, s, name);
+}
+
+// cellSpursJoinTask2(taskset, id, exitCode) and cellSpursTryJoinTask2: the taskset's checks, an ID past 127 (INVAL),
+// the exit code's memory (it may be NULL: the code is then not written); a task that is not a Task2 task created and
+// not yet joined is SRCH, one another JoinTask2 waits for BUSY. Then the task's bit of its event flag, AND and CLEAR
+// (sys_event_flag_wait; TryJoin: sys_event_flag_trywait, whose EBUSY is TASK_ERROR_BUSY): the exit code from the
+// task's exit slot, the ID free again. A wait that cellSpursDestroyTaskset2 ended (the flag's ECANCELED) is
+// TASK_ERROR_SHUTDOWN; another lv2 error is a task error with its low byte (as the event flag functions convert them).
+s32 join_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 id, u32 exit_code, bool block)
+{
+    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
+    if (id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    if (exit_code) {
+        if (const s32 rc = task_readable(ctx, fn, "exit code", exit_code, 4); rc != lv2::CELL_OK) return rc;
+    }
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    const u128 bit = u128{1} << (127 - id);
+    SpursHost& h = host();
+    {
+        std::lock_guard lock(h.mutex);
+        const auto it = h.task2.find(taskset);
+        if (it == h.task2.end() || !(it->second.unjoined & bit)) return error(CELL_SPURS_TASK_ERROR_SRCH);
+        if (it->second.joining & bit) return error(CELL_SPURS_TASK_ERROR_BUSY);
+        if (block) it->second.joining |= bit;
+    }
+    // The wait ends with the process too (lv2 unwinds the thread): the task is no longer being joined either way.
+    struct Joining {
+        SpursHost& host_state;
+        u32 set;
+        u128 mask;
+        bool active;
+        ~Joining()
+        {
+            if (!active) return;
+            std::lock_guard lock(host_state.mutex);
+            if (const auto it = host_state.task2.find(set); it != host_state.task2.end()) it->second.joining &= ~mask;
+        }
+    } joining{h, taskset, bit, block};
+    const u32 flag = ps_read32(base, taskset + task2_flag_offset(id));
+    constexpr u32 mode = lv2::SYS_EVENT_FLAG_WAIT_AND | lv2::SYS_EVENT_FLAG_WAIT_CLEAR;
+    const s32 rc = block ? lv2::sys_event_flag_wait(t, flag, task2_flag_bit(id), mode, 0, 0)
+                         : lv2::sys_event_flag_trywait(t, flag, task2_flag_bit(id), mode, 0);
+    if (rc != lv2::CELL_OK) {
+        if (rc == lv2::err(lv2::CELL_EBUSY)) return error(CELL_SPURS_TASK_ERROR_BUSY);
+        PS_LOG_WARN(kChan, "{}(taskset {:#x}, task {}): the wait on event flag {:#x}: {}", fn, taskset, id, flag,
+            lv2::error_name(rc));
+        if (rc == lv2::err(lv2::CELL_ECANCELED)) return error(CELL_SPURS_TASK_ERROR_SHUTDOWN);
+        return task_error(rc);
+    }
+    alignas(16) u8 line[PS_RES_LINE_SIZE];
+    const u32 slot = taskset + ts_off::exit_slots + 16 * id;
+    ps_res_acquire(base, slot, line);
+    const u32 code = ps_read32(line, slot & (PS_RES_LINE_SIZE - 1));
+    {
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.task2.find(taskset); it != h.task2.end()) it->second.unjoined &= ~bit;
+    }
+    if (exit_code) ps_write32(base, exit_code, code);
+    PS_LOG_DEBUG(kChan, "{}(taskset {:#x}, task {}): exit code {:#x}", fn, taskset, id, code);
+    return lv2::CELL_OK;
+}
+
+s32 cellSpursJoinTask2(PPUContext& ctx, u32 taskset, u32 id, u32 exit_code)
+{
+    return join_task2(ctx, "cellSpursJoinTask2", taskset, id, exit_code, true);
+}
+
+s32 cellSpursTryJoinTask2(PPUContext& ctx, u32 taskset, u32 id, u32 exit_code)
+{
+    return join_task2(ctx, "cellSpursTryJoinTask2", taskset, id, exit_code, false);
+}
+
+// cellSpursDestroyTaskset2(taskset): the taskset's checks; cellSpursShutdownTaskset and cellSpursJoinTaskset (their
+// errors returned as they are: the taskset stays when one fails), then what cellSpursCreateTaskset2 made for it: both
+// event flags, their waiters woken first (a JoinTask2 still waiting gets TASK_ERROR_SHUTDOWN), destroyed and their IDs
+// cleared, and the tasks not joined forgotten. Tasks that had not run are abandoned with the taskset, as by
+// cellSpursShutdownTaskset (D-136).
+s32 cellSpursDestroyTaskset2(PPUContext& ctx, u32 taskset)
+{
+    constexpr std::string_view fn = "cellSpursDestroyTaskset2";
+    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = cellSpursShutdownTaskset(ctx, taskset); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = cellSpursJoinTaskset(ctx, taskset); rc != lv2::CELL_OK) return rc;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    for (const u32 off : {ts_off::event_flag_id1, ts_off::event_flag_id2}) {
+        const u32 flag = ps_read32(base, taskset + off);
+        if (!flag) continue;
+        lv2::sys_event_flag_cancel(t, flag, 0);
+        if (const s32 rc = lv2::sys_event_flag_destroy(t, flag); rc != lv2::CELL_OK) {
+            PS_LOG_WARN(kChan, "{}({:#x}): destroying event flag {:#x}: {}", fn, taskset, flag, lv2::error_name(rc));
+        }
+        ps_write32(base, taskset + off, 0);
+    }
+    {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        h.task2.erase(taskset);
+    }
+    PS_LOG_INFO(kChan, "{}({:#x}): destroyed", fn, taskset);
+    return lv2::CELL_OK;
 }
 
 // ------------------------------------------------------------------------------------------------- lv2 event queues
@@ -3334,6 +3691,170 @@ s32 cellSpursLFQueueGetTasksetAddress(PPUContext& ctx, u32 queue, u32 taskset)
     return lv2::CELL_OK;
 }
 
+// ------------------------------------------------------------------------------- the LF queue's bodies and lv2 queue
+//
+// _cellSpursLFQueuePushBody, PopBody, cellSpursLFQueueAttachLv2EventQueue and DetachLv2EventQueue (D-628, unverified:
+// RPCS3 has todos answering CELL_OK, libsre was not read). A SPURS LF queue is a CellSyncLFQueue whose eaSignal is its
+// taskset, or its CellSpurs with bit 0 set for one of the whole instance (cellSpursLFQueueInitializeIWL), as
+// _cellSpursLFQueueInitialize leaves it. Its SPU side is task code (or a workload's policy module) that waits in the
+// queue's rings for a signal; its PPU side are these.
+
+// CellSyncLFQueue's fields these use (cellSync.cpp's lfq_off; RPCS3 cellSync.h).
+namespace lfq {
+constexpr u32 h3 = 0x04, h7 = 0x0C, bs = 0x20, direction = 0x24, ea_signal = 0x70, eq_id = 0x7C;
+constexpr u32 SPU2SPU = 0, ANY2ANY = 3;
+}
+
+// A cellSync error from the queue's own functions as a task error with the same low byte (RPCS3's
+// SyncErrorToSpursError, as _cellSpursLFQueueInitialize converts them); other answers pass unchanged.
+s32 sync_to_task_error(s32 rc)
+{
+    const u32 u = static_cast<u32>(rc);
+    return (u & 0xFFFFFF00u) == 0x80410100u ? error(0x80410900u | (u & 0xFF)) : rc;
+}
+
+// The signal a completion gives the SPU waiter it took from the ring: _cellSpursSendSignal(taskset, task) for a
+// taskset's queue, cellSpursSendWorkloadSignal(spurs, workload) for one of the whole instance (its waiters are
+// workloads); their answer is the body's.
+s32 lfqueue_signal(PPUContext& ctx, u32 ea_signal, u32 waiter)
+{
+    if (ea_signal & 1) return cellSpursSendWorkloadSignal(ctx, ea_signal & ~1u, waiter);
+    return _cellSpursSendSignal(ctx, ea_signal, waiter);
+}
+
+// _cellSpursLFQueuePushBody(queue, buffer, isBlocking) and _cellSpursLFQueuePopBody (cellSpursLFQueuePush, TryPush,
+// Pop and TryPop pass 1 or 0): cellSync's bodies (their checks, the first forms for PPU2SPU and SPU2PPU queues, the
+// second for ANY2ANY, D-625) with the signal above where cellSync's pass none, so a task waiting for an entry (or for
+// room) is woken; cellSync's errors as task errors. A blocked call sleeps until the queue's line changes, as cellSync's
+// bodies: it does not wait on an attached lv2 queue (which the pointer functions with useEventQueue do).
+s32 spurs_lfqueue_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push)
+{
+    static const LfSignal signal = lfqueue_signal;
+    return sync_to_task_error(sync_lfqueue_body(ctx, fn, queue, buffer, is_blocking, push, signal));
+}
+
+s32 _cellSpursLFQueuePushBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_blocking)
+{
+    return spurs_lfqueue_body(ctx, "_cellSpursLFQueuePushBody", queue, buffer, is_blocking, true);
+}
+
+s32 _cellSpursLFQueuePopBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_blocking)
+{
+    return spurs_lfqueue_body(ctx, "_cellSpursLFQueuePopBody", queue, buffer, is_blocking, false);
+}
+
+// The checks of the attach and detach: NULL, 128-byte ALIGN, memory (FAULT); an SPU2SPU queue has no PPU side to wake
+// (PERM); `spurs` gets the queue's SPURS instance from eaSignal (the taskset's, which must be guest memory).
+s32 check_spurs_lfqueue(PPUContext& ctx, std::string_view fn, u32 queue, u32& spurs)
+{
+    if (!queue) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (queue % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "queue", queue, 128, CELL_SPURS_TASK_ERROR_FAULT); rc != lv2::CELL_OK) return rc;
+    u8* base = guest_base(ctx);
+    if (ps_read32(base, queue + lfq::direction) == lfq::SPU2SPU) return error(CELL_SPURS_TASK_ERROR_PERM);
+    const u32 signal = static_cast<u32>(ps_read64(base, queue + lfq::ea_signal));
+    if (signal & 1) {
+        spurs = signal & ~1u;
+        return lv2::CELL_OK;
+    }
+    if (const s32 rc = check_pointer(ctx, fn, "taskset", signal, ts_off::size, CELL_SPURS_TASK_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    spurs = static_cast<u32>(ps_read64(base, signal + ts_off::spurs));
+    return lv2::CELL_OK;
+}
+
+// cellSpursLFQueueAttachLv2EventQueue(queue): the lv2 event queue a PPU thread blocked in the queue's pointer functions
+// with useEventQueue receives from, as cellSpursEventFlagAttachLv2EventQueue makes the event flag's (RPCS3
+// _spurs::create_lv2_eq): a PPU queue "_spuLFQ" (127 entries, as cellSync's attach, D-625) on a dynamic SPU port of
+// the queue's SPURS instance (attach_lv2_eq: the lowest free of 0x10..0x3F, a port SPURS makes for itself), which SPU
+// tasks send their wake-up to; m_bs = the port (a word, as cellSync's) and m_eq_id = the queue, in one update of the
+// line. The checks above; a queue attached already is STAT; the port's errors (an instance in exception state: STAT,
+// no free port: BUSY, not initialized: ESRCH) as task errors, the lv2 queue destroyed again.
+s32 cellSpursLFQueueAttachLv2EventQueue(PPUContext& ctx, u32 queue)
+{
+    constexpr std::string_view fn = "cellSpursLFQueueAttachLv2EventQueue";
+    u32 spurs = 0;
+    if (const s32 rc = check_spurs_lfqueue(ctx, fn, queue, spurs); rc != lv2::CELL_OK) return rc;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    {
+        alignas(16) u8 line[PS_RES_LINE_SIZE];
+        ps_res_acquire(base, queue, line);
+        if (ps_read32(line, lfq::eq_id)) return error(CELL_SPURS_TASK_ERROR_STAT);
+    }
+    StackVar vars(ctx, base, 0x20); // the queue's ID, sys_event_queue_attribute_t {protocol, type, name[8]}
+    const u32 id_out = vars.addr(), attr = vars.addr() + 0x10;
+    ps_write32(base, attr, lv2::SYS_SYNC_PRIORITY);
+    ps_write32(base, attr + 4, lv2::SYS_PPU_QUEUE);
+    std::memcpy(base + attr + 8, "_spuLFQ", 8);
+    if (const s32 rc = lv2::sys_event_queue_create(t, id_out, attr, 0, 127); rc != lv2::CELL_OK) return task_error(rc);
+    const u32 eq = ps_read32(base, id_out);
+    u8 port = 0;
+    if (const s32 rc = attach_lv2_eq(ctx, spurs, eq, port, true, true); rc != lv2::CELL_OK) {
+        lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+        return task_error(rc);
+    }
+    bool attached = false;
+    reservation_op(base, queue, [&](u8* q) {
+        attached = ps_read32(q, lfq::eq_id) != 0;
+        if (attached) return false;
+        ps_write32(q, lfq::bs, port);
+        ps_write32(q, lfq::eq_id, eq);
+        return true;
+    });
+    if (attached) { // another thread attached one meanwhile
+        if (detach_lv2_eq(base, spurs, port, true, t.kernel.config().sdk_version) == lv2::CELL_OK) {
+            lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+        }
+        return error(CELL_SPURS_TASK_ERROR_STAT);
+    }
+    PS_LOG_INFO(kChan, "{}({:#x}): lv2 event queue {:#x} on SPU port {:#x} of SPURS {:#x}", fn, queue, eq, port, spurs);
+    return lv2::CELL_OK;
+}
+
+// cellSpursLFQueueDetachLv2EventQueue(queue): the checks above; no queue attached is STAT, a PPU thread waiting on it
+// (its side's event state, m_h7 or m_h3, set) BUSY; then m_bs back as cellSyncLFQueueInitialize left it (all ones, an
+// ANY2ANY queue's first two bytes) and m_eq_id 0 in one update of the line, the SPU port detached and the lv2 queue
+// destroyed.
+s32 cellSpursLFQueueDetachLv2EventQueue(PPUContext& ctx, u32 queue)
+{
+    constexpr std::string_view fn = "cellSpursLFQueueDetachLv2EventQueue";
+    u32 spurs = 0;
+    if (const s32 rc = check_spurs_lfqueue(ctx, fn, queue, spurs); rc != lv2::CELL_OK) return rc;
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = t.kernel.base();
+    u32 eq = 0, port = 0;
+    s32 rc = lv2::CELL_OK;
+    reservation_op(base, queue, [&](u8* q) {
+        eq = ps_read32(q, lfq::eq_id);
+        port = ps_read32(q, lfq::bs);
+        rc = lv2::CELL_OK;
+        if (!eq) {
+            rc = error(CELL_SPURS_TASK_ERROR_STAT);
+            return false;
+        }
+        const bool any2any = ps_read32(q, lfq::direction) == lfq::ANY2ANY;
+        if (!any2any && (ps_read16(q, lfq::h3) || ps_read16(q, lfq::h7))) {
+            rc = error(CELL_SPURS_TASK_ERROR_BUSY);
+            return false;
+        }
+        ps_write32(q, lfq::bs, any2any ? 0xFFFF0000u : 0xFFFFFFFFu);
+        ps_write32(q, lfq::eq_id, 0);
+        return true;
+    });
+    if (rc != lv2::CELL_OK) return rc;
+    if (const s32 r = detach_lv2_eq(base, spurs, static_cast<u8>(port & 0x3F), true, t.kernel.config().sdk_version);
+        r != lv2::CELL_OK) {
+        PS_LOG_WARN(kChan, "{}({:#x}): detaching SPU port {:#x} of SPURS {:#x}: {:#x}", fn, queue, port, spurs,
+            static_cast<u32>(r));
+    }
+    lv2::sys_event_queue_destroy(t, eq, lv2::SYS_EVENT_QUEUE_DESTROY_FORCE);
+    PS_LOG_INFO(kChan, "{}({:#x}): lv2 event queue {:#x} and SPU port {:#x} gone", fn, queue, eq, port);
+    return lv2::CELL_OK;
+}
+
 // ------------------------------------------------------------------------------------------------- barriers
 
 // RPCS3 cellSpursBarrierInitialize. CellSpursBarrier (128 bytes, 128-aligned): zero, remained (u32), taskset at 0x34.
@@ -3774,6 +4295,45 @@ s32 cellSpursJobChainGetError(PPUContext& ctx, u32 job_chain, u32 cause)
     return chain_error;
 }
 
+// cellSpursGetJobPipelineInfo(spurs, wid, info) (D-629, unverified: RPCS3 has an UNIMPLEMENTED stub answering CELL_OK
+// and no structure; libsre was not read): what each SPU's job chain policy module has in its pipeline (the jobs it
+// fetched, is loading, runs and is writing back), which libsre can only read from SPUs a job stopped on an exception
+// (the job chain's exception event handler is where such information is asked for). A native SPURS has no such
+// pipeline (its job chain policy runs one job at a time to its end, D-055) and stops the process when a job faults
+// (CLAUDE.md rule 5), so no job chain is ever stopped in one: after its checks the call answers JOB_ERROR_STAT and
+// writes nothing (CellSpursJobPipelineInfo's layout is not known, so nothing could be written faithfully either).
+// Checks: NULL (spurs, info), the instance's 128-byte ALIGN, memory (FAULT, D-042), a workload ID past the instance's
+// (INVAL), one not registered (SRCH), one that is not a job chain (INVAL).
+s32 cellSpursGetJobPipelineInfo(PPUContext& ctx, u32 spurs, u32 wid, u32 info)
+{
+    constexpr std::string_view fn = "cellSpursGetJobPipelineInfo";
+    if (!spurs || !info) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
+    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_JOB_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "SPURS instance", spurs, CELL_SPURS_SIZE, CELL_SPURS_JOB_ERROR_FAULT);
+        rc != lv2::CELL_OK) {
+        return rc;
+    }
+    u8* base = guest_base(ctx);
+    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_JOB_ERROR_SRCH);
+    bool job_chain = false;
+    {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        if (const auto it = h.instances.find(spurs); it != h.instances.end()) {
+            const auto w = it->second.workloads.find(wid);
+            job_chain = w != it->second.workloads.end() && w->second.kind == Workload::Kind::JobChain;
+        }
+    }
+    if (!job_chain) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        PS_LOG_WARN(kChan, "{}(SPURS {:#x}, workload {}): no job chain of a native SPURS stops in a job, so there is no "
+            "pipeline to report: CELL_SPURS_JOB_ERROR_STAT (D-629)", fn, spurs, wid);
+    }
+    return error(CELL_SPURS_JOB_ERROR_STAT);
+}
+
 // cellSpursJobChainGetSpursAddress(jobChain, spurs), as libsre: NULL (both), ALIGN, INVAL for a workload ID past 31 (RPCS3
 // does not check it); then the chain's CellSpurs (u32).
 s32 cellSpursJobChainGetSpursAddress(PPUContext& ctx, u32 job_chain, u32 spurs)
@@ -4182,6 +4742,21 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0x00AF2519, cellSpursJobGuardReset),
         PS_HLE_FUNC(0xE7B0E69A, cellSpursJobSetMaxGrab),
         PS_HLE_INTERNAL(NID_event_helper, _pspocket_spurs_event_helper),
+        // Made without libsre to compare with (D-594): CellSpursTaskset2's tasks (D-626), the exit code containers
+        // (D-627), the LF queue's bodies and lv2 event queue (D-628), the job pipeline and the system workload (D-629).
+        PS_HLE_UNVERIFIED(0xE14CA62D, cellSpursCreateTask2),
+        PS_HLE_UNVERIFIED(0xE4944A1C, cellSpursCreateTask2WithBinInfo),
+        PS_HLE_UNVERIFIED(0xA7A94892, cellSpursJoinTask2),
+        PS_HLE_UNVERIFIED(0x838FA4F0, cellSpursTryJoinTask2),
+        PS_HLE_UNVERIFIED(0x1EBCF459, cellSpursDestroyTaskset2),
+        PS_HLE_UNVERIFIED(0x13AE18F3, cellSpursTaskExitCodeGet),
+        PS_HLE_UNVERIFIED(0xE717AC73, cellSpursTaskExitCodeTryGet),
+        PS_HLE_UNVERIFIED(0x8A85674D, _cellSpursLFQueuePushBody),
+        PS_HLE_UNVERIFIED(0x35DAE22B, _cellSpursLFQueuePopBody),
+        PS_HLE_UNVERIFIED(0x1656D49F, cellSpursLFQueueAttachLv2EventQueue),
+        PS_HLE_UNVERIFIED(0x73E06F91, cellSpursLFQueueDetachLv2EventQueue),
+        PS_HLE_UNVERIFIED(0xD86380D8, cellSpursGetJobPipelineInfo),
+        PS_HLE_UNVERIFIED(0x31F5196B, cellSpursRemoveSystemWorkloadForUtility),
     });
 }
 

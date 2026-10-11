@@ -73,6 +73,7 @@ add_library(pspocket_hle STATIC
     src/cellGifDec.cpp
     src/cellJpgDec.cpp
     src/jpeg_decoder.cpp
+    src/jpeg_encoder.cpp
     src/cellVdec.cpp
     src/vdec_hw.cpp
     src/cellDmuxPamf.cpp
@@ -125,12 +126,15 @@ add_library(pspocket_hle STATIC
     src/cellPngEnc.cpp
     src/libsnd3.cpp
     src/libsynth2.cpp
+    src/spu2.cpp
     src/libmixer.cpp
     src/codec_cores.cpp
     src/cellCelpEnc.cpp
     src/cellRudp.cpp
     src/cellNetAoi.cpp
     src/libad.cpp
+    src/libmedi.cpp
+    src/cellLibprof.cpp
     src/sys_libstdcxx.cpp
     src/stdcxx_streams.cpp
     src/stdcxx_facets.cpp

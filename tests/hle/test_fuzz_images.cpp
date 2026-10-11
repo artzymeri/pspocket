@@ -2,7 +2,8 @@
 // and through cellJpgDec, cellGifDec's own GIF decoder and cellPngDec on libpng, each over damaged files the tests'
 // writers made (jpeg_writer.hpp, gif_writer.hpp, png_writer.hpp). A file comes from a buffer flush against unmapped
 // memory and decodes into a frame flush against it too, at random output settings: every stream must open, decode
-// or be refused, never read past its file or write past its frame. Longer: PSPOCKET_FUZZ_ITERS=<n>
+// or be refused, never read past its file or write past its frame. cellJpgDec's Ext functions (D-617) too: the file
+// fed by a stream callback in parts, decoded in parts to a display callback. Longer: PSPOCKET_FUZZ_ITERS=<n>
 // build/host/tests/hle/test_hle "[fuzz]".
 
 #include <catch_amalgamated.hpp>
@@ -16,6 +17,7 @@
 #include "gif_writer.hpp"
 #include "guest.hpp"
 #include "hle_fuzz_util.hpp"
+#include "imgdec_ext_util.hpp"
 #include "jpeg_decoder.hpp" // runtime/hle/src
 #include "jpeg_writer.hpp"
 #include "png_writer.hpp"
@@ -402,4 +404,78 @@ TEST_CASE("fuzz: cellJpgDec, cellPngDec and cellGifDec over damaged files", "[hl
             CHECK(decoded > 0);
         }
     }
+}
+
+TEST_CASE("fuzz: cellJpgDec's Ext functions, damaged files from a stream callback, decoded in parts (D-617)",
+    "[hle][fuzz]")
+{
+    // The source's buffer holds the first bytes, the stream callback gives the rest (imgdec_ext_util.hpp's, reading
+    // the file where it lies, flush against unmapped memory); the display callback takes the parts one after another
+    // in a frame flush against it too, at most 32 of them.
+    namespace ext = pspocket::hle::test::imgdec_ext;
+    constexpr u32 kExtCode = kData + 0x2000, kStrmCtl = kData + 0x2800, kDispCtl = kData + 0x8000;
+    constexpr u32 kCbStrm = kArgs + 0x200, kExtIn = kArgs + 0x210, kExtOut = kArgs + 0x220, kCbDisp = kArgs + 0x230,
+                  kExtInfo = kArgs + 0x240;
+    ImageRun run(kJpg, false);
+    u8* b = run.b;
+    const ext::Callbacks cbs = ext::write_callbacks(b, kExtCode, 0x3C);
+    fuzz::Tally tally("cellJpgDec (Ext)");
+    u64 decoded = 0, parts = 0;
+    fuzz::run(tally, jpeg_samples(), 300, [&](const std::vector<u8>& input, fuzz::Rng& rng) {
+        if (input.empty()) return false;
+        kGuestHeap.reset(b, run.heap_after_create);
+        const u32 at = place_input(b, input), size = static_cast<u32>(input.size());
+        const u32 first = std::min<u32>(size, 1 + static_cast<u32>(rng.below(48)));
+        static constexpr u32 kChunks[] = {37, 512, 4093};
+        std::memset(b + kSrc, 0, 0x20);
+        ps_write32(b, kSrc + 0, 1);
+        ps_write32(b, kSrc + 20, at);
+        ps_write32(b, kSrc + 24, first);
+        std::memset(b + kStrmCtl, 0, 0x40);
+        ps_write32(b, kStrmCtl + ext::strm::source, at);
+        ps_write32(b, kStrmCtl + ext::strm::size, size);
+        ps_write32(b, kStrmCtl + ext::strm::offset, first);
+        ps_write32(b, kStrmCtl + ext::strm::chunk, size > 0x4000 ? 4093 : kChunks[rng.below(3)]); // its log fits
+        ps_write32(b, kCbStrm, cbs.stream_opd);
+        ps_write32(b, kCbStrm + 4, kStrmCtl);
+        if (run.call("ExtOpen", {run.handle, kStreamOut, kSrc, kOpenInfo, kCbStrm}) != 0) {
+            run.call("Destroy", {run.handle});
+            run.create();
+            return false;
+        }
+        const u32 stream = ps_read32(b, kStreamOut);
+        bool header = false;
+        if (run.call("ExtReadHeader", {run.handle, stream, kInfo, kExtInfo}) == 0) {
+            header = true;
+            jpg_in(b, rng);
+            const u32 height = ps_read32(b, kInfo + 4);
+            ps_write32(b, kExtIn, 1); // CELL_JPGDEC_LINE_MODE
+            ps_write32(b, kExtIn + 4, std::max(1u, (height + 31) / 32));
+            ps_write32(b, kExtIn + 8, 0);
+            if (run.call("ExtSetParameter", {run.handle, stream, kInParam, kOutParam, kExtIn, kExtOut}) == 0) {
+                const u64 width_bytes = ps_read64(b, kOutParam);
+                const u32 out_height = ps_read32(b, kOutParam + 12);
+                const u64 pitch = width_bytes + (rng.one_in(2) ? 0 : 16 * rng.below(3));
+                if (pitch && out_height && pitch * out_height <= kAreaSize) {
+                    const u32 frame = place_output(b, static_cast<u32>(pitch * out_height));
+                    ps_write64(b, kCtrl, pitch);
+                    std::memset(b + kDispCtl, 0, 0x40); // mode 0: each part's place just past the last
+                    ps_write32(b, kCbDisp, cbs.display_opd);
+                    ps_write32(b, kCbDisp + 4, kDispCtl);
+                    std::memset(b + kDataOut, 0xEE, 0x10);
+                    const bool display = !rng.one_in(4);
+                    if (run.call("ExtDecodeData", {run.handle, stream, frame, kCtrl, kDataOut, display ? kCbDisp : 0, 0}) == 0)
+                        decoded++;
+                    parts += ps_read32(b, kDispCtl + ext::disp::count);
+                }
+            }
+        }
+        run.call("Close", {run.handle, stream});
+        CHECK_FALSE(kGuestHeap.overrun(b));
+        return header;
+    }, kAreaSize);
+    std::printf("fuzz %-24s %8llu decoded, %llu parts\n", tally.name().c_str(), static_cast<unsigned long long>(decoded),
+        static_cast<unsigned long long>(parts));
+    CHECK(decoded > 0);
+    CHECK(parts > 0);
 }

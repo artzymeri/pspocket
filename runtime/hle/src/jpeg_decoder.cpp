@@ -380,7 +380,7 @@ bool Decoder::parse_sof(const u8* p, u32 n, int marker, std::string& error)
         c.height_in_blocks = div_round_up(div_round_up(header_.height * static_cast<u32>(c.v), static_cast<u32>(max_v_)), 8);
         c.blocks_per_row = mcus_x_ * static_cast<u32>(c.h);
         c.block_rows = mcus_y_ * static_cast<u32>(c.v);
-        c.coefficients.assign(usize{c.blocks_per_row} * c.block_rows * 64, 0);
+        c.coefficients.clear(); // taken when the image is decoded: a header alone may claim up to 65535 x 65535 (D-619)
     }
     // libjpeg 6b's default_decompress_parms: the colour space from the component count and the markers.
     switch (header_.components) {
@@ -628,7 +628,7 @@ bool Decoder::decode(std::string& error)
     rows_done_ = 0;
     multiple_scans_ = header_.progressive;
     scans_ = 0;
-    for (ComponentInfo& c : comps_) std::fill(c.coefficients.begin(), c.coefficients.end(), s16{0});
+    for (ComponentInfo& c : comps_) c.coefficients.assign(usize{c.blocks_per_row} * c.block_rows * 64, s16{0});
     Input in{data_, size_, pos_, warnings_};
     for (;;) {
         if (in.unread_marker == 0 && !in.next_marker()) break;
@@ -1040,6 +1040,10 @@ bool Decoder::output(int scale, bool fast, ColorSpace out_space, Output& out, st
         const ComponentInfo& c = comps_[ci];
         if (!quant_present_[c.tq]) {
             error = "a component without its quantisation table";
+            return false;
+        }
+        if (c.coefficients.size() < usize{c.blocks_per_row} * c.block_rows * 64) {
+            error = "an image not decoded";
             return false;
         }
         int ssize = dct;

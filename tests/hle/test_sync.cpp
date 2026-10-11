@@ -8,7 +8,8 @@
 // an SPU with GETLLAR/PUTLLC, without two holders, with TryLock and with Lock. The barrier, rwm and queue across threads.
 // The lock-free queue: libsre's layout and init 2, pointers handed out and completed out of order, a waiter signalled
 // through a guest function, the lv2 event queue wait, and a PPU pushing (popping) against an SPU popping (pushing) with
-// GETLLAR/PUTLLC.
+// GETLLAR/PUTLLC. ANY2ANY queues through the second forms, from PPU threads on both sides, and the lv2 event queue
+// attached to SPU threads (one of which sends the wake-up) and detached (D-625).
 
 #include "hle_test_util.hpp"
 
@@ -28,13 +29,15 @@
 #include "pspocket/core/reservation.h"
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/spu/context.h"
+#include "spu_program.hpp"
 
 using namespace pspocket;
 using namespace pspocket::hle::test;
 
 namespace {
 
-constexpr u64 kAgain = 0xFFFFFFFF80410101ull, kInval = 0xFFFFFFFF80410102ull, kNosys = 0xFFFFFFFF80410103ull,
+constexpr u64 kAgain = 0xFFFFFFFF80410101ull, kInval = 0xFFFFFFFF80410102ull,
               kPerm = 0xFFFFFFFF80410109ull, kBusy = 0xFFFFFFFF8041010Aull, kFault = 0xFFFFFFFF8041010Dull,
               kStat = 0xFFFFFFFF8041010Full, kAlign = 0xFFFFFFFF80410110ull, kNullPointer = 0xFFFFFFFF80410111ull;
 
@@ -212,11 +215,24 @@ TEST_CASE("cellSync: every function RPCS3 implements, under its NID", "[hle][syn
         REQUIRE(fn != nullptr);
         CHECK(fn->name == name);
     }
-    // RPCS3's todo stubs stay unimplemented (an error, never a silent CELL_OK): _cellSyncLFQueueGetPushPointer2,
-    // CompletePushPointer2, GetPopPointer2, CompletePopPointer2, AttachLv2EventQueue, DetachLv2EventQueue.
-    for (const u32 nid : {0x6BB4EF9Du, 0x35BBDAD2u, 0x46356FE0u, 0x7A51DEEEu, 0x54FC2032u, 0x811D148Eu}) {
-        CHECK(hle::registry().find("cellSync", nid) == nullptr);
+    // RPCS3's todo stubs, pspocket's own and unverified (D-625, D-594): the second forms and the lv2 event queue.
+    const std::pair<std::string_view, u32> unverified[] = {
+        {"_cellSyncLFQueueGetPushPointer2", 0x6BB4EF9D},
+        {"_cellSyncLFQueueCompletePushPointer2", 0x35BBDAD2},
+        {"_cellSyncLFQueueGetPopPointer2", 0x46356FE0},
+        {"_cellSyncLFQueueCompletePopPointer2", 0x7A51DEEE},
+        {"_cellSyncLFQueueAttachLv2EventQueue", 0x54FC2032},
+        {"_cellSyncLFQueueDetachLv2EventQueue", 0x811D148E},
+    };
+    for (const auto& [name, nid] : unverified) {
+        INFO(name);
+        const hle::Function* fn = hle::registry().find("cellSync", nid);
+        REQUIRE(fn != nullptr);
+        CHECK(fn->name == name);
+        CHECK(fn->unverified);
+        CHECK(hle::registry().is_unverified("cellSync", nid));
     }
+    for (const auto& [name, nid] : expected) CHECK_FALSE(hle::registry().is_unverified("cellSync", nid));
 }
 
 // ================================================================================================================ mutex
@@ -1294,8 +1310,8 @@ TEST_CASE("cellSyncLFQueue: the getters, Size and Clear as RPCS3", "[hle][sync][
     CHECK(a.call("cellSyncLFQueueClear", kLfq) == kBusy);
 }
 
-TEST_CASE("_cellSyncLFQueuePushBody and PopBody: entries in order, AGAIN when full or empty, PERM the other way, NOSYS "
-          "for ANY2ANY", "[hle][sync][lfqueue]")
+TEST_CASE("_cellSyncLFQueuePushBody and PopBody: entries in order, AGAIN when full or empty, PERM the other way, both "
+          "ways through ANY2ANY's second forms", "[hle][sync][lfqueue]")
 {
     Fixture f;
     GuestThread a(f, 0, "a");
@@ -1359,10 +1375,29 @@ TEST_CASE("_cellSyncLFQueuePushBody and PopBody: entries in order, AGAIN when fu
     CHECK(h(b, kH1) == 3);
     CHECK(a.call("_cellSyncLFQueuePopBody", kLfq, kLfDst, 0) == kAgain);
 
-    // ANY2ANY: RPCS3's *2 functions are todo stubs: NOSYS.
+    // ANY2ANY (D-625): the PPU pushes and pops the same queue through the second forms, in order, the entries in the
+    // buffer (m_buffer's bit 0 cleared); AGAIN when empty and when full.
     lf_init(a, 4, kAny2Any);
-    CHECK(a.call("_cellSyncLFQueuePushBody", kLfq, kLfSrc, 1) == kNosys);
-    CHECK(a.call("_cellSyncLFQueuePopBody", kLfq, kLfDst, 1) == kNosys);
+    CHECK(a.call("_cellSyncLFQueuePopBody", kLfq, kLfDst, 0) == kAgain);
+    for (u32 round = 0; round < 3; round++) {
+        for (u32 v = 0; v < 4; v++) {
+            put_entry(b, kLfSrc, 100 * round + v);
+            REQUIRE(a.call("_cellSyncLFQueuePushBody", kLfq, kLfSrc, 1) == 0);
+        }
+        CHECK(a.call("_cellSyncLFQueuePushBody", kLfq, kLfSrc, 0) == kAgain);
+        CHECK(ps_read32(b, kLfEntries + 16 * 3) == 100 * round + 3);
+        for (u32 v = 0; v < 4; v++) {
+            REQUIRE(a.call("_cellSyncLFQueuePopBody", kLfq, kLfDst, round % 2) == 0);
+            CHECK(ps_read32(b, kLfDst) == 100 * round + v);
+        }
+        CHECK(a.call("_cellSyncLFQueuePopBody", kLfq, kLfDst, 0) == kAgain);
+    }
+    const u16 end = 12 % 8;
+    for (const u32 off : {kH1, kH4, kH5, kH8}) CHECK(h(b, off) == end);
+    CHECK(h(b, kH3) == 0); // the rings' packs, untouched
+    CHECK(h(b, kH7) == 0);
+    CHECK(h(b, kPush2) == 0xFFFF);
+    CHECK(h(b, kPop2) == 0xFFFF);
 }
 
 TEST_CASE("_cellSyncLFQueueGet/CompletePush/PopPointer: pointers completed out of order, as RPCS3's bitmap", "[hle][sync][lfqueue]")
@@ -1598,4 +1633,348 @@ TEST_CASE("cellSyncLFQueue: a PPU pushing with PushBody against an SPU popping w
         CHECK(h(b, kH2) == 0);
         CHECK(h(b, kH6) == 0);
     }
+}
+
+// ================================================================================== LFQueue: ANY2ANY and lv2 (D-625)
+
+TEST_CASE("_cellSyncLFQueueGet/CompletePush/PopPointer2: an ANY2ANY queue's pointers on both sides, completed out of "
+          "order; PERM for the other queues, and the first forms PERM for ANY2ANY (D-625)", "[hle][sync][lfqueue]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    u8* b = f.base();
+    // The checks the first forms make: the queue's memory and alignment, the pointer's memory.
+    CHECK(a.call("_cellSyncLFQueueGetPushPointer2", kUnmapped, kOutWord, 0, 0) == kFault);
+    CHECK(a.call("_cellSyncLFQueueGetPopPointer2", kLfq + 64, kOutWord, 0, 0) == kAlign);
+    CHECK(a.call("_cellSyncLFQueueCompletePushPointer2", 0, 0, 0) == kFault);
+    CHECK(a.call("_cellSyncLFQueueCompletePopPointer2", kLfq + 8, 0, 0, 0) == kAlign);
+    for (const u32 direction : {kSpu2Ppu, kPpu2Spu, 0u}) {
+        INFO(direction);
+        lf_init(a, 4, direction);
+        CHECK(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord, 0, 0) == kPerm);
+        CHECK(a.call("_cellSyncLFQueueGetPopPointer2", kLfq, kOutWord, 0, 0) == kPerm);
+        CHECK(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, 0, 0) == kPerm);
+        CHECK(a.call("_cellSyncLFQueueCompletePopPointer2", kLfq, 0, 0, 0) == kPerm);
+    }
+    lf_init(a, 4, kAny2Any);
+    CHECK(a.call("_cellSyncLFQueueGetPushPointer", kLfq, kOutWord, 0, 0) == kPerm);
+    CHECK(a.call("_cellSyncLFQueueGetPopPointer", kLfq, kOutWord, 0, 0, 0) == kPerm);
+    CHECK(a.call("_cellSyncLFQueueCompletePushPointer", kLfq, 0, 0) == kPerm);
+    CHECK(a.call("_cellSyncLFQueueCompletePopPointer", kLfq, 0, 0, 0) == kPerm);
+    CHECK(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kUnmapped, 0, 0) == kFault);
+
+    // Nothing pushed: no pop pointer (useEventQueue changes nothing: no STAT without an lv2 queue, no event state).
+    CHECK(a.call("_cellSyncLFQueueGetPopPointer2", kLfq, kOutWord, 0, 1) == kAgain);
+    for (u32 p = 0; p < 3; p++) {
+        REQUIRE(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord, 0, p % 2) == 0);
+        CHECK(ps_read32(b, kOutWord) == p);
+    }
+    CHECK(h(b, kH8) == 3);
+    CHECK(a.call("_cellSyncLFQueueGetPopPointer2", kLfq, kOutWord, 0, 0) == kAgain); // none completed yet
+    // Completed out of order, as the first forms' bitmap: 2 waits behind 0 and 1.
+    REQUIRE(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, 2, 0) == 0);
+    CHECK(h(b, kH5) == 0);
+    CHECK(h(b, kH6) == 0x2000);
+    REQUIRE(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, 0, 0) == 0);
+    CHECK(h(b, kH5) == 1);
+    CHECK(h(b, kH6) == 0x4000);
+    REQUIRE(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, 1, 0) == 0);
+    CHECK(h(b, kH5) == 3);
+    CHECK(h(b, kH6) == 0);
+    // The pop side the same way, from the same thread.
+    for (u32 p = 0; p < 3; p++) {
+        REQUIRE(a.call("_cellSyncLFQueueGetPopPointer2", kLfq, kOutWord, 1, 0) == 0);
+        CHECK(ps_read32(b, kOutWord) == p);
+    }
+    CHECK(h(b, kH4) == 3);
+    CHECK(a.call("_cellSyncLFQueueGetPopPointer2", kLfq, kOutWord, 0, 0) == kAgain);
+    REQUIRE(a.call("_cellSyncLFQueueCompletePopPointer2", kLfq, 1, 0, 0) == 0);
+    CHECK(h(b, kH1) == 0);
+    CHECK(h(b, kH2) == 0x4000);
+    REQUIRE(a.call("_cellSyncLFQueueCompletePopPointer2", kLfq, 0, 0, 0) == 0);
+    CHECK(h(b, kH1) == 2);
+    CHECK(h(b, kH2) == 0);
+    REQUIRE(a.call("_cellSyncLFQueueCompletePopPointer2", kLfq, 2, 0, 1) == 0);
+    CHECK(h(b, kH1) == 3);
+    // Room for four: pointers 3..6, then AGAIN; the pointers wrap at 2 * depth.
+    for (u32 p = 3; p < 7; p++) {
+        REQUIRE(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord, 0, 0) == 0);
+        CHECK(ps_read32(b, kOutWord) == p);
+    }
+    CHECK(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord, 0, 0) == kAgain);
+    for (u32 p = 3; p < 7; p++) REQUIRE(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, p, 0) == 0);
+    CHECK(h(b, kH5) == 7);
+    for (u32 p = 3; p < 7; p++) {
+        REQUIRE(a.call("_cellSyncLFQueueGetPopPointer2", kLfq, kOutWord, 0, 0) == 0);
+        REQUIRE(a.call("_cellSyncLFQueueCompletePopPointer2", kLfq, p, 0, 0) == 0);
+    }
+    REQUIRE(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord, 0, 0) == 0);
+    CHECK(ps_read32(b, kOutWord) == 7);
+    CHECK(h(b, kH8) == 0);
+    // The rings' packs (m_h3, m_h7) and the first forms' rings (push2, pop2: 0xFFFF in ANY2ANY) were left alone.
+    CHECK(h(b, kH3) == 0);
+    CHECK(h(b, kH7) == 0);
+    CHECK(h(b, kPush2) == 0xFFFF);
+    CHECK(h(b, kPop2) == 0xFFFF);
+
+    // Blocking: a pop waits until a push is completed, on another thread.
+    lf_init(a, 2, kAny2Any);
+    {
+        Caller get(f, 1, "_cellSyncLFQueueGetPopPointer2", {kLfq, kOutWord, 1, 1});
+        CHECK(get.blocked());
+        REQUIRE(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord + 4, 0, 0) == 0);
+        CHECK(get.blocked()); // handed out, not completed
+        REQUIRE(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, 0, 0) == 0);
+        get.join();
+        CHECK(get.result == 0);
+        CHECK(ps_read32(b, kOutWord) == 0);
+    }
+    // And a push until a pop is completed.
+    REQUIRE(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord + 4, 0, 0) == 0);
+    REQUIRE(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, 1, 0) == 0); // full: 0 handed out, 1 waiting
+    {
+        Caller get(f, 1, "_cellSyncLFQueueGetPushPointer2", {kLfq, kOutWord + 8, 1, 0});
+        CHECK(get.blocked());
+        REQUIRE(a.call("_cellSyncLFQueueCompletePopPointer2", kLfq, 0, 0, 0) == 0);
+        get.join();
+        CHECK(get.result == 0);
+        CHECK(ps_read32(b, kOutWord + 8) == 2);
+    }
+}
+
+TEST_CASE("_cellSyncLFQueueComplete*Pointer2: SPU code waiting in ANY2ANY's rings (packs in m_h7 and m_h3) is taken "
+          "and signalled through the guest's function (D-625)", "[hle][sync][lfqueue]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    u8* b = f.base();
+    write_signal_function(b);
+    lf_init(a, 4, kAny2Any, 0x12345600);
+    // A push completion wakes the oldest SPU waiter in the push side's ring: m_h7's head and tail, m_hs1's IDs.
+    REQUIRE(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord, 0, 0) == 0);
+    ps_write16(b, kLfq + kHs1, 7);
+    ps_write16(b, kLfq + kH7, 0x0001); // head 0, tail 1
+    CHECK(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, 0, kSigOpd) == 0x55);
+    CHECK(ps_read32(b, kSigRecord) == 0x12345600);
+    CHECK(ps_read32(b, kSigRecord + 4) == 7);
+    CHECK(h(b, kH7) == 0x0401);
+    CHECK(h(b, kH5) == 1);
+    CHECK(h(b, kPush2) == 0xFFFF);
+    // A pop completion, the pop side's: m_h3 and m_hs2.
+    REQUIRE(a.call("_cellSyncLFQueueGetPopPointer2", kLfq, kOutWord, 0, 0) == 0);
+    ps_write16(b, kLfq + kHs2, 9);
+    ps_write16(b, kLfq + kH3, 0x0001);
+    CHECK(a.call("_cellSyncLFQueueCompletePopPointer2", kLfq, 0, kSigOpd, 0) == 0x55);
+    CHECK(ps_read32(b, kSigRecord + 4) == 9);
+    CHECK(h(b, kH3) == 0x0401);
+    CHECK(h(b, kH1) == 1);
+    CHECK(h(b, kPop2) == 0xFFFF);
+    // A waiter in the ring: Clear, which reads ANY2ANY's rings there too, is BUSY.
+    ps_write16(b, kLfq + kHs2 + 2, 11);
+    ps_write16(b, kLfq + kH3, 0x0402);
+    CHECK(a.call("cellSyncLFQueueClear", kLfq) == kBusy);
+    // noQueueFull: no signal; the completion waits until nobody waits (SPU code takes its waiter out).
+    ps_write64(b, kSigRecord, 0);
+    REQUIRE(a.call("_cellSyncLFQueueGetPushPointer2", kLfq, kOutWord, 0, 0) == 0);
+    REQUIRE(a.call("_cellSyncLFQueueCompletePushPointer2", kLfq, 1, 0) == 0);
+    REQUIRE(a.call("_cellSyncLFQueueGetPopPointer2", kLfq, kOutWord, 0, 0) == 0);
+    {
+        Caller complete(f, 1, "_cellSyncLFQueueCompletePopPointer2", {kLfq, 1, kSigOpd, 1});
+        CHECK(complete.blocked());
+        CHECK(h(b, kH1) == 1);
+        spu_update(b, kLfq, [](u8* q) {
+            ps_write16(q, kH3, 0x0802); // head 2 == tail 2
+            return true;
+        });
+        complete.join();
+        CHECK(complete.result == 0);
+    }
+    CHECK(ps_read64(b, kSigRecord) == 0);
+    CHECK(h(b, kH1) == 2);
+    CHECK(a.call("cellSyncLFQueueClear", kLfq) == 0);
+}
+
+TEST_CASE("cellSyncLFQueue ANY2ANY: PPU threads pushing and popping with the bodies at once, every entry popped once "
+          "(D-625)", "[hle][sync][lfqueue]")
+{
+    constexpr u32 kPushers = 2, kPoppers = 2, kEach = 1500, kRing = 4;
+    constexpr u32 kSrcs = kData + 0x24000, kDsts = kData + 0x25000; // a 16-byte buffer per thread
+    Fixture f;
+    u8* b = f.base();
+    {
+        GuestThread a(f, 0, "init");
+        lf_init(a, kRing, kAny2Any);
+    }
+    const hle::Function& push = GuestThread::find("_cellSyncLFQueuePushBody");
+    const hle::Function& pop = GuestThread::find("_cellSyncLFQueuePopBody");
+    std::atomic<u32> errors{0}, disorder{0};
+    std::vector<std::atomic<u32>> seen(kPushers * kEach);
+    std::vector<std::thread> threads;
+    for (u32 p = 0; p < kPushers; p++) {
+        threads.emplace_back([&, p] {
+            GuestThread g(f, 1 + p, "pusher");
+            for (u32 n = 0; n < kEach; n++) {
+                put_entry(b, kSrcs + 16 * p, (p << 16) | n);
+                if (raw(g, push, {kLfq, kSrcs + 16 * p, 1}) != 0) errors++;
+            }
+        });
+    }
+    for (u32 c = 0; c < kPoppers; c++) {
+        threads.emplace_back([&, c] {
+            GuestThread g(f, 1 + kPushers + c, "popper");
+            std::array<s64, kPushers> last;
+            last.fill(-1);
+            for (u32 n = 0; n < kPushers * kEach / kPoppers; n++) {
+                if (raw(g, pop, {kLfq, kDsts + 16 * c, 1}) != 0) {
+                    errors++;
+                    continue;
+                }
+                const u32 v = ps_read32(b, kDsts + 16 * c), from = v >> 16, i = v & 0xFFFF;
+                if (from >= kPushers || i >= kEach || ps_read32(b, kDsts + 16 * c + 12) != v) {
+                    errors++;
+                    continue;
+                }
+                seen[from * kEach + i]++;
+                if (static_cast<s64>(i) <= last[from]) disorder++; // one pusher's entries reach a popper in order
+                last[from] = i;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    CHECK(errors == 0);
+    CHECK(disorder == 0);
+    u32 once = 0;
+    for (const auto& s : seen) once += s == 1;
+    CHECK(once == kPushers * kEach);
+    const u16 end = (kPushers * kEach) % (2 * kRing);
+    for (const u32 off : {kH1, kH4, kH5, kH8}) CHECK(h(b, off) == end);
+    CHECK(h(b, kH2) == 0);
+    CHECK(h(b, kH6) == 0);
+}
+
+namespace {
+constexpr u32 kSpuScratchA = kData + 0x40000, kSpuScratchB = kData + 0x44000; // make_spu_group's 0x2000 bytes each
+constexpr u32 kSpus = kData + 0x48000, kLfq2 = kData + 0x48080, kOtherQueue = kData + 0x48100;
+
+// An SPU thread program: the port the PPU writes to its inbound mailbox, then sys_spu_thread_send_event(port, 0,
+// 0x1234) (the data word in the outbound mailbox, the port in the interrupt mailbox's code), the answer read back
+// into LS 0x200, then a spin until the group is terminated.
+pspocket::test::SpuProgram event_sender()
+{
+    namespace as = pspocket::recomp::spu::as;
+    pspocket::test::SpuProgram p;
+    p.emit(as::rdch(3, PS_SPU_RdInMbox));
+    p.emit(as::il(4, 0x1234));
+    p.emit(as::wrch(PS_SPU_WrOutMbox, 4));
+    p.emit(as::shli(5, 3, 24));
+    p.emit(as::wrch(PS_SPU_WrOutIntrMbox, 5));
+    p.emit(as::rdch(6, PS_SPU_RdInMbox));
+    p.emit(as::ila(7, 0x200));
+    p.emit(as::stqd(6, 0, 7));
+    p.emit(as::br(0));
+    return p;
+}
+} // namespace
+
+TEST_CASE("_cellSyncLFQueueAttachLv2EventQueue and Detach: the queue made and connected to the SPU threads on a free "
+          "port, m_bs and m_eq_id; an SPU thread's event wakes a PPU blocked with useEventQueue (D-625)",
+    "[hle][sync][lfqueue]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    lv2::PpuThread& t = *a.t;
+    u8* b = f.base();
+    const auto sa = pspocket::test::make_spu_group(t, b, kSpuScratchA, event_sender());
+    const auto sb = pspocket::test::make_spu_group(t, b, kSpuScratchB, event_sender());
+    REQUIRE(sa.thread);
+    REQUIRE(sb.thread);
+    ps_write32(b, kSpus, sa.thread);
+    ps_write32(b, kSpus + 4, sb.thread);
+    ps_write32(b, kSpus + 8, 0x0BADBAD0); // no such SPU thread
+
+    // The checks.
+    lf_init(a, 2, kPpu2Spu);
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 2, 0) == kNullPointer);
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", 0, 2, kLfq) == kNullPointer);
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 2, kLfq + 4) == kAlign);
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 0, kLfq) == kInval);
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", kUnmapped, 2, kLfq) == kFault);
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 2, kUnmapped) == kFault);
+    CHECK(a.call("_cellSyncLFQueueDetachLv2EventQueue", kSpus, 2, kLfq) == kStat); // none attached
+    std::memset(b + kLfq2, 0, 128);
+    REQUIRE(a.call("cellSyncLFQueueInitialize", kLfq2, kLfEntries, 16, 2, 0 /* SPU2SPU */, 0) == 0);
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 2, kLfq2) == kPerm);
+    CHECK(a.call("_cellSyncLFQueueDetachLv2EventQueue", kSpus, 2, kLfq2) == kPerm);
+
+    // Port 0x10 of the first thread is the game's own: the queue gets 0x11, free on both.
+    constexpr u32 kEqOut = kData + 0x23000, kAttr = kData + 0x23010;
+    ps_write32(b, kAttr, lv2::SYS_SYNC_FIFO);
+    ps_write32(b, kAttr + 4, lv2::SYS_PPU_QUEUE);
+    std::memcpy(b + kAttr + 8, "game", 5);
+    REQUIRE(lv2::sys_event_queue_create(t, kEqOut, kAttr, 0, 4) == 0);
+    const u32 game_queue = ps_read32(b, kEqOut);
+    REQUIRE(lv2::sys_spu_thread_connect_event(t, sa.thread, game_queue, 1, 0x10) == 0);
+    REQUIRE(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 2, kLfq) == 0);
+    CHECK(ps_read32(b, kLfq + kBs) == 0x11);
+    const u32 eq = ps_read32(b, kLfq + kEqId);
+    REQUIRE(f.kernel->event_queue(eq) != nullptr);
+    CHECK(f.kernel->event_queue(eq)->type == lv2::SYS_PPU_QUEUE);
+    CHECK(lv2::sys_spu_thread_connect_event(t, sa.thread, game_queue, 1, 0x11) == lv2::err(lv2::CELL_EISCONN));
+    CHECK(lv2::sys_spu_thread_connect_event(t, sb.thread, game_queue, 1, 0x11) == lv2::err(lv2::CELL_EISCONN));
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 2, kLfq) == kStat); // one already
+    // A thread that does not exist: lv2's ESRCH, nothing left connected (0x12 is free again on the first thread).
+    std::memset(b + kOtherQueue, 0, 128);
+    REQUIRE(a.call("cellSyncLFQueueInitialize", kOtherQueue, kLfEntries, 16, 2, kSpu2Ppu, 0) == 0);
+    CHECK(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 3, kOtherQueue) == r3_of(lv2::CELL_ESRCH));
+    CHECK(ps_read32(b, kOtherQueue + kEqId) == 0);
+    CHECK(ps_read32(b, kOtherQueue + kBs) == 0xFFFFFFFF);
+    REQUIRE(lv2::sys_spu_thread_connect_event(t, sa.thread, game_queue, 1, 0x12) == 0);
+    REQUIRE(lv2::sys_spu_thread_disconnect_event(t, sa.thread, 1, 0x12) == 0);
+
+    // A PPU push into the full queue sleeps on the lv2 queue; SPU code pops an entry (here: the host on its behalf) and
+    // the first SPU thread sends the wake-up on the port it was given.
+    for (u32 v = 0; v < 2; v++) REQUIRE(a.call("_cellSyncLFQueuePushBody", kLfq, kLfSrc, 0) == 0); // full
+    REQUIRE(lv2::sys_spu_thread_group_start(t, sa.group) == 0);
+    {
+        Caller get(f, 1, "_cellSyncLFQueueGetPushPointer", {kLfq, kOutWord, 1, 1});
+        REQUIRE(get.parked_on(lv2::WaitKind::EventQueue));
+        u32 value = 0;
+        REQUIRE(spu_pop(b, 2, value));
+        CHECK(get.blocked());
+        REQUIRE(lv2::sys_spu_thread_write_spu_mb(t, sa.thread, ps_read32(b, kLfq + kBs)) == 0);
+        get.join();
+        CHECK(get.result == 0);
+        CHECK(ps_read32(b, kOutWord) == 2);
+    }
+    REQUIRE(a.call("_cellSyncLFQueueCompletePushPointer", kLfq, 2, 0) == 0);
+    REQUIRE(lv2::sys_spu_thread_group_terminate(t, sa.group, 0) == 0);
+
+    // Detach: BUSY while a PPU thread waits on it (isBlocking 3 marks the push side's event state).
+    {
+        Caller get(f, 1, "_cellSyncLFQueueGetPushPointer", {kLfq, kOutWord, 3, 1});
+        REQUIRE(get.parked_on(lv2::WaitKind::EventQueue));
+        CHECK(a.call("_cellSyncLFQueueDetachLv2EventQueue", kSpus, 2, kLfq) == kBusy);
+        u32 value = 0;
+        REQUIRE(spu_pop(b, 2, value));
+        REQUIRE(f.kernel->event_queue(eq)->send(lv2::Event{}) == 0);
+        get.join();
+        CHECK(get.result == 0);
+    }
+    REQUIRE(a.call("_cellSyncLFQueueDetachLv2EventQueue", kSpus, 2, kLfq) == 0);
+    CHECK(ps_read32(b, kLfq + kBs) == 0xFFFFFFFF);
+    CHECK(ps_read32(b, kLfq + kEqId) == 0);
+    CHECK(f.kernel->event_queue(eq) == nullptr);
+    CHECK(lv2::sys_spu_thread_connect_event(t, sb.thread, game_queue, 1, 0x11) == 0); // the port is free again
+    CHECK(a.call("_cellSyncLFQueueDetachLv2EventQueue", kSpus, 2, kLfq) == kStat);
+    CHECK(a.call("_cellSyncLFQueueGetPushPointer", kLfq, kOutWord, 1, 1) == kStat); // no queue to sleep on
+
+    // ANY2ANY: attached and detached the same way, m_bs back to what Initialize left (its first two bytes all ones).
+    lf_init(a, 2, kAny2Any);
+    CHECK(ps_read32(b, kLfq + kBs) == 0xFFFF0000);
+    REQUIRE(a.call("_cellSyncLFQueueAttachLv2EventQueue", kSpus, 1, kLfq) == 0);
+    CHECK(ps_read32(b, kLfq + kBs) == 0x11); // the first thread's 0x10 is still the game's
+    REQUIRE(a.call("_cellSyncLFQueueDetachLv2EventQueue", kSpus, 1, kLfq) == 0);
+    CHECK(ps_read32(b, kLfq + kBs) == 0xFFFF0000);
+    CHECK(ps_read32(b, kLfq + kEqId) == 0);
 }

@@ -13,9 +13,15 @@
 // which lv2 leaves zero, as RPCS3's: they are refused, as there.
 //
 // Deviations: the debug/retail variants of libfs, libgcm_sys and liblv2dbg are one module each.
+//
+// RPCS3's two names past the module calls (D-639): its variable s_sysmodule_context, RPCS3's copy of libsysmodule's
+// own data in guest memory, exported with RPCS3's layout and kept in step with the state here once something links it;
+// and the export 0x59521326, the console's OpenPSID decrypted with a key libsysmodule holds, as RPCS3 makes it.
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <format>
 #include <initializer_list>
 #include <mutex>
 #include <string_view>
@@ -29,6 +35,8 @@
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/crypto.hpp"
+#include "pspocket/recomp/sysmodule_key.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -266,12 +274,31 @@ bool internal_id(u16 id) { return id >= kInternalBase && (id & kInternalMask) < 
 // module (not tracked here).
 constexpr u16 kDefaultModules[] = {0x15, 0x10, 0x11, 0x17, 0x0A, 0x0E};
 
+// RPCS3's s_sysmodule_context (cellSysmodule.cpp sysmodule_context, D-639): sys_lwmutex_t mutex (24 bytes), be u32
+// unk_addr at 0x18, u32 mem_container_id at 0x1C, b8 use_mem_container at 0x20, module_state module_states[189] at 0x24
+// (s32 loaded_count, s32 prx_id), char module_base_path[16] at 0x60C, u8 module_base_path_size at 0x61C: 0x620 bytes,
+// aligned to 8 (the lwmutex's). The 189 states are the 93 public modules, the 87 internal ones (from 93, the order of
+// SysmoduleState::loaded) and RPCS3's nine variants (liblv2dbg for DEX and CEX at 180 and 181, libgcm_sys_deh and
+// libgcm_sys at 182 and 183, libfs and libfs_155 at 184 and 185, libprof, liblv2coredump and libgpad at 186 to 188).
+constexpr u32 kContextNid = 0xA1B6F70B, kContextSize = 0x620, kContextAlign = 8;
+constexpr u32 kCtxContainerId = 0x1C, kCtxUseContainer = 0x20, kCtxStates = 0x24, kCtxBasePath = 0x60C,
+              kCtxBasePathSize = 0x61C;
+constexpr u32 kContextStates = 189;
+constexpr u16 kFs = 0x0E, kGcmSys = 0x10, kLv2Dbg = 0x2E;
+// The variants RPCS3 keeps in step with those three for a retail console's game: liblv2dbg_for_cex, libgcm_sys, libfs.
+constexpr u32 kLv2DbgCex = 181, kGcmSysRetail = 183, kFsRetail = 184;
+constexpr std::string_view kBasePath = "/dev_flash/sys/", kBasePathDebug = "/app_home/"; // RPCS3 MODULE_BASE_PATH*
+
 struct SysmoduleState {
     std::mutex mutex;
     std::array<s32, kExternalCount + kInternalCount> loaded{}; // external IDs, then internal ones by index
     u32 container = kNoContainer; // cellSysmoduleSetMemcontainer's: where later loads would put their PRX images
+    u32 last_container = 0;       // the last container taken, which s_sysmodule_context keeps when none is used
     bool debug_mode = false;      // cellSysmoduleSetDebugmode(1): modules from /app_home/ (recorded only)
     std::recursive_mutex file_mutex; // the module file calls (RPCS3's lwmutex; module_start may load more)
+    // s_sysmodule_context's address once something has linked it (0 before: it is laid out only then), under `mutex`.
+    u32 context = 0;
+    u8* context_base = nullptr;
 
     explicit SysmoduleState(HleProcess& p)
     {
@@ -281,6 +308,55 @@ struct SysmoduleState {
         if (sdk_330) loaded[kExternalCount + (kNpTrophy & kInternalMask)] = 1;
     }
 };
+
+// ---- s_sysmodule_context, kept in step with the state (under its mutex)
+
+void publish_count(SysmoduleState& s, usize index)
+{
+    if (!s.context) return;
+    const auto put = [&](u32 state) {
+        ps_write32(s.context_base, s.context + kCtxStates + 8 * state, static_cast<u32>(s.loaded[index]));
+    };
+    put(static_cast<u32>(index));
+    if (index == kLv2Dbg) put(kLv2DbgCex);
+    if (index == kGcmSys) put(kGcmSysRetail);
+    if (index == kFs) put(kFsRetail);
+}
+
+void publish_container(SysmoduleState& s)
+{
+    if (!s.context) return;
+    ps_write32(s.context_base, s.context + kCtxContainerId, s.last_container);
+    ps_write8(s.context_base, s.context + kCtxUseContainer, s.container != kNoContainer ? 1 : 0);
+}
+
+// As RPCS3's cellSysmoduleSetDebugmode: the path and its NUL over the one there, then its size.
+void publish_base_path(SysmoduleState& s)
+{
+    if (!s.context) return;
+    const std::string_view path = s.debug_mode ? kBasePathDebug : kBasePath;
+    std::memcpy(s.context_base + s.context + kCtxBasePath, path.data(), path.size());
+    ps_write8(s.context_base, s.context + kCtxBasePath + static_cast<u32>(path.size()), 0);
+    ps_write8(s.context_base, s.context + kCtxBasePathSize, static_cast<u8>(path.size()));
+}
+
+// The variable's layout (HleProcess::link_variable: zeroed, then this, once): RPCS3's own (its REG_VAR init: no memory
+// taken, no container, every module unloaded with no PRX, the retail modules' path), then the state as it stands.
+void init_sysmodule_context(u8* base, u32 addr)
+{
+    for (u32 i = 0; i < kContextStates; i++) ps_write32(base, addr + kCtxStates + 8 * i + 4, 0xFFFFFFFF); // prx_id
+    std::memcpy(base + addr + kCtxBasePath, kBasePath.data(), kBasePath.size());
+    ps_write8(base, addr + kCtxBasePathSize, static_cast<u8>(kBasePath.size()));
+    HleProcess* p = HleProcess::current();
+    if (!p) return;
+    SysmoduleState& s = p->state<SysmoduleState>();
+    std::lock_guard lock(s.mutex);
+    s.context = addr;
+    s.context_base = base;
+    for (usize i = 0; i < s.loaded.size(); i++) publish_count(s, i);
+    publish_container(s);
+    publish_base_path(s);
+}
 
 SysmoduleState& state()
 {
@@ -301,6 +377,7 @@ s32 load_one(SysmoduleState& s, u16 id)
     std::lock_guard lock(s.mutex);
     if (s.loaded[id] == 0x7FFFFFFF) return error(CELL_SYSMODULE_ERROR_FATAL);
     s.loaded[id]++;
+    publish_count(s, id);
     return lv2::CELL_OK;
 }
 
@@ -309,6 +386,7 @@ void unload_one(SysmoduleState& s, u16 id)
     if (!kModules[id].has_image) return;
     std::lock_guard lock(s.mutex);
     if (s.loaded[id] > 0) s.loaded[id]--;
+    publish_count(s, id);
 }
 
 s32 load(SysmoduleState& s, u16 id)
@@ -351,9 +429,10 @@ s32 load_internal(SysmoduleState& s, u16 id)
         if (r != lv2::CELL_OK && r != error(CELL_SYSMODULE_ERROR_DUPLICATED)) return r;
     }
     std::lock_guard lock(s.mutex);
-    s32& count = s.loaded[kExternalCount + (id & kInternalMask)];
-    if (count == 0x7FFFFFFF) return error(CELL_SYSMODULE_ERROR_FATAL);
-    count++;
+    const usize index = kExternalCount + (id & kInternalMask);
+    if (s.loaded[index] == 0x7FFFFFFF) return error(CELL_SYSMODULE_ERROR_FATAL);
+    s.loaded[index]++;
+    publish_count(s, index);
     return lv2::CELL_OK;
 }
 
@@ -362,8 +441,9 @@ s32 unload_internal(SysmoduleState& s, u16 id)
     if (!internal_id(id)) return error(CELL_SYSMODULE_ERROR_UNKNOWN);
     {
         std::lock_guard lock(s.mutex);
-        s32& count = s.loaded[kExternalCount + (id & kInternalMask)];
-        if (count > 0) count--;
+        const usize index = kExternalCount + (id & kInternalMask);
+        if (s.loaded[index] > 0) s.loaded[index]--;
+        publish_count(s, index);
     }
     const auto& deps = kInternal[id & kInternalMask].dependencies;
     for (auto it = std::rbegin(deps); it != std::rend(deps); ++it) {
@@ -452,6 +532,8 @@ s32 cellSysmoduleSetMemcontainer(PPUContext& ctx, u32 ct_id)
     }
     std::lock_guard lock(s.mutex);
     s.container = usable ? ct_id : kNoContainer;
+    if (s.container != kNoContainer) s.last_container = ct_id;
+    publish_container(s);
     return usable ? lv2::CELL_OK : error(CELL_SYSMODULE_ERROR_INVALID_MEMCONTAINER);
 }
 
@@ -543,7 +625,9 @@ s32 cellSysmoduleSetDebugmode(PPUContext&, u32 mode)
     SysmoduleState& s = state();
     std::lock_guard lock(s.mutex);
     s.debug_mode = mode == 1;
-    PS_LOG_INFO(kChan, "cellSysmoduleSetDebugmode({}): modules from {}", mode, s.debug_mode ? "/app_home/" : "/dev_flash/sys/");
+    publish_base_path(s);
+    PS_LOG_INFO(kChan, "cellSysmoduleSetDebugmode({}): modules from {}", mode,
+        s.debug_mode ? kBasePathDebug : kBasePath);
     return lv2::CELL_OK;
 }
 
@@ -620,6 +704,39 @@ s32 cellSysmoduleFetchImage(PPUContext& ctx, u16 id, u32 buf, u32 buf_size)
     return lv2::CELL_OK;
 }
 
+// ---- the export 0x59521326 (RPCS3 cellSysmodule_0x59521326; its name is not known)
+
+constexpr s32 kOpenPsidError = -22; // RPCS3's answer
+constexpr u32 kSysSsGetOpenPsid = 872;
+
+// cellSysmodule_0x59521326(u8 output[16]), as RPCS3 makes it: the console's OpenPSID (lv2's sys_ss_get_open_psid),
+// its two 64-bit halves swapped, decrypted with AES-128-CBC under libsysmodule's key (scripts/self-keys.py takes it
+// from RPCS3's source into the build), the swapped OpenPSID being the IV too, into the caller's 16 bytes. -22 for no
+// output or when sys_ss_get_open_psid fails, and here also for an output that is not guest memory (RPCS3 ensure()s).
+// Unverified (D-594): not compared with libsysmodule; registered only in a build that has the key (D-639).
+s32 cellSysmodule_0x59521326(PPUContext& ctx, u32 output)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    u8* base = guest_base(ctx);
+    if (!output) return kOpenPsidError;
+    StackVar psid(ctx, base, 16); // CellSsOpenPSID: be u64 high, low
+    if (lv2_syscall(ctx, kSysSsGetOpenPsid, {psid.addr()}) != 0) return kOpenPsidError;
+    if (!guest_readable(t, output, 16)) {
+        log_call_site(ctx, base, std::format("cellSysmodule_0x59521326: the output {:#x} is not guest memory", output));
+        return kOpenPsidError;
+    }
+    std::array<u8, 16> swapped{}, out{};
+    std::memcpy(swapped.data(), base + psid.addr() + 8, 8);
+    std::memcpy(swapped.data() + 8, base + psid.addr(), 8);
+    const recomp::SysmoduleKey& key = recomp::builtin_sysmodule_key();
+    if (!recomp::crypto::aes_cbc_decrypt(key.key, swapped.data(), swapped.data(), swapped.size(), out.data())) {
+        PS_LOG_ERROR(kChan, "cellSysmodule_0x59521326: AES-128-CBC failed");
+        return kOpenPsidError;
+    }
+    std::memcpy(base + output, out.data(), out.size());
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_cellSysmodule(Registry& r)
@@ -643,6 +760,12 @@ void register_cellSysmodule(Registry& r)
         PS_HLE_FUNC(0x3C92BE09, cellSysmoduleFetchImage),
         PS_HLE_FUNC(0x002CD0BF, cellSysmoduleSetInternalmode),
     });
+    // Without the key (a build without RPCS3's source) the export stays unimplemented: a call logs and fails (D-639).
+    if (recomp::builtin_sysmodule_key().present)
+        r.add("cellSysmodule", {PS_HLE_UNVERIFIED(0x59521326, cellSysmodule_0x59521326)});
+    // RPCS3's variable (hidden there: no game or module imports it), laid out when something links it (D-639).
+    r.add_variables("cellSysmodule",
+        {PS_HLE_VAR(kContextNid, s_sysmodule_context, kContextSize, kContextAlign, &init_sysmodule_context)});
 }
 
 } // namespace pspocket::hle

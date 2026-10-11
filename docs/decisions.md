@@ -9568,3 +9568,754 @@ too.
   vdec_test_util.hpp's wait for the last pictures, the decoder thread idle on its queue); 40 runs of the case alone did
   not repeat it. The helper's log count is now cut at the log's 255 entries and that wait at 30 s, so such a run fails
   with a line saying so instead of hanging.
+
+## D-635 · 2026-10-10 · cellNetAoi as a console with no ad hoc wireless: the link never up, the peers kept, firmware-first
+
+cellNetAoi links a PS3 game with PSP peers: a PSP in ad hoc mode, reached through the PS3's wireless LAN. RPCS3
+registers its nine names with no arguments (rpcs3/Emu/Cell/Modules/cellNetAoi.cpp: todos answering CELL_OK) and nothing
+public describes the library, so pspocket's (runtime/hle/src/cellNetAoi.cpp) is the smallest model the names describe,
+for a console whose network is disconnected (cellNetCtl, D-024) and which has no ad hoc link to a PSP (an iPhone has
+none). Firmware-first (D-563): where the system software has the library's module, a game gets Sony's.
+- **The library.** Init and Term bracket it, a process each: any other call before Init or after Term is
+  NOT_INITIALIZED, a second Init NOT_TERMINATED; Term forgets the peers. Init's and Start's arguments are not read.
+- **The link never comes up.** Start answers NOT_CONNECTED, and so does Stop (nothing was started). What the link
+  would tell, this station's information (GetLocalInfo), a peer's (GetRemotePeerInfo, for a peer the game added) and the
+  title ID of the game the PSP on it plays (GetPspTitleId: a PSP's ad hoc network is named after its game), answers
+  NOT_CONNECTED once the pointers are checked, and nothing is written. GetPspTitleId is read as the PSP's game, not as
+  a value the game gave at Init: a getter of an Init argument would read a structure nobody has described, and could
+  hand back bytes that are not a title ID.
+- **Peers.** AddPeer and DeletePeer keep the set of peers by their 6-byte MAC address (a station's identity in a PSP's
+  ad hoc mode), read through the pointer the call takes: 16 at most (a PSP ad hoc group), the 17th HANDLER_MAX; adding
+  one already kept answers CELL_OK and changes nothing; deleting, or asking after, one not kept is ID_NOT_FOUND. They
+  are kept with or without the link: adding a peer needs nothing from it.
+- **Error codes.** The library's own are not known; these are cellNetCtl's (rpcs3/Emu/Cell/Modules/cellNetCtl.h), the
+  network facility's documented codes, each for its own meaning: NOT_INITIALIZED 0x80130101, NOT_TERMINATED
+  0x80130102, HANDLER_MAX 0x80130103, ID_NOT_FOUND 0x80130104, INVALID_ADDR 0x80130107 (a null pointer, or one that is
+  not guest memory, logged with the call site), NOT_CONNECTED 0x80130108. The library's state is checked first, then
+  the pointers, then the peer.
+To check on the Mac, against Sony's module (first which module exports cellNetAoi: if it is one pspocket always serves,
+the marker changes nothing): the nine signatures (what Init and Start take; whether a peer is a MAC address, an IP
+address or an NP ID; GetRemotePeerInfo's argument order; what GetPspTitleId writes), the error codes and the order of
+the checks, what Start answers on a PS3 that is not connected or whose wireless is in use, whether AddPeer needs the
+link, the peer limit.
+Tests: tests/hle/test_netaoi.cpp (every function before Init and after Term; Start, Stop and the three getters with
+nothing written; sixteen peers and the seventeenth, a peer given from another buffer, one added twice, Term forgetting
+them; a process each).
+
+## D-636 · 2026-10-10 · libmedi as a console with no PSN: the mediator's contexts kept, all else offline, firmware-first
+
+libmedi (cellMediator, 10 functions) is Sony's mediator service: through it a game's reports go to a provider on PSN,
+signed by the console. RPCS3 registers the ten names with no arguments (rpcs3/Emu/Cell/Modules/libmedi.cpp: todos
+answering CELL_OK) and nothing public describes the library. What is known: it depends on libnet and NP (RPCS3
+cellSysmodule.cpp DEPENDENCIES_MEDI) and signs with the console's own key through lv2's sys_ss_ad_sign (D-527, read
+from the firmware's modules). pspocket's (runtime/hle/src/libmedi.cpp) is that library on a console that never reaches
+PSN; firmware-first (D-563).
+- **Contexts** are the library's own bookkeeping: CreateContext makes one, at most 32 (as NP's title contexts, RPCS3
+  SCE_NP_LOOKUP_MAX_CTX_NUM), and answers its ID, 1 to 32 (the lowest free), as NP's title context creators answer
+  theirs (sceNpLookupCreateTitleCtx); the 33rd is ID_NO_SPACE. Its arguments (what the mediator would be told) are not
+  read and nothing is written: an ID written through a pointer guessed wrong would land in the game's own data.
+  CloseContext forgets one; an ID not open is ID_NOT_FOUND for every call.
+- **Everything a context does needs the mediator on PSN**: its status, the provider's URL, the user's information,
+  posting reports (PostReports, ReliablePostReports) and sending the reports kept for later (FlushCache) answer
+  SCE_NP_ERROR_OFFLINE, after the context ID and the pointer the call fills or reads (its second argument) are checked;
+  nothing is written. GetStatus gives the context's state as that answer rather than as a status word: the status
+  values are not known, and a value made up here would read as Sony's.
+- **The signature is the console's**, made by the PS3's security service with keys only a PS3 holds (sys_ss_ad_sign):
+  Sign and GetSignatureLength answer CELL_ENOTSUP, lv2's "not supported", after the same checks. pspocket's lv2 answers
+  sys_ss_ad_sign itself with CELL_OK and no signature, for Sony's modules (D-527); this library does not call it, so it
+  never hands out a signature it did not make. The length is not answered either: Sony's is not known, and no
+  signature of any length can be made here.
+- **Error codes.** The library's own are not known; these are NP's (rpcs3/Emu/Cell/Modules/sceNp.h), the closest
+  documented ones: INVALID_ARGUMENT 0x8002aa03 (a null pointer or one that is not guest memory, logged with the call
+  site), ID_NO_SPACE 0x8002aa05, ID_NOT_FOUND 0x8002aa06, OFFLINE 0x8002aa0c; and lv2's CELL_ENOTSUP 0x80010037.
+To check on the Mac, against libmedi.sprx: the signatures (CreateContext's parameters and where the ID goes; which
+argument each call fills), the error codes and the order of the checks, whether a context can be made offline at all
+and what GetStatus reports for it, the signature's length and whether Sign works on a PS3 that is offline (it needs no
+network), whether ReliablePostReports keeps reports while offline, the context limit.
+Tests: tests/hle/test_medi.cpp (contexts 1 to 32 and the 33rd, the lowest free ID again, IDs never open; each call's
+answer, its pointer's checks, the context before them, nothing written; a closed context gone for every call; a
+process each).
+
+## D-637 · 2026-10-10 · libad_core and libad_async as a console never online: contexts shared, never connected, firmware-first
+
+libad_core (7 functions) and libad_async (6) are Sony's in-game advertising: contexts connected to the ad server on
+PSN, the ad spaces a game shows and their assets, the reports of what was shown. RPCS3 registers their thirteen names
+with no arguments (rpcs3/Emu/Cell/Modules/libad_core.cpp, libad_async.cpp: todos answering CELL_OK) and nothing public
+describes them. Known: libad_core depends on libfs, libnet and NP, libad_async on libad_core (RPCS3 cellSysmodule.cpp
+DEPENDENCIES_AD_CORE, DEPENDENCIES_AD_ASYNC), and libad_core signs with the console's key (sys_ss_ad_sign, D-527).
+pspocket's (runtime/hle/src/libad.cpp) are those libraries on a console that never reaches PSN and has never been online
+(no ads kept on its disk); both firmware-first (D-563).
+- **Contexts**: sceAdOpenContext and sceAdAsyncOpenContext make one (at most 32, as NP's title contexts) and answer its
+  ID, 1 to 32, as D-636's; their arguments are not read, nothing is written. libad_async being a layer over libad_core,
+  the two share their contexts: sceAdCloseContext and sceAdAsyncCloseContext forget one, whichever opened it.
+- **Never connected**: sceAdConnectContext and sceAdAsyncConnectContext answer SCE_NP_ERROR_OFFLINE (the asynchronous
+  one at once: there is nothing to wait for, and how its completion would be told is not known), and so does
+  everything a connection gives: the connection's information (sceAdGetConnectionInfo, its pointer checked), an ad
+  space's and an asset's (sceAdGetSpaceInfo, sceAdGetAssetInfo), opening an ad space (sceAdAsyncSpaceOpen), sending the
+  reports (sceAdFlushReports, sceAdAsyncFlushReports). Each after the context ID is checked; nothing is written. No
+  space is ever open, so sceAdAsyncSpaceClose finds none (ID_NOT_FOUND) once the context is found.
+- **Error codes**: NP's, as D-636's: INVALID_ARGUMENT, ID_NO_SPACE, ID_NOT_FOUND (a context or a space not open),
+  OFFLINE.
+To check on the Mac, against libad_core.sprx and libad_async.sprx: the signatures (OpenContext's parameters and where
+the ID goes; a space's identity; how the asynchronous calls tell their completion: a callback or a state to poll), the
+error codes and the order of the checks, whether the two libraries' contexts are one set, whether a space opens without
+a connection (from ads kept on disk), the context limit.
+Tests: tests/hle/test_ad.cpp (contexts 1 to 32 from either library and the 33rd, either library closing either's; every
+call's answer on contexts of both, an ID not open, the connection information's pointer, a space never open, nothing
+written; a closed context gone for every call; a process each).
+
+## D-638 · 2026-10-10 · cellLibprof: user trace registrations kept, no profiler attached, firmware-first
+
+cellLibprof (cellUserTraceInit, Register, Unregister, Terminate) is the user trace of Sony's profiler (libprof.sprx),
+through which a game marks its own events for the performance tools. The module belongs to the development tools, not
+to a retail system's software, so on a retail PS3 these imports never resolve (docs/firmware.md) and a game that runs
+there does not depend on them. RPCS3 registers the four names with no arguments (rpcs3/Emu/Cell/Modules/cellLibprof.cpp:
+todos answering CELL_OK; its cellSysmodule.cpp lists external/libprof.sprx). pspocket's
+(runtime/hle/src/cellLibprof.cpp) keeps what the game registers and does nothing else: no profiler is attached to read
+the traces. Firmware-first (D-563), though no retail system software has the module.
+- Init and Terminate bracket the library, a process each: any other call before Init or after Terminate, and a second
+  Init, answer CELL_ESTAT. Init's arguments are not read.
+- Register keeps a registration under its first argument (what the game names its trace by: an ID or the address of
+  its description, as sys_ppu_thread_register_atexit and cellSysutilRegisterCallback key theirs), its next two arguments
+  as given; at most 64. A registration under 0 is CELL_EINVAL, one already kept CELL_EEXIST, the 65th CELL_EAGAIN.
+  Unregister forgets one (CELL_ESRCH for one not kept); Terminate forgets them all.
+- Error codes: the library's own are not known; these are lv2's (sys/return_code.h, rpcs3/Emu/Cell/ErrorCodes.h), which
+  the system libraries share.
+To check on the Mac, where a development system's software is at hand (a retail one has no libprof): the signatures
+(what Init takes; whether Register answers an ID or keys on what it is given), the error codes, the registration limit.
+Tests: tests/hle/test_libprof.cpp (every call before Init and after Terminate, a second Init; a registration kept,
+refused twice, forgotten and made again; 64 and the 65th; Terminate forgetting them; a process each).
+
+## D-639 · 2026-10-10 · cellSysmodule's export 0x59521326 as RPCS3 makes it, its key from RPCS3 at build time; s_sysmodule_context
+
+The last two of cellSysmodule's names in the chart (D-184 left the first out: its key is RPCS3's):
+- **cellSysmodule_0x59521326(u8 output[16])**, libsysmodule's export of that NID (its name is not known), as RPCS3
+  makes it (rpcs3/Emu/Cell/Modules/cellSysmodule.cpp): the console's OpenPSID from lv2's sys_ss_get_open_psid
+  (pspocket's lv2: Config::console_psid_*), its two 64-bit halves swapped, decrypted with AES-128-CBC under
+  libsysmodule's key (RPCS3's KEY_UNK), the swapped OpenPSID being the IV as well, into the caller's 16 bytes. -22,
+  RPCS3's answer, for no output or a failed sys_ss_get_open_psid, and here also for an output that is not guest memory
+  (RPCS3 ensure()s; logged with the call site).
+- **The key** comes from RPCS3's source at build time into the build directory only, as the SELF keys do (D-121):
+  scripts/self-keys.py reads the sixteen constants of KEY_UNK in rpcs3/Emu/Cell/Modules/cellSysmodule.cpp into the
+  generated self_keys.cpp (recomp::builtin_sysmodule_key, pspocket/recomp/sysmodule_key.hpp), which the iOS app compiles
+  from the host build as it does the other keys. Nothing of the key is in the repository; the tests compute what they
+  expect from the build's key. A build without RPCS3's source (or whose cellSysmodule.cpp lacks the array) has no key
+  and leaves the export unimplemented: it is not registered, so a call logs and fails (rule 4).
+- It is unverified (D-594): made from RPCS3, not compared with libsysmodule. cellSysmodule is a library pspocket always
+  serves (libsysmodule.sprx is on the native list), so the marker only records that.
+- **s_sysmodule_context** is RPCS3's variable (cellSysmodule.cpp sysmodule_context): its copy of libsysmodule's own
+  data in guest memory, registered hidden (MFF_HIDDEN), so no game or module imports it: only RPCS3's own cellSysmodule
+  functions read it. pspocket exports it as a host variable (PS_HLE_VAR, D-503) with RPCS3's layout: the lwmutex (24
+  bytes; none is made, pspocket's lock being the host's), unk_addr at 0x18 (0: no memory is taken at module start),
+  mem_container_id at 0x1C, use_mem_container at 0x20, the 189 module states at 0x24 (load count and PRX ID, big-endian
+  as a PS3's would be, where RPCS3 leaves those two fields in the host's byte order), the base path at 0x60C and its
+  size at 0x61C; 0x620 bytes, aligned to 8. It is laid out when something links it, as RPCS3's init leaves it (every
+  PRX ID -1, pspocket's modules having no PRX; the retail modules' path), then holds pspocket's state as it stands and
+  is kept in step with it from then on: each load count (the 93 public modules and the 87 internal ones; the retail
+  variants RPCS3 keeps beside GCM_SYS, FS and LV2DBG, libgcm_sys, libfs and liblv2dbg_for_cex, in step with them), the
+  container in use (the last one taken stays when none is used, as RPCS3 keeps it), the debug mode's path (written over
+  the retail one as RPCS3 copies it). pspocket's module states stay the host's (D-567): nothing changes for a game.
+The count: 5,904 of 6,625 library functions pspocket's own before D-635, 5,942 after (cellNetAoi 9, libmedi 10,
+libad_core 7, libad_async 6, cellLibprof 4, cellSysmodule 2: every cell of the six).
+To check on the Mac, against libsysmodule.sprx: 0x59521326's answer for the installed console's OpenPSID, and its
+errors (RPCS3's -22).
+Tests: tests/hle/test_sysmodule.cpp (the export against the AES block functions over the swapped OpenPSID, encrypted
+back, the same each time, two other consoles giving other answers, no output and one outside guest memory; without the
+key, the export absent; the variable's size and alignment, its layout when linked after a load, loads and unloads with
+their dependencies and variants, an internal module, the debug path and back, the container taken, given up and
+refused); tests/hle/test_hle.cpp's NID check takes RPCS3's "_0x" name.
+
+## D-625 · 2026-10-10 · cellSync's LF queue: the second forms for ANY2ANY queues and the lv2 event queue, unverified
+
+The six cellSync functions pspocket lacked (RPCS3's todo stubs answering CELL_OK; no libsre here to read) are
+pspocket's own (runtime/hle/src/cellSync.cpp), unverified (D-594), made from what RPCS3's code shows of them and from
+the queue's own layout:
+- **The second forms** (_cellSyncLFQueueGetPushPointer2, GetPopPointer2, CompletePushPointer2, CompletePopPointer2).
+  RPCS3's PushBody and PopBody call them for a CELL_SYNC_QUEUE_ANY2ANY queue, with the first forms' arguments
+  ("arguments copied from" the first forms; GetPopPointer2 without arg4), and the first forms refuse ANY2ANY (PERM).
+  Initialize sets an ANY2ANY queue up apart (m_buffer's bit 0, m_bs[0..1] 0xFF, m_v1 all ones, push2 and pop2 0xFFFF,
+  m_h3 and m_h7 zeroed), and libsre's cellSyncLFQueueClear (RPCS3's, which libsre agrees with, D-169) reads the waiter
+  rings' heads and tails from m_h7 and m_h3 for ANY2ANY. So the second forms are the first forms' algorithm on both
+  sides from the PPU: the claim against the other side's completed counter, the completion bitmap, the oldest SPU waiter
+  of the side's ring taken and signalled through fpSendSignal (noQueueFull as in the first form), with the rings' packs
+  in m_h7 (pushes) and m_h3 (pops), and no event state. PERM unless the queue is ANY2ANY; the queue's memory and
+  alignment are checked as in the first forms (D-042). A blocked call sleeps until the line changes, whatever
+  useEventQueue says: in ANY2ANY the words the first forms keep the event state in are the rings' packs, so there is no
+  state to sleep on the lv2 queue with, and the event queue's one-pointer-at-a-time BUSY does not apply. PushBody and
+  PopBody take ANY2ANY queues through them (they answered NOSYS).
+- **The lv2 event queue** (_cellSyncLFQueueAttachLv2EventQueue(spus, num, queue) and Detach, RPCS3's arguments): the
+  queue a PPU thread blocked in the pointer functions with useEventQueue receives from (m_eq_id), connected to the SPU
+  threads whose side of the library sends the wake-up. A PPU queue "_sncLFQ" of 127 entries (an SPU never finds it
+  full), connected (sys_spu_thread_connect_event, the user event type) to SPU port p of every thread listed, p the lowest
+  of 0x10..0x3F free on all of them (SPURS' dynamic range, D-040); m_bs = p as one big-endian word (RPCS3 tests m_bs as a
+  word: all ones is "none") and m_eq_id = the queue, in one update of the line. Detach takes the port off every thread,
+  destroys the queue and puts m_bs back as Initialize left it. Checks: the queue and the list NULL, the queue
+  128-aligned, num 0 (INVAL), memory (FAULT); an SPU2SPU queue PERM (it has no PPU side); attaching twice and detaching
+  none STAT; detaching while a PPU thread waits on it (its side's event state set) BUSY; a port free on no thread BUSY;
+  lv2's answers (a thread that does not exist: ESRCH) as they are, with what was connected undone.
+
+To compare with libsre on the Mac (each a guess until then): the second forms' algorithm, above all how SPU code waits
+in ANY2ANY (the rings in m_h7 and m_h3, m_bs[0..1] and m_v1) and how libsre's PPU sleeps there; the event queue's name,
+size, protocol and port; where the port goes (m_bs as a word, or one of its bytes, as the SPU side of the library reads
+it); the attach's checks and errors (num 0, SPU2SPU, a second attach). A game's own SPU code that reads the port
+elsewhere would send its wake-up to the wrong port, and a PPU thread waiting in a pointer function with useEventQueue
+would then wait for ever (the bodies never use the event queue).
+
+Tests: tests/hle/test_sync.cpp: the six under their NIDs and unverified; the second forms' checks and PERM (and the first
+forms' for ANY2ANY), pointers on both sides completed out of order, AGAIN full and empty, the wrap at 2 * depth, the
+rings' packs untouched, a blocked push and pop woken by the other side's completion; SPU waiters in m_h7 and m_h3 taken
+and signalled through a guest function, noQueueFull waiting for the ring, Clear BUSY with a waiter; four PPU threads (two
+pushers, two poppers) through the bodies, 3,000 entries each popped once and each pusher's in order; the attach and
+detach on two SPU threads (a port the game took passed by, the queue and m_bs, a thread that does not exist: ESRCH with
+nothing left connected), an SPU thread's sys_spu_thread_send_event on the port it was given waking a PPU thread blocked
+in GetPushPointer with the event queue, BUSY while one waits, an ANY2ANY queue's m_bs back to 0xFFFF0000.
+
+## D-626 · 2026-10-10 · cellSpurs: CellSpursTaskset2's own tasks, created, run and joined, unverified
+
+cellSpursCreateTask2, CreateTask2WithBinInfo, JoinTask2, TryJoinTask2 and DestroyTaskset2 are pspocket's own
+(runtime/hle/src/cellSpurs.cpp, spurs_taskset.cpp), unverified (D-594). RPCS3 has UNIMPLEMENTED stubs and declares no
+signatures; libsre was not read. What they are made from: the structures RPCS3 lays out (CellSpursTaskAttribute2
+{revision, sizeContext, eaContext (u64), lsPattern, name}, which _cellSpursTaskAttribute2Initialize fills;
+CellSpursTaskBinInfo {eaElf (u64), sizeContext, reserved, lsPattern}; CellSpursTaskset2's task_exit_code[128] at 0x1980);
+what cellSpursCreateTaskset2 makes for them as libsre does (D-171: the Task2 handler's descriptor at 0x78, two lv2 event
+flags "taskset2" that libsre's JoinTask2 waits on, a task name buffer of 128 names of 32 bytes); and the SDK's signatures
+as far as they are known: CreateTask2(taskset, &id, eaElf, argument, attribute2), CreateTask2WithBinInfo(taskset, &id,
+binInfo, argument, contextBuffer, name, reserved), JoinTask2(taskset, id, &exitCode), TryJoinTask2 the same,
+DestroyTaskset2(taskset). A CellSpursTaskset2 holds 128 tasks, as a CellSpursTaskset: its larger size is the exit slots
+and libsre's own fields.
+- **Creation.** A Task2 task is a task of the taskset (create_task: its checks, the lowest free ID, its TaskInfo, its
+  start) whose ELF word has bit 2, the mark for which the taskset policy runs libsre's Task2 handler at its exit. First the
+  taskset: NULL, 128-byte ALIGN, memory (FAULT); a CellSpursTaskset is PERM (as an exit code container on one is). Then
+  the task's own checks (check_task, as for any task); then the taskset's two event flags must exist (STAT: a
+  CellSpursTaskset2 made through the attribute's size, cellSpursTasksetAttributeSetTasksetSize, has none to be joined
+  with). Before it starts, its name (31 characters, the rest of its 32-byte slot zero) goes to the name buffer when the
+  taskset has one, its exit slot is cleared and its bit of the event flag cleared. CreateTask2's attribute may be NULL (no
+  context, no name); its revision and alignment are not checked. CreateTask2WithBinInfo: a NULL bin info is
+  NULL_POINTER; the ELF, context size and pattern come from it, the context from contextBuffer (a size with no buffer:
+  NULL_POINTER); the last argument is not read.
+- **Exit** (spurs_taskset.cpp task2_exit, libsre's Task2 handler's work natively): after the task's destroy request, its
+  exit code into the first word of its exit slot (0x1980 + 16 * id) in one update of the slot's line, then bit id % 64 of
+  the first event flag (tasks 0..63) or the second (64..127). The policy tells a Task2 task by its TaskInfo's ELF word: the
+  execution context's flags at 0x2FD4 share the quadword task code stores its exit code in (the tests' tasks splat it).
+  Before, such a task stopped with "not implemented" (D-171).
+- **The ID until the join.** A Task2 task's ID stays taken from its creation until JoinTask2 takes its exit code
+  (SpursHost::task2: the IDs created and not joined, by taskset), as a thread's resources stay until pthread_join, so a
+  task created meanwhile cannot take it and overwrite the code; every creation in a CellSpursTaskset2 passes them by.
+  Creating a taskset at the address forgets them.
+- **Join.** The taskset's checks; an ID past 127 INVAL; the exit code's memory (it may be NULL: nothing is written then);
+  a task that is not a Task2 task created and not yet joined SRCH (one of cellSpursCreateTask, one joined already), one
+  another JoinTask2 waits for BUSY. Then the task's bit, AND and CLEAR: sys_event_flag_wait, or for TryJoinTask2
+  sys_event_flag_trywait, whose EBUSY (the task has not exited) is TASK_ERROR_BUSY; the code from the slot; the ID free
+  again. A wait that DestroyTaskset2 ends is TASK_ERROR_SHUTDOWN (cellSpurs.h's 0x80410920, which nothing else uses);
+  another lv2 error becomes the task error with its low byte.
+- **DestroyTaskset2.** The taskset's checks; cellSpursShutdownTaskset and cellSpursJoinTaskset (their errors as they are);
+  then both event flags: their waiters woken (sys_event_flag_cancel), destroyed, their IDs cleared; the unjoined tasks
+  forgotten. Tasks that had not run are abandoned with it, as cellSpursShutdownTaskset leaves them (D-136).
+
+To compare with libsre on the Mac (each a guess until then): the five signatures (the attribute in CreateTask2, WithBinInfo's
+seventh argument); the checks, their order and codes (PERM, STAT, SRCH, BUSY, SHUTDOWN); whether libsre keeps an exited
+task's ID until it is joined; where its Task2 handler puts the exit code (the slot's first word, or elsewhere in
+task_exit_code) and which bit of which event flag it sets; whether JoinTask2 takes a NULL exitCode; what DestroyTaskset2
+does with tasks still running and joins still waiting. The comparison (D-629) holds the refusals of all five.
+
+Tests: tests/hle/test_spurs_task2.cpp (the placeholder): the five under their NIDs and unverified; CreateTask2's checks,
+none taking an ID; three tasks run and joined in another order, each with its code, their names in the buffer (one cut to
+31), TryJoinTask2 BUSY before they ran and SRCH after the join, a task of cellSpursCreateTask SRCH; an exited task's ID
+kept until its join, a join waiting for a task that waits for a signal, a second join BUSY, a NULL exitCode, seventy tasks
+at once (64..69 through the second flag); CreateTask2WithBinInfo's checks and a task with the bin info's context that
+waits and resumes; DestroyTaskset2's checks, a waiting join ended with SHUTDOWN, the flags destroyed, the workload gone, a
+new taskset at the same address.
+
+## D-627 · 2026-10-10 · cellSpurs: task exit code containers, Get and TryGet, and the container at task creation
+
+cellSpursTaskExitCodeGet and TryGet are pspocket's own, unverified (D-594; RPCS3: UNIMPLEMENTED stubs; libsre's PPU side
+was not read), and cellSpursCreateTaskWithAttribute's exit code container, which answered STAT ("not implemented") on a
+CellSpursTaskset2, now does its work (the function's checks, compared with libsre in D-047 and D-506, are unchanged):
+- **Creation with a container**: the task gets an exit callback (the ELF word's bit 0, as D-195's tasks): its exit slot
+  names the taskset's exit code handler (the descriptor a CellSpursTaskset2 keeps at 0x1900) with the container as its
+  argument, so the native taskset policy stores the code there when the task exits (D-195's handler, natively); the
+  container is bound before the task starts: its status word's bit 0, which libsre's handler requires and
+  cellSpursTaskExitCodeInitialize (zeroing, as libsre's) never sets, and a code stored before (bit 2) forgotten. A
+  container that is not guest memory is FAULT.
+- **Get and TryGet** (container, exitCode): NULL either (NULL_POINTER), the container's 128-byte ALIGN, memory (FAULT).
+  From one look at the container's line: not initialized (no task bound to it) STAT; the code stored: written, CELL_OK,
+  as often as asked (it stays until a task is bound again); else TryGet is BUSY (as cellSpursEventFlagTryWait) and Get
+  sleeps until the line changes (the handler's update), as cellSync's blocking calls do (D-169); the process ending
+  unwinds it. pspocket's Get marks nothing: libsre's PPU waiter sets bit 16 and waits on an event flag at +0x40 (D-195),
+  which the native handler has no need of and still stops loudly on (no native code sets it).
+
+To compare on the Mac: TryGet's and Get's answer for each status (the comparison, D-629, gives them for ten states);
+whether either clears anything; what libsre's creation writes into the container and the exit slot; libsre's PPU waiter
+(bit 16, the event flag at +0x40: which one, which bit).
+
+Tests: tests/hle/test_spurs_task2.cpp: both's checks, STAT unbound; a container bound by creation (its status, the task's
+ELF word and exit slot), TryGet BUSY before the task ran, a Get that waits for it, the code as often as asked; bound
+again to a task that waits for a signal (the old code forgotten, BUSY until the new one comes); a container that is not
+guest memory FAULT, on a CellSpursTaskset PERM. test_spurs_run.cpp's exit callback and handler tests are unchanged.
+
+## D-628 · 2026-10-10 · cellSpurs: the LF queue's bodies and lv2 event queue through SPURS, unverified
+
+_cellSpursLFQueuePushBody, PopBody, cellSpursLFQueueAttachLv2EventQueue and DetachLv2EventQueue are pspocket's own
+(runtime/hle/src/cellSpurs.cpp, over cellSync.cpp's queue), unverified (D-594; RPCS3: todos answering CELL_OK; libsre
+was not read). A SPURS LF queue is a CellSyncLFQueue whose eaSignal is its taskset, or its CellSpurs with bit 0 set for
+one of the whole instance (cellSpursLFQueueInitializeIWL), as _cellSpursLFQueueInitialize leaves it (D-171); its SPU side
+is task code (or a workload's policy module) that waits in the queue's rings for a signal, which a completion gives with
+fpSendSignal(eaSignal, the waiter's ID).
+- **The bodies** (queue, buffer, isBlocking: cellSpursLFQueuePush, TryPush, Pop and TryPop pass 1 or 0): cellSync's
+  bodies (their checks, the first forms for PPU2SPU and SPU2PPU queues, the second for ANY2ANY, D-625) with a signal
+  where cellSync's pass none, so a task waiting for an entry or for room is woken: _cellSpursSendSignal(taskset, ID) for
+  a taskset's queue, cellSpursSendWorkloadSignal(spurs, ID) for one of the whole instance (its waiters taken to be
+  workloads); their answer is the body's (a waiter that is no task: SRCH, the entry in). cellSync's errors become task
+  errors with their low byte (as _cellSpursLFQueueInitialize's, RPCS3's SyncErrorToSpursError). A blocked body sleeps
+  until the queue's line changes, as cellSync's do: it does not wait on an attached lv2 queue.
+- **The lv2 event queue** (queue), as cellSpursEventFlagAttachLv2EventQueue makes the event flag's: a PPU queue
+  "_spuLFQ" (127 entries, as cellSync's attach, D-625) on a dynamic SPU port of the queue's SPURS instance (the lowest
+  free of 0x10..0x3F, a port SPURS takes for itself, D-040), which SPU tasks throw their wake-up to; m_bs = the port (a
+  word, as cellSync's attach) and m_eq_id = the queue, in one update of the line. The pointer functions with
+  useEventQueue sleep on it (cellSync's, D-169). Checks: NULL, ALIGN, memory (FAULT, the taskset's too), an SPU2SPU
+  queue PERM, one attached already or none to detach STAT, detaching while a PPU thread waits on it (its side's event
+  state) BUSY; the port's errors (an instance in exception state, no free port, not initialized) as task errors, the
+  queue destroyed again. Detach puts m_bs back as Initialize left it, detaches the port and destroys the queue.
+
+To compare on the Mac: whether libsre's bodies sleep on the lv2 queue when one is attached (useEventQueue 1) and which
+signal function they pass (and what an IWL queue's waiters are); the queue's name, size and protocol; where the port
+goes and how the SPU side of the SPURS queue library reads it; the checks and codes. A different place for the port
+would leave a PPU thread in the pointer functions with useEventQueue waiting for a wake-up sent elsewhere; the bodies
+cannot hang so.
+
+Tests: tests/hle/test_spurs_task2.cpp: the bodies' checks as task errors; a PPU2SPU queue pushed until full (AGAIN),
+popped by SPU code (the host on its behalf, GETLLAR/PUTLLC), a blocked push let go by a pop; a task waiting in the push
+ring signalled by the PPU's push and joined, a waiter that is no task (SRCH, the entry in); an SPU2PPU queue popped, a
+task waiting for room signalled, a blocked pop let go by a push; ANY2ANY both ways; an IWL queue's waiter signalled with
+cellSpursSendWorkloadSignal (its workload's signal bit), one that does not exist (SRCH); the attach and detach (the
+queue, its port in the instance's map and not in spuPortBits, a PPU thread in GetPushPointer with the event queue woken
+by an SPU event on that port, BUSY while one waits, all of it gone after the detach, an IWL ANY2ANY queue).
+
+## D-629 · 2026-10-10 · cellSpurs: the job pipeline's answer and the system workload given up; D-625 to D-629 against libsre
+
+The last two of cellSpurs' grey functions, unverified (D-594; RPCS3: UNIMPLEMENTED stubs answering CELL_OK, and no
+structures; libsre was not read), in runtime/hle/src/cellSpurs.cpp:
+- **cellSpursGetJobPipelineInfo(spurs, wid, info)**: what each SPU's job chain policy module has in its pipeline (the
+  jobs it fetched, loads, runs and writes back). libsre can only take that from SPUs a job stopped on an exception: it is
+  what a job chain's exception handler asks for. A native SPURS has no such pipeline (its job chain policy runs one job
+  at a time to its end, D-055) and stops the process when a job faults (CLAUDE.md rule 5), so no chain is ever stopped in
+  one: after its checks the call answers CELL_SPURS_JOB_ERROR_STAT and writes nothing (CellSpursJobPipelineInfo's layout
+  is not known either), logged once. Checks: NULL (spurs, info), ALIGN, memory (FAULT), a workload ID past the
+  instance's (INVAL), one not registered (SRCH), one that is not a job chain (INVAL).
+- **cellSpursRemoveSystemWorkloadForUtility(spurs)**: an instance made with the system workload
+  (cellSpursAttributeEnableSystemWorkload: SPUs lent to the system's own work) gives it up, so that a system utility a
+  game starts can have them. A native SPURS lends none (its system workload does not run, as RPCS3's, D-171): the
+  removal takes SAF_SYSTEM_WORKLOAD_ENABLED away, so what needs the system workload (cellSpursSetPreemptionVictimHints)
+  is PERM afterwards, as for an instance made without one. Checks as the victim hints' (libsre's, D-506): NULL, ALIGN,
+  memory (NULL_POINTER), an instance in exception state STAT, one without the system workload (or that gave it up) PERM.
+To compare on the Mac: GetJobPipelineInfo's signature ((spurs, wid, info) is the most plausible; a game passing a job
+chain gets INVAL) and whether libsre answers outside an exception at all, and with what; for the second, what libsre does
+with the system workload's slot and whether it waits for its shutdown.
+
+**The comparison** (tests/hle/test_spurs_compare.cpp, hidden while it is expected to differ, D-597): what the thirteen of
+D-626 to D-629 show without a running SPURS kernel, against libsre: TryGet in ten states of the container's status word
+and Get where the code is stored; the refusals of the five Task2 functions on made-up tasksets of both sizes (whose
+event flag IDs nothing has, so a call that gets further fails at lv2 instead of waiting); the LF queue's Try bodies in
+every direction, around empty and full, rings empty; the lv2 event queue's refusals; the job pipeline over made-up
+instances and workload IDs 0..33 (libsre's answer and what it writes into the info area); the system workload's
+refusals. Left out: calls that would start a task, wait, or give up a system workload on a made-up instance (libsre would
+act on them): those answers are for a test with an instance libsre itself initialized. On the Mac:
+`PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare][spurs-task2]"`
+(PSPOCKET_COMPARE_TRACE=1 names each call first); PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice without the
+firmware (the halves agree on all 212 calls). cellSync's six (D-625) are not in it: its second forms and the attach need
+an ANY2ANY queue's SPU side and SPU threads libsre's own code would drive.
+
+libsre is always native (firmware_module_native: the loader never gives a game Sony's libsre), so the D-594 markers on
+these thirteen and cellSync's six change nothing a game gets, with the system software installed or not: they record
+that the functions wait for this comparison. With them cellSpurs (141 of 141) and cellSync (42 of 42) are pspocket's own:
+5,923 of 6,625 library functions (5,904 before).
+
+## D-615 · 2026-10-10 · A baseline JPEG encoder of pspocket's own, written from T.81
+
+cellJpgEnc (D-616) needs a JPEG encoder and the build has none: pspocket's JPEG code was its decoder (D-200), FFmpeg's
+builds carry no MJPEG encoder, and no third-party encoder is to be copied. runtime/hle/src/jpeg_encoder.cpp is written
+from ITU-T T.81 (the forward DCT of A.3.3, quantisation, the zigzag order of figure A.6, the Huffman coding of DC
+differences and AC run/size pairs of F.1.2 with the code tables built as annex C builds them, the marker segments of
+annex B, restart intervals) with its annex K tables, and from ITU-T T.871 (JFIF's APP0 segment, YCbCr from RGB):
+- **The stream:** SOI, a JFIF APP0 (version 1.01, no units, a 1:1 aspect, no thumbnail), DQT (8-bit tables in zigzag
+  order), SOF0 (baseline, 8-bit samples), DHT, DRI when restart markers are asked for, one interleaved scan of every
+  component (Ss 0, Se 63, no successive approximation), EOI. A gray JPEG has one component (id 1, 1x1, table 0); a
+  colour one Y, Cb and Cr (ids 1 to 3), the luma at the sampling's factors (4:4:4 1x1, 4:2:2 2x1, 4:2:0 2x2, 4:1:1
+  4x1), the chroma at 1x1 with table 1.
+- **Quality:** annex K's tables (K.1, K.2) scaled as libjpeg scales them, the convention every encoder's "quality 1 to
+  100" follows: 5000 / quality percent below 50, 200 - 2 x quality from 50, each entry rounded and kept within 1-255.
+- **DCT and quantisation:** A.3.3's transform, rows then columns, each 8-point transform split into the sums of
+  mirrored samples (a 4-point DCT gives the even outputs) and their differences (the odd ones); in double precision,
+  or in single precision for cellJpgEnc's fast method. Quantised to the nearest (A.3.4); AC kept within +-1023 and DC
+  within -1024..1023, so that a coefficient takes at most baseline's 10 bits and a DC difference 11.
+- **Edges and chroma:** the picture padded to whole MCUs by repeating its last column and row; a subsampled chroma
+  sample is the mean of the full-size samples it covers, rounded.
+- **Colour:** T.871 section 7 in 16-bit fixed point (the coefficients' sums 65536, or 0 for Cb and Cr), rounded, kept
+  within 0-255.
+- **Entropy coding:** annex K.3's typical tables (libjpeg's default too; optimised tables are not made), ZRL for
+  sixteen zeros and EOB for the rest, a 0 stuffed after each 0xFF, the last byte filled with 1 bits before a marker;
+  restart markers RST0 to RST7 in turn, each resetting the DC predictions.
+Not made (cellJpgEnc asks for none of them): optimised Huffman tables, progressive or arithmetic coding, 12-bit
+samples. Checked during the work against an independent decoder outside the repository (libjpeg-turbo through
+Pillow): every sampling at sizes from 1x1 to 200x150, qualities 10 to 100, restart intervals, both methods: its decodes
+agreed with pspocket's decoder's to 53-61 dB, and the stream sizes and PSNR with libjpeg's own encoder at the same
+quality and sampling within 2%; ffmpeg and ImageMagick read the files without a complaint.
+Tests: tests/hle/test_jpgenc.cpp: the tables at qualities 1, 10, 50, 75 and 100; T.871's white, black, red, green,
+blue and gray; every sampling and gray at seven sizes (1x1 to 100x3, most off the MCU) with both DCTs: the markers in
+order, JFIF's header, what pspocket's decoder reads back (sizes, components, colour space, each component's id and
+sampling, both tables in natural order: the DQT's zigzag order), and the picture within a PSNR 3 dB under the worst
+measured (gray 52 dB, 4:4:4 45.5, 4:2:2 42.3, 4:2:0 40.0, 4:1:1 34.2); restart intervals of 1 to 40 MCUs (the markers'
+count and RST0-7 order, the same decoded image); what cannot be a JPEG (no width, past 65535, a plane too small, two
+components, a restart interval past 65535).
+
+## D-616 · 2026-10-10 · cellJpgEnc pspocket's own on its encoder, firmware-first; its structures inferred from libpngenc's
+
+libjpgenc writes JPEG files or buffers from pictures in memory (photos, screenshots). RPCS3's
+(rpcs3/Emu/Cell/Modules/cellJpgEnc.cpp/.h) has its error codes and its enums (colour spaces, sampling formats, DCT
+methods, compression modes, locations), stub bodies and no structures. No Sony module was at hand: the library is
+firmware-first (D-563), so where the system software is installed a game still gets Sony's libjpgenc, and pspocket's
+where it is not, on the encoder of D-615. Its ten functions are made as cellPngEnc's nine are (D-566: libpngenc is the
+same SDK family and design): the handle is the work memory the game gives Open (nothing is written there);
+EncodePicture encodes on the calling thread and queues its result, at most 4 waiting (then BUSY); WaitForInput,
+WaitForOutput (RESET when the encoder is reset during a blocking wait), GetStreamInfo (oldest first, EMPTY without
+one) and Reset as there; blocking waits sleep a millisecond at a time through lv2; output to the game's buffer (what
+fits; STREAM_OVERFLOW past limitSize) or to a file made or emptied through lv2's file calls (STREAM_FILE_OPEN when it
+cannot be).
+
+**The structures, inferred** (each from RPCS3 cellPngEnc.h's with what JPEG has in place of what PNG has):
+- CellJpgEncConfig {maxWidth, maxHeight, enableSpu (b8, +8), addMemSize (+12), exParamList, exParamNum} (24 bytes):
+  PNG's but for maxBitDepth (JPEG's samples are 8 bits). Checked as RPCS3 checks PNG's, with JPEG's limit: both sizes
+  1 to 65535 (SOF's 16-bit fields), addMemSize not negative, no extended parameters; else ARG.
+- CellJpgEncAttr {memSize, cmdQueueDepth (u8), versionUpper (+8), versionLower}, CellJpgEncResource {memAddr,
+  memSize, ppuThreadPriority, spuThreadPriority}, CellJpgEncResourceEx {memAddr, memSize, ppuThreadPriority, spurs,
+  priority[8]}, CellJpgEncOutputParam {location, streamFileName, streamAddr, limitSize} and CellJpgEncStreamInfo
+  {state, location, streamFileName, streamAddr, limitSize, streamSize, processedLine, userData (u64, +32)}: PNG's.
+- CellJpgEncPicture {width, height, pitchWidth, colorSpace, pictureAddr (+16), userData (u64, +24)} (32 bytes): PNG's
+  but for bitDepth and packedPixel. The pixels interleaved at full size: gray 1 byte, RGB, YCbCr (Y Cb Cr), RGBA and
+  ARGB (their alpha not encoded); pitchWidth at least a row.
+- CellJpgEncPicture2 (EncodePicture2's) {width, height, pitchWidth, colorSpace, samplingFormat (+16), pictureAddr
+  (+20), userData (+24)}: what the 2 is for is not known; taken as the picture with its sampling, which a YCbCr picture
+  from cellVdec or the camera has: FULL is CellJpgEncPicture's pixels; 4:4:4, 4:2:2, 4:2:0 and 4:1:1 a YCbCr picture's
+  planes one after another as cellVdec's YUV420_PLANAR lays them out (Y, height rows of pitchWidth bytes; then Cb, then
+  Cr, each the height over the vertical subsampling rows of pitchWidth over the horizontal subsampling bytes, both
+  rounded up). Its chroma is repeated over the samples it covers, which the encoder averages back: a JPEG at the
+  picture's own sampling has its chroma exactly.
+- CellJpgEncEncodeParam {enableSpu (b8), encodeColorSpace (+4), samplingFormat (+8), dctMethod (+12),
+  compressionMode (+16), compressionModeParam (+20)} (24 bytes): PNG's first two fields, then the enums in RPCS3's
+  order, each with its parameter. encodeColorSpace GRAYSCALE gives a gray JPEG (a colour picture's luma by T.871), any
+  other colour space a YCbCr one (JFIF), as every decoder reads them; samplingFormat its chroma, FULL (every component
+  at full size) as 4:4:4; dctMethod QUALITY (0) the double-precision DCT, FAST (5) the single-precision one;
+  compressionModeParam the quality, 1 to 100. In the stream size limit mode it is the highest quality: the stream is
+  made at the highest up to it whose stream fits limitSize (the qualities searched by halves, each stream measured),
+  else at quality 1 and cut to limitSize with STREAM_OVERFLOW; limitSize must be given then, for a file too.
+- The enums: RPCS3 writes them as one, so that its values run on from ARGB (20): sampling formats 21 to 25,
+  compression modes 6 and 7, locations 8 and 9. Taken as separate enums from 0, as libpngenc's location is (FILE 0,
+  BUFFER 1 in RPCS3 cellPngEnc.h): sampling formats YCbCr444 0, 422 1, 420 2, 411 3, FULL 4; CONSTANT_QUALITY 0,
+  STREAM_SIZE_LIMIT 1; FILE 0, BUFFER 1. The DCT methods are RPCS3's (QUALITY 0, FAST 5, libjpgdec's two values).
+
+**pspocket's answers where nothing is known:** QueryAttr's memSize is addMemSize + 0x10000 (0x40000 with SPUs) + 64
+bytes a column of maxWidth (the MCU rows a baseline encoder keeps), kept modest so that a game sized by Sony's numbers
+is not refused for memory pspocket does not use; cmdQueueDepth 4 and versionUpper 0x270000, versionLower 0, as
+libpngenc's (D-566). EncodePicture's checks: the handle, every structure in guest memory, width and height at least 1
+and at most the configuration's, a known colour space, a pitch of at least a row, the whole picture in guest memory, a
+known encode colour space, sampling format, DCT method and compression mode, a quality of 1 to 100, a file name for a
+file and an address and limit for a buffer: else ARG and nothing queued. enableSpu is noted once: the picture is
+encoded on the calling thread. SEQ, FATAL and STREAM_SKIP are never answered.
+
+To check on the Mac with Sony's libjpgenc (each guess above): the structures' layouts and sizes, the enums' values,
+QueryAttr's answers, the dimension and quality limits, what encodeColorSpace accepts and whether FULL writes RGB
+components, what the size limit mode limits (limitSize, or compressionModeParam as the limit) and what it does when it
+cannot, what EncodePicture2 takes, the stream's markers (JFIF's version, Sony's tables and their scaling by quality,
+restart intervals, optimised Huffman tables), the queue's depth and order, the stream information after Reset.
+The count: 5,942 of 6,625 library functions pspocket's own before, 5,952 after.
+Tests: tests/hle/test_jpgenc.cpp, 10 cases: the ten functions and the marker; QueryAttr's memory and every check of
+the configuration, Open, OpenEx and Close; RGB, RGBA, ARGB and YCbCr pictures with padded rows at every sampling, the
+same JPEG from each and the encoder's own from T.871's YCbCr, read back by pspocket's decoder within a PSNR (3 dB under
+the measured: 4:4:4 44.2 dB, 4:2:2 41.9, 4:2:0 41.6, 4:1:1 33.3); gray JPEGs from every colour space (the same), a
+gray picture as a YCbCr JPEG (neutral chroma); EncodePicture2's planes at every sampling (the encoder's JPEG of the
+chroma repeated, byte for byte) and at another sampling, FULL as EncodePicture, its refusals; qualities 1 to 100 (the
+tables, sizes and PSNR rising) and the fast method; the size limit mode (the highest quality that fits, the one above
+not; the quality asked for when it fits; a limit nothing fits: quality 1's first bytes, STREAM_OVERFLOW); the queue
+(four, BUSY, EMPTY, oldest first, userData, Reset, a buffer too small); WaitForOutput and WaitForInput blocking until
+another thread encodes or takes a stream, and RESET when it resets the encoder; a file on /dev_hdd0 (whole, and in the
+size limit mode) and one that cannot be made; every argument check of EncodePicture.
+
+## D-617 · 2026-10-10 · cellJpgDec's Ext functions on pspocket's decoder, unverified: streams in, parts out
+
+cellJpgDec's five Ext functions were Sony's (D-595: RPCS3's are bare todos that log and answer CELL_OK; only
+cellJpgDecExtCreate has its arguments there, and cellJpgDec.h none of their structures). They are now pspocket's,
+made on its decoder (D-200) as cellPngDec's and cellGifDec's are (D-595), libjpgdec being their sibling, with
+libpngdec's structures (RPCS3 cellPngDec.h) inferred for libjpgdec's; unverified (D-594): cellJpgDec is a compared
+library, so where the system software is installed a game importing one still gets Sony's whole libjpgdec. The
+compared paths are unchanged: DecodeData's row writing is shared with the parts now (the same code), and the digest of
+D-200's 1,848 answers and 149 images, found identical to Sony's, is the same.
+- ExtCreate(handle, threadInParam, threadOutParam, extThreadInParam, extThreadOutParam): CellJpgDecExtThreadInParam
+  {spurs, priority[8], maxContention} and CellJpgDecExtThreadOutParam {reserved} are checked for being guest memory
+  when given (ARG): pspocket decodes on the calling thread. Then Create, its memory the same.
+- ExtOpen(handle, stream, src, openInfo, cbCtrlStrm): Open, with stream input when CellJpgDecCbCtrlStrm
+  {cbCtrlStrmFunc, cbCtrlStrmArg} has a function: the source's buffer is the stream's first part; a stream callback
+  with a file source is STREAM_FORMAT, answered before the handle is taken (as cellPngDec's). A sixth argument
+  (libpngdec's CellPngDecOpnParam) is not read: a JPEG has no chunks to select.
+- Stream input: before ReadHeader the marker segments up to the first scan's header are asked of the callback, before
+  DecodeData the rest to EOI (through each scan's entropy-coded data: stuffed bytes, restart markers, fill bytes, and the
+  segments between a progressive file's scans), never a byte past EOI; then the decoder reads the header again over the
+  bytes now held. CellJpgDecStrmInfo {decodedStrmSize} and CellJpgDecStrmParam {strmPtr, strmSize} are in the stream's
+  guest block from +0x40; what the callback gives is copied at once. A negative answer or no bytes ends the stream (a
+  JPEG cut short: STREAM_FORMAT, or HEADER without its SOI); bytes that are not guest memory answer CB_PARAM; no stream
+  is taken past 256 MB. The plain ReadHeader and DecodeData do the same on such a stream.
+- ExtReadHeader(…, info, extInfo): ReadHeader; CellJpgDecExtInfo's reserved 8 bytes set to 0 when given (else ARG).
+- ExtSetParameter(…, inParam, outParam, extInParam, extOutParam): SetParameter; CellJpgDecExtInParam {bufferMode,
+  outputCounts, spuMode} and CellJpgDecExtOutParam {outputWidthByte (8 bytes), outputHeight}, both optional;
+  bufferMode CELL_JPGDEC_LINE_MODE (1), else ARG with the stream failed; outputCounts the lines a part (0: the whole
+  image to DecodeData's buffer); extOutParam the row and a part's lines (the height for 0).
+- ExtDecodeData(…, data, dataCtrlParam, dataOutInfo, cbCtrlDisp, dispParam): with a display callback and outputCounts
+  the image is decoded whole (the decoder decodes every scan before its output), then goes out outputCounts lines at a
+  time at the frame's pitch from CellJpgDecDispParam's nextOutputImage (the game's dispParam, else the stream's at
+  +0x50, which starts at `data`, as a first nextOutputImage of 0 does), each part followed by the display callback with
+  CellJpgDecDispInfo in CellPngDecDispInfo's layout (frame width bytes, frame height, start x bytes, start y, width
+  bytes, height, bit depth 8, components, nextOutputStartY, scanPassCount 0, outputImage), the last part too, top to
+  bottom whatever outputMode (noted once). CELL_JPGDEC_STOP (1) at commandPtr after a callback stops the rest (status
+  STOP, outputLines the lines given, CELL_OK); the first part's place not guest memory is ARG, a later one a callback
+  gave CB_PARAM, the stream failed; a JPEG that ends early gives its decoded lines in parts, then STREAM_FORMAT, damaged
+  data the whole image, then STREAM_FORMAT, as DecodeData. CellJpgDecDataOutInfo's status is STOP until the end, then
+  the mean, outputLines and FINISH. Without a callback or outputCounts: DecodeData.
+To compare with Sony's libjpgdec on the Mac: the structures (CellJpgDecDispInfo's layout above all, and ExtOpen's
+arguments), whether the last part has its callback, nextOutputStartY, scanPassCount for a progressive JPEG (libjpeg's
+buffered image mode could give each scan), which dispParam the callback gets and where the first part goes, the stop
+between parts, the order of stream and display callbacks, a stream callback with a file source, ExtCreate's checks and
+memory, the stream block's use. The count: 5,952 of 6,625 before, 5,957 after.
+Tests: tests/hle/test_jpgdec.cpp, the Ext functions as test_pngdec.cpp tests cellPngDec's (imgdec_ext_util.hpp's
+callbacks): the five unverified and the seven compared ones not; ExtCreate's checks and memory; whole (4:2:0, gray,
+restart markers, progressive gray and colour; RGB, gray and a downscaled fast ARGB), with and without a display
+callback, every answer, header, parameter and image DecodeData's; in parts (each CellJpgDecDispInfo field, the game's
+dispParam and the stream's), into one buffer the callback copies from (gray, downscaled, progressive, a line at a
+time); from a stream (20 bytes, then 37 at a time: every call's decodedStrmSize, none past EOI, the header's asked at
+ReadHeader), the plain functions on such a stream; the stop between parts; the refusals (a buffer mode, extInfo,
+a file source, the stream's bytes not guest memory, a stream cut in the header and in the scan, no place for the next
+part, the first part's place).
+
+## D-618 · 2026-10-10 · cellJpgEnc's comparison with Sony's libjpgenc, ready for the Mac
+
+cellJpgEnc is firmware-first (D-616) and its structures are guesses, so it gets its comparison as D-597's libraries
+have theirs (tests/hle/test_jpgenc_compare.cpp over compare_util.hpp, hidden: "[compare][jpgenc]"). It is where a
+session on the Mac finds out which guesses hold: one that does not shows as an answer (Sony's ARG where pspocket
+encodes, or the reverse), a frame header of another size or sampling, a stream information laid out otherwise.
+The same calls go to both halves: QueryAttr for twelve configurations (sizes to 65535 and past, SPUs, addMemSize,
+an extended parameter); Open's and OpenEx's checks and the handle; pictures in every colour space at every sampling
+format and as gray, the qualities 1 to 100, the fast method, enableSpu, EncodePicture2 with FULL and with a YCbCr
+picture's 4:2:0 planes; the stream size limit mode (a limit between two qualities' streams, then 300 bytes); the queue
+(four, BUSY, oldest first, Reset); a buffer too small; a file, and one that cannot be made; EncodePicture's checks;
+an encoder opened for SPUs.
+Compared: every answer, attribute and stream information (but its size); each JPEG whole or not, its length as
+streamSize, the 64 bytes past it, its frame header, quantisation tables (Sony's scaling of the quality), Huffman
+tables and scan header; whether pspocket's decoder (which decodes as libjpgdec does, D-200) reads it and what it
+reads: the picture within 10 steps of the other half's at qualities of 85 and up (where only the two encoders' rounding
+should differ), and its PSNR against the picture within 10% at every quality. Notes, not compared: the markers in
+order with their restart markers and the APP0 (Sony may write other APPn or COM segments, another JFIF version or
+density), each stream's size, the quality the size limit mode chose (its luma DC quantiser).
+PSPOCKET_COMPARE_SELF=1 runs it here: 816 observations, the halves agree, and pspocket's own values are checked
+(its memory measure, the handle, the frame headers of 4:2:0, 4:1:1 and gray, the size limit, the queue, the file, the
+refusals). Its function names are checked in every ctest run, with the library still firmware-first. When it matches
+on the Mac (after the fixes it shows), the test loses its [.] with cellJpgEnc's firmware-first marker, in a decision
+of its own.
+
+## D-619 · 2026-10-10 · The JPEG decoder takes an image's memory to decode it; cellJpgDec's Ext functions fuzzed
+
+The parser fuzzing (D-603) now covers cellJpgDec's Ext functions (D-617) too: tests/hle/test_fuzz_images.cpp feeds
+each damaged JPEG through ExtOpen's stream callback (the source's first bytes, then parts of 37, 512 or 4093 bytes
+read where the file lies, flush against unmapped memory) and decodes it with ExtDecodeData in parts to a display
+callback (at most 32 parts, one after another in a frame flush against unmapped memory too), or whole. Run longer
+(PSPOCKET_FUZZ_ITERS=2500), it found two ways a damaged file took the host's memory:
+- **A header alone.** pspocket's JPEG decoder (D-200) made its coefficient buffers when it read the frame header, for
+  the size the header claims: up to 65535 x 65535, some 13 GB at 4:2:0, zeroed at once; the process was killed for its
+  memory. Every ReadHeader of such a file did it (Sony's libjpgdec, libjpeg 6b, reads a header without taking its
+  image's memory). The buffers are now made by decode(), when the image is decoded (DecodeData bounds it by the
+  game's buffer, which must be guest memory); output() before decode() is refused. Nothing a game sees changes: the
+  digest of D-200's answers and images is the same.
+- **Parts of a huge image.** decode_parts (D-617) checked only that the first part's place was guest memory before
+  decoding the image whole; a header claiming a huge picture with one line a part went on to decode all of it. As
+  cellPngDec's and cellGifDec's parts (D-595), the image decoded whole is now at most 256 MB (the PS3's main memory),
+  else FATAL with the stream failed.
+Tests: tests/hle/test_jpgdec.cpp, a 16x16 JPEG whose header claims 8192 x 8192: read with no coefficients made,
+output() before decode() refused, and through cellJpgDec the header and parameters as libjpgdec gives them, DecodeData
+refused for a buffer that cannot hold the image (ARG); a gray one claiming 16384 x 16400 in parts: FATAL, no part out,
+the stream failed. The fuzz case: 2,107 damaged inputs a run (855 headers read, 144 decoded, 1,935 parts); with
+PSPOCKET_FUZZ_ITERS=2500, 5,250,007 inputs (2,074,101 headers read, 332,768 decoded, 4,400,740 parts), no fault, the
+process at most 71 MB.
+
+## D-610 · 2026-10-10 · libsynth2 pspocket's own, firmware-first: the PS2's SPU2 in software behind libsd's interface
+
+libsynth2 is the PlayStation 2's sound processor, the SPU2, as a PS3 library for games and ports that drive it the PS2
+way. Its 17 functions are the PS2's libsd under cell names: cellSoundSynth2Init is sceSdInit; SetParam/GetParam,
+SetSwitch/GetSwitch, SetAddr/GetAddr and SetCoreAttr are libsd's register calls with libsd's register numbers;
+SetEffectAttr and SetEffectMode its reverb presets; VoiceTrans and VoiceTransStatus its transfers into the 2 MB sound
+memory; Note2Pitch and Pitch2Note its pitch arithmetic; and Generate(samples, Lout, Rout, Ls, Rs) renders the next
+samples as floats for the game to give cellAudio. RPCS3 (rpcs3/Emu/Cell/Modules/libsynth2.cpp and .h) has the
+signatures, the error codes and CellSoundSynth2EffectAttr; its bodies are stubs (a log, CELL_OK or 0). No Sony module
+was at hand, so all 17 are made from what is public, each rule credited where it is used:
+- psx-spx (the PS1's SPU, one SPU2 core: "the PS2's SPU2 is basically two PS1 SPU cores sharing the same memory"): the
+  ADPCM, the pitch counter, the gaussian interpolation, the envelopes and sweeps, the noise, the reverb's formula,
+  resampling and presets;
+- ps2sdk (Academic Free License, not GPL-compatible: read for facts, nothing copied): libsd-common.h (the register,
+  entry, transfer and effect mode numbers), spu2_mmio_hwport.h and spu2regs.h (the SPU2's registers and its reverb
+  registers' order), and freesd, ps2sdk's libsd (what each call does, the initialisation, the presets and work area
+  sizes, the echo and delay arithmetic, the pitch tables and arithmetic);
+- PCSX2 (GPLv3: no code taken): what its comments and register decoding record of the SPU2 from tests (the written loop
+  address, the effect bit, ENDX writes, MMIX's bits, the IRQ seen by both cores), consulted after the code was written
+  to check its choices.
+The synthesizer is runtime/hle/src/spu2.hpp and spu2.cpp (D-611, D-612), the interface libsynth2.cpp (D-613, D-614).
+The library is firmware-first (D-563): where the system software is installed a game gets Sony's libsynth2 whole,
+pspocket's where it is not. Its only other client is libsnd3 (built on it, not made yet): pspocket's libsnd3 is to call
+it through its exports as Sony's libsnd3 does, and to be firmware-first too, so that a process never pairs Sony's
+libsnd3 with pspocket's libsynth2 or the reverse.
+
+Tests: tests/hle/test_synth2.cpp, 17 cases, about 71,700 checks, every output sample compared with the test's own model
+of the SPU2 (written from psx-spx and libsd's documents, not from spu2.cpp): synthetic VAG sounds (vag_writer.hpp in
+tests/hle, a closed-loop ADPCM encoder: sines, one-shots, silent loops) played by voices keyed on and off at pitches
+0x0800 to 0x1ABC with linear and exponential ADSR, direct and phase-inverted volumes; core 0 through core 1 with the
+voice and core mixes switched; noise; pitch modulation; swept volumes; the reverb off and on (a studio, a hall, an
+echo with its delay and feedback, the work area word for word); ENDX, ENVX, NAX, LSAX and the IRQ flag; Note2Pitch and
+Pitch2Note against values of libsd's arithmetic; every argument check and error. The comparison with Sony's module is
+written for the Mac (tests/hle/test_synth2_compare.cpp in D-597's suite, hidden: test_hle "[compare][synth2]"): the same
+calls and sounds to both halves, 2,950 observations (every answer; the registers after Init and after writes; 1,248
+Note2Pitch and about 1,100 Pitch2Note answers; the transfers; Generate's four outputs within 5 steps of 1/32768 in each
+of the unit tests' scenarios; the reverb's work areas within 0.2%). With PSPOCKET_COMPARE_SELF=1, 0 of 2,950 differ.
+The count: 5,904 of 6,625 library functions pspocket's own before, 5,921 after (libsynth2's 17 of 17).
+Speed: with every voice of both cores playing and both reverbs on, one second of output takes 66 ms of one core of the
+Linux host (6.6%).
+On the Mac: run the comparison, fix what differs (D-611 to D-614 name what to look at first: Generate's Ls and Rs, the
+effect bit, VoiceTrans's and VoiceTransStatus's answers, Config, the hot Init), then drop the firmware-first marker with
+a decision of its own.
+
+## D-611 · 2026-10-10 · libsynth2's SPU2: the voices, sample by sample
+
+runtime/hle/src/spu2.cpp renders one 48 kHz sample at a time, the SPU2's rate (pitch 0x1000 plays one sample a tick).
+Sound memory is 2 MB, byte addressed (libsd's addresses are bytes); a voice's addresses are 16-byte blocks.
+- ADPCM (psx-spx "SPU ADPCM Samples"): a block is a shift/filter byte, a flag byte (bit 0 loop end, bit 1 repeat, bit 2
+  loop start) and 28 nibbles, low first; a sample is the nibble times 2^(12 - shift) plus the prediction, (old * f0 +
+  older * f1 + 32) >> 6 with the filters (0, 0), (60, 0), (115, -52), (98, -55), (122, -60), clamped to 16 bits. Shifts
+  13 to 15 act as 9 (psx-spx's XA note; PCSX2 shifts further; Sony's encoders write 0 to 12). Filters 5 to 7 predict
+  nothing (not documented; PCSX2's table leaves them zero).
+- Blocks: a loop end sets the voice's ENDX bit and goes on at the loop address (LSAX); with the repeat bit clear the
+  envelope goes to zero and the voice stops (end and mute); the repeat bit matters only there (psx-spx's codes 1 and 3;
+  PCSX2's notes from tests). A block with the loop start flag copies its address to LSAX unless the game wrote LSAX
+  since the voice's key on (PCSX2's tests found the SPU2 keeps a written loop address; psx-spx documents the PS1's
+  override). A stopped voice moves on through its blocks without decoding them, as every SPU voice always reads memory,
+  so its ENDX, LSAX and IRQ still come.
+- Key on (psx-spx "SPU Voice Flags"): the voice starts at SSA, the envelope in attack from zero, the decoder's and the
+  interpolation's history zero, ENDX clear; key off sends a playing voice to release. KON and KOFF read back what was
+  last written.
+- Pitch (psx-spx "SPU ADPCM Pitch"): the counter adds the pitch each sample, at most 0x4000 (four samples); with the
+  voice's PMON bit (voices 1 to 23) the pitch, sign-extended, times the previous voice's output plus 0x8000, over
+  0x8000, its low 16 bits. The four latest samples are interpolated with psx-spx's 512-entry gaussian table at the
+  counter's bits 4-11 (the tests check the table by psx-spx's property: each four entries sum to 0x7F7F..0x7F81).
+- Envelopes (psx-spx "Envelope Operation depending on Shift/Step/Mode/Direction"): the step 7 - the step bits (negated
+  to decrease) times 2^(11 - shift) (1 from shift 11 up), a counter growing by 0x8000 >> (shift - 11) (0x8000 below
+  shift 11), at least 1 unless every bit of the rate is set (then it never steps), a step when its bit 15 is set; the
+  exponential increase slower past 0x6000, the exponential decrease the step times the level >> 15. Attack (ADSR1 bit 15
+  the mode, bits 8-14 the rate) to 0x7FFF; decay (bits 4-7 the shift, exponential) to the sustain level ((N + 1) *
+  0x800, N its bits 0-3; none when the attack's peak is not above it, so a level of 15 holds the peak); sustain (ADSR2
+  bit 15 the mode, bit 14 decreasing, bits 6-12 the rate) until key off; release (bit 5 the mode, bits 0-4 the shift) to
+  zero, where the voice stops. Volumes (VOLL, VOLR, MVOLL, MVOLR): bit 15 clear, bits 0-14 times two (a negative volume
+  inverts the phase); set, a sweep from the current level (bit 14 exponential, 13 decreasing, 12 negative phase, bits
+  0-6 the rate) by the same steps.
+- Noise (psx-spx "SPU Noise Generator"): one generator a core, clocked by ATTR bits 8-13 (the shift in the upper four,
+  the step in the lower two); a voice with its NON bit plays it in place of its samples, under its envelope.
+- A voice's sample: the envelope's step, the volumes' steps, the output (the interpolated sample or the noise, times
+  ENVX >> 15: OUTX, which the next voice's PMON takes), times the volumes into the mixes, then the pitch counter.
+Chosen where nothing says, to compare on the Mac: that order; NAX reads the block the voice plays, not the word; an IRQ
+is raised when a voice fetches the block holding a core's IRQ address with that core's IRQ enabled (either core's
+voices, PCSX2's note), and no libsynth2 function reports it (libsd's sceSdSetIRQCallback has no cell form): the flag is
+the engine's own, seen in the tests; writing ENVX sets the level of a voice that plays.
+
+## D-612 · 2026-10-10 · libsynth2's SPU2: the two cores, the reverb and its presets, Generate's output
+
+- Mixes (psx-spx; spu2_mmio_hwport.h; MMIX's bits as PCSX2 decodes them): each voice goes into its core's dry left, dry
+  right, wet left and wet right sums by VMIXL, VMIXR, VMIXEL and VMIXER; MMIX bits 11-8 take those, bits 3-0 the
+  external input the same way, bits 7-4 the memory input (block transfers, which libsynth2 has none of: silent). Core
+  0's output, after its master volume, is core 1's external input times AVOL (freesd: "The external Input is Core 0's
+  output"); core 1's, after its master volume, is the SPU2's. A core's output is dry plus reverb times its current
+  master volume; the sums clamp to 16 bits at each stage.
+- Reverb (psx-spx "SPU Reverb Formula", "Reverb Buffer Resampling"): the wet sum through psx-spx's 39-tap filter to 24
+  kHz; every second sample one step of the formula (the same side and different side reflections, four combs, two
+  all-pass filters) in the core's work area [ESA, EEA] of sound memory (16-bit words in the PPU's byte order), its
+  result times EVOL; back to 48 kHz through the same filter at twice its gain over the zeros between. Addresses and
+  displacements count 8 bytes and are relative to the buffer's address, which moves a word each step within the area and
+  starts again at ESA when ESA is written. With the core's effect bit clear (SetCoreAttr EFFECT_ENABLE 0) the reverb
+  neither writes nor plays and its address still moves on: PCSX2's mixer notes that the SPU2's bit "seems to disable all
+  reverb processing and output, but does not disable the advancing buffers" (psx-spx: the PS1's stops only the writes).
+- Presets (SetEffectAttr; libsd's effect.c): each mode's 32 registers as libsd sets them (off, room, studios small,
+  medium and large, hall, space, echo, delay, pipe: the studios, hall, space and pipe equal psx-spx's PS1 presets, the
+  room, echo and delay differ a little), its work area the mode's size ending at the core's EEA (0x10 to 0x18040 bytes).
+  Echo and delay take the delay ((delay + 1) * 32 into the same side reflection, the first comb and the all-pass
+  filters) and the feedback (feedback * 258 as vWALL), in libsd's 16-bit arithmetic. CLEAR (0x100) zeroes the new area,
+  and the old mode's when the effect was on. SetEffectAttr sets EVOL to the depths; SetEffectMode does the same without
+  the depths (libsd 3.3's sceSdSetEffectMode is documented nowhere public: the most plausible split). A mode past 9
+  (with or without CLEAR), or attributes that are not guest memory: INVALID_PARAMETER, nothing set. The bus is bit 0.
+- The mute bit (SetCoreAttr MUTE_ENABLE, ATTR bit 14) is kept and not applied: libsd's own initialisation sets it on
+  both cores (freesd InitCoreVolume), on the PS1 the bit set means unmuted, and PCSX2 keeps its mute at 0. The S/PDIF
+  mode is kept.
+- Generate: the SPU2's output as floats, a sample over 32768, into Lout and Rout. Ls and Rs (the surround pair) may be
+  NULL; given, they get silence: the SPU2 is stereo, and what Sony's library puts there (core 0 apart, the reverb, an
+  upmix) is not known. Lout or Rout NULL (whatever the count), or a buffer that is not guest memory for the samples:
+  INVALID_PARAMETER, nothing rendered; else no samples is CELL_OK, nothing done.
+To compare on the Mac, first: Ls and Rs; then the effect bit's silence, SetEffectMode against SetEffectAttr, the mute
+bit, and the rounding (EVOL applied at 24 kHz, where the clamps are), which the comparison's tolerance lets through but
+counts.
+
+## D-613 · 2026-10-10 · libsynth2's libsd calls: registers, Init and Exit, transfers, Config, errors
+
+- Registers (libsd-common.h): the parameter in bits 8-15, the core in bit 0, the voice in bits 1-5 (SD_VOICE); bit 7,
+  which the cores' volume parameters carry, is ignored. SetParam/GetParam 0x00-0x07: a voice's VOLL, VOLR, PITCH, ADSR1,
+  ADSR2, ENVX, VOLXL, VOLXR (the last three its current levels); 0x08-0x12: a core's MMIX, MVOLL/R, EVOLL/R, AVOLL/R,
+  BVOLL/R, MVOLXL/R. SetSwitch/GetSwitch 0x13-0x1B: the 24 voice bits of PMON, NON, KON, KOFF, ENDX, VMIXL, VMIXEL,
+  VMIXR, VMIXER. SetAddr/GetAddr 0x1C-0x22: a core's ESA, EEA, TSA, IRQA, a voice's SSA, LSAX, NAX, byte addresses kept
+  as libsd keeps them (freesd sceSdSetAddr, sceSdGetAddr): a 16-byte block's, the low four bits dropped; EEA only its
+  128 KB boundary, read with the low 17 bits set. A write to ENDX clears it, whatever the value (PCSX2: a write clears
+  the half written; libsd writes both). SetParam, SetSwitch and SetCoreAttr are void, as libsd's: an unknown register or
+  a voice past 23 changes nothing and the getters read 0, each logged once. SetAddr, which has an answer in libsynth2
+  (libsd's is void), answers INVALID_PARAMETER for an unknown register, a voice past 23 or an address past the 2 MB.
+- Core, channel and bus arguments take bit 0, as libsd does (core &= 1), a value past 1 logged once.
+- Init (libsd sceSdInit, freesd): ALREADY_INITIALIZED until Exit; flag bit 0 a hot start (other bits logged once).
+  Either way every voice gets volume 0, pitch 0x3FFF, ADSR 0 and libsd's 32 bytes at 0x5000 as its start (a looping
+  block of 0x07 bytes, then zeros), keyed on and off, ENDX cleared (within eight samples every stopped voice has met
+  that block's loop end again: ENDX all set, as on a PS2 after sceSdInit); ATTR on with the mute bit, core 1's external
+  input bit; every voice in every mix; MMIX 0xFF0 and 0xFFC; AVOL 0 and 0x7FFF; BVOL 0. A cold start (flag 0) also keys
+  every voice off, zeroes the master and effect volumes, PMON and NON, and puts each core's effect area at the top of
+  its half of memory (EEA 0x1DFFFF and 0x1FFFFF, the "off" mode's 16 bytes) with the off preset and the effect bit
+  clear; a hot one keeps those and sets the effect bit. Exit ends the library and leaves the synthesizer as it is
+  (libsd's sceSdQuit leaves the SPU2 alone) for a later Init; Exit before Init answers CELL_OK. Before Init every
+  function works on the synthesizer's power-on state (all zero: silence). FATAL is never answered: nothing here fails
+  that way.
+- VoiceTrans(channel, mode, m_addr, s_addr, size): mode bits 0-1 the direction (SD_TRANS_WRITE 0 into sound memory, READ
+  1 back), bit 3 I/O rather than DMA (the same here). The copy is made at once, the channel's TSA becomes s_addr, and
+  the answer is the bytes copied, as libsd's DMA transfer answers. STOP (2) and 3, a range past sound memory, or main
+  memory that is not the guest's: INVALID_PARAMETER, nothing copied. VoiceTransStatus answers 1, the transfer finished
+  (libsd's answer; with flag 1 libsd waits until then).
+- Config(param, value): a setting of the library that libsd has no counterpart of and pspocket's synthesizer none to
+  change: kept, logged once, CELL_OK.
+To compare on the Mac: VoiceTrans's answer (the bytes, or CELL_OK as RPCS3 types it) and VoiceTransStatus's (1, or
+CELL_OK); what Config's parameters are and do; whether Init checks its flag and what a hot start keeps; what the getters
+read for unknown registers and what SetAddr checks; whether Sony's SetParam honours bit 7 (libsd's own register table
+uses it to tell the cores' volume block from the voices').
+
+## D-614 · 2026-10-10 · libsynth2's Note2Pitch and Pitch2Note: libsd's tables and arithmetic
+
+libsd's tables are floor(0x8000 * 2^(n/12)) for the 12 semitones and floor(0x8000 * 2^(n/1536)) for the 128 fine steps
+of a semitone: freesd.c's NotePitchTable holds exactly these values. pspocket computes them; each is at least 0.0024
+from an integer, so double precision floors them alike on every host.
+- Note2Pitch(center_note, center_fine, note, fine): fine + center_fine (1/128 semitones) carried into the note; the
+  offset from the centre as octave and semitone (floors); the semitone and fine factors multiplied and shifted down 16
+  (0x4000 at the centre's octave + 2), then halved with rounding ((p + 2^(k-1)) >> k) for each octave below that. Two
+  octaves up and beyond keep that octave's values (libsd only shifts right): note 96 from 60 is 0x4000, note 127 from 0
+  0x5FE4. A scratch check against a transliteration of freesd's (decompiled) arithmetic over 4.3 million arguments
+  (fines -128 to 127, centre fines 0 to 127) found them equal everywhere. Below -128 (fine + center_fine) libsd's
+  arithmetic leaves the fine negative and reads semitone entries, or memory before its table, as fine steps; pspocket
+  carries the semitones as for any other value.
+- Pitch2Note(center_note, center_fine, pitch): the pitch (at most 0x3FFF) shifted up to its top bit (that bit's place
+  the octave, 12 the centre's), the largest semitone factor not above it, the quotient's largest fine factor not above,
+  the fine plus one and the centre's fine carried into the note: (note << 8) + (fine & 0x7E) in 16 bits (pitches 0 and 1
+  are 144 semitones below the centre).
+Tests: 21 Note2Pitch and 14 Pitch2Note values of libsd's arithmetic; every note from 12 to 83 at every fine step near
+4096 * 2^(offset / 12) (within 1 + 0.06%), rising, and back through Pitch2Note within 5 fine steps (1 from the centre
+up). To compare on the Mac: the comparison's 2,350 answers against Sony's.

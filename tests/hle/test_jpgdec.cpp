@@ -1,7 +1,8 @@
 // cellJpgDec (D-200): pspocket's JPEG decoder, alone and against Sony's libjpgdec (IJG libjpeg 6b) from the user's
 // installed system software (PSPOCKET_TEST_DEV_FLASH, firmware_compare.hpp). The JPEGs are built here
 // (jpeg_writer.hpp: gray and colour, every chroma sampling, restart markers, JFIF, Adobe or no header); the same calls
-// go to both decoders and every answer, header, parameter set and output row is compared.
+// go to both decoders and every answer, header, parameter set and output row is compared. The Ext functions (D-617)
+// as test_pngdec.cpp tests cellPngDec's: whole, in parts, from a stream.
 
 #include <catch_amalgamated.hpp>
 
@@ -18,9 +19,11 @@
 
 #include "firmware_compare.hpp"
 #include "hle_test_util.hpp"
+#include "imgdec_ext_util.hpp"
 #include "jpeg_decoder.hpp" // runtime/hle/src
 #include "jpeg_writer.hpp"
 #include "pspocket/ppu/runtime.h"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 #include "pspocket/spu/runtime.h"
 
@@ -562,4 +565,561 @@ TEST_CASE("pspocket's JPEG decoder: a scan's tables and band, and a table's coun
         CHECK_FALSE(o.decoded);
         CHECK(o.error == "a scan with a bad Huffman table");
     }
+}
+
+// ---- the Ext functions (D-617): made on pspocket's decoder as cellPngDec's are (D-595), unverified (D-594). Every
+// JPEG through them gives what DecodeData gives: whole, in parts handed to the game's display callback, and from a
+// stream the game's stream callback feeds.
+
+namespace {
+
+namespace ext = pspocket::hle::test::imgdec_ext;
+
+constexpr u32 kExtCode = kData + 0x2000, kStrmCtl = kData + 0x2800, kDispCtl = kData + 0xC0000;
+constexpr u32 kFrame = kData + 0xD0000, kPart = kData + 0x110000; // the parts' frame (0x40000), one part's buffer
+constexpr u32 kExt = kArgs + 0x300, kExtThreadIn = kExt, kExtThreadOut = kExt + 0x10, kCbStrm = kExt + 0x20,
+              kExtInfo = kExt + 0x30, kExtIn = kExt + 0x40, kExtOut = kExt + 0x50, kCbDisp = kExt + 0x60,
+              kDispParam = kExt + 0x68, kCommandWord = kExt + 0x70;
+constexpr u32 kNowhere = 0xF0000000; // not guest memory
+constexpr u32 kArg = 0x80611103, kSeq = 0x80611104, kStreamFormat = 0x80611102, kCbParam = 0x80611109;
+static_assert(kStrmCtl + 0x1800 <= kArgs && kImage + kImageMax <= kDispCtl && kPart + 0x10000 <= kData + 0x200000);
+
+constexpr u32 kExtCreate = 0x8B300F66, kExtOpen = 0xA9F703E3, kExtReadHeader = 0xB91EB3D2,
+              kExtSetParameter = 0x65CBBB16, kExtDecodeData = 0x716F8792;
+
+// One Ext decode.
+struct ExtOptions {
+    u32 counts = 3;         // CellJpgDecExtInParam's outputCounts
+    u32 mode = 0;           // the display callback's (imgdec_ext::disp)
+    bool display = true;    // a display callback
+    bool game_param = true; // the game's own CellJpgDecDispParam
+    u32 first_image = 0;    // the first part's place (0: the frame, or the part's buffer in mode 1)
+    u32 first = 0;          // stream input: the source buffer's bytes (0: the whole file, no stream callback)
+    u32 chunk = 0;          // the stream callback's part
+    u32 stream_size = 0;    // what the stream callback gives in all (0: the file)
+    u32 stream_source = 0;  // where it reads (0: the file)
+    u32 stop_at = 0;        // the display callback asking CELL_JPGDEC_STOP at this call
+    u32 buffer_mode = 1;    // CELL_JPGDEC_LINE_MODE
+};
+
+struct ExtRun {
+    u32 open = 0, header = 0, parameter = 0, decode = 0, decode_again = 0, stream = 0;
+    u64 ext_info = 0, out_width_byte = 0, pitch = 0, row = 0;
+    u32 out_height = 0, height = 0, stream_calls_at_header = 0;
+    std::string info, out_param, data_out;
+    std::vector<u8> frame; // pitch x height + 64 bytes at kFrame
+    bool data_untouched = true;
+    std::vector<ext::Part> parts;
+    std::vector<std::pair<u32, u32>> stream_calls;
+};
+
+// jpg_run's frame: 16 bytes past the row, 16-byte aligned.
+u64 frame_pitch(u64 row) { return (row + 16 + 15) & ~u64{15}; }
+
+void buffer_source(u8* b, const std::vector<u8>& file, u32 bytes)
+{
+    std::memcpy(b + kFile, file.data(), file.size());
+    std::memset(b + kSrc, 0, 0x20);
+    ps_write32(b, kSrc + 0, 1);
+    ps_write32(b, kSrc + 20, kFile);
+    ps_write32(b, kSrc + 24, bytes);
+}
+
+// CellJpgDecInParam: commandPtr, downScale, method, outputMode, outputColorSpace, outputColorAlpha.
+void in_param(u8* b, const Setting& s, u32 command)
+{
+    std::memset(b + kInParam, 0, 0x18);
+    ps_write32(b, kInParam + 0, command);
+    ps_write32(b, kInParam + 4, s.scale);
+    ps_write32(b, kInParam + 8, s.method);
+    ps_write32(b, kInParam + 12, s.mode);
+    ps_write32(b, kInParam + 16, s.space);
+    ps_write8(b, kInParam + 20, static_cast<u8>(s.alpha));
+}
+
+// DecodeData's frame for `file` in `s` (the reference), with its CellJpgDecInfo, CellJpgDecOutParam and
+// CellJpgDecDataOutInfo.
+std::vector<u8> plain_decode(u8* b, const Call& call, u32 handle, const std::vector<u8>& file, const Setting& s,
+    std::string* data_out = nullptr, std::string* info = nullptr, std::string* out_param = nullptr)
+{
+    buffer_source(b, file, static_cast<u32>(file.size()));
+    REQUIRE(call("cellJpgDecOpen", 0x976CA5C2, {handle, kStreamOut, kSrc, kOpenInfo}) == 0);
+    const u32 stream = ps_read32(b, kStreamOut);
+    std::memset(b + kInfo, 0xEE, 0x10);
+    REQUIRE(call("cellJpgDecReadHeader", 0x6D9EBCCF, {handle, stream, kInfo}) == 0);
+    if (info) *info = hex(b + kInfo, 0x10);
+    in_param(b, s, 0);
+    std::memset(b + kOutParam, 0xEE, 0x28);
+    REQUIRE(call("cellJpgDecSetParameter", 0xE08F3910, {handle, stream, kInParam, kOutParam}) == 0);
+    if (out_param) *out_param = hex(b + kOutParam, 0x24);
+    const u64 pitch = frame_pitch(ps_read64(b, kOutParam));
+    const u32 height = ps_read32(b, kOutParam + 12);
+    ps_write64(b, kCtrl, pitch);
+    std::memset(b + kFrame, 0xCC, pitch * height + 64);
+    std::memset(b + kDataOut, 0xEE, 0x0C);
+    const u32 r = call("cellJpgDecDecodeData", 0xAF8BB012, {handle, stream, kFrame, kCtrl, kDataOut});
+    REQUIRE((r == 0 || r == kStreamFormat));
+    if (data_out) *data_out = std::format("{:#x} {}", r, hex(b + kDataOut, 0x0C));
+    std::vector<u8> frame(b + kFrame, b + kFrame + pitch * height + 64);
+    REQUIRE(call("cellJpgDecClose", 0x9338A07A, {handle, stream}) == 0);
+    return frame;
+}
+
+ExtRun ext_decode(u8* b, const Call& call, const ext::Callbacks& cbs, u32 handle, const std::vector<u8>& file,
+    const Setting& s, const ExtOptions& e)
+{
+    ExtRun o;
+    buffer_source(b, file, e.first ? e.first : static_cast<u32>(file.size()));
+    std::memset(b + kStrmCtl, 0, 0x1800);
+    ps_write32(b, kStrmCtl + ext::strm::source, e.stream_source ? e.stream_source : kFile);
+    ps_write32(b, kStrmCtl + ext::strm::size, e.stream_size ? e.stream_size : static_cast<u32>(file.size()));
+    ps_write32(b, kStrmCtl + ext::strm::offset, e.first);
+    ps_write32(b, kStrmCtl + ext::strm::chunk, e.chunk);
+    ps_write32(b, kStrmCtl + ext::strm::sample, kDispCtl + ext::disp::count);
+    std::memset(b + kDispCtl, 0, 0x40);
+    ps_write32(b, kCbStrm, cbs.stream_opd);
+    ps_write32(b, kCbStrm + 4, kStrmCtl);
+    o.open = call("cellJpgDecExtOpen", kExtOpen, {handle, kStreamOut, kSrc, kOpenInfo, e.first ? kCbStrm : 0});
+    if (o.open) return o;
+    o.stream = ps_read32(b, kStreamOut);
+    std::memset(b + kExtInfo, 0xEE, 8);
+    std::memset(b + kInfo, 0xEE, 0x10);
+    o.header = call("cellJpgDecExtReadHeader", kExtReadHeader, {handle, o.stream, kInfo, kExtInfo});
+    o.ext_info = ps_read64(b, kExtInfo);
+    o.info = hex(b + kInfo, 0x10);
+    o.stream_calls_at_header = ps_read32(b, kStrmCtl + ext::strm::calls);
+    if (o.header == 0) {
+        in_param(b, s, kCommandWord);
+        ps_write32(b, kCommandWord, 0);
+        ps_write32(b, kExtIn + 0, e.buffer_mode);
+        ps_write32(b, kExtIn + 4, e.counts);
+        ps_write32(b, kExtIn + 8, 0);
+        std::memset(b + kExtOut, 0xEE, 16);
+        std::memset(b + kOutParam, 0xEE, 0x28);
+        o.parameter = call("cellJpgDecExtSetParameter", kExtSetParameter, {handle, o.stream, kInParam, kOutParam, kExtIn, kExtOut});
+        o.out_param = hex(b + kOutParam, 0x24);
+    }
+    if (o.header == 0 && o.parameter == 0) {
+        o.out_width_byte = ps_read64(b, kExtOut);
+        o.out_height = ps_read32(b, kExtOut + 8);
+        o.row = ps_read64(b, kOutParam);
+        o.height = ps_read32(b, kOutParam + 12);
+        o.pitch = frame_pitch(o.row);
+        ps_write64(b, kCtrl, o.pitch);
+        std::memset(b + kFrame, 0xCC, o.pitch * o.height + 64);
+        std::memset(b + kPart, 0xCC, 0x10000);
+        std::memset(b + kImage, 0xCC, 0x100);
+        ps_write32(b, kDispCtl + ext::disp::mode, e.mode);
+        ps_write32(b, kDispCtl + ext::disp::frame, kFrame);
+        ps_write32(b, kDispCtl + ext::disp::stop_at, e.stop_at);
+        ps_write32(b, kDispCtl + ext::disp::command, kCommandWord);
+        ps_write32(b, kCbDisp, cbs.display_opd);
+        ps_write32(b, kCbDisp + 4, kDispCtl);
+        const u32 first_image = e.first_image ? e.first_image : e.mode == 1 ? kPart : kFrame;
+        ps_write32(b, kDispParam, first_image);
+        const bool parts = e.display && e.counts;
+        const u32 data = !parts ? kFrame : e.game_param ? kImage : first_image;
+        std::memset(b + kDataOut, 0xEE, 0x0C);
+        o.decode = call("cellJpgDecExtDecodeData", kExtDecodeData,
+            {handle, o.stream, data, kCtrl, kDataOut, e.display ? kCbDisp : 0, e.game_param ? kDispParam : 0});
+        o.data_out = std::format("{:#x} {}", o.decode, hex(b + kDataOut, 0x0C));
+        o.frame.assign(b + kFrame, b + kFrame + o.pitch * o.height + 64);
+        for (u32 i = 0; i < 0x100; i++) o.data_untouched &= b[kImage + i] == 0xCC;
+        o.parts = ext::parts(b, kDispCtl);
+        o.decode_again = call("cellJpgDecExtDecodeData", kExtDecodeData, {handle, o.stream, data, kCtrl, kDataOut, kCbDisp, 0});
+    }
+    o.stream_calls = ext::stream_calls(b, kStrmCtl);
+    REQUIRE(call("cellJpgDecClose", 0x9338A07A, {handle, o.stream}) == 0);
+    return o;
+}
+
+} // namespace
+
+TEST_CASE("cellJpgDec: the Ext functions: whole, in parts to a display callback, from a stream callback (D-617)",
+    "[hle][jpgdec]")
+{
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const Call call = hle_calls(f, t);
+    // The five, unverified (D-594); the functions compared with Sony's are not.
+    const std::pair<const char*, u32> kExtFunctions[] = {{"cellJpgDecExtCreate", kExtCreate},
+        {"cellJpgDecExtOpen", kExtOpen}, {"cellJpgDecExtReadHeader", kExtReadHeader},
+        {"cellJpgDecExtSetParameter", kExtSetParameter}, {"cellJpgDecExtDecodeData", kExtDecodeData}};
+    for (const auto& [name, nid] : kExtFunctions) {
+        CHECK(recomp::nid_of(name) == nid);
+        CHECK(hle::registry().is_unverified("cellJpgDec", nid));
+    }
+    for (const u32 nid : {0xA7978F59u, 0xD8EA91F8u, 0x976CA5C2u, 0x9338A07Au, 0x6D9EBCCFu, 0xE08F3910u, 0xAF8BB012u})
+        CHECK_FALSE(hle::registry().is_unverified("cellJpgDec", nid));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellJpgDec"));
+
+    write_callbacks(b);
+    const ext::Callbacks cbs = ext::write_callbacks(b, kExtCode, 0x3C); // outputImage at CellPngDecDispInfo's place
+    std::memset(b + kArgs, 0, 0x400);
+    const u32 tin[7] = {0, 1000, 200, kMallocOpd, kHeapCtl, kFreeOpd, kHeapCtl};
+    for (u32 i = 0; i < 7; i++) ps_write32(b, kThreadIn + 4 * i, tin[i]);
+    // CellJpgDecExtThreadInParam: no SPURS, eight priorities, maxContention.
+    for (u32 i = 0; i < 8; i++) ps_write8(b, kExtThreadIn + 4 + i, 8);
+    ps_write32(b, kExtThreadIn + 12, 1);
+    CHECK(call("cellJpgDecExtCreate", kExtCreate, {kHandleOut, kThreadIn, kThreadOut, kExtThreadIn, kNowhere}) == kArg);
+    CHECK(call("cellJpgDecExtCreate", kExtCreate, {kHandleOut, kThreadIn, kThreadOut, kNowhere, kExtThreadOut}) == kArg);
+    CHECK(ps_read32(b, kHeapCtl + 4) == 0); // nothing taken for those
+    REQUIRE(call("cellJpgDecExtCreate", kExtCreate, {kHandleOut, kThreadIn, kThreadOut, kExtThreadIn, kExtThreadOut}) == 0);
+    CHECK(ps_read32(b, kThreadOut) == 0x430000);
+    const u32 handle = ps_read32(b, kHandleOut);
+    // Create's memory, the same.
+    CHECK(ps_read32(b, kHeapCtl + 4) == 1);
+    CHECK(ps_read32(b, kHeapCtl + 0x10) == 0x428);
+
+    const std::vector<jpeg::Image> images = test_images();
+    const Setting rgb{1, 0, 0, 2, 0}, rgba{1, 0, 0, 10, 0x80}, gray{1, 0, 0, 1, 0}, half{2, 5, 0, 20, 0x40};
+
+    SECTION("whole, without a display callback or with no lines per part: DecodeData's image")
+    {
+        for (const usize n : {usize{0}, usize{3}, usize{4}, usize{7}, usize{8}}) {
+            for (const Setting* s : {&rgb, &gray, &half}) {
+                std::string data_out, info, out_param;
+                const std::vector<u8> file = jpeg::encode(images[n]);
+                const std::vector<u8> want = plain_decode(b, call, handle, file, *s, &data_out, &info, &out_param);
+                for (const bool display : {false, true}) {
+                    ExtOptions e;
+                    e.display = display;
+                    e.counts = display ? 0 : 3;
+                    const ExtRun o = ext_decode(b, call, cbs, handle, file, *s, e);
+                    INFO("image " << n << ", colour space " << s->space << ", display callback " << display);
+                    REQUIRE(o.open == 0);
+                    CHECK(o.header == 0);
+                    CHECK(o.ext_info == 0); // CellJpgDecExtInfo's reserved word
+                    CHECK(o.info == info);
+                    CHECK(o.parameter == 0);
+                    CHECK(o.out_param == out_param);
+                    CHECK(o.out_width_byte == o.row);
+                    CHECK(o.out_height == (display ? o.height : std::min(3u, o.height)));
+                    CHECK(o.decode == 0);
+                    CHECK(o.data_out == data_out);
+                    CHECK(o.frame == want);
+                    CHECK(o.parts.empty());
+                    CHECK(o.decode_again == kSeq);
+                }
+            }
+        }
+    }
+
+    SECTION("in parts: outputCounts lines to each display callback, the last part too")
+    {
+        const std::vector<u8> file = jpeg::encode(images[0]); // 37x21, 4:2:0
+        std::string data_out;
+        const std::vector<u8> want = plain_decode(b, call, handle, file, rgba, &data_out);
+        for (const bool game_param : {true, false}) {
+            ExtOptions e;
+            e.game_param = game_param;
+            e.counts = 8;
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, rgba, e);
+            INFO("the game's dispParam " << game_param);
+            REQUIRE(o.decode == 0);
+            CHECK(o.out_width_byte == 37 * 4);
+            CHECK(o.out_height == 8);
+            CHECK(o.data_out == data_out); // the mean, the lines, the status
+            CHECK(o.frame == want);
+            CHECK(o.data_untouched); // the parts go to nextOutputImage (DecodeData's `data` when the game gives none)
+            REQUIRE(o.parts.size() == 3);
+            const u32 starts[3] = {0, 8, 16}, heights[3] = {8, 8, 5};
+            for (u32 i = 0; i < 3; i++) {
+                const ext::Part& p = o.parts[i];
+                CHECK(p.frame_width_byte == o.pitch);
+                CHECK(p.frame_height == 21);
+                CHECK(p.start_x_byte == 0);
+                CHECK(p.start_y == starts[i]);
+                CHECK(p.width_byte == 37 * 4);
+                CHECK(p.height == heights[i]);
+                CHECK(p.bit_depth == 8);
+                CHECK(p.components == 4);
+                CHECK(p.word_34 == starts[i] + heights[i]);       // nextOutputStartY
+                CHECK(p.word_38 == 0);                            // scanPassCount
+                CHECK(p.word_3c == kFrame + starts[i] * o.pitch); // outputImage
+                CHECK(p.param == (game_param ? kDispParam : o.stream + 0x50));
+                CHECK(p.next_image == p.word_3c);
+            }
+            CHECK(o.decode_again == kSeq);
+        }
+    }
+
+    SECTION("in parts into one buffer the callback copies from; gray; downscaled; progressive")
+    {
+        struct Case {
+            usize image;
+            Setting setting;
+            u32 counts, lines, width_byte, components;
+        };
+        const Case cases[] = {{3, gray, 2, 21, 37, 1}, {0, half, 4, 11, 19 * 4, 4}, {8, rgb, 5, 18, 29 * 3, 3},
+            {4, rgb, 1, 18, 29 * 3, 3}};
+        for (const Case& c : cases) {
+            INFO("image " << c.image << ", " << c.counts << " lines a part");
+            const std::vector<u8> file = jpeg::encode(images[c.image]);
+            const std::vector<u8> want = plain_decode(b, call, handle, file, c.setting);
+            ExtOptions e;
+            e.mode = 1;
+            e.counts = c.counts;
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, c.setting, e);
+            REQUIRE(o.decode == 0);
+            CHECK(o.out_height == c.counts);
+            CHECK(o.frame == want);
+            REQUIRE(o.parts.size() == (c.lines + c.counts - 1) / c.counts);
+            for (u32 i = 0; i < o.parts.size(); i++) {
+                CHECK(o.parts[i].word_3c == kPart);
+                CHECK(o.parts[i].start_y == i * c.counts);
+                CHECK(o.parts[i].height == std::min(c.counts, c.lines - i * c.counts));
+                CHECK(o.parts[i].components == c.components);
+                CHECK(o.parts[i].width_byte == c.width_byte);
+                CHECK(o.parts[i].frame_height == c.lines);
+            }
+        }
+    }
+
+    SECTION("from a stream: the source's first bytes, the rest from the stream callback as the decoder needs them")
+    {
+        for (const usize n : {usize{0}, usize{4}, usize{7}, usize{8}}) { // baseline; restart markers; progressive
+            INFO("image " << n);
+            const std::vector<u8> file = jpeg::encode(images[n]);
+            std::string data_out, info;
+            const std::vector<u8> want = plain_decode(b, call, handle, file, rgb, &data_out, &info);
+            ExtOptions e;
+            e.first = 20;
+            e.chunk = 37;
+            e.counts = 4;
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, rgb, e);
+            REQUIRE(o.header == 0);
+            CHECK(o.info == info);
+            CHECK(o.stream_calls_at_header > 0); // the header's segments asked for at ReadHeader
+            CHECK(o.stream_calls_at_header < o.stream_calls.size());
+            REQUIRE(o.decode == 0);
+            CHECK(o.frame == want);
+            CHECK(o.data_out == data_out);
+            // Each call told the bytes given so far; every byte given, none asked for past EOI.
+            REQUIRE(o.stream_calls.size() == (file.size() - 20 + 36) / 37);
+            for (usize i = 0; i < o.stream_calls.size(); i++) CHECK(o.stream_calls[i].first == 20 + 37 * i);
+            // The rest asked for before any part went out: the image is decoded whole first.
+            CHECK(o.stream_calls.back().second == 0);
+        }
+        {
+            // The plain ReadHeader, SetParameter and DecodeData on a stream opened with a stream callback do the same.
+            const std::vector<u8> file = jpeg::encode(images[2]);
+            std::string data_out;
+            const std::vector<u8> want = plain_decode(b, call, handle, file, rgb, &data_out);
+            buffer_source(b, file, 50);
+            std::memset(b + kStrmCtl, 0, 0x1800);
+            ps_write32(b, kStrmCtl + ext::strm::source, kFile);
+            ps_write32(b, kStrmCtl + ext::strm::size, static_cast<u32>(file.size()));
+            ps_write32(b, kStrmCtl + ext::strm::offset, 50);
+            ps_write32(b, kStrmCtl + ext::strm::chunk, 100);
+            ps_write32(b, kCbStrm, cbs.stream_opd);
+            ps_write32(b, kCbStrm + 4, kStrmCtl);
+            REQUIRE(call("cellJpgDecExtOpen", kExtOpen, {handle, kStreamOut, kSrc, kOpenInfo, kCbStrm}) == 0);
+            const u32 stream = ps_read32(b, kStreamOut);
+            REQUIRE(call("cellJpgDecReadHeader", 0x6D9EBCCF, {handle, stream, kInfo}) == 0);
+            in_param(b, rgb, 0);
+            REQUIRE(call("cellJpgDecSetParameter", 0xE08F3910, {handle, stream, kInParam, kOutParam}) == 0);
+            const u64 pitch = frame_pitch(ps_read64(b, kOutParam));
+            ps_write64(b, kCtrl, pitch);
+            std::memset(b + kFrame, 0xCC, pitch * 21 + 64);
+            std::memset(b + kDataOut, 0xEE, 0x0C);
+            const u32 r = call("cellJpgDecDecodeData", 0xAF8BB012, {handle, stream, kFrame, kCtrl, kDataOut});
+            CHECK(std::format("{:#x} {}", r, hex(b + kDataOut, 0x0C)) == data_out);
+            CHECK(std::vector<u8>(b + kFrame, b + kFrame + pitch * 21 + 64) == want);
+            CHECK(ps_read32(b, kStrmCtl + ext::strm::calls) == (file.size() - 50 + 99) / 100);
+            REQUIRE(call("cellJpgDecClose", 0x9338A07A, {handle, stream}) == 0);
+        }
+    }
+
+    SECTION("CELL_JPGDEC_STOP at commandPtr from a display callback stops the decoding")
+    {
+        const std::vector<u8> file = jpeg::encode(images[0]);
+        const std::vector<u8> want = plain_decode(b, call, handle, file, rgba);
+        ExtOptions e;
+        e.counts = 4;
+        e.stop_at = 2;
+        const ExtRun o = ext_decode(b, call, cbs, handle, file, rgba, e);
+        CHECK(o.decode == 0);
+        CHECK(o.data_out.ends_with("0000000800000001")); // outputLines 8, CELL_JPGDEC_DEC_STATUS_STOP
+        CHECK(o.parts.size() == 2);
+        CHECK(std::equal(o.frame.begin(), o.frame.begin() + static_cast<std::ptrdiff_t>(8 * o.pitch), want.begin()));
+        CHECK(o.frame[8 * o.pitch] == 0xCC); // nothing past the second part
+        CHECK(o.decode_again == kSeq);
+    }
+
+    SECTION("what the Ext functions refuse")
+    {
+        const std::vector<u8> file = jpeg::encode(images[0]);
+        {
+            // A buffer mode that is not CELL_JPGDEC_LINE_MODE: ARG, and the stream fails.
+            ExtOptions e;
+            e.buffer_mode = 2;
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, rgb, e);
+            CHECK(o.header == 0);
+            CHECK(o.parameter == kArg);
+        }
+        buffer_source(b, file, static_cast<u32>(file.size()));
+        REQUIRE(call("cellJpgDecExtOpen", kExtOpen, {handle, kStreamOut, kSrc, kOpenInfo, 0}) == 0);
+        u32 stream = ps_read32(b, kStreamOut);
+        CHECK(call("cellJpgDecExtReadHeader", kExtReadHeader, {handle, stream, kInfo, kNowhere}) == kArg);
+        REQUIRE(call("cellJpgDecExtReadHeader", kExtReadHeader, {handle, stream, kInfo, 0}) == 0);
+        in_param(b, rgb, 0);
+        ps_write32(b, kExtIn + 0, 2);
+        ps_write32(b, kExtIn + 4, 3);
+        CHECK(call("cellJpgDecExtSetParameter", kExtSetParameter, {handle, stream, kInParam, kOutParam, kExtIn, kExtOut}) == kArg);
+        ps_write64(b, kCtrl, 0x100);
+        CHECK(call("cellJpgDecExtDecodeData", kExtDecodeData, {handle, stream, kFrame, kCtrl, kDataOut, kCbDisp, 0}) == kSeq);
+        REQUIRE(call("cellJpgDecClose", 0x9338A07A, {handle, stream}) == 0);
+        // A stream callback with a file source: STREAM_FORMAT, the handle still free.
+        std::memset(b + kSrc, 0, 0x20);
+        ps_write32(b, kSrc + 4, kSrc + 0x100);
+        std::memcpy(b + kSrc + 0x100, "/app_home/images.jpg", 21);
+        ps_write32(b, kCbStrm, cbs.stream_opd);
+        ps_write32(b, kCbStrm + 4, kStrmCtl);
+        CHECK(call("cellJpgDecExtOpen", kExtOpen, {handle, kStreamOut, kSrc, kOpenInfo, kCbStrm}) == kStreamFormat);
+        CHECK(call("cellJpgDecExtOpen", kExtOpen, {handle, kStreamOut, kSrc, kOpenInfo, kNowhere}) == kArg);
+        buffer_source(b, file, static_cast<u32>(file.size()));
+        REQUIRE(call("cellJpgDecOpen", 0x976CA5C2, {handle, kStreamOut, kSrc, kOpenInfo}) == 0);
+        stream = ps_read32(b, kStreamOut);
+        REQUIRE(call("cellJpgDecClose", 0x9338A07A, {handle, stream}) == 0);
+        {
+            ExtOptions e; // the stream callback's bytes are not guest memory
+            e.first = 20;
+            e.chunk = 37;
+            e.stream_source = kNowhere;
+            CHECK(ext_decode(b, call, cbs, handle, file, rgb, e).header == kCbParam);
+        }
+        {
+            ExtOptions e; // the stream callback's bytes stop short of the first byte: no SOI
+            e.first = 1;
+            e.chunk = 37;
+            e.stream_source = kNowhere;
+            CHECK(ext_decode(b, call, cbs, handle, file, rgb, e).header == kCbParam);
+        }
+        {
+            ExtOptions e; // the stream ends in the header
+            e.first = 20;
+            e.chunk = 37;
+            e.stream_size = 100;
+            CHECK(ext_decode(b, call, cbs, handle, file, rgb, e).header == kStreamFormat);
+        }
+        {
+            // The stream ends in the scan: the lines decoded go out in parts, then STREAM_FORMAT (as DecodeData).
+            ExtOptions e;
+            e.first = 20;
+            e.chunk = 37;
+            e.counts = 4;
+            e.stream_size = static_cast<u32>(file.size()) - 60;
+            std::string data_out;
+            const std::vector<u8> cut(file.begin(), file.end() - 60);
+            const std::vector<u8> want = plain_decode(b, call, handle, cut, rgb, &data_out);
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, rgb, e);
+            CHECK(o.decode == kStreamFormat);
+            CHECK(o.data_out.substr(0, 10) == data_out.substr(0, 10)); // the answer
+            CHECK(o.data_out.substr(19, 8) == data_out.substr(19, 8)); // outputLines
+            CHECK(o.frame == want);
+            CHECK_FALSE(o.parts.empty());
+            CHECK(o.decode_again == kSeq);
+        }
+        {
+            ExtOptions e; // the display callback gives no place for the next part
+            e.mode = 2;
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, rgb, e);
+            CHECK(o.decode == kCbParam);
+            CHECK(o.parts.size() == 1);
+        }
+        {
+            ExtOptions e; // the first part's place is not guest memory
+            e.first_image = kNowhere;
+            const ExtRun o = ext_decode(b, call, cbs, handle, file, rgb, e);
+            CHECK(o.decode == kArg);
+            CHECK(o.parts.empty());
+        }
+    }
+    REQUIRE(call("cellJpgDecDestroy", 0xD8EA91F8, {handle}) == 0);
+}
+
+TEST_CASE("pspocket's JPEG decoder takes an image's memory to decode it, not to read its header; parts of an image "
+          "past 256 MB are refused (D-619)",
+    "[hle][jpgdec]")
+{
+    // A header may claim up to 65535 x 65535. Reading one took the coefficients' memory for the whole image at once
+    // (some 13 GB for 65535 x 65535 at 4:2:0), which the longer fuzzing of the Ext functions found: the process was
+    // killed for its memory. These files are small; their SOF claims more.
+    const auto claim = [](std::vector<u8> file, u32 w, u32 h) {
+        for (usize i = 0; i + 8 < file.size(); i++)
+            if (file[i] == 0xFF && (file[i + 1] == 0xC0 || file[i + 1] == 0xC2)) {
+                file[i + 5] = static_cast<u8>(h >> 8);
+                file[i + 6] = static_cast<u8>(h);
+                file[i + 7] = static_cast<u8>(w >> 8);
+                file[i + 8] = static_cast<u8>(w);
+                break;
+            }
+        return file;
+    };
+    const std::vector<u8> colour = claim(jpeg::encode(jpeg::pattern(16, 16, false, 2, 2, 1)), 8192, 8192);
+    const std::vector<u8> gray = claim(jpeg::encode(jpeg::pattern(16, 16, true, 1, 1, 2)), 16384, 16400);
+    {
+        pspocket::hle::jpeg::Decoder d;
+        std::string why;
+        REQUIRE(d.read_header(colour.data(), colour.size(), why));
+        CHECK(d.header().width == 8192);
+        CHECK(d.header().height == 8192);
+        REQUIRE(d.components().size() == 3);
+        for (const pspocket::hle::jpeg::ComponentInfo& c : d.components()) CHECK(c.coefficients.empty());
+        pspocket::hle::jpeg::Decoder::Output o;
+        CHECK_FALSE(d.output(1, false, pspocket::hle::jpeg::ColorSpace::RGB, o, why)); // nothing decoded to give
+        CHECK(why == "an image not decoded");
+    }
+
+    // Through cellJpgDec: the header read as libjpgdec reads it and the parameters set, then DecodeData refused for a
+    // buffer that cannot hold the image (ARG), none of it taking the image's memory; in parts, a gray 16384 x 16400
+    // (past 256 MB decoded whole): FATAL, the stream failed, no part out.
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const Call call = hle_calls(f, t);
+    write_callbacks(b);
+    const ext::Callbacks cbs = ext::write_callbacks(b, kExtCode, 0x3C);
+    std::memset(b + kArgs, 0, 0x400);
+    const u32 tin[7] = {0, 1000, 200, kMallocOpd, kHeapCtl, kFreeOpd, kHeapCtl};
+    for (u32 i = 0; i < 7; i++) ps_write32(b, kThreadIn + 4 * i, tin[i]);
+    REQUIRE(call("cellJpgDecCreate", 0xA7978F59, {kHandleOut, kThreadIn, kThreadOut}) == 0);
+    const u32 handle = ps_read32(b, kHandleOut);
+    const Setting rgb{1, 0, 0, 2, 0}, as_gray{1, 0, 0, 1, 0};
+    buffer_source(b, colour, static_cast<u32>(colour.size()));
+    REQUIRE(call("cellJpgDecOpen", 0x976CA5C2, {handle, kStreamOut, kSrc, kOpenInfo}) == 0);
+    u32 stream = ps_read32(b, kStreamOut);
+    REQUIRE(call("cellJpgDecReadHeader", 0x6D9EBCCF, {handle, stream, kInfo}) == 0);
+    CHECK(ps_read32(b, kInfo) == 8192);
+    CHECK(ps_read32(b, kInfo + 4) == 8192);
+    in_param(b, rgb, 0);
+    REQUIRE(call("cellJpgDecSetParameter", 0xE08F3910, {handle, stream, kInParam, kOutParam}) == 0);
+    CHECK(ps_read64(b, kOutParam) == 8192 * 3);
+    ps_write64(b, kCtrl, 8192 * 3);
+    CHECK(call("cellJpgDecDecodeData", 0xAF8BB012, {handle, stream, kFrame, kCtrl, kDataOut}) == kArg);
+    REQUIRE(call("cellJpgDecClose", 0x9338A07A, {handle, stream}) == 0);
+
+    buffer_source(b, gray, static_cast<u32>(gray.size()));
+    REQUIRE(call("cellJpgDecExtOpen", kExtOpen, {handle, kStreamOut, kSrc, kOpenInfo, 0}) == 0);
+    stream = ps_read32(b, kStreamOut);
+    REQUIRE(call("cellJpgDecExtReadHeader", kExtReadHeader, {handle, stream, kInfo, 0}) == 0);
+    in_param(b, as_gray, 0);
+    ps_write32(b, kExtIn + 0, 1);
+    ps_write32(b, kExtIn + 4, 1); // a line a part: the first fits
+    ps_write32(b, kExtIn + 8, 0);
+    REQUIRE(call("cellJpgDecExtSetParameter", kExtSetParameter, {handle, stream, kInParam, kOutParam, kExtIn, kExtOut}) == 0);
+    ps_write64(b, kCtrl, 16384);
+    std::memset(b + kDispCtl, 0, 0x40);
+    ps_write32(b, kCbDisp, cbs.display_opd);
+    ps_write32(b, kCbDisp + 4, kDispCtl);
+    CHECK(call("cellJpgDecExtDecodeData", kExtDecodeData, {handle, stream, kFrame, kCtrl, kDataOut, kCbDisp, 0}) ==
+        0x80611106); // CELL_JPGDEC_ERROR_FATAL
+    CHECK(ps_read32(b, kDispCtl + ext::disp::count) == 0);
+    CHECK(call("cellJpgDecExtDecodeData", kExtDecodeData, {handle, stream, kFrame, kCtrl, kDataOut, kCbDisp, 0}) == kSeq);
+    REQUIRE(call("cellJpgDecClose", 0x9338A07A, {handle, stream}) == 0);
+    REQUIRE(call("cellJpgDecDestroy", 0xD8EA91F8, {handle}) == 0);
 }

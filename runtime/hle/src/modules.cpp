@@ -90,6 +90,8 @@ void register_cellCelpEnc(Registry& r);
 void register_cellRudp(Registry& r);
 void register_cellNetAoi(Registry& r);
 void register_libad(Registry& r);
+void register_libmedi(Registry& r);
+void register_cellLibprof(Registry& r);
 void register_sys_libstdcxx(Registry& r);
 void register_sysutil_more(Registry& r);
 void register_sys_fs(Registry& r);
@@ -187,6 +189,8 @@ void register_all_modules(Registry& r)
     register_cellRudp(r);
     register_cellNetAoi(r);
     register_libad(r);
+    register_libmedi(r);
+    register_cellLibprof(r);
     register_sys_libstdcxx(r);
     register_sysutil_more(r);
     register_sys_fs(r);

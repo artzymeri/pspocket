@@ -24,7 +24,7 @@ struct ComponentInfo {
     int id = 0, h = 1, v = 1, tq = 0; // sampling factors, quantisation table
     int td = 0, ta = 0;               // the last scan's Huffman tables
     u32 width_in_blocks = 0, height_in_blocks = 0;
-    std::vector<s16> coefficients; // 64 per block, natural order, blocks row by row (padded to whole MCUs)
+    std::vector<s16> coefficients; // 64 per block, natural order, blocks row by row (padded to whole MCUs); decode()'s
     u32 blocks_per_row = 0, block_rows = 0;
 };
 
