@@ -10474,3 +10474,12 @@ libsre), so nothing a game gets changes. cellSpursCreateTask2, CreateTask2WithBi
 DestroyTaskset2 and the LF queue's lv2 event queue attach and detach stay marked: the comparison checks only their
 refusals, and libsre's Task2 exit slots work differently from D-626's (part 5). The comparison, matching, loses its
 [.] and joins the gate (it skips without the firmware).
+
+## D-914 · 2026-10-11 · libsynth2 has nothing to compare with in firmware 4.92; it stays firmware-first (part 7)
+
+The installed system software (4.92) has no module exporting libsynth2: none of its 177 modules (the module index, the
+decrypted modules, dev_flash) has it or its names. Its comparison (D-610) cannot run there: it now skips saying so
+(require_firmware_module, as libmixer's, D-911) instead of failing on the missing module, and runs on a system software
+that has one. In Self mode its 2,950 observations still agree (D-610). libsynth2 stays firmware-first (D-563), which
+changes nothing a game gets on 4.92 (no module to give it): the mark records that the library, made from public
+sources (psx-spx, ps2sdk's libsd documentation, D-610 to D-614), was never compared with Sony's module.

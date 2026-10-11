@@ -368,6 +368,9 @@ TEST_CASE("libsynth2 against Sony's libsynth2: registers, pitches, transfers, vo
     "[.][hle][lle][compare][synth2]")
 {
     const Setup s = setup();
+    // Firmware 4.92 ships no module exporting libsynth2 (none of its 177 modules does, D-914): nothing to compare with
+    // there, as with libmixer (D-911); an installed system software that has one runs the comparison.
+    require_firmware_module(s, "libsynth2");
     run(s, "libsynth2 against Sony's libsynth2", [&](bool sony) { return half(s, sony); },
         [](const Observed& o) {
             // pspocket's own half: test_synth2.cpp's answers.
