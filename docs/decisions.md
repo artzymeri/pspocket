@@ -11870,3 +11870,9 @@ each later sixteen keeps; for other windows the lanes keep their negative offset
 lane, and for any input window). With part 6 the comparison shows 49 of 791 observations differing: scaler types 1 to 3
 (36), the edge-adaptive interlace conversion's few pixels (7), a horizontal reduction past a half (2), and the bytes
 libvpost writes past a YUV output whose chroma has an odd size (4). cellVpost stays firmware-first (D-563).
+What is known of the rest, for whoever takes it up: scaler types 2 and 3 scale vertically with libvpost's 4-tap filters,
+tables in its PPU module's data (five of 64 phases, each tap in 1/256 written twice; chosen by the ratio, out over in
+times 4 plus 0.6), and type 3 horizontally with its 8-tap ones (seventeen tables of 256 phases in 1/4096, chosen by the
+ratio times 16 plus 0.6; past enlarging, the bilinear one); type 2's horizontal filter and type 1's sharpening are
+computed by the SPU program. The tables are Sony's data and stay out of the repository: matching them means reading
+them from the installed libvpost.sprx at run time, as cellFont reads libfont's (D-526).
