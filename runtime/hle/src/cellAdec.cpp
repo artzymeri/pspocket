@@ -5,8 +5,10 @@
 // the operation table it exports, as Sony's libadec and RPCS3's cellAdec call it. The core modules are the host's
 // imports of cellAdec (Registry::add_imports): the loader chooses and links them for a game importing cellAdec, as it
 // would for libadec. Where no firmware module gives one, pspocket's own core on FFmpeg serves the codecs it has one of
-// (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3; adec_ffmpeg.hpp): firmware first, as D-563 does
-// for whole libraries, until each is compared with Sony's core on the Mac.
+// (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3; D-621: Dolby Digital Plus, MPEG-2 AAC, MP3
+// Surround, ATRAC3 multichannel; D-622: TrueHD, DTS, DTS-HD, its core, DTS Express, WMA; adec_ffmpeg.hpp): firmware
+// first, as D-563 does for whole libraries, until each is compared with Sony's core on the Mac. CELP and CELP 8 kHz
+// have none (FFmpeg has no MPEG-4 CELP decoder).
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h (get_core_ops, AdecContext, the notifications, the API).
 
 //
@@ -14,7 +16,7 @@
 // - cellAdecQueryAttr's adecVerUpper is 0x492000, Sony's (4.92); RPCS3 has 0x491000.
 // - A codec whose core no firmware module gives (DTS, DTS-HD core, WMA Pro, WMA Lossless; or no firmware installed) is
 //   logged and refused with CELL_ADEC_ERROR_FATAL: Sony's libadec calls through the empty table and crashes, RPCS3
-//   aborts. Unless pspocket has a core of its own for it (D-577), which then serves.
+//   aborts. Unless pspocket has a core of its own for it (D-577, D-621, D-622), which then serves.
 // - Pointers RPCS3 dereferences without a check (LLE would fault) are checked; one that is not guest memory is logged
 //   and refused with CELL_ADEC_ERROR_ARG (D-042). A PCM handle out of range is FATAL (LLE reads past the frames).
 
@@ -262,7 +264,7 @@ std::unique_ptr<AdecCore> core_for(s32 type, u32* ops_out = nullptr)
         return std::make_unique<GuestCore>(ops);
     }
     if (std::unique_ptr<AdecCore> own = own_first_core(type)) return own;
-    if (std::unique_ptr<AdecCore> own = make_ffmpeg_core(type)) {
+    if (std::unique_ptr<AdecCore> own = c.library.empty() ? nullptr : make_ffmpeg_core(type)) {
         if (ops_out)
             PS_LOG_INFO(kChan, "codec type {}: no firmware module gave {} ({:#010x}): pspocket's own core (D-577)", type,
                 c.library, c.nid);
@@ -275,12 +277,14 @@ std::unique_ptr<AdecCore> core_for(s32 type, u32* ops_out = nullptr)
 }
 
 // The core of an open decoder: what open chose (D-577): the table it was opened on, else pspocket's own first-served
-// core, else pspocket's own core of its codec.
+// core, else pspocket's own core of its codec (never of a reserved type: libadec has no core for 28 and 29, whose
+// numbers pspocket's WMA Pro and WMA Lossless cores carry, D-622).
 std::unique_ptr<AdecCore> core_of(u8* base, u32 h)
 {
     const s32 type = static_cast<s32>(ps_read32(base, h + ctx_off::type));
     if (const u32 ops = ps_read32(base, h + ctx_off::core_ops)) return std::make_unique<GuestCore>(ops);
     if (std::unique_ptr<AdecCore> own = own_first_core(type)) return own;
+    if (invalid_type(type) || kCoreOps[static_cast<usize>(type)].library.empty()) return std::make_unique<NoCore>(type);
     if (std::unique_ptr<AdecCore> own = make_ffmpeg_core(type)) return own;
     return std::make_unique<NoCore>(type);
 }

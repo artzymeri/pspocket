@@ -936,6 +936,78 @@ TEST_CASE("LLE: a codec core's operation table goes to pspocket's, or to the fir
     fs::remove_all(root);
 }
 
+// D-624: a variable the host made from RPCS3 without Sony's module to compare it with (cellDmuxPamf's raw elementary
+// stream table) is unverified in a library whose other export was compared (the PAMF table): an import of it goes to
+// the library's module when one is installed, for the game and for a module importing it, as an unverified function's
+// does (D-594); with no module, the host's serves it. Imports of the compared table stay on the host either way.
+TEST_CASE("LLE: an unverified variable's import goes to its library's module when one is installed, to the host when "
+          "not (D-624)",
+    "[hle][lle]")
+{
+    using Needs = loader::LleModules::LibraryNeeds;
+    using Files = std::set<std::string, std::less<>>;
+    constexpr u32 kPamfOps = 0x28B2B7B2, kRawOps = 0x9728A0E9;
+    REQUIRE(hle::registry().find_variable("cellDmuxPamf", kPamfOps) != nullptr);
+    REQUIRE(hle::registry().find_variable("cellDmuxPamf", kRawOps) != nullptr);
+    REQUIRE(hle::registry().is_unverified_variable("cellDmuxPamf", kRawOps));
+    CHECK_FALSE(hle::registry().is_unverified_variable("cellDmuxPamf", kPamfOps));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellDmuxPamf"));
+
+    const fs::path root = fresh_flash("pspocket-test-lle-unverified-variable");
+    const fs::path external = root / "dev_flash" / "sys" / "external";
+    test::PrxOptions o;
+    o.variables = true;
+    const auto x = test::build_ppu_prx(o);
+    const auto renamed_variable = [&](std::vector<u8> m, std::string_view library, u32 nid) {
+        std::fill(m.begin() + 0x320, m.begin() + 0x330, u8{0});
+        std::memcpy(m.data() + 0x320, library.data(), library.size());
+        ps_st32(m.data() + 0x418, nid);
+        return m;
+    };
+    // Two modules exporting a library of their own, importing one of cellDmuxPamf's tables each.
+    write(external / "libuser_raw.sprx",
+        debug_self(renamed_variable(prx_exporting(x, "synthRawUser", 0x66660011), "cellDmuxPamf", kRawOps)));
+    write(external / "libuser_pamf.sprx",
+        debug_self(renamed_variable(prx_exporting(x, "synthPamfUser", 0x66660012), "cellDmuxPamf", kPamfOps)));
+    const auto bound = [](u32) { return true; };
+    for (int installed = 0; installed < 2; installed++) {
+        if (installed) { // libdmuxpamf, exporting the raw table (and importing it, its own)
+            std::vector<u8> m = renamed_variable(prx_exporting(x, "cellDmuxPamf", 0x12340001), "cellDmuxPamf", kRawOps);
+            ps_st32(m.data() + 0x40C, kRawOps);
+            write(external / "libdmuxpamf.sprx", debug_self(m));
+            fs::remove(root / "lle-index.txt");
+        }
+        INFO("libdmuxpamf installed: " << installed);
+        hle::test::Fixture f;
+        loader::LleModules lle((root / "dev_flash").string());
+        REQUIRE(lle.index());
+        std::string why;
+        // A game importing the raw table: Sony's module where there is one, else the host's.
+        lle.decide({Needs{"cellDmuxPamf", {}, {kRawOps}}}, bound);
+        CHECK(lle.chosen_files() == (installed ? Files{"libdmuxpamf.sprx"} : Files{}));
+        // The compared PAMF table: the host's either way.
+        lle.decide({Needs{"cellDmuxPamf", {}, {kPamfOps}}}, bound);
+        CHECK(lle.chosen_files().empty());
+        lle.decide({Needs{"synthPamfUser", {0x66660012}, {}}}, bound);
+        CHECK(lle.chosen_files() == Files{"libuser_pamf.sprx"});
+        CHECK_FALSE(lle.gaps().contains("libuser_pamf.sprx"));
+        // A module importing the raw table: libdmuxpamf joins for it where installed.
+        lle.decide({Needs{"synthRawUser", {0x66660011}, {}}}, bound);
+        CHECK(lle.chosen_files() ==
+            (installed ? Files{"libdmuxpamf.sprx", "libuser_raw.sprx"} : Files{"libuser_raw.sprx"}));
+        CHECK_FALSE(lle.gaps().contains("libuser_raw.sprx"));
+        const loader::PrxModule* u = lle.load("synthRawUser", *f.hle, &why);
+        INFO(why);
+        REQUIRE(u != nullptr);
+        const loader::PrxModule* sony = installed ? lle.load("cellDmuxPamf", *f.hle, &why) : nullptr;
+        const u32 want =
+            sony ? sony->variables.at({"cellDmuxPamf", kRawOps}) : f.hle->link_variable("cellDmuxPamf", kRawOps);
+        CHECK(want != 0);
+        CHECK(ps_read32(f.base(), u->segments[1].first + 0xC0) == want);
+    }
+    fs::remove_all(root);
+}
+
 // D-175: a game's own PRX loaded while it runs needs a firmware module the boot did not choose: the module joins, is
 // loaded for it, and its module_start runs before the PRX's own (on the thread that starts the PRX).
 TEST_CASE("Run-time modules: the firmware modules a game's PRX needs join, and start before it", "[hle][lle][prx]")

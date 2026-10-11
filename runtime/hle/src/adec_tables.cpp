@@ -3,12 +3,14 @@
 // getVersion, realign, releasePcm, getPcmHandleNum, getBsiInfoSize, openExt), and for the codecs whose module corrects
 // a missing PTS itself a _SceAdecCorrectPtsValue_* function; Sony's libadec and other modules call cores only through
 // these. pspocket's own cores (LPCM, adec_lpcm.cpp; ATRAC3plus, adec_atracx.cpp; MP3, MPEG audio layers I and II,
-// MPEG-4 AAC, AC-3 and ATRAC3 on FFmpeg, adec_ffmpeg.hpp) are offered here the same way: each table is a variable of
-// its library, laid out when first linked with descriptors of internal functions of cellAdec that run the core's code
-// (AdecCore) with the arguments, notifications and answers of the ABI. A core opened through a table notifies the
-// functions open was given, as guest calls (CoreNotifier); pspocket's own front end opens its cores directly and is
-// notified directly. The cores on FFmpeg are not compared with Sony's yet: their libraries are firmware-first (D-563),
-// so a module importing one gets Sony's where the system software has it, and pspocket's where it does not.
+// MPEG-4 AAC, AC-3 and ATRAC3 on FFmpeg, adec_ffmpeg.hpp; and, D-623, Dolby Digital Plus, MPEG-2 AAC, MP3 Surround,
+// ATRAC3 multichannel, TrueHD, DTS, DTS-HD, its core, DTS Express, WMA, WMA Pro and WMA Lossless, D-621 and D-622) are
+// offered here the same way: each table is a variable of its library, laid out when first linked with descriptors of
+// internal functions of cellAdec that run the core's code (AdecCore) with the arguments, notifications and answers of
+// the ABI. A core opened through a table notifies the functions open was given, as guest calls (CoreNotifier);
+// pspocket's own front end opens its cores directly and is notified directly. The cores on FFmpeg are not compared with
+// Sony's yet: their libraries are firmware-first (D-563), so a module importing one gets Sony's where the system
+// software has it, and pspocket's where it does not.
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp (g_cell_adec_core_ops_lpcm and _CellAdecCoreOp*_lpcm; each core
 // module's REG_VNID table and REG_FUNC _SceAdecCorrectPtsValue_*), cellAdec.h (CellAdecCoreOps, CellAdecCoreOp*,
 // AdecNotify*), cellAtracXdec.cpp (the four g_cell_adec_core_ops_atracx* tables and _CellAdecCoreOp*_atracx).
@@ -42,7 +44,9 @@ using namespace adec;
 constexpr std::string_view kChan = "cellAdec";
 
 enum class Table : u8 {
-    Lpcm, AtracX, AtracX2ch, AtracX6ch, AtracX8ch, Mp3, MpegL1, MpegL2, M4Aac, M4Aac2ch, M4Aac2chMod, Ac3, Atrac3
+    Lpcm, AtracX, AtracX2ch, AtracX6ch, AtracX8ch, Mp3, MpegL1, MpegL2, M4Aac, M4Aac2ch, M4Aac2chMod, Ac3, Atrac3,
+    // D-623
+    Ddp, M2Aac, Mp3s, Atrac3Multi, TrueHd, DtsCore, DtsHd, DtsHdCore, DtsLbr, Wma, WmaPro, WmaLsl
 };
 
 struct TableInfo {
@@ -70,6 +74,22 @@ constexpr TableInfo kTables[] = {
         0, ffcore::fx::size},
     {"cell_libac3dec", "g_cell_adec_core_ops_ac3", "ac3", 0xC58BB170, CELL_ADEC_TYPE_AC3, 0, ffcore::fx::size},
     {"cellAtrac3dec", "g_cell_adec_core_ops_atrac3", "atrac3", 0x60487D65, CELL_ADEC_TYPE_ATRAC3, 0, ffcore::fx::size},
+    {"cellDDPdec", "g_cell_adec_core_ops_Ddp", "Ddp", 0xF5E9C15C, CELL_ADEC_TYPE_EAC3, 0, ffcore::fx::size},
+    {"cellM2AACdec", "g_cell_adec_core_ops_Aac", "Aac", 0xAC2F0831, CELL_ADEC_TYPE_M2AAC, 0, ffcore::fx::size},
+    {"cellMP3Sdec", "g_cell_adec_core_ops_Mp3s", "Mp3s", 0x292CDF0A, CELL_ADEC_TYPE_MP3S, 0, ffcore::fx::size},
+    {"cellAtrac3multidec", "g_cell_adec_core_ops_atrac3multi", "atrac3multi", 0xC20C6BD7, CELL_ADEC_TYPE_ATRAC3MULTI, 0,
+        ffcore::fx::size},
+    {"cellTRHDdec", "g_cell_adec_core_ops_truehd", "truehd", 0xE88E381B, CELL_ADEC_TYPE_TRUEHD, 0, ffcore::fx::size},
+    {"cellDTSdec", "g_cell_adec_core_ops_DtsCore", "DtsCore", 0x15248EC5, CELL_ADEC_TYPE_DTS, 0, ffcore::fx::size},
+    {"cellDTSHDdec", "g_cell_adec_core_ops_DtsHd", "DtsHd", 0x51AC2B6C, CELL_ADEC_TYPE_DTSHD, 0, ffcore::fx::size},
+    {"cellDTSHDCOREdec", "g_cell_adec_core_ops_DtsHd_Core", "DtsHd_Core", 0x6C8F4F1C, CELL_ADEC_TYPE_DTSHDCORE, 0,
+        ffcore::fx::size},
+    {"cellDTSLBRdec", "g_cell_adec_core_ops_DtsLbr", "DtsLbr", 0x8C50AF52, CELL_ADEC_TYPE_DTSLBR, 0, ffcore::fx::size},
+    {"cellWMAdec", "g_cell_adec_core_ops_wma", "wma", 0x88320B10, CELL_ADEC_TYPE_WMA, 0, ffcore::fx::size},
+    {"cellWMAPROdec", "g_cell_adec_core_ops_WmaPro", "WmaPro", 0xA8BAC670, CELL_ADEC_TYPE_WMAPRO_CORE, 0,
+        ffcore::fx::size},
+    {"cellWMALSLdec", "g_cell_adec_core_ops_WmaLsl", "WmaLsl", 0x602AAB16, CELL_ADEC_TYPE_WMALSL_CORE, 0,
+        ffcore::fx::size},
 };
 
 constexpr const TableInfo& info_of(Table t) { return kTables[static_cast<usize>(t)]; }
@@ -274,6 +294,21 @@ s32 _SceAdecCorrectPtsValue_M4Aac2chmod(PPUContext& ctx, u32 h, u32 pts)
 {
     return correct_pts<Table::M4Aac2chMod>(ctx, h, pts);
 }
+// D-623: the PTS functions of the cores of D-621 and D-622 (ATRAC3 multichannel has none: libadec steps its PTS).
+s32 _SceAdecCorrectPtsValue_Ddp(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::Ddp>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_Aac(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::M2Aac>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_Mp3s(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::Mp3s>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_truehd(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::TrueHd>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_DtsCore(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::DtsCore>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_DtsHd(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::DtsHd>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_DtsHd_Core(PPUContext& ctx, u32 h, u32 pts)
+{
+    return correct_pts<Table::DtsHdCore>(ctx, h, pts);
+}
+s32 _SceAdecCorrectPtsValue_DtsLbr(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::DtsLbr>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_wma(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::Wma>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_WmaPro(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::WmaPro>(ctx, h, pts); }
+s32 _SceAdecCorrectPtsValue_WmaLsl(PPUContext& ctx, u32 h, u32 pts) { return correct_pts<Table::WmaLsl>(ctx, h, pts); }
 
 #endif
 
@@ -300,9 +335,36 @@ void register_adec_tables(Registry& r)
     r.add("cellM4AacDec", {PS_HLE_FUNC(0x431A1DCA, _SceAdecCorrectPtsValue_M4Aac)});
     r.add("cellM4AacDec2ch", {PS_HLE_FUNC(0x869E328D, _SceAdecCorrectPtsValue_M4Aac2ch)});
     r.add("cellM4AacDec2chmod", {PS_HLE_FUNC(0x156FE2F0, _SceAdecCorrectPtsValue_M4Aac2chmod)});
-    // The cores on FFmpeg are not compared with Sony's yet (D-577 to D-579): Sony's module serves first (D-563).
+    // D-623: the cores of D-621 and D-622.
+    add_table<Table::Ddp>(r);
+    add_table<Table::M2Aac>(r);
+    add_table<Table::Mp3s>(r);
+    add_table<Table::Atrac3Multi>(r);
+    add_table<Table::TrueHd>(r);
+    add_table<Table::DtsCore>(r);
+    add_table<Table::DtsHd>(r);
+    add_table<Table::DtsHdCore>(r);
+    add_table<Table::DtsLbr>(r);
+    add_table<Table::Wma>(r);
+    add_table<Table::WmaPro>(r);
+    add_table<Table::WmaLsl>(r);
+    r.add("cellDDPdec", {PS_HLE_FUNC(0xEE2731D3, _SceAdecCorrectPtsValue_Ddp)});
+    r.add("cellM2AACdec", {PS_HLE_FUNC(0x7CBA9865, _SceAdecCorrectPtsValue_Aac)});
+    r.add("cellMP3Sdec", {PS_HLE_FUNC(0x73A2C895, _SceAdecCorrectPtsValue_Mp3s)});
+    r.add("cellTRHDdec", {PS_HLE_FUNC(0x75080F7B, _SceAdecCorrectPtsValue_truehd)});
+    r.add("cellDTSdec", {PS_HLE_FUNC(0x8C7AD5ED, _SceAdecCorrectPtsValue_DtsCore)});
+    r.add("cellDTSHDdec", {PS_HLE_FUNC(0xF3AF1093, _SceAdecCorrectPtsValue_DtsHd)});
+    r.add("cellDTSHDCOREdec", {PS_HLE_FUNC(0xD4C180D4, _SceAdecCorrectPtsValue_DtsHd_Core)});
+    r.add("cellDTSLBRdec", {PS_HLE_FUNC(0x185591D6, _SceAdecCorrectPtsValue_DtsLbr)});
+    r.add("cellWMAdec", {PS_HLE_FUNC(0x46E6C806, _SceAdecCorrectPtsValue_wma)});
+    r.add("cellWMAPROdec", {PS_HLE_FUNC(0x8D45F21A, _SceAdecCorrectPtsValue_WmaPro)});
+    r.add("cellWMALSLdec", {PS_HLE_FUNC(0xF2F9C183, _SceAdecCorrectPtsValue_WmaLsl)});
+    // The cores on FFmpeg are not compared with Sony's yet (D-577 to D-579, D-621, D-622): Sony's module serves first
+    // (D-563).
     for (const std::string_view library : {"cellMP3dec", "cellMPL1dec", "cellM2BCdec", "cellM4AacDec",
-             "cellM4AacDec2ch", "cellM4AacDec2chmod", "cell_libac3dec", "cellAtrac3dec"})
+             "cellM4AacDec2ch", "cellM4AacDec2chmod", "cell_libac3dec", "cellAtrac3dec", "cellDDPdec", "cellM2AACdec",
+             "cellMP3Sdec", "cellAtrac3multidec", "cellTRHDdec", "cellDTSdec", "cellDTSHDdec", "cellDTSHDCOREdec",
+             "cellDTSLBRdec", "cellWMAdec", "cellWMAPROdec", "cellWMALSLdec"})
         r.firmware_first(library);
 #endif
 }

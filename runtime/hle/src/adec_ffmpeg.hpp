@@ -1,8 +1,10 @@
 #pragma once
 
-// pspocket's own cellAdec cores on FFmpeg for the codecs whose firmware core serves first (D-577): MP3 (adec_mp3.cpp),
-// MPEG audio layers I and II (adec_mpeg.cpp), MPEG-4 AAC (adec_aac.cpp), AC-3 (adec_ac3.cpp) and ATRAC3
-// (adec_atrac3.cpp). The front end (cellAdec.cpp) opens one only where no firmware module gives the codec's core.
+// pspocket's own cellAdec cores on FFmpeg for the codecs whose firmware core serves first (D-577): MP3 and MP3 Surround
+// (adec_mp3.cpp), MPEG audio layers I and II (adec_mpeg.cpp), MPEG-4 and MPEG-2 AAC (adec_aac.cpp), AC-3 and Dolby
+// Digital Plus (adec_ac3.cpp), ATRAC3 and ATRAC3 multichannel (adec_atrac3.cpp), TrueHD (adec_truehd.cpp), DTS
+// (adec_dts.cpp) and WMA (adec_wma.cpp). The front end (cellAdec.cpp) opens one only where no firmware module gives the
+// codec's core; the cores' own modules' tables are pspocket's where none is installed (adec_tables.cpp).
 //
 // The common part (adec_ffmpeg.cpp) is shaped as adec_atracx.cpp, RPCS3's port of libatxdec's PPU side
 // (rpcs3/Emu/Cell/Modules/cellAtracXdec.cpp): the core's context in the game's memory at its handle, a command queue of
@@ -62,9 +64,12 @@ public:
     // A sequence with the game's parameters (Spec::param_size bytes, as the game wrote them; Spec::check passed them on
     // the game's thread). CELL_OK, or an error (logged): the sequence's decodes then fail with the codec's error.
     virtual s32 start(const u8* param) = 0;
-    // The access unit at `au` (`size` bytes of guest memory) into the output at `out` (Spec::output_bytes) and the
-    // information block at `bsi` (Spec::bsi_size bytes, zeroed).
+    // The access unit at `au` (`size` bytes of guest memory, bytes_needed(size) of them readable) into the output at
+    // `out` (Spec::output_bytes) and the information block at `bsi` (Spec::bsi_size bytes, zeroed).
     virtual Decoded decode(u8* base, u32 au, u32 size, u32 out, u32 bsi) = 0;
+    // The bytes from the unit's start the codec reads: its size (ATRAC3 multichannel reads its tracks' blocks, which
+    // may run past the size its caller gives, D-621).
+    virtual u32 bytes_needed(u32 size) const { return size; }
 };
 
 // A codec's constants and parts.
@@ -85,18 +90,22 @@ struct Spec {
 
 // Each codec file's Spec.
 extern const Spec kMp3, kMpegL1, kMpegL2, kM4Aac, kM4Aac2ch, kM4Aac2chMod, kAc3, kAtrac3;
+extern const Spec kDdp, kM2Aac, kMp3s, kAtrac3Multi;                                 // D-621
+extern const Spec kTrueHd, kDts, kDtsHd, kDtsHdCore, kDtsLbr, kWma, kWmaPro, kWmaLsl; // D-622
 
 // The Spec of a cellAdec type, or null.
 const Spec* spec_of(s32 type);
 
 // ---- what the codecs share
 
-// Decoded audio: planar floats per channel, with FFmpeg's channel of each (AVChannel) and the rate.
+// Decoded audio: planar floats per channel, with FFmpeg's channel of each (AVChannel) and the rate; `bits` the
+// resolution FFmpeg says it decoded (bits_per_raw_sample: a lossless stream's), 0 where it says none.
 struct Planar {
     std::vector<std::vector<float>> ch;
     std::vector<int> ids;
     u32 samples = 0;
     u32 rate = 0;
+    u32 bits = 0;
     u32 channels() const { return static_cast<u32>(ch.size()); }
     void clear()
     {
@@ -104,6 +113,7 @@ struct Planar {
         ids.clear();
         samples = 0;
         rate = 0;
+        bits = 0;
     }
 };
 
@@ -121,11 +131,16 @@ public:
     void close();
     bool is_open() const { return av_ != nullptr; }
     // One packet (copied, with FFmpeg's padding): every frame it gives appended to `out`, at most `max_samples` samples
-    // per channel (more is left out, logged). 0, or FFmpeg's error for the packet.
+    // per channel (more is left out, logged). FFmpeg's planar or interleaved floats, 16- and 32-bit samples become
+    // planar floats (exactly, for samples of up to 24 bits: the lossless codecs' 16 and 24, D-620). 0, or FFmpeg's
+    // error for the packet.
     int decode(const u8* data, u32 size, Planar& out, u32 max_samples);
     AVCodecContext* context() { return av_; }
 
 private:
+    static bool convertible(int format);
+    static float sample_of(const AVFrame* f, u32 c, u32 i, u32 channels);
+
     AVCodecContext* av_ = nullptr;
     AVPacket* packet_ = nullptr;
     AVFrame* frame_ = nullptr;
@@ -152,6 +167,52 @@ constexpr u32 ticks(u32 samples, u32 rate) { return rate ? static_cast<u32>((u64
 
 // A once-per-process log line for a codec's quirk (`key` names it).
 void log_once(std::string_view key, std::string_view line);
+
+// ---- the downmixes the cores share (D-620)
+
+// To two channels: each side its front at 1, the centre and its surrounds at 0.7071 (a back centre at 0.5 to both), the
+// LFE left out, each side over its coefficients' sum so a full-scale input cannot clip (the AAC cores', D-578). A
+// stream of two channels or fewer is left as it is.
+void stereo_downmix(Planar& p);
+// The output a CellAdecChannel `channel_number` asks for, as the MPEG audio cores read it (D-577): MONO one channel (a
+// stereo downmix's two averaged), STEREO two (the stereo downmix; a mono stream in both), anything else the stream's
+// own channels.
+void apply_channel_number(Planar& p, u32 channel_number);
+// Past `max` channels, the first `max` kept (logged once): the cores' outputs hold that many.
+void limit_channels(Planar& p, u32 max, std::string_view name);
+// The channels of `p` in order as WAVE_FORMAT_EXTENSIBLE's mask names them (front left 0x1, right 0x2, centre 0x4, LFE
+// 0x8, back left 0x10, right 0x20, ..., side left 0x200, right 0x400: FFmpeg's own channel numbers as bits), a channel
+// past them none.
+u32 channel_mask(const Planar& p);
+
+// The information block of the cores whose own Sony's is not known and RPCS3 has none of (TrueHD, the DTS cores, the
+// WMA cores, D-622): pspocket's layout, 0x40 bytes of big-endian words. A common head, then each codec's own words.
+namespace ginfo {
+constexpr u32 sampling_freq = 0x00, // the PCM's rate (Hz)
+    number_of_channels = 0x04,      // the PCM's channels
+    channel_mask = 0x08,            // the PCM's channels in order (channel_mask above)
+    samples = 0x0C,                 // per channel, in this PCM
+    stream_channels = 0x10,         // the stream's own channels, before a downmix
+    stream_channel_mask = 0x14,     // and their mask
+    bits_per_sample = 0x18,         // the stream's resolution where it codes one (else 0)
+    bit_rate = 0x1C,                // bits per second where the stream says (else 0)
+    is_bsi_valid = 0x20,            // 1 once a unit decoded
+    error_code = 0x24,              // the unit's error, else 0
+    own = 0x28,                     // the codec's own words, to 0x40
+    size = 0x40;
+} // namespace ginfo
+// The common head for `pcm` (the output) and the stream's own channels (before a downmix).
+void write_ginfo(u8* base, u32 bsi, const Planar& pcm, u32 stream_channels, u32 stream_mask, u32 bits, u32 bit_rate);
+
+// The parameters of TrueHD's and the DTS cores (D-622), Sony's not being known: laid out as MPEG audio's
+// CellAdecParamMpmc (D-577), libadec's one multichannel structure without a codec's own fields: channelNumber (the
+// output, apply_channel_number), downmix and lfeUpSample (flags, kept as the MPEG audio cores keep them: the LFE is
+// always decoded at the full rate). StartSeq's check: a layout up to 3/4 with the LFE and flags of 0 or 1, else
+// libadec's ARG.
+namespace lprm {
+constexpr u32 channel_number = 0x0, downmix = 0x4, lfe_up_sample = 0x8, size = 0xC;
+}
+s32 check_layout_params(const u8* p, std::string_view name);
 
 // Bits read most significant first from host bytes; past the end reads zeros (and `overrun` says so).
 class Bits {

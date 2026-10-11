@@ -683,13 +683,10 @@ void taskset_shutdown_complete(lv2::Kernel& kernel, u8* base, u32 taskset)
             if (!(live & (0x80000000u >> k))) continue;
             const u32 id = 32 * w + k;
             const u32 info = taskset + ts_off::task_info + id * ts_off::task_info_stride + ts_off::ti_elf;
-            u64 elf = 0;
-            reservation_op(base, info, [&](u8* line) {
-                const u32 off = info & (PS_RES_LINE_SIZE - 1);
-                elf = ps_read64(line, off);
-                ps_write64(line, off, elf & ~5ull);
-                return true;
-            });
+            // One doubleword (libsre's ldarx/stdcx.): a whole-line update could put back a stale copy of another
+            // TaskInfo in the line that a creation on another thread writes meanwhile.
+            u64 elf = atomic_load_be64(base, info);
+            while (!atomic_cas_be64(base, info, elf, elf & ~5ull)) elf = atomic_load_be64(base, info);
             const u32 slot = taskset + ts_off::exit_slots + 16 * id;
             if (elf & 1) {
                 const u32 container = ps_read32(base, slot + 12);

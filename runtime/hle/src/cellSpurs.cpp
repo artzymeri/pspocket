@@ -2680,6 +2680,10 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
     if (second) {
         if (const s32 rc = task_readable(ctx, what, "taskset", taskset, kTaskset2Size); rc != lv2::CELL_OK) return rc;
     }
+    // The lowest ID free in `enabled`, claimed in one reservation operation. A CellSpursTaskset2's Task2 task keeps its
+    // enabled bit from here until its join clears it (its exit leaves it, spurs_taskset.cpp), so no task created
+    // meanwhile on another thread can take its ID while its exit code waits: the guest bits are the only record, which
+    // leaves D-652's host table and its lock nothing to guard.
     u32 id = CELL_SPURS_MAX_TASK;
     reservation_op(base, taskset, [&id](u8* line) {
         id = CELL_SPURS_MAX_TASK;
@@ -3048,7 +3052,8 @@ s32 create_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 task_id,
     u8* base = t.kernel.base();
     if (const s32 rc = task_readable(ctx, fn, "taskset", taskset, kTaskset2Size); rc != lv2::CELL_OK) return rc;
     if (ps_read32(base, taskset + ts_off::size) < kTaskset2MinSize ||
-        (!ps_read32(base, taskset + ts_off::event_flag_id1) && !ps_read32(base, taskset + ts_off::event_flag_id2))) {
+        (!atomic_load_be32(base, taskset + ts_off::event_flag_id1) &&
+            !atomic_load_be32(base, taskset + ts_off::event_flag_id2))) {
         return error(CELL_SPURS_TASK_ERROR_PERM);
     }
     TaskExtras x;
@@ -3129,7 +3134,7 @@ s32 join_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 id, u32 ex
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
     const u32 slot = taskset + ts_off::exit_slots + 16 * id, off = slot & (PS_RES_LINE_SIZE - 1);
-    const u32 flag = ps_read32(base, taskset + task2_flag_offset(id));
+    const u32 flag = atomic_load_be32(base, taskset + task2_flag_offset(id)); // shared guest words (D-653)
     u64 joiner_before = 0;
     if (block) {
         reservation_op(base, slot, [&](u8* line) {
@@ -3254,7 +3259,10 @@ s32 cellSpursTryJoinTask2(PPUContext& ctx, u32 taskset, u32 id, u32 exit_code)
 // otherwise the destruction's flag set, then cellSpursShutdownTaskset, both event flags destroyed,
 // cellSpursWaitForWorkloadShutdown (its INVAL and STAT become the task errors, another error is returned as it is) and
 // cellSpursRemoveWorkload, and the workload ID 0x20. The event flags' IDs stay in the taskset. libsre asserts when the
-// shutdown, an event flag's destruction or the removal fails.
+// shutdown, an event flag's destruction or the removal fails. What other threads share here is changed atomically:
+// the flags and count in one reservation operation; the event flag IDs, read by joins and creations on other threads
+// and written by a cellSpursCreateTaskset2 at the same address, with atomic loads (D-653's intent; libsre does not
+// clear them here, so D-653's release store has nothing left to do).
 s32 cellSpursDestroyTaskset2(PPUContext& ctx, u32 taskset)
 {
     constexpr std::string_view fn = "cellSpursDestroyTaskset2";
@@ -3267,7 +3275,8 @@ s32 cellSpursDestroyTaskset2(PPUContext& ctx, u32 taskset)
     const u32 wid = ps_read32(base, taskset + ts_off::wid);
     if (wid >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
     const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
-    const u32 flag1 = ps_read32(base, taskset + ts_off::event_flag_id1), flag2 = ps_read32(base, taskset + ts_off::event_flag_id2);
+    const u32 flag1 = atomic_load_be32(base, taskset + ts_off::event_flag_id1),
+              flag2 = atomic_load_be32(base, taskset + ts_off::event_flag_id2);
     if (ps_read32(base, taskset + ts_off::size) < kTaskset2MinSize || (!flag1 && !flag2))
         return error(CELL_SPURS_TASK_ERROR_STAT);
     s32 rc = lv2::CELL_OK;

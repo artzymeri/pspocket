@@ -209,3 +209,45 @@ TEST_CASE("cellImeJp: open and close, input, cursor, focus, conversion and confi
     REQUIRE(a.call("cellImeJpClose", 0) == 0);
     REQUIRE(a.call("cellImeJpOpen2", 1, kHandle, 0) == 0);
 }
+
+TEST_CASE("cellImeJpOpenExt: Open3's form, the one IME of the process (D-674)", "[hle][imejp]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    u8* base = f.base();
+    constexpr u32 kHandle = kData + 0x100, kOut = kData + 0x104, kDic = kData + 0x800, kDics = kData + 0xA00,
+                  kUnmapped = 0x0FFF0000;
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    std::memset(base + kDic, 0, 256);
+    std::memcpy(base + kDic, "/dev_hdd0/game/TEST00001/USRDIR/user.dic", 41);
+
+    // A container and a handle pointer, as every Open.
+    CHECK(a.call("cellImeJpOpenExt", 0, kHandle, 0) == kParam);
+    CHECK(a.call("cellImeJpOpenExt", 1, 0, 0) == kParam);
+    CHECK(a.call("cellImeJpOpenExt", 1, kUnmapped, 0) == kParam);
+    CHECK(a.call("cellImeJpGetStatus", 0, kOut) == kContext); // still closed
+
+    // The list of four dictionaries (a null and one that is not guest memory skipped), and what follows not read.
+    ps_write32(base, kDics, kDic);
+    ps_write32(base, kDics + 4, 0);
+    ps_write32(base, kDics + 8, kUnmapped);
+    ps_write32(base, kDics + 12, kDic);
+    ps_write32(base, kHandle, 0);
+    REQUIRE(a.call("cellImeJpOpenExt", 1, kHandle, kDics, 0xDEADBEEF, kUnmapped) == 0);
+    CHECK(ps_read32(base, kHandle) == 0xF0000000);
+    REQUIRE(a.call("cellImeJpGetStatus", 0, kOut) == 0);
+    CHECK(ps_read16(base, kOut) == 0); // BEFORE_INPUT
+    // One IME: every Open is refused while it is open, OpenExt too.
+    CHECK(a.call("cellImeJpOpenExt", 1, kHandle, 0) == kAlreadyOpen);
+    CHECK(a.call("cellImeJpOpen", 1, kHandle, 0) == kAlreadyOpen);
+    REQUIRE(a.call("cellImeJpClose", 0) == 0);
+    CHECK(a.call("cellImeJpGetStatus", 0, kOut) == kContext);
+
+    // A single CellImeJpAddDic where the list goes (Open2's form): its path's bytes are no guest pointers, skipped.
+    REQUIRE(a.call("cellImeJpOpenExt", 1, kHandle, kDic) == 0);
+    REQUIRE(a.call("cellImeJpClose", 0) == 0);
+    REQUIRE(a.call("cellImeJpOpenExt", 1, kHandle, kUnmapped) == 0); // no list at all: none added
+    REQUIRE(a.call("cellImeJpClose", 0) == 0);
+    CHECK(hle::registry().is_unverified("cellImeJpUtility", 0xCEB2EB36));
+    CHECK_FALSE(hle::registry().is_unverified("cellImeJpUtility", 0x1B119958)); // cellImeJpOpen3
+}

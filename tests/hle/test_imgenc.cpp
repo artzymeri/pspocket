@@ -4,12 +4,17 @@
 
 #include "hle_test_util.hpp"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "pspocket/recomp/nid.hpp"
@@ -577,6 +582,128 @@ TEST_CASE("cellPngEnc: EncodePicture's checks", "[hle][pngenc]")
     CHECK(encode(g, h, good, {RGBA}, 0, 1) == kArg);                   // a buffer of no size
     CHECK(encode(g, h, good, {RGBA}, 0x1000, 0, 0) == kArg);           // a file without a name
     CHECK(encode(g, h, good, {RGBA}) == 0);
+    CHECK(g.call("cellPngEncClose", h) == 0);
+}
+
+namespace {
+
+// A thread's own structures for EncodePicture, 0x100 bytes from kThreadCalls + 0x100 * n: the picture, the parameters,
+// the output parameters.
+constexpr u32 kThreadCalls = kData + 0x18000;
+constexpr u32 kAtPic = 0x00, kAtParam = 0x30, kAtOut = 0x50;
+
+u64 encode_at(GuestThread& g, u32 handle, u32 at, const Pic& p, const Param& e, u32 stream, u32 limit)
+{
+    u8* b = g.f.base();
+    const u32 pic = at + kAtPic, param = at + kAtParam, out = at + kAtOut;
+    std::memset(b + pic, 0, 40);
+    ps_write32(b, pic, p.width);
+    ps_write32(b, pic + 4, p.height);
+    ps_write32(b, pic + 8, p.pitch);
+    ps_write32(b, pic + 12, p.space);
+    ps_write32(b, pic + 16, p.depth);
+    ps_write32(b, pic + 24, kPixels);
+    ps_write64(b, pic + 32, p.user);
+    std::memset(b + param, 0, 24);
+    ps_write32(b, param + 4, e.space);
+    ps_write32(b, param + 8, e.level);
+    ps_write32(b, param + 12, e.filters);
+    ps_write32(b, out, 1); // a buffer
+    ps_write32(b, out + 4, 0);
+    ps_write32(b, out + 8, stream);
+    ps_write32(b, out + 12, limit);
+    return g.call("cellPngEncEncodePicture", handle, pic, param, out);
+}
+
+bool eventually(const std::function<bool()>& done, std::chrono::milliseconds timeout = std::chrono::seconds(30))
+{
+    const auto end = std::chrono::steady_clock::now() + timeout;
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > end) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+} // namespace
+
+TEST_CASE("cellPngEnc: eight threads encoding with one encoder at once: four pictures queued, the others BUSY; a Reset "
+          "drops those still being encoded (D-651)", "[hle][pngenc]")
+{
+    constexpr u32 kThreads = 8, kW = 128, kH = 96, kLimit = 0x20000;
+    static_assert(kPixels + kW * kH * 4 <= kThreadCalls && kThreadCalls + 9 * 0x100 <= kStream);
+    static_assert(kStream + kThreads * kLimit <= kWork);
+    Fixture f;
+    GuestThread g(f, 0, "game");
+    u8* b = f.base();
+    for (u32 y = 0; y < kH; y++) // RGBA with some detail, so that the filters and zlib have work to do
+        for (u32 x = 0; x < kW * 4; x++) b[kPixels + y * kW * 4 + x] = static_cast<u8>((x * x + 7 * y * x + y) >> 3);
+    const u32 h = open(g, kW, kH, 8);
+    const Pic pic{kW, kH, kW * 4, RGBA, 8};
+    const Param param{RGBA, 9, 0xF8};
+    // The stream the encoder makes of the picture alone.
+    REQUIRE(encode_at(g, h, kThreadCalls, pic, param, kStream, kLimit) == 0);
+    const Info alone = stream_info(g, h);
+    REQUIRE(alone.state == 0);
+    const std::vector<u8> want(b + kStream, b + kStream + alone.size);
+
+    for (const bool reset : {false, true}) {
+        INFO("reset " << reset);
+        std::atomic<u32> ready{0}, busy{0};
+        std::atomic<bool> go{false};
+        std::array<std::atomic<u64>, kThreads> answers;
+        for (auto& a : answers) a = ~0ull;
+        std::vector<std::thread> threads;
+        for (u32 t = 0; t < kThreads; t++) {
+            threads.emplace_back([&, t] {
+                GuestThread o(f, 1 + t, "encoder");
+                Pic p = pic;
+                p.user = 0x700 + t;
+                ready++;
+                while (!go.load()) std::this_thread::yield();
+                const u64 r = encode_at(o, h, kThreadCalls + 0x100 * (t + 1), p, param, kStream + kLimit * t, kLimit);
+                answers[t] = r;
+                if (r == kBusy) busy++;
+            });
+        }
+        while (ready.load() < kThreads) std::this_thread::yield();
+        go = true;
+        if (reset) {
+            // Every thread has made its call once four were refused: the four taken still being encoded, or done.
+            CHECK(eventually([&] { return busy.load() == kThreads - 4; }));
+            REQUIRE(g.call("cellPngEncReset", h) == 0);
+        }
+        for (std::thread& th : threads) th.join();
+        u32 refused = 0;
+        std::vector<u64> accepted;
+        for (u32 t = 0; t < kThreads; t++) {
+            if (answers[t] == 0) accepted.push_back(0x700 + t);
+            else if (answers[t] == kBusy) refused++;
+        }
+        CHECK(accepted.size() == 4);
+        CHECK(refused == 4);
+        if (!reset) {
+            // The four pictures taken, each the stream the encoder makes alone, in its own thread's buffer.
+            REQUIRE(g.call("cellPngEncWaitForOutput", h, kNum, 0) == 0);
+            CHECK(ps_read32(b, kNum) == 4);
+            std::vector<u64> users;
+            for (u32 n = 0; n < 4; n++) {
+                const Info s = stream_info(g, h);
+                CHECK(s.state == 0);
+                users.push_back(s.user);
+                const u64 t = s.user - 0x700;
+                REQUIRE(t < kThreads);
+                CHECK(s.addr == kStream + kLimit * t);
+                REQUIRE(s.size == want.size());
+                CHECK(std::memcmp(b + s.addr, want.data(), want.size()) == 0);
+            }
+            std::sort(users.begin(), users.end());
+            CHECK(users == accepted);
+        }
+        // Nothing more: the four taken, or dropped by the Reset with what was still being encoded then; room again.
+        CHECK(g.call("cellPngEncGetStreamInfo", h, kInfo) == kEmpty);
+        CHECK(g.call("cellPngEncWaitForInput", h, 0) == 0);
+    }
     CHECK(g.call("cellPngEncClose", h) == 0);
 }
 

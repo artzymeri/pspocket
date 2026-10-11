@@ -459,7 +459,25 @@ u32 decode(PPUContext& ctx, u32 h, const Cmd& cmd)
     return static_cast<u32>(output_size);
 }
 
-// RPCS3 LpcmDecContext::exec: one command at a time, each after the previous output was taken.
+// Whether the context at `h` is still the calling thread's, as adec_atracx.cpp's own_context (D-645): `r`, the answer
+// of the call just made on its semaphore, mutexes or conditions, is CELL_OK, and its thread ID names the thread. LLE
+// notes such a failure in error_occurred and goes on: with the context overwritten by the game while the decoder was
+// open, that went round failing calls for ever (or took the commands of another decoder opened in its memory). The
+// thread ends instead, logged.
+bool own_context(PPUContext& ctx, u32 h, s32 r, std::string_view what)
+{
+    const u32 self = thread(ctx).id;
+    const u64 named = ps_read64(guest_base(ctx), h + lp::thread_id);
+    if (r == lv2::CELL_OK && named == self) return true;
+    const std::string answer =
+        r == lv2::CELL_OK ? "" : std::format("; {} answered {:#010x}", what, static_cast<u32>(r));
+    PS_LOG_ERROR(kChan, "LPCM decoder {:#x}: its context is no longer its own (it names thread {:#x}{}): the game "
+        "overwrote it while the decoder was open; the decoder's thread {:#x} ends", h, named, answer, self);
+    return false;
+}
+
+// RPCS3 LpcmDecContext::exec: one command at a time, each after the previous output was taken; until its context is
+// no longer its own (own_context, D-645).
 void run(PPUContext& ctx, u32 h)
 {
     u8* base = guest_base(ctx);
@@ -467,11 +485,18 @@ void run(PPUContext& ctx, u32 h)
         if (r != lv2::CELL_OK) ps_write32(base, h + lp::error_occurred, 1);
     };
     while (ps_read32(base, h + lp::run_thread)) {
-        failed(sem_acquire(ctx, h + lp::cmd_available));
+        if (!own_context(ctx, h, lv2::CELL_OK, {}) ||
+            !own_context(ctx, h, sem_acquire(ctx, h + lp::cmd_available), "the command semaphore"))
+            return;
         // The output is taken first, even before a command that decodes nothing.
-        failed(lock(ctx, h, lp::output_mutex));
-        while (ps_read32(base, h + lp::output_locked))
-            lv2::sys_cond_wait(thread(ctx), ps_read32(base, h + lp::output_consumed), 0); // unchecked on LLE
+        const s32 locked = lock(ctx, h, lp::output_mutex);
+        s32 r = locked;
+        while (r == lv2::CELL_OK && ps_read32(base, h + lp::output_locked))
+            r = lv2::sys_cond_wait(thread(ctx), ps_read32(base, h + lp::output_consumed), 0); // unchecked on LLE
+        if (!own_context(ctx, h, r, "the output's mutex or condition")) {
+            if (locked == lv2::CELL_OK) unlock(ctx, h, lp::output_mutex);
+            return;
+        }
         lock(ctx, h, lp::queue_mutex);
         const Cmd cmd = pop_command(base, h);
         unlock(ctx, h, lp::queue_mutex);
@@ -524,6 +549,9 @@ public:
     {
         u8* base = guest_base(ctx);
         const u32 end_of_context = h + ((lp::size + 0x7F) & ~0x7Fu);
+        // No thread ID until the new thread's: an earlier decoder's thread still going in this memory does not take the
+        // new context for its own (D-645).
+        ps_write64(base, h + lp::thread_id, 0);
         ps_write32(base, h + lp::cmd_front, 0);
         ps_write32(base, h + lp::cmd_back, 0);
         set_queue_size(base, h, 0);

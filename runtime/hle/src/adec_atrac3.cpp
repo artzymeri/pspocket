@@ -15,7 +15,25 @@
 // - A unit shorter than its frame, or one FFmpeg refuses: AT3_ERROR.
 // - CellAdecAtrac3Info: the sequence's nch, isJoint and nbytes.
 // - PTS: the front end's step for ATRAC3 (correctPtsValueType 6, whatever the rate, as Sony's front end has it).
+//
+// ATRAC3 multichannel (CELL_ADEC_TYPE_ATRAC3MULTI, for cellAtrac3multidec's table 0xC20C6BD7, D-621), which
+// cellAtracMulti decodes its files through (cellAtrac.cpp, D-535). RPCS3 has no structures for it; the parameters are
+// what libatrac3multi writes (D-535, its handle compared byte for byte with Sony's module's): nch the output tracks (1
+// to 8), isJoint 0 (multichannel ATRAC3 has no joint stereo), nbytes the stream's frame (all its channels), bw_pcm as
+// ATRAC3's, and at +0x10 the stream's channels (pspocket's name for the 0x14 bytes: CellAdecParamAtrac3Multi). Before
+// each frame libatrac3multi lays out, for each track, the block (nbytes / the stream's channels) of the channel the
+// track plays, a silent block for a track that plays none, and gives that with the stream frame's size; so:
+// - An access unit is nch blocks, each one channel's ATRAC3 frame (one sound unit), decoded by FFmpeg's ATRAC3 decoder
+//   as a mono stream, a decoder for each track (each keeps its channel's overlap and gain control state). The blocks
+//   may pass the size given (eight tracks of a two-channel stream): the core reads nch blocks from the unit's start.
+// - The PCM: nch channels interleaved, 1024 samples each, in bw_pcm's format as ATRAC3's.
+// - StartSeq refuses (ARG) a track count outside 1 to 8, joint stereo, a stream of more than 8 channels, a frame other
+//   than 96, 152 or 192 bytes a channel, or another word size; a stream's channel count of 0 is taken as nch. Its
+//   errors are libadec's own (ARG, BUSY, and FATAL for a unit it cannot decode), its own not being known.
+// - The information block: nch, isJoint, nbytes and the stream's channels (pspocket's, 0x10 bytes).
+// - PTS: the front end's step for it (correctPtsValueType 39).
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <format>
@@ -44,6 +62,37 @@ constexpr u32 nch = 0x0, is_joint = 0x4, nbytes = 0x8, bw_pcm = 0xC, size = 0x10
 }
 constexpr u32 kInfoSize = 0xC;
 
+Format format_of(u32 bw)
+{
+    return bw == WORD_SZ_16BIT ? Format::S16 : bw == WORD_SZ_24BIT ? Format::S24 :
+           bw == WORD_SZ_32BIT ? Format::S32 : Format::F32;
+}
+
+// FFmpeg's ATRAC3 decoder for frames of `nbytes` and `channels` channels, its configuration a WAV file's 14 extra
+// bytes: 1, the samples per channel, the coding mode (joint stereo or single channels) twice, the frame factor 1, 0.
+bool open_atrac3(FfDecoder& ff, std::string_view name, u32 channels, bool joint, u32 nbytes)
+{
+    std::array<u8, 14> extra{};
+    const auto le16 = [&](u32 at, u32 v) {
+        extra[at] = static_cast<u8>(v);
+        extra[at + 1] = static_cast<u8>(v >> 8);
+    };
+    le16(0, 1);
+    le16(2, 0x1000);
+    le16(6, joint);
+    le16(8, joint);
+    le16(10, 1);
+    return ff.open("atrac3", name, [&](AVCodecContext* av) {
+        av_channel_layout_uninit(&av->ch_layout);
+        av_channel_layout_default(&av->ch_layout, static_cast<int>(channels));
+        av->sample_rate = 44100; // not in the parameters; FFmpeg's decoding does not depend on it
+        av->block_align = static_cast<int>(nbytes);
+        av->extradata = static_cast<u8*>(av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+        std::memcpy(av->extradata, extra.data(), extra.size());
+        av->extradata_size = static_cast<int>(extra.size());
+    });
+}
+
 class Atrac3 final : public Codec {
 public:
     s32 start(const u8* param) override
@@ -51,29 +100,8 @@ public:
         nch_ = ps_ld32(param + prm::nch);
         joint_ = ps_ld32(param + prm::is_joint) != 0;
         nbytes_ = ps_ld32(param + prm::nbytes);
-        const u32 bw = ps_ld32(param + prm::bw_pcm);
-        format_ = bw == WORD_SZ_16BIT ? Format::S16 : bw == WORD_SZ_24BIT ? Format::S24 :
-                  bw == WORD_SZ_32BIT ? Format::S32 : Format::F32;
-        // A WAV file's extra bytes: 1, the samples per channel, the coding mode twice, the frame factor 1, 0.
-        std::array<u8, 14> extra{};
-        const auto le16 = [&](u32 at, u32 v) {
-            extra[at] = static_cast<u8>(v);
-            extra[at + 1] = static_cast<u8>(v >> 8);
-        };
-        le16(0, 1);
-        le16(2, 0x1000);
-        le16(6, joint_);
-        le16(8, joint_);
-        le16(10, 1);
-        configured_ = ff_.open("atrac3", "ATRAC3", [&](AVCodecContext* av) {
-            av_channel_layout_uninit(&av->ch_layout);
-            av_channel_layout_default(&av->ch_layout, static_cast<int>(nch_));
-            av->sample_rate = 44100; // not in the parameters; FFmpeg's decoding does not depend on it
-            av->block_align = static_cast<int>(nbytes_);
-            av->extradata = static_cast<u8*>(av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE));
-            std::memcpy(av->extradata, extra.data(), extra.size());
-            av->extradata_size = static_cast<int>(extra.size());
-        });
+        format_ = format_of(ps_ld32(param + prm::bw_pcm));
+        configured_ = open_atrac3(ff_, "ATRAC3", nch_, joint_, nbytes_);
         return configured_ ? lv2::CELL_OK : error(CELL_ADEC_ERROR_AT3_ERROR);
     }
 
@@ -115,6 +143,72 @@ private:
     Format format_ = Format::F32;
 };
 
+// ATRAC3 multichannel (D-621): CellAdecParamAtrac3's four words and the stream's channels; its information block the
+// same five words but bw_pcm.
+namespace mprm {
+constexpr u32 nch = 0x0, is_joint = 0x4, nbytes = 0x8, bw_pcm = 0xC, channels = 0x10, size = 0x14;
+}
+constexpr u32 kMultiInfoSize = 0x10, kMaxTracks = 8;
+
+class Atrac3Multi final : public Codec {
+public:
+    s32 start(const u8* param) override
+    {
+        nch_ = ps_ld32(param + mprm::nch);
+        nbytes_ = ps_ld32(param + mprm::nbytes);
+        channels_ = ps_ld32(param + mprm::channels);
+        if (!channels_) channels_ = nch_;
+        configured_ = channels_ && nch_ <= kMaxTracks; // as check_multi passed them
+        block_ = configured_ ? nbytes_ / channels_ : 0;
+        format_ = format_of(ps_ld32(param + mprm::bw_pcm));
+        for (u32 t = 0; t < nch_ && configured_; t++)
+            configured_ = open_atrac3(tracks_[t], "ATRAC3 multichannel", 1, false, block_);
+        return configured_ ? lv2::CELL_OK : error(CELL_ADEC_ERROR_ARG);
+    }
+
+    // Each track's block, from the unit's start (D-535: they may pass the stream frame's size the unit is given with).
+    u32 bytes_needed(u32 size) const override { return configured_ ? std::max(size, nch_ * block_) : size; }
+
+    Decoded decode(u8* base, u32 au, u32 size, u32 out, u32 bsi) override
+    {
+        Decoded d;
+        d.pts_type = CORRECT_PTS_ATRAC3MULTI;
+        ps_write32(base, bsi + mprm::nch, nch_);
+        ps_write32(base, bsi + mprm::is_joint, 0);
+        ps_write32(base, bsi + mprm::nbytes, nbytes_);
+        ps_write32(base, bsi + 0xC, channels_);
+        const auto fail = [&] {
+            d.error = error(CELL_ADEC_ERROR_FATAL);
+            return d;
+        };
+        if (!configured_) {
+            PS_LOG_ERROR("cellAdec", "ATRAC3 multichannel: a decode without a sequence started with valid parameters");
+            return fail();
+        }
+        if (!size) return fail(); // not guest memory (logged)
+        Planar pcm;
+        pcm.ch.resize(nch_);
+        pcm.samples = 1024;
+        for (u32 t = 0; t < nch_; t++) {
+            Planar one;
+            if (const int e = tracks_[t].decode(base + au + t * block_, block_, one, 1024); e < 0 || one.samples != 1024) {
+                PS_LOG_ERROR("cellAdec", "ATRAC3 multichannel: FFmpeg refused track {}'s block ({}): the game sent "
+                    "invalid data", t, e);
+                return fail();
+            }
+            pcm.ch[t] = std::move(one.ch[0]);
+        }
+        d.size = write_pcm(base, out, pcm, straight(nch_), format_);
+        return d;
+    }
+
+private:
+    std::array<FfDecoder, kMaxTracks> tracks_;
+    u32 nch_ = 0, nbytes_ = 0, channels_ = 0, block_ = 0;
+    bool configured_ = false;
+    Format format_ = Format::F32;
+};
+
 // cellAdecStartSeq: one or two channels (joint stereo only with two), frames of 96, 152 or 192 bytes a channel, a word
 // size ATRAC3_WordSize names.
 s32 check(const u8* p)
@@ -129,12 +223,31 @@ s32 check(const u8* p)
     return error(CELL_ADEC_ERROR_ARG);
 }
 
+// cellAdecStartSeq for ATRAC3 multichannel (D-621): 1 to 8 tracks, no joint stereo, a stream of up to 8 channels (0:
+// the tracks'), frames of 96, 152 or 192 bytes a channel, a word size ATRAC3_WordSize names.
+s32 check_multi(const u8* p)
+{
+    const u32 nch = ps_ld32(p + mprm::nch), joint = ps_ld32(p + mprm::is_joint), nbytes = ps_ld32(p + mprm::nbytes),
+              bw = ps_ld32(p + mprm::bw_pcm), channels = ps_ld32(p + mprm::channels) ? ps_ld32(p + mprm::channels) : nch;
+    bool ok = nch >= 1 && nch <= kMaxTracks && joint == 0 && channels >= 1 && channels <= kMaxTracks;
+    ok = ok && (nbytes == 96 * channels || nbytes == 152 * channels || nbytes == 192 * channels);
+    ok = ok && (bw == WORD_SZ_16BIT || bw == WORD_SZ_24BIT || bw == WORD_SZ_32BIT || bw == WORD_SZ_FLOAT);
+    if (ok) return lv2::CELL_OK;
+    PS_LOG_ERROR("cellAdec", "ATRAC3 multichannel: parameters nch {}, isJoint {}, nbytes {}, bw_pcm {:#x}, {} channels",
+        nch, joint, nbytes, bw, channels);
+    return error(CELL_ADEC_ERROR_ARG);
+}
+
 } // namespace
 
 // libat3dec's version is not known (pspocket's word); the information block is CellAdecAtrac3Info's size. Two channels
 // of a frame's 1024 samples, 32 bits each at most.
 const Spec kAtrac3 = {CELL_ADEC_TYPE_ATRAC3, "ATRAC3", prm::size, kInfoSize, 1024 * 2 * 4, 0x01000000,
     CELL_ADEC_ERROR_AT3_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3>()); }};
+// ATRAC3 multichannel (D-621): eight tracks of 1024 samples, 32 bits each at most; libadec's error codes.
+const Spec kAtrac3Multi = {CELL_ADEC_TYPE_ATRAC3MULTI, "ATRAC3 multichannel", mprm::size, kMultiInfoSize,
+    1024 * kMaxTracks * 4, 0x01000000, CELL_ADEC_ERROR_BUSY, check_multi,
+    [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3Multi>()); }};
 
 } // namespace pspocket::hle::adec::ffcore
 

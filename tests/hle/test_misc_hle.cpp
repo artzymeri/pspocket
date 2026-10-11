@@ -327,3 +327,174 @@ TEST_CASE("cellNetCtl: game update checks find no update; the start dialog abort
     CHECK(callback_param(b, 0) == 0x5555);
     REQUIRE(g.call("cellNetCtlTerm") == 0);
 }
+
+// ---- cellNetCtl's game-internal forms and the game update's Init, Term and CheckAbort (D-670)
+
+TEST_CASE("cellNetCtl game-internal forms: the public forms' offline answers, handlers kept and never called (D-670)",
+    "[hle][net][netctl-gameint]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread g(f, 0, "gameint");
+    u8* b = f.base();
+    write_callback(b);
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    constexpr u32 kState = kData + 0x100, kInfo = kData + 0x200, kHid = kData + 0x400, kScan = kData + 0x500;
+    constexpr u64 kHandlerMax = 0xFFFFFFFF80130103ull, kIdNotFound = 0xFFFFFFFF80130104ull,
+                  kInvalidId = 0xFFFFFFFF80130105ull;
+    constexpr u32 kInfoSize = 0x104;
+
+    // Nothing before cellNetCtlInit, whatever the arguments.
+    CHECK(g.call("cellNetCtlGetStateGameInt", kState) == kNetNotInit);
+    CHECK(g.call("cellNetCtlGetStateGameInt", 0) == kNetNotInit);
+    CHECK(g.call("cellNetCtlGetInfoGameInt", 2, kInfo) == kNetNotInit);
+    CHECK(g.call("cellNetCtlAddHandlerGameInt", kOpd, 0, kHid) == kNetNotInit);
+    CHECK(g.call("cellNetCtlDelHandlerGameInt", 0) == kNetNotInit);
+    CHECK(g.call("cellNetCtlConnectGameInt") == kNetNotInit);
+    CHECK(g.call("cellNetCtlDisconnectGameInt") == kNetNotInit);
+    CHECK(g.call("cellNetCtlScanGameInt") == kNetNotInit);
+    CHECK(g.call("cellNetCtlGetScanInfoGameInt", kScan, kScan + 4) == kNetNotInit);
+    REQUIRE(g.call("cellNetCtlInit") == 0);
+
+    // The state: Disconnected, as cellNetCtlGetState; the pointer checked first.
+    ps_write32(b, kState, 0xA5A5A5A5);
+    CHECK(g.call("cellNetCtlGetStateGameInt", 0) == kNetBadAddr);
+    CHECK(g.call("cellNetCtlGetStateGameInt", kUnmapped) == kNetBadAddr);
+    REQUIRE(g.call("cellNetCtlGetStateGameInt", kState) == 0);
+    CHECK(ps_read32(b, kState) == 0);
+    ps_write32(b, kState, 0xA5A5A5A5);
+    REQUIRE(g.call("cellNetCtlGetState", kState) == 0);
+    CHECK(ps_read32(b, kState) == 0);
+
+    // The information: the Ethernet address only, as cellNetCtlGetInfo; every other code needs a connection.
+    std::memset(b + kInfo, 0xAA, kInfoSize);
+    CHECK(g.call("cellNetCtlGetInfoGameInt", 2, 0) == kNetBadAddr);
+    CHECK(g.call("cellNetCtlGetInfoGameInt", 16, 0) == kNetBadAddr);
+    CHECK(g.call("cellNetCtlGetInfoGameInt", 2, kUnmapped) == kNetBadAddr);
+    for (s32 code = -1; code <= 27; code++) {
+        if (code == 2) continue;
+        INFO("code " << code);
+        CHECK(g.call("cellNetCtlGetInfoGameInt", code, kInfo) == kNetNotConnected);
+    }
+    CHECK(all_bytes(b + kInfo, kInfoSize, 0xAA));
+    REQUIRE(g.call("cellNetCtlGetInfoGameInt", 2, kInfo) == 0);
+    CHECK(all_bytes(b + kInfo, 6, 0xFF));
+    CHECK(all_bytes(b + kInfo + 6, kInfoSize - 6, 0xAA));
+
+    // Handlers: four slots, IDs 0 to 3 written to *hid, the lowest free first; a fifth is HANDLER_MAX.
+    CHECK(g.call("cellNetCtlAddHandlerGameInt", kOpd, 0x70, 0) == kNetBadAddr);
+    CHECK(g.call("cellNetCtlAddHandlerGameInt", kOpd, 0x70, kUnmapped) == kNetBadAddr);
+    for (u32 id = 0; id < 4; id++) {
+        ps_write32(b, kHid, 0xA5A5A5A5);
+        REQUIRE(g.call("cellNetCtlAddHandlerGameInt", kOpd, 0x70 + id, kHid) == 0);
+        CHECK(ps_read32(b, kHid) == id);
+    }
+    ps_write32(b, kHid, 0xA5A5A5A5);
+    CHECK(g.call("cellNetCtlAddHandlerGameInt", kOpd, 0x74, kHid) == kHandlerMax);
+    CHECK(ps_read32(b, kHid) == 0xA5A5A5A5);
+    CHECK(g.call("cellNetCtlDelHandlerGameInt", 4) == kInvalidId);
+    CHECK(g.call("cellNetCtlDelHandlerGameInt", -1) == kInvalidId);
+    REQUIRE(g.call("cellNetCtlDelHandlerGameInt", 1) == 0);
+    CHECK(g.call("cellNetCtlDelHandlerGameInt", 1) == kIdNotFound);
+    REQUIRE(g.call("cellNetCtlAddHandlerGameInt", kOpd, 0x75, kHid) == 0);
+    CHECK(ps_read32(b, kHid) == 1);
+
+    // No link: Connect fails, Disconnect has nothing to do, a scan finds nothing and its results write nothing.
+    CHECK(g.call("cellNetCtlConnectGameInt") == kNetNotConnected);
+    CHECK(g.call("cellNetCtlConnectGameInt", kInfo) == kNetNotConnected);
+    CHECK(g.call("cellNetCtlDisconnectGameInt") == 0);
+    CHECK(g.call("cellNetCtlScanGameInt") == 0);
+    std::memset(b + kScan, 0xAA, 0x100);
+    CHECK(g.call("cellNetCtlGetScanInfoGameInt", kScan, kScan + 4, kScan + 8) == 0);
+    CHECK(all_bytes(b + kScan, 0x100, 0xAA));
+    CHECK(g.call("cellNetCtlGetStateGameInt", kState) == 0);
+    CHECK(ps_read32(b, kState) == 0); // still Disconnected
+
+    // The handlers were never called: the interface never changed state.
+    REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+    CHECK(callback_calls(b) == 0);
+
+    // Term forgets the handlers and closes the library to every form.
+    g.call("cellNetCtlTerm");
+    CHECK(g.call("cellNetCtlGetStateGameInt", kState) == kNetNotInit);
+    CHECK(g.call("cellNetCtlDelHandlerGameInt", 0) == kNetNotInit);
+    REQUIRE(g.call("cellNetCtlInit") == 0);
+    CHECK(g.call("cellNetCtlDelHandlerGameInt", 0) == kIdNotFound);
+    REQUIRE(g.call("cellNetCtlAddHandlerGameInt", kOpd, 0x76, kHid) == 0);
+    CHECK(ps_read32(b, kHid) == 0);
+    g.call("cellNetCtlTerm");
+
+    // Unverified (D-594): made from RPCS3's names without Sony's libnetctl to compare with.
+    for (const u32 nid : {0xB23D5A13u, 0x21D67EEFu, 0x793BBF51u, 0xF08BA0D0u, 0x11F777B7u, 0xF8C8B9FFu, 0x3BFA5B37u,
+             0x71DB688Du}) {
+        INFO(std::hex << nid);
+        CHECK(hle::registry().is_unverified("cellNetCtl", nid));
+    }
+    CHECK_FALSE(hle::registry().is_unverified("cellNetCtl", 0x1E585B5D)); // cellNetCtlGetInfo
+}
+
+TEST_CASE("cellGameUpdate: Init and Term bracket it; CheckAbort aborts a check not yet answered (D-670)",
+    "[hle][net][gameupdate]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread g(f, 0, "update");
+    u8* b = f.base();
+    write_callback(b);
+    constexpr u32 kParam = kData + 0x100;
+    constexpr u64 kNotInit = 0xFFFFFFFF8002CC01ull, kAlready = 0xFFFFFFFF8002CC02ull, kNotStart = 0xFFFFFFFF8002CC08ull;
+
+    CHECK(g.call("cellGameUpdateTerm") == kNotInit);
+    CHECK(g.call("cellGameUpdateCheckAbort") == kNotInit);
+    REQUIRE(g.call("cellGameUpdateInit") == 0);
+    CHECK(g.call("cellGameUpdateInit") == kAlready);
+    CHECK(g.call("cellGameUpdateCheckAbort") == kNotStart); // no check started
+
+    // A check aborted before its answer: the callback hears ABORTED (6); the finish is not a check.
+    REQUIRE(g.call("cellGameUpdateCheckStartWithoutDialogAsync", kOpd, 0x10) == 0);
+    REQUIRE(g.call("cellGameUpdateCheckAbort") == 0);
+    CHECK(g.call("cellGameUpdateCheckAbort") == 0); // still in progress until answered
+    REQUIRE(g.call("cellGameUpdateCheckFinishAsync", kOpd, 0x11) == 0);
+    REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+    REQUIRE(callback_calls(b) == 2);
+    CHECK(callback_status(b, 0) == 6);
+    CHECK(callback_param(b, 0) == 0);
+    CHECK(callback_userdata(b, 0) == 0x10);
+    CHECK(callback_status(b, 1) == 5);
+    CHECK(callback_userdata(b, 1) == 0x11);
+    CHECK(g.call("cellGameUpdateCheckAbort") == kNotStart); // answered: none in progress
+
+    // A check not aborted still finds no update (0); one answered before the abort cannot be aborted.
+    std::memset(b + kLog, 0, 0x100);
+    REQUIRE(g.call("cellGameUpdateCheckStartAsync", kParam, kOpd, 0x20) == 0);
+    REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+    CHECK(g.call("cellGameUpdateCheckAbort") == kNotStart);
+    REQUIRE(callback_calls(b) == 1);
+    CHECK(callback_status(b, 0) == 0);
+
+    // The Ex form's result carries ABORTED too.
+    std::memset(b + kLog, 0, 0x100);
+    REQUIRE(g.call("cellGameUpdateCheckStartAsyncEx", kParam, kOpd, 0x30) == 0);
+    REQUIRE(g.call("cellGameUpdateCheckStartWithoutDialogAsyncEx", kOpd, 0x31) == 0);
+    REQUIRE(g.call("cellGameUpdateCheckAbort") == 0); // both in progress
+    REQUIRE(g.call("cellSysutilCheckCallback") == 0);
+    REQUIRE(callback_calls(b) == 2);
+    for (u32 i = 0; i < 2; i++) {
+        INFO("callback " << i);
+        const u32 result = callback_status(b, i);
+        CHECK(callback_param(b, i) == 0x30 + i);
+        CHECK(ps_read32(b, result) == 6);
+        CHECK(ps_read32(b, result + 4) == 0);
+    }
+
+    REQUIRE(g.call("cellGameUpdateTerm") == 0);
+    CHECK(g.call("cellGameUpdateTerm") == kNotInit);
+    CHECK(g.call("cellGameUpdateCheckAbort") == kNotInit);
+    REQUIRE(g.call("cellGameUpdateInit") == 0); // again after Term
+    REQUIRE(g.call("cellGameUpdateTerm") == 0);
+
+    for (const u32 nid : {0x99AB1A26u, 0x10DAE56Du, 0x3E359AB6u}) {
+        INFO(std::hex << nid);
+        CHECK(hle::registry().is_unverified("cellNetCtl", nid));
+    }
+}

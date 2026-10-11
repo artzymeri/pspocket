@@ -1277,6 +1277,43 @@ TEST_CASE("cellVideoOut, cellAudioOut, cellSysutilAvconfExt: the rest of RPCS3's
     CHECK(a.call("cellAudioInUnregisterDevice", 0) == 0);
 }
 
+TEST_CASE("cellSysutilAvconfExt: an audio device unregistered as registered; the second resolution availability "
+          "(D-674)",
+    "[hle][sysutil][avconf]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    constexpr u32 kName = kData + 0x100;
+    const u64 kNotFound = r3_of_code(0x8002b244);
+    std::memcpy(f.base() + kName, "USB Headset", 12);
+
+    // cellAudioOutRegisterDevice gives device 0 (RPCS3) each time; each registration is unregistered once.
+    CHECK(a.call("cellAudioOutUnregisterDevice", 0) == kNotFound);
+    REQUIRE(a.call("cellAudioOutRegisterDevice", 1, kName, 0, 0) == 0);
+    REQUIRE(a.call("cellAudioOutRegisterDevice", 1, kName, 0, 0) == 0);
+    CHECK(a.call("cellAudioOutRegisterDevice", 1, kName, kName, 0) == r3_of_code(0x8002b262)); // refused: not counted
+    CHECK(a.call("cellAudioOutUnregisterDevice", 1) == kNotFound);
+    CHECK(a.call("cellAudioOutUnregisterDevice", 0xFFFFFFFF) == kNotFound);
+    CHECK(a.call("cellAudioOutUnregisterDevice", 0) == 0);
+    CHECK(a.call("cellAudioOutUnregisterDevice", 0) == 0);
+    CHECK(a.call("cellAudioOutUnregisterDevice", 0) == kNotFound);
+
+    // The second form answers as the first for the 720p display (a boolean): the further arguments are not read.
+    for (const char* fn : {"cellVideoOutGetResolutionAvailability", "cellVideoOutGetResolutionAvailability2"}) {
+        INFO(fn);
+        CHECK(a.call(fn, 0, 2, 0, 0) == 1);          // 720p, any aspect
+        CHECK(a.call(fn, 0, 2, 2, 0x12345678) == 1); // 720p, 16:9
+        CHECK(a.call(fn, 0, 2, 1, 0) == 0);          // 720p, 4:3
+        CHECK(a.call(fn, 0, 1, 0, 0) == 0);          // 1080
+        CHECK(a.call(fn, 0, 0x81, 0, 0) == 0);       // 3D
+        CHECK(a.call(fn, 1, 2, 0, 0) == 0);          // the secondary output has no display
+        CHECK(a.call(fn, 2, 2, 0, 0) == kVideoUnsupportedOut);
+    }
+    CHECK(hle::registry().is_unverified("cellSysutilAvconfExt", 0x0BDDEF7D));
+    CHECK(hle::registry().is_unverified("cellSysutilAvconfExt", 0x21036F4E));
+    CHECK_FALSE(hle::registry().is_unverified("cellSysutilAvconfExt", 0xC7087631)); // cellAudioOutRegisterDevice
+}
+
 TEST_CASE("cellOskDialog: input text, the finish message, settings and separate windows; cellOskExtUtility (D-183)",
     "[hle][sysutil][osk]")
 {

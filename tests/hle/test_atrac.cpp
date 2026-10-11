@@ -231,3 +231,77 @@ TEST_CASE("cellAtrac against libatrac3plus: every answer, output and handle byte
     CHECK(count("cellAtracDecode -> 0x80610332") >= 1); // a stream that ran dry
     compare_logs(ours, script(f.base(), theirs));
 }
+
+namespace {
+
+constexpr u32 CELL_ATRAC_ERROR_UNKNOWN_FORMAT = 0x80610312, CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL = 0x80610313;
+
+// cellAtracSetDataAndGetMemSize over `file`, read whole into a buffer of 0x20000 bytes.
+u32 set_data(GuestThread& t, u8* b, const std::vector<u8>& file)
+{
+    std::memset(b + kHandle, 0, 0x200);
+    std::memcpy(b + kBuffer, file.data(), file.size());
+    return static_cast<u32>(
+        t.call("cellAtracSetDataAndGetMemSize", kHandle, kBuffer, static_cast<u32>(file.size()), 0x20000, kOut));
+}
+
+} // namespace
+
+// A file whose ATRAC3plus configuration has more channels than its fmt chunk (D-645): refused. Each decoded frame ran
+// past the memory sized from the fmt's channels, onto cellAdec's context after the frame's PCM in the work memory (the
+// cellAtrac fuzzing's damaged files: cellAdecClose then refused the context and its decoder's thread went on). Fewer
+// channels fit, and are taken as before; an fmt of more than ATRAC3plus's eight is refused too.
+TEST_CASE("cellAtrac: a configuration of more channels than the fmt chunk's is refused (D-645)", "[hle][atrac]")
+{
+#if !PSPOCKET_HAVE_FFMPEG
+    SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): pspocket's cellAdec has no ATRAC3plus core");
+#endif
+    Fixture f;
+    REQUIRE(f.hle->link_internal_functions({"cellAdec", "cellAtrac"}));
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    // at3p_file's fmt chunk: its channels at 22, the configuration's first byte (rate << 5 | channels << 2) at 62.
+    const auto with = [](u16 channels, u8 config) {
+        std::vector<u8> file = at3p_file({});
+        file[22] = static_cast<u8>(channels);
+        file[23] = static_cast<u8>(channels >> 8);
+        file[62] = static_cast<u8>(2 << 5 | config << 2); // 48 kHz
+        return file;
+    };
+    CHECK(set_data(t, b, with(2, 2)) == 0);
+    CHECK(set_data(t, b, with(1, 2)) == CELL_ATRAC_ERROR_UNKNOWN_FORMAT); // stereo frames, one channel's memory
+    CHECK(set_data(t, b, with(2, 3)) == CELL_ATRAC_ERROR_UNKNOWN_FORMAT); // three channels for two
+    CHECK(set_data(t, b, with(6, 6)) == CELL_ATRAC_ERROR_UNKNOWN_FORMAT); // 6.1, seven channels, for six
+    CHECK(set_data(t, b, with(8, 7)) == 0);                               // 7.1, eight channels
+    CHECK(set_data(t, b, with(2, 1)) == 0);                               // mono frames for two channels fit
+    CHECK(set_data(t, b, with(9, 7)) == CELL_ATRAC_ERROR_UNKNOWN_FORMAT); // nine channels, more than ATRAC3plus has
+    CHECK(set_data(t, b, with(0x102, 2)) == CELL_ATRAC_ERROR_UNKNOWN_FORMAT); // 258 (the handle keeps a byte: 2)
+}
+
+// Header lengths that the reader's 32-bit sums wrap round to a header or chunk already read (D-646): refused, where the
+// reader read the same headers again for ever (the cellAtrac fuzzing with another seed: a chunk of 0xFFFFFF00 bytes).
+TEST_CASE("cellAtrac: a header length that wraps the reader back is refused, not read for ever (D-646)", "[hle][atrac]")
+{
+    Fixture f;
+    REQUIRE(f.hle->link_internal_functions({"cellAdec", "cellAtrac"}));
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    // A RIFF form that is not WAVE, 12 bytes, whose length takes the reader back to its own start.
+    CHECK(set_data(t, b, {'R', 'I', 'F', 'F', 0xF8, 0xFF, 0xFF, 0xFF, 'A', 'V', 'I', ' '}) ==
+          CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+    // After the fmt chunk (it ends at 72): a chunk whose length takes the reader back to its own start; two empty
+    // chunks and one that goes back to the first of them.
+    const auto inserted = [](const std::vector<u8>& chunks) {
+        std::vector<u8> file = at3p_file({});
+        file.insert(file.begin() + 72, chunks.begin(), chunks.end());
+        return file;
+    };
+    CHECK(set_data(t, b, inserted({'L', 'O', 'O', 'P', 0xF8, 0xFF, 0xFF, 0xFF})) ==
+          CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+    CHECK(set_data(t, b, inserted({'J', 'U', 'N', 'K', 0, 0, 0, 0, 'J', 'U', 'N', 'K', 0, 0, 0, 0, 'B', 'A', 'C', 'K',
+                             0xE8, 0xFF, 0xFF, 0xFF})) == CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+    // A fmt chunk whose length runs past the bytes only through the wrap: refused before it is read.
+    std::vector<u8> fmt = at3p_file({});
+    for (u32 i = 16; i < 20; i++) fmt[i] = i == 16 ? 0xF0 : 0xFF;
+    CHECK(set_data(t, b, fmt) == CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+}

@@ -36,6 +36,7 @@ void register_cellSearch(Registry& r);
 void register_cellMusic(Registry& r);
 void register_media_export(Registry& r);
 void register_cellSysutilAvc2(Registry& r);
+void register_cellVideoPlayerUtility(Registry& r);
 void register_cellImeJp(Registry& r);
 void register_cellRec(Registry& r);
 void register_cellPamf(Registry& r);
@@ -99,6 +100,7 @@ void register_sys_io(Registry& r);
 void register_sys_net(Registry& r);
 void register_sysutil_misc(Registry& r);
 void register_devices(Registry& r);
+void register_cellRemotePlay(Registry& r);
 void register_gem(Registry& r);
 
 void register_all_modules(Registry& r)
@@ -135,6 +137,7 @@ void register_all_modules(Registry& r)
     register_cellMusic(r);
     register_media_export(r);
     register_cellSysutilAvc2(r);
+    register_cellVideoPlayerUtility(r);
     register_cellImeJp(r);
     register_cellRec(r);
     register_cellPamf(r);
@@ -198,6 +201,7 @@ void register_all_modules(Registry& r)
     register_sys_net(r);
     register_sysutil_misc(r);
     register_devices(r);
+    register_cellRemotePlay(r);
     register_gem(r);
 }
 

@@ -7,11 +7,13 @@
 // pspocket's:
 // - The handle is the work memory the game gives Open (resource.memAddr), where libpngenc keeps itself; nothing is
 //   written there.
-// - EncodePicture encodes the picture at once, on the calling thread, and queues its result (at most 4 waiting: then
-//   BUSY); WaitForInput says there is room (waiting for it when asked to block); WaitForOutput gives the number of
-//   results waiting (waiting for one when asked to block, else EMPTY); GetStreamInfo takes the oldest (EMPTY without
-//   one); Reset drops them. A result's state is CELL_OK, STREAM_OVERFLOW (a buffer too small: what fits is written),
-//   STREAM_FILE_OPEN (the file cannot be made) or STREAM_ABORT (libpng refused).
+// - EncodePicture encodes the picture at once, on the calling thread, and queues its result (at most 4 waiting or
+//   being encoded: then BUSY; a picture takes its place before it is encoded, so threads encoding at once cannot pass
+//   the depth, and a Reset or Close meanwhile drops it unwritten, D-651); WaitForInput says there is room (waiting for
+//   it when asked to block); WaitForOutput gives the number of results waiting (waiting for one when asked to block,
+//   else EMPTY); GetStreamInfo takes the oldest (EMPTY without one); Reset drops them. A result's state is CELL_OK,
+//   STREAM_OVERFLOW (a buffer too small: what fits is written), STREAM_FILE_OPEN (the file cannot be made) or
+//   STREAM_ABORT (libpng refused).
 // - The picture (width, height, pitchWidth bytes a row, its colour space and bit depth, below 8 bits one sample a byte
 //   unless packedPixel) becomes a PNG of the encode colour space: the same, or with the alpha dropped (RGBA or ARGB to
 //   RGB, gray and alpha to gray), or added opaque (RGB to RGBA, gray to gray and alpha); ARGB is written as RGBA (PNG
@@ -106,12 +108,15 @@ struct Result {
 struct Encoder {
     Config cfg;
     std::deque<Result> results;
+    u32 encoding = 0; // pictures being encoded on their callers' threads, each holding its place in the queue (D-651)
     u64 resets = 0;
+    u64 serial = 0; // the Open that made it: a picture whose encoder was closed meanwhile is not another's
 };
 
 struct State {
     std::mutex mutex;
     std::map<u32, Encoder> encoders; // by handle (the work memory)
+    u64 opened = 0;                  // encoders opened, for their serials
     bool chunk_logged = false;
 };
 
@@ -516,7 +521,8 @@ s32 open(PPUContext& ctx, u32 config, u32 resource, u32 handle, bool ex)
     if (!mem || !size || !priorities || size < mem_size(c) + 0x1780) return error(CELL_PNGENC_ERROR_ARG);
     State& s = state();
     std::lock_guard lock(s.mutex);
-    if (!s.encoders.try_emplace(mem, Encoder{c, {}, 0}).second) return error(CELL_PNGENC_ERROR_ARG); // already open
+    if (s.encoders.contains(mem)) return error(CELL_PNGENC_ERROR_ARG); // already open
+    s.encoders.emplace(mem, Encoder{c, {}, 0, 0, ++s.opened});
     ps_write32(base, handle, mem);
     PS_LOG_INFO(kChan, "cellPngEncOpen{}: handle {:#x}, up to {}x{} at {} bits", ex ? "Ex" : "", mem, c.max_w, c.max_h,
         c.max_depth);
@@ -552,7 +558,7 @@ s32 cellPngEncReset(PPUContext&, u32 handle)
     return lv2::CELL_OK;
 }
 
-// cellPngEncWaitForInput(handle, bool block): room for a picture (fewer than 4 results waiting).
+// cellPngEncWaitForInput(handle, bool block): room for a picture (fewer than 4 results waiting or being encoded).
 s32 cellPngEncWaitForInput(PPUContext& ctx, u32 handle, u32 block)
 {
     State& s = state();
@@ -561,24 +567,29 @@ s32 cellPngEncWaitForInput(PPUContext& ctx, u32 handle, u32 block)
             std::lock_guard lock(s.mutex);
             const auto e = s.encoders.find(handle);
             if (!handle || e == s.encoders.end()) return error(CELL_PNGENC_ERROR_ARG);
-            if (e->second.results.size() < kQueueDepth) return lv2::CELL_OK;
+            if (e->second.results.size() + e->second.encoding < kQueueDepth) return lv2::CELL_OK;
             if (!(block & 0xFF)) return error(CELL_PNGENC_ERROR_BUSY);
         }
         nap(ctx);
     }
 }
 
-// cellPngEncEncodePicture(handle, picture, encodeParam, outputParam).
+// cellPngEncEncodePicture(handle, picture, encodeParam, outputParam). The picture takes its place in the queue (BUSY
+// when 4 results wait or are being encoded) before it is encoded outside the lock; then its output is written and its
+// result queued in one step under the lock, unless a Reset or Close came meanwhile: then it is dropped, nothing
+// written, as the queue it was in (D-651).
 s32 cellPngEncEncodePicture(PPUContext& ctx, u32 handle, u32 picture, u32 param, u32 output)
 {
     u8* base = gb(ctx);
     State& s = state();
     Config c;
+    u64 serial = 0;
     {
         std::lock_guard lock(s.mutex);
         const auto e = s.encoders.find(handle);
         if (!handle || e == s.encoders.end()) return error(CELL_PNGENC_ERROR_ARG);
         c = e->second.cfg;
+        serial = e->second.serial;
     }
     if (!picture || !in_guest(ctx, picture, 40) || !param || !in_guest(ctx, param, 24) || !output ||
         !in_guest(ctx, output, 16))
@@ -613,21 +624,46 @@ s32 cellPngEncEncodePicture(PPUContext& ctx, u32 handle, u32 picture, u32 param,
             p.width, p.height, p.pitch, p.space, p.depth, p.packed ? " packed" : "", space, level, filters, location);
         return error(CELL_PNGENC_ERROR_ARG);
     }
+    u64 resets = 0;
     {
         std::lock_guard lock(s.mutex);
         const auto e = s.encoders.find(handle);
-        if (e == s.encoders.end()) return error(CELL_PNGENC_ERROR_ARG);
-        if (e->second.results.size() >= kQueueDepth) return error(CELL_PNGENC_ERROR_BUSY);
+        if (e == s.encoders.end() || e->second.serial != serial) return error(CELL_PNGENC_ERROR_ARG);
+        if (e->second.results.size() + e->second.encoding >= kQueueDepth) return error(CELL_PNGENC_ERROR_BUSY);
+        e->second.encoding++;
+        resets = e->second.resets;
     }
+    // The place, given back with the result or without it, also when the process ends meanwhile.
+    struct Place {
+        State& s;
+        u32 handle;
+        u64 serial;
+        bool held = true;
+        ~Place()
+        {
+            if (!held) return;
+            std::lock_guard lock(s.mutex);
+            if (const auto e = s.encoders.find(handle); e != s.encoders.end() && e->second.serial == serial)
+                e->second.encoding--;
+        }
+    } place{s, handle, serial};
 
+    std::vector<u8> png;
+    const bool encoded = encode(ctx, p, space, level, filters, chunk_list, chunk_count, png);
+
+    std::lock_guard lock(s.mutex);
+    place.held = false;
+    const auto e = s.encoders.find(handle);
+    if (e == s.encoders.end() || e->second.serial != serial) return error(CELL_PNGENC_ERROR_ARG); // closed meanwhile
+    e->second.encoding--;
+    if (e->second.resets != resets) return lv2::CELL_OK; // reset meanwhile: dropped with the queue, nothing written
     Result r;
     r.location = location;
     r.file_name = location == LOCATION_FILE ? file_name : 0;
     r.addr = location == LOCATION_BUFFER ? stream : 0;
     r.limit = limit;
     r.user_data = user_data;
-    std::vector<u8> png;
-    if (!encode(ctx, p, space, level, filters, chunk_list, chunk_count, png)) {
+    if (!encoded) {
         r.state = error(CELL_PNGENC_ERROR_STREAM_ABORT);
     } else if (location == LOCATION_BUFFER) {
         const u32 n = static_cast<u32>(std::min<usize>(png.size(), limit));
@@ -641,9 +677,6 @@ s32 cellPngEncEncodePicture(PPUContext& ctx, u32 handle, u32 picture, u32 param,
     } else {
         r.state = error(CELL_PNGENC_ERROR_STREAM_FILE_OPEN);
     }
-    std::lock_guard lock(s.mutex);
-    const auto e = s.encoders.find(handle);
-    if (e == s.encoders.end()) return error(CELL_PNGENC_ERROR_ARG); // closed meanwhile
     e->second.results.push_back(r);
     return lv2::CELL_OK;
 }
