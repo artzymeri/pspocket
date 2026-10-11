@@ -314,7 +314,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-11: 6,211 of 6,625, 93.8%):
+firmware module. Done so far (2026-10-11: 6,240 of 6,625, 94.2%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -406,7 +406,12 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   cellAtrac overrun its PCM buffer into cellAdec's decoder state; the decoder's thread then outlived its close and
   either spun or took the next decoder's commands (the rare test abort and the test run that stalled). Each core's
   thread now ends once its context is not its own, and cellAtrac refuses such files and a RIFF length that wraps.
-Left (414, 2026-10-11). What each part needs (a session without the firmware could not make these faithfully):
+- The functions RPCS3 answers with a stub (D-182), made pspocket's own for a console with no PSN, no device and no
+  peer (D-660 to D-684), unverified (D-594), each decision saying what to check against Sony's module: cellCamera's
+  asynchronous forms, Read2, ResetAttribute and SetContainer, cellMic's system sharing, Command, multi-mic queue and
+  StopEx, and cellRemotePlay (D-665 to D-669: the three libraries complete). Fixed on the way:
+  cellRemotePlayGetComparativeVolume wrote through a pointer that was not guest memory.
+Left (385, 2026-10-11). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSailRec (58)
   and cellSail's playback (19, libsail), the codec
   cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 6, and
@@ -414,8 +419,8 @@ Left (414, 2026-10-11). What each part needs (a session without the firmware cou
   cellCelp8Enc (19), and the small ones
   (sys_lv2coredump, cellSysconfPs1emu, cellGamePs1Emu,
   module management's six).
-- The 188 functions answered as RPCS3's stubs, in libraries pspocket always serves: their arguments and answers from
-  the libraries' modules.
+- The 160 functions still answered as RPCS3's stubs, in libraries pspocket always serves (being made in the cloud
+  session, D-660 to D-684); where no signature is public, their arguments and answers from the libraries' modules.
 - To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
   cellFiber, the codec cores' version queries; and cellVdec's DivX 3.11, VC-1 and MVC. The comparisons are written
   (D-597: tests/hle/test_*_compare.cpp over compare_util.hpp, hidden from ctest until each matches): on the Mac,

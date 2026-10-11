@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 6211 of 6625 pspocket&#x27;s own (93.8%), 188 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 6240 of 6625 pspocket&#x27;s own (94.2%), 160 answered as RPCS3</text>
 <g><title>sys_libc: 1119 own, 0 answered as RPCS3, 0 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -5209,7 +5209,7 @@
 <rect x="612.2" y="207.1" width="6.6" height="6.2" fill="#2da44e"/>
 <text x="585.4" y="177.0" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">cellFi…</text>
 </g>
-<g><title>cellCamera: 30 own, 13 answered as RPCS3, 0 not yet, of 43</title>
+<g><title>cellCamera: 43 own, 0 answered as RPCS3, 0 not yet, of 43</title>
 <rect x="582.4" y="214.9" width="52.5" height="45.7" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="583.4" y="215.9" width="6.6" height="5.6" fill="#2da44e"/>
 <rect x="590.6" y="215.9" width="6.6" height="5.6" fill="#2da44e"/>
@@ -5241,19 +5241,19 @@
 <rect x="626.7" y="234.6" width="6.6" height="5.6" fill="#2da44e"/>
 <rect x="583.4" y="240.9" width="6.6" height="5.6" fill="#2da44e"/>
 <rect x="590.6" y="240.9" width="6.6" height="5.6" fill="#2da44e"/>
-<rect x="597.8" y="240.9" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="605.0" y="240.9" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="612.2" y="240.9" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="619.4" y="240.9" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="626.7" y="240.9" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="583.4" y="247.1" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="590.6" y="247.1" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="597.8" y="247.1" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="605.0" y="247.1" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="612.2" y="247.1" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="619.4" y="247.1" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="626.7" y="247.1" width="6.6" height="5.6" fill="#9be9a8"/>
-<rect x="583.4" y="253.3" width="6.6" height="5.6" fill="#9be9a8"/>
+<rect x="597.8" y="240.9" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="605.0" y="240.9" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="612.2" y="240.9" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="619.4" y="240.9" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="626.7" y="240.9" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="583.4" y="247.1" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="590.6" y="247.1" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="597.8" y="247.1" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="605.0" y="247.1" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="612.2" y="247.1" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="619.4" y="247.1" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="626.7" y="247.1" width="6.6" height="5.6" fill="#2da44e"/>
+<rect x="583.4" y="253.3" width="6.6" height="5.6" fill="#2da44e"/>
 <text x="585.4" y="226.9" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">cellCa…</text>
 </g>
 <g><title>cellFontFT: 43 own, 0 answered as RPCS3, 0 not yet, of 43</title>
@@ -5349,7 +5349,7 @@
 <rect x="626.7" y="342.7" width="6.6" height="6.5" fill="#9be9a8"/>
 <text x="585.4" y="318.2" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">cellIm…</text>
 </g>
-<g><title>cellMic: 33 own, 8 answered as RPCS3, 1 not yet, of 42</title>
+<g><title>cellMic: 42 own, 0 answered as RPCS3, 0 not yet, of 42</title>
 <rect x="582.4" y="350.8" width="52.5" height="44.6" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="583.4" y="351.8" width="6.6" height="6.5" fill="#2da44e"/>
 <rect x="590.6" y="351.8" width="6.6" height="6.5" fill="#2da44e"/>
@@ -5384,15 +5384,15 @@
 <rect x="597.8" y="380.2" width="6.6" height="6.5" fill="#2da44e"/>
 <rect x="605.0" y="380.2" width="6.6" height="6.5" fill="#2da44e"/>
 <rect x="612.2" y="380.2" width="6.6" height="6.5" fill="#2da44e"/>
-<rect x="619.4" y="380.2" width="6.6" height="6.5" fill="#9be9a8"/>
-<rect x="626.7" y="380.2" width="6.6" height="6.5" fill="#9be9a8"/>
-<rect x="583.4" y="387.3" width="6.6" height="6.5" fill="#9be9a8"/>
-<rect x="590.6" y="387.3" width="6.6" height="6.5" fill="#9be9a8"/>
-<rect x="597.8" y="387.3" width="6.6" height="6.5" fill="#9be9a8"/>
-<rect x="605.0" y="387.3" width="6.6" height="6.5" fill="#9be9a8"/>
-<rect x="612.2" y="387.3" width="6.6" height="6.5" fill="#9be9a8"/>
-<rect x="619.4" y="387.3" width="6.6" height="6.5" fill="#9be9a8"/>
-<rect x="626.7" y="387.3" width="6.6" height="6.5" fill="#8c959f"/>
+<rect x="619.4" y="380.2" width="6.6" height="6.5" fill="#2da44e"/>
+<rect x="626.7" y="380.2" width="6.6" height="6.5" fill="#2da44e"/>
+<rect x="583.4" y="387.3" width="6.6" height="6.5" fill="#2da44e"/>
+<rect x="590.6" y="387.3" width="6.6" height="6.5" fill="#2da44e"/>
+<rect x="597.8" y="387.3" width="6.6" height="6.5" fill="#2da44e"/>
+<rect x="605.0" y="387.3" width="6.6" height="6.5" fill="#2da44e"/>
+<rect x="612.2" y="387.3" width="6.6" height="6.5" fill="#2da44e"/>
+<rect x="619.4" y="387.3" width="6.6" height="6.5" fill="#2da44e"/>
+<rect x="626.7" y="387.3" width="6.6" height="6.5" fill="#2da44e"/>
 <text x="585.4" y="362.8" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">cellMic</text>
 </g>
 <g><title>cellSync: 42 own, 0 answered as RPCS3, 0 not yet, of 42</title>
@@ -6772,16 +6772,16 @@
 <rect x="801.8" y="375.4" width="6.2" height="6.1" fill="#8c959f"/>
 <rect x="808.6" y="375.4" width="6.2" height="6.1" fill="#8c959f"/>
 </g>
-<g><title>cellRemotePlay: 1 own, 7 answered as RPCS3, 0 not yet, of 8</title>
+<g><title>cellRemotePlay: 8 own, 0 answered as RPCS3, 0 not yet, of 8</title>
 <rect x="793.9" y="383.1" width="22.5" height="19.8" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="794.9" y="384.1" width="6.2" height="5.3" fill="#2da44e"/>
-<rect x="801.8" y="384.1" width="6.2" height="5.3" fill="#9be9a8"/>
-<rect x="808.6" y="384.1" width="6.2" height="5.3" fill="#9be9a8"/>
-<rect x="794.9" y="390.1" width="6.2" height="5.3" fill="#9be9a8"/>
-<rect x="801.8" y="390.1" width="6.2" height="5.3" fill="#9be9a8"/>
-<rect x="808.6" y="390.1" width="6.2" height="5.3" fill="#9be9a8"/>
-<rect x="794.9" y="396.0" width="6.2" height="5.3" fill="#9be9a8"/>
-<rect x="801.8" y="396.0" width="6.2" height="5.3" fill="#9be9a8"/>
+<rect x="801.8" y="384.1" width="6.2" height="5.3" fill="#2da44e"/>
+<rect x="808.6" y="384.1" width="6.2" height="5.3" fill="#2da44e"/>
+<rect x="794.9" y="390.1" width="6.2" height="5.3" fill="#2da44e"/>
+<rect x="801.8" y="390.1" width="6.2" height="5.3" fill="#2da44e"/>
+<rect x="808.6" y="390.1" width="6.2" height="5.3" fill="#2da44e"/>
+<rect x="794.9" y="396.0" width="6.2" height="5.3" fill="#2da44e"/>
+<rect x="801.8" y="396.0" width="6.2" height="5.3" fill="#2da44e"/>
 </g>
 <g><title>fs_utility_init: 1 own, 7 answered as RPCS3, 0 not yet, of 8</title>
 <rect x="793.9" y="402.9" width="22.5" height="19.8" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
