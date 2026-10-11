@@ -58,6 +58,9 @@ target_sources(test_hle PRIVATE
     test_libprof.cpp
     test_sysmodule.cpp)
 
+# cellAdec's decoder threads when the game overwrites a decoder's context while it is open (D-645).
+target_sources(test_hle PRIVATE test_adec_context.cpp)
+
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.
 add_executable(make_boot_programs make_boot_programs.cpp)
