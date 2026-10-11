@@ -147,7 +147,7 @@ struct Window {
 // the first sixteen a step (in 1/256) from the window's first column, each later sixteen 16 steps on (in 1/65536,
 // rounded down to 1/256). A chroma plane is sited between its luma samples (type A horizontally, both types
 // vertically): its positions start (step - 1) / 4 on
-// (rounded down); a negative start for a window at a multiple of 16 in the output is 0.
+// (rounded down); for windows at multiples of 16 in both pictures, a negative position in the first sixteen is 0.
 void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow, bool chroma, u32 chroma_type, Plane& out)
 {
     // Past a halving horizontally, every second column of the window is taken first.
@@ -181,7 +181,8 @@ void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow
     const u32 first = ow.x & 15;
     std::array<s32, 16> lane{};
     for (u32 k = 0; k < 16; k++) lane[k] = off_h + (static_cast<s32>(k) - static_cast<s32>(first)) * step8;
-    if (first == 0 && lane[0] < 0) lane[0] = 0;
+    if (first == 0 && (iw_given.x & 15) == 0)
+        for (s32& l : lane) l = std::max(l, 0);
     for (u32 x = 0; x < ow.w; x++) {
         const u32 a = ow.x + x;
         const s32 p = static_cast<s32>((a >> 4) - (ow.x >> 4)) * block + lane[a & 15];

@@ -11826,9 +11826,9 @@ output) now shows 88 of 791 observations differing, in the features listed last.
   step apart); a row past the window's bottom is the picture's, a column past its right edge its last; chroma planes
   sited (step - 1) / 4 on (horizontally for type A only); past a halving horizontally, every second column first.
 Still different, each logged once when a game uses it: scaler types 1 to 3 (libvpost's sharpening and 4-tap and 8x4-tap
-filters, the last from tables of coefficients in its data), exec types 1 to 6 (its field and frame conversions; types 0
-and 7 match), a horizontal reduction past a half, a chroma window not at a multiple of 16 enlarged, and the bytes
-libvpost writes past a YUV output whose chroma planes have an odd size. cellVpost stays firmware-first (D-563) while
+filters, the last from tables of coefficients in its data), exec types 1 to 6 (part 6), a horizontal reduction past a
+half, a chroma window not at a multiple of 16 enlarged, and the bytes libvpost writes past a YUV output whose chroma
+planes have an odd size. cellVpost stays firmware-first (D-563) while
 these differ.
 Tests: tests/hle/test_vpost_compare.cpp (PSPOCKET_COMPARE_SELF=1 agrees with itself); tests/hle/test_vpost.cpp rewritten
 for libvpost's answers (its memory, handle, checks, conversion, sitings, scaler positions, windows, information).
@@ -11861,3 +11861,12 @@ output format (all 144 such probes match but the edge-adaptive type's few pixels
   A progressive picture out as a field (PTOP_ITOP, PBTM_IBTM) is the frame's conversion, its parity's rows.
 Type 2's direction choice is close to libvpost's (its SPU code compares absolute differences of bytes, some of whose
 rounding is not known): about 1% of the interpolated pixels of noise differ.
+
+## D-913 · 2026-10-11 · cellVpost: the bilinear scaler's first sixteen columns (part 7)
+
+A chroma plane enlarged into windows at multiples of 16 in both pictures: libvpost's first sixteen columns' positions
+are its lanes' offsets, and every negative one is 0 (not only the first: an enlargement past four times has two), which
+each later sixteen keeps; for other windows the lanes keep their negative offsets (part 4's rule took only the first
+lane, and for any input window). With part 6 the comparison shows 49 of 791 observations differing: scaler types 1 to 3
+(36), the edge-adaptive interlace conversion's few pixels (7), a horizontal reduction past a half (2), and the bytes
+libvpost writes past a YUV output whose chroma has an odd size (4). cellVpost stays firmware-first (D-563).
