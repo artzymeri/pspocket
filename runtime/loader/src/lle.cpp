@@ -579,6 +579,10 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
     // A function the host made without Sony's module to compare it with (D-594) counts as one it lacks wherever the
     // library's module can serve instead: adding one never changes what a system with the firmware gets.
     const auto unverified = [](std::string_view library, u32 nid) { return hle::registry().is_unverified(library, nid); };
+    // A variable likewise (D-624).
+    const auto unverified_variable = [](std::string_view library, u32 nid) {
+        return hle::registry().is_unverified_variable(library, nid);
+    };
     // A file whose libraries something already linked to the host stays there (a library has one implementation).
     const auto host_bound = [&](std::string_view file) {
         const auto it = file_libraries_.find(file);
@@ -608,7 +612,10 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
         }
         const bool variables_on_host = std::all_of(need.variables.begin(), need.variables.end(),
             [&](u32 nid) { return hle::registry().find_variable(need.library, nid) != nullptr; });
-        // An unverified function goes to the module as a missing one would; where none can serve, the host's does.
+        for (const u32 nid : need.variables)
+            if (unverified_variable(need.library, nid)) unverified_import = true;
+        // An unverified function or variable goes to the module as a missing one would; where none can serve, the
+        // host's does.
         if (missing.empty() && variables_on_host && !(file && unverified_import)) continue;
         if (file && (chosen_.contains(*file) || can_join(*file))) roots.insert(*file);
         else if (!missing.empty()) lacking[need.library] = std::move(missing);
@@ -658,7 +665,9 @@ void LleModules::choose(std::string_view who, const std::vector<LibraryNeeds>& g
                                                                       : info->second.import_variables) {
                 const auto dep = file_for(library);
                 for (const u32 nid : nids) {
-                    const bool to_module = dep && can_join(*dep) && forced(library);
+                    // A forced library's module joins, and so does the module of a variable the host has unverified
+                    // (D-624).
+                    const bool to_module = dep && can_join(*dep) && (forced(library) || unverified_variable(library, nid));
                     if (dep && candidates.contains(*dep)) {
                         const auto& exported = files_[*dep].export_variables;
                         const auto e = exported.find(library);

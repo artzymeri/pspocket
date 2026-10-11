@@ -1,9 +1,10 @@
 // cellDmux and its PAMF core (D-194) over a synthetic MPEG program stream built here (no game data): AVC video on
 // channel 0 and ATRAC3plus audio on channel 0 in 2048-byte packs, a start code and a sync word split between two packs,
 // a random access point named by a private stream 2, timestamps with bit 31 set (sign-extended on LLE), a program end
-// code. First the demultiplexer alone, then the whole API with the game's callbacks as guest code. Then the same calls
-// to Sony's libdmux and libdmuxpamf from the user's installed system software, when PSPOCKET_TEST_DEV_FLASH names it
-// (firmware_compare.hpp): every answer, callback and access unit must be the same, down to its address.
+// code. First the demultiplexer alone, then the whole API with the game's callbacks as guest code, the core's exported
+// tables (D-592) and its raw elementary stream form (D-624). Then the same calls to Sony's libdmux and libdmuxpamf from
+// the user's installed system software, when PSPOCKET_TEST_DEV_FLASH names it (firmware_compare.hpp): every answer,
+// callback and access unit must be the same, down to its address.
 
 #include <catch_amalgamated.hpp>
 
@@ -779,6 +780,180 @@ TEST_CASE("cellDmuxPamf: the PAMF core through its own operation table, as a fir
     CHECK(op(JoinThread, {handle}) == 0);
     CHECK(op(SetStream, {handle, kStream, stream.size(), 0, kUserData}) == PAMF_FATAL);
     CHECK(op(CreateThread, {handle}) == PAMF_FATAL);
+    CHECK(op(Close, {handle}) == 0);
+}
+
+// ---- D-624: the raw elementary stream core, g_cell_dmux_core_ops_raw_es
+
+// The demultiplexer with raw_es (RPCS3 dmux_pamf_base, its raw path): no MPEG program stream around the one elementary
+// stream enabled, its bytes read in 2048-byte sections straight into that stream's parser, so a start code or sync word
+// may be split between two sections; no timestamps, no random access points, no program end code.
+TEST_CASE("cellDmuxPamf: a raw elementary stream's access units cut at their delimiters, without timestamps (D-624)",
+    "[hle][dmux]")
+{
+    // AVC: the third unit's delimiter split between the first two sections (00 00 | 01 09).
+    constexpr u32 kSizes[4] = {900, 1146, 1200, 700};
+    std::vector<u8> v;
+    for (u32 u = 0; u < 4; u++) {
+        v.insert(v.end(), {0x00, 0x00, 0x01, 0x09, 0x10});
+        for (u32 i = 5; i < kSizes[u]; i++) v.push_back(body_byte(20 + u, i));
+    }
+    REQUIRE(v.size() == 3946);
+    REQUIRE(ps_ld32(v.data() + 2046) == 0x00000109);
+    std::vector<u8> v_queue(0xb00c0);
+    Recorder d;
+    REQUIRE(d.enable_es(0xE0, 0, true, v_queue, 0x12900, true, 7));
+    d.set_stream(v, true);
+    for (int i = 0; i < 100 && d.has_work(); i++) REQUIRE(d.process_next_pack());
+    CHECK_FALSE(d.has_work());
+    REQUIRE(d.found.size() == 3);
+    CHECK(d.found[0].bytes == au_bytes(v, 0, 900));
+    CHECK(d.found[1].bytes == au_bytes(v, 900, 1146));
+    CHECK(d.found[2].bytes == au_bytes(v, 2046, 1200));
+    for (const Found& f : d.found) {
+        CHECK(f.stream_id == 0xE0);
+        CHECK(f.pts == kNoTs);
+        CHECK(f.dts == kNoTs);
+        CHECK_FALSE(f.rap);
+    }
+    CHECK(d.events.back() == "demux done");
+    CHECK(std::find(d.events.begin(), d.events.end(), "prog end") == d.events.end());
+    REQUIRE(d.flush_es(0xE0, 0));
+    REQUIRE(d.found.size() == 4);
+    CHECK(d.found[3].bytes == au_bytes(v, 3246, 700));
+
+    // ATRAC3plus: the frames the next sync word ends, at the size in their header; the last from a flush.
+    const std::vector<u8> a = at3_es();
+    std::vector<u8> a_queue(0x6400);
+    Recorder da;
+    REQUIRE(da.enable_es(0xBD, 0x00, false, a_queue, 0x1008, true, 8));
+    da.set_stream(a, true);
+    for (int i = 0; i < 100 && da.has_work(); i++) REQUIRE(da.process_next_pack());
+    REQUIRE(da.found.size() == kAt3Frames - 1);
+    for (u32 f = 0; f + 1 < kAt3Frames; f++) {
+        CHECK(da.found[f].bytes == au_bytes(a, f * kAt3Frame, kAt3Frame));
+        CHECK(da.found[f].stream_id == 0xBD);
+        CHECK(da.found[f].private_stream_id == 0x00);
+        CHECK(da.found[f].pts == kNoTs);
+    }
+    REQUIRE(da.flush_es(0xBD, 0x00));
+    REQUIRE(da.found.size() == kAt3Frames);
+    CHECK(da.found.back().bytes == au_bytes(a, (kAt3Frames - 1) * kAt3Frame, kAt3Frame));
+}
+
+// The raw table driven from guest code as a firmware module would (the D-592 test's caller): its entries the PAMF
+// table's but SetStream, QueryEsAttr and EnableEs, whose raw variants read the filter as a raw stream's (bytes 2 and 3,
+// bit 7 of byte 8) and give no specific information; a raw AVC stream's units, notified with RPCS3's arguments.
+TEST_CASE("cellDmuxPamf: the raw elementary stream core through its own operation table, unverified (D-624)",
+    "[hle][dmux]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    REQUIRE(f.hle->initialize_tls({0, 0, 0x100}));
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    constexpr u32 kRawOps = 0x9728A0E9, kPamfOps = 0x28B2B7B2;
+    REQUIRE(hle::registry().is_unverified_variable("cellDmuxPamf", kRawOps));
+    CHECK_FALSE(hle::registry().is_unverified_variable("cellDmuxPamf", kPamfOps));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellDmuxPamf"));
+    const u32 table = f.hle->link_variable("cellDmuxPamf", kRawOps);
+    REQUIRE(table != 0);
+    CHECK(table != f.hle->link_variable("cellDmuxPamf", kPamfOps));
+    enum { QueryAttr, Open, Close, ResetStream, CreateThread, JoinThread, SetStream, ReleaseAu, QueryEsAttr, EnableEs,
+        DisableEs, FlushEs, ResetEs, ResetStreamAndWaitDone };
+    const char* names[14] = {"QueryAttr", "Open", "Close", "ResetStream", "CreateThread", "JoinThread",
+        "SetStream_raw_es", "ReleaseAu", "QueryEsAttr_raw_es", "EnableEs_raw_es", "DisableEs", "FlushEs", "ResetEs",
+        "ResetStreamAndWaitDone"};
+    for (u32 i = 0; i < 14; i++) {
+        INFO(names[i]);
+        CHECK(ps_read32(b, table + 4 * i) ==
+            f.hle->descriptor_of("cellDmux", recomp::nid_of(std::format("_CellDmuxCoreOp{}", names[i]))));
+    }
+    const auto op = [&](u32 i, std::initializer_list<u64> args) {
+        return static_cast<u32>(hle::call_guest(t.ctx, ps_read32(b, table + 4 * i), args));
+    };
+    constexpr u32 PAMF_ARG = 2, PAMF_UNKNOWN_STREAM = 3;
+    write_table_notifications(b);
+    const std::vector<u8> v = avc_es();
+    std::memcpy(b + kStream, v.data(), v.size());
+    std::memset(b + kArgs, 0, 0x200);
+    constexpr u32 kCbDone = kArgs + 0x140, kCbProg = kArgs + 0x148, kCbFatal = kArgs + 0x150, kCbAu = kArgs + 0x158,
+                  kCbFlush = kArgs + 0x160, kOut = kArgs + 0x180, kRawFilter = kArgs + 0x190;
+    const auto cb = [&](u32 at, u32 kind, u32 arg) {
+        ps_write32(b, at, kTableOpds + 8 * kind);
+        ps_write32(b, at + 4, arg);
+    };
+    cb(kCbDone, kDemuxDone, 0xD0D0);
+    cb(kCbProg, kProgEnd, 0xE0E0);
+    cb(kCbFatal, kFatal, 0xFA7A);
+    cb(kCbAu, kAuFound, 0xA0A0);
+    cb(kCbFlush, kFlushDone, 0xF0F0);
+
+    CHECK(op(QueryAttr, {0, kAttr}) == 0);
+    CHECK(ps_read32(b, kAttr + 8) == 0x1c + 0x3d880 + 0xe7b);
+    const u32 core_mem = kDmuxMem + 0x1C0;
+    const u32 res[6] = {core_mem, kDmuxMemSize - 0x1C0, 1000, 0x4000, 200, 1};
+    for (u32 i = 0; i < 6; i++) ps_write32(b, kRes + 4 * i, res[i]);
+    REQUIRE(op(Open, {0, kRes, 0, kCbDone, kCbProg, kCbFatal, kOut}) == 0);
+    const u32 handle = ps_read32(b, kOut);
+    CHECK(handle == core_mem);
+
+    // A raw stream's filter: AVC (stream 0xE0, bit 7 of byte 8 set) at level 2.1. Its units have no specific
+    // information, so its memory is the PAMF stream's less 0x40 units of 4 bytes.
+    const u8 filter[16] = {0x00, 0x00, 0xE0, 0x00, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0};
+    std::memcpy(b + kRawFilter, filter, 16);
+    ps_write32(b, kSpecV, 21);
+    CHECK(op(QueryEsAttr, {kRawFilter, kSpecV, kEsAttr}) == 0);
+    CHECK(ps_read32(b, kEsAttr) == 0x40);
+    CHECK(ps_read32(b, kEsAttr + 4) == 0xb00c0 + 0x7f + 0x98 + 0xf + 0x14);
+    CHECK(ps_read32(b, kEsAttr + 8) == 0);
+    // A PAMF filter read as a raw one names stream 0: none.
+    const u32 pamf_filter[4] = {0xE0, 0, 1, 0};
+    for (u32 i = 0; i < 4; i++) ps_write32(b, kFilterV + 4 * i, pamf_filter[i]);
+    CHECK(op(QueryEsAttr, {kFilterV, kSpecV, kEsAttr}) == PAMF_UNKNOWN_STREAM);
+    const u32 es_mem = kEsMemV + 0xF90, es_size = kEsMemVSize - 0xF90;
+    ps_write32(b, kEsResV, es_mem);
+    ps_write32(b, kEsResV + 4, es_size);
+    CHECK(op(EnableEs, {handle, kFilterV, kEsResV, kCbAu, kCbFlush, kSpecV, kOut}) == PAMF_UNKNOWN_STREAM);
+    REQUIRE(op(EnableEs, {handle, kRawFilter, kEsResV, kCbAu, kCbFlush, kSpecV, kEsHandleV}) == 0);
+    const u32 es = ps_read32(b, kEsHandleV);
+    CHECK(es == es_mem);
+    CHECK(ps_read32(b, es + 4) == kTableOpds + 8 * kAuFound);
+
+    // The stream to its end, then a flush for the last unit; each unit released.
+    CHECK(op(SetStream, {handle, 0, v.size(), 0, kUserData}) == PAMF_ARG);
+    REQUIRE(op(SetStream, {handle, kStream, v.size(), 0, kUserData}) == 0);
+    const auto wait_for = [&](u32 kind, usize seen) {
+        return wait_until([&] {
+            const auto log = table_log(b);
+            for (usize i = seen; i < log.size(); i++)
+                if (log[i].kind == kind) return true;
+            return false;
+        });
+    };
+    REQUIRE(wait_for(kDemuxDone, 0));
+    const usize seen = table_log(b).size();
+    REQUIRE(op(FlushEs, {es}) == 0);
+    REQUIRE(wait_for(kFlushDone, seen));
+    std::vector<std::vector<u8>> units;
+    for (const TableEntry& e : table_log(b)) {
+        CHECK(e.kind != kFatal);
+        CHECK(e.kind != kProgEnd);
+        if (e.kind != kAuFound) continue;
+        const u32 i = e.at + 0x10; // the DmuxAuInfo's copy
+        CHECK(e.r3 == es);
+        CHECK(e.r5 == 0xA0A0);
+        CHECK(ps_read64(b, i + 0x10) == kUserData);
+        CHECK(ps_read64(b, i + 0x18) == kNoTs); // no PES: no timestamps
+        CHECK(ps_read64(b, i + 0x20) == kNoTs);
+        CHECK(ps_read32(b, i + 0x2C) == 0);     // no specific information
+        const u32 addr = ps_read32(b, i), size = ps_read32(b, i + 4);
+        units.emplace_back(b + addr, b + addr + size);
+        CHECK(op(ReleaseAu, {es, addr, size}) == 0);
+    }
+    REQUIRE(units.size() == 4);
+    for (u32 u = 0, at = 0; u < 4; at += kAvcSizes[u], u++) CHECK(units[u] == au_bytes(v, at, kAvcSizes[u]));
+    CHECK(op(DisableEs, {es}) == 0);
     CHECK(op(Close, {handle}) == 0);
 }
 

@@ -15,8 +15,10 @@
 //   priority the game asked for), whose SPU thread group takes 256 KB of the default memory container and an SPU.
 //   Here an SPU thread group of that name is created and destroyed with the demuxer but never started: it takes the
 //   same from the game and fails where the console's would.
-// - Only the PAMF core (libdmux's), not the raw elementary stream one other libraries use (0x9728a0e9): see D-592 for
-//   why that table stays Sony's.
+// - The raw elementary stream core (g_cell_dmux_core_ops_raw_es, 0x9728A0E9: other libraries' demuxer of one bare
+//   elementary stream) is the same core with RPCS3's raw variants of SetStream, QueryEsAttr and EnableEs; made without
+//   libdmuxpamf to compare it with, its table is unverified (D-624): where the system software has libdmuxpamf, a
+//   module importing it gets Sony's.
 // - Pointers RPCS3 ensure()s are logged and refused (PAMF_ERROR_ARG, D-042).
 //
 // The core is called two ways. pspocket's cellDmux calls core_* directly and is notified directly (dmux.hpp). Any other
@@ -643,9 +645,10 @@ void exec(PPUContext& ctx, Core& c)
     }
 }
 
-// The access unit queue's sizes (RPCS3 dmuxPamfGet*).
-u32 au_specific_info_size(u16 stream_id, u16 private_stream_id, bool is_avc)
+// The access unit queue's sizes (RPCS3 dmuxPamfGet*); a raw elementary stream's units have no specific information.
+u32 au_specific_info_size(u16 stream_id, u16 private_stream_id, bool is_avc, bool raw_es)
 {
+    if (raw_es) return 0;
     switch (stream_id_to_type_channel(stream_id, private_stream_id).first) {
     case STREAM_TYPE_INDEX_VIDEO: return is_avc ? 4 : 0; // LLE: four for AVC, though its struct has one reserved field
     case STREAM_TYPE_INDEX_LPCM:
@@ -731,9 +734,9 @@ u32 au_queue_buffer_size(u8* base, u16 stream_id, u16 private_stream_id, bool is
     }
 }
 
-u32 es_mem_size(u8* base, u16 stream_id, u16 private_stream_id, bool is_avc, u32 info)
+u32 es_mem_size(u8* base, u16 stream_id, u16 private_stream_id, bool is_avc, u32 info, bool raw_es)
 {
-    return au_specific_info_size(stream_id, private_stream_id, is_avc) * au_queue_max_size(stream_id, private_stream_id) +
+    return au_specific_info_size(stream_id, private_stream_id, is_avc, raw_es) * au_queue_max_size(stream_id, private_stream_id) +
            au_queue_buffer_size(base, stream_id, private_stream_id, is_avc, info) + 0x7f + kPamfEsSize + 0xf;
 }
 
@@ -759,6 +762,19 @@ u32 au_max_size(u8* base, u16 stream_id, u16 private_stream_id, bool is_avc, u32
     case STREAM_TYPE_INDEX_USER_DATA: return 0xa0000;
     default: return 0;
     }
+}
+
+// The stream an ES filter names (RPCS3 get_stream_ids): CellCodecEsFilterId's filterIdMajor, filterIdMinor and
+// supplementalInfo1 for PAMF; for a raw elementary stream its bytes 2 and 3, and bit 7 of byte 8.
+struct StreamIds {
+    u16 stream_id = 0, private_stream_id = 0;
+    bool is_avc = false;
+};
+StreamIds stream_ids(u8* base, u32 filter, bool raw_es)
+{
+    if (raw_es) return {ps_read8(base, filter + 2), ps_read8(base, filter + 3), (ps_read8(base, filter + 8) >> 7) != 0};
+    return {static_cast<u16>(ps_read32(base, filter)), static_cast<u16>(ps_read32(base, filter + 4)),
+        ps_read32(base, filter + 8) != 0};
 }
 
 // An lv2 object's name: eight bytes, zero padded.
@@ -966,7 +982,8 @@ u32 core_reset_stream(PPUContext& ctx, u32 core_handle)
     return reset_stream(thread_of(ctx), *c);
 }
 
-u32 core_set_stream(PPUContext& ctx, u32 core_handle, u32 stream_address, u32 stream_size, bool discontinuity, u64 user_data)
+u32 core_set_stream(PPUContext& ctx, u32 core_handle, u32 stream_address, u32 stream_size, bool discontinuity, u64 user_data,
+    bool raw_es)
 {
     if (!stream_address || stream_size == 0) return PAMF_ERROR_ARG;
     Core* c = core_of(core_handle);
@@ -978,7 +995,7 @@ u32 core_set_stream(PPUContext& ctx, u32 core_handle, u32 stream_address, u32 st
     {
         std::lock_guard lk(c->qm);
         busy = c->stream_info.has_value(); // the last stream is not consumed yet
-        if (!busy) c->stream_info = StreamInfo{stream_address, stream_size, static_cast<u32>(user_data), !discontinuity, false};
+        if (!busy) c->stream_info = StreamInfo{stream_address, stream_size, static_cast<u32>(user_data), !discontinuity, raw_es};
     }
     if (busy) return unlock(t, c->mutex) ? PAMF_ERROR_BUSY : PAMF_ERROR_FATAL;
     send_spu_command_and_wait(t, *c, {CommandType::set_stream});
@@ -1009,13 +1026,11 @@ u32 core_release_au(PPUContext& ctx, u32 core_es_handle, u32 au_addr, u32 au_siz
     return unlock(t, c.mutex) ? PAMF_OK : PAMF_ERROR_FATAL;
 }
 
-u32 core_query_es_attr(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, PamfEsAttr& attr)
+u32 core_query_es_attr(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, PamfEsAttr& attr, bool raw_es)
 {
     if (!es_filter_id || !usable(ctx, es_filter_id, 16, "the ES filter")) return PAMF_ERROR_ARG;
     u8* base = guest_base(ctx);
-    const u16 stream_id = static_cast<u16>(ps_read32(base, es_filter_id)),
-              private_stream_id = static_cast<u16>(ps_read32(base, es_filter_id + 4));
-    const bool is_avc = ps_read32(base, es_filter_id + 8) != 0;
+    const auto [stream_id, private_stream_id, is_avc] = stream_ids(base, es_filter_id, raw_es);
     if (es_specific_info && !usable(ctx, es_specific_info, 12, "the ES specific information")) return PAMF_ERROR_ARG;
     // RPCS3 dmuxPamfGetEsAttr, then the CellDmuxPamfEsHandle.
     u32 r = PAMF_OK;
@@ -1023,15 +1038,15 @@ u32 core_query_es_attr(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, 
     else if (verify_es_specific_info(base, stream_id, private_stream_id, is_avc, es_specific_info) != 0) r = PAMF_ERROR_ARG;
     else {
         attr.au_queue_max_size = au_queue_max_size(stream_id, private_stream_id);
-        attr.mem_size = es_mem_size(base, stream_id, private_stream_id, is_avc, es_specific_info);
-        attr.specific_info_size = au_specific_info_size(stream_id, private_stream_id, is_avc);
+        attr.mem_size = es_mem_size(base, stream_id, private_stream_id, is_avc, es_specific_info, raw_es);
+        attr.specific_info_size = au_specific_info_size(stream_id, private_stream_id, is_avc, raw_es);
     }
     attr.mem_size += kPamfEsHandleSize; // added whatever the answer (RPCS3)
     return r;
 }
 
 u32 core_enable_es(PPUContext& ctx, u32 core_handle, u32 es_filter_id, u32 mem_addr, u32 mem_size, u32 es_handle,
-    u32 es_specific_info, u32& core_es_handle, const EsCallbacks* guest)
+    u32 es_specific_info, u32& core_es_handle, const EsCallbacks* guest, bool raw_es)
 {
     Core* c = core_of(core_handle);
     if (!c || !es_filter_id || !mem_addr || mem_size == 0 || !usable(ctx, es_filter_id, 16, "the ES filter")) return PAMF_ERROR_ARG;
@@ -1039,18 +1054,16 @@ u32 core_enable_es(PPUContext& ctx, u32 core_handle, u32 es_filter_id, u32 mem_a
     if (es_specific_info && !usable(ctx, es_specific_info, 12, "the ES specific information")) return PAMF_ERROR_ARG;
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    const u16 stream_id = static_cast<u16>(ps_read32(base, es_filter_id)),
-              private_stream_id = static_cast<u16>(ps_read32(base, es_filter_id + 4));
-    const bool is_avc = ps_read32(base, es_filter_id + 8) != 0;
+    const auto [stream_id, private_stream_id, is_avc] = stream_ids(base, es_filter_id, raw_es);
     core_es_handle = mem_addr;
     // RPCS3 DmuxPamfContext::enable_es, its memory after the CellDmuxPamfEsHandle.
     const u32 es_mem = mem_addr + kPamfEsHandleSize, es_mem_left = mem_size - kPamfEsHandleSize;
-    if (es_mem_left < es_mem_size(base, stream_id, private_stream_id, is_avc, es_specific_info)) return PAMF_ERROR_ARG;
+    if (es_mem_left < es_mem_size(base, stream_id, private_stream_id, is_avc, es_specific_info, raw_es)) return PAMF_ERROR_ARG;
     const auto type = stream_id_to_type_channel(stream_id, private_stream_id).first;
     if (type == STREAM_TYPE_INDEX_INVALID) return PAMF_ERROR_UNKNOWN_STREAM;
     if (verify_es_specific_info(base, stream_id, private_stream_id, is_avc, es_specific_info) != 0) return PAMF_ERROR_ARG;
     if (!lock(t, c->mutex)) return PAMF_ERROR_FATAL;
-    c->is_raw_es = false;
+    c->is_raw_es = raw_es;
     if (c->enabled_es_num == c->max_enabled_es_num) return unlock(t, c->mutex) ? PAMF_ERROR_NO_MEMORY : PAMF_ERROR_FATAL;
     if (c->find_es(stream_id, private_stream_id)) return unlock(t, c->mutex) ? PAMF_ERROR_ARG : PAMF_ERROR_FATAL; // enabled
     auto e = std::make_unique<Es>();
@@ -1065,7 +1078,7 @@ u32 core_enable_es(PPUContext& ctx, u32 core_handle, u32 es_filter_id, u32 mem_a
     if (guest) e->guest = *guest;
     e->au_queue_buffer = (es_struct + kPamfEsSize + 0x7f) & ~0x7fu;       // the access unit queue after it
     e->au_max_size = au_max_size(base, stream_id, private_stream_id, is_avc, es_specific_info);
-    e->au_specific_info_size = au_specific_info_size(stream_id, private_stream_id, is_avc);
+    e->au_specific_info_size = au_specific_info_size(stream_id, private_stream_id, is_avc, raw_es);
     Command cmd{CommandType::enable_es};
     cmd.stream_id = stream_id;
     cmd.private_stream_id = private_stream_id;
@@ -1074,6 +1087,7 @@ u32 core_enable_es(PPUContext& ctx, u32 core_handle, u32 es_filter_id, u32 mem_a
     cmd.au_queue_buffer_size = au_queue_buffer_size(base, stream_id, private_stream_id, is_avc, es_specific_info);
     cmd.au_max_size = e->au_max_size;
     cmd.au_specific_info_size = e->au_specific_info_size;
+    cmd.raw_es = raw_es;
     cmd.user_data = c->next_es_id;
     send_spu_command_and_wait(t, *c, cmd);
     u32 index = 0;
@@ -1162,9 +1176,11 @@ u32 core_reset_stream_and_wait_done(PPUContext& ctx, u32 core_handle)
     return unlock(t, c->mutex) ? PAMF_OK : PAMF_ERROR_FATAL;
 }
 
-// ---- The exported table, g_cell_dmux_core_ops_pamf (D-592): CellDmuxCoreOps (RPCS3 cellDmux.h), its entries the
-// _CellDmuxCoreOp* functions below (RPCS3 cellDmuxPamf.cpp), each with RPCS3's checks of the caller's pointers, then
-// the core_* function pspocket's cellDmux calls itself.
+// ---- The exported tables, g_cell_dmux_core_ops_pamf (D-592) and g_cell_dmux_core_ops_raw_es (D-624): CellDmuxCoreOps
+// (RPCS3 cellDmux.h), their entries the _CellDmuxCoreOp* functions below (RPCS3 cellDmuxPamf.cpp), each with RPCS3's
+// checks of the caller's pointers, then the core_* function pspocket's cellDmux calls itself. The raw elementary
+// stream table has RPCS3's raw_es variants of SetStream, QueryEsAttr and EnableEs (its _CellDmuxCoreOp*<true>, named
+// here with a _raw_es suffix), the PAMF table's other entries.
 
 namespace {
 
@@ -1175,6 +1191,11 @@ constexpr std::string_view kOpNames[] = {"_CellDmuxCoreOpQueryAttr", "_CellDmuxC
     "_CellDmuxCoreOpDisableEs", "_CellDmuxCoreOpFlushEs", "_CellDmuxCoreOpResetEs",
     "_CellDmuxCoreOpResetStreamAndWaitDone"};
 constexpr u32 kOps = sizeof(kOpNames) / sizeof(kOpNames[0]);
+constexpr std::string_view kRawOpNames[kOps] = {"_CellDmuxCoreOpQueryAttr", "_CellDmuxCoreOpOpen",
+    "_CellDmuxCoreOpClose", "_CellDmuxCoreOpResetStream", "_CellDmuxCoreOpCreateThread", "_CellDmuxCoreOpJoinThread",
+    "_CellDmuxCoreOpSetStream_raw_es", "_CellDmuxCoreOpReleaseAu", "_CellDmuxCoreOpQueryEsAttr_raw_es",
+    "_CellDmuxCoreOpEnableEs_raw_es", "_CellDmuxCoreOpDisableEs", "_CellDmuxCoreOpFlushEs", "_CellDmuxCoreOpResetEs",
+    "_CellDmuxCoreOpResetStreamAndWaitDone"};
 
 // A DmuxCb the caller passes (RPCS3 DmuxCb: cbFunc, cbArg): readable, and with a function and an argument where RPCS3
 // requires them.
@@ -1296,12 +1317,25 @@ u32 _CellDmuxCoreOpJoinThread(PPUContext& ctx, u32 handle)
     return PAMF_OK;
 }
 
+template <bool raw_es>
+u32 set_stream_op(PPUContext& ctx, u32 handle, u32 stream_address, u32 stream_size, bool discontinuity, u64 user_data)
+{
+    if (!stream_address || stream_size == 0 || !handle) return PAMF_ERROR_ARG;
+    if (stopped(core_of(handle), raw_es ? "_CellDmuxCoreOpSetStream_raw_es" : "_CellDmuxCoreOpSetStream"))
+        return PAMF_ERROR_FATAL;
+    return core_set_stream(ctx, handle, stream_address, stream_size, discontinuity, user_data, raw_es);
+}
+
 u32 _CellDmuxCoreOpSetStream(PPUContext& ctx, u32 handle, u32 stream_address, u32 stream_size, bool discontinuity,
     u64 user_data)
 {
-    if (!stream_address || stream_size == 0 || !handle) return PAMF_ERROR_ARG;
-    if (stopped(core_of(handle), "_CellDmuxCoreOpSetStream")) return PAMF_ERROR_FATAL;
-    return core_set_stream(ctx, handle, stream_address, stream_size, discontinuity, user_data);
+    return set_stream_op<false>(ctx, handle, stream_address, stream_size, discontinuity, user_data);
+}
+
+u32 _CellDmuxCoreOpSetStream_raw_es(PPUContext& ctx, u32 handle, u32 stream_address, u32 stream_size,
+    bool discontinuity, u64 user_data)
+{
+    return set_stream_op<true>(ctx, handle, stream_address, stream_size, discontinuity, user_data);
 }
 
 Core* core_of_es(u32 es_handle)
@@ -1318,11 +1352,12 @@ u32 _CellDmuxCoreOpReleaseAu(PPUContext& ctx, u32 es_handle, u32 au_addr, u32 au
 }
 
 // RPCS3 writes the attributes whatever the answer (the memory size with the CellDmuxPamfEsHandle's).
-u32 _CellDmuxCoreOpQueryEsAttr(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, u32 attr)
+template <bool raw_es>
+u32 query_es_attr_op(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, u32 attr)
 {
     if (!es_filter_id || !attr || !usable(ctx, attr, 12, "the attributes")) return PAMF_ERROR_ARG;
     PamfEsAttr a;
-    const u32 r = core_query_es_attr(ctx, es_filter_id, es_specific_info, a);
+    const u32 r = core_query_es_attr(ctx, es_filter_id, es_specific_info, a, raw_es);
     u8* base = guest_base(ctx);
     ps_write32(base, attr, a.au_queue_max_size); // CellDmuxPamfEsAttr
     ps_write32(base, attr + 4, a.mem_size);
@@ -1330,9 +1365,20 @@ u32 _CellDmuxCoreOpQueryEsAttr(PPUContext& ctx, u32 es_filter_id, u32 es_specifi
     return r;
 }
 
+u32 _CellDmuxCoreOpQueryEsAttr(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, u32 attr)
+{
+    return query_es_attr_op<false>(ctx, es_filter_id, es_specific_info, attr);
+}
+
+u32 _CellDmuxCoreOpQueryEsAttr_raw_es(PPUContext& ctx, u32 es_filter_id, u32 es_specific_info, u32 attr)
+{
+    return query_es_attr_op<true>(ctx, es_filter_id, es_specific_info, attr);
+}
+
 // RPCS3 _CellDmuxCoreOpEnableEs: the notifications kept in the CellDmuxPamfEsHandle at the memory's start (the
 // stream, then the access unit found and flush done notifications), the handle given back whatever the answer.
-u32 _CellDmuxCoreOpEnableEs(PPUContext& ctx, u32 handle, u32 es_filter_id, u32 es_resource, u32 notify_au_found,
+template <bool raw_es>
+u32 enable_es_op(PPUContext& ctx, u32 handle, u32 es_filter_id, u32 es_resource, u32 notify_au_found,
     u32 notify_flush_done, u32 es_specific_info, u32 es_handle_out)
 {
     u8* base = guest_base(ctx);
@@ -1346,19 +1392,34 @@ u32 _CellDmuxCoreOpEnableEs(PPUContext& ctx, u32 handle, u32 es_filter_id, u32 e
     if (!es_handle_out || !usable(ctx, es_handle_out, 4, "the stream's handle") || (mem_addr & 0xf) ||
         mem_size < kPamfEsHandleSize || !usable(ctx, mem_addr, mem_size, "the stream's memory"))
         return PAMF_ERROR_ARG;
-    if (stopped(core_of(handle), "_CellDmuxCoreOpEnableEs")) return PAMF_ERROR_FATAL;
+    if (stopped(core_of(handle), raw_es ? "_CellDmuxCoreOpEnableEs_raw_es" : "_CellDmuxCoreOpEnableEs"))
+        return PAMF_ERROR_FATAL;
     const EsCallbacks cbs{*au_found, *flush_done};
     ps_write32(base, mem_addr + 0x04, cbs.au_found.fn);
     ps_write32(base, mem_addr + 0x08, cbs.au_found.arg);
     ps_write32(base, mem_addr + 0x0C, cbs.flush_done.fn);
     ps_write32(base, mem_addr + 0x10, cbs.flush_done.arg);
     u32 core_es_handle = 0;
-    const u32 r =
-        core_enable_es(ctx, handle, es_filter_id, mem_addr, mem_size, 0, es_specific_info, core_es_handle, &cbs);
+    const u32 r = core_enable_es(ctx, handle, es_filter_id, mem_addr, mem_size, 0, es_specific_info, core_es_handle,
+        &cbs, raw_es);
     if (r == PAMF_OK) // the CellDmuxPamfEsHandle's first word: its DmuxPamfElementaryStream
         if (const Es* e = es_of(core_es_handle)) ps_write32(base, mem_addr, e->es_struct);
     ps_write32(base, es_handle_out, mem_addr);
     return r;
+}
+
+u32 _CellDmuxCoreOpEnableEs(PPUContext& ctx, u32 handle, u32 es_filter_id, u32 es_resource, u32 notify_au_found,
+    u32 notify_flush_done, u32 es_specific_info, u32 es_handle_out)
+{
+    return enable_es_op<false>(ctx, handle, es_filter_id, es_resource, notify_au_found, notify_flush_done,
+        es_specific_info, es_handle_out);
+}
+
+u32 _CellDmuxCoreOpEnableEs_raw_es(PPUContext& ctx, u32 handle, u32 es_filter_id, u32 es_resource, u32 notify_au_found,
+    u32 notify_flush_done, u32 es_specific_info, u32 es_handle_out)
+{
+    return enable_es_op<true>(ctx, handle, es_filter_id, es_resource, notify_au_found, notify_flush_done,
+        es_specific_info, es_handle_out);
 }
 
 u32 _CellDmuxCoreOpDisableEs(PPUContext& ctx, u32 es_handle)
@@ -1389,13 +1450,15 @@ u32 _CellDmuxCoreOpResetStreamAndWaitDone(PPUContext& ctx, u32 handle)
     return core_reset_stream_and_wait_done(ctx, handle);
 }
 
-// The table, laid out when the variable is first linked: each entry the descriptor of its function.
-void init_table(u8* base, u32 at)
+// A table, laid out when the variable is first linked: each entry the descriptor of its function.
+void lay_out(u8* base, u32 at, const std::string_view (&names)[kOps])
 {
     HleProcess& p = *HleProcess::current();
     for (u32 op = 0; op < kOps; op++)
-        ps_write32(base, at + 4 * op, p.link_function("cellDmux", recomp::nid_of(kOpNames[op]), kOpNames[op]));
+        ps_write32(base, at + 4 * op, p.link_function("cellDmux", recomp::nid_of(names[op]), names[op]));
 }
+void init_table(u8* base, u32 at) { lay_out(base, at, kOpNames); }
+void init_raw_table(u8* base, u32 at) { lay_out(base, at, kRawOpNames); }
 
 } // namespace
 
@@ -1419,10 +1482,16 @@ void register_pamf_table(Registry& r)
         PS_PAMF_OP(_CellDmuxCoreOpFlushEs),
         PS_PAMF_OP(_CellDmuxCoreOpResetEs),
         PS_PAMF_OP(_CellDmuxCoreOpResetStreamAndWaitDone),
+        PS_PAMF_OP(_CellDmuxCoreOpSetStream_raw_es),
+        PS_PAMF_OP(_CellDmuxCoreOpQueryEsAttr_raw_es),
+        PS_PAMF_OP(_CellDmuxCoreOpEnableEs_raw_es),
     });
-    // The PAMF core, compared with libdmuxpamf (D-194): no firmware-first marker. 0x28B2B7B2 is RPCS3's REG_VNID.
+    // The PAMF core, compared with libdmuxpamf (D-194): no firmware-first marker. Its raw elementary stream table, not
+    // compared, is unverified (D-624): a module importing it gets Sony's libdmuxpamf where the system software has
+    // one, pspocket's where not. 0x28B2B7B2 and 0x9728A0E9 are RPCS3's REG_VNIDs.
     r.add_variables("cellDmuxPamf",
-        {Variable{{}, "g_cell_dmux_core_ops_pamf", 0x28B2B7B2, kOps * 4, 4, &init_table}});
+        {Variable{{}, "g_cell_dmux_core_ops_pamf", 0x28B2B7B2, kOps * 4, 4, &init_table},
+            Variable{{}, "g_cell_dmux_core_ops_raw_es", 0x9728A0E9, kOps * 4, 4, &init_raw_table, true}});
 }
 
 #undef PS_PAMF_OP
