@@ -10766,3 +10766,107 @@ anywhere, PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice: 0 of 1,361 observa
 values are checked against test_snd.cpp's. In every ctest run: each function it calls is in the NID database under
 libsnd3 (or libsynth2, for the getters and VoiceTrans) by that name, pspocket's own, the library firmware-first. When
 the halves match, libsnd3's marker and the test's [.] go together, with a decision of their own.
+
+## D-650 · 2026-10-11 · ThreadSanitizer over the libraries of 2026-10-10: the LF queues, Task2, libsynth2, the encoders
+
+D-600's sweep left no race reports. The libraries added since were swept the same way (scripts/tsan.sh's build/tsan,
+test_hle once per test file with its TSAN_OPTIONS and scripts/tsan.supp): cellSync's LF queue second forms and lv2 event
+queue (D-625); cellSpurs' CellSpursTaskset2 tasks, exit code containers and LF queue bodies (D-626 to D-629); libsynth2
+on pspocket's SPU2 (D-610 to D-614); pspocket's JPEG encoder and cellJpgEnc (D-615, D-616, D-618) and cellJpgDec's Ext
+functions (D-617, D-619); cellNetAoi, libmedi, libad, cellLibprof and cellSysmodule's two (D-635 to D-639). First the
+twenty test files that cover them (test_sync, test_spurs_task2, test_spurs_compare, test_synth2 and test_jpgenc with
+their comparisons, test_jpgdec, test_imgenc, test_netaoi, test_medi, test_ad, test_libprof, test_sysmodule, test_daisy,
+test_spurs_run, test_spurs_api, test_spurs_queue, test_spurs_semaphore, test_hle), then the whole hle group.
+- None of their tests had a PPU side on several threads at once. These do now, each checking what the threads got, not
+  only that nothing broke: four PPU threads pushing into a PPU2SPU LF queue against SPU code popping with
+  GETLLAR/PUTLLC, and four popping an SPU2PPU one (test_sync.cpp); three pushing into a taskset's PPU2SPU queue with
+  _cellSpursLFQueuePushBody while SPU code pops and tasks waiting in its ring are taken and signalled one after another,
+  three pushers and three poppers on an ANY2ANY one, four threads creating CellSpursTaskset2 tasks and four joining them
+  (D-652), a CellSpursTaskset2 destroyed while threads join its tasks (D-653) (test_spurs_task2.cpp); libsynth2's
+  Generate on one thread while another sets registers, keys voices on and off, transfers sound data and changes the
+  reverb presets (test_synth2.cpp); two cellJpgEnc encoders at once, each stream byte for byte the one an encoder makes
+  alone, and eight threads with one encoder (test_jpgenc.cpp, D-651); eight threads with one cellPngEnc encoder
+  (test_imgenc.cpp, D-651).
+- Before (the tree as the day left it, with those tests but D-653's): no report in any of the twenty files; the
+  eight-thread tests of cellJpgEnc and cellPngEnc failed, eight of eight pictures queued with a depth of four. After the
+  fixes: no report in any of them, every test passing. The whole hle group (117 files): no report but in
+  test_fuzz_media (D-603, swept here for the first time); test_libm failing as it does without ThreadSanitizer (fmin and
+  fmax of signed zeros on glibc). test_fuzz_media's cellVdec case reported, every run, the test's own reuse of an
+  access unit's memory once its AUDONE came against cellVdec's thread reading it (FFmpeg's copy, made before the
+  AUDONE): the order holds, but the guest callback's count was a plain store after an lwsync and the test's look a
+  plain load with a fence, which ThreadSanitizer does not model. As D-585's tests do, the cellVdec tests' callback now
+  raises its count with lwarx/stwcx. and the tests read it through the reservation system
+  (tests/hle/vdec_test_util.hpp): the report in 3 of 3 runs before, none after, the cellVdec tests and their comparison
+  as before. Its other reports are in its cellAtrac case (the last point).
+- Without the suppressions (tsan.sh --raw) the twelve files of these libraries show only the guest-level patterns D-585
+  lets go, none of them in this code: test_sync's mutex test standing in for guest code; cellSync's rwm reading its
+  buffer's size beside a writer's update of the line; libsre's plain loads of a taskset's workload ID (create_task) and
+  of CellSpurs' SPU count (cellSpursSetPriority), each in a doubleword the SPURS kernel's reservation updates rewrite
+  unchanged.
+- Found and fixed: the encoders' queue (D-651), a CellSpursTaskset2's task IDs (D-652) and its event flags' IDs (D-653).
+  Nothing to fix in libsynth2 (one lock over the synthesizer and every call, Generate's rendering included), cellNetAoi,
+  libmedi, libad and cellLibprof (their state under one lock each), cellSysmodule's variable (written under its lock,
+  read by no other thread of pspocket's), cellSync's LF queue (every update one reservation operation; an entry is
+  copied after its claim and before its completion, both ordered by the line's version), cellJpgDec's Ext functions (a
+  stream's state belongs to the thread calling with it; the decoder has no shared tables to build).
+- libsnd3, cellRudp, cellAdec's cores and tables and cellAtrac, which were being changed at the time, were not swept
+  here; their test files ran in the hle group as they stood. test_snd, test_rudp, test_adec, test_adec_cores,
+  test_atrac, test_atrac_multi and test_codec_cores: no report. test_fuzz_media's cellAtrac case, every run: the
+  ATRAC3plus core's decoder thread reads a decoder's input while cellAdecGetPcm's realign moves it on the game's thread
+  (adec_atracx.cpp, AtracXCore::realign); and a decoder's thread still runs cellAtrac's cellAdec callback, and reads a
+  mutex ID, after its decoder was deleted, against the next decoder made in the same memory (cellAtrac.cpp make_sync and
+  cellAtracSetDataAndGetMemSize, lv2's sys_mutex_create writing the new decoder's mutex ID). The same case ended once
+  on the kernel's check that guest threads still ran when it was destroyed (PS_FATAL), and once spun for ten minutes,
+  a decoder's thread busy and the test's waiting, until it was stopped: the decoder threads' shutdown, which that work
+  covers.
+
+## D-651 · 2026-10-11 · cellJpgEnc's and cellPngEnc's queue: a picture takes its place before it is encoded; a Reset meanwhile drops it
+
+EncodePicture (both libraries, D-566 and D-616: the picture encoded on the calling thread, its result queued, at most
+four) checked the queue's depth under the library's lock, encoded without it and queued the result afterwards. Threads
+encoding with one encoder at once all passed the check before any result was queued: eight at once queued eight, where
+the libraries' command queue answers BUSY past four (the attribute's cmdQueueDepth). A Reset while a picture was being
+encoded cleared the queue, and the picture's stream was written and its result queued after it: a game that reset the
+encoder could still find a stream from before, and its buffer written.
+- The picture takes its place under the lock: results waiting plus pictures being encoded, against the depth (BUSY past
+  it); WaitForInput counts both. It is encoded outside the lock. Its stream is written (to the buffer, or the file
+  through lv2) and its result queued in one step under the lock, unless the encoder was reset or closed meanwhile (a
+  reset count, and a serial each Open gives an encoder): then it is dropped and nothing written; EncodePicture answers
+  CELL_OK (the picture was taken), or ARG for an encoder closed meanwhile, as before. The place is given back on every
+  path, the process ending included.
+- Nothing changes for one thread: the order, the answers and the streams (the comparisons' halves still agree, D-618).
+Tests: test_jpgenc.cpp and test_imgenc.cpp, eight threads encoding with one encoder at once: four queued, each stream
+the one the encoder makes alone, in its own thread's buffer, and four BUSY; then again with a Reset once four were
+refused, after which nothing is queued and there is room for four. Before: eight accepted and queued in both libraries,
+and the Reset round left results behind.
+
+## D-652 · 2026-10-11 · cellSpurs: a CellSpursTaskset2's task IDs claimed and given back under the host's lock
+
+D-626 keeps, by taskset, the IDs of a CellSpursTaskset2's own tasks created and not yet joined, and those a JoinTask2
+waits for (SpursHost::task2). Two windows, found reading the code for D-650:
+- create_task copied the unjoined IDs under the host's lock, let it go, claimed the lowest ID free in the taskset's
+  `enabled` bits and the copy (a reservation operation), then took the lock again to record a Task2 task's ID. A Task2
+  task created, run and ended by other threads in between left its ID free in `enabled` and missing from the copy: the
+  claim could take it while its exit code waited for its join, which then got the new task's code (and the new task's
+  own join SRCH). In a CellSpursTaskset2 the copy, the claim and the record are now one critical section; the claim's
+  reservation operation takes no lock and calls nothing, so nothing waits on the host's lock inside it.
+- join_task2 freed the ID under the lock and cleared its joining bit afterwards, in its guard's destructor: a task
+  created with the ID in between and joined at once was BUSY. Both bits now go in one critical section.
+Neither is a data race (every access is under the lock), and both windows are too narrow for a test to hit (the first
+needs another task's whole life inside it). Their regression check, which passes before and after: test_spurs_task2.cpp,
+four threads creating tasks that end at once and four joining them, half with JoinTask2 and half polling TryJoinTask2,
+200 tasks, every join with its own task's exit code and every ID free at the end.
+
+## D-653 · 2026-10-11 · cellSpurs: a CellSpursTaskset2's event flag IDs read and cleared atomically
+
+cellSpursDestroyTaskset2 cancels and destroys the taskset's two lv2 event flags and then clears the guest words holding
+their IDs (0x1898, 0x189C) with plain stores, while JoinTask2 and TryJoinTask2 on other threads read them with plain
+loads on their way to the wait: a game destroying the taskset while its tasks are being joined, D-626's SHUTDOWN case.
+Two of pspocket's own host paths share the guest word, as D-587's did, and ThreadSanitizer reported the join's load
+against the destroy's store. The word is now read with atomic_load_be32 (JoinTask2 and TryJoinTask2, the task
+creations' check and clear of the flag, the taskset policy's Task2 exit) and cleared with atomic_store_be32 (release).
+What a join sees is as before: a wait the cancel ends is SHUTDOWN; one on a flag already gone, or on ID 0, is lv2's
+ESRCH, TASK_ERROR_SRCH.
+Test: test_spurs_task2.cpp, 24 rounds of a CellSpursTaskset2 destroyed while a JoinTask2 waits (SHUTDOWN) and three
+threads poll TryJoinTask2 (BUSY, then SRCH). Under ThreadSanitizer the race was reported in 6 of 6 runs before, in none
+of 6 after.
