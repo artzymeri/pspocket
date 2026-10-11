@@ -1,4 +1,5 @@
-// cellCamera, cellMic and libgem with no device attached, as RPCS3's default (null) handlers answer (synthetic: no game data).
+// cellCamera, cellMic and libgem with no device attached, as RPCS3's default (null) handlers answer, and cellRemotePlay with
+// no Remote Play peer (synthetic: no game data).
 
 #include "hle_test_util.hpp"
 
@@ -15,7 +16,27 @@ using namespace pspocket::hle::test;
 namespace {
 
 constexpr u32 kInfo = kData + 0x100, kOut = kData + 0x200, kAttr = kData + 0x300, kQueue = kData + 0x400;
+constexpr u32 kEvents = kData + 0x500, kCount = kData + 0x5F0;
 constexpr u32 kUnmapped = 0x0FFF0000; // in the main area, never committed by these tests
+
+// An lv2 event queue of 8 events under `key`; its ID at kQueue.
+void make_queue(GuestThread& g, u64 key)
+{
+    u8* b = g.f.base();
+    ps_write32(b, kAttr, lv2::SYS_SYNC_FIFO);
+    ps_write32(b, kAttr + 4, lv2::SYS_PPU_QUEUE);
+    ps_write64(b, kAttr + 8, 0);
+    REQUIRE(lv2::sys_event_queue_create(*g.t, kQueue, kAttr, key, 8) == 0);
+}
+
+// How many events wait in the queue at kQueue (taken).
+u32 queued_events(GuestThread& g)
+{
+    u8* b = g.f.base();
+    ps_write32(b, kCount, 0xAAAA);
+    REQUIRE(lv2::sys_event_queue_tryreceive(*g.t, ps_read32(b, kQueue), kEvents, 4, kCount) == 0);
+    return ps_read32(b, kCount);
+}
 
 } // namespace
 
@@ -86,6 +107,112 @@ TEST_CASE("cellCamera: initialised with no camera attached", "[hle][devices]")
     CHECK(g.call("cellCameraGetAttribute", 0, 0, kOut, kAttr) == kNotInit);
 }
 
+TEST_CASE("cellCamera: the asynchronous forms refused as their synchronous forms, no event (D-665)",
+    "[hle][devices][camera]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "camera");
+    u8* b = f.base();
+    const u64 kNotInit = r3_of_code(0x80140803), kParam = r3_of_code(0x80140804), kNotOpen = r3_of_code(0x80140806),
+              kNotFound = r3_of_code(0x80140807), kFormat = r3_of_code(0x8014080A),
+              kResolution = r3_of_code(0x8014080B), kFramerate = r3_of_code(0x8014080C);
+    const char* const kOnOpen[] = {"cellCameraCloseAsync", "cellCameraClosePost", "cellCameraStartAsync",
+        "cellCameraStartPost", "cellCameraStopAsync", "cellCameraStopPost", "cellCameraResetAsync",
+        "cellCameraResetPost"};
+
+    // Before Init: the info pointer first (as Open), then init; the others the device number first (as Close).
+    std::memset(b + kInfo, 0, 64);
+    CHECK(g.call("cellCameraOpenAsync", 0, 0) == kParam);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kNotInit);
+    CHECK(g.call("cellCameraOpenPost", 0, kInfo) == kNotInit);
+    CHECK(g.call("cellCameraOpenPost", 1, kInfo) == kNotInit);
+    for (const char* fn : kOnOpen) {
+        INFO(fn);
+        CHECK(g.call(fn, 0) == kNotInit);
+        CHECK(g.call(fn, 1) == kParam);
+    }
+
+    REQUIRE(g.call("cellCameraInit") == 0);
+    // A notify queue asking for every completion event (CELL_CAMERA_EFLAG_OPEN to RESET) and frame updates.
+    make_queue(g, 0x8000000000CA0001ull);
+    REQUIRE(g.call("cellCameraSetNotifyEventQueue2", 0x8000000000CA0001ull, 0x33, 0x3F) == 0);
+
+    // OpenAsync: Open's checks in Open's order, then no camera; the info is left as it was.
+    CHECK(g.call("cellCameraOpenAsync", 0, 0) == kParam);
+    CHECK(g.call("cellCameraOpenAsync", 1, kInfo) == kParam);
+    CHECK(g.call("cellCameraOpenAsync", 0, kUnmapped) == kParam);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kFormat);
+    ps_write32(b, kInfo, 3); // YUV422
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kResolution);
+    ps_write32(b, kInfo + 4, 1); // VGA
+    ps_write32(b, kInfo + 8, 24);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kFramerate);
+    ps_write32(b, kInfo + 8, 60);
+    u8 before[64];
+    std::memcpy(before, b + kInfo, sizeof before);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kNotFound);
+    CHECK(std::memcmp(before, b + kInfo, sizeof before) == 0);
+
+    // OpenPost: no open was started; the device number, then no camera, the info not read.
+    CHECK(g.call("cellCameraOpenPost", 1, kInfo) == kParam);
+    CHECK(g.call("cellCameraOpenPost", 0, kInfo) == kNotFound);
+    CHECK(g.call("cellCameraOpenPost", 0, kUnmapped) == kNotFound);
+    CHECK(std::memcmp(before, b + kInfo, sizeof before) == 0);
+    CHECK(g.call("cellCameraIsOpen", 0) == 0);
+
+    // Close, Start, Stop and Reset, asynchronous or their Post: the camera never open.
+    for (const char* fn : kOnOpen) {
+        INFO(fn);
+        CHECK(g.call(fn, 0) == kNotOpen);
+        CHECK(g.call(fn, 1) == kParam);
+    }
+    CHECK(g.call("cellCameraIsStarted", 0) == 0);
+
+    // Nothing was started, so no completion event came.
+    CHECK(queued_events(g) == 0);
+
+    REQUIRE(g.call("cellCameraEnd") == 0);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kNotInit);
+    CHECK(g.call("cellCameraStartAsync", 0) == kNotInit);
+    CHECK(g.call("cellCameraStartPost", 0) == kNotInit);
+}
+
+TEST_CASE("cellCamera: Read2 and ResetAttribute with no camera open, SetContainer kept (D-666)",
+    "[hle][devices][camera]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "camera");
+    u8* b = f.base();
+    const u64 kNotInit = r3_of_code(0x80140803), kParam = r3_of_code(0x80140804), kNotOpen = r3_of_code(0x80140806);
+
+    CHECK(g.call("cellCameraRead2", 0, kOut) == kNotInit);
+    CHECK(g.call("cellCameraResetAttribute", 0, 0) == kNotInit);
+    CHECK(g.call("cellCameraResetAttribute", 1, 0) == kNotInit); // init before the device number, as GetAttribute
+    CHECK(g.call("cellCameraSetContainer", 0, 0x3F000001) == 0); // taken before Init too
+
+    REQUIRE(g.call("cellCameraInit") == 0);
+    // Read2 answers as Read and ReadEx: NOT_OPEN before the device number is looked at; nothing is written.
+    ps_write32(b, kOut, 0xAAAA);
+    CHECK(g.call("cellCameraRead2", 0, kOut) == kNotOpen);
+    CHECK(g.call("cellCameraRead2", 1, kOut) == kNotOpen);
+    CHECK(g.call("cellCameraReadEx", 1, kOut) == kNotOpen);
+    CHECK(g.call("cellCameraRead2", 0, kUnmapped) == kNotOpen);
+    CHECK(ps_read32(b, kOut) == 0xAAAA);
+    // ResetAttribute as Get/SetAttribute.
+    CHECK(g.call("cellCameraResetAttribute", 0, 0) == kNotOpen);
+    CHECK(g.call("cellCameraResetAttribute", 0, 9) == kNotOpen);
+    CHECK(g.call("cellCameraResetAttribute", 1, 0) == kParam);
+    CHECK(g.call("cellCameraGetAttribute", 1, 0, kOut, kAttr) == kParam);
+    // SetContainer: kept for an open that never comes, whatever it is given.
+    CHECK(g.call("cellCameraSetContainer", 0, 0x3F000002) == 0);
+    CHECK(g.call("cellCameraSetContainer", 1, 0) == 0);
+
+    REQUIRE(g.call("cellCameraEnd") == 0);
+    CHECK(g.call("cellCameraRead2", 0, kOut) == kNotInit);
+    CHECK(g.call("cellCameraResetAttribute", 0, 0) == kNotInit);
+    CHECK(g.call("cellCameraSetContainer", 0, 0x3F000003) == 0);
+}
+
 TEST_CASE("cellMic: initialised with no microphone registered", "[hle][devices]")
 {
     Fixture f;
@@ -150,6 +277,82 @@ TEST_CASE("cellMic: initialised with no microphone registered", "[hle][devices]"
     CHECK(g.call("cellMicEnd") == kNotInit);
     CHECK(g.call("cellMicGetDeviceGUID", 0, kOut) == kNotInit); // written all the same (RPCS3)
     CHECK(ps_read32(b, kOut) == 0xFFFFFFFF);
+}
+
+TEST_CASE("cellMic: the system's sharing, Command and the multi-mic queue with no microphone (D-667)",
+    "[hle][devices][mic]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "mic");
+    const u64 kAlready = r3_of_code(0x80140101), kNotInit = r3_of_code(0x80140103),
+              kQueueError = r3_of_code(0x8014010D), kNotFound = r3_of_code(0x8014010E);
+    const char* const kShared[] = {"cellMicSysShareOpen", "cellMicSysShareStart", "cellMicSysShareStop",
+        "cellMicSysShareClose"};
+
+    // cellMicCommand: a command to a microphone, none registered.
+    CHECK(g.call("cellMicCommand", 0, 8) == kNotInit);
+    CHECK(g.call("cellMicSetMultiMicNotifyEventQueue", 0x8000000000AB0002ull, 0, 0) == kNotInit);
+    REQUIRE(g.call("cellMicInit") == 0);
+    CHECK(g.call("cellMicCommand", 0, 8) == kNotFound);
+    CHECK(g.call("cellMicCommand", 3, 0) == kNotFound);
+
+    // The multi-mic notify queue: it must exist; it gets no event.
+    CHECK(g.call("cellMicSetMultiMicNotifyEventQueue", 0x8000000000AB0002ull, 5, 0) == kQueueError);
+    make_queue(g, 0x8000000000AB0002ull);
+    REQUIRE(g.call("cellMicSetMultiMicNotifyEventQueue", 0x8000000000AB0002ull, 5, 0) == 0);
+    REQUIRE(g.call("cellMicSetNotifyEventQueue", 0x8000000000AB0002ull) == 0);
+    CHECK(queued_events(g) == 0);
+
+    // The system's sharing: bracketed by its own Init and End, cellMicInit or not; no microphone to share in between.
+    for (const char* fn : kShared) {
+        INFO(fn);
+        CHECK(g.call(fn, 0) == kNotInit);
+    }
+    CHECK(g.call("cellMicSysShareEnd") == kNotInit);
+    REQUIRE(g.call("cellMicSysShareInit") == 0);
+    CHECK(g.call("cellMicSysShareInit") == kAlready);
+    for (const char* fn : kShared) {
+        INFO(fn);
+        CHECK(g.call(fn, 0) == kNotFound);
+        CHECK(g.call(fn, 1) == kNotFound);
+    }
+    CHECK(queued_events(g) == 0);
+    REQUIRE(g.call("cellMicEnd") == 0);
+    CHECK(g.call("cellMicSysShareOpen", 0) == kNotFound); // the sharing outlives cellMicEnd
+    CHECK(g.call("cellMicCommand", 0, 8) == kNotInit);
+    CHECK(g.call("cellMicSetMultiMicNotifyEventQueue", 0x8000000000AB0002ull, 5, 0) == kNotInit);
+    REQUIRE(g.call("cellMicSysShareEnd") == 0);
+    CHECK(g.call("cellMicSysShareEnd") == kNotInit);
+    CHECK(g.call("cellMicSysShareStart", 0) == kNotInit);
+
+    // And without cellMicInit at all.
+    REQUIRE(g.call("cellMicSysShareInit") == 0);
+    CHECK(g.call("cellMicSysShareClose", 0) == kNotFound);
+    REQUIRE(g.call("cellMicSysShareEnd") == 0);
+}
+
+TEST_CASE("cellMic: StopEx in StartEx's form, no microphone (D-668)", "[hle][devices][mic]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "mic");
+    const u64 kNotInit = r3_of_code(0x80140103), kParam = r3_of_code(0x80140104), kNotFound = r3_of_code(0x8014010E);
+
+    // A flag outside StartEx's two is PARAM before anything else, as StartEx's.
+    CHECK(g.call("cellMicStopEx", 0, 4) == kParam);
+    CHECK(g.call("cellMicStartEx", 0, 4) == kParam);
+    CHECK(g.call("cellMicStopEx", 0, 0x80000000u) == kParam);
+    CHECK(g.call("cellMicStopEx", 0, 0) == kNotInit);
+    CHECK(g.call("cellMicStopEx", 0, 3) == kNotInit);
+    REQUIRE(g.call("cellMicInit") == 0);
+    for (u32 flags = 0; flags < 4; flags++) {
+        INFO(flags);
+        CHECK(g.call("cellMicStopEx", 0, flags) == kNotFound);
+        CHECK(g.call("cellMicStopEx", 7, flags) == kNotFound);
+    }
+    CHECK(g.call("cellMicStopEx", 0, 8) == kParam);
+    CHECK(g.call("cellMicStop", 0) == kNotFound); // Stop as StopEx(dev_num, 0)
+    REQUIRE(g.call("cellMicEnd") == 0);
+    CHECK(g.call("cellMicStopEx", 0, 1) == kNotInit);
 }
 
 TEST_CASE("libgem: initialised with no Move controller connected", "[hle][devices]")
@@ -290,4 +493,57 @@ TEST_CASE("libgem: initialised with no Move controller connected", "[hle][device
 
     REQUIRE(g.call("cellGemEnd") == 0);
     CHECK(g.call("cellGemEnd") == kUninit);
+}
+
+TEST_CASE("cellRemotePlay: no Remote Play peer, the game's settings kept (D-669)", "[hle][devices][remoteplay]")
+{
+    const u64 kZeroRegistered = r3_of_code(0x80029813), kInternal = r3_of_code(0x80029830);
+    {
+        Fixture f;
+        GuestThread g(f, 0, "remoteplay");
+        u8* b = f.base();
+
+        // No session: RPCS3's status kept; what a session would give is refused, nothing written.
+        CHECK(g.call("cellRemotePlayGetStatus") == 0);
+        u8 before[0x40];
+        std::memset(b + kOut, 0xAA, sizeof before);
+        std::memcpy(before, b + kOut, sizeof before);
+        CHECK(g.call("cellRemotePlayGetPeerInfo", kOut) == kZeroRegistered);
+        CHECK(g.call("cellRemotePlayGetSharedMemory", kOut, kOut + 4) == kZeroRegistered);
+        CHECK(g.call("cellRemotePlayGetSharedMemory", 0, kUnmapped) == kZeroRegistered); // the arguments not read
+        CHECK(std::memcmp(before, b + kOut, sizeof before) == 0);
+
+        // The comparative volume: 1.0 (RPCS3's) until the game sets one, then the one it set.
+        ps_write32(b, kOut, 0);
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut) == 0);
+        CHECK(ps_readf32(b, kOut) == 1.0f);
+        g.ctx.fpr[1] = 0.25;
+        REQUIRE(g.call("cellRemotePlaySetComparativeVolume") == 0);
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut) == 0);
+        CHECK(ps_readf32(b, kOut) == 0.25f);
+        g.ctx.fpr[1] = 2.0; // no range is known: kept as given
+        REQUIRE(g.call("cellRemotePlaySetComparativeVolume") == 0);
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut + 8) == 0);
+        CHECK(ps_readf32(b, kOut + 8) == 2.0f);
+        CHECK(g.call("cellRemotePlayGetComparativeVolume", 0) == 0); // a null pointer gets nothing (RPCS3)
+        // A pointer that is not guest memory is refused: it was written unchecked before (a host fault).
+        CHECK(g.call("cellRemotePlayGetComparativeVolume", kUnmapped) == kInternal);
+
+        // The requests for a session that never comes: kept, CELL_OK as RPCS3.
+        CHECK(g.call("cellRemotePlayEncryptAllData") == 0);
+        CHECK(g.call("cellRemotePlayEncryptAllData") == 0);
+        CHECK(g.call("cellRemotePlayStopPeerVideoOut") == 0);
+        CHECK(g.call("cellRemotePlayBreak") == 0);
+        CHECK(g.call("cellRemotePlayGetStatus") == 0);
+        CHECK(g.call("cellRemotePlayGetPeerInfo", kOut) == kZeroRegistered);
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut) == 0);
+        CHECK(ps_readf32(b, kOut) == 2.0f);
+    }
+    {
+        // A process each: the next starts again at 1.0.
+        Fixture f;
+        GuestThread g(f, 0, "remoteplay");
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut) == 0);
+        CHECK(ps_readf32(f.base(), kOut) == 1.0f);
+    }
 }

@@ -314,7 +314,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-10: 5,993 of 6,625, 90.5%):
+firmware module. Done so far (2026-10-11: 6,318 of 6,625, 95.4%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -385,19 +385,47 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   (two cores of 24 voices over 2 MB of sound memory: VAG ADPCM, pitch and its modulation, ADSR, noise, the voice mixes
   and each core's reverb), behind libsd's calls and register numbers. A comparison with Sony's libsynth2 is ready for
   the Mac ("[compare][synth2]"); the first thing to check is what Generate puts in the surround outputs.
-Left (632, 2026-10-10). What each part needs (a session without the firmware could not make these faithfully):
+- cellRudp whole, firmware-first (D-630 to D-633): reliable connections over lv2's network, ordered or not,
+  windows, retransmission, keep-alive, polling, the internal I/O thread or the game's own; its wire format is
+  pspocket's own (rudp.hpp), so it talks to pspocket only. Fixed on the way: a socket closed under its contexts made
+  the I/O thread spin. libsnd3, firmware-first (D-640 to D-644): HD3 banks bound into libsynth2's memory, notes by
+  tone and by program, voices and their allocation, the request queue, a Standard MIDI File player, all through
+  libsynth2's exports; the HD3 tone and program records are inferred (D-641: the first thing to check on the Mac).
+  Both have comparisons with Sony's modules ready for the Mac ("[compare][rudp]", "[compare][snd3]").
+- sys_libc and sys_libm complete (D-904 to D-907, by the session on the Mac): Dinkumware's internals as the SDK's C
+  library has them, compared with the copies two games link into themselves: the SPU accessors and printf helpers,
+  printf's and scanf's engines, number parsing, the locale objects, multibyte conversions, collation and time.
+- The audio decoder cores still missing, on FFmpeg, firmware-first (D-620 to D-623): Dolby Digital Plus, MPEG-2 AAC,
+  MP3 Surround (its stereo core), ATRAC3 multichannel, Dolby TrueHD, DTS (core, HD, HD core, LBR) and WMA (standard,
+  Pro, Lossless), each through pspocket's cellAdec and as its core module's operation table and PTS function; their
+  parameter and information layouts inferred where RPCS3 has none (to check on the Mac). The Mac must rerun
+  scripts/build-ffmpeg.sh (macos, macos-tests, ios) for the new decoders. cellDmuxPamf's raw elementary stream core
+  from RPCS3, unverified (D-624). Races found and fixed by a ThreadSanitizer pass over the day's libraries (D-650 to
+  D-653): cellJpgEnc's and cellPngEnc's queue, a taskset 2's task IDs and event flag IDs.
+- Fixed (D-645, D-646): a damaged ATRAC3plus file whose fmt chunk counts fewer channels than its configuration made
+  cellAtrac overrun its PCM buffer into cellAdec's decoder state; the decoder's thread then outlived its close and
+  either spun or took the next decoder's commands (the rare test abort and the test run that stalled). Each core's
+  thread now ends once its context is not its own, and cellAtrac refuses such files and a RIFF length that wraps.
+- The functions RPCS3 answers with a stub (D-182), made pspocket's own for a console with no PSN, no device and no
+  peer (D-660 to D-684), unverified (D-594), each decision saying what to check against Sony's module: cellCamera's
+  asynchronous forms, Read2, ResetAttribute and SetContainer, cellMic's system sharing, Command, multi-mic queue and
+  StopEx, and cellRemotePlay (D-665 to D-669); cellNetCtl's game-internal forms and the game update's Init, Term and
+  CheckAbort, background downloads, the access point mode, the auth dialog's Abort and Close, cellGameExec's games,
+  the RTC alarms, cellImeJpOpenExt and AvconfExt's last two (D-670 to D-674); cellSysutilAvc2's chat and video
+  windows, cellSysutilAvcExt's and the system video player, which this console does not have (D-675 to D-679). These
+  libraries are complete. Fixed on the way: cellRemotePlayGetComparativeVolume wrote through a pointer that was not
+  guest memory; AvcExt's SetWindowAlpha and SetWindowSize read their transition from the float's register (D-678).
+Left (307, 2026-10-11). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSailRec (58)
-  and cellSail's playback (19, libsail), libsnd3 (50), cellRudp (28, its wire protocol), the codec
+  and cellSail's playback (19, libsail), the codec
   cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 6, and
-  the audio cores' operation tables and PTS functions, about 160 in all), cellCelpEnc and
+  CELP's decoder tables and PTS functions: about 140 in all; no CELP decoder exists to build them on), cellCelpEnc and
   cellCelp8Enc (19), and the small ones
   (sys_lv2coredump, cellSysconfPs1emu, cellGamePs1Emu,
   module management's six).
-- The 188 functions answered as RPCS3's stubs, in libraries pspocket always serves: their arguments and answers from
-  the libraries' modules.
-- sys_libc and sys_libm's internals (260: Dinkumware's formatter, scanner and locale internals, the SPU printf
-  helpers' read and write families): no firmware module has them; their arguments are to be read in a game's own copy
-  of the C library.
+- The 82 functions still answered as RPCS3's stubs, in libraries pspocket always serves (the NP family, printing,
+  fs_utility_init, DTCP-IP and PESM: being made in the cloud session, D-660 to D-664, D-680 to D-684); where no
+  signature is public, their arguments and answers from the libraries' modules.
 - To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
   cellFiber, the codec cores' version queries; and cellVdec's DivX 3.11, VC-1 and MVC. The comparisons are written
   (D-597: tests/hle/test_*_compare.cpp over compare_util.hpp, hidden from ctest until each matches): on the Mac,

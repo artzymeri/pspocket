@@ -54,6 +54,7 @@ add_library(pspocket_hle STATIC
     src/cellMusic.cpp
     src/media_export.cpp
     src/cellSysutilAvc2.cpp
+    src/cellVideoPlayerUtility.cpp
     src/cellImeJp.cpp
     src/cellRec.cpp
     src/cellPamf.cpp
@@ -68,6 +69,9 @@ add_library(pspocket_hle STATIC
     src/adec_aac.cpp
     src/adec_ac3.cpp
     src/adec_atrac3.cpp
+    src/adec_truehd.cpp
+    src/adec_dts.cpp
+    src/adec_wma.cpp
     src/adec_tables.cpp
     src/cellPngDec.cpp
     src/cellGifDec.cpp
@@ -144,6 +148,7 @@ add_library(pspocket_hle STATIC
     src/sys_net.cpp
     src/sysutil_misc.cpp
     src/devices.cpp
+    src/cellRemotePlay.cpp
     src/gem.cpp
     src/trophy_files.cpp)
 target_include_directories(pspocket_hle PUBLIC include)

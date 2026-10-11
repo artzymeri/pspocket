@@ -317,7 +317,7 @@ TEST_CASE("cellAtracMulti: ATRAC3 files of four channels built here, as tracks (
     MultiFixture f;
     GuestThread t(f, 0, "ppu");
     const auto log = script(f.base(), ours(f, t));
-    CHECK(log.size() > 50); // without the firmware's ATRAC3 multichannel core cellAdec opens none
+    CHECK(log.size() > 50); // without the firmware, cellAdec plays it through pspocket's core (D-621)
     CHECK(std::find(log.begin(), log.end(), "cellAtracMultiDeleteDecoder unset -> 0x80610b22") != log.end());
     CHECK(std::find(log.begin(), log.end(), "cellAtracMultiGetChannel NULL -> 0x80610b91") != log.end());
 }

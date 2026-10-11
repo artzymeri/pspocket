@@ -7,8 +7,13 @@
 // data blocks; for ADIF the program, for raw blocks the sampling frequency index and profile; enableDownmix), the
 // information block (CellAdecM4AacInfo, 0x80 bytes: aligned to 16) and the error codes (CELL_ADEC_ERROR_M4AAC_*), and
 // that the three cores correct PTS with functions of their own (_SceAdecCorrectPtsValue_M4Aac, _M4Aac2ch,
-// _M4Aac2chmod: ADEC_CORRECT_PTS_VALUE_TYPE_M4AAC). MPEG-2 AAC (CELL_ADEC_TYPE_M2AAC, cellM2AACdec) stays Sony's: RPCS3
-// has no structures for it. RPCS3 runs Sony's modules, so what follows is pspocket's reading, to compare on the Mac:
+// _M4Aac2chmod: ADEC_CORRECT_PTS_VALUE_TYPE_M4AAC). MPEG-2 AAC (CELL_ADEC_TYPE_M2AAC, cellM2AACdec's table 0xAC2F0831,
+// D-621) is the same core: RPCS3 has no structures for it, so its parameters and information block are taken as
+// MPEG-4 AAC's (MPEG-2 AAC is MPEG-4's LC, Main and SSR profiles without SBR), its PTS type is its own
+// (ADEC_CORRECT_PTS_VALUE_TYPE_M2AAC, _SceAdecCorrectPtsValue_Aac), and, its error codes not being known, it answers
+// libadec's own: ARG for parameters StartSeq refuses, BUSY, and FATAL for any unit it cannot decode (the reason
+// logged). Raw data blocks take Main or LC (MPEG-2 has no LTP). RPCS3 runs Sony's modules, so what follows is
+// pspocket's reading, to compare on the Mac:
 // - ADTS: one frame per access unit, its header read here (no sync ADTS_SYNCWORD_ERROR, a layer not 0
 //   INVALID_LAYER_ID, an index past 8 kHz INVALID_SAMP_RATE_INDEX, SSR NOT_SUPPORTED_PROFILE, a frame longer than the
 //   unit END_OF_BITSTREAM); MPEG-2's ID is decoded as MPEG-4's.
@@ -226,7 +231,11 @@ std::pair<u32, std::optional<Pce>> first_element(const u8* p, u32 size)
 
 class Aac final : public Codec {
 public:
-    explicit Aac(u32 max_channels) : max_channels_(max_channels) {}
+    // `mpeg2`: cellM2AACdec's core (libadec's error codes, its own PTS type).
+    Aac(u32 max_channels, bool mpeg2)
+        : max_channels_(max_channels), mpeg2_(mpeg2), name_(mpeg2 ? "MPEG-2 AAC" : "MPEG-4 AAC")
+    {
+    }
 
     s32 start(const u8* param) override
     {
@@ -244,13 +253,13 @@ public:
     Decoded decode(u8* base, u32 au, u32 size, u32 out, u32 bsi) override
     {
         Decoded d;
-        d.pts_type = CORRECT_PTS_M4AAC;
-        const auto fail = [&](u32 code) {
-            d.error = error(code);
+        d.pts_type = mpeg2_ ? CORRECT_PTS_M2AAC : CORRECT_PTS_M4AAC;
+        const auto fail = [&](u32 code) { // MPEG-2 AAC: libadec's FATAL for every unit refused (D-621)
+            d.error = error(mpeg2_ ? CELL_ADEC_ERROR_FATAL : code);
             return d;
         };
         if (!configured_) {
-            PS_LOG_ERROR("cellAdec", "MPEG-4 AAC: a decode without a sequence started with valid parameters");
+            PS_LOG_ERROR("cellAdec", "{}: a decode without a sequence started with valid parameters", name_);
             return fail(CELL_ADEC_ERROR_M4AAC_FATAL);
         }
         ps_write32(base, bsi + info::config_number, config_);
@@ -279,16 +288,17 @@ public:
             core_rate = kRates[sfi];
             d.duration = ticks(1024, core_rate); // a frame refused past here keeps its length
             if (frame_length < 7 || frame_length > size) {
-                PS_LOG_ERROR("cellAdec", "MPEG-4 AAC: an ADTS frame of {} bytes in an access unit of {}", frame_length, size);
+                PS_LOG_ERROR("cellAdec", "{}: an ADTS frame of {} bytes in an access unit of {}", name_, frame_length, size);
                 return fail(CELL_ADEC_ERROR_M4AAC_END_OF_BITSTREAM);
             }
             if (frame_length < size)
-                log_once("AAC longer", std::format("MPEG-4 AAC: an access unit of {} bytes holds more than its {}-byte "
-                    "ADTS frame: the frame is decoded, the rest left", size, frame_length));
+                log_once("AAC longer", std::format("{}: an access unit of {} bytes holds more than its {}-byte ADTS "
+                    "frame: the frame is decoded, the rest left", name_, size, frame_length));
             if (raw_blocks)
-                log_once("AAC raw blocks", "MPEG-4 AAC: ADTS frames of several raw data blocks: FFmpeg decodes the first");
+                log_once("AAC raw blocks", std::format("{}: ADTS frames of several raw data blocks: FFmpeg decodes the "
+                    "first", name_));
             bytes = frame_length;
-            if (!ff_.is_open() && !ff_.open("aac", "MPEG-4 AAC")) return fail(CELL_ADEC_ERROR_M4AAC_FATAL);
+            if (!ff_.is_open() && !ff_.open("aac", name_)) return fail(CELL_ADEC_ERROR_M4AAC_FATAL);
         } else if (config_ == ADIF_HEADER) {
             if (!adif_read_) {
                 const s32 r = read_adif(base, au, size, bsi, bytes);
@@ -308,8 +318,8 @@ public:
                     channel_config = 0;
                     pce = inband;
                 } else if (id != ID_SCE && id != ID_CPE) {
-                    log_once("AAC raw first element", std::format("MPEG-4 AAC: a raw data block whose first element is {}: "
-                        "decoded as mono", id));
+                    log_once("AAC raw first element", std::format("{}: a raw data block whose first element is {}: "
+                        "decoded as mono", name_, id));
                 }
                 const std::vector<u8> asc = audio_specific_config(profile_ + 1, sfi_, channel_config, pce ? &*pce : nullptr);
                 if (!open_with(asc)) return fail(CELL_ADEC_ERROR_M4AAC_FATAL);
@@ -323,7 +333,7 @@ public:
         if (!bytes) return fail(CELL_ADEC_ERROR_M4AAC_END_OF_BITSTREAM);
         pcm_.clear();
         if (const int e = ff_.decode(data, bytes, pcm_, 2048); e < 0 || !pcm_.samples) {
-            PS_LOG_ERROR("cellAdec", "MPEG-4 AAC: FFmpeg refused a frame ({}): the game sent invalid data", e);
+            PS_LOG_ERROR("cellAdec", "{}: FFmpeg refused a frame ({}): the game sent invalid data", name_, e);
             return fail(CELL_ADEC_ERROR_M4AAC_FATAL);
         }
         // The stream's channels by position (FFmpeg's layout).
@@ -360,7 +370,7 @@ public:
 private:
     bool open_with(const std::vector<u8>& asc)
     {
-        return ff_.open("aac", "MPEG-4 AAC", [&](AVCodecContext* av) {
+        return ff_.open("aac", name_, [&](AVCodecContext* av) {
             av->extradata = static_cast<u8*>(av_mallocz(asc.size() + AV_INPUT_BUFFER_PADDING_SIZE));
             std::memcpy(av->extradata, asc.data(), asc.size());
             av->extradata_size = static_cast<int>(asc.size());
@@ -390,7 +400,7 @@ private:
             pces.push_back(read_pce(b, 0));
         }
         if (b.overrun || b.pos() % 8) {
-            PS_LOG_ERROR("cellAdec", "MPEG-4 AAC: an ADIF header past the access unit ({} bytes)", size);
+            PS_LOG_ERROR("cellAdec", "{}: an ADIF header past the access unit ({} bytes)", name_, size);
             return error(CELL_ADEC_ERROR_M4AAC_END_OF_BITSTREAM);
         }
         const Pce* chosen = nullptr;
@@ -398,7 +408,7 @@ private:
             if (p.tag == program_) chosen = &p;
         if (!chosen && program_ < pces.size()) chosen = &pces[program_];
         if (!chosen) {
-            PS_LOG_ERROR("cellAdec", "MPEG-4 AAC: program {} is not in the ADIF header's {}", program_, pces.size());
+            PS_LOG_ERROR("cellAdec", "{}: program {} is not in the ADIF header's {}", name_, program_, pces.size());
             return error(CELL_ADEC_ERROR_M4AAC_PROG_NUMBER_NOT_FOUND);
         }
         if (chosen->object_type == 2) return error(CELL_ADEC_ERROR_M4AAC_NOT_SUPPORTED_PROFILE);
@@ -412,48 +422,9 @@ private:
         return lv2::CELL_OK;
     }
 
-    // To two channels: each side its front at 1, the centre and its surrounds at 0.7071 (the back centre at 0.5 to both),
-    // the LFE left out; each side normalised by its coefficients' sum.
-    static void stereo_downmix(Planar& p)
-    {
-        constexpr float k = 0.70710678f;
-        float gl[16] = {}, gr[16] = {};
-        float sum_l = 0, sum_r = 0;
-        for (u32 c = 0; c < p.channels() && c < 16; c++) {
-            switch (p.ids[c]) {
-            case AV_CHAN_FRONT_LEFT:
-            case AV_CHAN_FRONT_LEFT_OF_CENTER:
-            case AV_CHAN_WIDE_LEFT: gl[c] = 1; break;
-            case AV_CHAN_FRONT_RIGHT:
-            case AV_CHAN_FRONT_RIGHT_OF_CENTER:
-            case AV_CHAN_WIDE_RIGHT: gr[c] = 1; break;
-            case AV_CHAN_FRONT_CENTER: gl[c] = gr[c] = k; break;
-            case AV_CHAN_BACK_LEFT:
-            case AV_CHAN_SIDE_LEFT: gl[c] = k; break;
-            case AV_CHAN_BACK_RIGHT:
-            case AV_CHAN_SIDE_RIGHT: gr[c] = k; break;
-            case AV_CHAN_BACK_CENTER: gl[c] = gr[c] = 0.5f; break;
-            default: break; // the LFE and anything else: left out
-            }
-            sum_l += gl[c];
-            sum_r += gr[c];
-        }
-        Planar s;
-        s.ch.assign(2, std::vector<float>(p.samples, 0.0f));
-        s.ids = {AV_CHAN_FRONT_LEFT, AV_CHAN_FRONT_RIGHT};
-        s.samples = p.samples;
-        s.rate = p.rate;
-        for (u32 c = 0; c < p.channels() && c < 16; c++) {
-            const float l = gl[c] / std::max(sum_l, 1.0f), r = gr[c] / std::max(sum_r, 1.0f);
-            for (u32 i = 0; i < p.samples; i++) {
-                s.ch[0][i] += l * p.ch[c][i];
-                s.ch[1][i] += r * p.ch[c][i];
-            }
-        }
-        p = std::move(s);
-    }
-
     u32 max_channels_;
+    bool mpeg2_;
+    std::string_view name_;
     FfDecoder ff_;
     Planar pcm_;
     u32 config_ = ADTS_HEADER, program_ = 0, sfi_ = 3, profile_ = 1;
@@ -463,27 +434,33 @@ private:
 };
 
 // cellAdecStartSeq: the configuration's type; for raw blocks a sampling frequency index and a profile FFmpeg decodes
-// (Main, LC, LTP: not SSR); enableDownmix a flag.
-s32 check(const u8* param)
+// (Main, LC, LTP: not SSR; MPEG-2 AAC Main or LC); enableDownmix a flag.
+s32 check_params(const u8* param, bool mpeg2)
 {
     const u32 config = ps_ld32(param), a = ps_ld32(param + 4), profile = ps_ld32(param + 8), downmix = ps_ld32(param + 12);
     bool ok = config <= RAW_DATA_BLOCK_ONLY && downmix <= 1;
-    if (ok && config == RAW_DATA_BLOCK_ONLY) ok = a < 12 && profile <= 3 && profile != 2;
+    if (ok && config == RAW_DATA_BLOCK_ONLY) ok = a < 12 && (mpeg2 ? profile <= 1 : profile <= 3 && profile != 2);
     if (ok) return lv2::CELL_OK;
-    PS_LOG_ERROR("cellAdec", "MPEG-4 AAC: parameters config {}, {:#x}, profile {}, downmix {}", config, a, profile, downmix);
-    return error(CELL_ADEC_ERROR_M4AAC_ARG);
+    PS_LOG_ERROR("cellAdec", "{}: parameters config {}, {:#x}, profile {}, downmix {}", mpeg2 ? "MPEG-2 AAC" : "MPEG-4 AAC",
+        config, a, profile, downmix);
+    return error(mpeg2 ? u32{CELL_ADEC_ERROR_ARG} : u32{CELL_ADEC_ERROR_M4AAC_ARG});
 }
+s32 check(const u8* param) { return check_params(param, false); }
+s32 check_m2(const u8* param) { return check_params(param, true); }
 
 } // namespace
 
 // The cores' versions are not known (pspocket's word); the information block is CellAdecM4AacInfo's size. Up to 8
 // channels of 2048 samples (SBR's) for the full core, 2 for the others.
 const Spec kM4Aac = {CELL_ADEC_TYPE_M4AAC, "MPEG-4 AAC", 16, info::size, 2048 * 8 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8)); }};
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8, false)); }};
 const Spec kM4Aac2ch = {CELL_ADEC_TYPE_M4AAC_2CH, "MPEG-4 AAC 2ch", 16, info::size, 2048 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2)); }};
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }};
 const Spec kM4Aac2chMod = {CELL_ADEC_TYPE_M4AAC_2CH_MOD, "MPEG-4 AAC 2ch mod", 16, info::size, 2048 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2)); }};
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }};
+// MPEG-2 AAC (D-621): MPEG-4 AAC's parameters and information block, libadec's error codes.
+const Spec kM2Aac = {CELL_ADEC_TYPE_M2AAC, "MPEG-2 AAC", 16, info::size, 2048 * 8 * 4, 0x01000000, CELL_ADEC_ERROR_BUSY,
+    check_m2, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8, true)); }};
 
 } // namespace pspocket::hle::adec::ffcore
 

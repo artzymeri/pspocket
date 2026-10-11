@@ -17,8 +17,9 @@
 //   compression modes CONSTANT_QUALITY 0, STREAM_SIZE_LIMIT 1. The DCT methods are RPCS3's (QUALITY 0, FAST 5, as
 //   libjpgdec's methods are).
 // pspocket's, as cellPngEnc (D-566) has it: the handle is the work memory the game gives Open (nothing is written
-// there); EncodePicture encodes on the calling thread and queues the result, at most 4 waiting (then BUSY);
-// WaitForInput, WaitForOutput, GetStreamInfo and Reset as cellPngEnc's.
+// there); EncodePicture encodes on the calling thread and queues the result, at most 4 waiting or being encoded (then
+// BUSY; a picture takes its place before it is encoded, so threads encoding at once cannot pass the depth, and a Reset
+// or Close meanwhile drops it unwritten, D-651); WaitForInput, WaitForOutput, GetStreamInfo and Reset as cellPngEnc's.
 
 #include <algorithm>
 #include <cstring>
@@ -97,12 +98,15 @@ struct Result {
 struct Encoder {
     Config cfg;
     std::deque<Result> results;
+    u32 encoding = 0; // pictures being encoded on their callers' threads, each holding its place in the queue (D-651)
     u64 resets = 0;
+    u64 serial = 0; // the Open that made it: a picture whose encoder was closed meanwhile is not another's
 };
 
 struct State {
     std::mutex mutex;
     std::map<u32, Encoder> encoders; // by handle (the work memory)
+    u64 opened = 0;                  // encoders opened, for their serials
     bool spu_logged = false;
 };
 
@@ -314,7 +318,8 @@ s32 open(PPUContext& ctx, u32 config, u32 resource, u32 handle, bool ex)
     if (!mem || !size || !priorities || size < mem_size(c)) return error(CELL_JPGENC_ERROR_ARG);
     State& s = state();
     std::lock_guard lock(s.mutex);
-    if (!s.encoders.try_emplace(mem, Encoder{c, {}, 0}).second) return error(CELL_JPGENC_ERROR_ARG); // already open
+    if (s.encoders.contains(mem)) return error(CELL_JPGENC_ERROR_ARG); // already open
+    s.encoders.emplace(mem, Encoder{c, {}, 0, 0, ++s.opened});
     ps_write32(base, handle, mem);
     PS_LOG_INFO(kChan, "cellJpgEncOpen{}: handle {:#x}, up to {}x{}", ex ? "Ex" : "", mem, c.max_w, c.max_h);
     return lv2::CELL_OK;
@@ -349,7 +354,7 @@ s32 cellJpgEncReset(PPUContext&, u32 handle)
     return lv2::CELL_OK;
 }
 
-// cellJpgEncWaitForInput(handle, bool block): room for a picture (fewer than 4 results waiting).
+// cellJpgEncWaitForInput(handle, bool block): room for a picture (fewer than 4 results waiting or being encoded).
 s32 cellJpgEncWaitForInput(PPUContext& ctx, u32 handle, u32 block)
 {
     State& s = state();
@@ -358,7 +363,7 @@ s32 cellJpgEncWaitForInput(PPUContext& ctx, u32 handle, u32 block)
             std::lock_guard lock(s.mutex);
             const auto e = s.encoders.find(handle);
             if (!handle || e == s.encoders.end()) return error(CELL_JPGENC_ERROR_ARG);
-            if (e->second.results.size() < kQueueDepth) return lv2::CELL_OK;
+            if (e->second.results.size() + e->second.encoding < kQueueDepth) return lv2::CELL_OK;
             if (!(block & 0xFF)) return error(CELL_JPGENC_ERROR_BUSY);
         }
         nap(ctx);
@@ -403,17 +408,23 @@ std::vector<u8> compress(const jpeg::Planes& planes, jpeg::EncodeSettings settin
 // limitSize}. encodeColorSpace GRAYSCALE gives a gray JPEG, the other colour spaces a YCbCr one (JFIF) at the
 // sampling format's chroma (FULL as 4:4:4); compressionModeParam is the quality (1 to 100), in the stream size limit
 // mode the highest, lowered until the stream fits limitSize. Inferred (D-616).
+// The queue (D-651): the picture takes its place in the queue (BUSY when 4 results wait or are being encoded) before it
+// is encoded outside the lock, then its output is written and its result queued in one step under the lock, unless a
+// Reset or Close came meanwhile: then it is dropped, nothing written, as the queue it was in. So threads encoding with
+// one encoder at once never queue more than 4, and nothing of a picture taken before a Reset appears after it.
 s32 encode_picture(PPUContext& ctx, u32 handle, u32 picture, u32 param, u32 output, bool two)
 {
     const char* call = two ? "cellJpgEncEncodePicture2" : "cellJpgEncEncodePicture";
     u8* base = gb(ctx);
     State& s = state();
     Config c;
+    u64 serial = 0;
     {
         std::lock_guard lock(s.mutex);
         const auto e = s.encoders.find(handle);
         if (!handle || e == s.encoders.end()) return error(CELL_JPGENC_ERROR_ARG);
         c = e->second.cfg;
+        serial = e->second.serial;
     }
     if (!picture || !in_guest(ctx, picture, 32) || !param || !in_guest(ctx, param, 24) || !output ||
         !in_guest(ctx, output, 16))
@@ -445,21 +456,32 @@ s32 encode_picture(PPUContext& ctx, u32 handle, u32 picture, u32 param, u32 outp
             location);
         return error(CELL_JPGENC_ERROR_ARG);
     }
+    u64 resets = 0;
     {
         std::lock_guard lock(s.mutex);
         const auto e = s.encoders.find(handle);
-        if (e == s.encoders.end()) return error(CELL_JPGENC_ERROR_ARG);
-        if (e->second.results.size() >= kQueueDepth) return error(CELL_JPGENC_ERROR_BUSY);
+        if (e == s.encoders.end() || e->second.serial != serial) return error(CELL_JPGENC_ERROR_ARG);
+        if (e->second.results.size() + e->second.encoding >= kQueueDepth) return error(CELL_JPGENC_ERROR_BUSY);
+        e->second.encoding++;
+        resets = e->second.resets;
         if (spu && !s.spu_logged) PS_LOG_INFO(kChan, "{}: encoded on the calling thread, not on SPUs (logged once)", call);
         s.spu_logged = s.spu_logged || spu;
     }
+    // The place, given back with the result or without it, also when the process ends meanwhile.
+    struct Place {
+        State& s;
+        u32 handle;
+        u64 serial;
+        bool held = true;
+        ~Place()
+        {
+            if (!held) return;
+            std::lock_guard lock(s.mutex);
+            if (const auto e = s.encoders.find(handle); e != s.encoders.end() && e->second.serial == serial)
+                e->second.encoding--;
+        }
+    } place{s, handle, serial};
 
-    Result r;
-    r.location = location;
-    r.file_name = location == LOCATION_FILE ? file_name : 0;
-    r.addr = location == LOCATION_BUFFER ? stream : 0;
-    r.limit = limit;
-    r.user_data = p.user_data;
     jpeg::EncodeSettings settings;
     settings.quality = static_cast<int>(quality);
     settings.fast = method == DCT_FAST;
@@ -470,6 +492,19 @@ s32 encode_picture(PPUContext& ctx, u32 handle, u32 picture, u32 param, u32 outp
     bool fits = true;
     const std::vector<u8> jpg =
         compress(planes_of(base, p, space == GRAYSCALE), settings, mode == STREAM_SIZE_LIMIT, limit, fits);
+
+    std::lock_guard lock(s.mutex);
+    place.held = false;
+    const auto e = s.encoders.find(handle);
+    if (e == s.encoders.end() || e->second.serial != serial) return error(CELL_JPGENC_ERROR_ARG); // closed meanwhile
+    e->second.encoding--;
+    if (e->second.resets != resets) return lv2::CELL_OK; // reset meanwhile: dropped with the queue, nothing written
+    Result r;
+    r.location = location;
+    r.file_name = location == LOCATION_FILE ? file_name : 0;
+    r.addr = location == LOCATION_BUFFER ? stream : 0;
+    r.limit = limit;
+    r.user_data = p.user_data;
     if (jpg.empty()) {
         r.state = error(CELL_JPGENC_ERROR_STREAM_ABORT);
     } else {
@@ -488,9 +523,6 @@ s32 encode_picture(PPUContext& ctx, u32 handle, u32 picture, u32 param, u32 outp
         }
         if (!r.state && (!fits || n < jpg.size())) r.state = error(CELL_JPGENC_ERROR_STREAM_OVERFLOW);
     }
-    std::lock_guard lock(s.mutex);
-    const auto e = s.encoders.find(handle);
-    if (e == s.encoders.end()) return error(CELL_JPGENC_ERROR_ARG); // closed meanwhile
     e->second.results.push_back(r);
     return lv2::CELL_OK;
 }

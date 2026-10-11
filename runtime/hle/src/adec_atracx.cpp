@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <string_view>
 
 #include "adec.hpp"
@@ -427,26 +428,52 @@ void decode_au(PPUContext& ctx, u32 h, Decoder& d, const Cmd& cmd)
     notify.pcm_out(cmd.pcm_handle, output, output_size, bsi.addr(), pts_type, err);
 }
 
-// The thread's run_thread check (RPCS3: the decoder stops at the next command once Close cleared it).
+// Whether the context at `h` is still the calling thread's (D-645): `r`, the answer of the call just made on its
+// mutexes or conditions, is CELL_OK, and its first word names the thread (open writes the ID there before it starts the
+// thread). The context is the game's memory, and a game can overwrite it while the decoder is open: a damaged file's
+// PCM run past its buffer onto it (the cellAtrac fuzzing's), memory used again after a close cellAdec refused.
+// libatxdec's thread would go on with what is there then (RPCS3 ensure()s each call and stops the emulator): a lock and
+// a wait that fail at once, round and round, past the process's end, or the queue of another decoder opened in the same
+// place, taking its commands. This one ends instead, logged; a thread waiting on its own condition when the context
+// goes stays so, as on a PS3, until the process ends.
+bool own_context(PPUContext& ctx, u32 h, s32 r, std::string_view what)
+{
+    const u32 self = thread(ctx).id;
+    const u64 named = ps_read64(guest_base(ctx), h + ax::thread_id);
+    if (r == lv2::CELL_OK && named == self) return true;
+    const std::string answer =
+        r == lv2::CELL_OK ? "" : std::format("; {} answered {:#010x}", what, static_cast<u32>(r));
+    PS_LOG_ERROR(kChan, "ATRAC3plus decoder {:#x}: its context is no longer its own (it names thread {:#x}{}): the "
+        "game overwrote it while the decoder was open; the decoder's thread {:#x} ends", h, named, answer, self);
+    return false;
+}
+
+// The thread's run_thread check (RPCS3: the decoder stops at the next command once Close cleared it); false too when
+// the context is no longer the thread's (D-645).
 bool still_running(PPUContext& ctx, u32 h)
 {
-    lock(ctx, h, ax::run_thread_mutex);
-    const bool run = ps_read32(guest_base(ctx), h + ax::run_thread) != 0;
-    unlock(ctx, h, ax::run_thread_mutex);
+    const s32 r = lock(ctx, h, ax::run_thread_mutex);
+    const bool run = own_context(ctx, h, r, "run_thread's mutex") && ps_read32(guest_base(ctx), h + ax::run_thread);
+    if (r == lv2::CELL_OK) unlock(ctx, h, ax::run_thread_mutex);
     return run;
 }
 
-// RPCS3 AtracXdecContext::exec.
+// RPCS3 AtracXdecContext::exec. Its context lost (own_context), the thread ends where RPCS3's ensure()s would stop.
 void run(PPUContext& ctx, u32 h)
 {
     u8* base = guest_base(ctx);
     const std::shared_ptr<Decoder> d = decoder_of(h);
     for (;;) {
         for (;;) {
-            lock(ctx, h, ax::queue_mutex);
+            const s32 r = lock(ctx, h, ax::queue_mutex);
+            if (!own_context(ctx, h, r, "the queue's mutex")) {
+                if (r == lv2::CELL_OK) unlock(ctx, h, ax::queue_mutex);
+                return;
+            }
             if (ps_read32(base, h + ax::cmd_size) != 0) break;
-            wait(ctx, h, ax::queue_not_empty);
+            const s32 w = wait(ctx, h, ax::queue_not_empty);
             unlock(ctx, h, ax::queue_mutex);
+            if (!own_context(ctx, h, w, "the queue's condition")) return;
         }
         const u32 front = ps_read32(base, h + ax::cmd_front);
         const u32 param_at = cmd_at(h, front) + ax::c_param;
@@ -470,10 +497,11 @@ void run(PPUContext& ctx, u32 h)
         }
         case END_SEQ: CoreNotifier(ctx, h, kSlots).seq_done(); break;
         case DECODE_AU: {
-            lock(ctx, h, ax::output_mutex);
-            while (ps_read32(base, h + ax::output_locked)) wait(ctx, h, ax::output_consumed);
-            if (!still_running(ctx, h)) {
-                unlock(ctx, h, ax::output_mutex);
+            const s32 locked = lock(ctx, h, ax::output_mutex);
+            s32 r = locked;
+            while (r == lv2::CELL_OK && ps_read32(base, h + ax::output_locked)) r = wait(ctx, h, ax::output_consumed);
+            if (!own_context(ctx, h, r, "the output's mutex or condition") || !still_running(ctx, h)) {
+                if (locked == lv2::CELL_OK) unlock(ctx, h, ax::output_mutex);
                 return;
             }
             decode_au(ctx, h, *d, cmd);

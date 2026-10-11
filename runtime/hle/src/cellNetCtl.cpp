@@ -15,11 +15,23 @@
 // events from a helper thread 500 ms after the load; here the first cellSysutilCheckCallback at least 500 ms after it
 // sends them (sysutil_queue_call), so they reach the callbacks registered by then at the check after that, and no
 // host thread outlives the process.
+//
+// pspocket's own where RPCS3 has todos with no arguments (D-670), unverified (D-594; libnetctl is always native, so the
+// marker only records that no Sony module was compared): the game-internal forms (cellNetCtl*GameInt) answer as the
+// public forms do for this offline network. GetState, GetInfo, AddHandler and DelHandler take the public forms'
+// arguments; their interface is disconnected, its handlers kept (four, IDs 0 to 3, written to *hid as the SDK's
+// AddHandler does) and never called. Connect answers NOT_CONNECTED (no link comes up), Disconnect CELL_OK (it is not
+// connected), Scan CELL_OK with nothing found and GetScanInfo CELL_OK with nothing written: their arguments are not
+// known, so they are logged, not read. The game update's Init and Term bracket it (ALREADY_INITIALIZED,
+// NOT_INITIALIZED), and CheckAbort aborts a check started and not yet answered (its callback then hears ABORTED),
+// NOT_START with none.
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <format>
+#include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -38,12 +50,18 @@ constexpr std::string_view kChan = "cellNetCtl";
 enum : u32 {
     CELL_NET_CTL_ERROR_NOT_INITIALIZED = 0x80130101,
     CELL_NET_CTL_ERROR_NOT_TERMINATED = 0x80130102,
+    CELL_NET_CTL_ERROR_HANDLER_MAX = 0x80130103,
+    CELL_NET_CTL_ERROR_ID_NOT_FOUND = 0x80130104,
     CELL_NET_CTL_ERROR_INVALID_ID = 0x80130105,
     CELL_NET_CTL_ERROR_INVALID_ADDR = 0x80130107,
     CELL_NET_CTL_ERROR_NOT_CONNECTED = 0x80130108,
     CELL_NET_CTL_ERROR_INVALID_TYPE = 0x8013010a,
     CELL_NET_CTL_ERROR_INVALID_SIZE = 0x8013010b,
     CELL_NET_CTL_ERROR_DIALOG_CANCELED = 0x80130190,
+
+    CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED = 0x8002cc01,
+    CELL_GAMEUPDATE_ERROR_ALREADY_INITIALIZED = 0x8002cc02,
+    CELL_GAMEUPDATE_ERROR_NOT_START = 0x8002cc08,
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 constexpr s32 CELL_NET_CTL_STATE_Disconnected = 0;
@@ -53,10 +71,16 @@ std::string result_name(s32 r)
     switch (static_cast<u32>(r)) {
     case 0: return "CELL_OK";
     case CELL_NET_CTL_ERROR_NOT_INITIALIZED: return "CELL_NET_CTL_ERROR_NOT_INITIALIZED";
+    case CELL_NET_CTL_ERROR_HANDLER_MAX: return "CELL_NET_CTL_ERROR_HANDLER_MAX";
+    case CELL_NET_CTL_ERROR_ID_NOT_FOUND: return "CELL_NET_CTL_ERROR_ID_NOT_FOUND";
+    case CELL_NET_CTL_ERROR_INVALID_ID: return "CELL_NET_CTL_ERROR_INVALID_ID";
     case CELL_NET_CTL_ERROR_INVALID_ADDR: return "CELL_NET_CTL_ERROR_INVALID_ADDR";
     case CELL_NET_CTL_ERROR_NOT_CONNECTED: return "CELL_NET_CTL_ERROR_NOT_CONNECTED";
     case CELL_NET_CTL_ERROR_INVALID_TYPE: return "CELL_NET_CTL_ERROR_INVALID_TYPE";
     case CELL_NET_CTL_ERROR_INVALID_SIZE: return "CELL_NET_CTL_ERROR_INVALID_SIZE";
+    case CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED: return "CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED";
+    case CELL_GAMEUPDATE_ERROR_ALREADY_INITIALIZED: return "CELL_GAMEUPDATE_ERROR_ALREADY_INITIALIZED";
+    case CELL_GAMEUPDATE_ERROR_NOT_START: return "CELL_GAMEUPDATE_ERROR_NOT_START";
     }
     return std::format("{:#010x}", static_cast<u32>(r));
 }
@@ -88,13 +112,39 @@ constexpr u64 CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED = 0x0803;
 // registers its sysutil callback after cellNetCtlNetStartDialogLoadAsync).
 constexpr auto kNetStartDelay = std::chrono::milliseconds(500);
 
+// The game-internal interface's handler slots (D-670): four, IDs 0 to 3, as cellNetCtlDelHandler's check (RPCS3: an
+// ID above 3 is INVALID_ID) has the public ones.
+constexpr u32 kHandlerSlots = 4;
+
+// The game-internal forms whose calls are logged by count (D-670), each's first kInfoCalls at info.
+enum class GameInt : u8 { AddHandler, DelHandler, Connect, Disconnect, GetInfo, GetScanInfo, GetState, Scan, Count };
+constexpr u32 kInfoCalls = 4;
+
 struct NetCtlState {
     std::atomic<bool> initialized{false};
     // cellNetCtlGetInfo codes already logged at info (RPCS3 logs most codes once).
     std::array<std::atomic<bool>, kInfoNames.size()> info_logged{};
+    std::array<std::atomic<u32>, static_cast<usize>(GameInt::Count)> gameint_calls{};
+    // The game-internal interface's handlers: {handler, arg} where `used`. Never called: the interface stays
+    // disconnected. cellNetCtlTerm forgets them.
+    struct Handler {
+        bool used = false;
+        u32 handler = 0, arg = 0;
+    };
+    std::mutex mutex;
+    std::array<Handler, kHandlerSlots> gameint_handlers{};
 };
 
 NetCtlState& netctl() { return HleProcess::current()->state<NetCtlState>(); }
+
+// A game-internal form's log line: its first calls at info (a warning for an error), later ones at debug.
+s32 gameint_logged(GameInt fn, s32 r, std::string_view call)
+{
+    const u32 n = netctl().gameint_calls[static_cast<usize>(fn)].fetch_add(1, std::memory_order_relaxed);
+    const log::Level level = n >= kInfoCalls ? log::Level::Debug : r < 0 ? log::Level::Warn : log::Level::Info;
+    log::print(level, kChan, "{}: {}", call, result_name(r));
+    return r;
+}
 
 // Whether [addr, addr + size) is guest memory; if not, the call site is logged (D-042: RPCS3 would fault).
 bool usable(PPUContext& ctx, u32 addr, u32 size, std::string_view what)
@@ -111,7 +161,14 @@ s32 cellNetCtlInit(PPUContext&)
     return lv2::CELL_OK;
 }
 
-void cellNetCtlTerm(PPUContext&) { netctl().initialized = false; }
+// The game-internal interface's handlers go with the library (D-670).
+void cellNetCtlTerm(PPUContext&)
+{
+    NetCtlState& s = netctl();
+    s.initialized = false;
+    std::lock_guard lock(s.mutex);
+    s.gameint_handlers = {};
+}
 
 s32 cellNetCtlGetState(PPUContext& ctx, u32 state)
 {
@@ -140,26 +197,29 @@ s32 cellNetCtlDelHandler(PPUContext&, s32 hid)
 
 // cellNetCtlGetInfo(code, CellNetCtlInfo* info): the Ethernet address (6 bytes; the union's 2 padding bytes are not
 // written) whatever the state; every other code, known or not, needs a connection. The first call with each code is
-// logged at info, later ones at debug.
-s32 cellNetCtlGetInfo(PPUContext& ctx, s32 code, u32 info)
+// logged at info, later ones at debug. The game-internal form (cellNetCtlGetInfoGameInt, D-670) answers the same.
+s32 get_info(PPUContext& ctx, std::string_view name, s32 code, u32 info)
 {
     NetCtlState& s = netctl();
     const bool known = code >= 0 && static_cast<usize>(code) < kInfoNames.size();
     const bool first = !known || !s.info_logged[static_cast<usize>(code)].exchange(true);
     const auto done = [&](s32 r) {
-        log::print(first ? log::Level::Info : log::Level::Debug, kChan, "cellNetCtlGetInfo({:#x} {}, info {:#x}): {}",
-            code, known ? kInfoNames[static_cast<usize>(code)] : "?", info, result_name(r));
+        log::print(first ? log::Level::Info : log::Level::Debug, kChan, "{}({:#x} {}, info {:#x}): {}", name, code,
+            known ? kInfoNames[static_cast<usize>(code)] : "?", info, result_name(r));
         return r;
     };
     if (!s.initialized) return done(error(CELL_NET_CTL_ERROR_NOT_INITIALIZED));
     if (!info) return done(error(CELL_NET_CTL_ERROR_INVALID_ADDR));
     if (code != CELL_NET_CTL_INFO_ETHER_ADDR) return done(error(CELL_NET_CTL_ERROR_NOT_CONNECTED));
     constexpr u32 kEtherAddrSize = static_cast<u32>(kEtherAddr.size());
-    if (!usable(ctx, info, kEtherAddrSize, "cellNetCtlGetInfo: info")) return error(CELL_NET_CTL_ERROR_INVALID_ADDR);
+    if (!usable(ctx, info, kEtherAddrSize, std::format("{}: info", name)))
+        return error(CELL_NET_CTL_ERROR_INVALID_ADDR);
     u8* base = guest_base(ctx);
     for (u32 i = 0; i < kEtherAddrSize; i++) ps_write8(base, info + i, kEtherAddr[i]);
     return done(lv2::CELL_OK);
 }
+
+s32 cellNetCtlGetInfo(PPUContext& ctx, s32 code, u32 info) { return get_info(ctx, "cellNetCtlGetInfo", code, info); }
 
 // cellNetCtlGetNatInfo(CellNetCtlNatInfo*): RPCS3 answers NAT type 2 with STUN OK even without a network, and its UPnP
 // status (not in use). The mapped address is not written.
@@ -250,25 +310,153 @@ s32 cellNetCtlNetStartDialogAbortAsync(PPUContext&)
     return r;
 }
 
-// ---- game update checks (RPCS3: they need no cellGameUpdateInit and check nothing)
+// ---- the game-internal forms (D-670): the public forms' answers for this offline network
 
-constexpr s32 CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE = 0, CELL_GAMEUPDATE_RESULT_STATUS_FINISHED = 5;
+// cellNetCtlGetStateGameInt(s32* state): Disconnected, as cellNetCtlGetState.
+s32 cellNetCtlGetStateGameInt(PPUContext& ctx, u32 state)
+{
+    const std::string call = std::format("cellNetCtlGetStateGameInt({:#x})", state);
+    if (!netctl().initialized)
+        return gameint_logged(GameInt::GetState, error(CELL_NET_CTL_ERROR_NOT_INITIALIZED), call);
+    if (!state || !usable(ctx, state, 4, "cellNetCtlGetStateGameInt: state"))
+        return gameint_logged(GameInt::GetState, error(CELL_NET_CTL_ERROR_INVALID_ADDR), call);
+    ps_write32(guest_base(ctx), state, static_cast<u32>(CELL_NET_CTL_STATE_Disconnected));
+    return gameint_logged(GameInt::GetState, lv2::CELL_OK, call + ": Disconnected");
+}
+
+s32 cellNetCtlGetInfoGameInt(PPUContext& ctx, s32 code, u32 info)
+{
+    return get_info(ctx, "cellNetCtlGetInfoGameInt", code, info);
+}
+
+// cellNetCtlAddHandlerGameInt(handler, arg, s32* hid): the lowest free of four slots, its ID written; HANDLER_MAX when
+// all four are taken. The handler is kept and never called: the interface never changes state.
+s32 cellNetCtlAddHandlerGameInt(PPUContext& ctx, u32 handler, u32 arg, u32 hid)
+{
+    const std::string call =
+        std::format("cellNetCtlAddHandlerGameInt(handler {:#x}, arg {:#x}, hid {:#x})", handler, arg, hid);
+    NetCtlState& s = netctl();
+    if (!s.initialized) return gameint_logged(GameInt::AddHandler, error(CELL_NET_CTL_ERROR_NOT_INITIALIZED), call);
+    if (!hid || !usable(ctx, hid, 4, "cellNetCtlAddHandlerGameInt: hid"))
+        return gameint_logged(GameInt::AddHandler, error(CELL_NET_CTL_ERROR_INVALID_ADDR), call);
+    std::lock_guard lock(s.mutex);
+    for (u32 id = 0; id < kHandlerSlots; id++) {
+        NetCtlState::Handler& h = s.gameint_handlers[id];
+        if (h.used) continue;
+        h = {true, handler, arg};
+        ps_write32(guest_base(ctx), hid, id);
+        return gameint_logged(GameInt::AddHandler, lv2::CELL_OK,
+            call + std::format(": handler {} (never called: the interface stays disconnected)", id));
+    }
+    return gameint_logged(GameInt::AddHandler, error(CELL_NET_CTL_ERROR_HANDLER_MAX), call);
+}
+
+// cellNetCtlDelHandlerGameInt(hid): an ID outside 0 to 3 is INVALID_ID (the public form's check, which a negative ID
+// fails here too), a free slot ID_NOT_FOUND.
+s32 cellNetCtlDelHandlerGameInt(PPUContext&, s32 hid)
+{
+    const std::string call = std::format("cellNetCtlDelHandlerGameInt({})", hid);
+    NetCtlState& s = netctl();
+    if (!s.initialized) return gameint_logged(GameInt::DelHandler, error(CELL_NET_CTL_ERROR_NOT_INITIALIZED), call);
+    if (hid < 0 || hid >= static_cast<s32>(kHandlerSlots))
+        return gameint_logged(GameInt::DelHandler, error(CELL_NET_CTL_ERROR_INVALID_ID), call);
+    std::lock_guard lock(s.mutex);
+    NetCtlState::Handler& h = s.gameint_handlers[static_cast<usize>(hid)];
+    if (!h.used) return gameint_logged(GameInt::DelHandler, error(CELL_NET_CTL_ERROR_ID_NOT_FOUND), call);
+    h = {};
+    return gameint_logged(GameInt::DelHandler, lv2::CELL_OK, call);
+}
+
+// The calls whose arguments are not known: logged as the registers the game passed, not read.
+std::string registers(std::string_view name, const PPUContext& ctx)
+{
+    return std::format("{}(r3 {:#x}, r4 {:#x}, r5 {:#x})", name, ctx.gpr[3], ctx.gpr[4], ctx.gpr[5]);
+}
+
+// No link comes up: the network is disconnected (D-024), as cellNetAoiStart answers (D-635).
+s32 cellNetCtlConnectGameInt(PPUContext& ctx)
+{
+    const std::string call = registers("cellNetCtlConnectGameInt", ctx);
+    if (!netctl().initialized) return gameint_logged(GameInt::Connect, error(CELL_NET_CTL_ERROR_NOT_INITIALIZED), call);
+    return gameint_logged(GameInt::Connect, error(CELL_NET_CTL_ERROR_NOT_CONNECTED),
+        call + ": no network to connect to");
+}
+
+// Not connected, so there is nothing to disconnect: the interface is as the call asks.
+s32 cellNetCtlDisconnectGameInt(PPUContext& ctx)
+{
+    const std::string call = registers("cellNetCtlDisconnectGameInt", ctx);
+    if (!netctl().initialized)
+        return gameint_logged(GameInt::Disconnect, error(CELL_NET_CTL_ERROR_NOT_INITIALIZED), call);
+    return gameint_logged(GameInt::Disconnect, lv2::CELL_OK, call + ": not connected");
+}
+
+// A scan for networks finds none at once (no wireless LAN); its results are none, and nothing is written.
+s32 cellNetCtlScanGameInt(PPUContext& ctx)
+{
+    const std::string call = registers("cellNetCtlScanGameInt", ctx);
+    if (!netctl().initialized) return gameint_logged(GameInt::Scan, error(CELL_NET_CTL_ERROR_NOT_INITIALIZED), call);
+    return gameint_logged(GameInt::Scan, lv2::CELL_OK, call + ": no networks");
+}
+
+s32 cellNetCtlGetScanInfoGameInt(PPUContext& ctx)
+{
+    const std::string call = registers("cellNetCtlGetScanInfoGameInt", ctx);
+    if (!netctl().initialized)
+        return gameint_logged(GameInt::GetScanInfo, error(CELL_NET_CTL_ERROR_NOT_INITIALIZED), call);
+    return gameint_logged(GameInt::GetScanInfo, lv2::CELL_OK, call + ": no networks, nothing written");
+}
+
+// ---- game update checks (RPCS3: they need no cellGameUpdateInit and check nothing)
+//
+// D-670: cellGameUpdateInit and Term bracket the utility. A check (StartAsync, StartWithoutDialogAsync and their Ex
+// forms) is in progress from its start until its callback is called; cellGameUpdateCheckAbort aborts the checks in
+// progress, whose callbacks then hear ABORTED rather than NO_UPDATE. The checks themselves still need no Init (RPCS3's,
+// which games run on today).
+
+constexpr s32 CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE = 0, CELL_GAMEUPDATE_RESULT_STATUS_FINISHED = 5,
+              CELL_GAMEUPDATE_RESULT_STATUS_ABORTED = 6;
 constexpr u32 kGameUpdateResultSize = 16; // CellGameUpdateResult: be s32 status, error_code; char app_ver[6]; pad[2]
 
+struct GameUpdateState {
+    std::mutex mutex;
+    bool initialized = false;
+    u64 next_check = 1;
+    std::set<u64> running; // checks started whose callbacks have not been called
+    std::set<u64> aborted; // those of them cellGameUpdateCheckAbort aborted
+};
+
+GameUpdateState& game_update_state() { return HleProcess::current()->state<GameUpdateState>(); }
+
 // The callback, from the next cellSysutilCheckCallback: (status, error 0, userdata), or for the Ex functions
-// (CellGameUpdateResult*, userdata).
-s32 game_update(const char* fn, u32 func, u32 userdata, s32 status, bool ex)
+// (CellGameUpdateResult*, userdata). A start's status is NO_UPDATE (ABORTED once aborted), a finish's FINISHED.
+s32 game_update(const char* fn, u32 func, u32 userdata, bool start, bool ex)
 {
+    const s32 status = start ? CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE : CELL_GAMEUPDATE_RESULT_STATUS_FINISHED;
     PS_LOG_INFO(kChan, "{}(func {:#x}, userdata {:#x}): no update server; status {}", fn, func, userdata, status);
     if (!func) return lv2::CELL_OK; // RPCS3 would call address 0
+    u64 check = 0;
+    if (start) {
+        GameUpdateState& u = game_update_state();
+        std::lock_guard lock(u.mutex);
+        check = u.next_check++;
+        u.running.insert(check);
+    }
     sysutil_queue_call([=](PPUContext& ctx) -> s32 {
+        s32 answer = status;
+        if (check) {
+            GameUpdateState& u = game_update_state();
+            std::lock_guard lock(u.mutex);
+            u.running.erase(check);
+            if (u.aborted.erase(check)) answer = CELL_GAMEUPDATE_RESULT_STATUS_ABORTED;
+        }
         if (!ex) {
-            call_guest(ctx, func, {static_cast<u64>(status), 0, userdata});
+            call_guest(ctx, func, {static_cast<u64>(answer), 0, userdata});
             return lv2::CELL_OK;
         }
         u8* base = guest_base(ctx);
         StackVar result(ctx, base, kGameUpdateResultSize);
-        ps_write32(base, result.addr(), static_cast<u32>(status));
+        ps_write32(base, result.addr(), static_cast<u32>(answer));
         call_guest(ctx, func, {result.addr(), userdata});
         return lv2::CELL_OK;
     });
@@ -277,34 +465,74 @@ s32 game_update(const char* fn, u32 func, u32 userdata, s32 status, bool ex)
 
 s32 cellGameUpdateCheckStartAsync(PPUContext&, u32, u32 func, u32 userdata)
 {
-    return game_update("cellGameUpdateCheckStartAsync", func, userdata, CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE, false);
+    return game_update("cellGameUpdateCheckStartAsync", func, userdata, true, false);
 }
 
 s32 cellGameUpdateCheckStartAsyncEx(PPUContext&, u32, u32 func, u32 userdata)
 {
-    return game_update("cellGameUpdateCheckStartAsyncEx", func, userdata, CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE, true);
+    return game_update("cellGameUpdateCheckStartAsyncEx", func, userdata, true, true);
 }
 
 s32 cellGameUpdateCheckStartWithoutDialogAsync(PPUContext&, u32 func, u32 userdata)
 {
-    return game_update("cellGameUpdateCheckStartWithoutDialogAsync", func, userdata,
-        CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE, false);
+    return game_update("cellGameUpdateCheckStartWithoutDialogAsync", func, userdata, true, false);
 }
 
 s32 cellGameUpdateCheckStartWithoutDialogAsyncEx(PPUContext&, u32 func, u32 userdata)
 {
-    return game_update("cellGameUpdateCheckStartWithoutDialogAsyncEx", func, userdata,
-        CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE, true);
+    return game_update("cellGameUpdateCheckStartWithoutDialogAsyncEx", func, userdata, true, true);
 }
 
 s32 cellGameUpdateCheckFinishAsync(PPUContext&, u32 func, u32 userdata)
 {
-    return game_update("cellGameUpdateCheckFinishAsync", func, userdata, CELL_GAMEUPDATE_RESULT_STATUS_FINISHED, false);
+    return game_update("cellGameUpdateCheckFinishAsync", func, userdata, false, false);
 }
 
 s32 cellGameUpdateCheckFinishAsyncEx(PPUContext&, u32 func, u32 userdata)
 {
-    return game_update("cellGameUpdateCheckFinishAsyncEx", func, userdata, CELL_GAMEUPDATE_RESULT_STATUS_FINISHED, true);
+    return game_update("cellGameUpdateCheckFinishAsyncEx", func, userdata, false, true);
+}
+
+s32 game_update_logged(s32 r, std::string_view call)
+{
+    log::print(r < 0 ? log::Level::Warn : log::Level::Info, kChan, "{}: {}", call, result_name(r));
+    return r;
+}
+
+// cellGameUpdateInit(): once until cellGameUpdateTerm (ALREADY_INITIALIZED again before it). Its arguments, if any,
+// are not read.
+s32 cellGameUpdateInit(PPUContext&)
+{
+    GameUpdateState& u = game_update_state();
+    std::lock_guard lock(u.mutex);
+    if (u.initialized)
+        return game_update_logged(error(CELL_GAMEUPDATE_ERROR_ALREADY_INITIALIZED), "cellGameUpdateInit()");
+    u.initialized = true;
+    return game_update_logged(lv2::CELL_OK, "cellGameUpdateInit()");
+}
+
+s32 cellGameUpdateTerm(PPUContext&)
+{
+    GameUpdateState& u = game_update_state();
+    std::lock_guard lock(u.mutex);
+    if (!u.initialized) return game_update_logged(error(CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED), "cellGameUpdateTerm()");
+    u.initialized = false;
+    return game_update_logged(lv2::CELL_OK, "cellGameUpdateTerm()");
+}
+
+// cellGameUpdateCheckAbort(): the checks in progress hear ABORTED; with none, NOT_START (a check answered already, as
+// every check here is at the cellSysutilCheckCallback after its start).
+s32 cellGameUpdateCheckAbort(PPUContext&)
+{
+    GameUpdateState& u = game_update_state();
+    std::lock_guard lock(u.mutex);
+    if (!u.initialized)
+        return game_update_logged(error(CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED), "cellGameUpdateCheckAbort()");
+    if (u.running.empty())
+        return game_update_logged(error(CELL_GAMEUPDATE_ERROR_NOT_START), "cellGameUpdateCheckAbort()");
+    u.aborted.insert(u.running.begin(), u.running.end());
+    return game_update_logged(lv2::CELL_OK,
+        std::format("cellGameUpdateCheckAbort(): {} check(s) aborted, their callbacks hear ABORTED", u.running.size()));
 }
 
 } // namespace
@@ -328,6 +556,18 @@ void register_cellNetCtl(Registry& r)
         PS_HLE_FUNC(0x558700F6, cellGameUpdateCheckStartWithoutDialogAsyncEx),
         PS_HLE_FUNC(0xFFA3D791, cellGameUpdateCheckFinishAsync),
         PS_HLE_FUNC(0xF463981C, cellGameUpdateCheckFinishAsyncEx),
+        // D-670: RPCS3's todos, pspocket's own; unverified (D-594).
+        PS_HLE_UNVERIFIED(0xB23D5A13, cellNetCtlAddHandlerGameInt),
+        PS_HLE_UNVERIFIED(0x21D67EEF, cellNetCtlConnectGameInt),
+        PS_HLE_UNVERIFIED(0x793BBF51, cellNetCtlDelHandlerGameInt),
+        PS_HLE_UNVERIFIED(0xF08BA0D0, cellNetCtlDisconnectGameInt),
+        PS_HLE_UNVERIFIED(0x11F777B7, cellNetCtlGetInfoGameInt),
+        PS_HLE_UNVERIFIED(0xF8C8B9FF, cellNetCtlGetScanInfoGameInt),
+        PS_HLE_UNVERIFIED(0x3BFA5B37, cellNetCtlGetStateGameInt),
+        PS_HLE_UNVERIFIED(0x71DB688D, cellNetCtlScanGameInt),
+        PS_HLE_UNVERIFIED(0x99AB1A26, cellGameUpdateInit),
+        PS_HLE_UNVERIFIED(0x10DAE56D, cellGameUpdateTerm),
+        PS_HLE_UNVERIFIED(0x3E359AB6, cellGameUpdateCheckAbort),
     });
 }
 

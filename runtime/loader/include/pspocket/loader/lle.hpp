@@ -9,10 +9,10 @@
 //
 // Which modules run as they are is decided per game, per module file, as a PS3 links a game to the system's libraries
 // (D-175, decide()): the host's module when it implements every function the game imports from it (one it made
-// without Sony's module to compare with, Function::unverified, counts as lacking while a firmware module can serve the
-// library, D-594); else the firmware's own module, its imports linked to other firmware modules chosen with it or to
-// the host, as RPCS3 links a module (what nothing implements fails when called, a variable no module exports stays
-// unlinked, both logged). Modules in
+// without Sony's module to compare with, Function::unverified or Variable::unverified, counts as lacking while a
+// firmware module can serve the library, D-594, D-624); else the firmware's own module, its imports linked to other
+// firmware modules chosen with it or to the host, as RPCS3 links a module (what nothing implements fails when called,
+// a variable no module exports stays unlinked, both logged). Modules in
 // sys/internal (codec cores, services) are indexed too, keyed "internal/NAME" (D-177). Some modules
 // always stay on the host, as pspocket must own what they do (the process runtime, module loading, SPURS (D-037), the
 // RSX, audio, input, files, network, sysutil and its dialogs, devices). Before decide() (tests, runtime loads with no

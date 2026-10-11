@@ -5,18 +5,22 @@
 // Camera: cellCameraInit succeeds and nothing is ever attached or opened. Open finds no device after checking its
 // arguments; OpenEx, GetType and GetBufferSize answer DEVICE_NOT_FOUND, the attribute and read functions NOT_OPEN
 // (RPCS3's answers with the null handler, which it returns as values rather than errors); the Is* queries answer 0.
-// Notify queues are accepted and get no events.
+// Notify queues are accepted and get no events. The asynchronous forms (D-665) are refused by their synchronous forms'
+// checks, so no completion event is ever sent and no request waits for its Post; Read2 and ResetAttribute answer as the
+// read and attribute functions, SetContainer keeps its container (D-666).
 //
 // Microphone: cellMicInit succeeds with no microphone registered, so every function on a device answers
 // DEVICE_NOT_FOUND after RPCS3's argument checks. As in RPCS3, cellMicIsAttached answers 1 regardless, cellMicGetType
 // reports a USB microphone for devices 0 to 7 (RPCS3's default type, which Guitar Hero: Warriors of Rock needs) and
 // cellMicGetStatus a closed device with RPCS3's fixed levels. A notify queue must exist (by key); it gets no attach
-// events, since no microphone is registered.
+// events, since no microphone is registered. The system's sharing of a microphone, cellMicCommand and the multi-mic
+// notify queue (D-667) and cellMicStopEx (D-668) likewise.
 //
 // Pointers are checked before use (D-042): where RPCS3 writes through a pointer unchecked, one that is not guest
 // memory is logged with the call site and refused with the library's PARAM error.
 
 #include <mutex>
+#include <set>
 #include <string_view>
 
 #include "guest.hpp"
@@ -60,6 +64,11 @@ constexpr u32 kCameraInfoChecked = 12;
 struct CameraState {
     std::mutex mutex;
     bool init = false;
+    // cellCameraSetContainer's arguments (D-666): kept for an open, which never comes with no camera attached.
+    bool container_set = false;
+    s32 container_dev = 0;
+    u32 container = 0;
+    std::set<std::string_view> logged; // the functions whose "no camera" answer was logged once
 };
 
 CameraState& camera() { return HleProcess::current()->state<CameraState>(); }
@@ -69,6 +78,16 @@ bool camera_init()
     CameraState& c = camera();
     std::lock_guard lock(c.mutex);
     return c.init;
+}
+
+// A function's answer for want of a camera, logged the first time each function gives it.
+s32 no_camera(std::string_view call, s32 r)
+{
+    CameraState& c = camera();
+    std::lock_guard lock(c.mutex);
+    if (c.logged.insert(call).second)
+        PS_LOG_INFO(kCameraChan, "{}: no camera is attached -> {:#010x}", call, static_cast<u32>(r));
+    return r;
 }
 
 s32 cellCameraInit(PPUContext&)
@@ -103,16 +122,21 @@ s32 check_camera_info(u8* base, u32 info)
     return lv2::CELL_OK;
 }
 
-// cellCameraOpen(dev_num, CellCameraInfo*): the arguments are checked, then no device is found.
-s32 cellCameraOpen(PPUContext& ctx, s32 dev, u32 info)
+// RPCS3 cellCameraOpen's checks before it looks for the camera: the info pointer, init, the device number, then the
+// info's format, resolution and frame rate (`what` names the info in the log when it is not guest memory).
+s32 open_checks(PPUContext& ctx, s32 dev, u32 info, std::string_view what)
 {
     if (!info) return error(CELL_CAMERA_ERROR_PARAM);
     if (!camera_init()) return error(CELL_CAMERA_ERROR_NOT_INIT);
     if (dev != 0) return error(CELL_CAMERA_ERROR_PARAM);
-    if (!usable(ctx, info, kCameraInfoChecked, "cellCameraOpen: the CellCameraInfo")) {
-        return error(CELL_CAMERA_ERROR_PARAM);
-    }
-    if (const s32 r = check_camera_info(guest_base(ctx), info); r != lv2::CELL_OK) return r;
+    if (!usable(ctx, info, kCameraInfoChecked, what)) return error(CELL_CAMERA_ERROR_PARAM);
+    return check_camera_info(guest_base(ctx), info);
+}
+
+// cellCameraOpen(dev_num, CellCameraInfo*): the arguments are checked, then no device is found.
+s32 cellCameraOpen(PPUContext& ctx, s32 dev, u32 info)
+{
+    if (const s32 r = open_checks(ctx, dev, info, "cellCameraOpen: the CellCameraInfo"); r != lv2::CELL_OK) return r;
     PS_LOG_INFO(kCameraChan, "cellCameraOpen({}): no camera is attached", dev);
     return error(CELL_CAMERA_ERROR_DEVICE_NOT_FOUND);
 }
@@ -137,6 +161,50 @@ s32 cellCameraClose(PPUContext&, s32 dev) { return init_and_open(dev); }
 s32 cellCameraReset(PPUContext&, s32 dev) { return init_and_open(dev); }
 s32 cellCameraStart(PPUContext&, s32 dev) { return init_and_open(dev); }
 s32 cellCameraStop(PPUContext&, s32 dev) { return init_and_open(dev); }
+
+// The asynchronous forms (D-665): OpenAsync/OpenPost, CloseAsync/ClosePost, StartAsync/StartPost, StopAsync/StopPost,
+// ResetAsync/ResetPost. RPCS3 registers their names only (UNIMPLEMENTED_FUNC answering CELL_OK, no arguments). In the
+// SDK's model an Async call makes its synchronous form's checks and starts the operation; its end comes to the notify
+// queues whose flag asks for it (CELL_CAMERA_EFLAG_OPEN 0x02, CLOSE 0x04, START 0x08, STOP 0x10, RESET 0x20 of
+// cellCameraSetNotifyEventQueue2) as the event CELL_CAMERA_OPEN (3), CLOSE, START, STOP or RESET (7) (RPCS3
+// cellCamera.h), and the Post call then completes it and answers its result. With no camera attached each Async call is
+// refused by its synchronous form's checks, in their order (Open's arguments, then no camera: DEVICE_NOT_FOUND; Close,
+// Start, Stop and Reset: the camera is never open, NOT_OPEN), so nothing is started, no event is sent and no request
+// waits for its Post. A Post finds none and answers as its Async does from what it reads, the device number: what else
+// each takes (OpenPost the info to fill, perhaps) is not known, so it is not read.
+
+// cellCameraOpenAsync(dev_num, CellCameraInfoEx*): Open's checks (only the first three words of the info are read, the
+// format, resolution and frame rate CellCameraInfo and CellCameraInfoEx share), then no camera.
+s32 cellCameraOpenAsync(PPUContext& ctx, s32 dev, u32 info)
+{
+    if (const s32 r = open_checks(ctx, dev, info, "cellCameraOpenAsync: the CellCameraInfoEx"); r != lv2::CELL_OK)
+        return r;
+    return no_camera("cellCameraOpenAsync", error(CELL_CAMERA_ERROR_DEVICE_NOT_FOUND));
+}
+
+// cellCameraOpenPost(dev_num, ...): no open was started. Init and the device number in Open's order, then no camera.
+s32 cellCameraOpenPost(PPUContext&, s32 dev)
+{
+    if (!camera_init()) return error(CELL_CAMERA_ERROR_NOT_INIT);
+    if (dev != 0) return error(CELL_CAMERA_ERROR_PARAM);
+    return no_camera("cellCameraOpenPost", error(CELL_CAMERA_ERROR_DEVICE_NOT_FOUND));
+}
+
+// The other Async and Post functions: RPCS3 check_init_and_open, as their synchronous forms; the camera is never open.
+s32 on_open_camera(std::string_view call, s32 dev)
+{
+    const s32 r = init_and_open(dev);
+    return r == error(CELL_CAMERA_ERROR_NOT_OPEN) ? no_camera(call, r) : r;
+}
+
+s32 cellCameraCloseAsync(PPUContext&, s32 dev) { return on_open_camera("cellCameraCloseAsync", dev); }
+s32 cellCameraClosePost(PPUContext&, s32 dev) { return on_open_camera("cellCameraClosePost", dev); }
+s32 cellCameraStartAsync(PPUContext&, s32 dev) { return on_open_camera("cellCameraStartAsync", dev); }
+s32 cellCameraStartPost(PPUContext&, s32 dev) { return on_open_camera("cellCameraStartPost", dev); }
+s32 cellCameraStopAsync(PPUContext&, s32 dev) { return on_open_camera("cellCameraStopAsync", dev); }
+s32 cellCameraStopPost(PPUContext&, s32 dev) { return on_open_camera("cellCameraStopPost", dev); }
+s32 cellCameraResetAsync(PPUContext&, s32 dev) { return on_open_camera("cellCameraResetAsync", dev); }
+s32 cellCameraResetPost(PPUContext&, s32 dev) { return on_open_camera("cellCameraResetPost", dev); }
 
 // cellCameraGetDeviceGUID(dev_num, u32* guid): always 0 (RPCS3).
 s32 cellCameraGetDeviceGUID(PPUContext& ctx, s32, u32 guid)
@@ -174,6 +242,14 @@ s32 cellCameraGetBufferInfo(PPUContext&, s32 dev, u32) { return not_open(dev, fa
 s32 cellCameraGetBufferInfoEx(PPUContext&, s32 dev, u32) { return not_open(dev, false); }
 s32 cellCameraReadComplete(PPUContext&, s32 dev, u32, u32) { return not_open(dev, false); }
 
+// cellCameraResetAttribute(dev_num, ...) (D-666): RPCS3 registers the name only. As Get/SetAttribute: init, the device
+// number, then NOT_OPEN; what it takes past the device number (an attribute, perhaps) is not known and not read.
+s32 cellCameraResetAttribute(PPUContext&, s32 dev)
+{
+    const s32 r = not_open(dev, false);
+    return r == error(CELL_CAMERA_ERROR_NOT_OPEN) ? no_camera("cellCameraResetAttribute", r) : r;
+}
+
 // cellCameraReadEx and cellCameraRead: RPCS3 answers NOT_OPEN for the null handler before it checks the device number.
 s32 cellCameraReadEx(PPUContext&, s32, u32)
 {
@@ -182,6 +258,15 @@ s32 cellCameraReadEx(PPUContext&, s32, u32)
 }
 
 s32 cellCameraRead(PPUContext& ctx, s32 dev, u32, u32) { return cellCameraReadEx(ctx, dev, 0); }
+
+// cellCameraRead2(dev_num, ...) (D-666): RPCS3 registers the name only. It answers as Read and ReadEx do (NOT_OPEN once
+// initialised, before the device number is looked at, RPCS3's null-handler order); what it takes past the device number
+// is not known and not read.
+s32 cellCameraRead2(PPUContext& ctx, s32 dev)
+{
+    const s32 r = cellCameraReadEx(ctx, dev, 0);
+    return r == error(CELL_CAMERA_ERROR_NOT_OPEN) ? no_camera("cellCameraRead2", r) : r;
+}
 
 // The extension unit: RPCS3 checks the device number and pointer, then wants an attached (or open) camera.
 s32 cellCameraPrepExtensionUnit(PPUContext&, s32 dev, u32 guid)
@@ -199,6 +284,22 @@ s32 ctrl_extension_unit(s32 dev)
 s32 cellCameraCtrlExtensionUnit(PPUContext&, s32 dev, u8, u16, u16, u32) { return ctrl_extension_unit(dev); }
 s32 cellCameraGetExtensionUnit(PPUContext&, s32 dev, u16, u16, u32) { return ctrl_extension_unit(dev); }
 s32 cellCameraSetExtensionUnit(PPUContext&, s32 dev, u16, u16, u32) { return ctrl_extension_unit(dev); }
+
+// cellCameraSetContainer(dev_num, container) (D-666): RPCS3 registers the name only. Read as the memory container for
+// the camera's buffers (CellCameraInfoEx's container at open): kept with the device number as given, CELL_OK,
+// initialised or not (a game may hand it over before cellCameraInit). Nothing is checked: a check made on a wrong reading
+// of the arguments would refuse a call games get CELL_OK for today. No camera ever opens to use it.
+s32 cellCameraSetContainer(PPUContext&, s32 dev, u32 container)
+{
+    CameraState& c = camera();
+    std::lock_guard lock(c.mutex);
+    c.container_set = true;
+    c.container_dev = dev;
+    c.container = container;
+    PS_LOG_INFO(kCameraChan, "cellCameraSetContainer({}, {:#x}): kept; no camera is attached to open with it", dev,
+        container);
+    return lv2::CELL_OK;
+}
 
 // Queries: no camera is available, attached, open or started.
 s32 cellCameraIsAvailable(PPUContext&, s32) { return 0; }
@@ -238,6 +339,10 @@ struct MicState {
     bool init = false;
     u64 queue_key = 0; // the notify queue (no events: no microphone is registered)
     u64 queue_source = 0;
+    u64 multi_key = 0; // the multi-mic notify queue (D-667; no events either)
+    u64 multi_source = 0;
+    bool share_init = false;           // the system's sharing of a microphone, between SysShareInit and End (D-667)
+    std::set<std::string_view> logged; // the functions whose "no microphone" answer was logged once
 };
 
 MicState& mic() { return HleProcess::current()->state<MicState>(); }
@@ -266,6 +371,7 @@ s32 cellMicEnd(PPUContext&)
     if (!m.init) return error(CELL_MICIN_ERROR_NOT_INIT);
     m.init = false;
     m.queue_key = m.queue_source = 0;
+    m.multi_key = m.multi_source = 0;
     return lv2::CELL_OK;
 }
 
@@ -294,6 +400,70 @@ s32 cellMicStartEx(PPUContext&, s32, u32 flags)
     if (flags & ~3u) return error(CELL_MICIN_ERROR_PARAM);
     return no_mic();
 }
+
+// A function's answer for want of a microphone, logged the first time each function gives it.
+s32 mic_refused(std::string_view call, s32 r)
+{
+    MicState& m = mic();
+    std::lock_guard lock(m.mutex);
+    if (r == error(CELL_MICIN_ERROR_DEVICE_NOT_FOUND) && m.logged.insert(call).second)
+        PS_LOG_INFO(kMicChan, "{}: no microphone is registered -> DEVICE_NOT_FOUND", call);
+    return r;
+}
+
+// cellMicStopEx(dev_num, iflags) (D-668): RPCS3 registers the name and stops the emulator if it is called ("this
+// function shouldn't exist"); its form is StartEx's, Stop being to StopEx what Start is to StartEx (RPCS3 cellMicStart
+// is cellMicStartEx(dev_num, 0)): a flag outside the two StartEx takes is PARAM before anything else, then as Stop:
+// NOT_INIT, else DEVICE_NOT_FOUND.
+s32 cellMicStopEx(PPUContext&, s32, u32 flags)
+{
+    if (flags & ~3u) return error(CELL_MICIN_ERROR_PARAM);
+    return mic_refused("cellMicStopEx", no_mic());
+}
+
+// cellMicCommand(...) (D-667): RPCS3 registers the name only; its header's CellMicCommand lists the commands (INIT, END,
+// ATTACH, ... the notify events' types). A command for a microphone, of which none is registered: NOT_INIT before Init,
+// else DEVICE_NOT_FOUND, as every call on a device here. Its arguments are not known and not read.
+s32 cellMicCommand(PPUContext&) { return mic_refused("cellMicCommand", no_mic()); }
+
+// The system's sharing of a microphone (D-667): SysShareInit, Open, Start, Stop, Close and End, RPCS3's names only (no
+// arguments). Init and End bracket the sharing, apart from cellMicInit (a second Init is ALREADY_INIT, an End without
+// one NOT_INIT); in between there is no microphone to share: Open, Start, Stop and Close answer DEVICE_NOT_FOUND (and
+// NOT_INIT outside). Their arguments are not known and not read.
+s32 cellMicSysShareInit(PPUContext&)
+{
+    MicState& m = mic();
+    std::lock_guard lock(m.mutex);
+    if (m.share_init) return error(CELL_MICIN_ERROR_ALREADY_INIT);
+    m.share_init = true;
+    PS_LOG_INFO(kMicChan, "cellMicSysShareInit(): no microphone is registered to share");
+    return lv2::CELL_OK;
+}
+
+s32 cellMicSysShareEnd(PPUContext&)
+{
+    MicState& m = mic();
+    std::lock_guard lock(m.mutex);
+    if (!m.share_init) return error(CELL_MICIN_ERROR_NOT_INIT);
+    m.share_init = false;
+    return lv2::CELL_OK;
+}
+
+s32 no_shared_mic(std::string_view call)
+{
+    s32 r = error(CELL_MICIN_ERROR_DEVICE_NOT_FOUND);
+    {
+        MicState& m = mic();
+        std::lock_guard lock(m.mutex);
+        if (!m.share_init) r = error(CELL_MICIN_ERROR_NOT_INIT);
+    }
+    return mic_refused(call, r);
+}
+
+s32 cellMicSysShareOpen(PPUContext&) { return no_shared_mic("cellMicSysShareOpen"); }
+s32 cellMicSysShareStart(PPUContext&) { return no_shared_mic("cellMicSysShareStart"); }
+s32 cellMicSysShareStop(PPUContext&) { return no_shared_mic("cellMicSysShareStop"); }
+s32 cellMicSysShareClose(PPUContext&) { return no_shared_mic("cellMicSysShareClose"); }
 
 s32 cellMicGetDeviceAttr(PPUContext&, s32 dev, u32, u32, u32)
 {
@@ -400,6 +570,23 @@ s32 cellMicRemoveNotifyEventQueue(PPUContext&, u64)
     return lv2::CELL_OK;
 }
 
+// cellMicSetMultiMicNotifyEventQueue(key, source, flag) (D-667): RPCS3 registers the name only; read as
+// SetNotifyEventQueue2's arguments. As that function: NOT_INIT before Init, the queue must exist (by key, else
+// EVENT_QUEUE), and it is kept, apart from the notify queue, until cellMicEnd; no microphone is registered, so it gets no
+// attach (or any) event. The flag is not used, as SetNotifyEventQueue2's is not (RPCS3).
+s32 cellMicSetMultiMicNotifyEventQueue(PPUContext&, u64 key, u64 source, u64 flag)
+{
+    MicState& m = mic();
+    std::lock_guard lock(m.mutex);
+    if (!m.init) return error(CELL_MICIN_ERROR_NOT_INIT);
+    if (!HleProcess::current()->kernel().event_queue_by_key(key)) return error(CELL_MICIN_ERROR_EVENT_QUEUE);
+    m.multi_key = key;
+    m.multi_source = source;
+    PS_LOG_INFO(kMicChan, "cellMicSetMultiMicNotifyEventQueue({:#x}, {:#x}, {:#x}): kept; no microphone to report",
+        key, source, flag);
+    return lv2::CELL_OK;
+}
+
 } // namespace
 
 void register_devices(Registry& r)
@@ -435,6 +622,20 @@ void register_devices(Registry& r)
         PS_HLE_FUNC(0x9B98D258, cellCameraRemoveNotifyEventQueue),
         PS_HLE_FUNC(0xA7FD2F5B, cellCameraSetNotifyEventQueue2),
         PS_HLE_FUNC(0x44673F07, cellCameraRemoveNotifyEventQueue2),
+        // Made from RPCS3's names without Sony's libcamera to compare them with (D-594): D-665, D-666.
+        PS_HLE_UNVERIFIED(0xC76BC1B4, cellCameraOpenAsync),
+        PS_HLE_UNVERIFIED(0x4C0219A5, cellCameraOpenPost),
+        PS_HLE_UNVERIFIED(0x16B4BA78, cellCameraCloseAsync),
+        PS_HLE_UNVERIFIED(0x0CBEDF6A, cellCameraClosePost),
+        PS_HLE_UNVERIFIED(0x77D8037F, cellCameraStartAsync),
+        PS_HLE_UNVERIFIED(0x5D134C93, cellCameraStartPost),
+        PS_HLE_UNVERIFIED(0x3C1FF1E0, cellCameraStopAsync),
+        PS_HLE_UNVERIFIED(0xBB5C565B, cellCameraStopPost),
+        PS_HLE_UNVERIFIED(0x18B294D0, cellCameraResetAsync),
+        PS_HLE_UNVERIFIED(0xA65CE0F8, cellCameraResetPost),
+        PS_HLE_UNVERIFIED(0xE25C7B03, cellCameraRead2),
+        PS_HLE_UNVERIFIED(0x1350864E, cellCameraResetAttribute),
+        PS_HLE_UNVERIFIED(0x090EB5C8, cellCameraSetContainer),
     });
     r.add("cellMic", {
         PS_HLE_FUNC(0x8325E02D, cellMicInit),
@@ -470,6 +671,16 @@ void register_devices(Registry& r)
         PS_HLE_FUNC(0x7903400E, cellMicSetNotifyEventQueue),
         PS_HLE_FUNC(0x6CC7AE00, cellMicSetNotifyEventQueue2),
         PS_HLE_FUNC(0x65336418, cellMicRemoveNotifyEventQueue),
+        // Made from RPCS3's names without Sony's libmic to compare them with (D-594): D-667, D-668.
+        PS_HLE_UNVERIFIED(0xC461563C, cellMicCommand),
+        PS_HLE_UNVERIFIED(0x891C6291, cellMicSetMultiMicNotifyEventQueue),
+        PS_HLE_UNVERIFIED(0xD127CD3E, cellMicSysShareInit),
+        PS_HLE_UNVERIFIED(0xC3610DBD, cellMicSysShareOpen),
+        PS_HLE_UNVERIFIED(0xCAC7E7D7, cellMicSysShareStart),
+        PS_HLE_UNVERIFIED(0xBDFD51E2, cellMicSysShareStop),
+        PS_HLE_UNVERIFIED(0x3ACE58F3, cellMicSysShareClose),
+        PS_HLE_UNVERIFIED(0xF82BBF7C, cellMicSysShareEnd),
+        PS_HLE_UNVERIFIED(0xE839380F, cellMicStopEx),
     });
 }
 

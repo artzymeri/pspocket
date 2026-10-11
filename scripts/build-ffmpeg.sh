@@ -13,9 +13,9 @@
 # build/ffmpeg/ios into the app. JOBS=N sets make's parallel jobs (default: every core).
 #
 # The hosts that run the tests (macos, linux) also get <target>-tests (D-577): the same decoders and the LGPL encoders
-# the tests write their streams with (MPEG audio layer II, AC-3, AAC, MPEG-4 part 2, DivX 3.11). Only the test programs
-# link those libraries, in place of the decoders' own (third_party/CMakeLists.txt), so nothing the app or pspocket-boot
-# links changes.
+# the tests write their streams with (MPEG audio layer II, AC-3, E-AC-3, AAC, DTS, TrueHD, WMA, MPEG-4 part 2, DivX
+# 3.11). Only the test programs link those libraries, in place of the decoders' own (third_party/CMakeLists.txt), so
+# nothing the app or pspocket-boot links changes.
 #
 # Licence: configured --disable-gpl --disable-nonfree --disable-version3, then only LGPL-2.1-or-later decoders,
 # parsers and libraries, which combine with pspocket's GPLv2 (D-001). No GPL, version3 or nonfree component here.
@@ -56,12 +56,12 @@ fi
 
 # What pspocket's media libraries decode: the PS3's video (AVC/H.264, also MVC's base view; MPEG-2; MPEG-4 part 2 as in
 # DivX; VC-1; DivX 3.11, which is Microsoft's MPEG-4 version 3, D-588) and audio (ATRAC3, ATRAC3plus and their "AL"
-# forms, MP3 and MPEG-1/2 audio, AAC, AC-3 and E-AC-3, big- and little-endian PCM), with the parsers that split their
-# streams. The HEVC parser is there only for its SEI code: 7.1.1's H.264 decoder calls
-# ff_aom_uninit_film_grain_params (h2645_sei.c), whose aom_film_grain.o only HEVC's SEI selects, so an H.264 build
-# without it does not link (D-195).
-DECODERS=h264,mpeg2video,mpeg1video,mpeg4,vc1,msmpeg4v3,atrac3,atrac3al,atrac3p,atrac3pal,mp3,mp3float,mp2,mp2float,mp1,mp1float,aac,ac3,eac3,pcm_s16be,pcm_s16le,pcm_s24be,pcm_f32be
-PARSERS=h264,hevc,mpegvideo,mpeg4video,vc1,aac,ac3,mpegaudio
+# forms, MP3 and MPEG-1/2 audio, AAC, AC-3 and E-AC-3, DTS with its HD and LBR extensions, Dolby TrueHD, WMA 1 and 2,
+# WMA Pro and WMA Lossless (D-620), big- and little-endian PCM), with the parsers that split their streams. The HEVC
+# parser is there only for its SEI code: 7.1.1's H.264 decoder calls ff_aom_uninit_film_grain_params (h2645_sei.c),
+# whose aom_film_grain.o only HEVC's SEI selects, so an H.264 build without it does not link (D-195).
+DECODERS=h264,mpeg2video,mpeg1video,mpeg4,vc1,msmpeg4v3,atrac3,atrac3al,atrac3p,atrac3pal,mp3,mp3float,mp2,mp2float,mp1,mp1float,aac,ac3,eac3,dca,truehd,wmav1,wmav2,wmapro,wmalossless,pcm_s16be,pcm_s16le,pcm_s24be,pcm_f32be
+PARSERS=h264,hevc,mpegvideo,mpeg4video,vc1,aac,ac3,mpegaudio,dca,mlp
 COMMON=(--disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect
     --disable-gpl --disable-nonfree --disable-version3 --disable-avformat --disable-avdevice --disable-avfilter
     --disable-postproc --enable-avcodec --enable-avutil --enable-swscale --enable-swresample
@@ -71,9 +71,10 @@ COMMON=(--disable-everything --disable-programs --disable-doc --disable-network 
 # decodes the slices. Apple's frameworks, linked by whatever links these libraries: VideoToolbox, CoreMedia, CoreVideo
 # and CoreFoundation. The Apple builds only.
 APPLE_HW=(--enable-videotoolbox --enable-hwaccel=h264_videotoolbox)
-# The tests' encoders (D-577; MPEG-4 part 2 and msmpeg4v3 for DivX and DivX 3.11, D-588), for the <target>-tests
+# The tests' encoders (D-577; MPEG-4 part 2 and msmpeg4v3 for DivX and DivX 3.11, D-588; E-AC-3, DTS, TrueHD and WMA 1
+# and 2 for the audio cores of D-620, DTS's and TrueHD's being FFmpeg's experimental ones), for the <target>-tests
 # builds only; set per build in EXTRA.
-TEST_ENCODERS=mp2,ac3,aac,mpeg4,msmpeg4v3
+TEST_ENCODERS=mp2,ac3,aac,mpeg4,msmpeg4v3,eac3,dca,truehd,wmav1,wmav2
 EXTRA=()
 
 # Configures (again only when the arguments change), builds and installs one target: name, then configure's arguments.

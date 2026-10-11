@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -311,15 +312,15 @@ enum : u32 { S444 = 0, S422 = 1, S420 = 2, S411 = 3, FULL = 4 };
 
 u32 pixel_bytes(u32 space) { return space == GRAY ? 1 : space == RGB || space == YCBCR ? 3 : 4; }
 
-// The source as a picture of `space` at kPixels, rows `pitch` bytes apart (the padding 0xA5); RGBA's and ARGB's alpha
-// some pattern, not encoded.
-void put_picture(u8* b, const Source& s, u32 space, u32 pitch)
+// The source as a picture of `space` at `at` (kPixels), rows `pitch` bytes apart (the padding 0xA5); RGBA's and ARGB's
+// alpha some pattern, not encoded.
+void put_picture(u8* b, const Source& s, u32 space, u32 pitch, u32 at = kPixels)
 {
-    std::memset(b + kPixels, 0xA5, usize{pitch} * s.h);
+    std::memset(b + at, 0xA5, usize{pitch} * s.h);
     for (u32 y = 0; y < s.h; y++)
         for (u32 x = 0; x < s.w; x++) {
             const u8* c = s.rgb.data() + (usize{y} * s.w + x) * 3;
-            u8* o = b + kPixels + usize{y} * pitch + usize{x} * pixel_bytes(space);
+            u8* o = b + at + usize{y} * pitch + usize{x} * pixel_bytes(space);
             const u8 alpha = static_cast<u8>(x * 31 + y * 17);
             switch (space) {
             case GRAY: o[0] = jpeg::rgb_to_y(c[0], c[1], c[2]); break;
@@ -966,5 +967,227 @@ TEST_CASE("cellJpgEnc: EncodePicture's checks", "[hle][jpgenc]")
     CHECK(ps_read32(b, kNum) == 1); // only the good one queued
     CHECK(encode(g, h, good, ok) == 0);
     CHECK(encode(g, h, {64, 48, 256, RGBA}, ok) == 0); // the largest the encoder was opened for
+    CHECK(g.call("cellJpgEncClose", h) == 0);
+}
+
+// ------------------------------------------------------------------------------------- several threads at once (D-650)
+
+namespace {
+
+// A thread's own guest structures for the calls, 0x100 bytes from `at` (kCalls + 0x100 * n, nine of them): Open's
+// configuration and resource, the handle, the picture, the parameters, the output parameters, the stream information.
+constexpr u32 kCalls = kData + 0x400;
+constexpr u32 kAtCfg = 0x00, kAtRsrc = 0x20, kAtHandle = 0x40, kAtPic = 0x50, kAtParam = 0x70, kAtOut = 0x90,
+              kAtInfo = 0xA0, kAtNum = 0xD0;
+static_assert(kCalls + 9 * 0x100 <= kPixels);
+
+bool eventually(const std::function<bool()>& done, std::chrono::milliseconds timeout = std::chrono::seconds(30))
+{
+    const auto end = std::chrono::steady_clock::now() + timeout;
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > end) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+// cellJpgEncOpen of an encoder whose work memory is `work`, from the structures at `at`: its handle, or 0.
+u32 open_at(GuestThread& g, u32 at, u32 work, u32 max_w = 640, u32 max_h = 480)
+{
+    u8* b = g.f.base();
+    std::memset(b + at + kAtCfg, 0, 24);
+    ps_write32(b, at + kAtCfg, max_w);
+    ps_write32(b, at + kAtCfg + 4, max_h);
+    ps_write32(b, at + kAtRsrc, work);
+    ps_write32(b, at + kAtRsrc + 4, needed(max_w));
+    ps_write32(b, at + kAtRsrc + 8, 1000);
+    ps_write32(b, at + kAtRsrc + 12, 200);
+    if (g.call("cellJpgEncOpen", at + kAtCfg, at + kAtRsrc, at + kAtHandle) != 0) return 0;
+    return ps_read32(b, at + kAtHandle);
+}
+
+// cellJpgEncEncodePicture of `p` (its pixels at p.addr) into the buffer `stream` of `limit` bytes, from the structures
+// at `at`.
+u64 encode_at(GuestThread& g, u32 handle, u32 at, const Pic& p, const Param& e, u32 stream, u32 limit)
+{
+    u8* b = g.f.base();
+    const u32 pic = at + kAtPic, param = at + kAtParam, out = at + kAtOut;
+    std::memset(b + pic, 0, 32);
+    ps_write32(b, pic, p.width);
+    ps_write32(b, pic + 4, p.height);
+    ps_write32(b, pic + 8, p.pitch);
+    ps_write32(b, pic + 12, p.space);
+    ps_write32(b, pic + 16, p.addr);
+    ps_write64(b, pic + 24, p.user);
+    std::memset(b + param, 0, 24);
+    ps_write32(b, param + 4, e.space);
+    ps_write32(b, param + 8, e.sampling);
+    ps_write32(b, param + 12, e.method);
+    ps_write32(b, param + 16, e.mode);
+    ps_write32(b, param + 20, e.quality);
+    ps_write32(b, out, 1); // a buffer
+    ps_write32(b, out + 4, 0);
+    ps_write32(b, out + 8, stream);
+    ps_write32(b, out + 12, limit);
+    return g.call("cellJpgEncEncodePicture", handle, pic, param, out);
+}
+
+// cellJpgEncGetStreamInfo into the structures at `at`: its answer, and the information in `i`.
+u64 info_at(GuestThread& g, u32 handle, u32 at, Info& i)
+{
+    u8* b = g.f.base();
+    const u32 info = at + kAtInfo;
+    const u64 r = g.call("cellJpgEncGetStreamInfo", handle, info);
+    i = {static_cast<s32>(ps_read32(b, info)), ps_read32(b, info + 4), ps_read32(b, info + 8), ps_read32(b, info + 12),
+        ps_read32(b, info + 16), ps_read32(b, info + 20), ps_read32(b, info + 24), ps_read64(b, info + 32)};
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("cellJpgEnc: two encoders on two threads at once, each stream the one an encoder alone makes (D-650)",
+    "[hle][jpgenc]")
+{
+    constexpr u32 kRounds = 8, kW = 96, kH = 64, kLimit = 0x40000;
+    constexpr u32 kPictures[2] = {kPixels, kPixels + 0x20000}, kWorks[2] = {kWork, kWork + 0x80000},
+                  kStreams[2] = {kStream, kStream + kLimit};
+    Fixture f;
+    u8* b = f.base();
+    put_picture(b, smooth(kW, kH, 5), RGB, kW * 3, kPictures[0]);
+    put_picture(b, smooth(kW, kH, 41), RGBA, kW * 4, kPictures[1]);
+    const auto picture = [&](u32 t, u32 round) {
+        Pic p{kW, kH, kW * (t ? 4 : 3), t ? RGBA : RGB, FULL, kPictures[t]};
+        p.user = 0x1000 * (t + 1) + round;
+        return p;
+    };
+    // Gray and colour, every sampling, both DCTs, qualities 40 to 89.
+    const auto settings = [](u32 round) {
+        return Param{round % 3 ? YCBCR : GRAY, round % 4, round % 2 ? 5u : 0u, 0, 40 + 7 * round};
+    };
+
+    // What an encoder alone makes of each picture in each round.
+    std::vector<u8> want[2][kRounds];
+    {
+        GuestThread g(f, 0, "alone");
+        const u32 h = open_at(g, kCalls, kWorks[0]);
+        REQUIRE(h != 0);
+        for (u32 t = 0; t < 2; t++)
+            for (u32 r = 0; r < kRounds; r++) {
+                REQUIRE(encode_at(g, h, kCalls, picture(t, r), settings(r), kStreams[0], kLimit) == 0);
+                Info i{};
+                REQUIRE(info_at(g, h, kCalls, i) == 0);
+                REQUIRE(i.state == 0);
+                REQUIRE(i.size > 0);
+                want[t][r].assign(b + kStreams[0], b + kStreams[0] + i.size);
+            }
+        REQUIRE(g.call("cellJpgEncClose", h) == 0);
+    }
+
+    // Two encoders, each on its own thread with its own pictures, at once.
+    std::atomic<u32> rounds{0}, wrong{0};
+    std::vector<std::thread> threads;
+    for (u32 t = 0; t < 2; t++) {
+        threads.emplace_back([&, t] {
+            GuestThread g(f, 1 + t, "encoder");
+            const u32 at = kCalls + 0x100 * (t + 1);
+            const u32 h = open_at(g, at, kWorks[t]);
+            THREAD_CHECK(h == kWorks[t]);
+            if (h != kWorks[t]) return;
+            for (u32 r = 0; r < kRounds; r++) {
+                const u64 encoded = encode_at(g, h, at, picture(t, r), settings(r), kStreams[t], kLimit);
+                const u64 waited = g.call("cellJpgEncWaitForOutput", h, at + kAtNum, 1);
+                Info i{};
+                const u64 taken = info_at(g, h, at, i);
+                const bool same = encoded == 0 && waited == 0 && taken == 0 && i.state == 0 && i.addr == kStreams[t] &&
+                    i.user == picture(t, r).user && i.size == want[t][r].size() &&
+                    std::memcmp(b + kStreams[t], want[t][r].data(), i.size) == 0;
+                if (!same) wrong++;
+                rounds++;
+            }
+            THREAD_CHECK(g.call("cellJpgEncClose", h) == 0);
+        });
+    }
+    for (std::thread& th : threads) th.join();
+    CHECK(rounds == 2 * kRounds);
+    CHECK(wrong == 0);
+}
+
+TEST_CASE("cellJpgEnc: eight threads encoding with one encoder at once: four pictures queued, the others BUSY; a Reset "
+          "drops those still being encoded (D-651)", "[hle][jpgenc]")
+{
+    constexpr u32 kThreads = 8, kW = 256, kH = 192, kLimit = 0x10000;
+    static_assert(kStream + kThreads * kLimit <= kWork);
+    Fixture f;
+    GuestThread g(f, 0, "game");
+    u8* b = f.base();
+    put_picture(b, smooth(kW, kH, 17), RGB, kW * 3);
+    const u32 h = open_at(g, kCalls, kWork);
+    REQUIRE(h != 0);
+    const Pic pic{kW, kH, kW * 3, RGB};
+    // The stream the encoder makes of the picture alone.
+    REQUIRE(encode_at(g, h, kCalls, pic, {}, kStream, kLimit) == 0);
+    Info alone{};
+    REQUIRE(info_at(g, h, kCalls, alone) == 0);
+    REQUIRE(alone.state == 0);
+    const std::vector<u8> want(b + kStream, b + kStream + alone.size);
+
+    for (const bool reset : {false, true}) {
+        INFO("reset " << reset);
+        std::atomic<u32> ready{0}, busy{0};
+        std::atomic<bool> go{false};
+        std::array<std::atomic<u64>, kThreads> answers;
+        for (auto& a : answers) a = ~0ull;
+        std::vector<std::thread> threads;
+        for (u32 t = 0; t < kThreads; t++) {
+            threads.emplace_back([&, t] {
+                GuestThread o(f, 1 + t, "encoder");
+                Pic p = pic;
+                p.user = 0x700 + t;
+                ready++;
+                while (!go.load()) std::this_thread::yield();
+                const u64 r = encode_at(o, h, kCalls + 0x100 * (t + 1), p, {}, kStream + kLimit * t, kLimit);
+                answers[t] = r;
+                if (r == kBusy) busy++;
+            });
+        }
+        while (ready.load() < kThreads) std::this_thread::yield();
+        go = true;
+        if (reset) {
+            // Every thread has made its call once four were refused: the four taken still being encoded, or done.
+            CHECK(eventually([&] { return busy.load() == kThreads - 4; }));
+            REQUIRE(g.call("cellJpgEncReset", h) == 0);
+        }
+        for (std::thread& th : threads) th.join();
+        u32 refused = 0;
+        std::vector<u64> accepted;
+        for (u32 t = 0; t < kThreads; t++) {
+            if (answers[t] == 0) accepted.push_back(0x700 + t);
+            else if (answers[t] == kBusy) refused++;
+        }
+        CHECK(accepted.size() == 4);
+        CHECK(refused == 4);
+        if (!reset) {
+            // The four pictures taken, each the stream the encoder makes alone, in its own thread's buffer.
+            REQUIRE(g.call("cellJpgEncWaitForOutput", h, kCalls + kAtNum, 0) == 0);
+            CHECK(ps_read32(b, kCalls + kAtNum) == 4);
+            std::vector<u64> users;
+            for (u32 n = 0; n < 4; n++) {
+                Info s{};
+                REQUIRE(info_at(g, h, kCalls, s) == 0);
+                CHECK(s.state == 0);
+                users.push_back(s.user);
+                const u64 t = s.user - 0x700;
+                REQUIRE(t < kThreads);
+                CHECK(s.addr == kStream + kLimit * t);
+                REQUIRE(s.size == want.size());
+                CHECK(std::memcmp(b + s.addr, want.data(), want.size()) == 0);
+            }
+            std::sort(users.begin(), users.end());
+            CHECK(users == accepted);
+        }
+        // Nothing more: the four taken, or dropped by the Reset with what was still being encoded then; room again.
+        CHECK(g.call("cellJpgEncGetStreamInfo", h, kCalls + kAtInfo) == kEmpty);
+        CHECK(g.call("cellJpgEncWaitForInput", h, 0) == 0);
+    }
     CHECK(g.call("cellJpgEncClose", h) == 0);
 }
