@@ -312,7 +312,8 @@ TEST_CASE("sys_libc: the printf and scanf families on strings", "[hle][libc][std
     put(b, kFmt, "%lf");
     CHECK(t.call("sscanf", kStr, kFmt, kOut) == 1);
     CHECK(std::bit_cast<double>(ps_read64(b, kOut)) == 25.0);
-    // The wide forms: swprintf (negative when the text does not fit) and swscanf.
+    // The wide forms: swprintf (negative when a piece does not fit, what fitted written, as the SDK's, D-905) and
+    // swscanf.
     const auto wput = [&](u32 at, std::u32string_view s) {
         for (usize i = 0; i < s.size(); i++) ps_write32(b, at + 4 * static_cast<u32>(i), static_cast<u32>(s[i]));
         ps_write32(b, at + 4 * static_cast<u32>(s.size()), 0);
@@ -324,6 +325,7 @@ TEST_CASE("sys_libc: the printf and scanf families on strings", "[hle][libc][std
     CHECK(ps_read32(b, kBuf + 12) == 0xE9);
     CHECK(ps_read32(b, kBuf + 16) == 0);
     CHECK(i32(t.call("swprintf", kBuf, 3, kFmt, 5, kStr)) < 0);
+    CHECK(ps_read32(b, kBuf + 4) == '/');
     CHECK(ps_read32(b, kBuf + 8) == 0);
     wput(kStr, U"41 x");
     wput(kFmt, U"%d %lc");

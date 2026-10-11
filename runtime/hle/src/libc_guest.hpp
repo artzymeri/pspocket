@@ -8,6 +8,7 @@
 // they are used (D-042): a range that is not committed guest memory is refused with the call site logged.
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <format>
 #include <mutex>
@@ -266,6 +267,16 @@ public:
             return 0;
         }
         return ps_read64(guest_base(ctx_), static_cast<u32>(slot));
+    }
+    // A vector argument (Sony's printf qualifier v): two slots at a 16-byte boundary of the argument area (slot n is
+    // at r1 + 0x30 + 8n, so an even one; a va_list's address rounded up to 16, as the SDK's va_arg), in memory order.
+    std::array<u8, 16> next_vector()
+    {
+        if (from_list_ ? ((list_ + 8 * next_) & 15) != 0 : (next_ & 1) != 0) next_++;
+        std::array<u8, 16> v{};
+        ps_write64(v.data(), 0, next());
+        ps_write64(v.data(), 8, next());
+        return v;
     }
     bool unreadable() const { return unreadable_; }
     // The va_list's address after the arguments taken so far (list() only).

@@ -7,9 +7,7 @@
 // takes what is stored. The C library's sizes: int, long, size_t, ptrdiff_t and pointers 32 bits; long long and
 // intmax_t 64; long double is double; wchar_t 32 bits.
 //
-// Floating point text is the host C library's (snprintf and strtod in the "C" locale, both correctly rounded), which
-// gives the standard's results for every finite value; infinities and NaNs are written here ("inf", "nan", with the
-// sign bit, padded with spaces).
+// printf is the SDK's own (libc_printf.hpp, D-905). Parsed floating point is the host's strtod in the "C" locale.
 
 #include <algorithm>
 #include <bit>
@@ -28,6 +26,7 @@
 #include <xlocale.h>
 #endif
 
+#include "libc_printf.hpp"
 #include "pspocket/core/types.hpp"
 
 namespace pspocket::hle::libc {
@@ -300,26 +299,8 @@ private:
 
 // ------------------------------------------------------------------------------------------------- printf
 
-// Where a formatter takes its arguments from (the guest's variadic arguments or va_list, or an SPU's local store) and
-// what their pointers lead to. A string or %n target that is not memory is a problem (noted, the call goes on).
-class FormatSource {
-public:
-    virtual ~FormatSource() = default;
-    virtual u64 next() = 0; // the next argument's 64-bit slot (an int is its low word, a double its bits)
-    // The next integer or pointer argument of `bits` (32 or 64), in the low bits: a source that keeps a 32-bit value
-    // elsewhere than a 64-bit one (an SPU's quadwords) needs to know which; the PPU's slots do not.
-    virtual u64 next_int(u32 bits)
-    {
-        (void)bits;
-        return next();
-    }
-    virtual double next_double() { return std::bit_cast<double>(next()); }
-    // The string at `addr`: up to its NUL, at most `max` bytes (wide: characters).
-    virtual std::optional<std::string> string(u32 addr, u64 max) = 0;
-    virtual std::optional<std::u32string> wstring(u32 addr, u64 max) = 0;
-    virtual bool store(u32 addr, u64 value, u32 bytes) = 0;
-    std::vector<std::string> problems;
-};
+// printf is the SDK's (libc_printf.hpp, D-905); FormatSource is there. What follows: the lengths scanf's directives
+// name, and the facets' way into printf's conversions.
 
 enum class Len : u8 { None, hh, h, l, ll, j, z, t, L };
 
@@ -330,12 +311,12 @@ struct Spec {
     Len len = Len::None;
 };
 
-// Widths and numeric precisions are cut to these, so "%999999999d" cannot exhaust the host's memory.
+// Widths and precisions scanf and the facets take are cut to these.
 inline constexpr u64 kMaxWidth = 0x1000000;
 inline constexpr s64 kMaxNumericPrecision = 0x100000;
 
-// The bits of an integer argument of this length: hh 8, h 16, l/z/t/none 32 (long, size_t and ptrdiff_t are 32
-// bits), ll/j/L 64.
+// The bits of an integer argument of this length for scanf: hh 8, h 16, l/z/t/none 32 (long, size_t and ptrdiff_t
+// are 32 bits), ll/j/L 64.
 inline u32 int_bits(Len len)
 {
     switch (len) {
@@ -346,113 +327,70 @@ inline u32 int_bits(Len len)
     }
 }
 
+namespace fmtdetail {
+
+// A field of the SDK's printf for one value, from a Spec: the flags, width and precision as _Printf parses them.
 template <class C>
-void append_ascii(std::basic_string<C>& out, std::string_view s)
+Pft<C, C*> pft_of(const Spec& s)
 {
-    for (const char c : s) out += static_cast<C>(static_cast<u8>(c));
+    Pft<C, C*> px;
+    px.flags = static_cast<u16>((s.space ? kFsp : 0) | (s.plus ? kFpl : 0) | (s.minus ? kFmi : 0) | (s.alt ? kFno : 0) |
+                                (s.zero ? kFze : 0));
+    px.width = static_cast<s32>(std::min<u64>(s.width, 0x7FFFFFFF));
+    px.prec = s.prec < 0 ? -1 : static_cast<s32>(std::min<s64>(s.prec, 0x7FFFFFFF));
+    return px;
 }
 
-// `prefix`, `zeros` zeros and `body`, padded to the width: spaces before, after with '-', or zeros after the prefix
-// with '0' when `zero_pad`.
-template <class C>
-void put_field(std::basic_string<C>& out, const Spec& s, std::basic_string_view<C> prefix, u64 zeros,
-    std::basic_string_view<C> body, bool zero_pad)
-{
-    const u64 n = prefix.size() + zeros + body.size();
-    const u64 fill = s.width > n ? s.width - n : 0;
-    if (s.minus) {
-        out += prefix;
-        out.append(zeros, static_cast<C>('0'));
-        out += body;
-        out.append(fill, static_cast<C>(' '));
-    } else if (zero_pad && s.zero) {
-        out += prefix;
-        out.append(zeros + fill, static_cast<C>('0'));
-        out += body;
-    } else {
-        out.append(fill, static_cast<C>(' '));
-        out += prefix;
-        out.append(zeros, static_cast<C>('0'));
-        out += body;
-    }
-}
+} // namespace fmtdetail
 
+// printf's text of one integer conversion (d, i, u, o, x, X, p) of the raw argument under `s`: the SDK's (_Putfld,
+// _Litob), its length ll (64 bits), l or none (32).
 template <class C>
 void put_integer(std::basic_string<C>& out, const Spec& s, char conv, u64 raw)
 {
-    const u32 bits = int_bits(s.len);
-    const u64 mask = bits == 64 ? ~u64{0} : (u64{1} << bits) - 1;
-    bool negative = false;
-    u64 magnitude = raw & mask;
-    if (conv == 'd' || conv == 'i') {
-        const s64 v = bits == 64 ? static_cast<s64>(raw) : static_cast<s64>(raw << (64 - bits)) >> (64 - bits);
-        negative = v < 0;
-        magnitude = negative ? 0 - static_cast<u64>(v) : static_cast<u64>(v);
+    Pft<C, C*> px = fmtdetail::pft_of<C>(s);
+    C ac[64] = {};
+    const bool wide64 = s.len == Len::ll || s.len == Len::j;
+    if (conv == 'p') {
+        px.v = static_cast<u32>(raw);
+        px.s = ac + px.n0;
+        litob(px, 'x');
+    } else if (conv == 'd' || conv == 'i') {
+        px.v = wide64 ? raw : static_cast<u64>(static_cast<s64>(static_cast<s32>(raw)));
+        if (static_cast<s64>(px.v) < 0) ac[px.n0++] = static_cast<C>('-');
+        else if (px.flags & kFpl) ac[px.n0++] = static_cast<C>('+');
+        else if (px.flags & kFsp) ac[px.n0++] = static_cast<C>(' ');
+        px.s = ac + px.n0;
+        litob(px, conv);
+    } else {
+        px.v = wide64 ? raw : static_cast<u32>(raw);
+        if ((px.flags & kFno) && px.v != 0 && (conv == 'x' || conv == 'X')) {
+            ac[px.n0++] = static_cast<C>('0');
+            ac[px.n0++] = static_cast<C>(conv);
+        }
+        px.s = ac + px.n0;
+        litob(px, conv);
     }
-    const u32 base = conv == 'o' ? 8 : (conv == 'x' || conv == 'X' || conv == 'p') ? 16 : 10;
-    const char* set = conv == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
-    char buf[24];
-    int k = sizeof buf;
-    for (u64 v = magnitude; v; v /= base) buf[--k] = set[v % base];
-    std::basic_string<C> digits;
-    for (int i = k; i < static_cast<int>(sizeof buf); i++) digits += static_cast<C>(buf[i]);
-    if (digits.empty() && s.prec != 0) digits = static_cast<C>('0'); // 0 has one digit, none at precision 0
-    const s64 prec = std::min(s.prec, kMaxNumericPrecision);
-    u64 zeros = prec > static_cast<s64>(digits.size()) ? static_cast<u64>(prec) - digits.size() : 0;
-    // '#' with o: the precision grows until the first digit is 0.
-    if (conv == 'o' && s.alt && zeros == 0 && (digits.empty() || digits[0] != '0')) zeros = 1;
-    std::basic_string<C> prefix;
-    if (conv == 'd' || conv == 'i') {
-        if (negative) prefix = static_cast<C>('-');
-        else if (s.plus) prefix = static_cast<C>('+');
-        else if (s.space) prefix = static_cast<C>(' ');
-    } else if ((conv == 'x' || conv == 'X') && s.alt && magnitude) {
-        append_ascii(prefix, conv == 'x' ? "0x" : "0X");
-    } else if (conv == 'p') {
-        append_ascii(prefix, "0x");
-    }
-    put_field<C>(out, s, prefix, zeros, digits, s.prec < 0);
+    StringSink<C> sink;
+    puttxt(px, static_cast<C*>(ac), sink);
+    out += sink.text;
 }
 
+// printf's text of one floating conversion (e, E, f, F, g, G, a, A) of v under `s`: the SDK's (_Putfld, _Ldtob).
 template <class C>
 void put_double(std::basic_string<C>& out, const Spec& s, char conv, double v)
 {
-    const bool upper = conv >= 'A' && conv <= 'Z';
-    if (!std::isfinite(v)) {
-        std::basic_string<C> body;
-        if (std::signbit(v)) body = static_cast<C>('-');
-        else if (s.plus) body = static_cast<C>('+');
-        else if (s.space) body = static_cast<C>(' ');
-        append_ascii(body, std::isnan(v) ? (upper ? "NAN" : "nan") : (upper ? "INF" : "inf"));
-        put_field<C>(out, s, {}, 0, body, false);
-        return;
-    }
-    std::string f = "%";
-    if (s.minus) f += '-';
-    if (s.plus) f += '+';
-    if (s.space) f += ' ';
-    if (s.alt) f += '#';
-    if (s.zero) f += '0';
-    f += "*.*";
-    f += conv;
-    const int width = static_cast<int>(std::min<u64>(s.width, kMaxWidth));
-    const int prec = s.prec < 0 ? -1 : static_cast<int>(std::min(s.prec, kMaxNumericPrecision));
-    CLocaleScope c_locale_here;
-    char small[128];
-    // The format is one of the floating conversions with its flags, built above.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wformat-nonliteral"
-    const int n = std::snprintf(small, sizeof small, f.c_str(), width, prec, v);
-    if (n < 0) return;
-    if (static_cast<usize>(n) < sizeof small) {
-        append_ascii(out, std::string_view(small, static_cast<usize>(n)));
-        return;
-    }
-    std::string big(static_cast<usize>(n) + 1, '\0');
-    std::snprintf(big.data(), big.size(), f.c_str(), width, prec, v);
-#pragma clang diagnostic pop
-    big.resize(static_cast<usize>(n));
-    append_ascii(out, big);
+    Pft<C, C*> px = fmtdetail::pft_of<C>(s);
+    C ac[64] = {};
+    px.v = std::bit_cast<u64>(v);
+    if (px.v >> 63) ac[px.n0++] = static_cast<C>('-');
+    else if (px.flags & kFpl) ac[px.n0++] = static_cast<C>('+');
+    else if (px.flags & kFsp) ac[px.n0++] = static_cast<C>(' ');
+    px.s = ac + px.n0;
+    ldtob(px, conv);
+    StringSink<C> sink;
+    puttxt(px, static_cast<C*>(ac), sink);
+    out += sink.text;
 }
 
 template <class C>
@@ -461,155 +399,12 @@ struct FormatResult {
     bool failed = false; // an encoding error (EILSEQ): the function returns a negative value
 };
 
-// The text of `fmt` with the arguments of `src` (7.19.6.1; wide: 7.24.2.1). Dinkumware's choices where the standard
-// leaves them: %p is "0x" and the hex digits; %s or %ls of a null pointer prints "(null)"; a conversion character the
-// standard does not have prints itself and takes no argument; a % the format ends in prints nothing; h and hh apply
-// to %n's store as well; L, q and j are 64-bit for integers.
+// The text of `fmt` with the arguments of `src`, as the SDK's printf makes it (libc_printf.hpp).
 template <class C>
 FormatResult<C> format(std::basic_string_view<C> fmt, FormatSource& src)
 {
-    FormatResult<C> r;
-    std::basic_string<C>& out = r.text;
-    usize i = 0;
-    const auto at = [&](usize k) -> s64 { return k < fmt.size() ? static_cast<s64>(static_cast<u32>(fmt[k])) : -1; };
-    const auto decimal = [&] {
-        u64 v = 0;
-        while (c_isdigit(at(i))) v = std::min<u64>(v * 10 + static_cast<u64>(fmt[i++] - '0'), kMaxWidth);
-        return v;
-    };
-    while (i < fmt.size()) {
-        if (fmt[i] != static_cast<C>('%')) {
-            out += fmt[i++];
-            continue;
-        }
-        i++;
-        Spec s;
-        for (bool flag = true; flag;) {
-            switch (at(i)) {
-            case '-': s.minus = true; break;
-            case '+': s.plus = true; break;
-            case ' ': s.space = true; break;
-            case '#': s.alt = true; break;
-            case '0': s.zero = true; break;
-            default: flag = false; continue;
-            }
-            i++;
-        }
-        if (at(i) == '*') {
-            i++;
-            const s32 w = static_cast<s32>(src.next_int(32));
-            if (w < 0) s.minus = true;
-            s.width = std::min<u64>(w < 0 ? 0 - static_cast<u64>(static_cast<s64>(w)) : static_cast<u64>(w), kMaxWidth);
-        } else {
-            s.width = decimal();
-        }
-        if (at(i) == '.') {
-            i++;
-            if (at(i) == '*') {
-                i++;
-                const s32 p = static_cast<s32>(src.next_int(32));
-                s.prec = p < 0 ? -1 : p;
-            } else {
-                u64 p = 0;
-                while (c_isdigit(at(i))) p = std::min<u64>(p * 10 + static_cast<u64>(fmt[i++] - '0'), 0x7FFFFFFF);
-                s.prec = static_cast<s64>(p);
-            }
-        }
-        switch (at(i)) {
-        case 'h':
-            s.len = at(i + 1) == 'h' ? Len::hh : Len::h;
-            i += s.len == Len::hh ? 2 : 1;
-            break;
-        case 'l':
-            s.len = at(i + 1) == 'l' ? Len::ll : Len::l;
-            i += s.len == Len::ll ? 2 : 1;
-            break;
-        case 'q': s.len = Len::ll; i++; break;
-        case 'j': s.len = Len::j; i++; break;
-        case 'z': s.len = Len::z; i++; break;
-        case 't': s.len = Len::t; i++; break;
-        case 'L': s.len = Len::L; i++; break;
-        default: break;
-        }
-        if (i >= fmt.size()) break; // a conversion the format ends in prints nothing
-        const s64 conv = at(i++);
-        switch (conv) {
-        case 'd': case 'i': case 'u': case 'o': case 'x': case 'X':
-            put_integer(out, s, static_cast<char>(conv), src.next_int(int_bits(s.len) > 32 ? 64 : 32));
-            break;
-        case 'p': {
-            Spec p = s;
-            p.len = Len::None;
-            put_integer(out, p, 'p', src.next_int(32));
-            break;
-        }
-        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
-            put_double(out, s, static_cast<char>(conv), src.next_double());
-            break;
-        case 'c': {
-            const u64 v = src.next_int(32);
-            std::basic_string<C> body;
-            if constexpr (sizeof(C) == 1) {
-                if (s.len == Len::l) { // a wint_t converted as by wcrtomb
-                    const std::optional<char> b = wide_to_byte(static_cast<char32_t>(static_cast<u32>(v)));
-                    if (!b) {
-                        r.failed = true;
-                        return r;
-                    }
-                    body = *b;
-                } else {
-                    body = static_cast<C>(static_cast<u8>(v));
-                }
-            } else {
-                // wide: an int converted as by btowc, a wint_t as it is
-                body = s.len == Len::l ? static_cast<C>(static_cast<u32>(v)) : static_cast<C>(static_cast<u8>(v));
-            }
-            put_field<C>(out, s, {}, 0, body, false);
-            break;
-        }
-        case 's': {
-            const u32 addr = static_cast<u32>(src.next_int(32));
-            std::basic_string<C> body;
-            const u64 max = s.prec >= 0 ? static_cast<u64>(s.prec) : ~u64{0};
-            if (!addr) {
-                append_ascii(body, std::string_view("(null)").substr(0, std::min<u64>(6, max)));
-            } else if (s.len == Len::l) {
-                const std::optional<std::u32string> w = src.wstring(addr, max);
-                if (!w) {
-                    src.problems.push_back(std::format("the %ls argument {:#x} is not memory (printed as nothing)", addr));
-                } else if constexpr (sizeof(C) == 1) {
-                    for (const char32_t wc : *w) { // as by wcrtomb, no more bytes than the precision
-                        const std::optional<char> b = wide_to_byte(wc);
-                        if (!b) {
-                            r.failed = true;
-                            return r;
-                        }
-                        body += *b;
-                    }
-                } else {
-                    body = *w;
-                }
-            } else {
-                const std::optional<std::string> n = src.string(addr, max);
-                if (!n) src.problems.push_back(std::format("the %s argument {:#x} is not memory (printed as nothing)", addr));
-                else for (const char c : *n) body += static_cast<C>(static_cast<u8>(c)); // as by mbrtowc for wide
-            }
-            put_field<C>(out, s, {}, 0, body, false);
-            break;
-        }
-        case 'n': {
-            const u32 addr = static_cast<u32>(src.next_int(32));
-            const u32 bytes = s.len == Len::hh ? 1 : s.len == Len::h ? 2 : int_bits(s.len) == 64 ? 8 : 4;
-            if (!src.store(addr, out.size(), bytes))
-                src.problems.push_back(std::format("the %n argument {:#x} is not memory (nothing stored)", addr));
-            break;
-        }
-        default: // '%' and any character the standard does not convert
-            out += static_cast<C>(conv);
-            break;
-        }
-    }
-    return r;
+    PrintResult<C> r = print_host<C>(fmt, src);
+    return FormatResult<C>{std::move(r.text), r.failed()};
 }
 
 // ------------------------------------------------------------------------------------------------- scanf

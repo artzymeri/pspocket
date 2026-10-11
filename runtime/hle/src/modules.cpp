@@ -63,6 +63,7 @@ void register_sys_libc_time(Registry& r);
 void register_sys_libc_locale(Registry& r);
 void register_sys_libc_process(Registry& r);
 void register_sys_libc_spu(Registry& r);
+void register_sys_libc_format(Registry& r);
 void register_cellFont(Registry& r);
 void register_cellFontFT(Registry& r);
 void register_cell_FreeType2(Registry& r);
@@ -158,6 +159,7 @@ void register_all_modules(Registry& r)
     register_sys_libc_locale(r);
     register_sys_libc_process(r);
     register_sys_libc_spu(r);
+    register_sys_libc_format(r);
     register_cellFont(r);
     register_cellFontFT(r);
     register_cell_FreeType2(r);

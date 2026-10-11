@@ -9430,3 +9430,67 @@ wcsftime, `_Getdst`/`_Isdst`, the locale objects, a locale file read, made curre
 Not done here: printf's %lc/%ls, scanf's wide conversions and the wide streams still convert bytes one to one (they are
 libc_format.hpp's and stdio's, D-905); sys_libstdcxx's codecvt<wchar_t, char> and ctype<wchar_t>::widen are bytes
 too, where the SDK's C++ library converts UTF-8 through the same machine (its do_widen gives WEOF past 0x7F).
+
+## D-905 · 2026-10-11 · sys_libc's printf as the SDK's: the output internals, the SPU printf's, against a game's copy
+
+The SDK's C library (Dinkumware's, Sony's additions; no firmware module has it) as Assassin's Creed (BLES00158) links
+it was read and pspocket's printf rewritten to give what it gives, piece by piece (runtime/hle/src/libc_printf.hpp, an
+engine over the library's print-formatting structure that works on the host's buffers for sprintf and the rest and on
+guest memory for the internals a game calls; runtime/hle/src/sys_libc_format.cpp). 18 names new, under sys_libc and
+sys_libm: _Putfld, _Puttxt, _Putstr, _Litob, _Ldtob, _Genld, their _W forms, the six SPU printf internals
+(__spu_thread_printf, __spu_thread_putfld, __spu_thread_puttxt and the __raw_spu_ ones), plus _Printf, _WPrintf,
+spu_thread_printf/sprintf/snprintf, raw_spu_printf and spu_raw_sprintf/snprintf moved onto them. (The input side,
+_Getfld .. _WStoxflt, went to D-907.)
+- _Pft: +0 the value (long long or double), +16 a vector argument, +32 pfn, +36 arg, +40 s, +44 n0, nz0, n1, nz1, n2,
+  nz2, +68 prec, +72 nchar, +76 width, +80 flags (u16: ' ' 1, '+' 2, '-' 4, '#' 8, '0' 16, Sony's separators ',' 0x80,
+  ';' 0x100, ':' 0x200, '_' 0x400), +82 qual; the SPU printf's adds the SPU at +84 (flag 0x20: %s's text is in its
+  store). _WPft: +0 value, +8 pfn, +12 arg, +16 s, +20 n0 .. +40 nz2, +44 nchar, +48 prec, +52 width, +56 flags, +60
+  qual: the game's build has a 16-bit wchar_t (qual at +58); sys_libc's is 32-bit (D-512), so its wide text is words.
+- Floating point (_Ldtob, _Genld): the value scaled by powers of ten in double arithmetic, eight digits at a time, 19
+  significant at most, rounded half up on the first dropped digit: "%.0f" of 0.5 is "1", "%.1f" of 0.25 "0.3",
+  "%.20f" of 0.1 "0.10000000000000000000", "%.20f" of 1/3 "0.33333333333333330301". %a is exact, as few digits as
+  needed. The host's correctly rounded snprintf is gone (and faster: 20,000 vsprintf calls of 11 mixed conversions
+  took 21.0 ms before, 12.1 ms after, the same session).
+- Integers (_Litob) as C99, but: L is 32 bits (ll and j are 64; q is no qualifier at all: "%qd" prints "qd"); "% Ld"
+  has no space; %p is the hex digits alone, '#' or not.
+- Any conversion character it has none for prints itself padded to the width, taking no argument ("%5k" is
+  "    k"); %% is padded too; %s of NULL is "(null)" whatever the precision; %n of the narrow printf is not padded.
+- The "C" locale's multibyte characters are UTF-8 (U+00E9 is C3 A9), by the bits, with no surrogate or overlong
+  checks: %ls/%lc (wctomb) and the wide printf's %s (mbtowc) and %c (btowc: none past 0x7F, EOF). The game's 16-bit
+  build stops at three bytes; for the 32-bit wchar_t the same rule goes on to six (31 bits), as UTF-8 was first
+  defined: derived, no game shows it. This differs from D-512's byte-a-character "C" locale for mbrtowc and kin, which
+  stays as it is here (reported to the main session).
+- %ls goes through a buffer of 64 bytes, or of width + 3 (malloc) when right-justified and wider; a buffer that fills
+  is put out unpadded ("%-100ls" of a long string is not padded); a failed output inside it is ignored.
+- Sony's AltiVec vectors: v, vl or lv four 32-bit elements, vh/hv eight, vhh/hhv sixteen, vll/llv two 64-bit, vL/Lv
+  two doubles, v with a floating conversion four floats, vc sixteen characters, "%xc" and "%cx" (o, u, x, X) sixteen
+  bytes; the vector at the va_list's next 16-byte boundary. Each element is a field of its own after a separator (a
+  space unless , ; : or _ is given; for signed integers a ' ' flag and a separator both), which counts in its width;
+  floats keep the space as their sign too (" 1.5 -0.3  2.0  0.0").
+- The wide printf: no vectors, no %S; %n takes its pointer and stores nothing, and its field is padded ("%5n" puts
+  five spaces); padding 31 characters a piece (32 narrow).
+- swprintf answers -1 when a piece of the text does not fit, written as far as it fits, with a NUL (C99's negative);
+  sprintf writes no NUL after a failure; snprintf always writes one (n > 0).
+- The SPU printf (__spu_thread_printf on a thread's store, a word at a time through lv2 as the library's accessors,
+  D-904): format characters one a time, literal ones to pfn one a time; flags " +-#0", qualifiers h hh l ll j t z L;
+  every conversion takes the next quadword, %% too ("%d %% %d" of 1, 2, 3 is "1 % 3"); %s's text stays in the store,
+  read 128 bytes at a time, "(null)" for address 0 (its length measured at 0 meanwhile); %n writes the count into the
+  store as wide as its qualifier. spu_thread_printf writes to the TTY's SPU channel (2), as the library's output
+  function does. The raw SPU forms have no copy in any executable: the same on a raw SPU's store (guest memory).
+- No copy in the game: the __raw_spu_ internals (from the thread ones) and 32-bit wide text (from the game's 16-bit wide
+  functions, which do exist).
+- Undefined, left as it was: a format that ends inside a conversion (the library reads on past its NUL; pspocket
+  stops); a negative width with %ls makes the library malloc 4 GB (sys_libc's malloc refuses: -1).
+Compared (tests/hle/test_libc_format_game.cpp, test_hle "[gamelibc]"; every call made on the game's function and on
+pspocket's, answers, each piece the output function got, structures, buffers and memory written compared): _Printf
+2,131 calls (integers, characters, strings, %n, the output failing at each call), 49,240 (floating point: special
+values, ties, powers, denormals and 300 random ones by every precision and conversion, flags, widths, huge
+precisions), 992 (vectors); _WPrintf 4,252; _Litob, _Ldtob,
+_Genld 12,000 and their wide forms 12,000; _Puttxt, _Putstr, _Putfld 7,511 and the wide 7,468; __spu_thread_printf
+1,076 on a running SPU thread, __spu_thread_putfld/puttxt 1,500, spu_thread_sprintf/snprintf 20; sprintf, snprintf,
+vsprintf, vsnprintf, swprintf 139. 0 differences. Not compared: what makes the game's own code fault (its output
+function called with the NULL it answered, a negative precision handed to _Genld, swprintf with no room for a %s).
+Tests without the game: tests/hle/test_libc_format.cpp (the behaviours above, _Printf's pieces, a raw SPU's printf, the
+timing as "[.bench]"). Tests changed from the host's output to the SDK's: test_libc_process.cpp (_Printf's "%5.1f" of
+2.25 is "  2.3"), test_libc_stdio.cpp (swprintf's truncated text), test_libstdcxx_facets.cpp (num_put's reference is
+sys_libc's printf now: a pointer's "****1234abcd" without 0x, "-1.235e+03").

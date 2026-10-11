@@ -95,6 +95,7 @@ add_library(pspocket_hle STATIC
     src/sys_libc_locale.cpp
     src/sys_libc_process.cpp
     src/sys_libc_spu.cpp
+    src/sys_libc_format.cpp
     src/sys_libm.cpp
     src/cellFont.cpp
     src/cellFontFT.cpp

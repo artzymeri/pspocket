@@ -11,11 +11,14 @@
 #include <cstring>
 #include <format>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "guest.hpp" // runtime/hle/src (internal): call_guest
+#include "libc_printf.hpp" // runtime/hle/src (internal): the SDK's printf, num_put's reference
 #include "hle_test_util.hpp"
 #include "pspocket/recomp/nid.hpp"
 #include "stdcxx.hpp" // runtime/hle/src (internal): the library's own data (the facet ids it keeps)
@@ -245,14 +248,23 @@ constexpr u32 kUppercase = 0x4, kShowbase = 0x8, kShowpoint = 0x10, kShowpos = 0
               kRight = 0x80, kInternal = 0x100, kDec = 0x200, kOct = 0x400, kHex = 0x800, kScientific = 0x1000,
               kFixed = 0x2000, kBoolalpha = 0x4000;
 
+// The text sys_libc's printf gives (the SDK's, D-905: num_put's text is the C library's sprintf's).
 std::string printf_text(const char* fmt, auto... v)
 {
-    char buf[512];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wformat-nonliteral"
-    std::snprintf(buf, sizeof buf, fmt, v...);
-#pragma clang diagnostic pop
-    return buf;
+    struct Slots final : libc::FormatSource {
+        std::vector<u64> a;
+        usize i = 0;
+        u64 next() override { return i < a.size() ? a[i++] : 0; }
+        std::optional<std::string> string(u32, u64) override { return std::nullopt; }
+        std::optional<std::u32string> wstring(u32, u64) override { return std::nullopt; }
+        bool store(u32, u64, u32) override { return false; }
+    } src;
+    const auto slot = [](auto x) -> u64 {
+        if constexpr (std::is_floating_point_v<decltype(x)>) return std::bit_cast<u64>(static_cast<double>(x));
+        else return static_cast<u64>(static_cast<s64>(x));
+    };
+    (src.a.push_back(slot(v)), ...);
+    return libc::print_host<char>(std::string_view(fmt), src).text;
 }
 
 // The text printf gives for the format num_put's _Ifmt makes of these flags, for a value of `bits` (a long is 32).
@@ -641,10 +653,10 @@ TEST_CASE("sys_libstdcxx facets: num_put formats as printf does under _Ifmt's an
     e.flags(kDec | kBoolalpha | kLeft);
     e.width(7);
     CHECK(put_long("b", 0) == "false**");
-    // A pointer: "0x" and its hex digits.
+    // A pointer: its hex digits (the SDK's %p, D-905), the fill before them.
     e.flags(kDec | kInternal);
     e.width(12);
-    CHECK(put_long("PKv", 0x1234ABCD) == "0x**1234abcd");
+    CHECK(put_long("PKv", 0x1234ABCD) == "****1234abcd");
 
     // Floats: fixed, scientific, general, precision, showpoint, showpos, uppercase, padding.
     const auto put_double = [&](double v) {
@@ -718,7 +730,7 @@ TEST_CASE("sys_libstdcxx facets: num_put<wchar_t> and the exported _Iput and _Fp
     e.flags(kDec | kScientific);
     e.precision(3);
     e.callf(kNumPutW + "d", -1234.5, kRet, np, kOit, kIos, ' ');
-    CHECK(e.written<4>() == U"-1.234e+03");
+    CHECK(e.written<4>() == U"-1.235e+03"); // the SDK's printf rounds half up (D-905)
     e.output<4>();
     e.flags(kDec | kBoolalpha);
     e.t.call(kNumPutW + "b", kRet, np, kOit, kIos, ' ', 1);
