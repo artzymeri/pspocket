@@ -608,33 +608,25 @@ s32 cellSpursSetPreemptionVictimHints(PPUContext& ctx, u32 spurs, u32 is_preempt
     return lv2::CELL_OK;
 }
 
-// cellSpursRemoveSystemWorkloadForUtility(spurs) (D-629, unverified: RPCS3 has an UNIMPLEMENTED stub answering
-// CELL_OK; libsre was not read): an instance made with the system workload (cellSpursAttributeEnableSystemWorkload,
-// which lends some of its SPUs to the system's own SPU work) gives it up, so that a system utility a game starts can
-// have those SPUs. A native SPURS lends no SPU (it has no system workload running, as RPCS3's, D-171): the removal
-// only takes the instance's SAF_SYSTEM_WORKLOAD_ENABLED flag away, so that what needs the system workload
-// (cellSpursSetPreemptionVictimHints) is PERM afterwards, as for an instance made without one. Checks, as the victim
-// hints' (libsre's): NULL, ALIGN, memory (NULL_POINTER, as that function's, D-042); an instance in exception state
-// STAT; one without the system workload (or that gave it up already) PERM.
-s32 cellSpursRemoveSystemWorkloadForUtility(PPUContext& ctx, u32 spurs)
+// cellSpursRemoveSystemWorkloadForUtility(handle), as libsre (0xF854, D-914): the counterpart of libsre's export
+// 0xD9A9C592 (no SDK names it; a system utility's module adds a workload of libsre's own with it, the instance needing
+// the system workload, and gets a 128-byte handle marked 0xCE3F7FF5653795B9, registered in a table of 32 in libsre).
+// Checks: NULL, the handle's ALIGN (memory: NULL_POINTER, D-042), a handle without the mark INVAL; then the handle is
+// looked for in the table: not there, INVAL; there, it is taken out, unmarked, and its workload removed. pspocket has no
+// 0xD9A9C592 (its workload is libsre's SPU code; a module that imports it is refused at its link, rule 4), so no handle
+// is ever registered: a marked handle is INVAL too, logged.
+s32 cellSpursRemoveSystemWorkloadForUtility(PPUContext& ctx, u32 handle)
 {
     constexpr std::string_view fn = "cellSpursRemoveSystemWorkloadForUtility";
-    if (!spurs) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
-    if (spurs % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
-    if (const s32 rc = check_pointer(ctx, fn, "SPURS instance", spurs, CELL_SPURS_SIZE, CELL_SPURS_CORE_ERROR_NULL_POINTER);
-        rc != lv2::CELL_OK) {
+    constexpr u64 kUtilityWorkloadMark = 0xCE3F7FF5653795B9ull;
+    if (!handle) return error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (handle % CELL_SPURS_ALIGN) return error(CELL_SPURS_CORE_ERROR_ALIGN);
+    if (const s32 rc = check_pointer(ctx, fn, "handle", handle, 8, CELL_SPURS_CORE_ERROR_NULL_POINTER); rc != lv2::CELL_OK)
         return rc;
-    }
-    u8* base = guest_base(ctx);
-    if (ps_read32(base, spurs + wkl_off::exception)) return error(CELL_SPURS_CORE_ERROR_STAT);
-    for (u32 flags = atomic_load_be32(base, spurs + spurs_off::flags);;) {
-        if (!(flags & SAF_SYSTEM_WORKLOAD_ENABLED)) return error(CELL_SPURS_CORE_ERROR_PERM);
-        const u32 seen = atomic_cas_be32(base, spurs + spurs_off::flags, flags, flags & ~SAF_SYSTEM_WORKLOAD_ENABLED);
-        if (seen == flags) break;
-        flags = seen;
-    }
-    PS_LOG_INFO(kChan, "{}(SPURS {:#x}): the system workload is given up (it lent no SPU natively)", fn, spurs);
-    return lv2::CELL_OK;
+    if (ps_read64(guest_base(ctx), handle) != kUtilityWorkloadMark) return error(CELL_SPURS_CORE_ERROR_INVAL);
+    PS_LOG_WARN(kChan, "{}({:#x}): a handle marked as libsre's system utility workload's, which pspocket never "
+        "registers (no 0xD9A9C592): CELL_SPURS_CORE_ERROR_INVAL", fn, handle);
+    return error(CELL_SPURS_CORE_ERROR_INVAL);
 }
 
 // cellSpurs 0xE279681F, a libsre export no SDK names (0xF664): NULL (both), ALIGN, then the word at CellSpurs + 0x10
@@ -2709,11 +2701,11 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
         });
     }
     if (x.container) {
-        reservation_op(base, x.container, [](u8* line) {
-            ps_write32(line, exitcode_off::status, (ps_read32(line, exitcode_off::status) | kExitCodeInitialized) &
-                ~kExitCodeStored);
-            return true;
-        });
+        // libsre binds the container before the start: its status word 1, the taskset at +0x50, the byte at +0x39 0.
+        ps_write32(base, x.container + exitcode_off::status, kExitCodeInitialized);
+        ps_write64(base, x.container + exitcode_off::taskset, taskset);
+        base[x.container + exitcode_off::byte39] = 0;
+        ps_res_notify_write(x.container, exitcode_off::size);
     }
     if (x.task2) {
         const u32 names = static_cast<u32>(ps_read64(base, taskset + ts_off::task_name_buffer));
@@ -2739,6 +2731,19 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
     if (woken != lv2::CELL_OK) {
         PS_FATAL(kChan, "{}: cellSpursWakeUp({:#x}) for task {} of taskset {:#x} returned {:#x}; libsre (fw 4.92) asserts "
             "here and aborts the process", what, spurs, id, taskset, static_cast<u32>(woken));
+    }
+    if (x.container) {
+        // And marks it started once the task is: the code may be asked for from now on (libsre's 0x13588). A container
+        // a task already stored its code in keeps it; one with other bits set (a second binding) is left alone. A
+        // taskset whose shutdown has begun (its word at +0x1894 1) has the code marked as given by the shutdown.
+        const bool shut = ps_read32(base, taskset + ts_off::shutdown_done) == 1;
+        reservation_op(base, x.container, [shut](u8* line) {
+            const u32 st = ps_read32(line, exitcode_off::status);
+            if (st & 0xFFFFFFF2u) return false;
+            const u32 marks = shut && !(st & kExitCodeStored) ? kExitCodeStored | kExitCodeShutdown : 0;
+            ps_write32(line, exitcode_off::status, st | kExitCodeStarted | marks);
+            return true;
+        });
     }
     ps_write32(base, task_id_out, id);
     static std::atomic<u64> created{0}; // the first 8 and every 1024th, as the task starts (spurs_taskset.cpp)
@@ -2906,16 +2911,15 @@ s32 task_error(s32 rc); // the event flags' (below)
 // it; the process ending is noticed at this rate), as cellSync's blocking calls.
 constexpr u64 kWaitPollNs = 1'000'000;
 
-// cellSpursTaskExitCodeGet(container, exitCode) and cellSpursTaskExitCodeTryGet (D-627, unverified: RPCS3 has
-// UNIMPLEMENTED stubs answering CELL_OK, libsre's PPU side was not read): the exit code of the task bound to an exit
-// code container (cellSpursCreateTaskWithAttribute), which libsre's exit code handler stores when the task exits
-// (natively: spurs_taskset.cpp, D-195). Checks as cellSpursTaskExitCodeInitialize's: NULL (either pointer), the
-// container's 128-byte ALIGN; memory (FAULT, D-042). Then, from one look at the container's line: not initialized (no
-// task was ever bound to it) STAT; the code stored: written to exitCode, CELL_OK (as often as asked: the code stays
-// until a task is bound to the container again); else TryGet answers BUSY (as the SPURS Try functions,
-// cellSpursEventFlagTryWait), and Get sleeps until the line changes (the handler's update) and looks again, as
-// cellSync's blocking calls do (D-169); the process ending unwinds it. pspocket's Get marks nothing in the container
-// (libsre's PPU waiter sets bit 16 and waits on an event flag at +0x40, which the native handler would not need).
+// cellSpursTaskExitCodeGet(container, exitCode) and cellSpursTaskExitCodeTryGet, as libsre (fw 4.92, 0x13864 and the
+// update at 0x13734; D-914): NULL (either pointer), the container's 128-byte ALIGN (memory: FAULT, D-042). Then one
+// update of the container's status word: a task not yet started with it (bit 1 clear) is STAT; a PPU thread or an SPU
+// task waiting on it already (bit 16 or 17) BUSY; the code stored (bit 2) is taken: written to exitCode (or, where the
+// taskset's shutdown ended the task, bit 3, TASK_ERROR_SHUTDOWN) and the status word cleared, so a second Get finds no
+// task (STAT). No code yet: TryGet answers AGAIN; Get waits. libsre's Get then marks itself (bit 16, the low word an lv2
+// event flag the exit code handler sets) and waits on the flag; pspocket's sleeps until the container's line changes
+// (the handler's update) and looks again, waiters or not (libsre's second look), as cellSync's blocking calls do
+// (D-169); the process ending unwinds it. Its native handler never needs bit 16, which it refuses loudly.
 s32 exit_code_get(PPUContext& ctx, std::string_view fn, u32 container, u32 exit_code, bool block)
 {
     if (!container || !exit_code) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
@@ -2924,16 +2928,37 @@ s32 exit_code_get(PPUContext& ctx, std::string_view fn, u32 container, u32 exit_
     if (const s32 rc = task_readable(ctx, fn, "exit code", exit_code, 4); rc != lv2::CELL_OK) return rc;
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    for (;;) {
-        alignas(16) u8 line[PS_RES_LINE_SIZE];
-        const u64 version = ps_res_acquire(base, container, line);
-        const u32 status = ps_read32(line, exitcode_off::status);
-        if (!(status & kExitCodeInitialized)) return error(CELL_SPURS_TASK_ERROR_STAT);
-        if (status & kExitCodeStored) {
-            ps_write32(base, exit_code, ps_read32(line, exitcode_off::code));
-            return lv2::CELL_OK;
+    for (bool first = true;; first = false) {
+        s32 result = lv2::CELL_OK;
+        bool taken = false;
+        u32 code = 0;
+        alignas(16) u8 seen[PS_RES_LINE_SIZE];
+        const u64 version = ps_res_acquire(base, container, seen); // to sleep on, when no code is there yet
+        reservation_op(base, container, [&](u8* line) {
+            const u32 st = ps_read32(line, exitcode_off::status);
+            if (!(st & kExitCodeStarted)) {
+                result = error(CELL_SPURS_TASK_ERROR_STAT);
+                return false;
+            }
+            if (first && (st & (kExitCodePpuWaits | kExitCodeSpuWaits))) {
+                result = error(CELL_SPURS_TASK_ERROR_BUSY);
+                return false;
+            }
+            if (!(st & kExitCodeStored)) {
+                result = error(CELL_SPURS_TASK_ERROR_AGAIN);
+                return false;
+            }
+            if (st & kExitCodeShutdown) result = error(CELL_SPURS_TASK_ERROR_SHUTDOWN);
+            code = ps_read32(line, exitcode_off::code);
+            ps_write32(line, exitcode_off::status, 0);
+            taken = true;
+            return true;
+        });
+        if (taken) {
+            if (result == lv2::CELL_OK) ps_write32(base, exit_code, code);
+            return result;
         }
-        if (!block) return error(CELL_SPURS_TASK_ERROR_BUSY);
+        if (result != error(CELL_SPURS_TASK_ERROR_AGAIN) || !block) return result;
         if (lv2::wait_aborted(t.waiter)) throw lv2::ThreadExit{};
         ps_res_wait_change(container, version, kWaitPollNs);
         if (lv2::wait_aborted(t.waiter)) throw lv2::ThreadExit{};
@@ -3060,11 +3085,13 @@ s32 cellSpursCreateTask2WithBinInfo(PPUContext& ctx, u32 taskset, u32 task_id, u
 // TASK_ERROR_SHUTDOWN; another lv2 error is a task error with its low byte (as the event flag functions convert them).
 s32 join_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 id, u32 exit_code, bool block)
 {
-    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
+    // libsre's checks come first (0x11484): the taskset and the exit code pointer NULL, the taskset's ALIGN, an ID past
+    // 127; it looks at nothing else of the taskset before the task's exit slot.
+    if (!taskset || !exit_code) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
     if (id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_INVAL);
-    if (exit_code) {
-        if (const s32 rc = task_readable(ctx, fn, "exit code", exit_code, 4); rc != lv2::CELL_OK) return rc;
-    }
+    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = task_readable(ctx, fn, "exit code", exit_code, 4); rc != lv2::CELL_OK) return rc;
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
     const u128 bit = u128{1} << (127 - id);
@@ -3730,7 +3757,15 @@ s32 lfqueue_signal(PPUContext& ctx, u32 ea_signal, u32 waiter)
 s32 spurs_lfqueue_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push)
 {
     static const LfSignal signal = lfqueue_signal;
-    return sync_to_task_error(sync_lfqueue_body(ctx, fn, queue, buffer, is_blocking, push, signal));
+    // libsre's own checks (0x171B8, 0x17344): PushBody the queue's ALIGN before NULL, PopBody NULL first; neither looks
+    // at the buffer's alignment.
+    if (push && queue % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (!queue || !buffer) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (queue % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    const s32 rc = sync_lfqueue_body(ctx, fn, queue, buffer, is_blocking, push, signal, /*check_buffer=*/false);
+    // A signal refused as INVAL or STAT (the waiter is no task that waits) becomes 0x80410914.
+    if (rc == error(CELL_SPURS_TASK_ERROR_INVAL) || rc == error(CELL_SPURS_TASK_ERROR_STAT)) return error(0x80410914u);
+    return sync_to_task_error(rc);
 }
 
 s32 _cellSpursLFQueuePushBody(PPUContext& ctx, u32 queue, u32 buffer, u32 is_blocking)
@@ -4295,16 +4330,13 @@ s32 cellSpursJobChainGetError(PPUContext& ctx, u32 job_chain, u32 cause)
     return chain_error;
 }
 
-// cellSpursGetJobPipelineInfo(spurs, wid, info) (D-629, unverified: RPCS3 has an UNIMPLEMENTED stub answering CELL_OK
-// and no structure; libsre was not read): what each SPU's job chain policy module has in its pipeline (the jobs it
-// fetched, is loading, runs and is writing back), which libsre can only read from SPUs a job stopped on an exception
-// (the job chain's exception event handler is where such information is asked for). A native SPURS has no such
-// pipeline (its job chain policy runs one job at a time to its end, D-055) and stops the process when a job faults
-// (CLAUDE.md rule 5), so no job chain is ever stopped in one: after its checks the call answers JOB_ERROR_STAT and
-// writes nothing (CellSpursJobPipelineInfo's layout is not known, so nothing could be written faithfully either).
-// Checks: NULL (spurs, info), the instance's 128-byte ALIGN, memory (FAULT, D-042), a workload ID past the instance's
-// (INVAL), one not registered (SRCH), one that is not a job chain (INVAL).
-s32 cellSpursGetJobPipelineInfo(PPUContext& ctx, u32 spurs, u32 wid, u32 info)
+// cellSpursGetJobPipelineInfo(spurs, spuThreadId, info), as libsre (0x1AA60, D-914): what the job chain policy module
+// on one of the instance's SPU threads has in its pipeline, read from that SPU's local store (it is what a job chain's
+// exception handler asks for). Checks: NULL (spurs, info), the instance's ALIGN (memory: FAULT, D-042); a thread ID
+// that is none of the instance's SPU threads (cellSpursGetSpuThreadId's list) INVAL. Then libsre reads the thread's
+// local store from 0xA00, lv2's error answered as it is, and INVAL unless the job chain policy module is there. A native
+// SPURS runs no SPU thread of its own, and never that module in one: lv2's answer, or INVAL.
+s32 cellSpursGetJobPipelineInfo(PPUContext& ctx, u32 spurs, u32 spu_thread, u32 info)
 {
     constexpr std::string_view fn = "cellSpursGetJobPipelineInfo";
     if (!spurs || !info) return error(CELL_SPURS_JOB_ERROR_NULL_POINTER);
@@ -4314,24 +4346,17 @@ s32 cellSpursGetJobPipelineInfo(PPUContext& ctx, u32 spurs, u32 wid, u32 info)
         return rc;
     }
     u8* base = guest_base(ctx);
-    if (wid >= max_workloads(base, spurs)) return error(CELL_SPURS_JOB_ERROR_INVAL);
-    if (!workload_enabled(base, spurs, wid)) return error(CELL_SPURS_JOB_ERROR_SRCH);
-    bool job_chain = false;
-    {
-        SpursHost& h = host();
-        std::lock_guard lock(h.mutex);
-        if (const auto it = h.instances.find(spurs); it != h.instances.end()) {
-            const auto w = it->second.workloads.find(wid);
-            job_chain = w != it->second.workloads.end() && w->second.kind == Workload::Kind::JobChain;
-        }
-    }
-    if (!job_chain) return error(CELL_SPURS_JOB_ERROR_INVAL);
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true)) {
-        PS_LOG_WARN(kChan, "{}(SPURS {:#x}, workload {}): no job chain of a native SPURS stops in a job, so there is no "
-            "pipeline to report: CELL_SPURS_JOB_ERROR_STAT (D-629)", fn, spurs, wid);
-    }
-    return error(CELL_SPURS_JOB_ERROR_STAT);
+    const u32 n = std::min<u32>(ps_read8(base, spurs + spurs_off::nSpus), 8);
+    bool found = false;
+    for (u32 i = 0; i < n && !found; i++) found = ps_read32(base, spurs + spurs_off::spus + 4 * i) == spu_thread;
+    if (!found) return error(CELL_SPURS_JOB_ERROR_INVAL);
+    lv2::PpuThread& t = thread_of(ctx);
+    StackVar value(ctx, base, 8);
+    const s32 rc = lv2::sys_spu_thread_read_ls(t, spu_thread, 0xA00, value.addr(), 8);
+    if (rc != lv2::CELL_OK) return rc;
+    PS_LOG_WARN(kChan, "{}(SPURS {:#x}, SPU thread {:#x}): no job chain policy module of SPURS runs in it natively: "
+        "CELL_SPURS_JOB_ERROR_INVAL", fn, spurs, spu_thread);
+    return error(CELL_SPURS_JOB_ERROR_INVAL);
 }
 
 // cellSpursJobChainGetSpursAddress(jobChain, spurs), as libsre: NULL (both), ALIGN, INVAL for a workload ID past 31 (RPCS3

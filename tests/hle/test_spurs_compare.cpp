@@ -628,6 +628,7 @@ void compare_or_self(GuestThread& t, const FirmwareLibrary* sony, const std::vec
 {
     u8* b = t.f.base();
     usize differ = 0;
+    std::string text; // the differences (UNSCOPED_INFO's would go to the next passing REQUIRE in theirs())
     for (const Call& c : calls) {
         if (std::getenv("PSPOCKET_COMPARE_TRACE")) std::fprintf(stderr, "[compare] %s %s\n", c.fn, c.what.c_str());
         const Answer o = run(b, c, [&](const char* n, const std::vector<u64>& a) { return ours(t, n, a); });
@@ -638,12 +639,12 @@ void compare_or_self(GuestThread& t, const FirmwareLibrary* sony, const std::vec
         usize at = 0;
         while (at < o.area.size() && o.area[at] == s.area[at]) at++;
         if (++differ <= 80)
-            UNSCOPED_INFO(std::format("{} {}: {:#x} (pspocket) vs {:#x} (Sony){}", c.fn, c.what, o.r3, s.r3,
+            text += std::format("{} {}: {:#x} (pspocket) vs {:#x} (Sony){}\n", c.fn, c.what, o.r3, s.r3,
                 at < o.area.size() ? std::format("; area differs first at +{:#x} ({:#04x} vs {:#04x})", at, o.area[at],
                                          s.area[at])
-                                   : std::string()));
+                                   : std::string());
     }
-    INFO(std::format("{} of {} calls differ", differ, calls.size()));
+    INFO(std::format("{} of {} calls differ\n{}", differ, calls.size(), text));
     CHECK(differ == 0);
 }
 
@@ -706,7 +707,8 @@ TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system w
     std::vector<Call> calls;
 
     // Exit code containers: TryGet in every state, Get where the code is there; the pointers' checks.
-    for (const u32 status : {0u, 1u, 4u, 5u, 0x10001u, 0x20001u, 0x10005u, 0x20005u, 0xFFFFFFFBu, 0xFFFFFFFFu}) {
+    for (const u32 status : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 0xAu, 0xEu, 0xFu, 0x10001u, 0x20001u, 0x10005u, 0x20005u,
+             0x10002u, 0x20006u, 0x10006u, 0x3000Fu, 0xFFFFFFFBu, 0xFFFFFFFFu}) {
         const auto setup = [status](u8* b) {
             std::memset(b + kContainer, 0, 128);
             ps_write32(b, kContainer + 0x20, status);
@@ -716,7 +718,9 @@ TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system w
         };
         const std::string what = std::format("status {:#x}", status);
         calls.push_back({"cellSpursTaskExitCodeTryGet", {kContainer, kOut}, setup, what});
-        if ((status & 5) == 5) calls.push_back({"cellSpursTaskExitCodeGet", {kContainer, kOut}, setup, what});
+        // Get where it does not wait: no task started (bit 1 clear), another waiter (bits 16, 17), the code there.
+        if (!(status & 2) || (status & 0x30000) || (status & 4))
+            calls.push_back({"cellSpursTaskExitCodeGet", {kContainer, kOut}, setup, what});
     }
     const auto unbound = [](u8* b) { std::memset(b + kContainer, 0, 128); };
     for (const char* fn : {"cellSpursTaskExitCodeTryGet", "cellSpursTaskExitCodeGet"}) {
@@ -751,6 +755,9 @@ TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system w
         calls.push_back({"cellSpursCreateTask2WithBinInfo", {kTaskset, kOut, kBin, 0, 0, 0, 0}, setup, what + " ELF + 8"});
         for (const char* fn : {"cellSpursJoinTask2", "cellSpursTryJoinTask2"}) {
             calls.push_back({fn, {0, 1, kOut}, setup, what + " no taskset"});
+            calls.push_back({fn, {kTaskset, 1, 0}, setup, what + " no exit code"});
+            calls.push_back({fn, {kTaskset + 0x10, 200, 0}, setup, what + " misaligned, task 200, no exit code"});
+            calls.push_back({fn, {kTaskset + 0x10, 200, kOut}, setup, what + " misaligned, task 200"});
             calls.push_back({fn, {kTaskset + 0x10, 1, kOut}, setup, what + " misaligned"});
             calls.push_back({fn, {kTaskset, 128, kOut}, setup, what + " task 128"});
             calls.push_back({fn, {kTaskset, 0xFFFFFFFF, kOut}, setup, what + " task -1"});
@@ -776,11 +783,16 @@ TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system w
         }
     }
     for (const char* fn : {"_cellSpursLFQueuePushBody", "_cellSpursLFQueuePopBody"}) {
-        const auto setup = [](u8* b) { put_lfqueue(b, kLfq, 2, 4, 0, 0, kTaskset); };
-        calls.push_back({fn, {0, kSrc, 0}, setup, "no queue"});
-        calls.push_back({fn, {kLfq, 0, 0}, setup, "no buffer"});
-        calls.push_back({fn, {kLfq + 0x40, kSrc, 0}, setup, "misaligned queue"});
-        calls.push_back({fn, {kLfq, kSrc + 8, 0}, setup, "misaligned buffer"});
+        for (const u32 direction : {1u, 2u}) {
+            const auto setup = [direction](u8* b) { put_lfqueue(b, kLfq, direction, 4, 0, 2, kTaskset); };
+            const std::string d = std::format(" (direction {})", direction);
+            calls.push_back({fn, {0, kSrc, 0}, setup, "no queue" + d});
+            calls.push_back({fn, {kLfq, 0, 0}, setup, "no buffer" + d});
+            calls.push_back({fn, {kLfq + 0x40, kSrc, 0}, setup, "misaligned queue" + d});
+            calls.push_back({fn, {kLfq + 0x40, 0, 0}, setup, "misaligned queue, no buffer" + d});
+            calls.push_back({fn, {kLfq, kSrc + 8, 0}, setup, "misaligned buffer" + d});
+            calls.push_back({fn, {kLfq, kSrc + 3, 0}, setup, "a buffer at an odd address" + d});
+        }
     }
     // The lv2 event queue's refusals: none to detach; an SPU2SPU queue; bad pointers.
     for (const u32 direction : {0u, 1u, 2u, 3u}) {
@@ -807,6 +819,18 @@ TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system w
             calls.push_back({"cellSpursGetJobPipelineInfo", {kSpurs, wid, kInfo}, setup,
                 std::format("wid {} second {} round {}", wid, second, round)});
     }
+    // Its second argument is one of the instance's SPU thread IDs (cellSpursGetSpuThreadId's list, at +0xD34, as
+    // many as +0x76 says): IDs there (lv2 has no such SPU thread: its answer), past the count, and none.
+    for (const u32 n : {0u, 3u, 6u, 8u}) {
+        const auto setup = [n](u8* b) {
+            std::memset(b + kSpurs, 0, 0x1000);
+            b[kSpurs + 0x76] = static_cast<u8>(n);
+            for (u32 i = 0; i < 8; i++) ps_write32(b, kSpurs + 0xD34 + 4 * i, 0x02000100 + i);
+        };
+        for (const u32 id : {0x02000100u, 0x02000102u, 0x02000105u, 0x02000107u, 0x02000108u, 0u})
+            calls.push_back({"cellSpursGetJobPipelineInfo", {kSpurs, id, kInfo}, setup,
+                std::format("{} SPU threads, thread {:#x}", n, id)});
+    }
     calls.push_back({"cellSpursGetJobPipelineInfo", {0, 1, kInfo}, nullptr, "no instance"});
     calls.push_back({"cellSpursGetJobPipelineInfo", {kSpurs, 1, 0}, nullptr, "no info"});
     calls.push_back({"cellSpursGetJobPipelineInfo", {kSpurs + 0x40, 1, kInfo}, nullptr, "misaligned"});
@@ -827,6 +851,18 @@ TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system w
     }
     calls.push_back({"cellSpursRemoveSystemWorkloadForUtility", {0}, nullptr, "no instance"});
     calls.push_back({"cellSpursRemoveSystemWorkloadForUtility", {kSpurs + 0x40}, nullptr, "misaligned"});
+    // Its argument is a handle libsre's export 0xD9A9C592 marks and registers. (A marked one is looked for in libsre's
+    // table under its lightweight mutex, which libsre's module_start makes and this fixture does not run: libsre would
+    // assert on the lock's ESRCH. Only handles without the mark are sent.)
+    for (const u64 mark : {0xCE3F7FF5653795B8ull, 0x653795B9CE3F7FF5ull, 0ull}) {
+        const auto setup = [mark](u8* b) {
+            std::memset(b + kSpurs, 0, 0x100);
+            ps_write64(b, kSpurs, mark);
+        };
+        calls.push_back({"cellSpursRemoveSystemWorkloadForUtility", {kSpurs}, setup, std::format("a handle {:#x}", mark)});
+        calls.push_back({"cellSpursRemoveSystemWorkloadForUtility", {kSpurs + 0x80}, setup,
+            std::format("the handle {:#x} 0x80 on", mark)});
+    }
 
     compare_or_self(t, sony ? &*sony : nullptr, calls);
 }

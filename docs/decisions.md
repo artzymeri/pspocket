@@ -10427,3 +10427,40 @@ cellKey2char matches Sony's libkey2char over its comparison (part 3: 74,278 obse
 firmware-first mark goes (D-563): a game gets pspocket's cellKey2char with the system software installed or not. The
 comparison loses its [.] and joins the gate (under a second; it skips without the firmware), its name check requiring
 the library unmarked, as test_key2char.cpp does.
+
+## D-914 · 2026-10-11 · cellSpurs' exit code containers, Task2 joins, LF queue bodies, job pipeline and utility workload as libsre has them (part 5)
+
+The comparison of D-626 to D-629's functions with libsre (written without the module, never run before) ran for the
+first time: 27 of 212 calls differed. libsre was read where they did (fw 4.92), and pspocket's now does what it does:
+- **Exit code containers** (0x13538 to 0x13BC4). The status word at +0x20 is the high half of a doubleword libsre
+  updates atomically: bit 0 bound (creation writes the word 1, the taskset at +0x50, the byte at +0x39 0, before the
+  task starts), bit 1 started (set once the task is: only then may the code be asked for; a taskset whose shutdown is
+  done, its word at +0x1894 1, has the code marked as given by the shutdown, bits 2 and 3), bit 2 the code stored, bit
+  3 the task ended by the shutdown, bits 16 and 17 a PPU thread or an SPU task waiting. TryGet and Get: NULL, ALIGN;
+  not started STAT; another waiter BUSY; the code there is taken (TASK_ERROR_SHUTDOWN with bit 3) and the status word
+  cleared, so it is had once (D-627 gave it as often as asked, and STAT only without bit 0); none yet: TryGet AGAIN
+  (D-627: BUSY), Get waits (libsre marks bit 16 and waits on an lv2 event flag; pspocket's sleeps on the line, D-169).
+- **cellSpursJoinTask2 and TryJoinTask2** check the taskset and the exit code pointer for NULL (an exit code pointer is
+  required: D-626 took NULL), the ALIGN and the ID's range before anything else of the taskset, so a CellSpursTaskset
+  with task 128 is INVAL, not PERM.
+- **_cellSpursLFQueuePushBody and PopBody**: PushBody looks at the queue's alignment before NULL, PopBody after; neither
+  looks at the buffer's alignment (cellSync's bodies do, D-169; sync_lfqueue_body takes a flag); a signal refused as
+  INVAL or STAT becomes 0x80410914.
+- **cellSpursGetJobPipelineInfo(spurs, spuThreadId, info)**: its second argument is one of the instance's SPU thread
+  IDs (cellSpursGetSpuThreadId's list), not a workload ID: NULL, ALIGN, a thread that is none of them INVAL, then
+  libsre reads that SPU's local store (from 0xA00) through lv2, answering lv2's error as it is, and INVAL unless the
+  job chain policy module is there. A native SPURS runs no SPU thread of its own and never that module in one: lv2's
+  answer (ESRCH for the IDs it lists), else INVAL.
+- **cellSpursRemoveSystemWorkloadForUtility(handle)**: its argument is not the instance but a 128-byte handle libsre's
+  unnamed export 0xD9A9C592 marks (0xCE3F7FF5653795B9) and registers in a table of 32 when it adds libsre's own system
+  utility workload (libsysutil_music, music_decode and rec import both). NULL, ALIGN, a handle without the mark INVAL;
+  then the handle is looked for (not there: INVAL) and removed. pspocket has no 0xD9A9C592 (its workload is libsre's
+  SPU code), so nothing is ever registered: a marked handle is INVAL too, logged. D-629's instance-flag model is gone.
+The comparison, widened to 295 calls (the container in 21 states, joins without an exit code pointer, the bodies'
+checks in both directions with buffers at odd addresses, the job pipeline for thread IDs listed and not, handles with
+and without the mark), now shows 0 differences; a marked handle is not sent (libsre takes its table's lightweight mutex,
+which its module_start makes and the fixture does not run: it asserts on ESRCH). Its report now lists the differing
+calls (UNSCOPED_INFO's went to the next passing REQUIRE). Not native yet, recorded: 0xD9A9C592; the taskset shutdown's
+completion, which marks the containers of the tasks it ended (libsre 0x14DF8); libsre's Task2 exit slots (ExitCode2: a
+waiter word and the code with a state byte, joined through them) where D-626 joins through the event flags directly.
+Tests: tests/hle/test_spurs_task2.cpp's container, join, body, pipeline and utility cases follow libsre's answers.

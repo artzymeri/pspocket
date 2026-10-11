@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <string_view>
 #include <functional>
 #include <initializer_list>
 #include <string>
@@ -428,10 +429,11 @@ TEST_CASE("CellSpursTaskset2: a task that exited keeps its ID until it is joined
         CHECK(ps_read32(s.b, kExit + 4) == 0x55);
         CHECK(s.report(0, 16) == 2);
     }
-    // Joined without an exit code pointer: the code is not written, the ID is free again.
-    ps_write32(s.b, kExit, 0xDEAD);
-    REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, e, 0) == 0);
-    CHECK(ps_read32(s.b, kExit) == 0xDEAD);
+    // An exit code pointer is needed (NULL_POINTER, libsre's first check).
+    CHECK(s.a.call("cellSpursJoinTask2", kTs2, e, 0) == code(TASK | kNull));
+    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, e, 0) == code(TASK | kNull));
+    REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, e, kExit) == 0);
+    CHECK(ps_read32(s.b, kExit) == 0x66);
     REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, c, kExit) == 0);
     CHECK(ps_read32(s.b, kExit) == 0x77);
     const u32 again = s.create(3, exiting_task(0x88), "again");
@@ -562,7 +564,7 @@ TEST_CASE("cellSpursTaskExitCodeGet and TryGet: their checks; a container cellSp
         CHECK(s.a.call(fn, kContainer + 0x40, kExit) == code(TASK | kAlign));
         CHECK(s.a.call(fn, kUnmapped, kExit) == code(TASK | kFault));
         CHECK(s.a.call(fn, kContainer, kUnmapped) == code(TASK | kFault));
-        // No task bound to it yet: nothing will ever store a code.
+        // No task started with it: nothing will store a code.
         CHECK(s.a.call(fn, kContainer, kExit) == code(TASK | kStat));
     }
 
@@ -575,11 +577,12 @@ TEST_CASE("cellSpursTaskExitCodeGet and TryGet: their checks; a container cellSp
     REQUIRE(s.a.call("cellSpursTaskAttributeSetExitCodeContainer", kTaskAttr, kContainer) == 0);
     CHECK(s.a.call("cellSpursCreateTaskWithAttribute", kTs2, kId, kTaskAttr) == 0);
     const u32 id = ps_read32(b, kId);
-    CHECK(ps_read32(b, kContainer + 0x20) == 1);
+    CHECK(ps_read32(b, kContainer + 0x20) == 3); // bound, then started (libsre's two steps)
+    CHECK(ps_read64(b, kContainer + 0x50) == kTs2);
     CHECK(ps_read64(b, kTs2 + 0x80 + 0x30 * id + 0x10) == (kElf | 1));
     CHECK(ps_read64(b, kTs2 + 0x1980 + 16 * id) == ps_read64(b, kTs2 + 0x1900));
     CHECK(ps_read64(b, kTs2 + 0x1988 + 16 * id) == kContainer);
-    CHECK(s.a.call("cellSpursTaskExitCodeTryGet", kContainer, kExit) == code(TASK | kBusy)); // not run yet
+    CHECK(s.a.call("cellSpursTaskExitCodeTryGet", kContainer, kExit) == code(TASK | kAgain)); // not run yet
     {
         Caller get(s.f, 1, "cellSpursTaskExitCodeGet", {kContainer, kExit + 4});
         CHECK(get.blocked());
@@ -588,11 +591,10 @@ TEST_CASE("cellSpursTaskExitCodeGet and TryGet: their checks; a container cellSp
         CHECK(get.result == 0);
         CHECK(ps_read32(b, kExit + 4) == 0x77);
     }
-    CHECK(line_word(b, kContainer + 0x20) == 5); // initialized, the code stored
+    CHECK(line_word(b, kContainer + 0x20) == 0); // the code taken: the status word cleared
     CHECK(ps_read32(b, kContainer + 0x28) == 0x77);
-    REQUIRE(s.a.call("cellSpursTaskExitCodeTryGet", kContainer, kExit) == 0); // as often as asked
-    CHECK(ps_read32(b, kExit) == 0x77);
-    REQUIRE(s.a.call("cellSpursTaskExitCodeGet", kContainer, kExit) == 0);
+    CHECK(s.a.call("cellSpursTaskExitCodeTryGet", kContainer, kExit) == code(TASK | kStat)); // taken once
+    CHECK(s.a.call("cellSpursTaskExitCodeGet", kContainer, kExit) == code(TASK | kStat));
     CHECK(s.report(0) == 1);
 
     // Bound to a second task (one that waits for a signal first): the old code is forgotten until the new one's comes.
@@ -606,10 +608,14 @@ TEST_CASE("cellSpursTaskExitCodeGet and TryGet: their checks; a container cellSp
     REQUIRE(s.a.call("cellSpursTaskAttributeSetExitCodeContainer", kTaskAttr, kContainer) == 0);
     REQUIRE(s.a.call("cellSpursCreateTaskWithAttribute", kTs2, kId, kTaskAttr) == 0);
     const u32 waiter = ps_read32(b, kId);
-    CHECK((line_word(b, kContainer + 0x20) & 5) == 1);
-    CHECK(s.a.call("cellSpursTaskExitCodeTryGet", kContainer, kExit) == code(TASK | kBusy));
+    CHECK(line_word(b, kContainer + 0x20) == 3);
+    CHECK(s.a.call("cellSpursTaskExitCodeTryGet", kContainer, kExit) == code(TASK | kAgain));
     REQUIRE(wait_for([&] { return s.report(1) == 1 && s.task_bit(0x50, waiter); }));
+    CHECK(s.a.call("cellSpursTaskExitCodeTryGet", kContainer, kExit) == code(TASK | kAgain));
+    // Another waiter's mark (bit 16 or 17): BUSY.
+    ps_write32(b, kContainer + 0x20, 0x20003);
     CHECK(s.a.call("cellSpursTaskExitCodeTryGet", kContainer, kExit) == code(TASK | kBusy));
+    ps_write32(b, kContainer + 0x20, 3);
     REQUIRE(s.a.call("_cellSpursSendSignal", kTs2, waiter) == 0);
     REQUIRE(s.a.call("cellSpursTaskExitCodeGet", kContainer, kExit) == 0);
     CHECK(ps_read32(b, kExit) == 0x78);
@@ -735,7 +741,9 @@ TEST_CASE("_cellSpursLFQueuePushBody and PopBody: a taskset's queues pushed and 
         CHECK(s.a.call(fn, 0, kSrc, 0) == code(TASK | kNull));
         CHECK(s.a.call(fn, kLfq, 0, 0) == code(TASK | kNull));
         CHECK(s.a.call(fn, kLfq + 64, kSrc, 0) == code(TASK | kAlign));
-        CHECK(s.a.call(fn, kLfq, kSrc + 8, 0) == code(TASK | kAlign));
+        // libsre's order: PushBody looks at the queue's alignment before NULL, PopBody after (D-914).
+        CHECK(s.a.call(fn, kLfq + 64, 0, 0) ==
+            code(TASK | (std::string_view(fn) == "_cellSpursLFQueuePushBody" ? kAlign : kNull)));
         CHECK(s.a.call(fn, kUnmapped, kSrc, 0) == code(TASK | kFault));
     }
 
@@ -748,6 +756,7 @@ TEST_CASE("_cellSpursLFQueuePushBody and PopBody: a taskset's queues pushed and 
         CHECK(ps_read32(b, kLfqBuf + 16 * (v - 1)) == v);
     }
     CHECK(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc, 0) == code(TASK | kAgain));
+    CHECK(s.a.call("_cellSpursLFQueuePushBody", kLfq, kSrc + 8, 0) == code(TASK | kAgain)); // no buffer alignment
     CHECK(s.a.call("_cellSpursLFQueuePopBody", kLfq, kDst, 0) == code(TASK | kPerm));
     for (u32 v = 1; v <= 4; v++) {
         u32 value = 0;
@@ -925,7 +934,7 @@ TEST_CASE("cellSpursLFQueueAttachLv2EventQueue and Detach: an lv2 queue on a dyn
 
 // ------------------------------------------------------------------------------------------------- D-629
 
-TEST_CASE("cellSpursGetJobPipelineInfo: its checks, then STAT: no job chain of a native SPURS stops in a job (D-629)",
+TEST_CASE("cellSpursGetJobPipelineInfo: its checks; an SPU thread of the instance's, read through lv2 (D-914)",
     "[hle][spurs][spurs-task2]")
 {
     Task2Fixture s(false);
@@ -933,48 +942,38 @@ TEST_CASE("cellSpursGetJobPipelineInfo: its checks, then STAT: no job chain of a
     std::memset(b + kPrio, 0, 8);
     ps_write64(b, kCmds, 0x7F); // END
     REQUIRE(s.a.call("cellSpursCreateJobChain", kSpurs, kChain, kCmds, 0x80, 4, kPrio, 1, 1, 4, 5) == 0);
-    const u32 jwid = ps_read32(b, kChain + 0x74);
-    CHECK(s.a.call("cellSpursGetJobPipelineInfo", 0, jwid, kOutWord) == code(JOB | kNull));
-    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, jwid, 0) == code(JOB | kNull));
-    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs + 0x40, jwid, kOutWord) == code(JOB | kAlign));
-    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kUnmapped, jwid, kOutWord) == code(JOB | kFault));
-    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, 16, kOutWord) == code(JOB | kInval)); // SPURS1: 16
-    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, 15, kOutWord) == code(JOB | kSrch));  // no workload 15
-    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, s.wid, kOutWord) == code(JOB | kInval)); // a taskset
+    // Its second argument is an SPU thread ID: one of the instance's (cellSpursGetSpuThreadId's list), else INVAL.
+    constexpr u32 kThreads = kOutWord + 0x10;
+    ps_write32(b, kThreads + 0x20, 8);
+    REQUIRE(s.a.call("cellSpursGetSpuThreadId", kSpurs, kThreads, kThreads + 0x20) == 0);
+    REQUIRE(ps_read32(b, kThreads + 0x20) == 1);
+    const u32 thread = ps_read32(b, kThreads);
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", 0, thread, kOutWord) == code(JOB | kNull));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, thread, 0) == code(JOB | kNull));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs + 0x40, thread, kOutWord) == code(JOB | kAlign));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kUnmapped, thread, kOutWord) == code(JOB | kFault));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, thread + 1, kOutWord) == code(JOB | kInval));
+    // The instance's thread: libsre reads its local store; a native SPURS has no such SPU thread (lv2's ESRCH).
     ps_write32(b, kOutWord, 0x5A5A5A5A);
-    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, jwid, kOutWord) == code(JOB | kStat));
+    CHECK(s.a.call("cellSpursGetJobPipelineInfo", kSpurs, thread, kOutWord) == r3_of(lv2::CELL_ESRCH));
     CHECK(ps_read32(b, kOutWord) == 0x5A5A5A5A); // nothing written
     REQUIRE(s.a.call("cellSpursShutdownJobChain", kChain) == 0);
     REQUIRE(s.a.call("cellSpursJoinJobChain", kChain) == 0);
 }
 
-TEST_CASE("cellSpursRemoveSystemWorkloadForUtility: an instance made with the system workload gives it up; PERM for "
-          "one without (D-629)", "[hle][spurs][spurs-task2]")
+TEST_CASE("cellSpursRemoveSystemWorkloadForUtility: a handle of libsre's system utility workload, never registered "
+          "natively (D-914)", "[hle][spurs][spurs-task2]")
 {
-    constexpr u32 kSwlPrio = kData + 0x15500, kPreempt = kData + 0x15510, kPlain = kData + 0x18000;
+    constexpr u32 kHandle = kData + 0x18000;
     Fixture f(config(false));
     GuestThread a(f, 0, "ppu");
     u8* b = f.base();
-    const u8 swl_prio[8] = {0, 1, 0, 0, 0, 0, 0, 0}, preempt[8] = {1, 1, 0, 0, 0, 0, 0, 0};
-    std::memcpy(b + kSwlPrio, swl_prio, 8);
-    std::memcpy(b + kPreempt, preempt, 8);
-    REQUIRE(a.call("_cellSpursAttributeInitialize", kSpursAttr, 2, 0x330000, 2, 200, 2016, 0) == 0);
-    REQUIRE(a.call("cellSpursAttributeEnableSystemWorkload", kSpursAttr, kSwlPrio, 1, kPreempt) == 0);
-    REQUIRE(a.call("cellSpursInitializeWithAttribute", kSpurs, kSpursAttr) == 0);
-    CHECK(a.call("cellSpursSetPreemptionVictimHints", kSpurs, kPreempt) == 0);
     CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", 0) == code(CORE | kNull));
-    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kSpurs + 0x40) == code(CORE | kAlign));
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kHandle + 0x40) == code(CORE | kAlign));
     CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kUnmapped) == code(CORE | kNull));
-    ps_write32(b, kSpurs + 0xD6C, 1); // an exception
-    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kSpurs) == code(CORE | kStat));
-    ps_write32(b, kSpurs + 0xD6C, 0);
-    REQUIRE(a.call("cellSpursRemoveSystemWorkloadForUtility", kSpurs) == 0);
-    CHECK((ps_read32(b, kSpurs + 0xD80) & 0x02000000u) == 0);
-    CHECK(a.call("cellSpursSetPreemptionVictimHints", kSpurs, kPreempt) == code(CORE | kPerm));
-    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kSpurs) == code(CORE | kPerm)); // given up already
-    CHECK(a.call("cellSpursFinalize", kSpurs) == 0);
-    // One made without it.
-    REQUIRE(a.call("cellSpursInitialize", kPlain, 1, 200, 2016, 0) == 0);
-    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kPlain) == code(CORE | kPerm));
-    CHECK(a.call("cellSpursFinalize", kPlain) == 0);
+    std::memset(b + kHandle, 0, 0x100);
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kHandle) == code(CORE | kInval)); // not marked
+    ps_write64(b, kHandle, 0xCE3F7FF5653795B9ull);
+    CHECK(a.call("cellSpursRemoveSystemWorkloadForUtility", kHandle) == code(CORE | kInval)); // marked, not registered
+    CHECK(ps_read64(b, kHandle) == 0xCE3F7FF5653795B9ull);
 }

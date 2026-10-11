@@ -1201,11 +1201,12 @@ s32 _cellSyncLFQueueCompletePopPointer2(PPUContext& ctx, u32 queue, s32 pointer,
 // then CompletePushPointer (CompletePopPointer, noQueueFull 0) without a signal function. An ANY2ANY queue goes through
 // the second forms, as RPCS3's bodies call them (D-625). `host_signal`: the signal function cellSpurs' bodies give the
 // completion (D-628); the cellSync bodies have none.
+// `check_buffer` false: the buffer's alignment is not looked at (libsre's SPURS bodies, D-914).
 s32 lf_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push,
-    const spurs::LfSignal* host_signal)
+    const spurs::LfSignal* host_signal, bool check_buffer = true)
 {
     if (!queue || !buffer) return null_pointer(ctx, fn, queue);
-    if (queue % kLfQueueAlign || buffer % 16) return misaligned(ctx, fn, queue);
+    if (queue % kLfQueueAlign || (check_buffer && buffer % 16)) return misaligned(ctx, fn, queue);
     if (const s32 rc = check_memory(ctx, fn, queue, "queue", queue, kLfQueueSize); rc != lv2::CELL_OK) return rc;
     u8* base = guest_base(ctx);
     const bool any2any = ps_read32(base, queue + lfq_off::direction) == CELL_SYNC_QUEUE_ANY2ANY;
@@ -1490,9 +1491,9 @@ s32 sync_lfqueue_complete_pop_pointer(PPUContext& ctx, u32 queue, s32 pointer, u
 
 // For cellSpurs' _cellSpursLFQueuePushBody and PopBody (D-628).
 s32 sync_lfqueue_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push,
-    const LfSignal& signal)
+    const LfSignal& signal, bool check_buffer)
 {
-    return lf_body(ctx, fn, queue, buffer, is_blocking, push, &signal);
+    return lf_body(ctx, fn, queue, buffer, is_blocking, push, &signal, check_buffer);
 }
 } // namespace spurs
 

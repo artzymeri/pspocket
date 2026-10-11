@@ -218,20 +218,25 @@ constexpr u32 spurs = 0x60, args = 0x68, enable_clear_ls = 0x70, wkl_flag_wait_t
 // exit callback's descriptor and argument, or a CellSpursTaskset2 task's exit code in its first word, D-626).
 constexpr u32 event_flag_id1 = 0x1898, event_flag_id2 = 0x189C, task_name_buffer = 0x18A8, exit_code_handler = 0x1900,
               exit_slots = 0x1980;
+// The word libsre sets to 1 when the taskset's shutdown completes (its tasks' exit code containers marked then).
+constexpr u32 shutdown_done = 0x1894;
 }
 // A CellSpursTaskset2 task's lv2 event flag (its ID's offset in the taskset) and bit (D-626).
 constexpr u32 task2_flag_offset(u32 id) { return id < 64 ? ts_off::event_flag_id1 : ts_off::event_flag_id2; }
 constexpr u64 task2_flag_bit(u32 id) { return u64{1} << (id & 63); }
 constexpr u32 CELL_SPURS_MAX_TASK_NAME_LENGTH = 32; // a name in the task name buffer, its NUL included
 
-// CellSpursTaskExitCode (128 bytes, 128-aligned) as libsre's exit code handler uses it (D-195, D-627): the status word
-// (bit 0 initialized: a task created with the container will store its code; bit 2 the code is stored; bit 16 a PPU
-// thread waits, libsre's own PPU side with an event flag at +0x40; bit 17 an SPU task waits), the exit code, and a
-// waiting SPU task's taskset (u64) and ID (a byte).
+// CellSpursTaskExitCode (128 bytes, 128-aligned) as libsre uses it (D-195, D-627, D-914): the status word (bit 0 bound:
+// a task created with the container will store its code; bit 1 the task started, so the code may be asked for; bit 2
+// the code is stored; bit 3 the task ended by its taskset's shutdown; bit 16 a PPU thread waits, libsre's own PPU side
+// with an event flag at +0x40; bit 17 an SPU task waits), the exit code, a waiting SPU task's taskset (u64) and ID (a
+// byte), the byte at +0x39 libsre clears at binding, and the taskset the task was made in (u64 at +0x50).
 namespace exitcode_off {
-constexpr u32 status = 0x20, code = 0x28, waiter_taskset = 0x30, waiter_id = 0x38, size = 0x80;
+constexpr u32 status = 0x20, code = 0x28, waiter_taskset = 0x30, waiter_id = 0x38, byte39 = 0x39, taskset = 0x50,
+              size = 0x80;
 }
-constexpr u32 kExitCodeInitialized = 1u, kExitCodeStored = 4u, kExitCodePpuWaits = 1u << 16, kExitCodeSpuWaits = 1u << 17;
+constexpr u32 kExitCodeInitialized = 1u, kExitCodeStarted = 2u, kExitCodeStored = 4u, kExitCodeShutdown = 8u,
+              kExitCodePpuWaits = 1u << 16, kExitCodeSpuWaits = 1u << 17;
 
 // CellSpursJobChainAttribute (8-aligned) and CellSpursJobChain (128-aligned; create clears 0x110 bytes), as libsre
 // lays them out (fw 4.92, D-054). RPCS3's cellSpurs.h swaps the attribute's name and haltOnError, puts maxGrabbedJob
@@ -367,6 +372,6 @@ using LfSignal = std::function<s32(PPUContext& ctx, u32 ea_signal, u32 waiter)>;
 // ones) with `signal` waking the waiter a completion takes, for cellSpurs' _cellSpursLFQueuePushBody and PopBody
 // (D-628): CELL_OK, a CELL_SYNC_ERROR_* or the signal's result.
 s32 sync_lfqueue_body(PPUContext& ctx, std::string_view fn, u32 queue, u32 buffer, u32 is_blocking, bool push,
-    const LfSignal& signal);
+    const LfSignal& signal, bool check_buffer = true);
 
 } // namespace pspocket::hle::spurs
