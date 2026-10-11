@@ -22,6 +22,10 @@ endif()
 # test_hle "[compare][synth2]".
 target_sources(test_hle PRIVATE test_synth2.cpp test_synth2_compare.cpp)
 
+# libsnd3 over libsynth2 (D-640 to D-643): test_hle "[snd3]" (test_snd.cpp, above); its comparison with Sony's module
+# (D-644), hidden: test_hle "[compare][snd3]".
+target_sources(test_hle PRIVATE test_snd3_compare.cpp)
+
 # The C library compared with a game's statically linked copy of the SDK's (D-904): test_hle "[gamelibc]", skipped without
 # PSPOCKET_TEST_AC_EBOOT and PSPOCKET_TEST_AC_LIBC_MAP (game_executable.hpp).
 target_sources(test_hle PRIVATE
