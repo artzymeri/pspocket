@@ -1,19 +1,24 @@
 // The small sysutil libraries (synthetic: no game data): user info on a temporary /dev_hdd0, screenshots, storage
 // data, system settings, the web browser's setup, AV chat, the licence area, the NP EULA, the access point, remote
-// play, video upload, printing, the auth dialog, the cross controller and cellGameExec (D-183).
+// play, video upload, printing, the auth dialog, the cross controller and cellGameExec (D-183); the access point mode,
+// background downloads, the auth dialog's Abort and Close, cellGameExec's games and the RTC alarms (D-671 to D-673).
 
 #include <catch_amalgamated.hpp>
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "hle_test_util.hpp"
+#include "psf.hpp"
 #include "pspocket/ppu/runtime.h"
 #include "pspocket/recomp/ppu/asm.hpp"
 
@@ -292,4 +297,277 @@ TEST_CASE("NP EULA, video upload, print, cross controller, cellGameExec (D-183)"
     CHECK(a.call("cellGameGetHomeDataExportPath", kStr) == r3_of_code(0x8002cb08));
     CHECK(a.call("cellGameGetHomePath", kStr) == 0);
     CHECK(a.call("cellGameGetHomeLaunchOptionPath", kStr, 0) == r3_of_code(0x8002cb07));
+}
+
+// ---- pspocket's own where RPCS3 has stubs (D-671 to D-673)
+
+namespace {
+
+constexpr u32 kUnmapped = 0x0FFF0000; // in the main area, never committed by these tests
+
+bool all_bytes(const u8* p, usize n, u8 value)
+{
+    for (usize i = 0; i < n; i++)
+        if (p[i] != value) return false;
+    return true;
+}
+
+// <dir>/PARAM.SFO of `category` for `title_id`.
+void write_sfo(const fsys::path& dir, std::string_view category, std::string_view title_id)
+{
+    fsys::create_directories(dir);
+    hle::psf::Registry sfo;
+    sfo["CATEGORY"] = hle::psf::string(4, category);
+    sfo["TITLE_ID"] = hle::psf::string(16, title_id);
+    sfo["TITLE"] = hle::psf::string(128, "Synthetic");
+    const std::vector<u8> bytes = hle::psf::save(sfo);
+    std::ofstream(dir / "PARAM.SFO", std::ios::binary)
+        .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+void check_unverified(std::string_view module, std::initializer_list<u32> nids)
+{
+    for (const u32 nid : nids) {
+        INFO(module << " " << std::hex << nid);
+        CHECK(hle::registry().is_unverified(module, nid));
+    }
+}
+
+} // namespace
+
+TEST_CASE("cellSysutilAp: the access point mode never comes on; off is off (D-671)", "[hle][sysutil][sysutil-ap]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    REQUIRE_FALSE(f.mem.is_committed(kData + 0x300000));
+    constexpr u32 kParam = kData + 0x100;
+    const u64 kInvalidValue = r3_of_code(0x8002cd02), kNoCable = r3_of_code(0x8002cd15);
+
+    // CellSysutilApParam: type, wlanFlag, titleId[9]+3, ssid[33]+3, wpakey[65]+3 (124 bytes).
+    std::memset(base + kParam, 0, 124);
+    ps_write32(base, kParam, 1);
+    ps_write32(base, kParam + 4, 1);
+    put(base, kParam + 8, "NPEB00001");
+    put(base, kParam + 20, "pspocket");
+    put(base, kParam + 56, "secret-key");
+    std::vector<u8> before(base + kParam, base + kParam + 124);
+
+    CHECK(a.call("cellSysutilApOn", 0, 0) == kInvalidValue);
+    CHECK(a.call("cellSysutilApOn", kUnmapped, 0) == kInvalidValue);
+    CHECK(a.call("cellSysutilApOn", kData + 0x300000 - 64, 0) == kInvalidValue); // runs out of guest memory
+    CHECK(a.call("cellSysutilApOn", kParam, 0x12345678) == kNoCable);
+    CHECK(a.call("cellSysutilApOn", kParam, 0xFFFFFFFF) == kNoCable); // the same each time
+    CHECK(std::equal(before.begin(), before.end(), base + kParam));
+    CHECK(a.call("cellSysutilApOff") == 0);
+    CHECK(a.call("cellSysutilApOff") == 0);
+    CHECK(a.call("cellSysutilApGetRequiredMemSize") == 1024 * 1024);
+    check_unverified("cellSysutilAp", {0x3343824C, 0x90C2BB19});
+}
+
+TEST_CASE("cellAuthDialog: Abort and Close of the dialog cellAuthDialogOpen opened (D-672)",
+    "[hle][sysutil][authdialog]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    const u64 kNoDialog = r3_of_code(0x8002d203);
+
+    CHECK(a.call("cellAuthDialogAbort") == kNoDialog);
+    CHECK(a.call("cellAuthDialogClose") == kNoDialog);
+    CHECK(a.call("cellAuthDialogOpen", 0) == r3_of_code(0x8002d202)); // refused: no dialog
+    CHECK(a.call("cellAuthDialogAbort") == kNoDialog);
+
+    // Abort leaves the dialog to Close; Close ends it.
+    REQUIRE(a.call("cellAuthDialogOpen", 1) == 0);
+    CHECK(a.call("cellAuthDialogAbort") == 0);
+    CHECK(a.call("cellAuthDialogAbort") == 0);
+    CHECK(a.call("cellAuthDialogClose", 0) == 0);
+    CHECK(a.call("cellAuthDialogClose", 0) == kNoDialog);
+    CHECK(a.call("cellAuthDialogAbort") == kNoDialog);
+
+    // Close without an abort; a second Open while one is open is still one dialog (RPCS3's CELL_OK).
+    REQUIRE(a.call("cellAuthDialogOpen", 0x100000000ull) == 0);
+    CHECK(a.call("cellAuthDialogClose", 0) == 0);
+    REQUIRE(a.call("cellAuthDialogOpen", 2) == 0);
+    REQUIRE(a.call("cellAuthDialogOpen", 3) == 0);
+    CHECK(a.call("cellAuthDialogClose", 0) == 0);
+    CHECK(a.call("cellAuthDialogClose", 0) == kNoDialog);
+    check_unverified("cellAuthDialogUtility", {0xEB27885B, 0x975D4824});
+}
+
+TEST_CASE("cellGameExec: no other game booted, listed or deleted; no exit information (D-672)",
+    "[hle][sysutil][gameexec]")
+{
+    const fsys::path root = fsys::temp_directory_path() / ("pspocket-hle-gameexec-" + std::to_string(::getpid()));
+    fsys::remove_all(root);
+    // This game (an HDD game), another installed one, and game data that is no game.
+    write_sfo(root / "hdd0" / "game" / "NPEB00001", "HG", "NPEB00001");
+    write_sfo(root / "hdd0" / "game" / "NPEB00002", "HG", "NPEB00002");
+    write_sfo(root / "hdd0" / "game" / "SAVEDATA1", "GD", "NPEB00001");
+    write_sfo(root / "bdvd" / "PS3_GAME", "DG", "BLES00001");
+
+    hle::ProcessConfig config;
+    config.game.title_id = "NPEB00001";
+    config.game.boot = hle::GameInfo::Boot::Hdd;
+    Fixture f(config);
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    constexpr u32 kName = kData + 0x100, kNum = kData + 0x200, kGot = kData + 0x204, kBuf = kData + 0x300,
+                  kStatus = kData + 0x800, kType = kData + 0x804, kDir = kData + 0x810, kExec = kData + 0x830,
+                  kUser = kData + 0x834;
+    const u64 kNotFound = r3_of_code(0x8002cb04), kParam = r3_of_code(0x8002cb07), kNoApp = r3_of_code(0x8002cb08),
+              kNotSupported = r3_of_code(0x8002cb21);
+    const auto name = [&](std::string_view s) {
+        put(base, kName, s);
+        return kName;
+    };
+
+    // The list: no game, both counts 0, the buffer untouched; the counts' pointers are checked.
+    std::memset(base + kBuf, 0xA5, 0x400);
+    ps_write32(base, kNum, 0xA5A5A5A5);
+    ps_write32(base, kGot, 0xA5A5A5A5);
+    REQUIRE(a.call("cellGameGetList", 16, kBuf, kNum, kGot, 0) == 0);
+    CHECK(ps_read32(base, kNum) == 0);
+    CHECK(ps_read32(base, kGot) == 0);
+    CHECK(all_bytes(base + kBuf, 0x400, 0xA5));
+    CHECK(a.call("cellGameGetList", 16, kBuf, 0, kGot, 0) == kParam);
+    CHECK(a.call("cellGameGetList", 16, kBuf, kNum, 0, 0) == kParam);
+    CHECK(a.call("cellGameGetList", 16, kBuf, kUnmapped, kGot, 0) == kParam);
+
+    // Deleting: an installed game stays (another's, or this one), what is no game or not there is NOTFOUND, and a
+    // name that is no directory name is PARAM.
+    CHECK(a.call("cellGameDeleteGame", name("NPEB00002"), 0) == kNotSupported);
+    CHECK(a.call("cellGameDeleteGame", name("NPEB00001"), 0) == kNotSupported);
+    CHECK(fsys::exists(root / "hdd0" / "game" / "NPEB00002" / "PARAM.SFO"));
+    CHECK(fsys::exists(root / "hdd0" / "game" / "NPEB00001" / "PARAM.SFO"));
+    CHECK(a.call("cellGameDeleteGame", name("SAVEDATA1"), 0) == kNotFound);
+    CHECK(a.call("cellGameDeleteGame", name("NOSUCHGAME"), 0) == kNotFound);
+    CHECK(a.call("cellGameDeleteGame", 0, 0) == kParam);
+    CHECK(a.call("cellGameDeleteGame", kUnmapped, 0) == kParam);
+    for (const char* bad : {"", "../game", "_NPEB0000", "npeb00002", "NPEB/0002"}) {
+        INFO(bad);
+        CHECK(a.call("cellGameDeleteGame", name(bad), 0) == kParam);
+    }
+    std::memset(base + kName, 'A', 32); // no NUL within CELL_GAME_DIRNAME_SIZE
+    CHECK(a.call("cellGameDeleteGame", kName, 0) == kParam);
+
+    // Booting another game: HDD and DISC; Home is gone; other types are PARAM.
+    CHECK(a.call("cellGameExecGame", 2, name("NPEB00002"), 0, 0, 0x11, 0x22) == kNotSupported);
+    CHECK(a.call("cellGameExecGame", 2, name("NPEB00001"), 0, 0, 0, 0) == kNotSupported); // this game
+    CHECK(a.call("cellGameExecGame", 2, name("NOSUCHGAME"), 0, 0, 0, 0) == kNotFound);
+    CHECK(a.call("cellGameExecGame", 2, name("SAVEDATA1"), 0, 0, 0, 0) == kNotFound);
+    CHECK(a.call("cellGameExecGame", 2, 0, 0, 0, 0, 0) == kParam);
+    CHECK(a.call("cellGameExecGame", 2, name("../x"), 0, 0, 0, 0) == kParam);
+    CHECK(a.call("cellGameExecGame", 1, 0, 0, 0, 0, 0) == kNotFound); // an HDD game, no disc in the drive
+    REQUIRE(f.kernel->vfs_mount("/dev_bdvd", (root / "bdvd").string(), true));
+    CHECK(a.call("cellGameExecGame", 1, 0, 0, 0, 0, 0) == kNotSupported);
+    CHECK(a.call("cellGameExecGame", 4, 0, 0, 0, 0, 0) == kNoApp);
+    for (const u32 type : {0u, 3u, 5u, 0xFFFFFFFFu}) {
+        INFO("type " << type);
+        CHECK(a.call("cellGameExecGame", type, name("NPEB00002"), 0, 0, 0, 0) == kParam);
+    }
+    CHECK(fsys::exists(root / "hdd0" / "game" / "NPEB00002" / "PARAM.SFO"));
+
+    // The exit information: none (no game was booted from this one), nothing written.
+    std::memset(base + kStatus, 0xA5, 0x40);
+    REQUIRE(a.call("cellGameGetExitGameInfo", kStatus, kType, kDir, kExec, kUser) == 0);
+    CHECK(all_bytes(base + kStatus, 0x40, 0xA5));
+    CHECK(a.call("cellGameGetExitGameInfo", kStatus, kType, kDir, 0, 0) == 0);
+    CHECK(a.call("cellGameGetExitGameInfo", 0, kType, kDir, kExec, kUser) == kParam);
+    CHECK(a.call("cellGameGetExitGameInfo", kStatus, 0, kDir, kExec, kUser) == kParam);
+    CHECK(a.call("cellGameGetExitGameInfo", kStatus, kType, 0, kExec, kUser) == kParam);
+    CHECK(a.call("cellGameGetExitGameInfo", kStatus, kType, kUnmapped, kExec, kUser) == kParam);
+    CHECK(all_bytes(base + kStatus, 0x40, 0xA5));
+
+    check_unverified("cellGameExec", {0x93D4AE69, 0x34B74160, 0xCA872C41, 0x7767C4E3});
+    fsys::remove_all(root);
+}
+
+TEST_CASE("cellGameExec: a disc game's disc is in the drive (D-672)", "[hle][sysutil][gameexec]")
+{
+    Fixture f; // a disc boot, no /dev_hdd0
+    GuestThread a(f, 0, "a");
+    CHECK(a.call("cellGameExecGame", 1, 0, 0, 0, 0, 0) == r3_of_code(0x8002cb21));
+    put(f.base(), kData + 0x100, "BLES00001");
+    CHECK(a.call("cellGameExecGame", 2, kData + 0x100, 0, 0, 0, 0) == r3_of_code(0x8002cb04));
+    CHECK(a.call("cellGameDeleteGame", kData + 0x100, 0) == r3_of_code(0x8002cb04));
+}
+
+TEST_CASE("cellBGDL: no background download (no PSN); the mode kept (D-671)", "[hle][sysutil][bgdl]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    REQUIRE_FALSE(f.mem.is_committed(kUnmapped));
+    REQUIRE_FALSE(f.mem.is_committed(kData + 0x300000));
+    constexpr u32 kId = kData + 0x100, kInfo = kData + 0x200, kMode = kData + 0x400;
+    const u64 kParam = r3_of_code(0x8002ce03);
+    put(base, kId, "EP0001-NPEB00001_00-0000000000000001");
+
+    // The mode: AUTO (0) at first; ALWAYS_ALLOW (1) or AUTO kept; nothing else.
+    ps_write32(base, kMode, 0xA5A5A5A5);
+    REQUIRE(a.call("cellBGDLGetMode", kMode) == 0);
+    CHECK(ps_read32(base, kMode) == 0);
+    REQUIRE(a.call("cellBGDLSetMode", 1) == 0);
+    REQUIRE(a.call("cellBGDLGetMode", kMode) == 0);
+    CHECK(ps_read32(base, kMode) == 1);
+    CHECK(a.call("cellBGDLSetMode", 2) == kParam);
+    CHECK(a.call("cellBGDLSetMode", 0xFFFFFFFF) == kParam);
+    REQUIRE(a.call("cellBGDLGetMode", kMode) == 0);
+    CHECK(ps_read32(base, kMode) == 1);
+    REQUIRE(a.call("cellBGDLSetMode", 0) == 0);
+    REQUIRE(a.call("cellBGDLGetMode", kMode) == 0);
+    CHECK(ps_read32(base, kMode) == 0);
+    CHECK(a.call("cellBGDLGetMode", 0) == kParam);
+    CHECK(a.call("cellBGDLGetMode", kUnmapped) == kParam);
+
+    // No download: 0 entries, nothing written; the buffer for `num` entries (24 bytes each) is checked.
+    for (const char* fn : {"cellBGDLGetInfo", "cellBGDLGetInfo2"}) {
+        INFO(fn);
+        std::memset(base + kInfo, 0xA5, 0x100);
+        CHECK(a.call(fn, kId, kInfo, 4) == 0);
+        CHECK(a.call(fn, 0, kInfo, 4) == 0); // no ID: none either
+        CHECK(a.call(fn, kId, 0, 0) == 0);
+        CHECK(all_bytes(base + kInfo, 0x100, 0xA5));
+        CHECK(a.call(fn, kId, 0, 1) == kParam);
+        CHECK(a.call(fn, kId, kInfo, -1) == kParam);
+        CHECK(a.call(fn, kId, kUnmapped, 1) == kParam);
+        CHECK(a.call(fn, kUnmapped, kInfo, 1) == kParam);
+        CHECK(a.call(fn, kId, kData + 0x300000 - 24, 1) == 0);
+        CHECK(a.call(fn, kId, kData + 0x300000 - 24, 2) == kParam); // the second entry is not guest memory
+        CHECK(a.call(fn, kId, kInfo, 0x7FFFFFFF) == kParam);
+    }
+    check_unverified("cellBGDLUtility", {0x4E9BB95B, 0x2AB0D183, 0x7E134A90, 0x74E57BDF});
+}
+
+TEST_CASE("cellRtcAlarm: registrations kept, no alarm rings, no argument read or written (D-673)",
+    "[hle][sysutil][rtcalarm]")
+{
+    Fixture f;
+    u8* base = f.base();
+    GuestThread a(f, 0, "a");
+    constexpr u32 kBuf = kData + 0x100;
+    std::memset(base + kBuf, 0xA5, 0x100);
+
+    CHECK(a.call("cellRtcAlarmRegister", kBuf, kBuf + 0x10, kBuf + 0x20, kBuf + 0x30) == 0);
+    CHECK(a.call("cellRtcAlarmRegister", kBuf, kBuf + 0x10, kBuf + 0x20, kBuf + 0x30) == 0); // again: replaced
+    CHECK(a.call("cellRtcAlarmGetStatus", kBuf, kBuf + 0x40) == 0);
+    CHECK(a.call("cellRtcAlarmNotification", kBuf, kBuf + 0x40) == 0);
+    CHECK(a.call("cellRtcAlarmStopRunning", kBuf) == 0);
+    CHECK(a.call("cellRtcAlarmUnregister", kBuf) == 0);
+    CHECK(a.call("cellRtcAlarmUnregister", kBuf) == 0); // none kept under it: still CELL_OK
+    // Arguments that are no guest memory are not dereferenced either.
+    CHECK(a.call("cellRtcAlarmRegister", kUnmapped, 0xFFFFFFFF, 0, 0) == 0);
+    CHECK(a.call("cellRtcAlarmGetStatus", kUnmapped, 0xFFFFFFFF) == 0);
+    CHECK(a.call("cellRtcAlarmNotification", 0xFFFFFFFF) == 0);
+    CHECK(a.call("cellRtcAlarmStopRunning", 0) == 0);
+    CHECK(a.call("cellRtcAlarmUnregister", kUnmapped) == 0);
+    // Past the 256 kept, each is answered as the others.
+    for (u32 i = 0; i < 300; i++) CHECK(a.call("cellRtcAlarmRegister", i, 0, 0, 0) == 0);
+    for (u32 i = 0; i < 300; i++) CHECK(a.call("cellRtcAlarmUnregister", i) == 0);
+    CHECK(all_bytes(base + kBuf, 0x100, 0xA5));
+    check_unverified("cellRtcAlarm", {0x122D3DB1, 0x559234A3, 0xAD8D9839, 0xB287748C, 0xDB215455});
 }

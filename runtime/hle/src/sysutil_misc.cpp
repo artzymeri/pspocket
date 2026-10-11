@@ -11,8 +11,17 @@
 // (cellSysutil.cpp). The user list picks the current user (RPCS3's fallback without its overlay), the cross
 // controller's "waiting for PS Vita" dialog is cancelled, and the system's callbacks reach the game at its
 // cellSysutilCheckCallback.
+//
+// pspocket's own where RPCS3 has stubs (D-671 to D-673), each unverified (D-594; these modules are always native, so
+// the marker only records that no Sony module was compared): background downloads (cellBGDLUtility, RPCS3
+// cellBgdl.cpp: none, no PSN), the access point mode's On and Off (never on: no wired LAN to bridge, no wireless access
+// point), the auth dialog's Abort and Close (of the dialog cellAuthDialogOpen opened), cellGameExec's game list,
+// deletion, execution and exit information (pspocket runs one game: no other is booted or deleted from it), and the
+// system's RTC alarms (cellRtcAlarm, RPCS3 cellRtcAlarm.cpp: registrations kept, none ever rings).
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <filesystem>
@@ -20,12 +29,17 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "guest.hpp"
+#include "psf.hpp"
+#include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
@@ -76,6 +90,45 @@ void put_string(u8* base, u32 addr, u32 capacity, std::string_view s)
     const usize n = std::min<usize>(s.size(), capacity - 1);
     std::memcpy(base + addr, s.data(), n);
     std::memset(base + addr + n, 0, capacity - n);
+}
+
+// Whether [addr, addr + size) is committed guest memory, page by page (guest_readable looks at the two ends only, for
+// a page at most; libc_guest.hpp's guest_range, which sys_libc keeps to itself).
+bool guest_span(lv2::PpuThread& t, u32 addr, u64 size)
+{
+    if (!size) return true;
+    if (u64{addr} + size > GuestMemory::kGuestSize) return false;
+    const u64 page = GuestMemory::host_page_size();
+    for (u64 p = addr & ~(page - 1); p < u64{addr} + size; p += page)
+        if (!t.kernel.memory().is_committed(static_cast<u32>(p))) return false;
+    return true;
+}
+
+// Whether a pointer argument can take `size` bytes: non-null and guest memory. One that is not guest memory is logged
+// with the call site (D-042: a PS3 would fault).
+bool guest_out(PPUContext& ctx, u32 addr, u64 size, std::string_view what)
+{
+    if (!addr) return false;
+    if (guest_span(thread_of(ctx), addr, size)) return true;
+    log_call_site(ctx, guest_base(ctx), std::format("{} ({:#x}, {} bytes) is not guest memory", what, addr, size));
+    return false;
+}
+
+// A polled call's log line: its first kPolledInfoCalls at info (a warning for an error), later ones at debug.
+constexpr u32 kPolledInfoCalls = 4;
+s32 logged_polled(std::atomic<u32>& calls, std::string_view chan, s32 r, std::string_view call)
+{
+    if (calls.fetch_add(1, std::memory_order_relaxed) < kPolledInfoCalls) return logged(chan, r, call);
+    log::print(log::Level::Debug, chan, "{}: {}", call,
+        r < 0 ? std::format("{:#010x}", static_cast<u32>(r)) : std::to_string(r));
+    return r;
+}
+
+// The argument registers of a call whose signature is not known (RPCS3 registers the name only): logged, not read.
+std::string argument_registers(std::string_view name, const PPUContext& ctx)
+{
+    return std::format("{}(r3 {:#x}, r4 {:#x}, r5 {:#x}, r6 {:#x})", name, ctx.gpr[3], ctx.gpr[4], ctx.gpr[5],
+        ctx.gpr[6]);
 }
 
 // ------------------------------------------------------------------------------------- cellUserInfo
@@ -865,10 +918,54 @@ s32 sceNpEulaShowCurrentEula(PPUContext&, u32 communication_id, u64 arg2, u32 cb
     return logged("cellSysutilNpEula", lv2::CELL_OK, call);
 }
 
-// cellSysutilAp: the PS3 as a Wi-Fi access point for a PSP (remote play): 1 MB, and on and off do nothing (RPCS3).
+// cellSysutilAp: the PS3 as a Wi-Fi access point for a PSP (remote play): 1 MB (RPCS3).
 s32 cellSysutilApGetRequiredMemSize(PPUContext&)
 {
     return logged("cellSysutilAp", 1024 * 1024, "cellSysutilApGetRequiredMemSize()");
+}
+
+// The access point mode (D-671; RPCS3's On and Off are todos answering CELL_OK). It makes the console's wireless LAN an
+// access point bridged to its wired LAN, which it needs connected. pspocket's console has neither (an iPhone has no
+// Ethernet and cannot be made an access point), so the mode never comes on: On answers NETIF_NO_CABLE once its
+// parameters are checked, and Off, asked for a mode that is off, has nothing to do.
+enum : u32 {
+    CELL_SYSUTIL_AP_ERROR_INVALID_VALUE = 0x8002cd02,
+    CELL_SYSUTIL_AP_ERROR_NETIF_NO_CABLE = 0x8002cd15,
+};
+// CellSysutilApParam (RPCS3 cellSysutilAp.cpp, 124 bytes): be s32 type, wlanFlag; char titleId[9] + 3 at 8; char
+// ssid[33] + 3 at 20; char wpakey[65] + 3 at 56 (never logged).
+constexpr u32 kApParamSize = 124, kApTitleIdAt = 8, kApTitleIdLen = 9, kApSsidAt = 20, kApSsidLen = 32;
+
+// A fixed-size char field of a guest structure (checked already), up to its NUL.
+std::string fixed_string(u8* base, u32 addr, u32 max)
+{
+    std::string s;
+    for (u32 i = 0; i < max; i++) {
+        const char c = static_cast<char>(ps_read8(base, addr + i));
+        if (!c) break;
+        s += c;
+    }
+    return s;
+}
+
+// cellSysutilApOn(const CellSysutilApParam* pParam, sys_memory_container_t container).
+s32 cellSysutilApOn(PPUContext& ctx, u32 param, u32 container)
+{
+    std::string call = std::format("cellSysutilApOn({:#x}, container {:#x})", param, container);
+    if (!guest_out(ctx, param, kApParamSize, "cellSysutilApOn: pParam"))
+        return logged("cellSysutilAp", error(CELL_SYSUTIL_AP_ERROR_INVALID_VALUE), call);
+    u8* base = guest_base(ctx);
+    call += std::format(" {{type {}, wlanFlag {}, titleId \"{}\", ssid \"{}\"}}",
+        static_cast<s32>(ps_read32(base, param)), static_cast<s32>(ps_read32(base, param + 4)),
+        fixed_string(base, param + kApTitleIdAt, kApTitleIdLen), fixed_string(base, param + kApSsidAt, kApSsidLen));
+    PS_LOG_WARN("cellSysutilAp", "cellSysutilApOn: the access point mode needs a wired LAN to bridge and a wireless "
+                                 "LAN to be the access point; this console has neither");
+    return logged("cellSysutilAp", error(CELL_SYSUTIL_AP_ERROR_NETIF_NO_CABLE), call);
+}
+
+s32 cellSysutilApOff(PPUContext&)
+{
+    return logged("cellSysutilAp", lv2::CELL_OK, "cellSysutilApOff(): the access point mode is off");
 }
 
 // cellVideoUpload: the callback(status, errorCode, resultURL, userdata) hears INITIALIZED (1) then FINALIZED (2), both
@@ -917,10 +1014,53 @@ s32 cellPrintUnloadAsync(PPUContext&, u32 function, u32 userdata)
 }
 
 // cellAuthDialogUtility: a zero argument is 0x8002d202 (RPCS3's CELL_AUTHDIALOG_ARG1_IS_ZERO).
+//
+// D-672: the dialog cellAuthDialogOpen opens stays open (there is no UI to answer it) until cellAuthDialogClose.
+// Abort and Close of a dialog that is not open answer 0x8002d203: RPCS3's reading of libsysutil_authdialog
+// (cellAuthDialog.cpp: "If it fails the first if condition (not init cond?) return CELL_AUTHDIALOG_UNKNOWN_203").
+// Abort ends the dialog's interaction and leaves it to Close, as the other sysutil dialogs' aborts leave theirs to
+// their unload; Close's argument (RPCS3: "arg1", not known) is logged, not read.
+enum : u32 {
+    CELL_AUTHDIALOG_ARG1_IS_ZERO = 0x8002d202,
+    CELL_AUTHDIALOG_UNKNOWN_203 = 0x8002d203,
+};
+
+struct AuthDialogState {
+    std::mutex mutex;
+    bool open = false;
+    bool aborted = false;
+};
+
 s32 cellAuthDialogOpen(PPUContext&, u64 arg1)
 {
     const std::string call = std::format("cellAuthDialogOpen({:#x})", arg1);
-    return logged("cellAuthDialog", arg1 == 0 ? error(0x8002d202) : lv2::CELL_OK, call);
+    if (arg1 == 0) return logged("cellAuthDialog", error(CELL_AUTHDIALOG_ARG1_IS_ZERO), call);
+    AuthDialogState& d = state<AuthDialogState>();
+    std::lock_guard lock(d.mutex);
+    d.open = true;
+    d.aborted = false;
+    return logged("cellAuthDialog", lv2::CELL_OK, call);
+}
+
+s32 cellAuthDialogAbort(PPUContext&)
+{
+    AuthDialogState& d = state<AuthDialogState>();
+    std::lock_guard lock(d.mutex);
+    if (!d.open)
+        return logged("cellAuthDialog", error(CELL_AUTHDIALOG_UNKNOWN_203), "cellAuthDialogAbort(): no dialog");
+    d.aborted = true;
+    return logged("cellAuthDialog", lv2::CELL_OK, "cellAuthDialogAbort(): aborted, open until cellAuthDialogClose");
+}
+
+s32 cellAuthDialogClose(PPUContext& ctx)
+{
+    const std::string call = std::format("cellAuthDialogClose(r3 {:#x})", ctx.gpr[3]);
+    AuthDialogState& d = state<AuthDialogState>();
+    std::lock_guard lock(d.mutex);
+    if (!d.open) return logged("cellAuthDialog", error(CELL_AUTHDIALOG_UNKNOWN_203), call + ": no dialog");
+    const bool aborted = std::exchange(d.aborted, false);
+    d.open = false;
+    return logged("cellAuthDialog", lv2::CELL_OK, call + (aborted ? ": closed after an abort" : ": closed"));
 }
 
 // cellCrossController (LittleBigPlanet 2 and 3 talk to a PS Vita with it): RPCS3's checks, then the callback(status,
@@ -971,9 +1111,13 @@ s32 cellCrossControllerInitialize(PPUContext& ctx, u32 param, u32 pkg_info, u32 
 
 // cellGameExec: how the game was booted, and PlayStation Home's paths (Home is gone: NOAPP, as RPCS3).
 enum : u32 {
+    CELL_GAME_ERROR_NOTFOUND = 0x8002cb04,
     CELL_GAME_ERROR_PARAM = 0x8002cb07,
     CELL_GAME_ERROR_NOAPP = 0x8002cb08,
+    CELL_GAME_ERROR_NOTSUPPORTED = 0x8002cb21,
 };
+constexpr u32 CELL_GAME_GAMETYPE_DISC = 1, CELL_GAME_GAMETYPE_HDD = 2, CELL_GAME_GAMETYPE_HOME = 4;
+constexpr u32 CELL_GAME_DIRNAME_SIZE = 32;
 
 struct GameExecState {
     std::mutex mutex;
@@ -1027,6 +1171,269 @@ s32 cellGameGetHomeLaunchOptionPath(PPUContext&, u32 common, u32 personal)
     return home_path("cellGameGetHomeLaunchOptionPath", common && personal ? 1 : 0, error(CELL_GAME_ERROR_NOAPP));
 }
 
+// D-672: the games a PS3 has installed, deleted or booted through cellGameExec (RPCS3's signatures; its four are
+// todos answering CELL_OK). pspocket runs one game, the one it was built for (on iOS each game is an app of its own,
+// D-036), so no other game is booted or deleted from it. What is installed is read from pspocket's /dev_hdd0 as
+// cellGame reads it: /dev_hdd0/game/<dirName> with a PARAM.SFO of an HDD game's category (RPCS3 psf::is_cat_hdd); the
+// disc is in the drive when the game booted from it or /dev_bdvd has PS3_GAME/PARAM.SFO.
+//
+// A directory name: 1 to 31 characters of [A-Z0-9_-], not starting with '_' (RPCS3's sysutil_check_name_string, as
+// cellGameDeleteGameData checks its name), ending within CELL_GAME_DIRNAME_SIZE bytes; nullopt otherwise (logged when
+// it is not guest memory).
+std::optional<std::string> game_dir_name(PPUContext& ctx, u32 addr, std::string_view what)
+{
+    if (!addr) return std::nullopt;
+    const GuestString s = read_cstr(thread_of(ctx), addr, CELL_GAME_DIRNAME_SIZE);
+    if (s.faulted) {
+        log_call_site(ctx, guest_base(ctx), std::format("{} ({:#x}) is not guest memory", what, addr));
+        return std::nullopt;
+    }
+    const bool name_chars = std::all_of(s.text.begin(), s.text.end(),
+        [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'; });
+    if (!s.terminated || s.text.empty() || s.text[0] == '_' || !name_chars) return std::nullopt;
+    return s.text;
+}
+
+// Whether /dev_hdd0/game/<name> holds an installed HDD game.
+bool hdd_game_installed(lv2::Kernel& kernel, const std::string& name)
+{
+    std::vector<u8> bytes;
+    if (!kernel.vfs_read_file("/dev_hdd0/game/" + name + "/PARAM.SFO", bytes)) return false;
+    const std::optional<psf::Registry> sfo = psf::parse(bytes);
+    if (!sfo) return false;
+    const std::string cat = psf::get_string(*sfo, "CATEGORY");
+    return cat.size() == 2 && cat[1] != 'D' && cat != "DG" && cat != "MS";
+}
+
+bool disc_in_drive(lv2::Kernel& kernel)
+{
+    if (HleProcess::current()->config().game.boot == GameInfo::Boot::Disc) return true;
+    std::vector<u8> bytes;
+    return kernel.vfs_read_file("/dev_bdvd/PS3_GAME/PARAM.SFO", bytes);
+}
+
+// cellGameGetList(listBufNum, listBuf, u32* listNum, u32* getListNum, memContainer): no game is listed. The list's
+// entries are not known (RPCS3: "unk"), so none is written even where /dev_hdd0 holds games: both counts are 0.
+s32 cellGameGetList(PPUContext& ctx, u32 list_buf_num, u32 list_buf, u32 list_num, u32 get_list_num, u32 container)
+{
+    const std::string call = std::format("cellGameGetList(listBufNum {}, {:#x}, listNum {:#x}, getListNum {:#x}, "
+                                         "memContainer {:#x})",
+        list_buf_num, list_buf, list_num, get_list_num, container);
+    if (!guest_out(ctx, list_num, 4, "cellGameGetList: listNum") ||
+        !guest_out(ctx, get_list_num, 4, "cellGameGetList: getListNum")) {
+        return logged("cellGameExec", error(CELL_GAME_ERROR_PARAM), call);
+    }
+    u8* base = guest_base(ctx);
+    ps_write32(base, list_num, 0);
+    ps_write32(base, get_list_num, 0);
+    return logged("cellGameExec", lv2::CELL_OK, call + ": no game listed");
+}
+
+// cellGameDeleteGame(dirName, memContainer): an installed HDD game is not deleted at a game's request (the PS3 asks
+// the user in a dialog; there is none, and pspocket deletes no installation); one not installed is NOTFOUND.
+s32 cellGameDeleteGame(PPUContext& ctx, u32 dir_name, u32 container)
+{
+    const std::string shown =
+        dir_name ? read_cstr(thread_of(ctx), dir_name, CELL_GAME_DIRNAME_SIZE).text : std::string();
+    const std::string call =
+        std::format("cellGameDeleteGame({:#x} \"{}\", memContainer {:#x})", dir_name, shown, container);
+    const std::optional<std::string> name = game_dir_name(ctx, dir_name, "cellGameDeleteGame: dirName");
+    if (!name) return logged("cellGameExec", error(CELL_GAME_ERROR_PARAM), call);
+    if (!hdd_game_installed(thread_of(ctx).kernel, *name))
+        return logged("cellGameExec", error(CELL_GAME_ERROR_NOTFOUND), call + ": no such game installed");
+    PS_LOG_WARN("cellGameExec", "cellGameDeleteGame: /dev_hdd0/game/{} is not deleted at a game's request", *name);
+    return logged("cellGameExec", error(CELL_GAME_ERROR_NOTSUPPORTED), call);
+}
+
+// cellGameExecGame(type, dirName, options, memContainer, execData, userData): DISC or HDD (HOME: Home is gone, NOAPP);
+// a game that is not there is NOTFOUND, and one that is (this game too) is NOTSUPPORTED: pspocket boots no other
+// program from a running one (lv2's exitspawn, too, ends the process without the program it names).
+s32 cellGameExecGame(PPUContext& ctx, u32 type, u32 dir_name, u32 options, u32 container, u32 exec_data, u32 user_data)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    const std::string shown = dir_name ? read_cstr(t, dir_name, CELL_GAME_DIRNAME_SIZE).text : std::string();
+    const std::string call = std::format("cellGameExecGame(type {}, dirName {:#x} \"{}\", options {:#x}, memContainer "
+                                         "{:#x}, execData {:#x}, userData {:#x})",
+        type, dir_name, shown, options, container, exec_data, user_data);
+    switch (type) {
+    case CELL_GAME_GAMETYPE_HOME:
+        return logged("cellGameExec", error(CELL_GAME_ERROR_NOAPP), call + ": PlayStation Home is gone");
+    case CELL_GAME_GAMETYPE_DISC:
+        if (!disc_in_drive(t.kernel))
+            return logged("cellGameExec", error(CELL_GAME_ERROR_NOTFOUND), call + ": no disc in the drive");
+        break;
+    case CELL_GAME_GAMETYPE_HDD: {
+        const std::optional<std::string> name = game_dir_name(ctx, dir_name, "cellGameExecGame: dirName");
+        if (!name) return logged("cellGameExec", error(CELL_GAME_ERROR_PARAM), call);
+        if (!hdd_game_installed(t.kernel, *name))
+            return logged("cellGameExec", error(CELL_GAME_ERROR_NOTFOUND), call + ": no such game installed");
+        break;
+    }
+    default: return logged("cellGameExec", error(CELL_GAME_ERROR_PARAM), call);
+    }
+    PS_LOG_WARN("cellGameExec", "cellGameExecGame: pspocket runs this game only; it boots no other program from it");
+    return logged("cellGameExec", error(CELL_GAME_ERROR_NOTSUPPORTED), call);
+}
+
+// cellGameGetExitGameInfo(u32* status, u32* type, char* dirName, u32* execData, u32* userData): what the game this
+// one booted through cellGameExecGame left when it ended. None was ever booted, so there is nothing to tell: RPCS3's
+// CELL_OK with nothing written, once status, type and dirName are checked (execData and userData may be null, as
+// cellGameGetBootGameInfo's execdata).
+s32 cellGameGetExitGameInfo(PPUContext& ctx, u32 status, u32 type, u32 dir_name, u32 exec_data, u32 user_data)
+{
+    const std::string call = std::format("cellGameGetExitGameInfo({:#x}, {:#x}, {:#x}, {:#x}, {:#x})", status, type,
+        dir_name, exec_data, user_data);
+    if (!guest_out(ctx, status, 4, "cellGameGetExitGameInfo: status") ||
+        !guest_out(ctx, type, 4, "cellGameGetExitGameInfo: type") ||
+        !guest_out(ctx, dir_name, CELL_GAME_DIRNAME_SIZE, "cellGameGetExitGameInfo: dirName")) {
+        return logged("cellGameExec", error(CELL_GAME_ERROR_PARAM), call);
+    }
+    return logged("cellGameExec", lv2::CELL_OK, call + ": no game was booted from this one; nothing written");
+}
+
+// ------------------------------------------------------------------------------------- cellBGDLUtility
+
+// Background downloads (D-671; RPCS3 cellBgdl.cpp/.h: four todos answering CELL_OK): the PS3 downloads a game's PSN
+// content in the background while it runs, and the game reads how far each download has come. There is no PSN here
+// (D-139), so nothing is ever downloading:
+// - GetInfo(const char* content_id, CellBGDLInfo* info, s32 num) and GetInfo2 (a service ID) find no download: 0
+//   entries, RPCS3's CELL_OK read as the count, nothing written. The ID may be null (left as RPCS3 takes it); a buffer
+//   for num entries must be guest memory, and num must not be negative (CELL_BGDL_UTIL_ERROR_PARAM).
+// - SetMode keeps the mode, AUTO or ALWAYS_ALLOW (another is PARAM), and GetMode writes it; AUTO at first.
+// Polled calls are logged at info the first few times.
+enum : u32 {
+    CELL_BGDL_UTIL_ERROR_PARAM = 0x8002ce03,
+};
+constexpr u32 CELL_BGDL_MODE_AUTO = 0, CELL_BGDL_MODE_ALWAYS_ALLOW = 1;
+constexpr u32 kBgdlInfoSize = 24; // CellBGDLInfo: be64 received_size, content_size; be s32 state; be32 reserved
+constexpr u32 kBgdlIdMax = 48;    // read for the log: a content ID is 36 characters, a service ID fewer
+
+struct BgdlState {
+    std::mutex mutex;
+    u32 mode = CELL_BGDL_MODE_AUTO;
+    std::atomic<u32> info_calls{0}, mode_calls{0};
+};
+
+s32 bgdl_info(PPUContext& ctx, std::string_view name, u32 id, u32 info, s32 num)
+{
+    BgdlState& s = state<BgdlState>();
+    const GuestString text = id ? read_cstr(thread_of(ctx), id, kBgdlIdMax) : GuestString{};
+    const std::string call = std::format("{}(\"{}\", info {:#x}, num {})", name, text.text, info, num);
+    if (text.faulted) {
+        log_call_site(ctx, guest_base(ctx), std::format("{}: the ID ({:#x}) is not guest memory", name, id));
+        return logged_polled(s.info_calls, "cellBGDL", error(CELL_BGDL_UTIL_ERROR_PARAM), call);
+    }
+    if (num < 0 ||
+        (num > 0 && !guest_out(ctx, info, u64{kBgdlInfoSize} * static_cast<u32>(num), std::format("{}: info", name)))) {
+        return logged_polled(s.info_calls, "cellBGDL", error(CELL_BGDL_UTIL_ERROR_PARAM), call);
+    }
+    return logged_polled(s.info_calls, "cellBGDL", 0, call + ": no background download (no PSN), 0 entries");
+}
+
+s32 cellBGDLGetInfo(PPUContext& ctx, u32 content_id, u32 info, s32 num)
+{
+    return bgdl_info(ctx, "cellBGDLGetInfo", content_id, info, num);
+}
+
+s32 cellBGDLGetInfo2(PPUContext& ctx, u32 service_id, u32 info, s32 num)
+{
+    return bgdl_info(ctx, "cellBGDLGetInfo2", service_id, info, num);
+}
+
+s32 cellBGDLSetMode(PPUContext&, u32 mode)
+{
+    const std::string call = std::format("cellBGDLSetMode({})", mode);
+    if (mode != CELL_BGDL_MODE_AUTO && mode != CELL_BGDL_MODE_ALWAYS_ALLOW)
+        return logged("cellBGDL", error(CELL_BGDL_UTIL_ERROR_PARAM), call);
+    BgdlState& s = state<BgdlState>();
+    std::lock_guard lock(s.mutex);
+    s.mode = mode;
+    return logged("cellBGDL", lv2::CELL_OK, call);
+}
+
+s32 cellBGDLGetMode(PPUContext& ctx, u32 mode)
+{
+    BgdlState& s = state<BgdlState>();
+    const std::string call = std::format("cellBGDLGetMode({:#x})", mode);
+    if (!guest_out(ctx, mode, 4, "cellBGDLGetMode: mode"))
+        return logged_polled(s.mode_calls, "cellBGDL", error(CELL_BGDL_UTIL_ERROR_PARAM), call);
+    std::lock_guard lock(s.mutex);
+    ps_write32(guest_base(ctx), mode, s.mode);
+    return logged_polled(s.mode_calls, "cellBGDL", lv2::CELL_OK, call + std::format(": {}", s.mode));
+}
+
+// ------------------------------------------------------------------------------------- cellRtcAlarm
+
+// The system's RTC alarms (D-673; libsysutil_rtcalarm, an internal module, 0xf032 in RPCS3's cellSysmodule.cpp): what
+// an application registers to have the console woken from standby at a time (the system manager's RTC alarm, lv2's
+// sys_sm_set_rtc_alarm, which only the system may call). RPCS3 registers the five names with no arguments (each
+// UNIMPLEMENTED_FUNC answering CELL_OK) and nothing public describes them, so none of their arguments is read or
+// written: each call logs its argument registers. pspocket's console has no standby to wake from, so no alarm ever
+// rings or runs: Register keeps a registration under its first argument (the low word; what it names its alarm by is
+// not known), Unregister forgets the one kept under its first argument (one not kept is logged, and still CELL_OK:
+// the keys are a guess), Notification, StopRunning and GetStatus have no rung or running alarm to tell of. Every answer
+// is RPCS3's CELL_OK. Each function's first calls are logged at info.
+constexpr usize kMaxAlarms = 256; // registrations kept; more are answered and not kept (logged)
+
+enum class Alarm : u8 { Register, Unregister, Notification, StopRunning, GetStatus, Count };
+
+struct RtcAlarmState {
+    std::mutex mutex;
+    std::map<u32, std::array<u64, 4>> alarms; // by the first argument's low word: r3..r6 as given
+    std::array<std::atomic<u32>, static_cast<usize>(Alarm::Count)> calls{};
+};
+
+s32 alarm_logged(RtcAlarmState& s, Alarm fn, std::string_view call)
+{
+    return logged_polled(s.calls[static_cast<usize>(fn)], "cellRtcAlarm", lv2::CELL_OK, call);
+}
+
+s32 cellRtcAlarmRegister(PPUContext& ctx)
+{
+    std::string call = argument_registers("cellRtcAlarmRegister", ctx);
+    RtcAlarmState& s = state<RtcAlarmState>();
+    std::lock_guard lock(s.mutex);
+    const u32 key = static_cast<u32>(ctx.gpr[3]);
+    if (s.alarms.size() >= kMaxAlarms && !s.alarms.contains(key)) {
+        call += std::format(": not kept (already {} registrations)", kMaxAlarms);
+    } else {
+        s.alarms[key] = {ctx.gpr[3], ctx.gpr[4], ctx.gpr[5], ctx.gpr[6]};
+        call += std::format(": kept ({} in all); it never rings (no standby to wake from)", s.alarms.size());
+    }
+    return alarm_logged(s, Alarm::Register, call);
+}
+
+s32 cellRtcAlarmUnregister(PPUContext& ctx)
+{
+    const std::string call = argument_registers("cellRtcAlarmUnregister", ctx);
+    RtcAlarmState& s = state<RtcAlarmState>();
+    std::lock_guard lock(s.mutex);
+    const bool kept = s.alarms.erase(static_cast<u32>(ctx.gpr[3])) != 0;
+    return alarm_logged(s, Alarm::Unregister,
+        call + (kept ? std::format(": forgotten ({} left)", s.alarms.size()) : std::string(": none kept under it")));
+}
+
+s32 cellRtcAlarmNotification(PPUContext& ctx)
+{
+    return alarm_logged(state<RtcAlarmState>(), Alarm::Notification,
+        argument_registers("cellRtcAlarmNotification", ctx) + ": no alarm has rung; nothing written");
+}
+
+s32 cellRtcAlarmStopRunning(PPUContext& ctx)
+{
+    return alarm_logged(state<RtcAlarmState>(), Alarm::StopRunning,
+        argument_registers("cellRtcAlarmStopRunning", ctx) + ": no alarm is running");
+}
+
+s32 cellRtcAlarmGetStatus(PPUContext& ctx)
+{
+    RtcAlarmState& s = state<RtcAlarmState>();
+    std::lock_guard lock(s.mutex);
+    return alarm_logged(s, Alarm::GetStatus,
+        argument_registers("cellRtcAlarmGetStatus", ctx) +
+            std::format(": {} registered, none rung; nothing written", s.alarms.size()));
+}
+
 } // namespace
 
 bool sysutil_avc_loaded(u32& media)
@@ -1065,6 +1472,8 @@ void register_sysutil_misc(Registry& r)
     });
     r.add("cellSysutilAp", {
         PS_HLE_FUNC(0x9E67E0DD, cellSysutilApGetRequiredMemSize),
+        PS_HLE_UNVERIFIED(0x3343824C, cellSysutilApOn), // D-671
+        PS_HLE_UNVERIFIED(0x90C2BB19, cellSysutilApOff),
     });
     r.add("cellVideoUpload", {
         PS_HLE_FUNC(0x122E0D0F, cellVideoUploadInitialize),
@@ -1077,6 +1486,8 @@ void register_sysutil_misc(Registry& r)
     });
     r.add("cellAuthDialogUtility", {
         PS_HLE_FUNC(0x395EF8D7, cellAuthDialogOpen),
+        PS_HLE_UNVERIFIED(0xEB27885B, cellAuthDialogAbort), // D-672
+        PS_HLE_UNVERIFIED(0x975D4824, cellAuthDialogClose),
     });
     r.add("cellCrossController", {
         PS_HLE_FUNC(0x37E1F502, cellCrossControllerInitialize),
@@ -1119,6 +1530,23 @@ void register_sysutil_misc(Registry& r)
         PS_HLE_FUNC(0x72CC6CF7, cellGameGetHomeDataImportPath),
         PS_HLE_FUNC(0x59BBEBD4, cellGameGetHomePath),
         PS_HLE_FUNC(0x94E9F81D, cellGameGetHomeLaunchOptionPath),
+        PS_HLE_UNVERIFIED(0x93D4AE69, cellGameGetList), // D-672
+        PS_HLE_UNVERIFIED(0x34B74160, cellGameDeleteGame),
+        PS_HLE_UNVERIFIED(0xCA872C41, cellGameExecGame),
+        PS_HLE_UNVERIFIED(0x7767C4E3, cellGameGetExitGameInfo),
+    });
+    r.add("cellBGDLUtility", { // D-671
+        PS_HLE_UNVERIFIED(0x4E9BB95B, cellBGDLGetInfo),
+        PS_HLE_UNVERIFIED(0x2AB0D183, cellBGDLGetInfo2),
+        PS_HLE_UNVERIFIED(0x7E134A90, cellBGDLSetMode),
+        PS_HLE_UNVERIFIED(0x74E57BDF, cellBGDLGetMode),
+    });
+    r.add("cellRtcAlarm", { // D-673
+        PS_HLE_UNVERIFIED(0x122D3DB1, cellRtcAlarmRegister),
+        PS_HLE_UNVERIFIED(0x559234A3, cellRtcAlarmUnregister),
+        PS_HLE_UNVERIFIED(0xAD8D9839, cellRtcAlarmNotification),
+        PS_HLE_UNVERIFIED(0xB287748C, cellRtcAlarmStopRunning),
+        PS_HLE_UNVERIFIED(0xDB215455, cellRtcAlarmGetStatus),
     });
     r.add("cellSysutil", {
         PS_HLE_FUNC(0x27AC51E4, cellStorageDataImportMove),
