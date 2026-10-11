@@ -15,7 +15,27 @@ using namespace pspocket::hle::test;
 namespace {
 
 constexpr u32 kInfo = kData + 0x100, kOut = kData + 0x200, kAttr = kData + 0x300, kQueue = kData + 0x400;
+constexpr u32 kEvents = kData + 0x500, kCount = kData + 0x5F0;
 constexpr u32 kUnmapped = 0x0FFF0000; // in the main area, never committed by these tests
+
+// An lv2 event queue of 8 events under `key`; its ID at kQueue.
+void make_queue(GuestThread& g, u64 key)
+{
+    u8* b = g.f.base();
+    ps_write32(b, kAttr, lv2::SYS_SYNC_FIFO);
+    ps_write32(b, kAttr + 4, lv2::SYS_PPU_QUEUE);
+    ps_write64(b, kAttr + 8, 0);
+    REQUIRE(lv2::sys_event_queue_create(*g.t, kQueue, kAttr, key, 8) == 0);
+}
+
+// How many events wait in the queue at kQueue (taken).
+u32 queued_events(GuestThread& g)
+{
+    u8* b = g.f.base();
+    ps_write32(b, kCount, 0xAAAA);
+    REQUIRE(lv2::sys_event_queue_tryreceive(*g.t, ps_read32(b, kQueue), kEvents, 4, kCount) == 0);
+    return ps_read32(b, kCount);
+}
 
 } // namespace
 
@@ -84,6 +104,112 @@ TEST_CASE("cellCamera: initialised with no camera attached", "[hle][devices]")
     REQUIRE(g.call("cellCameraEnd") == 0);
     CHECK(g.call("cellCameraSetNotifyEventQueue", 0x1234) == kNotInit);
     CHECK(g.call("cellCameraGetAttribute", 0, 0, kOut, kAttr) == kNotInit);
+}
+
+TEST_CASE("cellCamera: the asynchronous forms refused as their synchronous forms, no event (D-665)",
+    "[hle][devices][camera]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "camera");
+    u8* b = f.base();
+    const u64 kNotInit = r3_of_code(0x80140803), kParam = r3_of_code(0x80140804), kNotOpen = r3_of_code(0x80140806),
+              kNotFound = r3_of_code(0x80140807), kFormat = r3_of_code(0x8014080A),
+              kResolution = r3_of_code(0x8014080B), kFramerate = r3_of_code(0x8014080C);
+    const char* const kOnOpen[] = {"cellCameraCloseAsync", "cellCameraClosePost", "cellCameraStartAsync",
+        "cellCameraStartPost", "cellCameraStopAsync", "cellCameraStopPost", "cellCameraResetAsync",
+        "cellCameraResetPost"};
+
+    // Before Init: the info pointer first (as Open), then init; the others the device number first (as Close).
+    std::memset(b + kInfo, 0, 64);
+    CHECK(g.call("cellCameraOpenAsync", 0, 0) == kParam);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kNotInit);
+    CHECK(g.call("cellCameraOpenPost", 0, kInfo) == kNotInit);
+    CHECK(g.call("cellCameraOpenPost", 1, kInfo) == kNotInit);
+    for (const char* fn : kOnOpen) {
+        INFO(fn);
+        CHECK(g.call(fn, 0) == kNotInit);
+        CHECK(g.call(fn, 1) == kParam);
+    }
+
+    REQUIRE(g.call("cellCameraInit") == 0);
+    // A notify queue asking for every completion event (CELL_CAMERA_EFLAG_OPEN to RESET) and frame updates.
+    make_queue(g, 0x8000000000CA0001ull);
+    REQUIRE(g.call("cellCameraSetNotifyEventQueue2", 0x8000000000CA0001ull, 0x33, 0x3F) == 0);
+
+    // OpenAsync: Open's checks in Open's order, then no camera; the info is left as it was.
+    CHECK(g.call("cellCameraOpenAsync", 0, 0) == kParam);
+    CHECK(g.call("cellCameraOpenAsync", 1, kInfo) == kParam);
+    CHECK(g.call("cellCameraOpenAsync", 0, kUnmapped) == kParam);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kFormat);
+    ps_write32(b, kInfo, 3); // YUV422
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kResolution);
+    ps_write32(b, kInfo + 4, 1); // VGA
+    ps_write32(b, kInfo + 8, 24);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kFramerate);
+    ps_write32(b, kInfo + 8, 60);
+    u8 before[64];
+    std::memcpy(before, b + kInfo, sizeof before);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kNotFound);
+    CHECK(std::memcmp(before, b + kInfo, sizeof before) == 0);
+
+    // OpenPost: no open was started; the device number, then no camera, the info not read.
+    CHECK(g.call("cellCameraOpenPost", 1, kInfo) == kParam);
+    CHECK(g.call("cellCameraOpenPost", 0, kInfo) == kNotFound);
+    CHECK(g.call("cellCameraOpenPost", 0, kUnmapped) == kNotFound);
+    CHECK(std::memcmp(before, b + kInfo, sizeof before) == 0);
+    CHECK(g.call("cellCameraIsOpen", 0) == 0);
+
+    // Close, Start, Stop and Reset, asynchronous or their Post: the camera never open.
+    for (const char* fn : kOnOpen) {
+        INFO(fn);
+        CHECK(g.call(fn, 0) == kNotOpen);
+        CHECK(g.call(fn, 1) == kParam);
+    }
+    CHECK(g.call("cellCameraIsStarted", 0) == 0);
+
+    // Nothing was started, so no completion event came.
+    CHECK(queued_events(g) == 0);
+
+    REQUIRE(g.call("cellCameraEnd") == 0);
+    CHECK(g.call("cellCameraOpenAsync", 0, kInfo) == kNotInit);
+    CHECK(g.call("cellCameraStartAsync", 0) == kNotInit);
+    CHECK(g.call("cellCameraStartPost", 0) == kNotInit);
+}
+
+TEST_CASE("cellCamera: Read2 and ResetAttribute with no camera open, SetContainer kept (D-666)",
+    "[hle][devices][camera]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "camera");
+    u8* b = f.base();
+    const u64 kNotInit = r3_of_code(0x80140803), kParam = r3_of_code(0x80140804), kNotOpen = r3_of_code(0x80140806);
+
+    CHECK(g.call("cellCameraRead2", 0, kOut) == kNotInit);
+    CHECK(g.call("cellCameraResetAttribute", 0, 0) == kNotInit);
+    CHECK(g.call("cellCameraResetAttribute", 1, 0) == kNotInit); // init before the device number, as GetAttribute
+    CHECK(g.call("cellCameraSetContainer", 0, 0x3F000001) == 0); // taken before Init too
+
+    REQUIRE(g.call("cellCameraInit") == 0);
+    // Read2 answers as Read and ReadEx: NOT_OPEN before the device number is looked at; nothing is written.
+    ps_write32(b, kOut, 0xAAAA);
+    CHECK(g.call("cellCameraRead2", 0, kOut) == kNotOpen);
+    CHECK(g.call("cellCameraRead2", 1, kOut) == kNotOpen);
+    CHECK(g.call("cellCameraReadEx", 1, kOut) == kNotOpen);
+    CHECK(g.call("cellCameraRead2", 0, kUnmapped) == kNotOpen);
+    CHECK(ps_read32(b, kOut) == 0xAAAA);
+    // ResetAttribute as Get/SetAttribute.
+    CHECK(g.call("cellCameraResetAttribute", 0, 0) == kNotOpen);
+    CHECK(g.call("cellCameraResetAttribute", 0, 9) == kNotOpen);
+    CHECK(g.call("cellCameraResetAttribute", 1, 0) == kParam);
+    CHECK(g.call("cellCameraGetAttribute", 1, 0, kOut, kAttr) == kParam);
+    // SetContainer: kept for an open that never comes, whatever it is given.
+    CHECK(g.call("cellCameraSetContainer", 0, 0x3F000002) == 0);
+    CHECK(g.call("cellCameraSetContainer", 1, 0) == 0);
+
+    REQUIRE(g.call("cellCameraEnd") == 0);
+    CHECK(g.call("cellCameraRead2", 0, kOut) == kNotInit);
+    CHECK(g.call("cellCameraResetAttribute", 0, 0) == kNotInit);
+    CHECK(g.call("cellCameraSetContainer", 0, 0x3F000003) == 0);
 }
 
 TEST_CASE("cellMic: initialised with no microphone registered", "[hle][devices]")
