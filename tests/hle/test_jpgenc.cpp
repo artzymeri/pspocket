@@ -981,6 +981,16 @@ constexpr u32 kAtCfg = 0x00, kAtRsrc = 0x20, kAtHandle = 0x40, kAtPic = 0x50, kA
               kAtInfo = 0xA0, kAtNum = 0xD0;
 static_assert(kCalls + 9 * 0x100 <= kPixels);
 
+bool eventually(const std::function<bool()>& done, std::chrono::milliseconds timeout = std::chrono::seconds(30))
+{
+    const auto end = std::chrono::steady_clock::now() + timeout;
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > end) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
 // cellJpgEncOpen of an encoder whose work memory is `work`, from the structures at `at`: its handle, or 0.
 u32 open_at(GuestThread& g, u32 at, u32 work, u32 max_w = 640, u32 max_h = 480)
 {
@@ -1100,4 +1110,84 @@ TEST_CASE("cellJpgEnc: two encoders on two threads at once, each stream the one 
     for (std::thread& th : threads) th.join();
     CHECK(rounds == 2 * kRounds);
     CHECK(wrong == 0);
+}
+
+TEST_CASE("cellJpgEnc: eight threads encoding with one encoder at once: four pictures queued, the others BUSY; a Reset "
+          "drops those still being encoded (D-651)", "[hle][jpgenc]")
+{
+    constexpr u32 kThreads = 8, kW = 256, kH = 192, kLimit = 0x10000;
+    static_assert(kStream + kThreads * kLimit <= kWork);
+    Fixture f;
+    GuestThread g(f, 0, "game");
+    u8* b = f.base();
+    put_picture(b, smooth(kW, kH, 17), RGB, kW * 3);
+    const u32 h = open_at(g, kCalls, kWork);
+    REQUIRE(h != 0);
+    const Pic pic{kW, kH, kW * 3, RGB};
+    // The stream the encoder makes of the picture alone.
+    REQUIRE(encode_at(g, h, kCalls, pic, {}, kStream, kLimit) == 0);
+    Info alone{};
+    REQUIRE(info_at(g, h, kCalls, alone) == 0);
+    REQUIRE(alone.state == 0);
+    const std::vector<u8> want(b + kStream, b + kStream + alone.size);
+
+    for (const bool reset : {false, true}) {
+        INFO("reset " << reset);
+        std::atomic<u32> ready{0}, busy{0};
+        std::atomic<bool> go{false};
+        std::array<std::atomic<u64>, kThreads> answers;
+        for (auto& a : answers) a = ~0ull;
+        std::vector<std::thread> threads;
+        for (u32 t = 0; t < kThreads; t++) {
+            threads.emplace_back([&, t] {
+                GuestThread o(f, 1 + t, "encoder");
+                Pic p = pic;
+                p.user = 0x700 + t;
+                ready++;
+                while (!go.load()) std::this_thread::yield();
+                const u64 r = encode_at(o, h, kCalls + 0x100 * (t + 1), p, {}, kStream + kLimit * t, kLimit);
+                answers[t] = r;
+                if (r == kBusy) busy++;
+            });
+        }
+        while (ready.load() < kThreads) std::this_thread::yield();
+        go = true;
+        if (reset) {
+            // Every thread has made its call once four were refused: the four taken still being encoded, or done.
+            CHECK(eventually([&] { return busy.load() == kThreads - 4; }));
+            REQUIRE(g.call("cellJpgEncReset", h) == 0);
+        }
+        for (std::thread& th : threads) th.join();
+        u32 refused = 0;
+        std::vector<u64> accepted;
+        for (u32 t = 0; t < kThreads; t++) {
+            if (answers[t] == 0) accepted.push_back(0x700 + t);
+            else if (answers[t] == kBusy) refused++;
+        }
+        CHECK(accepted.size() == 4);
+        CHECK(refused == 4);
+        if (!reset) {
+            // The four pictures taken, each the stream the encoder makes alone, in its own thread's buffer.
+            REQUIRE(g.call("cellJpgEncWaitForOutput", h, kCalls + kAtNum, 0) == 0);
+            CHECK(ps_read32(b, kCalls + kAtNum) == 4);
+            std::vector<u64> users;
+            for (u32 n = 0; n < 4; n++) {
+                Info s{};
+                REQUIRE(info_at(g, h, kCalls, s) == 0);
+                CHECK(s.state == 0);
+                users.push_back(s.user);
+                const u64 t = s.user - 0x700;
+                REQUIRE(t < kThreads);
+                CHECK(s.addr == kStream + kLimit * t);
+                REQUIRE(s.size == want.size());
+                CHECK(std::memcmp(b + s.addr, want.data(), want.size()) == 0);
+            }
+            std::sort(users.begin(), users.end());
+            CHECK(users == accepted);
+        }
+        // Nothing more: the four taken, or dropped by the Reset with what was still being encoded then; room again.
+        CHECK(g.call("cellJpgEncGetStreamInfo", h, kCalls + kAtInfo) == kEmpty);
+        CHECK(g.call("cellJpgEncWaitForInput", h, 0) == 0);
+    }
+    CHECK(g.call("cellJpgEncClose", h) == 0);
 }
