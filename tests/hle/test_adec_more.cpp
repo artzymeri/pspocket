@@ -1,7 +1,9 @@
-// cellAdec's cores of D-621 on FFmpeg: Dolby Digital Plus, MPEG-2 AAC, MP3 Surround and ATRAC3 multichannel. Streams
-// FFmpeg's encoders write in the tests' own FFmpeg (E-AC-3, AC-3, AAC: PSPOCKET_FFMPEG_ENCODERS, D-577), or frames
-// built here (MP3, ATRAC3): decoded through pspocket's cellAdec, the PCM against FFmpeg's own decoding of the same
-// units, every item, information block, PTS and error. The tests need FFmpeg (D-606). No game data.
+// cellAdec's cores of D-621 and D-622 on FFmpeg: Dolby Digital Plus, MPEG-2 AAC, MP3 Surround, ATRAC3 multichannel,
+// TrueHD, DTS (the core, DTS-HD, the DTS-HD core, DTS Express) and WMA 1 and 2. Streams FFmpeg's encoders write in the
+// tests' own FFmpeg (E-AC-3, AC-3, AAC, DTS, TrueHD, WMA 1 and 2: PSPOCKET_FFMPEG_ENCODERS, D-577), or frames built
+// here (MP3, ATRAC3): decoded through pspocket's cellAdec, the PCM against FFmpeg's own decoding of the same units
+// (TrueHD's against the signal put in, exactly), every item, information block, PTS and error. The tests need FFmpeg
+// (D-606). No game data.
 
 #include <catch_amalgamated.hpp>
 
@@ -217,8 +219,9 @@ std::vector<std::vector<double>> tones(u32 rate, u32 samples, const std::vector<
     return v;
 }
 
-// A 24-bit sample of x, as an encoder of 32-bit samples is given it.
+// A 24-bit sample of x (as the lossless encoders are given it) and its float, as the cores convert.
 s32 to24(double x) { return static_cast<s32>(std::lround(x * 8388607.0)); }
+float of24(double x) { return static_cast<float>(to24(x)) / 8388608.0f; }
 
 struct Encoded {
     std::vector<std::vector<u8>> packets;
@@ -444,6 +447,21 @@ double snr_db(const std::vector<float>& in, const std::vector<float>& out, u32 m
     return noise > 0 ? 10 * std::log10(signal / noise) : 999;
 }
 
+// The stereo downmix the cores make (adec_ffmpeg.cpp's stereo_downmix, the AAC cores' rule) of 5.1 in FFmpeg's order
+// (front left, right, centre, LFE, side or back left, right): each side its front, the centre and its surround at
+// 0.7071 over the coefficients' sum.
+Unit stereo_of_51(const Unit& u)
+{
+    constexpr float k = 0.70710678f;
+    const float norm = 1.0f + k + k;
+    Unit s(2, std::vector<float>(u[0].size()));
+    for (usize i = 0; i < u[0].size(); i++) {
+        s[0][i] = (u[0][i] / norm + (k / norm) * u[2][i]) + (k / norm) * u[4][i];
+        s[1][i] = (u[1][i] / norm + (k / norm) * u[2][i]) + (k / norm) * u[5][i];
+    }
+    return s;
+}
+
 bool close_to(const std::vector<float>& a, const std::vector<float>& b, double tolerance)
 {
     if (a.size() != b.size()) return false;
@@ -458,7 +476,8 @@ bool close_to(const std::vector<float>& a, const std::vector<float>& b, double t
 
 namespace {
 
-constexpr u32 kTypeM2Aac = 7, kTypeEac3 = 8, kTypeMp3s = 23, kTypeAtrac3Multi = 31;
+constexpr u32 kTypeM2Aac = 7, kTypeEac3 = 8, kTypeTrueHd = 9, kTypeDts = 10, kTypeWma = 18, kTypeDtsLbr = 19,
+              kTypeDtsHd = 21, kTypeMp3s = 23, kTypeDtsHdCore = 30, kTypeAtrac3Multi = 31;
 
 // CellAdecParamAc3 (RPCS3's layout, which Dolby Digital Plus takes, D-621). The pointers give each of Dolby's channels
 // (L, C, R, Ls, Rs, LFE) its output slot: by default WAV's order (L, R, C, LFE, Ls, Rs), as FFmpeg's.
@@ -623,6 +642,54 @@ double energy_near(const std::vector<float>& x, double rate, double freq, double
         if (std::abs(f - freq) <= width) near += e;
     }
     return total > 0 ? near / total : 0;
+}
+
+// TrueHD's and the DTS cores' parameters (CellAdecParamMpmc's layout, D-622).
+std::vector<u8> layout_param(u32 channel_number, u32 downmix = 0, u32 lfe = 0) { return be32s({channel_number, downmix, lfe}); }
+
+// pspocket's CellAdecParamWma (D-622).
+struct WmaParam {
+    u32 tag = 0x161, channels = 2, rate = 44100, avg_bytes = 16000, block = 743, bits = 16, mask = 0, options = 0,
+        layout = 0;
+};
+std::vector<u8> wma_param(const WmaParam& p)
+{
+    return be32s({p.tag, p.channels, p.rate, p.avg_bytes, p.block, p.bits, p.mask, p.options, p.layout});
+}
+
+// FFmpeg's WMA decoder `decoder` set up as the core sets it up from those parameters (its codec data as a WAV
+// file's).
+std::function<void(AVCodecContext*)> wma_setup(const WmaParam& p)
+{
+    return [=](AVCodecContext* av) {
+        std::vector<u8> extra;
+        const auto le = [&](u32 v, u32 bytes) {
+            for (u32 i = 0; i < bytes; i++) extra.push_back(static_cast<u8>(v >> (8 * i)));
+        };
+        if (p.tag == 0x160) {
+            le(0, 2);
+            le(p.options, 2);
+        } else if (p.tag == 0x161) {
+            le(0, 4);
+            le(p.options, 2);
+            le(0, 4);
+        } else {
+            le(p.bits, 2);
+            le(p.mask, 4);
+            le(0, 8);
+            le(p.options, 2);
+            le(0, 2);
+        }
+        av_channel_layout_uninit(&av->ch_layout);
+        if (p.mask) av_channel_layout_from_mask(&av->ch_layout, p.mask);
+        else av_channel_layout_default(&av->ch_layout, static_cast<int>(p.channels));
+        av->sample_rate = static_cast<int>(p.rate);
+        av->bit_rate = 8 * s64{p.avg_bytes};
+        av->block_align = static_cast<int>(p.block);
+        av->extradata = static_cast<u8*>(av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+        std::memcpy(av->extradata, extra.data(), extra.size());
+        av->extradata_size = static_cast<int>(extra.size());
+    };
 }
 
 } // namespace
@@ -1097,6 +1164,382 @@ TEST_CASE("cellAtracMulti plays a four-channel ATRAC3 file through pspocket's AT
     CHECK(energy_near(channel_of(pcm, 2, 0), 44100, 30.5 * 44100 / 2048, 150) > 0.8);
     CHECK(energy_near(channel_of(pcm, 2, 1), 44100, 100.5 * 44100 / 2048, 150) > 0.8);
     CHECK(call("cellAtracMultiDeleteDecoder", {kAtHandle}) == 0);
+}
+
+// ---- TrueHD (D-622)
+
+namespace {
+
+// FFmpeg's TrueHD decoder as its parser leaves it (the layout from the major sync, as the core opens it), downmixing
+// to stereo when asked.
+std::function<void(AVCodecContext*)> truehd_setup(const char* layout, bool stereo = false)
+{
+    return [=](AVCodecContext* av) {
+        av_channel_layout_uninit(&av->ch_layout);
+        REQUIRE(av_channel_layout_from_string(&av->ch_layout, layout) == 0);
+        if (stereo) av_opt_set(av, "downmix", "stereo", AV_OPT_SEARCH_CHILDREN);
+    };
+}
+
+} // namespace
+
+TEST_CASE("cellAdec: TrueHD on FFmpeg, 5.1 that FFmpeg's encoder wrote: the signal exactly, information, PTS, the "
+          "stereo and mono outputs, a stream joined between its major syncs, refusals (D-622)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_encoder_by_name("truehd")) SKIP("this FFmpeg has no truehd encoder (the tests' build: build-ffmpeg.sh)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    const auto input = tones(48000, 48000 / 10, {500, 800, 1200, 60, 1700, 2300});
+    const Encoded enc = encode("truehd", 48000, "5.1(side)", 0, input);
+    REQUIRE(enc.packets.size() == 120); // TrueHD's access units: 40 samples each
+    // Four TrueHD access units to each of cellAdec's (160 samples: 300 ticks).
+    std::vector<std::vector<u8>> units;
+    for (usize k = 0; k + 4 <= enc.packets.size(); k += 4)
+        units.push_back(concat({enc.packets[k], enc.packets[k + 1], enc.packets[k + 2], enc.packets[k + 3]}));
+    Feed feed;
+    feed.step = 300;
+    feed.aus = units;
+    feed.missing = {2, 7};
+    const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeTrueHd, layout_param(0), feed);
+    INFO(all(run));
+    REQUIRE(run.outs.size() == units.size());
+    CHECK(flow_ok(run, static_cast<u32>(units.size()), {}));
+    CHECK(pts_ok(run, feed)); // the core's own correction (type 27)
+    const Ref ref = reference("truehd", units, truehd_setup("5.1(side)"));
+    for (u32 k = 0; k < run.outs.size(); k++) {
+        INFO("access unit " << k);
+        const Out& o = run.outs[k];
+        CHECK(o.size == 160 * 6 * 4);
+        CHECK(o.pcm == pcm_of(ref.units[k]));
+        CHECK(be32(o.bsi, 0x00) == 48000);
+        CHECK(be32(o.bsi, 0x04) == 6);
+        CHECK(be32(o.bsi, 0x08) == 0x60F); // FL FR FC LFE SL SR
+        CHECK(be32(o.bsi, 0x0C) == 160);
+        CHECK(be32(o.bsi, 0x10) == 6);     // the major sync's presentation
+        CHECK(be32(o.bsi, 0x14) == 0x60F);
+        CHECK(be32(o.bsi, 0x18) == 0);
+        CHECK(be32(o.bsi, 0x1C) > 0);      // the peak data rate
+        CHECK(be32(o.bsi, 0x20) == 1);
+        CHECK(be32(o.bsi, 0x24) == 0);
+        CHECK(be32(o.bsi, 0x28) != 0);     // the format_info word
+        CHECK(be32(o.bsi, 0x2C) == 4);     // TrueHD access units
+    }
+    // Lossless: every sample the 24-bit input.
+    for (u32 c = 0; c < 6; c++) {
+        const auto out = joined(run, 6, c);
+        REQUIRE(out.size() == input[c].size());
+        u32 differ = 0;
+        for (usize i = 0; i < out.size(); i++) differ += out[i] != of24(input[c][i]);
+        INFO("channel " << c);
+        CHECK(differ == 0);
+    }
+    // Stereo: the stream's two-channel presentation where FFmpeg finds one, else pspocket's stereo downmix; mono that
+    // pair averaged.
+    const Ref stereo_ref = reference("truehd", units, truehd_setup("5.1(side)", true));
+    const CoreRun st = run_core(f.base(), hle_calls(f, t), kTypeTrueHd, layout_param(3), feed);
+    const CoreRun mono = run_core(f.base(), hle_calls(f, t), kTypeTrueHd, layout_param(1), feed);
+    REQUIRE(st.outs.size() == units.size());
+    REQUIRE(mono.outs.size() == units.size());
+    for (u32 k = 0; k < st.outs.size(); k++) {
+        INFO("access unit " << k);
+        const Unit pair = stereo_ref.units[k].size() == 2 ? stereo_ref.units[k] : stereo_of_51(stereo_ref.units[k]);
+        CHECK(st.outs[k].size == 160 * 2 * 4);
+        CHECK(close_to(channel_of(st.outs[k].pcm, 2, 0), pair[0], 1e-6));
+        CHECK(close_to(channel_of(st.outs[k].pcm, 2, 1), pair[1], 1e-6));
+        CHECK(be32(st.outs[k].bsi, 0x04) == 2);
+        CHECK(be32(st.outs[k].bsi, 0x08) == 3);
+        std::vector<float> mean;
+        for (usize i = 0; i < pair[0].size(); i++) mean.push_back((pair[0][i] + pair[1][i]) * 0.5f);
+        CHECK(close_to(channel_of(mono.outs[k].pcm, 1, 0), mean, 1e-6));
+        CHECK(be32(mono.outs[k].bsi, 0x08) == 4); // front centre
+    }
+    // Joined after its first major sync: the units before the next give no PCM (no error), then it decodes.
+    Feed late;
+    late.step = 300;
+    late.aus.assign(units.begin() + 1, units.end());
+    const CoreRun lr = run_core(f.base(), hle_calls(f, t), kTypeTrueHd, layout_param(0), late);
+    INFO(all(lr));
+    REQUIRE(lr.outs.size() == late.aus.size());
+    CHECK(flow_ok(lr, static_cast<u32>(late.aus.size()), {}));
+    const Ref late_ref = reference("truehd", late.aus, truehd_setup("5.1(side)"));
+    u32 silent = 0;
+    for (u32 k = 0; k < lr.outs.size(); k++) {
+        CHECK(lr.outs[k].pcm == pcm_of(late_ref.units[k]));
+        silent += lr.outs[k].size == 0;
+    }
+    CHECK(silent > 0);
+    CHECK(silent < lr.outs.size());
+    CHECK(lr.outs.back().size == 160 * 6 * 4);
+    // Refused: a unit FFmpeg cannot decode (FATAL); a layout past the enum and flags past 1 (ARG).
+    Feed bad;
+    bad.step = 300;
+    bad.aus = {units[0], std::vector<u8>{0x00, 0x02, 0xFF, 0xFF}};
+    const CoreRun e = run_core(f.base(), hle_calls(f, t), kTypeTrueHd, layout_param(0), bad);
+    INFO(all(e));
+    CHECK(flow_ok(e, 2, {{1, kFatal}}));
+    for (const auto& refused : {layout_param(12), layout_param(0, 2), layout_param(0, 0, 2)}) {
+        const CoreRun r = run_core(f.base(), hle_calls(f, t), kTypeTrueHd, refused, Feed{});
+        CHECK(std::find(r.lines.begin(), r.lines.end(), "cellAdecStartSeq -> 0x80610003") != r.lines.end());
+    }
+}
+
+// ---- DTS (D-622)
+
+namespace {
+
+// A DTS core frame's header fields (ETSI TS 102 114 5.3.1), read here for the expectations.
+struct DtsHeader {
+    u32 nblks, fsize, amode, sfreq, rate, lff, pcmr;
+};
+DtsHeader dts_header(const std::vector<u8>& f)
+{
+    u32 bit = 32;
+    const auto get = [&](u32 n) {
+        u32 v = 0;
+        for (u32 i = 0; i < n; i++, bit++) v = v << 1 | ((f[bit / 8] >> (7 - bit % 8)) & 1u);
+        return v;
+    };
+    DtsHeader h{};
+    get(1 + 5);
+    const u32 cpf = get(1);
+    h.nblks = get(7);
+    h.fsize = get(14);
+    h.amode = get(6);
+    h.sfreq = get(4);
+    h.rate = get(5);
+    get(10);
+    h.lff = get(2);
+    get(1);
+    if (cpf) get(16);
+    get(7);
+    h.pcmr = get(3);
+    return h;
+}
+
+} // namespace
+
+TEST_CASE("cellAdec: the DTS cores on FFmpeg, 5.1 that FFmpeg's encoder wrote, through each of the four: PCM, "
+          "information, PTS, the stereo output, refusals (D-622)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_encoder_by_name("dca")) SKIP("this FFmpeg has no dca encoder (the tests' build: build-ffmpeg.sh)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    const auto input = tones(48000, 512 * 60, {500, 800, 1200, 60, 1700, 2300});
+    const Encoded enc = encode("dca", 48000, "5.1(side)", 1509000, input);
+    REQUIRE(enc.packets.size() >= 58);
+    const DtsHeader h = dts_header(enc.packets[0]);
+    CHECK(h.amode == 9);                          // C + L + R + Ls + Rs
+    CHECK(h.sfreq == 13);                         // 48 kHz
+    CHECK(h.fsize + 1 == enc.packets[0].size());
+    CHECK((h.nblks + 1) * 32 == 512);
+    Feed feed;
+    feed.step = 960; // 512 samples at 48 kHz
+    feed.aus = enc.packets;
+    feed.missing = {3, 11};
+    static constexpr u32 kRates[29] = {32000, 56000, 64000, 96000, 112000, 128000, 192000, 224000, 256000, 320000,
+        384000, 448000, 512000, 576000, 640000, 768000, 960000, 1024000, 1152000, 1280000, 1344000, 1408000, 1411200,
+        1472000, 1536000, 1920000, 2048000, 3072000, 3840000};
+    static constexpr u32 kPcmrBits[8] = {16, 16, 20, 20, 0, 24, 24, 0};
+    const struct {
+        u32 type;
+        bool core_only;
+        const char* name;
+    } cores[] = {{kTypeDts, true, "DTS"}, {kTypeDtsHd, false, "DTS-HD"}, {kTypeDtsHdCore, true, "DTS-HD core"},
+        {kTypeDtsLbr, false, "DTS Express"}};
+    for (const auto& c : cores) {
+        DYNAMIC_SECTION(c.name)
+        {
+            const CoreRun run = run_core(f.base(), hle_calls(f, t), c.type, layout_param(0), feed);
+            INFO(all(run));
+            REQUIRE(run.outs.size() == feed.aus.size());
+            CHECK(flow_ok(run, static_cast<u32>(feed.aus.size()), {}));
+            CHECK(pts_ok(run, feed)); // each core's own correction (types 28, 21, 37, 31)
+            const Ref ref = reference("dca", feed.aus, [&](AVCodecContext* av) {
+                av_opt_set_int(av, "core_only", c.core_only, AV_OPT_SEARCH_CHILDREN);
+            });
+            for (u32 k = 0; k < run.outs.size(); k++) {
+                INFO("access unit " << k);
+                const Out& o = run.outs[k];
+                const DtsHeader fh = dts_header(feed.aus[k]);
+                CHECK(o.size == 512 * 6 * 4);
+                CHECK(o.pcm == pcm_of(ref.units[k]));
+                CHECK(be32(o.bsi, 0x00) == 48000);
+                CHECK(be32(o.bsi, 0x04) == 6);
+                CHECK(be32(o.bsi, 0x08) == 0x60F);
+                CHECK(be32(o.bsi, 0x0C) == 512);
+                CHECK(be32(o.bsi, 0x10) == 6); // the core header's AMODE and LFE
+                CHECK(be32(o.bsi, 0x14) == 0x60F);
+                CHECK(be32(o.bsi, 0x18) == kPcmrBits[fh.pcmr]);
+                CHECK(be32(o.bsi, 0x1C) == (fh.rate < 29 ? kRates[fh.rate] : 0));
+                CHECK(be32(o.bsi, 0x20) == 1);
+                CHECK(be32(o.bsi, 0x28) == 9);                 // AMODE
+                CHECK(be32(o.bsi, 0x2C) == feed.aus[k].size()); // the frame's bytes
+                CHECK(be32(o.bsi, 0x30) == 13);                // SFREQ
+                CHECK(be32(o.bsi, 0x34) == fh.rate);
+                CHECK(be32(o.bsi, 0x38) == fh.lff);
+                CHECK(be32(o.bsi, 0x3C) == 0);                 // no extension substream
+            }
+            if (c.type == kTypeDtsHd) {
+                // The full-band channels close to their input; the LFE (coded at a 64th of the rate, its filters
+                // FFmpeg's encoder's) carries its tone.
+                for (u32 ch = 0; ch < 6; ch++) {
+                    if (ch == 3) {
+                        CHECK(energy_near(joined(run, 6, ch), 48000, 60, 20) > 0.8);
+                        continue;
+                    }
+                    const double snr = snr_db(floats(input[ch]), joined(run, 6, ch), 2000);
+                    INFO(std::format("channel {}: SNR {:.1f} dB", ch, snr));
+                    CHECK(snr > 20);
+                }
+            }
+        }
+    }
+    // Stereo: FFmpeg's downmix where the stream carries its coefficients, else pspocket's.
+    Feed few;
+    few.step = 960;
+    few.aus.assign(enc.packets.begin(), enc.packets.begin() + 8);
+    const CoreRun st = run_core(f.base(), hle_calls(f, t), kTypeDtsHd, layout_param(3), few);
+    REQUIRE(st.outs.size() == 8);
+    const Ref stereo_ref = reference("dca", few.aus, [](AVCodecContext* av) { av_opt_set(av, "downmix", "stereo", AV_OPT_SEARCH_CHILDREN); });
+    for (u32 k = 0; k < 8; k++) {
+        const Unit pair = stereo_ref.units[k].size() == 2 ? stereo_ref.units[k] : stereo_of_51(stereo_ref.units[k]);
+        CHECK(close_to(channel_of(st.outs[k].pcm, 2, 0), pair[0], 1e-6));
+        CHECK(close_to(channel_of(st.outs[k].pcm, 2, 1), pair[1], 1e-6));
+        CHECK(be32(st.outs[k].bsi, 0x10) == 6); // the stream's own: 5.1
+    }
+    // Refused: a unit with no DTS sync, an extension substream with no core to the cores that decode only the core
+    // (libadec's FATAL, the next unit decoding), and parameters (ARG).
+    std::vector<u8> exss(64, 0);
+    exss[0] = 0x64, exss[1] = 0x58, exss[2] = 0x20, exss[3] = 0x25;
+    Feed bad;
+    bad.step = 960;
+    bad.aus = {enc.packets[0], std::vector<u8>(64, 0), exss, enc.packets[1]};
+    for (const u32 type : {kTypeDts, kTypeDtsHdCore}) {
+        const CoreRun e = run_core(f.base(), hle_calls(f, t), type, layout_param(0), bad);
+        INFO(all(e));
+        CHECK(flow_ok(e, 4, {{1, kFatal}, {2, kFatal}}));
+        REQUIRE(e.outs.size() == 4);
+        CHECK(be32(e.outs[2].bsi, 0x24) == kFatal);
+        CHECK(be32(e.outs[2].bsi, 0x28) == 0xFFFFFFFF); // no core header read
+        CHECK(e.outs[3].size == 512 * 6 * 4);
+    }
+    for (const auto& refused : {layout_param(13), layout_param(0, 3)}) {
+        const CoreRun r = run_core(f.base(), hle_calls(f, t), kTypeDts, refused, Feed{});
+        CHECK(std::find(r.lines.begin(), r.lines.end(), "cellAdecStartSeq -> 0x80610003") != r.lines.end());
+    }
+}
+
+// ---- WMA (D-622)
+
+TEST_CASE("cellAdec: WMA on FFmpeg, WMA 2 and WMA 1 that FFmpeg's encoders wrote: PCM, information, PTS, units of "
+          "several packets, refusals (D-622)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_encoder_by_name("wmav2") || !avcodec_find_encoder_by_name("wmav1"))
+        SKIP("this FFmpeg has no wmav1 or wmav2 encoder (the tests' build: build-ffmpeg.sh)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    const auto input = tones(44100, 44100 * 2, {1000, 2500}, 0.4);
+    for (const u32 tag : {0x161u, 0x160u}) {
+        DYNAMIC_SECTION(std::format("format {:#x}", tag))
+        {
+            const Encoded enc = encode(tag == 0x161 ? "wmav2" : "wmav1", 44100, "stereo", 128000, input);
+            REQUIRE(enc.packets.size() > 30);
+            REQUIRE(enc.block_align > 0);
+            WmaParam p;
+            p.tag = tag;
+            p.block = enc.block_align;
+            p.avg_bytes = static_cast<u32>(enc.bit_rate / 8);
+            p.options = tag == 0x161 ? (u32{enc.extradata[4]} | u32{enc.extradata[5]} << 8) :
+                                       (u32{enc.extradata[2]} | u32{enc.extradata[3]} << 8);
+            Feed feed;
+            feed.step = 4180; // 2048 samples at 44.1 kHz
+            feed.aus = enc.packets;
+            feed.missing = {5, 13};
+            const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeWma, wma_param(p), feed);
+            INFO(all(run));
+            REQUIRE(run.outs.size() == feed.aus.size());
+            CHECK(flow_ok(run, static_cast<u32>(feed.aus.size()), {}));
+            CHECK(pts_ok(run, feed)); // the core's own correction (type 30)
+            const Ref ref = reference(tag == 0x161 ? "wmav2" : "wmav1", feed.aus, wma_setup(p), p.block);
+            u32 empty = 0;
+            for (u32 k = 0; k < run.outs.size(); k++) {
+                INFO("access unit " << k);
+                const Out& o = run.outs[k];
+                const usize samples = ref.units[k].empty() ? 0 : ref.units[k][0].size();
+                CHECK(o.pcm == pcm_of(ref.units[k]));
+                CHECK(o.size == samples * 2 * 4);
+                CHECK(be32(o.bsi, 0x28) == tag);
+                CHECK(be32(o.bsi, 0x2C) == p.block);
+                CHECK(be32(o.bsi, 0x30) == p.options);
+                CHECK(be32(o.bsi, 0x34) == 1); // packets
+                if (!samples) { // a packet that finished no frame
+                    empty++;
+                    continue;
+                }
+                CHECK(samples == 2048);
+                CHECK(be32(o.bsi, 0x00) == 44100);
+                CHECK(be32(o.bsi, 0x04) == 2);
+                CHECK(be32(o.bsi, 0x08) == 3);
+                CHECK(be32(o.bsi, 0x0C) == 2048);
+                CHECK(be32(o.bsi, 0x10) == 2);
+                CHECK(be32(o.bsi, 0x14) == 3);
+                CHECK(be32(o.bsi, 0x18) == 0);
+                CHECK(be32(o.bsi, 0x1C) == 8 * p.avg_bytes);
+            }
+            CHECK(empty <= 2);
+            for (u32 c = 0; c < 2; c++) {
+                const double snr = snr_db(floats(input[c]), joined(run, 2, c), 3000);
+                INFO(std::format("channel {}: SNR {:.1f} dB", c, snr));
+                CHECK(snr > 15);
+            }
+            // Two packets a unit: 4096 samples, 8359 ticks; mono (the pair averaged).
+            Feed pairs;
+            pairs.step = 8359;
+            for (usize k = 0; k + 2 <= 12; k += 2) pairs.aus.push_back(concat({enc.packets[k], enc.packets[k + 1]}));
+            pairs.missing = {3};
+            WmaParam m = p;
+            m.layout = 1;
+            const CoreRun two = run_core(f.base(), hle_calls(f, t), kTypeWma, wma_param(m), pairs);
+            INFO(all(two));
+            REQUIRE(two.outs.size() == 6);
+            CHECK(flow_ok(two, 6, {}));
+            std::vector<float> mean;
+            for (u32 k = 0; k < 12; k++)
+                if (!ref.units[k].empty())
+                    for (usize i = 0; i < ref.units[k][0].size(); i++)
+                        mean.push_back((ref.units[k][0][i] + ref.units[k][1][i]) * 0.5f);
+            CHECK(close_to(joined(two, 1, 0), mean, 1e-6));
+            for (u32 k = 1; k < 6; k++) {
+                CHECK(two.outs[k].size == 4096 * 4);
+                CHECK(two.outs[k].pts_lower == 0x1000 + pairs.step * k);
+                CHECK(be32(two.outs[k].bsi, 0x34) == 2);
+                CHECK(be32(two.outs[k].bsi, 0x08) == 4); // front centre
+            }
+        }
+    }
+    // Refused by StartSeq: another core's format, three channels, 96 kHz, no bit rate, a mask of another channel count,
+    // a layout past the enum; a unit shorter than a packet (libadec's FATAL).
+    const Encoded enc = encode("wmav2", 44100, "stereo", 128000, input);
+    WmaParam good;
+    good.block = enc.block_align;
+    good.options = u32{enc.extradata[4]} | u32{enc.extradata[5]} << 8;
+    for (const WmaParam& refused : {WmaParam{.tag = 0x162}, WmaParam{.channels = 3}, WmaParam{.rate = 96000},
+             WmaParam{.avg_bytes = 0}, WmaParam{.mask = 0x7}, WmaParam{.layout = 12}}) {
+        const CoreRun r = run_core(f.base(), hle_calls(f, t), kTypeWma, wma_param(refused), Feed{});
+        CHECK(std::find(r.lines.begin(), r.lines.end(), "cellAdecStartSeq -> 0x80610003") != r.lines.end());
+    }
+    Feed bad;
+    bad.step = 4180;
+    bad.aus = {enc.packets[0], std::vector<u8>(enc.packets[1].begin(), enc.packets[1].begin() + 100), enc.packets[2]};
+    const CoreRun e = run_core(f.base(), hle_calls(f, t), kTypeWma, wma_param(good), bad);
+    INFO(all(e));
+    CHECK(flow_ok(e, 3, {{1, kFatal}}));
 }
 
 #endif

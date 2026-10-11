@@ -68,6 +68,9 @@ add_library(pspocket_hle STATIC
     src/adec_aac.cpp
     src/adec_ac3.cpp
     src/adec_atrac3.cpp
+    src/adec_truehd.cpp
+    src/adec_dts.cpp
+    src/adec_wma.cpp
     src/adec_tables.cpp
     src/cellPngDec.cpp
     src/cellGifDec.cpp

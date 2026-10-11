@@ -387,11 +387,19 @@ const Spec* spec_of(s32 type)
     case CELL_ADEC_TYPE_MPEG_L2: return &kMpegL2;
     case CELL_ADEC_TYPE_M2AAC: return &kM2Aac;
     case CELL_ADEC_TYPE_EAC3: return &kDdp;
+    case CELL_ADEC_TYPE_TRUEHD: return &kTrueHd;
+    case CELL_ADEC_TYPE_DTS: return &kDts;
     case CELL_ADEC_TYPE_M4AAC: return &kM4Aac;
+    case CELL_ADEC_TYPE_WMA: return &kWma;
+    case CELL_ADEC_TYPE_DTSLBR: return &kDtsLbr;
     case CELL_ADEC_TYPE_M4AAC_2CH: return &kM4Aac2ch;
+    case CELL_ADEC_TYPE_DTSHD: return &kDtsHd;
     case CELL_ADEC_TYPE_MPEG_L1: return &kMpegL1;
     case CELL_ADEC_TYPE_MP3S: return &kMp3s;
     case CELL_ADEC_TYPE_M4AAC_2CH_MOD: return &kM4Aac2chMod;
+    case CELL_ADEC_TYPE_WMAPRO_CORE: return &kWmaPro;
+    case CELL_ADEC_TYPE_WMALSL_CORE: return &kWmaLsl;
+    case CELL_ADEC_TYPE_DTSHDCORE: return &kDtsHdCore;
     case CELL_ADEC_TYPE_ATRAC3MULTI: return &kAtrac3Multi;
     default: return nullptr;
     }
@@ -453,11 +461,12 @@ int FfDecoder::decode(const u8* data, u32 size, Planar& out, u32 max_samples)
         if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) return 0;
         if (err < 0) return err;
         const u32 channels = static_cast<u32>(frame_->ch_layout.nb_channels);
-        if (frame_->format != AV_SAMPLE_FMT_FLTP)
-            PS_FATAL(kChan, "{}: FFmpeg gave sample format {}, not planar floats", name_, frame_->format);
+        if (!convertible(frame_->format))
+            PS_FATAL(kChan, "{}: FFmpeg gave sample format {}, which the cores do not take", name_, frame_->format);
         if (out.ch.empty()) {
             out.ch.resize(channels);
             out.rate = static_cast<u32>(frame_->sample_rate);
+            out.bits = av_->bits_per_raw_sample > 0 ? static_cast<u32>(av_->bits_per_raw_sample) : 0;
             for (u32 c = 0; c < channels; c++)
                 out.ids.push_back(av_channel_layout_channel_from_index(&frame_->ch_layout, c));
         } else if (out.channels() != channels || out.rate != static_cast<u32>(frame_->sample_rate)) {
@@ -471,11 +480,45 @@ int FfDecoder::decode(const u8* data, u32 size, Planar& out, u32 max_samples)
             log_once(std::format("{} too long", name_), std::format("{}: an access unit decoded to more than its output "
                 "holds ({} samples): the rest is left out", name_, max_samples));
         for (u32 c = 0; c < channels; c++) {
-            const float* in = reinterpret_cast<const float*>(frame_->extended_data[c]);
-            out.ch[c].insert(out.ch[c].end(), in, in + n);
+            std::vector<float>& to = out.ch[c];
+            if (frame_->format == AV_SAMPLE_FMT_FLTP) {
+                const float* in = reinterpret_cast<const float*>(frame_->extended_data[c]);
+                to.insert(to.end(), in, in + n);
+            } else {
+                for (u32 i = 0; i < n; i++) to.push_back(sample_of(frame_, c, i, channels));
+            }
         }
         out.samples += n;
         av_frame_unref(frame_);
+    }
+}
+
+bool FfDecoder::convertible(int format)
+{
+    switch (format) {
+    case AV_SAMPLE_FMT_FLTP:
+    case AV_SAMPLE_FMT_FLT:
+    case AV_SAMPLE_FMT_S16P:
+    case AV_SAMPLE_FMT_S16:
+    case AV_SAMPLE_FMT_S32P:
+    case AV_SAMPLE_FMT_S32: return true;
+    default: return false;
+    }
+}
+
+// Sample i of channel c of `f` (one of convertible's formats) as a float: integers over their full scale (2^15, 2^31),
+// exact for the 16- and 24-bit samples of the lossless codecs (a 24-bit sample is 32 bits' top 24).
+float FfDecoder::sample_of(const AVFrame* f, u32 c, u32 i, u32 channels)
+{
+    const bool packed = f->format == AV_SAMPLE_FMT_FLT || f->format == AV_SAMPLE_FMT_S16 || f->format == AV_SAMPLE_FMT_S32;
+    const u8* plane = f->extended_data[packed ? 0 : c];
+    const usize at = packed ? usize{i} * channels + c : i;
+    switch (f->format) {
+    case AV_SAMPLE_FMT_FLTP:
+    case AV_SAMPLE_FMT_FLT: return reinterpret_cast<const float*>(plane)[at];
+    case AV_SAMPLE_FMT_S16P:
+    case AV_SAMPLE_FMT_S16: return static_cast<float>(reinterpret_cast<const s16*>(plane)[at]) / 32768.0f;
+    default: return static_cast<float>(static_cast<double>(reinterpret_cast<const s32*>(plane)[at]) / 2147483648.0);
     }
 }
 
@@ -511,6 +554,7 @@ void stereo_downmix(Planar& p)
     s.ids = {AV_CHAN_FRONT_LEFT, AV_CHAN_FRONT_RIGHT};
     s.samples = p.samples;
     s.rate = p.rate;
+    s.bits = p.bits;
     for (u32 c = 0; c < p.channels() && c < 16; c++) {
         const float l = gl[c] / std::max(sum_l, 1.0f), r = gr[c] / std::max(sum_r, 1.0f);
         for (u32 i = 0; i < p.samples; i++) {
@@ -519,6 +563,55 @@ void stereo_downmix(Planar& p)
         }
     }
     p = std::move(s);
+}
+
+void apply_channel_number(Planar& p, u32 channel_number)
+{
+    if (channel_number != CELL_ADEC_CH_MONO && channel_number != CELL_ADEC_CH_STEREO) return;
+    stereo_downmix(p);
+    if (channel_number == CELL_ADEC_CH_MONO && p.channels() == 2) {
+        for (u32 i = 0; i < p.samples; i++) p.ch[0][i] = (p.ch[0][i] + p.ch[1][i]) * 0.5f;
+        p.ch.resize(1);
+        p.ids = {AV_CHAN_FRONT_CENTER};
+    } else if (channel_number == CELL_ADEC_CH_STEREO && p.channels() == 1) {
+        p.ch.push_back(p.ch[0]);
+        p.ids = {AV_CHAN_FRONT_LEFT, AV_CHAN_FRONT_RIGHT};
+    }
+}
+
+void limit_channels(Planar& p, u32 max, std::string_view name)
+{
+    if (p.channels() <= max) return;
+    log_once(std::format("{} channels", name), std::format("{}: a stream of {} channels: the first {} are given out",
+        name, p.channels(), max));
+    p.ch.resize(max);
+    p.ids.resize(max);
+}
+
+u32 channel_mask(const Planar& p)
+{
+    u32 mask = 0;
+    for (const int id : p.ids)
+        if (id >= 0 && id < 32) mask |= 1u << id;
+    return mask;
+}
+
+void write_ginfo(u8* base, u32 bsi, const Planar& pcm, u32 stream_channels, u32 stream_mask, u32 bits, u32 bit_rate)
+{
+    const std::pair<u32, u32> fields[] = {{ginfo::sampling_freq, pcm.rate}, {ginfo::number_of_channels, pcm.channels()},
+        {ginfo::channel_mask, channel_mask(pcm)}, {ginfo::samples, pcm.samples}, {ginfo::stream_channels, stream_channels},
+        {ginfo::stream_channel_mask, stream_mask}, {ginfo::bits_per_sample, bits}, {ginfo::bit_rate, bit_rate},
+        {ginfo::is_bsi_valid, 1}};
+    for (const auto& [at, v] : fields) ps_write32(base, bsi + at, v);
+}
+
+s32 check_layout_params(const u8* p, std::string_view name)
+{
+    const u32 channels = ps_ld32(p + lprm::channel_number), downmix = ps_ld32(p + lprm::downmix),
+              lfe = ps_ld32(p + lprm::lfe_up_sample);
+    if (channels <= CELL_ADEC_CH_3_4_LFE && downmix <= 1 && lfe <= 1) return lv2::CELL_OK;
+    PS_LOG_ERROR(kChan, "{}: parameters channelNumber {}, downmix {}, lfeUpSample {}", name, channels, downmix, lfe);
+    return error(CELL_ADEC_ERROR_ARG);
 }
 
 // ---- MPEG audio headers
