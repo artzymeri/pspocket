@@ -12297,3 +12297,21 @@ on random pictures, windows and both formats:
   last row for an output row whose position reaches it; before a window not starting a 16-byte block the picture's
   column, otherwise and past the window's end the edge sample.
 The comparison: 24 of 791 to 12 (the edge-adaptive interlace conversion, 7; reductions past a half, 5).
+
+## D-913 · 2026-10-11 · cellVpost's bilinear reductions past a half and its chroma siting at windows (part 11)
+
+Read from libvpost's scaler program and checked byte for byte on random pictures over input windows at columns 0 to
+66, output windows at 0 to 72, widths kept, enlarged up to eight times and reduced up to 2.4 times, both chroma types
+and both formats:
+- A bilinear width reduction past a half (types 0 and 1) first halves the rows: sample m of the halved row at
+  start + (m / 16) block + (m % 16) lane in 1/256 of the window's columns, where full = in/out width in 16.16, lane =
+  512 (full rounded down to even) / full, block = 8192 (full rounded down to even) / full, and start the output
+  window's column in its 16-column block times -(full / 256) plus, for a type-A chroma plane, its siting at the full
+  step ((full - 1.0) / 1024); before the window its first column, past its end its last. The halved row (half the
+  width) then goes through the ordinary horizontal pass at its own step, its sixteen lanes from the block's start, with
+  no siting.
+- The sixteen lanes of the ordinary horizontal pass at a type-A chroma plane: a lane whose sited position would fall
+  before the input's 16-column block while its unsited one does not starts at the block, for every lane when the output
+  window starts a block (as before) and otherwise for lane 0 only (seen where the output window's column is the input
+  window's scaled: lane 0 of every block after the first then starts one siting earlier than the formula).
+The comparison: 12 of 791 to 7, all the edge-adaptive interlace conversion (interpolation type 2).

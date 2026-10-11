@@ -201,7 +201,7 @@ void sharpen_row(const u8* a, const u8* b, const u8* c, u32 n, u8* out)
 //   window's first column, each later sixteen 16 steps on (in 1/65536, rounded down to 1/256). A chroma plane is sited
 //   between its luma samples (type A horizontally, both types vertically): its positions start (step - 1) / 4 on
 //   (rounded down); for windows at multiples of 16 in both pictures, a negative position in the first sixteen is 0.
-//   Past a halving horizontally, every second column of the window is taken first.
+//   Past a halving horizontally, the window is halved first (see scale_plane).
 // - Types 2 and 3 vertically: libvpost's 4-tap filter of the row's phase (its position's 6 bits below the row) over the
 //   rows above it to two below, the sum in 1/256 rounded down and clamped; rows above the picture are its first, below
 //   it mirrored about its last; an output row whose position reaches the last row is filtered there (its phase 0), the
@@ -218,23 +218,13 @@ void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow
     const bool eight_tap = filters && scaler == 3 && iw_given.w != ow.w;
     // Type 1's sharpening: luma only, where the width changes.
     const bool sharp = scaler == 1 && !chroma && iw_given.w != ow.w;
-    // Past a halving horizontally, every second column of the window is taken first.
-    Plane halved;
-    Window iw = iw_given;
-    const Plane* src = &in_plane;
-    if (!eight_tap && iw.w > 2 * ow.w) {
-        halved = {iw.w / 2, in_plane.h, std::vector<u8>(static_cast<usize>(iw.w / 2) * in_plane.h)};
-        for (u32 y = 0; y < in_plane.h; y++)
-            for (u32 x = 0; x < iw.w / 2; x++) halved.at(x, y) = in_plane.at(iw.x + 2 * x, y);
-        iw = {0, iw.y, iw.w / 2, iw.h};
-        src = &halved;
-    }
-    const Plane& in = *src;
-    const u32 step_v = static_cast<u32>((u64{iw.h} << 16) / ow.h), step_h = static_cast<u32>((u64{iw.w} << 16) / ow.w);
+    const Window& iw = iw_given;
+    const Plane& in = in_plane;
+    const u32 step_v = static_cast<u32>((u64{iw.h} << 16) / ow.h);
     const s32 off_v = chroma ? (static_cast<s32>(step_v) - 0x10000) >> 2 : 0;
-    const s32 off_h = chroma && chroma_type == 0 ? (static_cast<s32>(step_h) - 0x10000) >> 10 : 0;
     // The vertical pass over the window's columns; for the 8-tap filter from the 16-byte block holding its first, as
     // libvpost reads them (the filter reads before the window into it, mirrored before it; past the window mirrored).
+    const bool halving = !eight_tap && iw.w > 2 * ow.w;
     const u32 col0 = eight_tap ? iw.x & ~15u : iw.x;
     const u32 cols = iw.x + iw.w - col0;
     Plane tmp{cols, ow.h, std::vector<u8>(static_cast<usize>(cols) * ow.h)};
@@ -303,6 +293,35 @@ void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow
                 tmp.at(x, y) = static_cast<u8>((in.at(col0 + x, r0) * (256 - f) + in.at(col0 + x, r1) * f) >> 8);
         }
     }
+    // Past a halving horizontally, the vertical pass's rows are halved first: libvpost's halving takes each sixteen
+    // samples a bilinear step of 2 apart (in 1/256) and each sixteen 32 on, both shortened by the scaler's step rounded
+    // to even over the step itself (511 and 8191 for an odd step).
+    u32 hcols = cols, hw = iw.w;
+    if (halving) {
+        // The halving starts at the position of the first lane of the output window's 16-column block, its samples a
+        // sixteen at a time, the window's first column before it and its last past its end.
+        hw = iw.w / 2;
+        const u32 full = static_cast<u32>((u64{iw.w} << 16) / ow.w);
+        const u32 lane = static_cast<u32>(u64{512} * (full & ~1u) / full);
+        const u32 block = static_cast<u32>(u64{8192} * (full & ~1u) / full);
+        // A type-A chroma plane's siting goes into the halving (at the full step), none after it.
+        const s32 sited = chroma && chroma_type == 0 ? static_cast<s32>((full - 0x10000) >> 10) : 0;
+        const s32 start = sited - static_cast<s32>((ow.x & 15) * (full >> 8));
+        hcols = hw + 32;
+        const s32 last = static_cast<s32>(iw.w) - 1;
+        Plane halved{hcols, ow.h, std::vector<u8>(static_cast<usize>(hcols) * ow.h)};
+        for (u32 x = 0; x < hcols; x++) {
+            const s32 pos = start + static_cast<s32>((x >> 4) * block + (x & 15) * lane);
+            const s32 i = pos >> 8;
+            const u32 f = static_cast<u32>(pos) & 0xFF;
+            const u32 c0 = static_cast<u32>(std::clamp(i, 0, last)), c1 = static_cast<u32>(std::clamp(i + 1, 0, last));
+            for (u32 y = 0; y < ow.h; y++)
+                halved.at(x, y) = static_cast<u8>((tmp.at(c0, y) * (256 - f) + tmp.at(c1, y) * f) >> 8);
+        }
+        tmp = std::move(halved);
+    }
+    const u32 step_h = static_cast<u32>((u64{hw} << 16) / ow.w);
+    const s32 off_h = chroma && chroma_type == 0 && hw == iw.w ? (static_cast<s32>(step_h) - 0x10000) >> 10 : 0;
     out.w = ow.w;
     out.h = ow.h;
     out.px.assign(static_cast<usize>(ow.w) * ow.h, 0);
@@ -333,17 +352,22 @@ void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow
         return;
     }
     const s32 block = static_cast<s32>((u64{step_h} * 16) >> 8), step8 = static_cast<s32>(step_h >> 8);
-    const u32 first = ow.x & 15;
+    const u32 first = halving ? 0 : ow.x & 15;
     std::array<s32, 16> lane{};
-    for (u32 k = 0; k < 16; k++) lane[k] = off_h + (static_cast<s32>(k) - static_cast<s32>(first)) * step8;
-    if (first == 0 && (iw_given.x & 15) == 0)
-        for (s32& l : lane) l = std::max(l, 0);
+    // A sited lane that would start before the input's 16-column block, its position unsited not, starts at the
+    // block: every such lane when the output window starts a block, otherwise only lane 0.
+    const s32 lead = static_cast<s32>(iw.x & 15) * 256;
+    for (u32 k = 0; k < 16; k++) {
+        const s32 unsited = (static_cast<s32>(k) - static_cast<s32>(first)) * step8;
+        lane[k] = off_h + unsited;
+        if ((k == 0 || first == 0) && lead + unsited >= 0 && lead + lane[k] < 0) lane[k] = -lead;
+    }
     for (u32 x = 0; x < ow.w; x++) {
         const u32 a = ow.x + x;
         const s32 p = static_cast<s32>((a >> 4) - (ow.x >> 4)) * block + lane[a & 15];
         const u32 pos = static_cast<u32>(std::max(p, 0));
         const u32 i = pos >> 8, f = pos & 0xFF;
-        const u32 c0 = std::min(i, cols - 1), c1 = std::min(i + 1, cols - 1);
+        const u32 c0 = std::min(i, hcols - 1), c1 = std::min(i + 1, hcols - 1);
         for (u32 y = 0; y < ow.h; y++)
             out.at(x, y) = static_cast<u8>((tmp.at(c0, y) * (256 - f) + tmp.at(c1, y) * f) >> 8);
     }
