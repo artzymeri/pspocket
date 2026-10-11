@@ -314,7 +314,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-11: 6,187 of 6,625, 93.4%):
+firmware module. Done so far (2026-10-11: 6,211 of 6,625, 93.8%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -395,11 +395,18 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
 - sys_libc and sys_libm complete (D-904 to D-907, by the session on the Mac): Dinkumware's internals as the SDK's C
   library has them, compared with the copies two games link into themselves: the SPU accessors and printf helpers,
   printf's and scanf's engines, number parsing, the locale objects, multibyte conversions, collation and time.
-Left (438, 2026-10-11). What each part needs (a session without the firmware could not make these faithfully):
+- The audio decoder cores still missing, on FFmpeg, firmware-first (D-620 to D-623): Dolby Digital Plus, MPEG-2 AAC,
+  MP3 Surround (its stereo core), ATRAC3 multichannel, Dolby TrueHD, DTS (core, HD, HD core, LBR) and WMA (standard,
+  Pro, Lossless), each through pspocket's cellAdec and as its core module's operation table and PTS function; their
+  parameter and information layouts inferred where RPCS3 has none (to check on the Mac). The Mac must rerun
+  scripts/build-ffmpeg.sh (macos, macos-tests, ios) for the new decoders. cellDmuxPamf's raw elementary stream core
+  from RPCS3, unverified (D-624). Races found and fixed by a ThreadSanitizer pass over the day's libraries (D-650 to
+  D-653): cellJpgEnc's and cellPngEnc's queue, a taskset 2's task IDs and event flag IDs.
+Left (414, 2026-10-11). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSailRec (58)
   and cellSail's playback (19, libsail), the codec
   cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 6, and
-  the audio cores' operation tables and PTS functions, about 160 in all), cellCelpEnc and
+  CELP's decoder tables and PTS functions: about 140 in all; no CELP decoder exists to build them on), cellCelpEnc and
   cellCelp8Enc (19), and the small ones
   (sys_lv2coredump, cellSysconfPs1emu, cellGamePs1Emu,
   module management's six).
