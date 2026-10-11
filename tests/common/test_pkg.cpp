@@ -177,7 +177,9 @@ TEST_CASE("PKG: a game's package installs into game/<TITLE_ID>, its files as the
 {
     const PkgKeys keys = made_up_pkg_keys();
     const PkgSpec spec = game_spec(keys.ps3);
-    const fs::path root = temp_dir("game");
+    // Canonical, as the installer reports the executable's path (macOS's temporary folders are reached through
+    // /var -> /private/var).
+    const fs::path root = fs::weakly_canonical(temp_dir("game"));
     write_file(root / "game.pkg", build_pkg(spec));
     const Install in = install(root / "game.pkg", root / "hdd0", keys);
     INFO(message(in.result));

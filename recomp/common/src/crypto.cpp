@@ -11,6 +11,7 @@
 #include <cstring>
 #include <vector>
 
+#include "pspocket/core/be.h"
 #include "pspocket/recomp/hash.hpp"
 
 #if defined(__APPLE__)
@@ -309,19 +310,34 @@ bool aes_cbc_decrypt(std::span<const u8> key, const u8* iv, const u8* in, usize 
     return cc_crypt(kCCDecrypt, 0, key, iv, in, size, out);
 }
 
+// CommonCrypto's big-endian counter counts in its low 64 bits only and wraps there without a carry (D-908), where
+// PolarSSL's (and so RPCS3's and the PS3 formats') counts over all 128: the data is cut where the low half would wrap,
+// and the next part starts from the counter with its high half incremented and its low half 0.
 bool aes_ctr(std::span<const u8> key, const u8* iv, const u8* in, usize size, u8* out)
 {
     if (!key_ok(key)) return false;
-    if (!size) return true;
-    CCCryptorRef c = nullptr;
-    if (CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR, kCCAlgorithmAES, ccNoPadding, iv, key.data(), key.size(), nullptr,
-            0, 0, kCCModeOptionCTR_BE, &c) != kCCSuccess) {
-        return false;
+    u8 counter[16];
+    std::memcpy(counter, iv, 16);
+    while (size) {
+        const u64 low = ps_ld64(counter + 8);
+        const u64 room = ~low + 1; // blocks before the low half wraps (0: all 2^64 of them)
+        const usize n = room != 0 && room <= size / 16 ? static_cast<usize>(room) * 16 : size;
+        CCCryptorRef c = nullptr;
+        if (CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR, kCCAlgorithmAES, ccNoPadding, counter, key.data(), key.size(),
+                nullptr, 0, 0, kCCModeOptionCTR_BE, &c) != kCCSuccess) {
+            return false;
+        }
+        usize moved = 0;
+        const bool ok = CCCryptorUpdate(c, in, n, out, n, &moved) == kCCSuccess && moved == n;
+        CCCryptorRelease(c);
+        if (!ok) return false;
+        in += n;
+        out += n;
+        size -= n;
+        ps_st64(counter, ps_ld64(counter) + 1);
+        ps_st64(counter + 8, 0);
     }
-    usize moved = 0;
-    const bool ok = CCCryptorUpdate(c, in, size, out, size, &moved) == kCCSuccess && moved == size;
-    CCCryptorRelease(c);
-    return ok;
+    return true;
 }
 
 const char* aes_library() { return "CommonCrypto"; }

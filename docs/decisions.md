@@ -9298,3 +9298,199 @@ executable (by its strings, its TOC slots and its calls); nothing of it is in th
   executable links them and nothing describes them; they log the call and answer an error, as D-510's _Eadd and kin.
 Tests: tests/hle/test_libc_spu.cpp (both families on an SPU thread and a raw SPU, the slots, _Getmem, the unknown
 names), tests/hle/test_libc_spu_game.cpp (the comparisons); the SPU program builder moved to tests/hle/spu_program.hpp.
+
+## D-908 · 2026-10-10 · AES-CTR on Apple platforms carries the counter over all 128 bits
+
+CommonCrypto's CTR mode with kCCModeOptionCTR_BE counts in the counter's low 64 bits only and wraps there without a carry
+into the high half; PolarSSL's aes_crypt_ctr (RPCS3's, and what the PS3 formats expect) counts over all 128 bits. So on
+the Mac and the iPhone, where crypto.hpp's AES goes through CommonCrypto (D-580), any CTR data whose counter crosses a
+64-bit boundary decrypted wrongly from that block on: PS3 packages with such an IV installed garbage names and contents
+(the PKG tests failed on macOS from D-583 on, never on Linux, whose portable AES is PolarSSL's), and SP 800-38A-style
+counters of all ones rolled over wrongly. aes_ctr now cuts the data where the low half would wrap and goes on from the
+counter with its high half incremented and its low half 0; the portable AES was right. Tests: test_crypto's
+platform-against-portable rounds add a counter whose low half wraps within the data (the all-ones case there now passes
+on Apple platforms too); test_pkg's game package compares canonical paths, as test_psn does (b6ff761), since macOS's
+temporary folders are reached through /var -> /private/var.
+
+## D-909 · 2026-10-10 · scripts/build-ffmpeg.sh runs under macOS's bash 3.2
+
+D-576 and D-577 added the EXTRA array to build-ffmpeg.sh, empty for the decoders' builds; under `set -u` bash before 4.4
+calls an empty array's "${EXTRA[@]}" an unbound variable, so on the Mac (bash 3.2) the script stopped before configuring
+and build/ffmpeg/macos kept the decoders of 2026-10-08, without D-588's VC-1 and DivX 3.11: cellVdec refused those
+codecs (CELL_VDEC_ERROR_ARG) and test_fuzz_media's VC-1 case failed on the Mac only. The script expands it as
+${EXTRA[@]+"${EXTRA[@]}"}, which every bash takes; the Mac's macos, macos-tests and ios builds were made again with it.
+
+## D-910 · 2026-10-10 · cellSpursJq's comparison reads the pool's free lists as sets
+
+D-537's job comparison ends with the queue at rest, each descriptor class's record among its answers. A class's free
+list is a stack of blocks linked through their first words; jobs pushed with PushAndRelease give their descriptors back
+from the SPU as they end, in whatever order the policy module finishes them, so which block is on top varied between
+runs (class 7: head 0x110380 or 0x110000, two blocks free either way) and the test failed about one run in three with
+either PPU side. It now compares each free list as its count, wake-ups and waiters and the set of its blocks; six runs in
+a row agree.
+
+## D-911 · 2026-10-11 · The comparisons with Sony's modules on the Mac: what they show (part 1)
+
+D-597's comparisons (test_hle "[compare]"), written in a session without the firmware, ran on the Mac with the installed
+system software for the first time, after FFmpeg was rebuilt with every decoder (D-909). Of eleven: the codec cores'
+version queries agree; libmixer's two cannot run, firmware 4.92 shipping no module that exports libmixer (D-563 made it
+from RPCS3 for that reason), and now SKIP saying so (compare_util.hpp require_firmware_module); the others show
+differences or stop: cellVpost (500 of 536 observations: QueryAttr's attribute, the limits Open checks, Exec's
+picture information), cellPngEnc, cellVdec's MPEG-4 part 2, MVC and VC-1, while cellFiber, cellVdec's DivX 3.11 and
+cellKey2char stop with a fault in Sony's module running on pspocket (cellFiber's at its second
+cellFiberPpuInitializeScheduler). These libraries stay firmware-first (D-563): a game gets Sony's modules for them
+while the user's system software is installed, so none of this reaches a game; making pspocket's own match is the next
+work on them.
+
+## D-906 · 2026-10-10 · sys_libc's locale and time as the SDK's C library has them
+
+The last 28 of sys_libc's (and sys_libm's) locale and time names are pspocket's own (runtime/hle/src/sys_libc_locale.cpp,
+the time ones in sys_libc_time.cpp, the shared layouts and conversion machine in libc_locale.hpp), and sys_libc's
+locale, time, multibyte and wide-class functions now give what the SDK's give. The reference is a game's statically
+linked copy of the SDK's library (Assassin's Creed's, BLES00158; addresses only in inventory/libc-ac/ac-libc-map.txt,
+nothing of it in the repository), read and called next to pspocket's (D-904's fixture).
+
+**What the SDK's library is.** Dinkumware's C99 library with the newer locale design: a locale is a `_Linfo` of 452
+bytes (name, next, collation and wide collation state tables, ctype/tolower/toupper, MB_CUR_MAX, multibyte and wide
+state tables, wide translation and class tables, an 80-byte `struct lconv`, a 21-pointer `_Tinfo`); `_Loctab` is its
+64 locale-file keywords {name, offset, kind} (kinds 0 grouping string ... 8 wide table); the four state tables are
+thread-local (here in the thread's block, which grew to 512 bytes); `_Times` is the current `_Tinfo`, whose name lists
+are delimited strings and whose ten format pointers share one four-field string. Sony's choices on top: setlocale knows
+"C" alone, `_Findloc` reads no file (so `_Getloc` finds "C" only), the time zone and summer time come from lv2.
+
+**The 28** (AC's address in the map where it has a copy):
+- `_Clocale` (variable, sys_libc): its name "C", the rest filled by `_Getcloc` (the current tables, MB_CUR_MAX 3,
+  `_Locale`, `_Times`; the translation table left out, as the SDK's). `_Locale`: the "C" lconv, the 14 chars 0x7F
+  (the SDK's char is signed), false/true "false"/"true", the rest "" but decimal_point ".". `_Loctab`: the 64 entries.
+  `_Times`: the "C" names.
+- In AC: `_Defloc` ("C"), `_Findloc` (NULL), `_Freeloc` (frees what a locale holds that "C" does not, by `_Loctab`'s
+  kinds; state tables by their "made" halfword), `_Getcloc`, `_Getgloballocale`/`_Setgloballocale` (the thread's
+  global locale pointer, now also sys_libstdcxx's: its locale::global and _Init keep the C++ _Locimp there, as the
+  SDK's C++ library does), `_Getloc` (the plain component of "name;category:name;...", overridden by the category's
+  own; looked up from `_Clocale`), `_Skip`, `_Getnloc` and `_Getlname` (pspocket's names for the two category-mask
+  helpers the SDK links beside setlocale and never calls: set pcats[1..6] (and [0] for all) from a name, -1 for a bad
+  mask or name, 1 changed / 0 not; build "name;category:name;..." into a malloc'd buffer), `_Getptimes` (&_Times),
+  `_CStrftime`, `_Gentime`.
+- No copy in AC (Dinkumware's design, Plauger's book for the C89 parts, adapted to the C99 `_Loctab`; their file syntax
+  pspocket's reading, nothing to compare with): `_Setloc(cat, p)` (Plauger's per-category copy for categories 1..6, 0
+  all: collation tables; ctype tables, MB_CUR_MAX (at most 8), multibyte/wide tables, wide tables; monetary; numeric
+  with false/true; time; messages no/yes), `_Readloc` (keyword lines, blank lines skipped, '\' continues, a table
+  line's '[' ends the keyword), `_Makeloc` (to the next LOCALE line), `_Makestab` ("ctype[lo:hi] sum",
+  "mbtowc[state, lo:hi] sum", copy-on-write tables, $@ the entry and $$ its value), `_Makewct` ("wctype name lo:hi
+  value ...", copying the "C" table's names), `_Locsum`/`_Locterm`/`_Locvar` (terms: numbers, 'c', $^ $a..$v $@ $$,
+  $0..$9 states, $A..$Z variables, F I O R preset to the state-table bits), `_Nnl` (strip a line's newline: 1 when
+  there was one); `_Getdst` and `_Isdst` (Plauger's rules over the locale's dst_rules or time_zone's fourth field; with
+  none, the "C" locale, lv2's summer flag); `_Wcsftime`/wcsftime (the AC build has neither, its wchar_t is 16 bits:
+  derived from `_CStrftime` with sys_libc's 32-bit wchar_t, conversions' text widened by the multibyte conversion).
+
+**What changed in sys_libc's own functions** (D-511, D-512, D-515 asserted other behaviour; their tests in
+test_libc.cpp changed to the SDK's):
+- setlocale: NULL or "C" answers "C" (the `_Clocale` name), anything else NULL, the category not looked at:
+  setlocale(LC_ALL, "") and "POSIX" are NULL now, setlocale(99, NULL) is "C". localeconv is `_Locale` (0x7F chars).
+- strftime is `_CStrftime` over `_Times`: Dinkumware's table-driven conversions with three-deep format expansion and
+  the format read as multibyte characters; an unknown conversion gives its letter and a NUL ("%q|" is 3 bytes "q\0|");
+  numbers clamped at 0 and cut to their width (year -5 is "0000", 12345 "2345"); %C is year/100+19; %z and %Z come from
+  the locale's time_zone only, empty in "C" (D-515 printed lv2's offset); the E modifier uses the era fields
+  ("+:offset:start:end:name:format"), O the alt_digits; %V/%G/%g count every year as 365 days (the SDK's leap test for
+  them can never pass), so 2020-12-30 and -31 are week 01 of 2021 (D-902's "%V at a year's start"); a buffer too small
+  answers 0 and keeps the pieces that fit. A locale whose formats expand into themselves stops with a log (the SDK's
+  loops for ever), and a modifier as the format's last character ends it (the SDK's reads past the string).
+- asctime is "%c\n" through the "C" _Tinfo into the thread's 26 bytes (wday 7 gives no day name, years cut to four
+  digits); gmtime, localtime and `_Ttotm` use Plauger's calendar (2100 a leap year: gmtime(4107542400) is 29 February
+  2100), negative fields before 1900, localtime = zone + summer offset with tm_isdst 1, `_Ttotm`'s non-zero isdst adds
+  the summer offset and is stored as given; `_Gettime` past the fields answers the NUL with length 0 (Plauger's 1);
+  time() answers -1 when lv2 fails. mktime (no copy) keeps D-515's meaning on the same calendar.
+- Multibyte: the "C" locale is UTF-8 of up to three bytes, MB_CUR_MAX 3 (`_Mbcurmax` 3), as the SDK's (its wchar_t
+  is 16 bits; with sys_libc's 32-bit one a wide character past 0xFFFF has no form, EILSEQ, and a four-byte lead is
+  EILSEQ); no overlong or surrogate checks; mbstate_t is {_Wchar, _Byte, _State} with a pending sequence kept;
+  `_Mbtowcx`/`_Wctombx` run Dinkumware's state-table machine when a locale has tables. btowc of a byte past 0x7F is
+  WEOF, wctob of é EOF; `_Getpmbstate` and its kin answer the thread's 64-byte state tables (D-512 had 8-byte states).
+- Wide classes: the SDK's table layout ({ranges, 0}, {name, first}, ..., {NULL, end}; ranges {lo, hi, value}), its
+  order (alnum 1, alpha, cntrl, digit, graph, lower, print, punct, space, upper, xdigit, blank 12), cntrl 0..0x1F (DEL
+  is not); `_Getpwctytab` answers the table. `_Wctrans` (no copy in AC) the same layout, tolower/toupper deltas.
+- The ctype table's \t..\r carry _BB as well as _CN (0x4C0, 0xC0), as the SDK's.
+- Collation in "C": strxfrm/wcsxfrm/`_Strxfrmx`/`_Wcsxfrmx` write as much of the string as fits (the SDK's leaves the
+  pieces); `_CStrxfrm(sout, size, save, tables)` and `_CWcsxfrm(sout, &src, size, ps, tables)` have the SDK's
+  signatures. Collation by a locale's state tables is not done (logged, code order): only a locale file's collate
+  lines could make them, which the SDK's setlocale never loads.
+- sys_libstdcxx: kCharMax 0x7F (the facets compare the lconv's "not available" with it).
+
+**How it was checked** (tests/hle/test_libc_locale_game.cpp, "[gamelibc]", 0 differences): strftime 99,286 calls (every
+conversion and modifier over 650 dates and odd fields, literal and multibyte formats, buffers 0..29); `_Gentime` and
+`_CStrftime` 876,688 calls over four _Tinfos (eras, alt digits, zones, self-referring formats); gmtime, localtime,
+asctime, ctime, `_Ttotm`, `_Daysto`, `_Gettime`, time 16,689 calls; locale objects, setlocale (11 categories × 16
+names), `_Getloc`, `_Getnloc`, `_Skip`, `_Findloc`, the global pointer, `_Getcloc`'s result 1,300; `_Mbtowc`,
+`_Wctomb` (all 65,536), `_Mbtowcx`/`_Wctombx` with state tables, `_Iswctype`, the class table 74,209; strcoll,
+strxfrm, `_CStrxfrm`, `_CWcsxfrm` 516. Not compared: formats whose first byte is no multibyte character (the SDK's
+then reuses whatever its stack held), `_Getlname` (it always frees or mallocs through the game's own allocator, which
+an unstarted executable lacks), the file functions (no copy). The game's _Once needs its lwmutex, which the test makes
+with the game's own start-up function. Firmware-free: tests/hle/test_libc_locale.cpp (strftime and the calendar, eras,
+wcsftime, `_Getdst`/`_Isdst`, the locale objects, a locale file read, made current with `_Setloc` and freed).
+
+Not done here: printf's %lc/%ls, scanf's wide conversions and the wide streams still convert bytes one to one (they are
+libc_format.hpp's and stdio's, D-905); sys_libstdcxx's codecvt<wchar_t, char> and ctype<wchar_t>::widen are bytes
+too, where the SDK's C++ library converts UTF-8 through the same machine (its do_widen gives WEOF past 0x7F).
+
+## D-905 · 2026-10-11 · sys_libc's printf as the SDK's: the output internals, the SPU printf's, against a game's copy
+
+The SDK's C library (Dinkumware's, Sony's additions; no firmware module has it) as Assassin's Creed (BLES00158) links
+it was read and pspocket's printf rewritten to give what it gives, piece by piece (runtime/hle/src/libc_printf.hpp, an
+engine over the library's print-formatting structure that works on the host's buffers for sprintf and the rest and on
+guest memory for the internals a game calls; runtime/hle/src/sys_libc_format.cpp). 18 names new, under sys_libc and
+sys_libm: _Putfld, _Puttxt, _Putstr, _Litob, _Ldtob, _Genld, their _W forms, the six SPU printf internals
+(__spu_thread_printf, __spu_thread_putfld, __spu_thread_puttxt and the __raw_spu_ ones), plus _Printf, _WPrintf,
+spu_thread_printf/sprintf/snprintf, raw_spu_printf and spu_raw_sprintf/snprintf moved onto them. (The input side,
+_Getfld .. _WStoxflt, went to D-907.)
+- _Pft: +0 the value (long long or double), +16 a vector argument, +32 pfn, +36 arg, +40 s, +44 n0, nz0, n1, nz1, n2,
+  nz2, +68 prec, +72 nchar, +76 width, +80 flags (u16: ' ' 1, '+' 2, '-' 4, '#' 8, '0' 16, Sony's separators ',' 0x80,
+  ';' 0x100, ':' 0x200, '_' 0x400), +82 qual; the SPU printf's adds the SPU at +84 (flag 0x20: %s's text is in its
+  store). _WPft: +0 value, +8 pfn, +12 arg, +16 s, +20 n0 .. +40 nz2, +44 nchar, +48 prec, +52 width, +56 flags, +60
+  qual: the game's build has a 16-bit wchar_t (qual at +58); sys_libc's is 32-bit (D-512), so its wide text is words.
+- Floating point (_Ldtob, _Genld): the value scaled by powers of ten in double arithmetic, eight digits at a time, 19
+  significant at most, rounded half up on the first dropped digit: "%.0f" of 0.5 is "1", "%.1f" of 0.25 "0.3",
+  "%.20f" of 0.1 "0.10000000000000000000", "%.20f" of 1/3 "0.33333333333333330301". %a is exact, as few digits as
+  needed. The host's correctly rounded snprintf is gone (and faster: 20,000 vsprintf calls of 11 mixed conversions
+  took 21.0 ms before, 12.1 ms after, the same session).
+- Integers (_Litob) as C99, but: L is 32 bits (ll and j are 64; q is no qualifier at all: "%qd" prints "qd"); "% Ld"
+  has no space; %p is the hex digits alone, '#' or not.
+- Any conversion character it has none for prints itself padded to the width, taking no argument ("%5k" is
+  "    k"); %% is padded too; %s of NULL is "(null)" whatever the precision; %n of the narrow printf is not padded.
+- The "C" locale's multibyte characters are UTF-8 (U+00E9 is C3 A9), by the bits, with no surrogate or overlong
+  checks: %ls/%lc (wctomb) and the wide printf's %s (mbtowc) and %c (btowc: none past 0x7F, EOF). The game's 16-bit
+  build stops at three bytes; for the 32-bit wchar_t the same rule goes on to six (31 bits), as UTF-8 was first
+  defined: derived, no game shows it. This differs from D-512's byte-a-character "C" locale for mbrtowc and kin, which
+  stays as it is here (reported to the main session).
+- %ls goes through a buffer of 64 bytes, or of width + 3 (malloc) when right-justified and wider; a buffer that fills
+  is put out unpadded ("%-100ls" of a long string is not padded); a failed output inside it is ignored.
+- Sony's AltiVec vectors: v, vl or lv four 32-bit elements, vh/hv eight, vhh/hhv sixteen, vll/llv two 64-bit, vL/Lv
+  two doubles, v with a floating conversion four floats, vc sixteen characters, "%xc" and "%cx" (o, u, x, X) sixteen
+  bytes; the vector at the va_list's next 16-byte boundary. Each element is a field of its own after a separator (a
+  space unless , ; : or _ is given; for signed integers a ' ' flag and a separator both), which counts in its width;
+  floats keep the space as their sign too (" 1.5 -0.3  2.0  0.0").
+- The wide printf: no vectors, no %S; %n takes its pointer and stores nothing, and its field is padded ("%5n" puts
+  five spaces); padding 31 characters a piece (32 narrow).
+- swprintf answers -1 when a piece of the text does not fit, written as far as it fits, with a NUL (C99's negative);
+  sprintf writes no NUL after a failure; snprintf always writes one (n > 0).
+- The SPU printf (__spu_thread_printf on a thread's store, a word at a time through lv2 as the library's accessors,
+  D-904): format characters one a time, literal ones to pfn one a time; flags " +-#0", qualifiers h hh l ll j t z L;
+  every conversion takes the next quadword, %% too ("%d %% %d" of 1, 2, 3 is "1 % 3"); %s's text stays in the store,
+  read 128 bytes at a time, "(null)" for address 0 (its length measured at 0 meanwhile); %n writes the count into the
+  store as wide as its qualifier. spu_thread_printf writes to the TTY's SPU channel (2), as the library's output
+  function does. The raw SPU forms have no copy in any executable: the same on a raw SPU's store (guest memory).
+- No copy in the game: the __raw_spu_ internals (from the thread ones) and 32-bit wide text (from the game's 16-bit wide
+  functions, which do exist).
+- Undefined, left as it was: a format that ends inside a conversion (the library reads on past its NUL; pspocket
+  stops); a negative width with %ls makes the library malloc 4 GB (sys_libc's malloc refuses: -1).
+Compared (tests/hle/test_libc_format_game.cpp, test_hle "[gamelibc]"; every call made on the game's function and on
+pspocket's, answers, each piece the output function got, structures, buffers and memory written compared): _Printf
+2,131 calls (integers, characters, strings, %n, the output failing at each call), 49,240 (floating point: special
+values, ties, powers, denormals and 300 random ones by every precision and conversion, flags, widths, huge
+precisions), 992 (vectors); _WPrintf 4,252; _Litob, _Ldtob,
+_Genld 12,000 and their wide forms 12,000; _Puttxt, _Putstr, _Putfld 7,511 and the wide 7,468; __spu_thread_printf
+1,076 on a running SPU thread, __spu_thread_putfld/puttxt 1,500, spu_thread_sprintf/snprintf 20; sprintf, snprintf,
+vsprintf, vsnprintf, swprintf 139. 0 differences. Not compared: what makes the game's own code fault (its output
+function called with the NULL it answered, a negative precision handed to _Genld, swprintf with no room for a %s).
+Tests without the game: tests/hle/test_libc_format.cpp (the behaviours above, _Printf's pieces, a raw SPU's printf, the
+timing as "[.bench]"). Tests changed from the host's output to the SDK's: test_libc_process.cpp (_Printf's "%5.1f" of
+2.25 is "  2.3"), test_libc_stdio.cpp (swprintf's truncated text), test_libstdcxx_facets.cpp (num_put's reference is
+sys_libc's printf now: a pointer's "****1234abcd" without 0x, "-1.235e+03").

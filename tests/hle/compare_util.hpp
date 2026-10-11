@@ -94,6 +94,16 @@ inline Setup setup()
     return s;
 }
 
+// A library the installed system software has no module for cannot be compared with Sony's: the test SKIPs, saying
+// so (libmixer: firmware 4.92 ships no module exporting it, D-563, D-911).
+inline void require_firmware_module(const Setup& s, std::string_view library)
+{
+    if (s.mode != Mode::Firmware) return;
+    loader::LleModules lle(s.flash);
+    if (lle.index() && !lle.file_for(library))
+        SKIP(std::format("the installed system software has no module exporting {}: nothing to compare with", library));
+}
+
 // What can be checked without the firmware: each function a comparison calls has this name in the NID database under
 // `library` (the names Sony's module exports it by, as RPCS3 registers them) and is pspocket's own under that name,
 // and the library is still firmware-first (D-563) when `marked`.
