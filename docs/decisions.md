@@ -12380,3 +12380,11 @@ module (part 8); without it its quality comes from a search, logged. Not reprodu
 SPU encoder reads past a picture's right edge when the picture is not a whole number of MCUs wide (part 14). Its
 comparison (test_jpgenc_compare.cpp) loses its [.]: it runs in the Mac's gate with the firmware and skips without it;
 the name check and test_jpgenc.cpp check the library is pspocket's and unmarked.
+
+## D-915 · 2026-10-12 · libsnd3's comparison skips where no firmware module has libsnd3
+
+D-644's comparison of libsnd3 with Sony's module, written in a session without the firmware, stops on the Mac: firmware
+4.92 ships no module that exports libsnd3 (as with libmixer, D-911, and libsynth2, D-914). It now SKIPs saying so
+(compare_util.hpp require_firmware_module) and libsnd3 stays firmware-first. Of the comparisons with Sony's modules,
+every one now agrees or has nothing to compare with, but cellRudp's (D-633: 201 of 342 observations differ), which is
+next.

@@ -487,6 +487,7 @@ TEST_CASE("libsnd3 against Sony's libsnd3: banks, key-ons, registers, output, th
     "[.][hle][lle][compare][snd3]")
 {
     const Setup s = setup();
+    require_firmware_module(s, "libsnd3");
     run(s, "libsnd3 against Sony's libsnd3", [&](bool sony) { return half(s, sony); },
         [](const Observed& o) {
             // pspocket's own half: test_snd.cpp's answers.
