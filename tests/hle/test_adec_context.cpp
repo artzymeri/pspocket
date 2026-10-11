@@ -1,13 +1,14 @@
-// cellAdec's decoders when the game overwrites a decoder's context while it is open (D-645). A core keeps its context,
-// with its queue and the IDs of its mutexes and conditions, in the game's memory, as Sony's cores do. A damaged AT3+ file
-// whose PCM ran past its buffer onto that memory (the cellAtrac fuzzing, test_fuzz_media.cpp) left the ATRAC3plus
-// decoder's thread going round its queue's calls, which failed at once, past the process's end, or taking the commands
-// of another decoder opened in the same place. Each core's thread now ends when its context is no longer its own.
+// cellAdec's decoders when the game overwrites a decoder's context while it is open (D-645). A core keeps its
+// context, with its queue and the IDs of its mutexes and conditions, in the game's memory, as Sony's cores do. A
+// damaged AT3+ file whose PCM ran past its buffer onto that memory (the cellAtrac fuzzing, test_fuzz_media.cpp) left
+// the ATRAC3plus decoder's thread going round its queue's calls, which failed at once, past the process's end, or
+// taking the commands of another decoder opened in the same place. The thread of each of pspocket's cores with one
+// (LPCM, ATRAC3plus, the cores on FFmpeg) now ends when its context is no longer its own.
 //
-// Shown here without load: the game's callback runs on the decoder's own thread, so the context it overwrites at PCMOUT
-// is gone before the thread is back at its queue (where the fuzzing needed a busy machine for the game's thread to get
-// there first), and a callback held at PCMOUT keeps the thread away from its queue while another decoder opens in the
-// same memory.
+// Shown here without load: the game's callback runs on the decoder's own thread, so the context it overwrites at
+// PCMOUT is gone before the thread is back at its queue (where the fuzzing needed a busy machine for the game's thread
+// to get there first), and a callback held at PCMOUT keeps the thread away from its queue while another decoder opens
+// in the same memory.
 
 #include <catch_amalgamated.hpp>
 
@@ -97,12 +98,18 @@ struct CoreCase {
     std::vector<u8> au;     // an access unit: PCMOUT follows its decode, an error or not
 };
 
+// LPCM always; ATRAC3plus and the cores on FFmpeg in a build with FFmpeg.
 std::vector<CoreCase> core_cases()
 {
     std::vector<CoreCase> cases;
+    // adec_lpcm.cpp: the thread's ID at +0xC0. PAMF's LPCM, stereo, 48 kHz, 16 bits: 1024 samples of silence.
+    cases.push_back({"LPCM", 1, 0xC0, {3, 1, 1, 1024 * 4}, std::vector<u8>(1024 * 4, 0)});
 #if PSPOCKET_HAVE_FFMPEG
     // adec_atracx.cpp: the thread's ID first. 48 kHz stereo, 688-byte frames, floats.
     cases.push_back({"ATRAC3plus", 3, 0x00, {48000, 2, 2, 0x2B0, 0, 0x84, 0}, hle::test::atrac::silent_frame(8)});
+    // The cores on FFmpeg (adec_ffmpeg.hpp: the thread's ID at +0x148), MP3's for them: floats; bytes that are no MP3
+    // frame, an error (AUDONE and PCMOUT follow it all the same).
+    cases.push_back({"MP3 (the cores on FFmpeg)", 4, 0x148, {4}, std::vector<u8>(0x100, 0)});
 #endif
     return cases;
 }
@@ -119,7 +126,8 @@ bool ended(Fixture& f, u32 id)
     return t->finished;
 }
 
-// cellAdecOpen and cellAdecStartSeq of a decoder of `c.type` on kDecoderMem, its callback the overwriting one: the handle.
+// cellAdecOpen and cellAdecStartSeq of a decoder of `c.type` on kDecoderMem, its callback the overwriting one: the
+// handle.
 u32 open_decoder(u8* b, const Call& call, const CoreCase& c)
 {
     std::memset(b + kArgs, 0, 0x100);
@@ -159,7 +167,6 @@ u32 thread_of_core(u8* b, u32 handle, const CoreCase& c)
 TEST_CASE("cellAdec: a decoder whose context the game overwrites ends its thread (D-645)", "[hle][adec]")
 {
     const std::vector<CoreCase> cases = core_cases();
-    if (cases.empty()) SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): no core with a thread of its own to test");
     for (const CoreCase& c : cases) {
         // Zeros (silent PCM, as in the fuzzing) and a pattern (PCM that is not silent: words that are no IDs, a queue
         // that seems full, a thread that seems to be running).
@@ -194,7 +201,6 @@ TEST_CASE("cellAdec: a decoder whose context the game overwrites ends its thread
 TEST_CASE("cellAdec: a decoder's thread that finds another decoder opened in its place ends (D-645)", "[hle][adec]")
 {
     const std::vector<CoreCase> cases = core_cases();
-    if (cases.empty()) SKIP("no FFmpeg in this build (scripts/build-ffmpeg.sh): no core with a thread of its own to test");
     for (const CoreCase& c : cases) {
         DYNAMIC_SECTION(c.name)
         {

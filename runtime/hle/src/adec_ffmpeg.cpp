@@ -137,11 +137,28 @@ Cmd pop_command(u8* base, u32 h, u8 (&param)[fx::kParamMax])
     return c;
 }
 
-bool still_running(PPUContext& ctx, u32 h)
+// Whether the context at `h` is still the calling thread's, as adec_atracx.cpp's own_context (D-645): `r`, the answer
+// of the call just made on its mutexes or conditions, is CELL_OK, and its thread ID names the thread. A context the
+// game overwrote while the decoder was open, or another decoder's opened in its memory, ends the thread, logged.
+bool own_context(PPUContext& ctx, u32 h, std::string_view name, s32 r, std::string_view what)
 {
-    lock(ctx, h, fx::run_thread_mutex);
-    const bool run = ps_read32(guest_base(ctx), h + fx::run_thread) != 0;
-    unlock(ctx, h, fx::run_thread_mutex);
+    const u32 self = thread(ctx).id;
+    const u64 named = ps_read64(guest_base(ctx), h + fx::thread_id);
+    if (r == lv2::CELL_OK && named == self) return true;
+    const std::string answer =
+        r == lv2::CELL_OK ? "" : std::format("; {} answered {:#010x}", what, static_cast<u32>(r));
+    PS_LOG_ERROR(kChan, "{} decoder {:#x}: its context is no longer its own (it names thread {:#x}{}): the game "
+        "overwrote it while the decoder was open; the decoder's thread {:#x} ends", name, h, named, answer, self);
+    return false;
+}
+
+// The thread's run_thread check; false too when the context is no longer the thread's (D-645).
+bool still_running(PPUContext& ctx, u32 h, std::string_view name)
+{
+    const s32 r = lock(ctx, h, fx::run_thread_mutex);
+    const bool run =
+        own_context(ctx, h, name, r, "run_thread's mutex") && ps_read32(guest_base(ctx), h + fx::run_thread);
+    if (r == lv2::CELL_OK) unlock(ctx, h, fx::run_thread_mutex);
     return run;
 }
 
@@ -172,7 +189,8 @@ void decode_au(PPUContext& ctx, u32 h, const Spec& spec, Codec& codec, const Cmd
     notify.pcm_out(cmd.pcm_handle, output, d.size, bsi.addr(), d.pts_type, d.error);
 }
 
-// The decoder's thread (as AtracXdecContext::exec): one command at a time until Close.
+// The decoder's thread (as AtracXdecContext::exec): one command at a time until Close, or until its context is no
+// longer its own (own_context, D-645).
 void run(PPUContext& ctx, u32 h)
 {
     u8* base = guest_base(ctx);
@@ -182,15 +200,20 @@ void run(PPUContext& ctx, u32 h)
     const std::unique_ptr<Codec> codec = spec->make();
     for (;;) {
         for (;;) {
-            lock(ctx, h, fx::queue_mutex);
+            const s32 r = lock(ctx, h, fx::queue_mutex);
+            if (!own_context(ctx, h, spec->name, r, "the queue's mutex")) {
+                if (r == lv2::CELL_OK) unlock(ctx, h, fx::queue_mutex);
+                return;
+            }
             if (ps_read32(base, h + fx::cmd_size) != 0) break;
-            wait(ctx, h, fx::queue_not_empty);
+            const s32 w = wait(ctx, h, fx::queue_not_empty);
             unlock(ctx, h, fx::queue_mutex);
+            if (!own_context(ctx, h, spec->name, w, "the queue's condition")) return;
         }
         u8 param[fx::kParamMax];
         const Cmd cmd = pop_command(base, h, param);
         unlock(ctx, h, fx::queue_mutex);
-        if (!still_running(ctx, h)) return;
+        if (!still_running(ctx, h, spec->name)) return;
         switch (cmd.type) {
         case START_SEQ:
             std::memcpy(base + h + fx::param, param, spec->param_size);
@@ -199,15 +222,18 @@ void run(PPUContext& ctx, u32 h)
                     static_cast<u32>(r));
             break;
         case END_SEQ: CoreNotifier(ctx, h, kSlots).seq_done(); break;
-        case DECODE_AU:
-            lock(ctx, h, fx::output_mutex);
-            while (ps_read32(base, h + fx::output_locked)) wait(ctx, h, fx::output_consumed);
-            if (!still_running(ctx, h)) {
-                unlock(ctx, h, fx::output_mutex);
+        case DECODE_AU: {
+            const s32 locked = lock(ctx, h, fx::output_mutex);
+            s32 r = locked;
+            while (r == lv2::CELL_OK && ps_read32(base, h + fx::output_locked)) r = wait(ctx, h, fx::output_consumed);
+            if (!own_context(ctx, h, spec->name, r, "the output's mutex or condition") ||
+                !still_running(ctx, h, spec->name)) {
+                if (locked == lv2::CELL_OK) unlock(ctx, h, fx::output_mutex);
                 return;
             }
             decode_au(ctx, h, *spec, *codec, cmd);
             break;
+        }
         case CLOSE: break; // run_thread is clear: the next turn ends
         default: PS_FATAL(kChan, "{}: command type {} in the queue of {:#x}", spec->name, cmd.type, h);
         }
