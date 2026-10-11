@@ -1,8 +1,8 @@
 {
-  "engine_percent": 89.2,
+  "engine_percent": 89.4,
   "libraries": {
-    "own": 6109,
-    "answered_as_rpcs3": 188,
+    "own": 6318,
+    "answered_as_rpcs3": 82,
     "known": 6625
   },
   "kernel": {

@@ -1853,6 +1853,93 @@ TEST_CASE("cellSyncLFQueue ANY2ANY: PPU threads pushing and popping with the bod
     CHECK(h(b, kH6) == 0);
 }
 
+TEST_CASE("cellSyncLFQueue: four PPU threads on the PPU's side at once (pushing into a PPU2SPU queue, popping an SPU2PPU "
+          "one) against SPU code on the other: every entry once, each thread's in order (D-650)",
+    "[hle][sync][lfqueue]")
+{
+    constexpr u32 kThreads = 4, kEach = 600, kRing = 4;
+    constexpr u32 kBufs = kData + 0x24000; // a 16-byte buffer per PPU thread
+    Fixture f;
+    u8* b = f.base();
+    for (const bool ppu_pushes : {true, false}) {
+        INFO("the PPU threads " << (ppu_pushes ? "push" : "pop"));
+        {
+            GuestThread a(f, 0, "init");
+            lf_init(a, kRing, ppu_pushes ? kPpu2Spu : kSpu2Ppu);
+        }
+        const hle::Function& body = GuestThread::find(ppu_pushes ? "_cellSyncLFQueuePushBody" : "_cellSyncLFQueuePopBody");
+        std::atomic<u32> errors{0}, disorder{0};
+        std::atomic<bool> stop{false};
+        std::vector<std::atomic<u32>> seen(kThreads * kEach);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        std::vector<std::thread> ppus;
+        for (u32 t = 0; t < kThreads; t++) {
+            ppus.emplace_back([&, t] {
+                GuestThread g(f, 1 + t, "ppu");
+                const u32 buf = kBufs + 16 * t;
+                s64 last = -1;
+                for (u32 n = 0; n < kEach; n++) {
+                    if (ppu_pushes) put_entry(b, buf, (t << 16) | n);
+                    if (raw(g, body, {kLfq, buf, 1}) != 0) {
+                        errors++;
+                        continue;
+                    }
+                    if (ppu_pushes) continue;
+                    // Popped: what SPU code pushed, whole; each popper's entries in the order they were pushed.
+                    const u32 v = ps_read32(b, buf);
+                    if (v >= kThreads * kEach || ps_read32(b, buf + 12) != v) {
+                        errors++;
+                        continue;
+                    }
+                    seen[v]++;
+                    if (static_cast<s64>(v) <= last) disorder++;
+                    last = v;
+                }
+            });
+        }
+        // SPU code on the other side, one entry at a time in order (popping, or pushing 0, 1, 2, ...).
+        std::thread spu([&] {
+            std::array<s64, kThreads> last;
+            last.fill(-1);
+            for (u32 n = 0; n < kThreads * kEach && !stop; n++) {
+                u32 value = 0;
+                while (!(ppu_pushes ? spu_pop(b, kRing, value) : spu_push(b, kRing, n))) {
+                    if (std::chrono::steady_clock::now() > deadline) {
+                        stop = true;
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+                if (!ppu_pushes) continue;
+                const u32 from = value >> 16, i = value & 0xFFFF;
+                if (from >= kThreads || i >= kEach) {
+                    errors++;
+                    continue;
+                }
+                seen[from * kEach + i]++;
+                if (static_cast<s64>(i) <= last[from]) disorder++; // one pusher's entries reach SPU code in order
+                last[from] = i;
+            }
+        });
+        spu.join();
+        if (stop) { // the PPU side may wait for ever: end the process to unwind it
+            GuestThread x(f, 1 + kThreads, "exit");
+            CHECK_THROWS_AS(lv2::sys_process_exit3(*x.t, 0), lv2::ThreadExit);
+        }
+        for (std::thread& t : ppus) t.join();
+        REQUIRE_FALSE(stop);
+        CHECK(errors == 0);
+        CHECK(disorder == 0);
+        u32 once = 0;
+        for (const auto& s : seen) once += s.load() == 1;
+        CHECK(once == kThreads * kEach);
+        const u16 end = (kThreads * kEach) % (2 * kRing);
+        for (const u32 off : {kH1, kH4, kH5, kH8}) CHECK(h(b, off) == end);
+        CHECK(h(b, kH2) == 0); // the completion bitmaps: nothing completed ahead of a gap
+        CHECK(h(b, kH6) == 0);
+    }
+}
+
 namespace {
 constexpr u32 kSpuScratchA = kData + 0x40000, kSpuScratchB = kData + 0x44000; // make_spu_group's 0x2000 bytes each
 constexpr u32 kSpus = kData + 0x48000, kLfq2 = kData + 0x48080, kOtherQueue = kData + 0x48100;

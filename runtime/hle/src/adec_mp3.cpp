@@ -22,6 +22,14 @@
 //   is decoded anyway: the error codes have no CRC error); i_error_code the error the unit got, else 0.
 // - PTS: correctPtsValueType 7, 8 or 9 for 48, 44.1 and 32 kHz (and 24, 22.05 and 16 kHz, whose 576-sample frames last
 //   as long).
+//
+// MP3 Surround (CELL_ADEC_TYPE_MP3S, for cellMP3Sdec's table 0x292CDF0A, D-621) is the same core. MP3 Surround is an
+// MP3 stream whose ancillary data carries spatial parameters for 5.1; FFmpeg has no decoder for those, so its stereo
+// MP3 (the downmix the encoder made, which every MP3 decoder plays) is decoded and the spatial data left (logged once).
+// RPCS3 has no structures for it: its parameters and information block are taken as MP3's (CellAdecParamMP3,
+// CellAdecMP3Info), its errors, not being known, are libadec's own (ARG for a word size StartSeq refuses, BUSY, FATAL
+// for a unit it cannot decode, the reason logged and i_error_code FATAL), and its PTS is the core's own correction
+// (ADEC_CORRECT_PTS_VALUE_TYPE_MP3S, _SceAdecCorrectPtsValue_Mp3s: the previous frame's PTS plus its length).
 
 #include <algorithm>
 #include <format>
@@ -92,23 +100,31 @@ SideInfo side_info(const u8* p, u32 size, const MpegHeader& h)
 
 class Mp3 final : public Codec {
 public:
+    // `surround`: cellMP3Sdec's core (D-621): MP3 Surround's stereo, libadec's error codes, its own PTS correction.
+    explicit Mp3(bool surround) : surround_(surround), name_(surround ? "MP3 Surround" : "MP3") {}
+
     s32 start(const u8* param) override
     {
         bw_pcm_ = ps_ld32(param);
-        configured_ = ff_.open("mp3float", "MP3");
-        return configured_ ? lv2::CELL_OK : error(CELL_ADEC_ERROR_MP3_ERROR);
+        if (surround_)
+            log_once("MP3 Surround", "MP3 Surround: the spatial data in its ancillary bytes is not decoded: its stereo "
+                "MP3, the encoder's downmix, is");
+        configured_ = ff_.open("mp3float", name_);
+        return configured_ ? lv2::CELL_OK : error(surround_ ? u32{CELL_ADEC_ERROR_ARG} : u32{CELL_ADEC_ERROR_MP3_ERROR});
     }
 
     Decoded decode(u8* base, u32 au, u32 size, u32 out, u32 bsi) override
     {
         Decoded d;
-        const auto fail = [&](u32 code) {
-            d.error = error(code);
-            ps_write32(base, bsi + info::error_code, code);
+        if (surround_) d.pts_type = CORRECT_PTS_MP3S;
+        const auto fail = [&](u32 code) { // MP3 Surround: libadec's FATAL for every unit refused (D-621)
+            const u32 c = surround_ ? CELL_ADEC_ERROR_FATAL : code;
+            d.error = error(c);
+            ps_write32(base, bsi + info::error_code, c);
             return d;
         };
         if (!configured_) {
-            PS_LOG_ERROR("cellAdec", "MP3: a decode without a sequence started with valid parameters");
+            PS_LOG_ERROR("cellAdec", "{}: a decode without a sequence started with valid parameters", name_);
             return fail(CELL_ADEC_ERROR_MP3_ERROR);
         }
         if (size < 4) return fail(CELL_ADEC_ERROR_MP3_LOST_SYNC);
@@ -125,9 +141,11 @@ public:
         if (h.layer != 3) return fail(CELL_ADEC_ERROR_MP3_NOT_L3);
         if (h.rate) {
             // The front end's steps for 1152 samples at 48, 44.1 and 32 kHz (576 at half those rates last as long);
-            // a frame refused past its header keeps its length.
+            // a frame refused past its header keeps its length. MP3 Surround corrects its own.
             const u32 rate = h.version == 3 ? h.rate : 2 * h.rate;
-            d.pts_type = rate == 48000 ? CORRECT_PTS_MP3_48000 : rate == 44100 ? CORRECT_PTS_MP3_44100 : CORRECT_PTS_MP3_32000;
+            if (!surround_)
+                d.pts_type = rate == 48000 ? CORRECT_PTS_MP3_48000 : rate == 44100 ? CORRECT_PTS_MP3_44100 :
+                                                                                    CORRECT_PTS_MP3_32000;
             d.duration = ticks(h.samples, h.rate);
         }
         if (!h.bitrate) return fail(CELL_ADEC_ERROR_MP3_BAD_BITRATE);
@@ -136,12 +154,12 @@ public:
         const u32 crc_bytes = h.crc ? 2 : 0;
         const SideInfo si = side_info(base + au + 4 + crc_bytes, size - std::min(size, 4 + crc_bytes), h);
         if (size < h.frame_bytes || h.frame_bytes < 4 + crc_bytes + si.bytes) {
-            PS_LOG_ERROR("cellAdec", "MP3: an access unit of {} bytes for a {}-byte frame", size, h.frame_bytes);
+            PS_LOG_ERROR("cellAdec", "{}: an access unit of {} bytes for a {}-byte frame", name_, size, h.frame_bytes);
             return fail(CELL_ADEC_ERROR_MP3_ERROR);
         }
         if (size > h.frame_bytes)
-            log_once("MP3 longer", std::format("MP3: an access unit of {} bytes holds more than its {}-byte frame: the "
-                "frame is decoded, the rest left", size, h.frame_bytes));
+            log_once(std::format("{} longer", name_), std::format("{}: an access unit of {} bytes holds more than its "
+                "{}-byte frame: the frame is decoded, the rest left", name_, size, h.frame_bytes));
         const u32 now = h.frame_bytes - 4 - crc_bytes - si.bytes;
         const s64 remain = s64{si.main_data_begin} + now - (si.part23_bits + 7) / 8;
         ps_write32(base, bsi + info::main_data_begin, si.main_data_begin);
@@ -155,7 +173,7 @@ public:
         if (si.bad_block) return fail(CELL_ADEC_ERROR_MP3_BAD_BLKTYPE);
         pcm_.clear();
         if (const int e = ff_.decode(base + au, h.frame_bytes, pcm_, h.samples); e < 0 || !pcm_.samples) {
-            PS_LOG_ERROR("cellAdec", "MP3: FFmpeg refused a frame ({}): the game sent invalid data", e);
+            PS_LOG_ERROR("cellAdec", "{}: FFmpeg refused a frame ({}): the game sent invalid data", name_, e);
             return fail(CELL_ADEC_ERROR_MP3_ERROR);
         }
         d.size = write_pcm(base, out, pcm_, straight(pcm_.channels()),
@@ -164,6 +182,8 @@ public:
     }
 
 private:
+    bool surround_;
+    std::string_view name_;
     FfDecoder ff_;
     Planar pcm_;
     u32 bw_pcm_ = MP3_WORD_SZ_FLOAT;
@@ -179,13 +199,17 @@ s32 check(const u8* param)
     return error(CELL_ADEC_ERROR_ARG);
 }
 
-std::unique_ptr<Codec> make() { return std::make_unique<Mp3>(); }
+std::unique_ptr<Codec> make() { return std::make_unique<Mp3>(false); }
+std::unique_ptr<Codec> make_surround() { return std::make_unique<Mp3>(true); }
 
 } // namespace
 
 // libmp3dec's version is not known (pspocket's word); its information block is CellAdecMP3Info's size.
 const Spec kMp3 = {CELL_ADEC_TYPE_MP3, "MP3", 4, info::size, 1152 * 2 * 4, 0x01000000, CELL_ADEC_ERROR_MP3_BUSY, check,
     make};
+// MP3 Surround (D-621): MP3's parameters and information block, libadec's error codes.
+const Spec kMp3s = {CELL_ADEC_TYPE_MP3S, "MP3 Surround", 4, info::size, 1152 * 2 * 4, 0x01000000, CELL_ADEC_ERROR_BUSY,
+    check, make_surround};
 
 } // namespace pspocket::hle::adec::ffcore
 

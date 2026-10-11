@@ -74,6 +74,10 @@ struct Variable {
     u32 size = 4;
     u32 align = 4;
     void (*init)(u8* base, u32 addr) = nullptr;
+    // A variable made from RPCS3 without Sony's module to compare it with, in a library whose other exports were
+    // compared (D-624, as Function::unverified, D-594): an import of it counts as one of a variable the host lacks
+    // wherever the installed system software has the library's module.
+    bool unverified = false;
 };
 
 class Registry {
@@ -100,6 +104,12 @@ public:
     {
         const Function* f = find(module, nid);
         return f && f->unverified;
+    }
+    // And for one variable (Variable::unverified, D-624).
+    bool is_unverified_variable(std::string_view module, u32 nid) const
+    {
+        const Variable* v = find_variable(module, nid);
+        return v && v->unverified;
     }
 
 private:

@@ -142,6 +142,8 @@ struct Encoder {
     std::deque<Result> streams;   // waiting to be taken (eight at most)
     bool skip_next = false;       // Reset leaves libjpgenc's abort flag up: the next picture is skipped
     bool pumping = false;
+    bool in_flight = false;       // the first command is being encoded (it keeps its place until its stream is queued)
+    bool reset_pending = false;   // a Reset came while it was: the others are skipped once its stream is queued
     u64 generation = 0, resets = 0;
 };
 
@@ -354,6 +356,14 @@ Result encode(PPUContext& ctx, State& s, const Config& cfg, const Command& c)
 }
 
 // Encodes the commands waiting while fewer than four streams wait (libjpgenc's thread), one thread at a time.
+// Reset's work: the commands waiting become skipped streams (eight streams at most).
+void skip_waiting(Encoder& enc)
+{
+    for (const Command& c : enc.commands)
+        if (enc.streams.size() < kStreamQueue) enc.streams.push_back(result_of(c, error(CELL_JPGENC_ERROR_STREAM_SKIP)));
+    enc.commands.clear();
+}
+
 void pump(PPUContext& ctx, State& s, u32 handle)
 {
     u64 generation = 0;
@@ -379,6 +389,7 @@ void pump(PPUContext& ctx, State& s, u32 handle)
                 return;
             }
             c = enc.commands.front();
+            enc.in_flight = true;
             skip = enc.skip_next;
             enc.skip_next = false;
         }
@@ -387,8 +398,13 @@ void pump(PPUContext& ctx, State& s, u32 handle)
         const auto e = s.encoders.find(handle);
         if (e == s.encoders.end() || e->second.generation != generation) return;
         Encoder& enc = e->second;
-        if (!enc.commands.empty()) enc.commands.pop_front();
+        if (enc.in_flight && !enc.commands.empty()) enc.commands.pop_front();
+        enc.in_flight = false;
         enc.streams.push_back(r);
+        if (enc.reset_pending) {
+            enc.reset_pending = false;
+            skip_waiting(enc);
+        }
     }
 }
 
@@ -469,9 +485,10 @@ s32 cellJpgEncReset(PPUContext&, u32 handle)
     if (!handle || e == s.encoders.end()) return error(CELL_JPGENC_ERROR_ARG);
     Encoder& enc = e->second;
     if (enc.streams.size() >= 5) return error(CELL_JPGENC_ERROR_BUSY);
-    for (const Command& c : enc.commands)
-        if (enc.streams.size() < kStreamQueue) enc.streams.push_back(result_of(c, error(CELL_JPGENC_ERROR_STREAM_SKIP)));
-    enc.commands.clear();
+    // A command being encoded finishes as it is and its stream is queued first (libpngenc's thread takes the Reset
+    // between commands); the others become skipped streams then.
+    if (enc.in_flight) enc.reset_pending = true;
+    else skip_waiting(enc);
     enc.skip_next = true;
     enc.resets++;
     return lv2::CELL_OK;

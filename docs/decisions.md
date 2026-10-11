@@ -10320,6 +10320,1364 @@ Tests: 21 Note2Pitch and 14 Pitch2Note values of libsd's arithmetic; every note 
 4096 * 2^(offset / 12) (within 1 + 0.06%), rising, and back through Pitch2Note within 5 fine steps (1 from the centre
 up). To compare on the Mac: the comparison's 2,350 answers against Sony's.
 
+## D-630 · 2026-10-10 · cellRudp pspocket's own: contexts, connections and data (the API as decided without librudp)
+
+cellRudp is Sony's reliable UDP for games' peer-to-peer play (librudp). D-607 made its life pspocket's (Init, End,
+SetEventHandler); its other 28 functions are now pspocket's too (runtime/hle/src/cellRudp.cpp), and the library stays
+firmware-first (D-563): where the system software is installed a game still gets Sony's librudp, until the comparison
+of D-633 has run on the Mac. RPCS3 (cellRudp.cpp, cellRudp.h) gives the error codes, the option numbers, the poll event
+flags, CellRudpAllocator and CellRudpEventHandler's arguments, and nothing else: its other 28 are bare stubs without
+signatures. Sony's library was not at hand, so everything below was decided, from the library's names, its error codes
+and options, and the argument lists its successors (the PS Vita's and PS4's RUDP, the same functions) are recalled to
+have; no document of them was at hand either. Each is the first thing to check on the Mac (D-633). The wire format,
+which a game never sees, is pspocket's own (D-631); the I/O and the threads are D-632.
+
+**Signatures** (int answers; an ID or a count where noted):
+- EnableInternalIOThread(uint32_t stack_size, uint32_t priority); SetMaxSegmentSize(uint16_t mss);
+  GetMaxSegmentSize(uint16_t *mss).
+- CreateContext(CellRudpContextEventHandler handler, void *arg, int *ctx_id), the handler being (int ctx_id, int
+  event_id, int error_code, void *arg); SetOption and GetOption(int ctx_id, int option, [const] void *optval, size_t
+  optlen); GetContextStatus(int ctx_id, CellRudpContextStatus *status, size_t size); GetStatus(CellRudpStatus *status,
+  size_t size); GetLocalInfo(int ctx_id, int *soc, sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport, uint8_t
+  *muxmode); GetRemoteInfo(int ctx_id, sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport) (each output may be
+  NULL; *addrlen is the room in and 16 out).
+- Bind(int ctx_id, int soc, uint16_t vport, uint8_t muxmode); Listen(int ctx_id, int backlog); Accept(int ctx_id),
+  answering the new context's ID; Initiate(int ctx_id, const sys_net_sockaddr *to, socklen_t tolen, uint16_t vport);
+  Activate(int ctx_id, const sys_net_sockaddr *to, socklen_t tolen); Terminate(int ctx_id).
+- Read(int ctx_id, void *data, size_t len, uint8_t flags, CellRudpReadInfo *info) and Write(int ctx_id, const void
+  *data, size_t len, uint8_t flags), answering bytes; GetSizeReadable and GetSizeWritable(int ctx_id), answering bytes;
+  Flush(int ctx_id).
+- PollCreate(size_t size), answering the set's ID; PollDestroy(int poll_id); PollControl(int poll_id, int op, int
+  ctx_id, uint16_t events); PollWait(int poll_id, CellRudpPollEvent *events, size_t event_len, uint64_t timeout),
+  answering how many it wrote; PollCancel(int poll_id).
+- NetReceived(int soc, const uint8_t *data, size_t datalen, const sys_net_sockaddr *addr, socklen_t addrlen);
+  ProcessEvents(uint64_t timeout).
+
+**Numbers.** States: IDLE 0, CLOSED 1, SYN_SENT 2, SYN_RCVD 3, ESTABLISHED 4, CLOSE_WAIT 5 (the peer has ended). The
+context handler's events: CLOSED 1, ESTABLISHED 2, ERROR 3, WRITABLE 4, READABLE 5, FLUSHED 6; the event handler's:
+SEND 1, SOCKET_RELEASED 2. Poll operations ADD 1, MODIFY 2, REMOVE 3. Mux modes NORMAL 0, RAW 1. Read and Write flags:
+DONTWAIT 0x01, LATENCY_CRITICAL 0x08 (sent at once, counted, given to the reader); ALIGN_32 0x10, ALIGN_64 0x20 and
+WITH_TIMESTAMP 0x80 are taken and change nothing (every read information has its time stamp).
+
+**Structures**, all big-endian; Get*Status copy as many bytes as `size` asks for and write zeros past them (up to 256
+and 1024 bytes), so a game's larger structure never gets garbage:
+- CellRudpContextStatus, 48 bytes: state, parentId (the listener of an accepted context, else 0), children (a listener's
+  connections waiting and accepted ones still there), lostPackets, sentPackets, rcvdPackets (u32 each), sentBytes,
+  rcvdBytes (u64), retransmissions, rtt (the smoothed round trip in microseconds).
+- CellRudpStatus, 50 u64 counters: sentUdpBytes, rcvdUdpBytes, sentUdpPackets, rcvdUdpPackets, sentUserBytes,
+  sentUserPackets, sentLatencyCriticalPackets, rcvdUserBytes, rcvdUserPackets, rcvdLatencyCriticalPackets,
+  sent/rcvdSynPackets, sent/rcvdUsrPackets (DATA segments), sent/rcvdPrbPackets (probes), sent/rcvdRstPackets,
+  lostPackets, retransmittedPackets, reorderedPackets, currentContexts, then for quality levels 1 to 4 (delivery and
+  order guaranteed; delivery only; order only; neither) sent bytes, received bytes, sent packets, received packets;
+  allocs, frees, memCurrent, memPeak (the contexts' records and the bytes buffered), establishedConnections,
+  failedConnections and failed by reset, refused, timeout, version, transport type and quality level.
+- CellRudpReadInfo, 12 bytes: size (12), retransmissionCount, retransmissionDelay (u16, 0), retransmissionDelay2 (0),
+  flags (LATENCY_CRITICAL), sequenceNumber (the segment's low 16 bits), timestamp (the sender's guest clock in
+  microseconds when the segment first went).
+- CellRudpPollEvent, 8 bytes: ctx_id, reqEvents, rtnEvents.
+
+**Options** take 1, 2, 4 or 8 bytes (big-endian, unsigned) and GetOption writes in the width asked for
+(BUFFER_TOO_SMALL when the value does not fit; LAST_ERROR sign-extended in 8). Times are microseconds; a timeout of 0
+has no end. Defaults: MAX_PAYLOAD the segment's payload (1368), at most that (PAYLOAD_TOO_LARGE), at least 1; SNDBUF and
+RCVBUF 65,536 (256 to 16 MB); NODELAY 0; DELIVERY_CRITICAL and ORDER_CRITICAL 1; NONBLOCK 0; STREAM 0 (messages; a
+stream always has both guarantees); CONNECTION_TIMEOUT 30 s; CLOSE_WAIT_TIMEOUT 1 s; AGGREGATION_TIMEOUT 10 ms;
+READ_TIMEOUT, WRITE_TIMEOUT and FLUSH_TIMEOUT none; KEEP_ALIVE_INTERVAL 1 s; KEEP_ALIVE_TIMEOUT 10 s; LAST_ERROR the
+error that closed the connection, read only (INVALID_OPTION to set, as 12, 13 and past 19 are). STREAM,
+DELIVERY_CRITICAL and ORDER_CRITICAL are what a connection agrees on: IN_PROGRESS while it is being made,
+ALREADY_ESTABLISHED after; the others change at any time.
+
+**What each call does and answers** (every call NOT_INITIALIZED before Init; an unknown ID INVALID_CONTEXT_ID; a
+pointer that is not guest memory, a size of 0, a bad width INVALID_ARGUMENT, logged where a guest function is involved,
+never a host fault):
+- CreateContext: IDs from 1, never handed out twice in a process (a thread waiting across End and Init sees its ID go);
+  each context takes a 256-byte record from the game's app_malloc (the main area with the library's own allocator),
+  MEMORY when none comes, given back at Terminate or End; TOO_MANY_CONTEXTS past 256 (the game's, a listener's waiting
+  ones, the lingering ones). A NULL handler: no events.
+- Bind: a UDP or UDP P2P socket of the game's (INVALID_SOCKET otherwise, the type read from lv2's socket information);
+  mux mode 0 or 1 and the socket's contexts all in one (INVALID_MUXMODE); RAW needs the event handler
+  (NO_EVENT_HANDLER); ALREADY_BOUND; one context a vport (VPORT_IN_USE), vport 0 the lowest free one (VPORT_EXHAUSTED).
+- Listen(backlog): any peer's SYN at the vport makes a connection of its own, up to `backlog` waiting (8 for 0 or less,
+  64 at most); the listener hears READABLE when one has finished its handshake, and Accept hands it over as a context
+  with the listener's handler, argument and options (WOULDBLOCK when none and non-blocking or past READ_TIMEOUT;
+  NOT_ACCEPTABLE on a context not listening).
+- Initiate(to, vport): SYNs to the peer's vport until an answer or CONNECTION_TIMEOUT. Activate(to): a connection with
+  that peer only, from whichever vport its SYN comes; its own SYNs go to its own vport, so two peers activating each
+  other at one vport meet (D-631). Both: NOT_BOUND before Bind, NOT_ACCEPTABLE on a listener, IN_PROGRESS while
+  connecting, ALREADY_ESTABLISHED after; a peer address under 16 bytes INVALID_ARGUMENT; Initiate to vport 0
+  INVALID_VPORT.
+- Write: a datagram context takes a message whole (MSG_TOO_LARGE past MAX_PAYLOAD or SNDBUF), a stream as many bytes
+  as fit (all of them when blocking); without room WOULDBLOCK (NONBLOCK, DONTWAIT) or a wait up to WRITE_TIMEOUT, and
+  WRITABLE once room comes back. Written while the handshake runs, it goes out once it ends. NOT_BOUND before a
+  connection, END_OF_DATA once the peer has ended, the error after a failure.
+- Read: a whole message (BUFFER_TOO_SMALL, the message kept, when it does not fit) or the stream's bytes up to len, and
+  the read information; nothing there: WOULDBLOCK or a wait up to READ_TIMEOUT; END_OF_DATA once the peer's end is
+  read; NOT_ACCEPTABLE on a listener. GetSizeReadable: every byte waiting; GetSizeWritable: the room left.
+- Flush: what was written goes out now (no aggregation), then the call waits until the peer has acknowledged it all
+  (FLUSH_TIMEOUT); non-blocking it is WOULDBLOCK until then, with FLUSHED when it has.
+- Terminate: the ID goes at once; a connection lingers to send what was written and its end (D-631); one being made is
+  reset; a listener's connections not accepted are reset.
+- The connection's failures: CONN_REFUSED (nothing bound at the vport), CONN_TIMEOUT (the handshake past
+  CONNECTION_TIMEOUT), CONN_RESET (a RST), KEEP_ALIVE_FAILURE (nothing heard for KEEP_ALIVE_TIMEOUT),
+  CONN_VERSION_MISMATCH, CONN_TRANSPORT_TYPE_MISMATCH (a stream meeting messages), QUALITY_LEVEL_MISMATCH (different
+  delivery or order guarantees): the context is CLOSED, what it buffered goes, its handler hears ERROR and then CLOSED
+  with the code, which LAST_ERROR keeps and Read and Write answer.
+- Polls: PollCreate(1 to 1024 contexts; 64 sets, then MEMORY); PollControl ADD (ALREADY_EXISTS twice, MEMORY past the
+  size), MODIFY, REMOVE (INVALID_CONTEXT_ID for one not in the set; events past the four flags INVALID_ARGUMENT);
+  PollWait reports READ (data, the peer's end, a failure, a connection to accept), WRITE (room for a message, or a call
+  that would answer at once), FLUSH (all acknowledged), and ERROR whatever is asked; timeout 0 answers at once, a wait
+  that ends without an event answers 0, PollCancel or PollDestroy end it with CANCELLED; INVALID_POLL_ID.
+- Not used: INTERNAL and ADDR_IN_USE.
+To check on the Mac (D-633), first: every signature above (above all Listen's and Accept's, which the successors lack,
+EnableInternalIOThread's order and GetMaxSegmentSize's pointer), the structures' layouts and the numbers, the options'
+widths, units and defaults, PollWait's timeout 0, and the answers chosen where two would do.
+
+The count: 5,993 of 6,625 library functions pspocket's own before, 6,021 after; cellRudp's grey cells, all 28, green.
+Tests: tests/hle/test_rudp.cpp, 15 cases (D-631 and D-632 list what they cover).
+
+## D-631 · 2026-10-10 · cellRudp's wire format and protocol, pspocket's own; the test hook on the socket path
+
+Sony's wire format is not known, so pspocket's RUDP has its own (runtime/hle/src/rudp.hpp): it talks only to
+pspocket's; a real PS3 needs Sony's format, and PSN play is gone. Each packet is one UDP (or UDP P2P) datagram: a
+32-byte header, big-endian (magic 0x5052, version 1, type, flags, the RST's reason, the segment's retries, the source
+and destination vports, sequence number, acknowledgement, a 32-bit selective acknowledgement, the window in bytes, the
+sender's time stamp), then the payload. Types: SYN, SYN-ACK, ACK, DATA, PROBE, FIN, RST.
+- **Connections.** Each side starts its sequence numbers at random; SYN and SYN-ACK carry the connection's parameters
+  (stream or messages, delivery and order guarantees, the sender's maximum segment size, its receive buffer). The
+  handshake is TCP's: SYN, SYN-ACK, ACK, and two SYNs that cross (two Initiates, or Activates) make a simultaneous
+  open. A SYN at a vport where nothing is bound is refused (RST "refused": CONN_REFUSED); one at a bound context that
+  has not started yet, or has another peer, is dropped and comes again (so two Initiates a moment apart still meet);
+  an Activate's SYN is marked soft and is never refused. The parameters must agree (RST "transport" or "quality": the
+  mismatch errors on both sides); another version gets RST "version". The segment size is the smaller of the two
+  sides' (cellRudpSetMaxSegmentSize: header and payload in one datagram, 1400 by default, 128 to 65507).
+- **Data.** Messages are a segment each (MAX_PAYLOAD at most a segment's payload); a stream's bytes are cut into
+  segments of the payload, a part segment held while others are in flight for up to AGGREGATION_TIMEOUT unless NODELAY,
+  Flush or LATENCY_CRITICAL. The receiver acknowledges every segment (on DATA it sends, or an ACK) with its next
+  expected sequence number, the 32 after it it has, and its window (RCVBUF less what waits to be read); it takes a
+  segment or two past the window rather than drop it. Reliable and ordered: segments ahead are kept until the hole
+  fills; reliable and unordered: each message as it comes, the sequence numbers kept until the earlier ones came;
+  without delivery guarantees nothing is sent again, the receiver acknowledges the highest it has seen, and ordered
+  delivery drops a message older than one already given (so with neither guarantee each message comes once at most).
+- **Flow and congestion.** The sender keeps within the peer's window (one segment past it when nothing is in flight, so
+  a window under a segment never stalls) and within a congestion window (4 segments at first, slow start to 32, then a
+  segment an RTT, at most 128), halved once in a recovery episode. A segment the peer lacks that went before one it
+  has is lost once an RTT and a quarter more (a millisecond at least) has passed (RACK, RFC 8985, simplified) and goes
+  again at once; the retransmission timeout (Jacobson and Karels' RTO, 20 ms to 1 s, 200 ms at first, doubled on each
+  timeout) catches the rest. A shut window is probed (PROBE) every two RTOs, a second at most. Without delivery
+  guarantees a segment not acknowledged within the RTO counts as lost.
+- **Keep-alive and the end.** A connection idle for KEEP_ALIVE_INTERVAL sends a PROBE, which the peer acknowledges;
+  nothing heard for KEEP_ALIVE_TIMEOUT ends it with KEEP_ALIVE_FAILURE. cellRudpTerminate sends a FIN after what was
+  written; the peer goes to CLOSE_WAIT (END_OF_DATA once read, CLOSED with no error to its handler), and its own
+  Terminate sends its FIN; a terminated connection lingers until its FIN is acknowledged and the peer's has come, at
+  most CLOSE_WAIT_TIMEOUT, then sends a RST. A socket whose last context and connection are gone is released (D-632).
+- **The test hook** (rudp::set_send_filter): every packet the library sends goes through the process's filter, outside
+  the library's lock, which sends it, drops it or holds it back behind the next one; the tests make loss and reordering
+  with it.
+Tests (tests/hle/test_rudp.cpp): Listen and Accept, two Initiates (at once, and one 100 ms after the other), Activate
+and Initiate (either first) and two Activates, over UDP and UDP P2P sockets; 200 messages in order with their read
+information; a stream of 100 KB read in pieces of every size; 5,000 small messages in flight at once; every third DATA
+segment lost and every fifth held behind the next, for each pair of guarantees and a stream (every message once, in
+order when ordered, retransmissions and losses counted; without delivery guarantees nothing sent again); a reader that
+does not read stopping the writer at its window and buffer, WRITABLE and FLUSHED; refused, timed out, keep-alive, the
+transport, quality and version mismatches; a crafted RST.
+
+## D-632 · 2026-10-10 · cellRudp's I/O: the internal thread, ProcessEvents and NetReceived, the mux modes, the handlers
+
+pspocket's network is a console without a link (D-523): datagrams go between the game's own sockets, so two contexts of
+one process connect over loopback; two processes cannot (one HLE process runs at a time, and lv2's loopback is a
+process's own). The library is a client of lv2's network calls (sendto, recvfrom, socketpoll, getsockname, the socket
+information), as Sony's is of libnet. How the I/O runs was decided (to check on the Mac, D-633):
+- **CELL_RUDP_MUXMODE_NORMAL**: the library does the socket's I/O. It sends with sendto from the thread that has
+  something to send (a Write sends at once); it reads the socket on the internal I/O thread, or, without one, in
+  cellRudpProcessEvents.
+- **CELL_RUDP_MUXMODE_RAW**: the game does it. Each packet goes to the event handler (CELL_RUDP_EVENT_SEND: the socket,
+  the bytes, the address and its length, the handler's argument; the handler sends it), and what the game receives it
+  gives to cellRudpNetReceived, which takes datagrams for either mode. When a socket's last context and connection are
+  gone, the event handler hears CELL_RUDP_EVENT_SOCKET_RELEASED.
+- **cellRudpEnableInternalIOThread(stack, priority)**: a PPU thread of the game's process (sysPrxForUser's
+  sys_ppu_thread_create, an internal HLE function its entry, "_cellRudpIOThread"; stack 16 KB to 1 MB and priority 0 to
+  3071, clamped with a warning) that reads the NORMAL sockets, waiting in lv2's socketpoll for a datagram or the next
+  timer (10 ms at most), and runs the timers; cellRudpEnd stops and joins it. Its guest buffers come from the main
+  area.
+- **cellRudpProcessEvents(timeout)**: the same on the calling thread, once; with a timeout (microseconds) it first waits
+  up to that long for a datagram or a timer when nothing was there. It works with the I/O thread as well; called from
+  a handler the library's I/O is running it answers THREAD_IN_USE.
+- **The handlers** run on the thread that processed what caused their events (the I/O thread, or the game's in
+  NetReceived or ProcessEvents); the library holds no lock while guest code runs, so a handler may call it. The events
+  and the packets a call makes are gathered under the library's lock and given out after it; a guest function that is
+  not guest memory is logged and not called.
+- **Blocking calls** (Read, Write, Flush, Accept, PollWait) wait as lv2's network calls do: parked on lv2 waiters,
+  shown in the thread report as network waits, woken by every change, ended by the process's end. Without the I/O
+  thread, nothing moves while a game's only thread waits: as on a console, it must call ProcessEvents.
+- **A socket the game closes** under its contexts is no longer read: lv2's socketpoll answers POLLNVAL for it at once
+  (each poll would end at once and the I/O thread spin), so the library marks it closed with one warning and polls the
+  others, whose connections go on. What its own contexts send is lost (sendto fails) until they time out or are
+  terminated. cellRudpBind to a socket number that is open again (lv2 hands closed numbers out anew once all 1,000
+  have been used) reads it again.
+- Packets up to 4 KB are staged in guest memory on the sending thread's stack, larger ones in the main area.
+Tests (tests/hle/test_rudp.cpp): the I/O thread in most cases; the game's own I/O with ProcessEvents (nothing before it
+is called) and with RAW sockets, the handler sending with sendto and the test giving each datagram to NetReceived
+(ProcessEvents leaves RAW sockets alone), SOCKET_RELEASED for both sockets; a blocked Read woken by data, and by End;
+PollWait ended by PollCancel and PollDestroy; a handler calling ProcessEvents (THREAD_IN_USE) on the I/O thread and on
+the game's; THREAD_IN_USE for a second I/O thread; every call before Init and every argument check; the records from
+the game's allocator, MEMORY and TOO_MANY_CONTEXTS; a socket closed under a bound context (one warning; lv2's polls
+counted in its log over 200 ms of quiet: about 20, all of the two others, where the I/O thread spun 16,866 times
+before), the other connection going on, and the socket's number handed out again with a new connection on it.
+
+## D-633 · 2026-10-10 · cellRudp's comparison with Sony's librudp, ready for the Mac
+
+tests/hle/test_rudp_compare.cpp (D-597's suite) sends the same calls to pspocket's cellRudp and to Sony's librudp, each
+in a fresh process over pspocket's lv2 network, so each half's contexts talk to each other in their own wire format. It
+writes what a game sees: every function's answer before Init; the segment size and the answers to eleven sizes; the
+contexts' IDs relative to the first; every option 0 to 20 read in 4 and 8 bytes, in 1 byte, into nothing, and set to
+bad and good values; the context status of an idle context (its state and parent compared, the 256 bytes a note, what
+is past 48 bytes compared) and the library's status (what is past 400 bytes compared, the 400 a note); Bind to no
+socket, to a TCP socket, in mux mode 2, RAW without a handler, at vport 0, again, to a UDP P2P socket, with the local
+information; Initiate's and the data calls' checks before a connection; then a connection over the internal I/O
+thread and, after End and Init, one driven by ProcessEvents alone: Listen, Initiate, Accept within 5 s, the states,
+the handler's events in order, the remote and local information, messages both ways (a buffer too small, two
+messages, nothing there, the answer) with the read information (its first 6 bytes compared, the sequence number and
+time stamp notes), the sizes, a poll set, the client's end read as such and the events to the end. Every context is
+non-blocking, so no wait depends on Sony's units. A difference answers one of D-630's or D-632's guesses: a signature
+(an answer that makes no sense, a crash: PSPOCKET_COMPARE_TRACE=1 names the call), a structure's layout, an option's
+default or unit, what ProcessEvents reads (the second connection), Listen and Accept.
+Running it: `PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle
+"[compare][rudp]"`; hidden ([.]) until the halves agree, when it loses the [.] together with cellRudp's firmware-first
+marker (a decision of its own). Here, PSPOCKET_COMPARE_SELF=1: 0 of 342 observations differ, and pspocket's half
+answers as test_rudp.cpp; without either it skips. In every ctest run: each of the 31 functions is in the NID database
+under cellRudp, is pspocket's own, and the library is firmware-first.
+
+## D-640 · 2026-10-11 · libsnd3 pspocket's own, firmware-first: the library over libsynth2's exports, its voices and request queue
+
+libsnd3 is Sony's sound library over libsynth2 (D-610): sound banks (HD3 headers, their BD3 samples in libsynth2's
+sound memory) played by tone or by MIDI channel and program, and Standard MIDI Files played over a bank. RPCS3
+(rpcs3/Emu/Cell/Modules/libsnd3.cpp and .h) has every signature, the error codes and the structures
+(CellSnd3KeyOnParam, CellSnd3VoiceBitCtx, CellSnd3DataCtx's 32 bytes, CellSnd3SmfCtx's 352, CellSnd3RequestQueueCtx);
+its bodies are stubs. No Sony module was at hand: all 50 functions are made from what is public (D-641 for the banks,
+D-642 for the SMFs, D-643 for the pitch, volumes and effect) and from the most plausible reading where nothing says,
+each such choice listed below to check on the Mac. The library is firmware-first (D-563).
+- **libsynth2 through its exports**, as Sony's libsnd3 reaches it: the firmware module's when the loader linked one for
+  the process (Registry::add_imports, D-197: libsnd3's ten imports of libsynth2), else pspocket's own through the
+  registry. With both libraries firmware-first a process never pairs Sony's libsnd3 with pspocket's libsynth2 or the
+  reverse (D-610), and whichever serves libsynth2 there is one synthesizer.
+- **Init**(maxVoice, samples, queue): voices 0 to maxVoice - 1 (1 to 48: the SPU2's two cores of 24, voice n is core
+  n / 24's voice n % 24) are the library's, the rest the game's own through libsynth2; `samples` (1 to 65535,
+  Generate's u16) the frames each Synthesis makes; `queue` NULL or a CellSnd3RequestQueueCtx whose two buffers are guest
+  memory of a request at least. Else PARAM; a second Init ALREADY. It calls cellSoundSynth2Init(0): CELL_OK, and Exit
+  ends libsynth2 too; ALREADY_INITIALIZED (the game initialised it first, to transfer its BD3), and libsynth2 is used as
+  it is and left to the game; any other answer, or no libsynth2 in the process, SYNTH. Then both cores' master volumes
+  0x3FFF (libsd's cold start leaves them 0), the library's voices into both dry mixes and out of both effect mixes,
+  keyed off; the other voices' bits as they were. Exit keys the library's voices off and lets the banks, the SMFs and
+  the queue go. Before Init every call is NOTINIT but Note2Pitch and Pitch2Note (arithmetic) and KeyOffByID (0).
+- **The request queue** lets other threads than the one calling Synthesis make calls: libsynth2 is told only by the
+  Synthesis caller, before and after the block it generates. The front queue's requests (a key-on, a voice's new
+  pitch and volumes, the effect) are told before the next block, the rear queue's (the key-offs) after it, so a note
+  keyed on and off between two Synthesis calls still sounds for a block (the reading of "front" and "rear": two queues
+  of their own sizes suit two roles better than a double buffer of one). Each holds its size / 32 requests (a request's
+  32 bytes are pspocket's reckoning); a call whose requests do not all fit answers REQUESTQUEFULL and changes nothing.
+  The requests are kept by the library, not written into the game's buffers (their layout is Sony's). The library's own
+  state (voices, IDs, holds) changes at the call, so GetVoice and VoiceGetStatus answer at once. Without a queue each
+  call tells libsynth2 at once. Synthesis: the front requests, the SMFs' events in the block (D-642), Generate, the rear
+  requests and the SMFs' key-offs, then each sounding voice's envelope read back (ENVX).
+- **Voices.** An automatic key-on (NoteOn, NoteOnByTone, KeyOnByTone, an SMF's note) takes the lowest free voice not
+  reserved; with none, a released voice; else the playing one of the lowest priority (its tone's) not above the new
+  note's, the oldest first; with none the note is not played (CELL_OK, logged), as a MIDI synthesizer drops one. A voice
+  is free again after a block that leaves its envelope at 0 if it was keyed off, or had played a block before (its
+  one-shot sample ended: libsynth2 stops a voice at a loop end without repeat). A request queued for a stolen voice's
+  earlier key-on is dropped. VOICENUM for a voice number past maxVoice.
+- **Reserve mode** (VoiceSetReserveMode 1, 0 back, else PARAM): a reserved voice is the game's: the automatic key-ons
+  never take it, and VoiceNoteOnByTone and VoiceKeyOnByTone play only on a reserved voice, else RESERVEDVOICE (that
+  error code's most plausible reading).
+- **Key-on IDs**, the caller's: KeyOffByID keys off every voice keyed on with the ID and answers how many (RPCS3 types
+  it u32, not an error code: 0 before Init, or when the rear queue has no room, logged); GetVoiceByID and
+  GetVoice(channel, ID) write CellSnd3VoiceBitCtx as libsd's voice masks: core c's word has bit v for its voice v,
+  core[2] and core[3] zero; a voice counts while it sounds (keyed on or releasing).
+- **Sustain hold**: a held voice's key-off (NoteOff, VoiceKeyOff, KeyOffByID) waits for the hold's end
+  (VoiceSetSustainHold, SetSustainHold(channel, hold, ID); NoteOn's `sustain` holds the voices it starts);
+  VoiceAllKeyOff keys every voice off, held or not.
+- VoiceGetStatus: 0 free, 1 keyed on (or held), 2 keyed off and sounding. VoiceGetEnvelope: ENVX after the last block.
+- Sixteen banks (SOUNDDATAFULL) and sixteen SMFs (SMFFULL) at once, their IDs from 0 (Sony's limits are not known).
+  The contexts (CellSnd3DataCtx, CellSnd3SmfCtx) are checked to be guest memory and nothing is written into them: the
+  library keeps its state itself. Every pointer is checked before use: a wrong one is PARAM (SMFCTX for an SMF's
+  context), never a host fault.
+Tests: tests/hle/test_snd.cpp, test_hle "[snd3]", 18 cases, 27,769 checks. A recording libsynth2 in guest code, linked
+as a firmware module's exports would be (each call logged with its arguments, SetParam's and SetSwitch's registers
+kept, its answers set by the test): every register a key-on, a parameter, a key-off and the effect write, in their
+order around Generate; Init's setup and the cases of libsynth2's answer; the queue's front and rear, full and dropped;
+allocation, stealing by priority and age, reserve mode, holds, IDs and the bit masks; every argument check and error
+of the 50, NOTINIT before Init. End to end on pspocket's libsynth2 (D-610) with vag_writer.hpp's sounds: a tone's pitch
+counted in zero crossings at its base note and an octave up, the pan, the release, a one-shot's end freeing its voice,
+SynthesisEx's silent rear pair, an SMF heard, the reverb's tail. The count: 5,993 of 6,625 library functions
+pspocket's own before, 6,043 after (libsnd3's 50 of 50).
+To compare on the Mac (D-644): front and rear and the request size; the allocation and stealing order; RESERVEDVOICE;
+KeyOffByID's answer; VoiceGetStatus's values; the IDs and the limits; what Init sets in libsynth2; what Sony keeps in
+the contexts; the voice bits' layout.
+
+## D-641 · 2026-10-11 · libsnd3's HD3 banks: the header and VAG table as vgmstream reads them, the tones and programs inferred from the PS2's HD bank
+
+What is public of the PS3's HD3 (vgmstream src/meta/hd3_bd3.c, read for its facts, no code taken): the header "P3HD",
++0x04 the size of the rest, +0x08 a version (0x00020000), +0x10, +0x14 and +0x18 the offsets of the chunks "P3PG"
+(programs), "P3TN" (tones) and "P3VA" (the VAG table); P3VA's +0x04 the size of the rest, +0x14 its highest entry's
+index ("often there is an extra subsong than written"), 16-byte entries from +0x20: the sample's offset in the BD3,
+its rate, its size, -1. The BD3 is PS-ADPCM. Of P3PG vgmstream notes only that it "seems mostly empty and contains
+number of subsongs towards the end", of P3TN "config/volumes". Their ancestor is the PS2's HD bank of Sony's sound
+tools, whose "SCEI" chunks VGMTrans reads (src/main/formats/SonyPS2/SonyPS2InstrSet.h and .cpp, facts read): each chunk
+a highest index and a table of offsets to its records (0xFFFFFFFF none); the Sample param (42 bytes: the VAG index,
+velocity range, velocity follows, base note, detune, pan, group, priority, volume, ADSR1, ADSR2, key follows, LFO,
+SPU attributes with the direct and effect sends), the Program param (36 bytes: its split blocks' offset from the
+program, their number and size (20), volume, pan, transpose, detune, key follow pan, attributes, LFO) and the Split
+block (20 bytes: the sample set, the note range, cross fade, bend ranges, key follows, volume, pan, transpose,
+detune); a split whose high note is below its low plays up to 127; pans 0-127 about 64.
+Inferred (nothing public describes the PS3's tone and program records): P3TN and P3PG have P3VA's chunk header (the
+highest index at +0x14) and, from +0x20, the PS2's table of offsets from the chunk (0 or 0xFFFFFFFF none); a tone is
+the PS2's Sample param in the PPU's byte order (the tone is what NoteOnByTone's toneIndex names, the PS2's sample); a
+program is the PS2's Program param and its splits the PS2's Split blocks, the sample set read as a tone (the PS3's three
+chunks for the PS2's four: the sample sets folded into the splits, a tone's velocity range picking a program note's
+layers). A bank with P3PG's offset 0 has tones only (NoteOn finds no program).
+- Played: a tone's VAG, base note, detune (1/128 semitones, libsd's fine), pan, priority, volume, ADSR1 and ADSR2 as the
+  SPU2's registers, and its SPU attribute bits 0x04 and 0x08 (sent to the effect, left and right; the dry sends always
+  on, so a tone is never silent for a bit read wrong); a program's volume, pan, transpose and detune; a split's tone,
+  note range, bend ranges (1/128 semitones; 0 two semitones), volume, pan, transpose and detune. Not played: the
+  velocity and key follows, the LFOs, cross fades and groups.
+- BindSoundData(ctx, hd3, synthMemOffset): the BD3 already at synthMemOffset in sound memory (the game transfers it with
+  cellSoundSynth2VoiceTrans); a VAG plays from synthMemOffset plus its offset. The header (its size from +0x04, at most
+  16 MB, all guest memory) is read and kept at the bind: a header changed afterwards is not seen. FORMAT for what is not
+  such a bank (the magic, a chunk outside the header, more than 65,536 entries, an entry past its chunk, a VAG past 2 MB
+  or at a rate past 1 MHz, a tone of a missing VAG or a base note or volume past 127, a program's or split's volume past
+  127, a split of a missing tone or past note 127, split blocks under 20 bytes, more than 65,536 splits in all), the
+  reason logged; PARAM for no context or header, an offset past 2 MB, or a VAG ending past sound memory at that offset.
+  The VAG table's -1 is not used (loops are the ADPCM's flags).
+- UnbindSoundData keys the bank's voices off; the SMFs over it stop (D-642).
+Tests: banks built in the test, bound and let go, each FORMAT and PARAM case; tones-only banks; the split rule; the
+bank's fields in the registers (D-643); damaged copies fuzzed ("[fuzz]": 1,501 inputs, 186 accepted).
+To compare on the Mac, first: a libsnd3 game's own HD3 against this layout and Sony's module's answers (the tone and
+program records are the guess most likely wrong: a real bank read this way most likely answers FORMAT, its reason
+logged), the header's other words, whether the header is copied at the bind.
+
+## D-642 · 2026-10-11 · libsnd3's SMF player: the file read at the bind, its events block by block
+
+- Reading (the MIDI 1.0 specification's file format): MThd (6 to 4,096 bytes, format 0 or 1, at least one track,
+  ticks a quarter note), then the MTrk chunks, other chunks skipped (64 at most); SMFBind takes no size, so the file
+  ends with its last track (at most 4 MB, each chunk guest memory). Events with running status; tempo (meta 0x51) kept,
+  end of track (0x2F) ends the track, other metas and system exclusive skipped. SMF for format 2 (independent songs),
+  SMPTE time, no track or a division of 0, and in a track a data byte past 127 or with no running status, a delta of
+  more than four bytes, a system message, an event past its track. The tracks are merged by time, a track's events
+  before the next track's at the same tick, read once at the bind.
+- Timing: each Synthesis plays the SMFs for its block of `samples` frames at 48 kHz: the events that fall in the block,
+  told before it is generated (their key-offs after it, as the queue's rear, D-640). Integer time without drift: a
+  tick is tempo * 48,000 units of 1/(10^6 * division) samples, a block samples * 10^6 * division; the time past the
+  last event goes on into the next block. Tempo: the song's (500,000 microseconds a quarter note until it says, 120
+  BPM); SMFAddTempo(addTempo) adds beats a minute, added up over calls (the tempo at least 1 BPM), from the next block
+  (the part of a tick played kept); SMFGetTempo answers the tempo playing in beats a minute, rounded (before a play,
+  the song's tempo at tick 0).
+- SMFPlay(velocity, pan, count), SMFPlayEx(+ panEx): from the start at the next Synthesis; count 0 for ever (PS1
+  libsnd's SSPLAY_INFINITY), else that many times: at the song's end (its last track's) the notes still on are keyed
+  off and it starts again within the same block, once a block at most (a song shorter than a block, or of a tick at a
+  tempo of microseconds, cannot hold the block up); a song of no length plays once. Then stopped. PARAM for a velocity
+  or pan past 127, HD3ID when its bank was let go. SMFGetPlayStatus: 0 stopped (or played to its end), 1 playing, 2
+  paused. Pause keys its voices off at once and keeps its place (the time paused does not count); Resume goes on from
+  it; Stop keys off and goes back to the start; Pause and Resume of an SMF not in that state change nothing.
+- Notes: the channel's program (Program Change, bank select MSB * 128 plus it; one the bank lacks is not played,
+  logged once) as NoteOn plays it (D-641), with the channel's volume (CC 7, MIDI's default 100) and expression (CC 11)
+  and the play velocity as factors over 127, the channel's pan (CC 10) and the play pan as offsets from 64, the pitch
+  bend over the split's range or, once the song sets it, RPN 0's (CC 101/100 both 0, data entry CC 6 semitones and
+  CC 38 cents); sustain (CC 64 from 64) holds the channel's voices; CC 120 all sound off, CC 123 all notes off, CC 121
+  resets expression, bend, sustain and the RPN. A change of volume, pan, expression or bend, or of the play velocity or
+  pan (SMFSetPlayVelocity, SMFSetPlayPanpot), tells the sounding voices again. Not played: modulation, pressure, NRPNs.
+- SMFSetPlayChannel(bit n for channel n, past 16 bits PARAM): the channels that play, the voices of one taken out keyed
+  off at once; SMFGetPlayChannel writes it. SMFGetKeyOnID(channel 0-15): the key-on ID of the SMF's notes on that
+  channel, 0x80000000 | smfID << 8 | channel (pspocket's numbering), for cellSnd3GetVoice. The pans ex are kept and
+  answered (D-643).
+- SMFBind: SMFCTX for a context that is not guest memory, PARAM for no file, HD3ID for a bank not bound, SMF for a file
+  not played (its reason logged), SMFFULL past sixteen; SMFUnbind keys off its voices; every SMF call on an ID not bound
+  SMFID.
+Tests: songs built in the test played block by block against the recording libsynth2: each key-on and key-off in its
+block (ticks of 50 samples, blocks of 256), twice and for ever, a tempo in the song, SMFAddTempo before a play and
+between two blocks, pause and resume, stop; the play velocity, pans and channels, every controller, the bend and RPN
+0, a program of another bank; each refusal; end to end a note heard and its voice freed; damaged songs fuzzed
+("[fuzz]": 1,501 inputs, 122 accepted).
+To compare on the Mac: the status values; the tempo's unit and SMFAddTempo's adding up; count 0; what a loop does with
+held notes; the key-on IDs; Pause's key-off; whether events keep the block's time as here; format 2 and SMPTE time; loop
+markers in a song (none are played here).
+
+## D-643 · 2026-10-11 · libsnd3's pitch, volumes and pans, the effect and the output modes
+
+- Note2Pitch and Pitch2Note are libsd's arithmetic as libsynth2 has it (D-614), computed in libsnd3 (the same answers
+  as libsynth2's over a sweep in the tests).
+- A voice's pitch. Played by note (NoteOnByTone, NoteOn, an SMF): the note plus the program's and split's transposes
+  (0 to 127) against the tone's base note, plus the fine offsets in 1/128 semitones (the tone's, program's and split's
+  detunes, the key-on's addPitch and VoiceSetPitch's, the bend): 0x1000 * 2^(offset / 12) with libsd's tables (shifted
+  up past two octaves too, unlike Note2Pitch's answer), times the VAG's rate / 48,000 (the SPU2 plays 0x1000 at 48
+  kHz), at most 0x3FFF. KeyOnByTone(pitch): the pitch relative to the tone's own, 0x1000 its VAG at its own rate (as
+  cellSnd3Note2Pitch answers for the tone's centre), times 2^(fine offsets / 1536), times the rate / 48,000.
+  VoiceSetPitchBend: MIDI's 14 bits, 0x2000 in the middle, over the bend range up or down.
+- A voice's volume: 0x3FFF times the velocity and the tone's, program's and split's volumes, each over 127 (an SMF's
+  voice also its channel's volume and expression and the play velocity), rounded. Its pan: the key-on's (0-127, 64 the
+  middle) plus the tone's, program's and split's (and an SMF's channel's and play pan's) offsets from 64, clamped: the
+  left at full to 64, then down to 0 at 127; the right up from 0 to full at 64 (a balance, both full in the middle).
+  SetOutputMode(1) mono gives both sides the full volume, 0 stereo; another mode OUTPUTMODE (the values are pspocket's
+  reading). Sony's curves are not known: these are linear.
+- PanEx (front to rear: CellSnd3KeyOnParam's panEx, VoiceSetPanpotEx, the SMFs' pan ex): checked and kept, not applied.
+  libsynth2's SPU2 is stereo and Generate gives the rear pair silence (D-612); how Sony's libraries put a voice to the
+  rear is not known. SynthesisEx gives Generate the four buffers, Synthesis the front two and NULL.
+- CellSnd3KeyOnParam: vel, pan and panEx bytes, a pad, s32 addPitch (8 bytes); NULL takes 127, 64, 64, 0; a value past
+  127 PARAM.
+- SetEffectType(type, returnVol, delay, feedback): libsd's effect modes 0 (off) to 9 on both cores,
+  cellSoundSynth2SetEffectAttr(core, {core, mode with SD_EFFECT_MODE_CLEAR, returnVol, returnVol, delay, feedback}) (the
+  work area zeroed, so no echo of the last mode plays in the new one), the core's effect bit (SetCoreAttr
+  EFFECT_ENABLE) on for a mode and off for 0; a mode past 9, a delay or feedback past 127 PARAM. A tone's voice sends
+  to it by the tone's attribute bits (D-641).
+Tests: the registers of key-ons by note, by pitch and through programs, with transposes, detunes, rates, velocities,
+volumes, pans, bends and bend ranges, against the rules above; mono and stereo; the effect's attributes and core bits;
+end to end the pitch by zero crossings and the pan.
+To compare on the Mac: the pitch and volume registers against Sony's (the comparison reads them back through
+libsynth2, D-644), the pan law and mono, panEx and the rear pair, the effect's CLEAR and cores, the output modes'
+values.
+
+## D-644 · 2026-10-11 · libsnd3's comparison with Sony's libsnd3, ready for the Mac
+
+libsnd3 was made without Sony's module (D-640 to D-643); as D-597's comparisons do for the other firmware-first
+libraries, tests/hle/test_snd3_compare.cpp sends the same calls with the same synthetic inputs to pspocket's libsnd3 and
+to Sony's, each half in a process of its own, so that the Mac only has to run it and read the differences. Each half
+has its own libsynth2: both libraries are firmware-first, so the loader gives Sony's libsnd3 module Sony's libsynth2
+module (loaded with it as its import), and pspocket's half has pspocket's two (D-610: never one with the other's). The
+inputs: the bank of test_snd.cpp (D-641's layout) and its songs, built by snd3_writer.hpp (shared by both tests), and
+vag_writer.hpp's looped and one-shot sines put into each half's sound memory with cellSoundSynth2VoiceTrans.
+Observations (1,361):
+- every answer: before Init; Note2Pitch and Pitch2Note over 399 and 366 arguments; Init's checks (each followed by an
+  Exit, should Sony's take one) and its queues; BindSoundData's refusals and two banks; tone key-ons by note and by
+  pitch with a key-on parameter, their checks; each voice parameter and its checks; reserve mode and the Voice*
+  key-ons; holds; programs, NoteOff, GetVoice, SetSustainHold; the effect and the output modes; a queue of two and one
+  requests; an SMF's bind, its refusals, every getter and setter, Play, PlayEx, AddTempo, Pause, Resume, the channels,
+  Stop and Unbind;
+- what libsnd3 left in its libsynth2, read back with libsynth2's getters: the cores' master and effect volumes after
+  Init and after a hall, the effect area's start, both cores' KON, KOFF and mix switches after Init, after key-ons and
+  around a queued block, and each voice it touched (pitch, volumes, ADSR, start address);
+- what Synthesis and SynthesisEx render (floats within 5/32768, the rear pair too), the voices' statuses and envelopes,
+  GetVoice's and GetVoiceByID's 16 bytes (filled with 0xEE first);
+- the SMF player's timing as each block's loudness (the left side's RMS, within 0.002) over a play, two plays, a faster
+  tempo, a pause and its resume, a lower velocity and pan, a channel taken out;
+- notes (not compared): the contexts' bytes after BindSoundData and SMFBind.
+Where to look first on the Mac: BindSoundData's answer and the first key-on's registers (if Sony's module refuses the
+bank or plays other values, D-641's tone and program records are laid out otherwise: read a libsnd3 game's own HD3
+beside the registers Sony's module writes for it); the voice each key-on takes (D-640); the pitch and volume registers
+(D-643); the queue's timing (D-640); the loudness timeline (D-642). Running it: on the Mac
+`PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare][snd3]"`;
+anywhere, PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice: 0 of 1,361 observations differ, and pspocket's own
+values are checked against test_snd.cpp's. In every ctest run: each function it calls is in the NID database under
+libsnd3 (or libsynth2, for the getters and VoiceTrans) by that name, pspocket's own, the library firmware-first. When
+the halves match, libsnd3's marker and the test's [.] go together, with a decision of their own.
+
+## D-650 · 2026-10-11 · ThreadSanitizer over the libraries of 2026-10-10: the LF queues, Task2, libsynth2, the encoders
+
+D-600's sweep left no race reports. The libraries added since were swept the same way (scripts/tsan.sh's build/tsan,
+test_hle once per test file with its TSAN_OPTIONS and scripts/tsan.supp): cellSync's LF queue second forms and lv2 event
+queue (D-625); cellSpurs' CellSpursTaskset2 tasks, exit code containers and LF queue bodies (D-626 to D-629); libsynth2
+on pspocket's SPU2 (D-610 to D-614); pspocket's JPEG encoder and cellJpgEnc (D-615, D-616, D-618) and cellJpgDec's Ext
+functions (D-617, D-619); cellNetAoi, libmedi, libad, cellLibprof and cellSysmodule's two (D-635 to D-639). First the
+twenty test files that cover them (test_sync, test_spurs_task2, test_spurs_compare, test_synth2 and test_jpgenc with
+their comparisons, test_jpgdec, test_imgenc, test_netaoi, test_medi, test_ad, test_libprof, test_sysmodule, test_daisy,
+test_spurs_run, test_spurs_api, test_spurs_queue, test_spurs_semaphore, test_hle), then the whole hle group.
+- None of their tests had a PPU side on several threads at once. These do now, each checking what the threads got, not
+  only that nothing broke: four PPU threads pushing into a PPU2SPU LF queue against SPU code popping with
+  GETLLAR/PUTLLC, and four popping an SPU2PPU one (test_sync.cpp); three pushing into a taskset's PPU2SPU queue with
+  _cellSpursLFQueuePushBody while SPU code pops and tasks waiting in its ring are taken and signalled one after another,
+  three pushers and three poppers on an ANY2ANY one, four threads creating CellSpursTaskset2 tasks and four joining them
+  (D-652), a CellSpursTaskset2 destroyed while threads join its tasks (D-653) (test_spurs_task2.cpp); libsynth2's
+  Generate on one thread while another sets registers, keys voices on and off, transfers sound data and changes the
+  reverb presets (test_synth2.cpp); two cellJpgEnc encoders at once, each stream byte for byte the one an encoder makes
+  alone, and eight threads with one encoder (test_jpgenc.cpp, D-651); eight threads with one cellPngEnc encoder
+  (test_imgenc.cpp, D-651).
+- Before (the tree as the day left it, with those tests but D-653's): no report in any of the twenty files; the
+  eight-thread tests of cellJpgEnc and cellPngEnc failed, eight of eight pictures queued with a depth of four. After the
+  fixes: no report in any of them, every test passing. The whole hle group (117 files): no report but in
+  test_fuzz_media (D-603, swept here for the first time); test_libm failing as it does without ThreadSanitizer (fmin and
+  fmax of signed zeros on glibc). test_fuzz_media's cellVdec case reported, every run, the test's own reuse of an
+  access unit's memory once its AUDONE came against cellVdec's thread reading it (FFmpeg's copy, made before the
+  AUDONE): the order holds, but the guest callback's count was a plain store after an lwsync and the test's look a
+  plain load with a fence, which ThreadSanitizer does not model. As D-585's tests do, the cellVdec tests' callback now
+  raises its count with lwarx/stwcx. and the tests read it through the reservation system
+  (tests/hle/vdec_test_util.hpp): the report in 3 of 3 runs before, none after, the cellVdec tests and their comparison
+  as before. Its other reports are in its cellAtrac case (the last point).
+- Without the suppressions (tsan.sh --raw) the twelve files of these libraries show only the guest-level patterns D-585
+  lets go, none of them in this code: test_sync's mutex test standing in for guest code; cellSync's rwm reading its
+  buffer's size beside a writer's update of the line; libsre's plain loads of a taskset's workload ID (create_task) and
+  of CellSpurs' SPU count (cellSpursSetPriority), each in a doubleword the SPURS kernel's reservation updates rewrite
+  unchanged.
+- Found and fixed: the encoders' queue (D-651), a CellSpursTaskset2's task IDs (D-652) and its event flags' IDs (D-653).
+  Nothing to fix in libsynth2 (one lock over the synthesizer and every call, Generate's rendering included), cellNetAoi,
+  libmedi, libad and cellLibprof (their state under one lock each), cellSysmodule's variable (written under its lock,
+  read by no other thread of pspocket's), cellSync's LF queue (every update one reservation operation; an entry is
+  copied after its claim and before its completion, both ordered by the line's version), cellJpgDec's Ext functions (a
+  stream's state belongs to the thread calling with it; the decoder has no shared tables to build).
+- libsnd3, cellRudp, cellAdec's cores and tables and cellAtrac, which were being changed at the time, were not swept
+  here; their test files ran in the hle group as they stood. test_snd, test_rudp, test_adec, test_adec_cores,
+  test_atrac, test_atrac_multi and test_codec_cores: no report. test_fuzz_media's cellAtrac case, every run: the
+  ATRAC3plus core's decoder thread reads a decoder's input while cellAdecGetPcm's realign moves it on the game's thread
+  (adec_atracx.cpp, AtracXCore::realign); and a decoder's thread still runs cellAtrac's cellAdec callback, and reads a
+  mutex ID, after its decoder was deleted, against the next decoder made in the same memory (cellAtrac.cpp make_sync and
+  cellAtracSetDataAndGetMemSize, lv2's sys_mutex_create writing the new decoder's mutex ID). The same case ended once
+  on the kernel's check that guest threads still ran when it was destroyed (PS_FATAL), and once spun for ten minutes,
+  a decoder's thread busy and the test's waiting, until it was stopped: the decoder threads' shutdown, which that work
+  covers.
+
+## D-651 · 2026-10-11 · cellJpgEnc's and cellPngEnc's queue: a picture takes its place before it is encoded; a Reset meanwhile drops it
+
+EncodePicture (both libraries, D-566 and D-616: the picture encoded on the calling thread, its result queued, at most
+four) checked the queue's depth under the library's lock, encoded without it and queued the result afterwards. Threads
+encoding with one encoder at once all passed the check before any result was queued: eight at once queued eight, where
+the libraries' command queue answers BUSY past four (the attribute's cmdQueueDepth). A Reset while a picture was being
+encoded cleared the queue, and the picture's stream was written and its result queued after it: a game that reset the
+encoder could still find a stream from before, and its buffer written.
+- The picture takes its place under the lock: results waiting plus pictures being encoded, against the depth (BUSY past
+  it); WaitForInput counts both. It is encoded outside the lock. Its stream is written (to the buffer, or the file
+  through lv2) and its result queued in one step under the lock, unless the encoder was reset or closed meanwhile (a
+  reset count, and a serial each Open gives an encoder): then it is dropped and nothing written; EncodePicture answers
+  CELL_OK (the picture was taken), or ARG for an encoder closed meanwhile, as before. The place is given back on every
+  path, the process ending included.
+- Nothing changes for one thread: the order, the answers and the streams (the comparisons' halves still agree, D-618).
+Tests: test_jpgenc.cpp and test_imgenc.cpp, eight threads encoding with one encoder at once: four queued, each stream
+the one the encoder makes alone, in its own thread's buffer, and four BUSY; then again with a Reset once four were
+refused, after which nothing is queued and there is room for four. Before: eight accepted and queued in both libraries,
+and the Reset round left results behind.
+
+## D-652 · 2026-10-11 · cellSpurs: a CellSpursTaskset2's task IDs claimed and given back under the host's lock
+
+D-626 keeps, by taskset, the IDs of a CellSpursTaskset2's own tasks created and not yet joined, and those a JoinTask2
+waits for (SpursHost::task2). Two windows, found reading the code for D-650:
+- create_task copied the unjoined IDs under the host's lock, let it go, claimed the lowest ID free in the taskset's
+  `enabled` bits and the copy (a reservation operation), then took the lock again to record a Task2 task's ID. A Task2
+  task created, run and ended by other threads in between left its ID free in `enabled` and missing from the copy: the
+  claim could take it while its exit code waited for its join, which then got the new task's code (and the new task's
+  own join SRCH). In a CellSpursTaskset2 the copy, the claim and the record are now one critical section; the claim's
+  reservation operation takes no lock and calls nothing, so nothing waits on the host's lock inside it.
+- join_task2 freed the ID under the lock and cleared its joining bit afterwards, in its guard's destructor: a task
+  created with the ID in between and joined at once was BUSY. Both bits now go in one critical section.
+Neither is a data race (every access is under the lock), and both windows are too narrow for a test to hit (the first
+needs another task's whole life inside it). Their regression check, which passes before and after: test_spurs_task2.cpp,
+four threads creating tasks that end at once and four joining them, half with JoinTask2 and half polling TryJoinTask2,
+200 tasks, every join with its own task's exit code and every ID free at the end.
+
+## D-653 · 2026-10-11 · cellSpurs: a CellSpursTaskset2's event flag IDs read and cleared atomically
+
+cellSpursDestroyTaskset2 cancels and destroys the taskset's two lv2 event flags and then clears the guest words holding
+their IDs (0x1898, 0x189C) with plain stores, while JoinTask2 and TryJoinTask2 on other threads read them with plain
+loads on their way to the wait: a game destroying the taskset while its tasks are being joined, D-626's SHUTDOWN case.
+Two of pspocket's own host paths share the guest word, as D-587's did, and ThreadSanitizer reported the join's load
+against the destroy's store. The word is now read with atomic_load_be32 (JoinTask2 and TryJoinTask2, the task
+creations' check and clear of the flag, the taskset policy's Task2 exit) and cleared with atomic_store_be32 (release).
+What a join sees is as before: a wait the cancel ends is SHUTDOWN; one on a flag already gone, or on ID 0, is lv2's
+ESRCH, TASK_ERROR_SRCH.
+Test: test_spurs_task2.cpp, 24 rounds of a CellSpursTaskset2 destroyed while a JoinTask2 waits (SHUTDOWN) and three
+threads poll TryJoinTask2 (BUSY, then SRCH). Under ThreadSanitizer the race was reported in 6 of 6 runs before, in none
+of 6 after.
+
+## D-620 · 2026-10-11 · FFmpeg's DTS, TrueHD and WMA decoders; what the audio cores on FFmpeg share
+
+The audio decoder cores still grey on the library chart (cellDDPdec, cellM2AACdec, cellMP3Sdec, cellAtrac3multidec,
+cellTRHDdec, the four DTS modules, cellWMAdec, cellWMAPROdec and cellWMALSLdec: D-621 to D-623) need decoders the build
+did not have. scripts/build-ffmpeg.sh now builds, for every target:
+- the decoders dca (DTS: Coherent Acoustics' core with its XCh, XXCH, X96 and XBR extensions, and the extension
+  substream's lossless XLL and low bit rate LBR, so all four of libadec's DTS types), truehd (Dolby TrueHD), wmav1,
+  wmav2, wmapro and wmalossless, and the parsers dca and mlp (TrueHD's); all LGPL-2.1-or-later (D-181). E-AC-3's decoder
+  was there already (D-576).
+- in the tests' builds (<target>-tests, D-577) the encoders eac3, dca, truehd, wmav1 and wmav2, which write the streams
+  the tests decode. DTS's and TrueHD's are FFmpeg's experimental encoders (the tests open them with
+  strict_std_compliance experimental): good enough to write test streams, and only the test programs link them. FFmpeg
+  has no WMA Pro or WMA Lossless encoder: those tests build their packets themselves (D-622, D-623).
+The cloud's Linux build was rebuilt with them (build/ffmpeg/linux and linux-tests). **On the Mac: run
+scripts/build-ffmpeg.sh macos, macos-tests and ios again** (their configure arguments changed, so each reconfigures and
+rebuilds). Until then a game opening one of the new DTS, TrueHD or WMA cores stops pspocket-boot or the app with the
+missing decoder named (FfDecoder::open's fatal error, as for any decoder a build lacks), and the tests that need one
+skip: as before each test whose encoder FFmpeg lacks, and the WMA Pro and WMA Lossless tests without their decoders.
+
+What the cores share grows (runtime/hle/src/adec_ffmpeg.cpp/.hpp):
+- Codec::bytes_needed: the bytes from an access unit's start a codec reads, its size except for ATRAC3 multichannel,
+  whose tracks' blocks may run past the size it is given (D-621). The common part checks that so many are guest memory
+  before decoding.
+- FfDecoder takes FFmpeg's planar or interleaved floats and 16- and 32-bit samples (TrueHD's, WMA Lossless's and DTS
+  XLL's integer output) and gives planar floats, the integers over 2^15 and 2^31: exact for samples of up to 24 bits.
+  Planar::bits keeps the resolution FFmpeg reports (bits_per_raw_sample). Another sample format is still fatal.
+- The AAC cores' stereo downmix (D-578) is shared (stereo_downmix), with apply_channel_number, the output a
+  CellAdecChannel asks for as the MPEG audio cores read channelNumber (D-577: MONO the downmix's pair averaged, STEREO
+  the downmix or a mono stream twice, any other the stream's own channels), limit_channels (past a core's output
+  channels the first ones kept, logged once) and channel_mask (the channels as WAVE_FORMAT_EXTENSIBLE's bits, FFmpeg's
+  channel numbers).
+- ginfo and lprm: the information block and the parameters of the cores whose structures nothing at hand gives (D-622).
+
+## D-621 · 2026-10-11 · cellAdec's Dolby Digital Plus, MPEG-2 AAC, MP3 Surround and ATRAC3 multichannel on FFmpeg
+
+Four more of libadec's codecs get pspocket's own core where no firmware module gives one, by D-577's rule, each on the
+core of the codec it extends: Dolby Digital Plus (CELL_ADEC_TYPE_EAC3, cellDDPdec), MPEG-2 AAC (M2AAC, cellM2AACdec),
+MP3 Surround (MP3S, cellMP3Sdec) and ATRAC3 multichannel (ATRAC3MULTI, cellAtrac3multidec). RPCS3 runs Sony's modules
+for them: it has their cellAdec and PTS types and the modules' names and NIDs, but none of their structures. So each
+takes the structures of the nearest codec RPCS3 lays out (inferred: each layout below, with what to check on the Mac
+against Sony's module, firmware_compare.hpp), and its errors, its own codes not being known, are libadec's:
+CELL_ADEC_ERROR_ARG for parameters StartSeq refuses, BUSY, and FATAL for a unit it cannot decode, the reason logged.
+Their libraries are firmware-first with their tables (D-563, D-623).
+- **Dolby Digital Plus** (adec_ac3.cpp): AC-3's core (D-579) on FFmpeg's E-AC-3 decoder, which decodes AC-3 frames too,
+  as a DD+ decoder must. Parameters and information block AC-3's (CellAdecParamAc3, CellAdecBsiAc3), read and checked as
+  AC-3's. An access unit holds one or more syncframes; program 1's independent ones (AC-3 frames, or E-AC-3's
+  independent substream 0, of 1, 2, 3 or 6 blocks) are decoded in order, at most 6144 samples a channel. Dependent
+  substreams (7.1's extra channels) and other programs' substreams are left out, logged once: the independent substream
+  carries the program's 5.1 as the encoder mixed it, which is what a 5.1 decoder plays. The information block describes
+  the unit's first independent frame: codecType 1 for E-AC-3 (0 for AC-3); fsIndex fscod, or 3 + fscod2 at the reduced
+  rates; frmSizeCod frmsiz; bsi the 64 bits from bsi()'s start; esSizeBit the bits decoded; annex D's fields from
+  E-AC-3's mixing and informational metadata (mixmdate, infomdate), whose Lo/Ro and Lt/Rt levels the downmix then uses
+  (FFmpeg's E-AC-3 defaults without them); crcErrorFlag any frame's. PTS: its own correction (type 17,
+  _SceAdecCorrectPtsValue_Ddp), an E-AC-3 frame's length varying with its blocks. To check: whether Sony's core takes
+  CellAdecParamAc3 as it is, its information block and codecType, whether it decodes 7.1's dependent substreams, how it
+  takes several frames in a unit, its error codes.
+- **MPEG-2 AAC** (adec_aac.cpp): the MPEG-4 AAC core (D-578) with MPEG-4's parameters and information
+  (CellAdecParamM4Aac, CellAdecM4AacInfo): MPEG-2 AAC is MPEG-4's Main, LC and SSR profiles without SBR. ADTS (either
+  ID) and ADIF as MPEG-4's, raw data blocks Main or LC only (MPEG-2 has no LTP), up to eight channels; PTS its own (type
+  25, _SceAdecCorrectPtsValue_Aac). To check: Sony's layouts (a structure of MPEG-2's own?), whether it decodes SBR in
+  MPEG-2 ADTS as FFmpeg does, its errors.
+- **MP3 Surround** (adec_mp3.cpp): MP3's core (D-577) with MP3's parameters and information (CellAdecParamMP3,
+  CellAdecMP3Info). An MP3 Surround stream is MP3 whose ancillary data carries spatial parameters for 5.1; FFmpeg
+  decodes no spatial data, so the stereo MP3 (the encoder's downmix, which any MP3 decoder plays) is decoded and the
+  spatial data left, logged once; i_error_code is FATAL for a refused unit. PTS its own (type 33,
+  _SceAdecCorrectPtsValue_Mp3s). To check: whether Sony's core gives 5.1, and then in what layout and information block.
+- **ATRAC3 multichannel** (adec_atrac3.cpp): the parameters are what libatrac3multi writes (D-535, its handle compared
+  byte for byte with Sony's module): nch the output tracks (1 to 8), isJoint 0, nbytes the stream frame's bytes, bw_pcm
+  as ATRAC3's, and the stream's channels at +0x10 (pspocket's CellAdecParamAtrac3Multi, 0x14 bytes). libatrac3multi
+  gives each unit as nch blocks of nbytes / channels, each the sound unit of the channel its track plays (a silent one
+  for a track that plays none), with the stream frame's size; so each track is decoded on its own one-channel FFmpeg
+  ATRAC3 decoder (keeping its channel's overlap and gain control state), the nch blocks read from the unit's start even
+  past the size given (bytes_needed, D-620). The PCM is nch channels of 1024 samples in bw_pcm's format, the information
+  block nch, isJoint, nbytes and the stream's channels (0x10 bytes), PTS the front end's step (type 39). StartSeq
+  refuses (ARG) tracks outside 1 to 8, joint stereo, more than 8 stream channels, frames other than 96, 152 or 192 bytes
+  a channel, another word size. Through it cellAtracMulti (D-535) plays its files without the system software. To check:
+  the information block, and whether Sony's core reads past the size given.
+
+Tests: tests/hle/test_adec_more.cpp, with FFmpeg (D-606): streams the tests' encoders wrote and frames built in the
+tests, each unit's PCM against FFmpeg's own decoding of the same units, sample for sample.
+- Dolby Digital Plus: 5.1 E-AC-3 at 48 kHz and 640 kbit/s, a tone in each channel: 92.0 to 93.3 dB from the input in the
+  full-band channels and 36.1 in the LFE (20 required), the information block's fields, PTS. A stream with Lo/Ro
+  preferred at -6 dB: the Lo/Ro output from the full output's channels within 1e-5, the metadata in the block. Units of
+  two frames (5760 ticks), a frame followed by a dependent substream and one by another program's (left out), AC-3
+  frames (codecType 0); a unit with no syncframe and a cut one FATAL, the next decoding; four parameter sets refused.
+- MPEG-2 AAC: stereo LC as MPEG-2 ADTS frames, 29.5 and 28.1 dB, the ADTS fields, PTS; raw data blocks giving the same
+  PCM; no sync and an SSR frame FATAL; four parameter sets refused.
+- MP3 Surround: stereo frames built here (test_adec_cores.cpp's builder): PCM, the header's word and fields, PTS; 16-bit
+  PCM; a layer II header FATAL (in i_error_code too); a word size refused.
+- ATRAC3 multichannel: four tracks of a four-channel stream (playing channels 2 and 0, none, and 3) and eight tracks of
+  a two-channel stream given with the stream frame's 384 bytes, each track against FFmpeg's one-channel decoding of its
+  units; 16-bit PCM; the information; five parameter sets refused. cellAtracMulti playing a four-channel ATRAC3 file
+  built here through the core, its two tracks' tones.
+
+## D-622 · 2026-10-11 · cellAdec's TrueHD, DTS and WMA cores on FFmpeg, firmware first; their structures pspocket's
+
+Dolby TrueHD (CELL_ADEC_TYPE_TRUEHD, cellTRHDdec), the four DTS types (DTS, cellDTSdec; DTS-HD, cellDTSHDdec; the DTS-HD
+core, cellDTSHDCOREdec; DTS Express, cellDTSLBRdec) and WMA (cellWMAdec), with WMA Pro (cellWMAPROdec) and WMA Lossless
+(cellWMALSLdec), get pspocket's own cores where no firmware module gives one, by D-577's rule (adec_truehd.cpp,
+adec_dts.cpp, adec_wma.cpp). RPCS3 has nothing of these codecs but the cellAdec types, the modules' names and NIDs and
+their PTS types (TrueHD 27, DTS 28, DTS-HD 21, the DTS-HD core 37 and 38, DTS Express 31, WMA 30, WMA Pro 35, WMA
+Lossless 36), and no structure of a related codec fits them as one did in D-621. So their parameters and information
+blocks are pspocket's, made to carry what each decoder needs and a game would read, all to be checked against Sony's
+modules on the Mac:
+- **The parameters of TrueHD and the DTS cores** (lprm, adec_ffmpeg.hpp): CellAdecParamMpmc's layout (D-577), libadec's
+  one multichannel structure without a codec's own fields: channelNumber (a CellAdecChannel: MONO and STEREO a downmix,
+  any other the stream's own channels, up to 8), downmix and lfeUpSample (flags, kept as the MPEG audio cores keep
+  them). StartSeq refuses (ARG) a layout past 3/4 with LFE or a flag past 1.
+- **Their information block** (ginfo, 0x40 bytes of big-endian words; the WMA cores' too): the PCM's rate, channels,
+  channel mask (WAVE_FORMAT_EXTENSIBLE's bits) and samples; the stream's own channels and mask before a downmix; its
+  resolution where it codes one and its bit rate where it says; isBsiValid; the unit's error; then each codec's own
+  words from +0x28.
+- **TrueHD**: an access unit holds one or more TrueHD access units (each starting with its length), decoded in order.
+  Decoding starts at a major sync: the units before one give no PCM and no error (logged once). FFmpeg's decoder opens
+  there with the channel layout its parser reads from the major sync (the 8-channel presentation's, else the 6-channel
+  one's), without which it refuses one- and two-channel streams. STEREO and MONO take the stream's two-channel
+  presentation (FFmpeg's downmix option: the lossless downmix the encoder coded), else pspocket's stereo downmix. The
+  PCM is floats, the stream's 24-bit samples exactly. Information: the stream's channels and mask from the last major
+  sync, bitRate its peak data rate, +0x28 its format_info word, +0x2C the TrueHD access units in the unit. At most 8192
+  samples a channel.
+- **DTS**: one DTS frame per unit, a core frame (16-bit big-endian, or the 14-bit and little-endian forms FFmpeg
+  converts) with or without an extension substream, or an extension substream alone. DTS and the DTS-HD core decode the
+  core alone (FFmpeg's core_only; a unit without a core is FATAL), DTS-HD and DTS Express all FFmpeg decodes (the core
+  with XCh, XXCH, X96 and XBR, XLL's lossless audio, LBR). STEREO and MONO ask FFmpeg for the stream's own stereo
+  downmix where it carries the coefficients, else pspocket's. Information: the stream's channels from the core header's
+  AMODE and LFF where there is a 16-bit core; bitsPerSample XLL's resolution, else the core's PCMR; bitRate the core's
+  RATE; then AMODE, the frame's bytes, SFREQ, RATE and LFF (each 0xFFFFFFFF without a core) and whether an extension
+  substream follows. At most 4096 samples a channel. The DTS-HD core's PTS type is 37 (RPCS3's DTSHDCORE_UNK1; 38 calls
+  the same function).
+- **WMA's parameters** (pspocket's CellAdecParamWma, 0x24 bytes): what an ASF stream's properties give a WMA decoder,
+  WAVEFORMATEX's fields and the codec data's options, as words, as Sony's structures carry a WAV header's fields for
+  ATRAC3 (D-579): formatTag (0x160 WMA 1, 0x161 WMA 2, 0x162 WMA Pro, 0x163 WMA Lossless), channels, samplesPerSec,
+  avgBytesPerSec, blockAlign, bitsPerSample (WMA Pro's and Lossless's valid bits), channelMask, encodeOptions and
+  channelNumber (the output, as above). FFmpeg gets them as a WAV file's codec data. StartSeq refuses (ARG) another
+  core's format, WMA 1 and 2 past 2 channels or 50 kHz or without a bit rate, more than 8 channels, a mask of another
+  channel count, WMA Lossless at other than 16 or 24 bits, no block, a layout past the enum. An access unit is one or
+  more packets of blockAlign bytes (an ASF payload's), decoded in turn, bytes past the last whole packet left (logged
+  once); a packet may finish no frame (frames span packets, and WMA Pro holds its first back): no PCM, no error.
+  Information: ginfo's, then formatTag, blockAlign, encodeOptions and the packets decoded. At most 32768 samples a
+  channel.
+- **WMA Pro and WMA Lossless have no libadec type** (RPCS3's RESERVED22 and RESERVED23, "never released"): cellAdec
+  refuses types 28 and 29 as before, and these cores serve only the modules that drive them through their own tables
+  (D-623), their contexts carrying 28 (WMA Pro) and 29 (WMA Lossless), in the order of their PTS types.
+- The errors: libadec's own (ARG, BUSY, FATAL for a unit FFmpeg refuses or a WMA unit shorter than a packet), the
+  codecs' own not being known.
+To check on the Mac, for each: Sony's parameter and information structures (WMA's as WAVEFORMATEX's here?), which DTS
+extensions each DTS core decodes, how TrueHD's and WMA's units are cut (TrueHD access units, ASF packets), where
+decoding starts, the error codes.
+
+Tests (with FFmpeg): TrueHD 5.1 at 48 kHz that FFmpeg's encoder wrote, four TrueHD units to each of cellAdec's: every
+sample the 24-bit input exactly and FFmpeg's decoding of the units, the information, PTS (300 ticks); STEREO the
+stream's two-channel presentation and MONO its mean within 1e-6; a stream joined after its first major sync giving no
+PCM until the next, no error; a unit FFmpeg refuses FATAL; three parameter sets refused. DTS 5.1 at 1509 kbit/s through
+each of the four cores: FFmpeg's decoding (core only or whole), the core header's fields, PTS (960); in DTS-HD the
+full-band channels 76 to 104 dB from the input and the LFE's tone at 60 Hz; STEREO FFmpeg's downmix or pspocket's; no
+sync, and an extension substream without a core to the core-only types, FATAL; two parameter sets refused. WMA 2 and WMA
+1 at 128 kbit/s: FFmpeg's decoding of each packet, 49.2 and 48.3 dB (48.2 for WMA 1), PTS (4180), the information; two
+packets a unit, mono; six parameter sets refused and a unit shorter than a packet FATAL. WMA Lossless and WMA Pro
+through their tables (D-623).
+
+## D-623 · 2026-10-11 · The new cores' operation tables and PTS functions, firmware first; CELP stays grey
+
+Each core of D-621 and D-622 is now also its module's exports, as D-591's are (adec_tables.cpp): the CellAdecCoreOps
+table under RPCS3's name and NID (g_cell_adec_core_ops_Ddp 0xF5E9C15C, Aac 0xAC2F0831, Mp3s 0x292CDF0A, atrac3multi
+0xC20C6BD7, truehd 0xE88E381B, DtsCore 0x15248EC5, DtsHd 0x51AC2B6C, DtsHd_Core 0x6C8F4F1C, DtsLbr 0x8C50AF52, wma
+0x88320B10, WmaPro 0xA8BAC670, WmaLsl 0x602AAB16), and the _SceAdecCorrectPtsValue_* function of each but ATRAC3
+multichannel, whose PTS libadec steps itself (Ddp 0xEE2731D3, Aac 0x7CBA9865, Mp3s 0x73A2C895, truehd 0x75080F7B,
+DtsCore 0x8C7AD5ED, DtsHd 0xF3AF1093, DtsHd_Core 0xD4C180D4, DtsLbr 0x185591D6, wma 0x46E6C806, WmaPro 0x8D45F21A,
+WmaLsl 0xF2F9C183). A PTS function corrects a missing PTS as D-591's do: the core's last PTS plus that frame's length;
+half a timestamp, a core of another codec or a timestamp outside guest memory is FATAL. The twelve libraries are
+firmware-first (D-563): where the system software has the module it serves, elsewhere pspocket's. pspocket's cellAdec
+takes the ten libadec types through D-577's rule (the firmware's table first, else the own core); WMA Pro and WMA
+Lossless are reached only through their tables.
+
+**CELP and CELP 8 kHz** (cellCelpDec and cellCelp8Dec: their tables and PTS functions, four cells) stay grey. FFmpeg has
+no MPEG-4 CELP decoder (its CELP-like decoders are other codecs: QCELP, Sipro's ACELP, G.729, AMR), RPCS3 has nothing of
+them beyond their names, and an MPEG-4 CELP decoder written here from ISO/IEC 14496-3 with no reference stream and no
+Sony module to compare with could not be shown right. Without the system software cellAdec still refuses those types
+(FATAL, logged), and a game importing either module gets Sony's where it is installed.
+
+The count: 6,187 of 6,625 library functions pspocket's own before, 6,210 after (the twelve tables and eleven PTS
+functions).
+
+Tests: tests/hle/test_adec_more.cpp: the exports, their NIDs and firmware-first markers, there exactly when the build
+has FFmpeg; no core for CELP, CELP 8 kHz or types 28 and 29 (cellAdecQueryAttr FATAL; 26 and 27 ARG); with FFmpeg, each
+new core through its table driven from guest code as Sony's libadec drives it, with guest notifications, giving the
+answers, PCM, information and callbacks it gives through pspocket's front end; WMA Lossless's raw PCM tiles built here
+(16 and 24 bits) decoded exactly through cellWMALSLdec's table, and WMA Pro's silent frames built here (FFmpeg has no
+encoder) through cellWMAPROdec's, the first frame held back as the decoder does; each PTS function's corrections and
+refusals. The HLE NID check covers the new names.
+
+## D-624 · 2026-10-11 · cellDmuxPamf's raw elementary stream core from RPCS3, unverified: D-594's marker for a variable
+
+D-592 left g_cell_dmux_core_ops_raw_es (0x9728A0E9, the table with which libraries other than libdmux demux one bare
+elementary stream) to Sony's module for two reasons: the PPU side's raw variants were not written, and which
+implementation serves is decided per library, so neither marking cellDmuxPamf firmware-first (Sony's module would take
+the compared PAMF table with it) nor leaving it unmarked (an uncompared raw core would displace Sony's) fitted. Both are
+answered now:
+- **The raw variants** (runtime/hle/src/cellDmuxPamf.cpp; RPCS3 cellDmuxPamf.cpp's _CellDmuxCoreOpSetStream, QueryEsAttr
+  and EnableEs with raw_es): the filter read as a raw stream's (its bytes 2 and 3 the stream and private stream IDs, bit
+  7 of byte 8 AVC: RPCS3 get_stream_ids), no specific information for its units (so QueryEsAttr's memory size is the
+  PAMF stream's less the access unit queue's specific information), and the demuxer told the stream is raw (EnableEs;
+  SetStream's stream information carries the flag as RPCS3's does). The core's SPU side had RPCS3's raw path already
+  (D-194): each 2048-byte section straight into the one enabled stream's parser, no pack, PES packet or program end
+  code, so no timestamps and no random access points. The table is the PAMF table's fourteen entries with those three
+  replaced (internal functions of cellDmux named _CellDmuxCoreOpSetStream_raw_es, _CellDmuxCoreOpQueryEsAttr_raw_es and
+  _CellDmuxCoreOpEnableEs_raw_es: RPCS3's <true> instances), laid out when first linked as D-592's is.
+- **Unverified variables** (hle.hpp Variable::unverified, Registry::is_unverified_variable; runtime/loader/src/lle.cpp):
+  D-594's marker, for a variable. The loader's per-game choice treats an import of an unverified variable as one of a
+  variable the host lacks while the library's firmware module can serve: a game's import library importing it goes to
+  that module, and a firmware module importing it brings the module in, where the system software has it; with none, the
+  host's serves, the variable included. The raw table is unverified; the PAMF table (compared with libdmuxpamf, D-194)
+  is not, and cellDmuxPamf is not firmware-first. So what a system with the firmware gets is unchanged (Sony's
+  libdmuxpamf, for a module importing the raw table, as before), and without the firmware the raw table is pspocket's
+  instead of unlinked. An unverified variable counts as pspocket's own, as an unverified function does.
+To check on the Mac: the raw table against libdmuxpamf's (a raw AVC and a raw ATRAC3plus stream through both,
+firmware_compare.hpp); once they agree, the marker goes, with a decision of its own.
+
+The count: 6,210 of 6,625 library functions pspocket's own before, 6,211 after. With D-623 the audio decoder cores and
+the demultiplexer cores are all pspocket's but CELP's four (D-623).
+
+Tests: tests/hle/test_dmux.cpp: the demultiplexer with raw_es, an AVC stream's units cut at their delimiters (one split
+between two sections), without timestamps or random access, the last on a flush, and no program end code; an ATRAC3plus
+stream's frames likewise. The raw table driven from guest code as the D-592 test drives the PAMF one: its entries; a raw
+filter's attributes (no specific information); a PAMF filter read as a raw one refused (UNKNOWN_STREAM); a raw AVC
+stream's four units notified with RPCS3's arguments (no timestamps, no specific information) and released; flush,
+disable, close. tests/hle/test_lle.cpp: an import of the raw table, a game's or a module's, goes to libdmuxpamf where it
+is installed and to pspocket's table where not; an import of the PAMF table stays on the host either way.
+
+## D-645 · 2026-10-11 · The cellAtrac fuzzing's abort and stall: a decoder thread whose context the game overwrote
+
+The cellAtrac fuzzing target (D-603, D-605) aborted at its fixture's end about once in ten runs on a busy machine
+("shutdown: 1 guest thread(s) still running", twice, then "kernel destroyed while guest threads still run guest code"),
+and a loaded ctest stalled in test_hle for 30 minutes until its timeout. Pinned to one core (taskset -c 0) the target
+failed 7 runs in 9: 2 such aborts and 5 stalls (the stall taken apart: the test's thread in cellAdecClose's join).
+ThreadSanitizer, run by another helper, reported the same case: realign's copy against the ATRAC3plus decoder thread's
+reads, and that thread's cellAtrac callback against the next file's SetDataAndGetMemSize. One cause:
+- **What happened.** Three of the default seed's inputs (plain #86, looped #133, odd chunk #142) are AT3+ files whose
+  fmt chunk says one channel and whose ATRAC3plus configuration says two. cellAtrac sizes a frame's PCM in its work
+  memory from the fmt (8 KB, libatrac3plus's sizes, D-532); cellAdec's realign copies the whole frame the decoder made
+  (16 KB, by the configuration, libatxdec's, D-198). The PCM ran over cellAdec's context and the core's after it (zeros:
+  the frames are silent). cellAdecClose then refused the context (its first word no longer its address: ARG, as Sony's
+  libadec), so cellAtracDeleteDecoder never stopped or joined the decoder's thread. Coming back to its queue after the
+  overwrite (on a loaded machine the game's thread, woken by the PCMOUT callback, got there first), that thread read
+  mutex and condition IDs of 0: a lock and a wait that failed at once, round and round at a core's full speed, which the
+  kernel cannot stop (it stops a thread in a syscall or a wait, and an HLE function's lv2 calls that fail at once are
+  neither): the shutdown waited 5 s twice, then the fatal. Or the next file's decoder opened in the same memory, the old
+  thread read its new IDs and took its commands, its close among them, and cellAdecClose's join waited for a thread
+  that never heard it: the stall. The close path itself was right: each core's close stops its thread and joins it
+  before it returns (RPCS3 cellAdec.cpp, as libadec), and a game closing a decoder while its last frame decodes waits
+  for that frame.
+- **The decoder threads (adec_atracx.cpp, adec_ffmpeg.cpp, adec_lpcm.cpp).** The thread of each of pspocket's cores
+  (ATRAC3plus, the cores on FFmpeg, LPCM) checks that its context is still its own each time it takes its queue (after
+  the lock, so a context replaced in between is seen), its semaphore (LPCM), run_thread and its output: the context's
+  thread ID names it, and the call just made on the context's mutexes, conditions or semaphore succeeded. When not, it
+  logs an error ("its context is no longer its own") and ends, releasing what it holds. So it neither goes round
+  failing calls nor takes another decoder's commands: the path that blocked for ever is gone with the one that aborted.
+  A thread asleep on its own condition when the context goes stays asleep, as on a PS3, until the process ends (the
+  kernel's shutdown wakes and unwinds it). ATRAC3plus's and the FFmpeg cores' open clear the whole context first;
+  LPCM's now clears the thread ID first, so an earlier thread still in that memory never finds itself named while the
+  new objects are made.
+  Deviations: LLE's threads ignore these calls' failures (LPCM notes them in error_occurred), RPCS3 ensure()s each and
+  stops the emulator; the thread ID check is pspocket's own.
+- **cellAtrac (cellAtrac.cpp).** The overrun is stopped where it starts: SetDataAndGetMemSize answers UNKNOWN_FORMAT for
+  an ATRAC3plus configuration of more channels than the fmt chunk's (each frame would run past the work memory's PCM,
+  the core's memory, whose cellAdec type is chosen from the fmt's, and the game's buffer, sized from GetChannel) and for
+  an fmt of more than the 8 channels ATRAC3plus carries (a partial frame's samples, read at the fmt's stride, came from
+  up to 2 MB past the PCM). Fewer channels fit and are taken as before. libatrac3plus, as read, checks neither: a PS3
+  would overwrite the decoder's memory the same way. To compare on the Mac with such a file. With the default seed the
+  fuzzing now refuses those files, and no close is refused.
+- **A game** meets the overwrite only with such a damaged file or a bug of its own (memory used again after a close that
+  failed); it then loses that decoder, as on a PS3, and goes on.
+- **The other media libraries' end calls.** cellVdec and cellDmux's PAMF core keep their decoder's and demuxer's state
+  on the host (the commands, the queues, the lv2 objects' IDs), so an overwrite of the game's memory cannot take their
+  threads' queues, and cellVdecClose and cellDmuxClose (the core's join_thread) join their threads. cellPamf,
+  cellJpgDec and cellPngDec (their SPU paths decode on the calling thread here) and cellVpost have no threads.
+  cellAtracMulti closes through cellAdec, but its ATRAC3 multichannel type is served only by the firmware's core
+  (pspocket has none of its own), whose thread is Sony's code making syscalls the kernel stops; its shuffled frame
+  buffer holds 4,352 bytes a track, and a file whose frames are larger per channel would write past it as libatrac3multi
+  would (not fuzzed, left).
+Tests: test_adec_context.cpp, on the LPCM, ATRAC3plus and MP3 (FFmpeg) cores, without load: the game's callback, on the
+decoder's own thread, overwrites the context at PCMOUT with zeros and with a pattern (the thread ends; cellAdecClose
+refuses the context), and holds the thread at PCMOUT while another decoder opens in the same memory (the first thread
+ends; the second decodes, gives its PCM and closes, its thread joined). Before: the reported abort (zeros, and LPCM's
+pattern), the fatal "command type" (the pattern taken for a command), a first thread that never ends (the stall).
+test_atrac.cpp: the channel refusals. The fuzzing target pinned to one core: 50 runs with the default seed after the
+threads' fix, none failed; after the whole of it 20 with the default seed and 16 with other seeds and four times the
+inputs (one of them needed D-646), none failed. The whole test_hle three times on the loaded machine with two busy
+loops more: 75 to 79 s each, no stall, only libm's known signed zeros failing.
+
+## D-646 · 2026-10-11 · cellAtrac's header reader: a length that wraps the reader back is refused
+
+The cellAtrac fuzzing with another seed and four times the inputs (PSPOCKET_FUZZ_SEED=7919 PSPOCKET_FUZZ_ITERS=4) hung
+in SetDataAndGetMemSize on its input 44.1 kHz #852: a chunk of 0xFFFFFF00 bytes after a run of empty ones. The reader's
+check that a chunk ends within the bytes read is a 32-bit sum, which a length near 4 GB wraps: the check passed and the
+next chunk was 256 bytes back, so the reader went round the same chunks for ever (and the same sum let a fmt chunk near
+the end be read past the bytes). The check is now made without the sum, and a RIFF form other than WAVE whose length
+takes the reader back to its header (or before it) is refused: READSIZE_IS_TOO_SMALL both. libatrac3plus's reader, as
+read, makes the same sums; nothing else changes. cellAtracMulti reads its headers with the same reader. Test
+(test_atrac.cpp): a 12-byte RIFF that points back at itself, a chunk that does, empty chunks and one that goes back to
+them (the old reader went round for ever on all three), a fmt chunk whose length only wraps: each refused.
+
+## D-665 · 2026-10-11 · cellCamera's asynchronous forms with no camera: refused as their synchronous forms, no event, unverified
+
+cellCamera's ten asynchronous functions (OpenAsync and OpenPost, CloseAsync and ClosePost, StartAsync and StartPost,
+StopAsync and StopPost, ResetAsync and ResetPost) were answered as RPCS3's stubs (D-182): RPCS3 registers the names with
+no arguments (rpcs3/Emu/Cell/Modules/cellCamera.cpp: UNIMPLEMENTED_FUNC, CELL_OK). They are pspocket's own now
+(runtime/hle/src/devices.cpp), unverified (D-594; libcamera is always native, D-175, so the marker only records that),
+for the camera pspocket models: none attached, RPCS3's default null handler (D-183).
+- **The SDK's model**, as the library's header gives it (RPCS3 cellCamera.h): a game asks for events with the flags of
+  cellCameraSetNotifyEventQueue2, CELL_CAMERA_EFLAG_OPEN 0x02, CLOSE 0x04, START 0x08, STOP 0x10 and RESET 0x20 beside
+  FRAME_UPDATE 0x01; the events are CELL_CAMERA_OPEN (3), CLOSE, START, STOP and RESET (7) beside ATTACH, DETACH and
+  FRAME_UPDATE. An Async call makes its synchronous form's checks and starts the operation, its end comes to the queues
+  asking for it as that event, and the Post call completes it and answers its result.
+- **With no camera** each Async call is refused at once by its synchronous form's checks, in their order: OpenAsync by
+  Open's (a null info PARAM, NOT_INIT, a device other than 0 PARAM, an info that is not guest memory PARAM, logged with
+  the call site, then the format, resolution and frame rate as RPCS3's check_camera_info for its unknown camera type),
+  then DEVICE_NOT_FOUND; CloseAsync, StartAsync, StopAsync and ResetAsync by check_init_and_open's (the device number,
+  NOT_INIT, then NOT_OPEN: the camera is never open). Nothing is started, so no event is sent and no request waits for
+  a Post. The library knows whether a camera is attached before it asks the camera anything (in RPCS3's model it tells
+  a queue ATTACH as the queue is set), so a refusal at the call is how a console with no camera answers, not an
+  accepted request failing through the event.
+- **A Post** finds no request and answers as its Async from what it reads: OpenPost NOT_INIT, a device other than 0
+  PARAM, then DEVICE_NOT_FOUND; the other four check_init_and_open's answers. Only the device number is read: what
+  else a Post takes (OpenPost the info to fill, perhaps) is not known, and nothing is written.
+- **Why not RPCS3's CELL_OK.** The stubs told a game a camera was opening, starting or stopping when none would: a game
+  waiting for CELL_CAMERA_OPEN on its queue never got it, and one calling OpenPost was told the camera was open with
+  an info nobody filled. Most PS3s are played with no camera, so these answers are the path games take there. OpenAsync
+  reads only the info's first three words, which CellCameraInfo and CellCameraInfoEx share, so which it takes need not
+  be known.
+- Each "no camera" answer is logged once a function. Open's checks are one function (open_checks), shared by Open and
+  OpenAsync; Open answers as before.
+To check on the Mac, against libcamera.sprx: the ten signatures (CellCameraInfo or CellCameraInfoEx for OpenAsync, what
+each Post takes), whether an Async call with no camera is refused at once or accepted and failed through its event and
+Post (and with which event data), what a Post answers with no request outstanding, the order of the checks.
+Tests: tests/hle/test_devices.cpp "[camera]": every async form before Init, after it and after End; OpenAsync's checks
+one by one with the info left untouched; OpenPost's; the other eight with devices 0 and 1; no event on a queue asking
+for all of them.
+
+## D-666 · 2026-10-11 · cellCamera's Read2, ResetAttribute and SetContainer: the read and attribute answers, the container kept
+
+The last three of cellCamera's stubs (RPCS3: UNIMPLEMENTED_FUNC, CELL_OK, no arguments), pspocket's own and unverified
+as D-665's:
+- **Read2** answers as Read and ReadEx (D-183): NOT_INIT before Init, else NOT_OPEN, before the device number is looked
+  at (RPCS3's null-handler order for the read functions). What it takes past the device number is not known and not
+  read; nothing is written.
+- **ResetAttribute** answers as Get and SetAttribute: NOT_INIT, a device other than 0 PARAM, NOT_OPEN. What it takes
+  past the device number (an attribute, or nothing when it resets them all) is not read.
+- **SetContainer** is read as (dev_num, container): the memory container for the camera's buffers, as CellCameraInfoEx's
+  container gives one at open. Both are kept as given and it answers CELL_OK, initialised or not: a game may hand the
+  container over before cellCameraInit, and a check made on a wrong reading of the arguments (a device check where it
+  takes the container alone, an init check where it comes first) would refuse a call games get CELL_OK for today. The
+  container is not checked against lv2's; no camera ever opens to use it.
+To check on the Mac, against libcamera.sprx: the three signatures; what Read2 reads and writes; whether ResetAttribute
+resets one attribute or all and needs the camera open (from FORMATCAP on, RPCS3's Get/SetAttribute with a camera do
+not); whether SetContainer wants Init or checks the device number or the container, and what libcamera takes from it.
+Tests: test_devices.cpp "[camera]": the three before Init, after it and after End; Read2 with devices 0 and 1 and a
+pointer that is not guest memory, nothing written; ResetAttribute beside GetAttribute; SetContainer whatever it is
+given.
+
+## D-667 · 2026-10-11 · cellMic's system sharing, cellMicCommand and the multi-mic notify queue with no microphone
+
+cellMic's eight stubs (RPCS3 cellMic.cpp: UNIMPLEMENTED_FUNC, CELL_OK, no arguments) are pspocket's own, unverified
+(D-594; libmic is always native), with no microphone registered (D-183: every call on a device answers DEVICE_NOT_FOUND
+after RPCS3's checks). Nothing public gives their arguments; each reads what its model needs and no more.
+- **The system's sharing** (SysShareInit, Open, Start, Stop, Close, End): Init and End bracket it, apart from
+  cellMicInit; a second SysShareInit is ALREADY_INIT, a SysShareEnd without one NOT_INIT. Between them Open, Start, Stop
+  and Close find no microphone to share (DEVICE_NOT_FOUND); outside, NOT_INIT. Apart from cellMicInit because the
+  sharing may be begun without it (by a process on the system's side of the microphone): requiring cellMicInit would
+  refuse a call RPCS3 takes, and cellMicEnd does not end the sharing either.
+- **cellMicCommand** is a command to a microphone (RPCS3's header names the commands CellMicCommand: INIT, END, ATTACH
+  and on, the notify events' types). None is registered: NOT_INIT before Init, else DEVICE_NOT_FOUND, as every call on a
+  device here.
+- **cellMicSetMultiMicNotifyEventQueue** is read as SetNotifyEventQueue2's arguments (key, source, flag) and checked as
+  it is: NOT_INIT, the queue must exist by key (EVENT_QUEUE), then it is kept, apart from the notify queue, until
+  cellMicEnd (cellMicRemoveNotifyEventQueue removes the notify queue, as RPCS3's, which ignores its key). No microphone
+  is registered, so it gets no ATTACH or any other event. The flag is not used, as SetNotifyEventQueue2's is not.
+- **Why errors for the stubs' CELL_OK.** These act on a microphone that is not there. Most PS3s are played with none, so
+  DEVICE_NOT_FOUND is what games meet and handle there; the stubs told a game a shared microphone was open and started.
+- Each "no microphone" answer is logged once a function.
+To check on the Mac, against libmic.sprx: the signatures (what the sharing's calls take, cellMicCommand's arguments,
+SetMultiMicNotifyEventQueue's), whether the sharing needs cellMicInit or SysShareInit stands in for it, the error codes
+and their order, whether a multi-mic queue gets attach events for every device and what Remove does to it.
+Tests: test_devices.cpp "[mic]": Command before and after Init; the multi-mic queue refused before Init and without a
+queue, taken with one, no event, refused after cellMicEnd; the sharing's calls before, during and after it, with and
+without cellMicInit, a second Init and End, the sharing outliving cellMicEnd.
+
+## D-668 · 2026-10-11 · cellMicStopEx in cellMicStartEx's form
+
+cellMicStopEx was grey (D-183, D-189): RPCS3 registers it with no arguments and stops the emulator when it is called
+("unexpected function", "this function shouldn't exist"), so pspocket left it unimplemented (CELL_ENOSYS, logged) and
+the stub table (D-182) does not take it. It is in libmic's NID list and nothing gives its arguments. Its form is made
+from cellMicStartEx's: RPCS3's cellMicStart is cellMicStartEx(dev_num, 0), so cellMicStop is read as
+cellMicStopEx(dev_num, 0) and StopEx takes (dev_num, iflags):
+- a flag outside the two StartEx takes (CELL_MIC_STARTFLAG_LATENCY_4 1 and LATENCY_2 2; LATENCY_1 is 3) is PARAM,
+  before anything else, as StartEx's;
+- then as Stop: NOT_INIT before Init, else DEVICE_NOT_FOUND (no microphone is registered); with one it would stop it as
+  Stop does.
+Unverified (D-594). What the flags mean for a stop is not known: StartEx's are taken as the set a stop accepts, so a
+game passing what StartEx takes is not refused.
+To check on the Mac, against libmic.sprx: whether it exports cellMicStopEx at all (RPCS3's comment says it should not
+exist), its arguments and the flags it accepts.
+Tests: test_devices.cpp "[mic]": the flags before and after Init (PARAM for 4, 8 and the top bit, beside StartEx's 4),
+NOT_INIT, DEVICE_NOT_FOUND for every flag StartEx takes on two devices, Stop beside it, NOT_INIT after cellMicEnd.
+
+## D-669 · 2026-10-11 · cellRemotePlay with no Remote Play peer: a session's data refused, the game's settings kept
+
+cellRemotePlay (libsysutil_remoteplay) tells a game played on a PSP or PS Vita over Remote Play so, and takes its
+settings for the session. RPCS3 registers eight functions (rpcs3/Emu/Cell/Modules/cellRemotePlay.cpp), all todos
+answering CELL_OK, none with arguments but SetComparativeVolume's float and GetComparativeVolume's pointer (filled with
+1.0); its header gives the six statuses (LOADING 0, WAIT, RUNNING, UNLOADING, FATALERROR, PREMOEND 5),
+CELL_REMOTEPLAY_ERROR_INTERNAL (0x80029830) and the encoders' memory container sizes, and cellSubDisplay.h names
+0x80029813 CELL_REMOTEPLAY_ERROR_ZERO_REGISTERED. The seven stubs are pspocket's own
+(runtime/hle/src/cellRemotePlay.cpp), with GetComparativeVolume moved there from sysutil_misc.cpp so that the library is
+one state; all eight unverified (D-594; libsysutil_remoteplay is always native, D-175, so the marker only records that).
+No PSP or PS Vita is registered with this console for Remote Play (cellSubDisplay's init answers ZERO_REGISTERED,
+D-189), so no session ever starts:
+- **What a session would give** answers ZERO_REGISTERED, the code for that lack, and writes nothing: the peer's
+  information (GetPeerInfo) and the memory shared with the session (GetSharedMemory). The stubs' CELL_OK handed a game
+  what was in its own buffer as a peer's information or a pointer. Their arguments are not known and not read.
+- **GetStatus** keeps RPCS3's answer as its result, 0 (LOADING's value): none of the six statuses names "no session", an
+  error or another status could send a game down a path it does not take today, and games run with 0 on RPCS3.
+- **The game's settings** are kept and answer CELL_OK, as RPCS3's: the comparative volume (SetComparativeVolume, read
+  back by GetComparativeVolume: 1.0, RPCS3's value, until one is set; any value kept, its range not being known), all
+  the data encrypted (EncryptAllData), the video to the peer stopped (StopPeerVideoOut), for a session that never comes;
+  Break ends no session. An error for these could change a game's path for the worse, and a console with no session may
+  well take them alike.
+- **Fixed**: GetComparativeVolume wrote through its pointer unchecked (one that is not guest memory faulted the host);
+  it is now logged with the call site and refused with INTERNAL, the library's one known code. A null pointer still
+  gets CELL_OK and nothing (RPCS3).
+To check on the Mac, against libsysutil_remoteplay.sprx: the signatures (GetStatus's result or a pointer, what
+GetPeerInfo fills and GetSharedMemory gives), what GetStatus answers with no session and no device registered, the error
+codes with no session, whether the settings are kept or refused then (and the volume's range), what Break and
+StopPeerVideoOut do without a session.
+The count, with D-665 to D-668: 6,211 of 6,625 library functions pspocket's own before, 6,240 after (cellCamera's 13,
+cellMic's 8 and cellMicStopEx, cellRemotePlay's 7): every cell of the three libraries (cellCamera 43, cellMic 42,
+cellRemotePlay 8).
+Tests: test_devices.cpp "[remoteplay]": the status; the peer's information and the shared memory refused, their buffers
+untouched; the volume 1.0, then each one set, a null pointer, one that is not guest memory (the regression); the
+settings and Break; a second process starting again at 1.0. test_sysutil_misc.cpp's check of the default volume passes
+unchanged.
+
+## D-670 · 2026-10-11 · cellNetCtl's game-internal forms and the game update's Init, Term and CheckAbort, pspocket's own
+
+Eleven of the functions answered as RPCS3's stubs (D-182) in libnetctl, a library pspocket always serves (D-175), made
+pspocket's own (runtime/hle/src/cellNetCtl.cpp), each unverified (D-594: libnetctl.sprx is always native, so the
+marker only records that no Sony module was compared). RPCS3 registers all eleven as todos with no arguments
+(rpcs3/Emu/Cell/Modules/cellNetCtl.cpp) and nothing public describes them.
+- **The game-internal forms** (cellNetCtl*GameInt) are read as libnetctl's interface for a network a game drives
+  itself: four have public forms, and Scan, GetScanInfo, Connect and Disconnect have none (a wireless LAN scanned and
+  joined, as the PSP's ad hoc control does). They answer as the public forms do for pspocket's offline network
+  (D-024). Each is NOT_INITIALIZED before cellNetCtlInit and after Term (the library's one Init); then those with
+  known pointers check them (null or not guest memory: INVALID_ADDR, the latter logged with the call site):
+  - GetStateGameInt(s32* state): Disconnected (0).
+  - GetInfoGameInt(code, CellNetCtlInfo* info): cellNetCtlGetInfo's answer, from one body for both: the Ethernet
+    address FF:FF:FF:FF:FF:FF only (RPCS3's np_handler before it discovers one), every other code NOT_CONNECTED.
+  - AddHandlerGameInt(handler, arg, s32* hid) and DelHandlerGameInt(hid): four handler slots, IDs 0 to 3 (the public
+    DelHandler's check, RPCS3: an ID above 3 is INVALID_ID), the lowest free one's ID written to *hid as the SDK's
+    AddHandler writes its ID; a fifth is HANDLER_MAX. DelHandler of an ID outside 0 to 3 (a negative one too) is
+    INVALID_ID, of a free slot ID_NOT_FOUND. The handlers are kept and never called: the interface never changes
+    state. cellNetCtlTerm forgets them. (The public AddHandler, RPCS3's todo, writes no ID and keeps nothing; it is
+    left as games run on it.)
+  - ConnectGameInt: NOT_CONNECTED at once, no link being able to come up (cellNetAoiStart's answer, D-635), rather
+    than RPCS3's CELL_OK, which would leave a game waiting for a connection. DisconnectGameInt: CELL_OK, the
+    interface being disconnected as asked. ScanGameInt: CELL_OK, nothing found; GetScanInfoGameInt: CELL_OK, nothing
+    written. Their arguments are not known, so these four log their argument registers (r3 to r5) and read none: a
+    count or a list written through a pointer guessed wrong would land in the game's data.
+  - Each function's first four calls are logged at info, later ones at debug (GetState may be polled).
+- **The game update** (CELL_GAMEUPDATE_ERROR_*, RPCS3 cellNetCtl.h): cellGameUpdateInit once, ALREADY_INITIALIZED
+  until cellGameUpdateTerm; Term without Init is NOT_INITIALIZED. A check (StartAsync, StartWithoutDialogAsync and
+  their Ex forms) is in progress from its start until its callback is called (at the next cellSysutilCheckCallback);
+  cellGameUpdateCheckAbort, after Init, aborts those in progress: their callbacks hear
+  CELL_GAMEUPDATE_RESULT_STATUS_ABORTED (6) instead of NO_UPDATE, the Ex forms' result too. With none in progress
+  (none started, or answered already) it is NOT_START (0x8002cc08); a finish (FinishAsync) is not a check. The checks
+  themselves still need no Init (RPCS3's, which games run on today); only CheckAbort asks for it.
+To check on the Mac, against libnetctl.sprx: the GameInt signatures (whether GetState, GetInfo, AddHandler and
+DelHandler take the public forms' arguments; what Connect, Scan and GetScanInfo take and write), whether they need
+cellNetCtlInit or an Init of their own, the handler limit and IDs (and whether the public AddHandler writes its ID),
+what Connect answers with no link (at once, or through a handler's ERROR event with which error), what a scan that
+finds nothing writes; cellGameUpdateInit's arguments, whether the checks need Init, whether Term during a check is
+BUSY, CheckAbort's answer with no check and what an aborted callback hears.
+Tests: test_misc_hle.cpp "[netctl-gameint]" (every form before Init and after Term, the state, the information, the
+pointers, four handlers and a fifth, deletion and reuse, Connect, Disconnect, the scan, no handler called, Term
+forgetting them), "[gameupdate]" (Init and Term twice, an abort before the answer in the plain and Ex forms, a finish
+not aborted, none after the answer).
+
+## D-671 · 2026-10-11 · Background downloads and the access point mode: none, and never on (cellBGDLUtility, cellSysutilAp)
+
+Six of RPCS3's stubs in two sysutil libraries pspocket always serves, made pspocket's own
+(runtime/hle/src/sysutil_misc.cpp), unverified (D-594; libsysutil_* modules are always native).
+- **cellBGDLUtility** (libsysutil_bgdl; RPCS3 rpcs3/Emu/Cell/Modules/cellBgdl.cpp/.h: CellBGDLInfo, the modes, the
+  error codes, four todos answering CELL_OK). The system downloads a game's PSN content (an add-on, a demo) in the
+  background while the game runs, and the game reads how far each download has come. There is no PSN here (D-139), so
+  nothing is ever downloading:
+  - GetInfo(const char* content_id, CellBGDLInfo* info, s32 num) and GetInfo2 (a service ID): 0, RPCS3's CELL_OK read
+    as the number of entries filled, and nothing written. The ID is read for the log only and may be null (RPCS3 takes
+    one; refusing it could fail a game asking after all its downloads); one that runs into memory that is not guest
+    memory is CELL_BGDL_UTIL_ERROR_PARAM (logged). num below 0 is PARAM; the num entries (24 bytes each) must be guest
+    memory (PARAM, logged), and num 0 needs no buffer.
+  - SetMode(mode) keeps AUTO (0) or ALWAYS_ALLOW (1), another is PARAM; GetMode(mode*) writes it, AUTO at first (a
+    null pointer or one that is not guest memory: PARAM).
+  - GetInfo, GetInfo2 and GetMode may be polled (a progress bar): each's first four calls at info, then debug.
+- **cellSysutilAp's On and Off** (RPCS3 rpcs3/Emu/Cell/Modules/cellSysutilAp.cpp: CellSysutilApParam and the error
+  codes; On and Off todos answering CELL_OK). The access point mode makes the console's wireless LAN an access point,
+  bridged to its wired LAN, for PSPs. pspocket's console has neither (an iPhone has no Ethernet and cannot be made an
+  access point) and no network (D-024), so the mode never comes on:
+  - On(const CellSysutilApParam* pParam, container): pParam null, or its 124 bytes not guest memory (logged), is
+    INVALID_VALUE (0x8002cd02); otherwise NETIF_NO_CABLE (0x8002cd15: the wired LAN the mode bridges to is not
+    connected), its type, wlanFlag, title ID and SSID logged (the WPA key never). RPCS3's CELL_OK would leave a game
+    waiting for PSPs that cannot join. The container is not checked: what On does with it is not known.
+  - Off: CELL_OK, the mode being off as asked. A PS3 may answer NOT_INITIALIZED (0x8002cd03) to an Off without an On;
+    a game's cleanup would then meet an error where it meets CELL_OK today, so RPCS3's answer is kept.
+  - GetRequiredMemSize is unchanged (RPCS3's 1 MB).
+To check on the Mac, against libsysutil_bgdl.sprx and libsysutil_ap.sprx: whether GetInfo answers a count or CELL_OK,
+and what it writes when nothing downloads (an entry in state ERROR, or nothing); whether a null ID is taken; num's and
+the buffer's checks; the default mode. CellSysutilApParam's checks (type, wlanFlag, the strings) and their order; what
+On answers with no cable, or with the network disabled (NETIF_DISABLED?); whether it shows a dialog in its container;
+what Off answers when the mode is not on.
+Tests: test_sysutil_misc.cpp "[bgdl]" (the mode, the IDs, the buffer's checks, an entry past guest memory, nothing
+written), "[sysutil-ap]" (On's checks and answer, its parameters untouched, Off).
+
+## D-672 · 2026-10-11 · The auth dialog's Abort and Close; cellGameExec's games: this one game, nothing booted or deleted
+
+Six more of RPCS3's stubs in runtime/hle/src/sysutil_misc.cpp made pspocket's own, unverified (D-594).
+- **cellAuthDialogUtility** (RPCS3 rpcs3/Emu/Cell/Modules/cellAuthDialog.cpp). Open's check is RPCS3's (a zero
+  argument is ARG1_IS_ZERO, 0x8002d202, its answers unchanged); Abort and Close were todos, RPCS3 noting from the
+  module that their first check fails with 0x8002d203 ("not init cond?"). Now Open with a non-zero argument opens the
+  dialog, which stays open until Close (no UI answers it, D-183); a second Open while it is open is RPCS3's CELL_OK
+  and still one dialog. Abort and Close of a dialog that is not open (never opened, refused, closed) answer
+  0x8002d203, read as "not open". Abort of the open dialog is CELL_OK and leaves it open for Close, as the other
+  sysutil dialogs' aborts leave their unload to the game (a game aborting and then closing gets CELL_OK twice). Close
+  is CELL_OK and closes it; its argument (RPCS3: "arg1", not known) is logged, not read.
+- **cellGameExec** (RPCS3 rpcs3/Emu/Cell/Modules/cellGameExec.cpp: the signatures; GetList, DeleteGame, ExecGame and
+  GetExitGameInfo todos answering CELL_OK): PlayStation Home's library for booting other games, listing and deleting
+  them, and reading what a game it booted left when it ended. pspocket runs the one game it was built for (on iOS each
+  game is an app of its own, D-036). What is installed is read from its /dev_hdd0 as cellGame reads it:
+  /dev_hdd0/game/<dirName>/PARAM.SFO of an HDD game's category (RPCS3 psf::is_cat_hdd; game data is no game); the
+  disc is in the drive when the game booted from it or /dev_bdvd holds PS3_GAME/PARAM.SFO.
+  - A directory name is 1 to 31 characters of [A-Z0-9_-] not starting with '_', ending within CELL_GAME_DIRNAME_SIZE
+    (32) bytes (RPCS3's sysutil_check_name_string, which cellGameDeleteGameData applies), else CELL_GAME_ERROR_PARAM
+    (logged when not guest memory). The name goes into a host path, so nothing else is let through.
+  - ExecGame(type, dirName, options, memContainer, execData, userData): HOME (4) is NOAPP (Home is gone, as its paths
+    answer); DISC (1) with no disc, and HDD (2) naming no installed game, are NOTFOUND; one that is there (this game
+    too) is NOTSUPPORTED (0x8002cb21), logged: pspocket boots no other program from a running one. Another type is
+    PARAM. RPCS3's CELL_OK would leave a game waiting for an exit that never comes.
+  - DeleteGame(dirName, memContainer): an installed game is not deleted (NOTSUPPORTED, logged): a PS3 asks the user
+    first, there is no dialog, and pspocket deletes no installation, this game's or another's. One not installed is
+    NOTFOUND.
+  - GetList(listBufNum, listBuf, u32* listNum, u32* getListNum, memContainer): both counts 0 and nothing in the
+    buffer: the list's entries are not known (RPCS3 names the buffer "unk"), so no game is listed, even where
+    /dev_hdd0 holds some (on iOS it holds this game alone). A count's pointer null or not guest memory: PARAM.
+  - GetExitGameInfo(u32* status, u32* type, char* dirName, u32* execData, u32* userData): no game was booted from this
+    one, so there is nothing to tell: RPCS3's CELL_OK with nothing written (what a status would say is not known), once
+    status, type and dirName are checked (null or not guest memory: PARAM). execData and userData may be null, as
+    cellGameGetBootGameInfo's execdata may.
+To check on the Mac, against libsysutil_authdialog.sprx and libsysutil_game_exec.sprx: what Open takes, whether a
+second Open is refused (0x8002d201?), what Abort does to the dialog and whether Close after it is CELL_OK, Close's
+argument; who may call cellGameExec (Home alone?), GetList's entries and whether this game and the disc are listed,
+DeleteGame's dialog and answers, ExecGame's checks and its answer for this game, GetExitGameInfo's answer when no game
+was booted from this one (an error, or a status saying so), and the arguments' order of all four.
+Tests: test_sysutil_misc.cpp "[authdialog]" (Abort and Close with no dialog, after a refused Open, after an abort,
+twice, one dialog for two Opens), "[gameexec]" (a synthetic /dev_hdd0 with this HDD game, another and game data: the
+list, deletion and booting of each, the names refused, the disc mounted and not, a disc game's own disc, the exit
+information's checks; nothing written, nothing deleted).
+
+## D-673 · 2026-10-11 · cellRtcAlarm: the system's RTC alarms kept, none rings; no argument read or written
+
+libsysutil_rtcalarm is an internal sysmodule (0xf032 in RPCS3's cellSysmodule.cpp; no public module ID loads it).
+RPCS3 registers its five names with no arguments (rpcs3/Emu/Cell/Modules/cellRtcAlarm.cpp: UNIMPLEMENTED_FUNC, CELL_OK
+each) and nothing public describes them. Read with lv2's system manager calls sys_sm_set_rtc_alarm and
+sys_sm_get_rtc_alarm (396 and 397, for the system only: pspocket's lv2 refuses them to a game, D-527), it is the
+application side of the console's wake-up alarm: an application registers a time at which the console leaves standby
+for it. pspocket's (runtime/hle/src/sysutil_misc.cpp), unverified (D-594; the module is always native):
+- pspocket's console has no standby (the app is the console, and nothing runs while it is closed), so no alarm ever
+  rings or runs.
+- Register keeps a registration under its first argument's low word (what names an alarm is not known: an ID, a time,
+  the address of a description), its argument registers r3 to r6 as given; the same first argument again replaces
+  it; at most 256 are kept, more are answered and not kept (logged). Unregister forgets the one kept under its first
+  argument, and answers CELL_OK when none is (logged): the keys being a guess, an error there could fail a cleanup
+  that works on a PS3. Notification (no alarm has rung), StopRunning (none runs) and GetStatus (the count kept, none
+  rung) have nothing to tell. Every answer is RPCS3's CELL_OK.
+- No argument is read or written: the layouts are not known, and a status written through a pointer guessed wrong
+  would land in the game's data. Each call logs its argument registers (each function's first four calls at info),
+  so a run shows what a game passes.
+To check on the Mac, against libsysutil_rtcalarm.sprx: the five signatures (whether Register takes a CellRtcTick or a
+CellRtcDateTime, an application's parameters, and answers an ID), the error codes, whether a game may load the module
+at all, what GetStatus and Notification write when no alarm has rung, what StopRunning stops, the registration limit.
+Tests: test_sysutil_misc.cpp "[rtcalarm]" (every call with pointers and with values that are no guest memory, a
+registration replaced, unregistered twice, 300 registrations and their unregistering; nothing written).
+
+## D-674 · 2026-10-11 · cellImeJpOpenExt, cellAudioOutUnregisterDevice and cellVideoOutGetResolutionAvailability2 on their neighbours
+
+The last three of this round's stubs, made on pspocket's own neighbouring functions, unverified (D-594; libsysutil_*
+modules are always native).
+- **cellImeJpOpenExt** (RPCS3: a todo with no arguments; runtime/hle/src/cellImeJp.cpp) as the newest Open, Open3
+  (RPCS3 cellImeJp.cpp, D-188): a non-zero memory container and a handle pointer (PARAM otherwise, logged when not
+  guest memory), the one IME of the process (ALREADY_OPEN while any Open's IME is open), RPCS3's handle 0xF0000000
+  written, the list of four CellImeJpAddDic pointers noted (null entries and those not guest memory skipped, logged).
+  What an extended form adds (r6 on) is not read. Should the third argument be one CellImeJpAddDic (Open2's form), its
+  path's first bytes read as four pointers are not guest memory and are skipped: dictionaries are only noted (RPCS3
+  has none), so the IME is the same either way.
+- **cellAudioOutUnregisterDevice(deviceNumber)** (RPCS3 cellAvconfExt.cpp: a todo answering CELL_OK;
+  runtime/hle/src/cellSysutil.cpp): cellAudioOutRegisterDevice still gives device 0 to every registration (RPCS3's
+  answer, unchanged) and now counts them; Unregister of device 0 while one is counted takes it, CELL_OK; any other
+  number, or device 0 with none counted, is CELL_AUDIO_OUT_ERROR_DEVICE_NOT_FOUND (0x8002b244).
+  cellAudioInUnregisterDevice is unchanged (CELL_OK for any number, as RPCS3's microphone thread unregisters).
+- **cellVideoOutGetResolutionAvailability2** (RPCS3: a todo with no arguments answering 0, which as this boolean answer
+  says "not available" to every mode): the public form's first three arguments (videoOut, resolutionId, aspect) and its
+  answer, from one body for both: 1 for the 720p display at 16:9 or auto on the primary output, 0 for any other mode
+  and on the secondary output, UNSUPPORTED_VIDEO_OUT for another output. What the second form adds (r6, r7) is logged,
+  not read.
+To check on the Mac: OpenExt's arguments and whether it opens the same IME; the device numbers RegisterDevice gives
+(pspocket: always 0) and Unregister's answers; GetResolutionAvailability2's arguments (a refresh rate? a 3D mode?) and
+whether its answer is the same boolean.
+Tests: test_imejp.cpp (OpenExt's checks, the list, one IME for every Open, a single dictionary and an unmapped list),
+test_sysutil.cpp "[avconf]" (registrations unregistered once each, other numbers; both availability forms over the
+same modes and outputs).
+The count (scripts/progress.py): 6,211 of 6,625 library functions pspocket's own before D-670 and 188 answered as
+RPCS3's stubs; after D-674, 6,242 and 157 (cellNetCtl 11, cellBGDLUtility 4, cellSysutilAp 2, cellAuthDialogUtility
+2, cellGameExec 4, cellRtcAlarm 5, cellImeJpUtility 1, cellSysutilAvconfExt 2: every one of these libraries' cells).
+
+## D-675 · 2026-10-11 · cellSysutilAvc2's chat with nobody else in it: streaming, LeaveChat, the target, voice detection, unverified
+
+libsysutil_avc2 is always native (D-175), and 16 of its functions were RPCS3's stubs (D-182: a log, then CELL_OK). They
+are pspocket's own now (runtime/hle/src/cellSysutilAvc2.cpp), unverified (D-594: made from RPCS3's header and the
+library's neighbours, without Sony's module; the library is always native, so the marker only records that). This
+decision is the chat's seven (StartStreaming, StopStreaming, LeaveChat, SetStreamingTarget, SetStreamPriority,
+StartVoiceDetection, StopVoiceDetection) and the states they need; D-676 is the video chat's nine. With them,
+cellSysutilAvc2 is 54 of 54 pspocket's own, and the library chart 6,258 of 6,625 (from 6,211, D-675 to D-679: 47).
+
+**The console modelled.** One that never reaches a peer: PSN offline (D-139, D-185: matching 2 makes no context, so
+there is no room), the network disconnected (cellNetCtl, D-024), no camera and no microphone (D-187). D-187 answers the
+join as succeeded (RPCS3's TODOs: JOIN_SUCCEEDED, "nobody to talk to"), and games run on that answer today, so it is
+kept: the chat a game joins here has nobody else in it.
+- **The chat.** JoinChat and JoinChatRequest (D-187) now mark it joined; LeaveChat, LeaveChatRequest and an unload of
+  the voice chat (Unload, UnloadAsync, Unload2 and UnloadAsync2 with VOICE_CHAT) end it, at the call (an asynchronous
+  unload's event still drops the callback when it runs, as before).
+- **StartStreaming, StopStreaming.** NOT_INITIALIZED with neither chat loaded (as cellSysutilAvc2Unload answers, RPCS3);
+  INVALID_STATUS outside a chat (there is nothing to stream in: the stub's CELL_OK is not what the library answers then,
+  and INVALID_STATUS is the AV chat's state error, which libsysutil's own AV chat requests answer, D-534); in one,
+  CELL_OK: streaming starts, to nobody, and stops; either twice changes nothing. Leaving the chat stops it.
+  StartStreaming2 and StopStreaming2 (D-187: the media type checked, nothing else) are unchanged.
+- **LeaveChat.** LeaveChatRequest's synchronous form: the chat left at once with no event (as the synchronous JoinChat
+  joins with none), CELL_OK also with no chat joined (as LeaveChatRequest answers). Its arguments are not read: RPCS3
+  registers it with none, and by JoinChat's they would be an event ID and parameter to write, which a wrong guess would
+  write into the game's data.
+- **SetStreamingTarget(target).** RPCS3's CellSysutilAvc2StreamingTarget, by pointer as RPCS3 has it (20 bytes: the
+  mode, then a team ID, a CellSysutilAvc2RoomMemberList or a CellSysutilAvc2MemberIpAndPortList): ROOM, TEAM, PRIVATE
+  (members) or DIRECT (members at addresses and ports, the direct streaming modes). INVALID_ARGUMENT for a null target
+  or one that is not guest memory (logged with the call site, D-042), another mode, a list of no member, or a list that
+  is null or not guest memory; then NOT_INITIALIZED with no chat loaded; else kept as given. No member is checked
+  against a room (there is none) and none is reached.
+- **SetStreamPriority(priority).** Kept as given once the library is loaded (NOT_INITIALIZED before): its values are not
+  known, so none is refused.
+- **StartVoiceDetection, StopVoiceDetection.** The voice chat's (NOT_INITIALIZED without its callback); switched on and
+  off. No microphone, so nothing is ever detected: no CELL_AVC2_EVENT_SYSTEM_VOICE_DETECTED is sent.
+- **Order.** An argument's check first, then the library's state, as libsysutil's AV chat requests check the transition
+  before the load (D-534).
+D-187's functions answer as before; only JoinChat, JoinChatRequest, LeaveChatRequest and the unloads now keep the chat's
+state.
+To check on the Mac against libsysutil_avc2.sprx (always native: read it, or run it on pspocket's lv2 as D-534 ran
+libsysutil): LeaveChat's arguments; SetStreamingTarget's target, by pointer or by value; SetStreamPriority's values;
+whether streaming needs a joined chat and the error then (INVALID_STATUS or NO_SESSION), and whether StopStreaming
+without streaming is one; whether StartStreaming2 and StopStreaming2 need the chat too; NOT_INITIALIZED before a load;
+the target's checks (a DIRECT target in the normal streaming mode, the member limits); voice detection without a
+microphone.
+Tests: tests/hle/test_avc.cpp "[avc2]": every call before a load; streaming outside a chat, in one joined by request and
+by the synchronous call, after LeaveChat and LeaveChatRequest (with their events), after an unload of the voice chat and
+a load again; each target mode, its refusals and memory that is not guest memory; the priority; voice detection with no
+event; a video chat alone (no voice detection, streaming in a chat); UnloadAsync ending it at the call; the 16 functions
+registered under their names, unverified.
+
+## D-676 · 2026-10-11 · cellSysutilAvc2's video chat: the game's windows and the screen, kept as it set them, nothing drawn, unverified
+
+The other nine of D-675's sixteen (CreateWindow, DestroyWindow, ShowWindow, HideWindow, SetWindowPosition,
+SetWindowSize, ShowScreen, HideScreen, ChangeVideoResolution), on the same console.
+- **The video chat** is loaded by Load or LoadAsync with a video chat's parameters (D-187's checks), which now keep its
+  max_video_windows and max_video_resolution; Unload2 and UnloadAsync2 with VIDEO_CHAT, Unload and UnloadAsync unload it
+  and drop its windows and screen. A second load keeps its windows (RPCS3 refuses no second load). Unload answers
+  CELL_OK when only a video chat is loaded: RPCS3's looks at the voice chat's callback alone, as it keeps nothing of the
+  video chat, and so answered NOT_INITIALIZED with something loaded.
+- **CreateWindow(member_id).** NOT_INITIALIZED without the video chat; WINDOW_ALREADY_EXISTS for a member's second;
+  TOO_MANY_WINDOWS past max_video_windows; else a window, hidden. Any member ID (16 bits): pspocket has no room to check
+  it against (matching 2 is offline), and its GetPlayerInfo answers any member as joined (D-187); the custom video
+  window's 0xFFF0 counts like the others. A joined chat is not needed: a game may lay windows out before it joins.
+- **DestroyWindow, ShowWindow, HideWindow, SetWindowPosition(member, x, y, z), SetWindowSize(member, width, height).**
+  NOT_INITIALIZED without the video chat, WINDOW_NOT_FOUND for a member with no window; the floats from f1.. (D-503)
+  kept as given (in the load's coordinates form; no range is known to check).
+- **ShowScreen, HideScreen.** The screen the windows are on, switched; NOT_INITIALIZED without the video chat.
+- **ChangeVideoResolution(resolution).** QQVGA or QVGA, else INVALID_ARGUMENT (checked first); NOT_INITIALIZED without
+  the video chat; INVALID_ARGUMENT past the load's max_video_resolution when the load named one of the two (RPCS3's load
+  takes any); kept. No camera sends at either here.
+- **The getters (D-187's) report what the game set.** GetScreenShowStatus the screen's status (0 until shown);
+  GetWindowShowStatus a window's (0 for a member with none, as before); GetWindowPosition and GetWindowSize the window's
+  position and size once the game set them, each output checked first (INVALID_ARGUMENT, logged, for one that is not
+  guest memory), and before that nothing, as D-187's wrote nothing: there the system's own layout would be read, which
+  is not known here, and a value made up would read as Sony's. Nothing is drawn: pspocket has no overlay for the
+  windows. (D-187's "the windows and the screen are never shown" becomes "shown as the game switches them, not drawn".)
+To check on the Mac: the errors and their order (CreateWindow with only a voice chat or before a join; whether the
+custom window counts against the limit; when TOO_MANY_PEER_WINDOWS is answered); a new window's show status and layout,
+and what the getters write before the game sets anything; GetWindowShowStatus for a member with no window
+(WINDOW_NOT_FOUND?); the screen's first status; ChangeVideoResolution's check against the load; Unload with only a video
+chat.
+Tests: tests/hle/test_avc.cpp "[avc2]": each call without the video chat and with only the voice chat; windows to the
+limit, twice for a member, the custom window's ID, a member ID past 16 bits; shown, hidden, positioned and sized, read
+back (nothing written before), a member with no window, outputs null or not guest memory; the screen; the resolution
+against the load's; a window destroyed and its place taken; the video chat unloaded by Unload2, UnloadAsync2 (its event
+keeping the callback) and Unload, alone and with the voice chat.
+
+## D-677 · 2026-10-11 · cellSysutilAvcExt's 14: the panel through libsysutil, each player's window kept, detections with no device, unverified
+
+libsysutil_avc_ext is always native too; its 14 stubs are pspocket's own (runtime/hle/src/sysutil_misc.cpp), unverified
+(D-594). cellSysutilAvcExt is 30 of 30. AvcExt extends the AV chat of cellSysutil (cellSysutilAvcLoadAsync, pspocket's
+own, D-183 and D-534) with its panel, windows and name plates, for a console with no system software behind the AV chat
+and no camera or microphone.
+- **ShowPanelEx(transition), HidePanelEx(transition): libsysutil's request.** libsysutil exports 0x44F288A7 for the AV
+  chat's library: the panel's show state with a transition (D-534 read it, and compared it with Sony's libsysutil), and
+  its own cellSysutilAvcShowPanel and HidePanel send it with -1. The two call it through the registry with the panel
+  shown (1) or hidden (0): INVALID_ARGUMENT for a transition past EXPONENT (signed: NONE, -1, passes), INVALID_STATUS
+  for an AV chat not loaded or loaded for voice only, and for one loaded for video the request to the system software,
+  which pspocket's console does not have (its channels closed, D-534): CELL_AVC_ERROR_UNKNOWN, as
+  cellSysutilAvcShowPanel answers here. Here the stub's CELL_OK is not what a console with no system software answers,
+  and libsysutil's own code says what it does answer.
+- **SetWindowPosition, SetWindowRotation(player, x, y, z, transition).** RPCS3's stubs, checked as RPCS3 checks
+  SetWindowAlpha: INVALID_ARGUMENT for a null player or a transition past EXPONENT (NONE refused too); the transition
+  after the three floats from r7 (D-678).
+- **Each player's window kept, D-187's setters too.** AvcExt now keys windows by the player's online ID (SceNpId's first
+  16 characters, as sceNpUtilCmpNpId tells NP IDs apart; the pointer checked for guest memory first, INVALID_ARGUMENT
+  and the call site logged when it is not). SetWindowAlpha, SetWindowSize, SetWindowPosition, SetWindowRotation,
+  ShowWindow, HideWindow and SetWindowZorder keep what they set; GetWindowPosition, GetWindowRotation, GetWindowSize,
+  GetWindowAlpha and GetWindowShowStatus write it (each output checked first), and nothing before the game set it, as
+  D-187's getters wrote nothing (the system's own layout is not known here). Any player is taken, as D-187's setters
+  take any: the windows are the system's to draw, and nothing is drawn. GetSurfacePointer is unchanged: no video comes,
+  so there is no surface.
+- **The name plates.** SetShowNamePlate and SetHideNamePlate keep them shown or hidden; GetNamePlateShowStatus writes
+  that once set (nothing before).
+- **SetChatMode(mode)** keeps the mode as given (its values are not known). **SetChatGroup**: RPCS3 registers it with no
+  arguments and nothing public describes them, so none is read (a wrong guess would read the game's data as players);
+  logged with a count, CELL_OK: there is nobody else in the chat to group.
+- **Start/StopCameraDetection, Start/StopMicDetection, Start/StopVoiceDetection** switch the detections; with no camera
+  or microphone nothing is ever detected, and no event (CAMERA_DETECTED, MIC_DETECTED, VOICE_DETECTED) is sent.
+- **The AV chat's own state is not looked at** but by the panel's request: D-187's neighbours look at none, and an error
+  there could change a game's path, so these keep RPCS3's answer, now with their checks and state. libsysutil_avc_ext
+  probably sends its window, name plate, chat and detection requests to the system as libsysutil sends the panel and
+  the muting (D-534), which pspocket's console would refuse (UNKNOWN); only the panel's path is known. What AvcExt keeps
+  lasts while the process runs (it does not reach into the AV chat's load and unload, which are cellSysutil's).
+To check on the Mac against libsysutil_avc_ext.sprx: that ShowPanelEx and HidePanelEx call 0x44F288A7 (that it is this
+module that imports it) and what they check first; whether the other functions send requests to the system software
+(they would then answer UNKNOWN here, as the panel does); SetChatGroup's and SetChatMode's arguments; the window
+functions' answers for a player not in the chat and with no AV chat loaded; what the getters write before anything is
+set; the name plates' first state; the detections' events.
+Tests: tests/hle/test_avc.cpp "[avcext]": the panel with no AV chat, one for voice and one for video (UNKNOWN, as
+cellSysutilAvcShowPanel), the transitions; two players' windows, a third NP ID with Alice's online ID and other bytes
+after it (the same window), each value read back, nothing written before, the refusals (transitions, a null player, one
+that is not guest memory, outputs that are not); the name plates; the chat mode and group; the six detections with the
+AV chat loaded and no event but the load's; the 14 registered under their names, unverified.
+
+## D-678 · 2026-10-11 · cellSysutilAvcExt: SetWindowAlpha's and SetWindowSize's transition came from the float's register
+
+A bug in D-187. SetWindowAlpha(player_id, float alpha, transition) and SetWindowSize(player_id, float size_x, float
+size_y, transition) read the transition as RPCS3's binder does, floats from f1.. and integers from r3.. skipping no
+register: from r4. On a PS3 each float takes its slot in the arguments' sequence (the PPC64 ELF ABI, which pspocket's
+typed binding follows, D-503), so the transition is in r5 after one float and r6 after two, and r4 (r5) holds whatever
+the caller left there. A game's good transition was refused (INVALID_ARGUMENT) when r4 held more than 4, and a bad one
+taken when it held 0 to 4. Both now take their floats as typed arguments and the transition after them, as D-677's
+SetWindowPosition and SetWindowRotation (r7, after three). cellSysutilAvc2's float functions take no integer after their
+floats, and their floats were read from f1.. already.
+Test (tests/hle/test_avc.cpp): garbage in the floats' registers before a good transition answers CELL_OK, 0 there before
+a bad one INVALID_ARGUMENT (the old binding answered the opposite); D-187's test passed the transition in r4 and now
+passes it after the floats' slots.
+
+## D-679 · 2026-10-11 · cellVideoPlayerUtility as a console with no system video player: nothing opens, unverified
+
+cellVideoPlayerUtility is libsysutil_video_player.sprx, internal module 0xF048 (RPCS3 cellSysmodule.cpp), which
+cellSysmoduleLoadModule refuses and only cellSysmoduleLoadModuleEx loads (RPCS3's two lists, D-179): the system
+software's video player lent to an application: content opened, controlled and closed, its pictures (stereo ones too),
+its status, the volume, start and stop positions, content still downloading (SetDownloadPosition, SetTransferComplete,
+GetTransferPictureInfo) and thumbnails. Always native (libsysutil*). RPCS3 registers the 17 names with no arguments
+(rpcs3/Emu/Cell/Modules/cellVideoPlayerUtility.cpp: UNIMPLEMENTED_FUNC answering CELL_OK) and has no header; nothing
+public describes the library. pspocket's (runtime/hle/src/cellVideoPlayerUtility.cpp) is the smallest library those
+names describe on a console whose system software has no video player to lend; unverified (D-594). 17 of 17.
+- **Initialize and Finalize** bracket the library, a process each: a second Initialize, and anything else before
+  Initialize or after Finalize, answers CELL_ESTAT.
+- **Open and StartThumbnail** answer CELL_ENOTSUP ("not supported"): nothing is opened, no thumbnail started.
+- **The other 13** (Close, PlaybackControl, GetOutputPicture, GetOutputStereoPicture, GetPlaybackStatus,
+  GetTransferPictureInfo, GetVolume, SetVolume, SetDownloadPosition, SetStartPosition, SetStopPosition,
+  SetTransferComplete, EndThumbnail) answer CELL_ESTAT: nothing is open.
+- **No argument is read or written**: their types are not known, and a pointer guessed wrong would be read, or written,
+  in the caller's data. Each refusal is logged once a function and reason, then at debug level (a player is polled
+  every frame).
+- **Error codes**: the library's own are not known; these are lv2's (sys/return_code.h, rpcs3/Emu/Cell/ErrorCodes.h),
+  which the system libraries share, as cellLibprof's (D-638).
+- **Why an error at Open** rather than RPCS3's CELL_OK: with CELL_OK and nothing written, a caller polls a status that
+  never changes (its movie never ends) and draws pictures never written; refused at Open, it falls back to its own
+  playback, or skips the movie, at once. Initialize succeeds, so a caller that sets the library up as it starts goes on.
+- **Future work, not made half-way.** No title pspocket runs is known to import it. Should one (a runtime log names
+  cellVideoPlayer*), read libsysutil_video_player.sprx on the Mac for the signatures and structures: pspocket's cellSail
+  (its player over cellDmux, cellVdec and cellAdec, D-562) could then serve the playback (Open as a cellSail player over
+  the file, or over the stream as it downloads; the output pictures from its video frames; the status, positions and
+  volume from its own). Without the signatures every part of it would be a guess in the caller's memory.
+To check on the Mac against libsysutil_video_player.sprx: the signatures and structures, the error codes, whether
+Initialize or Open fails on a system without the player (and with what), whether the volume and the positions need
+content open, the thumbnail's calls.
+Tests: tests/hle/test_videoplayer.cpp "[videoplayer]": every function before Initialize and after Finalize, a second
+Initialize, Open and StartThumbnail refused three times over with the other 13, every argument register pointing at a
+pattern no call changes, Initialize again, a process each; the 17 registered under their names, unverified.
+
 ## D-913 · 2026-10-11 · cellPngEnc as Sony's libpngenc answers and writes it (part 1)
 
 D-597's comparison of cellPngEnc with libpngenc.sprx (firmware 4.92) showed 134 of 616 observations differing (D-911):
@@ -10474,3 +11832,15 @@ libvpost writes past a YUV output whose chroma planes have an odd size. cellVpos
 these differ.
 Tests: tests/hle/test_vpost_compare.cpp (PSPOCKET_COMPARE_SELF=1 agrees with itself); tests/hle/test_vpost.cpp rewritten
 for libvpost's answers (its memory, handle, checks, conversion, sitings, scaler positions, windows, information).
+
+## D-913 · 2026-10-11 · cellPngEnc's and cellJpgEnc's queues across threads after D-651 (part 5)
+
+Main's D-651 (a picture takes its place before it is encoded; a Reset meanwhile drops it) was written for the
+libraries before parts 1 and 3. Merged, the libraries keep libpngenc's and libjpgenc's queues as compared (four commands
+waiting, the one being encoded among them; the thread encoding while fewer than four streams wait; Reset turning the
+waiting commands into STREAM_SKIP streams and skipping the next picture), and D-651's race is closed the way Sony's
+thread closes it: the command being encoded keeps its place, a Reset meanwhile leaves it to finish and queue its stream
+first, and only then are the commands still waiting skipped (before, the Reset turned it into a skipped stream too and
+its encoder then popped the next picture's command). D-651's tests are rewritten for those queues: eight threads at once
+give four to eight pictures taken (the rest BUSY), each taken picture exactly one stream (its own bytes, or STREAM_SKIP
+after a Reset), nothing left after; D-650's two encoders on two threads stand as they were, on the new structures.

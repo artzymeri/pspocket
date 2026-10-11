@@ -528,7 +528,7 @@ void Policy::task2_exit(u32 exit_code)
         ps_write32(line, slot & (PS_RES_LINE_SIZE - 1), exit_code);
         return true;
     });
-    const u32 flag_id = ps_read32(base_, taskset_ + task2_flag_offset(id));
+    const u32 flag_id = atomic_load_be32(base_, taskset_ + task2_flag_offset(id)); // cleared by DestroyTaskset2 (D-653)
     if (const auto flag = w_.sched.kernel.event_flag(flag_id)) {
         flag->set(task2_flag_bit(id));
     } else {

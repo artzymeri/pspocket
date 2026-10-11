@@ -54,12 +54,17 @@ constexpr u32 kPicture = kData + 0x100000; // GetPicture's output
 constexpr u32 kDecoderMem = 0x01000000, kDecoderMemSize = 0x01000000;
 
 // The callback (handle r3, msgType r4, msgData r5, cbArg r6) appends (type, data, handle) to the log at cbArg: a
-// count, then 16-byte entries from +16.
+// count, then 16-byte entries from +16. Only the decoder's thread calls it; after its lwsync it raises the count with
+// lwarx/stwcx., an update through the reservation system that log_count reads back, so that ThreadSanitizer (which
+// does not model the lwsync's fence) sees what the decoder did before a message ordered before the test's next step:
+// a test that reuses an access unit's memory once its AUDONE came (D-650, as D-585's tests).
 inline void write_callback(u8* b)
 {
     const std::vector<u32> code = {
         as::lwz(9, 0, 6), as::slwi(10, 9, 4), as::add(10, 10, 6), as::stw(4, 16, 10), as::stw(5, 20, 10),
-        as::stw(3, 24, 10), as::lwsync(), as::addi(9, 9, 1), as::stw(9, 0, 6), as::li(3, 0), as::blr(),
+        as::stw(3, 24, 10), as::lwsync(), as::lwarx(9, 0, 6), as::addi(9, 9, 1), as::stwcx_(9, 0, 6),
+        as::bc_rel(4, 2, -12), // bne- back to the lwarx
+        as::li(3, 0), as::blr(),
     };
     for (usize i = 0; i < code.size(); i++) ps_write32(b, kCode + 4 * static_cast<u32>(i), code[i]);
     ps_write32(b, kOpd, kCode);
@@ -67,12 +72,9 @@ inline void write_callback(u8* b)
     std::memset(b + kLog, 0, 0x1000);
 }
 
-inline u32 log_count(u8* b)
-{
-    const u32 n = ps_read32(b, kLog);
-    std::atomic_thread_fence(std::memory_order_acquire);
-    return n;
-}
+// The callback's count, through the reservation system (as lwarx reads it): what the callback wrote before it, and
+// the decoder before the callback, is then visible.
+inline u32 log_count(u8* b) { return line_word(b, kLog); }
 
 // The log holds 255 entries; a count past them (a run gone wrong) is cut there, so a test fails rather than spins.
 inline u32 count_of(u8* b, u32 type)
