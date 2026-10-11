@@ -11497,8 +11497,8 @@ RPCS3's stubs; after D-674, 6,242 and 157 (cellNetCtl 11, cellBGDLUtility 4, cel
 libsysutil_avc2 is always native (D-175), and 16 of its functions were RPCS3's stubs (D-182: a log, then CELL_OK). They
 are pspocket's own now (runtime/hle/src/cellSysutilAvc2.cpp), unverified (D-594: made from RPCS3's header and the
 library's neighbours, without Sony's module; the library is always native, so the marker only records that). This
-decision is the chat's eight (StartStreaming, StopStreaming, LeaveChat, SetStreamingTarget, SetStreamPriority,
-StartVoiceDetection, StopVoiceDetection, and the states the others need); D-676 is the video chat's eight. With them,
+decision is the chat's seven (StartStreaming, StopStreaming, LeaveChat, SetStreamingTarget, SetStreamPriority,
+StartVoiceDetection, StopVoiceDetection) and the states they need; D-676 is the video chat's nine. With them,
 cellSysutilAvc2 is 54 of 54 pspocket's own, and the library chart 6,258 of 6,625 (from 6,211, D-675 to D-679: 47).
 
 **The console modelled.** One that never reaches a peer: PSN offline (D-139, D-185: matching 2 makes no context, so
@@ -11545,8 +11545,8 @@ registered under their names, unverified.
 
 ## D-676 · 2026-10-11 · cellSysutilAvc2's video chat: the game's windows and the screen, kept as it set them, nothing drawn, unverified
 
-The other eight of D-675's sixteen (CreateWindow, DestroyWindow, ShowWindow, HideWindow, SetWindowPosition,
-SetWindowSize, ShowScreen, HideScreen) and ChangeVideoResolution, on the same console.
+The other nine of D-675's sixteen (CreateWindow, DestroyWindow, ShowWindow, HideWindow, SetWindowPosition,
+SetWindowSize, ShowScreen, HideScreen, ChangeVideoResolution), on the same console.
 - **The video chat** is loaded by Load or LoadAsync with a video chat's parameters (D-187's checks), which now keep its
   max_video_windows and max_video_resolution; Unload2 and UnloadAsync2 with VIDEO_CHAT, Unload and UnloadAsync unload it
   and drop its windows and screen. A second load keeps its windows (RPCS3 refuses no second load). Unload answers
