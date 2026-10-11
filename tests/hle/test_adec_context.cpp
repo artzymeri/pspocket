@@ -12,7 +12,6 @@
 
 #include <catch_amalgamated.hpp>
 
-#include <chrono>
 #include <cstring>
 #include <format>
 #include <memory>
@@ -21,6 +20,7 @@
 
 #include "adec_test_util.hpp"
 #include "atrac_writer.hpp"
+#include "guest.hpp" // runtime/hle/src: reservation_op
 #include "hle_test_util.hpp"
 #include "internal.hpp" // runtime/lv2/src (white-box): whether a thread has ended
 #include "pspocket/recomp/ppu/asm.hpp"
@@ -33,14 +33,17 @@ namespace {
 
 constexpr u32 CELL_ADEC_ERROR_ARG = 0x80610003;
 
-// The callback's control block: +0 where to write, +4 how many words, +8 the word written, +0xC the PCMOUTs seen, +0x10
-// whether to hold the thread at PCMOUT, +0x14 released, +0x18 holding.
+// The callback's control block (one 128-byte line): +0 where to write, +4 how many words, +8 the word written, +0xC
+// the PCMOUTs seen, +0x10 whether to hold the thread at PCMOUT, +0x14 released, +0x18 holding. Holding and released
+// change hands through the reservation system (stwcx. and lwarx in the callback, reservation_op and line_word here), so
+// that what each thread wrote before is ordered for the other, ThreadSanitizer included (D-585).
 constexpr u32 kCtl = kData + 0x2000;
 constexpr u32 kFillAt = kCtl, kFillWords = kCtl + 4, kFillWord = kCtl + 8, kPcmOuts = kCtl + 0xC, kHold = kCtl + 0x10,
-              kRelease = kCtl + 0x14, kHolding = kCtl + 0x18;
+              kHolding = kCtl + 0x18;
 
-// The callback (handle r3, msgType r4, msgData r5, cbArg r6 = kCtl). At PCMOUT (1): held while +0x10 asks, sleeping
-// 200 us at a time (sys_timer_usleep), until +0x14; then +4 words from +0 written with +8; then +0xC counted. 0 back.
+// The callback (handle r3, msgType r4, msgData r5, cbArg r6 = kCtl). At PCMOUT (1): held while +0x10 asks (+0x18 set,
+// then sleeping 200 us at a time, sys_timer_usleep, until +0x14); then +4 words from +0 written with +8; then +0xC
+// counted. 0 back.
 void write_overwriting_callback(u8* b)
 {
     as::Assembler a(kCode);
@@ -50,16 +53,20 @@ void write_overwriting_callback(u8* b)
     a.emit(as::lwz(9, 0x10, 6));
     a.emit(as::cmpwi(0, 9, 0));
     a.beq(0, fill);
+    a.emit(as::addi(10, 6, 0x18));
+    const auto set = a.here();
+    a.emit(as::lwarx(9, 0, 10));
     a.emit(as::li(9, 1));
-    a.emit(as::lwsync());
-    a.emit(as::stw(9, 0x18, 6));
+    a.emit(as::stwcx_(9, 0, 10));
+    a.bne(0, set);
     const auto hold = a.here();
     a.emit(as::li(3, 200));
     a.emit(as::li(11, 141)); // sys_timer_usleep
     a.emit(as::sc());
     a.emit(as::lis(6, static_cast<s32>(kCtl >> 16)));
     a.emit(as::ori(6, 6, kCtl & 0xFFFF));
-    a.emit(as::lwz(9, 0x14, 6));
+    a.emit(as::addi(10, 6, 0x14));
+    a.emit(as::lwarx(9, 0, 10));
     a.emit(as::cmpwi(0, 9, 0));
     a.beq(0, hold);
     a.emit(as::isync());
@@ -190,7 +197,7 @@ TEST_CASE("cellAdec: a decoder whose context the game overwrites ends its thread
                 REQUIRE(wait_until([&] { return load32_acquire(b, kPcmOuts) >= 1; }));
                 // The decoder's thread, back at its queue, finds its context gone: it ends (it went round failing calls
                 // for ever, or took the pattern for a command and stopped the process).
-                CHECK(wait_until([&] { return ended(f, thread); }, std::chrono::seconds(10)));
+                CHECK(wait_until([&] { return ended(f, thread); }));
                 // Its context's first word no longer names it: refused, as Sony's libadec refuses it.
                 CHECK(call("cellAdecClose", 0x847D2380, {handle}) == CELL_ADEC_ERROR_ARG);
             }
@@ -215,18 +222,21 @@ TEST_CASE("cellAdec: a decoder's thread that finds another decoder opened in its
             const u32 first_thread = thread_of_core(b, first, c);
             store32_release(b, kHold, 1);
             decode(b, call, first, c.au);
-            REQUIRE(wait_until([&] { return load32_acquire(b, kHolding) != 0; }));
+            REQUIRE(wait_until([&] { return line_word(b, kHolding) != 0; }));
             // Another decoder in the same memory (as a game opens one after a close that was refused): its context in
             // place of the first's, with a queue, mutexes and conditions of its own, and a thread of its own.
             const u32 second = open_decoder(b, call, c);
             REQUIRE(second == first);
             const u32 second_thread = thread_of_core(b, second, c);
             REQUIRE(second_thread != first_thread);
-            store32_release(b, kHold, 0);
-            store32_release(b, kRelease, 1);
+            hle::reservation_op(b, kCtl, [](u8* line) {
+                ps_write32(line, 0x10, 0); // the second decoder's PCMOUT is not held
+                ps_write32(line, 0x14, 1); // released
+                return true;
+            });
             // The first thread, back at the queue now in its memory, ends: it would have taken the second decoder's
             // commands, its sequence or its close (whose join then never returned).
-            REQUIRE(wait_until([&] { return ended(f, first_thread); }, std::chrono::seconds(10)));
+            REQUIRE(wait_until([&] { return ended(f, first_thread); }));
             CHECK(load32_acquire(b, kPcmOuts) == 1);
             // The second decoder whole: its access unit decoded, its PCM taken, closed, its thread joined.
             decode(b, call, second, c.au);
