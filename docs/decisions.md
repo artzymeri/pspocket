@@ -10357,3 +10357,74 @@ crashed, the others differed) is reworked so that what it compares is what a gam
 
 Tests: the four comparisons (hidden, [compare][vdec]); with PSPOCKET_COMPARE_SELF=1 both halves agree and the sanity
 checks hold the values Sony's module gave.
+
+## D-912 (part 2) · 2026-10-11 · cellVdec's DivX 3.11, DivX, MPEG-4, VC-1 and MVC as Sony's libvdec 4.92 decodes them
+
+Read in libvdec and its cores (libdivx311dec, libdivxdec, libsmvd4, libsvc1d, libmvcdec; only what is understood is
+written, runtime/hle/src/vdec_layout.hpp and cellVdec.cpp) and checked by part 1's comparisons: DivX 3.11 0 of 542
+observations differ, MPEG-4 part 2 as DivX and as MPEG-4 0 of 890, VC-1 0 of 437, MVC 0 of 191 (before: a crash, 89,
+84 and 167 differences).
+
+- **Sizes.** Each core's memory query with the codec specific information, reproduced: libdivxdec's (n frame buffers
+  of (lines to 16 + chroma lines to 8 + 48) x (width to 16 + 32), plus 0.5% truncated, plus 0x9E86B, to 16 bytes;
+  level 0 with the size, so the level only bounds it), libdivx311dec's (two frames plus 0x4D800), libsmvd4's (three
+  frames of (lines to 32 + 32) x (width to 16 + 32) x 1.5 + 0x80, 0x80 a macroblock, 0x15380), libsvc1d's (six frames,
+  nine for the main profile, of ((lines to 32 + 128) x (width to 16 + 32) x 1.5 + 256) to 256, two tables per
+  macroblock, fixed parts) and libmvcdec's (libavcdec's algorithm for two views: twice the decoded picture buffer, four
+  more frames, its own blocks, + 0x33700 + 0x4FC100). libvdec adds 0x41580 + 5 x 0x50 + 0xA8 and each codec's part
+  (DivX 0x34F8, DivX 3.11 0x3500, MPEG-4 and VC-1 0x3493, MVC 0x41580 + 0x12FD); QueryAttrEx adds 0x858 and the ring
+  ((information + 0x90) x elements + (elements x 0x14 + 0x14) x 2 + 0x40; 0x20 elements, 0x30 for H.264 and MVC). Every
+  refusal is ARG. RPCS3's max-size tables are the cores' level limits.
+- **Open** refuses memory less than the codec's part (ARG); one byte less than all QueryAttrEx asked opens (D-196).
+  VC-1's simple and main profiles open, as Sony's (pspocket refused them FATAL); their access units are still not
+  decoded (AU error, logged).
+- **The ring.** Each access unit takes the lowest free element at DecodeAu (none free: FATAL). Its picture's item is in
+  the element (+0x40), its information block in the blocks after the elements; libvdec writes them when it announces the
+  picture, and only these bytes: item: codec, start address, size, the number of access units (a byte), the first
+  access unit's PTS, DTS and user data, status, attributes (the rest as a free element has them: start and size 0, PTS
+  and DTS ones, user data 0; the information's address set at open). GetPicture frees the element; an access unit that
+  makes no picture frees it at AUDONE. GetPicItem gives the items in turn.
+- **Frame buffers**, the cores' own: DivX 3.11 two at the core's +0x3D700, DivX three in turn (memory for n; one
+  holds back past two) at +0x76680, MPEG-4 three at the decoder +0x16980, VC-1 six after its per-picture tables, at
+  +0x118A00 + the macroblock table + the block table to 128. Laid out in 16-byte strips (8 Cb, 8 Cr a chroma line), one
+  strip of repeated edge each side and lines of edge above and below: DivX's and MPEG-4's 16 luma and 8 chroma lines,
+  VC-1's 64 and 32 with its lines to 32. The item's start address is the frame's (DivX) or its first luma sample's
+  (MPEG-4, VC-1). A VC-1 skipped picture shows the frame before it again.
+- **A core holds at most so many pictures** (decoded, not yet released by GetPicture: DivX 3.11 2, DivX 3, MPEG-4 3,
+  VC-1 4) and holds the next access unit back (no AUDONE) until the game takes one. pspocket counts the pictures it
+  holds, announced and still inside FFmpeg. Pictures are announced one access unit late, but MPEG-4's at once.
+- **Information blocks**: DivX 3.11's (type, size, frame rate code, frame address, size, 0, 0x30, an error word),
+  DivX's (RPCS3's fields from the VOL as libdivxdec reports them: colour codes 0 without a description; then the frame
+  address, size, 0, 0x30, an error word), MPEG-4's (the VOL's aspect ratio code, pixel sizes, time increment resolution,
+  fixed rate and increment, size; the VOP type; luma, Cb and Cr addresses; the frame's luma lines; 3), VC-1's (the
+  sequence header as read when the picture is announced, the picture's entry point and header fields, the headers its
+  access unit carried, the addresses, the frame's lines, the range mapping), each with the bytes Sony leaves unwritten
+  left. An MPEG-4 VOL and visual object parser (cellVdec.cpp) gives the fields.
+- **The frame rate code**: StartSeq forgets a SetFrameRate made before it (libdivxdec's and libdivx311dec's reset), so
+  it is 0 unless set inside the sequence; for the streams compared the stream's own timing gives 0 too.
+- **VC-1**: libsvc1d leaves range mapping to the game (the flags and values in the information; D-589 applied it: no
+  longer); the picture's size given is the sequence header's as read when it is announced (a 64x48 picture announced
+  after a 32x32 header is given cut to 32x32, its item's size 0x600); an access unit before the headers is done with
+  CELL_VDEC_ERROR_AU in AUDONE's data; decode mode 3 is taken and then refused by the core: ERROR with
+  CELL_VDEC_ERROR_FATAL, then nothing more (no AUDONE, no SEQDONE). FFmpeg's skipped pictures, references to the picture
+  before with its access unit, are given the access unit still owed.
+- **MVC never decodes through cellVdecDecodeAu** on Sony's libvdec 4.92: it converts the information to DecodeAuEx2's
+  layout and its MVC decoder reads that as libmvcdec's chunks (address, size, ...): the size word is 0 and
+  mvcDecAccessUnit answers "bad parameter", FATAL. pspocket refuses it the same way; through DecodeAuEx2 (part 1: no
+  behaviour of Sony's to match) it decodes the base view (D-590), logged. MVC's information past 0x214 bytes is not
+  written (it was H.264's, into the next block).
+- **A picture decoded with errors concealed** (FFmpeg's decode error flags) is reported as Sony's cores report a damaged
+  picture: CELL_VDEC_ERROR_PIC in the PICOUT's data and the item's status, the DivX error word 0x11.
+- **Pictures**: DivX 3.11's samples are within one step of Sony's (2.05% one step off), DivX's and MPEG-4's too (1.15%),
+  none more: the IDCT's rounding, which the standard leaves to the decoder (IEEE 1180), accepted as D-597 set. VC-1's are
+  exact. Frame buffers likewise.
+- **H.264 (unchanged here, test_vdec.cpp)**: its frame buffers no longer have their gaps written (Sony's libavcdec leaves
+  them); their place stays pspocket's, and its information block is still written whole: Sony's leaves bytes of it
+  unwritten (seen through the 0xA5 fill) and places its frames in libavcdec's memory, which test_vdec.cpp does not
+  compare. To do with H.264's own comparison.
+
+Tests: tests/hle/test_vdec_codecs.cpp rewritten to these behaviours (Sony's sizes, the information blocks, MPEG-4 without
+lag, VC-1 without range mapping and cut to the sequence header, mode 3's ERROR, the simple and main profiles opening, MVC
+refused through DecodeAu and decoded through DecodeAuEx2); vdec_test_util.hpp's decode_stream takes the pictures as a
+game does. The four comparisons with the firmware: 0 differences each; test_vdec.cpp's H.264 comparison and the codec
+cores' version queries pass.

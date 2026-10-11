@@ -2,20 +2,24 @@
 // MPEG-2 and MPEG-4 part 2 (as in DivX) decode with FFmpeg as in RPCS3 (rpcs3/Emu/Cell/Modules/cellVdec.cpp: the
 // sequence states, the commands, the checks of each call, the picture formats). DivX 3.11 (D-588), VC-1's advanced
 // profile (D-589) and MVC's base view (D-590), which RPCS3 does not decode, go the same way. What a game sees follows
-// Sony's libvdec 4.92 as it ran over synthetic H.264 in tests/hle/test_vdec.cpp (D-195), where it differs from RPCS3's:
+// Sony's libvdec 4.92 and its codec cores, compared call for call (tests/hle/test_vdec.cpp for H.264, D-195;
+// tests/hle/test_vdec_codecs_compare.cpp for DivX 3.11, DivX, MPEG-4, VC-1 and MVC, D-912), where it differs from
+// RPCS3's:
 //
-// - Sizes: cellVdecQueryAttr gives Sony's. For H.264 the decoder's memory comes from libavcdec's avcDecQueryMemory,
-//   reconstructed (avc_memory below: Sony's answers in every case tried); for the other codecs, Sony's answers for each
-//   level. RPCS3's codec memory queries are TODOs.
+// - Sizes: cellVdecQueryAttr gives Sony's: each codec core's memory query (H.264's avc_memory below, libavcdec's;
+//   the others in vdec_layout.hpp, with the codec specific information), plus libvdec's own parts and ring. A decoder
+//   opens with at least the codec's part of it (vdec_layout.hpp). RPCS3's codec memory queries call Sony's cores.
 // - The handle is the address of the decoder's memory, as Sony's (RPCS3: an ID).
-// - Pictures are announced one access unit late: after an access unit's AUDONE come the PICOUTs of the pictures the
-//   earlier access units made; the last ones when the sequence ends, before SEQDONE.
-// - Picture items (CellVdecPicItem) and the H.264 information (CellVdecAvcInfo, 0x244 bytes as Sony's: RPCS3's
-//   structure stops at 0x138) are rings in the decoder's memory at Sony's places (items at +0xDC, 0x90 apart; the
-//   information at +0x1B9C, 0x244 apart). The H.264 information comes from the stream (SPS, PPS, the NAL units of the
-//   access unit), as Sony's; RPCS3 writes fixed guesses.
-// - An item's start address is the picture in a frame buffer laid out as Sony's: 16-byte-wide strips of luma, then
-//   of chroma (8 Cb then 8 Cr a row), two strips of repeated edge on each side (RPCS3: 0x123).
+// - The ring (vdec_layout.hpp): each access unit takes the lowest free element of libvdec's ring at DecodeAu; its
+//   picture's item (CellVdecPicItem) is in the element and its information block in the ring of blocks after them,
+//   written when the picture is announced, only the bytes Sony's libvdec writes. GetPicture frees the element.
+// - Pictures are announced one access unit late (H.264, DivX, DivX 3.11, VC-1) or at once (MPEG-4): after an access
+//   unit's AUDONE come the PICOUTs; the last ones when the sequence ends, before SEQDONE.
+// - Frame buffers: DivX's, DivX 3.11's, MPEG-4's and VC-1's are the cores' own, at their places, used in turn, laid
+//   out in strips with edges; a core holds at most so many pictures (decoded, not yet released by GetPicture) before
+//   it holds the next access unit back (no AUDONE until the game takes one). H.264's frame buffer is laid out as
+//   Sony's (16-byte strips of luma, then of chroma, two strips of repeated edge each side; RPCS3: 0x123); its place is
+//   pspocket's own.
 // - Pictures to RGBA and ARGB use the colour matrix asked for (BT.601 or BT.709, limited range; RPCS3: a TODO), with
 //   the exact coefficients, truncated: within one step of Sony's values. UYVY repeats each chroma row, as Sony's.
 //
@@ -23,10 +27,10 @@
 // compare them with: they are unverified (D-594), so a game importing one still gets Sony's whole libvdec where the
 // system software is installed.
 //
-// Not yet (each fails loudly): VC-1's simple and main profiles (their sequence header travels outside the stream, and
-// how libsvc1d is given it is not known: open fails, logged), MVC's views past the base one (FFmpeg has no MVC
-// decoder: their NAL units are left out, logged once), the codec specific information of codecs other than H.264 in
-// the sizes (Sony's answer without it is given, and logged; DivX 3.11's is checked and gives the frame size).
+// Not yet (each fails loudly): VC-1's simple and main profiles (they open, as Sony's, but their access units are not
+// decoded: how libsvc1d is given their sequence header is not known, logged), MVC's views past the base one (FFmpeg
+// has no MVC decoder; and Sony's libvdec 4.92 decodes MVC neither through DecodeAu, refused, nor soundly through
+// DecodeAuEx2, D-912), the codec specific information of MPEG-2 and JVT in the sizes (Sony's answer without it, logged).
 
 #include <algorithm>
 #include <array>
@@ -39,6 +43,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -61,6 +66,7 @@ extern "C" {
 }
 #include "vdec_hw.hpp"
 #endif
+#include "vdec_layout.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -91,15 +97,11 @@ enum : u32 {
     CODEC_MVC2 = 13,
     CODEC_MAX = 14,
 };
-constexpr s32 MSG_AUDONE = 0, MSG_PICOUT = 1, MSG_SEQDONE = 2;
+constexpr s32 MSG_AUDONE = 0, MSG_PICOUT = 1, MSG_SEQDONE = 2, MSG_ERROR = 3;
 constexpr s32 DEC_MODE_NORMAL = 0, DEC_MODE_B_SKIP = 1, DEC_MODE_PB_SKIP = 2;
 constexpr u32 PICFMT_RGBA32 = 1, PICFMT_UYVY422 = 2, PICFMT_YUV420_PLANAR = 3;
 constexpr u32 AVC_LEVEL_UNK = 1042; // 4.2 with the deblocking filter off
 constexpr u32 kVersionUpper = 0x4920000;
-// DivX 3.11's frames carry no size (an AVI file's header does): RPCS3's default for its decoder (query_attr_divx,
-// DivxDecParams), the largest it takes through CellVdecDivxSpecificInfo2, and that structure's size (D-588).
-constexpr u32 kDivx311Width = 720, kDivx311Height = 576, kDivx311MaxWidth = 1920, kDivx311MaxHeight = 1088;
-constexpr u32 kDivxSpecificInfo2Size = 12;
 constexpr u32 VC1_AP_L0 = 5; // CELL_VDEC_VC1_AP_L0: the levels below are the simple and main profiles' (D-589)
 
 // ---- sizes
@@ -167,29 +169,17 @@ std::optional<u32> avc_memory(u32 level, u32 disable_deblocking, u32 buffers, u3
     return size;
 }
 
-// Sony's answers (libvdec 4.92, test_vdec.cpp's probe) for the codecs whose memory query is not reproduced: the
-// memory for each level without codec specific information.
+// Sony's answers (libvdec 4.92, test_vdec.cpp's probe) for MPEG-2 and JVT, whose memory queries are not reproduced:
+// the memory for each level without codec specific information.
 struct LevelSize {
     u32 codec, level, mem_size;
 };
 constexpr LevelSize kLevelSizes[] = {
     {CODEC_MPEG2, 0, 0x11290B}, {CODEC_MPEG2, 1, 0x2DFB8B}, {CODEC_MPEG2, 2, 0xA0270B}, {CODEC_MPEG2, 3, 0xD2F40B},
-    {CODEC_MPEG4, 0, 0x8B78B}, {CODEC_MPEG4, 1, 0xEFE0B}, {CODEC_MPEG4, 2, 0xEFE0B}, {CODEC_MPEG4, 3, 0x22DB0B},
-    {CODEC_MPEG4, 4, 0x1FC00B}, {CODEC_MPEG4, 5, 0x28570B},
-    {CODEC_VC1, 0, 0x1FDEFB}, {CODEC_VC1, 1, 0x3298FB}, {CODEC_VC1, 2, 0x3D93FB}, {CODEC_VC1, 3, 0x9E383B},
-    {CODEC_VC1, 4, 0x287197B}, {CODEC_VC1, 5, 0x3298FB}, {CODEC_VC1, 6, 0x79DB3B}, {CODEC_VC1, 7, 0x12073FB},
-    {CODEC_VC1, 8, 0x202887B}, {CODEC_VC1, 9, 0x3949A7B},
-    {CODEC_DIVX, 10, 0x11B720}, {CODEC_DIVX, 11, 0x19A740}, {CODEC_DIVX, 12, 0x386A60}, {CODEC_DIVX, 13, 0x692070},
-    {CODEC_DIVX, 14, 0xD78100},
     {CODEC_JVT, 10, 0x336DDB}, {CODEC_JVT, 11, 0x73675B}, {CODEC_JVT, 12, 0x73675B}, {CODEC_JVT, 13, 0x73675B},
     {CODEC_JVT, 20, 0x73675B}, {CODEC_JVT, 21, 0xC6CB5B}, {CODEC_JVT, 22, 0x175A75B}, {CODEC_JVT, 30, 0x175A75B},
     {CODEC_JVT, 31, 0x31FBCDB}, {CODEC_JVT, 32, 0x444FDDB}, {CODEC_JVT, 40, 0x6B4D7DB}, {CODEC_JVT, 41, 0x6B4D7DB},
     {CODEC_JVT, 42, 0x6B4D7DB},
-    {CODEC_DIVX3_11, 15, 0x1E3578},
-    {CODEC_MVC, 10, 0xA2E0FD}, {CODEC_MVC, 11, 0xC37A7D}, {CODEC_MVC, 12, 0xE9047D}, {CODEC_MVC, 13, 0xEBE47D},
-    {CODEC_MVC, 20, 0xEBE47D}, {CODEC_MVC, 21, 0x143CAFD}, {CODEC_MVC, 22, 0x1B058FD}, {CODEC_MVC, 30, 0x1BA3EFD},
-    {CODEC_MVC, 31, 0x2911E7D}, {CODEC_MVC, 32, 0x3253E7D}, {CODEC_MVC, 40, 0x48CA47D}, {CODEC_MVC, 41, 0x48CA47D},
-    {CODEC_MVC, 42, 0x48CA47D}, {CODEC_MVC, AVC_LEVEL_UNK, 0x48CA47D},
 };
 
 u32 version_lower(u32 codec)
@@ -225,12 +215,17 @@ u32 avc_old_sdk_size(u32 level)
 }
 
 struct Attr {
-    u32 mem_size = 0;
+    u32 mem_size = 0;   // what QueryAttrEx answers
+    u32 codec_part = 0; // the codec's part of it: a decoder opens with at least this (Sony's libvdec checks it)
     u8 cmd_depth = 4;
     u32 version = 0;
+    vdec::Sizing sizing; // what the codec's frame buffers are sized for (D-912)
 };
 
-// cellVdecQueryAttrEx's answer for a codec, level and codec specific information (0: none), or an error.
+// cellVdecQueryAttrEx's answer for a codec, level and codec specific information (0: none), or an error. Sony's
+// libvdec asks the codec's core for its memory (with the codec specific information where given), adds its own parts
+// (kSpursPart and each codec's), then QueryAttrEx adds kQuery and the ring (D-912). Every refusal is ARG, as libvdec
+// answers it whatever the core said.
 s32 query_attr(PPUContext& ctx, u32 codec, u32 level, u32 spec, Attr& out)
 {
     u8* base = guest_base(ctx);
@@ -238,6 +233,8 @@ s32 query_attr(PPUContext& ctx, u32 codec, u32 level, u32 spec, Attr& out)
     if (!valid_codec) return error(CELL_VDEC_ERROR_ARG);
     out.version = version_lower(codec);
     const bool new_sdk = thread_of(ctx).kernel.config().sdk_version >= 0x210000;
+    const vdec::Ring ring = vdec::ring_of(codec);
+    const bool readable = spec && guest_readable(thread_of(ctx), spec, 12);
     if (codec == CODEC_AVC) {
         u32 lv = level, deblock_off = 0, buffers = 0, w = 0, h = 0;
         if (level == AVC_LEVEL_UNK) {
@@ -245,7 +242,7 @@ s32 query_attr(PPUContext& ctx, u32 codec, u32 level, u32 spec, Attr& out)
             deblock_off = 1;
         }
         if (spec) {
-            if (!guest_readable(thread_of(ctx), spec, 10) || ps_read32(base, spec) != 12) return error(CELL_VDEC_ERROR_ARG);
+            if (!readable || ps_read32(base, spec) != 12) return error(CELL_VDEC_ERROR_ARG);
             const u32 sw = ps_read16(base, spec + 4), sh = ps_read16(base, spec + 6);
             deblock_off = ps_read8(base, spec + 8);
             buffers = ps_read8(base, spec + 9);
@@ -256,27 +253,34 @@ s32 query_attr(PPUContext& ctx, u32 codec, u32 level, u32 spec, Attr& out)
         }
         const std::optional<u32> mem = avc_memory(lv, deblock_off, buffers, w, h);
         if (!mem) return error(CELL_VDEC_ERROR_ARG);
-        const u32 decoder = 0x41580 + *mem + 0x89FD;
-        const u32 unk = (0x244 + 0x90) * 0x30 + (0x30 * 0x14 + 0x14) * 2 + 0x40; // libvdec's own (RPCS3 get_unk_size)
-        out.mem_size = new_sdk ? decoder + 0x858 + unk : avc_old_sdk_size(lv);
+        out.codec_part = 0x41580 + *mem + 0x89FD;
+        out.mem_size = new_sdk ? out.codec_part + vdec::kQuery + vdec::ring_bytes(ring) : avc_old_sdk_size(lv);
         return lv2::CELL_OK;
     }
-    const auto it = std::find_if(std::begin(kLevelSizes), std::end(kLevelSizes), [&](const LevelSize& s) {
-        return (s.codec == codec || (codec == CODEC_MVC2 && s.codec == CODEC_MVC)) && s.level == level;
-    });
-    if (it == std::end(kLevelSizes)) return error(CELL_VDEC_ERROR_ARG);
-    if (spec && codec == CODEC_DIVX3_11) {
-        // CellVdecDivxSpecificInfo2 (RPCS3 cellVdec.h: thisSize, maxDecodedFrameWidth, maxDecodedFrameHeight,
-        // numberOfDecodedFrameBuffer), the only form DivX 3.11 takes, checked as RPCS3's query_attr_divx checks it.
-        if (!guest_readable(thread_of(ctx), spec, 10) || ps_read32(base, spec) != kDivxSpecificInfo2Size ||
-            ps_read16(base, spec + 4) > kDivx311MaxWidth || ps_read16(base, spec + 6) > kDivx311MaxHeight ||
-            (ps_read16(base, spec + 8) != 0 && ps_read16(base, spec + 8) != 2))
-            return error(CELL_VDEC_ERROR_ARG);
+    if (codec == CODEC_MPEG2 || codec == CODEC_JVT) {
+        // Sony's answers for each level (the codec specific information is not reproduced for these, logged).
+        const auto it = std::find_if(std::begin(kLevelSizes), std::end(kLevelSizes),
+            [&](const LevelSize& s) { return s.codec == codec && s.level == level; });
+        if (it == std::end(kLevelSizes)) return error(CELL_VDEC_ERROR_ARG);
+        if (spec)
+            PS_LOG_WARN(kChan, "cellVdecQueryAttr: codec {} specific information ({:#x}) is not reproduced; Sony's size "
+                               "without it is given", codec, spec);
+        out.mem_size = it->mem_size;
+        out.codec_part = it->mem_size - vdec::kQuery - vdec::ring_bytes(ring);
+        return lv2::CELL_OK;
     }
-    if (spec)
-        PS_LOG_WARN(kChan, "cellVdecQueryAttr: codec {} specific information ({:#x}) is not reproduced; Sony's size "
-                           "without it is given", codec, spec);
-    out.mem_size = it->mem_size;
+    vdec::Sizing s;
+    switch (codec) {
+    case CODEC_MPEG4: s = vdec::mpeg4_sizing(base, level, spec, readable); break;
+    case CODEC_VC1: s = vdec::vc1_sizing(base, level, spec, readable); break;
+    case CODEC_DIVX: s = vdec::divx_sizing(base, level, spec, readable); break;
+    case CODEC_DIVX3_11: s = vdec::divx311_sizing(base, level, spec, readable); break;
+    default: s = vdec::mvc_sizing(base, level, spec, readable); break; // MVC, MVC2
+    }
+    if (s.fail != vdec::Fail::none) return error(CELL_VDEC_ERROR_ARG);
+    out.sizing = s;
+    out.codec_part = s.codec_part;
+    out.mem_size = s.codec_part + vdec::kQuery + vdec::ring_bytes(ring);
     return lv2::CELL_OK;
 }
 
@@ -581,6 +585,7 @@ struct Vc1Sequence {
     u8 level = 0;
     u16 max_coded_width = 0, max_coded_height = 0;
     bool pulldown = false, interlace = false, tfcntrflag = false, psf = false, display_ext = false;
+    bool postprocflag = false, finterpflag = false, aspect_ratio_flag = false;
     u16 display_width = 0, display_height = 0, aspect_width = 0, aspect_height = 0, framerate_exp = 0;
     u8 aspect_ratio = 0, framerate_nr = 0, framerate_dr = 0;
     bool framerate_flag = false, framerate_ind = false, color_format_flag = false;
@@ -612,6 +617,7 @@ struct Vc1Headers {
     Vc1Entry entry;
     Vc1Picture pic;
     std::vector<u8> seq_bdu, entry_bdu;
+    u32 units = 0; // the access unit's own: a sequence header 1, an entry point 2, a frame 4
 };
 
 // An advanced profile sequence header's payload; false for another profile's (the simple and main profiles have no
@@ -623,20 +629,22 @@ bool parse_vc1_sequence(std::span<const u8> payload, Vc1Sequence& s)
     if (b.bits(2) != 3) return false; // PROFILE: advanced
     s.level = static_cast<u8>(b.bits(3));
     b.bits(2);         // COLORDIFF_FORMAT
-    b.bits(3 + 5 + 1); // FRMRTQ_POSTPROC, BITRTQ_POSTPROC, POSTPROCFLAG
+    b.bits(3 + 5); // FRMRTQ_POSTPROC, BITRTQ_POSTPROC
+    s.postprocflag = b.bit();
     s.max_coded_width = static_cast<u16>((b.bits(12) + 1) * 2);
     s.max_coded_height = static_cast<u16>((b.bits(12) + 1) * 2);
     s.pulldown = b.bit();
     s.interlace = b.bit();
     s.tfcntrflag = b.bit();
-    b.bit(); // FINTERPFLAG
+    s.finterpflag = b.bit();
     b.bit(); // reserved
     s.psf = b.bit();
     s.display_ext = b.bit();
     if (s.display_ext) {
         s.display_width = static_cast<u16>(b.bits(14) + 1);
         s.display_height = static_cast<u16>(b.bits(14) + 1);
-        if (b.bit()) { // ASPECT_RATIO_FLAG
+        s.aspect_ratio_flag = b.bit();
+        if (s.aspect_ratio_flag) {
             s.aspect_ratio = static_cast<u8>(b.bits(4));
             if (s.aspect_ratio == 15) {
                 s.aspect_width = static_cast<u16>(b.bits(8) + 1);
@@ -717,8 +725,9 @@ void parse_vc1_picture(std::span<const u8> payload, const Vc1Sequence& s, Vc1Pic
 // An access unit's BDUs in order: a sequence header or entry point becomes the decoder's (with its bytes, less the
 // zeros before the next start code), a frame's header the access unit's picture. A sequence header of another
 // profile than the advanced one is not taken (`other_profile`).
-void scan_vc1_au(std::span<const u8> au, Vc1Headers& state, Vc1Picture& pic, bool& other_profile)
+void scan_vc1_au(std::span<const u8> au, Vc1Headers& state, Vc1Picture& pic, bool& other_profile, u32& units)
 {
+    units = 0;
     usize i = next_start_code(au, 0);
     while (i + 4 <= au.size()) {
         const usize next = next_start_code(au, i + 4); // after the start code's suffix
@@ -727,6 +736,7 @@ void scan_vc1_au(std::span<const u8> au, Vc1Headers& state, Vc1Picture& pic, boo
         const std::span<const u8> bdu = au.subspan(i, end - i), payload = bdu.subspan(4);
         switch (au[i + 3]) {
         case 0x0F: { // sequence header
+            units |= 1;
             Vc1Sequence s;
             if (parse_vc1_sequence(payload, s)) {
                 state.seq = s;
@@ -738,12 +748,14 @@ void scan_vc1_au(std::span<const u8> au, Vc1Headers& state, Vc1Picture& pic, boo
             break;
         }
         case 0x0E: // entry point
+            units |= 2;
             if (Vc1Entry e; !state.seq_bdu.empty() && parse_vc1_entry(payload, state.seq, e)) {
                 state.entry = e;
                 state.entry_bdu.assign(bdu.begin(), bdu.end());
             }
             break;
         case 0x0D: // frame
+            units |= 4;
             if (!state.seq_bdu.empty()) parse_vc1_picture(payload, state.seq, pic);
             break;
         default: break; // fields, slices, user data, the end of a sequence
@@ -752,37 +764,126 @@ void scan_vc1_au(std::span<const u8> au, Vc1Headers& state, Vc1Picture& pic, boo
     }
 }
 
+// ---- MPEG-4 part 2 (ISO/IEC 14496-2): what CellVdecMpeg4Info and CellVdecDivxInfo report of the stream's headers
+
+// The visual object's video signal type and the video object layer's fields Sony's information blocks report (D-912).
+struct Mpeg4Vol {
+    bool valid = false;
+    u8 aspect_ratio_info = 1, par_width = 0, par_height = 0;
+    u16 time_increment_resolution = 0, fixed_vop_time_increment = 0, width = 0, height = 0;
+    bool fixed_vop_rate = false, interlaced = false;
+    bool colour_description = false;
+    u8 colour_primaries = 0, transfer_characteristics = 0, matrix_coefficients = 0;
+};
+
+// The visual object header (start code 0xB5): its video signal type, when it is a video object.
+void parse_mpeg4_visual_object(std::span<const u8> payload, Mpeg4Vol& v)
+{
+    Bits b(std::vector<u8>(payload.begin(), payload.end()));
+    if (b.bit()) b.bits(4 + 3); // is_visual_object_identifier: verid, priority
+    if (b.bits(4) != 1) return; // visual_object_type: video ID
+    v.colour_description = false;
+    if (b.bit()) {                     // video_signal_type
+        b.bits(3 + 1);                 // video_format, video_range
+        v.colour_description = b.bit(); // colour_description
+        if (v.colour_description) {
+            v.colour_primaries = static_cast<u8>(b.bits(8));
+            v.transfer_characteristics = static_cast<u8>(b.bits(8));
+            v.matrix_coefficients = static_cast<u8>(b.bits(8));
+        }
+    }
+}
+
+// A video object layer header (start codes 0x20 to 0x2F) of a rectangular layer.
+void parse_mpeg4_vol(std::span<const u8> payload, Mpeg4Vol& v)
+{
+    Bits b(std::vector<u8>(payload.begin(), payload.end()));
+    b.bit();   // random_accessible_vol
+    b.bits(8); // video_object_type_indication
+    u32 verid = 1;
+    if (b.bit()) { // is_object_layer_identifier
+        verid = b.bits(4);
+        b.bits(3);
+    }
+    v.aspect_ratio_info = static_cast<u8>(b.bits(4));
+    v.par_width = v.par_height = 0;
+    if (v.aspect_ratio_info == 15) { // extended PAR
+        v.par_width = static_cast<u8>(b.bits(8));
+        v.par_height = static_cast<u8>(b.bits(8));
+    }
+    if (b.bit()) {                                                        // vol_control_parameters
+        b.bits(2 + 1);                                                    // chroma_format, low_delay
+        if (b.bit()) b.bits(15 + 1 + 15 + 1 + 15 + 1 + 3 + 11 + 1 + 15 + 1); // vbv_parameters
+    }
+    const u32 shape = b.bits(2);
+    if (shape == 3 && verid != 1) b.bits(4);
+    b.bit(); // marker
+    v.time_increment_resolution = static_cast<u16>(b.bits(16));
+    b.bit(); // marker
+    v.fixed_vop_rate = b.bit();
+    v.fixed_vop_time_increment = 0;
+    if (v.fixed_vop_rate) {
+        u32 bits = 1;
+        while (bits < 16 && (1u << bits) < v.time_increment_resolution) bits++;
+        v.fixed_vop_time_increment = static_cast<u16>(b.bits(bits));
+    }
+    if (shape != 0) return; // not rectangular: no size
+    b.bit();
+    v.width = static_cast<u16>(b.bits(13));
+    b.bit();
+    v.height = static_cast<u16>(b.bits(13));
+    b.bit();
+    v.interlaced = b.bit();
+    v.valid = !b.over();
+}
+
+// An access unit's headers: the visual object and video object layer in force afterwards.
+void scan_mpeg4_au(std::span<const u8> au, Mpeg4Vol& v)
+{
+    for (usize i = next_start_code(au, 0); i + 4 <= au.size(); i = next_start_code(au, i + 4)) {
+        const u8 code = au[i + 3];
+        const usize end = next_start_code(au, i + 4);
+        const std::span<const u8> payload = au.subspan(i + 4, end - (i + 4));
+        if (code == 0xB5) parse_mpeg4_visual_object(payload, v);
+        else if (code >= 0x20 && code <= 0x2F) parse_mpeg4_vol(payload, v);
+    }
+}
+
 // ---- the decoder
 
-// Sony's places in the decoder's memory (handle = its address): picture items, H.264 information, then pspocket's
-// frame buffers (Sony's layout; their place is pspocket's own).
-constexpr u32 kItems = 0xDC, kItemStride = 0x90, kItemSize = 0x4C, kInfos = 0x1B9C, kInfoStride = 0x244, kRing = 16;
-constexpr u32 kFrames = (kInfos + kRing * kInfoStride + 0x7F) & ~0x7Fu;
-constexpr u32 kOutMax = 60; // decoded pictures the game has not taken (RPCS3 out_max)
+constexpr u32 kOutMax = 60;    // decoded pictures the game has not taken (RPCS3 out_max)
+constexpr u32 kOwnFrames = 16; // H.264's and MPEG-2's frame buffers: pspocket's own count and place (D-196)
 
 enum class Seq : u32 { closed, dormant, ready, ending, resetting };
 
 struct AuMeta {
     u64 index = 0, seq = 0;
+    u32 slot = 0; // the ring element it holds (Sony's: the lowest free one at DecodeAu, D-912)
     u32 pts_upper = 0, pts_lower = 0, dts_upper = 0, dts_lower = 0;
     u64 user_data = 0;
     s32 attr = 0;
     AvcAuInfo avc;
     AvcSps sps;
     Vc1Headers vc1;
+    Mpeg4Vol vol;
 };
 
 struct Picture {
     u64 seq = 0;
-    u64 au = 0; // the access unit it came from
-    u32 number = 0; // pictures before it in the decoder's life: its ring slot
+    u64 au = 0;     // the access unit it came from
+    u32 number = 0; // pictures before it in the decoder's life
     u32 width = 0, height = 0;
     int pict_type = 0;
     std::vector<u8> y, u, v; // planar 4:2:0, no padding
     AuMeta meta;
     bool item_taken = false;
-    // What FFmpeg reports of the stream with the picture (CellVdecDivxInfo): the pixel aspect ratio (0/0: none), the
-    // colour description (ISO/IEC 23001-8 codes, as MPEG-4's; 2: unspecified), the field order and the frame rate.
+    u32 frame = 0, start = 0; // its frame buffer and the item's start address in it
+    bool damaged = false;     // the decoder concealed errors in it (the PICOUT's error, CELL_VDEC_ERROR_PIC)
+    // The size libvdec gives the game (the item's size, GetPicture's picture): the picture's own, but VC-1's is the
+    // sequence header's as the decoder has read it when the picture is announced (the picture cut to it, D-912).
+    u32 out_width = 0, out_height = 0;
+    // What FFmpeg reports of the stream with the picture: the pixel aspect ratio (0/0: none), the colour description
+    // (ISO/IEC 23001-8 codes; 2: unspecified), the field order and the frame rate.
     s32 sar_num = 0, sar_den = 0;
     u8 primaries = 2, transfer = 2, matrix = 2;
     bool interlaced = false, top_field_first = false;
@@ -817,15 +918,29 @@ struct Vdec {
     u64 seq = 0, next_au = 0;
     u32 pending_aus = 0; // DecodeAu accepted, AUDONE not yet sent (Sony's command depth)
     std::deque<Command> commands;
-    lv2::WaitQueue waiters; // the decoder's thread, waiting for a command
-    std::deque<Picture> held, out; // decoded but not announced; announced, for the game
-    u32 pictures = 0, frames = 0, frame_size = 0, frame_width = 0, frame_height = 0;
-    u32 frame_rate = 0; // cellVdecSetFrameRate's: set on the decoder's thread, under m
+    lv2::WaitQueue waiters;        // the decoder's thread, waiting for a command or a picture released
+    std::deque<Picture> held, out; // decoded but not announced; announced, not yet released by GetPicture
+    u32 pictures = 0;
+    vdec::Ring ring;
+    vdec::Plan plan;
+    vdec::Sizing sizing;
+    std::vector<u8> slots; // the ring's elements in use (under m)
+    u32 next_frame = 0;    // the frame buffer the next picture takes (Plan::frames; the decoder's thread)
+    u32 last_frame = 0, last_start = 0; // the last picture's (a VC-1 skipped picture shows it again)
+    bool have_last = false;
+    u32 own_frame_size = 0, own_frames = 0, own_width = 0, own_height = 0; // pspocket's own frames (Plan::frames 0)
+    u32 frame_rate = 0; // cellVdecSetFrameRate's code (H.264's 0 to 7), set on the decoder's thread, under m
+    u32 seq_frame_rate = 0; // DivX's and DivX 3.11's: SetFrameRate's code during the sequence (StartSeq clears it)
+    bool dead = false;      // a fatal error reported (ERROR): the decoder does nothing more but Close (D-912)
     u64 thread_id = 0;
     u32 tls = 0;
     AvcSps sps;
-    u32 divx_width = kDivx311Width, divx_height = kDivx311Height; // DivX 3.11's frame size (the stream has none)
+    Mpeg4Vol vol;                  // MPEG-4's headers in force (DecodeAu's, under m)
+    u32 divx_width = 720, divx_height = 576; // DivX 3.11's frame size (the stream has none)
     Vc1Headers vc1;                // VC-1's sequence header and entry point in force (DecodeAu's, under m)
+    Vc1Headers vc1_current;        // the headers as the decoder has read them (the decoder's thread)
+    std::set<u64> produced;        // the access units that have given a picture (the decoder's thread)
+    std::set<u64> awaiting;        // the access units FFmpeg has and has not given a picture of yet (under m)
     std::vector<u8> vc1_opened;    // the sequence header FFmpeg's decoder was opened with (the decoder's thread)
     bool vc1_skip_logged = false;  // the decoder's thread
     bool vc1_other_logged = false; // under m
@@ -884,19 +999,26 @@ void push_command(Vdec& v, Command c)
     for (lv2::Waiter* w : v.waiters.take_all(lv2::SYS_SYNC_FIFO)) lv2::wake(*w, lv2::CELL_OK);
 }
 
-void callback(PPUContext& ctx, const Vdec& v, s32 type)
+void callback(PPUContext& ctx, const Vdec& v, s32 type, u32 data = 0)
 {
-    call_guest(ctx, v.cb_func, {v.handle, static_cast<u64>(static_cast<u32>(type)), 0, v.cb_arg});
+    call_guest(ctx, v.cb_func, {v.handle, static_cast<u64>(static_cast<u32>(type)), data, v.cb_arg});
 }
 
-// Sony's frame buffer layout for a picture (luma, then chroma): 16-byte strips, two of repeated edge on each side.
-u32 frame_size(u32 width, u32 height)
+// Wakes the decoder's thread (a command queued, a picture released: an access unit held back may go on). Under v.m.
+void wake_decoder(Vdec& v)
+{
+    for (lv2::Waiter* w : v.waiters.take_all(lv2::SYS_SYNC_FIFO)) lv2::wake(*w, lv2::CELL_OK);
+}
+
+// H.264's frame buffer layout (D-196): 16-byte strips, two of repeated edge on each side, luma, a gap of 0x400 bytes,
+// chroma (8 Cb then 8 Cr a line), a gap. Sony's libavcdec leaves the gaps as they were (D-912).
+u32 avc_frame_size(u32 width, u32 height)
 {
     const u32 strips = (width + 15) / 16 + 4;
     return strips * 16 * height + 0x400 + strips * 16 * (height / 2) + 0x400;
 }
 
-void write_frame(u8* base, u32 at, const Picture& p)
+void write_avc_frame(u8* base, u32 at, const Picture& p)
 {
     const u32 strips = (p.width + 15) / 16 + 4, cw = p.width / 2, ch = p.height / 2;
     for (u32 s = 0; s < strips; s++) {
@@ -907,9 +1029,7 @@ void write_frame(u8* base, u32 at, const Picture& p)
             }
         }
     }
-    const u32 luma_end = strips * 16 * p.height;
-    std::memset(base + at + luma_end, 0, 0x400);
-    const u32 chroma = at + luma_end + 0x400;
+    const u32 chroma = at + strips * 16 * p.height + 0x400;
     for (u32 s = 0; s < strips; s++) {
         for (u32 row = 0; row < ch; row++) {
             for (u32 k = 0; k < 8; k++) {
@@ -919,7 +1039,41 @@ void write_frame(u8* base, u32 at, const Picture& p)
             }
         }
     }
-    std::memset(base + chroma + strips * 16 * ch, 0, 0x400);
+}
+
+// A picture decoded: the frame buffer it takes and its contents there (the decoder's thread). A core with its own
+// frame buffers (Plan::frames) takes them in turn; a VC-1 skipped picture shows the frame before it again. H.264's and
+// MPEG-2's are pspocket's own (D-196): as many of the picture's size as fit after the ring, at most 16.
+void place_picture(u8* base, Vdec& v, Picture& p)
+{
+    const vdec::Plan& plan = v.plan;
+    if (plan.frames) {
+        if (v.codec == CODEC_VC1 && v.have_last && p.meta.vc1.pic.type[0] == VC1_PCT_SKIPPED) {
+            p.frame = v.last_frame;
+            p.start = v.last_start;
+            return;
+        }
+        p.frame = plan.frame0 + v.next_frame * plan.frame_bytes;
+        v.next_frame = (v.next_frame + 1) % plan.frames;
+        p.start = plan.start_inside ? p.frame + vdec::strip_start(plan, p.height) : p.frame;
+        vdec::write_strips(base, p.frame, plan, p.width, p.height, p.y.data(), p.u.data(), p.v.data());
+    } else {
+        const u32 first = vdec::align(vdec::codec_memory(v.handle, v.ring), 128);
+        if (p.width != v.own_width || p.height != v.own_height) {
+            v.own_width = p.width;
+            v.own_height = p.height;
+            v.own_frame_size = vdec::align(avc_frame_size(p.width, p.height), 128);
+            v.own_frames = v.mem_size > first - v.handle
+                               ? std::min<u32>(kOwnFrames, (v.mem_size - (first - v.handle)) / v.own_frame_size)
+                               : 0;
+        }
+        if (!v.own_frames) return;
+        p.frame = p.start = first + (p.number % v.own_frames) * v.own_frame_size;
+        write_avc_frame(base, p.frame, p);
+    }
+    v.last_frame = p.frame;
+    v.last_start = p.start;
+    v.have_last = true;
 }
 
 #if PSPOCKET_HAVE_FFMPEG
@@ -972,22 +1126,33 @@ bool open_ffmpeg(Vdec& v, std::string_view call, std::span<const u8> extradata =
     return true;
 }
 
-// VC-1's range mapping of a plane (the entry point's RANGE_MAPY or RANGE_MAPUV): the samples scaled about 128 by
-// (R + 9) / 8. FFmpeg leaves it out ("expect wrong picture"), so pspocket maps the pictures it gives the game; the
-// decoder's references stay as decoded (D-589).
-void vc1_range_map(std::vector<u8>& plane, u8 r)
-{
-    for (u8& s : plane) s = static_cast<u8>(std::clamp((((s - 128) * (r + 9) + 4) >> 3) + 128, 0, 255));
-}
-
-// The pictures the decoder has ready, with the access units they came from.
-void receive_pictures(Vdec& v, std::map<u64, AuMeta>& in_flight, u64 seq)
+// The pictures the decoder has ready, with the access units they came from: each placed in its frame buffer (the
+// decoder's thread) and held until it is announced.
+void receive_pictures(u8* base, Vdec& v, std::map<u64, AuMeta>& in_flight, u64 seq, std::optional<u64> current = {})
 {
     AVFrame* f = av_frame_alloc();
     while (avcodec_receive_frame(v.av, f) == 0) {
         Picture p;
         p.seq = seq;
         p.au = static_cast<u64>(reinterpret_cast<uintptr_t>(f->opaque));
+        // FFmpeg's VC-1 decoder shows a skipped picture as a new reference to the picture before it, which keeps that
+        // one's access unit: a picture of an access unit that has given one already is the next one's still owed (the
+        // pictures come in decoding order), else the current access unit's.
+        if (current && v.produced.contains(p.au)) {
+            p.au = *current;
+            for (const u64 au : v.awaiting)
+                if (!v.produced.contains(au)) {
+                    p.au = au;
+                    break;
+                }
+        }
+        v.produced.insert(p.au);
+        {
+            // The earlier access units still owed give no picture now (the pictures come in decoding order).
+            std::lock_guard lk(v.m);
+            v.awaiting.erase(v.awaiting.begin(), v.awaiting.upper_bound(p.au));
+        }
+        if (v.produced.size() > 128) v.produced.erase(v.produced.begin());
         if (const auto it = in_flight.find(p.au); it != in_flight.end()) p.meta = it->second;
         p.width = static_cast<u32>(f->width);
         p.height = static_cast<u32>(f->height);
@@ -999,6 +1164,7 @@ void receive_pictures(Vdec& v, std::map<u64, AuMeta>& in_flight, u64 seq)
         p.matrix = static_cast<u8>(f->colorspace);
         p.interlaced = (f->flags & AV_FRAME_FLAG_INTERLACED) != 0;
         p.top_field_first = (f->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0;
+        p.damaged = f->decode_error_flags != 0 || (f->flags & AV_FRAME_FLAG_CORRUPT) != 0;
         if (v.av->framerate.num > 0 && v.av->framerate.den > 0) p.fps = av_q2d(v.av->framerate);
         // 4:2:0 from FFmpeg's software decoder, or from the media engine's pixel buffer (D-254).
         if (!vdec_hw::planes(f, p.width, p.height, p.y, p.u, p.v)) {
@@ -1007,15 +1173,15 @@ void receive_pictures(Vdec& v, std::map<u64, AuMeta>& in_flight, u64 seq)
             av_frame_unref(f);
             continue;
         }
-        if (v.codec == CODEC_VC1) {
-            const Vc1Entry& e = p.meta.vc1.entry;
-            if (e.range_mapy_flag) vc1_range_map(p.y, e.range_mapy);
-            if (e.range_mapuv_flag) {
-                vc1_range_map(p.u, e.range_mapuv);
-                vc1_range_map(p.v, e.range_mapuv);
-            }
+        if (p.damaged)
+            PS_LOG_WARN(kChan, "decoder {:#x}: picture of access unit {} decoded with errors concealed (reported as "
+                               "CELL_VDEC_ERROR_PIC)", v.handle, p.au);
+        p.number = v.pictures++;
+        place_picture(base, v, p);
+        {
+            std::lock_guard lk(v.m);
+            v.held.push_back(std::move(p));
         }
-        v.held.push_back(std::move(p));
         av_frame_unref(f);
     }
     av_frame_free(&f);
@@ -1025,7 +1191,7 @@ void receive_pictures(Vdec& v, std::map<u64, AuMeta>& in_flight, u64 seq)
 // first access unit they are known for. A different sequence header later (which FFmpeg's decoder would not read in
 // the stream) opens it again, once the pictures the old one holds are out. Until the first, access units are skipped,
 // logged once, as RPCS3 skips MPEG-2 and MPEG-4 access units before a sequence header (au_has_sequence_header).
-void vc1_open(Vdec& v, const Vc1Headers& h, std::map<u64, AuMeta>& in_flight, u64 seq)
+void vc1_open(u8* base, Vdec& v, const Vc1Headers& h, std::map<u64, AuMeta>& in_flight, u64 seq)
 {
     if (h.seq_bdu.empty() || h.entry_bdu.empty()) {
         if (!v.vc1_skip_logged)
@@ -1037,7 +1203,7 @@ void vc1_open(Vdec& v, const Vc1Headers& h, std::map<u64, AuMeta>& in_flight, u6
     if (h.seq_bdu == v.vc1_opened) return; // open with it (or refused, logged)
     if (v.av) {
         avcodec_send_packet(v.av, nullptr);
-        receive_pictures(v, in_flight, seq);
+        receive_pictures(base, v, in_flight, seq);
         avcodec_free_context(&v.av);
         PS_LOG_INFO(kChan, "decoder {:#x}: a new VC-1 sequence header: FFmpeg's decoder opens again", v.handle);
     }
@@ -1048,35 +1214,309 @@ void vc1_open(Vdec& v, const Vc1Headers& h, std::map<u64, AuMeta>& in_flight, u6
 }
 #endif
 
-// Announces the held pictures (all, or those of access units before `before`): each goes to the game's queue when
-// it has room, then PICOUT.
+// ---- what a picture's item and information block hold (written when the picture is announced, as Sony's libvdec
+// does; only the bytes Sony's writes, the others left as they were: D-912)
+
+// The error word libdivx311dec (and libdivxdec) report for a picture decoded with errors (0x11 as seen), else 0.
+constexpr u32 kDivxDamaged = 0x11;
+
+// CellVdecDivxInfo of DivX 3.11 (0x18 bytes): the picture type (I 0, P 1), the size, the frame rate code
+// (CELL_VDEC_DIVX_FRC_*: SetFrameRate's during the sequence, else 0), the frame buffer's address and the size again,
+// then two bytes and a word libdivx311dec reports (0, 0x30, and 0 or kDivxDamaged).
+void write_divx311_info(u8* base, u32 info, const Vdec& v, const Picture& p)
+{
+#if PSPOCKET_HAVE_FFMPEG
+    const u8 type = p.pict_type == AV_PICTURE_TYPE_I ? 0 : 1;
+#else
+    const u8 type = 0;
+#endif
+    ps_write8(base, info + 0x00, type);
+    ps_write16(base, info + 0x02, static_cast<u16>(p.width));
+    ps_write16(base, info + 0x04, static_cast<u16>(p.height));
+    ps_write16(base, info + 0x06, static_cast<u16>(v.seq_frame_rate));
+    ps_write32(base, info + 0x08, p.frame);
+    ps_write16(base, info + 0x0C, static_cast<u16>(p.width));
+    ps_write16(base, info + 0x0E, static_cast<u16>(p.height));
+    ps_write8(base, info + 0x10, 0);
+    ps_write8(base, info + 0x11, 0x30);
+    ps_write32(base, info + 0x14, p.damaged ? kDivxDamaged : 0);
+}
+
+// CellVdecDivxInfo of DivX (0x20 bytes): RPCS3's fields (rpcs3/Emu/Cell/Modules/cellVdec.h) from the stream's headers
+// as Sony's libdivxdec reports them (the video object layer's aspect ratio code and pixel sizes; the visual object's
+// colour description, 0s without one; the picture structure), the frame rate code (SetFrameRate's during the sequence,
+// else 0), then libdivxdec's own: the frame buffer's address, the size again, two bytes (0, 0x30) and a word (0 or
+// kDivxDamaged).
+void write_divx_info(u8* base, u32 info, const Vdec& v, const Picture& p)
+{
+#if PSPOCKET_HAVE_FFMPEG
+    const u8 type = p.pict_type == AV_PICTURE_TYPE_B ? 2 : p.pict_type == AV_PICTURE_TYPE_I ? 0 : 1; // P, S (sprite)
+#else
+    const u8 type = 0;
+#endif
+    const Mpeg4Vol& vol = p.meta.vol;
+    ps_write8(base, info + 0x00, type);
+    ps_write16(base, info + 0x02, static_cast<u16>(p.width));
+    ps_write16(base, info + 0x04, static_cast<u16>(p.height));
+    ps_write8(base, info + 0x06, vol.aspect_ratio_info);
+    ps_write8(base, info + 0x07, vol.par_width);
+    ps_write8(base, info + 0x08, vol.par_height);
+    ps_write8(base, info + 0x09, vol.colour_description);
+    ps_write8(base, info + 0x0A, vol.colour_description ? vol.colour_primaries : 0);
+    ps_write8(base, info + 0x0B, vol.colour_description ? vol.transfer_characteristics : 0);
+    ps_write8(base, info + 0x0C, vol.colour_description ? vol.matrix_coefficients : 0);
+    ps_write8(base, info + 0x0D, !p.interlaced ? 0 : p.top_field_first ? 1 : 2); // FRAME, TOP_BTM, BTM_TOP
+    ps_write16(base, info + 0x0E, static_cast<u16>(v.seq_frame_rate));
+    ps_write32(base, info + 0x10, p.frame);
+    ps_write16(base, info + 0x14, static_cast<u16>(p.width));
+    ps_write16(base, info + 0x16, static_cast<u16>(p.height));
+    ps_write8(base, info + 0x18, 0);
+    ps_write8(base, info + 0x19, 0x30);
+    ps_write32(base, info + 0x1C, p.damaged ? kDivxDamaged : 0);
+}
+
+// CellVdecMpeg4Info (0x38 bytes), as Sony's libvdec writes it from libsmvd4's side information: the video object
+// layer's aspect ratio code and pixel sizes, time increment resolution, fixed VOP rate and increment, width and height
+// (when the stream has given a layer), the VOP coding type, the picture's luma, Cb and Cr addresses in its frame buffer
+// (Cr 8 bytes past Cb: the strips hold 8 of each a line), the width and height as words (read back from the block), the
+// frame's luma lines (with the edge's), then 3, 0, 0 and 0 at 0x30, 0x31, 0x32 and 0x35.
+void write_mpeg4_info(u8* base, u32 info, const Vdec& v, const Picture& p)
+{
+    const Mpeg4Vol& vol = p.meta.vol;
+    if (vol.valid) {
+        ps_write8(base, info + 0x00, vol.aspect_ratio_info);
+        ps_write8(base, info + 0x01, vol.par_width);
+        ps_write8(base, info + 0x02, vol.par_height);
+        ps_write16(base, info + 0x04, vol.time_increment_resolution);
+        ps_write8(base, info + 0x06, vol.fixed_vop_rate);
+        ps_write16(base, info + 0x08, vol.fixed_vop_time_increment);
+        ps_write16(base, info + 0x0A, vol.width);
+        ps_write16(base, info + 0x0C, vol.height);
+    }
+#if PSPOCKET_HAVE_FFMPEG
+    const u8 type = p.pict_type == AV_PICTURE_TYPE_I   ? 0
+                    : p.pict_type == AV_PICTURE_TYPE_P ? 1
+                    : p.pict_type == AV_PICTURE_TYPE_B ? 2
+                                                       : 3;
+#else
+    const u8 type = 0;
+#endif
+    ps_write8(base, info + 0x0E, type);
+    const u32 cb = p.frame + vdec::strip_cb(v.plan, p.width, p.height);
+    ps_write32(base, info + 0x10, p.start);
+    ps_write32(base, info + 0x14, cb);
+    ps_write32(base, info + 0x18, cb + 8);
+    ps_write32(base, info + 0x20, ps_read16(base, info + 0x0A));
+    ps_write32(base, info + 0x24, ps_read16(base, info + 0x0C));
+    ps_write32(base, info + 0x28, vdec::align(p.height, 16) + 32); // the frame's luma lines
+    ps_write8(base, info + 0x30, 3);
+    ps_write8(base, info + 0x31, 0);
+    ps_write8(base, info + 0x32, 0);
+    ps_write8(base, info + 0x35, 0);
+}
+
+// CellVdecVc1Info (0x170 bytes) as Sony's libvdec writes it from libsvc1d's side information (D-912): the sequence
+// header as the decoder has read it when the picture is announced (its size, flags, display extension, aspect ratio,
+// frame rate code, colour description), then the picture's own entry point and picture header fields, the headers its
+// access unit carried, what the decoder holds valid, the picture's addresses in its frame buffer, the size again, the
+// frame's lines and its range mapping. The bytes libvdec leaves are left.
+void write_vc1_info(u8* base, u32 info, const Vdec& v, const Picture& p)
+{
+    const Vc1Sequence& s = v.vc1_current.seq;
+    const Vc1Headers& h = p.meta.vc1;
+    ps_write32(base, info + 0x00, s.max_coded_width);
+    ps_write32(base, info + 0x04, s.max_coded_height);
+    ps_write8(base, info + 0x08, s.pulldown);
+    ps_write8(base, info + 0x09, s.interlace);
+    ps_write8(base, info + 0x0A, s.tfcntrflag);
+    ps_write8(base, info + 0x0B, s.finterpflag);
+    ps_write8(base, info + 0x0C, s.postprocflag);
+    ps_write8(base, info + 0x0D, s.psf);
+    ps_write8(base, info + 0x0E, s.display_ext);
+    ps_write16(base, info + 0x10, static_cast<u16>(s.display_ext ? s.display_width - 1 : 0));
+    ps_write16(base, info + 0x12, static_cast<u16>(s.display_ext ? s.display_height - 1 : 0));
+    ps_write8(base, info + 0x14, s.aspect_ratio_flag);
+    ps_write8(base, info + 0x15, s.aspect_ratio);
+    ps_write8(base, info + 0x16, static_cast<u8>(s.aspect_width ? s.aspect_width - 1 : 0));
+    ps_write8(base, info + 0x17, static_cast<u8>(s.aspect_height ? s.aspect_height - 1 : 0));
+    if (s.display_ext && s.framerate_flag && !s.framerate_ind) {
+        // The frame rate code (CELL_VDEC_FRC_* less 0x80: 24000/1001 1, 24 2, 25 3, 30000/1001 4, 30 5, 50 6,
+        // 60000/1001 7, 60 8; 0 for another) from FRAMERATENR and FRAMERATEDR.
+        u8 code = 0;
+        if (s.framerate_dr == 1) {
+            constexpr u8 kRates[8] = {0, 2, 3, 5, 6, 8, 0, 0};
+            code = kRates[s.framerate_nr & 7];
+        } else if (s.framerate_dr == 2) {
+            constexpr u8 kRates[8] = {0, 1, 0, 4, 0, 7, 0, 0};
+            code = kRates[s.framerate_nr & 7];
+        }
+        ps_write8(base, info + 0x18, code);
+    }
+    ps_write8(base, info + 0x19, s.color_format_flag);
+    ps_write8(base, info + 0x1A, s.color_prim);
+    ps_write8(base, info + 0x1B, s.transfer_char);
+    ps_write8(base, info + 0x1C, s.matrix_coef);
+    u32 valid = 1;
+    if (!h.entry_bdu.empty()) {
+        valid |= 2;
+        ps_write8(base, info + 0x1D, h.entry.broken_link);
+        ps_write8(base, info + 0x1E, h.entry.closed_entry);
+    }
+    if (h.units & 4) {
+        valid |= 4;
+        // libsvc1d's picture type codes: I 1 and skipped 5 (seen); P 2, B 3 and BI 4 assumed in the standard's order.
+        const u8 type = h.pic.type[0] == VC1_PCT_I ? 1 : h.pic.type[0] == VC1_PCT_P ? 2 : h.pic.type[0] == VC1_PCT_B ? 3
+                        : h.pic.type[0] == VC1_PCT_BI ? 4 : 5;
+        ps_write8(base, info + 0x28, 0);
+        ps_write8(base, info + 0x1F, type);
+        ps_write8(base, info + 0x22, h.pic.rptfrm);
+        ps_write8(base, info + 0x23, h.pic.tff);
+        ps_write8(base, info + 0x24, h.pic.rff);
+        ps_write8(base, info + 0x25, 0);
+        ps_write8(base, info + 0x20, 0); // a frame: one field's entries
+        ps_write8(base, info + 0x26, 0);
+        ps_write8(base, info + 0x34, 0); // its pan-scan windows: none
+    }
+    ps_write32(base, info + 0x2C, h.units);
+    ps_write32(base, info + 0x30, valid);
+    const u32 cb = p.frame + vdec::strip_cb(v.plan, p.width, p.height);
+    ps_write32(base, info + 0x148, p.start);
+    ps_write32(base, info + 0x14C, cb);
+    ps_write32(base, info + 0x150, cb + 8);
+    ps_write32(base, info + 0x158, s.max_coded_width);
+    ps_write32(base, info + 0x15C, s.max_coded_height);
+    ps_write32(base, info + 0x160, vdec::align(p.height, 32) + 128);
+    ps_write8(base, info + 0x168, 3);
+    ps_write8(base, info + 0x169, h.entry.range_mapy_flag);
+    ps_write8(base, info + 0x16A, h.entry.range_mapuv_flag);
+    ps_write8(base, info + 0x16B, h.entry.range_mapy);
+    ps_write8(base, info + 0x16C, h.entry.range_mapuv);
+    ps_write8(base, info + 0x16D, 0);
+}
+
+// H.264's information (CellVdecAvcInfo, 0x244 bytes), and MVC's base view's as H.264's; MPEG-2's as RPCS3 fills it.
+void write_avc_info(u8* base, u32 info, const Vdec& v, const Picture& p)
+{
+    std::memset(base + info, 0, v.ring.info);
+    if (v.codec == CODEC_MPEG2) { // CellVdecMpeg2Info as RPCS3 fills it (not compared with Sony's yet)
+        ps_write16(base, info + 0x00, static_cast<u16>(p.width));
+        ps_write16(base, info + 0x02, static_cast<u16>(p.height));
+        return;
+    }
+    const AvcSps& s = p.meta.sps;
+    ps_write16(base, info + 0x00, static_cast<u16>(p.width));
+    ps_write16(base, info + 0x02, static_cast<u16>(p.height));
+#if PSPOCKET_HAVE_FFMPEG
+    ps_write8(base, info + 0x04, p.pict_type == AV_PICTURE_TYPE_I ? 0 : p.pict_type == AV_PICTURE_TYPE_P ? 1
+                                   : p.pict_type == AV_PICTURE_TYPE_B ? 2 : 3);
+#endif
+    ps_write8(base, info + 0x06, p.meta.avc.idr);
+    ps_write8(base, info + 0x07, s.aspect_ratio_idc);
+    ps_write16(base, info + 0x08, s.sar_height);
+    ps_write16(base, info + 0x0A, s.sar_width);
+    ps_write8(base, info + 0x12, s.vui);
+    ps_write8(base, info + 0x13, s.frame_mbs_only);
+    ps_write8(base, info + 0x14, s.video_signal_type);
+    ps_write8(base, info + 0x15, s.video_format);
+    ps_write8(base, info + 0x16, s.full_range);
+    ps_write8(base, info + 0x17, s.colour_description);
+    ps_write8(base, info + 0x18, s.primaries);
+    ps_write8(base, info + 0x19, s.transfer);
+    ps_write8(base, info + 0x1A, s.matrix);
+    ps_write8(base, info + 0x1B, s.timing);
+    const u8 frc = v.frame_rate ? static_cast<u8>(v.frame_rate & 7) : avc_frame_rate_code(s);
+    ps_write8(base, info + 0x1C, frc == 0xFF ? 0 : frc);
+    ps_write8(base, info + 0x1D, s.fixed_frame_rate);
+    ps_write8(base, info + 0x1E, s.low_delay_hrd);
+    ps_write8(base, info + 0x1F, p.meta.avc.entropy_cabac);
+    ps_write16(base, info + 0x20, p.meta.avc.nal_flags);
+    // Past RPCS3's structure, as Sony's for the streams tried (meanings inferred): the picture order count type, the
+    // VUI timing, the picture's number and its size.
+    ps_write8(base, info + 0x138, static_cast<u8>(s.poc_type));
+    ps_write32(base, info + 0x154, s.time_scale);
+    ps_write32(base, info + 0x158, s.units_in_tick);
+    ps_write8(base, info + 0x15C, s.fixed_frame_rate);
+    if (v.ring.info < 0x230) return; // MVC's block is 0x214 bytes (D-590): its own layout past that is not known
+    ps_write32(base, info + 0x224, p.number);
+    ps_write32(base, info + 0x228, p.width);
+    ps_write32(base, info + 0x22C, p.height);
+}
+
+// CellVdecPicItem as Sony's libvdec fills it when it announces the picture (D-912): the codec, the start address, the
+// size of the picture in 4:2:0, one access unit, its PTS, DTS and user data (the second access unit's left as the free
+// element has them), the status (the PICOUT's error) and the attributes. The information block's address was set when
+// the decoder opened.
+void write_item(u8* base, const Vdec& v, const Picture& p, u32 status)
+{
+    const u32 item = vdec::item_addr(v.handle, p.meta.slot), info = vdec::info_addr(v.handle, v.ring, p.meta.slot);
+    ps_write32(base, item + 0x00, v.codec);
+    ps_write32(base, item + 0x04, p.start);
+    ps_write32(base, item + 0x08, p.out_width * p.out_height + p.out_width * p.out_height / 2);
+    ps_write8(base, item + 0x0C, 1); // auNum
+    ps_write32(base, item + 0x10, p.meta.pts_upper);
+    ps_write32(base, item + 0x14, p.meta.pts_lower);
+    ps_write32(base, item + 0x20, p.meta.dts_upper);
+    ps_write32(base, item + 0x24, p.meta.dts_lower);
+    ps_write64(base, item + 0x30, p.meta.user_data);
+    ps_write32(base, item + 0x40, status);
+    ps_write32(base, item + 0x44, static_cast<u32>(p.meta.attr));
+    switch (v.codec) {
+    case CODEC_DIVX3_11: write_divx311_info(base, info, v, p); break;
+    case CODEC_DIVX: write_divx_info(base, info, v, p); break;
+    case CODEC_MPEG4: write_mpeg4_info(base, info, v, p); break;
+    case CODEC_VC1: write_vc1_info(base, info, v, p); break;
+    default: write_avc_info(base, info, v, p); break; // H.264, JVT, MVC's base view, MPEG-2
+    }
+}
+
+// A ring element made free (under v.m): its item's fields as libvdec sets them then.
+void release_slot(u8* base, Vdec& v, u32 slot)
+{
+    if (slot >= v.slots.size()) return;
+    v.slots[slot] = 0;
+    vdec::clear_item(base, vdec::item_addr(v.handle, slot));
+}
+
+// The ring's elements whose access units hold no picture any more (nothing held or out came of them): free (under
+// v.m). Sony's libvdec frees an element when its access unit is done without a picture.
+void release_orphans(u8* base, Vdec& v)
+{
+    std::vector<u8> used(v.slots.size(), 0);
+    for (const Picture& p : v.held) used[p.meta.slot] = 1;
+    for (const Picture& p : v.out) used[p.meta.slot] = 1;
+    for (u32 i = 0; i < v.slots.size(); i++)
+        if (v.slots[i] && !used[i]) release_slot(base, v, i);
+}
+
+// Announces the held pictures (all, or those of access units before `before`): each goes to the game's queue, its item
+// and information written, then PICOUT.
 void announce(PPUContext& ctx, Vdec& v, std::optional<u64> before)
 {
+    u8* base = guest_base(ctx);
     for (;;) {
-        Picture p;
+        u32 status = 0;
         {
             std::unique_lock lk(v.m);
             if (v.held.empty() || (before && v.held.front().au >= *before)) return;
-            if (v.out.size() >= kOutMax) {
-                PS_LOG_WARN(kChan, "decoder {:#x}: {} pictures not taken; the oldest is dropped", v.handle, v.out.size());
-                v.out.pop_front();
-            }
-            p = std::move(v.held.front());
+            Picture p = std::move(v.held.front());
             v.held.pop_front();
             if (p.seq != v.seq) continue; // a sequence restarted meanwhile
-            p.number = v.pictures++;
-            // The frame buffers: as many of the picture's size as fit after the rings, at most 16 (Sony's count and
-            // place are its own).
-            if (p.width != v.frame_width || p.height != v.frame_height) {
-                v.frame_width = p.width;
-                v.frame_height = p.height;
-                v.frame_size = (frame_size(p.width, p.height) + 0x7F) & ~0x7Fu;
-                v.frames = std::min<u32>(kRing, (v.mem_size - kFrames) / v.frame_size);
+            if (v.out.size() >= kOutMax) {
+                PS_LOG_WARN(kChan, "decoder {:#x}: {} pictures not taken; the oldest is dropped", v.handle, v.out.size());
+                release_slot(base, v, v.out.front().meta.slot);
+                v.out.pop_front();
             }
-            if (v.frames) write_frame(guest_base(ctx), v.handle + kFrames + (p.number % v.frames) * v.frame_size, p);
+            status = p.damaged ? CELL_VDEC_ERROR_PIC : 0;
+            p.out_width = p.width;
+            p.out_height = p.height;
+            if (v.codec == CODEC_VC1 && v.vc1_current.seq.max_coded_width && v.vc1_current.seq.max_coded_height) {
+                p.out_width = v.vc1_current.seq.max_coded_width;
+                p.out_height = v.vc1_current.seq.max_coded_height;
+            }
+            write_item(base, v, p, status);
             v.out.push_back(std::move(p));
         }
-        callback(ctx, v, MSG_PICOUT);
+        callback(ctx, v, MSG_PICOUT, status);
     }
 }
 
@@ -1085,6 +1525,7 @@ void announce(PPUContext& ctx, Vdec& v, std::optional<u64> before)
 void run(PPUContext& ctx, Vdec& v)
 {
     lv2::PpuThread& t = thread_of(ctx);
+    u8* base = guest_base(ctx);
     [[maybe_unused]] std::map<u64, AuMeta> in_flight; // by access unit index, until its pictures are out
     for (;;) {
         Command c;
@@ -1100,65 +1541,116 @@ void run(PPUContext& ctx, Vdec& v)
             if (v.av) avcodec_flush_buffers(v.av);
 #endif
             in_flight.clear();
+            v.produced.clear();
             std::lock_guard lk(v.m);
+            v.awaiting.clear();
             v.held.clear();
             v.out.clear();
+            v.next_frame = 0;
+            v.have_last = false;
+            v.seq_frame_rate = 0; // libdivxdec's and libdivx311dec's StartSeq forget a frame rate set before it
             break;
         }
-        case Command::au:
-        case Command::drain: {
-#if PSPOCKET_HAVE_FFMPEG
-            u64 seq = 0;
+        case Command::au: {
+            // Sony's cores hold an access unit back while they hold their most pictures (decoded and not yet released
+            // by GetPicture): it waits for the game to take one (D-912).
             {
-                std::lock_guard lk(v.m);
-                seq = v.seq;
-            }
-            if (c.seq == seq && c.type == Command::au && v.codec == CODEC_VC1) vc1_open(v, c.meta.vc1, in_flight, seq);
-            // An access unit of the views past MVC's base one alone has nothing to decode (an empty packet would end
-            // the stream).
-            const bool nothing = c.type == Command::au && c.own_data && c.au_size == 0;
-            if (c.seq == seq && v.av && !nothing) {
-                if (c.type == Command::au) {
-                    AVPacket* pkt = av_packet_alloc();
-                    pkt->data = c.own_data ? c.data.data() : guest_base(ctx) + c.au_addr;
-                    pkt->size = static_cast<int>(c.au_size);
-                    pkt->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(c.meta.index));
-                    v.av->skip_frame = c.mode == DEC_MODE_NORMAL ? AVDISCARD_DEFAULT
-                                       : c.mode == DEC_MODE_B_SKIP ? AVDISCARD_NONREF
-                                                                   : AVDISCARD_NONINTRA;
-                    // An access unit's entry stays until no picture can come of it: FFmpeg holds pictures for
-                    // reordering, at most 16 access units (H.264's deepest), so 64 back are gone.
-                    const u64 oldest = c.meta.index > 64 ? c.meta.index - 64 : 0;
-                    in_flight.erase(in_flight.begin(), in_flight.lower_bound(oldest));
-                    in_flight[c.meta.index] = c.meta;
-                    if (const int r = avcodec_send_packet(v.av, pkt); r < 0)
-                        PS_LOG_ERROR(kChan, "decoder {:#x}: access unit {} ({:#x}, {} bytes) refused by the decoder ({})",
-                            v.handle, c.meta.index, c.au_addr, c.au_size, r);
-                    av_packet_free(&pkt);
-                } else {
-                    avcodec_send_packet(v.av, nullptr);
+                std::unique_lock lk(v.m);
+                park_until(t, v, lk, [&] {
+                    return c.seq != v.seq || v.held.size() + v.out.size() + v.awaiting.size() < v.plan.limit;
+                });
+                if (c.seq != v.seq || v.dead) {
+                    if (v.pending_aus) v.pending_aus--;
+                    break;
                 }
-                receive_pictures(v, in_flight, seq);
             }
-#endif
-            if (c.type == Command::au) {
+            u32 au_error = 0;
+            bool decoded = false;
+            if (v.codec == CODEC_VC1 && c.mode == (DEC_MODE_B_SKIP | DEC_MODE_PB_SKIP)) {
+                // libsvc1d refuses the mode libvdec takes (B and PB pictures skipped): libvdec reports it as a fatal
+                // error (ERROR, CELL_VDEC_ERROR_FATAL) and its decoder does nothing more (no AUDONE, no SEQDONE).
+                PS_LOG_ERROR(kChan, "decoder {:#x}: VC-1 access unit {} in decode mode 3: refused by the codec, as "
+                                    "Sony's (a fatal error; the decoder stops)", v.handle, c.meta.index);
                 {
                     std::lock_guard lk(v.m);
+                    v.dead = true;
                     if (v.pending_aus) v.pending_aus--;
                 }
-                callback(ctx, v, MSG_AUDONE);
-                announce(ctx, v, c.meta.index); // the pictures of earlier access units: Sony's one-unit lag
-            } else {
-                announce(ctx, v, std::nullopt);
-#if PSPOCKET_HAVE_FFMPEG
-                if (v.av) avcodec_flush_buffers(v.av);
-#endif
+                callback(ctx, v, MSG_ERROR, CELL_VDEC_ERROR_FATAL);
+                break;
             }
+            if (v.codec == CODEC_VC1 && v.level < VC1_AP_L0) {
+                PS_LOG_ERROR(kChan, "decoder {:#x}: VC-1's simple and main profiles are not decoded (how libsvc1d is "
+                                    "given their sequence header is not known, D-589): access unit {} skipped",
+                    v.handle, c.meta.index);
+                au_error = CELL_VDEC_ERROR_AU;
+            }
+#if PSPOCKET_HAVE_FFMPEG
+            if (!au_error && v.codec == CODEC_VC1) vc1_open(base, v, c.meta.vc1, in_flight, c.seq);
+            if (!au_error && v.codec == CODEC_VC1 && !v.av) au_error = CELL_VDEC_ERROR_AU; // before the headers
+            // An access unit of the views past MVC's base one alone has nothing to decode (an empty packet would end
+            // the stream).
+            const bool nothing = c.own_data && c.au_size == 0;
+            if (!au_error && v.av && !nothing) {
+                AVPacket* pkt = av_packet_alloc();
+                pkt->data = c.own_data ? c.data.data() : base + c.au_addr;
+                pkt->size = static_cast<int>(c.au_size);
+                pkt->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(c.meta.index));
+                v.av->skip_frame = c.mode == DEC_MODE_NORMAL ? AVDISCARD_DEFAULT
+                                   : c.mode == DEC_MODE_B_SKIP ? AVDISCARD_NONREF
+                                                               : AVDISCARD_NONINTRA;
+                // An access unit's entry stays until no picture can come of it: FFmpeg holds pictures for reordering,
+                // at most 16 access units (H.264's deepest), so 64 back are gone.
+                const u64 oldest = c.meta.index > 64 ? c.meta.index - 64 : 0;
+                in_flight.erase(in_flight.begin(), in_flight.lower_bound(oldest));
+                in_flight[c.meta.index] = c.meta;
+                {
+                    std::lock_guard lk(v.m);
+                    v.awaiting.insert(c.meta.index);
+                }
+                if (const int r = avcodec_send_packet(v.av, pkt); r < 0)
+                    PS_LOG_ERROR(kChan, "decoder {:#x}: access unit {} ({:#x}, {} bytes) refused by the decoder ({})",
+                        v.handle, c.meta.index, c.au_addr, c.au_size, r);
+                av_packet_free(&pkt);
+                receive_pictures(base, v, in_flight, c.seq, c.meta.index);
+                decoded = true;
+            }
+#endif
+            if (v.codec == CODEC_VC1 && !c.meta.vc1.seq_bdu.empty()) v.vc1_current = c.meta.vc1;
+            {
+                std::lock_guard lk(v.m);
+                if (v.pending_aus) v.pending_aus--;
+                if (!decoded) release_slot(base, v, c.meta.slot); // no picture comes of it
+            }
+            callback(ctx, v, MSG_AUDONE, au_error);
+            // The pictures of earlier access units (Sony's one-unit lag), or of this one too for a core without it.
+            announce(ctx, v, v.plan.lag ? c.meta.index : c.meta.index + 1);
+            break;
+        }
+        case Command::drain: {
+            {
+                std::lock_guard lk(v.m);
+                if (c.seq != v.seq || v.dead) break;
+            }
+#if PSPOCKET_HAVE_FFMPEG
+            if (v.av) {
+                avcodec_send_packet(v.av, nullptr);
+                receive_pictures(base, v, in_flight, c.seq);
+            }
+#endif
+            announce(ctx, v, std::nullopt);
+#if PSPOCKET_HAVE_FFMPEG
+            if (v.av) avcodec_flush_buffers(v.av);
+#endif
+            std::lock_guard lk(v.m);
+            v.awaiting.clear(); // what the decoder had not given by now gives nothing
+            release_orphans(base, v);
             break;
         }
         case Command::end: {
             {
                 std::lock_guard lk(v.m);
+                if (v.dead) break; // a decoder stopped by a fatal error ends no sequence
                 v.state = Seq::dormant;
             }
             callback(ctx, v, MSG_SEQDONE);
@@ -1167,6 +1659,8 @@ void run(PPUContext& ctx, Vdec& v)
         case Command::framerate: {
             std::lock_guard lk(v.m); // GetPicItem reads it on the game's thread (D-601)
             v.frame_rate = c.frame_rate;
+            // DivX's and DivX 3.11's codes (CELL_VDEC_DIVX_FRC_*, from 1): libvdec gives the core the code plus one.
+            v.seq_frame_rate = (c.frame_rate & 7) + 1;
             break;
         }
         case Command::close: return;
@@ -1215,15 +1709,17 @@ s32 open(PPUContext& ctx, u32 type, u32 spec, u32 res, u32 cb, u32 handle_out, c
     if (!mem || ppu_prio >= 3072 || spu_prio >= 256 || stack < 4096 || codec >= CODEC_MAX) return error(CELL_VDEC_ERROR_ARG);
     Attr attr;
     if (const s32 r = query_attr(ctx, codec, level, spec, attr); r != lv2::CELL_OK) return r;
-    if (mem_size < kFrames || !usable(ctx, mem, mem_size, "the decoder's memory")) return error(CELL_VDEC_ERROR_ARG);
+    // Sony's libvdec opens with the codec's part of what QueryAttrEx asks for (one byte less than all of it opens, D-196),
+    // and refuses less (D-912).
+    if (mem_size < attr.codec_part) {
+        PS_LOG_WARN(kChan, "{}: {:#x} bytes, less than the codec's {:#x} (of the {:#x} asked for): refused, as Sony's",
+            call, mem_size, attr.codec_part, attr.mem_size);
+        return error(CELL_VDEC_ERROR_ARG);
+    }
+    if (!usable(ctx, mem, mem_size, "the decoder's memory")) return error(CELL_VDEC_ERROR_ARG);
     if (mem_size < attr.mem_size)
         PS_LOG_WARN(kChan, "{}: {:#x} bytes, less than the {:#x} asked for (Sony's libvdec opens anyway)", call, mem_size,
             attr.mem_size);
-    if (codec == CODEC_VC1 && level < VC1_AP_L0) {
-        PS_LOG_ERROR(kChan, "{}: VC-1's simple and main profiles (level {}) are not decoded: their streams carry no "
-                            "sequence header, and how libsvc1d is given it is not known (D-589)", call, level);
-        return error(CELL_VDEC_ERROR_FATAL);
-    }
     auto v = std::make_shared<Vdec>();
     v->handle = mem;
     v->mem_size = mem_size;
@@ -1231,16 +1727,31 @@ s32 open(PPUContext& ctx, u32 type, u32 spec, u32 res, u32 cb, u32 handle_out, c
     v->level = level;
     v->cb_func = ps_read32(base, cb);
     v->cb_arg = ps_read32(base, cb + 4);
+    v->ring = vdec::ring_of(codec);
+    v->sizing = attr.sizing;
+    v->plan = vdec::plan_for(codec, mem, attr.sizing);
+    v->slots.assign(v->ring.count, 0);
     if (codec == CODEC_DIVX3_11) {
-        // DivX 3.11's frame size (D-588): the stream has none, so the codec specific information's largest frame
-        // (query_attr checked it) is the picture's, else RPCS3's default for the decoder.
-        if (spec && ps_read16(base, spec + 4) && ps_read16(base, spec + 6)) {
-            v->divx_width = ps_read16(base, spec + 4);
-            v->divx_height = ps_read16(base, spec + 6);
-        } else {
-            PS_LOG_WARN(kChan, "{}: DivX 3.11 without its frame size (CellVdecDivxSpecificInfo2): {}x{} assumed", call,
-                kDivx311Width, kDivx311Height);
-        }
+        // DivX 3.11's frame size (D-588): the stream has none, so it is the codec specific information's largest frame
+        // (query_attr checked it). Without the information Sony's libvdec reads the size from address 4 (its pointer
+        // to the information is a register left at 0, D-912), which faults on a PS3: a game always gives it.
+        // pspocket's decoder assumes the query's 720x576 then, logged.
+        v->divx_width = attr.sizing.width;
+        v->divx_height = attr.sizing.height;
+        if (!spec)
+            PS_LOG_WARN(kChan, "{}: DivX 3.11 without its frame size (CellVdecDivxSpecificInfo2): Sony's libvdec faults "
+                               "here (it reads address 4); {}x{} assumed", call, v->divx_width, v->divx_height);
+    }
+    if (codec == CODEC_VC1 && level < VC1_AP_L0)
+        PS_LOG_ERROR(kChan, "{}: VC-1's simple and main profiles (level {}) open as Sony's, but are not decoded: their "
+                            "streams carry no sequence header, and how libsvc1d is given it is not known (D-589)",
+            call, level);
+    // The ring as libvdec sets it up in the decoder's memory: each element's item free, and its information block's
+    // address (the item's picInfo).
+    for (u32 i = 0; i < v->ring.count; i++) {
+        const u32 item = vdec::item_addr(mem, i);
+        vdec::clear_item(base, item);
+        ps_write32(base, item + 0x48, vdec::info_addr(mem, v->ring, i));
     }
 #if PSPOCKET_HAVE_FFMPEG
     if (codec == CODEC_VC1) { // FFmpeg's decoder opens with the stream's headers (vc1_open)
@@ -1295,174 +1806,25 @@ s32 open(PPUContext& ctx, u32 type, u32 spec, u32 res, u32 cb, u32 handle_out, c
 // it is SEQ, not ARG.
 std::shared_ptr<Vdec> live(PPUContext&, u32 handle) { return vdec_of(handle); }
 
-// CellVdecDivxInfo, RPCS3's structure (rpcs3/Emu/Cell/Modules/cellVdec.h), which RPCS3 writes for MPEG-4 and DivX
-// (D-588): pictureType (u8), horizontalSize and verticalSize (u16 at 2 and 4), pixelAspectRatio, parWidth, parHeight,
-// colourDescription, colourPrimaries, transferCharacteristics, matrixCoefficients and pictureStruct (u8 at 6 to 13),
-// frameRateCode (u16 at 14). From the stream where it says (MPEG-4's VOL through FFmpeg), else RPCS3's values: a
-// square pixel, no colour description with BT.709's codes, a frame. The frame rate is SetFrameRate's, else the
-// stream's, else CELL_VDEC_DIVX_FRC_UNDEFINED (RPCS3 gives 30, a guess; DivX 3.11's stream names none).
-void write_divx_info(u8* base, u32 info, const Vdec& v, const Picture& p)
+// The picture at the size libvdec gives the game (Picture::out_width): cut, or the samples past its edge repeating it.
+void fit_to_output(Picture& p)
 {
-#if PSPOCKET_HAVE_FFMPEG
-    const u8 type = p.pict_type == AV_PICTURE_TYPE_B ? 2 : p.pict_type == AV_PICTURE_TYPE_I ? 0 : 1; // P, S (sprite)
-#else
-    const u8 type = 0;
-#endif
-    ps_write8(base, info + 0x00, type);
-    ps_write16(base, info + 0x02, static_cast<u16>(p.width));
-    ps_write16(base, info + 0x04, static_cast<u16>(p.height));
-    // CELL_VDEC_DIVX_ARI_PAR_*: MPEG-4's aspect_ratio_info, 15 with the ratio itself for another.
-    u8 par = 1, par_width = 0, par_height = 0;
-    if (p.sar_num > 0 && p.sar_den > 0) {
-        const struct {
-            s32 num, den;
-            u8 code;
-        } pars[] = {{1, 1, 1}, {12, 11, 2}, {10, 11, 3}, {16, 11, 4}, {40, 33, 5}};
-        par = 15;
-        par_width = static_cast<u8>(std::min(p.sar_num, 255));
-        par_height = static_cast<u8>(std::min(p.sar_den, 255));
-        for (const auto& k : pars)
-            if (s64{p.sar_num} * k.den == s64{p.sar_den} * k.num) {
-                par = k.code;
-                par_width = par_height = 0;
-            }
-    }
-    ps_write8(base, info + 0x06, par);
-    ps_write8(base, info + 0x07, par_width);
-    ps_write8(base, info + 0x08, par_height);
-    const bool colour = p.primaries != 2 || p.transfer != 2 || p.matrix != 2;
-    ps_write8(base, info + 0x09, colour);
-    ps_write8(base, info + 0x0A, colour ? p.primaries : 1);
-    ps_write8(base, info + 0x0B, colour ? p.transfer : 1);
-    ps_write8(base, info + 0x0C, colour ? p.matrix : 1);
-    ps_write8(base, info + 0x0D, !p.interlaced ? 0 : p.top_field_first ? 1 : 2); // FRAME, TOP_BTM, BTM_TOP
-    // CELL_VDEC_DIVX_FRC_*: 0 undefined, then the eight rates from 24000/1001.
-    const u8 index = v.frame_rate ? static_cast<u8>(v.frame_rate & 7) : frame_rate_index(p.fps);
-    ps_write16(base, info + 0x0E, index == 0xFF ? 0 : static_cast<u16>(index + 1));
-}
-
-// CellVdecVc1Info (D-589). RPCS3 has no structure for it and Sony's layout is not known (its block is 0x170 bytes by
-// RPCS3's attributes for libsvc1d), so this one is pspocket's: the picture's size where Sony's other decoders' blocks
-// begin, then the picture header's, the sequence header's and the entry point's fields a player needs, in the stream's
-// order, each the syntax element's value (sizes as sizes, the frame rate as coded):
-//   0x00 u16 horizontalSize, 0x02 u16 verticalSize (the picture's)
-//   0x04 u8 pictureType[2] (VC1_PCT_*; a frame's twice), 0x06 u8 frameCodingMode, 0x07 b8 topFieldFirst,
-//   0x08 b8 repeatFirstField, 0x09 u8 repeatFrameCount (RPTFRM)
-//   0x0A u8 level, 0x0B b8 interlace, 0x0C b8 pulldown, 0x0D b8 displayExtension, 0x0E u16 maxCodedWidth,
-//   0x10 u16 maxCodedHeight, 0x12 u16 displayHorizontalSize, 0x14 u16 displayVerticalSize, 0x16 u8 aspectRatio,
-//   0x17 b8 frameRateFlag, 0x18 u16 aspectHorizontalSize, 0x1A u16 aspectVerticalSize, 0x1C b8 frameRateIndicator,
-//   0x1D u8 frameRateNumerator (FRAMERATENR), 0x1E u8 frameRateDenominator (FRAMERATEDR), 0x1F b8 colorFormatFlag,
-//   0x20 u16 frameRateExp, 0x22 u8 colorPrimaries, 0x23 u8 transferCharacteristics, 0x24 u8 matrixCoefficients
-//   0x25 b8 brokenLink, 0x26 b8 closedEntry, 0x27 b8 rangeMappingYFlag, 0x28 u8 rangeMappingY,
-//   0x29 b8 rangeMappingUVFlag, 0x2A u8 rangeMappingUV (the picture has them applied)
-void write_vc1_info(u8* base, u32 info, const Picture& p)
-{
-    const Vc1Headers& h = p.meta.vc1;
-    ps_write16(base, info + 0x00, static_cast<u16>(p.width));
-    ps_write16(base, info + 0x02, static_cast<u16>(p.height));
-    ps_write8(base, info + 0x04, h.pic.type[0]);
-    ps_write8(base, info + 0x05, h.pic.type[1]);
-    ps_write8(base, info + 0x06, h.pic.fcm);
-    ps_write8(base, info + 0x07, h.pic.tff);
-    ps_write8(base, info + 0x08, h.pic.rff);
-    ps_write8(base, info + 0x09, h.pic.rptfrm);
-    ps_write8(base, info + 0x0A, h.seq.level);
-    ps_write8(base, info + 0x0B, h.seq.interlace);
-    ps_write8(base, info + 0x0C, h.seq.pulldown);
-    ps_write8(base, info + 0x0D, h.seq.display_ext);
-    ps_write16(base, info + 0x0E, h.seq.max_coded_width);
-    ps_write16(base, info + 0x10, h.seq.max_coded_height);
-    ps_write16(base, info + 0x12, h.seq.display_width);
-    ps_write16(base, info + 0x14, h.seq.display_height);
-    ps_write8(base, info + 0x16, h.seq.aspect_ratio);
-    ps_write8(base, info + 0x17, h.seq.framerate_flag);
-    ps_write16(base, info + 0x18, h.seq.aspect_width);
-    ps_write16(base, info + 0x1A, h.seq.aspect_height);
-    ps_write8(base, info + 0x1C, h.seq.framerate_ind);
-    ps_write8(base, info + 0x1D, h.seq.framerate_nr);
-    ps_write8(base, info + 0x1E, h.seq.framerate_dr);
-    ps_write8(base, info + 0x1F, h.seq.color_format_flag);
-    ps_write16(base, info + 0x20, h.seq.framerate_exp);
-    ps_write8(base, info + 0x22, h.seq.color_prim);
-    ps_write8(base, info + 0x23, h.seq.transfer_char);
-    ps_write8(base, info + 0x24, h.seq.matrix_coef);
-    ps_write8(base, info + 0x25, h.entry.broken_link);
-    ps_write8(base, info + 0x26, h.entry.closed_entry);
-    ps_write8(base, info + 0x27, h.entry.range_mapy_flag);
-    ps_write8(base, info + 0x28, h.entry.range_mapy);
-    ps_write8(base, info + 0x29, h.entry.range_mapuv_flag);
-    ps_write8(base, info + 0x2A, h.entry.range_mapuv);
-}
-
-// CellVdecPicItem and the codec's information for the picture at the front of the game's queue whose item is not
-// taken yet, in the rings (see the top).
-void write_item(u8* base, const Vdec& v, const Picture& p, u32 item, u32 info)
-{
-    std::memset(base + item, 0, kItemSize);
-    ps_write32(base, item + 0x00, v.codec);
-    ps_write32(base, item + 0x04, v.frames ? v.handle + kFrames + (p.number % v.frames) * v.frame_size : 0);
-    ps_write32(base, item + 0x08, p.width * p.height * 3 / 2);
-    ps_write8(base, item + 0x0C, 1); // auNum
-    ps_write32(base, item + 0x10, p.meta.pts_upper);
-    ps_write32(base, item + 0x14, p.meta.pts_lower);
-    ps_write64(base, item + 0x18, ~0ull);
-    ps_write32(base, item + 0x20, p.meta.dts_upper);
-    ps_write32(base, item + 0x24, p.meta.dts_lower);
-    ps_write64(base, item + 0x28, ~0ull);
-    ps_write64(base, item + 0x30, p.meta.user_data);
-    ps_write64(base, item + 0x38, 0);
-    ps_write32(base, item + 0x40, 0); // status
-    ps_write32(base, item + 0x44, static_cast<u32>(p.meta.attr));
-    ps_write32(base, item + 0x48, info);
-    std::memset(base + info, 0, kInfoStride);
-    if (v.codec == CODEC_AVC || v.codec == CODEC_JVT || v.codec == CODEC_MVC || v.codec == CODEC_MVC2) {
-        // H.264's, and MVC's base view's as H.264's (D-590: Sony's CellVdecMvcInfo, 0x214 bytes by RPCS3's
-        // attributes, is not known).
-        const AvcSps& s = p.meta.sps;
-        ps_write16(base, info + 0x00, static_cast<u16>(p.width));
-        ps_write16(base, info + 0x02, static_cast<u16>(p.height));
-#if PSPOCKET_HAVE_FFMPEG
-        ps_write8(base, info + 0x04, p.pict_type == AV_PICTURE_TYPE_I ? 0 : p.pict_type == AV_PICTURE_TYPE_P ? 1
-                                       : p.pict_type == AV_PICTURE_TYPE_B ? 2 : 3);
-#endif
-        ps_write8(base, info + 0x06, p.meta.avc.idr);
-        ps_write8(base, info + 0x07, s.aspect_ratio_idc);
-        ps_write16(base, info + 0x08, s.sar_height);
-        ps_write16(base, info + 0x0A, s.sar_width);
-        ps_write8(base, info + 0x12, s.vui);
-        ps_write8(base, info + 0x13, s.frame_mbs_only);
-        ps_write8(base, info + 0x14, s.video_signal_type);
-        ps_write8(base, info + 0x15, s.video_format);
-        ps_write8(base, info + 0x16, s.full_range);
-        ps_write8(base, info + 0x17, s.colour_description);
-        ps_write8(base, info + 0x18, s.primaries);
-        ps_write8(base, info + 0x19, s.transfer);
-        ps_write8(base, info + 0x1A, s.matrix);
-        ps_write8(base, info + 0x1B, s.timing);
-        const u8 frc = v.frame_rate ? static_cast<u8>(v.frame_rate & 7) : avc_frame_rate_code(s);
-        ps_write8(base, info + 0x1C, frc == 0xFF ? 0 : frc);
-        ps_write8(base, info + 0x1D, s.fixed_frame_rate);
-        ps_write8(base, info + 0x1E, s.low_delay_hrd);
-        ps_write8(base, info + 0x1F, p.meta.avc.entropy_cabac);
-        ps_write16(base, info + 0x20, p.meta.avc.nal_flags);
-        // Past RPCS3's structure, as Sony's for the streams tried (meanings inferred): the picture order count type,
-        // the VUI timing, the picture's number and its size.
-        ps_write8(base, info + 0x138, static_cast<u8>(s.poc_type));
-        ps_write32(base, info + 0x154, s.time_scale);
-        ps_write32(base, info + 0x158, s.units_in_tick);
-        ps_write8(base, info + 0x15C, s.fixed_frame_rate);
-        ps_write32(base, info + 0x224, p.number);
-        ps_write32(base, info + 0x228, p.width);
-        ps_write32(base, info + 0x22C, p.height);
-    } else if (v.codec == CODEC_MPEG2) {
-        // CellVdecMpeg2Info as RPCS3 fills it (not compared with Sony's yet).
-        ps_write16(base, info + 0x00, static_cast<u16>(p.width));
-        ps_write16(base, info + 0x02, static_cast<u16>(p.height));
-    } else if (v.codec == CODEC_VC1) {
-        write_vc1_info(base, info, p);
-    } else {
-        write_divx_info(base, info, v, p); // MPEG-4, DivX, DivX 3.11
-    }
+    if (!p.out_width || !p.out_height || (p.out_width == p.width && p.out_height == p.height)) return;
+    const u32 w = p.out_width, h = p.out_height;
+    std::vector<u8> y(w * h), u((w / 2) * (h / 2)), v((w / 2) * (h / 2));
+    for (u32 r = 0; r < h; r++)
+        for (u32 x = 0; x < w; x++) y[r * w + x] = p.y[std::min(r, p.height - 1) * p.width + std::min(x, p.width - 1)];
+    for (u32 r = 0; r < h / 2; r++)
+        for (u32 x = 0; x < w / 2; x++) {
+            const u32 at = std::min(r, p.height / 2 - 1) * (p.width / 2) + std::min(x, p.width / 2 - 1);
+            u[r * (w / 2) + x] = p.u[at];
+            v[r * (w / 2) + x] = p.v[at];
+        }
+    p.y = std::move(y);
+    p.u = std::move(u);
+    p.v = std::move(v);
+    p.width = w;
+    p.height = h;
 }
 
 // The picture in the format asked (CellVdecPicFormat: type, colour matrix, alpha).
@@ -1595,6 +1957,8 @@ s32 cellVdecStartSeq(PPUContext& ctx, u32 handle)
     if (v->state != Seq::dormant && v->state != Seq::ready) return finish(error(CELL_VDEC_ERROR_SEQ), call);
     v->seq++;
     v->pending_aus = 0;
+    // libvdec sets its ring up again: every element free (D-912).
+    for (u32 i = 0; i < v->slots.size(); i++) release_slot(guest_base(ctx), *v, i);
     Command c(Command::start);
     c.seq = v->seq;
     push_command(*v, c);
@@ -1618,7 +1982,7 @@ s32 cellVdecEndSeq(PPUContext& ctx, u32 handle)
 }
 
 // DecodeAu, and DecodeAuEx2 with its access unit information as a CellVdecAuInfo (D-596).
-s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::string& call)
+s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::string& call, bool ex2 = false)
 {
     const std::shared_ptr<Vdec> v = live(ctx, handle);
     u8* base = guest_base(ctx);
@@ -1630,9 +1994,31 @@ s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::str
         (mode == (DEC_MODE_B_SKIP | DEC_MODE_PB_SKIP) && v->codec != CODEC_VC1) ||
         (mode == DEC_MODE_PB_SKIP && v->codec != CODEC_AVC))
         return finish(error(CELL_VDEC_ERROR_ARG), call);
+    // The access unit's ring element: the lowest free one (none free: FATAL, as libvdec answers it).
+    const auto free_slot = std::find(v->slots.begin(), v->slots.end(), 0);
+    if (free_slot == v->slots.end()) {
+        PS_LOG_ERROR(kChan, "{}: all {} of the decoder's ring elements hold access units or pictures", call,
+            v->slots.size());
+        return finish(error(CELL_VDEC_ERROR_FATAL), call);
+    }
+    if ((v->codec == CODEC_MVC || v->codec == CODEC_MVC2) && !ex2) {
+        // Sony's libvdec gives libmvcdec an access unit whose size is the word cellVdecDecodeAu leaves 0 (its MVC
+        // decoder reads the information as DecodeAuEx2's), and mvcDecAccessUnit refuses it ("bad parameter"): MVC never
+        // decodes through cellVdecDecodeAu, FATAL (D-912).
+        PS_LOG_ERROR(kChan, "{}: MVC through cellVdecDecodeAu is refused, as Sony's libvdec refuses it (its MVC core "
+                            "gets a size of 0)", call);
+        return finish(error(CELL_VDEC_ERROR_FATAL), call);
+    }
+    if ((v->codec == CODEC_MVC || v->codec == CODEC_MVC2) && !v->mvc_logged)
+        // Through DecodeAuEx2 Sony's libvdec gives libmvcdec the picture information's address from the caller's saved
+        // r26 (0x10 bytes past its own) and writes the information there: nothing to match (D-912). pspocket decodes
+        // the base view (D-590).
+        PS_LOG_WARN(kChan, "{}: MVC through DecodeAuEx2: Sony's libvdec writes the picture information through the "
+                           "caller's r26 here; pspocket decodes the base view", call);
     if (v->pending_aus >= 4) return finish(error(CELL_VDEC_ERROR_BUSY), call);
     // CellVdecAuInfo: startAddr, size, pts, dts, userData, codecSpecificData.
     Command c(Command::au);
+    c.meta.slot = static_cast<u32>(free_slot - v->slots.begin());
     c.seq = v->seq;
     c.mode = mode;
     c.au_addr = ps_read32(base, au_info);
@@ -1661,18 +2047,25 @@ s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::str
         c.au_size = static_cast<u32>(c.data.size());
         c.data.resize(c.data.size() + kPacketPadding, 0);
     }
+    if (v->codec == CODEC_MPEG4 || v->codec == CODEC_DIVX) {
+        scan_mpeg4_au({base + c.au_addr, c.au_size}, v->vol);
+        c.meta.vol = v->vol;
+    }
     if (v->codec == CODEC_VC1) {
         Vc1Picture pic;
         bool other_profile = false;
-        scan_vc1_au({base + c.au_addr, c.au_size}, v->vc1, pic, other_profile);
+        u32 units = 0;
+        scan_vc1_au({base + c.au_addr, c.au_size}, v->vc1, pic, other_profile, units);
         if (other_profile && !v->vc1_other_logged)
             PS_LOG_ERROR(kChan, "decoder {:#x}: a VC-1 sequence header of the simple or main profile is not decoded "
                                 "(D-589)", v->handle);
         v->vc1_other_logged |= other_profile;
         c.meta.vc1 = v->vc1;
         c.meta.vc1.pic = pic;
+        c.meta.vc1.units = units;
     }
     v->pending_aus++;
+    v->slots[c.meta.slot] = 1;
     push_command(*v, std::move(c));
     return lv2::CELL_OK;
 }
@@ -1739,7 +2132,7 @@ s32 cellVdecDecodeAuEx2(PPUContext& ctx, u32 handle, s32 mode, u32 au_info)
     ps_write32(base, info.addr() + 0, ps_read32(base, au_info + 0));
     ps_write32(base, info.addr() + 4, ps_read32(base, au_info + 8));
     for (u32 at = 0; at < 0x20; at += 4) ps_write32(base, info.addr() + 8 + at, ps_read32(base, au_info + 0x10 + at));
-    return decode_au(ctx, handle, mode, info.addr(), call);
+    return decode_au(ctx, handle, mode, info.addr(), call, true);
 }
 
 s32 cellVdecGetPicItem(PPUContext& ctx, u32 handle, u32 item_out)
@@ -1750,13 +2143,11 @@ s32 cellVdecGetPicItem(PPUContext& ctx, u32 handle, u32 item_out)
     u8* base = guest_base(ctx);
     std::lock_guard lk(v->m);
     if (v->state == Seq::closed) return finish(error(CELL_VDEC_ERROR_SEQ), call);
+    // The item libvdec filled when it announced the picture, in the picture's ring element (D-912).
     for (Picture& p : v->out) {
         if (p.item_taken) continue;
         p.item_taken = true;
-        const u32 item = v->handle + kItems + (p.number % kRing) * kItemStride;
-        const u32 info = v->handle + kInfos + (p.number % kRing) * kInfoStride;
-        write_item(base, *v, p, item, info);
-        ps_write32(base, item_out, item);
+        ps_write32(base, item_out, vdec::item_addr(v->handle, p.meta.slot));
         return lv2::CELL_OK;
     }
     return error(CELL_VDEC_ERROR_EMPTY);
@@ -1779,7 +2170,12 @@ s32 cellVdecGetPicture(PPUContext& ctx, u32 handle, u32 format, u32 out_buff)
         if (v->out.empty()) return error(CELL_VDEC_ERROR_EMPTY);
         p = std::move(v->out.front());
         v->out.pop_front();
+        // The picture released: its ring element free, its frame buffer the core's again (an access unit held back
+        // for it goes on).
+        release_slot(base, *v, p.meta.slot);
+        wake_decoder(*v);
     }
+    fit_to_output(p);
     if (out_buff) {
         if (!usable(ctx, out_buff, picture_bytes(p, type), "the picture's buffer")) return finish(error(CELL_VDEC_ERROR_ARG), call);
         convert(base + out_buff, p, type, matrix, alpha);
