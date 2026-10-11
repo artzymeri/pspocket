@@ -11172,3 +11172,143 @@ takes the reader back to its header (or before it) is refused: READSIZE_IS_TOO_S
 read, makes the same sums; nothing else changes. cellAtracMulti reads its headers with the same reader. Test
 (test_atrac.cpp): a 12-byte RIFF that points back at itself, a chunk that does, empty chunks and one that goes back to
 them (the old reader went round for ever on all three), a fmt chunk whose length only wraps: each refused.
+
+## D-665 · 2026-10-11 · cellCamera's asynchronous forms with no camera: refused as their synchronous forms, no event, unverified
+
+cellCamera's ten asynchronous functions (OpenAsync and OpenPost, CloseAsync and ClosePost, StartAsync and StartPost,
+StopAsync and StopPost, ResetAsync and ResetPost) were answered as RPCS3's stubs (D-182): RPCS3 registers the names with
+no arguments (rpcs3/Emu/Cell/Modules/cellCamera.cpp: UNIMPLEMENTED_FUNC, CELL_OK). They are pspocket's own now
+(runtime/hle/src/devices.cpp), unverified (D-594; libcamera is always native, D-175, so the marker only records that),
+for the camera pspocket models: none attached, RPCS3's default null handler (D-183).
+- **The SDK's model**, as the library's header gives it (RPCS3 cellCamera.h): a game asks for events with the flags of
+  cellCameraSetNotifyEventQueue2, CELL_CAMERA_EFLAG_OPEN 0x02, CLOSE 0x04, START 0x08, STOP 0x10 and RESET 0x20 beside
+  FRAME_UPDATE 0x01; the events are CELL_CAMERA_OPEN (3), CLOSE, START, STOP and RESET (7) beside ATTACH, DETACH and
+  FRAME_UPDATE. An Async call makes its synchronous form's checks and starts the operation, its end comes to the queues
+  asking for it as that event, and the Post call completes it and answers its result.
+- **With no camera** each Async call is refused at once by its synchronous form's checks, in their order: OpenAsync by
+  Open's (a null info PARAM, NOT_INIT, a device other than 0 PARAM, an info that is not guest memory PARAM, logged with
+  the call site, then the format, resolution and frame rate as RPCS3's check_camera_info for its unknown camera type),
+  then DEVICE_NOT_FOUND; CloseAsync, StartAsync, StopAsync and ResetAsync by check_init_and_open's (the device number,
+  NOT_INIT, then NOT_OPEN: the camera is never open). Nothing is started, so no event is sent and no request waits for
+  a Post. The library knows whether a camera is attached before it asks the camera anything (in RPCS3's model it tells
+  a queue ATTACH as the queue is set), so a refusal at the call is how a console with no camera answers, not an
+  accepted request failing through the event.
+- **A Post** finds no request and answers as its Async from what it reads: OpenPost NOT_INIT, a device other than 0
+  PARAM, then DEVICE_NOT_FOUND; the other four check_init_and_open's answers. Only the device number is read: what
+  else a Post takes (OpenPost the info to fill, perhaps) is not known, and nothing is written.
+- **Why not RPCS3's CELL_OK.** The stubs told a game a camera was opening, starting or stopping when none would: a game
+  waiting for CELL_CAMERA_OPEN on its queue never got it, and one calling OpenPost was told the camera was open with
+  an info nobody filled. Most PS3s are played with no camera, so these answers are the path games take there. OpenAsync
+  reads only the info's first three words, which CellCameraInfo and CellCameraInfoEx share, so which it takes need not
+  be known.
+- Each "no camera" answer is logged once a function. Open's checks are one function (open_checks), shared by Open and
+  OpenAsync; Open answers as before.
+To check on the Mac, against libcamera.sprx: the ten signatures (CellCameraInfo or CellCameraInfoEx for OpenAsync, what
+each Post takes), whether an Async call with no camera is refused at once or accepted and failed through its event and
+Post (and with which event data), what a Post answers with no request outstanding, the order of the checks.
+Tests: tests/hle/test_devices.cpp "[camera]": every async form before Init, after it and after End; OpenAsync's checks
+one by one with the info left untouched; OpenPost's; the other eight with devices 0 and 1; no event on a queue asking
+for all of them.
+
+## D-666 · 2026-10-11 · cellCamera's Read2, ResetAttribute and SetContainer: the read and attribute answers, the container kept
+
+The last three of cellCamera's stubs (RPCS3: UNIMPLEMENTED_FUNC, CELL_OK, no arguments), pspocket's own and unverified
+as D-665's:
+- **Read2** answers as Read and ReadEx (D-183): NOT_INIT before Init, else NOT_OPEN, before the device number is looked
+  at (RPCS3's null-handler order for the read functions). What it takes past the device number is not known and not
+  read; nothing is written.
+- **ResetAttribute** answers as Get and SetAttribute: NOT_INIT, a device other than 0 PARAM, NOT_OPEN. What it takes
+  past the device number (an attribute, or nothing when it resets them all) is not read.
+- **SetContainer** is read as (dev_num, container): the memory container for the camera's buffers, as CellCameraInfoEx's
+  container gives one at open. Both are kept as given and it answers CELL_OK, initialised or not: a game may hand the
+  container over before cellCameraInit, and a check made on a wrong reading of the arguments (a device check where it
+  takes the container alone, an init check where it comes first) would refuse a call games get CELL_OK for today. The
+  container is not checked against lv2's; no camera ever opens to use it.
+To check on the Mac, against libcamera.sprx: the three signatures; what Read2 reads and writes; whether ResetAttribute
+resets one attribute or all and needs the camera open (from FORMATCAP on, RPCS3's Get/SetAttribute with a camera do
+not); whether SetContainer wants Init or checks the device number or the container, and what libcamera takes from it.
+Tests: test_devices.cpp "[camera]": the three before Init, after it and after End; Read2 with devices 0 and 1 and a
+pointer that is not guest memory, nothing written; ResetAttribute beside GetAttribute; SetContainer whatever it is
+given.
+
+## D-667 · 2026-10-11 · cellMic's system sharing, cellMicCommand and the multi-mic notify queue with no microphone
+
+cellMic's eight stubs (RPCS3 cellMic.cpp: UNIMPLEMENTED_FUNC, CELL_OK, no arguments) are pspocket's own, unverified
+(D-594; libmic is always native), with no microphone registered (D-183: every call on a device answers DEVICE_NOT_FOUND
+after RPCS3's checks). Nothing public gives their arguments; each reads what its model needs and no more.
+- **The system's sharing** (SysShareInit, Open, Start, Stop, Close, End): Init and End bracket it, apart from
+  cellMicInit; a second SysShareInit is ALREADY_INIT, a SysShareEnd without one NOT_INIT. Between them Open, Start, Stop
+  and Close find no microphone to share (DEVICE_NOT_FOUND); outside, NOT_INIT. Apart from cellMicInit because the
+  sharing may be begun without it (by a process on the system's side of the microphone): requiring cellMicInit would
+  refuse a call RPCS3 takes, and cellMicEnd does not end the sharing either.
+- **cellMicCommand** is a command to a microphone (RPCS3's header names the commands CellMicCommand: INIT, END, ATTACH
+  and on, the notify events' types). None is registered: NOT_INIT before Init, else DEVICE_NOT_FOUND, as every call on a
+  device here.
+- **cellMicSetMultiMicNotifyEventQueue** is read as SetNotifyEventQueue2's arguments (key, source, flag) and checked as
+  it is: NOT_INIT, the queue must exist by key (EVENT_QUEUE), then it is kept, apart from the notify queue, until
+  cellMicEnd (cellMicRemoveNotifyEventQueue removes the notify queue, as RPCS3's, which ignores its key). No microphone
+  is registered, so it gets no ATTACH or any other event. The flag is not used, as SetNotifyEventQueue2's is not.
+- **Why errors for the stubs' CELL_OK.** These act on a microphone that is not there. Most PS3s are played with none, so
+  DEVICE_NOT_FOUND is what games meet and handle there; the stubs told a game a shared microphone was open and started.
+- Each "no microphone" answer is logged once a function.
+To check on the Mac, against libmic.sprx: the signatures (what the sharing's calls take, cellMicCommand's arguments,
+SetMultiMicNotifyEventQueue's), whether the sharing needs cellMicInit or SysShareInit stands in for it, the error codes
+and their order, whether a multi-mic queue gets attach events for every device and what Remove does to it.
+Tests: test_devices.cpp "[mic]": Command before and after Init; the multi-mic queue refused before Init and without a
+queue, taken with one, no event, refused after cellMicEnd; the sharing's calls before, during and after it, with and
+without cellMicInit, a second Init and End, the sharing outliving cellMicEnd.
+
+## D-668 · 2026-10-11 · cellMicStopEx in cellMicStartEx's form
+
+cellMicStopEx was grey (D-183, D-189): RPCS3 registers it with no arguments and stops the emulator when it is called
+("unexpected function", "this function shouldn't exist"), so pspocket left it unimplemented (CELL_ENOSYS, logged) and
+the stub table (D-182) does not take it. It is in libmic's NID list and nothing gives its arguments. Its form is made
+from cellMicStartEx's: RPCS3's cellMicStart is cellMicStartEx(dev_num, 0), so cellMicStop is read as
+cellMicStopEx(dev_num, 0) and StopEx takes (dev_num, iflags):
+- a flag outside the two StartEx takes (CELL_MIC_STARTFLAG_LATENCY_4 1 and LATENCY_2 2; LATENCY_1 is 3) is PARAM,
+  before anything else, as StartEx's;
+- then as Stop: NOT_INIT before Init, else DEVICE_NOT_FOUND (no microphone is registered); with one it would stop it as
+  Stop does.
+Unverified (D-594). What the flags mean for a stop is not known: StartEx's are taken as the set a stop accepts, so a
+game passing what StartEx takes is not refused.
+To check on the Mac, against libmic.sprx: whether it exports cellMicStopEx at all (RPCS3's comment says it should not
+exist), its arguments and the flags it accepts.
+Tests: test_devices.cpp "[mic]": the flags before and after Init (PARAM for 4, 8 and the top bit, beside StartEx's 4),
+NOT_INIT, DEVICE_NOT_FOUND for every flag StartEx takes on two devices, Stop beside it, NOT_INIT after cellMicEnd.
+
+## D-669 · 2026-10-11 · cellRemotePlay with no Remote Play peer: a session's data refused, the game's settings kept
+
+cellRemotePlay (libsysutil_remoteplay) tells a game played on a PSP or PS Vita over Remote Play so, and takes its
+settings for the session. RPCS3 registers eight functions (rpcs3/Emu/Cell/Modules/cellRemotePlay.cpp), all todos
+answering CELL_OK, none with arguments but SetComparativeVolume's float and GetComparativeVolume's pointer (filled with
+1.0); its header gives the six statuses (LOADING 0, WAIT, RUNNING, UNLOADING, FATALERROR, PREMOEND 5),
+CELL_REMOTEPLAY_ERROR_INTERNAL (0x80029830) and the encoders' memory container sizes, and cellSubDisplay.h names
+0x80029813 CELL_REMOTEPLAY_ERROR_ZERO_REGISTERED. The seven stubs are pspocket's own
+(runtime/hle/src/cellRemotePlay.cpp), with GetComparativeVolume moved there from sysutil_misc.cpp so that the library is
+one state; all eight unverified (D-594; libsysutil_remoteplay is always native, D-175, so the marker only records that).
+No PSP or PS Vita is registered with this console for Remote Play (cellSubDisplay's init answers ZERO_REGISTERED,
+D-189), so no session ever starts:
+- **What a session would give** answers ZERO_REGISTERED, the code for that lack, and writes nothing: the peer's
+  information (GetPeerInfo) and the memory shared with the session (GetSharedMemory). The stubs' CELL_OK handed a game
+  what was in its own buffer as a peer's information or a pointer. Their arguments are not known and not read.
+- **GetStatus** keeps RPCS3's answer as its result, 0 (LOADING's value): none of the six statuses names "no session", an
+  error or another status could send a game down a path it does not take today, and games run with 0 on RPCS3.
+- **The game's settings** are kept and answer CELL_OK, as RPCS3's: the comparative volume (SetComparativeVolume, read
+  back by GetComparativeVolume: 1.0, RPCS3's value, until one is set; any value kept, its range not being known), all
+  the data encrypted (EncryptAllData), the video to the peer stopped (StopPeerVideoOut), for a session that never comes;
+  Break ends no session. An error for these could change a game's path for the worse, and a console with no session may
+  well take them alike.
+- **Fixed**: GetComparativeVolume wrote through its pointer unchecked (one that is not guest memory faulted the host);
+  it is now logged with the call site and refused with INTERNAL, the library's one known code. A null pointer still
+  gets CELL_OK and nothing (RPCS3).
+To check on the Mac, against libsysutil_remoteplay.sprx: the signatures (GetStatus's result or a pointer, what
+GetPeerInfo fills and GetSharedMemory gives), what GetStatus answers with no session and no device registered, the error
+codes with no session, whether the settings are kept or refused then (and the volume's range), what Break and
+StopPeerVideoOut do without a session.
+The count, with D-665 to D-668: 6,211 of 6,625 library functions pspocket's own before, 6,240 after (cellCamera's 13,
+cellMic's 8 and cellMicStopEx, cellRemotePlay's 7): every cell of the three libraries (cellCamera 43, cellMic 42,
+cellRemotePlay 8).
+Tests: test_devices.cpp "[remoteplay]": the status; the peer's information and the shared memory refused, their buffers
+untouched; the volume 1.0, then each one set, a null pointer, one that is not guest memory (the regression); the
+settings and Break; a second process starting again at 1.0. test_sysutil_misc.cpp's check of the default volume passes
+unchanged.
