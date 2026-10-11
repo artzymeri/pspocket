@@ -9341,6 +9341,7 @@ cellKey2char stop with a fault in Sony's module running on pspocket (cellFiber's
 cellFiberPpuInitializeScheduler). These libraries stay firmware-first (D-563): a game gets Sony's modules for them
 while the user's system software is installed, so none of this reaches a game; making pspocket's own match is the next
 work on them.
+
 ## D-906 · 2026-10-10 · sys_libc's locale and time as the SDK's C library has them
 
 The last 28 of sys_libc's (and sys_libm's) locale and time names are pspocket's own (runtime/hle/src/sys_libc_locale.cpp,
