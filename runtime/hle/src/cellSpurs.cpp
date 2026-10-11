@@ -2728,7 +2728,7 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
             std::memset(base + at, 0, CELL_SPURS_MAX_TASK_NAME_LENGTH);
             std::memcpy(base + at, x.name.data(), std::min<usize>(x.name.size(), CELL_SPURS_MAX_TASK_NAME_LENGTH - 1));
         }
-        lv2::sys_event_flag_clear(t, ps_read32(base, taskset + task2_flag_offset(id)), ~task2_flag_bit(id));
+        lv2::sys_event_flag_clear(t, atomic_load_be32(base, taskset + task2_flag_offset(id)), ~task2_flag_bit(id));
     }
 
     // Task start.
@@ -2995,7 +2995,7 @@ s32 create_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 task_id,
     u32 saved_blocks = 0;
     if (const s32 rc = check_task(ctx, fn, s, saved_blocks); rc != lv2::CELL_OK) return rc;
     for (const u32 off : {ts_off::event_flag_id1, ts_off::event_flag_id2}) {
-        if (!t.kernel.event_flag(ps_read32(base, taskset + off))) {
+        if (!t.kernel.event_flag(atomic_load_be32(base, taskset + off))) {
             PS_LOG_ERROR(kChan, "{}({:#x}): the taskset has no lv2 event flag at +{:#x} (not made by "
                 "cellSpursCreateTaskset2); refused with CELL_SPURS_TASK_ERROR_STAT", fn, taskset, off);
             return error(CELL_SPURS_TASK_ERROR_STAT);
@@ -3095,7 +3095,9 @@ s32 join_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 id, u32 ex
             if (const auto it = host_state.task2.find(set); it != host_state.task2.end()) it->second.joining &= ~mask;
         }
     } joining{h, taskset, bit, block};
-    const u32 flag = ps_read32(base, taskset + task2_flag_offset(id));
+    // cellSpursDestroyTaskset2 may clear the word meanwhile, on another thread (D-653): the wait is then on a flag that
+    // is gone, ESRCH (TASK_ERROR_SRCH), or ends with its cancel (SHUTDOWN).
+    const u32 flag = atomic_load_be32(base, taskset + task2_flag_offset(id));
     constexpr u32 mode = lv2::SYS_EVENT_FLAG_WAIT_AND | lv2::SYS_EVENT_FLAG_WAIT_CLEAR;
     const s32 rc = block ? lv2::sys_event_flag_wait(t, flag, task2_flag_bit(id), mode, 0, 0)
                          : lv2::sys_event_flag_trywait(t, flag, task2_flag_bit(id), mode, 0);
@@ -3139,7 +3141,8 @@ s32 cellSpursTryJoinTask2(PPUContext& ctx, u32 taskset, u32 id, u32 exit_code)
 // errors returned as they are: the taskset stays when one fails), then what cellSpursCreateTaskset2 made for it: both
 // event flags, their waiters woken first (a JoinTask2 still waiting gets TASK_ERROR_SHUTDOWN), destroyed and their IDs
 // cleared, and the tasks not joined forgotten. Tasks that had not run are abandoned with the taskset, as by
-// cellSpursShutdownTaskset (D-136).
+// cellSpursShutdownTaskset (D-136). The flags' IDs are guest words the joins and creations on other threads read while
+// this clears them: atomic loads and a release store (D-653), as D-587's shared words.
 s32 cellSpursDestroyTaskset2(PPUContext& ctx, u32 taskset)
 {
     constexpr std::string_view fn = "cellSpursDestroyTaskset2";
@@ -3149,13 +3152,13 @@ s32 cellSpursDestroyTaskset2(PPUContext& ctx, u32 taskset)
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
     for (const u32 off : {ts_off::event_flag_id1, ts_off::event_flag_id2}) {
-        const u32 flag = ps_read32(base, taskset + off);
+        const u32 flag = atomic_load_be32(base, taskset + off);
         if (!flag) continue;
         lv2::sys_event_flag_cancel(t, flag, 0);
         if (const s32 rc = lv2::sys_event_flag_destroy(t, flag); rc != lv2::CELL_OK) {
             PS_LOG_WARN(kChan, "{}({:#x}): destroying event flag {:#x}: {}", fn, taskset, flag, lv2::error_name(rc));
         }
-        ps_write32(base, taskset + off, 0);
+        atomic_store_be32(base, taskset + off, 0);
     }
     {
         SpursHost& h = host();

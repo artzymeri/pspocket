@@ -648,6 +648,47 @@ TEST_CASE("cellSpursDestroyTaskset2: shut down and joined, its event flags destr
     REQUIRE(s.a.call("cellSpursDestroyTaskset2", kTs2) == 0);
 }
 
+TEST_CASE("cellSpursDestroyTaskset2 while other threads join its tasks: a JoinTask2 waiting ends with SHUTDOWN, "
+          "TryJoinTask2 polling through it is BUSY, then SRCH (D-653)", "[hle][spurs][spurs-task2]")
+{
+    constexpr u32 kRounds = 24, kPollers = 3;
+    Task2Fixture s;
+    for (u32 round = 0; round < kRounds; round++) {
+        INFO("round " << round);
+        if (round) { // the taskset made again at the same address
+            REQUIRE(s.a.call("cellSpursCreateTaskset2", kSpurs, kTs2, kTs2Attr) == 0);
+            s.wid = ps_read32(s.b, kTs2 + 0x74);
+        }
+        const u32 w0 = s.create(0, waiting_task(1), "w0", true), w1 = s.create(1, waiting_task(2), "w1", true);
+        s.run();
+        REQUIRE(wait_for([&] { return s.task_bit(0x50, w0) && s.task_bit(0x50, w1); }));
+        // A join of the first task (it never ends), and threads polling TryJoinTask2 on the second until it is no longer
+        // BUSY: the taskset is destroyed while they do, its event flags with it.
+        Caller join(s.f, 1, "cellSpursJoinTask2", {kTs2, w0, kExit});
+        REQUIRE(join.parked_on(lv2::WaitKind::EventFlag));
+        std::atomic<u32> polls{0}, other{0};
+        std::array<std::atomic<u64>, kPollers> last{};
+        std::vector<std::thread> pollers;
+        for (u32 p = 0; p < kPollers; p++) {
+            pollers.emplace_back([&, p] {
+                GuestThread g(s.f, 2 + p, "poller");
+                const u32 out = kExit + 8 + 4 * p;
+                u64 r = 0;
+                while ((r = g.call("cellSpursTryJoinTask2", kTs2, w1, out)) == code(TASK | kBusy)) polls++;
+                if (r != code(TASK | kSrch)) other++;
+                last[p] = r;
+            });
+        }
+        REQUIRE(wait_for([&] { return polls.load() >= 20; }));
+        REQUIRE(s.a.call("cellSpursDestroyTaskset2", kTs2) == 0);
+        for (std::thread& t : pollers) t.join();
+        join.join();
+        CHECK(join.result == code(TASK | kShutdown));
+        CHECK(other == 0); // after BUSY, SRCH: the task gone with its taskset
+        for (const auto& r : last) CHECK(r.load() == code(TASK | kSrch));
+    }
+}
+
 // ------------------------------------------------------------------------------------------------- D-627
 
 TEST_CASE("cellSpursTaskExitCodeGet and TryGet: their checks; a container cellSpursCreateTaskWithAttribute binds to a "
