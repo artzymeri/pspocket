@@ -22,6 +22,7 @@ endif()
 # PSPOCKET_TEST_AC_EBOOT and PSPOCKET_TEST_AC_LIBC_MAP (game_executable.hpp).
 target_sources(test_hle PRIVATE
     test_libc_game.cpp
+    test_libc_locale_game.cpp
 )
 
 # The comparisons with Sony's modules of the firmware-first libraries and of cellVdec's newest codecs (D-597): hidden,
