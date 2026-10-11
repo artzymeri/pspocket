@@ -871,13 +871,6 @@ s32 cellSysutilApGetRequiredMemSize(PPUContext&)
     return logged("cellSysutilAp", 1024 * 1024, "cellSysutilApGetRequiredMemSize()");
 }
 
-// cellRemotePlay: no remote play; the comparative volume is 1.0 (RPCS3).
-s32 cellRemotePlayGetComparativeVolume(PPUContext& ctx, u32 volume)
-{
-    if (volume) ps_write32(guest_base(ctx), volume, std::bit_cast<u32>(1.0f));
-    return logged("cellRemotePlay", lv2::CELL_OK, std::format("cellRemotePlayGetComparativeVolume({:#x})", volume));
-}
-
 // cellVideoUpload: the callback(status, errorCode, resultURL, userdata) hears INITIALIZED (1) then FINALIZED (2), both
 // CELL_OK with an empty URL, at the next check (RPCS3); nothing is uploaded.
 s32 cellVideoUploadInitialize(PPUContext&, u32 param, u32 cb, u32 userdata)
@@ -1072,9 +1065,6 @@ void register_sysutil_misc(Registry& r)
     });
     r.add("cellSysutilAp", {
         PS_HLE_FUNC(0x9E67E0DD, cellSysutilApGetRequiredMemSize),
-    });
-    r.add("cellRemotePlay", {
-        PS_HLE_FUNC(0xE12C8C19, cellRemotePlayGetComparativeVolume),
     });
     r.add("cellVideoUpload", {
         PS_HLE_FUNC(0x122E0D0F, cellVideoUploadInitialize),

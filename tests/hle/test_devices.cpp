@@ -1,4 +1,5 @@
-// cellCamera, cellMic and libgem with no device attached, as RPCS3's default (null) handlers answer (synthetic: no game data).
+// cellCamera, cellMic and libgem with no device attached, as RPCS3's default (null) handlers answer, and cellRemotePlay with
+// no Remote Play peer (synthetic: no game data).
 
 #include "hle_test_util.hpp"
 
@@ -492,4 +493,57 @@ TEST_CASE("libgem: initialised with no Move controller connected", "[hle][device
 
     REQUIRE(g.call("cellGemEnd") == 0);
     CHECK(g.call("cellGemEnd") == kUninit);
+}
+
+TEST_CASE("cellRemotePlay: no Remote Play peer, the game's settings kept (D-669)", "[hle][devices][remoteplay]")
+{
+    const u64 kZeroRegistered = r3_of_code(0x80029813), kInternal = r3_of_code(0x80029830);
+    {
+        Fixture f;
+        GuestThread g(f, 0, "remoteplay");
+        u8* b = f.base();
+
+        // No session: RPCS3's status kept; what a session would give is refused, nothing written.
+        CHECK(g.call("cellRemotePlayGetStatus") == 0);
+        u8 before[0x40];
+        std::memset(b + kOut, 0xAA, sizeof before);
+        std::memcpy(before, b + kOut, sizeof before);
+        CHECK(g.call("cellRemotePlayGetPeerInfo", kOut) == kZeroRegistered);
+        CHECK(g.call("cellRemotePlayGetSharedMemory", kOut, kOut + 4) == kZeroRegistered);
+        CHECK(g.call("cellRemotePlayGetSharedMemory", 0, kUnmapped) == kZeroRegistered); // the arguments not read
+        CHECK(std::memcmp(before, b + kOut, sizeof before) == 0);
+
+        // The comparative volume: 1.0 (RPCS3's) until the game sets one, then the one it set.
+        ps_write32(b, kOut, 0);
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut) == 0);
+        CHECK(ps_readf32(b, kOut) == 1.0f);
+        g.ctx.fpr[1] = 0.25;
+        REQUIRE(g.call("cellRemotePlaySetComparativeVolume") == 0);
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut) == 0);
+        CHECK(ps_readf32(b, kOut) == 0.25f);
+        g.ctx.fpr[1] = 2.0; // no range is known: kept as given
+        REQUIRE(g.call("cellRemotePlaySetComparativeVolume") == 0);
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut + 8) == 0);
+        CHECK(ps_readf32(b, kOut + 8) == 2.0f);
+        CHECK(g.call("cellRemotePlayGetComparativeVolume", 0) == 0); // a null pointer gets nothing (RPCS3)
+        // A pointer that is not guest memory is refused: it was written unchecked before (a host fault).
+        CHECK(g.call("cellRemotePlayGetComparativeVolume", kUnmapped) == kInternal);
+
+        // The requests for a session that never comes: kept, CELL_OK as RPCS3.
+        CHECK(g.call("cellRemotePlayEncryptAllData") == 0);
+        CHECK(g.call("cellRemotePlayEncryptAllData") == 0);
+        CHECK(g.call("cellRemotePlayStopPeerVideoOut") == 0);
+        CHECK(g.call("cellRemotePlayBreak") == 0);
+        CHECK(g.call("cellRemotePlayGetStatus") == 0);
+        CHECK(g.call("cellRemotePlayGetPeerInfo", kOut) == kZeroRegistered);
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut) == 0);
+        CHECK(ps_readf32(b, kOut) == 2.0f);
+    }
+    {
+        // A process each: the next starts again at 1.0.
+        Fixture f;
+        GuestThread g(f, 0, "remoteplay");
+        REQUIRE(g.call("cellRemotePlayGetComparativeVolume", kOut) == 0);
+        CHECK(ps_readf32(f.base(), kOut) == 1.0f);
+    }
 }
