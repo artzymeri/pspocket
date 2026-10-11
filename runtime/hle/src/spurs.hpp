@@ -206,7 +206,7 @@ constexpr u32 revision = 0x00, name = 0x04, args = 0x08, priority = 0x10, max_co
 // Task bitsets (128 bits each, task 0 the top bit): running 0x00, ready 0x10, pending_ready 0x20, enabled 0x30,
 // signalled 0x40, waiting 0x50.
 namespace ts_off {
-constexpr u32 pending_ready = 0x20, enabled = 0x30;
+constexpr u32 running = 0x00, pending_ready = 0x20, enabled = 0x30, signalled = 0x40;
 // TaskInfo[128] at 0x80, 0x30 bytes each: args (16 bytes), elf (u64), context save storage | allocated LS blocks
 // (u64), LS pattern (16 bytes).
 constexpr u32 task_info = 0x80, task_info_stride = 0x30, ti_args = 0x00, ti_elf = 0x10, ti_context = 0x18,
@@ -215,12 +215,26 @@ constexpr u32 spurs = 0x60, args = 0x68, enable_clear_ls = 0x70, wkl_flag_wait_t
               exception_handler = 0x1880, exception_handler_arg = 0x1888, size = 0x1890;
 // CellSpursTaskset2 only: its two lv2 event flags (task joins: tasks 0..63 the first, 64..127 the second, bit id % 64),
 // the task name buffer (u64), the exit code handler, and each task's exit slot (16 bytes at exit_slots + 16 * id: an
-// exit callback's descriptor and argument, or a CellSpursTaskset2 task's exit code in its first word, D-626).
+// exit callback's descriptor and argument, or a CellSpursTaskset2 task's ExitCode2 slot, slot2_off).
 constexpr u32 event_flag_id1 = 0x1898, event_flag_id2 = 0x189C, task_name_buffer = 0x18A8, exit_code_handler = 0x1900,
               exit_slots = 0x1980;
-// The word libsre sets to 1 when the taskset's shutdown completes (its tasks' exit code containers marked then).
+// The word libsre sets to 1 when the taskset's shutdown completes (taskset_shutdown_complete).
 constexpr u32 shutdown_done = 0x1894;
+// A CellSpursTaskset2's flags byte (bit 1: its destruction has begun) and its count of Task2 tasks not yet joined
+// (libsre keeps both in the doubleword at 0x70, the workload ID its low word), and a third lv2 event flag libsre sets
+// when that count comes back to 0 during a destruction.
+constexpr u32 task2_flags = 0x70, task2_count = 0x71, event_flag_id3 = 0x18A0;
 }
+constexpr u8 kTask2Destroying = 0x02;
+// A CellSpursTaskset2 task's exit slot (16 bytes at ts_off::exit_slots + 16 * id; libsre's ExitCode2, D-914): the word
+// of the one joining it (u64: a PPU thread's lv2 event flag << 32 | 0xFFFFFF00 | the task's ID; an SPU task's taskset
+// | its ID), then the exit code (u32), 16 bits, the kind of joiner waiting (a byte: 1 a PPU thread, 2 an SPU task) and
+// the state (a byte: its low 4 bits 1 made, 2 exited, 3 ended by the taskset's shutdown, 4 joined; bit 4 started).
+namespace slot2_off {
+constexpr u32 joiner = 0, code = 8, kind = 14, state = 15;
+}
+enum : u8 { kSlot2Made = 1, kSlot2Exited = 2, kSlot2Shutdown = 3, kSlot2Joined = 4, kSlot2Started = 0x10 };
+enum : u8 { kSlot2JoinerPpu = 1, kSlot2JoinerSpu = 2 };
 // A CellSpursTaskset2 task's lv2 event flag (its ID's offset in the taskset) and bit (D-626).
 constexpr u32 task2_flag_offset(u32 id) { return id < 64 ? ts_off::event_flag_id1 : ts_off::event_flag_id2; }
 constexpr u64 task2_flag_bit(u32 id) { return u64{1} << (id & 63); }
@@ -291,17 +305,9 @@ struct Instance {
     bool helper_failed = false;
 };
 
-// A CellSpursTaskset2's own tasks (cellSpursCreateTask2, D-626), by the taskset's address: the IDs of those created and
-// not yet joined (a task that exited keeps its ID until cellSpursJoinTask2 takes its exit code, so a task created in
-// between cannot take it) and those a JoinTask2 waits for. Bit 127 - id, as the taskset's bit sets.
-struct Task2Ids {
-    u128 unjoined = 0, joining = 0;
-};
-
 struct SpursHost {
     std::mutex mutex;
     std::map<u32, Instance> instances;
-    std::map<u32, Task2Ids> task2;
 };
 
 inline SpursHost& host()
@@ -352,6 +358,21 @@ s32 send_signal(u8* base, u32 taskset, u32 task_id);
 // (running and waiting, ready and pending ready, a bit of a task that is not enabled), and nothing changed; 1 when it
 // was waiting for the signal and had none, so its workload needs one; 0 otherwise.
 int signal_task(u8* base, u32 taskset, u32 task_id);
+
+// A CellSpursTaskset2 task's exit as libsre's ExitCode2 makes it (natively, D-914): the code and `state` into its exit
+// slot (the state byte replaced: 0x12 when the task itself exited, 2 or 3 in libsre's PPU copy, which its taskset's
+// shutdown runs), then the joiner waiting woken (a PPU thread's event flag bit, an SPU task's signal).
+void task2_store_exit(lv2::Kernel& kernel, u8* base, u32 taskset, u32 id, u32 code, u8 state);
+// A task's exit code into its exit code container, as libsre's exit code handler makes it (D-195, D-914): only into a
+// bound one (status bit 0), the code and bit 2 (and 3 when the taskset's shutdown ended the task), then an SPU task
+// waiting signalled. CELL_OK, or the TASK_ERROR NULL_POINTER, ALIGN or STAT (not bound) libsre's handler returns.
+s32 container_store_exit(u8* base, u32 container, u32 code, bool shutdown);
+// A taskset's shutdown completion, libsre's shutdown-completion hook for every taskset (natively, D-914): its word at
+// +0x1894 set to 1, then each task left ready, pending or waiting loses its ELF word's bits 0 and 2 and gets its end:
+// a bound exit code container code 0 with bit 3 (container_store_exit), a CellSpursTaskset2 task state 3
+// (task2_store_exit), which wakes a JoinTask2 waiting for it with TASK_ERROR_SHUTDOWN. Once per taskset: a second call
+// finds the word 1 and does nothing. Called when the taskset's workload is removable and no worker is inside it.
+void taskset_shutdown_complete(lv2::Kernel& kernel, u8* base, u32 taskset);
 
 // Wakes the instance's idle workers (cellSpursWakeUp, and HLE writes to CellSpurs line 0 that don't go through the
 // reservation system).

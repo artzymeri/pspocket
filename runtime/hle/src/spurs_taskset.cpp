@@ -19,9 +19,10 @@
 // the callback's code is loaded at 0x10000 and run with the taskset, task ID, exit code and argument (RPCS3
 // cellSpursSpu.cpp spursTasksetOnTaskExit, a draft of libsre's; Sony's libvdec chains its H.264 decoder's tasks so).
 // libsre's own exit code handler is done natively (store_exit_code). A task with bit 2 is a CellSpursTaskset2's own
-// task (cellSpursCreateTask2, D-626): when it exits, libsre's Task2 handler's work is done natively (task2_exit): its
-// exit code into the taskset's exit slot, then its bit of the taskset's lv2 event flag, which cellSpursJoinTask2 waits
-// on. Elf bit 1 (a debugger break) is logged.
+// task (cellSpursCreateTask2, D-626, D-914): when it exits, its enabled bit stays (its ID is taken until it is joined)
+// and libsre's Task2 handler's work is done natively (task2_exit): its exit code and state into its exit slot, then the
+// joiner waiting, if any, woken. A taskset's shutdown completion (libsre's hook) is native too
+// (taskset_shutdown_complete). Elf bit 1 (a debugger break) is logged.
 
 #include <atomic>
 #include <bit>
@@ -78,8 +79,10 @@ ps_spu_v128 word0(u32 v)
     return r;
 }
 
+// Destroy2: a CellSpursTaskset2 task's exit (Destroy, its enabled bit kept: its ID stays taken until cellSpursJoinTask2
+// takes its exit code and clears it, as libsre's join does; D-914).
 enum class Request : s32 { PollSignal = -1, Destroy = 0, Yield = 1, WaitSignal = 2, Poll = 3, WaitWklFlag = 4, Select = 5,
-                           RecvWklFlag = 6 };
+                           RecvWklFlag = 6, Destroy2 = 0x100 };
 enum class Next { Resume, Dispatch, Exit };
 
 class Policy {
@@ -152,8 +155,9 @@ s32 Policy::request(Request r, u32* task_id_out, bool* was_waiting)
             signalled &= ~m;
             break;
         case Request::Destroy:
+        case Request::Destroy2:
             R &= ~m;
-            E &= ~m;
+            if (r == Request::Destroy) E &= ~m;
             ready &= ~m;
             signalled &= ~m;
             n -= 1;
@@ -473,70 +477,23 @@ void Policy::run_exit_callback(u32 exit_code)
             ea, reason, c.stop_code));
 }
 
-// libsre's exit code handler (the SPU code its CellSpursTaskset2 keeps at 0x1900, D-195), natively: the exit code goes
-// into the task's exit code container, one 128-byte line: the status word at +0x20 (bit 0 initialized, bit 2 an exit
-// code stored, bit 16 a PPU thread waits, bit 17 an SPU task waits), the exit code at +0x28, a waiting task's taskset
-// (u64) at +0x30 and its ID (a byte) at +0x38. A NULL or misaligned container, or one not initialized, is left alone (libsre's
-// handler returns an error nobody reads). Then the task that waits is signalled. A PPU thread waiting in pspocket's
-// cellSpursTaskExitCodeGet sleeps until the container's line changes, which this update does (D-627), and marks
-// nothing; bit 16 (libsre's PPU waiter, with an event flag at +0x40) is set by no native code: it stops loudly.
+// libsre's exit code handler (the SPU code its CellSpursTaskset2 keeps at 0x1900, D-195), natively: container_store_exit.
 void Policy::store_exit_code(u32 container, u32 exit_code)
 {
-    if (!container || (container & 0x7F)) {
-        PS_LOG_ERROR(kTaskChan, "task {} of taskset {:#x}: exit code container {:#x} is NULL or misaligned", task_id(),
-            taskset_, container);
-        return;
-    }
-    u32 old = 0;
-    bool stored = false;
-    reservation_op(base_, container, [&](u8* line) {
-        old = ps_read32(line, 0x20);
-        stored = old & 1;
-        if (!stored) return false;
-        ps_write32(line, 0x20, old | 4);
-        ps_write32(line, 0x28, exit_code);
-        return true;
-    });
-    if (!stored) {
-        PS_LOG_ERROR(kTaskChan, "task {} of taskset {:#x}: exit code container {:#x} is not initialized", task_id(), taskset_,
-            container);
-        return;
-    }
-    PS_LOG_DEBUG(kTaskChan, "task {} of taskset {:#x}: exit code {:#x} into container {:#x} (status {:#x})", task_id(),
-        taskset_, exit_code, container, old);
-    if (old & (1u << 17)) {
-        const u64 waiter_taskset = ps_read64(base_, container + 0x30);
-        const u32 waiter = base_[container + 0x38];
-        if (const s32 rc = send_signal(base_, static_cast<u32>(waiter_taskset), waiter); rc != lv2::CELL_OK)
-            PS_LOG_ERROR(kTaskChan, "exit code container {:#x}: signalling task {} of taskset {:#x}: {:#x}", container,
-                waiter, waiter_taskset, static_cast<u32>(rc));
-    }
-    if (old & (1u << 16)) fatal(std::format("exit code container {:#x}: a PPU thread waiting on it is not implemented", container));
+    PS_LOG_DEBUG(kTaskChan, "task {} of taskset {:#x}: exit code {:#x} into container {:#x}", task_id(), taskset_,
+        exit_code, container);
+    if (const s32 rc = container_store_exit(base_, container, exit_code, false); rc != lv2::CELL_OK)
+        PS_LOG_ERROR(kTaskChan, "task {} of taskset {:#x}: its exit code {:#x} not stored in container {:#x} ({:#x}: NULL, "
+            "misaligned or not bound)", task_id(), taskset_, exit_code, container, static_cast<u32>(rc));
 }
 
 // libsre's handler for a CellSpursTaskset2's own tasks (the SPU code whose descriptor cellSpursCreateTaskset2 keeps at
-// 0x78; D-626), natively, after the task's destroy request: its exit code into the first word of the task's exit slot
-// in the taskset (0x1980 + 16 * id), in one update of the slot's line, then its bit (id % 64) of the taskset's lv2
-// event flag for its half (0x1898 for tasks 0..63, 0x189C for 64..127), which cellSpursJoinTask2 waits on. The task's
-// ID stays out of reach of new tasks until it is joined (cellSpurs.cpp keeps that). A flag that does not exist (the
-// taskset not made by cellSpursCreateTaskset2, or destroyed) is logged: nobody can join the task then.
+// 0x78), natively, after the task's destroy request: task2_store_exit with state 0x12, exited and started (libsre's SPU
+// handler was not read: libsre's PPU side, when CreateTask2 marks the task started, accepts only 1 or 0x12, so a task
+// that exits before that mark leaves 0x12 there; JoinTask2 reads the low 4 bits).
 void Policy::task2_exit(u32 exit_code)
 {
-    const u32 id = task_id();
-    const u32 slot = taskset_ + ts_off::exit_slots + 16 * id;
-    reservation_op(base_, slot, [&](u8* line) {
-        ps_write32(line, slot & (PS_RES_LINE_SIZE - 1), exit_code);
-        return true;
-    });
-    const u32 flag_id = ps_read32(base_, taskset_ + task2_flag_offset(id));
-    if (const auto flag = w_.sched.kernel.event_flag(flag_id)) {
-        flag->set(task2_flag_bit(id));
-    } else {
-        PS_LOG_ERROR(kTaskChan, "task {} of CellSpursTaskset2 {:#x} exited ({:#x}), but its lv2 event flag {:#x} does not "
-            "exist: no cellSpursJoinTask2 can take its exit code", id, taskset_, exit_code, flag_id);
-    }
-    PS_LOG_DEBUG(kTaskChan, "task {} of CellSpursTaskset2 {:#x}: exit code {:#x}, event flag {:#x} bit {}", id, taskset_,
-        exit_code, flag_id, id & 63);
+    task2_store_exit(w_.sched.kernel, base_, taskset_, task_id(), exit_code, kSlot2Started | kSlot2Exited);
 }
 
 // A task gave up the SPU (exit, yield, wait): its GUID in local store is cleared (the saved copy keeps it), then the
@@ -562,7 +519,7 @@ Next Policy::syscall()
         // A CellSpursTaskset2 task by its TaskInfo's ELF word, read before the destroy request frees the ID (the
         // execution context's flags at 0x2FD4 say the same, but sit in the quadword a task stores its exit code in).
         const u64 elf = ps_read64(base_, taskset_ + ts_off::task_info + task_id() * ts_off::task_info_stride + ts_off::ti_elf);
-        request(Request::Destroy);
+        request((elf & 4) ? Request::Destroy2 : Request::Destroy);
         if (elf & 4) task2_exit(ps_read32(ls_, ls::ctx_exit_code));
         else if (static_cast<u32>(ps_read64(ls_, ls::ctx_exit_cb))) run_exit_callback(ps_read32(ls_, ls::ctx_exit_code));
         PS_LOG_DEBUG(kTaskChan, "SPURS {:#x}: task {} of taskset {:#x} exited ({:#x})", w_.sched.spurs, task_id(), taskset_,
@@ -667,6 +624,125 @@ void Policy::run(u32 poll_status)
 void run_taskset(Worker& w, u32 wid, u32 taskset, u32 poll_status)
 {
     Policy(w, wid, taskset).run(poll_status);
+}
+
+// The exit code container (one 128-byte line): the status word at +0x20 (bit 0 bound, bit 1 started, bit 2 the code
+// stored, bit 3 the task ended by its taskset's shutdown, bit 16 a PPU thread waits, bit 17 an SPU task waits), the
+// exit code at +0x28, a waiting task's taskset (u64) at +0x30 and its ID (a byte) at +0x38 (libsre 0x13a90). A NULL or
+// misaligned container, or one not bound, is left alone with the error libsre's handler returns (its callers ignore
+// it). A PPU thread waiting in pspocket's cellSpursTaskExitCodeGet sleeps until the container's line changes, which
+// this update does, and marks nothing; bit 16 (libsre's PPU waiter, with an event flag at +0x40) is set by no native
+// code: it stops loudly.
+s32 container_store_exit(u8* base, u32 container, u32 code, bool shutdown)
+{
+    if (!container) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (container & 0x7F) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    u32 old = 0;
+    bool bound = false;
+    reservation_op(base, container, [&](u8* line) {
+        old = ps_read32(line, exitcode_off::status);
+        bound = old & kExitCodeInitialized;
+        if (!bound) return false;
+        ps_write32(line, exitcode_off::code, code);
+        ps_write32(line, exitcode_off::status, old | kExitCodeStored | (shutdown ? kExitCodeShutdown : 0));
+        return true;
+    });
+    if (!bound) return error(CELL_SPURS_TASK_ERROR_STAT);
+    if (old & kExitCodeSpuWaits) {
+        const u64 waiter_taskset = ps_read64(base, container + exitcode_off::waiter_taskset);
+        const u32 waiter = base[container + exitcode_off::waiter_id];
+        if (const s32 rc = send_signal(base, static_cast<u32>(waiter_taskset), waiter); rc != lv2::CELL_OK)
+            PS_LOG_ERROR(kTaskChan, "exit code container {:#x}: signalling task {} of taskset {:#x}: {:#x}", container,
+                waiter, waiter_taskset, static_cast<u32>(rc));
+    }
+    if (old & kExitCodePpuWaits)
+        PS_FATAL(kTaskChan, "exit code container {:#x}: a PPU thread waiting on it through libsre's event flag is not "
+            "implemented", container);
+    return lv2::CELL_OK;
+}
+
+// libsre's shutdown-completion hook (0x14df8), natively. The ELF word update and the ends are libsre's; the tasks it
+// looks at are those ready, pending ready or waiting (none runs: no worker is inside).
+void taskset_shutdown_complete(lv2::Kernel& kernel, u8* base, u32 taskset)
+{
+    const u32 done = taskset + ts_off::shutdown_done;
+    bool first = false;
+    reservation_op(base, done, [&](u8* line) {
+        const u32 off = done & (PS_RES_LINE_SIZE - 1);
+        first = ps_read32(line, off) != 1;
+        if (!first) return false; // completed already (the hook runs once per shutdown)
+        ps_write32(line, off, 1);
+        return true;
+    });
+    if (!first) return;
+    u32 ended = 0;
+    for (u32 w = 0; w < 4; w++) {
+        const u32 live = ps_read32(base, taskset + bits::ready + 4 * w) | ps_read32(base, taskset + bits::pending_ready + 4 * w) |
+            ps_read32(base, taskset + bits::waiting + 4 * w);
+        for (u32 k = 0; k < 32; k++) {
+            if (!(live & (0x80000000u >> k))) continue;
+            const u32 id = 32 * w + k;
+            const u32 info = taskset + ts_off::task_info + id * ts_off::task_info_stride + ts_off::ti_elf;
+            u64 elf = 0;
+            reservation_op(base, info, [&](u8* line) {
+                const u32 off = info & (PS_RES_LINE_SIZE - 1);
+                elf = ps_read64(line, off);
+                ps_write64(line, off, elf & ~5ull);
+                return true;
+            });
+            const u32 slot = taskset + ts_off::exit_slots + 16 * id;
+            if (elf & 1) {
+                const u32 container = ps_read32(base, slot + 12);
+                if (const s32 rc = container_store_exit(base, container, 0, true); rc != lv2::CELL_OK)
+                    PS_LOG_DEBUG(kTaskChan, "taskset {:#x}'s shutdown: task {}'s exit code container {:#x}: {:#x} "
+                        "(ignored, as libsre)", taskset, id, container, static_cast<u32>(rc));
+            }
+            if (elf & 4) task2_store_exit(kernel, base, taskset, id, 0, kSlot2Shutdown);
+            ended++;
+        }
+    }
+    PS_LOG_DEBUG(kTaskChan, "taskset {:#x}: its shutdown completed ({} tasks left ended)", taskset, ended);
+}
+
+// libsre's ExitCode2 store (its PPU copy at 0x116fc): the exit slot's code word gets the code and the state byte, the
+// joiner's kind and the 16 bits kept, in one update; then the joiner waiting, if any: a PPU thread through its lv2
+// event flag (the slot's first word's high half), bit id % 64; an SPU task through its signal. Another kind, a PPU
+// joiner's word naming another task, a flag that is gone or a signal refused are libsre's assertions.
+void task2_store_exit(lv2::Kernel& kernel, u8* base, u32 taskset, u32 id, u32 code, u8 state)
+{
+    const u32 slot = taskset + ts_off::exit_slots + 16 * id, off = slot & (PS_RES_LINE_SIZE - 1);
+    u64 joiner = 0;
+    u32 kind = 0;
+    reservation_op(base, slot, [&](u8* line) {
+        const u64 w = ps_read64(line, off + slot2_off::code);
+        kind = static_cast<u32>(w >> 8) & 0xFF;
+        joiner = ps_read64(line, off + slot2_off::joiner);
+        ps_write64(line, off + slot2_off::code, u64{code} << 32 | (w & 0xFFFFFF00u) | state);
+        return true;
+    });
+    PS_LOG_DEBUG(kTaskChan, "task {} of CellSpursTaskset2 {:#x}: exit code {:#x}, state {:#x}, joiner kind {}", id,
+        taskset, code, state, kind);
+    if (kind == kSlot2JoinerPpu) {
+        if ((joiner & 0xFF) != id)
+            PS_FATAL(kTaskChan, "task {} of CellSpursTaskset2 {:#x}: its joiner's word {:#x} names another task; libsre "
+                "(fw 4.92) asserts here", id, taskset, joiner);
+        const u32 flag_id = static_cast<u32>(joiner >> 32);
+        if (const auto flag = kernel.event_flag(flag_id)) {
+            flag->set(u64{1} << (id & 63));
+        } else {
+            PS_FATAL(kTaskChan, "task {} of CellSpursTaskset2 {:#x}: its joiner's lv2 event flag {:#x} does not exist; "
+                "libsre (fw 4.92) asserts here and aborts the process", id, taskset, flag_id);
+        }
+    } else if (kind == kSlot2JoinerSpu) {
+        if (const s32 rc = send_signal(base, static_cast<u32>(joiner) & ~0x7Fu, static_cast<u32>(joiner) & 0x7F);
+            rc != lv2::CELL_OK) {
+            PS_FATAL(kTaskChan, "task {} of CellSpursTaskset2 {:#x}: signalling its joining task ({:#x}): {:#x}; libsre "
+                "(fw 4.92) asserts here", id, taskset, joiner, static_cast<u32>(rc));
+        }
+    } else if (kind != 0) {
+        PS_FATAL(kTaskChan, "task {} of CellSpursTaskset2 {:#x}: its exit slot names joiner kind {}; libsre (fw 4.92) "
+            "asserts here", id, taskset, kind);
+    }
 }
 
 } // namespace pspocket::hle::spurs

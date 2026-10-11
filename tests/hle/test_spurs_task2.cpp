@@ -1,8 +1,9 @@
-// cellSpurs' last functions on the native SPURS, made without libsre to compare with (unverified, D-594), with
-// synthetic SPU tasks (assembled here: no game data): CellSpursTaskset2's own tasks, created, run and joined with their
-// exit codes (D-626); task exit code containers (D-627); the LF queue's bodies and lv2 event queue through SPURS, with
-// PPU threads on one side and SPU code (the host on its behalf, or a waiting task) on the other (D-628); the job
-// pipeline's answer and the system workload given up (D-629).
+// cellSpurs' last functions on the native SPURS, made without libsre to compare with (D-594), libsre's since D-914 but
+// for the lv2 event queue's, with synthetic SPU tasks (assembled here: no game data): CellSpursTaskset2's own tasks,
+// created, run and joined with their exit codes (D-626, D-914); task exit code containers (D-627); a taskset's
+// shutdown completion (D-914); the LF queue's bodies and lv2 event queue through SPURS, with PPU threads on one side
+// and SPU code (the host on its behalf, or a waiting task) on the other (D-628); the job pipeline's answer and the
+// system workload given up (D-629).
 
 #include "hle_test_util.hpp"
 
@@ -230,7 +231,7 @@ struct Task2Fixture {
         write_task_elf(b, kElf + 0x1000 * n, p);
         std::memset(b + kArg, 0, 16);
         ps_write32(b, kArg, kOut + 0x100 * n);
-        REQUIRE(a.call("_cellSpursTaskAttribute2Initialize", kAttr2, 1) == 0);
+        REQUIRE(a.call("_cellSpursTaskAttribute2Initialize", kAttr2, 0) == 0); // revision 0, the only one libsre takes
         if (context) {
             ps_write32(b, kAttr2 + 0x04, 0xC00);
             ps_write64(b, kAttr2 + 0x08, kCtx + 0x1000 * n);
@@ -302,9 +303,7 @@ private:
 TEST_CASE("cellSpurs: the functions made without libsre to compare with, under their NIDs and unverified (D-594)",
     "[hle][spurs][spurs-task2]")
 {
-    for (const char* name : {"cellSpursCreateTask2", "cellSpursCreateTask2WithBinInfo", "cellSpursJoinTask2",
-             "cellSpursTryJoinTask2", "cellSpursDestroyTaskset2", "cellSpursLFQueueAttachLv2EventQueue",
-             "cellSpursLFQueueDetachLv2EventQueue"}) {
+    for (const char* name : {"cellSpursLFQueueAttachLv2EventQueue", "cellSpursLFQueueDetachLv2EventQueue"}) {
         INFO(name);
         const hle::Function* fn = hle::registry().find("cellSpurs", recomp::nid_of(name));
         REQUIRE(fn != nullptr);
@@ -316,16 +315,29 @@ TEST_CASE("cellSpurs: the functions made without libsre to compare with, under t
     for (const char* name : {"cellSpursCreateTaskset2", "cellSpursCreateTaskWithAttribute", "cellSpursTaskExitCodeInitialize",
              "_cellSpursLFQueueInitialize", "cellSpursTaskExitCodeGet", "cellSpursTaskExitCodeTryGet",
              "_cellSpursLFQueuePushBody", "_cellSpursLFQueuePopBody", "cellSpursGetJobPipelineInfo",
-             "cellSpursRemoveSystemWorkloadForUtility"}) {
+             "cellSpursRemoveSystemWorkloadForUtility", "cellSpursCreateTask2", "cellSpursCreateTask2WithBinInfo",
+             "cellSpursJoinTask2", "cellSpursTryJoinTask2", "cellSpursDestroyTaskset2"}) {
         INFO(name);
+        const hle::Function* fn = hle::registry().find("cellSpurs", recomp::nid_of(name));
+        REQUIRE(fn != nullptr);
+        CHECK(fn->name == name);
         CHECK_FALSE(hle::registry().is_unverified("cellSpurs", recomp::nid_of(name)));
     }
 }
 
-// ------------------------------------------------------------------------------------------------- D-626
+// ------------------------------------------------------------------------------------------------- D-626, D-914
+
+namespace {
+
+// A Task2 task's exit slot: its state byte (low 4 bits 1 made, 2 exited, 3 shut down; bit 4 started), the kind of
+// joiner waiting, the joiner's word and the exit code (libsre's ExitCode2, D-914).
+u8 slot_state(u8* b, u32 id) { return line_word(b, kTs2 + 0x198C + 16 * id) & 0xFF; }
+u8 slot_kind(u8* b, u32 id) { return (line_word(b, kTs2 + 0x198C + 16 * id) >> 8) & 0xFF; }
+
+} // namespace
 
 TEST_CASE("cellSpursCreateTask2: its checks; a CellSpursTaskset2's tasks run, exit and are joined with their exit "
-          "codes (D-626)", "[hle][spurs][spurs-task2]")
+          "codes (D-626, D-914)", "[hle][spurs][spurs-task2]")
 {
     Task2Fixture s;
     u8* b = s.b;
@@ -336,31 +348,37 @@ TEST_CASE("cellSpursCreateTask2: its checks; a CellSpursTaskset2's tasks run, ex
     REQUIRE(s.a.call("cellSpursTasksetAttributeSetTasksetSize", kTsAttr, 10496) == 0);
     REQUIRE(s.a.call("cellSpursCreateTasksetWithAttribute", kSpurs, kTsBig, kTsAttr) == 0);
 
-    // The taskset's checks: NULL, ALIGN, memory; a CellSpursTaskset PERM; a CellSpursTaskset2 without the event flags
-    // cellSpursCreateTaskset2 makes (one made through the attribute's size) STAT.
+    // libsre's order: id and taskset NULL, ALIGN; the attribute's revision (0 only: INVAL); a CellSpursTaskset (its
+    // size) or a CellSpursTaskset2 without the event flags cellSpursCreateTaskset2 makes PERM. Memory libsre would read
+    // is checked first (FAULT, D-042).
     CHECK(s.a.call("cellSpursCreateTask2", kTs2, 0, kElf, 0, 0) == code(TASK | kNull));
     CHECK(s.a.call("cellSpursCreateTask2", 0, kId, kElf, 0, 0) == code(TASK | kNull));
     CHECK(s.a.call("cellSpursCreateTask2", kTs2 + 0x40, kId, kElf, 0, 0) == code(TASK | kAlign));
     CHECK(s.a.call("cellSpursCreateTask2", kUnmapped, kId, kElf, 0, 0) == code(TASK | kFault));
     CHECK(s.a.call("cellSpursCreateTask2", kTs1, kId, kElf, 0, 0) == code(TASK | kPerm));
-    CHECK(s.a.call("cellSpursCreateTask2", kTsBig, kId, kElf, 0, 0) == code(TASK | kStat));
-    // The task's own (create_task's): the ELF NULL, misaligned or not an SPU task's, a context too small, the attribute
-    // or the name not guest memory.
+    CHECK(s.a.call("cellSpursCreateTask2", kTsBig, kId, kElf, 0, 0) == code(TASK | kPerm));
+    REQUIRE(s.a.call("_cellSpursTaskAttribute2Initialize", kAttr2, 1) == 0);
+    CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf, 0, kAttr2) == code(TASK | kInval));
+    CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf, 0, kUnmapped) == code(TASK | kFault));
+    // The task's own (create_task's): the ELF NULL, misaligned or not an SPU task's, a context too small, the name not
+    // guest memory.
     CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, 0, 0, 0) == code(TASK | kNull));
     CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf + 8, 0, 0) == code(TASK | kAlign));
     std::memset(b + kElf + 0x9000, 0, 0x100);
     CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf + 0x9000, 0, 0) == code(TASK | kNoexec));
-    CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf, 0, kUnmapped) == code(TASK | kFault));
-    REQUIRE(s.a.call("_cellSpursTaskAttribute2Initialize", kAttr2, 1) == 0);
+    REQUIRE(s.a.call("_cellSpursTaskAttribute2Initialize", kAttr2, 0) == 0);
     ps_write32(b, kAttr2 + 0x04, 0x200);
     ps_write64(b, kAttr2 + 0x08, kCtx);
     CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf, 0, kAttr2) == code(TASK | kInval));
-    REQUIRE(s.a.call("_cellSpursTaskAttribute2Initialize", kAttr2, 1) == 0);
+    REQUIRE(s.a.call("_cellSpursTaskAttribute2Initialize", kAttr2, 0) == 0);
     ps_write32(b, kAttr2 + 0x20, kUnmapped);
     CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf, 0, kAttr2) == code(TASK | kFault));
     CHECK(ps_read32(b, kTs2 + 0x30) == 0); // a refused call takes no ID
+    CHECK(b[kTs2 + 0x71] == 0);
 
-    // Three tasks: the ELF word's bit 2 marks them; their names in the task name buffer, cut to 31 characters.
+    // Three tasks: the ELF word's bit 2 marks them; their names in the task name buffer, cut to 31 characters, a task
+    // without a name leaves its slot as it was; the count of Task2 tasks not joined; each slot made and started.
+    std::memset(b + kNames + 64, 0x5A, 32);
     const std::string long_name = "a name of more than thirty-one characters";
     const u32 t0 = s.create(0, exiting_task(0x11), "first");
     const u32 t1 = s.create(1, exiting_task(0x22), long_name.c_str());
@@ -371,58 +389,78 @@ TEST_CASE("cellSpursCreateTask2: its checks; a CellSpursTaskset2's tasks run, ex
     CHECK(ps_read64(b, kTs2 + 0x80 + 0x30 * t1 + 0x10) == ((kElf + 0x1000) | 4));
     CHECK(std::string(reinterpret_cast<const char*>(b + kNames + 32 * t0)) == "first");
     CHECK(std::string(reinterpret_cast<const char*>(b + kNames + 32 * t1)) == long_name.substr(0, 31));
-    CHECK(b[kNames + 32 * t2] == 0);
+    CHECK(b[kNames + 32 * t2] == 0x5A);
+    CHECK(b[kTs2 + 0x71] == 3);
+    CHECK(slot_state(b, t0) == 0x11);
+    CHECK(ps_read64(b, kTs2 + 0x1980 + 16 * t0) == 0); // no joiner
 
-    // Not run yet: TryJoinTask2 is BUSY. JoinTask2's checks.
-    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, t0, kExit) == code(TASK | kBusy));
+    // Not run yet: TryJoinTask2 AGAIN. JoinTask2's checks: NULL, ALIGN, INVAL, then the slot: none made there STAT
+    // (JoinTask2 has registered itself in that slot, as libsre leaves it), the exit code not guest memory FAULT.
+    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, t0, kExit) == code(TASK | kAgain));
     CHECK(s.a.call("cellSpursJoinTask2", 0, t0, kExit) == code(TASK | kNull));
+    CHECK(s.a.call("cellSpursJoinTask2", kTs2, t0, 0) == code(TASK | kNull));
     CHECK(s.a.call("cellSpursJoinTask2", kTs2 + 0x40, t0, kExit) == code(TASK | kAlign));
-    CHECK(s.a.call("cellSpursJoinTask2", kTs1, t0, kExit) == code(TASK | kPerm));
     CHECK(s.a.call("cellSpursJoinTask2", kTs2, 128, kExit) == code(TASK | kInval));
-    CHECK(s.a.call("cellSpursJoinTask2", kTs2, 5, kExit) == code(TASK | kSrch)); // no such task
+    CHECK(s.a.call("cellSpursJoinTask2", kTs2, 5, kExit) == code(TASK | kStat)); // no such task
+    CHECK(ps_read64(b, kTs2 + 0x1980 + 16 * 5) == (u64{ps_read32(b, kTs2 + 0x1898)} << 32 | 0xFFFFFF05u));
+    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, 6, kExit) == code(TASK | kStat));
+    CHECK(ps_read64(b, kTs2 + 0x1980 + 16 * 6) == 0); // TryJoinTask2 registers nothing
     CHECK(s.a.call("cellSpursJoinTask2", kTs2, t0, kUnmapped) == code(TASK | kFault));
     CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, 200, kExit) == code(TASK | kInval));
 
-    // They run; joined in another order than they ran, each with its own code from its exit slot.
+    // They run; joined in another order than they ran, each with its own code from its exit slot; a join clears the
+    // slot, the name's first byte, the task's enabled bit and counts the task off.
     s.run();
     REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, t2, kExit) == 0);
     CHECK(ps_read32(b, kExit) == 0x33);
     CHECK(s.report(2) == 1);
     REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, t0, kExit) == 0);
     CHECK(ps_read32(b, kExit) == 0x11);
+    CHECK(b[kNames + 32 * t0] == 0);
+    CHECK(b[kNames + 32 * t0 + 1] == 'i');
     REQUIRE(wait_for([&] { return s.a.call("cellSpursTryJoinTask2", kTs2, t1, kExit) == 0; }));
     CHECK(ps_read32(b, kExit) == 0x22);
-    CHECK(ps_read32(b, kTs2 + 0x1980 + 16 * t1) == 0x22);
-    CHECK(ps_read64(b, kTs2 + 0x1988 + 16 * t1) == 0); // no exit code container
-    CHECK(s.a.call("cellSpursJoinTask2", kTs2, t1, kExit) == code(TASK | kSrch)); // joined already
-    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, t0, kExit) == code(TASK | kSrch));
+    CHECK(ps_read64(b, kTs2 + 0x1980 + 16 * t1) == 0);
+    CHECK(ps_read64(b, kTs2 + 0x1988 + 16 * t1) == 0);
+    CHECK_FALSE(s.task_bit(0x30, t1));
+    CHECK(b[kTs2 + 0x71] == 0);
+    CHECK(s.a.call("cellSpursJoinTask2", kTs2, t1, kExit) == code(TASK | kStat)); // joined already
+    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, t0, kExit) == code(TASK | kStat));
 
-    // A task of the taskset made with cellSpursCreateTask is not one of its own: nothing to join (SRCH).
+    // A task of the taskset made with cellSpursCreateTask is not one of its own: nothing to join (STAT).
     write_task_elf(b, kElf + 0x3000, exiting_task(0x44));
     ps_write32(b, kArg, kOut + 0x300);
     REQUIRE(s.a.call("cellSpursCreateTask", kTs2, kId, kElf + 0x3000, 0, 0, 0, kArg) == 0);
     const u32 plain = ps_read32(b, kId);
-    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, plain, kExit) == code(TASK | kSrch));
+    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, plain, kExit) == code(TASK | kStat));
     REQUIRE(wait_for([&] { return s.report(3) == 1; }));
 }
 
 TEST_CASE("CellSpursTaskset2: a task that exited keeps its ID until it is joined; JoinTask2 waits for its task, a second "
-          "one is BUSY (D-626)", "[hle][spurs][spurs-task2]")
+          "one is STAT (D-626, D-914)", "[hle][spurs][spurs-task2]")
 {
     Task2Fixture s;
     const u32 w = s.create(0, waiting_task(0x55), "waiter", true);
     const u32 e = s.create(1, exiting_task(0x66), "exiter");
     s.run();
-    REQUIRE(wait_for([&] { return s.report(1) == 1 && !s.task_bit(0x30, e); })); // ran and destroyed
-    REQUIRE(wait_for([&] { return s.report(0) == 1 && s.task_bit(0x50, w); }));  // waiting
+    // The exited task: its slot exited (with the started bit), its enabled bit kept.
+    REQUIRE(wait_for([&] { return s.report(1) == 1 && (slot_state(s.b, e) & 0xF) == 2; }));
+    CHECK(slot_state(s.b, e) == 0x12);
+    CHECK(s.task_bit(0x30, e));
+    CHECK_FALSE(s.task_bit(0x00, e));
+    CHECK(ps_read32(s.b, kTs2 + 0x1988 + 16 * e) == 0x66);
+    REQUIRE(wait_for([&] { return s.report(0) == 1 && s.task_bit(0x50, w); })); // waiting
     // The exited task's ID is not given to the next task before its exit code was taken.
     const u32 c = s.create(2, exiting_task(0x77), "third");
     CHECK(c == 2);
     {
         Caller join(s.f, 1, "cellSpursJoinTask2", {kTs2, w, kExit + 4});
         REQUIRE(join.parked_on(lv2::WaitKind::EventFlag));
-        CHECK(s.a.call("cellSpursJoinTask2", kTs2, w, kExit) == code(TASK | kBusy));
-        CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, w, kExit) == code(TASK | kBusy));
+        CHECK(slot_kind(s.b, w) == 1);
+        CHECK(ps_read64(s.b, kTs2 + 0x1980 + 16 * w) == (u64{ps_read32(s.b, kTs2 + 0x1898)} << 32 | 0xFFFFFF00u | w));
+        // A second join finds a joiner waiting: STAT, both.
+        CHECK(s.a.call("cellSpursJoinTask2", kTs2, w, kExit) == code(TASK | kStat));
+        CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, w, kExit) == code(TASK | kStat));
         REQUIRE(s.a.call("_cellSpursSendSignal", kTs2, w) == 0);
         join.join();
         CHECK(join.result == 0);
@@ -455,21 +493,23 @@ TEST_CASE("CellSpursTaskset2: a task that exited keeps its ID until it is joined
         ids.push_back(ps_read32(s.b, kId));
         CHECK(ids.back() == n);
     }
+    CHECK(s.b[kTs2 + 0x71] == 70);
     for (u32 n = 70; n-- > 0;) {
         REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, ids[n], kExit) == 0);
         CHECK(ps_read32(s.b, kExit) == 0x100 + n);
     }
-    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, 69, kExit) == code(TASK | kSrch));
+    CHECK(s.b[kTs2 + 0x71] == 0);
+    CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, 69, kExit) == code(TASK | kStat));
 }
 
-TEST_CASE("cellSpursCreateTask2WithBinInfo: the ELF, context size and LS pattern from the bin info, the context in "
-          "the buffer given (D-626)", "[hle][spurs][spurs-task2]")
+TEST_CASE("cellSpursCreateTask2WithBinInfo: the ELF from the bin info, no context and no name, as libsre (D-626, "
+          "D-914)", "[hle][spurs][spurs-task2]")
 {
     Task2Fixture s;
     u8* b = s.b;
     std::memset(b + kPrio, 0, 8);
     REQUIRE(s.a.call("cellSpursCreateTaskset", kSpurs, kTs1, 0, kPrio, 1) == 0);
-    write_task_elf(b, kElf, waiting_task(0x99));
+    write_task_elf(b, kElf, exiting_task(0x99));
     std::memset(b + kBinInfo, 0, 32);
     ps_write64(b, kBinInfo, kElf);
     ps_write32(b, kBinInfo + 8, 0xC00);
@@ -478,37 +518,38 @@ TEST_CASE("cellSpursCreateTask2WithBinInfo: the ELF, context size and LS pattern
     ps_write32(b, kArg, kOut);
     const u32 name = kAttr2 + 0x80;
     std::strcpy(reinterpret_cast<char*>(b + name), "binned");
-    const auto create = [&](u32 ts, u32 id, u32 info, u32 ctx) {
-        return s.a.call("cellSpursCreateTask2WithBinInfo", ts, id, info, kArg, ctx, name, 0);
+    const auto create = [&](u32 ts, u32 id, u32 info, u32 reserved = 0) {
+        return s.a.call("cellSpursCreateTask2WithBinInfo", ts, id, info, kArg, kCtx, name, reserved);
     };
-    CHECK(create(kTs2, 0, kBinInfo, kCtx) == code(TASK | kNull));
-    CHECK(create(0, kId, kBinInfo, kCtx) == code(TASK | kNull));
-    CHECK(create(kTs2, kId, 0, kCtx) == code(TASK | kNull));
-    CHECK(create(kTs2 + 4, kId, kBinInfo, kCtx) == code(TASK | kAlign));
-    CHECK(create(kTs1, kId, kBinInfo, kCtx) == code(TASK | kPerm));
-    CHECK(create(kTs2, kId, kUnmapped, kCtx) == code(TASK | kFault));
-    CHECK(create(kTs2, kId, kBinInfo, 0) == code(TASK | kNull));         // a context asked for, no buffer
-    CHECK(create(kTs2, kId, kBinInfo, kCtx + 0x40) == code(TASK | kAlign)); // 128-aligned from SDK 2.8
-    ps_write32(b, kBinInfo + 8, 0x200);
-    CHECK(create(kTs2, kId, kBinInfo, kCtx) == code(TASK | kInval)); // smaller than the execution context
-    ps_write32(b, kBinInfo + 8, 0xC00);
-    REQUIRE(create(kTs2, kId, kBinInfo, kCtx) == 0);
+    // The bin info NULL first; then the reserved argument and the bin info's reserved word (INVAL); then
+    // cellSpursCreateTask2's checks.
+    CHECK(create(0, 0, 0) == code(TASK | kNull));
+    CHECK(create(kTs2, kId, kUnmapped) == code(TASK | kFault));
+    CHECK(create(0, kId, kBinInfo, 1) == code(TASK | kInval));
+    ps_write32(b, kBinInfo + 0xC, 1);
+    CHECK(create(0, kId, kBinInfo) == code(TASK | kInval));
+    ps_write32(b, kBinInfo + 0xC, 0);
+    CHECK(create(kTs2, 0, kBinInfo) == code(TASK | kNull));
+    CHECK(create(0, kId, kBinInfo) == code(TASK | kNull));
+    CHECK(create(kTs2 + 4, kId, kBinInfo) == code(TASK | kAlign));
+    CHECK(create(kTs1, kId, kBinInfo) == code(TASK | kPerm));
+    std::memset(b + kNames, 0x5A, 32);
+    REQUIRE(create(kTs2, kId, kBinInfo) == 0);
     const u32 id = ps_read32(b, kId);
+    CHECK(id == 0);
     const u32 ti = kTs2 + 0x80 + 0x30 * id;
     CHECK(ps_read64(b, ti + 0x10) == (kElf | 4));
-    CHECK(ps_read64(b, ti + 0x18) == (kCtx | 1)); // one LS block saved
-    CHECK(ps_read8(b, ti + 0x2F) == 1);           // the pattern: the stack's block
-    CHECK(std::string(reinterpret_cast<const char*>(b + kNames + 32 * id)) == "binned");
+    CHECK(ps_read64(b, ti + 0x18) == 0); // no context
+    CHECK(ps_read8(b, ti + 0x2F) == 0);  // no pattern
+    CHECK(b[kNames + 32 * id] == 0x5A);  // no name
     s.run();
-    REQUIRE(wait_for([&] { return s.report(0) == 1 && s.task_bit(0x50, id); })); // waits, its context saved
-    REQUIRE(s.a.call("_cellSpursSendSignal", kTs2, id) == 0);
     REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, id, kExit) == 0);
     CHECK(ps_read32(b, kExit) == 0x99);
-    CHECK(s.report(0, 16) == 2);
+    CHECK(s.report(0) == 1);
 }
 
-TEST_CASE("cellSpursDestroyTaskset2: shut down and joined, its event flags destroyed; a JoinTask2 still waiting ends "
-          "with SHUTDOWN (D-626)", "[hle][spurs][spurs-task2]")
+TEST_CASE("cellSpursDestroyTaskset2: BUSY while a Task2 task is not joined; a shutdown ends a JoinTask2 that waits "
+          "with SHUTDOWN; destroyed, its event flags with it (D-626, D-914)", "[hle][spurs][spurs-task2]")
 {
     Task2Fixture s;
     u8* b = s.b;
@@ -523,20 +564,31 @@ TEST_CASE("cellSpursDestroyTaskset2: shut down and joined, its event flags destr
     CHECK(s.a.call("cellSpursDestroyTaskset2", 0) == code(TASK | kNull));
     CHECK(s.a.call("cellSpursDestroyTaskset2", kTs2 + 8) == code(TASK | kAlign));
     CHECK(s.a.call("cellSpursDestroyTaskset2", kUnmapped) == code(TASK | kFault));
-    CHECK(s.a.call("cellSpursDestroyTaskset2", kTs1) == code(TASK | kPerm));
+    CHECK(s.a.call("cellSpursDestroyTaskset2", kTs1) == code(TASK | kStat)); // not a CellSpursTaskset2
+    CHECK(s.a.call("cellSpursDestroyTaskset2", kTs2) == code(TASK | kBusy)); // a Task2 task not joined
+    CHECK(b[kTs2 + 0x70] == 0);
     {
+        // The taskset's shutdown completes (no worker inside: the task waits): the waiting task's slot gets state 3,
+        // which wakes the join with SHUTDOWN; its ELF word loses bit 2.
         Caller join(s.f, 1, "cellSpursJoinTask2", {kTs2, w, kExit});
         REQUIRE(join.parked_on(lv2::WaitKind::EventFlag));
-        REQUIRE(s.a.call("cellSpursDestroyTaskset2", kTs2) == 0);
+        REQUIRE(s.a.call("cellSpursShutdownTaskset", kTs2) == 0);
         join.join();
         CHECK(join.result == code(TASK | kShutdown));
     }
-    CHECK(ps_read32(b, kTs2 + 0x1898) == 0);
-    CHECK(ps_read32(b, kTs2 + 0x189C) == 0);
+    CHECK(ps_read32(b, kTs2 + 0x1894) == 1);
+    CHECK(ps_read64(b, kTs2 + 0x80 + 0x30 * w + 0x10) == (kElf | 0));
+    CHECK(b[kTs2 + 0x71] == 0);
+    REQUIRE(s.a.call("cellSpursDestroyTaskset2", kTs2) == 0);
+    CHECK(s.a.call("cellSpursDestroyTaskset2", kTs2) == code(TASK | kInval)); // workload ID 0x20 now
+    CHECK(ps_read32(b, kTs2 + 0x74) == 0x20);
+    CHECK(b[kTs2 + 0x70] == 2);
+    CHECK(ps_read32(b, kTs2 + 0x1898) == f1); // the IDs stay
     CHECK(s.f.kernel->event_flag(f1) == nullptr);
     CHECK(s.f.kernel->event_flag(f2) == nullptr);
     CHECK(ps_read8(b, kSpurs + 0x80 + s.wid) == 0); // the workload is gone (NON_EXISTENT)
-    // Made again at the same address: no task of the old one is reserved; its tasks run and are joined.
+    // Made again at the same address: its tasks run and are joined; a destruction begun refuses new Task2 tasks (BUSY,
+    // the ID taken as libsre leaves it).
     REQUIRE(s.a.call("cellSpursCreateTaskset2", kSpurs, kTs2, kTs2Attr) == 0);
     s.wid = ps_read32(b, kTs2 + 0x74);
     const u32 again = s.create(1, exiting_task(5), "again");
@@ -544,6 +596,12 @@ TEST_CASE("cellSpursDestroyTaskset2: shut down and joined, its event flags destr
     s.run();
     REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, again, kExit) == 0);
     CHECK(ps_read32(b, kExit) == 5);
+    b[kTs2 + 0x70] = 2;
+    REQUIRE(s.a.call("_cellSpursTaskAttribute2Initialize", kAttr2, 0) == 0);
+    CHECK(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf + 0x1000, kArg, kAttr2) == code(TASK | kBusy));
+    CHECK(s.task_bit(0x30, 0));
+    CHECK(s.a.call("cellSpursDestroyTaskset2", kTs2) == code(TASK | kInval));
+    b[kTs2 + 0x70] = 0;
     REQUIRE(s.a.call("cellSpursDestroyTaskset2", kTs2) == 0);
 }
 
@@ -627,6 +685,51 @@ TEST_CASE("cellSpursTaskExitCodeGet and TryGet: their checks; a container cellSp
     REQUIRE(s.a.call("cellSpursCreateTaskset", kSpurs, kTs1, 0, kPrio, 1) == 0);
     ps_write64(b, kTaskAttr + 0x40, kContainer);
     CHECK(s.a.call("cellSpursCreateTaskWithAttribute", kTs1, kId, kTaskAttr) == code(TASK | kPerm));
+}
+
+TEST_CASE("A taskset's shutdown completion ends the tasks it left: an exit code container gets code 0 and the shutdown "
+          "bit, a Task2 task state 3; a task created after it is ended at once (D-914)", "[hle][spurs][spurs-task2]")
+{
+    Task2Fixture s;
+    u8* b = s.b;
+    constexpr u32 kSaveConfig = kTaskAttr + 0x100;
+    REQUIRE(s.a.call("cellSpursTaskExitCodeInitialize", kContainer) == 0);
+    // A task bound to the container that waits for a signal (its context saved), and a Task2 task that never ran.
+    write_task_elf(b, kElf, waiting_task(0x78));
+    std::memset(b + kArg, 0, 16);
+    ps_write32(b, kArg, kOut);
+    ps_write32(b, kSaveConfig + 0, kCtx);
+    ps_write32(b, kSaveConfig + 4, 0xC00);
+    ps_write32(b, kSaveConfig + 8, kPattern);
+    top_block_pattern(b, kPattern);
+    REQUIRE(s.a.call("_cellSpursTaskAttributeInitialize", kTaskAttr, 1, 0x330000, kElf, kSaveConfig, kArg) == 0);
+    REQUIRE(s.a.call("cellSpursTaskAttributeSetExitCodeContainer", kTaskAttr, kContainer) == 0);
+    REQUIRE(s.a.call("cellSpursCreateTaskWithAttribute", kTs2, kId, kTaskAttr) == 0);
+    const u32 waiter = ps_read32(b, kId);
+    s.run();
+    REQUIRE(wait_for([&] { return s.report(0) == 1 && s.task_bit(0x50, waiter); }));
+    REQUIRE(s.a.call("cellSpursSetPriority", kSpurs, s.wid, 0, 0) == 0); // no SPU takes the taskset again
+    const u32 idle = s.create(1, exiting_task(0x11), "never ran");
+    {
+        Caller get(s.f, 1, "cellSpursTaskExitCodeGet", {kContainer, kExit + 4});
+        CHECK(get.blocked());
+        REQUIRE(s.a.call("cellSpursShutdownTaskset", kTs2) == 0);
+        get.join();
+        CHECK(get.result == code(TASK | kShutdown));
+    }
+    CHECK(ps_read32(b, kContainer + 0x28) == 0);
+    CHECK(ps_read32(b, kTs2 + 0x1894) == 1);
+    CHECK(ps_read64(b, kTs2 + 0x80 + 0x30 * waiter + 0x10) == kElf); // bits 0 and 2 cleared
+    CHECK(ps_read64(b, kTs2 + 0x80 + 0x30 * idle + 0x10) == kElf + 0x1000);
+    CHECK(slot_state(b, idle) == 0x03); // ended by the shutdown (its started bit replaced)
+    CHECK(s.report(1) == 0);
+    REQUIRE(s.a.call("cellSpursTryJoinTask2", kTs2, idle, kExit) == code(TASK | kShutdown));
+    CHECK(b[kTs2 + 0x71] == 0);
+    // Created after the shutdown completed: marked ended when it is marked started.
+    const u32 late = s.create(2, exiting_task(0x22), "late");
+    CHECK(slot_state(b, late) == 0x13);
+    REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, late, kExit) == code(TASK | kShutdown));
+    REQUIRE(s.a.call("cellSpursJoinTaskset", kTs2) == 0);
 }
 
 // ------------------------------------------------------------------------------------------------- D-628

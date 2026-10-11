@@ -10483,3 +10483,47 @@ decrypted modules, dev_flash) has it or its names. Its comparison (D-610) cannot
 that has one. In Self mode its 2,950 observations still agree (D-610). libsynth2 stays firmware-first (D-563), which
 changes nothing a game gets on 4.92 (no module to give it): the mark records that the library, made from public
 sources (psx-spx, ps2sdk's libsd documentation, D-610 to D-614), was never compared with Sony's module.
+
+## D-914 · 2026-10-11 · CellSpursTaskset2's tasks and a taskset's shutdown completion as libsre has them (part 8)
+
+Widened with made-up exit slots (every state, joiner kinds, registered or not) and DestroyTaskset2 on tasksets with
+Task2 tasks not joined, the Task2 comparison found D-626's model wrong: libsre (fw 4.92, 0x10acc to 0x11acc, 0x11f60,
+0x121ec, 0x14df8, 0x14ff4) keeps everything in the taskset, and pspocket now does what it does:
+- **The exit slot** (16 bytes at 0x1980 + 16 * id, libsre's ExitCode2): a joiner's word (a PPU thread's event flag
+  << 32 | 0xFFFFFF00 | id), then the exit code in the high half of a doubleword whose low bytes are the kind of joiner
+  waiting and a state: 1 made, bit 4 started, 2 exited, 3 ended by the taskset's shutdown, 4 joined. The taskset counts
+  its Task2 tasks not joined (+0x71); bit 1 of +0x70 says its destruction has begun. D-626's host table of unjoined IDs
+  is gone: a Task2 task's exit keeps its enabled bit (the native policy's Destroy2 request), so its ID stays taken
+  until the join clears it, as libsre's join does (it clears the running, signalled and enabled bits).
+- **cellSpursCreateTask2**: id and taskset NULL, ALIGN, the attribute's revision 0 only (INVAL; the test fixture passed
+  1), a taskset smaller than 0x2900 or with both event flags 0 PERM (D-626: PERM, and STAT for flags that did not
+  exist); after the ID and TaskInfo, the count up (BUSY instead during a destruction, the ID left taken as libsre
+  leaves it), the name only when the attribute gives one, the slot made, the ELF word's bit 2, the start, then the slot
+  marked started (state 3 first when the shutdown completed). **WithBinInfo**: binInfo NULL first, its `reserved`
+  argument or the bin info's reserved word INVAL, then CreateTask2 with the bin info's ELF and the default attribute:
+  libsre reads neither the context size and pattern nor the context buffer and name (D-626 used them all).
+- **JoinTask2 and TryJoinTask2**: after the checks, the slot alone answers: exited, the code (CELL_OK); shut down,
+  TASK_ERROR_SHUTDOWN; started and running, TryJoin AGAIN (D-626: BUSY), Join waits unless another JoinTask2
+  registered first (BUSY); another joiner waiting, nothing made there or not started, STAT (D-626: SRCH, BUSY). Join
+  registers itself in the slot before it reads the state, and the registration stays whatever the answer. A join that
+  waits sets the slot's kind 1, waits on its event flag bit (OR), clears it, takes the state again. After CELL_OK or
+  SHUTDOWN the name's first byte, the slot and the task's bits are cleared and the count goes down (at 0 during a
+  destruction libsre sets a third event flag, +0x18A0, which pspocket does too).
+- **cellSpursDestroyTaskset2**: NULL, ALIGN, a workload ID past 31 INVAL, not a CellSpursTaskset2 STAT (D-626: PERM), a
+  destruction begun INVAL, Task2 tasks not joined BUSY (D-626 shut down regardless, ending waiting joins with
+  SHUTDOWN); then shutdown, both event flags destroyed (their IDs stay), the wait for the workload's shutdown, its
+  removal, the workload ID 0x20.
+- **A taskset's shutdown completion** (libsre's hook for every taskset, 0x14df8): never native before (D-914 part 5).
+  Now taskset_shutdown_complete runs when the taskset's workload is removable and no worker is inside it (in
+  cellSpursShutdownWorkload when none is, else by the last worker to leave): the word at +0x1894 set to 1, and every
+  task left ready, pending or waiting loses its ELF word's bits 0 and 2 and is ended: its exit code container gets code
+  0 with bits 2 and 3 (a Get waiting returns SHUTDOWN), its Task2 slot state 3 (a JoinTask2 waiting wakes with
+  SHUTDOWN). This is how a join waiting for a task that never ends returns now, as on the PS3.
+Inferred, not read (libsre's SPU handlers are SPU code): the native exit writes the slot state 0x12, exited with the
+started bit, which is what libsre's PPU side accepts when CreateTask2 marks a task that already exited; libsre's own
+copy for the shutdown writes 2 or 3. The comparison grows to 471 calls (the slots in 10 states by 3 joiner kinds,
+registered or not; DestroyTaskset2 over counts, flags and workload IDs; CreateTask2's and WithBinInfo's checks over
+revisions, sizes and flags) with 0 differences. The five functions lose their unverified mark (D-594); only the LF
+queue's lv2 event queue attach and detach keep theirs (the comparison sees only their refusals). Tests:
+test_spurs_task2.cpp's D-626 cases follow libsre's answers, and a new case shows the shutdown completion ending a task
+bound to an exit code container, a Task2 task that never ran and one created after it.

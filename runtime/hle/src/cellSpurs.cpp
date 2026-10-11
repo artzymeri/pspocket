@@ -1686,11 +1686,6 @@ s32 create_taskset(u8* base, u32 spurs, u32 taskset, u64 args, const u8 (&priori
     ps_write64(base, taskset + ts_off::args, args);
     ps_write8(base, taskset + ts_off::enable_clear_ls, enable_clear_ls > 0 ? 1 : 0);
     ps_write32(base, taskset + ts_off::size, size);
-    {
-        SpursHost& h = host(); // a CellSpursTaskset2 that was here before: its unjoined tasks are gone (D-626)
-        std::lock_guard lock(h.mutex);
-        h.task2.erase(taskset);
-    }
 
     u32 wid = 0;
     if (const s32 r = add_workload(base, spurs, wid, SPURS_IMG_ADDR_TASKSET_PM, kTasksetPmSize, taskset, priority, 8,
@@ -1787,8 +1782,8 @@ s32 _cellSpursTasksetAttribute2Initialize(PPUContext& ctx, u32 attr, u32 revisio
 // event flags "taskset2" (priority protocol, waiters multiple) at 0x1898 and 0x189C, which cellSpursJoinTask2 waits on,
 // and the task name buffer, cleared (4 KB) and kept at 0x18A8. An event flag that cannot be created gives lv2's error
 // (the first one is destroyed when the second fails, as libsre; the workload stays added, as libsre). Tasks created with
-// cellSpursCreateTask run in it as in any taskset; its own tasks (cellSpursCreateTask2, JoinTask2) are D-626's. The
-// IDs a previous taskset at the same address left unjoined are forgotten.
+// cellSpursCreateTask run in it as in any taskset; its own tasks (cellSpursCreateTask2, JoinTask2) are D-626's, made
+// libsre's since D-914: their state is all in the taskset (the count at +0x71, each task's exit slot).
 s32 cellSpursCreateTaskset2(PPUContext& ctx, u32 spurs, u32 taskset, u32 attr)
 {
     constexpr std::string_view fn = "cellSpursCreateTaskset2";
@@ -2065,6 +2060,28 @@ s32 cellSpursLookUpTasksetAddress(PPUContext& ctx, u32 spurs, u32 taskset, u32 i
     return lv2::CELL_OK;
 }
 
+// libsre gives every taskset a shutdown-completion hook (0x14df8); natively it is taskset_shutdown_complete
+// (spurs_taskset.cpp, D-914), run when a taskset's workload is removable and no worker is inside it: here, when the
+// workload became removable with none inside; else by the last worker to leave (spurs_scheduler.cpp).
+void complete_taskset_shutdown(lv2::Kernel& kernel, u8* base, u32 spurs, u32 wid)
+{
+    std::shared_ptr<Scheduler> scheduler;
+    u32 taskset = 0;
+    {
+        SpursHost& h = host();
+        std::lock_guard lock(h.mutex);
+        const auto it = h.instances.find(spurs);
+        if (it == h.instances.end()) return;
+        const auto w = it->second.workloads.find(wid);
+        if (w == it->second.workloads.end() || w->second.kind != Workload::Kind::Taskset) return;
+        taskset = w->second.arg;
+        scheduler = it->second.scheduler;
+    }
+    if (scheduler && workers_inside(*scheduler, wid)) return;
+    if (__atomic_load_n(base + spurs + wkl_state(wid), __ATOMIC_SEQ_CST) != SPURS_WKL_STATE_REMOVABLE) return;
+    taskset_shutdown_complete(kernel, base, taskset);
+}
+
 // cellSpursShutdownWorkload, checked against libsre (fw 4.92), which RPCS3 follows: NULL, ALIGN, INVAL for a
 // workload ID past the instance's 16 (32 for SPURS2), SRCH for a workload that is not registered (its wklEnabled bit
 // clear), STAT for an instance in exception state or a workload not yet runnable. The native scheduler does not keep
@@ -2104,6 +2121,7 @@ s32 shutdown_workload(PPUContext& ctx, u32 spurs, u32 wid)
         __atomic_store_n(state, SPURS_WKL_STATE_REMOVABLE, __ATOMIC_SEQ_CST);
         event = __atomic_fetch_or(base + spurs + wkl_event(wid), u8{1}, __ATOMIC_SEQ_CST);
     }
+    complete_taskset_shutdown(t.kernel, base, spurs, wid);
     return notify_shutdown_completion(t, spurs, wid, event);
 }
 
@@ -2202,6 +2220,7 @@ s32 wait_for_workload_shutdown(PPUContext& ctx, u32 spurs, u32 wid)
             u8 expected = SPURS_WKL_STATE_SHUTTING_DOWN;
             if (__atomic_compare_exchange_n(state, &expected, SPURS_WKL_STATE_REMOVABLE, false, __ATOMIC_SEQ_CST,
                     __ATOMIC_SEQ_CST)) {
+                complete_taskset_shutdown(t.kernel, base, spurs, wid);
                 notify_shutdown_completion(t, spurs, wid, __atomic_fetch_or(event, u8{1}, __ATOMIC_SEQ_CST));
             }
             continue;
@@ -2528,16 +2547,17 @@ struct TaskSpec {
     u32 elf = 0, context = 0, context_size = 0, pattern = 0, args = 0;
 };
 
-// What a CellSpursTaskset2's tasks add: flags for the TaskInfo's ELF word (bit 0 an exit callback, bit 2 a
-// CellSpursTaskset2 task), the exit callback's descriptor and argument for the task's exit slot and the exit code
-// container it binds (cellSpursCreateTaskWithAttribute, D-627), a Task2 task and its name for the task name buffer
-// (cellSpursCreateTask2, D-626).
+// What a CellSpursTaskset2's tasks add: flags for the TaskInfo's ELF word (bit 0 an exit callback), the exit
+// callback's descriptor and argument for the task's exit slot and the exit code container it binds
+// (cellSpursCreateTaskWithAttribute, D-627), or a Task2 task (ELF word bit 2) and its name, if it has one, for the
+// task name buffer (cellSpursCreateTask2, D-626, D-914).
 struct TaskExtras {
     u32 elf_flags = 0;
     bool exit_callback = false;
     u64 callback = 0, callback_arg = 0;
     u32 container = 0;
     bool task2 = false;
+    bool has_name = false;
     std::string name;
 };
 
@@ -2637,10 +2657,12 @@ s32 _cellSpursSendSignal(PPUContext& ctx, u32 taskset, u32 task_id)
 // argument is zero without one, the pattern without a context or a pattern), then the start: the task's pending-ready
 // bit, cellSpursSendWorkloadSignal (its result ignored, as libsre) and cellSpursWakeUp, whose STAT becomes
 // TASK_ERROR_STAT (libsre asserts on any other error). The ID is written only when all of that succeeded.
-// In a CellSpursTaskset2, the IDs of its own tasks that exited and were not joined are passed by too (D-626), and
-// before the start `x` adds the ELF word's flags, the task's exit slot (an exit callback's descriptor and argument, or
-// a Task2 task's cleared), the exit code container bound to the task (its status word's bit 0, the stored code's bit 2
-// cleared: D-627), and for a Task2 task its name in the task name buffer and its bit of the lv2 event flag cleared.
+// In a CellSpursTaskset2, before the start `x` adds the ELF word's flags, the task's exit slot (an exit callback's
+// descriptor and argument) and the exit code container bound to the task (its status word's bit 0: D-627). A Task2
+// task (libsre's cellSpursCreateTask2, D-914), after its ID and TaskInfo: the taskset's count of Task2 tasks not
+// joined goes up by one, BUSY instead when the taskset's destruction has begun (the ID and TaskInfo stay taken, as
+// libsre leaves them); its name into the task name buffer (when both are given); its exit slot made (state 1); the ELF
+// word's bit 2; the start; then the slot marked started (bit 4; state 3 when the taskset's shutdown completed).
 s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id_out, const TaskSpec& s,
     const TaskExtras& x = {})
 {
@@ -2658,21 +2680,13 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
     if (second) {
         if (const s32 rc = task_readable(ctx, what, "taskset", taskset, kTaskset2Size); rc != lv2::CELL_OK) return rc;
     }
-    u128 unjoined = 0;
-    if (second) {
-        SpursHost& h = host();
-        std::lock_guard lock(h.mutex);
-        if (const auto it = h.task2.find(taskset); it != h.task2.end()) unjoined = it->second.unjoined;
-    }
-
     u32 id = CELL_SPURS_MAX_TASK;
-    reservation_op(base, taskset, [&id, unjoined](u8* line) {
+    reservation_op(base, taskset, [&id](u8* line) {
         id = CELL_SPURS_MAX_TASK;
         for (u32 w = 0; w < 4; w++) {
             const u32 enabled = ps_read32(line, ts_off::enabled + 4 * w);
-            const u32 taken = enabled | static_cast<u32>(unjoined >> (96 - 32 * w));
-            if (taken == 0xFFFFFFFF) continue;
-            const u32 bit = static_cast<u32>(std::countl_one(taken));
+            if (enabled == 0xFFFFFFFF) continue;
+            const u32 bit = static_cast<u32>(std::countl_one(enabled));
             id = 32 * w + bit;
             ps_write32(line, ts_off::enabled + 4 * w, enabled | (0x80000000u >> bit));
             return true;
@@ -2680,23 +2694,17 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
         return false;
     });
     if (id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_AGAIN);
-    if (x.task2) {
-        SpursHost& h = host();
-        std::lock_guard lock(h.mutex);
-        h.task2[taskset].unjoined |= u128{1} << (127 - id);
-    }
 
     const u32 info = taskset + ts_off::task_info + id * ts_off::task_info_stride;
-    ps_write64(base, info + ts_off::ti_elf, s.elf | x.elf_flags);
+    ps_write64(base, info + ts_off::ti_elf, s.elf | (x.task2 ? 0 : x.elf_flags));
     ps_write64(base, info + ts_off::ti_context, u64{s.context | saved_blocks});
     write_ls_pattern(base, info + ts_off::ti_args, s.args ? read_ls_pattern(base, s.args) : 0);
     write_ls_pattern(base, info + ts_off::ti_ls_pattern, s.context && s.pattern ? read_ls_pattern(base, s.pattern) : 0);
-    if (second && (x.exit_callback || x.task2)) {
-        const u32 slot = taskset + ts_off::exit_slots + 16 * id;
-        reservation_op(base, slot, [&x, slot](u8* line) {
-            const u32 off = slot & (PS_RES_LINE_SIZE - 1);
-            ps_write64(line, off, x.exit_callback ? x.callback : 0);
-            ps_write64(line, off + 8, x.exit_callback ? x.callback_arg : 0);
+    const u32 slot = taskset + ts_off::exit_slots + 16 * id, slot_off = slot & (PS_RES_LINE_SIZE - 1);
+    if (second && x.exit_callback) {
+        reservation_op(base, slot, [&x, slot_off](u8* line) {
+            ps_write64(line, slot_off, x.callback);
+            ps_write64(line, slot_off + 8, x.callback_arg);
             return true;
         });
     }
@@ -2708,13 +2716,31 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
         ps_res_notify_write(x.container, exitcode_off::size);
     }
     if (x.task2) {
-        const u32 names = static_cast<u32>(ps_read64(base, taskset + ts_off::task_name_buffer));
-        const u32 at = names + CELL_SPURS_MAX_TASK_NAME_LENGTH * id;
-        if (names && guest_readable(t, at, CELL_SPURS_MAX_TASK_NAME_LENGTH)) {
-            std::memset(base + at, 0, CELL_SPURS_MAX_TASK_NAME_LENGTH);
-            std::memcpy(base + at, x.name.data(), std::min<usize>(x.name.size(), CELL_SPURS_MAX_TASK_NAME_LENGTH - 1));
+        bool destroying = false;
+        reservation_op(base, taskset, [&destroying](u8* line) {
+            destroying = ps_read8(line, ts_off::task2_flags) & kTask2Destroying;
+            if (destroying) return false;
+            ps_write8(line, ts_off::task2_count, static_cast<u8>(ps_read8(line, ts_off::task2_count) + 1));
+            return true;
+        });
+        if (destroying) return error(CELL_SPURS_TASK_ERROR_BUSY);
+        const u64 names = ps_read64(base, taskset + ts_off::task_name_buffer);
+        const u32 at = static_cast<u32>(names) + CELL_SPURS_MAX_TASK_NAME_LENGTH * id;
+        if (names && x.has_name) {
+            if (guest_readable(t, at, CELL_SPURS_MAX_TASK_NAME_LENGTH)) {
+                std::memset(base + at, 0, CELL_SPURS_MAX_TASK_NAME_LENGTH); // strncpy's padding, the last byte 0
+                std::memcpy(base + at, x.name.data(), std::min<usize>(x.name.size(), CELL_SPURS_MAX_TASK_NAME_LENGTH - 1));
+            } else {
+                PS_LOG_ERROR(kChan, "{}: task {}'s name slot {:#x} in taskset {:#x}'s name buffer is not guest memory; "
+                    "not written (libsre would fault)", what, id, at, taskset);
+            }
         }
-        lv2::sys_event_flag_clear(t, ps_read32(base, taskset + task2_flag_offset(id)), ~task2_flag_bit(id));
+        reservation_op(base, slot, [slot_off](u8* line) { // libsre 0x10acc: no joiner, state 1
+            std::memset(line + slot_off, 0, 16);
+            line[slot_off + slot2_off::state] = kSlot2Made;
+            return true;
+        });
+        ps_write64(base, info + ts_off::ti_elf, s.elf | 4);
     }
 
     // Task start.
@@ -2731,6 +2757,27 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
     if (woken != lv2::CELL_OK) {
         PS_FATAL(kChan, "{}: cellSpursWakeUp({:#x}) for task {} of taskset {:#x} returned {:#x}; libsre (fw 4.92) asserts "
             "here and aborts the process", what, spurs, id, taskset, static_cast<u32>(woken));
+    }
+    if (x.task2) {
+        // Marked started (libsre 0x113a0): the state 1, or 0x12 for a task that already exited (task2_exit), gets bit 4;
+        // made 3 first when the taskset's shutdown completed. libsre asserts on any other state or a joiner's kind.
+        const bool shut = ps_read32(base, taskset + ts_off::shutdown_done) == 1;
+        u8 seen_state = 0, seen_kind = 0;
+        bool bad = false;
+        reservation_op(base, slot, [&](u8* line) {
+            seen_state = line[slot_off + slot2_off::state];
+            seen_kind = line[slot_off + slot2_off::kind];
+            bad = (seen_state != kSlot2Made && seen_state != (kSlot2Started | kSlot2Exited)) || seen_kind;
+            if (bad) return false;
+            const u8 st = shut && seen_state != kSlot2Exited ? kSlot2Shutdown : seen_state;
+            line[slot_off + slot2_off::state] = static_cast<u8>(st | kSlot2Started);
+            return true;
+        });
+        if (bad) {
+            PS_FATAL(kChan, "{}: task {} of taskset {:#x}: its exit slot has state {:#x} and joiner kind {} when it is "
+                "marked started; libsre (fw 4.92) asserts here and aborts the process", what, id, taskset, seen_state,
+                seen_kind);
+        }
     }
     if (x.container) {
         // And marks it started once the task is: the code may be asked for from now on (libsre's 0x13588). A container
@@ -2977,55 +3024,39 @@ s32 cellSpursTaskExitCodeTryGet(PPUContext& ctx, u32 container, u32 exit_code)
 
 // ------------------------------------------------------------------------------------------- CellSpursTaskset2's tasks
 //
-// cellSpursCreateTask2, CreateTask2WithBinInfo, JoinTask2, TryJoinTask2 and DestroyTaskset2 (D-626, unverified: RPCS3
-// has UNIMPLEMENTED stubs and declares no signatures; libsre was not read). What they are made from: the structures
-// RPCS3 does lay out (CellSpursTaskAttribute2 {revision, sizeContext, eaContext (u64), lsPattern, name}, which
-// _cellSpursTaskAttribute2Initialize fills; CellSpursTaskBinInfo {eaElf (u64), sizeContext, reserved, lsPattern};
-// CellSpursTaskset2's task_exit_code[128] at 0x1980), what cellSpursCreateTaskset2 makes for them as libsre does (the
-// Task2 handler's descriptor at 0x78, two lv2 event flags "taskset2" that cellSpursJoinTask2 waits on, the task name
-// buffer of 128 names of 32 bytes) and the SDK's signatures as far as they are known:
+// cellSpursCreateTask2, CreateTask2WithBinInfo, JoinTask2, TryJoinTask2 and DestroyTaskset2: made without libsre
+// (D-626), then libsre's (fw 4.92) since D-914, where RPCS3 has only stubs:
 //   cellSpursCreateTask2(taskset, &id, eaElf, argument, attribute)
 //   cellSpursCreateTask2WithBinInfo(taskset, &id, binInfo, argument, contextBuffer, name, reserved)
 //   cellSpursJoinTask2(taskset, id, &exitCode), cellSpursTryJoinTask2(...), cellSpursDestroyTaskset2(taskset)
-// A Task2 task is a task of the taskset (create_task: its checks, the lowest free ID, its TaskInfo, its start) whose ELF
-// word has bit 2, which libsre's policy module runs the Task2 handler for at its exit (natively spurs_taskset.cpp
-// task2_exit: the exit code into its exit slot, its bit of the event flag for its half set). Its ID stays taken from
-// its creation until it is joined (SpursHost::task2), as a thread's resources stay until pthread_join: a task created
-// meanwhile cannot take it and overwrite the code. Every function checks the taskset first: NULL, 128-byte ALIGN,
-// memory (FAULT, D-042), a CellSpursTaskset2 (PERM for a CellSpursTaskset, as an exit code container on one is).
+// A Task2 task is a task of the taskset (create_task) whose ELF word has bit 2. Everything about it lives in the
+// taskset: its count of Task2 tasks not joined (+0x71) with the flag a destruction sets (+0x70 bit 1), and each task's
+// exit slot (16 bytes at 0x1980 + 16 * id, libsre's ExitCode2: slot2_off): its state goes from made (1) to started
+// (bit 4, which CreateTask2 sets once the task is started) to exited (2) or ended by the taskset's shutdown (3; the
+// shutdown completion, taskset_shutdown_complete), then joined (4) and cleared. Its ID stays taken (its enabled bit
+// set: spurs_taskset.cpp keeps it at the task's exit) until JoinTask2 took the exit code. A JoinTask2 that waits
+// registers itself in the slot (its lv2 event flag: the taskset's first for tasks 0..63, the second for 64..127) and
+// sleeps on bit id % 64 of that flag, which the exit sets. pspocket checks memory libsre would read and refuses an
+// unreadable taskset or pointer with TASK_ERROR_FAULT (D-042); where libsre asserts, it stops with a fatal log.
 
-s32 check_taskset2(PPUContext& ctx, std::string_view fn, u32 taskset)
-{
-    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
-    if (const s32 rc = task_readable(ctx, fn, "taskset", taskset, ts_off::size + 4); rc != lv2::CELL_OK) return rc;
-    if (ps_read32(guest_base(ctx), taskset + ts_off::size) < kTaskset2MinSize) return error(CELL_SPURS_TASK_ERROR_PERM);
-    return task_readable(ctx, fn, "taskset", taskset, kTaskset2Size);
-}
-
-// A Task2 task's creation once the call's own arguments are read: the task's checks (check_task's, as create_task
-// makes them, first), then the taskset's two event flags must exist (STAT: a taskset made without
-// cellSpursCreateTaskset2, through the attribute's size, has none to join on), the name (up to 31 characters, as the
-// 32-byte slots of the name buffer hold) readable (FAULT); then create_task as a Task2 task.
+// A Task2 task's creation (libsre's cellSpursCreateTask2 after its attribute is read): the taskset's own checks
+// (a CellSpursTaskset2's size, at least one of its event flags: PERM), then create_task as a Task2 task. The name (up to
+// 31 characters, as the 32-byte slots of the name buffer hold) is read first (FAULT) when there is one.
 s32 create_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 task_id, const TaskSpec& s, u32 name)
 {
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    u32 saved_blocks = 0;
-    if (const s32 rc = check_task(ctx, fn, s, saved_blocks); rc != lv2::CELL_OK) return rc;
-    for (const u32 off : {ts_off::event_flag_id1, ts_off::event_flag_id2}) {
-        if (!t.kernel.event_flag(ps_read32(base, taskset + off))) {
-            PS_LOG_ERROR(kChan, "{}({:#x}): the taskset has no lv2 event flag at +{:#x} (not made by "
-                "cellSpursCreateTaskset2); refused with CELL_SPURS_TASK_ERROR_STAT", fn, taskset, off);
-            return error(CELL_SPURS_TASK_ERROR_STAT);
-        }
+    if (const s32 rc = task_readable(ctx, fn, "taskset", taskset, kTaskset2Size); rc != lv2::CELL_OK) return rc;
+    if (ps_read32(base, taskset + ts_off::size) < kTaskset2MinSize ||
+        (!ps_read32(base, taskset + ts_off::event_flag_id1) && !ps_read32(base, taskset + ts_off::event_flag_id2))) {
+        return error(CELL_SPURS_TASK_ERROR_PERM);
     }
     TaskExtras x;
-    x.elf_flags = 4;
     x.task2 = true;
     if (name) {
         const GuestString n = read_cstr(t, name, CELL_SPURS_MAX_TASK_NAME_LENGTH - 1);
         if (n.faulted) return task_readable(ctx, fn, "task name", name + static_cast<u32>(n.text.size()), 1);
+        x.has_name = true;
         x.name = n.text;
     }
     const s32 rc = create_task(ctx, fn, taskset, task_id, s, x);
@@ -3036,108 +3067,176 @@ s32 create_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 task_id,
     return rc;
 }
 
-// cellSpursCreateTask2(taskset, id, eaElf, argument, attribute): id and taskset NULL, the taskset's checks; then the
-// attribute (CellSpursTaskAttribute2; NULL: no context, no pattern, no name) gives the context, its size, the LS
-// pattern and the name. Its revision and alignment are not checked (what libsre wants of them is not known; a game's
-// attribute comes from _cellSpursTaskAttribute2Initialize, which takes the revision it is given). create_task checks
-// the ELF, the context and the pattern as for any task.
+// cellSpursCreateTask2(taskset, id, eaElf, argument, attribute), as libsre: id and taskset NULL, the taskset's ALIGN;
+// the attribute (CellSpursTaskAttribute2 {revision, sizeContext, eaContext (u64), lsPattern (16 bytes), name}; NULL:
+// _cellSpursTaskAttribute2Initialize's, revision 0) must have revision 0 (INVAL); then create_task2 with its context,
+// context size, LS pattern and name. `argument` is a CellSpursTaskArgument's address, as for cellSpursCreateTask.
 s32 cellSpursCreateTask2(PPUContext& ctx, u32 taskset, u32 task_id, u32 elf, u32 argument, u32 attribute)
 {
     constexpr std::string_view fn = "cellSpursCreateTask2";
     if (!task_id || !taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
     TaskSpec s{elf, 0, 0, 0, argument};
     u32 name = 0;
     if (attribute) {
         if (const s32 rc = task_readable(ctx, fn, "attribute", attribute, 0x24); rc != lv2::CELL_OK) return rc;
         u8* base = guest_base(ctx);
+        if (ps_read32(base, attribute + 0x00) != 0) return error(CELL_SPURS_TASK_ERROR_INVAL);
         s.context_size = ps_read32(base, attribute + 0x04);
-        s.context = static_cast<u32>(ps_read64(base, attribute + 0x08));
+        s.context = ps_read32(base, attribute + 0x0C); // eaContext's low word, as libsre reads it
         s.pattern = attribute + 0x10;
         name = ps_read32(base, attribute + 0x20);
     }
     return create_task2(ctx, fn, taskset, task_id, s, name);
 }
 
-// cellSpursCreateTask2WithBinInfo(taskset, id, binInfo, argument, contextBuffer, name, reserved): id, taskset and
-// binInfo NULL, the taskset's checks; then the ELF, the context's size and the LS pattern from the CellSpursTaskBinInfo
-// (what the SDK's tools compute from a task's ELF), the context in the buffer given: a bin info that asks for a context
-// with no buffer is NULL_POINTER. The last argument is not read.
+// cellSpursCreateTask2WithBinInfo(taskset, id, binInfo, argument, contextBuffer, name, reserved), as libsre: binInfo
+// NULL first; `reserved` or the bin info's reserved word (+0xC) not 0 is INVAL; then cellSpursCreateTask2 with the bin
+// info's ELF (eaElf's low word) and the default attribute: libsre reads neither the bin info's context size and LS
+// pattern nor the context buffer and name given, so the task has no context and no name.
 s32 cellSpursCreateTask2WithBinInfo(PPUContext& ctx, u32 taskset, u32 task_id, u32 bin_info, u32 argument, u32 context,
-    u32 name)
+    u32 name, u32 reserved)
 {
     constexpr std::string_view fn = "cellSpursCreateTask2WithBinInfo";
-    if (!task_id || !taskset || !bin_info) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
-    if (const s32 rc = task_readable(ctx, fn, "bin info", bin_info, 0x20); rc != lv2::CELL_OK) return rc;
+    if (!bin_info) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (const s32 rc = task_readable(ctx, fn, "bin info", bin_info, 0x10); rc != lv2::CELL_OK) return rc;
     u8* base = guest_base(ctx);
-    const u32 size = ps_read32(base, bin_info + 0x08);
-    if (size && !context) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
-    const TaskSpec s{static_cast<u32>(ps_read64(base, bin_info + 0x00)), context, size, bin_info + 0x10, argument};
-    return create_task2(ctx, fn, taskset, task_id, s, name);
+    if (reserved || ps_read32(base, bin_info + 0x0C)) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    if (context || name) {
+        PS_LOG_DEBUG(kChan, "{}: context buffer {:#x} and name {:#x} not read (libsre reads neither)", fn, context, name);
+    }
+    return cellSpursCreateTask2(ctx, taskset, task_id, ps_read32(base, bin_info + 0x04), argument, 0);
 }
 
-// cellSpursJoinTask2(taskset, id, exitCode) and cellSpursTryJoinTask2: the taskset's checks, an ID past 127 (INVAL),
-// the exit code's memory (it may be NULL: the code is then not written); a task that is not a Task2 task created and
-// not yet joined is SRCH, one another JoinTask2 waits for BUSY. Then the task's bit of its event flag, AND and CLEAR
-// (sys_event_flag_wait; TryJoin: sys_event_flag_trywait, whose EBUSY is TASK_ERROR_BUSY): the exit code from the
-// task's exit slot, the ID free again. A wait that cellSpursDestroyTaskset2 ended (the flag's ECANCELED) is
-// TASK_ERROR_SHUTDOWN; another lv2 error is a task error with its low byte (as the event flag functions convert them).
+// cellSpursJoinTask2(taskset, id, exitCode) and cellSpursTryJoinTask2, as libsre (0x11484, 0x11854): the taskset and
+// the exit code pointer NULL, the taskset's ALIGN, an ID past 127 (INVAL); then the task's exit slot, its state read
+// with no joiner waiting (another JoinTask2's kind in the slot is STAT): exited, the code given (CELL_OK); ended by the
+// taskset's shutdown, TASK_ERROR_SHUTDOWN; started and running, TryJoinTask2 AGAIN, JoinTask2 waits unless another
+// JoinTask2 registered first (BUSY); otherwise (no Task2 task made there, or not started yet) STAT. JoinTask2 registers
+// itself in the slot's first word before it reads the state (only when the word is 0; it stays so whatever the answer).
+// A join that waits marks the slot's kind 1 (a PPU joiner), waits on its event flag bit (OR), clears the bit, then
+// takes the state again (exited or shut down; anything else is libsre's assertion). After CELL_OK or SHUTDOWN: the
+// task's name in the name buffer emptied (its first byte), the slot cleared, its running, signalled and enabled bits
+// cleared (the ID free again), the count of Task2 tasks not joined down by one, and when it reaches 0 during a
+// destruction the taskset's third event flag set (sys_event_flag_set(+0x18A0, 1)).
 s32 join_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 id, u32 exit_code, bool block)
 {
-    // libsre's checks come first (0x11484): the taskset and the exit code pointer NULL, the taskset's ALIGN, an ID past
-    // 127; it looks at nothing else of the taskset before the task's exit slot.
     if (!taskset || !exit_code) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
     if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
     if (id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_INVAL);
-    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
+    if (const s32 rc = task_readable(ctx, fn, "taskset", taskset, kTaskset2Size); rc != lv2::CELL_OK) return rc;
     if (const s32 rc = task_readable(ctx, fn, "exit code", exit_code, 4); rc != lv2::CELL_OK) return rc;
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    const u128 bit = u128{1} << (127 - id);
-    SpursHost& h = host();
-    {
-        std::lock_guard lock(h.mutex);
-        const auto it = h.task2.find(taskset);
-        if (it == h.task2.end() || !(it->second.unjoined & bit)) return error(CELL_SPURS_TASK_ERROR_SRCH);
-        if (it->second.joining & bit) return error(CELL_SPURS_TASK_ERROR_BUSY);
-        if (block) it->second.joining |= bit;
-    }
-    // The wait ends with the process too (lv2 unwinds the thread): the task is no longer being joined either way.
-    struct Joining {
-        SpursHost& host_state;
-        u32 set;
-        u128 mask;
-        bool active;
-        ~Joining()
-        {
-            if (!active) return;
-            std::lock_guard lock(host_state.mutex);
-            if (const auto it = host_state.task2.find(set); it != host_state.task2.end()) it->second.joining &= ~mask;
-        }
-    } joining{h, taskset, bit, block};
+    const u32 slot = taskset + ts_off::exit_slots + 16 * id, off = slot & (PS_RES_LINE_SIZE - 1);
     const u32 flag = ps_read32(base, taskset + task2_flag_offset(id));
-    constexpr u32 mode = lv2::SYS_EVENT_FLAG_WAIT_AND | lv2::SYS_EVENT_FLAG_WAIT_CLEAR;
-    const s32 rc = block ? lv2::sys_event_flag_wait(t, flag, task2_flag_bit(id), mode, 0, 0)
-                         : lv2::sys_event_flag_trywait(t, flag, task2_flag_bit(id), mode, 0);
-    if (rc != lv2::CELL_OK) {
-        if (rc == lv2::err(lv2::CELL_EBUSY)) return error(CELL_SPURS_TASK_ERROR_BUSY);
-        PS_LOG_WARN(kChan, "{}(taskset {:#x}, task {}): the wait on event flag {:#x}: {}", fn, taskset, id, flag,
-            lv2::error_name(rc));
-        if (rc == lv2::err(lv2::CELL_ECANCELED)) return error(CELL_SPURS_TASK_ERROR_SHUTDOWN);
-        return task_error(rc);
+    u64 joiner_before = 0;
+    if (block) {
+        reservation_op(base, slot, [&](u8* line) {
+            joiner_before = ps_read64(line, off + slot2_off::joiner);
+            if (joiner_before) return false;
+            ps_write64(line, off + slot2_off::joiner, u64{flag} << 32 | 0xFFFFFF00u | (id & 0xFF));
+            return true;
+        });
     }
-    alignas(16) u8 line[PS_RES_LINE_SIZE];
-    const u32 slot = taskset + ts_off::exit_slots + 16 * id;
-    ps_res_acquire(base, slot, line);
-    const u32 code = ps_read32(line, slot & (PS_RES_LINE_SIZE - 1));
-    {
-        std::lock_guard lock(h.mutex);
-        if (const auto it = h.task2.find(taskset); it != h.task2.end()) it->second.unjoined &= ~bit;
+    s32 rc = lv2::CELL_OK;
+    bool wait = false, have_code = false;
+    u32 code = 0;
+    reservation_op(base, slot, [&](u8* line) {
+        u64 w = ps_read64(line, off + slot2_off::code);
+        const u64 before = w;
+        rc = error(CELL_SPURS_TASK_ERROR_STAT);
+        wait = have_code = false;
+        if (!(w & 0xFF00)) {
+            const u32 state = static_cast<u32>(w) & 0xF;
+            if (state == kSlot2Exited) {
+                code = static_cast<u32>(w >> 32);
+                have_code = true;
+                w = (w & ~0xFFull) | kSlot2Joined;
+                rc = lv2::CELL_OK;
+            } else if (state == kSlot2Shutdown) {
+                w = (w & ~0xFFull) | kSlot2Joined;
+                rc = error(CELL_SPURS_TASK_ERROR_SHUTDOWN);
+            } else if (state == kSlot2Made && (w & kSlot2Started)) {
+                if (!block) {
+                    rc = error(CELL_SPURS_TASK_ERROR_AGAIN);
+                } else if (joiner_before) {
+                    rc = error(CELL_SPURS_TASK_ERROR_BUSY);
+                } else {
+                    w = (w & ~0xFF00ull) | (u64{kSlot2JoinerPpu} << 8);
+                    rc = lv2::CELL_OK;
+                    wait = true;
+                }
+            }
+        }
+        ps_write64(line, off + slot2_off::code, w);
+        return w != before;
+    });
+    if (wait) {
+        const u64 bit = task2_flag_bit(id);
+        if (const s32 r = lv2::sys_event_flag_wait(t, flag, bit, lv2::SYS_EVENT_FLAG_WAIT_OR, 0, 0); r != lv2::CELL_OK) {
+            PS_FATAL(kChan, "{}(taskset {:#x}, task {}): waiting on event flag {:#x}: {}; libsre (fw 4.92) asserts here "
+                "and aborts the process", fn, taskset, id, flag, lv2::error_name(r));
+        }
+        if (const s32 r = lv2::sys_event_flag_clear(t, flag, ~bit); r != lv2::CELL_OK) {
+            PS_FATAL(kChan, "{}(taskset {:#x}, task {}): clearing event flag {:#x}: {}; libsre (fw 4.92) asserts here", fn,
+                taskset, id, flag, lv2::error_name(r));
+        }
+        u64 seen = 0;
+        bool bad = false;
+        reservation_op(base, slot, [&](u8* line) {
+            const u64 w = ps_read64(line, off + slot2_off::code);
+            seen = w;
+            const u32 state = static_cast<u32>(w) & 0xF;
+            bad = state != kSlot2Exited && state != kSlot2Shutdown;
+            if (bad) return false;
+            have_code = state == kSlot2Exited;
+            code = static_cast<u32>(w >> 32);
+            rc = have_code ? lv2::CELL_OK : error(CELL_SPURS_TASK_ERROR_SHUTDOWN);
+            ps_write64(line, off + slot2_off::code, (w & ~0xFFull) | kSlot2Joined);
+            return true;
+        });
+        if (bad) {
+            PS_FATAL(kChan, "{}(taskset {:#x}, task {}): woken with the exit slot's word {:#x} (neither exited nor shut "
+                "down); libsre (fw 4.92) asserts here", fn, taskset, id, seen);
+        }
     }
-    if (exit_code) ps_write32(base, exit_code, code);
-    PS_LOG_DEBUG(kChan, "{}(taskset {:#x}, task {}): exit code {:#x}", fn, taskset, id, code);
-    return lv2::CELL_OK;
+    if (have_code) ps_write32(base, exit_code, code);
+    if (rc != lv2::CELL_OK && rc != error(CELL_SPURS_TASK_ERROR_SHUTDOWN)) return rc;
+
+    if (const u64 names = ps_read64(base, taskset + ts_off::task_name_buffer)) {
+        const u32 at = static_cast<u32>(names) + CELL_SPURS_MAX_TASK_NAME_LENGTH * id;
+        if (guest_readable(t, at, 1)) {
+            base[at] = static_cast<u8>(taskset & 0x7F);
+        } else {
+            PS_LOG_ERROR(kChan, "{}: task {}'s name slot {:#x} is not guest memory; not emptied (libsre would fault)", fn,
+                id, at);
+        }
+    }
+    reservation_op(base, slot, [off](u8* line) {
+        std::memset(line + off, 0, 16);
+        return true;
+    });
+    bool last = false;
+    reservation_op(base, taskset, [&](u8* line) {
+        const u32 word = 4 * (id / 32), keep = ~(0x80000000u >> (id % 32));
+        for (const u32 set : {ts_off::running, ts_off::signalled, ts_off::enabled})
+            ps_write32(line, set + word, ps_read32(line, set + word) & keep);
+        const u8 count = static_cast<u8>(ps_read8(line, ts_off::task2_count) - 1);
+        ps_write8(line, ts_off::task2_count, count);
+        last = count == 0 && (ps_read8(line, ts_off::task2_flags) & kTask2Destroying);
+        return true;
+    });
+    if (last) {
+        const u32 flag3 = ps_read32(base, taskset + ts_off::event_flag_id3);
+        if (const s32 r = lv2::sys_event_flag_set(t, flag3, 1); r != lv2::CELL_OK) {
+            PS_FATAL(kChan, "{}(taskset {:#x}): setting its third event flag {:#x}: {}; libsre (fw 4.92) asserts here", fn,
+                taskset, flag3, lv2::error_name(r));
+        }
+    }
+    PS_LOG_DEBUG(kChan, "{}(taskset {:#x}, task {}) -> {:#x}, exit code {:#x}", fn, taskset, id, static_cast<u32>(rc),
+        code);
+    return rc;
 }
 
 s32 cellSpursJoinTask2(PPUContext& ctx, u32 taskset, u32 id, u32 exit_code)
@@ -3150,33 +3249,57 @@ s32 cellSpursTryJoinTask2(PPUContext& ctx, u32 taskset, u32 id, u32 exit_code)
     return join_task2(ctx, "cellSpursTryJoinTask2", taskset, id, exit_code, false);
 }
 
-// cellSpursDestroyTaskset2(taskset): the taskset's checks; cellSpursShutdownTaskset and cellSpursJoinTaskset (their
-// errors returned as they are: the taskset stays when one fails), then what cellSpursCreateTaskset2 made for it: both
-// event flags, their waiters woken first (a JoinTask2 still waiting gets TASK_ERROR_SHUTDOWN), destroyed and their IDs
-// cleared, and the tasks not joined forgotten. Tasks that had not run are abandoned with the taskset, as by
-// cellSpursShutdownTaskset (D-136).
+// cellSpursDestroyTaskset2(taskset), as libsre (0x14ff4): NULL, ALIGN; a workload ID past 31 INVAL; not a
+// CellSpursTaskset2 (its size, both event flags 0) STAT; a destruction begun INVAL; Task2 tasks not joined BUSY;
+// otherwise the destruction's flag set, then cellSpursShutdownTaskset, both event flags destroyed,
+// cellSpursWaitForWorkloadShutdown (its INVAL and STAT become the task errors, another error is returned as it is) and
+// cellSpursRemoveWorkload, and the workload ID 0x20. The event flags' IDs stay in the taskset. libsre asserts when the
+// shutdown, an event flag's destruction or the removal fails.
 s32 cellSpursDestroyTaskset2(PPUContext& ctx, u32 taskset)
 {
     constexpr std::string_view fn = "cellSpursDestroyTaskset2";
-    if (const s32 rc = check_taskset2(ctx, fn, taskset); rc != lv2::CELL_OK) return rc;
-    if (const s32 rc = cellSpursShutdownTaskset(ctx, taskset); rc != lv2::CELL_OK) return rc;
-    if (const s32 rc = cellSpursJoinTaskset(ctx, taskset); rc != lv2::CELL_OK) return rc;
+    if (!taskset) return error(CELL_SPURS_TASK_ERROR_NULL_POINTER);
+    if (taskset % 128) return error(CELL_SPURS_TASK_ERROR_ALIGN);
+    if (const s32 rc = task_readable(ctx, fn, "taskset", taskset, ts_off::event_flag_id2 + 4); rc != lv2::CELL_OK)
+        return rc;
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
-    for (const u32 off : {ts_off::event_flag_id1, ts_off::event_flag_id2}) {
-        const u32 flag = ps_read32(base, taskset + off);
-        if (!flag) continue;
-        lv2::sys_event_flag_cancel(t, flag, 0);
-        if (const s32 rc = lv2::sys_event_flag_destroy(t, flag); rc != lv2::CELL_OK) {
-            PS_LOG_WARN(kChan, "{}({:#x}): destroying event flag {:#x}: {}", fn, taskset, flag, lv2::error_name(rc));
+    const u32 wid = ps_read32(base, taskset + ts_off::wid);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    const u32 spurs = static_cast<u32>(ps_read64(base, taskset + ts_off::spurs));
+    const u32 flag1 = ps_read32(base, taskset + ts_off::event_flag_id1), flag2 = ps_read32(base, taskset + ts_off::event_flag_id2);
+    if (ps_read32(base, taskset + ts_off::size) < kTaskset2MinSize || (!flag1 && !flag2))
+        return error(CELL_SPURS_TASK_ERROR_STAT);
+    s32 rc = lv2::CELL_OK;
+    reservation_op(base, taskset, [&rc](u8* line) {
+        const u8 flags = ps_read8(line, ts_off::task2_flags);
+        rc = (flags & kTask2Destroying) ? error(CELL_SPURS_TASK_ERROR_INVAL)
+           : ps_read8(line, ts_off::task2_count) ? error(CELL_SPURS_TASK_ERROR_BUSY)
+                                                 : lv2::CELL_OK;
+        if (rc != lv2::CELL_OK) return false;
+        ps_write8(line, ts_off::task2_flags, flags | kTask2Destroying);
+        return true;
+    });
+    if (rc != lv2::CELL_OK) return rc;
+    if (const s32 r = cellSpursShutdownTaskset(ctx, taskset); r != lv2::CELL_OK) {
+        PS_FATAL(kChan, "{}({:#x}): cellSpursShutdownTaskset returned {:#x}; libsre (fw 4.92) asserts here and aborts the "
+            "process", fn, taskset, static_cast<u32>(r));
+    }
+    for (const u32 flag : {flag1, flag2}) {
+        if (const s32 r = lv2::sys_event_flag_destroy(t, flag); r != lv2::CELL_OK) {
+            PS_FATAL(kChan, "{}({:#x}): destroying event flag {:#x}: {}; libsre (fw 4.92) asserts here", fn, taskset, flag,
+                lv2::error_name(r));
         }
-        ps_write32(base, taskset + off, 0);
     }
-    {
-        SpursHost& h = host();
-        std::lock_guard lock(h.mutex);
-        h.task2.erase(taskset);
+    const s32 waited = wait_for_workload_shutdown(ctx, spurs, wid);
+    if (waited == error(CELL_SPURS_POLICY_MODULE_ERROR_INVAL)) return error(CELL_SPURS_TASK_ERROR_INVAL);
+    if (waited == error(CELL_SPURS_POLICY_MODULE_ERROR_STAT)) return error(CELL_SPURS_TASK_ERROR_STAT);
+    if (waited != lv2::CELL_OK) return waited;
+    if (const s32 r = remove_workload(ctx, spurs, wid); r != lv2::CELL_OK) {
+        PS_FATAL(kChan, "{}({:#x}): removing workload {} returned {:#x}; libsre (fw 4.92) asserts here", fn, taskset, wid,
+            static_cast<u32>(r));
     }
+    ps_write32(base, taskset + ts_off::wid, CELL_SPURS_MAX_WORKLOAD2);
     PS_LOG_INFO(kChan, "{}({:#x}): destroyed", fn, taskset);
     return lv2::CELL_OK;
 }
@@ -4768,12 +4891,13 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xE7B0E69A, cellSpursJobSetMaxGrab),
         PS_HLE_INTERNAL(NID_event_helper, _pspocket_spurs_event_helper),
         // Made without libsre to compare with (D-594): CellSpursTaskset2's tasks (D-626), the exit code containers
-        // (D-627), the LF queue's bodies and lv2 event queue (D-628), the job pipeline and the system workload (D-629).
-        PS_HLE_UNVERIFIED(0xE14CA62D, cellSpursCreateTask2),
-        PS_HLE_UNVERIFIED(0xE4944A1C, cellSpursCreateTask2WithBinInfo),
-        PS_HLE_UNVERIFIED(0xA7A94892, cellSpursJoinTask2),
-        PS_HLE_UNVERIFIED(0x838FA4F0, cellSpursTryJoinTask2),
-        PS_HLE_UNVERIFIED(0x1EBCF459, cellSpursDestroyTaskset2),
+        // (D-627), the LF queue's bodies and lv2 event queue (D-628), the job pipeline and the system workload (D-629);
+        // all but the lv2 event queue's libsre's since D-914.
+        PS_HLE_FUNC(0xE14CA62D, cellSpursCreateTask2),
+        PS_HLE_FUNC(0xE4944A1C, cellSpursCreateTask2WithBinInfo),
+        PS_HLE_FUNC(0xA7A94892, cellSpursJoinTask2),
+        PS_HLE_FUNC(0x838FA4F0, cellSpursTryJoinTask2),
+        PS_HLE_FUNC(0x1EBCF459, cellSpursDestroyTaskset2),
         PS_HLE_FUNC(0x13AE18F3, cellSpursTaskExitCodeGet),
         PS_HLE_FUNC(0xE717AC73, cellSpursTaskExitCodeTryGet),
         PS_HLE_FUNC(0x8A85674D, _cellSpursLFQueuePushBody),

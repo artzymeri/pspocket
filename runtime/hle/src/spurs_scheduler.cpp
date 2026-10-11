@@ -132,6 +132,23 @@ int worker_intr_mbox(SPUContext* ctx, uint32_t value)
 
 constexpr ps_spu_hooks kWorkerHooks{worker_stop, worker_intr_mbox, 0, nullptr};
 
+// A worker left workload `wid` (its count of workers inside went down by one, to `now`). The last one to leave a
+// taskset that is removable completes the taskset's shutdown, as libsre's shutdown-completion hook runs once the SPUs
+// left it (D-914); cellSpursShutdownWorkload does it itself when no worker was inside.
+void left_workload(Scheduler& sched, u32 wid, u32 now)
+{
+    if (now != 0) return;
+    if (__atomic_load_n(sched.base + sched.spurs + wkl_state(wid), __ATOMIC_SEQ_CST) != SPURS_WKL_STATE_REMOVABLE) return;
+    u32 taskset = 0;
+    {
+        std::lock_guard lock(sched.host_mutex);
+        const auto it = sched.inst.workloads.find(wid);
+        if (it == sched.inst.workloads.end() || it->second.kind != Workload::Kind::Taskset) return;
+        taskset = it->second.arg;
+    }
+    taskset_shutdown_complete(sched.kernel, sched.base, taskset);
+}
+
 } // namespace
 
 // ------------------------------------------------------------------------------------------------- worker
@@ -243,13 +260,13 @@ void Worker::body()
         // the shutdown and leaves, or the join sees it inside and waits (D-136).
         sched.inside[sel.wid].fetch_add(1, std::memory_order_seq_cst);
         if (__atomic_load_n(sched.base + sched.spurs + wkl_state(sel.wid), __ATOMIC_SEQ_CST) != SPURS_WKL_STATE_RUNNABLE) {
-            sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst);
+            left_workload(sched, sel.wid, sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst) - 1);
             continue;
         }
         // The DMA log's tag for what the workload's policy writes (a job chain tags its jobs' writes, D-138).
         ps_spu_set_dma_tag(0xFF00000000000000ull | (u64{sel.wid} << 48) | sched.spurs);
         const bool custom = run_workload(sel);
-        sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst);
+        left_workload(sched, sel.wid, sched.inside[sel.wid].fetch_sub(1, std::memory_order_seq_cst) - 1);
         const u64 dt = ps_host_now_ns() - t0;
         if (custom && ctx.mem_writes == writes) {
             sched.idle_poll_ns.fetch_add(dt, std::memory_order_relaxed);

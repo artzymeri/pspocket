@@ -14,6 +14,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -764,6 +765,93 @@ TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system w
         }
         calls.push_back({"cellSpursDestroyTaskset2", {0}, setup, what + " no taskset"});
         calls.push_back({"cellSpursDestroyTaskset2", {kTaskset + 0x40}, setup, what + " misaligned"});
+    }
+
+    // Task2 joins against the task's exit slot (16 bytes at 0x1980 + 16 * id: a joiner's word, then the exit code in
+    // the high half and a state byte: 1 made, bit 4 started, 2 exited, 3 ended by a shutdown, 4 joined; the byte above
+    // it the kind of joiner waiting), made up in every state, with joiners registered or not: TryJoinTask2 always,
+    // JoinTask2 where it would not wait; after a join the task's bits (running, signalled, enabled) and the taskset's
+    // count of Task2 tasks (+0x71) as libsre leaves them. Then DestroyTaskset2 with tasks not joined (BUSY) or a
+    // destruction begun (bit 57 of +0x70: INVAL).
+    {
+        constexpr u32 kNames = kArea + 0xC000, task = 37;
+        for (const u32 state : {0u, 1u, 0x11u, 2u, 0x12u, 3u, 0x13u, 4u, 0x14u, 5u})
+            for (const u32 kind : {0u, 1u, 2u})
+                for (const bool registered : {false, true}) {
+                    const auto setup = [=](u8* b) {
+                        put_taskset2(b, 10496, 0x98FFFF01u, 0x98FFFF02u);
+                        ps_write64(b, kTaskset + 0x18A8, kNames);
+                        std::memset(b + kNames, 0x41, 0x1000);
+                        b[kTaskset + 0x71] = 3; // three Task2 tasks not joined
+                        const u32 w = 4 * (task / 32), bit = 0x80000000u >> (task % 32);
+                        for (const u32 off : {0x00u, 0x10u, 0x30u, 0x40u, 0x50u}) ps_write32(b, kTaskset + off + w, bit | 1);
+                        const u32 slot = kTaskset + 0x1980 + 16 * task;
+                        ps_write64(b, slot, registered ? (u64{0x98FFFF01u} << 32 | 0xFFFFFF00u | task) : 0);
+                        ps_write64(b, slot + 8, u64{0x12345678} << 32 | (kind << 8) | state);
+                    };
+                    const std::string what = std::format("slot state {:#x} joiner kind {} {}", state, kind,
+                        registered ? "registered" : "none registered");
+                    calls.push_back({"cellSpursTryJoinTask2", {kTaskset, task, kOut}, setup, what});
+                    const bool waits = kind == 0 && (state & 0xF) == 1 && (state & 0x10) && !registered;
+                    if (!waits) calls.push_back({"cellSpursJoinTask2", {kTaskset, task, kOut}, setup, what});
+                }
+        // CreateTask2's own checks before it claims an ID (the ELF misaligned stops it after them): the attribute's
+        // revision, the taskset's size and event flags; WithBinInfo's reserved words. DestroyTaskset2's: a workload ID
+        // past 31, the size, the event flags.
+        for (const u32 revision : {0u, 1u, 0x80000000u})
+            for (const auto& [size, flag1, flag2] : std::initializer_list<std::tuple<u32, u32, u32>>{
+                     {10496, 0x98FFFF01u, 0}, {10496, 0, 0x98FFFF02u}, {10496, 0, 0}, {10495, 1, 1}, {6400, 1, 1}}) {
+                const auto setup = [=](u8* b) {
+                    put_taskset2(b, size, flag1, flag2);
+                    b[kTaskset + 0x71] = 1; // a Task2 task not joined: a DestroyTaskset2 past its checks is BUSY
+                    std::memset(b + kAttr2, 0, 0x100);
+                    ps_write32(b, kAttr2, revision);
+                    std::memset(b + kBin, 0, 32);
+                    ps_write64(b, kBin, kElf + 8);
+                };
+                const std::string what = std::format("revision {:#x}, size {}, flags {:#x} {:#x}", revision, size,
+                    flag1, flag2);
+                calls.push_back({"cellSpursCreateTask2", {kTaskset, kOut, kElf + 8, 0, kAttr2}, setup, what});
+                calls.push_back({"cellSpursCreateTask2WithBinInfo", {kTaskset, kOut, kBin, 0, 0, 0, revision}, setup,
+                    what + " (WithBinInfo, reserved = revision)"});
+                if (revision == 0) {
+                    calls.push_back({"cellSpursDestroyTaskset2", {kTaskset}, setup, what});
+                    calls.push_back({"cellSpursTryJoinTask2", {kTaskset, 3, kOut}, setup, what});
+                    calls.push_back({"cellSpursJoinTask2", {kTaskset, 3, kOut}, setup, what});
+                }
+            }
+        for (const u32 reserved : {0u, 1u}) {
+            const auto setup = [=](u8* b) {
+                put_taskset2(b, 10496, 0x98FFFF01u, 0x98FFFF02u);
+                std::memset(b + kBin, 0, 32);
+                ps_write64(b, kBin, kElf + 8);
+                ps_write32(b, kBin + 0xC, reserved);
+                ps_write32(b, kBin + 0x8, 0x200); // a context size and pattern libsre does not read
+                ps_write32(b, kBin + 0x10, 0xFFFFFFFFu);
+            };
+            calls.push_back({"cellSpursCreateTask2WithBinInfo", {kTaskset, kOut, kBin, 0, kArea, kArea, 0}, setup,
+                std::format("bin info reserved word {}", reserved)});
+            calls.push_back({"cellSpursCreateTask2WithBinInfo", {0, 0, kBin, 0, 0, 0, 0}, setup,
+                std::format("bin info reserved word {}, no taskset nor id", reserved)});
+        }
+        for (const u32 wid : {31u, 32u, 0xFFFFFFFFu}) {
+            const auto setup = [=](u8* b) {
+                put_taskset2(b, 10496, 0x98FFFF01u, 0x98FFFF02u);
+                ps_write32(b, kTaskset + 0x74, wid);
+                b[kTaskset + 0x71] = 1;
+            };
+            calls.push_back({"cellSpursDestroyTaskset2", {kTaskset}, setup, std::format("workload {:#x}", wid)});
+        }
+        for (const auto& [flags, count] : std::initializer_list<std::pair<u8, u8>>{{0, 1}, {0, 0x80}, {2, 0}, {2, 1},
+                 {0xFD, 1}}) {
+            const auto setup = [=](u8* b) {
+                put_taskset2(b, 10496, 0x98FFFF01u, 0x98FFFF02u);
+                b[kTaskset + 0x70] = flags;
+                b[kTaskset + 0x71] = count;
+            };
+            calls.push_back({"cellSpursDestroyTaskset2", {kTaskset}, setup,
+                std::format("flags {:#x}, {} Task2 tasks not joined", flags, count)});
+        }
     }
 
     // The LF queue's Try bodies (isBlocking 0, nothing to wait for), every direction, around empty and full.
