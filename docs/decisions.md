@@ -10870,3 +10870,194 @@ ESRCH, TASK_ERROR_SRCH.
 Test: test_spurs_task2.cpp, 24 rounds of a CellSpursTaskset2 destroyed while a JoinTask2 waits (SHUTDOWN) and three
 threads poll TryJoinTask2 (BUSY, then SRCH). Under ThreadSanitizer the race was reported in 6 of 6 runs before, in none
 of 6 after.
+
+## D-620 · 2026-10-11 · FFmpeg's DTS, TrueHD and WMA decoders; what the audio cores on FFmpeg share
+
+The audio decoder cores still grey on the library chart (cellDDPdec, cellM2AACdec, cellMP3Sdec, cellAtrac3multidec,
+cellTRHDdec, the four DTS modules, cellWMAdec, cellWMAPROdec and cellWMALSLdec: D-621 to D-623) need decoders the build
+did not have. scripts/build-ffmpeg.sh now builds, for every target:
+- the decoders dca (DTS: Coherent Acoustics' core with its XCh, XXCH, X96 and XBR extensions, and the extension
+  substream's lossless XLL and low bit rate LBR, so all four of libadec's DTS types), truehd (Dolby TrueHD), wmav1,
+  wmav2, wmapro and wmalossless, and the parsers dca and mlp (TrueHD's); all LGPL-2.1-or-later (D-181). E-AC-3's decoder
+  was there already (D-576).
+- in the tests' builds (<target>-tests, D-577) the encoders eac3, dca, truehd, wmav1 and wmav2, which write the streams
+  the tests decode. DTS's and TrueHD's are FFmpeg's experimental encoders (the tests open them with
+  strict_std_compliance experimental): good enough to write test streams, and only the test programs link them. FFmpeg
+  has no WMA Pro or WMA Lossless encoder: those tests build their packets themselves (D-622, D-623).
+The cloud's Linux build was rebuilt with them (build/ffmpeg/linux and linux-tests). **On the Mac: run
+scripts/build-ffmpeg.sh macos, macos-tests and ios again** (their configure arguments changed, so each reconfigures and
+rebuilds). Until then a game opening one of the new DTS, TrueHD or WMA cores stops pspocket-boot or the app with the
+missing decoder named (FfDecoder::open's fatal error, as for any decoder a build lacks), and the tests that need one
+skip: as before each test whose encoder FFmpeg lacks, and the WMA Pro and WMA Lossless tests without their decoders.
+
+What the cores share grows (runtime/hle/src/adec_ffmpeg.cpp/.hpp):
+- Codec::bytes_needed: the bytes from an access unit's start a codec reads, its size except for ATRAC3 multichannel,
+  whose tracks' blocks may run past the size it is given (D-621). The common part checks that so many are guest memory
+  before decoding.
+- FfDecoder takes FFmpeg's planar or interleaved floats and 16- and 32-bit samples (TrueHD's, WMA Lossless's and DTS
+  XLL's integer output) and gives planar floats, the integers over 2^15 and 2^31: exact for samples of up to 24 bits.
+  Planar::bits keeps the resolution FFmpeg reports (bits_per_raw_sample). Another sample format is still fatal.
+- The AAC cores' stereo downmix (D-578) is shared (stereo_downmix), with apply_channel_number, the output a
+  CellAdecChannel asks for as the MPEG audio cores read channelNumber (D-577: MONO the downmix's pair averaged, STEREO
+  the downmix or a mono stream twice, any other the stream's own channels), limit_channels (past a core's output
+  channels the first ones kept, logged once) and channel_mask (the channels as WAVE_FORMAT_EXTENSIBLE's bits, FFmpeg's
+  channel numbers).
+- ginfo and lprm: the information block and the parameters of the cores whose structures nothing at hand gives (D-622).
+
+## D-621 · 2026-10-11 · cellAdec's Dolby Digital Plus, MPEG-2 AAC, MP3 Surround and ATRAC3 multichannel on FFmpeg
+
+Four more of libadec's codecs get pspocket's own core where no firmware module gives one, by D-577's rule, each on the
+core of the codec it extends: Dolby Digital Plus (CELL_ADEC_TYPE_EAC3, cellDDPdec), MPEG-2 AAC (M2AAC, cellM2AACdec),
+MP3 Surround (MP3S, cellMP3Sdec) and ATRAC3 multichannel (ATRAC3MULTI, cellAtrac3multidec). RPCS3 runs Sony's modules
+for them: it has their cellAdec and PTS types and the modules' names and NIDs, but none of their structures. So each
+takes the structures of the nearest codec RPCS3 lays out (inferred: each layout below, with what to check on the Mac
+against Sony's module, firmware_compare.hpp), and its errors, its own codes not being known, are libadec's:
+CELL_ADEC_ERROR_ARG for parameters StartSeq refuses, BUSY, and FATAL for a unit it cannot decode, the reason logged.
+Their libraries are firmware-first with their tables (D-563, D-623).
+- **Dolby Digital Plus** (adec_ac3.cpp): AC-3's core (D-579) on FFmpeg's E-AC-3 decoder, which decodes AC-3 frames too,
+  as a DD+ decoder must. Parameters and information block AC-3's (CellAdecParamAc3, CellAdecBsiAc3), read and checked as
+  AC-3's. An access unit holds one or more syncframes; program 1's independent ones (AC-3 frames, or E-AC-3's
+  independent substream 0, of 1, 2, 3 or 6 blocks) are decoded in order, at most 6144 samples a channel. Dependent
+  substreams (7.1's extra channels) and other programs' substreams are left out, logged once: the independent substream
+  carries the program's 5.1 as the encoder mixed it, which is what a 5.1 decoder plays. The information block describes
+  the unit's first independent frame: codecType 1 for E-AC-3 (0 for AC-3); fsIndex fscod, or 3 + fscod2 at the reduced
+  rates; frmSizeCod frmsiz; bsi the 64 bits from bsi()'s start; esSizeBit the bits decoded; annex D's fields from
+  E-AC-3's mixing and informational metadata (mixmdate, infomdate), whose Lo/Ro and Lt/Rt levels the downmix then uses
+  (FFmpeg's E-AC-3 defaults without them); crcErrorFlag any frame's. PTS: its own correction (type 17,
+  _SceAdecCorrectPtsValue_Ddp), an E-AC-3 frame's length varying with its blocks. To check: whether Sony's core takes
+  CellAdecParamAc3 as it is, its information block and codecType, whether it decodes 7.1's dependent substreams, how it
+  takes several frames in a unit, its error codes.
+- **MPEG-2 AAC** (adec_aac.cpp): the MPEG-4 AAC core (D-578) with MPEG-4's parameters and information
+  (CellAdecParamM4Aac, CellAdecM4AacInfo): MPEG-2 AAC is MPEG-4's Main, LC and SSR profiles without SBR. ADTS (either
+  ID) and ADIF as MPEG-4's, raw data blocks Main or LC only (MPEG-2 has no LTP), up to eight channels; PTS its own (type
+  25, _SceAdecCorrectPtsValue_Aac). To check: Sony's layouts (a structure of MPEG-2's own?), whether it decodes SBR in
+  MPEG-2 ADTS as FFmpeg does, its errors.
+- **MP3 Surround** (adec_mp3.cpp): MP3's core (D-577) with MP3's parameters and information (CellAdecParamMP3,
+  CellAdecMP3Info). An MP3 Surround stream is MP3 whose ancillary data carries spatial parameters for 5.1; FFmpeg
+  decodes no spatial data, so the stereo MP3 (the encoder's downmix, which any MP3 decoder plays) is decoded and the
+  spatial data left, logged once; i_error_code is FATAL for a refused unit. PTS its own (type 33,
+  _SceAdecCorrectPtsValue_Mp3s). To check: whether Sony's core gives 5.1, and then in what layout and information block.
+- **ATRAC3 multichannel** (adec_atrac3.cpp): the parameters are what libatrac3multi writes (D-535, its handle compared
+  byte for byte with Sony's module): nch the output tracks (1 to 8), isJoint 0, nbytes the stream frame's bytes, bw_pcm
+  as ATRAC3's, and the stream's channels at +0x10 (pspocket's CellAdecParamAtrac3Multi, 0x14 bytes). libatrac3multi
+  gives each unit as nch blocks of nbytes / channels, each the sound unit of the channel its track plays (a silent one
+  for a track that plays none), with the stream frame's size; so each track is decoded on its own one-channel FFmpeg
+  ATRAC3 decoder (keeping its channel's overlap and gain control state), the nch blocks read from the unit's start even
+  past the size given (bytes_needed, D-620). The PCM is nch channels of 1024 samples in bw_pcm's format, the information
+  block nch, isJoint, nbytes and the stream's channels (0x10 bytes), PTS the front end's step (type 39). StartSeq
+  refuses (ARG) tracks outside 1 to 8, joint stereo, more than 8 stream channels, frames other than 96, 152 or 192 bytes
+  a channel, another word size. Through it cellAtracMulti (D-535) plays its files without the system software. To check:
+  the information block, and whether Sony's core reads past the size given.
+
+Tests: tests/hle/test_adec_more.cpp, with FFmpeg (D-606): streams the tests' encoders wrote and frames built in the
+tests, each unit's PCM against FFmpeg's own decoding of the same units, sample for sample.
+- Dolby Digital Plus: 5.1 E-AC-3 at 48 kHz and 640 kbit/s, a tone in each channel: 92.0 to 93.3 dB from the input in the
+  full-band channels and 36.1 in the LFE (20 required), the information block's fields, PTS. A stream with Lo/Ro
+  preferred at -6 dB: the Lo/Ro output from the full output's channels within 1e-5, the metadata in the block. Units of
+  two frames (5760 ticks), a frame followed by a dependent substream and one by another program's (left out), AC-3
+  frames (codecType 0); a unit with no syncframe and a cut one FATAL, the next decoding; four parameter sets refused.
+- MPEG-2 AAC: stereo LC as MPEG-2 ADTS frames, 29.5 and 28.1 dB, the ADTS fields, PTS; raw data blocks giving the same
+  PCM; no sync and an SSR frame FATAL; four parameter sets refused.
+- MP3 Surround: stereo frames built here (test_adec_cores.cpp's builder): PCM, the header's word and fields, PTS; 16-bit
+  PCM; a layer II header FATAL (in i_error_code too); a word size refused.
+- ATRAC3 multichannel: four tracks of a four-channel stream (playing channels 2 and 0, none, and 3) and eight tracks of
+  a two-channel stream given with the stream frame's 384 bytes, each track against FFmpeg's one-channel decoding of its
+  units; 16-bit PCM; the information; five parameter sets refused. cellAtracMulti playing a four-channel ATRAC3 file
+  built here through the core, its two tracks' tones.
+
+## D-622 · 2026-10-11 · cellAdec's TrueHD, DTS and WMA cores on FFmpeg, firmware first; their structures pspocket's
+
+Dolby TrueHD (CELL_ADEC_TYPE_TRUEHD, cellTRHDdec), the four DTS types (DTS, cellDTSdec; DTS-HD, cellDTSHDdec; the DTS-HD
+core, cellDTSHDCOREdec; DTS Express, cellDTSLBRdec) and WMA (cellWMAdec), with WMA Pro (cellWMAPROdec) and WMA Lossless
+(cellWMALSLdec), get pspocket's own cores where no firmware module gives one, by D-577's rule (adec_truehd.cpp,
+adec_dts.cpp, adec_wma.cpp). RPCS3 has nothing of these codecs but the cellAdec types, the modules' names and NIDs and
+their PTS types (TrueHD 27, DTS 28, DTS-HD 21, the DTS-HD core 37 and 38, DTS Express 31, WMA 30, WMA Pro 35, WMA
+Lossless 36), and no structure of a related codec fits them as one did in D-621. So their parameters and information
+blocks are pspocket's, made to carry what each decoder needs and a game would read, all to be checked against Sony's
+modules on the Mac:
+- **The parameters of TrueHD and the DTS cores** (lprm, adec_ffmpeg.hpp): CellAdecParamMpmc's layout (D-577), libadec's
+  one multichannel structure without a codec's own fields: channelNumber (a CellAdecChannel: MONO and STEREO a downmix,
+  any other the stream's own channels, up to 8), downmix and lfeUpSample (flags, kept as the MPEG audio cores keep
+  them). StartSeq refuses (ARG) a layout past 3/4 with LFE or a flag past 1.
+- **Their information block** (ginfo, 0x40 bytes of big-endian words; the WMA cores' too): the PCM's rate, channels,
+  channel mask (WAVE_FORMAT_EXTENSIBLE's bits) and samples; the stream's own channels and mask before a downmix; its
+  resolution where it codes one and its bit rate where it says; isBsiValid; the unit's error; then each codec's own
+  words from +0x28.
+- **TrueHD**: an access unit holds one or more TrueHD access units (each starting with its length), decoded in order.
+  Decoding starts at a major sync: the units before one give no PCM and no error (logged once). FFmpeg's decoder opens
+  there with the channel layout its parser reads from the major sync (the 8-channel presentation's, else the 6-channel
+  one's), without which it refuses one- and two-channel streams. STEREO and MONO take the stream's two-channel
+  presentation (FFmpeg's downmix option: the lossless downmix the encoder coded), else pspocket's stereo downmix. The
+  PCM is floats, the stream's 24-bit samples exactly. Information: the stream's channels and mask from the last major
+  sync, bitRate its peak data rate, +0x28 its format_info word, +0x2C the TrueHD access units in the unit. At most 8192
+  samples a channel.
+- **DTS**: one DTS frame per unit, a core frame (16-bit big-endian, or the 14-bit and little-endian forms FFmpeg
+  converts) with or without an extension substream, or an extension substream alone. DTS and the DTS-HD core decode the
+  core alone (FFmpeg's core_only; a unit without a core is FATAL), DTS-HD and DTS Express all FFmpeg decodes (the core
+  with XCh, XXCH, X96 and XBR, XLL's lossless audio, LBR). STEREO and MONO ask FFmpeg for the stream's own stereo
+  downmix where it carries the coefficients, else pspocket's. Information: the stream's channels from the core header's
+  AMODE and LFF where there is a 16-bit core; bitsPerSample XLL's resolution, else the core's PCMR; bitRate the core's
+  RATE; then AMODE, the frame's bytes, SFREQ, RATE and LFF (each 0xFFFFFFFF without a core) and whether an extension
+  substream follows. At most 4096 samples a channel. The DTS-HD core's PTS type is 37 (RPCS3's DTSHDCORE_UNK1; 38 calls
+  the same function).
+- **WMA's parameters** (pspocket's CellAdecParamWma, 0x24 bytes): what an ASF stream's properties give a WMA decoder,
+  WAVEFORMATEX's fields and the codec data's options, as words, as Sony's structures carry a WAV header's fields for
+  ATRAC3 (D-579): formatTag (0x160 WMA 1, 0x161 WMA 2, 0x162 WMA Pro, 0x163 WMA Lossless), channels, samplesPerSec,
+  avgBytesPerSec, blockAlign, bitsPerSample (WMA Pro's and Lossless's valid bits), channelMask, encodeOptions and
+  channelNumber (the output, as above). FFmpeg gets them as a WAV file's codec data. StartSeq refuses (ARG) another
+  core's format, WMA 1 and 2 past 2 channels or 50 kHz or without a bit rate, more than 8 channels, a mask of another
+  channel count, WMA Lossless at other than 16 or 24 bits, no block, a layout past the enum. An access unit is one or
+  more packets of blockAlign bytes (an ASF payload's), decoded in turn, bytes past the last whole packet left (logged
+  once); a packet may finish no frame (frames span packets, and WMA Pro holds its first back): no PCM, no error.
+  Information: ginfo's, then formatTag, blockAlign, encodeOptions and the packets decoded. At most 32768 samples a
+  channel.
+- **WMA Pro and WMA Lossless have no libadec type** (RPCS3's RESERVED22 and RESERVED23, "never released"): cellAdec
+  refuses types 28 and 29 as before, and these cores serve only the modules that drive them through their own tables
+  (D-623), their contexts carrying 28 (WMA Pro) and 29 (WMA Lossless), in the order of their PTS types.
+- The errors: libadec's own (ARG, BUSY, FATAL for a unit FFmpeg refuses or a WMA unit shorter than a packet), the
+  codecs' own not being known.
+To check on the Mac, for each: Sony's parameter and information structures (WMA's as WAVEFORMATEX's here?), which DTS
+extensions each DTS core decodes, how TrueHD's and WMA's units are cut (TrueHD access units, ASF packets), where
+decoding starts, the error codes.
+
+Tests (with FFmpeg): TrueHD 5.1 at 48 kHz that FFmpeg's encoder wrote, four TrueHD units to each of cellAdec's: every
+sample the 24-bit input exactly and FFmpeg's decoding of the units, the information, PTS (300 ticks); STEREO the
+stream's two-channel presentation and MONO its mean within 1e-6; a stream joined after its first major sync giving no
+PCM until the next, no error; a unit FFmpeg refuses FATAL; three parameter sets refused. DTS 5.1 at 1509 kbit/s through
+each of the four cores: FFmpeg's decoding (core only or whole), the core header's fields, PTS (960); in DTS-HD the
+full-band channels 76 to 104 dB from the input and the LFE's tone at 60 Hz; STEREO FFmpeg's downmix or pspocket's; no
+sync, and an extension substream without a core to the core-only types, FATAL; two parameter sets refused. WMA 2 and WMA
+1 at 128 kbit/s: FFmpeg's decoding of each packet, 49.2 and 48.3 dB (48.2 for WMA 1), PTS (4180), the information; two
+packets a unit, mono; six parameter sets refused and a unit shorter than a packet FATAL. WMA Lossless and WMA Pro
+through their tables (D-623).
+
+## D-623 · 2026-10-11 · The new cores' operation tables and PTS functions, firmware first; CELP stays grey
+
+Each core of D-621 and D-622 is now also its module's exports, as D-591's are (adec_tables.cpp): the CellAdecCoreOps
+table under RPCS3's name and NID (g_cell_adec_core_ops_Ddp 0xF5E9C15C, Aac 0xAC2F0831, Mp3s 0x292CDF0A, atrac3multi
+0xC20C6BD7, truehd 0xE88E381B, DtsCore 0x15248EC5, DtsHd 0x51AC2B6C, DtsHd_Core 0x6C8F4F1C, DtsLbr 0x8C50AF52, wma
+0x88320B10, WmaPro 0xA8BAC670, WmaLsl 0x602AAB16), and the _SceAdecCorrectPtsValue_* function of each but ATRAC3
+multichannel, whose PTS libadec steps itself (Ddp 0xEE2731D3, Aac 0x7CBA9865, Mp3s 0x73A2C895, truehd 0x75080F7B,
+DtsCore 0x8C7AD5ED, DtsHd 0xF3AF1093, DtsHd_Core 0xD4C180D4, DtsLbr 0x185591D6, wma 0x46E6C806, WmaPro 0x8D45F21A,
+WmaLsl 0xF2F9C183). A PTS function corrects a missing PTS as D-591's do: the core's last PTS plus that frame's length;
+half a timestamp, a core of another codec or a timestamp outside guest memory is FATAL. The twelve libraries are
+firmware-first (D-563): where the system software has the module it serves, elsewhere pspocket's. pspocket's cellAdec
+takes the ten libadec types through D-577's rule (the firmware's table first, else the own core); WMA Pro and WMA
+Lossless are reached only through their tables.
+
+**CELP and CELP 8 kHz** (cellCelpDec and cellCelp8Dec: their tables and PTS functions, four cells) stay grey. FFmpeg has
+no MPEG-4 CELP decoder (its CELP-like decoders are other codecs: QCELP, Sipro's ACELP, G.729, AMR), RPCS3 has nothing of
+them beyond their names, and an MPEG-4 CELP decoder written here from ISO/IEC 14496-3 with no reference stream and no
+Sony module to compare with could not be shown right. Without the system software cellAdec still refuses those types
+(FATAL, logged), and a game importing either module gets Sony's where it is installed.
+
+The count: 6,187 of 6,625 library functions pspocket's own before, 6,210 after (the twelve tables and eleven PTS
+functions).
+
+Tests: tests/hle/test_adec_more.cpp: the exports, their NIDs and firmware-first markers, there exactly when the build
+has FFmpeg; no core for CELP, CELP 8 kHz or types 28 and 29 (cellAdecQueryAttr FATAL; 26 and 27 ARG); with FFmpeg, each
+new core through its table driven from guest code as Sony's libadec drives it, with guest notifications, giving the
+answers, PCM, information and callbacks it gives through pspocket's front end; WMA Lossless's raw PCM tiles built here
+(16 and 24 bits) decoded exactly through cellWMALSLdec's table, and WMA Pro's silent frames built here (FFmpeg has no
+encoder) through cellWMAPROdec's, the first frame held back as the decoder does; each PTS function's corrections and
+refusals. The HLE NID check covers the new names.
