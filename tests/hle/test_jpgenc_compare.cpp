@@ -1,16 +1,20 @@
-// cellJpgEnc against Sony's libjpgenc (D-618; the library D-616, the suite D-597): the same configurations, resources
-// and pictures go to pspocket's library (on its own encoder, D-615) and to Sony's module. pspocket's structures are
-// inferred (D-616), so this comparison is first of all where the Mac finds out whether they are Sony's: a guess that
-// is not shows as an answer (ARG where pspocket encodes), a frame header of another size or sampling, or a stream
-// information laid out otherwise.
-// Compared: QueryAttr's attributes; Open's, OpenEx's and Close's answers and the handle (as an offset into the work
-// memory when it lies there); every answer of the result queue and every field of each stream's information but its
-// size; each JPEG's frame header (size, components, their sampling and tables), quantisation tables (Sony's scaling of
-// the quality), Huffman tables and scan header, whole or not, its length as streamSize; and its picture as pspocket's
-// decoder reads it back (it decodes as Sony's libjpgdec does, D-200): within a few steps of the other half's at high
-// qualities, and its PSNR against the picture within 10% at every quality. Notes, not compared: the markers in order
-// (Sony may write other APPn or COM segments), JFIF's version and density, the stream's size, the quality the size
-// limit mode chose. No game data; skipped without the firmware (compare_util.hpp).
+// cellJpgEnc against Sony's libjpgenc (D-616, D-618, D-913): the same configurations, resources, pictures and
+// parameters go to pspocket's library and to Sony's module. Compared: QueryAttr's attributes; Open's, OpenEx's and
+// Close's answers and the handle (as an offset into the work memory when it lies there); every answer of the two queues
+// and every field of each stream's information; each JPEG byte for byte (libjpgenc is IJG's libjpeg 6b: its markers,
+// tables and entropy-coded data are deterministic), with its markers, headers and tables as lines to read a difference
+// by.
+//
+// The structures (Sony's, D-913): CellJpgEncConfig {maxWidth, maxHeight, encodeColorSpace, samplingFormat, enableSpu
+// (b8, +16), exParamList, exParamNum}; CellJpgEncPicture {width, height, colorSpace, pictureAddr, userData (u64,
+// +16)}; CellJpgEncPicture2 {width, height, pitchWidth, colorSpace, pictureAddr, (4 bytes), userData (u64, +24)};
+// CellJpgEncEncodeParam {enableSpu (b8), restartInterval, dctMethod, compressionMode, compressionModeParam,
+// exParamList, exParamNum}, each extended parameter {marker, data, size} (a marker segment); CellJpgEncOutputParam
+// {location, streamFileName, streamAddr, limitSize}; CellJpgEncStreamInfo {state, location, streamFileName,
+// streamAddr, limitSize, streamSize, processedLine, quality, userData (u64, +32)}.
+//
+// libjpgenc encodes on a thread of its own: each comparison waits for a stream (WaitForOutput blocking) before it reads
+// it. No game data; skipped without the firmware (compare_util.hpp).
 
 #include <catch_amalgamated.hpp>
 
@@ -26,13 +30,10 @@
 #include <vector>
 
 #include "compare_util.hpp"
-#include "jpeg_decoder.hpp" // runtime/hle/src
-#include "jpeg_encoder.hpp"
 
 using namespace pspocket;
 using namespace pspocket::hle::test;
 using namespace pspocket::hle::test::compare;
-namespace jpeg = pspocket::hle::jpeg;
 
 TEST_CASE("cellJpgEnc's comparison calls Sony's exports by their names; pspocket's library, firmware first",
     "[hle][jpgenc]")
@@ -46,12 +47,14 @@ namespace {
 
 constexpr u32 kCfg = kData + 0x100, kAttr = kData + 0x140, kRsrc = kData + 0x180, kHandle = kData + 0x1C0,
               kPic = kData + 0x200, kParam = kData + 0x240, kOutParam = kData + 0x280, kInfo = kData + 0x2C0,
-              kNum = kData + 0x300, kName = kData + 0x800, kPixels = kData + 0x1000, kStreams = kData + 0x40000;
+              kNum = kData + 0x300, kEx = kData + 0x400, kExData = kData + 0x500, kName = kData + 0x800,
+              kPixels = kData + 0x1000, kStreams = kData + 0x40000;
 constexpr u32 kStreamSize = 0x10000; // each stream buffer (eight of them)
-constexpr u32 kWork = 0x01000000, kWorkSize = 0x01000000;
+constexpr u32 kWork = 0x01000000, kWorkSize = 0x01000000, kEncoderMem = 0x100000;
 constexpr u8 kFill = 0xEE;
 enum : u32 { GRAY = 1, RGB = 2, YCBCR = 3, RGBA = 10, ARGB = 20 };
 enum : u32 { S444 = 0, S422 = 1, S420 = 2, S411 = 3, FULL = 4 };
+enum : u32 { QUALITY = 0, FAST = 5 };
 static_assert(kPixels + 0x3F000 <= kStreams && kStreams + 8 * kStreamSize <= kData + 0x200000);
 
 struct JpgFixture : TlsFixture {
@@ -63,67 +66,24 @@ struct JpgFixture : TlsFixture {
 };
 
 u32 stream_at(u32 i) { return kStreams + kStreamSize * i; }
-
-// ---- the pictures (test_jpgenc.cpp's kind: smooth, with some detail), as R, G, B and as each colour space
-
-struct Picture {
-    u32 w = 0, h = 0;
-    std::vector<u8> rgb;
-};
-
-Picture smooth(u32 w, u32 h, u32 seed)
-{
-    Picture p{w, h, std::vector<u8>(usize{w} * h * 3)};
-    for (u32 y = 0; y < h; y++)
-        for (u32 x = 0; x < w; x++) {
-            u8* c = p.rgb.data() + (usize{y} * w + x) * 3;
-            const double fx = x + seed, fy = y;
-            c[0] = static_cast<u8>(std::clamp(128 + 90 * std::sin(fx * 0.13 + fy * 0.05), 0.0, 255.0));
-            c[1] = static_cast<u8>(std::clamp(110 + 70 * std::cos(fy * 0.11 - fx * 0.02), 0.0, 255.0));
-            c[2] = static_cast<u8>(std::clamp(40 + 1.5 * (fx + fy) + 20 * std::sin(fx * fy * 0.004), 0.0, 255.0));
-        }
-    return p;
-}
-
 u32 pixel_bytes(u32 space) { return space == GRAY ? 1 : space == RGB || space == YCBCR ? 3 : 4; }
 
-// The picture at kPixels in `space`, rows `pitch` bytes apart.
-void put_picture(u8* b, const Picture& p, u32 space, u32 pitch)
+// A picture of smooth gradients with detail (edges, a checker, noise), as bytes of `space` at kPixels, rows `pitch`
+// apart: the same function of (x, y, channel) whatever the colour space, so each space's encoder has varied input.
+void put_picture(u8* b, u32 w, u32 h, u32 space, u32 pitch, u32 seed)
 {
-    std::memset(b + kPixels, 0xA5, usize{pitch} * p.h);
-    for (u32 y = 0; y < p.h; y++)
-        for (u32 x = 0; x < p.w; x++) {
-            const u8* c = p.rgb.data() + (usize{y} * p.w + x) * 3;
-            u8* o = b + kPixels + usize{y} * pitch + usize{x} * pixel_bytes(space);
-            switch (space) {
-            case GRAY: o[0] = jpeg::rgb_to_y(c[0], c[1], c[2]); break;
-            case RGB: std::memcpy(o, c, 3); break;
-            case YCBCR: jpeg::rgb_to_ycbcr(c[0], c[1], c[2], o[0], o[1], o[2]); break;
-            case RGBA:
-                std::memcpy(o, c, 3);
-                o[3] = static_cast<u8>(x * 9);
-                break;
-            default:
-                o[0] = static_cast<u8>(y * 9);
-                std::memcpy(o + 1, c, 3);
-                break;
+    std::memset(b + kPixels, 0xA5, usize{pitch} * h + 64);
+    const u32 n = pixel_bytes(space);
+    for (u32 y = 0; y < h; y++)
+        for (u32 x = 0; x < w; x++)
+            for (u32 c = 0; c < n; c++) {
+                const u32 k = c + seed;
+                u32 v = (x * (3 + k) + y * (5 + 2 * k)) * 3;
+                if (((x / 4) + (y / 4)) % 5 == k % 5) v += 60;
+                if (x > w / 2 && y < h / 3) v = 255 - v;
+                v += ((x * 2654435761u) ^ (y * 40503u) ^ (k * 977u)) >> 29;
+                b[kPixels + usize{y} * pitch + usize{x} * n + c] = static_cast<u8>(v);
             }
-        }
-}
-
-std::vector<u8> gray_of(const Picture& p)
-{
-    std::vector<u8> g(usize{p.w} * p.h);
-    for (usize i = 0; i < g.size(); i++) g[i] = jpeg::rgb_to_y(p.rgb[3 * i], p.rgb[3 * i + 1], p.rgb[3 * i + 2]);
-    return g;
-}
-
-double psnr(const std::vector<u8>& a, const std::vector<u8>& b)
-{
-    if (a.size() != b.size() || a.empty()) return 0;
-    double se = 0;
-    for (usize i = 0; i < a.size(); i++) se += (double(a[i]) - b[i]) * (double(a[i]) - b[i]);
-    return se == 0 ? 99.0 : 10 * std::log10(255.0 * 255.0 / (se / static_cast<double>(a.size())));
 }
 
 // ---- reading a JPEG back
@@ -198,16 +158,16 @@ std::string marker_name(u8 m)
 struct Run : Half<JpgFixture> {
     using Half::Half;
 
-    void write_config(u32 max_w, u32 max_h, bool spu = false, u32 add = 0, u32 ex_num = 0)
+    void write_config(u32 max_w, u32 max_h, u32 space, u32 sampling, bool spu = false, u32 ex_num = 0)
     {
-        // CellJpgEncConfig {maxWidth, maxHeight, enableSpu (b8), addMemSize, exParamList, exParamNum} (D-616).
-        std::memset(b + kCfg, 0, 24);
+        std::memset(b + kCfg, 0, 28);
         ps_write32(b, kCfg, max_w);
         ps_write32(b, kCfg + 4, max_h);
-        ps_write8(b, kCfg + 8, spu ? 1 : 0);
-        ps_write32(b, kCfg + 12, add);
-        ps_write32(b, kCfg + 16, ex_num ? kName + 0x100 : 0);
-        ps_write32(b, kCfg + 20, ex_num);
+        ps_write32(b, kCfg + 8, space);
+        ps_write32(b, kCfg + 12, sampling);
+        ps_write8(b, kCfg + 16, spu ? 1 : 0);
+        ps_write32(b, kCfg + 20, ex_num ? kEx : 0);
+        ps_write32(b, kCfg + 24, ex_num);
     }
 
     u32 query(const std::string& what)
@@ -233,11 +193,12 @@ struct Run : Half<JpgFixture> {
         ps_write32(b, kRsrc + 12, static_cast<u32>(spu));
     }
 
-    u32 open(const std::string& what, u32 max_w, u32 max_h, bool spu)
+    // An encoder in work memory `slot` (an odd offset into it: the handle is the next 128-byte boundary).
+    u32 open(const std::string& what, u32 slot, u32 max_w, u32 max_h, u32 space, u32 sampling, bool spu = false)
     {
-        write_config(max_w, max_h, spu);
+        write_config(max_w, max_h, space, sampling, spu);
         const u32 size = query(what);
-        write_resource(kWork, std::min(size ? size : 0x100000u, kWorkSize));
+        write_resource(kWork + slot * kEncoderMem + 0x10, std::min(size ? size : 0x100000u, kEncoderMem - 0x10));
         ps_write32(b, kHandle, 0xEEEEEEEE);
         const u64 r = Half::r("cellJpgEncOpen", {kCfg, kRsrc, kHandle}, "Open " + what);
         o.line("Open " + what + ": the handle", handle_text(ps_read32(b, kHandle)));
@@ -245,42 +206,45 @@ struct Run : Half<JpgFixture> {
     }
 
     struct Pic {
-        u32 width = 0, height = 0, pitch = 0, space = RGB, sampling = FULL;
+        u32 width = 0, height = 0, space = RGB, pitch = 0; // pitch 0: EncodePicture (the picture's own rows)
         u64 user = 0;
     };
     struct Param {
-        u32 space = YCBCR, sampling = S420, method = 0, mode = 0, quality = 90;
+        u32 quality = 90, method = QUALITY, restart = 0, mode = 0, ex = 0;
         bool spu = false;
     };
 
-    // EncodePicture (EncodePicture2 with `two`) to stream buffer `slot`, or to the file kName when `slot` is ~0u.
-    u64 encode(const std::string& what, u32 handle, const Pic& p, const Param& e, u32 slot = 0, u32 limit = kStreamSize,
-        bool two = false)
+    // EncodePicture (EncodePicture2 when the picture has a pitch) to stream buffer `slot`, or to the file kName when
+    // `slot` is ~0u.
+    u64 encode(const std::string& what, u32 handle, const Pic& p, const Param& e, u32 slot = 0, u32 limit = kStreamSize)
     {
-        // CellJpgEncPicture {width, height, pitchWidth, colorSpace, pictureAddr, userData (u64, +24)}; Picture2 with
-        // samplingFormat at +16 and pictureAddr at +20. CellJpgEncEncodeParam {enableSpu (b8), encodeColorSpace,
-        // samplingFormat, dctMethod, compressionMode, compressionModeParam}. CellJpgEncOutputParam {location,
-        // streamFileName, streamAddr, limitSize} (D-616).
+        const bool two = p.pitch != 0;
         std::memset(b + kPic, 0, 32);
         ps_write32(b, kPic, p.width);
         ps_write32(b, kPic + 4, p.height);
-        ps_write32(b, kPic + 8, p.pitch);
-        ps_write32(b, kPic + 12, p.space);
-        if (two) ps_write32(b, kPic + 16, p.sampling);
-        ps_write32(b, kPic + (two ? 20 : 16), kPixels);
-        ps_write64(b, kPic + 24, p.user);
-        std::memset(b + kParam, 0, 24);
+        if (two) {
+            ps_write32(b, kPic + 8, p.pitch);
+            ps_write32(b, kPic + 12, p.space);
+            ps_write32(b, kPic + 16, kPixels);
+            ps_write64(b, kPic + 24, p.user);
+        } else {
+            ps_write32(b, kPic + 8, p.space);
+            ps_write32(b, kPic + 12, kPixels);
+            ps_write64(b, kPic + 16, p.user);
+        }
+        std::memset(b + kParam, 0, 28);
         ps_write8(b, kParam, e.spu ? 1 : 0);
-        ps_write32(b, kParam + 4, e.space);
-        ps_write32(b, kParam + 8, e.sampling);
-        ps_write32(b, kParam + 12, e.method);
-        ps_write32(b, kParam + 16, e.mode);
-        ps_write32(b, kParam + 20, e.quality);
+        ps_write32(b, kParam + 4, e.restart);
+        ps_write32(b, kParam + 8, e.method);
+        ps_write32(b, kParam + 12, e.mode);
+        ps_write32(b, kParam + 16, e.quality);
+        ps_write32(b, kParam + 20, e.ex ? kEx : 0);
+        ps_write32(b, kParam + 24, e.ex);
         const bool file = slot == ~0u;
         ps_write32(b, kOutParam, file ? 0 : 1);
         ps_write32(b, kOutParam + 4, file ? kName : 0);
         ps_write32(b, kOutParam + 8, file ? 0 : stream_at(slot));
-        ps_write32(b, kOutParam + 12, limit);
+        ps_write32(b, kOutParam + 12, file ? 0 : limit);
         if (!file) std::memset(b + stream_at(slot), kFill, kStreamSize);
         return Half::r(two ? "cellJpgEncEncodePicture2" : "cellJpgEncEncodePicture", {handle, kPic, kParam, kOutParam},
             (two ? "EncodePicture2 " : "EncodePicture ") + what);
@@ -295,21 +259,14 @@ struct Run : Half<JpgFixture> {
         return r;
     }
 
-    // GetStreamInfo: its answer and fields (the size checked against the JPEG it describes), then the JPEG, against
-    // `want` (the picture as RGB, or gray) at `quality`.
-    void stream_info(const std::string& what, u32 handle, const std::vector<u8>& want = {}, u32 quality = 0,
-        const std::string& file = {})
+    // GetStreamInfo: its answer and every field, then the JPEG it describes.
+    void stream_info(const std::string& what, u32 handle, const std::string& file = {})
     {
         std::memset(b + kInfo, kFill, 48);
         const u64 r = Half::r("cellJpgEncGetStreamInfo", {handle, kInfo}, "GetStreamInfo " + what);
-        if (r != 0) {
-            o.line("GetStreamInfo " + what + ": the information", hex(b + kInfo, 48));
-            return;
-        }
-        std::vector<u8> fields(b + kInfo, b + kInfo + 48);
+        o.line("GetStreamInfo " + what + ": the information", hex(b + kInfo, 48));
+        if (r != 0 || ps_read32(b, kInfo) != 0) return;
         const u32 size = ps_read32(b, kInfo + 20), addr = ps_read32(b, kInfo + 12);
-        std::memset(fields.data() + 20, 0, 4); // streamSize: below
-        o.line("GetStreamInfo " + what + ": the information but streamSize", hex(fields));
         std::vector<u8> bytes;
         if (!file.empty()) {
             std::ifstream in(file, std::ios::binary);
@@ -318,56 +275,52 @@ struct Run : Half<JpgFixture> {
                 bytes.size() == size ? "yes" : std::format("no ({} bytes)", bytes.size()));
         } else if (addr >= kStreams && addr + u64{size} <= kStreams + 8 * kStreamSize) {
             bytes.assign(b + addr, b + addr + std::min(size + 64u, kStreamSize));
+            bool untouched = bytes.size() >= u64{size} + 64;
+            for (u32 i = 0; untouched && i < 64; i++) untouched = bytes[size + i] == kFill;
+            o.line("stream " + what + ": the 64 bytes past it untouched", untouched ? "yes" : "no");
         }
-        analyse(what, bytes, size, file.empty(), want, quality);
+        analyse(what, std::vector<u8>(bytes.begin(), bytes.begin() + std::min<usize>(bytes.size(), size)));
     }
 
-    // A JPEG of `size` bytes (`bytes` may hold 64 more: what follows it in the buffer).
-    void analyse(const std::string& what, const std::vector<u8>& bytes, u32 size, bool buffer,
-        const std::vector<u8>& want, u32 quality)
+    // A JPEG: its markers, headers and tables as lines (a difference names them), the whole stream exactly.
+    void analyse(const std::string& what, const std::vector<u8>& bytes)
     {
-        const usize n = std::min<usize>(bytes.size(), size);
-        const Parsed p = parse(bytes.data(), n);
-        const std::string s = "stream " + what + ": ";
-        o.line(s + "a whole JPEG", !p.soi ? "no SOI" : p.eoi ? "yes" : "cut short");
-        o.line(s + "streamSize is the JPEG's length", p.eoi && p.length == size ? "yes" : std::format("no ({})", p.length));
-        if (buffer && bytes.size() >= u64{size} + 64) {
-            bool untouched = true;
-            for (u32 i = 0; i < 64; i++) untouched = untouched && bytes[size + i] == kFill;
-            o.line(s + "the 64 bytes past it untouched", untouched ? "yes" : "no");
+        const Parsed p = parse(bytes.data(), bytes.size());
+        o.line("stream " + what + ": a whole JPEG", !p.soi ? "no SOI" : p.eoi ? "yes" : "cut short");
+        o.line("stream " + what + ": streamSize is the JPEG's length",
+            p.eoi && p.length == bytes.size() ? "yes" : std::format("no (the JPEG {} bytes)", p.length));
+        std::string order;
+        u32 dqt = 0, dht = 0;
+        for (const Segment& s : p.segments) {
+            order += " " + marker_name(s.marker);
+            if (s.marker == 0xDB) o.line(std::format("stream {}: DQT {}", what, dqt++), hex(s.data));
+            else if (s.marker == 0xC4) o.line(std::format("stream {}: DHT {}", what, dht++), hex(s.data));
+            else o.line(std::format("stream {}: {}", what, marker_name(s.marker)), hex(s.data));
         }
-        std::string order, app0;
-        std::vector<u8> tables, huffman;
-        for (const Segment& g : p.segments) {
-            order += " " + marker_name(g.marker);
-            if (g.marker == 0xC0 || g.marker == 0xC1 || g.marker == 0xC2)
-                o.line(s + "the frame (" + marker_name(g.marker) + ")", hex(g.data));
-            if (g.marker == 0xDB) tables.insert(tables.end(), g.data.begin(), g.data.end());
-            if (g.marker == 0xC4) huffman.insert(huffman.end(), g.data.begin(), g.data.end());
-            if (g.marker == 0xDA) o.line(s + "the scan", hex(g.data));
-            if (g.marker == 0xDD) o.line(s + "the restart interval", hex(g.data));
-            if (g.marker == 0xE0) app0 = hex(g.data);
-        }
-        o.line(s + "the quantisation tables", hex(tables));
-        o.line(s + "the Huffman tables", hex(huffman));
-        o.note(std::format("stream {}: {} bytes, markers{} EOI, {} restart markers, APP0 {}", what, size, order,
-            p.restarts, app0.empty() ? "none" : app0));
-        jpeg::Decoder d;
-        std::string why;
-        const bool read = p.soi && d.read_header(bytes.data(), n, why) && d.decode(why);
-        o.line(s + "pspocket's decoder reads it", read ? "yes" : "no: " + why);
-        if (!read) return;
-        const bool gray = d.header().components == 1;
-        jpeg::Decoder::Output img;
-        if (!d.output(1, false, gray ? jpeg::ColorSpace::Gray : jpeg::ColorSpace::RGB, img, why)) return;
-        o.line(s + "decoded", std::format("{}x{}, {} components{}", img.width, img.height, img.components,
-            d.warnings() ? std::format(", {} warnings", d.warnings()) : ""));
-        // The picture: within a few steps of the other half's at high qualities (where the two encoders' rounding is
-        // all that differs), and its PSNR against the picture within 10% at any.
-        if (quality >= 85) o.bytes(s + "the picture as decoded", img.pixels, Rule::within(10));
-        if (!want.empty()) o.numbers(s + "its PSNR against the picture (dB)", {psnr(img.pixels, want)}, 0.1);
+        o.line("stream " + what + ": the markers", std::format("SOI{} EOI, {} restart markers", order, p.restarts));
+        o.bytes("stream " + what + ": the JPEG", bytes);
+    }
+
+    // One picture encoded to stream 0 and taken.
+    void one(const std::string& what, u32 handle, const Pic& p, const Param& e)
+    {
+        if (encode(what, handle, p, e) != 0) return;
+        wait_output(what, handle, true);
+        stream_info(what, handle);
     }
 };
+
+const char* space_name(u32 s)
+{
+    switch (s) {
+    case GRAY: return "gray";
+    case RGB: return "RGB";
+    case YCBCR: return "YCbCr";
+    case RGBA: return "RGBA";
+    case ARGB: return "ARGB";
+    default: return "?";
+    }
+}
 
 Observed half(const Setup& s, bool sony_half)
 {
@@ -375,257 +328,267 @@ Observed half(const Setup& s, bool sony_half)
     Run h(s, sony_half, "cellJpgEnc");
     u8* b = h.b;
     using Pic = Run::Pic;
-    using Param = Run::Param;
 
     // QueryAttr: the memory for each configuration, and its checks.
+    h.write_config(640, 480, YCBCR, S420);
     h.r("cellJpgEncQueryAttr", {kCfg, 0}, "QueryAttr(cfg, NULL)");
     h.r("cellJpgEncQueryAttr", {0, kAttr}, "QueryAttr(NULL, attr)");
     struct Query {
-        u32 w, h;
+        u32 w, h, space, sampling;
         bool spu;
-        u32 add, ex;
-        const char* what;
+        u32 ex;
     };
-    for (const Query& q : {Query{640, 480, false, 0x100, 0, "640x480, 0x100 more"}, Query{640, 480, true, 0, 0, "640x480 with SPUs"},
-             Query{64, 64, false, 0, 0, "64x64"}, Query{1920, 1080, false, 0, 0, "1920x1080"}, Query{1, 1, false, 0, 0, "1x1"},
-             Query{4096, 4096, false, 0, 0, "4096x4096"}, Query{65535, 16, false, 0, 0, "65535 wide"},
-             Query{65536, 16, false, 0, 0, "65536 wide"}, Query{0, 480, false, 0, 0, "no width"},
-             Query{640, 0, false, 0, 0, "no height"}, Query{640, 480, false, 0x80000000u, 0, "addMemSize 2 GB"},
-             Query{640, 480, false, 0, 1, "an extended parameter"}}) {
-        h.write_config(q.w, q.h, q.spu, q.add, q.ex);
-        std::memset(b + kName + 0x100, 0, 16); // CellJpgEncExParam {index 0, value -> 0}, for the one that has it
-        ps_write32(b, kName + 0x104, kName + 0x108);
-        h.query(q.what);
+    for (const Query& q : {Query{640, 480, YCBCR, S420, false, 0}, Query{640, 480, YCBCR, S444, false, 0},
+             Query{640, 480, YCBCR, S422, false, 0}, Query{640, 480, YCBCR, S411, false, 0},
+             Query{640, 480, GRAY, FULL, false, 0}, Query{640, 480, RGB, FULL, false, 0},
+             Query{640, 480, YCBCR, S420, true, 0}, Query{1920, 1080, YCBCR, S422, true, 0},
+             Query{1, 1, GRAY, FULL, false, 0}, Query{65535, 65535, YCBCR, S420, false, 0},
+             Query{65536, 480, YCBCR, S420, false, 0}, Query{640, 65536, YCBCR, S420, false, 0},
+             Query{0, 480, YCBCR, S420, false, 0}, Query{640, 0, YCBCR, S420, false, 0},
+             Query{640, 480, 0, FULL, false, 0}, Query{640, 480, 4, FULL, false, 0},
+             Query{640, 480, YCBCR, 5, false, 0}, Query{640, 480, YCBCR, FULL, false, 0},
+             Query{640, 480, GRAY, S420, false, 0}, Query{640, 480, RGB, S444, false, 0},
+             Query{640, 480, YCBCR, S420, false, 1}}) {
+        h.write_config(q.w, q.h, q.space, q.sampling, q.spu, q.ex);
+        h.query(std::format("{}x{} colour space {} sampling {}{}{}", q.w, q.h, q.space, q.sampling,
+            q.spu ? " with SPUs" : "", q.ex ? " and an extended parameter" : ""));
     }
 
-    // Open's and OpenEx's checks, then the handle.
-    h.write_config(128, 96);
+    // Open's and OpenEx's checks.
+    h.write_config(64, 64, YCBCR, S420);
     const u32 size = h.query("for Open's checks");
-    const u32 mem = std::min(size ? size : 0x100000u, kWorkSize);
-    // An Open that should be refused; one that is not is closed again (unless its handle is `keep`'s).
-    const auto open_refused = [&](const std::string& what, u32 cfg, u32 rsrc, u32 handle, bool ex = false, u32 keep = 0) {
+    const u32 mem = std::min(size ? size : 0x100000u, kEncoderMem);
+    const auto open_refused = [&](const std::string& what, u32 cfg, u32 rsrc, u32 handle, bool ex = false) {
         ps_write32(b, kHandle, 0xEEEEEEEE);
-        const u64 r = h.r(ex ? "cellJpgEncOpenEx" : "cellJpgEncOpen", {cfg, rsrc, handle}, (ex ? "OpenEx " : "Open ") + what);
+        const u64 r = h.r(ex ? "cellJpgEncOpenEx" : "cellJpgEncOpen", {cfg, rsrc, handle},
+            (ex ? "OpenEx " : "Open ") + what);
         h.o.line((ex ? "OpenEx " : "Open ") + what + ": the handle word", h.handle_text(ps_read32(b, kHandle)));
-        if (r == 0 && ps_read32(b, kHandle) != keep) h.r("cellJpgEncClose", {ps_read32(b, kHandle)}, "Close after Open " + what);
+        if (r == 0) h.r("cellJpgEncClose", {ps_read32(b, kHandle)}, "Close after Open " + what);
     };
     h.write_resource(kWork, mem > 0 ? mem - 1 : 0);
     open_refused("with a byte too little memory", kCfg, kRsrc, kHandle);
     h.write_resource(kWork, mem, 0xC00);
     open_refused("with PPU priority 0xC00", kCfg, kRsrc, kHandle);
+    h.write_resource(kWork, mem, -1);
+    open_refused("with PPU priority -1", kCfg, kRsrc, kHandle);
     h.write_resource(kWork, mem, 1000, 0x100);
     open_refused("with SPU priority 0x100", kCfg, kRsrc, kHandle);
     h.write_resource(0, mem);
     open_refused("without memory", kCfg, kRsrc, kHandle);
+    h.write_resource(kWork, 0);
+    open_refused("with no memory size", kCfg, kRsrc, kHandle);
     h.write_resource(kWork, mem);
     open_refused("without a handle pointer", kCfg, kRsrc, 0);
     open_refused("without a resource", kCfg, 0, kHandle);
     open_refused("without a configuration", 0, kRsrc, kHandle);
-    std::memset(b + kRsrc, 0, 24);
+    h.write_config(64, 64, GRAY, S420);
+    open_refused("with gray at 4:2:0", kCfg, kRsrc, kHandle);
+    h.write_config(64, 64, YCBCR, S420);
+    // CellJpgEncResourceEx {memAddr, memSize, ppuThreadPriority, spurs, priority[8]}.
+    std::memset(b + kRsrc, 0, 28);
     ps_write32(b, kRsrc, kWork);
     ps_write32(b, kRsrc + 4, mem);
     ps_write32(b, kRsrc + 8, 1000);
     ps_write8(b, kRsrc + 16 + 3, 16);
     open_refused("with a priority of 16", kCfg, kRsrc, kHandle, true);
-    ps_write8(b, kRsrc + 16 + 3, 15);
-    open_refused("with eight priorities of at most 15", kCfg, kRsrc, kHandle, true);
+    open_refused("without a resource", kCfg, 0, kHandle, true);
 
-    const u32 hd = h.open("128x96", 128, 96, false);
-    if (!hd) return std::move(h.o);
-    h.write_resource(kWork, mem);
-    open_refused("of the memory already open", kCfg, kRsrc, kHandle, false, hd);
-
-    // Pictures in every colour space and sampling, each taken from the queue and read back.
-    const Picture pic = smooth(61, 37, 3);
-    const auto take = [&](const std::string& what, const std::vector<u8>& want, u32 quality) {
-        h.wait_output(what, hd, true);
-        h.stream_info(what, hd, want, quality);
+    // An encoder for each encoded colour space and sampling, and the pictures each takes.
+    struct Encoder {
+        u32 space, sampling;
+        const char* what;
     };
-    const auto one = [&](const std::string& what, const Pic& p, const Param& e, bool two = false) {
-        if (h.encode(what, hd, p, e, 0, kStreamSize, two) == 0) take(what, e.space == GRAY ? gray_of(pic) : pic.rgb, e.quality);
-    };
-    for (const u32 space : {GRAY, RGB, YCBCR, RGBA, ARGB}) {
-        const u32 pitch = pic.w * pixel_bytes(space) + 3;
-        put_picture(b, pic, space, pitch);
-        for (const u32 sampling : {S444, S422, S420, S411, FULL})
-            one(std::format("colour space {} at sampling {}", space, sampling), {pic.w, pic.h, pitch, space},
-                {YCBCR, sampling, 0, 0, 90});
-        one(std::format("colour space {} as gray", space), {pic.w, pic.h, pitch, space}, {GRAY, S420, 0, 0, 90});
-    }
-    // Qualities, the fast method, SPUs asked for.
-    put_picture(b, pic, RGB, pic.w * 3);
-    for (const u32 quality : {1u, 10u, 50u, 75u, 95u, 100u})
-        one(std::format("RGB at quality {}", quality), {pic.w, pic.h, pic.w * 3, RGB}, {YCBCR, S420, 0, 0, quality});
-    one("RGB by the fast method", {pic.w, pic.h, pic.w * 3, RGB}, {YCBCR, S420, 5, 0, 90});
-    one("RGB with enableSpu", {pic.w, pic.h, pic.w * 3, RGB}, {YCBCR, S420, 0, 0, 90, true});
-    // EncodePicture2: FULL, then a YCbCr picture's 4:2:0 planes (D-616's guess).
-    one("RGB (Picture2, FULL)", {pic.w, pic.h, pic.w * 3, RGB, FULL}, {YCBCR, S420, 0, 0, 90}, true);
-    {
-        const u32 pitch = 64, cw = (pic.w + 1) / 2, ch = (pic.h + 1) / 2, cb = kPixels + pitch * pic.h,
-                  cr = cb + (pitch / 2) * ch;
-        std::memset(b + kPixels, 0x80, pitch * pic.h + pitch * ch);
-        for (u32 y = 0; y < pic.h; y++)
-            for (u32 x = 0; x < pic.w; x++) {
-                const u8* c = pic.rgb.data() + (usize{y} * pic.w + x) * 3;
-                u8 yy = 0, u = 0, v = 0;
-                jpeg::rgb_to_ycbcr(c[0], c[1], c[2], yy, u, v);
-                ps_write8(b, kPixels + y * pitch + x, yy);
-                if (x % 2 == 0 && y % 2 == 0 && x / 2 < cw && y / 2 < ch) {
-                    ps_write8(b, cb + (y / 2) * (pitch / 2) + x / 2, u);
-                    ps_write8(b, cr + (y / 2) * (pitch / 2) + x / 2, v);
-                }
-            }
-        one("YCbCr 4:2:0 planes (Picture2)", {pic.w, pic.h, pitch, YCBCR, S420}, {YCBCR, S420, 0, 0, 90}, true);
+    const Encoder encoders[] = {{YCBCR, S420, "4:2:0"}, {YCBCR, S422, "4:2:2"}, {YCBCR, S444, "4:4:4"},
+        {YCBCR, S411, "4:1:1"}, {GRAY, FULL, "gray"}, {RGB, FULL, "RGB"}};
+    u32 slot = 1;
+    for (const Encoder& enc : encoders) {
+        const u32 e = h.open(std::string("an encoder of ") + enc.what, slot++, 64, 64, enc.space, enc.sampling);
+        if (!e) continue;
+        const std::string name = enc.what;
+        // Every colour space of picture (the ones this encoder takes and the ones it refuses), 33x17.
+        for (const u32 space : {GRAY, RGB, YCBCR, RGBA, ARGB}) {
+            put_picture(b, 33, 17, space, 33 * pixel_bytes(space), space);
+            h.one(std::format("{}: {} 33x17 at quality 85", name, space_name(space)), e, {33, 17, space},
+                {85, QUALITY});
+        }
+        // Sizes on and off the MCU, both DCTs; qualities; restart intervals.
+        const u32 in = enc.space == GRAY ? GRAY : RGB;
+        for (const auto& [w, hh] : {std::pair{1u, 1u}, std::pair{8u, 8u}, std::pair{16u, 16u}, std::pair{7u, 5u},
+                 std::pair{64u, 48u}, std::pair{50u, 61u}}) {
+            put_picture(b, w, hh, in, w * pixel_bytes(in), w + hh);
+            for (const u32 method : {QUALITY, FAST})
+                h.one(std::format("{}: {} {}x{}, {} DCT", name, space_name(in), w, hh, method ? "fast" : "accurate"),
+                    e, {w, hh, in}, {75, method});
+        }
+        put_picture(b, 40, 24, in, 40 * pixel_bytes(in), 3);
+        for (const u32 q : {0u, 1u, 5u, 10u, 25u, 50u, 51u, 90u, 99u, 100u})
+            h.one(std::format("{}: quality {}", name, q), e, {40, 24, in}, {q, FAST});
+        for (const u32 restart : {1u, 2u, 5u, 1000u})
+            h.one(std::format("{}: restart interval {}", name, restart), e, {40, 24, in}, {60, QUALITY, restart});
+        // EncodePicture2: rows with a pitch longer than the picture's.
+        put_picture(b, 20, 10, RGBA, 100, 9);
+        h.one(std::format("{}: RGBA 20x10 in rows of 100 bytes", name), e, {20, 10, RGBA, 100, 0x1234}, {70, FAST});
+        h.r("cellJpgEncClose", {e}, std::string("Close of the encoder of ") + enc.what);
     }
 
-    // The stream size limit mode: a limit between quality 30's stream and 90's (pspocket's), then one nothing fits.
+    // Extended parameters: marker segments written after the encoder's own header.
+    const u32 e = h.open("an encoder for the rest", slot++, 64, 64, YCBCR, S420);
+    if (!e) return std::move(h.o);
+    put_picture(b, 16, 16, RGB, 48, 4);
     {
-        jpeg::Planes planes;
-        planes.width = pic.w;
-        planes.height = pic.h;
-        planes.components = 3;
-        planes.y.resize(usize{pic.w} * pic.h);
-        planes.cb.resize(planes.y.size());
-        planes.cr.resize(planes.y.size());
-        for (usize i = 0; i < planes.y.size(); i++)
-            jpeg::rgb_to_ycbcr(pic.rgb[3 * i], pic.rgb[3 * i + 1], pic.rgb[3 * i + 2], planes.y[i], planes.cb[i], planes.cr[i]);
-        jpeg::EncodeSettings at;
-        at.quality = 30;
-        const usize low = jpeg::encode(planes, at).size();
-        at.quality = 90;
-        const u32 limit = static_cast<u32>((low + jpeg::encode(planes, at).size()) / 2);
-        put_picture(b, pic, RGB, pic.w * 3);
-        if (h.encode("in the size limit mode", hd, {pic.w, pic.h, pic.w * 3, RGB}, {YCBCR, S420, 0, 1, 90}, 1, limit) == 0) {
-            h.wait_output("in the size limit mode", hd, true);
-            std::memset(b + kInfo, kFill, 48);
-            if (h.r("cellJpgEncGetStreamInfo", {hd, kInfo}, "GetStreamInfo in the size limit mode") == 0) {
-                const u32 got = ps_read32(b, kInfo + 20);
-                h.o.line("in the size limit mode: the stream fits the limit", got <= limit ? "yes" : "no");
-                h.o.line("in the size limit mode: the state", std::format("{:#x}", ps_read32(b, kInfo)));
-                const Parsed p = parse(b + stream_at(1), std::min(got, kStreamSize));
-                for (const Segment& g : p.segments)
-                    if (g.marker == 0xDB && g.data.size() >= 65)
-                        h.o.note(std::format("in the size limit mode: {} of {} bytes, the luma table's first entry {}",
-                            got, limit, g.data[1]));
-            }
-        }
-        if (h.encode("in the size limit mode to 300 bytes", hd, {pic.w, pic.h, pic.w * 3, RGB}, {YCBCR, S420, 0, 1, 90}, 2,
-                300) == 0) {
-            h.wait_output("in the size limit mode to 300 bytes", hd, true);
-            std::memset(b + kInfo, kFill, 48);
-            h.r("cellJpgEncGetStreamInfo", {hd, kInfo}, "GetStreamInfo in the size limit mode to 300 bytes");
-            h.o.line("in the size limit mode to 300 bytes: the information", hex(b + kInfo, 48));
-            h.o.line("in the size limit mode to 300 bytes: the byte past the limit", hex(b + stream_at(2) + 300, 1));
-        }
+        for (u32 i = 0; i < 64; i++) ps_write8(b, kExData + i, static_cast<u8>('A' + i % 26));
+        const u32 ex[3][3] = {{0xFFE1, kExData, 10}, {0xFFEC, kExData + 16, 1}, {0xFFFE, kExData + 32, 17}};
+        for (u32 i = 0; i < 3; i++)
+            for (u32 k = 0; k < 3; k++) ps_write32(b, kEx + 12 * i + 4 * k, ex[i][k]);
+        h.one("with an APP1 segment", e, {16, 16, RGB}, {80, QUALITY, 0, 0, 1});
+        h.one("with APP1, APP12 and COM segments", e, {16, 16, RGB}, {80, QUALITY, 0, 0, 3});
+        ps_write32(b, kEx, 0xE1);
+        h.one("with a marker of 0xE1", e, {16, 16, RGB}, {80, QUALITY, 0, 0, 1});
+        ps_write32(b, kEx, 0x12345678);
+        h.one("with a marker of 0x12345678", e, {16, 16, RGB}, {80, QUALITY, 0, 0, 1});
+        ps_write32(b, kEx, 0xFFE1);
     }
 
-    // The queue: four waiting (each in its own buffer), then room and a fifth; oldest first; Reset; EMPTY.
-    h.wait_output("with nothing waiting", hd, false);
-    h.r("cellJpgEncGetStreamInfo", {hd, kInfo}, "GetStreamInfo with nothing waiting");
-    std::memset(b + kPixels, 0x22, 16 * 16 * 4);
-    for (u32 i = 0; i < 4; i++) {
-        h.r("cellJpgEncWaitForInput", {hd, 1}, std::format("WaitForInput before picture {}", i));
-        Pic p{16, 16, 64, RGBA};
-        p.user = 0x100 + i;
-        h.encode(std::format("queued picture {}", i), hd, p, {}, i);
+    // The stream size limit mode: the highest quality whose stream fits (to the quality given), in a buffer.
+    put_picture(b, 64, 48, RGB, 192, 11);
+    for (const u32 limit : {0x1000u, 0x1800u, 0x3000u}) {
+        const std::string what = std::format("64x48 in at most {:#x} bytes, up to quality 95", limit);
+        if (h.encode(what, e, {64, 48, RGB}, {95, FAST, 0, 1}, 0, limit) != 0) continue;
+        h.wait_output(what, e, true);
+        h.stream_info(what, e);
     }
-    // Until `n` are encoded (Sony's may encode on threads of its own; a non-blocking answer before then would only say
-    // how far it had got): how many were, after at most two seconds.
+
+    // The queues: four streams wait, then the commands (four at most); Reset; the picture after it.
+    h.wait_output("with nothing waiting", e, false);
+    h.r("cellJpgEncGetStreamInfo", {e, kInfo}, "GetStreamInfo with nothing waiting");
+    h.r("cellJpgEncWaitForInput", {e, 0}, "WaitForInput with nothing waiting");
+    put_picture(b, 8, 8, RGB, 24, 2);
     const auto ready = [&](u32 n) {
         u32 got = 0;
         for (int tries = 0; tries < 400 && got < n; tries++) {
             ps_write32(b, kNum, 0);
-            h.side.call("cellJpgEncWaitForOutput", {hd, kNum, 0});
+            h.side.call("cellJpgEncWaitForOutput", {e, kNum, 0});
             got = ps_read32(b, kNum);
             if (got < n) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         return got;
     };
+    for (u32 i = 0; i < 4; i++) {
+        Pic p{8, 8, RGB};
+        p.user = 0x100 + i;
+        h.encode(std::format("queued picture {}", i), e, p, {50, FAST}, i);
+    }
     h.o.line("the four queued pictures encoded", std::format("{}", ready(4)));
-    h.r("cellJpgEncWaitForInput", {hd, 0}, "WaitForInput with four waiting, not blocking");
-    if (h.encode("a fifth with four waiting", hd, {16, 16, 64, RGBA}, {}, 4) == 0)
-        h.o.line("the fifth encoded too", std::format("{}", ready(5)));
-    h.wait_output("with four waiting", hd, false);
-    h.stream_info("the oldest of the four", hd);
-    h.stream_info("the next of the four", hd);
-    h.r("cellJpgEncWaitForInput", {hd, 0}, "WaitForInput with two taken");
-    h.r("cellJpgEncReset", {hd}, "Reset");
-    h.r("cellJpgEncGetStreamInfo", {hd, kInfo}, "GetStreamInfo after Reset");
-    h.wait_output("after Reset", hd, false);
-    h.r("cellJpgEncReset", {hd + 4}, "Reset of no handle");
+    for (u32 i = 4; i < 9; i++) {
+        h.r("cellJpgEncWaitForInput", {e, 0}, std::format("WaitForInput before command {}, not blocking", i));
+        Pic p{8, 8, RGB};
+        p.user = 0x100 + i;
+        h.encode(std::format("command {} with four streams waiting", i), e, p, {50, FAST}, i == 8 ? 6 : i);
+    }
+    h.o.line("streams waiting after the commands", std::format("{}", ready(5)));
+    h.r("cellJpgEncReset", {e}, "Reset with four streams and four commands waiting");
+    h.o.line("streams waiting after Reset", std::format("{}", ready(8)));
+    h.r("cellJpgEncReset", {e}, "Reset with eight streams waiting");
+    for (u32 i = 0; i < 8; i++) h.stream_info(std::format("stream {} after Reset", i), e);
+    h.one("the first picture after Reset", e, {8, 8, RGB}, {50, FAST});
+    h.one("the second picture after Reset", e, {8, 8, RGB}, {50, FAST});
+    h.r("cellJpgEncReset", {e + 4}, "Reset of no handle");
     h.r("cellJpgEncReset", {0}, "Reset(NULL)");
 
-    // A buffer too small: what fits, the stream overflowing.
-    if (h.encode("to a buffer of 20 bytes", hd, {16, 16, 64, RGBA}, {}, 5, 20) == 0) {
-        h.wait_output("to a buffer of 20 bytes", hd, true);
+    // A buffer too small for the stream.
+    put_picture(b, 64, 48, RGB, 192, 12);
+    for (const u32 limit : {0x1000u, 0x1400u}) {
+        const std::string what = std::format("to a buffer of {:#x} bytes", limit);
+        if (h.encode(what, e, {64, 48, RGB}, {100, QUALITY}, 5, limit) != 0) continue;
+        h.wait_output(what, e, true);
         std::memset(b + kInfo, kFill, 48);
-        h.r("cellJpgEncGetStreamInfo", {hd, kInfo}, "GetStreamInfo to a buffer of 20 bytes");
-        h.o.line("GetStreamInfo to a buffer of 20 bytes: the information", hex(b + kInfo, 48));
-        h.o.line("the buffer of 20 bytes and the 16 after it", hex(b + stream_at(5), 36));
+        h.r("cellJpgEncGetStreamInfo", {e, kInfo}, "GetStreamInfo " + what);
+        h.o.line("GetStreamInfo " + what + ": the information", hex(b + kInfo, 48));
+        h.o.line("the buffer of " + what + ": its first 0x400 bytes", hex(b + stream_at(5), 0x400));
+        h.o.line("the buffer of " + what + ": the 16 bytes past it", hex(b + stream_at(5) + limit, 16));
     }
 
-    // To a file on /dev_hdd0 (lv2 makes no file in /dev_hdd0 itself), and one that cannot be made.
+    // To a file on /dev_hdd0, and one that cannot be made.
     const fs::path root = fs::temp_directory_path() /
         std::format("pspocket-jpgenc-compare-{}", h.side.sony_half() ? "theirs" : "ours");
     fs::remove_all(root);
     fs::create_directories(root / "hdd0" / "tmp");
     REQUIRE(h.f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
-    put_picture(b, pic, RGB, pic.w * 3);
+    put_picture(b, 16, 16, RGB, 48, 13);
     std::memcpy(b + kName, "/dev_hdd0/tmp/shot.jpg", 23);
-    if (h.encode("to a file", hd, {pic.w, pic.h, pic.w * 3, RGB}, {YCBCR, S422, 0, 0, 90}, ~0u, 0) == 0) {
-        h.wait_output("to a file", hd, true);
-        h.stream_info("to a file", hd, pic.rgb, 90, (root / "hdd0" / "tmp" / "shot.jpg").string());
+    if (h.encode("to a file", e, {16, 16, RGB}, {80, QUALITY}, ~0u) == 0) {
+        h.wait_output("to a file", e, true);
+        h.stream_info("to a file", e, (root / "hdd0" / "tmp" / "shot.jpg").string());
     }
     std::memcpy(b + kName, "/dev_nowhere/x.jpg", 19);
-    if (h.encode("to a file that cannot be made", hd, {pic.w, pic.h, pic.w * 3, RGB}, {}, ~0u, 0) == 0) {
-        h.wait_output("to a file that cannot be made", hd, true);
-        std::memset(b + kInfo, kFill, 48);
-        h.r("cellJpgEncGetStreamInfo", {hd, kInfo}, "GetStreamInfo to a file that cannot be made");
-        h.o.line("GetStreamInfo to a file that cannot be made: the information", hex(b + kInfo, 48));
+    if (h.encode("to a file that cannot be made", e, {16, 16, RGB}, {80, QUALITY}, ~0u) == 0) {
+        h.wait_output("to a file that cannot be made", e, true);
+        h.stream_info("to a file that cannot be made", e);
     }
 
-    // EncodePicture's checks (test_jpgenc.cpp's).
+    // EncodePicture's checks; what passes them is taken.
     {
-        std::memset(b + kPixels, 0x33, 128 * 96 * 4);
-        const Pic good{16, 16, 64, RGBA};
-        h.encode("of no handle", hd + 1, good, {});
-        h.r("cellJpgEncEncodePicture", {hd, 0, kParam, kOutParam}, "EncodePicture without a picture");
-        h.encode("of no width", hd, {0, 16, 64, RGBA}, {});
-        h.encode("past maxWidth", hd, {129, 16, 520, RGBA}, {});
-        h.encode("past maxHeight", hd, {16, 97, 64, RGBA}, {});
-        h.encode("of colour space 4", hd, {16, 16, 64, 4}, {});
-        h.encode("with a pitch shorter than a row", hd, {16, 16, 63, RGBA}, {});
-        h.encode("to encode colour space 9", hd, good, {9});
-        h.encode("at sampling format 5", hd, good, {YCBCR, 5});
-        h.encode("by DCT method 1", hd, good, {YCBCR, S420, 1});
-        h.encode("in compression mode 2", hd, good, {YCBCR, S420, 0, 2});
-        h.encode("at quality 0", hd, good, {YCBCR, S420, 0, 0, 0});
-        h.encode("at quality 101", hd, good, {YCBCR, S420, 0, 0, 101});
-        h.encode("to a buffer of no size", hd, good, {}, 6, 0);
-        ps_write32(b, kOutParam, 2); // the rest as for the buffer of no size
-        h.r("cellJpgEncEncodePicture", {hd, kPic, kParam, kOutParam}, "EncodePicture to location 2");
+        const Pic good{8, 8, RGB};
+        const auto check = [&](const std::string& what, const Pic& p, const Run::Param& pr, u32 slot_ = 6,
+                               u32 limit = kStreamSize) {
+            if (h.encode(what, e, p, pr, slot_, limit) != 0) return;
+            h.wait_output(what, e, true);
+            h.stream_info(what, e);
+        };
+        h.encode("of no handle", e + 1, good, {});
+        h.r("cellJpgEncEncodePicture", {e, 0, kParam, kOutParam}, "EncodePicture without a picture");
+        h.r("cellJpgEncEncodePicture2", {e, 0, kParam, kOutParam}, "EncodePicture2 without a picture");
+        check("of no width", {0, 8, RGB}, {});
+        check("of no height", {8, 0, RGB}, {});
+        check("past maxWidth", {65, 8, RGB}, {});
+        check("past maxHeight", {8, 65, RGB}, {});
+        for (const u32 space : {0u, 4u, 9u, 11u, 21u}) check(std::format("of colour space {}", space), {8, 8, space}, {});
+        check("of gray to YCbCr", {8, 8, GRAY}, {});
+        check("with a pitch shorter than a row", {8, 8, RGB, 23}, {});
+        check("with a pitch of a row", {8, 8, RGB, 24}, {});
+        check("at quality 101", good, {101});
+        check("with DCT method 1", good, {75, 1});
+        check("with DCT method 6", good, {75, 6});
+        check("in compression mode 2", good, {75, FAST, 0, 2});
+        check("with restart interval 0xFFFF", good, {75, FAST, 0xFFFF});
+        check("with restart interval 0x10000", good, {75, FAST, 0x10000});
+        check("on the SPUs, not opened for them", good, {75, FAST, 0, 0, 0, true});
+        ps_write32(b, kEx + 8, 0);
+        check("with a segment of no bytes", good, {75, FAST, 0, 0, 1});
+        ps_write32(b, kEx + 8, 0xFFFE);
+        check("with a segment of 0xFFFE bytes", good, {75, FAST, 0, 0, 1});
+        ps_write32(b, kEx + 8, 10);
+        ps_write32(b, kEx + 4, 0);
+        check("with a segment of no data", good, {75, FAST, 0, 0, 1});
+        ps_write32(b, kEx + 4, kExData);
+        check("to a buffer of 0xFFF bytes", good, {}, 6, 0xFFF);
+        check("to a buffer of 0x100D bytes with a segment of 10", good, {75, FAST, 0, 0, 1}, 6, 0x100D);
+        check("to a buffer of 0x100E bytes with a segment of 10", good, {75, FAST, 0, 0, 1}, 6, 0x100E);
+        check("in the size limit mode, to a file", good, {75, FAST, 0, 1}, ~0u);
+        check("for the output checks", good, {});
+        ps_write32(b, kOutParam, 2);
+        h.r("cellJpgEncEncodePicture", {e, kPic, kParam, kOutParam}, "EncodePicture to location 2");
+        ps_write32(b, kOutParam, 1);
+        ps_write32(b, kOutParam + 8, 0);
+        h.r("cellJpgEncEncodePicture", {e, kPic, kParam, kOutParam}, "EncodePicture to a buffer at no address");
         ps_write32(b, kOutParam, 0);
         ps_write32(b, kOutParam + 4, 0);
-        h.r("cellJpgEncEncodePicture", {hd, kPic, kParam, kOutParam}, "EncodePicture to a file without a name");
-        h.encode("as planes of an RGB picture", hd, {16, 16, 64, RGB, S420}, {}, 6, kStreamSize, true);
-        // What the refusals left queued (a refused picture must not be).
-        for (int i = 0; i < 4; i++) {
-            if (h.wait_output(std::format("after the checks, {}", i), hd, false) != 0) break;
-            h.stream_info(std::format("after the checks, {}", i), hd);
-        }
+        h.r("cellJpgEncEncodePicture", {e, kPic, kParam, kOutParam}, "EncodePicture to a file without a name");
+        h.r("cellJpgEncEncodePicture", {e, kPic, kParam, 0}, "EncodePicture without an output");
+        h.wait_output("after the checks", e, false);
     }
-    h.r("cellJpgEncClose", {hd}, "Close");
-    h.r("cellJpgEncClose", {hd}, "Close again");
-    h.r("cellJpgEncWaitForInput", {hd, 0}, "WaitForInput after Close");
+    h.r("cellJpgEncClose", {e}, "Close");
+    h.r("cellJpgEncClose", {e}, "Close again");
+    h.r("cellJpgEncWaitForInput", {e, 0}, "WaitForInput after Close");
 
-    // With the SPUs: an encoder opened for them, a picture encoded on them.
-    const u32 spu = h.open("128x96 with SPUs", 128, 96, true);
+    // With the SPUs: an encoder opened for them, pictures encoded on them (the fast DCT only).
+    const u32 spu = h.open("an SPU encoder", slot++, 64, 64, YCBCR, S420, true);
     if (spu) {
-        put_picture(b, pic, RGB, pic.w * 3);
-        if (h.encode("RGB on the SPUs", spu, {pic.w, pic.h, pic.w * 3, RGB}, {YCBCR, S420, 0, 0, 90, true}) == 0) {
-            h.wait_output("RGB on the SPUs", spu, true);
-            h.stream_info("RGB on the SPUs", spu, pic.rgb, 90);
-        }
+        put_picture(b, 33, 17, RGB, 99, 5);
+        h.one("RGB 33x17 on the SPUs", spu, {33, 17, RGB}, {85, FAST, 0, 0, 0, true});
+        h.one("RGB 33x17 on the SPUs, restart interval 2", spu, {33, 17, RGB}, {85, FAST, 2, 0, 0, true});
+        h.one("RGB 33x17 with the SPUs' encoder, on the PPU", spu, {33, 17, RGB}, {85, FAST});
+        h.one("RGB 33x17 on the SPUs, the accurate DCT", spu, {33, 17, RGB}, {85, QUALITY, 0, 0, 0, true});
         h.r("cellJpgEncClose", {spu}, "Close of the SPU encoder");
     }
     fs::remove_all(root);
@@ -640,32 +603,8 @@ TEST_CASE("cellJpgEnc against Sony's libjpgenc: sizes, handles, the queue, the s
     const Setup s = setup();
     run(s, "cellJpgEnc against Sony's libjpgenc", [&](bool sony) { return half(s, sony); },
         [](const Observed& o) {
-            // pspocket's own half (D-616): its memory measure, the handle at the work memory, the streams.
-            CHECK(o.value("QueryAttr 64x64: the attribute") ==
-                std::format("hex:{:08x}04eeeeee0027000000000000", 0x10000 + 64 * 0x40));
-            CHECK(o.value("Open 128x96: the handle") == "the work memory +0x0");
-            CHECK(o.value("Open of the memory already open") == "0x80611191");
-            CHECK(o.value("QueryAttr 65536 wide") == "0x80611191");
-            const std::string first = "stream colour space 2 at sampling 2: ";
-            CHECK(o.value(first + "a whole JPEG") == "yes");
-            CHECK(o.value(first + "streamSize is the JPEG's length") == "yes");
-            CHECK(o.value(first + "the 64 bytes past it untouched") == "yes");
-            // SOF0: 8 bits, 37 high, 61 wide, three components: Y 2x2 table 0, Cb and Cr 1x1 table 1.
-            CHECK(o.value(first + "the frame (SOF0)") == "hex:080025003d03012200021101031101");
-            CHECK(o.value(first + "pspocket's decoder reads it") == "yes");
-            CHECK(o.value(first + "decoded") == "61x37, 3 components");
-            CHECK(o.value("stream colour space 1 as gray: the frame (SOF0)") == "hex:080025003d01011100");
-            CHECK(o.value("stream colour space 2 at sampling 3: the frame (SOF0)") == "hex:080025003d03014100021101031101");
-            CHECK(o.value("stream YCbCr 4:2:0 planes (Picture2): pspocket's decoder reads it") == "yes");
-            CHECK(o.value("in the size limit mode: the stream fits the limit") == "yes");
-            CHECK(o.value("in the size limit mode to 300 bytes: the byte past the limit") == "hex:ee");
-            CHECK(o.value("the four queued pictures encoded") == "4");
-            CHECK(o.value("WaitForInput with four waiting, not blocking") == "0x80611193");
-            CHECK(o.value("GetStreamInfo the next of the four: the information but streamSize")
-                      .ends_with("0000000000000101eeeeeeeeeeeeeeee"));
-            CHECK(o.value("stream to a file: pspocket's decoder reads it") == "yes");
-            CHECK(o.value("GetStreamInfo to a file that cannot be made: the information").starts_with("hex:806111a4"));
-            CHECK(o.value("EncodePicture at quality 101") == "0x80611191");
-            CHECK(o.value("EncodePicture2 as planes of an RGB picture") == "0x80611191");
+            CHECK(o.value("QueryAttr 640x480 colour space 3 sampling 2") == "0x0");
+            CHECK(o.value("Open an encoder of 4:2:0: the handle") == "the work memory +0x100080");
+            CHECK(o.value("stream 4:2:0: RGB 8x8, accurate DCT: a whole JPEG") == "yes");
         });
 }

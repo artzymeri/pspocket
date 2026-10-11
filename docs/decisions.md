@@ -12025,3 +12025,202 @@ than the memory given, ARG as Sony's) and DecodeAu refuses MVC (FATAL as Sony's)
 the codec specific information (what part 2's MVC unit test does) and decodes through cellVdecDecodeAuEx2, so the
 damaged access units still reach the MVC parsing: 151 inputs, 130 accepted, the 21 refused those with the decode mode
 for P and B skipping, which only H.264 takes (as before).
+
+## D-913 · 2026-10-11 · cellPngEnc as Sony's libpngenc answers and writes it (part 1)
+
+D-597's comparison of cellPngEnc with libpngenc.sprx (firmware 4.92) showed 134 of 616 observations differing (D-911):
+pspocket's library (D-566) was RPCS3's checks on libpng 1.6. Sony's module was read (its exports, its encoder thread,
+its chunk setters; nothing of it in the repository) and pspocket's rewritten to do what it does; the comparison, widened
+and made independent of libpngenc's thread timing, now shows 0 of 1,834 observations differing.
+What libpngenc is, and pspocket's now:
+- **The handle** is the work memory's first 128-byte boundary (RPCS3: the memory itself). Open over memory already open
+  makes a new encoder there (pspocket refused it). QueryAttr's memory and Open's checks were right; a priority of -1
+  is refused too.
+- **Two queues.** EncodePicture queues a command (four at most: BUSY); libpngenc's thread encodes them while fewer than
+  four streams wait. WaitForInput is BUSY with four commands waiting, not four streams (pspocket refused a fifth picture).
+  Reset, with fewer than five streams waiting (else BUSY), turns the commands waiting into streams of state STREAM_SKIP
+  and leaves libpngenc's abort flag up: the next picture is skipped too (STREAM_SKIP, no bytes). Reset keeps the streams
+  (pspocket dropped them). pspocket encodes a command as soon as there is room, on the calling thread.
+- **EncodePicture's checks** (ARG): no colour conversion but RGBA or ARGB to RGB and gray and alpha to gray (pspocket
+  also added an opaque alpha); a filter set needs one of libpng's filter bits (0 is refused); a buffer needs more than
+  0x30 bytes; the pitch is measured in the encoded colour space's samples (an RGBA picture encoded as RGB needs 3 bytes
+  a pixel, and the stream then fails FATAL when the row cannot hold the picture's own); a palette picture needs its
+  PLTE; the SPU encoder takes 2560 columns at 8 bits, 1280 at 16. Every ancillary chunk is checked: its fields
+  (palette sizes against the bit depth, tRNS and bKGD against the palette given before them and the bit depth, sBIT 1 to
+  the depth, cHRM's white point at most 0.8 and each point's x + y at most 1, gAMA up to 21474.83, sRGB 0 to 3, units
+  0 to 1 or 0 to 2, tIME's fields, iTXt's language, sPLT's depths and 8-bit entries, pCAL's parameters, unknown chunks'
+  locations), and the memory the chunks take (libpngenc's own measure of each string and buffer) against addMemSize:
+  with addMemSize 0, any text, iCCP, sPLT, pCAL or unknown chunk is refused.
+- **The PNG is libpng 1.2.8's**: chunks in 1.2.8's order (gAMA, sRGB, iCCP, sBIT, cHRM before PLTE; PLTE, tRNS, bKGD,
+  hIST, oFFs, pCAL, sCAL, pHYs, tIME, sPLT, the texts after it), unknown chunks before PLTE, after it or after IDAT by
+  their location, unsafe ones too; IDAT in 2048-byte chunks; gAMA and cHRM from the floats png_set_* keeps, times 100000
+  by the PPU's fused multiply-add, truncated (gAMA 0.45455 is 45455; 21474.83 is 2147483008); sCAL's numbers by
+  libpngenc's own "%d.%06de%+03d" ("1.000000e-03"; pspocket printed ".001"); a text's length is its strlen, an empty
+  zTXt is a tEXt. libpngenc installs no warning handler, so each of libpng's warnings ends the stream with FATAL: a
+  keyword with spaces to tidy, a PLTE on a gray picture, a tRNS out of range or on an alpha picture, a cHRM point past
+  0.8 as a float (0.8 itself), a palette background past the palette or the bit depth, an hIST whose count is not the
+  palette's, an unknown chunk's location 0 or 3. A 1-bit sample a byte is any byte but 0 (libpng's packing).
+- **A stream too long for its buffer**: what fits is written a chunk piece at a time (the signature, IHDR, the first
+  IDAT's header), then STREAM_OVERFLOW with streamSize 0 and processedLine the rows written before the write that
+  failed (pspocket wrote what fitted and gave its size).
+The PNG is written here rather than by the build's libpng 1.6, which orders and checks chunks otherwise; IDAT, zTXt and
+iCCP are zlib's of the build with libpng 1.2.8's settings (the window bits tidied as 1.2 does), so their bytes may
+differ from zlib 1.2.3's for the same pixels and texts (notes in the comparison, D-597).
+Tests: tests/hle/test_pngenc_compare.cpp (0 of 1,834 against Sony's; PSPOCKET_COMPARE_SELF=1 agrees with itself);
+tests/hle/test_imgenc.cpp updated to Sony's answers (the queues and Reset's skips, the refusals, FATAL for a keyword to
+tidy, the memory of a text, 1.2.8's chunk order, sCAL's and gAMA's bytes, a buffer too small).
+
+## D-913 · 2026-10-11 · cellPngEnc no longer firmware-first (part 2)
+
+cellPngEnc matches Sony's libpngenc call for call (part 1: 0 of 1,834 observations differ, every answer, both queues,
+each stream's information and every PNG's chunks and pixels), so its firmware-first marker goes (D-563): where the
+system software is installed, a game importing cellPngEnc now gets pspocket's, not libpngenc.sprx. Its comparison
+(test_pngenc_compare.cpp) loses its [.]: it runs in the Mac's gate with the firmware and skips without it; the name
+check and test_imgenc.cpp check the library is pspocket's and unmarked.
+
+## D-913 · 2026-10-11 · cellJpgEnc as Sony's libjpgenc answers and writes it (part 3)
+
+cellJpgEnc (D-616) was made without a Sony module, its structures inferred from libpngenc's; D-618's comparison had
+never run. Run against libjpgenc.sprx (firmware 4.92), 788 of 816 observations differed: most structures were wrong.
+Sony's module was read (its exports, its encoder thread, its libjpeg; nothing of it in the repository) and pspocket's
+library and encoder rewritten to do what it does. The comparison, rewritten on Sony's structures and widened (21
+configurations, every sampling and colour space, sizes 1x1 to 50x61 at both DCTs, qualities 0 to 100, restart
+intervals, a pitch past the row, extended parameters, the queues and Reset, buffers too small, files, every check, an
+SPU encoder), shows 14 of 3,751 observations differing, all in two features below.
+- **The structures** (Sony's): CellJpgEncConfig {maxWidth, maxHeight, encodeColorSpace (gray 1, RGB 2, YCbCr 3),
+  samplingFormat (4:4:4 0, 4:2:2 1, 4:2:0 2, 4:1:1 3, none 4), enableSpu (b8, +16), exParamList, exParamNum}: the JPEG's
+  colour space and sampling are the encoder's, not each picture's. CellJpgEncPicture {width, height, colorSpace,
+  pictureAddr, userData (u64, +16)} (rows of the picture's width); CellJpgEncPicture2 {width, height, pitchWidth,
+  colorSpace, pictureAddr, userData (u64, +24)} (EncodePicture2 is the pitch, not planes); CellJpgEncEncodeParam
+  {enableSpu (b8), restartInterval, dctMethod, compressionMode, compressionModeParam, exParamList, exParamNum}, each
+  extended parameter {marker, data, size}: a marker segment after SOI, its code the marker's low byte; the stream
+  information has the quality used at +28 before userData.
+- **QueryAttr**: sizes 1 to 65535, a colour space 1 to 3, sampling 4 exactly when not YCbCr, no extended parameters;
+  memSize 0x1B630 (0x388A0 with SPUs) + the width to 16 times 12 (gray), 30 (RGB, 4:4:4), 22 (4:2:2), 18 (4:1:1) or
+  33 (4:2:0), + 0x1780; cmdQueueDepth 4, versionUpper 0x270000, versionLower 4.
+- **Open** (and OpenEx): the handle is the work memory's first 128-byte boundary; too little memory, a PPU priority
+  past 0xBFF or an SPU priority past 0xFF is ARG; opening over memory already open makes a new encoder there.
+- **The queues** are libpngenc's (part 1): four commands (BUSY), the thread encoding while fewer than four streams wait,
+  eight streams; Reset (BUSY with five or more streams) turns the commands into STREAM_SKIP streams, skips the next
+  picture too and keeps the streams.
+- **EncodePicture's checks**: a picture within the encoder's size, a colour space the encoder takes (gray only into a
+  gray encoder; YCbCr not into an RGB one; RGB, RGBA and ARGB into any), a pitch of a row at least; enableSpu only on
+  an encoder opened for SPUs and only with the fast DCT; dctMethod 0 or 5; compressionMode 0 or 1; quality at most 100;
+  restartInterval at most 0xFFFF; each extended parameter's data given and its size 1 to 0xFFFD; location 0 or 1; the
+  size limit mode only into a buffer; a file needs its name; a buffer its address and limitSize of at least 0x1000 plus
+  the extended parameters' segments.
+- **The stream is libjpeg 6b's, byte for byte** (jpeg_encoder.cpp rewritten on its algorithms): no JFIF APP0 (pspocket
+  wrote one), jpeg_set_quality's tables (quality 0 is 1) forced to baseline, jccolor's fixed-point conversion (a YCbCr
+  picture taken as it is), jcsample's downsampling with its alternating bias, the last column and row repeated to the
+  iMCU, dummy blocks at the DC of the block before, jfdctflt in double with the two fused multiply-adds and the fused
+  quantisation libjpgenc's compiler made (QUALITY) or jfdctfst with its scaled divisors (FAST), jchuff's bit buffer,
+  restart markers and fill, and jcmarker's order (DQT, SOF0, DHT as the scan first uses each table, DRI, SOS). RGBA and
+  ARGB give the RGB picture's stream. A scratch harness compared 186 of Sony's streams: none differ.
+- **A buffer too small**: the stream is written until the buffer is full (to its end), then STREAM_OVERFLOW, streamSize
+  0, processedLine the rows written before the one whose data did not fit. A file that cannot be made is
+  STREAM_FILE_OPEN; the quality is reported in every stream's information.
+Still different, each logged once when a game uses it:
+- **The stream size limit mode** (6 observations): libjpgenc predicts the quality from a trial encoding of a corner of
+  the picture and tables of stream sizes by quality in its data (4 sampling groups, 3 activity rows, 101 qualities),
+  retrying lower up to three times; the tables are Sony's measurements, which pspocket does not carry. pspocket takes the
+  highest quality up to the one given whose stream fits (searched by halves): its streams fit as Sony's do, at a higher
+  quality (64x48 in 0x1000 bytes: Sony quality 69, pspocket 95).
+- **The SPU encoder** (8 observations): libjpgenc's SPU program converts, samples and transforms in its own arithmetic
+  (its first coefficients differ from libjpeg's) and pads the stream with two zero bytes after EOI (streamSize counts
+  them). pspocket encodes those pictures with libjpeg's FAST path: the same headers and tables, a picture within a
+  rounding of Sony's.
+cellJpgEnc stays firmware-first (D-563) while these differ.
+Tests: tests/hle/test_jpgenc_compare.cpp (PSPOCKET_COMPARE_SELF=1: 0 of 3,751; against Sony's: 14, the two features
+above); tests/hle/test_jpgenc.cpp rewritten for Sony's structures and answers (libjpeg 6b's tables and colours, the
+markers of every sampling at both DCTs read back by pspocket's decoder, the queues and Reset's skips, the overflow's
+rows, the size limit mode, files, every check). compare_util.hpp: PSPOCKET_COMPARE_DUMP=<dir> writes each half's data
+observations (the streams) to files for reading a difference.
+
+## D-913 · 2026-10-11 · cellVpost as Sony's libvpost answers and converts (part 4)
+
+cellVpost (D-564) was RPCS3's: its attributes, idm handles and a float conversion and scaler of pspocket's own. The
+comparison with libvpost.sprx (firmware 4.92) showed 374 of 536 observations differing, and most of its pictures were
+ones libvpost refuses (sizes under 32, unaligned buffers, empty windows). Sony's module was read (its PPU wrapper over
+four SPURS task stages: input, interlace conversion, scaler, colour conversion) and run on chosen pictures (thousands of
+probes: flat colours over the whole YUV cube, impulses, noise, every window placement); nothing of it in the repository.
+pspocket's library is rewritten to do what it does. The comparison, rewritten on what libvpost takes and widened (25
+configurations, every resource field at its limits, OpenEx's checks, flat colours, noise and ramps in both matrices,
+ranges and chroma sitings, 13 scalings by each scaler type, windows, every exec and interpolation type, every check, YUV
+output) now shows 88 of 791 observations differing, in the features listed last.
+- **QueryAttr**: inMaxWidth and outMaxWidth even, 32 to 1920, the heights even, 32 to 1088, depths 8 bits, the input YUV
+  4:2:0 planar, the output RGBA or YUV 4:2:0 planar, both reserved words 0 (else Q_ARG_CFG_INVALID). memSize is twice
+  the larger frame (the width to 16 times the height plus two chroma planes of half the width to 16 times half the height
+  plus one) plus 0x9FE5 (RPCS3: 4 MB); delay 0; versions 0x40000 and 0x05060606.
+- **Open** makes the handle in the work memory, at its first 128-byte boundary, its first word its own address (Exec and
+  Close check it: a pointer that is no handle is HDL_INVALID). O_ARG_RSRC_INVALID for no memory, less than QueryAttr's, a
+  PPU priority past 0xBFF, an SPU priority outside 16 to 255 or SPUs other than one (the stack is not checked). OpenEx
+  takes {memAddr, memSize, spurs, priority[8], maxContention}: a SPURS instance, priorities 0 to 15 not all 0, a
+  maximum contention of 1. Close clears the handle.
+- **Exec's checks**, in libvpost's order: the handle, the input (given, 128-byte aligned: INPICBUF_INVALID), the
+  control parameters (CTRL_INVALID: exec type to 7, scaler type to 3, interpolation type to 2, the sizes as QueryAttr's
+  and within the handle's, chroma siting, range and matrix 0 or 1, both windows inside their pictures, even and at least
+  32 square, both reserved words 0), the output (128-byte aligned: OUTPICBUF_INVALID), the picture information.
+- **The output** is the whole picture: the input window scaled into the output window, black around it (Y 0, or 16 in
+  broadcast range; chroma 128). The picture information takes libvpost's tables for the exec type's scans and
+  structures; an RGBA output's range is 0.
+- **The colour conversion** is libvpost's fixed point, found exactly from all 2^24 colours' slices: R, G, B = (A * Y +
+  Cu (U - 128) + Cv (V - 128) + B) >> 20, clamped; full range A = 2^20 and B = 2^19; broadcast A = 64 * 19076 on Y - 16
+  and B = 523264; the chroma weights 128 times BT.601's 11485, -2818, -5850, 14516 (broadcast 13078, -3204, -6658,
+  16520) or BT.709's 12900, -1534, -3834, 15201 (broadcast 14690, -1746, -4378, 17322). Each pixel's chroma: its 2x2
+  block's (siting type A), or for odd columns the byte average, rounded up, of its sample and the next (type B).
+- **The scaler type 0** is libvpost's bilinear: vertically first, then horizontally; weights in 1/256, each sum rounded
+  down; vertical positions in 1/65536 per row; horizontal ones in 1/256, sixteen output columns at a time from a
+  multiple of 16 in the output picture (each sixteen 16 steps of 1/65536 on, rounded down to 1/256, its columns a 1/256
+  step apart); a row past the window's bottom is the picture's, a column past its right edge its last; chroma planes
+  sited (step - 1) / 4 on (horizontally for type A only); past a halving horizontally, every second column first.
+Still different, each logged once when a game uses it: scaler types 1 to 3 (libvpost's sharpening and 4-tap and 8x4-tap
+filters, the last from tables of coefficients in its data), exec types 1 to 6 (part 6), a horizontal reduction past a
+half, a chroma window not at a multiple of 16 enlarged, and the bytes libvpost writes past a YUV output whose chroma
+planes have an odd size. cellVpost stays firmware-first (D-563) while
+these differ.
+Tests: tests/hle/test_vpost_compare.cpp (PSPOCKET_COMPARE_SELF=1 agrees with itself); tests/hle/test_vpost.cpp rewritten
+for libvpost's answers (its memory, handle, checks, conversion, sitings, scaler positions, windows, information).
+
+## D-913 · 2026-10-11 · cellPngEnc's and cellJpgEnc's queues across threads after D-651 (part 5)
+
+Main's D-651 (a picture takes its place before it is encoded; a Reset meanwhile drops it) was written for the
+libraries before parts 1 and 3. Merged, the libraries keep libpngenc's and libjpgenc's queues as compared (four commands
+waiting, the one being encoded among them; the thread encoding while fewer than four streams wait; Reset turning the
+waiting commands into STREAM_SKIP streams and skipping the next picture), and D-651's race is closed the way Sony's
+thread closes it: the command being encoded keeps its place, a Reset meanwhile leaves it to finish and queue its stream
+first, and only then are the commands still waiting skipped (before, the Reset turned it into a skipped stream too and
+its encoder then popped the next picture's command). D-651's tests are rewritten for those queues: eight threads at once
+give four to eight pictures taken (the rest BUSY), each taken picture exactly one stream (its own bytes, or STREAM_SKIP
+after a Reset), nothing left after; D-650's two encoders on two threads stand as they were, on the new structures.
+
+## D-913 · 2026-10-11 · cellVpost's exec types: libvpost's fields and interlace conversion (part 6)
+
+The exec types are libvpost's, found by running its module on noise pictures at every type, interpolation type, size and
+output format (all 144 such probes match but the edge-adaptive type's few pixels):
+- A field picture out (PTOP_ITOP, PBTM_IBTM, ITOP_ITOP, IBTM_IBTM, IFRM_IFRM) is only the output's rows of its parity,
+  luma and chroma alike; the other rows are left as they were (IFRM_IFRM writes the top field's, then the bottom's).
+- A field picture in becomes a frame by the interlace conversion when the output is a frame (ITOP_PFRM, IBTM_PFRM) or
+  when it is scaled (the field types): the field's rows kept, the others' made from them: type 0 repeats the field's row
+  (above for the top field, below for the bottom), type 1 averages the rows above and below as bytes (rounded up), type
+  2 averages along the one of three directions whose three pixels about it differ least (a diagonal only two or more
+  less than straight down; the chroma averaged straight); then the frame is scaled as any frame, and a field out takes
+  its parity's rows of the scaled frame.
+- Kept as a field (the field types at the same size), a row's chroma for RGBA is its field's (rows 2 (y / 4) + parity).
+  A progressive picture out as a field (PTOP_ITOP, PBTM_IBTM) is the frame's conversion, its parity's rows.
+Type 2's direction choice is close to libvpost's (its SPU code compares absolute differences of bytes, some of whose
+rounding is not known): about 1% of the interpolated pixels of noise differ.
+
+## D-913 · 2026-10-11 · cellVpost: the bilinear scaler's first sixteen columns (part 7)
+
+A chroma plane enlarged into windows at multiples of 16 in both pictures: libvpost's first sixteen columns' positions
+are its lanes' offsets, and every negative one is 0 (not only the first: an enlargement past four times has two), which
+each later sixteen keeps; for other windows the lanes keep their negative offsets (part 4's rule took only the first
+lane, and for any input window). With part 6 the comparison shows 49 of 791 observations differing: scaler types 1 to 3
+(36), the edge-adaptive interlace conversion's few pixels (7), a horizontal reduction past a half (2), and the bytes
+libvpost writes past a YUV output whose chroma has an odd size (4). cellVpost stays firmware-first (D-563).
+What is known of the rest, for whoever takes it up: scaler types 2 and 3 scale vertically with libvpost's 4-tap filters,
+tables in its PPU module's data (five of 64 phases, each tap in 1/256 written twice; chosen by the ratio, out over in
+times 4 plus 0.6), and type 3 horizontally with its 8-tap ones (seventeen tables of 256 phases in 1/4096, chosen by the
+ratio times 16 plus 0.6; past enlarging, the bilinear one); type 2's horizontal filter and type 1's sharpening are
+computed by the SPU program. The tables are Sony's data and stay out of the repository: matching them means reading
+them from the installed libvpost.sprx at run time, as cellFont reads libfont's (D-526).

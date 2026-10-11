@@ -1,6 +1,6 @@
-// cellPngEnc (D-566): pspocket's PNG encoder (made from RPCS3's checks; no Sony module to compare with). Synthetic
-// pictures in every colour space and depth, encoded and read back with libpng's own decoder pixel by pixel, with their
-// ancillary chunks; the result queue; buffer and file output; the checks. No game data.
+// cellPngEnc (D-566, D-913): pspocket's PNG encoder, as Sony's libpngenc answers (tests/hle/test_pngenc_compare.cpp
+// compares the two). Synthetic pictures in every colour space and depth, encoded and read back with libpng's own decoder
+// pixel by pixel, with their ancillary chunks; the two queues; buffer and file output; the checks. No game data.
 
 #include "hle_test_util.hpp"
 
@@ -28,7 +28,7 @@
 using namespace pspocket;
 using namespace pspocket::hle::test;
 
-TEST_CASE("cellPngEnc: the nine functions, firmware first", "[hle][pngenc]")
+TEST_CASE("cellPngEnc: the nine functions, pspocket's own (no longer firmware-first, D-913)", "[hle][pngenc]")
 {
 #if PSPOCKET_HAVE_LIBPNG
     for (const std::string_view name : {"cellPngEncQueryAttr", "cellPngEncOpen", "cellPngEncOpenEx", "cellPngEncClose",
@@ -39,7 +39,7 @@ TEST_CASE("cellPngEnc: the nine functions, firmware first", "[hle][pngenc]")
         REQUIRE(fn != nullptr);
         CHECK(fn->name == name);
     }
-    CHECK(hle::registry().is_firmware_first("cellPngEnc"));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellPngEnc"));
 #else
     SKIP("no libpng in this build: cellPngEnc is not pspocket's");
 #endif
@@ -72,12 +72,12 @@ u32 needed(u32 max_w, u32 depth, bool spu = false, u32 add = 0)
     return add + (spu ? 0x78200 : 0x47A00) + (depth >> 1) * max_w * 7 + 0x1780;
 }
 
-u32 open(GuestThread& g, u32 max_w = 64, u32 max_h = 64, u32 depth = 16)
+u32 open(GuestThread& g, u32 max_w = 64, u32 max_h = 64, u32 depth = 16, u32 add = 0)
 {
     u8* b = g.f.base();
-    write_config(b, max_w, max_h, depth);
+    write_config(b, max_w, max_h, depth, false, add);
     ps_write32(b, kRsrc, kWork);
-    ps_write32(b, kRsrc + 4, needed(max_w, depth));
+    ps_write32(b, kRsrc + 4, needed(max_w, depth, false, add));
     ps_write32(b, kRsrc + 8, 1000);
     ps_write32(b, kRsrc + 12, 200);
     REQUIRE(g.call("cellPngEncOpen", kCfg, kRsrc, kHandle) == 0);
@@ -256,7 +256,7 @@ TEST_CASE("cellPngEnc: QueryAttr's memory and the checks of Open and Close", "[h
     ps_write32(b, kCfg + 24, 1); // extended parameters
     CHECK(g.call("cellPngEncQueryAttr", kCfg, kAttr) == kArg);
 
-    // Open: the handle is the work memory; too little of it, priorities out of range, or memory already open: ARG.
+    // Open: the handle is the work memory's first 128-byte boundary; too little of it or priorities out of range: ARG.
     write_config(b, 64, 64, 8);
     ps_write32(b, kRsrc, kWork);
     ps_write32(b, kRsrc + 4, needed(64, 8) - 1);
@@ -273,7 +273,9 @@ TEST_CASE("cellPngEnc: QueryAttr's memory and the checks of Open and Close", "[h
     CHECK(g.call("cellPngEncOpen", kCfg, kRsrc, 0) == kArg);
     REQUIRE(g.call("cellPngEncOpen", kCfg, kRsrc, kHandle) == 0);
     CHECK(ps_read32(b, kHandle) == kWork);
-    CHECK(g.call("cellPngEncOpen", kCfg, kRsrc, kHandle) == kArg);
+    // Opened again over its memory: a new encoder there (as libpngenc's).
+    CHECK(g.call("cellPngEncOpen", kCfg, kRsrc, kHandle) == 0);
+    CHECK(ps_read32(b, kHandle) == kWork);
     CHECK(g.call("cellPngEncClose", kWork) == 0);
     CHECK(g.call("cellPngEncClose", kWork) == kArg);
     CHECK(g.call("cellPngEncClose", 0) == kArg);
@@ -287,6 +289,13 @@ TEST_CASE("cellPngEnc: QueryAttr's memory and the checks of Open and Close", "[h
     ps_write8(b, kRsrc + 16 + 3, 15);
     REQUIRE(g.call("cellPngEncOpenEx", kCfg, kRsrc, kHandle) == 0);
     CHECK(g.call("cellPngEncClose", kWork) == 0);
+    // Memory not on a 128-byte boundary: the encoder (and the handle) at the next one.
+    ps_write32(b, kRsrc, kWork + 0x10);
+    ps_write32(b, kRsrc + 8, 1000);
+    ps_write32(b, kRsrc + 12, 200);
+    REQUIRE(g.call("cellPngEncOpen", kCfg, kRsrc, kHandle) == 0);
+    CHECK(ps_read32(b, kHandle) == kWork + 0x80);
+    CHECK(g.call("cellPngEncClose", kWork + 0x80) == 0);
 }
 
 TEST_CASE("cellPngEnc: pictures in every colour space and depth, read back with libpng", "[hle][pngenc]")
@@ -310,11 +319,11 @@ TEST_CASE("cellPngEnc: pictures in every colour space and depth, read back with 
         for (u32 y = 0; y < 3; y++)
             for (u32 x = 0; x < 20; x++) CHECK(png.rows[y][x] == px(y * 24 + x));
     }
-    SECTION("ARGB to RGBA (reordered) and to RGB (alpha dropped)")
+    SECTION("ARGB written as RGBA (reordered) and to RGB (alpha dropped)")
     {
         Pic p{4, 2, 16, ARGB, 8};
         fill(32, 7);
-        Png png = round_trip(g, h, p, {ARGB, 0, 0});
+        Png png = round_trip(g, h, p, {ARGB, 0, 0x08});
         CHECK(png.color_type == PNG_COLOR_TYPE_RGB_ALPHA);
         for (u32 y = 0; y < 2; y++)
             for (u32 x = 0; x < 4; x++) {
@@ -328,32 +337,31 @@ TEST_CASE("cellPngEnc: pictures in every colour space and depth, read back with 
         CHECK(png.color_type == PNG_COLOR_TYPE_RGB);
         for (u32 x = 0; x < 4; x++) CHECK(png.rows[1][3 * x + 2] == px(16 + 4 * x + 3));
     }
-    SECTION("RGB to RGBA (opaque), 16-bit RGBA, gray to gray and alpha and back")
+    SECTION("16-bit RGBA, RGBA to RGB, gray and alpha to gray; no alpha added")
     {
         Pic p{3, 2, 9, RGB, 8};
         fill(18, 3);
-        Png png = round_trip(g, h, p, {RGBA, 6, 0x20});
-        for (u32 x = 0; x < 3; x++) {
-            CHECK(png.rows[1][4 * x] == px(9 + 3 * x));
-            CHECK(png.rows[1][4 * x + 3] == 0xFF);
-        }
+        CHECK(encode(g, h, p, {RGBA, 6, 0x20}) == kArg); // libpngenc adds no alpha
         p = {2, 2, 16, RGBA, 16};
         fill(32, 5);
-        png = round_trip(g, h, p, {RGBA, 6, 0x40});
+        Png png = round_trip(g, h, p, {RGBA, 6, 0x40});
         CHECK(png.depth == 16);
         for (u32 i = 0; i < 16; i++) CHECK(png.rows[1][i] == px(16 + i)); // big-endian samples as they are
+        png = round_trip(g, h, p, {RGB, 6, 0x40});
+        for (u32 i = 0; i < 6; i++) CHECK(png.rows[1][i] == px(16 + i));
         p = {4, 1, 4, GRAY, 8};
         fill(4, 9);
-        png = round_trip(g, h, p, {GRAY_ALPHA, 6, 0x80});
-        CHECK(png.color_type == PNG_COLOR_TYPE_GRAY_ALPHA);
-        for (u32 x = 0; x < 4; x++) {
-            CHECK(png.rows[0][2 * x] == px(x));
-            CHECK(png.rows[0][2 * x + 1] == 0xFF);
-        }
+        CHECK(encode(g, h, p, {GRAY_ALPHA, 6, 0x80}) == kArg);
         p = {4, 1, 8, GRAY_ALPHA, 8};
         png = round_trip(g, h, p, {GRAY, 6, 0xF8});
         CHECK(png.color_type == PNG_COLOR_TYPE_GRAY);
         for (u32 x = 0; x < 4; x++) CHECK(png.rows[0][x] == px(2 * x));
+        // RGBA to RGB: the row measured in RGB's samples, encoded only when it holds an RGBA row (else FATAL).
+        p = {4, 1, 13, RGBA, 8};
+        REQUIRE(encode(g, h, p, {RGB, 6, 0x08}) == 0);
+        CHECK(stream_info(g, h).state == static_cast<s32>(0x80611296));
+        p.pitch = 11;
+        CHECK(encode(g, h, p, {RGB, 6, 0x08}) == kArg);
     }
     SECTION("4-bit gray, one sample a byte and packed; 1-bit gray")
     {
@@ -377,6 +385,13 @@ TEST_CASE("cellPngEnc: pictures in every colour space and depth, read back with 
         png = round_trip(g, h, p, {GRAY, 6, 0x08});
         const u8 bits[10] = {1, 0, 1, 0, 0, 1, 0, 1, 1, 0};
         for (u32 x = 0; x < 10; x++) CHECK(png.rows[0][x] == bits[x]);
+        // 1 bit a byte: any byte but 0 is a 1 (libpng's packing).
+        p = {4, 1, 4, GRAY, 1};
+        const u8 ones[4] = {0x00, 0xF0, 0x02, 0x01};
+        std::memcpy(b + kPixels, ones, 4);
+        png = round_trip(g, h, p, {GRAY, 6, 0x08});
+        const u8 got[4] = {0, 1, 1, 1};
+        for (u32 x = 0; x < 4; x++) CHECK(png.rows[0][x] == got[x]);
     }
     SECTION("a palette picture with its PLTE and tRNS")
     {
@@ -403,9 +418,8 @@ TEST_CASE("cellPngEnc: pictures in every colour space and depth, read back with 
         CHECK(png.palette[2] == std::array<u8, 3>{0, 0, 255});
         CHECK(png.trans == std::vector<u8>{0, 128, 255});
         for (u32 i = 0; i < 6; i++) CHECK(png.rows[i / 3][i % 3] == idx[i]);
-        // Without its PLTE, a palette picture's stream aborts.
-        REQUIRE(encode(g, h, p, {PALETTE, 6, 0x08, 0}) == 0);
-        CHECK(stream_info(g, h).state == static_cast<s32>(0x806112A1));
+        // Without its PLTE, a palette picture is refused.
+        CHECK(encode(g, h, p, {PALETTE, 6, 0x08, 0}) == kArg);
     }
     CHECK(g.call("cellPngEncClose", h) == 0);
 }
@@ -415,7 +429,7 @@ TEST_CASE("cellPngEnc: ancillary chunks: text, time, gamma, physical size", "[hl
     Fixture f;
     GuestThread g(f, 0, "game");
     u8* b = f.base();
-    const u32 h = open(g);
+    const u32 h = open(g, 64, 64, 16, 0x1000); // texts take addMemSize
     std::memset(b + kPixels, 0x40, 64);
     std::memset(b + kChunkData, 0, 0x200);
     // CellPngTextInfo {tEXt, keyword, text, textLength 0 (NUL-terminated)}.
@@ -432,13 +446,12 @@ TEST_CASE("cellPngEnc: ancillary chunks: text, time, gamma, physical size", "[hl
     ps_write32(b, kChunkData + 0x60, 2835);
     ps_write32(b, kChunkData + 0x64, 2835);
     ps_write32(b, kChunkData + 0x68, 1);
-    const u32 chunks[][2] = {{7, kChunkData}, {12, kChunkData + 0x40}, {3, kChunkData + 0x50}, {10, kChunkData + 0x60},
-        {11, kChunkData + 0x80}}; // and an sPLT, left out
-    for (u32 i = 0; i < 5; i++) {
+    const u32 chunks[][2] = {{7, kChunkData}, {12, kChunkData + 0x40}, {3, kChunkData + 0x50}, {10, kChunkData + 0x60}};
+    for (u32 i = 0; i < 4; i++) {
         ps_write32(b, kChunks + 8 * i, chunks[i][0]);
         ps_write32(b, kChunks + 8 * i + 4, chunks[i][1]);
     }
-    const Png png = round_trip(g, h, {4, 4, 4, GRAY, 8}, {GRAY, 6, 0xF8, 5});
+    const Png png = round_trip(g, h, {4, 4, 4, GRAY, 8}, {GRAY, 6, 0xF8, 4});
     REQUIRE(png.texts.size() == 1);
     CHECK(png.texts[0].first == "Title");
     CHECK(png.texts[0].second == "pspocket");
@@ -451,6 +464,62 @@ TEST_CASE("cellPngEnc: ancillary chunks: text, time, gamma, physical size", "[hl
     REQUIRE(png.has_phys);
     CHECK(png.phys_x == 2835);
     CHECK(png.phys_unit == 1);
+    // Every warning of libpng 1.2.8's is an error in libpngenc: a keyword with spaces to tidy ends the stream (FATAL).
+    std::memcpy(b + kChunkData + 0x100, " Title", 7);
+    ps_write32(b, kChunks, 7);
+    ps_write32(b, kChunks + 4, kChunkData);
+    REQUIRE(encode(g, h, {4, 4, 4, GRAY, 8}, {GRAY, 6, 0xF8, 1}) == 0);
+    CHECK(stream_info(g, h).state == static_cast<s32>(0x80611296));
+    // Without the memory for the text (addMemSize 0): refused.
+    CHECK(g.call("cellPngEncClose", h) == 0);
+    const u32 tight = open(g, 64, 64, 16, 0);
+    std::memcpy(b + kChunkData + 0x100, "Title", 6);
+    CHECK(encode(g, tight, {4, 4, 4, GRAY, 8}, {GRAY, 6, 0xF8, 1}) == kArg);
+    CHECK(g.call("cellPngEncClose", tight) == 0);
+}
+
+TEST_CASE("cellPngEnc: chunks as libpng 1.2.8 writes them: order, sCAL, gAMA and cHRM", "[hle][pngenc]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "game");
+    u8* b = f.base();
+    const u32 h = open(g, 64, 64, 16, 0x1000);
+    std::memset(b + kPixels, 0x30, 64);
+    std::memset(b + kChunkData, 0, 0x400);
+    // gAMA 0.45455 (written from its float), sRGB, sBIT, cHRM, sCAL {metre, 1234.5678, 0.001}, oFFs.
+    ps_writef64(b, kChunkData, 0.45455);
+    ps_write32(b, kChunkData + 0x10, 1);
+    const u32 sbit[5] = {5, 6, 5, 0, 0};
+    for (u32 i = 0; i < 5; i++) ps_write32(b, kChunkData + 0x20 + 4 * i, sbit[i]);
+    const double chrm[8] = {0.3127, 0.329, 0.64, 0.33, 0.3, 0.6, 0.15, 0.06};
+    for (u32 i = 0; i < 8; i++) ps_writef64(b, kChunkData + 0x40 + 8 * i, chrm[i]);
+    ps_write32(b, kChunkData + 0x80, 1);
+    ps_writef64(b, kChunkData + 0x88, 1234.5678);
+    ps_writef64(b, kChunkData + 0x90, 0.001);
+    ps_write32(b, kChunkData + 0xA0, 100);
+    ps_write32(b, kChunkData + 0xA4, static_cast<u32>(-50));
+    const u32 list[][2] = {{15, kChunkData + 0x80}, {13, kChunkData + 0xA0}, {2, kChunkData + 0x40},
+        {5, kChunkData + 0x20}, {6, kChunkData + 0x10}, {3, kChunkData}};
+    for (u32 i = 0; i < 6; i++) {
+        ps_write32(b, kChunks + 8 * i, list[i][0]);
+        ps_write32(b, kChunks + 8 * i + 4, list[i][1]);
+    }
+    REQUIRE(encode(g, h, {4, 4, 12, RGB, 8}, {RGB, 6, 0x08, 6}) == 0);
+    const Info i = stream_info(g, h);
+    REQUIRE(i.state == 0);
+    // The chunks in 1.2.8's order, whatever order they were given in.
+    std::vector<std::string> order;
+    std::vector<std::vector<u8>> bodies;
+    for (u32 at = 8; at + 12 <= i.size;) {
+        const u32 len = ps_read32(b, kStream + at);
+        order.emplace_back(reinterpret_cast<const char*>(b + kStream + at + 4), 4);
+        bodies.emplace_back(b + kStream + at + 8, b + kStream + at + 8 + len);
+        at += 12 + len;
+    }
+    CHECK(order == std::vector<std::string>{"IHDR", "gAMA", "sRGB", "sBIT", "cHRM", "oFFs", "sCAL", "IDAT", "IEND"});
+    CHECK(bodies[1] == std::vector<u8>{0, 0, 0xB1, 0x8F}); // 45455
+    const std::string scal(bodies[6].begin(), bodies[6].end());
+    CHECK(scal == std::string("\x01" "1.234568e+03" "\0" "1.000000e-03", 26));
     CHECK(g.call("cellPngEncClose", h) == 0);
 }
 
@@ -461,7 +530,7 @@ TEST_CASE("cellPngEnc: three text chunks in one picture, short keywords and text
     Fixture f;
     GuestThread g(f, 0, "game");
     u8* b = f.base();
-    const u32 h = open(g);
+    const u32 h = open(g, 64, 64, 16, 0x1000); // texts take addMemSize
     std::memset(b + kPixels, 0x40, 64);
     std::memset(b + kChunkData, 0, 0x400);
     const char* strings[] = {"Title", "pspocket", "Comment", "a compressed text", "Author", "en", "Auteur", "nobody"};
@@ -482,7 +551,7 @@ TEST_CASE("cellPngEnc: three text chunks in one picture, short keywords and text
     CHECK(g.call("cellPngEncClose", h) == 0);
 }
 
-TEST_CASE("cellPngEnc: the result queue: four at most, BUSY, EMPTY, Reset; a buffer too small", "[hle][pngenc]")
+TEST_CASE("cellPngEnc: the queues: four streams, four commands, BUSY, EMPTY, Reset; a buffer too small", "[hle][pngenc]")
 {
     Fixture f;
     GuestThread g(f, 0, "game");
@@ -492,8 +561,9 @@ TEST_CASE("cellPngEnc: the result queue: four at most, BUSY, EMPTY, Reset; a buf
     CHECK(g.call("cellPngEncWaitForOutput", h, kNum, 0) == kEmpty);
     CHECK(ps_read32(b, kNum) == 0);
     CHECK(g.call("cellPngEncGetStreamInfo", h, kInfo) == kEmpty);
-    for (u32 i = 0; i < 4; i++) {
-        REQUIRE(g.call("cellPngEncWaitForInput", h, 1) == 0);
+    // Four streams wait at most; then the commands wait, four at most (BUSY).
+    for (u32 i = 0; i < 8; i++) {
+        REQUIRE(g.call("cellPngEncWaitForInput", h, 0) == 0);
         Pic p{4, 4, 16, RGBA, 8};
         p.user = 0x100 + i;
         REQUIRE(encode(g, h, p, {RGBA, 6, 0xF8}) == 0);
@@ -511,17 +581,45 @@ TEST_CASE("cellPngEnc: the result queue: four at most, BUSY, EMPTY, Reset; a buf
     CHECK(i.user == 0x100); // oldest first
     CHECK(i.size > 8);
     CHECK(std::memcmp(b + kStream, "\x89PNG\r\n\x1A\n", 8) == 0);
+    // Taking a stream lets the next command be encoded: four wait again.
+    REQUIRE(g.call("cellPngEncWaitForOutput", h, kNum, 0) == 0);
+    CHECK(ps_read32(b, kNum) == 4);
     CHECK(stream_info(g, h).user == 0x101);
-    CHECK(g.call("cellPngEncWaitForInput", h, 0) == 0);
+    // Reset: the two commands waiting become skipped streams; the next picture is skipped as well.
     REQUIRE(g.call("cellPngEncReset", h) == 0);
+    REQUIRE(g.call("cellPngEncWaitForOutput", h, kNum, 0) == 0);
+    CHECK(ps_read32(b, kNum) == 6);
+    CHECK(g.call("cellPngEncReset", h) == kBusy); // five streams or more wait
+    for (u32 k = 0; k < 4; k++) CHECK(stream_info(g, h).state == 0);
+    for (u32 k = 0; k < 2; k++) {
+        i = stream_info(g, h);
+        CHECK(i.state == static_cast<s32>(0x806112A2)); // STREAM_SKIP
+        CHECK(i.user == 0x106 + k);
+        CHECK(i.size == 0);
+        CHECK(i.lines == 0);
+    }
     CHECK(g.call("cellPngEncGetStreamInfo", h, kInfo) == kEmpty);
+    REQUIRE(encode(g, h, {4, 4, 16, RGBA, 8}, {RGBA, 6, 0xF8}) == 0);
+    CHECK(stream_info(g, h).state == static_cast<s32>(0x806112A2));
+    REQUIRE(encode(g, h, {4, 4, 16, RGBA, 8}, {RGBA, 6, 0xF8}) == 0);
+    CHECK(stream_info(g, h).state == 0);
     CHECK(g.call("cellPngEncReset", h + 4) == kArg);
+    REQUIRE(g.call("cellPngEncReset", h) == 0); // and the skip it leaves
+    REQUIRE(encode(g, h, {4, 4, 16, RGBA, 8}, {RGBA, 6, 0xF8}) == 0);
+    CHECK(stream_info(g, h).state == static_cast<s32>(0x806112A2));
 
-    // A buffer too small: what fits is written, the stream overflows.
-    REQUIRE(encode(g, h, {4, 4, 16, RGBA, 8}, {RGBA, 0, 0x08}, 20) == 0);
+    // A buffer of 0x30 bytes or less is refused; one too small for the stream: what fits, chunk by chunk, is written
+    // (the signature, IHDR and the first IDAT's header), streamSize 0, the rows written before the failing write.
+    CHECK(encode(g, h, {4, 4, 16, RGBA, 8}, {RGBA, 0, 0x08}, 0x30) == kArg);
+    for (u32 k = 0; k < 64 * 16; k++) ps_write32(b, kPixels + 4 * k, k * 0x9E3779B9u); // noise: no compression
+    std::memset(b + kStream, 0xEE, 0x100);
+    REQUIRE(encode(g, h, {64, 16, 256, RGBA, 8}, {RGBA, 0, 0x08}, 0x40) == 0);
     i = stream_info(g, h);
     CHECK(i.state == kOverflow);
-    CHECK(i.size == 20);
+    CHECK(i.size == 0);
+    CHECK(i.lines == 15); // zlib holds the stored rows until the last one flushes it
+    CHECK(std::memcmp(b + kStream + 37, "IDAT", 4) == 0);
+    CHECK(ps_read8(b, kStream + 41) == 0xEE);
     CHECK(g.call("cellPngEncClose", h) == 0);
     CHECK(g.call("cellPngEncWaitForInput", h, 0) == kArg);
 }
@@ -577,7 +675,11 @@ TEST_CASE("cellPngEnc: EncodePicture's checks", "[hle][pngenc]")
     CHECK(encode(g, h, good, {GRAY}) == kArg);                         // colour to gray
     CHECK(encode(g, h, good, {PALETTE}) == kArg);                      // colour to a palette
     CHECK(encode(g, h, good, {RGBA, 10}) == kArg);                     // zlib's levels are 0-9
-    CHECK(encode(g, h, good, {RGBA, 6, 0x01}) == kArg);                // not a filter
+    CHECK(encode(g, h, good, {RGBA, 6, 0x09}) == kArg);                // not a filter
+    CHECK(encode(g, h, good, {RGBA, 6, 0}) == kArg);                   // no filter at all
+    CHECK(encode(g, h, good, {RGBA, 6, 0xF8}, 0x30) == kArg);          // a buffer of 0x30 bytes
+    CHECK(encode(g, h, {4, 4, 12, RGB, 8}, {RGBA}) == kArg);           // no alpha added
+    CHECK(encode(g, h, good, {ARGB}) == kArg);                         // RGBA as ARGB
     CHECK(encode(g, h, good, {RGBA}, 0x1000, 2) == kArg);              // no such location
     CHECK(encode(g, h, good, {RGBA}, 0, 1) == kArg);                   // a buffer of no size
     CHECK(encode(g, h, good, {RGBA}, 0x1000, 0, 0) == kArg);           // a file without a name
@@ -627,9 +729,11 @@ bool eventually(const std::function<bool()>& done, std::chrono::milliseconds tim
 
 } // namespace
 
-TEST_CASE("cellPngEnc: eight threads encoding with one encoder at once: four pictures queued, the others BUSY; a Reset "
-          "drops those still being encoded (D-651)", "[hle][pngenc]")
+TEST_CASE("cellPngEnc: eight threads encoding with one encoder at once: each picture queued once or refused; a Reset "
+          "meanwhile skips the waiting ones, never one being encoded (D-651, D-913)", "[hle][pngenc]")
 {
+    // libpngenc's queues (D-913): four commands waiting (the one being encoded keeps its place), its thread encoding
+    // them while fewer than four streams wait; so of eight pictures at once four to eight are taken, the others BUSY.
     constexpr u32 kThreads = 8, kW = 128, kH = 96, kLimit = 0x20000;
     static_assert(kPixels + kW * kH * 4 <= kThreadCalls && kThreadCalls + 9 * 0x100 <= kStream);
     static_assert(kStream + kThreads * kLimit <= kWork);
@@ -649,7 +753,7 @@ TEST_CASE("cellPngEnc: eight threads encoding with one encoder at once: four pic
 
     for (const bool reset : {false, true}) {
         INFO("reset " << reset);
-        std::atomic<u32> ready{0}, busy{0};
+        std::atomic<u32> ready{0};
         std::atomic<bool> go{false};
         std::array<std::atomic<u64>, kThreads> answers;
         for (auto& a : answers) a = ~0ull;
@@ -661,48 +765,57 @@ TEST_CASE("cellPngEnc: eight threads encoding with one encoder at once: four pic
                 p.user = 0x700 + t;
                 ready++;
                 while (!go.load()) std::this_thread::yield();
-                const u64 r = encode_at(o, h, kThreadCalls + 0x100 * (t + 1), p, param, kStream + kLimit * t, kLimit);
-                answers[t] = r;
-                if (r == kBusy) busy++;
+                answers[t] = encode_at(o, h, kThreadCalls + 0x100 * (t + 1), p, param, kStream + kLimit * t, kLimit);
             });
         }
         while (ready.load() < kThreads) std::this_thread::yield();
         go = true;
         if (reset) {
-            // Every thread has made its call once four were refused: the four taken still being encoded, or done.
-            CHECK(eventually([&] { return busy.load() == kThreads - 4; }));
+            // While the pictures are being taken and encoded: the waiting ones skipped, the one being encoded not.
+            CHECK(eventually([&] {
+                for (const auto& a : answers)
+                    if (a == 0) return true;
+                return false;
+            }));
             REQUIRE(g.call("cellPngEncReset", h) == 0);
         }
         for (std::thread& th : threads) th.join();
-        u32 refused = 0;
         std::vector<u64> accepted;
+        u32 refused = 0;
         for (u32 t = 0; t < kThreads; t++) {
             if (answers[t] == 0) accepted.push_back(0x700 + t);
             else if (answers[t] == kBusy) refused++;
         }
-        CHECK(accepted.size() == 4);
-        CHECK(refused == 4);
-        if (!reset) {
-            // The four pictures taken, each the stream the encoder makes alone, in its own thread's buffer.
-            REQUIRE(g.call("cellPngEncWaitForOutput", h, kNum, 0) == 0);
-            CHECK(ps_read32(b, kNum) == 4);
-            std::vector<u64> users;
-            for (u32 n = 0; n < 4; n++) {
-                const Info s = stream_info(g, h);
-                CHECK(s.state == 0);
-                users.push_back(s.user);
-                const u64 t = s.user - 0x700;
-                REQUIRE(t < kThreads);
-                CHECK(s.addr == kStream + kLimit * t);
-                REQUIRE(s.size == want.size());
-                CHECK(std::memcmp(b + s.addr, want.data(), want.size()) == 0);
+        CHECK(accepted.size() >= 4);
+        CHECK(accepted.size() + refused == kThreads);
+        // Each picture taken gives one stream: the encoder's own (in its thread's buffer) or, after the Reset, skipped.
+        std::vector<u64> users;
+        for (usize n = 0; n < accepted.size(); n++) {
+            REQUIRE(g.call("cellPngEncWaitForOutput", h, kNum, 1) == 0);
+            const Info s = stream_info(g, h);
+            users.push_back(s.user);
+            const u64 t = s.user - 0x700;
+            REQUIRE(t < kThreads);
+            if (s.state != 0) {
+                CHECK(reset);
+                CHECK(s.state == static_cast<s32>(0x806112A2));
+                continue;
             }
-            std::sort(users.begin(), users.end());
-            CHECK(users == accepted);
+            CHECK(s.addr == kStream + kLimit * t);
+            REQUIRE(s.size == want.size());
+            CHECK(std::memcmp(b + s.addr, want.data(), want.size()) == 0);
         }
-        // Nothing more: the four taken, or dropped by the Reset with what was still being encoded then; room again.
+        std::sort(users.begin(), users.end());
+        CHECK(users == accepted);
+        // Nothing more; room again.
         CHECK(g.call("cellPngEncGetStreamInfo", h, kInfo) == kEmpty);
         CHECK(g.call("cellPngEncWaitForInput", h, 0) == 0);
+        if (reset) {
+            // The Reset's skip of the next picture, if no thread's picture came after it: taken by this one.
+            REQUIRE(encode_at(g, h, kThreadCalls, pic, param, kStream, kLimit) == 0);
+            const s32 next = stream_info(g, h).state;
+            CHECK((next == 0 || next == static_cast<s32>(0x806112A2)));
+        }
     }
     CHECK(g.call("cellPngEncClose", h) == 0);
 }
