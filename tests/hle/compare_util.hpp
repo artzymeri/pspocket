@@ -359,6 +359,23 @@ public:
         return f_.hle->link_function(library, nid, function);
     }
 
+    // An export known only by its NID (named "<library>_<NID>" by pspocket): its descriptor, 0 when there is none.
+    u32 descriptor_nid(u32 nid) const
+    {
+        if (firmware_) {
+            const auto it = firmware_->module->functions.find({library_, nid});
+            return it == firmware_->module->functions.end() ? 0 : it->second;
+        }
+        const Function* fn = registry().find(library_, nid);
+        return fn ? f_.hle->link_function(library_, nid, fn->name) : 0;
+    }
+    std::optional<u64> call_nid(u32 nid, std::initializer_list<u64> args) const
+    {
+        const u32 d = descriptor_nid(nid);
+        if (!d) return std::nullopt;
+        return call_guest(t_.ctx, d, args);
+    }
+
     // Calls the export with up to eight arguments on `t` (the half's thread when none); nullopt when it has none.
     std::optional<u64> call(std::string_view function, std::initializer_list<u64> args) const
     {

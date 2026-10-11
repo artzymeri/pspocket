@@ -10377,3 +10377,46 @@ firmware-first mark goes (D-563): a game gets pspocket's cellFiber whether the u
 not, and the loader no longer gives the game libfiber.sprx for it. The comparison loses its [.] and joins the gate
 (test_hle with PSPOCKET_TEST_DEV_FLASH set; it skips without the firmware and takes under a second); its name check now
 requires the library not to be marked, as test_fiber.cpp does.
+
+## D-914 · 2026-10-11 · cellKey2char as libkey2char makes it, its nine other exports too (part 3)
+
+D-911 found Sony's libkey2char faulting (SIGBUS) under the comparison. Not pspocket's engine: the comparison passed NULL
+for charNum and processed, which libkey2char writes unchecked (on a PS3 too it faults, at guest address 0); the step is
+gone, with a comment. The comparison then ran: 17,141 of 43,640 observations differed, so cellKey2char is now
+libkey2char's logic read from the module (runtime/hle/src/cellKey2char.cpp), with every table written from the public
+standard it is (keyboard layouts, code pages, Unicode's compositions and jamo mappings):
+- The handle holds everything: the conversion arrangement (byte 0; 0xFF when Open found no keyboard: the first of ports
+  0 to 126 cellKbGetConfiguration answers for gives the arrangement), the arrangement set (byte 1, 106 kana as 106), a
+  dead key's or the kana's state (2), the mode (3), the dead key waiting (4), the kana typed last (6), the characters
+  *charCode points at (from byte 10, five UTF-16 units, zeroed at each call), and the Korean automaton from 0x14.
+- SetArrangement sets byte 0 again whatever the mark (Russian and Korean convert in the US layout until their native
+  mode; 16 set twice goes back to 0) and clears the kana and dead-key state and the mode; SetMode is OTHER on a marked
+  handle, keeps the mode only for 106, Russian, Korean and traditional Chinese (2 only there), and leaving Korean drops
+  the syllable. GetChar on a marked handle looks for a keyboard again: OTHER while there is none.
+- GetChar: cellKbCnvRawCode in the conversion arrangement (the whole 16-bit key code); its raw flag hands back the key
+  code itself, not processed; nothing at all is OTHER. Then dead keys (` ´ ^ ~ ¨ ¸ wait for the next key, which
+  composes, or comes with them, Backspace too; ~ is the Polish programmers' ogonek key; none in the 101, 106, Italian,
+  Russian, UK and Chinese arrangements, ~ plain in German and Swiss German, ^ with AltGr in French and Belgian), the
+  result a byte of Windows-1252 (1250 Polish, 1254 Turkish, Russian's native mode the upper half of ISO 8859-5, its
+  0xF0 the numero sign). Japanese (106, mode 1): the JIS kana layout and shift layer, shift 0 を, ゛ and ゜ replacing the
+  kana typed last by its voiced form (a backspace first). Traditional Chinese: Zhuyin (mode 1), Cangjie (mode 2: Z has
+  no radical and is not processed, the shifted letter's case inverted unless Caps Lock is on, the grave key a euro).
+- Korean (mode 1): the 2-set layout through libkey2char's automaton, laid out in the handle as the module lays it
+  (its stacks' data addresses included): jamo on a stack of six, the syllable's state recomputed from it, medials and
+  finals combined by the module's own rules (ㄱ in its final form makes no cluster), a final moving on to start the
+  next syllable, ᅵ after ㅏ ㅑ ㅓ ㅕ ending the syllable; each key hands back the syllable (a backspace first when one
+  is shown), and the one it completed; Backspace takes a jamo off, or goes to the game when none is left.
+- The module's nine other exports, known by NID and now pspocket's (cellKey2char_<NID>): the automaton's init, close,
+  recompute, restore, backspace, add jamo, reset, the syllable composition and the jamo-to-compatibility mapping. Those
+  libkey2char has as void answer the r3 its code leaves (a stack's address, or recompute's last step).
+The comparison, widened to 74,278 observations (Korean, kana and dead-key typing in sequences; every byte through each
+code page and every dead key with every letter, the handle set to a dead key waiting, whatever cellKbCnvRawCode gives;
+the automaton's functions over 600 made-up steps, with jamo of every kind; shift with Caps Lock and Num Lock in the
+native modes), shows 0 differences. Left as Sony's: GetChar's NULL charNum or processed (pspocket refuses them,
+INVALID_PARAMETER, where the module faults).
+Found on the way, not cellKey2char's: pspocket's sys_io gives cellKbCnvRawCode's characters past ASCII in code page 850
+(RPCS3's tables: the yen sign 190, sharp s 225, ´ 239), which libkey2char reads as Windows-1252 (¾, á, ï); and it has
+layouts for 101, 106 and German only (letters, digits and a few keys elsewhere). Comparing sys_io's cellKbCnvRawCode
+with Sony's libio is the next step for typed text.
+Tests: tests/hle/test_key2char.cpp rewritten for libkey2char's answers (8 cases), test_key2char_compare.cpp widened;
+compare_util.hpp's Side reaches an export by its NID.
