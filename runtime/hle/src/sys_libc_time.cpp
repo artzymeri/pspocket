@@ -1,12 +1,17 @@
-// sys_libc part 5a (D-515): time.h, the "C" locale's locale.h and ctype tables, and Dinkumware's number-conversion
-// internals, under sys_libc and sys_libm.
+// sys_libc part 5a (D-515, D-906): time.h as the SDK's C library has it, the "C" locale's ctype tables, and
+// Dinkumware's number-conversion internals, under sys_libc and sys_libm. The locale objects are sys_libc_locale.cpp's.
 // - time_t is 64 bits (the SDK's CellFsStat and CellFsUtimbuf hold time_t in 64-bit fields), counting seconds from
 //   1970 (lv2's sys_time_get_current_time). Local time is lv2's: its time zone and summer-time offsets in minutes east
 //   of UTC (sys_time_get_timezone), tm_isdst 1 while the summer offset is not 0.
+// - The calendar, gmtime, localtime, asctime, ctime, strftime and their internals (_Ttotm, _Daysto, _CStrftime,
+//   _Gentime, _Gettime) are the SDK's, read from a game's statically linked copy of its library (D-906): Plauger's
+//   calendar (every fourth year a leap year but 1900), Dinkumware's table-driven strftime over the locale's _Tinfo
+//   (the variable _Times) with Sony's choices (an unknown conversion gives its letter and a NUL, numbers clamped at 0
+//   and cut to their width, %z and %Z from the locale's time_zone only, empty in the "C" locale, %V without leap
+//   years). mktime, _Isdst, _Getdst, _Wcsftime and wcsftime have no copy in that game: Dinkumware's design, said so
+//   where they are.
 // - clock() counts microseconds from the first call (POSIX's CLOCKS_PER_SEC of 1000000; the SDK's value is not
 //   known).
-// - strftime and wcsftime are C99's in the "C" locale (%c "%a %b %e %H:%M:%S %Y", %x "%m/%d/%y", %X "%H:%M:%S"); %Z
-//   gives nothing (no zone names), %z lv2's offset.
 // - The ctype tables a header's macros may read: Dinkumware's (_Ctype, _Tolotab, _Touptab and the _Getp* functions:
 //   257 shorts from EOF, its C99 class bits) and newlib's __ctype_ptr (257 chars from EOF). The variables hold the
 //   pointer to entry 0 (Plauger's `const short *_Ctype = &ctyp_tab[1]`), the table after it.
@@ -16,10 +21,13 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <string>
 
 #include "libc_format.hpp"
 #include "libc_guest.hpp"
+#include "libc_locale.hpp"
+#include "libc_scan_guest.hpp"
 #include "libc_malloc.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/lv2/syscalls.hpp"
@@ -34,71 +42,61 @@ u8* gb(PPUContext& ctx) { return guest_base(ctx); }
 
 // ------------------------------------------------------------------------------------------------- calendar
 
-// Days from 1970-01-01 to y-m-d (proleptic Gregorian; Howard Hinnant's days_from_civil), and back.
-s64 days_from_civil(s64 y, u32 m, u32 d)
-{
-    y -= m <= 2;
-    const s64 era = (y >= 0 ? y : y - 399) / 400;
-    const u32 yoe = static_cast<u32>(y - era * 400);
-    const u32 doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
-    const u32 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + static_cast<s64>(doe) - 719468;
-}
+// The SDK's calendar is Plauger's (xttotm.c, xdaysto.c in Dinkumware's library): years counted from 1900, every fourth
+// year a leap year but 1900 itself (his "correct for leap year: 1801-2099"), so 2100 is a leap year here as in the
+// SDK's gmtime. Divisions truncate towards zero as the PPU's do.
+constexpr s16 kLmos[12] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
+constexpr s16 kMos[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+constexpr s64 kBias1900 = 2208988800; // seconds from 1900 to 1970
 
-void civil_from_days(s64 z, s64& y, u32& m, u32& d)
-{
-    z += 719468;
-    const s64 era = (z >= 0 ? z : z - 146096) / 146097;
-    const u32 doe = static_cast<u32>(z - era * 146097);
-    const u32 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const u32 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const u32 mp = (5 * doy + 2) / 153;
-    d = doy - (153 * mp + 2) / 5 + 1;
-    m = mp < 10 ? mp + 3 : mp - 9;
-    y = static_cast<s64>(yoe) + era * 400 + (m <= 2);
-}
+bool sdk_leap(s32 year) { return (year & 3) == 0 && year != 0; }
 
-bool leap(s64 y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+// _Daysto: the leap days from 1900 to `year` and the days before month `mon` in it.
+s32 daysto(s32 year, s32 mon)
+{
+    s32 days;
+    if (0 < year) days = (year - 1) / 4;
+    else if (year <= -4) days = 1 + (4 - year) / 4;
+    else days = 0;
+    const s16* tab = sdk_leap(year) ? kLmos : kMos;
+    return days + (mon >= 0 && mon < 12 ? tab[mon] : 0);
+}
 
 struct Tm {
     s32 sec = 0, min = 0, hour = 0, mday = 1, mon = 0, year = 70, wday = 4, yday = 0, isdst = 0;
 };
 
-Tm to_tm(s64 t, s32 isdst)
+// The SDK's _Ttotm: `secs` from 1970 broken down; a non-zero isdst adds lv2's summer offset (`summer` seconds) first
+// and is kept in tm_isdst as given.
+Tm ttotm(s64 secs, s32 isdst, s64 summer)
 {
-    Tm r;
-    s64 days = t / 86400, rem = t % 86400;
-    if (rem < 0) {
-        rem += 86400;
-        days--;
+    Tm t;
+    s64 s = static_cast<s64>(static_cast<u64>(secs) + static_cast<u64>(kBias1900));
+    t.isdst = isdst;
+    if (isdst != 0) s = static_cast<s64>(static_cast<u64>(s) + static_cast<u64>(summer));
+    const s64 days64 = s / 86400;
+    const s32 days = static_cast<s32>(days64);
+    t.wday = static_cast<s32>(static_cast<u32>(days) + 1u) % 7;
+    s32 year = days / 365, start = 0;
+    for (s32 base = year * 365;; base -= 365, year--) {
+        start = base + daysto(year, 0);
+        if (days >= start) break;
     }
-    r.hour = static_cast<s32>(rem / 3600);
-    r.min = static_cast<s32>(rem % 3600 / 60);
-    r.sec = static_cast<s32>(rem % 60);
-    s64 y;
-    u32 m, d;
-    civil_from_days(days, y, m, d);
-    r.year = static_cast<s32>(y - 1900);
-    r.mon = static_cast<s32>(m) - 1;
-    r.mday = static_cast<s32>(d);
-    r.wday = static_cast<s32>(((days % 7) + 11) % 7); // 1970-01-01 was a Thursday
-    r.yday = static_cast<s32>(days - days_from_civil(y, 1, 1));
-    r.isdst = isdst;
-    return r;
-}
-
-// The seconds of a broken-down time (its fields normalized as mktime does), as if it were UTC.
-s64 from_tm(const Tm& t)
-{
-    s64 mon = t.mon, year = s64{t.year} + 1900;
-    year += mon / 12;
-    mon %= 12;
-    if (mon < 0) {
-        mon += 12;
-        year--;
-    }
-    const s64 days = days_from_civil(year, static_cast<u32>(mon) + 1, 1) + t.mday - 1;
-    return days * 86400 + s64{t.hour} * 3600 + s64{t.min} * 60 + t.sec;
+    t.year = year;
+    t.yday = days - start;
+    const s16* pm = sdk_leap(year) ? kLmos : kMos;
+    s32 mon = 12;
+    while (t.yday < pm[--mon]) {}
+    t.mon = mon;
+    t.mday = t.yday - pm[mon] + 1;
+    s64 rem = s - days64 * 86400;
+    const s64 hour = rem / 3600;
+    rem -= hour * 3600;
+    const s64 min = rem / 60;
+    t.hour = static_cast<s32>(hour);
+    t.min = static_cast<s32>(min);
+    t.sec = static_cast<s32>(rem - min * 60);
+    return t;
 }
 
 Tm read_tm(u8* b, u32 a)
@@ -115,10 +113,13 @@ void write_tm(u8* b, u32 a, const Tm& t)
     for (u32 i = 0; i < 9; i++) ps_write32(b, a + 4 * i, static_cast<u32>(f[i]));
 }
 
-// lv2's time zone and summer-time offsets, in seconds east of UTC.
+// lv2's time zone and summer-time offsets (sys_time_get_timezone, minutes east of UTC), in seconds; the SDK
+// multiplies the minutes in 32 bits.
 struct Zone {
     s64 offset = 0, summer = 0;
 };
+
+s64 minutes_to_seconds(u32 minutes) { return static_cast<s32>(minutes * 60u); }
 
 Zone zone(PPUContext& ctx)
 {
@@ -126,18 +127,24 @@ Zone zone(PPUContext& ctx)
     StackVar v(ctx, t.kernel.base(), 8);
     Zone z;
     if (lv2::sys_time_get_timezone(t, v.addr(), v.addr() + 4) == lv2::CELL_OK) {
-        z.offset = s64{static_cast<s32>(ps_read32(t.kernel.base(), v.addr()))} * 60;
-        z.summer = s64{static_cast<s32>(ps_read32(t.kernel.base(), v.addr() + 4))} * 60;
+        z.offset = minutes_to_seconds(ps_read32(t.kernel.base(), v.addr()));
+        z.summer = minutes_to_seconds(ps_read32(t.kernel.base(), v.addr() + 4));
     }
     return z;
 }
 
-s64 now(PPUContext& ctx)
+// time(): lv2's clock; -1 (stored too) when lv2 fails, as the SDK's.
+u64 time_(PPUContext& ctx, u32 out)
 {
     lv2::PpuThread& t = thread_of(ctx);
-    StackVar v(ctx, t.kernel.base(), 16);
-    if (lv2::sys_time_get_current_time(t, v.addr(), v.addr() + 8) != lv2::CELL_OK) return 0;
-    return static_cast<s64>(ps_read64(t.kernel.base(), v.addr()));
+    s64 now = -1;
+    {
+        StackVar v(ctx, t.kernel.base(), 16);
+        if (lv2::sys_time_get_current_time(t, v.addr(), v.addr() + 8) == lv2::CELL_OK)
+            now = static_cast<s64>(ps_read64(t.kernel.base(), v.addr()));
+    }
+    if (out && range_ok(ctx, "time", out, 8)) ps_write64(gb(ctx), out, static_cast<u64>(now));
+    return static_cast<u64>(now);
 }
 
 u32 tm_block(PPUContext& ctx)
@@ -147,13 +154,6 @@ u32 tm_block(PPUContext& ctx)
 }
 
 // ------------------------------------------------------------------------------------------------- time.h
-
-u64 time_(PPUContext& ctx, u32 out)
-{
-    const s64 t = now(ctx);
-    if (out && range_ok(ctx, "time", out, 8)) ps_write64(gb(ctx), out, static_cast<u64>(t));
-    return static_cast<u64>(t);
-}
 
 struct ClockState {
     std::mutex mutex;
@@ -185,69 +185,663 @@ u32 put_tm(PPUContext& ctx, const Tm& t)
     return out;
 }
 
+// gmtime: _Ttotm(NULL, *t, 0), the thread's struct tm.
 u32 gmtime_(PPUContext& ctx, u32 tp)
 {
     if (!tp || !range_ok(ctx, "gmtime", tp, 8)) return 0;
-    return put_tm(ctx, to_tm(static_cast<s64>(ps_read64(gb(ctx), tp)), 0));
+    return put_tm(ctx, ttotm(static_cast<s64>(ps_read64(gb(ctx), tp)), 0, 0));
 }
 
-Tm local(PPUContext& ctx, s64 t)
-{
-    const Zone z = zone(ctx);
-    return to_tm(t + z.offset + z.summer, z.summer ? 1 : 0);
-}
-
+// localtime: lv2's zone added, then _Ttotm with tm_isdst 1 while lv2 has a summer offset (which _Ttotm adds).
 u32 localtime_(PPUContext& ctx, u32 tp)
 {
     if (!tp || !range_ok(ctx, "localtime", tp, 8)) return 0;
-    return put_tm(ctx, local(ctx, static_cast<s64>(ps_read64(gb(ctx), tp))));
+    const Zone z = zone(ctx);
+    const s64 t = static_cast<s64>(ps_read64(gb(ctx), tp));
+    return put_tm(ctx, ttotm(static_cast<s64>(static_cast<u64>(t) + static_cast<u64>(z.offset)), z.summer ? 1 : 0,
+                            z.summer));
 }
 
-// mktime: the local time's seconds, its fields normalized (wday and yday set); tm_isdst > 0 takes the summer offset,
-// < 0 lv2's current choice.
+// mktime (no copy in the game's library to read): Plauger's arithmetic (the months folded into the years, the days
+// from the SDK's _Daysto) for the local time, lv2's zone taken off; tm_isdst > 0 takes the summer offset off too, < 0
+// lv2's current choice. The fields come back normalized as the SDK's _Ttotm breaks the local time down.
 u64 mktime_(PPUContext& ctx, u32 tp)
 {
     if (!tp || !range_ok(ctx, "mktime", tp, 36)) return ~u64{0};
     const Tm in = read_tm(gb(ctx), tp);
+    s64 ymon = in.mon / 12, mon = in.mon - ymon * 12;
+    if (mon < 0) {
+        mon += 12;
+        ymon--;
+    }
+    const s64 year = s64{in.year} + ymon;
+    if (year < std::numeric_limits<s32>::min() || year > std::numeric_limits<s32>::max()) return ~u64{0};
+    const double dsecs = 86400.0 * (daysto(static_cast<s32>(year), static_cast<s32>(mon)) - 1) +
+                         31536000.0 * static_cast<double>(year) + 86400.0 * in.mday + 3600.0 * in.hour +
+                         60.0 * in.min + static_cast<double>(in.sec);
+    if (!(dsecs > -9.0e18 && dsecs < 9.0e18)) return ~u64{0};
+    const s64 local = static_cast<s64>(dsecs) - kBias1900;
     const Zone z = zone(ctx);
     const bool dst = in.isdst > 0 || (in.isdst < 0 && z.summer);
-    const s64 t = from_tm(in) - z.offset - (dst ? z.summer : 0);
-    Tm out = to_tm(t + z.offset + (dst ? z.summer : 0), dst ? 1 : 0);
+    Tm out = ttotm(local, 0, 0);
+    out.isdst = dst ? 1 : 0;
     write_tm(gb(ctx), tp, out);
-    return static_cast<u64>(t);
+    return static_cast<u64>(local - z.offset - (dst ? z.summer : 0));
 }
 
-constexpr std::array<const char*, 7> kDays = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
-    "Saturday"};
-constexpr std::array<const char*, 12> kMonths = {"January", "February", "March", "April", "May", "June", "July",
-    "August", "September", "October", "November", "December"};
+// ------------------------------------------------------------------------------------------------- strftime
 
-std::string_view day_name(s32 d, bool full)
+// The library's constant strings in guest memory (made once): the formats _Gentime hands back for %D %F %R %T, %n,
+// %t and %%, the empty zone and era ("+:", the SDK's "no era"), asctime's "%c\n" and the "C" _Tinfo asctime formats
+// with whatever the locale.
+struct TimeConsts {
+    u32 percent = 0, newline = 0, tab = 0, mdy = 0, ymd = 0, hm = 0, hms = 0, colon = 0, no_era = 0, ctime_fmt = 0,
+        c_times = 0;
+};
+
+struct TimeState {
+    std::mutex mutex;
+    TimeConsts consts;
+};
+
+const TimeConsts* time_consts(PPUContext& ctx)
 {
-    if (d < 0 || d > 6) return "?";
-    const std::string_view n = kDays[static_cast<usize>(d)];
-    return full ? n : n.substr(0, 3);
+    TimeState& s = HleProcess::current()->state<TimeState>();
+    std::lock_guard l(s.mutex);
+    TimeConsts& c = s.consts;
+    if (!c.percent) {
+        const u32 a = HleProcess::current()->main_memory().alloc(0x200);
+        if (!a) return nullptr;
+        u8* b = gb(ctx);
+        u32 at = a + ti::kSize;
+        const auto put = [&](std::string_view text) {
+            const u32 p = at;
+            std::memcpy(b + at, text.data(), text.size());
+            b[at + text.size()] = 0;
+            at += static_cast<u32>(text.size()) + 1;
+            return p;
+        };
+        c.c_times = a;
+        at = lay_c_times(b, a, at);
+        c.newline = put("\n");
+        c.tab = put("\t");
+        c.mdy = put("%m/%d/%y");
+        c.ymd = put("%Y-%m-%d");
+        c.hm = put("%H:%M");
+        c.hms = put("%H:%M:%S");
+        c.colon = put(":");
+        c.no_era = put("+:");
+        c.ctime_fmt = put("%c\n");
+        c.percent = put("%");
+    }
+    return &c;
 }
 
-std::string_view month_name(s32 m, bool full)
+struct Field {
+    u32 ptr = 0;
+    s32 len = 0;
+};
+
+// A guest string whose reading failed stops the formatting (refused, logged).
+struct Unreadable {};
+
+std::string guest_text(PPUContext& ctx, u32 a)
 {
-    if (m < 0 || m > 11) return "?";
-    const std::string_view n = kMonths[static_cast<usize>(m)];
-    return full ? n : n.substr(0, 3);
+    const auto t = read_string(thread_of(ctx), a, kMaxString);
+    if (!t) {
+        refuse(ctx, std::format("strftime: the string at {:#x} runs out of guest memory", a));
+        throw Unreadable{};
+    }
+    return *t;
 }
 
-// asctime: C99's algorithm (7.23.3.1), "Sun Sep 16 01:03:52 1973\n", in the thread's 26 bytes.
+// _Gettime: field n of s, whose first character delimits its fields, and its length; n <= 0 is the first field, one
+// past the last is the empty string at the end.
+Field gettime(PPUContext& ctx, u32 s, s32 n)
+{
+    const std::string t = guest_text(ctx, s);
+    usize at = 0;
+    char delim = 0;
+    if (!t.empty()) {
+        delim = t[0];
+        at = 1;
+    }
+    for (;;) {
+        usize q = delim ? t.find(delim, at) : t.size();
+        const bool found = q != std::string::npos;
+        if (!found) q = t.size();
+        if (n <= 0) return {s + static_cast<u32>(at), static_cast<s32>(q - at)};
+        n--;
+        if (!found || q == t.size()) return {s + static_cast<u32>(q), 0};
+        at = q + 1;
+    }
+}
+
+// strtol(s, &end, 10) as the library's (errno ERANGE beyond a long).
+s32 strtol10(PPUContext& ctx, u32 s, u32* end)
+{
+    GuestBytes in(thread_of(ctx), s);
+    const IntParse p = parse_int([&](u64 i) -> s64 { return in.at(i); }, 10);
+    bool range = false;
+    const u64 v = int_result(p, 32, true, &range);
+    if (range) set_errno(ctx, kERANGE);
+    if (end) *end = s + static_cast<u32>(p.end);
+    return static_cast<s32>(static_cast<u32>(v));
+}
+
+u8 byte_at(PPUContext& ctx, u32 a)
+{
+    if (!guest_readable(thread_of(ctx), a, 1)) {
+        refuse(ctx, std::format("strftime: {:#x} is not guest memory", a));
+        throw Unreadable{};
+    }
+    return gb(ctx)[a];
+}
+
+u32 tin_field(PPUContext& ctx, u32 tin, u32 off) { return ps_read32(gb(ctx), tin + off); }
+
+// The SDK's number field: `val` (0 when negative) in n digits, its low ones, into buf; with the O modifier the
+// locale's alt_digits field of that number when it has one.
+Field getval(PPUContext& ctx, u32 buf, s32 val, s32 n, char qual, u32 tin)
+{
+    if (val < 0) val = 0;
+    if (qual == 'O') {
+        const Field f = gettime(ctx, tin_field(ctx, tin, ti::kAltDigits), val);
+        if (f.len > 0) return f;
+    }
+    u8* b = gb(ctx);
+    b[buf + static_cast<u32>(n)] = 0;
+    for (s32 i = n - 1; i >= 0; i--) {
+        b[buf + static_cast<u32>(i)] = static_cast<u8>('0' + val % 10);
+        val /= 10;
+    }
+    return {buf, n};
+}
+
+// The SDK's week arithmetic. Its leap-year test for these never answers true (its range tests on the year cannot
+// pass), so %V, %G and %g count every year as 365 days; kept as found.
+s32 week_leap(s32) { return 0; }
+
+// The week of the year counting from the first `first` day (0 Sunday, 1 Monday), the days before it week 0.
+s32 wkno(s32 first, s32 wday, s32 yday) { return (yday - (wday - first + 7) % 7 + 7) / 7; }
+
+// The ISO 8601 week: 1..53, 0 for a day of the previous year's last week, -1 for one of the next year's first.
+s32 isoweek(s32 year, s32 wday, s32 yday)
+{
+    const s32 leap = week_leap(year);
+    const s32 jan1 = (wday - yday + 371) % 7;
+    const s32 tail = yday - leap;
+    const s32 next_jan1 = (jan1 + leap + 365) % 7;
+    // The last days of the year in the next year's week 1: three of them when that year begins on a Thursday, two on
+    // a Wednesday, one on a Tuesday.
+    if (tail > 363) {
+        if (next_jan1 == 2 || next_jan1 == 3 || next_jan1 == 4) return -1;
+    } else if (tail > 362) {
+        if (next_jan1 == 3 || next_jan1 == 4) return -1;
+    } else if (tail > 361) {
+        if (next_jan1 == 4) return -1;
+    }
+    s32 w = wkno(1, wday, yday);
+    if (static_cast<u32>(jan1 - 2) <= 2) w++;
+    return w;
+}
+
+s32 isoyear(s32 year, s32 wday, s32 yday)
+{
+    const s32 w = isoweek(year, wday, yday);
+    return w == 0 ? year - 1 : w > 0 ? year : year + 1;
+}
+
+// -1, 0 or 1 as the date of t comes before, on or after "yyyy/mm/dd" at s; 2 when s is no date.
+s32 cmpdate(PPUContext& ctx, const Tm& t, u32 s)
+{
+    u32 e = 0;
+    const s32 y = strtol10(ctx, s, &e);
+    if (e == s || byte_at(ctx, e) != '/') return 2;
+    const s32 ty = t.year + 1900;
+    bool before = ty < y;
+    if (y == ty) {
+        const u32 s2 = e + 1;
+        const s32 m = strtol10(ctx, s2, &e);
+        if (e == s2 || byte_at(ctx, e) != '/') return 2;
+        before = t.mon + 1 < m;
+        if (m == t.mon + 1) {
+            const u32 s3 = e + 1;
+            const s32 d = strtol10(ctx, s3, &e);
+            if (e == s3) return 2;
+            before = t.mday < d;
+            if (d == t.mday) return 0;
+        }
+    }
+    return before ? -1 : 1;
+}
+
+// The era of t among the locale's era entries ("+:offset:start:end:name:format", '+' counting up from the start,
+// '-' down), or "+:" (none).
+u32 era_of(PPUContext& ctx, const Tm& t, u32 tin, const TimeConsts& c)
+{
+    const u32 eras = tin_field(ctx, tin, ti::kEra);
+    for (s32 i = 0;; i++) {
+        const u32 p = gettime(ctx, eras, i).ptr;
+        const u8 dir = byte_at(ctx, p);
+        if (dir == 0) return c.no_era;
+        const u32 q = p + 1;
+        const s32 c1 = cmpdate(ctx, t, gettime(ctx, q, 1).ptr);
+        bool in = false;
+        if (dir == '-') in = static_cast<u32>(c1 + 1) <= 1;
+        else if (dir == '+') in = static_cast<u32>(c1) <= 1;
+        if (!in) continue;
+        const u32 end = gettime(ctx, q, 2).ptr;
+        if (byte_at(ctx, end) == dir && byte_at(ctx, end + 1) == '*') return p;
+        const s32 c2 = cmpdate(ctx, t, end);
+        if (dir == '-' && static_cast<u32>(c2) <= 1) return p;
+        if (dir == '+' && static_cast<u32>(c2 + 1) <= 1) return p;
+    }
+}
+
+// Dinkumware's _Gentime with the SDK's choices: the text of one conversion (qual 'E', 'O' or 0, code its letter) for
+// t, from the _Tinfo at tin, in buf (32 bytes) or the locale's strings; a negative length is a format to expand. An
+// unknown conversion is its letter and a NUL.
+Field gentime(PPUContext& ctx, const Tm& t, u32 tin, char qual, char code, u32 buf, const TimeConsts& c)
+{
+    u8* b = gb(ctx);
+    const auto names = [&](u32 off, s32 n) { return gettime(ctx, tin_field(ctx, tin, off), n); };
+    const auto expand = [&](u32 off, u32 era_off, s32 n) {
+        Field f = gettime(ctx, tin_field(ctx, tin, qual == 'E' ? era_off : off), n);
+        f.len = -f.len;
+        return f;
+    };
+    const auto zone_text = [&]() {
+        const u32 z = tin_field(ctx, tin, ti::kTzone);
+        return byte_at(ctx, z) ? z : c.colon;
+    };
+    const auto year2 = [&](s32 y) {
+        s32 r = y % 100;
+        return r < 0 ? r + 100 : r;
+    };
+    switch (code) {
+    case 'a': return names(ti::kAbday, static_cast<s32>(static_cast<u32>(t.wday) * 2));
+    case 'A': return names(ti::kDay, static_cast<s32>(static_cast<u32>(t.wday) * 2 + 1));
+    case 'b':
+    case 'h': return names(ti::kAbmon, static_cast<s32>(static_cast<u32>(t.mon) * 2));
+    case 'B': return names(ti::kMon, static_cast<s32>(static_cast<u32>(t.mon) * 2 + 1));
+    case 'c': return expand(ti::kDTFmt, ti::kEraDTFmt, 0);
+    case 'x': return expand(ti::kDFmt, ti::kEraDFmt, 1);
+    case 'X': return expand(ti::kTFmt, ti::kEraTFmt, 2);
+    case 'r': return expand(ti::kTFmtAmpm, ti::kEraTFmtAmpm, 3);
+    case 'C':
+        if (qual == 'E') {
+            const Field f = gettime(ctx, era_of(ctx, t, tin, c) + 1, 3);
+            if (byte_at(ctx, f.ptr)) return f;
+        }
+        return getval(ctx, buf, t.year / 100 + 19, 2, qual, tin);
+    case 'd': return getval(ctx, buf, t.mday, 2, qual, tin);
+    case 'e': {
+        const Field f = getval(ctx, buf, t.mday, 2, qual, tin);
+        if (b[buf] == '0') b[buf] = ' ';
+        return f;
+    }
+    case 'D': return {c.mdy, -8};
+    case 'F': return {c.ymd, -8};
+    case 'R': return {c.hm, -5};
+    case 'T': return {c.hms, -8};
+    case 'n': return {c.newline, 1};
+    case 't': return {c.tab, 1};
+    case '%': return {c.percent, 1};
+    case 'g': return getval(ctx, buf, year2(isoyear(t.year, t.wday, t.yday)), 2, qual, tin);
+    case 'G': return getval(ctx, buf, isoyear(t.year, t.wday, t.yday) + 1900, 4, qual, tin);
+    case 'H': return getval(ctx, buf, t.hour, 2, qual, tin);
+    case 'I': return getval(ctx, buf, (t.hour + 11) % 12 + 1, 2, qual, tin);
+    case 'j': return getval(ctx, buf, t.yday + 1, 3, qual, tin);
+    case 'm': return getval(ctx, buf, t.mon + 1, 2, qual, tin);
+    case 'M': return getval(ctx, buf, t.min, 2, qual, tin);
+    case 'S': return getval(ctx, buf, t.sec, 2, qual, tin);
+    case 'p': return names(ti::kAmPm, t.hour > 11 ? 1 : 0);
+    case 'u': return getval(ctx, buf, t.wday == 0 ? 7 : t.wday, 1, qual, tin);
+    case 'w': return getval(ctx, buf, t.wday, 1, qual, tin);
+    case 'U': return getval(ctx, buf, wkno(0, t.wday, t.yday), 2, qual, tin);
+    case 'W': return getval(ctx, buf, wkno(1, t.wday, t.yday), 2, qual, tin);
+    case 'V': {
+        s32 w = isoweek(t.year, t.wday, t.yday);
+        if (w == 0) w = isoweek(t.year - 1, t.wday - t.yday + 7, week_leap(t.year - 1) ? 366 : 365);
+        else if (w < 0) w = 1;
+        return getval(ctx, buf, w, 2, qual, tin);
+    }
+    case 'y': {
+        const s32 yy = year2(t.year);
+        if (qual == 'E') {
+            const u32 era = era_of(ctx, t, tin, c);
+            if (byte_at(ctx, era + 2)) {
+                const s32 y0 = strtol10(ctx, gettime(ctx, era + 1, 1).ptr, nullptr);
+                s32 years = t.year - y0 + 1900;
+                if (byte_at(ctx, era) == '-') years = -years;
+                u32 end = 0;
+                const s32 offset = strtol10(ctx, era + 2, &end);
+                if (end != era + 2 && byte_at(ctx, end) == byte_at(ctx, era + 1)) {
+                    const s32 v = years + offset;
+                    s32 digits = 1;
+                    for (s32 q = v / 10; q > 0; q /= 10) digits++;
+                    return getval(ctx, buf, v, digits, qual, tin);
+                }
+            }
+        }
+        return getval(ctx, buf, yy, 2, qual, tin);
+    }
+    case 'Y':
+        if (qual == 'E') {
+            Field f = gettime(ctx, era_of(ctx, t, tin, c) + 1, 4);
+            if (byte_at(ctx, f.ptr) != ';' && f.len != 0) {
+                const std::string rest = guest_text(ctx, f.ptr);
+                if (const usize semi = rest.find(';'); semi != std::string::npos) f.len = static_cast<s32>(semi);
+                f.len = -f.len;
+                return f;
+            }
+        }
+        return getval(ctx, buf, t.year + 1900, 4, qual, tin);
+    case 'Z': return gettime(ctx, zone_text(), t.isdst > 0 ? 1 : 0);
+    case 'z': {
+        const Field f = gettime(ctx, zone_text(), 2);
+        if (f.len <= 0 || t.isdst <= 0) return f;
+        s32 v = strtol10(ctx, f.ptr, nullptr) + 100;
+        b[buf] = '+';
+        if (v < 0) {
+            b[buf] = '-';
+            v = -v;
+        }
+        Field r = getval(ctx, buf + 1, v, 4, qual, tin);
+        r.ptr -= 1;
+        r.len += 1;
+        return r;
+    }
+    default:
+        b[buf] = static_cast<u8>(code);
+        b[buf + 1] = 0;
+        return {buf, 2};
+    }
+}
+
+// The conversion's letter at `p` (after a '%'), with an E or O modifier.
+struct Conversion {
+    char qual = 0, code = 0;
+    u32 taken = 1;
+};
+
+// Dinkumware's _CStrftime: fmt (len bytes) formatted for t from the _Tinfo at tin, the pieces that fit appended to
+// out; false when the text (and its NUL) does not fit in max. The format is read as multibyte characters (the thread's
+// state tables; a byte that is no character stands for itself) and a '%' with something after it starts a conversion;
+// a conversion that is a format (%c %x %X %r %D %F %R %T, the era's %EY) is expanded in place, three deep at most (the
+// rest of a format whose expansion finds no room is dropped, as the SDK's does).
+bool cstrftime_run(PPUContext& ctx, std::string& out, u32 max, u32 fmt, const Tm& t, u32 tin, u32 buf)
+{
+    const TimeConsts* c = time_consts(ctx);
+    if (!c) return false;
+    struct Src {
+        u32 p = 0, len = 0;
+    };
+    Src cur{fmt, static_cast<u32>(guest_text(ctx, fmt).size())};
+    Src stack[3];
+    u32 depth = 0;
+    MbState st;
+    u32 wc = 0, room = max, expansions = 0;
+    const u32 tables = mb_tables(ctx);
+    lv2::PpuThread& th = thread_of(ctx);
+    while (cur.len || depth) {
+        if (!cur.len) cur = stack[--depth];
+        GuestBytes bytes(th, cur.p);
+        bool unreadable = false;
+        const MbStep r = mbtowc_step(ctx, [&](u64 i) { return bytes.at(i); }, cur.len, st, tables, &unreadable);
+        if (unreadable) {
+            refuse(ctx, std::format("strftime: the format at {:#x} runs out of guest memory", cur.p));
+            throw Unreadable{};
+        }
+        if (r.have) wc = r.wc;
+        u32 m = r.result;
+        if (static_cast<s32>(m) <= 0) m = byte_at(ctx, cur.p) ? 1 : 0;
+        if (m == 0) {
+            cur.len = 0; // a NUL inside a counted format (only after a modifier that ended it): nothing more
+            continue;
+        }
+        cur.p += m;
+        cur.len -= m;
+        if (wc == '%' && cur.len != 0) {
+            char qual = 0, code = static_cast<char>(byte_at(ctx, cur.p));
+            if (code == 'E' || code == 'O') {
+                qual = code;
+                code = static_cast<char>(byte_at(ctx, cur.p + 1));
+                cur.p += 2;
+                cur.len = cur.len >= 2 ? cur.len - 2 : 0; // the SDK's reads on past the end of the format here
+            } else {
+                cur.p += 1;
+                cur.len -= 1;
+            }
+            const Field f = gentime(ctx, t, tin, qual, code, buf, *c);
+            if (f.len > 0) {
+                const u32 n = static_cast<u32>(f.len);
+                if (room < n) return false;
+                if (!guest_readable(th, f.ptr, n)) {
+                    refuse(ctx, std::format("strftime: [{:#x}, +{:#x}) is not guest memory", f.ptr, n));
+                    throw Unreadable{};
+                }
+                out.append(reinterpret_cast<const char*>(gb(ctx) + f.ptr), n);
+                room -= n;
+            } else {
+                // A locale whose formats expand into themselves (an era format "%EY") makes the SDK's loop for ever.
+                if (++expansions > 100000) {
+                    refuse(ctx, "strftime: the locale's formats expand without end (the SDK's would loop for ever)");
+                    throw Unreadable{};
+                }
+                if (cur.len != 0 && depth <= 2) stack[depth++] = cur;
+                cur = {f.ptr, static_cast<u32>(-f.len)};
+            }
+        } else {
+            if (room < m) return false;
+            if (!guest_readable(th, cur.p - m, m)) throw Unreadable{};
+            out.append(reinterpret_cast<const char*>(gb(ctx) + cur.p - m), m);
+            room -= m;
+        }
+    }
+    return room != 0;
+}
+
+// _CStrftime(char *s, size_t max, const char *fmt, const struct tm *t, const _Tinfo *tin): the length of the text, or
+// 0 when it and its NUL do not fit (the pieces that did are left in s, as the SDK's leaves them).
+u32 cstrftime(PPUContext& ctx, u32 s, u32 max, u32 fmt, u32 tp, u32 tin)
+{
+    if (!range_ok(ctx, "strftime", tp, 36) || !range_ok(ctx, "strftime", tin, ti::kSize)) return 0;
+    StackVar buf(ctx, gb(ctx), 32);
+    std::string out;
+    bool fits = false;
+    try {
+        fits = cstrftime_run(ctx, out, max, fmt, read_tm(gb(ctx), tp), tin, buf.addr());
+    } catch (const Unreadable&) {
+        return 0;
+    }
+    if (!range_ok(ctx, "strftime", s, out.size() + (fits ? 1 : 0))) return 0;
+    std::memcpy(gb(ctx) + s, out.data(), out.size());
+    if (!fits) return 0;
+    gb(ctx)[s + out.size()] = 0;
+    return static_cast<u32>(out.size());
+}
+
+u32 times_var(PPUContext&) { return variable(recomp::nid_of("_Times")); }
+
+u32 _CStrftime_(PPUContext& ctx, u32 s, u32 max, u32 fmt, u32 tp, u32 tin) { return cstrftime(ctx, s, max, fmt, tp, tin); }
+u32 strftime_(PPUContext& ctx, u32 s, u32 max, u32 fmt, u32 tp) { return cstrftime(ctx, s, max, fmt, tp, times_var(ctx)); }
+
+// _Gentime(const struct tm *t, const _Tinfo *tin, char qual, char code, int *plen, char *buf): the conversion's text
+// (in buf or the locale's strings) and its length in *plen, negative for a format to expand.
+u32 _Gentime_(PPUContext& ctx, u32 tp, u32 tin, s32 qual, s32 code, u32 plen, u32 buf)
+{
+    const TimeConsts* c = time_consts(ctx);
+    if (!c || !range_ok(ctx, "_Gentime", tp, 36) || !range_ok(ctx, "_Gentime", tin, ti::kSize) ||
+        !range_ok(ctx, "_Gentime", plen, 4) || !range_ok(ctx, "_Gentime", buf, 12))
+        return 0;
+    try {
+        const Field f = gentime(ctx, read_tm(gb(ctx), tp), tin, static_cast<char>(qual), static_cast<char>(code), buf, *c);
+        ps_write32(gb(ctx), plen, static_cast<u32>(f.len));
+        return f.ptr;
+    } catch (const Unreadable&) {
+        return 0;
+    }
+}
+
+// _Gettime(const char *s, int n, int *len).
+u32 _Gettime_(PPUContext& ctx, u32 s, s32 n, u32 len)
+{
+    if (!range_ok(ctx, "_Gettime", len, 4)) return 0;
+    try {
+        const Field f = gettime(ctx, s, n);
+        ps_write32(gb(ctx), len, static_cast<u32>(f.len));
+        return f.ptr;
+    } catch (const Unreadable&) {
+        return 0;
+    }
+}
+
+// _Getptimes: the current locale's _Tinfo, the variable _Times.
+u32 _Getptimes_(PPUContext& ctx) { return times_var(ctx); }
+
+// _Wcsftime(wchar_t *s, size_t max, const wchar_t *fmt, const struct tm *t, const _Tinfo *tin) has no copy in the
+// game's library (its C++ library formats through strftime): derived from _CStrftime with sys_libc's 32-bit wchar_t.
+// The wide format's characters are taken one by one ('%' and a modifier and letter, the letter's low byte, as the
+// narrow conversion takes a char); a conversion's narrow text and the formats it expands are read as multibyte
+// characters (a byte that is none stands for itself, a NUL inside a text is a NUL character) and delivered as wide
+// characters.
+bool wcsftime_run(PPUContext& ctx, std::u32string& out, u32 max, u32 fmt, const Tm& t, u32 tin, u32 buf)
+{
+    const TimeConsts* c = time_consts(ctx);
+    if (!c) return false;
+    const auto f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
+    if (!f) {
+        refuse(ctx, std::format("wcsftime: the format at {:#x} runs out of guest memory", fmt));
+        throw Unreadable{};
+    }
+    struct Src {
+        u32 p = 0, len = 0;
+    };
+    u32 room = max, expansions = 0;
+    const u32 tables = mb_tables(ctx);
+    lv2::PpuThread& th = thread_of(ctx);
+    const auto put = [&](char32_t w) {
+        if (room == 0) return false;
+        out += w;
+        room--;
+        return true;
+    };
+    // The narrow text [p, p + n) delivered as wide characters.
+    const auto widen = [&](u32 p, u32 n) {
+        MbState st;
+        while (n) {
+            GuestBytes bytes(th, p);
+            bool unreadable = false;
+            const MbStep r = mbtowc_step(ctx, [&](u64 i) { return bytes.at(i); }, n, st, tables, &unreadable);
+            if (unreadable) throw Unreadable{};
+            u32 m = r.result;
+            char32_t w = r.wc;
+            if (static_cast<s32>(m) <= 0 || !r.have) {
+                w = byte_at(ctx, p);
+                m = 1;
+            }
+            if (!put(w)) return false;
+            p += m;
+            n -= m;
+        }
+        return true;
+    };
+    // A narrow format expanded (as _CStrftime does, three deep).
+    const auto narrow = [&](auto&& self, u32 p, u32 n, u32 depth) -> bool {
+        MbState st;
+        u32 wc = 0;
+        while (n) {
+            GuestBytes bytes(th, p);
+            bool unreadable = false;
+            const MbStep r = mbtowc_step(ctx, [&](u64 i) { return bytes.at(i); }, n, st, tables, &unreadable);
+            if (unreadable) throw Unreadable{};
+            if (r.have) wc = r.wc;
+            u32 m = r.result;
+            if (static_cast<s32>(m) <= 0) m = byte_at(ctx, p) ? 1 : 0;
+            if (m == 0) break;
+            p += m;
+            n -= m;
+            if (wc == '%' && n != 0) {
+                char qual = 0, code = static_cast<char>(byte_at(ctx, p));
+                if (code == 'E' || code == 'O') {
+                    qual = code;
+                    code = static_cast<char>(byte_at(ctx, p + 1));
+                    p += 2;
+                    n = n >= 2 ? n - 2 : 0;
+                } else {
+                    p++;
+                    n--;
+                }
+                const Field g = gentime(ctx, t, tin, qual, code, buf, *c);
+                if (g.len > 0) {
+                    if (!widen(g.ptr, static_cast<u32>(g.len))) return false;
+                } else if (depth < 3) {
+                    if (!self(self, g.ptr, static_cast<u32>(-g.len), depth + 1)) return false;
+                } else {
+                    if (++expansions > 100000) {
+                        refuse(ctx, "wcsftime: the locale's formats expand without end");
+                        throw Unreadable{};
+                    }
+                    p = g.ptr;
+                    n = static_cast<u32>(-g.len);
+                }
+            } else if (!widen(p - m, m)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    for (usize i = 0; i < f->size(); i++) {
+        const char32_t w = (*f)[i];
+        if (w != U'%' || i + 1 >= f->size()) {
+            if (!put(w)) return false;
+            continue;
+        }
+        char qual = 0, code = static_cast<char>((*f)[++i]);
+        if (code == 'E' || code == 'O') {
+            qual = code;
+            code = i + 1 < f->size() ? static_cast<char>((*f)[++i]) : 0;
+        }
+        const Field g = gentime(ctx, t, tin, qual, code, buf, *c);
+        if (g.len > 0) {
+            if (!widen(g.ptr, static_cast<u32>(g.len))) return false;
+        } else if (!narrow(narrow, g.ptr, static_cast<u32>(-g.len), 1)) {
+            return false;
+        }
+    }
+    return room != 0;
+}
+
+u32 wcsftime_common(PPUContext& ctx, u32 s, u32 max, u32 fmt, u32 tp, u32 tin)
+{
+    if (!range_ok(ctx, "wcsftime", tp, 36) || !range_ok(ctx, "wcsftime", tin, ti::kSize)) return 0;
+    StackVar buf(ctx, gb(ctx), 32);
+    std::u32string out;
+    bool fits = false;
+    try {
+        fits = wcsftime_run(ctx, out, max, fmt, read_tm(gb(ctx), tp), tin, buf.addr());
+    } catch (const Unreadable&) {
+        return 0;
+    }
+    if (!write_wstring(thread_of(ctx), s, out, fits)) {
+        refuse(ctx, std::format("wcsftime: the array at {:#x} is not guest memory", s));
+        return 0;
+    }
+    return fits ? static_cast<u32>(out.size()) : 0;
+}
+
+u32 _Wcsftime_(PPUContext& ctx, u32 s, u32 max, u32 fmt, u32 tp, u32 tin) { return wcsftime_common(ctx, s, max, fmt, tp, tin); }
+u32 wcsftime_(PPUContext& ctx, u32 s, u32 max, u32 fmt, u32 tp) { return wcsftime_common(ctx, s, max, fmt, tp, times_var(ctx)); }
+
+// asctime: _CStrftime(the thread's 26 bytes, 26, "%c\n", t, the "C" _Tinfo), the buffer answered whatever it gave.
 u32 asctime_(PPUContext& ctx, u32 tp)
 {
-    if (!tp || !range_ok(ctx, "asctime", tp, 36)) return 0;
-    const Tm t = read_tm(gb(ctx), tp);
-    const std::string s = std::format("{:.3} {:.3}{:3} {:02}:{:02}:{:02} {}\n", day_name(t.wday, false),
-        month_name(t.mon, false), t.mday, t.hour, t.min, t.sec, s64{t.year} + 1900);
+    const TimeConsts* c = time_consts(ctx);
     const u32 b = thread_block(ctx);
-    if (!b) return 0;
-    const usize n = std::min<usize>(s.size(), 25);
-    std::memcpy(gb(ctx) + b + tb::kAsctime, s.data(), n);
-    gb(ctx)[b + tb::kAsctime + n] = 0;
+    if (!c || !b || !tp) return 0;
+    cstrftime(ctx, b + tb::kAsctime, 26, c->ctime_fmt, tp, c->c_times);
     return b + tb::kAsctime;
 }
 
@@ -257,193 +851,135 @@ u32 ctime_(PPUContext& ctx, u32 tp)
     return t ? asctime_(ctx, t) : 0;
 }
 
-// ISO 8601 week-based year and week of a broken-down time.
-void iso_week(const Tm& t, s64& year, s32& week)
-{
-    year = s64{t.year} + 1900;
-    const s32 wday = (t.wday + 6) % 7; // Monday 0
-    s32 w = (t.yday - wday + 10) / 7;
-    if (w < 1) {
-        year--;
-        const s32 days = leap(year) ? 366 : 365;
-        w = (t.yday + days - wday + 10) / 7;
-    } else if (w == 53) {
-        const s32 days = leap(year) ? 366 : 365;
-        if (t.yday - wday + 3 >= days) {
-            year++;
-            w = 1;
-        }
-    }
-    week = w;
-}
+// Dinkumware's time internals.
+s32 _Daysto_(PPUContext&, s32 year, s32 mon) { return daysto(year, mon); }
 
-// strftime's text of `fmt` for `t` (C99 7.23.3.5 in the "C" locale).
-template <class C>
-std::basic_string<C> strftime_text(std::basic_string_view<C> fmt, const Tm& t, const Zone& z)
-{
-    std::basic_string<C> out;
-    const auto put = [&](std::string_view s) {
-        for (const char c : s) out += static_cast<C>(static_cast<u8>(c));
-    };
-    for (usize i = 0; i < fmt.size(); i++) {
-        if (fmt[i] != '%' || i + 1 >= fmt.size()) {
-            out += fmt[i];
-            continue;
-        }
-        C c = fmt[++i];
-        if ((c == 'E' || c == 'O') && i + 1 < fmt.size()) c = fmt[++i]; // the "C" locale's alternatives are the same
-        const s64 year = s64{t.year} + 1900;
-        switch (c) {
-        case 'a': put(day_name(t.wday, false)); break;
-        case 'A': put(day_name(t.wday, true)); break;
-        case 'b':
-        case 'h': put(month_name(t.mon, false)); break;
-        case 'B': put(month_name(t.mon, true)); break;
-        case 'c':
-            put(std::format("{} {} {:2} {:02}:{:02}:{:02} {}", day_name(t.wday, false), month_name(t.mon, false),
-                t.mday, t.hour, t.min, t.sec, year));
-            break;
-        case 'C': put(std::format("{:02}", year / 100)); break;
-        case 'd': put(std::format("{:02}", t.mday)); break;
-        case 'D':
-        case 'x': put(std::format("{:02}/{:02}/{:02}", t.mon + 1, t.mday, ((year % 100) + 100) % 100)); break;
-        case 'e': put(std::format("{:2}", t.mday)); break;
-        case 'F': put(std::format("{}-{:02}-{:02}", year, t.mon + 1, t.mday)); break;
-        case 'g':
-        case 'G': {
-            s64 y;
-            s32 w;
-            iso_week(t, y, w);
-            put(c == 'g' ? std::format("{:02}", ((y % 100) + 100) % 100) : std::format("{}", y));
-            break;
-        }
-        case 'H': put(std::format("{:02}", t.hour)); break;
-        case 'I': put(std::format("{:02}", t.hour % 12 ? t.hour % 12 : 12)); break;
-        case 'j': put(std::format("{:03}", t.yday + 1)); break;
-        case 'm': put(std::format("{:02}", t.mon + 1)); break;
-        case 'M': put(std::format("{:02}", t.min)); break;
-        case 'n': out += static_cast<C>('\n'); break;
-        case 'p': put(t.hour < 12 ? "AM" : "PM"); break;
-        case 'r':
-            put(std::format("{:02}:{:02}:{:02} {}", t.hour % 12 ? t.hour % 12 : 12, t.min, t.sec,
-                t.hour < 12 ? "AM" : "PM"));
-            break;
-        case 'R': put(std::format("{:02}:{:02}", t.hour, t.min)); break;
-        case 'S': put(std::format("{:02}", t.sec)); break;
-        case 't': out += static_cast<C>('\t'); break;
-        case 'T':
-        case 'X': put(std::format("{:02}:{:02}:{:02}", t.hour, t.min, t.sec)); break;
-        case 'u': put(std::format("{}", t.wday ? t.wday : 7)); break;
-        case 'U': put(std::format("{:02}", (t.yday + 7 - t.wday) / 7)); break;
-        case 'V': {
-            s64 y;
-            s32 w;
-            iso_week(t, y, w);
-            put(std::format("{:02}", w));
-            break;
-        }
-        case 'w': put(std::format("{}", t.wday)); break;
-        case 'W': put(std::format("{:02}", (t.yday + 7 - (t.wday + 6) % 7) / 7)); break;
-        case 'y': put(std::format("{:02}", ((year % 100) + 100) % 100)); break;
-        case 'Y': put(std::format("{}", year)); break;
-        case 'z': {
-            const s64 off = (z.offset + (t.isdst > 0 ? z.summer : 0)) / 60;
-            put(std::format("{}{:02}{:02}", off < 0 ? '-' : '+', std::abs(off) / 60, std::abs(off) % 60));
-            break;
-        }
-        case 'Z': break; // no zone names
-        case '%': out += static_cast<C>('%'); break;
-        default:
-            out += static_cast<C>('%');
-            out += c;
-            break;
-        }
-    }
-    return out;
-}
-
-// strftime: the text and a NUL when they fit in max, its length; else 0 (the array's contents indeterminate).
-u32 strftime_(PPUContext& ctx, u32 s, u32 max, u32 fmt, u32 tp)
-{
-    const auto f = read_string(thread_of(ctx), fmt);
-    if (!f || !tp || !range_ok(ctx, "strftime", tp, 36)) {
-        if (!f) refuse(ctx, std::format("strftime: the format at {:#x} runs out of guest memory", fmt));
-        return 0;
-    }
-    const std::string text = strftime_text<char>(*f, read_tm(gb(ctx), tp), zone(ctx));
-    if (text.size() + 1 > max || !range_ok(ctx, "strftime", s, text.size() + 1)) return 0;
-    write_string(thread_of(ctx), s, text);
-    return static_cast<u32>(text.size());
-}
-
-u32 wcsftime_(PPUContext& ctx, u32 s, u32 max, u32 fmt, u32 tp)
-{
-    const auto f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
-    if (!f || !tp || !range_ok(ctx, "wcsftime", tp, 36)) {
-        if (!f) refuse(ctx, std::format("wcsftime: the format at {:#x} runs out of guest memory", fmt));
-        return 0;
-    }
-    const std::u32string text = strftime_text<char32_t>(*f, read_tm(gb(ctx), tp), zone(ctx));
-    if (text.size() + 1 > max || !range_ok(ctx, "wcsftime", s, 4 * (text.size() + 1))) return 0;
-    write_wstring(thread_of(ctx), s, text);
-    return static_cast<u32>(text.size());
-}
-
-// Dinkumware's time internals (Plauger's xttotm.c, xgettime.c, xisdst.c).
-// int _Daysto(int year, int mon): the leap days from 1900 to `year` (years since 1900) and the days before month
-// `mon` in it.
-s32 _Daysto_(PPUContext&, s32 year, s32 mon)
-{
-    static constexpr s16 kMos[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
-    static constexpr s16 kLmos[] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
-    s32 days;
-    if (0 < year) days = (year - 1) / 4;
-    else if (year <= -4) days = 1 + (4 - year) / 4;
-    else days = 0;
-    const s16* tab = ((year & 3) || year == 0) ? kMos : kLmos;
-    return days + (mon >= 0 && mon < 12 ? tab[mon] : 0);
-}
-
-// struct tm *_Ttotm(struct tm *t, time_t secs, int isdst): the broken-down UTC time of secs (the thread's tm when t
-// is NULL); isdst < 0 takes lv2's summer time, > 0 adds its offset.
+// struct tm *_Ttotm(struct tm *t, time_t secs, int isdst): the SDK's (above); the thread's tm when t is NULL.
 u32 _Ttotm_(PPUContext& ctx, u32 tp, u64 secs, s32 isdst)
 {
-    const Zone z = zone(ctx);
-    if (isdst < 0) isdst = z.summer ? 1 : 0;
-    const Tm t = to_tm(static_cast<s64>(secs) + (isdst > 0 ? (z.summer ? z.summer : 3600) : 0), isdst);
     const u32 out = tp ? tp : tm_block(ctx);
     if (!out || !range_ok(ctx, "_Ttotm", out, 36)) return 0;
-    write_tm(gb(ctx), out, t);
+    write_tm(gb(ctx), out, ttotm(static_cast<s64>(secs), isdst, isdst ? zone(ctx).summer : 0));
     return out;
 }
 
-// int _Isdst(const struct tm *t): lv2's summer time.
-s32 _Isdst_(PPUContext& ctx, u32) { return zone(ctx).summer ? 1 : 0; }
-
-// const char *_Gettime(const char *s, int n, int *len): field n of s, whose first character delimits its fields
-// (":Sun:Sunday:..."), and its length.
-u32 _Gettime_(PPUContext& ctx, u32 s, s32 n, u32 len)
+// Dinkumware's summer-time rules (Plauger's xgetdst.c, the SDK's library has no copy: its localtime asks lv2):
+// "<delim>[(yyyy)]mmdd[hh][+w|-w]<delim>..." in Dstrule records of five bytes {wday, hour, day, mon, year}, malloc'd,
+// a wday of 255 ending them (its year the last rule's). wday 0 is the date itself; "+w" the first weekday w (0 Sunday)
+// on or after it (w + 7, Sunday 14), "-w" the last one before it (w, Sunday 7).
+u32 getdst(PPUContext& ctx, const std::string& s)
 {
-    const auto text = read_string(thread_of(ctx), s);
-    if (!text || !range_ok(ctx, "_Gettime", len, 4)) return 0;
-    usize at = 0;
-    const char delim = text->empty() ? '\0' : (*text)[at++];
-    for (;; --n) {
-        usize end = delim ? text->find(delim, at) : std::string::npos;
-        if (end == std::string::npos) end = text->size();
-        if (n <= 0) {
-            ps_write32(gb(ctx), len, static_cast<u32>(end - at));
-            return s + static_cast<u32>(at);
+    if (s.empty()) return 0;
+    const char delim = s[0];
+    usize i = 1;
+    u32 count = 2;
+    for (usize k = 1; (k = s.find(delim, k)) != std::string::npos; k++) count++;
+    const u32 rules = lib_malloc(ctx, 5 * count);
+    if (!rules) return 0;
+    u8* b = gb(ctx);
+    const auto getint = [&](usize at, s32 n) {
+        s32 value = 0;
+        for (; 0 <= --n && at < s.size() && s[at] >= '0' && s[at] <= '9'; at++) value = value * 10 + s[at] - '0';
+        return 0 <= n ? -1 : value;
+    };
+    const auto ch = [&](usize at) { return at < s.size() ? s[at] : '\0'; };
+    s32 year = 0;
+    for (u32 r = rules;; r += 5, i++) {
+        if (ch(i) == '(') {
+            year = getint(i + 1, 4) - 1900;
+            if (year < 0 || ch(i + 5) != ')') break;
+            i += 6;
         }
-        if (end >= text->size()) {
-            ps_write32(gb(ctx), len, 1);
-            return s + static_cast<u32>(end);
+        const s32 mon = getint(i, 2) - 1;
+        const s32 day = getint(i + 2, 2) - 1;
+        i += 4;
+        s32 hour = 0;
+        if (ch(i) >= '0' && ch(i) <= '9') {
+            hour = getint(i, 2);
+            i += 2;
         }
-        at = end + 1;
+        if (mon < 0 || 12 <= mon || day < 0 || 99 < day || hour < 0 || 99 < hour) break;
+        s32 wday = 0;
+        if (ch(i) == '+' || ch(i) == '-') {
+            if (ch(i + 1) < '0' || '6' < ch(i + 1)) break;
+            wday = ch(i + 1) == '0' ? 7 : ch(i + 1) - '0';
+            if (ch(i) == '+') wday += 7;
+            i += 2;
+        }
+        b[r] = static_cast<u8>(wday);
+        b[r + 1] = static_cast<u8>(hour);
+        b[r + 2] = static_cast<u8>(day);
+        b[r + 3] = static_cast<u8>(mon);
+        b[r + 4] = static_cast<u8>(year);
+        if (ch(i) == '\0') {
+            b[r + 5] = 0xFF;
+            b[r + 9] = static_cast<u8>(year);
+            return rules;
+        }
+        if (ch(i) != delim) break;
     }
+    lib_free(ctx, rules, "_Getdst");
+    return 0;
 }
 
-// ------------------------------------------------------------------------------------------------- locale
+u32 _Getdst_(PPUContext& ctx, u32 s)
+{
+    const auto t = read_string(thread_of(ctx), s);
+    if (!t) {
+        refuse(ctx, std::format("_Getdst: the rules at {:#x} run out of guest memory", s));
+        return 0;
+    }
+    return getdst(ctx, *t);
+}
+
+// int _Isdst(const struct tm *t): Plauger's xisdst.c over the current locale's dst_rules (or, when empty, the fourth
+// field of its time_zone); with no rules (the "C" locale), lv2's summer time as the SDK's localtime has it.
+s32 _Isdst_(PPUContext& ctx, u32 tp)
+{
+    if (!range_ok(ctx, "_Isdst", tp, 36)) return -1;
+    const Tm t = read_tm(gb(ctx), tp);
+    const u32 tin = times_var(ctx);
+    std::string rules;
+    if (tin) {
+        if (const auto r = read_string(thread_of(ctx), tin_field(ctx, tin, ti::kDstRules))) rules = *r;
+        if (rules.empty()) {
+            const u32 z = tin_field(ctx, tin, ti::kTzone);
+            if (const auto zt = read_string(thread_of(ctx), z); zt && !zt->empty()) {
+                try {
+                    const Field f = gettime(ctx, z, 3);
+                    if (byte_at(ctx, f.ptr)) {
+                        if (const auto rest = read_string(thread_of(ctx), f.ptr - 1)) rules = *rest;
+                    }
+                } catch (const Unreadable&) {
+                    rules.clear();
+                }
+            }
+        }
+    }
+    if (rules.empty()) return zone(ctx).summer ? 1 : 0;
+    const u32 pr0 = getdst(ctx, rules);
+    if (!pr0) return -1;
+    const u8* b = gb(ctx);
+    const s32 d0 = daysto(t.year, 0);
+    const s32 hour = t.hour + 24 * t.yday;
+    const s32 wd0 = static_cast<s32>((365 * s64{t.year} + d0 + 1) % 7) + 14;
+    s32 ans = 0;
+    for (u32 pr = pr0; b[pr] != 0xFF; pr += 5) {
+        if (b[pr + 4] > t.year) continue;
+        s32 rday = daysto(t.year, b[pr + 3]) - d0 + b[pr + 2];
+        if (0 < b[pr]) {
+            const s32 wd = (rday + wd0 - b[pr]) % 7;
+            rday += wd == 0 ? 0 : 7 - wd;
+            if (b[pr] <= 7) rday -= 7;
+        }
+        if (hour < rday * 24 + b[pr + 1]) break;
+        ans = b[pr + 4] == b[pr + 9] ? !ans : 0;
+    }
+    lib_free(ctx, pr0, "_Isdst");
+    return ans;
+}
+
+// ------------------------------------------------------------------------------------------------- ctype tables
 
 // Dinkumware's C99 class bits.
 constexpr u16 kXB = 0x400, kXD = 0x01, kUP = 0x02, kSP = 0x04, kPU = 0x08, kLO = 0x10, kDI = 0x20, kCN = 0x40,
@@ -452,8 +988,8 @@ constexpr u16 kXB = 0x400, kXD = 0x01, kUP = 0x02, kSP = 0x04, kPU = 0x08, kLO =
 u16 dinkum_class(s32 c)
 {
     if (c < 0 || c > 127) return 0;
-    if (c == '\t') return kCN | kXB;
-    if (c >= '\n' && c <= '\r') return kCN;
+    if (c == '\t') return kCN | kBB | kXB; // the SDK's table marks the space controls with both bits
+    if (c >= '\n' && c <= '\r') return kCN | kBB;
     if (c < 0x20 || c == 0x7F) return kBB;
     if (c == ' ') return kSP;
     if (c >= '0' && c <= '9') return kDI | kXD;
@@ -519,91 +1055,16 @@ u32 _Getpctype_(PPUContext& ctx) { return table_of(ctx, "_Ctype"); }
 u32 _Getptolower_(PPUContext& ctx) { return table_of(ctx, "_Tolotab"); }
 u32 _Getptoupper_(PPUContext& ctx) { return table_of(ctx, "_Touptab"); }
 
-// The library's constant strings in guest memory (made once): "C", "", "." and the lconv of the "C" locale.
-struct LocaleState {
-    std::mutex mutex;
-    u32 strings = 0; // "C\0" at +0, "" at +2, ".\0" at +4
-    u32 lconv = 0;
-};
-
-u32 locale_strings(PPUContext& ctx, LocaleState& s)
-{
-    if (!s.strings) {
-        s.strings = lib_malloc(ctx, 8);
-        if (s.strings) std::memcpy(gb(ctx) + s.strings, "C\0\0\0.\0\0", 8);
-    }
-    return s.strings;
-}
-
-// setlocale: the "C" locale only ("C", "POSIX" or "" for it); NULL asks which (always "C"). Categories LC_ALL (0) to
-// LC_MESSAGES (6).
-u32 setlocale_(PPUContext& ctx, s32 category, u32 name)
-{
-    if (category < 0 || category > 6) return 0;
-    LocaleState& s = HleProcess::current()->state<LocaleState>();
-    std::lock_guard l(s.mutex);
-    const u32 strings = locale_strings(ctx, s);
-    if (!strings) return 0;
-    if (!name) return strings;
-    const auto n = read_string(thread_of(ctx), name, 256);
-    if (!n) {
-        refuse(ctx, std::format("setlocale: the name at {:#x} runs out of guest memory", name));
-        return 0;
-    }
-    return (n->empty() || *n == "C" || *n == "POSIX") ? strings : 0;
-}
-
-// localeconv: the "C" locale's struct lconv, Dinkumware's C99 layout: seven monetary strings, fourteen chars
-// (CHAR_MAX, 255: a guest char is unsigned), then decimal_point (+44), grouping, thousands_sep and Dinkumware's five
-// more strings.
-u32 localeconv_(PPUContext& ctx)
-{
-    LocaleState& s = HleProcess::current()->state<LocaleState>();
-    std::lock_guard l(s.mutex);
-    const u32 strings = locale_strings(ctx, s);
-    if (!strings) return 0;
-    if (!s.lconv) {
-        s.lconv = lib_malloc(ctx, 80);
-        if (!s.lconv) return 0;
-        u8* b = gb(ctx);
-        std::memset(b + s.lconv, 0, 80);
-        for (u32 i = 0; i < 7; i++) ps_write32(b, s.lconv + 4 * i, strings + 2);
-        for (u32 i = 0; i < 14; i++) b[s.lconv + 28 + i] = 0xFF;
-        ps_write32(b, s.lconv + 44, strings + 4);
-        for (u32 i = 1; i < 9; i++) ps_write32(b, s.lconv + 44 + 4 * i, strings + 2);
-    }
-    return s.lconv;
-}
-
 // ------------------------------------------------------------------------------------------------- conversions
 
+// Dinkumware's conversions as the SDK's C library has them (libc_scan.hpp, D-907, a game's copy the reference): the
+// x forms set *perr (0, or 1 on a range error) and errno as well; _Stoul is _Stoulx without perr, and so on. _Stod,
+// _Stof and _Stold scale by 10^pten in the same arithmetic (the power of ten added to the digits' own).
 u64 to_int(PPUContext& ctx, const char* fn, u32 s, u32 endp, s32 base, u32 bits, bool is_signed, u32 perr, bool wide)
 {
-    if (base < 0 || base == 1 || base > 36) {
-        if (perr && range_ok(ctx, fn, perr, 4)) ps_write32(gb(ctx), perr, 1);
-        else set_errno(ctx, kEINVAL);
-        if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, s);
-        return 0;
-    }
-    IntParse p;
-    if (wide) {
-        GuestWords in(thread_of(ctx), s);
-        p = parse_int([&](u64 i) -> s64 { const s64 c = in.at(i); return c > 0x7F ? 0x7F : c; }, base);
-    } else {
-        GuestBytes in(thread_of(ctx), s);
-        p = parse_int([&](u64 i) -> s64 { return in.at(i); }, base);
-    }
-    bool range = false;
-    const u64 v = int_result(p, bits, is_signed, &range);
-    if (perr && range_ok(ctx, fn, perr, 4)) ps_write32(gb(ctx), perr, range ? 1 : 0);
-    else if (range) set_errno(ctx, kERANGE);
-    const u32 unit = wide ? 4 : 1;
-    if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, p.end ? s + unit * static_cast<u32>(p.end) : s);
-    return v;
+    return guest_strtoint(ctx, fn, s, endp, base, bits, is_signed, perr, wide);
 }
 
-// _Stoul(s, endptr, base) and the rest: strtoul and its kin; the x forms report a range error in *perr (0 or 1)
-// instead of errno.
 u32 _Stoul_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(to_int(ctx, "_Stoul", s, e, b, 32, false, 0, false)); }
 u64 _Stoull_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "_Stoull", s, e, b, 64, false, 0, false); }
 u64 _Stoll_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "_Stoll", s, e, b, 64, true, 0, false); }
@@ -615,61 +1076,9 @@ u64 _WStoll_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "_WStoll
 u32 _WStoul_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(to_int(ctx, "_WStoul", s, e, b, 32, false, 0, true)); }
 u64 _WStoull_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "_WStoull", s, e, b, 64, false, 0, true); }
 
-// _Stod(s, endptr, pten): strtod scaled by 10^pten, rounded once (the decimal exponent moved by pten before the
-// conversion); the x forms report a range error in *perr. Hex, inf and nan are not scaled exactly (multiplied).
-FloatParse parse_scaled(const std::string& text, s32 pten)
-{
-    FloatParse p = parse_float(text);
-    if (!pten || !p.end) return p;
-    std::string sub = text.substr(0, p.end);
-    const usize start = sub.find_first_not_of(" \t\n\v\f\r");
-    const bool hex = start != std::string::npos && sub.size() > start + 2 &&
-                     (sub.compare(start, 2, "0x") == 0 || sub.compare(start, 2, "0X") == 0 ||
-                         sub.compare(start + 1, 2, "0x") == 0 || sub.compare(start + 1, 2, "0X") == 0);
-    if (!hex && std::isfinite(p.d)) {
-        s64 exp = pten;
-        const usize e = sub.find_first_of("eE");
-        if (e != std::string::npos) {
-            exp += std::strtoll(sub.c_str() + e + 1, nullptr, 10);
-            sub.resize(e);
-        }
-        const usize end = p.end;
-        p = parse_float(sub + "e" + std::to_string(exp));
-        p.end = end;
-        return p;
-    }
-    p.d *= std::pow(10.0, pten);
-    p.f = static_cast<float>(p.d);
-    return p;
-}
-
-FloatParse stod_parse(PPUContext& ctx, const char* fn, u32 s, u32 endp, s32 pten, bool wide)
-{
-    std::string text;
-    u32 unit = 1;
-    if (wide) {
-        unit = 4;
-        if (const auto w = read_wstring(thread_of(ctx), s, 0x10000)) {
-            for (const char32_t c : *w) {
-                if (c > 0x7F) break;
-                text += static_cast<char>(c);
-            }
-        }
-    } else if (const auto t = read_string(thread_of(ctx), s, 0x10000)) {
-        text = *t;
-    }
-    const FloatParse p = parse_scaled(text, pten);
-    if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, s + unit * static_cast<u32>(p.end));
-    return p;
-}
-
 double stod_common(PPUContext& ctx, const char* fn, u32 s, u32 e, s32 pten, u32 perr, bool wide, bool single)
 {
-    const FloatParse p = stod_parse(ctx, fn, s, e, pten, wide);
-    const bool range = single ? p.range_f : p.range_d;
-    if (perr && range_ok(ctx, fn, perr, 4)) ps_write32(gb(ctx), perr, range ? 1 : 0);
-    else if (range) set_errno(ctx, kERANGE);
-    return single ? static_cast<double>(p.f) : p.d;
+    return guest_strtod(ctx, fn, s, e, pten, perr, wide, single);
 }
 
 double _Stod_(PPUContext& ctx, u32 s, u32 e, s32 pten) { return stod_common(ctx, "_Stod", s, e, pten, 0, false, false); }
@@ -685,9 +1094,18 @@ double _WStodx_(PPUContext& ctx, u32 s, u32 e, s32 pten, u32 perr) { return stod
 double _WStoldx_(PPUContext& ctx, u32 s, u32 e, s32 pten, u32 perr) { return stod_common(ctx, "_WStoldx", s, e, pten, perr, true, false); }
 float _WStofx_(PPUContext& ctx, u32 s, u32 e, s32 pten, u32 perr) { return static_cast<float>(stod_common(ctx, "_WStofx", s, e, pten, perr, true, true)); }
 
-// Collation in the "C" locale is the code order, whatever table the x forms are given.
-s32 coll(PPUContext& ctx, const char* fn, u32 a, u32 b, bool wide)
+// Collation. The "C" locale has no collation state tables (the thread's, _Getpcostate): its order is the code order
+// and its transformation the string itself, as the SDK's. A locale with tables (only from a locale file's collate
+// lines, which the SDK's setlocale never loads) is not done: logged, and the code order used.
+void note_tables(PPUContext& ctx, const char* fn, u32 tables)
 {
+    if (tables && guest_readable(thread_of(ctx), tables, 4) && ps_read32(gb(ctx), tables))
+        PS_LOG_ERROR(kChan, "{}: collation by a locale's state tables is not implemented; the code order is used", fn);
+}
+
+s32 coll(PPUContext& ctx, const char* fn, u32 a, u32 b, bool wide, u32 tables)
+{
+    note_tables(ctx, fn, tables);
     if (wide) {
         const auto x = read_wstring(thread_of(ctx), a), y = read_wstring(thread_of(ctx), b);
         if (!x || !y) {
@@ -705,26 +1123,83 @@ s32 coll(PPUContext& ctx, const char* fn, u32 a, u32 b, bool wide)
     return c < 0 ? -1 : c > 0 ? 1 : 0;
 }
 
-u32 xfrm(PPUContext& ctx, const char* fn, u32 d, u32 s, u32 n, bool wide)
+// The transformation (strxfrm's): the string and its NUL into d, as much of it as n holds (the SDK's writes the
+// pieces that fit even when the whole does not); its length answered.
+u32 xfrm(PPUContext& ctx, const char* fn, u32 d, u32 s, u32 n, bool wide, u32 tables)
 {
+    note_tables(ctx, fn, tables);
     if (wide) {
         const auto t = read_wstring(thread_of(ctx), s);
-        if (!t) return 0;
-        if (t->size() < n && range_ok(ctx, fn, d, 4 * (t->size() + 1))) write_wstring(thread_of(ctx), d, *t);
+        if (!t) {
+            refuse(ctx, std::format("{}: the wide string at {:#x} runs out of guest memory", fn, s));
+            return 0;
+        }
+        const u32 k = std::min<u32>(static_cast<u32>(t->size()) + 1, n);
+        if (k && range_ok(ctx, fn, d, 4 * u64{k}))
+            write_wstring(thread_of(ctx), d, std::u32string_view(t->data(), std::min<usize>(k, t->size())), k > t->size());
         return static_cast<u32>(t->size());
     }
     const auto t = read_string(thread_of(ctx), s);
-    if (!t) return 0;
-    if (t->size() < n && range_ok(ctx, fn, d, t->size() + 1)) write_string(thread_of(ctx), d, *t);
+    if (!t) {
+        refuse(ctx, std::format("{}: the string at {:#x} runs out of guest memory", fn, s));
+        return 0;
+    }
+    const u32 k = std::min<u32>(static_cast<u32>(t->size()) + 1, n);
+    if (k && range_ok(ctx, fn, d, k)) std::memcpy(gb(ctx) + d, t->c_str(), k);
     return static_cast<u32>(t->size());
 }
 
-s32 _Strcollx_(PPUContext& ctx, u32 a, u32 b, u32) { return coll(ctx, "_Strcollx", a, b, false); }
-s32 _Wcscollx_(PPUContext& ctx, u32 a, u32 b, u32) { return coll(ctx, "_Wcscollx", a, b, true); }
-u32 _Strxfrmx_(PPUContext& ctx, u32 d, u32 s, u32 n, u32) { return xfrm(ctx, "_Strxfrmx", d, s, n, false); }
-u32 _Wcsxfrmx_(PPUContext& ctx, u32 d, u32 s, u32 n, u32) { return xfrm(ctx, "_Wcsxfrmx", d, s, n, true); }
-u32 _CStrxfrm_(PPUContext& ctx, u32 d, u32 s, u32 n, u32) { return xfrm(ctx, "_CStrxfrm", d, s, n, false); }
-u32 _CWcsxfrm_(PPUContext& ctx, u32 d, u32 s, u32 n, u32) { return xfrm(ctx, "_CWcsxfrm", d, s, n, true); }
+s32 _Strcollx_(PPUContext& ctx, u32 a, u32 b, u32 tab) { return coll(ctx, "_Strcollx", a, b, false, tab); }
+s32 _Wcscollx_(PPUContext& ctx, u32 a, u32 b, u32 tab) { return coll(ctx, "_Wcscollx", a, b, true, tab); }
+u32 _Strxfrmx_(PPUContext& ctx, u32 d, u32 s, u32 n, u32 tab) { return xfrm(ctx, "_Strxfrmx", d, s, n, false, tab); }
+u32 _Wcsxfrmx_(PPUContext& ctx, u32 d, u32 s, u32 n, u32 tab) { return xfrm(ctx, "_Wcsxfrmx", d, s, n, true, tab); }
+
+// size_t _CStrxfrm(char *sout, size_t size, _Cosave *ps, const _Statab *tables): the next piece of the
+// transformation of the string ps holds (its position the save area's first word, the second the SDK's scratch copy
+// of it), at most size bytes into sout, the NUL included when reached; the bytes written answered.
+u32 _CStrxfrm_(PPUContext& ctx, u32 sout, u32 size, u32 ps, u32 tables)
+{
+    note_tables(ctx, "_CStrxfrm", tables);
+    if (!range_ok(ctx, "_CStrxfrm", ps, 8)) return 0;
+    u8* b = gb(ctx);
+    u32 s = ps_read32(b, ps);
+    ps_write32(b, ps + 4, s);
+    if (size == 0) return 0;
+    lv2::PpuThread& th = thread_of(ctx);
+    for (u32 n = 0;;) {
+        if (!guest_readable(th, s, 1) || !range_ok(ctx, "_CStrxfrm", sout + n, 1)) return n;
+        const u8 c = b[s];
+        b[sout + n++] = c;
+        if (c == 0) {
+            ps_write32(b, ps, s);
+            return n;
+        }
+        ps_write32(b, ps + 4, ++s);
+        if (n == size) {
+            ps_write32(b, ps, s);
+            return n;
+        }
+    }
+}
+
+// size_t _CWcsxfrm(wchar_t *sout, const wchar_t **psin, size_t size, mbstate_t *ps, const _Statab *tables): the same
+// for wide characters, *psin moved past what was written (at the NUL once it was).
+u32 _CWcsxfrm_(PPUContext& ctx, u32 sout, u32 psin, u32 size, u32, u32 tables)
+{
+    note_tables(ctx, "_CWcsxfrm", tables);
+    if (!range_ok(ctx, "_CWcsxfrm", psin, 4)) return 0;
+    u8* b = gb(ctx);
+    u32 s = ps_read32(b, psin), n = 0;
+    while (n < size) {
+        if (!range_ok(ctx, "_CWcsxfrm", s, 4) || !range_ok(ctx, "_CWcsxfrm", sout + 4 * n, 4)) break;
+        const u32 c = ps_read32(b, s);
+        ps_write32(b, sout + 4 * n++, c);
+        if (c == 0) break;
+        s += 4;
+    }
+    ps_write32(b, psin, s);
+    return n;
+}
 
 // char *_Strerror(int code, char *buf): the message, copied into buf when one is given (Dinkumware's buffer holds
 // any of them), else the thread's strerror text.
@@ -743,6 +1218,7 @@ u32 _Strerror_(PPUContext& ctx, u32 code, u32 buf)
     return out;
 }
 
+
 } // namespace
 
 #define LIBC(name) ::pspocket::hle::Function{{}, #name, ::pspocket::recomp::nid_of(#name), &detail::thunk<&name##_>, false}
@@ -753,7 +1229,8 @@ void register_sys_libc_time(Registry& r)
         r.add(lib, {
             LIBC(time), LIBC(clock), LIBC(difftime), LIBC(gmtime), LIBC(localtime), LIBC(mktime), LIBC(asctime),
             LIBC(ctime), LIBC(strftime), LIBC(wcsftime), LIBC(_Daysto), LIBC(_Ttotm), LIBC(_Isdst), LIBC(_Gettime),
-            LIBC(setlocale), LIBC(localeconv), LIBC(_Getpctype), LIBC(_Getptolower), LIBC(_Getptoupper),
+            LIBC(_CStrftime), LIBC(_Gentime), LIBC(_Getdst), LIBC(_Getptimes), LIBC(_Wcsftime),
+            LIBC(_Getpctype), LIBC(_Getptolower), LIBC(_Getptoupper),
             LIBC(_Stoul), LIBC(_Stoull), LIBC(_Stoll), LIBC(_Stolx), LIBC(_Stoulx), LIBC(_Stollx), LIBC(_Stoullx),
             LIBC(_WStoll), LIBC(_WStoul), LIBC(_WStoull), LIBC(_Stod), LIBC(_Stold), LIBC(_Stof), LIBC(_Stodx),
             LIBC(_Stoldx), LIBC(_Stofx), LIBC(_WStod), LIBC(_WStold), LIBC(_WStof), LIBC(_WStodx), LIBC(_WStoldx),

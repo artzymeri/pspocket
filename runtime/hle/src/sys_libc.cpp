@@ -18,6 +18,7 @@
 
 #include "libc_format.hpp"
 #include "libc_guest.hpp"
+#include "libc_scan_guest.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/recomp/nid.hpp"
 
@@ -146,14 +147,16 @@ s32 casecmp(PPUContext& ctx, const char* fn, u32 a, u32 b, u64 n)
 s32 strcasecmp_(PPUContext& ctx, u32 a, u32 b) { return casecmp(ctx, "strcasecmp", a, b, ~u64{0}); }
 s32 strncasecmp_(PPUContext& ctx, u32 a, u32 b, u32 n) { return casecmp(ctx, "strncasecmp", a, b, n); }
 
-// strcoll and strxfrm in the "C" locale: the bytes' order.
+// strcoll and strxfrm in the "C" locale: the bytes' order; strxfrm writes as much of the string and its NUL as n
+// holds, as the SDK's (D-906), and answers the length.
 s32 strcoll_(PPUContext& ctx, u32 a, u32 b) { return strcmp_(ctx, a, b); }
 
 u32 strxfrm_(PPUContext& ctx, u32 d, u32 s, u32 n)
 {
     const auto t = str_arg(ctx, "strxfrm", s);
     if (!t) return 0;
-    if (t->size() < n && range_ok(ctx, "strxfrm", d, t->size() + 1)) std::memcpy(gb(ctx) + d, t->c_str(), t->size() + 1);
+    const u32 k = std::min<u32>(static_cast<u32>(t->size()) + 1, n);
+    if (k && range_ok(ctx, "strxfrm", d, k)) std::memcpy(gb(ctx) + d, t->c_str(), k);
     return static_cast<u32>(t->size());
 }
 
@@ -339,69 +342,27 @@ void lldiv_(PPUContext& ctx, u32 out, s64 n, s64 d)
     ps_write64(gb(ctx), out + 8, static_cast<u64>(ov ? 0 : n % d));
 }
 
-// strtol's family: C99 7.20.1.4 on the guest string, *end set (when given) past the subject sequence, ERANGE
-// clamping; long is 32 bits.
-u64 to_int(PPUContext& ctx, const char* fn, u32 s, u32 endp, s32 base, u32 bits, bool is_signed)
-{
-    GuestBytes in(thread_of(ctx), s);
-    const auto at = [&](u64 i) -> s64 { return in.at(i); };
-    if (base < 0 || base == 1 || base > 36) {
-        set_errno(ctx, kEINVAL);
-        if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, s);
-        return 0;
-    }
-    const IntParse p = parse_int(at, base);
-    bool range = false;
-    const u64 v = int_result(p, bits, is_signed, &range);
-    if (range) set_errno(ctx, kERANGE);
-    if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, p.end ? s + static_cast<u32>(p.end) : s);
-    return v;
-}
+// strtol's family as the SDK's C library has it (D-907): strtol is _Stolx, strtoul _Stoulx, the long long and intmax
+// forms _Stollx and _Stoullx (long is 32 bits); atoi and atol are (int)_Stoul(s, 0, 10), so a value past INT_MAX wraps
+// rather than clamping, and atoll (long long)_Stoull(s, 0, 10). Dinkumware's subject sequence (libc_scan.hpp): a bad
+// base sets no errno, "0x" with no hex digit after it converts nothing.
+s32 strtol_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<s32>(guest_strtoint(ctx, "strtol", s, e, b, 32, true, 0, false)); }
+u32 strtoul_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(guest_strtoint(ctx, "strtoul", s, e, b, 32, false, 0, false)); }
+u64 strtoll_(PPUContext& ctx, u32 s, u32 e, s32 b) { return guest_strtoint(ctx, "strtoll", s, e, b, 64, true, 0, false); }
+u64 strtoull_(PPUContext& ctx, u32 s, u32 e, s32 b) { return guest_strtoint(ctx, "strtoull", s, e, b, 64, false, 0, false); }
+u64 strtoimax_(PPUContext& ctx, u32 s, u32 e, s32 b) { return guest_strtoint(ctx, "strtoimax", s, e, b, 64, true, 0, false); }
+u64 strtoumax_(PPUContext& ctx, u32 s, u32 e, s32 b) { return guest_strtoint(ctx, "strtoumax", s, e, b, 64, false, 0, false); }
+s32 atoi_(PPUContext& ctx, u32 s) { return static_cast<s32>(guest_strtoint(ctx, "atoi", s, 0, 10, 32, false, 0, false)); }
+s32 atol_(PPUContext& ctx, u32 s) { return static_cast<s32>(guest_strtoint(ctx, "atol", s, 0, 10, 32, false, 0, false)); }
+u64 atoll_(PPUContext& ctx, u32 s) { return guest_strtoint(ctx, "atoll", s, 0, 10, 64, false, 0, false); }
 
-s32 strtol_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<s32>(to_int(ctx, "strtol", s, e, b, 32, true)); }
-u32 strtoul_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(to_int(ctx, "strtoul", s, e, b, 32, false)); }
-u64 strtoll_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "strtoll", s, e, b, 64, true); }
-u64 strtoull_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "strtoull", s, e, b, 64, false); }
-u64 strtoimax_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "strtoimax", s, e, b, 64, true); }
-u64 strtoumax_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "strtoumax", s, e, b, 64, false); }
-s32 atoi_(PPUContext& ctx, u32 s) { return static_cast<s32>(to_int(ctx, "atoi", s, 0, 10, 32, true)); }
-s32 atol_(PPUContext& ctx, u32 s) { return atoi_(ctx, s); }
-u64 atoll_(PPUContext& ctx, u32 s) { return to_int(ctx, "atoll", s, 0, 10, 64, true); }
-
-// strtod's family (7.20.1.3), the host's correctly rounded parse in the "C" locale.
-FloatParse to_float(PPUContext& ctx, const char* fn, u32 s, u32 endp)
-{
-    const auto text = read_string(thread_of(ctx), s, 0x10000);
-    FloatParse p{};
-    if (!text) {
-        refuse(ctx, std::format("{}: the string at {:#x} runs out of guest memory", fn, s));
-    } else {
-        p = parse_float(*text);
-    }
-    if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, s + static_cast<u32>(p.end));
-    return p;
-}
-
-// ERANGE for the result's own type (double, or float for strtof and atoff).
-double float_d(PPUContext& ctx, const char* fn, u32 s, u32 e)
-{
-    const FloatParse p = to_float(ctx, fn, s, e);
-    if (p.range_d) set_errno(ctx, kERANGE);
-    return p.d;
-}
-
-float float_f(PPUContext& ctx, const char* fn, u32 s, u32 e)
-{
-    const FloatParse p = to_float(ctx, fn, s, e);
-    if (p.range_f) set_errno(ctx, kERANGE);
-    return p.f;
-}
-
-double strtod_(PPUContext& ctx, u32 s, u32 e) { return float_d(ctx, "strtod", s, e); }
-double strtold_(PPUContext& ctx, u32 s, u32 e) { return float_d(ctx, "strtold", s, e); }
-float strtof_(PPUContext& ctx, u32 s, u32 e) { return float_f(ctx, "strtof", s, e); }
-double atof_(PPUContext& ctx, u32 s) { return float_d(ctx, "atof", s, 0); }
-float atoff_(PPUContext& ctx, u32 s) { return float_f(ctx, "atoff", s, 0); }
+// strtod's family as the SDK's: strtod and atof are _Stodx (strtold _Stoldx, long double being double), strtof and
+// atoff _Stofx, each with no power of ten added (libc_scan.hpp has the parsing and its rounding).
+double strtod_(PPUContext& ctx, u32 s, u32 e) { return guest_strtod(ctx, "strtod", s, e, 0, 0, false, false); }
+double strtold_(PPUContext& ctx, u32 s, u32 e) { return guest_strtod(ctx, "strtold", s, e, 0, 0, false, false); }
+float strtof_(PPUContext& ctx, u32 s, u32 e) { return static_cast<float>(guest_strtod(ctx, "strtof", s, e, 0, 0, false, true)); }
+double atof_(PPUContext& ctx, u32 s) { return guest_strtod(ctx, "atof", s, 0, 0, 0, false, false); }
+float atoff_(PPUContext& ctx, u32 s) { return static_cast<float>(guest_strtod(ctx, "atoff", s, 0, 0, 0, false, true)); }
 
 // ------------------------------------------------------------------------------------------------- searching, sorting
 

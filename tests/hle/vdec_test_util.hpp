@@ -5,6 +5,7 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -73,10 +74,12 @@ inline u32 log_count(u8* b)
     return n;
 }
 
+// The log holds 255 entries; a count past them (a run gone wrong) is cut there, so a test fails rather than spins.
 inline u32 count_of(u8* b, u32 type)
 {
+    const u32 entries = std::min<u32>(log_count(b), (0x1000 - 16) / 16);
     u32 n = 0;
-    for (u32 i = 0; i < log_count(b); i++) n += ps_read32(b, kLog + 16 + 16 * i) == type;
+    for (u32 i = 0; i < entries; i++) n += ps_read32(b, kLog + 16 + 16 * i) == type;
     return n;
 }
 
@@ -201,11 +204,16 @@ inline Decoded decode_stream(u8* b, const Call& call, const Stream& s)
     // The pictures announced before the end of the sequence (once no more come for 0.4 s): one access unit late, as
     // Sony's.
     u32 seen = count_of(b, 1);
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     for (int quiet = 0; quiet < 20; quiet++) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         const u32 now = count_of(b, 1);
         if (now != seen) quiet = 0;
         seen = now;
+        if (std::chrono::steady_clock::now() > give_up) {
+            d.lines.push_back("pictures still coming after 30 s");
+            break;
+        }
     }
     d.pictures_after_aus = seen;
     r("cellVdecEndSeq", 0x824433F0, {handle});

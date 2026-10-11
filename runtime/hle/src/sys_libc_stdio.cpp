@@ -30,6 +30,7 @@
 
 #include "libc_format.hpp"
 #include "libc_guest.hpp"
+#include "libc_scan_guest.hpp"
 #include "libc_malloc.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/lv2/syscalls.hpp"
@@ -1037,6 +1038,7 @@ class GuestFormat final : public FormatSource {
 public:
     GuestFormat(PPUContext& ctx, VarArgs& args) : ctx_(ctx), args_(args) {}
     u64 next() override { return args_.next(); }
+    std::array<u8, 16> next_vector() override { return args_.next_vector(); }
     std::optional<std::string> string(u32 addr, u64 max) override { return read_string(thread_of(ctx_), addr, max); }
     std::optional<std::u32string> wstring(u32 addr, u64 max) override
     {
@@ -1059,57 +1061,44 @@ void note_problems(PPUContext& ctx, const char* fn, const std::vector<std::strin
     for (const std::string& p : problems) refuse(ctx, std::format("{}: {}", fn, p));
 }
 
-// The text of a narrow format: nullopt when the format is not memory or encodes badly (errno EILSEQ).
-std::optional<std::string> narrow_text(PPUContext& ctx, const char* fn, u32 fmt, VarArgs& args)
+// printf's text for a format (the SDK's, libc_printf.hpp): nullopt when the format is not memory; a negative count
+// for an encoding error (errno EILSEQ), the text then what was put out before it.
+template <class C, class Sink = StringSink<C>>
+std::optional<PrintResult<C>> print_text(PPUContext& ctx, const char* fn, u32 fmt, VarArgs& args, Sink out = Sink{})
 {
-    const auto f = read_string(thread_of(ctx), fmt);
+    std::optional<std::basic_string<C>> f;
+    if constexpr (sizeof(C) == 1) f = read_string(thread_of(ctx), fmt);
+    else f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
     if (!f) {
         refuse(ctx, std::format("{}: the format at {:#x} runs out of guest memory", fn, fmt));
         return std::nullopt;
     }
     GuestFormat src(ctx, args);
-    FormatResult<char> r = format<char>(*f, src);
+    PrintResult<C> r = print_host<C, Sink>(std::basic_string_view<C>(*f), src, std::move(out));
     note_problems(ctx, fn, src.problems);
-    if (r.failed) {
-        set_errno(ctx, kEILSEQ);
-        return std::nullopt;
-    }
-    return std::move(r.text);
+    if (r.failed()) set_errno(ctx, kEILSEQ);
+    return r;
 }
 
-std::optional<std::u32string> wide_text(PPUContext& ctx, const char* fn, u32 fmt, VarArgs& args)
-{
-    const auto f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
-    if (!f) {
-        refuse(ctx, std::format("{}: the wide format at {:#x} runs out of guest memory", fn, fmt));
-        return std::nullopt;
-    }
-    GuestFormat src(ctx, args);
-    FormatResult<char32_t> r = format<char32_t>(*f, src);
-    note_problems(ctx, fn, src.problems);
-    if (r.failed) {
-        set_errno(ctx, kEILSEQ);
-        return std::nullopt;
-    }
-    return std::move(r.text);
-}
-
+// printf and fprintf: the text to the stream as it is made (what came before a failure stays written); the count.
 s32 print_to(PPUContext& ctx, const char* fn, u32 file, u32 fmt, VarArgs& args)
 {
-    const auto text = narrow_text(ctx, fn, fmt, args);
-    if (!text) return -1;
+    const auto r = print_text<char>(ctx, fn, fmt, args);
+    if (!r) return -1;
     const auto st = stream_of(ctx, fn, file);
     if (!st) return -1;
     std::lock_guard l(st->lock);
     orient(*st, -1);
-    return put_bytes(ctx, *st, *text) ? static_cast<s32>(text->size()) : -1;
+    if (!r->text.empty() && !put_bytes(ctx, *st, r->text)) return -1;
+    return r->count;
 }
 
 s32 wprint_to(PPUContext& ctx, const char* fn, u32 file, u32 fmt, VarArgs& args)
 {
-    const auto text = wide_text(ctx, fn, fmt, args);
-    if (!text) return -1;
-    return put_wide(ctx, fn, file, *text) == 0 ? static_cast<s32>(text->size()) : -1;
+    const auto r = print_text<char32_t>(ctx, fn, fmt, args);
+    if (!r) return -1;
+    if (!r->text.empty() && put_wide(ctx, fn, file, r->text) != 0) return -1;
+    return r->count;
 }
 
 s32 printf_(PPUContext& ctx, u32 fmt)
@@ -1136,28 +1125,30 @@ s32 vfprintf_(PPUContext& ctx, u32 file, u32 fmt, u32 ap)
     return print_to(ctx, "vfprintf", file, fmt, a);
 }
 
-// sprintf: the text and a NUL; its length.
+// sprintf: the text and a NUL (none after a failure, as the SDK's: the text before it is written); the count.
 s32 to_buffer(PPUContext& ctx, const char* fn, u32 buf, u32 fmt, VarArgs& args)
 {
-    const auto text = narrow_text(ctx, fn, fmt, args);
-    if (!text) return -1;
-    if (!range_ok(ctx, fn, buf, text->size() + 1)) return -1;
-    write_string(thread_of(ctx), buf, *text);
-    return static_cast<s32>(text->size());
+    const auto r = print_text<char>(ctx, fn, fmt, args);
+    if (!r) return -1;
+    const usize n = r->text.size() + (r->count >= 0 ? 1 : 0);
+    if (!range_ok(ctx, fn, buf, n)) return -1;
+    std::memcpy(gb(ctx) + buf, r->text.data(), r->text.size());
+    if (r->count >= 0) gb(ctx)[buf + r->text.size()] = 0;
+    return r->count;
 }
 
-// snprintf: at most n - 1 bytes and a NUL (nothing for n 0); the whole text's length.
+// snprintf: at most n - 1 bytes and a NUL (nothing for n 0, a NUL even after a failure); the whole count.
 s32 to_sized(PPUContext& ctx, const char* fn, u32 buf, u32 n, u32 fmt, VarArgs& args)
 {
-    const auto text = narrow_text(ctx, fn, fmt, args);
-    if (!text) return -1;
+    const auto r = print_text<char>(ctx, fn, fmt, args);
+    if (!r) return -1;
     if (n) {
-        const usize k = std::min<usize>(text->size(), n - 1);
+        const usize k = std::min<usize>(r->text.size(), n - 1);
         if (!range_ok(ctx, fn, buf, k + 1)) return -1;
-        std::memcpy(gb(ctx) + buf, text->data(), k);
+        std::memcpy(gb(ctx) + buf, r->text.data(), k);
         gb(ctx)[buf + k] = 0;
     }
-    return static_cast<s32>(text->size());
+    return r->count;
 }
 
 s32 sprintf_(PPUContext& ctx, u32 buf, u32 fmt)
@@ -1208,18 +1199,19 @@ s32 vfwprintf_(PPUContext& ctx, u32 file, u32 fmt, u32 ap)
     return wprint_to(ctx, "vfwprintf", file, fmt, a);
 }
 
-// swprintf: at most n wide characters with the NUL; negative when the text does not fit (C99 7.24.2.3), its first
-// n - 1 characters written then.
+// swprintf: the text up to n - 1 wide characters and a NUL (nothing for n 0); the count, or -1 when a piece printf
+// puts out did not fit (the SDK's output function writes what fits of it and answers NULL).
 s32 to_wide_sized(PPUContext& ctx, const char* fn, u32 buf, u32 n, u32 fmt, VarArgs& args)
 {
-    const auto text = wide_text(ctx, fn, fmt, args);
-    if (!text) return -1;
-    if (!n) return -1;
-    const usize k = std::min<usize>(text->size(), n - 1);
-    if (!range_ok(ctx, fn, buf, 4 * (k + 1))) return -1;
-    for (usize i = 0; i < k; i++) ps_write32(gb(ctx), buf + 4 * static_cast<u32>(i), static_cast<u32>((*text)[i]));
-    ps_write32(gb(ctx), buf + 4 * static_cast<u32>(k), 0);
-    return text->size() < n ? static_cast<s32>(text->size()) : -1;
+    const auto r = print_text<char32_t, BoundedSink<char32_t>>(ctx, fn, fmt, args, BoundedSink<char32_t>(n ? n - 1 : 0));
+    if (!r) return -1;
+    if (n) {
+        const usize k = r->text.size();
+        if (!range_ok(ctx, fn, buf, 4 * (k + 1))) return -1;
+        for (usize i = 0; i < k; i++) ps_write32(gb(ctx), buf + 4 * static_cast<u32>(i), static_cast<u32>(r->text[i]));
+        ps_write32(gb(ctx), buf + 4 * static_cast<u32>(k), 0);
+    }
+    return r->count;
 }
 
 s32 swprintf_(PPUContext& ctx, u32 buf, u32 n, u32 fmt)
@@ -1236,46 +1228,14 @@ s32 vswprintf_(PPUContext& ctx, u32 buf, u32 n, u32 fmt, u32 ap)
 
 // ------------------------------------------------------------------------------------------------- scanf
 
-class GuestTarget final : public ScanTarget {
+// The scanf family on the SDK's scan engine (libc_scan.hpp, D-907): sscanf and swscanf read the guest string as the
+// SDK's string reader does, the stream forms a byte at a time through the stream (a wide stream's characters are the
+// "C" locale's bytes).
+class StreamIo final : public ScanIo {
 public:
-    GuestTarget(PPUContext& ctx, VarArgs& args) : ctx_(ctx), args_(args) {}
-    u32 next_pointer() override { return static_cast<u32>(args_.next()); }
-    bool put(u32 addr, const u8* data, usize size) override
-    {
-        if (!guest_range(thread_of(ctx_), addr, size)) return false;
-        std::memcpy(gb(ctx_) + addr, data, size);
-        return true;
-    }
-
-private:
-    PPUContext& ctx_;
-    VarArgs& args_;
-};
-
-template <class C>
-class TextInput final : public ScanInput {
-public:
-    explicit TextInput(std::basic_string<C> s) : s_(std::move(s)) {}
-    s64 get() override
-    {
-        const usize i = pos_++;
-        return i < s_.size() ? static_cast<s64>(static_cast<std::make_unsigned_t<C>>(s_[i])) : -1;
-    }
-    void unget(s64) override
-    {
-        if (pos_) pos_--;
-    }
-
-private:
-    std::basic_string<C> s_;
-    usize pos_ = 0;
-};
-
-class StreamInput final : public ScanInput {
-public:
-    StreamInput(PPUContext& ctx, Stream& st) : ctx_(ctx), st_(st) {}
-    s64 get() override { return get_byte(ctx_, st_); }
-    void unget(s64 c) override
+    StreamIo(PPUContext& ctx, Stream& st) : ctx_(ctx), st_(st) {}
+    s32 get() override { return get_byte(ctx_, st_); }
+    void unget(s32 c) override
     {
         if (c >= 0) unget_byte(st_, static_cast<u8>(c));
     }
@@ -1286,28 +1246,17 @@ private:
 };
 
 template <class C>
-s32 scan_text(PPUContext& ctx, const char* fn, std::basic_string<C> input, u32 fmt, VarArgs& args)
+s32 scan_text(PPUContext& ctx, const char* fn, u32 s, u32 fmt, VarArgs& args)
 {
-    std::optional<std::basic_string<C>> f;
-    if constexpr (std::is_same_v<C, char>) f = read_string(thread_of(ctx), fmt);
-    else f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
-    if (!f) {
-        refuse(ctx, std::format("{}: the format at {:#x} runs out of guest memory", fn, fmt));
-        return -1;
-    }
-    TextInput<C> in(std::move(input));
-    GuestTarget out(ctx, args);
-    const int r = scan<C>(*f, in, out);
-    note_problems(ctx, fn, out.problems);
-    return r;
+    GuestTextIo in(ctx, s, sizeof(C) != 1);
+    GuestScanArgs out(ctx, args);
+    return guest_scanf<C>(ctx, fn, fmt, in, out);
 }
 
 template <class C>
 s32 scan_stream(PPUContext& ctx, const char* fn, u32 file, u32 fmt, VarArgs& args)
 {
-    std::optional<std::basic_string<C>> f;
-    if constexpr (std::is_same_v<C, char>) f = read_string(thread_of(ctx), fmt);
-    else f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
+    const auto f = scan_format<C>(ctx, fmt);
     if (!f) {
         refuse(ctx, std::format("{}: the format at {:#x} runs out of guest memory", fn, fmt));
         return -1;
@@ -1316,9 +1265,9 @@ s32 scan_stream(PPUContext& ctx, const char* fn, u32 file, u32 fmt, VarArgs& arg
     if (!st) return -1;
     std::lock_guard l(st->lock);
     orient(*st, std::is_same_v<C, char> ? -1 : 1);
-    StreamInput in(ctx, *st);
-    GuestTarget out(ctx, args);
-    const int r = scan<C>(*f, in, out);
+    StreamIo in(ctx, *st);
+    GuestScanArgs out(ctx, args);
+    const s32 r = sdk_scanf<C>(in, out, f->c_str());
     note_problems(ctx, fn, out.problems);
     return r;
 }
@@ -1326,45 +1275,25 @@ s32 scan_stream(PPUContext& ctx, const char* fn, u32 file, u32 fmt, VarArgs& arg
 s32 sscanf_(PPUContext& ctx, u32 s, u32 fmt)
 {
     VarArgs a(ctx, 2);
-    const auto input = read_string(thread_of(ctx), s);
-    if (!input) {
-        refuse(ctx, std::format("sscanf: the string at {:#x} runs out of guest memory", s));
-        return -1;
-    }
-    return scan_text<char>(ctx, "sscanf", *input, fmt, a);
+    return scan_text<char>(ctx, "sscanf", s, fmt, a);
 }
 
 s32 vsscanf_(PPUContext& ctx, u32 s, u32 fmt, u32 ap)
 {
     VarArgs a = VarArgs::list(ctx, ap);
-    const auto input = read_string(thread_of(ctx), s);
-    if (!input) {
-        refuse(ctx, std::format("vsscanf: the string at {:#x} runs out of guest memory", s));
-        return -1;
-    }
-    return scan_text<char>(ctx, "vsscanf", *input, fmt, a);
+    return scan_text<char>(ctx, "vsscanf", s, fmt, a);
 }
 
 s32 swscanf_(PPUContext& ctx, u32 s, u32 fmt)
 {
     VarArgs a(ctx, 2);
-    const auto input = read_wstring(thread_of(ctx), s, kMaxString / 4);
-    if (!input) {
-        refuse(ctx, std::format("swscanf: the wide string at {:#x} runs out of guest memory", s));
-        return -1;
-    }
-    return scan_text<char32_t>(ctx, "swscanf", *input, fmt, a);
+    return scan_text<char32_t>(ctx, "swscanf", s, fmt, a);
 }
 
 s32 vswscanf_(PPUContext& ctx, u32 s, u32 fmt, u32 ap)
 {
     VarArgs a = VarArgs::list(ctx, ap);
-    const auto input = read_wstring(thread_of(ctx), s, kMaxString / 4);
-    if (!input) {
-        refuse(ctx, std::format("vswscanf: the wide string at {:#x} runs out of guest memory", s));
-        return -1;
-    }
-    return scan_text<char32_t>(ctx, "vswscanf", *input, fmt, a);
+    return scan_text<char32_t>(ctx, "vswscanf", s, fmt, a);
 }
 
 s32 scanf_(PPUContext& ctx, u32 fmt)

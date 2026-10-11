@@ -40,6 +40,8 @@
 #include <type_traits>
 
 #include "guest.hpp"
+#include "libc_guest.hpp"
+#include "libc_scan.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
@@ -628,26 +630,6 @@ T sin_quadrant(T x, u32 qoff)
     return (qoff & 2) ? -r : r;
 }
 
-// _Dtentox: x * 10^n.
-template <class T>
-T tento(T x, s64 n)
-{
-    double r = static_cast<double>(x);
-    if (r == 0 || !std::isfinite(r) || n == 0) return x;
-    n = std::clamp<s64>(n, -2000, 2000);
-    while (n > 300 && std::isfinite(r)) {
-        r *= 1e300;
-        n -= 300;
-    }
-    while (n < -300 && r != 0) {
-        r *= 1e-300;
-        n += 300;
-    }
-    if (n >= 0) r *= std::pow(10.0, static_cast<double>(n));
-    else r /= std::pow(10.0, static_cast<double>(-n));
-    return static_cast<T>(r);
-}
-
 // Reads and writes of the guest value a Dinkumware helper points at.
 double load(u8* base, u32 addr, double) { return ps_readf64(base, addr); }
 float load(u8* base, u32 addr, float) { return ps_readf32(base, addr); }
@@ -742,7 +724,7 @@ s32 dk_scale(PPUContext& ctx, u32 px, s32 n, std::string_view name)
     }
     u8* base = guest_base(ctx);
     T x = load(base, px, T{});
-    const s32 code = dscale(x, n);
+    const s32 code = libc::dk_scale(x, n); // the SDK's: a denormal result truncated (D-907)
     store(base, px, x);
     return code;
 }
@@ -808,8 +790,20 @@ double dk_Lgamma(PPUContext&, double x) { return ::lgamma(x); }
 float dk_FLgamma(PPUContext&, float x) { return ::lgammaf(x); }
 double dk_Tgamma(PPUContext&, double x) { return ::tgamma(x); }
 float dk_FTgamma(PPUContext&, float x) { return ::tgammaf(x); }
-double dk_Dtentox(PPUContext&, double x, s32 n) { return tento(x, n); }
-float dk_FDtentox(PPUContext&, float x, s32 n) { return tento(x, n); }
+// _Dtentox(x, n, perr) as the SDK's (libc_scan.hpp, D-907): errno ERANGE and *perr |= 1 for a zero or infinite result.
+template <class T>
+T dk_tentox(PPUContext& ctx, T x, s32 n, u32 perr)
+{
+    bool range = false;
+    const T r = libc::dk_tento(x, n, &range);
+    if (range) {
+        libc::set_errno(ctx, libc::kERANGE);
+        if (perr && guest_ok(ctx, perr, 4)) ps_write32(guest_base(ctx), perr, ps_read32(guest_base(ctx), perr) | 1);
+    }
+    return r;
+}
+double dk_Dtentox(PPUContext& ctx, double x, s32 n, u32 perr) { return dk_tentox(ctx, x, n, perr); }
+float dk_FDtentox(PPUContext& ctx, float x, s32 n, u32 perr) { return dk_tentox(ctx, x, n, perr); }
 
 // _Hypot: hypot(x, y) = result * 2^*pexp, so that the result stays finite (*pexp is 1 where hypot overflows).
 template <class T>

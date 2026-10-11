@@ -110,9 +110,9 @@ inline constexpr u32 kTmSec = 0, kTmMin = 4, kTmHour = 8, kTmMday = 12, kTmMon =
 
 // Dinkumware's limits (xlocnum): _MAX_EXP_DIG, _MAX_INT_DIG, _MAX_SIG_DIG; and its _MBMAX (MB_LEN_MAX).
 inline constexpr u32 kMaxExpDig = 8, kMaxIntDig = 32, kMaxSigDig = 36, kMbLenMax = 8;
-// CHAR_MAX: a guest char is unsigned (255), the "not available" of the C library's lconv, which the facets compare
-// grouping sizes and fraction digits with.
-inline constexpr u32 kCharMax = 0xFF;
+// CHAR_MAX: 127, the SDK's libraries being built with a signed char (its C library's lconv holds 0x7F for "not
+// available", D-906), which the facets compare grouping sizes and fraction digits with.
+inline constexpr u32 kCharMax = 0x7F;
 
 // ------------------------------------------------------------------------------------------------- elements
 
