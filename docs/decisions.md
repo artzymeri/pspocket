@@ -9564,3 +9564,7 @@ too.
   through its own, so the last-place differences D-902 counted there are gone.
 - Timing (test_hle "[.libcbench]", the same session before and after, 4,000 mixed texts 20 times): strtod 63 -> 55-62
   ns, sscanf with four conversions 470-504 -> 438-445 ns.
+- On the way: a full test_hle run hung for 17 hours in test_vdec_codecs.cpp's DivX 3.11 case (the test thread in
+  vdec_test_util.hpp's wait for the last pictures, the decoder thread idle on its queue); 40 runs of the case alone did
+  not repeat it. The helper's log count is now cut at the log's 255 entries and that wait at 30 s, so such a run fails
+  with a line saying so instead of hanging.
