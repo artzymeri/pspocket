@@ -104,7 +104,7 @@ build() { # name sdk cflags...
     # The tools configure builds and runs here are the Mac's: its own compiler and SDK.
     local host_sdk
     host_sdk="$(xcrun --sdk macosx --show-sdk-path)"
-    local args=("${COMMON[@]}" "${APPLE_HW[@]}" "${EXTRA[@]}" --prefix="$prefix" --cc="$cc" --sysroot="$sysroot"
+    local args=("${COMMON[@]}" "${APPLE_HW[@]}" ${EXTRA[@]+"${EXTRA[@]}"} --prefix="$prefix" --cc="$cc" --sysroot="$sysroot"
         --arch=aarch64 --host-cc="$(xcrun --sdk macosx -f clang)" --host-cflags="-isysroot $host_sdk" --host-ldflags="-isysroot $host_sdk"
         --extra-cflags="$*" --extra-ldflags="$*")
     [ "$name" = ios ] && args+=(--enable-cross-compile --target-os=darwin)
@@ -115,7 +115,7 @@ build() { # name sdk cflags...
 # nasm; without it the same decoders build from their C code.
 build_linux() { # name
     local name="$1"
-    local args=("${COMMON[@]}" "${EXTRA[@]}" --prefix="$OUT/$name" --cc="${CC:-clang}")
+    local args=("${COMMON[@]}" ${EXTRA[@]+"${EXTRA[@]}"} --prefix="$OUT/$name" --cc="${CC:-clang}")
     case "$(uname -m)" in
         x86_64|i?86) command -v nasm > /dev/null || { say "no nasm: FFmpeg's C code only"; args+=(--disable-x86asm); } ;;
     esac

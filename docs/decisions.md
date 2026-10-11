@@ -9299,6 +9299,49 @@ executable (by its strings, its TOC slots and its calls); nothing of it is in th
 Tests: tests/hle/test_libc_spu.cpp (both families on an SPU thread and a raw SPU, the slots, _Getmem, the unknown
 names), tests/hle/test_libc_spu_game.cpp (the comparisons); the SPU program builder moved to tests/hle/spu_program.hpp.
 
+## D-908 · 2026-10-10 · AES-CTR on Apple platforms carries the counter over all 128 bits
+
+CommonCrypto's CTR mode with kCCModeOptionCTR_BE counts in the counter's low 64 bits only and wraps there without a carry
+into the high half; PolarSSL's aes_crypt_ctr (RPCS3's, and what the PS3 formats expect) counts over all 128 bits. So on
+the Mac and the iPhone, where crypto.hpp's AES goes through CommonCrypto (D-580), any CTR data whose counter crosses a
+64-bit boundary decrypted wrongly from that block on: PS3 packages with such an IV installed garbage names and contents
+(the PKG tests failed on macOS from D-583 on, never on Linux, whose portable AES is PolarSSL's), and SP 800-38A-style
+counters of all ones rolled over wrongly. aes_ctr now cuts the data where the low half would wrap and goes on from the
+counter with its high half incremented and its low half 0; the portable AES was right. Tests: test_crypto's
+platform-against-portable rounds add a counter whose low half wraps within the data (the all-ones case there now passes
+on Apple platforms too); test_pkg's game package compares canonical paths, as test_psn does (b6ff761), since macOS's
+temporary folders are reached through /var -> /private/var.
+
+## D-909 · 2026-10-10 · scripts/build-ffmpeg.sh runs under macOS's bash 3.2
+
+D-576 and D-577 added the EXTRA array to build-ffmpeg.sh, empty for the decoders' builds; under `set -u` bash before 4.4
+calls an empty array's "${EXTRA[@]}" an unbound variable, so on the Mac (bash 3.2) the script stopped before configuring
+and build/ffmpeg/macos kept the decoders of 2026-10-08, without D-588's VC-1 and DivX 3.11: cellVdec refused those
+codecs (CELL_VDEC_ERROR_ARG) and test_fuzz_media's VC-1 case failed on the Mac only. The script expands it as
+${EXTRA[@]+"${EXTRA[@]}"}, which every bash takes; the Mac's macos, macos-tests and ios builds were made again with it.
+
+## D-910 · 2026-10-10 · cellSpursJq's comparison reads the pool's free lists as sets
+
+D-537's job comparison ends with the queue at rest, each descriptor class's record among its answers. A class's free
+list is a stack of blocks linked through their first words; jobs pushed with PushAndRelease give their descriptors back
+from the SPU as they end, in whatever order the policy module finishes them, so which block is on top varied between
+runs (class 7: head 0x110380 or 0x110000, two blocks free either way) and the test failed about one run in three with
+either PPU side. It now compares each free list as its count, wake-ups and waiters and the set of its blocks; six runs in
+a row agree.
+
+## D-911 · 2026-10-11 · The comparisons with Sony's modules on the Mac: what they show (part 1)
+
+D-597's comparisons (test_hle "[compare]"), written in a session without the firmware, ran on the Mac with the installed
+system software for the first time, after FFmpeg was rebuilt with every decoder (D-909). Of eleven: the codec cores'
+version queries agree; libmixer's two cannot run, firmware 4.92 shipping no module that exports libmixer (D-563 made it
+from RPCS3 for that reason), and now SKIP saying so (compare_util.hpp require_firmware_module); the others show
+differences or stop: cellVpost (500 of 536 observations: QueryAttr's attribute, the limits Open checks, Exec's
+picture information), cellPngEnc, cellVdec's MPEG-4 part 2, MVC and VC-1, while cellFiber, cellVdec's DivX 3.11 and
+cellKey2char stop with a fault in Sony's module running on pspocket (cellFiber's at its second
+cellFiberPpuInitializeScheduler). These libraries stay firmware-first (D-563): a game gets Sony's modules for them
+while the user's system software is installed, so none of this reaches a game; making pspocket's own match is the next
+work on them.
+
 ## D-905 · 2026-10-11 · sys_libc's printf as the SDK's: the output internals, the SPU printf's, against a game's copy
 
 The SDK's C library (Dinkumware's, Sony's additions; no firmware module has it) as Assassin's Creed (BLES00158) links

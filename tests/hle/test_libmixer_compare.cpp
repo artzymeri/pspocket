@@ -607,6 +607,7 @@ TEST_CASE("libmixer against Sony's libmixer: the mixer's life, a block's mix, th
     "[.][hle][lle][compare][libmixer]")
 {
     const Setup s = setup();
+    require_firmware_module(s, "libmixer");
     run(s, "libmixer (the mixer's life and mix) against Sony's libmixer", [&](bool sony) { return life(s, sony); },
         [](const Observed& o) {
             // pspocket's own half: test_libmixer.cpp's answers and mix.
@@ -641,6 +642,7 @@ TEST_CASE("libmixer against Sony's libmixer: sample players' speeds and loops, t
     "[.][hle][lle][compare][libmixer]")
 {
     const Setup s = setup();
+    require_firmware_module(s, "libmixer");
     run(s, "libmixer (players and utilities) against Sony's libmixer", [&](bool sony) { return players(s, sony); },
         [](const Observed& o) {
             const Data* once = o.find_data("the first block heard, once at double speed from frame 11");

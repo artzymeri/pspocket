@@ -10,6 +10,7 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -872,8 +873,24 @@ Log job_script(Side& s, bool entry_lock, bool busy)
     log.answers.push_back(std::format("headers {:#x} {} bits {:08x}{:08x}{:08x}{:08x} signals {:#x} handles {:#x}",
         ps_read64(b, jq(0)), waiting(jq(0) + 8), ps_read32(b, jq(0) + 0x88), ps_read32(b, jq(0) + 0x8C),
         ps_read32(b, jq(0) + 0x90), ps_read32(b, jq(0) + 0x94), ps_read32(b, jq(0) + 0x68), ps_read32(b, jq(0) + 0x70)));
+    // A class's free list (head u32, count u16, wake-ups, waiters; blocks linked through their first word) as the set of
+    // its blocks: jobs that release their descriptors end on the SPU in whatever order, so which block is on top varies
+    // (D-910).
+    const auto free_list = [&](u32 rec) {
+        const u64 f = ps_read64(b, rec);
+        std::vector<u32> blocks;
+        u32 p = static_cast<u32>(f >> 32);
+        for (u32 k = 0; p && k < ((f >> 16) & 0xFFFF) && k < 256; k++) {
+            blocks.push_back(p);
+            p = ps_read32(b, p);
+        }
+        std::sort(blocks.begin(), blocks.end());
+        std::string text = std::format("{:#x} {{", f & 0xFFFFFFFFu);
+        for (const u32 x : blocks) text += std::format(" {:#x}", x);
+        return text + " }";
+    };
     for (u32 c = 0; c < 8; c++)
-        log.answers.push_back(std::format("class {}: {:#x} {}", c, ps_read64(b, jq(0) + 0x680 + 16 * c),
+        log.answers.push_back(std::format("class {}: {} {}", c, free_list(jq(0) + 0x680 + 16 * c),
             waiting(jq(0) + 0x688 + 16 * c)));
     return log;
 }
