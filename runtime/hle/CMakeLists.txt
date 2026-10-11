@@ -127,6 +127,7 @@ add_library(pspocket_hle STATIC
     src/cellVpost.cpp
     src/cellAtrac.cpp
     src/cellJpgEnc.cpp
+    src/firmware_data.cpp
     src/cellPngEnc.cpp
     src/libsnd3.cpp
     src/libsynth2.cpp

@@ -62,6 +62,8 @@ struct JpgFixture : TlsFixture {
     {
         REQUIRE(hle->main_memory().reserve(kWork, kWorkSize));
         REQUIRE(mem.commit(kWork, kWorkSize));
+        // The installed system software, for the data pspocket's library reads from it (D-913).
+        if (const auto flash = test_dev_flash()) REQUIRE(kernel->vfs_mount("/dev_flash", *flash, true));
     }
 };
 

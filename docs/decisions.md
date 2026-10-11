@@ -12224,3 +12224,34 @@ times 4 plus 0.6), and type 3 horizontally with its 8-tap ones (seventeen tables
 ratio times 16 plus 0.6; past enlarging, the bilinear one); type 2's horizontal filter and type 1's sharpening are
 computed by the SPU program. The tables are Sony's data and stay out of the repository: matching them means reading
 them from the installed libvpost.sprx at run time, as cellFont reads libfont's (D-526).
+
+## D-913 · 2026-10-11 · cellJpgEnc's stream size limit mode from libjpgenc's tables, read from the firmware (part 8)
+
+libjpgenc chooses a size-limited picture's quality from tables of stream sizes in its data. They are now read from the
+user's installed system software at the first size-limited picture, as cellFont reads libfont's (D-526): a new helper,
+runtime/hle/src/firmware_data.cpp, decrypts /dev_flash/sys/external/<module> with the build's SELF keys, accepts it only
+when it is firmware 4.92's (its prx_identity) and gives back the bytes at a virtual address of its image; nothing of the
+data is in the repository. Without the module the mode falls back to part 3's search, logged once.
+The algorithm is libjpgenc's encoder thread's, read from its code:
+- A trial encoding at quality 75 with the fast DCT (the encoder's colour space, sampling and restart interval; no
+  extended parameters) of at most 128x128 of the picture (its top-left corner, or with both sizes past 128 four blocks
+  of half that about the quarter points) into a 0x4000-byte buffer gives the activity: its bytes (less 394 past 1182
+  when width plus height pass 256) per 10,000 samples (three a pixel, one for gray). A trial that fills its buffer
+  counts 0x4000 bytes over the rows it reached less a margin (1, 2, 4 or 8 by how many).
+- A curve of sizes by quality is made from the tables (four sampling groups, three activity rows): above the smallest
+  row's value at quality 75, between the two rows about the activity (weights in hundredths, the first whose sum is at
+  most it), else from the nearest row scaled by the activity over its value (plus a 10% margin, 5% in later tries); for
+  pictures of at most 9,999 pixels always the smallest row scaled.
+- The target is a share of the limit less the extended parameters' bytes: 80 (75 for activity under 400), 75/70 for up
+  to 89,999 pixels, 55 up to 39,999, 60 up to 9,999; less 4 for RGB, 6 for gray, 2 for subsampled YCbCr, 8 or 4 for
+  4:4:4; as activity per 10,000 samples, quartered under 400, halved under 800. The quality is the curve's binary search
+  for it, less 8 (4 for YCbCr) under quality 40 for plain pictures, at most the one given, less 4, 10 or 12 for small
+  plain pictures under 75; a step (4, 3, 2 or 1 by size, doubled for targets under 8 KB, plus 8, 4 or 2 past quality
+  60) lowers the later tries.
+- If the stream does not fit, the activity is estimated again from the target over the rows reached, the curve made
+  again about the quality tried, and the next quality is its search, at most the one tried less 6 or 10, less the step
+  doubled per try; three tries at most, then STREAM_OVERFLOW.
+Probes on Sony's module and pspocket's (1,116 size-limited pictures: six encoder kinds, gray to ARGB, 33x17 to 640x480,
+smooth, noisy and mixed, limits 4 KB to 32 KB, both DCTs, restart intervals): every quality, size, row count and stream
+byte the same. The comparison: 14 of 3,751 to 6 (the SPU encoder's, part 9). The comparisons of cellJpgEnc and cellVpost
+mount the installed /dev_flash in pspocket's half too, as a game has it.

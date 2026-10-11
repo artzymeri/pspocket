@@ -23,7 +23,9 @@
 // The stream is jpeg_encoder.cpp's (libjpeg 6b, without JFIF or Adobe markers, as libjpgenc's).
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <optional>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -31,6 +33,7 @@
 #include <string_view>
 #include <vector>
 
+#include "firmware_data.hpp"
 #include "guest.hpp"
 #include "jpeg_encoder.hpp"
 #include "pspocket/core/be.h"
@@ -147,11 +150,18 @@ struct Encoder {
     u64 generation = 0, resets = 0;
 };
 
+// libjpgenc's stream size tables (the size limit mode's), read at the first size-limited picture.
+struct SizeTables {
+    bool tried = false, ok = false;
+    std::array<std::array<std::array<u16, 101>, 3>, 4> t{}; // [sampling group][activity row][quality]
+};
+
 struct State {
     std::mutex mutex;
     std::map<u32, Encoder> encoders; // by handle
     u64 opens = 0;
     bool spu_logged = false, limit_logged = false;
+    SizeTables tables;
 };
 
 State& state() { return HleProcess::current()->state<State>(); }
@@ -263,26 +273,33 @@ jpeg::Settings settings_of(const Config& cfg, const Command& c, u32 quality)
 
 enum class Failure { None, Fatal, Overflow };
 
-// One encode of a command at `quality` into `out`: the extended parameters' segments after SOI, the rows (RGBA and
-// ARGB with their alpha left out, as libjpgenc gives libjpeg RGB), EOI. `lines`: the rows written.
-Failure encode_once(PPUContext& ctx, const Config& cfg, const Command& c, u32 quality, Output& out, u32& lines)
+// A picture's rows in host memory or guest memory: `width` pixels of `space` (a byte a pixel for gray, three for RGB and
+// YCbCr, four for RGBA and ARGB), rows `pitch` bytes apart.
+struct Pixels {
+    const u8* data = nullptr;
+    u32 width = 0, height = 0, pitch = 0, space = 0;
+};
+
+// One encode of `px` with `settings` into `sink`: the extended parameters' segments after SOI (when `c` is given), the
+// rows (RGBA and ARGB with their alpha left out, as libjpgenc gives libjpeg RGB), EOI. `lines`: the rows written.
+Failure encode_pixels(u8* base, const jpeg::Settings& settings, const Command* c, const Pixels& px,
+    const jpeg::Sink& sink, u32& lines)
 {
-    u8* base = gb(ctx);
-    jpeg::Encoder e(settings_of(cfg, c, quality), [&](const u8* p, usize n) { return out.write(p, n); });
+    jpeg::Encoder e(settings, sink);
     lines = 0;
     if (!e.valid()) return Failure::Fatal;
     if (!e.start()) return Failure::Overflow;
-    for (u32 i = 0; i < c.ex_num; i++) {
-        const u32 entry = c.ex_list + 12 * i, data = ps_read32(base, entry + 4), size = ps_read32(base, entry + 8);
+    for (u32 i = 0; c && i < c->ex_num; i++) {
+        const u32 entry = c->ex_list + 12 * i, data = ps_read32(base, entry + 4), size = ps_read32(base, entry + 8);
         if (!e.marker(static_cast<u8>(ps_read32(base, entry)), base + data, size)) return Failure::Overflow;
     }
     std::vector<u8> rgb;
-    for (u32 y = 0; y < c.height; y++) {
-        const u8* row = base + c.addr + static_cast<usize>(y) * c.pitch;
-        if (c.space == RGBA || c.space == ARGB) {
-            rgb.resize(static_cast<usize>(c.width) * 3);
-            const u32 skip = c.space == ARGB ? 1 : 0;
-            for (u32 x = 0; x < c.width; x++) std::memcpy(rgb.data() + 3 * x, row + 4 * x + skip, 3);
+    for (u32 y = 0; y < px.height; y++) {
+        const u8* row = px.data + static_cast<usize>(y) * px.pitch;
+        if (px.space == RGBA || px.space == ARGB) {
+            rgb.resize(static_cast<usize>(px.width) * 3);
+            const u32 skip = px.space == ARGB ? 1 : 0;
+            for (u32 x = 0; x < px.width; x++) std::memcpy(rgb.data() + 3 * x, row + 4 * x + skip, 3);
             row = rgb.data();
         }
         if (!e.write_row(row)) {
@@ -290,8 +307,259 @@ Failure encode_once(PPUContext& ctx, const Config& cfg, const Command& c, u32 qu
             return e.bad_coefficient() ? Failure::Fatal : Failure::Overflow;
         }
     }
-    lines = c.height;
+    lines = px.height;
     return e.finish() ? Failure::None : Failure::Overflow;
+}
+
+Failure encode_once(PPUContext& ctx, const Config& cfg, const Command& c, u32 quality, Output& out, u32& lines)
+{
+    u8* base = gb(ctx);
+    const Pixels px{base + c.addr, c.width, c.height, c.pitch, c.space};
+    return encode_pixels(base, settings_of(cfg, c, quality), &c, px, [&](const u8* p, usize n) { return out.write(p, n); },
+        lines);
+}
+
+// ------------------------------------------------------------------------------------------------- the size limit
+
+// libjpgenc's stream size limit mode (read from its encoder thread): a trial encoding of the picture (at most 128x128
+// of it: its top-left corner, or with both sizes past 128 four blocks about its quarter points) at quality 75 with the
+// fast DCT into a 0x4000-byte buffer measures how much the picture costs (bytes per 10,000 samples, "activity"); a
+// curve of stream sizes by quality is made from libjpgenc's tables (stream sizes measured by quality for three
+// activities, one set per sampling) about that activity; the quality whose predicted size is the limit's share (55 to
+// 80 percent by the picture's size and kind, less the extended parameters) is taken, trimmed for small and plain
+// pictures; if the stream does not fit, the prediction is made again from what it cost, lower, up to three tries.
+// The tables are libjpgenc's data, read from the installed system software (firmware_data.hpp).
+constexpr std::string_view kLibjpgencIdentity = "189f428931b796f0f8f228260d658eb12e339bb3a99b589481384a051086e603";
+constexpr u64 kTablesVaddr = 0x15648, kGroupBytes = 0x25E, kRowBytes = 0xCA;
+
+SizeTables& size_tables(State& s)
+{
+    std::lock_guard lock(s.mutex);
+    SizeTables& st = s.tables;
+    if (st.tried) return st;
+    st.tried = true;
+    const auto bytes = firmware_module_data(*HleProcess::current(), "libjpgenc.sprx", kLibjpgencIdentity, kTablesVaddr,
+        4 * kGroupBytes);
+    if (!bytes) return st;
+    for (u32 g = 0; g < 4; g++)
+        for (u32 r = 0; r < 3; r++)
+            for (u32 q = 0; q < 101; q++) {
+                const usize at = g * kGroupBytes + r * kRowBytes + 2 * q;
+                st.t[g][r][q] = static_cast<u16>(((*bytes)[at] << 8) | (*bytes)[at + 1]);
+            }
+    st.ok = true;
+    return st;
+}
+
+// The table group for an encoder: gray and RGB; 4:4:4; 4:2:2; 4:2:0 and 4:1:1.
+u32 group_of(const Config& cfg)
+{
+    if (cfg.space != YCBCR) return 0;
+    if (cfg.sampling == SAMPLING_422) return 2;
+    if (cfg.sampling == SAMPLING_420 || cfg.sampling == SAMPLING_411) return 3;
+    return 1;
+}
+
+// libjpgenc's predicted stream sizes by quality (activity units), from `quality`'s measured `activity`.
+std::array<u32, 101> predict(const std::array<std::array<u16, 101>, 3>& t, u32 quality, u32 activity, u32 margin,
+    u32 pixels)
+{
+    std::array<u32, 101> out{};
+    const auto ratio_from = [&](const std::array<u16, 101>& row) {
+        const u32 r = row[quality] ? static_cast<u32>(u64{activity} * (margin + 100) / row[quality]) : 0;
+        for (u32 i = 0; i < 101; i++) out[i] = static_cast<u32>((u64{r} * row[i] + 100) / 100) & 0xFFFF;
+    };
+    if (pixels <= 9999 || t[2][quality] >= activity) {
+        ratio_from(t[2]);
+        return out;
+    }
+    u32 hi_row = 1;
+    if (t[1][quality] < activity) {
+        if (t[0][quality] < activity) {
+            ratio_from(t[0]);
+            return out;
+        }
+        hi_row = 0;
+    }
+    const std::array<u16, 101>& hi = t[hi_row];
+    const std::array<u16, 101>& lo = t[hi_row + 1];
+    // The weights (lo k, hi 100 - k) whose sum at the quality is first at most the activity.
+    const u32 target = activity * 100;
+    u32 k = 1, w_hi = 0;
+    for (;; k++) {
+        if (k == 100) break;
+        const u32 v = lo[quality] * k + hi[quality] * (100 - k);
+        if (target >= v) {
+            w_hi = 100 - k;
+            break;
+        }
+    }
+    for (u32 i = 0; i < 101; i++) out[i] = ((lo[i] * k + hi[i] * w_hi) / 100) & 0xFFFF;
+    return out;
+}
+
+// libjpgenc's search of the prediction for `target`: a binary search; past it, the quality below.
+u32 pick(const std::array<u32, 101>& pred, u32 target)
+{
+    s32 lo = 0, hi = 100, mid = 100;
+    while (lo <= hi) {
+        mid = lo + (hi - lo) / 2;
+        if (target < pred[static_cast<u32>(mid)]) hi = mid - 1;
+        else if (target <= pred[static_cast<u32>(mid)]) break;
+        else lo = mid + 1;
+    }
+    if (pred[static_cast<u32>(mid)] > target && pred[0] < pred[static_cast<u32>(mid)]) mid--;
+    return static_cast<u32>(mid);
+}
+
+// libjpgenc's trim of a quality for plain pictures (activity under 400) of low quality.
+u32 trim(const Config& cfg, u32 activity, s32 q)
+{
+    if (activity <= 399 && q <= 39) q -= cfg.space == YCBCR ? 4 : 8;
+    return static_cast<u32>(std::max(q, 0));
+}
+
+// libjpgenc's estimate after a picture stopped at `lines` rows: the height measured less a margin.
+void stopped_at(u32& w, u32& h, u32& size, u32 lines)
+{
+    if (h == 1) {
+        if (w != 1) w >>= 1;
+        else size = 591;
+    } else if (h == 2 || lines <= 1) h = 1;
+    else if (lines <= 3) h = lines - 1;
+    else if (lines <= 7) h = lines - 2;
+    else if (lines > 15) h = lines - 8;
+    else h = lines - 4;
+}
+
+// The trial encoding's activity, or nothing when it failed otherwise than by filling its buffer.
+std::optional<u32> trial_activity(PPUContext& ctx, const Config& cfg, const Command& c)
+{
+    u8* base = gb(ctx);
+    const u32 spp = c.space == GRAYSCALE ? 1 : 3;
+    const u32 bpp = c.space == RGB || c.space == YCBCR ? 3 : c.space == RGBA || c.space == ARGB ? 4 : 1;
+    u32 cw = std::min(c.width, 128u), ch = std::min(c.height, 128u);
+    std::vector<u8> crop(static_cast<usize>(cw) * ch * bpp);
+    const u8* src = base + c.addr;
+    if (cw == c.width || ch == c.height) {
+        for (u32 y = 0; y < ch; y++)
+            std::memcpy(crop.data() + static_cast<usize>(y) * cw * bpp, src + static_cast<usize>(y) * c.pitch, cw * bpp);
+    } else {
+        // Four blocks of cw/2 x ch/2 about the quarter points: top left, top right, bottom left, bottom right.
+        const u32 bw = cw / 2, bh = ch / 2;
+        const u32 xs[2] = {c.width / 4 - cw / 4, 3 * (c.width / 4) - cw / 4};
+        const u32 ys[2] = {c.height / 4 - ch / 4, 3 * (c.height / 4) - ch / 4};
+        for (u32 by = 0; by < 2; by++)
+            for (u32 bx = 0; bx < 2; bx++)
+                for (u32 y = 0; y < bh; y++)
+                    std::memcpy(crop.data() + (static_cast<usize>(by * bh + y) * cw + bx * bw) * bpp,
+                        src + static_cast<usize>(ys[by] + y) * c.pitch + static_cast<usize>(xs[bx]) * bpp, bw * bpp);
+    }
+    jpeg::Settings st = settings_of(cfg, c, 75);
+    st.width = cw;
+    st.height = ch;
+    st.dct = jpeg::Dct::Fast;
+    constexpr u32 kTrialBuffer = 0x4000;
+    u64 written = 0;
+    u32 lines = 0;
+    const Pixels px{crop.data(), cw, ch, cw * bpp, c.space};
+    const Failure f = encode_pixels(base, st, nullptr, px,
+        [&](const u8*, usize n) {
+            written = std::min<u64>(written + n, kTrialBuffer);
+            return written < kTrialBuffer;
+        },
+        lines);
+    u32 size = static_cast<u32>(written);
+    if (f == Failure::Fatal) return std::nullopt;
+    if (f == Failure::Overflow) {
+        size = kTrialBuffer;
+        stopped_at(cw, ch, size, lines);
+    }
+    if (c.width + c.height > 256 && size > 1182) size -= 394;
+    return static_cast<u32>(u64{size} * 10000 / (u64{spp} * cw * ch));
+}
+
+// The extended parameters' bytes in the stream (each marker segment's 4 bytes and its data).
+u32 extra_bytes(u8* base, const Command& c)
+{
+    u32 n = 0;
+    for (u32 i = 0; c.ex_list && i < c.ex_num; i++) n += ps_read32(base, c.ex_list + 12 * i + 8) + 4;
+    return n;
+}
+
+// A size-limited picture (to a buffer), as libjpgenc's thread encodes it.
+Result encode_size_limited(PPUContext& ctx, const Config& cfg, const Command& c, const SizeTables& st, Result r)
+{
+    u8* base = gb(ctx);
+    const auto& t = st.t[group_of(cfg)];
+    const u32 pixels = c.width * c.height, spp = c.space == GRAYSCALE ? 1 : 3, samples = spp * pixels;
+    u32 step = pixels <= 4999 ? 4 : pixels <= 9999 ? 3 : pixels <= 39999 ? 2 : 1;
+    const u32 bump = pixels <= 4999 ? 3 : pixels <= 39999 ? 2 : 1;
+    const std::optional<u32> measured = trial_activity(ctx, cfg, c);
+    if (!measured) {
+        r.state = error(CELL_JPGENC_ERROR_FATAL);
+        return r;
+    }
+    u32 activity = *measured;
+    const u32 extra = extra_bytes(base, c);
+    // The limit's share the stream is aimed at.
+    s32 share = activity <= 399 ? 75 : 80;
+    if (pixels <= 9999) share = 60;
+    else if (pixels <= 39999) share = 55;
+    else if (pixels <= 89999) share -= 5;
+    if (cfg.space == RGB) share -= 4;
+    else if (cfg.space == GRAYSCALE) share -= 6;
+    else if (cfg.sampling == SAMPLING_422 || cfg.sampling == SAMPLING_420 || cfg.sampling == SAMPLING_411) share -= 2;
+    else share -= activity <= 399 ? 8 : 4;
+    const u32 target_bytes = static_cast<u32>(static_cast<u32>(share) * (c.limit - extra)) / 100;
+    u32 target = static_cast<u32>(u64{target_bytes} * 10000 / samples);
+    if (target <= 399) target >>= 2;
+    else if (target <= 799) target >>= 1;
+    if (target_bytes <= 8191) step <<= 1;
+
+    u32 q = trim(cfg, activity, static_cast<s32>(pick(predict(t, 75, activity, 10, pixels), target)));
+    q = std::min(q, c.quality);
+    bool bumped = true;
+    if (activity <= 8999 && pixels <= 89999 && q <= 74) {
+        const u32 cut = pixels <= 4999 ? 4 : pixels <= 9999 ? 10 : 12;
+        if (q <= cut) {
+            q = 0;
+            bumped = false;
+        } else {
+            q -= cut;
+        }
+    }
+    if (bumped && q > 60) step += 1u << bump;
+
+    for (u32 attempt = 1;; attempt++) {
+        Output out{ctx, true, c.stream, c.limit, {}, 0};
+        u32 lines = 0;
+        const Failure f = encode_once(ctx, cfg, c, q, out, lines);
+        r.quality = q;
+        if (f == Failure::None) {
+            r.size = static_cast<u32>(out.written);
+            r.lines = c.height;
+            return r;
+        }
+        if (f == Failure::Fatal) {
+            r.state = error(CELL_JPGENC_ERROR_FATAL);
+            return r;
+        }
+        r.state = error(CELL_JPGENC_ERROR_STREAM_OVERFLOW);
+        r.size = 0;
+        r.lines = lines;
+        if (q == 0 || attempt == 3) return r;
+        r.state = 0;
+        // What the stopped stream cost: the target over the rows it reached (less a margin).
+        u32 w = c.width, h = c.height, size = target_bytes;
+        stopped_at(w, h, size, lines);
+        activity = static_cast<u32>(u64{size} * 10000 / (u64{spp} * w * h));
+        const u32 cap = q > 40 ? q - 10 : q > 20 ? q - 6 : 0;
+        u32 next = trim(cfg, activity, static_cast<s32>(pick(predict(t, q, activity, 5, pixels), target)));
+        next = std::min(next, cap);
+        const u32 down = step << attempt;
+        q = down < next ? next - down : 0;
+    }
 }
 
 // One command encoded, as libjpgenc's thread does it.
@@ -315,14 +583,14 @@ Result encode(PPUContext& ctx, State& s, const Config& cfg, const Command& c)
     u32 lines = 0, quality = c.quality;
     Failure failed = Failure::None;
     if (c.mode == STREAM_SIZE_LIMIT) {
-        // libjpgenc chooses the quality from tables of its own (stream sizes measured by quality); pspocket takes the
-        // highest quality up to the one given whose stream fits the buffer, the qualities searched by halves.
+        const SizeTables& st = size_tables(s);
+        if (st.ok) return encode_size_limited(ctx, cfg, c, st, r);
         {
             std::lock_guard lock(s.mutex);
             if (!s.limit_logged) {
                 s.limit_logged = true;
-                PS_LOG_INFO(kChan, "cellJpgEncEncodePicture: the stream size limit mode chooses its quality by a "
-                                   "search, not libjpgenc's tables (D-913)");
+                PS_LOG_WARN(kChan, "cellJpgEncEncodePicture: no libjpgenc.sprx of firmware 4.92 installed: the stream "
+                                   "size limit mode chooses its quality by a search, not libjpgenc's tables (D-913)");
             }
         }
         u32 lo = 0, hi = c.quality;

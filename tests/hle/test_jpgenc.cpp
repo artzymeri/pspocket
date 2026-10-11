@@ -5,6 +5,7 @@
 // size limit mode; buffer and file output; the checks. tests/hle/test_jpgenc_compare.cpp compares the library with Sony's
 // libjpgenc byte for byte. No game data.
 
+#include "firmware_compare.hpp" // test_dev_flash
 #include "hle_test_util.hpp"
 
 #include <algorithm>
@@ -846,5 +847,26 @@ TEST_CASE("cellJpgEnc: eight threads encoding with one encoder at once: each pic
             CHECK((s.state == 0 || s.state == kSkip));
         }
     }
+    CHECK(g.call("cellJpgEncClose", h) == 0);
+}
+
+TEST_CASE("cellJpgEnc: the size limit mode with libjpgenc's tables from the installed system software (D-913)",
+    "[hle][jpgenc]")
+{
+    const auto flash = test_dev_flash();
+    if (!flash) SKIP("no PSPOCKET_TEST_DEV_FLASH: the size limit mode falls back to a search without libjpgenc's tables");
+    Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/dev_flash", *flash, true));
+    GuestThread g(f, 0, "game");
+    u8* b = f.base();
+    const u32 h = open(g);
+    put_rgb(b, noisy(64, 48, 3), RGB, 192);
+    // libjpgenc aims at a share of the limit from its predictions: a quality under the one the stream alone would fit.
+    REQUIRE(encode(g, h, {64, 48, RGB}, {95, FAST, 0, 1}, 0x1800) == 0);
+    const Info i = stream_info(g, h);
+    CHECK(i.state == 0);
+    CHECK(i.size < 0x1800);
+    CHECK(i.quality < 95);
+    CHECK(i.lines == 48);
     CHECK(g.call("cellJpgEncClose", h) == 0);
 }
