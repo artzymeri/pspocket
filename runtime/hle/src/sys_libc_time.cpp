@@ -20,6 +20,7 @@
 
 #include "libc_format.hpp"
 #include "libc_guest.hpp"
+#include "libc_scan_guest.hpp"
 #include "libc_malloc.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/lv2/syscalls.hpp"
@@ -577,33 +578,14 @@ u32 localeconv_(PPUContext& ctx)
 
 // ------------------------------------------------------------------------------------------------- conversions
 
+// Dinkumware's conversions as the SDK's C library has them (libc_scan.hpp, D-907, a game's copy the reference): the
+// x forms set *perr (0, or 1 on a range error) and errno as well; _Stoul is _Stoulx without perr, and so on. _Stod,
+// _Stof and _Stold scale by 10^pten in the same arithmetic (the power of ten added to the digits' own).
 u64 to_int(PPUContext& ctx, const char* fn, u32 s, u32 endp, s32 base, u32 bits, bool is_signed, u32 perr, bool wide)
 {
-    if (base < 0 || base == 1 || base > 36) {
-        if (perr && range_ok(ctx, fn, perr, 4)) ps_write32(gb(ctx), perr, 1);
-        else set_errno(ctx, kEINVAL);
-        if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, s);
-        return 0;
-    }
-    IntParse p;
-    if (wide) {
-        GuestWords in(thread_of(ctx), s);
-        p = parse_int([&](u64 i) -> s64 { const s64 c = in.at(i); return c > 0x7F ? 0x7F : c; }, base);
-    } else {
-        GuestBytes in(thread_of(ctx), s);
-        p = parse_int([&](u64 i) -> s64 { return in.at(i); }, base);
-    }
-    bool range = false;
-    const u64 v = int_result(p, bits, is_signed, &range);
-    if (perr && range_ok(ctx, fn, perr, 4)) ps_write32(gb(ctx), perr, range ? 1 : 0);
-    else if (range) set_errno(ctx, kERANGE);
-    const u32 unit = wide ? 4 : 1;
-    if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, p.end ? s + unit * static_cast<u32>(p.end) : s);
-    return v;
+    return guest_strtoint(ctx, fn, s, endp, base, bits, is_signed, perr, wide);
 }
 
-// _Stoul(s, endptr, base) and the rest: strtoul and its kin; the x forms report a range error in *perr (0 or 1)
-// instead of errno.
 u32 _Stoul_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(to_int(ctx, "_Stoul", s, e, b, 32, false, 0, false)); }
 u64 _Stoull_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "_Stoull", s, e, b, 64, false, 0, false); }
 u64 _Stoll_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "_Stoll", s, e, b, 64, true, 0, false); }
@@ -615,61 +597,9 @@ u64 _WStoll_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "_WStoll
 u32 _WStoul_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(to_int(ctx, "_WStoul", s, e, b, 32, false, 0, true)); }
 u64 _WStoull_(PPUContext& ctx, u32 s, u32 e, s32 b) { return to_int(ctx, "_WStoull", s, e, b, 64, false, 0, true); }
 
-// _Stod(s, endptr, pten): strtod scaled by 10^pten, rounded once (the decimal exponent moved by pten before the
-// conversion); the x forms report a range error in *perr. Hex, inf and nan are not scaled exactly (multiplied).
-FloatParse parse_scaled(const std::string& text, s32 pten)
-{
-    FloatParse p = parse_float(text);
-    if (!pten || !p.end) return p;
-    std::string sub = text.substr(0, p.end);
-    const usize start = sub.find_first_not_of(" \t\n\v\f\r");
-    const bool hex = start != std::string::npos && sub.size() > start + 2 &&
-                     (sub.compare(start, 2, "0x") == 0 || sub.compare(start, 2, "0X") == 0 ||
-                         sub.compare(start + 1, 2, "0x") == 0 || sub.compare(start + 1, 2, "0X") == 0);
-    if (!hex && std::isfinite(p.d)) {
-        s64 exp = pten;
-        const usize e = sub.find_first_of("eE");
-        if (e != std::string::npos) {
-            exp += std::strtoll(sub.c_str() + e + 1, nullptr, 10);
-            sub.resize(e);
-        }
-        const usize end = p.end;
-        p = parse_float(sub + "e" + std::to_string(exp));
-        p.end = end;
-        return p;
-    }
-    p.d *= std::pow(10.0, pten);
-    p.f = static_cast<float>(p.d);
-    return p;
-}
-
-FloatParse stod_parse(PPUContext& ctx, const char* fn, u32 s, u32 endp, s32 pten, bool wide)
-{
-    std::string text;
-    u32 unit = 1;
-    if (wide) {
-        unit = 4;
-        if (const auto w = read_wstring(thread_of(ctx), s, 0x10000)) {
-            for (const char32_t c : *w) {
-                if (c > 0x7F) break;
-                text += static_cast<char>(c);
-            }
-        }
-    } else if (const auto t = read_string(thread_of(ctx), s, 0x10000)) {
-        text = *t;
-    }
-    const FloatParse p = parse_scaled(text, pten);
-    if (endp && range_ok(ctx, fn, endp, 4)) ps_write32(gb(ctx), endp, s + unit * static_cast<u32>(p.end));
-    return p;
-}
-
 double stod_common(PPUContext& ctx, const char* fn, u32 s, u32 e, s32 pten, u32 perr, bool wide, bool single)
 {
-    const FloatParse p = stod_parse(ctx, fn, s, e, pten, wide);
-    const bool range = single ? p.range_f : p.range_d;
-    if (perr && range_ok(ctx, fn, perr, 4)) ps_write32(gb(ctx), perr, range ? 1 : 0);
-    else if (range) set_errno(ctx, kERANGE);
-    return single ? static_cast<double>(p.f) : p.d;
+    return guest_strtod(ctx, fn, s, e, pten, perr, wide, single);
 }
 
 double _Stod_(PPUContext& ctx, u32 s, u32 e, s32 pten) { return stod_common(ctx, "_Stod", s, e, pten, 0, false, false); }

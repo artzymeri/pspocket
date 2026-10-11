@@ -166,10 +166,11 @@ TEST_CASE("sys_libc: stdlib.h numbers, sorting and random numbers", "[hle][libc]
     CHECK(ps_read32(b, kOut) == kA); // no digits: end = the string
     put(b, kA, "  42abc");
     CHECK(i32(t.call("atoi", kA)) == 42);
-    // strtod: the C locale's text, hex, inf and nan; the result in f1.
+    // strtod: the C locale's text, hex, inf and nan; the result in f1, the SDK's parse (D-907: -1500 one place off,
+    // as a game's copy of the library gives it).
     put(b, kA, "  -1.5e3xyz");
     t.call("strtod", kA, kOut);
-    CHECK(t.ctx.fpr[1] == -1500.0);
+    CHECK(std::bit_cast<u64>(t.ctx.fpr[1]) == 0xC097700000000001ull);
     CHECK(ps_read32(b, kOut) == kA + 8);
     put(b, kA, "0x1p-2");
     t.call("atof", kA);
@@ -318,7 +319,7 @@ TEST_CASE("sys_libc: wide numbers, multibyte conversions and wide classes", "[hl
     CHECK(ps_read32(b, kOut) == kA);
     wput(b, kA, U"  -1.5e3xyz");
     t.call("wcstod", kA, kOut);
-    CHECK(t.ctx.fpr[1] == -1500.0);
+    CHECK(std::bit_cast<u64>(t.ctx.fpr[1]) == 0xC097700000000001ull); // the SDK's parse (D-907)
     CHECK(ps_read32(b, kOut) == kA + 4 * 8);
     wput(b, kA, U"0x1p-2");
     t.call("wcstof", kA, 0);

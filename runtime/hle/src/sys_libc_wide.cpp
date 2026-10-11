@@ -12,6 +12,7 @@
 
 #include "libc_format.hpp"
 #include "libc_guest.hpp"
+#include "libc_scan_guest.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/recomp/nid.hpp"
 
@@ -205,71 +206,17 @@ u32 wmemset_(PPUContext& ctx, u32 d, u32 c, u32 n)
 
 // ------------------------------------------------------------------------------------------------- wide numbers
 
-// The wide forms of strtol and strtod (7.24.4.1): the same subject sequences over wide characters; one past 127
-// ends them. *end set as their narrow forms.
-u64 wide_int(PPUContext& ctx, const char* fn, u32 s, u32 endp, s32 base, u32 bits, bool is_signed)
-{
-    GuestWords in(thread_of(ctx), s);
-    const auto at = [&](u64 i) -> s64 {
-        const s64 c = in.at(i);
-        return c > 0x7F ? 0x7F : c; // no wide character past 127 is a digit, sign or space
-    };
-    if (base < 0 || base == 1 || base > 36) {
-        set_errno(ctx, kEINVAL);
-        if (endp && range_ok(ctx, fn, endp, 4)) wr(ctx, endp, s);
-        return 0;
-    }
-    const IntParse p = parse_int(at, base);
-    bool range = false;
-    const u64 v = int_result(p, bits, is_signed, &range);
-    if (range) set_errno(ctx, kERANGE);
-    if (endp && range_ok(ctx, fn, endp, 4)) wr(ctx, endp, p.end ? s + 4 * static_cast<u32>(p.end) : s);
-    return v;
-}
-
-u32 wcstol_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(wide_int(ctx, "wcstol", s, e, b, 32, true)); }
-u32 wcstoul_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(wide_int(ctx, "wcstoul", s, e, b, 32, false)); }
-u64 wcstoll_(PPUContext& ctx, u32 s, u32 e, s32 b) { return wide_int(ctx, "wcstoll", s, e, b, 64, true); }
-u64 wcstoull_(PPUContext& ctx, u32 s, u32 e, s32 b) { return wide_int(ctx, "wcstoull", s, e, b, 64, false); }
-u64 wcstoimax_(PPUContext& ctx, u32 s, u32 e, s32 b) { return wide_int(ctx, "wcstoimax", s, e, b, 64, true); }
-u64 wcstoumax_(PPUContext& ctx, u32 s, u32 e, s32 b) { return wide_int(ctx, "wcstoumax", s, e, b, 64, false); }
-
-FloatParse wide_float(PPUContext& ctx, const char* fn, u32 s, u32 endp)
-{
-    const auto t = wstr(ctx, fn, s, 0x10000);
-    FloatParse p{};
-    if (t) {
-        std::string narrow;
-        for (const char32_t c : *t) {
-            if (c > 0x7F) break;
-            narrow += static_cast<char>(c);
-        }
-        p = parse_float(narrow);
-    }
-    if (endp && range_ok(ctx, fn, endp, 4)) wr(ctx, endp, s + 4 * static_cast<u32>(p.end));
-    return p;
-}
-
-double wcstod_(PPUContext& ctx, u32 s, u32 e)
-{
-    const FloatParse p = wide_float(ctx, "wcstod", s, e);
-    if (p.range_d) set_errno(ctx, kERANGE);
-    return p.d;
-}
-
-double wcstold_(PPUContext& ctx, u32 s, u32 e)
-{
-    const FloatParse p = wide_float(ctx, "wcstold", s, e);
-    if (p.range_d) set_errno(ctx, kERANGE);
-    return p.d;
-}
-
-float wcstof_(PPUContext& ctx, u32 s, u32 e)
-{
-    const FloatParse p = wide_float(ctx, "wcstof", s, e);
-    if (p.range_f) set_errno(ctx, kERANGE);
-    return p.f;
-}
+// The wide forms of strtol and strtod (7.24.4.1): the narrow ones' SDK parsing (libc_scan.hpp, D-907) over 32-bit
+// wide characters; no wide character past 127 is a digit, sign, space or letter in the "C" locale.
+u32 wcstol_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(guest_strtoint(ctx, "wcstol", s, e, b, 32, true, 0, true)); }
+u32 wcstoul_(PPUContext& ctx, u32 s, u32 e, s32 b) { return static_cast<u32>(guest_strtoint(ctx, "wcstoul", s, e, b, 32, false, 0, true)); }
+u64 wcstoll_(PPUContext& ctx, u32 s, u32 e, s32 b) { return guest_strtoint(ctx, "wcstoll", s, e, b, 64, true, 0, true); }
+u64 wcstoull_(PPUContext& ctx, u32 s, u32 e, s32 b) { return guest_strtoint(ctx, "wcstoull", s, e, b, 64, false, 0, true); }
+u64 wcstoimax_(PPUContext& ctx, u32 s, u32 e, s32 b) { return guest_strtoint(ctx, "wcstoimax", s, e, b, 64, true, 0, true); }
+u64 wcstoumax_(PPUContext& ctx, u32 s, u32 e, s32 b) { return guest_strtoint(ctx, "wcstoumax", s, e, b, 64, false, 0, true); }
+double wcstod_(PPUContext& ctx, u32 s, u32 e) { return guest_strtod(ctx, "wcstod", s, e, 0, 0, true, false); }
+double wcstold_(PPUContext& ctx, u32 s, u32 e) { return guest_strtod(ctx, "wcstold", s, e, 0, 0, true, false); }
+float wcstof_(PPUContext& ctx, u32 s, u32 e) { return static_cast<float>(guest_strtod(ctx, "wcstof", s, e, 0, 0, true, true)); }
 
 // ------------------------------------------------------------------------------------------------- multibyte
 
